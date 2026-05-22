@@ -1,17 +1,23 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
+import type { ToolTrace } from '../shared/toolTrace.js'
 import type {
   EventListOptions,
   EventListResult,
   NexusStorage,
   SessionGetOptions,
   StorageListOptions,
+  ToolTraceListOptions,
+  ToolTraceListResult,
+  PermissionAudit,
 } from './Storage.js'
 
 export class MemoryStorage implements NexusStorage {
   private readonly sessions = new Map<string, SessionSnapshot>()
   private readonly tasks = new Map<string, NexusTask>()
+  private readonly toolTraces = new Map<string, ToolTrace>()
+  private readonly permissionAudits = new Map<string, PermissionAudit[]>()
 
   async saveSession(session: SessionSnapshot): Promise<void> {
     const cloned = structuredClone(session)
@@ -64,6 +70,26 @@ export class MemoryStorage implements NexusStorage {
     if (!session) return
     session.events.push(structuredClone(event))
     session.updatedAt = event.timestamp
+
+    if (event.type === 'tool_started') {
+      const trace: ToolTrace = {
+        toolUseId: event.toolUseId,
+        sessionId,
+        name: event.name,
+        input: event.input,
+        startedAt: event.timestamp,
+      }
+      this.toolTraces.set(event.toolUseId, trace)
+    } else if (event.type === 'tool_completed') {
+      const existing = this.toolTraces.get(event.toolUseId)
+      if (existing) {
+        existing.output = event.output
+        existing.success = event.success
+        existing.completedAt = event.timestamp
+        existing.durationMs =
+          new Date(event.timestamp).getTime() - new Date(existing.startedAt).getTime()
+      }
+    }
   }
 
   async saveTask(task: NexusTask): Promise<void> {
@@ -80,6 +106,50 @@ export class MemoryStorage implements NexusStorage {
       .filter(task => task.sessionId === sessionId)
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
       .map(task => structuredClone(task))
+  }
+
+  async saveToolTrace(trace: ToolTrace): Promise<void> {
+    this.toolTraces.set(trace.toolUseId, structuredClone(trace))
+  }
+
+  async getToolTrace(toolUseId: string): Promise<ToolTrace | null> {
+    const trace = this.toolTraces.get(toolUseId)
+    return trace ? structuredClone(trace) : null
+  }
+
+  async listToolTraces(
+    sessionId: string,
+    options: ToolTraceListOptions = {},
+  ): Promise<ToolTraceListResult> {
+    const limit = options.limit ?? 100
+    const order = options.order ?? 'asc'
+    const startIndex = options.cursor ? Number(options.cursor) : 0
+    const allTraces = [...this.toolTraces.values()]
+      .filter(t => t.sessionId === sessionId)
+      .sort((a, b) => {
+        const cmp = a.startedAt.localeCompare(b.startedAt)
+        if (cmp !== 0) return cmp
+        return a.toolUseId.localeCompare(b.toolUseId)
+      })
+
+    const orderedTraces = order === 'asc' ? allTraces : [...allTraces].reverse()
+    const page = orderedTraces.slice(startIndex, startIndex + limit)
+    const nextIndex = startIndex + page.length
+    return {
+      traces: structuredClone(page),
+      nextCursor: nextIndex < orderedTraces.length ? String(nextIndex) : undefined,
+    }
+  }
+
+  async savePermissionAudit(audit: PermissionAudit): Promise<void> {
+    const list = this.permissionAudits.get(audit.sessionId) ?? []
+    list.push(structuredClone(audit))
+    this.permissionAudits.set(audit.sessionId, list)
+  }
+
+  async listPermissionAudits(sessionId: string): Promise<PermissionAudit[]> {
+    const list = this.permissionAudits.get(sessionId) ?? []
+    return structuredClone(list)
   }
 
   async close(): Promise<void> {}

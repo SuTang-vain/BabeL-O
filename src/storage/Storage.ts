@@ -1,6 +1,7 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
+import type { ToolTrace } from '../shared/toolTrace.js'
 
 export type StorageListOptions = {
   limit?: number
@@ -22,6 +23,29 @@ export type EventListResult = {
   nextCursor?: string
 }
 
+export type ToolTraceListOptions = {
+  limit?: number
+  cursor?: string
+  order?: 'asc' | 'desc'
+}
+
+export type ToolTraceListResult = {
+  traces: ToolTrace[]
+  nextCursor?: string
+}
+
+export type PermissionAudit = {
+  auditId: string
+  sessionId: string
+  toolUseId: string
+  toolName: string
+  toolRisk: string
+  toolInput: unknown
+  decision: 'approved' | 'denied'
+  reason?: string
+  timestamp: string
+}
+
 export interface NexusStorage {
   saveSession(session: SessionSnapshot): Promise<void>
   getSession(
@@ -34,5 +58,13 @@ export interface NexusStorage {
   saveTask(task: NexusTask): Promise<void>
   getTask(taskId: string): Promise<NexusTask | null>
   listTasks(sessionId: string): Promise<NexusTask[]>
+  saveToolTrace(trace: ToolTrace): Promise<void>
+  getToolTrace(toolUseId: string): Promise<ToolTrace | null>
+  listToolTraces(
+    sessionId: string,
+    options?: ToolTraceListOptions,
+  ): Promise<ToolTraceListResult>
+  savePermissionAudit(audit: PermissionAudit): Promise<void>
+  listPermissionAudits(sessionId: string): Promise<PermissionAudit[]>
   close?(): Promise<void>
 }

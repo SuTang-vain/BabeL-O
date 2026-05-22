@@ -1,5 +1,6 @@
 import {
   allowAllTools,
+  denyByDefaultTools,
   allowlistedTools,
   LocalCodingRuntime,
 } from '../runtime/LocalCodingRuntime.js'
@@ -25,13 +26,22 @@ export function createDefaultNexusRuntime(
   const configManager = ConfigManager.getInstance()
   const settings = configManager.resolveSettings()
 
-  const policy = options.allowedTools
-    ? allowlistedTools(options.allowedTools)
-    : allowAllTools()
+  let policy = denyByDefaultTools()
+  if (options.allowedTools) {
+    const hasWildcard = options.allowedTools.some(t => {
+      const norm = t.trim().toLowerCase()
+      return norm === '*' || norm === 'all'
+    })
+    if (hasWildcard) {
+      policy = allowAllTools()
+    } else {
+      policy = allowlistedTools(options.allowedTools)
+    }
+  }
 
   const runtime =
     settings.providerId === 'local'
-      ? new LocalCodingRuntime(tools, policy)
+      ? new LocalCodingRuntime(tools, policy, storage)
       : new LLMCodingRuntime(tools, policy, storage, configManager)
 
   return { runtime, storage, tools }

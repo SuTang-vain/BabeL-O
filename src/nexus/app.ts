@@ -2,13 +2,16 @@ import websocket from '@fastify/websocket'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
-import { eventBase, type NexusEvent } from '../shared/events.js'
+import { eventBase, type NexusEvent, NexusEventSchema } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
 import { NexusMetrics, round } from './metrics.js'
+import { PendingPermissionRegistry } from '../shared/session.js'
+import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
+
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -22,6 +25,10 @@ const executeSchema = z.object({
   cwd: z.string().optional(),
   timeoutMs: z.number().int().positive().max(300_000).optional(),
   maxToolOutputBytes: z.number().int().positive().max(10_000_000).optional(),
+  skipPermissionCheck: z.boolean().optional(),
+  requestId: z.string().optional(),
+  model: z.string().optional(),
+  budget: z.number().int().positive().optional(),
 })
 
 const createTaskSchema = z.object({
@@ -47,6 +54,12 @@ const eventListQuerySchema = z.object({
   order: z.enum(['asc', 'desc']).default('asc'),
 })
 
+const toolTraceListQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(500).default(100),
+  cursor: z.string().optional(),
+  order: z.enum(['asc', 'desc']).default('asc'),
+})
+
 const sessionDetailQuerySchema = z.object({
   recentEventLimit: z.coerce.number().int().min(0).max(500).default(100),
 })
@@ -59,6 +72,7 @@ export type CreateNexusAppOptions = {
   maxConcurrentExecutions?: number
   maxToolOutputBytes?: number
   bashMaxBufferBytes?: number
+  apiKey?: string
 }
 
 type WebSocketLike = {
@@ -73,15 +87,65 @@ export async function createNexusApp(
 ): Promise<FastifyInstance> {
   const app = Fastify({ logger: false })
   const metrics = new NexusMetrics()
+  const apiKey = options.apiKey ?? process.env.NEXUS_API_KEY
   const executeTimeoutMs = options.executeTimeoutMs ?? 30_000
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
   await app.register(websocket)
 
+  app.setErrorHandler((error: any, request, reply) => {
+    const isValidationError =
+      error.validation ||
+      error.name === 'ZodError' ||
+      error.statusCode === 400
+
+    if (isValidationError) {
+      return reply.status(400).send({
+        type: 'error',
+        code: 'INVALID_REQUEST',
+        message: error.message || String(error),
+      })
+    }
+
+    const code = (error as any).code || 'INTERNAL_ERROR'
+    const statusCode = error.statusCode || 500
+    return reply.status(statusCode).send({
+      type: 'error',
+      code,
+      message: error.message || String(error),
+    })
+  })
+
   app.addHook('onRequest', async request => {
     request.performanceStartMs = metrics.now()
   })
+
+  if (apiKey) {
+    app.addHook('onRequest', async (request, reply) => {
+      const pathname = request.url.split('?')[0]
+      if (pathname === '/health') {
+        return
+      }
+
+      const authHeader = request.headers['authorization']
+      let clientKey = request.headers['x-nexus-api-key']
+      if (!clientKey && typeof authHeader === 'string') {
+        const parts = authHeader.split(' ')
+        if (parts.length === 2 && parts[0].toLowerCase() === 'bearer') {
+          clientKey = parts[1]
+        }
+      }
+
+      if (clientKey !== apiKey) {
+        return reply.code(401).send({
+          type: 'error',
+          code: 'UNAUTHORIZED',
+          message: 'Unauthorized: Invalid or missing API key',
+        })
+      }
+    })
+  }
 
   app.addHook('onResponse', async (request, reply) => {
     metrics.recordRoute(
@@ -109,6 +173,10 @@ export async function createNexusApp(
 
   app.get('/v1/runtime/metrics', async () => metrics.snapshot())
 
+  app.get('/v1/schema/events', async () => {
+    return z.toJSONSchema(NexusEventSchema)
+  })
+
   app.get('/v1/tools/audit', async () => ({
     type: 'tools_audit',
     tools: options.runtime.listTools?.() ?? [],
@@ -130,6 +198,14 @@ export async function createNexusApp(
       const body = executeSchema.parse(request.body)
       const sessionId = body.sessionId ?? createId('session')
       const cwd = body.cwd ?? options.defaultCwd
+
+      if (!isWorkspaceAllowed(cwd)) {
+        return reply.status(400).send({
+          type: 'error',
+          code: 'INVALID_REQUEST',
+          message: `Workspace directory not allowed: ${cwd}`,
+        })
+      }
       const abortController = new AbortController()
       const timeout = setTimeout(
         () => abortController.abort(),
@@ -139,6 +215,7 @@ export async function createNexusApp(
       await options.storage.saveSession(session)
 
       const events: NexusEvent[] = []
+      const requestId = body.requestId ?? createId('req')
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -147,6 +224,10 @@ export async function createNexusApp(
           signal: abortController.signal,
           maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
           bashMaxBufferBytes,
+          skipPermissionCheck: body.skipPermissionCheck,
+          requestId,
+          model: body.model,
+          budget: body.budget,
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
@@ -256,7 +337,51 @@ export async function createNexusApp(
     }
   })
 
-  app.post('/v1/sessions/:sessionId/input', async request => {
+  app.get('/v1/sessions/:sessionId/tool-traces', async request => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = toolTraceListQuerySchema.parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return {
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      }
+    }
+    const page = await options.storage.listToolTraces(params.sessionId, query)
+    return {
+      type: 'tool_traces',
+      sessionId: params.sessionId,
+      traces: page.traces,
+      nextCursor: page.nextCursor,
+      order: query.order,
+      limit: query.limit,
+    }
+  })
+
+  app.get('/v1/sessions/:sessionId/permission-audits', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const audits = await options.storage.listPermissionAudits(params.sessionId)
+    return {
+      type: 'permission_audits',
+      sessionId: params.sessionId,
+      audits,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/input', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const body = sessionInputSchema.parse(request.body)
     const session = await options.storage.getSession(params.sessionId)
@@ -266,6 +391,15 @@ export async function createNexusApp(
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
       }
+    }
+
+    if (session.phase === 'waiting_permission') {
+      const lowerMessage = body.message.trim().toLowerCase()
+      const approved = ['y', 'yes', 'approve', 'ok', 'true'].includes(lowerMessage)
+      PendingPermissionRegistry.getInstance().resolveSession(params.sessionId, {
+        approved,
+        reason: approved ? undefined : body.message,
+      })
     }
 
     const event: NexusEvent = {
@@ -283,6 +417,52 @@ export async function createNexusApp(
       type: 'session_input_accepted',
       sessionId: params.sessionId,
       phase: session.phase,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/approve', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const body = z.object({ toolUseId: z.string() }).parse(request.body)
+    const resolved = PendingPermissionRegistry.getInstance().resolve(
+      params.sessionId,
+      body.toolUseId,
+      { approved: true }
+    )
+    if (!resolved) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'PERMISSION_REQUEST_NOT_FOUND',
+        message: `No pending permission request found for session ${params.sessionId} and tool use ${body.toolUseId}`,
+      })
+    }
+    return {
+      type: 'permission_resolved',
+      sessionId: params.sessionId,
+      toolUseId: body.toolUseId,
+      approved: true,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/deny', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const body = z.object({ toolUseId: z.string(), reason: z.string().optional() }).parse(request.body)
+    const resolved = PendingPermissionRegistry.getInstance().resolve(
+      params.sessionId,
+      body.toolUseId,
+      { approved: false, reason: body.reason }
+    )
+    if (!resolved) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'PERMISSION_REQUEST_NOT_FOUND',
+        message: `No pending permission request found for session ${params.sessionId} and tool use ${body.toolUseId}`,
+      })
+    }
+    return {
+      type: 'permission_resolved',
+      sessionId: params.sessionId,
+      toolUseId: body.toolUseId,
+      approved: false,
     }
   })
 
@@ -321,6 +501,9 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       title: body.title,
       status: 'pending',
+      dependsOn: [],
+      blocks: [],
+      retryCount: 0,
       createdAt: nowIso(),
       updatedAt: nowIso(),
     }
@@ -411,6 +594,16 @@ export async function createNexusApp(
 
   app.get('/v1/stream', { websocket: true }, socket => {
     socket.on('message', async (raw: Buffer) => {
+      const parsedJson = parseJsonObject(raw)
+      if (parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && parsedJson.type === 'permission_response') {
+        const res = parsedJson as any
+        PendingPermissionRegistry.getInstance().resolve(res.sessionId, res.toolUseId, {
+          approved: res.approved,
+          reason: res.reason,
+        })
+        return
+      }
+
       let closedByClient = false
       const markClosed = () => {
         closedByClient = true
@@ -437,20 +630,27 @@ export async function createNexusApp(
       let success = false
       let timedOut = false
       try {
-        const parsedJson = parseJsonObject(raw)
         const parsed = executeSchema.safeParse(parsedJson)
-      if (!parsed.success) {
-        sendJson(socket, {
-          type: 'error',
-          code: 'INVALID_REQUEST',
-          message: z.prettifyError(parsed.error),
-        })
-        return
-      }
+        if (!parsed.success) {
+          sendJson(socket, {
+            type: 'error',
+            code: 'INVALID_REQUEST',
+            message: z.prettifyError(parsed.error),
+          })
+          return
+        }
 
       const body = parsed.data
       const sessionId = body.sessionId ?? createId('session')
       const cwd = body.cwd ?? options.defaultCwd
+      if (!isWorkspaceAllowed(cwd)) {
+        sendJson(socket, {
+          type: 'error',
+          code: 'INVALID_REQUEST',
+          message: `Workspace directory not allowed: ${cwd}`,
+        })
+        return
+      }
       const timeout = setTimeout(
         () => abortController.abort(),
         body.timeoutMs ?? executeTimeoutMs,
@@ -459,6 +659,7 @@ export async function createNexusApp(
         createSessionSnapshot(sessionId, cwd, body.prompt),
       )
 
+      const requestId = body.requestId ?? createId('req')
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -467,6 +668,10 @@ export async function createNexusApp(
           signal: abortController.signal,
           maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
           bashMaxBufferBytes,
+          skipPermissionCheck: body.skipPermissionCheck,
+          requestId,
+          model: body.model,
+          budget: body.budget,
         })) {
           await options.storage.appendEvent(sessionId, event)
           if (socket.readyState !== socket.OPEN) {
@@ -528,5 +733,23 @@ function createSessionSnapshot(
     createdAt: timestamp,
     updatedAt: timestamp,
     events: [],
+  }
+}
+
+export function isLocalHost(h: string): boolean {
+  const normalized = h.toLowerCase().trim()
+  return (
+    normalized === '127.0.0.1' ||
+    normalized === 'localhost' ||
+    normalized === '::1' ||
+    normalized === '[::1]'
+  )
+}
+
+export function validateSecurityConfig(host: string, apiKey: string | undefined): void {
+  if (!isLocalHost(host) && !apiKey) {
+    throw new Error(
+      `Security Error: Running Nexus on non-localhost (${host}) requires setting the NEXUS_API_KEY environment variable.`,
+    )
   }
 }

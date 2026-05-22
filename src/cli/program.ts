@@ -3,13 +3,26 @@ import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
 import chalk from 'chalk'
 import { Command } from 'commander'
+import * as path from 'node:path'
+import * as fs from 'node:fs'
+import os from 'node:os'
 import { NexusClient } from './NexusClient.js'
 import { executeEmbedded } from './embedded.js'
 import { renderEvent } from './renderEvents.js'
+import { renderWelcome } from './welcome.js'
 import { flushStartupTrace, markStartup } from './startupTrace.js'
 import type { NexusEvent } from '../shared/events.js'
-import { ConfigManager } from '../shared/config.js'
+import { ConfigManager, DEFAULT_CONFIG_DIR } from '../shared/config.js'
 import { modelRegistry } from '../providers/registry.js'
+import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
+import { createRuntimeAgentStepRunner } from '../nexus/runtimeAgentStep.js'
+import { runAgentLoop } from '../nexus/agentLoop.js'
+import { setNexusStorage } from '../nexus/storageBridge.js'
+import { createId } from '../shared/id.js'
+import { PLANNER_ROLE } from '../nexus/agentRoles.js'
+import { PendingPermissionRegistry } from '../shared/session.js'
+import { SqliteStorage } from '../storage/SqliteStorage.js'
+
 
 markStartup('cli.imported')
 
@@ -28,12 +41,24 @@ program
   .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
   .action(async (promptParts: string[], options: { url?: string; cwd: string }) => {
     const prompt = promptParts.join(' ')
-    const result = options.url
-      ? await new NexusClient({ baseUrl: options.url }).execute({ prompt, cwd: options.cwd })
-      : await executeEmbedded(prompt, options.cwd)
+    const rl = readline.createInterface({ input, output })
+    const abortController = new AbortController()
 
-    for (const event of result.events as NexusEvent[]) {
-      renderEvent(event)
+    rl.on('SIGINT', () => {
+      abortController.abort()
+      console.log(chalk.yellow('\nExecution cancelled by user.'))
+      process.exit(130)
+    })
+
+    try {
+      renderWelcome({ cwd: options.cwd, url: options.url })
+      await runSessionFlow(prompt, options.cwd, options.url, rl, abortController)
+    } catch (e: any) {
+      if (e.message !== 'Aborted' && e.name !== 'AbortError') {
+        console.error(chalk.red(`Error: ${e.message || e}`))
+      }
+    } finally {
+      rl.close()
     }
   })
 
@@ -43,23 +68,221 @@ program
   .option('--url <url>', 'Use a running Nexus service instead of embedded mode')
   .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
   .action(async (options: { url?: string; cwd: string }) => {
-    console.log(chalk.bold('bbl chat'))
-    console.log(chalk.dim('Try: read README.md, grep Nexus, bash pwd, task "review runtime"'))
-    const rl = readline.createInterface({ input, output })
+    const historyFile = path.join(DEFAULT_CONFIG_DIR, 'history')
+    let history: string[] = []
+    try {
+      if (fs.existsSync(historyFile)) {
+        history = fs.readFileSync(historyFile, 'utf8')
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 0)
+          .reverse()
+      }
+    } catch (e) {
+      // ignore
+    }
+
+    const completer = (line: string): [string[], string] => {
+      if (line.startsWith('/') && !line.includes(' ')) {
+        const commands = ['/help', '/clear', '/exit', '/model', '/status', '/sessions']
+        const hits = commands.filter(c => c.startsWith(line))
+        return [hits, line]
+      }
+
+      if (line.startsWith('/model ')) {
+        const modelPrefix = line.slice('/model '.length)
+        const modelIds = modelRegistry.map(m => m.id)
+        const hits = modelIds.filter(id => id.startsWith(modelPrefix))
+        return [hits.map(id => `/model ${id}`), line]
+      }
+
+      const words = line.split(' ')
+      const lastWord = words[words.length - 1] || ''
+
+      if (lastWord.length > 0) {
+        let searchDir = options.cwd
+        let prefix = lastWord
+
+        if (lastWord.includes('/') || lastWord.includes('\\')) {
+          const lastSlashIndex = Math.max(lastWord.lastIndexOf('/'), lastWord.lastIndexOf('\\'))
+          const dirPart = lastWord.slice(0, lastSlashIndex)
+          prefix = lastWord.slice(lastSlashIndex + 1)
+          searchDir = path.resolve(options.cwd, dirPart)
+        }
+
+        try {
+          if (fs.existsSync(searchDir) && fs.statSync(searchDir).isDirectory()) {
+            const files = fs.readdirSync(searchDir)
+            const hits = files
+              .filter(f => f.startsWith(prefix))
+              .map(f => {
+                const fullPath = path.join(searchDir, f)
+                let isDir = false
+                try {
+                  isDir = fs.statSync(fullPath).isDirectory()
+                } catch {}
+                const pathPrefix = lastWord.slice(0, lastWord.length - prefix.length)
+                return pathPrefix + f + (isDir ? '/' : '')
+              })
+            return [hits, lastWord]
+          }
+        } catch (e) {
+          // ignore
+        }
+      }
+
+      return [[], line]
+    }
+
+    const rl = readline.createInterface({
+      input,
+      output,
+      completer,
+      historySize: 1000,
+      removeHistoryDuplicates: true
+    })
+
+    ;(rl as any).history = history
+
+    let activeAbortController: AbortController | null = null
+
+    rl.on('SIGINT', () => {
+      if (activeAbortController) {
+        activeAbortController.abort()
+        console.log(chalk.yellow('\nExecution cancelled by user.'))
+      } else {
+        console.log(chalk.dim('\nExiting chat...'))
+        rl.close()
+        process.exit(0)
+      }
+    })
+
+    renderWelcome({ cwd: options.cwd, url: options.url })
+
     try {
       for (;;) {
-        const prompt = await rl.question(chalk.cyan('bbl> '))
-        if (['exit', 'quit', '/exit'].includes(prompt.trim())) break
-        if (!prompt.trim()) continue
+        let prompt: string
+        try {
+          prompt = await rl.question(chalk.cyan('bbl> '))
+        } catch (e: any) {
+          if (e.name === 'AbortError') {
+            continue
+          }
+          throw e
+        }
 
-        const result = options.url
-          ? await new NexusClient({ baseUrl: options.url }).execute({
-              prompt,
-              cwd: options.cwd,
-            })
-          : await executeEmbedded(prompt, options.cwd)
-        for (const event of result.events as NexusEvent[]) {
-          renderEvent(event)
+        const trimmed = prompt.trim()
+        if (trimmed === '/exit' || trimmed === 'exit' || trimmed === 'quit') {
+          break
+        }
+        if (!trimmed) {
+          continue
+        }
+
+        try {
+          fs.mkdirSync(path.dirname(historyFile), { recursive: true })
+          fs.appendFileSync(historyFile, trimmed + '\n', 'utf8')
+        } catch (e) {
+          // ignore
+        }
+
+        if (trimmed === '/clear' || trimmed === 'clear') {
+          console.clear()
+          continue
+        }
+
+        if (trimmed === '/help') {
+          console.log(chalk.cyan('\n--- BabeL-O CLI Commands ---'))
+          console.log(`${chalk.bold('/help')}          Show this help message`)
+          console.log(`${chalk.bold('/clear')}         Clear terminal screen`)
+          console.log(`${chalk.bold('/exit')}          Exit the interactive shell`)
+          console.log(`${chalk.bold('/model')}         Show default model or switch it (e.g. /model anthropic/claude-3-5-sonnet)`)
+          console.log(`${chalk.bold('/status')}        Show Nexus connection status`)
+          console.log(`${chalk.bold('/sessions')}      List recent sessions`)
+          console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
+          console.log()
+          continue
+        }
+
+        if (trimmed.startsWith('/model')) {
+          const parts = trimmed.split(/\s+/)
+          const configManager = ConfigManager.getInstance()
+          if (parts.length === 1) {
+            const current = configManager.resolveSettings().modelId || 'local/coding-runtime'
+            console.log(`Current default model: ${chalk.yellow(current)}`)
+            console.log(`To switch model: ${chalk.bold('/model <modelId>')}`)
+            console.log(`Available models:`)
+            for (const m of modelRegistry) {
+              console.log(`  - ${m.id}`)
+            }
+          } else {
+            const modelId = parts[1]!
+            const exists = modelRegistry.some(m => m.id === modelId)
+            if (!exists) {
+              console.warn(chalk.yellow(`Warning: Model "${modelId}" is not in the registered list, but setting it anyway.`))
+            }
+            configManager.setDefaultModel(modelId)
+            console.log(chalk.green(`✓ Default model set to: ${modelId}`))
+          }
+          continue
+        }
+
+        if (trimmed === '/status') {
+          if (options.url) {
+            try {
+              const client = new NexusClient({ baseUrl: options.url })
+              const stat = await client.status()
+              console.log(chalk.cyan('\n--- Nexus Service Status ---'))
+              console.log(JSON.stringify(stat, null, 2))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to get status from service: ${e.message || e}`))
+            }
+          } else {
+            console.log(chalk.cyan('\n--- Embedded Nexus Status ---'))
+            console.log(`Mode: ${chalk.bold('Embedded (Local)')}`)
+            console.log(`Workspace CWD: ${chalk.white(options.cwd)}`)
+            const configManager = ConfigManager.getInstance()
+            const model = configManager.resolveSettings().modelId || 'local/coding-runtime'
+            console.log(`Model: ${chalk.yellow(model)}`)
+          }
+          continue
+        }
+
+        if (trimmed === '/sessions') {
+          if (options.url) {
+            try {
+              const client = new NexusClient({ baseUrl: options.url })
+              const list = await client.listSessions()
+              console.log(chalk.cyan('\n--- Recent Sessions ---'))
+              console.log(JSON.stringify(list, null, 2))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to list sessions from service: ${e.message || e}`))
+            }
+          } else {
+            try {
+              const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+              const storage = new SqliteStorage(storagePath)
+              const list = await storage.listSessions({ limit: 10 })
+              await storage.close?.()
+              console.log(chalk.cyan('\n--- Recent Sessions (Local) ---'))
+              console.log(JSON.stringify(list, null, 2))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to list local sessions: ${e.message || e}`))
+            }
+          }
+          continue
+        }
+
+        const abortController = new AbortController()
+        activeAbortController = abortController
+        try {
+          await runSessionFlow(trimmed, options.cwd, options.url, rl, abortController)
+        } catch (e: any) {
+          if (e.message !== 'Aborted' && e.name !== 'AbortError') {
+            console.error(chalk.red(`Error: ${e.message || e}`))
+          }
+        } finally {
+          activeAbortController = null
         }
       }
     } finally {
@@ -332,5 +555,297 @@ modelsCmd
     console.log()
   })
 
+program
+  .command('optimize')
+  .description('Optimize a specific target file or directory using self-optimizing agents')
+  .option('--target <path>', 'Path to file or directory to optimize')
+  .option('--focus <focus>', 'Optimization focus: performance, cleanup, or security', 'performance')
+  .option('--dry-run', 'Generate the plan but do not execute changes')
+  .option('--auto-approve', 'Automatically approve all optimization changes without manual feedback')
+  .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
+  .action(async (options: { target?: string; focus: 'performance' | 'cleanup' | 'security'; dryRun?: boolean; autoApprove?: boolean; cwd: string }) => {
+    const targetPath = options.target
+    if (!targetPath) {
+      console.error(chalk.red('Error: --target option is required.'))
+      process.exit(1)
+    }
+
+    console.log(chalk.bold.blue(`Starting optimizer on: ${targetPath} (focus: ${options.focus})`))
+
+    const { runtime, storage } = createDefaultNexusRuntime()
+    setNexusStorage(storage)
+
+    // Wrap storage.appendEvent to render events in real-time
+    const originalAppendEvent = storage.appendEvent.bind(storage)
+    storage.appendEvent = async (sessionId, event) => {
+      await originalAppendEvent(sessionId, event)
+      renderEvent(event)
+    }
+
+    const sessionId = createId('session')
+    const prompt = `Optimize the file or directory at "${targetPath}" focusing on ${options.focus}. Please compile and verify correctness.`
+
+    if (options.dryRun) {
+      console.log(chalk.yellow('Dry-run mode: planning phase only.'))
+      try {
+        const stepRunner = createRuntimeAgentStepRunner({
+          cwd: options.cwd,
+          runtimeFactory: async () => runtime,
+        })
+
+        const plannerOutput = await stepRunner<{ sessionId: string; goal: string; queueId: string; context?: string }, {
+          summary: string
+          tasks: Array<{
+            title: string
+            description?: string
+            dependsOn?: string[]
+            metadata?: Record<string, unknown>
+          }>
+        }>({
+          roleDefinition: PLANNER_ROLE,
+          input: {
+            sessionId,
+            goal: prompt,
+            queueId: sessionId,
+            context: `Cwd: ${options.cwd}`,
+          },
+        })
+
+        console.log(chalk.green.bold('\n--- Optimization Plan ---'))
+        console.log(chalk.white(plannerOutput.summary))
+        console.log(chalk.cyan.bold('\nProposed Tasks:'))
+        plannerOutput.tasks.forEach((t, i) => {
+          console.log(chalk.white(`  ${i + 1}. [${t.title}]` + (t.description ? `: ${t.description}` : '')))
+          if (t.dependsOn && t.dependsOn.length > 0) {
+            console.log(chalk.dim(`     Depends on: ${t.dependsOn.join(', ')}`))
+          }
+        })
+        console.log(chalk.yellow('\nDry-run: exiting without executing changes.'))
+      } catch (err) {
+        console.error(chalk.red('Failed during dry-run planning:'), err)
+      } finally {
+        await storage.close?.()
+      }
+      return
+    }
+
+    try {
+      const stepRunner = createRuntimeAgentStepRunner({
+        cwd: options.cwd,
+        runtimeFactory: async () => runtime,
+      })
+
+      const finalSession = await runAgentLoop({
+        sessionId,
+        cwd: options.cwd,
+        prompt,
+        stepRunner,
+        role: 'optimizer',
+        autoApprove: options.autoApprove,
+      })
+
+      if (finalSession.phase === 'completed') {
+        console.log(chalk.green.bold('\n✓ Optimization successfully completed!'))
+      } else {
+        console.log(chalk.red.bold(`\n✗ Optimization failed: ${finalSession.error || finalSession.failureReason || 'Unknown error'}`))
+      }
+    } catch (err) {
+      console.error(chalk.red('\nOptimizer encountered an uncaught error:'), err)
+    } finally {
+      await storage.close?.()
+    }
+  })
+
 await program.parseAsync(process.argv)
 flushStartupTrace()
+
+async function runSessionFlow(
+  prompt: string,
+  cwd: string,
+  url: string | undefined,
+  rl: readline.Interface,
+  abortController: AbortController
+): Promise<void> {
+  const sessionId = createId('session')
+
+  if (url) {
+    const wsUrl = url.replace(/^http/, 'ws') + '/v1/stream'
+    const wsModule = await (new Function("return import('ws')")())
+    const WebSocketCtor = (globalThis as any).WebSocket || wsModule.default
+
+    return new Promise<void>((resolve, reject) => {
+      let socket: any
+      
+      const onAbort = () => {
+        if (socket) {
+          try {
+            socket.close()
+          } catch {}
+        }
+        new NexusClient({ baseUrl: url }).cancelSession(sessionId).catch(() => {})
+        reject(new Error('Aborted'))
+      }
+
+      if (abortController.signal.aborted) {
+        onAbort()
+        return
+      }
+      abortController.signal.addEventListener('abort', onAbort)
+
+      try {
+        const wsOpts: any = {}
+        const apiKey = process.env.NEXUS_API_KEY
+        if (apiKey) {
+          wsOpts.headers = {
+            'X-Nexus-API-Key': apiKey,
+          }
+        }
+        socket = new WebSocketCtor(wsUrl, wsOpts)
+      } catch (err) {
+        abortController.signal.removeEventListener('abort', onAbort)
+        reject(err)
+        return
+      }
+
+      socket.addEventListener('open', () => {
+        socket.send(JSON.stringify({ prompt, cwd, sessionId }))
+      })
+
+      socket.addEventListener('message', async (event: any) => {
+        try {
+          const data = JSON.parse(event.data)
+          if (data.type === 'permission_request') {
+            renderEvent(data)
+            try {
+              const answer = await rl.question(chalk.yellow('Approve tool execution? [y/n] '), {
+                signal: abortController.signal,
+              })
+              const approved = ['y', 'yes'].includes(answer.trim().toLowerCase())
+              if (socket.readyState === 1 /* OPEN */) {
+                socket.send(JSON.stringify({
+                  type: 'permission_response',
+                  sessionId: data.sessionId,
+                  toolUseId: data.toolUseId,
+                  approved,
+                }))
+              }
+            } catch (err: any) {
+              if (err.name === 'AbortError') {
+                // User aborted during prompt
+              } else {
+                reject(err)
+              }
+            }
+          } else {
+            renderEvent(data)
+            if (data.type === 'result' || data.type === 'error') {
+              abortController.signal.removeEventListener('abort', onAbort)
+              socket.close()
+              resolve()
+            }
+          }
+        } catch (err) {
+          abortController.signal.removeEventListener('abort', onAbort)
+          reject(err)
+        }
+      })
+
+      socket.addEventListener('close', () => {
+        abortController.signal.removeEventListener('abort', onAbort)
+        resolve()
+      })
+
+      socket.addEventListener('error', (err: any) => {
+        abortController.signal.removeEventListener('abort', onAbort)
+        console.error(chalk.red(`WebSocket error: ${err.message || err}`))
+        reject(err)
+      })
+    })
+  } else {
+    fs.mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true })
+    const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+    const { runtime, storage } = createDefaultNexusRuntime({ storagePath })
+    const originalAppendEvent = storage.appendEvent.bind(storage)
+
+    storage.appendEvent = async (sid, ev) => {
+      await originalAppendEvent(sid, ev)
+      if (ev.type === 'permission_request') {
+        renderEvent(ev)
+        try {
+          const answer = await rl.question(chalk.yellow('Approve tool execution? [y/n] '), {
+            signal: abortController.signal,
+          })
+          const approved = ['y', 'yes'].includes(answer.trim().toLowerCase())
+          PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, { approved })
+        } catch (err: any) {
+          if (err.name === 'AbortError') {
+            PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, {
+              approved: false,
+              reason: 'Cancelled by user',
+            })
+          } else {
+            throw err
+          }
+        }
+      } else {
+        renderEvent(ev)
+      }
+    }
+
+    const session = {
+      sessionId,
+      cwd,
+      prompt,
+      phase: 'executing' as const,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: [],
+    }
+    await storage.saveSession(session)
+
+    try {
+      const configManager = ConfigManager.getInstance()
+      const settings = configManager.resolveSettings()
+      const requestId = createId('req')
+      const budget = process.env.BABEL_O_THINKING_BUDGET
+        ? parseInt(process.env.BABEL_O_THINKING_BUDGET, 10)
+        : undefined
+
+      for await (const event of runtime.executeStream({
+        sessionId,
+        prompt,
+        cwd,
+        signal: abortController.signal,
+        requestId,
+        model: settings.modelId,
+        budget,
+      })) {
+        await storage.appendEvent(sessionId, event)
+      }
+    } catch (err: any) {
+      if (err.message !== 'Aborted' && err.name !== 'AbortError') {
+        throw err
+      }
+    } finally {
+      const finalSession = await storage.getSession(sessionId, { includeEvents: false })
+      if (finalSession) {
+        if (abortController.signal.aborted) {
+          finalSession.phase = 'cancelled'
+        } else {
+          const eventsResult = await storage.listEvents(sessionId, { limit: 100 })
+          const events = eventsResult.events
+          const errorEvent = events.findLast(e => e.type === 'error')
+          const resultEvent = events.findLast(e => e.type === 'result')
+          const succeeded = !errorEvent && resultEvent?.type === 'result' && resultEvent.success
+          finalSession.phase = succeeded ? 'completed' : 'failed'
+          if (resultEvent?.type === 'result') finalSession.result = resultEvent.message
+          if (errorEvent?.type === 'error') finalSession.error = errorEvent.message
+        }
+        finalSession.updatedAt = new Date().toISOString()
+        await storage.saveSession(finalSession)
+      }
+      await storage.close?.()
+    }
+  }
+}
+

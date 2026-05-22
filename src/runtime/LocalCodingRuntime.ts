@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
-import { createId } from '../shared/id.js'
+import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { truncateToolOutput } from '../tools/output.js'
 import type {
@@ -9,6 +9,10 @@ import type {
   RuntimeExecuteOptions,
   RuntimeToolAuditEntry,
 } from './Runtime.js'
+import { checkOptimizerSafety } from './safetyCheck.js'
+import { PendingPermissionRegistry } from '../shared/session.js'
+import type { NexusStorage } from '../storage/Storage.js'
+
 
 type ParsedIntent =
   | { kind: 'tool'; toolName: string; input: unknown }
@@ -23,6 +27,7 @@ export class LocalCodingRuntime implements NexusRuntime {
   constructor(
     private readonly tools: Map<string, AnyTool>,
     private readonly toolPolicy: ToolPolicy = allowAllTools(),
+    private readonly storage?: NexusStorage,
   ) {}
 
   listTools(): RuntimeToolAuditEntry[] {
@@ -41,108 +46,198 @@ export class LocalCodingRuntime implements NexusRuntime {
       type: 'session_started',
       ...eventBase(options.sessionId),
       cwd: options.cwd,
+      requestId: options.requestId,
+      model: options.model,
+      budget: options.budget,
     }
 
-    const intent = parseIntent(options.prompt)
-    if (intent.kind === 'text') {
+    try {
+      const intent = parseIntent(options.prompt)
+      if (intent.kind === 'text') {
+        yield {
+          type: 'assistant_delta',
+          ...eventBase(options.sessionId),
+          text: intent.text,
+        }
+        yield {
+          type: 'result',
+          ...eventBase(options.sessionId),
+          success: true,
+          message: intent.text,
+        }
+        return
+      }
+
+      const tool = this.tools.get(intent.toolName)
+      if (!tool) {
+        yield {
+          type: 'error',
+          ...eventBase(options.sessionId),
+          code: 'TOOL_NOT_FOUND',
+          message: `Tool not found: ${intent.toolName}`,
+        }
+        return
+      }
+
+      if (!this.toolPolicy.isAllowed(tool)) {
+        const message = `Tool denied by Nexus policy: ${tool.name}`
+        yield {
+          type: 'tool_denied',
+          ...eventBase(options.sessionId),
+          name: tool.name,
+          risk: tool.risk,
+          message,
+        }
+        yield {
+          type: 'result',
+          ...eventBase(options.sessionId),
+          success: false,
+          message,
+        }
+        return
+      }
+
+      const parsed = tool.inputSchema.safeParse(intent.input)
+      if (!parsed.success) {
+        yield {
+          type: 'error',
+          ...eventBase(options.sessionId),
+          code: 'INVALID_TOOL_INPUT',
+          message: z.prettifyError(parsed.error),
+        }
+        return
+      }
+
+      const safetyCheck = checkOptimizerSafety(tool.name, parsed.data, options.role)
+      if (!safetyCheck.allowed) {
+        const message = safetyCheck.reason!
+        yield {
+          type: 'tool_denied',
+          ...eventBase(options.sessionId),
+          name: tool.name,
+          risk: tool.risk,
+          message,
+        }
+        yield {
+          type: 'result',
+          ...eventBase(options.sessionId),
+          success: false,
+          message,
+        }
+        return
+      }
+
+      const toolUseId = createId('tool')
+      yield {
+        type: 'tool_started',
+        ...eventBase(options.sessionId),
+        toolUseId,
+        name: tool.name,
+        input: parsed.data,
+      }
+
+      // Check if the tool requires authorization.
+      if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
+        yield {
+          type: 'permission_request',
+          ...eventBase(options.sessionId),
+          toolUseId,
+          name: tool.name,
+          input: parsed.data,
+          risk: tool.risk,
+          message: `Tool ${tool.name} requires user permission to run.`,
+        }
+
+        const decision = await PendingPermissionRegistry.getInstance().register(
+          options.sessionId,
+          toolUseId
+        )
+
+        if (this.storage) {
+          await this.storage.savePermissionAudit({
+            auditId: createId('audit'),
+            sessionId: options.sessionId,
+            toolUseId,
+            toolName: tool.name,
+            toolRisk: tool.risk,
+            toolInput: parsed.data,
+            decision: decision.approved ? 'approved' : 'denied',
+            reason: decision.reason,
+            timestamp: nowIso(),
+          })
+        }
+
+        yield {
+          type: 'permission_response',
+          ...eventBase(options.sessionId),
+          toolUseId,
+          approved: decision.approved,
+          reason: decision.reason,
+        }
+
+        if (!decision.approved) {
+          const denyMessage = decision.reason || `Tool execution denied by user: ${tool.name}`
+          yield {
+            type: 'tool_denied',
+            ...eventBase(options.sessionId),
+            name: tool.name,
+            risk: tool.risk,
+            message: denyMessage,
+          }
+          yield {
+            type: 'result',
+            ...eventBase(options.sessionId),
+            success: false,
+            message: denyMessage,
+          }
+          return
+        }
+      }
+
+      const result = await executeToolSafely(tool, parsed.data, options)
+      if (result.kind === 'error') {
+        yield {
+          type: 'error',
+          ...eventBase(options.sessionId),
+          code: result.code,
+          message: result.message,
+        }
+        return
+      }
+
+      yield {
+        type: 'tool_completed',
+        ...eventBase(options.sessionId),
+        toolUseId,
+        name: tool.name,
+        success: result.success,
+        output: result.output,
+        truncated: result.truncated,
+        originalBytes: result.originalBytes,
+      }
+
+      const summary = result.success
+        ? `${tool.name} completed.`
+        : `${tool.name} failed.`
       yield {
         type: 'assistant_delta',
         ...eventBase(options.sessionId),
-        text: intent.text,
+        text: summary,
       }
       yield {
         type: 'result',
         ...eventBase(options.sessionId),
-        success: true,
-        message: intent.text,
+        success: result.success,
+        message: summary,
       }
-      return
-    }
-
-    const tool = this.tools.get(intent.toolName)
-    if (!tool) {
+    } catch (err: any) {
+      const isTimeout = options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError'
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
-        code: 'TOOL_NOT_FOUND',
-        message: `Tool not found: ${intent.toolName}`,
+        code: isTimeout ? 'REQUEST_TIMEOUT' : 'PROVIDER_ERROR',
+        message: err instanceof Error ? err.message : String(err),
       }
-      return
-    }
-
-    if (!this.toolPolicy.isAllowed(tool)) {
-      const message = `Tool denied by Nexus policy: ${tool.name}`
-      yield {
-        type: 'tool_denied',
-        ...eventBase(options.sessionId),
-        name: tool.name,
-        risk: tool.risk,
-        message,
-      }
-      yield {
-        type: 'result',
-        ...eventBase(options.sessionId),
-        success: false,
-        message,
-      }
-      return
-    }
-
-    const parsed = tool.inputSchema.safeParse(intent.input)
-    if (!parsed.success) {
-      yield {
-        type: 'error',
-        ...eventBase(options.sessionId),
-        code: 'INVALID_TOOL_INPUT',
-        message: z.prettifyError(parsed.error),
-      }
-      return
-    }
-
-    const toolUseId = createId('tool')
-    yield {
-      type: 'tool_started',
-      ...eventBase(options.sessionId),
-      toolUseId,
-      name: tool.name,
-      input: parsed.data,
-    }
-
-    const result = await executeToolSafely(tool, parsed.data, options)
-    if (result.kind === 'error') {
-      yield {
-        type: 'error',
-        ...eventBase(options.sessionId),
-        code: result.code,
-        message: result.message,
-      }
-      return
-    }
-
-    yield {
-      type: 'tool_completed',
-      ...eventBase(options.sessionId),
-      toolUseId,
-      name: tool.name,
-      success: result.success,
-      output: result.output,
-      truncated: result.truncated,
-      originalBytes: result.originalBytes,
-    }
-
-    const summary = result.success
-      ? `${tool.name} completed.`
-      : `${tool.name} failed.`
-    yield {
-      type: 'assistant_delta',
-      ...eventBase(options.sessionId),
-      text: summary,
-    }
-    yield {
-      type: 'result',
-      ...eventBase(options.sessionId),
-      success: result.success,
-      message: summary,
     }
   }
 }
@@ -203,6 +298,17 @@ export function allowAllTools(): ToolPolicy {
     },
     describe() {
       return { mode: 'allow_all' }
+    },
+  }
+}
+
+export function denyByDefaultTools(): ToolPolicy {
+  return {
+    isAllowed(tool) {
+      return tool.risk === 'read' || tool.risk === 'task'
+    },
+    describe() {
+      return { mode: 'allowlist', allowedTools: ['read', 'grep', 'glob', 'task'] }
     },
   }
 }

@@ -5,9 +5,14 @@ export type RuntimeExecuteOptions = {
   sessionId: string
   prompt: string
   cwd: string
+  role?: string
   signal?: AbortSignal
   maxToolOutputBytes?: number
   bashMaxBufferBytes?: number
+  skipPermissionCheck?: boolean
+  requestId?: string
+  model?: string
+  budget?: number
 }
 
 export interface NexusRuntime {

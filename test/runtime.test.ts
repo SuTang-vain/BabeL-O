@@ -297,7 +297,7 @@ test('session detail uses recent events and events endpoint paginates history', 
 test('execute timeout aborts long-running tools and records metrics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-timeout`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -308,7 +308,7 @@ test('execute timeout aborts long-running tools and records metrics', async () =
     const response = await app.inject({
       method: 'POST',
       url: '/v1/execute',
-      payload: { prompt: 'bash "sleep 1"', cwd },
+      payload: { prompt: 'bash "sleep 1"', cwd, skipPermissionCheck: true },
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
@@ -336,7 +336,7 @@ test('execute timeout aborts long-running tools and records metrics', async () =
 test('execute concurrency gate rejects excess work quickly', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-busy`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -348,7 +348,7 @@ test('execute concurrency gate rejects excess work quickly', async () => {
     const first = app.inject({
       method: 'POST',
       url: '/v1/execute',
-      payload: { prompt: 'bash "sleep 0.2"', cwd },
+      payload: { prompt: 'bash "sleep 0.2"', cwd, skipPermissionCheck: true },
     })
     await new Promise(resolve => setTimeout(resolve, 20))
     const rejected = await app.inject({
@@ -411,7 +411,7 @@ test('tool output is truncated before it is stored in events', async () => {
 test('bash max buffer is configurable and fails safely on excessive output', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-buffer`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -422,7 +422,7 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
     const response = await app.inject({
       method: 'POST',
       url: '/v1/execute',
-      payload: { prompt: 'bash "printf 1234567890123456789012345678901234567890"', cwd },
+      payload: { prompt: 'bash "printf 1234567890123456789012345678901234567890"', cwd, skipPermissionCheck: true },
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
@@ -473,7 +473,7 @@ test('websocket stream executes prompts and records stream metrics', async () =>
 test('websocket stream timeout aborts long-running tools', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream-timeout`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -487,7 +487,7 @@ test('websocket stream timeout aborts long-running tools', async () => {
     ws.on('message', (data: Buffer) => {
       events.push(JSON.parse(String(data)))
     })
-    ws.send(JSON.stringify({ prompt: 'bash "sleep 1"', cwd }))
+    ws.send(JSON.stringify({ prompt: 'bash "sleep 1"', cwd, skipPermissionCheck: true }))
     await waitFor(() =>
       events.some(event => event.type === 'error' && event.code === 'REQUEST_TIMEOUT'),
     )
@@ -508,7 +508,7 @@ test('websocket stream timeout aborts long-running tools', async () => {
 test('websocket stream concurrency gate rejects excess work', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream-busy`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -519,7 +519,7 @@ test('websocket stream concurrency gate rejects excess work', async () => {
   try {
     await app.ready()
     const first = await app.injectWS('/v1/stream')
-    first.send(JSON.stringify({ prompt: 'bash "sleep 0.2"', cwd }))
+    first.send(JSON.stringify({ prompt: 'bash "sleep 0.2"', cwd, skipPermissionCheck: true }))
     await new Promise(resolve => setTimeout(resolve, 20))
 
     const second = await app.injectWS('/v1/stream')
@@ -539,6 +539,84 @@ test('websocket stream concurrency gate rejects excess work', async () => {
       url: '/v1/runtime/metrics',
     })
     assert.equal(metricsResponse.json().stream.rejectedCount, 1)
+  } finally {
+    await app.close()
+  }
+})
+
+test('bash tool session CWD retention', async () => {
+  const baseCwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-cwd`)
+  await mkdir(baseCwd, { recursive: true })
+  const subDir = join(baseCwd, 'sub')
+  await mkdir(subDir, { recursive: true })
+
+  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: baseCwd })
+  try {
+    const sessionId = `test-session-${Date.now()}`
+
+    // 1. Run "cd sub && pwd" to navigate to the subdirectory
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "cd sub && pwd"', cwd: baseCwd, sessionId, skipPermissionCheck: true },
+    })
+    assert.equal(res1.statusCode, 200)
+    const body1 = res1.json()
+    assert.equal(body1.success, true)
+    const event1 = body1.events.find((e: any) => e.type === 'tool_completed' && e.name === 'Bash')
+    assert.ok(event1)
+    assert.match(event1.output.stdout, /sub/)
+
+    // 2. Run a simple "pwd" and verify CWD is retained as the subdirectory
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "pwd"', cwd: baseCwd, sessionId, skipPermissionCheck: true },
+    })
+    assert.equal(res2.statusCode, 200)
+    const body2 = res2.json()
+    assert.equal(body2.success, true)
+    const event2 = body2.events.find((e: any) => e.type === 'tool_completed' && e.name === 'Bash')
+    assert.ok(event2)
+    assert.match(event2.output.stdout, /sub/)
+
+    // 3. Execute a failing command, and make sure that subsequent CWD is still preserved as subDir
+    const res3 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "cd nonexistent && pwd"', cwd: baseCwd, sessionId, skipPermissionCheck: true },
+    })
+    assert.equal(res3.statusCode, 200)
+    const body3 = res3.json()
+    assert.equal(body3.success, false) // Should fail as cd nonexistent fails
+
+    // Verify it is still subDir after the failure
+    const res4 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "pwd"', cwd: baseCwd, sessionId, skipPermissionCheck: true },
+    })
+    assert.equal(res4.statusCode, 200)
+    const body4 = res4.json()
+    assert.equal(body4.success, true)
+    const event4 = body4.events.find((e: any) => e.type === 'tool_completed' && e.name === 'Bash')
+    assert.ok(event4)
+    assert.match(event4.output.stdout, /sub/)
+
+    // 4. Verify different session IDs have isolated CWDs
+    const otherSessionId = `other-session-${Date.now()}`
+    const res5 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "pwd"', cwd: baseCwd, sessionId: otherSessionId, skipPermissionCheck: true },
+    })
+    assert.equal(res5.statusCode, 200)
+    const body5 = res5.json()
+    const event5 = body5.events.find((e: any) => e.type === 'tool_completed' && e.name === 'Bash')
+    assert.ok(event5)
+    // The other session should run in baseCwd, which does not contain 'sub'
+    assert.ok(!event5.output.stdout.includes('sub'))
   } finally {
     await app.close()
   }

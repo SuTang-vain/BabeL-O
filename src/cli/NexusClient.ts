@@ -2,16 +2,19 @@ import type { NexusEvent } from '../shared/events.js'
 
 export type NexusClientOptions = {
   baseUrl?: string
+  apiKey?: string
 }
 
 export class NexusClient {
   private readonly baseUrl: string
+  private readonly apiKey?: string
 
   constructor(options: NexusClientOptions = {}) {
     this.baseUrl =
       options.baseUrl ??
       process.env.NEXUS_URL ??
       `http://${process.env.NEXUS_HOST ?? '127.0.0.1'}:${process.env.NEXUS_PORT ?? '3000'}`
+    this.apiKey = options.apiKey ?? process.env.NEXUS_API_KEY
   }
 
   async status(): Promise<unknown> {
@@ -78,8 +81,36 @@ export class NexusClient {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/cancel`, {})
   }
 
+  async approvePermission(sessionId: string, toolUseId: string): Promise<unknown> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/approve`, {
+      toolUseId,
+    })
+  }
+
+  async denyPermission(
+    sessionId: string,
+    toolUseId: string,
+    reason?: string,
+  ): Promise<unknown> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/deny`, {
+      toolUseId,
+      reason,
+    })
+  }
+
+  private getHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {}
+    if (this.apiKey) {
+      headers['X-Nexus-API-Key'] = this.apiKey
+    }
+    return headers
+  }
+
   private async getJson(path: string): Promise<unknown> {
-    const response = await fetch(new URL(path, this.baseUrl))
+    const headers = this.getHeaders()
+    const response = await fetch(new URL(path, this.baseUrl), {
+      headers,
+    })
     if (!response.ok) {
       throw new Error(`GET ${path} failed: ${response.status}`)
     }
@@ -87,9 +118,11 @@ export class NexusClient {
   }
 
   private async postJson(path: string, body: unknown): Promise<unknown> {
+    const headers = this.getHeaders()
+    headers['content-type'] = 'application/json'
     const response = await fetch(new URL(path, this.baseUrl), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(body),
     })
     if (!response.ok) {

@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
-import { createId } from '../shared/id.js'
+import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { truncateToolOutput } from '../tools/output.js'
 import type {
@@ -10,6 +10,8 @@ import type {
   RuntimeToolAuditEntry,
 } from './Runtime.js'
 import type { ToolPolicy } from './LocalCodingRuntime.js'
+import { checkOptimizerSafety } from './safetyCheck.js'
+import { PendingPermissionRegistry } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
 import type {
@@ -18,6 +20,7 @@ import type {
   ContentBlock,
 } from '../providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../shared/config.js'
+
 
 export class LLMCodingRuntime implements NexusRuntime {
   constructor(
@@ -43,264 +46,353 @@ export class LLMCodingRuntime implements NexusRuntime {
       type: 'session_started',
       ...eventBase(options.sessionId),
       cwd: options.cwd,
+      requestId: options.requestId,
+      model: options.model,
+      budget: options.budget,
     }
 
-    // 1. Resolve connection and credential settings
-    const settings = this.configManager.resolveSettings()
+    try {
+      // 1. Resolve connection and credential settings
+      const settings = this.configManager.resolveSettings()
 
-    // 2. Load previous session events from storage (if any)
-    let previousEvents: NexusEvent[] = []
-    if (this.storage) {
-      try {
-        const result = await this.storage.listEvents(options.sessionId, {
-          order: 'asc',
-          limit: 1000,
-        })
-        previousEvents = result?.events || []
-      } catch {
-        // Fallback to empty history on storage error
-      }
-    }
-
-    // Strip optional [1m] tag from canonical model name
-    const cleanedModelId = settings.modelId.replace(/\[1m\]$/i, '')
-    const adapter = getAdapter(settings.providerId)
-
-    // Build the messages history
-    const messages = mapEventsToMessages(previousEvents, options.prompt)
-
-    // Parse thinking budget config from environments
-    const thinkingBudgetEnv =
-      process.env.BABEL_O_THINKING_BUDGET || process.env.ANTHROPIC_THINKING_BUDGET
-    const thinkingBudget = thinkingBudgetEnv ? parseInt(thinkingBudgetEnv, 10) : undefined
-
-    let loopCount = 0
-    const maxLoops = 25
-
-    while (loopCount < maxLoops) {
-      loopCount++
-
-      if (options.signal?.aborted) {
-        throw new Error('Aborted')
+      // 2. Load previous session events from storage (if any)
+      let previousEvents: NexusEvent[] = []
+      if (this.storage) {
+        try {
+          const result = await this.storage.listEvents(options.sessionId, {
+            order: 'asc',
+            limit: 1000,
+          })
+          previousEvents = result?.events || []
+        } catch {
+          // Fallback to empty history on storage error
+        }
       }
 
-      // Convert tool registry definitions to JSON Schema objects using Zod native export
-      const toolsList = [...this.tools.values()].map(tool => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: z.toJSONSchema(tool.inputSchema),
-      }))
+      // Strip optional [1m] tag from canonical model name
+      const activeModel = options.model || settings.modelId
+      const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
+      const adapter = getAdapter(settings.providerId)
 
-      const queryParams: ModelQueryParams = {
-        model: cleanedModelId,
-        systemPrompt: buildSystemPrompt(options),
-        messages,
-        tools: toolsList,
-        enablePromptCaching: settings.providerId === 'anthropic',
-        ...(thinkingBudget &&
-          thinkingBudget > 0 && {
-            thinking: { budgetTokens: thinkingBudget },
-          }),
-      }
+      // Build the messages history
+      const messages = mapEventsToMessages(previousEvents, options.prompt)
 
-      const adapterOptions = {
-        signal: options.signal,
-        apiKey: settings.apiKey,
-        baseUrl: settings.baseUrl,
-      }
+      // Parse thinking budget config from environments or options.budget
+      const thinkingBudgetEnv =
+        process.env.BABEL_O_THINKING_BUDGET || process.env.ANTHROPIC_THINKING_BUDGET
+      const thinkingBudget = options.budget !== undefined ? options.budget : (thinkingBudgetEnv ? parseInt(thinkingBudgetEnv, 10) : undefined)
 
-      let currentAssistantText = ''
-      const currentToolCalls: {
-        id: string
-        name: string
-        partialInput: string
-        input?: unknown
-      }[] = []
+      let loopCount = 0
+      const maxLoops = 25
 
-      // Stream LLM response
-      const stream = adapter.queryStream(queryParams, adapterOptions)
-      for await (const delta of stream) {
+      while (loopCount < maxLoops) {
+        loopCount++
+
         if (options.signal?.aborted) {
           throw new Error('Aborted')
         }
 
-        if (delta.type === 'text') {
-          currentAssistantText += delta.text
-          yield {
-            type: 'assistant_delta',
-            ...eventBase(options.sessionId),
-            text: delta.text,
+        // Convert tool registry definitions to JSON Schema objects using Zod native export
+        const toolsList = [...this.tools.values()].map(tool => ({
+          name: tool.name,
+          description: tool.description,
+          inputSchema: z.toJSONSchema(tool.inputSchema),
+        }))
+
+        const queryParams: ModelQueryParams = {
+          model: cleanedModelId,
+          systemPrompt: buildSystemPrompt(options),
+          messages,
+          tools: toolsList,
+          enablePromptCaching: settings.providerId === 'anthropic',
+          ...(thinkingBudget &&
+            thinkingBudget > 0 && {
+              thinking: { budgetTokens: thinkingBudget },
+            }),
+        }
+
+        const adapterOptions = {
+          signal: options.signal,
+          apiKey: settings.apiKey,
+          baseUrl: settings.baseUrl,
+        }
+
+        let currentAssistantText = ''
+        const currentToolCalls: {
+          id: string
+          name: string
+          partialInput: string
+          input?: unknown
+        }[] = []
+
+        // Stream LLM response
+        const stream = adapter.queryStream(queryParams, adapterOptions)
+        for await (const delta of stream) {
+          if (options.signal?.aborted) {
+            throw new Error('Aborted')
           }
-        } else if (delta.type === 'thinking') {
-          yield {
-            type: 'thinking_delta',
-            ...eventBase(options.sessionId),
-            text: delta.text,
+
+          if (delta.type === 'text') {
+            currentAssistantText += delta.text
+            yield {
+              type: 'assistant_delta',
+              ...eventBase(options.sessionId),
+              text: delta.text,
+            }
+          } else if (delta.type === 'thinking') {
+            yield {
+              type: 'thinking_delta',
+              ...eventBase(options.sessionId),
+              text: delta.text,
+            }
+          } else if (delta.type === 'tool_use_start') {
+            currentToolCalls.push({
+              id: delta.id,
+              name: delta.name,
+              partialInput: '',
+            })
+          } else if (delta.type === 'tool_use_delta') {
+            const toolCall = currentToolCalls.find(tc => tc.id === delta.id)
+            if (toolCall) {
+              toolCall.partialInput += delta.inputDelta
+            }
+          } else if (delta.type === 'tool_use_end') {
+            const toolCall = currentToolCalls.find(tc => tc.id === delta.id)
+            if (toolCall) {
+              toolCall.input = delta.input
+            }
           }
-        } else if (delta.type === 'tool_use_start') {
-          currentToolCalls.push({
-            id: delta.id,
-            name: delta.name,
-            partialInput: '',
+        }
+
+        // Record assistant's turn in messages array
+        const assistantContent: ContentBlock[] = []
+        if (currentAssistantText) {
+          assistantContent.push({ type: 'text', text: currentAssistantText })
+        }
+        for (const tc of currentToolCalls) {
+          let resolvedInput = tc.input
+          if (resolvedInput === undefined && tc.partialInput) {
+            try {
+              resolvedInput = JSON.parse(tc.partialInput)
+            } catch {
+              resolvedInput = {}
+            }
+          }
+          assistantContent.push({
+            type: 'tool_use',
+            id: tc.id,
+            name: tc.name,
+            input: resolvedInput,
           })
-        } else if (delta.type === 'tool_use_delta') {
-          const toolCall = currentToolCalls.find(tc => tc.id === delta.id)
-          if (toolCall) {
-            toolCall.partialInput += delta.inputDelta
-          }
-        } else if (delta.type === 'tool_use_end') {
-          const toolCall = currentToolCalls.find(tc => tc.id === delta.id)
-          if (toolCall) {
-            toolCall.input = delta.input
-          }
         }
-      }
 
-      // Record assistant's turn in messages array
-      const assistantContent: ContentBlock[] = []
-      if (currentAssistantText) {
-        assistantContent.push({ type: 'text', text: currentAssistantText })
-      }
-      for (const tc of currentToolCalls) {
-        let resolvedInput = tc.input
-        if (resolvedInput === undefined && tc.partialInput) {
-          try {
-            resolvedInput = JSON.parse(tc.partialInput)
-          } catch {
-            resolvedInput = {}
-          }
-        }
-        assistantContent.push({
-          type: 'tool_use',
-          id: tc.id,
-          name: tc.name,
-          input: resolvedInput,
+        messages.push({
+          role: 'assistant',
+          content: assistantContent.length > 0 ? assistantContent : currentAssistantText,
         })
-      }
 
-      messages.push({
-        role: 'assistant',
-        content: assistantContent.length > 0 ? assistantContent : currentAssistantText,
-      })
-
-      // If no tool call was issued, we yield the final result and terminate loop
-      if (currentToolCalls.length === 0) {
-        yield {
-          type: 'result',
-          ...eventBase(options.sessionId),
-          success: true,
-          message: currentAssistantText,
-        }
-        return
-      }
-
-      // Execute requested tools
-      const toolResultsContent: ContentBlock[] = []
-      for (const tc of currentToolCalls) {
-        let resolvedInput = tc.input
-        if (resolvedInput === undefined && tc.partialInput) {
-          try {
-            resolvedInput = JSON.parse(tc.partialInput)
-          } catch {
-            resolvedInput = {}
-          }
-        }
-
-        const tool = this.tools.get(tc.name)
-        if (!tool) {
-          const msg = `Tool not found: ${tc.name}`
-          yield {
-            type: 'error',
-            ...eventBase(options.sessionId),
-            code: 'TOOL_NOT_FOUND',
-            message: msg,
-          }
-          return
-        }
-
-        yield {
-          type: 'tool_started',
-          ...eventBase(options.sessionId),
-          toolUseId: tc.id,
-          name: tc.name,
-          input: resolvedInput,
-        }
-
-        if (!this.toolPolicy.isAllowed(tool)) {
-          const message = `Tool denied by Nexus policy: ${tool.name}`
-          yield {
-            type: 'tool_denied',
-            ...eventBase(options.sessionId),
-            name: tool.name,
-            risk: tool.risk,
-            message,
-          }
+        // If no tool call was issued, we yield the final result and terminate loop
+        if (currentToolCalls.length === 0) {
           yield {
             type: 'result',
             ...eventBase(options.sessionId),
-            success: false,
-            message,
+            success: true,
+            message: currentAssistantText,
           }
           return
         }
 
-        const parsed = tool.inputSchema.safeParse(resolvedInput)
-        if (!parsed.success) {
+        // Execute requested tools
+        const toolResultsContent: ContentBlock[] = []
+        for (const tc of currentToolCalls) {
+          let resolvedInput = tc.input
+          if (resolvedInput === undefined && tc.partialInput) {
+            try {
+              resolvedInput = JSON.parse(tc.partialInput)
+            } catch {
+              resolvedInput = {}
+            }
+          }
+
+          const tool = this.tools.get(tc.name)
+          if (!tool) {
+            const msg = `Tool not found: ${tc.name}`
+            yield {
+              type: 'error',
+              ...eventBase(options.sessionId),
+              code: 'TOOL_NOT_FOUND',
+              message: msg,
+            }
+            return
+          }
+
           yield {
-            type: 'error',
+            type: 'tool_started',
             ...eventBase(options.sessionId),
-            code: 'INVALID_TOOL_INPUT',
-            message: z.prettifyError(parsed.error),
+            toolUseId: tc.id,
+            name: tc.name,
+            input: resolvedInput,
           }
-          return
-        }
 
-        const result = await executeToolSafely(tool, parsed.data, options)
-        if (result.kind === 'error') {
+          if (!this.toolPolicy.isAllowed(tool)) {
+            const message = `Tool denied by Nexus policy: ${tool.name}`
+            yield {
+              type: 'tool_denied',
+              ...eventBase(options.sessionId),
+              name: tool.name,
+              risk: tool.risk,
+              message,
+            }
+            yield {
+              type: 'result',
+              ...eventBase(options.sessionId),
+              success: false,
+              message,
+            }
+            return
+          }
+
+          const parsed = tool.inputSchema.safeParse(resolvedInput)
+          if (!parsed.success) {
+            yield {
+              type: 'error',
+              ...eventBase(options.sessionId),
+              code: 'INVALID_TOOL_INPUT',
+              message: z.prettifyError(parsed.error),
+            }
+            return
+          }
+
+          const safetyCheck = checkOptimizerSafety(tool.name, parsed.data, options.role)
+          if (!safetyCheck.allowed) {
+            const message = safetyCheck.reason!
+            yield {
+              type: 'tool_denied',
+              ...eventBase(options.sessionId),
+              name: tool.name,
+              risk: tool.risk,
+              message,
+            }
+            yield {
+              type: 'result',
+              ...eventBase(options.sessionId),
+              success: false,
+              message,
+            }
+            return
+          }
+
+          // Check if the tool requires authorization.
+          if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
+            yield {
+              type: 'permission_request',
+              ...eventBase(options.sessionId),
+              toolUseId: tc.id,
+              name: tool.name,
+              input: parsed.data,
+              risk: tool.risk,
+              message: `Tool ${tool.name} requires user permission to run.`,
+            }
+
+            const decision = await PendingPermissionRegistry.getInstance().register(
+              options.sessionId,
+              tc.id
+            )
+
+            await this.storage.savePermissionAudit({
+              auditId: createId('audit'),
+              sessionId: options.sessionId,
+              toolUseId: tc.id,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput: parsed.data,
+              decision: decision.approved ? 'approved' : 'denied',
+              reason: decision.reason,
+              timestamp: nowIso(),
+            })
+
+            yield {
+              type: 'permission_response',
+              ...eventBase(options.sessionId),
+              toolUseId: tc.id,
+              approved: decision.approved,
+              reason: decision.reason,
+            }
+
+            if (!decision.approved) {
+              const denyMessage = decision.reason || `Tool execution denied by user: ${tool.name}`
+              yield {
+                type: 'tool_denied',
+                ...eventBase(options.sessionId),
+                name: tool.name,
+                risk: tool.risk,
+                message: denyMessage,
+              }
+              yield {
+                type: 'result',
+                ...eventBase(options.sessionId),
+                success: false,
+                message: denyMessage,
+              }
+              return
+            }
+          }
+
+          const result = await executeToolSafely(tool, parsed.data, options)
+          if (result.kind === 'error') {
+            yield {
+              type: 'error',
+              ...eventBase(options.sessionId),
+              code: result.code,
+              message: result.message,
+            }
+            return
+          }
+
           yield {
-            type: 'error',
+            type: 'tool_completed',
             ...eventBase(options.sessionId),
-            code: result.code,
-            message: result.message,
+            toolUseId: tc.id,
+            name: tool.name,
+            success: result.success,
+            output: result.output,
+            truncated: result.truncated,
+            originalBytes: result.originalBytes,
           }
-          return
+
+          const blockContent =
+            typeof result.output === 'string'
+              ? result.output
+              : JSON.stringify(result.output, null, 2)
+          toolResultsContent.push({
+            type: 'tool_result',
+            toolUseId: tc.id,
+            content: blockContent,
+            isError: !result.success,
+          })
         }
 
-        yield {
-          type: 'tool_completed',
-          ...eventBase(options.sessionId),
-          toolUseId: tc.id,
-          name: tool.name,
-          success: result.success,
-          output: result.output,
-          truncated: result.truncated,
-          originalBytes: result.originalBytes,
-        }
-
-        const blockContent =
-          typeof result.output === 'string'
-            ? result.output
-            : JSON.stringify(result.output, null, 2)
-        toolResultsContent.push({
-          type: 'tool_result',
-          toolUseId: tc.id,
-          content: blockContent,
-          isError: !result.success,
+        // Record tool results as a single user message
+        messages.push({
+          role: 'user',
+          content: toolResultsContent,
         })
       }
 
-      // Record tool results as a single user message
-      messages.push({
-        role: 'user',
-        content: toolResultsContent,
-      })
-    }
-
-    yield {
-      type: 'error',
-      ...eventBase(options.sessionId),
-      code: 'MAX_LOOPS_EXCEEDED',
-      message: `Execution exceeded maximum tool call iterations (${maxLoops}).`,
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'MAX_LOOPS_EXCEEDED',
+        message: `Execution exceeded maximum tool call iterations (${maxLoops}).`,
+      }
+    } catch (err: any) {
+      const isTimeout = options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError'
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: isTimeout ? 'REQUEST_TIMEOUT' : 'PROVIDER_ERROR',
+        message: err instanceof Error ? err.message : String(err),
+      }
     }
   }
 }

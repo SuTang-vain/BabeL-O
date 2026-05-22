@@ -262,6 +262,7 @@ describe('LLMCodingRuntime', () => {
         sessionId: 'test-session-tool',
         prompt: 'write text to file',
         cwd,
+        skipPermissionCheck: true,
       })
     )
 

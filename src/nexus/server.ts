@@ -1,8 +1,15 @@
-import { createNexusApp } from './app.js'
+import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
 
 const host = process.env.NEXUS_HOST ?? '127.0.0.1'
 const port = Number(process.env.NEXUS_PORT ?? 3000)
+
+try {
+  validateSecurityConfig(host, process.env.NEXUS_API_KEY)
+} catch (err: any) {
+  console.error(err.message)
+  process.exit(1)
+}
 const cwd = process.env.BABEL_O_WORKSPACE ?? process.cwd()
 const storagePath = process.env.NEXUS_STORAGE_PATH
 const allowedTools = parseAllowedTools(process.env.NEXUS_ALLOWED_TOOLS)
