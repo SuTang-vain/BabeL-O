@@ -1,0 +1,23 @@
+import type { NexusEvent } from '../shared/events.js'
+import type { ToolRisk } from '../tools/Tool.js'
+
+export type RuntimeExecuteOptions = {
+  sessionId: string
+  prompt: string
+  cwd: string
+  signal?: AbortSignal
+  maxToolOutputBytes?: number
+  bashMaxBufferBytes?: number
+}
+
+export interface NexusRuntime {
+  executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent>
+  listTools?(): RuntimeToolAuditEntry[]
+}
+
+export type RuntimeToolAuditEntry = {
+  name: string
+  description: string
+  risk: ToolRisk
+  allowed: boolean
+}

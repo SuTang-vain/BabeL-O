@@ -1,0 +1,284 @@
+import { z } from 'zod'
+import { errorMessage } from '../shared/errors.js'
+import { eventBase, type NexusEvent } from '../shared/events.js'
+import { createId } from '../shared/id.js'
+import type { AnyTool } from '../tools/Tool.js'
+import { truncateToolOutput } from '../tools/output.js'
+import type {
+  NexusRuntime,
+  RuntimeExecuteOptions,
+  RuntimeToolAuditEntry,
+} from './Runtime.js'
+
+type ParsedIntent =
+  | { kind: 'tool'; toolName: string; input: unknown }
+  | { kind: 'text'; text: string }
+
+export type ToolPolicy = {
+  isAllowed(tool: AnyTool): boolean
+  describe(): { mode: 'allow_all' | 'allowlist'; allowedTools?: string[] }
+}
+
+export class LocalCodingRuntime implements NexusRuntime {
+  constructor(
+    private readonly tools: Map<string, AnyTool>,
+    private readonly toolPolicy: ToolPolicy = allowAllTools(),
+  ) {}
+
+  listTools(): RuntimeToolAuditEntry[] {
+    return [...this.tools.values()]
+      .map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        risk: tool.risk,
+        allowed: this.toolPolicy.isAllowed(tool),
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    yield {
+      type: 'session_started',
+      ...eventBase(options.sessionId),
+      cwd: options.cwd,
+    }
+
+    const intent = parseIntent(options.prompt)
+    if (intent.kind === 'text') {
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: intent.text,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: intent.text,
+      }
+      return
+    }
+
+    const tool = this.tools.get(intent.toolName)
+    if (!tool) {
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'TOOL_NOT_FOUND',
+        message: `Tool not found: ${intent.toolName}`,
+      }
+      return
+    }
+
+    if (!this.toolPolicy.isAllowed(tool)) {
+      const message = `Tool denied by Nexus policy: ${tool.name}`
+      yield {
+        type: 'tool_denied',
+        ...eventBase(options.sessionId),
+        name: tool.name,
+        risk: tool.risk,
+        message,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message,
+      }
+      return
+    }
+
+    const parsed = tool.inputSchema.safeParse(intent.input)
+    if (!parsed.success) {
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'INVALID_TOOL_INPUT',
+        message: z.prettifyError(parsed.error),
+      }
+      return
+    }
+
+    const toolUseId = createId('tool')
+    yield {
+      type: 'tool_started',
+      ...eventBase(options.sessionId),
+      toolUseId,
+      name: tool.name,
+      input: parsed.data,
+    }
+
+    const result = await executeToolSafely(tool, parsed.data, options)
+    if (result.kind === 'error') {
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: result.code,
+        message: result.message,
+      }
+      return
+    }
+
+    yield {
+      type: 'tool_completed',
+      ...eventBase(options.sessionId),
+      toolUseId,
+      name: tool.name,
+      success: result.success,
+      output: result.output,
+      truncated: result.truncated,
+      originalBytes: result.originalBytes,
+    }
+
+    const summary = result.success
+      ? `${tool.name} completed.`
+      : `${tool.name} failed.`
+    yield {
+      type: 'assistant_delta',
+      ...eventBase(options.sessionId),
+      text: summary,
+    }
+    yield {
+      type: 'result',
+      ...eventBase(options.sessionId),
+      success: result.success,
+      message: summary,
+    }
+  }
+}
+
+async function executeToolSafely(
+  tool: AnyTool,
+  input: unknown,
+  options: RuntimeExecuteOptions,
+): Promise<
+  | {
+      kind: 'result'
+      success: boolean
+      output: unknown
+      truncated?: boolean
+      originalBytes?: number
+    }
+  | { kind: 'error'; code: string; message: string }
+> {
+  try {
+    const result = await tool.execute(input, {
+      cwd: options.cwd,
+      sessionId: options.sessionId,
+      signal: options.signal,
+      maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
+      bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
+    })
+    const truncated = truncateToolOutput(
+      result.output,
+      options.maxToolOutputBytes ?? 200_000,
+    )
+    return {
+      kind: 'result',
+      success: result.success,
+      output: truncated.value,
+      truncated: truncated.truncated || undefined,
+      originalBytes: truncated.originalBytes,
+    }
+  } catch (error) {
+    if (options.signal?.aborted) {
+      return {
+        kind: 'error',
+        code: 'REQUEST_TIMEOUT',
+        message: `Execution timed out while running ${tool.name}.`,
+      }
+    }
+    return {
+      kind: 'error',
+      code: 'TOOL_ERROR',
+      message: errorMessage(error),
+    }
+  }
+}
+
+export function allowAllTools(): ToolPolicy {
+  return {
+    isAllowed() {
+      return true
+    },
+    describe() {
+      return { mode: 'allow_all' }
+    },
+  }
+}
+
+export function allowlistedTools(allowedTools: Iterable<string>): ToolPolicy {
+  const allowed = new Set([...allowedTools].map(normalizeToolName).filter(Boolean))
+  return {
+    isAllowed(tool) {
+      return allowed.has(normalizeToolName(tool.name))
+    },
+    describe() {
+      return { mode: 'allowlist', allowedTools: [...allowed].sort() }
+    },
+  }
+}
+
+function normalizeToolName(name: string): string {
+  return name.trim().toLowerCase()
+}
+
+function parseIntent(prompt: string): ParsedIntent {
+  const trimmed = prompt.trim()
+  const [verb = '', ...rest] = splitCommand(trimmed)
+  const arg = rest.join(' ')
+
+  if (verb === 'read' && arg) {
+    return { kind: 'tool', toolName: 'Read', input: { path: arg } }
+  }
+  if (verb === 'write' && rest.length >= 2) {
+    const [path, ...content] = rest
+    return {
+      kind: 'tool',
+      toolName: 'Write',
+      input: { path, content: content.join(' ') },
+    }
+  }
+  if (verb === 'edit' && rest.length >= 3) {
+    const [path, oldString, ...newString] = rest
+    return {
+      kind: 'tool',
+      toolName: 'Edit',
+      input: { path, oldString, newString: newString.join(' ') },
+    }
+  }
+  if (verb === 'grep' && arg) {
+    return { kind: 'tool', toolName: 'Grep', input: { pattern: arg } }
+  }
+  if (verb === 'glob' && arg) {
+    return { kind: 'tool', toolName: 'Glob', input: { pattern: arg } }
+  }
+  if (verb === 'bash' && arg) {
+    return { kind: 'tool', toolName: 'Bash', input: { command: arg } }
+  }
+  if (verb === 'task' && arg) {
+    return { kind: 'tool', toolName: 'TaskCreate', input: { title: arg } }
+  }
+
+  return {
+    kind: 'text',
+    text:
+      `BabeL-O local runtime is active. I can already run explicit coding tools: ` +
+      '`read <file>`, `write <file> <text>`, `edit <file> <old> <new>`, ' +
+      '`grep <pattern>`, `glob <pattern>`, `bash <command>`, `task <title>`. ' +
+      `You said: ${trimmed || '(empty prompt)'}`,
+  }
+}
+
+function splitCommand(input: string): string[] {
+  const matches = input.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
+  return matches.map(part => {
+    if (
+      (part.startsWith('"') && part.endsWith('"')) ||
+      (part.startsWith("'") && part.endsWith("'"))
+    ) {
+      return part.slice(1, -1)
+    }
+    return part
+  })
+}

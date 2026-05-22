@@ -1,0 +1,32 @@
+{
+  "name": "babel-o",
+  "version": "0.1.0",
+  "description": "Nexus-first rewrite of BabeL-X with a lightweight interactive CLI.",
+  "type": "module",
+  "bin": {
+    "bbl": "./bin/bbl.js"
+  },
+  "scripts": {
+    "dev": "tsx watch src/nexus/server.ts",
+    "start": "tsx src/nexus/server.ts",
+    "cli": "tsx src/cli/program.ts",
+    "benchmark": "tsx scripts/benchmark-performance-core.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.2.0",
+    "chalk": "^5.6.2",
+    "commander": "^14.0.2",
+    "fastify": "^5.6.2",
+    "zod": "^4.1.13"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

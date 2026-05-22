@@ -1,0 +1,17 @@
+node_modules/
+dist/
+.env
+.DS_Store
+*.db
+*.sqlite
+coverage/
+
+# Local planning / technical-detail docs are intentionally not published.
+docs/
+*TODO*.md
+*WORK_LOG*.md
+*ANALYSIS*.md
+*FEASIBILITY*.md
+*REEVALUATION*.md
+*REVIEW*.md
+*PLAN*.md
