@@ -16,6 +16,13 @@ export type NexusEvent =
       text: string
     }
   | {
+      type: 'thinking_delta'
+      schemaVersion: typeof NEXUS_EVENT_SCHEMA_VERSION
+      sessionId: string
+      timestamp: string
+      text: string
+    }
+  | {
       type: 'user_message'
       schemaVersion: typeof NEXUS_EVENT_SCHEMA_VERSION
       sessionId: string

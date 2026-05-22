@@ -1,13 +1,25 @@
 import chalk from 'chalk'
 import type { NexusEvent } from '../shared/events.js'
 
+let lastWasDelta = false
+
 export function renderEvent(event: NexusEvent): void {
+  if (lastWasDelta && event.type !== 'assistant_delta' && event.type !== 'thinking_delta') {
+    process.stdout.write('\n')
+    lastWasDelta = false
+  }
+
   switch (event.type) {
     case 'session_started':
       console.log(chalk.dim(`session ${event.sessionId}`))
       break
     case 'assistant_delta':
-      console.log(event.text)
+      process.stdout.write(event.text)
+      lastWasDelta = true
+      break
+    case 'thinking_delta':
+      process.stdout.write(chalk.dim(event.text))
+      lastWasDelta = true
       break
     case 'tool_started':
       console.log(chalk.cyan(`→ ${event.name}`), chalk.dim(JSON.stringify(event.input)))
