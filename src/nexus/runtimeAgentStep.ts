@@ -5,7 +5,7 @@ import type { AgentStepRunner } from './agentLoop.js'
 import type { NexusEvent } from '../shared/events.js'
 import { recordTaskSessionNexusEvent } from './taskSession.js'
 
-type NexusRuntimeLike = ReturnType<typeof createDefaultNexusRuntime>['runtime']
+type NexusRuntimeLike = Awaited<ReturnType<typeof createDefaultNexusRuntime>>['runtime']
 
 export type RuntimeAgentStepOptions = {
   cwd?: string
@@ -38,7 +38,7 @@ export function createRuntimeAgentStepRunner(
 
   async function getRuntime(): Promise<NexusRuntimeLike> {
     if (!runtimePromise) {
-      const factory = options.runtimeFactory ?? (() => Promise.resolve(createDefaultNexusRuntime().runtime))
+      const factory = options.runtimeFactory ?? (async () => (await createDefaultNexusRuntime()).runtime)
       runtimePromise = factory()
     }
     return runtimePromise

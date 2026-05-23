@@ -20,6 +20,7 @@ import type {
   ContentBlock,
 } from '../providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../shared/config.js'
+import { assembleContext } from './contextAssembler.js'
 
 
 export class LLMCodingRuntime implements NexusRuntime {
@@ -37,6 +38,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         description: tool.description,
         risk: tool.risk,
         allowed: this.toolPolicy.isAllowed(tool),
+        source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
   }
@@ -74,8 +76,14 @@ export class LLMCodingRuntime implements NexusRuntime {
       const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
       const adapter = getAdapter(settings.providerId)
 
-      // Build the messages history
-      const messages = mapEventsToMessages(previousEvents, options.prompt)
+      const assembledContext = await assembleContext({
+        runtimeOptions: options,
+        events: previousEvents,
+        modelId: cleanedModelId,
+        buildSystemPrompt,
+        mapEventsToMessages,
+      })
+      const messages = assembledContext.messages
 
       // Parse thinking budget config from environments or options.budget
       const thinkingBudgetEnv =
@@ -96,12 +104,12 @@ export class LLMCodingRuntime implements NexusRuntime {
         const toolsList = [...this.tools.values()].map(tool => ({
           name: tool.name,
           description: tool.description,
-          inputSchema: z.toJSONSchema(tool.inputSchema),
+          inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         }))
 
         const queryParams: ModelQueryParams = {
           model: cleanedModelId,
-          systemPrompt: buildSystemPrompt(options),
+          systemPrompt: assembledContext.systemPrompt,
           messages,
           tools: toolsList,
           enablePromptCaching: settings.providerId === 'anthropic',
@@ -455,11 +463,24 @@ async function executeToolSafely(
   }
 }
 
-function buildSystemPrompt(options: RuntimeExecuteOptions): string {
+export function buildSystemPrompt(
+  options: RuntimeExecuteOptions,
+  projectMemory = '',
+  sessionSummary = '',
+): string {
+  const memoryBlock = projectMemory.trim()
+    ? `\nProject Memory:\n${projectMemory.trim()}\n`
+    : ''
+  const summaryBlock = sessionSummary.trim()
+    ? `\nSession Summary:\n${sessionSummary.trim()}\n`
+    : ''
+
   return `You are BabeL-O, a powerful agentic AI coding assistant designed to help developers with tasks.
 You are running in the workspace: ${options.cwd}
 Current OS: ${process.platform}
 Current time: ${new Date().toISOString()}
+${memoryBlock}
+${summaryBlock}
 
 Guidelines:
 1. Use the workspace tools sequentially to accomplish the requested task.

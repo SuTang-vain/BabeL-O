@@ -32,7 +32,7 @@ test('HTTP API endpoints authentication checks', async () => {
   const cwd = join(tmpdir(), `babel-o-test-security-http-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({
     runtime,
     storage,
@@ -109,7 +109,7 @@ test('WebSocket stream handshake authentication checks', async () => {
   await mkdir(cwd, { recursive: true })
 
   const apiKey = 'ws-secret-key'
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({
     runtime,
     storage,
@@ -181,7 +181,7 @@ test('Workspace allowlist blocks unauthorized paths', async () => {
   // Set the environment variable
   process.env.NEXUS_ALLOWED_WORKSPACES = allowedCwd
 
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -223,7 +223,7 @@ test('Deny-by-default blocks high risk tools unless allowed', async () => {
   await mkdir(cwd, { recursive: true })
 
   // Create runtime with default option -> denyByDefaultTools()
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({
     runtime,
     storage,
@@ -248,12 +248,55 @@ test('Deny-by-default blocks high risk tools unless allowed', async () => {
   }
 })
 
+test('Allow-all policy still prompts for high risk tools', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-allow-all-prompts-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const sessionId = `allow-all-prompts-${Date.now()}`
+  const events: any[] = []
+
+  const executePromise = (async () => {
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'bash "pwd"',
+      cwd,
+    })) {
+      events.push(event)
+    }
+  })()
+
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 50))
+    const request = events.find((e: any) => e.type === 'permission_request')
+    if (request) {
+      toolUseId = request.toolUseId
+      break
+    }
+  }
+
+  assert.ok(toolUseId, 'high risk tools should reach permission_request')
+  assert.ok(!events.some((e: any) => e.type === 'tool_denied' && e.message.includes('policy')))
+
+  const { PendingPermissionRegistry } = await import('../src/shared/session.js')
+  PendingPermissionRegistry.getInstance().resolve(sessionId, toolUseId, {
+    approved: false,
+    reason: 'test denial',
+  })
+
+  await executePromise
+
+  assert.ok(events.some((e: any) => e.type === 'permission_response' && e.approved === false))
+  assert.ok(events.some((e: any) => e.type === 'tool_denied' && e.message === 'test denial'))
+})
+
 test('Permission audit records are correctly persisted and retrievable', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-audit-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
   // Enable all tools in policy, so high risk tools trigger permission flow instead of policy block
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,

@@ -24,6 +24,7 @@ Legacy complexity is not imported by default.
 - [TODO_cleanup.md](./TODO_cleanup.md): 与 BabeL-X 遗留复杂度隔离、依赖治理、命名和兼容策略。
 - [TODO_performance.md](./TODO_performance.md): 启动速度、streaming、工具执行、storage、CLI 响应速度。
 - [TODO_cli.md](./TODO_cli.md): CLI 主题兼容导航页，不作为主规划源。
+- [../RECOMMENDATIONS.md](../RECOMMENDATIONS.md): 基于 BabeL-X 审计和横向 CLI 对比形成的能力迁移建议总纲。
 - [WORK_LOG.md](./WORK_LOG.md): 时间线工作记录，只记录事实和验证。
 
 ## 阶段状态
@@ -38,17 +39,24 @@ Legacy complexity is not imported by default.
 | P1 Coding Workflow Parity | 已完成第一版 | [TODO_tui.md](./TODO_tui.md) | 支持 slash command、history 检索、行级 Diff、文件补全、历史重试。 |
 | P2 Agents / Task Orchestration | 已完成第一版 | [TODO_agents.md](./TODO_agents.md) | 实现了 TaskSession/TaskQueue 管理，Planner->Executor/Optimizer->Critic 协作闭环，及 `bbl optimize` 自优化机制。 |
 | P2 Performance Hardening | 进行中 | [TODO_performance.md](./TODO_performance.md) | benchmark、startup trace、tool output limit、stream backpressure、分页和并发闸门已建立；大量 session/event 压测、chat 首响、Grep/Glob result limit、O(n) 审计和 SQLite 索引审计待收口。 |
+| P0 Context-Aware Runtime | 已完成第一版 | [TODO_runtime.md](./TODO_runtime.md) | ContextBudget、snipCompactor、项目记忆、规则摘要和长会话 benchmark 已落地。 |
+| P0 MCP-Ready Extensions | 已完成第一版 | [TODO_runtime.md](./TODO_runtime.md) | stdio-only MCP client、显式 allowedTools 白名单、tools audit 来源展示和 3 个官方 MCP server smoke 已落地。 |
+| P1 Knowledge-First Skills | 待开始 | [TODO_runtime.md](./TODO_runtime.md) | 按 `RECOMMENDATIONS.md` 实现 built-in/user/project 三级 inline Skills，不迁移 BabeL-X 的 React SkillTool。 |
+| P2 Smart Permissions | 待开始 | [TODO_runtime.md](./TODO_runtime.md) | 按 `RECOMMENDATIONS.md` 实现轻量规则分类器，read-only 自动放行，Bash 白名单/黑名单。 |
 
 ## 当前优先级
 
-1. **P1 收口**: 补齐 provider options schema、真实 provider smoke、model/profile switching 和 task/Todo status panel。
-2. **P2 Performance**: 补齐大量数据压测、chat 首响 benchmark、Grep/Glob result limit、route handler O(n) 审计与 SQLite 索引审计。
+1. **P1 Knowledge-First**: 实现纯文本 inline Skills 三级目录和关键词注入，先不支持 fork/AgentTool 模式。
+2. **P1 收口**: 补齐 provider options schema、真实 provider smoke、model/profile switching 和 task/Todo status panel。
+3. **P2 Performance**: 补齐大量数据压测、chat 首响 benchmark、Grep/Glob result limit、route handler O(n) 审计与 SQLite 索引审计。
 
 ## 当前阻塞项
 
 - 暂无。
 
 ## 最近完成
+
+- 实现工具自动完成快捷别名映射与 `/model` 配置向导：在 `completer` 中对 `/read` -> `read ` 等快捷别名提供翻译映射，保留常规控制命令；为 CLI 交互控件引入了 `wasRaw` 状态备份还原与 Esc 键取消逻辑；实现带 Provider -> API Key（允许留空保留） -> Base URL（支持 `-` 清除） -> Model ID 选取流的 `/model` 配置向导。在 `program.ts` 中增设 `isMain()` 防污染校验并补充 `test/completer.test.ts` 全量测试。
 
 - 实现 Provider 错误与 Token 消耗（Usage）归一化：新增 `ProviderError` 错误类型用于封装 HTTP status 和错误体；在 `events.ts` 中注册 `UsageEventSchema` 记录输入、输出及缓存 Tokens 消耗；在 `AnthropicAdapter` 与 `OpenAIAdapter` 中开启统计并随流提取 yield，在 `LLMCodingRuntime` 中捕获转化并保存至数据库。扩增了 `test/adapters.test.ts` 以完整校验。
 

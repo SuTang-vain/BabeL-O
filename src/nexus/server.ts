@@ -21,7 +21,13 @@ const maxToolOutputBytes =
 const bashMaxBufferBytes =
   parsePositiveInt(process.env.NEXUS_BASH_MAX_BUFFER_BYTES) ?? 1_000_000
 
-const { runtime, storage } = createDefaultNexusRuntime({ storagePath, allowedTools })
+const enableMcp = process.env.BABEL_O_ENABLE_MCP === '1'
+const { runtime, storage } = await createDefaultNexusRuntime({
+  storagePath,
+  allowedTools,
+  cwd,
+  enableMcp,
+})
 const app = await createNexusApp({
   runtime,
   storage,
@@ -36,7 +42,10 @@ await app.listen({ host, port })
 console.log(
   `BabeL-O Nexus listening on http://${host}:${port}` +
     (storagePath ? ` storage=${storagePath}` : ' storage=memory') +
-    (allowedTools ? ` allowedTools=${allowedTools.join(',')}` : ' allowedTools=all') +
+    (allowedTools
+      ? ` allowedTools=${allowedTools.join(',')}`
+      : ' allowedTools=default(read,grep,glob,task)') +
+    ` mcp=${enableMcp ? 'enabled' : 'disabled'}` +
     ` maxConcurrentExecutions=${maxConcurrentExecutions}` +
     ` maxToolOutputBytes=${maxToolOutputBytes}` +
     ` bashMaxBufferBytes=${bashMaxBufferBytes}`,

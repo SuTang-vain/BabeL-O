@@ -65,6 +65,11 @@
 
 ## P3 AetheL / SDK / Dashboard
 
+- [ ] 渐进实现 AgentTool 语义：不迁移 BabeL-X `AgentTool.tsx`，先让 Executor 能创建 sub-task，由 TaskQueue 调度。
+- [ ] Executor output schema 增加 `subTasks` 字段，支持 title/description/requiresIsolation。
+- [ ] `runAgentLoop()` 增加 `enableSubAgents` 与 `maxSubAgentDepth`，防止无限递归。
+- [ ] 支持跨 session task 委派后，再实现动态子 Agent。
+- [ ] worktree 隔离作为 AgentLoop 的 execution environment 能力延后实现。
 - [ ] 定义外部 SDK task API。
 - [ ] 定义 dashboard session/task query API。
 - [ ] 支持 human-in-the-loop。

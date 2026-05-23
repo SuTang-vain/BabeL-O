@@ -10,7 +10,7 @@ test('interactive permission approval flow via HTTP POST', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-approve-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const sessionId = `session-approve-${Date.now()}`
@@ -77,7 +77,7 @@ test('interactive permission denial flow via HTTP POST', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-deny-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const sessionId = `session-deny-${Date.now()}`
@@ -145,7 +145,7 @@ test('interactive permission approval via WebSocket stream', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-ws-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const address = await app.listen({ port: 0 })

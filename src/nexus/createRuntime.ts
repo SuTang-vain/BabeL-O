@@ -9,19 +9,34 @@ import { MemoryStorage } from '../storage/MemoryStorage.js'
 import { SqliteStorage } from '../storage/SqliteStorage.js'
 import { createDefaultToolRegistry } from '../tools/registry.js'
 import { ConfigManager } from '../shared/config.js'
+import { createMcpToolRegistry } from '../mcp/McpToolAdapter.js'
 
 export type CreateDefaultNexusRuntimeOptions = {
   storagePath?: string
   allowedTools?: string[]
+  cwd?: string
+  enableMcp?: boolean
 }
 
-export function createDefaultNexusRuntime(
+export async function createDefaultNexusRuntime(
   options: CreateDefaultNexusRuntimeOptions = {},
 ) {
   const tools = createDefaultToolRegistry()
+  if (options.enableMcp) {
+    const mcpTools = await createMcpToolRegistry(options.cwd ?? process.cwd())
+    for (const [name, tool] of mcpTools) {
+      tools.set(name, tool)
+    }
+  }
   const storage = options.storagePath
     ? new SqliteStorage(options.storagePath)
     : new MemoryStorage()
+  const originalClose = storage.close?.bind(storage)
+  storage.close = async () => {
+    const disposableTools = [...tools.values()].filter(tool => tool.dispose)
+    await Promise.allSettled(disposableTools.map(tool => tool.dispose?.()))
+    await originalClose?.()
+  }
 
   const configManager = ConfigManager.getInstance()
   const settings = configManager.resolveSettings()

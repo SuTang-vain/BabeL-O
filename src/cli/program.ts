@@ -1,14 +1,26 @@
 import { spawn } from 'node:child_process'
-import readline from 'node:readline/promises'
+import readline from 'node:readline'
+import { emitKeypressEvents } from 'node:readline'
 import { stdin as input, stdout as output } from 'node:process'
 import chalk from 'chalk'
 import { Command } from 'commander'
 import * as path from 'node:path'
 import * as fs from 'node:fs'
 import os from 'node:os'
+import { fileURLToPath } from 'node:url'
 import { NexusClient } from './NexusClient.js'
 import { executeEmbedded } from './embedded.js'
-import { renderEvent } from './renderEvents.js'
+import {
+  renderEvent,
+  getChatPrompt,
+  setActiveReadline,
+  startSession,
+  resumeSessionHistory,
+  toggleTuiMode,
+  startSpinner,
+  stopSpinner,
+  redrawSession
+} from './renderEvents.js'
 import { renderWelcome } from './welcome.js'
 import { flushStartupTrace, markStartup } from './startupTrace.js'
 import type { NexusEvent } from '../shared/events.js'
@@ -23,10 +35,31 @@ import { PLANNER_ROLE } from '../nexus/agentRoles.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { SqliteStorage } from '../storage/SqliteStorage.js'
 
+type CliReadline = readline.Interface
 
 markStartup('cli.imported')
 
 const program = new Command()
+
+type PermissionChoice =
+  | 'approve_once'
+  | 'approve_session'
+  | 'reject'
+  | 'reject_instruct'
+
+type PermissionDecision = {
+  approved: boolean
+  scope: 'once' | 'session'
+  reason?: string
+}
+
+const sessionPermissionApprovals = new Map<string, Set<string>>()
+
+function questionAsync(rl: CliReadline, query: string): Promise<string> {
+  return new Promise(resolve => {
+    rl.question(query, answer => resolve(answer))
+  })
+}
 
 program
   .name('bbl')
@@ -83,69 +116,140 @@ program
       // ignore
     }
 
-    const completer = (line: string): [string[], string] => {
-      if (line.startsWith('/') && !line.includes(' ')) {
-        const commands = ['/help', '/clear', '/exit', '/model', '/status', '/sessions', '/history']
-        const hits = commands.filter(c => c.startsWith(line))
-        return [hits, line]
-      }
+    const completer = (line: string, callback?: (err?: any, result?: [string[], string]) => void) => {
+      let hits: string[] = []
+      let substring = line
 
-      if (line.startsWith('/model ')) {
+      if (line.startsWith('/') && !line.includes(' ')) {
+        const commands = getSlashCompletionChoices()
+        hits = commands.filter(c => c.startsWith(line))
+        substring = line
+      } else if (line.startsWith('/tool')) {
+        const toolPrefix = line.slice('/tool'.length).trimStart().toLowerCase()
+        const toolChoices = getToolCompletionChoices()
+        hits = toolChoices.filter(c => c.toLowerCase().startsWith(`/tool ${toolPrefix}`))
+        substring = line
+      } else if (line.startsWith('/model ')) {
         const modelPrefix = line.slice('/model '.length)
         const modelIds = modelRegistry.map(m => m.id)
-        const hits = modelIds.filter(id => id.startsWith(modelPrefix))
-        return [hits.map(id => `/model ${id}`), line]
-      }
+        hits = modelIds.filter(id => id.startsWith(modelPrefix)).map(id => `/model ${id}`)
+        substring = line
+      } else {
+        const words = line.split(' ')
+        const lastWord = words[words.length - 1] || ''
 
-      const words = line.split(' ')
-      const lastWord = words[words.length - 1] || ''
+        if (lastWord.length > 0) {
+          let searchDir = options.cwd
+          let prefix = lastWord
 
-      if (lastWord.length > 0) {
-        let searchDir = options.cwd
-        let prefix = lastWord
-
-        if (lastWord.includes('/') || lastWord.includes('\\')) {
-          const lastSlashIndex = Math.max(lastWord.lastIndexOf('/'), lastWord.lastIndexOf('\\'))
-          const dirPart = lastWord.slice(0, lastSlashIndex)
-          prefix = lastWord.slice(lastSlashIndex + 1)
-          searchDir = path.resolve(options.cwd, dirPart)
-        }
-
-        try {
-          if (fs.existsSync(searchDir) && fs.statSync(searchDir).isDirectory()) {
-            const files = fs.readdirSync(searchDir)
-            const hits = files
-              .filter(f => f.startsWith(prefix))
-              .map(f => {
-                const fullPath = path.join(searchDir, f)
-                let isDir = false
-                try {
-                  isDir = fs.statSync(fullPath).isDirectory()
-                } catch {}
-                const pathPrefix = lastWord.slice(0, lastWord.length - prefix.length)
-                return pathPrefix + f + (isDir ? '/' : '')
-              })
-            return [hits, lastWord]
+          if (lastWord.includes('/') || lastWord.includes('\\')) {
+            const lastSlashIndex = Math.max(lastWord.lastIndexOf('/'), lastWord.lastIndexOf('\\'))
+            const dirPart = lastWord.slice(0, lastSlashIndex)
+            prefix = lastWord.slice(lastSlashIndex + 1)
+            searchDir = path.resolve(options.cwd, dirPart)
           }
-        } catch (e) {
-          // ignore
+
+          try {
+            if (fs.existsSync(searchDir) && fs.statSync(searchDir).isDirectory()) {
+              const files = fs.readdirSync(searchDir)
+              const fileHits = files
+                .filter(f => f.startsWith(prefix))
+                .map(f => {
+                  const fullPath = path.join(searchDir, f)
+                  let isDir = false
+                  try {
+                    isDir = fs.statSync(fullPath).isDirectory()
+                  } catch {}
+                  const pathPrefix = lastWord.slice(0, lastWord.length - prefix.length)
+                  return pathPrefix + f + (isDir ? '/' : '')
+                })
+              hits = fileHits
+              substring = lastWord
+            }
+          } catch (e) {
+            // ignore
+          }
         }
       }
 
-      return [[], line]
+      const complete = (result: [string[], string]) => {
+        if (callback) {
+          callback(null, result)
+          return undefined
+        }
+        return result
+      }
+
+      if (hits.length === 0) {
+        return complete([[], substring])
+      } else if (hits.length === 1) {
+        const mapped = mapDropdownSelection(hits[0]!)
+        return complete([[mapped], substring])
+      } else {
+        return complete([hits, substring])
+      }
     }
 
     const rl = readline.createInterface({
       input,
       output,
-      completer,
+      completer: completer as any,
       historySize: 1000,
       removeHistoryDuplicates: true
-    })
+    } as any)
 
     ;(rl as any).history = history
+    setActiveReadline(rl)
 
     let activeAbortController: AbortController | null = null
+    let isExecuting = false
+    const slashPalette = createSlashPalette(rl)
+
+    const onGlobalKeypress = (chunk: any, key: any) => {
+      if (!isExecuting && slashPalette.handleKey(chunk, key)) {
+        return
+      }
+      if (key) {
+        if (key.ctrl && key.name === 'o') {
+          // Clear readline prompt line
+          process.stdout.write('\r\x1b[K')
+          // Toggle TUI mode and redraw session
+          toggleTuiMode()
+          // Refresh prompt if not executing
+          if (!isExecuting) {
+            if (typeof (rl as any)._refreshLine === 'function') {
+              ;(rl as any)._refreshLine()
+            } else {
+              rl.prompt()
+            }
+          }
+          return
+        }
+        if (key.ctrl && key.name === 'c') {
+          if (isExecuting && activeAbortController) {
+            activeAbortController.abort()
+            console.log(chalk.yellow('\nExecution cancelled by user.'))
+          } else {
+            console.log(chalk.dim('\nExiting chat...'))
+            cleanupListeners()
+            rl.close()
+            process.exit(0)
+          }
+          return
+        }
+      }
+    }
+
+    const cleanupListeners = () => {
+      slashPalette.dispose()
+      process.stdin.removeListener('keypress', onGlobalKeypress)
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(false)
+      }
+    }
+
+    process.stdin.on('keypress', onGlobalKeypress)
+    rl.on('line', () => slashPalette.close())
 
     rl.on('SIGINT', () => {
       if (activeAbortController) {
@@ -153,6 +257,7 @@ program
         console.log(chalk.yellow('\nExecution cancelled by user.'))
       } else {
         console.log(chalk.dim('\nExiting chat...'))
+        cleanupListeners()
         rl.close()
         process.exit(0)
       }
@@ -181,33 +286,7 @@ program
         }
 
         if (events && events.length > 0) {
-          console.log(chalk.dim('\n--- Session History ---'))
-          let currentAssistantText = ''
-          for (const ev of events) {
-            if (ev.type === 'user_message') {
-              if (currentAssistantText) {
-                console.log(currentAssistantText)
-                currentAssistantText = ''
-              }
-              console.log(`${chalk.cyan('bbl>')} ${ev.text}`)
-            } else if (ev.type === 'assistant_delta') {
-              currentAssistantText += ev.text
-            } else if (ev.type === 'tool_started') {
-              if (currentAssistantText) {
-                console.log(currentAssistantText)
-                currentAssistantText = ''
-              }
-              console.log(chalk.cyan(`→ ${ev.name}`), chalk.dim(JSON.stringify(ev.input)))
-            } else if (ev.type === 'tool_completed') {
-              console.log(
-                ev.success ? chalk.green(`✓ ${ev.name}`) : chalk.red(`✗ ${ev.name}`)
-              )
-            }
-          }
-          if (currentAssistantText) {
-            console.log(currentAssistantText)
-          }
-          console.log(chalk.dim('-----------------------\n'))
+          resumeSessionHistory(events)
         }
       } catch (e: any) {
         console.error(chalk.yellow(`Warning: Failed to load session history: ${e.message || e}`))
@@ -220,7 +299,7 @@ program
       for (;;) {
         let prompt: string
         try {
-          prompt = await rl.question(chalk.cyan('bbl> '))
+          prompt = await questionAsync(rl, getChatPrompt())
         } catch (e: any) {
           if (e.name === 'AbortError') {
             continue
@@ -258,8 +337,33 @@ program
           console.log(`${chalk.bold('/sessions')}      List recent sessions`)
           console.log(`${chalk.bold('/history')}       Show or search command history (e.g. /history [keyword])`)
           console.log(`${chalk.bold('/history !<idx>')} Re-run history command at index`)
+          console.log(`${chalk.bold('/tool')}          Browse built-in tools and insert a tool prompt prefix`)
           console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
           console.log()
+          continue
+        }
+
+        if (trimmed === '/tool' || trimmed === '/tools') {
+          const selected = await pickCompletionChoice(getToolCompletionChoices())
+          if (selected) {
+            const mapped = mapDropdownSelection(selected)
+            console.log(chalk.dim(`Inserted: ${mapped.trim()}`))
+            const abortController = new AbortController()
+            activeAbortController = abortController
+            isExecuting = true
+            startSession()
+            try {
+              await runSessionFlow(mapped.trim(), options.cwd, options.url, rl, abortController, sessionId)
+            } catch (e: any) {
+              if (e.message !== 'Aborted' && e.name !== 'AbortError') {
+                console.error(chalk.red(`Error: ${e.message || e}`))
+              }
+            } finally {
+              activeAbortController = null
+              isExecuting = false
+              stopSpinner()
+            }
+          }
           continue
         }
 
@@ -267,12 +371,13 @@ program
           const parts = trimmed.split(/\s+/)
           const configManager = ConfigManager.getInstance()
           if (parts.length === 1) {
-            const current = configManager.resolveSettings().modelId || 'local/coding-runtime'
-            console.log(`Current default model: ${chalk.yellow(current)}`)
-            console.log(`To switch model: ${chalk.bold('/model <modelId>')}`)
-            console.log(`Available models:`)
-            for (const m of modelRegistry) {
-              console.log(`  - ${m.id}`)
+            isExecuting = true
+            try {
+              await runModelConfigWizard()
+            } catch (err: any) {
+              console.error(chalk.red(`Wizard error: ${err.message || err}`))
+            } finally {
+              isExecuting = false
             }
           } else {
             const modelId = parts[1]!
@@ -350,6 +455,8 @@ program
 
                 const abortController = new AbortController()
                 activeAbortController = abortController
+                isExecuting = true
+                startSession()
                 try {
                   await runSessionFlow(cmdToRun, options.cwd, options.url, rl, abortController, sessionId)
                 } catch (e: any) {
@@ -358,6 +465,8 @@ program
                   }
                 } finally {
                   activeAbortController = null
+                  isExecuting = false
+                  stopSpinner()
                 }
               } else {
                 console.log(chalk.red(`Invalid history index. Range: 1 - ${allLines.length}`))
@@ -416,6 +525,8 @@ program
 
         const abortController = new AbortController()
         activeAbortController = abortController
+        isExecuting = true
+        startSession()
         try {
           await runSessionFlow(trimmed, options.cwd, options.url, rl, abortController, sessionId)
         } catch (e: any) {
@@ -424,9 +535,12 @@ program
           }
         } finally {
           activeAbortController = null
+          isExecuting = false
+          stopSpinner()
         }
       }
     } finally {
+      cleanupListeners()
       rl.close()
     }
   })
@@ -713,7 +827,7 @@ program
 
     console.log(chalk.bold.blue(`Starting optimizer on: ${targetPath} (focus: ${options.focus})`))
 
-    const { runtime, storage } = createDefaultNexusRuntime()
+    const { runtime, storage } = await createDefaultNexusRuntime()
     setNexusStorage(storage)
 
     // Wrap storage.appendEvent to render events in real-time
@@ -797,14 +911,26 @@ program
     }
   })
 
-await program.parseAsync(process.argv)
-flushStartupTrace()
+const isMain = () => {
+  try {
+    const mainPath = fs.realpathSync(process.argv[1] || '')
+    const currentPath = fs.realpathSync(fileURLToPath(import.meta.url))
+    return mainPath === currentPath
+  } catch {
+    return false
+  }
+}
+
+if (isMain()) {
+  await program.parseAsync(process.argv)
+  flushStartupTrace()
+}
 
 async function runSessionFlow(
   prompt: string,
   cwd: string,
   url: string | undefined,
-  rl: readline.Interface,
+  rl: CliReadline,
   abortController: AbortController,
   sessionIdArg?: string
 ): Promise<string> {
@@ -859,16 +985,22 @@ async function runSessionFlow(
           if (data.type === 'permission_request') {
             renderEvent(data)
             try {
-              const answer = await rl.question(chalk.yellow('Approve tool execution? [y/n] '), {
-                signal: abortController.signal,
-              })
-              const approved = ['y', 'yes'].includes(answer.trim().toLowerCase())
+              const cached = data.name ? sessionPermissionApprovals.get(data.sessionId)?.has(data.name) : false
+              const decision: PermissionDecision = cached
+                ? { approved: true, scope: 'session' }
+                : await askPermission(rl, data, abortController.signal)
+              if (decision.approved && decision.scope === 'session' && data.name) {
+                const tools = sessionPermissionApprovals.get(data.sessionId) ?? new Set<string>()
+                tools.add(data.name)
+                sessionPermissionApprovals.set(data.sessionId, tools)
+              }
               if (socket.readyState === 1 /* OPEN */) {
                 socket.send(JSON.stringify({
                   type: 'permission_response',
                   sessionId: data.sessionId,
                   toolUseId: data.toolUseId,
-                  approved,
+                  approved: decision.approved,
+                  reason: decision.reason,
                 }))
               }
             } catch (err: any) {
@@ -906,29 +1038,23 @@ async function runSessionFlow(
   } else {
     fs.mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true })
     const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-    const { runtime, storage } = createDefaultNexusRuntime({ storagePath })
+    const { runtime, storage } = await createDefaultNexusRuntime({
+      storagePath,
+      allowedTools: ['*'],
+    })
     const originalAppendEvent = storage.appendEvent.bind(storage)
 
     storage.appendEvent = async (sid, ev) => {
       await originalAppendEvent(sid, ev)
       if (ev.type === 'permission_request') {
         renderEvent(ev)
-        try {
-          const answer = await rl.question(chalk.yellow('Approve tool execution? [y/n] '), {
-            signal: abortController.signal,
+        void handleLocalPermissionRequest(sid, ev, rl, abortController.signal).catch(err => {
+          console.error(chalk.red(`Permission prompt error: ${err.message || err}`))
+          PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, {
+            approved: false,
+            reason: 'Permission prompt failed',
           })
-          const approved = ['y', 'yes'].includes(answer.trim().toLowerCase())
-          PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, { approved })
-        } catch (err: any) {
-          if (err.name === 'AbortError') {
-            PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, {
-              approved: false,
-              reason: 'Cancelled by user',
-            })
-          } else {
-            throw err
-          }
-        }
+        })
       } else {
         renderEvent(ev)
       }
@@ -1007,3 +1133,952 @@ async function runSessionFlow(
   }
 }
 
+export function mapDropdownSelection(selected: string): string {
+  const mappings: Record<string, string> = {
+    '/read': 'read ',
+    '/write': 'write ',
+    '/edit': 'edit ',
+    '/grep': 'grep ',
+    '/glob': 'glob ',
+    '/bash': 'bash ',
+    '/task': 'task ',
+    '/tool': '/tool ',
+    '/tools': '/tool ',
+    '/tool read': 'read ',
+    '/tool write': 'write ',
+    '/tool edit': 'edit ',
+    '/tool grep': 'grep ',
+    '/tool glob': 'glob ',
+    '/tool bash': 'bash ',
+    '/tool task': 'task ',
+    '/model': '/model ',
+    '/history': '/history ',
+    '/help': '/help',
+    '/clear': '/clear',
+    '/exit': '/exit',
+    '/status': '/status',
+    '/sessions': '/sessions',
+  }
+  return mappings[selected] ?? mappings[selected.toLowerCase()] ?? selected
+}
+
+export function getSlashCompletionChoices(): string[] {
+  return [
+    '/help', '/clear', '/exit', '/model', '/status', '/sessions', '/history', '/tool',
+    '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task',
+  ]
+}
+
+export function getToolCompletionChoices(): string[] {
+  return [
+    '/tool read',
+    '/tool write',
+    '/tool edit',
+    '/tool grep',
+    '/tool glob',
+    '/tool bash',
+    '/tool task',
+  ]
+}
+
+export function describeCompletionChoice(choice: string): { label: string; tag: string; description: string } {
+  const details: Record<string, { tag: string; description: string }> = {
+    '/help': { tag: 'command', description: 'Show command help' },
+    '/clear': { tag: 'command', description: 'Clear the terminal' },
+    '/exit': { tag: 'command', description: 'Exit chat' },
+    '/model': { tag: 'config', description: 'Open model configuration wizard' },
+    '/status': { tag: 'status', description: 'Show current runtime and model' },
+    '/sessions': { tag: 'session', description: 'List recent sessions' },
+    '/history': { tag: 'history', description: 'Search and replay prompt history' },
+    '/tool': { tag: 'tools', description: 'Open the tool picker' },
+    '/read': { tag: 'tool', description: 'Insert read prompt prefix' },
+    '/write': { tag: 'tool', description: 'Insert write prompt prefix' },
+    '/edit': { tag: 'tool', description: 'Insert edit prompt prefix' },
+    '/grep': { tag: 'tool', description: 'Insert grep prompt prefix' },
+    '/glob': { tag: 'tool', description: 'Insert glob prompt prefix' },
+    '/bash': { tag: 'tool', description: 'Insert bash prompt prefix' },
+    '/task': { tag: 'tool', description: 'Insert task prompt prefix' },
+    '/tool read': { tag: 'read', description: 'Read a file inside the workspace' },
+    '/tool write': { tag: 'write', description: 'Write a file with permission' },
+    '/tool edit': { tag: 'write', description: 'Replace text in a file with permission' },
+    '/tool grep': { tag: 'read', description: 'Search file contents' },
+    '/tool glob': { tag: 'read', description: 'Find files by pattern' },
+    '/tool bash': { tag: 'execute', description: 'Run a shell command with permission' },
+    '/tool task': { tag: 'task', description: 'Create a task record' },
+  }
+  return {
+    label: choice,
+    tag: details[choice]?.tag ?? 'path',
+    description: details[choice]?.description ?? 'Workspace path',
+  }
+}
+
+export function formatCompletionChoice(choice: string, selected: boolean): string {
+  const { label, tag, description } = describeCompletionChoice(choice)
+  const prefix = selected ? '~ ' : '  '
+  const row = `${prefix}${label.padEnd(16)} [${tag}]  ${description}`
+  return selected ? chalk.black.bgCyan(row) : chalk.dim(row)
+}
+
+export function getSlashPaletteChoices(input: string): string[] {
+  if (!/^\/[A-Za-z]*$/.test(input)) return []
+  const normalized = input.toLowerCase()
+  return getSlashCompletionChoices()
+    .filter(choice => choice.toLowerCase().startsWith(normalized))
+    .sort((left, right) => left.localeCompare(right))
+}
+
+export function formatSlashPalette(
+  choices: string[],
+  activeIndex: number,
+  totalCount = choices.length,
+): string {
+  if (choices.length === 0) return ''
+  const visible = choices.slice(0, 8)
+  const lines = [
+    chalk.dim('─'.repeat(Math.min(process.stdout.columns || 80, 72))),
+  ]
+  for (let index = 0; index < visible.length; index++) {
+    const choice = visible[index]!
+    const { label, description } = describeCompletionChoice(choice)
+    const selected = index === activeIndex
+    const marker = selected ? chalk.blue('>') : ' '
+    const left = selected ? chalk.blue(label) : chalk.white(label)
+    const right = chalk.dim(description)
+    lines.push(`${marker} ${left.padEnd(18)} ${right}`)
+  }
+  const remaining = Math.max(0, totalCount - visible.length)
+  if (remaining > 0) {
+    lines.push(`  ${chalk.dim(`↓ ${remaining} more`)}`)
+  }
+  lines.push('')
+  lines.push(`${chalk.dim('↑/↓ Navigate ·')} ${chalk.blue('tab')} ${chalk.dim('Complete ·')} ${chalk.blue('enter')} ${chalk.dim('Run')}`)
+  return `${lines.join('\n')}\n`
+}
+
+export function isPermissionApproved(answer: string): boolean {
+  return ['y', 'yes'].includes(answer.trim().toLowerCase())
+}
+
+async function handleLocalPermissionRequest(
+  sessionId: string,
+  event: { toolUseId: string; name?: string; risk?: string },
+  rl: CliReadline,
+  signal: AbortSignal,
+): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve))
+  try {
+    const cached = event.name ? sessionPermissionApprovals.get(sessionId)?.has(event.name) : false
+    const decision: PermissionDecision = cached
+      ? { approved: true, scope: 'session' }
+      : await askPermission(rl, event, signal)
+    if (decision.approved && decision.scope === 'session' && event.name) {
+      const tools = sessionPermissionApprovals.get(sessionId) ?? new Set<string>()
+      tools.add(event.name)
+      sessionPermissionApprovals.set(sessionId, tools)
+    }
+    const resolved = PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+      approved: decision.approved,
+      reason: decision.approved ? undefined : decision.reason ?? 'Denied by user',
+    })
+    if (!resolved) {
+      console.error(chalk.red(`Permission request not found: ${event.toolUseId}`))
+    }
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+        approved: false,
+        reason: 'Cancelled by user',
+      })
+    } else {
+      throw err
+    }
+  }
+}
+
+async function askPermission(
+  rl: CliReadline,
+  event: { name?: string; risk?: string; input?: unknown },
+  signal: AbortSignal,
+): Promise<PermissionDecision> {
+  const wasRaw = process.stdin.isRaw
+  const dataListeners = process.stdin.listeners('data')
+  const keypressListeners = process.stdin.listeners('keypress')
+  rl.pause()
+  process.stdin.removeAllListeners('keypress')
+
+  return new Promise<PermissionDecision>((resolve, reject) => {
+    let settled = false
+    let activeIndex = 0
+    let renderedLines = 0
+    const choices: { id: PermissionChoice; label: string }[] = [
+      { id: 'approve_once', label: 'Approve once' },
+      { id: 'approve_session', label: 'Approve for this session' },
+      { id: 'reject', label: 'Reject' },
+      { id: 'reject_instruct', label: 'Reject, tell the model what to do instead' },
+    ]
+
+    const cleanup = () => {
+      clearRenderedPermissionDialog()
+      process.stdin.removeListener('data', onData)
+      process.stdin.removeListener('keypress', onKeypress)
+      for (const listener of dataListeners) {
+        process.stdin.on('data', listener as any)
+      }
+      for (const listener of keypressListeners) {
+        process.stdin.on('keypress', listener as any)
+      }
+      if (process.stdin.isTTY) {
+        process.stdin.setRawMode(wasRaw)
+      }
+      signal.removeEventListener('abort', onAbort)
+      rl.resume()
+      process.stdin.resume()
+    }
+
+    const redraw = () => {
+      clearRenderedPermissionDialog()
+      const dialog = formatPermissionDialog(event, choices, activeIndex)
+      process.stdout.write(dialog)
+      renderedLines = countRenderedLines(dialog)
+    }
+
+    const clearRenderedPermissionDialog = () => {
+      if (renderedLines <= 0) return
+      process.stdout.write(`\x1b[${renderedLines}A\x1b[J`)
+      renderedLines = 0
+    }
+
+    const finish = async (choice: PermissionChoice) => {
+      if (settled) return
+      settled = true
+      let decision: PermissionDecision
+      if (choice === 'approve_once') {
+        decision = { approved: true, scope: 'once' }
+      } else if (choice === 'approve_session') {
+        decision = { approved: true, scope: 'session' }
+      } else if (choice === 'reject_instruct') {
+        cleanup()
+        const reason = await questionAsync(rl, chalk.yellow('Tell the model what to do instead: '))
+        resolve({
+          approved: false,
+          scope: 'once',
+          reason: reason.trim() || 'Denied by user',
+        })
+        return
+      } else {
+        decision = { approved: false, scope: 'once', reason: 'Denied by user' }
+      }
+      cleanup()
+      resolve(decision)
+    }
+
+    const onAbort = () => {
+      if (settled) return
+      settled = true
+      process.stdout.write('\n')
+      cleanup()
+      const err = new Error('Aborted')
+      err.name = 'AbortError'
+      reject(err)
+    }
+
+    const move = (delta: number) => {
+      activeIndex = (activeIndex + delta + choices.length) % choices.length
+      redraw()
+    }
+
+    const chooseIndex = (index: number) => {
+      activeIndex = index
+      void finish(choices[activeIndex]!.id)
+    }
+
+    const onData = (chunk: Buffer | string) => {
+      const text = chunk.toString('utf8')
+      if (text.includes('\u0003')) {
+        onAbort()
+        return
+      }
+      if (text.includes('\x1b[A')) {
+        move(-1)
+        return
+      }
+      if (text.includes('\x1b[B')) {
+        move(1)
+        return
+      }
+      for (const char of text) {
+        if (char >= '1' && char <= '4') {
+          chooseIndex(Number(char) - 1)
+          return
+        }
+        if (char === '\r' || char === '\n') {
+          void finish(choices[activeIndex]!.id)
+          return
+        }
+        if (char === '\x1b') {
+          chooseIndex(2)
+          return
+        }
+      }
+    }
+
+    const onKeypress = (_chunk: any, key: any) => {
+      if (key?.ctrl && key.name === 'c') {
+        onAbort()
+        return
+      }
+      if (key?.name === 'up') {
+        move(-1)
+      } else if (key?.name === 'down') {
+        move(1)
+      } else if (key?.name === 'return') {
+        void finish(choices[activeIndex]!.id)
+      } else if (key?.name === 'escape') {
+        chooseIndex(2)
+      } else if (['1', '2', '3', '4'].includes(key?.name)) {
+        chooseIndex(Number(key.name) - 1)
+      }
+    }
+
+    for (const listener of dataListeners) {
+      process.stdin.removeListener('data', listener as any)
+    }
+    process.stdin.on('data', onData)
+    process.stdin.on('keypress', onKeypress)
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true)
+    }
+    process.stdin.resume()
+    signal.addEventListener('abort', onAbort, { once: true })
+    redraw()
+  })
+}
+
+export function formatPermissionDialog(
+  event: { name?: string; risk?: string; input?: unknown },
+  choices: { id: PermissionChoice; label: string }[],
+  activeIndex: number,
+): string {
+  const tool = event.name || 'tool'
+  const risk = event.risk ? `${event.risk} risk` : 'unknown risk'
+  const command = formatPermissionInput(event.input)
+  const lines = [
+    chalk.yellow(' approval '),
+    `│ ${chalk.yellow(`${tool} is requesting approval (${risk})`)}`,
+  ]
+  if (command) {
+    lines.push('│')
+    lines.push(`│ ${command}`)
+  }
+
+  choices.forEach((choice, index) => {
+    const selected = index === activeIndex
+    const marker = selected ? chalk.cyan('➜') : ' '
+    const label = selected ? chalk.cyan(choice.label) : chalk.dim(choice.label)
+    lines.push(`│ ${marker} [${index + 1}] ${label}`)
+  })
+
+  lines.push(` ${chalk.dim('▲/▼ select   1/2/3/4 choose   ↵ confirm   esc reject')}`)
+  return `${lines.join('\n')}\n`
+}
+
+function formatPermissionInput(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const record = input as Record<string, unknown>
+  if (typeof record.command === 'string') return record.command
+  if (typeof record.path === 'string') return record.path
+  return JSON.stringify(input)
+}
+
+function countRenderedLines(text: string): number {
+  return text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length
+}
+
+function createSlashPalette(rl: CliReadline) {
+  let activeIndex = 0
+  let currentChoices: string[] = []
+  let consumedNavigationKey = false
+  let isOpen = false
+  let query = ''
+  let renderedLines = 0
+  let pendingRefresh: NodeJS.Timeout | null = null
+  const originalTtyWrite = typeof (rl as any)._ttyWrite === 'function'
+    ? (rl as any)._ttyWrite.bind(rl)
+    : null
+
+  const cancelPendingRefresh = () => {
+    if (pendingRefresh) {
+      clearTimeout(pendingRefresh)
+      pendingRefresh = null
+    }
+  }
+
+  const scheduleRefresh = () => {
+    cancelPendingRefresh()
+    pendingRefresh = setTimeout(() => {
+      pendingRefresh = null
+      refresh()
+    }, 0)
+  }
+
+  const refresh = () => {
+    const line = (rl as any).line ?? ''
+    if (!isOpen || line !== currentChoices[activeIndex]) {
+      query = line
+    }
+    currentChoices = getSlashPaletteChoices(query)
+    if (currentChoices.length === 0) {
+      close()
+      return
+    }
+    isOpen = true
+    activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
+    preview()
+    renderOverlay()
+  }
+
+  const renderOverlay = () => {
+    clear()
+    const palette = formatSlashPalette(currentChoices, activeIndex, currentChoices.length)
+    if (!palette) return
+    const line = (rl as any).line ?? ''
+    const prompt = getChatPrompt()
+    output.write(`\r\x1b[K${prompt}${line}`)
+    output.write('\n')
+    output.write(palette)
+    renderedLines = 1 + countRenderedLines(palette)
+    readline.moveCursor(output, 0, -renderedLines)
+    readline.cursorTo(output, prompt.length + line.length)
+  }
+
+  const clear = () => {
+    if (!isOpen || renderedLines <= 0) return
+    readline.cursorTo(output, 0)
+    readline.clearScreenDown(output)
+    renderedLines = 0
+  }
+
+  const close = () => {
+    cancelPendingRefresh()
+    clear()
+    currentChoices = []
+    activeIndex = 0
+    isOpen = false
+    query = ''
+    refreshReadline()
+  }
+
+  const setInputLine = (value: string) => {
+    ;(rl as any).line = value
+    ;(rl as any).cursor = value.length
+  }
+
+  const preview = () => {
+    const selected = currentChoices[activeIndex]
+    if (!selected) return false
+    setInputLine(selected)
+    return true
+  }
+
+  const refreshFromCurrentInput = (previewSelection: boolean) => {
+    const line = (rl as any).line ?? ''
+    query = line
+    currentChoices = getSlashPaletteChoices(query)
+    if (currentChoices.length === 0) {
+      close()
+      return
+    }
+    isOpen = true
+    activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
+    if (previewSelection) {
+      preview()
+    }
+    renderOverlay()
+  }
+
+  const select = () => {
+    const selected = currentChoices[activeIndex]
+    if (!selected) return false
+    const mapped = mapDropdownSelection(selected)
+    setInputLine(mapped)
+    close()
+    return true
+  }
+
+  const move = (delta: number) => {
+    if (currentChoices.length === 0) return false
+    const visibleCount = Math.min(currentChoices.length, 8)
+    activeIndex = (activeIndex + delta + visibleCount) % visibleCount
+    preview()
+    renderOverlay()
+    return true
+  }
+
+  const handleKey = (chunk: any, key: any): boolean => {
+    if (consumedNavigationKey) {
+      consumedNavigationKey = false
+      return true
+    }
+    const line = (rl as any).line ?? ''
+    const shouldShow = getSlashPaletteChoices(line).length > 0
+    if (!shouldShow) {
+      close()
+      return false
+    }
+    const raw = chunk ? chunk.toString('utf8') : ''
+    if (raw.includes('\x1b[A')) return move(-1)
+    if (raw.includes('\x1b[B')) return move(1)
+    if (raw === '\t') return select()
+    if (raw === '\r' || raw === '\n') return false
+    if (key?.name === 'up') return move(-1)
+    if (key?.name === 'down') return move(1)
+    if (key?.name === 'tab') return select()
+    if (key?.name === 'return') return false
+    if (key?.name === 'escape') {
+      close()
+      return true
+    }
+    scheduleRefresh()
+    return false
+  }
+
+  if (originalTtyWrite) {
+    ;(rl as any)._ttyWrite = (text: string, key: any) => {
+      const raw = typeof text === 'string' ? text : ''
+      const keyName = key?.name
+      const navigationKey = keyName === 'up' || keyName === 'down' || keyName === 'tab' ||
+        raw.includes('\x1b[A') || raw.includes('\x1b[B') || raw === '\t'
+      const escapeKey = keyName === 'escape' || raw === '\x1b'
+      const backspaceKey = keyName === 'backspace' || raw === '\x7f' || raw === '\b'
+      const line = (rl as any).line ?? ''
+      const choices = isOpen ? currentChoices : getSlashPaletteChoices(line)
+
+      if (escapeKey && isOpen) {
+        cancelPendingRefresh()
+        consumedNavigationKey = true
+        close()
+        return
+      }
+
+      if (backspaceKey && isOpen) {
+        cancelPendingRefresh()
+        clear()
+        const cursor = (rl as any).cursor ?? line.length
+        if (cursor > 0) {
+          const nextLine = line.slice(0, cursor - 1) + line.slice(cursor)
+          ;(rl as any).line = nextLine
+          ;(rl as any).cursor = cursor - 1
+        }
+        refreshFromCurrentInput(false)
+        consumedNavigationKey = true
+        return
+      }
+
+      if (navigationKey && choices.length > 0) {
+        cancelPendingRefresh()
+        currentChoices = choices
+        if (!isOpen) {
+          query = line
+          isOpen = true
+        }
+        activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
+        consumedNavigationKey = true
+        if (keyName === 'up' || raw.includes('\x1b[A')) move(-1)
+        else if (keyName === 'down' || raw.includes('\x1b[B')) move(1)
+        else select()
+        return
+      }
+      return originalTtyWrite(text, key)
+    }
+  }
+
+  const refreshReadline = () => {
+    if (typeof (rl as any)._refreshLine === 'function') {
+      ;(rl as any)._refreshLine()
+    }
+  }
+
+  const dispose = () => {
+    cancelPendingRefresh()
+    close()
+    if (originalTtyWrite) {
+      ;(rl as any)._ttyWrite = originalTtyWrite
+    }
+  }
+
+  return { close, dispose, handleKey }
+}
+
+function runInteractiveDropdown(
+  choices: string[],
+  originalWord: string,
+  onSelect: (selected: string) => void
+) {
+  let activeIndex = 0
+  const displayChoices = choices.slice(0, 10)
+
+  const keypressListeners = process.stdin.listeners('keypress')
+  const wasRaw = process.stdin.isRaw
+
+  process.stdin.removeAllListeners('keypress')
+
+  const redraw = () => {
+    // Save cursor
+    process.stdout.write('\x1b[s')
+    // Move down 1 line and clear everything below
+    process.stdout.write('\n\x1b[J')
+    // Draw the dropdown options
+    for (let i = 0; i < displayChoices.length; i++) {
+      const isSelected = i === activeIndex
+      process.stdout.write(formatCompletionChoice(displayChoices[i]!, isSelected) + '\n')
+    }
+    // Restore cursor position
+    process.stdout.write('\x1b[u')
+  }
+
+  const cleanup = () => {
+    // Clear dropdown rendering
+    process.stdout.write('\x1b[s\n\x1b[J\x1b[u')
+    process.stdin.removeListener('keypress', handleKey)
+    for (const l of keypressListeners) {
+      process.stdin.addListener('keypress', l as any)
+    }
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(wasRaw)
+    }
+  }
+
+  const handleKey = (chunk: any, key: any) => {
+    const name = key?.name || (chunk ? chunk.toString() : '')
+    const ctrl = key?.ctrl || (key && key.ctrl)
+
+    if (ctrl && name === 'c') {
+      cleanup()
+      process.exit(0)
+    }
+    if (name === 'up' || name === '\u001b[A' || name === '\x1b[A') {
+      activeIndex = (activeIndex - 1 + displayChoices.length) % displayChoices.length
+      redraw()
+      return
+    }
+    if (name === 'down' || name === '\u001b[B' || name === '\x1b[B') {
+      activeIndex = (activeIndex + 1) % displayChoices.length
+      redraw()
+      return
+    }
+    if (name === 'enter' || name === 'return' || name === '\r' || name === '\n') {
+      cleanup()
+      onSelect(displayChoices[activeIndex]!)
+      return
+    }
+    if (name === 'escape' || name === '\u001b' || name === '\x1b') {
+      cleanup()
+      onSelect('')
+      return
+    }
+
+    // Any other key: close dropdown, cancel select, and replay key event on stdin
+    cleanup()
+    onSelect('')
+    if (chunk || key) {
+      process.stdin.emit('keypress', chunk, key)
+    }
+  }
+
+  process.stdin.on('keypress', handleKey)
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true)
+  }
+
+  redraw()
+}
+
+function pickCompletionChoice(choices: string[]): Promise<string> {
+  return new Promise(resolve => {
+    runInteractiveDropdown(choices, '', selected => resolve(selected))
+  })
+}
+
+function chooseInteractive(
+  question: string,
+  choices: string[],
+  onSelect: (selected: string) => void
+) {
+  let activeIndex = 0
+
+  // Ensure keypress parser is active and stdin is flowing
+  emitKeypressEvents(process.stdin)
+  process.stdin.resume()
+
+  const keypressListeners = process.stdin.listeners('keypress')
+  const wasRaw = process.stdin.isRaw
+
+  process.stdin.removeAllListeners('keypress')
+
+  const redraw = () => {
+    process.stdout.write('\x1b[s')
+    process.stdout.write('\n\x1b[J')
+    process.stdout.write(chalk.cyan(question) + '\n')
+    for (let i = 0; i < choices.length; i++) {
+      const isSelected = i === activeIndex
+      const prefix = isSelected ? chalk.cyan('> ') : '  '
+      const text = isSelected ? chalk.black.bgCyan(choices[i]!) : chalk.dim(choices[i]!)
+      process.stdout.write(prefix + text + '\n')
+    }
+    process.stdout.write('\x1b[u')
+  }
+
+  const cleanup = () => {
+    process.stdout.write('\x1b[s\n\x1b[J\x1b[u')
+    process.stdin.removeListener('keypress', handleKey)
+    for (const l of keypressListeners) {
+      process.stdin.addListener('keypress', l as any)
+    }
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(wasRaw)
+    }
+  }
+
+  const handleKey = (chunk: any, key: any) => {
+    const name = key?.name || (chunk ? chunk.toString() : '')
+    const ctrl = key?.ctrl || (key && key.ctrl)
+
+    if (ctrl && name === 'c') {
+      cleanup()
+      process.exit(0)
+    }
+    if (name === 'up' || name === '\u001b[A' || name === '\x1b[A') {
+      activeIndex = (activeIndex - 1 + choices.length) % choices.length
+      redraw()
+      return
+    }
+    if (name === 'down' || name === '\u001b[B' || name === '\x1b[B') {
+      activeIndex = (activeIndex + 1) % choices.length
+      redraw()
+      return
+    }
+    if (name === 'enter' || name === 'return' || name === '\r' || name === '\n') {
+      cleanup()
+      onSelect(choices[activeIndex]!)
+      return
+    }
+    if (name === 'escape' || name === '\u001b' || name === '\x1b') {
+      cleanup()
+      onSelect('')
+      return
+    }
+  }
+
+  process.stdin.on('keypress', handleKey)
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true)
+  }
+
+  redraw()
+}
+
+function promptSecret(question: string, callback: (secret: string) => void) {
+  // Ensure keypress parser is active and stdin is flowing
+  emitKeypressEvents(process.stdin)
+  process.stdin.resume()
+
+  process.stdout.write(chalk.cyan(question))
+  let value = ''
+
+  const keypressListeners = process.stdin.listeners('keypress')
+  const wasRaw = process.stdin.isRaw
+
+  process.stdin.removeAllListeners('keypress')
+
+  const handleKey = (chunk: any, key: any) => {
+    const name = key?.name || (chunk ? chunk.toString() : '')
+    const ctrl = key?.ctrl || (key && key.ctrl)
+
+    if (ctrl && name === 'c') {
+      cleanup()
+      process.exit(0)
+    }
+    if (name === 'escape' || name === '\u001b' || name === '\x1b') {
+      process.stdout.write('\n')
+      cleanup()
+      callback('')
+      return
+    }
+    if (name === 'enter' || name === 'return' || name === '\r' || name === '\n') {
+      process.stdout.write('\n')
+      cleanup()
+      callback(value)
+      return
+    }
+    if (name === 'backspace' || name === '\x7f' || name === '\b') {
+      if (value.length > 0) {
+        value = value.slice(0, -1)
+        process.stdout.write('\b\x1b[K')
+      }
+      return
+    }
+
+    if (chunk && chunk !== '\r' && chunk !== '\n' && chunk !== '\u001b' && chunk !== '\x1b' && chunk !== '\x7f' && chunk !== '\b') {
+      if (!chunk.toString().startsWith('\x1b')) {
+        value += chunk
+        process.stdout.write('*')
+      }
+    }
+  }
+
+  const cleanup = () => {
+    process.stdin.removeListener('keypress', handleKey)
+    for (const l of keypressListeners) {
+      process.stdin.addListener('keypress', l as any)
+    }
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(wasRaw)
+    }
+  }
+
+  process.stdin.on('keypress', handleKey)
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true)
+  }
+}
+
+function promptText(question: string, defaultValue: string, callback: (text: string) => void) {
+  // Ensure keypress parser is active and stdin is flowing
+  emitKeypressEvents(process.stdin)
+  process.stdin.resume()
+
+  const showDefault = defaultValue ? chalk.dim(` (${defaultValue})`) : ''
+  process.stdout.write(chalk.cyan(question) + showDefault + ': ')
+  let value = ''
+
+  const keypressListeners = process.stdin.listeners('keypress')
+  const wasRaw = process.stdin.isRaw
+
+  process.stdin.removeAllListeners('keypress')
+
+  const handleKey = (chunk: any, key: any) => {
+    const name = key?.name || (chunk ? chunk.toString() : '')
+    const ctrl = key?.ctrl || (key && key.ctrl)
+
+    if (ctrl && name === 'c') {
+      cleanup()
+      process.exit(0)
+    }
+    if (name === 'escape' || name === '\u001b' || name === '\x1b') {
+      process.stdout.write('\n')
+      cleanup()
+      callback('')
+      return
+    }
+    if (name === 'enter' || name === 'return' || name === '\r' || name === '\n') {
+      process.stdout.write('\n')
+      cleanup()
+      callback(value || defaultValue)
+      return
+    }
+    if (name === 'backspace' || name === '\x7f' || name === '\b') {
+      if (value.length > 0) {
+        value = value.slice(0, -1)
+        process.stdout.write('\b\x1b[K')
+      }
+      return
+    }
+
+    if (chunk && chunk !== '\r' && chunk !== '\n' && chunk !== '\u001b' && chunk !== '\x1b' && chunk !== '\x7f' && chunk !== '\b') {
+      if (!chunk.toString().startsWith('\x1b')) {
+        value += chunk
+        process.stdout.write(chunk)
+      }
+    }
+  }
+
+  const cleanup = () => {
+    process.stdin.removeListener('keypress', handleKey)
+    for (const l of keypressListeners) {
+      process.stdin.addListener('keypress', l as any)
+    }
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(wasRaw)
+    }
+  }
+
+  process.stdin.on('keypress', handleKey)
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true)
+  }
+}
+
+async function runModelConfigWizard() {
+  const chooseInteractivePromise = (question: string, choices: string[]): Promise<string> => {
+    return new Promise((resolve) => chooseInteractive(question, choices, resolve))
+  }
+  const promptSecretPromise = (question: string): Promise<string> => {
+    return new Promise((resolve) => promptSecret(question, resolve))
+  }
+  const promptTextPromise = (question: string, defaultValue: string): Promise<string> => {
+    return new Promise((resolve) => promptText(question, defaultValue, resolve))
+  }
+
+  console.log(chalk.bold.cyan('\n--- BabeL-O Model Config Wizard ---'))
+
+  const providers = ['anthropic', 'openai', 'zhipu', 'minimax', 'local']
+  const provider = await chooseInteractivePromise('Select provider:', providers)
+  if (!provider) {
+    console.log(chalk.yellow('Wizard cancelled.'))
+    return
+  }
+
+  if (provider === 'local') {
+    const configManager = ConfigManager.getInstance()
+    configManager.setDefaultModel('local/coding-runtime')
+    console.log(chalk.green('\n✓ Default model set to: local/coding-runtime'))
+    return
+  }
+
+  const configManager = ConfigManager.getInstance()
+  const currentProviderConfig = configManager.getProviderConfig(provider)
+  const existingKey = currentProviderConfig?.apiKey || ''
+
+  const keyPrompt = existingKey
+    ? `Enter API Key for ${provider} (leave empty to keep existing key): `
+    : `Enter API Key for ${provider}: `
+  const apiKey = await promptSecretPromise(keyPrompt)
+
+  const finalApiKey = apiKey || existingKey
+  if (!finalApiKey) {
+    console.log(chalk.yellow('Wizard cancelled: API key is required.'))
+    return
+  }
+
+  const defaultBaseUrl = currentProviderConfig.baseUrl || ''
+  const baseUrlPrompt = defaultBaseUrl
+    ? `Enter Custom Base URL (optional) (type '-' to clear, current: ${defaultBaseUrl}): `
+    : `Enter Custom Base URL (optional): `
+  const baseUrl = await promptTextPromise(baseUrlPrompt, defaultBaseUrl)
+
+  let finalBaseUrl: string | undefined = baseUrl ? baseUrl.trim() : undefined
+  if (finalBaseUrl === '-') {
+    finalBaseUrl = undefined
+  }
+
+  const providerModels = modelRegistry.filter(m => m.id.startsWith(provider + '/')).map(m => m.id)
+  let modelId = ''
+  if (providerModels.length > 0) {
+    modelId = await chooseInteractivePromise('Select default model:', providerModels)
+  } else {
+    modelId = await promptTextPromise('Enter custom model ID', `${provider}/model-name`)
+  }
+
+  if (!modelId) {
+    console.log(chalk.yellow('Wizard cancelled.'))
+    return
+  }
+
+  configManager.setProviderConfig(provider, {
+    apiKey: finalApiKey,
+    baseUrl: finalBaseUrl
+  })
+  configManager.setDefaultModel(modelId)
+  console.log(chalk.green(`\n✓ Configuration saved! Default model set to: ${chalk.bold(modelId)}`))
+}

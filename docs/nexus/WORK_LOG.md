@@ -415,3 +415,226 @@
 - **验证**:
   - `npm run typecheck` 通过。
   - `npm test` 通过，全量 60 项测试用例全部通过。
+
+## 0.27 2026-05-23 Lightweight CLI/TUI renderer
+
+- **用户请求**: 进一步开发并记录后，核对当前进度。
+- **实现结果**:
+  - 在 `src/cli/renderEvents.ts` 中引入轻量 terminal renderer 第一版，支持 compact / expanded 双模式渲染，并通过 `Ctrl-O` 切换视图。
+  - 新增 session 渲染状态管理：`startSession()`、`resumeSessionHistory()`、`redrawSession()`、`setActiveReadline()`，统一处理当前会话、历史恢复和 readline prompt 刷新。
+  - 新增 spinner 状态：在 thinking、tool running 等阶段显示动态状态，并在 assistant delta、tool completion、result/error/permission request 时停止。
+  - 将 assistant delta 保持直接流式输出，expanded 模式下显示 thinking delta，compact 模式下用 spinner 表达思考中状态。
+  - 升级工具渲染：compact 模式显示单行工具摘要，expanded 模式显示完整 input、success/output、Edit/Write diff、permission request/response 和 tool denial 详情。
+  - 在 `src/cli/program.ts` 中接入 renderer 状态，替换手写 session history 渲染，并为补全候选增加交互式下拉选择。
+  - 新增 `test/tui-renderer.test.ts`，覆盖 compact/expanded 渲染、工具结果、拒绝和错误输出；`package.json` 已将该测试纳入 `npm test`。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `npm test` 通过，全量 63 项测试用例全部通过。
+
+## 0.28 2026-05-23 Interactive CLI Autocomplete Mappings and /model Config Wizard
+
+- **用户请求**: 批准并推进重写，使得 BabeL-O 支持在 / 下拉选项中对工具自动完成进行映射，并参考 BabeL-X 实现交互式 `/model` 配置向导。
+- **实现结果**:
+  - **Tool Selection 自动完成映射**: 在 `src/cli/program.ts` 的 `completer` 中支持将 `/read` -> `read `、`/bash` -> `bash ` 等快捷下拉选项翻译为直接可执行的工具前缀，并保留常规控制指令（如 `/clear`、`/help` 等）。提取并导出了全局公共 `mapDropdownSelection()` 函数。
+  - **安全状态保护与键盘事件流恢复**:
+    - 为所有交互式 Prompt 控件（`chooseInteractive`、`promptSecret`、`promptText`、`runInteractiveDropdown`）增加了 `process.stdin.isRaw` 的状态恢复。
+    - **键盘事件流恢复 (Stdin Flow)**: 修复了 `rl.question()` 结束后 readline 自动暂停 stdin 流导致交互向导无法通过键盘输入（方向键、字符、回车）的问题。在控件启动时显式调用 `emitKeypressEvents(process.stdin)` 和 `process.stdin.resume()`，并在退出清理时调用 `process.stdin.pause()` 返回挂起状态。
+    - **方向键事件修复**: 经真实 PTY 复现发现清理 `data` listener 会移除 Node keypress parser 的底层解析器，导致 `/model` 的 Provider 选择无法响应 ↑/↓。已改为只临时接管业务层 `keypress` listener，不清理 `data` listener，也不在控件退出后暂停 stdin，确保回到 `bbl>` 后 readline 可继续接收输入。
+    - **方向键/控制键 Escape 序列兜底**: 在 `handleKey` 键盘事件分发中引入对原始 `chunk` 字节转义序列的兜底判断。在 `keypress` 解析器尚未完全准备或被挂起时，手动解析 `\x1b[A` (Up)、`\x1b[B` (Down)、`\r`/`\n` (Enter) 和 `\x1b` (Esc)，确保任何终端环境下方向键及确认取消功能 100% 坚固可用，同时自动屏蔽输入流中不慎掺杂的 `\x1b` 引导控制字符写入密码和文本字段。
+    - **live 渲染修复**: 将执行过程中的 TUI renderer 从全量 `redrawSession()` 改为追加式 `renderLiveEvent()`，避免 `session_started`、`tool_started`、`result` 等事件重绘整段历史时和 readline 当前输入行互相覆盖，修复中文输入后出现重复 `bbl>` 输入、`bsession` 错位等问题。
+  - **交互式 `/model` 配置向导**:
+    - 在 `bbl chat` 命令接收到不带参数的 `/model` 时，触发交互式向导，支持 Provider、API Key、Base URL 和 Model ID 连贯交互配置。
+    - **保留现有密钥**: 检测到 Provider 已有 API Key 配置时，提示 `(leave empty to keep existing key)` 允许用户直接回车保留。
+    - **自定义 URL 的清除**: 支持输入 `-` 显式清除自定义 Base URL 并还原到提供商的默认 Endpoint。
+  - **测试与模块隔离**:
+    - 新增 `test/completer.test.ts` 覆盖 `mapDropdownSelection` 的各种分支（工具别名转换、控制命令保留、未知输入防错）。
+    - 新增 renderer 测试覆盖 live `user_message` 忽略逻辑，避免 readline 已回显的输入在 TUI 事件流中被再次渲染。
+    - 针对 `src/cli/program.ts` 在末尾注入了 `isMain()` 判断机制，确保在运行单元测试导入该模块时，不会受 `process.argv` 污染而错误执行 commander 命令行。
+    - 将新测试登记到 `package.json` 的 `npm run test` 中，并通过 `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json` 隔离用户本机默认模型配置，避免测试因 `~/.babel-o/config.json` 指向真实 provider 而不稳定。
+  - **工具 fallback**:
+    - 为 `Grep` 和 `Glob` 增加 Node.js fallback：当系统没有 `rg` 或 PATH 中找不到 ripgrep 时，自动递归遍历工作区（跳过 `.git` / `node_modules`）完成内容搜索或文件列表过滤，避免出现 `TOOL_ERROR: spawn rg ENOENT`。
+- **验证**:
+  - PTY smoke：`/model` -> ↓↓ ↓↓ -> Enter 可切换到 `local`，返回 `bbl>` 后 `exit` 可正常退出。
+  - PTY smoke：输入 `你好` 后不再重复渲染多条 `bbl> 你好`；live `user_message` 事件已在 renderer 中忽略，历史恢复仍由 `resumeSessionHistory()` 渲染。
+  - PTY smoke：输入 `你是谁` 后输出采用追加渲染，不再出现重复输入行或 `bsession` 错位。
+  - 工具 smoke：在空 `PATH` 下运行 `glob package` 不再报 `spawn rg ENOENT`。
+  - `npm run typecheck` 通过。
+  - `npm test` 通过，全量 69 项测试用例全部绿屏成功。
+
+## 0.29 2026-05-23 CLI/TUI permission prompt wiring
+
+- **用户请求**: 当前 CLI/TUI 中没有给用户提供权限选择选项，参考 BabeL-X 权限交互方式修复。
+- **核对结果**:
+  - `LocalCodingRuntime` / `LLMCodingRuntime` 已具备 `permission_request` -> `PendingPermissionRegistry` -> approve/deny 的挂起确认流。
+  - 问题出在 `bbl chat` 本地 embedded path 创建 runtime 时未传入 `allowedTools`，导致 Bash/Write/Edit 在进入确认流前被 `denyByDefaultTools()` 直接策略拒绝，表现为 `Tool denied by Nexus policy: Bash`。
+  - BabeL-X 对应语义是高风险工具先进入 ask/permission dialog，由用户明确 allow/deny；不是默认静默执行。
+- **实现结果**:
+  - `src/cli/program.ts` 的本地 embedded `bbl chat` 改为使用 `createDefaultNexusRuntime({ storagePath, allowedTools: ['*'] })`，让高风险工具进入单次权限确认流。
+  - 保留默认 runtime 与 service runtime 的 deny-by-default 行为，避免放宽非交互服务安全边界；service 模式仍需通过 `--allowed-tools` 或 `NEXUS_ALLOWED_TOOLS` 明确开放可询问工具。
+  - 权限询问提示由泛化的 `Approve tool execution? [y/n]` 改为 `Approve <Tool> (<risk> risk)? [y/N]`，默认回车为拒绝；确认交互改为单键 TUI 输入，`y` 批准，`n` 或 Enter 拒绝。
+  - 本地 embedded permission prompt 改为异步处理，避免在 `permission_request` 事件持久化期间过早 resolve，导致 runtime 尚未注册 pending permission 而丢失用户选择。
+  - `src/nexus/server.ts` 启动日志修正默认 allowedTools 口径，避免把默认 deny-by-default 误显示成 all。
+  - 新增安全测试覆盖 `allowedTools: ['*']` 下高风险工具会触发 `permission_request`，且默认 policy denial 既有测试仍保留。
+- **验证**:
+  - `git diff --check` 通过。
+  - `npm run typecheck` 通过。
+  - `npm test` 通过，全量 70 项测试用例全部通过。
+  - PTY smoke：`bbl chat` 输入 `bash "pwd"` 后出现 `Permission requested for Bash (execute risk)` 与 `Approve Bash (execute risk)? [y/N]`。
+  - PTY smoke：按 `n` 会输出 `Permission denied`、`Bash denied`、`failed` 并返回 `bbl>`。
+  - PTY smoke：再次输入 `bash "pwd"` 后按 `y` 会输出 `Permission approved`、`Bash completed`、`done` 并返回 `bbl>`。
+
+## 0.30 2026-05-23 BabeL-X-inspired lightweight TUI second pass
+
+- **用户请求**: 参考 BabeL-X 的 TUI 设计，包括 CLI 交互形式、用户输入框、模型工具调用显示、agent 运行显示、模型输出和 `/tool` 下拉列表，以更合适合理的方式重写。
+- **参考结论**:
+  - BabeL-X 的关键交互不是单个组件，而是“稳定输入底栏 + 候选列表 + 状态化消息流 + 工具专属显示 + 权限/agent 状态分层”。
+  - BabeL-O 暂不引入完整 React/Ink 栈，先在现有 Nexus event stream 上实现轻量等价语义，避免扩大依赖和重写范围。
+- **实现结果**:
+  - 新增 `/tool` 工具选择面板，展示工具类别和用途说明；支持方向键选择和 Enter 执行对应工具前缀。
+  - 新增 completion metadata：`describeCompletionChoice()` / `formatCompletionChoice()` / `getToolCompletionChoices()`，为 slash command 与工具候选提供标签、描述和统一格式。
+  - `renderEvents.ts` 升级为更状态化的 TUI 输出：
+    - `session_started` 渲染为 `agent <sessionId> model <model>` 状态行。
+    - `tool_started` 渲染为工具运行块，显示工具名、输入摘要和 running 状态。
+    - `tool_completed` / `tool_denied` 渲染为 done/failed/denied 状态块，expanded 模式保留完整 input/output/diff。
+    - `task_session_event` 渲染为 `agent <phase> <event>`，补齐 agent 运行可观察性。
+    - `usage` 在 expanded 模式显示 token 统计。
+  - 将 chat 主循环从 `node:readline/promises` 切回 callback readline 并用 `questionAsync()` 包装，后续可继续对输入层做更细的 TUI 控制。
+  - 保留 readline 默认 Tab 补全作为兜底；BabeL-X 风格的描述式候选面板由 `/tool` 确定入口承载，避免 Node readline Tab 行为在不同终端里不稳定。
+- **验证**:
+  - `git diff --check` 通过。
+  - `npm run typecheck` 通过。
+  - `npm test` 通过，全量 72 项测试用例全部通过。
+  - PTY smoke：输入 `/tool` 后出现带 `[read]`、`[write]`、`[execute]` 等标签和说明的工具选择面板。
+  - PTY smoke：`/tool` 选择 read 后执行并显示 `agent <sessionId> model local/coding-runtime` 状态行。
+  - PTY smoke：执行 `bash "pwd"` 时显示 `Bash ... running`、权限确认、批准后 `Bash done` 与 `done`。
+
+## 0.31 2026-05-23 RECOMMENDATIONS roadmap sync
+
+- **用户请求**: 将 `docs/RECOMMENDATIONS.md` 中的建议更新到 TODO 文档中。
+- **实现结果**:
+  - `TODO.md` 增加 `RECOMMENDATIONS.md` 索引，并将当前优先级调整为 Context-Aware、MCP-Ready、Knowledge-First、P1 收口、P2 Performance。
+  - `TODO_runtime.md` 新增 P0 Context-Aware Runtime、P0 MCP-Ready Runtime Extensions、P1 Knowledge-First Skills、P2 Smart Permissions 四个章节。
+  - `TODO_agents.md` 补充 AgentTool 渐进演进路线：先 sub-task，再跨 session 委派，最后动态子 Agent。
+  - `TODO_performance.md` 补充 Observability / Metrics：本地结构化日志、SQLite metrics、execute duration、first token、context size、tool roundtrip 等。
+  - `TODO_cleanup.md` 补充不迁移 React/Ink、telemetry/analytics、复杂 plugin system 的规则，并加入 BabeL-X -> BabeL-O 文件映射表。
+- **验证**:
+  - 文档同步，无代码实现变更。
+  - `git diff --check` 通过。
+
+## 0.32 2026-05-23 Context-Aware runtime first slice
+
+- **用户请求**: 根据最新 TODO 推进项目。
+- **实现结果**:
+  - 新增 `src/runtime/contextAssembler.ts`，实现 `ContextBudget`、`allocateBudget()`、`selectRecentEvents()` 和 `assembleContext()`。
+  - 新增 `src/runtime/compactors/snipCompactor.ts`，对历史 `tool_completed.output` 做 head/tail 字符级截断；原始 events 仍保存在 SQLite，不改变审计数据。
+  - 新增 `src/runtime/memory.ts`，加载 `<cwd>/.babel-o/memory.md` 并限制最大注入字符数。
+  - `LLMCodingRuntime` 接入 context assembler，在调用 provider 前先选择近期事件、压缩历史工具输出并注入项目记忆。
+  - `buildSystemPrompt()` 支持 Project Memory 块，并导出以便测试。
+  - 新增 `test/context-assembler.test.ts`，覆盖预算分配、snip、近期事件选择、project memory 注入和消息映射前压缩。
+  - `package.json` 将 `test/context-assembler.test.ts` 纳入 `npm test`。
+- **仍未完成**:
+  - 规则化 session summary 尚未实现。
+  - Context benchmark 尚未建立，`TODO_runtime.md` 中 benchmark 项仍未勾选。
+- **验证**:
+  - `git diff --check` 通过。
+  - `npm run typecheck` 通过。
+  - `npm test` 通过，全量 76 项测试用例全部通过。
+
+## 0.33 2026-05-23 Context-Aware rule-based session summary
+
+- **用户请求**: 继续推进收口重写。
+- **实现结果**:
+  - 新增 `src/runtime/sessionSummary.ts`，对被 recent context 截掉的旧事件生成确定性规则摘要，不调用模型、不改写 SQLite 原始 events。
+  - 摘要覆盖旧 user message 数量、assistant/thinking 字符量、工具调用统计、引用文件、权限拒绝、错误和旧 result 状态。
+  - `contextAssembler` 现在区分 selected events 与 omitted events，只把 omitted events 生成 `Session Summary` 注入 system prompt，避免和近期完整上下文重复。
+  - `buildSystemPrompt()` 支持 `Session Summary` 块，与 `Project Memory` 分层注入。
+  - `test/context-assembler.test.ts` 增加规则摘要覆盖：长会话会注入摘要，短会话不生成摘要。
+- **仍未完成**:
+  - Context benchmark 尚未建立，`TODO_runtime.md` 中 benchmark 项仍未勾选。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts` 通过。
+  - `npm run typecheck` 通过。
+
+## 0.34 2026-05-23 Context-Aware benchmark gate
+
+- **用户请求**: 继续任务。
+- **实现结果**:
+  - `scripts/benchmark-performance-core.ts` 新增 `Context assembly long session` benchmark，输出原始上下文字符数、装配后字符数、压缩率、selected/omitted/snipped event 数量以及最近轮次保留标记。
+  - benchmark 主进程与 CLI 子进程均固定使用临时 `local/coding-runtime` 配置，避免读取用户本机真实 provider 配置导致 benchmark 卡住或依赖外部网络。
+  - benchmark 对 Context-Aware 建立失败门槛：长会话上下文压缩率必须达到 50%+，且最近三轮 marker 必须保留，否则 `npm run benchmark` 直接失败。
+  - `test/context-assembler.test.ts` 新增同等覆盖，确保 `npm test` 也会守住长会话 50%+ 压缩和最近三轮保留。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts` 通过。
+  - `npm run typecheck` 通过。
+  - `npm run benchmark` 通过；本机样本中 context 从 654,517 chars 降至 11,655 chars，压缩率 98.22%，保留 `recent-turn-37`、`recent-turn-38`、`recent-turn-39`。
+
+## 0.35 2026-05-23 MCP-ready stdio first slice
+
+- **用户请求**: 继续根据 TODO 文档推进重写。
+- **实现结果**:
+  - 新增 `src/mcp/McpClient.ts`，实现 JSON-RPC 2.0 over stdio 的 initialize、tools/list、tools/call、shutdown。
+  - 新增 `src/mcp/McpRegistry.ts`，合并加载 `~/.babel-o/mcp.json` 与 `<cwd>/.babel-o/mcp.json`，server 配置默认 `allowedTools: []`。
+  - 新增 `src/mcp/McpToolAdapter.ts`，将 MCP tool 注册为 BabeL-O tool，命名为 `mcp:<server>:<tool>`，并保留远端 input schema 给模型调用。
+  - `createDefaultNexusRuntime()` 支持 `enableMcp` 与 `cwd`，默认仍不启用 MCP；service 可通过 `BABEL_O_ENABLE_MCP=1` 打开。
+  - MCP tool 支持 `source` 元数据，`GET /v1/tools/audit` 与 `bbl tools audit` 可显示 source/server/originalName、risk 和 allowlist 状态。
+  - MCP tool 执行前会检查 server 级 `allowedTools`，未显式白名单的工具返回失败；write/execute 风险继续复用现有 permission_request 流。
+  - runtime storage close 时会 dispose MCP clients，避免 stdio server 子进程泄漏。
+  - 新增 `test/fixtures/mock-mcp-server.mjs` 与 `test/mcp.test.ts`，覆盖注册、审计、allowlist 和执行。
+- **仍未完成**:
+  - 官方 MCP server e2e smoke 尚未补齐。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/mcp.test.ts` 通过。
+  - `npm run typecheck` 通过。
+
+## 0.36 2026-05-23 MCP official smoke and chat TUI layering
+
+- **用户请求**: 推进 MCP 官方 server smoke 收尾，并改善 `bbl chat` 页面输入框、Bash 和信息分层显示。
+- **实现结果**:
+  - 新增 `npm run test:mcp:official`，由 `scripts/smoke-mcp-official.ts` 通过 npx 启动 3 个官方 MCP server：`@modelcontextprotocol/server-filesystem`、`@modelcontextprotocol/server-memory`、`@modelcontextprotocol/server-everything`。
+  - 官方 smoke 覆盖 tools/list；filesystem 额外调用 `read_file` 读取临时文件，验证真实 tools/call。
+  - MCP client 支持新版官方 SDK 的 JSONL stdio framing，同时保留旧 Content-Length framing 兼容本地 mock server。
+  - MCP client 在 initialize 后发送 `notifications/initialized`，并 drain stderr，避免官方 server 输出导致管道阻塞。
+  - `bbl chat` 输入提示从 `bbl>` 改为更接近输入框的 `> `。
+  - TUI renderer 将 assistant、thinking、tool/bash、permission 和 result 分层显示；Bash 会以 `bash` 层标记，普通工具以 `tool` 层标记。
+  - session 状态行压缩 session id 和过长 model id，避免截图中 model 名换行挤压。
+  - `test/tui-renderer.test.ts` 增加 assistant 与 Bash/tool 分层断言。
+- **验证**:
+  - `BABEL_O_MCP_SMOKE_TIMEOUT_MS=90000 npm run test:mcp:official` 通过：filesystem 14 tools、memory 9 tools、everything 13 tools。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/tui-renderer.test.ts test/mcp.test.ts` 通过。
+
+## 0.37 2026-05-23 Chat TUI block hierarchy polish
+
+- **用户请求**: 当前模型输出层级仍不清晰，参考 Claude/Gemini 风格继续重写 TUI。
+- **实现结果**:
+  - `renderEvents.ts` 将 live 输出改为块状层级：assistant 回复使用 `⏺`，expanded thinking 使用 `▸ Thought`，工具调用使用 `● Tool(input)`。
+  - 工具运行、完成、拒绝和权限确认不再和 spinner 粘连；`tool_started` 前主动停止 spinner。
+  - 移除普通执行阶段对 stdin raw mode 的切换，只在交互控件/权限确认里临时接管键盘，修复 `bash "pwd"` 等命令在终端中重复回显的问题。
+  - 修复权限拒绝后 `formatToolInput(undefined)` 引发的异常。
+  - `test/tui-renderer.test.ts` 增加 `▸ Thought` 分块断言，并更新工具完成行断言为 `● ... done` 风格。
+- **验证**:
+  - PTY smoke：`bbl chat` 输入 `bash "pwd"` 只回显一次；Bash 行显示为 `● Bash({...}) running`；拒绝权限不会抛错，批准权限显示 `● ✓ Bash done`。
+
+## 0.38 2026-05-23 Multi-level permission approval panel
+
+- **用户请求**: 将权限确认从 `y/n` 改为图片中的上下选择、多级权限面板。
+- **实现结果**:
+  - `askPermission()` 从单键 `y/n` 升级为 approval panel，支持方向键上下选择、数字 `1/2/3/4` 快捷选择、Enter 确认、Esc 拒绝。
+  - 权限选项包括 `Approve once`、`Approve for this session`、`Reject`、`Reject, tell the model what to do instead`。
+  - `Approve for this session` 会在当前 CLI session 内缓存同一工具名，后续同工具 permission request 自动批准。
+  - `Reject, tell the model what to do instead` 会收集用户说明，并作为 permission denial reason 返回给 runtime/model。
+  - `permission_request` live 渲染不再额外打印旧的 `? Permission requested...` 行，避免和新 approval panel 重复。
+  - 新增 `formatPermissionDialog()` 单元测试，防止权限 UI 退回单行 `y/n`。
+- **验证**:
+  - PTY smoke：`bash "pwd"` 出现 approval panel；按 `2` 批准本会话，第二次 Bash 自动批准。
+  - PTY smoke：`write tmp-permission.txt hello` 按 `4` 后输入说明，runtime 收到对应拒绝原因且不抛错。
+
+## 0.39 2026-05-23 Slash command dropdown palette
+
+- **用户请求**: 当前项目 `/` 无法显示下拉列表，参考图片构建 `/` 下拉工具列表。
+- **实现结果**:
+  - `bbl chat` 增加 slash command palette：当前输入为 `/...` 且尚未包含参数空格时自动显示下拉候选。
+  - 下拉列表采用两列布局：左侧命令，右侧描述；底部显示 `↑/↓ Navigate · tab Complete · enter Run`。
+  - 支持上下键移动选中项，Tab 将当前选中命令补全到输入行；输入参数后自动关闭 palette，避免干扰 `/model xxx` 和自然语言输入。
+  - 新增 `getSlashPaletteChoices()` 与 `formatSlashPalette()` 单元测试，覆盖过滤、描述渲染和参数后不弹出。
+- **验证**:
+  - PTY smoke：输入 `/` 后显示下拉列表；按 ↓ 后选中 `/clear`；按 Tab 后输入行补全为 `/clear`。

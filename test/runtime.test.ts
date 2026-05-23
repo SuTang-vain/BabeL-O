@@ -14,7 +14,7 @@ test('execute reads a workspace file and records session events', async () => {
   await mkdir(cwd, { recursive: true })
   await writeFile(join(cwd, 'sample.txt'), 'hello nexus\n', 'utf8')
 
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const response = await app.inject({
@@ -39,7 +39,7 @@ test('execute reads a workspace file and records session events', async () => {
 test('plain prompts return local runtime guidance', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-plain`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const response = await app.inject({
@@ -105,7 +105,7 @@ test('sqlite storage persists sessions and events across storage instances', asy
 test('/v1/execute session reuse and history mapping', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-reuse`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   try {
@@ -153,7 +153,7 @@ test('/v1/execute session reuse and history mapping', async () => {
 test('session input, cancel, and task lifecycle endpoints update state', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-lifecycle`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const executeResponse = await app.inject({
@@ -207,7 +207,7 @@ test('session input, cancel, and task lifecycle endpoints update state', async (
 test('tool audit reports risk and allowlist status', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-audit`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({
+  const { runtime, storage } = await createDefaultNexusRuntime({
     allowedTools: ['Read', 'Grep', 'Glob'],
   })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
@@ -230,11 +230,58 @@ test('tool audit reports risk and allowlist status', async () => {
   }
 })
 
+test('Grep and Glob fall back when ripgrep is unavailable', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-rg-fallback`)
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'src', 'fallback.txt'), 'needle appears here\n', 'utf8')
+
+  const oldPath = process.env.PATH
+  process.env.PATH = ''
+  try {
+    const { runtime, storage } = await createDefaultNexusRuntime({
+      allowedTools: ['Grep', 'Glob'],
+    })
+    const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+    try {
+      const grepResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/execute',
+        payload: { prompt: 'grep needle', cwd },
+      })
+      assert.equal(grepResponse.statusCode, 200)
+      assert.match(
+        JSON.stringify(
+          grepResponse.json().events.find((event: { type: string }) => event.type === 'tool_completed'),
+        ),
+        /fallback\.txt/,
+      )
+
+      const globResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/execute',
+        payload: { prompt: 'glob fallback', cwd },
+      })
+      assert.equal(globResponse.statusCode, 200)
+      assert.match(
+        JSON.stringify(
+          globResponse.json().events.find((event: { type: string }) => event.type === 'tool_completed'),
+        ),
+        /fallback\.txt/,
+      )
+    } finally {
+      await app.close()
+    }
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH
+    else process.env.PATH = oldPath
+  }
+})
+
 test('allowlisted runtime executes allowed tools and denies blocked tools', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allowlist`)
   await mkdir(cwd, { recursive: true })
   await writeFile(join(cwd, 'sample.txt'), 'hello allowlist\n', 'utf8')
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const readResponse = await app.inject({
@@ -269,7 +316,7 @@ test('allowlisted runtime executes allowed tools and denies blocked tools', asyn
 test('session list stays lightweight while session detail keeps events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-session-list`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const executeResponse = await app.inject({
@@ -302,7 +349,7 @@ test('session list stays lightweight while session detail keeps events', async (
 test('session detail uses recent events and events endpoint paginates history', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-events-page`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const executeResponse = await app.inject({
@@ -345,7 +392,7 @@ test('session detail uses recent events and events endpoint paginates history', 
 test('execute timeout aborts long-running tools and records metrics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-timeout`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -384,7 +431,7 @@ test('execute timeout aborts long-running tools and records metrics', async () =
 test('execute concurrency gate rejects excess work quickly', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-busy`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -423,7 +470,7 @@ test('tool output is truncated before it is stored in events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-truncate`)
   await mkdir(cwd, { recursive: true })
   await writeFile(join(cwd, 'big.txt'), 'x'.repeat(500), 'utf8')
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({
     runtime,
     storage,
@@ -459,7 +506,7 @@ test('tool output is truncated before it is stored in events', async () => {
 test('bash max buffer is configurable and fails safely on excessive output', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-buffer`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -489,7 +536,7 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
 test('websocket stream executes prompts and records stream metrics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     await app.ready()
@@ -521,7 +568,7 @@ test('websocket stream executes prompts and records stream metrics', async () =>
 test('websocket stream timeout aborts long-running tools', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream-timeout`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -556,7 +603,7 @@ test('websocket stream timeout aborts long-running tools', async () => {
 test('websocket stream concurrency gate rejects excess work', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream-busy`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
     runtime,
     storage,
@@ -598,7 +645,7 @@ test('bash tool session CWD retention', async () => {
   const subDir = join(baseCwd, 'sub')
   await mkdir(subDir, { recursive: true })
 
-  const { runtime, storage } = createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: baseCwd })
   try {
     const sessionId = `test-session-${Date.now()}`

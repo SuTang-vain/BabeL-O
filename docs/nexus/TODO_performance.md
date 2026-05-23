@@ -14,6 +14,7 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] 已建立正式 benchmark。
 - [x] 已建立 `npm run benchmark`。
 - [x] 已记录 startup trace。
+- [x] 已建立 Context-Aware 长会话压缩 benchmark。
 - [x] `/v1/sessions` 采用轻量摘要，避免默认携带全量 events。
 - [x] `/v1/execute` 支持 timeout。
 - [x] `/v1/runtime/metrics` 提供机器可读 metrics。
@@ -31,6 +32,7 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] benchmark `/v1/runtime/status`。
 - [ ] benchmark `chat` 首次响应时间。
 - [x] benchmark Read/Grep/Bash 工具。
+- [x] benchmark 长会话 context assembly 压缩率和最近轮次保留。
 - [x] 输出机器可读 JSON。
 
 ## P1 Runtime Performance
@@ -68,6 +70,21 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [ ] tool call roundtrip duration 记录。
 - [ ] retry policy benchmark。
 - [ ] provider timeout policy。
+
+## P2 Observability / Metrics
+
+来自 `docs/RECOMMENDATIONS.md` 的 Milestone 5。目标是本地可观测，不迁移 BabeL-X 的 telemetry / analytics / GrowthBook。
+
+- [ ] 新增最小结构化 logger，支持 `NEXUS_LOG_LEVEL=silent`。
+- [ ] SQLite metrics 表记录执行指标。
+- [ ] 记录 `execute_duration_ms`。
+- [ ] 记录 `provider_first_token_ms`。
+- [x] benchmark 记录 context 字符级近似输入规模、压缩后规模和压缩率。
+- [ ] runtime metrics 记录 `context_tokens_in` / `context_tokens_out` 或字符级近似值。
+- [ ] 记录 `tool_call_count`。
+- [ ] 记录 `tool_roundtrip_duration_ms`。
+- [ ] `/v1/runtime/metrics` 返回新增指标。
+- [ ] 压力测试覆盖 1000+ sessions。
 
 ## 验证命令
 

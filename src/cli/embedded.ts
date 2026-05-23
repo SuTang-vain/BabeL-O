@@ -2,7 +2,7 @@ import { createNexusApp } from '../nexus/app.js'
 import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
 
 export async function executeEmbedded(prompt: string, cwd: string) {
-  const { runtime, storage } = createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const response = await app.inject({

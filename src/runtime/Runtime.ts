@@ -25,4 +25,9 @@ export type RuntimeToolAuditEntry = {
   description: string
   risk: ToolRisk
   allowed: boolean
+  source?: {
+    type: 'builtin' | 'mcp'
+    serverName?: string
+    originalName?: string
+  }
 }

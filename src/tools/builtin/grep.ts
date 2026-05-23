@@ -1,4 +1,6 @@
 import { execFile } from 'node:child_process'
+import { readdir, readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
@@ -37,7 +39,68 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
       ) {
         return { success: true, output: '' }
       }
+      if (
+        typeof error === 'object' &&
+        error !== null &&
+        'code' in error &&
+        error.code === 'ENOENT'
+      ) {
+        const output = await grepFallback(context.cwd, input.path, input.pattern, input.maxMatches)
+        return { success: true, output }
+      }
       throw error
     }
   },
+}
+
+async function grepFallback(
+  cwd: string,
+  searchPath: string,
+  pattern: string,
+  maxMatches: number,
+): Promise<string> {
+  const root = join(cwd, searchPath)
+  const results: string[] = []
+  const needle = pattern.toLowerCase()
+
+  async function visit(path: string): Promise<void> {
+    if (results.length >= maxMatches) return
+    let entries
+    try {
+      entries = await readdir(path, { withFileTypes: true })
+    } catch {
+      await scanFile(path)
+      return
+    }
+
+    for (const entry of entries) {
+      if (results.length >= maxMatches) return
+      if (entry.name === 'node_modules' || entry.name === '.git') continue
+      const fullPath = join(path, entry.name)
+      if (entry.isDirectory()) {
+        await visit(fullPath)
+      } else if (entry.isFile()) {
+        await scanFile(fullPath)
+      }
+    }
+  }
+
+  async function scanFile(filePath: string): Promise<void> {
+    if (results.length >= maxMatches) return
+    let text = ''
+    try {
+      text = await readFile(filePath, 'utf8')
+    } catch {
+      return
+    }
+    const lines = text.split('\n')
+    for (let index = 0; index < lines.length && results.length < maxMatches; index++) {
+      if (lines[index]!.toLowerCase().includes(needle)) {
+        results.push(`${filePath}:${index + 1}:${lines[index]}`)
+      }
+    }
+  }
+
+  await visit(root)
+  return results.join('\n')
 }

@@ -20,6 +20,13 @@ export type ToolDefinition<TInput extends z.ZodType = z.ZodType> = {
   description: string
   risk: ToolRisk
   inputSchema: TInput
+  modelInputSchema?: unknown
+  source?: {
+    type: 'builtin' | 'mcp'
+    serverName?: string
+    originalName?: string
+  }
+  dispose?(): Promise<void> | void
   execute(input: z.infer<TInput>, context: ToolContext): Promise<ToolResult>
 }
 

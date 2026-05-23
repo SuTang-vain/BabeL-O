@@ -37,6 +37,7 @@ export class LocalCodingRuntime implements NexusRuntime {
         description: tool.description,
         risk: tool.risk,
         allowed: this.toolPolicy.isAllowed(tool),
+        source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
   }
@@ -333,6 +334,22 @@ function parseIntent(prompt: string): ParsedIntent {
   const trimmed = prompt.trim()
   const [verb = '', ...rest] = splitCommand(trimmed)
   const arg = rest.join(' ')
+
+  if (verb.includes(':') && arg) {
+    try {
+      return {
+        kind: 'tool',
+        toolName: verb,
+        input: JSON.parse(arg),
+      }
+    } catch {
+      return {
+        kind: 'tool',
+        toolName: verb,
+        input: {},
+      }
+    }
+  }
 
   if (verb === 'read' && arg) {
     return { kind: 'tool', toolName: 'Read', input: { path: arg } }

@@ -48,6 +48,52 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 增加 `PATCH /v1/sessions/:id/tasks/:taskId`。
 - [x] 增加 task claim/complete endpoint。
 
+## P0 Context-Aware Runtime
+
+来自 `docs/RECOMMENDATIONS.md` 的 Milestone 1。目标是先做低风险、Nexus-owned 的上下文预算和压缩，不迁移 BabeL-X 的重型后台 SessionMemory 子 Agent。
+
+- [x] 新增 `ContextBudget`：按 model context window 分配 system / memory / summary / recent budgets，预留输出余量。
+- [x] 新增 `src/runtime/compactors/snipCompactor.ts`：对超长 `tool_completed.output` 做 head/tail 字符级截断，原始 events 继续完整保存在 SQLite。
+- [x] 新增 `src/runtime/contextAssembler.ts`：按 System Prompt、Project Memory、Session Summary、Recent Events、Current Turn 分层装配模型上下文。
+- [x] 支持 `.babel-o/memory.md` 项目记忆加载，并注入 system prompt。
+- [x] 初版只做字符预算和规则摘要；暂不实现 BabeL-X `SessionMemory` 的后台子 Agent 提取。
+- [x] Benchmark：长会话上下文输入规模降低 50%+，且最近 3-5 轮完整保留。
+
+## P0 MCP-Ready Runtime Extensions
+
+来自 `docs/RECOMMENDATIONS.md` 的 Milestone 2。目标是利用 Nexus-first 架构把 MCP server 作为 Nexus 管理的外部工具源，而不是绑定 CLI 生命周期。
+
+- [x] 新增 `src/mcp/McpClient.ts`：实现 JSON-RPC 2.0 over stdio，覆盖 initialize、tools/list、tools/call、shutdown。
+- [x] 新增 `src/mcp/McpRegistry.ts`：加载 `~/.babel-o/mcp.json` 和项目级 MCP 配置。
+- [x] 新增 `src/mcp/McpToolAdapter.ts`：将 MCP tool 适配为 BabeL-O `ToolDefinition`。
+- [x] MCP 初版只支持 stdio transport；http/sse/ws/OAuth/XAA 延后。
+- [x] MCP server 配置默认 `allowedTools: []`，未显式白名单的 MCP 工具全部拒绝。
+- [x] MCP tool 风险在适配阶段确定：read / write / execute / task，并复用现有 `permission_request` 流。
+- [x] `GET /v1/tools/audit` 和 `bbl tools audit` 显示 MCP tool 来源、server name、risk 和 allowlist 状态。
+- [x] 增加至少 3 个官方 MCP server e2e smoke。
+
+## P1 Knowledge-First Skills
+
+来自 `docs/RECOMMENDATIONS.md` 的 Milestone 3。目标是先实现纯文本 inline Skills，为模型提供稳定工作方法，不迁移 BabeL-X 的 React `SkillTool` 和 fork 模式。
+
+- [ ] 新增 `src/skills/loader.ts`：解析 front matter，加载 skill id/name/triggers/priority/content。
+- [ ] 支持三级目录：`src/skills/built-in`、`~/.babel-o/skills`、`<cwd>/.babel-o/skills`。
+- [ ] 新增 `matchSkills(skills, prompt)`：按触发词匹配，最多注入 3 个，按 priority 排序。
+- [ ] 将匹配到的 inline skill 注入 system prompt 或 context assembler。
+- [ ] 内置 5 个 skill：coding、optimization、debugging、testing、git。
+- [ ] 初版不支持 `mode: fork`；fork 等 AgentLoop/sub-agent 能力稳定后再接。
+
+## P2 Smart Permissions
+
+来自 `docs/RECOMMENDATIONS.md` 的 Milestone 4。目标是从全手动审批升级为轻量规则自动分类，不迁移 BabeL-X 的复杂九阶段权限管道。
+
+- [ ] 新增 `src/runtime/classifier.ts`。
+- [ ] Read/Grep/Glob 等 read-only 操作自动放行。
+- [ ] Bash 支持安全白名单：`ls`、`cat`、`pwd`、`git status`、`git log`、`git diff`、`npm list`、`npx tsc --noEmit` 等。
+- [ ] Bash 支持危险黑名单：`rm -rf`、`sudo`、管道 curl/wget、`npm publish`、`git push` 等。
+- [ ] 写操作默认仍要求人工确认。
+- [ ] 所有自动放行/拒绝记录 permission audit reason。
+
 ## P1 Storage
 
 - [x] 定义正式 `NexusStorage` schema 版本。
