@@ -43,8 +43,12 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
       .split('\n')
       .filter(Boolean)
       .filter(file => file.includes(needle))
-      .slice(0, input.maxResults)
-    return { success: true, output: files }
+    const truncated = files.length > input.maxResults
+    const sliced = files.slice(0, input.maxResults)
+    if (truncated) {
+      sliced.push(`... (${files.length - input.maxResults} more results truncated)`)
+    }
+    return { success: true, output: sliced }
   },
 }
 

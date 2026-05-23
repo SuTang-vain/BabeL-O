@@ -2,6 +2,37 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.51 2026-05-24 P2 Model Capability Routing 收口
+
+- **用户请求**: 根据下一步开发建议继续稳步重写，优先推进 Provider Registry 收口与 Agent 能力闭环。
+- **实现结果**:
+  - **统一模型解析优先级**：`ConfigManager.resolveSettings()` 支持传入 `{ model, role, provider }`，明确优先级为 request model > env model > role model > profile model > defaultModel。
+  - **Provider 解析修正**：带 provider 前缀的模型 ID（如 `deepseek/deepseek-v4-pro`）不再被 `BABEL_O_PROVIDER` 或 active profile provider 错配，避免 request model 被错误送到其他 adapter。
+  - **Nexus HTTP/WS 统一口径**：`POST /v1/execute` 与 WS `/v1/stream` 均使用 `resolveSettings({ model })` 解析 request model，继续对 `toolCalling=false` 的已知模型前置拒绝。
+  - **Structured role gate**：`runtimeAgentStep.ts` 在 Agent step 执行前校验模型能力。工具角色要求 `toolCalling=true`；`modelPreference.capability === 'structured-output'` 的角色要求 `jsonOutput=true`。不满足时直接报错，不调用 runtime。
+  - **测试覆盖**：新增配置解析测试，锁定 request model 优先于 env/role/profile/default；新增 Agent Step 测试，验证 Critic 这类 structured role 在不支持 JSON 输出模型上被前置拒绝。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/agent-loop.test.ts test/runtime.test.ts` 成功通过，42/42 全绿。
+- **后续核对**:
+  - Model Capability Routing 核心路径已收口；未配置 roles 时根据 role capability 自动推荐默认模型仍待补。
+
+## 0.50 2026-05-23 P0 Safety / Stability Hardening
+
+- **用户请求**: 根据 TODO 文档进一步重写开发，优先收口 P0 安全与稳定性问题：PendingPermissionRegistry TTL、storageBridge 持久化重试、模块级 Map 生命周期、Bash 标记注入、`new Function` 动态 import。
+- **实现结果**:
+  - **PendingPermissionRegistry TTL**：`src/shared/session.ts` 为 pending permission 增加 `expiresAt`、30 分钟默认 TTL、后台 sweeper、`sweepExpired()`、`pendingCount()`、测试配置与 reset 入口。超时请求自动返回 deny，释放等待中的 Promise。
+  - **storageBridge 重试队列**：`src/nexus/storageBridge.ts` 从 fire-and-forget 改为内存持久化队列，支持最多 3 次重试、延迟调度、永久失败计数、`lastError` 与 `getStorageBridgeStats()`。
+  - **模块级 Map 生命周期**：`src/tools/builtin/bash.ts` 的 `sessionCwdMap` 保存 `lastActiveAt` 并增加 TTL prune；`src/nexus/taskQueue.ts` 与 `src/nexus/taskSession.ts` 对终态 task/session 增加 24 小时默认 prune 与后台 sweeper。
+  - **Bash probe 加固**：Bash CWD 状态探测从固定 `---BABEL_O_STATE---` 改为每次执行随机 nonce + HMAC marker，并用 `timingSafeEqual` 验证，避免用户命令伪造 marker 污染会话 CWD。
+  - **动态 import 安全收口**：移除 CLI/测试中 `new Function("return import('ws')")` 形式，改为普通 `await import('ws')`，并补充本地 `src/types/ws.d.ts` 以保持 strict typecheck。
+  - **测试覆盖**：新增/更新测试覆盖 pending permission 超时、task/session prune、storageBridge 失败后重试、Bash forged marker 防护、Bash CWD TTL prune。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/permission-flow.test.ts test/agent-loop.test.ts test/runtime.test.ts test/security.test.ts` 成功通过，43/43 全绿。
+- **后续核对**:
+  - 本次完成的是 P0 级长运行进程稳定性治理。`storageBridge` durable WAL、批量写入和 session close event 级联清理仍可作为后续可靠性增强，不再作为当前 P0 阻塞。
+
 ## 0.1 2026-05-21 Clean rewrite skeleton
 
 - **用户请求**: 在 `/Users/tangyaoyue/develop/BabeL-O` 新文件夹中进行 BabeL-X Nexus-first 重写。
@@ -638,3 +669,170 @@
   - 新增 `getSlashPaletteChoices()` 与 `formatSlashPalette()` 单元测试，覆盖过滤、描述渲染和参数后不弹出。
 - **验证**:
   - PTY smoke：输入 `/` 后显示下拉列表；按 ↓ 后选中 `/clear`；按 Tab 后输入行补全为 `/clear`。
+
+## 0.40 2026-05-23 P1 Knowledge-First Skills and prompt integration
+
+- **用户请求**: 批准，继续稳步推进重写；更新todo文档和工作记录文档。
+- **实现结果**:
+  - 新增 `src/skills/loader.ts`，解析 markdown front-matter (id, triggers, priority, name)，并支持 built-in、user (~/.babel-o/skills) 和 project (<cwd>/.babel-o/skills) 三级目录覆盖。
+  - 新增 `src/skills/matcher.ts`，基于触发词在 prompt 中匹配度、优先级和 id 进行多级排序，单次 query 最多匹配并提取 3 个 inline skills。
+  - 新增 5 个内置技能 markdown 模板 (`coding`, `optimization`, `debugging`, `testing`, `git`) 放置于 `src/skills/built-in/`。
+  - 改造 `src/runtime/contextAssembler.ts` 与 `LLMCodingRuntime.ts` 中的 `buildSystemPrompt`，将匹配到的技能拼装为 `Active Developer Skills` 结构化 markdown 文本注入到 LLM system prompt。
+  - 新增 `test/skills.test.ts` 单元与集成测试，并在 `package.json` 的 `npm test` 中注册。
+- **验证**:
+  - `npm run typecheck` 通过.
+  - `npm test` 通过，全量 93 个测试用例全部绿屏通过。
+
+## 0.41 2026-05-23 P1 Wrapping-Up: provider validation, E2E smoke, profile switching, task status board
+
+- **用户请求**: 批准，并且顺便完成 第一优先级：P1 收口 (P1 Wrapping-up)。主要目标是补齐现有 Provider、Model 与 任务界面的易用性与功能盲区，实现完整的功能闭环。同时检查并修正 DeepSeek 模型的选择映射以支持最新的 V4 模型（`deepseek-v4-pro` 和 `deepseek-v4-flash`），以及为项目的 TUI 界面用户输入添加上下输入框分割线。
+- **实现结果**:
+  - **Provider 参数校验**: 扩展 `src/shared/config.ts` 中的 `ProviderConfigSchema`、`ProfileConfigSchema` 和 `BabelOConfigSchema`，严格限制提供商参数格式（如 `apiKey` 最小长度及 `baseUrl` URL 格式），对 model/provider ID 结合 registry 进行存在性检查，并在配置加载出错时友好警示，避免擦除用户配置。
+  - **DeepSeek V4 模型更新**: 更新 `src/providers/registry.ts` 和 `src/providers/adapters/OpenAIAdapter.ts` 以将 DeepSeek 模型首选映射切换到 `deepseek/deepseek-v4-pro` (默认旗舰推理模型) 和 `deepseek/deepseek-v4-flash` (快速高性价比模型)，保留 `deepseek-chat` (V3) 和 `deepseek-reasoner` (R1) 作为向后兼容选项，并确保 V4 Pro 在使用 OpenAI 适配器时能够正确命中并还原 `reasoning_content`。
+  - **真实提供商冒烟测试**: 新增 `scripts/smoke-providers.ts`，对 Anthropic/OpenAI/DeepSeek 等真实厂商接口提供流式 E2E 测试，如未配置对应密钥则优雅跳过；在 `package.json` 中注册 `"test:providers:smoke"` 命令。
+  - **模型/环境切换 (`/profile`)**: 在交互命令行中支持 `/profile` 列出配置、`/profile clear` 清理当前环境、`/profile add <name>` 基于当前配置克隆新环境、`/profile <name>` 切换活动配置。并在 `src/cli/program.ts` 中补全补全别名及 Tab 自动补全逻辑。
+  - **任务状态看板**: 实现了任务状态跟踪逻辑 `formatTaskStatusPanel`，并在 `src/cli/renderEvents.ts` 的 `formatSessionHistory` 底部实时显示当前会话任务状态（规划中、执行中、已完成、已失败）。
+  - **TUI 输入框分割线**: 优化 `src/cli/program.ts` 的会话输入循环，在用户输入提示符的前后均输出亮灰色细横线分割栏（`─`），实现用户输入区域与历史日志内容的视觉物理隔离。
+  - **测试覆盖**:
+    - 在 `test/runtime-llm.test.ts` 中补充 ConfigManager 校验及 profiles 切换用例。
+    - 在 `test/tui-renderer.test.ts` 中补充 Task Status Panel 格式断言。
+    - 在 `test/adapters.test.ts` 中新增 DeepSeek V4 推理序列化和 `(reasoning omitted)` 降级机制断言。
+- **验证**:
+  - `npm run typecheck` 成功无错。
+  - `npm test` 通过，全量 97 个测试用例全绿通过。
+  - `npm run test:providers:smoke` 成功运行并输出跳过/成功状态。
+
+## 0.42 2026-05-23 Context boundary correction for long sessions
+
+- **用户请求**: 继续核对聊天输入读取问题，并参考 BabeL-X 的上下文处理方式吸收更好的设计。
+- **实现结果**:
+  - 修复 `src/runtime/contextAssembler.ts` 的长会话截断策略：不再优先保留最早的用户开场，而是从最近窗口中的首个 `user_message` 开始切片，避免旧 `hi` 与残缺的早期历史污染模型上下文起点。
+  - 在 `src/runtime/LLMCodingRuntime.ts` 的 `buildSystemPrompt()` 中加入 `Context Boundary` 段，明确提示模型“更早的历史已经压缩，最近消息才是权威工作历史”，吸收了 BabeL-X 的边界提示设计。
+  - 更新 `test/context-assembler.test.ts`，增加对最新中文问题优先级与边界提示的回归断言。
+  - 同步更新 `docs/nexus/TODO.md` 与 `docs/nexus/TODO_runtime.md` 的状态说明。
+- **验证**:
+  - `git diff --check` 通过。
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime-llm.test.ts` 通过。
+
+## 0.43 2026-05-23 TUI Input borders and full-width alignment polish
+
+- **用户请求**: 为项目的 tui 界面用户输入添加上下输入框分割线，输入部分应该是有上下两条分割线，覆盖终端的左右边界。
+- **实现结果**:
+  - 优化 `src/cli/program.ts` 会话输入循环：在输入等待前通过 stdout 顺序绘制上线、空行和下线，并使用 ANSI `\x1b[2A` 将光标回退 2 行至输入行进行 readline 输入。输入完成后使用 `\x1b[1B\r` 将光标跨越下分割线。
+  - 移除原分割线中 Math.min(..., 72) 的硬限制，改用 `process.stdout.columns || 80`。分割线会根据终端当前实际列宽大小动态调整，完美拉满到左右边界。
+  - 修复 `/` 下拉补全菜单关闭时 `clearScreenDown` 擦除并丢失底部分割线的问题：在 `close()` 中增加 `wasOpen` 条件守卫，仅在菜单开启时执行重画下分割线和光标归位。
+- **验证**:
+  - 启动会话后显示完美的上下两条分割线，横跨整个终端左右边界。
+  - 正常按下回车提交输入后，分割线完全对齐保留，没有任何多余的 `>` 符号。
+  - 输入 `/` 弹出补全菜单并选择或 Esc 关闭后，下方的分割线重绘成功且位置保持一致。
+  - 单元测试 97/97 全部通过。
+
+## 0.44 2026-05-23 P2 Performance Hardening: Grep/Glob limits, Sqlite N+1 optimization, and CLI dynamic loading
+
+- **用户请求**: 根据 todo 文档稳步推进重写任务：p2 性能优化硬化与硬边界。
+- **实现结果**:
+  - **Grep/Glob 结果安全限额**：在 `grep.ts` 及其 fallback 的 fs 遍历执行中，强制限制输出行数在 `maxMatches`（最大 200 行），超限时进行安全裁剪并追加 `... (matches truncated for context budget)` 说明。在 `glob.ts` 中切片输出结果至 `maxResults`，并在末尾追加说明元素，防止大项目文件搜索耗尽模型上下文。
+  - **消灭存储 N+1 查询**：重构 `SqliteStorage.listSessions` 的多会话获取逻辑。当 `includeEvents: true` 时，用单次 `LEFT JOIN` 联合查询拼装全量数据，并在内存侧分组，代替以往查询 50 个会话需要进行 51 次数据库查询 the N+1 瓶颈。
+  - **SQLite 复合索引与平滑升级**：重组 `tool_traces` 的索引结构为复合索引 `(session_id, started_at, tool_use_id)` 提升分页检索效率。设计 `user_version = 3` 数据库自动迁移，在初始化时自动 DROP 旧索引并建立新索引，保护已有 session 历史文件。
+  - **CLI 3ms 启动懒加载**：重构 `src/cli/program.ts` 的头部静态引用，将 `createDefaultNexusRuntime`、`SqliteStorage` 等大型模块全部转换为 async action 内部的延迟 `await import`。`bbl --help` 启动时间由原本的 tsx 加载几百毫秒压缩到了 `3.07ms`（`cli.imported` 编译仅耗时 `0.06ms`），极大缩短了冷启动延迟。
+  - **测试覆盖**：在 `test/runtime.test.ts` 中新增 Grep 与 Glob 限额截断的专门断言。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 通过，全量 100 个测试用例全部绿屏跑通。
+  - `BABEL_O_STARTUP_TRACE=1 npm run cli -- --help` 显示冷启动耗时大幅减小至 3.07ms。
+- **后续核对**:
+  - 该阶段完成的是性能硬边界核心项；大量 session/event 压测、chat 首响 benchmark、retry benchmark 和结构化 logger 仍按 `TODO_performance.md` 跟进。
+  - 2026-05-23 复核时发现 `rg --max-count=maxMatches` 无法判断是否还有更多匹配，已修正为探测 `maxMatches + 1` 条再裁剪，避免 truncation warning 缺失。
+
+## 0.45 2026-05-23 P2 Smart Permissions: Automatic rule classifier and audit logging
+
+- **用户请求**: 根据 todo 文档稳步推进开发重写：P2 智能权限分类。
+- **实现结果**:
+  - **规则分类器 (`src/runtime/classifier.ts`)**：实现对输入工具调用的自动分类逻辑。对 `Read`、`Grep`、`Glob` 等只读查询工具以及 `ls`、`pwd`、`cat`、`git status`/`diff`/`log`、`npm list`/`test` 等白名单内的 shell 安全命令执行自动批准（`autoApprove: true`）；而对 `Write`、`Edit` 以及存在高风险指令（`rm -rf`、`sudo`、`git push`、`npm publish` 等）或未知/非白名单的命令强制要求用户手动交互审批（`autoApprove: false`）。
+  - **运行时流水线对接**：集成到 `LLMCodingRuntime` 与 `LocalCodingRuntime` 中。如果分类器断言可以自动批准，将跳过 `permission_request` 事件 yield 和 pending registry 注册，直接写入一条决策为 `approved`、原因为 `Auto-approved: [Reason]` 的审计记录到数据库 `permission_audits` 中，并直接调用工具。
+  - **测试覆盖与修复**：
+    - 新增 `test/classifier.test.ts` 以单元测试覆盖规则分类器的全部白名单、黑名单和默认拦截分支。
+    - 在 `test/permission-flow.test.ts` 中新增两个集成测试：验证安全命令自动批准且无 `permission_request` 且存入 SQLite 审计中；验证危险命令拦截并正常派发 `permission_request` 悬空状态等待外部审批。
+    - 修复 `test/security.test.ts` 中原本使用 `bash "pwd"` 预期必触发弹窗的用例（由于 `pwd` 现已被自动批准，已将其更新为非白名单的 `bash "make build"` 以通过断言）。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 成功通过，全部 105 个测试用例全部绿屏跑通（无一挂起或报错）。
+
+## 0.46 2026-05-23 P2 Execution Environments and Observability Metrics
+
+- **用户请求**: 根据 todo 文档和开发建议完成 p2 的开发重写。
+- **实现结果**:
+  - **多执行环境安全校验**：在 `app.ts` 的 `executeSchema` 校验中新增并规范化了 `executionEnvironment` 字段。仅限支持 `local` 执行环境；若请求参数中传递 `docker` 或 `remote`，在 HTTP API (/v1/execute) 及 WebSocket 握手 (/v1/stream) 中均会短路拦截并抛出 `501 NOT_IMPLEMENTED` 状态错误，强化系统执行环境安全隔离。
+  - **SQLite 指标持久化 (`execution_metrics`)**：设计并执行了数据库模式自动升级（`user_version = 4`），自动创建 `execution_metrics` 存储表和 session_id 复合索引。
+  - **运行时指标监控与上报**：重构了 `LLMCodingRuntime` 与 `LocalCodingRuntime` 级别的执行流。在每次会话执行时，自适应统计并生成包含：总执行时长（`execute_duration_ms`）、首包响应时长（`provider_first_token_ms`）、大模型请求耗时（`provider_request_duration_ms`）、流式 Delta 数量、工具执行次数与耗时统计、输入输出近似字符数的 `execution_metrics` 全量事件，随流结束后同步写入 SQLite 中，并主动回传更新至内存 `metrics` 快照以通过 `/v1/runtime/metrics` REST 接口提供实时查询。
+  - **测试覆盖**：在 `test/runtime.test.ts` 中新增了 `executionEnvironment parameter validation` 及 `execution metrics recording and retrieval` 两个核心集成测试，分别覆盖环境拦截与指标搜集/持久化/接口快照逻辑。
+- **验证**:
+  - `npm run typecheck` 成功通过.
+  - `npm test` 成功通过，全量 107 个测试用例 100% 全部通过。
+- **后续核对**:
+  - `executionEnvironment` 目前仅完成 local-only 参数校验和 docker/remote 的明确未实现拦截；Docker workspace mount、资源限制和 remote runner protocol 仍未设计落地。
+  - Observability 已完成指标核心链路；结构化 logger 与 1000+ sessions 压测仍待补。
+
+## 0.47 2026-05-23 P3/P4 Architectural Refactoring and Type Hardening
+
+- **用户请求**: 根据todo文档稳步推进p0，务必严谨仔细。
+- **实现结果**:
+  - **CLI 子命令模块化拆分**：将原本臃肿的 `src/cli/program.ts`（超过 2100 行）进行拆分，将各子命令重构至单独的文件（`src/cli/commands/run.ts`, `src/cli/commands/chat.ts`, `src/cli/commands/nexus.ts`, `src/cli/commands/sessions.ts`, `src/cli/commands/tools.ts`, `src/cli/commands/config.ts`, `src/cli/commands/models.ts`, `src/cli/commands/optimize.ts`）。
+  - **公共交互与补全解耦**：抽离 `src/cli/ui.ts` 整合输入询问、密钥获取和权限审批菜单，抽离 `src/cli/completer.ts` 集中处理 Readline 的快捷别名补全和斜杠下拉 palette，抽离 `src/cli/runSessionFlow.ts` 处理会话流控制。
+  - **强类型收窄与消除 \`as any\`**：对 Zod to JSON Schema 结构映射、Websocket message 类型转换、SSE 管道检测等处大量的 \`as any\` 进行强类型收窄和 \`unknown\` 渐进式强制类型转换处理，全面消除类型逃逸。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 成功通过，107 个单元和集成测试用例 100% 成功。
+
+## 0.48 2026-05-23 Bash Timeout Threshold Tuning
+
+- **用户请求**: 修复 Bash 工具执行超时导致的 \`TOOL_ERROR: Command failed\` 报错。
+- **实现结果**:
+  - **超时限制放宽**：定位并调整了 `src/tools/builtin/bash.ts` 中的 Zod timeoutMs 校验限制，将最大可接受的超时限制由 `30,000ms` 提升至 `300,000ms`。
+  - **默认超时提升**：将缺省命令的默认执行超时时长从过于仓促的 `10,000ms` 调高为 `60,000ms`（60秒），降低网络安装命令（如 `pip3 install`）或编译测试执行命令遭遇超时夭折的概率。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 成功通过，107 个用例 100% 成功。
+
+## 0.49 2026-05-23 P2 Model Capability Routing — 声明式角色路由与底线拦截
+
+- **用户请求**: 批准并稳步推进 P2 Model Capability Routing 的开发（声明式角色重写 + Gatekeeping 方案）。
+- **实现结果**:
+
+  - **配置 Schema 扩展 (`src/shared/config.ts`)**:
+    - `ProfileConfig` 接口与 `ProfileConfigSchema` Zod 校验新增可选 `roles` 字段，支持用户为 `planner`、`executor`、`critic`、`optimizer` 四个 Agent 角色独立指定模型 ID。
+    - `resolveSettings(role?: string)` 扩展为三层模型优先级解析：①`process.env.BABEL_O_MODEL`（最高）→ ②`profile.roles[role]`（角色专属覆盖）→ ③`profile.model` / `defaultModel` / `local/coding-runtime`（兜底）。
+
+  - **Nexus 服务端前置拦截 (`src/nexus/app.ts`)**:
+    - 在 `POST /v1/execute` 与 WebSocket `/v1/stream` 路由中，执行前通过 `getModel()` 查找目标模型在 `modelRegistry` 中的能力声明。
+    - 若 `capabilities.toolCalling === false`，立即返回 `400 INVALID_REQUEST`，附错误消息 `Model "X" does not support tool calling`；WS 端则发送对应 error 事件。
+    - 未注册的自定义模型允许通过，不受拦截影响。
+    - 补充了缺失的 `import { ConfigManager } from '../shared/config.js'`，修复 TypeScript 编译报错。
+
+  - **Agent 步骤运行器集成 (`src/nexus/runtimeAgentStep.ts`)**:
+    - 每个 Agent 步骤执行前调用 `ConfigManager.getInstance().resolveSettings(roleDefinition.role)` 解析当前角色的目标模型 `targetModelId`。
+    - 将 `targetModelId` 显式传递给 `runtime.executeStream({ model: targetModelId })`。
+    - 对需要工具执行的角色（`toolPolicy.allowedTools.length > 0`，即 executor/optimizer），预检 `toolCalling` 能力，若为 `false` 直接抛出异常阻断，避免浪费 Token。
+
+  - **模型能力声明修正 (`src/providers/registry.ts`)**:
+    - 将 `deepseek/deepseek-reasoner`（R1 推理模型）的 `capabilities.toolCalling` 由 `true` 修正为 `false`，符合其实际 API 不支持 function calling 的特性。
+
+  - **新增测试用例（+4 个，共 111 个）**:
+    - `profile roles field is parsed and loaded by ProfileConfigSchema`（runtime-llm.test.ts）
+    - `resolveSettings respects role override over profile model`（runtime-llm.test.ts）
+    - `POST /v1/execute blocks model without tool calling support`（runtime.test.ts）
+    - `WebSocket /v1/stream blocks model without tool calling support`（runtime.test.ts）
+    - providers.test.ts 补充断言验证 `deepseek-reasoner` 的 `toolCalling: false` 声明正确。
+
+- **重要决策**:
+  - 路由方案采用"完全声明式"设计，不进行任何自动推断或 API 探测，所有路由决策均由用户在配置文件中明确声明，避免系统黑盒行为。
+  - Gatekeeping 仅针对 registry 中已知声明为不支持工具调用的模型，未注册的自定义模型不受限制，确保开放性与兼容性。
+  - 推理模型（如 `deepseek-reasoner`）可被指定为 planner/critic 角色（toolPolicy.allowedTools 为空，不触发工具拦截），实现纯文本推理任务的路由分配。
+
+- **验证**:
+  - `npm run typecheck` 成功通过，0 errors。
+  - `npm test` 成功通过，全量 **111 个**测试用例 100% 全部通过（0 fail, 0 skip）。
+- **后续核对**:
+  - 该阶段为 Model Capability Routing 第一版。已完成角色模型声明、角色解析和 toolCalling=false 前置拦截。
+  - request model > role model > active profile default 的完整优先级、Planner/Executor/Critic 默认模型策略和 structured output role gate 仍按 `TODO_provider_registry.md` 跟进。

@@ -5,6 +5,8 @@ import { getModel } from '../providers/registry.js'
 import { snipEvents } from './compactors/snipCompactor.js'
 import { loadProjectMemory } from './memory.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
+import { loadAllSkills } from '../skills/loader.js'
+import { matchSkills } from '../skills/matcher.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -27,6 +29,7 @@ export type ContextAssemblerOptions = {
     options: RuntimeExecuteOptions,
     projectMemory?: string,
     sessionSummary?: string,
+    activeSkills?: string,
   ) => string
   mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
 }
@@ -39,6 +42,7 @@ export type AssembledContext = {
   omittedEventCount: number
   snippedEventCount: number
   sessionSummary: string
+  activeSkills: string
 }
 
 export function allocateBudget(modelId: string): ContextBudget {
@@ -79,26 +83,34 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     options.runtimeOptions.prompt,
   )
 
+  const allSkills = await loadAllSkills(options.runtimeOptions.cwd)
+  const matched = matchSkills(allSkills, options.runtimeOptions.prompt)
+  let activeSkills = ''
+  if (matched.length > 0) {
+    activeSkills = `Active Developer Skills:\n` + matched.map(skill => {
+      return `## Skill: ${skill.name} (id: ${skill.id})\n${skill.content}`
+    }).join('\n\n')
+  }
+
   return {
-    systemPrompt: options.buildSystemPrompt(options.runtimeOptions, projectMemory, sessionSummary),
+    systemPrompt: options.buildSystemPrompt(options.runtimeOptions, projectMemory, sessionSummary, activeSkills),
     messages,
     budget,
     selectedEventCount: selectedEvents.length,
     omittedEventCount: omittedEvents.length,
     snippedEventCount: snippedEvents.filter((event, index) => event !== selectedEvents[index]).length,
     sessionSummary,
+    activeSkills,
   }
 }
 
 export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
   if (events.length <= budget.recentEventLimit) return [...events]
 
-  const firstUserMessage = events.find(event => event.type === 'user_message')
   const recent = events.slice(-budget.recentEventLimit)
-  if (!firstUserMessage || recent.includes(firstUserMessage)) {
-    return recent
-  }
-  return [firstUserMessage, ...recent]
+  const firstRecentUserIndex = recent.findIndex(event => event.type === 'user_message')
+  if (firstRecentUserIndex <= 0) return recent
+  return recent.slice(firstRecentUserIndex)
 }
 
 export function selectOmittedEvents(

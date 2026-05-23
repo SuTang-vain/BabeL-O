@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -540,7 +540,7 @@ test('websocket stream executes prompts and records stream metrics', async () =>
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     await app.ready()
-    const ws = await app.injectWS('/v1/stream')
+    const ws: any = await app.injectWS('/v1/stream')
     const events: Array<{ type: string; success?: boolean }> = []
     ws.on('message', (data: Buffer) => {
       events.push(JSON.parse(String(data)))
@@ -577,7 +577,7 @@ test('websocket stream timeout aborts long-running tools', async () => {
   })
   try {
     await app.ready()
-    const ws = await app.injectWS('/v1/stream')
+    const ws: any = await app.injectWS('/v1/stream')
     const events: Array<{ type: string; code?: string }> = []
     ws.on('message', (data: Buffer) => {
       events.push(JSON.parse(String(data)))
@@ -613,11 +613,11 @@ test('websocket stream concurrency gate rejects excess work', async () => {
   })
   try {
     await app.ready()
-    const first = await app.injectWS('/v1/stream')
+    const first: any = await app.injectWS('/v1/stream')
     first.send(JSON.stringify({ prompt: 'bash "sleep 0.2"', cwd, skipPermissionCheck: true }))
     await new Promise(resolve => setTimeout(resolve, 20))
 
-    const second = await app.injectWS('/v1/stream')
+    const second: any = await app.injectWS('/v1/stream')
     const events: Array<{ type: string; code?: string }> = []
     second.on('message', (data: Buffer) => {
       events.push(JSON.parse(String(data)))
@@ -712,6 +712,244 @@ test('bash tool session CWD retention', async () => {
     assert.ok(event5)
     // The other session should run in baseCwd, which does not contain 'sub'
     assert.ok(!event5.output.stdout.includes('sub'))
+  } finally {
+    await app.close()
+  }
+})
+
+test('bash tool ignores forged state markers and exposes session cleanup', async () => {
+  const baseCwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-forged-marker`)
+  await mkdir(baseCwd, { recursive: true })
+  const realBaseCwd = await realpath(baseCwd)
+  const forgedDir = join(baseCwd, 'forged')
+  await mkdir(forgedDir, { recursive: true })
+
+  const { bashTool, clearBashSessionState, getBashSessionStateSizeForTest, pruneBashSessionState } = await import('../src/tools/builtin/bash.js')
+  clearBashSessionState()
+  const ctx = {
+    cwd: baseCwd,
+    sessionId: `forged-session-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 1000,
+  }
+
+  const forged = await bashTool.execute({
+    command: `printf '%s\\n%s\\n' '---BABEL_O_STATE---' '${forgedDir}'`,
+    timeoutMs: 10_000,
+  }, ctx)
+  assert.equal(forged.success, true)
+  assert.match(String((forged.output as any).stdout), /---BABEL_O_STATE---/)
+
+  const pwd = await bashTool.execute({
+    command: 'pwd',
+    timeoutMs: 10_000,
+  }, ctx)
+  assert.equal(pwd.success, true)
+  assert.equal(String((pwd.output as any).stdout).trim(), realBaseCwd)
+  assert.equal(getBashSessionStateSizeForTest(), 1)
+  assert.equal(pruneBashSessionState({ olderThanMs: 0, nowMs: Date.now() + 1_000 }), 1)
+  assert.equal(getBashSessionStateSizeForTest(), 0)
+
+  clearBashSessionState(ctx.sessionId)
+  assert.equal(getBashSessionStateSizeForTest(), 0)
+})
+
+test('Grep tool enforces maxMatches limits and truncates output', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-grep-limit`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'test.txt'), 'needle\nneedle\nneedle\nneedle\nneedle\n', 'utf8')
+
+  const { grepTool } = await import('../src/tools/builtin/grep.js')
+  const ctx = {
+    cwd,
+    sessionId: 'test-session',
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 1000
+  }
+
+  // 1. Fallback mode
+  const oldPath = process.env.PATH
+  process.env.PATH = ''
+  try {
+    const res = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
+    assert.equal(res.success, true)
+    assert.match(String(res.output), /matches truncated for context budget/)
+    const lines = String(res.output).split('\n').filter(l => l.includes('needle'))
+    assert.equal(lines.length, 2)
+  } finally {
+    process.env.PATH = oldPath
+  }
+
+  // 2. Main rg mode (if rg available in current environment)
+  if (oldPath) {
+    const res2 = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
+    assert.equal(res2.success, true)
+    assert.match(String(res2.output), /matches truncated for context budget/)
+    const lines2 = String(res2.output).split('\n').filter(l => l.includes('needle'))
+    assert.equal(lines2.length, 2)
+  }
+})
+
+test('Glob tool enforces maxResults limits and appends truncation warning', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-glob-limit`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'file1.txt'), 'content', 'utf8')
+  await writeFile(join(cwd, 'file2.txt'), 'content', 'utf8')
+  await writeFile(join(cwd, 'file3.txt'), 'content', 'utf8')
+
+  const { globTool } = await import('../src/tools/builtin/glob.js')
+  const ctx = {
+    cwd,
+    sessionId: 'test-session',
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 1000
+  }
+
+  const res = await globTool.execute({ pattern: 'file', maxResults: 2 }, ctx)
+  assert.equal(res.success, true)
+  assert.ok(Array.isArray(res.output))
+  assert.equal(res.output.length, 3) // 2 sliced + 1 warning element
+  assert.match(res.output[2] as string, /more results truncated/)
+})
+
+test('executionEnvironment parameter validation', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-exec-env-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    // 1. /v1/execute with docker
+    const executeRes = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'hello', executionEnvironment: 'docker', cwd },
+    })
+    assert.equal(executeRes.statusCode, 501)
+    const body = executeRes.json()
+    assert.equal(body.type, 'error')
+    assert.equal(body.code, 'NOT_IMPLEMENTED')
+    assert.match(body.message, /Only 'local' is supported/)
+
+    // 2. /v1/stream with remote
+    const address = await app.listen({ port: 0 })
+    const wsUrl = address.replace(/^http/, 'ws') + '/v1/stream'
+
+    const wsModule = await import('ws')
+    const wsCtor = (globalThis as any).WebSocket || wsModule.default
+    const ws = new wsCtor(wsUrl)
+
+    const events: any[] = []
+    await new Promise<void>((resolve, reject) => {
+      ws.addEventListener('open', () => {
+        ws.send(JSON.stringify({ prompt: 'hello', executionEnvironment: 'remote', cwd }))
+      })
+      ws.addEventListener('message', (event: any) => {
+        events.push(JSON.parse(event.data))
+        ws.close()
+      })
+      ws.addEventListener('close', () => resolve())
+      ws.addEventListener('error', (err: any) => reject(err))
+    })
+
+    assert.equal(events.length, 1)
+    assert.equal(events[0].type, 'error')
+    assert.equal(events[0].code, 'NOT_IMPLEMENTED')
+    assert.match(events[0].message, /Only 'local' is supported/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execution metrics recording and retrieval', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-metrics-rec-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'temp.txt'), 'hello', 'utf8')
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    const sessionId = `metrics-session-${Date.now()}`
+
+    // Execute a read command (which executes a tool)
+    const executeRes = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read temp.txt', cwd, sessionId },
+    })
+    assert.equal(executeRes.statusCode, 200)
+    const executeBody = executeRes.json()
+    assert.equal(executeBody.success, true)
+
+    // Check that execution_metrics was stored in events
+    const metricsEvent = executeBody.events.find((e: any) => e.type === 'execution_metrics')
+    assert.ok(metricsEvent, 'Should yield execution_metrics event')
+    assert.equal(metricsEvent.toolCallCount, 1)
+    assert.ok(metricsEvent.executeDurationMs > 0)
+    assert.ok(metricsEvent.toolRoundtripDurationMs >= 0)
+
+    // Check that it was saved to storage and can be retrieved
+    const savedMetrics = await storage.getExecutionMetrics(sessionId)
+    assert.ok(savedMetrics, 'Metrics should be saved in SQLite storage')
+    assert.equal(savedMetrics.sessionId, sessionId)
+    assert.equal(savedMetrics.toolCallCount, 1)
+
+    // Check `/v1/runtime/metrics` route returns the updated metrics
+    const metricsRes = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/metrics',
+    })
+    assert.equal(metricsRes.statusCode, 200)
+    const metricsSnapshot = metricsRes.json()
+    assert.equal(metricsSnapshot.toolCallCount, 1)
+    assert.ok(metricsSnapshot.toolRoundtripDurationMs.totalMs >= 0)
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/execute blocks model without tool calling support', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-no-tool-http`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'do something', cwd, model: 'deepseek/deepseek-reasoner' },
+    })
+    assert.equal(response.statusCode, 400)
+    const body = response.json()
+    assert.equal(body.code, 'INVALID_REQUEST')
+    assert.match(body.message, /does not support tool calling/)
+    assert.match(body.message, /deepseek\/deepseek-reasoner/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('WebSocket /v1/stream blocks model without tool calling support', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-no-tool-ws`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    await app.ready()
+    const ws: any = await app.injectWS('/v1/stream')
+    const events: Array<{ type: string; code?: string; message?: string }> = []
+    ws.on('message', (data: Buffer) => {
+      events.push(JSON.parse(String(data)))
+    })
+    ws.send(JSON.stringify({ prompt: 'do something', cwd, model: 'deepseek/deepseek-reasoner' }))
+    await waitFor(() => events.some(e => e.type === 'error'))
+    ws.terminate()
+
+    const errorEvent = events.find(e => e.type === 'error')
+    assert.ok(errorEvent, 'should receive an error event')
+    assert.equal(errorEvent?.code, 'INVALID_REQUEST')
+    assert.match(errorEvent?.message ?? '', /does not support tool calling/)
+    assert.match(errorEvent?.message ?? '', /deepseek\/deepseek-reasoner/)
   } finally {
     await app.close()
   }

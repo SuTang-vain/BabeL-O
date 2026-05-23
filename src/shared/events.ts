@@ -121,6 +121,20 @@ export const PermissionResponseEventSchema = z.object({
   reason: z.string().optional(),
 })
 
+export const ExecutionMetricsEventSchema = z.object({
+  type: z.literal('execution_metrics'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  executeDurationMs: z.number().optional(),
+  providerFirstTokenMs: z.number().optional(),
+  providerRequestDurationMs: z.number().optional(),
+  streamDeltaCount: z.number().optional(),
+  toolCallCount: z.number().optional(),
+  toolRoundtripDurationMs: z.number().optional(),
+  contextCharsIn: z.number().optional(),
+  contextCharsOut: z.number().optional(),
+})
+
 export const NexusEventSchema = z.discriminatedUnion('type', [
   SessionStartedEventSchema,
   AssistantDeltaEventSchema,
@@ -136,6 +150,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   TaskSessionEventSchema,
   PermissionRequestEventSchema,
   PermissionResponseEventSchema,
+  ExecutionMetricsEventSchema,
 ])
 
 export type NexusEvent = z.infer<typeof NexusEventSchema>

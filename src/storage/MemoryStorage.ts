@@ -11,6 +11,7 @@ import type {
   ToolTraceListOptions,
   ToolTraceListResult,
   PermissionAudit,
+  ExecutionMetrics,
 } from './Storage.js'
 
 export class MemoryStorage implements NexusStorage {
@@ -18,6 +19,7 @@ export class MemoryStorage implements NexusStorage {
   private readonly tasks = new Map<string, NexusTask>()
   private readonly toolTraces = new Map<string, ToolTrace>()
   private readonly permissionAudits = new Map<string, PermissionAudit[]>()
+  private readonly executionMetricsMap = new Map<string, ExecutionMetrics>()
 
   async saveSession(session: SessionSnapshot): Promise<void> {
     const cloned = structuredClone(session)
@@ -150,6 +152,15 @@ export class MemoryStorage implements NexusStorage {
   async listPermissionAudits(sessionId: string): Promise<PermissionAudit[]> {
     const list = this.permissionAudits.get(sessionId) ?? []
     return structuredClone(list)
+  }
+
+  async saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void> {
+    this.executionMetricsMap.set(metrics.sessionId, structuredClone(metrics))
+  }
+
+  async getExecutionMetrics(sessionId: string): Promise<ExecutionMetrics | null> {
+    const metrics = this.executionMetricsMap.get(sessionId)
+    return metrics ? structuredClone(metrics) : null
   }
 
   async close(): Promise<void> {}

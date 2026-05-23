@@ -482,6 +482,8 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
     }
   }
 
+  outputText += formatTaskStatusPanel(events)
+
   if (pendingPermissionRequest) {
     const inputSoFar = activeReadlineInterface ? activeReadlineInterface.line : ''
     const tool = 'name' in pendingPermissionRequest ? pendingPermissionRequest.name : 'tool'
@@ -490,6 +492,119 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   }
 
   return outputText
+}
+
+export function formatTaskStatusPanel(events: NexusEvent[]): string {
+  const tasks: { taskId?: string; title: string; status: 'pending' | 'in_progress' | 'completed' | 'failed' }[] = []
+  const taskIdToTitle = new Map<string, string>()
+
+  for (const ev of events) {
+    if (ev.type === 'task_created') {
+      const title = ev.title
+      const taskId = ev.taskId
+      const existing = tasks.find(t => t.title === title || t.taskId === taskId)
+      if (existing) {
+        existing.taskId = taskId
+      } else {
+        tasks.push({ taskId, title, status: 'pending' })
+      }
+      taskIdToTitle.set(taskId, title)
+    } else if (ev.type === 'task_session_event') {
+      interface TaskSessionPayload {
+        plannerOutput?: {
+          tasks?: Array<{ title?: string; description?: string }>
+        }
+        taskId?: string
+        title?: string
+        approved?: boolean
+      }
+      const payload = ev.payload as TaskSessionPayload | undefined
+
+      if (ev.eventType === 'planner_completed') {
+        const plannerOutput = payload?.plannerOutput
+        if (plannerOutput && Array.isArray(plannerOutput.tasks)) {
+          for (const t of plannerOutput.tasks) {
+            if (t && t.title) {
+              if (!tasks.some(existing => existing.title === t.title)) {
+                tasks.push({ title: t.title, status: 'pending' })
+              }
+            }
+          }
+        }
+      } else if (ev.eventType === 'task_claimed') {
+        if (payload && payload.taskId) {
+          taskIdToTitle.set(payload.taskId, payload.title || '')
+          let task = tasks.find(t => t.title === payload.title || t.taskId === payload.taskId)
+          if (!task) {
+            task = { taskId: payload.taskId, title: payload.title || '', status: 'in_progress' }
+            tasks.push(task)
+          } else {
+            task.taskId = payload.taskId
+            task.status = 'in_progress'
+          }
+        }
+      } else if (ev.eventType === 'critic_completed') {
+        if (payload && payload.taskId) {
+          const title = taskIdToTitle.get(payload.taskId)
+          const task = tasks.find(t => t.taskId === payload.taskId || (title && t.title === title))
+          if (task) {
+            task.status = payload.approved ? 'completed' : 'pending'
+          }
+        }
+      } else if (ev.eventType === 'executor_failed_error' || ev.eventType === 'critic_failed_error') {
+        if (payload && payload.taskId) {
+          const title = taskIdToTitle.get(payload.taskId)
+          const task = tasks.find(t => t.taskId === payload.taskId || (title && t.title === title))
+          if (task) {
+            task.status = 'pending'
+          }
+        }
+      } else if (ev.eventType === 'task_session_failed') {
+        for (const t of tasks) {
+          if (t.status !== 'completed') {
+            t.status = 'failed'
+          }
+        }
+      } else if (ev.eventType === 'session_completed_success') {
+        for (const t of tasks) {
+          t.status = 'completed'
+        }
+      }
+    } else if (ev.type === 'tool_completed' && ev.name === 'TaskCreate') {
+      const output = ev.output as { title?: string } | undefined
+      if (output && output.title) {
+        const existing = tasks.find(t => t.title === output.title)
+        if (!existing) {
+          tasks.push({ title: output.title, status: 'completed' })
+        } else {
+          existing.status = 'completed'
+        }
+      }
+    }
+  }
+
+  if (tasks.length === 0) return ''
+
+  let panel = `\n${chalk.cyan('--- Task Status Board ---')}\n`
+  for (const t of tasks) {
+    let coloredStatus = ''
+    switch (t.status) {
+      case 'pending':
+        coloredStatus = chalk.yellow('⟳ 规划中')
+        break
+      case 'in_progress':
+        coloredStatus = chalk.cyan('▶ 执行中')
+        break
+      case 'completed':
+        coloredStatus = chalk.green('✓ 已完成')
+        break
+      case 'failed':
+        coloredStatus = chalk.red('✗ 已失败')
+        break
+    }
+    panel += `  ${coloredStatus}  ${t.title}\n`
+  }
+  return panel
 }
 
 function formatAgentStatusLine(event: Extract<NexusEvent, { type: 'session_started' }>): string {

@@ -27,6 +27,7 @@ export type ContentBlock =
 export type ModelMessage = {
   role: MessageRole
   content: string | ContentBlock[]
+  reasoningContent?: string
 }
 
 export type ModelToolDefinition = {

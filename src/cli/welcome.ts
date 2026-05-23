@@ -59,5 +59,5 @@ export function renderWelcome(options: {
     // Use literal spacing since logoCol has a constant visual width of 9 cells
     console.log(`  ${logoCol}   ${metaCol}`)
   }
-  console.log(chalk.dim('  ' + '─'.repeat(60)))
+  console.log(chalk.dim('  ' + ' '.repeat(60)))
 }

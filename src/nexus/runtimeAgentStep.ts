@@ -4,6 +4,8 @@ import type { AgentRoleDefinition } from './agentRoles.js'
 import type { AgentStepRunner } from './agentLoop.js'
 import type { NexusEvent } from '../shared/events.js'
 import { recordTaskSessionNexusEvent } from './taskSession.js'
+import { ConfigManager } from '../shared/config.js'
+import { getModel, UnknownModelError } from '../providers/registry.js'
 
 type NexusRuntimeLike = Awaited<ReturnType<typeof createDefaultNexusRuntime>>['runtime']
 
@@ -66,11 +68,41 @@ export function createRuntimeAgentStepRunner(
 
     const sessionId = (input as { sessionId: string }).sessionId
 
+    const configManager = ConfigManager.getInstance()
+    const settings = configManager.resolveSettings({
+      role: roleDefinition.role,
+      model: options.model,
+    })
+    const targetModelId = options.model || settings.modelId || 'local/coding-runtime'
+
+    try {
+      const modelDef = getModel(targetModelId)
+      if (
+        roleDefinition.toolPolicy.allowedTools.length > 0 &&
+        !modelDef.capabilities.toolCalling
+      ) {
+        throw new Error(`Model "${targetModelId}" does not support tool calling`)
+      }
+      if (
+        roleDefinition.modelPreference.capability === 'structured-output' &&
+        !modelDef.capabilities.jsonOutput
+      ) {
+        throw new Error(`Model "${targetModelId}" does not support structured output`)
+      }
+    } catch (err) {
+      if (err instanceof UnknownModelError) {
+        // Allow unknown models to support custom models.
+      } else {
+        throw err
+      }
+    }
+
     for await (const event of runtime.executeStream({
       sessionId,
       prompt,
       cwd: options.cwd ?? process.cwd(),
       role: roleDefinition.role,
+      model: targetModelId,
     })) {
       const nexusEvent = event as NexusEvent
       eventCount += 1
@@ -403,7 +435,7 @@ function zodRoleOutputSchemaToJsonSchema(schema: z.ZodTypeAny): Record<string, u
 }
 
 function zodToJsonSchemaShape(schema: z.ZodTypeAny): unknown {
-  const definition = (schema._def as any) as {
+  const definition = (schema._def as unknown) as {
     typeName?: string
     shape?: (() => Record<string, z.ZodTypeAny>) | Record<string, z.ZodTypeAny>
     innerType?: z.ZodTypeAny

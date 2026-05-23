@@ -20,15 +20,21 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
   inputSchema,
   async execute(input, context) {
     try {
+      const probeLimit = input.maxMatches + 1
       const { stdout } = await execFileAsync(
         'rg',
-        ['-n', '--max-count', String(input.maxMatches), input.pattern, input.path],
+        ['-n', '--max-count', String(probeLimit), input.pattern, input.path],
         {
           cwd: context.cwd,
           maxBuffer: 1_000_000,
           signal: context.signal,
         },
       )
+      const lines = stdout.split('\n').filter(line => line.length > 0)
+      if (lines.length > input.maxMatches) {
+        const truncated = lines.slice(0, input.maxMatches).join('\n') + '\n... (matches truncated for context budget)'
+        return { success: true, output: truncated }
+      }
       return { success: true, output: stdout }
     } catch (error) {
       if (
@@ -61,10 +67,11 @@ async function grepFallback(
 ): Promise<string> {
   const root = join(cwd, searchPath)
   const results: string[] = []
+  const probeLimit = maxMatches + 1
   const needle = pattern.toLowerCase()
 
   async function visit(path: string): Promise<void> {
-    if (results.length >= maxMatches) return
+    if (results.length >= probeLimit) return
     let entries
     try {
       entries = await readdir(path, { withFileTypes: true })
@@ -74,7 +81,7 @@ async function grepFallback(
     }
 
     for (const entry of entries) {
-      if (results.length >= maxMatches) return
+      if (results.length >= probeLimit) return
       if (entry.name === 'node_modules' || entry.name === '.git') continue
       const fullPath = join(path, entry.name)
       if (entry.isDirectory()) {
@@ -86,7 +93,7 @@ async function grepFallback(
   }
 
   async function scanFile(filePath: string): Promise<void> {
-    if (results.length >= maxMatches) return
+    if (results.length >= probeLimit) return
     let text = ''
     try {
       text = await readFile(filePath, 'utf8')
@@ -94,7 +101,7 @@ async function grepFallback(
       return
     }
     const lines = text.split('\n')
-    for (let index = 0; index < lines.length && results.length < maxMatches; index++) {
+    for (let index = 0; index < lines.length && results.length < probeLimit; index++) {
       if (lines[index]!.toLowerCase().includes(needle)) {
         results.push(`${filePath}:${index + 1}:${lines[index]}`)
       }
@@ -102,5 +109,8 @@ async function grepFallback(
   }
 
   await visit(root)
+  if (results.length > maxMatches) {
+    return results.slice(0, maxMatches).join('\n') + '\n... (matches truncated for context budget)'
+  }
   return results.join('\n')
 }

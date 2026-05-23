@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { performance } from 'node:perf_hooks'
 import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
@@ -11,6 +12,7 @@ import type {
 } from './Runtime.js'
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
+import { classifyAction } from './classifier.js'
 import type { NexusStorage } from '../storage/Storage.js'
 
 
@@ -52,6 +54,31 @@ export class LocalCodingRuntime implements NexusRuntime {
       budget: options.budget,
     }
 
+    const executionStartMs = performance.now()
+    let toolCallCount = 0
+    let totalToolDurationMs = 0
+
+    for await (const event of this._executeInner(options, (duration) => {
+      toolCallCount += 1
+      totalToolDurationMs += duration
+    })) {
+      yield event
+    }
+
+    yield {
+      type: 'execution_metrics',
+      ...eventBase(options.sessionId),
+      requestId: options.requestId,
+      executeDurationMs: performance.now() - executionStartMs,
+      toolCallCount,
+      toolRoundtripDurationMs: totalToolDurationMs,
+    }
+  }
+
+  private async *_executeInner(
+    options: RuntimeExecuteOptions,
+    recordToolRun: (duration: number) => void,
+  ): AsyncIterable<NexusEvent> {
     try {
       const intent = parseIntent(options.prompt)
       if (intent.kind === 'text') {
@@ -139,45 +166,68 @@ export class LocalCodingRuntime implements NexusRuntime {
 
       // Check if the tool requires authorization.
       if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
-        yield {
-          type: 'permission_request',
-          ...eventBase(options.sessionId),
-          toolUseId,
-          name: tool.name,
-          input: parsed.data,
-          risk: tool.risk,
-          message: `Tool ${tool.name} requires user permission to run.`,
-        }
+        const { autoApprove, reason } = classifyAction(tool.name, parsed.data)
+        let approved = autoApprove
+        let decisionReason = `Auto-approved: ${reason}`
 
-        const decision = await PendingPermissionRegistry.getInstance().register(
-          options.sessionId,
-          toolUseId
-        )
-
-        if (this.storage) {
-          await this.storage.savePermissionAudit({
-            auditId: createId('audit'),
-            sessionId: options.sessionId,
+        if (autoApprove) {
+          if (this.storage) {
+            await this.storage.savePermissionAudit({
+              auditId: createId('audit'),
+              sessionId: options.sessionId,
+              toolUseId,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput: parsed.data,
+              decision: 'approved',
+              reason: decisionReason,
+              timestamp: nowIso(),
+            })
+          }
+        } else {
+          yield {
+            type: 'permission_request',
+            ...eventBase(options.sessionId),
             toolUseId,
-            toolName: tool.name,
-            toolRisk: tool.risk,
-            toolInput: parsed.data,
-            decision: decision.approved ? 'approved' : 'denied',
-            reason: decision.reason,
-            timestamp: nowIso(),
-          })
+            name: tool.name,
+            input: parsed.data,
+            risk: tool.risk,
+            message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+          }
+
+          const decision = await PendingPermissionRegistry.getInstance().register(
+            options.sessionId,
+            toolUseId
+          )
+
+          approved = decision.approved
+          decisionReason = decision.reason ?? 'User review'
+
+          if (this.storage) {
+            await this.storage.savePermissionAudit({
+              auditId: createId('audit'),
+              sessionId: options.sessionId,
+              toolUseId,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput: parsed.data,
+              decision: approved ? 'approved' : 'denied',
+              reason: decisionReason,
+              timestamp: nowIso(),
+            })
+          }
+
+          yield {
+            type: 'permission_response',
+            ...eventBase(options.sessionId),
+            toolUseId,
+            approved,
+            reason: decisionReason,
+          }
         }
 
-        yield {
-          type: 'permission_response',
-          ...eventBase(options.sessionId),
-          toolUseId,
-          approved: decision.approved,
-          reason: decision.reason,
-        }
-
-        if (!decision.approved) {
-          const denyMessage = decision.reason || `Tool execution denied by user: ${tool.name}`
+        if (!approved) {
+          const denyMessage = decisionReason || `Tool execution denied by user: ${tool.name}`
           yield {
             type: 'tool_denied',
             ...eventBase(options.sessionId),
@@ -195,7 +245,9 @@ export class LocalCodingRuntime implements NexusRuntime {
         }
       }
 
+      const toolStartMs = performance.now()
       const result = await executeToolSafely(tool, parsed.data, options)
+      recordToolRun(performance.now() - toolStartMs)
       if (result.kind === 'error') {
         yield {
           type: 'error',

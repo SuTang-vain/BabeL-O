@@ -5,6 +5,7 @@ import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
+import { PendingPermissionRegistry } from '../src/shared/session.js'
 
 test('interactive permission approval flow via HTTP POST', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-approve-${Date.now()}`)
@@ -153,7 +154,7 @@ test('interactive permission approval via WebSocket stream', async () => {
 
   const sessionId = `session-ws-${Date.now()}`
   
-  const wsModule = await (new Function("return import('ws')")())
+  const wsModule = await import('ws')
   const wsCtor = (globalThis as any).WebSocket || wsModule.default
   const ws = new wsCtor(wsUrl)
 
@@ -194,4 +195,135 @@ test('interactive permission approval via WebSocket stream', async () => {
   assert.ok(events.some((e: any) => e.type === 'tool_completed' && e.success === true))
 
   await app.close()
+})
+
+test('smart permissions: auto-approves safe commands and persists audit log', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-smart-approve-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-smart-approve-${Date.now()}`
+
+  // Execute a whitelisted safe command 'ls'
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: { prompt: 'bash "ls"', cwd, sessionId },
+  })
+
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  assert.equal(body.success, true)
+
+  // Verify that it auto-approved: there should be NO permission_request event
+  const sessionRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}`,
+  })
+  assert.equal(sessionRes.statusCode, 200)
+  const sessionData = sessionRes.json()
+  const events = sessionData.session.events
+  assert.ok(!events.some((e: any) => e.type === 'permission_request'), 'Should not have asked for permission')
+
+  // Verify the audit log exists in SQLite storage and is marked as approved with reason Auto-approved
+  const auditsRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}/permission-audits`,
+  })
+  assert.equal(auditsRes.statusCode, 200)
+  const auditsBody = auditsRes.json()
+  assert.equal(auditsBody.type, 'permission_audits')
+  assert.equal(auditsBody.sessionId, sessionId)
+  assert.ok(Array.isArray(auditsBody.audits))
+  assert.equal(auditsBody.audits.length, 1)
+  assert.equal(auditsBody.audits[0].toolName, 'Bash')
+  assert.equal(auditsBody.audits[0].decision, 'approved')
+  assert.match(auditsBody.audits[0].reason, /Auto-approved: Known safe command/)
+
+  await app.close()
+})
+
+test('smart permissions: prompts user on non-whitelisted/dangerous command', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-smart-prompt-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-smart-prompt-${Date.now()}`
+
+  // Execute a dangerous/non-whitelisted command: 'rm -rf temporary_folder'
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: { prompt: 'bash "rm -rf temporary_folder"', cwd, sessionId },
+  })
+
+  // Poll until permission_request event is added
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      if (data.session && Array.isArray(data.session.events)) {
+        const reqEvent = data.session.events.find((e: any) => e.type === 'permission_request')
+        if (reqEvent) {
+          toolUseId = reqEvent.toolUseId
+          break
+        }
+      }
+    }
+  }
+
+  assert.ok(toolUseId, 'Should have received permission request for dangerous command')
+
+  // Approve the request to let it complete
+  const approveRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/approve`,
+    payload: { toolUseId },
+  })
+  assert.equal(approveRes.statusCode, 200)
+
+  // Wait for execution to finish
+  const response = await executePromise
+  assert.equal(response.statusCode, 200)
+
+  // Verify the audit log exists and matches user review
+  const auditsRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}/permission-audits`,
+  })
+  assert.equal(auditsRes.statusCode, 200)
+  const auditsBody = auditsRes.json()
+  assert.equal(auditsBody.audits.length, 1)
+  assert.equal(auditsBody.audits[0].toolName, 'Bash')
+  assert.equal(auditsBody.audits[0].decision, 'approved')
+  assert.equal(auditsBody.audits[0].reason, 'User review')
+
+  await app.close()
+})
+
+test('pending permission registry expires unresolved requests', async () => {
+  const registry = PendingPermissionRegistry.getInstance()
+  registry.resetForTest()
+  registry.configureForTest({ ttlMs: 5, disableSweeper: true })
+
+  const pending = registry.register('session-ttl', 'tool-ttl')
+  assert.equal(registry.pendingCount(), 1)
+
+  const expired = registry.sweepExpired(Date.now() + 10)
+  assert.equal(expired, 1)
+  assert.equal(registry.pendingCount(), 0)
+  const resolution = await pending
+  assert.equal(resolution.approved, false)
+  assert.equal(resolution.reason, 'Permission request timed out')
+
+  registry.resetForTest()
 })

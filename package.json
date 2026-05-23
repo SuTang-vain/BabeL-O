@@ -12,8 +12,9 @@
     "cli": "tsx src/cli/program.ts",
     "benchmark": "tsx scripts/benchmark-performance-core.ts",
     "test:mcp:official": "tsx scripts/smoke-mcp-official.ts",
+    "test:providers:smoke": "tsx scripts/smoke-providers.ts",
     "typecheck": "tsc --noEmit",
-    "test": "BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json tsx --test --test-concurrency=1 test/adapters.test.ts test/agent-loop.test.ts test/completer.test.ts test/context-assembler.test.ts test/diff.test.ts test/mcp.test.ts test/optimizer-safety.test.ts test/permission-flow.test.ts test/providers.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/security.test.ts test/tool-trace.test.ts test/tui-renderer.test.ts"
+    "test": "BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json tsx --test --test-concurrency=1 test/adapters.test.ts test/agent-loop.test.ts test/classifier.test.ts test/completer.test.ts test/context-assembler.test.ts test/diff.test.ts test/mcp.test.ts test/optimizer-safety.test.ts test/permission-flow.test.ts test/providers.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/security.test.ts test/skills.test.ts test/tool-trace.test.ts test/tui-renderer.test.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.2.0",

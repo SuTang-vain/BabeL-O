@@ -1,11 +1,33 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { runAgentLoop } from '../src/nexus/agentLoop.js'
-import { setNexusStorage } from '../src/nexus/storageBridge.js'
+import {
+  flushStorageBridgeForTest,
+  getStorageBridgeStats,
+  resetStorageBridgeForTest,
+  setNexusStorage,
+} from '../src/nexus/storageBridge.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { PLANNER_ROLE, EXECUTOR_ROLE, CRITIC_ROLE, OPTIMIZER_ROLE } from '../src/nexus/agentRoles.js'
-import { resetTaskQueuesForTest, listNexusTasks } from '../src/nexus/taskQueue.js'
-import { resetTaskSessionsForTest, getTaskSession } from '../src/nexus/taskSession.js'
+import { createRuntimeAgentStepRunner } from '../src/nexus/runtimeAgentStep.js'
+import {
+  completeNexusTask,
+  createNexusTask,
+  listNexusTasks,
+  pruneTaskQueues,
+  resetTaskQueuesForTest,
+  taskQueueStatsForTest,
+} from '../src/nexus/taskQueue.js'
+import {
+  createTaskSession,
+  getTaskSession,
+  pruneTaskSessions,
+  resetTaskSessionsForTest,
+  setTaskSessionPhase,
+  taskSessionStatsForTest,
+} from '../src/nexus/taskSession.js'
+import type { NexusTask } from '../src/shared/task.js'
+import { ConfigManager } from '../src/shared/config.js'
 
 test('runAgentLoop runs successfully and handles critic approval', async () => {
   resetTaskQueuesForTest()
@@ -121,4 +143,110 @@ test('runAgentLoop stops and marks failed when retry limit is reached', async ()
   assert.equal(queue.tasks.length, 1)
   assert.equal(queue.tasks[0].status, 'failed')
   assert.equal(queue.tasks[0].retryCount, 2) // Retried 2 times and then failed
+})
+
+test('task queues and task sessions prune old terminal state', () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const task = createNexusTask({
+    queueId: 'queue-prune',
+    title: 'terminal task',
+  })
+  completeNexusTask({
+    queueId: 'queue-prune',
+    taskId: task.taskId,
+  })
+  assert.equal(taskQueueStatsForTest().tasks, 1)
+  assert.equal(pruneTaskQueues({ olderThanMs: 0, nowMs: Date.now() + 1_000 }), 1)
+  assert.equal(taskQueueStatsForTest().tasks, 0)
+
+  createTaskSession({ sessionId: 'session-prune' })
+  setTaskSessionPhase('session-prune', 'completed')
+  assert.equal(taskSessionStatsForTest().sessions, 1)
+  assert.equal(pruneTaskSessions({ olderThanMs: 0, nowMs: Date.now() + 1_000 }), 1)
+  assert.equal(taskSessionStatsForTest().sessions, 0)
+})
+
+test('storageBridge retries failed task persistence before succeeding', async () => {
+  resetStorageBridgeForTest()
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  class FlakyStorage extends MemoryStorage {
+    attempts = 0
+    async saveTask(task: NexusTask): Promise<void> {
+      this.attempts += 1
+      if (this.attempts === 1) {
+        throw new Error('temporary storage failure')
+      }
+      await super.saveTask(task)
+    }
+  }
+
+  const storage = new FlakyStorage()
+  setNexusStorage(storage)
+  const task = createNexusTask({
+    queueId: 'queue-storage-retry',
+    title: 'retry persistence',
+  })
+
+  await flushStorageBridgeForTest()
+  await flushStorageBridgeForTest()
+
+  assert.equal(storage.attempts, 2)
+  assert.equal((await storage.getTask(task.taskId))?.title, 'retry persistence')
+  const stats = getStorageBridgeStats()
+  assert.equal(stats.succeeded, 1)
+  assert.equal(stats.failed, 1)
+  assert.equal(stats.permanentFailures, 0)
+})
+
+test('runtime agent step rejects structured roles on non-json models', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-structured-output-gate'
+  createTaskSession({ sessionId })
+
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const tempConfig = new ConfigManager('/tmp/babel-o-agent-step-config.json')
+  tempConfig.save({
+    defaultModel: 'local/coding-runtime',
+    activeProfile: 'structured-gate',
+    profiles: {
+      'structured-gate': {
+        model: 'anthropic/claude-3-opus',
+        provider: 'anthropic',
+        roles: {
+          critic: 'anthropic/claude-3-opus',
+        },
+      },
+    },
+  })
+
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = tempConfig
+  try {
+    const stepRunner = createRuntimeAgentStepRunner({
+      runtimeFactory: async () => ({
+        async *executeStream() {
+          throw new Error('runtime should not be called when capability gate fails')
+        },
+      } as any),
+    })
+
+    await assert.rejects(
+      stepRunner({
+        roleDefinition: CRITIC_ROLE,
+        input: {
+          sessionId,
+          queueId: sessionId,
+          taskId: '1',
+          title: 'review',
+          result: 'done',
+        },
+      }),
+      /does not support structured output/,
+    )
+  } finally {
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+  }
 })

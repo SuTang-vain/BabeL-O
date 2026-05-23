@@ -46,6 +46,20 @@ export type PermissionAudit = {
   timestamp: string
 }
 
+export type ExecutionMetrics = {
+  metricId: string
+  sessionId: string
+  executeDurationMs?: number
+  providerFirstTokenMs?: number
+  providerRequestDurationMs?: number
+  streamDeltaCount?: number
+  toolCallCount?: number
+  toolRoundtripDurationMs?: number
+  contextCharsIn?: number
+  contextCharsOut?: number
+  timestamp: string
+}
+
 export interface NexusStorage {
   saveSession(session: SessionSnapshot): Promise<void>
   getSession(
@@ -66,5 +80,7 @@ export interface NexusStorage {
   ): Promise<ToolTraceListResult>
   savePermissionAudit(audit: PermissionAudit): Promise<void>
   listPermissionAudits(sessionId: string): Promise<PermissionAudit[]>
+  saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void>
+  getExecutionMetrics(sessionId: string): Promise<ExecutionMetrics | null>
   close?(): Promise<void>
 }

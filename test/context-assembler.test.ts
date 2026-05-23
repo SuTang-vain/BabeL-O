@@ -51,7 +51,7 @@ test('snipEvent compacts long tool outputs without changing non-tool events', ()
   assert.equal(snipEvent(userEvent, 10), userEvent)
 })
 
-test('selectRecentEvents keeps first user message plus recent bounded history', () => {
+test('selectRecentEvents starts at a recent user boundary instead of preserving stale first user', () => {
   const events: NexusEvent[] = [
     {
       type: 'user_message',
@@ -70,6 +70,20 @@ test('selectRecentEvents keeps first user message plus recent bounded history', 
       text: `delta-${i}`,
     })
   }
+  events.push({
+    type: 'user_message',
+    schemaVersion,
+    sessionId: 'session-context',
+    timestamp: '2026-05-23T00:00:10.000Z',
+    text: 'latest question',
+  })
+  events.push({
+    type: 'session_started',
+    schemaVersion,
+    sessionId: 'session-context',
+    timestamp: '2026-05-23T00:00:11.000Z',
+    cwd: '/repo',
+  })
 
   const selected = selectRecentEvents(events, {
     maxTokens: 100,
@@ -80,9 +94,9 @@ test('selectRecentEvents keeps first user message plus recent bounded history', 
   })
 
   assert.equal(selected[0].type, 'user_message')
-  assert.equal((selected[0] as any).text, 'initial goal')
-  assert.equal(selected.length, 4)
-  assert.equal((selected.at(-1) as any).text, 'delta-9')
+  assert.equal((selected[0] as any).text, 'latest question')
+  assert.equal(selected.length, 2)
+  assert.equal(selected.at(-1)?.type, 'session_started')
 })
 
 test('assembleContext injects project memory and snips historical tool output', async () => {
@@ -273,6 +287,78 @@ test('assembleContext reduces long-session context by more than 50 percent while
   assert.match(assembledText, /recent-turn-38/)
   assert.match(assembledText, /recent-turn-39/)
   assert.match(context.systemPrompt, /Session Summary/)
+})
+
+test('assembleContext prioritizes the latest user question in long noisy sessions', async () => {
+  const cwd = join(tmpdir(), `babel-o-latest-question-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'hi',
+    },
+  ]
+
+  for (let index = 0; index < 180; index += 1) {
+    events.push({
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: `2026-05-23T00:01:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: `old project analysis fragment ${index}. `,
+    })
+  }
+
+  events.push(
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:02:00.000Z',
+      text: '你可以感知我具体再问你什么吗',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:02:01.000Z',
+      text: 'I should answer the latest question.',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:03:00.000Z',
+      text: '你还记得我们之前在讨论什么吗',
+    },
+    {
+      type: 'session_started',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:03:01.000Z',
+      cwd,
+    },
+  )
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: '你还记得我们之前在讨论什么吗',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.notEqual(context.messages[0]?.content, 'hi')
+  assert.match(JSON.stringify(context.messages), /你还记得我们之前在讨论什么吗/)
+  assert.doesNotMatch(String(context.messages[0]?.content), /old project analysis fragment/)
+  assert.match(context.systemPrompt, /Context Boundary:/)
+  assert.match(context.systemPrompt, /authoritative working history/)
 })
 
 function estimateMessagesChars(messages: ModelMessage[]): number {

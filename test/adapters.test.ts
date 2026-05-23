@@ -386,5 +386,42 @@ describe('Model Adapters & Factory', () => {
         },
       ])
     })
+
+    test('deepseek reasoning model serialization handles reasoning_content replay and fallback', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([])
+
+      // 1. With reasoningContent
+      await collectStream(
+        adapter.queryStream({
+          model: 'deepseek/deepseek-v4-pro',
+          messages: [
+            { role: 'user', content: 'hello' },
+            { role: 'assistant', content: 'thinking', reasoningContent: 'my thinking process' },
+          ],
+        })
+      )
+      let body = JSON.parse(lastFetchInit?.body as string)
+      assert.strictEqual(body.messages[1].reasoning_content, 'my thinking process')
+
+      // 2. Missing reasoningContent in a tool call should use '(reasoning omitted)' fallback
+      await collectStream(
+        adapter.queryStream({
+          model: 'deepseek/deepseek-v4-pro',
+          messages: [
+            { role: 'user', content: 'hello' },
+            {
+              role: 'assistant',
+              content: [
+                { type: 'text', text: 'call' },
+                { type: 'tool_use', id: 'call_1', name: 'Read', input: {} },
+              ],
+            },
+          ],
+        })
+      )
+      body = JSON.parse(lastFetchInit?.body as string)
+      assert.strictEqual(body.messages[1].reasoning_content, '(reasoning omitted)')
+    })
   })
 })

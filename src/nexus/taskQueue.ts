@@ -14,6 +14,9 @@ export class TaskQueueError extends Error {
 
 const taskQueues = new Map<string, Map<string, NexusTask>>()
 const taskCounters = new Map<string, number>()
+const TERMINAL_TASK_STATUSES = new Set<TaskStatus>(['completed', 'failed'])
+const TERMINAL_TASK_TTL_MS = 24 * 60 * 60 * 1000
+const TERMINAL_TASK_SWEEP_INTERVAL_MS = 60 * 60 * 1000
 
 function now(): string {
   return new Date().toISOString()
@@ -255,6 +258,48 @@ export function isNexusTaskQueueSettled(queueId: string): boolean {
 export function resetTaskQueuesForTest(): void {
   taskQueues.clear()
   taskCounters.clear()
+}
+
+export function pruneTaskQueues(options: {
+  olderThanMs?: number
+  nowMs?: number
+} = {}): number {
+  const olderThanMs = options.olderThanMs ?? TERMINAL_TASK_TTL_MS
+  const nowMs = options.nowMs ?? Date.now()
+  let pruned = 0
+
+  for (const [queueId, queue] of taskQueues.entries()) {
+    for (const [taskId, task] of queue.entries()) {
+      if (!TERMINAL_TASK_STATUSES.has(task.status)) continue
+      const updatedAtMs = Date.parse(task.updatedAt)
+      if (!Number.isFinite(updatedAtMs)) continue
+      if (nowMs - updatedAtMs < olderThanMs) continue
+      queue.delete(taskId)
+      pruned += 1
+    }
+    if (queue.size === 0) {
+      taskQueues.delete(queueId)
+      taskCounters.delete(queueId)
+    }
+  }
+
+  return pruned
+}
+
+const taskQueueSweeper = setInterval(() => {
+  pruneTaskQueues()
+}, TERMINAL_TASK_SWEEP_INTERVAL_MS)
+taskQueueSweeper.unref?.()
+
+export function taskQueueStatsForTest(): { queues: number; tasks: number } {
+  let tasks = 0
+  for (const queue of taskQueues.values()) {
+    tasks += queue.size
+  }
+  return {
+    queues: taskQueues.size,
+    tasks,
+  }
 }
 
 export function hydrateNexusTasks(tasks: NexusTask[]): void {

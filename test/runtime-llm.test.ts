@@ -129,6 +129,197 @@ describe('ConfigManager', () => {
       if (oldOpenAiApiKey) process.env.OPENAI_API_KEY = oldOpenAiApiKey; else delete process.env.OPENAI_API_KEY
     }
   })
+
+  test('validates provider and profile options format', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    // Valid save should succeed
+    configManager.save({
+      defaultModel: 'openai/gpt-4o',
+      providers: {
+        openai: { apiKey: 'my-key', baseUrl: 'https://api.openai.com/v1' }
+      }
+    })
+
+    // Invalid baseUrl should throw during save
+    assert.throws(() => {
+      configManager.save({
+        providers: {
+          openai: { baseUrl: 'not-a-valid-url' }
+        }
+      })
+    })
+
+    // Load method should fallback safely if configuration is invalid
+    fs.writeFileSync(tempConfigPath, JSON.stringify({
+      defaultModel: 'nonexistent/model',
+    }), 'utf-8')
+    const originalConsoleError = console.error
+    let gotErrorLog = false
+    console.error = () => { gotErrorLog = true }
+    try {
+      const configManager2 = new ConfigManager(tempConfigPath)
+      const loaded = configManager2.load()
+      assert.deepEqual(loaded, {})
+      assert.ok(gotErrorLog)
+    } finally {
+      console.error = originalConsoleError
+    }
+  })
+
+  test('supports profiles switching and resolution', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      defaultModel: 'local/coding-runtime',
+      providers: {
+        openai: { apiKey: 'global-key' }
+      },
+      profiles: {
+        dev: {
+          model: 'openai/gpt-4o',
+          provider: 'openai',
+          apiKey: 'dev-key',
+          baseUrl: 'https://dev.openai.com/v1'
+        },
+        prod: {
+          model: 'anthropic/claude-3-5-sonnet',
+          provider: 'anthropic',
+          apiKey: 'prod-key'
+        }
+      }
+    })
+
+    // No active profile: resolves to defaultModel/global provider configs
+    const resDefault = configManager.resolveSettings()
+    assert.equal(resDefault.modelId, 'local/coding-runtime')
+
+    // Switch to dev profile
+    configManager.setActiveProfile('dev')
+    const resDev = configManager.resolveSettings()
+    assert.equal(resDev.modelId, 'openai/gpt-4o')
+    assert.equal(resDev.apiKey, 'dev-key')
+    assert.equal(resDev.baseUrl, 'https://dev.openai.com/v1')
+
+    // Switch to prod profile
+    configManager.setActiveProfile('prod')
+    const resProd = configManager.resolveSettings()
+    assert.equal(resProd.modelId, 'anthropic/claude-3-5-sonnet')
+    assert.equal(resProd.apiKey, 'prod-key')
+    assert.equal(resProd.baseUrl, 'https://api.anthropic.com') // Default anthropic base URL fallback
+  })
+
+  test('profile roles field is parsed and loaded by ProfileConfigSchema', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    // Save a profile that has per-role model overrides
+    configManager.save({
+      defaultModel: 'local/coding-runtime',
+      profiles: {
+        roletest: {
+          model: 'openai/gpt-4o',
+          provider: 'openai',
+          apiKey: 'role-key',
+          roles: {
+            planner: 'anthropic/claude-3-7-sonnet',
+            executor: 'openai/gpt-4o',
+            critic: 'anthropic/claude-3-5-sonnet',
+          },
+        },
+      },
+    })
+
+    const loaded = configManager.load()
+    const profile = loaded.profiles?.roletest
+    assert.ok(profile, 'profile should exist')
+    assert.equal(profile.roles?.planner, 'anthropic/claude-3-7-sonnet')
+    assert.equal(profile.roles?.executor, 'openai/gpt-4o')
+    assert.equal(profile.roles?.critic, 'anthropic/claude-3-5-sonnet')
+    assert.equal(profile.roles?.optimizer, undefined)
+  })
+
+  test('resolveSettings respects role override over profile model', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      defaultModel: 'local/coding-runtime',
+      activeProfile: 'roletest',
+      profiles: {
+        roletest: {
+          model: 'openai/gpt-4o',
+          provider: 'openai',
+          apiKey: 'role-key',
+          roles: {
+            planner: 'anthropic/claude-3-7-sonnet',
+          },
+        },
+      },
+    })
+
+    const oldBabelOModel = process.env.BABEL_O_MODEL
+    try {
+      delete process.env.BABEL_O_MODEL
+
+      // With role=planner → should use roles.planner override
+      const plannerSettings = configManager.resolveSettings('planner')
+      assert.equal(plannerSettings.modelId, 'anthropic/claude-3-7-sonnet')
+
+      // With role=executor (no override) → should fall back to profile.model
+      const executorSettings = configManager.resolveSettings('executor')
+      assert.equal(executorSettings.modelId, 'openai/gpt-4o')
+
+      // With no role → should fall back to profile.model
+      const noRoleSettings = configManager.resolveSettings()
+      assert.equal(noRoleSettings.modelId, 'openai/gpt-4o')
+    } finally {
+      if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel
+      else delete process.env.BABEL_O_MODEL
+    }
+  })
+
+  test('resolveSettings respects request model over env, role, and profile defaults', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      defaultModel: 'local/coding-runtime',
+      activeProfile: 'roletest',
+      profiles: {
+        roletest: {
+          model: 'openai/gpt-4o',
+          provider: 'openai',
+          apiKey: 'role-key',
+          roles: {
+            planner: 'anthropic/claude-3-7-sonnet',
+          },
+        },
+      },
+    })
+
+    const oldBabelOModel = process.env.BABEL_O_MODEL
+    const oldBabelOProvider = process.env.BABEL_O_PROVIDER
+    try {
+      process.env.BABEL_O_MODEL = 'anthropic/claude-3-opus'
+      process.env.BABEL_O_PROVIDER = 'openai'
+
+      const requestSettings = configManager.resolveSettings({
+        role: 'planner',
+        model: 'deepseek/deepseek-v4-pro',
+      })
+      assert.equal(requestSettings.modelId, 'deepseek/deepseek-v4-pro')
+      assert.equal(requestSettings.providerId, 'deepseek')
+      assert.equal(requestSettings.modelSource, 'request')
+
+      const roleSettings = configManager.resolveSettings({ role: 'planner' })
+      assert.equal(roleSettings.modelId, 'anthropic/claude-3-opus')
+      assert.equal(roleSettings.providerId, 'anthropic')
+      assert.equal(roleSettings.modelSource, 'env')
+    } finally {
+      if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel
+      else delete process.env.BABEL_O_MODEL
+      if (oldBabelOProvider) process.env.BABEL_O_PROVIDER = oldBabelOProvider
+      else delete process.env.BABEL_O_PROVIDER
+    }
+  })
 })
 
 describe('LLMCodingRuntime', () => {

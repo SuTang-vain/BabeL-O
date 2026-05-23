@@ -19,6 +19,13 @@ export class TaskSessionError extends Error {
 }
 
 const taskSessions = new Map<string, SessionSnapshot>()
+const TERMINAL_SESSION_PHASES = new Set<SessionPhase>([
+  'completed',
+  'failed',
+  'cancelled',
+])
+const TERMINAL_SESSION_TTL_MS = 24 * 60 * 60 * 1000
+const TERMINAL_SESSION_SWEEP_INTERVAL_MS = 60 * 60 * 1000
 
 function now(): string {
   return new Date().toISOString()
@@ -270,6 +277,37 @@ export function listTaskSessions(): SessionSnapshot[] {
 
 export function resetTaskSessionsForTest(): void {
   taskSessions.clear()
+}
+
+export function pruneTaskSessions(options: {
+  olderThanMs?: number
+  nowMs?: number
+} = {}): number {
+  const olderThanMs = options.olderThanMs ?? TERMINAL_SESSION_TTL_MS
+  const nowMs = options.nowMs ?? Date.now()
+  let pruned = 0
+
+  for (const [sessionId, session] of taskSessions.entries()) {
+    if (!TERMINAL_SESSION_PHASES.has(session.phase)) continue
+    const updatedAtMs = Date.parse(session.updatedAt)
+    if (!Number.isFinite(updatedAtMs)) continue
+    if (nowMs - updatedAtMs < olderThanMs) continue
+    taskSessions.delete(sessionId)
+    pruned += 1
+  }
+
+  return pruned
+}
+
+const taskSessionSweeper = setInterval(() => {
+  pruneTaskSessions()
+}, TERMINAL_SESSION_SWEEP_INTERVAL_MS)
+taskSessionSweeper.unref?.()
+
+export function taskSessionStatsForTest(): { sessions: number } {
+  return {
+    sessions: taskSessions.size,
+  }
 }
 
 export function hydrateTaskSessions(sessions: SessionSnapshot[]): void {

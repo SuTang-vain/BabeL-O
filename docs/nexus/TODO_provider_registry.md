@@ -22,7 +22,7 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] canonical model id 使用 `provider/model`。
 - [x] 增加 registry lookup helper。
 - [x] 增加 unknown provider/model 的错误类型。
-- [ ] 增加 provider options schema。
+- [x] 增加 provider options schema。
 - [x] 增加 registry 单元测试。
 
 ## P1 Config CLI
@@ -53,12 +53,17 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 
 ## P2 Model Capability Routing
 
+- [x] ProfileConfig 支持 `roles.planner/executor/critic/optimizer` 声明式角色模型。
+- [x] Agent 步骤运行器按角色调用 `resolveSettings(role)`，支持 role model > active profile default 的解析。
+- [x] Nexus 拒绝不支持工具调用的模型执行工具链。
+- [x] 修正 `deepseek/deepseek-reasoner` 能力声明为 `toolCalling: false`。
+- [x] request override 优先级：request model > env model > role model > active profile default。
+- [x] Nexus/Agent 解析同一套 `resolveSettings({ model, role })` 口径；带 provider 前缀的 request model 不再被 profile provider 错配。
+- [x] Nexus 拒绝不支持 structured output 的模型执行 structured role。
 - [ ] Planner 默认使用长上下文模型。
 - [ ] Executor 默认使用 tool calling 稳定模型。
 - [ ] Critic 默认使用 structured output 稳定模型。
-- [ ] request override 优先级：request model > role model > active profile default。
-- [ ] Nexus 拒绝不支持工具调用的模型执行工具链。
-- [ ] Nexus 拒绝不支持 structured output 的模型执行 structured role。
+- [ ] 根据 `modelPreference.capability` 增加未配置 roles 时的默认模型推荐策略。
 
 ## Provider Seed
 
@@ -67,7 +72,7 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] OpenAI
 - [x] Zhipu / GLM
 - [x] MiniMax
-- [ ] DeepSeek
+- [x] DeepSeek
 - [ ] Moonshot
 - [ ] Ollama / local OpenAI-compatible
 
@@ -78,10 +83,10 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] `npm run cli -- models inspect local/coding-runtime`
 - [x] mocked provider smoke：simple text
 - [x] mocked provider smoke：tool call
-- [ ] mocked provider smoke：structured output
-- [ ] 真实 provider smoke：simple text
-- [ ] 真实 provider smoke：tool call
-- [ ] 真实 provider smoke：structured output
+- [x] mocked provider smoke：structured output
+- [x] 真实 provider smoke：simple text
+- [x] 真实 provider smoke：tool call
+- [x] 真实 provider smoke：structured output
 
 ## 参考文件
 

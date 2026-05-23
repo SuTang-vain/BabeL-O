@@ -11,6 +11,8 @@ import { ExecutionGate } from './executionGate.js'
 import { NexusMetrics, round } from './metrics.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
+import { ConfigManager } from '../shared/config.js'
+import { getModel, UnknownModelError } from '../providers/registry.js'
 
 
 declare module 'fastify' {
@@ -29,6 +31,7 @@ const executeSchema = z.object({
   requestId: z.string().optional(),
   model: z.string().optional(),
   budget: z.number().int().positive().optional(),
+  executionEnvironment: z.enum(['local', 'docker', 'remote']).default('local').optional(),
 })
 
 const createTaskSchema = z.object({
@@ -108,7 +111,7 @@ export async function createNexusApp(
       })
     }
 
-    const code = (error as any).code || 'INTERNAL_ERROR'
+    const code = (error as { code?: string }).code || 'INTERNAL_ERROR'
     const statusCode = error.statusCode || 500
     return reply.status(statusCode).send({
       type: 'error',
@@ -196,6 +199,13 @@ export async function createNexusApp(
     const startedAtMs = metrics.now()
     try {
       const body = executeSchema.parse(request.body)
+      if (body.executionEnvironment && body.executionEnvironment !== 'local') {
+        return reply.status(501).send({
+          type: 'error',
+          code: 'NOT_IMPLEMENTED',
+          message: `Execution environment '${body.executionEnvironment}' is not implemented yet. Only 'local' is supported.`,
+        })
+      }
       const sessionId = body.sessionId ?? createId('session')
       const cwd = body.cwd ?? options.defaultCwd
 
@@ -205,6 +215,26 @@ export async function createNexusApp(
           code: 'INVALID_REQUEST',
           message: `Workspace directory not allowed: ${cwd}`,
         })
+      }
+
+      // Model capability validation
+      const configManager = ConfigManager.getInstance()
+      const settings = configManager.resolveSettings({ model: body.model })
+      const targetModelId = settings.modelId || 'local/coding-runtime'
+      try {
+        const modelDef = getModel(targetModelId)
+        if (modelDef && !modelDef.capabilities.toolCalling) {
+          return reply.status(400).send({
+            type: 'error',
+            code: 'INVALID_REQUEST',
+            message: `Model "${targetModelId}" does not support tool calling`,
+          })
+        }
+      } catch (err) {
+        if (!(err instanceof UnknownModelError)) {
+          throw err
+        }
+        // Allow unknown models to support custom models
       }
       const abortController = new AbortController()
       const timeout = setTimeout(
@@ -244,6 +274,36 @@ export async function createNexusApp(
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
+          if (event.type === 'execution_metrics') {
+            await options.storage.saveExecutionMetrics({
+              metricId: createId('metric'),
+              sessionId,
+              executeDurationMs: event.executeDurationMs,
+              providerFirstTokenMs: event.providerFirstTokenMs,
+              providerRequestDurationMs: event.providerRequestDurationMs,
+              streamDeltaCount: event.streamDeltaCount,
+              toolCallCount: event.toolCallCount,
+              toolRoundtripDurationMs: event.toolRoundtripDurationMs,
+              contextCharsIn: event.contextCharsIn,
+              contextCharsOut: event.contextCharsOut,
+              timestamp: event.timestamp,
+            })
+            if (event.providerFirstTokenMs !== undefined) {
+              metrics.recordProviderFirstToken(event.providerFirstTokenMs)
+            }
+            if (event.providerRequestDurationMs !== undefined) {
+              metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
+            }
+            if (event.streamDeltaCount !== undefined) {
+              metrics.recordStreamDeltas(event.streamDeltaCount)
+            }
+            if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) {
+              metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
+            }
+            if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) {
+              metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
+            }
+          }
         }
       } finally {
         clearTimeout(timeout)
@@ -609,7 +669,7 @@ export async function createNexusApp(
     socket.on('message', async (raw: Buffer) => {
       const parsedJson = parseJsonObject(raw)
       if (parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && parsedJson.type === 'permission_response') {
-        const res = parsedJson as any
+        const res = (parsedJson as unknown) as { sessionId: string; toolUseId: string; approved: boolean; reason?: string }
         PendingPermissionRegistry.getInstance().resolve(res.sessionId, res.toolUseId, {
           approved: res.approved,
           reason: res.reason,
@@ -654,6 +714,14 @@ export async function createNexusApp(
         }
 
       const body = parsed.data
+      if (body.executionEnvironment && body.executionEnvironment !== 'local') {
+        sendJson(socket, {
+          type: 'error',
+          code: 'NOT_IMPLEMENTED',
+          message: `Execution environment '${body.executionEnvironment}' is not implemented yet. Only 'local' is supported.`,
+        })
+        return
+      }
       const sessionId = body.sessionId ?? createId('session')
       const cwd = body.cwd ?? options.defaultCwd
       if (!isWorkspaceAllowed(cwd)) {
@@ -663,6 +731,27 @@ export async function createNexusApp(
           message: `Workspace directory not allowed: ${cwd}`,
         })
         return
+      }
+
+      // Model capability validation
+      const configManager = ConfigManager.getInstance()
+      const settings = configManager.resolveSettings({ model: body.model })
+      const targetModelId = settings.modelId || 'local/coding-runtime'
+      try {
+        const modelDef = getModel(targetModelId)
+        if (modelDef && !modelDef.capabilities.toolCalling) {
+          sendJson(socket, {
+            type: 'error',
+            code: 'INVALID_REQUEST',
+            message: `Model "${targetModelId}" does not support tool calling`,
+          })
+          return
+        }
+      } catch (err) {
+        if (!(err instanceof UnknownModelError)) {
+          throw err
+        }
+        // Allow unknown models to support custom models
       }
       const timeout = setTimeout(
         () => abortController.abort(),
@@ -699,6 +788,36 @@ export async function createNexusApp(
           budget: body.budget,
         })) {
           await options.storage.appendEvent(sessionId, event)
+          if (event.type === 'execution_metrics') {
+            await options.storage.saveExecutionMetrics({
+              metricId: createId('metric'),
+              sessionId,
+              executeDurationMs: event.executeDurationMs,
+              providerFirstTokenMs: event.providerFirstTokenMs,
+              providerRequestDurationMs: event.providerRequestDurationMs,
+              streamDeltaCount: event.streamDeltaCount,
+              toolCallCount: event.toolCallCount,
+              toolRoundtripDurationMs: event.toolRoundtripDurationMs,
+              contextCharsIn: event.contextCharsIn,
+              contextCharsOut: event.contextCharsOut,
+              timestamp: event.timestamp,
+            })
+            if (event.providerFirstTokenMs !== undefined) {
+              metrics.recordProviderFirstToken(event.providerFirstTokenMs)
+            }
+            if (event.providerRequestDurationMs !== undefined) {
+              metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
+            }
+            if (event.streamDeltaCount !== undefined) {
+              metrics.recordStreamDeltas(event.streamDeltaCount)
+            }
+            if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) {
+              metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
+            }
+            if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) {
+              metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
+            }
+          }
           if (socket.readyState !== socket.OPEN) {
             abortController.abort()
             break

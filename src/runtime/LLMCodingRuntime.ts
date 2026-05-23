@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { performance } from 'node:perf_hooks'
 import { errorMessage, ProviderError } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
@@ -12,6 +13,7 @@ import type {
 import type { ToolPolicy } from './LocalCodingRuntime.js'
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
+import { classifyAction } from './classifier.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
 import type {
@@ -52,6 +54,15 @@ export class LLMCodingRuntime implements NexusRuntime {
       model: options.model,
       budget: options.budget,
     }
+
+    const executionStartMs = performance.now()
+    let providerFirstTokenMs: number | undefined = undefined
+    let totalProviderRequestDurationMs = 0
+    let streamDeltaCount = 0
+    let toolCallCount = 0
+    let totalToolDurationMs = 0
+    let contextCharsIn = 0
+    let contextCharsOut = 0
 
     try {
       // 1. Resolve connection and credential settings
@@ -100,6 +111,22 @@ export class LLMCodingRuntime implements NexusRuntime {
           throw new Error('Aborted')
         }
 
+        let turnCharsIn = assembledContext.systemPrompt.length
+        for (const msg of messages) {
+          if (typeof msg.content === 'string') {
+            turnCharsIn += msg.content.length
+          } else if (Array.isArray(msg.content)) {
+            for (const block of msg.content) {
+              if (block.type === 'text') {
+                turnCharsIn += block.text.length
+              } else if (block.type === 'tool_result') {
+                turnCharsIn += block.content.length
+              }
+            }
+          }
+        }
+        contextCharsIn += turnCharsIn
+
         // Convert tool registry definitions to JSON Schema objects using Zod native export
         const toolsList = [...this.tools.values()].map(tool => ({
           name: tool.name,
@@ -133,6 +160,9 @@ export class LLMCodingRuntime implements NexusRuntime {
           input?: unknown
         }[] = []
 
+        const queryStartMs = performance.now()
+        let turnFirstTokenMs: number | undefined = undefined
+
         // Stream LLM response
         const stream = adapter.queryStream(queryParams, adapterOptions)
         for await (const delta of stream) {
@@ -141,6 +171,14 @@ export class LLMCodingRuntime implements NexusRuntime {
           }
 
           if (delta.type === 'text') {
+            if (turnFirstTokenMs === undefined) {
+              turnFirstTokenMs = performance.now() - queryStartMs
+              if (providerFirstTokenMs === undefined) {
+                providerFirstTokenMs = performance.now() - executionStartMs
+              }
+            }
+            streamDeltaCount += 1
+            contextCharsOut += delta.text.length
             currentAssistantText += delta.text
             yield {
               type: 'assistant_delta',
@@ -148,12 +186,26 @@ export class LLMCodingRuntime implements NexusRuntime {
               text: delta.text,
             }
           } else if (delta.type === 'thinking') {
+            if (turnFirstTokenMs === undefined) {
+              turnFirstTokenMs = performance.now() - queryStartMs
+              if (providerFirstTokenMs === undefined) {
+                providerFirstTokenMs = performance.now() - executionStartMs
+              }
+            }
+            streamDeltaCount += 1
+            contextCharsOut += delta.text.length
             yield {
               type: 'thinking_delta',
               ...eventBase(options.sessionId),
               text: delta.text,
             }
           } else if (delta.type === 'tool_use_start') {
+            if (turnFirstTokenMs === undefined) {
+              turnFirstTokenMs = performance.now() - queryStartMs
+              if (providerFirstTokenMs === undefined) {
+                providerFirstTokenMs = performance.now() - executionStartMs
+              }
+            }
             currentToolCalls.push({
               id: delta.id,
               name: delta.name,
@@ -180,6 +232,9 @@ export class LLMCodingRuntime implements NexusRuntime {
             }
           }
         }
+
+        const turnDurationMs = performance.now() - queryStartMs
+        totalProviderRequestDurationMs += turnDurationMs
 
         // Record assistant's turn in messages array
         const assistantContent: ContentBlock[] = []
@@ -215,6 +270,19 @@ export class LLMCodingRuntime implements NexusRuntime {
             ...eventBase(options.sessionId),
             success: true,
             message: currentAssistantText,
+          }
+          yield {
+            type: 'execution_metrics',
+            ...eventBase(options.sessionId),
+            requestId: options.requestId,
+            executeDurationMs: performance.now() - executionStartMs,
+            providerFirstTokenMs,
+            providerRequestDurationMs: totalProviderRequestDurationMs,
+            streamDeltaCount,
+            toolCallCount,
+            toolRoundtripDurationMs: totalToolDurationMs,
+            contextCharsIn,
+            contextCharsOut,
           }
           return
         }
@@ -301,43 +369,64 @@ export class LLMCodingRuntime implements NexusRuntime {
 
           // Check if the tool requires authorization.
           if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
-            yield {
-              type: 'permission_request',
-              ...eventBase(options.sessionId),
-              toolUseId: tc.id,
-              name: tool.name,
-              input: parsed.data,
-              risk: tool.risk,
-              message: `Tool ${tool.name} requires user permission to run.`,
+            const { autoApprove, reason } = classifyAction(tool.name, parsed.data)
+            let approved = autoApprove
+            let decisionReason = `Auto-approved: ${reason}`
+
+            if (autoApprove) {
+              await this.storage.savePermissionAudit({
+                auditId: createId('audit'),
+                sessionId: options.sessionId,
+                toolUseId: tc.id,
+                toolName: tool.name,
+                toolRisk: tool.risk,
+                toolInput: parsed.data,
+                decision: 'approved',
+                reason: decisionReason,
+                timestamp: nowIso(),
+              })
+            } else {
+              yield {
+                type: 'permission_request',
+                ...eventBase(options.sessionId),
+                toolUseId: tc.id,
+                name: tool.name,
+                input: parsed.data,
+                risk: tool.risk,
+                message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+              }
+
+              const decision = await PendingPermissionRegistry.getInstance().register(
+                options.sessionId,
+                tc.id
+              )
+
+              approved = decision.approved
+              decisionReason = decision.reason ?? 'User review'
+
+              await this.storage.savePermissionAudit({
+                auditId: createId('audit'),
+                sessionId: options.sessionId,
+                toolUseId: tc.id,
+                toolName: tool.name,
+                toolRisk: tool.risk,
+                toolInput: parsed.data,
+                decision: approved ? 'approved' : 'denied',
+                reason: decisionReason,
+                timestamp: nowIso(),
+              })
+
+              yield {
+                type: 'permission_response',
+                ...eventBase(options.sessionId),
+                toolUseId: tc.id,
+                approved,
+                reason: decisionReason,
+              }
             }
 
-            const decision = await PendingPermissionRegistry.getInstance().register(
-              options.sessionId,
-              tc.id
-            )
-
-            await this.storage.savePermissionAudit({
-              auditId: createId('audit'),
-              sessionId: options.sessionId,
-              toolUseId: tc.id,
-              toolName: tool.name,
-              toolRisk: tool.risk,
-              toolInput: parsed.data,
-              decision: decision.approved ? 'approved' : 'denied',
-              reason: decision.reason,
-              timestamp: nowIso(),
-            })
-
-            yield {
-              type: 'permission_response',
-              ...eventBase(options.sessionId),
-              toolUseId: tc.id,
-              approved: decision.approved,
-              reason: decision.reason,
-            }
-
-            if (!decision.approved) {
-              const denyMessage = decision.reason || `Tool execution denied by user: ${tool.name}`
+            if (!approved) {
+              const denyMessage = decisionReason || `Tool execution denied by user: ${tool.name}`
               yield {
                 type: 'tool_denied',
                 ...eventBase(options.sessionId),
@@ -355,7 +444,10 @@ export class LLMCodingRuntime implements NexusRuntime {
             }
           }
 
+          toolCallCount += 1
+          const toolStartMs = performance.now()
           const result = await executeToolSafely(tool, parsed.data, options)
+          totalToolDurationMs += performance.now() - toolStartMs
           if (result.kind === 'error') {
             yield {
               type: 'error',
@@ -402,6 +494,19 @@ export class LLMCodingRuntime implements NexusRuntime {
         code: 'MAX_LOOPS_EXCEEDED',
         message: `Execution exceeded maximum tool call iterations (${maxLoops}).`,
       }
+      yield {
+        type: 'execution_metrics',
+        ...eventBase(options.sessionId),
+        requestId: options.requestId,
+        executeDurationMs: performance.now() - executionStartMs,
+        providerFirstTokenMs,
+        providerRequestDurationMs: totalProviderRequestDurationMs,
+        streamDeltaCount,
+        toolCallCount,
+        toolRoundtripDurationMs: totalToolDurationMs,
+        contextCharsIn,
+        contextCharsOut,
+      }
     } catch (err: any) {
       const isTimeout = options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError'
       yield {
@@ -409,6 +514,19 @@ export class LLMCodingRuntime implements NexusRuntime {
         ...eventBase(options.sessionId),
         code: isTimeout ? 'REQUEST_TIMEOUT' : (err.code || 'PROVIDER_ERROR'),
         message: err instanceof Error ? err.message : String(err),
+      }
+      yield {
+        type: 'execution_metrics',
+        ...eventBase(options.sessionId),
+        requestId: options.requestId,
+        executeDurationMs: performance.now() - executionStartMs,
+        providerFirstTokenMs,
+        providerRequestDurationMs: totalProviderRequestDurationMs,
+        streamDeltaCount,
+        toolCallCount,
+        toolRoundtripDurationMs: totalToolDurationMs,
+        contextCharsIn,
+        contextCharsOut,
       }
     }
   }
@@ -467,12 +585,19 @@ export function buildSystemPrompt(
   options: RuntimeExecuteOptions,
   projectMemory = '',
   sessionSummary = '',
+  activeSkills = '',
 ): string {
   const memoryBlock = projectMemory.trim()
     ? `\nProject Memory:\n${projectMemory.trim()}\n`
     : ''
+  const boundaryBlock = sessionSummary.trim()
+    ? `\nContext Boundary:\nEarlier conversation was compacted. Treat the recent messages below as the authoritative working history.\n`
+    : ''
   const summaryBlock = sessionSummary.trim()
     ? `\nSession Summary:\n${sessionSummary.trim()}\n`
+    : ''
+  const skillsBlock = activeSkills.trim()
+    ? `\n${activeSkills.trim()}\n`
     : ''
 
   return `You are BabeL-O, a powerful agentic AI coding assistant designed to help developers with tasks.
@@ -480,8 +605,9 @@ You are running in the workspace: ${options.cwd}
 Current OS: ${process.platform}
 Current time: ${new Date().toISOString()}
 ${memoryBlock}
+${boundaryBlock}
 ${summaryBlock}
-
+${skillsBlock}
 Guidelines:
 1. Use the workspace tools sequentially to accomplish the requested task.
 2. Maintain context awareness. Search, read, or list files before making edits or running commands if you are unsure of the structure.
@@ -517,7 +643,7 @@ export function mapEventsToMessages(
     } else if (event.type === 'assistant_delta') {
       let lastMsg = messages[messages.length - 1]
       if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = { role: 'assistant', content: '' }
+        lastMsg = { role: 'assistant', content: '', reasoningContent: '' }
         messages.push(lastMsg)
       }
       if (typeof lastMsg.content === 'string') {
@@ -530,6 +656,13 @@ export function mapEventsToMessages(
           lastMsg.content.push({ type: 'text', text: event.text })
         }
       }
+    } else if (event.type === 'thinking_delta') {
+      let lastMsg = messages[messages.length - 1]
+      if (!lastMsg || lastMsg.role !== 'assistant') {
+        lastMsg = { role: 'assistant', content: '', reasoningContent: '' }
+        messages.push(lastMsg)
+      }
+      lastMsg.reasoningContent = (lastMsg.reasoningContent || '') + event.text
     } else if (event.type === 'tool_started') {
       let lastMsg = messages[messages.length - 1]
       if (!lastMsg || lastMsg.role !== 'assistant') {

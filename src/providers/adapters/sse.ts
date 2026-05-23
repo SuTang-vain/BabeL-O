@@ -5,10 +5,10 @@ export async function* parseSSE(
   let buffer = ''
   let currentEvent: string | undefined
 
-  const iterator = (stream as any)[Symbol.asyncIterator]
+  const iterator = (Symbol.asyncIterator in stream)
     ? (stream as AsyncIterable<Uint8Array>)
-    : (stream as any).getReader
-      ? readerToAsyncIterable((stream as any).getReader())
+    : ('getReader' in stream && typeof (stream as ReadableStream<Uint8Array>).getReader === 'function')
+      ? readerToAsyncIterable((stream as ReadableStream<Uint8Array>).getReader())
       : null
 
   if (!iterator) {

@@ -37,9 +37,27 @@ export class OpenAIAdapter implements ModelAdapter {
       openaiMessages.push({ role: 'system', content: params.systemPrompt })
     }
 
+    const isDeepSeek =
+      params.model.includes('deepseek') ||
+      (options?.baseUrl && options.baseUrl.includes('deepseek'))
+    const requiresReasoning =
+      isDeepSeek &&
+      (params.model.includes('reasoner') ||
+        params.model.includes('r1') ||
+        params.model.includes('pro') ||
+        params.model.includes('chat'))
+
     for (const msg of params.messages) {
       if (typeof msg.content === 'string') {
-        openaiMessages.push({ role: msg.role, content: msg.content })
+        let reasoning = msg.reasoningContent || undefined
+        if (requiresReasoning && !reasoning && msg.role === 'assistant') {
+          reasoning = '(reasoning omitted)'
+        }
+        openaiMessages.push({
+          role: msg.role,
+          content: msg.content,
+          ...(isDeepSeek && reasoning && { reasoning_content: reasoning }),
+        })
       } else {
         const textBlocks = msg.content.filter(
           b => b.type === 'text'
@@ -74,9 +92,15 @@ export class OpenAIAdapter implements ModelAdapter {
             },
           }))
 
+          let reasoning = msg.reasoningContent || undefined
+          if (requiresReasoning && !reasoning && msg.role === 'assistant') {
+            reasoning = '(reasoning omitted)'
+          }
+
           openaiMessages.push({
             role: msg.role,
             content: contentText,
+            ...(isDeepSeek && reasoning && { reasoning_content: reasoning }),
             ...(toolCalls.length > 0 && { tool_calls: toolCalls }),
           })
         }

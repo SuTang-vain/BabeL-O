@@ -226,3 +226,41 @@ test('formatSessionHistory: renders expanded thinking as a separate thought bloc
   assert.ok(output.includes('Thought'))
   assert.ok(output.includes('Need to inspect files first.'))
 })
+
+test('formatTaskStatusPanel renders task status board correctly', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'task_created',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-task-board',
+      timestamp: new Date().toISOString(),
+      taskId: 'task-1',
+      title: 'Setup repository',
+    },
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-task-board',
+      eventId: 'event-1',
+      eventType: 'task_claimed',
+      phase: 'executing',
+      timestamp: new Date().toISOString(),
+      payload: { taskId: 'task-1', title: 'Setup repository' },
+    },
+    {
+      type: 'task_created',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-task-board',
+      timestamp: new Date().toISOString(),
+      taskId: 'task-2',
+      title: 'Run migrations',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('--- Task Status Board ---'))
+  assert.ok(output.includes('▶ 执行中'))
+  assert.ok(output.includes('Setup repository'))
+  assert.ok(output.includes('⟳ 规划中'))
+  assert.ok(output.includes('Run migrations'))
+})

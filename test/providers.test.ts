@@ -79,6 +79,12 @@ test('getModel returns valid model definition', () => {
   assert.equal(minimaxModel.capabilities.toolCalling, true)
   assert.equal(minimaxModel.capabilities.jsonOutput, true)
   assert.equal(minimaxModel.capabilities.streaming, true)
+
+  // deepseek-reasoner (R1) explicitly declares no tool-calling support
+  const reasonerModel = getModel('deepseek/deepseek-reasoner')
+  assert.equal(reasonerModel.id, 'deepseek/deepseek-reasoner')
+  assert.equal(reasonerModel.capabilities.toolCalling, false)
+  assert.equal(reasonerModel.capabilities.streaming, true)
 })
 
 test('getModel throws UnknownModelError for unknown ids', () => {

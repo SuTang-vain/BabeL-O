@@ -60,7 +60,7 @@ export const providerRegistry: ProviderDefinition[] = [
     authMode: 'api-key',
     defaultBaseUrl: 'https://api.anthropic.com',
     defaultModel: 'anthropic/claude-3-5-sonnet',
-    models: ['anthropic/claude-3-5-sonnet', 'anthropic/claude-3-opus'],
+    models: ['anthropic/claude-3-5-sonnet', 'anthropic/claude-3-opus', 'anthropic/claude-3-7-sonnet'],
   },
   {
     id: 'openai',
@@ -70,6 +70,20 @@ export const providerRegistry: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.openai.com/v1',
     defaultModel: 'openai/gpt-4o',
     models: ['openai/gpt-4o', 'openai/gpt-4-turbo', 'openai/gpt-3.5-turbo'],
+  },
+  {
+    id: 'deepseek',
+    displayName: 'DeepSeek',
+    adapter: 'openai-compatible',
+    authMode: 'bearer',
+    defaultBaseUrl: 'https://api.deepseek.com',
+    defaultModel: 'deepseek/deepseek-v4-pro',
+    models: [
+      'deepseek/deepseek-v4-pro',
+      'deepseek/deepseek-v4-flash',
+      'deepseek/deepseek-chat',
+      'deepseek/deepseek-reasoner',
+    ],
   },
   {
     id: 'zhipu',
@@ -134,6 +148,16 @@ export const modelRegistry: ModelDefinition[] = [
     },
   },
   {
+    id: 'anthropic/claude-3-7-sonnet',
+    name: 'Claude 3.7 Sonnet',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
     id: 'openai/gpt-4o',
     name: 'GPT-4o',
     contextWindow: 128000,
@@ -160,6 +184,46 @@ export const modelRegistry: ModelDefinition[] = [
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'deepseek/deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro',
+    contextWindow: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'deepseek/deepseek-v4-flash',
+    name: 'DeepSeek V4 Flash',
+    contextWindow: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'deepseek/deepseek-chat',
+    name: 'DeepSeek Chat (V3)',
+    contextWindow: 64000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'deepseek/deepseek-reasoner',
+    name: 'DeepSeek Reasoner (R1)',
+    contextWindow: 64000,
+    capabilities: {
+      toolCalling: false,
+      jsonOutput: false,
       streaming: true,
     },
   },

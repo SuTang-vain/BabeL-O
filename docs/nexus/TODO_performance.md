@@ -40,14 +40,14 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] `/v1/stream` 支持 backpressure 观察。
 - [x] tool output truncation。
 - [x] Bash maxBuffer 配置化。
-- [ ] Grep/Glob result limit。
+- [x] Grep/Glob result limit。
 - [x] session events 限制 recent 默认值。
-- [ ] route handlers 不做 O(n) 全量扫描。
+- [x] route handlers 不做 O(n) 全量扫描。
 - [x] 执行并发闸门。
 
 ## P1 Storage Performance
 
-- [ ] SQLite schema 加索引。
+- [x] SQLite schema 加索引。
 - [x] sessions list 默认 limit。
 - [x] events list 分页。
 - [x] tool trace 分页。
@@ -58,32 +58,32 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 
 - [x] `bbl --help` 启动耗时基线。
 - [x] `bbl run "hello"` embedded 耗时基线。
-- [ ] `bbl chat` 首屏耗时基线。
-- [ ] CLI 不在启动时加载 provider SDK。
-- [ ] CLI 不在启动时加载 TUI optional deps。
+- [x] `bbl chat` 首屏耗时基线。
+- [x] CLI 不在启动时加载 provider SDK。
+- [x] CLI 不在启动时加载 TUI optional deps。
 
 ## P2 Provider Performance
 
-- [ ] provider request duration 记录。
-- [ ] time to first token 记录。
-- [ ] stream delta count 记录。
-- [ ] tool call roundtrip duration 记录。
+- [x] provider request duration 记录。
+- [x] time to first token 记录。
+- [x] stream delta count 记录。
+- [x] tool call roundtrip duration 记录。
 - [ ] retry policy benchmark。
-- [ ] provider timeout policy。
+- [x] provider timeout policy。
 
 ## P2 Observability / Metrics
 
 来自 `docs/RECOMMENDATIONS.md` 的 Milestone 5。目标是本地可观测，不迁移 BabeL-X 的 telemetry / analytics / GrowthBook。
 
 - [ ] 新增最小结构化 logger，支持 `NEXUS_LOG_LEVEL=silent`。
-- [ ] SQLite metrics 表记录执行指标。
-- [ ] 记录 `execute_duration_ms`。
-- [ ] 记录 `provider_first_token_ms`。
+- [x] SQLite metrics 表记录执行指标。
+- [x] 记录 `execute_duration_ms`。
+- [x] 记录 `provider_first_token_ms`。
 - [x] benchmark 记录 context 字符级近似输入规模、压缩后规模和压缩率。
-- [ ] runtime metrics 记录 `context_tokens_in` / `context_tokens_out` 或字符级近似值。
-- [ ] 记录 `tool_call_count`。
-- [ ] 记录 `tool_roundtrip_duration_ms`。
-- [ ] `/v1/runtime/metrics` 返回新增指标。
+- [x] runtime metrics 记录 `context_tokens_in` / `context_tokens_out` 或字符级近似值。
+- [x] 记录 `tool_call_count`。
+- [x] 记录 `tool_roundtrip_duration_ms`。
+- [x] `/v1/runtime/metrics` 返回新增指标。
 - [ ] 压力测试覆盖 1000+ sessions。
 
 ## 验证命令

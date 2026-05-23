@@ -14,6 +14,7 @@ import type {
   ToolTraceListOptions,
   ToolTraceListResult,
   PermissionAudit,
+  ExecutionMetrics,
 } from './Storage.js'
 
 type Row = Record<string, unknown>
@@ -81,23 +82,65 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async listSessions(options: StorageListOptions = {}): Promise<SessionSnapshot[]> {
+    const limit = options.limit ?? 50
+    const includeEvents = options.includeEvents ?? false
+
+    if (!includeEvents) {
+      const rows = this.db
+        .prepare(
+          `SELECT * FROM sessions
+           ORDER BY updated_at DESC, session_id ASC
+           LIMIT ?`,
+        )
+        .all(limit) as Row[]
+      return rows.map(row => rowToSession(row, []))
+    }
+
+    // 采用 LEFT JOIN 一次性检索出所有的 sessions 及其 events，避免 N+1 查询
     const rows = this.db
       .prepare(
-        `SELECT * FROM sessions
+        `SELECT s.*, e.event_json FROM sessions s
+         LEFT JOIN events e ON s.session_id = e.session_id
+         WHERE s.session_id IN (
+           SELECT session_id FROM sessions
+           ORDER BY updated_at DESC, session_id ASC
+           LIMIT ?
+         )
+         ORDER BY s.updated_at DESC, s.session_id ASC, e.timestamp ASC, e.event_key ASC`,
+      )
+      .all(limit) as Row[]
+
+    // 记录正确的顺序
+    const orderedSessionIds = this.db
+      .prepare(
+        `SELECT session_id FROM sessions
          ORDER BY updated_at DESC, session_id ASC
          LIMIT ?`,
       )
-      .all(options.limit ?? 50) as Row[]
-    const includeEvents = options.includeEvents ?? false
+      .all(limit) as Row[]
 
-    return Promise.all(
-      rows.map(row =>
-        rowToSession(
-          row,
-          includeEvents ? this.listEventsSync(String(row.session_id)) : [],
-        ),
-      ),
-    )
+    const sessionMap = new Map<string, { row: Row; events: NexusEvent[] }>()
+    for (const row of rows) {
+      const sid = String(row.session_id)
+      let entry = sessionMap.get(sid)
+      if (!entry) {
+        entry = { row, events: [] }
+        sessionMap.set(sid, entry)
+      }
+      if (row.event_json !== null && row.event_json !== undefined) {
+        entry.events.push(JSON.parse(String(row.event_json)) as NexusEvent)
+      }
+    }
+
+    const result: SessionSnapshot[] = []
+    for (const osid of orderedSessionIds) {
+      const sid = String(osid.session_id)
+      const entry = sessionMap.get(sid)
+      if (entry) {
+        result.push(rowToSession(entry.row, entry.events))
+      }
+    }
+    return result
   }
 
   async listEvents(
@@ -457,7 +500,7 @@ export class SqliteStorage implements NexusStorage {
         );
 
         CREATE INDEX IF NOT EXISTS tool_traces_session_started_at_idx
-          ON tool_traces(session_id, started_at ASC);
+          ON tool_traces(session_id, started_at ASC, tool_use_id ASC);
       `)
 
       // Dynamically alter schemas if columns do not exist
@@ -519,6 +562,39 @@ export class SqliteStorage implements NexusStorage {
       this.db.exec('PRAGMA user_version = 2;')
       version = 2
     }
+
+    if (version < 3) {
+      this.db.exec(`
+        DROP INDEX IF EXISTS tool_traces_session_started_at_idx;
+        CREATE INDEX IF NOT EXISTS tool_traces_session_started_at_idx
+          ON tool_traces(session_id, started_at ASC, tool_use_id ASC);
+      `)
+      this.db.exec('PRAGMA user_version = 3;')
+      version = 3
+    }
+
+    if (version < 4) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS execution_metrics (
+          metric_id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          execute_duration_ms REAL,
+          provider_first_token_ms REAL,
+          provider_request_duration_ms REAL,
+          stream_delta_count INTEGER,
+          tool_call_count INTEGER,
+          tool_roundtrip_duration_ms REAL,
+          context_chars_in INTEGER,
+          context_chars_out INTEGER,
+          timestamp TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS execution_metrics_session_idx
+          ON execution_metrics(session_id);
+      `)
+      this.db.exec('PRAGMA user_version = 4;')
+      version = 4
+    }
   }
 
   private async listAllEvents(sessionId: string): Promise<NexusEvent[]> {
@@ -534,6 +610,66 @@ export class SqliteStorage implements NexusStorage {
       )
       .all(sessionId) as Row[]
     return rows.map(row => JSON.parse(String(row.event_json)) as NexusEvent)
+  }
+
+  async saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO execution_metrics (
+          metric_id, session_id, execute_duration_ms, provider_first_token_ms,
+          provider_request_duration_ms, stream_delta_count, tool_call_count,
+          tool_roundtrip_duration_ms, context_chars_in, context_chars_out,
+          timestamp
+        ) VALUES (
+          :metricId, :sessionId, :executeDurationMs, :providerFirstTokenMs,
+          :providerRequestDurationMs, :streamDeltaCount, :toolCallCount,
+          :toolRoundtripDurationMs, :contextCharsIn, :contextCharsOut,
+          :timestamp
+        )
+        ON CONFLICT(metric_id) DO UPDATE SET
+          execute_duration_ms = excluded.execute_duration_ms,
+          provider_first_token_ms = excluded.provider_first_token_ms,
+          provider_request_duration_ms = excluded.provider_request_duration_ms,
+          stream_delta_count = excluded.stream_delta_count,
+          tool_call_count = excluded.tool_call_count,
+          tool_roundtrip_duration_ms = excluded.tool_roundtrip_duration_ms,
+          context_chars_in = excluded.context_chars_in,
+          context_chars_out = excluded.context_chars_out,
+          timestamp = excluded.timestamp`
+      )
+      .run({
+        metricId: metrics.metricId,
+        sessionId: metrics.sessionId,
+        executeDurationMs: metrics.executeDurationMs ?? null,
+        providerFirstTokenMs: metrics.providerFirstTokenMs ?? null,
+        providerRequestDurationMs: metrics.providerRequestDurationMs ?? null,
+        streamDeltaCount: metrics.streamDeltaCount ?? null,
+        toolCallCount: metrics.toolCallCount ?? null,
+        toolRoundtripDurationMs: metrics.toolRoundtripDurationMs ?? null,
+        contextCharsIn: metrics.contextCharsIn ?? null,
+        contextCharsOut: metrics.contextCharsOut ?? null,
+        timestamp: metrics.timestamp,
+      })
+  }
+
+  async getExecutionMetrics(sessionId: string): Promise<ExecutionMetrics | null> {
+    const row = this.db
+      .prepare(`SELECT * FROM execution_metrics WHERE session_id = ? ORDER BY timestamp DESC LIMIT 1`)
+      .get(sessionId) as Row | undefined
+    if (!row) return null
+    return {
+      metricId: String(row.metric_id),
+      sessionId: String(row.session_id),
+      executeDurationMs: row.execute_duration_ms !== null && row.execute_duration_ms !== undefined ? Number(row.execute_duration_ms) : undefined,
+      providerFirstTokenMs: row.provider_first_token_ms !== null && row.provider_first_token_ms !== undefined ? Number(row.provider_first_token_ms) : undefined,
+      providerRequestDurationMs: row.provider_request_duration_ms !== null && row.provider_request_duration_ms !== undefined ? Number(row.provider_request_duration_ms) : undefined,
+      streamDeltaCount: row.stream_delta_count !== null && row.stream_delta_count !== undefined ? Number(row.stream_delta_count) : undefined,
+      toolCallCount: row.tool_call_count !== null && row.tool_call_count !== undefined ? Number(row.tool_call_count) : undefined,
+      toolRoundtripDurationMs: row.tool_roundtrip_duration_ms !== null && row.tool_roundtrip_duration_ms !== undefined ? Number(row.tool_roundtrip_duration_ms) : undefined,
+      contextCharsIn: row.context_chars_in !== null && row.context_chars_in !== undefined ? Number(row.context_chars_in) : undefined,
+      contextCharsOut: row.context_chars_out !== null && row.context_chars_out !== undefined ? Number(row.context_chars_out) : undefined,
+      timestamp: String(row.timestamp),
+    }
   }
 }
 

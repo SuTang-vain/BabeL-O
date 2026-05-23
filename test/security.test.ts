@@ -121,7 +121,7 @@ test('WebSocket stream handshake authentication checks', async () => {
     const address = await app.listen({ port: 0 })
     const wsUrl = address.replace(/^http/, 'ws') + '/v1/stream'
 
-    const wsModule = await (new Function("return import('ws')")())
+    const wsModule = await import('ws')
     const wsCtor = wsModule.default
 
     // 1. Connection without API key should fail
@@ -259,7 +259,7 @@ test('Allow-all policy still prompts for high risk tools', async () => {
   const executePromise = (async () => {
     for await (const event of runtime.executeStream({
       sessionId,
-      prompt: 'bash "pwd"',
+      prompt: 'bash "make build"',
       cwd,
     })) {
       events.push(event)

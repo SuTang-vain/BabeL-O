@@ -61,6 +61,40 @@ export class NexusMetrics {
     maxBufferedAmount: 0,
   }
 
+  private providerFirstTokenTotalMs = 0
+  private providerFirstTokenCount = 0
+  private providerRequestTotalMs = 0
+  private providerRequestCount = 0
+  private streamDeltaTotalCount = 0
+  private toolCallTotalCount = 0
+  private toolRoundtripTotalMs = 0
+  private contextCharsInTotal = 0
+  private contextCharsOutTotal = 0
+
+  recordProviderFirstToken(ms: number): void {
+    this.providerFirstTokenTotalMs += ms
+    this.providerFirstTokenCount += 1
+  }
+
+  recordProviderRequestDuration(ms: number): void {
+    this.providerRequestTotalMs += ms
+    this.providerRequestCount += 1
+  }
+
+  recordStreamDeltas(count: number): void {
+    this.streamDeltaTotalCount += count
+  }
+
+  recordToolCalls(count: number, durationMs: number): void {
+    this.toolCallTotalCount += count
+    this.toolRoundtripTotalMs += durationMs
+  }
+
+  recordContextChars(charsIn: number, charsOut: number): void {
+    this.contextCharsInTotal += charsIn
+    this.contextCharsOutTotal += charsOut
+  }
+
   now(): number {
     return performance.now()
   }
@@ -149,6 +183,25 @@ export class NexusMetrics {
       uptimeMs: Math.round(this.now() - this.startedAtMs),
       execute: withAverage(this.execute),
       stream: withAverage(this.stream),
+      providerFirstTokenMs: {
+        totalMs: round(this.providerFirstTokenTotalMs),
+        count: this.providerFirstTokenCount,
+        avgMs: this.providerFirstTokenCount > 0 ? round(this.providerFirstTokenTotalMs / this.providerFirstTokenCount) : 0,
+      },
+      providerRequestDurationMs: {
+        totalMs: round(this.providerRequestTotalMs),
+        count: this.providerRequestCount,
+        avgMs: this.providerRequestCount > 0 ? round(this.providerRequestTotalMs / this.providerRequestCount) : 0,
+      },
+      streamDeltaCount: this.streamDeltaTotalCount,
+      toolCallCount: this.toolCallTotalCount,
+      toolRoundtripDurationMs: {
+        totalMs: round(this.toolRoundtripTotalMs),
+        count: this.toolCallTotalCount,
+        avgMs: this.toolCallTotalCount > 0 ? round(this.toolRoundtripTotalMs / this.toolCallTotalCount) : 0,
+      },
+      contextCharsIn: this.contextCharsInTotal,
+      contextCharsOut: this.contextCharsOutTotal,
       routes: [...this.routes.values()]
         .map(withAverage)
         .sort((left, right) => left.route.localeCompare(right.route)),

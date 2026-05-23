@@ -36,6 +36,8 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [ ] 将 `LocalCodingRuntime` 改为可组合 runtime pipeline：prompt parser、provider call、tool loop、result aggregator。
 - [x] 新增 `LLMCodingRuntime`，实现 provider stream、tool loop、result aggregator 第一版。
 - [x] 实现零额外依赖的 Bash 状态探测软拦截（State Probing），使 Bash 工具在同一会话下能够保持工作目录（CWD）。
+- [x] 将 Bash 状态探测从固定标记改为每次执行随机 nonce + HMAC + `timingSafeEqual` 验证，避免用户命令伪造 marker 注入 CWD。
+- [x] Bash `sessionCwdMap` 增加 lastActiveAt、24 小时默认 TTL、每小时后台 sweeper、`pruneBashSessionState()` 与 `clearBashSessionState()`。
 - [x] 实现完整 request context：`requestId`、`sessionId`、`cwd`、`model`、`budget`、`abortSignal`。
 - [x] runtime execute options 已传递 `sessionId`、`cwd`、`abortSignal` 与工具输出预算。
 - [x] 给 `/v1/execute` 加 timeout。
@@ -58,6 +60,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 支持 `.babel-o/memory.md` 项目记忆加载，并注入 system prompt。
 - [x] 初版只做字符预算和规则摘要；暂不实现 BabeL-X `SessionMemory` 的后台子 Agent 提取。
 - [x] Benchmark：长会话上下文输入规模降低 50%+，且最近 3-5 轮完整保留。
+- [x] 修复长会话历史截断的 user boundary 选择，避免旧 `hi` 和残缺历史抢占上下文起点，并在 system prompt 中加入 `Context Boundary` 提示，明确最近消息是权威工作历史。
 
 ## P0 MCP-Ready Runtime Extensions
 
@@ -76,23 +79,23 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 来自 `docs/RECOMMENDATIONS.md` 的 Milestone 3。目标是先实现纯文本 inline Skills，为模型提供稳定工作方法，不迁移 BabeL-X 的 React `SkillTool` 和 fork 模式。
 
-- [ ] 新增 `src/skills/loader.ts`：解析 front matter，加载 skill id/name/triggers/priority/content。
-- [ ] 支持三级目录：`src/skills/built-in`、`~/.babel-o/skills`、`<cwd>/.babel-o/skills`。
-- [ ] 新增 `matchSkills(skills, prompt)`：按触发词匹配，最多注入 3 个，按 priority 排序。
-- [ ] 将匹配到的 inline skill 注入 system prompt 或 context assembler。
-- [ ] 内置 5 个 skill：coding、optimization、debugging、testing、git。
-- [ ] 初版不支持 `mode: fork`；fork 等 AgentLoop/sub-agent 能力稳定后再接。
+- [x] 新增 `src/skills/loader.ts`：解析 front matter，加载 skill id/name/triggers/priority/content。
+- [x] 支持三级目录：`src/skills/built-in`、`~/.babel-o/skills`、`<cwd>/.babel-o/skills`。
+- [x] 新增 `matchSkills(skills, prompt)`：按触发词匹配，最多注入 3 个，按 priority 排序。
+- [x] 将匹配到的 inline skill 注入 system prompt 或 context assembler。
+- [x] 内置 5 个 skill：coding、optimization、debugging、testing、git。
+- [x] 初版不支持 `mode: fork`；fork 等 AgentLoop/sub-agent 能力稳定后再接。
 
 ## P2 Smart Permissions
 
 来自 `docs/RECOMMENDATIONS.md` 的 Milestone 4。目标是从全手动审批升级为轻量规则自动分类，不迁移 BabeL-X 的复杂九阶段权限管道。
 
-- [ ] 新增 `src/runtime/classifier.ts`。
-- [ ] Read/Grep/Glob 等 read-only 操作自动放行。
-- [ ] Bash 支持安全白名单：`ls`、`cat`、`pwd`、`git status`、`git log`、`git diff`、`npm list`、`npx tsc --noEmit` 等。
-- [ ] Bash 支持危险黑名单：`rm -rf`、`sudo`、管道 curl/wget、`npm publish`、`git push` 等。
-- [ ] 写操作默认仍要求人工确认。
-- [ ] 所有自动放行/拒绝记录 permission audit reason。
+- [x] 新增 `src/runtime/classifier.ts`。
+- [x] Read/Grep/Glob 等 read-only 操作自动放行。
+- [x] Bash 支持安全白名单：`ls`、`cat`、`pwd`、`git status`、`git log`、`git diff`、`npm list`、`npx tsc --noEmit` 等。
+- [x] Bash 支持危险黑名单：`rm -rf`、`sudo`、管道 curl/wget、`npm publish`、`git push` 等。
+- [x] 写操作默认仍要求人工确认。
+- [x] 所有自动放行/拒绝记录 permission audit reason。
 
 ## P1 Storage
 
@@ -106,6 +109,10 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 支持 storage restart smoke test。
 - [x] 给 sessions/tasks/events 列表加 `limit`。
 - [x] 预留/实现 cursor pagination (复合游标复合分页)。
+- [x] `storageBridge` 改为带 3 次重试、延迟调度、永久失败计数和 stats 暴露的内存持久化队列，避免 fire-and-forget 静默失败。
+- [x] `TaskQueue` / `TaskSession` 模块级 Map 对终态数据增加 24 小时默认 prune 策略和后台 sweeper。
+- [ ] 如需跨进程崩溃恢复，为 `storageBridge` 增加 durable WAL 与批量写入。
+- [ ] 如需更短生命周期，补充 session close event 并触发 Bash CWD、task queue、task session 和 pending permission 级联清理。
 
 ## P1 Security
 
@@ -126,14 +133,15 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] CLI 支持 approve/deny permission event.
 - [x] 记录当前工具 allow/deny audit view.
 - [x] 记录持久化 permission audit.
+- [x] `PendingPermissionRegistry` 增加 30 分钟默认 TTL、后台 sweeper、`sweepExpired()`、`pendingCount()`，超时请求自动 deny 并释放 Promise。
 - [x] 默认绑定 `127.0.0.1`.
 - [x] 生产/远程部署默认要求 `NEXUS_API_KEY`.
 
 ## P2 Execution Environments
 
-- [ ] 定义 `executionEnvironment` 请求字段。
-- [ ] P2 只支持 `local`。
-- [ ] 对 `docker` / `remote` 返回明确 not implemented。
+- [x] 定义 `executionEnvironment` 请求字段。
+- [x] P2 只支持 `local`。
+- [x] 对 `docker` / `remote` 返回明确 not implemented。
 - [ ] 设计 Docker workspace mount 和资源限制。
 - [ ] 设计 remote runner protocol。
 
@@ -148,6 +156,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] storage restart test 已纳入 `npm test`
 - [x] allowlisted tool denial test 已纳入 `npm test`
 - [x] `test/security.test.ts` 安全鉴权测试已纳入 `npm test`
+- [x] `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/permission-flow.test.ts test/agent-loop.test.ts test/runtime.test.ts test/security.test.ts`
 - [ ] `npm run test:stream`
 
 ## 参考文件
