@@ -22,6 +22,18 @@ test('getProvider returns valid provider definition', () => {
   assert.equal(openaiProvider.adapter, 'openai-compatible')
   assert.equal(openaiProvider.authMode, 'bearer')
   assert.ok(openaiProvider.models.includes('openai/gpt-4o'))
+
+  const zhipuProvider = getProvider('zhipu')
+  assert.equal(zhipuProvider.id, 'zhipu')
+  assert.equal(zhipuProvider.adapter, 'anthropic-compatible')
+  assert.equal(zhipuProvider.authMode, 'api-key')
+  assert.ok(zhipuProvider.models.includes('zhipu/glm-5.1'))
+
+  const minimaxProvider = getProvider('minimax')
+  assert.equal(minimaxProvider.id, 'minimax')
+  assert.equal(minimaxProvider.adapter, 'anthropic-compatible')
+  assert.equal(minimaxProvider.authMode, 'api-key')
+  assert.ok(minimaxProvider.models.includes('minimax/MiniMax-M2.7'))
 })
 
 test('getProvider throws UnknownProviderError for unknown ids', () => {
@@ -53,6 +65,20 @@ test('getModel returns valid model definition', () => {
   assert.equal(claudeModel.capabilities.toolCalling, true)
   assert.equal(claudeModel.capabilities.jsonOutput, true)
   assert.equal(claudeModel.capabilities.streaming, true)
+
+  const glmModel = getModel('zhipu/glm-5.1')
+  assert.equal(glmModel.id, 'zhipu/glm-5.1')
+  assert.equal(glmModel.contextWindow, 200000)
+  assert.equal(glmModel.capabilities.toolCalling, true)
+  assert.equal(glmModel.capabilities.jsonOutput, true)
+  assert.equal(glmModel.capabilities.streaming, true)
+
+  const minimaxModel = getModel('minimax/MiniMax-M2.7')
+  assert.equal(minimaxModel.id, 'minimax/MiniMax-M2.7')
+  assert.equal(minimaxModel.contextWindow, 200000)
+  assert.equal(minimaxModel.capabilities.toolCalling, true)
+  assert.equal(minimaxModel.capabilities.jsonOutput, true)
+  assert.equal(minimaxModel.capabilities.streaming, true)
 })
 
 test('getModel throws UnknownModelError for unknown ids', () => {

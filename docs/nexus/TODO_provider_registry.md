@@ -65,8 +65,8 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] local: `local/coding-runtime`
 - [x] Anthropic official
 - [x] OpenAI
-- [ ] Zhipu / GLM
-- [ ] MiniMax
+- [x] Zhipu / GLM
+- [x] MiniMax
 - [ ] DeepSeek
 - [ ] Moonshot
 - [ ] Ollama / local OpenAI-compatible

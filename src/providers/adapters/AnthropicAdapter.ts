@@ -7,6 +7,7 @@ import type {
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
 import { ProviderError } from '../../shared/errors.js'
+import { getProvider } from '../registry.js'
 
 const MODEL_MAPPING: Record<
   string,
@@ -85,6 +86,16 @@ export class AnthropicAdapter implements ModelAdapter {
       process.env.ANTHROPIC_BASE_URL ||
       'https://api.anthropic.com'
 
+    const slashIdx = params.model.indexOf('/')
+    const providerId = slashIdx !== -1 ? params.model.substring(0, slashIdx) : 'anthropic'
+
+    let providerDef
+    try {
+      providerDef = getProvider(providerId)
+    } catch {
+      providerDef = { authMode: 'api-key' as const }
+    }
+
     const betas = ['prompt-caching-2024-07-31']
     if (params.thinking && params.thinking.budgetTokens > 0) {
       betas.push('thinking-2025-02-19')
@@ -101,10 +112,20 @@ export class AnthropicAdapter implements ModelAdapter {
 
     const headers: Record<string, string> = {
       'content-type': 'application/json',
-      'x-api-key': apiKey,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': betas.join(','),
       ...getCustomHeaders(),
+    }
+
+    if (providerDef.authMode === 'bearer') {
+      headers['Authorization'] = `Bearer ${apiKey}`
+    } else if (providerDef.authMode === 'api-key') {
+      headers['x-api-key'] = apiKey
+    }
+
+    headers['anthropic-version'] = '2023-06-01'
+
+    const isNativeAnthropic = providerId === 'anthropic'
+    if (isNativeAnthropic || process.env.ANTHROPIC_BETA) {
+      headers['anthropic-beta'] = betas.join(',')
     }
 
     // Convert system prompt to block format supporting caching
@@ -215,7 +236,7 @@ export class AnthropicAdapter implements ModelAdapter {
 
     if (!response.ok) {
       const errorText = await response.text()
-      throw new ProviderError('anthropic', response.status, errorText)
+      throw new ProviderError(providerId, response.status, errorText)
     }
 
     if (!response.body) {

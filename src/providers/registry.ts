@@ -71,6 +71,35 @@ export const providerRegistry: ProviderDefinition[] = [
     defaultModel: 'openai/gpt-4o',
     models: ['openai/gpt-4o', 'openai/gpt-4-turbo', 'openai/gpt-3.5-turbo'],
   },
+  {
+    id: 'zhipu',
+    displayName: 'Zhipu AI',
+    adapter: 'anthropic-compatible',
+    authMode: 'api-key',
+    defaultBaseUrl: 'https://open.bigmodel.cn/api/anthropic',
+    defaultModel: 'zhipu/glm-5.1',
+    models: [
+      'zhipu/glm-5.1',
+      'zhipu/glm-5',
+      'zhipu/glm-5-turbo',
+    ],
+  },
+  {
+    id: 'minimax',
+    displayName: 'MiniMax',
+    adapter: 'anthropic-compatible',
+    authMode: 'api-key',
+    defaultBaseUrl: 'https://api.minimaxi.com/anthropic',
+    defaultModel: 'minimax/MiniMax-M2.7',
+    models: [
+      'minimax/MiniMax-M2.7',
+      'minimax/MiniMax-M2.7-highspeed',
+      'minimax/MiniMax-M2.5',
+      'minimax/MiniMax-M2.5-highspeed',
+      'minimax/MiniMax-M2.1',
+      'minimax/MiniMax-M2',
+    ],
+  },
 ]
 
 export const modelRegistry: ModelDefinition[] = [
@@ -134,6 +163,96 @@ export const modelRegistry: ModelDefinition[] = [
       streaming: true,
     },
   },
+  {
+    id: 'zhipu/glm-5.1',
+    name: 'GLM 5.1',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'zhipu/glm-5',
+    name: 'GLM 5',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'zhipu/glm-5-turbo',
+    name: 'GLM 5 Turbo',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2.7',
+    name: 'MiniMax M2.7',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2.7-highspeed',
+    name: 'MiniMax M2.7 Highspeed',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2.5',
+    name: 'MiniMax M2.5',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2.5-highspeed',
+    name: 'MiniMax M2.5 Highspeed',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2.1',
+    name: 'MiniMax M2.1',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M2',
+    name: 'MiniMax M2',
+    contextWindow: 200000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
 ]
 
 export function getProvider(id: string): ProviderDefinition {
@@ -166,4 +285,3 @@ export function getAdapter(providerId: string): ModelAdapter {
       throw new Error(`No adapter found for provider type: ${provider.adapter}`)
   }
 }
-

@@ -135,6 +135,10 @@ export class ConfigManager {
         apiKey = process.env.ANTHROPIC_API_KEY;
       } else if (providerId === 'openai') {
         apiKey = process.env.OPENAI_API_KEY;
+      } else if (providerId === 'zhipu') {
+        apiKey = process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY;
+      } else if (providerId === 'minimax') {
+        apiKey = process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN;
       }
     }
     if (!apiKey) {
@@ -147,6 +151,10 @@ export class ConfigManager {
         baseUrl = process.env.ANTHROPIC_BASE_URL;
       } else if (providerId === 'openai') {
         baseUrl = process.env.OPENAI_BASE_URL;
+      } else if (providerId === 'zhipu') {
+        baseUrl = process.env.ZHIPU_BASE_URL || process.env.ZHIPUAI_BASE_URL;
+      } else if (providerId === 'minimax') {
+        baseUrl = process.env.MINIMAX_BASE_URL;
       }
     }
     if (!baseUrl) {

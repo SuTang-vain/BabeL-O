@@ -231,6 +231,50 @@ describe('Model Adapters & Factory', () => {
         },
       ])
     })
+
+    test('zhipu model uses x-api-key and omits anthropic-beta', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      await collectStream(
+        adapter.queryStream(
+          {
+            model: 'zhipu/glm-5.1',
+            messages: [{ role: 'user', content: 'test' }],
+          },
+          { apiKey: 'sk-zhipu-test' }
+        )
+      )
+
+      assert.ok(lastFetchInit)
+      const headers = lastFetchInit.headers as Record<string, string>
+      assert.strictEqual(headers['x-api-key'], 'sk-zhipu-test')
+      assert.strictEqual(headers['Authorization'], undefined)
+      assert.strictEqual(headers['anthropic-version'], '2023-06-01')
+      assert.strictEqual(headers['anthropic-beta'], undefined)
+    })
+
+    test('minimax model uses x-api-key and omits anthropic-beta', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      await collectStream(
+        adapter.queryStream(
+          {
+            model: 'minimax/MiniMax-M2.7',
+            messages: [{ role: 'user', content: 'test' }],
+          },
+          { apiKey: 'sk-minimax-test' }
+        )
+      )
+
+      assert.ok(lastFetchInit)
+      const headers = lastFetchInit.headers as Record<string, string>
+      assert.strictEqual(headers['x-api-key'], 'sk-minimax-test')
+      assert.strictEqual(headers['Authorization'], undefined)
+      assert.strictEqual(headers['anthropic-version'], '2023-06-01')
+      assert.strictEqual(headers['anthropic-beta'], undefined)
+    })
   })
 
   describe('OpenAIAdapter', () => {
