@@ -102,6 +102,54 @@ test('sqlite storage persists sessions and events across storage instances', asy
   }
 })
 
+test('/v1/execute session reuse and history mapping', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-reuse`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    const sessionId = 'session-test-reuse'
+    
+    // First execute
+    const res1 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { sessionId, prompt: 'hello first time', cwd },
+    })
+    assert.equal(res1.statusCode, 200)
+    const body1 = res1.json()
+    assert.equal(body1.sessionId, sessionId)
+
+    // Verify session phase is completed
+    const sessionAfterFirst = await storage.getSession(sessionId, { includeEvents: true })
+    assert.ok(sessionAfterFirst)
+    assert.ok(sessionAfterFirst.events.some(e => e.type === 'user_message' && e.text === 'hello first time'))
+
+    // Second execute with the same sessionId
+    const res2 = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { sessionId, prompt: 'hello second time', cwd },
+    })
+    assert.equal(res2.statusCode, 200)
+    const body2 = res2.json()
+    assert.equal(body2.sessionId, sessionId)
+
+    // Verify session events include both user_message events and that the session phase is updated
+    const sessionAfterSecond = await storage.getSession(sessionId, { includeEvents: true })
+    assert.ok(sessionAfterSecond)
+    assert.equal(sessionAfterSecond.lastUserInput, 'hello second time')
+    
+    const userMessages = sessionAfterSecond.events.filter(e => e.type === 'user_message')
+    assert.equal(userMessages.length, 2)
+    assert.equal((userMessages[0] as any).text, 'hello first time')
+    assert.equal((userMessages[1] as any).text, 'hello second time')
+  } finally {
+    await app.close()
+  }
+})
+
 test('session input, cancel, and task lifecycle endpoints update state', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-lifecycle`)
   await mkdir(cwd, { recursive: true })

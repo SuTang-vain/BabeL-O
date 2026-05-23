@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import { errorMessage } from '../shared/errors.js'
+import { errorMessage, ProviderError } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
@@ -160,6 +160,15 @@ export class LLMCodingRuntime implements NexusRuntime {
             const toolCall = currentToolCalls.find(tc => tc.id === delta.id)
             if (toolCall) {
               toolCall.input = delta.input
+            }
+          } else if (delta.type === 'usage') {
+            yield {
+              type: 'usage',
+              ...eventBase(options.sessionId),
+              inputTokens: delta.inputTokens,
+              outputTokens: delta.outputTokens,
+              cacheCreationInputTokens: delta.cacheCreationInputTokens,
+              cacheReadInputTokens: delta.cacheReadInputTokens,
             }
           }
         }
@@ -390,7 +399,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
-        code: isTimeout ? 'REQUEST_TIMEOUT' : 'PROVIDER_ERROR',
+        code: isTimeout ? 'REQUEST_TIMEOUT' : (err.code || 'PROVIDER_ERROR'),
         message: err instanceof Error ? err.message : String(err),
       }
     }
@@ -467,8 +476,9 @@ export function mapEventsToMessages(
 ): ModelMessage[] {
   const messages: ModelMessage[] = []
 
-  // Always start with the user's initial prompt
-  messages.push({ role: 'user', content: initialPrompt })
+  const firstUserMsg = events.find(e => e.type === 'user_message') as Extract<NexusEvent, { type: 'user_message' }> | undefined
+  const initial = firstUserMsg ? firstUserMsg.text : initialPrompt
+  messages.push({ role: 'user', content: initial })
 
   const completedToolIds = new Set<string>()
   for (const event of events) {

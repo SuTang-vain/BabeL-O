@@ -76,12 +76,21 @@ export type ToolUseEnd = {
   input: unknown
 }
 
+export type UsageDelta = {
+  type: 'usage'
+  inputTokens: number
+  outputTokens: number
+  cacheCreationInputTokens?: number
+  cacheReadInputTokens?: number
+}
+
 export type StreamDelta =
   | TextDelta
   | ThinkingDelta
   | ToolUseStart
   | ToolUseDelta
   | ToolUseEnd
+  | UsageDelta
 
 export interface ModelAdapter {
   queryStream(

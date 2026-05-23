@@ -35,6 +35,15 @@ export const UserMessageEventSchema = z.object({
   text: z.string(),
 })
 
+export const UsageEventSchema = z.object({
+  type: z.literal('usage'),
+  ...baseEventFields,
+  inputTokens: z.number(),
+  outputTokens: z.number(),
+  cacheCreationInputTokens: z.number().optional(),
+  cacheReadInputTokens: z.number().optional(),
+})
+
 export const ToolStartedEventSchema = z.object({
   type: z.literal('tool_started'),
   ...baseEventFields,
@@ -117,6 +126,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   AssistantDeltaEventSchema,
   ThinkingDeltaEventSchema,
   UserMessageEventSchema,
+  UsageEventSchema,
   ToolStartedEventSchema,
   ToolCompletedEventSchema,
   ToolDeniedEventSchema,

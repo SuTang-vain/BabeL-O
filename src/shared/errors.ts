@@ -24,6 +24,21 @@ export class NexusError extends Error {
   }
 }
 
+export class ProviderError extends NexusError {
+  constructor(
+    public readonly providerId: string,
+    public readonly httpStatus: number,
+    public readonly rawMessage: string,
+  ) {
+    super(
+      `Provider '${providerId}' request failed with status ${httpStatus}: ${rawMessage}`,
+      ErrorCodes.PROVIDER_ERROR,
+      502,
+    )
+    this.name = 'ProviderError'
+  }
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }

@@ -211,8 +211,21 @@ export async function createNexusApp(
         () => abortController.abort(),
         body.timeoutMs ?? executeTimeoutMs,
       )
-      const session = createSessionSnapshot(sessionId, cwd, body.prompt)
+      let session = await options.storage.getSession(sessionId, { includeEvents: false })
+      if (!session) {
+        session = createSessionSnapshot(sessionId, cwd, body.prompt)
+      } else {
+        session.phase = 'executing'
+        session.updatedAt = nowIso()
+        session.lastUserInput = body.prompt
+      }
       await options.storage.saveSession(session)
+
+      await options.storage.appendEvent(sessionId, {
+        type: 'user_message',
+        ...eventBase(sessionId),
+        text: body.prompt,
+      })
 
       const events: NexusEvent[] = []
       const requestId = body.requestId ?? createId('req')
@@ -655,9 +668,21 @@ export async function createNexusApp(
         () => abortController.abort(),
         body.timeoutMs ?? executeTimeoutMs,
       )
-      await options.storage.saveSession(
-        createSessionSnapshot(sessionId, cwd, body.prompt),
-      )
+      let session = await options.storage.getSession(sessionId, { includeEvents: false })
+      if (!session) {
+        session = createSessionSnapshot(sessionId, cwd, body.prompt)
+      } else {
+        session.phase = 'executing'
+        session.updatedAt = nowIso()
+        session.lastUserInput = body.prompt
+      }
+      await options.storage.saveSession(session)
+
+      await options.storage.appendEvent(sessionId, {
+        type: 'user_message',
+        ...eventBase(sessionId),
+        text: body.prompt,
+      })
 
       const requestId = body.requestId ?? createId('req')
       try {

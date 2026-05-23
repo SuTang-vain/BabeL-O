@@ -35,8 +35,8 @@
 - [x] `nexus start --storage-path` 已可用。
 - [x] `config add/use/list` 已实现。
 - [x] `models list/inspect` 已实现。
-- [ ] slash command 待实现。
-- [ ] 权限确认 UI 待实现。
+- [x] slash command 已实现，主清单维护在 [TODO_tui.md](./TODO_tui.md)。
+- [x] 权限确认 UI 已实现，主清单维护在 [TODO_tui.md](./TODO_tui.md)。
 
 ## 维护规则
 

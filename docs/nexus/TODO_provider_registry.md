@@ -47,8 +47,8 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] `openai-compatible` adapter。
 - [x] 流式 delta 归一为 Nexus events。
 - [x] tool call 归一为 Nexus tool invocation。
-- [ ] usage 归一。
-- [ ] provider error 归一为 Nexus `PROVIDER_ERROR`。
+- [x] usage 归一。
+- [x] provider error 归一为 Nexus `PROVIDER_ERROR`。
 - [x] 保留 `local` adapter 作为 deterministic test backend。
 
 ## P2 Model Capability Routing

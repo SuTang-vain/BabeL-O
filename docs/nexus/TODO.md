@@ -32,23 +32,29 @@ Legacy complexity is not imported by default.
 | --- | --- | --- | --- |
 | P0 Clean Skeleton | 已完成第一版 | [TODO_runtime.md](./TODO_runtime.md) | Fastify API、runtime facade、MemoryStorage、基础工具、CLI embedded/service smoke 已落地。 |
 | P0 CLI Interaction Baseline | 已完成第一版 | [TODO_tui.md](./TODO_tui.md) | `run`、`chat`、`nexus start/status`、`sessions list/show` 已可用；交互仍是 readline 级别。 |
-| P1 Real Provider Runtime | 已完成第一版 | [TODO_provider_registry.md](./TODO_provider_registry.md) | Anthropic/OpenAI adapter、LLMCodingRuntime 与 ConfigManager 已接入；provider options schema、usage 归一、真实 provider smoke 和 structured output 验证仍按 provider 子 TODO 跟进。 |
+| P1 Real Provider Runtime | 已完成第一版 | [TODO_provider_registry.md](./TODO_provider_registry.md) | Anthropic/OpenAI adapter、LLMCodingRuntime 与 ConfigManager 已接入；usage 与 provider error 已归一；provider options schema、真实 provider smoke 和 structured output 验证仍按 provider 子 TODO 跟进。 |
 | P1 Durable Storage | 已完成 | [TODO_runtime.md](./TODO_runtime.md) | SQLite storage、session/event/task/tool_traces 持久化，以及游标分页与 restart test 已落地。 |
 | P1 Service-Safe Permissions | 已完成 | [TODO_runtime.md](./TODO_runtime.md) | 限制非 localhost 强制开启 API 鉴权，支持 HTTP/WS 安全握手阻断与 CLI 凭证传输，安全保护规则全面覆盖并运行测试。 |
-| P1 Coding Workflow Parity | 待开始 | [TODO_tui.md](./TODO_tui.md) | 需要补 slash command、history、diff、文件补全、任务视图。 |
+| P1 Coding Workflow Parity | 已完成第一版 | [TODO_tui.md](./TODO_tui.md) | 支持 slash command、history 检索、行级 Diff、文件补全、历史重试。 |
 | P2 Agents / Task Orchestration | 已完成第一版 | [TODO_agents.md](./TODO_agents.md) | 实现了 TaskSession/TaskQueue 管理，Planner->Executor/Optimizer->Critic 协作闭环，及 `bbl optimize` 自优化机制。 |
-| P2 Performance Hardening | 待开始 | [TODO_performance.md](./TODO_performance.md) | 需要 benchmark、stream latency、startup trace、tool execution limits。 |
+| P2 Performance Hardening | 进行中 | [TODO_performance.md](./TODO_performance.md) | benchmark、startup trace、tool output limit、stream backpressure、分页和并发闸门已建立；大量 session/event 压测、chat 首响、Grep/Glob result limit、O(n) 审计和 SQLite 索引审计待收口。 |
 
 ## 当前优先级
 
-1. **P1 CLI 编程体验**: `chat` 从 readline 升级为更像 BabeL-X 的交互入口，先补 slash/help/history/diff。
-2. **P2 Performance**: 建立性能基线，避免新项目早早长成“大而慢”的形状。
+1. **P1 收口**: 补齐 provider options schema、真实 provider smoke、model/profile switching 和 task/Todo status panel。
+2. **P2 Performance**: 补齐大量数据压测、chat 首响 benchmark、Grep/Glob result limit、route handler O(n) 审计与 SQLite 索引审计。
 
 ## 当前阻塞项
 
 - 暂无。
 
 ## 最近完成
+
+- 实现 Provider 错误与 Token 消耗（Usage）归一化：新增 `ProviderError` 错误类型用于封装 HTTP status 和错误体；在 `events.ts` 中注册 `UsageEventSchema` 记录输入、输出及缓存 Tokens 消耗；在 `AnthropicAdapter` 与 `OpenAIAdapter` 中开启统计并随流提取 yield，在 `LLMCodingRuntime` 中捕获转化并保存至数据库。扩增了 `test/adapters.test.ts` 以完整校验。
+
+- 实现行级 LCS Diff 对比渲染器与命令历史检索：新增 `src/cli/diffLcs.ts` 实现最长公共子序列（LCS）对比算法并在 `diff.ts` 中重构 `Edit` 结果输出为红绿 unified diff 格式；在 `program.ts` 中新增 `/history`、`/history <keyword>` 以及 `/history !<idx>` 支持查看、搜索与快捷运行历史命令。添加了完整的单元测试 `test/diff.test.ts`。
+
+- 实现本地及远程多轮会话恢复支持：在 `bbl chat` 周期内维持单一 `sessionId` 并支持 `--session <id>` 参数恢复会话，开启时拉取渲染以往历史记录；在本地 SQLite 模式下追加 `user_message` 事件与 session 动态状态更新。在 `test/runtime.test.ts` 中新增集成测试用例。
 
 - 实现 SQLite 工具执行轨迹存储与复合游分页：建立 `tool_traces` 独立表并创建 `(session_id, started_at)` 索引；在 MemoryStorage 和 SqliteStorage 的 `appendEvent` 中自动拦截 `tool_started` / `tool_completed` 记录并更新轨迹状态，自动计算耗时；设计并实现 Composite Cursor (`${startedAt}|${toolUseId}`) 游标分页，确保同一时间戳下并发工具执行分页的绝对稳定性；提供 GET `/v1/sessions/:sessionId/tool-traces` 接口，支持 limit、order 和 cursor 分页查询，编写完备的集成测试，串行压测 100% 通过。
 

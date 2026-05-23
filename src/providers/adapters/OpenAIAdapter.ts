@@ -7,6 +7,7 @@ import type {
   ToolResultContentBlock,
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
+import { ProviderError } from '../../shared/errors.js'
 
 export class OpenAIAdapter implements ModelAdapter {
   async *queryStream(
@@ -98,6 +99,7 @@ export class OpenAIAdapter implements ModelAdapter {
       ...(params.temperature !== undefined && { temperature: params.temperature }),
       ...(params.maxTokens !== undefined && { max_tokens: params.maxTokens }),
       stream: true,
+      stream_options: { include_usage: true },
     }
 
     const response = await fetch(`${baseUrl}/chat/completions`, {
@@ -109,9 +111,7 @@ export class OpenAIAdapter implements ModelAdapter {
 
     if (!response.ok) {
       const errorText = await response.text()
-      throw new Error(
-        `OpenAI API request failed with status ${response.status}: ${errorText}`
-      )
+      throw new ProviderError('openai', response.status, errorText)
     }
 
     if (!response.body) {
@@ -132,6 +132,13 @@ export class OpenAIAdapter implements ModelAdapter {
         data = JSON.parse(sse.data)
       } catch {
         continue
+      }
+      if (data.usage) {
+        yield {
+          type: 'usage',
+          inputTokens: data.usage.prompt_tokens || 0,
+          outputTokens: data.usage.completion_tokens || 0,
+        }
       }
       const choice = data.choices?.[0]
       if (!choice) continue

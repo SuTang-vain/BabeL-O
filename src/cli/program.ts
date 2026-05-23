@@ -67,7 +67,8 @@ program
   .description('Start an interactive Nexus-backed chat loop')
   .option('--url <url>', 'Use a running Nexus service instead of embedded mode')
   .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
-  .action(async (options: { url?: string; cwd: string }) => {
+  .option('--session <id>', 'Resume an existing session ID')
+  .action(async (options: { url?: string; cwd: string; session?: string }) => {
     const historyFile = path.join(DEFAULT_CONFIG_DIR, 'history')
     let history: string[] = []
     try {
@@ -84,7 +85,7 @@ program
 
     const completer = (line: string): [string[], string] => {
       if (line.startsWith('/') && !line.includes(' ')) {
-        const commands = ['/help', '/clear', '/exit', '/model', '/status', '/sessions']
+        const commands = ['/help', '/clear', '/exit', '/model', '/status', '/sessions', '/history']
         const hits = commands.filter(c => c.startsWith(line))
         return [hits, line]
       }
@@ -159,6 +160,62 @@ program
 
     renderWelcome({ cwd: options.cwd, url: options.url })
 
+    const sessionId = options.session ?? createId('session')
+    if (options.session) {
+      console.log(chalk.cyan(`Resuming session: ${sessionId}`))
+      
+      try {
+        let events: NexusEvent[] = []
+        if (options.url) {
+          const client = new NexusClient({ baseUrl: options.url })
+          const res = (await client.listSessionEvents(sessionId, { limit: 100, order: 'asc' })) as { events: NexusEvent[] }
+          events = res.events
+        } else {
+          const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+          if (fs.existsSync(storagePath)) {
+            const storage = new SqliteStorage(storagePath)
+            const res = await storage.listEvents(sessionId, { limit: 100, order: 'asc' })
+            events = res.events
+            await storage.close?.()
+          }
+        }
+
+        if (events && events.length > 0) {
+          console.log(chalk.dim('\n--- Session History ---'))
+          let currentAssistantText = ''
+          for (const ev of events) {
+            if (ev.type === 'user_message') {
+              if (currentAssistantText) {
+                console.log(currentAssistantText)
+                currentAssistantText = ''
+              }
+              console.log(`${chalk.cyan('bbl>')} ${ev.text}`)
+            } else if (ev.type === 'assistant_delta') {
+              currentAssistantText += ev.text
+            } else if (ev.type === 'tool_started') {
+              if (currentAssistantText) {
+                console.log(currentAssistantText)
+                currentAssistantText = ''
+              }
+              console.log(chalk.cyan(`→ ${ev.name}`), chalk.dim(JSON.stringify(ev.input)))
+            } else if (ev.type === 'tool_completed') {
+              console.log(
+                ev.success ? chalk.green(`✓ ${ev.name}`) : chalk.red(`✗ ${ev.name}`)
+              )
+            }
+          }
+          if (currentAssistantText) {
+            console.log(currentAssistantText)
+          }
+          console.log(chalk.dim('-----------------------\n'))
+        }
+      } catch (e: any) {
+        console.error(chalk.yellow(`Warning: Failed to load session history: ${e.message || e}`))
+      }
+    } else {
+      console.log(chalk.cyan(`Started new session: ${sessionId}`))
+    }
+
     try {
       for (;;) {
         let prompt: string
@@ -199,6 +256,8 @@ program
           console.log(`${chalk.bold('/model')}         Show default model or switch it (e.g. /model anthropic/claude-3-5-sonnet)`)
           console.log(`${chalk.bold('/status')}        Show Nexus connection status`)
           console.log(`${chalk.bold('/sessions')}      List recent sessions`)
+          console.log(`${chalk.bold('/history')}       Show or search command history (e.g. /history [keyword])`)
+          console.log(`${chalk.bold('/history !<idx>')} Re-run history command at index`)
           console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
           console.log()
           continue
@@ -273,10 +332,92 @@ program
           continue
         }
 
+        if (trimmed.startsWith('/history !')) {
+          const indexStr = trimmed.slice('/history !'.length).trim()
+          const targetIdx = parseInt(indexStr, 10)
+
+          try {
+            if (fs.existsSync(historyFile)) {
+              const allLines = fs.readFileSync(historyFile, 'utf8')
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 0)
+
+              if (targetIdx > 0 && targetIdx <= allLines.length) {
+                const cmdToRun = allLines[targetIdx - 1]!
+                console.log(chalk.green(`Re-running command #${targetIdx}: ${cmdToRun}`))
+                fs.appendFileSync(historyFile, cmdToRun + '\n', 'utf8')
+
+                const abortController = new AbortController()
+                activeAbortController = abortController
+                try {
+                  await runSessionFlow(cmdToRun, options.cwd, options.url, rl, abortController, sessionId)
+                } catch (e: any) {
+                  if (e.message !== 'Aborted' && e.name !== 'AbortError') {
+                    console.error(chalk.red(`Error: ${e.message || e}`))
+                  }
+                } finally {
+                  activeAbortController = null
+                }
+              } else {
+                console.log(chalk.red(`Invalid history index. Range: 1 - ${allLines.length}`))
+              }
+            } else {
+              console.log(chalk.dim('No command history found.'))
+            }
+          } catch (e: any) {
+            console.error(chalk.red(`Failed to execute history command: ${e.message || e}`))
+          }
+          continue
+        }
+
+        if (trimmed.startsWith('/history')) {
+          const parts = trimmed.split(/\s+/)
+          const keyword = parts.slice(1).join(' ').trim()
+
+          try {
+            if (fs.existsSync(historyFile)) {
+              const allLines = fs.readFileSync(historyFile, 'utf8')
+                .split('\n')
+                .map(l => l.trim())
+                .filter(l => l.length > 0)
+
+              if (keyword) {
+                const matches = allLines
+                  .map((cmd, idx) => ({ cmd, originalIdx: idx + 1 }))
+                  .filter(item => item.cmd.toLowerCase().includes(keyword.toLowerCase()))
+
+                console.log(chalk.cyan(`\n--- History search results for "${keyword}" ---`))
+                if (matches.length === 0) {
+                  console.log(chalk.dim('No matches found.'))
+                } else {
+                  const lastMatches = matches.slice(-20)
+                  for (const match of lastMatches) {
+                    console.log(`${chalk.dim(match.originalIdx + ':')} ${match.cmd}`)
+                  }
+                }
+              } else {
+                console.log(chalk.cyan(`\n--- Recent Command History ---`))
+                const lastCommands = allLines.slice(-20)
+                const startIdx = Math.max(1, allLines.length - 20 + 1)
+                lastCommands.forEach((cmd, idx) => {
+                  console.log(`${chalk.dim((startIdx + idx) + ':')} ${cmd}`)
+                })
+              }
+              console.log()
+            } else {
+              console.log(chalk.dim('No command history found.'))
+            }
+          } catch (e: any) {
+            console.error(chalk.red(`Failed to read history: ${e.message || e}`))
+          }
+          continue
+        }
+
         const abortController = new AbortController()
         activeAbortController = abortController
         try {
-          await runSessionFlow(trimmed, options.cwd, options.url, rl, abortController)
+          await runSessionFlow(trimmed, options.cwd, options.url, rl, abortController, sessionId)
         } catch (e: any) {
           if (e.message !== 'Aborted' && e.name !== 'AbortError') {
             console.error(chalk.red(`Error: ${e.message || e}`))
@@ -664,16 +805,17 @@ async function runSessionFlow(
   cwd: string,
   url: string | undefined,
   rl: readline.Interface,
-  abortController: AbortController
-): Promise<void> {
-  const sessionId = createId('session')
+  abortController: AbortController,
+  sessionIdArg?: string
+): Promise<string> {
+  const sessionId = sessionIdArg ?? createId('session')
 
   if (url) {
     const wsUrl = url.replace(/^http/, 'ws') + '/v1/stream'
     const wsModule = await (new Function("return import('ws')")())
     const WebSocketCtor = (globalThis as any).WebSocket || wsModule.default
 
-    return new Promise<void>((resolve, reject) => {
+    return new Promise<string>((resolve, reject) => {
       let socket: any
       
       const onAbort = () => {
@@ -741,7 +883,7 @@ async function runSessionFlow(
             if (data.type === 'result' || data.type === 'error') {
               abortController.signal.removeEventListener('abort', onAbort)
               socket.close()
-              resolve()
+              resolve(sessionId)
             }
           }
         } catch (err) {
@@ -752,7 +894,7 @@ async function runSessionFlow(
 
       socket.addEventListener('close', () => {
         abortController.signal.removeEventListener('abort', onAbort)
-        resolve()
+        resolve(sessionId)
       })
 
       socket.addEventListener('error', (err: any) => {
@@ -792,16 +934,31 @@ async function runSessionFlow(
       }
     }
 
-    const session = {
-      sessionId,
-      cwd,
-      prompt,
-      phase: 'executing' as const,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      events: [],
+    let session = await storage.getSession(sessionId, { includeEvents: false })
+    if (!session) {
+      session = {
+        sessionId,
+        cwd,
+        prompt,
+        phase: 'executing' as const,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        events: [],
+      }
+    } else {
+      session.phase = 'executing'
+      session.updatedAt = new Date().toISOString()
+      session.lastUserInput = prompt
     }
     await storage.saveSession(session)
+
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date().toISOString(),
+      text: prompt,
+    })
 
     try {
       const configManager = ConfigManager.getInstance()
@@ -846,6 +1003,7 @@ async function runSessionFlow(
       }
       await storage.close?.()
     }
+    return sessionId
   }
 }
 

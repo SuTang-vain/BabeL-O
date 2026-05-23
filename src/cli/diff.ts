@@ -1,4 +1,5 @@
 import chalk from 'chalk'
+import { computeLcs } from './diffLcs.js'
 
 export function renderDiff(toolName: string, input: any): string {
   if (!input || typeof input !== 'object') return ''
@@ -12,11 +13,15 @@ export function renderDiff(toolName: string, input: any): string {
     out += chalk.dim(`--- ${path} (before)\n`)
     out += chalk.dim(`+++ ${path} (after)\n`)
 
-    for (const line of oldLines) {
-      out += chalk.red(`- ${line}\n`)
-    }
-    for (const line of newLines) {
-      out += chalk.green(`+ ${line}\n`)
+    const diff = computeLcs(oldLines, newLines)
+    for (const item of diff) {
+      if (item.type === 'common') {
+        out += chalk.dim(`  ${item.text}\n`)
+      } else if (item.type === 'removed') {
+        out += chalk.red(`- ${item.text}\n`)
+      } else if (item.type === 'added') {
+        out += chalk.green(`+ ${item.text}\n`)
+      }
     }
     return out
   }

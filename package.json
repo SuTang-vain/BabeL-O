@@ -12,7 +12,7 @@
     "cli": "tsx src/cli/program.ts",
     "benchmark": "tsx scripts/benchmark-performance-core.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test --test-concurrency=1 test/adapters.test.ts test/agent-loop.test.ts test/optimizer-safety.test.ts test/permission-flow.test.ts test/providers.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/security.test.ts test/tool-trace.test.ts"
+    "test": "tsx --test --test-concurrency=1 test/adapters.test.ts test/agent-loop.test.ts test/diff.test.ts test/optimizer-safety.test.ts test/permission-flow.test.ts test/providers.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/security.test.ts test/tool-trace.test.ts"
   },
   "dependencies": {
     "@fastify/websocket": "^11.2.0",

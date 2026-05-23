@@ -3,6 +3,7 @@ import assert from 'node:assert'
 import { AnthropicAdapter } from '../src/providers/adapters/AnthropicAdapter.js'
 import { OpenAIAdapter } from '../src/providers/adapters/OpenAIAdapter.js'
 import { getAdapter } from '../src/providers/registry.js'
+import { ProviderError } from '../src/shared/errors.js'
 
 function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -177,6 +178,59 @@ describe('Model Adapters & Factory', () => {
         { type: 'tool_use_end', id: 'tool_123', input: { path: 'README.md' } },
       ])
     })
+
+    test('throws ProviderError on non-200 response', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseOk = false
+      mockResponseStatus = 400
+
+      await assert.rejects(
+        async () => {
+          for await (const chunk of adapter.queryStream({
+            model: 'anthropic/claude-3-5-sonnet',
+            messages: [{ role: 'user', content: 'test' }],
+          })) {}
+        },
+        (err: any) => {
+          assert.strictEqual(err.name, 'ProviderError')
+          assert.strictEqual(err.providerId, 'anthropic')
+          assert.strictEqual(err.httpStatus, 400)
+          return true
+        }
+      )
+    })
+
+    test('yields usage stats on message_start and message_delta events', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: message_start\n',
+        'data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":1,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}}}\n\n',
+        'event: message_delta\n',
+        'data: {"type":"message_delta","usage":{"output_tokens":15}}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'anthropic/claude-3-5-sonnet',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        {
+          type: 'usage',
+          inputTokens: 100,
+          outputTokens: 1,
+          cacheCreationInputTokens: 10,
+          cacheReadInputTokens: 20,
+        },
+        {
+          type: 'usage',
+          inputTokens: 0,
+          outputTokens: 15,
+        },
+      ])
+    })
   })
 
   describe('OpenAIAdapter', () => {
@@ -241,6 +295,51 @@ describe('Model Adapters & Factory', () => {
         { type: 'tool_use_delta', id: 'call_1', inputDelta: '{"pa' },
         { type: 'tool_use_delta', id: 'call_1', inputDelta: 'th":"a"}' },
         { type: 'tool_use_end', id: 'call_1', input: { path: 'a' } },
+      ])
+    })
+
+    test('throws ProviderError on non-200 response', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseOk = false
+      mockResponseStatus = 401
+
+      await assert.rejects(
+        async () => {
+          for await (const chunk of adapter.queryStream({
+            model: 'openai/gpt-4o',
+            messages: [{ role: 'user', content: 'test' }],
+          })) {}
+        },
+        (err: any) => {
+          assert.strictEqual(err.name, 'ProviderError')
+          assert.strictEqual(err.providerId, 'openai')
+          assert.strictEqual(err.httpStatus, 401)
+          return true
+        }
+      )
+    })
+
+    test('yields usage stats when stream_options are set', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([
+        'data: {"choices":[]}\n\n',
+        'data: {"usage":{"prompt_tokens":150,"completion_tokens":40}}\n\n',
+        'data: [DONE]\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'openai/gpt-4o',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        {
+          type: 'usage',
+          inputTokens: 150,
+          outputTokens: 40,
+        },
       ])
     })
   })

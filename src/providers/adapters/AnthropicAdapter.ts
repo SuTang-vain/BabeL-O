@@ -6,6 +6,7 @@ import type {
   ContentBlock,
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
+import { ProviderError } from '../../shared/errors.js'
 
 const MODEL_MAPPING: Record<
   string,
@@ -214,9 +215,7 @@ export class AnthropicAdapter implements ModelAdapter {
 
     if (!response.ok) {
       const errorText = await response.text()
-      throw new Error(
-        `Anthropic API request failed with status ${response.status}: ${errorText}`
-      )
+      throw new ProviderError('anthropic', response.status, errorText)
     }
 
     if (!response.body) {
@@ -229,7 +228,29 @@ export class AnthropicAdapter implements ModelAdapter {
     >()
 
     for await (const sse of parseSSE(response.body)) {
-      if (sse.event === 'content_block_start') {
+      if (sse.event === 'message_start') {
+        const data = JSON.parse(sse.data)
+        const usage = data.message?.usage
+        if (usage) {
+          yield {
+            type: 'usage',
+            inputTokens: usage.input_tokens || 0,
+            outputTokens: usage.output_tokens || 0,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens || 0,
+            cacheReadInputTokens: usage.cache_read_input_tokens || 0,
+          }
+        }
+      } else if (sse.event === 'message_delta') {
+        const data = JSON.parse(sse.data)
+        const usage = data.usage
+        if (usage) {
+          yield {
+            type: 'usage',
+            inputTokens: 0,
+            outputTokens: usage.output_tokens || 0,
+          }
+        }
+      } else if (sse.event === 'content_block_start') {
         const data = JSON.parse(sse.data)
         const index = data.index
         const block = data.content_block

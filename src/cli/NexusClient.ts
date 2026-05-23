@@ -1,4 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
+import type { NexusTask } from '../shared/task.js'
 
 export type NexusClientOptions = {
   baseUrl?: string
@@ -43,6 +44,13 @@ export class NexusClient {
 
   async listSessions(): Promise<unknown> {
     return this.getJson('/v1/sessions')
+  }
+
+  async listTasks(sessionId: string): Promise<{ type: 'tasks_list'; tasks: NexusTask[] }> {
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/tasks`) as Promise<{
+      type: 'tasks_list'
+      tasks: NexusTask[]
+    }>
   }
 
   async getSession(
