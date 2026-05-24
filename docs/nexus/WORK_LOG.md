@@ -2,6 +2,22 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.78 2026-05-24 Context Compact UX
+
+- **用户请求**: 推进 TODO 中的 P1 Context Compact UX，把 context budget、snip compactor、session summary 和恢复边界变成用户可感知、可控制、可调试的长会话能力。
+- **实现结果**:
+  - `NexusEventSchema` 新增 `compact_boundary` 与 `context_warning` 事件。`compact_boundary` 记录 `beforeEventCount`、`afterEventCount`、`summaryChars`、`snippedToolResults`、`trigger`、`modelId`、`budget`；`context_warning` 记录估算 token、模型窗口、阈值和提示文案。
+  - 新增 `src/runtime/compact.ts`，实现逻辑压缩：不删除 SQLite 历史，只追加 compact boundary event；后续上下文装配通过最新 boundary summary + boundary 后 recent events 运行，避免历史审计数据被破坏。
+  - `contextAssembler` 支持读取最新 compact boundary：旧事件不再作为 live messages 回放，也不会和旧 summary 双重计入；boundary 后的新 omitted events 会继续进入 session summary。
+  - `LLMCodingRuntime` 在 provider 调用前估算当前上下文用量，超过 85% budget 时产出 `context_warning`，CLI 会提示用户考虑 `/compact`。
+  - `bbl chat` 新增 `/compact` 命令；embedded 模式直接压缩本地 SQLite session，service 模式调用新增的 `POST /v1/sessions/:sessionId/compact` API。
+  - Slash palette / completion / help 已加入 `/compact`；CLI renderer 能展示 compact boundary 和 context warning。
+- **仍保留为后续项**:
+  - auto-compact threshold 默认启用策略、compact failure 熔断、auto-compact benchmark 尚未实现；当前交付为手动 compact + warning first。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/completer.test.ts test/tui-renderer.test.ts` 成功通过，33/33 通过。
+
 ## 0.77 2026-05-24 Nexus Hooks 最小内核
 
 - **用户请求**: 根据 TODO 中的 Hooks 生命周期系统开始推进，实现能解决工具调用失败自动修复、权限前置审计、子 Agent 上下文注入和长任务结束清理的最小 hooks 内核。

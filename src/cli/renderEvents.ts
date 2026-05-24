@@ -315,6 +315,23 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'error':
       console.log(chalk.red(`${event.code}: ${event.message}`))
       break
+    case 'compact_boundary':
+      console.log(
+        chalk.cyan(
+          `context compacted: ${event.beforeEventCount} -> ${event.afterEventCount} events (${event.summaryChars} chars summary)`,
+        ),
+      )
+      if (event.summary) {
+        console.log(chalk.dim(event.summary))
+      }
+      break
+    case 'context_warning':
+      console.log(
+        chalk.yellow(
+          `context warning: ${event.percentUsed}% of window used (${event.tokenEstimate}/${event.maxTokens} tokens). consider /compact.`,
+        ),
+      )
+      break
     case 'result':
       console.log(event.success ? chalk.green('✓ done') : chalk.red('✗ failed'))
       console.log('')
@@ -454,6 +471,21 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
 
       case 'error':
         outputText += chalk.red(`${ev.code}: ${ev.message}\n`)
+        break
+
+      case 'compact_boundary':
+        outputText += chalk.cyan(
+          `context compacted: ${ev.beforeEventCount} -> ${ev.afterEventCount} events (${ev.summaryChars} chars summary)\n`,
+        )
+        if (ev.summary) {
+          outputText += chalk.dim(`${ev.summary}\n`)
+        }
+        break
+
+      case 'context_warning':
+        outputText += chalk.yellow(
+          `context warning: ${ev.percentUsed}% of window used (${ev.tokenEstimate}/${ev.maxTokens} tokens). consider /compact.\n`,
+        )
         break
 
       case 'tool_denied': {

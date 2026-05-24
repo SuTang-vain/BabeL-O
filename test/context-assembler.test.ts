@@ -376,6 +376,83 @@ test('assembleContext omits session summary when all events fit recent context',
   assert.doesNotMatch(context.systemPrompt, /Session Summary/)
 })
 
+test('assembleContext respects compact boundaries without double counting old history', async () => {
+  const cwd = join(tmpdir(), `babel-o-compact-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'old goal',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:01.000Z',
+      toolUseId: 'tool-old',
+      name: 'Read',
+      input: { path: 'legacy.txt' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:02.000Z',
+      toolUseId: 'tool-old',
+      name: 'Read',
+      success: true,
+      output: 'legacy output',
+    },
+    {
+      type: 'compact_boundary',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:03.000Z',
+      trigger: 'manual',
+      summary: 'Compressed old goal and legacy output.',
+      beforeEventCount: 3,
+      afterEventCount: 1,
+      summaryChars: 38,
+      snippedToolResults: 1,
+      modelId: 'local/coding-runtime',
+      budget: allocateBudget('local/coding-runtime'),
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:04.000Z',
+      text: 'latest question',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:05.000Z',
+      text: 'answering latest question',
+    },
+  ]
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: 'latest question',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.match(context.sessionSummary, /Compressed old goal/)
+  assert.doesNotMatch(context.sessionSummary, /legacy output.*legacy output/)
+  assert.match(JSON.stringify(context.messages), /latest question/)
+  assert.doesNotMatch(JSON.stringify(context.messages), /old goal/)
+})
+
 test('assembleContext reduces long-session context by more than 50 percent while preserving recent turns', async () => {
   const cwd = join(tmpdir(), `babel-o-context-benchmark-${Date.now()}`)
   const events = createLongSessionEvents()

@@ -14,6 +14,7 @@ import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { closeNexusSession } from './sessionLifecycle.js'
+import { compactSession } from '../runtime/compact.js'
 
 
 declare module 'fastify' {
@@ -414,6 +415,37 @@ export async function createNexusApp(
       nextCursor: page.nextCursor,
       order: query.order,
       limit: query.limit,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/compact', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const body = z.object({
+      modelId: z.string().optional(),
+      trigger: z.enum(['manual', 'auto', 'reactive']).default('manual').optional(),
+    }).parse(request.body ?? {})
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const result = await compactSession({
+      storage: options.storage,
+      sessionId: params.sessionId,
+      modelId: body.modelId,
+      trigger: body.trigger ?? 'manual',
+    })
+    return {
+      type: 'compact_result',
+      sessionId: params.sessionId,
+      event: result.event,
+      beforeEventCount: result.beforeEventCount,
+      afterEventCount: result.afterEventCount,
     }
   })
 

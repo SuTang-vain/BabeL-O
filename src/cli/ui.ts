@@ -57,6 +57,7 @@ export function mapDropdownSelection(selected: string): string {
     '/history': '/history ',
     '/help': '/help',
     '/clear': '/clear',
+    '/compact': '/compact',
     '/exit': '/exit',
     '/status': '/status',
     '/sessions': '/sessions',
@@ -311,6 +312,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
   const details: Record<string, { tag: string; description: string }> = {
     '/help': { tag: 'command', description: 'Show command help' },
     '/clear': { tag: 'command', description: 'Clear the terminal' },
+    '/compact': { tag: 'session', description: 'Compact current session context' },
     '/exit': { tag: 'command', description: 'Exit chat' },
     '/model': { tag: 'config', description: 'Open model configuration wizard' },
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },

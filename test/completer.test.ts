@@ -29,6 +29,7 @@ test('mapDropdownSelection correctly translates tool shortcuts', () => {
 test('mapDropdownSelection preserves control commands', () => {
   assert.strictEqual(mapDropdownSelection('/help'), '/help')
   assert.strictEqual(mapDropdownSelection('/clear'), '/clear')
+  assert.strictEqual(mapDropdownSelection('/compact'), '/compact')
   assert.strictEqual(mapDropdownSelection('/exit'), '/exit')
   assert.strictEqual(mapDropdownSelection('/status'), '/status')
   assert.strictEqual(mapDropdownSelection('/sessions'), '/sessions')
@@ -41,11 +42,16 @@ test('mapDropdownSelection preserves unknown inputs', () => {
 
 test('tool and slash completion choices expose productized metadata', () => {
   assert.ok(getSlashCompletionChoices().includes('/tool'))
+  assert.ok(getSlashCompletionChoices().includes('/compact'))
   assert.ok(getToolCompletionChoices().includes('/tool bash'))
 
   const bash = describeCompletionChoice('/tool bash')
   assert.strictEqual(bash.tag, 'execute')
   assert.match(bash.description, /shell command/)
+
+  const compact = describeCompletionChoice('/compact')
+  assert.strictEqual(compact.tag, 'session')
+  assert.match(compact.description, /Compact current session context/)
 
   const formatted = formatCompletionChoice('/tool read', true)
   assert.ok(formatted.includes('/tool read'))

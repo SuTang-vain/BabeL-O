@@ -79,6 +79,13 @@ export class NexusClient {
     )
   }
 
+  async compactSession(
+    sessionId: string,
+    body: { modelId?: string; trigger?: 'manual' | 'auto' | 'reactive' } = {},
+  ): Promise<unknown> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/compact`, body)
+  }
+
   async resumeSession(sessionId: string, message: string): Promise<unknown> {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/input`, {
       message,

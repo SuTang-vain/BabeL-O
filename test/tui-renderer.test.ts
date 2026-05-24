@@ -125,6 +125,43 @@ test('formatSessionHistory: handles tool denials and errors', () => {
   assert.ok(outputExpanded.includes('UNEXPECTED_ERROR: Something went wrong'))
 })
 
+test('formatSessionHistory: renders compact boundaries and context warnings', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'compact_boundary',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-compact',
+      timestamp: new Date().toISOString(),
+      trigger: 'manual',
+      summary: 'Old project analysis summarized.',
+      beforeEventCount: 120,
+      afterEventCount: 18,
+      summaryChars: 32,
+      snippedToolResults: 3,
+      modelId: 'local/coding-runtime',
+      budget: { maxTokens: 8192 },
+    },
+    {
+      type: 'context_warning',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-compact',
+      timestamp: new Date().toISOString(),
+      modelId: 'local/coding-runtime',
+      tokenEstimate: 7000,
+      maxTokens: 8192,
+      percentUsed: 85,
+      thresholdPercent: 85,
+      message: 'Context is approaching the model window.',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('context compacted: 120 -> 18 events'))
+  assert.ok(output.includes('Old project analysis summarized.'))
+  assert.ok(output.includes('context warning: 85%'))
+  assert.ok(output.includes('/compact'))
+})
+
 test('startSession can initialize execution state without replaying readline input', () => {
   startSession()
   assert.equal(formatSessionHistory([], 'compact'), '')

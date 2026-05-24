@@ -15,7 +15,7 @@ type CliReadline = readline.Interface
 
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/exit', '/model', '/profile', '/status', '/sessions', '/history', '/tool',
+    '/help', '/clear', '/compact', '/exit', '/model', '/profile', '/status', '/sessions', '/history', '/tool',
     '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task',
   ]
 }

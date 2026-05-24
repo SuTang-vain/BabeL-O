@@ -276,6 +276,7 @@ export function registerChatCommand(program: Command): void {
             console.log(chalk.cyan('\n--- BabeL-O CLI Commands ---'))
             console.log(`${chalk.bold('/help')}          Show this help message`)
             console.log(`${chalk.bold('/clear')}         Clear terminal screen`)
+            console.log(`${chalk.bold('/compact')}       Compact the current session context`)
             console.log(`${chalk.bold('/exit')}          Exit the interactive shell`)
             console.log(`${chalk.bold('/model')}         Show default model or switch it (e.g. /model anthropic/claude-3-5-sonnet)`)
             console.log(`${chalk.bold('/profile')}       List profiles, switch active profile, or create profile (e.g. /profile dev)`)
@@ -286,6 +287,46 @@ export function registerChatCommand(program: Command): void {
             console.log(`${chalk.bold('/tool')}          Browse built-in tools and insert a tool prompt prefix`)
             console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
             console.log()
+            continue
+          }
+
+          if (trimmed === '/compact') {
+            try {
+              if (options.url) {
+                const client = new NexusClient({ baseUrl: options.url })
+                const modelId = ConfigManager.getInstance().resolveSettings().modelId
+                const result = await client.compactSession(sessionId, {
+                  modelId,
+                  trigger: 'manual',
+                })
+                console.log(chalk.green(`✓ Compacted session ${sessionId}`))
+                console.log(JSON.stringify(result, null, 2))
+              } else {
+                const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+                if (!fs.existsSync(storagePath)) {
+                  console.log(chalk.yellow('No local storage found to compact.'))
+                } else {
+                  const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
+                  const { compactSession } = await import('../../runtime/compact.js')
+                  const storage = new SqliteStorage(storagePath)
+                  try {
+                    const modelId = ConfigManager.getInstance().resolveSettings().modelId
+                    const result = await compactSession({
+                      storage,
+                      sessionId,
+                      modelId,
+                      trigger: 'manual',
+                    })
+                    console.log(chalk.green(`✓ Compacted session ${sessionId}`))
+                    console.log(JSON.stringify(result, null, 2))
+                  } finally {
+                    await storage.close?.()
+                  }
+                }
+              }
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to compact session: ${e.message || e}`))
+            }
             continue
           }
 

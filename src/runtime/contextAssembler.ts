@@ -76,9 +76,20 @@ export function allocateBudget(modelId: string): ContextBudget {
 export async function assembleContext(options: ContextAssemblerOptions): Promise<AssembledContext> {
   const budget = allocateBudget(options.modelId)
   const projectMemory = await loadProjectMemory(options.runtimeOptions.cwd)
-  const selectedEvents = selectRecentEvents(options.events, budget)
-  const omittedEvents = selectOmittedEvents(options.events, selectedEvents)
-  const sessionSummary = summarizeSessionEvents(omittedEvents, budget.layerBudgets.summary * 4)
+  const compactBoundary = findLatestCompactBoundary(options.events)
+  const compactAwareEvents = compactBoundary
+    ? options.events.slice(compactBoundary.index + 1)
+    : options.events
+  const selectedEvents = selectRecentEvents(compactAwareEvents, budget)
+  const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
+  const compactSummary = compactBoundary?.event.summary.trim() ?? ''
+  const sessionSummary = [
+    compactSummary,
+    summarizeSessionEvents(omittedEvents, budget.layerBudgets.summary * 4),
+  ]
+    .filter(part => part.trim().length > 0)
+    .join('\n')
+    .trim()
   const snippedEvents = snipEvents(selectedEvents, budget.snipToolOutputChars)
   const messages = options.mapEventsToMessages(
     snippedEvents,
@@ -104,6 +115,19 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     sessionSummary,
     activeSkills,
   }
+}
+
+function findLatestCompactBoundary(events: NexusEvent[]): {
+  event: Extract<NexusEvent, { type: 'compact_boundary' }>
+  index: number
+} | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'compact_boundary') {
+      return { event, index }
+    }
+  }
+  return undefined
 }
 
 export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {

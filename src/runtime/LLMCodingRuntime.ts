@@ -115,6 +115,22 @@ export class LLMCodingRuntime implements NexusRuntime {
         mapEventsToMessages,
       })
       const messages = assembledContext.messages
+      const contextEstimateTokens = Math.ceil(
+        (assembledContext.systemPrompt.length + estimateMessagesChars(messages)) / 4,
+      )
+      const contextWarningThreshold = 0.85
+      if (contextEstimateTokens > Math.floor(assembledContext.budget.maxTokens * contextWarningThreshold)) {
+        yield {
+          type: 'context_warning',
+          ...eventBase(options.sessionId),
+          modelId: cleanedModelId,
+          tokenEstimate: contextEstimateTokens,
+          maxTokens: assembledContext.budget.maxTokens,
+          percentUsed: Math.round((contextEstimateTokens / assembledContext.budget.maxTokens) * 100),
+          thresholdPercent: Math.round(contextWarningThreshold * 100),
+          message: `Context is approaching the model window. Consider running /compact soon.`,
+        }
+      }
 
       // Parse thinking budget config from environments or options.budget
       const thinkingBudgetEnv =
@@ -707,6 +723,10 @@ export class LLMCodingRuntime implements NexusRuntime {
       }
     }
   }
+}
+
+function estimateMessagesChars(messages: ModelMessage[]): number {
+  return JSON.stringify(messages).length
 }
 
 async function executeToolSafely(

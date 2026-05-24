@@ -151,6 +151,30 @@ export const HookFailedEventSchema = z.object({
   message: z.string(),
 })
 
+export const CompactBoundaryEventSchema = z.object({
+  type: z.literal('compact_boundary'),
+  ...baseEventFields,
+  trigger: z.enum(['manual', 'auto', 'reactive']),
+  summary: z.string(),
+  beforeEventCount: z.number(),
+  afterEventCount: z.number(),
+  summaryChars: z.number(),
+  snippedToolResults: z.number(),
+  modelId: z.string().optional(),
+  budget: z.unknown().optional(),
+})
+
+export const ContextWarningEventSchema = z.object({
+  type: z.literal('context_warning'),
+  ...baseEventFields,
+  modelId: z.string().optional(),
+  tokenEstimate: z.number(),
+  maxTokens: z.number(),
+  percentUsed: z.number(),
+  thresholdPercent: z.number(),
+  message: z.string(),
+})
+
 export const ExecutionMetricsEventSchema = z.object({
   type: z.literal('execution_metrics'),
   ...baseEventFields,
@@ -183,6 +207,8 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   HookStartedEventSchema,
   HookCompletedEventSchema,
   HookFailedEventSchema,
+  CompactBoundaryEventSchema,
+  ContextWarningEventSchema,
   ExecutionMetricsEventSchema,
 ])
 
