@@ -483,6 +483,88 @@ test('assembleContext prioritizes the latest user question in long noisy session
   assert.match(context.systemPrompt, /你还记得我们之前在讨论什么吗/)
 })
 
+test('assembleContext starts fresh after a cancelled or timed out long task', async () => {
+  const cwd = join(tmpdir(), `babel-o-recovery-boundary-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: '/Users/tangyaoyue/DEV/BABEL/BabeL-O深入分析这个项目',
+    },
+  ]
+
+  for (let index = 0; index < 20; index += 1) {
+    events.push(
+      {
+        type: 'thinking_delta',
+        schemaVersion,
+        sessionId: 'session-context',
+        timestamp: `2026-05-23T00:00:${String(index).padStart(2, '0')}.000Z`,
+        text: `Let me continue reading runtimeAgentStep.ts old-task-${index}.`,
+      },
+      {
+        type: 'tool_started',
+        schemaVersion,
+        sessionId: 'session-context',
+        timestamp: `2026-05-23T00:01:${String(index).padStart(2, '0')}.000Z`,
+        toolUseId: `old-tool-${index}`,
+        name: 'Read',
+        input: { path: '/Users/tangyaoyue/DEV/BABEL/BabeL-O/src/nexus/runtimeAgentStep.ts' },
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion,
+        sessionId: 'session-context',
+        timestamp: `2026-05-23T00:02:${String(index).padStart(2, '0')}.000Z`,
+        toolUseId: `old-tool-${index}`,
+        name: 'Read',
+        success: true,
+        output: `old runtimeAgentStep content ${index}`,
+      },
+    )
+  }
+
+  events.push(
+    {
+      type: 'error',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:03:00.000Z',
+      code: 'REQUEST_CANCELLED',
+      message: 'Execution cancelled by user.',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:04:00.000Z',
+      text: '？你回答我你现在在干什么？？？',
+    },
+  )
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: '？你回答我你现在在干什么？？？',
+      cwd,
+    },
+    events,
+    modelId: 'minimax/MiniMax-M2.7',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  const messagesText = JSON.stringify(context.messages)
+  assert.equal(context.messages.at(-1)?.role, 'user')
+  assert.equal(context.messages.at(-1)?.content, '？你回答我你现在在干什么？？？')
+  assert.doesNotMatch(messagesText, /runtimeAgentStep/)
+  assert.doesNotMatch(messagesText, /old-task/)
+  assert.match(context.systemPrompt, /Session Summary/)
+  assert.match(context.systemPrompt, /REQUEST_CANCELLED|cancelled/i)
+})
+
 test('buildSystemPrompt anchors explicit absolute paths from the current request', async () => {
   const cwd = join(tmpdir(), `babel-o-path-anchor-${Date.now()}`)
   const explicitTarget = join(cwd, 'BabeL-X')

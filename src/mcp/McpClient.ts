@@ -36,6 +36,7 @@ export class McpClient {
   private nextId = 1
   private buffer = Buffer.alloc(0)
   private readonly pending = new Map<number, PendingRequest>()
+  private shutdownPromise?: Promise<void>
 
   constructor(private readonly options: McpClientOptions) {}
 
@@ -89,14 +90,26 @@ export class McpClient {
   }
 
   async shutdown(): Promise<void> {
-    if (!this.child) return
+    if (this.shutdownPromise) return this.shutdownPromise
+    this.shutdownPromise = this.shutdownOnce()
+    return this.shutdownPromise
+  }
+
+  private async shutdownOnce(): Promise<void> {
+    const child = this.child
+    if (!child) return
     try {
-      await this.request('shutdown', {})
+      await Promise.race([
+        this.request('shutdown', {}),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('MCP shutdown timed out')), 1_000)),
+      ])
     } catch {
       // Some MCP servers exit without replying to shutdown.
+    } finally {
+      this.rejectAll(new Error('MCP client is shutting down'))
+      if (!child.killed) child.kill()
+      this.child = undefined
     }
-    this.child.kill()
-    this.child = undefined
   }
 
   private request(method: string, params: unknown): Promise<unknown> {

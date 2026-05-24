@@ -196,12 +196,14 @@ export async function runSessionFlow(
       const budget = process.env.BABEL_O_THINKING_BUDGET
         ? parseInt(process.env.BABEL_O_THINKING_BUDGET, 10)
         : undefined
+      const timeoutController = new AbortController()
 
       for await (const event of runtime.executeStream({
         sessionId,
         prompt,
         cwd,
         signal: abortController.signal,
+        timeoutSignal: timeoutController.signal,
         requestId,
         model: settings.modelId,
         budget,

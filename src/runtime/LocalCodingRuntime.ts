@@ -14,6 +14,12 @@ import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { classifyAction } from './classifier.js'
 import type { NexusStorage } from '../storage/Storage.js'
+import {
+  executeRuntimeHooks,
+  firstHookDenyReason,
+  firstHookPermissionDecision,
+  lastHookUpdatedInput,
+} from './hooks.js'
 
 
 type ParsedIntent =
@@ -174,9 +180,47 @@ export class LocalCodingRuntime implements NexusRuntime {
         input: parsed.data,
       }
 
+      const preToolHooks = await executeRuntimeHooks(
+        'PreToolUse',
+        {
+          toolUseId,
+          toolName: tool.name,
+          toolRisk: tool.risk,
+          toolInput: parsed.data,
+        },
+        {
+          sessionId: options.sessionId,
+          cwd: options.cwd,
+          role: options.role,
+          signal: options.signal,
+        },
+      )
+      for (const hookEvent of preToolHooks.events) yield hookEvent
+      const hookDenyReason = firstHookDenyReason(preToolHooks)
+      if (hookDenyReason) {
+        yield {
+          type: 'tool_denied',
+          ...eventBase(options.sessionId),
+          name: tool.name,
+          risk: tool.risk,
+          message: hookDenyReason,
+        }
+        yield {
+          type: 'result',
+          ...eventBase(options.sessionId),
+          success: false,
+          message: hookDenyReason,
+        }
+        return
+      }
+      const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
+      const toolInput = hookUpdatedInput === undefined
+        ? parsed.data
+        : tool.inputSchema.parse(hookUpdatedInput)
+
       // Check if the tool requires authorization.
       if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
-        const { autoApprove, reason } = classifyAction(tool.name, parsed.data)
+        const { autoApprove, reason } = classifyAction(tool.name, toolInput)
         let approved = autoApprove
         let decisionReason = `Auto-approved: ${reason}`
 
@@ -188,7 +232,7 @@ export class LocalCodingRuntime implements NexusRuntime {
               toolUseId,
               toolName: tool.name,
               toolRisk: tool.risk,
-              toolInput: parsed.data,
+              toolInput,
               decision: 'approved',
               reason: decisionReason,
               timestamp: nowIso(),
@@ -200,12 +244,30 @@ export class LocalCodingRuntime implements NexusRuntime {
             ...eventBase(options.sessionId),
             toolUseId,
             name: tool.name,
-            input: parsed.data,
+            input: toolInput,
             risk: tool.risk,
             message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
           }
 
-          const decision = await PendingPermissionRegistry.getInstance().register(
+          const permissionHooks = await executeRuntimeHooks(
+            'PermissionRequest',
+            {
+              toolUseId,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput,
+            },
+            {
+              sessionId: options.sessionId,
+              cwd: options.cwd,
+              role: options.role,
+              signal: options.signal,
+            },
+          )
+          for (const hookEvent of permissionHooks.events) yield hookEvent
+
+          const hookDecision = firstHookPermissionDecision(permissionHooks)
+          const decision = hookDecision ?? await PendingPermissionRegistry.getInstance().register(
             options.sessionId,
             toolUseId
           )
@@ -216,14 +278,14 @@ export class LocalCodingRuntime implements NexusRuntime {
           if (this.storage) {
             await this.storage.savePermissionAudit({
               auditId: createId('audit'),
-              sessionId: options.sessionId,
-              toolUseId,
-              toolName: tool.name,
-              toolRisk: tool.risk,
-              toolInput: parsed.data,
-              decision: approved ? 'approved' : 'denied',
-              reason: decisionReason,
-              timestamp: nowIso(),
+                sessionId: options.sessionId,
+                toolUseId,
+                toolName: tool.name,
+                toolRisk: tool.risk,
+                toolInput,
+                decision: approved ? 'approved' : 'denied',
+                reason: decisionReason,
+                timestamp: nowIso(),
             })
           }
 
@@ -256,7 +318,7 @@ export class LocalCodingRuntime implements NexusRuntime {
       }
 
       const toolStartMs = performance.now()
-      const result = await executeToolSafely(tool, parsed.data, options)
+      const result = await executeToolSafely(tool, toolInput, options)
       recordToolRun(performance.now() - toolStartMs)
       if (result.kind === 'error') {
         yield {
@@ -280,6 +342,27 @@ export class LocalCodingRuntime implements NexusRuntime {
         originalBytes: result.originalBytes,
       }
 
+      const postToolHooks = await executeRuntimeHooks(
+        result.success ? 'PostToolUse' : 'PostToolUseFailure',
+        {
+          toolUseId,
+          toolName: tool.name,
+          toolRisk: tool.risk,
+          toolInput,
+          success: result.success,
+          output: result.output,
+          errorCode: result.success ? undefined : 'TOOL_RESULT_FAILED',
+          errorMessage: result.success ? undefined : `${tool.name} returned success=false.`,
+        },
+        {
+          sessionId: options.sessionId,
+          cwd: options.cwd,
+          role: options.role,
+          signal: options.signal,
+        },
+      )
+      for (const hookEvent of postToolHooks.events) yield hookEvent
+
       const summary = result.success
         ? `${tool.name} completed.`
         : `${tool.name} failed.`
@@ -295,12 +378,15 @@ export class LocalCodingRuntime implements NexusRuntime {
         message: summary,
       }
     } catch (err: any) {
-      const isTimeout = options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError'
+      const isTimeout = options.timeoutSignal?.aborted
+      const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
-        code: isTimeout ? 'REQUEST_TIMEOUT' : 'PROVIDER_ERROR',
-        message: err instanceof Error ? err.message : String(err),
+        code: isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : 'PROVIDER_ERROR',
+        message: isCancelled
+          ? 'Execution cancelled by user.'
+          : err instanceof Error ? err.message : String(err),
       }
     }
   }
@@ -342,10 +428,13 @@ async function executeToolSafely(
     }
   } catch (error) {
     if (options.signal?.aborted) {
+      const isTimeout = options.timeoutSignal?.aborted
       return {
         kind: 'error',
-        code: 'REQUEST_TIMEOUT',
-        message: `Execution timed out while running ${tool.name}.`,
+        code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
+        message: isTimeout
+          ? `Execution timed out while running ${tool.name}.`
+          : `Execution cancelled while running ${tool.name}.`,
       }
     }
     return {

@@ -1,4 +1,5 @@
 import { mkdir, realpath, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -37,6 +38,28 @@ test('execute reads a workspace file and records session events', async () => {
   } finally {
     await app.close()
   }
+})
+
+test('local runtime emits hook events around failed tool execution', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-hooks`)
+  await mkdir(cwd, { recursive: true })
+  const tools = createDefaultToolRegistry()
+  const runtime = new LocalCodingRuntime(tools)
+
+  const events: Array<{ type: string; [key: string]: unknown }> = []
+  for await (const event of runtime.executeStream({
+    sessionId: 'session-hooks',
+    prompt: 'bash cd /definitely/missing && pwd',
+    cwd,
+    skipPermissionCheck: true,
+  })) {
+    events.push(event as any)
+  }
+
+  assert.ok(events.some(event => event.type === 'tool_completed'))
+  assert.ok(events.some(event => event.type === 'hook_started'))
+  assert.ok(events.some(event => event.type === 'hook_completed'))
+  assert.ok(events.some(event => event.type === 'result'))
 })
 
 test('Read returns a recoverable tool result for directories', async () => {

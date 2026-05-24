@@ -619,6 +619,78 @@ describe('LLMCodingRuntime', () => {
     } catch {}
   })
 
+  test('returns invalid tool input to the model so it can retry with corrected arguments', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-invalid-tool-input-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'plan.md')
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-invalid","name":"Write","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"content\\":\\"draft plan\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-fixed","name":"Write","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+          targetFile.replace(/\\/g, '\\\\') +
+          '\\",\\"content\\":\\"draft plan\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"I fixed the Write call and saved the plan."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-invalid-tool-input-retry',
+        prompt: 'write a plan',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      if (fs.existsSync(targetFile)) fs.unlinkSync(targetFile)
+      fs.rmdirSync(cwd)
+    } catch {}
+
+    const invalidCompleted = events.find(e =>
+      e.type === 'tool_completed' && e.toolUseId === 'tool-call-invalid'
+    ) as any
+    assert.ok(invalidCompleted)
+    assert.equal(invalidCompleted.success, false)
+    assert.equal(invalidCompleted.output.code, 'INVALID_TOOL_INPUT')
+    assert.match(invalidCompleted.output.message, /path/)
+
+    const fixedCompleted = events.find(e =>
+      e.type === 'tool_completed' && e.toolUseId === 'tool-call-fixed'
+    ) as any
+    assert.ok(fixedCompleted)
+    assert.equal(fixedCompleted.success, true)
+    assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'INVALID_TOOL_INPUT'))
+    assert.equal(fetchCalls.length, 3)
+  })
+
   test('returns Bash non-zero exits to the model instead of aborting the turn', async () => {
     const cwd = join(tmpdir(), `babel-o-test-bash-nonzero-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
@@ -1043,6 +1115,24 @@ describe('Agent role structured output', () => {
     assert.equal(parsed.subTasks[0].requiresIsolation, true)
   })
 
+  test('ExecutorOutputSchema normalizes partial provider results with input taskId', () => {
+    const parsed = parseStructuredAgentOutput(
+      undefined,
+      JSON.stringify({
+        status: 'completed',
+        message: 'Cleaned up the helper function and verified the tiny project.',
+      }),
+      EXECUTOR_ROLE.outputSchema,
+      undefined,
+      { taskId: 'task-from-input' },
+    ) as any
+
+    assert.equal(parsed.taskId, 'task-from-input')
+    assert.equal(parsed.success, true)
+    assert.match(parsed.result, /Cleaned up/)
+    assert.equal(parsed.metadata.status, 'completed')
+  })
+
   test('PlannerOutputSchema falls back to numbered natural language plans', () => {
     const parsed = parseStructuredAgentOutput(
       undefined,
@@ -1058,5 +1148,17 @@ describe('Agent role structured output', () => {
     assert.equal(parsed.tasks.length, 2)
     assert.equal(parsed.tasks[0].title, 'Simplify add function')
     assert.match(parsed.tasks[0].description, /remove redundant/)
+  })
+
+  test('PlannerOutputSchema falls back from empty JSON objects', () => {
+    const parsed = parseStructuredAgentOutput(
+      undefined,
+      '{}',
+      PLANNER_ROLE.outputSchema,
+    ) as any
+
+    assert.match(parsed.summary, /empty plan/)
+    assert.equal(parsed.tasks.length, 1)
+    assert.equal(parsed.tasks[0].metadata.generatedFallback, 'empty-planner-output')
   })
 })

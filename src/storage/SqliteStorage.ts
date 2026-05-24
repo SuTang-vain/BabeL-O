@@ -763,9 +763,9 @@ function nullableString(value: unknown): string | undefined {
 }
 
 function eventIndexPayload(event: NexusEvent): string {
-  if ('toolUseId' in event) return event.toolUseId
-  if ('taskId' in event) return event.taskId
-  if ('code' in event) return event.code
+  if ('toolUseId' in event && event.toolUseId !== undefined) return String(event.toolUseId)
+  if ('taskId' in event && event.taskId !== undefined) return String(event.taskId)
+  if ('code' in event && event.code !== undefined) return String(event.code)
   return ''
 }
 

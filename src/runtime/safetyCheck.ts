@@ -1,7 +1,37 @@
+export type OptimizerSafetyPolicy = {
+  protectedFileNames: string[]
+  protectedPathSegments: string[]
+  protectedFilePrefixes: string[]
+  deniedCommandPatterns: RegExp[]
+}
+
+export const defaultOptimizerSafetyPolicy: OptimizerSafetyPolicy = {
+  protectedFileNames: [
+    'package.json',
+    'package-lock.json',
+    'npm-shrinkwrap.json',
+    'pnpm-lock.yaml',
+    'yarn.lock',
+    'bun.lockb',
+    'tsconfig.json',
+  ],
+  protectedPathSegments: ['bin'],
+  protectedFilePrefixes: ['.env'],
+  deniedCommandPatterns: [
+    /\brm\s+-[rf]*f[rf]*\b/,
+    /\bgit\s+push\b/,
+    /\bnpm\s+publish\b/,
+    /\bsudo\b/,
+    /\bgit\s+reset\s+--hard\b/,
+    /\bgit\s+clean\s+-[^\s]*f/,
+  ],
+}
+
 export function checkOptimizerSafety(
   toolName: string,
   input: unknown,
   role?: string,
+  policy: OptimizerSafetyPolicy = defaultOptimizerSafetyPolicy,
 ): { allowed: boolean; reason?: string } {
   if (role !== 'optimizer') {
     return { allowed: true }
@@ -15,13 +45,13 @@ export function checkOptimizerSafety(
         const normalized = filePath.replace(/\\/g, '/')
         const segments = normalized.split('/')
         const fileName = segments[segments.length - 1]
-        if (['package.json', 'package-lock.json', 'tsconfig.json'].includes(fileName)) {
+        if (policy.protectedFileNames.includes(fileName)) {
           return true
         }
-        if (segments.includes('bin')) {
+        if (segments.some(segment => policy.protectedPathSegments.includes(segment))) {
           return true
         }
-        if (fileName.startsWith('.env')) {
+        if (policy.protectedFilePrefixes.some(prefix => fileName.startsWith(prefix))) {
           return true
         }
         return false
@@ -40,11 +70,11 @@ export function checkOptimizerSafety(
   if (toolName === 'Bash') {
     const typedInput = input as { command?: string }
     if (typedInput && typeof typedInput.command === 'string') {
-      const commandRegex = /rm\s+-rf|git\s+push|npm\s+publish|sudo/
-      if (commandRegex.test(typedInput.command)) {
+      const command = typedInput.command
+      if (policy.deniedCommandPatterns.some(pattern => pattern.test(command))) {
         return {
           allowed: false,
-          reason: `Command execution denied: command "${typedInput.command}" is blocklisted under optimizer role.`,
+          reason: `Command execution denied: command "${command}" is blocklisted under optimizer role.`,
         }
       }
     }
@@ -52,5 +82,3 @@ export function checkOptimizerSafety(
 
   return { allowed: true }
 }
-
-

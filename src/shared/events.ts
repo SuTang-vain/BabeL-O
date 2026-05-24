@@ -122,6 +122,35 @@ export const PermissionResponseEventSchema = z.object({
   reason: z.string().optional(),
 })
 
+export const HookStartedEventSchema = z.object({
+  type: z.literal('hook_started'),
+  ...baseEventFields,
+  hookName: z.string(),
+  hookEvent: z.string(),
+  toolUseId: z.string().optional(),
+  toolName: z.string().optional(),
+})
+
+export const HookCompletedEventSchema = z.object({
+  type: z.literal('hook_completed'),
+  ...baseEventFields,
+  hookName: z.string(),
+  hookEvent: z.string(),
+  toolUseId: z.string().optional(),
+  toolName: z.string().optional(),
+  output: z.unknown().optional(),
+})
+
+export const HookFailedEventSchema = z.object({
+  type: z.literal('hook_failed'),
+  ...baseEventFields,
+  hookName: z.string(),
+  hookEvent: z.string(),
+  toolUseId: z.string().optional(),
+  toolName: z.string().optional(),
+  message: z.string(),
+})
+
 export const ExecutionMetricsEventSchema = z.object({
   type: z.literal('execution_metrics'),
   ...baseEventFields,
@@ -151,6 +180,9 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   TaskSessionEventSchema,
   PermissionRequestEventSchema,
   PermissionResponseEventSchema,
+  HookStartedEventSchema,
+  HookCompletedEventSchema,
+  HookFailedEventSchema,
   ExecutionMetricsEventSchema,
 ])
 

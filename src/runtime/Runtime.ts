@@ -7,6 +7,7 @@ export type RuntimeExecuteOptions = {
   cwd: string
   role?: string
   signal?: AbortSignal
+  timeoutSignal?: AbortSignal
   maxToolOutputBytes?: number
   bashMaxBufferBytes?: number
   skipPermissionCheck?: boolean

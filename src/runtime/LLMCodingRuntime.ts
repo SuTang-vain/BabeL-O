@@ -24,6 +24,13 @@ import type {
 } from '../providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../shared/config.js'
 import { assembleContext } from './contextAssembler.js'
+import {
+  executeRuntimeHooks,
+  firstHookDenyReason,
+  firstHookPermissionDecision,
+  lastHookUpdatedInput,
+  mergeHookRetryHints,
+} from './hooks.js'
 
 
 export class LLMCodingRuntime implements NexusRuntime {
@@ -380,15 +387,95 @@ export class LLMCodingRuntime implements NexusRuntime {
             return
           }
 
-          const parsed = tool.inputSchema.safeParse(resolvedInput)
-          if (!parsed.success) {
+          const preToolHooks = await executeRuntimeHooks(
+            'PreToolUse',
+            {
+              toolUseId: tc.id,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput: resolvedInput,
+            },
+            {
+              sessionId: options.sessionId,
+              cwd: options.cwd,
+              role: options.role,
+              signal: options.signal,
+            },
+          )
+          for (const hookEvent of preToolHooks.events) yield hookEvent
+          const hookDenyReason = firstHookDenyReason(preToolHooks)
+          if (hookDenyReason) {
             yield {
-              type: 'error',
+              type: 'tool_denied',
               ...eventBase(options.sessionId),
-              code: 'INVALID_TOOL_INPUT',
-              message: z.prettifyError(parsed.error),
+              name: tool.name,
+              risk: tool.risk,
+              message: hookDenyReason,
+            }
+            yield {
+              type: 'result',
+              ...eventBase(options.sessionId),
+              success: false,
+              message: hookDenyReason,
             }
             return
+          }
+          const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
+          if (hookUpdatedInput !== undefined) {
+            resolvedInput = hookUpdatedInput
+          }
+
+          const parsed = tool.inputSchema.safeParse(resolvedInput)
+          if (!parsed.success) {
+            let message = [
+              `Invalid input for tool ${tool.name}.`,
+              z.prettifyError(parsed.error),
+              `Return a corrected ${tool.name} tool call with all required fields.`,
+            ].join('\n')
+            const failureHooks = await executeRuntimeHooks(
+              'PostToolUseFailure',
+              {
+                toolUseId: tc.id,
+                toolName: tool.name,
+                toolRisk: tool.risk,
+                toolInput: resolvedInput,
+                success: false,
+                output: {
+                  code: 'INVALID_TOOL_INPUT',
+                  message,
+                  input: resolvedInput,
+                },
+                errorCode: 'INVALID_TOOL_INPUT',
+                errorMessage: message,
+              },
+              {
+                sessionId: options.sessionId,
+                cwd: options.cwd,
+                role: options.role,
+                signal: options.signal,
+              },
+            )
+            for (const hookEvent of failureHooks.events) yield hookEvent
+            message = mergeHookRetryHints(message, failureHooks)
+            yield {
+              type: 'tool_completed',
+              ...eventBase(options.sessionId),
+              toolUseId: tc.id,
+              name: tool.name,
+              success: false,
+              output: {
+                code: 'INVALID_TOOL_INPUT',
+                message,
+                input: resolvedInput,
+              },
+            }
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: message,
+              isError: true,
+            })
+            continue
           }
 
           const safetyCheck = checkOptimizerSafety(tool.name, parsed.data, options.role)
@@ -439,7 +526,25 @@ export class LLMCodingRuntime implements NexusRuntime {
                 message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
               }
 
-              const decision = await PendingPermissionRegistry.getInstance().register(
+              const permissionHooks = await executeRuntimeHooks(
+                'PermissionRequest',
+                {
+                  toolUseId: tc.id,
+                  toolName: tool.name,
+                  toolRisk: tool.risk,
+                  toolInput: parsed.data,
+                },
+                {
+                  sessionId: options.sessionId,
+                  cwd: options.cwd,
+                  role: options.role,
+                  signal: options.signal,
+                },
+              )
+              for (const hookEvent of permissionHooks.events) yield hookEvent
+
+              const hookDecision = firstHookPermissionDecision(permissionHooks)
+              const decision = hookDecision ?? await PendingPermissionRegistry.getInstance().register(
                 options.sessionId,
                 tc.id
               )
@@ -513,14 +618,39 @@ export class LLMCodingRuntime implements NexusRuntime {
             originalBytes: result.originalBytes,
           }
 
+          const postHookName = result.success ? 'PostToolUse' : 'PostToolUseFailure'
+          const postToolHooks = await executeRuntimeHooks(
+            postHookName,
+            {
+              toolUseId: tc.id,
+              toolName: tool.name,
+              toolRisk: tool.risk,
+              toolInput: parsed.data,
+              success: result.success,
+              output: result.output,
+              errorCode: result.success ? undefined : 'TOOL_RESULT_FAILED',
+              errorMessage: result.success ? undefined : `${tool.name} returned success=false.`,
+            },
+            {
+              sessionId: options.sessionId,
+              cwd: options.cwd,
+              role: options.role,
+              signal: options.signal,
+            },
+          )
+          for (const hookEvent of postToolHooks.events) yield hookEvent
+
           const blockContent =
             typeof result.output === 'string'
               ? result.output
               : JSON.stringify(result.output, null, 2)
+          const contentWithHints = result.success
+            ? blockContent
+            : mergeHookRetryHints(blockContent, postToolHooks)
           toolResultsContent.push({
             type: 'tool_result',
             toolUseId: tc.id,
-            content: blockContent,
+            content: contentWithHints,
             isError: !result.success,
           })
         }
@@ -552,12 +682,15 @@ export class LLMCodingRuntime implements NexusRuntime {
         contextCharsOut,
       }
     } catch (err: any) {
-      const isTimeout = options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError'
+      const isTimeout = options.timeoutSignal?.aborted
+      const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
-        code: isTimeout ? 'REQUEST_TIMEOUT' : (err.code || 'PROVIDER_ERROR'),
-        message: err instanceof Error ? err.message : String(err),
+        code: isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR'),
+        message: isCancelled
+          ? 'Execution cancelled by user.'
+          : err instanceof Error ? err.message : String(err),
       }
       yield {
         type: 'execution_metrics',
@@ -612,10 +745,13 @@ async function executeToolSafely(
     }
   } catch (error) {
     if (options.signal?.aborted) {
+      const isTimeout = options.timeoutSignal?.aborted
       return {
         kind: 'error',
-        code: 'REQUEST_TIMEOUT',
-        message: `Execution timed out while running ${tool.name}.`,
+        code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
+        message: isTimeout
+          ? `Execution timed out while running ${tool.name}.`
+          : `Execution cancelled while running ${tool.name}.`,
       }
     }
     return {

@@ -50,18 +50,62 @@ Legacy complexity is not imported by default.
 
 ## 当前优先级
 
-1. **P1 Safety Hardening**: 收紧 Bash 自动审批白名单、为 MCP tool 接入远端 inputSchema 运行时校验，并把 Optimizer safety 从硬编码黑名单升级为策略配置。
-2. **P3 Non-dry-run Provider Smoke**: 用小目录跑真实 `bbl optimize --enable-subagents` 非 dry-run 流程，验证 Planner 审批、子任务委派、父任务回收、worktree 隔离和 Git 保护链路。
-3. **P3 Worktree / Git Hardening**: 在已完成的嵌套隔离、cherry-pick 范围合并和冲突文件检测诊断基础上，补充真实 provider smoke、冲突人工恢复策略，并加固非隔离 in-place Git 操作。
-4. **P2 Architecture Boundary**: 明确 embedded local 与 Nexus-only 的产品口径，减少 CLI 直接操作 Storage 的路径。
-5. **P2/P3 Provider Registry 完善**: 补齐未配置 roles 时的默认推荐策略，并验证推理模型纯文本角色路由。
-6. **P2 Reliability / Performance Enhancement**: 继续完善大量 session/event API 响应压测、chat 首响 benchmark、retry policy benchmark、测试并发化和 storageBridge 故障注入。
+1. **P3 Role Structured Output Repair / Retry**: 真实 provider 非 dry-run smoke 已证明 Git/rollback 链路可运行，当前阻塞集中在 Planner/Optimizer structured output 变体和 provider 空响应；AgentLoop 已能显示 `structured` failureType、缺失字段和候选来源，下一步实现 role-level repair prompt、一次自修复重试或更稳定的 role model 路由。
+2. **P1 Nexus Hooks 最小内核**: 参考 BabeL-X `src/utils/hooks.ts` 的生命周期设计，但不迁移巨型实现；优先在 Nexus core 中实现 `PreToolUse`、`PostToolUseFailure`、`PermissionRequest`、`SubagentStart`、`SessionEnd`，用于工具失败自恢复、权限审计、子 Agent 上下文注入和 session 结束清理。
+3. **P1 Context Compact UX**: BabeL-O 已有 `contextAssembler`、snip compactor 和恢复边界；下一步参考 BabeL-X `autoCompact.ts` / `TokenWarning.tsx` 增加 `/compact`、auto-compact threshold、token/context 剩余提示、compact 失败熔断，改善长会话与连续任务能力。
+4. **P2/P3 Provider Registry 完善**: 补齐未配置 roles 时的默认推荐策略，并验证推理模型纯文本角色路由，让 Planner/Executor/Critic 默认落到更符合 capability 的模型。
+5. **P3 Non-dry-run Provider Smoke**: 在 structured-output repair、hooks 和 role model routing 后，用小目录继续跑真实 `bbl optimize --enable-subagents` 非 dry-run 流程，验证 Planner 审批、子任务委派、父任务回收、worktree 隔离和 Git 保护链路。
+6. **P2 Agent Lifecycle Visibility**: 参考 BabeL-X AgentTool / BackgroundTask 的状态治理，补齐子 Agent transcript、权限继承、MCP/skill 上下文继承、parent blocked、child running/completed、depth、parentTaskId、delegatedSubTaskIds 的统一事件模型和 CLI 展示。
+7. **P2 TUI Interaction Hardening**: 参考 BabeL-X PromptInput 的状态分层，但保持轻量 ANSI/readline；继续拆分输入框、slash overlay、权限 approval panel、agent/task status、tool block，避免方向键冲突、双输入框、输入回显污染和状态提示不清。
+8. **P2 Architecture Boundary**: 明确 embedded local 与 Nexus-only 的产品口径，减少 CLI 直接操作 Storage 的路径。
+9. **P2 Reliability / Performance Enhancement**: 继续完善大量 session/event API 响应压测、chat 首响 benchmark、retry policy benchmark、测试并发化和 storageBridge 故障注入。
+10. **P2 Build / CI Hardening**: 补齐生产 build、lint/format、CI 与 coverage report，避免发布路径继续依赖 tsx。
+
+## BabeL-X 精华设计迁移结论
+
+2026-05-24 横向阅读 `/Users/tangyaoyue/DEV/BABEL/BabeL-X` 后确认：BabeL-X 的可复用价值主要在交互编排和生命周期治理，而不是单个工具实现。BabeL-O 应吸收机制，不吸收重量。
+
+### 应优先吸收
+
+- **Lifecycle Hooks**: BabeL-X 在 `src/utils/hooks.ts` 中围绕 `PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`PermissionRequest`、`UserPromptSubmit`、`SubagentStart`、`SessionEnd` 建立了统一扩展点。BabeL-O 应做 Nexus-owned 最小内核，用事件和 typed input/output 驱动，而不是复制 shell/plugin/telemetry/React 相关复杂度。
+- **Agent Lifecycle Governance**: BabeL-X `AgentTool` / `runAgent` 不是简单拉起子模型，而是包含 agentId、permission mode、allowedTools、MCP 继承、frontmatter hooks、transcript、worktree notice、后台任务登记和 cleanup。BabeL-O 已有 TaskQueue/subAgents/worktree，下一步应补生命周期事件、独立 transcript、权限继承边界和恢复/取消语义。
+- **Context Compact and Warning UX**: BabeL-X 的 `autoCompact.ts` / `TokenWarning.tsx` 提供 token 阈值、auto-compact、blocking limit、失败熔断和用户可见提示。BabeL-O 已有 context budget 与恢复边界，应将其产品化为 `/compact`、context warning、compact failure event 和 auto-compact policy。
+- **Permission Approval Options**: BabeL-X 的 Bash/File permission dialog 支持一次批准、拒绝、批准并记住、编辑 allow rule、拒绝/批准反馈。BabeL-O 已完成安全分类器和多级权限 UI 第一版，后续应补 rule 编辑、session/project scope、可审计 permission decision reason。
+- **Prompt Input State Separation**: BabeL-X PromptInput 把输入缓冲、history、slash typeahead、modal overlay、footer、agent status、background tasks 分层处理。BabeL-O 不迁移 React/Ink，但要继续采用状态机/overlay 方式保证输入框、slash 菜单和 agent 状态互不抢键盘。
+
+### 暂不吸收或禁止直接迁移
+
+- 不迁移 BabeL-X 的 React/Ink TUI 到 runtime core；CLI 交互增强继续走 lightweight renderer。
+- 不迁移 analytics、GrowthBook、cloud telemetry、desktop/remote/team/swarm 全量体系。
+- 不复制 `src/utils/hooks.ts` 这种巨型文件；按 BabeL-O 的 Nexus event schema 重写最小 Hook executor。
+- 不让 CLI UI 状态进入 runtime；runtime 只产出结构化事件，CLI 负责展示。
+- 不把 fork subagent 的完整 prompt-cache 优化作为近期目标；先完成 task/sub-agent 生命周期、transcript 和权限继承。
+
+### 推荐落地顺序
+
+1. Nexus Hooks 最小内核：`PreToolUse`、`PostToolUseFailure`、`PermissionRequest`、`SubagentStart`、`SessionEnd`。
+2. `/compact` 与 auto-compact warning：先提供手动 compact 和上下文剩余提示，再做自动 compact。
+3. 子 Agent lifecycle：独立 transcript、permission inheritance、MCP/skill inheritance、cancel/resume。
+4. 权限 approval rule editor：一次/会话/项目级批准，Bash prefix rule 可编辑。
+5. TUI 状态分层最终收口：输入框、slash overlay、permission panel、agent running indicator、tool block 独立渲染与键盘路由。
 
 ## 当前阻塞项
 
 - 暂无。
 
 ## 最近完成
+
+- 完成 P0 Recoverable Invalid Tool Input (v0.76)：根据最新 `session_0f3f9a49-7558-4174-ac35-27c176bc0083` 日志核实，模型调用 `Write` 时只传 `content` 未传 `path`，`LLMCodingRuntime` 原先将 schema 校验失败升级成全局 `INVALID_TOOL_INPUT` 并终止。现改为 `tool_completed success=false` + provider `tool_result isError=true`，让模型能看到缺失字段并补齐参数重试。已验证 `npm run typecheck` 与 Runtime LLM 目标测试 26/26 通过。
+
+- 完成 P0 Chat Recovery Context Boundary and Cancellation Semantics (v0.75)：根据最新 `session_0b39043f-04a3-49d2-b77e-5d84153d4de7` 日志核实，用户 ESC/超时后的追问已写入 `last_user_input`，但旧长任务工具链仍作为 live context 回放，导致模型继续读旧文件。现已在 context assembler 中增加取消/超时/失败后的恢复边界，新用户输入会作为新的 recent context 起点；runtime 同时区分 `REQUEST_CANCELLED` 与真正的 `REQUEST_TIMEOUT`。已验证 `npm run typecheck` 与 Context/Runtime/RunSession 目标测试 69/69 通过。
+
+- 完成 P3 Agent Structured Output Failure Diagnostics (v0.74)：`RuntimeAgentStepError.summary` 增加 structured-output 诊断对象，可区分 `no_structured_json`、`schema_mismatch`、`provider_error`，并暴露 candidateSources、missingRequiredKeys、schemaErrors 与输出预览；CLI task session 摘要优先展示 `structured=<type>`、`missing=<keys>`、`sources=<candidateSources>`，方便真实 provider smoke 直接定位失败原因。已验证 `npm run typecheck` 与 Agent/TUI/Runtime 目标测试 53/53 通过。
+
+- 完成 P3 Agent Failure Observability and Provider Smoke Diagnostics (v0.73)：Agent step 失败现在携带 role、tool、result、provider error 与最后 tool 输出摘要；CLI 可直接展示 executor/optimizer 失败原因。真实非 dry-run smoke 已定位到 Planner 空 JSON、Optimizer structured output 字段缺失和 provider 空响应；已补 Planner 空计划 fallback 与 Executor 常见字段归一化。已验证 `npm run typecheck` 与 Runtime/Agent/TUI 目标测试 52/52 通过。
+
+- 完成 P3 Worktree / Git Hardening (v0.72)：`commitAndMergeWorktree()` 改为基于 `git status --porcelain=v1 -z` 的显式 pathspec staging，替代宽泛 `git add -A`；in-place optimizer commit 替代 `git add .`，rollback 替代 `git reset --hard && git clean -fd`，避免删除用户未跟踪文件；保留嵌套 worktree commit range 合并能力，确保子 Agent 变更能继续回主工作区。已验证 `npm run typecheck` 与 Worktree/AgentLoop 目标测试 18/18 通过。
+
+- 完成 P1 Safety Hardening 收口 (v0.71)：Bash 自动审批从单条宽松正则改为轻量 shell 词法扫描 + 精确命令白名单，`npm test`、宽松 `npx tsc .*`、`cat /dev/*`、管道/重定向/命令替换等均需人工确认；Optimizer safety 升级为可注入策略配置，新增 lockfile、`git reset --hard`、`git clean -fd` 等保护；MCP tool 运行时按远端 `inputSchema` 校验，失败以可恢复 tool result 返回。已验证 `npm run typecheck`、Classifier/Optimizer/MCP/Permission 目标测试通过。
 
 - 完成 P0 Recoverable Bash Non-Zero Exit (v0.70)：根据真实会话中 `cd /Users/tangyaoyue/DEV/BABEL/BabeL-X && git remote -v && git log --oneline -20` 失败后 Agent 停止继续的问题核实，根因是 Bash 将“命令正常启动但退出码非 0”升级为全局 `TOOL_ERROR`，provider 收不到工具失败结果。现已将本地/Docker Bash 非零退出改为 `tool_completed success=false`，保留 stdout/stderr/exitCode/message，并映射为 `tool_result is_error=true` 回传模型；超时、maxBuffer、spawn/Docker 环境异常仍按运行时错误处理。已验证 `npm run typecheck` 与 Runtime/LLM 目标测试 52/52 通过。
 

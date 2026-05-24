@@ -80,7 +80,20 @@
 - [x] 支持 worktree 隔离第一版：带 `requiresIsolation` metadata 的任务会在 Git worktree 中执行，审核通过后 commit 并 cherry-pick 回主工作区，完成后清理临时 worktree。
 - [x] 支持跨 session task 委派并实现动态子 Agent。
 - [x] 解决嵌套隔离 Worktree 合并及 cherry-pick 范围回传，实现冲突文件精确提取与错误诊断，完成子代理嵌套隔离测试。
-- [ ] 非隔离 in-place optimizer 的 Git 操作继续加固：避免 `git add .` 纳入无关未跟踪文件，避免 `git reset --hard` / `git clean -fd` 删除用户手动创建但未纳入本次任务的文件。
+- [x] 非隔离 in-place optimizer 的 Git 操作继续加固：避免 `git add .` 纳入无关未跟踪文件，避免 `git reset --hard` / `git clean -fd` 删除用户手动创建但未纳入本次任务的文件。
+- [ ] 参考 BabeL-X `AgentTool.tsx` / `runAgent.ts` 的生命周期治理，为 BabeL-O 子 Agent 定义正式 `agentId`、`parentAgentId`、`parentTaskId`、`depth`、`agentType`、`status`、`transcriptPath` 元数据。
+- [ ] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、queueId、taskId、depth、cwd/worktreeCwd、role、allowedTools、permissionMode。
+- [ ] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、修改文件、commit hash、失败类型、retry 建议。
+- [ ] 为跨 session 子 Agent 保存独立 transcript：父 session 只保存摘要和 transcript 引用，避免父上下文被子任务完整工具链撑爆。
+- [ ] 子 Agent resume：给 parent session 提供可查询子 transcript 路径和最近状态，允许后续命令恢复或查看子 Agent 详细日志。
+- [ ] 子 Agent cancel：父 session 取消时级联取消未完成子 session；单个子 session 取消时父任务应收到结构化失败结果并可重排/收口。
+- [ ] 子 Agent permission inheritance：默认继承父 session 的 deny-by-default 和 CLI arg allow rules，但不继承临时 once approval；session-scope approval 是否继承必须可配置并写入 audit。
+- [ ] 子 Agent MCP inheritance：默认只继承父 runtime 已显式 allowlisted 的 MCP tools；agent-specific MCP server 延后，避免前置引入插件级复杂度。
+- [ ] 子 Agent skill/context inheritance：继承当前匹配 inline skills 和 explicit path anchors；只读 Explore/Plan 类任务可裁剪 gitStatus/大体积 project memory。
+- [ ] 子 Agent worktree notice：当子 Agent 在隔离 worktree 内运行时，在 system/additional context 中注入 parent cwd、worktree cwd、路径转换规则、变更隔离说明。
+- [ ] 子 Agent 输出契约：要求输出 `Scope`、`Result`、`Key files`、`Files changed`、`Issues` 等稳定字段，父 Agent 汇总时优先读取结构化摘要，不扫描完整 transcript。
+- [ ] 防无限派生加强：除 max depth/max tasks 外，增加同 parentTaskId 重复委派检测、相同 title/description 去重、失败子任务 retry 上限。
+- [ ] 成本控制：提供 `--no-critic`、`--subagent-model`、`--subagent-max-turns` 或 role 配置，避免简单任务触发过多模型往返。
 - [ ] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
 - [ ] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
 - [ ] 定义外部 SDK task API。
@@ -97,7 +110,15 @@
 - [x] Planner review approve/edit/reject 测试已纳入 `test/agent-loop.test.ts`。
 - [x] subTasks 层级渲染测试已纳入 `test/tui-renderer.test.ts`。
 - [x] worktree 生命周期与冲突提取测试已纳入 `test/worktree.test.ts`，AgentLoop 隔离执行以及子代理嵌套隔离合并测试已纳入 `test/agent-loop.test.ts`。
+- [x] in-place optimizer Git hardening 测试已纳入 `test/agent-loop.test.ts`，worktree pathspec staging 测试已纳入 `test/worktree.test.ts`。
 - [ ] 非 dry-run 的真实 provider AgentLoop smoke。
+  - 2026-05-24 已用临时 Git 仓库执行真实 `bbl optimize --enable-subagents` 非 dry-run smoke：Planner/工具调用/rollback 链路运行，但 executor 多轮失败后 TaskQueue settled，临时仓库保持干净。下一步需诊断 executor 失败细节展示与真实 provider 输出稳定性后再标完成。
+  - 2026-05-24 复跑诊断后确认：Planner 空 JSON 已可 fallback；当前主要失败类型为 Optimizer/Executor structured output 缺字段，以及 provider 空响应。下一步需做 role structured-output repair/retry 或 role model routing，再继续标完成。
+  - 2026-05-24 AgentLoop/CLI 已能展示 structured-output 失败类型、缺失必填字段、候选来源和输出预览；下一步复跑 smoke 时应优先根据 `structured=schema_mismatch` / `structured=no_structured_json` / `EMPTY_PROVIDER_RESPONSE` 分流到 repair/retry 或 role model routing。
+- [ ] 子 Agent lifecycle 单元测试：started/completed/failed/cancelled 事件、depth、parentTaskId、transcriptPath、permission inheritance。
+- [ ] 子 Agent transcript 压缩测试：父 session 只注入子任务摘要，不把完整子工具链放入 recent context。
+- [ ] 子 Agent cancel/resume smoke：父任务 blocked 时取消子 Agent，确认父任务能恢复为 failed/requeued 或终态 cancelled。
+- [ ] 子 Agent worktree notice smoke：子 Agent 在 worktree 中正确读取目标文件、提交修改并回传父工作区。
 
 ## 参考文件
 

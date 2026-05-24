@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { checkOptimizerSafety } from '../src/runtime/safetyCheck.js'
+import { checkOptimizerSafety, defaultOptimizerSafetyPolicy } from '../src/runtime/safetyCheck.js'
 import { LocalCodingRuntime } from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { eventBase } from '../src/shared/events.js'
@@ -14,6 +14,8 @@ test('checkOptimizerSafety rules', () => {
   // Forbidden files
   assert.equal(checkOptimizerSafety('Write', { path: 'package.json' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Write', { path: 'package-lock.json' }, 'optimizer').allowed, false)
+  assert.equal(checkOptimizerSafety('Write', { path: 'pnpm-lock.yaml' }, 'optimizer').allowed, false)
+  assert.equal(checkOptimizerSafety('Write', { path: 'yarn.lock' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Write', { path: 'tsconfig.json' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Write', { path: 'bin/bbl.js' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Write', { path: '.env.development' }, 'optimizer').allowed, false)
@@ -24,6 +26,19 @@ test('checkOptimizerSafety rules', () => {
   assert.equal(checkOptimizerSafety('Bash', { command: 'git push origin main' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Bash', { command: 'npm publish' }, 'optimizer').allowed, false)
   assert.equal(checkOptimizerSafety('Bash', { command: 'sudo rm -f test' }, 'optimizer').allowed, false)
+  assert.equal(checkOptimizerSafety('Bash', { command: 'git reset --hard HEAD' }, 'optimizer').allowed, false)
+  assert.equal(checkOptimizerSafety('Bash', { command: 'git clean -fd' }, 'optimizer').allowed, false)
+})
+
+test('checkOptimizerSafety accepts policy overrides', () => {
+  const relaxedPolicy = {
+    ...defaultOptimizerSafetyPolicy,
+    protectedFileNames: defaultOptimizerSafetyPolicy.protectedFileNames.filter(name => name !== 'package.json'),
+  }
+  assert.equal(
+    checkOptimizerSafety('Write', { path: 'package.json' }, 'optimizer', relaxedPolicy).allowed,
+    true,
+  )
 })
 
 test('LocalCodingRuntime blocks forbidden actions under optimizer role', async () => {

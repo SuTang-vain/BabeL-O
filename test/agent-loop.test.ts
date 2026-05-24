@@ -15,7 +15,7 @@ import {
 } from '../src/nexus/storageBridge.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { PLANNER_ROLE, EXECUTOR_ROLE, CRITIC_ROLE, OPTIMIZER_ROLE } from '../src/nexus/agentRoles.js'
-import { createRuntimeAgentStepRunner } from '../src/nexus/runtimeAgentStep.js'
+import { createRuntimeAgentStepRunner, RuntimeAgentStepError } from '../src/nexus/runtimeAgentStep.js'
 import {
   completeNexusTask,
   createNexusTask,
@@ -605,6 +605,103 @@ test('runtime agent step rejects structured roles on non-json models', async () 
   }
 })
 
+test('runtime agent step surfaces diagnostics on structured output parse failure', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-diagnostics'
+  createTaskSession({ sessionId })
+
+  const stepRunner = createRuntimeAgentStepRunner({
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        yield {
+          type: 'tool_completed',
+          schemaVersion: '2026-05-21.babel-o.v1',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          toolUseId: 'tool-1',
+          name: 'Bash',
+          success: false,
+          output: { stderr: 'command failed with code 2', exitCode: 2 },
+        }
+        yield {
+          type: 'result',
+          schemaVersion: '2026-05-21.babel-o.v1',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          success: true,
+          message: 'not json',
+        }
+      },
+    } as any),
+  })
+
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: OPTIMIZER_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-diagnostics',
+        title: 'diagnose',
+      },
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof RuntimeAgentStepError)
+      assert.equal(err.summary.toolResultCount, 1)
+      assert.equal(err.summary.toolFailedCount, 1)
+      assert.equal(err.summary.lastToolName, 'Bash')
+      assert.match(err.summary.lastToolOutputPreview ?? '', /command failed/)
+      assert.equal(err.summary.structuredOutput?.failureType, 'no_structured_json')
+      assert.equal(err.summary.structuredOutput?.candidateCount, 0)
+      assert.match(err.message, /structured output/)
+      return true
+    },
+  )
+})
+
+test('runtime agent step diagnostics include structured output missing required fields', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-structured-diagnostics'
+  createTaskSession({ sessionId })
+
+  const stepRunner = createRuntimeAgentStepRunner({
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        yield {
+          type: 'result',
+          schemaVersion: '2026-05-21.babel-o.v1',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          success: true,
+          message: JSON.stringify({ status: 'completed', details: { checked: true } }),
+        }
+      },
+    } as any),
+  })
+
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: OPTIMIZER_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-structured-diagnostics',
+        title: 'diagnose structured fields',
+      },
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof RuntimeAgentStepError)
+      assert.equal(err.summary.structuredOutput?.failureType, 'schema_mismatch')
+      assert.deepEqual(err.summary.structuredOutput?.candidateSources, ['assistantText'])
+      assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('taskId'))
+      assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('success'))
+      assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('result'))
+      assert.ok((err.summary.structuredOutput?.schemaErrors?.length ?? 0) > 0)
+      return true
+    },
+  )
+})
+
 test('runAgentLoop runs with requiresIsolation and successfully manages Git Worktree lifecycle', async () => {
   resetTaskQueuesForTest()
   resetTaskSessionsForTest()
@@ -707,6 +804,87 @@ test('runAgentLoop runs with requiresIsolation and successfully manages Git Work
     assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'worktree_merged'))
     assert.equal(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'git_commit_performed'), false)
 
+  } finally {
+    if (existsSync(testRepoDir)) {
+      rmSync(testRepoDir, { recursive: true, force: true })
+    }
+  }
+})
+
+test('runAgentLoop optimizer rollback preserves unrelated untracked files', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const rootDir = resolve(process.cwd())
+  const babelODir = join(rootDir, '.babel-o')
+  if (!existsSync(babelODir)) {
+    mkdirSync(babelODir)
+  }
+  const testRepoDir = join(babelODir, `test-agent-rollback-repo-${Date.now()}`)
+  mkdirSync(testRepoDir)
+
+  const runRepoCmd = (cmd: string, args: string[]) => {
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn(cmd, args, { cwd: testRepoDir })
+      child.on('close', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`${cmd} ${args.join(' ')} failed with code ${code}`))
+      })
+    })
+  }
+
+  try {
+    await runRepoCmd('git', ['init'])
+    await runRepoCmd('git', ['config', 'user.name', 'Test Agent'])
+    await runRepoCmd('git', ['config', 'user.email', 'agent@test.com'])
+
+    const trackedFile = join(testRepoDir, 'tracked.txt')
+    const untrackedFile = join(testRepoDir, 'user-notes.txt')
+    writeFileSync(trackedFile, 'original content', 'utf8')
+    await runRepoCmd('git', ['add', '.'])
+    await runRepoCmd('git', ['commit', '-m', 'initial'])
+    writeFileSync(untrackedFile, 'manual user scratchpad', 'utf8')
+
+    const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
+      if (roleDefinition.role === 'planner') {
+        return {
+          summary: 'Rollback plan',
+          tasks: [{ title: 'Modify tracked file', description: 'This will be rejected' }],
+        }
+      }
+      if (roleDefinition.role === 'optimizer') {
+        writeFileSync(join(input.cwd, 'tracked.txt'), 'agent modified content', 'utf8')
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Modified tracked file',
+          needsReview: true,
+        }
+      }
+      if (roleDefinition.role === 'critic') {
+        return { approved: false, reason: 'Reject to test rollback' }
+      }
+      throw new Error(`Unexpected role ${roleDefinition.role}`)
+    }
+
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-optimizer-rollback-preserves-untracked',
+      cwd: testRepoDir,
+      prompt: 'Modify tracked file',
+      stepRunner,
+      role: 'optimizer',
+      maxRetriesPerTask: 1,
+    })
+
+    assert.equal(finalSession.phase, 'failed')
+    assert.equal(readFileSync(trackedFile, 'utf8'), 'original content')
+    assert.equal(readFileSync(untrackedFile, 'utf8'), 'manual user scratchpad')
+    assert.ok(finalSession.events.some(event =>
+      event.type === 'task_session_event' && event.eventType === 'git_rollback_performed',
+    ))
   } finally {
     if (existsSync(testRepoDir)) {
       rmSync(testRepoDir, { recursive: true, force: true })
@@ -847,4 +1025,3 @@ test('runAgentLoop runs sub-agent session with isolation and merges changes back
     }
   }
 })
-

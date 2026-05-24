@@ -36,6 +36,7 @@ import {
   removeWorktree,
   pruneOrphanedWorktrees,
 } from './worktree.js'
+import { RuntimeAgentStepError } from './runtimeAgentStep.js'
 
 type AgentSubTask = {
   title: string
@@ -107,14 +108,59 @@ async function gitStashPop(cwd: string): Promise<void> {
   await runGitCommand(cwd, ['stash', 'pop'])
 }
 
-async function gitHardReset(cwd: string): Promise<void> {
-  await runGitCommand(cwd, ['reset', '--hard', 'HEAD'])
-  await runGitCommand(cwd, ['clean', '-fd'])
+function parsePorcelainChangedPaths(stdout: string): string[] {
+  const paths = new Set<string>()
+  for (const entry of stdout.split('\0')) {
+    if (!entry) continue
+    const status = entry.slice(0, 2)
+    const rawPath = entry[2] === ' '
+      ? entry.slice(3)
+      : entry[1] === ' '
+        ? entry.slice(2)
+        : entry.slice(3)
+    if (!rawPath) continue
+    if (status.includes('D')) continue
+    paths.add(rawPath)
+  }
+  return [...paths].sort()
+}
+
+async function gitChangedPaths(cwd: string): Promise<string[]> {
+  const { code, stdout, stderr } = await runGitCommand(cwd, [
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=normal',
+  ])
+  if (code !== 0) {
+    throw new Error(`Failed to inspect git changes: ${stderr}`)
+  }
+  return parsePorcelainChangedPaths(stdout)
+}
+
+async function gitRollbackTracked(cwd: string): Promise<void> {
+  await runGitCommand(cwd, ['restore', '--staged', '--worktree', '.'])
 }
 
 async function gitCommit(cwd: string, message: string): Promise<void> {
-  await runGitCommand(cwd, ['add', '.'])
-  await runGitCommand(cwd, ['commit', '-m', message])
+  const changedPaths = await gitChangedPaths(cwd)
+  if (changedPaths.length === 0) return
+  const { code: addCode, stderr: addStderr, stdout: addStdout } = await runGitCommand(cwd, ['add', '--', ...changedPaths])
+  if (addCode !== 0) {
+    throw new Error(`Git stage failed: ${addStderr || addStdout}`)
+  }
+  const { code, stderr, stdout } = await runGitCommand(cwd, [
+    '-c',
+    'user.name=BabeL-O Agent',
+    '-c',
+    'user.email=agent@babel-o.local',
+    'commit',
+    '-m',
+    message,
+  ])
+  if (code !== 0) {
+    throw new Error(`Git commit failed: ${stderr || stdout}`)
+  }
 }
 
 export type RunAgentLoopOptions = {
@@ -403,7 +449,11 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             executorSuccess = executorResult.success
           } catch (err) {
             executorSuccess = false
-            recordTaskSessionEvent(sessionId, 'executor_failed_error', { taskId: task.taskId, error: String(err) })
+            recordTaskSessionEvent(sessionId, 'executor_failed_error', {
+              taskId: task.taskId,
+              error: err instanceof Error ? err.message : String(err),
+              diagnostics: err instanceof RuntimeAgentStepError ? err.summary : undefined,
+            })
           }
         }
 
@@ -515,7 +565,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               isIsolated = false
             } else if (role === 'optimizer') {
               try {
-                await gitHardReset(cwd)
+                await gitRollbackTracked(cwd)
                 recordTaskSessionEvent(sessionId, 'git_rollback_performed', { taskId: task.taskId, reason: criticReason })
               } catch (err) {
                 logger.error('Git rollback failed', err)
@@ -547,7 +597,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             isIsolated = false
           } else if (role === 'optimizer') {
             try {
-              await gitHardReset(cwd)
+              await gitRollbackTracked(cwd)
               recordTaskSessionEvent(sessionId, 'git_rollback_performed', { taskId: task.taskId, reason: 'executor_failed' })
             } catch (err) {
               logger.error('Git rollback failed', err)

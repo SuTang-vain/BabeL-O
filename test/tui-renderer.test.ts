@@ -171,6 +171,40 @@ test('formatSessionHistory: renders agent status and task session events', () =>
   assert.ok(output.includes('task-1'))
 })
 
+test('formatSessionHistory: renders agent failure diagnostics', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-agent',
+      eventId: 'event-diagnostics',
+      eventType: 'executor_failed_error',
+      phase: 'executing',
+      timestamp: new Date().toISOString(),
+      payload: {
+        taskId: 'task-1',
+        error: 'Failed to parse optimizer structured output',
+        diagnostics: {
+          resultMessage: 'not json',
+          lastToolName: 'Bash',
+          lastToolOutputPreview: 'stderr: command failed with code 2',
+          structuredOutput: {
+            failureType: 'schema_mismatch',
+            missingRequiredKeys: ['taskId', 'result'],
+            candidateSources: ['assistantText'],
+          },
+        },
+      },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('executor failed error'))
+  assert.ok(output.includes('Failed to parse optimizer structured output'))
+  assert.ok(output.includes('structured=schema_mismatch'))
+  assert.ok(output.includes('missing=taskId,result'))
+})
+
 test('formatSessionHistory: separates assistant text and bash tool layers', () => {
   const events: NexusEvent[] = [
     {

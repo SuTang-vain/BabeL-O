@@ -104,3 +104,42 @@ test('MCP tools default to denied when server allowlist omits the tool', async (
     await storage.close?.()
   }
 })
+
+test('MCP tools validate runtime input against remote inputSchema', async () => {
+  const cwd = join(tmpdir(), `babel-o-mcp-schema-${Date.now()}`)
+  await mkdir(join(cwd, '.babel-o'), { recursive: true })
+  await writeFile(join(cwd, '.babel-o', 'mcp.json'), JSON.stringify({
+    servers: {
+      mock: {
+        command: process.execPath,
+        args: [join(process.cwd(), 'test/fixtures/mock-mcp-server.mjs')],
+        allowedTools: ['echo'],
+      },
+    },
+  }), 'utf8')
+
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    cwd,
+    enableMcp: true,
+    allowedTools: ['mcp:mock:echo'],
+  })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        cwd,
+        prompt: 'mcp:mock:echo {"extra":true}',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.result.success, false)
+    assert.match(JSON.stringify(body.events), /MCP_INPUT_SCHEMA_VALIDATION_FAILED/)
+    assert.match(JSON.stringify(body.events), /message/)
+  } finally {
+    await app.close()
+    await storage.close?.()
+  }
+})

@@ -735,6 +735,31 @@ function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session
 function summarizePayload(payload: unknown): string {
   if (!payload || typeof payload !== 'object') return ''
   const record = payload as Record<string, unknown>
+  const diagnostics = record.diagnostics
+  if (diagnostics && typeof diagnostics === 'object') {
+    const summary = diagnostics as Record<string, unknown>
+    const structuredOutput = summary.structuredOutput && typeof summary.structuredOutput === 'object'
+      ? summary.structuredOutput as Record<string, unknown>
+      : undefined
+    const pieces = [
+      typeof structuredOutput?.failureType === 'string' ? `structured=${structuredOutput.failureType}` : '',
+      Array.isArray(structuredOutput?.missingRequiredKeys) && structuredOutput.missingRequiredKeys.length > 0
+        ? `missing=${structuredOutput.missingRequiredKeys.join(',')}`
+        : '',
+      Array.isArray(structuredOutput?.candidateSources) && structuredOutput.candidateSources.length > 0
+        ? `sources=${structuredOutput.candidateSources.join(',')}`
+        : '',
+      typeof record.error === 'string' ? record.error : '',
+      typeof summary.errorCode === 'string' ? summary.errorCode : '',
+      typeof summary.errorMessage === 'string' ? summary.errorMessage : '',
+      typeof summary.resultMessage === 'string' ? summary.resultMessage : '',
+      typeof summary.lastToolName === 'string' ? `lastTool=${summary.lastToolName}` : '',
+      typeof summary.lastToolOutputPreview === 'string' ? summary.lastToolOutputPreview : '',
+      typeof structuredOutput?.assistantTextPreview === 'string' ? structuredOutput.assistantTextPreview : '',
+    ].filter(Boolean)
+    if (pieces.length > 0) return truncateMiddle(pieces.join(' | '), 240)
+  }
+  if (typeof record.error === 'string') return truncateMiddle(record.error, 120)
   if (typeof record.title === 'string') return record.title
   if (typeof record.taskId === 'string') return record.taskId
   if (typeof record.reason === 'string') return record.reason

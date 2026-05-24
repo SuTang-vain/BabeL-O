@@ -25,6 +25,42 @@ function runGitCommand(
   });
 }
 
+function parsePorcelainChangedPaths(stdout: string): string[] {
+  const paths = new Set<string>()
+  for (const entry of stdout.split('\0')) {
+    if (!entry) continue
+    const status = entry.slice(0, 2)
+    const rawPath = entry[2] === ' '
+      ? entry.slice(3)
+      : entry[1] === ' '
+        ? entry.slice(2)
+        : entry.slice(3)
+    if (!rawPath) continue
+    if (status.includes('D')) continue
+    paths.add(rawPath)
+  }
+  return [...paths].sort()
+}
+
+async function stagePorcelainChanges(worktreePath: string): Promise<string[]> {
+  const { code, stdout, stderr } = await runGitCommand(worktreePath, [
+    'status',
+    '--porcelain=v1',
+    '-z',
+    '--untracked-files=normal',
+  ])
+  if (code !== 0) {
+    throw new Error(`Failed to inspect worktree changes: ${stderr}`)
+  }
+  const paths = parsePorcelainChangedPaths(stdout)
+  if (paths.length === 0) return []
+  const { code: addCode, stderr: addStderr, stdout: addStdout } = await runGitCommand(worktreePath, ['add', '--', ...paths])
+  if (addCode !== 0) {
+    throw new Error(`Failed to stage worktree changes: ${addStderr || addStdout}`)
+  }
+  return paths
+}
+
 /**
  * Checks if the directory is a Git repository.
  */
@@ -76,8 +112,7 @@ export async function commitAndMergeWorktree(
     throw new Error(`Failed to get parent HEAD commit: ${parentHeadStderr}`)
   }
 
-  // Stage all changes (including untracked files) in the worktree
-  await runGitCommand(worktreePath, ['add', '-A'])
+  await stagePorcelainChanges(worktreePath)
   
   // Check if there are uncommitted changes to commit
   const { code: diffCode } = await runGitCommand(worktreePath, [

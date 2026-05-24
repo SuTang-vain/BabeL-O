@@ -9,6 +9,7 @@ import { getModel, UnknownModelError } from '../providers/registry.js'
 import { allowlistedTools, type ToolPolicy } from '../runtime/LocalCodingRuntime.js'
 
 type NexusRuntimeLike = Awaited<ReturnType<typeof createDefaultNexusRuntime>>['runtime']
+type RuntimeErrorEvent = Extract<NexusEvent, { type: 'error' }>
 type RolePolicyRuntime = NexusRuntimeLike & {
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T
 }
@@ -18,6 +19,7 @@ export type RuntimeAgentStepOptions = {
   model?: string
   maxTurns?: number
   useStructuredOutputTool?: boolean
+  maxRepairAttempts?: number
   runtimeFactory?: () => Promise<NexusRuntimeLike>
   onUsageSummary?: (usage: RuntimeAgentStepUsageSummary) => void
 }
@@ -32,9 +34,42 @@ export type RuntimeAgentStepUsageSummary = {
   eventCount: number
   toolCallCount: number
   toolResultCount: number
+  toolFailedCount?: number
+  toolDeniedCount?: number
+  resultSuccess?: boolean
+  resultMessage?: string
+  errorCode?: string
+  errorMessage?: string
+  lastToolName?: string
+  lastToolSuccess?: boolean
+  lastToolOutputPreview?: string
   resultUsage?: unknown
   modelUsage?: unknown
   permissionDenials?: unknown
+  structuredOutput?: StructuredOutputDiagnostics
+  repairAttempts?: number
+}
+
+export type StructuredOutputDiagnostics = {
+  failureType: 'no_structured_json' | 'schema_mismatch' | 'provider_error'
+  candidateCount: number
+  candidateSources: string[]
+  missingRequiredKeys?: string[]
+  schemaErrors?: string[]
+  assistantTextPreview?: string
+  resultPayloadPreview?: string
+  structuredOutputPreview?: string
+}
+
+export class RuntimeAgentStepError extends Error {
+  constructor(
+    message: string,
+    readonly summary: RuntimeAgentStepUsageSummary,
+    readonly cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'RuntimeAgentStepError'
+  }
 }
 
 export function createRuntimeAgentStepRunner(
@@ -66,10 +101,17 @@ export function createRuntimeAgentStepRunner(
     let resultUsage: unknown
     let modelUsage: unknown
     let permissionDenials: unknown
-    let errorEvent: NexusEvent | null = null
+    let errorEvent: RuntimeErrorEvent | null = null
     let eventCount = 0
     let toolCallCount = 0
     let toolResultCount = 0
+    let toolFailedCount = 0
+    let toolDeniedCount = 0
+    let resultSuccess: boolean | undefined
+    let resultMessage: string | undefined
+    let lastToolName: string | undefined
+    let lastToolSuccess: boolean | undefined
+    let lastToolOutputPreview: string | undefined
 
     const sessionId = (input as { sessionId: string }).sessionId
 
@@ -120,13 +162,25 @@ export function createRuntimeAgentStepRunner(
         textParts.push(nexusEvent.text)
       }
       if (nexusEvent.type === 'tool_started') toolCallCount += 1
-      if (nexusEvent.type === 'tool_completed') toolResultCount += 1
+      if (nexusEvent.type === 'tool_denied') {
+        toolDeniedCount += 1
+        resultMessage = nexusEvent.message
+      }
+      if (nexusEvent.type === 'tool_completed') {
+        toolResultCount += 1
+        lastToolName = nexusEvent.name
+        lastToolSuccess = nexusEvent.success
+        lastToolOutputPreview = summarizeForDiagnostics(nexusEvent.output)
+        if (!nexusEvent.success) toolFailedCount += 1
+      }
       if (nexusEvent.type === 'result') {
         resultPayload = (nexusEvent as { result?: unknown }).result
         structuredOutputPayload = (nexusEvent as { structuredOutput?: unknown }).structuredOutput
         resultUsage = (nexusEvent as { usage?: unknown }).usage
         modelUsage = (nexusEvent as { modelUsage?: unknown }).modelUsage
         permissionDenials = (nexusEvent as { permissionDenials?: unknown }).permissionDenials
+        resultSuccess = nexusEvent.success
+        resultMessage = nexusEvent.message
       }
       if (nexusEvent.type === 'error') {
         errorEvent = nexusEvent
@@ -134,26 +188,456 @@ export function createRuntimeAgentStepRunner(
     }
 
     if (errorEvent) {
-      throw new Error(errorEvent.message)
+      const summary = buildUsageSummary({
+        role: roleDefinition.role,
+        eventCount,
+        toolCallCount,
+        toolResultCount,
+        toolFailedCount,
+        toolDeniedCount,
+        resultSuccess,
+        resultMessage,
+        errorEvent,
+        lastToolName,
+        lastToolSuccess,
+        lastToolOutputPreview,
+        resultUsage,
+        modelUsage,
+        permissionDenials,
+      })
+      options.onUsageSummary?.(summary)
+      throw new RuntimeAgentStepError(errorEvent.message, summary, errorEvent)
     }
 
-    const parsed = parseStructuredAgentOutput(
-      resultPayload,
-      textParts.join(''),
-      roleDefinition.outputSchema,
-      structuredOutputPayload,
-    )
-    options.onUsageSummary?.({
+    const summary = buildUsageSummary({
       role: roleDefinition.role,
       eventCount,
       toolCallCount,
       toolResultCount,
+      toolFailedCount,
+      toolDeniedCount,
+      resultSuccess,
+      resultMessage,
+      errorEvent,
+      lastToolName,
+      lastToolSuccess,
+      lastToolOutputPreview,
       resultUsage,
       modelUsage,
       permissionDenials,
     })
-    return parsed as TOutput
+    const assistantTextForParsing = buildAssistantTextForParsing(textParts, resultMessage)
+    try {
+      const parsed = await tryParseWithRepair({
+        roleDefinition,
+        input,
+        resultPayload,
+        assistantText: assistantTextForParsing,
+        structuredOutputPayload,
+        runtimeForRole,
+        sessionId,
+        targetModelId,
+        maxRepairAttempts: options.maxRepairAttempts ?? 1,
+      })
+      options.onUsageSummary?.(summary)
+      return parsed as TOutput
+    } catch (err) {
+      if (err instanceof RuntimeAgentStepError) {
+        const failureSummary = {
+          ...summary,
+          structuredOutput: err.summary.structuredOutput,
+          repairAttempts: err.summary.repairAttempts,
+        }
+        options.onUsageSummary?.(failureSummary)
+        throw new RuntimeAgentStepError(err.message, failureSummary, err.cause)
+      }
+      throw err
+    }
   }
+}
+
+interface RepairContext {
+  roleDefinition: AgentRoleDefinition
+  input: unknown
+  resultPayload: unknown
+  assistantText: string
+  structuredOutputPayload: unknown
+  runtimeForRole: NexusRuntimeLike
+  sessionId: string
+  targetModelId: string
+  repairCount: number
+  diagnostics: StructuredOutputDiagnostics
+  prompt: string
+}
+
+async function tryParseWithRepair(context: {
+  roleDefinition: AgentRoleDefinition
+  input: unknown
+  resultPayload: unknown
+  assistantText: string
+  structuredOutputPayload: unknown
+  runtimeForRole: NexusRuntimeLike
+  sessionId: string
+  targetModelId: string
+  maxRepairAttempts: number
+}): Promise<unknown> {
+  let attempt = 0
+  let currentPrompt = buildAgentStepPrompt(context.roleDefinition, context.input)
+  let currentTextParts: string[] = context.assistantText ? [context.assistantText] : []
+  let currentResultPayload = context.resultPayload
+  let currentStructuredOutputPayload = context.structuredOutputPayload
+  let firstFailure: { error: unknown; diagnostics: StructuredOutputDiagnostics } | undefined
+
+  while (attempt < context.maxRepairAttempts + 1) {
+    attempt++
+
+    // On first attempt, we already have the parsed values; on retries, re-execute
+    if (attempt > 1) {
+      currentTextParts = []
+      currentResultPayload = undefined
+      currentStructuredOutputPayload = undefined
+
+      const repairPrompt = buildRepairPrompt(context.roleDefinition, context.input, attempt)
+      currentPrompt = repairPrompt
+
+      const executionResult = await executeRuntimeTurn(
+        context.runtimeForRole,
+        context.sessionId,
+        currentPrompt,
+        context.targetModelId,
+        (context.input as { cwd?: string }).cwd ?? process.cwd(),
+        !context.roleDefinition.toolPolicy.requiresApproval,
+        (event) => {
+          if (event.type === 'assistant_delta') currentTextParts.push(event.text)
+          if (event.type === 'result') {
+            currentResultPayload = (event as { result?: unknown }).result
+            currentStructuredOutputPayload = (event as { structuredOutput?: unknown }).structuredOutput
+          }
+        },
+      )
+
+      if (executionResult.errorEvent) {
+        throw new RuntimeAgentStepError(
+          executionResult.errorEvent.message,
+          buildUsageSummaryFromExecution(executionResult),
+          executionResult.errorEvent,
+        )
+      }
+    }
+
+    try {
+      const parsed = parseStructuredAgentOutput(
+        currentResultPayload,
+        currentTextParts.join(''),
+        context.roleDefinition.outputSchema,
+        currentStructuredOutputPayload,
+        context.input,
+      )
+      return parsed
+    } catch (err) {
+      const diagnostics = buildStructuredOutputDiagnostics(
+        err,
+        currentResultPayload,
+        currentTextParts.join(''),
+        context.roleDefinition.outputSchema,
+        currentStructuredOutputPayload,
+      )
+      firstFailure ??= { error: err, diagnostics }
+      const isLastAttempt = attempt >= context.maxRepairAttempts + 1
+      if (isLastAttempt) {
+        const rootFailure = firstFailure ?? { error: err, diagnostics }
+        const summary = buildUsageSummaryFromExecution({
+          eventCount: 0,
+          toolCallCount: 0,
+          toolResultCount: 0,
+          toolFailedCount: 0,
+          toolDeniedCount: 0,
+          resultSuccess: undefined,
+          resultMessage: undefined,
+          errorEvent: null,
+        })
+        throw new RuntimeAgentStepError(
+          `Failed to parse ${context.roleDefinition.role} structured output after ${attempt} attempt(s): ${rootFailure.error instanceof Error ? rootFailure.error.message : String(rootFailure.error)}`,
+          { ...summary, structuredOutput: rootFailure.diagnostics, repairAttempts: attempt },
+          rootFailure.error,
+        )
+      }
+
+      // Log repair attempt and continue to next iteration
+    }
+  }
+
+  // Should not reach here, but TypeScript needs it
+  throw new Error('Repair loop exited unexpectedly')
+}
+
+function buildRepairPrompt(
+  roleDefinition: AgentRoleDefinition,
+  input: unknown,
+  attempt: number,
+): string {
+  const role = roleDefinition.role
+  let correctionInstruction = ''
+
+  switch (role) {
+    case 'planner':
+      correctionInstruction = [
+        'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
+        `Attempt ${attempt}: Please return ONLY a valid JSON object with "summary" (string) and "tasks" (array of objects with "title" string and optional "description" string).`,
+        'Do not include any explanation, markdown formatting, or extra text.',
+      ].join('\n')
+      break
+    case 'executor':
+    case 'optimizer':
+      correctionInstruction = [
+        'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
+        `Attempt ${attempt}: Please return ONLY a valid JSON object with "taskId" (string), "success" (boolean), and "result" (string).`,
+        'Do not include any explanation, markdown formatting, or extra text.',
+      ].join('\n')
+      break
+    case 'critic':
+      correctionInstruction = [
+        'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
+        `Attempt ${attempt}: Please return ONLY a valid JSON object with "approved" (boolean) and optional "reason" (string).`,
+        'Do not include any explanation, markdown formatting, or extra text.',
+      ].join('\n')
+      break
+    default:
+      correctionInstruction = [
+        `Attempt ${attempt}: Please return ONLY a valid JSON object matching the schema below. No markdown, no explanation.`,
+      ].join('\n')
+  }
+
+  const outputSchema = zodRoleOutputSchemaToJsonSchema(roleDefinition.outputSchema)
+  return [
+    roleDefinition.systemPrompt,
+    '',
+    correctionInstruction,
+    '',
+    'Output JSON Schema:',
+    JSON.stringify(outputSchema, null, 2),
+    '',
+    'Role:',
+    roleDefinition.role,
+    '',
+    'Input:',
+    JSON.stringify(input, null, 2),
+  ].join('\n')
+}
+
+async function executeRuntimeTurn(
+  runtime: NexusRuntimeLike,
+  sessionId: string,
+  prompt: string,
+  model: string,
+  cwd: string,
+  skipPermissionCheck: boolean,
+  onEvent: (event: NexusEvent) => void,
+): Promise<{
+  errorEvent: RuntimeErrorEvent | null
+  eventCount: number
+  toolCallCount: number
+  toolResultCount: number
+  toolFailedCount: number
+  toolDeniedCount: number
+  resultSuccess?: boolean
+  resultMessage?: string
+}> {
+  let errorEvent: RuntimeErrorEvent | null = null
+  let eventCount = 0
+  let toolCallCount = 0
+  let toolResultCount = 0
+  let toolFailedCount = 0
+  let toolDeniedCount = 0
+  let resultSuccess: boolean | undefined
+  let resultMessage: string | undefined
+
+  for await (const event of runtime.executeStream({
+    sessionId,
+    prompt,
+    cwd,
+    model,
+    skipPermissionCheck,
+  })) {
+    const nexusEvent = event as NexusEvent
+    eventCount++
+    onEvent(nexusEvent)
+
+    if (nexusEvent.type === 'tool_started') toolCallCount++
+    if (nexusEvent.type === 'tool_denied') {
+      toolDeniedCount++
+      resultMessage = (nexusEvent as { message?: string }).message
+    }
+    if (nexusEvent.type === 'tool_completed') {
+      toolResultCount++
+      if (!(nexusEvent as { success?: boolean }).success) toolFailedCount++
+    }
+    if (nexusEvent.type === 'result') {
+      resultSuccess = (nexusEvent as { success?: boolean }).success
+      resultMessage = (nexusEvent as { message?: string }).message
+    }
+    if (nexusEvent.type === 'error') {
+      errorEvent = nexusEvent as RuntimeErrorEvent
+    }
+  }
+
+  return { errorEvent, eventCount, toolCallCount, toolResultCount, toolFailedCount, toolDeniedCount, resultSuccess, resultMessage }
+}
+
+function buildUsageSummaryFromExecution(execution: {
+  eventCount: number
+  toolCallCount: number
+  toolResultCount: number
+  toolFailedCount: number
+  toolDeniedCount: number
+  resultSuccess?: boolean
+  resultMessage?: string
+  errorEvent: RuntimeErrorEvent | null
+}): RuntimeAgentStepUsageSummary {
+  return {
+    role: 'unknown',
+    eventCount: execution.eventCount,
+    toolCallCount: execution.toolCallCount,
+    toolResultCount: execution.toolResultCount,
+    toolFailedCount: execution.toolFailedCount,
+    toolDeniedCount: execution.toolDeniedCount,
+    resultSuccess: execution.resultSuccess,
+    resultMessage: execution.resultMessage,
+    errorCode: execution.errorEvent?.code,
+    errorMessage: execution.errorEvent?.message,
+  }
+}
+
+function buildAssistantTextForParsing(
+  textParts: string[],
+  resultMessage?: string,
+): string {
+  const streamedText = textParts.join('')
+  if (streamedText.trim().length > 0) return streamedText
+  return resultMessage ?? ''
+}
+
+function buildStructuredOutputDiagnostics(
+  err: unknown,
+  resultPayload: unknown,
+  assistantText: string,
+  outputSchema?: z.ZodTypeAny,
+  structuredOutputPayload?: unknown,
+): StructuredOutputDiagnostics {
+  const candidates = collectStructuredOutputCandidates(
+    resultPayload,
+    assistantText,
+    structuredOutputPayload,
+  )
+  const message = err instanceof Error ? err.message : String(err)
+  const providerErrorCandidate = candidates
+    .map(candidate => getProviderError(candidate.value))
+    .find((providerError): providerError is string => Boolean(providerError))
+  const schemaErrors = extractSchemaErrorSummaries(message)
+
+  return {
+    failureType: providerErrorCandidate
+      ? 'provider_error'
+      : candidates.length > 0
+        ? 'schema_mismatch'
+        : 'no_structured_json',
+    candidateCount: candidates.length,
+    candidateSources: candidates.map(candidate => candidate.source),
+    missingRequiredKeys: inferMissingRequiredKeys(candidates, outputSchema),
+    schemaErrors: schemaErrors.length > 0 ? schemaErrors : undefined,
+    assistantTextPreview: summarizeForDiagnostics(assistantText),
+    resultPayloadPreview: previewForDiagnostics(resultPayload),
+    structuredOutputPreview: previewForDiagnostics(structuredOutputPayload),
+  }
+}
+
+function buildUsageSummary(input: {
+  role: string
+  eventCount: number
+  toolCallCount: number
+  toolResultCount: number
+  toolFailedCount: number
+  toolDeniedCount: number
+  resultSuccess?: boolean
+  resultMessage?: string
+  errorEvent: RuntimeErrorEvent | null
+  lastToolName?: string
+  lastToolSuccess?: boolean
+  lastToolOutputPreview?: string
+  resultUsage?: unknown
+  modelUsage?: unknown
+  permissionDenials?: unknown
+}): RuntimeAgentStepUsageSummary {
+  return {
+    role: input.role,
+    eventCount: input.eventCount,
+    toolCallCount: input.toolCallCount,
+    toolResultCount: input.toolResultCount,
+    toolFailedCount: input.toolFailedCount,
+    toolDeniedCount: input.toolDeniedCount,
+    resultSuccess: input.resultSuccess,
+    resultMessage: input.resultMessage,
+    errorCode: input.errorEvent?.code,
+    errorMessage: input.errorEvent?.message,
+    lastToolName: input.lastToolName,
+    lastToolSuccess: input.lastToolSuccess,
+    lastToolOutputPreview: input.lastToolOutputPreview,
+    resultUsage: input.resultUsage,
+    modelUsage: input.modelUsage,
+    permissionDenials: input.permissionDenials,
+  }
+}
+
+function summarizeForDiagnostics(value: unknown): string {
+  const text = typeof value === 'string' ? value : JSON.stringify(value)
+  if (!text) return ''
+  return text.length > 240 ? `${text.slice(0, 237)}...` : text
+}
+
+function previewForDiagnostics(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined
+  return summarizeForDiagnostics(value)
+}
+
+function extractSchemaErrorSummaries(message: string): string[] {
+  const lines = message
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+  const summaries: string[] = []
+
+  for (const line of lines) {
+    if (
+      line.includes('Invalid input:') ||
+      line.includes('expected') ||
+      line.includes('Too small:') ||
+      line.includes('Unrecognized key')
+    ) {
+      summaries.push(line)
+    }
+    if (summaries.length >= 4) break
+  }
+
+  return summaries
+}
+
+function inferMissingRequiredKeys(
+  candidates: StructuredOutputCandidate[],
+  outputSchema?: z.ZodTypeAny,
+): string[] | undefined {
+  if (!outputSchema) return undefined
+  const requiredKeys = getRequiredZodObjectKeys(outputSchema)
+  if (requiredKeys.length === 0) return undefined
+  const missing = new Set<string>()
+
+  for (const candidate of candidates) {
+    if (!isRecord(candidate.value)) continue
+    for (const key of requiredKeys) {
+      if (!(key in candidate.value)) missing.add(key)
+    }
+  }
+
+  return missing.size > 0 ? [...missing] : undefined
 }
 
 function withRoleToolPolicy<T extends NexusRuntimeLike>(runtime: T, allowedTools: string[]): T {
@@ -206,6 +690,7 @@ export function parseStructuredAgentOutput(
   assistantText: string,
   outputSchema?: z.ZodTypeAny,
   structuredOutputPayload?: unknown,
+  inputDefaults?: unknown,
 ): unknown {
   const candidates = collectStructuredOutputCandidates(
     resultPayload,
@@ -231,6 +716,7 @@ export function parseStructuredAgentOutput(
       const normalized = normalizeRoleOutputCandidate(
         candidate.value,
         outputSchema,
+        inputDefaults,
       )
       if (normalized !== candidate.value) {
         const normalizedParsed = outputSchema.safeParse(normalized)
@@ -240,6 +726,13 @@ export function parseStructuredAgentOutput(
     }
 
     if (failures.length > 0) {
+      const textFallback = buildStructuredOutputFromText(
+        assistantText,
+        outputSchema,
+      )
+      if (textFallback !== undefined) {
+        return textFallback
+      }
       throw new Error(
         [
           'Agent step returned JSON, but it did not match the role schema.',
@@ -280,6 +773,7 @@ function buildStructuredOutputFromText(
 function normalizeRoleOutputCandidate(
   value: unknown,
   outputSchema: z.ZodTypeAny,
+  inputDefaults?: unknown,
 ): unknown {
   if (!isRecord(value)) return value
   if (outputSchema !== undefined && outputSchema !== null) {
@@ -289,7 +783,7 @@ function normalizeRoleOutputCandidate(
       schemaKeys.has('success') &&
       schemaKeys.has('result')
     if (isExecutorShape) {
-      return normalizeExecutorOutputCandidate(value)
+      return normalizeExecutorOutputCandidate(value, inputDefaults)
     }
     const isPlannerShape =
       schemaKeys.has('summary') &&
@@ -304,7 +798,23 @@ function normalizeRoleOutputCandidate(
 function normalizePlannerOutputCandidate(
   value: Record<string, unknown>,
 ): unknown {
-  if (!Array.isArray(value.tasks)) return value
+  if (!Array.isArray(value.tasks)) {
+    if (Object.keys(value).length === 0 || typeof value.goal === 'string') {
+      const summary = inferPlannerSummary(value) ?? 'Planner returned an empty plan; using conservative fallback.'
+      return {
+        ...value,
+        summary,
+        tasks: [
+          {
+            title: summary.slice(0, 80),
+            description: 'Conservative fallback task generated because planner output was empty.',
+            metadata: { generatedFallback: 'empty-planner-output' },
+          },
+        ],
+      }
+    }
+    return value
+  }
 
   return {
     ...value,
@@ -409,8 +919,18 @@ function cleanMarkdownInline(text: string): string {
 
 function normalizeExecutorOutputCandidate(
   value: Record<string, unknown>,
+  inputDefaults?: unknown,
 ): unknown {
-  const taskId = typeof value.taskId === 'string' ? value.taskId : undefined
+  const defaultTaskId = isRecord(inputDefaults) && typeof inputDefaults.taskId === 'string'
+    ? inputDefaults.taskId
+    : undefined
+  const taskId = typeof value.taskId === 'string'
+    ? value.taskId
+    : typeof value.id === 'string'
+      ? value.id
+      : typeof value.id === 'number'
+        ? String(value.id)
+        : defaultTaskId
   const result =
     typeof value.result === 'string'
       ? value.result
@@ -418,7 +938,13 @@ function normalizeExecutorOutputCandidate(
         ? value.output.message
         : typeof value.summary === 'string'
           ? value.summary
-          : undefined
+          : typeof value.message === 'string'
+            ? value.message
+            : typeof value.finalOutput === 'string'
+              ? value.finalOutput
+              : Array.isArray(value.changes)
+                ? `Completed with ${value.changes.length} reported change(s).`
+                : undefined
   if (!taskId || !result) return value
 
   let success = typeof value.success === 'boolean' ? value.success : undefined
@@ -430,10 +956,10 @@ function normalizeExecutorOutputCandidate(
       success = false
     }
   }
-  if (success === undefined) return value
+  if (success === undefined) success = true
 
   const metadata: Record<string, unknown> = {}
-  for (const key of ['sessionId', 'queueId', 'status', 'timestamp', 'executor', 'summary', 'role', 'output']) {
+  for (const key of ['sessionId', 'queueId', 'status', 'timestamp', 'executor', 'summary', 'role', 'output', 'message', 'finalOutput', 'changes']) {
     if (key in value) metadata[key] = value[key]
   }
 
@@ -441,6 +967,8 @@ function normalizeExecutorOutputCandidate(
     taskId,
     success,
     result,
+    ...(typeof value.needsReview === 'boolean' ? { needsReview: value.needsReview } : {}),
+    ...(Array.isArray(value.subTasks) ? { subTasks: value.subTasks } : {}),
     ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   }
 }
@@ -457,6 +985,23 @@ function getZodObjectKeys(schema: z.ZodTypeAny): Set<string> {
       ? definition.shape()
       : definition.shape ?? {}
   return new Set(Object.keys(shape))
+}
+
+function getRequiredZodObjectKeys(schema: z.ZodTypeAny): string[] {
+  const definition = schema._def as {
+    type?: string
+    typeName?: string
+    shape?: (() => Record<string, z.ZodTypeAny>) | Record<string, z.ZodTypeAny>
+  }
+  if (definition.typeName !== 'ZodObject' && definition.type !== 'object') return []
+  const shape =
+    typeof definition.shape === 'function'
+      ? definition.shape()
+      : definition.shape ?? {}
+
+  return Object.entries(shape)
+    .filter(([, value]) => !value.isOptional())
+    .map(([key]) => key)
 }
 
 function collectStructuredOutputCandidates(

@@ -238,8 +238,12 @@ export async function createNexusApp(
         // Allow unknown models to support custom models
       }
       const abortController = new AbortController()
+      const timeoutController = new AbortController()
       const timeout = setTimeout(
-        () => abortController.abort(),
+        () => {
+          timeoutController.abort()
+          abortController.abort()
+        },
         body.timeoutMs ?? executeTimeoutMs,
       )
       let session = await options.storage.getSession(sessionId, { includeEvents: false })
@@ -266,6 +270,7 @@ export async function createNexusApp(
           prompt: body.prompt,
           cwd,
           signal: abortController.signal,
+          timeoutSignal: timeoutController.signal,
           maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
           bashMaxBufferBytes,
           skipPermissionCheck: body.skipPermissionCheck,
@@ -729,6 +734,7 @@ export async function createNexusApp(
       metrics.recordStreamStart()
       const startedAtMs = metrics.now()
       const abortController = new AbortController()
+      const timeoutController = new AbortController()
       socket.once('close', () => abortController.abort())
 
       let success = false
@@ -785,7 +791,10 @@ export async function createNexusApp(
         // Allow unknown models to support custom models
       }
       const timeout = setTimeout(
-        () => abortController.abort(),
+        () => {
+          timeoutController.abort()
+          abortController.abort()
+        },
         body.timeoutMs ?? executeTimeoutMs,
       )
       let session = await options.storage.getSession(sessionId, { includeEvents: false })
@@ -811,6 +820,7 @@ export async function createNexusApp(
           prompt: body.prompt,
           cwd,
           signal: abortController.signal,
+          timeoutSignal: timeoutController.signal,
           maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
           bashMaxBufferBytes,
           skipPermissionCheck: body.skipPermissionCheck,

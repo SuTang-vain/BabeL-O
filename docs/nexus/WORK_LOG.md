@@ -2,6 +2,121 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.77 2026-05-24 Nexus Hooks 最小内核
+
+- **用户请求**: 根据 TODO 中的 Hooks 生命周期系统开始推进，实现能解决工具调用失败自动修复、权限前置审计、子 Agent 上下文注入和长任务结束清理的最小 hooks 内核。
+- **实现结果**:
+  - 新增 `src/runtime/hooks.ts`，以 Nexus-owned 方式实现内置 hooks 运行器，第一版支持 `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PostToolUseFailure`、`PermissionRequest`、`SubagentStart`、`SubagentStop`、`SessionEnd`。
+  - 内置 hooks 目前包含四类可落地行为：`RecoverInvalidToolInputHook`（为 schema 校验失败生成 retry hint）、`BashFailureSummaryHook`（汇总 Bash 失败摘要）、`PermissionExplanationHook`（为权限请求生成解释）、`SessionCleanupAuditHook`（记录 session 结束清理审计）。
+  - `NexusEventSchema` 新增 `hook_started`、`hook_completed`、`hook_failed` 三类事件，hook 执行过程可进入 session event 流并被 CLI / storage 观察。
+  - `LLMCodingRuntime` 已在 `PreToolUse`、`PermissionRequest`、`PostToolUse`、`PostToolUseFailure` 路径接入 hooks；`INVALID_TOOL_INPUT` 与 Bash 失败会把 hook retry hint 追加回模型可见的 tool result。
+  - `LocalCodingRuntime` 也在工具执行、权限请求和失败摘要路径接入 hooks，保证 embedded 本地路径和 LLM runtime 口径一致。
+  - `sessionLifecycle.closeNexusSession()` 在关闭 session 时触发 `SessionEnd` hooks，并把 hook 事件追加到 session events。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npx tsx --test --test-concurrency=1 test/hooks.test.ts` 成功通过，2/2 通过。
+  - `npx tsx --test --test-concurrency=1 test/runtime.test.ts --test-name-pattern 'local runtime emits hook events around failed tool execution'` 成功通过。
+
+## 0.76 2026-05-24 Recoverable Invalid Tool Input
+
+- **用户请求**: 查看最新 `Write` 工具调用错误，分析并修复 `INVALID_TOOL_INPUT: expected string, received undefined → at path`。
+- **日志核实**:
+  - 最新 `session_0f3f9a49-7558-4174-ac35-27c176bc0083` 中，模型发起 `Write` 调用时只传入 `content`，缺少必填 `path`。
+  - `Write` 工具 schema 正确要求 `{ path: string, content: string }`；问题在 `LLMCodingRuntime` 将 tool input schema 校验失败升级为全局 `INVALID_TOOL_INPUT` error 后直接终止，模型无法收到 tool result 并自行补齐参数重试。
+- **实现结果**:
+  - `LLMCodingRuntime` 中 provider 工具循环遇到 `tool.inputSchema.safeParse()` 失败时，不再产出全局 `error` 并结束整轮。
+  - 现在会产出 `tool_completed success=false`，output 包含 `code: INVALID_TOOL_INPUT`、可读 schema 错误、原始 input，并把同样信息作为 provider `tool_result isError=true` 回传模型。
+  - 这样模型可以继续下一轮，重新发起带完整参数的 `Write` / `Edit` / 其他工具调用，符合“工具调用失败后 Agent 自行决策继续”的目标。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts` 成功通过，26/26 通过。
+
+## 0.75 2026-05-24 Chat Recovery Context Boundary and Cancellation Semantics
+
+- **用户请求**: 查看最新 `bbl chat` 会话记录，修复用户 ESC/超时后 Agent 不回复当前追问、继续旧任务读文件，以及上下文长任务能力弱的问题。
+- **日志核实**:
+  - 最新 `session_0b39043f-04a3-49d2-b77e-5d84153d4de7` 中，用户追问 `？你回答我你现在在干什么？？？` 已写入 `last_user_input`。
+  - 该 session 之前存在大量 `/Users/tangyaoyue/DEV/BABEL/BabeL-O深入分析这个项目` 的工具调用、thinking 和 Read/Bash 历史；取消/超时后下一轮仍回放这些 live messages，导致模型继续旧的“读 runtimeAgentStep.ts / 跑测试”任务。
+  - ESC 取消路径被 runtime 统一标记为 `REQUEST_TIMEOUT`，造成 UI 同时显示 `Execution cancelled by user` 与 `REQUEST_TIMEOUT: Execution timed out while running Bash.`，语义混乱。
+- **实现结果**:
+  - **恢复边界**：`contextAssembler.selectRecentEvents()` 遇到 `REQUEST_CANCELLED`、`REQUEST_TIMEOUT`、`MAX_LOOPS_EXCEEDED`、`PROVIDER_ERROR`、`EMPTY_PROVIDER_RESPONSE` 或失败 result 后，若后续出现新的 `user_message`，会从该新用户消息处重新开始 recent context；旧长工具链只进入 session summary，不再作为可继续执行的 live messages 回放。
+  - **取消语义修复**：`RuntimeExecuteOptions` 新增 `timeoutSignal`。HTTP/WS timeout 由独立 `timeoutController` 标记，用户 ESC/连接关闭只 abort 主 signal；`LLMCodingRuntime` 与 `LocalCodingRuntime` 现在能区分 `REQUEST_CANCELLED` 与真正的 `REQUEST_TIMEOUT`。
+  - **Planner 自然语言 fallback 顺序修复**：structured output diagnostics 增强后，Planner 自然语言 numbered plan 会先走文本 fallback，再在确实无法恢复时抛 schema mismatch，避免兼容层被诊断候选提前截断。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/run-session-flow.test.ts` 成功通过，69/69 通过。
+
+## 0.74 2026-05-24 Agent Structured Output Failure Diagnostics
+
+- **用户请求**: 继续推进 P3 真实 provider 非 dry-run smoke 诊断，重点展开 structured output 失败细节和 AgentLoop 失败可观测性。
+- **实现结果**:
+  - **Structured output 诊断细化**：`RuntimeAgentStepError.summary` 新增 `structuredOutput` 诊断对象，区分 `no_structured_json`、`schema_mismatch`、`provider_error`，并记录候选来源、候选数量、缺失必填字段、schema 错误摘要、assistant/result/structuredOutput 预览。
+  - **Result message 解析补齐**：当 runtime 没有流式 assistant text、只通过 `result.message` 返回最终文本时，Agent step 现在会把该 message 纳入 structured output 候选解析，避免真实 provider/测试 runtime 的 JSON 被误判为无结构化输出。
+  - **CLI 失败摘要增强**：`task_session_event` 的 executor/critic 失败摘要优先展示 `structured=<type>`、`missing=<keys>`、`sources=<candidateSources>`，再展示原始 error、provider/tool 信息和最后工具输出，便于在 `bbl optimize` 真实 smoke 中直接定位是字段缺失、空响应还是 provider 错误。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/agent-loop.test.ts test/tui-renderer.test.ts test/runtime-llm.test.ts` 成功通过，53/53 通过。
+
+## 0.73 2026-05-24 Agent Failure Observability and Provider Smoke Diagnostics
+
+- **用户请求**: 继续推进 P3 真实 provider 非 dry-run smoke 诊断与 AgentLoop 失败可观测性。
+- **实现结果**:
+  - **Agent step 诊断对象**：`createRuntimeAgentStepRunner()` 新增 `RuntimeAgentStepError`，在 provider error、空响应、structured output parse 失败时携带 role、event/tool 计数、tool_denied/tool_failed 计数、result message、provider error code/message、最后一个 tool 名称与输出摘要。
+  - **AgentLoop 失败事件增强**：`executor_failed_error` 事件 payload 现在包含 `diagnostics`，CLI `renderEvents` 会优先展示 error/diagnostics 摘要，避免真实 smoke 只看到 `executor failed error 1/2/3`。
+  - **Planner 空 JSON 兜底**：Planner structured output 解析支持 `{}` / 空计划 fallback，生成保守单任务计划，避免 provider 返回空 JSON 时直接卡死在规划阶段。
+  - **Executor 输出归一化增强**：Executor/Optimizer structured output 归一化可从当前 task input 补齐 `taskId`，并接受 `id`、`message`、`finalOutput`、`summary`、`status` 等常见 provider 变体，降低“结构接近但字段缺失”的失败率。
+- **真实 provider smoke 诊断结果**:
+  - 复跑临时仓库 `/tmp/babel-o-smoke-diag2-29PsE3` 后，Planner 阶段通过并生成 4 个任务，证明 Planner 空 JSON fallback 有效。
+  - 复跑临时仓库 `/tmp/babel-o-smoke-diag3-ePVVB1` 后，主要失败类型收敛为两类：`Failed to parse optimizer structured output`（缺少必需字段，如 result/taskId）与 `Provider returned an empty assistant response with no tool calls`。
+  - 两次临时 Git 仓库均保持干净，Git rollback/worktree 保护链路未污染目标目录。
+  - 结论：当前 P3 非 dry-run smoke 的主要阻塞已经从 Git/rollback 链路转移到 provider/role structured-output 稳定性，下一步应做 role-level structured-output repair/retry 或按 `modelPreference.capability` 路由到更稳定的 role 模型。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/agent-loop.test.ts test/tui-renderer.test.ts` 成功通过，52/52 通过。
+
+## 0.72 2026-05-24 P3 Worktree / Git Hardening
+
+- **用户请求**: 继续推进 P3 Non-dry-run Provider Smoke 与 Worktree / Git Hardening 重写。
+- **实现结果**:
+  - **Worktree 提交加固**：`commitAndMergeWorktree()` 不再使用宽泛 `git add -A`，改为读取 `git status --porcelain=v1 -z --untracked-files=normal` 后通过显式 pathspec staging 本轮变更；stage 失败会抛出结构化错误，不再继续尝试 commit。
+  - **嵌套 worktree 合并修复保留**：即使父 worktree 没有未提交文件，也会继续检查 `parentHead..worktreeHead` commit 范围，确保子 Agent 已经提交到父 worktree 的变更仍能 cherry-pick 回主工作区。
+  - **非隔离 optimizer Git 回滚加固**：in-place rollback 从 `git reset --hard && git clean -fd` 改为 `git restore --staged --worktree .`，只回滚 tracked 文件，避免删除用户手动创建但未纳入任务的 untracked 文件。
+  - **非隔离 optimizer commit 加固**：in-place commit 不再使用 `git add .`，改为显式 pathspec staging 当前 porcelain 变更，并配置本地 agent author，避免误纳入路径解析以外的文件或因缺少全局 Git 身份失败。
+  - **MCP shutdown 稳定性修复**：`McpClient.shutdown()` 改为幂等并增加 1 秒超时兜底，避免同一 MCP server 暴露多个 tool 时共享 client 被并发 dispose，导致测试或运行时关闭流程挂起。
+- **测试覆盖**:
+  - `test/worktree.test.ts` 新增 pathspec staging + 新文件合并回归。
+  - `test/agent-loop.test.ts` 新增 optimizer rollback 保留 unrelated untracked 文件回归。
+  - 既有嵌套子 Agent worktree 合并、冲突文件诊断、worktree 生命周期测试全部继续通过。
+  - `test/mcp.test.ts test/permission-flow.test.ts` 组合运行验证 MCP shutdown 不再挂起。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/worktree.test.ts test/agent-loop.test.ts` 成功通过，18/18 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/mcp.test.ts test/permission-flow.test.ts` 成功通过，9/9 通过。
+- **真实 provider smoke**:
+  - 使用临时 Git 仓库 `/tmp/babel-o-smoke-WiPr4l` 执行 `npm run cli -- optimize --target /tmp/babel-o-smoke-WiPr4l --focus cleanup --enable-subagents --max-sub-agent-depth 1 --max-sub-tasks-per-task 2 --yes --cwd /tmp/babel-o-smoke-WiPr4l`。
+  - 结果：真实 provider 非 dry-run 流程成功进入 Planner、生成 3 个任务、执行多轮工具调用，并在 executor 失败时触发 tracked-only rollback；最终因多任务达到 retry/settled 状态失败，终态为 `Task queue settled but not all tasks completed successfully.`
+  - Git 安全验证：临时仓库保持干净，未生成额外 commit 或未跟踪残留，说明本轮 rollback/保护链路未污染目标目录。
+  - 后续需要继续诊断 executor 失败细节展示与真实 provider 任务粒度/structured output 稳定性，暂不将非 dry-run provider smoke 标记为完成。
+
+## 0.71 2026-05-24 P1 Safety Hardening Closure
+
+- **用户请求**: 根据 TODO 文档推进完成 P0/P1 安全收口。
+- **实现结果**:
+  - **Bash 自动审批白名单收紧**：`src/runtime/classifier.ts` 从单条宽松正则升级为轻量 shell 词法扫描 + 精确命令白名单。自动审批仅覆盖 `pwd`、受限 `ls`、受限 `cat`、`git status/diff/log`、`npm list`、`npx tsc --noEmit` 等明确只读/校验命令；`npm test`、宽松 `npx tsc .*`、`cat /dev/*`、管道、重定向、链式操作、命令替换、变量展开和未闭合引号均回落人工确认。
+  - **Optimizer safety 策略化**：`src/runtime/safetyCheck.ts` 新增 `OptimizerSafetyPolicy` 与 `defaultOptimizerSafetyPolicy`，把 package/lock/env/bin/tsconfig 保护和高危命令 deny 规则从函数体硬编码抽出为可注入策略；新增对 `pnpm-lock.yaml`、`yarn.lock`、`git reset --hard`、`git clean -fd` 的保护。
+  - **MCP inputSchema 运行时校验**：`src/mcp/McpToolAdapter.ts` 在调用远端 MCP tool 前，将远端 `inputSchema` 的常用 JSON Schema 子集转换为 Zod 校验器；校验失败返回 `MCP_INPUT_SCHEMA_VALIDATION_FAILED` 可恢复 tool result，不再把任意对象直接传给远端 server。
+- **测试覆盖**:
+  - `test/classifier.test.ts` 覆盖 Bash 白名单收紧、命令替换、管道/重定向、`cat /dev/*` 等绕过样例。
+  - `test/optimizer-safety.test.ts` 覆盖策略 override、lockfile、`git reset --hard` 与 `git clean -fd`。
+  - `test/mcp.test.ts` 覆盖 MCP 远端 `inputSchema` 缺失 required 字段时的可恢复失败。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/classifier.test.ts test/optimizer-safety.test.ts` 成功通过，7/7 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/mcp.test.ts` 成功通过，3/3 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/permission-flow.test.ts` 成功通过，6/6 通过。
+- **后续核对**:
+  - `test/mcp.test.ts test/permission-flow.test.ts` 在同一个 `tsx --test` 进程中组合运行时曾出现 Node test runner 子进程挂起；两者单独运行均通过。该问题更适合纳入测试并发化/子进程生命周期治理，而不作为本次安全实现阻塞。
+
 ## 0.70 2026-05-24 Recoverable Bash Non-Zero Exit
 
 - **用户请求**: 深度分析最新聊天会话中 Bash 工具失败后 Agent 停止继续决策的问题，要求 Planner / Executor / Critic AgentLoop 能在工具调用失败后自行继续。

@@ -154,3 +154,47 @@ test('commitAndMergeWorktree reports conflicting files on cherry-pick failure', 
   }
 })
 
+test('commitAndMergeWorktree stages explicit changed paths and merges new files', async () => {
+  const rootDir = resolve(process.cwd())
+  const babelODir = join(rootDir, '.babel-o')
+  if (!existsSync(babelODir)) {
+    mkdirSync(babelODir)
+  }
+
+  const testRepoDir = join(babelODir, `test-repo-pathspec-${Date.now()}`)
+  mkdirSync(testRepoDir)
+
+  try {
+    await runCommand(testRepoDir, 'git', ['init'])
+    await runCommand(testRepoDir, 'git', ['config', 'user.name', 'Test User'])
+    await runCommand(testRepoDir, 'git', ['config', 'user.email', 'test@example.com'])
+
+    const trackedFile = join(testRepoDir, 'tracked.txt')
+    writeFileSync(trackedFile, 'before', 'utf8')
+    await runCommand(testRepoDir, 'git', ['add', '.'])
+    await runCommand(testRepoDir, 'git', ['commit', '-m', 'initial commit'])
+
+    const taskId = 'test-worktree-pathspec-task'
+    const worktreePath = await createWorktree(testRepoDir, taskId)
+    writeFileSync(join(worktreePath, 'tracked.txt'), 'after', 'utf8')
+    writeFileSync(join(worktreePath, 'new-file.txt'), 'new content', 'utf8')
+
+    const commitHash = await commitAndMergeWorktree(
+      testRepoDir,
+      worktreePath,
+      taskId,
+      'Pathspec merge',
+    )
+
+    assert.ok(commitHash)
+    assert.equal(readFileSync(join(testRepoDir, 'tracked.txt'), 'utf8'), 'after')
+    assert.equal(readFileSync(join(testRepoDir, 'new-file.txt'), 'utf8'), 'new content')
+
+    await removeWorktree(testRepoDir, worktreePath, taskId)
+    assert.equal(existsSync(worktreePath), false)
+  } finally {
+    if (existsSync(testRepoDir)) {
+      rmSync(testRepoDir, { recursive: true, force: true })
+    }
+  }
+})

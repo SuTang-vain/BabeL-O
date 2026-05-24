@@ -107,6 +107,12 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
 }
 
 export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
+  const recoveryEvents = selectRecoveryBoundaryEvents(events)
+  if (recoveryEvents.length > 0) {
+    if (recoveryEvents.length <= budget.recentEventLimit) return recoveryEvents
+    return trimEventsToRecentUserBoundary(recoveryEvents, budget.recentEventLimit)
+  }
+
   if (events.length <= budget.recentEventLimit) return [...events]
 
   const selectedByTurn = selectRecentTurnEvents(events, budget.recentTurnLimit)
@@ -115,6 +121,37 @@ export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget):
   }
 
   return trimEventsToRecentUserBoundary(events, budget.recentEventLimit)
+}
+
+function selectRecoveryBoundaryEvents(events: NexusEvent[]): NexusEvent[] {
+  let lastTerminalIndex = -1
+  for (let index = 0; index < events.length; index += 1) {
+    if (isConversationBoundaryEvent(events[index]!)) {
+      lastTerminalIndex = index
+    }
+  }
+  if (lastTerminalIndex === -1) return []
+
+  const nextUserIndex = events.findIndex((event, index) =>
+    index > lastTerminalIndex && event.type === 'user_message'
+  )
+  if (nextUserIndex === -1) return []
+
+  return events.slice(nextUserIndex)
+}
+
+function isConversationBoundaryEvent(event: NexusEvent): boolean {
+  if (event.type === 'error') {
+    return [
+      'REQUEST_TIMEOUT',
+      'REQUEST_CANCELLED',
+      'MAX_LOOPS_EXCEEDED',
+      'PROVIDER_ERROR',
+      'EMPTY_PROVIDER_RESPONSE',
+    ].includes(event.code)
+  }
+  if (event.type !== 'result') return false
+  return event.success === false
 }
 
 function trimEventsToRecentUserBoundary(events: NexusEvent[], limit: number): NexusEvent[] {
