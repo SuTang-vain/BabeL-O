@@ -2,6 +2,22 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.70 2026-05-24 Recoverable Bash Non-Zero Exit
+
+- **用户请求**: 深度分析最新聊天会话中 Bash 工具失败后 Agent 停止继续决策的问题，要求 Planner / Executor / Critic AgentLoop 能在工具调用失败后自行继续。
+- **问题核实**:
+  - 真实会话中的失败命令为 `cd /Users/tangyaoyue/DEV/BABEL/BabeL-X && git remote -v && git log --oneline -20`。
+  - 外部直接原因是 `/Users/tangyaoyue/DEV/BABEL/BabeL-X` 当前不是 Git 仓库，`git` 返回非 0 退出码并输出 `fatal: not a git repository`。
+  - 内部问题是 Bash 将“命令成功启动但业务退出码非 0”的情况抛成全局 `TOOL_ERROR`，导致 provider 收不到 `tool_result`，模型没有机会基于 stderr/exitCode 决定下一步，例如改查父目录、换目标路径或向用户说明。
+- **实现结果**:
+  - `src/tools/builtin/bash.ts` 将 Bash 非零退出码区分为可恢复失败：返回 `tool_completed success=false`，并保留结构化 `stdout`、`stderr`、`exitCode`、`signal` 和 `message`。
+  - Docker Bash 与本地 Bash 使用相同口径；失败前若已探测到最新 CWD，仍会更新 session CWD。
+  - 超时、maxBuffer、spawn/Docker 环境异常等运行时失败仍继续抛出 `TOOL_ERROR` 或超时错误，避免把基础设施故障伪装成普通命令失败。
+  - LLM runtime 会把该失败作为 `tool_result is_error=true` 回传给模型，允许后续 provider 轮次继续生成工具调用或总结。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts test/runtime-llm.test.ts` 成功通过，52/52 通过。
+
 ## 0.69 2026-05-24 Docker Sandbox Execution Environment
 
 - **用户请求**: 实现 `executionEnvironment: 'docker'` 沙箱执行环境（P2 优先级），包括 Docker 容器生命周期管理、Workspace 目录挂载、网络/资源隔离以及 Session 清理。

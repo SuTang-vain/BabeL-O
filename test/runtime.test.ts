@@ -649,8 +649,8 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
   }
 })
 
-test('tool errors preserve structured stdout and stderr details', async () => {
-  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-tool-error-details`)
+test('bash non-zero exit returns a recoverable failed tool result', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-nonzero`)
   await mkdir(cwd, { recursive: true })
   const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({
@@ -670,12 +670,17 @@ test('tool errors preserve structured stdout and stderr details', async () => {
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
-    const errorEvent = body.events.find((event: { type: string }) => event.type === 'error')
-    assert.ok(errorEvent)
-    assert.equal(errorEvent.code, 'TOOL_ERROR')
-    assert.match(errorEvent.details.stdout, /visible-out/)
-    assert.match(errorEvent.details.stderr, /visible-err/)
-    assert.equal(errorEvent.details.code, 7)
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Bash',
+    )
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.success, false)
+    assert.match(toolCompleted.output.stdout, /visible-out/)
+    assert.match(toolCompleted.output.stderr, /visible-err/)
+    assert.equal(toolCompleted.output.exitCode, 7)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
   } finally {
     await app.close()
   }

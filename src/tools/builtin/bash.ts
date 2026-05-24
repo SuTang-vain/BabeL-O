@@ -21,6 +21,14 @@ type StateProbe = {
   signature: string
 }
 
+type FailedCommandResult = {
+  stdout: string
+  stderr: string
+  exitCode?: number
+  signal?: string
+  message: string
+}
+
 function createStateProbe(): StateProbe {
   const nonce = randomBytes(16).toString('hex')
   const signature = createHmac('sha256', sessionProbeSecret)
@@ -59,6 +67,52 @@ function parseStateFromStdout(
     return { cleanStdout, detectedCwd: lastCwd }
   }
   return { cleanStdout: stdout, detectedCwd: null }
+}
+
+function isRecoverableCommandFailure(err: { code?: unknown; signal?: unknown }): boolean {
+  return typeof err.code === 'number' && (err.signal === undefined || err.signal === null)
+}
+
+function toFailedCommandResult(
+  err: {
+    message?: string
+    code?: unknown
+    signal?: unknown
+    stdout?: unknown
+    stderr?: unknown
+  },
+  probe: StateProbe,
+  wrappedCommand: string,
+  originalCommand: string,
+): { result: FailedCommandResult; detectedCwd: string | null } {
+  const stdoutStr = typeof err.stdout === 'string' ? err.stdout : ''
+  const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
+  const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
+  let cleanedMessage = err.message || 'Command failed'
+  cleanedMessage = cleanedMessage.replace(wrappedCommand, originalCommand)
+  cleanedMessage = cleanedMessage.replaceAll(probe.marker, '').trim()
+
+  return {
+    result: {
+      stdout: cleanStdout,
+      stderr: stderrStr,
+      exitCode: typeof err.code === 'number' ? err.code : undefined,
+      signal: typeof err.signal === 'string' ? err.signal : undefined,
+      message: cleanedMessage,
+    },
+    detectedCwd,
+  }
+}
+
+function updateSessionCwdFromFailure(
+  sessionId: string,
+  detectedCwd: string | null,
+): void {
+  if (!detectedCwd) return
+  sessionCwdMap.set(sessionId, {
+    cwd: detectedCwd,
+    lastActiveAt: Date.now(),
+  })
 }
 
 export async function clearBashSessionState(sessionId?: string): Promise<void> {
@@ -236,27 +290,25 @@ exit $_EXIT_CODE`
           output: { stdout: cleanStdout, stderr },
         }
       } catch (err: any) {
-        const stdoutStr = typeof err.stdout === 'string' ? err.stdout : ''
-        const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
-        const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
-        if (detectedCwd) {
-          sessionCwdMap.set(context.sessionId, {
-            cwd: detectedCwd,
-            lastActiveAt: Date.now(),
-          })
+        const { result, detectedCwd } = toFailedCommandResult(
+          err,
+          probe,
+          wrappedCommand,
+          input.command,
+        )
+        updateSessionCwdFromFailure(context.sessionId, detectedCwd)
+        if (isRecoverableCommandFailure(err)) {
+          return {
+            success: false,
+            output: result,
+          }
         }
 
-        let cleanedMessage = err.message || 'Command failed'
-        if (typeof wrappedCommand === 'string' && typeof input.command === 'string') {
-          cleanedMessage = cleanedMessage.replace(wrappedCommand, input.command)
-        }
-        cleanedMessage = cleanedMessage.replaceAll(probe.marker, '')
-
-        const newErr = new Error(cleanedMessage) as any
+        const newErr = new Error(result.message) as any
         newErr.code = err.code
         newErr.signal = err.signal
-        newErr.stdout = cleanStdout
-        newErr.stderr = stderrStr
+        newErr.stdout = result.stdout
+        newErr.stderr = result.stderr
         throw newErr
       }
     }
@@ -287,28 +339,25 @@ exit $_EXIT_CODE`
       }
     } catch (err: any) {
       // Even if the command fails, salvage any CWD change that occurred prior to the failure
-      const stdoutStr = typeof err.stdout === 'string' ? err.stdout : ''
-      const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
-      const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
-      if (detectedCwd) {
-        sessionCwdMap.set(context.sessionId, {
-          cwd: detectedCwd,
-          lastActiveAt: Date.now(),
-        })
+      const { result, detectedCwd } = toFailedCommandResult(
+        err,
+        probe,
+        wrappedCommand,
+        input.command,
+      )
+      updateSessionCwdFromFailure(context.sessionId, detectedCwd)
+      if (isRecoverableCommandFailure(err)) {
+        return {
+          success: false,
+          output: result,
+        }
       }
 
-      // Re-write the error message to mask the wrapped command and internal probe marker
-      let cleanedMessage = err.message || 'Command failed'
-      if (typeof wrappedCommand === 'string' && typeof input.command === 'string') {
-        cleanedMessage = cleanedMessage.replace(wrappedCommand, input.command)
-      }
-      cleanedMessage = cleanedMessage.replaceAll(probe.marker, '')
-
-      const newErr = new Error(cleanedMessage) as any
+      const newErr = new Error(result.message) as any
       newErr.code = err.code
       newErr.signal = err.signal
-      newErr.stdout = cleanStdout
-      newErr.stderr = stderrStr
+      newErr.stdout = result.stdout
+      newErr.stderr = result.stderr
       throw newErr
     }
   },

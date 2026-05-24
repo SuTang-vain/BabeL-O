@@ -63,6 +63,8 @@ Legacy complexity is not imported by default.
 
 ## 最近完成
 
+- 完成 P0 Recoverable Bash Non-Zero Exit (v0.70)：根据真实会话中 `cd /Users/tangyaoyue/DEV/BABEL/BabeL-X && git remote -v && git log --oneline -20` 失败后 Agent 停止继续的问题核实，根因是 Bash 将“命令正常启动但退出码非 0”升级为全局 `TOOL_ERROR`，provider 收不到工具失败结果。现已将本地/Docker Bash 非零退出改为 `tool_completed success=false`，保留 stdout/stderr/exitCode/message，并映射为 `tool_result is_error=true` 回传模型；超时、maxBuffer、spawn/Docker 环境异常仍按运行时错误处理。已验证 `npm run typecheck` 与 Runtime/LLM 目标测试 52/52 通过。
+
 - 删除过期审计快照 `docs/AUDIT_2026-05-24.md`，并将仍成立的结论同步进 TODO 体系：Bash 自动审批白名单硬化、MCP inputSchema 运行时校验、embedded/Nexus 架构边界、非隔离 Git 操作风险、storageBridge 故障注入、AgentLoop 成本 benchmark、测试并发化，以及 CI/lint/build/coverage 工程化事项。已确认 audit 中“Allow-all policy 测试失败”结论过期，当前相关测试通过。
 
 - 完成 P3 Git Cherry-pick Conflict Diagnostics (v0.66)：实现 Worktree 合并冲突时的结构化错误诊断。当 cherry-pick 失败时，通过 `git diff --name-only --diff-filter=U` 自动提取冲突文件列表，清除残留的 cherry-pick 状态，并将详细的冲突文件信息写入错误事件，供 Critic/Planner/用户查看。在单元测试中制造冲突，断言检验了冲突文件提取的正确性，并将 `optimize-command` 测试集正式接入整体运行脚本。已验证类型检查与全部 155 个测试全绿通过。

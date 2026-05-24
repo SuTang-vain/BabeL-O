@@ -44,6 +44,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 给 `/v1/stream` 加 cancellation / close handling。
 - [x] 增加标准 error code：`INVALID_REQUEST`、`SESSION_NOT_FOUND`、`TOOL_DENIED`、`REQUEST_TIMEOUT`、`PROVIDER_ERROR`。
 - [x] 工具异常事件保留结构化 `details`，包含 stdout/stderr/code/signal，并对 stdout/stderr 分别按工具输出预算截断。
+- [x] Bash 非零退出码作为可恢复失败结果回传模型：`tool_completed success=false` 保留 stdout/stderr/exitCode/message，并在 LLM 请求中映射为 `tool_result is_error=true`，避免 AgentLoop 因可预期命令失败直接中断。
 - [x] 增加 `thinking_delta` event。
 - [x] 增加 `GET /v1/schema/events`。
 - [x] 增加 `GET /v1/tools/audit`。

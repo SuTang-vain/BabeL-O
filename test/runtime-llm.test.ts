@@ -619,6 +619,64 @@ describe('LLMCodingRuntime', () => {
     } catch {}
   })
 
+  test('returns Bash non-zero exits to the model instead of aborting the turn', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-bash-nonzero-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-bash-fail","name":"Bash","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"cd /definitely/missing && git remote -v\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"The command failed because the directory does not exist, so I will inspect another path."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-bash-nonzero-recoverable',
+        prompt: 'inspect git remotes',
+        cwd,
+        skipPermissionCheck: true,
+      })
+    )
+
+    const toolCompleted = events.find(e => e.type === 'tool_completed') as any
+    assert.equal(toolCompleted.name, 'Bash')
+    assert.equal(toolCompleted.success, false)
+    assert.match(String(toolCompleted.output.stderr), /no such file or directory|not a directory|can't cd/i)
+    assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'TOOL_ERROR'))
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /command failed/)
+
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    const toolResultTurn = secondBody.messages.find((message: any) =>
+      Array.isArray(message.content) &&
+      message.content.some((block: any) => block.type === 'tool_result'),
+    )
+    const toolResult = toolResultTurn.content.find((block: any) => block.type === 'tool_result')
+    assert.equal(toolResult.is_error, true)
+    assert.match(toolResult.content, /exitCode|stderr/)
+
+    try {
+      fs.rmdirSync(cwd)
+    } catch {}
+  })
+
   test('blocks disallowed tools and yields tool_denied event', async () => {
     // Stream 1: Request tool execution (bash tool which is not in our allowlist)
     fetchStreamResponses.push(
