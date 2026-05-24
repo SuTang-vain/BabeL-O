@@ -6,9 +6,14 @@ import assert from 'node:assert/strict'
 import {
   allocateBudget,
   assembleContext,
+  type ContextBudget,
   selectRecentEvents,
 } from '../src/runtime/contextAssembler.js'
 import { snipEvent } from '../src/runtime/compactors/snipCompactor.js'
+import {
+  getAutoCompactDecision,
+  countConsecutiveAutoCompactFailures,
+} from '../src/runtime/compact.js'
 import {
   buildSystemPrompt,
   extractAbsolutePaths,
@@ -376,6 +381,99 @@ test('assembleContext omits session summary when all events fit recent context',
   assert.doesNotMatch(context.systemPrompt, /Session Summary/)
 })
 
+test('auto compact decision respects thresholds and fuse state', () => {
+  const budget: ContextBudget = {
+    maxTokens: 1000,
+    maxChars: 4000,
+    layerBudgets: { system: 100, memory: 100, summary: 100, recent: 700 },
+    snipToolOutputChars: 100,
+    recentEventLimit: 10,
+    recentTurnLimit: 2,
+  }
+  assert.equal(
+    getAutoCompactDecision({
+      events: [],
+      tokenEstimate: 750,
+      maxTokens: budget.maxTokens,
+      enabled: true,
+      thresholdPercent: 80,
+      failureLimit: 2,
+    }).shouldCompact,
+    false,
+  )
+  assert.equal(
+    getAutoCompactDecision({
+      events: [],
+      tokenEstimate: 850,
+      maxTokens: budget.maxTokens,
+      enabled: true,
+      thresholdPercent: 80,
+      failureLimit: 2,
+    }).shouldCompact,
+    true,
+  )
+  assert.equal(
+    getAutoCompactDecision({
+      events: [
+        {
+          type: 'compact_failure',
+          schemaVersion,
+          sessionId: 'session-context',
+          timestamp: '2026-05-23T00:00:00.000Z',
+          trigger: 'auto',
+          failureCount: 1,
+          maxFailures: 2,
+          message: 'first',
+        },
+        {
+          type: 'compact_failure',
+          schemaVersion,
+          sessionId: 'session-context',
+          timestamp: '2026-05-23T00:00:01.000Z',
+          trigger: 'auto',
+          failureCount: 2,
+          maxFailures: 2,
+          message: 'second',
+        },
+      ],
+      tokenEstimate: 900,
+      maxTokens: budget.maxTokens,
+      enabled: true,
+      thresholdPercent: 80,
+      failureLimit: 2,
+    }).fuseOpen,
+    true,
+  )
+  assert.equal(
+    countConsecutiveAutoCompactFailures([
+      {
+        type: 'compact_failure',
+        schemaVersion,
+        sessionId: 'session-context',
+        timestamp: '2026-05-23T00:00:00.000Z',
+        trigger: 'auto',
+        failureCount: 1,
+        maxFailures: 2,
+        message: 'first',
+      },
+      {
+        type: 'compact_boundary',
+        schemaVersion,
+        sessionId: 'session-context',
+        timestamp: '2026-05-23T00:00:01.000Z',
+        trigger: 'auto',
+        summary: 'ok',
+        beforeEventCount: 1,
+        afterEventCount: 1,
+        summaryChars: 2,
+        snippedToolResults: 0,
+        budget,
+      } as any,
+    ]),
+    0,
+  )
+})
+
 test('assembleContext respects compact boundaries without double counting old history', async () => {
   const cwd = join(tmpdir(), `babel-o-compact-${Date.now()}`)
   const events: NexusEvent[] = [
@@ -451,6 +549,90 @@ test('assembleContext respects compact boundaries without double counting old hi
   assert.doesNotMatch(context.sessionSummary, /legacy output.*legacy output/)
   assert.match(JSON.stringify(context.messages), /latest question/)
   assert.doesNotMatch(JSON.stringify(context.messages), /old goal/)
+})
+
+test('manual compact smoke retains latest answerable context around cancellation and failures', async () => {
+  const cwd = join(tmpdir(), `babel-o-compact-smoke-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'analyze the project',
+    },
+    {
+      type: 'thinking_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:01.000Z',
+      text: 'Thinking through a large task.',
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:02.000Z',
+      toolUseId: 'tool-big',
+      name: 'Read',
+      success: true,
+      output: 'x'.repeat(5000),
+    },
+    {
+      type: 'error',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:03.000Z',
+      code: 'PROVIDER_ERROR',
+      message: 'provider failed',
+    },
+    {
+      type: 'error',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:04.000Z',
+      code: 'REQUEST_CANCELLED',
+      message: 'Execution cancelled by user.',
+    },
+    {
+      type: 'compact_boundary',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:05.000Z',
+      trigger: 'manual',
+      summary: 'Earlier analysis and tool output summarized.',
+      beforeEventCount: 5,
+      afterEventCount: 1,
+      summaryChars: 44,
+      snippedToolResults: 1,
+      modelId: 'local/coding-runtime',
+      budget: allocateBudget('local/coding-runtime'),
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:06.000Z',
+      text: 'what should I do next?',
+    },
+  ]
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: 'what should I do next?',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.match(context.sessionSummary, /Earlier analysis/)
+  assert.match(JSON.stringify(context.messages), /what should I do next\?/)
+  assert.doesNotMatch(JSON.stringify(context.messages), /provider failed/)
+  assert.doesNotMatch(JSON.stringify(context.messages), /Thinking through a large task/)
 })
 
 test('assembleContext reduces long-session context by more than 50 percent while preserving recent turns', async () => {

@@ -79,10 +79,10 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 定义 compact event schema：记录 `beforeEventCount`、`afterEventCount`、`summaryChars`、`snippedToolResults`、`trigger=manual|auto|reactive`、`modelId`、`budget`。
 - [x] `contextAssembler` 支持读取 compact boundary：优先使用最新 compact summary，再叠加 compact 后的 recent events，避免旧 summary 与旧 omitted events 双重计入。
 - [x] 增加 context warning 事件：当估算 token/char 用量接近模型窗口时，runtime 产生 `context_warning`，CLI 展示“剩余上下文/建议 compact”。
-- [ ] 增加 auto-compact threshold：按 model context window 预留输出空间和安全 buffer，超过阈值时自动 compact；默认先关闭或 opt-in，避免早期误压缩。
-- [ ] 增加 compact failure 熔断：连续 compact 失败达到阈值后停止自动重试，产出可见 warning，避免长会话每轮重复消耗 provider 调用。
+- [x] 增加 auto-compact threshold：按 model context window 预留输出空间和安全 buffer，超过阈值时自动 compact；默认先关闭或 opt-in，避免早期误压缩。
+- [x] 增加 compact failure 熔断：连续 compact 失败达到阈值后停止自动重试，产出可见 warning，避免长会话每轮重复消耗 provider 调用。
 - [x] 增加 manual compact smoke：构造包含大量 tool output、thinking_delta、provider error、cancel boundary 的 session，验证 compact 后仍能回答最新用户问题。
-- [ ] 增加 auto-compact benchmark：验证长会话输入规模下降、最近 2-4 个用户轮次完整保留、失败/取消后的 recovery boundary 不被 compact 破坏。
+- [ ] 增加 auto-compact benchmark：验证长会话输入规模下降、最近 2-4 个用户轮次完整保留、失败/取消后的 recovery boundary 不被 compact 破坏。当前已补充手动 smoke 与阈值/熔断单测，benchmark 仍待系统化补齐。
 - [ ] 暂不迁移 BabeL-X SessionMemory 后台子 Agent；待 hooks、子 Agent transcript 和成本控制稳定后再评估。
 
 ## P1 Nexus Hooks 最小内核

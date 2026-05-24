@@ -2,6 +2,24 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.79 2026-05-24 Auto Compact Threshold and Fuse
+
+- **用户请求**: 继续推进 P1 Context Compact UX 中未完成的 auto-compact threshold、compact failure 熔断、manual compact smoke、auto-compact benchmark 和 SessionMemory 迁移评估项。
+- **实现结果**:
+  - `src/runtime/compact.ts` 新增 auto compact 判定 helper：默认通过 `BABEL_O_AUTO_COMPACT=1|true|yes|on` opt-in 开启，阈值默认 90%，可用 `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT` 调整，并限制在 50%-99% 范围内。
+  - `LLMCodingRuntime` 在 provider 调用前基于已组装上下文估算 token 用量；超过 warning 阈值会继续产出 `context_warning`，超过 auto threshold 且 opt-in 开启时会生成 `trigger=auto` 的 compact boundary，并重新组装当轮上下文。
+  - `compactSession()` 新增 `persist=false` 模式，供 runtime 自动压缩路径只产出事件、由外层既有 storage event 管线统一持久化，避免重复写入。
+  - `NexusEventSchema` 新增 `compact_failure`，记录 `trigger`、`modelId`、`failureCount`、`maxFailures`、`message`。
+  - 自动压缩连续失败达到 `BABEL_O_AUTO_COMPACT_FAILURE_LIMIT`（默认 2）后打开熔断：runtime 只产出可见 warning，不再每轮重复尝试 auto compact。
+  - CLI renderer 新增 `compact_failure` 展示，便于在长会话中直接看到自动压缩失败与熔断原因。
+  - 增加手动 compact smoke，覆盖大量 tool output、thinking_delta、provider error、cancel boundary 后，compact 后仍优先回答最新用户问题。
+- **仍保留为后续项**:
+  - auto-compact benchmark 目前只有阈值/熔断单测与手动 smoke，尚未形成独立 benchmark 脚本或持续性能指标。
+  - 暂不迁移 BabeL-X SessionMemory 后台子 Agent，继续等 hooks、子 Agent transcript 和成本控制稳定。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/tui-renderer.test.ts` 成功通过，28/28 通过。
+
 ## 0.78 2026-05-24 Context Compact UX
 
 - **用户请求**: 推进 TODO 中的 P1 Context Compact UX，把 context budget、snip compactor、session summary 和恢复边界变成用户可感知、可控制、可调试的长会话能力。

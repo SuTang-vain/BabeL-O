@@ -332,6 +332,13 @@ function renderLiveEvent(event: NexusEvent): void {
         ),
       )
       break
+    case 'compact_failure':
+      console.log(
+        chalk.yellow(
+          `context compact failed (${event.failureCount}/${event.maxFailures}): ${event.message}`,
+        ),
+      )
+      break
     case 'result':
       console.log(event.success ? chalk.green('✓ done') : chalk.red('✗ failed'))
       console.log('')
@@ -485,6 +492,12 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       case 'context_warning':
         outputText += chalk.yellow(
           `context warning: ${ev.percentUsed}% of window used (${ev.tokenEstimate}/${ev.maxTokens} tokens). consider /compact.\n`,
+        )
+        break
+
+      case 'compact_failure':
+        outputText += chalk.yellow(
+          `context compact failed (${ev.failureCount}/${ev.maxFailures}): ${ev.message}\n`,
         )
         break
 

@@ -25,6 +25,11 @@ import type {
 import { ConfigManager } from '../shared/config.js'
 import { assembleContext } from './contextAssembler.js'
 import {
+  buildCompactFailureEvent,
+  compactSession,
+  getAutoCompactDecision,
+} from './compact.js'
+import {
   executeRuntimeHooks,
   firstHookDenyReason,
   firstHookPermissionDecision,
@@ -107,19 +112,27 @@ export class LLMCodingRuntime implements NexusRuntime {
       const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
       const adapter = getAdapter(settings.providerId)
 
-      const assembledContext = await assembleContext({
+      let assembledContext = await assembleContext({
         runtimeOptions: options,
         events: previousEvents,
         modelId: cleanedModelId,
         buildSystemPrompt,
         mapEventsToMessages,
       })
-      const messages = assembledContext.messages
-      const contextEstimateTokens = Math.ceil(
+      let messages = assembledContext.messages
+      let contextEstimateTokens = Math.ceil(
         (assembledContext.systemPrompt.length + estimateMessagesChars(messages)) / 4,
       )
       const contextWarningThreshold = 0.85
-      if (contextEstimateTokens > Math.floor(assembledContext.budget.maxTokens * contextWarningThreshold)) {
+      const autoCompactDecision = getAutoCompactDecision({
+        events: previousEvents,
+        tokenEstimate: contextEstimateTokens,
+        maxTokens: assembledContext.budget.maxTokens,
+      })
+      if (
+        contextEstimateTokens > Math.floor(assembledContext.budget.maxTokens * contextWarningThreshold) ||
+        autoCompactDecision.fuseOpen
+      ) {
         yield {
           type: 'context_warning',
           ...eventBase(options.sessionId),
@@ -127,8 +140,47 @@ export class LLMCodingRuntime implements NexusRuntime {
           tokenEstimate: contextEstimateTokens,
           maxTokens: assembledContext.budget.maxTokens,
           percentUsed: Math.round((contextEstimateTokens / assembledContext.budget.maxTokens) * 100),
-          thresholdPercent: Math.round(contextWarningThreshold * 100),
-          message: `Context is approaching the model window. Consider running /compact soon.`,
+          thresholdPercent: autoCompactDecision.enabled
+            ? autoCompactDecision.thresholdPercent
+            : Math.round(contextWarningThreshold * 100),
+          message: autoCompactDecision.fuseOpen
+            ? `Auto compact is paused after ${autoCompactDecision.failureCount} consecutive failures. Run /compact manually or inspect compact_failure events.`
+            : autoCompactDecision.enabled
+              ? `Context is approaching the auto-compact threshold.`
+              : `Context is approaching the model window. Consider running /compact soon.`,
+        }
+      }
+      if (autoCompactDecision.shouldCompact) {
+        try {
+          const compactResult = await compactSession({
+            storage: this.storage,
+            sessionId: options.sessionId,
+            modelId: cleanedModelId,
+            trigger: 'auto',
+            persist: false,
+          })
+          yield compactResult.event
+          previousEvents = [...previousEvents, compactResult.event]
+          assembledContext = await assembleContext({
+            runtimeOptions: options,
+            events: previousEvents,
+            modelId: cleanedModelId,
+            buildSystemPrompt,
+            mapEventsToMessages,
+          })
+          messages = assembledContext.messages
+          contextEstimateTokens = Math.ceil(
+            (assembledContext.systemPrompt.length + estimateMessagesChars(messages)) / 4,
+          )
+        } catch (error) {
+          yield buildCompactFailureEvent({
+            sessionId: options.sessionId,
+            trigger: 'auto',
+            modelId: cleanedModelId,
+            failureCount: autoCompactDecision.failureCount + 1,
+            maxFailures: autoCompactDecision.failureLimit,
+            message: error instanceof Error ? error.message : String(error),
+          })
         }
       }
 

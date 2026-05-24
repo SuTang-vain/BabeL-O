@@ -97,7 +97,7 @@ export function formatPermissionDialog(
 
   choices.forEach((choice, index) => {
     const selected = index === activeIndex
-    const marker = selected ? chalk.cyan('➜') : ' '
+    const marker = selected ? chalk.cyan('~') : ' '
     const label = selected ? chalk.cyan(choice.label) : chalk.dim(choice.label)
     lines.push(`│ ${marker} [${index + 1}] ${label}`)
   })
