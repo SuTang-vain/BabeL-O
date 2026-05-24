@@ -10,12 +10,18 @@ import { SqliteStorage } from '../storage/SqliteStorage.js'
 import { createDefaultToolRegistry } from '../tools/registry.js'
 import { ConfigManager } from '../shared/config.js'
 import { createMcpToolRegistry } from '../mcp/McpToolAdapter.js'
+import {
+  configureStorageBridgeWal,
+  flushStorageBridge,
+  type StorageBridgeWalOptions,
+} from './storageBridge.js'
 
 export type CreateDefaultNexusRuntimeOptions = {
   storagePath?: string
   allowedTools?: string[]
   cwd?: string
   enableMcp?: boolean
+  storageWal?: StorageBridgeWalOptions
 }
 
 export async function createDefaultNexusRuntime(
@@ -31,8 +37,14 @@ export async function createDefaultNexusRuntime(
   const storage = options.storagePath
     ? new SqliteStorage(options.storagePath)
     : new MemoryStorage()
+  if (options.storagePath) {
+    configureStorageBridgeWal(`${options.storagePath}.wal.jsonl`, options.storageWal)
+  } else {
+    configureStorageBridgeWal(null)
+  }
   const originalClose = storage.close?.bind(storage)
   storage.close = async () => {
+    await flushStorageBridge()
     const disposableTools = [...tools.values()].filter(tool => tool.dispose)
     await Promise.allSettled(disposableTools.map(tool => tool.dispose?.()))
     await originalClose?.()

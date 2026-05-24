@@ -2,6 +2,289 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.69 2026-05-24 Docker Sandbox Execution Environment
+
+- **用户请求**: 实现 `executionEnvironment: 'docker'` 沙箱执行环境（P2 优先级），包括 Docker 容器生命周期管理、Workspace 目录挂载、网络/资源隔离以及 Session 清理。
+- **实现结果**:
+  - **类型扩展**：`ToolContext`（`src/tools/Tool.ts`）和 `RuntimeExecuteOptions`（`src/runtime/Runtime.ts`）均新增可选字段 `executionEnvironment?: 'local' | 'docker' | 'remote'`。
+  - **配置扩展**：`BabelOConfig` 接口与 `BabelOConfigSchema`（`src/shared/config.ts`）新增可选 `docker` 配置块（`image` / `network` / `memory` / `cpus`），支持通过 config.json 或环境变量（`BABEL_O_DOCKER_IMAGE` / `BABEL_O_DOCKER_NETWORK` / `BABEL_O_DOCKER_MEMORY` / `BABEL_O_DOCKER_CPUS`）覆盖。
+  - **API 路由调整**：`src/nexus/app.ts` 的 `/v1/execute` 和 `/v1/stream` 入口改为仅拦截 `remote`（返回 501），放行 `docker`；并将 `executionEnvironment` 透传至 `runtime.executeStream()`。
+  - **运行时透传**：`LocalCodingRuntime` 与 `LLMCodingRuntime` 的 `executeToolSafely` 均将 `executionEnvironment` 写入 `tool.execute()` 的 context 对象。
+  - **Docker Bash 执行器**：`src/tools/builtin/bash.ts` 新增 Docker 分支——首次调用时按需拉起命名为 `babel-o-session-${sessionId}` 的 detached 容器（`docker run -d -v <cwd>:<cwd> -w <currentCwd> --network none <image> tail -f /dev/null`），后续通过 `docker exec -w <currentCwd>` 执行命令；Docker 不存在时抛出明确的用户友好错误。
+  - **异步容器清理**：`clearBashSessionState` 改为 `async`，Session 关闭时自动执行 `docker rm -f babel-o-session-${sessionId}`；全局 `spawnedContainers` Set 追踪所有已启动容器。
+  - **Session 生命周期对接**：`src/nexus/sessionLifecycle.ts` 的 `closeNexusSession` 改为 `await clearBashSessionState()`。
+  - **测试更新**：`test/runtime.test.ts` 的 `executionEnvironment parameter validation` 用例改为验证 `docker` 请求放行（无 Docker 时优雅报错），`remote` 仍返回 501；所有 `clearBashSessionState` 调用均加上 `await`。
+- **验证结果**:
+  - `npm run typecheck` — 0 错误。
+  - 全部 155 项测试通过（20 个测试文件分组验证）。
+  - `executionEnvironment: 'docker'` 在无 Docker daemon 环境下返回 HTTP 200 + 明确错误事件；有 Docker 时可实际进入容器执行命令。
+
+## 0.68 2026-05-24 Audit Snapshot Cleanup
+
+- **用户请求**: 删除 `docs/AUDIT_2026-05-24.md`，并将可用结论合并同步到 TODO 文档的合适位置。
+- **核实结果**:
+  - 审计中 `SEC-01` / `TEST-01` 提到的 `Allow-all policy still prompts for high risk tools` 失败结论已经过期；复跑 `test/security.test.ts test/classifier.test.ts test/tool-trace.test.ts test/diff.test.ts`，17/17 通过。
+  - 审计中仍成立的结论主要是工程化和安全硬化事项，而不是当前 P0 失败：Bash 自动审批规则仍依赖正则/字符串、MCP runtime input schema 未用远端 schema 校验、CLI embedded 仍直接碰 Storage、非隔离 optimizer Git 操作仍需更保守策略、测试并发仍固定为 1。
+- **实现结果**:
+  - 删除过期快照 `docs/AUDIT_2026-05-24.md`。
+  - `TODO_runtime.md` 增补 Bash 自动审批白名单收紧、shell parser、Optimizer safety 策略化、MCP inputSchema 运行时校验，以及 embedded/Nexus 架构边界事项。
+  - `TODO_agents.md` 增补非隔离 in-place Git 操作加固、worktree isolation 默认推荐路径、AgentLoop 低成本 `--no-critic` 模式。
+  - `TODO_performance.md` 增补 storageBridge 故障注入/复杂度再评估、AgentLoop 成本 benchmark、测试并发化治理。
+  - `TODO_cleanup.md` 增补生产 build、lint/format、CI、coverage。
+  - `TODO.md` 更新当前优先级并记录本次审计清理摘要。
+
+## 0.67 2026-05-24 Model Routing and Provider Error Diagnostics Fix
+
+- **用户请求**: 解决 `deepseek/deepseek-v4-pro` 模型请求报错 `Provider 'openai' request failed with status 402` 的问题，确保正确解析路由与报错诊断。
+- **设计与实现**:
+  - **模型凭证路由修复**：修复了 `src/runtime/LLMCodingRuntime.ts` 中调用 `resolveSettings` 未传入 `options.model` 的 bug。该问题导致运行时执行任何重写模型时均只能获取默认配置（OpenAI/默认 Profile）的 API Key 和 Base URL，现已修改为传入 `{ model: options.model }` 正确路由至 `deepseek` 凭证。
+  - **动态 ProviderError 诊断**：修复了 `src/providers/adapters/OpenAIAdapter.ts` 中抛出 `ProviderError` 时硬编码 `'openai'` 作为 providerId 的问题。现已修改为提取 model 的 provider 前缀（如 `'deepseek'`)，使第三方或代理请求失败时可以返回真实的 providerId。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm run test` 成功通过全部 155 个测试用例。
+
+## 0.66 2026-05-24 Git Cherry-pick Conflict Diagnostics
+
+- **用户请求**: 稳步推进建议一，在 Worktree 冲突下增加具体的文件名与诊断细节，编写测试验证。
+- **设计与实现**:
+  - **冲突文件诊断机制**：在 `commitAndMergeWorktree` 中，如果 `git cherry-pick <commit>` 失败，在调用 `cherry-pick --abort` 恢复父仓库干净状态之前，运行 `git diff --name-only --diff-filter=U` 搜集所有冲突状态的文件名列表。
+  - **结构化错误抛出**：将搜集到的冲突文件名序列化并随 Error 抛出（格式如：`Cherry-pick failed with conflicts. Conflicting files: conflict.txt.`），让 Critic、Planner 以及用户和调用端可以从异常中看到详细的冲突文件诊断。
+  - **冲突单元测试**：在 `test/worktree.test.ts` 中新增了 `commitAndMergeWorktree reports conflicting files on cherry-pick failure` 单元测试，通过向 parent 仓库和 worktree 隔离目录的同一行写入不同内容并合并来制造冲突，断言抛出的异常信息包含 `conflict.txt`，并验证 `.git/CHERRY_PICK_HEAD` 被正确清除（无残留 cherry-pick 状态）。
+  - **构建测试链条**：将 `test/optimize-command.test.ts` 补充至 `package.json` 的 `test` 运行脚本中，确保全面覆盖。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm run test` 成功通过全部 155 个测试用例。
+
+## 0.65 2026-05-24 Provider Error Session Outcome Fix
+
+- **用户请求**: 深度分析最新 `PROVIDER_ERROR: Provider 'openai' request failed with status 402 ... Insufficient Balance` 会话报错。
+- **日志核实**:
+  - 最新问题会话为 `session_ba17e426-0e80-4b34-909a-d5893cdd04f0`，SQLite 中共有 4104 个事件：`tool_started`/`tool_completed` 各 62 个，最后一条终态事件是 `error`，code 为 `PROVIDER_ERROR`。
+  - 外部直接原因是 OpenAI 返回 402 `Insufficient Balance`，发生在最后 3 个 Bash 工具结果成功回传给 provider 之后，因此模型没有机会基于最后工具结果生成最终总结。
+  - 内部状态问题是 embedded `bbl chat` 收尾逻辑只读取升序前 100 条事件判断终态；长会话中它看到早期成功 `result`，漏掉尾部 `PROVIDER_ERROR`，导致 session 表仍显示 `completed`，`result` 还停留在更早的 `hi` 回复。
+- **实现结果**:
+  - `runSessionFlow()` 收尾改为按 `order: 'desc'` 读取最新事件窗口。
+  - 新增 `resolveFinalSessionOutcome()`，以最新 terminal event（`error` 或 `result`）决定 session phase/result/error，避免早期成功结果覆盖最新失败。
+  - 新增 `test/run-session-flow.test.ts`，覆盖“早期 success result + 长工具流 + 最新 provider error”应标记为 failed，以及最新 failed result 的失败口径。
+  - 将 `test/run-session-flow.test.ts` 纳入 `npm test`。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/run-session-flow.test.ts test/runtime-llm.test.ts test/runtime.test.ts` 成功通过，53/53 通过。
+
+## 0.64 2026-05-24 Cross-Session Task Delegation & Dynamic Sub-Agents
+
+- **用户请求**: 稳步推进重写建议一，实现跨 Session 任务委派与动态子代理，确保功能稳定完善，批准开发。
+- **设计与实现**:
+  - **动态子代理会话**：在 `runAgentLoop` 中增加了对 `tasks` 预定义计划任务的支持。在执行阶段，如遇到拥有 `parentTaskId` 且启用了子代理的任务，会启动一个全新的子代理 Session（带有独立 queueId 和 parentSessionId），使子任务生命周期与上下文完全独立，默认 autoApprove 为 true。
+  - **防无限递归 (OOM) 修复**：在子会话启动时，通过在 tasks 的 metadata 中将 `parentTaskId` 设为 `undefined` 以隔离上下游父子任务标记；并在 `isSubAgentTask` 判断中强化约束 `String(task.metadata.parentTaskId) !== String(task.taskId)`，彻底避免子 Session 根任务自己匹配自己导致无限生成孙 Session。
+  - **嵌套隔离 Worktree 合并修复**：修复了子代理在其隔离 worktree 内 commit + cherry-pick 到父隔离工作区后，父代理因工作目录 relative clean 导致无法检测到新 Commit 的 bug。将 `commitAndMergeWorktree` 升级为检测范围 Commit 并批量 cherry-pick 合并：通过 `git rev-list --reverse parentHead..worktreeHead` 获取工作流自创建以来的全部 Commit 列表并逐个 cherry-pick 合并回主工作区。
+  - **集成测试覆盖**：在 `test/agent-loop.test.ts` 中新增了 `runAgentLoop runs sub-agent session with isolation and merges changes back` 集成用例，覆盖了子代理 Session 嵌套隔离 worktree 读写、递归调用、变更合并和工作区清理流程。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm run test` 成功通过全部 148 个测试用例。
+
+## 0.63 2026-05-24 Worktree Isolation First Pass
+
+- **用户请求**: 用户进一步修改并更新项目后，核对当前开发状态与文档记录。
+- **核实结果**:
+  - 新增 `src/nexus/worktree.ts` 与 `test/worktree.test.ts`，实现 Git worktree 创建、隔离提交、cherry-pick 合并与清理。
+  - `runAgentLoop()` 已接入 `requiresIsolation` metadata：任务要求隔离时会在 `.babel-o/worktrees/<taskId>` 中执行 Executor/Critic，审核通过后合并回主工作区。
+  - `TODO_agents.md` 原先仍写着 worktree 隔离延后实现，和代码状态不一致。
+- **实现修正**:
+  - 修正 AgentLoop 隔离任务合并后的提交语义：worktree merge 已经产生并 cherry-pick 提交，不再继续走主工作区 `gitCommit`，避免 no-op warn 或把主工作区其他改动误纳入提交。
+  - 更新 `TODO.md` 与 `TODO_agents.md`：worktree isolation 第一版标记为已接入，剩余项改为真实 provider 非 dry-run smoke、冲突恢复策略和可视化提示。
+  - `test/agent-loop.test.ts` 增加断言：隔离任务应记录 `worktree_merged`，且不应再记录 `git_commit_performed`。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/worktree.test.ts test/agent-loop.test.ts test/optimize-command.test.ts test/runtime-llm.test.ts test/context-assembler.test.ts` 成功通过，52/52 通过。
+
+## 0.62 2026-05-24 Explicit Path Request Anchoring
+
+- **用户请求**: 最新会话中输入 `/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比分析这个项目` 后，Agent 依旧被旧上下文带偏并继续分析 BabeL-O，要求深度分析修复。
+- **日志核实**:
+  - 本地 SQLite 中 `session_bff7cbdd-d987-4dbf-8145-549c94aed2dc` 已完成，`last_user_input` 确认为 `/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比分析这个项目`。
+  - 该 session 共 6314 个事件，其中 `user_message` 4 个、`tool_started` 54 个、`assistant_delta` 5380 个。
+  - 最新用户输入后的第一批工具调用仍然是 `find /Users/tangyaoyue/DEV/BABEL/BabeL-O ...`、`ls .../BabeL-O` 和读取 BabeL-O 源码，说明问题已经不是输入未写入或轮次未锚定，而是模型把“这个项目”解释成旧历史中的 BabeL-O。
+- **实现结果**:
+  - `buildSystemPrompt()` 增加 `Explicit paths in current request` 块，解析当前请求中的绝对路径并标注是否存在。
+  - system prompt 新增规则：当前请求包含显式绝对路径时，该路径是权威任务目标，不得用旧历史项目替换；横向对比/compare 且只有一个显式路径时，必须先检查该显式路径，再把最相关旧项目作为对比基线。
+  - 路径解析支持 `/Users/.../BabeL-X横向对比分析这个项目` 这种中文无空格后缀：会回退到最长真实存在路径 `/Users/.../BabeL-X`，同时避免把普通缺失文件误折叠成父目录。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime-llm.test.ts test/runtime.test.ts` 成功通过，63/63 通过。
+
+## 0.60 2026-05-24 Recoverable Read Failures
+
+- **用户请求**: 根据 `session_923e...f29a0` 的项目分析输出中断问题，调用项目日志和数据库分析模型输出错误原因并修复优化。
+- **日志核实**:
+  - 本地持久化库路径为 `/Users/tangyaoyue/.babel-o/db.sqlite`。
+  - `session_923ecd72-3a8a-43d7-a039-03a04b1f29a0` 共 570 个事件：`tool_started` 19 个、`tool_completed` 18 个、最后 1 个 `error`。
+  - 最后一项工具调用为 `Read({"path":"/Users/tangyaoyue/DEV/BABEL/BabeL-O/.babel-o/config.json"})`，该文件不存在，`Read` 内部 `stat` 抛出 `ENOENT`，runtime 将其升级为全局 `TOOL_ERROR`，导致模型没有机会收到失败结果并继续输出项目分析。
+- **实现结果**:
+  - `Read` 工具现在将 `ENOENT` / `ENOTDIR` 转为 `success=false` 的可恢复工具结果，并提示用户/模型用 `Glob` 探测真实文件。
+  - `Read` 对目录和非普通文件同样返回可解释的 `success=false` 工具结果，不抛异常中断 Agent turn。
+  - LLM runtime 回归测试确认缺失 `Read` 会作为 `tool_result is_error=true` 回传给 provider，模型可继续给出后续回复；真正的 Bash 执行异常仍保留 `TOOL_ERROR` 结构化诊断。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts test/runtime-llm.test.ts` 成功通过，51/51 通过。
+  - CLI smoke：`BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm run cli -- run 'read missing.txt' --cwd <tmpdir>` 输出 `Read failed` 和 `✗ failed`，不再输出 `TOOL_ERROR`。
+
+## 0.61 2026-05-24 Latest-Turn Context Anchoring
+
+- **用户请求**: 继续查看当前正在运行的聊天会话，分析为什么输入 `/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比这个项目` 后没有得到正常直接反馈。
+- **日志核实**:
+  - 本地 SQLite 中 `session_804224db-8b7c-4c96-bc3b-4912e02cff91` 已完成，并非仍在运行中；该 session 共 3859 个事件，其中 `assistant_delta` 3501 个、`user_message` 4 个。
+  - 最新用户输入确实写入数据库：`/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比这个项目`，但随后模型继续读取 BabeL-O 的核心文件并输出 BabeL-O 深度分析。
+  - 根因是 `selectRecentEvents()` 的“最近 4 个用户轮次”策略在长输出会话中直接保留几千个旧事件，旧 BabeL-O 分析与后续 assistant 尾巴压过了当前对比 BabeL-X 的意图。
+- **实现结果**:
+  - `selectRecentEvents()` 现在即使按用户轮次选择历史，也会受 `recentEventLimit` 约束，不再把几千个历史 delta 全量回放给 provider。
+  - 裁剪逻辑以最新 `user_message` 为锚点：如果一轮内部事件超预算，会保留该轮最新用户请求，再拼接预算内的尾部事件，避免当前请求被裁掉。
+  - system prompt 新增 `Current user request:` 显式块，并加入规则：当前请求优先于冲突的旧历史。
+  - 用真实 `session_8042...cff91` 事件回放验证：组装后 `selectedEventCount=256`、`omittedEventCount=3603`，system prompt 含 BabeL-X 对比请求，第一条 message 是最新 BabeL-X 对比请求。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime-llm.test.ts test/runtime.test.ts` 成功通过，61/61 通过。
+
+## 0.59 2026-05-24 Planner HITL and SubTask Visualization
+
+- **用户请求**: 推进后续优先级 1 + 2：Planner Human-in-the-Loop，以及在 CLI/TUI 中更清晰展示子任务状态。
+- **实现结果**:
+  - `runAgentLoop()` 增加 `reviewPlan` 钩子和 `PlannerReviewDecision` 类型；Planner 输出后可记录 `planner_review` pending input，等待调用方确认、编辑或拒绝。
+  - Planner 审批拒绝时会记录 `planner_review_rejected`，取消 TaskSession，并写入 `PLANNER_REJECTED` terminal reason；审批通过时会记录 `planner_review_approved` 并使用编辑后的任务列表创建 TaskQueue。
+  - `bbl optimize` 非 dry-run 默认在执行前展示计划，支持 `[a]pprove`、`[e]dit`、`[r]eject`；`--auto-approve` 和 `--yes` 可跳过 Planner 审批。
+  - AgentLoop task session events 改为携带完整 task payload；委派成功时单独记录父任务 `task_blocked`，并在 `subtasks_delegated` 中包含 parentTask、subTasks、depth、accepted/requested 等元信息。
+  - CLI Task Status Board 支持展示 blocked 父任务、子任务缩进层级、`parent #id` 和 `delegated #id`，方便观察父任务 blocked、子任务 created/claimed/completed 的流转。
+  - 修正 Planner 编辑交互中“删除全部任务”后的语义：直接按拒绝计划处理，避免空任务列表被误当作批准。
+  - 为真实 `bbl optimize --target <目录>` smoke 补齐两个恢复性边界：`Read` 读取目录时返回可解释的工具失败结果，不再抛 `EISDIR` 打断 AgentStep；`Glob` 兼容绝对 workspace 目录 pattern，避免目录目标被误判为空。
+  - Planner 结构化输出解析增加自然语言编号列表兜底，仅在 Planner schema 下启用，用于吸收部分 provider 未严格返回 JSON 的计划文本。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts test/agent-loop.test.ts test/tui-renderer.test.ts test/optimize-command.test.ts test/runtime-llm.test.ts` 成功通过，75/75 通过。
+  - 真实 provider dry-run smoke 通过：`npm run cli -- optimize --target /tmp/babel-o-opt-hitl-smoke-real.7phfKH --cwd /tmp/babel-o-opt-hitl-smoke-real.7phfKH --focus cleanup --dry-run --enable-subagents --max-sub-agent-depth 1 --max-sub-tasks-per-task 2` 成功输出 4 个 Proposed Tasks，且 dry-run 未写入目标目录。
+- **后续核对**:
+  - 下一步优先跑真实 provider 的非 dry-run `bbl optimize --enable-subagents` 小目录 smoke，验证 Planner 审批、Git stash/commit/rollback、子任务回收在真实模型输出下是否稳定。
+  - 跨 session dynamic sub-agent 与 worktree isolation 仍未开始，继续作为 P3 后续主线。
+
+## 0.58 2026-05-24 Optimize SubAgents CLI and Provider Smoke
+
+- **用户请求**: 按建议继续推进，优先完成 `bbl optimize` 暴露 subAgents 开关，并跑真实 provider smoke。
+- **实现结果**:
+  - `bbl optimize` 新增 `--enable-subagents`、`--max-sub-agent-depth`、`--max-sub-tasks-per-task`，并将参数传入 `runAgentLoop()` 的 `enableSubAgents`、`maxSubAgentDepth`、`maxSubTasksPerTask`。
+  - 修复 Commander 对 `--enable-subagents` 的 camelcase 解析差异：兼容 `enableSubAgents` 与 `enableSubagents`。
+  - dry-run planner 路径现在会创建 TaskSession，避免 `recordTaskSessionNexusEvent()` 报 `TaskSession not found`。
+  - Agent role 工具策略接入 runtime：`runtimeAgentStep` 运行角色步骤时临时应用 role allowlist；`LLMCodingRuntime` provider 请求只暴露当前 policy 允许的 tools，避免 Planner 看到 Bash/Write 等不可用工具后触发 denied。
+  - Planner role 开放只读工具 `Read` / `Grep` / `Glob`，可先检查目标再生成计划。
+  - Planner structured output normalization 增强：兼容 provider 返回 `goal` / `finalOutput` / `optimizationFocus` 作为 summary，以及 `tasks[].description/action/file` 作为任务 title/metadata。
+- **真实 smoke**:
+  - 临时目录 `/tmp/babel-o-opt-smoke.YN0znC`，含一个 `sample.ts`。
+  - 执行 `npm run cli -- optimize --target /tmp/babel-o-opt-smoke.YN0znC --cwd /tmp/babel-o-opt-smoke.YN0znC --focus cleanup --dry-run --enable-subagents --max-sub-agent-depth 1 --max-sub-tasks-per-task 2`。
+  - 结果：CLI 正确显示 `Sub-agents enabled: max depth 1, max subTasks/task 2`；Planner 调用只读工具读取目标目录；最终输出 4 个 proposed tasks，dry-run 未写入目标目录。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/optimize-command.test.ts test/agent-loop.test.ts test/runtime-llm.test.ts` 成功通过，34/34 通过。
+- **后续核对**:
+  - 下一步建议推进 Planner Human-in-the-Loop：dry-run 已能出计划，非 dry-run 前需要用户确认/编辑/拒绝任务列表，避免真实 optimizer 一上来按错误计划写文件。
+
+## 0.57 2026-05-24 Context Replay and Empty Response Fix
+
+- **用户请求**: 查看最近一次调用日志，分析当前项目上下文管理混乱、不能支持相对连续任务和交互回应的问题。问题 session 为 `session_fa312235-4377-430f-b7f9-65753bf6e1ad`。
+- **日志核实**:
+  - SQLite 中该 session 共有 3376 个事件，其中 `assistant_delta` 2963 条、`thinking_delta` 180 条、`user_message` 6 条。
+  - 第一次输入 `架构性能差异` 只产生 usage/result/metrics，`result.message` 为空但 `success=true`，因此 CLI 显示空白 `✓ done`。
+  - 第二次输入 `架构性能差异` 的上下文组装中，最后一个 assistant message 正文为空，但带有 10k+ 字符 `reasoningContent`，开头包含 `<file_contents>` 等旧隐藏推理内容，确认历史 thinking 被回放并污染后续 provider 请求。
+  - 原 `selectRecentEvents()` 按原始事件条数切片，长回答会产生大量 delta，容易切碎用户轮次和工具调用边界。
+- **实现结果**:
+  - `mapEventsToMessages()` 不再把历史 `thinking_delta` 组装为 `reasoningContent`。thinking 仍保留在事件日志和 TUI 显示路径，但不会回放给 provider。
+  - `selectRecentEvents()` 改为优先按最近用户轮次选择上下文；大窗口模型保留最近 4 个用户轮次，本地小窗口保留最近 2 个用户轮次，旧内容进入规则摘要。
+  - provider 返回无文本且无工具调用时，`LLMCodingRuntime` 产出 `EMPTY_PROVIDER_RESPONSE` error 和 `success=false` result，不再把空响应显示为成功 done。
+  - `mapEventsToMessages()` 跳过连续相同 user message，降低历史空轮次造成重复追问的上下文噪音。
+  - `summarizeSessionEvents()` 的 earlier user requests 改为保留最近被压缩的几个用户请求，便于恢复连续任务语义。
+- **真实日志回放验证**:
+  - 对 `session_fa31...6e1ad` 重新组装上下文后，messages 中不再包含 `<file_contents>`，`totalReasoningChars=0`。
+  - 选中上下文从“横向对比分析这两个项目”开始，并保留“你对比错了两个项目 -> 架构性能差异”的最近连续语义；更早的大段 BabeL-X 分析进入 summary。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/context-assembler.test.ts` 成功通过，27/27 通过。
+
+## 0.56 2026-05-24 Provider Tool Result Mapping Fix
+
+- **用户请求**: 查看 `PROVIDER_ERROR: Provider 'minimax' request failed with status 400 ... tool result's tool id(...) not found` 的项目日志并分析报错原因。
+- **根因核实**:
+  - 本地 SQLite 日志确认 `session_0158eef1-20db-4178-aa57-069d1d27a36e` 中 `call_function_lgkuocdgyntw_3` 的 `tool_started` 与 `tool_completed` 均存在，数据库事件本身没有丢失。
+  - 报错发生在下一轮用户输入组装历史上下文并发送给 Minimax 时。现有 `mapEventsToMessages()` 会把持久化事件中的 `tool_started -> tool_completed -> tool_started -> tool_completed` 还原为多组 `assistant(tool_use) -> user(tool_result)`。Minimax 的 Anthropic-compatible `/v1/messages` 校验要求同一 assistant turn 的多个 `tool_use` 保持在同一个 assistant message 中，并由紧随其后的一个 user message 一次性返回全部 `tool_result`；拆散后会触发 `tool result's tool id not found`。
+  - 另一个潜在风险是上下文压缩后可能只保留 `tool_completed` 而遗漏对应 `tool_started`，从而生成 orphan `tool_result`。
+- **实现结果**:
+  - `mapEventsToMessages()` 现在会跳过没有对应 `tool_started` 的 orphan `tool_completed`，避免向 provider 发送无来源 `tool_result`。
+  - 连续工具调用事件会被恢复为一个 assistant message 内的多个 `tool_use` blocks，并紧跟一个 user message 内的多个 `tool_result` blocks，匹配 Anthropic-compatible provider 的工具调用协议。
+  - 用真实 `session_0158...7a36e` 数据重放验证：`call_function_lgkuocdgyntw_1..4` 被恢复为一条 assistant + 一条 user，且无 orphan tool_result。
+  - 新增单测覆盖 orphan `tool_completed` 跳过和连续工具调用分组合并。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/context-assembler.test.ts` 成功通过，23/23 通过。
+
+## 0.55 2026-05-24 P3 Agent Orchestration: Controlled SubTasks
+
+- **用户请求**: 参考 BabeL-X 中的优秀设计推进 Agent Orchestration P3：Executor 能拆 subTasks，`runAgentLoop()` 限制最大嵌套深度，避免无限派生。
+- **设计参考**:
+  - 参考 BabeL-X coordinator / AgentTool 的核心约束：不要委派琐碎读文件/简单命令、不要重复委派、worker/子任务结果是内部信号而不是对话对象、必须有深度与数量边界。
+  - 不迁移 BabeL-X 的后台 worker、React AgentTool、跨 session fork 和 worktree 隔离复杂体系；BabeL-O 第一版采用同 TaskQueue 的轻量受控委派，复用现有 TaskSession、TaskQueue、Critic、storageBridge 和审计链路。
+- **实现结果**:
+  - **Executor/Optimizer schema 扩展**：`ExecutorOutputSchema` 增加 `subTasks` 字段，支持 `title`、`description`、`requiresIsolation`、`metadata`。
+  - **AgentLoop 委派控制**：`runAgentLoop()` 新增 `enableSubAgents`、`maxSubAgentDepth`、`maxSubTasksPerTask`。默认关闭 subAgents，避免旧流程行为变化。
+  - **父子任务调度语义**：Executor 返回有效 `subTasks` 且未超过深度时，父任务转为 `blocked`，把子任务 ID 写入父任务 `dependsOn` 和 `metadata.delegatedSubTaskIds`；子任务完成后现有 `unblockTasks()` 会让父任务回到 `pending`，再由 Executor 汇总收口。
+  - **防无限派生**：每个任务通过 `metadata.depth` 记录嵌套深度；达到 `maxSubAgentDepth` 或未启用 subAgents 时，记录 `subtasks_rejected_depth_limit` 事件，并将拒绝原因写入任务 metadata，不创建子任务。
+  - **真实 runtime 提示**：Executor/Optimizer system prompt 和 input orchestration context 会明确当前深度、最大深度、剩余深度和已委派子任务，指导模型不要滥用子任务。
+  - **测试覆盖**：新增 AgentLoop 测试覆盖父任务委派、子任务执行、父任务恢复收口，以及深度上限拒绝继续派生；新增 structured output 测试覆盖 Executor schema 接收 `subTasks`。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/agent-loop.test.ts` 成功通过，10/10 通过。
+- **后续核对**:
+  - 下一步可继续做跨 session dynamic sub-agent 生命周期、worktree isolation、Planner 输出后 human approval，以及真实 provider 下的 `bbl optimize --enable-subagents` smoke。
+
+## 0.54 2026-05-24 T0 Reliability Completion: WAL Batch/Fsync Strategy
+
+- **用户请求**: 完成 T0 完善。
+- **实现结果**:
+  - **WAL 批量写入策略**：`storageBridge` WAL 从固定逐条同步追加升级为可配置策略，支持 `batchSize`、`flushIntervalMs` 和 `fsync`。默认 `batchSize=1`、`flushIntervalMs=0`、`fsync=false`，保持原有即时写入语义；需要吞吐时可调大 batch 并用 interval 定时 flush。
+  - **刷盘安全选项**：`fsync=true` 时，WAL 追加会 fsync 文件描述符；compact 时会 fsync 临时文件并在 rename 后 fsync 目录，降低系统崩溃下 rename 丢失风险。
+  - **服务端配置入口**：`createDefaultNexusRuntime()` 新增 `storageWal` 选项；`nexus/server.ts` 支持 `NEXUS_STORAGE_WAL_BATCH_SIZE`、`NEXUS_STORAGE_WAL_FLUSH_INTERVAL_MS`、`NEXUS_STORAGE_WAL_FSYNC`。
+  - **测试覆盖**：新增 batch flush + fsync smoke，验证 WAL buffer、flush 计数和配置 stats；新增 1000 pending ops WAL replay smoke，验证大量待持久化 task 在重启后完整恢复。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/agent-loop.test.ts` 成功通过，8/8 通过。
+- **后续核对**:
+  - T0 高优先级可靠性项已收口。后续性能主线仍可继续补 1000+ sessions/events API 响应压测、chat 首响 benchmark、provider retry benchmark。
+
+## 0.53 2026-05-24 T0 Reliability Closure: Durable WAL and Session Close Cascade
+
+- **用户请求**: 推进 T0，继续收口 reliability / safety 高优先级项。
+- **实现结果**:
+  - **storageBridge durable WAL**：将 `storageBridge` 从纯内存重试队列升级为 JSONL WAL 队列。每个 task/session mutation 入队前先追加 `op` 记录，落库成功后追加 `ack`，队列清空时 compact WAL；启动/配置 WAL 时 replay 未 ack 操作，避免进程崩溃导致未 flush 数据丢失。
+  - **runtime 生命周期接入**：`createDefaultNexusRuntime({ storagePath })` 默认为 SQLite storage 配套启用 `${storagePath}.wal.jsonl`，并在 storage close 前主动 flush storageBridge。
+  - **session close 级联清理**：新增 `closeNexusSession()` 和 `POST /v1/sessions/:sessionId/close`；`cancel` 路径复用 close 流程。关闭会话时统一清理 Bash CWD、TaskQueue、TaskSession 和 PendingPermission，避免长运行进程中模块级 Map 常驻。
+  - **CLI 退出清理**：`bbl chat` 的 `/exit` 与 Ctrl-C 退出路径改为 best-effort 调用 close 流程；远程模式通过 Nexus API close，本地模式直接打开默认 SQLite storage 清理。
+  - **测试覆盖**：新增 storageBridge WAL replay 测试和 session close cascade 测试，覆盖 WAL 恢复、Bash CWD 清理、TaskQueue/TaskSession 清理和 pending permission 自动 deny。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/agent-loop.test.ts test/runtime.test.ts` 成功通过，33/33 通过。
+- **后续核对**:
+  - T0-1 / T0-2 已从高优先级未收口项转为完成；后续如需增强，重点是 WAL 批量写入、fsync 策略配置和大量 session/event 恢复压测。
+
+## 0.52 2026-05-24 T0 Reliability Follow-up: Tool error diagnostics and structured logger
+
+- **用户请求**: 根据 T0 优先级继续推进优化，包含 durable WAL、session close 清理、工具错误信息传递修复和结构化 Logger。
+- **实现结果**:
+  - **工具错误诊断增强 (T0-3)**：`LocalCodingRuntime` 与 `LLMCodingRuntime` 的 `executeToolSafely()` 在工具异常时保留结构化 `details`，包含 `stdout`、`stderr`、`code`、`signal`、`exitCode` 等字段；stdout/stderr 会按工具输出预算分别截断并记录 original bytes，避免错误事件只剩 `Command failed`。
+  - **事件 Schema 扩展**：`ErrorEventSchema` 增加可选 `details` 字段，保持已有 `code/message` 兼容。
+  - **最小结构化 Logger (T0-4)**：新增 `src/shared/logger.ts`，输出 JSON 日志，支持 `NEXUS_LOG_LEVEL=silent|error|warn|info|debug`。
+  - **Nexus/shared 层日志治理**：`storageBridge` 永久失败、`nexus/server.ts` 安全配置失败、`agentLoop` Git stash/commit/rollback 异常、`ConfigManager` 配置校验失败均改为结构化 logger；CLI 面向用户的 console 输出暂不纳入 silent logger 控制。
+  - **测试覆盖**：新增 `test/logger.test.ts` 验证 silent 静默和 JSON 日志格式；新增 runtime 集成测试验证 Bash 工具失败时 error event 带 stdout/stderr/code details。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/logger.test.ts test/runtime.test.ts test/runtime-llm.test.ts test/agent-loop.test.ts` 成功通过，45/45 全绿。
+- **后续核对**:
+  - T0-1 `storageBridge` durable WAL 与批量写入仍未实现。
+  - T0-2 session close event + 级联清理仍未实现。当前不应在每次 execute 完成后清理，因为 chat 需要跨轮保留 Bash CWD；应先定义明确的 session close/cancel/end 语义。
+
 ## 0.51 2026-05-24 P2 Model Capability Routing 收口
 
 - **用户请求**: 根据下一步开发建议继续稳步重写，优先推进 Provider Registry 收口与 Agent 能力闭环。

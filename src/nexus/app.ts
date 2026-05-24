@@ -13,6 +13,7 @@ import { PendingPermissionRegistry } from '../shared/session.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
+import { closeNexusSession } from './sessionLifecycle.js'
 
 
 declare module 'fastify' {
@@ -199,11 +200,11 @@ export async function createNexusApp(
     const startedAtMs = metrics.now()
     try {
       const body = executeSchema.parse(request.body)
-      if (body.executionEnvironment && body.executionEnvironment !== 'local') {
+      if (body.executionEnvironment && body.executionEnvironment === 'remote') {
         return reply.status(501).send({
           type: 'error',
           code: 'NOT_IMPLEMENTED',
-          message: `Execution environment '${body.executionEnvironment}' is not implemented yet. Only 'local' is supported.`,
+          message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`,
         })
       }
       const sessionId = body.sessionId ?? createId('session')
@@ -271,6 +272,7 @@ export async function createNexusApp(
           requestId,
           model: body.model,
           budget: body.budget,
+          executionEnvironment: body.executionEnvironment,
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
@@ -541,7 +543,12 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/cancel', async request => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const session = await options.storage.getSession(params.sessionId)
+    const { session } = await closeNexusSession({
+      storage: options.storage,
+      sessionId: params.sessionId,
+      phase: 'cancelled',
+      reason: 'Session cancelled',
+    })
     if (!session) {
       return {
         type: 'error',
@@ -549,12 +556,36 @@ export async function createNexusApp(
         message: `Session not found: ${params.sessionId}`,
       }
     }
-    session.phase = 'cancelled'
-    session.updatedAt = nowIso()
-    await options.storage.saveSession(session)
     return {
       type: 'session_cancelled',
       sessionId: params.sessionId,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/close', async request => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const body = z.object({
+      phase: z.enum(['cancelled', 'completed', 'failed']).optional(),
+      reason: z.string().optional(),
+    }).parse(request.body ?? {})
+    const { session, permissionsResolved } = await closeNexusSession({
+      storage: options.storage,
+      sessionId: params.sessionId,
+      phase: body.phase,
+      reason: body.reason,
+    })
+    if (!session) {
+      return {
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      }
+    }
+    return {
+      type: 'session_closed',
+      sessionId: params.sessionId,
+      phase: session.phase,
+      permissionsResolved,
     }
   })
 
@@ -714,11 +745,11 @@ export async function createNexusApp(
         }
 
       const body = parsed.data
-      if (body.executionEnvironment && body.executionEnvironment !== 'local') {
+      if (body.executionEnvironment && body.executionEnvironment === 'remote') {
         sendJson(socket, {
           type: 'error',
           code: 'NOT_IMPLEMENTED',
-          message: `Execution environment '${body.executionEnvironment}' is not implemented yet. Only 'local' is supported.`,
+          message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`,
         })
         return
       }
@@ -786,6 +817,7 @@ export async function createNexusApp(
           requestId,
           model: body.model,
           budget: body.budget,
+          executionEnvironment: body.executionEnvironment,
         })) {
           await options.storage.appendEvent(sessionId, event)
           if (event.type === 'execution_metrics') {

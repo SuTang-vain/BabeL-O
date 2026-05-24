@@ -24,6 +24,7 @@ export type TaskSessionTerminalReason = {
 }
 
 export type TaskSessionInputRequest = {
+  kind?: 'planner_review' | 'user_input'
   reason?: string
   prompt?: string
   requestedBy?: 'planner' | 'executor' | 'critic' | 'system'

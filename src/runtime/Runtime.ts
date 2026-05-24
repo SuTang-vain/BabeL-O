@@ -13,6 +13,7 @@ export type RuntimeExecuteOptions = {
   requestId?: string
   model?: string
   budget?: number
+  executionEnvironment?: 'local' | 'docker' | 'remote'
 }
 
 export interface NexusRuntime {

@@ -89,6 +89,13 @@ export class NexusClient {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/cancel`, {})
   }
 
+  async closeSession(
+    sessionId: string,
+    options: { phase?: 'cancelled' | 'completed' | 'failed'; reason?: string } = {},
+  ): Promise<unknown> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/close`, options)
+  }
+
   async approvePermission(sessionId: string, toolUseId: string): Promise<unknown> {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/approve`, {
       toolUseId,

@@ -43,6 +43,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 给 `/v1/execute` 加 timeout。
 - [x] 给 `/v1/stream` 加 cancellation / close handling。
 - [x] 增加标准 error code：`INVALID_REQUEST`、`SESSION_NOT_FOUND`、`TOOL_DENIED`、`REQUEST_TIMEOUT`、`PROVIDER_ERROR`。
+- [x] 工具异常事件保留结构化 `details`，包含 stdout/stderr/code/signal，并对 stdout/stderr 分别按工具输出预算截断。
 - [x] 增加 `thinking_delta` event。
 - [x] 增加 `GET /v1/schema/events`。
 - [x] 增加 `GET /v1/tools/audit`。
@@ -61,6 +62,11 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 初版只做字符预算和规则摘要；暂不实现 BabeL-X `SessionMemory` 的后台子 Agent 提取。
 - [x] Benchmark：长会话上下文输入规模降低 50%+，且最近 3-5 轮完整保留。
 - [x] 修复长会话历史截断的 user boundary 选择，避免旧 `hi` 和残缺历史抢占上下文起点，并在 system prompt 中加入 `Context Boundary` 提示，明确最近消息是权威工作历史。
+- [x] 修复上下文回放污染：历史 `thinking_delta` 仅作为日志/UI 事件保留，不再以 `reasoningContent` 注入后续 provider 请求；上下文选择改为按最近用户轮次保留，避免长回答的数千条 delta 切碎语义边界。
+- [x] 修复 provider 空响应状态：当 provider 返回无文本且无工具调用时，runtime 产出 `EMPTY_PROVIDER_RESPONSE` 失败结果，不再显示空白 `✓ done`。
+- [x] 修复 provider error 后 session 终态误判：embedded `bbl chat` 收尾读取最新事件窗口，并以最新 terminal event 判断 `completed/failed`，避免长会话尾部 `PROVIDER_ERROR` 被早期成功 result 覆盖。
+- [x] 修复空历史轮次造成的重复相邻用户消息：`mapEventsToMessages()` 会跳过连续相同的 user turn，避免旧空响应日志污染下一轮追问。
+- [x] 修复显式路径请求被旧上下文带偏：system prompt 会列出当前请求中的绝对路径，并要求模型将其作为权威任务目标；支持中文无空格后缀路径解析，例如 `/Users/.../BabeL-X横向对比分析这个项目`。
 
 ## P0 MCP-Ready Runtime Extensions
 
@@ -96,6 +102,16 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] Bash 支持危险黑名单：`rm -rf`、`sudo`、管道 curl/wget、`npm publish`、`git push` 等。
 - [x] 写操作默认仍要求人工确认。
 - [x] 所有自动放行/拒绝记录 permission audit reason。
+- [ ] 收紧 Bash 自动审批白名单：把 `npm test`、宽松 `npx tsc .*`、任意参数 `cat` 等规则拆成精确命令/参数集合，补充绕过样例测试；未知 Bash 继续默认人工确认。
+- [ ] 为 Bash 分类引入 shell 词法解析或等价的安全 parser，避免仅靠正则判断管道、命令替换、别名和嵌套 shell。
+- [ ] Optimizer safety 从硬编码黑名单升级为策略配置：保护 package/lock/env/bin 等敏感路径，并对高危命令保持 deny 或人工确认。
+- [ ] MCP tool 运行时输入校验使用远端 `inputSchema`，不再仅以 `z.record(z.string(), z.unknown())` 接收任意对象；校验失败返回可恢复 tool result。
+
+## P2 Architecture Boundary
+
+- [ ] 明确 embedded local 与 Nexus-only 两种运行模式的架构口径：若保留 embedded，文档中承认其为本地单进程路径；若推进 Nexus-only，则 CLI 必须经 HTTP/WS 调用 Nexus。
+- [ ] 减少 CLI 对 `SqliteStorage` / `closeNexusSession` 的直接 import：优先复用 Nexus API 或嵌入式 `createNexusApp()`，避免 Storage 操作散落在 CLI 层。
+- [ ] 将 permission pending state 从进程内单例逐步抽象为可插拔 backend，为多进程 service/CLI 场景预留 SQLite 或 Nexus-owned 状态同步。
 
 ## P1 Storage
 
@@ -109,10 +125,11 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 支持 storage restart smoke test。
 - [x] 给 sessions/tasks/events 列表加 `limit`。
 - [x] 预留/实现 cursor pagination (复合游标复合分页)。
-- [x] `storageBridge` 改为带 3 次重试、延迟调度、永久失败计数和 stats 暴露的内存持久化队列，避免 fire-and-forget 静默失败。
+- [x] `storageBridge` 改为带 3 次重试、延迟调度、永久失败计数和 stats 暴露的持久化队列，避免 fire-and-forget 静默失败。
+- [x] `storageBridge` 增加 JSONL WAL，持久化待落库操作和 ack，支持进程崩溃后 replay 未 flush 的 task/session mutation，并在队列清空时 compact WAL。
+- [x] `storageBridge` WAL 支持可配置批量写入、flush interval 和 fsync 策略；默认 `batchSize=1` 保持即时落盘口径。
 - [x] `TaskQueue` / `TaskSession` 模块级 Map 对终态数据增加 24 小时默认 prune 策略和后台 sweeper。
-- [ ] 如需跨进程崩溃恢复，为 `storageBridge` 增加 durable WAL 与批量写入。
-- [ ] 如需更短生命周期，补充 session close event 并触发 Bash CWD、task queue、task session 和 pending permission 级联清理。
+- [x] 补充 session close 生命周期入口，`POST /v1/sessions/:sessionId/close` 与 cancel 路径均触发 Bash CWD、task queue、task session 和 pending permission 级联清理。
 
 ## P1 Security
 
@@ -142,7 +159,8 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 定义 `executionEnvironment` 请求字段。
 - [x] P2 只支持 `local`。
 - [x] 对 `docker` / `remote` 返回明确 not implemented。
-- [ ] 设计 Docker workspace mount 和资源限制。
+- [x] 设计并实现 Docker workspace mount 和资源限制（`BABEL_O_DOCKER_IMAGE` / `BABEL_O_DOCKER_NETWORK` / `BABEL_O_DOCKER_MEMORY` / `BABEL_O_DOCKER_CPUS`，默认 `--network none`）。
+- [x] 实现 Docker 容器 Session 生命周期管理（首次按需创建、`docker exec` 复用、Session 关闭时 `docker rm -f`）。
 - [ ] 设计 remote runner protocol。
 
 ## 验证命令
@@ -154,6 +172,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] `npm run start` + `curl /health`
 - [x] `npm run cli -- run --url http://127.0.0.1:3000 "bash pwd"`
 - [x] storage restart test 已纳入 `npm test`
+- [x] storageBridge WAL replay / batch flush / 1000 pending ops 恢复测试已纳入 `npm test`
 - [x] allowlisted tool denial test 已纳入 `npm test`
 - [x] `test/security.test.ts` 安全鉴权测试已纳入 `npm test`
 - [x] `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/permission-flow.test.ts test/agent-loop.test.ts test/runtime.test.ts test/security.test.ts`

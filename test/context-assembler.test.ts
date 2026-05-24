@@ -9,7 +9,11 @@ import {
   selectRecentEvents,
 } from '../src/runtime/contextAssembler.js'
 import { snipEvent } from '../src/runtime/compactors/snipCompactor.js'
-import { buildSystemPrompt, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
+import {
+  buildSystemPrompt,
+  extractAbsolutePaths,
+  mapEventsToMessages,
+} from '../src/runtime/LLMCodingRuntime.js'
 import type { NexusEvent } from '../src/shared/events.js'
 import type { ModelMessage } from '../src/providers/adapters/ModelAdapter.js'
 
@@ -91,12 +95,121 @@ test('selectRecentEvents starts at a recent user boundary instead of preserving 
     layerBudgets: { system: 10, memory: 10, summary: 10, recent: 70 },
     snipToolOutputChars: 100,
     recentEventLimit: 3,
+    recentTurnLimit: 1,
   })
 
   assert.equal(selected[0].type, 'user_message')
   assert.equal((selected[0] as any).text, 'latest question')
   assert.equal(selected.length, 2)
   assert.equal(selected.at(-1)?.type, 'session_started')
+})
+
+test('selectRecentEvents keeps recent user turns even when assistant deltas dominate the raw event window', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'analyze project A',
+    },
+  ]
+
+  for (let index = 0; index < 200; index += 1) {
+    events.push({
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: `2026-05-23T00:01:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: `long analysis fragment ${index}. `,
+    })
+  }
+
+  events.push({
+    type: 'user_message',
+    schemaVersion,
+    sessionId: 'session-context',
+    timestamp: '2026-05-23T00:02:00.000Z',
+    text: 'now compare architecture performance',
+  })
+
+  for (let index = 0; index < 400; index += 1) {
+    events.push({
+      type: 'thinking_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: `2026-05-23T00:03:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: `hidden reasoning fragment ${index}. `,
+    })
+  }
+
+  const selected = selectRecentEvents(events, {
+    maxTokens: 100,
+    maxChars: 400,
+    layerBudgets: { system: 10, memory: 10, summary: 10, recent: 70 },
+    snipToolOutputChars: 100,
+    recentEventLimit: 50,
+    recentTurnLimit: 1,
+  })
+
+  assert.equal(selected[0].type, 'user_message')
+  assert.equal((selected[0] as any).text, 'now compare architecture performance')
+  assert.equal(selected.length, 50)
+  assert.doesNotMatch(JSON.stringify(selected), /hidden reasoning fragment 0/)
+})
+
+test('selectRecentEvents caps selected user turns to the event budget', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'analyze BabeL-O',
+    },
+  ]
+
+  for (let index = 0; index < 120; index += 1) {
+    events.push({
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: `2026-05-23T00:01:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: `BabeL-O analysis fragment ${index}. `,
+    })
+  }
+
+  events.push({
+    type: 'user_message',
+    schemaVersion,
+    sessionId: 'session-context',
+    timestamp: '2026-05-23T00:02:00.000Z',
+    text: '/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比这个项目',
+  })
+
+  for (let index = 0; index < 300; index += 1) {
+    events.push({
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: `2026-05-23T00:03:${String(index % 60).padStart(2, '0')}.000Z`,
+      text: `stale BabeL-O follow-up fragment ${index}. `,
+    })
+  }
+
+  const selected = selectRecentEvents(events, {
+    maxTokens: 100,
+    maxChars: 400,
+    layerBudgets: { system: 10, memory: 10, summary: 10, recent: 70 },
+    snipToolOutputChars: 100,
+    recentEventLimit: 80,
+    recentTurnLimit: 4,
+  })
+
+  assert.equal(selected.length, 80)
+  assert.equal(selected[0].type, 'user_message')
+  assert.equal((selected[0] as any).text, '/Users/tangyaoyue/DEV/BABEL/BabeL-X横向对比这个项目')
+  assert.doesNotMatch(JSON.stringify(selected), /BabeL-O analysis fragment 0/)
 })
 
 test('assembleContext injects project memory and snips historical tool output', async () => {
@@ -186,6 +299,13 @@ test('assembleContext summarizes omitted older events without duplicating recent
       type: 'user_message',
       schemaVersion,
       sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:02.500Z',
+      text: 'note the old failure',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
       timestamp: '2026-05-23T00:00:03.000Z',
       text: 'then inspect the failing file',
     },
@@ -217,7 +337,7 @@ test('assembleContext summarizes omitted older events without duplicating recent
   assert.match(context.systemPrompt, /Read x1/)
   assert.match(context.systemPrompt, /src\/old\.ts/)
   assert.match(context.systemPrompt, /Read failed/)
-  assert.match(context.systemPrompt, /then inspect the failing file/)
+  assert.match(JSON.stringify(context.messages), /then inspect the failing file/)
 })
 
 test('assembleContext omits session summary when all events fit recent context', async () => {
@@ -283,10 +403,10 @@ test('assembleContext reduces long-session context by more than 50 percent while
   const assembledText = JSON.stringify(context.messages)
 
   assert.ok(reductionPct > 50, `expected >50% reduction, got ${reductionPct.toFixed(2)}%`)
-  assert.match(assembledText, /recent-turn-37/)
   assert.match(assembledText, /recent-turn-38/)
   assert.match(assembledText, /recent-turn-39/)
   assert.match(context.systemPrompt, /Session Summary/)
+  assert.match(context.systemPrompt, /recent-turn-37/)
 })
 
 test('assembleContext prioritizes the latest user question in long noisy sessions', async () => {
@@ -359,10 +479,47 @@ test('assembleContext prioritizes the latest user question in long noisy session
   assert.doesNotMatch(String(context.messages[0]?.content), /old project analysis fragment/)
   assert.match(context.systemPrompt, /Context Boundary:/)
   assert.match(context.systemPrompt, /authoritative working history/)
+  assert.match(context.systemPrompt, /Current user request:/)
+  assert.match(context.systemPrompt, /你还记得我们之前在讨论什么吗/)
+})
+
+test('buildSystemPrompt anchors explicit absolute paths from the current request', async () => {
+  const cwd = join(tmpdir(), `babel-o-path-anchor-${Date.now()}`)
+  const explicitTarget = join(cwd, 'BabeL-X')
+  await mkdir(explicitTarget, { recursive: true })
+
+  const prompt = `${explicitTarget}横向对比分析这个项目`
+  const paths = extractAbsolutePaths(prompt)
+  assert.deepEqual(paths, [explicitTarget])
+
+  const systemPrompt = buildSystemPrompt({
+    sessionId: 'session-context',
+    prompt,
+    cwd,
+  })
+
+  assert.match(systemPrompt, /Explicit paths in current request:/)
+  assert.match(systemPrompt, new RegExp(escapeRegExp(explicitTarget)))
+  const explicitPathBlock = systemPrompt.match(/Explicit paths in current request:\n(?<block>(?:- .+\n)+)/)?.groups?.block ?? ''
+  assert.doesNotMatch(explicitPathBlock, new RegExp(escapeRegExp(`${explicitTarget}横向`)))
+  assert.match(systemPrompt, /authoritative task targets/)
+  assert.match(systemPrompt, /inspect that explicit path first/)
+})
+
+test('extractAbsolutePaths does not collapse missing file paths to an existing parent directory', async () => {
+  const cwd = join(tmpdir(), `babel-o-missing-path-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+
+  const missingPath = join(cwd, 'missing.txt')
+  assert.deepEqual(extractAbsolutePaths(`请读取${missingPath}`), [missingPath])
 })
 
 function estimateMessagesChars(messages: ModelMessage[]): number {
   return JSON.stringify(messages).length
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
 function createLongSessionEvents(): NexusEvent[] {

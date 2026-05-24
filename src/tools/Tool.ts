@@ -6,6 +6,7 @@ export type ToolContext = {
   signal?: AbortSignal
   maxOutputBytes: number
   bashMaxBufferBytes: number
+  executionEnvironment?: 'local' | 'docker' | 'remote'
 }
 
 export type ToolResult = {

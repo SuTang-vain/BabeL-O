@@ -53,6 +53,11 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] tool trace 分页。
 - [x] 大 session hydrate 策略。
 - [x] storage restart benchmark。
+- [x] storageBridge durable WAL replay smoke。
+- [x] storageBridge 批量写入 / fsync 策略 smoke。
+- [x] storageBridge 1000 pending ops WAL replay smoke。
+- [ ] storageBridge 做故障注入压测：模拟 WAL 损坏、SQLite 写失败、进程崩溃中断、compact 失败，确认不会造成 task/session 状态分叉。
+- [ ] 重新评估 storageBridge 复杂度：如果故障注入收益不足，设计降级为更简单的 await 持久化或单层 async retry。
 
 ## P1 CLI Performance
 
@@ -70,12 +75,14 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] tool call roundtrip duration 记录。
 - [ ] retry policy benchmark。
 - [x] provider timeout policy。
+- [ ] AgentLoop 成本 benchmark：记录 Planner/Executor/Critic/SubAgent 各 role 的调用次数、token、耗时和失败率，支撑是否默认启用 Critic/子代理。
 
 ## P2 Observability / Metrics
 
 来自 `docs/RECOMMENDATIONS.md` 的 Milestone 5。目标是本地可观测，不迁移 BabeL-X 的 telemetry / analytics / GrowthBook。
 
-- [ ] 新增最小结构化 logger，支持 `NEXUS_LOG_LEVEL=silent`。
+- [x] 新增最小结构化 logger，支持 `NEXUS_LOG_LEVEL=silent`。
+- [x] Nexus/shared 层错误日志改为结构化 JSON 输出，避免生产环境散落 `console.error` 不可控。
 - [x] SQLite metrics 表记录执行指标。
 - [x] 记录 `execute_duration_ms`。
 - [x] 记录 `provider_first_token_ms`。
@@ -84,7 +91,8 @@ BabeL-O 从第一天就建立性能边界，避免重写后再次变成启动慢
 - [x] 记录 `tool_call_count`。
 - [x] 记录 `tool_roundtrip_duration_ms`。
 - [x] `/v1/runtime/metrics` 返回新增指标。
-- [ ] 压力测试覆盖 1000+ sessions。
+- [ ] 压力测试覆盖 1000+ sessions/events API 响应。
+- [ ] 测试并发化治理：梳理 `PendingPermissionRegistry`、TaskQueue、TaskSession、Bash CWD 等全局状态 reset，逐步移除 `--test-concurrency=1`。
 
 ## 验证命令
 

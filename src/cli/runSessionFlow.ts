@@ -10,6 +10,8 @@ import {
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../shared/config.js'
 import { createId } from '../shared/id.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
+import type { NexusEvent } from '../shared/events.js'
+import type { SessionPhase } from '../shared/session.js'
 import {
   CliReadline,
   sessionPermissionApprovals,
@@ -216,20 +218,47 @@ export async function runSessionFlow(
         if (abortController.signal.aborted) {
           finalSession.phase = 'cancelled'
         } else {
-          const eventsResult = await storage.listEvents(sessionId, { limit: 100 })
-          const events = eventsResult.events
-          const errorEvent = events.findLast(e => e.type === 'error')
-          const resultEvent = events.findLast(e => e.type === 'result')
-          const succeeded = !errorEvent && resultEvent?.type === 'result' && resultEvent.success
-          finalSession.phase = succeeded ? 'completed' : 'failed'
-          if (resultEvent?.type === 'result') finalSession.result = resultEvent.message
-          if (errorEvent?.type === 'error') finalSession.error = errorEvent.message
+          const eventsResult = await storage.listEvents(sessionId, {
+            limit: 100,
+            order: 'desc',
+          })
+          const outcome = resolveFinalSessionOutcome(eventsResult.events)
+          finalSession.phase = outcome.phase
+          if (outcome.result !== undefined) finalSession.result = outcome.result
+          if (outcome.error !== undefined) finalSession.error = outcome.error
         }
         finalSession.updatedAt = new Date().toISOString()
         await storage.saveSession(finalSession)
       }
       await storage.close?.()
     }
+    PendingPermissionRegistry.getInstance().resolveSession(sessionId, {
+      approved: false,
+      reason: 'Session finished',
+    })
     return sessionId
+  }
+}
+
+export function resolveFinalSessionOutcome(eventsNewestFirst: NexusEvent[]): {
+  phase: SessionPhase
+  result?: string
+  error?: string
+} {
+  const terminalEvent = eventsNewestFirst.find(event =>
+    event.type === 'error' || event.type === 'result'
+  )
+  if (!terminalEvent) return { phase: 'failed' }
+
+  if (terminalEvent.type === 'error') {
+    return {
+      phase: 'failed',
+      error: terminalEvent.message,
+    }
+  }
+
+  return {
+    phase: terminalEvent.success ? 'completed' : 'failed',
+    result: terminalEvent.message,
   }
 }

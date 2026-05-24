@@ -264,3 +264,76 @@ test('formatTaskStatusPanel renders task status board correctly', () => {
   assert.ok(output.includes('⟳ 规划中'))
   assert.ok(output.includes('Run migrations'))
 })
+
+test('formatTaskStatusPanel renders delegated subtask hierarchy', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-subtasks',
+      eventId: 'event-parent-blocked',
+      eventType: 'task_blocked',
+      phase: 'executing',
+      timestamp: now,
+      payload: {
+        task: {
+          taskId: '1',
+          sessionId: 'sess-subtasks',
+          title: 'Parent feature',
+          status: 'blocked',
+          dependsOn: ['2'],
+          blocks: [],
+          retryCount: 0,
+          metadata: { delegatedSubTaskIds: ['2'] },
+          createdAt: now,
+          updatedAt: now,
+        },
+      },
+    },
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-subtasks',
+      eventId: 'event-delegated',
+      eventType: 'subtasks_delegated',
+      phase: 'executing',
+      timestamp: now,
+      payload: {
+        parentTask: {
+          taskId: '1',
+          sessionId: 'sess-subtasks',
+          title: 'Parent feature',
+          status: 'blocked',
+          dependsOn: ['2'],
+          blocks: [],
+          retryCount: 0,
+          metadata: { delegatedSubTaskIds: ['2'] },
+          createdAt: now,
+          updatedAt: now,
+        },
+        subTasks: [
+          {
+            taskId: '2',
+            sessionId: 'sess-subtasks',
+            title: 'Child implementation',
+            status: 'pending',
+            dependsOn: [],
+            blocks: ['1'],
+            retryCount: 0,
+            metadata: { parentTaskId: '1', depth: 1 },
+            createdAt: now,
+            updatedAt: now,
+          },
+        ],
+      },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('Ⅱ 等待子任务'))
+  assert.ok(output.includes('Parent feature'))
+  assert.ok(output.includes('delegated #2'))
+  assert.ok(output.includes('Child implementation'))
+  assert.ok(output.includes('parent #1'))
+})

@@ -46,6 +46,22 @@ export const ExecutorInputSchema = z.object({
   taskId: z.string().min(1),
   title: z.string().min(1),
   description: z.string().optional(),
+  orchestration: z
+    .object({
+      enableSubAgents: z.boolean(),
+      currentDepth: z.number().int().min(0),
+      maxDepth: z.number().int().min(0),
+      remainingDepth: z.number().int().min(0),
+      delegatedSubTaskIds: z.array(z.string()).optional(),
+    })
+    .optional(),
+})
+
+export const SubTaskOutputSchema = z.object({
+  title: z.string().min(1),
+  description: z.string().optional(),
+  requiresIsolation: z.boolean().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
 })
 
 export const ExecutorOutputSchema = z.object({
@@ -54,6 +70,7 @@ export const ExecutorOutputSchema = z.object({
   result: z.string().min(1),
   needsReview: z.boolean().optional(),
   metadata: z.record(z.string(), z.unknown()).optional(),
+  subTasks: z.array(SubTaskOutputSchema).optional(),
 })
 
 export const CriticInputSchema = z.object({
@@ -82,7 +99,7 @@ export const PLANNER_ROLE: AgentRoleDefinition = {
     capability: 'long-context',
   },
   toolPolicy: {
-    allowedTools: [],
+    allowedTools: ['Read', 'Grep', 'Glob'],
     requiresApproval: false,
   },
   inputSchema: PlannerInputSchema,
@@ -93,7 +110,7 @@ export const EXECUTOR_ROLE: AgentRoleDefinition = {
   role: 'executor',
   version: '2026-05-17.p1-b',
   systemPrompt:
-    'You are the Executor in a BabeL-Nexus workforce. Claim one task, execute only that task through the BabeL Runtime, and return a concise structured result. Do not create unrelated tasks.',
+    'You are the Executor in a BabeL-Nexus workforce. Claim one task and execute only that task through the BabeL Runtime. If orchestration.enableSubAgents is true and the task is too large for one focused step, you may return substantive subTasks instead of doing all work yourself. Do not delegate trivial file reads, simple commands, or duplicate work. If orchestration.remainingDepth is 0, execute directly and do not create subTasks. Return a concise structured result.',
   modelPreference: {
     capability: 'tool-stable',
   },
@@ -125,7 +142,7 @@ export const OPTIMIZER_ROLE: AgentRoleDefinition = {
   role: 'optimizer',
   version: '2026-05-22.p2-b',
   systemPrompt:
-    'You are the Optimizer in a BabeL-Nexus workforce. Your goal is to optimize existing code for better performance, complexity, safety, and cleanliness. Ensure compilation passes and run validation tests. Return only structured JSON matching the ExecutorOutput schema.',
+    'You are the Optimizer in a BabeL-Nexus workforce. Your goal is to optimize existing code for better performance, complexity, safety, and cleanliness. Ensure compilation passes and run validation tests. If orchestration.enableSubAgents is true and the optimization is too broad for one focused step, you may return substantive subTasks; do not delegate trivial reads or duplicate work. If orchestration.remainingDepth is 0, execute directly and do not create subTasks. Return only structured JSON matching the ExecutorOutput schema.',
   modelPreference: {
     capability: 'tool-stable',
   },

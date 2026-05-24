@@ -8,6 +8,9 @@ import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { LocalCodingRuntime } from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
+import { createNexusTask, taskQueueStatsForTest } from '../src/nexus/taskQueue.js'
+import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSession.js'
+import { PendingPermissionRegistry } from '../src/shared/session.js'
 
 test('execute reads a workspace file and records session events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}`)
@@ -31,6 +34,60 @@ test('execute reads a workspace file and records session events', async () => {
     const session = await storage.getSession(body.sessionId)
     assert.ok(session)
     assert.ok(session.events.length >= 3)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Read returns a recoverable tool result for directories', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-dir`)
+  await mkdir(join(cwd, 'src'), { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read src', cwd },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Read',
+    )
+    assert.equal(toolCompleted.success, false)
+    assert.match(String(toolCompleted.output), /is a directory/)
+    assert.equal(body.result.success, false)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Read returns a recoverable tool result for missing files', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-missing`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read missing.txt', cwd },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Read',
+    )
+    assert.equal(toolCompleted.success, false)
+    assert.match(String(toolCompleted.output), /could not find/)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
   } finally {
     await app.close()
   }
@@ -200,6 +257,65 @@ test('session input, cancel, and task lifecycle endpoints update state', async (
     const session = await storage.getSession(sessionId)
     assert.equal(session?.phase, 'cancelled')
   } finally {
+    await app.close()
+  }
+})
+
+test('session close cascades runtime session state cleanup', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-session-close`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    allowedTools: ['Bash'],
+  })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  const sessionId = `session-close-${Date.now()}`
+  const registry = PendingPermissionRegistry.getInstance()
+  registry.resetForTest()
+
+  try {
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'close me',
+      phase: 'executing',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: [],
+    })
+
+    createTaskSession({ sessionId, cwd, prompt: 'close me' })
+    createNexusTask({ queueId: sessionId, title: 'cleanup task' })
+    const pendingPermission = registry.register(sessionId, 'tool-close-test')
+
+    const { bashTool, getBashSessionStateSizeForTest } = await import('../src/tools/builtin/bash.js')
+    await bashTool.execute({ command: 'cd /', timeoutMs: 10_000 }, {
+      cwd,
+      sessionId,
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 10_000,
+    })
+    assert.equal(getBashSessionStateSizeForTest(), 1)
+    assert.equal(taskQueueStatsForTest().tasks, 1)
+    assert.equal(taskSessionStatsForTest().sessions, 1)
+    assert.equal(registry.pendingCount(), 1)
+
+    const closeResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/close`,
+      payload: { reason: 'test close' },
+    })
+    assert.equal(closeResponse.statusCode, 200)
+    assert.equal(closeResponse.json().type, 'session_closed')
+
+    const permissionResult = await pendingPermission
+    assert.equal(permissionResult.approved, false)
+    assert.equal(permissionResult.reason, 'test close')
+    assert.equal(getBashSessionStateSizeForTest(), 0)
+    assert.equal(taskQueueStatsForTest().tasks, 0)
+    assert.equal(taskSessionStatsForTest().sessions, 0)
+    assert.equal(registry.pendingCount(), 0)
+  } finally {
+    registry.resetForTest()
     await app.close()
   }
 })
@@ -533,6 +649,38 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
   }
 })
 
+test('tool errors preserve structured stdout and stderr details', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-tool-error-details`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: cwd,
+  })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'bash "printf visible-out && printf visible-err >&2 && exit 7"',
+        cwd,
+        skipPermissionCheck: true,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const errorEvent = body.events.find((event: { type: string }) => event.type === 'error')
+    assert.ok(errorEvent)
+    assert.equal(errorEvent.code, 'TOOL_ERROR')
+    assert.match(errorEvent.details.stdout, /visible-out/)
+    assert.match(errorEvent.details.stderr, /visible-err/)
+    assert.equal(errorEvent.details.code, 7)
+  } finally {
+    await app.close()
+  }
+})
+
 test('websocket stream executes prompts and records stream metrics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream`)
   await mkdir(cwd, { recursive: true })
@@ -725,7 +873,7 @@ test('bash tool ignores forged state markers and exposes session cleanup', async
   await mkdir(forgedDir, { recursive: true })
 
   const { bashTool, clearBashSessionState, getBashSessionStateSizeForTest, pruneBashSessionState } = await import('../src/tools/builtin/bash.js')
-  clearBashSessionState()
+  await clearBashSessionState()
   const ctx = {
     cwd: baseCwd,
     sessionId: `forged-session-${Date.now()}`,
@@ -750,7 +898,7 @@ test('bash tool ignores forged state markers and exposes session cleanup', async
   assert.equal(pruneBashSessionState({ olderThanMs: 0, nowMs: Date.now() + 1_000 }), 1)
   assert.equal(getBashSessionStateSizeForTest(), 0)
 
-  clearBashSessionState(ctx.sessionId)
+  await clearBashSessionState(ctx.sessionId)
   assert.equal(getBashSessionStateSizeForTest(), 0)
 })
 
@@ -810,12 +958,17 @@ test('Glob tool enforces maxResults limits and appends truncation warning', asyn
   assert.ok(Array.isArray(res.output))
   assert.equal(res.output.length, 3) // 2 sliced + 1 warning element
   assert.match(res.output[2] as string, /more results truncated/)
+
+  const absoluteRes = await globTool.execute({ pattern: cwd, maxResults: 10 }, ctx)
+  assert.equal(absoluteRes.success, true)
+  assert.ok(Array.isArray(absoluteRes.output))
+  assert.ok(absoluteRes.output.includes('file1.txt'))
 })
 
 test('executionEnvironment parameter validation', async () => {
   const cwd = join(tmpdir(), `babel-o-test-exec-env-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = await createDefaultNexusRuntime()
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   try {
@@ -823,13 +976,14 @@ test('executionEnvironment parameter validation', async () => {
     const executeRes = await app.inject({
       method: 'POST',
       url: '/v1/execute',
-      payload: { prompt: 'hello', executionEnvironment: 'docker', cwd },
+      payload: { prompt: 'bash echo hello-sandbox', executionEnvironment: 'docker', cwd, skipPermissionCheck: true },
     })
-    assert.equal(executeRes.statusCode, 501)
+    assert.equal(executeRes.statusCode, 200)
     const body = executeRes.json()
-    assert.equal(body.type, 'error')
-    assert.equal(body.code, 'NOT_IMPLEMENTED')
-    assert.match(body.message, /Only 'local' is supported/)
+    assert.equal(body.type, 'execute_result')
+    const hasDockerError = body.events.some((e: any) => e.type === 'error' && (e.message.includes('Docker') || e.message.includes('docker')))
+    const hasSuccess = body.events.some((e: any) => e.type === 'tool_completed' && e.success === true && String(e.output?.stdout).includes('hello-sandbox'))
+    assert.ok(hasDockerError || hasSuccess, 'Should either fail with a Docker error or succeed in a Docker sandbox container')
 
     // 2. /v1/stream with remote
     const address = await app.listen({ port: 0 })
@@ -855,7 +1009,7 @@ test('executionEnvironment parameter validation', async () => {
     assert.equal(events.length, 1)
     assert.equal(events[0].type, 'error')
     assert.equal(events[0].code, 'NOT_IMPLEMENTED')
-    assert.match(events[0].message, /Only 'local' is supported/)
+    assert.match(events[0].message, /Execution environment 'remote' is not implemented yet/)
   } finally {
     await app.close()
   }

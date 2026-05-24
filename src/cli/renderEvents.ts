@@ -1,5 +1,6 @@
 import chalk from 'chalk'
 import type { NexusEvent } from '../shared/events.js'
+import type { NexusTask, TaskStatus } from '../shared/task.js'
 import { renderDiff } from './diff.js'
 
 function stripAnsi(text: string): string {
@@ -494,8 +495,17 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   return outputText
 }
 
+type TaskBoardItem = {
+  taskId?: string
+  title: string
+  status: TaskStatus
+  parentTaskId?: string
+  depth: number
+  delegatedSubTaskIds?: string[]
+}
+
 export function formatTaskStatusPanel(events: NexusEvent[]): string {
-  const tasks: { taskId?: string; title: string; status: 'pending' | 'in_progress' | 'completed' | 'failed' }[] = []
+  const tasks: TaskBoardItem[] = []
   const taskIdToTitle = new Map<string, string>()
 
   for (const ev of events) {
@@ -506,7 +516,7 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
       if (existing) {
         existing.taskId = taskId
       } else {
-        tasks.push({ taskId, title, status: 'pending' })
+        tasks.push({ taskId, title, status: 'pending', depth: 0 })
       }
       taskIdToTitle.set(taskId, title)
     } else if (ev.type === 'task_session_event') {
@@ -514,11 +524,15 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
         plannerOutput?: {
           tasks?: Array<{ title?: string; description?: string }>
         }
+        task?: NexusTask
+        parentTask?: NexusTask
+        subTasks?: NexusTask[]
         taskId?: string
         title?: string
         approved?: boolean
       }
       const payload = ev.payload as TaskSessionPayload | undefined
+      if (payload?.task) upsertTaskBoardItem(tasks, taskIdToTitle, payload.task)
 
       if (ev.eventType === 'planner_completed') {
         const plannerOutput = payload?.plannerOutput
@@ -526,23 +540,41 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
           for (const t of plannerOutput.tasks) {
             if (t && t.title) {
               if (!tasks.some(existing => existing.title === t.title)) {
-                tasks.push({ title: t.title, status: 'pending' })
+                tasks.push({ title: t.title, status: 'pending', depth: 0 })
               }
             }
           }
         }
+      } else if (ev.eventType === 'planner_review_approved') {
+        const approvedTasks = Array.isArray((payload as any)?.tasks) ? (payload as any).tasks : []
+        for (const task of approvedTasks) {
+          if (task && typeof task.title === 'string' && !tasks.some(existing => existing.title === task.title)) {
+            tasks.push({ title: task.title, status: 'pending', depth: 0 })
+          }
+        }
+      } else if (ev.eventType === 'subtasks_delegated') {
+        if (payload?.parentTask) upsertTaskBoardItem(tasks, taskIdToTitle, payload.parentTask)
+        if (Array.isArray(payload?.subTasks)) {
+          for (const subTask of payload.subTasks) upsertTaskBoardItem(tasks, taskIdToTitle, subTask)
+        }
       } else if (ev.eventType === 'task_claimed') {
-        if (payload && payload.taskId) {
+        if (payload?.task) {
+          upsertTaskBoardItem(tasks, taskIdToTitle, { ...payload.task, status: 'in_progress' })
+        } else if (payload && payload.taskId) {
           taskIdToTitle.set(payload.taskId, payload.title || '')
           let task = tasks.find(t => t.title === payload.title || t.taskId === payload.taskId)
           if (!task) {
-            task = { taskId: payload.taskId, title: payload.title || '', status: 'in_progress' }
+            task = { taskId: payload.taskId, title: payload.title || '', status: 'in_progress', depth: 0 }
             tasks.push(task)
           } else {
             task.taskId = payload.taskId
             task.status = 'in_progress'
           }
         }
+      } else if (ev.eventType === 'task_blocked') {
+        if (payload?.task) upsertTaskBoardItem(tasks, taskIdToTitle, { ...payload.task, status: 'blocked' })
+      } else if (ev.eventType === 'task_completed' || ev.eventType === 'task_updated' || ev.eventType === 'task_created') {
+        if (payload?.task) upsertTaskBoardItem(tasks, taskIdToTitle, payload.task)
       } else if (ev.eventType === 'critic_completed') {
         if (payload && payload.taskId) {
           const title = taskIdToTitle.get(payload.taskId)
@@ -575,7 +607,7 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
       if (output && output.title) {
         const existing = tasks.find(t => t.title === output.title)
         if (!existing) {
-          tasks.push({ title: output.title, status: 'completed' })
+          tasks.push({ title: output.title, status: 'completed', depth: 0 })
         } else {
           existing.status = 'completed'
         }
@@ -595,16 +627,52 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
       case 'in_progress':
         coloredStatus = chalk.cyan('▶ 执行中')
         break
+      case 'blocked':
+        coloredStatus = chalk.magenta('Ⅱ 等待子任务')
+        break
       case 'completed':
         coloredStatus = chalk.green('✓ 已完成')
         break
       case 'failed':
         coloredStatus = chalk.red('✗ 已失败')
         break
+      case 'cancelled':
+        coloredStatus = chalk.red('✗ 已取消')
+        break
     }
-    panel += `  ${coloredStatus}  ${t.title}\n`
+    const indent = '  '.repeat(Math.max(0, t.depth))
+    const meta: string[] = []
+    if (t.taskId) meta.push(`#${t.taskId}`)
+    if (t.parentTaskId) meta.push(`parent #${t.parentTaskId}`)
+    if (t.delegatedSubTaskIds?.length) meta.push(`delegated ${t.delegatedSubTaskIds.map(id => `#${id}`).join(',')}`)
+    const suffix = meta.length > 0 ? chalk.dim(` (${meta.join(' · ')})`) : ''
+    panel += `  ${indent}${coloredStatus}  ${t.title}${suffix}\n`
   }
   return panel
+}
+
+function upsertTaskBoardItem(
+  tasks: TaskBoardItem[],
+  taskIdToTitle: Map<string, string>,
+  task: NexusTask,
+) {
+  taskIdToTitle.set(task.taskId, task.title)
+  const existing = tasks.find(item => item.taskId === task.taskId || item.title === task.title)
+  const next: TaskBoardItem = {
+    taskId: task.taskId,
+    title: task.title,
+    status: task.status,
+    parentTaskId: typeof task.metadata?.parentTaskId === 'string' ? task.metadata.parentTaskId : undefined,
+    depth: typeof task.metadata?.depth === 'number' ? task.metadata.depth : 0,
+    delegatedSubTaskIds: Array.isArray(task.metadata?.delegatedSubTaskIds)
+      ? task.metadata.delegatedSubTaskIds.filter(id => typeof id === 'string')
+      : undefined,
+  }
+  if (!existing) {
+    tasks.push(next)
+    return
+  }
+  Object.assign(existing, next)
 }
 
 function formatAgentStatusLine(event: Extract<NexusEvent, { type: 'session_started' }>): string {

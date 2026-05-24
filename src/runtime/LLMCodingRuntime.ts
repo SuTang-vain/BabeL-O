@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { performance } from 'node:perf_hooks'
+import { existsSync } from 'node:fs'
 import { errorMessage, ProviderError } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
@@ -28,7 +29,7 @@ import { assembleContext } from './contextAssembler.js'
 export class LLMCodingRuntime implements NexusRuntime {
   constructor(
     private readonly tools: Map<string, AnyTool>,
-    private readonly toolPolicy: ToolPolicy,
+    private toolPolicy: ToolPolicy,
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
   ) {}
@@ -43,6 +44,16 @@ export class LLMCodingRuntime implements NexusRuntime {
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
+    const previousPolicy = this.toolPolicy
+    this.toolPolicy = toolPolicy
+    try {
+      return fn()
+    } finally {
+      this.toolPolicy = previousPolicy
+    }
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
@@ -66,7 +77,9 @@ export class LLMCodingRuntime implements NexusRuntime {
 
     try {
       // 1. Resolve connection and credential settings
-      const settings = this.configManager.resolveSettings()
+      const settings = this.configManager.resolveSettings({
+        model: options.model,
+      })
 
       // 2. Load previous session events from storage (if any)
       let previousEvents: NexusEvent[] = []
@@ -128,11 +141,13 @@ export class LLMCodingRuntime implements NexusRuntime {
         contextCharsIn += turnCharsIn
 
         // Convert tool registry definitions to JSON Schema objects using Zod native export
-        const toolsList = [...this.tools.values()].map(tool => ({
-          name: tool.name,
-          description: tool.description,
-          inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
-        }))
+        const toolsList = [...this.tools.values()]
+          .filter(tool => this.toolPolicy.isAllowed(tool))
+          .map(tool => ({
+            name: tool.name,
+            description: tool.description,
+            inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
+          }))
 
         const queryParams: ModelQueryParams = {
           model: cleanedModelId,
@@ -265,6 +280,34 @@ export class LLMCodingRuntime implements NexusRuntime {
 
         // If no tool call was issued, we yield the final result and terminate loop
         if (currentToolCalls.length === 0) {
+          if (currentAssistantText.trim().length === 0) {
+            yield {
+              type: 'error',
+              ...eventBase(options.sessionId),
+              code: 'EMPTY_PROVIDER_RESPONSE',
+              message: 'Provider returned an empty assistant response with no tool calls.',
+            }
+            yield {
+              type: 'result',
+              ...eventBase(options.sessionId),
+              success: false,
+              message: 'Provider returned an empty assistant response with no tool calls.',
+            }
+            yield {
+              type: 'execution_metrics',
+              ...eventBase(options.sessionId),
+              requestId: options.requestId,
+              executeDurationMs: performance.now() - executionStartMs,
+              providerFirstTokenMs,
+              providerRequestDurationMs: totalProviderRequestDurationMs,
+              streamDeltaCount,
+              toolCallCount,
+              toolRoundtripDurationMs: totalToolDurationMs,
+              contextCharsIn,
+              contextCharsOut,
+            }
+            return
+          }
           yield {
             type: 'result',
             ...eventBase(options.sessionId),
@@ -454,6 +497,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               ...eventBase(options.sessionId),
               code: result.code,
               message: result.message,
+              details: result.details,
             }
             return
           }
@@ -544,7 +588,7 @@ async function executeToolSafely(
       truncated?: boolean
       originalBytes?: number
     }
-  | { kind: 'error'; code: string; message: string }
+  | { kind: 'error'; code: string; message: string; details?: unknown }
 > {
   try {
     const result = await tool.execute(input, {
@@ -553,6 +597,7 @@ async function executeToolSafely(
       signal: options.signal,
       maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
       bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
+      executionEnvironment: options.executionEnvironment,
     })
     const truncated = truncateToolOutput(
       result.output,
@@ -577,8 +622,32 @@ async function executeToolSafely(
       kind: 'error',
       code: 'TOOL_ERROR',
       message: errorMessage(error),
+      details: normalizeToolErrorDetails(error, options.maxToolOutputBytes ?? 200_000),
     }
   }
+}
+
+function normalizeToolErrorDetails(error: unknown, maxBytes: number): unknown {
+  if (!error || typeof error !== 'object') return undefined
+  const record = error as Record<string, unknown>
+  const details: Record<string, unknown> = {}
+
+  if (record.code !== undefined) details.code = record.code
+  if (record.signal !== undefined) details.signal = record.signal
+  if (record.exitCode !== undefined) details.exitCode = record.exitCode
+
+  for (const streamName of ['stdout', 'stderr'] as const) {
+    const value = record[streamName]
+    if (typeof value !== 'string' || value.length === 0) continue
+    const truncated = truncateToolOutput(value, maxBytes)
+    details[streamName] = truncated.value
+    if (truncated.truncated) {
+      details[`${streamName}Truncated`] = true
+      details[`${streamName}OriginalBytes`] = truncated.originalBytes
+    }
+  }
+
+  return Object.keys(details).length > 0 ? details : undefined
 }
 
 export function buildSystemPrompt(
@@ -599,11 +668,16 @@ export function buildSystemPrompt(
   const skillsBlock = activeSkills.trim()
     ? `\n${activeSkills.trim()}\n`
     : ''
+  const requestPathBlock = buildRequestPathBlock(options.prompt)
 
   return `You are BabeL-O, a powerful agentic AI coding assistant designed to help developers with tasks.
 You are running in the workspace: ${options.cwd}
 Current OS: ${process.platform}
 Current time: ${new Date().toISOString()}
+Current user request:
+${options.prompt}
+
+${requestPathBlock}
 ${memoryBlock}
 ${boundaryBlock}
 ${summaryBlock}
@@ -614,7 +688,47 @@ Guidelines:
 3. Keep your explanations concise and direct.
 4. When writing code, ensure correct syntax and path safety within the workspace.
 5. All operations must be confined to the current directory (${options.cwd}). Do not access files outside this workspace.
+6. Treat the current user request above as authoritative. If older session history conflicts with it, follow the current request.
+7. If the current request contains explicit absolute paths, treat those paths as authoritative task targets. Do not replace them with a project from older history. If the request asks to compare/cross-analyze and only one explicit path is present, inspect that explicit path first, then use the most relevant prior project only as the comparison baseline.
 `
+}
+
+function buildRequestPathBlock(prompt: string): string {
+  const paths = extractAbsolutePaths(prompt)
+  if (paths.length === 0) return ''
+
+  const lines = paths.map(path => {
+    const status = existsSync(path) ? 'exists' : 'not found'
+    return `- ${path} (${status})`
+  })
+
+  return `Explicit paths in current request:\n${lines.join('\n')}\n`
+}
+
+export function extractAbsolutePaths(text: string): string[] {
+  const paths = new Set<string>()
+  const pathPattern = /\/[^\s"'`，。！？；：、）\])}<>]+/g
+  for (const match of text.matchAll(pathPattern)) {
+    const cleaned = match[0].replace(/[.,;:!?]+$/u, '')
+    const resolved = resolvePromptPath(cleaned)
+    if (resolved !== '/') paths.add(resolved)
+  }
+  return [...paths]
+}
+
+function resolvePromptPath(candidate: string): string {
+  if (existsSync(candidate)) return candidate
+
+  for (let index = candidate.length - 1; index > 1; index -= 1) {
+    const prefix = candidate.slice(0, index)
+    if (!existsSync(prefix)) continue
+    const suffix = candidate.slice(index)
+    if (!/^[\p{Script=Han}]/u.test(suffix)) break
+    if (prefix.length >= candidate.length * 0.5) return prefix
+    break
+  }
+
+  return candidate
 }
 
 export function mapEventsToMessages(
@@ -628,19 +742,35 @@ export function mapEventsToMessages(
   messages.push({ role: 'user', content: initial })
 
   const completedToolIds = new Set<string>()
+  const startedToolIds = new Set<string>()
   for (const event of events) {
+    if (event.type === 'tool_started') {
+      startedToolIds.add(event.toolUseId)
+    }
     if (event.type === 'tool_completed') {
       completedToolIds.add(event.toolUseId)
     }
   }
 
+  let pendingToolResultMsg: ModelMessage | null = null
+  let pendingToolAssistantMsg: ModelMessage | null = null
+
   for (const event of events) {
     if (event.type === 'user_message') {
-      if (messages.length === 1 && messages[0].content === event.text) {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      const lastMsg = messages[messages.length - 1]
+      if (
+        lastMsg?.role === 'user' &&
+        typeof lastMsg.content === 'string' &&
+        lastMsg.content === event.text
+      ) {
         continue
       }
       messages.push({ role: 'user', content: event.text })
     } else if (event.type === 'assistant_delta') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
       let lastMsg = messages[messages.length - 1]
       if (!lastMsg || lastMsg.role !== 'assistant') {
         lastMsg = { role: 'assistant', content: '', reasoningContent: '' }
@@ -657,19 +787,21 @@ export function mapEventsToMessages(
         }
       }
     } else if (event.type === 'thinking_delta') {
-      let lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = { role: 'assistant', content: '', reasoningContent: '' }
-        messages.push(lastMsg)
-      }
-      lastMsg.reasoningContent = (lastMsg.reasoningContent || '') + event.text
+      // Keep thinking_delta in the event log for UI/history, but do not replay
+      // prior hidden reasoning into future provider calls. Some providers treat
+      // reasoningContent as live context, which can pollute follow-up turns.
+      continue
     } else if (event.type === 'tool_started') {
-      let lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = { role: 'assistant', content: [] }
-        messages.push(lastMsg)
-      } else if (typeof lastMsg.content === 'string') {
-        lastMsg.content = lastMsg.content ? [{ type: 'text', text: lastMsg.content }] : []
+      let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
+      if (!lastMsg) {
+        lastMsg = messages[messages.length - 1]
+        if (!lastMsg || lastMsg.role !== 'assistant' || !isToolCompatibleAssistantMessage(lastMsg)) {
+          lastMsg = { role: 'assistant', content: [] }
+          messages.push(lastMsg)
+        } else if (typeof lastMsg.content === 'string') {
+          lastMsg.content = lastMsg.content ? [{ type: 'text', text: lastMsg.content }] : []
+        }
+        pendingToolAssistantMsg = lastMsg
       }
       ;(lastMsg.content as ContentBlock[]).push({
         type: 'tool_use',
@@ -681,10 +813,11 @@ export function mapEventsToMessages(
       // If this tool was started but never completed (e.g. denied or interrupted),
       // we must synthetically complete it with an error result block so future queries don't break.
       if (!completedToolIds.has(event.toolUseId)) {
-        let lastUserMsg = messages.findLast(m => m.role === 'user')
+        let lastUserMsg: ModelMessage | null = pendingToolResultMsg
         if (!lastUserMsg || typeof lastUserMsg.content === 'string') {
           lastUserMsg = { role: 'user', content: [] }
           messages.push(lastUserMsg)
+          pendingToolResultMsg = lastUserMsg
         }
         ;(lastUserMsg.content as ContentBlock[]).push({
           type: 'tool_result',
@@ -693,11 +826,12 @@ export function mapEventsToMessages(
           isError: true,
         })
       }
-    } else if (event.type === 'tool_completed') {
-      let lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'user' || typeof lastMsg.content === 'string') {
+    } else if (event.type === 'tool_completed' && startedToolIds.has(event.toolUseId)) {
+      let lastMsg: ModelMessage | null = pendingToolResultMsg
+      if (!lastMsg || typeof lastMsg.content === 'string') {
         lastMsg = { role: 'user', content: [] }
         messages.push(lastMsg)
+        pendingToolResultMsg = lastMsg
       }
       const outputText =
         typeof event.output === 'string'
@@ -713,4 +847,11 @@ export function mapEventsToMessages(
   }
 
   return messages
+}
+
+function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {
+  if (message.role !== 'assistant' || typeof message.content === 'string') {
+    return message.role === 'assistant'
+  }
+  return message.content.every(block => block.type === 'text' || block.type === 'tool_use')
 }

@@ -90,6 +90,7 @@ export const ErrorEventSchema = z.object({
   ...baseEventFields,
   code: z.string(),
   message: z.string(),
+  details: z.unknown().optional(),
 })
 
 export const TaskSessionEventSchema = z.object({
@@ -162,4 +163,3 @@ export function eventBase(sessionId: string) {
     timestamp: new Date().toISOString(),
   } as const
 }
-

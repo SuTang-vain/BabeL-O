@@ -1,5 +1,6 @@
 import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
+import { logger } from '../shared/logger.js'
 
 const host = process.env.NEXUS_HOST ?? '127.0.0.1'
 const port = Number(process.env.NEXUS_PORT ?? 3000)
@@ -7,7 +8,7 @@ const port = Number(process.env.NEXUS_PORT ?? 3000)
 try {
   validateSecurityConfig(host, process.env.NEXUS_API_KEY)
 } catch (err: any) {
-  console.error(err.message)
+  logger.error('Nexus server failed security validation', err)
   process.exit(1)
 }
 const cwd = process.env.BABEL_O_WORKSPACE ?? process.cwd()
@@ -20,6 +21,9 @@ const maxToolOutputBytes =
   parsePositiveInt(process.env.NEXUS_MAX_TOOL_OUTPUT_BYTES) ?? 200_000
 const bashMaxBufferBytes =
   parsePositiveInt(process.env.NEXUS_BASH_MAX_BUFFER_BYTES) ?? 1_000_000
+const storageWalBatchSize = parsePositiveInt(process.env.NEXUS_STORAGE_WAL_BATCH_SIZE)
+const storageWalFlushIntervalMs = parseNonNegativeInt(process.env.NEXUS_STORAGE_WAL_FLUSH_INTERVAL_MS)
+const storageWalFsync = parseBoolean(process.env.NEXUS_STORAGE_WAL_FSYNC)
 
 const enableMcp = process.env.BABEL_O_ENABLE_MCP === '1'
 const { runtime, storage } = await createDefaultNexusRuntime({
@@ -27,6 +31,11 @@ const { runtime, storage } = await createDefaultNexusRuntime({
   allowedTools,
   cwd,
   enableMcp,
+  storageWal: {
+    batchSize: storageWalBatchSize,
+    flushIntervalMs: storageWalFlushIntervalMs,
+    fsync: storageWalFsync,
+  },
 })
 const app = await createNexusApp({
   runtime,
@@ -64,4 +73,19 @@ function parsePositiveInt(value: string | undefined): number | undefined {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed <= 0) return undefined
   return parsed
+}
+
+function parseNonNegativeInt(value: string | undefined): number | undefined {
+  if (!value) return undefined
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed < 0) return undefined
+  return parsed
+}
+
+function parseBoolean(value: string | undefined): boolean | undefined {
+  if (!value) return undefined
+  const normalized = value.trim().toLowerCase()
+  if (normalized === '1' || normalized === 'true' || normalized === 'yes') return true
+  if (normalized === '0' || normalized === 'false' || normalized === 'no') return false
+  return undefined
 }

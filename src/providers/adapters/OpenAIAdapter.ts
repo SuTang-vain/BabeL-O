@@ -18,6 +18,8 @@ export class OpenAIAdapter implements ModelAdapter {
     const slashIndex = params.model.indexOf('/')
     const targetModel =
       slashIndex !== -1 ? params.model.substring(slashIndex + 1) : params.model
+    const providerId =
+      slashIndex !== -1 ? params.model.substring(0, slashIndex) : 'openai'
 
     const apiKey = options?.apiKey || process.env.OPENAI_API_KEY || ''
     const baseUrl =
@@ -135,7 +137,7 @@ export class OpenAIAdapter implements ModelAdapter {
 
     if (!response.ok) {
       const errorText = await response.text()
-      throw new ProviderError('openai', response.status, errorText)
+      throw new ProviderError(providerId, response.status, errorText)
     }
 
     if (!response.body) {

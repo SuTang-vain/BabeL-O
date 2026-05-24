@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process'
 import { readdir } from 'node:fs/promises'
-import { join, relative } from 'node:path'
+import { isAbsolute, join, relative } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
@@ -38,11 +38,11 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
         throw error
       }
     }
-    const needle = input.pattern.replaceAll('*', '')
+    const needle = normalizeGlobNeedle(input.pattern, context.cwd)
     const files = stdout
       .split('\n')
       .filter(Boolean)
-      .filter(file => file.includes(needle))
+      .filter(file => needle === '' || file.includes(needle))
     const truncated = files.length > input.maxResults
     const sliced = files.slice(0, input.maxResults)
     if (truncated) {
@@ -50,6 +50,19 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
     }
     return { success: true, output: sliced }
   },
+}
+
+function normalizeGlobNeedle(pattern: string, cwd: string): string {
+  let needle = pattern.trim().replaceAll('*', '')
+  if (needle === '.' || needle === './' || needle === '/') return ''
+  if (isAbsolute(needle)) {
+    const relativeNeedle = relative(cwd, needle)
+    if (relativeNeedle === '' || relativeNeedle === '.') return ''
+    if (!relativeNeedle.startsWith('..')) {
+      needle = relativeNeedle
+    }
+  }
+  return needle.replace(/^\.\/+/, '').replace(/^\/+/, '').replace(/\/+$/, '')
 }
 
 async function listFilesFallback(cwd: string, maxFiles: number): Promise<string[]> {

@@ -8,6 +8,8 @@ import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingR
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import type { NexusEvent } from '../src/shared/events.js'
+import { EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
+import { parseStructuredAgentOutput } from '../src/nexus/runtimeAgentStep.js'
 
 function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -154,16 +156,26 @@ describe('ConfigManager', () => {
     fs.writeFileSync(tempConfigPath, JSON.stringify({
       defaultModel: 'nonexistent/model',
     }), 'utf-8')
-    const originalConsoleError = console.error
+    const originalStderrWrite = process.stderr.write
+    const previousLogLevel = process.env.NEXUS_LOG_LEVEL
     let gotErrorLog = false
-    console.error = () => { gotErrorLog = true }
+    process.env.NEXUS_LOG_LEVEL = 'error'
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      gotErrorLog = String(chunk).includes('Invalid BabeL-O configuration file')
+      return true
+    }) as typeof process.stderr.write
     try {
       const configManager2 = new ConfigManager(tempConfigPath)
       const loaded = configManager2.load()
       assert.deepEqual(loaded, {})
       assert.ok(gotErrorLog)
     } finally {
-      console.error = originalConsoleError
+      process.stderr.write = originalStderrWrite
+      if (previousLogLevel === undefined) {
+        delete process.env.NEXUS_LOG_LEVEL
+      } else {
+        process.env.NEXUS_LOG_LEVEL = previousLogLevel
+      }
     }
   })
 
@@ -416,6 +428,68 @@ describe('LLMCodingRuntime', () => {
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
   })
 
+  test('only exposes policy-allowed tools to provider requests', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Done"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read', 'Glob']),
+      null as any,
+      configManager,
+    )
+    await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-tool-policy-visible',
+        prompt: 'inspect project',
+        cwd: tmpdir(),
+      })
+    )
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    const toolNames = body.tools.map((tool: any) => tool.name).sort()
+    assert.deepEqual(toolNames, ['Glob', 'Read'])
+  })
+
+  test('treats empty provider response as a failed result instead of successful done', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: message_start\n',
+        'data: {"type":"message_start","message":{"id":"msg_empty","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}\n\n',
+        'event: message_delta\n',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":0}}\n\n',
+        'event: message_stop\n',
+        'data: {"type":"message_stop"}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-empty-response',
+        prompt: 'hello',
+        cwd: tmpdir(),
+      })
+    )
+
+    const errorEvent = events.find(e => e.type === 'error') as any
+    assert.ok(errorEvent)
+    assert.equal(errorEvent.code, 'EMPTY_PROVIDER_RESPONSE')
+
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, false)
+    assert.match(resultEvent.message, /empty assistant response/)
+  })
+
   test('sequentially calls and executes allowed tools', async () => {
     const cwd = join(tmpdir(), `babel-o-test-exec-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
@@ -485,6 +559,64 @@ describe('LLMCodingRuntime', () => {
 
     // Ensure two LLM prompts were made
     assert.equal(fetchCalls.length, 2)
+  })
+
+  test('returns missing Read paths to the model instead of aborting the turn', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-missing-read-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-missing","name":"Read","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"missing.txt\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"The file is missing, so I will continue without it."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-missing-read-recoverable',
+        prompt: 'read missing config',
+        cwd,
+        skipPermissionCheck: true,
+      })
+    )
+
+    const toolCompleted = events.find(e => e.type === 'tool_completed') as any
+    assert.equal(toolCompleted.name, 'Read')
+    assert.equal(toolCompleted.success, false)
+    assert.match(String(toolCompleted.output), /could not find/)
+    assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'TOOL_ERROR'))
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /file is missing/)
+
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    const toolResultTurn = secondBody.messages.find((message: any) =>
+      Array.isArray(message.content) &&
+      message.content.some((block: any) => block.type === 'tool_result'),
+    )
+    const toolResult = toolResultTurn.content.find((block: any) => block.type === 'tool_result')
+    assert.equal(toolResult.is_error, true)
+    assert.match(toolResult.content, /could not find/)
+
+    try {
+      fs.rmdirSync(cwd)
+    } catch {}
   })
 
   test('blocks disallowed tools and yields tool_denied event', async () => {
@@ -604,6 +736,74 @@ describe('mapEventsToMessages', () => {
     assert.equal(userContent[0].content, 'file content here')
   })
 
+  test('does not replay historical thinking_delta as provider reasoning content', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.123Z',
+        text: 'first task',
+      },
+      {
+        type: 'thinking_delta',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.124Z',
+        text: '<file_contents>stale hidden analysis</file_contents>',
+      },
+      {
+        type: 'assistant_delta',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.125Z',
+        text: 'visible answer',
+      },
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.126Z',
+        text: 'follow up',
+      },
+    ], 'first task')
+
+    assert.equal(messages.length, 3)
+    assert.equal(messages[1].role, 'assistant')
+    assert.equal(messages[1].content, 'visible answer')
+    assert.ok(!messages[1].reasoningContent)
+    assert.doesNotMatch(JSON.stringify(messages), /file_contents/)
+  })
+
+  test('deduplicates repeated adjacent user messages from empty historical turns', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.123Z',
+        text: '架构性能差异',
+      },
+      {
+        type: 'result',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.124Z',
+        success: true,
+        message: '',
+      },
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.125Z',
+        text: '架构性能差异',
+      },
+    ], '架构性能差异')
+
+    assert.deepEqual(messages, [{ role: 'user', content: '架构性能差异' }])
+  })
+
   test('synthetically completes incomplete tool calls to satisfy model validation schemas', () => {
     const events: NexusEvent[] = [
       {
@@ -635,5 +835,170 @@ describe('mapEventsToMessages', () => {
     assert.equal(userContent[0].toolUseId, 'call-1')
     assert.equal(userContent[0].isError, true)
     assert.match(userContent[0].content, /denied or interrupted/)
+  })
+
+  test('skips orphan tool_completed events whose tool_started was compacted away', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.123Z',
+        text: 'continue',
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.127Z',
+        toolUseId: 'call-orphan',
+        name: 'Read',
+        success: true,
+        output: 'file content here',
+      },
+    ], 'continue')
+
+    assert.equal(messages.length, 1)
+    assert.equal(messages[0].role, 'user')
+    assert.equal(messages[0].content, 'continue')
+    assert.doesNotMatch(JSON.stringify(messages), /call-orphan/)
+  })
+
+  test('groups consecutive tool calls into one assistant turn and one tool result turn', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.123Z',
+        text: 'inspect files',
+      },
+      {
+        type: 'assistant_delta',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.124Z',
+        text: 'I will inspect both files.',
+      },
+      {
+        type: 'tool_started',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.125Z',
+        toolUseId: 'call-1',
+        name: 'Read',
+        input: { path: 'a.ts' },
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.126Z',
+        toolUseId: 'call-1',
+        name: 'Read',
+        success: true,
+        output: 'a',
+      },
+      {
+        type: 'tool_started',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.127Z',
+        toolUseId: 'call-2',
+        name: 'Read',
+        input: { path: 'b.ts' },
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.128Z',
+        toolUseId: 'call-2',
+        name: 'Read',
+        success: true,
+        output: 'b',
+      },
+    ], 'inspect files')
+
+    assert.equal(messages.length, 3)
+    const assistantContent = messages[1].content as any[]
+    const toolResultContent = messages[2].content as any[]
+    assert.deepEqual(assistantContent.map(block => block.type), ['text', 'tool_use', 'tool_use'])
+    assert.deepEqual(assistantContent.slice(1).map(block => block.id), ['call-1', 'call-2'])
+    assert.deepEqual(toolResultContent.map(block => block.toolUseId), ['call-1', 'call-2'])
+  })
+})
+
+describe('Agent role structured output', () => {
+  test('PlannerOutputSchema normalizes provider task variants', () => {
+    const parsed = parseStructuredAgentOutput(
+      undefined,
+      JSON.stringify({
+        goal: 'Optimize project cleanup',
+        tasks: [
+          {
+            id: 1,
+            description: 'Create package.json with TypeScript build dependencies',
+            action: 'write',
+            file: 'package.json',
+            status: 'pending',
+          },
+          {
+            id: 2,
+            action: 'edit',
+            file: 'src/app.ts',
+          },
+        ],
+      }),
+      PLANNER_ROLE.outputSchema,
+    ) as any
+
+    assert.equal(parsed.summary, 'Optimize project cleanup')
+    assert.equal(parsed.tasks[0].title, 'Create package.json with TypeScript build dependencies')
+    assert.equal(parsed.tasks[0].metadata.action, 'write')
+    assert.equal(parsed.tasks[1].title, 'edit src/app.ts')
+  })
+
+  test('ExecutorOutputSchema accepts delegated subTasks', () => {
+    const parsed = parseStructuredAgentOutput(
+      undefined,
+      JSON.stringify({
+        taskId: '1',
+        success: true,
+        result: 'Delegated implementation subtasks',
+        needsReview: false,
+        subTasks: [
+          {
+            title: 'Implement parser',
+            description: 'Add parser changes',
+            requiresIsolation: true,
+            metadata: { area: 'runtime' },
+          },
+        ],
+      }),
+      EXECUTOR_ROLE.outputSchema,
+    ) as any
+
+    assert.equal(parsed.taskId, '1')
+    assert.equal(parsed.subTasks.length, 1)
+    assert.equal(parsed.subTasks[0].title, 'Implement parser')
+    assert.equal(parsed.subTasks[0].requiresIsolation, true)
+  })
+
+  test('PlannerOutputSchema falls back to numbered natural language plans', () => {
+    const parsed = parseStructuredAgentOutput(
+      undefined,
+      [
+        'Plan for cleanup:',
+        '1. Simplify add function: remove redundant temporary result variable.',
+        '2. Verify TypeScript syntax: inspect sample.ts after the edit.',
+      ].join('\n'),
+      PLANNER_ROLE.outputSchema,
+    ) as any
+
+    assert.equal(parsed.summary, 'Plan for cleanup:')
+    assert.equal(parsed.tasks.length, 2)
+    assert.equal(parsed.tasks[0].title, 'Simplify add function')
+    assert.match(parsed.tasks[0].description, /remove redundant/)
   })
 })

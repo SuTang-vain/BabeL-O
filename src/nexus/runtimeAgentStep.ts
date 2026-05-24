@@ -6,8 +6,12 @@ import type { NexusEvent } from '../shared/events.js'
 import { recordTaskSessionNexusEvent } from './taskSession.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
+import { allowlistedTools, type ToolPolicy } from '../runtime/LocalCodingRuntime.js'
 
 type NexusRuntimeLike = Awaited<ReturnType<typeof createDefaultNexusRuntime>>['runtime']
+type RolePolicyRuntime = NexusRuntimeLike & {
+  withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T
+}
 
 export type RuntimeAgentStepOptions = {
   cwd?: string
@@ -54,6 +58,7 @@ export function createRuntimeAgentStepRunner(
     input: TInput
   }): Promise<TOutput> {
     const runtime = await getRuntime()
+    const runtimeForRole = withRoleToolPolicy(runtime, roleDefinition.toolPolicy.allowedTools)
     const prompt = buildAgentStepPrompt(roleDefinition, input)
     const textParts: string[] = []
     let resultPayload: unknown
@@ -97,12 +102,13 @@ export function createRuntimeAgentStepRunner(
       }
     }
 
-    for await (const event of runtime.executeStream({
+    for await (const event of runtimeForRole.executeStream({
       sessionId,
       prompt,
-      cwd: options.cwd ?? process.cwd(),
+      cwd: (input as { cwd?: string }).cwd ?? options.cwd ?? process.cwd(),
       role: roleDefinition.role,
       model: targetModelId,
+      skipPermissionCheck: !roleDefinition.toolPolicy.requiresApproval,
     })) {
       const nexusEvent = event as NexusEvent
       eventCount += 1
@@ -148,6 +154,29 @@ export function createRuntimeAgentStepRunner(
     })
     return parsed as TOutput
   }
+}
+
+function withRoleToolPolicy<T extends NexusRuntimeLike>(runtime: T, allowedTools: string[]): T {
+  if (!hasRolePolicyRuntime(runtime)) return runtime
+
+  const rolePolicy = allowlistedTools(allowedTools)
+
+  return new Proxy(runtime, {
+    get(target, property, receiver) {
+      if (property !== 'executeStream') {
+        return Reflect.get(target, property, receiver)
+      }
+      return function executeStreamWithRolePolicy(...args: unknown[]) {
+        return runtime.withToolPolicy(rolePolicy, () =>
+          (target.executeStream as (...innerArgs: unknown[]) => AsyncIterable<NexusEvent>)(...args),
+        )
+      }
+    },
+  }) as T
+}
+
+function hasRolePolicyRuntime(runtime: NexusRuntimeLike): runtime is RolePolicyRuntime {
+  return typeof (runtime as { withToolPolicy?: unknown }).withToolPolicy === 'function'
 }
 
 export function buildAgentStepPrompt(
@@ -220,7 +249,32 @@ export function parseStructuredAgentOutput(
     }
   }
 
+  const textFallback = buildStructuredOutputFromText(
+    assistantText,
+    outputSchema,
+  )
+  if (textFallback !== undefined) {
+    return textFallback
+  }
+
   throw new Error('Agent step did not return structured JSON output')
+}
+
+function buildStructuredOutputFromText(
+  assistantText: string,
+  outputSchema?: z.ZodTypeAny,
+): unknown | undefined {
+  if (!outputSchema) return undefined
+  const schemaKeys = getZodObjectKeys(outputSchema)
+  const isPlannerShape =
+    schemaKeys.has('summary') &&
+    schemaKeys.has('tasks')
+  if (!isPlannerShape) return undefined
+
+  const fallback = extractPlannerOutputFromText(assistantText)
+  if (!fallback) return undefined
+  const parsed = outputSchema.safeParse(fallback)
+  return parsed.success ? parsed.data : undefined
 }
 
 function normalizeRoleOutputCandidate(
@@ -254,6 +308,7 @@ function normalizePlannerOutputCandidate(
 
   return {
     ...value,
+    ...(!('summary' in value) ? { summary: inferPlannerSummary(value) } : {}),
     ...(value.userPrompt === null ? { userPrompt: undefined } : {}),
     tasks: value.tasks.map(task => {
       if (!isRecord(task) || typeof task.title === 'string') return task
@@ -264,6 +319,8 @@ function normalizePlannerOutputCandidate(
             ? task.name
             : typeof task.description === 'string'
               ? task.description.slice(0, 80)
+              : typeof task.action === 'string' && typeof task.file === 'string'
+                ? `${task.action} ${task.file}`
               : undefined
       if (!title) return task
 
@@ -288,6 +345,66 @@ function normalizePlannerOutputCandidate(
       }
     }),
   }
+}
+
+function inferPlannerSummary(value: Record<string, unknown>): string | undefined {
+  if (typeof value.summary === 'string') return value.summary
+  if (typeof value.finalOutput === 'string') return value.finalOutput
+  if (typeof value.goal === 'string') return value.goal
+  if (typeof value.optimizationFocus === 'string') {
+    return `Planned optimization with focus: ${value.optimizationFocus}`
+  }
+  return undefined
+}
+
+function extractPlannerOutputFromText(text: string): unknown | undefined {
+  const lines = stripMarkdownFence(text)
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+  if (lines.length === 0) return undefined
+
+  const tasks = lines
+    .map(extractPlannerTaskFromLine)
+    .filter((task): task is { title: string; description?: string } => task !== undefined)
+
+  if (tasks.length === 0) return undefined
+
+  const summaryLine =
+    lines.find(line => !extractPlannerTaskFromLine(line) && !line.startsWith('|')) ??
+    'Planner produced a fallback task list from natural language output.'
+
+  return {
+    summary: cleanMarkdownInline(summaryLine).slice(0, 240),
+    tasks,
+  }
+}
+
+function extractPlannerTaskFromLine(line: string): { title: string; description?: string } | undefined {
+  if (line.startsWith('|')) return undefined
+  const match = line.match(/^(?:[-*+]\s+|\d+[.)]\s+)(?:\[[ xX]\]\s+)?(.+)$/)
+  if (!match) return undefined
+  const cleaned = cleanMarkdownInline(match[1] ?? '')
+  if (!cleaned) return undefined
+
+  const separator = cleaned.match(/^([^:：\-–]+)[:：\-–]\s+(.+)$/)
+  if (separator) {
+    return {
+      title: separator[1]!.trim().slice(0, 120),
+      description: separator[2]!.trim(),
+    }
+  }
+  return { title: cleaned.slice(0, 120) }
+}
+
+function cleanMarkdownInline(text: string): string {
+  return text
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\*([^*]+)\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/\s+/g, ' ')
+    .trim()
 }
 
 function normalizeExecutorOutputCandidate(
@@ -330,10 +447,11 @@ function normalizeExecutorOutputCandidate(
 
 function getZodObjectKeys(schema: z.ZodTypeAny): Set<string> {
   const definition = schema._def as {
+    type?: string
     typeName?: string
     shape?: (() => Record<string, z.ZodTypeAny>) | Record<string, z.ZodTypeAny>
   }
-  if (definition.typeName !== 'ZodObject') return new Set()
+  if (definition.typeName !== 'ZodObject' && definition.type !== 'object') return new Set()
   const shape =
     typeof definition.shape === 'function'
       ? definition.shape()

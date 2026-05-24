@@ -47,7 +47,7 @@ export function summarizeSessionEvents(
     switch (event.type) {
       case 'user_message':
         stats.userMessages++
-        pushLimited(earlierRequests, quoteSnippet(event.text, 120), 3)
+        pushRecentLimited(earlierRequests, quoteSnippet(event.text, 120), 3)
         break
       case 'assistant_delta':
         stats.assistantChars += event.text.length
@@ -150,6 +150,12 @@ function countToolOnce(
 function pushLimited(values: string[], value: string, maxItems: number) {
   if (!value || values.length >= maxItems) return
   values.push(value)
+}
+
+function pushRecentLimited(values: string[], value: string, maxItems: number) {
+  if (!value) return
+  values.push(value)
+  if (values.length > maxItems) values.shift()
 }
 
 function formatTopCounts(counts: Map<string, number>): string {

@@ -3,7 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { z } from 'zod';
 import { getProvider, providerRegistry, modelRegistry } from '../providers/registry.js';
-import chalk from 'chalk';
+import { logger } from './logger.js';
 
 export interface ProviderConfig {
   apiKey?: string;
@@ -28,6 +28,12 @@ export interface BabelOConfig {
   providers?: Record<string, ProviderConfig>;
   profiles?: Record<string, ProfileConfig>;
   activeProfile?: string;
+  docker?: {
+    image?: string;
+    network?: string;
+    memory?: string;
+    cpus?: string;
+  };
 }
 
 export type ResolveSettingsOptions = {
@@ -59,6 +65,12 @@ export const BabelOConfigSchema = z.object({
   providers: z.record(z.string(), ProviderConfigSchema).optional(),
   profiles: z.record(z.string(), ProfileConfigSchema).optional(),
   activeProfile: z.string().optional(),
+  docker: z.object({
+    image: z.string().optional(),
+    network: z.string().optional(),
+    memory: z.string().optional(),
+    cpus: z.string().optional(),
+  }).optional(),
 }).superRefine((data, ctx) => {
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;
@@ -157,11 +169,13 @@ export class ConfigManager {
         if (validated.success) {
           this.config = validated.data;
         } else {
-          console.error(chalk.red(`\n[Config Error] Invalid configuration file at ${this.configFile}:`));
-          for (const issue of validated.error.issues) {
-            console.error(chalk.red(`  - ${issue.path.join('.')}: ${issue.message}`));
-          }
-          console.error(chalk.yellow(`Falling back to default empty configuration. Please fix the config file to avoid settings being overwritten.\n`));
+          logger.error('Invalid BabeL-O configuration file; falling back to empty configuration', {
+            configFile: this.configFile,
+            issues: validated.error.issues.map(issue => ({
+              path: issue.path.join('.'),
+              message: issue.message,
+            })),
+          });
           this.config = {};
         }
       } else {

@@ -3,6 +3,9 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { ConfigManager } from '../../shared/config.js'
+
+const spawnedContainers = new Set<string>()
 
 const execFileAsync = promisify(execFile)
 const sessionProbeSecret = randomBytes(32)
@@ -58,12 +61,31 @@ function parseStateFromStdout(
   return { cleanStdout: stdout, detectedCwd: null }
 }
 
-export function clearBashSessionState(sessionId?: string): void {
+export async function clearBashSessionState(sessionId?: string): Promise<void> {
   if (sessionId) {
     sessionCwdMap.delete(sessionId)
+    const containerName = `babel-o-session-${sessionId}`
+    spawnedContainers.delete(containerName)
+    try {
+      await execFileAsync('docker', ['rm', '-f', containerName])
+    } catch {
+      // Ignore
+    }
     return
   }
+
   sessionCwdMap.clear()
+  const containers = [...spawnedContainers]
+  spawnedContainers.clear()
+  await Promise.all(
+    containers.map(async name => {
+      try {
+        await execFileAsync('docker', ['rm', '-f', name])
+      } catch {
+        // Ignore
+      }
+    })
+  )
 }
 
 export function pruneBashSessionState(options: {
@@ -113,6 +135,131 @@ echo ""
 echo "${probe.marker}"
 pwd -P
 exit $_EXIT_CODE`
+
+    if (context.executionEnvironment === 'docker') {
+      const containerName = `babel-o-session-${context.sessionId}`
+      
+      // 1. Ensure docker container is running
+      try {
+        let isRunning = false
+        try {
+          const { stdout } = await execFileAsync('docker', [
+            'inspect',
+            '--format',
+            '{{.State.Running}}',
+            containerName,
+          ])
+          if (stdout.trim() === 'true') {
+            isRunning = true
+          }
+        } catch {
+          // Container might not exist
+        }
+
+        if (!isRunning) {
+          // Resolve config
+          const config = ConfigManager.getInstance().load()
+          const dockerImage = process.env.BABEL_O_DOCKER_IMAGE || config.docker?.image || 'node:22-bookworm'
+          const dockerNetwork = process.env.BABEL_O_DOCKER_NETWORK || config.docker?.network || 'none'
+          const dockerMemory = process.env.BABEL_O_DOCKER_MEMORY || config.docker?.memory
+          const dockerCpus = process.env.BABEL_O_DOCKER_CPUS || config.docker?.cpus
+
+          // Clean up potentially stopped container
+          try {
+            await execFileAsync('docker', ['rm', '-f', containerName])
+          } catch {
+            // Ignore
+          }
+
+          // Build runner args
+          const runArgs = [
+            'run',
+            '-d',
+            '--name',
+            containerName,
+            '-v',
+            `${context.cwd}:${context.cwd}`,
+            '-w',
+            currentCwd,
+          ]
+          if (dockerNetwork) {
+            runArgs.push('--network', dockerNetwork)
+          }
+          if (dockerMemory) {
+            runArgs.push('--memory', dockerMemory)
+          }
+          if (dockerCpus) {
+            runArgs.push('--cpus', dockerCpus)
+          }
+          runArgs.push(dockerImage, 'tail', '-f', '/dev/null')
+
+          await execFileAsync('docker', runArgs)
+          spawnedContainers.add(containerName)
+        }
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          throw new Error('Docker executable not found on host. Please install Docker and ensure it is in the system PATH.')
+        }
+        throw new Error(`Failed to initialize Docker sandbox environment: ${err.message}`)
+      }
+
+      // 2. Execute command via docker exec
+      try {
+        const { stdout, stderr } = await execFileAsync(
+          'docker',
+          [
+            'exec',
+            '-w',
+            currentCwd,
+            containerName,
+            '/bin/sh',
+            '-c',
+            wrappedCommand,
+          ],
+          {
+            timeout: input.timeoutMs,
+            signal: context.signal,
+            maxBuffer: context.bashMaxBufferBytes,
+          }
+        )
+
+        const { cleanStdout, detectedCwd } = parseStateFromStdout(stdout, probe)
+        if (detectedCwd) {
+          sessionCwdMap.set(context.sessionId, {
+            cwd: detectedCwd,
+            lastActiveAt: Date.now(),
+          })
+        }
+
+        return {
+          success: true,
+          output: { stdout: cleanStdout, stderr },
+        }
+      } catch (err: any) {
+        const stdoutStr = typeof err.stdout === 'string' ? err.stdout : ''
+        const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
+        const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
+        if (detectedCwd) {
+          sessionCwdMap.set(context.sessionId, {
+            cwd: detectedCwd,
+            lastActiveAt: Date.now(),
+          })
+        }
+
+        let cleanedMessage = err.message || 'Command failed'
+        if (typeof wrappedCommand === 'string' && typeof input.command === 'string') {
+          cleanedMessage = cleanedMessage.replace(wrappedCommand, input.command)
+        }
+        cleanedMessage = cleanedMessage.replaceAll(probe.marker, '')
+
+        const newErr = new Error(cleanedMessage) as any
+        newErr.code = err.code
+        newErr.signal = err.signal
+        newErr.stdout = cleanStdout
+        newErr.stderr = stderrStr
+        throw newErr
+      }
+    }
 
     try {
       const { stdout, stderr } = await execFileAsync(

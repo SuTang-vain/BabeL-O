@@ -242,6 +242,58 @@ export function completeNexusTask(options: {
   return completed
 }
 
+export function createNexusSubTasks(options: {
+  queueId: string
+  parentTaskId: string
+  ownerAgentId?: string
+  createdBySessionId?: string
+  source?: NexusTask['source']
+  subTasks: Array<{
+    title: string
+    description?: string
+    requiresIsolation?: boolean
+    metadata?: Record<string, unknown>
+  }>
+}): NexusTask[] {
+  const queue = getQueue(options.queueId)
+  const parent = queue.get(options.parentTaskId)
+  if (!parent) {
+    throw new TaskQueueError(
+      `Parent task not found: ${options.parentTaskId}`,
+      'TASK_NOT_FOUND',
+      404,
+    )
+  }
+
+  const created = options.subTasks.map(subTask =>
+    createNexusTask({
+      queueId: options.queueId,
+      title: subTask.title,
+      description: subTask.description,
+      ownerAgentId: options.ownerAgentId,
+      createdBySessionId: options.createdBySessionId,
+      source: options.source ?? 'executor',
+      metadata: {
+        ...(subTask.metadata ?? {}),
+        parentTaskId: options.parentTaskId,
+        requiresIsolation: subTask.requiresIsolation ?? false,
+      },
+    }),
+  )
+
+  parent.status = 'blocked'
+  parent.ownerAgentId = undefined
+  parent.dependsOn = Array.from(new Set([...parent.dependsOn, ...created.map(task => task.taskId)]))
+  parent.metadata = {
+    ...(parent.metadata ?? {}),
+    delegatedSubTaskIds: created.map(task => task.taskId),
+  }
+  parent.updatedAt = now()
+  persistNexusTask(cloneTask(parent))
+
+  return created
+}
+
 export function areAllNexusTasksCompleted(queueId: string): boolean {
   const tasks = Array.from(getQueue(queueId).values())
   return tasks.length > 0 && tasks.every(task => task.status === 'completed')
@@ -258,6 +310,11 @@ export function isNexusTaskQueueSettled(queueId: string): boolean {
 export function resetTaskQueuesForTest(): void {
   taskQueues.clear()
   taskCounters.clear()
+}
+
+export function clearTaskQueue(queueId: string): boolean {
+  taskCounters.delete(queueId)
+  return taskQueues.delete(queueId)
 }
 
 export function pruneTaskQueues(options: {

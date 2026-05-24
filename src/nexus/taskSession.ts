@@ -279,6 +279,10 @@ export function resetTaskSessionsForTest(): void {
   taskSessions.clear()
 }
 
+export function clearTaskSession(sessionId: string): boolean {
+  return taskSessions.delete(sessionId)
+}
+
 export function pruneTaskSessions(options: {
   olderThanMs?: number
   nowMs?: number

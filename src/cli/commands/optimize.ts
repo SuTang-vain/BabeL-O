@@ -2,6 +2,28 @@ import chalk from 'chalk'
 import { Command } from 'commander'
 import { renderEvent } from '../renderEvents.js'
 import { createId } from '../../shared/id.js'
+import { questionAsync } from '../ui.js'
+import type { CliReadline } from '../ui.js'
+import type { PlannerAgentResult, PlannerReviewDecision, PlannerTaskPlan } from '../../nexus/agentLoop.js'
+
+export type OptimizeCommandOptions = {
+  target?: string
+  focus: 'performance' | 'cleanup' | 'security'
+  dryRun?: boolean
+  autoApprove?: boolean
+  cwd: string
+  enableSubAgents?: boolean
+  enableSubagents?: boolean
+  maxSubAgentDepth?: string | number
+  maxSubTasksPerTask?: string | number
+  yes?: boolean
+}
+
+export type OptimizeSubAgentOptions = {
+  enableSubAgents: boolean
+  maxSubAgentDepth: number
+  maxSubTasksPerTask: number
+}
 
 export function registerOptimizeCommand(program: Command): void {
   program
@@ -11,15 +33,32 @@ export function registerOptimizeCommand(program: Command): void {
     .option('--focus <focus>', 'Optimization focus: performance, cleanup, or security', 'performance')
     .option('--dry-run', 'Generate the plan but do not execute changes')
     .option('--auto-approve', 'Automatically approve all optimization changes without manual feedback')
+    .option('--yes', 'Approve the planner task list without prompting')
+    .option('--enable-subagents', 'Allow optimizer/executor agents to delegate substantive subTasks')
+    .option('--max-sub-agent-depth <number>', 'Maximum nested sub-agent delegation depth', '1')
+    .option('--max-sub-tasks-per-task <number>', 'Maximum subTasks accepted from a single task result', '5')
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
-    .action(async (options: { target?: string; focus: 'performance' | 'cleanup' | 'security'; dryRun?: boolean; autoApprove?: boolean; cwd: string }) => {
+    .action(async (options: OptimizeCommandOptions) => {
       const targetPath = options.target
       if (!targetPath) {
         console.error(chalk.red('Error: --target option is required.'))
         process.exit(1)
       }
 
+      let subAgentOptions: OptimizeSubAgentOptions
+      try {
+        subAgentOptions = parseOptimizeSubAgentOptions(options)
+      } catch (err) {
+        console.error(chalk.red(`Error: ${err instanceof Error ? err.message : String(err)}`))
+        process.exit(1)
+      }
+
       console.log(chalk.bold.blue(`Starting optimizer on: ${targetPath} (focus: ${options.focus})`))
+      if (subAgentOptions.enableSubAgents) {
+        console.log(chalk.dim(`Sub-agents enabled: max depth ${subAgentOptions.maxSubAgentDepth}, max subTasks/task ${subAgentOptions.maxSubTasksPerTask}`))
+      } else {
+        console.log(chalk.dim('Sub-agents disabled. Use --enable-subagents to allow task delegation.'))
+      }
 
       const { createDefaultNexusRuntime } = await import('../../nexus/createRuntime.js')
       const { setNexusStorage } = await import('../../nexus/storageBridge.js')
@@ -41,6 +80,13 @@ export function registerOptimizeCommand(program: Command): void {
         try {
           const { createRuntimeAgentStepRunner } = await import('../../nexus/runtimeAgentStep.js')
           const { PLANNER_ROLE } = await import('../../nexus/agentRoles.js')
+          const { createTaskSession } = await import('../../nexus/taskSession.js')
+          createTaskSession({
+            sessionId,
+            cwd: options.cwd,
+            prompt,
+            queueId: sessionId,
+          })
           const stepRunner = createRuntimeAgentStepRunner({
             cwd: options.cwd,
             runtimeFactory: async () => runtime,
@@ -85,19 +131,33 @@ export function registerOptimizeCommand(program: Command): void {
       try {
         const { createRuntimeAgentStepRunner } = await import('../../nexus/runtimeAgentStep.js')
         const { runAgentLoop } = await import('../../nexus/agentLoop.js')
+        const readline = await import('node:readline')
+        const { stdin: input, stdout: output } = await import('node:process')
         const stepRunner = createRuntimeAgentStepRunner({
           cwd: options.cwd,
           runtimeFactory: async () => runtime,
         })
+        const rl = readline.createInterface({ input, output })
 
-        const finalSession = await runAgentLoop({
-          sessionId,
-          cwd: options.cwd,
-          prompt,
-          stepRunner,
-          role: 'optimizer',
-          autoApprove: options.autoApprove,
-        })
+        let finalSession
+        try {
+          finalSession = await runAgentLoop({
+            sessionId,
+            cwd: options.cwd,
+            prompt,
+            stepRunner,
+            role: 'optimizer',
+            autoApprove: options.autoApprove,
+            enableSubAgents: subAgentOptions.enableSubAgents,
+            maxSubAgentDepth: subAgentOptions.maxSubAgentDepth,
+            maxSubTasksPerTask: subAgentOptions.maxSubTasksPerTask,
+            reviewPlan: options.autoApprove || options.yes
+              ? undefined
+              : plan => askPlannerReview(rl, plan),
+          })
+        } finally {
+          rl.close()
+        }
 
         if (finalSession.phase === 'completed') {
           console.log(chalk.green.bold('\n✓ Optimization successfully completed!'))
@@ -110,4 +170,99 @@ export function registerOptimizeCommand(program: Command): void {
         await storage.close?.()
       }
     })
+}
+
+export function renderPlannerPlan(plan: PlannerAgentResult): string {
+  const lines = [
+    chalk.green.bold('\n--- Optimization Plan ---'),
+    chalk.white(plan.summary),
+    chalk.cyan.bold('\nProposed Tasks:'),
+  ]
+  plan.tasks.forEach((task, index) => {
+    lines.push(formatPlannerTask(task, index))
+  })
+  return lines.join('\n')
+}
+
+async function askPlannerReview(
+  rl: CliReadline,
+  plan: PlannerAgentResult,
+): Promise<PlannerReviewDecision> {
+  console.log(renderPlannerPlan(plan))
+  console.log(chalk.dim('\nApprove the plan, edit task titles/descriptions, or reject before any files are changed.'))
+  const answer = (await questionAsync(rl, chalk.cyan('Plan action [a]pprove/[e]dit/[r]eject: '))).trim().toLowerCase()
+  if (answer === 'r' || answer === 'reject') {
+    const reason = await questionAsync(rl, chalk.yellow('Rejection reason: '))
+    return { approved: false, reason: reason.trim() || 'Rejected by user' }
+  }
+  if (answer === 'e' || answer === 'edit') {
+    const editedTasks = await editPlannerTasks(rl, plan.tasks)
+    if (editedTasks.length === 0) {
+      return { approved: false, reason: 'All planner tasks were dropped by user' }
+    }
+    return { approved: true, tasks: editedTasks }
+  }
+  return { approved: true }
+}
+
+async function editPlannerTasks(
+  rl: CliReadline,
+  tasks: PlannerTaskPlan[],
+): Promise<PlannerTaskPlan[]> {
+  const edited: PlannerTaskPlan[] = []
+  console.log(chalk.dim('Press Enter to keep each value. Enter "-" to drop a task.'))
+  for (const [index, task] of tasks.entries()) {
+    const title = await questionAsync(rl, chalk.cyan(`Task ${index + 1} title [${task.title}]: `))
+    if (title.trim() === '-') continue
+    const description = await questionAsync(rl, chalk.cyan(`Task ${index + 1} description [${task.description ?? ''}]: `))
+    edited.push({
+      ...task,
+      title: title.trim() || task.title,
+      description: description.trim() || task.description,
+      metadata: {
+        ...(task.metadata ?? {}),
+        editedByUser: true,
+      },
+    })
+  }
+  if (edited.length === 0) {
+    console.log(chalk.yellow('All tasks were dropped; rejecting plan.'))
+  }
+  if (edited.length > 0) {
+    console.log(renderPlannerPlan({ summary: 'Edited optimization plan', tasks: edited }))
+  }
+  return edited
+}
+
+function formatPlannerTask(task: PlannerTaskPlan, index: number): string {
+  const dependsOn = task.dependsOn && task.dependsOn.length > 0
+    ? chalk.dim(` depends on ${task.dependsOn.join(', ')}`)
+    : ''
+  const description = task.description ? `: ${task.description}` : ''
+  return chalk.white(`  ${index + 1}. [${task.title}]${description}`) + dependsOn
+}
+
+export function parseOptimizeSubAgentOptions(options: OptimizeCommandOptions): OptimizeSubAgentOptions {
+  const maxSubAgentDepth = parsePositiveIntegerOption(
+    options.maxSubAgentDepth,
+    '--max-sub-agent-depth',
+  )
+  const maxSubTasksPerTask = parsePositiveIntegerOption(
+    options.maxSubTasksPerTask,
+    '--max-sub-tasks-per-task',
+  )
+
+  return {
+    enableSubAgents: options.enableSubAgents === true || options.enableSubagents === true,
+    maxSubAgentDepth,
+    maxSubTasksPerTask,
+  }
+}
+
+function parsePositiveIntegerOption(value: string | number | undefined, name: string): number {
+  const normalized = Number(value)
+  if (!Number.isInteger(normalized) || normalized < 1) {
+    throw new Error(`${name} must be a positive integer.`)
+  }
+  return normalized
 }

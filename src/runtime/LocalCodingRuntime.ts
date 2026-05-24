@@ -28,7 +28,7 @@ export type ToolPolicy = {
 export class LocalCodingRuntime implements NexusRuntime {
   constructor(
     private readonly tools: Map<string, AnyTool>,
-    private readonly toolPolicy: ToolPolicy = allowAllTools(),
+    private toolPolicy: ToolPolicy = allowAllTools(),
     private readonly storage?: NexusStorage,
   ) {}
 
@@ -42,6 +42,16 @@ export class LocalCodingRuntime implements NexusRuntime {
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
+    const previousPolicy = this.toolPolicy
+    this.toolPolicy = toolPolicy
+    try {
+      return fn()
+    } finally {
+      this.toolPolicy = previousPolicy
+    }
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
@@ -254,6 +264,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           ...eventBase(options.sessionId),
           code: result.code,
           message: result.message,
+          details: result.details,
         }
         return
       }
@@ -307,7 +318,7 @@ async function executeToolSafely(
       truncated?: boolean
       originalBytes?: number
     }
-  | { kind: 'error'; code: string; message: string }
+  | { kind: 'error'; code: string; message: string; details?: unknown }
 > {
   try {
     const result = await tool.execute(input, {
@@ -316,6 +327,7 @@ async function executeToolSafely(
       signal: options.signal,
       maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
       bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
+      executionEnvironment: options.executionEnvironment,
     })
     const truncated = truncateToolOutput(
       result.output,
@@ -340,8 +352,32 @@ async function executeToolSafely(
       kind: 'error',
       code: 'TOOL_ERROR',
       message: errorMessage(error),
+      details: normalizeToolErrorDetails(error, options.maxToolOutputBytes ?? 200_000),
     }
   }
+}
+
+function normalizeToolErrorDetails(error: unknown, maxBytes: number): unknown {
+  if (!error || typeof error !== 'object') return undefined
+  const record = error as Record<string, unknown>
+  const details: Record<string, unknown> = {}
+
+  if (record.code !== undefined) details.code = record.code
+  if (record.signal !== undefined) details.signal = record.signal
+  if (record.exitCode !== undefined) details.exitCode = record.exitCode
+
+  for (const streamName of ['stdout', 'stderr'] as const) {
+    const value = record[streamName]
+    if (typeof value !== 'string' || value.length === 0) continue
+    const truncated = truncateToolOutput(value, maxBytes)
+    details[streamName] = truncated.value
+    if (truncated.truncated) {
+      details[`${streamName}Truncated`] = true
+      details[`${streamName}OriginalBytes`] = truncated.originalBytes
+    }
+  }
+
+  return Object.keys(details).length > 0 ? details : undefined
 }
 
 export function allowAllTools(): ToolPolicy {

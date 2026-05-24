@@ -19,6 +19,7 @@ export type ContextBudget = {
   }
   snipToolOutputChars: number
   recentEventLimit: number
+  recentTurnLimit: number
 }
 
 export type ContextAssemblerOptions = {
@@ -68,6 +69,7 @@ export function allocateBudget(modelId: string): ContextBudget {
     },
     snipToolOutputChars: Math.max(2_000, Math.min(20_000, Math.floor(maxChars * 0.08))),
     recentEventLimit: Math.max(20, Math.min(300, Math.floor(maxTokens / 400))),
+    recentTurnLimit: contextWindow >= 100_000 ? 4 : 2,
   }
 }
 
@@ -107,10 +109,46 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
 export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
   if (events.length <= budget.recentEventLimit) return [...events]
 
-  const recent = events.slice(-budget.recentEventLimit)
-  const firstRecentUserIndex = recent.findIndex(event => event.type === 'user_message')
-  if (firstRecentUserIndex <= 0) return recent
-  return recent.slice(firstRecentUserIndex)
+  const selectedByTurn = selectRecentTurnEvents(events, budget.recentTurnLimit)
+  if (selectedByTurn.length > 0) {
+    return trimEventsToRecentUserBoundary(selectedByTurn, budget.recentEventLimit)
+  }
+
+  return trimEventsToRecentUserBoundary(events, budget.recentEventLimit)
+}
+
+function trimEventsToRecentUserBoundary(events: NexusEvent[], limit: number): NexusEvent[] {
+  if (events.length <= limit) return [...events]
+  const lastUserIndex = findLastUserMessageIndex(events)
+  if (lastUserIndex === -1) return events.slice(-limit)
+
+  const candidate = events.slice(lastUserIndex)
+  if (candidate.length <= limit) return candidate
+
+  const tail = candidate.slice(-(limit - 1))
+  return [events[lastUserIndex]!, ...tail]
+}
+
+function selectRecentTurnEvents(events: NexusEvent[], maxUserTurns: number): NexusEvent[] {
+  let userTurnsSeen = 0
+  let startIndex = -1
+
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].type !== 'user_message') continue
+    userTurnsSeen += 1
+    startIndex = index
+    if (userTurnsSeen >= maxUserTurns) break
+  }
+
+  if (startIndex === -1) return []
+  return events.slice(startIndex)
+}
+
+function findLastUserMessageIndex(events: NexusEvent[]): number {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index].type === 'user_message') return index
+  }
+  return -1
 }
 
 export function selectOmittedEvents(

@@ -78,6 +78,59 @@ export function registerChatCommand(program: Command): void {
       let activeAbortController: AbortController | null = null
       let isExecuting = false
       const slashPalette = createSlashPalette(rl)
+      let sessionId = ''
+
+      const closeCurrentSession = async (reason: string): Promise<void> => {
+        if (!sessionId) return
+        try {
+          if (options.url) {
+            await new NexusClient({ baseUrl: options.url }).closeSession(sessionId, {
+              reason,
+            })
+          } else {
+            const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
+            const { closeNexusSession } = await import('../../nexus/sessionLifecycle.js')
+            const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+            if (!fs.existsSync(storagePath)) return
+            const storage = new SqliteStorage(storagePath)
+            try {
+              await closeNexusSession({
+                storage,
+                sessionId,
+                reason,
+              })
+            } finally {
+              await storage.close?.()
+            }
+          }
+        } catch {
+          // Best-effort cleanup only. Chat exit must remain fast and reliable.
+        }
+      }
+
+      const executeSessionFlow = async (command: string, abortController: AbortController) => {
+        activeAbortController = abortController
+        isExecuting = true
+        startSession()
+        const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false
+        if (process.stdin.isTTY) {
+          process.stdin.setRawMode(true)
+        }
+        try {
+          await runSessionFlow(command, options.cwd, options.url, rl, abortController, sessionId)
+        } catch (e: any) {
+          if (e.message !== 'Aborted' && e.name !== 'AbortError') {
+            console.error(chalk.red(`Error: ${e.message || e}`))
+          }
+        } finally {
+          if (process.stdin.isTTY) {
+            process.stdin.setRawMode(wasRaw)
+          }
+          activeAbortController = null
+          isExecuting = false
+          stopSpinner()
+        }
+      }
 
       const onGlobalKeypress = (chunk: any, key: any) => {
         if (!isExecuting && slashPalette.handleKey(chunk, key)) {
@@ -107,8 +160,21 @@ export function registerChatCommand(program: Command): void {
               console.log(chalk.dim('\nExiting chat...'))
               cleanupListeners()
               rl.close()
-              process.exit(0)
+              void closeCurrentSession('CLI interrupted').finally(() => process.exit(0))
             }
+            return
+          }
+          if (key.name === 'escape') {
+            if (isExecuting && activeAbortController) {
+              activeAbortController.abort()
+              console.log(chalk.yellow('\nExecution cancelled by user (ESC key).'))
+              return
+            }
+          }
+        } else if (chunk === '\x1b' || chunk === '\u001b') {
+          if (isExecuting && activeAbortController) {
+            activeAbortController.abort()
+            console.log(chalk.yellow('\nExecution cancelled by user (ESC key).'))
             return
           }
         }
@@ -133,13 +199,13 @@ export function registerChatCommand(program: Command): void {
           console.log(chalk.dim('\nExiting chat...'))
           cleanupListeners()
           rl.close()
-          process.exit(0)
+          void closeCurrentSession('CLI interrupted').finally(() => process.exit(0))
         }
       })
 
       renderWelcome({ cwd: options.cwd, url: options.url })
 
-      const sessionId = options.session ?? createId('session')
+      sessionId = options.session ?? createId('session')
       if (options.session) {
         console.log(chalk.cyan(`Resuming session: ${sessionId}`))
 
@@ -187,6 +253,7 @@ export function registerChatCommand(program: Command): void {
 
           const trimmed = prompt.trim()
           if (trimmed === '/exit' || trimmed === 'exit' || trimmed === 'quit') {
+            await closeCurrentSession('CLI exit')
             break
           }
           if (!trimmed) {
@@ -228,20 +295,7 @@ export function registerChatCommand(program: Command): void {
               const mapped = mapDropdownSelection(selected)
               console.log(chalk.dim(`Inserted: ${mapped.trim()}`))
               const abortController = new AbortController()
-              activeAbortController = abortController
-              isExecuting = true
-              startSession()
-              try {
-                await runSessionFlow(mapped.trim(), options.cwd, options.url, rl, abortController, sessionId)
-              } catch (e: any) {
-                if (e.message !== 'Aborted' && e.name !== 'AbortError') {
-                  console.error(chalk.red(`Error: ${e.message || e}`))
-                }
-              } finally {
-                activeAbortController = null
-                isExecuting = false
-                stopSpinner()
-              }
+              await executeSessionFlow(mapped.trim(), abortController)
             }
             continue
           }
@@ -402,20 +456,7 @@ export function registerChatCommand(program: Command): void {
                   fs.appendFileSync(historyFile, cmdToRun + '\n', 'utf8')
 
                   const abortController = new AbortController()
-                  activeAbortController = abortController
-                  isExecuting = true
-                  startSession()
-                  try {
-                    await runSessionFlow(cmdToRun, options.cwd, options.url, rl, abortController, sessionId)
-                  } catch (e: any) {
-                    if (e.message !== 'Aborted' && e.name !== 'AbortError') {
-                      console.error(chalk.red(`Error: ${e.message || e}`))
-                    }
-                  } finally {
-                    activeAbortController = null
-                    isExecuting = false
-                    stopSpinner()
-                  }
+                  await executeSessionFlow(cmdToRun, abortController)
                 } else {
                   console.log(chalk.red(`Invalid history index. Range: 1 - ${allLines.length}`))
                 }
@@ -472,20 +513,7 @@ export function registerChatCommand(program: Command): void {
           }
 
           const abortController = new AbortController()
-          activeAbortController = abortController
-          isExecuting = true
-          startSession()
-          try {
-            await runSessionFlow(trimmed, options.cwd, options.url, rl, abortController, sessionId)
-          } catch (e: any) {
-            if (e.message !== 'Aborted' && e.name !== 'AbortError') {
-              console.error(chalk.red(`Error: ${e.message || e}`))
-            }
-          } finally {
-            activeAbortController = null
-            isExecuting = false
-            stopSpinner()
-          }
+          await executeSessionFlow(trimmed, abortController)
         }
       } finally {
         cleanupListeners()
