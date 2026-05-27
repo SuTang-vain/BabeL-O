@@ -12,6 +12,7 @@ const inputSchema = z.object({
 export const writeTool: ToolDefinition<typeof inputSchema> = {
   name: 'Write',
   description: 'Write a file inside the workspace, creating parent directories.',
+  prompt: () => 'Writes a file to the local filesystem. This will overwrite the existing file. Prefer the Edit tool for modifying existing files. Use this only when creating new files or when a complete rewrite is needed.',
   risk: 'write',
   inputSchema,
   async execute(input, context) {

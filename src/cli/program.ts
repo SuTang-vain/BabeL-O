@@ -49,10 +49,12 @@ if (isMain()) {
 export { program }
 
 export {
+  isSessionPermissionCached,
   mapDropdownSelection,
   describeCompletionChoice,
   formatCompletionChoice,
   formatPermissionDialog,
+  sessionPermissionApprovals,
 } from './ui.js'
 
 export {

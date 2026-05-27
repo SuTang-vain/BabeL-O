@@ -160,6 +160,14 @@ export const CompactBoundaryEventSchema = z.object({
   afterEventCount: z.number(),
   summaryChars: z.number(),
   snippedToolResults: z.number(),
+  retainedEvents: z.array(z.unknown()).optional(),
+  retainedSegment: z.object({
+    retainedCount: z.number(),
+    boundaryId: z.string().optional(),
+    firstEventId: z.string().optional(),
+    lastEventId: z.string().optional(),
+    hash: z.string(),
+  }).optional(),
   modelId: z.string().optional(),
   budget: z.unknown().optional(),
 })
@@ -183,6 +191,15 @@ export const ContextWarningEventSchema = z.object({
   percentUsed: z.number(),
   thresholdPercent: z.number(),
   message: z.string(),
+})
+
+export const SessionMemoryUpdatedEventSchema = z.object({
+  type: z.literal('session_memory_updated'),
+  ...baseEventFields,
+  path: z.string(),
+  trigger: z.enum(['manual', 'auto', 'reactive']),
+  summaryChars: z.number(),
+  eventCount: z.number(),
 })
 
 export const ExecutionMetricsEventSchema = z.object({
@@ -220,6 +237,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   CompactBoundaryEventSchema,
   CompactFailureEventSchema,
   ContextWarningEventSchema,
+  SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
 ])
 

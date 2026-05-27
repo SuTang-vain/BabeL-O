@@ -12,9 +12,13 @@ import { createId } from '../shared/id.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionPhase } from '../shared/session.js'
+import { executeRuntimeHooks } from '../runtime/hooks.js'
+import { extractAbsolutePaths } from '../runtime/LLMCodingRuntime.js'
+import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
 import {
   CliReadline,
   sessionPermissionApprovals,
+  isSessionPermissionCached,
   PermissionDecision,
   askPermission,
   handleLocalPermissionRequest
@@ -87,13 +91,17 @@ export async function runSessionFlow(
           if (data.type === 'permission_request') {
             renderEvent(data)
             try {
-              const cached = data.name ? sessionPermissionApprovals.get(data.sessionId)?.has(data.name) : false
+              const cached = isSessionPermissionCached(data.sessionId, data)
               const decision: PermissionDecision = cached
-                ? { approved: true, scope: 'session' }
+                ? { approved: true, scope: 'session', reason: 'Approved from session permission cache' }
                 : await askPermission(rl, data, abortController.signal)
               if (decision.approved && decision.scope === 'session' && data.name) {
                 const tools = sessionPermissionApprovals.get(data.sessionId) ?? new Set<string>()
-                tools.add(data.name)
+                if (decision.rule) {
+                  tools.add(`${data.name}:${decision.rule}`)
+                } else {
+                  tools.add(data.name)
+                }
                 sessionPermissionApprovals.set(data.sessionId, tools)
               }
               if (socket && socket.readyState === 1 /* OPEN */) {
@@ -164,10 +172,11 @@ export async function runSessionFlow(
     }
 
     let session = await storage.getSession(sessionId, { includeEvents: false })
+    const effectiveCwd = resolveCliRequestCwd(prompt, cwd, session?.cwd)
     if (!session) {
       session = {
         sessionId,
-        cwd,
+        cwd: effectiveCwd,
         prompt,
         phase: 'executing' as const,
         createdAt: new Date().toISOString(),
@@ -176,6 +185,7 @@ export async function runSessionFlow(
       }
     } else {
       session.phase = 'executing'
+      session.cwd = effectiveCwd
       session.updatedAt = new Date().toISOString()
       session.lastUserInput = prompt
     }
@@ -189,6 +199,15 @@ export async function runSessionFlow(
       text: prompt,
     })
 
+    const userPromptHooks = await executeRuntimeHooks(
+      'UserPromptSubmit',
+      { prompt },
+      { sessionId, cwd: session.cwd },
+    )
+    for (const ev of userPromptHooks.events) {
+      await storage.appendEvent(sessionId, ev)
+    }
+
     try {
       const configManager = ConfigManager.getInstance()
       const settings = configManager.resolveSettings()
@@ -201,7 +220,7 @@ export async function runSessionFlow(
       for await (const event of runtime.executeStream({
         sessionId,
         prompt,
-        cwd,
+        cwd: session.cwd,
         signal: abortController.signal,
         timeoutSignal: timeoutController.signal,
         requestId,
@@ -240,6 +259,26 @@ export async function runSessionFlow(
     })
     return sessionId
   }
+}
+
+function resolveCliRequestCwd(prompt: string, requestedCwd: string, sessionCwd?: string): string {
+  const explicitCwd = resolveExplicitPromptCwd(prompt)
+  if (explicitCwd) return explicitCwd
+  return sessionCwd ?? requestedCwd
+}
+
+function resolveExplicitPromptCwd(prompt: string): string | undefined {
+  for (const candidate of extractAbsolutePaths(prompt)) {
+    const resolved = resolvePromptPath(candidate)
+    if (!fs.existsSync(resolved)) continue
+    try {
+      const stat = fs.lstatSync(resolved)
+      if (stat.isDirectory()) return resolved
+    } catch {
+      continue
+    }
+  }
+  return undefined
 }
 
 export function resolveFinalSessionOutcome(eventsNewestFirst: NexusEvent[]): {

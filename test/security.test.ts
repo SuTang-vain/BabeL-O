@@ -2,9 +2,13 @@ import test from 'node:test'
 import assert from 'node:assert'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { createNexusApp, isLocalHost, validateSecurityConfig } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
+import {
+  isWorkspacePathError,
+  resolveInsideWorkspace,
+} from '../src/tools/builtin/pathSafety.js'
 
 test('isLocalHost detects localhost patterns', () => {
   assert.ok(isLocalHost('127.0.0.1'))
@@ -216,6 +220,24 @@ test('Workspace allowlist blocks unauthorized paths', async () => {
     delete process.env.NEXUS_ALLOWED_WORKSPACES
     await app.close()
   }
+})
+
+test('resolveInsideWorkspace keeps inside paths and rejects workspace escapes', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-path-safety-${Date.now()}`)
+  const dotPrefixDir = join(cwd, '..valid-name')
+  const existingFile = join(cwd, 'package.json')
+  await mkdir(dotPrefixDir, { recursive: true })
+  await writeFile(existingFile, '{"name":"inside"}')
+
+  assert.equal(resolveInsideWorkspace(cwd, existingFile), existingFile)
+  assert.equal(resolveInsideWorkspace(cwd, join(cwd, 'missing', 'child.txt')), join(cwd, 'missing', 'child.txt'))
+  assert.equal(resolveInsideWorkspace(cwd, join(dotPrefixDir, 'note.md')), join(dotPrefixDir, 'note.md'))
+
+  const outsidePath = join(tmpdir(), `babel-o-outside-${Date.now()}.json`)
+  assert.throws(
+    () => resolveInsideWorkspace(cwd, outsidePath),
+    error => isWorkspacePathError(error),
+  )
 })
 
 test('Deny-by-default blocks high risk tools unless allowed', async () => {

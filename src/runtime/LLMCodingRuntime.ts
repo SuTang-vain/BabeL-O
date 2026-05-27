@@ -1,11 +1,16 @@
 import { z } from 'zod'
 import { performance } from 'node:perf_hooks'
-import { existsSync } from 'node:fs'
+import { existsSync, lstatSync } from 'node:fs'
+import { dirname } from 'node:path'
 import { errorMessage, ProviderError } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { truncateToolOutput } from '../tools/output.js'
+import {
+  formatWorkspacePathError,
+  isWorkspacePathError,
+} from '../tools/builtin/pathSafety.js'
 import type {
   NexusRuntime,
   RuntimeExecuteOptions,
@@ -15,6 +20,8 @@ import type { ToolPolicy } from './LocalCodingRuntime.js'
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { classifyAction } from './classifier.js'
+import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
+import { normalizeMessages } from './messageNormalizer.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
 import type {
@@ -30,12 +37,18 @@ import {
   getAutoCompactDecision,
 } from './compact.js'
 import {
+  estimateContextTokens,
+  getContextWindowState,
+  type ContextWindowState,
+} from './tokenEstimator.js'
+import {
   executeRuntimeHooks,
   firstHookDenyReason,
   firstHookPermissionDecision,
   lastHookUpdatedInput,
   mergeHookRetryHints,
 } from './hooks.js'
+import { classifyProviderRecovery } from './providerRecovery.js'
 
 
 export class LLMCodingRuntime implements NexusRuntime {
@@ -53,6 +66,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         description: tool.description,
         risk: tool.risk,
         allowed: this.toolPolicy.isAllowed(tool),
+        inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
@@ -69,6 +83,11 @@ export class LLMCodingRuntime implements NexusRuntime {
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    const resolvedCwd = resolveCwdFromPrompt(options.prompt, options.cwd)
+    if (resolvedCwd !== options.cwd) {
+      options.cwd = resolvedCwd
+    }
+
     yield {
       type: 'session_started',
       ...eventBase(options.sessionId),
@@ -120,44 +139,59 @@ export class LLMCodingRuntime implements NexusRuntime {
         mapEventsToMessages,
       })
       let messages = assembledContext.messages
-      let contextEstimateTokens = Math.ceil(
-        (assembledContext.systemPrompt.length + estimateMessagesChars(messages)) / 4,
-      )
-      const contextWarningThreshold = 0.85
-      const autoCompactDecision = getAutoCompactDecision({
+      const toolsList = () => [...this.tools.values()]
+        .filter(tool => this.toolPolicy.isAllowed(tool))
+        .map(tool => ({
+          name: tool.name,
+          description: tool.prompt ? tool.prompt() : tool.description,
+          inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
+        }))
+      let currentToolsList = toolsList()
+      let contextEstimateTokens = estimateContextTokens({
+        systemPrompt: assembledContext.systemPrompt,
+        messages,
+        tools: currentToolsList,
+      }).totalTokens
+      const contextWarningPercent = 70
+      const contextCompactPercent = 85
+      let contextWindowState = getContextWindowState({
+        tokenEstimate: contextEstimateTokens,
+        maxTokens: assembledContext.budget.maxTokens,
+        warningPercent: contextWarningPercent,
+        compactPercent: contextCompactPercent,
+      })
+      let autoCompactDecision = getAutoCompactDecision({
         events: previousEvents,
         tokenEstimate: contextEstimateTokens,
         maxTokens: assembledContext.budget.maxTokens,
       })
-      if (
-        contextEstimateTokens > Math.floor(assembledContext.budget.maxTokens * contextWarningThreshold) ||
-        autoCompactDecision.fuseOpen
-      ) {
-        yield {
-          type: 'context_warning',
-          ...eventBase(options.sessionId),
+      if (contextWindowState.isWarning || autoCompactDecision.fuseOpen) {
+        const compactPercent = autoCompactDecision.enabled
+          ? autoCompactDecision.thresholdPercent
+          : contextCompactPercent
+        yield createContextWarningEvent({
+          sessionId: options.sessionId,
           modelId: cleanedModelId,
-          tokenEstimate: contextEstimateTokens,
-          maxTokens: assembledContext.budget.maxTokens,
-          percentUsed: Math.round((contextEstimateTokens / assembledContext.budget.maxTokens) * 100),
-          thresholdPercent: autoCompactDecision.enabled
-            ? autoCompactDecision.thresholdPercent
-            : Math.round(contextWarningThreshold * 100),
+          windowState: contextWindowState,
+          thresholdPercent: compactPercent,
           message: autoCompactDecision.fuseOpen
             ? `Auto compact is paused after ${autoCompactDecision.failureCount} consecutive failures. Run /compact manually or inspect compact_failure events.`
-            : autoCompactDecision.enabled
-              ? `Context is approaching the auto-compact threshold.`
-              : `Context is approaching the model window. Consider running /compact soon.`,
-        }
+            : contextWindowState.isCompact
+              ? `Context has passed the compact threshold (${compactPercent}%). Auto-compact will trigger on this turn.`
+              : `Context is approaching the compact threshold (${contextWarningPercent}%→${compactPercent}%). Consider /compact soon.`,
+        })
       }
+      let compactAttempted = false
       if (autoCompactDecision.shouldCompact) {
+        compactAttempted = true
         try {
           const compactResult = await compactSession({
             storage: this.storage,
             sessionId: options.sessionId,
             modelId: cleanedModelId,
             trigger: 'auto',
-            persist: false,
+            mapEventsToMessages,
+            initialPrompt: options.prompt,
           })
           yield compactResult.event
           previousEvents = [...previousEvents, compactResult.event]
@@ -169,9 +203,23 @@ export class LLMCodingRuntime implements NexusRuntime {
             mapEventsToMessages,
           })
           messages = assembledContext.messages
-          contextEstimateTokens = Math.ceil(
-            (assembledContext.systemPrompt.length + estimateMessagesChars(messages)) / 4,
-          )
+          currentToolsList = toolsList()
+          contextEstimateTokens = estimateContextTokens({
+            systemPrompt: assembledContext.systemPrompt,
+            messages,
+            tools: currentToolsList,
+          }).totalTokens
+          contextWindowState = getContextWindowState({
+            tokenEstimate: contextEstimateTokens,
+            maxTokens: assembledContext.budget.maxTokens,
+            warningPercent: contextWarningPercent,
+            compactPercent: contextCompactPercent,
+          })
+          autoCompactDecision = getAutoCompactDecision({
+            events: previousEvents,
+            tokenEstimate: contextEstimateTokens,
+            maxTokens: assembledContext.budget.maxTokens,
+          })
         } catch (error) {
           yield buildCompactFailureEvent({
             sessionId: options.sessionId,
@@ -183,6 +231,88 @@ export class LLMCodingRuntime implements NexusRuntime {
           })
         }
       }
+      if (contextWindowState.isBlocking && !compactAttempted) {
+        compactAttempted = true
+        try {
+          const compactResult = await compactSession({
+            storage: this.storage,
+            sessionId: options.sessionId,
+            modelId: cleanedModelId,
+            trigger: 'reactive',
+            mapEventsToMessages,
+            initialPrompt: options.prompt,
+          })
+          yield compactResult.event
+          previousEvents = [...previousEvents, compactResult.event]
+          assembledContext = await assembleContext({
+            runtimeOptions: options,
+            events: previousEvents,
+            modelId: cleanedModelId,
+            buildSystemPrompt,
+            mapEventsToMessages,
+          })
+          messages = assembledContext.messages
+          currentToolsList = toolsList()
+          contextEstimateTokens = estimateContextTokens({
+            systemPrompt: assembledContext.systemPrompt,
+            messages,
+            tools: currentToolsList,
+          }).totalTokens
+          contextWindowState = getContextWindowState({
+            tokenEstimate: contextEstimateTokens,
+            maxTokens: assembledContext.budget.maxTokens,
+            warningPercent: contextWarningPercent,
+            compactPercent: contextCompactPercent,
+          })
+        } catch (error) {
+          yield buildCompactFailureEvent({
+            sessionId: options.sessionId,
+            trigger: 'reactive',
+            modelId: cleanedModelId,
+            failureCount: autoCompactDecision.failureCount + 1,
+            maxFailures: autoCompactDecision.failureLimit,
+            message: error instanceof Error ? error.message : String(error),
+          })
+        }
+      }
+      if (contextWindowState.isBlocking) {
+        const message = `Context estimate ${contextWindowState.tokenEstimate}/${contextWindowState.maxTokens} tokens exceeds the blocking limit (${contextWindowState.blockingLimitTokens}). Run /compact or /context before continuing.`
+        yield createContextWarningEvent({
+          sessionId: options.sessionId,
+          modelId: cleanedModelId,
+          windowState: contextWindowState,
+          thresholdPercent: autoCompactDecision.enabled
+            ? autoCompactDecision.thresholdPercent
+            : contextCompactPercent,
+          message,
+        })
+        yield {
+          type: 'error',
+          ...eventBase(options.sessionId),
+          code: 'CONTEXT_LIMIT_EXCEEDED',
+          message,
+        }
+        yield {
+          type: 'result',
+          ...eventBase(options.sessionId),
+          success: false,
+          message,
+        }
+        yield {
+          type: 'execution_metrics',
+          ...eventBase(options.sessionId),
+          requestId: options.requestId,
+          executeDurationMs: performance.now() - executionStartMs,
+          providerFirstTokenMs,
+          providerRequestDurationMs: totalProviderRequestDurationMs,
+          streamDeltaCount,
+          toolCallCount,
+          toolRoundtripDurationMs: totalToolDurationMs,
+          contextCharsIn,
+          contextCharsOut,
+        }
+        return
+      }
 
       // Parse thinking budget config from environments or options.budget
       const thinkingBudgetEnv =
@@ -191,12 +321,66 @@ export class LLMCodingRuntime implements NexusRuntime {
 
       let loopCount = 0
       const maxLoops = 25
+      let outputRetryCount = 0
+      const MAX_OUTPUT_RETRIES = 2
+      const MAX_TOKEN_RECOVERIES = 3
+      let maxTokenRecoveryCount = 0
 
       while (loopCount < maxLoops) {
         loopCount++
 
         if (options.signal?.aborted) {
           throw new Error('Aborted')
+        }
+
+        currentToolsList = toolsList()
+        const turnContextWindowState = getContextWindowState({
+          tokenEstimate: estimateContextTokens({
+            systemPrompt: assembledContext.systemPrompt,
+            messages,
+            tools: currentToolsList,
+          }).totalTokens,
+          maxTokens: assembledContext.budget.maxTokens,
+          warningPercent: contextWarningPercent,
+          compactPercent: contextCompactPercent,
+        })
+        if (turnContextWindowState.isBlocking) {
+          const message = `Context estimate ${turnContextWindowState.tokenEstimate}/${turnContextWindowState.maxTokens} tokens exceeds the blocking limit (${turnContextWindowState.blockingLimitTokens}). Run /compact or /context before continuing.`
+          yield createContextWarningEvent({
+            sessionId: options.sessionId,
+            modelId: cleanedModelId,
+            windowState: turnContextWindowState,
+            thresholdPercent: autoCompactDecision.enabled
+              ? autoCompactDecision.thresholdPercent
+              : contextCompactPercent,
+            message,
+          })
+          yield {
+            type: 'error',
+            ...eventBase(options.sessionId),
+            code: 'CONTEXT_LIMIT_EXCEEDED',
+            message,
+          }
+          yield {
+            type: 'result',
+            ...eventBase(options.sessionId),
+            success: false,
+            message,
+          }
+          yield {
+            type: 'execution_metrics',
+            ...eventBase(options.sessionId),
+            requestId: options.requestId,
+            executeDurationMs: performance.now() - executionStartMs,
+            providerFirstTokenMs,
+            providerRequestDurationMs: totalProviderRequestDurationMs,
+            streamDeltaCount,
+            toolCallCount,
+            toolRoundtripDurationMs: totalToolDurationMs,
+            contextCharsIn,
+            contextCharsOut,
+          }
+          return
         }
 
         let turnCharsIn = assembledContext.systemPrompt.length
@@ -215,20 +399,12 @@ export class LLMCodingRuntime implements NexusRuntime {
         }
         contextCharsIn += turnCharsIn
 
-        // Convert tool registry definitions to JSON Schema objects using Zod native export
-        const toolsList = [...this.tools.values()]
-          .filter(tool => this.toolPolicy.isAllowed(tool))
-          .map(tool => ({
-            name: tool.name,
-            description: tool.description,
-            inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
-          }))
-
         const queryParams: ModelQueryParams = {
           model: cleanedModelId,
           systemPrompt: assembledContext.systemPrompt,
-          messages,
-          tools: toolsList,
+          systemPromptBlocks: assembledContext.systemPromptBlocks,
+          messages: normalizeMessages(messages),
+          tools: currentToolsList,
           enablePromptCaching: settings.providerId === 'anthropic',
           ...(thinkingBudget &&
             thinkingBudget > 0 && {
@@ -243,6 +419,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         }
 
         let currentAssistantText = ''
+        let currentFinishReason: string | undefined
         const currentToolCalls: {
           id: string
           name: string
@@ -320,11 +497,25 @@ export class LLMCodingRuntime implements NexusRuntime {
               cacheCreationInputTokens: delta.cacheCreationInputTokens,
               cacheReadInputTokens: delta.cacheReadInputTokens,
             }
+          } else if (delta.type === 'finish') {
+            currentFinishReason = delta.reason
           }
         }
 
         const turnDurationMs = performance.now() - queryStartMs
         totalProviderRequestDurationMs += turnDurationMs
+
+        // Max output tokens recovery
+        if (currentFinishReason === 'max_tokens' && maxTokenRecoveryCount < MAX_TOKEN_RECOVERIES) {
+          maxTokenRecoveryCount++
+          if (currentToolCalls.length === 0) {
+            messages.push({
+              role: 'user',
+              content: 'Your previous response was cut off because it hit the maximum output token limit. Please continue exactly from where you left off — do not repeat what you already said.',
+            })
+            continue
+          }
+        }
 
         // Record assistant's turn in messages array
         const assistantContent: ContentBlock[] = []
@@ -356,6 +547,14 @@ export class LLMCodingRuntime implements NexusRuntime {
         // If no tool call was issued, we yield the final result and terminate loop
         if (currentToolCalls.length === 0) {
           if (currentAssistantText.trim().length === 0) {
+            if (outputRetryCount < MAX_OUTPUT_RETRIES) {
+              outputRetryCount++
+              messages.push({
+                role: 'user',
+                content: 'Your previous response was cut off or empty. Please continue from where you left off.',
+              })
+              continue
+            }
             yield {
               type: 'error',
               ...eventBase(options.sessionId),
@@ -407,6 +606,9 @@ export class LLMCodingRuntime implements NexusRuntime {
 
         // Execute requested tools
         const toolResultsContent: ContentBlock[] = []
+        const toolResultBudgetChars = assembledContext.budget.maxChars * 0.3
+        let toolResultUsedChars = 0
+        let toolBudgetExceeded = false
         for (const tc of currentToolCalls) {
           let resolvedInput = tc.input
           if (resolvedInput === undefined && tc.partialInput) {
@@ -417,16 +619,63 @@ export class LLMCodingRuntime implements NexusRuntime {
             }
           }
 
+          if (toolBudgetExceeded) {
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: `[Tool result skipped: per-turn tool output budget exceeded (${Math.round(toolResultBudgetChars / 1024)}KB). The tool ${tc.name} was not executed. Proceed with the results already available.]`,
+              isError: true,
+            })
+            yield {
+              type: 'tool_completed',
+              ...eventBase(options.sessionId),
+              toolUseId: tc.id,
+              name: tc.name,
+              success: false,
+              output: { code: 'TURN_BUDGET_EXCEEDED', message: 'Per-turn tool output budget exceeded' },
+            }
+            continue
+          }
+
+          if (resolvedInput && typeof resolvedInput === 'object' && '_parseError' in (resolvedInput as Record<string, unknown>)) {
+            const rawPreview = (resolvedInput as Record<string, unknown>)._rawInput as string || '(empty)'
+            const errorMsg = `Failed to parse tool input for ${tc.name}. The model output was not valid JSON. Raw input preview: ${rawPreview}`
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: errorMsg,
+              isError: true,
+            })
+            yield {
+              type: 'tool_completed',
+              ...eventBase(options.sessionId),
+              toolUseId: tc.id,
+              name: tc.name,
+              success: false,
+              output: { code: 'PARSE_ERROR', message: 'Invalid JSON from model', rawPreview },
+            }
+            continue
+          }
+
           const tool = this.tools.get(tc.name)
           if (!tool) {
-            const msg = `Tool not found: ${tc.name}`
+            const availableTools = [...this.tools.keys()].join(', ')
+            const errorMsg = `Unknown tool "${tc.name}". Available tools: ${availableTools}. Check the tool name and try again.`
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: errorMsg,
+              isError: true,
+            })
             yield {
-              type: 'error',
+              type: 'tool_completed',
               ...eventBase(options.sessionId),
-              code: 'TOOL_NOT_FOUND',
-              message: msg,
+              toolUseId: tc.id,
+              name: tc.name,
+              success: false,
+              output: { code: 'TOOL_NOT_FOUND', message: errorMsg },
             }
-            return
+            continue
           }
 
           yield {
@@ -715,12 +964,25 @@ export class LLMCodingRuntime implements NexusRuntime {
           const contentWithHints = result.success
             ? blockContent
             : mergeHookRetryHints(blockContent, postToolHooks)
-          toolResultsContent.push({
-            type: 'tool_result',
-            toolUseId: tc.id,
-            content: contentWithHints,
-            isError: !result.success,
-          })
+          toolResultUsedChars += contentWithHints.length
+          if (toolResultUsedChars > toolResultBudgetChars) {
+            const truncated = contentWithHints.slice(0, Math.max(0, contentWithHints.length - (toolResultUsedChars - toolResultBudgetChars)))
+            const truncatedContent = truncated + `\n\n[Per-turn budget exceeded: ${Math.round(toolResultUsedChars / 1024)}KB/${Math.round(toolResultBudgetChars / 1024)}KB. Subsequent tool calls in this turn will be skipped.]`
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: truncatedContent,
+              isError: !result.success,
+            })
+            toolBudgetExceeded = true
+          } else {
+            toolResultsContent.push({
+              type: 'tool_result',
+              toolUseId: tc.id,
+              content: contentWithHints,
+              isError: !result.success,
+            })
+          }
         }
 
         // Record tool results as a single user message
@@ -752,6 +1014,7 @@ export class LLMCodingRuntime implements NexusRuntime {
     } catch (err: any) {
       const isTimeout = options.timeoutSignal?.aborted
       const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
+      const providerRecovery = classifyProviderRecovery(err)
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
@@ -759,6 +1022,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         message: isCancelled
           ? 'Execution cancelled by user.'
           : err instanceof Error ? err.message : String(err),
+        details: providerRecovery,
       }
       yield {
         type: 'execution_metrics',
@@ -777,9 +1041,26 @@ export class LLMCodingRuntime implements NexusRuntime {
   }
 }
 
-function estimateMessagesChars(messages: ModelMessage[]): number {
-  return JSON.stringify(messages).length
+function createContextWarningEvent(options: {
+  sessionId: string
+  modelId: string
+  windowState: ContextWindowState
+  thresholdPercent: number
+  message: string
+}): Extract<NexusEvent, { type: 'context_warning' }> {
+  return {
+    type: 'context_warning',
+    ...eventBase(options.sessionId),
+    modelId: options.modelId,
+    tokenEstimate: options.windowState.tokenEstimate,
+    maxTokens: options.windowState.maxTokens,
+    percentUsed: options.windowState.percentUsed,
+    thresholdPercent: options.thresholdPercent,
+    message: options.message,
+  }
 }
+
+const TOOL_EXECUTION_TIMEOUT_MS = 120_000
 
 async function executeToolSafely(
   tool: AnyTool,
@@ -795,11 +1076,16 @@ async function executeToolSafely(
     }
   | { kind: 'error'; code: string; message: string; details?: unknown }
 > {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), TOOL_EXECUTION_TIMEOUT_MS)
+  const onParentAbort = () => controller.abort()
+  options.signal?.addEventListener('abort', onParentAbort)
+
   try {
     const result = await tool.execute(input, {
       cwd: options.cwd,
       sessionId: options.sessionId,
-      signal: options.signal,
+      signal: controller.signal,
       maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
       bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
       executionEnvironment: options.executionEnvironment,
@@ -816,14 +1102,27 @@ async function executeToolSafely(
       originalBytes: truncated.originalBytes,
     }
   } catch (error) {
-    if (options.signal?.aborted) {
-      const isTimeout = options.timeoutSignal?.aborted
+    if (options.signal?.aborted || controller.signal.aborted) {
+      const isTimeout = !options.signal?.aborted && controller.signal.aborted
       return {
         kind: 'error',
         code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
         message: isTimeout
-          ? `Execution timed out while running ${tool.name}.`
+          ? `Tool ${tool.name} timed out after ${TOOL_EXECUTION_TIMEOUT_MS}ms.`
           : `Execution cancelled while running ${tool.name}.`,
+      }
+    }
+    if (isWorkspacePathError(error)) {
+      return {
+        kind: 'result',
+        success: false,
+        output: {
+          code: error.code,
+          message: formatWorkspacePathError(error),
+          requestedPath: error.requestedPath,
+          cwd: error.cwd,
+          resolvedPath: error.resolvedPath,
+        },
       }
     }
     return {
@@ -832,6 +1131,9 @@ async function executeToolSafely(
       message: errorMessage(error),
       details: normalizeToolErrorDetails(error, options.maxToolOutputBytes ?? 200_000),
     }
+  } finally {
+    clearTimeout(timer)
+    options.signal?.removeEventListener('abort', onParentAbort)
   }
 }
 
@@ -864,79 +1166,46 @@ export function buildSystemPrompt(
   sessionSummary = '',
   activeSkills = '',
 ): string {
-  const memoryBlock = projectMemory.trim()
-    ? `\nProject Memory:\n${projectMemory.trim()}\n`
-    : ''
-  const boundaryBlock = sessionSummary.trim()
-    ? `\nContext Boundary:\nEarlier conversation was compacted. Treat the recent messages below as the authoritative working history.\n`
-    : ''
-  const summaryBlock = sessionSummary.trim()
-    ? `\nSession Summary:\n${sessionSummary.trim()}\n`
-    : ''
-  const skillsBlock = activeSkills.trim()
-    ? `\n${activeSkills.trim()}\n`
-    : ''
-  const requestPathBlock = buildRequestPathBlock(options.prompt)
-
-  return `You are BabeL-O, a powerful agentic AI coding assistant designed to help developers with tasks.
-You are running in the workspace: ${options.cwd}
-Current OS: ${process.platform}
-Current time: ${new Date().toISOString()}
-Current user request:
-${options.prompt}
-
-${requestPathBlock}
-${memoryBlock}
-${boundaryBlock}
-${summaryBlock}
-${skillsBlock}
-Guidelines:
-1. Use the workspace tools sequentially to accomplish the requested task.
-2. Maintain context awareness. Search, read, or list files before making edits or running commands if you are unsure of the structure.
-3. Keep your explanations concise and direct.
-4. When writing code, ensure correct syntax and path safety within the workspace.
-5. All operations must be confined to the current directory (${options.cwd}). Do not access files outside this workspace.
-6. Treat the current user request above as authoritative. If older session history conflicts with it, follow the current request.
-7. If the current request contains explicit absolute paths, treat those paths as authoritative task targets. Do not replace them with a project from older history. If the request asks to compare/cross-analyze and only one explicit path is present, inspect that explicit path first, then use the most relevant prior project only as the comparison baseline.
-`
-}
-
-function buildRequestPathBlock(prompt: string): string {
-  const paths = extractAbsolutePaths(prompt)
-  if (paths.length === 0) return ''
-
-  const lines = paths.map(path => {
-    const status = existsSync(path) ? 'exists' : 'not found'
-    return `- ${path} (${status})`
+  const sections = buildSystemPromptSections({
+    cwd: options.cwd,
+    platform: process.platform,
+    projectMemory: projectMemory.trim() || undefined,
+    sessionSummary: sessionSummary.trim() || undefined,
+    activeSkills: activeSkills.trim() || undefined,
+    prompt: options.prompt,
   })
-
-  return `Explicit paths in current request:\n${lines.join('\n')}\n`
+  return sectionsToPromptText(sections)
 }
 
-export function extractAbsolutePaths(text: string): string[] {
-  const paths = new Set<string>()
-  const pathPattern = /\/[^\s"'`，。！？；：、）\])}<>]+/g
-  for (const match of text.matchAll(pathPattern)) {
-    const cleaned = match[0].replace(/[.,;:!?]+$/u, '')
-    const resolved = resolvePromptPath(cleaned)
-    if (resolved !== '/') paths.add(resolved)
+// extractAbsolutePaths is now exported from systemPromptBuilder.ts
+// Re-export for backward compatibility
+export { extractAbsolutePaths } from './systemPromptBuilder.js'
+
+function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
+  const paths = extractAbsolutePaths(prompt)
+  for (const candidate of paths) {
+    const resolved = resolvePromptPath(candidate)
+    if (!existsSync(resolved)) {
+      const parent = dirname(resolved)
+      if (parent !== resolved && existsSync(parent)) {
+        return parent
+      }
+      continue
+    }
+    try {
+      const stat = lstatSync(resolved)
+      if (stat.isDirectory()) {
+        return resolved
+      }
+      const parent = dirname(resolved)
+      if (parent !== resolved) {
+        return parent
+      }
+    } catch {
+      continue
+    }
   }
-  return [...paths]
-}
-
-function resolvePromptPath(candidate: string): string {
-  if (existsSync(candidate)) return candidate
-
-  for (let index = candidate.length - 1; index > 1; index -= 1) {
-    const prefix = candidate.slice(0, index)
-    if (!existsSync(prefix)) continue
-    const suffix = candidate.slice(index)
-    if (!/^[\p{Script=Han}]/u.test(suffix)) break
-    if (prefix.length >= candidate.length * 0.5) return prefix
-    break
-  }
-
-  return candidate
+  return baseCwd
 }
 
 export function mapEventsToMessages(

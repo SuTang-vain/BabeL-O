@@ -1,12 +1,16 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
-import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import type { ModelMessage, SystemPromptBlock } from '../providers/adapters/ModelAdapter.js'
 import { getModel } from '../providers/registry.js'
-import { snipEvents } from './compactors/snipCompactor.js'
+import { snipEventsWithTurnBoundary } from './compactors/snipCompactor.js'
 import { loadProjectMemory } from './memory.js'
+import { buildSystemPromptSections, extractAbsolutePaths } from './systemPromptBuilder.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
+import { loadAgentMdFiles } from './agentMdLoader.js'
+import { collectGitContext } from './gitContext.js'
 import { loadAllSkills } from '../skills/loader.js'
 import { matchSkills } from '../skills/matcher.js'
+import type { Skill } from '../skills/loader.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -18,6 +22,9 @@ export type ContextBudget = {
     recent: number
   }
   snipToolOutputChars: number
+  snipPriorTurnToolOutputChars: number
+  microcompactToolOutputChars: number
+  microcompactInternalTextChars: number
   recentEventLimit: number
   recentTurnLimit: number
 }
@@ -37,13 +44,73 @@ export type ContextAssemblerOptions = {
 
 export type AssembledContext = {
   systemPrompt: string
+  systemPromptBlocks?: SystemPromptBlock[]
   messages: ModelMessage[]
   budget: ContextBudget
   selectedEventCount: number
   omittedEventCount: number
   snippedEventCount: number
   sessionSummary: string
+  projectMemory: string
   activeSkills: string
+  compactBoundary?: Extract<NexusEvent, { type: 'compact_boundary' }>
+  compactRetainedEventCount: number
+  compactRetainedSegmentValid: boolean
+  compactRetainedSegmentWarning: string
+  postCompactState: PostCompactState
+  memoryTruncated: boolean
+  microcompactedEventCount: number
+}
+
+export type RetainedSegmentMetadata = {
+  retainedCount: number
+  boundaryId?: string
+  firstEventId?: string
+  lastEventId?: string
+  hash: string
+}
+
+export const MAX_MEMORY_LINES = 200
+export const MAX_MEMORY_BYTES = 25_000
+
+export type MemoryTruncation = {
+  content: string
+  wasLineTruncated: boolean
+  wasByteTruncated: boolean
+  originalLines: number
+  originalBytes: number
+}
+
+export function truncateMemoryContent(raw: string): MemoryTruncation {
+  const trimmed = raw.trim()
+  const lines = trimmed.split('\n')
+  const originalLines = lines.length
+  const originalBytes = trimmed.length
+
+  const wasLineTruncated = originalLines > MAX_MEMORY_LINES
+  let content = wasLineTruncated ? lines.slice(0, MAX_MEMORY_LINES).join('\n') : trimmed
+
+  const wasByteTruncated = content.length > MAX_MEMORY_BYTES
+  if (wasByteTruncated) {
+    const cutAt = content.lastIndexOf('\n', MAX_MEMORY_BYTES)
+    content = content.slice(0, cutAt > 0 ? cutAt : MAX_MEMORY_BYTES)
+  }
+
+  return {
+    content,
+    wasLineTruncated,
+    wasByteTruncated,
+    originalLines,
+    originalBytes,
+  }
+}
+
+export type PostCompactState = {
+  recentReadFiles: string[]
+  activeToolNames: string[]
+  activeSkills: string[]
+  taskStatusLines: string[]
+  hookLines: string[]
 }
 
 export function allocateBudget(modelId: string): ContextBudget {
@@ -56,18 +123,21 @@ export function allocateBudget(modelId: string): ContextBudget {
 
   const maxTokens = Math.min(Math.floor(contextWindow * 0.8), 120_000)
   const maxChars = maxTokens * 4
-  const fixedBudget = 4_500
+  const fixedBudget = 11_000
 
   return {
     maxTokens,
     maxChars,
     layerBudgets: {
-      system: 500,
+      system: 5_000,
       memory: 2_000,
-      summary: 2_000,
+      summary: 4_000,
       recent: Math.max(1_000, maxTokens - fixedBudget),
     },
     snipToolOutputChars: Math.max(2_000, Math.min(20_000, Math.floor(maxChars * 0.08))),
+    snipPriorTurnToolOutputChars: Math.max(500, Math.min(3_000, Math.floor(maxChars * 0.015))),
+    microcompactToolOutputChars: Math.max(500, Math.min(4_000, Math.floor(maxChars * 0.012))),
+    microcompactInternalTextChars: Math.max(200, Math.min(1_000, Math.floor(maxChars * 0.004))),
     recentEventLimit: Math.max(20, Math.min(300, Math.floor(maxTokens / 400))),
     recentTurnLimit: contextWindow >= 100_000 ? 4 : 2,
   }
@@ -75,22 +145,40 @@ export function allocateBudget(modelId: string): ContextBudget {
 
 export async function assembleContext(options: ContextAssemblerOptions): Promise<AssembledContext> {
   const budget = allocateBudget(options.modelId)
-  const projectMemory = await loadProjectMemory(options.runtimeOptions.cwd)
+  const [projectMemory, agentMdContent, gitStatus] = await Promise.all([
+    loadProjectMemory(options.runtimeOptions.cwd),
+    loadAgentMdFiles(options.runtimeOptions.cwd),
+    collectGitContext(options.runtimeOptions.cwd),
+  ])
   const compactBoundary = findLatestCompactBoundary(options.events)
-  const compactAwareEvents = compactBoundary
-    ? options.events.slice(compactBoundary.index + 1)
+  const retainedBoundaryEvents = compactBoundary
+    ? normalizeRetainedEvents(compactBoundary.event.retainedEvents)
+    : []
+  const retainedSegmentCheck = compactBoundary
+    ? verifyRetainedSegment(retainedBoundaryEvents, compactBoundary.event.retainedSegment, compactBoundary.event)
+    : { valid: true, warning: '' }
+  const compactAwareEvents = compactBoundary && retainedSegmentCheck.valid
+    ? [...retainedBoundaryEvents, ...options.events.slice(compactBoundary.index + 1)]
     : options.events
-  const selectedEvents = selectRecentEvents(compactAwareEvents, budget)
+  const selectedEvents = protectToolPairs(
+    compactAwareEvents,
+    selectRecentEvents(compactAwareEvents, budget),
+  )
   const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
   const compactSummary = compactBoundary?.event.summary.trim() ?? ''
-  const sessionSummary = [
+  let sessionSummary = [
     compactSummary,
     summarizeSessionEvents(omittedEvents, budget.layerBudgets.summary * 4),
   ]
     .filter(part => part.trim().length > 0)
     .join('\n')
     .trim()
-  const snippedEvents = snipEvents(selectedEvents, budget.snipToolOutputChars)
+  const microcompactedEvents = microcompactEvents(selectedEvents, budget)
+  const snippedEvents = snipEventsWithTurnBoundary(
+    microcompactedEvents,
+    budget.snipToolOutputChars,
+    budget.snipPriorTurnToolOutputChars,
+  )
   const messages = options.mapEventsToMessages(
     snippedEvents,
     options.runtimeOptions.prompt,
@@ -104,119 +192,471 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
       return `## Skill: ${skill.name} (id: ${skill.id})\n${skill.content}`
     }).join('\n\n')
   }
+  const postCompactState = derivePostCompactState(compactAwareEvents, matched)
+  const stateBlock = formatPostCompactState(postCompactState)
+  const compactCapabilityReminder = compactBoundary
+    ? buildCompactCapabilityReminder(postCompactState)
+    : ''
+  if (compactBoundary && stateBlock) {
+    sessionSummary = [sessionSummary, stateBlock]
+      .filter(part => part.trim().length > 0)
+      .join('\n')
+      .trim()
+  }
+  if (compactCapabilityReminder) {
+    sessionSummary = [sessionSummary, compactCapabilityReminder]
+      .filter(part => part.trim().length > 0)
+      .join('\n')
+      .trim()
+  }
+  if (compactBoundary && !retainedSegmentCheck.valid) {
+    sessionSummary = [
+      sessionSummary,
+      `Preserved Segment Warning: ${retainedSegmentCheck.warning}. Falling back to full session history for this context build.`,
+    ]
+      .filter(part => part.trim().length > 0)
+      .join('\n')
+      .trim()
+  }
+
+  const { projectMemory: budgetedProjectMemory, sessionSummary: budgetedSessionSummary, activeSkills: budgetedActiveSkills } =
+    enforceDynamicLayerBudgets({
+      projectMemory,
+      sessionSummary,
+      activeSkills,
+      budget,
+    })
+
+  const memoryTruncation = truncateMemoryContent(budgetedProjectMemory)
+  const sections = buildSystemPromptSections({
+    cwd: options.runtimeOptions.cwd,
+    platform: process.platform,
+    projectMemory: memoryTruncation.content || undefined,
+    sessionSummary: budgetedSessionSummary.trim() || undefined,
+    activeSkills: budgetedActiveSkills.trim() || undefined,
+    agentMdContent: agentMdContent || undefined,
+    gitStatus: gitStatus || undefined,
+    prompt: options.runtimeOptions.prompt,
+  })
+  const systemPromptBlocks: SystemPromptBlock[] = sections.map(s => ({
+    text: s.content,
+    cacheable: s.cacheable,
+  }))
+  const systemPrompt = sections.map(s => s.content).join('\n\n')
 
   return {
-    systemPrompt: options.buildSystemPrompt(options.runtimeOptions, projectMemory, sessionSummary, activeSkills),
+    systemPrompt,
+    systemPromptBlocks,
     messages,
     budget,
     selectedEventCount: selectedEvents.length,
     omittedEventCount: omittedEvents.length,
-    snippedEventCount: snippedEvents.filter((event, index) => event !== selectedEvents[index]).length,
-    sessionSummary,
-    activeSkills,
+    snippedEventCount: snippedEvents.filter((event, index) => event !== microcompactedEvents[index]).length,
+    sessionSummary: budgetedSessionSummary,
+    projectMemory: budgetedProjectMemory,
+    activeSkills: budgetedActiveSkills,
+    compactBoundary: compactBoundary?.event,
+    compactRetainedEventCount: retainedBoundaryEvents.length,
+    compactRetainedSegmentValid: retainedSegmentCheck.valid,
+    compactRetainedSegmentWarning: retainedSegmentCheck.warning,
+    postCompactState,
+    memoryTruncated: memoryTruncation.wasLineTruncated || memoryTruncation.wasByteTruncated,
+    microcompactedEventCount: selectedEvents.filter((event, index) => {
+      const micro = microcompactedEvents[index]
+      if (!micro) return false
+      if (event.type !== 'tool_completed' && event.type !== 'tool_denied') return false
+      if (micro.type !== event.type) return false
+      return event !== micro
+    }).length,
   }
 }
 
-function findLatestCompactBoundary(events: NexusEvent[]): {
-  event: Extract<NexusEvent, { type: 'compact_boundary' }>
-  index: number
-} | undefined {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
-    if (event?.type === 'compact_boundary') {
-      return { event, index }
+function findLatestCompactBoundary(events: NexusEvent[]): { event: Extract<NexusEvent, { type: 'compact_boundary' }>; index: number } | null {
+  for (let idx = events.length - 1; idx >= 0; idx--) {
+    const event = events[idx]
+    if (event.type === 'compact_boundary') {
+      return { event: event as Extract<NexusEvent, { type: 'compact_boundary' }>, index: idx }
     }
   }
-  return undefined
+  return null
+}
+
+function normalizeRetainedEvents(retainedEvents: unknown[] | undefined): NexusEvent[] {
+  if (!Array.isArray(retainedEvents)) return []
+  return retainedEvents
+    .map(raw => (typeof raw === 'object' && raw !== null && 'type' in raw ? raw : null))
+    .filter((e): e is NexusEvent => e !== null)
+}
+
+export function eventIdentity(event: NexusEvent): string {
+  return [
+    event.type,
+    event.sessionId,
+    event.timestamp,
+    (event as { eventId?: string }).eventId ?? '',
+    (event as { toolUseId?: string }).toolUseId ?? '',
+    eventContentFingerprint(event),
+  ].join(':')
+}
+
+export function buildRetainedSegmentMetadata(
+  events: NexusEvent[],
+  boundary?: NexusEvent,
+): RetainedSegmentMetadata {
+  const identities = events.map(eventIdentity)
+  return {
+    retainedCount: events.length,
+    boundaryId: boundary ? eventIdentity(boundary) : undefined,
+    firstEventId: identities[0],
+    lastEventId: identities.at(-1),
+    hash: hashEventIdentities(identities),
+  }
+}
+
+export function verifyRetainedSegment(
+  events: NexusEvent[],
+  metadata: unknown,
+  boundary?: NexusEvent,
+): { valid: boolean; warning: string } {
+  if (!metadata || typeof metadata !== 'object') {
+    return { valid: true, warning: '' }
+  }
+  const record = metadata as Partial<RetainedSegmentMetadata>
+  const actual = buildRetainedSegmentMetadata(events)
+  if (record.boundaryId && boundary && record.boundaryId !== eventIdentity(boundary)) {
+    return { valid: false, warning: 'retained boundary anchor mismatch' }
+  }
+  if (record.retainedCount !== actual.retainedCount) {
+    return {
+      valid: false,
+      warning: `retained count mismatch: expected ${record.retainedCount}, got ${actual.retainedCount}`,
+    }
+  }
+  if (record.firstEventId && record.firstEventId !== actual.firstEventId) {
+    return { valid: false, warning: 'retained first event mismatch' }
+  }
+  if (record.lastEventId && record.lastEventId !== actual.lastEventId) {
+    return { valid: false, warning: 'retained last event mismatch' }
+  }
+  if (record.hash && record.hash !== actual.hash) {
+    return { valid: false, warning: 'retained hash mismatch' }
+  }
+  return { valid: true, warning: '' }
+}
+
+function eventContentFingerprint(event: NexusEvent): string {
+  switch (event.type) {
+    case 'user_message':
+      return hashString(event.text)
+    case 'assistant_delta':
+    case 'thinking_delta':
+      return hashString(event.text)
+    case 'tool_started':
+      return hashString(`${event.name}:${stableStringify(event.input)}`)
+    case 'tool_completed':
+      return hashString(`${event.name}:${event.success}:${stableStringify(event.output)}`)
+    case 'tool_denied':
+      return hashString(`${event.name}:${event.risk}:${event.message}`)
+    case 'permission_request':
+      return hashString(`${event.name}:${event.risk}:${event.toolUseId}:${stableStringify(event.input)}`)
+    case 'permission_response':
+      return hashString(`${event.toolUseId}:${event.approved}:${event.reason ?? ''}`)
+    case 'result':
+      return hashString(`${event.success}:${event.message}`)
+    case 'error':
+      return hashString(`${event.code}:${event.message}`)
+    case 'compact_boundary':
+      return hashString(`${event.trigger}:${event.beforeEventCount}:${event.afterEventCount}:${event.summaryChars}`)
+    case 'compact_failure':
+      return hashString(`${event.trigger}:${event.failureCount}:${event.message}`)
+    case 'context_warning':
+      return hashString(`${event.modelId ?? ''}:${event.tokenEstimate}:${event.maxTokens}:${event.message}`)
+    case 'session_memory_updated':
+      return hashString(`${event.path}:${event.trigger}:${event.summaryChars}:${event.eventCount}`)
+    case 'usage':
+      return hashString(`${event.inputTokens}:${event.outputTokens}:${event.cacheCreationInputTokens ?? ''}:${event.cacheReadInputTokens ?? ''}`)
+    case 'task_created':
+      return hashString(`${event.taskId}:${event.title}`)
+    case 'task_session_event':
+      return hashString(`${event.eventId}:${event.eventType}:${event.phase}:${stableStringify(event.payload)}`)
+    case 'hook_started':
+      return hashString(`${event.hookName}:${event.hookEvent}:${event.toolUseId ?? ''}:${event.toolName ?? ''}`)
+    case 'hook_completed':
+      return hashString(`${event.hookName}:${event.hookEvent}:${event.toolUseId ?? ''}:${event.toolName ?? ''}:${stableStringify(event.output)}`)
+    case 'hook_failed':
+      return hashString(`${event.hookName}:${event.hookEvent}:${event.toolUseId ?? ''}:${event.toolName ?? ''}:${event.message}`)
+    case 'session_started':
+      return hashString(`${event.cwd}:${event.requestId ?? ''}:${event.model ?? ''}:${event.budget ?? ''}`)
+    default:
+      return hashString(stableStringify(event))
+  }
+}
+
+function stableStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value, (_key, nestedValue) => {
+      if (!nestedValue || typeof nestedValue !== 'object' || Array.isArray(nestedValue)) {
+        return nestedValue
+      }
+      return Object.fromEntries(
+        Object.entries(nestedValue as Record<string, unknown>)
+          .sort(([left], [right]) => left.localeCompare(right)),
+      )
+    })
+  } catch {
+    return String(value)
+  }
+}
+
+function hashString(value: string): string {
+  return hashEventIdentities([value])
+}
+
+function hashEventIdentities(identities: string[]): string {
+  let hash = 2166136261
+  for (const identity of identities) {
+    for (let index = 0; index < identity.length; index += 1) {
+      hash ^= identity.charCodeAt(index)
+      hash = Math.imul(hash, 16777619)
+    }
+  }
+  return (hash >>> 0).toString(36)
 }
 
 export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
-  const recoveryEvents = selectRecoveryBoundaryEvents(events)
-  if (recoveryEvents.length > 0) {
-    if (recoveryEvents.length <= budget.recentEventLimit) return recoveryEvents
-    return trimEventsToRecentUserBoundary(recoveryEvents, budget.recentEventLimit)
-  }
+  const maxTurns = budget.recentTurnLimit
+  const maxEvents = budget.recentEventLimit
 
-  if (events.length <= budget.recentEventLimit) return [...events]
-
-  const selectedByTurn = selectRecentTurnEvents(events, budget.recentTurnLimit)
-  if (selectedByTurn.length > 0) {
-    return trimEventsToRecentUserBoundary(selectedByTurn, budget.recentEventLimit)
-  }
-
-  return trimEventsToRecentUserBoundary(events, budget.recentEventLimit)
-}
-
-function selectRecoveryBoundaryEvents(events: NexusEvent[]): NexusEvent[] {
-  let lastTerminalIndex = -1
-  for (let index = 0; index < events.length; index += 1) {
-    if (isConversationBoundaryEvent(events[index]!)) {
-      lastTerminalIndex = index
+  let recoveryIdx = 0
+  for (let idx = events.length - 1; idx >= 0; idx--) {
+    const event = events[idx]!
+    if (event.type === 'error') {
+      const code = (event as { code?: string }).code
+      if (code === 'REQUEST_CANCELLED' || code === 'EXECUTION_TIMEOUT') {
+        recoveryIdx = idx
+        break
+      }
     }
   }
-  if (lastTerminalIndex === -1) return []
+  const effectiveEvents = recoveryIdx > 0 ? events.slice(recoveryIdx) : events
 
-  const nextUserIndex = events.findIndex((event, index) =>
-    index > lastTerminalIndex && event.type === 'user_message'
-  )
-  if (nextUserIndex === -1) return []
-
-  return events.slice(nextUserIndex)
-}
-
-function isConversationBoundaryEvent(event: NexusEvent): boolean {
-  if (event.type === 'error') {
-    return [
-      'REQUEST_TIMEOUT',
-      'REQUEST_CANCELLED',
-      'MAX_LOOPS_EXCEEDED',
-      'PROVIDER_ERROR',
-      'EMPTY_PROVIDER_RESPONSE',
-    ].includes(event.code)
+  const userMsgIdxs: number[] = []
+  for (let idx = 0; idx < effectiveEvents.length; idx++) {
+    if (effectiveEvents[idx]!.type === 'user_message') {
+      userMsgIdxs.push(idx)
+    }
   }
-  if (event.type !== 'result') return false
-  return event.success === false
-}
-
-function trimEventsToRecentUserBoundary(events: NexusEvent[], limit: number): NexusEvent[] {
-  if (events.length <= limit) return [...events]
-  const lastUserIndex = findLastUserMessageIndex(events)
-  if (lastUserIndex === -1) return events.slice(-limit)
-
-  const candidate = events.slice(lastUserIndex)
-  if (candidate.length <= limit) return candidate
-
-  const tail = candidate.slice(-(limit - 1))
-  return [events[lastUserIndex]!, ...tail]
-}
-
-function selectRecentTurnEvents(events: NexusEvent[], maxUserTurns: number): NexusEvent[] {
-  let userTurnsSeen = 0
-  let startIndex = -1
-
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index].type !== 'user_message') continue
-    userTurnsSeen += 1
-    startIndex = index
-    if (userTurnsSeen >= maxUserTurns) break
+  const latestUserIdx = userMsgIdxs.at(-1)
+  const latestUser = latestUserIdx === undefined
+    ? undefined
+    : effectiveEvents[latestUserIdx]
+  if (
+    latestUserIdx !== undefined &&
+    latestUser?.type === 'user_message' &&
+    shouldStartFromLatestUserPrompt(latestUser.text)
+  ) {
+    return trimSelectedWindow(effectiveEvents.slice(latestUserIdx), maxEvents)
   }
 
-  if (startIndex === -1) return []
-  return events.slice(startIndex)
-}
-
-function findLastUserMessageIndex(events: NexusEvent[]): number {
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    if (events[index].type === 'user_message') return index
+  let keptTurns = 0
+  let startIdx = effectiveEvents.length
+  for (let t = userMsgIdxs.length - 1; t >= 0; t--) {
+    const candidateStart = userMsgIdxs[t]!
+    const candidateLen = effectiveEvents.length - candidateStart
+    if (keptTurns + 1 > maxTurns) break
+    if (candidateLen > maxEvents && keptTurns > 0) break
+    startIdx = candidateStart
+    keptTurns++
   }
-  return -1
+
+  const turnSlice = effectiveEvents.slice(startIdx)
+  return trimSelectedWindow(turnSlice, maxEvents)
 }
 
-export function selectOmittedEvents(
-  events: NexusEvent[],
-  selectedEvents: NexusEvent[],
-): NexusEvent[] {
-  if (events.length === selectedEvents.length) return []
-  const selected = new Set(selectedEvents)
-  return events.filter(event => !selected.has(event))
+function trimSelectedWindow(events: NexusEvent[], maxEvents: number): NexusEvent[] {
+  if (events.length <= maxEvents) return events
+  const head = events[0]!
+  const tail = events.slice(events.length - (maxEvents - 1))
+  return [head, ...tail]
+}
+
+function shouldStartFromLatestUserPrompt(text: string): boolean {
+  if (isConversationalPivotPrompt(text)) return true
+  if (isCorrectionPivotPrompt(text)) return true
+  if (extractAbsolutePaths(text).length === 0) return false
+  return !isComparisonPrompt(text)
+}
+
+function isConversationalPivotPrompt(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  if (/^(hi|hello|hey|你好|您好)[？?!.。！\s]*$/iu.test(normalized)) return true
+  if (/^(你)?还在吗[？?!.。！\s]*$/u.test(normalized)) return true
+  if (/你.*(在干什么|正在干什么|还记得|知道我.*问|感知我.*问|听得懂).*[？?!.。！]*$/u.test(normalized)) {
+    return true
+  }
+  return false
+}
+
+function isComparisonPrompt(text: string): boolean {
+  return /(横向|对比|比较|compare|comparison|versus|\bvs\b)/iu.test(text)
+}
+
+function isCorrectionPivotPrompt(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /(?:让你|要你|我说的|说的是|分析的就是|看的就是|不是.*是|不是.*而是|actually|i mean)/iu.test(normalized)
+}
+
+export function protectToolPairs(events: NexusEvent[], selected: NexusEvent[]): NexusEvent[] {
+  if (selected.length === 0) return selected
+  const selectedToolIds = new Set(selected
+    .filter(e => e.type === 'tool_completed' || e.type === 'tool_started' || e.type === 'tool_denied' || e.type === 'permission_request')
+    .map(e => (e as { toolUseId?: string }).toolUseId)
+    .filter(Boolean))
+  const selectedEventIds = new Set(selected.map(e => eventIdentity(e)))
+  const result = [...selected]
+  const firstSelectedIdx = events.findIndex(e => eventIdentity(e) === eventIdentity(result[0]!))
+  for (let idx = firstSelectedIdx - 1; idx >= 0; idx--) {
+    const event = events[idx]!
+    const toolUseId = (event.type === 'tool_completed' || event.type === 'tool_started' || event.type === 'tool_denied' || event.type === 'permission_request')
+      ? (event as { toolUseId?: string }).toolUseId
+      : undefined
+    if (toolUseId && selectedToolIds.has(toolUseId) && !selectedEventIds.has(eventIdentity(event))) {
+      result.unshift(event)
+      selectedEventIds.add(eventIdentity(event))
+    } else if (event.type === 'user_message' || event.type === 'session_started') {
+      break
+    }
+  }
+  return result
+}
+
+export function selectOmittedEvents(events: NexusEvent[], selected: NexusEvent[]): NexusEvent[] {
+  const selectedIds = new Set(selected.map(e => eventIdentity(e)))
+  return events.filter(e => !selectedIds.has(eventIdentity(e)))
+}
+
+export function microcompactEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
+  return events.map(event => {
+    if (event.type !== 'tool_completed') return event
+    const output = typeof event.output === 'string' ? event.output : JSON.stringify(event.output)
+    if (output.length <= budget.microcompactToolOutputChars) return event
+    const headLen = Math.floor(budget.microcompactToolOutputChars * 0.6)
+    const tailLen = budget.microcompactToolOutputChars - headLen
+    return {
+      ...event,
+      output: `${output.slice(0, headLen)}\n\n[microcompacted ${event.name} output (${output.length} chars)]\n\n${output.slice(-tailLen)}`,
+      truncated: true,
+      _originalOutputLength: output.length,
+    } as NexusEvent
+  })
+}
+
+function enforceDynamicLayerBudgets(options: {
+  projectMemory: string
+  sessionSummary: string
+  activeSkills: string
+  budget: ContextBudget
+}): { projectMemory: string; sessionSummary: string; activeSkills: string } {
+  const { budget } = options
+  return {
+    projectMemory: truncateToBudget(options.projectMemory, budget.layerBudgets.memory * 4),
+    sessionSummary: truncateToBudget(options.sessionSummary, budget.layerBudgets.summary * 4),
+    activeSkills: truncateToBudget(options.activeSkills, budget.layerBudgets.system * 4),
+  }
+}
+
+function truncateToBudget(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  return text.slice(0, maxChars)
+}
+
+export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skill[]): PostCompactState {
+  const recentReadFiles: string[] = []
+  const seenFiles = new Set<string>()
+  const activeToolNames: string[] = []
+  const seenTools = new Set<string>()
+  const taskStatusLines: string[] = []
+  const hookLines: string[] = []
+
+  for (let idx = events.length - 1; idx >= 0; idx--) {
+    const event = events[idx]
+    if (event.type === 'tool_completed' && event.success) {
+      const name = event.name
+      if (name && !seenTools.has(name)) {
+        seenTools.add(name)
+        activeToolNames.unshift(name)
+      }
+    }
+    if (event.type === 'tool_started') {
+      const name = event.name
+      if (name === 'Read' || name === 'Write' || name === 'Edit') {
+        const input = (event as { input?: Record<string, unknown> }).input
+        const path = (event as { path?: string }).path
+          || (event as { filePath?: string }).filePath
+          || (input && typeof input.path === 'string' ? input.path : undefined)
+        if (path && !seenFiles.has(path)) {
+          seenFiles.add(path)
+          recentReadFiles.unshift(path)
+        }
+      }
+    }
+    if (event.type === 'task_created') {
+      const taskEvent = event as { taskId?: string; title?: string }
+      if (taskEvent.title) {
+        taskStatusLines.unshift(`- [created] ${taskEvent.title}`)
+      }
+    }
+    if (event.type === 'task_session_event') {
+      const taskEvent = event as { phase?: string; eventType?: string; eventId?: string }
+      if (taskEvent.phase || taskEvent.eventType) {
+        taskStatusLines.unshift(`- [${taskEvent.eventType ?? 'task'}] ${taskEvent.phase ?? taskEvent.eventId ?? ''}`)
+      }
+    }
+    if (event.type === 'hook_completed') {
+      const hookEvent = event as { hookName?: string; hookEvent?: string }
+      hookLines.unshift(`- ${hookEvent.hookName ?? 'hook'} (${hookEvent.hookEvent ?? 'unknown'})`)
+    }
+  }
+
+  return {
+    recentReadFiles: recentReadFiles.slice(0, 10),
+    activeToolNames: activeToolNames.slice(0, 10),
+    activeSkills: matchedSkills.map(s => s.id),
+    taskStatusLines: taskStatusLines.slice(0, 10),
+    hookLines: hookLines.slice(0, 5),
+  }
+}
+
+function formatPostCompactState(state: PostCompactState): string {
+  const parts: string[] = []
+  if (state.recentReadFiles.length > 0) {
+    parts.push(`Recently accessed files: ${state.recentReadFiles.join(', ')}`)
+  }
+  if (state.activeToolNames.length > 0) {
+    parts.push(`Active tools: ${state.activeToolNames.join(', ')}`)
+  }
+  if (state.activeSkills.length > 0) {
+    parts.push(`Active skills: ${state.activeSkills.join(', ')}`)
+  }
+  if (state.taskStatusLines.length > 0) {
+    parts.push(`Task status:\n${state.taskStatusLines.join('\n')}`)
+  }
+  if (state.hookLines.length > 0) {
+    parts.push(`Hook activity:\n${state.hookLines.join('\n')}`)
+  }
+  return parts.length > 0 ? `## Post-Compact State\n${parts.join('\n')}` : ''
+}
+
+function buildCompactCapabilityReminder(state: PostCompactState): string {
+  const lines: string[] = []
+  lines.push('## Compact Capability Reminder')
+  lines.push('The conversation above has been compacted. The summary above captures the key context.')
+  if (state.recentReadFiles.length > 0) {
+    lines.push(`You have recently read files: ${state.recentReadFiles.join(', ')}. You may need to re-read them before making further edits.`)
+  }
+  if (state.taskStatusLines.length > 0) {
+    lines.push('The task list above shows current progress. Continue working on incomplete items.')
+  }
+  lines.push('Important: tool_use and tool_result pairs must remain matched — do not generate one without the other.')
+  return lines.join(' ')
 }

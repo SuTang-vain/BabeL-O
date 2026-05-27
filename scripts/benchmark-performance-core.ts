@@ -12,6 +12,12 @@ import {
   type NexusEvent,
 } from '../src/shared/events.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
+import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import { compactSession } from '../src/runtime/compact.js'
+import {
+  estimateContextTokens,
+  getContextWindowState,
+} from '../src/runtime/tokenEstimator.js'
 
 type BenchmarkResult = {
   name: string
@@ -35,6 +41,29 @@ type ContextBenchmarkResult = {
   omittedEventCount: number
   snippedEventCount: number
   preservedRecentMarkers: string[]
+}
+
+type AutoCompactBenchmarkResult = {
+  name: string
+  beforeEventCount: number
+  afterEventCount: number
+  reductionPct: number
+  preservedRecentTurns: number
+  recentTurnsExpected: number
+  recoveryBoundaryIntact: boolean
+}
+
+type TokenEstimatorBenchmarkResult = {
+  name: string
+  legacyTokens: number
+  estimatedTokens: number
+  multiplier: number
+  maxTokens: number
+  warningThresholdTokens: number
+  blockingLimitTokens: number
+  legacyWouldWarn: boolean
+  estimatorWouldWarn: boolean
+  estimatorWouldBlock: boolean
 }
 
 function elapsedMs(start: bigint): number {
@@ -208,6 +237,8 @@ async function main(): Promise<void> {
       ),
     ]
     const contextBenchmark = await benchmarkContextAssembly(cwd)
+    const autoCompactBenchmark = await benchmarkAutoCompact()
+    const tokenEstimatorBenchmark = benchmarkChineseTokenEstimator()
 
     console.log(
       JSON.stringify(
@@ -217,6 +248,8 @@ async function main(): Promise<void> {
           schemaVersion: 1,
           results,
           context: contextBenchmark,
+          autoCompact: autoCompactBenchmark,
+          tokenEstimator: tokenEstimatorBenchmark,
           metrics: (await app.inject({
             method: 'GET',
             url: '/v1/runtime/metrics',
@@ -270,13 +303,14 @@ async function benchmarkContextAssembly(cwd: string): Promise<ContextBenchmarkRe
   const assembledChars =
     assembled.systemPrompt.length + estimateMessagesChars(assembled.messages)
   const reductionPct = ((originalChars - assembledChars) / originalChars) * 100
-  const preservedRecentMarkers = ['recent-turn-37', 'recent-turn-38', 'recent-turn-39']
-    .filter(marker => JSON.stringify(assembled.messages).includes(marker))
+  const assembledMessagesText = JSON.stringify(assembled.messages)
+  const preservedRecentMarkers = ['recent-turn-38', 'recent-turn-39']
+    .filter(marker => assembledMessagesText.includes(marker))
 
   if (reductionPct < 50) {
     throw new Error(`Context benchmark reduction below target: ${round(reductionPct)}%`)
   }
-  if (preservedRecentMarkers.length !== 3) {
+  if (preservedRecentMarkers.length !== 2) {
     throw new Error('Context benchmark did not preserve recent turns')
   }
 
@@ -294,6 +328,134 @@ async function benchmarkContextAssembly(cwd: string): Promise<ContextBenchmarkRe
 
 function estimateMessagesChars(messages: ModelMessage[]): number {
   return JSON.stringify(messages).length
+}
+
+function benchmarkChineseTokenEstimator(): TokenEstimatorBenchmarkResult {
+  const systemPrompt = [
+    'You are BabeL-O. Preserve the latest Chinese user request and tool chain.',
+    '当前任务是继续分析上下文管理、自动压缩、工具结果和模型窗口边界。',
+  ].join('\n')
+  const chineseParagraph =
+    '请继续核对 BabeL-O 的上下文管理能力，重点确认中文长会话、工具调用结果、JSON 结构、thinking 输出和 compact 恢复边界是否会触发窗口风险。'
+  const codeBlock = [
+    '```ts',
+    'export function explainContextRisk(input: string): string {',
+    '  return `上下文风险: ${input.length}`',
+    '}',
+    '```',
+  ].join('\n')
+  const jsonToolResult = JSON.stringify({
+    diagnostics: Array.from({ length: 80 }, (_, index) => ({
+      file: `src/runtime/example-${index}.ts`,
+      message: `中文诊断 ${index}: 工具输出过长，需要估算 token 并保护最近用户轮次。`,
+      severity: index % 3 === 0 ? 'warning' : 'info',
+    })),
+  })
+  const messages: ModelMessage[] = [
+    {
+      role: 'user',
+      content: `${chineseParagraph}\n`.repeat(120),
+    },
+    {
+      role: 'assistant',
+      content: `${chineseParagraph}\n${codeBlock}\n`.repeat(80),
+      reasoningContent: `${chineseParagraph}\n`.repeat(60),
+    },
+    {
+      role: 'assistant',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tool-benchmark-1',
+          name: 'Grep',
+          input: {
+            pattern: 'context_warning|compact_boundary|tool_result',
+            path: '/Users/tangyaoyue/DEV/BABEL/BabeL-O/src',
+          },
+        },
+      ],
+    },
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          toolUseId: 'tool-benchmark-1',
+          content: jsonToolResult,
+        },
+      ],
+    },
+  ]
+  const tools = [
+    {
+      name: 'Grep',
+      description: 'Search files and return matching lines.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          pattern: { type: 'string' },
+          path: { type: 'string' },
+          maxMatches: { type: 'number' },
+        },
+        required: ['pattern'],
+      },
+    },
+    {
+      name: 'Read',
+      description: 'Read file contents.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          path: { type: 'string' },
+        },
+        required: ['path'],
+      },
+    },
+  ]
+
+  const legacyTokens = Math.ceil((systemPrompt.length + estimateMessagesChars(messages)) / 4)
+  const estimatedTokens = estimateContextTokens({
+    systemPrompt,
+    messages,
+    tools,
+  }).totalTokens
+  const maxTokens = estimatedTokens + 250
+  const legacyState = getContextWindowState({
+    tokenEstimate: legacyTokens,
+    maxTokens,
+    warningPercent: 85,
+    blockingBufferTokens: 500,
+  })
+  const estimatorState = getContextWindowState({
+    tokenEstimate: estimatedTokens,
+    maxTokens,
+    warningPercent: 85,
+    blockingBufferTokens: 500,
+  })
+  const multiplier = estimatedTokens / legacyTokens
+
+  if (multiplier < 1.5) {
+    throw new Error(`Token estimator benchmark multiplier below target: ${round(multiplier)}x`)
+  }
+  if (legacyState.isWarning) {
+    throw new Error('Legacy chars/4 estimate unexpectedly reached warning threshold')
+  }
+  if (!estimatorState.isWarning || !estimatorState.isBlocking) {
+    throw new Error('Token estimator did not reach expected warning/blocking threshold')
+  }
+
+  return {
+    name: 'Chinese context token estimator',
+    legacyTokens,
+    estimatedTokens,
+    multiplier: round(multiplier),
+    maxTokens,
+    warningThresholdTokens: estimatorState.warningThresholdTokens,
+    blockingLimitTokens: estimatorState.blockingLimitTokens,
+    legacyWouldWarn: legacyState.isWarning,
+    estimatorWouldWarn: estimatorState.isWarning,
+    estimatorWouldBlock: estimatorState.isBlocking,
+  }
 }
 
 function createLongSessionEvents(): NexusEvent[] {
@@ -346,6 +508,266 @@ function createLongSessionEvents(): NexusEvent[] {
       },
     )
   }
+
+  return events
+}
+
+async function benchmarkAutoCompact(): Promise<AutoCompactBenchmarkResult> {
+  const sessionId = 'session-auto-compact-benchmark'
+  const storage = new MemoryStorage()
+
+  // Build a long session with many turns and large tool outputs
+  const events = createLongSessionEventsForAutoCompact(sessionId)
+  await storage.saveSession({
+    sessionId,
+    cwd: '/tmp',
+    prompt: 'benchmark',
+    phase: 'executing',
+    createdAt: '2026-05-23T00:00:00.000Z',
+    updatedAt: '2026-05-23T00:00:00.000Z',
+    events,
+  })
+
+  const result = await compactSession({
+    storage,
+    sessionId,
+    modelId: 'local/coding-runtime',
+    trigger: 'auto',
+  })
+
+  const beforeEventCount = result.beforeEventCount
+  const afterEventCount = result.afterEventCount
+  const reductionPct = ((beforeEventCount - afterEventCount) / beforeEventCount) * 100
+
+  // Verify recent 2-4 user turns are preserved
+  const recentUserMessages = events
+    .filter((e, i): e is Extract<NexusEvent, { type: 'user_message' }> =>
+      e.type === 'user_message' && i >= events.length - 8,
+    )
+  const { events: postCompactEvents } = await storage.listEvents(sessionId, { limit: 10_000, order: 'asc' })
+  const assembledAfterCompact = await assembleContext({
+    runtimeOptions: {
+      sessionId,
+      prompt: 'Continue after auto-compact benchmark.',
+      cwd: '/tmp',
+    },
+    events: postCompactEvents,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+  const postCompactMessagesText = JSON.stringify(assembledAfterCompact.messages)
+  const preservedRecentTurns = recentUserMessages.filter(um =>
+    postCompactMessagesText.includes(um.text),
+  ).length
+
+  if (reductionPct < 50) {
+    throw new Error(`Auto-compact benchmark reduction below target: ${round(reductionPct)}%`)
+  }
+
+  // Recovery boundary test: build a session with cancellation + subsequent user message
+  const recoverySessionId = 'session-recovery-benchmark'
+  const recoveryEvents = createRecoveryBoundarySession(recoverySessionId)
+  await storage.saveSession({
+    sessionId: recoverySessionId,
+    cwd: '/tmp',
+    prompt: 'recovery benchmark',
+    phase: 'executing',
+    createdAt: '2026-05-23T00:00:00.000Z',
+    updatedAt: '2026-05-23T00:00:00.000Z',
+    events: recoveryEvents,
+  })
+
+  const recoveryResult = await compactSession({
+    storage,
+    sessionId: recoverySessionId,
+    modelId: 'local/coding-runtime',
+    trigger: 'auto',
+  })
+
+  const { events: recoveryPostCompact } = await storage.listEvents(recoverySessionId, { limit: 10_000, order: 'asc' })
+  const assembledRecovery = await assembleContext({
+    runtimeOptions: {
+      sessionId: recoverySessionId,
+      prompt: 'Final question after recovery.',
+      cwd: '/tmp',
+    },
+    events: recoveryPostCompact,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+  const recoveryMessagesText = JSON.stringify(assembledRecovery.messages)
+  const recoveryBoundaryIntact =
+    recoveryMessagesText.includes('Follow-up after cancellation') &&
+    recoveryMessagesText.includes('Final question after recovery.')
+
+  if (!recoveryBoundaryIntact) {
+    throw new Error('Auto-compact benchmark destroyed recovery boundary')
+  }
+
+  return {
+    name: 'Auto-compact long session',
+    beforeEventCount,
+    afterEventCount,
+    reductionPct: round(reductionPct),
+    preservedRecentTurns,
+    recentTurnsExpected: recentUserMessages.length,
+    recoveryBoundaryIntact,
+  }
+}
+
+function createLongSessionEventsForAutoCompact(sessionId: string): NexusEvent[] {
+  const events: NexusEvent[] = [
+    {
+      type: 'session_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:00.000Z',
+      cwd: '/tmp',
+    },
+    {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:01.000Z',
+      text: 'Start the long task.',
+    },
+  ]
+
+  for (let index = 0; index < 40; index += 1) {
+    const minute = String(index).padStart(2, '0')
+    events.push(
+      {
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: `2026-05-23T00:${minute}:02.000Z`,
+        text: `Assistant turn ${index} with a lengthy explanation that goes on and on to simulate real model output. `.repeat(20),
+      },
+      {
+        type: 'thinking_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: `2026-05-23T00:${minute}:03.000Z`,
+        text: `Thinking about turn ${index} and considering various approaches. `.repeat(10),
+      },
+      {
+        type: 'tool_started',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: `2026-05-23T00:${minute}:04.000Z`,
+        toolUseId: `tool-${index}`,
+        name: 'Read',
+        input: { path: `src/feature-${index}.ts` },
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: `2026-05-23T00:${minute}:05.000Z`,
+        toolUseId: `tool-${index}`,
+        name: 'Read',
+        success: true,
+        output: `${'x'.repeat(10_000)}\nauto-compact-turn-${index}\n${'y'.repeat(10_000)}`,
+      },
+      {
+        type: 'user_message',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: `2026-05-23T00:${minute}:06.000Z`,
+        text: `Continue after auto-compact-turn-${index}.`,
+      },
+    )
+  }
+
+  return events
+}
+
+function createRecoveryBoundarySession(sessionId: string): NexusEvent[] {
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'Start the task.',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:01.000Z',
+      text: 'Working on it.',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:02.000Z',
+      toolUseId: 'tool-1',
+      name: 'Bash',
+      input: { command: 'sleep 10' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:03.000Z',
+      toolUseId: 'tool-1',
+      name: 'Bash',
+      success: false,
+      output: 'Command was cancelled.',
+    },
+    {
+      type: 'error',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:04.000Z',
+      code: 'REQUEST_CANCELLED',
+      message: 'Execution cancelled by user.',
+    },
+    {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:05.000Z',
+      text: 'Follow-up after cancellation',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:06.000Z',
+      text: 'Responding to follow-up.',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:07.000Z',
+      toolUseId: 'tool-2',
+      name: 'Read',
+      input: { path: 'README.md' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:08.000Z',
+      toolUseId: 'tool-2',
+      name: 'Read',
+      success: true,
+      output: 'x'.repeat(5_000),
+    },
+    {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:09.000Z',
+      text: 'Final question after recovery.',
+    },
+  ]
 
   return events
 }

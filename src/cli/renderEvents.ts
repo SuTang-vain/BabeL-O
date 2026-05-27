@@ -18,7 +18,7 @@ let currentOutputBlock: 'none' | 'assistant' | 'thinking' = 'none'
 let activeReadlineInterface: any = null
 let pendingPermissionRequest: NexusEvent | null = null
 
-// Spinner state
+// Spinner / Agent status state
 let spinnerTimer: NodeJS.Timeout | null = null
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 let spinnerFrameIndex = 0
@@ -26,6 +26,9 @@ let isSpinnerActive = false
 let spinnerStatusText = 'Thinking...'
 let spinnerStartedAt = 0
 let activeSessionModel: string | undefined
+let currentAgentStatus: 'thinking' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle' = 'idle'
+let currentToolName: string | undefined
+let lastContextWarning: { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
 const inputPrompt = chalk.blue('> ')
 const toolPrefix = chalk.blue('●')
 const thoughtPrefix = chalk.magenta('▸')
@@ -52,6 +55,9 @@ export function startSession(prompt?: string): void {
   currentOutputBlock = 'none'
   pendingPermissionRequest = null
   activeSessionModel = undefined
+  currentAgentStatus = 'idle'
+  currentToolName = undefined
+  lastContextWarning = undefined
 
   if (!prompt) {
     return
@@ -80,6 +86,9 @@ export function resumeSessionHistory(events: NexusEvent[]): void {
   currentOutputBlock = 'none'
   pendingPermissionRequest = null
   activeSessionModel = events.findLast(e => e.type === 'session_started')?.model
+  currentAgentStatus = 'idle'
+  currentToolName = undefined
+  lastContextWarning = events.findLast(e => e.type === 'context_warning') as { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
   redrawSession()
 }
 
@@ -102,6 +111,32 @@ export function startSpinner(text: string = 'Thinking...'): void {
     spinnerFrameIndex = (spinnerFrameIndex + 1) % spinnerFrames.length
     drawSpinnerLine()
   }, 100)
+}
+
+function setAgentStatus(status: typeof currentAgentStatus, toolName?: string) {
+  currentAgentStatus = status
+  currentToolName = toolName
+  const statusText = formatAgentStatusText()
+  if (statusText) {
+    startSpinner(statusText)
+  }
+}
+
+function formatAgentStatusText(): string {
+  switch (currentAgentStatus) {
+    case 'thinking':
+      return 'Thinking...'
+    case 'running_tool':
+      return currentToolName ? `Running ${currentToolName}...` : 'Running tool...'
+    case 'waiting_permission':
+      return 'Waiting for permission...'
+    case 'compacting':
+      return 'Compacting context...'
+    case 'retrying':
+      return 'Retrying...'
+    default:
+      return 'Thinking...'
+  }
 }
 
 export function stopSpinner(): void {
@@ -169,10 +204,21 @@ export function renderEvent(event: NexusEvent): void {
   }
 
   // Handle spinner transitions for other events
-  if (event.type === 'tool_started' || event.type === 'tool_completed' || event.type === 'tool_denied') {
+  if (event.type === 'tool_started') {
+    setAgentStatus('running_tool', event.name)
+  } else if (event.type === 'tool_completed' || event.type === 'tool_denied') {
     stopSpinner()
-  } else if (event.type === 'result' || event.type === 'error' || event.type === 'permission_request') {
+    currentAgentStatus = 'idle'
+  } else if (event.type === 'permission_request') {
+    setAgentStatus('waiting_permission')
+  } else if (event.type === 'permission_response') {
     stopSpinner()
+    currentAgentStatus = 'idle'
+  } else if (event.type === 'compact_boundary') {
+    setAgentStatus('compacting')
+  } else if (event.type === 'result' || event.type === 'error') {
+    stopSpinner()
+    currentAgentStatus = 'idle'
   }
 
   sessionEvents.push(event)
@@ -268,6 +314,7 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'session_started':
       activeSessionModel = event.model
       console.log(formatAgentStatusLine(event))
+      currentAgentStatus = 'thinking'
       startSpinner('Thinking...')
       break
     case 'tool_started': {
@@ -314,6 +361,7 @@ function renderLiveEvent(event: NexusEvent): void {
       break
     case 'error':
       console.log(chalk.red(`${event.code}: ${event.message}`))
+      process.stdout.write(formatErrorRecoveryDetails(event.details))
       break
     case 'compact_boundary':
       console.log(
@@ -326,6 +374,7 @@ function renderLiveEvent(event: NexusEvent): void {
       }
       break
     case 'context_warning':
+      lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
       console.log(
         chalk.yellow(
           `context warning: ${event.percentUsed}% of window used (${event.tokenEstimate}/${event.maxTokens} tokens). consider /compact.`,
@@ -346,12 +395,40 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'task_session_event':
       console.log(formatTaskSessionEvent(event))
       break
+    case 'hook_started':
+      if (tuiMode === 'expanded') {
+        console.log(`${chalk.dim('◆')} hook ${chalk.dim(event.hookName)} started`)
+      }
+      break
+    case 'hook_completed':
+      if (tuiMode === 'expanded') {
+        console.log(`${chalk.dim('◆')} hook ${chalk.dim(event.hookName)} completed`)
+      }
+      break
+    case 'hook_failed':
+      if (tuiMode === 'expanded') {
+        console.log(`${chalk.red('◆')} hook ${chalk.dim(event.hookName)} failed: ${event.message}`)
+      }
+      break
     case 'usage':
       if (tuiMode === 'expanded') {
         console.log(chalk.dim(`usage input=${event.inputTokens} output=${event.outputTokens}`))
       }
       break
   }
+}
+
+function formatErrorRecoveryDetails(details: unknown): string {
+  if (!details || typeof details !== 'object') return ''
+  const record = details as Record<string, unknown>
+  if (typeof record.recoveryReason !== 'string') return ''
+  const parts = [
+    `recovery=${record.recoveryReason}`,
+    typeof record.kind === 'string' ? `kind=${record.kind}` : '',
+    typeof record.httpStatus === 'number' ? `status=${record.httpStatus}` : '',
+  ].filter(Boolean)
+  const suggestion = typeof record.suggestion === 'string' ? ` ${record.suggestion}` : ''
+  return chalk.yellow(`  ${parts.join(' ')}.${suggestion}\n`)
 }
 
 interface ToolCallState {
@@ -478,6 +555,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
 
       case 'error':
         outputText += chalk.red(`${ev.code}: ${ev.message}\n`)
+        outputText += formatErrorRecoveryDetails(ev.details)
         break
 
       case 'compact_boundary':
@@ -529,6 +607,8 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   }
 
   outputText += formatTaskStatusPanel(events)
+  outputText += formatAgentRunningFooter()
+  outputText += formatContextFooter()
 
   if (pendingPermissionRequest) {
     const inputSoFar = activeReadlineInterface ? activeReadlineInterface.line : ''
@@ -540,6 +620,21 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   return outputText
 }
 
+function formatAgentRunningFooter(): string {
+  if (currentAgentStatus === 'idle') return ''
+  const statusText = formatAgentStatusText()
+  return `${chalk.dim('─'.repeat(20))}\n${chalk.yellow('◉')} ${chalk.dim(statusText)}\n`
+}
+
+function formatContextFooter(): string {
+  if (!lastContextWarning) return ''
+  const { percentUsed, tokenEstimate, maxTokens } = lastContextWarning
+  const barWidth = 20
+  const filled = Math.min(barWidth, Math.round((percentUsed / 100) * barWidth))
+  const bar = chalk.green('█'.repeat(filled)) + chalk.dim('░'.repeat(barWidth - filled))
+  return `${chalk.dim('context')} ${bar} ${chalk.yellow(`${percentUsed}%`)} ${chalk.dim(`(${tokenEstimate}/${maxTokens})`)} ${chalk.cyan('/compact')}\n`
+}
+
 type TaskBoardItem = {
   taskId?: string
   title: string
@@ -547,6 +642,8 @@ type TaskBoardItem = {
   parentTaskId?: string
   depth: number
   delegatedSubTaskIds?: string[]
+  worktree?: boolean
+  subSessionId?: string
 }
 
 export function formatTaskStatusPanel(events: NexusEvent[]): string {
@@ -636,6 +733,30 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
             task.status = 'pending'
           }
         }
+      } else if (ev.eventType === 'sub_agent_session_started') {
+        const payload = ev.payload as { taskId?: string; subSessionId?: string; title?: string } | undefined
+        if (payload?.taskId) {
+          const task = tasks.find(t => t.taskId === payload.taskId)
+          if (task) {
+            task.subSessionId = payload.subSessionId
+          }
+        }
+      } else if (ev.eventType === 'sub_agent_session_completed') {
+        const payload = ev.payload as { taskId?: string } | undefined
+        if (payload?.taskId) {
+          const task = tasks.find(t => t.taskId === payload.taskId)
+          if (task && task.status !== 'completed') {
+            task.status = 'completed'
+          }
+        }
+      } else if (ev.eventType === 'sub_agent_session_failed' || ev.eventType === 'sub_agent_session_error') {
+        const payload = ev.payload as { taskId?: string } | undefined
+        if (payload?.taskId) {
+          const task = tasks.find(t => t.taskId === payload.taskId)
+          if (task && task.status !== 'completed') {
+            task.status = 'failed'
+          }
+        }
       } else if (ev.eventType === 'task_session_failed') {
         for (const t of tasks) {
           if (t.status !== 'completed') {
@@ -690,6 +811,8 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
     if (t.taskId) meta.push(`#${t.taskId}`)
     if (t.parentTaskId) meta.push(`parent #${t.parentTaskId}`)
     if (t.delegatedSubTaskIds?.length) meta.push(`delegated ${t.delegatedSubTaskIds.map(id => `#${id}`).join(',')}`)
+    if (t.worktree) meta.push('worktree')
+    if (t.subSessionId) meta.push(`sub=${shortSessionId(t.subSessionId)}`)
     const suffix = meta.length > 0 ? chalk.dim(` (${meta.join(' · ')})`) : ''
     panel += `  ${indent}${coloredStatus}  ${t.title}${suffix}\n`
   }
@@ -712,6 +835,8 @@ function upsertTaskBoardItem(
     delegatedSubTaskIds: Array.isArray(task.metadata?.delegatedSubTaskIds)
       ? task.metadata.delegatedSubTaskIds.filter(id => typeof id === 'string')
       : undefined,
+    worktree: task.metadata?.requiresIsolation === true || typeof task.metadata?.worktreePath === 'string',
+    subSessionId: typeof task.metadata?.subSessionId === 'string' ? task.metadata.subSessionId : undefined,
   }
   if (!existing) {
     tasks.push(next)
@@ -744,7 +869,8 @@ function formatToolHistoryLine(state: ToolCallState, formattedInput: string): st
   }
   const marker = state.success ? chalk.green('✓') : chalk.red('✗')
   const status = state.success ? chalk.green('done') : chalk.red('failed')
-  return `${toolPrefix} ${marker} ${chalk.bold(formatToolCallName(state.name, formattedInput))} ${status} ${chalk.dim('(ctrl+o to expand)')}`
+  const summary = formatToolOutputSummary(state.name, state.output, state.truncated)
+  return `${toolPrefix} ${marker} ${chalk.bold(formatToolCallName(state.name, formattedInput))} ${status}${summary ? ` ${chalk.dim(summary)}` : ''} ${chalk.dim('(ctrl+o to expand)')}`
 }
 
 function formatToolLiveLine(options: {
@@ -767,7 +893,10 @@ function formatToolLiveLine(options: {
   const marker = options.status === 'completed' ? chalk.green('✓') : chalk.red('✗')
   const status = options.status === 'completed' ? chalk.green('done') : chalk.red('failed')
   const truncated = options.truncated ? chalk.yellow(` truncated ${options.originalBytes ?? 'unknown'}b`) : ''
-  return `${toolPrefix} ${marker} ${chalk.bold(options.name)} ${status}${truncated}`
+  const summary = options.status === 'completed' || options.status === 'failed'
+    ? formatToolOutputSummary(options.name, options.output, options.truncated)
+    : ''
+  return `${toolPrefix} ${marker} ${chalk.bold(options.name)} ${status}${truncated}${summary ? ` ${chalk.dim(summary)}` : ''}`
 }
 
 function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): string {
@@ -821,6 +950,28 @@ function formatToolInput(input: any): string {
 function formatToolCallName(name: string, formattedInput: string): string {
   if (!formattedInput || formattedInput === undefined) return name
   return `${name}(${formattedInput})`
+}
+
+function formatToolOutputSummary(name: string, output: unknown, truncated?: boolean): string {
+  if (!output || typeof output !== 'object') return ''
+  const record = output as Record<string, unknown>
+  const pieces: string[] = []
+  if (typeof record.exitCode === 'number') {
+    pieces.push(`exitCode=${record.exitCode}`)
+  }
+  const stdout = typeof record.stdout === 'string' ? record.stdout : ''
+  const stderr = typeof record.stderr === 'string' ? record.stderr : ''
+  const combined = stdout || stderr
+  if (combined) {
+    const firstLine = combined.split(/\r?\n/).find(line => line.trim().length > 0)
+    if (firstLine) {
+      pieces.push(truncateMiddle(firstLine.trim(), 60))
+    }
+  }
+  if (truncated) {
+    pieces.push('...')
+  }
+  return pieces.join(' ')
 }
 
 function formatOutput(output: unknown): string {

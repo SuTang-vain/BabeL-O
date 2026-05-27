@@ -1,27 +1,34 @@
 import { execFile } from 'node:child_process'
 import { readdir } from 'node:fs/promises'
-import { isAbsolute, join, relative } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { resolveInsideWorkspace } from './pathSafety.js'
 
 const execFileAsync = promisify(execFile)
 
 const inputSchema = z.object({
   pattern: z.string().min(1),
+  path: z.string().optional(),
   maxResults: z.number().int().positive().max(500).default(100),
 })
 
 export const globTool: ToolDefinition<typeof inputSchema> = {
   name: 'Glob',
   description: 'List files using ripgrep file discovery and a simple substring filter.',
+  prompt: () => 'Fast file pattern matching tool. Supports glob patterns like "**/*.js" or "src/**/*.ts". Returns matching file paths sorted by modification time. Use this to find files by name patterns.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
+    const searchRoot = input.path
+      ? resolveInsideWorkspace(context.cwd, input.path)
+      : context.cwd
+
     let stdout = ''
     try {
       const result = await execFileAsync('rg', ['--files'], {
-        cwd: context.cwd,
+        cwd: searchRoot,
         maxBuffer: 2_000_000,
         signal: context.signal,
       })
@@ -33,12 +40,12 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
         'code' in error &&
         error.code === 'ENOENT'
       ) {
-        stdout = (await listFilesFallback(context.cwd, input.maxResults * 20)).join('\n')
+        stdout = (await listFilesFallback(searchRoot, input.maxResults * 20)).join('\n')
       } else {
         throw error
       }
     }
-    const needle = normalizeGlobNeedle(input.pattern, context.cwd)
+    const needle = normalizeGlobNeedle(input.pattern, searchRoot)
     const files = stdout
       .split('\n')
       .filter(Boolean)

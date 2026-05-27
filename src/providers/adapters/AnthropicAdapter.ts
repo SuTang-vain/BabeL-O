@@ -4,10 +4,12 @@ import type {
   StreamDelta,
   ModelMessage,
   ContentBlock,
+  FinishReason,
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
 import { ProviderError } from '../../shared/errors.js'
-import { getProvider } from '../registry.js'
+import { getProvider, getModel } from '../registry.js'
+import { withRetry } from '../retry.js'
 
 const MODEL_MAPPING: Record<
   string,
@@ -128,9 +130,35 @@ export class AnthropicAdapter implements ModelAdapter {
       headers['anthropic-beta'] = betas.join(',')
     }
 
-    // Convert system prompt to block format supporting caching
+    // Build system prompt blocks with segmented caching
     let formattedSystemPrompt: any[] | undefined
-    if (params.systemPrompt) {
+    if (params.systemPromptBlocks && params.systemPromptBlocks.length > 0) {
+      const staticText = params.systemPromptBlocks
+        .filter(b => b.cacheable)
+        .map(b => b.text)
+        .join('\n\n')
+      const dynamicText = params.systemPromptBlocks
+        .filter(b => !b.cacheable)
+        .map(b => b.text)
+        .join('\n\n')
+
+      formattedSystemPrompt = []
+      if (staticText) {
+        formattedSystemPrompt.push({
+          type: 'text',
+          text: staticText,
+          ...(params.enablePromptCaching && {
+            cache_control: { type: 'ephemeral' },
+          }),
+        })
+      }
+      if (dynamicText) {
+        formattedSystemPrompt.push({
+          type: 'text',
+          text: dynamicText,
+        })
+      }
+    } else if (params.systemPrompt) {
       formattedSystemPrompt = [
         {
           type: 'text',
@@ -203,15 +231,24 @@ export class AnthropicAdapter implements ModelAdapter {
       }
     })
 
+    let resolvedMaxTokens: number
+    if (params.maxTokens !== undefined) {
+      resolvedMaxTokens = params.maxTokens
+    } else {
+      try {
+        resolvedMaxTokens = getModel(params.model).defaultMaxTokens
+      } catch {
+        resolvedMaxTokens = 8192
+      }
+    }
+
     const body: any = {
       model: targetModel,
       messages: formattedMessages,
       ...(formattedSystemPrompt && { system: formattedSystemPrompt }),
       ...(mappedTools && mappedTools.length > 0 && { tools: mappedTools }),
       ...(params.temperature !== undefined && { temperature: params.temperature }),
-      ...(params.maxTokens !== undefined
-        ? { max_tokens: params.maxTokens }
-        : { max_tokens: 4096 }),
+      max_tokens: resolvedMaxTokens,
       stream: true,
     }
 
@@ -227,17 +264,21 @@ export class AnthropicAdapter implements ModelAdapter {
       delete body.temperature
     }
 
-    const response = await fetch(`${baseUrl}/v1/messages`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: options?.signal,
-    })
+    const response = await withRetry(async () => {
+      const res = await fetch(`${baseUrl}/v1/messages`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: options?.signal,
+      })
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new ProviderError(providerId, response.status, errorText)
-    }
+      if (!res.ok) {
+        const errorText = await res.text()
+        throw new ProviderError(providerId, res.status, errorText)
+      }
+
+      return res
+    })
 
     if (!response.body) {
       throw new Error('Response body is not readable')
@@ -269,6 +310,13 @@ export class AnthropicAdapter implements ModelAdapter {
             type: 'usage',
             inputTokens: 0,
             outputTokens: usage.output_tokens || 0,
+          }
+        }
+        const stopReason = data.delta?.stop_reason
+        if (stopReason) {
+          yield {
+            type: 'finish',
+            reason: stopReason as FinishReason,
           }
         }
       } else if (sse.event === 'content_block_start') {
@@ -323,11 +371,7 @@ export class AnthropicAdapter implements ModelAdapter {
           try {
             parsedInput = JSON.parse(toolUse.inputBuffer)
           } catch {
-            try {
-              parsedInput = (0, eval)(`(${toolUse.inputBuffer})`)
-            } catch {
-              parsedInput = { raw: toolUse.inputBuffer }
-            }
+            parsedInput = { _parseError: true, _rawInput: toolUse.inputBuffer.slice(0, 500) }
           }
           yield {
             type: 'tool_use_end',

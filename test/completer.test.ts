@@ -8,7 +8,9 @@ import {
   getSlashCompletionChoices,
   getSlashPaletteChoices,
   getToolCompletionChoices,
+  isSessionPermissionCached,
   mapDropdownSelection,
+  sessionPermissionApprovals,
 } from '../src/cli/program.js'
 
 test('mapDropdownSelection correctly translates tool shortcuts', () => {
@@ -30,6 +32,7 @@ test('mapDropdownSelection preserves control commands', () => {
   assert.strictEqual(mapDropdownSelection('/help'), '/help')
   assert.strictEqual(mapDropdownSelection('/clear'), '/clear')
   assert.strictEqual(mapDropdownSelection('/compact'), '/compact')
+  assert.strictEqual(mapDropdownSelection('/context'), '/context')
   assert.strictEqual(mapDropdownSelection('/exit'), '/exit')
   assert.strictEqual(mapDropdownSelection('/status'), '/status')
   assert.strictEqual(mapDropdownSelection('/sessions'), '/sessions')
@@ -43,6 +46,7 @@ test('mapDropdownSelection preserves unknown inputs', () => {
 test('tool and slash completion choices expose productized metadata', () => {
   assert.ok(getSlashCompletionChoices().includes('/tool'))
   assert.ok(getSlashCompletionChoices().includes('/compact'))
+  assert.ok(getSlashCompletionChoices().includes('/context'))
   assert.ok(getToolCompletionChoices().includes('/tool bash'))
 
   const bash = describeCompletionChoice('/tool bash')
@@ -52,6 +56,10 @@ test('tool and slash completion choices expose productized metadata', () => {
   const compact = describeCompletionChoice('/compact')
   assert.strictEqual(compact.tag, 'session')
   assert.match(compact.description, /Compact current session context/)
+
+  const context = describeCompletionChoice('/context')
+  assert.strictEqual(context.tag, 'session')
+  assert.match(context.description, /Inspect context budget/)
 
   const formatted = formatCompletionChoice('/tool read', true)
   assert.ok(formatted.includes('/tool read'))
@@ -94,6 +102,7 @@ test('formatPermissionDialog renders multi-level approval choices', () => {
     [
       { id: 'approve_once', label: 'Approve once' },
       { id: 'approve_session', label: 'Approve for this session' },
+      { id: 'approve_rule', label: 'Approve with editable rule' },
       { id: 'reject', label: 'Reject' },
       { id: 'reject_instruct', label: 'Reject, tell the model what to do instead' },
     ],
@@ -103,9 +112,43 @@ test('formatPermissionDialog renders multi-level approval choices', () => {
   assert.ok(output.includes('approval'))
   assert.ok(output.includes('Bash is requesting approval'))
   assert.ok(output.includes('npm test'))
+  assert.ok(output.includes('Suggested rule:'))
+  assert.ok(output.includes('npm test:*'))
   assert.ok(output.includes('[1] Approve once'))
   assert.ok(output.includes('[2] Approve for this session'))
-  assert.ok(output.includes('[3] Reject'))
-  assert.ok(output.includes('[4] Reject, tell the model what to do instead'))
+  assert.ok(output.includes('[3] Approve with editable rule'))
+  assert.ok(output.includes('[4] Reject'))
+  assert.ok(output.includes('[5] Reject, tell the model what to do instead'))
   assert.ok(output.includes('▲/▼ select'))
+  assert.ok(output.includes('1/2/3/4/5 choose'))
+})
+
+test('session permission rules only match the approved command prefix', () => {
+  const sessionId = 'session-permission-rule'
+  sessionPermissionApprovals.set(sessionId, new Set(['Bash:npm test:*']))
+  try {
+    assert.equal(
+      isSessionPermissionCached(sessionId, {
+        name: 'Bash',
+        input: { command: 'npm test -- --runInBand' },
+      }),
+      true,
+    )
+    assert.equal(
+      isSessionPermissionCached(sessionId, {
+        name: 'Bash',
+        input: { command: 'npm install left-pad' },
+      }),
+      false,
+    )
+    assert.equal(
+      isSessionPermissionCached(sessionId, {
+        name: 'Write',
+        input: { path: 'package.json' },
+      }),
+      false,
+    )
+  } finally {
+    sessionPermissionApprovals.delete(sessionId)
+  }
 })

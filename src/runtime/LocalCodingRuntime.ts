@@ -5,6 +5,10 @@ import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { truncateToolOutput } from '../tools/output.js'
+import {
+  formatWorkspacePathError,
+  isWorkspacePathError,
+} from '../tools/builtin/pathSafety.js'
 import type {
   NexusRuntime,
   RuntimeExecuteOptions,
@@ -45,6 +49,7 @@ export class LocalCodingRuntime implements NexusRuntime {
         description: tool.description,
         risk: tool.risk,
         allowed: this.toolPolicy.isAllowed(tool),
+        inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
@@ -435,6 +440,19 @@ async function executeToolSafely(
         message: isTimeout
           ? `Execution timed out while running ${tool.name}.`
           : `Execution cancelled while running ${tool.name}.`,
+      }
+    }
+    if (isWorkspacePathError(error)) {
+      return {
+        kind: 'result',
+        success: false,
+        output: {
+          code: error.code,
+          message: formatWorkspacePathError(error),
+          requestedPath: error.requestedPath,
+          cwd: error.cwd,
+          resolvedPath: error.resolvedPath,
+        },
       }
     }
     return {

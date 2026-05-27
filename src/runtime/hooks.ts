@@ -119,6 +119,29 @@ const builtInHooks: RuntimeHook[] = [
       }
     },
   },
+  {
+    name: 'SubagentLifecycleHook',
+    events: ['SubagentStart', 'SubagentStop'],
+    run(input) {
+      const isStart = input.success === undefined
+      return {
+        summary: isStart
+          ? `Subagent started: ${input.toolUseId}`
+          : `Subagent ${input.toolUseId} completed with success=${input.success}`,
+        metadata: { toolUseId: input.toolUseId, toolInput: input.toolInput },
+      }
+    },
+  },
+  {
+    name: 'UserPromptAuditHook',
+    events: ['UserPromptSubmit'],
+    run(input) {
+      return {
+        summary: 'User prompt received.',
+        metadata: { promptPreview: typeof input.prompt === 'string' ? input.prompt.slice(0, 200) : undefined },
+      }
+    },
+  },
 ]
 
 export async function executeRuntimeHooks(

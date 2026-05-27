@@ -22,6 +22,7 @@ export type ToolDefinition<TInput extends z.ZodType = z.ZodType> = {
   risk: ToolRisk
   inputSchema: TInput
   modelInputSchema?: unknown
+  prompt?(): string
   source?: {
     type: 'builtin' | 'mcp'
     serverName?: string

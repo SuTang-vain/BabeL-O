@@ -4,6 +4,11 @@ import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
 import { ConfigManager } from '../../shared/config.js'
+import {
+  formatWorkspacePathError,
+  resolveInsideWorkspace,
+  WorkspacePathError,
+} from './pathSafety.js'
 
 const spawnedContainers = new Set<string>()
 
@@ -27,6 +32,22 @@ type FailedCommandResult = {
   exitCode?: number
   signal?: string
   message: string
+}
+
+function resolveShellCwd(sessionId: string, workspaceCwd: string): string {
+  const retained = sessionCwdMap.get(sessionId)
+  if (!retained) return workspaceCwd
+
+  try {
+    resolveInsideWorkspace(workspaceCwd, retained.cwd)
+    return retained.cwd
+  } catch (error) {
+    if (error instanceof WorkspacePathError || (error as { code?: unknown })?.code === 'WORKSPACE_PATH_ESCAPE') {
+      sessionCwdMap.delete(sessionId)
+      return workspaceCwd
+    }
+    throw error
+  }
 }
 
 function createStateProbe(): StateProbe {
@@ -176,10 +197,24 @@ const inputSchema = z.object({
 export const bashTool: ToolDefinition<typeof inputSchema> = {
   name: 'Bash',
   description: 'Run a shell command in the workspace.',
+  prompt: () => 'Executes a bash command in the working directory. The shell state does not persist between commands. Use this for system commands and terminal operations that require shell execution. Prefer dedicated tools (Read, Edit, Glob, Grep) for file operations instead of shell commands.',
   risk: 'execute',
   inputSchema,
   async execute(input, context) {
-    const currentCwd = sessionCwdMap.get(context.sessionId)?.cwd ?? context.cwd
+    const currentCwd = resolveShellCwd(context.sessionId, context.cwd)
+    const workspaceEscape = findWorkspaceEscapeInCommand(input.command, context.cwd)
+    if (workspaceEscape) {
+      return {
+        success: false,
+        output: {
+          code: workspaceEscape.code,
+          message: formatWorkspacePathError(workspaceEscape),
+          requestedPath: workspaceEscape.requestedPath,
+          cwd: workspaceEscape.cwd,
+          resolvedPath: workspaceEscape.resolvedPath,
+        },
+      }
+    }
     const probe = createStateProbe()
 
     // Inject state probing code to capture the final CWD and exit code
@@ -361,4 +396,33 @@ exit $_EXIT_CODE`
       throw newErr
     }
   },
+}
+
+function findWorkspaceEscapeInCommand(command: string, cwd: string): WorkspacePathError | null {
+  for (const path of extractAbsoluteCommandPaths(command)) {
+    try {
+      resolveInsideWorkspace(cwd, path)
+    } catch (error) {
+      if (error instanceof WorkspacePathError) {
+        return error
+      }
+      const maybeWorkspaceError = error as { code?: unknown }
+      if (maybeWorkspaceError?.code === 'WORKSPACE_PATH_ESCAPE') {
+        return error as WorkspacePathError
+      }
+      throw error
+    }
+  }
+  return null
+}
+
+function extractAbsoluteCommandPaths(command: string): string[] {
+  const paths = new Set<string>()
+  const pathPattern = /\/[^\s"'`$|&;<>]+/g
+  for (const match of command.matchAll(pathPattern)) {
+    const candidate = match[0].replace(/[),.]+$/u, '')
+    if (candidate === '/' || candidate.startsWith('/dev/')) continue
+    paths.add(candidate)
+  }
+  return [...paths]
 }

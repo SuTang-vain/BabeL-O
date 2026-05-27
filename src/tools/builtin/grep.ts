@@ -16,6 +16,7 @@ const inputSchema = z.object({
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
+  prompt: () => 'A powerful search tool built on ripgrep. Supports full regex syntax. Use this to search file content by pattern. Prefer this tool over bash grep commands.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {

@@ -72,6 +72,9 @@ export class MemoryStorage implements NexusStorage {
     if (!session) return
     session.events.push(structuredClone(event))
     session.updatedAt = event.timestamp
+    if (event.type === 'session_started') {
+      session.cwd = event.cwd
+    }
 
     if (event.type === 'tool_started') {
       const trace: ToolTrace = {

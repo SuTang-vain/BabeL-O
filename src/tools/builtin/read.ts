@@ -11,6 +11,7 @@ const inputSchema = z.object({
 export const readTool: ToolDefinition<typeof inputSchema> = {
   name: 'Read',
   description: 'Read a text file inside the workspace.',
+  prompt: () => 'Reads a file from the local filesystem. You can access any file directly by using this tool. The file path must be an absolute path. Use this tool to understand code before making changes.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {

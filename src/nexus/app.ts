@@ -1,5 +1,6 @@
 import websocket from '@fastify/websocket'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { existsSync, lstatSync } from 'node:fs'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
 import { eventBase, type NexusEvent, NexusEventSchema } from '../shared/events.js'
@@ -15,6 +16,9 @@ import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
+import { analyzeContext } from '../runtime/contextAnalysis.js'
+import { buildSystemPrompt, extractAbsolutePaths, mapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
+import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
 
 
 declare module 'fastify' {
@@ -209,7 +213,13 @@ export async function createNexusApp(
         })
       }
       const sessionId = body.sessionId ?? createId('session')
-      const cwd = body.cwd ?? options.defaultCwd
+      let session = await options.storage.getSession(sessionId, { includeEvents: false })
+      const cwd = resolveRequestCwd({
+        prompt: body.prompt,
+        requestedCwd: body.cwd,
+        sessionCwd: session?.cwd,
+        defaultCwd: options.defaultCwd,
+      })
 
       if (!isWorkspaceAllowed(cwd)) {
         return reply.status(400).send({
@@ -247,11 +257,11 @@ export async function createNexusApp(
         },
         body.timeoutMs ?? executeTimeoutMs,
       )
-      let session = await options.storage.getSession(sessionId, { includeEvents: false })
       if (!session) {
         session = createSessionSnapshot(sessionId, cwd, body.prompt)
       } else {
         session.phase = 'executing'
+        session.cwd = cwd
         session.updatedAt = nowIso()
         session.lastUserInput = body.prompt
       }
@@ -439,6 +449,8 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       modelId: body.modelId,
       trigger: body.trigger ?? 'manual',
+      mapEventsToMessages,
+      initialPrompt: session.lastUserInput ?? session.prompt,
     })
     return {
       type: 'compact_result',
@@ -447,6 +459,51 @@ export async function createNexusApp(
       beforeEventCount: result.beforeEventCount,
       afterEventCount: result.afterEventCount,
     }
+  })
+
+  app.get('/v1/sessions/:sessionId/context', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = z.object({
+      modelId: z.string().optional(),
+      prompt: z.string().optional(),
+      cwd: z.string().optional(),
+    }).parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const { events } = await options.storage.listEvents(params.sessionId, {
+      limit: 10_000,
+      order: 'asc',
+    })
+    const settings = ConfigManager.getInstance().resolveSettings()
+    const modelId = query.modelId ?? settings.modelId ?? 'local/coding-runtime'
+    const toolDefinitions = (options.runtime.listTools?.() ?? [])
+      .filter(tool => tool.allowed)
+      .map(tool => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema ?? {},
+      }))
+    const analysis = await analyzeContext({
+      runtimeOptions: {
+        sessionId: params.sessionId,
+        prompt: query.prompt ?? session.lastUserInput ?? session.prompt,
+        cwd: query.cwd ?? session.cwd,
+      },
+      events,
+      modelId,
+      buildSystemPrompt,
+      mapEventsToMessages,
+      tools: toolDefinitions,
+    })
+    return analysis
   })
 
   app.get('/v1/sessions/:sessionId/tool-traces', async request => {
@@ -792,7 +849,13 @@ export async function createNexusApp(
         return
       }
       const sessionId = body.sessionId ?? createId('session')
-      const cwd = body.cwd ?? options.defaultCwd
+      let session = await options.storage.getSession(sessionId, { includeEvents: false })
+      const cwd = resolveRequestCwd({
+        prompt: body.prompt,
+        requestedCwd: body.cwd,
+        sessionCwd: session?.cwd,
+        defaultCwd: options.defaultCwd,
+      })
       if (!isWorkspaceAllowed(cwd)) {
         sendJson(socket, {
           type: 'error',
@@ -829,11 +892,11 @@ export async function createNexusApp(
         },
         body.timeoutMs ?? executeTimeoutMs,
       )
-      let session = await options.storage.getSession(sessionId, { includeEvents: false })
       if (!session) {
         session = createSessionSnapshot(sessionId, cwd, body.prompt)
       } else {
         session.phase = 'executing'
+        session.cwd = cwd
         session.updatedAt = nowIso()
         session.lastUserInput = body.prompt
       }
@@ -952,6 +1015,36 @@ function createSessionSnapshot(
     updatedAt: timestamp,
     events: [],
   }
+}
+
+function resolveRequestCwd(options: {
+  prompt: string
+  requestedCwd?: string
+  sessionCwd?: string
+  defaultCwd: string
+}): string {
+  const explicitCwd = resolveExplicitPromptCwd(options.prompt)
+  if (explicitCwd) {
+    return explicitCwd
+  }
+  if (options.requestedCwd && options.requestedCwd !== options.defaultCwd) {
+    return options.requestedCwd
+  }
+  return options.sessionCwd ?? options.requestedCwd ?? options.defaultCwd
+}
+
+function resolveExplicitPromptCwd(prompt: string): string | undefined {
+  for (const candidate of extractAbsolutePaths(prompt)) {
+    const resolved = resolvePromptPath(candidate)
+    if (!existsSync(resolved)) continue
+    try {
+      const stat = lstatSync(resolved)
+      if (stat.isDirectory()) return resolved
+    } catch {
+      continue
+    }
+  }
+  return undefined
 }
 
 export function isLocalHost(h: string): boolean {

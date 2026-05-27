@@ -3,22 +3,71 @@ import chalk from 'chalk'
 import { emitKeypressEvents } from 'node:readline'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { getChatPrompt } from './renderEvents.js'
+import { inputState } from './inputState.js'
 
 export type CliReadline = readline.Interface
 
 export type PermissionChoice =
   | 'approve_once'
   | 'approve_session'
+  | 'approve_rule'
   | 'reject'
   | 'reject_instruct'
+
+const REJECT_PERMISSION_CHOICE_INDEX = 3
 
 export interface PermissionDecision {
   approved: boolean
   scope: 'once' | 'session'
   reason?: string
+  rule?: string
 }
 
 export const sessionPermissionApprovals = new Map<string, Set<string>>()
+
+export function isSessionPermissionCached(
+  sessionId: string,
+  event: { name?: string; input?: unknown },
+): boolean {
+  if (!event.name) return false
+  const approvals = sessionPermissionApprovals.get(sessionId)
+  if (!approvals) return false
+  if (approvals.has(event.name)) return true
+
+  for (const entry of approvals) {
+    const separatorIndex = entry.indexOf(':')
+    if (separatorIndex === -1) continue
+    const toolName = entry.slice(0, separatorIndex)
+    const rule = entry.slice(separatorIndex + 1)
+    if (toolName !== event.name) continue
+    if (matchesPermissionRule(event.name, event.input, rule)) return true
+  }
+  return false
+}
+
+export function matchesPermissionRule(
+  toolName: string,
+  input: unknown,
+  rule: string,
+): boolean {
+  if (!rule || rule === '*') return true
+  if (toolName !== 'Bash') return false
+
+  const command = typeof input === 'object' && input !== null
+    ? (input as Record<string, unknown>).command
+    : undefined
+  if (typeof command !== 'string') return false
+  const normalizedCommand = command.trim().replace(/\s+/g, ' ')
+  const normalizedRule = rule.trim().replace(/\s+/g, ' ')
+  if (!normalizedCommand || !normalizedRule) return false
+  if (!normalizedRule.endsWith(':*')) {
+    return normalizedCommand === normalizedRule
+  }
+
+  const prefix = normalizedRule.slice(0, -2).trim()
+  if (!prefix) return true
+  return normalizedCommand === prefix || normalizedCommand.startsWith(`${prefix} `)
+}
 
 export function questionAsync(rl: CliReadline, query: string): Promise<string> {
   return new Promise(resolve => {
@@ -74,6 +123,24 @@ export function formatPermissionInput(input: unknown): string {
   return JSON.stringify(input)
 }
 
+export function extractCommandPrefix(command: unknown): string {
+  if (typeof command !== 'string') return '*'
+  const trimmed = command.trim()
+  const tokens = trimmed.split(/\s+/)
+  if (tokens.length === 0) return '*'
+  const first = tokens[0]!
+  if (tokens.length === 1) return `${first}:*`
+  // For npm/yarn/npx/uvx/uv, keep the subcommand
+  if (['npm', 'yarn', 'npx', 'pnpm', 'uvx', 'uv'].includes(first) && tokens.length >= 2) {
+    return `${first} ${tokens[1]}:*`
+  }
+  // For git, keep the subcommand
+  if (first === 'git' && tokens.length >= 2) {
+    return `git ${tokens[1]}:*`
+  }
+  return `${first}:*`
+}
+
 export function countRenderedLines(text: string): number {
   return text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length
 }
@@ -86,6 +153,9 @@ export function formatPermissionDialog(
   const tool = event.name || 'tool'
   const risk = event.risk ? `${event.risk} risk` : 'unknown risk'
   const command = formatPermissionInput(event.input)
+  const suggestedRule = tool === 'Bash' && typeof (event.input as Record<string, unknown>)?.command === 'string'
+    ? extractCommandPrefix((event.input as Record<string, unknown>).command)
+    : undefined
   const lines = [
     chalk.yellow(' approval '),
     `│ ${chalk.yellow(`${tool} is requesting approval (${risk})`)}`,
@@ -93,6 +163,10 @@ export function formatPermissionDialog(
   if (command) {
     lines.push('│')
     lines.push(`│ ${command}`)
+  }
+  if (suggestedRule) {
+    lines.push('│')
+    lines.push(`│ ${chalk.dim('Suggested rule:')} ${chalk.cyan(suggestedRule)}`)
   }
 
   choices.forEach((choice, index) => {
@@ -102,7 +176,7 @@ export function formatPermissionDialog(
     lines.push(`│ ${marker} [${index + 1}] ${label}`)
   })
 
-  lines.push(` ${chalk.dim('▲/▼ select   1/2/3/4 choose   ↵ confirm   esc reject')}`)
+  lines.push(` ${chalk.dim('▲/▼ select   1/2/3/4/5 choose   ↵ confirm   esc cancel')}`)
   return `${lines.join('\n')}\n`
 }
 
@@ -116,6 +190,7 @@ export async function askPermission(
   const keypressListeners = process.stdin.listeners('keypress')
   rl.pause()
   process.stdin.removeAllListeners('keypress')
+  inputState.set('permissionPanel', { toolName: event.name, toolRisk: event.risk })
 
   return new Promise<PermissionDecision>((resolve, reject) => {
     let settled = false
@@ -124,6 +199,7 @@ export async function askPermission(
     const choices: { id: PermissionChoice; label: string }[] = [
       { id: 'approve_once', label: 'Approve once' },
       { id: 'approve_session', label: 'Approve for this session' },
+      { id: 'approve_rule', label: 'Approve with editable rule' },
       { id: 'reject', label: 'Reject' },
       { id: 'reject_instruct', label: 'Reject, tell the model what to do instead' },
     ]
@@ -144,6 +220,9 @@ export async function askPermission(
       signal.removeEventListener('abort', onAbort)
       rl.resume()
       process.stdin.resume()
+      if (inputState.current === 'permissionPanel') {
+        inputState.set('idle')
+      }
     }
 
     const redraw = () => {
@@ -167,6 +246,20 @@ export async function askPermission(
         decision = { approved: true, scope: 'once' }
       } else if (choice === 'approve_session') {
         decision = { approved: true, scope: 'session' }
+      } else if (choice === 'approve_rule') {
+        cleanup()
+        const defaultRule = event.name === 'Bash' && typeof event.input === 'object' && event.input !== null
+          ? extractCommandPrefix((event.input as Record<string, unknown>).command)
+          : event.name ?? '*'
+        const ruleInput = await questionAsync(rl, chalk.yellow(`Enter allow rule prefix (default: ${defaultRule}): `))
+        const rule = ruleInput.trim() || defaultRule
+        resolve({
+          approved: true,
+          scope: 'session',
+          reason: `Approved with rule: ${rule}`,
+          rule,
+        })
+        return
       } else if (choice === 'reject_instruct') {
         cleanup()
         const reason = await questionAsync(rl, chalk.yellow('Tell the model what to do instead: '))
@@ -218,7 +311,7 @@ export async function askPermission(
         return
       }
       for (const char of text) {
-        if (char >= '1' && char <= '4') {
+        if (char >= '1' && char <= '5') {
           chooseIndex(Number(char) - 1)
           return
         }
@@ -227,7 +320,7 @@ export async function askPermission(
           return
         }
         if (char === '\x1b') {
-          chooseIndex(2)
+          chooseIndex(REJECT_PERMISSION_CHOICE_INDEX)
           return
         }
       }
@@ -245,8 +338,8 @@ export async function askPermission(
       } else if (key?.name === 'return') {
         void finish(choices[activeIndex]!.id)
       } else if (key?.name === 'escape') {
-        chooseIndex(2)
-      } else if (['1', '2', '3', '4'].includes(key?.name)) {
+        chooseIndex(REJECT_PERMISSION_CHOICE_INDEX)
+      } else if (['1', '2', '3', '4', '5'].includes(key?.name)) {
         chooseIndex(Number(key.name) - 1)
       }
     }
@@ -273,18 +366,22 @@ export async function handleLocalPermissionRequest(
 ): Promise<void> {
   await new Promise(resolve => setImmediate(resolve))
   try {
-    const cached = event.name ? sessionPermissionApprovals.get(sessionId)?.has(event.name) : false
+    const cached = isSessionPermissionCached(sessionId, event)
     const decision: PermissionDecision = cached
-      ? { approved: true, scope: 'session' }
+      ? { approved: true, scope: 'session', reason: 'Approved from session permission cache' }
       : await askPermission(rl, event, signal)
     if (decision.approved && decision.scope === 'session' && event.name) {
       const tools = sessionPermissionApprovals.get(sessionId) ?? new Set<string>()
-      tools.add(event.name)
+      if (decision.rule) {
+        tools.add(`${event.name}:${decision.rule}`)
+      } else {
+        tools.add(event.name)
+      }
       sessionPermissionApprovals.set(sessionId, tools)
     }
     const resolved = PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
       approved: decision.approved,
-      reason: decision.approved ? undefined : decision.reason ?? 'Denied by user',
+      reason: decision.approved ? decision.reason : decision.reason ?? 'Denied by user',
     })
     if (!resolved) {
       console.error(chalk.red(`Permission request not found: ${event.toolUseId}`))
@@ -313,6 +410,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/help': { tag: 'command', description: 'Show command help' },
     '/clear': { tag: 'command', description: 'Clear the terminal' },
     '/compact': { tag: 'session', description: 'Compact current session context' },
+    '/context': { tag: 'session', description: 'Inspect context budget and compact state' },
     '/exit': { tag: 'command', description: 'Exit chat' },
     '/model': { tag: 'config', description: 'Open model configuration wizard' },
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },

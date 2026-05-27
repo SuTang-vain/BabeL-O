@@ -83,7 +83,7 @@ export function summarizeSessionEvents(
         }
         break
       case 'error':
-        pushLimited(notableIssues, `${event.code}: ${snippet(event.message, 120)}`, MAX_LIST_ITEMS)
+        pushLimited(notableIssues, formatErrorIssue(event), MAX_LIST_ITEMS)
         break
       case 'result':
         if (event.success) stats.resultsSucceeded++
@@ -96,6 +96,13 @@ export function summarizeSessionEvents(
       case 'session_started':
       case 'usage':
       case 'task_created':
+      case 'compact_boundary':
+      case 'compact_failure':
+      case 'context_warning':
+      case 'session_memory_updated':
+      case 'hook_started':
+      case 'hook_completed':
+      case 'hook_failed':
         break
     }
   }
@@ -130,6 +137,15 @@ export function summarizeSessionEvents(
   }
 
   return trimToMaxChars(lines.join('\n'), maxChars)
+}
+
+function formatErrorIssue(event: Extract<NexusEvent, { type: 'error' }>): string {
+  const details = event.details
+  const recoveryReason = details && typeof details === 'object'
+    ? (details as { recoveryReason?: unknown }).recoveryReason
+    : undefined
+  const suffix = typeof recoveryReason === 'string' ? ` (${recoveryReason})` : ''
+  return `${event.code}: ${snippet(event.message, 120)}${suffix}`
 }
 
 function increment(counts: Map<string, number>, key: string) {

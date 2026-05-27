@@ -37,6 +37,7 @@ import {
   pruneOrphanedWorktrees,
 } from './worktree.js'
 import { RuntimeAgentStepError } from './runtimeAgentStep.js'
+import { executeRuntimeHooks } from '../runtime/hooks.js'
 
 type AgentSubTask = {
   title: string
@@ -353,6 +354,18 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
 
         if (isSubAgentTask) {
           const subSessionId = `${sessionId}-sub-${task.taskId}`
+          const subAgentHooks = await executeRuntimeHooks(
+            'SubagentStart',
+            {
+              toolUseId: task.taskId,
+              toolName: 'Subagent',
+              toolInput: { prompt: task.title, sessionId: subSessionId, parentSessionId: sessionId },
+            },
+            { sessionId, cwd: taskCwd },
+          )
+          for (const ev of subAgentHooks.events) {
+            recordTaskSessionEvent(sessionId, 'hook_event', { hookEvent: ev })
+          }
           recordTaskSessionEvent(sessionId, 'sub_agent_session_started', {
             taskId: task.taskId,
             subSessionId,
@@ -410,6 +423,20 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               subSessionId,
               error: String(err),
             })
+          } finally {
+            const subAgentStopHooks = await executeRuntimeHooks(
+              'SubagentStop',
+              {
+                toolUseId: task.taskId,
+                toolName: 'Subagent',
+                toolInput: { prompt: task.title, sessionId: subSessionId, parentSessionId: sessionId },
+                success: executorSuccess,
+              },
+              { sessionId, cwd: taskCwd },
+            )
+            for (const ev of subAgentStopHooks.events) {
+              recordTaskSessionEvent(sessionId, 'hook_event', { hookEvent: ev })
+            }
           }
         } else {
           try {

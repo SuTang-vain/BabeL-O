@@ -32,6 +32,8 @@ import {
   createSlashPalette,
   getToolCompletionChoices
 } from '../completer.js'
+import { inputState } from '../inputState.js'
+import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 
 interface ReadlineInternal extends readline.Interface {
   history: string[]
@@ -111,6 +113,7 @@ export function registerChatCommand(program: Command): void {
       const executeSessionFlow = async (command: string, abortController: AbortController) => {
         activeAbortController = abortController
         isExecuting = true
+        inputState.set('agentRunning')
         startSession()
         const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false
         if (process.stdin.isTTY) {
@@ -128,16 +131,84 @@ export function registerChatCommand(program: Command): void {
           }
           activeAbortController = null
           isExecuting = false
+          inputState.set('idle')
           stopSpinner()
         }
       }
 
+      const showContextAnalysis = async () => {
+        const modelId = ConfigManager.getInstance().resolveSettings().modelId
+        let analysis: ContextAnalysis
+        if (options.url) {
+          analysis = await new NexusClient({ baseUrl: options.url }).analyzeContext(sessionId, {
+            modelId,
+            cwd: options.cwd,
+          }) as ContextAnalysis
+        } else {
+          const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+          if (!fs.existsSync(storagePath)) {
+            console.log(chalk.yellow('No local storage found for context analysis.'))
+            return
+          }
+            const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
+            const { createDefaultToolRegistry } = await import('../../tools/registry.js')
+            const { analyzeContext } = await import('../../runtime/contextAnalysis.js')
+            const { buildSystemPrompt, mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
+            const storage = new SqliteStorage(storagePath)
+          try {
+            const session = await storage.getSession(sessionId, { includeEvents: false })
+            if (!session) {
+              console.log(chalk.yellow(`Session not found: ${sessionId}`))
+              return
+            }
+            const { events } = await storage.listEvents(sessionId, {
+              limit: 10_000,
+              order: 'asc',
+            })
+            const tools = [...createDefaultToolRegistry().values()].map(tool => ({
+              name: tool.name,
+              description: tool.description,
+              inputSchema: tool.modelInputSchema ?? {},
+            }))
+            analysis = await analyzeContext({
+              runtimeOptions: {
+                sessionId,
+                prompt: session.lastUserInput ?? session.prompt,
+                cwd: session.cwd,
+              },
+              events,
+              modelId,
+              buildSystemPrompt,
+              mapEventsToMessages,
+              tools,
+            })
+          } finally {
+            await storage.close?.()
+          }
+        }
+        console.log(formatContextAnalysis(analysis))
+      }
+
       const onGlobalKeypress = (chunk: any, key: any) => {
-        if (!isExecuting && slashPalette.handleKey(chunk, key)) {
+        // Route to slash palette only when idle (not when permission panel is open)
+        if (!isExecuting && inputState.current !== 'permissionPanel' && slashPalette.handleKey(chunk, key)) {
           return
+        }
+        // When an overlay is open, only allow Ctrl+C and Escape to pass through
+        if (inputState.isOverlayOpen()) {
+          if (key?.ctrl && key.name === 'c') {
+            // Let the overlay or SIGINT handler deal with it
+          } else if (key?.name === 'escape' || chunk === '\x1b' || chunk === '\u001b') {
+            // Overlay should handle escape itself; do not process globally
+            return
+          } else if (!isExecuting) {
+            // Block other keys when overlay is open to prevent input pollution
+            return
+          }
         }
         if (key) {
           if (key.ctrl && key.name === 'o') {
+            if (inputState.isOverlayOpen()) return
             // Clear readline prompt line
             process.stdout.write('\r\x1b[K')
             // Toggle TUI mode and redraw session
@@ -277,6 +348,7 @@ export function registerChatCommand(program: Command): void {
             console.log(`${chalk.bold('/help')}          Show this help message`)
             console.log(`${chalk.bold('/clear')}         Clear terminal screen`)
             console.log(`${chalk.bold('/compact')}       Compact the current session context`)
+            console.log(`${chalk.bold('/context')}       Inspect context budget and compact state`)
             console.log(`${chalk.bold('/exit')}          Exit the interactive shell`)
             console.log(`${chalk.bold('/model')}         Show default model or switch it (e.g. /model anthropic/claude-3-5-sonnet)`)
             console.log(`${chalk.bold('/profile')}       List profiles, switch active profile, or create profile (e.g. /profile dev)`)
@@ -287,6 +359,15 @@ export function registerChatCommand(program: Command): void {
             console.log(`${chalk.bold('/tool')}          Browse built-in tools and insert a tool prompt prefix`)
             console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
             console.log()
+            continue
+          }
+
+          if (trimmed === '/context') {
+            try {
+              await showContextAnalysis()
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to analyze context: ${e.message || e}`))
+            }
             continue
           }
 
@@ -308,6 +389,7 @@ export function registerChatCommand(program: Command): void {
                 } else {
                   const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
                   const { compactSession } = await import('../../runtime/compact.js')
+                  const { mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
                   const storage = new SqliteStorage(storagePath)
                   try {
                     const modelId = ConfigManager.getInstance().resolveSettings().modelId
@@ -316,6 +398,7 @@ export function registerChatCommand(program: Command): void {
                       sessionId,
                       modelId,
                       trigger: 'manual',
+                      mapEventsToMessages,
                     })
                     console.log(chalk.green(`✓ Compacted session ${sessionId}`))
                     console.log(JSON.stringify(result, null, 2))
@@ -561,6 +644,68 @@ export function registerChatCommand(program: Command): void {
         rl.close()
       }
     })
+}
+
+function formatContextAnalysis(analysis: ContextAnalysis): string {
+  const lines: string[] = []
+  const windowColor = analysis.window.isBlocking
+    ? chalk.red
+    : analysis.window.isWarning
+      ? chalk.yellow
+      : chalk.green
+  lines.push(chalk.cyan('\n--- Context Analysis ---'))
+  lines.push(`Session: ${chalk.dim(analysis.sessionId)}`)
+  lines.push(`Model:   ${chalk.yellow(analysis.modelId)}`)
+  lines.push(`CWD:     ${chalk.white(analysis.cwd)}`)
+  lines.push(
+    `Tokens:  ${windowColor(`${analysis.estimate.totalTokens}/${analysis.window.maxTokens}`)} ` +
+    chalk.dim(`(${analysis.window.percentUsed}%, warn ${analysis.window.warningThresholdTokens}, block ${analysis.window.blockingLimitTokens})`),
+  )
+  lines.push('')
+  lines.push(chalk.bold('Sections'))
+  lines.push(`  system prompt:   ${analysis.sections.systemPromptChars} chars`)
+  lines.push(`  project memory:  ${analysis.sections.projectMemoryChars} chars`)
+  lines.push(`  session summary: ${analysis.sections.sessionSummaryChars} chars`)
+  lines.push(`  active skills:   ${analysis.sections.activeSkillsChars} chars`)
+  lines.push(`  messages:        ${analysis.sections.messageCount}`)
+  lines.push(`  events:          selected ${analysis.sections.selectedEventCount}, omitted ${analysis.sections.omittedEventCount}, snipped ${analysis.sections.snippedEventCount}`)
+  lines.push(`  tool schemas:    ${analysis.sections.toolDefinitionCount}`)
+  lines.push('')
+  lines.push(chalk.bold('Compact'))
+  if (analysis.compact.hasBoundary) {
+    lines.push(`  boundary:        ${chalk.green('yes')} (${analysis.compact.trigger})`)
+    lines.push(`  retained events: ${analysis.compact.retainedEventCount}`)
+    lines.push(`  retained check:  ${
+      analysis.compact.retainedSegmentValid
+        ? chalk.green('valid')
+        : chalk.red('invalid')
+    }`)
+    if (analysis.compact.retainedSegmentWarning) {
+      lines.push(`  retained warn:   ${chalk.yellow(analysis.compact.retainedSegmentWarning)}`)
+    }
+    lines.push(`  event counts:    ${analysis.compact.beforeEventCount} -> ${analysis.compact.afterEventCount}`)
+  } else {
+    lines.push(`  boundary:        ${chalk.yellow('no')}`)
+  }
+  lines.push('')
+  lines.push(chalk.bold('Post-Compact State'))
+  lines.push(`  read files:      ${formatList(analysis.postCompactState.recentReadFiles)}`)
+  lines.push(`  recent tools:    ${formatList(analysis.postCompactState.activeToolNames)}`)
+  lines.push(`  active skills:   ${formatList(analysis.postCompactState.activeSkills)}`)
+  lines.push(`  agent/tasks:     ${formatList(analysis.postCompactState.taskStatusLines)}`)
+  lines.push(`  hooks:           ${formatList(analysis.postCompactState.hookLines)}`)
+  lines.push('')
+  lines.push(chalk.bold('Recommendations'))
+  for (const recommendation of analysis.recommendations) {
+    lines.push(`  - ${recommendation}`)
+  }
+  lines.push('')
+  return lines.join('\n')
+}
+
+function formatList(values: string[]): string {
+  if (values.length === 0) return chalk.dim('none')
+  return values.join(', ')
 }
 
 async function runModelConfigWizard() {

@@ -1,7 +1,16 @@
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
-import { allocateBudget, selectRecentEvents, selectOmittedEvents } from './contextAssembler.js'
+import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import {
+  allocateBudget,
+  buildRetainedSegmentMetadata,
+  protectToolPairs,
+  selectRecentEvents,
+  selectOmittedEvents,
+} from './contextAssembler.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
+import { llmSummarizeEvents } from './compactSummary.js'
+import { updateSessionMemoryLite } from './sessionMemoryLite.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -11,6 +20,8 @@ export type CompactSessionOptions = {
   modelId?: string
   trigger?: CompactTrigger
   persist?: boolean
+  mapEventsToMessages?: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
+  initialPrompt?: string
 }
 
 export type CompactSessionResult = {
@@ -39,16 +50,31 @@ export async function compactSession(
   })
 
   const previousBoundary = findLatestCompactBoundary(events)
+  const previousRetainedEvents = previousBoundary
+    ? normalizeRetainedEvents(previousBoundary.event.retainedEvents)
+    : []
   const compactableEvents = previousBoundary
-    ? events.slice(previousBoundary.index + 1)
+    ? [...previousRetainedEvents, ...events.slice(previousBoundary.index + 1)]
     : events
-  const selectedEvents = selectRecentEvents(compactableEvents, budget)
+  const selectedEvents = protectToolPairs(
+    compactableEvents,
+    selectRecentEvents(compactableEvents, budget),
+  )
   const omittedEvents = selectOmittedEvents(compactableEvents, selectedEvents)
   const priorSummary = previousBoundary?.event.summary.trim()
-  const newSummary = summarizeSessionEvents(
-    omittedEvents,
-    budget.layerBudgets.summary * 4,
-  )
+  const mapFn = options.mapEventsToMessages
+  let newSummary: string
+  if (mapFn && modelId !== 'local/coding-runtime') {
+    newSummary = await llmSummarizeEvents(omittedEvents, modelId, {
+      mapEventsToMessages: mapFn,
+      initialPrompt: options.initialPrompt,
+    })
+  } else {
+    newSummary = summarizeSessionEvents(
+      omittedEvents,
+      budget.layerBudgets.summary * 4,
+    )
+  }
   const summary = [priorSummary, newSummary]
     .filter((part): part is string => Boolean(part && part.trim()))
     .join('\n')
@@ -64,18 +90,52 @@ export async function compactSession(
     afterEventCount: selectedEvents.length + 1,
     summaryChars: fallbackSummary.length,
     snippedToolResults: countLargeToolResults(omittedEvents, budget.snipToolOutputChars),
+    retainedEvents: selectedEvents,
     modelId,
     budget,
   }
+  event.retainedSegment = buildRetainedSegmentMetadata(selectedEvents, event)
 
   if (options.persist !== false) {
     await options.storage.appendEvent(options.sessionId, event)
+    const memoryEvent = await updateSessionMemoryLite({
+      sessionId: options.sessionId,
+      cwd: inferSessionCwd(events) ?? await inferStoredSessionCwd(options.storage, options.sessionId),
+      trigger: event.trigger,
+      summary: fallbackSummary,
+      eventCount: omittedEvents.length,
+    })
+    if (memoryEvent) {
+      await options.storage.appendEvent(options.sessionId, memoryEvent)
+    }
   }
 
   return {
     event,
     beforeEventCount: event.beforeEventCount,
     afterEventCount: event.afterEventCount,
+  }
+}
+
+function inferSessionCwd(events: NexusEvent[]): string | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'session_started') {
+      return event.cwd
+    }
+  }
+  return undefined
+}
+
+async function inferStoredSessionCwd(
+  storage: NexusStorage,
+  sessionId: string,
+): Promise<string | undefined> {
+  try {
+    const session = await storage.getSession(sessionId, { includeEvents: false })
+    return session?.cwd
+  } catch {
+    return undefined
   }
 }
 
@@ -135,8 +195,8 @@ export function countConsecutiveAutoCompactFailures(events: NexusEvent[]): numbe
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
     if (!event) continue
-    if (event.type === 'compact_boundary' && event.trigger === 'auto') {
-      return 0
+    if (event.type === 'compact_boundary') {
+      return count
     }
     if (event.type === 'compact_failure' && event.trigger === 'auto') {
       count += 1
@@ -171,10 +231,26 @@ function countLargeToolResults(events: NexusEvent[], thresholdChars: number): nu
   return count
 }
 
-function isAutoCompactEnabled(): boolean {
-  return ['1', 'true', 'yes', 'on'].includes(
-    (process.env.BABEL_O_AUTO_COMPACT ?? '').trim().toLowerCase(),
+function normalizeRetainedEvents(value: unknown): NexusEvent[] {
+  if (!Array.isArray(value)) return []
+  return value.filter(isNexusEventLike)
+}
+
+function isNexusEventLike(value: unknown): value is NexusEvent {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    'type' in value &&
+    'sessionId' in value &&
+    'timestamp' in value,
   )
+}
+
+function isAutoCompactEnabled(): boolean {
+  const raw = (process.env.BABEL_O_AUTO_COMPACT ?? '').trim().toLowerCase()
+  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false
+  if (raw === '' || raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true
+  return true
 }
 
 function readPercentEnv(name: string, fallback: number): number {

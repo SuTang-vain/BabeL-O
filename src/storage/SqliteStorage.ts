@@ -199,6 +199,12 @@ export class SqliteStorage implements NexusStorage {
       .prepare(`UPDATE sessions SET updated_at = ? WHERE session_id = ?`)
       .run(event.timestamp, sessionId)
 
+    if (event.type === 'session_started') {
+      this.db
+        .prepare(`UPDATE sessions SET cwd = ?, updated_at = ? WHERE session_id = ?`)
+        .run(event.cwd, event.timestamp, sessionId)
+    }
+
     if (event.type === 'tool_started') {
       const trace: ToolTrace = {
         toolUseId: event.toolUseId,

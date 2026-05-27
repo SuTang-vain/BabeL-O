@@ -10,12 +10,13 @@ import {
   mapDropdownSelection,
   countRenderedLines
 } from './ui.js'
+import { inputState } from './inputState.js'
 
 type CliReadline = readline.Interface
 
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/compact', '/exit', '/model', '/profile', '/status', '/sessions', '/history', '/tool',
+    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/sessions', '/history', '/tool',
     '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task',
   ]
 }
@@ -199,6 +200,7 @@ export function createSlashPalette(rl: CliReadline) {
       return
     }
     isOpen = true
+    inputState.set('slashPalette')
     activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
     preview()
     renderOverlay()
@@ -233,6 +235,9 @@ export function createSlashPalette(rl: CliReadline) {
     activeIndex = 0
     isOpen = false
     query = ''
+    if (inputState.current === 'slashPalette') {
+      inputState.set('idle')
+    }
     if (wasOpen) {
       refreshReadline()
     }
@@ -272,6 +277,8 @@ export function createSlashPalette(rl: CliReadline) {
     const mapped = mapDropdownSelection(selected)
     setInputLine(mapped)
     close()
+    // Move cursor to end of line to avoid partial input issues
+    rlInt.cursor = rlInt.line.length
     return true
   }
 
@@ -289,6 +296,10 @@ export function createSlashPalette(rl: CliReadline) {
       consumedNavigationKey = false
       return true
     }
+    // If permission panel is open, do not intercept keys
+    if (inputState.current === 'permissionPanel') {
+      return false
+    }
     const line = rlInt.line ?? ''
     const shouldShow = getSlashPaletteChoices(line).length > 0
     if (!shouldShow) {
@@ -305,6 +316,10 @@ export function createSlashPalette(rl: CliReadline) {
     if (key?.name === 'tab') return select()
     if (key?.name === 'return') return false
     if (key?.name === 'escape') {
+      // Restore original query line when escaping palette
+      if (query && query !== rlInt.line) {
+        setInputLine(query)
+      }
       close()
       return true
     }
@@ -326,6 +341,10 @@ export function createSlashPalette(rl: CliReadline) {
       if (escapeKey && isOpen) {
         cancelPendingRefresh()
         consumedNavigationKey = true
+        // Restore original query line when escaping palette
+        if (query && query !== rlInt.line) {
+          setInputLine(query)
+        }
         close()
         return
       }
@@ -338,6 +357,12 @@ export function createSlashPalette(rl: CliReadline) {
           const nextLine = line.slice(0, cursor - 1) + line.slice(cursor)
           rlInt.line = nextLine
           rlInt.cursor = cursor - 1
+        }
+        // If backspace removed the leading '/', close palette immediately
+        if (!rlInt.line.startsWith('/')) {
+          close()
+          consumedNavigationKey = true
+          return
         }
         refreshFromCurrentInput(false)
         consumedNavigationKey = true

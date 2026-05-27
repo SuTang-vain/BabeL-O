@@ -3,15 +3,20 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
+import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
-import { LocalCodingRuntime } from '../src/runtime/LocalCodingRuntime.js'
+import { LocalCodingRuntime, allowAllTools } from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { createNexusTask, taskQueueStatsForTest } from '../src/nexus/taskQueue.js'
 import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSession.js'
 import { PendingPermissionRegistry } from '../src/shared/session.js'
+import { globTool } from '../src/tools/builtin/glob.js'
+import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
+import { ConfigManager } from '../src/shared/config.js'
+import type { NexusEvent } from '../src/shared/events.js'
 
 test('execute reads a workspace file and records session events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}`)
@@ -108,6 +113,36 @@ test('Read returns a recoverable tool result for missing files', async () => {
     )
     assert.equal(toolCompleted.success, false)
     assert.match(String(toolCompleted.output), /could not find/)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
+  } finally {
+    await app.close()
+  }
+})
+
+test('Read returns a recoverable tool result for workspace escape paths', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-escape`)
+  await mkdir(cwd, { recursive: true })
+  const outsidePath = join(tmpdir(), `babel-o-outside-${Date.now()}.txt`)
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: `read ${outsidePath}`, cwd },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Read',
+    )
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'WORKSPACE_PATH_ESCAPE')
+    assert.match(toolCompleted.output.message, /outside the current workspace/)
     assert.ok(!body.events.some((event: { type: string; code?: string }) =>
       event.type === 'error' && event.code === 'TOOL_ERROR',
     ))
@@ -230,6 +265,54 @@ test('/v1/execute session reuse and history mapping', async () => {
   }
 })
 
+test('/v1/execute persists resolved cwd and reuses it for correction turns', async () => {
+  const defaultCwd = join(tmpdir(), `babel-o-test-${Date.now()}-cwd-default`)
+  const targetCwd = join(tmpdir(), `babel-o-test-${Date.now()}-cwd-target`)
+  await mkdir(defaultCwd, { recursive: true })
+  await mkdir(targetCwd, { recursive: true })
+  await writeFile(join(targetCwd, 'marker.txt'), 'target marker\n', 'utf8')
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Bash'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd })
+  try {
+    const sessionId = `session-cwd-follow-${Date.now()}`
+    const first = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        sessionId,
+        prompt: `${targetCwd}查看这个项目`,
+        cwd: defaultCwd,
+      },
+    })
+    assert.equal(first.statusCode, 200)
+    const sessionAfterFirst = await storage.getSession(sessionId, { includeEvents: false })
+    assert.equal(sessionAfterFirst?.cwd, targetCwd)
+
+    const second = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        sessionId,
+        prompt: '呃让你分析的就是这个项目',
+        cwd: defaultCwd,
+      },
+    })
+    assert.equal(second.statusCode, 200)
+    const body = second.json()
+    const secondSessionStarted = body.events.find((event: any) =>
+      event.type === 'session_started' && event.requestId === body.events.find((e: any) => e.type === 'session_started')?.requestId,
+    )
+    assert.equal(secondSessionStarted?.cwd, targetCwd)
+
+    const sessionAfterSecond = await storage.getSession(sessionId, { includeEvents: false })
+    assert.equal(sessionAfterSecond?.cwd, targetCwd)
+    assert.equal(sessionAfterSecond?.lastUserInput, '呃让你分析的就是这个项目')
+  } finally {
+    await app.close()
+  }
+})
+
 test('session input, cancel, and task lifecycle endpoints update state', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-lifecycle`)
   await mkdir(cwd, { recursive: true })
@@ -310,7 +393,8 @@ test('session close cascades runtime session state cleanup', async () => {
     createNexusTask({ queueId: sessionId, title: 'cleanup task' })
     const pendingPermission = registry.register(sessionId, 'tool-close-test')
 
-    const { bashTool, getBashSessionStateSizeForTest } = await import('../src/tools/builtin/bash.js')
+    const { bashTool, getBashSessionStateSizeForTest, clearBashSessionState } = await import('../src/tools/builtin/bash.js')
+    await clearBashSessionState()
     await bashTool.execute({ command: 'cd /', timeoutMs: 10_000 }, {
       cwd,
       sessionId,
@@ -364,6 +448,75 @@ test('tool audit reports risk and allowlist status', async () => {
     assert.equal(read.risk, 'read')
     assert.equal(bash.allowed, false)
     assert.equal(bash.risk, 'execute')
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/sessions/:sessionId/context returns reusable context analysis', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-context-api`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'sample.txt'), 'hello context\n', 'utf8')
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const executeResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read sample.txt', cwd },
+    })
+    assert.equal(executeResponse.statusCode, 200)
+    const sessionId = executeResponse.json().sessionId
+
+    const contextResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/context?modelId=local/coding-runtime`,
+    })
+    assert.equal(contextResponse.statusCode, 200)
+    const body = contextResponse.json()
+    assert.equal(body.type, 'context_analysis')
+    assert.equal(body.sessionId, sessionId)
+    assert.ok(body.estimate.totalTokens > 0)
+    assert.ok(body.window.maxTokens > 0)
+    assert.equal(body.sections.toolDefinitionCount, 1)
+    assert.ok(Array.isArray(body.recommendations))
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/sessions/:sessionId/compact creates a manual compact boundary', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-compact-api`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'sample.txt'), 'hello compact\n', 'utf8')
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const executeResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read sample.txt', cwd },
+    })
+    assert.equal(executeResponse.statusCode, 200)
+    const sessionId = executeResponse.json().sessionId
+
+    const compactResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/compact`,
+      payload: {
+        modelId: 'local/coding-runtime',
+        trigger: 'manual',
+      },
+    })
+    assert.equal(compactResponse.statusCode, 200)
+    const body = compactResponse.json()
+    assert.equal(body.type, 'compact_result')
+    assert.equal(body.sessionId, sessionId)
+    assert.equal(body.event.type, 'compact_boundary')
+    assert.equal(body.event.trigger, 'manual')
+    assert.ok(body.event.summary.length > 0)
   } finally {
     await app.close()
   }
@@ -709,6 +862,29 @@ test('bash non-zero exit returns a recoverable failed tool result', async () => 
   }
 })
 
+test('bash absolute paths outside workspace return recoverable workspace escape result', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-workspace-escape`)
+  const outside = join(tmpdir(), `babel-o-outside-${Date.now()}.txt`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(outside, 'outside workspace')
+
+  const { bashTool } = await import('../src/tools/builtin/bash.js')
+  const result = await bashTool.execute({
+    command: `ls -la ${outside}`,
+    timeoutMs: 10_000,
+  }, {
+    cwd,
+    sessionId: `bash-escape-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 10_000,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal((result.output as any).code, 'WORKSPACE_PATH_ESCAPE')
+  assert.match((result.output as any).message, /outside the current workspace/)
+  assert.equal((result.output as any).requestedPath, outside)
+})
+
 test('websocket stream executes prompts and records stream metrics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream`)
   await mkdir(cwd, { recursive: true })
@@ -890,6 +1066,57 @@ test('bash tool session CWD retention', async () => {
     assert.ok(!event5.output.stdout.includes('sub'))
   } finally {
     await app.close()
+  }
+})
+
+test('bash retained CWD resets when the same session switches workspace', async () => {
+  const firstCwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-first`)
+  const secondCwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-second`)
+  await mkdir(join(firstCwd, 'nested'), { recursive: true })
+  await mkdir(secondCwd, { recursive: true })
+
+  const { bashTool, clearBashSessionState } = await import('../src/tools/builtin/bash.js')
+  const sessionId = `workspace-switch-${Date.now()}`
+
+  try {
+    const first = await bashTool.execute({
+      command: 'cd nested && pwd',
+      timeoutMs: 10_000,
+    }, {
+      cwd: firstCwd,
+      sessionId,
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 10_000,
+    })
+    assert.equal(first.success, true)
+    assert.match(String((first.output as any).stdout), /nested/)
+
+    const second = await bashTool.execute({
+      command: 'pwd',
+      timeoutMs: 10_000,
+    }, {
+      cwd: secondCwd,
+      sessionId,
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 10_000,
+    })
+    assert.equal(second.success, true)
+    assert.equal(String((second.output as any).stdout).trim(), await realpath(secondCwd))
+
+    const blocked = await bashTool.execute({
+      command: `ls -la ${firstCwd}`,
+      timeoutMs: 10_000,
+    }, {
+      cwd: secondCwd,
+      sessionId,
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 10_000,
+    })
+    assert.equal(blocked.success, false)
+    assert.equal((blocked.output as any).code, 'WORKSPACE_PATH_ESCAPE')
+    assert.equal((blocked.output as any).cwd, await realpath(secondCwd))
+  } finally {
+    await clearBashSessionState(sessionId)
   }
 })
 
@@ -1134,6 +1361,151 @@ test('WebSocket /v1/stream blocks model without tool calling support', async () 
     assert.match(errorEvent?.message ?? '', /deepseek\/deepseek-reasoner/)
   } finally {
     await app.close()
+  }
+})
+
+test('Glob respects custom path parameter', async () => {
+  const baseCwd = join(tmpdir(), `babel-o-glob-path-${Date.now()}`)
+  const subDir = join(baseCwd, 'subproject')
+  await mkdir(subDir, { recursive: true })
+  await writeFile(join(subDir, 'match-benchmark-here.txt'), 'found', 'utf8')
+
+  const toolCtx = {
+    cwd: baseCwd,
+    sessionId: 'test',
+    signal: new AbortController().signal,
+    maxOutputBytes: 200_000,
+    bashMaxBufferBytes: 1_000_000,
+  }
+
+  const resultDefault = await globTool.execute(
+    { pattern: 'benchmark', maxResults: 100 },
+    toolCtx,
+  )
+  assert.ok(
+    (resultDefault.output as string[]).some(f => f.includes('match-benchmark-here.txt')),
+    'default cwd should find the file',
+  )
+
+  const resultPath = await globTool.execute(
+    { pattern: 'benchmark', path: subDir, maxResults: 100 },
+    toolCtx,
+  )
+  assert.ok(
+    (resultPath.output as string[]).some(f => f.includes('match-benchmark-here.txt')),
+    'custom path should find the file in subDir',
+  )
+
+  const resultEmptyPath = await globTool.execute(
+    { pattern: 'nonexistent-xyz', maxResults: 100 },
+    toolCtx,
+  )
+  assert.equal(
+    (resultEmptyPath.output as string[]).filter(f => !f.startsWith('...')).length,
+    0,
+    'nonexistent pattern should return empty',
+  )
+})
+
+test('LLMCodingRuntime resolves cwd from prompt absolute path', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-cwd-test-${Date.now()}.sqlite`))
+  const configManager = ConfigManager.getInstance()
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+
+  const baseCwd = homedir()
+  const targetDir = join(tmpdir(), `babel-o-cwd-target-${Date.now()}`)
+  await mkdir(targetDir, { recursive: true })
+
+  try {
+    const events: Array<{ type: string; cwd?: string }> = []
+    for await (const event of runtime.executeStream({
+      sessionId: createId('session'),
+      prompt: `${targetDir} 查看这个项目`,
+      cwd: baseCwd,
+      signal: new AbortController().signal,
+    })) {
+      events.push(event)
+      if (event.type === 'error' || event.type === 'result') break
+    }
+
+    const sessionStarted = events.find(e => e.type === 'session_started')
+    assert.ok(sessionStarted, 'should emit session_started')
+    assert.equal(sessionStarted?.cwd, targetDir, 'cwd should follow explicit path in prompt')
+  } finally {
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime blocks provider calls when compacted context still exceeds limit', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-context-limit-${Date.now()}.sqlite`))
+  const configManager = ConfigManager.getInstance()
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message' as const,
+      schemaVersion: '2026-05-21.babel-o.v1' as const,
+      sessionId,
+      timestamp: now,
+      text: '开始一个很长的中文上下文任务。',
+    },
+  ]
+  for (let index = 0; index < 30; index += 1) {
+    events.push({
+      type: 'assistant_delta' as const,
+      schemaVersion: '2026-05-21.babel-o.v1' as const,
+      sessionId,
+      timestamp: new Date(Date.now() + index + 1).toISOString(),
+      text: '这是用于触发上下文阻塞限制的中文内容。'.repeat(500),
+    })
+  }
+
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: '继续',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events,
+  })
+
+  try {
+    const emitted: Array<{ type: string; code?: string; trigger?: string }> = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: '继续这个任务',
+      cwd,
+      model: 'local/coding-runtime',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      if (event.type === 'error' || event.type === 'result') break
+    }
+
+    assert.ok(
+      emitted.some(event => event.type === 'compact_boundary' && (event.trigger === 'reactive' || event.trigger === 'auto')),
+      'blocking guard should attempt compact before failing',
+    )
+    assert.ok(
+      emitted.some(event => event.type === 'context_warning'),
+      'blocking guard should emit context warning',
+    )
+    const errorEvent = emitted.find(event => event.type === 'error')
+    assert.equal(errorEvent?.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.ok(
+      !emitted.some(event => event.type === 'assistant_delta'),
+      'provider should not be called after blocking guard fails',
+    )
+  } finally {
+    await storage.close()
   }
 })
 

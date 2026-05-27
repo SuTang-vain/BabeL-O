@@ -32,3 +32,27 @@ export function snipEvent(event: NexusEvent, maxOutputChars: number): NexusEvent
 export function snipEvents(events: NexusEvent[], maxOutputChars: number): NexusEvent[] {
   return events.map(event => snipEvent(event, maxOutputChars))
 }
+
+export function snipEventsWithTurnBoundary(
+  events: NexusEvent[],
+  currentTurnMaxChars: number,
+  priorTurnMaxChars: number,
+): NexusEvent[] {
+  if (currentTurnMaxChars <= priorTurnMaxChars || priorTurnMaxChars <= 0) {
+    return snipEvents(events, currentTurnMaxChars)
+  }
+
+  let lastUserIndex = -1
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].type === 'user_message') {
+      lastUserIndex = i
+      break
+    }
+  }
+
+  return events.map((event, index) => {
+    if (event.type !== 'tool_completed') return event
+    const limit = index < lastUserIndex ? priorTurnMaxChars : currentTurnMaxChars
+    return snipEvent(event, limit)
+  })
+}

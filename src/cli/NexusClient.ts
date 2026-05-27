@@ -86,6 +86,18 @@ export class NexusClient {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/compact`, body)
   }
 
+  async analyzeContext(
+    sessionId: string,
+    options: { modelId?: string; prompt?: string; cwd?: string } = {},
+  ): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.modelId) params.set('modelId', options.modelId)
+    if (options.prompt) params.set('prompt', options.prompt)
+    if (options.cwd) params.set('cwd', options.cwd)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/context${query}`)
+  }
+
   async resumeSession(sessionId: string, message: string): Promise<unknown> {
     return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/input`, {
       message,

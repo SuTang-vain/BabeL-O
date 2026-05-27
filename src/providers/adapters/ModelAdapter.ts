@@ -36,9 +36,15 @@ export type ModelToolDefinition = {
   inputSchema: unknown // JSON Schema object
 }
 
+export type SystemPromptBlock = {
+  text: string
+  cacheable: boolean
+}
+
 export type ModelQueryParams = {
   model: string // Canonical model ID, e.g. 'anthropic/claude-3-5-sonnet'
   systemPrompt?: string
+  systemPromptBlocks?: SystemPromptBlock[]
   messages: ModelMessage[]
   tools?: ModelToolDefinition[]
   temperature?: number
@@ -85,6 +91,13 @@ export type UsageDelta = {
   cacheReadInputTokens?: number
 }
 
+export type FinishReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | 'pause'
+
+export type FinishDelta = {
+  type: 'finish'
+  reason: FinishReason
+}
+
 export type StreamDelta =
   | TextDelta
   | ThinkingDelta
@@ -92,6 +105,7 @@ export type StreamDelta =
   | ToolUseDelta
   | ToolUseEnd
   | UsageDelta
+  | FinishDelta
 
 export interface ModelAdapter {
   queryStream(

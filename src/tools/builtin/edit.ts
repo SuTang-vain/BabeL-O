@@ -12,6 +12,7 @@ const inputSchema = z.object({
 export const editTool: ToolDefinition<typeof inputSchema> = {
   name: 'Edit',
   description: 'Replace one exact string in a file inside the workspace.',
+  prompt: () => 'Performs exact string replacements in files. The old_string must be unique in the file. Use this for targeted modifications to existing files. Always read the file first before editing.',
   risk: 'write',
   inputSchema,
   async execute(input, context) {

@@ -1,7 +1,7 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ConfigManager } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
@@ -619,6 +619,68 @@ describe('LLMCodingRuntime', () => {
     } catch {}
   })
 
+  test('returns workspace escape paths to the model instead of aborting the turn', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-escape-read-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const outsidePath = join(dirname(cwd), 'outside-package.json')
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-escape","name":"Read","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+          outsidePath.replace(/\\/g, '\\\\') +
+          '\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"The path is outside the workspace, so I will stay in the current project."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-escape-read-recoverable',
+        prompt: 'read the package file',
+        cwd,
+        skipPermissionCheck: true,
+      })
+    )
+
+    const toolCompleted = events.find(e => e.type === 'tool_completed') as any
+    assert.equal(toolCompleted.name, 'Read')
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'WORKSPACE_PATH_ESCAPE')
+    assert.match(toolCompleted.output.message, /outside the current workspace/)
+    assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'TOOL_ERROR'))
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /outside the workspace/)
+
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    const toolResultTurn = secondBody.messages.find((message: any) =>
+      Array.isArray(message.content) &&
+      message.content.some((block: any) => block.type === 'tool_result'),
+    )
+    const toolResult = toolResultTurn.content.find((block: any) => block.type === 'tool_result')
+    assert.equal(toolResult.is_error, true)
+    assert.match(toolResult.content, /WORKSPACE_PATH_ESCAPE|outside the current workspace/)
+
+    try {
+      fs.rmdirSync(cwd)
+    } catch {}
+  })
+
   test('returns invalid tool input to the model so it can retry with corrected arguments', async () => {
     const cwd = join(tmpdir(), `babel-o-test-invalid-tool-input-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
@@ -700,7 +762,7 @@ describe('LLMCodingRuntime', () => {
         'event: content_block_start\n',
         'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-bash-fail","name":"Bash","input":{}}}\n\n',
         'event: content_block_delta\n',
-        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"cd /definitely/missing && git remote -v\\"}"}}\n\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"cd definitely-missing && git remote -v\\"}"}}\n\n',
         'event: content_block_stop\n',
         'data: {"index":0}\n\n',
       ])

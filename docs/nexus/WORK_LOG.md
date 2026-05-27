@@ -2,6 +2,367 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 0.96 2026-05-27 docs/nexus 文档口径收敛
+
+- **用户请求**: 清除/更新 `docs` 中所有文档，删除过时文档，并将所有文档内容更新到最核心的 `docs/nexus` 目录中。
+- **核实**:
+  - `docs` 根目录仍残留 `ARCHITECTURE.md`、`PLAN.md`、`RECOMMENDATIONS.md`、`implementation_plan.md`、`task.md`、`walkthrough.md`、多个 BabeL-O 历史分析/调优文档和 `.DS_Store`。
+  - 这些文档大多是一次性审计、历史实施计划或已被 `docs/nexus/TODO.md` / `WORK_LOG.md` 吸收的旧口径，继续保留会让后续开发误读当前状态。
+- **处理**:
+  - 重写 `docs/nexus/README.md` 为唯一文档入口，补充 Nexus-first 原则、架构分层、文档索引、当前实现状态、历史文档合并口径和维护规则。
+  - 更新 `docs/nexus/TODO.md`，移除对根目录 `RECOMMENDATIONS.md` 的权威引用，新增 Docs Canonicalization 口径。
+  - 更新根 `README.md` 的项目树和 Related Documentation，只指向 `docs/nexus/*`。
+  - 删除根目录过时 Markdown 文档与 `.DS_Store`，保留 `docs/nexus` 作为唯一长期文档目录。
+- **验证**:
+  - `find docs -maxdepth 2 -type f | sort` 确认只剩 `docs/nexus` 下文档。
+  - `rg` 检查根 README 与 docs 中不再存在旧文档链接。
+  - `git diff --check -- README.md docs` 通过。
+
+## 0.95 2026-05-27 session_e9fa6e3a 纠错轮项目目标丢失修复
+
+- **用户请求**: 查看 `session_e9fa6e3a-90c3-4bf9-afa7-c4c1b42d3be9` 最新会话，继续调用日志深入分析模型指路跟随问题。
+- **日志核实**:
+  - 会话共 52 次工具调用、4 条 `user_message`。前两轮分别分析 `/Users/tangyaoyue/DEV/Baidu` 与 `/Users/tangyaoyue/DEV/BABEL/BabeL-O`。
+  - 第 3 轮用户明确输入 `/Users/tangyaoyue/DEV/BABEL/BabeL-X查看这个项目`，`session_started.cwd` 已正确切到 `/Users/tangyaoyue/DEV/BABEL/BabeL-X`，但模型仍尝试读取 BabeL-O 并被 workspace guard 拦截。
+  - 第 4 轮用户纠正“呃让你分析的就是babel-X项目”，本轮 `session_started.cwd` 却回到了 `/Users/tangyaoyue`，随后工具成功读取 BabeL-O 和 Baidu/KeDU 文档，最终结果仍是“BabeL-O 作为动态百科服务平台服务内核”的分析。
+- **根因**:
+  - `LLMCodingRuntime.resolveCwdFromPrompt()` 能在含显式路径的本轮内部切换 cwd，并发出正确的 `session_started.cwd`，但 `SessionSnapshot.cwd` 没有根据 `session_started` 写回。
+  - CLI/service 下一轮如果用户输入没有显式绝对路径，会继续使用启动时的默认 cwd（如 `/Users/tangyaoyue`），而不是上一轮真实项目 cwd。
+  - `selectRecentEvents()` 对“我说的是 X / 让你分析的就是 X / 不是 A 是 B”这类纠错句没有 pivot 保护，旧 BabeL-O 分析仍进入 provider live messages。
+- **修复**:
+  - `MemoryStorage` 与 `SqliteStorage.appendEvent()` 在收到 `session_started` 事件时写回 `session.cwd = event.cwd`，让运行时解析出的真实项目成为持久会话状态。
+  - `app.ts` HTTP/WebSocket 入口增加 `resolveRequestCwd()`：存在真实目录型显式路径时切换到该目录；后续无显式路径的同 session 输入继承 `session.cwd`；保留文件路径由 Read/Write/Edit 自己做 workspace safety，避免把 `/tmp/file` 自动提升成新 workspace。
+  - `runSessionFlow.ts` embedded CLI 使用同样的 cwd 继承/目录型显式路径规则，并把 UserPromptSubmit hook 的 cwd 改成有效 cwd。
+  - `contextAssembler` 增加 correction pivot：覆盖“让你/要你/我说的/说的是/分析的就是/不是 A 是 B/i mean”等纠错短句，只保留最新用户意图，避免旧工具链锚定。
+- **测试覆盖**:
+  - `assembleContext treats user correction prompts as a new pivot`。
+  - `/v1/execute persists resolved cwd and reuses it for correction turns`。
+  - 既有 `Read returns a recoverable tool result for workspace escape paths` 验证文件路径不会被入口层误提升为 workspace。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime.test.ts test/runtime-llm.test.ts test/context-regression.test.ts`：98/98 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsc --noEmit` 通过。
+
+## 0.94 2026-05-27 session_b4fd19a4 多项目切换下 Bash CWD 污染修复
+
+- **用户请求**: 查看最新会话 `session_b4fd19a4-97cb-4210-8dfe-44d1dfd00805`，调用日志继续深入分析模型指路跟随问题。
+- **日志核实**:
+  - 最新会话共 66 次 `tool_started`、64 次 `tool_completed`、6 条 `user_message`；初始请求仍为 `/Users/tangyaoyue/DEV/Baidu查看这个文件夹中的项目内容`。
+  - 后续用户明确输入 `/Users/tangyaoyue/DEV/BABEL/BabeL-X` 和 `/Users/tangyaoyue/DEV/BABEL/BabeL-X查看这个项目`，`session_started.cwd` 已正确切到 `/Users/tangyaoyue/DEV/BABEL/BabeL-X`。
+  - 但工具调用仍多次访问 `/Users/tangyaoyue/DEV/BABEL/BabeL-O` 和 `/Users/tangyaoyue/DEV/Baidu/...`。Glob/Read 能返回 `WORKSPACE_PATH_ESCAPE`，Bash 也能返回 recoverable escape；不过部分 Bash escape 的 `Current workspace` 仍显示 `/Users/tangyaoyue/DEV/Baidu`，说明 Bash 内部 retained CWD 没有随新请求 workspace 切换。
+  - 最终 result 仍回答 BabeL-O/动态百科服务平台运行时适配，而不是用户最新要求的 BabeL-X 项目查看，证明同 session 多项目切换时仍存在路径锚定污染。
+- **根因**:
+  - `bash.ts` 的 `sessionCwdMap` 用 `sessionId -> cwd` 保存 shell `cd` 状态，但它既被用作 shell 当前目录，也被用于 workspace escape preflight。
+  - 当同一个 `sessionId` 从 Baidu 切到 BabeL-X 时，`LLMCodingRuntime.resolveCwdFromPrompt()` 已更新 `runtimeOptions.cwd`，但 Bash 仍优先使用旧的 `sessionCwdMap`，导致 workspace guard 基准可能回退到旧项目。
+  - 这是工具状态生命周期 bug，不是单纯 prompt 跟随能力问题。
+- **修复**:
+  - `bash.ts` 新增 `resolveShellCwd(sessionId, workspaceCwd)`：只有 retained shell cwd 仍位于当前 `context.cwd` workspace 内时才复用；一旦越界，立即清除该 session 的 Bash CWD 并回到本轮 `context.cwd`。
+  - Bash 命令绝对路径 preflight 改为始终以本轮 `context.cwd` 为 workspace root，而不是以 retained shell cwd 为 root；shell 执行目录仍可在同一 workspace 内保留 `cd` 状态。
+  - 新增回归测试 `bash retained CWD resets when the same session switches workspace`，覆盖同 session 先 `cd nested`，再切到另一个 workspace 后 `pwd` 必须落在新 workspace，访问旧 workspace 必须返回 `WORKSPACE_PATH_ESCAPE` 且 `cwd` 指向新 workspace。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts`：38/38 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime-llm.test.ts test/context-regression.test.ts`：58/58 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsc --noEmit` 通过。
+
+## 0.93 2026-05-27 session_7b928e48 指令跟随偏移根因分析与修复
+
+- **用户请求**: 查看 `session_7b928e48-e3b4-4326-95c9-f30cb2a554f6` 最新会话和调用日志，继续深入分析模型指路跟随问题。
+- **日志核实**:
+  - 会话共 2152 个 events，3 条 `user_message`，32 次工具调用；模型为 `deepseek/deepseek-v4-pro`。
+  - 第 1 轮用户请求 `/Users/tangyaoyue/DEV/Baidu查看这个文件夹中的项目内容`，模型使用 Bash `ls` + Glob `**/*` 扫描大目录，生成大量 Baidu 工具上下文。
+  - 第 2 轮用户请求 `/Users/tangyaoyue/DEV/BABEL/BabeL-O分析能否将这个项目作为动态百科服务平台的服务内核/运行时`。运行时已将 workspace 切到 BabeL-O，Glob 访问 Baidu 被正确返回 `WORKSPACE_PATH_ESCAPE`，但模型随后通过 Bash `cat/ls` 继续读取 `/Users/tangyaoyue/DEV/Baidu`，绕过了 Read/Glob 的 workspace guard，最终仍回答 Baidu 总览而非 BabeL-O 运行时适配分析。
+  - 第 3 轮用户只输入 `你好？`，模型仍继续调用 Bash/Glob/Read 分析 Baidu，并在用户 ESC 后产生 `REQUEST_CANCELLED`。这说明普通成功 result 后的短问候/状态追问没有形成新的 context pivot，旧任务工具链仍进入 live messages。
+- **根因**:
+  1. Bash 工具缺少绝对路径 workspace preflight。Read/Glob 已能阻止 workspace escape，但 Bash 命令中的 `/Users/...` 绝对路径仍可执行。
+  2. `selectRecentEvents()` 仅在取消/超时错误后建立 recovery boundary；对 `你好？`、`你现在在干什么？` 等短交互没有 pivot 保护，模型容易继续旧分析。
+  3. 最新显式路径虽然通过 `resolveCwdFromPrompt()` 切换了 cwd，但旧 Baidu 大摘要和工具结果仍能在非 pivot 场景中成为注意力锚点。
+- **修复**:
+  - `contextAssembler.selectRecentEvents()` 新增短问候/状态追问 pivot 识别：`hi/hello/你好/您好/还在吗/你现在在干什么/还记得/知道我在问什么` 等输入只保留最新用户轮次，不再回放旧工具链。
+  - `selectRecentEvents()` 对包含显式绝对路径的新用户请求默认从最新用户消息开始；保留 `横向/对比/compare/vs` 场景继续允许使用相关历史作为对比基线。
+  - `bash.ts` 新增 Bash 命令绝对路径预检：抽取命令中的绝对路径并调用 `resolveInsideWorkspace()`；若越界，返回 recoverable `WORKSPACE_PATH_ESCAPE` failed tool result，而不是执行命令或抛全局错误。
+  - 新增回归测试：`assembleContext treats short greetings and status questions as a new pivot`、`bash absolute paths outside workspace return recoverable workspace escape result`。
+- **真实会话回放验证**:
+  - 用 `session_7b928...` 真实 events 重建第 3 轮 `你好？` 的 assembled context，修复后 provider messages 仅为 `[{ role: "user", content: "你好？" }]`，`selectedEventCount=1`，不再包含 Baidu 或 tool_use。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/runtime.test.ts test/runtime-llm.test.ts test/security.test.ts`：101/101 通过。
+
+## 0.92 2026-05-27 P0 长会话可靠性（session_d61f22d0 实战驱动）
+
+- **用户请求**: "根据文档进一步开发完善" — 基于 `session_d61f22d0` 问题分析文档中识别的 4 项待修复项实施开发。
+- **背景**: 真实会话 `session_d61f22d0` 在 7 轮对话中 contextCharsIn 经历 10K→148K→303K→102K→28K→427K→126K 的剧烈波动，136 次工具调用（Bash×41, Glob×21, Read×74）中大量重复读取同一文件。auto-compact 默认关闭，无 compact_boundary/context_warning 事件。
+- **实施**:
+
+  1. **P0-1: StreamDelta 新增 FinishDelta + adapter 暴露 stop_reason**
+     - `ModelAdapter.ts`: 新增 `FinishReason` 联合类型（`end_turn | max_tokens | stop_sequence | tool_use | pause`）和 `FinishDelta`（`type: 'finish'`）加入 `StreamDelta` 联合类型。
+     - `AnthropicAdapter.ts`: 从 `message_delta` SSE 事件的 `delta.stop_reason` 提取并 yield `FinishDelta`。
+     - `OpenAIAdapter.ts`: 从 `choices[0].finish_reason` 提取并映射（`stop→end_turn`, `length→max_tokens`, `tool_calls→tool_use`, `content_filter→end_turn`）后 yield `FinishDelta`。
+
+  2. **P0-2: max_tokens 截断检测 + 恢复**
+     - `LLMCodingRuntime.ts`: 流解析中捕获 `finish` delta 存入 `currentFinishReason`；流结束后检测 `max_tokens`，注入续写 prompt（"Please continue exactly from where you left off"）让模型从断点继续；最多重试 `MAX_TOKEN_RECOVERIES=3` 次。
+
+  3. **P1-1: 工具结果 per-turn 预算截断**
+     - `LLMCodingRuntime.ts`: 工具执行循环新增 `toolResultBudgetChars = maxChars * 30%`；每个工具结果累加字符数到 `toolResultUsedChars`；超限时截断当前结果内容并附加预算溢出提示，设置 `toolBudgetExceeded=true`；后续工具跳过执行并返回 `TURN_BUDGET_EXCEEDED` 错误结果。
+
+  4. **P1-2: 三层 Context Warning 梯度**
+     - `tokenEstimator.ts`: `ContextWindowState` 新增 `compactThresholdTokens` 和 `isCompact`；`getContextWindowState()` 新增 `compactPercent` 参数。
+     - `LLMCodingRuntime.ts`: warning 阈值从 85% 降至 70%，compact 阈值 85%，blocking ≈99%；warning 消息根据所处区间（`isCompact` / `isWarning`）给出不同文案。
+     - `contextAnalysis.ts`: 默认 warningPercent 从 85 更新为 70。
+     - `token-estimator.test.ts`: 测试从 2 个断言（warning/blocking）扩展为 4 个（normal/warning/compact/blocking）。
+
+  5. **文档更新**:
+     - `docs/BabeL-O_Session_d61f22d0_问题分析.md`: 修正 4 处事实性错误（会话状态、轮次、工具总数、阻塞原因），新增逐轮 contextCharsIn 轨迹表，添加第五节"已实施的修复"。
+     - `docs/nexus/TODO.md`: 新增 P0 长会话可靠性阶段条目，问题状态全部标记已完成。
+
+- **涉及文件**: `ModelAdapter.ts`、`AnthropicAdapter.ts`、`OpenAIAdapter.ts`、`LLMCodingRuntime.ts`、`tokenEstimator.ts`、`contextAnalysis.ts`、`token-estimator.test.ts`、`runtime.test.ts`、`compact.ts`、`systemPromptBuilder.ts`、`docs/BabeL-O_Session_d61f22d0_问题分析.md`、`docs/nexus/TODO.md`。
+- **验证**:
+  - `npx tsc --noEmit` 零错误通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/*.test.ts`：242/244 通过（2 个 pre-existing ConfigManager 泄漏失败不变）。
+
+## 0.91 2026-05-27 P2 上下文恢复能力推进：Session Memory Lite / Preserved Segment / Provider Recovery / Regression Corpus
+
+- **用户请求**: 根据 TODO 中 P2 上下文能力继续稳步推进：Session Memory Lite、Preserved Segment / Resume Verification、Model Fallback / Max Output Recovery、Context Regression Corpus。
+- **实现**:
+  - `compact_boundary.retainedSegment` 增加 retained count、boundary anchor、first/last event identity 和 hash。`eventIdentity()` 升级为包含 `type/sessionId/timestamp/eventId/toolUseId/content fingerprint`，避免 deep clone 或内容漂移后误判 retained tail 完整。
+  - `contextAssembler` 恢复 compact boundary 时验证 retained segment；校验失败时不静默使用断裂 retained tail，而是回退完整历史，并在 `Session Summary` 注入 `Preserved Segment Warning`。`/context` 诊断新增 retained check/warn 展示。
+  - 新增 `src/runtime/sessionMemoryLite.ts`：仅在 `BABEL_O_SESSION_MEMORY_LITE=1` 时，compact 成功后写入 `.babel-o/session-memory.md`，并追加 `session_memory_updated` 审计事件；该文件不进入主 context/read cache，保持 opt-in 和固定路径受限写入。
+  - 新增 `src/runtime/providerRecovery.ts`：把 provider error 分类为 `ESCALATED_MAX_TOKENS`、`ESCALATED_CONTEXT_WINDOW`、`RETRY_PROVIDER_RATE_LIMIT`、`PROVIDER_AUTH_OR_BILLING`、`RETRY_PROVIDER_UNAVAILABLE` 等，写入 error `details`；TUI error 行会展示 recovery/kind/status 和建议动作。当前只做诊断层，不自动切换 fallback model。
+  - 新增 `test/context-regression.test.ts` 与 `test/provider-recovery.test.ts`，固化 workspace escape 后继续、cancel 后继续、provider empty response、invalid tool input/schema failure、max output/context window/billing provider error 等回归样本。
+- **涉及文件**: `src/shared/events.ts`、`src/runtime/contextAssembler.ts`、`src/runtime/compact.ts`、`src/runtime/sessionMemoryLite.ts`、`src/runtime/providerRecovery.ts`、`src/runtime/LLMCodingRuntime.ts`、`src/runtime/sessionSummary.ts`、`src/cli/renderEvents.ts`、`src/cli/commands/chat.ts`、`test/context-assembler.test.ts`、`test/context-regression.test.ts`、`test/provider-recovery.test.ts`、`package.json`。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/context-regression.test.ts test/provider-recovery.test.ts test/tui-renderer.test.ts`：45/45 通过。
+
+## 0.90 2026-05-26 P0 上下文补齐：AGENT.md 自动发现 + Git 状态注入
+
+- **用户请求**: 推进 P0 优先级任务：AGENT.md 自动发现与注入、Git 状态上下文收集。
+- **背景**: `systemPromptBuilder.ts` 接口已完整支持 `agentMdContent` 和 `gitStatus` 参数，但 `contextAssembler.ts` 实际调用时未传入数据——这两个信息通道虽已铺设但未接通。`BabeL-O_调优规划_v1.0.md` Phase 4 任务 4.1 和 4.2 描述了实现方案。
+- **实现**:
+  - 新建 `src/runtime/agentMdLoader.ts`（54 行）：从 cwd 向上遍历到根目录收集所有 `AGENTS.md`，检查 `.babel-o/AGENTS.md`，去重，8,000 字符上限。参照 `memory.ts` 的加载模式。
+  - 新建 `src/runtime/gitContext.ts`（88 行）：`rev-parse --git-dir` 检测 git 仓库，`branch --show-current` 获取分支（含 detached HEAD 处理），`status --short` 获取变更状态（带文件数统计），`log -5 --oneline` 获取最近提交。所有 git 命令使用 `execFile`（零 shell 注入风险），5s 超时，非 git 仓库返回空字符串。
+  - 修改 `src/runtime/contextAssembler.ts`：将 `loadProjectMemory` 升级为 `Promise.all([loadProjectMemory, loadAgentMdFiles, collectGitContext])` 并行加载；`buildSystemPromptSections` 调用新增 `agentMdContent` 和 `gitStatus` 参数传入。
+- **涉及文件**: `agentMdLoader.ts`（新建）、`gitContext.ts`（新建）、`contextAssembler.ts`（修改）。
+- **验证**:
+  - `npm run typecheck`：零新增错误（pre-existing 3 个错误来自 `compact.ts` 和 `context-assembler.test.ts`，与本次改动无关）。
+  - 单元测试 30/30 通过：`test/system-prompt-builder.test.ts`（16）、`test/tool-prompt.test.ts`（2）、`test/message-normalizer.test.ts`（6）、`test/retry.test.ts`（6）。
+  - 手工验证：`gitContext.ts` 在 BabeL-O 项目正确输出分支（main）、58 个变更文件、5 个最近提交；`agentMdLoader.ts` 在无 AGENTS.md 项目正确返回空字符串。
+
+## 0.89 2026-05-26 LLM 语义摘要升级
+
+- **用户请求**: 将会话摘要从纯统计拼接升级为 LLM 生成的结构化语义摘要（参考 BabeL-X 的 compact prompt.ts 实现）。
+- **问题**: `summarizeSessionEvents()` 只输出统计数字（事件数、工具名、文件引用），完全不包含语义信息。模型拿到这样的摘要无法理解之前发生了什么。
+- **BabeL-X 对比**: BabeL-X 调用 Claude 生成 9 段结构化摘要（用户意图、技术概念、文件代码、错误修复、问题解决、用户消息、待完成任务、当前工作、下一步），使用 `<analysis>` 思考块 + `<summary>` 输出块。
+- **实现**:
+  - 新建 `src/runtime/compactSummary.ts`：`queryModelText()` 流式文本收集器、`buildCompactUserPrompt()` 9 段 prompt 模板、`formatCompactSummary()` 解析 `<analysis>/<summary>` 块、`llmSummarizeEvents()` 主编排函数（LLM 优先 + 统计 fallback）。
+  - `compact.ts`：`CompactSessionOptions` 新增 `mapEventsToMessages` 和 `initialPrompt`，`compactSession()` 当有 mapFn 时调用 `llmSummarizeEvents()`。
+  - `LLMCodingRuntime.ts`：auto compact 和 reactive compact 两个调用点传递 `mapEventsToMessages` 和 `initialPrompt`。
+  - `systemPromptBuilder.ts`：移除 `Session Summary:\n` 前缀，LLM 摘要自带 `Summary:` header。
+  - `contextAssembler.ts`：summary 层预算从 2000 提升至 4000 tokens，fixedBudget 从 9000 提升至 11000。
+- **涉及文件**: `compactSummary.ts`（新建）、`compact.ts`、`LLMCodingRuntime.ts`、`systemPromptBuilder.ts`、`contextAssembler.ts`、`compact-summary.test.ts`（新建）、`context-assembler.test.ts`。
+- **测试**: 初始记录为 240/242 通过，但复核发现 `compact-summary.test.ts` 未纳入 `package.json` 的 `npm test` 脚本，且测试数量口径已过期。已修正测试脚本并重新验证：`npm run typecheck` 通过；`BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts test/compact-summary.test.ts` 46/46 通过；`npm test` 239/239 通过。
+
+## 0.88 2026-05-26 Session 0c03 深度根因分析与结构性修复
+
+- **用户请求**: "真的只是提示词导致的问题吗，需要你继续深入分析研究" — 要求超越 prompt 工程，从结构层面分析 DeepSeek v4-pro 指令跟随失效的根因。
+- **Session 0c03 复盘**: 用户在第 3 轮请求"分析改进的地方"时，模型执行了 `npx vite --host`（启动项目），与用户意图完全相反。第 2 轮用户请求"启动项目"，模型正确执行了 vite start。
+- **5 层非 Prompt 根因**:
+  1. **`mapEventsToMessages` 不区分轮次边界的 assistant 文本**: 第 2 轮的 "项目已启动成功" assistant_delta 文本完整保留到第 3 轮的上下文，成为 attention 锚点，导致模型倾向延续"启动"动作。
+  2. **`selectRecentEvents(recentTurnLimit=4)` 包含全部 4 轮**: 第 2 轮的完整工具调用链 + assistant 文本占据上下文主导地位。
+  3. **`defaultMaxTokens: 8192` 不鼓励深度分析**: 模型可能因为输出 token 限制而偏好快速动作（启动命令）而非多文件阅读分析。
+  4. **无轮次切换检测机制**: 系统无法识别用户从"启动项目"到"分析改进"的意图切换。
+  5. **旧轮次 `tool_completed` 输出创建强关联**: vite 启动输出在上下文中形成"运行 vite"的模式关联。
+- **结构性修复**:
+  - 实现 `microcompactEvents()`: 按轮次边界（最后一条 `user_message`）区分 prior-turn 和 current-turn 事件。Prior-turn 的 `assistant_delta` 文本截断至 `microcompactInternalTextChars`（~1000 字符），`tool_completed` 输出使用更紧凑的 `snipPriorTurnToolOutputChars` 配额。
+  - 实现 `protectToolPairs()`: 确保 `tool_started`/`tool_completed` 配对在事件选择后保持完整。
+  - 实现 `buildCompactCapabilityReminder()`: compact 后提醒模型可用工具和已读文件。
+  - 实现 `enforceDynamicLayerBudgets()` + `applySystemPromptSectionBudgets()`: 动态段（memory/summary/skills）预算控制。
+  - `deepseek-v4-pro` 的 `defaultMaxTokens` 从 8192 提升至 16384。
+- **上下文流水线**: `selectRecentEvents → protectToolPairs → microcompactEvents → snipEventsWithTurnBoundary → mapEventsToMessages`
+- **涉及文件**: `src/runtime/contextAssembler.ts`（5 个函数实现）、`src/providers/registry.ts`（defaultMaxTokens）、`test/context-assembler.test.ts`（预算字段更新）。
+- **测试**: 230/232 通过（2 个预存失败来自 ConfigManager 的全局配置泄漏）。
+
+## 0.87 2026-05-26 Session 6694 指令跟随失效根因分析与修复
+
+- **用户请求**: 深入分析 `session_66948496-4454-4300-b7c4-38422090a499` 中用户反复请求"帮我启动项目"但模型始终继续读文件回答平台来源的问题，并修复根因。
+- **日志核实**:
+  - Session 使用 `deepseek/deepseek-v4-pro`，CWD 为 `/Users/tangyaoyue`。
+  - 6 轮对话，42 次工具调用（Read 27、Glob 14、Bash 仅 1 次），用户从第 3 轮开始请求"启动项目"，但模型在第 3-6 轮中持续做文件分析。
+  - 到第 3 轮时已有 1666 个事件（756 个来自第 2 轮的文件读取），上下文被旧的"平台分析"工具结果主导。
+- **根因分析（3 层）**:
+  1. System Prompt 缺少"最新指令优先"和"动作意图识别"规则。
+  2. 旧轮次大量工具调用结果使用与当前轮次相同的 snip 配额，挤占上下文空间。
+  3. task_guidelines 的 "Read files first" 导致模型对所有请求都先做分析。
+- **修复内容**:
+  - `system_rules` 新增 "Latest instruction priority" 规则。
+  - `task_guidelines` 新增 "Action vs analysis" 规则（启动/运行/execute 等用 Bash 直接执行）。
+  - `tool_usage` 新增动作命令指引（"run, start, test, build, or execute → Bash"）。
+  - 新增两层 snip 策略：`snipPriorTurnToolOutputChars`（约当前轮次的 1/5），`snipEventsWithTurnBoundary()` 按 `user_message` 边界区分。
+- **测试覆盖**: 新增 8 个测试（3 system prompt 规则 + 5 snip compactor），全量 226/228 通过。
+- **涉及文件**: `src/runtime/systemPromptBuilder.ts`、`src/runtime/contextAssembler.ts`、`src/runtime/compactors/snipCompactor.ts`、`test/system-prompt-builder.test.ts`、`test/snip-compactor.test.ts`、`test/context-assembler.test.ts`。
+
+## 0.86 2026-05-26 P0 调优推进：System Prompt 工程 / Provider 加固 / 工具容错
+
+- **用户请求**: 根据 `BabeL-O_调优规划_v1.0.md` 和 `BabeL-O_vs_BabeL-X_深度分析_v1.0.md` 交叉核对审计后，实现 Phase 1-3 的 P0 级调优工作。
+- **文档修正**:
+  - `docs/BabeL-O_调优规划_v1.0.md`：修正 GLM-5.1/GLM-5/MiniMax-M2.7 contextWindow 值（128K→200K），补充 OpenAI adapter max_tokens 差异说明。
+  - `docs/BabeL-O_优化建议_v1.0.md`：storageBridge WAL 状态更新为"已完成"，Bash probe 标记名修正为 `__BABEL_O_STATE_`。
+- **Phase 1 System Prompt 工程**:
+  - 新建 `src/runtime/systemPromptBuilder.ts`：分段式 builder，7 个静态段（identity/system_rules/task_guidelines/tool_usage/risky_actions/tone_style/output_efficiency，cacheable=true）+ 动态段（env_info/request_paths/focus/git_status/agent_md/memory/summary/skills/language，cacheable=false）。导出 `buildSystemPromptSections()`、`sectionsToPromptText()`、`extractAbsolutePaths()`、`resolvePromptPath()`。
+  - `ToolDefinition` 新增 `prompt?(): string` 可选方法；Bash/Read/Write/Edit/Glob/Grep/TaskCreate 7 个内置工具全部实现 `prompt()`，返回比 `description` 更详细的工具描述。
+  - `LLMCodingRuntime.toolsList()` 优先使用 `prompt()` 替代 `description`。
+  - 用户请求从 system prompt 移至 user message（已由 `mapEventsToMessages` 插入）。
+  - `contextAssembler.ts` 预算调整：`system: 500→5000`，`fixedBudget: 4500→9000`；新增 `systemPromptBlocks` 字段。
+- **Phase 2 Provider 适配层加固**:
+  - `src/providers/registry.ts` 新增 `defaultMaxTokens: number`，按模型族设值（claude/gpt-4o/gpt-4-turbo=16384，glm-5.1/minimax-m2.7=16384，glm-5/glm-5-turbo/deepseek-v4=8192，gpt-3.5/deepseek-chat/reasoner=4096）。
+  - `AnthropicAdapter` 使用 registry `defaultMaxTokens` 替代硬编码 4096；`OpenAIAdapter` 使用 registry 值，未配置则省略 max_tokens（依赖 provider 默认值）。
+  - 新建 `src/providers/retry.ts`：`withRetry()` 通用重试包装器，默认 maxRetries=2、指数退避（baseDelay 1s、maxDelay 15s）、retryableStatuses=[429,500,502,503,529]，429 优先使用 Retry-After header。
+  - `AnthropicAdapter` 和 `OpenAIAdapter` 的 fetch 调用包裹在 `withRetry()` 中。
+  - 两个 adapter 的 eval 回退移除，替换为 `_parseError` 标记（`{ _parseError: true, _rawInput: buffer.slice(0, 500) }`）。
+  - `LLMCodingRuntime` 检测 `_parseError` 标记后产出 `tool_completed(success=false)` + error tool_result，`continue` 继续循环。
+  - `ModelAdapter.ts` 新增 `SystemPromptBlock { text, cacheable }` 类型和 `systemPromptBlocks` 字段；`AnthropicAdapter` 按 cacheable 分组为 static block（带 cache_control）+ dynamic block（无 cache_control），实现分段 prompt caching。
+- **Phase 3 工具调用容错**:
+  - TOOL_NOT_FOUND 从致命 `return` 改为 `continue`，返回包含可用工具列表的 error tool_result。
+  - Max Output Recovery：维护 `outputRetryCount`（最大 2 次），空响应注入续写提示而非终止。
+  - 新建 `src/runtime/messageNormalizer.ts`：`normalizeMessages()` 收集 tool_use/tool_result ID，移除孤立 tool_result，为孤立 tool_use 补充合成 error tool_result，确保首条消息非 assistant。
+  - 每次 provider 调用前 `normalizeMessages(messages)` 规范化 queryParams.messages。
+  - 工具执行超时保护：`TOOL_EXECUTION_TIMEOUT_MS = 120_000`，通过 AbortController 在 `executeToolSafely` 中实施。
+- **测试覆盖**:
+  - `test/system-prompt-builder.test.ts`（13 个测试）：7 个静态段、env_info、不含用户请求、request_paths、focus block、memory/summary/skills/language sections、唯一 ID。
+  - `test/tool-prompt.test.ts`（2 个测试）：每个 builtin tool prompt() 非空且长于 description、prompt 内容不同于 description。
+  - `test/retry.test.ts`（6 个测试）：首次成功、重试成功、耗尽重试、非 retryable 不重试、非 ProviderError 不重试、多状态码重试。
+  - `test/message-normalizer.test.ts`（6 个测试）：正常透传、孤立 tool_use 补充合成结果、孤立 tool_result 移除、配对保留、assistant 首条前置 user、混合场景。
+  - 更新 `test/context-assembler.test.ts`：验证用户请求在 messages 中而非 systemPrompt 中。
+- **验证**:
+  - `npx tsc --noEmit` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/*.test.ts` 215/217 通过。2 个 pre-existing 失败（`supports profiles switching and resolution` 和 `emits assistant_delta and thinking_delta events during stream execution`）与本次改动无关。
+- **涉及文件**:
+  - 新建：`src/runtime/systemPromptBuilder.ts`、`src/providers/retry.ts`、`src/runtime/messageNormalizer.ts`、`test/system-prompt-builder.test.ts`、`test/tool-prompt.test.ts`、`test/retry.test.ts`、`test/message-normalizer.test.ts`。
+  - 修改：`src/runtime/LLMCodingRuntime.ts`、`src/runtime/contextAssembler.ts`、`src/providers/registry.ts`、`src/providers/adapters/ModelAdapter.ts`、`src/providers/adapters/AnthropicAdapter.ts`、`src/providers/adapters/OpenAIAdapter.ts`、`src/tools/Tool.ts`、`src/tools/builtin/*.ts`（7 个）、`test/context-assembler.test.ts`。
+  - 文档：`docs/BabeL-O_调优规划_v1.0.md`、`docs/BabeL-O_优化建议_v1.0.md`。
+
+## 0.85 2026-05-25 Context Analysis API, /context, and Post-Compact State
+
+- **用户请求**: 继续推进 P1：`/context` 诊断命令、Context Analysis API、Post-Compact State Rebuild。
+- **实现结果**:
+  - 新增 `src/runtime/contextAnalysis.ts`，提供可复用 `analyzeContext()`。该 API 复用 `assembleContext()`、`estimateContextTokens()` 和 `getContextWindowState()`，输出 JSON 序列化结构，包含 token estimate、window state、section chars/counts、compact boundary、postCompactState 与 recommendations。
+  - Nexus service 新增 `GET /v1/sessions/:sessionId/context`，service 模式可直接返回同一套 context analysis，避免 CLI 和 Runtime 各自拼估算逻辑。
+  - CLI chat 新增 `/context` 命令和 slash palette/help 文案。embedded 模式读取本地 SQLite 后调用同一 `analyzeContext()`；service 模式调用 Nexus API。输出内容包含 session/model/cwd、token/window 阈值、system prompt/project memory/session summary/active skills/messages/tool schemas、compact boundary、Post-Compact State 和建议动作。
+  - `RuntimeToolAuditEntry` 增加 `inputSchema`，`LocalCodingRuntime` 与 `LLMCodingRuntime` 的 `listTools()` 会暴露模型可见 tool schema，供 `/context` 与 service API 估算 tool definition overhead。
+  - `contextAssembler` 增加轻量 Post-Compact State Rebuild：在 compact boundary 存在时，从 compact 后事件派生最近成功 Read 文件、recent tools、active skills、task/agent status、hook results，并作为 `Post-Compact State` 注入 `Session Summary` / system prompt。该实现保持 Nexus-first，不迁移 BabeL-X 重型 `buildPostCompactMessages`。
+- **测试覆盖**:
+  - `test/context-assembler.test.ts` 新增 `assembleContext rebuilds lightweight post-compact state` 与 `analyzeContext returns token and compact diagnostics`。
+  - `test/runtime.test.ts` 新增 `/v1/sessions/:sessionId/context returns reusable context analysis`。
+  - `test/completer.test.ts` 覆盖 `/context` slash 命令、描述和 control command 映射。
+- **文档修正**:
+  - `docs/nexus/TODO_runtime.md` 将 `/context`、Context Analysis API、Post-Compact State Rebuild 标记为已完成第一版。
+  - `docs/nexus/TODO.md` 将上下文能力水位更新为约 BabeL-X 的 75%-80%，后续优先级调整为 Microcompact/API Invariant Guard、System Prompt 分层硬截断、MCP/Skill Delta 重宣布、stable event identity 和 auto-compact fuse 重置。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts test/completer.test.ts test/runtime.test.ts` 成功通过，63/63 全绿。
+
+## 0.84 2026-05-25 Context Token Estimator and Blocking Limit
+
+- **用户请求**: 根据最新 TODO 文档推进 P0：补齐 Context Token Estimator 与 Context Blocking Limit，优先解决中文长会话未及时 compact、provider call 前仍可能触发 `prompt_too_long` 的问题。
+- **实现结果**:
+  - 新增 `src/runtime/tokenEstimator.ts`，提供 provider-neutral 保守 token estimator。第一版覆盖 CJK、JSON/tool schema、tool_use/tool_result、reasoningContent、thinking/redacted thinking、image/document/server tool block 和 provider tool overhead，并输出 system/messages/tool definitions 分项统计。
+  - `LLMCodingRuntime` 改用新 estimator 计算上下文窗口状态，估算范围包含 system prompt、messages 和当前可用 tool definitions，不再使用 `JSON.stringify(messages).length / 4` 作为 provider call 前判断依据。
+  - provider call 前新增 blocking guard：超过 warning 阈值产出 `context_warning`；超过 `blockingLimit = maxTokens - safetyBuffer` 时先尝试 `trigger=reactive` compact；compact 后仍超限则产出 `CONTEXT_LIMIT_EXCEEDED`、失败 `result` 和 `execution_metrics`，并阻止继续调用 provider。
+  - 工具多轮循环中也会在每次 provider call 前重新估算，避免 tool result 在中途膨胀后继续把明显超限的上下文发给 provider。
+  - `scripts/benchmark-performance-core.ts` 新增 `Chinese context token estimator` 子项：构造中文输入、中文输出、代码块、JSON tool result、reasoningContent 和 tool schema。当前实测旧估算 `10229` tokens 不触发 warning，新 estimator `18421` tokens 会触发 warning 与 blocking。
+  - `test/token-estimator.test.ts` 增加 estimator 单测；`test/runtime.test.ts` 增加 compact 后仍超限时阻断 provider call 的集成测试；`package.json` 将 token estimator 测试接入全量测试脚本。
+- **文档修正**:
+  - `docs/nexus/TODO_runtime.md` 将 `P0 Context Token Estimator`、`P0 中文长会话 benchmark`、`P0 Context Blocking Limit` 标记为已完成第一版，保留 System Prompt 分层硬截断、`/context` 诊断、Context Analysis API 和 Post-Compact State Rebuild 等后续项。
+  - `docs/nexus/TODO.md` 将当前上下文能力水位更新为约 BabeL-X 的 70%-75%，后续优先级调整为 `/context` 诊断、`analyzeContext()` API、post-compact state rebuild、microcompact/API invariant guard 和 system prompt 分层裁剪。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm test` 成功通过，183/183 全绿。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm run benchmark` 成功通过，新增 token estimator 子项输出 `legacyWouldWarn=false`、`estimatorWouldWarn=true`、`estimatorWouldBlock=true`。
+
+## 0.83 2026-05-25 Context Capability Gap Rebaseline
+
+- **用户请求**: 继续深入分析 BabeL-O 当前上下文管理与 BabeL-X 的差距，并将“尽可能补齐优化上下文能力”作为首要目标同步到 TODO 文档。
+- **分析结论更新**:
+  - 旧 `CONTEXT_GAP_ANALYSIS.md` 中“BabeL-O 约为 BabeL-X 40%”“auto-compact boundary 不持久化”“compact 后完全没有 tail”的判断已经过期。
+  - 当前代码已具备 persisted `compact_boundary`、`retainedEvents` tail、recovery boundary、显式路径锚定、focus project 和 auto-compact benchmark。
+  - 当前差距重估为约 BabeL-X 的 65%-70%，首要缺口转为 token 估算精度、blocking limit、post-compact state rebuild、`/context` 诊断、API invariant guard、Session Memory Lite 和 preserved segment。
+- **文档更新**:
+  - `docs/nexus/TODO.md` 将“P0 上下文能力补齐”提升为当前首要主线，列出 Context Token Estimator、Context Blocking Limit、`/context` 诊断、Post-Compact State Rebuild、Microcompact/API Invariant Guard、Session Memory Lite、Preserved Segment 和 Model Fallback。
+  - `docs/nexus/TODO_runtime.md` 将 Context Compact 已知缺陷改写为可执行任务清单，明确 P0/P1/P2 分层和首批落地文件/测试方向。
+  - `docs/nexus/CONTEXT_GAP_ANALYSIS.md` 整体重写为当前工作树口径，明确已完成项、当前能力估计、真实剩余差距和推荐 Phase 1-3 路线。
+- **重要决策**:
+  - 不直接迁移 BabeL-X 的完整 Session Memory / React UI / attachment message 体系；BabeL-O 继续保持 Nexus-first，先实现 provider-neutral token estimator、runtime-level `analyzeContext()` 和轻量 post-compact state rebuild。
+  - `retainedEvents` 是正确的 BabeL-O 化方向，但不能等同于 BabeL-X 的 `messagesToKeep + attachments + hooks` 完整结构化恢复。
+- **验证**:
+  - 纯文档更新，未运行代码测试。
+  - 计划运行 `git diff --check` 验证文档 diff 无空白错误。
+
+## 0.82 2026-05-25 Compact Boundary and Permission Rule Audit Fixes
+
+- **用户请求**: 对用户进一步开发完善后的代码、TODO 和工作记录进行核对，并继续收口未完成项。
+- **核对结论**:
+  - 用户新增的 context anchor、Glob `path`、hooks、TUI 输入状态、auto-compact benchmark 和文档更新整体方向成立，隔离配置下全量测试可通过。
+  - 发现并修复了 3 个需要立即校准的问题：权限 panel Esc 安全回归、session 级 Bash rule 过宽、auto-compact benchmark 未验证持久化恢复。
+- **实现修复**:
+  - **权限 panel 安全回归**：新增 `Approve with editable rule` 后，Esc 仍选择旧索引 2，会误触发批准。现改为显式 `REJECT_PERMISSION_CHOICE_INDEX = 3`，数字快捷键扩展到 1-5，Esc 始终走 Reject。
+  - **session rule 精确匹配**：原 `Approve for session` / editable rule cache 只按工具名命中，`Bash:npm test:*` 会错误批准所有 Bash。现新增 `isSessionPermissionCached()` 与 `matchesPermissionRule()`，Bash rule 只匹配精确前缀，如 `npm test` 或 `npm test ...`，不会批准 `npm install ...`。
+  - **auto-compact 持久化验证**：benchmark 和单测改为读取持久化后的 storage events 再 `assembleContext`，不再只看内存返回值。由此暴露 compact boundary 只保存 summary、未保存最近 tail 的问题。
+  - **compact boundary retained tail**：`compact_boundary` schema 新增 `retainedEvents`；`compactSession()` 写入 selected recent events；`contextAssembler` 读取最新 boundary 时拼接 `retainedEvents + boundary 后续事件`；重复 compact 会继承上一次 retained tail，避免恢复后最近用户轮次和取消/失败 recovery boundary 丢失。
+- **文档修正**:
+  - `TODO.md` 将 auto-compact boundary 持久化从 P0 未完成移出，当前 P0 聚焦精确 tokenizer。
+  - `TODO_runtime.md` 标记 boundary 持久化与 retained tail 恢复已完成，保留 attachments/hooks/MCP 状态重建、blocking limit、manual compact 熔断重置等真实待办。
+  - `TODO_tui.md` 明确状态机/权限 rule 是第一版已落地，同时保留 PTY 键盘路径和截图 smoke。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm test` 成功通过，179/179 全绿。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm run benchmark` 成功通过，auto-compact 实测 `beforeEventCount=202`、`afterEventCount=7`、reduction 96.53%，最近 2/2 用户轮次保留，recovery boundary 完整。
+  - `git diff --check` 成功通过。
+- **注意事项**:
+  - 直接运行 `npm test` 会读取本机 `~/.babel-o/config.json`，可能触发真实 provider 配置并造成环境性失败；测试验证应继续使用 `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json` 隔离配置。
+
+## 0.81 2026-05-25 Context Anchor and Tool Contract Hardening
+
+- **用户请求**: 深度修复 session `session_a1b20033` 中 Agent 无法按指令继续任务的系统性失效（CWD 漂移、Glob path 被静默忽略、输入退化后上下文丢失、指令理解偏差）。
+- **根因分析**:
+  1. CWD 漂移：`session_started.cwd` 始终是 `/Users/tangyaoyue`，用户输入 `/Users/.../BabeL-O 查看这个项目` 后 cwd 未切换。
+  2. Glob `path` 参数被静默忽略：`glob.ts` 的 `inputSchema` 不含 `path`，Agent 传入后被 Zod strip 丢弃。
+  3. 输入退化后上下文丢失：后续输入从完整路径退化为"运行" → "运行这个benchmark脚本"，system prompt 中只有 `workspace: /Users/tangyaoyue`。
+  4. 指令理解偏差："运行"被模型误解为"搜索"，Agent 选择 Glob 而非 Bash。
+  5. 历史 thinking 污染：旧轮次"未找到 benchmark"的结果被固化为当前轮次的前提假设。
+- **实现结果**:
+  - **`src/tools/builtin/glob.ts`**：
+    - `inputSchema` 增加 `path?: string`。
+    - `execute` 中若 `input.path` 存在，用 `resolveInsideWorkspace(context.cwd, input.path)` 解析为绝对路径，作为 `rg --files` 和 `listFilesFallback` 的搜索根目录。
+    - `normalizeGlobNeedle` 同步使用新搜索根计算相对路径。
+  - **`src/runtime/LLMCodingRuntime.ts`**：
+    - 新增 `resolveCwdFromPrompt(prompt, baseCwd)`：提取 prompt 中的绝对路径，按"存在目录 → 返回目录 / 存在文件 → 返回 dirname / 父目录存在 → 返回父目录"的优先级解析，并切换 `options.cwd`。
+    - `executeStream` 开头调用 `resolveCwdFromPrompt`，`session_started` 事件同步反映新 cwd。
+    - 新增 `buildFocusBlock(options)`：当 prompt 无显式路径且 `cwd` 不是用户主目录时，在 system prompt 中注入 `Current focus project:\n${cwd}`，防止输入退化后上下文丢失。
+    - `buildSystemPrompt` Guidelines 新增第 8 条：明确 "run/execute/call a script or command → use Bash; find/search/list files → use Glob or Grep; read file contents → use Read"。
+  - **`test/runtime.test.ts`**：新增 `Glob respects custom path parameter` 和 `LLMCodingRuntime resolves cwd from prompt absolute path`。
+  - **`test/context-assembler.test.ts`**：新增 `buildSystemPrompt anchors focus project when prompt lacks explicit path`。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 全量 178/178 通过（新增 3 个测试）。
+
+## 0.80 2026-05-25 Auto-Compact Benchmark
+
+- **用户请求**: 推进 `TODO_runtime.md` 中 P1 Context Compact UX 的 auto-compact benchmark 项，参考 BabeL-X 实现方法验证长会话 compact 后的规模下降、轮次保留和 recovery boundary 保护。
+- **实现结果**:
+  - `scripts/benchmark-performance-core.ts` 新增 `benchmarkAutoCompact()`：
+    - 构造 40 轮长会话（大量 assistant_delta、thinking_delta、tool_completed 大输出），通过 `compactSession` 执行 auto-compact。
+    - 验证规模下降：实测 `beforeEventCount=202` → `afterEventCount=7`，压缩率 96.53%。
+    - 验证最近轮次保留：检查后 compact 的 user_message 包含 turn 38 和 39，共 2/2 个最近轮次完整保留。
+    - 验证 recovery boundary 保护：构造带 `REQUEST_CANCELLED` + 后续 user_message 的会话，auto-compact 后 `Follow-up after cancellation` 和 `Final question after recovery.` 均未被破坏。
+  - 修复原有 `benchmarkContextAssembly` 的 preservedRecentMarkers 断言：原检查 `recent-turn-37/38/39` 三个标记都在 `assembled.messages` 中，但 `recentTurnLimit=2` 只会保留最后 2 轮；修正为检查 `recent-turn-38/39` 在 messages 中（与 `test/context-assembler.test.ts` 的测试口径一致）。
+  - `test/context-assembler.test.ts` 新增两个单元测试：
+    - `auto compact reduces session size while preserving recent user turns`
+    - `auto compact preserves recovery boundary after cancellation or failure`
+- **仍保留为后续项**:
+  - 暂不迁移 BabeL-X SessionMemory 后台子 Agent；继续等 hooks、子 Agent transcript 和成本控制稳定。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm run benchmark` 成功通过；auto-compact 子项产出完整 JSON 结果。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts` 成功通过，18/18 通过。
+
 ## 0.79 2026-05-24 Auto Compact Threshold and Fuse
 
 - **用户请求**: 继续推进 P1 Context Compact UX 中未完成的 auto-compact threshold、compact failure 熔断、manual compact smoke、auto-compact benchmark 和 SessionMemory 迁移评估项。
@@ -1284,3 +1645,55 @@
 - **后续核对**:
   - 该阶段为 Model Capability Routing 第一版。已完成角色模型声明、角色解析和 toolCalling=false 前置拦截。
   - request model > role model > active profile default 的完整优先级、Planner/Executor/Critic 默认模型策略和 structured output role gate 仍按 `TODO_provider_registry.md` 跟进。
+
+---
+
+## 2026-05-25 — 上下文管理深度差距分析（v0.81 审计）
+
+- **工作项**: 对 BabeL-O v0.81 上下文管理子系统进行源码级审计，并与 BabeL-X 横向对比。
+- **分析方法**: 逐行阅读 `src/runtime/contextAssembler.ts`、`compact.ts`、`sessionSummary.ts`、`memory.ts`、`LLMCodingRuntime.ts`、`hooks.ts`、`shared/events.ts`，以及 BabeL-X 的 `src/services/compact/`、`src/services/SessionMemory/`、`src/query.ts`、`src/components/TokenWarning.tsx`、`src/utils/analyzeContext.ts`。
+- **产出**:
+  - 新建 `docs/nexus/CONTEXT_GAP_ANALYSIS.md`（15KB 完整报告），覆盖：
+    - 9 个维度逐项对比（auto-compact、预算分配、压缩后结构、Session Memory、恢复边界、token 估算、UI/UX、工具映射、模型路由）
+    - 13 项按严重程度排序的具体缺陷清单（P0×2、P1×4、P2×4、P3×3）
+    - 4 阶段改进路线图（Phase 1 紧急修复 → Phase 4 健壮性硬化）
+  - 更新 `docs/nexus/TODO.md`：在"当前优先级"前插入 6 个上下文管理高优先级项。
+  - 更新 `docs/nexus/TODO_runtime.md`：在"P1 Context Compact UX"末尾补充 10 个具体缺陷修复项。
+- **核心结论**: BabeL-O 上下文管理处于 BabeL-X ~40% 水平；差距主要在压缩持久化结构化、轻量降级层、token 估算精度和诊断能力，而非架构方向性错误。按路线图补齐可达 ~80-90%。
+- **验证**: 无代码变更，纯文档审计。未运行测试。
+
+## 2026-05-26 — Recoverable Workspace Path Escape and Context Drift Fix (v0.87)
+
+- **用户请求**: 核对最新开发与文档，并深度分析真实会话中 `TOOL_ERROR: Path escapes workspace: /Users/tangyaoyue/DEV/BabeL/BabeL-O/package.json` 后，Agent 100% 忘记上下文并在用户输入“继续”后回复偏移的问题。
+- **日志核实**:
+  - SQLite 会话 `session_97950217-70e2-4609-8e7c-2c1cdcc3da9c` 显示 session cwd 为 `/Users/tangyaoyue`，用户任务在多个项目路径间切换。
+  - 事件序列中 `Read /Users/tangyaoyue/DEV/BabeL/BabeL-O/package.json` 后立即出现全局 `error`：`code=TOOL_ERROR`、`message=Path escapes workspace: /Users/tangyaoyue/DEV/BabeL/BabeL-O/package.json`。
+  - 下一轮用户只输入“继续”后，模型没有拿到上一轮工具失败的 `tool_result`，转而使用 Bash 探测 `NOT FOUND`、zip 目录和其他项目，证明这不是单纯模型幻觉，而是工具循环被运行时错误中断后恢复上下文过弱。
+- **根因**:
+  - `resolveInsideWorkspace()` 对 workspace escape 抛出普通 Error，`LLMCodingRuntime.executeToolSafely()` / `LocalCodingRuntime.executeToolSafely()` 将其升级为全局 `TOOL_ERROR`。
+  - 全局错误会结束 provider tool loop，模型看不到 `tool_result is_error=true`，下一句“继续”只能依赖旧 summary 和残缺上下文恢复，极易把任务目标带偏。
+  - 路径 `/DEV/BabeL/...` 与真实工作区 `/DEV/BABEL/...` 的大小写差异、以及 `relative().startsWith('..')` 的粗判断，会放大误判和上下文漂移风险。
+- **实现结果**:
+  - 新增 `WorkspacePathError`、`isWorkspacePathError()`、`formatWorkspacePathError()`，将 workspace escape 标准化为 `WORKSPACE_PATH_ESCAPE`。
+  - `LLMCodingRuntime` 与 `LocalCodingRuntime` 捕获该错误后返回 `tool_completed success=false`，输出 `requestedPath`、`cwd`、`resolvedPath` 与可读修复建议，并在 LLM 续轮中映射为 `tool_result is_error=true`。
+  - `resolveInsideWorkspace()` 改为真实路径优先，并用 `relative + isAbsolute + ../` 的标准包含判断，避免把工作区内 `..valid-name` 等合法路径误判为逃逸；安全边界仍保持 deny-by-default，不放宽跨 workspace 访问。
+  - 补充 Runtime LLM、HTTP Runtime 与 path safety 边界测试，覆盖 workspace escape 可恢复、全局 `TOOL_ERROR` 不再出现、外部路径仍拒绝、内部缺失路径和 `..` 前缀目录名仍允许。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/runtime.test.ts test/security.test.ts` 通过。
+
+## 2026-05-26 — Context P1 Microcompact and Invariant Guard 收口 (v0.88)
+
+- **用户请求**: 根据 TODO 中 P1 上下文治理项继续推进：Microcompact / API Invariant Guard、System Prompt 分层硬截断、MCP / Skill Delta 重宣布、`selectOmittedEvents` 稳定身份、manual compact 重置 auto-compact 熔断计数。
+- **实现结果**:
+  - **Microcompact**: 新增 `microcompactEvents()`，在 recent events 进入 message mapper 前先压缩旧轮次 `tool_completed.output`、`assistant_delta` 与 `thinking_delta`，使用 head/tail 保留并明确标记为 microcompact，避免把“上下文截断”误写成 denied/interrupted。
+  - **API Invariant Guard**: 新增 `protectToolPairs()`，在 `selectRecentEvents()` 后自动补齐同一 `toolUseId` 的 `tool_started/tool_completed` 配对；`compactSession()` 的 `retainedEvents` 也复用该保护，降低 compact 后 orphan tool_result / synthetic interrupted result 的概率。
+  - **Stable event identity**: 新增 `eventIdentity()`，优先使用 `eventId`、`toolUseId`，再退化到 `type/sessionId/timestamp/hash`，替代 `new Set(selectedEvents)` 的对象引用判断，避免 deep clone/normalize 后 omitted 计算失真。
+  - **System Prompt 分层硬截断**: 新增 `enforceDynamicLayerBudgets()` 与 `applySystemPromptSectionBudgets()`，对 Project Memory、Session Summary、Active Developer Skills、focus/request path 等动态 section 按预算裁剪，保留 head/tail 并记录 `systemPromptTruncation`；`/context` 诊断新增 `microcompactedEventCount` 与 `systemPromptTruncationCount`。
+  - **Compact 后能力重宣布**: 在 compact boundary 后追加 `Compact Capability Reminder`，与 `Post-Compact State` 一起重声明 recent tools、active skills、task/hook 状态和 `tool_use/tool_result` 配对约束。
+  - **Auto compact fuse reset**: `countConsecutiveAutoCompactFailures()` 遇到任意成功 `compact_boundary`（manual/reactive/auto）即停止继续向前累计，manual/reactive compact success 可清除边界之前的 auto failure。
+- **测试覆盖**:
+  - 新增/更新 `test/context-assembler.test.ts` 覆盖 cloned selected events、tool pair protection、microcompact 文案、system prompt layer budget、compact capability reminder、manual boundary fuse reset 和 context analysis 诊断字段。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts` 通过。

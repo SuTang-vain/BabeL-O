@@ -341,13 +341,7 @@ BabeL-O/
 │   └── smoke-providers.ts
 │
 └── docs/
-    ├── ARCHITECTURE.md           # Architecture overview
-    ├── PLAN.md                   # Technical evolution plan
-    ├── walkthrough.md            # Feature walkthrough
-    ├── RECOMMENDATIONS.md        # Migration recommendations from BabeL-X
-    ├── task.md                   # Task design notes
-    ├── implementation_plan.md    # Implementation plan
-    └── nexus/                    # Nexus-specific TODO & work logs
+    └── nexus/                    # Canonical Nexus docs, TODOs, audits, and work logs
 ```
 
 ---
@@ -533,14 +527,14 @@ npm run test:providers:smoke  # Smoke test provider connections
 
 | Document | Description |
 |----------|-------------|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Architecture overview and layer design |
-| [`docs/PLAN.md`](docs/PLAN.md) | Technical evolution plan (5 phases) |
-| [`docs/walkthrough.md`](docs/walkthrough.md) | Feature walkthrough with verification results |
-| [`docs/RECOMMENDATIONS.md`](docs/RECOMMENDATIONS.md) | Migration recommendations from BabeL-X |
-| [`docs/implementation_plan.md`](docs/implementation_plan.md) | Implementation plan |
-| [`docs/task.md`](docs/task.md) | Task system design notes |
-| [`docs/nexus/README.md`](docs/nexus/README.md) | Nexus sub-project overview |
-| [`docs/nexus/TODO.md`](docs/nexus/TODO.md) | Master TODO |
+| [`docs/nexus/README.md`](docs/nexus/README.md) | Canonical documentation index, architecture, and maintenance rules |
+| [`docs/nexus/TODO.md`](docs/nexus/TODO.md) | Master roadmap and current priorities |
+| [`docs/nexus/CONTEXT_GAP_ANALYSIS.md`](docs/nexus/CONTEXT_GAP_ANALYSIS.md) | BabeL-O vs BabeL-X context capability analysis |
+| [`docs/nexus/TODO_runtime.md`](docs/nexus/TODO_runtime.md) | Runtime, storage, context, MCP, skills, and safety tasks |
+| [`docs/nexus/TODO_agents.md`](docs/nexus/TODO_agents.md) | Agent orchestration and task-session work |
+| [`docs/nexus/TODO_tui.md`](docs/nexus/TODO_tui.md) | CLI/TUI interaction work |
+| [`docs/nexus/TODO_provider_registry.md`](docs/nexus/TODO_provider_registry.md) | Provider registry and model capability routing |
+| [`docs/nexus/TODO_performance.md`](docs/nexus/TODO_performance.md) | Performance, metrics, and benchmark work |
 | [`docs/nexus/WORK_LOG.md`](docs/nexus/WORK_LOG.md) | Development work log |
 
 ---

@@ -23,6 +23,7 @@ export type ModelDefinition = {
   id: string // Format: provider/model (e.g. openai/gpt-4o)
   name: string
   contextWindow: number
+  defaultMaxTokens: number
   capabilities: {
     toolCalling: boolean
     jsonOutput: boolean
@@ -121,6 +122,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'local/coding-runtime',
     name: 'Local Coding Runtime',
     contextWindow: 8192,
+    defaultMaxTokens: 4096,
     capabilities: {
       toolCalling: true,
       jsonOutput: false,
@@ -131,6 +133,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'anthropic/claude-3-5-sonnet',
     name: 'Claude 3.5 Sonnet',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -141,6 +144,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'anthropic/claude-3-opus',
     name: 'Claude 3 Opus',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: false,
@@ -151,6 +155,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'anthropic/claude-3-7-sonnet',
     name: 'Claude 3.7 Sonnet',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -161,6 +166,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'openai/gpt-4o',
     name: 'GPT-4o',
     contextWindow: 128000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -171,6 +177,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'openai/gpt-4-turbo',
     name: 'GPT-4 Turbo',
     contextWindow: 128000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -181,6 +188,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'openai/gpt-3.5-turbo',
     name: 'GPT-3.5 Turbo',
     contextWindow: 16385,
+    defaultMaxTokens: 4096,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -191,6 +199,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'deepseek/deepseek-v4-pro',
     name: 'DeepSeek V4 Pro',
     contextWindow: 128000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -201,6 +210,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'deepseek/deepseek-v4-flash',
     name: 'DeepSeek V4 Flash',
     contextWindow: 128000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -211,6 +221,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'deepseek/deepseek-chat',
     name: 'DeepSeek Chat (V3)',
     contextWindow: 64000,
+    defaultMaxTokens: 4096,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -221,6 +232,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'deepseek/deepseek-reasoner',
     name: 'DeepSeek Reasoner (R1)',
     contextWindow: 64000,
+    defaultMaxTokens: 4096,
     capabilities: {
       toolCalling: false,
       jsonOutput: false,
@@ -231,6 +243,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'zhipu/glm-5.1',
     name: 'GLM 5.1',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -241,6 +254,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'zhipu/glm-5',
     name: 'GLM 5',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -251,6 +265,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'zhipu/glm-5-turbo',
     name: 'GLM 5 Turbo',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -261,6 +276,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2.7',
     name: 'MiniMax M2.7',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -271,6 +287,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2.7-highspeed',
     name: 'MiniMax M2.7 Highspeed',
     contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -281,6 +298,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2.5',
     name: 'MiniMax M2.5',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -291,6 +309,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2.5-highspeed',
     name: 'MiniMax M2.5 Highspeed',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -301,6 +320,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2.1',
     name: 'MiniMax M2.1',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,
@@ -311,6 +331,7 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'minimax/MiniMax-M2',
     name: 'MiniMax M2',
     contextWindow: 200000,
+    defaultMaxTokens: 8192,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,

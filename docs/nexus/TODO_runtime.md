@@ -70,6 +70,9 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 修复显式路径请求被旧上下文带偏：system prompt 会列出当前请求中的绝对路径，并要求模型将其作为权威任务目标；支持中文无空格后缀路径解析，例如 `/Users/.../BabeL-X横向对比分析这个项目`。
 - [x] 修复取消/超时后的长任务上下文恢复：遇到 `REQUEST_CANCELLED`、`REQUEST_TIMEOUT`、`MAX_LOOPS_EXCEEDED`、`PROVIDER_ERROR`、`EMPTY_PROVIDER_RESPONSE` 或失败 result 后，下一条用户输入会形成新的 recent context 边界，旧工具链进入 summary，不再让模型继续旧任务；同时区分用户取消 `REQUEST_CANCELLED` 与真正执行超时 `REQUEST_TIMEOUT`。
 - [x] 修复 provider 工具参数校验失败不可恢复：`Write` / `Edit` 等工具缺少必填字段时，`LLMCodingRuntime` 现在返回 `tool_completed success=false` 与 provider `tool_result isError=true`，让模型能补齐参数后继续调用，而不是直接用全局 `INVALID_TOOL_INPUT` 终止 session。
+- [x] 修复 workspace path escape 不可恢复：`Read` / `Write` / `Edit` / `Glob` 等路径工具触发 `WORKSPACE_PATH_ESCAPE` 时，运行时现在返回 `tool_completed success=false` 与 provider `tool_result isError=true`，让模型看到“路径不在当前 workspace / 可能大小写或目标项目错误”的结构化结果并继续修正，而不是升级为全局 `TOOL_ERROR` 终止工具循环。
+- [x] **CWD 跟随用户输入中的显式绝对路径**：`LLMCodingRuntime.executeStream` 开头新增 `resolveCwdFromPrompt()`，提取 prompt 中的绝对路径，若存在且有效（目录/文件/父目录存在），将 `options.cwd` 切换到该路径；`session_started` 事件同步反映新 cwd。
+- [x] **Glob 工具支持 `path` 参数**：`glob.ts` 的 `inputSchema` 增加 `path?: string`，`execute` 中用 `resolveInsideWorkspace` 解析后作为搜索根目录；修复 Agent 传入 `path` 被静默忽略、在错误目录搜索的问题。
 
 ## P1 Context Compact UX
 
@@ -82,8 +85,37 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] 增加 auto-compact threshold：按 model context window 预留输出空间和安全 buffer，超过阈值时自动 compact；默认先关闭或 opt-in，避免早期误压缩。
 - [x] 增加 compact failure 熔断：连续 compact 失败达到阈值后停止自动重试，产出可见 warning，避免长会话每轮重复消耗 provider 调用。
 - [x] 增加 manual compact smoke：构造包含大量 tool output、thinking_delta、provider error、cancel boundary 的 session，验证 compact 后仍能回答最新用户问题。
-- [ ] 增加 auto-compact benchmark：验证长会话输入规模下降、最近 2-4 个用户轮次完整保留、失败/取消后的 recovery boundary 不被 compact 破坏。当前已补充手动 smoke 与阈值/熔断单测，benchmark 仍待系统化补齐。
+- [x] 增加 auto-compact benchmark：在 `scripts/benchmark-performance-core.ts` 中新增 `benchmarkAutoCompact`，验证长会话 compact 后规模下降 >50%（实测 96%+）、最近 2 个用户轮次完整保留、失败/取消后的 recovery boundary 不被 compact 破坏；benchmark 通过持久化后的事件重新 `assembleContext`，避免只验证内存假象。同时补充 `test/context-assembler.test.ts` 单元测试覆盖 auto-compact 规模和 recovery boundary 保留。
+- [x] 修复 auto-compact boundary 持久化与恢复：`compactSession` 默认持久化 `compact_boundary`，boundary 内新增 `retainedEvents` 保存最近 tail；`contextAssembler` 读取最新 boundary 时会拼接 `retainedEvents + boundary 后续事件`，重复 compact 也会继承上一次 retained tail，避免会话恢复后最近用户轮次和 recovery boundary 丢失。
 - [ ] 暂不迁移 BabeL-X SessionMemory 后台子 Agent；待 hooks、子 Agent transcript 和成本控制稳定后再评估。
+
+### Context Compact 已知缺陷（来自 CONTEXT_GAP_ANALYSIS.md）
+
+以下按严重程度排序，是当前首要开发主线。目标是优先补齐 BabeL-O 与 BabeL-X 的上下文治理差距，支撑长会话、连续任务、自优化和复杂项目开发；已完成项保留在列表中作为口径回溯：
+
+- [x] **P0: auto-compact boundary 持久化与 retained tail 恢复**。已修复早期 benchmark `persist:false` 假阳性：auto/manual compact 默认持久化 boundary，并将最近 tail 写入 `compact_boundary.retainedEvents`；`contextAssembler` 与重复 compact 均会读取 retained tail，确保会话恢复/并发实例读取时最近用户轮次和 recovery boundary 不丢失。
+- [x] **P0: Context Token Estimator**。新增 `src/runtime/tokenEstimator.ts`，替换 `LLMCodingRuntime` 中 `JSON.stringify(messages).length / 4` 的粗估。第一版不绑定 Anthropic API，采用 provider-neutral 保守估算：CJK 字符、JSON/tool schema、tool_use/tool_result、thinking/redacted thinking、image/document/server tool block 和 provider tool overhead 均纳入估算。
+- [x] **P0: 中文长会话 benchmark**。`scripts/benchmark-performance-core.ts` 已新增 `Chinese context token estimator` 子项，构造中文用户输入、中文 assistant 输出、代码块、JSON tool result、reasoningContent 和 tool schema；当前实测旧 chars/4 估算 `10229` tokens 不触发 warning，新 estimator 估算 `18421` tokens，会进入 warning/blocking 阈值。
+- [x] **P0: Context Blocking Limit**。`LLMCodingRuntime` 在 provider call 前计算 `blockingLimit`；超过 warning 阈值发 `context_warning`，超过 blocking limit 时先执行 `trigger=reactive` compact，compact 后仍超限则返回 `CONTEXT_LIMIT_EXCEEDED`、失败 `result` 和 `execution_metrics`，禁止继续调用 provider 等待 `prompt_too_long`。
+- [x] **P0: System Prompt 分层硬截断**。`layerBudgets.system/memory/summary/skills` 已用于实际裁剪；`Project Memory`、`Session Summary`、`Active Developer Skills`、focus/path block 会按字符预算保留 head/tail 并插入 truncation marker，`AssembledContext.systemPromptTruncation` 与 `/context` 诊断暴露截断计数。
+- [x] **P1: `/context` 诊断命令**。CLI chat 已新增 `/context`，可输出轻量诊断表格：model/window/token、system prompt、project memory、session summary、compact retainedEvents、recent messages、tool schema count、active skills、snipped tool outputs、post-compact state 和建议动作；service 模式调用 Nexus API，embedded 模式复用本地 SQLite 与同一 `analyzeContext()`。
+- [x] **P1: Context Analysis API**。新增 `src/runtime/contextAnalysis.ts` 的 `analyzeContext()`，并暴露 `GET /v1/sessions/:sessionId/context`。结果为 JSON 序列化结构，包含 token estimate/window state/sections/compact/postCompactState/recommendations；已纳入 `test/context-assembler.test.ts` 与 `test/runtime.test.ts`。
+- [x] **P1: Post-Compact State Rebuild**。`contextAssembler` 已派生轻量 `Post-Compact State` block 并在 compact boundary 存在时注入 system prompt，第一版覆盖最近成功 Read 文件、recent tools、active skills、task/agent status 和 hook results。MCP/tool instructions delta 与更强 preserved segment 校验仍在后续项继续。
+- [x] **P1: MCP / Skill Delta 重宣布**。compact boundary 存在时，`Post-Compact State` 与 `Compact Capability Reminder` 会重新声明 recent tools、active skills、task/hook 状态和必要 tool contract，明确 `tool_use/tool_result` 必须按 `toolUseId` 配对，避免 compact 后模型忘记可用能力或误解截断结果。
+- [x] **P1: `selectOmittedEvents` 稳定身份**。新增 `eventIdentity()`，优先使用 `eventId`、`toolUseId`，再退化到 `type/sessionId/timestamp/hash`，避免 deep clone/normalize 后 omitted 计算依赖对象引用相等。
+- [x] **P1: API Invariant Guard / Microcompact**。`protectToolPairs()` 会在 recent selection 后补齐匹配的 `tool_started/tool_completed`，compact retainedEvents 也复用同一保护；新增 `microcompactEvents()` 优先压缩旧 tool output、thinking_delta 和 assistant_delta，并在输出中明确为 microcompact head/tail，不再用 "denied or interrupted" 掩盖上下文截断。
+- [x] **P1: manual compact 重置 auto-compact 熔断计数**。`countConsecutiveAutoCompactFailures()` 遇到任意 `compact_boundary`（manual/reactive/auto）即停止向前累计，manual/reactive compact success 可作为用户主动恢复边界重置旧 auto failure。
+- [x] **P2: Session Memory Lite（opt-in 第一版）**。参考 BabeL-X Post-Sampling Hook，但保持 Nexus-first。compact 成功后若设置 `BABEL_O_SESSION_MEMORY_LITE=1`，维护 `.babel-o/session-memory.md`，只允许写入固定路径；追加 `session_memory_updated` 事件用于审计，但不把 memory 文件注入主 read cache/context。后续再做自然停顿触发、后台 lightweight agent、sequential 队列和成本控制。
+- [x] **P2: Preserved Segment / Resume Verification（第一版）**。`compact_boundary.retainedSegment` 已记录 retained count、boundary anchor、first/last event identity 和 hash；恢复时验证 retained tail，失败则回退完整历史并输出可见 warning，`/context` 展示 retained check/warn。
+- [x] **P2: Model Fallback / Max Output Recovery 诊断层**。新增 provider recovery 分类，识别 `max_output_tokens`、`prompt_too_long/context_length_exceeded`、rate limit、auth/billing 和 5xx；error `details.recoveryReason` 记录 `ESCALATED_MAX_TOKENS` / `ESCALATED_CONTEXT_WINDOW` 等，TUI 展示恢复建议。自动 fallback model 切换仍保留为后续策略项。
+- [x] **P2: Context Regression Corpus（第一版）**。新增真实漂移样本：workspace escape 后“继续”、cancel 后“你现在在干什么”、provider empty response、invalid tool input/schema failure，覆盖 context selection 与 message replay 不再带偏。
+- [x] **P1/P2: 短问候/状态追问 pivot boundary**。基于 `session_7b928e48`：当最新用户输入是 `你好？`、`还在吗`、`你现在在干什么`、`还记得...` 等短交互时，`selectRecentEvents()` 只保留最新用户轮次，不继续回放旧任务工具链；真实会话回放验证第三轮 `你好？` provider messages 不再包含 Baidu/tool_use。
+- [x] **P1/P2: Bash 绝对路径 workspace preflight**。Bash 命令执行前抽取绝对路径并调用 `resolveInsideWorkspace()`；越界时返回 recoverable `WORKSPACE_PATH_ESCAPE` tool result，避免模型通过 Bash 绕过 Read/Glob 的 workspace guard。
+- [x] **P1/P2: Bash retained CWD 随 workspace 切换重置**。基于 `session_b4fd19a4`：同一 session 从 Baidu 切到 BabeL-X 后，Bash 的 `sessionCwdMap` 仍可能保留旧 Baidu CWD，导致 workspace guard 基准回退到旧项目。现已限制 retained shell cwd 只能在当前 `context.cwd` workspace 内复用，跨 workspace 自动清除；绝对路径 preflight 始终以本轮 `context.cwd` 为根。
+- [x] **P1/P2: Session CWD 持久化与纠错轮继承**。基于 `session_e9fa6e3a`：含显式目录路径的本轮能切到 BabeL-X，但下一轮“让你分析的就是 babel-X 项目”因无绝对路径回退到启动 cwd。现已将 `session_started.cwd` 写回 session snapshot，HTTP/WS/embedded CLI 后续无显式路径输入继承 `session.cwd`；纠错短句触发 pivot，避免旧 BabeL-O/Baidu 工具链继续锚定。
+- [ ] **P2/P3: 自动 Model Fallback 执行策略**。与 provider registry role routing 联动，定义何时自动降低 max output、何时 fallback 到大上下文模型、何时要求用户确认，避免 silent model switch。
+- [ ] **P2: Prompt Intent Classifier / Pivot Guard 扩展**。把当前规则型 pivot 识别扩展为可测试的小型意图分类器，覆盖“换项目/换话题/停一下/只回答我/不要继续旧任务”等中文短句，并在 `/context` 中展示 pivot reason。
+- [ ] **P3: `thinking_delta` 策略再评估**。当前完全丢弃 thinking 可防污染，但对部分 provider/model 可能损失规划连续性。评估只保留短摘要、只给同 provider、或只在 Agent role 内部保留的策略。
 
 ## P1 Nexus Hooks 最小内核
 
@@ -119,7 +151,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 - [ ] `RecoverInvalidToolInputHook`: 对缺少 `Write.path`、`Edit.oldString/newString` 等常见 schema 失败生成清晰 retry hint。
 - [ ] `BashFailureSummaryHook`: 对 Bash exitCode 非零输出提取 stderr/stdout 摘要，帮助模型继续自我修复。
-- [ ] `ExplicitPathAnchorHook`: 当用户输入包含绝对路径时，将目标路径作为 additional context 强化给 runtime，防止被旧上下文带偏。
+- [x] `ExplicitPathAnchorHook`（以 `resolveCwdFromPrompt` + `Current focus project` system prompt 块实现）：当用户输入包含绝对路径时，将目标路径切换为 cwd 并注入 system prompt；当输入退化无显式路径但 cwd 不是用户主目录时，注入 `Current focus project` 块防止上下文丢失。
 - [ ] `SubagentWorktreeNoticeHook`: 子 Agent 在 worktree 内启动时注入 parent cwd、worktree cwd、路径转换和变更隔离说明。
 - [ ] `SessionCleanupAuditHook`: session 结束时记录 bash cwd/task queue/task session/pending permission 清理统计。
 

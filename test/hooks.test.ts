@@ -64,4 +64,50 @@ describe('runtime hooks', () => {
     assert.ok(sessionEndResult.events.some(event => event.type === 'hook_started'))
     assert.ok(sessionEndResult.events.some(event => event.type === 'hook_completed'))
   })
+
+  test('emits subagent start and stop hook events', async () => {
+    const startResult = await executeRuntimeHooks(
+      'SubagentStart',
+      {
+        toolUseId: 'task-1',
+        toolName: 'Subagent',
+        toolInput: { prompt: 'test', sessionId: 'sub-1' },
+      },
+      {
+        sessionId: 'session-4',
+        cwd: '/tmp',
+      },
+    )
+    assert.ok(startResult.events.some(event => event.type === 'hook_started'))
+    assert.ok(startResult.events.some(event => event.type === 'hook_completed'))
+
+    const stopResult = await executeRuntimeHooks(
+      'SubagentStop',
+      {
+        toolUseId: 'task-1',
+        toolName: 'Subagent',
+        toolInput: { prompt: 'test', sessionId: 'sub-1' },
+        success: true,
+      },
+      {
+        sessionId: 'session-4',
+        cwd: '/tmp',
+      },
+    )
+    assert.ok(stopResult.events.some(event => event.type === 'hook_started'))
+    assert.ok(stopResult.events.some(event => event.type === 'hook_completed'))
+  })
+
+  test('emits user prompt submit hook events', async () => {
+    const result = await executeRuntimeHooks(
+      'UserPromptSubmit',
+      { prompt: 'Hello world' },
+      {
+        sessionId: 'session-5',
+        cwd: '/tmp',
+      },
+    )
+    assert.ok(result.events.some(event => event.type === 'hook_started'))
+    assert.ok(result.events.some(event => event.type === 'hook_completed'))
+  })
 })

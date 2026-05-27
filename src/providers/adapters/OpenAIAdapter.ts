@@ -5,9 +5,12 @@ import type {
   TextContentBlock,
   ToolUseContentBlock,
   ToolResultContentBlock,
+  FinishReason,
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
 import { ProviderError } from '../../shared/errors.js'
+import { getModel } from '../registry.js'
+import { withRetry } from '../retry.js'
 
 export class OpenAIAdapter implements ModelAdapter {
   async *queryStream(
@@ -118,27 +121,42 @@ export class OpenAIAdapter implements ModelAdapter {
       },
     }))
 
+    let maxTokensValue: number | undefined
+    if (params.maxTokens !== undefined) {
+      maxTokensValue = params.maxTokens
+    } else {
+      try {
+        maxTokensValue = getModel(params.model).defaultMaxTokens
+      } catch {
+        maxTokensValue = undefined
+      }
+    }
+
     const body: any = {
       model: targetModel,
       messages: openaiMessages,
       ...(mappedTools && mappedTools.length > 0 && { tools: mappedTools }),
       ...(params.temperature !== undefined && { temperature: params.temperature }),
-      ...(params.maxTokens !== undefined && { max_tokens: params.maxTokens }),
+      ...(maxTokensValue !== undefined && { max_tokens: maxTokensValue }),
       stream: true,
       stream_options: { include_usage: true },
     }
 
-    const response = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-      signal: options?.signal,
-    })
+    const response = await withRetry(async () => {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: options?.signal,
+      })
 
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new ProviderError(providerId, response.status, errorText)
-    }
+      if (!res.ok) {
+        const errorText = await res.text()
+        throw new ProviderError(providerId, res.status, errorText)
+      }
+
+      return res
+    })
 
     if (!response.body) {
       throw new Error('Response body is not readable')
@@ -168,6 +186,13 @@ export class OpenAIAdapter implements ModelAdapter {
       }
       const choice = data.choices?.[0]
       if (!choice) continue
+
+      if (choice.finish_reason) {
+        yield {
+          type: 'finish',
+          reason: mapOpenAIFinishReason(choice.finish_reason),
+        }
+      }
 
       const delta = choice.delta
       if (!delta) continue
@@ -230,11 +255,7 @@ export class OpenAIAdapter implements ModelAdapter {
       try {
         parsedInput = JSON.parse(toolCall.argumentsBuffer)
       } catch {
-        try {
-          parsedInput = (0, eval)(`(${toolCall.argumentsBuffer})`)
-        } catch {
-          parsedInput = { raw: toolCall.argumentsBuffer }
-        }
+        parsedInput = { _parseError: true, _rawInput: toolCall.argumentsBuffer.slice(0, 500) }
       }
       yield {
         type: 'tool_use_end',
@@ -243,4 +264,15 @@ export class OpenAIAdapter implements ModelAdapter {
       }
     }
   }
+}
+
+const OPENAI_FINISH_MAP: Record<string, string> = {
+  stop: 'end_turn',
+  length: 'max_tokens',
+  content_filter: 'end_turn',
+  tool_calls: 'tool_use',
+}
+
+function mapOpenAIFinishReason(reason: string): FinishReason {
+  return (OPENAI_FINISH_MAP[reason] || reason) as FinishReason
 }
