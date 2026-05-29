@@ -16,12 +16,19 @@ export const editTool: ToolDefinition<typeof inputSchema> = {
   risk: 'write',
   inputSchema,
   async execute(input, context) {
-    const path = resolveInsideWorkspace(context.cwd, input.path)
+    const path = resolveInsideWorkspace(context.cwd, input.path, context.allowedPaths)
     const before = await readFile(path, 'utf8')
-    if (!before.includes(input.oldString)) {
+    const occurrences = before.split(input.oldString).length - 1
+    if (occurrences === 0) {
       return {
         success: false,
         output: `String not found in ${input.path}`,
+      }
+    }
+    if (occurrences > 1) {
+      return {
+        success: false,
+        output: `String is not unique in ${input.path} (found ${occurrences} occurrences). Provide more context to make it unique.`,
       }
     }
     const after = before.replace(input.oldString, input.newString)

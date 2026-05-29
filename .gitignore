@@ -5,6 +5,7 @@ dist/
 *.db
 *.sqlite
 coverage/
+.babel-o/tool-results/
 
 # Local planning / technical-detail docs are intentionally not published.
 docs/

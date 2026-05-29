@@ -148,6 +148,10 @@ export function updateNexusTask(
   if (updates.result !== undefined) task.result = updates.result
   task.updatedAt = now()
 
+  if (updates.status === 'failed') {
+    propagateFailures(queue)
+  }
+
   const updated = cloneTask(task)
   persistNexusTask(updated)
   return updated
@@ -405,4 +409,25 @@ function unblockTasks(queue: Map<string, NexusTask>): NexusTask[] {
     }
   }
   return unblockedTasks
+}
+
+function propagateFailures(queue: Map<string, NexusTask>): void {
+  let changed = true
+  while (changed) {
+    changed = false
+    for (const task of queue.values()) {
+      if (task.status === 'completed' || task.status === 'failed') continue
+      const hasFailedDep = task.dependsOn.some(depId => {
+        const dep = queue.get(depId)
+        return dep?.status === 'failed'
+      })
+      if (hasFailedDep) {
+        task.status = 'failed'
+        task.result = 'Dependency failed'
+        task.updatedAt = now()
+        persistNexusTask(cloneTask(task))
+        changed = true
+      }
+    }
+  }
 }

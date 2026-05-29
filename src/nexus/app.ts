@@ -191,6 +191,100 @@ export async function createNexusApp(
     tools: options.runtime.listTools?.() ?? [],
   }))
 
+  type PreparedExecution = {
+    sessionId: string
+    session: SessionSnapshot
+    cwd: string
+    body: z.infer<typeof executeSchema>
+    requestId: string
+    abortController: AbortController
+    timeoutController: AbortController
+    timeout: ReturnType<typeof setTimeout>
+    allowedPaths?: string[]
+  }
+
+  type PrepareError = { code: string; message: string; status: number }
+
+  async function prepareExecution(body: z.infer<typeof executeSchema>): Promise<PreparedExecution | PrepareError> {
+    if (body.executionEnvironment && body.executionEnvironment === 'remote') {
+      return { code: 'NOT_IMPLEMENTED', message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`, status: 501 }
+    }
+    const sessionId = body.sessionId ?? createId('session')
+    let session = await options.storage.getSession(sessionId, { includeEvents: false })
+    const cwd = resolveRequestCwd({
+      prompt: body.prompt,
+      requestedCwd: body.cwd,
+      sessionCwd: session?.cwd,
+      defaultCwd: options.defaultCwd,
+    })
+    if (!isWorkspaceAllowed(cwd)) {
+      return { code: 'INVALID_REQUEST', message: `Workspace directory not allowed: ${cwd}`, status: 400 }
+    }
+
+    let allowedPaths = session?.allowedPaths ? [...session.allowedPaths] : []
+    if (session && session.cwd && session.cwd !== cwd && !allowedPaths.includes(session.cwd)) {
+      allowedPaths.push(session.cwd)
+    }
+
+    const configManager = ConfigManager.getInstance()
+    const settings = configManager.resolveSettings({ model: body.model })
+    const targetModelId = settings.modelId || 'local/coding-runtime'
+    try {
+      const modelDef = getModel(targetModelId)
+      if (modelDef && !modelDef.capabilities.toolCalling) {
+        return { code: 'INVALID_REQUEST', message: `Model "${targetModelId}" does not support tool calling`, status: 400 }
+      }
+    } catch (err) {
+      if (!(err instanceof UnknownModelError)) throw err
+    }
+    const abortController = new AbortController()
+    const timeoutController = new AbortController()
+    const timeout = setTimeout(() => { timeoutController.abort(); abortController.abort() }, body.timeoutMs ?? executeTimeoutMs)
+    if (!session) {
+      session = createSessionSnapshot(sessionId, cwd, body.prompt)
+    } else {
+      session.phase = 'executing'
+      session.cwd = cwd
+      session.updatedAt = nowIso()
+      session.lastUserInput = body.prompt
+      session.allowedPaths = allowedPaths.length > 0 ? allowedPaths : undefined
+    }
+    await options.storage.saveSession(session)
+    await options.storage.appendEvent(sessionId, { type: 'user_message', ...eventBase(sessionId), text: body.prompt })
+    const requestId = body.requestId ?? createId('req')
+    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
+  }
+
+  function isPrepareError(r: PreparedExecution | PrepareError): r is PrepareError {
+    return 'status' in r
+  }
+
+  function recordEventMetrics(event: NexusEvent): void {
+    if (event.type !== 'execution_metrics') return
+    if (event.providerFirstTokenMs !== undefined) metrics.recordProviderFirstToken(event.providerFirstTokenMs)
+    if (event.providerRequestDurationMs !== undefined) metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
+    if (event.streamDeltaCount !== undefined) metrics.recordStreamDeltas(event.streamDeltaCount)
+    if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
+    if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
+  }
+
+  async function persistEventMetrics(sessionId: string, event: NexusEvent): Promise<void> {
+    if (event.type !== 'execution_metrics') return
+    await options.storage.saveExecutionMetrics({
+      metricId: createId('metric'),
+      sessionId,
+      executeDurationMs: event.executeDurationMs,
+      providerFirstTokenMs: event.providerFirstTokenMs,
+      providerRequestDurationMs: event.providerRequestDurationMs,
+      streamDeltaCount: event.streamDeltaCount,
+      toolCallCount: event.toolCallCount,
+      toolRoundtripDurationMs: event.toolRoundtripDurationMs,
+      contextCharsIn: event.contextCharsIn,
+      contextCharsOut: event.contextCharsOut,
+      timestamp: event.timestamp,
+    })
+  }
+
   app.post('/v1/execute', async (request, reply) => {
     const releaseExecution = executionGate.tryAcquire()
     if (!releaseExecution) {
@@ -205,76 +299,13 @@ export async function createNexusApp(
     const startedAtMs = metrics.now()
     try {
       const body = executeSchema.parse(request.body)
-      if (body.executionEnvironment && body.executionEnvironment === 'remote') {
-        return reply.status(501).send({
-          type: 'error',
-          code: 'NOT_IMPLEMENTED',
-          message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`,
-        })
+      const prepared = await prepareExecution(body)
+      if (isPrepareError(prepared)) {
+        return reply.status(prepared.status).send({ type: 'error', code: prepared.code, message: prepared.message })
       }
-      const sessionId = body.sessionId ?? createId('session')
-      let session = await options.storage.getSession(sessionId, { includeEvents: false })
-      const cwd = resolveRequestCwd({
-        prompt: body.prompt,
-        requestedCwd: body.cwd,
-        sessionCwd: session?.cwd,
-        defaultCwd: options.defaultCwd,
-      })
-
-      if (!isWorkspaceAllowed(cwd)) {
-        return reply.status(400).send({
-          type: 'error',
-          code: 'INVALID_REQUEST',
-          message: `Workspace directory not allowed: ${cwd}`,
-        })
-      }
-
-      // Model capability validation
-      const configManager = ConfigManager.getInstance()
-      const settings = configManager.resolveSettings({ model: body.model })
-      const targetModelId = settings.modelId || 'local/coding-runtime'
-      try {
-        const modelDef = getModel(targetModelId)
-        if (modelDef && !modelDef.capabilities.toolCalling) {
-          return reply.status(400).send({
-            type: 'error',
-            code: 'INVALID_REQUEST',
-            message: `Model "${targetModelId}" does not support tool calling`,
-          })
-        }
-      } catch (err) {
-        if (!(err instanceof UnknownModelError)) {
-          throw err
-        }
-        // Allow unknown models to support custom models
-      }
-      const abortController = new AbortController()
-      const timeoutController = new AbortController()
-      const timeout = setTimeout(
-        () => {
-          timeoutController.abort()
-          abortController.abort()
-        },
-        body.timeoutMs ?? executeTimeoutMs,
-      )
-      if (!session) {
-        session = createSessionSnapshot(sessionId, cwd, body.prompt)
-      } else {
-        session.phase = 'executing'
-        session.cwd = cwd
-        session.updatedAt = nowIso()
-        session.lastUserInput = body.prompt
-      }
-      await options.storage.saveSession(session)
-
-      await options.storage.appendEvent(sessionId, {
-        type: 'user_message',
-        ...eventBase(sessionId),
-        text: body.prompt,
-      })
+      const { sessionId, cwd, requestId, abortController, timeoutController, timeout } = prepared
 
       const events: NexusEvent[] = []
-      const requestId = body.requestId ?? createId('req')
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -289,39 +320,12 @@ export async function createNexusApp(
           model: body.model,
           budget: body.budget,
           executionEnvironment: body.executionEnvironment,
+          allowedPaths: prepared.allowedPaths,
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
-          if (event.type === 'execution_metrics') {
-            await options.storage.saveExecutionMetrics({
-              metricId: createId('metric'),
-              sessionId,
-              executeDurationMs: event.executeDurationMs,
-              providerFirstTokenMs: event.providerFirstTokenMs,
-              providerRequestDurationMs: event.providerRequestDurationMs,
-              streamDeltaCount: event.streamDeltaCount,
-              toolCallCount: event.toolCallCount,
-              toolRoundtripDurationMs: event.toolRoundtripDurationMs,
-              contextCharsIn: event.contextCharsIn,
-              contextCharsOut: event.contextCharsOut,
-              timestamp: event.timestamp,
-            })
-            if (event.providerFirstTokenMs !== undefined) {
-              metrics.recordProviderFirstToken(event.providerFirstTokenMs)
-            }
-            if (event.providerRequestDurationMs !== undefined) {
-              metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
-            }
-            if (event.streamDeltaCount !== undefined) {
-              metrics.recordStreamDeltas(event.streamDeltaCount)
-            }
-            if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) {
-              metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
-            }
-            if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) {
-              metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
-            }
-          }
+          await persistEventMetrics(sessionId, event)
+          recordEventMetrics(event)
         }
       } finally {
         clearTimeout(timeout)
@@ -373,18 +377,18 @@ export async function createNexusApp(
     }
   })
 
-  app.get('/v1/sessions/:sessionId', async request => {
+  app.get('/v1/sessions/:sessionId', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = sessionDetailQuerySchema.parse(request.query)
     const session = await options.storage.getSession(params.sessionId, {
       includeEvents: false,
     })
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
     const eventPage =
       query.recentEventLimit > 0
@@ -404,18 +408,18 @@ export async function createNexusApp(
     }
   })
 
-  app.get('/v1/sessions/:sessionId/events', async request => {
+  app.get('/v1/sessions/:sessionId/events', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = eventListQuerySchema.parse(request.query)
     const session = await options.storage.getSession(params.sessionId, {
       includeEvents: false,
     })
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
     const page = await options.storage.listEvents(params.sessionId, query)
     return {
@@ -506,18 +510,18 @@ export async function createNexusApp(
     return analysis
   })
 
-  app.get('/v1/sessions/:sessionId/tool-traces', async request => {
+  app.get('/v1/sessions/:sessionId/tool-traces', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = toolTraceListQuerySchema.parse(request.query)
     const session = await options.storage.getSession(params.sessionId, {
       includeEvents: false,
     })
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
     const page = await options.storage.listToolTraces(params.sessionId, query)
     return {
@@ -555,11 +559,11 @@ export async function createNexusApp(
     const body = sessionInputSchema.parse(request.body)
     const session = await options.storage.getSession(params.sessionId)
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
 
     if (session.phase === 'waiting_permission') {
@@ -635,7 +639,7 @@ export async function createNexusApp(
     }
   })
 
-  app.post('/v1/sessions/:sessionId/cancel', async request => {
+  app.post('/v1/sessions/:sessionId/cancel', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const { session } = await closeNexusSession({
       storage: options.storage,
@@ -644,11 +648,11 @@ export async function createNexusApp(
       reason: 'Session cancelled',
     })
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
     return {
       type: 'session_cancelled',
@@ -656,7 +660,7 @@ export async function createNexusApp(
     }
   })
 
-  app.post('/v1/sessions/:sessionId/close', async request => {
+  app.post('/v1/sessions/:sessionId/close', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const body = z.object({
       phase: z.enum(['cancelled', 'completed', 'failed']).optional(),
@@ -669,11 +673,11 @@ export async function createNexusApp(
       reason: body.reason,
     })
     if (!session) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
         message: `Session not found: ${params.sessionId}`,
-      }
+      })
     }
     return {
       type: 'session_closed',
@@ -715,18 +719,18 @@ export async function createNexusApp(
     return { type: 'task_created', task }
   })
 
-  app.patch('/v1/sessions/:sessionId/tasks/:taskId', async request => {
+  app.patch('/v1/sessions/:sessionId/tasks/:taskId', async (request, reply) => {
     const params = z
       .object({ sessionId: z.string(), taskId: z.string() })
       .parse(request.params)
     const body = updateTaskSchema.parse(request.body)
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'TASK_NOT_FOUND',
         message: `Task not found: ${params.taskId}`,
-      }
+      })
     }
     const updated: NexusTask = {
       ...task,
@@ -740,17 +744,17 @@ export async function createNexusApp(
     }
   })
 
-  app.post('/v1/sessions/:sessionId/tasks/:taskId/claim', async request => {
+  app.post('/v1/sessions/:sessionId/tasks/:taskId/claim', async (request, reply) => {
     const params = z
       .object({ sessionId: z.string(), taskId: z.string() })
       .parse(request.params)
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'TASK_NOT_FOUND',
         message: `Task not found: ${params.taskId}`,
-      }
+      })
     }
     const updated: NexusTask = {
       ...task,
@@ -764,18 +768,18 @@ export async function createNexusApp(
     }
   })
 
-  app.post('/v1/sessions/:sessionId/tasks/:taskId/complete', async request => {
+  app.post('/v1/sessions/:sessionId/tasks/:taskId/complete', async (request, reply) => {
     const params = z
       .object({ sessionId: z.string(), taskId: z.string() })
       .parse(request.params)
     const body = z.object({ result: z.string().optional() }).parse(request.body ?? {})
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
-      return {
+      return reply.code(404).send({
         type: 'error',
         code: 'TASK_NOT_FOUND',
         message: `Task not found: ${params.taskId}`,
-      }
+      })
     }
     const updated: NexusTask = {
       ...task,
@@ -822,9 +826,8 @@ export async function createNexusApp(
 
       metrics.recordStreamStart()
       const startedAtMs = metrics.now()
-      const abortController = new AbortController()
-      const timeoutController = new AbortController()
-      socket.once('close', () => abortController.abort())
+      let abortController: AbortController | undefined
+      socket.once('close', () => abortController?.abort())
 
       let success = false
       let timedOut = false
@@ -840,82 +843,22 @@ export async function createNexusApp(
         }
 
       const body = parsed.data
-      if (body.executionEnvironment && body.executionEnvironment === 'remote') {
-        sendJson(socket, {
-          type: 'error',
-          code: 'NOT_IMPLEMENTED',
-          message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`,
-        })
+      const prepared = await prepareExecution(body)
+      if (isPrepareError(prepared)) {
+        sendJson(socket, { type: 'error', code: prepared.code, message: prepared.message })
         return
       }
-      const sessionId = body.sessionId ?? createId('session')
-      let session = await options.storage.getSession(sessionId, { includeEvents: false })
-      const cwd = resolveRequestCwd({
-        prompt: body.prompt,
-        requestedCwd: body.cwd,
-        sessionCwd: session?.cwd,
-        defaultCwd: options.defaultCwd,
-      })
-      if (!isWorkspaceAllowed(cwd)) {
-        sendJson(socket, {
-          type: 'error',
-          code: 'INVALID_REQUEST',
-          message: `Workspace directory not allowed: ${cwd}`,
-        })
-        return
-      }
+      const { sessionId, cwd, requestId } = prepared
+      abortController = prepared.abortController
+      const timeout = prepared.timeout
 
-      // Model capability validation
-      const configManager = ConfigManager.getInstance()
-      const settings = configManager.resolveSettings({ model: body.model })
-      const targetModelId = settings.modelId || 'local/coding-runtime'
-      try {
-        const modelDef = getModel(targetModelId)
-        if (modelDef && !modelDef.capabilities.toolCalling) {
-          sendJson(socket, {
-            type: 'error',
-            code: 'INVALID_REQUEST',
-            message: `Model "${targetModelId}" does not support tool calling`,
-          })
-          return
-        }
-      } catch (err) {
-        if (!(err instanceof UnknownModelError)) {
-          throw err
-        }
-        // Allow unknown models to support custom models
-      }
-      const timeout = setTimeout(
-        () => {
-          timeoutController.abort()
-          abortController.abort()
-        },
-        body.timeoutMs ?? executeTimeoutMs,
-      )
-      if (!session) {
-        session = createSessionSnapshot(sessionId, cwd, body.prompt)
-      } else {
-        session.phase = 'executing'
-        session.cwd = cwd
-        session.updatedAt = nowIso()
-        session.lastUserInput = body.prompt
-      }
-      await options.storage.saveSession(session)
-
-      await options.storage.appendEvent(sessionId, {
-        type: 'user_message',
-        ...eventBase(sessionId),
-        text: body.prompt,
-      })
-
-      const requestId = body.requestId ?? createId('req')
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
           prompt: body.prompt,
           cwd,
           signal: abortController.signal,
-          timeoutSignal: timeoutController.signal,
+          timeoutSignal: prepared.timeoutController.signal,
           maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
           bashMaxBufferBytes,
           skipPermissionCheck: body.skipPermissionCheck,
@@ -923,38 +866,11 @@ export async function createNexusApp(
           model: body.model,
           budget: body.budget,
           executionEnvironment: body.executionEnvironment,
+          allowedPaths: prepared.allowedPaths,
         })) {
           await options.storage.appendEvent(sessionId, event)
-          if (event.type === 'execution_metrics') {
-            await options.storage.saveExecutionMetrics({
-              metricId: createId('metric'),
-              sessionId,
-              executeDurationMs: event.executeDurationMs,
-              providerFirstTokenMs: event.providerFirstTokenMs,
-              providerRequestDurationMs: event.providerRequestDurationMs,
-              streamDeltaCount: event.streamDeltaCount,
-              toolCallCount: event.toolCallCount,
-              toolRoundtripDurationMs: event.toolRoundtripDurationMs,
-              contextCharsIn: event.contextCharsIn,
-              contextCharsOut: event.contextCharsOut,
-              timestamp: event.timestamp,
-            })
-            if (event.providerFirstTokenMs !== undefined) {
-              metrics.recordProviderFirstToken(event.providerFirstTokenMs)
-            }
-            if (event.providerRequestDurationMs !== undefined) {
-              metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
-            }
-            if (event.streamDeltaCount !== undefined) {
-              metrics.recordStreamDeltas(event.streamDeltaCount)
-            }
-            if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) {
-              metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
-            }
-            if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) {
-              metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
-            }
-          }
+          await persistEventMetrics(sessionId, event)
+          recordEventMetrics(event)
           if (socket.readyState !== socket.OPEN) {
             abortController.abort()
             break

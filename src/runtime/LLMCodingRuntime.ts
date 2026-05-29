@@ -1,16 +1,12 @@
 import { z } from 'zod'
 import { performance } from 'node:perf_hooks'
 import { existsSync, lstatSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, resolve } from 'node:path'
 import { errorMessage, ProviderError } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
+import { logger } from '../shared/logger.js'
 import type { AnyTool } from '../tools/Tool.js'
-import { truncateToolOutput } from '../tools/output.js'
-import {
-  formatWorkspacePathError,
-  isWorkspacePathError,
-} from '../tools/builtin/pathSafety.js'
 import type {
   NexusRuntime,
   RuntimeExecuteOptions,
@@ -49,9 +45,23 @@ import {
   mergeHookRetryHints,
 } from './hooks.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
+import {
+  createReplacementState,
+  replaceLargeToolResult,
+  enforceMessageBudget,
+} from './toolResultBudget.js'
+import {
+  buildUserIntakeGuidanceEvent,
+  shouldSuppressToolsForIntent,
+} from './intentGuidance.js'
 
+export type MapEventsToMessagesOptions = {
+  replayReasoningContent?: boolean
+}
 
 export class LLMCodingRuntime implements NexusRuntime {
+  private readFileCache = new Map<string, { mtime: number; size: number }>()
+
   constructor(
     private readonly tools: Map<string, AnyTool>,
     private toolPolicy: ToolPolicy,
@@ -121,8 +131,8 @@ export class LLMCodingRuntime implements NexusRuntime {
             limit: 1000,
           })
           previousEvents = result?.events || []
-        } catch {
-          // Fallback to empty history on storage error
+        } catch (e) {
+          logger.debug('Failed to load previous session events from storage', e)
         }
       }
 
@@ -130,13 +140,36 @@ export class LLMCodingRuntime implements NexusRuntime {
       const activeModel = options.model || settings.modelId
       const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
       const adapter = getAdapter(settings.providerId)
+      const shouldReplayReasoningContent =
+        cleanedModelId.includes('deepseek') ||
+        settings.modelId.includes('deepseek') ||
+        settings.providerId === 'deepseek' ||
+        Boolean(settings.baseUrl?.includes('deepseek'))
+      const mapEventsForProvider = (events: NexusEvent[], initialPrompt: string): ModelMessage[] =>
+        mapEventsToMessages(events, initialPrompt, {
+          replayReasoningContent: shouldReplayReasoningContent,
+        })
+
+      const intakeEvent = await buildUserIntakeGuidanceEvent({
+        adapter,
+        modelId: cleanedModelId,
+        apiKey: settings.apiKey,
+        baseUrl: settings.baseUrl,
+        sessionId: options.sessionId,
+        events: previousEvents,
+        latestPrompt: options.prompt,
+        cwd: options.cwd,
+        signal: options.signal,
+      })
+      yield intakeEvent
+      previousEvents = [...previousEvents, intakeEvent]
 
       let assembledContext = await assembleContext({
         runtimeOptions: options,
         events: previousEvents,
         modelId: cleanedModelId,
         buildSystemPrompt,
-        mapEventsToMessages,
+        mapEventsToMessages: mapEventsForProvider,
       })
       let messages = assembledContext.messages
       const toolsList = () => [...this.tools.values()]
@@ -147,10 +180,11 @@ export class LLMCodingRuntime implements NexusRuntime {
           inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         }))
       let currentToolsList = toolsList()
+      let modelVisibleTools = shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
       let contextEstimateTokens = estimateContextTokens({
         systemPrompt: assembledContext.systemPrompt,
         messages,
-        tools: currentToolsList,
+        tools: modelVisibleTools,
       }).totalTokens
       const contextWarningPercent = 70
       const contextCompactPercent = 85
@@ -190,7 +224,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             sessionId: options.sessionId,
             modelId: cleanedModelId,
             trigger: 'auto',
-            mapEventsToMessages,
+            mapEventsToMessages: mapEventsForProvider,
             initialPrompt: options.prompt,
           })
           yield compactResult.event
@@ -200,14 +234,15 @@ export class LLMCodingRuntime implements NexusRuntime {
             events: previousEvents,
             modelId: cleanedModelId,
             buildSystemPrompt,
-            mapEventsToMessages,
+            mapEventsToMessages: mapEventsForProvider,
           })
           messages = assembledContext.messages
           currentToolsList = toolsList()
+          modelVisibleTools = shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
           contextEstimateTokens = estimateContextTokens({
             systemPrompt: assembledContext.systemPrompt,
             messages,
-            tools: currentToolsList,
+            tools: modelVisibleTools,
           }).totalTokens
           contextWindowState = getContextWindowState({
             tokenEstimate: contextEstimateTokens,
@@ -239,7 +274,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             sessionId: options.sessionId,
             modelId: cleanedModelId,
             trigger: 'reactive',
-            mapEventsToMessages,
+            mapEventsToMessages: mapEventsForProvider,
             initialPrompt: options.prompt,
           })
           yield compactResult.event
@@ -249,14 +284,15 @@ export class LLMCodingRuntime implements NexusRuntime {
             events: previousEvents,
             modelId: cleanedModelId,
             buildSystemPrompt,
-            mapEventsToMessages,
+            mapEventsToMessages: mapEventsForProvider,
           })
           messages = assembledContext.messages
           currentToolsList = toolsList()
+          modelVisibleTools = shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
           contextEstimateTokens = estimateContextTokens({
             systemPrompt: assembledContext.systemPrompt,
             messages,
-            tools: currentToolsList,
+            tools: modelVisibleTools,
           }).totalTokens
           contextWindowState = getContextWindowState({
             tokenEstimate: contextEstimateTokens,
@@ -325,6 +361,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       const MAX_OUTPUT_RETRIES = 2
       const MAX_TOKEN_RECOVERIES = 3
       let maxTokenRecoveryCount = 0
+      const replacementState = createReplacementState()
 
       while (loopCount < maxLoops) {
         loopCount++
@@ -333,12 +370,15 @@ export class LLMCodingRuntime implements NexusRuntime {
           throw new Error('Aborted')
         }
 
+        messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd)
+
         currentToolsList = toolsList()
+        modelVisibleTools = shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
         const turnContextWindowState = getContextWindowState({
           tokenEstimate: estimateContextTokens({
             systemPrompt: assembledContext.systemPrompt,
             messages,
-            tools: currentToolsList,
+            tools: modelVisibleTools,
           }).totalTokens,
           maxTokens: assembledContext.budget.maxTokens,
           warningPercent: contextWarningPercent,
@@ -399,12 +439,24 @@ export class LLMCodingRuntime implements NexusRuntime {
         }
         contextCharsIn += turnCharsIn
 
+        const executionStateBlock = buildExecutionState({
+          loopCount,
+          maxLoops,
+          readFileCache: this.readFileCache,
+          toolCallCount,
+          contextTokenEstimate: turnContextWindowState.tokenEstimate,
+          contextMaxTokens: turnContextWindowState.maxTokens,
+        })
+
         const queryParams: ModelQueryParams = {
           model: cleanedModelId,
           systemPrompt: assembledContext.systemPrompt,
-          systemPromptBlocks: assembledContext.systemPromptBlocks,
+          systemPromptBlocks: [
+            ...(assembledContext.systemPromptBlocks ?? []),
+            { text: executionStateBlock, cacheable: false },
+          ],
           messages: normalizeMessages(messages),
-          tools: currentToolsList,
+          tools: modelVisibleTools,
           enablePromptCaching: settings.providerId === 'anthropic',
           ...(thinkingBudget &&
             thinkingBudget > 0 && {
@@ -419,6 +471,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         }
 
         let currentAssistantText = ''
+        let currentReasoningText = ''
         let currentFinishReason: string | undefined
         const currentToolCalls: {
           id: string
@@ -461,6 +514,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             }
             streamDeltaCount += 1
             contextCharsOut += delta.text.length
+            currentReasoningText += delta.text
             yield {
               type: 'thinking_delta',
               ...eventBase(options.sessionId),
@@ -542,6 +596,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         messages.push({
           role: 'assistant',
           content: assistantContent.length > 0 ? assistantContent : currentAssistantText,
+          ...(currentReasoningText.trim() && { reasoningContent: currentReasoningText }),
         })
 
         // If no tool call was issued, we yield the final result and terminate loop
@@ -606,9 +661,6 @@ export class LLMCodingRuntime implements NexusRuntime {
 
         // Execute requested tools
         const toolResultsContent: ContentBlock[] = []
-        const toolResultBudgetChars = assembledContext.budget.maxChars * 0.3
-        let toolResultUsedChars = 0
-        let toolBudgetExceeded = false
         for (const tc of currentToolCalls) {
           let resolvedInput = tc.input
           if (resolvedInput === undefined && tc.partialInput) {
@@ -617,24 +669,6 @@ export class LLMCodingRuntime implements NexusRuntime {
             } catch {
               resolvedInput = {}
             }
-          }
-
-          if (toolBudgetExceeded) {
-            toolResultsContent.push({
-              type: 'tool_result',
-              toolUseId: tc.id,
-              content: `[Tool result skipped: per-turn tool output budget exceeded (${Math.round(toolResultBudgetChars / 1024)}KB). The tool ${tc.name} was not executed. Proceed with the results already available.]`,
-              isError: true,
-            })
-            yield {
-              type: 'tool_completed',
-              ...eventBase(options.sessionId),
-              toolUseId: tc.id,
-              name: tc.name,
-              success: false,
-              output: { code: 'TURN_BUDGET_EXCEEDED', message: 'Per-turn tool output budget exceeded' },
-            }
-            continue
           }
 
           if (resolvedInput && typeof resolvedInput === 'object' && '_parseError' in (resolvedInput as Record<string, unknown>)) {
@@ -911,8 +945,34 @@ export class LLMCodingRuntime implements NexusRuntime {
 
           toolCallCount += 1
           const toolStartMs = performance.now()
-          const result = await executeToolSafely(tool, parsed.data, options)
+
+          if (tool.name === 'Read' && parsed.data && typeof parsed.data === 'object' && 'path' in parsed.data) {
+            const readPath = resolve(options.cwd, String((parsed.data as { path: string }).path))
+            const cached = this.readFileCache.get(readPath)
+            if (cached) {
+              try {
+                const stat = lstatSync(readPath)
+                if (stat.mtimeMs === cached.mtime) {
+                  totalToolDurationMs += performance.now() - toolStartMs
+                  const stubMsg = 'File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.'
+                  yield { type: 'tool_completed', ...eventBase(options.sessionId), toolUseId: tc.id, name: tool.name, success: true, output: stubMsg }
+                  toolResultsContent.push({ type: 'tool_result', toolUseId: tc.id, content: stubMsg, isError: false })
+                  continue
+                }
+              } catch {}
+            }
+          }
+
+          const result = await executeToolSafely(tool, parsed.data, options, { timeout: TOOL_EXECUTION_TIMEOUT_MS })
           totalToolDurationMs += performance.now() - toolStartMs
+
+          if (tool.name === 'Read' && result.kind === 'result' && result.success && parsed.data && typeof parsed.data === 'object' && 'path' in parsed.data) {
+            const readPath = resolve(options.cwd, String((parsed.data as { path: string }).path))
+            try {
+              const stat = lstatSync(readPath)
+              this.readFileCache.set(readPath, { mtime: stat.mtimeMs, size: stat.size })
+            } catch {}
+          }
           if (result.kind === 'error') {
             yield {
               type: 'error',
@@ -964,25 +1024,19 @@ export class LLMCodingRuntime implements NexusRuntime {
           const contentWithHints = result.success
             ? blockContent
             : mergeHookRetryHints(blockContent, postToolHooks)
-          toolResultUsedChars += contentWithHints.length
-          if (toolResultUsedChars > toolResultBudgetChars) {
-            const truncated = contentWithHints.slice(0, Math.max(0, contentWithHints.length - (toolResultUsedChars - toolResultBudgetChars)))
-            const truncatedContent = truncated + `\n\n[Per-turn budget exceeded: ${Math.round(toolResultUsedChars / 1024)}KB/${Math.round(toolResultBudgetChars / 1024)}KB. Subsequent tool calls in this turn will be skipped.]`
-            toolResultsContent.push({
-              type: 'tool_result',
-              toolUseId: tc.id,
-              content: truncatedContent,
-              isError: !result.success,
-            })
-            toolBudgetExceeded = true
-          } else {
-            toolResultsContent.push({
-              type: 'tool_result',
-              toolUseId: tc.id,
-              content: contentWithHints,
-              isError: !result.success,
-            })
-          }
+          const finalContent = await replaceLargeToolResult({
+            content: contentWithHints,
+            toolUseId: tc.id,
+            toolName: tool.name,
+            sessionId: options.sessionId,
+            cwd: options.cwd,
+          })
+          toolResultsContent.push({
+            type: 'tool_result',
+            toolUseId: tc.id,
+            content: finalContent,
+            isError: !result.success,
+          })
         }
 
         // Record tool results as a single user message
@@ -1060,105 +1114,10 @@ function createContextWarningEvent(options: {
   }
 }
 
-const TOOL_EXECUTION_TIMEOUT_MS = 120_000
-
-async function executeToolSafely(
-  tool: AnyTool,
-  input: unknown,
-  options: RuntimeExecuteOptions,
-): Promise<
-  | {
-      kind: 'result'
-      success: boolean
-      output: unknown
-      truncated?: boolean
-      originalBytes?: number
-    }
-  | { kind: 'error'; code: string; message: string; details?: unknown }
-> {
-  const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), TOOL_EXECUTION_TIMEOUT_MS)
-  const onParentAbort = () => controller.abort()
-  options.signal?.addEventListener('abort', onParentAbort)
-
-  try {
-    const result = await tool.execute(input, {
-      cwd: options.cwd,
-      sessionId: options.sessionId,
-      signal: controller.signal,
-      maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
-      bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
-      executionEnvironment: options.executionEnvironment,
-    })
-    const truncated = truncateToolOutput(
-      result.output,
-      options.maxToolOutputBytes ?? 200_000,
-    )
-    return {
-      kind: 'result',
-      success: result.success,
-      output: truncated.value,
-      truncated: truncated.truncated || undefined,
-      originalBytes: truncated.originalBytes,
-    }
-  } catch (error) {
-    if (options.signal?.aborted || controller.signal.aborted) {
-      const isTimeout = !options.signal?.aborted && controller.signal.aborted
-      return {
-        kind: 'error',
-        code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
-        message: isTimeout
-          ? `Tool ${tool.name} timed out after ${TOOL_EXECUTION_TIMEOUT_MS}ms.`
-          : `Execution cancelled while running ${tool.name}.`,
-      }
-    }
-    if (isWorkspacePathError(error)) {
-      return {
-        kind: 'result',
-        success: false,
-        output: {
-          code: error.code,
-          message: formatWorkspacePathError(error),
-          requestedPath: error.requestedPath,
-          cwd: error.cwd,
-          resolvedPath: error.resolvedPath,
-        },
-      }
-    }
-    return {
-      kind: 'error',
-      code: 'TOOL_ERROR',
-      message: errorMessage(error),
-      details: normalizeToolErrorDetails(error, options.maxToolOutputBytes ?? 200_000),
-    }
-  } finally {
-    clearTimeout(timer)
-    options.signal?.removeEventListener('abort', onParentAbort)
-  }
-}
-
-function normalizeToolErrorDetails(error: unknown, maxBytes: number): unknown {
-  if (!error || typeof error !== 'object') return undefined
-  const record = error as Record<string, unknown>
-  const details: Record<string, unknown> = {}
-
-  if (record.code !== undefined) details.code = record.code
-  if (record.signal !== undefined) details.signal = record.signal
-  if (record.exitCode !== undefined) details.exitCode = record.exitCode
-
-  for (const streamName of ['stdout', 'stderr'] as const) {
-    const value = record[streamName]
-    if (typeof value !== 'string' || value.length === 0) continue
-    const truncated = truncateToolOutput(value, maxBytes)
-    details[streamName] = truncated.value
-    if (truncated.truncated) {
-      details[`${streamName}Truncated`] = true
-      details[`${streamName}OriginalBytes`] = truncated.originalBytes
-    }
-  }
-
-  return Object.keys(details).length > 0 ? details : undefined
-}
+import {
+  executeToolSafely,
+  TOOL_EXECUTION_TIMEOUT_MS,
+} from './toolExecutor.js'
 
 export function buildSystemPrompt(
   options: RuntimeExecuteOptions,
@@ -1180,6 +1139,36 @@ export function buildSystemPrompt(
 // extractAbsolutePaths is now exported from systemPromptBuilder.ts
 // Re-export for backward compatibility
 export { extractAbsolutePaths } from './systemPromptBuilder.js'
+
+function buildExecutionState(state: {
+  loopCount: number
+  maxLoops: number
+  readFileCache: Map<string, { mtime: number; size: number }>
+  toolCallCount: number
+  contextTokenEstimate: number
+  contextMaxTokens: number
+}): string {
+  const filesRead = [...state.readFileCache.keys()]
+  const remaining = state.maxLoops - state.loopCount
+  const pctUsed = state.contextMaxTokens > 0 ? Math.round(state.contextTokenEstimate / state.contextMaxTokens * 100) : 0
+  let phase = 'gathering'
+  if (remaining <= 3) phase = 'must_respond'
+  else if (state.toolCallCount >= 10) phase = 'synthesize'
+
+  const lines = [
+    `## Execution State (iteration ${state.loopCount}/${state.maxLoops})`,
+    `- Files read: ${filesRead.length > 0 ? filesRead.join(', ') : 'none'}`,
+    `- Tool calls: ${state.toolCallCount} | Remaining iterations: ${remaining}`,
+    `- Context: ${Math.round(state.contextTokenEstimate / 1000)}K/${Math.round(state.contextMaxTokens / 1000)}K tokens (${pctUsed}%)`,
+    `- Phase: ${phase}`,
+  ]
+  if (phase === 'synthesize') {
+    lines.push('  → Present your findings now. Only read more if critical information is missing.')
+  } else if (phase === 'must_respond') {
+    lines.push('  → You MUST produce your final answer immediately. No more tool calls.')
+  }
+  return lines.join('\n')
+}
 
 function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
   const paths = extractAbsolutePaths(prompt)
@@ -1211,6 +1200,7 @@ function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
 export function mapEventsToMessages(
   events: NexusEvent[],
   initialPrompt: string,
+  options: MapEventsToMessagesOptions = {},
 ): ModelMessage[] {
   const messages: ModelMessage[] = []
 
@@ -1231,11 +1221,13 @@ export function mapEventsToMessages(
 
   let pendingToolResultMsg: ModelMessage | null = null
   let pendingToolAssistantMsg: ModelMessage | null = null
+  let pendingReasoningContent = ''
 
   for (const event of events) {
     if (event.type === 'user_message') {
       pendingToolResultMsg = null
       pendingToolAssistantMsg = null
+      pendingReasoningContent = ''
       const lastMsg = messages[messages.length - 1]
       if (
         lastMsg?.role === 'user' &&
@@ -1250,7 +1242,14 @@ export function mapEventsToMessages(
       pendingToolAssistantMsg = null
       let lastMsg = messages[messages.length - 1]
       if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = { role: 'assistant', content: '', reasoningContent: '' }
+        lastMsg = {
+          role: 'assistant',
+          content: '',
+          ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
+            reasoningContent: pendingReasoningContent,
+          }),
+        }
+        pendingReasoningContent = ''
         messages.push(lastMsg)
       }
       if (typeof lastMsg.content === 'string') {
@@ -1264,16 +1263,32 @@ export function mapEventsToMessages(
         }
       }
     } else if (event.type === 'thinking_delta') {
-      // Keep thinking_delta in the event log for UI/history, but do not replay
-      // prior hidden reasoning into future provider calls. Some providers treat
-      // reasoningContent as live context, which can pollute follow-up turns.
+      if (!options.replayReasoningContent) {
+        // Keep thinking_delta in the event log for UI/history, but do not replay
+        // prior hidden reasoning into future provider calls. Some providers treat
+        // reasoningContent as live context, which can pollute follow-up turns.
+        continue
+      }
+      const lastMsg = messages[messages.length - 1]
+      if (!lastMsg || lastMsg.role !== 'assistant') {
+        pendingReasoningContent += event.text
+        continue
+      }
+      lastMsg.reasoningContent = `${lastMsg.reasoningContent ?? ''}${event.text}`
       continue
     } else if (event.type === 'tool_started') {
       let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
       if (!lastMsg) {
         lastMsg = messages[messages.length - 1]
         if (!lastMsg || lastMsg.role !== 'assistant' || !isToolCompatibleAssistantMessage(lastMsg)) {
-          lastMsg = { role: 'assistant', content: [] }
+          lastMsg = {
+            role: 'assistant',
+            content: [],
+            ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
+              reasoningContent: pendingReasoningContent,
+            }),
+          }
+          pendingReasoningContent = ''
           messages.push(lastMsg)
         } else if (typeof lastMsg.content === 'string') {
           lastMsg.content = lastMsg.content ? [{ type: 'text', text: lastMsg.content }] : []

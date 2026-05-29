@@ -47,6 +47,7 @@ export type ContextAnalysis = {
     afterEventCount?: number
   }
   postCompactState: AssembledContext['postCompactState']
+  userIntentGuidance: AssembledContext['userIntentGuidance']
   recommendations: string[]
 }
 
@@ -122,6 +123,7 @@ export async function analyzeContext(options: {
     },
     compact,
     postCompactState: assembled.postCompactState,
+    userIntentGuidance: assembled.userIntentGuidance,
     recommendations: buildContextRecommendations(window, compact.hasBoundary),
   }
 }

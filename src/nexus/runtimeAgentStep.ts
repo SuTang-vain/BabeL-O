@@ -5,6 +5,7 @@ import type { AgentStepRunner } from './agentLoop.js'
 import type { NexusEvent } from '../shared/events.js'
 import { recordTaskSessionNexusEvent } from './taskSession.js'
 import { ConfigManager } from '../shared/config.js'
+import { logger } from '../shared/logger.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { allowlistedTools, type ToolPolicy } from '../runtime/LocalCodingRuntime.js'
 
@@ -363,7 +364,10 @@ async function tryParseWithRepair(context: {
         )
       }
 
-      // Log repair attempt and continue to next iteration
+      logger.debug(`Structured output repair attempt ${attempt} for ${context.roleDefinition.role}`, {
+        error: err instanceof Error ? err.message : String(err),
+        diagnostics,
+      })
     }
   }
 
@@ -1120,7 +1124,7 @@ function zodToJsonSchemaShape(schema: z.ZodTypeAny): unknown {
     }
   }
   if (definition.typeName === 'ZodUnknown' || definition.typeName === 'ZodAny') {
-    return {}
+    return { type: 'object' }
   }
   if (definition.typeName === 'ZodRecord') {
     return {
@@ -1149,7 +1153,7 @@ function zodToJsonSchemaShape(schema: z.ZodTypeAny): unknown {
     }
   }
 
-  return {}
+  return { type: 'object' }
 }
 
 function tryParseJsonLike(text: string): unknown | undefined {

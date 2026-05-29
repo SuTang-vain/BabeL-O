@@ -16,7 +16,7 @@ export const writeTool: ToolDefinition<typeof inputSchema> = {
   risk: 'write',
   inputSchema,
   async execute(input, context) {
-    const path = resolveInsideWorkspace(context.cwd, input.path)
+    const path = resolveInsideWorkspace(context.cwd, input.path, context.allowedPaths)
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, input.content, 'utf8')
     return {

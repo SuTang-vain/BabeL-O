@@ -234,10 +234,15 @@ test('resolveInsideWorkspace keeps inside paths and rejects workspace escapes', 
   assert.equal(resolveInsideWorkspace(cwd, join(dotPrefixDir, 'note.md')), join(dotPrefixDir, 'note.md'))
 
   const outsidePath = join(tmpdir(), `babel-o-outside-${Date.now()}.json`)
-  assert.throws(
-    () => resolveInsideWorkspace(cwd, outsidePath),
-    error => isWorkspacePathError(error),
-  )
+  process.env.NEXUS_ALLOWED_WORKSPACES = cwd
+  try {
+    assert.throws(
+      () => resolveInsideWorkspace(cwd, outsidePath),
+      error => isWorkspacePathError(error),
+    )
+  } finally {
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
+  }
 })
 
 test('Deny-by-default blocks high risk tools unless allowed', async () => {

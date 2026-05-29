@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import type { NexusStorage } from '../storage/Storage.js'
 
 export type ToolContext = {
   cwd: string
@@ -7,6 +8,8 @@ export type ToolContext = {
   maxOutputBytes: number
   bashMaxBufferBytes: number
   executionEnvironment?: 'local' | 'docker' | 'remote'
+  storage?: NexusStorage
+  allowedPaths?: string[]
 }
 
 export type ToolResult = {

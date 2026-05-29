@@ -4,13 +4,18 @@ import type { ModelMessage, SystemPromptBlock } from '../providers/adapters/Mode
 import { getModel } from '../providers/registry.js'
 import { snipEventsWithTurnBoundary } from './compactors/snipCompactor.js'
 import { loadProjectMemory } from './memory.js'
-import { buildSystemPromptSections, extractAbsolutePaths } from './systemPromptBuilder.js'
+import { buildSystemPromptSections } from './systemPromptBuilder.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
 import { loadAgentMdFiles } from './agentMdLoader.js'
 import { collectGitContext } from './gitContext.js'
 import { loadAllSkills } from '../skills/loader.js'
 import { matchSkills } from '../skills/matcher.js'
 import type { Skill } from '../skills/loader.js'
+import {
+  deriveUserIntentGuidance,
+  formatUserIntentGuidance,
+  type UserIntentGuidance,
+} from './intentGuidance.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -58,6 +63,7 @@ export type AssembledContext = {
   compactRetainedSegmentValid: boolean
   compactRetainedSegmentWarning: string
   postCompactState: PostCompactState
+  userIntentGuidance: UserIntentGuidance
   memoryTruncated: boolean
   microcompactedEventCount: number
 }
@@ -107,6 +113,7 @@ export function truncateMemoryContent(raw: string): MemoryTruncation {
 
 export type PostCompactState = {
   recentReadFiles: string[]
+  restoredFileContents: { path: string; content: string }[]
   activeToolNames: string[]
   activeSkills: string[]
   taskStatusLines: string[]
@@ -160,6 +167,11 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const compactAwareEvents = compactBoundary && retainedSegmentCheck.valid
     ? [...retainedBoundaryEvents, ...options.events.slice(compactBoundary.index + 1)]
     : options.events
+  const userIntentGuidance = deriveUserIntentGuidance({
+    events: compactAwareEvents,
+    latestPrompt: options.runtimeOptions.prompt,
+    cwd: options.runtimeOptions.cwd,
+  })
   const selectedEvents = protectToolPairs(
     compactAwareEvents,
     selectRecentEvents(compactAwareEvents, budget),
@@ -236,6 +248,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     activeSkills: budgetedActiveSkills.trim() || undefined,
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
+    userIntentGuidance: formatUserIntentGuidance(userIntentGuidance),
     prompt: options.runtimeOptions.prompt,
   })
   const systemPromptBlocks: SystemPromptBlock[] = sections.map(s => ({
@@ -260,6 +273,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     compactRetainedSegmentValid: retainedSegmentCheck.valid,
     compactRetainedSegmentWarning: retainedSegmentCheck.warning,
     postCompactState,
+    userIntentGuidance,
     memoryTruncated: memoryTruncation.wasLineTruncated || memoryTruncation.wasByteTruncated,
     microcompactedEventCount: selectedEvents.filter((event, index) => {
       const micro = microcompactedEvents[index]
@@ -348,6 +362,8 @@ function eventContentFingerprint(event: NexusEvent): string {
   switch (event.type) {
     case 'user_message':
       return hashString(event.text)
+    case 'user_intake_guidance':
+      return hashString(`${event.userText}:${event.intent}:${event.actionHint}:${event.requiresTools}:${event.source}:${event.guidance}`)
     case 'assistant_delta':
     case 'thinking_delta':
       return hashString(event.text)
@@ -446,18 +462,6 @@ export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget):
       userMsgIdxs.push(idx)
     }
   }
-  const latestUserIdx = userMsgIdxs.at(-1)
-  const latestUser = latestUserIdx === undefined
-    ? undefined
-    : effectiveEvents[latestUserIdx]
-  if (
-    latestUserIdx !== undefined &&
-    latestUser?.type === 'user_message' &&
-    shouldStartFromLatestUserPrompt(latestUser.text)
-  ) {
-    return trimSelectedWindow(effectiveEvents.slice(latestUserIdx), maxEvents)
-  }
-
   let keptTurns = 0
   let startIdx = effectiveEvents.length
   for (let t = userMsgIdxs.length - 1; t >= 0; t--) {
@@ -478,32 +482,6 @@ function trimSelectedWindow(events: NexusEvent[], maxEvents: number): NexusEvent
   const head = events[0]!
   const tail = events.slice(events.length - (maxEvents - 1))
   return [head, ...tail]
-}
-
-function shouldStartFromLatestUserPrompt(text: string): boolean {
-  if (isConversationalPivotPrompt(text)) return true
-  if (isCorrectionPivotPrompt(text)) return true
-  if (extractAbsolutePaths(text).length === 0) return false
-  return !isComparisonPrompt(text)
-}
-
-function isConversationalPivotPrompt(text: string): boolean {
-  const normalized = text.trim().toLowerCase()
-  if (/^(hi|hello|hey|你好|您好)[？?!.。！\s]*$/iu.test(normalized)) return true
-  if (/^(你)?还在吗[？?!.。！\s]*$/u.test(normalized)) return true
-  if (/你.*(在干什么|正在干什么|还记得|知道我.*问|感知我.*问|听得懂).*[？?!.。！]*$/u.test(normalized)) {
-    return true
-  }
-  return false
-}
-
-function isComparisonPrompt(text: string): boolean {
-  return /(横向|对比|比较|compare|comparison|versus|\bvs\b)/iu.test(text)
-}
-
-function isCorrectionPivotPrompt(text: string): boolean {
-  const normalized = text.trim().toLowerCase()
-  return /(?:让你|要你|我说的|说的是|分析的就是|看的就是|不是.*是|不是.*而是|actually|i mean)/iu.test(normalized)
 }
 
 export function protectToolPairs(events: NexusEvent[], selected: NexusEvent[]): NexusEvent[] {
@@ -572,6 +550,7 @@ function truncateToBudget(text: string, maxChars: number): string {
 
 export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skill[]): PostCompactState {
   const recentReadFiles: string[] = []
+  const restoredFileContents: { path: string; content: string }[] = []
   const seenFiles = new Set<string>()
   const activeToolNames: string[] = []
   const seenTools = new Set<string>()
@@ -585,6 +564,17 @@ export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skil
       if (name && !seenTools.has(name)) {
         seenTools.add(name)
         activeToolNames.unshift(name)
+      }
+      if (name === 'Read' && restoredFileContents.length < 5) {
+        const output = (event as { output?: unknown }).output
+        if (typeof output === 'string' && output.length > 0 && output.length <= 5000) {
+          const toolUseId = (event as { toolUseId?: string }).toolUseId
+          const startedEvent = events.find(e => e.type === 'tool_started' && (e as { toolUseId?: string }).toolUseId === toolUseId) as { input?: { path?: string } } | undefined
+          const path = startedEvent?.input?.path
+          if (path && !seenFiles.has(path)) {
+            restoredFileContents.unshift({ path, content: output })
+          }
+        }
       }
     }
     if (event.type === 'tool_started') {
@@ -620,6 +610,7 @@ export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skil
 
   return {
     recentReadFiles: recentReadFiles.slice(0, 10),
+    restoredFileContents,
     activeToolNames: activeToolNames.slice(0, 10),
     activeSkills: matchedSkills.map(s => s.id),
     taskStatusLines: taskStatusLines.slice(0, 10),
@@ -644,6 +635,10 @@ function formatPostCompactState(state: PostCompactState): string {
   if (state.hookLines.length > 0) {
     parts.push(`Hook activity:\n${state.hookLines.join('\n')}`)
   }
+  if (state.restoredFileContents.length > 0) {
+    const fileBlocks = state.restoredFileContents.map(f => `### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n')
+    parts.push(`## Restored File Contents (from pre-compact reads)\n${fileBlocks}`)
+  }
   return parts.length > 0 ? `## Post-Compact State\n${parts.join('\n')}` : ''
 }
 
@@ -651,8 +646,10 @@ function buildCompactCapabilityReminder(state: PostCompactState): string {
   const lines: string[] = []
   lines.push('## Compact Capability Reminder')
   lines.push('The conversation above has been compacted. The summary above captures the key context.')
-  if (state.recentReadFiles.length > 0) {
-    lines.push(`You have recently read files: ${state.recentReadFiles.join(', ')}. You may need to re-read them before making further edits.`)
+  if (state.restoredFileContents.length > 0) {
+    lines.push(`File contents restored above for ${state.restoredFileContents.length} file(s). Only re-read if you need to verify changes since then.`)
+  } else if (state.recentReadFiles.length > 0) {
+    lines.push(`Previously read files: ${state.recentReadFiles.join(', ')}. Contents were too large to restore — re-read only the specific sections you need.`)
   }
   if (state.taskStatusLines.length > 0) {
     lines.push('The task list above shows current progress. Continue working on incomplete items.')

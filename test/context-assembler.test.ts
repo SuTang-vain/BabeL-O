@@ -237,6 +237,58 @@ test('selectRecentEvents caps selected user turns to the event budget', () => {
   assert.doesNotMatch(JSON.stringify(selected), /BabeL-O analysis fragment 0/)
 })
 
+test('selectRecentEvents keeps recent turns for explicit path prompts; intent guidance owns focus changes', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'older project analysis',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:01.000Z',
+      text: 'stale analysis',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:02.000Z',
+      text: '/Users/tangyaoyue/DEV/BABEL/BabeL-O /Users/tangyaoyue/DEV/BABEL/BabeL-X深入分析横向对比这两个项目',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:03.000Z',
+      text: 'older comparison draft',
+    },
+  ]
+
+  const selected = selectRecentEvents(events, {
+    maxTokens: 100,
+    maxChars: 400,
+    layerBudgets: { system: 10, memory: 10, summary: 10, recent: 70 },
+    snipToolOutputChars: 100,
+    snipPriorTurnToolOutputChars: 30,
+    microcompactToolOutputChars: 500,
+    microcompactInternalTextChars: 200,
+    recentEventLimit: 20,
+    recentTurnLimit: 2,
+  })
+
+  assert.equal(selected[0].type, 'user_message')
+  assert.equal(
+    (selected[0] as Extract<NexusEvent, { type: 'user_message' }>).text,
+    'older project analysis',
+  )
+  assert.match(JSON.stringify(selected), /stale analysis/)
+})
+
 test('selectOmittedEvents uses stable event identity after cloning', () => {
   const events: NexusEvent[] = [
     {
@@ -843,7 +895,7 @@ test('assembleContext rebuilds lightweight post-compact state', async () => {
   assert.match(context.sessionSummary, /Post-Compact State/)
   assert.match(context.sessionSummary, /Compact Capability Reminder/)
   assert.match(context.sessionSummary, /tool_use and tool_result pairs must remain matched/)
-  assert.match(context.systemPrompt, /recently read files/i)
+  assert.match(context.systemPrompt, /previously read files|file contents restored/i)
 })
 
 test('analyzeContext returns token and compact diagnostics', async () => {
@@ -1166,7 +1218,7 @@ test('assembleContext starts fresh after a cancelled or timed out long task', as
   assert.match(context.systemPrompt, /REQUEST_CANCELLED|cancelled/i)
 })
 
-test('assembleContext treats short greetings and status questions as a new pivot', async () => {
+test('assembleContext treats short greetings as intent guidance without dropping prior context', async () => {
   const cwd = join(tmpdir(), `babel-o-short-pivot-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -1236,11 +1288,14 @@ test('assembleContext treats short greetings and status questions as a new pivot
   })
 
   const messagesText = JSON.stringify(context.messages)
-  assert.deepEqual(context.messages, [{ role: 'user', content: '你好？' }])
-  assert.doesNotMatch(messagesText, /Baidu old output|Baidu project summary/)
+  assert.match(messagesText, /你好？/)
+  assert.match(messagesText, /Baidu old output|Baidu project summary/)
+  assert.equal(context.userIntentGuidance.intent, 'greeting')
+  assert.equal(context.userIntentGuidance.actionHint, 'respond_only')
+  assert.match(context.systemPrompt, /User Intake Guidance/)
 })
 
-test('assembleContext treats user correction prompts as a new pivot', async () => {
+test('assembleContext treats user correction prompts as high-priority intent guidance', async () => {
   const cwd = join(tmpdir(), `babel-o-correction-pivot-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -1287,8 +1342,130 @@ test('assembleContext treats user correction prompts as a new pivot', async () =
   })
 
   const messagesText = JSON.stringify(context.messages)
-  assert.deepEqual(context.messages, [{ role: 'user', content: '呃让你分析的就是babel-X项目' }])
-  assert.doesNotMatch(messagesText, /BabeL-O runtime analysis|BabeL-O analysis done/)
+  assert.match(messagesText, /呃让你分析的就是babel-X项目/)
+  assert.match(messagesText, /BabeL-O runtime analysis|BabeL-O analysis done/)
+  assert.equal(context.userIntentGuidance.intent, 'correction')
+  assert.equal(context.userIntentGuidance.actionHint, 'prioritize_latest')
+  assert.match(context.systemPrompt, /prioritize the latest user message as the active task/i)
+})
+
+test('assembleContext keeps prior project context for malformed greeting like session_321c48be', async () => {
+  const cwd = join(tmpdir(), `babel-o-session-321c48be-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:46:27.394Z',
+      text: '/Users/tangyaoyue/DEV/Baidu check this profile, list what you can see in it',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:46:29.865Z',
+      toolUseId: 'baidu-ls',
+      name: 'Bash',
+      input: { command: 'ls -la /Users/tangyaoyue/DEV/Baidu' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:46:29.964Z',
+      toolUseId: 'baidu-ls',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'Baidu directory listing with KeDU and app-bvh8xpidhpfl' },
+    },
+    {
+      type: 'result',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:47:04.339Z',
+      success: true,
+      message: 'Baidu summary complete.',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:48:44.508Z',
+      text: 'hi`',
+    },
+  ]
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: 'hi`',
+      cwd,
+    },
+    events,
+    modelId: 'deepseek/deepseek-v4-pro',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  const messagesText = JSON.stringify(context.messages)
+  assert.match(messagesText, /Baidu directory listing|Baidu summary complete/)
+  assert.equal(context.userIntentGuidance.intent, 'greeting')
+  assert.equal(context.userIntentGuidance.actionHint, 'respond_only')
+})
+
+test('assembleContext converts pause requests into respond-only intent guidance', async () => {
+  const cwd = join(tmpdir(), `babel-o-pause-guidance-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:48:44.508Z',
+      text: 'can you give a connection analysis of these project?',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:48:47.460Z',
+      toolUseId: 'old-ls',
+      name: 'Bash',
+      input: { command: 'ls -la /Users/tangyaoyue/DEV/Baidu' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:48:47.559Z',
+      toolUseId: 'old-ls',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'previous project listing' },
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-29T01:49:32.088Z',
+      text: 'just stop it and waite for me other require',
+    },
+  ]
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: 'just stop it and waite for me other require',
+      cwd,
+    },
+    events,
+    modelId: 'deepseek/deepseek-v4-pro',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.equal(context.userIntentGuidance.intent, 'pause')
+  assert.equal(context.userIntentGuidance.actionHint, 'respond_only')
+  assert.match(context.systemPrompt, /Do not start tool calls/)
 })
 
 test('buildSystemPrompt anchors explicit absolute paths from the current request', async () => {
@@ -1311,7 +1488,7 @@ test('buildSystemPrompt anchors explicit absolute paths from the current request
   const explicitPathBlock = systemPrompt.match(/Explicit paths in current request:\n(?<block>(?:- .+\n)+)/)?.groups?.block ?? ''
   assert.doesNotMatch(explicitPathBlock, new RegExp(escapeRegExp(`${explicitTarget}横向`)))
   assert.match(systemPrompt, /authoritative task targets/)
-  assert.match(systemPrompt, /inspect that explicit path first/)
+  assert.match(systemPrompt, /inspect the explicit path\(s\) from the current message first/)
 })
 
 test('extractAbsolutePaths does not collapse missing file paths to an existing parent directory', async () => {

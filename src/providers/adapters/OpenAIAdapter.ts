@@ -54,10 +54,7 @@ export class OpenAIAdapter implements ModelAdapter {
 
     for (const msg of params.messages) {
       if (typeof msg.content === 'string') {
-        let reasoning = msg.reasoningContent || undefined
-        if (requiresReasoning && !reasoning && msg.role === 'assistant') {
-          reasoning = '(reasoning omitted)'
-        }
+        const reasoning = msg.reasoningContent?.trim() || undefined
         openaiMessages.push({
           role: msg.role,
           content: msg.content,
@@ -97,10 +94,7 @@ export class OpenAIAdapter implements ModelAdapter {
             },
           }))
 
-          let reasoning = msg.reasoningContent || undefined
-          if (requiresReasoning && !reasoning && msg.role === 'assistant') {
-            reasoning = '(reasoning omitted)'
-          }
+          const reasoning = msg.reasoningContent?.trim() || undefined
 
           openaiMessages.push({
             role: msg.role,

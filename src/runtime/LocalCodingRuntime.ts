@@ -1,14 +1,8 @@
 import { z } from 'zod'
 import { performance } from 'node:perf_hooks'
-import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
-import { truncateToolOutput } from '../tools/output.js'
-import {
-  formatWorkspacePathError,
-  isWorkspacePathError,
-} from '../tools/builtin/pathSafety.js'
 import type {
   NexusRuntime,
   RuntimeExecuteOptions,
@@ -66,6 +60,9 @@ export class LocalCodingRuntime implements NexusRuntime {
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    if (!options.storage && this.storage) {
+      options = { ...options, storage: this.storage }
+    }
     yield {
       type: 'session_started',
       ...eventBase(options.sessionId),
@@ -397,95 +394,10 @@ export class LocalCodingRuntime implements NexusRuntime {
   }
 }
 
-async function executeToolSafely(
-  tool: AnyTool,
-  input: unknown,
-  options: RuntimeExecuteOptions,
-): Promise<
-  | {
-      kind: 'result'
-      success: boolean
-      output: unknown
-      truncated?: boolean
-      originalBytes?: number
-    }
-  | { kind: 'error'; code: string; message: string; details?: unknown }
-> {
-  try {
-    const result = await tool.execute(input, {
-      cwd: options.cwd,
-      sessionId: options.sessionId,
-      signal: options.signal,
-      maxOutputBytes: options.maxToolOutputBytes ?? 200_000,
-      bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
-      executionEnvironment: options.executionEnvironment,
-    })
-    const truncated = truncateToolOutput(
-      result.output,
-      options.maxToolOutputBytes ?? 200_000,
-    )
-    return {
-      kind: 'result',
-      success: result.success,
-      output: truncated.value,
-      truncated: truncated.truncated || undefined,
-      originalBytes: truncated.originalBytes,
-    }
-  } catch (error) {
-    if (options.signal?.aborted) {
-      const isTimeout = options.timeoutSignal?.aborted
-      return {
-        kind: 'error',
-        code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
-        message: isTimeout
-          ? `Execution timed out while running ${tool.name}.`
-          : `Execution cancelled while running ${tool.name}.`,
-      }
-    }
-    if (isWorkspacePathError(error)) {
-      return {
-        kind: 'result',
-        success: false,
-        output: {
-          code: error.code,
-          message: formatWorkspacePathError(error),
-          requestedPath: error.requestedPath,
-          cwd: error.cwd,
-          resolvedPath: error.resolvedPath,
-        },
-      }
-    }
-    return {
-      kind: 'error',
-      code: 'TOOL_ERROR',
-      message: errorMessage(error),
-      details: normalizeToolErrorDetails(error, options.maxToolOutputBytes ?? 200_000),
-    }
-  }
-}
-
-function normalizeToolErrorDetails(error: unknown, maxBytes: number): unknown {
-  if (!error || typeof error !== 'object') return undefined
-  const record = error as Record<string, unknown>
-  const details: Record<string, unknown> = {}
-
-  if (record.code !== undefined) details.code = record.code
-  if (record.signal !== undefined) details.signal = record.signal
-  if (record.exitCode !== undefined) details.exitCode = record.exitCode
-
-  for (const streamName of ['stdout', 'stderr'] as const) {
-    const value = record[streamName]
-    if (typeof value !== 'string' || value.length === 0) continue
-    const truncated = truncateToolOutput(value, maxBytes)
-    details[streamName] = truncated.value
-    if (truncated.truncated) {
-      details[`${streamName}Truncated`] = true
-      details[`${streamName}OriginalBytes`] = truncated.originalBytes
-    }
-  }
-
-  return Object.keys(details).length > 0 ? details : undefined
-}
+import {
+  executeToolSafely,
+  normalizeToolErrorDetails,
+} from './toolExecutor.js'
 
 export function allowAllTools(): ToolPolicy {
   return {

@@ -15,6 +15,7 @@ import {
   stopSpinner
 } from '../renderEvents.js'
 import { renderWelcome } from '../welcome.js'
+import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
 import { modelRegistry } from '../../providers/registry.js'
 import { createId } from '../../shared/id.js'
@@ -344,21 +345,12 @@ export function registerChatCommand(program: Command): void {
           }
 
           if (trimmed === '/help') {
-            console.log(chalk.cyan('\n--- BabeL-O CLI Commands ---'))
-            console.log(`${chalk.bold('/help')}          Show this help message`)
-            console.log(`${chalk.bold('/clear')}         Clear terminal screen`)
-            console.log(`${chalk.bold('/compact')}       Compact the current session context`)
-            console.log(`${chalk.bold('/context')}       Inspect context budget and compact state`)
-            console.log(`${chalk.bold('/exit')}          Exit the interactive shell`)
-            console.log(`${chalk.bold('/model')}         Show default model or switch it (e.g. /model anthropic/claude-3-5-sonnet)`)
-            console.log(`${chalk.bold('/profile')}       List profiles, switch active profile, or create profile (e.g. /profile dev)`)
-            console.log(`${chalk.bold('/status')}        Show Nexus connection status`)
-            console.log(`${chalk.bold('/sessions')}      List recent sessions`)
-            console.log(`${chalk.bold('/history')}       Show or search command history (e.g. /history [keyword])`)
-            console.log(`${chalk.bold('/history !<idx>')} Re-run history command at index`)
-            console.log(`${chalk.bold('/tool')}          Browse built-in tools and insert a tool prompt prefix`)
-            console.log(chalk.dim('You can also type any natural language prompt to start a session.'))
-            console.log()
+            process.stdout.write(renderHelpPanel('full'))
+            continue
+          }
+
+          if (trimmed === '/?' || trimmed === '/shortcuts') {
+            process.stdout.write(renderHelpPanel('compact'))
             continue
           }
 

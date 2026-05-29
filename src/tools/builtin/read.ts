@@ -15,7 +15,7 @@ export const readTool: ToolDefinition<typeof inputSchema> = {
   risk: 'read',
   inputSchema,
   async execute(input, context) {
-    const path = resolveInsideWorkspace(context.cwd, input.path)
+    const path = resolveInsideWorkspace(context.cwd, input.path, context.allowedPaths)
     let fileStat
     try {
       fileStat = await stat(path)

@@ -126,6 +126,7 @@ test('Read returns a recoverable tool result for workspace escape paths', async 
   await mkdir(cwd, { recursive: true })
   const outsidePath = join(tmpdir(), `babel-o-outside-${Date.now()}.txt`)
 
+  process.env.NEXUS_ALLOWED_WORKSPACES = cwd
   const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
@@ -147,6 +148,7 @@ test('Read returns a recoverable tool result for workspace escape paths', async 
       event.type === 'error' && event.code === 'TOOL_ERROR',
     ))
   } finally {
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
     await app.close()
   }
 })
@@ -868,21 +870,26 @@ test('bash absolute paths outside workspace return recoverable workspace escape 
   await mkdir(cwd, { recursive: true })
   await writeFile(outside, 'outside workspace')
 
-  const { bashTool } = await import('../src/tools/builtin/bash.js')
-  const result = await bashTool.execute({
-    command: `ls -la ${outside}`,
-    timeoutMs: 10_000,
-  }, {
-    cwd,
-    sessionId: `bash-escape-${Date.now()}`,
-    maxOutputBytes: 1000,
-    bashMaxBufferBytes: 10_000,
-  })
+  process.env.NEXUS_ALLOWED_WORKSPACES = cwd
+  try {
+    const { bashTool } = await import('../src/tools/builtin/bash.js')
+    const result = await bashTool.execute({
+      command: `ls -la ${outside}`,
+      timeoutMs: 10_000,
+    }, {
+      cwd,
+      sessionId: `bash-escape-${Date.now()}`,
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 10_000,
+    })
 
-  assert.equal(result.success, false)
-  assert.equal((result.output as any).code, 'WORKSPACE_PATH_ESCAPE')
-  assert.match((result.output as any).message, /outside the current workspace/)
-  assert.equal((result.output as any).requestedPath, outside)
+    assert.equal(result.success, false)
+    assert.equal((result.output as any).code, 'WORKSPACE_PATH_ESCAPE')
+    assert.match((result.output as any).message, /outside the current workspace/)
+    assert.equal((result.output as any).requestedPath, outside)
+  } finally {
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
+  }
 })
 
 test('websocket stream executes prompts and records stream metrics', async () => {
@@ -1103,6 +1110,7 @@ test('bash retained CWD resets when the same session switches workspace', async 
     assert.equal(second.success, true)
     assert.equal(String((second.output as any).stdout).trim(), await realpath(secondCwd))
 
+    process.env.NEXUS_ALLOWED_WORKSPACES = secondCwd
     const blocked = await bashTool.execute({
       command: `ls -la ${firstCwd}`,
       timeoutMs: 10_000,
@@ -1116,6 +1124,7 @@ test('bash retained CWD resets when the same session switches workspace', async 
     assert.equal((blocked.output as any).code, 'WORKSPACE_PATH_ESCAPE')
     assert.equal((blocked.output as any).cwd, await realpath(secondCwd))
   } finally {
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
     await clearBashSessionState(sessionId)
   }
 })

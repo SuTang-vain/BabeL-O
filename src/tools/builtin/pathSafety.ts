@@ -47,46 +47,43 @@ export function isWorkspaceAllowed(cwd: string): boolean {
   return false
 }
 
-export function resolveInsideWorkspace(cwd: string, requestedPath: string): string {
+export function resolveInsideWorkspace(cwd: string, requestedPath: string, allowedPaths?: string[]): string {
   const absolute = resolve(cwd, requestedPath)
+  if (!process.env.NEXUS_ALLOWED_WORKSPACES) return absolute
+
   const cwdReal = getRealpath(cwd)
 
+  if (isPathInsideBase(cwdReal, absolute)) {
+    return absolute
+  }
+
+  if (allowedPaths && allowedPaths.length > 0) {
+    for (const allowed of allowedPaths) {
+      const allowedReal = getRealpath(allowed)
+      if (isPathInsideBase(allowedReal, absolute)) {
+        return absolute
+      }
+    }
+  }
+
+  throw new WorkspacePathError(requestedPath, cwdReal, absolute)
+}
+
+function isPathInsideBase(baseReal: string, absolute: string): boolean {
   let current = absolute
   let checkedExistingAncestor = false
   while (current && current !== dirname(current)) {
     if (existsSync(current)) {
       checkedExistingAncestor = true
       const currentReal = realpathSync(current)
-      if (!isInsideOrSame(cwdReal, currentReal)) {
-        throw new WorkspacePathError(requestedPath, cwdReal, absolute)
-      }
-      break
+      return isInsideOrSame(baseReal, currentReal)
     }
     current = dirname(current)
   }
-
   if (!checkedExistingAncestor) {
-    if (!isInsideOrSame(cwdReal, absolute)) {
-      throw new WorkspacePathError(requestedPath, cwdReal, absolute)
-    }
-  } else if (!existsSync(absolute)) {
-    const parentReal = getRealpath(current)
-    if (!isInsideOrSame(cwdReal, parentReal)) {
-      throw new WorkspacePathError(requestedPath, cwdReal, absolute)
-    }
-  } else {
-    const absoluteReal = getRealpath(absolute)
-    if (!isInsideOrSame(cwdReal, absoluteReal)) {
-      throw new WorkspacePathError(requestedPath, cwdReal, absolute)
-    }
+    return isInsideOrSame(baseReal, absolute)
   }
-
-  const lexicalRel = relative(cwd, absolute)
-  if (!checkedExistingAncestor && !isInsideOrSame(cwd, absolute)) {
-    throw new WorkspacePathError(requestedPath, cwdReal, absolute)
-  }
-
-  return absolute
+  return false
 }
 
 export function isWorkspacePathError(error: unknown): error is WorkspacePathError {
@@ -104,6 +101,6 @@ export function formatWorkspacePathError(error: WorkspacePathError): string {
     `Requested path: ${error.requestedPath}`,
     `Current workspace: ${error.cwd}`,
     `Resolved path: ${error.resolvedPath}`,
-    `Use a path inside the current workspace, correct path casing/typos, or ask the user before switching projects.`,
+    `IMPORTANT: Do NOT retry this path with a different tool. The workspace boundary cannot be bypassed. Either use a path inside the workspace, or inform the user that this path is inaccessible.`,
   ].join('\n')
 }

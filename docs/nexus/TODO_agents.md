@@ -45,6 +45,7 @@
 - [x] 实现 complete。
 - [x] 实现 fail/requeue。
 - [x] 实现 queue settled 判断。
+- [x] 依赖失败传播：`propagateFailures` 级联标记下游任务为 failed，防止死锁 (2026-05-28)。
 
 ## P2 Agent Roles
 
@@ -67,6 +68,7 @@
 - [x] 解析失败时保存 raw output。
 - [x] AgentLoop events 写入 session events。
 - [x] CLI 可触发 `sessions resume --run-agent-loop` (或 cli 中已集成 optimize 执行)。
+- [x] structured-output repair: `tryParseWithRepair` 添加 logger.debug 日志；`zodToJsonSchemaShape` 对 ZodUnknown/ZodAny/fallback 返回 `{ type: 'object' }` 而非 `{}` (2026-05-28)。
 
 ## P3 AetheL / SDK / Dashboard
 
@@ -81,21 +83,21 @@
 - [x] 支持跨 session task 委派并实现动态子 Agent。
 - [x] 解决嵌套隔离 Worktree 合并及 cherry-pick 范围回传，实现冲突文件精确提取与错误诊断，完成子代理嵌套隔离测试。
 - [x] 非隔离 in-place optimizer 的 Git 操作继续加固：避免 `git add .` 纳入无关未跟踪文件，避免 `git reset --hard` / `git clean -fd` 删除用户手动创建但未纳入本次任务的文件。
-- [ ] 参考 BabeL-X `AgentTool.tsx` / `runAgent.ts` 的生命周期治理，为 BabeL-O 子 Agent 定义正式 `agentId`、`parentAgentId`、`parentTaskId`、`depth`、`agentType`、`status`、`transcriptPath` 元数据。
-- [ ] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、queueId、taskId、depth、cwd/worktreeCwd、role、allowedTools、permissionMode。
-- [ ] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、修改文件、commit hash、失败类型、retry 建议。
-- [ ] 为跨 session 子 Agent 保存独立 transcript：父 session 只保存摘要和 transcript 引用，避免父上下文被子任务完整工具链撑爆。
-- [ ] 子 Agent resume：给 parent session 提供可查询子 transcript 路径和最近状态，允许后续命令恢复或查看子 Agent 详细日志。
-- [ ] 子 Agent cancel：父 session 取消时级联取消未完成子 session；单个子 session 取消时父任务应收到结构化失败结果并可重排/收口。
-- [ ] 子 Agent permission inheritance：默认继承父 session 的 deny-by-default 和 CLI arg allow rules，但不继承临时 once approval；session-scope approval 是否继承必须可配置并写入 audit。
-- [ ] 子 Agent MCP inheritance：默认只继承父 runtime 已显式 allowlisted 的 MCP tools；agent-specific MCP server 延后，避免前置引入插件级复杂度。
-- [ ] 子 Agent skill/context inheritance：继承当前匹配 inline skills 和 explicit path anchors；只读 Explore/Plan 类任务可裁剪 gitStatus/大体积 project memory。
-- [ ] 子 Agent worktree notice：当子 Agent 在隔离 worktree 内运行时，在 system/additional context 中注入 parent cwd、worktree cwd、路径转换规则、变更隔离说明。
-- [ ] 子 Agent 输出契约：要求输出 `Scope`、`Result`、`Key files`、`Files changed`、`Issues` 等稳定字段，父 Agent 汇总时优先读取结构化摘要，不扫描完整 transcript。
-- [ ] 防无限派生加强：除 max depth/max tasks 外，增加同 parentTaskId 重复委派检测、相同 title/description 去重、失败子任务 retry 上限。
-- [ ] 成本控制：提供 `--no-critic`、`--subagent-model`、`--subagent-max-turns` 或 role 配置，避免简单任务触发过多模型往返。
-- [ ] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
-- [ ] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
+- [x] 参考 BabeL-X `AgentTool.tsx` / `runAgent.ts` 的生命周期治理，为 BabeL-O 子 Agent 定义正式 `agentId`、`parentAgentId`、`parentTaskId`、`depth`、`agentType`、`status`、`transcriptPath` 元数据。
+- [x] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、queueId、taskId、depth、cwd/worktreeCwd、role、allowedTools、permissionMode。
+- [x] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、修改文件、commit hash、失败类型、retry 建议。
+- [x] 为跨 session 子 Agent 保存独立 transcript：父 session 只保存摘要和 transcript 引用，避免父上下文被子任务完整工具链撑爆。
+- [x] 子 Agent resume：给 parent session 提供可查询子 transcript 路径和最近状态，允许后续命令恢复或查看子 Agent 详细日志。
+- [x] 子 Agent cancel：父 session 取消时级联取消未完成子 session；单个子 session 取消时父任务应收到结构化失败结果并可重排/收口。
+- [x] 子 Agent permission inheritance：默认继承父 session 的 deny-by-default 和 CLI arg allow rules，但不继承临时 once approval；session-scope approval 是否继承必须可配置并写入 audit。
+- [x] 子 Agent MCP inheritance：默认只继承父 runtime 已显式 allowlisted 的 MCP tools；agent-specific MCP server 延后，避免前置引入插件级复杂度。
+- [x] 子 Agent skill/context inheritance：继承当前匹配 inline skills 和 explicit path anchors；只读 Explore/Plan 类任务可裁剪 gitStatus/大体积 project memory。
+- [x] 子 Agent worktree notice：当子 Agent 在隔离 worktree 内运行时，在 system/additional context 中注入 parent cwd、worktree cwd、路径转换规则、变更隔离说明。
+- [x] 子 Agent 输出契约：要求输出 `Scope`、`Result`、`Key files`、`Files changed`、`Issues` 等稳定字段，父 Agent 汇总时优先读取结构化摘要，不扫描完整 transcript。
+- [x] 防无限派生加强：除 max depth/max tasks 外，增加同 parentTaskId 重复委派检测、相同 title/description 去重、失败子任务 retry 上限。
+- [x] 成本控制：提供 `--no-critic`、`--subagent-model`、`--subagent-max-turns` 或 role 配置，避免简单任务触发过多模型往返。
+- [x] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
+- [x] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
 - [ ] 定义外部 SDK task API。
 - [ ] 定义 dashboard session/task query API。
 - [ ] 支持远程取消和恢复.

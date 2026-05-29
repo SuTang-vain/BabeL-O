@@ -54,7 +54,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 ## P0 Context-Aware Runtime
 
-来自 `docs/RECOMMENDATIONS.md` 的 Milestone 1。目标是先做低风险、Nexus-owned 的上下文预算和压缩，不迁移 BabeL-X 的重型后台 SessionMemory 子 Agent。
+来自已合并的 BabeL-X 迁移结论 Milestone 1。目标是先做低风险、Nexus-owned 的上下文预算和压缩，不迁移 BabeL-X 的重型后台 SessionMemory 子 Agent。
 
 - [x] 新增 `ContextBudget`：按 model context window 分配 system / memory / summary / recent budgets，预留输出余量。
 - [x] 新增 `src/runtime/compactors/snipCompactor.ts`：对超长 `tool_completed.output` 做 head/tail 字符级截断，原始 events 继续完整保存在 SQLite。
@@ -114,8 +114,160 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] **P1/P2: Bash retained CWD 随 workspace 切换重置**。基于 `session_b4fd19a4`：同一 session 从 Baidu 切到 BabeL-X 后，Bash 的 `sessionCwdMap` 仍可能保留旧 Baidu CWD，导致 workspace guard 基准回退到旧项目。现已限制 retained shell cwd 只能在当前 `context.cwd` workspace 内复用，跨 workspace 自动清除；绝对路径 preflight 始终以本轮 `context.cwd` 为根。
 - [x] **P1/P2: Session CWD 持久化与纠错轮继承**。基于 `session_e9fa6e3a`：含显式目录路径的本轮能切到 BabeL-X，但下一轮“让你分析的就是 babel-X 项目”因无绝对路径回退到启动 cwd。现已将 `session_started.cwd` 写回 session snapshot，HTTP/WS/embedded CLI 后续无显式路径输入继承 `session.cwd`；纠错短句触发 pivot，避免旧 BabeL-O/Baidu 工具链继续锚定。
 - [ ] **P2/P3: 自动 Model Fallback 执行策略**。与 provider registry role routing 联动，定义何时自动降低 max output、何时 fallback 到大上下文模型、何时要求用户确认，避免 silent model switch。
-- [ ] **P2: Prompt Intent Classifier / Pivot Guard 扩展**。把当前规则型 pivot 识别扩展为可测试的小型意图分类器，覆盖“换项目/换话题/停一下/只回答我/不要继续旧任务”等中文短句，并在 `/context` 中展示 pivot reason。
+- [x] **P0: Pivot Guard 重建第二版——User Intake Guidance 事件管线**。已从同步 regex 主分类升级为轻量 intake 机制：`LLMCodingRuntime` 在主 provider 请求前先调用模型生成可持久化 `user_intake_guidance` 事件（intent、continuity、contextScope、actionHint、requiresTools、guidance、explicitPaths、source），`contextAssembler` 优先读取该事件并作为 `User Intake Guidance` 高优先级 system block 注入；当 intake 明确 `requiresTools=false` / `respond_only` 时，runtime 不向主 provider 暴露工具。regex 规则保留为 intake 调用失败或诊断离线场景的 fallback，不再作为主路径直接判定。session_321c48be 的 `hi`` 和暂停请求场景均有回归覆盖，确认不再硬丢旧上下文且不会继续旧工具链。
+- [ ] **P2: DeepSeek reasoning replay 兼容**。`OpenAIAdapter` 需要对 DeepSeek thinking 模式的 `reasoning_content` 做正确续传/降级处理，避免 provider 在后续 turn 报 `The reasoning_content in the thinking mode must be passed back to the API.`，并把该错误纳入 provider recovery 分类与回归样本。
 - [ ] **P3: `thinking_delta` 策略再评估**。当前完全丢弃 thinking 可防污染，但对部分 provider/model 可能损失规划连续性。评估只保留短摘要、只给同 provider、或只在 Agent role 内部保留的策略。
+
+### P0 Pivot Guard 缺陷专项
+
+> 来源: session_321c48be 实战复盘 + 源码审查
+> 核心文件: `src/runtime/contextAssembler.ts:427-515`
+
+#### 1. Pivot 的定义与作用
+
+Pivot 是 `selectRecentEvents()` 中的上下文截断起点策略。当检测到用户意图切换时，从这条新消息开始截取事件窗口，丢弃之前的所有事件。它是"保留最近 N 个 turn"默认策略的覆盖路径。
+
+```
+正常路径: 保留最近 N 个 user turn 对应的所有事件
+Pivot 路径: 只保留触发 pivot 的这条用户消息及其之后的事件
+```
+
+Pivot 被两处调用：
+- `contextAssembler.ts:166` — 每次 `assembleContext()` 时决定保留哪些事件
+- `compact.ts:61` — `compactSession()` 决定哪些事件被压缩
+
+#### 2. 当前触发条件（4 条路径）
+
+| 路径 | 函数 | 匹配模式 | 设计意图 |
+|------|------|---------|---------|
+| 闲聊 | `isConversationalPivotPrompt` | `hi/hello/你好/您好/还在吗/你在干什么/还记得...` | 用户打招呼/状态追问时不回放旧工具链 |
+| 暂停 | `isPausePivotPrompt` | `stop/pause/wait/等一下/先停/暂停` | 用户想暂停执行时不继续旧任务 |
+| 纠错 | `isCorrectionPivotPrompt` | `让你/我说的/不是...而是/actually/i mean` | 用户纠正目标时切换到新上下文 |
+| 路径 | `extractAbsolutePaths` | 消息中出现 `/Users/...` 等绝对路径 | 用户切换项目时以新路径为锚点 |
+
+#### 3. 核心缺陷：全有全无、不可逆、无 fallback
+
+```typescript
+// contextAssembler.ts:454-460
+if (shouldStartFromLatestUserPrompt(latestUser.text)) {
+  return trimSelectedWindow(effectiveEvents.slice(latestUserIdx), maxEvents)
+}
+```
+
+触发 pivot 后，`effectiveEvents.slice(latestUserIdx)` 只保留触发消息及其之后的事件。之前的事件：
+- **不进入** `sessionSummary`（只有 `selectOmittedEvents` 返回的事件才生成摘要）
+- **不进入** `retainedEvents`（compact 时保留的是 pivot 后的事件）
+- **不进入** `PostCompactState`（只从 selected events 派生）
+- **完全从 LLM 视野中消失**
+
+等价于一次无摘要的硬截断，没有任何恢复手段。
+
+#### 4. 各触发路径的风险评估
+
+**4.1 闲聊路径 — 高风险**
+
+session_321c48be 已复现：用户在 Baidu 分析中间输入 `hi`` 触发 pivot，丢弃了 Turn 6-7 的 30+ 条工具调用事件，导致模型重新跑 `ls`。
+
+问题分析：
+- 正则 `/^(hi|hello|hey|你好|您好)[？?!.。！\s]*$/iu` 只匹配**纯问候**，看起来合理
+- 但实际会话中用户说 "hi" 后紧接着会有新需求，不是真正的上下文切换
+- 即使用户只是打招呼，不代表要丢弃之前的工作上下文——模型应该记住之前做了什么
+- 测试用例 `test/context-assembler.test.ts:1221` 的断言 `assert.deepEqual(context.messages, [{ role: 'user', content: '你好？' }])` 反而**验证了上下文丢失是期望行为**，这表明设计意图本身就是"问候=丢上下文"
+
+**4.2 暂停路径 — 中风险**
+
+session_321c48be 已复现：用户说 "just stop it and waite for me other require" 触发 pivot，但模型仍然做了 25 次工具调用。
+
+问题分析：
+- 暂停 pivot 的设计意图正确：用户说"停"时不回放旧工具链
+- 但 pivot 只影响上下文选择，**不影响 runtime 的工具循环行为**——模型仍然可以自由发起工具调用
+- 这意味着暂停 pivot 只解决了"不要被旧上下文带偏"，没解决"用户说停但模型不停"的指令跟随性问题
+- 正则 `/(?:\b(?:wait|waite|hold on|hang on)\b)/u` 包含了 `waite`（拼写错误），但 `waite` 本身不是英语单词，过度匹配
+
+**4.3 纠错路径 — 低风险（设计合理但需微调）**
+
+纠错 pivot 的语义明确：用户说"我说的不是 A 是 B"，应该切换到新目标。这是 4 条路径中唯一有明确意图切换语义的。
+
+问题分析：
+- 正则 `/(?:让你|要你|我说的|说的是|分析的就是|看的就是|不是.*是|不是.*而是|actually|i mean)/iu` 中 `不是.*是` 过于宽泛——"这个 bug 不是很难修复"也会匹配
+- 但由于纠错场景确实需要 pivot，且误匹配概率相对低，风险可控
+
+**4.4 路径路径 — 高风险**
+
+`extractAbsolutePaths(text).length > 0` 导致任何包含绝对路径的消息都触发 pivot。
+
+session_321c48be 已复现：Turn 4 用户输入 `...rewrite this article.../Users/tangyaoyue/Library/.../工作流抽卡...md`，路径触发 pivot，丢弃了 Turn 1-3 的闲聊上下文。这次影响不大，因为 Turn 1-3 是无工具调用的闲聊。
+
+但更危险的场景：用户在一个长编码会话中说"也帮我看看 `/Users/.../other-project` 里的那个文件"，路径触发 pivot，导致当前项目的全部工具调用结果丢失。
+
+问题分析：
+- 路径触发 pivot 的原始意图是解决 `session_e9fa6e3a` 的问题：用户从 Baidu 切到 BabeL-X 后旧上下文带偏
+- 但这应该通过"项目切换检测"而非"任何路径"来触发——用户在同一项目中引用路径不应触发 pivot
+- `systemPromptBuilder.ts` 的 `buildRequestPathBlock` 已经通过 system prompt 告诉模型"以显式路径为权威目标"，不需要 pivot 来额外截断上下文
+
+#### 5. Pivot 与其他上下文机制的交互缺陷
+
+**5.1 Pivot 旁路了 Recovery Boundary**
+
+```typescript
+// contextAssembler.ts:431-442
+let recoveryIdx = 0
+for (let idx = events.length - 1; idx >= 0; idx--) {
+  if (event.type === 'error') {
+    if (code === 'REQUEST_CANCELLED' || code === 'EXECUTION_TIMEOUT') {
+      recoveryIdx = idx; break
+    }
+  }
+}
+const effectiveEvents = recoveryIdx > 0 ? events.slice(recoveryIdx) : events
+```
+
+Recovery boundary 从最近的 `REQUEST_CANCELLED`/`EXECUTION_TIMEOUT` 开始截取，确保取消后的下一条输入不被旧任务工具链锚定。
+
+但 pivot 检测发生在 recovery 之后（line 454-460），且 pivot 的截断范围（`effectiveEvents.slice(latestUserIdx)`）可能比 recovery boundary 更激进。如果 recovery boundary 正确设置了起点，pivot 会再次从 recovery boundary 内部截断，可能丢失 recovery boundary 保留的关键上下文。
+
+**5.2 Pivot 旁路了 `recentTurnLimit` 预算**
+
+正常路径下，`selectRecentEvents` 按 `recentTurnLimit`（大窗口 4 turn，小窗口 2 turn）保留最近 N 个 turn。pivot 路径完全跳过这个限制，只保留 pivot 消息之后的事件——可能只有 1 个 turn，也可能很多（如果 pivot 后有大量工具调用）。
+
+**5.3 Pivot 不产出 `omittedEvents` → 不生成摘要**
+
+```typescript
+// contextAssembler.ts:168
+const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
+```
+
+`selectOmittedEvents` 基于 `selectedEvents` 计算。如果 pivot 导致 `selectedEvents` 只有 pivot 后的事件，那么 `omittedEvents` 包含 pivot 前的全部事件。这些事件会进入 `summarizeSessionEvents` 生成统计摘要，但**不会进入 LLM 摘要**（`llmSummarizeEvents` 只在 `compactSession` 中调用，不是每次 `assembleContext` 都调用）。
+
+结果：pivot 前的上下文被压缩为一条统计摘要（"Earlier omitted events: N; user messages M"），而不是保留关键的技术细节、文件内容和决策。
+
+#### 6. 修复方案
+
+**Phase 1：止血（消除误触）**
+
+1. 闲聊路径加长度阈值：消息 < 15 chars 且无路径时才触发。超过 15 chars 的问候（如 "hi, can you also check this other thing?"）不触发 pivot
+2. 路径路径改为项目切换检测：只有当用户消息中的路径**不在当前 cwd 的 workspace 内**时才触发 pivot。同一项目内引用路径不触发
+3. 暂停路径保持，但增加 runtime 侧的配合：pivot 触发 `isPausePivotPrompt` 时，在 system prompt 中注入 "User requested pause. Respond with confirmation only. Do not initiate any tool calls." 的强指令
+
+**Phase 2：结构化（pivot 不再全有全无）**
+
+4. Pivot 后的 omitted events 强制进入 `sessionSummary`：pivot 截断前的事件仍然生成摘要（即使没有 compact boundary），确保关键上下文（文件路径、决策、待办）保留在 system prompt 中
+5. Pivot 增加 `pivot_reason` 字段到 `AssembledContext`，在 `/context` 诊断中展示，帮助用户理解为什么上下文被截断
+6. Pivot 增加回退机制：如果 pivot 后 LLM 请求了与 pivot 前相同的工具（如同一个 `ls` 命令），说明 pivot 可能是误触，在下一轮自动回退到正常路径
+
+**Phase 3：智能分类（替代规则型 pivot）**
+
+7. 用小型意图分类器替代正则匹配：输入（当前消息 + 最近 3 条 user_message 摘要）→ 输出（pivot / continue / correction / pause），可测试、可扩展
+8. 分类器覆盖中文短句：换项目/换话题/停一下/只回答我/不要继续旧任务
+9. 分类器结果写入 `/context` 和 `context_warning` 事件
+
+#### 7. 验证命令
+
+- [ ] 回放 session_321c48be：Turn 8 `hi`` 不应丢弃 Turn 6-7 的 Baidu 上下文
+- [ ] 回放 session_e9fa6e3a：纠错 pivot "让你分析的就是 babel-X 项目" 仍应正确切换
+- [ ] 新增：消息中包含同项目路径时不触发 pivot
+- [ ] 新增：暂停 pivot 触发后模型不发起工具调用
+- [ ] 新增：pivot 后的 omitted events 必须出现在 sessionSummary 中
 
 ## P1 Nexus Hooks 最小内核
 
@@ -157,7 +309,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 ## P0 MCP-Ready Runtime Extensions
 
-来自 `docs/RECOMMENDATIONS.md` 的 Milestone 2。目标是利用 Nexus-first 架构把 MCP server 作为 Nexus 管理的外部工具源，而不是绑定 CLI 生命周期。
+来自已合并的 BabeL-X 迁移结论 Milestone 2。目标是利用 Nexus-first 架构把 MCP server 作为 Nexus 管理的外部工具源，而不是绑定 CLI 生命周期。
 
 - [x] 新增 `src/mcp/McpClient.ts`：实现 JSON-RPC 2.0 over stdio，覆盖 initialize、tools/list、tools/call、shutdown。
 - [x] 新增 `src/mcp/McpRegistry.ts`：加载 `~/.babel-o/mcp.json` 和项目级 MCP 配置。
@@ -170,7 +322,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 ## P1 Knowledge-First Skills
 
-来自 `docs/RECOMMENDATIONS.md` 的 Milestone 3。目标是先实现纯文本 inline Skills，为模型提供稳定工作方法，不迁移 BabeL-X 的 React `SkillTool` 和 fork 模式。
+来自已合并的 BabeL-X 迁移结论 Milestone 3。目标是先实现纯文本 inline Skills，为模型提供稳定工作方法，不迁移 BabeL-X 的 React `SkillTool` 和 fork 模式。
 
 - [x] 新增 `src/skills/loader.ts`：解析 front matter，加载 skill id/name/triggers/priority/content。
 - [x] 支持三级目录：`src/skills/built-in`、`~/.babel-o/skills`、`<cwd>/.babel-o/skills`。
@@ -181,7 +333,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 
 ## P2 Smart Permissions
 
-来自 `docs/RECOMMENDATIONS.md` 的 Milestone 4。目标是从全手动审批升级为轻量规则自动分类，不迁移 BabeL-X 的复杂九阶段权限管道。
+来自已合并的 BabeL-X 迁移结论 Milestone 4。目标是从全手动审批升级为轻量规则自动分类，不迁移 BabeL-X 的复杂九阶段权限管道。
 
 - [x] 新增 `src/runtime/classifier.ts`。
 - [x] Read/Grep/Glob 等 read-only 操作自动放行。

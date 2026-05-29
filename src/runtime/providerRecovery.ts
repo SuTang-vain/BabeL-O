@@ -5,6 +5,7 @@ export type ProviderRecoveryKind =
   | 'context_window'
   | 'rate_limit'
   | 'auth_or_billing'
+  | 'provider_protocol'
   | 'provider_unavailable'
   | 'unknown'
 
@@ -91,6 +92,24 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'PROVIDER_AUTH_OR_BILLING',
       retryable: false,
       suggestion: 'Check API key, billing balance, provider permissions, or switch the active model/profile.',
+      rawMessage,
+    }
+  }
+
+  if (matchesAny(normalized, [
+    'reasoning_content',
+    'thinking mode',
+    'tool id',
+    'tool result',
+    'tool_call_id',
+  ])) {
+    return {
+      providerId: error.providerId,
+      httpStatus: status,
+      kind: 'provider_protocol',
+      recoveryReason: 'PROVIDER_PROTOCOL_REPLAY_MISMATCH',
+      retryable: false,
+      suggestion: 'Provider rejected replayed reasoning/tool-call history. Compact the session or retry after message normalization fixes.',
       rawMessage,
     }
   }

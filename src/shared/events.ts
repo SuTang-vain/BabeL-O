@@ -35,6 +35,22 @@ export const UserMessageEventSchema = z.object({
   text: z.string(),
 })
 
+export const UserIntakeGuidanceEventSchema = z.object({
+  type: z.literal('user_intake_guidance'),
+  ...baseEventFields,
+  userText: z.string(),
+  intent: z.enum(['continue', 'new_focus', 'correction', 'pause', 'greeting', 'status']),
+  confidence: z.number(),
+  continuity: z.number(),
+  contextScope: z.enum(['full', 'recent', 'new_focus']),
+  actionHint: z.enum(['normal', 'prioritize_latest', 'respond_only']),
+  requiresTools: z.boolean(),
+  reason: z.string(),
+  guidance: z.string(),
+  explicitPaths: z.array(z.string()).default([]),
+  source: z.enum(['model', 'fallback']),
+})
+
 export const UsageEventSchema = z.object({
   type: z.literal('usage'),
   ...baseEventFields,
@@ -221,6 +237,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   AssistantDeltaEventSchema,
   ThinkingDeltaEventSchema,
   UserMessageEventSchema,
+  UserIntakeGuidanceEventSchema,
   UsageEventSchema,
   ToolStartedEventSchema,
   ToolCompletedEventSchema,

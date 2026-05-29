@@ -2,6 +2,145 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-29 — runtime-llm 测试配置隔离
+
+- **问题**: `runtime-llm.test.ts` 在本机存在 `BABEL_O_BASE_URL` / provider baseUrl 等环境变量时，会覆盖测试临时 config，导致 Anthropic baseUrl 断言被 Baidu OneAPI 配置污染。
+- **处理**:
+  - 在 `runtime-llm.test.ts` 增加 provider/config 环境变量 snapshot、clear 和 restore helper。
+  - `ConfigManager` 与 `LLMCodingRuntime` test suite 的 `beforeEach` 清理 `BABEL_O_*`、`ANTHROPIC_*`、`OPENAI_*`、`DEEPSEEK_*`、`ZHIPU*`、`MINIMAX*` 相关变量，`afterEach` 恢复原环境。
+  - 保留单测内部主动设置 env 的断言场景，避免改变配置优先级语义。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：29/29 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：61/61 通过。
+
+## 2026-05-29 — Pivot Guard Phase 2.1：User Intake Guidance 事件管线
+
+- **用户决策**: 将 `intentGuidance` 从硬规则分类器升级为轻量 intake 机制：先让模型产出可持久化 `user_intake_guidance` 事件，再让 runtime/agent loop 把该事件作为本轮最高优先级上下文。
+- **实现**:
+  - `shared/events.ts` 新增 `user_intake_guidance` 事件类型，字段包含 `userText`、`intent`、`confidence`、`continuity`、`contextScope`、`actionHint`、`requiresTools`、`reason`、`guidance`、`explicitPaths` 和 `source=model|fallback`。
+  - `intentGuidance.ts` 改为 intake 管线模块：`buildUserIntakeGuidanceEvent()` 调用 provider 进行无工具、低 token 的 intake JSON 生成；解析失败或 provider 失败时回退到本地规则 `deriveFallbackUserIntentGuidance()`。
+  - `contextAssembler` 优先读取最新匹配当前用户消息的 `user_intake_guidance`，并注入 `User Intake Guidance` 高优先级 system block；事件身份 hash 覆盖 intake event。
+  - `LLMCodingRuntime` 在主 provider 请求前生成并 yield intake event，使外层 storage 正常持久化；主请求的工具列表由 intake 的 `requiresTools` / `actionHint` 决定。
+  - token 估算改为使用模型实际可见工具列表，避免 `respond_only` 场景仍把隐藏工具计入 context。
+- **测试覆盖**:
+  - `runtime-llm.test.ts` 新增 `persists user_intake_guidance and hides tools for respond-only intake`，验证 intake event `source=model`、`requiresTools=false`，并断言主 provider 请求不包含 tools。
+  - 既有 context assembler 测试继续覆盖短问候、纠错、session_321c48be 和暂停请求场景。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：29/29 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：61/61 通过。
+- **剩余项**: 可进一步把 AgentLoop role step 也显式消费 intake event，而不仅通过 runtime context 间接继承；也可为 `/context` UI 增加 intake event 原文展示。
+
+## 2026-05-29 — Pivot Guard Phase 2：用户信息意图引导层
+
+- **用户决策**: 不继续堆叠生硬中文提示词注入，直接进入 Phase 2，用结构化“用户信息意图引导层”替代 hard pivot 截断。
+- **实现**:
+  - 新增 `src/runtime/intentGuidance.ts`，派生 `continue/new_focus/correction/pause/greeting/status`、`continuity`、`contextScope` 和 `actionHint`。
+  - `contextAssembler` 不再因闲聊/暂停/纠错/绝对路径在 `selectRecentEvents()` 中硬截断 recent events，而是保留最近上下文并返回 `userIntentGuidance`。
+  - `systemPromptBuilder` 在高优先级动态段注入 `User Intent Guidance`，让最新用户意图成为后续动作的显式决策输入。
+  - `LLMCodingRuntime` 对 `actionHint=respond_only` 的问候、状态、暂停请求不向 provider 暴露工具，防止用户说停或短问候时继续旧工具链。
+  - `/context` 诊断经 `contextAnalysis` 暴露 `userIntentGuidance`，便于复盘当前意图判断。
+- **回归覆盖**:
+  - session_321c48be 的 `hi`` 场景：短问候不再丢弃 Baidu 上下文。
+  - 暂停请求：`just stop it and waite for me other require` 会得到 `respond_only` 指引。
+  - 旧 hard-pivot 测试已改为验证 guidance 注入、上下文保留和 `actionHint`。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `/Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts`：32/32 通过。
+  - 合并运行 `context-assembler.test.ts` + `runtime-llm.test.ts` 时 58/60 通过，2 个失败为本机 provider baseUrl 配置污染（Anthropic 期望 URL 与本机 Baidu OneAPI baseUrl 冲突），与本次改动无关。
+- **剩余项**: 可补一个 runtime 级测试，直接断言 `respond_only` 时 provider query 收到 `tools: []`；DeepSeek reasoning replay 仍是独立 P0/P2 待办。
+
+## 2026-05-29 — Pivot Guard P0 提升与深度缺陷分析
+
+- **问题**: `shouldStartFromLatestUserPrompt` 的闲聊/路径触发路径导致不可逆上下文丢失。
+- **复现**: session_321c48be Turn 8 用户输入 `hi`` 误触闲聊 pivot，丢弃 Turn 6-7 的 Baidu 分析上下文（30+ 条工具调用事件），导致模型重复执行 `ls /Users/tangyaoyue/DEV/Baidu`。
+- **处理**:
+  - 将 TODO_runtime.md 中 "P2: Prompt Intent Classifier / Pivot Guard 扩展" 提升为 **P0**，重写为 "P0: Pivot Guard 重建——闲聊/路径误触导致不可逆上下文丢失"。
+  - 新增 "P0 Pivot Guard 缺陷专项" 章节，包含 7 个子节：定义与作用、当前触发条件、核心缺陷、各触发路径风险评估、与其他上下文机制的交互缺陷、修复方案（Phase 1-3）、验证命令。
+  - 更新 TODO.md 总控 P0 收口标准，补充 Pivot Guard 缺陷描述。
+- **关键发现**:
+  1. Pivot 是全有全无操作：触发后旧事件不进 summary、不进 retainedEvents、不进 PostCompactState，完全从 LLM 视野消失。
+  2. 闲聊路径（`hi/你好`）在长对话中误触概率高，且丢失的上下文无法恢复。
+  3. 路径路径（`extractAbsolutePaths > 0`）过于激进：同项目内引用路径也会触发 pivot。
+  4. 暂停路径只影响上下文选择，不影响 runtime 工具循环——用户说"停"但模型不停。
+  5. Pivot 旁路了 Recovery Boundary 和 `recentTurnLimit` 预算。
+  6. Pivot 后的 omitted events 只生成统计摘要，不生成 LLM 结构化摘要。
+- **验证**: 本次为文档更新和缺陷分析，没有执行代码修改。
+
+## 2026-05-29 — TODO 口径重整与主线收束
+
+- **工作项**: 重新梳理 `docs/nexus` 的总控与专项 TODO 口径，清理混在一起的阶段状态、已完成项、验证项和长期规划。
+- **处理结果**:
+  - 将 `docs/nexus/TODO.md` 收敛为更短的总控路线板，只保留口径、当前优先级、主线状态、文档索引、底线与维护规则。
+  - 在 `TODO_runtime.md` 中补入最新会话暴露的两项待办：`Prompt Intent Classifier / Pivot Guard` 扩展，以及 DeepSeek `reasoning_content` replay 兼容。
+  - 将 `TODO_agents.md` 中已落地的 sub-agent lifecycle / transcript / inheritance / worktree notice / output contract 口径标为完成，保留非 dry-run smoke 与少量验证项。
+  - 将 `TODO_tui.md` 中已实现的输入框唯一 owner、slash/tool palette 互斥、agent running indicator、permission panel 键盘路径口径整理为完成，并将仍需真实 PTY / 截图 smoke 的项回调为待验证。
+- **验证**: 本次为文档口径整理，没有执行代码或测试。
+
+## 0.99 2026-05-28~29 指令跟随性问题分析与执行控制增强
+
+- **问题**: session_968feb69 和后续会话暴露严重指令跟随性问题：模型重复读取同一文件 3 次、用户说"等一下"后继续执行 23 次工具调用、单 turn token 从 2.9K 爆炸到 103K。
+- **根因分析**:
+  - LLMCodingRuntime 的 while 循环是无约束的 tool-call 循环，模型缺少做出合理决策所需的结构化信息
+  - 模型不知道当前迭代次数、已读文件列表、token 使用量、当前阶段
+  - 对比 BabeL-X：也没有模型可见的执行状态注入，但有跨 turn 持久化的文件读取缓存和结构化的 compaction 后状态恢复
+- **实施**:
+  1. **执行状态注入** (`LLMCodingRuntime.ts`): 每次 provider call 前注入 `## Execution State` 到 systemPromptBlocks，包含 iteration/maxLoops、已读文件列表、tool calls 计数、context token 使用百分比、当前阶段（gathering/synthesize/must_respond）
+  2. **跨 turn 文件读取缓存** (`LLMCodingRuntime.ts`): `readFileCache: Map<string, {mtime, size}>` 提升到实例级别，Read 工具执行前检查 mtime，未变则返回 stub
+  3. **Compaction 后文件内容恢复** (`contextAssembler.ts`): `PostCompactState.restoredFileContents` 恢复最多 5 个文件内容（≤5000 chars），`buildCompactCapabilityReminder` 不再鼓励重新读取
+  4. **系统 prompt 强化** (`systemPromptBuilder.ts`): No-Repetition 规则升级为 MANDATORY，新增 Analysis budget 规则
+- **验证**: typecheck 通过，261 tests 259 pass（2 个预先存在的 URL 配置失败）
+- **未解决**: 指令跟随性问题仍然存在。可能的根因：
+  - 服务未重启加载新代码
+  - 模型本身能力限制（DeepSeek 对 system prompt 指令的遵循度不如 Claude）
+  - execution state 注入的信息量不足以改变模型行为
+  - 需要更强的运行时强制机制（如硬限制工具调用次数、强制在 N 次后停止循环）而非仅依赖模型自觉
+- **待评估**: 部署新代码后实测效果；如果仍然无效，可能需要从"给模型信息让它自己决策"转向"runtime 强制执行策略"（如分析任务硬限 10 次工具调用后强制输出）
+
+## 0.98 2026-05-28 Tier 0-3 代码缺陷修复与架构去重
+
+- **背景**: 基于完整源码审查与 TODO 文档交叉比对，确认 4 个 Tier 0 代码缺陷、P0 预算问题、多处代码重复和 Agent 可靠性问题。
+- **Tier 0 — 代码缺陷修复**:
+  - `edit.ts`: 添加 occurrences 计数，多匹配时拒绝替换（正确性底线）。
+  - `glob.ts`: 引入 minimatch 依赖，使用 `rg --glob` + minimatch fallback 替代旧的子串匹配。`**/*.js` 不再匹配 `.json`。无 glob 元字符时自动包装为 `**/*{pattern}*` 保持向后兼容。
+  - `app.ts`: 9 个路由处理器从 plain object 返回改为 `reply.code(404).send(...)`，修复 HTTP 200 返回错误的问题。
+  - `task.ts`: TaskCreate 工具接入完整 NexusTask 持久化（ToolContext 增加 storage 字段，两个 runtime 传递）。
+- **Tier 1 — P0 工具结果持久化与消息级预算**:
+  - 新建 `src/runtime/toolResultBudget.ts`：层 1 `replaceLargeToolResult`（单条 >50K 持久化为预览）+ 层 2 `enforceMessageBudget`（跨轮聚合预算 200K，re-apply 已替换结果）。
+  - 集成到 `LLMCodingRuntime.ts`：移除旧 per-turn 预算逻辑，替换为两层预算。
+  - 预期效果：多轮 provider call input tokens 减少 50-59%。
+  - 新建 `test/tool-result-budget.test.ts`（9 个测试全部通过）。
+- **Tier 2 — 运行时去重**:
+  - 新建 `src/runtime/toolExecutor.ts`：提取 `executeToolSafely` + `normalizeToolErrorDetails`，两个 runtime 共享。支持可选 per-tool timeout。
+  - `app.ts`：提取 `prepareExecution`、`recordEventMetrics`、`persistEventMetrics`，POST /v1/execute 和 GET /v1/stream 共享 ~115 行验证/session/metrics 逻辑。
+  - `agentLoop.ts`：移除重复的 `runGitCommand` 和 `parsePorcelainChangedPaths`，改为从 `worktree.ts` 导入。
+  - 关键空 catch 块添加 `logger.debug`（LLMCodingRuntime、compactSummary）。
+- **Tier 3 — Agent 可靠性**:
+  - `taskQueue.ts`：新增 `propagateFailures` 函数，依赖 failed 时级联标记下游任务为 failed，防止死锁。
+  - `runtimeAgentStep.ts`：repair 尝试添加 `logger.debug` 日志；`zodToJsonSchemaShape` 对 ZodUnknown/ZodAny/fallback 返回 `{ type: 'object' }` 而非 `{}`。
+- **验证**:
+  - `npm run typecheck` 通过。
+  - `npm test`（含新增 test/tool-result-budget.test.ts）：261 tests, 259 pass, 2 fail（预先存在的本地 URL 配置问题，与本次改动无关）。
+- **新增文件**: `src/runtime/toolResultBudget.ts`, `src/runtime/toolExecutor.ts`, `test/tool-result-budget.test.ts`
+- **新增依赖**: `minimatch`
+- **修改文件**: `edit.ts`, `glob.ts`, `task.ts`, `Tool.ts`, `Runtime.ts`, `LLMCodingRuntime.ts`, `LocalCodingRuntime.ts`, `app.ts`, `worktree.ts`, `agentLoop.ts`, `taskQueue.ts`, `runtimeAgentStep.ts`, `compactSummary.ts`, `tool-trace.test.ts`
+
+## 0.97 2026-05-27 TODO 总控口径重整
+
+- **用户请求**: 重新梳理当前 TODO 文档，解决总控 TODO 混乱问题。
+- **核实**:
+  - `docs/nexus/TODO.md` 同时包含阶段表、当前优先级、真实会话复盘、已完成长清单和工作日志式记录，和 `WORK_LOG.md`、专项 TODO 重复。
+  - 子 TODO 中仍有少量指向已删除根目录文档的旧引用，例如 `docs/RECOMMENDATIONS.md` 和 `docs/ARCHITECTURE.md`。
+- **处理**:
+  - 将 `docs/nexus/TODO.md` 重写为 71 行路线板，只保留：口径、当前优先级、主线状态、文档索引、必须守住的底线和维护规则。
+  - 将 P0/P1/P2 任务细节保留在对应专项 TODO，避免总控与专项重复维护。
+  - 将 `TODO_runtime.md` 和 `TODO_cleanup.md` 中的旧根目录文档引用改为“已合并的 BabeL-X 迁移结论”或 `docs/nexus/README.md`。
+- **验证**:
+  - `wc -l docs/nexus/TODO.md` 确认总控从 270 行收敛到 71 行。
+  - `rg` 检查 `docs/nexus` 中不再存在指向已删除根目录文档的链接。
+  - `git diff --check -- docs/nexus/TODO.md docs/nexus/TODO_runtime.md docs/nexus/TODO_cleanup.md` 通过。
+
 ## 0.96 2026-05-27 docs/nexus 文档口径收敛
 
 - **用户请求**: 清除/更新 `docs` 中所有文档，删除过时文档，并将所有文档内容更新到最核心的 `docs/nexus` 目录中。

@@ -11,6 +11,49 @@ import type { NexusEvent } from '../src/shared/events.js'
 import { EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
 import { parseStructuredAgentOutput } from '../src/nexus/runtimeAgentStep.js'
 
+const CONFIG_ENV_KEYS = [
+  'BABEL_O_MODEL',
+  'BABEL_O_PROVIDER',
+  'BABEL_O_API_KEY',
+  'BABEL_O_BASE_URL',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_BASE_URL',
+  'OPENAI_API_KEY',
+  'OPENAI_BASE_URL',
+  'DEEPSEEK_API_KEY',
+  'DEEPSEEK_BASE_URL',
+  'ZHIPU_API_KEY',
+  'ZHIPUAI_API_KEY',
+  'ZHIPU_BASE_URL',
+  'ZHIPUAI_BASE_URL',
+  'MINIMAX_API_KEY',
+  'MINIMAX_AUTH_TOKEN',
+  'MINIMAX_BASE_URL',
+] as const
+
+type ConfigEnvSnapshot = Partial<Record<typeof CONFIG_ENV_KEYS[number], string>>
+
+function snapshotConfigEnv(): ConfigEnvSnapshot {
+  return Object.fromEntries(
+    CONFIG_ENV_KEYS
+      .map(key => [key, process.env[key]] as const)
+      .filter((entry): entry is readonly [typeof CONFIG_ENV_KEYS[number], string] => entry[1] !== undefined),
+  )
+}
+
+function clearConfigEnv(): void {
+  for (const key of CONFIG_ENV_KEYS) {
+    delete process.env[key]
+  }
+}
+
+function restoreConfigEnv(snapshot: ConfigEnvSnapshot): void {
+  clearConfigEnv()
+  for (const [key, value] of Object.entries(snapshot)) {
+    process.env[key] = value
+  }
+}
+
 function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
   return new ReadableStream({
@@ -31,14 +74,35 @@ async function collectEvents(iterable: AsyncIterable<NexusEvent>): Promise<Nexus
   return events
 }
 
+function parseRequestBody(init?: RequestInit): any {
+  if (typeof init?.body !== 'string') return undefined
+  try {
+    return JSON.parse(init.body)
+  } catch {
+    return undefined
+  }
+}
+
+function isIntakeRequestBody(body: any): boolean {
+  if (!body) return false
+  if (typeof body.system === 'string' && body.system.includes('fast intake classifier')) return true
+  if (Array.isArray(body.system) && JSON.stringify(body.system).includes('fast intake classifier')) return true
+  if (Array.isArray(body.messages) && JSON.stringify(body.messages).includes('coding agent intake step')) return true
+  return false
+}
+
 describe('ConfigManager', () => {
   let tempConfigPath: string
+  let envSnapshot: ConfigEnvSnapshot
 
   beforeEach(() => {
+    envSnapshot = snapshotConfigEnv()
+    clearConfigEnv()
     tempConfigPath = join(tmpdir(), `babel-o-test-config-${Date.now()}-${Math.random()}.json`)
   })
 
   afterEach(() => {
+    restoreConfigEnv(envSnapshot)
     if (fs.existsSync(tempConfigPath)) {
       try {
         fs.unlinkSync(tempConfigPath)
@@ -341,8 +405,11 @@ describe('LLMCodingRuntime', () => {
   let originalFetch: typeof globalThis.fetch
   let fetchCalls: { url: string; init?: RequestInit }[]
   let fetchStreamResponses: ReadableStream<Uint8Array>[]
+  let envSnapshot: ConfigEnvSnapshot
 
   beforeEach(() => {
+    envSnapshot = snapshotConfigEnv()
+    clearConfigEnv()
     tempConfigPath = join(tmpdir(), `babel-o-test-config-${Date.now()}-${Math.random()}.json`)
     configManager = new ConfigManager(tempConfigPath)
     configManager.setProviderConfig('anthropic', {
@@ -357,6 +424,22 @@ describe('LLMCodingRuntime', () => {
     originalFetch = globalThis.fetch
 
     globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"test intake\\",\\"guidance\\":\\"Proceed with the latest request.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
       fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
       const nextStream = fetchStreamResponses.shift() || createMockStream([])
       return {
@@ -370,6 +453,7 @@ describe('LLMCodingRuntime', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch
+    restoreConfigEnv(envSnapshot)
     if (fs.existsSync(tempConfigPath)) {
       try {
         fs.unlinkSync(tempConfigPath)
@@ -426,6 +510,62 @@ describe('LLMCodingRuntime', () => {
     assert.ok(fetchCalls[0].url.startsWith('https://api.test-anthropic.com'))
     const headers = fetchCalls[0].init?.headers as Record<string, string>
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
+  })
+
+  test('persists user_intake_guidance and hides tools for respond-only intake', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"pause\\",\\"confidence\\":0.96,\\"continuity\\":0.3,\\"contextScope\\":\\"recent\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"The user asked the agent to wait.\\",\\"guidance\\":\\"Acknowledge and wait without using tools.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"I will wait for your next request."}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-intake-respond-only',
+        prompt: 'just stop it and wait for me',
+        cwd: tmpdir(),
+      })
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.intent, 'pause')
+    assert.equal(intake.actionHint, 'respond_only')
+    assert.equal(intake.requiresTools, false)
+    assert.equal(intake.source, 'model')
+
+    assert.equal(fetchCalls.length, 1)
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.tools, undefined)
+    assert.match(JSON.stringify(body.system), /User Intake Guidance/)
   })
 
   test('only exposes policy-allowed tools to provider requests', async () => {
@@ -561,6 +701,58 @@ describe('LLMCodingRuntime', () => {
     assert.equal(fetchCalls.length, 2)
   })
 
+  test('replays live DeepSeek reasoning_content when returning tool results', async () => {
+    configManager.setProviderConfig('deepseek', {
+      apiKey: 'deepseek-test-key',
+      baseUrl: 'https://api.deepseek.test/v1',
+    })
+    configManager.setDefaultModel('deepseek/deepseek-v4-pro')
+    const cwd = join(tmpdir(), `babel-o-test-deepseek-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'README.md')
+    fs.writeFileSync(targetFile, 'hello from deepseek replay test', 'utf8')
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'data: {"choices":[{"delta":{"reasoning_content":"I should inspect the file first."}}]}\n\n',
+        'data: {"choices":[{"delta":{"content":"I will read the file."}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read","function":{"name":"Read"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\\"path\\":\\"' +
+          targetFile.replace(/\\/g, '\\\\') +
+          '\\"}"}}]}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'data: {"choices":[{"delta":{"content":"The file says hello."}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-deepseek-reasoning-replay',
+        prompt: 'read README',
+        cwd,
+      })
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    assert.equal(fetchCalls.length, 2)
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    const assistantWithTool = secondBody.messages.find((message: any) => message.role === 'assistant' && message.tool_calls)
+    assert.ok(assistantWithTool)
+    assert.equal(assistantWithTool.reasoning_content, 'I should inspect the file first.')
+    assert.ok(events.some(event => event.type === 'thinking_delta'))
+    const result = events.find(event => event.type === 'result') as any
+    assert.equal(result?.success, true)
+  })
+
   test('returns missing Read paths to the model instead of aborting the turn', async () => {
     const cwd = join(tmpdir(), `babel-o-test-missing-read-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
@@ -624,6 +816,8 @@ describe('LLMCodingRuntime', () => {
     fs.mkdirSync(cwd, { recursive: true })
     const outsidePath = join(dirname(cwd), 'outside-package.json')
 
+    process.env.NEXUS_ALLOWED_WORKSPACES = cwd
+
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -676,6 +870,7 @@ describe('LLMCodingRuntime', () => {
     assert.equal(toolResult.is_error, true)
     assert.match(toolResult.content, /WORKSPACE_PATH_ESCAPE|outside the current workspace/)
 
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
     try {
       fs.rmdirSync(cwd)
     } catch {}

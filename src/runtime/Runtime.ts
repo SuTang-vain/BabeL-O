@@ -1,4 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
+import type { NexusStorage } from '../storage/Storage.js'
 import type { ToolRisk } from '../tools/Tool.js'
 
 export type RuntimeExecuteOptions = {
@@ -15,6 +16,8 @@ export type RuntimeExecuteOptions = {
   model?: string
   budget?: number
   executionEnvironment?: 'local' | 'docker' | 'remote'
+  storage?: NexusStorage
+  allowedPaths?: string[]
 }
 
 export interface NexusRuntime {

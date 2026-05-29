@@ -343,7 +343,7 @@ test('REST API endpoint GET /v1/sessions/:sessionId/tool-traces', async () => {
       method: 'GET',
       url: '/v1/sessions/non-existent-session/tool-traces',
     })
-    assert.equal(notFoundRes.statusCode, 200) // Fastify API conventions might return 200 with an error object
+    assert.equal(notFoundRes.statusCode, 404)
     const notFoundBody = notFoundRes.json()
     assert.equal(notFoundBody.type, 'error')
     assert.equal(notFoundBody.code, 'SESSION_NOT_FOUND')

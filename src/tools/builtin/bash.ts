@@ -18,7 +18,7 @@ const SESSION_CWD_TTL_MS = 24 * 60 * 60 * 1000
 const SESSION_CWD_SWEEP_INTERVAL_MS = 60 * 60 * 1000
 
 // Maintain a map of sessionId -> last active CWD
-const sessionCwdMap = new Map<string, { cwd: string; lastActiveAt: number }>()
+const sessionCwdMap = new Map<string, { cwd: string; workspaceCwd: string; lastActiveAt: number }>()
 
 type StateProbe = {
   marker: string
@@ -37,17 +37,11 @@ type FailedCommandResult = {
 function resolveShellCwd(sessionId: string, workspaceCwd: string): string {
   const retained = sessionCwdMap.get(sessionId)
   if (!retained) return workspaceCwd
-
-  try {
-    resolveInsideWorkspace(workspaceCwd, retained.cwd)
-    return retained.cwd
-  } catch (error) {
-    if (error instanceof WorkspacePathError || (error as { code?: unknown })?.code === 'WORKSPACE_PATH_ESCAPE') {
-      sessionCwdMap.delete(sessionId)
-      return workspaceCwd
-    }
-    throw error
+  if (retained.workspaceCwd !== workspaceCwd) {
+    sessionCwdMap.delete(sessionId)
+    return workspaceCwd
   }
+  return retained.cwd
 }
 
 function createStateProbe(): StateProbe {
@@ -128,10 +122,12 @@ function toFailedCommandResult(
 function updateSessionCwdFromFailure(
   sessionId: string,
   detectedCwd: string | null,
+  workspaceCwd: string,
 ): void {
   if (!detectedCwd) return
   sessionCwdMap.set(sessionId, {
     cwd: detectedCwd,
+    workspaceCwd,
     lastActiveAt: Date.now(),
   })
 }
@@ -202,7 +198,7 @@ export const bashTool: ToolDefinition<typeof inputSchema> = {
   inputSchema,
   async execute(input, context) {
     const currentCwd = resolveShellCwd(context.sessionId, context.cwd)
-    const workspaceEscape = findWorkspaceEscapeInCommand(input.command, context.cwd)
+    const workspaceEscape = findWorkspaceEscapeInCommand(input.command, context.cwd, context.allowedPaths)
     if (workspaceEscape) {
       return {
         success: false,
@@ -316,6 +312,7 @@ exit $_EXIT_CODE`
         if (detectedCwd) {
           sessionCwdMap.set(context.sessionId, {
             cwd: detectedCwd,
+            workspaceCwd: context.cwd,
             lastActiveAt: Date.now(),
           })
         }
@@ -331,7 +328,7 @@ exit $_EXIT_CODE`
           wrappedCommand,
           input.command,
         )
-        updateSessionCwdFromFailure(context.sessionId, detectedCwd)
+        updateSessionCwdFromFailure(context.sessionId, detectedCwd, context.cwd)
         if (isRecoverableCommandFailure(err)) {
           return {
             success: false,
@@ -364,6 +361,7 @@ exit $_EXIT_CODE`
       if (detectedCwd) {
         sessionCwdMap.set(context.sessionId, {
           cwd: detectedCwd,
+          workspaceCwd: context.cwd,
           lastActiveAt: Date.now(),
         })
       }
@@ -380,7 +378,7 @@ exit $_EXIT_CODE`
         wrappedCommand,
         input.command,
       )
-      updateSessionCwdFromFailure(context.sessionId, detectedCwd)
+      updateSessionCwdFromFailure(context.sessionId, detectedCwd, context.cwd)
       if (isRecoverableCommandFailure(err)) {
         return {
           success: false,
@@ -398,10 +396,11 @@ exit $_EXIT_CODE`
   },
 }
 
-function findWorkspaceEscapeInCommand(command: string, cwd: string): WorkspacePathError | null {
+function findWorkspaceEscapeInCommand(command: string, cwd: string, allowedPaths?: string[]): WorkspacePathError | null {
+  if (!process.env.NEXUS_ALLOWED_WORKSPACES) return null
   for (const path of extractAbsoluteCommandPaths(command)) {
     try {
-      resolveInsideWorkspace(cwd, path)
+      resolveInsideWorkspace(cwd, path, allowedPaths)
     } catch (error) {
       if (error instanceof WorkspacePathError) {
         return error

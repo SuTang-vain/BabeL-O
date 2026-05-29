@@ -265,26 +265,17 @@ Call 8              39,098       12,800
 全会话 input      362,988      ~180,000  (-50%)
 ```
 
-## 实施顺序
+## 实施状态：✅ 已完成 (2026-05-28)
+
+实际实施与原方案略有差异：
+- Step 3 (maxResultSizeChars 字段) 未单独添加到 Tool.ts 类型，改为在 `replaceLargeToolResult` 中按 toolName === 'Read' 跳过，更简洁。
+- 旧 per-turn 预算（toolResultBudgetChars / toolBudgetExceeded）已完全移除。
+- 9 个测试覆盖：持久化写入、wx 去重、小结果跳过、大结果替换、Read 跳过、消息预算、re-apply、非 user 消息跳过。
 
 ```
-Step 1  toolResultBudget.ts 新建（无依赖）
-Step 2  LLMCodingRuntime.ts 集成两层预算 + 移除旧 per-turn 预算
-Step 3  Tool maxResultSizeChars 配置
-Step 4  tool-result-budget.test.ts 新建
-Step 5  runtime.test.ts 更新 + 全量验证
+Step 1  ✅ src/runtime/toolResultBudget.ts 新建
+Step 2  ✅ LLMCodingRuntime.ts 集成两层预算 + 移除旧 per-turn 预算
+Step 3  ✅ Read 工具跳过持久化（通过 toolName 判断，无需类型字段）
+Step 4  ✅ test/tool-result-budget.test.ts 新建（9 个测试）
+Step 5  ✅ 全量验证通过（259/261，2 个预先存在的 URL 配置失败）
 ```
-
-## 涉及文件
-
-| 文件 | 改动类型 |
-|------|----------|
-| `src/runtime/toolResultBudget.ts` | **新建** |
-| `src/runtime/LLMCodingRuntime.ts` | 修改：集成两层预算，移除旧 per-turn 预算 |
-| `src/tools/builtin/read.ts` | 修改：maxResultSizeChars = Infinity |
-| `src/tools/builtin/bash.ts` | 修改：maxResultSizeChars = 50000 |
-| `src/tools/builtin/grep.ts` | 修改：maxResultSizeChars = 50000 |
-| `src/tools/builtin/glob.ts` | 修改：maxResultSizeChars = 50000 |
-| `src/tools/Tool.ts` | 修改：类型增加 maxResultSizeChars 字段 |
-| `test/tool-result-budget.test.ts` | **新建** |
-| `test/runtime.test.ts` | 修改：移除 toolBudgetExceeded 断言 |

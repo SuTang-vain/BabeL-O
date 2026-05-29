@@ -1,5 +1,6 @@
 import chalk from 'chalk'
 import { ConfigManager } from '../shared/config.js'
+import { keyboardShortcuts, renderCompactHelp } from './helpPanel.js'
 
 const PIXEL_ROWS = [
   '    M    ',
@@ -38,7 +39,7 @@ export function renderWelcome(options: {
   url?: string
 }): void {
   const username = process.env.USER || process.env.USERNAME || 'User'
-  const version = '0.1.0'
+  const version = '0.2.0'
   const mode = options.url ? `Service (${options.url})` : 'Embedded (Local)'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
@@ -49,15 +50,22 @@ export function renderWelcome(options: {
     `${chalk.dim('Model:')}     ${chalk.yellow(defaultModel)}`,
     `${chalk.dim('Workspace:')} ${chalk.italic.white(options.cwd)}`,
     `${chalk.dim('Mode:')}      ${chalk.magenta(mode)}`,
-    `${chalk.dim('Type')} ${chalk.bold.yellow('/help')} ${chalk.dim('to list commands, or')} ${chalk.bold.green('exit')} ${chalk.dim('to quit.')}`,
+    '',
   ]
 
   console.log()
   for (let i = 0; i < PIXEL_ROWS.length; i++) {
     const logoCol = renderLogoRow(PIXEL_ROWS[i]!)
     const metaCol = metadataLines[i] || ''
-    // Use literal spacing since logoCol has a constant visual width of 9 cells
     console.log(`  ${logoCol}   ${metaCol}`)
   }
-  console.log(chalk.dim('  ' + ' '.repeat(60)))
+
+  // Quick commands bar
+  console.log()
+  console.log(renderCompactHelp())
+  console.log()
+
+  // Tips
+  //console.log(chalk.dim('  💡 Tips:') + ` ${chalk.white('输入 /help 查看完整帮助 ·')} ${chalk.white('Ctrl+O 切换视图模式')}`)
+  //console.log()
 }

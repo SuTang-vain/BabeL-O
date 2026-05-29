@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
 import { logger } from '../shared/logger.js'
 
-function runGitCommand(
+export function runGitCommand(
   cwd: string,
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -25,7 +25,7 @@ function runGitCommand(
   });
 }
 
-function parsePorcelainChangedPaths(stdout: string): string[] {
+export function parsePorcelainChangedPaths(stdout: string): string[] {
   const paths = new Set<string>()
   for (const entry of stdout.split('\0')) {
     if (!entry) continue

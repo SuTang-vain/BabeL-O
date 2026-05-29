@@ -1,6 +1,7 @@
 import type { ModelAdapter, ModelQueryParams, ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import type { NexusEvent } from '../shared/events.js'
 import { ConfigManager } from '../shared/config.js'
+import { logger } from '../shared/logger.js'
 import { getAdapter, getModel } from '../providers/registry.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
 
@@ -169,7 +170,7 @@ export async function llmSummarizeEvents(
     const allMessages = [...conversationMessages, compactPromptMessage]
 
     let contextWindow = 8192
-    try { contextWindow = getModel(modelId).contextWindow } catch {}
+    try { contextWindow = getModel(modelId).contextWindow } catch (e) { logger.debug('Failed to resolve model context window', e) }
     const maxInputTokens = contextWindow - COMPACT_MAX_OUTPUT_TOKENS - COMPACT_CONTEXT_RESERVE
 
     const messages = truncateMessagesToFit(allMessages, maxInputTokens)

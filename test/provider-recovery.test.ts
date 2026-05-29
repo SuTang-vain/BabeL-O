@@ -28,3 +28,16 @@ test('classifyProviderRecovery tags auth and billing failures as non-retryable',
   assert.equal(details?.recoveryReason, 'PROVIDER_AUTH_OR_BILLING')
   assert.equal(details?.retryable, false)
 })
+
+test('classifyProviderRecovery tags provider protocol replay mismatches', () => {
+  const details = classifyProviderRecovery(
+    new ProviderError(
+      'deepseek',
+      400,
+      '{"error":{"message":"The `reasoning_content` in the thinking mode must be passed back to the API."}}',
+    ),
+  )
+  assert.equal(details?.kind, 'provider_protocol')
+  assert.equal(details?.recoveryReason, 'PROVIDER_PROTOCOL_REPLAY_MISMATCH')
+  assert.equal(details?.retryable, false)
+})

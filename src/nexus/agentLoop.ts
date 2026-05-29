@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import type { AgentRoleDefinition } from './agentRoles.js'
 import {
   PLANNER_ROLE,
@@ -35,6 +34,8 @@ import {
   commitAndMergeWorktree,
   removeWorktree,
   pruneOrphanedWorktrees,
+  runGitCommand,
+  parsePorcelainChangedPaths,
 } from './worktree.js'
 import { RuntimeAgentStepError } from './runtimeAgentStep.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
@@ -78,20 +79,6 @@ export type AgentStepRunner = <TInput, TOutput>(options: {
   input: TInput
 }) => Promise<TOutput>
 
-// Git Utilities helper
-function runGitCommand(cwd: string, args: string[]): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    const child = spawn('git', args, { cwd })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (data) => { stdout += data.toString() })
-    child.stderr.on('data', (data) => { stderr += data.toString() })
-    child.on('close', (code) => {
-      resolve({ code: code ?? 0, stdout: stdout.trim(), stderr: stderr.trim() })
-    })
-  })
-}
-
 async function gitIsClean(cwd: string): Promise<boolean> {
   const { code, stdout } = await runGitCommand(cwd, ['status', '--porcelain'])
   return code === 0 && stdout === ''
@@ -107,23 +94,6 @@ async function gitStash(cwd: string): Promise<boolean> {
 
 async function gitStashPop(cwd: string): Promise<void> {
   await runGitCommand(cwd, ['stash', 'pop'])
-}
-
-function parsePorcelainChangedPaths(stdout: string): string[] {
-  const paths = new Set<string>()
-  for (const entry of stdout.split('\0')) {
-    if (!entry) continue
-    const status = entry.slice(0, 2)
-    const rawPath = entry[2] === ' '
-      ? entry.slice(3)
-      : entry[1] === ' '
-        ? entry.slice(2)
-        : entry.slice(3)
-    if (!rawPath) continue
-    if (status.includes('D')) continue
-    paths.add(rawPath)
-  }
-  return [...paths].sort()
 }
 
 async function gitChangedPaths(cwd: string): Promise<string[]> {

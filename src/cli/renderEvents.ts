@@ -2,6 +2,7 @@ import chalk from 'chalk'
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import { renderDiff } from './diff.js'
+import { renderMarkdown, containsMarkdown, formatToolOutputMarkdown, MarkdownStreamRenderer } from './markdown.js'
 
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
@@ -13,6 +14,10 @@ let printedLinesCount = 0
 let currentLineLength = 0
 let liveLineStarted = false
 let currentOutputBlock: 'none' | 'assistant' | 'thinking' = 'none'
+
+// Markdown streaming renderer for assistant output
+const markdownRenderer = new MarkdownStreamRenderer()
+let pendingMarkdownBuffer = ''
 
 // Track active readline for prompt redraws
 let activeReadlineInterface: any = null
@@ -285,8 +290,29 @@ function handleAssistantDelta(text: string) {
     process.stdout.write(`${chalk.green('⏺')} `)
     liveLineStarted = true
     currentOutputBlock = 'assistant'
+    // Reset markdown renderer on new block
+    markdownRenderer.flush()
   }
-  handleDelta(text, false)
+  // Use markdown renderer for styled output
+  const rendered = markdownRenderer.feed(text)
+  process.stdout.write(rendered)
+
+  // Track printed lines
+  const columns = process.stdout.columns || 80
+  const cleanText = stripAnsi(rendered)
+  const lines = cleanText.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      printedLinesCount++
+      currentLineLength = 0
+    }
+    currentLineLength += lines[i]!.length
+    if (currentLineLength >= columns) {
+      const wraps = Math.floor(currentLineLength / columns)
+      printedLinesCount += wraps
+      currentLineLength = currentLineLength % columns
+    }
+  }
 }
 
 function handleThinkingDelta(text: string) {
@@ -338,7 +364,7 @@ function renderLiveEvent(event: NexusEvent): void {
         console.log(chalk.yellow(`output truncated at ${event.originalBytes ?? 'unknown'} original bytes`))
       }
       if (tuiMode === 'expanded' && event.output !== undefined) {
-        console.log(formatOutput(event.output))
+        console.log(formatToolOutputMarkdown(String(event.output)))
       }
       break
     }
@@ -477,9 +503,15 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         outputText += `${formatUserPrompt(ev.text)}\n`
         break
 
-      case 'assistant_delta':
-        outputText += `${chalk.green('⏺')} ${ev.text}\n`
+      case 'assistant_delta': {
+        // Render assistant text with markdown if it contains formatting
+        if (containsMarkdown(ev.text)) {
+          outputText += `${chalk.green('⏺')} \n${renderMarkdown(ev.text)}\n`
+        } else {
+          outputText += `${chalk.green('⏺')} ${ev.text}\n`
+        }
         break
+      }
 
       case 'thinking_delta':
         if (mode === 'expanded') {
@@ -519,7 +551,12 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
                 }
               }
               if (state.output !== undefined) {
-                outputText += `  Output:\n${formatOutput(state.output)}\n`
+                const outputStr = String(state.output)
+                if (containsMarkdown(outputStr)) {
+                  outputText += `  Output:\n${formatToolOutputMarkdown(outputStr)}\n`
+                } else {
+                  outputText += `  Output:\n${formatOutput(state.output)}\n`
+                }
               }
             }
           }
@@ -975,7 +1012,12 @@ function formatToolOutputSummary(name: string, output: unknown, truncated?: bool
 }
 
 function formatOutput(output: unknown): string {
-  if (typeof output === 'string') return output
+  if (typeof output === 'string') {
+    if (containsMarkdown(output)) {
+      return formatToolOutputMarkdown(output)
+    }
+    return output
+  }
   return JSON.stringify(output, null, 2)
 }
 
