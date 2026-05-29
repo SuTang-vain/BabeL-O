@@ -2,6 +2,34 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-29 — P0 Provider smoke live tool-call 与协议回归扩展
+
+- **用户决策**: 继续推进 P0，并在用户已全量修复 TUI 页面问题后直接执行测试与 provider/runtime P0 收口。
+- **处理**:
+  - `POST /v1/runtime/provider-smoke/live` 新增显式 `mode=tool_call`，用固定 synthetic tool `provider_smoke_probe` 与固定 `BABEL_O_PROVIDER_SMOKE_OK` probe 参数验证 provider 工具调用协议。
+  - live tool-call smoke 只收集 `tool_use_start/tool_use_delta/tool_use_end`，不执行工具、不创建 session、不写 event、不自动切换 provider/model/profile、不泄露 API key。
+  - CLI 支持 `/smoke live tool-call` 与 `/smoke tool-call`，展示 tool matched 状态、toolCallCount 和工具名；help panel 增加对应入口。
+  - `adapters.test.ts` 新增 Anthropic malformed `input_json_delta` 回归，确认以 `_parseError/_rawInput` 保留为 recoverable tool input。
+  - `adapters.test.ts` 新增 OpenAI 并发 multi-tool `tool_calls` 回归，确认按 index 分离参数流并各自产生正确 `tool_use_end.input`。
+  - 清理 `src/cli/renderEvents.ts` EOF 多余空行，使 `git diff --check` 通过。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/adapters.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-input.test.ts`：82/82 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test`：305/305 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-29 — P0 Provider 协议 regression corpus 扩展
+
+- **用户决策**: 继续根据建议推进 P0，在 simple-text live smoke 之后优先扩展 provider 协议兼容回归。
+- **处理**:
+  - `adapters.test.ts` 新增 MiniMax text-encoded tool call 前后夹带普通文本的回归，确认普通文本保留、raw `<minimax:tool_call>` 不作为 text delta 泄露。
+  - `adapters.test.ts` 新增 MiniMax 未闭合 `<minimax:tool_call>` 回归，确认不会被转换成真实工具调用。
+  - `adapters.test.ts` 新增 OpenAI malformed `delta.tool_calls[].function.arguments` 回归，确认最终 `tool_use_end.input` 保留 `_parseError` 与 `_rawInput`。
+  - `runtime-llm.test.ts` 新增 OpenAI malformed tool-call runtime 回归，确认 raw provider 协议不进入 `assistant_delta`，并以 recoverable `tool_completed success=false` / `PARSE_ERROR` 回传模型。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/adapters.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：52/52 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
 ## 2026-05-29 — P0 Provider smoke live 与 CLI/TUI 展示第一版
 
 - **用户决策**: 根据建议执行 P0-0 与 P0-1：收口 live provider smoke，并把 provider smoke 诊断接入 CLI/TUI 状态展示。

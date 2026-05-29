@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
-import { formatSessionHistory, renderEvent, startSession } from '../src/cli/renderEvents.js'
+import { formatSessionHistory, renderEvent, renderEventForTest, startSession } from '../src/cli/renderEvents.js'
 import type { NexusEvent } from '../src/shared/events.js'
 
 test('formatSessionHistory: compact mode renders correct summaries', () => {
@@ -41,13 +41,14 @@ test('formatSessionHistory: compact mode renders correct summaries', () => {
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('> hello world'))
+  assert.ok(output.includes('BabeL-O'))
+  assert.ok(output.includes('hello world'))
   assert.ok(output.includes('Thinking about listing directory.'))
   // Should render compact bullet point
   assert.ok(output.includes('✓'))
   assert.ok(output.includes('ListDir'))
   assert.ok(output.includes('done'))
-  assert.ok(output.includes('ctrl+o to expand'))
+  assert.ok(output.includes('ctrl+o to expand tool details'))
   // Should NOT render outputs in compact mode
   assert.ok(!output.includes('file.txt'))
   assert.ok(!output.includes('Success: true'))
@@ -84,7 +85,8 @@ test('formatSessionHistory: expanded mode renders complete details', () => {
   ]
 
   const output = formatSessionHistory(events, 'expanded')
-  assert.ok(output.includes('> run command'))
+  assert.ok(output.includes('BabeL-O'))
+  assert.ok(output.includes('run command'))
   assert.ok(output.includes('✓ Bash'))
   assert.ok(output.includes('Input:'))
   assert.ok(output.includes('CommandLine'))
@@ -307,8 +309,161 @@ test('formatSessionHistory: separates assistant text and bash tool layers', () =
   assert.ok(output.includes('I will inspect the directory.'))
   assert.ok(output.includes('●'))
   assert.ok(output.includes('Bash'))
-  assert.ok(output.includes('running') || output.includes('done'))
+  assert.ok(output.includes('done'))
+  assert.ok(!output.includes('running'))
   assert.ok(!output.includes('Running Bash...'))
+})
+
+test('formatSessionHistory: completed tools replace running state on redraw', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-tool-redraw',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read',
+      name: 'Read',
+      input: { file_path: '/tmp/file.txt' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-tool-redraw',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read',
+      name: 'Read',
+      success: true,
+      output: 'content',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('Read /tmp/file.txt'))
+  assert.ok(output.includes('done'))
+  assert.ok(!output.includes('running'))
+})
+
+test('formatSessionHistory: compact mode shows expand hint only once', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expand-hint',
+      timestamp: now,
+      toolUseId: 'tool-read-a',
+      name: 'Read',
+      input: { path: '/tmp/a.md' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expand-hint',
+      timestamp: now,
+      toolUseId: 'tool-read-a',
+      name: 'Read',
+      success: true,
+      output: 'a',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expand-hint',
+      timestamp: now,
+      toolUseId: 'tool-read-b',
+      name: 'Read',
+      input: { path: '/tmp/b.md' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expand-hint',
+      timestamp: now,
+      toolUseId: 'tool-read-b',
+      name: 'Read',
+      success: true,
+      output: 'b',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('Read /tmp/a.md done'))
+  assert.ok(output.includes('Read /tmp/b.md done'))
+  assert.equal((output.match(/ctrl\+o to expand/g) ?? []).length, 1)
+  assert.ok(!output.includes('(ctrl+o to expand)'))
+})
+
+test('formatSessionHistory: compact tool rows hide raw tool parameter names', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-tool-simple',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-simple',
+      name: 'Read',
+      input: { path: '/Users/tangyaoyue/DEV/Baidu/project/README.md', maxBytes: 2000 },
+    },
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-tool-simple',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-bash-simple',
+      name: 'Bash',
+      input: { command: 'find /Users/tangyaoyue/DEV/Baidu -name README.md', timeoutMs: 10000 },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('Read /Users/tangyaoyue/DEV/Baidu/project/README.md'))
+  assert.ok(output.includes('Bash find /Users/tangyaoyue/DEV/Baidu -name README.md'))
+  assert.ok(!output.includes('path'))
+  assert.ok(!output.includes('maxBytes'))
+  assert.ok(!output.includes('timeoutMs'))
+  assert.ok(!output.includes('running'))
+})
+
+test('renderEvent updates live tool completion on the same terminal row', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-tool-row',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-live',
+      name: 'Read',
+      input: { path: '/tmp/file.txt', maxBytes: 2000 },
+    })
+    renderEventForTest({
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-tool-row',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-live',
+      name: 'Read',
+      success: true,
+      output: 'content',
+    })
+  } finally {
+    process.stdout.write = originalWrite
+  }
+
+  const output = writes.join('')
+  assert.ok(output.includes('● Read /tmp/file.txt'))
+  assert.ok(output.includes('\r\x1b[K'))
+  assert.ok(output.includes('● ✓ Read /tmp/file.txt done'))
+  assert.equal((output.match(/\n/g) ?? []).length, 0)
+  assert.ok(!output.includes('maxBytes'))
+  assert.ok(!output.includes('running'))
 })
 
 test('formatSessionHistory: renders expanded thinking as a separate thought block', () => {

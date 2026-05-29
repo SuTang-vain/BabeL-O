@@ -4,6 +4,14 @@ import { emitKeypressEvents } from 'node:readline'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { getChatPrompt } from './renderEvents.js'
 import { inputState } from './inputState.js'
+import { normalizeKeyEvent } from './keyEvent.js'
+import {
+  createPermissionPanelState,
+  reducePermissionPanelKey,
+  selectedPermissionChoice,
+} from './permissionPanel.js'
+import { renderedLineCount } from './terminalWidth.js'
+import { renderFixedInputBox } from './inputBox.js'
 
 export type CliReadline = readline.Interface
 
@@ -13,8 +21,6 @@ export type PermissionChoice =
   | 'approve_rule'
   | 'reject'
   | 'reject_instruct'
-
-const REJECT_PERMISSION_CHOICE_INDEX = 3
 
 export interface PermissionDecision {
   approved: boolean
@@ -143,28 +149,24 @@ export function setupAutosuggestions(
   isExecutingRef: { current: boolean }
 ) {
   const rlInt = rl as any
-  const originalRefresh = rlInt._refreshLine
-  if (!originalRefresh) return
+  const originalPrompt = rlInt._prompt ?? getChatPrompt()
 
   rlInt._refreshLine = function() {
-    // 1. Call original refresh to output prompt and current input line
-    originalRefresh.call(this)
+    const currentInput = String(this.line ?? '')
+    const cursor = typeof this.cursor === 'number' ? this.cursor : currentInput.length
+    const suggestion = !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
+      ? getAutosuggestion(currentInput, history)
+      : undefined
+    const rendered = renderFixedInputBox({
+      prompt: originalPrompt,
+      line: currentInput,
+      cursor,
+      suggestion,
+      columns: process.stdout.columns || 80,
+    })
 
-    // 2. Draw inline autosuggestion if input is not executing and suggestion panel is idle
-    const currentInput = this.line
-    if (!currentInput || isExecutingRef.current || inputState.current !== 'idle') {
-      return
-    }
-
-    const suggestion = getAutosuggestion(currentInput, history)
-    if (suggestion && this.cursor === this.line.length) {
-      const suggestionTail = suggestion.slice(currentInput.length)
-      if (suggestionTail) {
-        process.stdout.write(chalk.dim(suggestionTail))
-        // Move terminal cursor back to the end of the user's typed line
-        process.stdout.write(`\x1b[${suggestionTail.length}D`)
-      }
-    }
+    process.stdout.write(`\r\x1b[K${rendered.text}`)
+    readline.cursorTo(process.stdout, rendered.cursorColumn)
   }
 }
 
@@ -197,7 +199,7 @@ export function extractCommandPrefix(command: unknown): string {
 }
 
 export function countRenderedLines(text: string): number {
-  return text.endsWith('\n') ? text.split('\n').length - 1 : text.split('\n').length
+  return renderedLineCount(text)
 }
 
 export function formatPermissionDialog(
@@ -249,7 +251,7 @@ export async function askPermission(
 
   return new Promise<PermissionDecision>((resolve, reject) => {
     let settled = false
-    let activeIndex = 0
+    let panelState = createPermissionPanelState()
     let renderedLines = 0
     const choices: { id: PermissionChoice; label: string }[] = [
       { id: 'approve_once', label: 'Approve once' },
@@ -282,7 +284,7 @@ export async function askPermission(
 
     const redraw = () => {
       clearRenderedPermissionDialog()
-      const dialog = formatPermissionDialog(event, choices, activeIndex)
+      const dialog = formatPermissionDialog(event, choices, panelState.activeIndex)
       process.stdout.write(dialog)
       renderedLines = countRenderedLines(dialog)
     }
@@ -341,62 +343,24 @@ export async function askPermission(
       reject(err)
     }
 
-    const move = (delta: number) => {
-      activeIndex = (activeIndex + delta + choices.length) % choices.length
-      redraw()
-    }
-
-    const chooseIndex = (index: number) => {
-      activeIndex = index
-      void finish(choices[activeIndex]!.id)
+    const applyPanelKey = (chunk: any, key: any) => {
+      const reduced = reducePermissionPanelKey(panelState, normalizeKeyEvent(chunk, key))
+      panelState = reduced.state
+      if (reduced.action.type === 'abort') {
+        onAbort()
+      } else if (reduced.action.type === 'redraw') {
+        redraw()
+      } else if (reduced.action.type === 'finish') {
+        void finish(selectedPermissionChoice(choices, reduced.action.choiceIndex))
+      }
     }
 
     const onData = (chunk: Buffer | string) => {
-      const text = chunk.toString('utf8')
-      if (text.includes('\u0003')) {
-        onAbort()
-        return
-      }
-      if (text.includes('\x1b[A')) {
-        move(-1)
-        return
-      }
-      if (text.includes('\x1b[B')) {
-        move(1)
-        return
-      }
-      for (const char of text) {
-        if (char >= '1' && char <= '5') {
-          chooseIndex(Number(char) - 1)
-          return
-        }
-        if (char === '\r' || char === '\n') {
-          void finish(choices[activeIndex]!.id)
-          return
-        }
-        if (char === '\x1b') {
-          chooseIndex(REJECT_PERMISSION_CHOICE_INDEX)
-          return
-        }
-      }
+      applyPanelKey(chunk, undefined)
     }
 
-    const onKeypress = (_chunk: any, key: any) => {
-      if (key?.ctrl && key.name === 'c') {
-        onAbort()
-        return
-      }
-      if (key?.name === 'up') {
-        move(-1)
-      } else if (key?.name === 'down') {
-        move(1)
-      } else if (key?.name === 'return') {
-        void finish(choices[activeIndex]!.id)
-      } else if (key?.name === 'escape') {
-        chooseIndex(REJECT_PERMISSION_CHOICE_INDEX)
-      } else if (['1', '2', '3', '4', '5'].includes(key?.name)) {
-        chooseIndex(Number(key.name) - 1)
-      }
+    const onKeypress = (chunk: any, key: any) => {
+      applyPanelKey(chunk, key)
     }
 
     for (const listener of dataListeners) {
@@ -472,7 +436,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/model': { tag: 'config', description: 'Open model configuration wizard' },
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },
     '/status': { tag: 'status', description: 'Show current runtime and model' },
-    '/smoke': { tag: 'status', description: 'Run provider smoke readiness check' },
+    '/smoke': { tag: 'status', description: 'Run provider smoke readiness or live probe' },
     '/sessions': { tag: 'session', description: 'List recent sessions' },
     '/history': { tag: 'history', description: 'Search and replay prompt history' },
     '/tool': { tag: 'tools', description: 'Open the tool picker' },

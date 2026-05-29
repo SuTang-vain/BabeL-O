@@ -11,6 +11,7 @@ import {
   countRenderedLines
 } from './ui.js'
 import { inputState } from './inputState.js'
+import { visibleTerminalWidth } from './terminalWidth.js'
 
 type CliReadline = readline.Interface
 
@@ -110,7 +111,7 @@ export function makeCompleter(cwd: string) {
       substring = line
     } else if (line.startsWith('/smoke ')) {
       const smokePrefix = line.slice('/smoke '.length).trimStart().toLowerCase()
-      hits = ['dry-run', 'live']
+      hits = ['dry-run', 'live', 'live tool-call', 'tool-call']
         .filter(option => option.startsWith(smokePrefix))
         .map(option => `/smoke ${option}`)
       substring = line
@@ -235,11 +236,10 @@ export function createSlashPalette(rl: CliReadline) {
     process.stdout.write(palette)
     renderedLines = 1 + countRenderedLines(palette)
 
-    // Calculate visual width of prompt to avoid ANSI escape character offset
-    const promptWidth = prompt.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').length
+    const promptWidth = visibleTerminalWidth(prompt)
 
     readline.moveCursor(process.stdout, 0, -renderedLines)
-    readline.cursorTo(process.stdout, promptWidth + (rlInt.cursor ?? line.length))
+    readline.cursorTo(process.stdout, promptWidth + visibleTerminalWidth(line.slice(0, rlInt.cursor ?? line.length)))
   }
 
   const clear = () => {

@@ -625,6 +625,84 @@ test('/v1/runtime/provider-smoke/live runs fixed live smoke without creating ses
   }
 })
 
+test('/v1/runtime/provider-smoke/live tool-call mode probes provider protocol without sessions', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-live-tool`)
+  const configPath = join(cwd, 'config.json')
+  await mkdir(cwd, { recursive: true })
+
+  const oldConfigFile = process.env.BABEL_O_CONFIG_FILE
+  const oldAnthropicApiKey = process.env.ANTHROPIC_API_KEY
+  const oldAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL
+  const oldFetch = globalThis.fetch
+  process.env.BABEL_O_CONFIG_FILE = configPath
+  process.env.ANTHROPIC_API_KEY = 'anthropic-live-tool-smoke-test-key'
+  process.env.ANTHROPIC_BASE_URL = 'https://api.test-anthropic.com'
+
+  const fetchCalls: RequestInit[] = []
+  globalThis.fetch = async (_url, init) => {
+    fetchCalls.push(init ?? {})
+    return {
+      ok: true,
+      status: 200,
+      body: createRuntimeTestStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool_smoke","name":"provider_smoke_probe","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"probe\\":\\"BABEL_O_PROVIDER_SMOKE_OK\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+        'event: message_delta\n',
+        'data: {"delta":{"stop_reason":"tool_use"}}\n\n',
+      ]),
+      text: async () => 'mock live tool smoke response',
+    } as Response
+  }
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/provider-smoke/live',
+      payload: { model: 'anthropic/claude-3-5-sonnet', mode: 'tool_call' },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'provider_smoke')
+    assert.equal(body.mode, 'live')
+    assert.equal(body.smokeMode, 'tool_call')
+    assert.equal(body.ready, true)
+    assert.equal(body.live, true)
+    assert.equal(body.success, true)
+    assert.equal(body.requirements.tools, true)
+    assert.equal(body.matchedExpectedTool, true)
+    assert.equal(body.toolCallCount, 1)
+    assert.deepEqual(body.toolCalls, [
+      { name: 'provider_smoke_probe', input: { probe: 'BABEL_O_PROVIDER_SMOKE_OK' } },
+    ])
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
+
+    assert.equal(fetchCalls.length, 1)
+    const requestBody = JSON.parse(String(fetchCalls[0].body))
+    assert.equal(requestBody.tools[0].name, 'provider_smoke_probe')
+    assert.equal(requestBody.tools[0].input_schema.properties.probe.enum[0], 'BABEL_O_PROVIDER_SMOKE_OK')
+    assert.match(JSON.stringify(requestBody), /provider_smoke_probe/)
+    assert.match(JSON.stringify(requestBody), /BABEL_O_PROVIDER_SMOKE_OK/)
+    assert.doesNotMatch(JSON.stringify(requestBody), /分析|project|Baidu/)
+  } finally {
+    await app.close()
+    globalThis.fetch = oldFetch
+    if (oldAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey
+    if (oldAnthropicBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL
+    else process.env.ANTHROPIC_BASE_URL = oldAnthropicBaseUrl
+    if (oldConfigFile === undefined) delete process.env.BABEL_O_CONFIG_FILE
+    else process.env.BABEL_O_CONFIG_FILE = oldConfigFile
+  }
+})
+
 test('/v1/sessions/:sessionId/context returns reusable context analysis', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-context-api`)
   await mkdir(cwd, { recursive: true })

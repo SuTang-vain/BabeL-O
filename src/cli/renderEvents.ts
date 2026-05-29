@@ -3,16 +3,14 @@ import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import { renderDiff } from './diff.js'
 import { renderMarkdown, containsMarkdown, formatToolOutputMarkdown, MarkdownStreamRenderer } from './markdown.js'
-
-function stripAnsi(text: string): string {
-  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
-}
+import { renderedLineCount, stripAnsi, terminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
 let tuiMode: 'compact' | 'expanded' = 'compact'
 let sessionEvents: NexusEvent[] = []
 let printedLinesCount = 0
 let currentLineLength = 0
 let liveLineStarted = false
+let liveToolLine: { toolUseId: string; renderedLineCount: number; printedLineDelta: number } | undefined
 let currentOutputBlock: 'none' | 'assistant' | 'thinking' = 'none'
 
 // Markdown streaming renderer for assistant output
@@ -28,13 +26,14 @@ let spinnerTimer: NodeJS.Timeout | null = null
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 let spinnerFrameIndex = 0
 let isSpinnerActive = false
+let spinnerRenderedLineCount = 0
 let spinnerStatusText = 'Thinking...'
 let spinnerStartedAt = 0
 let activeSessionModel: string | undefined
 let currentAgentStatus: 'thinking' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle' = 'idle'
 let currentToolName: string | undefined
 let lastContextWarning: { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
-const inputPrompt = chalk.blue('> ')
+const inputPrompt = `${chalk.dim('╭─')} ${chalk.blue('BabeL-O')} ${chalk.dim('›')} `
 const toolPrefix = chalk.blue('●')
 const thoughtPrefix = chalk.magenta('▸')
 
@@ -61,6 +60,7 @@ export function startSession(prompt?: string): void {
   printedLinesCount = 0
   currentLineLength = 0
   liveLineStarted = false
+  liveToolLine = undefined
   currentOutputBlock = 'none'
   pendingPermissionRequest = null
   activeSessionModel = undefined
@@ -82,7 +82,7 @@ export function startSession(prompt?: string): void {
 
   const fullPromptText = `${chalk.cyan('bbl>')} ${prompt}`
   const columns = process.stdout.columns || 80
-  printedLinesCount = getLineCount(fullPromptText + '\n', columns)
+  printedLinesCount = renderedLineCount(fullPromptText + '\n', columns)
   currentLineLength = 0
 }
 
@@ -92,6 +92,7 @@ export function resumeSessionHistory(events: NexusEvent[]): void {
   printedLinesCount = 0
   currentLineLength = 0
   liveLineStarted = false
+  liveToolLine = undefined
   currentOutputBlock = 'none'
   pendingPermissionRequest = null
   activeSessionModel = events.findLast(e => e.type === 'session_started')?.model
@@ -125,10 +126,6 @@ export function startSpinner(text: string = 'Thinking...'): void {
 function setAgentStatus(status: typeof currentAgentStatus, toolName?: string) {
   currentAgentStatus = status
   currentToolName = toolName
-  const statusText = formatAgentStatusText()
-  if (statusText) {
-    startSpinner(statusText)
-  }
 }
 
 function formatAgentStatusText(): string {
@@ -159,6 +156,9 @@ export function stopSpinner(): void {
 }
 
 function drawSpinnerLine() {
+  if (spinnerRenderedLineCount > 0) {
+    clearSpinnerLine()
+  }
   const frame = spinnerFrames[spinnerFrameIndex]!
   const elapsed = spinnerStartedAt > 0 ? Math.floor((Date.now() - spinnerStartedAt) / 1000) : 0
   const elapsedText = elapsed > 0 ? ` ${elapsed}s` : ''
@@ -195,17 +195,27 @@ function drawSpinnerLine() {
   const rightText = `${modelText}|${gaugeText} `
 
   // Combine with padding
-  const leftLen = stripAnsi(leftText).length
-  const rightLen = stripAnsi(rightText).length
+  const leftLen = visibleTerminalWidth(leftText)
+  const rightLen = visibleTerminalWidth(rightText)
   const paddingSize = Math.max(0, columns - leftLen - rightLen - 2)
   const padding = ' '.repeat(paddingSize)
 
-  const fullLine = `\r\x1b[K${leftText}${padding}${rightText}`
-  process.stdout.write(fullLine)
+  const renderedLine = `${leftText}${padding}${rightText}`
+  process.stdout.write(`\r\x1b[K${renderedLine}`)
+  spinnerRenderedLineCount = renderedLineCount(renderedLine, columns)
 }
 
 function clearSpinnerLine() {
-  process.stdout.write('\r\x1b[K')
+  if (spinnerRenderedLineCount > 1) {
+    process.stdout.write(`\r\x1b[K\x1b[${spinnerRenderedLineCount - 1}A\x1b[J`)
+  } else {
+    process.stdout.write('\r\x1b[K')
+  }
+  spinnerRenderedLineCount = 0
+}
+
+export function renderEventForTest(event: NexusEvent): void {
+  renderEvent(event)
 }
 
 export function renderEvent(event: NexusEvent): void {
@@ -251,21 +261,22 @@ export function renderEvent(event: NexusEvent): void {
     return
   }
 
-  // Handle spinner transitions for other events
+  if (isCompactSilentEvent(event)) {
+    sessionEvents.push(event)
+    return
+  }
+
   if (event.type === 'tool_started') {
     setAgentStatus('running_tool', event.name)
   } else if (event.type === 'tool_completed' || event.type === 'tool_denied') {
-    stopSpinner()
     currentAgentStatus = 'idle'
   } else if (event.type === 'permission_request') {
     setAgentStatus('waiting_permission')
   } else if (event.type === 'permission_response') {
-    stopSpinner()
     currentAgentStatus = 'idle'
   } else if (event.type === 'compact_boundary') {
     setAgentStatus('compacting')
   } else if (event.type === 'result' || event.type === 'error') {
-    stopSpinner()
     currentAgentStatus = 'idle'
   }
 
@@ -281,11 +292,11 @@ export function redrawSession(): void {
 
   process.stdout.write(buffer)
 
-  printedLinesCount = getLineCount(buffer, columns)
+  printedLinesCount = renderedLineCount(buffer, columns)
 
   const lastNewlineIdx = buffer.lastIndexOf('\n')
   const lastLine = lastNewlineIdx === -1 ? buffer : buffer.slice(lastNewlineIdx + 1)
-  currentLineLength = lastLine.length
+  currentLineLength = visibleTerminalWidth(lastLine)
 
   if (isSpinnerActive) {
     drawSpinnerLine()
@@ -310,21 +321,7 @@ function handleDelta(text: string, isThinking: boolean) {
     process.stdout.write(text)
   }
 
-  const columns = process.stdout.columns || 80
-  const cleanText = stripAnsi(text)
-  const lines = cleanText.split('\n')
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) {
-      printedLinesCount++
-      currentLineLength = 0
-    }
-    currentLineLength += lines[i]!.length
-    if (currentLineLength >= columns) {
-      const wraps = Math.floor(currentLineLength / columns)
-      printedLinesCount += wraps
-      currentLineLength = currentLineLength % columns
-    }
-  }
+  trackRenderedText(text)
 }
 
 function handleAssistantDelta(text: string) {
@@ -340,22 +337,7 @@ function handleAssistantDelta(text: string) {
   const rendered = markdownRenderer.feed(text)
   process.stdout.write(rendered)
 
-  // Track printed lines
-  const columns = process.stdout.columns || 80
-  const cleanText = stripAnsi(rendered)
-  const lines = cleanText.split('\n')
-  for (let i = 0; i < lines.length; i++) {
-    if (i > 0) {
-      printedLinesCount++
-      currentLineLength = 0
-    }
-    currentLineLength += lines[i]!.length
-    if (currentLineLength >= columns) {
-      const wraps = Math.floor(currentLineLength / columns)
-      printedLinesCount += wraps
-      currentLineLength = currentLineLength % columns
-    }
-  }
+  trackRenderedText(rendered)
 }
 
 function handleThinkingDelta(text: string) {
@@ -369,40 +351,114 @@ function handleThinkingDelta(text: string) {
 }
 
 function ensureLiveLine(): void {
+  flushAssistantMarkdown()
   if (liveLineStarted) {
     process.stdout.write('\n')
+    printedLinesCount++
+    currentLineLength = 0
   }
   liveLineStarted = false
+  liveToolLine = undefined
   currentOutputBlock = 'none'
 }
 
+function clearLiveToolLine(toolUseId: string): boolean {
+  if (!liveToolLine || liveToolLine.toolUseId !== toolUseId) return false
+  if (liveToolLine.renderedLineCount > 1) {
+    process.stdout.write(`\r\x1b[K\x1b[${liveToolLine.renderedLineCount - 1}A\x1b[J`)
+  } else {
+    process.stdout.write('\r\x1b[K')
+  }
+  printedLinesCount = Math.max(0, printedLinesCount - liveToolLine.printedLineDelta)
+  currentLineLength = 0
+  liveLineStarted = false
+  liveToolLine = undefined
+  return true
+}
+
+function renderToolLine(text: string, toolUseId: string): void {
+  const beforePrintedLines = printedLinesCount
+  process.stdout.write(text)
+  const columns = process.stdout.columns || 80
+  trackRenderedText(text)
+  liveToolLine = {
+    toolUseId,
+    renderedLineCount: renderedLineCount(text, columns),
+    printedLineDelta: printedLinesCount - beforePrintedLines,
+  }
+  liveLineStarted = true
+}
+
+function flushAssistantMarkdown(): void {
+  if (currentOutputBlock !== 'assistant') return
+  const rendered = markdownRenderer.flush()
+  if (!rendered) return
+  process.stdout.write(rendered)
+  trackRenderedText(rendered)
+}
+
+function trackRenderedText(text: string): void {
+  const columns = process.stdout.columns || 80
+  const cleanText = stripAnsi(text)
+  const lines = cleanText.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    if (i > 0) {
+      printedLinesCount++
+      currentLineLength = 0
+    }
+    currentLineLength += terminalWidth(lines[i]!)
+    if (currentLineLength >= columns) {
+      const wraps = Math.floor(currentLineLength / columns)
+      printedLinesCount += wraps
+      currentLineLength = currentLineLength % columns
+    }
+  }
+}
+
+function isCompactSilentEvent(event: NexusEvent): boolean {
+  return tuiMode === 'compact' && (
+    event.type === 'usage' ||
+    event.type === 'hook_started' ||
+    event.type === 'hook_completed' ||
+    event.type === 'user_intake_guidance' ||
+    event.type === 'execution_metrics' ||
+    event.type === 'session_memory_updated'
+  )
+}
+
 function renderLiveEvent(event: NexusEvent): void {
-  ensureLiveLine()
+  stopSpinner()
+  const replacedLiveToolLine = event.type === 'tool_completed' ? clearLiveToolLine(event.toolUseId) : false
+  if (!replacedLiveToolLine) {
+    ensureLiveLine()
+  }
 
   switch (event.type) {
     case 'session_started':
       activeSessionModel = event.model
       console.log(formatAgentStatusLine(event))
       currentAgentStatus = 'thinking'
-      startSpinner('Thinking...')
       break
     case 'tool_started': {
-      console.log(formatToolLiveLine({
+      renderToolLine(formatToolLiveLine({
         name: event.name,
         input: event.input,
         status: 'running',
-      }))
-      startSpinner(`Running ${event.name}...`)
+      }), event.toolUseId)
       break
     }
     case 'tool_completed': {
-      console.log(formatToolLiveLine({
+      renderToolLine(formatToolLiveLine({
         name: event.name,
+        input: findToolInput(event.toolUseId),
         status: event.success ? 'completed' : 'failed',
         output: event.output,
         truncated: event.truncated,
         originalBytes: event.originalBytes,
-      }))
+      }), event.toolUseId)
+      if (event.truncated || (tuiMode === 'expanded' && event.output !== undefined)) {
+        ensureLiveLine()
+      }
       if (event.truncated) {
         console.log(chalk.yellow(`output truncated at ${event.originalBytes ?? 'unknown'} original bytes`))
       }
@@ -588,6 +644,14 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         state.truncated = ev.truncated
         state.originalBytes = ev.originalBytes
       }
+    } else if (ev.type === 'tool_denied') {
+      const state = findLatestIncompleteTool(toolsMap, ev.name)
+      if (state) {
+        state.completed = true
+        state.denied = true
+        state.risk = ev.risk
+        state.denialMessage = ev.message
+      }
     }
   }
 
@@ -621,7 +685,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         const state = toolsMap.get(ev.toolUseId)
         if (!state) break
 
-        const formattedInput = formatToolInput(state.input)
+        const formattedInput = formatToolInput(state.name, state.input)
 
         if (mode === 'compact') {
           outputText += formatToolHistoryLine(state, formattedInput) + '\n'
@@ -715,6 +779,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         break
 
       case 'tool_denied': {
+        if (isDeniedToolAlreadyRendered(toolsMap, ev.name, ev.message)) break
         if (mode === 'compact') {
           outputText += `${chalk.red('●')} ${ev.name} denied (${ev.risk} risk) - ${ev.message}\n`
         } else {
@@ -739,6 +804,10 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         }
         break
     }
+  }
+
+  if (mode === 'compact' && hasExpandableToolDetails(toolsMap)) {
+    outputText += chalk.dim('ctrl+o to expand tool details\n')
   }
 
   outputText += formatTaskStatusPanel(events)
@@ -973,7 +1042,7 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
     const suffix = meta.length > 0 ? chalk.dim(` (${meta.join(' · ')})`) : ''
 
     const content = `  ${treePrefix}${coloredStatus}  ${t.title}${suffix}`
-    const visibleLength = stripAnsi(content).length
+    const visibleLength = visibleTerminalWidth(content)
     const padding = ' '.repeat(Math.max(0, width - visibleLength))
     panel += `  ${chalk.cyan('│')}${content}${padding}${chalk.cyan('│')}\n`
   }
@@ -1008,6 +1077,18 @@ function upsertTaskBoardItem(
   Object.assign(existing, next)
 }
 
+function hasExpandableToolDetails(toolsMap: Map<string, ToolCallState>): boolean {
+  return [...toolsMap.values()].some(state => state.completed && !state.denied)
+}
+
+function findLatestIncompleteTool(toolsMap: Map<string, ToolCallState>, name: string): ToolCallState | undefined {
+  return [...toolsMap.values()].findLast(state => state.name === name && !state.completed)
+}
+
+function isDeniedToolAlreadyRendered(toolsMap: Map<string, ToolCallState>, name: string, message: string): boolean {
+  return [...toolsMap.values()].some(state => state.name === name && state.denied && state.denialMessage === message)
+}
+
 function formatAgentStatusLine(event: Extract<NexusEvent, { type: 'session_started' }>): string {
   const model = event.model ?? activeSessionModel ?? 'local/coding-runtime'
   return `${chalk.dim('agent')} ${chalk.cyan(shortSessionId(event.sessionId))} ${chalk.dim('model')} ${chalk.yellow(truncateMiddle(model, 32))}`
@@ -1018,22 +1099,24 @@ function formatUserPrompt(text: string): string {
 }
 
 function formatToolHeader(state: ToolCallState): string {
-  if (state.denied) return chalk.red(`! ${state.name} denied`)
-  if (state.success) return chalk.green(`✓ ${state.name}`)
-  return chalk.red(`✗ ${state.name}`)
+  const label = formatToolCallLabel(state.name, state.input)
+  if (state.denied) return chalk.red(`! ${label} denied`)
+  if (state.success) return chalk.green(`✓ ${label}`)
+  return chalk.red(`✗ ${label}`)
 }
 
 function formatToolHistoryLine(state: ToolCallState, formattedInput: string): string {
+  const label = formatToolCallName(state.name, formattedInput)
   if (!state.completed) {
-    return `${toolPrefix} ${chalk.bold(formatToolCallName(state.name, formattedInput))} ${chalk.dim('running')}`
+    return `${toolPrefix} ${chalk.bold(label)}`
   }
   if (state.denied) {
-    return `${chalk.red('●')} ${chalk.bold(state.name)} ${chalk.red('denied')} ${chalk.dim(state.risk ? `${state.risk} risk` : '')}`
+    return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(state.risk ? `${state.risk} risk` : '')}`
   }
   const marker = state.success ? chalk.green('✓') : chalk.red('✗')
   const status = state.success ? chalk.green('done') : chalk.red('failed')
   const summary = formatToolOutputSummary(state.name, state.output, state.truncated)
-  return `${toolPrefix} ${marker} ${chalk.bold(formatToolCallName(state.name, formattedInput))} ${status}${summary ? ` ${chalk.dim(summary)}` : ''} ${chalk.dim('(ctrl+o to expand)')}`
+  return `${toolPrefix} ${marker} ${chalk.bold(label)} ${status}${summary ? ` ${chalk.dim(summary)}` : ''}`
 }
 
 function formatToolLiveLine(options: {
@@ -1046,12 +1129,13 @@ function formatToolLiveLine(options: {
   truncated?: boolean
   originalBytes?: number
 }): string {
-  const formattedInput = formatToolInput(options.input)
+  const formattedInput = formatToolInput(options.name, options.input)
+  const label = formatToolCallName(options.name, formattedInput)
   if (options.status === 'running') {
-    return `${toolPrefix} ${chalk.bold(formatToolCallName(options.name, formattedInput))} ${chalk.dim('running')}`
+    return `${toolPrefix} ${chalk.bold(label)}`
   }
   if (options.status === 'denied') {
-    return `${chalk.red('●')} ${chalk.bold(options.name)} ${chalk.red('denied')} ${chalk.dim(options.risk ? `${options.risk} risk` : '')} ${options.denialMessage ?? ''}`.trimEnd()
+    return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(options.risk ? `${options.risk} risk` : '')} ${options.denialMessage ?? ''}`.trimEnd()
   }
   const marker = options.status === 'completed' ? chalk.green('✓') : chalk.red('✗')
   const status = options.status === 'completed' ? chalk.green('done') : chalk.red('failed')
@@ -1059,7 +1143,7 @@ function formatToolLiveLine(options: {
   const summary = options.status === 'completed' || options.status === 'failed'
     ? formatToolOutputSummary(options.name, options.output, options.truncated)
     : ''
-  return `${toolPrefix} ${marker} ${chalk.bold(options.name)} ${status}${truncated}${summary ? ` ${chalk.dim(summary)}` : ''}`
+  return `${toolPrefix} ${marker} ${chalk.bold(label)} ${status}${truncated}${summary ? ` ${chalk.dim(summary)}` : ''}`
 }
 
 function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): string {
@@ -1103,16 +1187,58 @@ function summarizePayload(payload: unknown): string {
   return ''
 }
 
-function formatToolInput(input: any): string {
-  if (input === undefined) return ''
-  const str = JSON.stringify(input)
-  if (!str) return ''
-  return truncateMiddle(str, 72)
+function findToolInput(toolUseId: string): unknown {
+  for (let i = sessionEvents.length - 1; i >= 0; i--) {
+    const event = sessionEvents[i]!
+    if (event.type === 'tool_started' && event.toolUseId === toolUseId) {
+      return event.input
+    }
+  }
+  return undefined
+}
+
+function formatToolInput(name: string, input: any): string {
+  if (input === undefined || input === null) return ''
+  const record = typeof input === 'object' ? input as Record<string, unknown> : undefined
+
+  if (name === 'Read') {
+    return firstString(record, ['path', 'file_path', 'filePath'])
+  }
+  if (name === 'Write' || name === 'Edit') {
+    return firstString(record, ['path', 'file_path', 'filePath'])
+  }
+  if (name === 'Glob' || name === 'Grep') {
+    return firstString(record, ['path', 'directory', 'DirectoryPath', 'pattern', 'Pattern'])
+  }
+  if (name === 'ListDir') {
+    return firstString(record, ['DirectoryPath', 'path', 'directory'])
+  }
+  if (name === 'Bash') {
+    return firstString(record, ['command', 'CommandLine'])
+  }
+
+  if (typeof input === 'string') return input
+  return firstString(record, ['path', 'file_path', 'filePath', 'command', 'CommandLine'])
+}
+
+function firstString(record: Record<string, unknown> | undefined, keys: string[]): string {
+  if (!record) return ''
+  for (const key of keys) {
+    const value = record[key]
+    if (typeof value === 'string' && value.length > 0) {
+      return truncateMiddle(value, 96)
+    }
+  }
+  return ''
 }
 
 function formatToolCallName(name: string, formattedInput: string): string {
   if (!formattedInput || formattedInput === undefined) return name
-  return `${name}(${formattedInput})`
+  return `${name} ${formattedInput}`
+}
+
+function formatToolCallLabel(name: string, input: unknown): string {
+  return formatToolCallName(name, formatToolInput(name, input))
 }
 
 function formatToolOutputSummary(name: string, output: unknown, truncated?: boolean): string {
@@ -1162,18 +1288,4 @@ function truncateMiddle(value: string, maxLength: number): string {
   const edge = Math.floor((maxLength - 3) / 2)
   const tail = maxLength - 3 - edge
   return `${value.slice(0, edge)}...${value.slice(-tail)}`
-}
-
-function getLineCount(text: string, columns: number): number {
-  const cleanText = stripAnsi(text)
-  const lines = cleanText.split('\n')
-  let count = 0
-  for (let i = 0; i < lines.length; i++) {
-    const len = lines[i]!.length
-    if (i === lines.length - 1 && len === 0 && cleanText.endsWith('\n')) {
-      continue
-    }
-    count += Math.max(1, Math.ceil(len / columns))
-  }
-  return count
 }

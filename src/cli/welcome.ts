@@ -1,6 +1,7 @@
 import chalk from 'chalk'
 import { ConfigManager } from '../shared/config.js'
-import { keyboardShortcuts, renderCompactHelp } from './helpPanel.js'
+import { renderCompactHelp } from './helpPanel.js'
+import { padToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
 const PIXEL_ROWS = [
   '    M    ',
@@ -38,13 +39,26 @@ export function renderWelcome(options: {
   sessionId?: string
   url?: string
 }): void {
+  console.log()
+  for (const line of formatWelcomeCardLines(options)) {
+    console.log(`  ${line}`)
+  }
+  console.log()
+  console.log(renderCompactHelp())
+  console.log()
+}
+
+export function formatWelcomeCardLines(options: {
+  modelId?: string
+  cwd: string
+  sessionId?: string
+  url?: string
+}): string[] {
   const username = process.env.USER || process.env.USERNAME || 'User'
-  const version = '0.2.0'
+  const version = '0.2.3'
   const mode = options.url ? `Service (${options.url})` : 'Embedded (Local)'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
-
-  const width = Math.max(55, options.cwd.length + 15)
 
   const metadataLines = [
     ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${version}`)}`,
@@ -53,32 +67,21 @@ export function renderWelcome(options: {
     ` ${chalk.dim('Workspace:')} ${chalk.italic.white(options.cwd)}`,
     ` ${chalk.dim('Mode:')}      ${chalk.magenta(mode)}`,
   ]
+  const contentWidths = PIXEL_ROWS.map((row, index) => {
+    const logoCol = renderLogoRow(row)
+    const metaCol = metadataLines[index] ? metadataLines[index] : ''
+    return visibleTerminalWidth(` ${logoCol}   ${metaCol}`)
+  })
+  const width = Math.max(55, ...contentWidths)
+  const lines = [chalk.cyan('┌' + '─'.repeat(width) + '┐')]
 
-  console.log()
-  const boxTop = chalk.cyan('┌' + '─'.repeat(width) + '┐')
-  const boxBottom = chalk.cyan('└' + '─'.repeat(width) + '┘')
-
-  console.log(`  ${boxTop}`)
   for (let i = 0; i < PIXEL_ROWS.length; i++) {
     const logoCol = renderLogoRow(PIXEL_ROWS[i]!)
     const metaCol = metadataLines[i] ? metadataLines[i] : ''
-
-    // Calculate padding to align the right border
-    const visibleLength = stripAnsi(metaCol).length
-    const paddingLength = Math.max(0, width - 13 - visibleLength)
-    const rightPadding = ' '.repeat(paddingLength)
-    const borderRight = chalk.cyan('│')
-
-    console.log(`  ${chalk.cyan('│')} ${logoCol}   ${metaCol}${rightPadding}${borderRight}`)
+    const content = ` ${logoCol}   ${metaCol}`
+    lines.push(`${chalk.cyan('│')}${padToTerminalWidth(content, width)}${chalk.cyan('│')}`)
   }
-  console.log(`  ${boxBottom}`)
 
-  // Quick commands bar
-  console.log()
-  console.log(renderCompactHelp())
-  console.log()
-}
-
-function stripAnsi(text: string): string {
-  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+  lines.push(chalk.cyan('└' + '─'.repeat(width) + '┘'))
+  return lines
 }

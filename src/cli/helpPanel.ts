@@ -15,10 +15,10 @@ export const helpCategories: HelpCategory[] = [
   {
     title: 'Session',
     items: [
-      { command: '/new', description: 'Start new session' },
       { command: '/sessions', description: 'List recent sessions' },
-      { command: '/history', description: 'Search message history' },
-      { command: '/resume <id>', description: 'Resume specific session' },
+      { command: '/history [query]', description: 'Search message history' },
+      { command: '/history !<n>', description: 'Replay a history entry' },
+      { command: '/exit', description: 'Exit chat' },
     ],
   },
   {
@@ -26,60 +26,48 @@ export const helpCategories: HelpCategory[] = [
     items: [
       { command: '/compact', description: 'Compact context to save tokens' },
       { command: '/context', description: 'View context usage' },
-      { command: '/clear', description: 'Clear current context' },
+      { command: '/clear', description: 'Clear terminal output' },
+      { command: '/pager', description: 'Open last output in pager' },
     ],
   },
   {
     title: 'Model',
     items: [
-      { command: '/model', description: 'Switch or view current model' },
-      { command: '/models', description: 'List available models' },
-      { command: '/provider', description: 'Switch or view provider' },
+      { command: '/model [id]', description: 'Configure or set model' },
+      { command: '/profile', description: 'Show profiles' },
+      { command: '/profile add <name>', description: 'Create profile' },
+      { command: '/profile clear', description: 'Clear active profile' },
     ],
   },
   {
     title: 'Tools',
     items: [
       { command: '/tool', description: 'Open tool selector' },
-      { command: '/tools', description: 'List available tools' },
-      { command: '/read <file>', description: 'Read file' },
-      { command: '/write <file>', description: 'Write file' },
-      { command: '/edit <file>', description: 'Edit file' },
-      { command: '/bash <cmd>', description: 'Execute shell command' },
-      { command: '/grep <pattern>', description: 'Search file content' },
-      { command: '/glob <pattern>', description: 'Find matching files' },
+      { command: '/read <file>', description: 'Insert read prompt prefix' },
+      { command: '/write <file>', description: 'Insert write prompt prefix' },
+      { command: '/edit <file>', description: 'Insert edit prompt prefix' },
+      { command: '/bash <cmd>', description: 'Insert shell command prefix' },
+      { command: '/grep <pattern>', description: 'Insert grep prompt prefix' },
+      { command: '/glob <pattern>', description: 'Insert glob prompt prefix' },
+      { command: '/task', description: 'Insert task prompt prefix' },
     ],
   },
   {
-    title: 'Task',
+    title: 'Status',
     items: [
-      { command: '/task', description: 'Create new task' },
-      { command: '/tasks', description: 'View task list' },
-      { command: '/delegate', description: 'Delegate to sub-agent' },
+      { command: '/status', description: 'Show runtime and provider status' },
+      { command: '/smoke', description: 'Run provider smoke dry-run' },
+      { command: '/smoke live', description: 'Run explicit live provider smoke' },
+      { command: '/smoke live tool-call', description: 'Run explicit provider tool-call smoke' },
     ],
   },
   {
-    title: 'Config',
+    title: 'Input',
     items: [
-      { command: '/config', description: 'View or modify config' },
-      { command: '/profile', description: 'Switch profile' },
-      { command: '/status', description: 'Show runtime status' },
-      { command: '/smoke [live]', description: 'Check provider readiness' },
-    ],
-  },
-  {
-    title: 'Optimization',
-    items: [
-      { command: '/optimize', description: 'Analyze and optimize code' },
-      { command: '/review', description: 'Code review' },
-    ],
-  },
-  {
-    title: 'Other',
-    items: [
+      { command: '/editor', description: 'Compose prompt in external editor' },
+      { command: '/e', description: 'Alias for /editor' },
       { command: '/help', description: 'Show this help' },
-      { command: '/quit', description: 'Exit program' },
-      { command: '/nexus', description: 'View Nexus status' },
+      { command: '/?', description: 'Show compact shortcuts' },
     ],
   },
 ]

@@ -59,7 +59,7 @@ const providerSmokeQuerySchema = z.object({
 const providerLiveSmokeSchema = z.object({
   model: z.string().optional(),
   role: z.string().optional(),
-  mode: z.enum(['simple_text']).default('simple_text').optional(),
+  mode: z.enum(['simple_text', 'tool_call']).default('simple_text').optional(),
   timeoutMs: z.number().int().positive().max(60_000).default(30_000).optional(),
 })
 
@@ -189,7 +189,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.1.0',
+    version: '0.2.3',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -198,7 +198,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.1.0',
+      version: '0.2.3',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),

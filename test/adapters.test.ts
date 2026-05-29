@@ -179,6 +179,35 @@ describe('Model Adapters & Factory', () => {
       ])
     })
 
+    test('keeps malformed Anthropic tool input JSON as parse-error input', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool_bad","name":"Read","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'anthropic/claude-3-5-sonnet',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'tool_use_start', id: 'tool_bad', name: 'Read' },
+        { type: 'tool_use_delta', id: 'tool_bad', inputDelta: '{"path":' },
+        {
+          type: 'tool_use_end',
+          id: 'tool_bad',
+          input: { _parseError: true, _rawInput: '{"path":' },
+        },
+      ])
+    })
+
     test('throws ProviderError on non-200 response', async () => {
       const adapter = new AnthropicAdapter()
       mockResponseOk = false
@@ -456,6 +485,33 @@ describe('Model Adapters & Factory', () => {
           id: 'call_bad',
           input: { _parseError: true, _rawInput: '{"path":README.md' },
         },
+      ])
+    })
+
+    test('keeps concurrent OpenAI tool calls separated by index', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_read","function":{"name":"Read","arguments":"{\\"pa"}},{"index":1,"id":"call_glob","function":{"name":"Glob","arguments":"{\\"pat"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"tern\\":\\"*.ts\\"}"}},{"index":0,"function":{"arguments":"th\\":\\"README.md\\"}"}}]}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'openai/gpt-4o',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'tool_use_start', id: 'call_read', name: 'Read' },
+        { type: 'tool_use_delta', id: 'call_read', inputDelta: '{"pa' },
+        { type: 'tool_use_start', id: 'call_glob', name: 'Glob' },
+        { type: 'tool_use_delta', id: 'call_glob', inputDelta: '{"pat' },
+        { type: 'tool_use_delta', id: 'call_glob', inputDelta: 'tern":"*.ts"}' },
+        { type: 'tool_use_delta', id: 'call_read', inputDelta: 'th":"README.md"}' },
+        { type: 'tool_use_end', id: 'call_read', input: { path: 'README.md' } },
+        { type: 'tool_use_end', id: 'call_glob', input: { pattern: '*.ts' } },
       ])
     })
 

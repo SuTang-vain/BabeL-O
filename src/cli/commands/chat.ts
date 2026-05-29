@@ -38,6 +38,9 @@ import {
 } from '../completer.js'
 import { inputState } from '../inputState.js'
 import { openExternalEditor } from '../editor.js'
+import { normalizeKeyEvent, terminalMouseDisableSequence } from '../keyEvent.js'
+import { consumePasteChunk, createPasteBufferState, flushPasteBuffer } from '../pasteBuffer.js'
+import { truncateToTerminalWidth } from '../terminalWidth.js'
 import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 
 interface ReadlineInternal extends readline.Interface {
@@ -86,6 +89,7 @@ export function registerChatCommand(program: Command): void {
       let isExecuting = false
 
       const isExecutingRef = { get current() { return isExecuting } }
+      rl.setPrompt(getChatPrompt())
       setupAutosuggestions(rl, history, isExecutingRef)
       const slashPalette = createSlashPalette(rl)
       let sessionId = ''
@@ -93,16 +97,11 @@ export function registerChatCommand(program: Command): void {
       // Enable bracketed paste mode
       process.stdout.write('\x1b[?2004h')
 
-      // Enable mouse button/wheel tracking + SGR extended coordinates.
-      // This causes the terminal to emit distinct escape sequences for mouse
-      // scroll events (\x1b[<64;col;rowM / \x1b[<65;col;rowM) instead of
-      // silently translating them into ↑/↓ arrow key sequences, which would
-      // otherwise trigger readline history navigation on every touchpad scroll.
-      process.stdout.write('\x1b[?1000h\x1b[?1006h')
+      // Keep terminal mouse reporting disabled so wheel/touchpad gestures scroll the native scrollback.
+      process.stdout.write(terminalMouseDisableSequence())
 
       const originalEmit = process.stdin.emit
-      let isPasting = false
-      let pasteBuffer = ''
+      let pasteState = createPasteBufferState()
       let pastedMultilineText = ''
       let pasteTimeout: NodeJS.Timeout | null = null
 
@@ -138,7 +137,7 @@ export function registerChatCommand(program: Command): void {
         process.stdout.write('\r\n' + chalk.cyan('  ┌─── Multiline Paste Buffer ──────────────────────────────────') + '\r\n')
         const previewLines = lines.slice(0, 8)
         for (const line of previewLines) {
-          process.stdout.write(chalk.cyan('  │ ') + chalk.white(line.slice(0, 75)) + '\r\n')
+          process.stdout.write(chalk.cyan('  │ ') + chalk.white(truncateToTerminalWidth(line, 75)) + '\r\n')
         }
         if (lineCount > 8) {
           process.stdout.write(chalk.cyan(`  │ ... and ${lineCount - 8} more lines.`) + '\r\n')
@@ -155,18 +154,7 @@ export function registerChatCommand(program: Command): void {
           const chunk = args[0]
           const str = chunk ? chunk.toString() : ''
 
-          // ── Mouse event filter ────────────────────────────────────────────
-          // When mouse reporting is active the terminal sends distinct escape
-          // sequences for scroll/click events.  We swallow them entirely so
-          // they never reach readline's arrow-key history-navigation handler.
-          //
-          // Formats intercepted:
-          //   SGR  : \x1b[<Pb;Px;PyM  or  \x1b[<Pb;Px;Pym  (Pb>=64 = wheel)
-          //   X10  : \x1b[M + 3 bytes  (first byte − 32 >= 64 = wheel)
-          //   URXVT: \x1b[Pb;Px;PyM
-          //
-          // We match ALL mouse report sequences here (not just wheel), because
-          // click/move events are noise we never act on inside the chat loop.
+          // If an external terminal mode still emits mouse reports, do not let them reach readline.
           if (
             /^\x1b\[<[\d;]+[Mm]/.test(str) ||
             (str.startsWith('\x1b[M') && str.length >= 6) ||
@@ -176,56 +164,33 @@ export function registerChatCommand(program: Command): void {
           }
 
           if (!isExecuting) {
-            // If Ctrl+C is pressed, immediately abort pasting and let keypress handle exit
-            if (str.includes('\x03')) {
-              isPasting = false
-              pasteBuffer = ''
+            const keyEvent = normalizeKeyEvent(chunk, undefined)
+            if (keyEvent.kind === 'ctrl_c') {
+              pasteState = createPasteBufferState()
               clearPasteTimeout()
               return originalEmit.apply(this, [event, ...args] as any)
             }
 
-          if (isPasting) {
-            pasteBuffer += str
-            const endIdx = pasteBuffer.indexOf('\x1b[201~')
-            if (endIdx !== -1) {
-              const pastedText = pasteBuffer.slice(0, endIdx)
-              isPasting = false
-              pasteBuffer = pasteBuffer.slice(endIdx + 6)
+            const pasteResult = consumePasteChunk(pasteState, str)
+            pasteState = pasteResult.state
+            if (pasteResult.pastedText !== undefined) {
               clearPasteTimeout()
-              handlePastedText(pastedText)
-            }
-            return true
-          }
-
-          if (str.includes('\x1b[200~')) {
-            isPasting = true
-            const startIdx = str.indexOf('\x1b[200~')
-            pasteBuffer = str.slice(startIdx + 6)
-
-            const endIdx = pasteBuffer.indexOf('\x1b[201~')
-            if (endIdx !== -1) {
-              const pastedText = pasteBuffer.slice(0, endIdx)
-              isPasting = false
-              pasteBuffer = pasteBuffer.slice(endIdx + 6)
-              handlePastedText(pastedText)
-            } else {
-              // Fail-safe: recover after 1 second if end paste marker is missing
-              clearPasteTimeout()
+              handlePastedText(pasteResult.pastedText)
+            } else if (pasteState.isPasting && !pasteTimeout) {
               pasteTimeout = setTimeout(() => {
-                if (isPasting) {
-                  const flushedText = pasteBuffer
-                  isPasting = false
-                  pasteBuffer = ''
-                  handlePastedText(flushedText)
+                const flushed = flushPasteBuffer(pasteState)
+                pasteState = flushed.state
+                pasteTimeout = null
+                if (flushed.pastedText !== undefined) {
+                  handlePastedText(flushed.pastedText)
                 }
               }, 1000)
             }
-            return true
-          }
+            if (pasteResult.consumed) return true
           } // end !isExecuting
         }
 
-        if (!isExecuting && event === 'keypress' && isPasting) {
+        if (!isExecuting && event === 'keypress' && pasteState.isPasting) {
           return true
         }
 
@@ -540,7 +505,7 @@ export function registerChatCommand(program: Command): void {
           process.stdin.setRawMode(false)
         }
         process.stdout.write('\x1b[?2004l')        // Disable bracketed paste
-        process.stdout.write('\x1b[?1006l\x1b[?1000l') // Disable mouse tracking
+        process.stdout.write(terminalMouseDisableSequence()) // Disable mouse tracking
         process.stdin.emit = originalEmit
       }
 
@@ -601,6 +566,7 @@ export function registerChatCommand(program: Command): void {
             // Readline logic wrapper to ask input with custom bbl prompt
             prompt = await new Promise<string>((resolve) => {
               pendingLineResolve = resolve
+              rl.setPrompt(getChatPrompt())
               rl.question(getChatPrompt(), resolve)
             })
           } catch (e: any) {
@@ -855,11 +821,12 @@ export function registerChatCommand(program: Command): void {
             continue
           }
 
-          if (trimmed === '/smoke live' || trimmed === '/provider-smoke live') {
+          if (trimmed === '/smoke live' || trimmed === '/provider-smoke live' || trimmed === '/smoke live tool-call' || trimmed === '/smoke tool-call' || trimmed === '/provider-smoke live tool-call') {
+            const mode = trimmed.includes('tool-call') ? 'tool_call' : 'simple_text'
             try {
               const smoke = options.url
-                ? await new NexusClient({ baseUrl: options.url }).providerLiveSmoke()
-                : await runProviderLiveSmoke()
+                ? await new NexusClient({ baseUrl: options.url }).providerLiveSmoke({ mode })
+                : await runProviderLiveSmoke({ mode })
               console.log(chalk.cyan('\n--- Provider Live Smoke ---'))
               console.log(formatProviderSmoke(smoke))
             } catch (e: any) {
@@ -1030,8 +997,9 @@ function formatProviderSmoke(smoke: any): string {
     `  requirements:    tools=${yesNo(requirements.tools)} streaming=${yesNo(requirements.streaming)} structured=${yesNo(requirements.structuredOutput)}`,
     `  checks:          auth=${yesNo(checks.authConfigured)} model=${yesNo(checks.modelResolved)} tools=${yesNo(checks.toolsSupported)} streaming=${yesNo(checks.streamingSupported)} structured=${yesNo(checks.structuredOutputSupported)}`,
     smoke.mode === 'live'
-      ? `  live:            ${smoke.live ? chalk.green('yes') : chalk.red('no')} success=${yesNo(smoke.success)} matched=${yesNo(smoke.matchedExpectedText)}`
+      ? `  live:            ${smoke.live ? chalk.green('yes') : chalk.red('no')} success=${yesNo(smoke.success)} text=${yesNo(smoke.matchedExpectedText)} tool=${yesNo(smoke.matchedExpectedTool)}`
       : undefined,
+    smoke.toolCallCount !== undefined ? `  tool calls:      ${smoke.toolCallCount}${Array.isArray(smoke.toolCalls) && smoke.toolCalls.length > 0 ? ` (${smoke.toolCalls.map((call: any) => call.name || 'unknown').join(', ')})` : ''}` : undefined,
     smoke.outputPreview ? `  output:          ${String(smoke.outputPreview).slice(0, 120)}` : undefined,
     `  fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `  next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,

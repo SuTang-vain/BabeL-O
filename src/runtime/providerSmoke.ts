@@ -44,26 +44,31 @@ export type ProviderSmokeResult = {
   fallbackPolicy: ProviderSmokeFallbackPolicy
 }
 
+export type ProviderLiveSmokeMode = 'simple_text' | 'tool_call'
+
 export type ProviderLiveSmokeOptions = {
   model?: string
   role?: string
-  mode?: 'simple_text'
+  mode?: ProviderLiveSmokeMode
   timeoutMs?: number
 }
 
 export type ProviderLiveSmokeResult = {
   type: 'provider_smoke'
   mode: 'live'
-  smokeMode: 'simple_text'
+  smokeMode: ProviderLiveSmokeMode
   ready: boolean
   live: boolean
   success?: boolean
   matchedExpectedText?: boolean
+  matchedExpectedTool?: boolean
+  toolCallCount?: number
+  toolCalls?: Array<{ name: string; input?: unknown }>
   provider: ProviderDiagnostics
   requirements: ProviderSmokeRequirements
   checks: ProviderSmokeChecks
   outputPreview?: string
-  deltas?: Array<{ type: string; text?: string; name?: string; reason?: string }>
+  deltas?: Array<{ type: string; id?: string; text?: string; name?: string; inputDelta?: string; input?: unknown; reason?: string }>
   error?: {
     message: string
     recovery: ReturnType<typeof classifyProviderRecovery>
@@ -72,6 +77,28 @@ export type ProviderLiveSmokeResult = {
 }
 
 const SMOKE_TEXT = 'BABEL_O_PROVIDER_SMOKE_OK'
+const SMOKE_TOOL_NAME = 'provider_smoke_probe'
+const SMOKE_TOOL_INPUT = { probe: SMOKE_TEXT } as const
+const SMOKE_TOOL = {
+  name: SMOKE_TOOL_NAME,
+  description: 'Synthetic provider smoke probe. It validates tool-call protocol and is never executed.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      probe: {
+        type: 'string',
+        enum: [SMOKE_TEXT],
+      },
+    },
+    required: ['probe'],
+    additionalProperties: false,
+  },
+} as const
+
+function matchesExpectedSmokeToolInput(input: unknown): boolean {
+  return typeof input === 'object' && input !== null &&
+    (input as Record<string, unknown>).probe === SMOKE_TEXT
+}
 
 export function runProviderSmokeDryRun(options: ProviderSmokeOptions = {}): ProviderSmokeResult {
   const provider = ConfigManager.getInstance().getProviderDiagnostics({
@@ -106,14 +133,14 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
     model: options.model,
     role: options.role,
   })
+  const smokeMode = options.mode ?? 'simple_text'
   const requirements: ProviderSmokeRequirements = {
-    tools: false,
+    tools: smokeMode === 'tool_call',
     streaming: true,
     structuredOutput: false,
   }
   const checks = buildProviderSmokeChecks(provider, requirements, options.model)
   const ready = Object.values(checks).every(Boolean)
-  const smokeMode = options.mode ?? 'simple_text'
   if (!ready) {
     return {
       type: 'provider_smoke',
@@ -132,14 +159,24 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
   const timeout = setTimeout(() => abortController.abort(), options.timeoutMs ?? 30_000)
   try {
     const adapter = getAdapter(settings.providerId)
-    const deltas = [] as Array<{ type: string; text?: string; name?: string; reason?: string }>
+    const deltas = [] as Array<{ type: string; id?: string; text?: string; name?: string; inputDelta?: string; input?: unknown; reason?: string }>
+    const toolCalls = [] as Array<{ name: string; input?: unknown }>
     let text = ''
-    for await (const delta of adapter.queryStream({
-      model: settings.modelId,
-      systemPrompt: `You are running a BabeL-O provider smoke test. Reply with exactly: ${SMOKE_TEXT}`,
-      messages: [{ role: 'user', content: `Reply with exactly: ${SMOKE_TEXT}` }],
-      maxTokens: 32,
-    }, {
+    const query = smokeMode === 'tool_call'
+      ? {
+          model: settings.modelId,
+          systemPrompt: 'You are running a BabeL-O provider smoke test. Call only the provided provider_smoke_probe tool with the exact probe value.',
+          messages: [{ role: 'user' as const, content: `Call ${SMOKE_TOOL_NAME} with exactly ${JSON.stringify(SMOKE_TOOL_INPUT)}. Do not do any other work.` }],
+          tools: [SMOKE_TOOL],
+          maxTokens: 128,
+        }
+      : {
+          model: settings.modelId,
+          systemPrompt: `You are running a BabeL-O provider smoke test. Reply with exactly: ${SMOKE_TEXT}`,
+          messages: [{ role: 'user' as const, content: `Reply with exactly: ${SMOKE_TEXT}` }],
+          maxTokens: 32,
+        }
+    for await (const delta of adapter.queryStream(query, {
       signal: abortController.signal,
       apiKey: settings.apiKey,
       baseUrl: settings.baseUrl,
@@ -148,7 +185,12 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
         text += delta.text
         deltas.push({ type: delta.type, text: delta.text })
       } else if (delta.type === 'tool_use_start') {
-        deltas.push({ type: delta.type, name: delta.name })
+        deltas.push({ type: delta.type, id: delta.id, name: delta.name })
+      } else if (delta.type === 'tool_use_delta') {
+        deltas.push({ type: delta.type, id: delta.id, inputDelta: delta.inputDelta })
+      } else if (delta.type === 'tool_use_end') {
+        toolCalls.push({ name: deltas.find(item => item.type === 'tool_use_start' && item.id === delta.id)?.name ?? '', input: delta.input })
+        deltas.push({ type: delta.type, id: delta.id, input: delta.input })
       } else if (delta.type === 'finish') {
         deltas.push({ type: delta.type, reason: delta.reason })
       } else {
@@ -156,14 +198,20 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
       }
     }
     const output = text.trim()
+    const matchedExpectedTool = toolCalls.some(call =>
+      call.name === SMOKE_TOOL_NAME && matchesExpectedSmokeToolInput(call.input),
+    )
     return {
       type: 'provider_smoke',
       mode: 'live',
       smokeMode,
       ready: true,
       live: true,
-      success: output.length > 0,
-      matchedExpectedText: output === SMOKE_TEXT,
+      success: smokeMode === 'tool_call' ? matchedExpectedTool : output.length > 0,
+      matchedExpectedText: smokeMode === 'simple_text' ? output === SMOKE_TEXT : undefined,
+      matchedExpectedTool: smokeMode === 'tool_call' ? matchedExpectedTool : undefined,
+      toolCallCount: smokeMode === 'tool_call' ? toolCalls.length : undefined,
+      toolCalls: smokeMode === 'tool_call' ? toolCalls : undefined,
       provider,
       requirements,
       checks,

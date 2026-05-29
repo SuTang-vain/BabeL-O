@@ -42,7 +42,7 @@ export class NexusClient {
   async providerLiveSmoke(options: {
     model?: string
     role?: string
-    mode?: 'simple_text'
+    mode?: 'simple_text' | 'tool_call'
     timeoutMs?: number
   } = {}): Promise<unknown> {
     return this.postJson('/v1/runtime/provider-smoke/live', options)

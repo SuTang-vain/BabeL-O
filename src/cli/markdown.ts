@@ -237,7 +237,7 @@ function renderInlineText(text: string): string {
   // Italic
   formatted = formatted.replace(/\*(.+?)\*/g, (_, t) => chalk.italic(t))
   // Inline code
-  formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.bgBlackBright.white(` ${code} `))
+  formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.cyan(code))
   // Links
   formatted = formatted.replace(/\[([^\]]+)\]\([^)]+\)/g, (_, t) => chalk.underline.blue(t))
   // Strikethrough
@@ -446,7 +446,7 @@ export function renderMarkdown(text: string, options: RenderOptions = {}): strin
       // Italic
       formatted = formatted.replace(/\*(.+?)\*/g, (_, text) => chalk.italic(text))
       // Inline code
-      formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.bgBlackBright.white(` ${code} `))
+      formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.cyan(code))
       // Links (show text only)
       formatted = formatted.replace(/\[([^\]]+)\]\([^)]+\)/g, (_, text) => chalk.underline.blue(text))
       // Strikethrough
@@ -537,7 +537,7 @@ export class MarkdownStreamRenderer {
     let formatted = text
 
     // Inline code
-    formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.bgBlackBright.white(` ${code} `))
+    formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.cyan(code))
     // Bold + Italic
     formatted = formatted.replace(/\*\*\*(.+?)\*\*\*/g, (_, t) => chalk.bold.italic(t))
     // Bold
