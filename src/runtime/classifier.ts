@@ -1,6 +1,12 @@
+import { isAbsolute, relative, resolve } from 'node:path'
+
 export type ClassificationResult = {
   autoApprove: boolean
   reason: string
+}
+
+export type ClassificationContext = {
+  cwd?: string
 }
 
 type ShellTokenizationResult = {
@@ -36,8 +42,8 @@ function tokenizeShellCommand(command: string): ShellTokenizationResult {
         quote = null
         continue
       }
-      if (quote === '"' && char === '$' && (next === '(' || next === '{')) {
-        return { tokens, unsafeSyntax: 'Command expansion is not auto-approved' }
+      if (quote === '"' && char === '$') {
+        return { tokens, unsafeSyntax: 'Shell variable or command expansion is not auto-approved' }
       }
       if (quote === '"' && char === '`') {
         return { tokens, unsafeSyntax: 'Command substitution is not auto-approved' }
@@ -59,8 +65,8 @@ function tokenizeShellCommand(command: string): ShellTokenizationResult {
       continue
     }
 
-    if (char === '$' && (next === '(' || next === '{')) {
-      return { tokens, unsafeSyntax: 'Command expansion is not auto-approved' }
+    if (char === '$') {
+      return { tokens, unsafeSyntax: 'Shell variable or command expansion is not auto-approved' }
     }
     if (char === '`') {
       return { tokens, unsafeSyntax: 'Command substitution is not auto-approved' }
@@ -93,7 +99,7 @@ function tokenizeShellCommand(command: string): ShellTokenizationResult {
   return { tokens }
 }
 
-function classifySafeBashTokens(tokens: string[]): ClassificationResult | null {
+function classifySafeBashTokens(tokens: string[], context: ClassificationContext = {}): ClassificationResult | null {
   const [command, ...args] = tokens
   if (!command) return { autoApprove: false, reason: 'Empty bash command input' }
 
@@ -107,11 +113,13 @@ function classifySafeBashTokens(tokens: string[]): ClassificationResult | null {
   }
 
   if (command === 'cat') {
-    const safe = args.length > 0 && args.every(arg =>
-      arg === '--' ||
-      arg === '-n' ||
-      arg === '-b' ||
-      (!arg.startsWith('-') && !arg.startsWith('/dev/')),
+    const pathArgs = args.filter(arg => arg !== '--' && arg !== '-n' && arg !== '-b')
+    const safe = pathArgs.length > 0 && pathArgs.every(arg =>
+      !arg.startsWith('-') &&
+      !arg.startsWith('/dev/') &&
+      !arg.includes('*') &&
+      !arg.includes('?') &&
+      isPathInsideClassifierWorkspace(arg, context.cwd),
     )
     return safe ? { autoApprove: true, reason: 'Known safe command' } : null
   }
@@ -187,13 +195,22 @@ function classifySafeBashTokens(tokens: string[]): ClassificationResult | null {
   return null
 }
 
+function isPathInsideClassifierWorkspace(path: string, cwd?: string): boolean {
+  if (!cwd) return !isAbsolute(path)
+  const resolvedCwd = resolve(cwd)
+  const resolvedPath = resolve(resolvedCwd, path)
+  const rel = relative(resolvedCwd, resolvedPath)
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
 /**
  * Classifies an incoming tool execution request to determine if it can be automatically
  * approved or if it must prompt the user for manual verification.
  */
 export function classifyAction(
   toolName: string,
-  input: unknown
+  input: unknown,
+  context: ClassificationContext = {},
 ): ClassificationResult {
   const name = toolName.trim()
 
@@ -231,7 +248,7 @@ export function classifyAction(
       return { autoApprove: false, reason: 'Potentially destructive or unauthorized action detected' }
     }
 
-    const safeCommand = classifySafeBashTokens(tokenized.tokens)
+    const safeCommand = classifySafeBashTokens(tokenized.tokens, context)
     if (safeCommand) {
       return safeCommand
     }

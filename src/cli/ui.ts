@@ -29,6 +29,14 @@ export interface PermissionDecision {
   rule?: string
 }
 
+export const defaultPermissionChoices: { id: PermissionChoice; label: string }[] = [
+  { id: 'approve_once', label: 'Approve once' },
+  { id: 'approve_session', label: 'Approve for this session' },
+  { id: 'approve_rule', label: 'Approve with editable rule' },
+  { id: 'reject', label: 'Reject' },
+  { id: 'reject_instruct', label: 'Reject, tell the model what to do instead' },
+]
+
 export const sessionPermissionApprovals = new Map<string, Set<string>>()
 
 export function isSessionPermissionCached(
@@ -116,6 +124,7 @@ export function mapDropdownSelection(selected: string): string {
     '/exit': '/exit',
     '/status': '/status',
     '/smoke': '/smoke ',
+    '/fallback': '/fallback ',
     '/sessions': '/sessions',
     '/editor': '/editor',
     '/e': '/editor',
@@ -133,7 +142,7 @@ export function getAutosuggestion(line: string, history: string[]): string | und
   // 2. Check slash commands
   if (line.startsWith('/')) {
     const slashChoices = [
-      '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/sessions', '/history', '/tool',
+      '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
       '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e'
     ]
     const matchingSlash = slashChoices.find(c => c.startsWith(line) && c !== line)
@@ -149,16 +158,17 @@ export function setupAutosuggestions(
   isExecutingRef: { current: boolean }
 ) {
   const rlInt = rl as any
-  const originalPrompt = rlInt._prompt ?? getChatPrompt()
+  const defaultPrompt = rlInt._prompt ?? getChatPrompt()
 
   rlInt._refreshLine = function() {
     const currentInput = String(this.line ?? '')
     const cursor = typeof this.cursor === 'number' ? this.cursor : currentInput.length
-    const suggestion = !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
+    const prompt = typeof this._prompt === 'string' ? this._prompt : defaultPrompt
+    const suggestion = prompt === defaultPrompt && !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
       ? getAutosuggestion(currentInput, history)
       : undefined
     const rendered = renderFixedInputBox({
-      prompt: originalPrompt,
+      prompt,
       line: currentInput,
       cursor,
       suggestion,
@@ -200,6 +210,36 @@ export function extractCommandPrefix(command: unknown): string {
 
 export function countRenderedLines(text: string): number {
   return renderedLineCount(text)
+}
+
+export function permissionDecisionFromChoice(
+  choice: PermissionChoice,
+  options?: { rule?: string; reason?: string },
+): PermissionDecision | 'needs_rule_input' | 'needs_reject_instruction' {
+  if (choice === 'approve_once') return { approved: true, scope: 'once' }
+  if (choice === 'approve_session') return { approved: true, scope: 'session' }
+  if (choice === 'approve_rule') {
+    if (options?.rule) {
+      return {
+        approved: true,
+        scope: 'session',
+        reason: `Approved with rule: ${options.rule}`,
+        rule: options.rule,
+      }
+    }
+    return 'needs_rule_input'
+  }
+  if (choice === 'reject_instruct') {
+    if (options?.reason !== undefined) {
+      return {
+        approved: false,
+        scope: 'once',
+        reason: options.reason.trim() || 'Denied by user',
+      }
+    }
+    return 'needs_reject_instruction'
+  }
+  return { approved: false, scope: 'once', reason: 'Denied by user' }
 }
 
 export function formatPermissionDialog(
@@ -253,13 +293,7 @@ export async function askPermission(
     let settled = false
     let panelState = createPermissionPanelState()
     let renderedLines = 0
-    const choices: { id: PermissionChoice; label: string }[] = [
-      { id: 'approve_once', label: 'Approve once' },
-      { id: 'approve_session', label: 'Approve for this session' },
-      { id: 'approve_rule', label: 'Approve with editable rule' },
-      { id: 'reject', label: 'Reject' },
-      { id: 'reject_instruct', label: 'Reject, tell the model what to do instead' },
-    ]
+    const choices = defaultPermissionChoices
 
     const cleanup = () => {
       clearRenderedPermissionDialog()
@@ -298,36 +332,22 @@ export async function askPermission(
     const finish = async (choice: PermissionChoice) => {
       if (settled) return
       settled = true
-      let decision: PermissionDecision
-      if (choice === 'approve_once') {
-        decision = { approved: true, scope: 'once' }
-      } else if (choice === 'approve_session') {
-        decision = { approved: true, scope: 'session' }
-      } else if (choice === 'approve_rule') {
+      const decision = permissionDecisionFromChoice(choice)
+      if (decision === 'needs_rule_input') {
         cleanup()
         const defaultRule = event.name === 'Bash' && typeof event.input === 'object' && event.input !== null
           ? extractCommandPrefix((event.input as Record<string, unknown>).command)
           : event.name ?? '*'
         const ruleInput = await questionAsync(rl, chalk.yellow(`Enter allow rule prefix (default: ${defaultRule}): `))
         const rule = ruleInput.trim() || defaultRule
-        resolve({
-          approved: true,
-          scope: 'session',
-          reason: `Approved with rule: ${rule}`,
-          rule,
-        })
+        resolve(permissionDecisionFromChoice(choice, { rule }) as PermissionDecision)
         return
-      } else if (choice === 'reject_instruct') {
+      }
+      if (decision === 'needs_reject_instruction') {
         cleanup()
         const reason = await questionAsync(rl, chalk.yellow('Tell the model what to do instead: '))
-        resolve({
-          approved: false,
-          scope: 'once',
-          reason: reason.trim() || 'Denied by user',
-        })
+        resolve(permissionDecisionFromChoice(choice, { reason }) as PermissionDecision)
         return
-      } else {
-        decision = { approved: false, scope: 'once', reason: 'Denied by user' }
       }
       cleanup()
       resolve(decision)
@@ -437,6 +457,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },
     '/status': { tag: 'status', description: 'Show current runtime and model' },
     '/smoke': { tag: 'status', description: 'Run provider smoke readiness or live probe' },
+    '/fallback': { tag: 'status', description: 'Show non-silent provider fallback plan' },
     '/sessions': { tag: 'session', description: 'List recent sessions' },
     '/history': { tag: 'history', description: 'Search and replay prompt history' },
     '/tool': { tag: 'tools', description: 'Open the tool picker' },

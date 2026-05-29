@@ -36,6 +36,7 @@ import {
   pruneOrphanedWorktrees,
   runGitCommand,
   parsePorcelainChangedPaths,
+  withGitOperationLock,
 } from './worktree.js'
 import { RuntimeAgentStepError } from './runtimeAgentStep.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
@@ -85,15 +86,19 @@ async function gitIsClean(cwd: string): Promise<boolean> {
 }
 
 async function gitStash(cwd: string): Promise<boolean> {
-  const { code, stdout } = await runGitCommand(cwd, ['stash', 'push', '--include-untracked', '-m', `babel-optimize-backup-${Date.now()}`])
-  if (code === 0 && !stdout.includes('No local changes to save')) {
-    return true
-  }
-  return false
+  return withGitOperationLock(cwd, async () => {
+    const { code, stdout } = await runGitCommand(cwd, ['stash', 'push', '--include-untracked', '-m', `babel-optimize-backup-${Date.now()}`])
+    if (code === 0 && !stdout.includes('No local changes to save')) {
+      return true
+    }
+    return false
+  })
 }
 
 async function gitStashPop(cwd: string): Promise<void> {
-  await runGitCommand(cwd, ['stash', 'pop'])
+  await withGitOperationLock(cwd, async () => {
+    await runGitCommand(cwd, ['stash', 'pop'])
+  })
 }
 
 async function gitChangedPaths(cwd: string): Promise<string[]> {
@@ -110,28 +115,32 @@ async function gitChangedPaths(cwd: string): Promise<string[]> {
 }
 
 async function gitRollbackTracked(cwd: string): Promise<void> {
-  await runGitCommand(cwd, ['restore', '--staged', '--worktree', '.'])
+  await withGitOperationLock(cwd, async () => {
+    await runGitCommand(cwd, ['restore', '--staged', '--worktree', '.'])
+  })
 }
 
 async function gitCommit(cwd: string, message: string): Promise<void> {
-  const changedPaths = await gitChangedPaths(cwd)
-  if (changedPaths.length === 0) return
-  const { code: addCode, stderr: addStderr, stdout: addStdout } = await runGitCommand(cwd, ['add', '--', ...changedPaths])
-  if (addCode !== 0) {
-    throw new Error(`Git stage failed: ${addStderr || addStdout}`)
-  }
-  const { code, stderr, stdout } = await runGitCommand(cwd, [
-    '-c',
-    'user.name=BabeL-O Agent',
-    '-c',
-    'user.email=agent@babel-o.local',
-    'commit',
-    '-m',
-    message,
-  ])
-  if (code !== 0) {
-    throw new Error(`Git commit failed: ${stderr || stdout}`)
-  }
+  await withGitOperationLock(cwd, async () => {
+    const changedPaths = await gitChangedPaths(cwd)
+    if (changedPaths.length === 0) return
+    const { code: addCode, stderr: addStderr, stdout: addStdout } = await runGitCommand(cwd, ['add', '--', ...changedPaths])
+    if (addCode !== 0) {
+      throw new Error(`Git stage failed: ${addStderr || addStdout}`)
+    }
+    const { code, stderr, stdout } = await runGitCommand(cwd, [
+      '-c',
+      'user.name=BabeL-O Agent',
+      '-c',
+      'user.email=agent@babel-o.local',
+      'commit',
+      '-m',
+      message,
+    ])
+    if (code !== 0) {
+      throw new Error(`Git commit failed: ${stderr || stdout}`)
+    }
+  })
 }
 
 export type RunAgentLoopOptions = {

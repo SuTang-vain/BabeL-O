@@ -232,7 +232,11 @@ export function renderEvent(event: NexusEvent): void {
   // Direct streaming of assistant text for speed & responsiveness
   if (event.type === 'assistant_delta') {
     const last = sessionEvents[sessionEvents.length - 1]
-    if (last && last.type === 'assistant_delta') {
+    const continuesAssistant = last && last.type === 'assistant_delta'
+    if (isWhitespaceOnlyAssistantDelta(event.text) && !continuesAssistant) {
+      return
+    }
+    if (continuesAssistant) {
       last.text += event.text
     } else {
       sessionEvents.push({ ...event })
@@ -256,6 +260,7 @@ export function renderEvent(event: NexusEvent): void {
       stopSpinner()
       handleThinkingDelta(event.text)
     } else {
+      ensureLiveLine()
       startSpinner('Thinking...')
     }
     return
@@ -325,6 +330,9 @@ function handleDelta(text: string, isThinking: boolean) {
 }
 
 function handleAssistantDelta(text: string) {
+  if (isWhitespaceOnlyAssistantDelta(text) && currentOutputBlock !== 'assistant') {
+    return
+  }
   if (currentOutputBlock !== 'assistant') {
     ensureLiveLine()
     process.stdout.write(`${chalk.green('⏺')} `)
@@ -340,6 +348,10 @@ function handleAssistantDelta(text: string) {
   trackRenderedText(rendered)
 }
 
+function isWhitespaceOnlyAssistantDelta(text: string): boolean {
+  return text.length > 0 && text.trim().length === 0
+}
+
 function handleThinkingDelta(text: string) {
   if (currentOutputBlock !== 'thinking') {
     ensureLiveLine()
@@ -352,7 +364,7 @@ function handleThinkingDelta(text: string) {
 
 function ensureLiveLine(): void {
   flushAssistantMarkdown()
-  if (liveLineStarted) {
+  if (liveLineStarted && currentLineLength > 0) {
     process.stdout.write('\n')
     printedLinesCount++
     currentLineLength = 0
@@ -605,6 +617,9 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       }
       if (foundIndex !== -1) {
         (processedEvents[foundIndex] as any).text += ev.text
+        continue
+      }
+      if (isWhitespaceOnlyAssistantDelta(ev.text)) {
         continue
       }
     } else if (ev.type === 'thinking_delta') {

@@ -7,6 +7,7 @@ import {
   UnknownModelError,
   providerRegistry,
   modelRegistry,
+  recommendModelForRole,
 } from '../src/providers/registry.js'
 
 test('getProvider returns valid provider definition', () => {
@@ -113,4 +114,19 @@ test('all models listed in providers exist in modelRegistry', () => {
     assert.ok(defaultModel)
     assert.ok(provider.models.includes(provider.defaultModel))
   }
+})
+
+test('role recommendations are capability-based and registry-backed', () => {
+  const planner = recommendModelForRole('planner')
+  const plannerModel = getModel(planner.modelId)
+  assert.equal(planner.capability, 'long_context')
+  assert.equal(plannerModel.contextWindow, Math.max(...modelRegistry.map(model => model.contextWindow)))
+
+  const executor = recommendModelForRole('executor')
+  assert.equal(executor.capability, 'tool_calling')
+  assert.equal(getModel(executor.modelId).capabilities.toolCalling, true)
+
+  const critic = recommendModelForRole('critic')
+  assert.equal(critic.capability, 'structured_output')
+  assert.equal(getModel(critic.modelId).capabilities.jsonOutput, true)
 })

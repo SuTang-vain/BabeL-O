@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { ProviderError } from '../src/shared/errors.js'
-import { classifyProviderRecovery } from '../src/runtime/providerRecovery.js'
+import { classifyProviderRecovery, planProviderFallbackAction } from '../src/runtime/providerRecovery.js'
 
 test('classifyProviderRecovery tags max output token failures', () => {
   const details = classifyProviderRecovery(
@@ -57,4 +57,46 @@ test('classifyProviderRecovery tags provider protocol replay mismatches', () => 
   assert.equal(details?.retryable, false)
   assert.equal(details?.fallbackPolicy.mode, 'no_auto_fallback')
   assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
+})
+
+test('planProviderFallbackAction returns an auditable non-executing action', () => {
+  const recovery = classifyProviderRecovery(
+    new ProviderError('openai', 400, '{"error":{"code":"context_length_exceeded"}}'),
+  )
+  assert.ok(recovery)
+
+  const plan = planProviderFallbackAction({
+    provider: {
+      providerId: 'openai',
+      providerName: 'OpenAI-compatible',
+      adapter: 'openai-compatible',
+      authMode: 'bearer',
+      authConfigured: true,
+      authSource: 'env',
+      baseUrl: 'https://api.openai.com/v1',
+      baseUrlSource: 'provider_default',
+      modelId: 'openai/gpt-4o',
+      modelName: 'GPT-4o',
+      modelSource: 'default',
+      contextWindow: 128000,
+      defaultMaxTokens: 16384,
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        structuredOutput: true,
+        streaming: true,
+      },
+    },
+    recovery,
+  })
+
+  assert.equal(plan.type, 'provider_fallback_plan')
+  assert.equal(plan.fallbackPolicy.mode, 'compact_then_retry')
+  assert.equal(plan.fallbackPolicy.allowSilentModelSwitch, false)
+  assert.equal(plan.action.requiresUserConfirmation, true)
+  assert.equal(plan.action.willSwitchModel, false)
+  assert.equal(plan.action.willSwitchProvider, false)
+  assert.equal(plan.action.willMutateConfig, false)
+  assert.equal(plan.action.willCallProvider, false)
+  assert.equal(plan.action.willCreateSession, false)
 })

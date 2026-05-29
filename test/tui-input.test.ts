@@ -7,6 +7,8 @@ import { helpCategories } from '../src/cli/helpPanel.js'
 import { visibleTerminalWidth, truncateToTerminalWidth } from '../src/cli/terminalWidth.js'
 import { formatWelcomeCardLines } from '../src/cli/welcome.js'
 import { renderFixedInputBox } from '../src/cli/inputBox.js'
+import { inputState, type InputMode } from '../src/cli/inputState.js'
+import { defaultPermissionChoices, permissionDecisionFromChoice, setupAutosuggestions } from '../src/cli/ui.js'
 
 test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent('\x03', undefined).kind, 'ctrl_c')
@@ -96,6 +98,32 @@ test('permission panel reducer supports navigation, numeric choices, enter, and 
   assert.deepEqual(reduced.action, { type: 'abort' })
 })
 
+test('permission panel keyboard paths map to safe approval decisions', () => {
+  const select = (raw: string) => {
+    const reduced = reducePermissionPanelKey(createPermissionPanelState(), normalizeKeyEvent(raw, undefined))
+    assert.equal(reduced.action.type, 'finish')
+    if (reduced.action.type !== 'finish') throw new Error('unreachable')
+    return defaultPermissionChoices[reduced.action.choiceIndex]!.id
+  }
+
+  assert.deepEqual(permissionDecisionFromChoice(select('1')), { approved: true, scope: 'once' })
+  assert.deepEqual(permissionDecisionFromChoice(select('2')), { approved: true, scope: 'session' })
+  assert.equal(permissionDecisionFromChoice(select('3')), 'needs_rule_input')
+  assert.deepEqual(permissionDecisionFromChoice('approve_rule', { rule: 'npm test:*' }), {
+    approved: true,
+    scope: 'session',
+    reason: 'Approved with rule: npm test:*',
+    rule: 'npm test:*',
+  })
+  assert.deepEqual(permissionDecisionFromChoice(select('4')), { approved: false, scope: 'once', reason: 'Denied by user' })
+  assert.equal(permissionDecisionFromChoice(select('5')), 'needs_reject_instruction')
+  assert.deepEqual(permissionDecisionFromChoice('reject_instruct', { reason: 'Use Read instead' }), {
+    approved: false,
+    scope: 'once',
+    reason: 'Use Read instead',
+  })
+})
+
 test('help panel command list only includes chat-supported slash entries', () => {
   const unsupported = new Set(['/new', '/resume <id>', '/tasks', '/delegate', '/config', '/models', '/provider', '/optimize', '/review', '/nexus', '/quit'])
   const commands = helpCategories.flatMap(category => category.items.map(item => item.command))
@@ -157,4 +185,58 @@ test('fixed input box only renders autosuggestion when it fits', () => {
   })
   assert.equal(long.renderedSuggestion, false)
   assert.ok(visibleTerminalWidth(long.text) <= 30)
+})
+
+test('input state keeps readline as the only text owner while overlays are open', () => {
+  const overlayModes: InputMode[] = [
+    'slashPalette',
+    'toolPalette',
+    'permissionPanel',
+    'historySearch',
+    'modelWizard',
+    'pasteBuffer',
+  ]
+
+  try {
+    for (const mode of overlayModes) {
+      inputState.set(mode, { source: 'smoke' })
+      assert.equal(inputState.isOverlayOpen(), true, `${mode} should block secondary input handling`)
+    }
+
+    inputState.set('agentRunning')
+    assert.equal(inputState.isOverlayOpen(), false, 'agentRunning is a status indicator, not a second input owner')
+  } finally {
+    inputState.set('idle')
+  }
+})
+
+test('autosuggestion refresh preserves secondary readline prompts', () => {
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+
+  const rl: any = {
+    _prompt: '> ',
+    line: '',
+    cursor: 0,
+  }
+  try {
+    setupAutosuggestions(rl as any, [], { current: false })
+    rl._prompt = 'Enter allow rule prefix (default: node:*): '
+    rl.line = 'node:*'
+    rl.cursor = rl.line.length
+    rl._refreshLine()
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+  }
+
+  const output = writes.join('')
+  assert.ok(output.includes('Enter allow rule prefix (default: node:*): node:*'))
+  assert.ok(!output.includes('BabeL-O'))
 })

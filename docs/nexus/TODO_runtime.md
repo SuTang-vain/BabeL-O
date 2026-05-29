@@ -126,6 +126,7 @@ Nexus 是 BabeL-O 的执行核心。它负责 API、event stream、runtime orche
 - [x] **P0: 工具循环 final-response-only 硬约束**。`LLMCodingRuntime` 在接近 `maxLoops` 尾部阶段时不再只靠 Execution State 提醒模型，而是直接隐藏主 provider 请求的 tools；若 provider 仍输出工具调用，runtime 返回 `TOOL_LOOP_FINAL_RESPONSE_ONLY` 可审计错误、拒绝执行新工具，并追加无工具最终回答提示继续合成。`runtime-llm.test.ts` 覆盖模型持续请求 Read 的失控循环，确认最终阶段没有执行新工具且最后成功产出 answer；同时覆盖 `MAX_LOOPS_EXCEEDED` 终态会输出失败 result。
 - [x] **P0: 终态错误 recovery boundary 与失败 result**。`selectRecentEvents()` 已将 `PROVIDER_ERROR`、`EMPTY_PROVIDER_RESPONSE`、`CONTEXT_LIMIT_EXCEEDED`、`MAX_LOOPS_EXCEEDED`、`MAX_OUTPUT_TOKENS_EXCEEDED`、`TOOL_LOOP_FINAL_RESPONSE_ONLY` 纳入 recovery boundary，下一轮状态追问不会回放旧工具链；`LLMCodingRuntime` 的 provider error catch、max-loops 与 max-output exhausted 终态都会输出失败 `result`，避免 UI/调用方只能看到 error/metrics 而无法按失败终态恢复。
 - [x] **P0: `/context` runtime policy 诊断可观测性**。`analyzeContext()` 现在返回 `runtimePolicy`，明确当前 intent 下 tools 是否可见、tool suppression 原因、最近 recovery boundary code/timestamp/message；CLI `/context` 增加 `User Intent / Runtime Policy` 区块，直接展示 intent/source/action/scope/requiresTools、显式路径、tools visible 和 recovery boundary。测试覆盖 API JSON 与 pause + cancel boundary 诊断。
+- [x] **P0: session_3ba2d788 指令跟随回归修复**。真实会话 `session_3ba2d788-6f78-468b-b01d-0a6a10ade46f` 暴露的长会话 latest user/intake 错位与 respond_only 工具穿透已修复：`LLMCodingRuntime` 读取最新 tail 并恢复时间顺序；User Intake Guidance 以本轮 `latestPrompt` 作为最高优先级校验来源；intake 模型输出的 `explicitPaths` 不再被信任，只使用 deterministic extractor；当 `shouldSuppressToolsForIntent()` 为 true 时，runtime 执行层会返回 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` 并拒绝任何 provider tool call（包括 MiniMax 文本编码工具调用），不得进入 `tool_started`。已补 `runtime-llm.test.ts` 长会话 tail/intake 与 MiniMax respond_only 硬拦截回归，以及 `context-regression.test.ts` 的 session_3ba2d788 sanitized replay。
 - [ ] **P2: DeepSeek reasoning replay 兼容（暂缓）**。`OpenAIAdapter` 后续仍需要对 DeepSeek thinking 模式的 `reasoning_content` 做正确续传/降级处理，避免 provider 在后续 turn 报 `The reasoning_content in the thinking mode must be passed back to the API.`；当前按用户要求暂不处理该模型适配项。
 - [ ] **P3: `thinking_delta` 策略再评估**。当前完全丢弃 thinking 可防污染，但对部分 provider/model 可能损失规划连续性。评估只保留短摘要、只给同 provider、或只在 Agent role 内部保留的策略。
 
@@ -354,6 +355,8 @@ const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
 - [x] 所有自动放行/拒绝记录 permission audit reason。
 - [x] 收紧 Bash 自动审批白名单：把 `npm test`、宽松 `npx tsc .*`、任意参数 `cat` 等规则拆成精确命令/参数集合，补充绕过样例测试；未知 Bash 继续默认人工确认。
 - [x] 为 Bash 分类引入轻量 shell 词法扫描，拦截管道/重定向/链式操作、命令替换、变量展开和未闭合引号，避免仅靠正则判断。
+- [x] 收紧 Bash `cat` 自动审批边界：`classifyAction()` 接收 cwd 上下文，只有 workspace 内的明确文件路径可自动批准；`$VAR` / `${VAR}` / command substitution / glob / `/dev/*` / workspace escape 均进入人工 review。`permission-flow.test.ts` 覆盖 `/tmp/secret.txt` 不再自动批准。
+- [x] Worktree / Git 并发安全：`createWorktree()`、`commitAndMergeWorktree()`、`removeWorktree()`、`pruneOrphanedWorktrees()` 以及 optimizer in-place `stash` / `commit` / `rollback` / `stash pop` 共用 per-cwd Git operation lock；`worktree.test.ts` 覆盖同仓串行、跨仓并发与真实 concurrent merge-back。
 - [x] Optimizer safety 从硬编码黑名单升级为策略配置：保护 package/lock/env/bin 等敏感路径，并对高危命令保持 deny 或人工确认。
 - [x] MCP tool 运行时输入校验使用远端 `inputSchema`，不再仅以 `z.record(z.string(), z.unknown())` 接收任意对象；校验失败返回可恢复 tool result。
 - [ ] 参考 BabeL-X Bash permission options，支持可编辑 Bash prefix allow rule，例如 `npm run:*`、`git diff:*`，并将规则写入 session/project/user scope。

@@ -31,6 +31,7 @@ test('context regression: workspace escape followed by continue keeps latest rec
   const sessionId = 'context-regression-workspace-escape'
   const cwd = join(tmpdir(), 'BABEL/BabeL-O')
   const wrongPath = '/Users/tangyaoyue/DEV/BabeL/BabeL-O/package.json'
+  const latest = '继续，注意正确项目是 /Users/tangyaoyue/DEV/BABEL/BabeL-O'
   const events: NexusEvent[] = [
     user(sessionId, '2026-05-24T00:00:00.000Z', '核对 BabeL-O 上下文能力'),
     assistant(sessionId, '2026-05-24T00:00:01.000Z', '我先读取 package.json。'),
@@ -41,7 +42,7 @@ test('context regression: workspace escape followed by continue keeps latest rec
       requestedPath: wrongPath,
       cwd,
     }, '2026-05-24T00:00:03.000Z'),
-    user(sessionId, '2026-05-24T00:00:04.000Z', '继续，注意正确项目是 /Users/tangyaoyue/DEV/BABEL/BabeL-O'),
+    user(sessionId, '2026-05-24T00:00:04.000Z', latest),
   ]
 
   const selected = selectRecentEvents(events, tinyBudget)
@@ -51,7 +52,7 @@ test('context regression: workspace escape followed by continue keeps latest rec
   const assembled = await assembleContext({
     runtimeOptions: {
       sessionId,
-      prompt: '继续',
+      prompt: latest,
       cwd,
     },
     events,
@@ -204,6 +205,59 @@ test('context regression: real session_321c48be replay keeps Baidu context for m
   assert.equal(assembled.userIntentGuidance.requiresTools, false)
   assert.match(messages, /hi`/)
   assert.match(messages, /KeDU-动态百科服务平台|app-bvh8xpidhpfl|Baidu workspace connection summary/)
+})
+
+test('context regression: real session_3ba2d788 replay binds greeting to latest prompt', async () => {
+  const sessionId = 'session_3ba2d788-6f78-468b-b01d-0a6a10ade46f'
+  const oldPrompt = '我记得bebal-X也有对应的上下文压缩机制呀，你再仔细看看'
+  const latest = '你好？'
+  const events: NexusEvent[] = [
+    user(sessionId, '2026-05-29T15:19:30.000Z', oldPrompt),
+    {
+      type: 'user_intake_guidance',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-05-29T15:19:31.000Z',
+      userText: oldPrompt,
+      intent: 'continue',
+      confidence: 0.9,
+      continuity: 0.8,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      reason: 'Old intake from a previous turn.',
+      guidance: 'Continue inspecting BabeL-X context compression.',
+      explicitPaths: [
+        '/Users/tangyaoyou/DEV/gemini-cli',
+        '/Users/tangyaoyao/DEV/gemini-cli',
+      ],
+      source: 'model',
+    },
+    assistant(sessionId, '2026-05-29T15:19:32.000Z', '旧上下文压缩分析。'),
+    toolStarted(sessionId, 'call-stale-grep', 'Grep', { pattern: 'compact', path: '/Users/tangyaoyue/DEV/BABEL/BabeL-X' }, '2026-05-29T15:19:33.000Z'),
+    toolCompleted(sessionId, 'call-stale-grep', 'Grep', true, { matches: ['old BabeL-X result'] }, '2026-05-29T15:19:34.000Z'),
+    user(sessionId, '2026-05-29T15:22:48.000Z', latest),
+  ]
+
+  const assembled = await assembleContext({
+    runtimeOptions: {
+      sessionId,
+      prompt: latest,
+      cwd: '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.equal(assembled.userIntentGuidance.latestUserText, latest)
+  assert.equal(assembled.userIntentGuidance.intent, 'greeting')
+  assert.equal(assembled.userIntentGuidance.actionHint, 'respond_only')
+  assert.equal(assembled.userIntentGuidance.requiresTools, false)
+  assert.deepEqual(assembled.userIntentGuidance.explicitPaths, [])
+  assert.match(assembled.systemPrompt, /respond directly to the latest user message/i)
+  assert.doesNotMatch(assembled.systemPrompt, /tangyaoyou|tangyaoyao/)
 })
 
 test('context regression: real session_321c48be replay treats post-cancel stop as recovery boundary', async () => {

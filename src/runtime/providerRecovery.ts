@@ -1,3 +1,4 @@
+import type { ProviderDiagnostics } from '../shared/config.js'
 import { ProviderError } from '../shared/errors.js'
 
 export type ProviderRecoveryKind =
@@ -25,6 +26,24 @@ export type ProviderRecoveryDetails = {
   suggestion: string
   fallbackPolicy: ProviderFallbackPolicy
   rawMessage?: string
+}
+
+export type ProviderFallbackAction = {
+  type: 'provider_fallback_plan'
+  provider: ProviderDiagnostics
+  recovery?: ProviderRecoveryDetails
+  fallbackPolicy: ProviderFallbackPolicy
+  action: {
+    mode: ProviderFallbackPolicy['mode']
+    status: 'ready' | 'blocked' | 'needs_user_confirmation'
+    description: string
+    requiresUserConfirmation: true
+    willSwitchModel: false
+    willSwitchProvider: false
+    willMutateConfig: false
+    willCallProvider: false
+    willCreateSession: false
+  }
 }
 
 export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetails | undefined {
@@ -149,6 +168,33 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
     suggestion: 'Inspect provider rawMessage and request payload.',
     fallbackPolicy: buildProviderFallbackPolicy('unknown'),
     rawMessage,
+  }
+}
+
+export function planProviderFallbackAction(options: {
+  provider: ProviderDiagnostics
+  recovery?: ProviderRecoveryDetails
+  policy?: ProviderFallbackPolicy
+}): ProviderFallbackAction {
+  const fallbackPolicy = options.policy ?? options.recovery?.fallbackPolicy ?? buildProviderFallbackPolicy('unknown')
+  return {
+    type: 'provider_fallback_plan',
+    provider: options.provider,
+    recovery: options.recovery,
+    fallbackPolicy,
+    action: {
+      mode: fallbackPolicy.mode,
+      status: fallbackPolicy.mode === 'no_auto_fallback' || fallbackPolicy.mode === 'fix_configuration'
+        ? 'blocked'
+        : 'needs_user_confirmation',
+      description: fallbackPolicy.nextAction,
+      requiresUserConfirmation: true,
+      willSwitchModel: false,
+      willSwitchProvider: false,
+      willMutateConfig: false,
+      willCallProvider: false,
+      willCreateSession: false,
+    },
   }
 }
 

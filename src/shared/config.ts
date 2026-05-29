@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { z } from 'zod';
-import { getProvider, getModel, providerRegistry, modelRegistry } from '../providers/registry.js';
+import { getProvider, getModel, providerRegistry, modelRegistry, recommendModelForRole, type ModelRole, type ModelRoleRecommendation } from '../providers/registry.js';
 import { logger } from './logger.js';
 
 export interface ProviderConfig {
@@ -53,6 +53,13 @@ export type ResolvedSettings = {
   baseUrlSource: 'env' | 'profile' | 'provider_config' | 'provider_default' | 'none';
 }
 
+export type ProviderRoleDiagnostics = ModelRoleRecommendation & {
+  configured: boolean;
+  activeModelId: string;
+  activeModelMatchesRecommendation: boolean;
+  willAutoSwitch: false;
+}
+
 export type ProviderDiagnostics = {
   providerId: string;
   providerName: string;
@@ -74,6 +81,7 @@ export type ProviderDiagnostics = {
     streaming: boolean;
     structuredOutput: boolean;
   };
+  roleRecommendation?: ProviderRoleDiagnostics;
 }
 
 export const ProviderConfigSchema = z.object({
@@ -446,6 +454,8 @@ export class ConfigManager {
         },
       };
     }
+    const role = typeof roleOrOptions === 'string' ? roleOrOptions : roleOrOptions?.role;
+    const recommendation = isModelRole(role) ? recommendModelForRole(role) : undefined;
     return {
       providerId: settings.providerId,
       providerName: provider.displayName,
@@ -467,6 +477,17 @@ export class ConfigManager {
         streaming: model.capabilities.streaming,
         structuredOutput: model.capabilities.jsonOutput,
       },
+      roleRecommendation: recommendation ? {
+        ...recommendation,
+        configured: settings.modelSource === 'role',
+        activeModelId: settings.modelId,
+        activeModelMatchesRecommendation: settings.modelId === recommendation.modelId,
+        willAutoSwitch: false,
+      } : undefined,
     };
   }
+}
+
+function isModelRole(role: string | undefined): role is ModelRole {
+  return role === 'planner' || role === 'executor' || role === 'critic' || role === 'optimizer';
 }

@@ -488,6 +488,16 @@ test('/v1/runtime/status returns redacted provider diagnostics', async () => {
     assert.equal(body.provider.capabilities.toolCalling, true)
     assert.equal(body.provider.capabilities.streaming, true)
     assert.equal(body.provider.apiKey, undefined)
+    const plannerResponse = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/provider-smoke?role=planner',
+    })
+    assert.equal(plannerResponse.statusCode, 200)
+    const plannerBody = plannerResponse.json()
+    assert.equal(plannerBody.provider.roleRecommendation.role, 'planner')
+    assert.equal(plannerBody.provider.roleRecommendation.configured, false)
+    assert.equal(plannerBody.provider.roleRecommendation.willAutoSwitch, false)
+
     assert.equal(body.providerSmoke.type, 'provider_smoke')
     assert.equal(body.providerSmoke.mode, 'dry_run')
     assert.equal(body.providerSmoke.ready, true)
@@ -553,6 +563,46 @@ test('/v1/runtime/provider-smoke reports unmet capability without silent fallbac
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
   } finally {
     await app.close()
+  }
+})
+
+test('/v1/runtime/provider-fallback/plan returns non-executing fallback action', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-fallback-plan`)
+  await mkdir(cwd, { recursive: true })
+
+  const oldFetch = globalThis.fetch
+  let fetchCalled = false
+  globalThis.fetch = async () => {
+    fetchCalled = true
+    throw new Error('provider should not be called')
+  }
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/provider-fallback/plan',
+      payload: { kind: 'context_window' },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'provider_fallback_plan')
+    assert.equal(body.provider.providerId, 'local')
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.fallbackPolicy.mode, 'compact_then_retry')
+    assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.action.requiresUserConfirmation, true)
+    assert.equal(body.action.willSwitchModel, false)
+    assert.equal(body.action.willSwitchProvider, false)
+    assert.equal(body.action.willMutateConfig, false)
+    assert.equal(body.action.willCallProvider, false)
+    assert.equal(body.action.willCreateSession, false)
+    assert.equal(fetchCalled, false)
+    assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
+  } finally {
+    await app.close()
+    globalThis.fetch = oldFetch
   }
 })
 

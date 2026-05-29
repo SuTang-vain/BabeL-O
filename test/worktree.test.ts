@@ -9,6 +9,9 @@ import {
   commitAndMergeWorktree,
   removeWorktree,
   pruneOrphanedWorktrees,
+  withGitOperationLock,
+  getGitOperationLockStatsForTest,
+  resetGitOperationLocksForTest,
 } from '../src/nexus/worktree.js'
 
 function runCommand(cwd: string, cmd: string, args: string[]): Promise<void> {
@@ -20,6 +23,108 @@ function runCommand(cwd: string, cmd: string, args: string[]): Promise<void> {
     })
   })
 }
+
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+test('per-cwd git operation lock serializes same repository operations', async () => {
+  resetGitOperationLocksForTest()
+  const cwd = join(resolve(process.cwd()), '.babel-o', `lock-test-${Date.now()}`)
+  const order: string[] = []
+
+  await Promise.all([
+    withGitOperationLock(cwd, async () => {
+      order.push('first:start')
+      await delay(20)
+      order.push('first:end')
+    }),
+    withGitOperationLock(cwd, async () => {
+      order.push('second:start')
+      await delay(1)
+      order.push('second:end')
+    }),
+  ])
+
+  assert.deepEqual(order, ['first:start', 'first:end', 'second:start', 'second:end'])
+  assert.equal(getGitOperationLockStatsForTest(cwd).maxActive, 1)
+  resetGitOperationLocksForTest()
+})
+
+test('per-cwd git operation lock allows different repositories concurrently', async () => {
+  resetGitOperationLocksForTest()
+  const root = join(resolve(process.cwd()), '.babel-o')
+  const firstCwd = join(root, `lock-test-a-${Date.now()}`)
+  const secondCwd = join(root, `lock-test-b-${Date.now()}`)
+  let active = 0
+  let globalMaxActive = 0
+
+  await Promise.all([
+    withGitOperationLock(firstCwd, async () => {
+      active += 1
+      globalMaxActive = Math.max(globalMaxActive, active)
+      await delay(20)
+      active -= 1
+    }),
+    withGitOperationLock(secondCwd, async () => {
+      active += 1
+      globalMaxActive = Math.max(globalMaxActive, active)
+      await delay(20)
+      active -= 1
+    }),
+  ])
+
+  assert.equal(globalMaxActive, 2)
+  assert.equal(getGitOperationLockStatsForTest(firstCwd).maxActive, 1)
+  assert.equal(getGitOperationLockStatsForTest(secondCwd).maxActive, 1)
+  resetGitOperationLocksForTest()
+})
+
+test('commitAndMergeWorktree serializes concurrent merge-back operations for same repository', async () => {
+  const rootDir = resolve(process.cwd())
+  const babelODir = join(rootDir, '.babel-o')
+  if (!existsSync(babelODir)) {
+    mkdirSync(babelODir)
+  }
+
+  const testRepoDir = join(babelODir, `test-repo-concurrent-merge-${Date.now()}`)
+  mkdirSync(testRepoDir)
+
+  try {
+    await runCommand(testRepoDir, 'git', ['init'])
+    await runCommand(testRepoDir, 'git', ['config', 'user.name', 'Test User'])
+    await runCommand(testRepoDir, 'git', ['config', 'user.email', 'test@example.com'])
+
+    writeFileSync(join(testRepoDir, 'initial.txt'), 'initial', 'utf8')
+    await runCommand(testRepoDir, 'git', ['add', '.'])
+    await runCommand(testRepoDir, 'git', ['commit', '-m', 'initial commit'])
+
+    const firstWorktreePath = await createWorktree(testRepoDir, 'concurrent-merge-task-1')
+    const secondWorktreePath = await createWorktree(testRepoDir, 'concurrent-merge-task-2')
+    writeFileSync(join(firstWorktreePath, 'first.txt'), 'first', 'utf8')
+    writeFileSync(join(secondWorktreePath, 'second.txt'), 'second', 'utf8')
+
+    resetGitOperationLocksForTest()
+    const [firstCommit, secondCommit] = await Promise.all([
+      commitAndMergeWorktree(testRepoDir, firstWorktreePath, 'concurrent-merge-task-1', 'First concurrent merge'),
+      commitAndMergeWorktree(testRepoDir, secondWorktreePath, 'concurrent-merge-task-2', 'Second concurrent merge'),
+    ])
+
+    assert.ok(firstCommit)
+    assert.ok(secondCommit)
+    assert.equal(getGitOperationLockStatsForTest(testRepoDir).maxActive, 1)
+    assert.equal(readFileSync(join(testRepoDir, 'first.txt'), 'utf8'), 'first')
+    assert.equal(readFileSync(join(testRepoDir, 'second.txt'), 'utf8'), 'second')
+
+    await removeWorktree(testRepoDir, firstWorktreePath, 'concurrent-merge-task-1')
+    await removeWorktree(testRepoDir, secondWorktreePath, 'concurrent-merge-task-2')
+  } finally {
+    resetGitOperationLocksForTest()
+    if (existsSync(testRepoDir)) {
+      rmSync(testRepoDir, { recursive: true, force: true })
+    }
+  }
+})
 
 test('Git Worktree Lifecycle Integration Test', async () => {
   // Create a temporary repository inside the project workspace directory

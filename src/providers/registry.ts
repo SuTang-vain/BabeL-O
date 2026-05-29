@@ -31,6 +31,15 @@ export type ModelDefinition = {
   }
 }
 
+export type ModelRole = 'planner' | 'executor' | 'critic' | 'optimizer'
+
+export type ModelRoleRecommendation = {
+  role: ModelRole
+  capability: 'long_context' | 'tool_calling' | 'structured_output' | 'balanced'
+  modelId: string
+  reason: string
+}
+
 export class UnknownProviderError extends Error {
   constructor(providerId: string) {
     super(`Unknown provider: ${providerId}`)
@@ -354,6 +363,55 @@ export function getModel(id: string): ModelDefinition {
     throw new UnknownModelError(id)
   }
   return model
+}
+
+export function recommendModelForRole(role: ModelRole): ModelRoleRecommendation {
+  const models = modelRegistry.filter(model => model.capabilities.streaming)
+  switch (role) {
+    case 'planner': {
+      const model = [...models]
+        .sort((left, right) => right.contextWindow - left.contextWindow || right.defaultMaxTokens - left.defaultMaxTokens)[0]!
+      return {
+        role,
+        capability: 'long_context',
+        modelId: model.id,
+        reason: 'Planner role benefits from the largest available context window.',
+      }
+    }
+    case 'executor': {
+      const model = [...models]
+        .filter(item => item.capabilities.toolCalling)
+        .sort((left, right) => right.defaultMaxTokens - left.defaultMaxTokens || right.contextWindow - left.contextWindow)[0]!
+      return {
+        role,
+        capability: 'tool_calling',
+        modelId: model.id,
+        reason: 'Executor role requires stable tool calling support.',
+      }
+    }
+    case 'critic': {
+      const model = [...models]
+        .filter(item => item.capabilities.jsonOutput)
+        .sort((left, right) => right.contextWindow - left.contextWindow || right.defaultMaxTokens - left.defaultMaxTokens)[0]!
+      return {
+        role,
+        capability: 'structured_output',
+        modelId: model.id,
+        reason: 'Critic role benefits from structured output support.',
+      }
+    }
+    case 'optimizer': {
+      const model = [...models]
+        .filter(item => item.capabilities.toolCalling && item.capabilities.jsonOutput)
+        .sort((left, right) => right.contextWindow - left.contextWindow || right.defaultMaxTokens - left.defaultMaxTokens)[0] ?? models[0]!
+      return {
+        role,
+        capability: 'balanced',
+        modelId: model.id,
+        reason: 'Optimizer role prefers a balanced model with tool and structured output support.',
+      }
+    }
+  }
 }
 
 export function getAdapter(providerId: string): ModelAdapter {

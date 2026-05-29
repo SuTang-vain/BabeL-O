@@ -222,7 +222,7 @@ export class LocalCodingRuntime implements NexusRuntime {
 
       // Check if the tool requires authorization.
       if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
-        const { autoApprove, reason } = classifyAction(tool.name, toolInput)
+        const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: options.cwd })
         let approved = autoApprove
         let decisionReason = `Auto-approved: ${reason}`
 

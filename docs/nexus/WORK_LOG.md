@@ -2,6 +2,46 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-30 — P0/P1 worktree / Git 并发安全
+
+- **用户决策**: 按建议推进 worktree / Git 并发安全，目标是避免多个 agent / optimizer 同时操作同一父工作区导致 cherry-pick 冲突、Git metadata 竞争或误覆盖。
+- **处理**:
+  - `src/nexus/worktree.ts` 新增 per-cwd Git operation lock，并暴露测试用 stats/reset helper。
+  - `createWorktree()`、`commitAndMergeWorktree()`、`removeWorktree()`、`pruneOrphanedWorktrees()` 均按父仓 cwd 串行化；merge-back 的 parent HEAD 读取、worktree commit、commit range 计算、cherry-pick 与 conflict abort 保持在同一临界区。
+  - `src/nexus/agentLoop.ts` 的 optimizer in-place Git mutation 也复用同一锁：`stash`、`commit`、`rollback`、`stash pop`，避免与 isolated worktree merge-back 并发修改同一父仓。
+  - `worktree.test.ts` 新增同仓串行、跨仓并发和真实 concurrent merge-back 回归；顺手修正 `tui-input.test.ts` 中 autosuggestion readline mock 的 `_refreshLine` 类型窄化问题，使 typecheck 恢复通过。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/worktree.test.ts`：6/6 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：17/17 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P0/P1 Bash classifier 路径与变量展开硬化
+
+- **用户决策**: 继续根据建议推进 P0；非 DeepSeek 的指令跟随与 provider 协议 P0 已收口后，顺手推进相邻 runtime 安全硬化项。
+- **处理**:
+  - `classifyAction()` 新增可选 cwd 上下文，`LLMCodingRuntime` 与 `LocalCodingRuntime` 在权限分类时传入当前 workspace。
+  - Bash `cat` 自动审批只允许明确的 workspace 内文件路径；`../` 越界、绝对路径越界、glob、`/dev/*` 均不自动批准。
+  - shell 词法扫描从只拒绝 `$()` / `${}` 扩展，收紧为所有 `$VAR` / `${VAR}` / `$()` 在自动审批路径下都进入人工 review。
+  - `classifier.test.ts` 覆盖 `$HOME`、`${HOME}`、workspace 内外 `cat` 与 glob；`permission-flow.test.ts` 覆盖 `cat /tmp/secret.txt` 触发 permission_request 而不是自动执行。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/classifier.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/permission-flow.test.ts`：12/12 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P0 session_3ba2d788 指令跟随回归修复
+
+- **用户决策**: 继续推进 P0，并针对真实会话 `session_3ba2d788-6f78-468b-b01d-0a6a10ade46f` 中 “你好？” 后仍继续旧 BabeL-X 工具链的问题做修复；DeepSeek reasoning 适配仍暂缓。
+- **处理**:
+  - `LLMCodingRuntime` 读取历史事件改为 `order=desc, limit=1000` 后 reverse，确保长会话使用最新 tail 而不是最早 1000 条。
+  - User Intake Guidance 绑定与校验改为以本轮 `latestPrompt` 为最高优先级，旧 `user_message` 只作为 history/background。
+  - intake 模型输出的 `explicitPaths` 不再被信任，统一使用 deterministic extractor 从当前 prompt 提取，避免 hallucinated path 污染 focus。
+  - runtime 执行层新增 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` 硬拦截：当 `respond_only` / `requiresTools=false` 时，即使 provider 通过 MiniMax text-encoded tool_call 产出工具调用，也不会进入 `tool_started`。
+  - `runtime-llm.test.ts` 覆盖长会话 tail/intake、respond_only 下 MiniMax 文本工具调用硬拦截；`context-regression.test.ts` 新增 session_3ba2d788 sanitized replay。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-regression.test.ts`：49/49 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
 ## 2026-05-29 — P0 Provider smoke live tool-call 与协议回归扩展
 
 - **用户决策**: 继续推进 P0，并在用户已全量修复 TUI 页面问题后直接执行测试与 provider/runtime P0 收口。

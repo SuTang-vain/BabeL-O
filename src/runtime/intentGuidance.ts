@@ -77,7 +77,7 @@ export function deriveUserIntentGuidance(options: {
   cwd: string
 }): UserIntentGuidance {
   const intake = findLatestUserIntakeGuidance(options.events)
-  if (intake && intake.userText === (findLatestUserText(options.events) || options.latestPrompt)) {
+  if (intake && intake.userText === options.latestPrompt) {
     return guidanceFromIntakeEvent(intake)
   }
   return deriveFallbackUserIntentGuidance(options)
@@ -163,7 +163,7 @@ export function deriveFallbackUserIntentGuidance(options: {
   latestPrompt: string
   cwd: string
 }): UserIntentGuidance {
-  const latestUserText = findLatestUserText(options.events) || options.latestPrompt
+  const latestUserText = options.latestPrompt || findLatestUserText(options.events)
   const explicitPaths = extractAbsolutePaths(latestUserText)
   const hasPriorUserTurns = countUserMessages(options.events) > 1
 
@@ -318,9 +318,7 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
     const requiresTools = typeof raw.requiresTools === 'boolean'
       ? raw.requiresTools
       : actionHint !== 'respond_only'
-    const explicitPaths = Array.isArray(raw.explicitPaths)
-      ? raw.explicitPaths.filter((path): path is string => typeof path === 'string')
-      : fallback.explicitPaths
+    const explicitPaths = fallback.explicitPaths
     return buildGuidance({
       intent,
       confidence: clamp01(typeof raw.confidence === 'number' ? raw.confidence : fallback.confidence),

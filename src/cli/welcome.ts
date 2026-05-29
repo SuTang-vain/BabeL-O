@@ -55,7 +55,7 @@ export function formatWelcomeCardLines(options: {
   url?: string
 }): string[] {
   const username = process.env.USER || process.env.USERNAME || 'User'
-  const version = '0.2.3'
+  const version = '0.2.4'
   const mode = options.url ? `Service (${options.url})` : 'Embedded (Local)'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'

@@ -52,6 +52,14 @@ export class NexusClient {
     return this.getJson('/v1/tools/audit')
   }
 
+  async providerFallbackPlan(options: {
+    model?: string
+    role?: string
+    kind?: 'max_output_tokens' | 'context_window' | 'rate_limit' | 'auth_or_billing' | 'provider_protocol' | 'provider_unavailable' | 'unknown'
+  } = {}): Promise<unknown> {
+    return this.postJson('/v1/runtime/provider-fallback/plan', options)
+  }
+
   async execute(body: {
     prompt: string
     cwd?: string

@@ -15,6 +15,7 @@ import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
+import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runtime/providerRecovery.js'
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
@@ -61,6 +62,20 @@ const providerLiveSmokeSchema = z.object({
   role: z.string().optional(),
   mode: z.enum(['simple_text', 'tool_call']).default('simple_text').optional(),
   timeoutMs: z.number().int().positive().max(60_000).default(30_000).optional(),
+})
+
+const providerFallbackPlanSchema = z.object({
+  model: z.string().optional(),
+  role: z.string().optional(),
+  kind: z.enum([
+    'max_output_tokens',
+    'context_window',
+    'rate_limit',
+    'auth_or_billing',
+    'provider_protocol',
+    'provider_unavailable',
+    'unknown',
+  ]).default('unknown').optional(),
 })
 
 const createTaskSchema = z.object({
@@ -189,7 +204,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.3',
+    version: '0.2.4',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -198,7 +213,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.3',
+      version: '0.2.4',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),
@@ -223,6 +238,18 @@ export async function createNexusApp(
       role: body.role,
       mode: body.mode,
       timeoutMs: body.timeoutMs,
+    })
+  })
+
+  app.post('/v1/runtime/provider-fallback/plan', async request => {
+    const body = providerFallbackPlanSchema.parse(request.body ?? {})
+    const provider = ConfigManager.getInstance().getProviderDiagnostics({
+      model: body.model,
+      role: body.role,
+    })
+    return planProviderFallbackAction({
+      provider,
+      policy: buildProviderFallbackPolicy(body.kind ?? 'unknown'),
     })
   })
 

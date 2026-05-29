@@ -7,7 +7,8 @@ import { ConfigManager } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
-import type { NexusEvent } from '../src/shared/events.js'
+import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 import { EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
 import { parseStructuredAgentOutput } from '../src/nexus/runtimeAgentStep.js'
 
@@ -364,6 +365,41 @@ describe('ConfigManager', () => {
     }
   })
 
+  test('provider diagnostics expose role recommendation without switching models', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      defaultModel: 'local/coding-runtime',
+      profiles: {
+        roletest: {
+          model: 'openai/gpt-4o',
+          provider: 'openai',
+          apiKey: 'role-key',
+        },
+      },
+      activeProfile: 'roletest',
+    })
+
+    const oldBabelOModel = process.env.BABEL_O_MODEL
+    try {
+      delete process.env.BABEL_O_MODEL
+      const plannerSettings = configManager.resolveSettings({ role: 'planner' })
+      const plannerDiagnostics = configManager.getProviderDiagnostics({ role: 'planner' })
+
+      assert.equal(plannerSettings.modelId, 'openai/gpt-4o')
+      assert.equal(plannerSettings.modelSource, 'profile')
+      assert.equal(plannerDiagnostics.modelId, 'openai/gpt-4o')
+      assert.equal(plannerDiagnostics.roleRecommendation?.role, 'planner')
+      assert.equal(plannerDiagnostics.roleRecommendation?.capability, 'long_context')
+      assert.equal(plannerDiagnostics.roleRecommendation?.configured, false)
+      assert.equal(plannerDiagnostics.roleRecommendation?.activeModelId, 'openai/gpt-4o')
+      assert.equal(plannerDiagnostics.roleRecommendation?.willAutoSwitch, false)
+    } finally {
+      if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel
+      else delete process.env.BABEL_O_MODEL
+    }
+  })
+
   test('resolveSettings respects request model over env, role, and profile defaults', () => {
     const configManager = new ConfigManager(tempConfigPath)
 
@@ -577,6 +613,93 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
     assert.match(JSON.stringify(body.system), /User Intake Guidance/)
+  })
+
+  test('loads latest session tail before building intake guidance', async () => {
+    const sessionId = 'test-long-session-tail-intake'
+    const storage = new MemoryStorage()
+    const oldEvents: NexusEvent[] = []
+    for (let index = 0; index < 1100; index += 1) {
+      oldEvents.push({
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: new Date(Date.UTC(2026, 4, 29, 15, 0, index)).toISOString(),
+        text: `old event ${index} `,
+      })
+    }
+    oldEvents.push({
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-29T15:22:48.000Z',
+      text: '你好？',
+    })
+    await storage.saveSession({
+      sessionId,
+      cwd: tmpdir(),
+      prompt: 'old prompt',
+      phase: 'created',
+      createdAt: '2026-05-29T15:00:00.000Z',
+      updatedAt: '2026-05-29T15:22:48.000Z',
+      events: oldEvents,
+    })
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        const bodyText = JSON.stringify(body)
+        assert.match(bodyText, /你好？/)
+        assert.doesNotMatch(bodyText, /old event 0/)
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"greeting\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Greeting.\\",\\"guidance\\":\\"Reply briefly.\\",\\"explicitPaths\\":[\\"/Users/tangyaoyou/DEV/gemini-cli\\"]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"你好，我在。"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), storage, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId,
+        prompt: '你好？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.userText, '你好？')
+    assert.equal(intake.actionHint, 'respond_only')
+    assert.deepEqual(intake.explicitPaths, [])
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.tools, undefined)
+    assert.match(JSON.stringify(body), /你好？/)
+    assert.doesNotMatch(JSON.stringify(body), /tangyaoyou/)
   })
 
   test('normalizes contradictory pause intake before exposing tools', async () => {
@@ -1277,6 +1400,82 @@ describe('LLMCodingRuntime', () => {
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, true)
     assert.match(resultEvent.message, /final answer/)
+  })
+
+  test('hard-suppresses MiniMax text-encoded tool calls for respond-only intake', async () => {
+    configManager.setProviderConfig('minimax', {
+      apiKey: 'minimax-test-key',
+      baseUrl: 'https://api.test-minimax.com/anthropic',
+    })
+    configManager.setDefaultModel('minimax/MiniMax-M2.7-highspeed')
+
+    let providerCallCount = 0
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"greeting\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Greeting.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      providerCallCount += 1
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: providerCallCount === 1
+          ? createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">pwd</parameter>\\n<parameter name=\\"timeoutMs\\">15000</parameter>\\n</invoke>\\n</minimax:tool_call>"}}\n\n',
+            ])
+          : createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"你好，我在。"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-minimax-tool-call-suppressed-by-intent',
+        prompt: '你好？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && (event as any).text.includes('<minimax:tool_call>'),
+    ))
+    assert.ok(!events.some(event => event.type === 'tool_started'))
+
+    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+    assert.ok(suppressionError)
+    assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(firstBody.tools, undefined)
   })
 
   test('normalizes MiniMax text-encoded tool calls before runtime rendering', async () => {

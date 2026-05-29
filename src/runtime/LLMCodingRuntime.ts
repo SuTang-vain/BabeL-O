@@ -129,10 +129,10 @@ export class LLMCodingRuntime implements NexusRuntime {
       if (this.storage) {
         try {
           const result = await this.storage.listEvents(options.sessionId, {
-            order: 'asc',
+            order: 'desc',
             limit: 1000,
           })
-          previousEvents = result?.events || []
+          previousEvents = [...(result?.events || [])].reverse()
         } catch (e) {
           logger.debug('Failed to load previous session events from storage', e)
         }
@@ -631,6 +631,29 @@ export class LLMCodingRuntime implements NexusRuntime {
           continue
         }
 
+        if (shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) && currentToolCalls.length > 0) {
+          const attemptedTools = currentToolCalls.map(toolCall => toolCall.name).join(', ')
+          const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
+          yield {
+            type: 'error',
+            ...eventBase(options.sessionId),
+            code: 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT',
+            message,
+            details: {
+              intent: assembledContext.userIntentGuidance.intent,
+              actionHint: assembledContext.userIntentGuidance.actionHint,
+              requiresTools: assembledContext.userIntentGuidance.requiresTools,
+              latestUserText: assembledContext.userIntentGuidance.latestUserText,
+              attemptedTools: currentToolCalls.map(toolCall => toolCall.name),
+            },
+          }
+          messages.push({
+            role: 'user',
+            content: `${message}\nAnswer the latest user message directly using existing context. Do not call tools.`,
+          })
+          continue
+        }
+
         // Record assistant's turn in messages array
         const assistantContent: ContentBlock[] = []
         if (currentAssistantText) {
@@ -910,7 +933,7 @@ export class LLMCodingRuntime implements NexusRuntime {
 
           // Check if the tool requires authorization.
           if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
-            const { autoApprove, reason } = classifyAction(tool.name, parsed.data)
+            const { autoApprove, reason } = classifyAction(tool.name, parsed.data, { cwd: options.cwd })
             let approved = autoApprove
             let decisionReason = `Auto-approved: ${reason}`
 

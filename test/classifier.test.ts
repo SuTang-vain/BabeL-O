@@ -65,6 +65,14 @@ test('classifyAction requires manual review for shell expansion and loose read s
   assert.equal(commandSubstitution.autoApprove, false)
   assert.match(commandSubstitution.reason, /expansion|substitution/)
 
+  const braceVariableExpansion = classifyAction('Bash', { command: 'cat ${HOME}/secret.txt' })
+  assert.equal(braceVariableExpansion.autoApprove, false)
+  assert.match(braceVariableExpansion.reason, /variable|expansion/)
+
+  const bareVariableExpansion = classifyAction('Bash', { command: 'cat $HOME/secret.txt' })
+  assert.equal(bareVariableExpansion.autoApprove, false)
+  assert.match(bareVariableExpansion.reason, /variable|expansion/)
+
   const pipeline = classifyAction('Bash', { command: 'git status && rm -rf dist' })
   assert.equal(pipeline.autoApprove, false)
   assert.match(pipeline.reason, /Shell operators/)
@@ -74,6 +82,25 @@ test('classifyAction requires manual review for shell expansion and loose read s
 
   const redirectedCat = classifyAction('Bash', { command: 'cat package.json > copy.json' })
   assert.equal(redirectedCat.autoApprove, false)
+})
+
+test('classifyAction only auto-approves cat paths inside workspace', () => {
+  const cwd = '/Users/tangyaoyue/DEV/BABEL/BabeL-O'
+
+  const relativeInside = classifyAction('Bash', { command: 'cat package.json' }, { cwd })
+  assert.equal(relativeInside.autoApprove, true)
+
+  const absoluteInside = classifyAction('Bash', { command: 'cat /Users/tangyaoyue/DEV/BABEL/BabeL-O/package.json' }, { cwd })
+  assert.equal(absoluteInside.autoApprove, true)
+
+  const parentTraversal = classifyAction('Bash', { command: 'cat ../BabeL-X/package.json' }, { cwd })
+  assert.equal(parentTraversal.autoApprove, false)
+
+  const absoluteOutside = classifyAction('Bash', { command: 'cat /Users/tangyaoyue/.ssh/config' }, { cwd })
+  assert.equal(absoluteOutside.autoApprove, false)
+
+  const globCat = classifyAction('Bash', { command: 'cat src/*.ts' }, { cwd })
+  assert.equal(globCat.autoApprove, false)
 })
 
 test('classifyAction blocks file modification tools by default', () => {

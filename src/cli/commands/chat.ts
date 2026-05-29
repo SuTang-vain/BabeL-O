@@ -19,6 +19,7 @@ import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
 import { modelRegistry } from '../../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../../runtime/providerSmoke.js'
+import { buildProviderFallbackPolicy, planProviderFallbackAction, type ProviderRecoveryKind } from '../../runtime/providerRecovery.js'
 import { createId } from '../../shared/id.js'
 import { NexusEvent } from '../../shared/events.js'
 import { runSessionFlow } from '../runSessionFlow.js'
@@ -835,6 +836,23 @@ export function registerChatCommand(program: Command): void {
             continue
           }
 
+          if (trimmed === '/fallback' || trimmed.startsWith('/fallback ')) {
+            const kind = parseProviderRecoveryKind(trimmed.slice('/fallback'.length).trim())
+            try {
+              const plan = options.url
+                ? await new NexusClient({ baseUrl: options.url }).providerFallbackPlan({ kind })
+                : planProviderFallbackAction({
+                    provider: ConfigManager.getInstance().getProviderDiagnostics(),
+                    policy: buildProviderFallbackPolicy(kind),
+                  })
+              console.log(chalk.cyan('\n--- Provider Fallback Plan ---'))
+              console.log(formatProviderFallbackPlan(plan))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to build provider fallback plan: ${e.message || e}`))
+            }
+            continue
+          }
+
           if (trimmed === '/sessions') {
             if (options.url) {
               try {
@@ -973,6 +991,7 @@ function formatProviderDiagnostics(provider: any): string {
   if (!provider) return chalk.dim('Provider diagnostics unavailable.')
   const auth = provider.authConfigured ? chalk.green('configured') : chalk.red('missing')
   const capabilities = provider.capabilities ?? {}
+  const roleRecommendation = provider.roleRecommendation
   return [
     chalk.bold('Provider'),
     `  provider:        ${provider.providerId} (${provider.providerName})`,
@@ -982,7 +1001,10 @@ function formatProviderDiagnostics(provider: any): string {
     `  model:           ${chalk.yellow(provider.modelId)} (${provider.modelName}) source=${provider.modelSource}`,
     `  window/output:   ${provider.contextWindow} / ${provider.defaultMaxTokens}`,
     `  capabilities:    tools=${yesNo(capabilities.toolCalling)} json=${yesNo(capabilities.jsonOutput)} structured=${yesNo(capabilities.structuredOutput)} streaming=${yesNo(capabilities.streaming)}`,
-  ].join('\n')
+    roleRecommendation
+      ? `  role hint:       ${roleRecommendation.role} recommends ${roleRecommendation.modelId} (${roleRecommendation.capability}) configured=${yesNo(roleRecommendation.configured)} autoSwitch=${yesNo(roleRecommendation.willAutoSwitch)}`
+      : undefined,
+  ].filter(Boolean).join('\n')
 }
 
 function formatProviderSmoke(smoke: any): string {
@@ -1004,6 +1026,38 @@ function formatProviderSmoke(smoke: any): string {
     `  fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `  next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
   ].join('\n')
+}
+
+function formatProviderFallbackPlan(plan: any): string {
+  if (!plan) return chalk.dim('Provider fallback plan unavailable.')
+  const action = plan.action ?? {}
+  const fallbackPolicy = plan.fallbackPolicy ?? {}
+  const provider = plan.provider ?? {}
+  return [
+    chalk.bold('Provider Fallback Plan'),
+    `  provider:        ${provider.providerId ?? 'unknown'} model=${provider.modelId ?? 'unknown'}`,
+    `  mode:            ${fallbackPolicy.mode ?? action.mode ?? 'unknown'}`,
+    `  status:          ${action.status ?? 'unknown'}`,
+    `  silent switch:   ${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
+    `  user confirm:    ${action.requiresUserConfirmation === true ? 'required' : 'unknown'}`,
+    `  side effects:    switchModel=${yesNo(action.willSwitchModel)} switchProvider=${yesNo(action.willSwitchProvider)} mutateConfig=${yesNo(action.willMutateConfig)} callProvider=${yesNo(action.willCallProvider)} createSession=${yesNo(action.willCreateSession)}`,
+    `  reason:          ${fallbackPolicy.reason ?? chalk.dim('none')}`,
+    `  next action:     ${action.description ?? fallbackPolicy.nextAction ?? chalk.dim('none')}`,
+  ].join('\n')
+}
+
+function parseProviderRecoveryKind(value: string): ProviderRecoveryKind {
+  const normalized = value.trim().replace(/-/g, '_')
+  const allowed = new Set<ProviderRecoveryKind>([
+    'max_output_tokens',
+    'context_window',
+    'rate_limit',
+    'auth_or_billing',
+    'provider_protocol',
+    'provider_unavailable',
+    'unknown',
+  ])
+  return allowed.has(normalized as ProviderRecoveryKind) ? normalized as ProviderRecoveryKind : 'unknown'
 }
 
 function yesNo(value: unknown): string {

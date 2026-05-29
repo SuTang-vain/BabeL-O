@@ -17,7 +17,7 @@ type CliReadline = readline.Interface
 
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/sessions', '/history', '/tool',
+    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
     '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e',
   ]
 }
@@ -114,6 +114,12 @@ export function makeCompleter(cwd: string) {
       hits = ['dry-run', 'live', 'live tool-call', 'tool-call']
         .filter(option => option.startsWith(smokePrefix))
         .map(option => `/smoke ${option}`)
+      substring = line
+    } else if (line.startsWith('/fallback ')) {
+      const fallbackPrefix = line.slice('/fallback '.length).trimStart().toLowerCase()
+      hits = ['max-output-tokens', 'context-window', 'rate-limit', 'auth-or-billing', 'provider-protocol', 'provider-unavailable', 'unknown']
+        .filter(option => option.startsWith(fallbackPrefix))
+        .map(option => `/fallback ${option}`)
       substring = line
     } else {
       const words = line.split(' ')

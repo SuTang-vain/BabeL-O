@@ -59,6 +59,7 @@ export const helpCategories: HelpCategory[] = [
       { command: '/smoke', description: 'Run provider smoke dry-run' },
       { command: '/smoke live', description: 'Run explicit live provider smoke' },
       { command: '/smoke live tool-call', description: 'Run explicit provider tool-call smoke' },
+      { command: '/fallback [kind]', description: 'Show non-silent provider fallback plan' },
     ],
   },
   {

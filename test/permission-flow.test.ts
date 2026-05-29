@@ -245,6 +245,65 @@ test('smart permissions: auto-approves safe commands and persists audit log', as
   await app.close()
 })
 
+test('smart permissions: prompts user for cat paths outside workspace', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-smart-cat-outside-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-smart-cat-outside-${Date.now()}`
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: { prompt: 'bash "cat /tmp/secret.txt"', cwd, sessionId },
+  })
+
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      const reqEvent = data.session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        assert.match(reqEvent.message, /manual review/i)
+        break
+      }
+    }
+  }
+
+  assert.ok(toolUseId, 'Should have received permission request for cat outside workspace')
+
+  const denyRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/deny`,
+    payload: { toolUseId, reason: 'outside workspace cat requires review' },
+  })
+  assert.equal(denyRes.statusCode, 200)
+
+  const response = await executePromise
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  assert.equal(body.success, false)
+
+  const auditsRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}/permission-audits`,
+  })
+  assert.equal(auditsRes.statusCode, 200)
+  const auditsBody = auditsRes.json()
+  assert.equal(auditsBody.audits.length, 1)
+  assert.equal(auditsBody.audits[0].toolName, 'Bash')
+  assert.equal(auditsBody.audits[0].decision, 'denied')
+
+  await app.close()
+})
+
 test('smart permissions: prompts user on non-whitelisted/dangerous command', async () => {
   const cwd = join(tmpdir(), `babel-o-test-smart-prompt-${Date.now()}`)
   await mkdir(cwd, { recursive: true })

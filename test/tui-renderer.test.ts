@@ -424,6 +424,166 @@ test('formatSessionHistory: compact tool rows hide raw tool parameter names', ()
   assert.ok(!output.includes('running'))
 })
 
+test('renderEvent keeps completed tool row before compact thinking spinner', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-thinking-after-tool',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-bash-thinking',
+      name: 'Bash',
+      input: { command: 'ls -la /tmp' },
+    })
+    renderEventForTest({
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-thinking-after-tool',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-bash-thinking',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'total 248\nfile', stderr: '', exitCode: 0 },
+    })
+    renderEventForTest({
+      type: 'thinking_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-thinking-after-tool',
+      timestamp: new Date().toISOString(),
+      text: 'Need to summarize.',
+    })
+  } finally {
+    process.stdout.write = originalWrite
+  }
+
+  const output = writes.join('')
+  const plainOutput = output.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('● ✓ Bash ls -la /tmp done'))
+  assert.ok(plainOutput.includes('total 248'))
+  assert.ok(plainOutput.includes('done exitCode=0 total 248\n'))
+})
+
+test('formatSessionHistory: skips standalone whitespace assistant deltas before tool rows', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'session_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      cwd: '/repo',
+      model: 'local/coding-runtime',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      text: '\n',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-whitespace',
+      name: 'Read',
+      input: { path: '/tmp/file.txt' },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-whitespace',
+      name: 'Read',
+      success: false,
+      output: 'failed',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.equal((output.match(/⏺/g) ?? []).length, 0)
+  assert.ok(output.includes('Read /tmp/file.txt failed'))
+})
+
+test('renderEvent skips standalone whitespace assistant deltas before tool rows', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    renderEventForTest({
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      text: '\n',
+    })
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-whitespace-assistant',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-live-whitespace-read',
+      name: 'Read',
+      input: { path: '/tmp/file.txt' },
+    })
+  } finally {
+    process.stdout.write = originalWrite
+  }
+
+  const output = writes.join('')
+  assert.equal((output.match(/⏺/g) ?? []).length, 0)
+  assert.ok(output.includes('● Read /tmp/file.txt'))
+})
+
+test('renderEvent does not insert blank line between newline-terminated assistant text and tool rows', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    renderEventForTest({
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-spacing',
+      timestamp: new Date().toISOString(),
+      text: '继续读取文件：\n',
+    })
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-spacing',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-spacing-read',
+      name: 'Read',
+      input: { path: '/tmp/file.txt' },
+    })
+  } finally {
+    process.stdout.write = originalWrite
+  }
+
+  const output = writes.join('')
+  assert.ok(output.includes('继续读取文件：\n● Read /tmp/file.txt'))
+  assert.ok(!output.includes('继续读取文件：\n\n● Read /tmp/file.txt'))
+})
+
 test('renderEvent updates live tool completion on the same terminal row', () => {
   startSession()
   const writes: string[] = []
