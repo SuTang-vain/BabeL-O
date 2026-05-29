@@ -28,11 +28,75 @@ const TOKEN_COLORS: Record<string, (text: string) => string> = {
 }
 
 // Simple syntax highlighting for common languages
+function highlightJson(code: string): string {
+  let result = ''
+  let i = 0
+  const len = code.length
+  while (i < len) {
+    const char = code[i]!
+    const remaining = code.slice(i)
+
+    // String
+    if (char === '"') {
+      let strVal = '"'
+      i++
+      let escaped = false
+      while (i < len) {
+        const c = code[i]!
+        strVal += c
+        if (escaped) {
+          escaped = false
+        } else if (c === '\\') {
+          escaped = true
+        } else if (c === '"') {
+          i++
+          break
+        }
+        i++
+      }
+      // Check if this string is a JSON key (followed by a colon)
+      const afterStr = code.slice(i).trimStart()
+      if (afterStr.startsWith(':')) {
+        result += chalk.cyan(strVal)
+      } else {
+        result += chalk.green(strVal)
+      }
+      continue
+    }
+
+    // Number
+    const numMatch = remaining.match(/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/)
+    if (numMatch) {
+      const num = numMatch[0]!
+      result += chalk.yellow(num)
+      i += num.length
+      continue
+    }
+
+    // Keyword (true, false, null)
+    const kwMatch = remaining.match(/^(?:true|false|null)\b/)
+    if (kwMatch) {
+      const kw = kwMatch[0]!
+      result += chalk.magenta(kw)
+      i += kw.length
+      continue
+    }
+
+    result += char
+    i++
+  }
+  return result
+}
+
+// Simple syntax highlighting for common languages using stateful tokenizer
 function highlightCode(code: string, lang: string): string {
   const langLower = lang.toLowerCase()
+  if (langLower === 'json') {
+    return highlightJson(code)
+  }
 
   // Basic keyword lists
-  const keywords: Record<string, string[]> = {
+  const keywordsMap: Record<string, string[]> = {
     typescript: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'class', 'interface', 'type', 'import', 'export', 'from', 'async', 'await', 'try', 'catch', 'throw', 'new', 'this', 'extends', 'implements', 'public', 'private', 'protected', 'static', 'readonly', 'abstract', 'as', 'in', 'of', 'typeof', 'instanceof', 'default', 'case', 'switch', 'break', 'continue', 'null', 'undefined', 'true', 'false', 'void', 'never', 'any', 'unknown'],
     javascript: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'class', 'import', 'export', 'from', 'async', 'await', 'try', 'catch', 'throw', 'new', 'this', 'extends', 'default', 'case', 'switch', 'break', 'continue', 'null', 'undefined', 'true', 'false'],
     tsx: ['const', 'let', 'var', 'function', 'return', 'if', 'else', 'for', 'while', 'class', 'interface', 'type', 'import', 'export', 'from', 'async', 'await', 'try', 'catch', 'throw', 'new', 'this', 'extends', 'implements', 'public', 'private', 'protected', 'static', 'readonly', 'abstract', 'as', 'in', 'of', 'typeof', 'instanceof', 'default', 'case', 'switch', 'break', 'continue', 'null', 'undefined', 'true', 'false', 'void', 'never', 'any', 'unknown'],
@@ -43,32 +107,100 @@ function highlightCode(code: string, lang: string): string {
     yaml: ['true', 'false', 'null', 'yes', 'no', 'on', 'off'],
   }
 
-  const words = keywords[langLower] || keywords.typescript || []
+  const words = new Set(keywordsMap[langLower] || keywordsMap.typescript || [])
 
-  // Simple regex-based tokenization
-  let result = code
+  let result = ''
+  let i = 0
+  const len = code.length
 
-  // Highlight strings (double and single quoted)
-  result = result.replace(/(["'`])(?:(?!\1)[^\\]|\\.)*\1/g, (match) => {
-    return chalk.green(match)
-  })
+  while (i < len) {
+    const char = code[i]!
+    const remaining = code.slice(i)
 
-  // Highlight comments
-  if (langLower === 'bash' || langLower === 'sh') {
-    result = result.replace(/#.*$/gm, (match) => chalk.gray(match))
-  } else if (langLower === 'python') {
-    result = result.replace(/#.*$/gm, (match) => chalk.gray(match))
-  } else {
-    result = result.replace(/\/\/.*$/gm, (match) => chalk.gray(match))
-    result = result.replace(/\/\*[\s\S]*?\*\//g, (match) => chalk.gray(match))
+    // 1. Comments
+    if (langLower === 'bash' || langLower === 'sh' || langLower === 'python' || langLower === 'yaml') {
+      if (char === '#') {
+        let comment = ''
+        while (i < len && code[i] !== '\n') {
+          comment += code[i]!
+          i++
+        }
+        result += chalk.gray(comment)
+        continue
+      }
+    } else {
+      if (remaining.startsWith('//')) {
+        let comment = ''
+        while (i < len && code[i] !== '\n') {
+          comment += code[i]!
+          i++
+        }
+        result += chalk.gray(comment)
+        continue
+      }
+      if (remaining.startsWith('/*')) {
+        const endIdx = code.indexOf('*/', i + 2)
+        if (endIdx !== -1) {
+          const comment = code.slice(i, endIdx + 2)
+          result += chalk.gray(comment)
+          i = endIdx + 2
+          continue
+        } else {
+          result += chalk.gray(code.slice(i))
+          break
+        }
+      }
+    }
+
+    // 2. Strings
+    if (char === '"' || char === "'" || char === '`') {
+      const quote = char
+      let strVal = quote
+      i++
+      let escaped = false
+      while (i < len) {
+        const c = code[i]!
+        strVal += c
+        if (escaped) {
+          escaped = false
+        } else if (c === '\\') {
+          escaped = true
+        } else if (c === quote) {
+          i++
+          break
+        }
+        i++
+      }
+      result += chalk.green(strVal)
+      continue
+    }
+
+    // 3. Keywords / Identifiers
+    const identMatch = remaining.match(/^[a-zA-Z_$][a-zA-Z0-9_$]*/)
+    if (identMatch) {
+      const word = identMatch[0]!
+      if (words.has(word)) {
+        result += chalk.cyan(word)
+      } else {
+        result += word
+      }
+      i += word.length
+      continue
+    }
+
+    // 4. Numbers
+    const numMatch = remaining.match(/^\b\d+(?:\.\d+)?\b/)
+    if (numMatch) {
+      const num = numMatch[0]!
+      result += chalk.yellow(num)
+      i += num.length
+      continue
+    }
+
+    // 5. Operators / Punctuation
+    result += char
+    i++
   }
-
-  // Highlight numbers
-  result = result.replace(/\b\d+\.?\d*\b/g, (match) => chalk.yellow(match))
-
-  // Highlight keywords
-  const keywordRegex = new RegExp(`\\b(${words.join('|')})\\b`, 'g')
-  result = result.replace(keywordRegex, (match) => chalk.cyan(match))
 
   return result
 }
@@ -94,6 +226,29 @@ function wrapText(text: string, width: number, indent: string = ''): string[] {
   }
 
   return lines
+}
+
+function renderInlineText(text: string): string {
+  let formatted = text
+  // Bold + Italic
+  formatted = formatted.replace(/\*\*\*(.+?)\*\*\*/g, (_, t) => chalk.bold.italic(t))
+  // Bold
+  formatted = formatted.replace(/\*\*(.+?)\*\*/g, (_, t) => chalk.bold(t))
+  // Italic
+  formatted = formatted.replace(/\*(.+?)\*/g, (_, t) => chalk.italic(t))
+  // Inline code
+  formatted = formatted.replace(/`([^`]+)`/g, (_, code) => chalk.bgBlackBright.white(` ${code} `))
+  // Links
+  formatted = formatted.replace(/\[([^\]]+)\]\([^)]+\)/g, (_, t) => chalk.underline.blue(t))
+  // Strikethrough
+  formatted = formatted.replace(/~~(.+?)~~/g, (_, t) => chalk.strikethrough(t))
+  return formatted
+}
+
+function padAnsi(text: string, width: number): string {
+  const visibleLen = text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').length
+  const paddingNeeded = Math.max(0, width - visibleLen)
+  return text + ' '.repeat(paddingNeeded)
 }
 
 export function renderMarkdown(text: string, options: RenderOptions = {}): string {
@@ -181,11 +336,12 @@ export function renderMarkdown(text: string, options: RenderOptions = {}): strin
       if (tableHeader.length > 0) {
         // Render table
         const colWidths = tableHeader.map((_, colIdx) => {
+          const cleanHeader = tableHeader[colIdx]!.replace(/\*\*|\*|`|~~/g, '')
           const maxWidth = Math.max(
-            tableHeader[colIdx]!.length,
-            ...tableRows.map(row => (row[colIdx] || '').length)
+            cleanHeader.length,
+            ...tableRows.map(row => (row[colIdx] || '').replace(/\*\*|\*|`|~~|\[([^\]]+)\]\([^)]+\)/g, '$1').length)
           )
-          return Math.min(maxWidth + 2, 20)
+          return Math.min(maxWidth + 2, 40)
         })
 
         const separator = tableAligns.length > 0
@@ -200,8 +356,8 @@ export function renderMarkdown(text: string, options: RenderOptions = {}): strin
 
         // Header
         lines.push(chalk.cyan('┌') + tableHeader.map((h, i) => {
-          const padded = h.padEnd(colWidths[i]!)
-          return chalk.bold.white(padded)
+          const rendered = renderInlineText(h)
+          return chalk.bold.white(padAnsi(rendered, colWidths[i]!))
         }).join(chalk.cyan('│')) + chalk.cyan('┐'))
 
         // Separator
@@ -210,8 +366,8 @@ export function renderMarkdown(text: string, options: RenderOptions = {}): strin
         // Rows
         for (const row of tableRows) {
           lines.push(chalk.cyan('│') + row.map((cell, i) => {
-            const padded = cell.padEnd(colWidths[i]!)
-            return chalk.white(padded)
+            const rendered = renderInlineText(cell || '')
+            return chalk.white(padAnsi(rendered, colWidths[i]!))
           }).join(chalk.cyan('│')) + chalk.cyan('│'))
         }
 
@@ -322,14 +478,18 @@ export function renderMarkdown(text: string, options: RenderOptions = {}): strin
   // Handle unclosed table
   if (inTable && tableHeader.length > 0) {
     const colWidths = tableHeader.map((_, colIdx) => {
+      const cleanHeader = tableHeader[colIdx]!.replace(/\*\*|\*|`|~~/g, '')
       const maxWidth = Math.max(
-        tableHeader[colIdx]!.length,
-        ...tableRows.map(row => (row[colIdx] || '').length)
+        cleanHeader.length,
+        ...tableRows.map(row => (row[colIdx] || '').replace(/\*\*|\*|`|~~|\[([^\]]+)\]\([^)]+\)/g, '$1').length)
       )
-      return Math.min(maxWidth + 2, 20)
+      return Math.min(maxWidth + 2, 40)
     })
 
-    lines.push(chalk.cyan('┌') + tableHeader.map((h, i) => chalk.bold.white(h.padEnd(colWidths[i]!))).join(chalk.cyan('│')) + chalk.cyan('┐'))
+    lines.push(chalk.cyan('┌') + tableHeader.map((h, i) => {
+      const rendered = renderInlineText(h)
+      return chalk.bold.white(padAnsi(rendered, colWidths[i]!))
+    }).join(chalk.cyan('│')) + chalk.cyan('┐'))
     lines.push(chalk.cyan('└') + tableHeader.map((_, i) => '─'.repeat(colWidths[i]!)).join(chalk.cyan('┴')) + chalk.cyan('┘'))
     lines.push('')
   }
@@ -346,54 +506,30 @@ export class MarkdownStreamRenderer {
 
   feed(text: string): string {
     this.buffer += text
+    const lines = this.buffer.split('\n')
+    // Keep the last unclosed line in the buffer
+    this.buffer = lines.pop() || ''
+
     let output = ''
-    let remaining = ''
-
-    // Process character by character to handle streaming
-    for (let i = 0; i < this.buffer.length; i++) {
-      const char = this.buffer[i]!
-
-      // Check for code block fence
-      if (this.buffer.slice(i).startsWith('```')) {
-        const fenceEnd = this.buffer.indexOf('\n', i)
-        if (fenceEnd !== -1) {
-          const fenceLine = this.buffer.slice(i, fenceEnd)
-          if (fenceLine.match(/^```\s*$/)) {
-            if (this.inCodeBlock) {
-              // End code block
-              this.codeBlockContent += '\n'
-              output += this.flushCodeBlock()
-              this.inCodeBlock = false
-              this.codeBlockContent = ''
-              this.codeBlockLang = ''
-              i = fenceEnd
-              continue
-            } else {
-              // Start code block
-              this.inCodeBlock = true
-              this.codeBlockLang = fenceLine.slice(3).trim()
-              i = fenceEnd
-              continue
-            }
-          }
+    for (const line of lines) {
+      if (line.startsWith('```')) {
+        if (this.inCodeBlock) {
+          output += this.flushCodeBlock()
+          this.inCodeBlock = false
+          this.codeBlockContent = ''
+          this.codeBlockLang = ''
+        } else {
+          this.inCodeBlock = true
+          this.codeBlockLang = line.slice(3).trim()
+        }
+      } else {
+        if (this.inCodeBlock) {
+          this.codeBlockContent += line + '\n'
+        } else {
+          output += this.renderInline(line) + '\n'
         }
       }
-
-      if (this.inCodeBlock) {
-        this.codeBlockContent += char
-      } else {
-        remaining += char
-      }
     }
-
-    // Process remaining text (not in code block)
-    if (remaining) {
-      output += this.renderInline(remaining)
-    }
-
-    // Keep code block content buffered
-    this.buffer = this.inCodeBlock ? this.codeBlockContent : ''
-
     return output
   }
 
@@ -420,7 +556,13 @@ export class MarkdownStreamRenderer {
       output += this.flushCodeBlock()
     }
     if (this.buffer) {
-      output += this.renderInline(this.buffer)
+      if (this.buffer.startsWith('```')) {
+        output += `\n${chalk.gray('─'.repeat(60))}\n`
+      } else if (this.inCodeBlock) {
+        output += this.flushCodeBlock()
+      } else {
+        output += this.renderInline(this.buffer)
+      }
     }
     this.buffer = ''
     this.codeBlockContent = ''

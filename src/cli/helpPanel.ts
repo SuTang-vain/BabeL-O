@@ -64,6 +64,7 @@ export const helpCategories: HelpCategory[] = [
       { command: '/config', description: 'View or modify config' },
       { command: '/profile', description: 'Switch profile' },
       { command: '/status', description: 'Show runtime status' },
+      { command: '/smoke [live]', description: 'Check provider readiness' },
     ],
   },
   {

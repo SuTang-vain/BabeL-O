@@ -10,6 +10,17 @@ test('classifyProviderRecovery tags max output token failures', () => {
   assert.equal(details?.kind, 'max_output_tokens')
   assert.equal(details?.recoveryReason, 'ESCALATED_MAX_TOKENS')
   assert.equal(details?.retryable, true)
+  assert.equal(details?.fallbackPolicy.mode, 'manual_confirm')
+  assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
+})
+
+test('classifyProviderRecovery tags OpenAI length finish failures as max output', () => {
+  const details = classifyProviderRecovery(
+    new ProviderError('openai', 400, '{"choices":[{"finish_reason":"length"}]}'),
+  )
+  assert.equal(details?.kind, 'max_output_tokens')
+  assert.equal(details?.recoveryReason, 'ESCALATED_MAX_TOKENS')
+  assert.equal(details?.retryable, true)
 })
 
 test('classifyProviderRecovery tags context window failures', () => {
@@ -18,6 +29,8 @@ test('classifyProviderRecovery tags context window failures', () => {
   )
   assert.equal(details?.kind, 'context_window')
   assert.equal(details?.recoveryReason, 'ESCALATED_CONTEXT_WINDOW')
+  assert.equal(details?.fallbackPolicy.mode, 'compact_then_retry')
+  assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
 })
 
 test('classifyProviderRecovery tags auth and billing failures as non-retryable', () => {
@@ -27,6 +40,8 @@ test('classifyProviderRecovery tags auth and billing failures as non-retryable',
   assert.equal(details?.kind, 'auth_or_billing')
   assert.equal(details?.recoveryReason, 'PROVIDER_AUTH_OR_BILLING')
   assert.equal(details?.retryable, false)
+  assert.equal(details?.fallbackPolicy.mode, 'fix_configuration')
+  assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
 })
 
 test('classifyProviderRecovery tags provider protocol replay mismatches', () => {
@@ -40,4 +55,6 @@ test('classifyProviderRecovery tags provider protocol replay mismatches', () => 
   assert.equal(details?.kind, 'provider_protocol')
   assert.equal(details?.recoveryReason, 'PROVIDER_PROTOCOL_REPLAY_MISMATCH')
   assert.equal(details?.retryable, false)
+  assert.equal(details?.fallbackPolicy.mode, 'no_auto_fallback')
+  assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
 })

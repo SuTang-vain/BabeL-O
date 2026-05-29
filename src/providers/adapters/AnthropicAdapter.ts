@@ -11,6 +11,8 @@ import { ProviderError } from '../../shared/errors.js'
 import { getProvider, getModel } from '../registry.js'
 import { withRetry } from '../retry.js'
 
+const MINIMAX_TOOL_CALL_OPEN = '<minimax:tool_call'
+
 const MODEL_MAPPING: Record<
   string,
   { firstParty: string; bedrock: string; vertex: string; foundry: string }
@@ -74,6 +76,91 @@ function getCustomHeaders(): Record<string, string> {
   }
 
   return customHeaders
+}
+
+function createMinimaxTextToolParser(): {
+  handleText(text: string): StreamDelta[]
+  flush(): StreamDelta[]
+} {
+  let buffer = ''
+  let counter = 0
+
+  const parseCompleteCalls = (): StreamDelta[] => {
+    const deltas: StreamDelta[] = []
+    while (true) {
+      const start = buffer.indexOf(MINIMAX_TOOL_CALL_OPEN)
+      if (start === -1) {
+        const keepChars = MINIMAX_TOOL_CALL_OPEN.length - 1
+        if (buffer.length > keepChars) {
+          const emitText = buffer.slice(0, buffer.length - keepChars)
+          if (emitText) deltas.push({ type: 'text', text: emitText })
+          buffer = buffer.slice(buffer.length - keepChars)
+        }
+        break
+      }
+
+      const before = buffer.slice(0, start)
+      if (before) deltas.push({ type: 'text', text: before })
+      buffer = buffer.slice(start)
+
+      const close = buffer.indexOf('</minimax:tool_call>')
+      if (close === -1) break
+
+      const rawCall = buffer.slice(0, close + '</minimax:tool_call>'.length)
+      buffer = buffer.slice(rawCall.length)
+      const parsed = parseMinimaxTextToolCall(rawCall, counter++)
+      deltas.push(...parsed)
+    }
+    return deltas
+  }
+
+  return {
+    handleText(text: string) {
+      buffer += text
+      return parseCompleteCalls()
+    },
+    flush() {
+      const deltas = parseCompleteCalls()
+      if (buffer) {
+        deltas.push({ type: 'text', text: buffer })
+        buffer = ''
+      }
+      return deltas
+    },
+  }
+}
+
+function parseMinimaxTextToolCall(rawCall: string, index: number): StreamDelta[] {
+  const name = extractXmlAttribute(rawCall, 'invoke', 'name')
+  if (!name) return []
+  const input: Record<string, unknown> = {}
+  const parameterPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g
+  let match: RegExpExecArray | null
+  while ((match = parameterPattern.exec(rawCall)) !== null) {
+    input[match[1]!] = decodeXmlEntities(match[2] ?? '')
+  }
+  const id = `minimax_tool_${index + 1}`
+  return [
+    { type: 'tool_use_start', id, name },
+    { type: 'tool_use_delta', id, inputDelta: JSON.stringify(input) },
+    { type: 'tool_use_end', id, input },
+    { type: 'finish', reason: 'tool_use' },
+  ]
+}
+
+function extractXmlAttribute(raw: string, tag: string, attribute: string): string | undefined {
+  const pattern = new RegExp(`<${tag}\\s+[^>]*${attribute}="([^"]+)"`)
+  const match = pattern.exec(raw)
+  return match?.[1]
+}
+
+function decodeXmlEntities(value: string): string {
+  return value
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
 }
 
 export class AnthropicAdapter implements ModelAdapter {
@@ -288,6 +375,7 @@ export class AnthropicAdapter implements ModelAdapter {
       number,
       { id: string; name: string; inputBuffer: string }
     >()
+    const minimaxTextToolParser = providerId === 'minimax' ? createMinimaxTextToolParser() : undefined
 
     for await (const sse of parseSSE(response.body)) {
       if (sse.event === 'message_start') {
@@ -341,9 +429,13 @@ export class AnthropicAdapter implements ModelAdapter {
         const delta = data.delta
         if (delta) {
           if (delta.type === 'text_delta') {
-            yield {
-              type: 'text',
-              text: delta.text,
+            if (minimaxTextToolParser) {
+              yield* minimaxTextToolParser.handleText(delta.text)
+            } else {
+              yield {
+                type: 'text',
+                text: delta.text,
+              }
             }
           } else if (delta.type === 'thinking_delta') {
             yield {
@@ -381,6 +473,10 @@ export class AnthropicAdapter implements ModelAdapter {
           activeToolUses.delete(index)
         }
       }
+    }
+
+    if (minimaxTextToolParser) {
+      yield* minimaxTextToolParser.flush()
     }
   }
 }

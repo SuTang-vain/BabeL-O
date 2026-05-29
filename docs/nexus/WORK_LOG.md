@@ -2,6 +2,231 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-29 — P0 Provider smoke live 与 CLI/TUI 展示第一版
+
+- **用户决策**: 根据建议执行 P0-0 与 P0-1：收口 live provider smoke，并把 provider smoke 诊断接入 CLI/TUI 状态展示。
+- **处理**:
+  - 新增共享 `providerSmoke` runtime helper，API 与 CLI 复用同一套 readiness/live smoke 判断。
+  - `POST /v1/runtime/provider-smoke/live` 使用固定 `BABEL_O_PROVIDER_SMOKE_OK` prompt 验证真实 provider/adapter streaming 链路；不执行用户任务、不创建 session、不写 session event、不自动切换 provider/model/profile、不泄露 API key。
+  - `/v1/runtime/status` 返回 `providerSmoke` dry-run readiness。
+  - CLI `/status` 在 embedded/service 模式展示 provider smoke readiness、requirements、checks 与 `allowSilentModelSwitch=false` fallbackPolicy。
+  - 新增 CLI `/smoke` dry-run 与显式 `/smoke live`；默认只读检查，只有用户明确输入 live 时才触发固定 live smoke。
+- **测试覆盖**:
+  - `runtime.test.ts` 覆盖 status 中的 `providerSmoke`、dry-run readiness、capability unmet、live smoke 固定 prompt 与不创建 session。
+  - `completer.test.ts` 覆盖 slash/palette 元数据仍可用。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts`：51/51 通过。
+
+## 2026-05-29 — TUI 多行剪贴板粘贴缓存 (Clipboard Multiline Paste Cache)
+
+- **用户反馈**: CLI 仍然不支持多行信息的直接粘贴缓存（直接粘贴会把回车解析为多行提交，导致指令错乱）。
+- **实现结果**:
+  - **终端 Bracketed Paste 整合**: 在 chat 命令启动时向 stdout 写入 `\x1b[?2004h` 开启 Bracketed Paste Mode，退出时通过 `\x1b[?2004l` 彻底关闭，防止污染用户终端环境。
+  - **Emitter 级数据截获**: 拦截 `process.stdin.emit` 事件。在 Raw 模式下，当检测到粘贴流起始符 `\x1b[200~` 时，自动进入 `isPasting` 状态，拦截所有 `data` 和 `keypress` 事件，将内容归拢至缓冲区直到收到结束符 `\x1b[201~`。
+  - **单行与多行智能分流**:
+    - 若粘贴文本不包含换行符（如 URL、单词），自动通过 `rl.write(text)` 写入当前输入行，允许用户继续交互编辑。
+    - 若粘贴文本包含换行符（多行粘贴），自动将输入状态切换为 `'pasteBuffer'`，并在控制台绘制醒目的 cyan 边框 Multiline Paste Buffer 预览卡片（展示前 8 行及总行数）。
+  - **专属快捷按键路由**: 在 `'pasteBuffer'` 状态下，只响应 `Enter`（确认提交多行内容）、`Ctrl+E`（打开外部编辑器编辑该粘贴内容）和 `Esc/Backspace`（取消并丢弃缓存），拦截其余所有字符输入，防范键盘敲击污染。
+- **测试覆盖与验证**:
+  - 在 `test/editor.test.ts` 中新增了 `bracketed paste logic isolates pasted content correctly` 单元测试，完全覆盖了单分包和多分包（multi-chunk）下对 `\x1b[200~` 与 `\x1b[201~` 粘贴内容的抽取逻辑与状态切换。
+  - 运行 `npm run typecheck` 通过。
+  - 运行 `npm test`，全量 279 项测试用例全部成功通过。
+
+## 2026-05-29 — P0 MiniMax text-encoded tool_call 协议兼容修复
+
+- **用户反馈**: 使用 `minimax/MiniMax-M2.7-highspeed` 时，CLI 直接显示 `<minimax:tool_call><invoke name="Bash">...` 原始文本，而不是正常执行工具并输出结果。
+- **原因**: MiniMax 的 Anthropic-compatible 流会把工具调用编码进 `text_delta`，形态为 `<minimax:tool_call><invoke ...><parameter ...>`；旧 `AnthropicAdapter` 只识别标准 Anthropic `content_block.type=tool_use`，因此把这段 provider-specific 工具协议当成普通助手文本透传成 `assistant_delta`。
+- **处理**:
+  - `AnthropicAdapter` 对 `providerId=minimax` 增加 text-encoded tool parser。
+  - 解析 `<invoke name="...">` 和 `<parameter name="...">...</parameter>`，输出标准 `tool_use_start/tool_use_delta/tool_use_end`，并补 `finish=tool_use`。
+  - 保留非 MiniMax provider 的原有 Anthropic text/tool_use 处理路径，避免影响 Anthropic/Zhipu 等 adapter 行为。
+- **测试覆盖**:
+  - `adapters.test.ts` 新增 MiniMax text-encoded tool call 回归，断言不产生 raw text，而是标准 tool deltas。
+  - `runtime-llm.test.ts` 新增 runtime 回归，断言 raw `<minimax:tool_call>` 不会作为 `assistant_delta` 出现，并会进入 `tool_started/tool_denied` 标准工具路径。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/adapters.test.ts`：13/13 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：35/35 通过。
+
+## 2026-05-29 — TUI 多行文本输入缓冲区 / 外部编辑器模式支持
+
+- **用户决策**: 批准推进 CLI 终端下 `bbl chat` 的多行输入缓冲区开发，支持使用外部文本编辑器。
+- **实现结果**:
+  - **外部编辑器集成 (`editor.ts` [NEW])**: 实现了 `openExternalEditor` 助手，优先使用用户配置的 `$VISUAL`/`$EDITOR` 变量，自动兜底到 `nano` 和 `vi` 编辑器。
+  - **行内快捷键编辑 (`Ctrl+E`)**: 在命令行 `idle` 输入状态下，拦截 `Ctrl+E` 组合键，挂起 Readline 界面，利用工作区下隔离的临时文件目录 `.babel-o/` 生成临时文本，交由编辑器全屏打开。用户保存并关闭编辑器后，自动读取内容并作为 prompt 直接提交运行。
+  - **斜杠命令扩展 (`/editor`/`/e`)**: 支持在 prompt 中输入 `/editor` 或 `/e`，回车后将直接触发外部编辑器打开一个空白 prompt 进行自由撰写。
+  - **自动清理与安全拦截**: 每次编辑产生的临时文件均在编辑器退出（无论成功或异常）后被立即删除。增加了命令行 keypress 监听恢复及 raw mode 切换的防御性还原。
+- **测试覆盖与验证**:
+  - 新建了 `test/editor.test.ts`，对 `openExternalEditor` 进行单元测试。通过 mock 导出的 spawner 容器，全量覆盖了成功编辑返回、断言临时文件存在、临时文件在 final 周期清理、以及 broken-editor 情况下向下兜底到 `nano` 的流程。
+  - `npm run typecheck` 成功通过。
+  - `npm test` 成功通过，全量 276 个测试用例（新增 2 个）全部通过。
+
+## 2026-05-29 — TUI 终端交互与 Markdown 语法高亮渲染优化
+
+- **用户决策**: 批准推进 CLI 终端交互 TUI 优化与 Markdown 渲染/高亮性能修复。
+- **实现结果**:
+  - **交互式终端分页器 (`pager.ts`)**: 基于备用屏幕缓冲区 (`\x1b[?1049h`) 实现了不污染主屏历史的分页器。支持 `↑`/`↓`/`PageUp`/`PageDown`/空格/`b`/`f` 键滚动，`q`/`Esc` 退出。集成 `/pager` 与 `/less` 命令查看上一次工具调用完整输出。
+  - **行内自动建议 (Auto-suggestions)**: 实现类似 Zsh/Fish 的灰色行内自动建议，通过 `→` 或 `Ctrl+F` 快速补全。修复了输入 `/` 时直接预填首项的干扰问题（现仅在按上下键时才显式预览），并利用 ANSI 剥离计算修复了原生 raw 模式下的光标偏移。
+  - **持久化底部状态栏**: 重构终端下方状态行，实现显示当前大模型及 Token 消耗比例的红黄绿渐变上下文 Gauge 进度条。
+  - **树状多层级任务看板**: 升级任务看板为双边框外盒，以 Unicode 连接符 (`├─`, `└─`, `│  `) 直观展示子任务深度、Worktree 范围和子会话依赖。
+  - **语法高亮状态机优化**: 废弃容易产生冲突的全局正则高亮方案，重构为基于字符遍历的词法状态机 (`highlightCode` & `highlightJson`)，精准着色字符串、注释、关键词及数值，避免转义符溢出污染；新增 JSON Key-Value 专用高亮。
+  - **富文本表格与对齐**: 支持表格内加粗、斜体、行内代码与链接的混合渲染；编写 `padAnsi` 自动剔除不可见 ANSI 字符以精确计算列宽对齐。
+  - **流式防抖与行缓冲 (`MarkdownStreamRenderer`)**: 重构流式渲染器为行缓冲机制，阻断由于分块传输导致的 Markdown 标记未闭合闪烁问题。
+- **验证**:
+  - `npm run typecheck` 成功通过。
+  - `npm test` 成功通过，全量 274 个测试用例 100% 通过。
+
+## 2026-05-29 — P0 Provider smoke dry-run 诊断入口第一版
+
+- **用户决策**: 继续根据建议推进 P0，并优先压实 provider/runtime 稳定性；DeepSeek reasoning replay 继续暂缓。
+- **问题**: `/status` 已能展示 provider/model/auth/capability，但缺少一个可由 service/CLI/UI 调用的 smoke readiness 入口；直接做真实 provider 请求会有成本、速率限制和误执行用户任务风险。
+- **处理**:
+  - 新增 `GET /v1/runtime/provider-smoke`，只做 dry-run readiness 诊断，不执行用户 prompt、不创建 session、不写 event。
+  - endpoint 返回 redacted provider diagnostics、requirements、checks、`ready` 与 fallbackPolicy。
+  - checks 覆盖 auth configured、model resolved、tool calling、streaming、structured output capability。
+  - fallbackPolicy 固定 `allowSilentModelSwitch=false`，未满足 readiness 时要求修配置或显式选择模型/配置，不自动切换 provider/model/profile。
+- **测试覆盖**:
+  - `runtime.test.ts` 新增 local provider dry-run ready 回归，断言不泄露 apiKey、不创建 session。
+  - `runtime.test.ts` 新增 capability unmet 回归，断言 `ready=false`、`fallbackPolicy.mode=fix_configuration`、禁止 silent switch、不创建 session。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：42/42 通过。
+
+## 2026-05-29 — P0 Provider diagnostics / auth mode 展示第一版
+
+- **用户决策**: 继续按建议推进 P0，优先让 provider/model/auth/capability 状态在请求失败前可见。
+- **问题**: `/status` embedded 模式只显示 model，service 模式只 dump raw runtime status；用户无法直接看到 provider、authMode、auth 是否配置、配置来源、baseUrl 来源、tool/structured-output capability。
+- **处理**:
+  - `ConfigManager.resolveSettings()` 增加 `apiKeySource` 与 `baseUrlSource`，保留原 `modelSource`。
+  - 新增 `ConfigManager.getProviderDiagnostics()`，输出 redacted provider diagnostics：provider/model、adapter、authMode、authConfigured、authSource、baseUrlSource、contextWindow、defaultMaxTokens、tool/json/structured/streaming capability；不输出 API key。
+  - `/v1/runtime/status` 返回 `provider` diagnostics。
+  - CLI `/status` 在 embedded/service 模式格式化展示 provider diagnostics。
+- **测试覆盖**:
+  - `runtime-llm.test.ts` 扩展 ConfigManager 配置优先级测试，断言 apiKey/baseUrl 来源和 provider diagnostics capability。
+  - `runtime.test.ts` 新增 `/v1/runtime/status returns redacted provider diagnostics`，断言 local provider diagnostics 且不泄露 apiKey。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：34/34 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：40/40 通过。
+
+## 2026-05-29 — P0 Provider fallback policy 第一版（非静默）
+
+- **用户决策**: 继续推进 P0 provider/runtime fallback 策略，但不处理 DeepSeek reasoning replay。
+- **问题**: provider recovery 只有 kind/recoveryReason/suggestion，无法审计 runtime 是否会自动切换模型，也无法在 UI 中明确下一步应该 compact、重试、修配置还是要求用户确认。
+- **处理**:
+  - `providerRecovery.ts` 新增 `ProviderFallbackPolicy`，字段包含 `mode`、`reason`、`nextAction`、`allowSilentModelSwitch=false`。
+  - `classifyProviderRecovery()` 为 max-output、context-window、rate-limit/provider-unavailable、auth/billing、provider-protocol、unknown 错误返回 fallback policy。
+  - `LLMCodingRuntime` 的 `MAX_OUTPUT_TOKENS_EXCEEDED` 终态也带同一 `max_output_tokens` fallback policy。
+  - CLI error rendering 展示 `fallback=<mode>` 与 `silentSwitch=false`，让用户能看到不会静默切换模型。
+- **测试覆盖**:
+  - `provider-recovery.test.ts` 断言 max-output/context-window/auth/protocol 的 fallback mode 和禁止 silent switch。
+  - `runtime-llm.test.ts` 断言 provider error 与 max-output exhausted error details 带 fallback policy。
+  - `tui-renderer.test.ts` 断言 session history 渲染 fallback policy。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/provider-recovery.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-renderer.test.ts`：18/18 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：34/34 通过。
+
+## 2026-05-29 — P0 `/context` runtime policy 诊断可观测性
+
+- **用户决策**: 认可继续按建议推进 P0，优先补齐 intake/tool suppression/recovery boundary 的可观测性。
+- **问题**: `/context` / context analysis 只暴露原始 `userIntentGuidance`，但没有明确告诉用户当前工具是否被 runtime 隐藏、隐藏原因，以及最近哪个终态错误正在作为 recovery boundary；真实会话复盘时仍需要从 event log 手工判断。
+- **处理**:
+  - `contextAnalysis.ts` 新增 `runtimePolicy`：`toolsVisible`、`toolSuppressionReason`、`recoveryBoundaryActive`、`recoveryBoundaryCode`、`recoveryBoundaryTimestamp`、`recoveryBoundaryMessage`。
+  - `contextAssembler.ts` 导出 `isRecoveryBoundaryError()`，保证 diagnostics 与 recent event 选择使用同一套 recovery boundary 判定。
+  - CLI `/context` 新增 `User Intent / Runtime Policy` 区块，展示 intent/source/confidence、action/scope/requiresTools、explicit paths、tools visible 和 recovery boundary。
+- **测试覆盖**:
+  - `context-assembler.test.ts` 的 `analyzeContext returns token and compact diagnostics` 增加 pause + `REQUEST_CANCELLED` 样本，断言 tools hidden 和 recovery boundary code。
+  - `runtime.test.ts` 的 `/v1/sessions/:sessionId/context` API 回归断言 `runtimePolicy` 与 `userIntentGuidance` 字段存在。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts`：32/32 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：39/39 通过。
+
+## 2026-05-29 — P0 真实 session_321c48be replay 回归
+
+- **用户决策**: 继续推进 P0，并继续暂缓 DeepSeek reasoning replay。
+- **问题**: 真实会话 `session_321c48be-0ffd-4ec4-bfc0-9ba7f1896f8f` 中，Baidu 项目分析后用户输入 malformed greeting `hi``，旧逻辑继续触发 Baidu 旧工具链；用户 cancel 后又输入 `just stop it and waite for me other require`，仍存在恢复边界后继续旧工具链的风险。
+- **处理**:
+  - `context-regression.test.ts` 新增 sanitized real-session replay fixture，保留真实 session id、Baidu cwd、关键时间线、关键工具结果和 cancel/pause 事件。
+  - 新增回归：`hi`` 被识别为 `greeting` + `respond_only` + `requiresTools=false`，同时保留 Baidu 项目上下文作为背景，不触发旧工具链。
+  - 新增回归：`REQUEST_CANCELLED` 后的 `just stop it...` 从 recovery boundary 开始，只保留最新 pause 用户轮次，并归一化为 `respond_only`。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-regression.test.ts`：9/9 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/provider-recovery.test.ts`：37/37 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：34/34 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-29 — P0 非 DeepSeek：max-output recovery 端到端修复
+
+- **问题**: `LLMCodingRuntime` 遇到 provider stream `finishReason=max_tokens` 时会尝试 continuation；但连续超过恢复次数后，旧逻辑会把最后一段截断文本作为 `success=true` 的最终回答，且早期截断段没有进入 messages。
+- **处理**:
+  - `max_tokens` 且无工具调用时，前三次恢复会把当前截断 assistant 文本写入 messages，再追加 continuation prompt，避免丢失已生成片段。
+  - 恢复耗尽后输出 `MAX_OUTPUT_TOKENS_EXCEEDED` error 和失败 `result`，details 使用 `kind=max_output_tokens`、`recoveryReason=ESCALATED_MAX_TOKENS`。
+  - `selectRecentEvents()` 将 `MAX_OUTPUT_TOKENS_EXCEEDED` 纳入 recovery boundary。
+- **测试覆盖**:
+  - `runtime-llm.test.ts` 新增连续 4 次 `max_tokens` 的端到端回归，断言不会误判成功。
+  - `context-regression.test.ts` 的终态错误组合加入 `MAX_OUTPUT_TOKENS_EXCEEDED`。
+  - `provider-recovery.test.ts` 新增 OpenAI `finish_reason=length` 分类回归。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-regression.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/provider-recovery.test.ts`：46/46 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
+## 2026-05-29 — P0 非 DeepSeek：provider/runtime 可恢复错误组合回归
+
+- **用户决策**: 认可继续推进 P0 provider/runtime 可恢复性组合回归，仍暂不处理 DeepSeek reasoning replay。
+- **问题**:
+  - `selectRecentEvents()` recovery boundary 只覆盖 cancel/timeout，provider error、empty response、context limit、max loops 等终态错误后的下一轮状态追问可能仍回放旧工具链。
+  - `LLMCodingRuntime` provider error catch 和 `MAX_LOOPS_EXCEEDED` 终态只输出 error/metrics，缺少失败 `result` 作为统一终态。
+- **处理**:
+  - `contextAssembler.ts` 新增终态错误 recovery boundary：`PROVIDER_ERROR`、`EMPTY_PROVIDER_RESPONSE`、`CONTEXT_LIMIT_EXCEEDED`、`MAX_LOOPS_EXCEEDED`、`TOOL_LOOP_FINAL_RESPONSE_ONLY`。
+  - `LLMCodingRuntime` 在 provider error catch 中输出失败 `result`，保留 `error.details` 的 provider recovery 分类。
+  - `MAX_LOOPS_EXCEEDED` 终态也输出失败 `result`，避免 UI/调用方误缺终态。
+- **测试覆盖**:
+  - `context-regression.test.ts` 新增 terminal runtime errors recovery boundary 组合回归。
+  - `runtime-llm.test.ts` 新增 provider error recovery details + failed result 回归。
+  - `runtime-llm.test.ts` 新增 max-loop exceeded failed result 回归。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-regression.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：40/40 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
+## 2026-05-29 — P0 非 DeepSeek：指令边界 regression corpus
+
+- **用户决策**: 认可优先补齐短纠错、取消后追问、多路径比较的 P0 regression corpus，继续暂缓 DeepSeek 适配。
+- **处理**:
+  - `context-regression.test.ts` 新增 `REQUEST_TIMEOUT` 后状态追问回归，覆盖超时后“你现在在干什么？”必须从 recovery boundary 开始。
+  - 新增短纠错回归：`不是这个，是 /Users/.../BabeL-X` 必须识别为 `correction` + `prioritize_latest`，同时保留旧上下文作为背景。
+  - 新增多路径比较回归：同一请求中的 BabeL-O 与 BabeL-X 两个显式路径必须同时保留为最新 focus，不被旧 Baidu 上下文锚偏。
+  - 修复 `selectRecentEvents()` recovery code 识别：除 `REQUEST_CANCELLED` 和旧 `EXECUTION_TIMEOUT` 外，也识别 runtime 实际产出的 `REQUEST_TIMEOUT`。
+  - 扩展短纠错识别：覆盖“不是这个，是 X”这类中文短句。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-regression.test.ts`：6/6 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：63/63 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
+## 2026-05-29 — P0 非 DeepSeek：User Intake Guidance 硬归一化
+
+- **问题**: `user_intake_guidance` 主路径仍信任 intake 模型 JSON。如果模型输出 `intent=pause/status/greeting` 但同时给出 `actionHint=normal`、`requiresTools=true`，runtime 会向主 provider 暴露工具，存在短暂停/状态追问继续旧工具链的风险。
+- **处理**:
+  - `intentGuidance.ts` 新增 policy normalization：`pause`、`greeting`、`status` 强制归一化为 `actionHint=respond_only`、`requiresTools=false`；`pause` 同时收敛到 `contextScope=recent`。
+  - `toUserIntakeGuidanceEvent()`、`guidanceFromIntakeEvent()`、`buildGuidance()` 和 `shouldSuppressToolsForIntent()` 均走同一归一化路径，确保持久事件、context 注入和 runtime tool suppression 一致。
+- **测试覆盖**:
+  - `runtime-llm.test.ts` 新增 contradictory pause intake 回归：mock intake 返回 `pause + normal + requiresTools=true`，断言持久事件被归一化，主 provider 请求不包含 tools。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：31/31 通过。
+
+## 2026-05-29 — P0 非 DeepSeek：工具循环 final-response-only 硬约束
+
+- **用户决策**: 继续推进 P0，但暂时不处理 DeepSeek 模型适配问题。
+- **问题**: 旧 `LLMCodingRuntime` 只在 Execution State 中提示 `must_respond`，如果模型忽略提示继续请求工具，runtime 仍会暴露工具并执行，直到 `MAX_LOOPS_EXCEEDED`。
+- **处理**:
+  - 新增 final-response-only 尾部阶段：接近 `maxLoops` 时主 provider 请求不再暴露 tools。
+  - 若 provider 在 final-response-only 阶段仍输出工具调用，runtime 产出 `TOOL_LOOP_FINAL_RESPONSE_ONLY` error，拒绝执行这些工具，并追加无工具最终回答提示让模型合成答案。
+  - `buildExecutionState()` 的 must-respond 文案改为明确 runtime 已隐藏工具，不再仅是软提示。
+- **测试覆盖**:
+  - `runtime-llm.test.ts` 新增模型持续请求 `Read` 的失控循环回归，验证 final-response-only 阶段没有执行新工具、provider 请求不含 tools，且最终成功产出 answer。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json /Users/tangyaoyue/DEV/BABEL/BabeL-O/node_modules/.bin/tsx --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime-llm.test.ts`：30/30 通过。
+
 ## 2026-05-29 — runtime-llm 测试配置隔离
 
 - **问题**: `runtime-llm.test.ts` 在本机存在 `BABEL_O_BASE_URL` / provider baseUrl 等环境变量时，会覆盖测试临时 config，导致 Anthropic baseUrl 断言被 Baidu OneAPI 配置污染。

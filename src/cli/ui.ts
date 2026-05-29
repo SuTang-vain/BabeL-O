@@ -109,10 +109,65 @@ export function mapDropdownSelection(selected: string): string {
     '/compact': '/compact',
     '/exit': '/exit',
     '/status': '/status',
+    '/smoke': '/smoke ',
     '/sessions': '/sessions',
+    '/editor': '/editor',
+    '/e': '/editor',
   }
   return mappings[selected] ?? mappings[selected.toLowerCase()] ?? selected
 }
+
+export function getAutosuggestion(line: string, history: string[]): string | undefined {
+  if (!line) return undefined
+
+  // 1. Check history (most recent first)
+  const matchingHistory = history.find(h => h.startsWith(line) && h !== line)
+  if (matchingHistory) return matchingHistory
+
+  // 2. Check slash commands
+  if (line.startsWith('/')) {
+    const slashChoices = [
+      '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/sessions', '/history', '/tool',
+      '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e'
+    ]
+    const matchingSlash = slashChoices.find(c => c.startsWith(line) && c !== line)
+    if (matchingSlash) return matchingSlash
+  }
+
+  return undefined
+}
+
+export function setupAutosuggestions(
+  rl: any,
+  history: string[],
+  isExecutingRef: { current: boolean }
+) {
+  const rlInt = rl as any
+  const originalRefresh = rlInt._refreshLine
+  if (!originalRefresh) return
+
+  rlInt._refreshLine = function() {
+    // 1. Call original refresh to output prompt and current input line
+    originalRefresh.call(this)
+
+    // 2. Draw inline autosuggestion if input is not executing and suggestion panel is idle
+    const currentInput = this.line
+    if (!currentInput || isExecutingRef.current || inputState.current !== 'idle') {
+      return
+    }
+
+    const suggestion = getAutosuggestion(currentInput, history)
+    if (suggestion && this.cursor === this.line.length) {
+      const suggestionTail = suggestion.slice(currentInput.length)
+      if (suggestionTail) {
+        process.stdout.write(chalk.dim(suggestionTail))
+        // Move terminal cursor back to the end of the user's typed line
+        process.stdout.write(`\x1b[${suggestionTail.length}D`)
+      }
+    }
+  }
+}
+
 
 
 export function formatPermissionInput(input: unknown): string {
@@ -410,11 +465,14 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/help': { tag: 'command', description: 'Show command help' },
     '/clear': { tag: 'command', description: 'Clear the terminal' },
     '/compact': { tag: 'session', description: 'Compact current session context' },
+    '/pager': { tag: 'command', description: 'Open the last output in terminal pager' },
+    '/less': { tag: 'command', description: 'Open the last output in terminal pager' },
     '/context': { tag: 'session', description: 'Inspect context budget and compact state' },
     '/exit': { tag: 'command', description: 'Exit chat' },
     '/model': { tag: 'config', description: 'Open model configuration wizard' },
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },
     '/status': { tag: 'status', description: 'Show current runtime and model' },
+    '/smoke': { tag: 'status', description: 'Run provider smoke readiness check' },
     '/sessions': { tag: 'session', description: 'List recent sessions' },
     '/history': { tag: 'history', description: 'Search and replay prompt history' },
     '/tool': { tag: 'tools', description: 'Open the tool picker' },

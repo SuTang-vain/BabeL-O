@@ -17,6 +17,7 @@ export type InputMode =
   | 'historySearch'
   | 'modelWizard'
   | 'agentRunning'
+  | 'pasteBuffer'
 
 type ModeChangeListener = (oldMode: InputMode, newMode: InputMode) => void
 

@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { z } from 'zod';
-import { getProvider, providerRegistry, modelRegistry } from '../providers/registry.js';
+import { getProvider, getModel, providerRegistry, modelRegistry } from '../providers/registry.js';
 import { logger } from './logger.js';
 
 export interface ProviderConfig {
@@ -40,6 +40,40 @@ export type ResolveSettingsOptions = {
   role?: string;
   model?: string;
   provider?: string;
+}
+
+export type ResolvedSettings = {
+  modelId: string;
+  providerId: string;
+  apiKey?: string;
+  baseUrl?: string;
+  activeProfile?: string;
+  modelSource: 'request' | 'env' | 'role' | 'profile' | 'default';
+  apiKeySource: 'env' | 'profile' | 'provider_config' | 'none';
+  baseUrlSource: 'env' | 'profile' | 'provider_config' | 'provider_default' | 'none';
+}
+
+export type ProviderDiagnostics = {
+  providerId: string;
+  providerName: string;
+  adapter: string;
+  authMode: 'api-key' | 'bearer' | 'none';
+  authConfigured: boolean;
+  authSource: ResolvedSettings['apiKeySource'];
+  baseUrl: string;
+  baseUrlSource: ResolvedSettings['baseUrlSource'];
+  modelId: string;
+  modelName: string;
+  modelSource: ResolvedSettings['modelSource'];
+  activeProfile?: string;
+  contextWindow: number;
+  defaultMaxTokens: number;
+  capabilities: {
+    toolCalling: boolean;
+    jsonOutput: boolean;
+    streaming: boolean;
+    structuredOutput: boolean;
+  };
 }
 
 export const ProviderConfigSchema = z.object({
@@ -258,7 +292,7 @@ export class ConfigManager {
     this.save(conf);
   }
 
-  public resolveSettings(roleOrOptions?: string | ResolveSettingsOptions) {
+  public resolveSettings(roleOrOptions?: string | ResolveSettingsOptions): ResolvedSettings {
     const conf = this.load();
     const options =
       typeof roleOrOptions === 'string'
@@ -317,7 +351,11 @@ export class ConfigManager {
 
     const provConfig = conf.providers?.[providerId] || {};
 
+    let apiKeySource: ResolvedSettings['apiKeySource'] = 'none';
     let apiKey = process.env.BABEL_O_API_KEY;
+    if (apiKey) {
+      apiKeySource = 'env';
+    }
     if (!apiKey) {
       if (providerId === 'anthropic') {
         apiKey = process.env.ANTHROPIC_API_KEY;
@@ -330,12 +368,24 @@ export class ConfigManager {
       } else if (providerId === 'minimax') {
         apiKey = process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN;
       }
+      if (apiKey) {
+        apiKeySource = 'env';
+      }
     }
-    if (!apiKey) {
-      apiKey = profile?.apiKey || provConfig.apiKey;
+    if (!apiKey && profile?.apiKey) {
+      apiKey = profile.apiKey;
+      apiKeySource = 'profile';
+    }
+    if (!apiKey && provConfig.apiKey) {
+      apiKey = provConfig.apiKey;
+      apiKeySource = 'provider_config';
     }
 
+    let baseUrlSource: ResolvedSettings['baseUrlSource'] = 'none';
     let baseUrl = process.env.BABEL_O_BASE_URL;
+    if (baseUrl) {
+      baseUrlSource = 'env';
+    }
     if (!baseUrl) {
       if (providerId === 'anthropic') {
         baseUrl = process.env.ANTHROPIC_BASE_URL;
@@ -348,9 +398,21 @@ export class ConfigManager {
       } else if (providerId === 'minimax') {
         baseUrl = process.env.MINIMAX_BASE_URL;
       }
+      if (baseUrl) {
+        baseUrlSource = 'env';
+      }
     }
-    if (!baseUrl) {
-      baseUrl = profile?.baseUrl || provConfig.baseUrl || providerDef.defaultBaseUrl;
+    if (!baseUrl && profile?.baseUrl) {
+      baseUrl = profile.baseUrl;
+      baseUrlSource = 'profile';
+    }
+    if (!baseUrl && provConfig.baseUrl) {
+      baseUrl = provConfig.baseUrl;
+      baseUrlSource = 'provider_config';
+    }
+    if (!baseUrl && providerDef.defaultBaseUrl) {
+      baseUrl = providerDef.defaultBaseUrl;
+      baseUrlSource = 'provider_default';
     }
 
     return {
@@ -360,6 +422,51 @@ export class ConfigManager {
       baseUrl,
       activeProfile: activeProfileName,
       modelSource,
+      apiKeySource,
+      baseUrlSource,
+    };
+  }
+
+  public getProviderDiagnostics(roleOrOptions?: string | ResolveSettingsOptions): ProviderDiagnostics {
+    const settings = this.resolveSettings(roleOrOptions);
+    const provider = getProvider(settings.providerId);
+    let model;
+    try {
+      model = getModel(settings.modelId);
+    } catch {
+      model = {
+        id: settings.modelId,
+        name: settings.modelId,
+        contextWindow: 8192,
+        defaultMaxTokens: 4096,
+        capabilities: {
+          toolCalling: false,
+          jsonOutput: false,
+          streaming: false,
+        },
+      };
+    }
+    return {
+      providerId: settings.providerId,
+      providerName: provider.displayName,
+      adapter: provider.adapter,
+      authMode: provider.authMode,
+      authConfigured: provider.authMode === 'none' || Boolean(settings.apiKey),
+      authSource: settings.apiKeySource,
+      baseUrl: settings.baseUrl || '',
+      baseUrlSource: settings.baseUrlSource,
+      modelId: settings.modelId,
+      modelName: model.name,
+      modelSource: settings.modelSource,
+      activeProfile: settings.activeProfile,
+      contextWindow: model.contextWindow,
+      defaultMaxTokens: model.defaultMaxTokens,
+      capabilities: {
+        toolCalling: model.capabilities.toolCalling,
+        jsonOutput: model.capabilities.jsonOutput,
+        streaming: model.capabilities.streaming,
+        structuredOutput: model.capabilities.jsonOutput,
+      },
     };
   }
 }

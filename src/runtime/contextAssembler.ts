@@ -448,7 +448,7 @@ export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget):
     const event = events[idx]!
     if (event.type === 'error') {
       const code = (event as { code?: string }).code
-      if (code === 'REQUEST_CANCELLED' || code === 'EXECUTION_TIMEOUT') {
+      if (isRecoveryBoundaryError(code)) {
         recoveryIdx = idx
         break
       }
@@ -475,6 +475,18 @@ export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget):
 
   const turnSlice = effectiveEvents.slice(startIdx)
   return trimSelectedWindow(turnSlice, maxEvents)
+}
+
+export function isRecoveryBoundaryError(code: string | undefined): boolean {
+  return code === 'REQUEST_CANCELLED' ||
+    code === 'REQUEST_TIMEOUT' ||
+    code === 'EXECUTION_TIMEOUT' ||
+    code === 'PROVIDER_ERROR' ||
+    code === 'EMPTY_PROVIDER_RESPONSE' ||
+    code === 'CONTEXT_LIMIT_EXCEEDED' ||
+    code === 'MAX_LOOPS_EXCEEDED' ||
+    code === 'MAX_OUTPUT_TOKENS_EXCEEDED' ||
+    code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY'
 }
 
 function trimSelectedWindow(events: NexusEvent[], maxEvents: number): NexusEvent[] {

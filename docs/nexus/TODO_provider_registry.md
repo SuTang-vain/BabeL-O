@@ -47,6 +47,7 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] `openai-compatible` adapter。
 - [x] 流式 delta 归一为 Nexus events。
 - [x] tool call 归一为 Nexus tool invocation。
+- [x] MiniMax text-encoded `<minimax:tool_call>` 归一为 Nexus tool invocation，避免 raw provider XML 被当作助手文本渲染。
 - [x] usage 归一。
 - [x] provider error 归一为 Nexus `PROVIDER_ERROR`。
 - [x] 保留 `local` adapter 作为 deterministic test backend。

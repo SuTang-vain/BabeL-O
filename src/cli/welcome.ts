@@ -44,28 +44,41 @@ export function renderWelcome(options: {
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
 
+  const width = Math.max(55, options.cwd.length + 15)
+
   const metadataLines = [
-    `${chalk.bold.hex('#ff006e')('BABEL-O')}  ${chalk.dim(`v${version}`)}`,
-    `${chalk.dim('Welcome,')} ${chalk.bold.cyan(username)}!`,
-    `${chalk.dim('Model:')}     ${chalk.yellow(defaultModel)}`,
-    `${chalk.dim('Workspace:')} ${chalk.italic.white(options.cwd)}`,
-    `${chalk.dim('Mode:')}      ${chalk.magenta(mode)}`,
-    '',
+    ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${version}`)}`,
+    ` ${chalk.dim('User:')}      ${chalk.bold.cyan(username)}`,
+    ` ${chalk.dim('Model:')}     ${chalk.yellow(defaultModel)}`,
+    ` ${chalk.dim('Workspace:')} ${chalk.italic.white(options.cwd)}`,
+    ` ${chalk.dim('Mode:')}      ${chalk.magenta(mode)}`,
   ]
 
   console.log()
+  const boxTop = chalk.cyan('┌' + '─'.repeat(width) + '┐')
+  const boxBottom = chalk.cyan('└' + '─'.repeat(width) + '┘')
+
+  console.log(`  ${boxTop}`)
   for (let i = 0; i < PIXEL_ROWS.length; i++) {
     const logoCol = renderLogoRow(PIXEL_ROWS[i]!)
-    const metaCol = metadataLines[i] || ''
-    console.log(`  ${logoCol}   ${metaCol}`)
+    const metaCol = metadataLines[i] ? metadataLines[i] : ''
+
+    // Calculate padding to align the right border
+    const visibleLength = stripAnsi(metaCol).length
+    const paddingLength = Math.max(0, width - 13 - visibleLength)
+    const rightPadding = ' '.repeat(paddingLength)
+    const borderRight = chalk.cyan('│')
+
+    console.log(`  ${chalk.cyan('│')} ${logoCol}   ${metaCol}${rightPadding}${borderRight}`)
   }
+  console.log(`  ${boxBottom}`)
 
   // Quick commands bar
   console.log()
   console.log(renderCompactHelp())
   console.log()
+}
 
-  // Tips
-  //console.log(chalk.dim('  💡 Tips:') + ` ${chalk.white('输入 /help 查看完整帮助 ·')} ${chalk.white('Ctrl+O 切换视图模式')}`)
-  //console.log()
+function stripAnsi(text: string): string {
+  return text.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
 }

@@ -44,7 +44,7 @@ import {
   lastHookUpdatedInput,
   mergeHookRetryHints,
 } from './hooks.js'
-import { classifyProviderRecovery } from './providerRecovery.js'
+import { buildProviderFallbackPolicy, classifyProviderRecovery } from './providerRecovery.js'
 import {
   createReplacementState,
   replaceLargeToolResult,
@@ -54,6 +54,8 @@ import {
   buildUserIntakeGuidanceEvent,
   shouldSuppressToolsForIntent,
 } from './intentGuidance.js'
+
+const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
 export type MapEventsToMessagesOptions = {
   replayReasoningContent?: boolean
@@ -357,6 +359,7 @@ export class LLMCodingRuntime implements NexusRuntime {
 
       let loopCount = 0
       const maxLoops = 25
+      let finalResponseOnlyMode = false
       let outputRetryCount = 0
       const MAX_OUTPUT_RETRIES = 2
       const MAX_TOKEN_RECOVERIES = 3
@@ -373,7 +376,8 @@ export class LLMCodingRuntime implements NexusRuntime {
         messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd)
 
         currentToolsList = toolsList()
-        modelVisibleTools = shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
+        finalResponseOnlyMode = maxLoops - loopCount <= FINAL_RESPONSE_ONLY_REMAINING_LOOPS
+        modelVisibleTools = finalResponseOnlyMode || shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) ? [] : currentToolsList
         const turnContextWindowState = getContextWindowState({
           tokenEstimate: estimateContextTokens({
             systemPrompt: assembledContext.systemPrompt,
@@ -446,6 +450,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           toolCallCount,
           contextTokenEstimate: turnContextWindowState.tokenEstimate,
           contextMaxTokens: turnContextWindowState.maxTokens,
+          finalResponseOnlyMode,
         })
 
         const queryParams: ModelQueryParams = {
@@ -560,15 +565,70 @@ export class LLMCodingRuntime implements NexusRuntime {
         totalProviderRequestDurationMs += turnDurationMs
 
         // Max output tokens recovery
-        if (currentFinishReason === 'max_tokens' && maxTokenRecoveryCount < MAX_TOKEN_RECOVERIES) {
-          maxTokenRecoveryCount++
-          if (currentToolCalls.length === 0) {
+        if (currentFinishReason === 'max_tokens' && currentToolCalls.length === 0) {
+          if (maxTokenRecoveryCount < MAX_TOKEN_RECOVERIES) {
+            maxTokenRecoveryCount++
+            messages.push({
+              role: 'assistant',
+              content: currentAssistantText,
+              ...(currentReasoningText.trim() && { reasoningContent: currentReasoningText }),
+            })
             messages.push({
               role: 'user',
               content: 'Your previous response was cut off because it hit the maximum output token limit. Please continue exactly from where you left off — do not repeat what you already said.',
             })
             continue
           }
+          const message = `Provider repeatedly stopped because it hit the maximum output token limit after ${MAX_TOKEN_RECOVERIES} recovery attempts.`
+          yield {
+            type: 'error',
+            ...eventBase(options.sessionId),
+            code: 'MAX_OUTPUT_TOKENS_EXCEEDED',
+            message,
+            details: {
+              kind: 'max_output_tokens',
+              recoveryReason: 'ESCALATED_MAX_TOKENS',
+              retryable: true,
+              suggestion: 'Retry with a smaller requested output, ask for a shorter summary, or route this task to a model with a larger output budget.',
+              fallbackPolicy: buildProviderFallbackPolicy('max_output_tokens'),
+            },
+          }
+          yield {
+            type: 'result',
+            ...eventBase(options.sessionId),
+            success: false,
+            message,
+          }
+          yield {
+            type: 'execution_metrics',
+            ...eventBase(options.sessionId),
+            requestId: options.requestId,
+            executeDurationMs: performance.now() - executionStartMs,
+            providerFirstTokenMs,
+            providerRequestDurationMs: totalProviderRequestDurationMs,
+            streamDeltaCount,
+            toolCallCount,
+            toolRoundtripDurationMs: totalToolDurationMs,
+            contextCharsIn,
+            contextCharsOut,
+          }
+          return
+        }
+
+        if (finalResponseOnlyMode && currentToolCalls.length > 0) {
+          const attemptedTools = currentToolCalls.map(toolCall => toolCall.name).join(', ')
+          const message = `Runtime entered final-response-only mode after repeated tool calls and ignored additional requested tools: ${attemptedTools}.`
+          yield {
+            type: 'error',
+            ...eventBase(options.sessionId),
+            code: 'TOOL_LOOP_FINAL_RESPONSE_ONLY',
+            message,
+          }
+          messages.push({
+            role: 'user',
+            content: `${message}\nProvide the best final answer now using the information already available. Do not call tools.`,
+          })
+          continue
         }
 
         // Record assistant's turn in messages array
@@ -1046,11 +1106,18 @@ export class LLMCodingRuntime implements NexusRuntime {
         })
       }
 
+      const maxLoopsMessage = `Execution exceeded maximum tool call iterations (${maxLoops}).`
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
         code: 'MAX_LOOPS_EXCEEDED',
-        message: `Execution exceeded maximum tool call iterations (${maxLoops}).`,
+        message: maxLoopsMessage,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message: maxLoopsMessage,
       }
       yield {
         type: 'execution_metrics',
@@ -1069,14 +1136,22 @@ export class LLMCodingRuntime implements NexusRuntime {
       const isTimeout = options.timeoutSignal?.aborted
       const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
       const providerRecovery = classifyProviderRecovery(err)
+      const errorCode = isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR')
+      const errorText = isCancelled
+        ? 'Execution cancelled by user.'
+        : err instanceof Error ? err.message : String(err)
       yield {
         type: 'error',
         ...eventBase(options.sessionId),
-        code: isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR'),
-        message: isCancelled
-          ? 'Execution cancelled by user.'
-          : err instanceof Error ? err.message : String(err),
+        code: errorCode,
+        message: errorText,
         details: providerRecovery,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message: errorText,
       }
       yield {
         type: 'execution_metrics',
@@ -1147,12 +1222,13 @@ function buildExecutionState(state: {
   toolCallCount: number
   contextTokenEstimate: number
   contextMaxTokens: number
+  finalResponseOnlyMode?: boolean
 }): string {
   const filesRead = [...state.readFileCache.keys()]
   const remaining = state.maxLoops - state.loopCount
   const pctUsed = state.contextMaxTokens > 0 ? Math.round(state.contextTokenEstimate / state.contextMaxTokens * 100) : 0
   let phase = 'gathering'
-  if (remaining <= 3) phase = 'must_respond'
+  if (state.finalResponseOnlyMode || remaining <= FINAL_RESPONSE_ONLY_REMAINING_LOOPS) phase = 'must_respond'
   else if (state.toolCallCount >= 10) phase = 'synthesize'
 
   const lines = [
@@ -1165,7 +1241,7 @@ function buildExecutionState(state: {
   if (phase === 'synthesize') {
     lines.push('  → Present your findings now. Only read more if critical information is missing.')
   } else if (phase === 'must_respond') {
-    lines.push('  → You MUST produce your final answer immediately. No more tool calls.')
+    lines.push('  → Runtime has hidden all tools for this request. You MUST produce your final answer immediately.')
   }
   return lines.join('\n')
 }

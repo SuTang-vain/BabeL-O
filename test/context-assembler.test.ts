@@ -915,12 +915,27 @@ test('analyzeContext returns token and compact diagnostics', async () => {
       timestamp: '2026-05-23T00:00:01.000Z',
       text: '上下文分析中。',
     },
+    {
+      type: 'error',
+      schemaVersion,
+      sessionId: 'session-analysis',
+      timestamp: '2026-05-23T00:00:02.000Z',
+      code: 'REQUEST_CANCELLED',
+      message: 'Execution cancelled by user.',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-analysis',
+      timestamp: '2026-05-23T00:00:03.000Z',
+      text: '等一下',
+    },
   ]
 
   const analysis = await analyzeContext({
     runtimeOptions: {
       sessionId: 'session-analysis',
-      prompt: '继续',
+      prompt: '等一下',
       cwd,
     },
     events,
@@ -942,6 +957,12 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.ok(analysis.window.maxTokens > 0)
   assert.equal(typeof analysis.sections.microcompactedEventCount, 'number')
   assert.equal(typeof analysis.sections.memoryTruncated, 'boolean')
+  assert.equal(analysis.userIntentGuidance.intent, 'pause')
+  assert.equal(analysis.userIntentGuidance.actionHint, 'respond_only')
+  assert.equal(analysis.runtimePolicy.toolsVisible, false)
+  assert.equal(analysis.runtimePolicy.toolSuppressionReason, 'intent:pause:respond_only')
+  assert.equal(analysis.runtimePolicy.recoveryBoundaryActive, true)
+  assert.equal(analysis.runtimePolicy.recoveryBoundaryCode, 'REQUEST_CANCELLED')
   assert.ok(analysis.recommendations.length > 0)
 })
 

@@ -6,8 +6,10 @@ import type {
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import {
   assembleContext,
+  isRecoveryBoundaryError,
   type AssembledContext,
 } from './contextAssembler.js'
+import { shouldSuppressToolsForIntent } from './intentGuidance.js'
 import {
   estimateContextTokens,
   getContextWindowState,
@@ -48,6 +50,14 @@ export type ContextAnalysis = {
   }
   postCompactState: AssembledContext['postCompactState']
   userIntentGuidance: AssembledContext['userIntentGuidance']
+  runtimePolicy: {
+    toolsVisible: boolean
+    toolSuppressionReason: string
+    recoveryBoundaryActive: boolean
+    recoveryBoundaryCode: string
+    recoveryBoundaryTimestamp: string
+    recoveryBoundaryMessage: string
+  }
   recommendations: string[]
 }
 
@@ -82,6 +92,7 @@ export async function analyzeContext(options: {
     maxTokens: assembled.budget.maxTokens,
     warningPercent: options.warningPercent ?? 70,
   })
+  const runtimePolicy = buildRuntimePolicyDiagnostics(assembled.userIntentGuidance, options.events)
   const compact = assembled.compactBoundary
     ? {
         hasBoundary: true,
@@ -124,8 +135,35 @@ export async function analyzeContext(options: {
     compact,
     postCompactState: assembled.postCompactState,
     userIntentGuidance: assembled.userIntentGuidance,
+    runtimePolicy,
     recommendations: buildContextRecommendations(window, compact.hasBoundary),
   }
+}
+
+function buildRuntimePolicyDiagnostics(
+  guidance: AssembledContext['userIntentGuidance'],
+  events: NexusEvent[],
+): ContextAnalysis['runtimePolicy'] {
+  const toolsVisible = !shouldSuppressToolsForIntent(guidance)
+  const recoveryBoundary = findLatestRecoveryBoundary(events)
+  return {
+    toolsVisible,
+    toolSuppressionReason: toolsVisible ? '' : `intent:${guidance.intent}:${guidance.actionHint}`,
+    recoveryBoundaryActive: recoveryBoundary !== null,
+    recoveryBoundaryCode: recoveryBoundary?.code ?? '',
+    recoveryBoundaryTimestamp: recoveryBoundary?.timestamp ?? '',
+    recoveryBoundaryMessage: recoveryBoundary?.message ?? '',
+  }
+}
+
+function findLatestRecoveryBoundary(events: NexusEvent[]): Extract<NexusEvent, { type: 'error' }> | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
+    if (event.type === 'error' && isRecoveryBoundaryError(event.code)) {
+      return event
+    }
+  }
+  return null
 }
 
 function buildContextRecommendations(

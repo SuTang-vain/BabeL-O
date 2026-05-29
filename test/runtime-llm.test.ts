@@ -169,12 +169,23 @@ describe('ConfigManager', () => {
       assert.equal(resolvedFromConfig.modelId, 'openai/gpt-4o')
       assert.equal(resolvedFromConfig.providerId, 'openai')
       assert.equal(resolvedFromConfig.apiKey, 'config-openai-key')
+      assert.equal(resolvedFromConfig.apiKeySource, 'provider_config')
       assert.equal(resolvedFromConfig.baseUrl, 'https://config.openai.com')
+      assert.equal(resolvedFromConfig.baseUrlSource, 'provider_config')
+
+      const diagnosticsFromConfig = configManager.getProviderDiagnostics()
+      assert.equal(diagnosticsFromConfig.providerId, 'openai')
+      assert.equal(diagnosticsFromConfig.modelId, 'openai/gpt-4o')
+      assert.equal(diagnosticsFromConfig.authConfigured, true)
+      assert.equal(diagnosticsFromConfig.authSource, 'provider_config')
+      assert.equal(diagnosticsFromConfig.capabilities.toolCalling, true)
+      assert.equal(diagnosticsFromConfig.capabilities.structuredOutput, true)
 
       // 2. Env variable fallback for API key
       process.env.OPENAI_API_KEY = 'env-openai-key'
       const resolvedFromProviderEnv = configManager.resolveSettings()
       assert.equal(resolvedFromProviderEnv.apiKey, 'env-openai-key')
+      assert.equal(resolvedFromProviderEnv.apiKeySource, 'env')
 
       // 3. BABEL_O_API_KEY precedence over provider specific env
       process.env.BABEL_O_API_KEY = 'babel-o-env-key'
@@ -568,6 +579,63 @@ describe('LLMCodingRuntime', () => {
     assert.match(JSON.stringify(body.system), /User Intake Guidance/)
   })
 
+  test('normalizes contradictory pause intake before exposing tools', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"pause\\",\\"confidence\\":0.94,\\"continuity\\":0.4,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"Contradictory intake fixture.\\",\\"guidance\\":\\"Pause, but incorrectly allows tools.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock contradictory intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"Paused. I will wait for your next instruction."}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-contradictory-pause-intake',
+        prompt: '等一下，先停',
+        cwd: tmpdir(),
+      }),
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.intent, 'pause')
+    assert.equal(intake.contextScope, 'recent')
+    assert.equal(intake.actionHint, 'respond_only')
+    assert.equal(intake.requiresTools, false)
+    assert.equal(intake.source, 'model')
+
+    assert.equal(fetchCalls.length, 1)
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.tools, undefined)
+    assert.match(JSON.stringify(body.system), /Requires tools: no/)
+  })
+
   test('only exposes policy-allowed tools to provider requests', async () => {
     fetchStreamResponses.push(
       createMockStream([
@@ -597,6 +665,98 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
     assert.deepEqual(toolNames, ['Glob', 'Read'])
+  })
+
+  test('emits classified provider error details and a failed result', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"test intake\\",\\"guidance\\":\\"Proceed.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: false,
+        status: 402,
+        body: null,
+        text: async () => '{"error":{"message":"Insufficient Balance"}}',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-provider-error-recoverable-result',
+        prompt: 'analyze code',
+        cwd: tmpdir(),
+      }),
+    )
+
+    const errorEvent = events.find(event => event.type === 'error') as any
+    assert.ok(errorEvent)
+    assert.equal(errorEvent.code, 'PROVIDER_ERROR')
+    assert.equal(errorEvent.details.kind, 'auth_or_billing')
+    assert.equal(errorEvent.details.retryable, false)
+    assert.equal(errorEvent.details.fallbackPolicy.mode, 'fix_configuration')
+    assert.equal(errorEvent.details.fallbackPolicy.allowSilentModelSwitch, false)
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, false)
+    assert.match(resultEvent.message, /Insufficient Balance/i)
+  })
+
+  test('fails instead of accepting repeated max token truncation as a successful answer', async () => {
+    for (let i = 1; i <= 4; i++) {
+      fetchStreamResponses.push(
+        createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          `data: {"index":0,"delta":{"type":"text_delta","text":"partial chunk ${i}"}}\n\n`,
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+          'event: message_delta\n',
+          'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":4096}}\n\n',
+          'event: message_stop\n',
+          'data: {"type":"message_stop"}\n\n',
+        ]),
+      )
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-max-output-recovery-exhausted',
+        prompt: 'write a very long report',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.equal(fetchCalls.length, 4)
+
+    const errorEvent = events.find(event => event.type === 'error' && (event as any).code === 'MAX_OUTPUT_TOKENS_EXCEEDED') as any
+    assert.ok(errorEvent)
+    assert.equal(errorEvent.details.kind, 'max_output_tokens')
+    assert.equal(errorEvent.details.recoveryReason, 'ESCALATED_MAX_TOKENS')
+    assert.equal(errorEvent.details.fallbackPolicy.mode, 'manual_confirm')
+    assert.equal(errorEvent.details.fallbackPolicy.allowSilentModelSwitch, false)
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, false)
+    assert.match(resultEvent.message, /maximum output token limit/)
   })
 
   test('treats empty provider response as a failed result instead of successful done', async () => {
@@ -1004,6 +1164,207 @@ describe('LLMCodingRuntime', () => {
     try {
       fs.rmdirSync(cwd)
     } catch {}
+  })
+
+  test('emits failed result when max loop limit is exceeded', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-max-loops-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    for (let i = 1; i <= 25; i++) {
+      fetchStreamResponses.push(
+        createMockStream([
+          'event: content_block_start\n',
+          `data: {"index":0,"content_block":{"type":"tool_use","id":"missing-tool-${i}","name":"MissingTool","input":{}}}\n\n`,
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+      )
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-max-loops-failed-result',
+        prompt: 'keep thinking without answering',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    const errorEvent = events.find(event => event.type === 'error' && (event as any).code === 'MAX_LOOPS_EXCEEDED') as any
+    assert.ok(errorEvent)
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, false)
+    assert.match(resultEvent.message, /maximum tool call iterations/)
+  })
+
+  test('hides tools and refuses new tool calls in final-response-only mode', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-tool-loop-guard-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'notes.txt')
+    fs.writeFileSync(targetFile, 'loop guard fixture', 'utf8')
+
+    for (let i = 1; i <= 21; i++) {
+      fetchStreamResponses.push(
+        createMockStream([
+          'event: content_block_start\n',
+          `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-${i}","name":"Read","input":{}}}\n\n`,
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+            targetFile.replace(/\\/g, '\\\\') +
+            '\\"}"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+      )
+    }
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-blocked","name":"Read","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"notes.txt\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"I will stop using tools and provide the final answer."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-tool-loop-final-response-only',
+        prompt: 'keep inspecting until done',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    const toolStartedEvents = events.filter(event => event.type === 'tool_started')
+    assert.equal(toolStartedEvents.length, 21)
+    assert.ok(!toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-blocked'))
+
+    const guardError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY') as any
+    assert.ok(guardError)
+    assert.match(guardError.message, /ignored additional requested tools/)
+
+    const finalOnlyBody = JSON.parse(String(fetchCalls[21].init?.body))
+    assert.equal(finalOnlyBody.tools, undefined)
+    assert.match(JSON.stringify(finalOnlyBody.system), /Runtime has hidden all tools/)
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /final answer/)
+  })
+
+  test('normalizes MiniMax text-encoded tool calls before runtime rendering', async () => {
+    configManager.setProviderConfig('minimax', {
+      apiKey: 'minimax-test-key',
+      baseUrl: 'https://api.test-minimax.com/anthropic',
+    })
+    configManager.setDefaultModel('minimax/MiniMax-M2.7-highspeed')
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">pwd</parameter>\\n<parameter name=\\"timeoutMs\\">15000</parameter>\\n</invoke>\\n</minimax:tool_call>"}}\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-minimax-text-tool-call-normalized',
+        prompt: 'run a command',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && (event as any).text.includes('<minimax:tool_call>'),
+    ))
+
+    const toolStarted = events.find(event => event.type === 'tool_started') as any
+    assert.ok(toolStarted)
+    assert.equal(toolStarted.name, 'Bash')
+    assert.equal(toolStarted.input.command, 'pwd')
+    assert.equal(toolStarted.input.timeoutMs, '15000')
+
+    const toolDenied = events.find(event => event.type === 'tool_denied') as any
+    assert.ok(toolDenied)
+    assert.equal(toolDenied.name, 'Bash')
+  })
+
+  test('keeps malformed OpenAI tool-call arguments recoverable at runtime', async () => {
+    configManager.setProviderConfig('openai', {
+      apiKey: 'openai-test-key',
+      baseUrl: 'https://api.test-openai.com/v1',
+    })
+    configManager.setDefaultModel('openai/gpt-4o')
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"Read","arguments":"{\\"path\\":"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"README.md"}}]}}]}\n\n',
+        'data: [DONE]\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-openai-malformed-tool-call-recoverable',
+        prompt: 'read a file',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && JSON.stringify(event).includes('tool_calls'),
+    ))
+
+    assert.ok(!events.some(event => event.type === 'tool_started'))
+
+    const toolCompleted = events.find(event => event.type === 'tool_completed') as any
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.name, 'Read')
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'PARSE_ERROR')
+    assert.equal(toolCompleted.output.rawPreview, '{"path":README.md')
   })
 
   test('blocks disallowed tools and yields tool_denied event', async () => {

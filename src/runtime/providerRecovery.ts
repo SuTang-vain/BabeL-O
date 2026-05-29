@@ -9,6 +9,13 @@ export type ProviderRecoveryKind =
   | 'provider_unavailable'
   | 'unknown'
 
+export type ProviderFallbackPolicy = {
+  mode: 'manual_confirm' | 'retry_same_model' | 'compact_then_retry' | 'fix_configuration' | 'no_auto_fallback'
+  reason: string
+  nextAction: string
+  allowSilentModelSwitch: false
+}
+
 export type ProviderRecoveryDetails = {
   providerId?: string
   httpStatus?: number
@@ -16,6 +23,7 @@ export type ProviderRecoveryDetails = {
   recoveryReason: string
   retryable: boolean
   suggestion: string
+  fallbackPolicy: ProviderFallbackPolicy
   rawMessage?: string
 }
 
@@ -41,6 +49,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'ESCALATED_MAX_TOKENS',
       retryable: true,
       suggestion: 'Retry with a smaller requested output, ask the model to summarize, or route this role to a model with a larger output budget.',
+      fallbackPolicy: buildProviderFallbackPolicy('max_output_tokens'),
       rawMessage,
     }
   }
@@ -61,6 +70,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'ESCALATED_CONTEXT_WINDOW',
       retryable: true,
       suggestion: 'Run /compact or retry with a smaller context window; fallback routing can use a larger-context model.',
+      fallbackPolicy: buildProviderFallbackPolicy('context_window'),
       rawMessage,
     }
   }
@@ -73,6 +83,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'RETRY_PROVIDER_RATE_LIMIT',
       retryable: true,
       suggestion: 'Retry after provider backoff or switch to another configured provider.',
+      fallbackPolicy: buildProviderFallbackPolicy('rate_limit'),
       rawMessage,
     }
   }
@@ -92,6 +103,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'PROVIDER_AUTH_OR_BILLING',
       retryable: false,
       suggestion: 'Check API key, billing balance, provider permissions, or switch the active model/profile.',
+      fallbackPolicy: buildProviderFallbackPolicy('auth_or_billing'),
       rawMessage,
     }
   }
@@ -110,6 +122,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'PROVIDER_PROTOCOL_REPLAY_MISMATCH',
       retryable: false,
       suggestion: 'Provider rejected replayed reasoning/tool-call history. Compact the session or retry after message normalization fixes.',
+      fallbackPolicy: buildProviderFallbackPolicy('provider_protocol'),
       rawMessage,
     }
   }
@@ -122,6 +135,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
       recoveryReason: 'RETRY_PROVIDER_UNAVAILABLE',
       retryable: true,
       suggestion: 'Retry after transient provider failure or switch provider.',
+      fallbackPolicy: buildProviderFallbackPolicy('provider_unavailable'),
       rawMessage,
     }
   }
@@ -133,7 +147,56 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
     recoveryReason: 'PROVIDER_ERROR_UNCLASSIFIED',
     retryable: false,
     suggestion: 'Inspect provider rawMessage and request payload.',
+    fallbackPolicy: buildProviderFallbackPolicy('unknown'),
     rawMessage,
+  }
+}
+
+export function buildProviderFallbackPolicy(kind: ProviderRecoveryKind): ProviderFallbackPolicy {
+  switch (kind) {
+    case 'max_output_tokens':
+      return {
+        mode: 'manual_confirm',
+        reason: 'The provider exhausted the output budget; a larger-output model may increase cost or change behavior.',
+        nextAction: 'Ask the user whether to retry with a shorter answer, continue in chunks, or switch to a larger-output model/profile.',
+        allowSilentModelSwitch: false,
+      }
+    case 'context_window':
+      return {
+        mode: 'compact_then_retry',
+        reason: 'The input context is too large; compaction is safer than silently changing providers.',
+        nextAction: 'Run /compact or reduce context first; ask before routing to a larger-context model/profile.',
+        allowSilentModelSwitch: false,
+      }
+    case 'rate_limit':
+    case 'provider_unavailable':
+      return {
+        mode: 'retry_same_model',
+        reason: 'The provider failure may be transient, but switching providers can change cost, latency, or output behavior.',
+        nextAction: 'Retry the same model after backoff; ask before switching provider/model/profile.',
+        allowSilentModelSwitch: false,
+      }
+    case 'auth_or_billing':
+      return {
+        mode: 'fix_configuration',
+        reason: 'The active provider credentials, quota, or billing need user action.',
+        nextAction: 'Ask the user to fix credentials/billing or explicitly choose another configured model/profile.',
+        allowSilentModelSwitch: false,
+      }
+    case 'provider_protocol':
+      return {
+        mode: 'no_auto_fallback',
+        reason: 'The provider rejected replay protocol details; switching models may hide a message-normalization bug.',
+        nextAction: 'Compact or normalize replayed messages, then retry; do not auto-switch providers.',
+        allowSilentModelSwitch: false,
+      }
+    case 'unknown':
+      return {
+        mode: 'no_auto_fallback',
+        reason: 'The provider error is not classified enough for safe automatic fallback.',
+        nextAction: 'Inspect the raw provider error and ask the user before retrying with a different model/profile.',
+        allowSilentModelSwitch: false,
+      }
   }
 }
 

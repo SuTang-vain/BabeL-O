@@ -16,8 +16,8 @@ type CliReadline = readline.Interface
 
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/sessions', '/history', '/tool',
-    '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task',
+    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/sessions', '/history', '/tool',
+    '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e',
   ]
 }
 
@@ -47,22 +47,35 @@ export function formatSlashPalette(
   totalCount = choices.length,
 ): string {
   if (choices.length === 0) return ''
-  const visible = choices.slice(0, 8)
+
+  const visibleHeight = 8
+  let scrollOffset = 0
+  if (activeIndex >= visibleHeight) {
+    scrollOffset = activeIndex - visibleHeight + 1
+  }
+
+  const visible = choices.slice(scrollOffset, scrollOffset + visibleHeight)
   const lines = [
     chalk.dim('─'.repeat(process.stdout.columns || 80)),
   ]
   for (let index = 0; index < visible.length; index++) {
     const choice = visible[index]!
     const { label, description } = describeCompletionChoice(choice)
-    const selected = index === activeIndex
+    const selected = (index + scrollOffset) === activeIndex
     const marker = selected ? chalk.blue('>') : ' '
     const left = selected ? chalk.blue(label) : chalk.white(label)
     const right = chalk.dim(description)
     lines.push(`${marker} ${left.padEnd(18)} ${right}`)
   }
-  const remaining = Math.max(0, totalCount - visible.length)
-  if (remaining > 0) {
-    lines.push(`  ${chalk.dim(`↓ ${remaining} more`)}`)
+
+  const remainingBelow = Math.max(0, totalCount - (scrollOffset + visible.length))
+  const remainingAbove = scrollOffset
+
+  if (remainingAbove > 0) {
+    lines.splice(1, 0, `  ${chalk.dim(`↑ ${remainingAbove} more`)}`)
+  }
+  if (remainingBelow > 0) {
+    lines.push(`  ${chalk.dim(`↓ ${remainingBelow} more`)}`)
   }
   lines.push('')
   lines.push(`${chalk.dim('↑/↓ Navigate ·')} ${chalk.blue('tab')} ${chalk.dim('Complete ·')} ${chalk.blue('enter')} ${chalk.dim('Run')}`)
@@ -94,6 +107,12 @@ export function makeCompleter(cwd: string) {
       const subCommands = ['clear', 'add']
       const allOptions = [...subCommands, ...profiles]
       hits = allOptions.filter(opt => opt.startsWith(profilePrefix)).map(opt => `/profile ${opt}`)
+      substring = line
+    } else if (line.startsWith('/smoke ')) {
+      const smokePrefix = line.slice('/smoke '.length).trimStart().toLowerCase()
+      hits = ['dry-run', 'live']
+        .filter(option => option.startsWith(smokePrefix))
+        .map(option => `/smoke ${option}`)
       substring = line
     } else {
       const words = line.split(' ')
@@ -201,8 +220,7 @@ export function createSlashPalette(rl: CliReadline) {
     }
     isOpen = true
     inputState.set('slashPalette')
-    activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
-    preview()
+    activeIndex = Math.min(activeIndex, currentChoices.length - 1)
     renderOverlay()
   }
 
@@ -216,8 +234,12 @@ export function createSlashPalette(rl: CliReadline) {
     process.stdout.write('\n')
     process.stdout.write(palette)
     renderedLines = 1 + countRenderedLines(palette)
+
+    // Calculate visual width of prompt to avoid ANSI escape character offset
+    const promptWidth = prompt.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').length
+
     readline.moveCursor(process.stdout, 0, -renderedLines)
-    readline.cursorTo(process.stdout, prompt.length + line.length)
+    readline.cursorTo(process.stdout, promptWidth + (rlInt.cursor ?? line.length))
   }
 
   const clear = () => {
@@ -264,7 +286,7 @@ export function createSlashPalette(rl: CliReadline) {
       return
     }
     isOpen = true
-    activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
+    activeIndex = Math.min(activeIndex, currentChoices.length - 1)
     if (previewSelection) {
       preview()
     }
@@ -284,8 +306,7 @@ export function createSlashPalette(rl: CliReadline) {
 
   const move = (delta: number) => {
     if (currentChoices.length === 0) return false
-    const visibleCount = Math.min(currentChoices.length, 8)
-    activeIndex = (activeIndex + delta + visibleCount) % visibleCount
+    activeIndex = (activeIndex + delta + currentChoices.length) % currentChoices.length
     preview()
     renderOverlay()
     return true
@@ -376,7 +397,7 @@ export function createSlashPalette(rl: CliReadline) {
           query = line
           isOpen = true
         }
-        activeIndex = Math.min(activeIndex, Math.min(currentChoices.length, 8) - 1)
+        activeIndex = Math.min(activeIndex, currentChoices.length - 1)
         consumedNavigationKey = true
         if (keyName === 'up' || raw.includes('\x1b[A')) move(-1)
         else if (keyName === 'down' || raw.includes('\x1b[B')) move(1)

@@ -22,6 +22,32 @@ export class NexusClient {
     return this.getJson('/v1/runtime/status')
   }
 
+  async providerSmoke(options: {
+    model?: string
+    role?: string
+    requireTools?: boolean
+    requireStreaming?: boolean
+    requireStructuredOutput?: boolean
+  } = {}): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.model) params.set('model', options.model)
+    if (options.role) params.set('role', options.role)
+    if (options.requireTools !== undefined) params.set('requireTools', String(options.requireTools))
+    if (options.requireStreaming !== undefined) params.set('requireStreaming', String(options.requireStreaming))
+    if (options.requireStructuredOutput !== undefined) params.set('requireStructuredOutput', String(options.requireStructuredOutput))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/runtime/provider-smoke${query}`)
+  }
+
+  async providerLiveSmoke(options: {
+    model?: string
+    role?: string
+    mode?: 'simple_text'
+    timeoutMs?: number
+  } = {}): Promise<unknown> {
+    return this.postJson('/v1/runtime/provider-smoke/live', options)
+  }
+
   async auditTools(): Promise<unknown> {
     return this.getJson('/v1/tools/audit')
   }

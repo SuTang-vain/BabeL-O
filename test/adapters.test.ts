@@ -275,6 +275,96 @@ describe('Model Adapters & Factory', () => {
       assert.strictEqual(headers['anthropic-version'], '2023-06-01')
       assert.strictEqual(headers['anthropic-beta'], undefined)
     })
+
+    test('minimax text-encoded tool calls are normalized instead of streamed as text', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">ls &amp;&amp; pwd</parameter>\\n"}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<parameter name=\\"timeoutMs\\">15000</parameter>\\n</invoke>\\n</minimax:tool_call>"}}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'minimax/MiniMax-M2.7-highspeed',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'tool_use_start', id: 'minimax_tool_1', name: 'Bash' },
+        {
+          type: 'tool_use_delta',
+          id: 'minimax_tool_1',
+          inputDelta: JSON.stringify({ command: 'ls && pwd', timeoutMs: '15000' }),
+        },
+        {
+          type: 'tool_use_end',
+          id: 'minimax_tool_1',
+          input: { command: 'ls && pwd', timeoutMs: '15000' },
+        },
+        { type: 'finish', reason: 'tool_use' },
+      ])
+    })
+
+    test('minimax text around encoded tool calls stays text while tool XML is suppressed', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Before <minimax:tool_call>\\n<invoke name=\\"Read\\">\\n<parameter name=\\"path\\">README.md</parameter>\\n</invoke>\\n</minimax:tool_call> after"}}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'minimax/MiniMax-M2.7-highspeed',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'text', text: 'Before ' },
+        { type: 'tool_use_start', id: 'minimax_tool_1', name: 'Read' },
+        {
+          type: 'tool_use_delta',
+          id: 'minimax_tool_1',
+          inputDelta: JSON.stringify({ path: 'README.md' }),
+        },
+        { type: 'tool_use_end', id: 'minimax_tool_1', input: { path: 'README.md' } },
+        { type: 'finish', reason: 'tool_use' },
+        { type: 'text', text: ' after' },
+      ])
+      assert.ok(!deltas.some(delta => delta.type === 'text' && delta.text.includes('<minimax:tool_call>')))
+    })
+
+    test('minimax incomplete text-encoded tool calls are not converted into tool invocations', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">pwd</parameter>"}}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'minimax/MiniMax-M2.7-highspeed',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.ok(!deltas.some(delta => delta.type === 'tool_use_start'))
+      assert.deepStrictEqual(deltas, [
+        {
+          type: 'text',
+          text: '<minimax:tool_call>\n<invoke name="Bash">\n<parameter name="command">pwd</parameter>',
+        },
+      ])
+    })
   })
 
   describe('OpenAIAdapter', () => {
@@ -339,6 +429,33 @@ describe('Model Adapters & Factory', () => {
         { type: 'tool_use_delta', id: 'call_1', inputDelta: '{"pa' },
         { type: 'tool_use_delta', id: 'call_1', inputDelta: 'th":"a"}' },
         { type: 'tool_use_end', id: 'call_1', input: { path: 'a' } },
+      ])
+    })
+
+    test('keeps malformed OpenAI tool call arguments as parse-error input', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_bad","function":{"name":"Read","arguments":"{\\"path\\":"}}]}}]}\n\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"README.md"}}]}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'openai/gpt-4o',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'tool_use_start', id: 'call_bad', name: 'Read' },
+        { type: 'tool_use_delta', id: 'call_bad', inputDelta: '{"path":' },
+        { type: 'tool_use_delta', id: 'call_bad', inputDelta: 'README.md' },
+        {
+          type: 'tool_use_end',
+          id: 'call_bad',
+          input: { _parseError: true, _rawInput: '{"path":README.md' },
+        },
       ])
     })
 

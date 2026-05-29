@@ -18,6 +18,18 @@ import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
 import { ConfigManager } from '../src/shared/config.js'
 import type { NexusEvent } from '../src/shared/events.js'
 
+function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+}
+
+ConfigManager.getInstance().save({})
+
 test('execute reads a workspace file and records session events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
@@ -455,6 +467,164 @@ test('tool audit reports risk and allowlist status', async () => {
   }
 })
 
+test('/v1/runtime/status returns redacted provider diagnostics', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-status`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/status',
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'runtime_status')
+    assert.equal(body.provider.modelId, 'local/coding-runtime')
+    assert.equal(body.provider.providerId, 'local')
+    assert.equal(body.provider.authConfigured, true)
+    assert.equal(body.provider.authMode, 'none')
+    assert.equal(body.provider.capabilities.toolCalling, true)
+    assert.equal(body.provider.capabilities.streaming, true)
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.providerSmoke.type, 'provider_smoke')
+    assert.equal(body.providerSmoke.mode, 'dry_run')
+    assert.equal(body.providerSmoke.ready, true)
+    assert.equal(body.providerSmoke.provider.apiKey, undefined)
+    assert.equal(body.providerSmoke.checks.authConfigured, true)
+    assert.equal(body.providerSmoke.fallbackPolicy.allowSilentModelSwitch, false)
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/provider-smoke returns local dry-run readiness without executing sessions', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-local`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/provider-smoke',
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'provider_smoke')
+    assert.equal(body.mode, 'dry_run')
+    assert.equal(body.ready, true)
+    assert.equal(body.provider.providerId, 'local')
+    assert.equal(body.provider.modelId, 'local/coding-runtime')
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.checks.authConfigured, true)
+    assert.equal(body.checks.toolsSupported, true)
+    assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/provider-smoke reports unmet capability without silent fallback', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-capability`)
+  await mkdir(cwd, { recursive: true })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/provider-smoke?model=local%2Fcoding-runtime&requireStructuredOutput=true',
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'provider_smoke')
+    assert.equal(body.mode, 'dry_run')
+    assert.equal(body.ready, false)
+    assert.equal(body.provider.providerId, 'local')
+    assert.equal(body.provider.modelId, 'local/coding-runtime')
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.checks.authConfigured, true)
+    assert.equal(body.checks.structuredOutputSupported, false)
+    assert.equal(body.fallbackPolicy.mode, 'fix_configuration')
+    assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/provider-smoke/live runs fixed live smoke without creating sessions', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-live`)
+  const configPath = join(cwd, 'config.json')
+  await mkdir(cwd, { recursive: true })
+
+  const oldConfigFile = process.env.BABEL_O_CONFIG_FILE
+  const oldAnthropicApiKey = process.env.ANTHROPIC_API_KEY
+  const oldAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL
+  const oldFetch = globalThis.fetch
+  process.env.BABEL_O_CONFIG_FILE = configPath
+  process.env.ANTHROPIC_API_KEY = 'anthropic-live-smoke-test-key'
+  process.env.ANTHROPIC_BASE_URL = 'https://api.test-anthropic.com'
+
+  const fetchCalls: RequestInit[] = []
+  globalThis.fetch = async (_url, init) => {
+    fetchCalls.push(init ?? {})
+    return {
+      ok: true,
+      status: 200,
+      body: createRuntimeTestStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"BABEL_O_PROVIDER_SMOKE_OK"}}\n\n',
+        'event: message_delta\n',
+        'data: {"delta":{"stop_reason":"end_turn"}}\n\n',
+      ]),
+      text: async () => 'mock live smoke response',
+    } as Response
+  }
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/provider-smoke/live',
+      payload: { model: 'anthropic/claude-3-5-sonnet' },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'provider_smoke')
+    assert.equal(body.mode, 'live')
+    assert.equal(body.smokeMode, 'simple_text')
+    assert.equal(body.ready, true)
+    assert.equal(body.live, true)
+    assert.equal(body.success, true)
+    assert.equal(body.matchedExpectedText, true)
+    assert.equal(body.outputPreview, 'BABEL_O_PROVIDER_SMOKE_OK')
+    assert.equal(body.provider.apiKey, undefined)
+    assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
+
+    assert.equal(fetchCalls.length, 1)
+    const requestBody = JSON.parse(String(fetchCalls[0].body))
+    assert.match(JSON.stringify(requestBody), /BABEL_O_PROVIDER_SMOKE_OK/)
+    assert.doesNotMatch(JSON.stringify(requestBody), /分析|project|Baidu/)
+  } finally {
+    await app.close()
+    globalThis.fetch = oldFetch
+    if (oldAnthropicApiKey === undefined) delete process.env.ANTHROPIC_API_KEY
+    else process.env.ANTHROPIC_API_KEY = oldAnthropicApiKey
+    if (oldAnthropicBaseUrl === undefined) delete process.env.ANTHROPIC_BASE_URL
+    else process.env.ANTHROPIC_BASE_URL = oldAnthropicBaseUrl
+    if (oldConfigFile === undefined) delete process.env.BABEL_O_CONFIG_FILE
+    else process.env.BABEL_O_CONFIG_FILE = oldConfigFile
+  }
+})
+
 test('/v1/sessions/:sessionId/context returns reusable context analysis', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-context-api`)
   await mkdir(cwd, { recursive: true })
@@ -482,6 +652,9 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     assert.ok(body.estimate.totalTokens > 0)
     assert.ok(body.window.maxTokens > 0)
     assert.equal(body.sections.toolDefinitionCount, 1)
+    assert.equal(typeof body.runtimePolicy.toolsVisible, 'boolean')
+    assert.equal(typeof body.runtimePolicy.recoveryBoundaryActive, 'boolean')
+    assert.equal(typeof body.userIntentGuidance.intent, 'string')
     assert.ok(Array.isArray(body.recommendations))
   } finally {
     await app.close()

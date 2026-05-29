@@ -92,7 +92,7 @@ export function findLatestUserIntakeGuidance(events: NexusEvent[]): UserIntakeGu
 }
 
 export function guidanceFromIntakeEvent(event: UserIntakeGuidanceEvent): UserIntentGuidance {
-  return {
+  return normalizeGuidancePolicy({
     intent: event.intent,
     confidence: clamp01(event.confidence),
     continuity: clamp01(event.continuity),
@@ -104,27 +104,28 @@ export function guidanceFromIntakeEvent(event: UserIntakeGuidanceEvent): UserInt
     latestUserText: event.userText,
     explicitPaths: event.explicitPaths,
     source: event.source,
-  }
+  })
 }
 
 export function toUserIntakeGuidanceEvent(options: {
   sessionId: string
   guidance: UserIntentGuidance
 }): UserIntakeGuidanceEvent {
+  const guidance = normalizeGuidancePolicy(options.guidance)
   return {
     type: 'user_intake_guidance',
     ...eventBase(options.sessionId),
-    userText: options.guidance.latestUserText,
-    intent: options.guidance.intent,
-    confidence: clamp01(options.guidance.confidence),
-    continuity: clamp01(options.guidance.continuity),
-    contextScope: options.guidance.contextScope,
-    actionHint: options.guidance.actionHint,
-    requiresTools: options.guidance.requiresTools,
-    reason: options.guidance.reason,
-    guidance: options.guidance.guidance,
-    explicitPaths: options.guidance.explicitPaths,
-    source: options.guidance.source,
+    userText: guidance.latestUserText,
+    intent: guidance.intent,
+    confidence: clamp01(guidance.confidence),
+    continuity: clamp01(guidance.continuity),
+    contextScope: guidance.contextScope,
+    actionHint: guidance.actionHint,
+    requiresTools: guidance.requiresTools,
+    reason: guidance.reason,
+    guidance: guidance.guidance,
+    explicitPaths: guidance.explicitPaths,
+    source: guidance.source,
   }
 }
 
@@ -153,7 +154,8 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
 }
 
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
-  return !guidance.requiresTools || guidance.actionHint === 'respond_only'
+  const normalized = normalizeGuidancePolicy(guidance)
+  return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
 
 export function deriveFallbackUserIntentGuidance(options: {
@@ -357,7 +359,19 @@ function summarizeRecentUserHistory(events: NexusEvent[]): string {
 }
 
 function buildGuidance(guidance: UserIntentGuidance): UserIntentGuidance {
-  return guidance
+  return normalizeGuidancePolicy(guidance)
+}
+
+function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
+  if (guidance.intent !== 'pause' && guidance.intent !== 'greeting' && guidance.intent !== 'status') {
+    return guidance
+  }
+  return {
+    ...guidance,
+    contextScope: guidance.intent === 'pause' ? 'recent' : guidance.contextScope,
+    actionHint: 'respond_only',
+    requiresTools: false,
+  }
 }
 
 function findLatestUserText(events: NexusEvent[]): string {
@@ -408,7 +422,7 @@ function isPausePrompt(text: string): boolean {
 
 function isCorrectionPrompt(text: string): boolean {
   const normalized = text.trim().toLowerCase()
-  return /(?:让你|要你|我说的|说的是|分析的就是|看的就是|不是.*而是|actually|i mean)/iu.test(normalized)
+  return /(?:让你|要你|我说的|说的是|分析的就是|看的就是|不是.*(?:而是|是)|actually|i mean)/iu.test(normalized)
 }
 
 function normalizeLoose(text: string): string {
