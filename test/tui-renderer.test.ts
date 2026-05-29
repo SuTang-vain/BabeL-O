@@ -125,6 +125,36 @@ test('formatSessionHistory: handles tool denials and errors', () => {
   assert.ok(outputExpanded.includes('UNEXPECTED_ERROR: Something went wrong'))
 })
 
+test('formatSessionHistory: renders provider fallback policy details', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'error',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-provider-policy',
+      timestamp: new Date().toISOString(),
+      code: 'PROVIDER_ERROR',
+      message: 'Provider failed.',
+      details: {
+        kind: 'context_window',
+        recoveryReason: 'ESCALATED_CONTEXT_WINDOW',
+        retryable: true,
+        suggestion: 'Run /compact.',
+        fallbackPolicy: {
+          mode: 'compact_then_retry',
+          reason: 'Context too large.',
+          nextAction: 'Run /compact before switching models.',
+          allowSilentModelSwitch: false,
+        },
+      },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('recovery=ESCALATED_CONTEXT_WINDOW'))
+  assert.ok(output.includes('fallback=compact_then_retry'))
+  assert.ok(output.includes('silentSwitch=false'))
+})
+
 test('formatSessionHistory: renders compact boundaries and context warnings', () => {
   const events: NexusEvent[] = [
     {
@@ -329,7 +359,7 @@ test('formatTaskStatusPanel renders task status board correctly', () => {
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('--- Task Status Board ---'))
+  assert.ok(output.includes('Task Status Board'))
   assert.ok(output.includes('▶ 执行中'))
   assert.ok(output.includes('Setup repository'))
   assert.ok(output.includes('⟳ 规划中'))
@@ -407,4 +437,81 @@ test('formatTaskStatusPanel renders delegated subtask hierarchy', () => {
   assert.ok(output.includes('delegated #2'))
   assert.ok(output.includes('Child implementation'))
   assert.ok(output.includes('parent #1'))
+})
+
+test('formatSessionHistory: consecutive assistant_delta events produce exactly one ⏺ prefix', () => {
+  // Simulates a streamed response stored as multiple assistant_delta records in the database.
+  // On redraw, they must be merged into a single cohesive paragraph with one ⏺ prefix symbol.
+  const events: NexusEvent[] = [
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-merge',
+      timestamp: new Date().toISOString(),
+      text: '你好！我是 BabeL-O，',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-merge',
+      timestamp: new Date().toISOString(),
+      text: '一个 AI 编程助手。',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-merge',
+      timestamp: new Date().toISOString(),
+      text: '我可以帮你完成各种软件开发任务。',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+
+  // The full merged text must be present
+  assert.ok(output.includes('你好！我是 BabeL-O，'), 'merged text missing')
+  assert.ok(output.includes('一个 AI 编程助手。'), 'merged text missing')
+  assert.ok(output.includes('我可以帮你完成各种软件开发任务。'), 'merged text missing')
+
+  // Crucially: only ONE ⏺ symbol should appear, not three
+  const bulletCount = (output.match(/⏺/g) ?? []).length
+  assert.strictEqual(bulletCount, 1, `Expected exactly 1 ⏺, got ${bulletCount}`)
+})
+
+test('formatSessionHistory: usage event between assistant_delta events does not break merging', () => {
+  // A "usage" metadata event stored between streaming chunks must be ignored (it is in ignorableTypes)
+  // and must NOT break the merge of consecutive assistant text.
+  const events: NexusEvent[] = [
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-usage-merge',
+      timestamp: new Date().toISOString(),
+      text: '首先分析代码结构，',
+    },
+    {
+      type: 'usage',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-usage-merge',
+      timestamp: new Date().toISOString(),
+      inputTokens: 120,
+      outputTokens: 15,
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-usage-merge',
+      timestamp: new Date().toISOString(),
+      text: '然后优化性能瓶颈。',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+
+  assert.ok(output.includes('首先分析代码结构，'), 'first chunk missing')
+  assert.ok(output.includes('然后优化性能瓶颈。'), 'second chunk missing')
+
+  // Still only one ⏺ even though there was a usage event in between
+  const bulletCount = (output.match(/⏺/g) ?? []).length
+  assert.strictEqual(bulletCount, 1, `Expected exactly 1 ⏺ after usage-event gap, got ${bulletCount}`)
 })

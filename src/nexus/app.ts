@@ -14,6 +14,7 @@ import { PendingPermissionRegistry } from '../shared/session.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
+import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
@@ -38,6 +39,28 @@ const executeSchema = z.object({
   model: z.string().optional(),
   budget: z.number().int().positive().optional(),
   executionEnvironment: z.enum(['local', 'docker', 'remote']).default('local').optional(),
+})
+
+const booleanQuery = (defaultValue: boolean) => z.preprocess(value => {
+  if (value === undefined) return defaultValue
+  if (value === true || value === 'true' || value === '1') return true
+  if (value === false || value === 'false' || value === '0') return false
+  return value
+}, z.boolean())
+
+const providerSmokeQuerySchema = z.object({
+  model: z.string().optional(),
+  role: z.string().optional(),
+  requireTools: booleanQuery(true),
+  requireStreaming: booleanQuery(true),
+  requireStructuredOutput: booleanQuery(false),
+})
+
+const providerLiveSmokeSchema = z.object({
+  model: z.string().optional(),
+  role: z.string().optional(),
+  mode: z.enum(['simple_text']).default('simple_text').optional(),
+  timeoutMs: z.number().int().positive().max(60_000).default(30_000).optional(),
 })
 
 const createTaskSchema = z.object({
@@ -177,8 +200,31 @@ export async function createNexusApp(
       status: 'ok',
       version: '0.1.0',
     },
+    provider: ConfigManager.getInstance().getProviderDiagnostics(),
+    providerSmoke: runProviderSmokeDryRun(),
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))
+
+  app.get('/v1/runtime/provider-smoke', async request => {
+    const query = providerSmokeQuerySchema.parse(request.query)
+    return runProviderSmokeDryRun({
+      model: query.model,
+      role: query.role,
+      requireTools: query.requireTools,
+      requireStreaming: query.requireStreaming,
+      requireStructuredOutput: query.requireStructuredOutput,
+    })
+  })
+
+  app.post('/v1/runtime/provider-smoke/live', async request => {
+    const body = providerLiveSmokeSchema.parse(request.body ?? {})
+    return runProviderLiveSmoke({
+      model: body.model,
+      role: body.role,
+      mode: body.mode,
+      timeoutMs: body.timeoutMs,
+    })
+  })
 
   app.get('/v1/runtime/metrics', async () => metrics.snapshot())
 

@@ -18,6 +18,7 @@ import { renderWelcome } from '../welcome.js'
 import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
 import { modelRegistry } from '../../providers/registry.js'
+import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../../runtime/providerSmoke.js'
 import { createId } from '../../shared/id.js'
 import { NexusEvent } from '../../shared/events.js'
 import { runSessionFlow } from '../runSessionFlow.js'
@@ -26,7 +27,9 @@ import {
   promptSecret,
   promptText,
   pickCompletionChoice,
-  mapDropdownSelection
+  mapDropdownSelection,
+  getAutosuggestion,
+  setupAutosuggestions
 } from '../ui.js'
 import {
   makeCompleter,
@@ -34,6 +37,7 @@ import {
   getToolCompletionChoices
 } from '../completer.js'
 import { inputState } from '../inputState.js'
+import { openExternalEditor } from '../editor.js'
 import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 
 interface ReadlineInternal extends readline.Interface {
@@ -80,8 +84,153 @@ export function registerChatCommand(program: Command): void {
 
       let activeAbortController: AbortController | null = null
       let isExecuting = false
+
+      const isExecutingRef = { get current() { return isExecuting } }
+      setupAutosuggestions(rl, history, isExecutingRef)
       const slashPalette = createSlashPalette(rl)
       let sessionId = ''
+
+      // Enable bracketed paste mode
+      process.stdout.write('\x1b[?2004h')
+
+      // Enable mouse button/wheel tracking + SGR extended coordinates.
+      // This causes the terminal to emit distinct escape sequences for mouse
+      // scroll events (\x1b[<64;col;rowM / \x1b[<65;col;rowM) instead of
+      // silently translating them into ↑/↓ arrow key sequences, which would
+      // otherwise trigger readline history navigation on every touchpad scroll.
+      process.stdout.write('\x1b[?1000h\x1b[?1006h')
+
+      const originalEmit = process.stdin.emit
+      let isPasting = false
+      let pasteBuffer = ''
+      let pastedMultilineText = ''
+      let pasteTimeout: NodeJS.Timeout | null = null
+
+      const clearPasteTimeout = () => {
+        if (pasteTimeout) {
+          clearTimeout(pasteTimeout)
+          pasteTimeout = null
+        }
+      }
+
+      const handlePastedText = (text: string) => {
+        if (!text) return
+
+        if (!text.includes('\n') && !text.includes('\r')) {
+          rl.write(text)
+        } else {
+          inputState.set('pasteBuffer')
+          pastedMultilineText = text
+          rlInt.line = ''
+          ;(rlInt as any).cursor = 0
+          drawPasteBufferCard()
+        }
+      }
+
+      const drawPasteBufferCard = () => {
+        const lines = pastedMultilineText.split(/\r?\n/)
+        const lineCount = lines.length
+
+        // Clear the current prompt line
+        process.stdout.write('\r\x1b[K')
+
+        // Render the preview box with explicit carriage returns to prevent terminal alignment staircasing
+        process.stdout.write('\r\n' + chalk.cyan('  ┌─── Multiline Paste Buffer ──────────────────────────────────') + '\r\n')
+        const previewLines = lines.slice(0, 8)
+        for (const line of previewLines) {
+          process.stdout.write(chalk.cyan('  │ ') + chalk.white(line.slice(0, 75)) + '\r\n')
+        }
+        if (lineCount > 8) {
+          process.stdout.write(chalk.cyan(`  │ ... and ${lineCount - 8} more lines.`) + '\r\n')
+        }
+        process.stdout.write(chalk.cyan('  └─────────────────────────────────────────────────────────────') + '\r\n')
+
+        const helpText = `  ${chalk.green('[Enter]')} Submit | ${chalk.yellow('[Ctrl+E]')} Edit | ${chalk.red('[Esc/Backspace]')} Cancel`
+        process.stdout.write(helpText + '\r\n')
+        rl.prompt()
+      }
+
+      process.stdin.emit = function (event: string, ...args: any[]) {
+        if (event === 'data') {
+          const chunk = args[0]
+          const str = chunk ? chunk.toString() : ''
+
+          // ── Mouse event filter ────────────────────────────────────────────
+          // When mouse reporting is active the terminal sends distinct escape
+          // sequences for scroll/click events.  We swallow them entirely so
+          // they never reach readline's arrow-key history-navigation handler.
+          //
+          // Formats intercepted:
+          //   SGR  : \x1b[<Pb;Px;PyM  or  \x1b[<Pb;Px;Pym  (Pb>=64 = wheel)
+          //   X10  : \x1b[M + 3 bytes  (first byte − 32 >= 64 = wheel)
+          //   URXVT: \x1b[Pb;Px;PyM
+          //
+          // We match ALL mouse report sequences here (not just wheel), because
+          // click/move events are noise we never act on inside the chat loop.
+          if (
+            /^\x1b\[<[\d;]+[Mm]/.test(str) ||
+            (str.startsWith('\x1b[M') && str.length >= 6) ||
+            /^\x1b\[[\d;]+[Mm]/.test(str)
+          ) {
+            return true
+          }
+
+          if (!isExecuting) {
+            // If Ctrl+C is pressed, immediately abort pasting and let keypress handle exit
+            if (str.includes('\x03')) {
+              isPasting = false
+              pasteBuffer = ''
+              clearPasteTimeout()
+              return originalEmit.apply(this, [event, ...args] as any)
+            }
+
+          if (isPasting) {
+            pasteBuffer += str
+            const endIdx = pasteBuffer.indexOf('\x1b[201~')
+            if (endIdx !== -1) {
+              const pastedText = pasteBuffer.slice(0, endIdx)
+              isPasting = false
+              pasteBuffer = pasteBuffer.slice(endIdx + 6)
+              clearPasteTimeout()
+              handlePastedText(pastedText)
+            }
+            return true
+          }
+
+          if (str.includes('\x1b[200~')) {
+            isPasting = true
+            const startIdx = str.indexOf('\x1b[200~')
+            pasteBuffer = str.slice(startIdx + 6)
+
+            const endIdx = pasteBuffer.indexOf('\x1b[201~')
+            if (endIdx !== -1) {
+              const pastedText = pasteBuffer.slice(0, endIdx)
+              isPasting = false
+              pasteBuffer = pasteBuffer.slice(endIdx + 6)
+              handlePastedText(pastedText)
+            } else {
+              // Fail-safe: recover after 1 second if end paste marker is missing
+              clearPasteTimeout()
+              pasteTimeout = setTimeout(() => {
+                if (isPasting) {
+                  const flushedText = pasteBuffer
+                  isPasting = false
+                  pasteBuffer = ''
+                  handlePastedText(flushedText)
+                }
+              }, 1000)
+            }
+            return true
+          }
+          } // end !isExecuting
+        }
+
+        if (!isExecuting && event === 'keypress' && isPasting) {
+          return true
+        }
+
+        return originalEmit.apply(this, [event, ...args] as any)
+      }
 
       const closeCurrentSession = async (reason: string): Promise<void> => {
         if (!sessionId) return
@@ -191,15 +340,159 @@ export function registerChatCommand(program: Command): void {
       }
 
       const onGlobalKeypress = (chunk: any, key: any) => {
+        const isCtrlC = (key?.ctrl && key?.name === 'c') || chunk === '\x03' || chunk?.toString() === '\x03' || (typeof chunk === 'string' && chunk.charCodeAt(0) === 3)
+
+        if (isCtrlC) {
+          clearPasteTimeout()
+          if (isExecuting && activeAbortController) {
+            activeAbortController.abort()
+            console.log(chalk.yellow('\nExecution cancelled by user.'))
+          } else {
+            console.log(chalk.dim('\nExiting chat...'))
+            cleanupListeners()
+            rl.close()
+            void closeCurrentSession('CLI interrupted').finally(() => process.exit(0))
+          }
+          return
+        }
+
+        if (inputState.current === 'pasteBuffer') {
+          const isCtrlE = (key?.ctrl && key?.name === 'e') || chunk === '\x05' || chunk?.toString() === '\x05' || (typeof chunk === 'string' && chunk.charCodeAt(0) === 5)
+          const isEnter = key?.name === 'enter' || key?.name === 'return' || chunk === '\r' || chunk === '\n' || chunk === '\r\n' || chunk?.toString() === '\r' || chunk?.toString() === '\n' || chunk?.toString() === '\r\n'
+          const isCancel = key?.name === 'escape' || key?.name === 'backspace' || chunk === '\x1b' || chunk === '\x7f' || chunk === '\b' || chunk?.toString() === '\x1b' || chunk?.toString() === '\x7f' || chunk?.toString() === '\b'
+
+          if (isEnter) {
+            const textToSubmit = pastedMultilineText
+            pastedMultilineText = ''
+            inputState.set('idle')
+
+            // Write to history
+            const trimmed = textToSubmit.trim()
+            try {
+              fs.mkdirSync(path.dirname(historyFile), { recursive: true })
+              fs.appendFileSync(historyFile, trimmed + '\n', 'utf8')
+            } catch (e) {}
+
+            if (pendingLineResolve) {
+              pendingLineResolve(textToSubmit)
+            }
+            return
+          }
+
+          if (isCtrlE) {
+            const textToEdit = pastedMultilineText
+            pastedMultilineText = ''
+            inputState.set('idle')
+
+            rl.pause()
+            void (async () => {
+              try {
+                const edited = await openExternalEditor(textToEdit, options.cwd)
+                rl.resume()
+
+                if (edited && edited.trim()) {
+                  const trimmedEdited = edited.trim()
+                  console.log(chalk.cyan(`\n[Editor] Loaded multi-line prompt (${trimmedEdited.split('\n').length} lines). Submitting...`))
+                  if (pendingLineResolve) {
+                    pendingLineResolve(edited)
+                  }
+                } else {
+                  if (typeof rlInt._refreshLine === 'function') {
+                    rlInt._refreshLine()
+                  } else {
+                    rl.prompt()
+                  }
+                }
+              } catch (err: any) {
+                console.error(chalk.red(`\nFailed to open editor: ${err.message || err}`))
+                rl.resume()
+                if (typeof rlInt._refreshLine === 'function') {
+                  rlInt._refreshLine()
+                } else {
+                  rl.prompt()
+                }
+              }
+            })()
+            return
+          }
+
+          if (isCancel) {
+            pastedMultilineText = ''
+            inputState.set('idle')
+            console.log(chalk.yellow('\nPaste buffer cancelled.'))
+            if (typeof rlInt._refreshLine === 'function') {
+              rlInt._refreshLine()
+            } else {
+              rl.prompt()
+            }
+            return
+          }
+
+          // Block all other keys in pasteBuffer mode
+          return
+        }
+
         // Route to slash palette only when idle (not when permission panel is open)
         if (!isExecuting && inputState.current !== 'permissionPanel' && slashPalette.handleKey(chunk, key)) {
           return
         }
-        // When an overlay is open, only allow Ctrl+C and Escape to pass through
+
+        // Handle accepting suggestion when right arrow or Ctrl+F is pressed
+        if (!isExecuting && inputState.current === 'idle') {
+          const suggestion = getAutosuggestion(rlInt.line, history)
+          if (suggestion && (key?.name === 'right' || (key?.ctrl && key?.name === 'f'))) {
+            rlInt.line = suggestion
+            ;(rlInt as any).cursor = suggestion.length
+            rlInt._refreshLine?.()
+            return
+          }
+        }
+
+        // Handle external editor mode via Ctrl+E when idle
+        const isCtrlEWhenIdle = (!isExecuting && inputState.current === 'idle' && (
+          (key?.ctrl && key?.name === 'e') || chunk === '\x05' || chunk?.toString() === '\x05' || (typeof chunk === 'string' && chunk.charCodeAt(0) === 5)
+        ))
+        if (isCtrlEWhenIdle) {
+          const currentText = rlInt.line
+          // Clear current readline visual line
+          process.stdout.write('\r\x1b[K')
+
+          rl.pause()
+          void (async () => {
+            try {
+              const edited = await openExternalEditor(currentText, options.cwd)
+              rl.resume()
+
+              if (edited && edited.trim()) {
+                const trimmedEdited = edited.trim()
+                console.log(chalk.cyan(`\n[Editor] Loaded multi-line prompt (${trimmedEdited.split('\n').length} lines). Submitting...`))
+                if (pendingLineResolve) {
+                  pendingLineResolve(edited)
+                }
+              } else {
+                // If it is empty or cancelled, go back to readline
+                if (typeof rlInt._refreshLine === 'function') {
+                  rlInt._refreshLine()
+                } else {
+                  rl.prompt()
+                }
+              }
+            } catch (err: any) {
+              console.error(chalk.red(`\nFailed to open editor: ${err.message || err}`))
+              rl.resume()
+              if (typeof rlInt._refreshLine === 'function') {
+                rlInt._refreshLine()
+              } else {
+                rl.prompt()
+              }
+            }
+          })()
+          return
+        }
+
+        // When an overlay is open, only allow Escape to pass through (Ctrl+C is handled at the top)
         if (inputState.isOverlayOpen()) {
-          if (key?.ctrl && key.name === 'c') {
-            // Let the overlay or SIGINT handler deal with it
-          } else if (key?.name === 'escape' || chunk === '\x1b' || chunk === '\u001b') {
+          if (key?.name === 'escape' || chunk === '\x1b' || chunk === '\u001b') {
             // Overlay should handle escape itself; do not process globally
             return
           } else if (!isExecuting) {
@@ -221,18 +514,6 @@ export function registerChatCommand(program: Command): void {
               } else {
                 rl.prompt()
               }
-            }
-            return
-          }
-          if (key.ctrl && key.name === 'c') {
-            if (isExecuting && activeAbortController) {
-              activeAbortController.abort()
-              console.log(chalk.yellow('\nExecution cancelled by user.'))
-            } else {
-              console.log(chalk.dim('\nExiting chat...'))
-              cleanupListeners()
-              rl.close()
-              void closeCurrentSession('CLI interrupted').finally(() => process.exit(0))
             }
             return
           }
@@ -258,6 +539,9 @@ export function registerChatCommand(program: Command): void {
         if (process.stdin.isTTY) {
           process.stdin.setRawMode(false)
         }
+        process.stdout.write('\x1b[?2004l')        // Disable bracketed paste
+        process.stdout.write('\x1b[?1006l\x1b[?1000l') // Disable mouse tracking
+        process.stdin.emit = originalEmit
       }
 
       process.stdin.on('keypress', onGlobalKeypress)
@@ -308,12 +592,15 @@ export function registerChatCommand(program: Command): void {
         console.log(chalk.cyan(`Started new session: ${sessionId}`))
       }
 
+      let pendingLineResolve: ((val: string) => void) | null = null
+
       try {
         for (;;) {
           let prompt: string
           try {
             // Readline logic wrapper to ask input with custom bbl prompt
             prompt = await new Promise<string>((resolve) => {
+              pendingLineResolve = resolve
               rl.question(getChatPrompt(), resolve)
             })
           } catch (e: any) {
@@ -321,15 +608,37 @@ export function registerChatCommand(program: Command): void {
               continue
             }
             throw e
+          } finally {
+            pendingLineResolve = null
           }
 
-          const trimmed = prompt.trim()
+          let trimmed = prompt.trim()
           if (trimmed === '/exit' || trimmed === 'exit' || trimmed === 'quit') {
             await closeCurrentSession('CLI exit')
             break
           }
           if (!trimmed) {
             continue
+          }
+
+          if (trimmed === '/editor' || trimmed === '/e') {
+            rl.pause()
+            try {
+              const edited = await openExternalEditor('', options.cwd)
+              rl.resume()
+              if (edited && edited.trim()) {
+                prompt = edited
+                trimmed = edited.trim()
+                console.log(chalk.cyan(`\n[Editor] Loaded multi-line prompt (${trimmed.split('\n').length} lines). Submitting...`))
+              } else {
+                console.log(chalk.yellow('\nEditor input was empty or cancelled.'))
+                continue
+              }
+            } catch (err: any) {
+              console.error(chalk.red(`\nFailed to open editor: ${err.message || err}`))
+              rl.resume()
+              continue
+            }
           }
 
           try {
@@ -512,9 +821,13 @@ export function registerChatCommand(program: Command): void {
             if (options.url) {
               try {
                 const client = new NexusClient({ baseUrl: options.url })
-                const stat = await client.status()
+                const stat = await client.status() as Record<string, unknown>
+                const smoke = (stat.providerSmoke ?? await client.providerSmoke()) as Record<string, unknown>
+                const { provider, providerSmoke: _providerSmoke, ...statusWithoutProvider } = stat
                 console.log(chalk.cyan('\n--- Nexus Service Status ---'))
-                console.log(JSON.stringify(stat, null, 2))
+                console.log(formatProviderDiagnostics(provider))
+                console.log(formatProviderSmoke(smoke))
+                console.log(JSON.stringify(statusWithoutProvider, null, 2))
               } catch (e: any) {
                 console.error(chalk.red(`Failed to get status from service: ${e.message || e}`))
               }
@@ -523,8 +836,34 @@ export function registerChatCommand(program: Command): void {
               console.log(`Mode: ${chalk.bold('Embedded (Local)')}`)
               console.log(`Workspace CWD: ${chalk.white(options.cwd)}`)
               const configManager = ConfigManager.getInstance()
-              const model = configManager.resolveSettings().modelId || 'local/coding-runtime'
-              console.log(`Model: ${chalk.yellow(model)}`)
+              console.log(formatProviderDiagnostics(configManager.getProviderDiagnostics()))
+              console.log(formatProviderSmoke(runProviderSmokeDryRun()))
+            }
+            continue
+          }
+
+          if (trimmed === '/smoke' || trimmed === '/smoke dry-run' || trimmed === '/provider-smoke') {
+            try {
+              const smoke = options.url
+                ? await new NexusClient({ baseUrl: options.url }).providerSmoke()
+                : runProviderSmokeDryRun()
+              console.log(chalk.cyan('\n--- Provider Smoke ---'))
+              console.log(formatProviderSmoke(smoke))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to run provider smoke dry-run: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/smoke live' || trimmed === '/provider-smoke live') {
+            try {
+              const smoke = options.url
+                ? await new NexusClient({ baseUrl: options.url }).providerLiveSmoke()
+                : await runProviderLiveSmoke()
+              console.log(chalk.cyan('\n--- Provider Live Smoke ---'))
+              console.log(formatProviderSmoke(smoke))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to run provider live smoke: ${e.message || e}`))
             }
             continue
           }
@@ -628,6 +967,31 @@ export function registerChatCommand(program: Command): void {
             continue
           }
 
+          if (trimmed === '/pager' || trimmed === '/less') {
+            try {
+              const { getSessionEvents } = await import('../renderEvents.js')
+              const { pageText } = await import('../pager.js')
+              const events = getSessionEvents()
+              const lastToolEvent = [...events].reverse().find(e => e.type === 'tool_completed' && e.output !== undefined)
+              if (lastToolEvent && lastToolEvent.type === 'tool_completed') {
+                console.log(chalk.cyan(`Paging output of tool: ${lastToolEvent.name}`))
+                await pageText(String(lastToolEvent.output))
+              } else {
+                const lastAssistant = [...events].reverse().find(e => e.type === 'assistant_delta')
+                if (lastAssistant && lastAssistant.type === 'assistant_delta') {
+                  console.log(chalk.cyan('Paging last assistant response...'))
+                  await pageText(lastAssistant.text)
+                } else {
+                  console.log(chalk.yellow('No tool output or assistant response found to page.'))
+                }
+              }
+            } catch (e: any) {
+              console.error(chalk.red(`Pager error: ${e.message || e}`))
+            }
+            continue
+          }
+
+
           const abortController = new AbortController()
           await executeSessionFlow(trimmed, abortController)
         }
@@ -636,6 +1000,46 @@ export function registerChatCommand(program: Command): void {
         rl.close()
       }
     })
+}
+
+function formatProviderDiagnostics(provider: any): string {
+  if (!provider) return chalk.dim('Provider diagnostics unavailable.')
+  const auth = provider.authConfigured ? chalk.green('configured') : chalk.red('missing')
+  const capabilities = provider.capabilities ?? {}
+  return [
+    chalk.bold('Provider'),
+    `  provider:        ${provider.providerId} (${provider.providerName})`,
+    `  adapter:         ${provider.adapter}`,
+    `  auth:            ${provider.authMode} ${auth} source=${provider.authSource}`,
+    `  baseUrl:         ${provider.baseUrl || chalk.dim('none')} source=${provider.baseUrlSource}`,
+    `  model:           ${chalk.yellow(provider.modelId)} (${provider.modelName}) source=${provider.modelSource}`,
+    `  window/output:   ${provider.contextWindow} / ${provider.defaultMaxTokens}`,
+    `  capabilities:    tools=${yesNo(capabilities.toolCalling)} json=${yesNo(capabilities.jsonOutput)} structured=${yesNo(capabilities.structuredOutput)} streaming=${yesNo(capabilities.streaming)}`,
+  ].join('\n')
+}
+
+function formatProviderSmoke(smoke: any): string {
+  if (!smoke) return chalk.dim('Provider smoke diagnostics unavailable.')
+  const checks = smoke.checks ?? {}
+  const requirements = smoke.requirements ?? {}
+  const fallbackPolicy = smoke.fallbackPolicy ?? {}
+  return [
+    chalk.bold('Provider Smoke'),
+    `  mode:            ${smoke.mode ?? 'unknown'}${smoke.smokeMode ? `/${smoke.smokeMode}` : ''}`,
+    `  ready:           ${smoke.ready ? chalk.green('yes') : chalk.red('no')}`,
+    `  requirements:    tools=${yesNo(requirements.tools)} streaming=${yesNo(requirements.streaming)} structured=${yesNo(requirements.structuredOutput)}`,
+    `  checks:          auth=${yesNo(checks.authConfigured)} model=${yesNo(checks.modelResolved)} tools=${yesNo(checks.toolsSupported)} streaming=${yesNo(checks.streamingSupported)} structured=${yesNo(checks.structuredOutputSupported)}`,
+    smoke.mode === 'live'
+      ? `  live:            ${smoke.live ? chalk.green('yes') : chalk.red('no')} success=${yesNo(smoke.success)} matched=${yesNo(smoke.matchedExpectedText)}`
+      : undefined,
+    smoke.outputPreview ? `  output:          ${String(smoke.outputPreview).slice(0, 120)}` : undefined,
+    `  fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
+    `  next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
+  ].join('\n')
+}
+
+function yesNo(value: unknown): string {
+  return value ? 'yes' : 'no'
 }
 
 function formatContextAnalysis(analysis: ContextAnalysis): string {
@@ -678,6 +1082,17 @@ function formatContextAnalysis(analysis: ContextAnalysis): string {
     lines.push(`  event counts:    ${analysis.compact.beforeEventCount} -> ${analysis.compact.afterEventCount}`)
   } else {
     lines.push(`  boundary:        ${chalk.yellow('no')}`)
+  }
+  lines.push('')
+  lines.push(chalk.bold('User Intent / Runtime Policy'))
+  lines.push(`  intent:          ${analysis.userIntentGuidance.intent} (${analysis.userIntentGuidance.source}, confidence ${analysis.userIntentGuidance.confidence})`)
+  lines.push(`  action:          ${analysis.userIntentGuidance.actionHint}, scope ${analysis.userIntentGuidance.contextScope}, requires tools ${analysis.userIntentGuidance.requiresTools ? 'yes' : 'no'}`)
+  lines.push(`  explicit paths:  ${formatList(analysis.userIntentGuidance.explicitPaths)}`)
+  lines.push(`  tools visible:   ${analysis.runtimePolicy.toolsVisible ? chalk.green('yes') : chalk.yellow('no')}${analysis.runtimePolicy.toolSuppressionReason ? chalk.dim(` (${analysis.runtimePolicy.toolSuppressionReason})`) : ''}`)
+  if (analysis.runtimePolicy.recoveryBoundaryActive) {
+    lines.push(`  recovery:        ${chalk.yellow(analysis.runtimePolicy.recoveryBoundaryCode)} at ${analysis.runtimePolicy.recoveryBoundaryTimestamp}`)
+  } else {
+    lines.push(`  recovery:        ${chalk.dim('none')}`)
   }
   lines.push('')
   lines.push(chalk.bold('Post-Compact State'))

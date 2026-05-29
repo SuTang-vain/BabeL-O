@@ -42,6 +42,10 @@ export function getTuiMode(): 'compact' | 'expanded' {
   return tuiMode
 }
 
+export function getSessionEvents(): NexusEvent[] {
+  return sessionEvents
+}
+
 export function toggleTuiMode(): void {
   tuiMode = tuiMode === 'compact' ? 'expanded' : 'compact'
   redrawSession()
@@ -155,10 +159,49 @@ export function stopSpinner(): void {
 }
 
 function drawSpinnerLine() {
-  const frame = spinnerFrames[spinnerFrameIndex]
+  const frame = spinnerFrames[spinnerFrameIndex]!
   const elapsed = spinnerStartedAt > 0 ? Math.floor((Date.now() - spinnerStartedAt) / 1000) : 0
   const elapsedText = elapsed > 0 ? ` ${elapsed}s` : ''
-  process.stdout.write(`\r\x1b[K${chalk.yellow(frame)} ${chalk.dim(spinnerStatusText)}${chalk.dim(elapsedText)}`)
+
+  const columns = process.stdout.columns || 80
+
+  // Left status text
+  const leftText = ` ${chalk.yellow(frame)} ${chalk.bold(spinnerStatusText)}${chalk.dim(elapsedText)}`
+
+  // Model info
+  const modelText = activeSessionModel ? ` ${chalk.cyan(activeSessionModel)} ` : ''
+
+  // Context usage gauge
+  let gaugeText = ''
+  if (lastContextWarning) {
+    const percent = Math.min(100, Math.max(0, Math.round(lastContextWarning.percentUsed || 0)))
+    const barWidth = 10
+    const filledCount = Math.round((percent / 100) * barWidth)
+    const emptyCount = barWidth - filledCount
+
+    let barColor = chalk.green
+    if (percent > 80) barColor = chalk.red
+    else if (percent > 60) barColor = chalk.yellow
+
+    const filledStr = barColor('█'.repeat(filledCount))
+    const emptyStr = chalk.dim('░'.repeat(emptyCount))
+
+    gaugeText = ` [${filledStr}${emptyStr}] ${percent}%`
+  } else {
+    gaugeText = ` ${chalk.green('[Context: OK]')}`
+  }
+
+  // Right section
+  const rightText = `${modelText}|${gaugeText} `
+
+  // Combine with padding
+  const leftLen = stripAnsi(leftText).length
+  const rightLen = stripAnsi(rightText).length
+  const paddingSize = Math.max(0, columns - leftLen - rightLen - 2)
+  const padding = ' '.repeat(paddingSize)
+
+  const fullLine = `\r\x1b[K${leftText}${padding}${rightText}`
+  process.stdout.write(fullLine)
 }
 
 function clearSpinnerLine() {
@@ -454,7 +497,16 @@ function formatErrorRecoveryDetails(details: unknown): string {
     typeof record.httpStatus === 'number' ? `status=${record.httpStatus}` : '',
   ].filter(Boolean)
   const suggestion = typeof record.suggestion === 'string' ? ` ${record.suggestion}` : ''
-  return chalk.yellow(`  ${parts.join(' ')}.${suggestion}\n`)
+  const fallbackPolicy = formatFallbackPolicy(record.fallbackPolicy)
+  return chalk.yellow(`  ${parts.join(' ')}.${suggestion}${fallbackPolicy}\n`)
+}
+
+function formatFallbackPolicy(value: unknown): string {
+  if (!value || typeof value !== 'object') return ''
+  const policy = value as Record<string, unknown>
+  if (typeof policy.mode !== 'string') return ''
+  const nextAction = typeof policy.nextAction === 'string' ? ` next=${policy.nextAction}` : ''
+  return ` fallback=${policy.mode} silentSwitch=false.${nextAction}`
 }
 
 interface ToolCallState {
@@ -473,8 +525,54 @@ interface ToolCallState {
 export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'expanded'): string {
   let outputText = ''
 
-  const toolsMap = new Map<string, ToolCallState>()
+  const processedEvents: NexusEvent[] = []
+  const ignorableTypes = new Set([
+    'usage',
+    'hook_started',
+    'hook_completed',
+    'user_intake_guidance',
+    'execution_metrics',
+  ])
+
   for (const ev of events) {
+    if (ev.type === 'assistant_delta') {
+      let foundIndex = -1
+      for (let j = processedEvents.length - 1; j >= 0; j--) {
+        const prev = processedEvents[j]!
+        if (prev.type === 'assistant_delta') {
+          foundIndex = j
+          break
+        }
+        if (!ignorableTypes.has(prev.type)) {
+          break
+        }
+      }
+      if (foundIndex !== -1) {
+        (processedEvents[foundIndex] as any).text += ev.text
+        continue
+      }
+    } else if (ev.type === 'thinking_delta') {
+      let foundIndex = -1
+      for (let j = processedEvents.length - 1; j >= 0; j--) {
+        const prev = processedEvents[j]!
+        if (prev.type === 'thinking_delta') {
+          foundIndex = j
+          break
+        }
+        if (!ignorableTypes.has(prev.type)) {
+          break
+        }
+      }
+      if (foundIndex !== -1) {
+        (processedEvents[foundIndex] as any).text += ev.text
+        continue
+      }
+    }
+    processedEvents.push({ ...ev })
+  }
+
+  const toolsMap = new Map<string, ToolCallState>()
+  for (const ev of processedEvents) {
     if (ev.type === 'tool_started') {
       toolsMap.set(ev.toolUseId, {
         name: ev.name,
@@ -493,7 +591,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
     }
   }
 
-  for (const ev of events) {
+  for (const ev of processedEvents) {
     switch (ev.type) {
       case 'session_started':
         outputText += `${formatAgentStatusLine(ev)}\n`
@@ -820,8 +918,20 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
 
   if (tasks.length === 0) return ''
 
-  let panel = `\n${chalk.cyan('--- Task Status Board ---')}\n`
-  for (const t of tasks) {
+  const width = Math.max(70, ...tasks.map(t => {
+    const depth = Math.max(0, t.depth)
+    const suffixLen = t.taskId ? t.taskId.length + 15 : 0
+    return t.title.length + depth * 3 + suffixLen + 20
+  }))
+
+  const boxTop = chalk.cyan('┌' + '─'.repeat(width) + '┐')
+  const boxBottom = chalk.cyan('└' + '─'.repeat(width) + '┘')
+  const titleStr = ' ❖ Task Status Board '
+  const headerPadding = '─'.repeat(Math.max(0, width - titleStr.length))
+  let panel = `\n  ${chalk.cyan(`┌${titleStr}${headerPadding}┐`)}\n`
+
+  for (let idx = 0; idx < tasks.length; idx++) {
+    const t = tasks[idx]!
     let coloredStatus = ''
     switch (t.status) {
       case 'pending':
@@ -843,7 +953,17 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
         coloredStatus = chalk.red('✗ 已取消')
         break
     }
-    const indent = '  '.repeat(Math.max(0, t.depth))
+
+    const depth = Math.max(0, t.depth)
+    let treePrefix = ''
+    if (depth > 0) {
+      for (let d = 0; d < depth - 1; d++) {
+        treePrefix += '│  '
+      }
+      const hasSibling = tasks.slice(idx + 1).some(sibling => sibling.depth === depth && sibling.parentTaskId === t.parentTaskId)
+      treePrefix += hasSibling ? '├─ ' : '└─ '
+    }
+
     const meta: string[] = []
     if (t.taskId) meta.push(`#${t.taskId}`)
     if (t.parentTaskId) meta.push(`parent #${t.parentTaskId}`)
@@ -851,8 +971,14 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
     if (t.worktree) meta.push('worktree')
     if (t.subSessionId) meta.push(`sub=${shortSessionId(t.subSessionId)}`)
     const suffix = meta.length > 0 ? chalk.dim(` (${meta.join(' · ')})`) : ''
-    panel += `  ${indent}${coloredStatus}  ${t.title}${suffix}\n`
+
+    const content = `  ${treePrefix}${coloredStatus}  ${t.title}${suffix}`
+    const visibleLength = stripAnsi(content).length
+    const padding = ' '.repeat(Math.max(0, width - visibleLength))
+    panel += `  ${chalk.cyan('│')}${content}${padding}${chalk.cyan('│')}\n`
   }
+
+  panel += `  ${boxBottom}\n`
   return panel
 }
 
