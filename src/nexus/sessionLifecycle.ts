@@ -1,8 +1,13 @@
-import { PendingPermissionRegistry, type SessionSnapshot } from '../shared/session.js'
+import { PendingPermissionRegistry, type SessionPhase, type SessionSnapshot } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { clearBashSessionState } from '../tools/builtin/bash.js'
 import { clearTaskQueue } from './taskQueue.js'
-import { clearTaskSession } from './taskSession.js'
+import {
+  cancelTaskSession,
+  clearTaskSession,
+  listTaskSessions,
+  updateTaskSession,
+} from './taskSession.js'
 import { nowIso } from '../shared/id.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
 
@@ -15,11 +20,20 @@ export type CloseNexusSessionOptions = {
 
 export async function closeNexusSession(
   options: CloseNexusSessionOptions,
-): Promise<{ session: SessionSnapshot | null; permissionsResolved: boolean }> {
+): Promise<{ session: SessionSnapshot | null; permissionsResolved: boolean; childSessionsCancelled: string[] }> {
   const session = await options.storage.getSession(options.sessionId)
+  const childSessionsCancelled = await cascadeCancelChildTaskSessions(
+    options.storage,
+    options.sessionId,
+    options.reason ?? 'Parent session closed',
+  )
   if (session) {
     session.phase = options.phase ?? session.phase
     session.updatedAt = nowIso()
+    session.metadata = {
+      ...(session.metadata ?? {}),
+      ...(childSessionsCancelled.length > 0 ? { childSessionsCancelled } : {}),
+    }
     await options.storage.saveSession(session)
   }
 
@@ -41,6 +55,7 @@ export async function closeNexusSession(
         permissionsResolved,
         phase: options.phase,
         reason: options.reason,
+        childSessionsCancelled,
       },
     },
     {
@@ -58,5 +73,55 @@ export async function closeNexusSession(
   return {
     session,
     permissionsResolved,
+    childSessionsCancelled,
+  }
+}
+
+const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled'])
+
+async function cascadeCancelChildTaskSessions(
+  storage: NexusStorage,
+  parentSessionId: string,
+  reason: string,
+): Promise<string[]> {
+  const cancelled = new Set<string>()
+  for (const child of listTaskSessions()) {
+    if (child.parentSessionId !== parentSessionId) continue
+    if (TERMINAL_PHASES.has(child.phase)) continue
+    const cancelledChild = cancelTaskSession(child.sessionId, reason, 'PARENT_SESSION_CANCELLED')
+    updateTaskSession(child.sessionId, {
+      metadata: cancelledChildMetadata(cancelledChild, parentSessionId, reason),
+    })
+    cancelled.add(child.sessionId)
+  }
+
+  for (const child of await storage.listSessions({ limit: 200 })) {
+    if (child.parentSessionId !== parentSessionId) continue
+    if (TERMINAL_PHASES.has(child.phase)) continue
+    child.phase = 'cancelled'
+    child.terminalReason = {
+      category: 'cancelled',
+      code: 'PARENT_SESSION_CANCELLED',
+      message: 'Nexus request was cancelled',
+    }
+    child.updatedAt = nowIso()
+    child.metadata = cancelledChildMetadata(child, parentSessionId, reason)
+    await storage.saveSession(child)
+    cancelled.add(child.sessionId)
+  }
+
+  return [...cancelled]
+}
+
+function cancelledChildMetadata(
+  child: SessionSnapshot,
+  parentSessionId: string,
+  reason: string,
+): Record<string, unknown> {
+  return {
+    ...(child.metadata ?? {}),
+    status: 'cancelled',
+    cancelledByParentSessionId: parentSessionId,
+    cancelReason: reason,
   }
 }

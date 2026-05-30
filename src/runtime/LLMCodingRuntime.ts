@@ -57,6 +57,10 @@ import {
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
+}
+
 export type MapEventsToMessagesOptions = {
   replayReasoningContent?: boolean
 }
@@ -87,11 +91,30 @@ export class LLMCodingRuntime implements NexusRuntime {
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
     const previousPolicy = this.toolPolicy
     this.toolPolicy = toolPolicy
+    let result: T
     try {
-      return fn()
-    } finally {
+      result = fn()
+    } catch (error) {
       this.toolPolicy = previousPolicy
+      throw error
     }
+    this.toolPolicy = previousPolicy
+    if (isAsyncIterable(result)) {
+      const iterable = result
+      const runtime = this
+      return (async function* () {
+        const activePolicy = runtime.toolPolicy
+        runtime.toolPolicy = toolPolicy
+        try {
+          for await (const item of iterable) {
+            yield item
+          }
+        } finally {
+          runtime.toolPolicy = activePolicy
+        }
+      })() as T
+    }
+    return result
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {

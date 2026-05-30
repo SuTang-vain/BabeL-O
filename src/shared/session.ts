@@ -58,6 +58,7 @@ export type SessionSnapshot = {
   terminalReason?: TaskSessionTerminalReason
   pendingInput?: TaskSessionInputRequest
   allowedPaths?: string[]
+  metadata?: Record<string, unknown>
 }
 
 export type PermissionResolution = { approved: boolean; reason?: string }

@@ -55,17 +55,17 @@ export function formatWelcomeCardLines(options: {
   url?: string
 }): string[] {
   const username = process.env.USER || process.env.USERNAME || 'User'
-  const version = '0.2.4'
+  const version = '0.2.5'
   const mode = options.url ? `Service (${options.url})` : 'Embedded (Local)'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
 
   const metadataLines = [
     ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${version}`)}`,
-    ` ${chalk.dim('User:')}      ${chalk.bold.cyan(username)}`,
-    ` ${chalk.dim('Model:')}     ${chalk.yellow(defaultModel)}`,
-    ` ${chalk.dim('Workspace:')} ${chalk.italic.white(options.cwd)}`,
-    ` ${chalk.dim('Mode:')}      ${chalk.magenta(mode)}`,
+    ` ${chalk.bold.cyan(username)}`,
+    ` ${chalk.yellow(defaultModel)}`,
+    ` ${chalk.italic.white(options.cwd)}`,
+    ` ${chalk.magenta(mode)}`,
   ]
   const contentWidths = PIXEL_ROWS.map((row, index) => {
     const logoCol = renderLogoRow(row)

@@ -71,6 +71,7 @@ export function createTaskSession(options: {
   parentSessionId?: string
   assignedAgentId?: string
   currentTaskId?: string
+  metadata?: Record<string, unknown>
 }): SessionSnapshot {
   const existing = taskSessions.get(options.sessionId)
   if (existing) {
@@ -80,6 +81,7 @@ export function createTaskSession(options: {
       parentSessionId: options.parentSessionId,
       assignedAgentId: options.assignedAgentId,
       currentTaskId: options.currentTaskId,
+      metadata: options.metadata,
     })
   }
 
@@ -96,6 +98,7 @@ export function createTaskSession(options: {
     parentSessionId: options.parentSessionId,
     assignedAgentId: options.assignedAgentId,
     currentTaskId: options.currentTaskId,
+    metadata: options.metadata,
   }
 
   taskSessions.set(options.sessionId, session)
@@ -105,6 +108,7 @@ export function createTaskSession(options: {
     parentSessionId: options.parentSessionId,
     assignedAgentId: options.assignedAgentId,
     currentTaskId: options.currentTaskId,
+    metadata: options.metadata,
   })
 
   return snapshotAndPersist(session, event)
@@ -121,6 +125,7 @@ export function updateTaskSession(
       | 'parentSessionId'
       | 'assignedAgentId'
       | 'currentTaskId'
+      | 'metadata'
     >
   >,
 ): SessionSnapshot {

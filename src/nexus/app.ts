@@ -111,6 +111,19 @@ const sessionDetailQuerySchema = z.object({
   recentEventLimit: z.coerce.number().int().min(0).max(500).default(100),
 })
 
+const sessionResumeSchema = z.object({
+  recentEventLimit: z.number().int().min(0).max(500).default(100).optional(),
+  includeTasks: z.boolean().default(true).optional(),
+  includeChildSessions: z.boolean().default(true).optional(),
+})
+
+type ActiveExecution = {
+  requestId: string
+  abortController: AbortController
+  transport: 'http' | 'websocket'
+  startedAt: string
+}
+
 export type CreateNexusAppOptions = {
   runtime: NexusRuntime
   storage: NexusStorage
@@ -139,6 +152,7 @@ export async function createNexusApp(
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
+  const activeExecutions = new Map<string, ActiveExecution>()
   await app.register(websocket)
 
   app.setErrorHandler((error: any, request, reply) => {
@@ -204,7 +218,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.4',
+    version: '0.2.5',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -213,7 +227,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.4',
+      version: '0.2.5',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),
@@ -332,6 +346,19 @@ export async function createNexusApp(
     return 'status' in r
   }
 
+  function registerActiveExecution(
+    sessionId: string,
+    execution: ActiveExecution,
+  ): void {
+    activeExecutions.set(sessionId, execution)
+  }
+
+  function clearActiveExecution(sessionId: string, requestId: string): void {
+    if (activeExecutions.get(sessionId)?.requestId === requestId) {
+      activeExecutions.delete(sessionId)
+    }
+  }
+
   function recordEventMetrics(event: NexusEvent): void {
     if (event.type !== 'execution_metrics') return
     if (event.providerFirstTokenMs !== undefined) metrics.recordProviderFirstToken(event.providerFirstTokenMs)
@@ -370,6 +397,8 @@ export async function createNexusApp(
     }
     metrics.recordExecuteStart()
     const startedAtMs = metrics.now()
+    let activeSessionId: string | undefined
+    let activeRequestId: string | undefined
     try {
       const body = executeSchema.parse(request.body)
       const prepared = await prepareExecution(body)
@@ -377,6 +406,14 @@ export async function createNexusApp(
         return reply.status(prepared.status).send({ type: 'error', code: prepared.code, message: prepared.message })
       }
       const { sessionId, cwd, requestId, abortController, timeoutController, timeout } = prepared
+      activeSessionId = sessionId
+      activeRequestId = requestId
+      registerActiveExecution(sessionId, {
+        requestId,
+        abortController,
+        transport: 'http',
+        startedAt: nowIso(),
+      })
 
       const events: NexusEvent[] = []
       try {
@@ -415,7 +452,9 @@ export async function createNexusApp(
         includeEvents: false,
       })
       if (finalSession) {
-        finalSession.phase = succeeded ? 'completed' : 'failed'
+        if (finalSession.phase !== 'cancelled') {
+          finalSession.phase = succeeded ? 'completed' : 'failed'
+        }
         finalSession.updatedAt = nowIso()
         if (resultEvent?.type === 'result') finalSession.result = resultEvent.message
         if (errorEvent?.type === 'error') finalSession.error = errorEvent.message
@@ -436,6 +475,9 @@ export async function createNexusApp(
         events,
       }
     } finally {
+      if (activeSessionId && activeRequestId) {
+        clearActiveExecution(activeSessionId, activeRequestId)
+      }
       releaseExecution()
     }
   })
@@ -627,6 +669,56 @@ export async function createNexusApp(
     }
   })
 
+  app.post('/v1/sessions/:sessionId/resume', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const body = sessionResumeSchema.parse(request.body ?? {})
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+
+    const eventPage = await options.storage.listEvents(params.sessionId, {
+      limit: body.recentEventLimit ?? 100,
+      order: 'desc',
+    })
+    const tasks = body.includeTasks === false
+      ? []
+      : await options.storage.listTasks(params.sessionId)
+    const allSessions = body.includeChildSessions === false
+      ? []
+      : await options.storage.listSessions({ limit: 200 })
+    const childSessions = allSessions
+      .filter(candidate => candidate.parentSessionId === params.sessionId)
+      .map(candidate => ({ ...candidate, events: [] }))
+    const activeExecution = activeExecutions.get(params.sessionId)
+
+    return {
+      type: 'session_resume_snapshot',
+      sessionId: params.sessionId,
+      session: {
+        ...session,
+        events: [...eventPage.events].reverse(),
+      },
+      eventsTruncated: eventPage.nextCursor !== undefined,
+      recentEventLimit: body.recentEventLimit ?? 100,
+      tasks,
+      childSessions,
+      activeExecution: activeExecution
+        ? {
+            requestId: activeExecution.requestId,
+            transport: activeExecution.transport,
+            startedAt: activeExecution.startedAt,
+          }
+        : null,
+    }
+  })
+
   app.post('/v1/sessions/:sessionId/input', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const body = sessionInputSchema.parse(request.body)
@@ -714,11 +806,16 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/cancel', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const { session } = await closeNexusSession({
+    const body = z.object({ reason: z.string().optional() }).parse(request.body ?? {})
+    const activeExecution = activeExecutions.get(params.sessionId)
+    if (activeExecution) {
+      activeExecution.abortController.abort()
+    }
+    const { session, permissionsResolved, childSessionsCancelled } = await closeNexusSession({
       storage: options.storage,
       sessionId: params.sessionId,
       phase: 'cancelled',
-      reason: 'Session cancelled',
+      reason: body.reason ?? 'Session cancelled',
     })
     if (!session) {
       return reply.code(404).send({
@@ -730,6 +827,12 @@ export async function createNexusApp(
     return {
       type: 'session_cancelled',
       sessionId: params.sessionId,
+      phase: session.phase,
+      activeExecutionCancelled: activeExecution !== undefined,
+      requestId: activeExecution?.requestId,
+      transport: activeExecution?.transport,
+      permissionsResolved,
+      childSessionsCancelled,
     }
   })
 
@@ -739,7 +842,7 @@ export async function createNexusApp(
       phase: z.enum(['cancelled', 'completed', 'failed']).optional(),
       reason: z.string().optional(),
     }).parse(request.body ?? {})
-    const { session, permissionsResolved } = await closeNexusSession({
+    const { session, permissionsResolved, childSessionsCancelled } = await closeNexusSession({
       storage: options.storage,
       sessionId: params.sessionId,
       phase: body.phase,
@@ -757,6 +860,7 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       phase: session.phase,
       permissionsResolved,
+      childSessionsCancelled,
     }
   })
 
@@ -923,6 +1027,12 @@ export async function createNexusApp(
       }
       const { sessionId, cwd, requestId } = prepared
       abortController = prepared.abortController
+      registerActiveExecution(sessionId, {
+        requestId,
+        abortController,
+        transport: 'websocket',
+        startedAt: nowIso(),
+      })
       const timeout = prepared.timeout
 
       try {
@@ -961,6 +1071,14 @@ export async function createNexusApp(
       timedOut = timedOut || abortController.signal.aborted
       } finally {
         socket.off('close', markClosed)
+        if (abortController) {
+          for (const [sessionId, execution] of activeExecutions.entries()) {
+            if (execution.abortController === abortController) {
+              clearActiveExecution(sessionId, execution.requestId)
+              break
+            }
+          }
+        }
         releaseExecution()
         metrics.recordStreamFinish({
           success,

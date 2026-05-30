@@ -16,7 +16,7 @@ import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
 import { ConfigManager } from '../src/shared/config.js'
-import type { NexusEvent } from '../src/shared/events.js'
+import { eventBase, type NexusEvent } from '../src/shared/events.js'
 
 function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -220,8 +220,15 @@ test('sqlite storage persists sessions and events across storage instances', asy
 
   const storageB = new SqliteStorage(dbPath)
   try {
+    const restoredBeforeMetadata = await storageB.getSession(sessionId)
+    assert.ok(restoredBeforeMetadata)
+    restoredBeforeMetadata.metadata = { agentType: 'subagent', transcriptPath: `nexus://sessions/${sessionId}/events` }
+    await storageB.saveSession(restoredBeforeMetadata)
+
     const restored = await storageB.getSession(sessionId)
     assert.ok(restored)
+    assert.equal(restored.metadata?.agentType, 'subagent')
+    assert.equal(restored.metadata?.transcriptPath, `nexus://sessions/${sessionId}/events`)
     assert.ok(restored.events.some(event => event.type === 'session_started'))
     const tasks = await storageB.listTasks(sessionId)
     assert.equal(tasks.length, 1)
@@ -378,6 +385,116 @@ test('session input, cancel, and task lifecycle endpoints update state', async (
     assert.equal(session?.phase, 'cancelled')
   } finally {
     await app.close()
+  }
+})
+
+test('remote cancel aborts active execution and resume returns session snapshot', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-remote-cancel`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(cwd, 'nexus.sqlite'))
+  const sessionId = `session-remote-cancel-${Date.now()}`
+  const childSessionId = `${sessionId}-sub-1`
+  let runtimeStarted!: () => void
+  const runtimeStartedPromise = new Promise<void>(resolve => {
+    runtimeStarted = resolve
+  })
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      runtimeStarted()
+      await new Promise<void>(resolve => {
+        options.signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'REQUEST_CANCELLED',
+        message: 'Execution cancelled by user.',
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message: 'Execution cancelled by user.',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    await storage.saveSession({
+      sessionId: childSessionId,
+      cwd,
+      prompt: 'child',
+      phase: 'executing',
+      parentSessionId: sessionId,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: [],
+      metadata: {
+        agentType: 'subagent',
+        status: 'running',
+        transcriptPath: `nexus://sessions/${childSessionId}/events`,
+      },
+    })
+
+    const executePromise = app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { sessionId, prompt: 'long running work', cwd },
+    })
+    await runtimeStartedPromise
+
+    const taskResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/tasks`,
+      payload: { title: 'remote task' },
+    })
+    assert.equal(taskResponse.statusCode, 200)
+
+    const activeResumeResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/resume`,
+      payload: { recentEventLimit: 10 },
+    })
+    assert.equal(activeResumeResponse.statusCode, 200)
+    assert.equal(activeResumeResponse.json().activeExecution.transport, 'http')
+    assert.equal(activeResumeResponse.json().childSessions[0].sessionId, childSessionId)
+    assert.equal(activeResumeResponse.json().tasks[0].title, 'remote task')
+
+    const cancelResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/cancel`,
+      payload: { reason: 'remote dashboard cancel' },
+    })
+    assert.equal(cancelResponse.statusCode, 200)
+    assert.equal(cancelResponse.json().activeExecutionCancelled, true)
+    assert.deepEqual(cancelResponse.json().childSessionsCancelled, [childSessionId])
+
+    const executeResponse = await executePromise
+    assert.equal(executeResponse.statusCode, 200)
+    assert.equal(executeResponse.json().success, false)
+
+    const session = await storage.getSession(sessionId, { includeEvents: true })
+    assert.equal(session?.phase, 'cancelled')
+    assert.ok(session?.events.some(event => event.type === 'error' && event.code === 'REQUEST_CANCELLED'))
+
+    const resumedResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/resume`,
+      payload: { recentEventLimit: 10 },
+    })
+    const resumed = resumedResponse.json()
+    assert.equal(resumed.activeExecution, null)
+    assert.equal(resumed.session.phase, 'cancelled')
+    assert.ok(resumed.session.events.some((event: NexusEvent) => event.type === 'error' && event.code === 'REQUEST_CANCELLED'))
+  } finally {
+    await app.close()
+    await storage.close()
   }
 })
 

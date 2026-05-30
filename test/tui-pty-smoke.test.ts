@@ -82,3 +82,31 @@ test('PTY smoke: compact read tool rendering hides raw state', { skip: !shouldRu
   assert.doesNotMatch(output, /maxBytes/)
   assert.doesNotMatch(output, /running/)
 })
+
+test('PTY smoke: input placeholder clears on typing and blank enter does not submit', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('input-placeholder')
+  assert.match(output, /什么我可以帮你的吗？/)
+  assert.doesNotMatch(output, /什么我可以帮你的吗？edit, \/ for commands/)
+  assert.equal((output.match(/✓ done/g) ?? []).length, 1)
+})
+
+test('PTY smoke: programming workflow covers read edit diff grep glob and task', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('programming-workflow')
+  assert.match(output, /Read smoke\.txt done/)
+  assert.match(output, /Edit smoke\.txt done/)
+  assert.match(output, /Diff for Edit in smoke\.txt/)
+  assert.match(output, /\+ gamma/)
+  assert.match(output, /Grep \. done/)
+  assert.match(output, /smoke\.txt:1:alpha gamma/)
+  assert.match(output, /Glob \*\*\/\*\.ts done/)
+  assert.match(output, /src\/smoke\.ts/)
+  assert.match(output, /TaskCreate done/)
+})
+
+test('PTY smoke: resume session redraws previous tool history', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('resume-session')
+  assert.match(output, /Started new session: session_/)
+  assert.match(output, /Resuming session: session_/)
+  assert.match(output, /Read smoke\.txt done/)
+  assert.match(output, /ctrl\+o to expand tool details/)
+})

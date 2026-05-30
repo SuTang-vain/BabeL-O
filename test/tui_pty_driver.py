@@ -2,6 +2,7 @@
 import argparse
 import os
 import pty
+import re
 import select
 import signal
 import subprocess
@@ -58,39 +59,29 @@ def send(fd: int, text: str) -> None:
     os.write(fd, text.encode('utf-8'))
 
 
-def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
-    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-    config_dir = os.path.join('/tmp', f'babel-o-pty-{os.getpid()}')
-    os.makedirs(config_dir, exist_ok=True)
-    config_file = os.path.join(config_dir, 'config.json')
-    with open(config_file, 'w', encoding='utf-8') as fh:
-        fh.write('{"defaultModel":"local/coding-runtime"}\n')
+def prepare_programming_workspace(config_dir: str) -> str:
+    workspace = os.path.join(config_dir, 'workspace')
+    os.makedirs(os.path.join(workspace, 'src'), exist_ok=True)
+    with open(os.path.join(workspace, 'smoke.txt'), 'w', encoding='utf-8') as fh:
+        fh.write('alpha beta\n')
+    with open(os.path.join(workspace, 'src', 'smoke.ts'), 'w', encoding='utf-8') as fh:
+        fh.write('export const token = "beta"\n')
+    try:
+        subprocess.run(['git', 'init'], cwd=workspace, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        pass
+    return workspace
 
-    env = os.environ.copy()
-    env.update({
-        'BABEL_O_CONFIG_FILE': config_file,
-        'BABEL_O_LAUNCH_CWD': repo,
-        'NO_COLOR': '1',
-        'TERM': 'xterm-256color',
-        'COLUMNS': '100',
-        'LINES': '30',
-    })
 
+def start_chat_process(command: list[str], workspace: str, env: dict[str, str]) -> tuple[int, subprocess.Popen]:
     master_fd, slave_fd = pty.openpty()
     attrs = termios.tcgetattr(slave_fd)
     attrs[3] = attrs[3] | termios.ECHO
     termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
 
-    command = [
-        os.path.join(repo, 'node_modules', '.bin', 'tsx'),
-        os.path.join(repo, 'src', 'cli', 'program.ts'),
-        'chat',
-        '--cwd',
-        repo,
-    ]
     proc = subprocess.Popen(
         command,
-        cwd=repo,
+        cwd=workspace,
         env=env,
         stdin=slave_fd,
         stdout=slave_fd,
@@ -99,6 +90,61 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         close_fds=True,
     )
     os.close(slave_fd)
+    return master_fd, proc
+
+
+def stop_chat_process(master_fd: int, proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+    try:
+        os.close(master_fd)
+    except OSError:
+        pass
+
+
+def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    config_dir = os.path.join('/tmp', f'babel-o-pty-{os.getpid()}')
+    os.makedirs(config_dir, exist_ok=True)
+    config_file = os.path.join(config_dir, 'config.json')
+    with open(config_file, 'w', encoding='utf-8') as fh:
+        fh.write('{"defaultModel":"local/coding-runtime"}\n')
+
+    workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session') else repo
+
+    env = os.environ.copy()
+    env.update({
+        'BABEL_O_CONFIG_FILE': config_file,
+        'BABEL_O_LAUNCH_CWD': workspace,
+        'HOME': config_dir,
+        'NO_COLOR': '1',
+        'TERM': 'xterm-256color',
+        'COLUMNS': '100',
+        'LINES': '30',
+    })
+
+    base_command = [
+        os.path.join(repo, 'node_modules', '.bin', 'tsx'),
+        os.path.join(repo, 'src', 'cli', 'program.ts'),
+        'chat',
+        '--cwd',
+        workspace,
+    ]
+    session_id = None
+    command = [*base_command]
+    if session_id:
+        command.extend(['--session', session_id])
+    master_fd, proc = start_chat_process(command, workspace, env)
     transcript: list[str] = []
 
     try:
@@ -185,6 +231,88 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             if 'maxBytes' in visible or 'running' in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] compact tool row leaked raw parameters/state\n'
             send(master_fd, '/exit\r')
+        elif sequence == 'input-placeholder':
+            send(master_fd, '\r')
+            time.sleep(0.1)
+            send(master_fd, '什么我可以帮你的吗？\r')
+            if not wait_for(master_fd, '什么我可以帮你的吗？', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] typed prompt did not render\n'
+            if not wait_for(master_fd, '✓ done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] typed prompt did not complete\n'
+            visible = visible_text(''.join(transcript))
+            if '什么我可以帮你的吗？edit, / for commands' in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] placeholder tail remained after typing\n'
+            if visible.count('✓ done') != 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] blank enter submitted unexpectedly\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'programming-workflow':
+            send(master_fd, 'read smoke.txt\r')
+            if not wait_for(master_fd, 'Read smoke.txt done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] read did not complete in programming workflow\n'
+
+            send(master_fd, 'edit smoke.txt beta gamma\r')
+            if not wait_for(master_fd, 'approval', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] edit permission panel did not render\n'
+            send(master_fd, '1')
+            if not wait_for(master_fd, 'Edit smoke.txt done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] edit did not complete\n'
+            send(master_fd, '\x0f')
+            if not wait_for(master_fd, 'Diff for Edit in smoke.txt', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] edit diff did not render after expand\n'
+            if not wait_for(master_fd, '+ gamma', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] edit diff added line did not render\n'
+
+            send(master_fd, 'grep gamma\r')
+            if not wait_for(master_fd, 'Grep . done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] grep did not complete\n'
+            if not wait_for(master_fd, 'smoke.txt:1:alpha gamma', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] grep output did not include edited file\n'
+            send(master_fd, 'glob **/*.ts\r')
+            if not wait_for(master_fd, 'Glob **/*.ts done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] glob did not complete\n'
+            if not wait_for(master_fd, 'src/smoke.ts', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] glob output did not include fixture file\n'
+            send(master_fd, 'task Verify smoke workflow\r')
+            if not wait_for(master_fd, 'TaskCreate done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task create did not complete\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'resume-session':
+            send(master_fd, 'read smoke.txt\r')
+            if not wait_for(master_fd, 'Read smoke.txt done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] initial read did not complete before resume\n'
+            send(master_fd, '/exit\r')
+            wait_for(master_fd, 'Exiting chat', 0.5, transcript)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                proc.wait(timeout=3)
+            transcript.append(read_available(master_fd, 0.1))
+            first_run = ''.join(transcript)
+            if proc.returncode != 0:
+                return proc.returncode, first_run
+            match = re.search(r'Started new session: (session_[A-Za-z0-9_-]+)', visible_text(first_run))
+            if not match:
+                return 1, first_run + '\n[pty-smoke] initial session id was not rendered\n'
+            resumed_session_id = match.group(1)
+            stop_chat_process(master_fd, proc)
+
+            resume_command = [*base_command, '--session', resumed_session_id]
+            master_fd, proc = start_chat_process(resume_command, workspace, env)
+            resumed: list[str] = []
+            if not wait_for(master_fd, f'Resuming session: {resumed_session_id}', timeout, resumed):
+                return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resume banner did not render\n'
+            if not wait_for(master_fd, 'Read smoke.txt done', timeout, resumed):
+                return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resumed history did not render prior read\n'
+            send(master_fd, '/exit\r')
+            wait_for(master_fd, 'Exiting chat', 0.5, resumed)
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                proc.wait(timeout=3)
+            resumed.append(read_available(master_fd, 0.1))
+            return 0 if proc.returncode == 0 else proc.returncode, first_run + ''.join(resumed)
         else:
             return 1, f'Unknown sequence: {sequence}\n'
 
@@ -197,22 +325,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         transcript.append(read_available(master_fd, 0.1))
         return 0 if proc.returncode == 0 else proc.returncode, ''.join(transcript)
     finally:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except OSError:
-                proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except OSError:
-                    proc.kill()
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
+        stop_chat_process(master_fd, proc)
 
 
 def main() -> int:

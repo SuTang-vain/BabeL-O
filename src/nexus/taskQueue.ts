@@ -422,8 +422,22 @@ function propagateFailures(queue: Map<string, NexusTask>): void {
         return dep?.status === 'failed'
       })
       if (hasFailedDep) {
+        const failedDependencies = task.dependsOn
+          .map(depId => queue.get(depId))
+          .filter((dep): dep is NexusTask => dep?.status === 'failed')
         task.status = 'failed'
-        task.result = 'Dependency failed'
+        task.result = failedDependencies
+          .map(dep => dep.result || `Dependency ${dep.taskId} failed`)
+          .join('\n') || 'Dependency failed'
+        task.metadata = {
+          ...(task.metadata ?? {}),
+          failedDependencies: failedDependencies.map(dep => ({
+            taskId: dep.taskId,
+            title: dep.title,
+            result: dep.result,
+            metadata: dep.metadata,
+          })),
+        }
         task.updatedAt = now()
         persistNexusTask(cloneTask(task))
         changed = true

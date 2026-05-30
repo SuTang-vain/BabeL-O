@@ -42,6 +42,7 @@ import { openExternalEditor } from '../editor.js'
 import { normalizeKeyEvent, terminalMouseDisableSequence } from '../keyEvent.js'
 import { consumePasteChunk, createPasteBufferState, flushPasteBuffer } from '../pasteBuffer.js'
 import { truncateToTerminalWidth } from '../terminalWidth.js'
+import { shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
 import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 
 interface ReadlineInternal extends readline.Interface {
@@ -170,6 +171,19 @@ export function registerChatCommand(program: Command): void {
               pasteState = createPasteBufferState()
               clearPasteTimeout()
               return originalEmit.apply(this, [event, ...args] as any)
+            }
+
+            if (inputState.current === 'idle' && shouldConsumeBlankInputEnter(rlInt.line ?? '', keyEvent.kind)) {
+              if (typeof rlInt._refreshLine === 'function') {
+                rlInt._refreshLine()
+              } else {
+                rl.prompt()
+              }
+              return true
+            }
+
+            if (inputState.current === 'idle' && shouldClearInputGhostBeforeWrite(rlInt.line ?? '', str)) {
+              process.stdout.write(`\r\x1b[K${getChatPrompt()}`)
             }
 
             const pasteResult = consumePasteChunk(pasteState, str)

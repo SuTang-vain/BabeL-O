@@ -25,6 +25,7 @@ import {
   taskQueueStatsForTest,
 } from '../src/nexus/taskQueue.js'
 import {
+  cancelTaskSession,
   createTaskSession,
   getTaskSession,
   pruneTaskSessions,
@@ -34,6 +35,10 @@ import {
 } from '../src/nexus/taskSession.js'
 import type { NexusTask } from '../src/shared/task.js'
 import { ConfigManager } from '../src/shared/config.js'
+import { closeNexusSession } from '../src/nexus/sessionLifecycle.js'
+import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
+import { allowAllTools } from '../src/runtime/LocalCodingRuntime.js'
+import { createDefaultToolRegistry } from '../src/tools/registry.js'
 
 test('runAgentLoop runs successfully and handles critic approval', async () => {
   resetTaskQueuesForTest()
@@ -224,6 +229,156 @@ test('runAgentLoop delegates executor subTasks and resumes parent after children
   assert.equal(executorCalls[0].orchestration.remainingDepth, 1)
   assert.equal(executorCalls[1].orchestration.currentDepth, 1)
   assert.deepEqual(executorCalls[3].orchestration.delegatedSubTaskIds, ['2', '3'])
+})
+
+test('runAgentLoop audits configured sub-agent session approval inheritance', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const sessionId = 'test-loop-subagent-approval-inheritance'
+
+  const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
+    if (roleDefinition.role === 'planner') {
+      return {
+        summary: 'Plan with one delegated task',
+        tasks: [{ title: 'Parent approval work' }],
+      }
+    }
+
+    if (roleDefinition.role === 'executor') {
+      if (input.title === 'Parent approval work' && !input.orchestration.delegatedSubTaskIds) {
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Delegated approval work',
+          needsReview: false,
+          subTasks: [{ title: 'Child approval work' }],
+        }
+      }
+      return {
+        taskId: input.taskId,
+        success: true,
+        result: `Completed ${input.title}`,
+        needsReview: false,
+      }
+    }
+
+    throw new Error('Unexpected role')
+  }
+
+  const finalSession = await runAgentLoop({
+    sessionId,
+    cwd: process.cwd(),
+    prompt: 'Delegate with configured approval inheritance',
+    stepRunner,
+    role: 'executor',
+    autoApprove: true,
+    enableSubAgents: true,
+    maxSubAgentDepth: 1,
+    subAgentApprovalInheritance: {
+      inheritSessionApprovals: true,
+      sessionApprovalAllowTools: ['Bash', 'Write', 'TaskCreate', 'NotAllowed'],
+    },
+  })
+
+  assert.equal(finalSession.phase, 'completed')
+  const inheritanceEvent = finalSession.events.find(e => e.type === 'task_session_event' && e.eventType === 'subagent_permission_inheritance') as any
+  assert.ok(inheritanceEvent)
+  assert.equal(inheritanceEvent.payload.permissionInheritance.inheritsOnceApprovals, false)
+  assert.equal(inheritanceEvent.payload.permissionInheritance.inheritsSessionApprovals, true)
+  assert.deepEqual(inheritanceEvent.payload.permissionInheritance.inheritedSessionApprovalTools, ['Bash', 'Write'])
+  assert.ok(inheritanceEvent.payload.permissionInheritance.inheritedAllowRules.includes('Bash'))
+  assert.equal(inheritanceEvent.payload.permissionInheritance.inheritedSessionApprovalTools.includes('TaskCreate'), false)
+  assert.equal(inheritanceEvent.payload.permissionInheritance.inheritedSessionApprovalTools.includes('NotAllowed'), false)
+
+  const child = listNexusTasks(sessionId).tasks.find(task => task.title === 'Child approval work')
+  const subSession = getTaskSession(`${sessionId}-sub-${child?.taskId}`)
+  assert.equal(subSession.metadata?.permissionInheritance && (subSession.metadata.permissionInheritance as any).inheritsSessionApprovals, true)
+  assert.deepEqual((subSession.metadata?.permissionInheritance as any)?.inheritedSessionApprovalTools, ['Bash', 'Write'])
+})
+
+test('runAgentLoop propagates cancelled child sub-agent failure to parent task', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const sessionId = 'test-loop-subagent-cancel-propagates'
+
+  const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
+    if (roleDefinition.role === 'planner') {
+      return {
+        summary: 'Plan with cancellable child work',
+        tasks: [{ title: 'Parent feature work' }],
+      }
+    }
+
+    if (roleDefinition.role === 'executor') {
+      if (input.title === 'Parent feature work' && !input.orchestration.delegatedSubTaskIds) {
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Delegated cancellable work',
+          needsReview: false,
+          subTasks: [{ title: 'Cancellable child work', description: 'Will be cancelled' }],
+        }
+      }
+
+      if (input.title === 'Cancellable child work') {
+        cancelTaskSession(input.sessionId, 'child cancelled by test', 'CHILD_CANCELLED_FOR_TEST')
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'This result must not overwrite cancellation',
+          needsReview: false,
+        }
+      }
+
+      return {
+        taskId: input.taskId,
+        success: true,
+        result: 'Parent should not resume after failed dependency',
+        needsReview: false,
+      }
+    }
+
+    throw new Error('Unexpected role')
+  }
+
+  const finalSession = await runAgentLoop({
+    sessionId,
+    cwd: process.cwd(),
+    prompt: 'Delegate and cancel child work',
+    stepRunner,
+    role: 'executor',
+    autoApprove: true,
+    enableSubAgents: true,
+    maxSubAgentDepth: 1,
+    maxRetriesPerTask: 1,
+  })
+
+  assert.equal(finalSession.phase, 'failed')
+  const tasks = listNexusTasks(sessionId).tasks
+  const parent = tasks.find(task => task.title === 'Parent feature work')
+  const child = tasks.find(task => task.title === 'Cancellable child work')
+  assert.equal(child?.status, 'failed')
+  assert.equal((child?.metadata?.subAgent as any)?.status, 'cancelled')
+  assert.equal((child?.metadata?.subAgent as any)?.summary, 'Nexus request was cancelled')
+  assert.equal(child?.review?.reason, 'Sub-agent session was cancelled')
+  assert.equal(parent?.status, 'failed')
+  assert.equal((parent?.metadata?.failedDependencies as any[])?.[0]?.taskId, child?.taskId)
+  assert.equal((parent?.metadata?.failedDependencies as any[])?.[0]?.metadata?.subAgent?.status, 'cancelled')
+  assert.match(parent?.result ?? '', /Nexus request was cancelled/)
+  assert.ok(finalSession.events.some(e => e.type === 'task_session_event' && e.eventType === 'subagent_cancelled'))
+
+  const subSession = getTaskSession(`${sessionId}-sub-${child?.taskId}`)
+  assert.equal(subSession.phase, 'cancelled')
+  assert.equal(subSession.terminalReason?.code, 'CHILD_CANCELLED_FOR_TEST')
+  assert.equal(subSession.metadata?.status, 'cancelled')
 })
 
 test('runAgentLoop rejects subTasks when maxSubAgentDepth is reached', async () => {
@@ -556,6 +711,214 @@ test('storageBridge replays a large pending WAL after restart', async () => {
   }
 })
 
+function createProviderMockStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+      controller.close()
+    },
+  })
+}
+
+function anthropicTextResponse(text: string): ReadableStream<Uint8Array> {
+  return createProviderMockStream([
+    'event: content_block_start\n',
+    'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\n',
+    `data: ${JSON.stringify({ index: 0, delta: { type: 'text_delta', text } })}\n\n`,
+    'event: content_block_stop\n',
+    'data: {"index":0}\n\n',
+    'event: message_stop\n',
+    'data: {"type":"message_stop"}\n\n',
+  ])
+}
+
+function anthropicToolResponse(options: {
+  id: string
+  name: string
+  input: unknown
+}): ReadableStream<Uint8Array> {
+  return createProviderMockStream([
+    'event: content_block_start\n',
+    `data: ${JSON.stringify({
+      index: 0,
+      content_block: { type: 'tool_use', id: options.id, name: options.name, input: {} },
+    })}\n\n`,
+    'event: content_block_delta\n',
+    `data: ${JSON.stringify({ index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(options.input) } })}\n\n`,
+    'event: content_block_stop\n',
+    'data: {"index":0}\n\n',
+    'event: message_delta\n',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":10}}\n\n',
+    'event: message_stop\n',
+    'data: {"type":"message_stop"}\n\n',
+  ])
+}
+
+function parseProviderRequestBody(init?: RequestInit): any {
+  if (typeof init?.body !== 'string') return undefined
+  return JSON.parse(init.body)
+}
+
+function isAgentLoopIntakeRequest(body: any): boolean {
+  return JSON.stringify(body).includes('fast intake classifier')
+}
+
+function latestProviderUserText(body: any): string {
+  const messages = Array.isArray(body?.messages) ? body.messages : []
+  const latest = messages.at(-1)
+  if (!latest) return ''
+  if (typeof latest.content === 'string') return latest.content
+  if (!Array.isArray(latest.content)) return ''
+  return latest.content
+    .map((block: any) => block?.text ?? block?.content ?? '')
+    .join('\n')
+}
+
+test('runAgentLoop non-dry-run provider smoke executes fixed runtime-backed task', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const workspace = mkdtempSync(join(tmpdir(), 'babel-o-agent-provider-smoke-'))
+  const targetFile = join(workspace, 'fixture.txt')
+  writeFileSync(targetFile, 'safe provider-backed smoke fixture\n', 'utf8')
+
+  const originalFetch = globalThis.fetch
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(workspace, 'config.json')
+  const configManager = new ConfigManager(configPath)
+  configManager.save({
+    defaultModel: 'anthropic/claude-3-5-sonnet',
+    providers: {
+      anthropic: {
+        apiKey: 'test-agent-loop-provider-key',
+        baseUrl: 'https://agent-loop-smoke.invalid',
+      },
+    },
+  })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+  const tools = createDefaultToolRegistry()
+  const runtime = new LLMCodingRuntime(tools, allowAllTools(), storage, configManager)
+  const requestBodies: any[] = []
+
+  globalThis.fetch = async (_url, init) => {
+    const body = parseProviderRequestBody(init)
+    requestBodies.push(body)
+    if (isAgentLoopIntakeRequest(body)) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          intent: 'continue',
+          confidence: 0.95,
+          continuity: 0.8,
+          contextScope: 'full',
+          actionHint: 'normal',
+          requiresTools: true,
+          reason: 'Fixed AgentLoop provider smoke should proceed.',
+          guidance: 'Proceed with the fixed smoke task.',
+          explicitPaths: [],
+        })),
+        text: async () => 'mock intake',
+      } as Response
+    }
+
+    const latestText = latestProviderUserText(body)
+    if (latestText.includes('Role:\nplanner')) {
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Glob', 'Grep', 'Read'])
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          summary: 'Fixed provider smoke plan',
+          tasks: [{
+            title: 'Read fixed provider smoke fixture',
+            description: 'Read only fixture.txt and summarize it.',
+          }],
+        })),
+        text: async () => 'mock planner',
+      } as Response
+    }
+
+    if (latestText.includes('Role:\noptimizer') && !latestText.includes('tool_result')) {
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Bash', 'Edit', 'Glob', 'Grep', 'Read', 'Write'])
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicToolResponse({
+          id: 'tool-smoke-read',
+          name: 'Read',
+          input: { path: targetFile },
+        }),
+        text: async () => 'mock optimizer tool',
+      } as Response
+    }
+
+    if (latestText.includes('safe provider-backed smoke fixture')) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          taskId: '1',
+          success: true,
+          result: 'Read fixture.txt via provider-backed AgentLoop smoke.',
+          needsReview: true,
+        })),
+        text: async () => 'mock optimizer final',
+      } as Response
+    }
+
+    if (latestText.includes('Role:\ncritic')) {
+      assert.equal(body.tools, undefined)
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          approved: true,
+          reason: 'Fixed provider smoke passed.',
+        })),
+        text: async () => 'mock critic',
+      } as Response
+    }
+
+    throw new Error(`Unexpected provider request: ${latestText.slice(0, 400)}`)
+  }
+
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-provider-backed-agent-loop-smoke',
+      cwd: workspace,
+      prompt: 'Run the fixed non-dry-run AgentLoop provider smoke.',
+      stepRunner: createRuntimeAgentStepRunner({
+        cwd: workspace,
+        model: 'anthropic/claude-3-5-sonnet',
+        runtimeFactory: async () => runtime,
+      }),
+      role: 'optimizer',
+      autoApprove: false,
+      maxRetriesPerTask: 1,
+    })
+
+    assert.equal(finalSession.phase, 'completed')
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'planner_completed'))
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'task_completed'))
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'critic_completed'))
+    assert.ok(finalSession.events.some(event => event.type === 'tool_started' && event.name === 'Read'))
+    assert.ok(finalSession.events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+    assert.equal(listNexusTasks(finalSession.sessionId).tasks[0].status, 'completed')
+    assert.equal(requestBodies.filter(isAgentLoopIntakeRequest).length, 3)
+    assert.equal(requestBodies.some(body => JSON.stringify(body).includes('arbitrary user task')), false)
+  } finally {
+    globalThis.fetch = originalFetch
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
 test('runtime agent step rejects structured roles on non-json models', async () => {
   resetTaskSessionsForTest()
   const sessionId = 'test-structured-output-gate'
@@ -700,6 +1063,43 @@ test('runtime agent step diagnostics include structured output missing required 
       return true
     },
   )
+})
+
+test('closeNexusSession cancels active child task sessions', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const parent = createTaskSession({ sessionId: 'parent-close-session', cwd: process.cwd(), prompt: 'parent' })
+  const child = createTaskSession({
+    sessionId: 'parent-close-session-sub-1',
+    cwd: process.cwd(),
+    prompt: 'child',
+    parentSessionId: parent.sessionId,
+    metadata: {
+      agentType: 'subagent',
+      status: 'running',
+      transcriptPath: 'nexus://sessions/parent-close-session-sub-1/events',
+    },
+  })
+  setTaskSessionPhase(child.sessionId, 'executing')
+  await flushStorageBridgeForTest()
+
+  const result = await closeNexusSession({
+    storage,
+    sessionId: parent.sessionId,
+    phase: 'cancelled',
+    reason: 'test parent close',
+  })
+
+  assert.deepEqual(result.childSessionsCancelled, [child.sessionId])
+  const cancelledChild = getTaskSession(child.sessionId)
+  assert.equal(cancelledChild.phase, 'cancelled')
+  assert.equal(cancelledChild.terminalReason?.code, 'PARENT_SESSION_CANCELLED')
+  assert.equal(cancelledChild.metadata?.status, 'cancelled')
+  assert.equal(cancelledChild.metadata?.cancelledByParentSessionId, parent.sessionId)
+  assert.equal(result.session?.phase, 'cancelled')
 })
 
 test('runAgentLoop runs with requiresIsolation and successfully manages Git Worktree lifecycle', async () => {
@@ -1016,8 +1416,42 @@ test('runAgentLoop runs sub-agent session with isolation and merges changes back
     assert.equal(existsSync(subAgentCwd), false)
 
     // Check events list to verify sub-agent lifecycle events were recorded
+      const startedEvent = finalSession.events.find(e => e.type === 'task_session_event' && e.eventType === 'subagent_started') as any
+    const inheritanceEvent = finalSession.events.find(e => e.type === 'task_session_event' && e.eventType === 'subagent_permission_inheritance') as any
+    const completedEvent = finalSession.events.find(e => e.type === 'task_session_event' && e.eventType === 'subagent_completed') as any
     assert.ok(finalSession.events.some(e => e.type === 'task_session_event' && e.eventType === 'sub_agent_session_started'))
     assert.ok(finalSession.events.some(e => e.type === 'task_session_event' && e.eventType === 'sub_agent_session_completed'))
+    assert.ok(startedEvent)
+    assert.ok(inheritanceEvent)
+    assert.ok(completedEvent)
+    assert.equal(startedEvent.payload.agentType, 'subagent')
+    assert.equal(startedEvent.payload.parentSessionId, sessionId)
+    assert.equal(startedEvent.payload.parentTaskId, '1')
+    assert.equal(startedEvent.payload.depth, 1)
+    assert.equal(startedEvent.payload.status, 'running')
+    assert.equal(startedEvent.payload.permissionInheritance.mode, 'role_policy')
+    assert.deepEqual(startedEvent.payload.permissionInheritance.inheritsOnceApprovals, false)
+    assert.deepEqual(startedEvent.payload.permissionInheritance.inheritsSessionApprovals, false)
+    assert.deepEqual(startedEvent.payload.permissionInheritance.inheritedSessionApprovalTools, [])
+    assert.ok(startedEvent.payload.permissionInheritance.inheritedAllowRules.includes('Write'))
+    assert.equal(inheritanceEvent.payload.agentId, startedEvent.payload.agentId)
+    assert.deepEqual(inheritanceEvent.payload.permissionInheritance, startedEvent.payload.permissionInheritance)
+    assert.match(startedEvent.payload.transcriptPath, /^nexus:\/\/sessions\/test-sub-agent-isolated-sub-2\/events$/)
+    assert.equal(completedEvent.payload.status, 'completed')
+    assert.equal(completedEvent.payload.transcriptPath, startedEvent.payload.transcriptPath)
+    assert.equal(completedEvent.payload.resultEventRange.eventCount > 0, true)
+
+    const subSession = getTaskSession('test-sub-agent-isolated-sub-2')
+    assert.equal(subSession.parentSessionId, sessionId)
+    assert.equal(subSession.assignedAgentId, startedEvent.payload.agentId)
+    assert.equal(subSession.currentTaskId, '2')
+    assert.equal(subSession.metadata?.agentType, 'subagent')
+    assert.equal(subSession.metadata?.status, 'completed')
+    assert.equal(subSession.metadata?.transcriptPath, startedEvent.payload.transcriptPath)
+
+    const parentQueueChildTask = listNexusTasks(sessionId).tasks.find(task => task.title === 'Isolated child work')
+    assert.equal((parentQueueChildTask?.metadata?.subAgent as any)?.transcriptPath, startedEvent.payload.transcriptPath)
+    assert.equal((parentQueueChildTask?.metadata?.subAgent as any)?.status, 'completed')
 
   } finally {
     if (existsSync(testRepoDir)) {

@@ -1,11 +1,12 @@
 import chalk from 'chalk'
-import { terminalWidth, visibleTerminalWidth } from './terminalWidth.js'
+import { terminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
 export interface FixedInputBoxOptions {
   prompt: string
   line: string
   cursor: number
   suggestion?: string
+  placeholder?: string
   columns?: number
 }
 
@@ -15,6 +16,7 @@ export interface FixedInputBoxRender {
   contentWidth: number
   truncated: boolean
   renderedSuggestion: boolean
+  renderedPlaceholder: boolean
 }
 
 export function renderFixedInputBox(options: FixedInputBoxOptions): FixedInputBoxRender {
@@ -27,15 +29,41 @@ export function renderFixedInputBox(options: FixedInputBoxOptions): FixedInputBo
   const canRenderSuggestion = !view.truncated &&
     suggestionTail.length > 0 &&
     terminalWidth(view.text) + terminalWidth(suggestionTail) <= contentWidth
+  const hasInputContent = options.line.length > 0
+  const canRenderPlaceholder = !hasInputContent &&
+    options.placeholder !== undefined &&
+    options.placeholder.length > 0
   const renderedSuggestion = canRenderSuggestion ? chalk.dim(suggestionTail) : ''
+  const renderedPlaceholder = canRenderPlaceholder
+    ? chalk.dim(truncateToTerminalWidth(options.placeholder!, contentWidth))
+    : ''
 
   return {
-    text: `${options.prompt}${view.text}${renderedSuggestion}`,
+    text: `${options.prompt}${view.text}${renderedSuggestion}${renderedPlaceholder}`,
     cursorColumn: promptWidth + view.cursorColumn,
     contentWidth,
     truncated: view.truncated,
     renderedSuggestion: canRenderSuggestion,
+    renderedPlaceholder: canRenderPlaceholder,
   }
+}
+
+export function shouldClearInputGhostBeforeWrite(line: string, chunk: string): boolean {
+  return line.length === 0 && isPrintableInputChunk(chunk)
+}
+
+export function shouldConsumeBlankInputEnter(line: string, keyKind: string): boolean {
+  return keyKind === 'enter' && line.trim().length === 0
+}
+
+function isPrintableInputChunk(chunk: string): boolean {
+  if (chunk.length === 0 || chunk.startsWith('\x1b')) return false
+  for (let i = 0; i < chunk.length; i++) {
+    const codePoint = chunk.codePointAt(i)!
+    if (codePoint > 0xffff) i++
+    if (codePoint < 32 || codePoint === 127) return false
+  }
+  return true
 }
 
 function createInputViewport(line: string, cursor: number, width: number): { text: string; cursorColumn: number; truncated: boolean } {

@@ -2,7 +2,7 @@ import readline from 'node:readline'
 import chalk from 'chalk'
 import { emitKeypressEvents } from 'node:readline'
 import { PendingPermissionRegistry } from '../shared/session.js'
-import { getChatPrompt } from './renderEvents.js'
+import { chatInputPlaceholder, getChatPrompt } from './renderEvents.js'
 import { inputState } from './inputState.js'
 import { normalizeKeyEvent } from './keyEvent.js'
 import {
@@ -164,14 +164,19 @@ export function setupAutosuggestions(
     const currentInput = String(this.line ?? '')
     const cursor = typeof this.cursor === 'number' ? this.cursor : currentInput.length
     const prompt = typeof this._prompt === 'string' ? this._prompt : defaultPrompt
-    const suggestion = prompt === defaultPrompt && !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
+    const isMainPrompt = prompt === defaultPrompt
+    const suggestion = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
       ? getAutosuggestion(currentInput, history)
+      : undefined
+    const placeholder = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle'
+      ? chatInputPlaceholder
       : undefined
     const rendered = renderFixedInputBox({
       prompt,
       line: currentInput,
       cursor,
       suggestion,
+      placeholder,
       columns: process.stdout.columns || 80,
     })
 

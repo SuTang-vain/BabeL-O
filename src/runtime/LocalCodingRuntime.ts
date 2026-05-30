@@ -24,6 +24,10 @@ type ParsedIntent =
   | { kind: 'tool'; toolName: string; input: unknown }
   | { kind: 'text'; text: string }
 
+function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
+  return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
+}
+
 export type ToolPolicy = {
   isAllowed(tool: AnyTool): boolean
   describe(): { mode: 'allow_all' | 'allowlist'; allowedTools?: string[] }
@@ -52,11 +56,30 @@ export class LocalCodingRuntime implements NexusRuntime {
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
     const previousPolicy = this.toolPolicy
     this.toolPolicy = toolPolicy
+    let result: T
     try {
-      return fn()
-    } finally {
+      result = fn()
+    } catch (error) {
       this.toolPolicy = previousPolicy
+      throw error
     }
+    this.toolPolicy = previousPolicy
+    if (isAsyncIterable(result)) {
+      const iterable = result
+      const runtime = this
+      return (async function* () {
+        const activePolicy = runtime.toolPolicy
+        runtime.toolPolicy = toolPolicy
+        try {
+          for await (const item of iterable) {
+            yield item
+          }
+        } finally {
+          runtime.toolPolicy = activePolicy
+        }
+      })() as T
+    }
+    return result
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {

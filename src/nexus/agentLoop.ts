@@ -24,6 +24,7 @@ import {
   failTaskSession,
   cancelTaskSession,
   getTaskSession,
+  updateTaskSession,
 } from './taskSession.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
@@ -75,10 +76,51 @@ type ExecutorAgentResult = {
   subTasks?: AgentSubTask[]
 }
 
+export type SubAgentApprovalInheritanceOptions = {
+  inheritSessionApprovals?: boolean
+  sessionApprovalAllowTools?: string[]
+}
+
+type SubAgentLifecycleMetadata = {
+  agentId: string
+  parentAgentId: string
+  parentSessionId: string
+  parentTaskId: string
+  depth: number
+  agentType: 'subagent'
+  role: 'executor' | 'optimizer'
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  transcriptPath: string
+  permissionInheritance: {
+    mode: 'role_policy'
+    inheritedAllowRules: string[]
+    inheritsOnceApprovals: false
+    inheritsSessionApprovals: boolean
+    inheritedSessionApprovalTools: string[]
+    requiresApproval: boolean
+  }
+}
+
 export type AgentStepRunner = <TInput, TOutput>(options: {
   roleDefinition: AgentRoleDefinition
   input: TInput
 }) => Promise<TOutput>
+
+function getCancelledTaskSession(sessionId: string): SessionSnapshot | null {
+  try {
+    const session = getTaskSession(sessionId)
+    return session.phase === 'cancelled' ? session : null
+  } catch {
+    return null
+  }
+}
+
+function getSubAgentStatus(metadata?: Record<string, unknown>): string | undefined {
+  const subAgent = metadata?.subAgent
+  if (typeof subAgent !== 'object' || subAgent === null) return undefined
+  if (!('status' in subAgent) || typeof subAgent.status !== 'string') return undefined
+  return subAgent.status
+}
 
 async function gitIsClean(cwd: string): Promise<boolean> {
   const { code, stdout } = await runGitCommand(cwd, ['status', '--porcelain'])
@@ -154,8 +196,12 @@ export type RunAgentLoopOptions = {
   enableSubAgents?: boolean
   maxSubAgentDepth?: number
   maxSubTasksPerTask?: number
+  subAgentApprovalInheritance?: SubAgentApprovalInheritanceOptions
   reviewPlan?: (plan: PlannerAgentResult) => Promise<PlannerReviewDecision> | PlannerReviewDecision
   parentSessionId?: string
+  assignedAgentId?: string
+  currentTaskId?: string
+  sessionMetadata?: Record<string, unknown>
   tasks?: PlannerTaskPlan[]
 }
 
@@ -171,8 +217,12 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
     enableSubAgents = false,
     maxSubAgentDepth = 1,
     maxSubTasksPerTask = 5,
+    subAgentApprovalInheritance,
     reviewPlan,
     parentSessionId,
+    assignedAgentId,
+    currentTaskId,
+    sessionMetadata,
     tasks,
   } = options
 
@@ -183,6 +233,9 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
     prompt,
     queueId: sessionId,
     parentSessionId,
+    assignedAgentId,
+    currentTaskId,
+    metadata: sessionMetadata,
   })
 
   // Prune any leftovers
@@ -282,6 +335,9 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
 
     // 2. Executing Phase
     while (!areAllNexusTasksCompleted(sessionId)) {
+      const cancelledSession = getCancelledTaskSession(sessionId)
+      if (cancelledSession) return cancelledSession
+
       if (isNexusTaskQueueSettled(sessionId)) {
         throw new Error('Task queue settled but not all tasks completed successfully.')
       }
@@ -333,6 +389,12 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
 
         if (isSubAgentTask) {
           const subSessionId = `${sessionId}-sub-${task.taskId}`
+          const subAgentMetadata = buildSubAgentLifecycleMetadata({
+            parentSessionId: sessionId,
+            task,
+            role,
+            approvalInheritance: subAgentApprovalInheritance,
+          })
           const subAgentHooks = await executeRuntimeHooks(
             'SubagentStart',
             {
@@ -349,6 +411,19 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             taskId: task.taskId,
             subSessionId,
             title: task.title,
+            ...subAgentMetadata,
+          })
+          recordTaskSessionEvent(sessionId, 'subagent_started', {
+            taskId: task.taskId,
+            subSessionId,
+            title: task.title,
+            ...subAgentMetadata,
+          })
+          recordTaskSessionEvent(sessionId, 'subagent_permission_inheritance', {
+            taskId: task.taskId,
+            subSessionId,
+            agentId: subAgentMetadata.agentId,
+            permissionInheritance: subAgentMetadata.permissionInheritance,
           })
           try {
             const subSession = await runAgentLoop({
@@ -362,7 +437,11 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               enableSubAgents,
               maxSubAgentDepth,
               maxSubTasksPerTask,
+              subAgentApprovalInheritance,
               parentSessionId: sessionId,
+              assignedAgentId: subAgentMetadata.agentId,
+              currentTaskId: task.taskId,
+              sessionMetadata: subAgentMetadata,
               tasks: [
                 {
                   title: task.title,
@@ -372,35 +451,106 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               ],
             })
 
-            if (subSession.phase === 'completed') {
+            const cancelledSubSession = getCancelledTaskSession(subSessionId)
+            if (subSession.phase === 'completed' && !cancelledSubSession) {
               executorSuccess = true
-              const resultStr = subSession.terminalReason ? String(subSession.terminalReason) : 'Completed successfully via sub-agent session'
+              const resultStr = subSession.result ?? summarizeSubAgentSession(subSession)
+              const completedMetadata = {
+                ...subAgentMetadata,
+                status: 'completed' as const,
+                resultEventRange: getTaskSessionEventRange(subSession),
+                summary: resultStr,
+              }
+              updateTaskSession(subSessionId, { metadata: completedMetadata })
               executorResult = {
                 taskId: task.taskId,
                 success: true,
                 result: resultStr,
                 needsReview: false,
+                metadata: {
+                  subAgent: toParentSubAgentReference(completedMetadata, subSessionId),
+                },
               }
               recordTaskSessionEvent(sessionId, 'sub_agent_session_completed', {
                 taskId: task.taskId,
                 subSessionId,
                 result: resultStr,
+                ...completedMetadata,
+              })
+              recordTaskSessionEvent(sessionId, 'subagent_completed', {
+                taskId: task.taskId,
+                subSessionId,
+                result: resultStr,
+                ...completedMetadata,
               })
             } else {
               executorSuccess = false
+              const endedSubSession = cancelledSubSession ?? subSession
+              const failedMetadata = {
+                ...subAgentMetadata,
+                status: endedSubSession.phase === 'cancelled' ? 'cancelled' as const : 'failed' as const,
+                resultEventRange: getTaskSessionEventRange(endedSubSession),
+                summary: summarizeSubAgentSession(endedSubSession),
+                error: endedSubSession.terminalReason || 'Sub-agent session failed to complete',
+              }
+              updateTaskSession(subSessionId, { metadata: failedMetadata })
+              executorResult = {
+                taskId: task.taskId,
+                success: false,
+                result: summarizeSubAgentSession(endedSubSession),
+                needsReview: false,
+                metadata: {
+                  subAgent: toParentSubAgentReference(failedMetadata, subSessionId),
+                },
+              }
               recordTaskSessionEvent(sessionId, 'sub_agent_session_failed', {
                 taskId: task.taskId,
                 subSessionId,
-                phase: subSession.phase,
-                error: subSession.terminalReason || 'Sub-agent session failed to complete',
+                phase: endedSubSession.phase,
+                ...failedMetadata,
+              })
+              recordTaskSessionEvent(sessionId, failedMetadata.status === 'cancelled' ? 'subagent_cancelled' : 'subagent_failed', {
+                taskId: task.taskId,
+                subSessionId,
+                phase: endedSubSession.phase,
+                ...failedMetadata,
               })
             }
           } catch (err) {
             executorSuccess = false
-            recordTaskSessionEvent(sessionId, 'sub_agent_session_error', {
+            const cancelledSubSession = getCancelledTaskSession(subSessionId)
+            const failedMetadata = {
+              ...subAgentMetadata,
+              status: cancelledSubSession ? 'cancelled' as const : 'failed' as const,
+              ...(cancelledSubSession ? { resultEventRange: getTaskSessionEventRange(cancelledSubSession) } : {}),
+              summary: cancelledSubSession ? summarizeSubAgentSession(cancelledSubSession) : String(err),
+              error: cancelledSubSession?.terminalReason ?? String(err),
+            }
+            try {
+              updateTaskSession(subSessionId, { metadata: failedMetadata })
+            } catch {
+              // The child session may fail before creation.
+            }
+            executorResult = {
+              taskId: task.taskId,
+              success: false,
+              result: cancelledSubSession ? summarizeSubAgentSession(cancelledSubSession) : String(err),
+              needsReview: false,
+              metadata: {
+                subAgent: toParentSubAgentReference(failedMetadata, subSessionId),
+              },
+            }
+            recordTaskSessionEvent(sessionId, cancelledSubSession ? 'sub_agent_session_failed' : 'sub_agent_session_error', {
               taskId: task.taskId,
               subSessionId,
-              error: String(err),
+              phase: cancelledSubSession?.phase,
+              ...failedMetadata,
+            })
+            recordTaskSessionEvent(sessionId, cancelledSubSession ? 'subagent_cancelled' : 'subagent_failed', {
+              taskId: task.taskId,
+              subSessionId,
+              phase: cancelledSubSession?.phase,
+              ...failedMetadata,
             })
           } finally {
             const subAgentStopHooks = await executeRuntimeHooks(
@@ -462,6 +612,9 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             })
           }
         }
+
+        const cancelledSessionAfterExecutor = getCancelledTaskSession(sessionId)
+        if (cancelledSessionAfterExecutor) return cancelledSessionAfterExecutor
 
         if (executorSuccess && executorResult) {
           const subTaskDecision = maybeDelegateSubTasks({
@@ -611,15 +764,23 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
           }
 
           const nextRetryCount = task.retryCount + 1
-          const status = nextRetryCount >= maxRetriesPerTask ? 'failed' : 'pending'
+          const subAgentStatus = getSubAgentStatus(executorResult?.metadata)
+          const status = subAgentStatus === 'cancelled' || nextRetryCount >= maxRetriesPerTask ? 'failed' : 'pending'
 
           const updatedTask = updateNexusTask(sessionId, task.taskId, {
             status,
             ownerAgentId: status === 'pending' ? null : task.ownerAgentId,
             retryCount: nextRetryCount,
+            result: executorResult?.result,
+            metadata: {
+              ...(task.metadata ?? {}),
+              ...(executorResult?.metadata ?? {}),
+            },
             review: {
               status: 'rejected',
-              reason: 'Executor step returned failure or crashed',
+              reason: subAgentStatus === 'cancelled'
+                ? 'Sub-agent session was cancelled'
+                : 'Executor step returned failure or crashed',
               reviewerAgentId: 'system',
             },
           })
@@ -653,6 +814,92 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
   }
 
   return getTaskSession(sessionId)
+}
+
+function buildSubAgentLifecycleMetadata(options: {
+  parentSessionId: string
+  task: NexusTask
+  role: 'executor' | 'optimizer'
+  approvalInheritance?: SubAgentApprovalInheritanceOptions
+}): SubAgentLifecycleMetadata {
+  const depth = getTaskDepth(options.task)
+  const agentId = `${options.parentSessionId}:subagent:${options.task.taskId}`
+  const inheritedAllowRules = roleAllowedTools(options.role)
+  const inheritedSessionApprovalTools = resolveInheritedSessionApprovalTools(
+    inheritedAllowRules,
+    options.approvalInheritance,
+  )
+  return {
+    agentId,
+    parentAgentId: options.parentSessionId,
+    parentSessionId: options.parentSessionId,
+    parentTaskId: String(options.task.metadata?.parentTaskId ?? options.task.taskId),
+    depth,
+    agentType: 'subagent',
+    role: options.role,
+    status: 'running',
+    transcriptPath: `nexus://sessions/${options.parentSessionId}-sub-${options.task.taskId}/events`,
+    permissionInheritance: {
+      mode: 'role_policy',
+      inheritedAllowRules,
+      inheritsOnceApprovals: false,
+      inheritsSessionApprovals: inheritedSessionApprovalTools.length > 0,
+      inheritedSessionApprovalTools,
+      requiresApproval: roleRequiresApproval(options.role),
+    },
+  }
+}
+
+function roleAllowedTools(role: 'executor' | 'optimizer'): string[] {
+  const roleDefinition = role === 'optimizer' ? OPTIMIZER_ROLE : EXECUTOR_ROLE
+  return [...roleDefinition.toolPolicy.allowedTools]
+}
+
+function resolveInheritedSessionApprovalTools(
+  inheritedAllowRules: string[],
+  approvalInheritance?: SubAgentApprovalInheritanceOptions,
+): string[] {
+  if (!approvalInheritance?.inheritSessionApprovals) return []
+  const requested = approvalInheritance.sessionApprovalAllowTools?.length
+    ? approvalInheritance.sessionApprovalAllowTools
+    : inheritedAllowRules
+  return Array.from(new Set(requested.filter(tool => inheritedAllowRules.includes(tool)))).sort()
+}
+
+function roleRequiresApproval(role: 'executor' | 'optimizer'): boolean {
+  const roleDefinition = role === 'optimizer' ? OPTIMIZER_ROLE : EXECUTOR_ROLE
+  return roleDefinition.toolPolicy.requiresApproval
+}
+
+function getTaskSessionEventRange(session: SessionSnapshot): { firstEventId?: string; lastEventId?: string; eventCount: number } {
+  const first = session.events[0]
+  const last = session.events.at(-1)
+  return {
+    firstEventId: first && 'eventId' in first ? first.eventId : undefined,
+    lastEventId: last && 'eventId' in last ? last.eventId : undefined,
+    eventCount: session.events.length,
+  }
+}
+
+function summarizeSubAgentSession(session: SessionSnapshot): string {
+  if (session.result) return session.result
+  if (session.terminalReason?.message) return session.terminalReason.message
+  return session.phase === 'completed'
+    ? 'Completed successfully via sub-agent session'
+    : `Sub-agent session ended with phase ${session.phase}`
+}
+
+function toParentSubAgentReference(metadata: SubAgentLifecycleMetadata & Record<string, unknown>, subSessionId: string): Record<string, unknown> {
+  return {
+    agentId: metadata.agentId,
+    subSessionId,
+    parentTaskId: metadata.parentTaskId,
+    depth: metadata.depth,
+    status: metadata.status,
+    transcriptPath: metadata.transcriptPath,
+    resultEventRange: metadata.resultEventRange,
+    summary: metadata.summary,
+  }
 }
 
 function buildTaskOrchestrationContext(

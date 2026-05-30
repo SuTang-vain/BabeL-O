@@ -37,12 +37,12 @@ export class SqliteStorage implements NexusStorage {
           session_id, cwd, prompt, phase, created_at, updated_at, result,
           error, last_user_input,
           queue_id, parent_session_id, assigned_agent_id, current_task_id,
-          failure_reason, terminal_reason, pending_input
+          failure_reason, terminal_reason, pending_input, metadata
         ) VALUES (
           :sessionId, :cwd, :prompt, :phase, :createdAt, :updatedAt, :result,
           :error, :lastUserInput,
           :queueId, :parentSessionId, :assignedAgentId, :currentTaskId,
-          :failureReason, :terminalReason, :pendingInput
+          :failureReason, :terminalReason, :pendingInput, :metadata
         )
         ON CONFLICT(session_id) DO UPDATE SET
           cwd = excluded.cwd,
@@ -58,7 +58,8 @@ export class SqliteStorage implements NexusStorage {
           current_task_id = excluded.current_task_id,
           failure_reason = excluded.failure_reason,
           terminal_reason = excluded.terminal_reason,
-          pending_input = excluded.pending_input`,
+          pending_input = excluded.pending_input,
+          metadata = excluded.metadata`,
       )
       .run(sessionParams(session))
 
@@ -451,7 +452,8 @@ export class SqliteStorage implements NexusStorage {
           current_task_id TEXT,
           failure_reason TEXT,
           terminal_reason TEXT,
-          pending_input TEXT
+          pending_input TEXT,
+          metadata TEXT
         );
 
         CREATE INDEX IF NOT EXISTS sessions_updated_at_idx
@@ -518,7 +520,8 @@ export class SqliteStorage implements NexusStorage {
         { name: 'current_task_id', type: 'TEXT' },
         { name: 'failure_reason', type: 'TEXT' },
         { name: 'terminal_reason', type: 'TEXT' },
-        { name: 'pending_input', type: 'TEXT' }
+        { name: 'pending_input', type: 'TEXT' },
+        { name: 'metadata', type: 'TEXT' }
       ]
       for (const col of expectedSessions) {
         if (!sessionsColumns.includes(col.name)) {
@@ -600,6 +603,14 @@ export class SqliteStorage implements NexusStorage {
       `)
       this.db.exec('PRAGMA user_version = 4;')
       version = 4
+    }
+
+    if (version < 5) {
+      const sessionsColumns = (this.db.prepare(`PRAGMA table_info(sessions)`).all() as Row[]).map(r => String(r.name))
+      if (!sessionsColumns.includes('metadata')) {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN metadata TEXT`)
+      }
+      this.db.exec('PRAGMA user_version = 5;')
     }
   }
 
@@ -697,6 +708,7 @@ function sessionParams(session: SessionSnapshot): Record<string, string | null> 
     failureReason: session.failureReason ?? null,
     terminalReason: session.terminalReason ? JSON.stringify(session.terminalReason) : null,
     pendingInput: session.pendingInput ? JSON.stringify(session.pendingInput) : null,
+    metadata: session.metadata ? JSON.stringify(session.metadata) : null,
   }
 }
 
@@ -740,6 +752,7 @@ function rowToSession(row: Row, events: NexusEvent[]): SessionSnapshot {
     failureReason: nullableString(row.failure_reason),
     terminalReason: row.terminal_reason ? JSON.parse(String(row.terminal_reason)) : undefined,
     pendingInput: row.pending_input ? JSON.parse(String(row.pending_input)) : undefined,
+    metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
   }
 }
 

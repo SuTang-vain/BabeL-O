@@ -6,7 +6,7 @@ import { createPermissionPanelState, reducePermissionPanelKey } from '../src/cli
 import { helpCategories } from '../src/cli/helpPanel.js'
 import { visibleTerminalWidth, truncateToTerminalWidth } from '../src/cli/terminalWidth.js'
 import { formatWelcomeCardLines } from '../src/cli/welcome.js'
-import { renderFixedInputBox } from '../src/cli/inputBox.js'
+import { renderFixedInputBox, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
 import { inputState, type InputMode } from '../src/cli/inputState.js'
 import { defaultPermissionChoices, permissionDecisionFromChoice, setupAutosuggestions } from '../src/cli/ui.js'
 
@@ -187,6 +187,62 @@ test('fixed input box only renders autosuggestion when it fits', () => {
   assert.ok(visibleTerminalWidth(long.text) <= 30)
 })
 
+test('fixed input box renders an empty-state placeholder without moving the cursor', () => {
+  const rendered = renderFixedInputBox({
+    prompt: '> ',
+    line: '',
+    cursor: 0,
+    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    columns: 28,
+  })
+
+  assert.equal(rendered.renderedPlaceholder, true)
+  assert.equal(rendered.cursorColumn, 2)
+  assert.ok(rendered.text.includes('Type a message'))
+  assert.ok(visibleTerminalWidth(rendered.text) <= 28)
+})
+
+test('fixed input box hides the placeholder as soon as input has content', () => {
+  const rendered = renderFixedInputBox({
+    prompt: '> ',
+    line: 'r',
+    cursor: 1,
+    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    columns: 40,
+  })
+
+  assert.equal(rendered.renderedPlaceholder, false)
+  assert.equal(rendered.text.includes('Type a message'), false)
+  assert.equal(rendered.text.includes('> r'), true)
+})
+
+test('fixed input box treats whitespace as content for placeholder rendering', () => {
+  const rendered = renderFixedInputBox({
+    prompt: '> ',
+    line: ' ',
+    cursor: 1,
+    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    columns: 40,
+  })
+
+  assert.equal(rendered.renderedPlaceholder, false)
+  assert.equal(rendered.cursorColumn, 3)
+  assert.equal(rendered.text.includes('Type a message'), false)
+})
+
+test('input ghost helpers clear placeholder before printable input and consume blank enter', () => {
+  assert.equal(shouldClearInputGhostBeforeWrite('', '你'), true)
+  assert.equal(shouldClearInputGhostBeforeWrite('', 'r'), true)
+  assert.equal(shouldClearInputGhostBeforeWrite('r', 'e'), false)
+  assert.equal(shouldClearInputGhostBeforeWrite('', '\x1b[A'), false)
+  assert.equal(shouldClearInputGhostBeforeWrite('', '\r'), false)
+
+  assert.equal(shouldConsumeBlankInputEnter('', 'enter'), true)
+  assert.equal(shouldConsumeBlankInputEnter('   ', 'enter'), true)
+  assert.equal(shouldConsumeBlankInputEnter('read', 'enter'), false)
+  assert.equal(shouldConsumeBlankInputEnter('', 'tab'), false)
+})
+
 test('input state keeps readline as the only text owner while overlays are open', () => {
   const overlayModes: InputMode[] = [
     'slashPalette',
@@ -239,4 +295,5 @@ test('autosuggestion refresh preserves secondary readline prompts', () => {
   const output = writes.join('')
   assert.ok(output.includes('Enter allow rule prefix (default: node:*): node:*'))
   assert.ok(!output.includes('BabeL-O'))
+  assert.ok(!output.includes('Type a message'))
 })

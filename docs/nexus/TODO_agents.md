@@ -84,12 +84,14 @@
 - [x] 解决嵌套隔离 Worktree 合并及 cherry-pick 范围回传，实现冲突文件精确提取与错误诊断，完成子代理嵌套隔离测试。
 - [x] 非隔离 in-place optimizer 的 Git 操作继续加固：避免 `git add .` 纳入无关未跟踪文件，避免 `git reset --hard` / `git clean -fd` 删除用户手动创建但未纳入本次任务的文件。
 - [x] 参考 BabeL-X `AgentTool.tsx` / `runAgent.ts` 的生命周期治理，为 BabeL-O 子 Agent 定义正式 `agentId`、`parentAgentId`、`parentTaskId`、`depth`、`agentType`、`status`、`transcriptPath` 元数据。
-- [x] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、queueId、taskId、depth、cwd/worktreeCwd、role、allowedTools、permissionMode。
-- [x] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、修改文件、commit hash、失败类型、retry 建议。
-- [x] 为跨 session 子 Agent 保存独立 transcript：父 session 只保存摘要和 transcript 引用，避免父上下文被子任务完整工具链撑爆。
-- [x] 子 Agent resume：给 parent session 提供可查询子 transcript 路径和最近状态，允许后续命令恢复或查看子 Agent 详细日志。
-- [x] 子 Agent cancel：父 session 取消时级联取消未完成子 session；单个子 session 取消时父任务应收到结构化失败结果并可重排/收口。
-- [x] 子 Agent permission inheritance：默认继承父 session 的 deny-by-default 和 CLI arg allow rules，但不继承临时 once approval；session-scope approval 是否继承必须可配置并写入 audit。
+- [x] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、taskId、depth、role、transcriptPath 与 permission inheritance 策略；兼容保留旧 `sub_agent_session_started` 给 CLI 渲染。
+- [x] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、transcriptPath、失败类型；兼容保留旧 `sub_agent_session_completed/failed/error`。
+- [x] 为跨 session 子 Agent 保存独立 transcript 引用：子 session 带正式 metadata，父队列任务只保存 `subAgent` 摘要和 `nexus://sessions/<subSessionId>/events` 引用，避免父上下文依赖完整子工具链。
+- [x] 子 Agent resume 第一版：parent session 的 task metadata 与 child session metadata 提供可查询 transcriptPath 和最近 status，允许后续命令恢复或查看子 Agent 详细日志。
+- [x] 子 Agent cancel 第一版：父 session close/cancel 时级联取消未完成 child TaskSession，并把取消来源写入 child metadata 与 close 响应。
+- [x] 单个子 Agent cancel 结构化失败传播：child TaskSession 被外部取消后不会被后续 executor result 覆盖为 completed；父队列 child task 保存 `subAgent.status=cancelled` 摘要，blocked parent task 通过 failed dependency metadata 收到结构化失败并终态 failed。
+- [x] 子 Agent permission inheritance smoke：记录 role policy allow rules、requiresApproval，新增 `subagent_permission_inheritance` 审计事件；默认不继承 once approval / session approval。
+- [x] 子 Agent session-scope approval 可配置继承 audit：`subAgentApprovalInheritance.inheritSessionApprovals` 显式开启时，只继承 role allowedTools 允许的 session approval 工具名并写入 child metadata / `subagent_permission_inheritance`，once approval 仍固定不继承。
 - [x] 子 Agent MCP inheritance：默认只继承父 runtime 已显式 allowlisted 的 MCP tools；agent-specific MCP server 延后，避免前置引入插件级复杂度。
 - [x] 子 Agent skill/context inheritance：继承当前匹配 inline skills 和 explicit path anchors；只读 Explore/Plan 类任务可裁剪 gitStatus/大体积 project memory。
 - [x] 子 Agent worktree notice：当子 Agent 在隔离 worktree 内运行时，在 system/additional context 中注入 parent cwd、worktree cwd、路径转换规则、变更隔离说明。
@@ -98,9 +100,10 @@
 - [x] 成本控制：提供 `--no-critic`、`--subagent-model`、`--subagent-max-turns` 或 role 配置，避免简单任务触发过多模型往返。
 - [x] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
 - [x] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
+- [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 通过 mock Anthropic SSE 覆盖 Planner → Optimizer → 真实 Read 工具 → Optimizer final → Critic，不访问真实网络、不执行任意用户任务，并验证 role tool policy。
 - [ ] 定义外部 SDK task API。
 - [ ] 定义 dashboard session/task query API。
-- [ ] 支持远程取消和恢复.
+- [x] 支持远程取消和恢复：`POST /v1/sessions/:sessionId/cancel` 可中止 active HTTP/WebSocket execution 并级联取消 child sessions；`POST /v1/sessions/:sessionId/resume` 返回 session snapshot、recent events、tasks、child sessions 与 active execution metadata。
 - [ ] 将 tool trace、critic reason、usage 变成可查询 data assets.
 
 ## 验证命令
@@ -113,14 +116,16 @@
 - [x] subTasks 层级渲染测试已纳入 `test/tui-renderer.test.ts`。
 - [x] worktree 生命周期与冲突提取测试已纳入 `test/worktree.test.ts`，AgentLoop 隔离执行以及子代理嵌套隔离合并测试已纳入 `test/agent-loop.test.ts`。
 - [x] in-place optimizer Git hardening 测试已纳入 `test/agent-loop.test.ts`，worktree pathspec staging 测试已纳入 `test/worktree.test.ts`。
-- [ ] 非 dry-run 的真实 provider AgentLoop smoke。
+- [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 覆盖真实 `LLMCodingRuntime` + Anthropic adapter + `createRuntimeAgentStepRunner()` + `runAgentLoop()` 路径，使用固定 mock SSE 与固定 fixture，不访问真实 provider、不执行任意用户任务。
+- [ ] 非 dry-run 的真实 provider live/manual AgentLoop smoke。
   - 2026-05-24 已用临时 Git 仓库执行真实 `bbl optimize --enable-subagents` 非 dry-run smoke：Planner/工具调用/rollback 链路运行，但 executor 多轮失败后 TaskQueue settled，临时仓库保持干净。下一步需诊断 executor 失败细节展示与真实 provider 输出稳定性后再标完成。
   - 2026-05-24 复跑诊断后确认：Planner 空 JSON 已可 fallback；当前主要失败类型为 Optimizer/Executor structured output 缺字段，以及 provider 空响应。下一步需做 role structured-output repair/retry 或 role model routing，再继续标完成。
   - 2026-05-24 AgentLoop/CLI 已能展示 structured-output 失败类型、缺失必填字段、候选来源和输出预览；下一步复跑 smoke 时应优先根据 `structured=schema_mismatch` / `structured=no_structured_json` / `EMPTY_PROVIDER_RESPONSE` 分流到 repair/retry 或 role model routing。
-- [ ] 子 Agent lifecycle 单元测试：started/completed/failed/cancelled 事件、depth、parentTaskId、transcriptPath、permission inheritance。
-- [ ] 子 Agent transcript 压缩测试：父 session 只注入子任务摘要，不把完整子工具链放入 recent context。
-- [ ] 子 Agent cancel/resume smoke：父任务 blocked 时取消子 Agent，确认父任务能恢复为 failed/requeued 或终态 cancelled。
-- [ ] 子 Agent worktree notice smoke：子 Agent 在 worktree 中正确读取目标文件、提交修改并回传父工作区。
+- [x] 子 Agent lifecycle 单元测试：`test/agent-loop.test.ts` 覆盖 `subagent_started` / `subagent_completed`、depth、parentTaskId、transcriptPath、permission inheritance 与 child session metadata。
+- [x] 子 Agent transcript 引用测试：父队列任务只保存 `subAgent` 摘要和 transcriptPath，完整事件留在 child session。
+- [x] 子 Agent cancel/resume smoke：父 session close/cancel 会级联取消 active child TaskSession 与持久化 child session，child metadata 记录 cancelledByParentSessionId/cancelReason，close/cancel response 返回 childSessionsCancelled；单个 child cancel 会写入 subAgent 取消摘要并通过 failed dependency metadata 传播到 blocked parent task。
+- [x] 远程 cancel/resume API smoke：`test/runtime.test.ts` 覆盖 active `/v1/execute` 被 `/v1/sessions/:sessionId/cancel` 远程中止、cancelled phase 被保留、持久化 child session 被级联取消，以及 `/resume` 返回 active execution / terminal snapshot。
+- [x] 子 Agent worktree notice smoke：子 Agent 在 worktree 中正确读取目标文件、提交修改并回传父工作区，已由隔离子代理合并测试覆盖。
 
 ## 参考文件
 

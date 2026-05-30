@@ -2,6 +2,144 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-30 — P1 非 dry-run provider-backed AgentLoop smoke
+
+- **用户决策**: 继续按建议推进 P1，在远程 cancel/resume 之后补非 dry-run provider AgentLoop smoke；真实 provider/live 仍保持为后续手动验证项，本次先落地可重复、无网络、无任意用户任务执行的 deterministic coverage。
+- **处理**:
+  - `test/agent-loop.test.ts` 新增 provider-backed 非 dry-run smoke：通过 mock Anthropic-compatible SSE 驱动真实 `LLMCodingRuntime`、Anthropic adapter、`createRuntimeAgentStepRunner()` 与 `runAgentLoop()` 路径，覆盖 Planner → Optimizer → 真实 `Read` 工具 → Optimizer final → Critic。
+  - smoke 使用固定临时 workspace、固定 `fixture.txt`、固定 prompt、固定 mock provider response，并固定 runner model 为 `anthropic/claude-3-5-sonnet`，避免本机 `BABEL_O_MODEL` 或 provider/profile 配置污染。
+  - smoke 验证 role tool policy：Planner 只看到 `Glob/Grep/Read`，Optimizer 看到 `Bash/Edit/Glob/Grep/Read/Write`，Critic 不看到 tools；同时断言 provider request 不含 arbitrary user task 文案。
+  - `LLMCodingRuntime.withToolPolicy()` 与 `LocalCodingRuntime.withToolPolicy()` 修复 async iterable policy 作用域：对 `executeStream()` 这类延迟消费的 stream，在 `for await` 期间保持 role policy 生效，避免创建 stream 后过早恢复默认 policy。
+  - `docs/nexus/TODO.md` 与 `docs/nexus/TODO_agents.md` 更新状态：deterministic provider-backed smoke 已完成，真实 provider live/manual AgentLoop smoke 仍单独保留为未完成项。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/agent-loop.test.ts` 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 远程 cancel/resume API
+
+- **用户决策**: 继续按建议推进 P1，在子 Agent lifecycle / cancel / permission audit 之后补远程 cancel/resume API，供 SDK/dashboard 侧可靠观察和中止运行中的 Nexus session。
+- **处理**:
+  - `src/nexus/app.ts` 增加 active execution registry，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 运行时登记 `requestId`、transport、startedAt 和 `AbortController`，结束时按 requestId 清理。
+  - `POST /v1/sessions/:sessionId/cancel` 会中止 active HTTP/WebSocket execution，复用 `closeNexusSession()` 设置 cancelled phase、解析 pending permissions，并返回 activeExecutionCancelled、requestId、transport、permissionsResolved 和 childSessionsCancelled。
+  - `POST /v1/sessions/:sessionId/resume` 返回 session snapshot、recent events、tasks、child sessions 和 active execution metadata；该接口是恢复/观察快照，不会重启执行。
+  - HTTP execute 终态保存时保留已被远程 cancel 标记的 `cancelled` phase，避免执行流返回失败 result 后把 session 覆盖为 failed。
+  - `closeNexusSession()` 的 child cascade 从仅扫描 in-memory TaskSession 扩展到同时扫描持久化 sessions，确保直接存在 storage 中的 child sessions 也会随父 session cancel 被标记为 cancelled。
+  - `test/runtime.test.ts` 新增远程 cancel/resume 回归：覆盖 active execute resume snapshot、远程 cancel abort、持久化 child session 级联取消、最终 cancelled phase 保留，以及 terminal resume 中 `REQUEST_CANCELLED` event 可见。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：46/46 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：20/20 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 TUI 输入框视觉 polish 与 placeholder PTY smoke
+
+- **用户决策**: 继续推进输入框视觉 polish，并同步 TODO 与工作记录文档。
+- **处理**:
+  - `src/cli/renderEvents.ts` 将主输入 prompt 收敛为紧凑 `chat` 标签，并把空输入提示改为 `Type a message · / commands · Ctrl+E editor`。
+  - `src/cli/inputBox.ts` 保持单行 fixed viewport，新增 placeholder/ghost 行为 helper；placeholder 只在输入内容真正为空时显示，普通字符、中文、空格输入都会清除提示。
+  - `src/cli/commands/chat.ts` 在 stdin data 截获层处理输入框 ghost：空白 Enter 只重绘当前行不提交空 turn；首字符输入前清除 hint 并重绘完整 prompt，避免提示残留或 prompt 被整行擦掉。
+  - `test/tui_pty_driver.py` / `test/tui-pty-smoke.test.ts` 新增 `input-placeholder` 真实 PTY 序列，覆盖空白 Enter、中文首字符输入、ghost hint 清除和 prompt 保留。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/tui-input.test.ts test/completer.test.ts`：334/334 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：11/11 通过。
+
+## 2026-05-30 — P1 子 Agent session-scope approval 可配置继承 audit
+
+- **用户决策**: 继续按建议推进 P1，在子 Agent cancel/resume 后补 session-scope approval 继承策略的可配置审计。
+- **处理**:
+  - `runAgentLoop()` 新增 `subAgentApprovalInheritance` 选项，默认不继承 once approval / session approval，保持安全默认。
+  - `buildSubAgentLifecycleMetadata()` 根据显式配置计算 `inheritedSessionApprovalTools`；即使开启 session approval 继承，也只保留当前子 Agent role policy `allowedTools` 中允许的工具名，过滤掉越权工具。
+  - `subagent_permission_inheritance` 审计事件和 child session metadata 均记录 `inheritsOnceApprovals=false`、`inheritsSessionApprovals` 和过滤后的 `inheritedSessionApprovalTools`。
+  - `test/agent-loop.test.ts` 新增显式开启 session approval 继承的 smoke，验证 `NotAllowed` 与当前 role 不允许的 `TaskCreate` 不会进入继承列表；既有 lifecycle 测试补断言默认 inheritedSessionApprovalTools 为空。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：20/20 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 单个子 Agent cancel 结构化失败传播
+
+- **用户决策**: 继续按建议推进 P1，在父 session close 级联取消之后补单个 child session cancel 后的父任务恢复/收口 smoke。
+- **处理**:
+  - `runAgentLoop()` 在执行循环和 executor 返回后检查当前 TaskSession 是否已被外部取消，避免取消中的 child session 被后续 executor success 覆盖成 completed。
+  - 子 Agent 返回 cancelled/failed 时生成结构化 `executorResult`，把 `subAgent.status`、`summary`、`resultEventRange` 和 transcriptPath 写入父队列 child task metadata。
+  - child sub-agent cancel 默认不重试，child task 终态 failed，review reason 为 `Sub-agent session was cancelled`。
+  - `TaskQueue` 的 dependency failure propagation 不再只写 `Dependency failed`，而是把 failed dependency 的 result/metadata 汇总进 blocked parent task 的 `failedDependencies` metadata，父任务可从队列层直接看到 child cancel 摘要。
+  - `test/agent-loop.test.ts` 新增单个 child TaskSession 在 executor 中被取消的 smoke，验证 child session 保持 cancelled、child task failed、parent task failed、`subagent_cancelled` 事件和 failed dependency metadata。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：19/19 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 TUI resume session PTY smoke 与 task update 入口核对
+
+- **用户决策**: 继续根据 TUI 优先级建议推进，补齐剩余编程闭环里最稳的 resume session smoke，并核对 task update/status 是否已有可测入口。
+- **处理**:
+  - `test/tui_pty_driver.py` 新增 `resume-session` 序列：第一次真实启动 `bbl chat`，执行 `read smoke.txt` 后退出，再从首轮 transcript 解析实际 `session_<id>` 并用 `--session` 恢复。
+  - resume 序列验证恢复 banner、历史 `Read smoke.txt done` 工具记录和 compact 展开提示重绘，覆盖 embedded SQLite session history 在真实 PTY 下的恢复路径。
+  - PTY driver 抽出 `start_chat_process()` / `stop_chat_process()`，确保 resume 序列可在同一隔离 config/HOME/workspace 内安全重启 chat 进程。
+  - 核对 task update/status：Nexus service 已有 `PATCH /v1/sessions/:sessionId/tasks/:taskId` 与 `task_updated` event 渲染路径，但 local `bbl chat` 的 `LocalCodingRuntime` 当前只暴露 `task <title>` -> `TaskCreate`，因此 task update/status 不能直接由 local PTY smoke 覆盖。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：10/10 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/tui-renderer.test.ts test/tui-input.test.ts test/completer.test.ts`：328/328 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
+## 2026-05-30 — P1 TUI 编程工作流 PTY smoke
+
+- **用户决策**: 继续根据 TUI 优先级建议推进，先补真实编程工作流闭环 smoke，再进入视觉 smoke 与 MCP display。
+- **处理**:
+  - `test/tui_pty_driver.py` 新增 `programming-workflow` 序列：在 `/tmp/babel-o-pty-<pid>/workspace` 初始化临时 git repo 和 fixture 文件，避免修改真实仓库。
+  - 该序列通过真实 PTY 驱动 `bbl chat` 依次执行 `read smoke.txt`、`edit smoke.txt beta gamma`、Ctrl+O 展开 diff、`grep gamma`、`glob **/*.ts`、`task Verify smoke workflow`。
+  - PTY driver 现在把 `HOME` 指向临时 config 目录，使 chat history 与 SQLite session DB 也隔离在 smoke 临时目录中。
+  - `test/tui-pty-smoke.test.ts` 新增对应 Node wrapper 断言，覆盖 Read/Edit/Grep/Glob/TaskCreate 完成行、Edit diff `+ gamma`、Grep 输出 `smoke.txt:1:alpha gamma` 和 Glob 输出 `src/smoke.ts`。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：9/9 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/tui-renderer.test.ts test/tui-input.test.ts test/completer.test.ts`：328/328 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
+## 2026-05-30 — P1 子 Agent cancel/resume smoke 与 permission inheritance audit
+
+- **用户决策**: 继续按建议推进 P1，在子 Agent lifecycle metadata 后补 cancel/resume smoke 与 permission inheritance 审计记录。
+- **处理**:
+  - `closeNexusSession()` 增加 active child TaskSession 级联取消：父 session close/cancel 时取消非终态 child session，并把 `childSessionsCancelled` 写入父 session metadata、SessionEnd hook cleanup payload 与 close API response。
+  - child session 取消时写入 `PARENT_SESSION_CANCELLED` terminal reason，并在 child metadata 中记录 `status=cancelled`、`cancelledByParentSessionId` 和 `cancelReason`。
+  - `runAgentLoop()` 在子 Agent 启动时新增 `subagent_permission_inheritance` 审计事件，显式记录 role policy allow rules、`requiresApproval`，以及不继承 once/session approvals。
+  - `test/agent-loop.test.ts` 补齐父 session close 级联取消 active child TaskSession 的 smoke，并扩展子 Agent lifecycle 测试覆盖 permission inheritance 审计事件、child metadata 和父队列 `subAgent` transcript 引用。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：18/18 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 子 Agent lifecycle metadata / transcript / permission inheritance
+
+- **用户决策**: 根据建议推进 P1，优先收口子 Agent lifecycle、transcript 引用和 permission inheritance 可审计性。
+- **处理**:
+  - `SessionSnapshot` 新增通用 `metadata`，`TaskSession` 与 SQLite storage 持久化该字段，并补 SQLite v5 metadata 迁移。
+  - `runAgentLoop()` 为子 Agent session 注入正式 metadata：`agentId`、`parentAgentId`、`parentSessionId`、`parentTaskId`、`depth`、`agentType=subagent`、`status`、`transcriptPath` 与 permission inheritance 策略。
+  - 父 session 兼容保留 `sub_agent_session_*` 事件，同时新增规范化 `subagent_started`、`subagent_completed`、`subagent_failed`、`subagent_cancelled` 事件；父队列任务只保存 `subAgent` 摘要引用和 `nexus://sessions/<subSessionId>/events` transcriptPath。
+  - permission inheritance 第一版记录 role policy allow rules、`requiresApproval`，并明确不继承 once/session approvals；cancel/resume smoke 与 session-scope approval audit 保留为下一步。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：17/17 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：45/45 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 TUI 最小 PTY smoke 与下一优先级重排
+
+- **用户决策**: 继续推进 TUI 开发优先级，并要求同步更新 TODO 文档和工作记录；当前重点从权限键盘正确性转向编程工作流闭环与终端视觉 smoke。
+- **处理**:
+  - 新增 `test/tui_pty_driver.py`，使用 Python stdlib `pty/select/termios` 启动真实 `bbl chat`，以隔离 temp config 和 `local/coding-runtime` 驱动真实键盘路径，不依赖真实 provider 或 native `node-pty`。
+  - 新增可选 `test:tui:pty` 脚本和 `test/tui-pty-smoke.test.ts`，由 `BABEL_O_RUN_PTY_SMOKE=1` 显式启用，覆盖 slash palette、permission panel Esc/Backspace reject、approve once、approve for session cache、editable rule、reject with instruction，以及 compact Read 工具渲染隐藏 raw 参数/state。
+  - 修复 PTY 暴露的 secondary readline prompt 问题：autosuggestion `_refreshLine` 现在保留当前 `this._prompt`，只在主 prompt idle 状态下展示 autosuggestion，避免 editable rule / reject instruction prompt 被 BabeL-O 主输入框覆盖。
+  - 修复 renderer 中 standalone whitespace-only `assistant_delta` 导致工具行前出现裸 `⏺` 的问题；live/history 渲染均跳过独立空白 assistant delta，但保留连续 assistant 文本内部空白。
+  - `test/tui-pty-smoke.test.ts` 在断言前剥离 ANSI 和 `\r`，避免 raw terminal 控制序列造成 false negative。
+  - TUI 下一轮优先级重排为：编程工作流闭环 smoke、唯一输入框/agent running 视觉 smoke、MCP tool/resource display。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：8/8 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/tui-renderer.test.ts test/tui-input.test.ts test/completer.test.ts`：327/327 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
 ## 2026-05-30 — P0/P1 worktree / Git 并发安全
 
 - **用户决策**: 按建议推进 worktree / Git 并发安全，目标是避免多个 agent / optimizer 同时操作同一父工作区导致 cherry-pick 冲突、Git metadata 竞争或误覆盖。
