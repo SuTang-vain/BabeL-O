@@ -1,8 +1,9 @@
 import chalk from 'chalk'
 import { ConfigManager } from '../shared/config.js'
-import { renderCompactHelp } from './helpPanel.js'
-import { padToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
+import { padToTerminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
+const VERSION = '0.2.6'
+const WELCOME_MAX_WIDTH = 96
 const PIXEL_ROWS = [
   '    M    ',
   '   M M   ',
@@ -44,8 +45,6 @@ export function renderWelcome(options: {
     console.log(`  ${line}`)
   }
   console.log()
-  console.log(renderCompactHelp())
-  console.log()
 }
 
 export function formatWelcomeCardLines(options: {
@@ -53,35 +52,57 @@ export function formatWelcomeCardLines(options: {
   cwd: string
   sessionId?: string
   url?: string
+  columns?: number
 }): string[] {
-  const username = process.env.USER || process.env.USERNAME || 'User'
-  const version = '0.2.5'
+  const columns = Math.max(48, options.columns ?? process.stdout.columns ?? 80)
+  const maxContentWidth = Math.max(46, Math.min(WELCOME_MAX_WIDTH, columns - 4))
   const mode = options.url ? `Service (${options.url})` : 'Embedded (Local)'
+  const username = process.env.USER || process.env.USERNAME || 'User'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
-
+  const logoWidth = Math.max(...PIXEL_ROWS.map(row => visibleTerminalWidth(renderLogoRow(row))))
+  const metadataWidth = Math.max(18, maxContentWidth - logoWidth - 5)
   const metadataLines = [
-    ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${version}`)}`,
-    ` ${chalk.bold.cyan(username)}`,
-    ` ${chalk.yellow(defaultModel)}`,
-    ` ${chalk.italic.white(options.cwd)}`,
-    ` ${chalk.magenta(mode)}`,
+    ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${VERSION}`)}`,
+    ` ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
+    ` ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
+    ` ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
+    ` ${chalk.magenta(truncateToTerminalWidth(mode, metadataWidth))}`,
   ]
   const contentWidths = PIXEL_ROWS.map((row, index) => {
     const logoCol = renderLogoRow(row)
-    const metaCol = metadataLines[index] ? metadataLines[index] : ''
+    const metaCol = metadataLines[index] ?? ''
     return visibleTerminalWidth(` ${logoCol}   ${metaCol}`)
   })
-  const width = Math.max(55, ...contentWidths)
-  const lines = [chalk.cyan('┌' + '─'.repeat(width) + '┐')]
+  const contentWidth = Math.min(maxContentWidth, Math.max(55, ...contentWidths))
+  const lines = []
 
   for (let i = 0; i < PIXEL_ROWS.length; i++) {
     const logoCol = renderLogoRow(PIXEL_ROWS[i]!)
-    const metaCol = metadataLines[i] ? metadataLines[i] : ''
+    const metaCol = metadataLines[i] ?? ''
     const content = ` ${logoCol}   ${metaCol}`
-    lines.push(`${chalk.cyan('│')}${padToTerminalWidth(content, width)}${chalk.cyan('│')}`)
+    lines.push(padToTerminalWidth(content, contentWidth))
   }
 
-  lines.push(chalk.cyan('└' + '─'.repeat(width) + '┘'))
   return lines
+}
+
+export function formatWelcomeHintLine(columns = process.stdout.columns ?? 80): string {
+  const width = Math.max(48, Math.min(WELCOME_MAX_WIDTH, columns))
+  const left = `${chalk.dim('?')} ${chalk.dim('shortcuts')} ${chalk.dim('·')} ${chalk.dim('/')} ${chalk.dim('commands')} ${chalk.dim('·')} ${chalk.dim('Ctrl+E')} ${chalk.dim('editor')}`
+  const right = `${chalk.dim('Ctrl+O')} ${chalk.dim('details')} ${chalk.dim('·')} ${chalk.dim('Ctrl+C')} ${chalk.dim('cancel')}`
+  const gap = Math.max(2, width - visibleTerminalWidth(left) - visibleTerminalWidth(right))
+  return `${left}${' '.repeat(gap)}${right}`
+}
+
+export function formatSessionBanner(action: 'started' | 'resuming', sessionId: string): string {
+  const label = action === 'started' ? 'session' : 'resume'
+  return `${chalk.dim(label)} ${chalk.dim(sessionId)}`
+}
+
+function formatCwd(cwd: string): string {
+  const home = process.env.HOME
+  if (home && cwd === home) return '~'
+  if (home && cwd.startsWith(`${home}/`)) return `~/${cwd.slice(home.length + 1)}`
+  return cwd
 }

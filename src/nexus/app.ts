@@ -218,7 +218,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.5',
+    version: '0.2.6',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -227,7 +227,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.5',
+      version: '0.2.6',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),

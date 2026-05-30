@@ -4,11 +4,13 @@ import { normalizeKeyEvent, isMouseSequence, terminalMouseDisableSequence } from
 import { consumePasteChunk, createPasteBufferState, flushPasteBuffer } from '../src/cli/pasteBuffer.js'
 import { createPermissionPanelState, reducePermissionPanelKey } from '../src/cli/permissionPanel.js'
 import { helpCategories } from '../src/cli/helpPanel.js'
+import readline from 'node:readline'
+import chalk from 'chalk'
 import { visibleTerminalWidth, truncateToTerminalWidth } from '../src/cli/terminalWidth.js'
-import { formatWelcomeCardLines } from '../src/cli/welcome.js'
-import { renderFixedInputBox, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
+import { formatSessionBanner, formatWelcomeCardLines, formatWelcomeHintLine } from '../src/cli/welcome.js'
+import { formatInputFooter, renderBoxedInput, renderFixedInputBox, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
 import { inputState, type InputMode } from '../src/cli/inputState.js'
-import { defaultPermissionChoices, permissionDecisionFromChoice, setupAutosuggestions } from '../src/cli/ui.js'
+import { defaultPermissionChoices, permissionDecisionFromChoice, renderSubmittedPrompt, setupAutosuggestions } from '../src/cli/ui.js'
 
 test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent('\x03', undefined).kind, 'ctrl_c')
@@ -142,17 +144,62 @@ test('terminal width helpers count CJK and truncate by terminal cells', () => {
   assert.equal(truncateToTerminalWidth('颜色要求-abc', 5), '颜色')
 })
 
-test('welcome card aligns borders when content contains ANSI and long model names', () => {
+test('welcome header keeps required identity info without outer box', () => {
   const lines = formatWelcomeCardLines({
     cwd: '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
     modelId: 'minimax/MiniMax-M2.7-highspeed',
+    columns: 80,
   })
-  const widths = lines.map(line => visibleTerminalWidth(line))
-  assert.ok(widths.length > 2)
-  assert.equal(new Set(widths).size, 1)
+  const joined = lines.join('\n')
+
+  assert.ok(lines.length > 2)
+  assert.match(joined, /❖ BABEL-O/)
+  assert.match(joined, /v0\.2\.5/)
+  assert.match(joined, /MiniMax-M2\.7-highspeed/)
+  assert.match(joined, /BabeL-O/)
+  assert.match(joined, /Embedded \(Local\)/)
+  assert.equal(lines.some(line => line.includes('┌')), false)
+  assert.equal(lines.some(line => line.includes('└')), false)
+  assert.equal(lines.some(line => line.includes('│')), false)
+  assert.ok(lines.every(line => visibleTerminalWidth(line) <= 80))
 })
 
-test('fixed input box keeps long path input on one terminal row', () => {
+test('welcome hint and session banners stay compact', () => {
+  const hint = formatWelcomeHintLine(80)
+  assert.match(hint, /\?/)
+  assert.match(hint, /\/ commands/)
+  assert.match(hint, /Ctrl\+O/)
+  assert.doesNotMatch(hint, /│/)
+  assert.ok(visibleTerminalWidth(hint) <= 80)
+
+  assert.match(formatSessionBanner('started', 'session_abc123'), /session session_abc123/)
+  assert.match(formatSessionBanner('resuming', 'session_abc123'), /resume session_abc123/)
+  assert.doesNotMatch(formatSessionBanner('started', 'session_abc123'), /Started new session/)
+})
+
+test('boxed input renders separator prompt and footer model line', () => {
+  const rendered = renderBoxedInput({
+    prompt: '> ',
+    line: '',
+    cursor: 0,
+    placeholder: '',
+    modelId: 'gemini/gemini-3.5-flash-medium',
+    columns: 84,
+  })
+  const lines = rendered.text.split('\n')
+
+  assert.equal(lines.length, 4)
+  assert.equal(lines[0], '─'.repeat(83))
+  assert.equal(lines[1], '> ')
+  assert.equal(lines[2], '─'.repeat(83))
+  assert.match(lines[3]!, /\? for shortcuts/)
+  assert.match(lines[3]!, /Gemini 3\.5 Flash \(Medium\)/)
+  assert.equal(rendered.cursorRow, 1)
+  assert.equal(rendered.cursorRowsFromBottom, 2)
+  assert.equal(rendered.cursorColumn, 2)
+})
+
+ test('fixed input box keeps long path input on one terminal row', () => {
   const line = '/Users/tangyaoyue/DEV/Baidu/app-bvh8xpid> /Users/tangyaoyue/DEV/BABEL/BabeL-O查看并'
   const rendered = renderFixedInputBox({
     prompt: '> ',
@@ -192,13 +239,13 @@ test('fixed input box renders an empty-state placeholder without moving the curs
     prompt: '> ',
     line: '',
     cursor: 0,
-    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    placeholder: 'Ask BabeL-O · / commands · Ctrl+E editor',
     columns: 28,
   })
 
   assert.equal(rendered.renderedPlaceholder, true)
   assert.equal(rendered.cursorColumn, 2)
-  assert.ok(rendered.text.includes('Type a message'))
+  assert.ok(rendered.text.includes('Ask BabeL-O'))
   assert.ok(visibleTerminalWidth(rendered.text) <= 28)
 })
 
@@ -207,12 +254,12 @@ test('fixed input box hides the placeholder as soon as input has content', () =>
     prompt: '> ',
     line: 'r',
     cursor: 1,
-    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    placeholder: 'Ask BabeL-O · / commands · Ctrl+E editor',
     columns: 40,
   })
 
   assert.equal(rendered.renderedPlaceholder, false)
-  assert.equal(rendered.text.includes('Type a message'), false)
+  assert.equal(rendered.text.includes('Ask BabeL-O'), false)
   assert.equal(rendered.text.includes('> r'), true)
 })
 
@@ -221,13 +268,13 @@ test('fixed input box treats whitespace as content for placeholder rendering', (
     prompt: '> ',
     line: ' ',
     cursor: 1,
-    placeholder: 'Type a message · / commands · Ctrl+E editor',
+    placeholder: 'Ask BabeL-O · / commands · Ctrl+E editor',
     columns: 40,
   })
 
   assert.equal(rendered.renderedPlaceholder, false)
   assert.equal(rendered.cursorColumn, 3)
-  assert.equal(rendered.text.includes('Type a message'), false)
+  assert.equal(rendered.text.includes('Ask BabeL-O'), false)
 })
 
 test('input ghost helpers clear placeholder before printable input and consume blank enter', () => {
@@ -266,15 +313,170 @@ test('input state keeps readline as the only text owner while overlays are open'
   }
 })
 
-test('autosuggestion refresh preserves secondary readline prompts', () => {
+test('autosuggestion refresh renders main chat input as a boxed prompt', () => {
   const writes: string[] = []
+  const moves: Array<[number, number]> = []
   const originalWrite = process.stdout.write
   const originalCursorTo = process.stdout.cursorTo
+  const originalMoveCursor = readline.moveCursor
+  const originalClearScreenDown = readline.clearScreenDown
+  const originalColumns = process.stdout.columns
   process.stdout.write = ((chunk: any, ...args: any[]) => {
     writes.push(String(chunk))
     return true
   }) as typeof process.stdout.write
   ;(process.stdout as any).cursorTo = () => true
+  ;(readline as any).moveCursor = (_stream: NodeJS.WritableStream, dx: number, dy: number) => {
+    moves.push([dx, dy])
+    return true
+  }
+  ;(readline as any).clearScreenDown = () => true
+  Object.defineProperty(process.stdout, 'columns', { value: 40, configurable: true })
+
+  const rl: any = {
+    _prompt: '> ',
+    line: '',
+    cursor: 0,
+  }
+  try {
+    setupAutosuggestions(rl as any, [], { current: false })
+    rl._refreshLine()
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(readline as any).moveCursor = originalMoveCursor
+    ;(readline as any).clearScreenDown = originalClearScreenDown
+    Object.defineProperty(process.stdout, 'columns', { value: originalColumns, configurable: true })
+  }
+
+  const output = writes.join('')
+  assert.ok(output.includes('─'.repeat(39)))
+  assert.ok(output.includes('? for shortcuts'))
+  assert.ok(output.split('\n').some(line => line.includes('? for shortcuts')))
+  assert.ok(moves.some(([, dy]) => dy === -2))
+})
+
+ test('submitted prompt renders as purple text without input chrome', () => {
+  const originalLevel = chalk.level
+  chalk.level = 1
+  try {
+    const submitted = renderSubmittedPrompt('你好～你是谁？')
+
+    assert.match(submitted, /\x1b\[[0-9;]*m>/)
+    assert.match(submitted, /你好～你是谁？/)
+    assert.doesNotMatch(submitted, /─/)
+    assert.doesNotMatch(submitted, /Ask BabeL-O/)
+    assert.ok(submitted.endsWith('\n'))
+  } finally {
+    chalk.level = originalLevel
+  }
+})
+
+ test('autosuggestion clearCurrentInputBlock removes boxed input before submission', () => {
+  const writes: string[] = []
+  const moves: Array<[number, number]> = []
+  let clearCount = 0
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  const originalMoveCursor = readline.moveCursor
+  const originalClearScreenDown = readline.clearScreenDown
+  const originalColumns = process.stdout.columns
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+  ;(readline as any).moveCursor = (_stream: NodeJS.WritableStream, dx: number, dy: number) => {
+    moves.push([dx, dy])
+    return true
+  }
+  ;(readline as any).clearScreenDown = () => {
+    clearCount++
+    return true
+  }
+  Object.defineProperty(process.stdout, 'columns', { value: 60, configurable: true })
+
+  const rl: any = {
+    _prompt: '> ',
+    line: '你好～你是谁？',
+    cursor: '你好～你是谁？'.length,
+  }
+  try {
+    const controls = setupAutosuggestions(rl as any, [], { current: false })
+    rl._refreshLine()
+    controls.clearCurrentInputBlock({ afterSubmit: true })
+    process.stdout.write(renderSubmittedPrompt(rl.line))
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(readline as any).moveCursor = originalMoveCursor
+    ;(readline as any).clearScreenDown = originalClearScreenDown
+    Object.defineProperty(process.stdout, 'columns', { value: originalColumns, configurable: true })
+  }
+
+  const output = writes.join('')
+  assert.ok(output.includes('─'.repeat(59)))
+  assert.ok(output.includes('你好～你是谁？'))
+  assert.equal(clearCount >= 2, true)
+  assert.equal(moves.filter(([, dy]) => dy === -2).length >= 2, true)
+  assert.ok(writes.at(-1)?.includes('你好～你是谁？'))
+  assert.equal(writes.at(-1)?.includes('─'), false)
+})
+
+ test('autosuggestion refresh clears old boxed rows after terminal resize', () => {
+  const writes: string[] = []
+  const moves: Array<[number, number]> = []
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  const originalMoveCursor = readline.moveCursor
+  const originalClearScreenDown = readline.clearScreenDown
+  const originalColumns = process.stdout.columns
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+  ;(readline as any).moveCursor = (_stream: NodeJS.WritableStream, dx: number, dy: number) => {
+    moves.push([dx, dy])
+    return true
+  }
+  ;(readline as any).clearScreenDown = () => true
+  Object.defineProperty(process.stdout, 'columns', { value: 100, configurable: true })
+
+  const rl: any = {
+    _prompt: '> ',
+    line: '',
+    cursor: 0,
+  }
+  try {
+    setupAutosuggestions(rl as any, [], { current: false })
+    rl._refreshLine()
+    Object.defineProperty(process.stdout, 'columns', { value: 40, configurable: true })
+    rl._refreshLine()
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(readline as any).moveCursor = originalMoveCursor
+    ;(readline as any).clearScreenDown = originalClearScreenDown
+    Object.defineProperty(process.stdout, 'columns', { value: originalColumns, configurable: true })
+  }
+
+  assert.ok(writes.some(write => write.includes('─'.repeat(99))))
+  assert.ok(writes.some(write => write.includes('─'.repeat(39))))
+  assert.ok(moves.some(([, dy]) => dy <= -3))
+})
+
+ test('autosuggestion refresh preserves secondary readline prompts', () => {
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  const originalClearScreenDown = process.stdout.clearScreenDown
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+  ;(process.stdout as any).clearScreenDown = () => true
 
   const rl: any = {
     _prompt: '> ',
@@ -290,10 +492,62 @@ test('autosuggestion refresh preserves secondary readline prompts', () => {
   } finally {
     process.stdout.write = originalWrite
     ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(process.stdout as any).clearScreenDown = originalClearScreenDown
   }
 
   const output = writes.join('')
   assert.ok(output.includes('Enter allow rule prefix (default: node:*): node:*'))
   assert.ok(!output.includes('BabeL-O'))
-  assert.ok(!output.includes('Type a message'))
+  assert.ok(!output.includes('Ask BabeL-O'))
+})
+
+test('autosuggestion refresh clears stale wrapped input rows', () => {
+  const writes: string[] = []
+  const moves: Array<[number, number]> = []
+  let clearCount = 0
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  const originalMoveCursor = readline.moveCursor
+  const originalClearScreenDown = readline.clearScreenDown
+  const originalColumns = process.stdout.columns
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+  ;(readline as any).moveCursor = (_stream: NodeJS.WritableStream, dx: number, dy: number) => {
+    moves.push([dx, dy])
+    return true
+  }
+  ;(readline as any).clearScreenDown = () => {
+    clearCount++
+    return true
+  }
+  Object.defineProperty(process.stdout, 'columns', { value: 30, configurable: true })
+
+  const initialPrompt = '> '
+  const wrappedPrompt = 'wrapped prompt '.repeat(3)
+  const rl: any = {
+    _prompt: initialPrompt,
+    line: 'x'.repeat(80),
+    cursor: 80,
+  }
+  try {
+    setupAutosuggestions(rl as any, [], { current: false })
+    rl._prompt = wrappedPrompt
+    rl._refreshLine()
+    rl.line = 'short'
+    rl.cursor = rl.line.length
+    rl._refreshLine()
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(readline as any).moveCursor = originalMoveCursor
+    ;(readline as any).clearScreenDown = originalClearScreenDown
+    Object.defineProperty(process.stdout, 'columns', { value: originalColumns, configurable: true })
+  }
+
+  assert.ok(clearCount >= 2)
+  assert.ok(moves.some(([, dy]) => dy < 0))
+  assert.ok(writes.filter(write => write.includes(wrappedPrompt)).length >= 2)
 })

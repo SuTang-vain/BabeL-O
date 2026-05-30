@@ -1,6 +1,6 @@
 {
   "name": "babel-o",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "description": "Nexus-first rewrite of BabeL-X with a lightweight interactive CLI.",
   "type": "module",
   "bin": {

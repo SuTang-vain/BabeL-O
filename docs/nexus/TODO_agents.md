@@ -101,10 +101,12 @@
 - [x] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
 - [x] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
 - [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 通过 mock Anthropic SSE 覆盖 Planner → Optimizer → 真实 Read 工具 → Optimizer final → Critic，不访问真实网络、不执行任意用户任务，并验证 role tool policy。
+- [x] 真实 provider live/manual AgentLoop smoke 入口与安全回归：`bbl optimize --provider-smoke-live` 使用固定临时 workspace、固定 fixture、固定 planner review task 和 Read-only 工具面，覆盖 Planner → Optimizer → Read → Optimizer final → Critic；mock provider 测试确认不执行任意 planner 任务、不泄露 key、不自动切 provider/model/profile。
+- [ ] 手动执行真实 provider live/manual AgentLoop smoke：运行 `bbl optimize --provider-smoke-live --model <provider/model>`，记录真实 provider structured output、role routing 与工具调用稳定性。
 - [ ] 定义外部 SDK task API。
 - [ ] 定义 dashboard session/task query API。
 - [x] 支持远程取消和恢复：`POST /v1/sessions/:sessionId/cancel` 可中止 active HTTP/WebSocket execution 并级联取消 child sessions；`POST /v1/sessions/:sessionId/resume` 返回 session snapshot、recent events、tasks、child sessions 与 active execution metadata。
-- [ ] 将 tool trace、critic reason、usage 变成可查询 data assets.
+- [ ] 将 tool trace、critic reason、usage 变成可查询 data assets，作为 SDK/dashboard query API 的收口标准。
 
 ## 验证命令
 
@@ -117,7 +119,9 @@
 - [x] worktree 生命周期与冲突提取测试已纳入 `test/worktree.test.ts`，AgentLoop 隔离执行以及子代理嵌套隔离合并测试已纳入 `test/agent-loop.test.ts`。
 - [x] in-place optimizer Git hardening 测试已纳入 `test/agent-loop.test.ts`，worktree pathspec staging 测试已纳入 `test/worktree.test.ts`。
 - [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 覆盖真实 `LLMCodingRuntime` + Anthropic adapter + `createRuntimeAgentStepRunner()` + `runAgentLoop()` 路径，使用固定 mock SSE 与固定 fixture，不访问真实 provider、不执行任意用户任务。
-- [ ] 非 dry-run 的真实 provider live/manual AgentLoop smoke。
+- [x] 非 dry-run provider live/manual AgentLoop smoke 入口与安全回归：`bbl optimize --provider-smoke-live` 显式触发，临时 workspace 自动清理，Planner 输出会经 `reviewPlan` 固定为只读任务，Optimizer 只暴露 `Read`，Critic 不暴露工具；测试覆盖 mocked provider 完整链路。
+- [ ] 手动执行真实 provider live/manual AgentLoop smoke。
+  - 命令：`bbl optimize --provider-smoke-live --model <provider/model>`。
   - 2026-05-24 已用临时 Git 仓库执行真实 `bbl optimize --enable-subagents` 非 dry-run smoke：Planner/工具调用/rollback 链路运行，但 executor 多轮失败后 TaskQueue settled，临时仓库保持干净。下一步需诊断 executor 失败细节展示与真实 provider 输出稳定性后再标完成。
   - 2026-05-24 复跑诊断后确认：Planner 空 JSON 已可 fallback；当前主要失败类型为 Optimizer/Executor structured output 缺字段，以及 provider 空响应。下一步需做 role structured-output repair/retry 或 role model routing，再继续标完成。
   - 2026-05-24 AgentLoop/CLI 已能展示 structured-output 失败类型、缺失必填字段、候选来源和输出预览；下一步复跑 smoke 时应优先根据 `structured=schema_mismatch` / `structured=no_structured_json` / `EMPTY_PROVIDER_RESPONSE` 分流到 repair/retry 或 role model routing。

@@ -61,10 +61,8 @@ Provider / Model Registry 负责统一多厂商模型配置、认证方式、能
 - [x] request override 优先级：request model > env model > role model > active profile default。
 - [x] Nexus/Agent 解析同一套 `resolveSettings({ model, role })` 口径；带 provider 前缀的 request model 不再被 profile provider 错配。
 - [x] Nexus 拒绝不支持 structured output 的模型执行 structured role。
-- [ ] Planner 默认使用长上下文模型。
-- [ ] Executor 默认使用 tool calling 稳定模型。
-- [ ] Critic 默认使用 structured output 稳定模型。
 - [ ] 根据 `modelPreference.capability` 增加未配置 roles 时的默认模型推荐策略。
+- [ ] 与 runtime fallback policy 联动：当 provider recovery 建议切换模型/provider/profile 时，只提供显式用户确认后的执行入口，保持 `allowSilentModelSwitch=false`。
 
 ## Provider Seed
 

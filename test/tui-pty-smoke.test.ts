@@ -34,7 +34,8 @@ function runPtySmoke(sequence: string) {
 test('PTY smoke: slash palette opens and exits cleanly', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('slash-palette')
   assert.match(output, /Insert bash prompt prefix/)
-  assert.match(output, /BabeL-O/)
+  assert.match(output, /BABEL-O/)
+  assert.match(output, /\? for shortcuts/)
 })
 
 test('PTY smoke: permission panel escape rejects without approval', { skip: !shouldRun || !existsSync(driver) }, () => {
@@ -105,8 +106,8 @@ test('PTY smoke: programming workflow covers read edit diff grep glob and task',
 
 test('PTY smoke: resume session redraws previous tool history', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('resume-session')
-  assert.match(output, /Started new session: session_/)
-  assert.match(output, /Resuming session: session_/)
+  assert.match(output, /session session_/)
+  assert.match(output, /resume session_/)
   assert.match(output, /Read smoke\.txt done/)
   assert.match(output, /ctrl\+o to expand tool details/)
 })

@@ -33,8 +33,8 @@ let activeSessionModel: string | undefined
 let currentAgentStatus: 'thinking' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle' = 'idle'
 let currentToolName: string | undefined
 let lastContextWarning: { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
-const inputPrompt = `${chalk.dim('╭─')} ${chalk.bgBlue.white('chat')} ${chalk.blue('BabeL-O')} ${chalk.dim('›')} `
-export const chatInputPlaceholder = 'Type a message · / commands · Ctrl+E editor'
+const inputPrompt = `${chalk.dim('>')} `
+export const chatInputPlaceholder = 'Ask BabeL-O · / commands · Ctrl+E editor'
 const toolPrefix = chalk.blue('●')
 const thoughtPrefix = chalk.magenta('▸')
 

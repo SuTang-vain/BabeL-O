@@ -148,7 +148,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
     transcript: list[str] = []
 
     try:
-        if not wait_for(master_fd, 'BabeL-O', timeout, transcript):
+        if not wait_for(master_fd, '? for shortcuts', timeout, transcript):
             return 1, ''.join(transcript) + '\n[pty-smoke] prompt did not appear\n'
 
         if sequence == 'slash-palette':
@@ -291,7 +291,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             first_run = ''.join(transcript)
             if proc.returncode != 0:
                 return proc.returncode, first_run
-            match = re.search(r'Started new session: (session_[A-Za-z0-9_-]+)', visible_text(first_run))
+            match = re.search(r'session (session_[A-Za-z0-9_-]+)', visible_text(first_run))
             if not match:
                 return 1, first_run + '\n[pty-smoke] initial session id was not rendered\n'
             resumed_session_id = match.group(1)
@@ -300,7 +300,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             resume_command = [*base_command, '--session', resumed_session_id]
             master_fd, proc = start_chat_process(resume_command, workspace, env)
             resumed: list[str] = []
-            if not wait_for(master_fd, f'Resuming session: {resumed_session_id}', timeout, resumed):
+            if not wait_for(master_fd, f'resume {resumed_session_id}', timeout, resumed):
                 return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resume banner did not render\n'
             if not wait_for(master_fd, 'Read smoke.txt done', timeout, resumed):
                 return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resumed history did not render prior read\n'

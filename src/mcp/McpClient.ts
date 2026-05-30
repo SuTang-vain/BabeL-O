@@ -69,7 +69,7 @@ export class McpClient {
       capabilities: {},
       clientInfo: {
         name: 'BabeL-O',
-        version: '0.2.5',
+        version: '0.2.6',
       },
     })
     this.notify('notifications/initialized', {})

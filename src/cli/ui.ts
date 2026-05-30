@@ -2,7 +2,7 @@ import readline from 'node:readline'
 import chalk from 'chalk'
 import { emitKeypressEvents } from 'node:readline'
 import { PendingPermissionRegistry } from '../shared/session.js'
-import { chatInputPlaceholder, getChatPrompt } from './renderEvents.js'
+import { getChatPrompt } from './renderEvents.js'
 import { inputState } from './inputState.js'
 import { normalizeKeyEvent } from './keyEvent.js'
 import {
@@ -10,8 +10,8 @@ import {
   reducePermissionPanelKey,
   selectedPermissionChoice,
 } from './permissionPanel.js'
-import { renderedLineCount } from './terminalWidth.js'
-import { renderFixedInputBox } from './inputBox.js'
+import { renderedLineCount, visibleTerminalWidth } from './terminalWidth.js'
+import { renderBoxedInput, renderFixedInputBox } from './inputBox.js'
 
 export type CliReadline = readline.Interface
 
@@ -152,37 +152,107 @@ export function getAutosuggestion(line: string, history: string[]): string | und
   return undefined
 }
 
+export type AutosuggestionRefreshControls = {
+  clearCurrentInputBlock: (options?: { afterSubmit?: boolean }) => void
+}
+
 export function setupAutosuggestions(
   rl: any,
   history: string[],
   isExecutingRef: { current: boolean }
-) {
+): AutosuggestionRefreshControls {
   const rlInt = rl as any
   const defaultPrompt = rlInt._prompt ?? getChatPrompt()
+  let lastRenderedLines = 1
+  let lastRenderedText = ''
+  let lastCursorLineIndex = 0
+  let lastCursorColumn = 0
+  let lastCursorRowsFromBottom = 0
+
+  const clearCurrentInputBlock = (options?: { afterSubmit?: boolean }) => {
+    const columns = process.stdout.columns || 80
+    const previousCursorRow = lastRenderedText
+      ? renderedCursorRow(lastRenderedText, lastCursorLineIndex, lastCursorColumn, columns)
+      : Math.max(0, lastRenderedLines - 1 - lastCursorRowsFromBottom)
+    const rowsToBlockTop = previousCursorRow + (options?.afterSubmit ? 1 : 0)
+    if (rowsToBlockTop > 0) {
+      readline.moveCursor(process.stdout, 0, -rowsToBlockTop)
+    }
+    readline.cursorTo(process.stdout, 0)
+    readline.clearScreenDown(process.stdout)
+    lastRenderedLines = 1
+    lastRenderedText = ''
+    lastCursorLineIndex = 0
+    lastCursorColumn = 0
+    lastCursorRowsFromBottom = 0
+  }
 
   rlInt._refreshLine = function() {
     const currentInput = String(this.line ?? '')
     const cursor = typeof this.cursor === 'number' ? this.cursor : currentInput.length
     const prompt = typeof this._prompt === 'string' ? this._prompt : defaultPrompt
     const isMainPrompt = prompt === defaultPrompt
+    const columns = process.stdout.columns || 80
     const suggestion = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
       ? getAutosuggestion(currentInput, history)
       : undefined
-    const placeholder = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle'
-      ? chatInputPlaceholder
-      : undefined
-    const rendered = renderFixedInputBox({
-      prompt,
-      line: currentInput,
-      cursor,
-      suggestion,
-      placeholder,
-      columns: process.stdout.columns || 80,
-    })
+    const placeholder = undefined
+    const rendered = isMainPrompt
+      ? renderBoxedInput({
+        prompt,
+        line: currentInput,
+        cursor,
+        suggestion,
+        placeholder,
+        columns,
+      })
+      : renderFixedInputBox({
+        prompt,
+        line: currentInput,
+        cursor,
+        suggestion,
+        placeholder,
+        columns,
+      })
+    const renderedLines = Math.max(1, renderedLineCount(rendered.text, columns))
 
-    process.stdout.write(`\r\x1b[K${rendered.text}`)
+    const cursorRowsFromBottom = rendered.cursorRowsFromBottom ?? 0
+    const previousCursorRow = lastRenderedText
+      ? renderedCursorRow(lastRenderedText, lastCursorLineIndex, lastCursorColumn, columns)
+      : Math.max(0, lastRenderedLines - 1 - lastCursorRowsFromBottom)
+    const rowsToBlockTop = Math.max(0, previousCursorRow)
+    if (rowsToBlockTop > 0) {
+      readline.moveCursor(process.stdout, 0, -rowsToBlockTop)
+    }
+    readline.cursorTo(process.stdout, 0)
+    readline.clearScreenDown(process.stdout)
+    process.stdout.write(rendered.text)
+    if (cursorRowsFromBottom > 0) {
+      readline.moveCursor(process.stdout, 0, -cursorRowsFromBottom)
+    }
     readline.cursorTo(process.stdout, rendered.cursorColumn)
+    lastRenderedLines = renderedLines
+    lastRenderedText = rendered.text
+    lastCursorLineIndex = rendered.cursorRow
+    lastCursorColumn = rendered.cursorColumn
+    lastCursorRowsFromBottom = cursorRowsFromBottom
   }
+
+  return { clearCurrentInputBlock }
+}
+
+export function renderSubmittedPrompt(prompt: string): string {
+  return `${chalk.magenta('>')} ${chalk.magenta(prompt)}\n`
+}
+
+function renderedCursorRow(text: string, logicalCursorRow: number, cursorColumn: number, columns: number): number {
+  const lines = text.split('\n')
+  let row = 0
+  const cursorLine = Math.max(0, Math.min(logicalCursorRow, lines.length - 1))
+  for (let i = 0; i < cursorLine; i++) {
+    row += Math.max(1, Math.ceil(visibleTerminalWidth(lines[i]!) / columns))
+  }
+  return row + Math.floor(Math.max(0, cursorColumn) / columns)
 }
 
 

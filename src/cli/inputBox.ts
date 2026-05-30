@@ -1,4 +1,6 @@
 import chalk from 'chalk'
+import { ConfigManager } from '../shared/config.js'
+import { modelRegistry } from '../providers/registry.js'
 import { terminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
 export interface FixedInputBoxOptions {
@@ -13,6 +15,8 @@ export interface FixedInputBoxOptions {
 export interface FixedInputBoxRender {
   text: string
   cursorColumn: number
+  cursorRow: number
+  cursorRowsFromBottom: number
   contentWidth: number
   truncated: boolean
   renderedSuggestion: boolean
@@ -41,11 +45,67 @@ export function renderFixedInputBox(options: FixedInputBoxOptions): FixedInputBo
   return {
     text: `${options.prompt}${view.text}${renderedSuggestion}${renderedPlaceholder}`,
     cursorColumn: promptWidth + view.cursorColumn,
+    cursorRow: 0,
+    cursorRowsFromBottom: 0,
     contentWidth,
     truncated: view.truncated,
     renderedSuggestion: canRenderSuggestion,
     renderedPlaceholder: canRenderPlaceholder,
   }
+}
+
+export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: string }): FixedInputBoxRender {
+  const columns = Math.max(20, options.columns ?? process.stdout.columns ?? 80)
+  const lineWidth = Math.max(1, columns - 1)
+  const separator = chalk.dim('─'.repeat(lineWidth))
+  const prompt = '> '
+  const promptWidth = visibleTerminalWidth(prompt)
+  const contentWidth = Math.max(1, lineWidth - promptWidth)
+  const cursor = Math.max(0, Math.min(options.cursor, options.line.length))
+  const view = createInputViewport(options.line, cursor, contentWidth)
+  const suggestionTail = getSuggestionTail(options.line, options.suggestion)
+  const canRenderSuggestion = !view.truncated &&
+    suggestionTail.length > 0 &&
+    terminalWidth(view.text) + terminalWidth(suggestionTail) <= contentWidth
+  const hasInputContent = options.line.length > 0
+  const canRenderPlaceholder = !hasInputContent &&
+    options.placeholder !== undefined &&
+    options.placeholder.length > 0
+  const renderedSuggestion = canRenderSuggestion ? chalk.dim(suggestionTail) : ''
+  const renderedPlaceholder = canRenderPlaceholder
+    ? chalk.dim(truncateToTerminalWidth(options.placeholder!, contentWidth))
+    : ''
+  const inputLine = `${prompt}${view.text}${renderedSuggestion}${renderedPlaceholder}`
+  const footer = formatInputFooter(lineWidth, options.modelId)
+
+  return {
+    text: `${separator}\n${inputLine}\n${separator}\n${footer}`,
+    cursorColumn: promptWidth + view.cursorColumn,
+    cursorRow: 1,
+    cursorRowsFromBottom: 2,
+    contentWidth,
+    truncated: view.truncated,
+    renderedSuggestion: canRenderSuggestion,
+    renderedPlaceholder: canRenderPlaceholder,
+  }
+}
+
+export function currentInputModelLabel(modelId = ConfigManager.getInstance().resolveSettings().modelId): string {
+  if (modelId === 'local/coding-runtime') return 'Embedded Local'
+  const registered = modelRegistry.find(model => model.id === modelId)
+  if (registered) return registered.name
+  const rawName = modelId.includes('/') ? modelId.slice(modelId.indexOf('/') + 1) : modelId
+  const words = rawName
+    .replace(/[-_]+/g, ' ')
+    .replace(/\b\w/g, char => char.toUpperCase())
+  return words.replace(/\s+(Low|Medium|High|Fast|Slow)$/i, ' ($1)')
+}
+
+export function formatInputFooter(columns = process.stdout.columns ?? 80, modelId?: string): string {
+  const left = chalk.dim('? for shortcuts')
+  const right = chalk.dim(currentInputModelLabel(modelId))
+  const gap = Math.max(1, columns - visibleTerminalWidth(left) - visibleTerminalWidth(right))
+  return `${left}${' '.repeat(gap)}${right}`
 }
 
 export function shouldClearInputGhostBeforeWrite(line: string, chunk: string): boolean {

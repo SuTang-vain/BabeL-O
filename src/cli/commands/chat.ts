@@ -14,7 +14,7 @@ import {
   toggleTuiMode,
   stopSpinner
 } from '../renderEvents.js'
-import { renderWelcome } from '../welcome.js'
+import { formatSessionBanner, renderWelcome } from '../welcome.js'
 import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
 import { modelRegistry } from '../../providers/registry.js'
@@ -30,6 +30,7 @@ import {
   pickCompletionChoice,
   mapDropdownSelection,
   getAutosuggestion,
+  renderSubmittedPrompt,
   setupAutosuggestions
 } from '../ui.js'
 import {
@@ -92,7 +93,7 @@ export function registerChatCommand(program: Command): void {
 
       const isExecutingRef = { get current() { return isExecuting } }
       rl.setPrompt(getChatPrompt())
-      setupAutosuggestions(rl, history, isExecutingRef)
+      const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef)
       const slashPalette = createSlashPalette(rl)
       let sessionId = ''
 
@@ -183,7 +184,7 @@ export function registerChatCommand(program: Command): void {
             }
 
             if (inputState.current === 'idle' && shouldClearInputGhostBeforeWrite(rlInt.line ?? '', str)) {
-              process.stdout.write(`\r\x1b[K${getChatPrompt()}`)
+              rlInt._refreshLine?.()
             }
 
             const pasteResult = consumePasteChunk(pasteState, str)
@@ -543,7 +544,7 @@ export function registerChatCommand(program: Command): void {
 
       sessionId = options.session ?? createId('session')
       if (options.session) {
-        console.log(chalk.cyan(`Resuming session: ${sessionId}`))
+        console.log(formatSessionBanner('resuming', sessionId))
 
         try {
           let events: NexusEvent[] = []
@@ -569,7 +570,7 @@ export function registerChatCommand(program: Command): void {
           console.error(chalk.yellow(`Warning: Failed to load session history: ${e.message || e}`))
         }
       } else {
-        console.log(chalk.cyan(`Started new session: ${sessionId}`))
+        console.log(formatSessionBanner('started', sessionId))
       }
 
       let pendingLineResolve: ((val: string) => void) | null = null
@@ -594,6 +595,10 @@ export function registerChatCommand(program: Command): void {
           }
 
           let trimmed = prompt.trim()
+          inputRefresh.clearCurrentInputBlock({ afterSubmit: true })
+          if (trimmed) {
+            process.stdout.write(renderSubmittedPrompt(trimmed))
+          }
           if (trimmed === '/exit' || trimmed === 'exit' || trimmed === 'quit') {
             await closeCurrentSession('CLI exit')
             break

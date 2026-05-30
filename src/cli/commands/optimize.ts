@@ -16,6 +16,9 @@ export type OptimizeCommandOptions = {
   enableSubagents?: boolean
   maxSubAgentDepth?: string | number
   maxSubTasksPerTask?: string | number
+  providerSmokeLive?: boolean
+  model?: string
+  timeoutMs?: string | number
   yes?: boolean
 }
 
@@ -33,12 +36,20 @@ export function registerOptimizeCommand(program: Command): void {
     .option('--focus <focus>', 'Optimization focus: performance, cleanup, or security', 'performance')
     .option('--dry-run', 'Generate the plan but do not execute changes')
     .option('--auto-approve', 'Automatically approve all optimization changes without manual feedback')
+    .option('--provider-smoke-live', 'Run the fixed live/manual AgentLoop provider smoke in a temporary workspace')
+    .option('--model <model>', 'Model override for the provider smoke or optimizer run')
+    .option('--timeout-ms <number>', 'Timeout in milliseconds for provider smoke live/manual runs', '120000')
     .option('--yes', 'Approve the planner task list without prompting')
     .option('--enable-subagents', 'Allow optimizer/executor agents to delegate substantive subTasks')
     .option('--max-sub-agent-depth <number>', 'Maximum nested sub-agent delegation depth', '1')
     .option('--max-sub-tasks-per-task <number>', 'Maximum subTasks accepted from a single task result', '5')
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
     .action(async (options: OptimizeCommandOptions) => {
+      if (options.providerSmokeLive) {
+        await runOptimizerProviderSmokeLive(options)
+        return
+      }
+
       const targetPath = options.target
       if (!targetPath) {
         console.error(chalk.red('Error: --target option is required.'))
@@ -89,6 +100,7 @@ export function registerOptimizeCommand(program: Command): void {
           })
           const stepRunner = createRuntimeAgentStepRunner({
             cwd: options.cwd,
+            model: options.model,
             runtimeFactory: async () => runtime,
           })
 
@@ -135,6 +147,7 @@ export function registerOptimizeCommand(program: Command): void {
         const { stdin: input, stdout: output } = await import('node:process')
         const stepRunner = createRuntimeAgentStepRunner({
           cwd: options.cwd,
+          model: options.model,
           runtimeFactory: async () => runtime,
         })
         const rl = readline.createInterface({ input, output })
@@ -232,6 +245,52 @@ async function editPlannerTasks(
     console.log(renderPlannerPlan({ summary: 'Edited optimization plan', tasks: edited }))
   }
   return edited
+}
+
+export function parseOptimizeProviderSmokeLiveOptions(options: OptimizeCommandOptions): { timeoutMs: number; model?: string } {
+  return {
+    timeoutMs: parsePositiveIntegerOption(options.timeoutMs, '--timeout-ms'),
+    model: options.model,
+  }
+}
+
+async function runOptimizerProviderSmokeLive(options: OptimizeCommandOptions): Promise<void> {
+  const smokeOptions = parseOptimizeProviderSmokeLiveOptions(options)
+  console.log(chalk.bold.blue('Running fixed AgentLoop provider live smoke.'))
+  console.log(chalk.dim('This uses a temporary workspace, a fixed fixture file, and only the Read tool. It does not execute arbitrary user tasks.'))
+  const { runAgentLoopLiveSmoke } = await import('../../nexus/agentLoopSmoke.js')
+  const result = await runAgentLoopLiveSmoke(smokeOptions)
+  console.log(formatAgentLoopSmokeResult(result))
+  if (!result.success) {
+    process.exitCode = 1
+  }
+}
+
+function formatAgentLoopSmokeResult(result: any): string {
+  const provider = result.provider ?? {}
+  const checks = result.checks ?? {}
+  const fallbackPolicy = result.fallbackPolicy ?? {}
+  const usage = Array.isArray(result.usage) ? result.usage : []
+  return [
+    chalk.cyan('\n--- AgentLoop Provider Live Smoke ---'),
+    `Provider:        ${provider.providerId ?? 'unknown'} model=${provider.modelId ?? 'unknown'}`,
+    `Mode:            ${result.mode ?? 'unknown'}`,
+    `Ready:           ${result.ready ? chalk.green('yes') : chalk.red('no')}`,
+    `Live:            ${result.live ? chalk.green('yes') : chalk.red('no')} success=${result.success ? chalk.green('yes') : chalk.red('no')}`,
+    `Checks:          auth=${yesNo(checks.authConfigured)} model=${yesNo(checks.modelResolved)} tools=${yesNo(checks.toolsSupported)} streaming=${yesNo(checks.streamingSupported)} structured=${yesNo(checks.structuredOutputSupported)}`,
+    result.sessionId ? `Session:         ${result.sessionId} phase=${result.sessionPhase ?? 'unknown'}` : undefined,
+    result.toolCallCount !== undefined ? `Tool calls:      ${result.toolCallCount}` : undefined,
+    `Task/Critic:     taskCompleted=${yesNo(result.taskCompleted)} criticCompleted=${yesNo(result.criticCompleted)}`,
+    `Workspace:       created=${yesNo(result.workspaceCreated)} cleaned=${yesNo(result.workspaceCleaned)}`,
+    usage.length > 0 ? `Usage roles:     ${usage.map((item: any) => `${item.role}:events=${item.eventCount},tools=${item.toolCallCount}`).join(' | ')}` : undefined,
+    result.error ? `Error:           ${result.error.message}` : undefined,
+    `Fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
+    `Next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
+  ].filter(Boolean).join('\n')
+}
+
+function yesNo(value: unknown): string {
+  return value ? 'yes' : 'no'
 }
 
 function formatPlannerTask(task: PlannerTaskPlan, index: number): string {

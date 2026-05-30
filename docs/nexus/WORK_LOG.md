@@ -2,6 +2,41 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-30 — P1 TUI 无外框 welcome 与 boxed input prompt
+
+- **用户决策**: 去掉 welcome 最外层框，保留 logo/身份信息；主输入框改为上下分隔线、裸 `>` 输入行和底部 `? for shortcuts` + 当前模型状态。
+- **处理**:
+  - `src/cli/welcome.ts` 移除 welcome header 的 `┌/│/└` 外框与独立快捷 hint，只保留 logo、`❖ BABEL-O`、版本、用户、工作区、模型和运行模式信息。
+  - `src/cli/inputBox.ts` 新增 boxed input renderer：顶部/底部 `─` 分隔线、`>` 输入行、footer 左侧快捷提示、右侧当前模型 label；未知模型会从 model id 生成可读名称，registry 内模型优先使用 display name。
+  - `src/cli/ui.ts` 只对主 chat prompt 使用 boxed input；二级 readline prompt（editable rule / reject instruction 等）继续使用原单行渲染，并在多行主输入刷新后把光标移回 `>` 行。
+  - `src/cli/ui.ts` 记录上一帧文本和光标位置，刷新前按当前终端列宽重算旧输入块的视觉光标行，修复 resize 后旧长分隔线残留/错位。
+  - `src/cli/inputBox.ts` 的 boxed separator 使用 `columns - 1` 安全宽度，避免刚好铺满终端宽度时被终端自动折到下一行。
+  - `src/cli/ui.ts` 暴露 `clearCurrentInputBlock()` 和 `renderSubmittedPrompt()`；`src/cli/commands/chat.ts` 在提交后按 readline 已换到下一行的真实光标位置清理整个 boxed input，再用紫色文本渲染用户消息，避免上分隔线、输入框 chrome 或 placeholder tail 残留到 agent 输出前。
+  - `src/cli/commands/chat.ts` 的首字符 ghost 清理改为调用 `_refreshLine()`，避免重新写入旧单行 prompt。
+  - `test/tui-input.test.ts` 覆盖无外框 welcome header、boxed input prompt/footer、主输入多行光标回移、resize 后旧 boxed rows 清理、二级 prompt 保持单行和 wrapped row 清理，以及发送后紫色用户消息不带输入框 chrome。
+- **验证**:
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-renderer.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-input.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts`：57/57 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：11/11 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
+## 2026-05-30 — P1 AgentLoop provider live/manual smoke 入口
+
+- **用户决策**: 继续按建议推进 P1，在 deterministic provider-backed smoke 后补真实 provider live/manual AgentLoop smoke；当前先落地显式入口和安全回归，真实联网执行仍作为下一步手动验证。
+- **处理**:
+  - 新增 `src/nexus/agentLoopSmoke.ts`，提供 `runAgentLoopLiveSmoke()`：创建临时 workspace 和固定 `fixture.txt`，用固定 prompt 跑 AgentLoop，并在结束后清理临时 workspace 与本次 queue。
+  - 新增 `bbl optimize --provider-smoke-live`，显式触发 live/manual AgentLoop smoke；支持 `--model <provider/model>` 与 `--timeout-ms <number>`，不要求 `--target`，不会执行任意用户传入任务。
+  - smoke 路径真实经过 Planner → Optimizer → `Read` → Optimizer final → Critic，但 Planner 结果会经 `reviewPlan` 固定替换成只读任务，避免真实模型产出任意任务被执行。
+  - `createRuntimeAgentStepRunner()` 增加 `allowedToolsOverride`，smoke 中将 Planner/Optimizer 工具可见面收敛到 `Read`；Critic 仍无工具。
+  - smoke 输出只展示 redacted provider/model、ready/live/success、session phase、tool call count、task/critic 状态、workspace cleanup、usage summary 和 fallback policy，不输出 API key。
+  - `test/agent-loop.test.ts` 新增 mocked provider live/manual smoke 回归，验证固定 planner review 覆盖任意 planner task、Optimizer 请求不含任意任务、只暴露 `Read`、不泄露 key、workspace 清理成功。
+  - `test/optimize-command.test.ts` 新增 `--provider-smoke-live` timeout/model 解析与非法 timeout 校验。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/agent-loop.test.ts`：22/22 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/optimize-command.test.ts`：6/6 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
+
 ## 2026-05-30 — P1 非 dry-run provider-backed AgentLoop smoke
 
 - **用户决策**: 继续按建议推进 P1，在远程 cancel/resume 之后补非 dry-run provider AgentLoop smoke；真实 provider/live 仍保持为后续手动验证项，本次先落地可重复、无网络、无任意用户任务执行的 deterministic coverage。
@@ -32,18 +67,22 @@
   - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
   - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
 
-## 2026-05-30 — P1 TUI 输入框视觉 polish 与 placeholder PTY smoke
+## 2026-05-30 — P1 TUI 启动信息与输入刷新 polish
 
-- **用户决策**: 继续推进输入框视觉 polish，并同步 TODO 与工作记录文档。
+- **用户决策**: 保留 boxed welcome card 的 logo、`❖ BABEL-O`、版本、登录用户、工作区和模型信息；只精简 `/help help │ Ctrl+O toggle │ Ctrl+C cancel` 与 `Started/Resuming session` 两段展示，并修复长输入刷新残影。
 - **处理**:
-  - `src/cli/renderEvents.ts` 将主输入 prompt 收敛为紧凑 `chat` 标签，并把空输入提示改为 `Type a message · / commands · Ctrl+E editor`。
+  - `src/cli/welcome.ts` 保留 boxed logo welcome card 结构，将启动 hint 改为轻量 `? shortcuts · / commands · Ctrl+E editor ... Ctrl+O details · Ctrl+C cancel`，避免重复 `help help` 和重分隔符。
+  - `src/cli/commands/chat.ts` 将新建/恢复 session banner 改为紧凑 `session <id>` / `resume <id>`；`test/tui_pty_driver.py` 与 `test/tui-pty-smoke.test.ts` 同步使用新 banner 解析真实 session id。
+  - `src/cli/ui.ts` 的 autosuggestion `_refreshLine` 记录上一次输入区占用行数，刷新前回到旧输入块顶部并 `clearScreenDown`，避免长路径/中文输入截断回退后旧 prompt 片段残留到相邻行。
+  - `test/tui-input.test.ts` 补 welcome identity/border、compact hint/session banner、wrapped input row 清理回归。
   - `src/cli/inputBox.ts` 保持单行 fixed viewport，新增 placeholder/ghost 行为 helper；placeholder 只在输入内容真正为空时显示，普通字符、中文、空格输入都会清除提示。
   - `src/cli/commands/chat.ts` 在 stdin data 截获层处理输入框 ghost：空白 Enter 只重绘当前行不提交空 turn；首字符输入前清除 hint 并重绘完整 prompt，避免提示残留或 prompt 被整行擦掉。
   - `test/tui_pty_driver.py` / `test/tui-pty-smoke.test.ts` 新增 `input-placeholder` 真实 PTY 序列，覆盖空白 Enter、中文首字符输入、ghost hint 清除和 prompt 保留。
 - **验证**:
-  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O test -- test/tui-input.test.ts test/completer.test.ts`：334/334 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-renderer.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-input.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts`：52/52 通过。
   - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
   - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：11/11 通过。
+  - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
 
 ## 2026-05-30 — P1 子 Agent session-scope approval 可配置继承 audit
 

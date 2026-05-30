@@ -19,7 +19,7 @@ const program = new Command()
 program
   .name('bbl')
   .description('BabeL-O: Nexus-first coding agent CLI')
-  .version('0.2.5')
+  .version('0.2.6')
 
 // Register modular commands
 registerRunCommand(program)

@@ -21,6 +21,7 @@ export type RuntimeAgentStepOptions = {
   maxTurns?: number
   useStructuredOutputTool?: boolean
   maxRepairAttempts?: number
+  allowedToolsOverride?: string[]
   runtimeFactory?: () => Promise<NexusRuntimeLike>
   onUsageSummary?: (usage: RuntimeAgentStepUsageSummary) => void
 }
@@ -94,7 +95,10 @@ export function createRuntimeAgentStepRunner(
     input: TInput
   }): Promise<TOutput> {
     const runtime = await getRuntime()
-    const runtimeForRole = withRoleToolPolicy(runtime, roleDefinition.toolPolicy.allowedTools)
+    const allowedTools = options.allowedToolsOverride
+      ? intersectAllowedTools(roleDefinition.toolPolicy.allowedTools, options.allowedToolsOverride)
+      : roleDefinition.toolPolicy.allowedTools
+    const runtimeForRole = withRoleToolPolicy(runtime, allowedTools)
     const prompt = buildAgentStepPrompt(roleDefinition, input)
     const textParts: string[] = []
     let resultPayload: unknown
@@ -373,6 +377,11 @@ async function tryParseWithRepair(context: {
 
   // Should not reach here, but TypeScript needs it
   throw new Error('Repair loop exited unexpectedly')
+}
+
+function intersectAllowedTools(roleTools: string[], overrideTools: string[]): string[] {
+  const allowed = new Set(overrideTools.map(tool => tool.trim().toLowerCase()))
+  return roleTools.filter(tool => allowed.has(tool.trim().toLowerCase()))
 }
 
 function buildRepairPrompt(

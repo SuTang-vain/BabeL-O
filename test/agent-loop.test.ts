@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { runAgentLoop } from '../src/nexus/agentLoop.js'
+import { runAgentLoopLiveSmoke } from '../src/nexus/agentLoopSmoke.js'
 import {
   configureStorageBridgeWalForTest,
   flushStorageBridgeWalForTest,
@@ -916,6 +917,139 @@ test('runAgentLoop non-dry-run provider smoke executes fixed runtime-backed task
     globalThis.fetch = originalFetch
     ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
     rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test('runAgentLoopLiveSmoke uses fixed live/manual task and read-only tool surface', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const originalFetch = globalThis.fetch
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(tmpdir(), `babel-o-agent-loop-live-smoke-${Date.now()}.json`)
+  const configManager = new ConfigManager(configPath)
+  configManager.save({
+    defaultModel: 'anthropic/claude-3-5-sonnet',
+    providers: {
+      anthropic: {
+        apiKey: 'test-agent-loop-live-smoke-key',
+        baseUrl: 'https://agent-loop-live-smoke.invalid',
+      },
+    },
+  })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  const requestBodies: any[] = []
+  globalThis.fetch = async (_url, init) => {
+    const body = parseProviderRequestBody(init)
+    requestBodies.push(body)
+    if (isAgentLoopIntakeRequest(body)) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          intent: 'continue',
+          confidence: 0.95,
+          continuity: 0.8,
+          contextScope: 'current_task',
+          actionHint: 'normal',
+          requiresTools: true,
+          reason: 'Fixed live smoke should proceed.',
+          guidance: 'Proceed with the fixed live smoke task.',
+          explicitPaths: [],
+        })),
+        text: async () => 'mock intake',
+      } as Response
+    }
+
+    const latestText = latestProviderUserText(body)
+    if (latestText.includes('Role:\nplanner')) {
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Read'])
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          summary: 'Unsafe plan that should be replaced by reviewPlan',
+          tasks: [{
+            title: 'Run arbitrary user task',
+            description: 'This should never be executed.',
+          }],
+        })),
+        text: async () => 'mock planner',
+      } as Response
+    }
+
+    if (latestText.includes('Role:\noptimizer') && !latestText.includes('BABEL_O_AGENT_LOOP_SMOKE_OK')) {
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Read'])
+      assert.ok(latestText.includes('Read fixed AgentLoop live smoke fixture'))
+      assert.equal(latestText.includes('Run arbitrary user task'), false)
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicToolResponse({
+          id: 'tool-live-smoke-read',
+          name: 'Read',
+          input: { path: 'fixture.txt' },
+        }),
+        text: async () => 'mock optimizer tool',
+      } as Response
+    }
+
+    if (latestText.includes('Role:\ncritic')) {
+      assert.equal(body.tools, undefined)
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          approved: true,
+          reason: 'Fixed live/manual AgentLoop smoke passed.',
+        })),
+        text: async () => 'mock critic',
+      } as Response
+    }
+
+    if (latestText.includes('BABEL_O_AGENT_LOOP_SMOKE_OK')) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          taskId: '1',
+          success: true,
+          result: 'Read fixture.txt and found BABEL_O_AGENT_LOOP_SMOKE_OK.',
+          needsReview: true,
+        })),
+        text: async () => 'mock optimizer final',
+      } as Response
+    }
+
+    throw new Error(`Unexpected live smoke request: ${latestText.slice(0, 400)}`)
+  }
+
+  try {
+    const result = await runAgentLoopLiveSmoke({
+      model: 'anthropic/claude-3-5-sonnet',
+      timeoutMs: 30_000,
+    })
+
+    assert.equal(result.type, 'agent_loop_smoke')
+    assert.equal(result.mode, 'live_manual')
+    assert.equal(result.ready, true)
+    assert.equal(result.live, true)
+    assert.equal(result.success, true)
+    assert.equal('apiKey' in result.provider, false)
+    assert.equal(result.workspaceCreated, true)
+    assert.equal(result.workspaceCleaned, true)
+    assert.equal(result.plannerCompleted, true)
+    assert.equal(result.taskCompleted, true)
+    assert.equal(result.criticCompleted, true)
+    assert.equal(result.toolCallCount, 1)
+    assert.equal(result.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(requestBodies.some(body => latestProviderUserText(body).includes('Role:\noptimizer') && JSON.stringify(body).includes('Run arbitrary user task')), false)
+    assert.equal(requestBodies.some(body => JSON.stringify(body).includes('test-agent-loop-live-smoke-key')), false)
+  } finally {
+    globalThis.fetch = originalFetch
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(configPath, { force: true })
   }
 })
 

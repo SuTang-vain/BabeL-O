@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseOptimizeSubAgentOptions } from '../src/cli/commands/optimize.js'
+import { parseOptimizeSubAgentOptions, parseOptimizeProviderSmokeLiveOptions } from '../src/cli/commands/optimize.js'
 
 test('parseOptimizeSubAgentOptions keeps sub-agents disabled by default', () => {
   const parsed = parseOptimizeSubAgentOptions({
@@ -46,6 +46,31 @@ test('parseOptimizeSubAgentOptions accepts commander camelcase for --enable-suba
   })
 
   assert.equal(parsed.enableSubAgents, true)
+})
+
+test('parseOptimizeProviderSmokeLiveOptions parses explicit timeout and model', () => {
+  const parsed = parseOptimizeProviderSmokeLiveOptions({
+    focus: 'performance',
+    cwd: '/repo',
+    timeoutMs: '45000',
+    model: 'anthropic/claude-3-5-sonnet',
+  })
+
+  assert.deepEqual(parsed, {
+    timeoutMs: 45000,
+    model: 'anthropic/claude-3-5-sonnet',
+  })
+})
+
+test('parseOptimizeProviderSmokeLiveOptions rejects invalid timeout', () => {
+  assert.throws(
+    () => parseOptimizeProviderSmokeLiveOptions({
+      focus: 'performance',
+      cwd: '/repo',
+      timeoutMs: 'soon',
+    }),
+    /--timeout-ms must be a positive integer/,
+  )
 })
 
 test('parseOptimizeSubAgentOptions rejects invalid limits', () => {
