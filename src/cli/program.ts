@@ -31,6 +31,13 @@ registerConfigCommand(program)
 registerModelsCommand(program)
 registerOptimizeCommand(program)
 
+program
+  .command('__server', { hidden: true })
+  .description('Start a local Nexus service (daemon)')
+  .action(async () => {
+    await import('../nexus/server.js')
+  })
+
 const isMain = () => {
   try {
     const mainPath = fs.realpathSync(process.argv[1] || '')

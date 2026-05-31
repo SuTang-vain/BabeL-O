@@ -72,6 +72,12 @@
 - `npm run typecheck`、`npm test`、`npm run benchmark`、核心 storage/context/provider/TUI smoke 已建立。
 - `README.md` 与 `README.zh-CN.md` 已拆分英文/中文入口。
 
+## 上下文管理升级专项
+
+详细实施路径见 [CONTEXT_UPGRADE_ROADMAP.md](./CONTEXT_UPGRADE_ROADMAP.md)。
+
+Phase 0-3 逐文件、逐函数、逐测试的实操指导，覆盖 Token 估算、Blocking Limit、Microcompact、Compact 后状态重建、Session Memory、Working Set、Prefix Cache、Path Mention。
+
 ## 仍需守住的底线
 
 - TODO 文件只写未完成项；完成后移动到本文件并在 WORK_LOG 追加事实。

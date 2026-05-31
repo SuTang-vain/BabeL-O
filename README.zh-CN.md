@@ -1,6 +1,6 @@
 # BabeL-O
 
-> **高性能、以 Nexus 服务端为核心（Nexus-first）的终端 AI 编程智能体。基于 Node.js 与 Fastify 构建，拥有独立的执行运行时、原生 stdio MCP 客户端、动态上下文压缩与状态重建，支持通过轻量级交互式终端 TUI CLI 进行管控。**
+> **高性能、以 Nexus 服务端为核心（Nexus-first）的通用泛化 AI 智能体（Generalized Agent）。基于 Node.js 与 Fastify 构建，拥有独立的执行运行时、原生 stdio MCP 客户端、动态上下文压缩与状态重建，支持通过轻量级交互式终端 TUI CLI 进行管控。**
 
 [English README](README.md)
 
@@ -8,11 +8,11 @@
 
 ## 什么是 BabeL-O？
 
-BabeL-O 是对 **BabeL-X 的 Nexus-first 重写版本**，旨在将智能体核心的状态控制与代码执行逻辑从臃肿的终端客户端中剥离，移至无界面（Headless）的服务端运行时（**Nexus**）。它贯彻以下设计原则：
+BabeL-O 采用 **以 Nexus 服务端为核心（Nexus-first）的架构设计**，旨在将智能体核心的状态控制与执行逻辑从终端客户端中剥离，移至无界面（Headless）的服务端运行时（**Nexus**）。它贯彻以下设计原则：
 
 > **Nexus 负责执行与状态，CLI 负责交互。**
 
-通过将终端用户界面（TUI）与核心执行引擎彻底解耦，BabeL-O 不仅能作为一个长驻的后台服务运行，还可以作为 CI 门禁中的无界面智能体或隔离的容器化编码助手；同时，为开发者提供一个极速、零开销的终端命令行客户端 `bbl` 进行日常交互。
+通过将终端用户界面（TUI）与核心执行引擎彻底解耦，BabeL-O 不仅能作为一个长驻的后台服务运行，还可以作为 CI 门禁中的无界面智能体或隔离的容器化任务求解智能体；同时，为用户提供一个极速、零开销的终端命令行客户端 `bbl` 进行日常交互。
 
 ---
 
@@ -67,50 +67,70 @@ graph TD
 - **严格的工作区路径保护**：通过统一的 `pathSafety.ts` 拦截非工作区文件读写，使用 `realpath` 解析真实物理路径，彻底防范利用符号链接（Symlinks）逃逸安全区。
 - **原生 MCP Stdio 客户端**：通过 `mcp.json` 配置直接接入 Model Context Protocol 服务端，将其动态包装为经过安全分级的原生工具。
 - **Planner ➔ Executor ➔ Critic 编排**：支持在隔离的 Git Worktree 中进行复杂的智能体协作，配合工作区文件系统互斥锁（Mutex Locks）实现安全的并发开发与自动合并/回滚。
-- **结构化审计审计**：所有工具输入输出、模型用量和权限变更日志均自动落盘至 SQLite 数据库（基于原生 `node:sqlite`）。
+- **结构化审计**：所有工具输入输出、模型用量和权限变更日志均自动落盘至 SQLite 数据库（基于原生 `node:sqlite`）。
 
 ---
 
-## 安装与快速上手
+## 安装与部署
 
-### 环境要求
+你可以通过直接下载预编译的原生二进制包（推荐，最快），或通过源码构建来进行安装。
 
-*   **Node.js >= 22**（依赖原生 ESM 和原生 SQLite 模块）
-*   **npm** 或 **yarn** 包管理器
-*   *可选：* Docker（用于开启命令执行的 Docker 隔离沙箱）
+### 方法一：下载预编译原生二进制包（推荐，最快）
 
-### 安装步骤
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`）。
 
+将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
+```bash
+# 启动交互式会话（本地无需安装任何 Node.js 运行环境）
+bbl chat
+```
+
+---
+
+### 方法二：通过源码构建安装（用于开发调试）
+
+#### 前提条件
+
+*   **Node.js >= 22**（使用了原生 ESM 与 native SQLite 模块）
+*   **npm** 或 **yarn**
+*   *可选：* Docker（用于运行沙箱环境）
+
+#### 源码构建步骤：
 ```bash
 # 克隆仓库
-git clone https://github.com/tangyaoyue/BabeL-O.git
+git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
 
 # 安装依赖
 npm install
 
-# 静态类型检查
-npm run typecheck
-
 # 运行自动化测试
 npm test
 
-# 启动 Nexus 服务端（绑定 API 与 WebSocket）
-npm run start
+# 选项 A：使用 npm 脚本构建运行
+npm run build
+npm run start # 启动后台守护 Nexus 服务
+
+# 选项 B：编译为单文件原生二进制包
+npm run build:binary
 ```
 
-在另一个终端终端，链接 CLI 并开始对话：
-
+如果使用**选项 A**，请在另一个终端中全局软链并启动 CLI 客户端：
 ```bash
-# 全局挂载 bbl 软链接
 npm link
-
-# 启动交互式会话
 bbl chat
-
-# 或者进行单次指令执行
-bbl run "编写一个 python 快速排序函数"
 ```
+
+如果使用**选项 B**，可直接运行编译好的二进制：
+```bash
+./dist/bbl chat
+```
+
+#### 独立原生二进制包编译 (Node.js SEA) 特性：
+* **全自包含 (Self-contained)**：目标运行系统上无需预装 Node.js 环境或 `node_modules` 依赖。
+* **内置资源整合 (Embedded Assets)**：内置的开发者技能（`.md` 技能文件）直接作为 SEA Asset 嵌入二进制包中，运行时原生动态加载。
+* **Homebrew 优化与剥离处理 (Homebrew Workaround)**：若编译环境使用的是被剥离了符号的 Node 运行时（如 macOS Homebrew 版本），脚本会自动从官方源下载、解压并缓存官方的 Node 模板二进制文件，以防注入失败。
+* **ESM require 垫片**：使用动态 Banner 垫片技术，支持打包后 ESM 代码中对 CommonJS 依赖库的无缝调用。
 
 ---
 

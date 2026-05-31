@@ -52,7 +52,7 @@ Legacy complexity is not imported by default.
 | 文档 | 维护内容 |
 | --- | --- |
 | [README.md](./README.md) | `docs/nexus` 入口、架构分层、历史文档合并口径。 |
-| [TODO_runtime.md](./TODO_runtime.md) | Runtime、Nexus API、storage、security、context、compact、MCP、skills、permissions 的未收口项。 |
+| [TODO_runtime.md](./TODO_runtime.md) | Runtime、Nexus API、storage、security、context、compact、MCP、skills、permissions 的未收口项。**上下文管理升级专项见 [CONTEXT_UPGRADE_ROADMAP.md](./CONTEXT_UPGRADE_ROADMAP.md)。** |
 | [TODO_agents.md](./TODO_agents.md) | TaskSession、TaskQueue、AgentLoop、Planner/Executor/Critic、sub-agent、worktree 的未收口项。 |
 | [TODO_provider_registry.md](./TODO_provider_registry.md) | Provider registry、adapter、role routing、model capability matrix 的未收口项。 |
 | [TODO_tui.md](./TODO_tui.md) | `bbl chat`、输入框、slash/tool palette、permission panel、事件渲染的未收口项。 |

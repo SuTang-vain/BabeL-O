@@ -28,9 +28,13 @@ export function registerNexusCommand(program: Command): void {
       maxToolOutputBytes?: string
       bashMaxBufferBytes?: string
     }) => {
+      const args = process.argv[1] && (process.argv[1].endsWith('.js') || process.argv[1].endsWith('.ts'))
+        ? [process.argv[1], '__server']
+        : ['__server']
+
       const child = spawn(
         process.execPath,
-        ['--import', 'tsx', new URL('../../nexus/server.ts', import.meta.url).pathname],
+        args,
         {
           stdio: 'inherit',
           env: {

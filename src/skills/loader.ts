@@ -88,10 +88,34 @@ export async function loadSkillsFromDir(dirPath: string): Promise<Skill[]> {
 }
 
 export async function loadAllSkills(cwd: string, builtInDir?: string): Promise<Skill[]> {
-  const defaultBuiltInDir = builtInDir || path.join(path.dirname(fileURLToPath(import.meta.url)), 'built-in');
-  const builtInSkills = await loadSkillsFromDir(defaultBuiltInDir);
-  const userSkills = await loadSkillsFromDir('~/.babel-o/skills');
-  const projectSkills = await loadSkillsFromDir(path.join(cwd, '.babel-o/skills'));
+  let hasAsset: any = null
+  let getAsset: any = null
+  try {
+    const sea = await import('node:sea') as any
+    hasAsset = sea.hasAsset
+    getAsset = sea.getAsset
+  } catch {}
+
+  const builtInSkills: Skill[] = []
+  const skillFiles = ['coding.md', 'debugging.md', 'git.md', 'optimization.md', 'testing.md']
+
+  if (hasAsset && getAsset && hasAsset('skills/built-in/coding.md')) {
+    for (const file of skillFiles) {
+      try {
+        const content = getAsset(`skills/built-in/${file}`, 'utf8')
+        const skill = parseFrontMatter(content)
+        if (skill) {
+          builtInSkills.push(skill)
+        }
+      } catch {}
+    }
+  } else {
+    const defaultBuiltInDir = builtInDir || path.join(path.dirname(fileURLToPath(import.meta.url)), 'built-in')
+    builtInSkills.push(...await loadSkillsFromDir(defaultBuiltInDir))
+  }
+
+  const userSkills = await loadSkillsFromDir('~/.babel-o/skills')
+  const projectSkills = await loadSkillsFromDir(path.join(cwd, '.babel-o/skills'))
 
   const skillMap = new Map<string, Skill>();
   for (const skill of builtInSkills) {

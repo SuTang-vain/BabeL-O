@@ -1,6 +1,6 @@
 # BabeL-O
 
-> **A high-performance, Nexus-first agentic AI coding assistant. Built with Fastify and Node.js, featuring an isolated runtime, stdio-based MCP client, dynamic context compaction, and multi-agent coordination, all controllable via a lightweight interactive TUI CLI.**
+> **A high-performance, Nexus-first generalized AI agent. Built with Fastify and Node.js, featuring an isolated runtime, stdio-based MCP client, dynamic context compaction, and multi-agent coordination, all controllable via a lightweight interactive TUI CLI.**
 
 [简体中文 README](README.zh-CN.md)
 
@@ -8,11 +8,11 @@
 
 ## What is BabeL-O?
 
-BabeL-O is a **Nexus-first rewrite of BabeL-X**, shifting the core intelligence and execution out of the client terminal and into a headless server runtime (**Nexus**). It operates under a strict design philosophy:
+BabeL-O is a **Nexus-first generalized agentic AI system**, shifting the core intelligence and execution out of the client terminal and into a headless server runtime (**Nexus**). It operates under a strict design philosophy:
 
 > **Nexus owns execution. CLI owns interaction.**
 
-By decoupling the terminal user interface (TUI) from the execution engine, BabeL-O can run as a persistent backend service, a headless CI agent, or a containerized coding assistant, while providing developers with a lightning-fast, zero-overhead CLI client (`bbl`) for day-to-day work.
+By decoupling the terminal user interface (TUI) from the execution engine, BabeL-O can run as a persistent backend service, a headless CI agent, or a containerized task-solving agent, while providing users with a lightning-fast, zero-overhead CLI client (`bbl`) for day-to-day operations.
 
 ---
 
@@ -71,44 +71,63 @@ graph TD
 
 ## Installation
 
-### Prerequisites
+You can install BabeL-O either by downloading a pre-compiled native binary directly or by building it from source.
+
+### Method 1: Pre-compiled Native Binary (Recommended & Fastest)
+
+Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases).
+
+Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
+```bash
+# Start an interactive chat session directly (no Node.js installation required)
+bbl chat
+```
+
+---
+
+### Method 2: Build from Source (For Development)
+
+#### Prerequisites
 
 *   **Node.js >= 22** (uses native ESM and native SQLite modules)
 *   **npm** or **yarn**
 *   *Optional:* Docker (for isolated sandbox execution)
 
-### Quick Start
-
+#### Steps:
 ```bash
 # Clone the repository
-git clone https://github.com/tangyaoyue/BabeL-O.git
+git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
 
 # Install dependencies
 npm install
 
-# Build & Run TypeScript typechecks
-npm run typecheck
-
 # Run unit and integration tests
 npm test
 
-# Start the Nexus server
-npm run start
+# Option A: Build and run via npm scripts
+npm run build
+npm run start # Start the Nexus background daemon
+
+# Option B: Compile into a native standalone binary
+npm run build:binary
 ```
 
-In a separate terminal, link the CLI and start chatting:
-
+In a separate terminal, if using Option A, link the CLI globally and start:
 ```bash
-# Link command globally as `bbl`
 npm link
-
-# Chat with the active agent
 bbl chat
-
-# Or run a one-shot task
-bbl run "Write a quicksort function in python"
 ```
+If using Option B, you can run the generated binary directly:
+```bash
+./dist/bbl chat
+```
+
+#### Standalone Native Binary Compilation (Node.js SEA) Features:
+* **Fully self-contained**: Runs on target systems without Node.js or `node_modules` pre-installed.
+* **Embedded Resources**: Built-in developer skills (`.md` files) are baked directly into the binary as native assets, loaded dynamically at runtime.
+* **Homebrew & Stripped Runtime Workaround**: If the compiling environment uses a stripped Node.js binary (common with macOS Homebrew), the build script automatically downloads, caches, and compiles with the official Node.js runtime template.
+* **ESM require shim**: Uses dynamic shimming to support CommonJS dependency requirements inside the bundled ESM codebase.
 
 ---
 
