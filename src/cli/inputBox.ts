@@ -62,11 +62,11 @@ export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: str
   const promptWidth = visibleTerminalWidth(prompt)
   const contentWidth = Math.max(1, lineWidth - promptWidth)
   const cursor = Math.max(0, Math.min(options.cursor, options.line.length))
-  const view = createInputViewport(options.line, cursor, contentWidth)
+  const wrapped = wrapInputLines(options.line, cursor, contentWidth)
   const suggestionTail = getSuggestionTail(options.line, options.suggestion)
-  const canRenderSuggestion = !view.truncated &&
+  const canRenderSuggestion = wrapped.lines.length === 1 &&
     suggestionTail.length > 0 &&
-    terminalWidth(view.text) + terminalWidth(suggestionTail) <= contentWidth
+    terminalWidth(wrapped.lines[0]!) + terminalWidth(suggestionTail) <= contentWidth
   const hasInputContent = options.line.length > 0
   const canRenderPlaceholder = !hasInputContent &&
     options.placeholder !== undefined &&
@@ -75,16 +75,22 @@ export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: str
   const renderedPlaceholder = canRenderPlaceholder
     ? chalk.dim(truncateToTerminalWidth(options.placeholder!, contentWidth))
     : ''
-  const inputLine = `${prompt}${view.text}${renderedSuggestion}${renderedPlaceholder}`
+  const inputLines = wrapped.lines.map((line, index) => {
+    const prefix = index === 0 ? prompt : ' '.repeat(promptWidth)
+    const suffix = index === 0 ? renderedSuggestion || renderedPlaceholder : ''
+    return `${prefix}${line}${suffix}`
+  })
   const footer = formatInputFooter(lineWidth, options.modelId)
+  const cursorRow = 1 + wrapped.cursorRow
+  const totalRows = inputLines.length + 3
 
   return {
-    text: `${separator}\n${inputLine}\n${separator}\n${footer}`,
-    cursorColumn: promptWidth + view.cursorColumn,
-    cursorRow: 1,
-    cursorRowsFromBottom: 2,
+    text: `${separator}\r\n${inputLines.join('\r\n')}\r\n${separator}\r\n${footer}`,
+    cursorColumn: promptWidth + wrapped.cursorColumn,
+    cursorRow,
+    cursorRowsFromBottom: totalRows - 1 - cursorRow,
     contentWidth,
-    truncated: view.truncated,
+    truncated: false,
     renderedSuggestion: canRenderSuggestion,
     renderedPlaceholder: canRenderPlaceholder,
   }
@@ -124,6 +130,38 @@ function isPrintableInputChunk(chunk: string): boolean {
     if (codePoint < 32 || codePoint === 127) return false
   }
   return true
+}
+
+function wrapInputLines(line: string, cursor: number, width: number): { lines: string[]; cursorRow: number; cursorColumn: number } {
+  const lines: string[] = ['']
+  let currentWidth = 0
+  let cursorRow = 0
+  let cursorColumn = 0
+  const clampedCursor = Math.max(0, Math.min(cursor, line.length))
+
+  for (let i = 0; i < line.length;) {
+    if (i === clampedCursor) {
+      cursorRow = lines.length - 1
+      cursorColumn = currentWidth
+    }
+    const codePoint = line.codePointAt(i)!
+    const char = String.fromCodePoint(codePoint)
+    const charWidth = terminalWidth(char)
+    if (currentWidth > 0 && currentWidth + charWidth > width) {
+      lines.push('')
+      currentWidth = 0
+    }
+    lines[lines.length - 1] += char
+    currentWidth += charWidth
+    i += codePoint > 0xffff ? 2 : 1
+  }
+
+  if (clampedCursor === line.length) {
+    cursorRow = lines.length - 1
+    cursorColumn = currentWidth
+  }
+
+  return { lines, cursorRow, cursorColumn }
 }
 
 function createInputViewport(line: string, cursor: number, width: number): { text: string; cursorColumn: number; truncated: boolean } {

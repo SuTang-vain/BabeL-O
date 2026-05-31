@@ -3,6 +3,7 @@ import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
 import type { ToolTrace } from '../shared/toolTrace.js'
 import type {
+  ChildSessionListOptions,
   EventListOptions,
   EventListResult,
   NexusStorage,
@@ -43,6 +44,23 @@ export class MemoryStorage implements NexusStorage {
     const includeEvents = options.includeEvents ?? false
     return [...this.sessions.values()]
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+      .slice(0, limit)
+      .map(session => cloneSession(session, includeEvents))
+  }
+
+  async listChildSessions(
+    parentSessionId: string,
+    options: ChildSessionListOptions = {},
+  ): Promise<SessionSnapshot[]> {
+    const limit = options.limit ?? 50
+    const includeEvents = options.includeEvents ?? false
+    return [...this.sessions.values()]
+      .filter(session => session.parentSessionId === parentSessionId)
+      .sort((a, b) => {
+        const cmp = a.createdAt.localeCompare(b.createdAt)
+        if (cmp !== 0) return cmp
+        return a.sessionId.localeCompare(b.sessionId)
+      })
       .slice(0, limit)
       .map(session => cloneSession(session, includeEvents))
   }

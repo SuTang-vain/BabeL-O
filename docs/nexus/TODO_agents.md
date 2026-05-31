@@ -2,138 +2,74 @@
 
 ## 目标
 
-在 Nexus core 上建立可恢复、可观察、可审计的多 Agent 编程工作流。短期目标是 TaskSession/TaskQueue 稳定；中期目标是 Planner/Executor/Critic；长期目标是 AetheL / SDK / dashboard 可以可靠编排任务。
+在 Nexus core 上保持可恢复、可观察、可审计的多 Agent 编程工作流。本文只记录 TaskSession、TaskQueue、AgentLoop、Planner/Executor/Critic、sub-agent、worktree 与 optimizer 仍未收口的开发项。已完成能力移入 [DONE.md](./DONE.md)，事实流水写入 [WORK_LOG.md](./WORK_LOG.md)。
 
 ## 当前状态
 
-- [x] `SessionSnapshot` 已存在。
-- [x] `NexusTask` 已存在。
-- [x] `TaskCreate` 工具已存在。
-- [x] `/v1/sessions/:sessionId/tasks` 可列出任务。
-- [x] `/v1/sessions/:sessionId/tasks` 可创建任务。
-- [x] 已实现 TaskQueue。
-- [x] 已实现 AgentLoop。
-- [x] 已实现 Planner/Executor/Critic 以及 Optimizer 自优化角色。
-- [x] AgentLoop 支持受控 subTasks 委派第一版，Executor/Optimizer 可拆分实质子任务，父任务等待子任务完成后再收口。
-- [x] `bbl optimize` 已暴露 subAgents 参数：`--enable-subagents`、`--max-sub-agent-depth`、`--max-sub-tasks-per-task`。
-- [x] Agent role 工具策略已接入 provider 可见工具过滤，Planner 只暴露只读工具，避免模型看到不可用工具后触发 denied。
-- [x] `bbl optimize` 非 dry-run 前已接入 Planner human-in-the-loop 第一版，支持确认、编辑任务标题/描述、拒绝计划。
-- [x] CLI Task Status Board 已展示父任务 blocked、子任务层级、parentTaskId 和 delegatedSubTaskIds。
+- TaskSession、TaskQueue、Planner/Executor/Critic、Optimizer、`bbl optimize`、Planner HITL、受控 sub-agent、跨 session 子 Agent、worktree isolation、in-place Git hardening、session assets query API 均已落地。
+- `bbl optimize --provider-smoke-live` 入口已存在，并已通过 mocked provider 安全回归；当前缺口是手动运行真实 provider，验证 structured output、role routing 与工具调用稳定性。
+- Dashboard/SDK 只读 assets snapshot 已落地；下一步需要把 task 写操作稳定成外部可用 mutation API。
 
-## P1 TaskSession
+## P1 Real Provider Live / Manual Smoke
 
-- [x] 扩展 Session phase：`planning`、`executing`、`waiting_permission`、`waiting_user`、`reviewing`、`completed`、`failed`、`cancelled`。
-- [x] 为 session 增加 `parentSessionId`。
-- [x] 为 session 增加 `currentTaskId`。
-- [x] 为 session 增加 `terminalReason`。
-- [x] 为 session 增加 `pendingInput`。
-- [x] 为 session 增加 `lastUserInput`。
-- [x] 建立 session event append-only 语义。
-- [x] 增加 `POST /v1/sessions/:id/input`。
-- [x] 增加 session resume smoke。
+- [ ] 手动执行真实 provider live/manual AgentLoop smoke。
+  - 推荐命令：`bbl optimize --provider-smoke-live --model <provider/model>`。
+  - 记录 provider/model/profile、Planner structured output、role routing、Read-only 工具调用、Critic 结果、fallback policy、临时 workspace 清理结果。
+  - 若失败，必须把失败分到具体类别：`schema_mismatch`、`no_structured_json`、`EMPTY_PROVIDER_RESPONSE`、tool denied、tool failed、role capability gate、provider protocol error。
+  - 将真实失败样本固化到 deterministic regression fixture 后，再修 adapter、role prompt、structured-output repair 或 model routing。
+- [ ] 给 live/manual smoke 增加可选诊断输出。
+  - 输出每个 role 的模型、工具白名单、structured parse source、repair/retry 次数、token/耗时、失败摘要。
+  - 默认隐藏 API key、baseUrl credential、完整 provider raw body；需要 debug 时只写入本地安全日志。
 
-## P1 TaskQueue
+## P1 SDK Task Mutation API
 
-- [x] 引入 `queueId`。
-- [x] task 支持 `dependsOn`。
-- [x] task 支持 `blocks`。
-- [x] task 支持 `ownerAgentId`。
-- [x] task 支持 `retryCount`。
-- [x] task 支持 `review`。
-- [x] task 支持 `metadata`。
-- [x] 实现 claim。
-- [x] 实现 complete。
-- [x] 实现 fail/requeue。
-- [x] 实现 queue settled 判断。
-- [x] 依赖失败传播：`propagateFailures` 级联标记下游任务为 failed，防止死锁 (2026-05-28)。
+- [ ] 定义外部 SDK task mutation API。
+  - 覆盖 create、update title/description/status/metadata、cancel、retry、approve/reject、claim/complete/fail 的最小稳定写接口。
+  - 每个 mutation 必须写入 session event audit，包含 actor、source、previous state、next state、reason、taskId、parentTaskId。
+  - 幂等 mutation 需要 request id 或 revision guard，避免 dashboard/SDK 重试导致重复子任务或重复 cancel。
+- [ ] 将 mutation API 与现有 TaskQueue/TaskSession 生命周期合并。
+  - 外部 cancel 需要级联 child sessions 和 blocked parent task。
+  - retry/fail 需要复用依赖失败传播语义，避免 settled 判断与外部写入竞态。
+  - approve/reject 不能绕过 Planner HITL 与 permission audit。
+- [ ] 补 SDK/dashboard 写操作 smoke。
+  - MemoryStorage 与 SqliteStorage 都要覆盖。
+  - 覆盖 active session、completed session、cancelled session、child session、worktree task、failed dependency。
 
-## P2 Agent Roles
+## P2 AgentLoop Robustness
 
-- [x] 定义 `AgentRoleDefinition`。
-- [x] 定义 Planner schema。
-- [x] 定义 Executor schema。
-- [x] 定义 Critic schema。
-- [x] 实现 mockable `runAgentLoop()`。
-- [x] Planner 生成 TaskQueue。
-- [x] Executor claim/complete task。
-- [x] Critic review task result。
-- [x] Critic rejected 时创建 fix task。
-- [x] 支持 `reviewMode=none|critic`。
+- [ ] 将真实 provider smoke 中暴露的 structured output 失败转化为 role-specific repair 策略。
+  - Planner：空 JSON 或任务过大时优先重问更小任务列表。
+  - Executor/Optimizer：缺 `status/result/summary` 时保留 raw output 并请求同模型修复一次。
+  - Critic：无法结构化时允许降级为 conservative reject 或 explicit needs-human-review。
+- [ ] AgentLoop 成本与失败率 benchmark。
+  - 记录 Planner/Executor/Critic/SubAgent 调用次数、tokens、耗时、失败类型。
+  - 用数据决定 Critic/sub-agent 默认开启策略，而不是凭体验判断。
+- [ ] 子 Agent transcript 查询与恢复 UX。
+  - 当前 metadata/transcriptPath 已具备；还需要 CLI/API 提供稳定查看 child transcript 摘要、展开详情、重新运行失败子任务的入口。
 
-## P2 Runtime Integration
+## P2 Worktree / Git Hardening
 
-- [x] AgentLoop 使用真实 provider runtime。
-- [x] role model preference 接入 provider registry。
-- [x] role 输出使用 structured output。
-- [x] 解析失败时保存 raw output。
-- [x] AgentLoop events 写入 session events。
-- [x] CLI 可触发 `sessions resume --run-agent-loop` (或 cli 中已集成 optimize 执行)。
-- [x] structured-output repair: `tryParseWithRepair` 添加 logger.debug 日志；`zodToJsonSchemaShape` 对 ZodUnknown/ZodAny/fallback 返回 `{ type: 'object' }` 而非 `{}` (2026-05-28)。
-
-## P3 AetheL / SDK / Dashboard
-
-- [x] 渐进实现 AgentTool 语义：不迁移 BabeL-X `AgentTool.tsx`，先让 Executor 能创建 sub-task，由 TaskQueue 调度。
-- [x] Executor output schema 增加 `subTasks` 字段，支持 title/description/requiresIsolation。
-- [x] `runAgentLoop()` 增加 `enableSubAgents`、`maxSubAgentDepth` 与 `maxSubTasksPerTask`，防止无限递归和过量派生。
-- [x] 父任务委派后转为 blocked，子任务完成后自动回到 pending，由 Executor 汇总收口。
-- [x] `bbl optimize --dry-run --enable-subagents` 真实 provider smoke 已验证可读取目标目录并产出结构化计划。
-- [x] 支持 human-in-the-loop 第一版：Planner 产出任务列表后可等待用户确认/编辑/拒绝，拒绝会取消 TaskSession 并记录 terminal reason。
-- [x] 支持 subTasks 可视化第一版：CLI 事件渲染会显示父任务 blocked、子任务缩进层级、parent/delegated 元信息。
-- [x] 支持 worktree 隔离第一版：带 `requiresIsolation` metadata 的任务会在 Git worktree 中执行，审核通过后 commit 并 cherry-pick 回主工作区，完成后清理临时 worktree。
-- [x] 支持跨 session task 委派并实现动态子 Agent。
-- [x] 解决嵌套隔离 Worktree 合并及 cherry-pick 范围回传，实现冲突文件精确提取与错误诊断，完成子代理嵌套隔离测试。
-- [x] 非隔离 in-place optimizer 的 Git 操作继续加固：避免 `git add .` 纳入无关未跟踪文件，避免 `git reset --hard` / `git clean -fd` 删除用户手动创建但未纳入本次任务的文件。
-- [x] 参考 BabeL-X `AgentTool.tsx` / `runAgent.ts` 的生命周期治理，为 BabeL-O 子 Agent 定义正式 `agentId`、`parentAgentId`、`parentTaskId`、`depth`、`agentType`、`status`、`transcriptPath` 元数据。
-- [x] 子 Agent 启动时记录 `subagent_started` 事件：包含 parent session、taskId、depth、role、transcriptPath 与 permission inheritance 策略；兼容保留旧 `sub_agent_session_started` 给 CLI 渲染。
-- [x] 子 Agent 完成时记录 `subagent_completed` / `subagent_failed` / `subagent_cancelled`：包含摘要、结果事件范围、transcriptPath、失败类型；兼容保留旧 `sub_agent_session_completed/failed/error`。
-- [x] 为跨 session 子 Agent 保存独立 transcript 引用：子 session 带正式 metadata，父队列任务只保存 `subAgent` 摘要和 `nexus://sessions/<subSessionId>/events` 引用，避免父上下文依赖完整子工具链。
-- [x] 子 Agent resume 第一版：parent session 的 task metadata 与 child session metadata 提供可查询 transcriptPath 和最近 status，允许后续命令恢复或查看子 Agent 详细日志。
-- [x] 子 Agent cancel 第一版：父 session close/cancel 时级联取消未完成 child TaskSession，并把取消来源写入 child metadata 与 close 响应。
-- [x] 单个子 Agent cancel 结构化失败传播：child TaskSession 被外部取消后不会被后续 executor result 覆盖为 completed；父队列 child task 保存 `subAgent.status=cancelled` 摘要，blocked parent task 通过 failed dependency metadata 收到结构化失败并终态 failed。
-- [x] 子 Agent permission inheritance smoke：记录 role policy allow rules、requiresApproval，新增 `subagent_permission_inheritance` 审计事件；默认不继承 once approval / session approval。
-- [x] 子 Agent session-scope approval 可配置继承 audit：`subAgentApprovalInheritance.inheritSessionApprovals` 显式开启时，只继承 role allowedTools 允许的 session approval 工具名并写入 child metadata / `subagent_permission_inheritance`，once approval 仍固定不继承。
-- [x] 子 Agent MCP inheritance：默认只继承父 runtime 已显式 allowlisted 的 MCP tools；agent-specific MCP server 延后，避免前置引入插件级复杂度。
-- [x] 子 Agent skill/context inheritance：继承当前匹配 inline skills 和 explicit path anchors；只读 Explore/Plan 类任务可裁剪 gitStatus/大体积 project memory。
-- [x] 子 Agent worktree notice：当子 Agent 在隔离 worktree 内运行时，在 system/additional context 中注入 parent cwd、worktree cwd、路径转换规则、变更隔离说明。
-- [x] 子 Agent 输出契约：要求输出 `Scope`、`Result`、`Key files`、`Files changed`、`Issues` 等稳定字段，父 Agent 汇总时优先读取结构化摘要，不扫描完整 transcript。
-- [x] 防无限派生加强：除 max depth/max tasks 外，增加同 parentTaskId 重复委派检测、相同 title/description 去重、失败子任务 retry 上限。
-- [x] 成本控制：提供 `--no-critic`、`--subagent-model`、`--subagent-max-turns` 或 role 配置，避免简单任务触发过多模型往返。
-- [x] 将 worktree isolation 设为 optimizer/sub-agent 的默认推荐执行路径；in-place 模式需要显式 opt-in 或用户确认。
-- [x] AgentLoop 增加低成本执行模式：支持 `--no-critic` 或 role 配置关闭 Critic，减少简单任务的多角色 LLM 往返成本。
-- [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 通过 mock Anthropic SSE 覆盖 Planner → Optimizer → 真实 Read 工具 → Optimizer final → Critic，不访问真实网络、不执行任意用户任务，并验证 role tool policy。
-- [x] 真实 provider live/manual AgentLoop smoke 入口与安全回归：`bbl optimize --provider-smoke-live` 使用固定临时 workspace、固定 fixture、固定 planner review task 和 Read-only 工具面，覆盖 Planner → Optimizer → Read → Optimizer final → Critic；mock provider 测试确认不执行任意 planner 任务、不泄露 key、不自动切 provider/model/profile。
-- [ ] 手动执行真实 provider live/manual AgentLoop smoke：运行 `bbl optimize --provider-smoke-live --model <provider/model>`，记录真实 provider structured output、role routing 与工具调用稳定性。
-- [ ] 定义外部 SDK task API。
-- [ ] 定义 dashboard session/task query API。
-- [x] 支持远程取消和恢复：`POST /v1/sessions/:sessionId/cancel` 可中止 active HTTP/WebSocket execution 并级联取消 child sessions；`POST /v1/sessions/:sessionId/resume` 返回 session snapshot、recent events、tasks、child sessions 与 active execution metadata。
-- [ ] 将 tool trace、critic reason、usage 变成可查询 data assets，作为 SDK/dashboard query API 的收口标准。
+- [ ] 冲突人工恢复策略。
+  - 当 isolated worktree merge-back/cherry-pick 冲突时，产出明确恢复步骤、冲突文件列表、父/子 commit、临时 worktree 路径。
+  - 提供继续、放弃、保留 worktree 的后续入口；默认不删除用户可能需要排查的冲突现场。
+- [ ] 非隔离 in-place optimizer 继续默认谨慎。
+  - 保持不使用 `git add .`、不使用 `git reset --hard`、不使用 `git clean -fd` 的底线。
+  - 若必须 in-place，要求显式确认或配置 opt-in，并记录 Git status before/after。
 
 ## 验证命令
 
-- [x] `npm test` 中包含的 `test/agent-loop.test.ts`
-- [x] `npm test` 中包含的 `test/optimizer-safety.test.ts`
-- [x] subTasks 委派、父任务恢复与 maxSubAgentDepth 防递归测试已纳入 `test/agent-loop.test.ts`
-- [x] `bbl optimize --dry-run --enable-subagents --target <tmpdir>` 真实 provider Planner smoke 已通过.
-- [x] Planner review approve/edit/reject 测试已纳入 `test/agent-loop.test.ts`。
-- [x] subTasks 层级渲染测试已纳入 `test/tui-renderer.test.ts`。
-- [x] worktree 生命周期与冲突提取测试已纳入 `test/worktree.test.ts`，AgentLoop 隔离执行以及子代理嵌套隔离合并测试已纳入 `test/agent-loop.test.ts`。
-- [x] in-place optimizer Git hardening 测试已纳入 `test/agent-loop.test.ts`，worktree pathspec staging 测试已纳入 `test/worktree.test.ts`。
-- [x] 非 dry-run provider-backed deterministic AgentLoop smoke：`test/agent-loop.test.ts` 覆盖真实 `LLMCodingRuntime` + Anthropic adapter + `createRuntimeAgentStepRunner()` + `runAgentLoop()` 路径，使用固定 mock SSE 与固定 fixture，不访问真实 provider、不执行任意用户任务。
-- [x] 非 dry-run provider live/manual AgentLoop smoke 入口与安全回归：`bbl optimize --provider-smoke-live` 显式触发，临时 workspace 自动清理，Planner 输出会经 `reviewPlan` 固定为只读任务，Optimizer 只暴露 `Read`，Critic 不暴露工具；测试覆盖 mocked provider 完整链路。
-- [ ] 手动执行真实 provider live/manual AgentLoop smoke。
-  - 命令：`bbl optimize --provider-smoke-live --model <provider/model>`。
-  - 2026-05-24 已用临时 Git 仓库执行真实 `bbl optimize --enable-subagents` 非 dry-run smoke：Planner/工具调用/rollback 链路运行，但 executor 多轮失败后 TaskQueue settled，临时仓库保持干净。下一步需诊断 executor 失败细节展示与真实 provider 输出稳定性后再标完成。
-  - 2026-05-24 复跑诊断后确认：Planner 空 JSON 已可 fallback；当前主要失败类型为 Optimizer/Executor structured output 缺字段，以及 provider 空响应。下一步需做 role structured-output repair/retry 或 role model routing，再继续标完成。
-  - 2026-05-24 AgentLoop/CLI 已能展示 structured-output 失败类型、缺失必填字段、候选来源和输出预览；下一步复跑 smoke 时应优先根据 `structured=schema_mismatch` / `structured=no_structured_json` / `EMPTY_PROVIDER_RESPONSE` 分流到 repair/retry 或 role model routing。
-- [x] 子 Agent lifecycle 单元测试：`test/agent-loop.test.ts` 覆盖 `subagent_started` / `subagent_completed`、depth、parentTaskId、transcriptPath、permission inheritance 与 child session metadata。
-- [x] 子 Agent transcript 引用测试：父队列任务只保存 `subAgent` 摘要和 transcriptPath，完整事件留在 child session。
-- [x] 子 Agent cancel/resume smoke：父 session close/cancel 会级联取消 active child TaskSession 与持久化 child session，child metadata 记录 cancelledByParentSessionId/cancelReason，close/cancel response 返回 childSessionsCancelled；单个 child cancel 会写入 subAgent 取消摘要并通过 failed dependency metadata 传播到 blocked parent task。
-- [x] 远程 cancel/resume API smoke：`test/runtime.test.ts` 覆盖 active `/v1/execute` 被 `/v1/sessions/:sessionId/cancel` 远程中止、cancelled phase 被保留、持久化 child session 被级联取消，以及 `/resume` 返回 active execution / terminal snapshot。
-- [x] 子 Agent worktree notice smoke：子 Agent 在 worktree 中正确读取目标文件、提交修改并回传父工作区，已由隔离子代理合并测试覆盖。
+- [x] `npm test` 中的 AgentLoop、optimizer safety、worktree、sub-agent lifecycle、session assets mocked smoke。
+- [ ] `bbl optimize --provider-smoke-live --model <provider/model>` 手动真实 provider smoke。
+- [ ] SDK task mutation API smoke：MemoryStorage + SqliteStorage。
+- [ ] AgentLoop cost benchmark。
 
 ## 参考文件
 
-- `src/shared/session.ts`
-- `src/shared/task.ts`
-- `src/tools/builtin/task.ts`
-- `src/nexus/app.ts`
+- `src/nexus/agentLoop.ts`
+- `src/nexus/runtimeAgentStep.ts`
+- `src/nexus/taskQueue.ts`
+- `src/nexus/taskSession.ts`
+- `src/nexus/sessionAssets.ts`
+- `src/cli/commands/optimize.ts`
+- `test/agent-loop.test.ts`
+- `test/worktree.test.ts`

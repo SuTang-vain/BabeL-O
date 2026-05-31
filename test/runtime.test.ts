@@ -16,7 +16,7 @@ import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
 import { ConfigManager } from '../src/shared/config.js'
-import { eventBase, type NexusEvent } from '../src/shared/events.js'
+import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 
 function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -77,6 +77,27 @@ test('local runtime emits hook events around failed tool execution', async () =>
   assert.ok(events.some(event => event.type === 'hook_started'))
   assert.ok(events.some(event => event.type === 'hook_completed'))
   assert.ok(events.some(event => event.type === 'result'))
+})
+
+test('local runtime answers natural-language questions about file contents', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-file-question`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'question.txt'), 'answer-token: violet-river\n', 'utf8')
+
+  const tools = createDefaultToolRegistry()
+  const runtime = new LocalCodingRuntime(tools)
+  const events: Array<{ type: string; [key: string]: unknown }> = []
+  for await (const event of runtime.executeStream({
+    sessionId: 'session-file-question',
+    prompt: 'What does question.txt say?',
+    cwd,
+  })) {
+    events.push(event as any)
+  }
+
+  assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read'))
+  assert.ok(events.some(event => event.type === 'assistant_delta' && String(event.text).includes('violet-river')))
+  assert.ok(events.some(event => event.type === 'result' && String(event.message).includes('violet-river')))
 })
 
 test('Read returns a recoverable tool result for directories', async () => {
@@ -867,6 +888,196 @@ test('/v1/runtime/provider-smoke/live tool-call mode probes provider protocol wi
     else process.env.ANTHROPIC_BASE_URL = oldAnthropicBaseUrl
     if (oldConfigFile === undefined) delete process.env.BABEL_O_CONFIG_FILE
     else process.env.BABEL_O_CONFIG_FILE = oldConfigFile
+  }
+})
+
+test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-session-assets-api`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-assets-${Date.now()}.sqlite`))
+  const runtime = new LocalCodingRuntime(createDefaultToolRegistry(), allowAllTools(), storage)
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  const sessionId = `session-assets-${Date.now()}`
+  const childSessionId = `${sessionId}-child`
+  const now = Date.now()
+  const iso = (offsetMs: number) => new Date(now + offsetMs).toISOString()
+
+  try {
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'dashboard assets',
+      phase: 'completed',
+      createdAt: iso(0),
+      updatedAt: iso(10),
+      events: [],
+      result: 'done',
+    })
+    await storage.saveSession({
+      sessionId: childSessionId,
+      cwd,
+      prompt: 'child assets',
+      phase: 'completed',
+      parentSessionId: sessionId,
+      createdAt: iso(1),
+      updatedAt: iso(9),
+      events: [
+        {
+          type: 'assistant_delta',
+          schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+          sessionId: childSessionId,
+          timestamp: iso(2),
+          text: 'child transcript stays out of parent asset snapshot',
+        },
+      ],
+      metadata: {
+        agentId: 'agent-child',
+        status: 'completed',
+        transcriptPath: `nexus://sessions/${childSessionId}/events`,
+      },
+    })
+    await storage.saveTask({
+      taskId: 'task-assets-1',
+      sessionId,
+      title: 'Review dashboard query API',
+      description: 'Expose stable data assets',
+      status: 'failed',
+      source: 'critic',
+      dependsOn: [],
+      blocks: [],
+      retryCount: 1,
+      review: {
+        status: 'rejected',
+        reason: 'Critic wants clearer usage totals',
+        reviewerAgentId: 'critic',
+      },
+      createdAt: iso(3),
+      updatedAt: iso(8),
+      result: 'needs changes',
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'usage',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: iso(4),
+      inputTokens: 12,
+      outputTokens: 8,
+      cacheCreationInputTokens: 2,
+      cacheReadInputTokens: 3,
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'task_session_event',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      eventId: 'event-critic-assets-1',
+      eventType: 'critic_completed',
+      phase: 'reviewing',
+      timestamp: iso(5),
+      payload: {
+        taskId: 'task-assets-1',
+        title: 'Review dashboard query API',
+        approved: false,
+        reason: 'Usage summary missing',
+      },
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: iso(6),
+      toolUseId: 'tool-assets-1',
+      name: 'Read',
+      input: { path: 'README.md' },
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'tool_completed',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: iso(7),
+      toolUseId: 'tool-assets-1',
+      name: 'Read',
+      success: true,
+      output: 'ok',
+    })
+    await storage.savePermissionAudit({
+      auditId: 'audit-assets-1',
+      sessionId,
+      toolUseId: 'tool-assets-1',
+      toolName: 'Read',
+      toolRisk: 'read',
+      toolInput: { path: 'README.md' },
+      decision: 'approved',
+      timestamp: iso(7),
+    })
+    await storage.saveExecutionMetrics({
+      metricId: 'metric-assets-1',
+      sessionId,
+      executeDurationMs: 123,
+      toolCallCount: 1,
+      contextCharsIn: 456,
+      contextCharsOut: 78,
+      timestamp: iso(9),
+    })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/assets?eventLimit=2&toolTraceLimit=1`,
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'session_assets')
+    assert.equal(body.schemaVersion, '2026-05-31.babel-o.session-assets.v1')
+    assert.equal(body.sessionId, sessionId)
+    assert.equal(body.session.events.length, 0)
+    assert.equal(body.tasks[0].taskId, 'task-assets-1')
+    assert.equal(body.childSessions[0].sessionId, childSessionId)
+    assert.equal(body.childSessions[0].events.length, 0)
+    assert.equal(body.childSessions[0].metadata.transcriptPath, `nexus://sessions/${childSessionId}/events`)
+    assert.equal(body.events.items.length, 2)
+    assert.equal(body.events.truncated, true)
+    assert.equal(body.toolTraces.items.length, 1)
+    assert.equal(body.toolTraces.items[0].toolUseId, 'tool-assets-1')
+    assert.equal(body.toolTraces.items[0].success, true)
+    assert.equal(body.usageSummary.eventCount, 1)
+    assert.equal(body.usageSummary.inputTokens, 12)
+    assert.equal(body.usageSummary.outputTokens, 8)
+    assert.equal(body.usageSummary.cacheCreationInputTokens, 2)
+    assert.equal(body.usageSummary.cacheReadInputTokens, 3)
+    assert.ok(body.criticReviews.some((review: any) =>
+      review.source === 'task_review' &&
+      review.taskId === 'task-assets-1' &&
+      review.reason === 'Critic wants clearer usage totals',
+    ))
+    assert.ok(body.criticReviews.some((review: any) =>
+      review.source === 'critic_event' &&
+      review.taskId === 'task-assets-1' &&
+      review.reason === 'Usage summary missing',
+    ))
+    assert.equal(body.permissionAudits[0].auditId, 'audit-assets-1')
+    assert.equal(body.executionMetrics.metricId, 'metric-assets-1')
+    assert.equal(body.executionMetrics.toolCallCount, 1)
+
+    const missingResponse = await app.inject({
+      method: 'GET',
+      url: '/v1/sessions/missing-session/assets',
+    })
+    assert.equal(missingResponse.statusCode, 404)
+    assert.equal(missingResponse.json().code, 'SESSION_NOT_FOUND')
+
+    const leanResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/assets?includeEvents=false&includeToolTraces=false&includePermissionAudits=false&includeExecutionMetrics=false`,
+    })
+    assert.equal(leanResponse.statusCode, 200)
+    const lean = leanResponse.json()
+    assert.equal(lean.events, undefined)
+    assert.equal(lean.toolTraces, undefined)
+    assert.equal(lean.permissionAudits, undefined)
+    assert.equal(lean.executionMetrics, undefined)
+    assert.equal(lean.usageSummary.inputTokens, 12)
+  } finally {
+    await app.close()
+    await storage.close()
   }
 })
 

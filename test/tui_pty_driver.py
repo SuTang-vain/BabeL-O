@@ -64,6 +64,8 @@ def prepare_programming_workspace(config_dir: str) -> str:
     os.makedirs(os.path.join(workspace, 'src'), exist_ok=True)
     with open(os.path.join(workspace, 'smoke.txt'), 'w', encoding='utf-8') as fh:
         fh.write('alpha beta\n')
+    with open(os.path.join(workspace, 'question.txt'), 'w', encoding='utf-8') as fh:
+        fh.write('answer-token: violet-river\n')
     with open(os.path.join(workspace, 'src', 'smoke.ts'), 'w', encoding='utf-8') as fh:
         fh.write('export const token = "beta"\n')
     try:
@@ -120,7 +122,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
     with open(config_file, 'w', encoding='utf-8') as fh:
         fh.write('{"defaultModel":"local/coding-runtime"}\n')
 
-    workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session') else repo
+    workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session', 'coding-question-files') else repo
 
     env = os.environ.copy()
     env.update({
@@ -244,6 +246,30 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 return 1, ''.join(transcript) + '\n[pty-smoke] placeholder tail remained after typing\n'
             if visible.count('✓ done') != 1:
                 return 1, ''.join(transcript) + '\n[pty-smoke] blank enter submitted unexpectedly\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'multiline-paste-placeholder':
+            send(master_fd, '\x1b[200~alpha\nbeta\ngamma\x1b[201~')
+            if not wait_for(master_fd, '[Pasted text #1 +3 lines]', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] pasted text placeholder did not render\n'
+            visible = visible_text(''.join(transcript))
+            if 'Multiline Paste Buffer' in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] old paste buffer panel rendered unexpectedly\n'
+            send(master_fd, ' analyze\r')
+            if not wait_for(master_fd, '✓ done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] pasted placeholder prompt did not submit\n'
+            visible = visible_text(''.join(transcript))
+            if 'beta' not in visible or '[Pasted text #1 +3 lines] analyze' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] pasted text was not expanded for execution or compressed for display\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'coding-question-files':
+            send(master_fd, 'What does question.txt say?\r')
+            if not wait_for(master_fd, 'Read question.txt done', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] file question did not read fixture file\n'
+            if not wait_for(master_fd, 'violet-river', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] file question answer did not include fixture token\n'
+            visible = visible_text(''.join(transcript))
+            if 'What does question.txt say?' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] file question prompt did not render\n'
             send(master_fd, '/exit\r')
         elif sequence == 'programming-workflow':
             send(master_fd, 'read smoke.txt\r')

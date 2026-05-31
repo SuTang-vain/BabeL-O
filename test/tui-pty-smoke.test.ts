@@ -91,6 +91,20 @@ test('PTY smoke: input placeholder clears on typing and blank enter does not sub
   assert.equal((output.match(/✓ done/g) ?? []).length, 1)
 })
 
+test('PTY smoke: multiline paste renders placeholder and expands on submit', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('multiline-paste-placeholder')
+  assert.match(output, /\[Pasted text #1 \+3 lines\] analyze/)
+  assert.match(output, /beta/)
+  assert.doesNotMatch(output, /Multiline Paste Buffer/)
+})
+
+test('PTY smoke: ask coding question about files reads and answers', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('coding-question-files')
+  assert.match(output, /What does question\.txt say\?/)
+  assert.match(output, /Read question\.txt done/)
+  assert.match(output, /violet-river/)
+})
+
 test('PTY smoke: programming workflow covers read edit diff grep glob and task', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('programming-workflow')
   assert.match(output, /Read smoke\.txt done/)

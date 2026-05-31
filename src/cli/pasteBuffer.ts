@@ -49,6 +49,24 @@ export function flushPasteBuffer(state: PasteBufferState): PasteBufferResult {
   }
 }
 
+export function formatPastedTextPlaceholder(index: number, text: string): string {
+  const lineCount = countPastedTextLines(text)
+  return `[Pasted text #${index} +${lineCount} ${lineCount === 1 ? 'line' : 'lines'}]`
+}
+
+export function expandPastedTextPlaceholders(text: string, replacements: Map<string, string>): string {
+  let expanded = text
+  for (const [placeholder, pastedText] of replacements) {
+    expanded = expanded.split(placeholder).join(pastedText)
+  }
+  return expanded
+}
+
+function countPastedTextLines(text: string): number {
+  if (!text) return 0
+  return text.split(/\r\n|\r|\n/).length
+}
+
 function consumeActivePaste(state: PasteBufferState): PasteBufferResult {
   const endIndex = state.buffer.indexOf(BRACKETED_PASTE_END)
   if (endIndex === -1) {

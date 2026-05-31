@@ -11,6 +11,7 @@
 - TaskSession / Agents：[TODO_agents.md](./TODO_agents.md)
 - Cleanup / Decoupling：[TODO_cleanup.md](./TODO_cleanup.md)
 - Performance：[TODO_performance.md](./TODO_performance.md)
+- 已完成能力索引：[DONE.md](./DONE.md)
 - 工作记录：[WORK_LOG.md](./WORK_LOG.md)
 
 ## CLI 相关内容归属
@@ -42,4 +43,4 @@
 
 - 不向本文件追加具体任务。
 - 新任务按主题写入对应子 TODO。
-- 已完成事实写入 [WORK_LOG.md](./WORK_LOG.md)。
+- 已完成事实写入 [WORK_LOG.md](./WORK_LOG.md)，已完成能力索引移入 [DONE.md](./DONE.md)。

@@ -41,8 +41,7 @@ import {
 import { inputState } from '../inputState.js'
 import { openExternalEditor } from '../editor.js'
 import { normalizeKeyEvent, terminalMouseDisableSequence } from '../keyEvent.js'
-import { consumePasteChunk, createPasteBufferState, flushPasteBuffer } from '../pasteBuffer.js'
-import { truncateToTerminalWidth } from '../terminalWidth.js'
+import { consumePasteChunk, createPasteBufferState, expandPastedTextPlaceholders, flushPasteBuffer, formatPastedTextPlaceholder } from '../pasteBuffer.js'
 import { shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
 import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 
@@ -105,8 +104,9 @@ export function registerChatCommand(program: Command): void {
 
       const originalEmit = process.stdin.emit
       let pasteState = createPasteBufferState()
-      let pastedMultilineText = ''
       let pasteTimeout: NodeJS.Timeout | null = null
+      let pastedTextCounter = 0
+      const pastedTextReplacements = new Map<string, string>()
 
       const clearPasteTimeout = () => {
         if (pasteTimeout) {
@@ -120,36 +120,12 @@ export function registerChatCommand(program: Command): void {
 
         if (!text.includes('\n') && !text.includes('\r')) {
           rl.write(text)
-        } else {
-          inputState.set('pasteBuffer')
-          pastedMultilineText = text
-          rlInt.line = ''
-          ;(rlInt as any).cursor = 0
-          drawPasteBufferCard()
+          return
         }
-      }
 
-      const drawPasteBufferCard = () => {
-        const lines = pastedMultilineText.split(/\r?\n/)
-        const lineCount = lines.length
-
-        // Clear the current prompt line
-        process.stdout.write('\r\x1b[K')
-
-        // Render the preview box with explicit carriage returns to prevent terminal alignment staircasing
-        process.stdout.write('\r\n' + chalk.cyan('  ┌─── Multiline Paste Buffer ──────────────────────────────────') + '\r\n')
-        const previewLines = lines.slice(0, 8)
-        for (const line of previewLines) {
-          process.stdout.write(chalk.cyan('  │ ') + chalk.white(truncateToTerminalWidth(line, 75)) + '\r\n')
-        }
-        if (lineCount > 8) {
-          process.stdout.write(chalk.cyan(`  │ ... and ${lineCount - 8} more lines.`) + '\r\n')
-        }
-        process.stdout.write(chalk.cyan('  └─────────────────────────────────────────────────────────────') + '\r\n')
-
-        const helpText = `  ${chalk.green('[Enter]')} Submit | ${chalk.yellow('[Ctrl+E]')} Edit | ${chalk.red('[Esc/Backspace]')} Cancel`
-        process.stdout.write(helpText + '\r\n')
-        rl.prompt()
+        const placeholder = formatPastedTextPlaceholder(++pastedTextCounter, text)
+        pastedTextReplacements.set(placeholder, text)
+        rl.write(placeholder)
       }
 
       process.stdin.emit = function (event: string, ...args: any[]) {
@@ -337,81 +313,6 @@ export function registerChatCommand(program: Command): void {
           return
         }
 
-        if (inputState.current === 'pasteBuffer') {
-          const isCtrlE = (key?.ctrl && key?.name === 'e') || chunk === '\x05' || chunk?.toString() === '\x05' || (typeof chunk === 'string' && chunk.charCodeAt(0) === 5)
-          const isEnter = key?.name === 'enter' || key?.name === 'return' || chunk === '\r' || chunk === '\n' || chunk === '\r\n' || chunk?.toString() === '\r' || chunk?.toString() === '\n' || chunk?.toString() === '\r\n'
-          const isCancel = key?.name === 'escape' || key?.name === 'backspace' || chunk === '\x1b' || chunk === '\x7f' || chunk === '\b' || chunk?.toString() === '\x1b' || chunk?.toString() === '\x7f' || chunk?.toString() === '\b'
-
-          if (isEnter) {
-            const textToSubmit = pastedMultilineText
-            pastedMultilineText = ''
-            inputState.set('idle')
-
-            // Write to history
-            const trimmed = textToSubmit.trim()
-            try {
-              fs.mkdirSync(path.dirname(historyFile), { recursive: true })
-              fs.appendFileSync(historyFile, trimmed + '\n', 'utf8')
-            } catch (e) {}
-
-            if (pendingLineResolve) {
-              pendingLineResolve(textToSubmit)
-            }
-            return
-          }
-
-          if (isCtrlE) {
-            const textToEdit = pastedMultilineText
-            pastedMultilineText = ''
-            inputState.set('idle')
-
-            rl.pause()
-            void (async () => {
-              try {
-                const edited = await openExternalEditor(textToEdit, options.cwd)
-                rl.resume()
-
-                if (edited && edited.trim()) {
-                  const trimmedEdited = edited.trim()
-                  console.log(chalk.cyan(`\n[Editor] Loaded multi-line prompt (${trimmedEdited.split('\n').length} lines). Submitting...`))
-                  if (pendingLineResolve) {
-                    pendingLineResolve(edited)
-                  }
-                } else {
-                  if (typeof rlInt._refreshLine === 'function') {
-                    rlInt._refreshLine()
-                  } else {
-                    rl.prompt()
-                  }
-                }
-              } catch (err: any) {
-                console.error(chalk.red(`\nFailed to open editor: ${err.message || err}`))
-                rl.resume()
-                if (typeof rlInt._refreshLine === 'function') {
-                  rlInt._refreshLine()
-                } else {
-                  rl.prompt()
-                }
-              }
-            })()
-            return
-          }
-
-          if (isCancel) {
-            pastedMultilineText = ''
-            inputState.set('idle')
-            console.log(chalk.yellow('\nPaste buffer cancelled.'))
-            if (typeof rlInt._refreshLine === 'function') {
-              rlInt._refreshLine()
-            } else {
-              rl.prompt()
-            }
-            return
-          }
-
-          // Block all other keys in pasteBuffer mode
-          return
-        }
 
         // Route to slash palette only when idle (not when permission panel is open)
         if (!isExecuting && inputState.current !== 'permissionPanel' && slashPalette.handleKey(chunk, key)) {
@@ -594,10 +495,13 @@ export function registerChatCommand(program: Command): void {
             pendingLineResolve = null
           }
 
+          const displayPrompt = prompt
+          prompt = expandPastedTextPlaceholders(prompt, pastedTextReplacements)
           let trimmed = prompt.trim()
+          const displayTrimmed = displayPrompt.trim()
           inputRefresh.clearCurrentInputBlock({ afterSubmit: true })
-          if (trimmed) {
-            process.stdout.write(renderSubmittedPrompt(trimmed))
+          if (displayTrimmed) {
+            process.stdout.write(renderSubmittedPrompt(displayTrimmed))
           }
           if (trimmed === '/exit' || trimmed === 'exit' || trimmed === 'quit') {
             await closeCurrentSession('CLI exit')

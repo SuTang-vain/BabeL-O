@@ -1,5 +1,7 @@
 # 工具结果持久化与消息级预算规划
 
+> 状态：本专项设计已完成并移入 [DONE.md](./DONE.md) 的完成能力索引。本文保留为历史设计与回归参考，不再作为当前优先级来源；若后续发现工具结果预算回归，请在 [TODO_runtime.md](./TODO_runtime.md) 重新开未收口项。
+
 > 来源: session_e9fa6e3a 实战分析
 > 优先级: P0
 > 参考: BabeL-X `src/utils/toolResultStorage.ts`

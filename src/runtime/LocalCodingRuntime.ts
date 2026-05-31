@@ -22,6 +22,7 @@ import {
 
 type ParsedIntent =
   | { kind: 'tool'; toolName: string; input: unknown }
+  | { kind: 'file_question'; path: string; question: string }
   | { kind: 'text'; text: string }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -134,6 +135,11 @@ export class LocalCodingRuntime implements NexusRuntime {
           success: true,
           message: intent.text,
         }
+        return
+      }
+
+      if (intent.kind === 'file_question') {
+        yield* this.executeFileQuestion(options, intent, recordToolRun)
         return
       }
 
@@ -264,6 +270,11 @@ export class LocalCodingRuntime implements NexusRuntime {
             })
           }
         } else {
+          const pendingPermission = PendingPermissionRegistry.getInstance().register(
+            options.sessionId,
+            toolUseId
+          )
+
           yield {
             type: 'permission_request',
             ...eventBase(options.sessionId),
@@ -292,10 +303,10 @@ export class LocalCodingRuntime implements NexusRuntime {
           for (const hookEvent of permissionHooks.events) yield hookEvent
 
           const hookDecision = firstHookPermissionDecision(permissionHooks)
-          const decision = hookDecision ?? await PendingPermissionRegistry.getInstance().register(
-            options.sessionId,
-            toolUseId
-          )
+          if (hookDecision) {
+            PendingPermissionRegistry.getInstance().resolve(options.sessionId, toolUseId, hookDecision)
+          }
+          const decision = hookDecision ?? await pendingPermission
 
           approved = decision.approved
           decisionReason = decision.reason ?? 'User review'
@@ -415,6 +426,90 @@ export class LocalCodingRuntime implements NexusRuntime {
       }
     }
   }
+
+  private async *executeFileQuestion(
+    options: RuntimeExecuteOptions,
+    intent: { path: string; question: string },
+    recordToolRun: (duration: number) => void,
+  ): AsyncIterable<NexusEvent> {
+    const tool = this.tools.get('Read')
+    if (!tool) {
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'TOOL_NOT_FOUND',
+        message: 'Tool not found: Read',
+      }
+      return
+    }
+    if (!this.toolPolicy.isAllowed(tool)) {
+      const message = 'Tool denied by Nexus policy: Read'
+      yield {
+        type: 'tool_denied',
+        ...eventBase(options.sessionId),
+        name: tool.name,
+        risk: tool.risk,
+        message,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message,
+      }
+      return
+    }
+
+    const toolInput = { path: intent.path }
+    const toolUseId = createId('tool')
+    yield {
+      type: 'tool_started',
+      ...eventBase(options.sessionId),
+      toolUseId,
+      name: tool.name,
+      input: toolInput,
+    }
+
+    const toolStartMs = performance.now()
+    const result = await executeToolSafely(tool, toolInput, options)
+    recordToolRun(performance.now() - toolStartMs)
+    if (result.kind === 'error') {
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: result.code,
+        message: result.message,
+        details: result.details,
+      }
+      return
+    }
+
+    yield {
+      type: 'tool_completed',
+      ...eventBase(options.sessionId),
+      toolUseId,
+      name: tool.name,
+      success: result.success,
+      output: result.output,
+      truncated: result.truncated,
+      originalBytes: result.originalBytes,
+    }
+
+    const answer = result.success
+      ? `I read ${intent.path}. Relevant content for your question (${intent.question}):\n${String(result.output).trim()}`
+      : `I could not answer from ${intent.path}: ${String(result.output)}`
+    yield {
+      type: 'assistant_delta',
+      ...eventBase(options.sessionId),
+      text: answer,
+    }
+    yield {
+      type: 'result',
+      ...eventBase(options.sessionId),
+      success: result.success,
+      message: answer,
+    }
+  }
 }
 
 import {
@@ -513,6 +608,11 @@ function parseIntent(prompt: string): ParsedIntent {
     return { kind: 'tool', toolName: 'TaskCreate', input: { title: arg } }
   }
 
+  const fileQuestionPath = extractFileQuestionPath(trimmed)
+  if (fileQuestionPath) {
+    return { kind: 'file_question', path: fileQuestionPath, question: trimmed }
+  }
+
   return {
     kind: 'text',
     text:
@@ -521,6 +621,12 @@ function parseIntent(prompt: string): ParsedIntent {
       '`grep <pattern>`, `glob <pattern>`, `bash <command>`, `task <title>`. ' +
       `You said: ${trimmed || '(empty prompt)'}`,
   }
+}
+
+function extractFileQuestionPath(prompt: string): string | undefined {
+  if (!/(file|文件|read|读取|内容|content|about|关于|what|does|say)/i.test(prompt)) return undefined
+  const match = prompt.match(/(?:^|\s)([\w./-]+\.[A-Za-z0-9_]+)(?=$|\s|[，。！？,.!?])/)
+  return match?.[1]
 }
 
 function splitCommand(input: string): string[] {

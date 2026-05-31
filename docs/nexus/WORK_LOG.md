@@ -2,22 +2,37 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-05-31 — P1 SDK/dashboard session assets query API
+
+- **用户决策**: 暂跳过真实 provider live/manual AgentLoop smoke，优先推进 SDK / dashboard-facing session/task query API，作为后续 AetheL / SDK / dashboard 的基础。
+- **处理**:
+  - 新增 `src/nexus/sessionAssets.ts`，提供稳定 `session_assets` snapshot 聚合：session、tasks、child sessions、events page、tool traces、permission audits、critic reviews、usage summary 与 execution metrics。
+  - `GET /v1/sessions/:sessionId/assets` 接入 Nexus API；支持 `eventLimit`、`toolTraceLimit`、`childSessionLimit` 和 `includeEvents/includeToolTraces/includePermissionAudits/includeExecutionMetrics` 查询参数。
+  - `NexusStorage` 新增 `listChildSessions(parentSessionId)` 原语，`MemoryStorage` 与 `SqliteStorage` 实现按 parent session 稳定查询，避免 dashboard/resume/cancel 路径继续依赖全局 session list 扫描。
+  - `/v1/sessions/:sessionId/resume` 与父 session cancel cascade 改用 `listChildSessions()`；child session snapshot 默认不嵌入完整 events，仍保留 metadata/transcriptPath 供外部查询。
+  - critic reviews 同时从 `NexusTask.review` 和 `task_session_event: critic_completed` 提取；usage summary 从完整 session event stream 聚合，不受返回 events page 截断影响。
+  - `test/runtime.test.ts` 新增 session assets API 回归，覆盖成功聚合、分页截断、child transcript 不内嵌、404、include 开关和 usage/critic/tool/metrics 输出。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`：47/47 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
+
 ## 2026-05-30 — P1 TUI 无外框 welcome 与 boxed input prompt
 
 - **用户决策**: 去掉 welcome 最外层框，保留 logo/身份信息；主输入框改为上下分隔线、裸 `>` 输入行和底部 `? for shortcuts` + 当前模型状态。
 - **处理**:
   - `src/cli/welcome.ts` 移除 welcome header 的 `┌/│/└` 外框与独立快捷 hint，只保留 logo、`❖ BABEL-O`、版本、用户、工作区、模型和运行模式信息。
-  - `src/cli/inputBox.ts` 新增 boxed input renderer：顶部/底部 `─` 分隔线、`>` 输入行、footer 左侧快捷提示、右侧当前模型 label；未知模型会从 model id 生成可读名称，registry 内模型优先使用 display name。
+  - `src/cli/inputBox.ts` 新增 boxed input renderer：顶部/底部 `─` 分隔线、`>` 输入行、footer 左侧快捷提示、右侧当前模型 label；长输入按终端宽度软换行，首行使用 `> `、续行使用两个空格缩进；未知模型会从 model id 生成可读名称，registry 内模型优先使用 display name。
   - `src/cli/ui.ts` 只对主 chat prompt 使用 boxed input；二级 readline prompt（editable rule / reject instruction 等）继续使用原单行渲染，并在多行主输入刷新后把光标移回 `>` 行。
   - `src/cli/ui.ts` 记录上一帧文本和光标位置，刷新前按当前终端列宽重算旧输入块的视觉光标行，修复 resize 后旧长分隔线残留/错位。
-  - `src/cli/inputBox.ts` 的 boxed separator 使用 `columns - 1` 安全宽度，避免刚好铺满终端宽度时被终端自动折到下一行。
+  - `src/cli/inputBox.ts` 的 boxed separator 使用 `columns - 1` 安全宽度；boxed input 多行文本使用 CRLF 输出，避免长路径/中文混排后下分隔线从当前列继续绘制或触发终端软换行。
   - `src/cli/ui.ts` 暴露 `clearCurrentInputBlock()` 和 `renderSubmittedPrompt()`；`src/cli/commands/chat.ts` 在提交后按 readline 已换到下一行的真实光标位置清理整个 boxed input，再用紫色文本渲染用户消息，避免上分隔线、输入框 chrome 或 placeholder tail 残留到 agent 输出前。
   - `src/cli/commands/chat.ts` 的首字符 ghost 清理改为调用 `_refreshLine()`，避免重新写入旧单行 prompt。
-  - `test/tui-input.test.ts` 覆盖无外框 welcome header、boxed input prompt/footer、主输入多行光标回移、resize 后旧 boxed rows 清理、二级 prompt 保持单行和 wrapped row 清理，以及发送后紫色用户消息不带输入框 chrome。
+  - `src/cli/commands/chat.ts` 将多行 bracketed paste 从独立 Paste Buffer 面板改为插入压缩占位符 `[Pasted text #n +m lines]`；提交前通过 `src/cli/pasteBuffer.ts` 展开占位符为真实粘贴内容，发送态仍保留压缩显示。
+  - `test/tui-input.test.ts` 覆盖无外框 welcome header、boxed input prompt/footer、长路径/中文混排输入按首行 `> ` + 续行双空格缩进软换行、boxed input CRLF 行复位、paste placeholder 压缩/展开、主输入多行光标回移、resize 后旧 boxed rows 清理、二级 prompt 保持单行和 wrapped row 清理，以及发送后紫色用户消息不带输入框 chrome。
 - **验证**:
-  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-renderer.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-input.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts`：57/57 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O exec tsx -- --test --test-concurrency=1 /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-renderer.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/tui-input.test.ts /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/completer.test.ts`：59/59 通过。
   - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck` 通过。
-  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：11/11 通过。
+  - `npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run test:tui:pty`：12/12 通过。
   - `git -C /Users/tangyaoyue/DEV/BABEL/BabeL-O diff --check` 通过。
 
 ## 2026-05-30 — P1 AgentLoop provider live/manual smoke 入口
@@ -2306,3 +2321,35 @@
 - **验证**:
   - `npm run typecheck` 通过。
   - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts` 通过。
+
+---
+
+## 2026-05-31 — Nexus TODO 优先级重梳与 DONE.md 拆分
+
+- **用户请求**: 推送更新到仓库，并查看各个 TODO 文档，将混乱的优先级重新梳理调整；必要时查看源码分析实际优先级；整理完成后分析是否需要添加 `DONE.md` 来转移 TODO 中已经完成的部分。
+- **源码校准**:
+  - 核对 `src/nexus/sessionAssets.ts`、`src/nexus/app.ts` 与 `test/runtime.test.ts`，确认 `GET /v1/sessions/:sessionId/assets` 已落地，不应继续作为 TODO 追踪。
+  - 核对 `src/cli/commands/optimize.ts`、`src/nexus/app.ts`、`src/runtime/providerSmoke.ts` 与测试，确认 `bbl optimize --provider-smoke-live` 入口已落地，剩余项是手动真实 provider live/manual smoke。
+  - 核对 `src/runtime/hooks.ts`、`src/runtime/LLMCodingRuntime.ts`、`src/runtime/LocalCodingRuntime.ts`、`src/nexus/sessionLifecycle.ts` 与 `test/hooks.test.ts`，确认 Hooks 最小内核已落地。
+  - 核对 `src/providers/adapters/OpenAIAdapter.ts`、`test/runtime-llm.test.ts`、`test/adapters.test.ts`，确认 DeepSeek `reasoning_content` replay 已有 adapter/runtime 回归。
+  - 核对 TUI 输入、权限、paste、PTY smoke 相关源码与测试，确认 slash/tool palette、permission panel、唯一 input owner、agent running indicator、paste placeholder 等已经进入完成能力口径。
+- **文档调整**:
+  - 新增 `docs/nexus/DONE.md`，作为已完成能力索引，承接 TODO 中大量 `[x]` 历史，避免待办优先级继续被完成项淹没。
+  - 重写 `docs/nexus/TODO.md`：只保留当前总控优先级、主线状态、推进顺序和维护规则。
+  - 重写 `TODO_runtime.md`、`TODO_agents.md`、`TODO_provider_registry.md`、`TODO_tui.md`、`TODO_performance.md`、`TODO_cleanup.md`：各文件只保留未收口任务，完成历史统一转入 `DONE.md`。
+  - 更新 `README.md`、`TODO_cli.md`、`TODO_tool_result_budget.md`：明确 `DONE.md` 入口、历史设计状态和 TODO/DONE/WORK_LOG 的职责边界。
+- **优先级结论**:
+  - 当前没有打开的 P0 功能开发项；真实会话指令跟随回归仍作为 P0 守门规则，一旦复现先补 regression corpus 再修 runtime/adapter/TUI。
+  - P1 顺序为：真实 provider live/manual AgentLoop smoke、SDK task mutation API、provider role defaults + 显式 fallback execution、TUI 编程闭环与视觉 smoke。
+  - P2 顺序为：生产 build/lint/CI/coverage、1000+ sessions/events 压测、storageBridge 故障注入、AgentLoop 成本 benchmark、并发测试治理。
+- **DONE.md 决策**:
+  - 需要新增 `DONE.md`。原因是 `TODO_agents.md`、`TODO_tui.md`、`TODO_runtime.md` 等已经沉积大量 `[x]` 项，继续保留会让真实优先级失真。
+  - `WORK_LOG.md` 继续记录事实流水和验证命令；`DONE.md` 只保留可检索的完成能力索引；TODO 文件原则上只写 `[ ]` 未完成项。
+- **校验中发现并修复的回归**:
+  - `LocalCodingRuntime` 新增的自然语言文件问答解析优先级过高，会把显式 `write temp.txt "ws content"` 误判为读取 `temp.txt` 回答问题，导致 WebSocket permission smoke 没有进入权限请求。已调整为显式 `read/write/edit/grep/glob/bash/task` 命令优先，自然语言文件问答后置。
+  - WebSocket 快速审批存在竞态：客户端收到 `permission_request` 后立即发送 `permission_response` 时，runtime 可能尚未注册 pending permission，导致响应被丢弃并长时间等待。已在 `LocalCodingRuntime` 与 `LLMCodingRuntime` 中改为发送 permission_request 前先注册 pending entry，hook 自动决策仍会清理 pending entry。
+- **验证**:
+  - `git diff --check` 通过。
+  - `npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/permission-flow.test.ts` 通过。
+  - `npm test` 全量通过：350 pass, 0 fail。

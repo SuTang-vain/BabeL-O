@@ -95,8 +95,7 @@ async function cascadeCancelChildTaskSessions(
     cancelled.add(child.sessionId)
   }
 
-  for (const child of await storage.listSessions({ limit: 200 })) {
-    if (child.parentSessionId !== parentSessionId) continue
+  for (const child of await storage.listChildSessions(parentSessionId, { limit: 200 })) {
     if (TERMINAL_PHASES.has(child.phase)) continue
     child.phase = 'cancelled'
     child.terminalReason = {

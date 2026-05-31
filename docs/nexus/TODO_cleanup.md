@@ -2,124 +2,84 @@
 
 ## 目标
 
-BabeL-O 是 clean rewrite，不应无选择地搬运 BabeL-X 的历史复杂度。Cleanup 的重点不是“删旧代码”，而是防止旧复杂度重新长回来。
+BabeL-O 是 clean rewrite，不应无选择地搬运 BabeL-X 的历史复杂度。Cleanup 的重点不是“删旧代码”，而是守住依赖边界、发布工程化和 BabeL-X 参考迁入纪律。已完成的重写能力见 [DONE.md](./DONE.md)。
 
 ## 当前状态
 
-- [x] 新项目没有引入 BabeL-X 源码树。
-- [x] 新项目没有引入 React/Ink 到 runtime core。
-- [x] 新项目没有引入 Bun/Elysia。
-- [x] 新项目没有引入 Anthropic 私有包。
-- [x] 新项目没有引入 telemetry/cloud service 依赖。
-- [x] 新项目使用 Fastify + Commander + Zod + TypeScript。
-- [ ] 尚未区分 runtime deps 和 CLI/UI deps 的 package boundary。
+- 项目没有引入 BabeL-X 源码树、React/Ink runtime、Bun/Elysia、Anthropic 私有包或 telemetry/cloud service 依赖。
+- Runtime 去重、结构化 logger、`docs/nexus` 文档中心、Hooks 最小内核、PromptInput 状态分层、多级 permission panel、Compact UX、MCP stdio client、Skill loader、Agent lifecycle metadata 等第一轮迁入/参考重写已完成。
+- 当前 cleanup 重点是 package boundary、生产 build、lint/format、CI/coverage、配置兼容策略和后续迁入门禁。
 
-## 依赖治理
+## P1 Package Boundary
 
-- [x] 使用 Node.js。
-- [x] 使用 Fastify。
-- [x] 使用 Commander。
-- [x] 使用 Zod。
-- [x] 使用 `@fastify/websocket`。
-- [x] 使用 `minimatch`（glob 模式匹配，2026-05-28）。
+- [ ] 区分 runtime deps、CLI/UI deps、dev deps、optional-ui deps。
 - [ ] 引入依赖前必须说明归属：runtime / cli / dev / optional-ui。
-- [ ] 不允许 runtime core 依赖 terminal UI。
-- [ ] 不允许 runtime core 依赖 desktop/browser/mobile integrations。
+- [ ] 不允许 runtime core 依赖 terminal UI、desktop/browser/mobile integration。
 - [ ] 不允许 provider adapter 泄漏 provider-specific event shape 到 Nexus API。
-- [ ] 发布前将 `tsx` 从生产运行路径移出，使用 tsup/esbuild。
-- [ ] 增加生产构建脚本与配置（tsup/esbuild），产出 `dist/`，CLI bin 不再依赖 tsx 启动。
-- [ ] 增加 ESLint / Prettier 或等价格式检查，避免类型断言、行尾空格和风格漂移继续累积。
+- [ ] 增加 dependency boundary audit。
+  - 定期运行 `npm ls --depth=0`。
+  - 输出 runtime reachable dependency report，确认 CLI/TUI 依赖不会进入 Nexus/runtime core。
 
-## 代码去重（2026-05-28 已完成）
+## P1 Production Build
 
-- [x] 提取 `src/runtime/toolExecutor.ts`：`executeToolSafely` + `normalizeToolErrorDetails` 共享，LLM/Local 两个 runtime 不再各自实现。
-- [x] `app.ts` 提取 `prepareExecution`/`recordEventMetrics`/`persistEventMetrics`：POST /v1/execute 和 GET /v1/stream 共享验证/session/metrics 逻辑。
-- [x] `agentLoop.ts` 移除重复 `runGitCommand`/`parsePorcelainChangedPaths`，改为从 `worktree.ts` 导入。
-- [x] 关键空 catch 块添加 `logger.debug`（LLMCodingRuntime、compactSummary）。
+- [ ] 发布前将 `tsx` 从生产运行路径移出，使用 tsup/esbuild 或等价生产构建。
+- [ ] 增加生产构建脚本与配置，产出 `dist/`。
+- [ ] CLI bin 不再依赖 tsx 启动。
+- [ ] Build smoke 覆盖 `bbl --help`、`bbl run "hello"`、`bbl chat --help` 或等价轻量入口。
 
-## 命名和兼容
+## P1 Lint / Format / CI
 
-- [x] 项目名使用 BabeL-O。
-- [x] CLI binary 使用 `bbl`。
-- [x] 配置目录使用 `~/.babel-o`。
-- [x] env 使用 `BABEL_O_*` 和 `NEXUS_*`。
+- [ ] 增加 ESLint / Prettier 或等价格式检查。
+- [ ] 建立 GitHub Actions 或等价 CI。
+  - 至少运行 typecheck、test、lint/format。
+  - 可选运行 benchmark smoke 和 provider/mock smoke。
+- [ ] 覆盖率报告接入。
+  - 先产出报告，不设置硬阈值。
+  - 重点观察 runtime/context/provider/TUI/AgentLoop 关键路径。
+
+## P1 BabeL-X Compatibility Strategy
+
 - [ ] 明确是否兼容 BabeL-X `~/.babel/config.json`。
 - [ ] 明确是否提供 BabeL-X transcript import。
+- [ ] 若支持 import，需要只做一次性迁移工具，不让 BabeL-X 历史 schema 污染 Nexus runtime schema。
 
-## 旧能力迁入规则
+## P2 Future Migration Gate
 
-从 BabeL-X 迁入能力时必须遵守：
+后续从 BabeL-X 迁入能力时必须遵守：
 
 - [ ] 先定义 Nexus-owned interface。
 - [ ] 再写 adapter。
 - [ ] 最后迁移实现。
 - [ ] 优先“参考重写”，不直接复制 giant file。
-- [ ] 不复制 feature flag dead code。
-- [ ] 不复制云服务 stub。
-- [ ] 不复制 UI state 到 runtime core。
-- [ ] 不迁移 React/Ink 组件到 runtime；CLI 需要增强时优先使用轻量 ANSI/readline/chalk。
-- [ ] 不迁移 telemetry / analytics / GrowthBook；只保留本地 metrics。
+- [ ] 不复制 feature flag dead code、cloud service stub、analytics/GrowthBook、React/Ink runtime 组件。
 - [ ] 不迁移复杂 plugin system；优先通过 MCP 扩展能力。
-- [ ] 不迁移 BabeL-X `src/utils/hooks.ts` 巨型实现；只参考事件语义，在 BabeL-O 内按 Nexus event schema 重写最小 Hook executor。
-- [ ] 不迁移 BabeL-X `PromptInput` React/Ink 组件；只参考输入状态分层、overlay 键盘路由和 footer/status 信息架构。
-- [ ] 不迁移 BabeL-X AgentTool 的完整 background/team/swarm/remote 体系；只迁移 agent lifecycle metadata、transcript、permission inheritance、worktree notice 等可验证机制。
-- [ ] 不迁移 prompt-cache/fork subagent 的复杂优化路径，除非 AgentLoop 的子 session、transcript 和 worktree 默认隔离先稳定。
-- [ ] 所有 BabeL-X 迁入能力必须先写 TODO/接口/测试计划，再实现；不得用“复制后再删”的方式引入未知依赖。
+- [ ] 所有迁入能力必须先写 TODO/接口/测试计划，再实现。
 
-## 待审计迁入能力
+## P2 仍可参考但未迁入的 BabeL-X 能力
 
-- [ ] QueryEngine 核心 tool loop。
-- [ ] Tool definitions 中稳定的 input schema。
-- [ ] Permission classifier。
-- [ ] Diff rendering。
-- [ ] File/path suggestions。
-- [ ] Session transcript import。
-- [ ] MCP client。
-- [ ] SkillTool。
-- [ ] AgentTool。
-- [ ] LSPTool。
-- [ ] Hooks lifecycle：审计 `src/utils/hooks.ts` 中的 `PreToolUse`、`PostToolUseFailure`、`PermissionRequest`、`SubagentStart`、`SessionEnd`，抽取事件语义和 timeout/error isolation 策略。
-- [ ] PromptInput state machine：审计 `src/components/PromptInput/*` 中输入缓冲、history、slash/typeahead、modal overlay、footer/status 的分层方式。
-- [ ] Permission option model：审计 `src/components/permissions/*` 中 once/session/always allow/editable rule/reject feedback 的选项建模。
-- [ ] Compact UX：审计 `src/services/compact/autoCompact.ts`、`TokenWarning.tsx`、`commands/compact`，抽取 threshold、warning、manual compact、failure circuit breaker。
-- [ ] Agent transcript/lifecycle：审计 `src/tools/AgentTool/runAgent.ts`、`forkSubagent.ts`、`agentDisplay.ts`、`tasks/LocalAgentTask/*`，抽取 metadata、transcript、background status 和 worktree notice。
-
-## BabeL-X 参考映射
-
-来自已合并的 BabeL-X 迁移结论，作为从 BabeL-X 迁入能力时的优先参考。旧根目录建议文档已删除，后续只维护本表和对应专项 TODO。
-
-| BabeL-X 文件 | BabeL-O 目标 | 策略 |
+| BabeL-X 能力 | BabeL-O 方向 | 当前口径 |
 | --- | --- | --- |
-| `src/services/mcp/mcpClient.ts` | `src/mcp/McpClient.ts` | 参考重写，只保留 stdio |
-| `src/services/mcp/mcpRegistry.ts` | `src/mcp/McpRegistry.ts` | 参考重写，简化认证 |
-| `src/services/compact/snipCompact.ts` | `src/runtime/compactors/snipCompactor.ts` | 参考重写，字符驱动 |
-| `src/services/compact/autoCompact.ts` | `src/runtime/contextAssembler.ts` / compact command | 参考 threshold、warning、failure circuit breaker；不迁移 ML/后台压缩 |
-| `src/components/TokenWarning.tsx` | `src/cli/renderEvents.ts` / footer status | 参考用户可见 context warning；不迁移 React 组件 |
-| `src/skills/loadSkill.ts` | `src/skills/loader.ts` | 参考重写，只保留 inline 模式 |
-| `src/skills/bundled/*` | `src/skills/built-in/*` | 迁移内容，改格式 |
-| `src/utils/claudemd.ts` | `src/runtime/memory.ts` | 参考重写，简化为 markdown 加载 |
-| `src/utils/permissions/yoloClassifier.ts` | `src/runtime/classifier.ts` | 参考重写，规则替代 ML |
-| `src/utils/hooks.ts` | `src/nexus/hooks/*` 或 `src/runtime/hooks/*` | 只抽取生命周期事件语义，重写最小内核 |
-| `src/tools/AgentTool/AgentTool.tsx` | `src/nexus/agentLoop.ts` / task session | 参考 agent lifecycle、permission inheritance、transcript、worktree notice；不迁移 React UI/team/remote 复杂度 |
-| `src/tools/AgentTool/runAgent.ts` | `src/nexus/agentLoop.ts` | 参考子 Agent MCP/skill/context 继承和 cleanup；重写为 Nexus TaskSession 语义 |
-| `src/tools/AgentTool/forkSubagent.ts` | 延后 | 只参考 worktree notice 和防递归规则；暂不迁移 fork prompt-cache 优化 |
-| `src/components/PromptInput/*` | `src/cli/ui.ts` / `src/cli/completer.ts` | 参考状态分层和键盘路由；不迁移 React/Ink |
-| `src/components/permissions/*` | CLI approval panel | 参考多级审批选项、editable rule、reject feedback |
-| `src/tools/LSPTool/LSPTool.ts` | 延后 | 优先通过 MCP LSP server 替代 |
-| `src/components/*` | 不迁移 | 与 clean rewrite 原则冲突 |
-| `src/services/analytics/*` | 不迁移 | 与纯本地原则冲突 |
+| QueryEngine 高阶 tool loop | Runtime pipeline / tool loop | 暂不搬迁，先完成 `LocalCodingRuntime` pipeline 化。 |
+| Session transcript import | 一次性导入工具 | 等配置兼容策略确定后再做。 |
+| LSPTool | MCP LSP server 或轻量 context picker | 排在 TUI P2。 |
+| fork subagent / prompt cache | 子 Agent transcript + worktree 稳定后评估 | 暂不迁入复杂优化路径。 |
+| remote/team/swarm agent | SDK/dashboard + remote runner protocol | 暂不迁入。 |
 
 ## 验证命令
 
 - [x] `npm run typecheck`
 - [x] `npm test`
-- [ ] `npm ls --depth=0` 定期审计。
-- [ ] bundle size / dependency count report。
-- [ ] GitHub Actions 或等价 CI：至少运行 typecheck、test、lint/format、可选 benchmark smoke；按总控排序在 P1 live smoke/API/role defaults/TUI 收口后推进。
-- [ ] 覆盖率报告接入（c8/nyc 或 Node 原生覆盖率），先产出报告，不设置硬阈值。
+- [ ] `npm ls --depth=0`
+- [ ] production build smoke
+- [ ] lint/format
+- [ ] CI smoke
+- [ ] coverage report
 
 ## 参考文件
 
 - `package.json`
 - `docs/nexus/README.md`
 - `docs/nexus/TODO.md`
+- `src/runtime`
+- `src/nexus`
+- `src/cli`

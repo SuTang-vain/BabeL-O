@@ -21,6 +21,7 @@ import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
 import { buildSystemPrompt, extractAbsolutePaths, mapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
+import { buildSessionAssetsSnapshot } from './sessionAssets.js'
 
 
 declare module 'fastify' {
@@ -109,6 +110,16 @@ const toolTraceListQuerySchema = z.object({
 
 const sessionDetailQuerySchema = z.object({
   recentEventLimit: z.coerce.number().int().min(0).max(500).default(100),
+})
+
+const sessionAssetsQuerySchema = z.object({
+  eventLimit: z.coerce.number().int().min(0).max(500).default(200),
+  toolTraceLimit: z.coerce.number().int().min(0).max(500).default(200),
+  childSessionLimit: z.coerce.number().int().min(0).max(500).default(200),
+  includeEvents: booleanQuery(true),
+  includeToolTraces: booleanQuery(true),
+  includePermissionAudits: booleanQuery(true),
+  includeExecutionMetrics: booleanQuery(true),
 })
 
 const sessionResumeSchema = z.object({
@@ -523,6 +534,24 @@ export async function createNexusApp(
     }
   })
 
+  app.get('/v1/sessions/:sessionId/assets', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = sessionAssetsQuerySchema.parse(request.query)
+    const snapshot = await buildSessionAssetsSnapshot({
+      storage: options.storage,
+      sessionId: params.sessionId,
+      assetOptions: query,
+    })
+    if (!snapshot) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    return snapshot
+  })
+
   app.get('/v1/sessions/:sessionId/events', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = eventListQuerySchema.parse(request.query)
@@ -690,12 +719,12 @@ export async function createNexusApp(
     const tasks = body.includeTasks === false
       ? []
       : await options.storage.listTasks(params.sessionId)
-    const allSessions = body.includeChildSessions === false
+    const childSessions = body.includeChildSessions === false
       ? []
-      : await options.storage.listSessions({ limit: 200 })
-    const childSessions = allSessions
-      .filter(candidate => candidate.parentSessionId === params.sessionId)
-      .map(candidate => ({ ...candidate, events: [] }))
+      : await options.storage.listChildSessions(params.sessionId, {
+          limit: 200,
+          includeEvents: false,
+        })
     const activeExecution = activeExecutions.get(params.sessionId)
 
     return {

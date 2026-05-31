@@ -30,6 +30,7 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | 文档 | 口径 |
 | --- | --- |
 | [TODO.md](./TODO.md) | 总控规划、阶段状态、当前优先级和阻塞项。 |
+| [DONE.md](./DONE.md) | 已完成能力索引，把 TODO 中的 `[x]` 历史移出待办清单。 |
 | [TODO_runtime.md](./TODO_runtime.md) | Nexus Runtime、API、storage、context、安全边界、MCP、skills。 |
 | [TODO_agents.md](./TODO_agents.md) | TaskSession、TaskQueue、Planner/Executor/Critic、sub-agent、worktree。 |
 | [TODO_provider_registry.md](./TODO_provider_registry.md) | Provider/model registry、角色路由、模型能力矩阵。 |
@@ -37,8 +38,8 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [TODO_performance.md](./TODO_performance.md) | 性能、benchmark、日志、指标、storage 查询优化。 |
 | [TODO_cleanup.md](./TODO_cleanup.md) | 依赖治理、架构边界、历史复杂度隔离、发布工程化。 |
 | [TODO_cli.md](./TODO_cli.md) | CLI 兼容导航页，不作为主规划源。 |
-| [TODO_tool_result_budget.md](./TODO_tool_result_budget.md) | 工具结果持久化与消息级预算。 |
-| [CONTEXT_GAP_ANALYSIS.md](./CONTEXT_GAP_ANALYSIS.md) | BabeL-O 与 BabeL-X 上下文能力差距分析。 |
+| [TODO_tool_result_budget.md](./TODO_tool_result_budget.md) | 已完成的工具结果持久化与消息级预算历史设计。 |
+| [CONTEXT_GAP_ANALYSIS.md](./CONTEXT_GAP_ANALYSIS.md) | BabeL-O 与 BabeL-X 上下文能力差距历史分析。 |
 | [WORK_LOG.md](./WORK_LOG.md) | 事实性工作记录、验证命令和重要决策。 |
 
 ## 当前实现状态
@@ -67,4 +68,5 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 - 总控 `TODO.md` 只维护阶段、优先级、阻塞项和跨主线结论。
 - 每条主线只在对应子 TODO 中维护细节，避免同一事项多处写不同状态。
 - `WORK_LOG.md` 只追加事实、验证命令和重要决策，不承载长期规划。
+- `DONE.md` 承接已完成能力索引；TODO 中原则上只保留未收口项。
 - 任何“已完成”状态必须能对应到代码、文档或命令验证。

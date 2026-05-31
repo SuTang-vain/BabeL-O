@@ -6,6 +6,7 @@ import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
 import type { ToolTrace } from '../shared/toolTrace.js'
 import type {
+  ChildSessionListOptions,
   EventListOptions,
   EventListResult,
   NexusStorage,
@@ -140,6 +141,32 @@ export class SqliteStorage implements NexusStorage {
       if (entry) {
         result.push(rowToSession(entry.row, entry.events))
       }
+    }
+    return result
+  }
+
+  async listChildSessions(
+    parentSessionId: string,
+    options: ChildSessionListOptions = {},
+  ): Promise<SessionSnapshot[]> {
+    const limit = options.limit ?? 50
+    const includeEvents = options.includeEvents ?? false
+
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM sessions
+         WHERE parent_session_id = ?
+         ORDER BY created_at ASC, session_id ASC
+         LIMIT ?`,
+      )
+      .all(parentSessionId, limit) as Row[]
+
+    if (!includeEvents) return rows.map(row => rowToSession(row, []))
+
+    const result: SessionSnapshot[] = []
+    for (const row of rows) {
+      const sessionId = String(row.session_id)
+      result.push(rowToSession(row, await this.listAllEvents(sessionId)))
     }
     return result
   }

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { normalizeKeyEvent, isMouseSequence, terminalMouseDisableSequence } from '../src/cli/keyEvent.js'
-import { consumePasteChunk, createPasteBufferState, flushPasteBuffer } from '../src/cli/pasteBuffer.js'
+import { consumePasteChunk, createPasteBufferState, expandPastedTextPlaceholders, flushPasteBuffer, formatPastedTextPlaceholder } from '../src/cli/pasteBuffer.js'
 import { createPermissionPanelState, reducePermissionPanelKey } from '../src/cli/permissionPanel.js'
 import { helpCategories } from '../src/cli/helpPanel.js'
 import readline from 'node:readline'
@@ -71,6 +71,18 @@ test('flushPasteBuffer emits partial paste when terminal omits end marker', () =
   assert.equal(flushed.consumed, true)
   assert.equal(flushed.pastedText, 'partial paste')
   assert.equal(flushed.state.isPasting, false)
+})
+
+test('pasted text placeholders compress display and expand before submission', () => {
+  const pasted = 'line one\nline two\nline three'
+  const placeholder = formatPastedTextPlaceholder(9, pasted)
+  const replacements = new Map([[placeholder, pasted]])
+
+  assert.equal(placeholder, '[Pasted text #9 +3 lines]')
+  assert.equal(
+    expandPastedTextPlaceholders(`analyze ${placeholder} now`, replacements),
+    `analyze ${pasted} now`,
+  )
 })
 
 test('permission panel reducer rejects on escape and backspace without approving', () => {
@@ -154,7 +166,7 @@ test('welcome header keeps required identity info without outer box', () => {
 
   assert.ok(lines.length > 2)
   assert.match(joined, /❖ BABEL-O/)
-  assert.match(joined, /v0\.2\.5/)
+  assert.match(joined, /v\d+\.\d+\.\d+/)
   assert.match(joined, /MiniMax-M2\.7-highspeed/)
   assert.match(joined, /BabeL-O/)
   assert.match(joined, /Embedded \(Local\)/)
@@ -186,8 +198,9 @@ test('boxed input renders separator prompt and footer model line', () => {
     modelId: 'gemini/gemini-3.5-flash-medium',
     columns: 84,
   })
-  const lines = rendered.text.split('\n')
+  const lines = rendered.text.split(/\r?\n/)
 
+  assert.match(rendered.text, /\r\n/)
   assert.equal(lines.length, 4)
   assert.equal(lines[0], '─'.repeat(83))
   assert.equal(lines[1], '> ')
@@ -197,6 +210,30 @@ test('boxed input renders separator prompt and footer model line', () => {
   assert.equal(rendered.cursorRow, 1)
   assert.equal(rendered.cursorRowsFromBottom, 2)
   assert.equal(rendered.cursorColumn, 2)
+})
+
+test('boxed input wraps long mixed-width text across indented input rows', () => {
+  const line = '/Users/tangyaoyue/DEV/BABEL/BabeL-O /Users/tangyaoyue/DEV/BABEL/BabeL-X深度对比分析这两个项目'
+  const rendered = renderBoxedInput({
+    prompt: '> ',
+    line,
+    cursor: line.length,
+    columns: 84,
+  })
+  const lines = rendered.text.split(/\r?\n/)
+
+  assert.match(rendered.text, /\r\n/)
+  assert.equal(rendered.truncated, false)
+  assert.equal(lines.length, 5)
+  assert.equal(lines[0], '─'.repeat(83))
+  assert.match(lines[1]!, /^> \/Users\/tangyaoyue\/DEV\/BABEL\/BabeL-O/)
+  assert.match(lines[2]!, /^  /)
+  assert.equal(`${lines[1]!.slice(2)}${lines[2]!.slice(2)}`, line)
+  assert.equal(lines[3], '─'.repeat(83))
+  assert.ok(visibleTerminalWidth(lines[1]!) <= 83)
+  assert.ok(visibleTerminalWidth(lines[2]!) <= 83)
+  assert.equal(rendered.cursorRow, 2)
+  assert.equal(rendered.cursorRowsFromBottom, 2)
 })
 
  test('fixed input box keeps long path input on one terminal row', () => {

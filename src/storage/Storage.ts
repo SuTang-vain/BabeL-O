@@ -8,6 +8,11 @@ export type StorageListOptions = {
   includeEvents?: boolean
 }
 
+export type ChildSessionListOptions = {
+  limit?: number
+  includeEvents?: boolean
+}
+
 export type SessionGetOptions = {
   includeEvents?: boolean
 }
@@ -67,6 +72,10 @@ export interface NexusStorage {
     options?: SessionGetOptions,
   ): Promise<SessionSnapshot | null>
   listSessions(options?: StorageListOptions): Promise<SessionSnapshot[]>
+  listChildSessions(
+    parentSessionId: string,
+    options?: ChildSessionListOptions,
+  ): Promise<SessionSnapshot[]>
   listEvents(sessionId: string, options?: EventListOptions): Promise<EventListResult>
   appendEvent(sessionId: string, event: NexusEvent): Promise<void>
   saveTask(task: NexusTask): Promise<void>

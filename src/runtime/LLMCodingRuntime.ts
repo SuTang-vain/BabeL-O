@@ -973,6 +973,11 @@ export class LLMCodingRuntime implements NexusRuntime {
                 timestamp: nowIso(),
               })
             } else {
+              const pendingPermission = PendingPermissionRegistry.getInstance().register(
+                options.sessionId,
+                tc.id
+              )
+
               yield {
                 type: 'permission_request',
                 ...eventBase(options.sessionId),
@@ -1001,10 +1006,10 @@ export class LLMCodingRuntime implements NexusRuntime {
               for (const hookEvent of permissionHooks.events) yield hookEvent
 
               const hookDecision = firstHookPermissionDecision(permissionHooks)
-              const decision = hookDecision ?? await PendingPermissionRegistry.getInstance().register(
-                options.sessionId,
-                tc.id
-              )
+              if (hookDecision) {
+                PendingPermissionRegistry.getInstance().resolve(options.sessionId, tc.id, hookDecision)
+              }
+              const decision = hookDecision ?? await pendingPermission
 
               approved = decision.approved
               decisionReason = decision.reason ?? 'User review'
