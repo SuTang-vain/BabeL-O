@@ -10,6 +10,10 @@ coverage/
 
 # Local planning / technical-detail docs are intentionally not published.
 docs/
+!docs/
+docs/*
+!docs/releases/
+!docs/releases/*.md
 *TODO*.md
 *WORK_LOG*.md
 *ANALYSIS*.md
