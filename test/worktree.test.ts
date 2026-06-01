@@ -13,6 +13,7 @@ import {
   getGitOperationLockStatsForTest,
   resetGitOperationLocksForTest,
   runGitCommand,
+  isWorktreeMergeConflictError,
 } from '../src/nexus/worktree.js'
 
 function runCommand(cwd: string, cmd: string, args: string[]): Promise<void> {
@@ -257,9 +258,14 @@ test('commitAndMergeWorktree reports conflicting files on cherry-pick failure', 
         )
       },
       (err: any) => {
-        assert.ok(err instanceof Error)
-        assert.ok(err.message.includes('Cherry-pick failed with conflicts'))
-        assert.ok(err.message.includes('conflict.txt'))
+        assert.ok(isWorktreeMergeConflictError(err))
+        assert.equal(err.code, 'WORKTREE_MERGE_CONFLICT')
+        assert.equal(err.diagnostic.type, 'worktree_merge_conflict')
+        assert.equal(err.diagnostic.taskId, taskId)
+        assert.equal(err.diagnostic.worktreePath, worktreePath)
+        assert.equal(err.diagnostic.conflictingFiles.includes('conflict.txt'), true)
+        assert.equal(err.diagnostic.defaultAction, 'keep')
+        assert.deepEqual(err.diagnostic.recoveryActions.map(action => action.action), ['keep', 'continue', 'abandon'])
         return true
       }
     )

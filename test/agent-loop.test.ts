@@ -1299,6 +1299,174 @@ test('runtime agent step diagnostics include structured output missing required 
   )
 })
 
+test('runtime agent step repairs empty planner output with a smaller task list', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-planner-repair'
+  createTaskSession({ sessionId })
+
+  const prompts: string[] = []
+  const usageSummaries: any[] = []
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(tmpdir(), `babel-o-agent-step-planner-repair-${Date.now()}.json`)
+  const configManager = new ConfigManager(configPath)
+  configManager.save({ defaultModel: 'anthropic/claude-3-5-sonnet' })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  try {
+    const stepRunner = createRuntimeAgentStepRunner({
+      model: 'anthropic/claude-3-5-sonnet',
+      onUsageSummary: usage => usageSummaries.push(usage),
+      runtimeFactory: async () => ({
+        async *executeStream({ prompt }: any) {
+          prompts.push(prompt)
+          yield {
+            type: 'result',
+            schemaVersion: '2026-05-21.babel-o.v1',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            success: true,
+            message: prompts.length === 1
+              ? '{}'
+              : JSON.stringify({
+                summary: 'Smaller repaired plan',
+                tasks: [{ title: 'Inspect structured output repair path' }],
+              }),
+          }
+        },
+      } as any),
+    })
+
+    const output = await stepRunner({
+      roleDefinition: PLANNER_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        goal: 'Fix broad structured output failures',
+      },
+    }) as any
+
+    assert.equal(prompts.length, 2)
+    assert.match(prompts[1], /Previous invalid output:/)
+    assert.match(prompts[1], /assistantText: \{\}/)
+    assert.equal(output.summary, 'Smaller repaired plan')
+    assert.equal(output.tasks[0].title, 'Inspect structured output repair path')
+    assert.equal(usageSummaries.at(-1)?.repairAttempts, 2)
+  } finally {
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(configPath, { force: true })
+  }
+})
+
+test('runtime agent step repairs optimizer output while preserving raw output', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-optimizer-repair'
+  createTaskSession({ sessionId })
+
+  const prompts: string[] = []
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(tmpdir(), `babel-o-agent-step-optimizer-repair-${Date.now()}.json`)
+  const configManager = new ConfigManager(configPath)
+  configManager.save({ defaultModel: 'anthropic/claude-3-5-sonnet' })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  try {
+    const stepRunner = createRuntimeAgentStepRunner({
+      model: 'anthropic/claude-3-5-sonnet',
+      runtimeFactory: async () => ({
+        async *executeStream({ prompt }: any) {
+          prompts.push(prompt)
+          yield {
+            type: 'result',
+            schemaVersion: '2026-05-21.babel-o.v1',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            success: true,
+            message: prompts.length === 1
+              ? JSON.stringify({ status: 'completed' })
+              : JSON.stringify({
+                taskId: 'task-optimizer-repair',
+                success: true,
+                result: 'Preserved raw optimizer summary from repair prompt.',
+              }),
+          }
+        },
+      } as any),
+    })
+
+    const output = await stepRunner({
+      roleDefinition: OPTIMIZER_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-optimizer-repair',
+        title: 'Repair optimizer output',
+      },
+    }) as any
+
+    assert.equal(prompts.length, 2)
+    assert.match(prompts[1], /Use the previous raw output/)
+    assert.match(prompts[1], /assistantText: \{"status":"completed"\}/)
+    assert.equal(output.taskId, 'task-optimizer-repair')
+    assert.equal(output.success, true)
+    assert.match(output.result, /Preserved raw optimizer summary/)
+  } finally {
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(configPath, { force: true })
+  }
+})
+
+test('runtime agent step falls back to conservative critic rejection after repair failure', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-critic-conservative-repair'
+  createTaskSession({ sessionId })
+
+  const prompts: string[] = []
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(tmpdir(), `babel-o-agent-step-critic-repair-${Date.now()}.json`)
+  const configManager = new ConfigManager(configPath)
+  configManager.save({ defaultModel: 'anthropic/claude-3-5-sonnet' })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  try {
+    const stepRunner = createRuntimeAgentStepRunner({
+      model: 'anthropic/claude-3-5-sonnet',
+      runtimeFactory: async () => ({
+        async *executeStream({ prompt }: any) {
+          prompts.push(prompt)
+          yield {
+            type: 'result',
+            schemaVersion: '2026-05-21.babel-o.v1',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            success: true,
+            message: prompts.length === 1
+              ? 'critic output was not json'
+              : JSON.stringify({ verdict: 'unclear' }),
+          }
+        },
+      } as any),
+    })
+
+    const output = await stepRunner({
+      roleDefinition: CRITIC_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-critic-repair',
+        title: 'Review repaired output',
+        result: 'Executor result to review',
+      },
+    }) as any
+
+    assert.equal(prompts.length, 2)
+    assert.equal(output.approved, false)
+    assert.match(output.reason, /needs-human-review/)
+  } finally {
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(configPath, { force: true })
+  }
+})
+
 test('closeNexusSession cancels active child task sessions', async () => {
   resetTaskQueuesForTest()
   resetTaskSessionsForTest()
@@ -1385,6 +1553,105 @@ test('runAgentLoop optimizer skips git bookkeeping outside git workspaces', asyn
   } finally {
     logger.warn = originalWarn
     rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
+test('runAgentLoop preserves isolated worktree and records recovery metadata on merge conflict', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const rootDir = resolve(process.cwd())
+  const babelODir = join(rootDir, '.babel-o')
+  if (!existsSync(babelODir)) {
+    mkdirSync(babelODir)
+  }
+  const testRepoDir = join(babelODir, `test-agent-conflict-repo-${Date.now()}`)
+  mkdirSync(testRepoDir)
+
+  const runRepoCmd = (cmd: string, args: string[]) => {
+    return new Promise<void>((resolve, reject) => {
+      const child = spawn(cmd, args, { cwd: testRepoDir })
+      child.on('close', (code) => {
+        if (code === 0) resolve()
+        else reject(new Error(`${cmd} ${args.join(' ')} failed with code ${code}`))
+      })
+    })
+  }
+
+  try {
+    await runRepoCmd('git', ['init'])
+    await runRepoCmd('git', ['config', 'user.name', 'Test Agent'])
+    await runRepoCmd('git', ['config', 'user.email', 'agent@test.com'])
+
+    const conflictFile = join(testRepoDir, 'conflict.txt')
+    writeFileSync(conflictFile, 'line 1\nline 2\nline 3\n', 'utf8')
+    await runRepoCmd('git', ['add', '.'])
+    await runRepoCmd('git', ['commit', '-m', 'initial'])
+
+    const sessionId = 'test-isolated-loop-conflict'
+    let isolatedCwd = ''
+
+    const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
+      if (roleDefinition.role === 'planner') {
+        return {
+          summary: 'Conflict planning',
+          tasks: [
+            {
+              title: 'Write conflicting file',
+              description: 'Modify conflict.txt',
+              metadata: { requiresIsolation: true },
+            },
+          ],
+        }
+      }
+      if (roleDefinition.role === 'optimizer') {
+        isolatedCwd = input.cwd
+        writeFileSync(join(input.cwd, 'conflict.txt'), 'line 1\nline 2 modified in worktree\nline 3\n', 'utf8')
+        writeFileSync(conflictFile, 'line 1\nline 2 modified in parent\nline 3\n', 'utf8')
+        await runRepoCmd('git', ['add', '.'])
+        await runRepoCmd('git', ['commit', '-m', 'parent modification'])
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Modified conflict file',
+          needsReview: true,
+        }
+      }
+      if (roleDefinition.role === 'critic') {
+        return { approved: true }
+      }
+      throw new Error(`Unexpected role ${roleDefinition.role}`)
+    }
+
+    const finalSession = await runAgentLoop({
+      sessionId,
+      cwd: testRepoDir,
+      prompt: 'Write conflicting file',
+      stepRunner,
+      role: 'optimizer',
+      autoApprove: false,
+      maxRetriesPerTask: 1,
+    })
+
+    assert.equal(finalSession.phase, 'waiting_user')
+    assert.equal(finalSession.pendingInput?.reason, 'worktree_merge_conflict')
+    assert.equal(existsSync(isolatedCwd), true)
+    assert.equal(existsSync(join(testRepoDir, '.git', 'CHERRY_PICK_HEAD')), false)
+
+    const task = listNexusTasks(sessionId).tasks[0]
+    assert.equal(task.status, 'failed')
+    assert.equal((task.metadata?.worktreeRecovery as any).type, 'worktree_merge_conflict')
+    assert.equal((task.metadata?.worktreeRecovery as any).preservedWorktreePath, isolatedCwd)
+    assert.equal((task.metadata?.worktreeRecovery as any).conflictingFiles.includes('conflict.txt'), true)
+    assert.deepEqual((task.metadata?.worktreeRecovery as any).recoveryActions.map((action: any) => action.action), ['keep', 'continue', 'abandon'])
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'worktree_merge_conflict'))
+  } finally {
+    if (existsSync(testRepoDir)) {
+      rmSync(testRepoDir, { recursive: true, force: true })
+    }
   }
 })
 
@@ -1576,6 +1843,93 @@ test('runAgentLoop optimizer rollback preserves unrelated untracked files', asyn
       rmSync(testRepoDir, { recursive: true, force: true })
     }
   }
+})
+
+test('runAgentLoop reruns failed sub-agent tasks with a new child transcript', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const sessionId = 'test-sub-agent-rerun-transcript'
+  const firstChildSessionId = `${sessionId}-sub-2`
+  const retryChildSessionId = `${sessionId}-sub-2-retry-1`
+  let firstChildExecutorFailures = 0
+
+  const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
+    if (roleDefinition.role === 'planner') {
+      return {
+        summary: 'Parent plan',
+        tasks: [{ title: 'Delegate flaky child' }],
+      }
+    }
+    if (roleDefinition.role === 'executor') {
+      if (input.title === 'Delegate flaky child') {
+        if (!input.orchestration.delegatedSubTaskIds) {
+          return {
+            taskId: input.taskId,
+            success: true,
+            result: 'Delegated flaky child',
+            needsReview: false,
+            subTasks: [{ title: 'Flaky child work' }],
+          }
+        }
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Parent completed after child rerun',
+          needsReview: false,
+        }
+      }
+      if (input.title === 'Flaky child work') {
+        if (input.sessionId === firstChildSessionId) {
+          firstChildExecutorFailures += 1
+          return {
+            taskId: input.taskId,
+            success: false,
+            result: 'Child failed first transcript',
+            needsReview: false,
+          }
+        }
+        return {
+          taskId: input.taskId,
+          success: true,
+          result: 'Child succeeded on rerun',
+          needsReview: false,
+        }
+      }
+    }
+    throw new Error(`Unexpected role ${roleDefinition.role}`)
+  }
+
+  const finalSession = await runAgentLoop({
+    sessionId,
+    cwd: process.cwd(),
+    prompt: 'Delegate flaky child',
+    stepRunner,
+    role: 'executor',
+    autoApprove: true,
+    enableSubAgents: true,
+    maxSubAgentDepth: 2,
+    maxRetriesPerTask: 2,
+  })
+
+  assert.equal(finalSession.phase, 'completed')
+  assert.equal(firstChildExecutorFailures, 2)
+  const firstChild = getTaskSession(firstChildSessionId)
+  const retryChild = getTaskSession(retryChildSessionId)
+  assert.equal(firstChild.phase, 'failed')
+  assert.equal(retryChild.phase, 'completed')
+  assert.equal(firstChild.metadata?.transcriptPath, `nexus://sessions/${firstChildSessionId}/events`)
+  assert.equal(retryChild.metadata?.transcriptPath, `nexus://sessions/${retryChildSessionId}/events`)
+
+  const childTask = listNexusTasks(sessionId).tasks.find(task => task.title === 'Flaky child work')
+  assert.equal(childTask?.status, 'completed')
+  assert.equal(childTask?.retryCount, 1)
+  assert.equal((childTask?.metadata?.subAgent as any).subSessionId, retryChildSessionId)
+  assert.equal((childTask?.metadata?.previousSubAgents as any[])[0].subSessionId, firstChildSessionId)
+  assert.equal((childTask?.metadata?.previousSubAgents as any[])[0].transcriptPath, `nexus://sessions/${firstChildSessionId}/events`)
 })
 
 test('runAgentLoop runs sub-agent session with isolation and merges changes back', async () => {

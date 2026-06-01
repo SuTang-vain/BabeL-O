@@ -38,6 +38,8 @@ import {
   runGitCommand,
   parsePorcelainChangedPaths,
   withGitOperationLock,
+  isWorktreeMergeConflictError,
+  type WorktreeMergeConflictDiagnostic,
 } from './worktree.js'
 import { RuntimeAgentStepError } from './runtimeAgentStep.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
@@ -120,6 +122,22 @@ function getSubAgentStatus(metadata?: Record<string, unknown>): string | undefin
   if (typeof subAgent !== 'object' || subAgent === null) return undefined
   if (!('status' in subAgent) || typeof subAgent.status !== 'string') return undefined
   return subAgent.status
+}
+
+function buildPreviousSubAgentsMetadata(
+  task: NexusTask,
+  executorResult?: ExecutorAgentResult | null,
+): Record<string, unknown> {
+  const subAgent = executorResult?.metadata?.subAgent
+  if (typeof subAgent !== 'object' || subAgent === null) return {}
+  const status = (subAgent as { status?: unknown }).status
+  if (status !== 'failed' && status !== 'cancelled') return {}
+  const previous = Array.isArray(task.metadata?.previousSubAgents)
+    ? task.metadata.previousSubAgents
+    : []
+  return {
+    previousSubAgents: [...previous, subAgent],
+  }
 }
 
 async function gitIsClean(cwd: string): Promise<boolean> {
@@ -389,9 +407,10 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
           getParentTaskSnapshot(sessionId, String(task.metadata.parentTaskId)) !== undefined
 
         if (isSubAgentTask) {
-          const subSessionId = `${sessionId}-sub-${task.taskId}`
+          const subSessionId = buildSubAgentSessionId(sessionId, task)
           const subAgentMetadata = buildSubAgentLifecycleMetadata({
             parentSessionId: sessionId,
+            subSessionId,
             task,
             role,
             approvalInheritance: subAgentApprovalInheritance,
@@ -633,11 +652,21 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 await commitAndMergeWorktree(cwd, taskCwd, task.taskId, task.title)
                 isolatedWorktreeMerged = true
                 recordTaskSessionEvent(sessionId, 'worktree_merged', { taskId: task.taskId })
+                await removeWorktree(cwd, taskCwd, task.taskId)
+                isIsolated = false
               } catch (err) {
                 logger.error(`Failed to merge isolated worktree changes for task ${task.taskId}`, err)
+                if (isWorktreeMergeConflictError(err)) {
+                  handleWorktreeMergeConflict({
+                    sessionId,
+                    task,
+                    diagnostic: err.diagnostic,
+                    executorResult,
+                  })
+                  isIsolated = false
+                  return getTaskSession(sessionId)
+                }
               }
-              await removeWorktree(cwd, taskCwd, task.taskId)
-              isIsolated = false
             }
             setTaskSessionPhase(sessionId, 'executing')
             continue
@@ -685,13 +714,23 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 await commitAndMergeWorktree(cwd, taskCwd, task.taskId, task.title)
                 isolatedWorktreeMerged = true
                 recordTaskSessionEvent(sessionId, 'worktree_merged', { taskId: task.taskId })
+                await removeWorktree(cwd, taskCwd, task.taskId)
+                isIsolated = false
               } catch (err) {
                 logger.error(`Failed to merge worktree for task ${task.taskId}`, err)
+                if (isWorktreeMergeConflictError(err)) {
+                  handleWorktreeMergeConflict({
+                    sessionId,
+                    task,
+                    diagnostic: err.diagnostic,
+                    executorResult,
+                  })
+                  isIsolated = false
+                  return getTaskSession(sessionId)
+                }
                 approved = false
                 criticReason = `Merge worktree failed: ${String(err)}`
               }
-              await removeWorktree(cwd, taskCwd, task.taskId)
-              isIsolated = false
             }
 
             if (approved) {
@@ -775,6 +814,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             result: executorResult?.result,
             metadata: {
               ...(task.metadata ?? {}),
+              ...buildPreviousSubAgentsMetadata(task, executorResult),
               ...(executorResult?.metadata ?? {}),
             },
             review: {
@@ -817,8 +857,58 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
   return getTaskSession(sessionId)
 }
 
+function handleWorktreeMergeConflict(options: {
+  sessionId: string
+  task: NexusTask
+  diagnostic: WorktreeMergeConflictDiagnostic
+  executorResult?: ExecutorAgentResult | null
+}): void {
+  const recovery = {
+    ...options.diagnostic,
+    status: 'awaiting_manual_recovery',
+    preservedWorktreePath: options.diagnostic.worktreePath,
+  }
+  const updatedTask = updateNexusTask(options.sessionId, options.task.taskId, {
+    status: 'failed',
+    ownerAgentId: options.task.ownerAgentId,
+    result: `Worktree merge conflict: ${options.diagnostic.conflictingFiles.join(', ') || 'unknown files'}`,
+    metadata: {
+      ...(options.task.metadata ?? {}),
+      ...(options.executorResult?.metadata ?? {}),
+      worktreeRecovery: recovery,
+    },
+    review: {
+      status: 'rejected',
+      reason: 'Worktree merge conflict requires manual recovery',
+      reviewerAgentId: 'system',
+    },
+  })
+  recordTaskSessionEvent(options.sessionId, 'worktree_merge_conflict', {
+    taskId: options.task.taskId,
+    task: updatedTask,
+    recovery,
+  })
+  requestTaskSessionInput(options.sessionId, {
+    kind: 'user_input',
+    requestedBy: 'system',
+    reason: 'worktree_merge_conflict',
+    prompt: `Worktree merge conflict for task ${options.task.taskId}. Choose continue, abandon, or keep after reviewing the preserved worktree.`,
+    metadata: {
+      taskId: options.task.taskId,
+      worktreeRecovery: recovery,
+    },
+  })
+}
+
+function buildSubAgentSessionId(parentSessionId: string, task: NexusTask): string {
+  return task.retryCount > 0
+    ? `${parentSessionId}-sub-${task.taskId}-retry-${task.retryCount}`
+    : `${parentSessionId}-sub-${task.taskId}`
+}
+
 function buildSubAgentLifecycleMetadata(options: {
   parentSessionId: string
+  subSessionId: string
   task: NexusTask
   role: 'executor' | 'optimizer'
   approvalInheritance?: SubAgentApprovalInheritanceOptions
@@ -839,7 +929,7 @@ function buildSubAgentLifecycleMetadata(options: {
     agentType: 'subagent',
     role: options.role,
     status: 'running',
-    transcriptPath: `nexus://sessions/${options.parentSessionId}-sub-${options.task.taskId}/events`,
+    transcriptPath: `nexus://sessions/${options.subSessionId}/events`,
     permissionInheritance: {
       mode: 'role_policy',
       inheritedAllowRules,

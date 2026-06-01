@@ -137,6 +137,36 @@ export class NexusClient {
     }>
   }
 
+  async recoverWorktreeTask(sessionId: string, taskId: string, action: 'continue' | 'abandon' | 'keep', body: {
+    actor?: string
+    source?: string
+    reason?: string
+    requestId?: string
+    expectedUpdatedAt?: string
+  } = {}): Promise<{ type: string; action: string; task: NexusTask }> {
+    return this.postJsonTaskMutation(sessionId, taskId, 'worktree-recovery', {
+      ...body,
+      action,
+    }) as Promise<{
+      type: string
+      action: string
+      task: NexusTask
+    }>
+  }
+
+  async rerunSubAgentTask(sessionId: string, taskId: string, body: {
+    actor?: string
+    source?: string
+    reason?: string
+    requestId?: string
+    expectedUpdatedAt?: string
+  } = {}): Promise<{ type: string; task: NexusTask }> {
+    return this.postJsonTaskMutation(sessionId, taskId, 'rerun-subagent', body) as Promise<{
+      type: string
+      task: NexusTask
+    }>
+  }
+
   async getSession(
     sessionId: string,
     options: { recentEventLimit?: number } = {},
@@ -161,6 +191,32 @@ export class NexusClient {
     return this.getJson(
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listChildSessions(
+    sessionId: string,
+    options: { limit?: number; eventLimit?: number; failedOnly?: boolean; includeEvents?: boolean } = {},
+  ): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.eventLimit !== undefined) params.set('eventLimit', String(options.eventLimit))
+    if (options.failedOnly !== undefined) params.set('failedOnly', String(options.failedOnly))
+    if (options.includeEvents !== undefined) params.set('includeEvents', String(options.includeEvents))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/children${query}`)
+  }
+
+  async listChildSessionEvents(
+    sessionId: string,
+    childSessionId: string,
+    options: { limit?: number; cursor?: string; order?: 'asc' | 'desc' } = {},
+  ): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.order) params.set('order', options.order)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/children/${encodeURIComponent(childSessionId)}/events${query}`)
   }
 
   async compactSession(

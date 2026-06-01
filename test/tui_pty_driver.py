@@ -21,6 +21,65 @@ def visible_text(text: str) -> str:
     return text.replace('\r', '')
 
 
+def screen_text(text: str) -> str:
+    text = re.sub(r'\x1b\][^\x07]*(?:\x07|\x1b\\)', '', text)
+    lines = ['']
+    row = 0
+    col = 0
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == '\x1b' and text.startswith('[', index + 1):
+            match = re.match(r'\x1b\[([0-9;?]*)([ -/]*)([@-~])', text[index:])
+            if match:
+                params = match.group(1)
+                command = match.group(3)
+                numbers = [int(part) for part in params.replace('?', '').split(';') if part.isdigit()]
+                count = numbers[0] if numbers else 1
+                if command == 'A':
+                    row = max(0, row - count)
+                    col = min(col, len(lines[row]))
+                elif command == 'B':
+                    row += count
+                    while row >= len(lines):
+                        lines.append('')
+                    col = min(col, len(lines[row]))
+                elif command == 'C':
+                    col += count
+                elif command == 'D':
+                    col = max(0, col - count)
+                elif command == 'G':
+                    col = max(0, count - 1)
+                elif command == 'K':
+                    if row >= len(lines):
+                        lines.append('')
+                    lines[row] = lines[row][:col]
+                elif command == 'J':
+                    if row >= len(lines):
+                        lines.append('')
+                    lines[row] = lines[row][:col]
+                    del lines[row + 1:]
+                index += len(match.group(0))
+                continue
+        if char == '\r':
+            col = 0
+        elif char == '\n':
+            row += 1
+            while row >= len(lines):
+                lines.append('')
+            col = 0
+        else:
+            while row >= len(lines):
+                lines.append('')
+            line = lines[row]
+            if col > len(line):
+                line = line + (' ' * (col - len(line)))
+            lines[row] = line[:col] + char + line[col + 1:]
+            col += 1
+        index += 1
+    return '\n'.join(lines)
+
+
 def read_available(fd: int, timeout: float) -> str:
     deadline = time.time() + timeout
     chunks: list[bytes] = []
@@ -148,13 +207,22 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         'LINES': '30',
     })
 
-    base_command = [
-        os.path.join(repo, 'node_modules', '.bin', 'tsx'),
-        os.path.join(repo, 'src', 'cli', 'program.ts'),
-        'chat',
-        '--cwd',
-        workspace,
-    ]
+    command_mode = os.environ.get('BABEL_O_PTY_COMMAND', 'source')
+    if command_mode in ('installed', 'bbl'):
+        base_command = [
+            os.environ.get('BABEL_O_BBL_BIN', 'bbl'),
+            'chat',
+            '--cwd',
+            workspace,
+        ]
+    else:
+        base_command = [
+            os.path.join(repo, 'node_modules', '.bin', 'tsx'),
+            os.path.join(repo, 'src', 'cli', 'program.ts'),
+            'chat',
+            '--cwd',
+            workspace,
+        ]
     session_id = None
     command = [*base_command]
     if session_id:
@@ -256,6 +324,45 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 return 1, ''.join(transcript) + '\n[pty-smoke] bash preview did not render first output lines\n'
             if '⎿  line-3' in visible or '⎿  line-4' in visible or '… +2 lines (ctrl+o to expand)' not in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] bash preview did not fold extra output lines\n'
+            screen = screen_text(''.join(transcript))
+            after_tool = screen.rsplit('Bash(for i in 0 1 2 3 4; do echo line-$i; done)', 1)[-1]
+            if 'Generating...' in after_tool or 'Waiting for permission...' in after_tool or '◉' in after_tool:
+                return 1, ''.join(transcript) + '\n[pty-smoke] live status leaked after completed bash row\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'compact-progress':
+            send(master_fd, 'hello\r')
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] compact setup prompt did not complete\n'
+            send(master_fd, '/compact\r')
+            if not wait_for(master_fd, 'Compacting conversation...', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] compact progress did not render\n'
+            if not wait_for(master_fd, '✓ Context compacted', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] compact completion did not render\n'
+            screen = screen_text(''.join(transcript))
+            if 'compact_boundary' in screen or 'summaryChars' in screen or 'Compacted session' in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] compact leaked internal result details\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'context-visualization':
+            send(master_fd, 'hello\r')
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] context setup prompt did not complete\n'
+            send(master_fd, '/context\r')
+            if not wait_for(master_fd, 'BABEL Context', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] context panel did not render\n'
+            visible = visible_text(''.join(transcript))
+            for expected in ('current context', 'Current context by source', 'System prompt', 'System tools', 'Skills · /skills', 'Autocompact buffer', 'Free space'):
+                if expected not in visible:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] context panel missing {expected}\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'live-waiting-status':
+            send(master_fd, 'read package.json\r')
+            if not wait_for(master_fd, 'Working...', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] initial working status did not render\n'
+            if not wait_for(master_fd, 'Read completed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] live status read did not complete\n'
+            visible = visible_text(''.join(transcript))
+            if 'Generating...' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] generating status did not render\n'
             send(master_fd, '/exit\r')
         elif sequence == 'input-placeholder':
             send(master_fd, '\r')

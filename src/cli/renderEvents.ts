@@ -10,7 +10,7 @@ let sessionEvents: NexusEvent[] = []
 let printedLinesCount = 0
 let currentLineLength = 0
 let liveLineStarted = false
-let liveToolLine: { toolUseId: string; renderedLineCount: number; printedLineDelta: number } | undefined
+let liveToolLine: { toolUseId: string; renderedLineCount: number; printedLineDelta: number; cursorRowsBelow: number } | undefined
 let currentOutputBlock: 'none' | 'assistant' | 'thinking' = 'none'
 
 // Markdown streaming renderer for assistant output
@@ -22,15 +22,17 @@ let activeReadlineInterface: any = null
 let pendingPermissionRequest: NexusEvent | null = null
 
 // Spinner / Agent status state
+type AgentStatus = 'working' | 'thinking' | 'generating' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle'
 let spinnerTimer: NodeJS.Timeout | null = null
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 let spinnerFrameIndex = 0
 let isSpinnerActive = false
 let spinnerRenderedLineCount = 0
+let spinnerCursorRowsBelow = 0
 let spinnerStatusText = 'Thinking...'
 let spinnerStartedAt = 0
 let activeSessionModel: string | undefined
-let currentAgentStatus: 'thinking' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle' = 'idle'
+let currentAgentStatus: AgentStatus = 'idle'
 let currentToolName: string | undefined
 let lastContextWarning: { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
 const inputPrompt = `${chalk.dim('>')} `
@@ -108,6 +110,7 @@ export function resumeSessionHistory(events: NexusEvent[]): void {
 export function startSpinner(text: string = 'Thinking...'): void {
   if (isSpinnerActive) {
     spinnerStatusText = text
+    drawSpinnerLine()
     return
   }
   isSpinnerActive = true
@@ -126,21 +129,36 @@ export function startSpinner(text: string = 'Thinking...'): void {
   }, 100)
 }
 
-function setAgentStatus(status: typeof currentAgentStatus, toolName?: string) {
+export function startAgentStatus(status: Exclude<AgentStatus, 'idle'> = 'working', toolName?: string): void {
+  setAgentStatus(status, toolName)
+  ensureLiveLine()
+  startSpinner(formatAgentStatusText())
+}
+
+export function stopAgentStatus(): void {
+  setAgentStatus('idle')
+  stopSpinner()
+}
+
+function setAgentStatus(status: AgentStatus, toolName?: string) {
   currentAgentStatus = status
   currentToolName = toolName
 }
 
 function formatAgentStatusText(): string {
   switch (currentAgentStatus) {
+    case 'working':
+      return 'Working...'
     case 'thinking':
       return 'Thinking...'
+    case 'generating':
+      return 'Generating...'
     case 'running_tool':
       return currentToolName ? `Running ${currentToolName}...` : 'Running tool...'
     case 'waiting_permission':
       return 'Waiting for permission...'
     case 'compacting':
-      return 'Compacting context...'
+      return 'Compacting conversation...'
     case 'retrying':
       return 'Retrying...'
     default:
@@ -162,59 +180,80 @@ function drawSpinnerLine() {
   if (spinnerRenderedLineCount > 0) {
     clearSpinnerLine()
   }
-  const frame = spinnerFrames[spinnerFrameIndex]!
-  const elapsed = spinnerStartedAt > 0 ? Math.floor((Date.now() - spinnerStartedAt) / 1000) : 0
-  const elapsedText = elapsed > 0 ? ` ${elapsed}s` : ''
-
   const columns = process.stdout.columns || 80
-
-  // Left status text
-  const leftText = ` ${chalk.yellow(frame)} ${chalk.bold(spinnerStatusText)}${chalk.dim(elapsedText)}`
-
-  // Model info
-  const modelText = activeSessionModel ? ` ${chalk.cyan(activeSessionModel)} ` : ''
-
-  // Context usage gauge
-  let gaugeText = ''
-  if (lastContextWarning) {
-    const percent = Math.min(100, Math.max(0, Math.round(lastContextWarning.percentUsed || 0)))
-    const barWidth = 10
-    const filledCount = Math.round((percent / 100) * barWidth)
-    const emptyCount = barWidth - filledCount
-
-    let barColor = chalk.green
-    if (percent > 80) barColor = chalk.red
-    else if (percent > 60) barColor = chalk.yellow
-
-    const filledStr = barColor('█'.repeat(filledCount))
-    const emptyStr = chalk.dim('░'.repeat(emptyCount))
-
-    gaugeText = ` [${filledStr}${emptyStr}] ${percent}%`
-  } else {
-    gaugeText = ` ${chalk.green('[Context: OK]')}`
-  }
-
-  // Right section
-  const rightText = `${modelText}|${gaugeText} `
-
-  // Combine with padding
-  const leftLen = visibleTerminalWidth(leftText)
-  const rightLen = visibleTerminalWidth(rightText)
-  const paddingSize = Math.max(0, columns - leftLen - rightLen - 2)
-  const padding = ' '.repeat(paddingSize)
-
-  const renderedLine = `${leftText}${padding}${rightText}`
+  const renderedLine = currentAgentStatus === 'compacting'
+    ? formatCompactingStatusLine(columns)
+    : formatDefaultStatusLine(columns)
   process.stdout.write(`\r\x1b[K${renderedLine}`)
   spinnerRenderedLineCount = renderedLineCount(renderedLine, columns)
 }
 
+function formatDefaultStatusLine(columns: number): string {
+  const frame = spinnerFrames[spinnerFrameIndex]!
+  const elapsed = spinnerStartedAt > 0 ? Math.floor((Date.now() - spinnerStartedAt) / 1000) : 0
+  const elapsedText = elapsed > 0 ? ` ${elapsed}s` : ''
+  const leftText = ` ${chalk.yellow(frame)} ${chalk.bold(spinnerStatusText)}${chalk.dim(elapsedText)}`
+  const modelText = activeSessionModel ? ` ${chalk.cyan(activeSessionModel)} ` : ''
+  const rightText = `${modelText}|${formatContextGauge()} `
+  const leftLen = visibleTerminalWidth(leftText)
+  const rightLen = visibleTerminalWidth(rightText)
+  const padding = ' '.repeat(Math.max(0, columns - leftLen - rightLen - 2))
+  return `${leftText}${padding}${rightText}`
+}
+
+function formatCompactingStatusLine(columns: number): string {
+  const elapsed = spinnerStartedAt > 0 ? Date.now() - spinnerStartedAt : 0
+  const elapsedText = formatCompactElapsed(elapsed)
+  const progress = Math.min(95, 8 + Math.floor((elapsed / 1000) % 88))
+  const prefix = ` ${chalk.yellow('◒')} ${chalk.bold(spinnerStatusText)} ${chalk.dim(`(${elapsedText})`)}`
+  const suffix = ` ${chalk.dim(`${progress}%`)}`
+  const availableBarWidth = Math.max(8, Math.min(40, columns - visibleTerminalWidth(prefix) - visibleTerminalWidth(suffix) - 4))
+  const filledCount = Math.max(1, Math.floor((progress / 100) * availableBarWidth))
+  const emptyCount = Math.max(0, availableBarWidth - filledCount)
+  const bar = `${chalk.green('▰'.repeat(filledCount))}${chalk.dim('▱'.repeat(emptyCount))}`
+  return `${prefix} ${bar}${suffix}`
+}
+
+function formatContextGauge(): string {
+  if (!lastContextWarning) return ` ${chalk.green('[Context: OK]')}`
+  const percent = Math.min(100, Math.max(0, Math.round(lastContextWarning.percentUsed || 0)))
+  const barWidth = 10
+  const filledCount = Math.round((percent / 100) * barWidth)
+  const emptyCount = barWidth - filledCount
+  let barColor = chalk.green
+  if (percent > 80) barColor = chalk.red
+  else if (percent > 60) barColor = chalk.yellow
+  const filledStr = barColor('█'.repeat(filledCount))
+  const emptyStr = chalk.dim('░'.repeat(emptyCount))
+  return ` [${filledStr}${emptyStr}] ${percent}%`
+}
+
+function formatCompactElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  if (minutes > 0) return `${minutes}m ${seconds}s`
+  return `${seconds}s`
+}
+
 function clearSpinnerLine() {
-  if (spinnerRenderedLineCount > 1) {
-    process.stdout.write(`\r\x1b[K\x1b[${spinnerRenderedLineCount - 1}A\x1b[J`)
+  const rowsToMoveUp = spinnerCursorRowsBelow + Math.max(0, spinnerRenderedLineCount - 1)
+  if (rowsToMoveUp > 0) {
+    process.stdout.write(`\r\x1b[K\x1b[${rowsToMoveUp}A\x1b[J`)
   } else {
     process.stdout.write('\r\x1b[K')
   }
   spinnerRenderedLineCount = 0
+  spinnerCursorRowsBelow = 0
+}
+
+function moveCursorBelowLiveToolLine(): void {
+  if (!liveToolLine || liveToolLine.cursorRowsBelow > 0) return
+  process.stdout.write('\n')
+  liveToolLine.cursorRowsBelow = 1
+  printedLinesCount++
+  currentLineLength = 0
+  liveLineStarted = false
 }
 
 export function renderEventForTest(event: NexusEvent): void {
@@ -245,6 +284,7 @@ export function renderEvent(event: NexusEvent): void {
       sessionEvents.push({ ...event })
     }
 
+    setAgentStatus('generating')
     stopSpinner()
     handleAssistantDelta(event.text)
     return
@@ -259,33 +299,23 @@ export function renderEvent(event: NexusEvent): void {
       sessionEvents.push({ ...event })
     }
 
+    setAgentStatus('thinking')
     if (tuiMode === 'expanded') {
       stopSpinner()
       handleThinkingDelta(event.text)
     } else {
       ensureLiveLine()
-      startSpinner('Thinking...')
+      startSpinner(formatAgentStatusText())
     }
     return
   }
 
+  updateAgentStatusFromEvent(event)
+
   if (isCompactSilentEvent(event)) {
     sessionEvents.push(event)
+    updateSpinnerForCurrentStatus()
     return
-  }
-
-  if (event.type === 'tool_started') {
-    setAgentStatus('running_tool', event.name)
-  } else if (event.type === 'tool_completed' || event.type === 'tool_denied') {
-    currentAgentStatus = 'idle'
-  } else if (event.type === 'permission_request') {
-    setAgentStatus('waiting_permission')
-  } else if (event.type === 'permission_response') {
-    currentAgentStatus = 'idle'
-  } else if (event.type === 'compact_boundary') {
-    setAgentStatus('compacting')
-  } else if (event.type === 'result' || event.type === 'error') {
-    currentAgentStatus = 'idle'
   }
 
   sessionEvents.push(event)
@@ -379,8 +409,9 @@ function ensureLiveLine(): void {
 
 function clearLiveToolLine(toolUseId: string): boolean {
   if (!liveToolLine || liveToolLine.toolUseId !== toolUseId) return false
-  if (liveToolLine.renderedLineCount > 1) {
-    process.stdout.write(`\r\x1b[K\x1b[${liveToolLine.renderedLineCount - 1}A\x1b[J`)
+  const rowsToMoveUp = liveToolLine.cursorRowsBelow + Math.max(0, liveToolLine.renderedLineCount - 1)
+  if (rowsToMoveUp > 0) {
+    process.stdout.write(`\r\x1b[K\x1b[${rowsToMoveUp}A\x1b[J`)
   } else {
     process.stdout.write('\r\x1b[K')
   }
@@ -400,6 +431,7 @@ function renderToolLine(text: string, toolUseId: string): void {
     toolUseId,
     renderedLineCount: renderedLineCount(text, columns),
     printedLineDelta: printedLinesCount - beforePrintedLines,
+    cursorRowsBelow: 0,
   }
   liveLineStarted = true
 }
@@ -441,10 +473,47 @@ function isCompactSilentEvent(event: NexusEvent): boolean {
   )
 }
 
+function updateAgentStatusFromEvent(event: NexusEvent): void {
+  switch (event.type) {
+    case 'session_started':
+      setAgentStatus('generating')
+      break
+    case 'tool_started':
+      setAgentStatus('running_tool', event.name)
+      break
+    case 'permission_request':
+      setAgentStatus('waiting_permission')
+      break
+    case 'permission_response':
+      setAgentStatus(event.approved ? 'running_tool' : 'idle', findToolName(event.toolUseId))
+      break
+    case 'tool_completed':
+      setAgentStatus('generating')
+      break
+    case 'tool_denied':
+    case 'result':
+    case 'error':
+      setAgentStatus('idle')
+      break
+    case 'compact_boundary':
+      setAgentStatus('compacting')
+      break
+    case 'compact_failure':
+      setAgentStatus('generating')
+      break
+  }
+}
+
+function updateSpinnerForCurrentStatus(): void {
+  if (!isSpinnerActive || currentAgentStatus === 'idle') return
+  startSpinner(formatAgentStatusText())
+}
+
 function renderLiveEvent(event: NexusEvent): void {
+  const hadSpinner = isSpinnerActive
   stopSpinner()
   const replacedLiveToolLine = event.type === 'tool_completed' ? clearLiveToolLine(event.toolUseId) : false
-  if (!replacedLiveToolLine) {
+  if (!replacedLiveToolLine && event.type !== 'permission_request') {
     ensureLiveLine()
   }
 
@@ -452,7 +521,7 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'session_started':
       activeSessionModel = event.model
       console.log(formatAgentStatusLine(event))
-      currentAgentStatus = 'thinking'
+      if (hadSpinner) startSpinner(formatAgentStatusText())
       break
     case 'tool_started': {
       renderToolLine(formatToolLiveLine({
@@ -460,6 +529,8 @@ function renderLiveEvent(event: NexusEvent): void {
         input: event.input,
         status: 'running',
       }), event.toolUseId)
+      moveCursorBelowLiveToolLine()
+      startSpinner(formatAgentStatusText())
       break
     }
     case 'tool_completed': {
@@ -480,6 +551,8 @@ function renderLiveEvent(event: NexusEvent): void {
       if (tuiMode === 'expanded' && event.output !== undefined) {
         console.log(formatToolOutputMarkdown(String(event.output)))
       }
+      ensureLiveLine()
+      startSpinner(formatAgentStatusText())
       break
     }
     case 'tool_denied':
@@ -502,14 +575,6 @@ function renderLiveEvent(event: NexusEvent): void {
       process.stdout.write(formatErrorRecoveryDetails(event.details))
       break
     case 'compact_boundary':
-      console.log(
-        chalk.cyan(
-          `context compacted: ${event.beforeEventCount} -> ${event.afterEventCount} events (${event.summaryChars} chars summary)`,
-        ),
-      )
-      if (event.summary) {
-        console.log(chalk.dim(event.summary))
-      }
       break
     case 'context_warning':
       lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
@@ -525,6 +590,7 @@ function renderLiveEvent(event: NexusEvent): void {
           `context compact failed (${event.failureCount}/${event.maxFailures}): ${event.message}`,
         ),
       )
+      startSpinner(formatAgentStatusText())
       break
     case 'result':
       if (!event.success) {
@@ -745,11 +811,8 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         break
 
       case 'compact_boundary':
-        outputText += chalk.cyan(
-          `context compacted: ${ev.beforeEventCount} -> ${ev.afterEventCount} events (${ev.summaryChars} chars summary)\n`,
-        )
-        if (ev.summary) {
-          outputText += chalk.dim(`${ev.summary}\n`)
+        if (mode === 'expanded') {
+          outputText += chalk.dim(`context compacted: ${ev.beforeEventCount} -> ${ev.afterEventCount} events\n`)
         }
         break
 
@@ -791,7 +854,6 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   }
 
   outputText += formatTaskStatusPanel(events)
-  outputText += formatAgentRunningFooter()
   outputText += formatContextFooter()
 
   if (pendingPermissionRequest) {
@@ -802,12 +864,6 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
   }
 
   return outputText
-}
-
-function formatAgentRunningFooter(): string {
-  if (currentAgentStatus === 'idle') return ''
-  const statusText = formatAgentStatusText()
-  return `${chalk.dim('─'.repeat(20))}\n${chalk.yellow('◉')} ${chalk.dim(statusText)}\n`
 }
 
 function formatContextFooter(): string {
@@ -1273,6 +1329,16 @@ function findToolInput(toolUseId: string): unknown {
     const event = sessionEvents[i]!
     if (event.type === 'tool_started' && event.toolUseId === toolUseId) {
       return event.input
+    }
+  }
+  return undefined
+}
+
+function findToolName(toolUseId: string): string | undefined {
+  for (let i = sessionEvents.length - 1; i >= 0; i--) {
+    const event = sessionEvents[i]!
+    if (event.type === 'tool_started' && event.toolUseId === toolUseId) {
+      return event.name
     }
   }
   return undefined

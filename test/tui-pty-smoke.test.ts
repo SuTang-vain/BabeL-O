@@ -95,6 +95,33 @@ test('PTY smoke: compact bash output preview folds long output', { skip: !should
   assert.match(output, /… \+2 lines \(ctrl\+o to expand\)/)
 })
 
+test('PTY smoke: live waiting status renders while a prompt is running', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('live-waiting-status')
+  assert.match(output, /Working\.\.\./)
+  assert.match(output, /Generating\.\.\./)
+  assert.match(output, /Read\(package\.json\)/)
+})
+
+test('PTY smoke: compact command renders progress without internal details', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('compact-progress')
+  assert.match(output, /Compacting conversation\.\.\./)
+  assert.match(output, /✓ Context compacted/)
+  assert.doesNotMatch(output, /Compacted session/)
+  assert.doesNotMatch(output, /summaryChars/)
+})
+
+test('PTY smoke: context command renders visual usage panel', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('context-visualization')
+  assert.match(output, /BABEL Context/)
+  assert.match(output, /current context/)
+  assert.match(output, /Current context by source/)
+  assert.match(output, /System prompt/)
+  assert.match(output, /System tools/)
+  assert.match(output, /Skills · \/skills/)
+  assert.match(output, /Autocompact buffer/)
+  assert.match(output, /Free space/)
+})
+
 test('PTY smoke: input placeholder clears on typing and blank enter does not submit', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('input-placeholder')
   assert.match(output, /什么我可以帮你的吗？/)

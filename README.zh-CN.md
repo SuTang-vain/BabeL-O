@@ -77,7 +77,7 @@ graph TD
 
 ### 方法一：下载预编译原生二进制包（推荐，最快）
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.2.6.md) 中的对应下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.2.7.md) 中的对应下载链接。
 
 将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
 ```bash

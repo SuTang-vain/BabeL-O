@@ -5,6 +5,7 @@ import { setNexusStorage } from './storageBridge.js'
 import { MemoryStorage } from '../storage/MemoryStorage.js'
 import type { SessionPhase } from '../shared/session.js'
 import type { NexusEvent } from '../shared/events.js'
+import { estimateTextTokens } from '../runtime/tokenEstimator.js'
 
 type RoleCallCounts = {
   planner: number
@@ -14,6 +15,43 @@ type RoleCallCounts = {
 }
 
 type FailureTypeCounts = Record<string, number>
+
+type RoleMetricTotals = Record<keyof RoleCallCounts, { durationMs: number; inputTokens: number; outputTokens: number }>
+
+type RoleCallMetric = {
+  role: keyof RoleCallCounts
+  taskId?: string
+  inputTokens: number
+  outputTokens: number
+  durationMs: number
+  isSubAgent: boolean
+}
+
+type MetricCollector = {
+  calls: RoleCallMetric[]
+}
+
+type AgentLoopBenchmarkCost = {
+  inputTokens: number
+  outputTokens: number
+  totalTokens: number
+  retryOverhead: {
+    attempts: number
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    durationMs: number
+  }
+  subAgent: {
+    sessionCount: number
+    roleCalls: RoleCallCounts
+    inputTokens: number
+    outputTokens: number
+    totalTokens: number
+    durationMs: number
+  }
+  byRole: RoleMetricTotals
+}
 
 export type AgentLoopBenchmarkScenarioResult = {
   name: string
@@ -28,11 +66,12 @@ export type AgentLoopBenchmarkScenarioResult = {
   subAgentSessionCount: number
   roleCalls: RoleCallCounts
   failureTypes: FailureTypeCounts
+  cost: AgentLoopBenchmarkCost
 }
 
 export type AgentLoopBenchmarkResult = {
   type: 'agent_loop_benchmark'
-  schemaVersion: 1
+  schemaVersion: 2
   live: false
   timestamp: string
   totalDurationMs: number
@@ -45,6 +84,7 @@ export type AgentLoopBenchmarkResult = {
     failedTaskCount: number
     retryCount: number
     subAgentSessionCount: number
+    cost: AgentLoopBenchmarkCost
   }
 }
 
@@ -58,7 +98,7 @@ export async function runMockAgentLoopBenchmark(): Promise<AgentLoopBenchmarkRes
 
   return {
     type: 'agent_loop_benchmark',
-    schemaVersion: 1,
+    schemaVersion: 2,
     live: false,
     timestamp: new Date().toISOString(),
     totalDurationMs: round(elapsedMs(startedAt)),
@@ -181,6 +221,7 @@ async function runScenario(
   const storage = new MemoryStorage()
   setNexusStorage(storage)
   const roleCalls = emptyRoleCallCounts()
+  const metrics = createMetricCollector()
   const sessionId = `benchmark-${name}`
   const startedAt = process.hrtime.bigint()
 
@@ -189,9 +230,21 @@ async function runScenario(
       sessionId,
       cwd: process.cwd(),
       prompt: `Benchmark scenario: ${name}`,
-      stepRunner: async args => {
+      stepRunner: async <TInput, TOutput>(args: {
+        roleDefinition: Parameters<AgentStepRunner>[0]['roleDefinition']
+        input: TInput
+      }): Promise<TOutput> => {
         incrementRoleCall(roleCalls, args.roleDefinition.role)
-        return stepRunner(args)
+        const callStartedAt = process.hrtime.bigint()
+        const output = await stepRunner<TInput, TOutput>(args)
+        recordRoleMetric(metrics, {
+          rootSessionId: sessionId,
+          role: args.roleDefinition.role,
+          input: args.input,
+          output,
+          durationMs: elapsedMs(callStartedAt),
+        })
+        return output
       },
       role: options.role,
       autoApprove: options.autoApprove,
@@ -213,6 +266,7 @@ async function runScenario(
       subAgentSessionCount: countSubAgentSessions(finalSession.events),
       roleCalls,
       failureTypes: classifyScenarioFailures(finalSession.events),
+      cost: buildScenarioCost(metrics, tasks.reduce((sum, task) => sum + task.retryCount, 0), countSubAgentSessions(finalSession.events)),
     }
   } finally {
     await storage.close?.()
@@ -249,6 +303,7 @@ function aggregateScenarioTotals(scenarios: AgentLoopBenchmarkScenarioResult[]):
     failedTaskCount: 0,
     retryCount: 0,
     subAgentSessionCount: 0,
+    cost: emptyCost(0, 0),
   }
   for (const scenario of scenarios) {
     totals.taskCount += scenario.taskCount
@@ -262,8 +317,143 @@ function aggregateScenarioTotals(scenarios: AgentLoopBenchmarkScenarioResult[]):
     for (const [type, count] of Object.entries(scenario.failureTypes)) {
       totals.failureTypes[type] = (totals.failureTypes[type] ?? 0) + count
     }
+    addCost(totals.cost, scenario.cost)
   }
   return totals
+}
+
+function createMetricCollector(): MetricCollector {
+  return { calls: [] }
+}
+
+function stringifyForTokenEstimate(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? null)
+  } catch {
+    return String(value)
+  }
+}
+
+function recordRoleMetric(metrics: MetricCollector, options: {
+  rootSessionId: string
+  role: string
+  input: unknown
+  output: unknown
+  durationMs: number
+}): void {
+  if (!isTrackedRole(options.role)) return
+  const input = isRecord(options.input) ? options.input : {}
+  const inputSessionId = typeof input.sessionId === 'string'
+    ? input.sessionId
+    : options.rootSessionId
+  metrics.calls.push({
+    role: options.role,
+    taskId: typeof input.taskId === 'string' ? input.taskId : undefined,
+    inputTokens: estimateTextTokens(stringifyForTokenEstimate(options.input)),
+    outputTokens: estimateTextTokens(stringifyForTokenEstimate(options.output)),
+    durationMs: round(options.durationMs),
+    isSubAgent: inputSessionId !== options.rootSessionId,
+  })
+}
+
+function buildScenarioCost(
+  metrics: MetricCollector,
+  retryCount: number,
+  subAgentSessionCount: number,
+): AgentLoopBenchmarkCost {
+  const cost = emptyCost(retryCount, subAgentSessionCount)
+  const rootTaskAttempts = new Map<string, number>()
+  const retryCallsRemaining = { count: retryCount }
+  for (const call of metrics.calls) {
+    cost.inputTokens += call.inputTokens
+    cost.outputTokens += call.outputTokens
+    cost.totalTokens += call.inputTokens + call.outputTokens
+    cost.byRole[call.role].durationMs = round(cost.byRole[call.role].durationMs + call.durationMs)
+    cost.byRole[call.role].inputTokens += call.inputTokens
+    cost.byRole[call.role].outputTokens += call.outputTokens
+    if (call.isSubAgent) {
+      cost.subAgent.roleCalls[call.role] += 1
+      cost.subAgent.inputTokens += call.inputTokens
+      cost.subAgent.outputTokens += call.outputTokens
+      cost.subAgent.totalTokens += call.inputTokens + call.outputTokens
+      cost.subAgent.durationMs = round(cost.subAgent.durationMs + call.durationMs)
+    }
+    if (isRetryOverheadCall(call, rootTaskAttempts, retryCallsRemaining)) {
+      cost.retryOverhead.inputTokens += call.inputTokens
+      cost.retryOverhead.outputTokens += call.outputTokens
+      cost.retryOverhead.totalTokens += call.inputTokens + call.outputTokens
+      cost.retryOverhead.durationMs = round(cost.retryOverhead.durationMs + call.durationMs)
+    }
+  }
+  return cost
+}
+
+function isRetryOverheadCall(
+  call: RoleCallMetric,
+  rootTaskAttempts: Map<string, number>,
+  retryCallsRemaining: { count: number },
+): boolean {
+  if (call.isSubAgent || (call.role !== 'executor' && call.role !== 'optimizer') || !call.taskId) return false
+  const attempts = rootTaskAttempts.get(call.taskId) ?? 0
+  rootTaskAttempts.set(call.taskId, attempts + 1)
+  if (attempts === 0 || retryCallsRemaining.count <= 0) return false
+  retryCallsRemaining.count -= 1
+  return true
+}
+
+function emptyCost(retryCount: number, subAgentSessionCount: number): AgentLoopBenchmarkCost {
+  return {
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    retryOverhead: {
+      attempts: retryCount,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      durationMs: 0,
+    },
+    subAgent: {
+      sessionCount: subAgentSessionCount,
+      roleCalls: emptyRoleCallCounts(),
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      durationMs: 0,
+    },
+    byRole: emptyRoleMetricTotals(),
+  }
+}
+
+function addCost(target: AgentLoopBenchmarkCost, source: AgentLoopBenchmarkCost): void {
+  target.inputTokens += source.inputTokens
+  target.outputTokens += source.outputTokens
+  target.totalTokens += source.totalTokens
+  target.retryOverhead.attempts += source.retryOverhead.attempts
+  target.retryOverhead.inputTokens += source.retryOverhead.inputTokens
+  target.retryOverhead.outputTokens += source.retryOverhead.outputTokens
+  target.retryOverhead.totalTokens += source.retryOverhead.totalTokens
+  target.retryOverhead.durationMs = round(target.retryOverhead.durationMs + source.retryOverhead.durationMs)
+  target.subAgent.sessionCount += source.subAgent.sessionCount
+  target.subAgent.inputTokens += source.subAgent.inputTokens
+  target.subAgent.outputTokens += source.subAgent.outputTokens
+  target.subAgent.totalTokens += source.subAgent.totalTokens
+  target.subAgent.durationMs = round(target.subAgent.durationMs + source.subAgent.durationMs)
+  for (const role of Object.keys(target.subAgent.roleCalls) as Array<keyof RoleCallCounts>) {
+    target.subAgent.roleCalls[role] += source.subAgent.roleCalls[role]
+    target.byRole[role].durationMs = round(target.byRole[role].durationMs + source.byRole[role].durationMs)
+    target.byRole[role].inputTokens += source.byRole[role].inputTokens
+    target.byRole[role].outputTokens += source.byRole[role].outputTokens
+  }
+}
+
+function emptyRoleMetricTotals(): RoleMetricTotals {
+  return {
+    planner: { durationMs: 0, inputTokens: 0, outputTokens: 0 },
+    executor: { durationMs: 0, inputTokens: 0, outputTokens: 0 },
+    optimizer: { durationMs: 0, inputTokens: 0, outputTokens: 0 },
+    critic: { durationMs: 0, inputTokens: 0, outputTokens: 0 },
+  }
 }
 
 function emptyRoleCallCounts(): RoleCallCounts {
@@ -276,9 +466,17 @@ function emptyRoleCallCounts(): RoleCallCounts {
 }
 
 function incrementRoleCall(counts: RoleCallCounts, role: string): void {
-  if (role === 'planner' || role === 'executor' || role === 'optimizer' || role === 'critic') {
+  if (isTrackedRole(role)) {
     counts[role] += 1
   }
+}
+
+function isTrackedRole(role: string): role is keyof RoleCallCounts {
+  return role === 'planner' || role === 'executor' || role === 'optimizer' || role === 'critic'
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function incrementFailure(counts: FailureTypeCounts, type: string): void {

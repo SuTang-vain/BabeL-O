@@ -1,5 +1,5 @@
 import { mkdir, realpath, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -433,6 +433,22 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
         updatedAt: timestamp,
         events: [],
       })
+      const worktreeRecoverySessionId = `${sessionId}-worktree-recovery`
+      await runtimeBundle.storage.saveSession({
+        sessionId: worktreeRecoverySessionId,
+        cwd,
+        prompt: 'worktree recovery smoke',
+        phase: 'waiting_user',
+        pendingInput: {
+          kind: 'user_input',
+          reason: 'worktree_merge_conflict',
+          requestedBy: 'system',
+          metadata: { taskId: `worktree-recovery-${storageKind}` },
+        },
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+      })
       const completedSessionId = `${sessionId}-completed`
       await runtimeBundle.storage.saveSession({
         sessionId: completedSessionId,
@@ -449,6 +465,23 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
         cwd,
         prompt: 'cancelled session mutation smoke',
         phase: 'cancelled',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+      })
+      const failedSubAgentSessionId = `${sessionId}-failed-subagent`
+      await runtimeBundle.storage.saveSession({
+        sessionId: failedSubAgentSessionId,
+        cwd,
+        prompt: 'failed sub-agent rerun smoke',
+        phase: 'failed',
+        error: 'parent failed after child failed',
+        failureReason: 'parent failed after child failed',
+        terminalReason: {
+          category: 'error',
+          code: 'NEXUS_RUNTIME_ERROR',
+          message: 'parent failed after child failed',
+        },
         createdAt: timestamp,
         updatedAt: timestamp,
         events: [],
@@ -568,6 +601,50 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
       assert.equal(worktreeClaimResponse.json().task.metadata.worktreePath, join(cwd, '.babel-o', 'worktrees', `sdk-${storageKind}`))
       assert.equal(worktreeClaimResponse.json().task.ownerAgentId, 'dashboard-worker')
 
+      const recoveryWorktreePath = join(cwd, '.babel-o', 'worktrees', `recovery-${storageKind}`)
+      mkdirSync(recoveryWorktreePath, { recursive: true })
+      const recoveryTask = {
+        ...worktreeTask,
+        taskId: `worktree-recovery-${storageKind}`,
+        sessionId: worktreeRecoverySessionId,
+        status: 'failed' as const,
+        result: 'Worktree merge conflict: conflict.txt',
+        metadata: {
+          requiresIsolation: true,
+          worktreeRecovery: {
+            type: 'worktree_merge_conflict',
+            status: 'awaiting_manual_recovery',
+            taskId: `worktree-recovery-${storageKind}`,
+            cwd,
+            worktreePath: recoveryWorktreePath,
+            preservedWorktreePath: recoveryWorktreePath,
+            conflictingFiles: ['conflict.txt'],
+          },
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await runtimeBundle.storage.saveTask(recoveryTask)
+      const keepRecoveryResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${worktreeRecoverySessionId}/tasks/${recoveryTask.taskId}/worktree-recovery`,
+        payload: { action: 'keep', actor: 'dashboard', source: 'sdk-test', reason: 'inspect later' },
+      })
+      assert.equal(keepRecoveryResponse.statusCode, 200)
+      assert.equal(keepRecoveryResponse.json().action, 'keep')
+      assert.equal(keepRecoveryResponse.json().task.metadata.worktreeRecovery.status, 'kept')
+      assert.equal(existsSync(recoveryWorktreePath), true)
+      const continueRecoveryResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${worktreeRecoverySessionId}/tasks/${recoveryTask.taskId}/worktree-recovery`,
+        payload: { action: 'continue', actor: 'dashboard', source: 'sdk-test', reason: 'manual fix applied' },
+      })
+      assert.equal(continueRecoveryResponse.statusCode, 200)
+      assert.equal(continueRecoveryResponse.json().task.status, 'pending')
+      assert.equal(continueRecoveryResponse.json().task.retryCount, recoveryTask.retryCount + 1)
+      assert.equal(continueRecoveryResponse.json().task.metadata.worktreeRecovery.status, 'retry_requested')
+      assert.equal(existsSync(recoveryWorktreePath), false)
+      assert.equal((await runtimeBundle.storage.getSession(worktreeRecoverySessionId))?.phase, 'executing')
+
       const completeResponse = await app.inject({
         method: 'POST',
         url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/complete`,
@@ -671,7 +748,11 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
       const retryAfterFailResponse = await app.inject({
         method: 'POST',
         url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/retry`,
-        payload: { reason: 'retry after dependency fix' },
+        payload: {
+          actor: 'cli',
+          source: 'sessions.retry-task',
+          reason: 'retry after dependency fix',
+        },
       })
       assert.equal(retryAfterFailResponse.statusCode, 200)
       assert.equal(retryAfterFailResponse.json().task.status, 'pending')
@@ -679,6 +760,59 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
       const restoredDependent = await runtimeBundle.storage.getTask(failedDependencyTask.taskId)
       assert.equal(restoredDependent?.status, 'blocked')
       assert.equal(restoredDependent?.metadata?.failedDependencies, undefined)
+
+      const failedSubAgentTask = {
+        ...created,
+        taskId: `failed-subagent-task-${storageKind}`,
+        sessionId: failedSubAgentSessionId,
+        status: 'failed' as const,
+        retryCount: 2,
+        result: 'Sub-agent session ended with phase failed',
+        metadata: {
+          parentTaskId: 'parent-subagent-task',
+          subAgent: {
+            status: 'failed',
+            subSessionId: `${failedSubAgentSessionId}-sub-2`,
+            transcriptPath: `nexus://sessions/${failedSubAgentSessionId}-sub-2/events`,
+            summary: 'child failed',
+          },
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await runtimeBundle.storage.saveTask(failedSubAgentTask)
+      const failedSubAgentParentTask = {
+        ...created,
+        taskId: `failed-subagent-parent-${storageKind}`,
+        sessionId: failedSubAgentSessionId,
+        status: 'failed' as const,
+        dependsOn: [failedSubAgentTask.taskId],
+        result: 'Dependency failed',
+        metadata: {
+          delegatedSubTaskIds: [failedSubAgentTask.taskId],
+          failedDependencies: [{ taskId: failedSubAgentTask.taskId }],
+        },
+        updatedAt: new Date().toISOString(),
+      }
+      await runtimeBundle.storage.saveTask(failedSubAgentParentTask)
+      const rerunSubAgentResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${failedSubAgentSessionId}/tasks/${failedSubAgentTask.taskId}/rerun-subagent`,
+        payload: {
+          actor: 'cli',
+          source: 'sessions.rerun-subagent',
+          reason: 'retry failed child with fixed dependency',
+        },
+      })
+      assert.equal(rerunSubAgentResponse.statusCode, 200)
+      assert.equal(rerunSubAgentResponse.json().task.status, 'pending')
+      assert.equal(rerunSubAgentResponse.json().task.retryCount, 3)
+      assert.equal(rerunSubAgentResponse.json().task.metadata.previousSubAgents[0].subSessionId, `${failedSubAgentSessionId}-sub-2`)
+      assert.equal(rerunSubAgentResponse.json().task.metadata.subAgentRerun.previousTranscriptPath, `nexus://sessions/${failedSubAgentSessionId}-sub-2/events`)
+      assert.deepEqual(rerunSubAgentResponse.json().task.metadata.blockedTasksRestored, [failedSubAgentParentTask.taskId])
+      assert.equal((await runtimeBundle.storage.getSession(failedSubAgentSessionId, { includeEvents: false }))?.phase, 'executing')
+      const restoredSubAgentParent = await runtimeBundle.storage.getTask(failedSubAgentParentTask.taskId)
+      assert.equal(restoredSubAgentParent?.status, 'blocked')
+      assert.equal(restoredSubAgentParent?.metadata?.failedDependencies, undefined)
 
       const childSessionId = `${sessionId}-child-${storageKind}`
       const blockedTaskResponse = await app.inject({
@@ -736,7 +870,9 @@ test('SDK task mutation API writes audit events and guards revisions', async () 
       assert.ok(mutationEvents.some(event => event.eventType === 'task_created' && event.payload.actor === 'dashboard'))
       assert.ok(mutationEvents.some(event => event.eventType === 'task_updated' && event.payload.previous.status === 'pending' && event.payload.next.status === 'in_progress'))
       assert.ok(mutationEvents.some(event => event.eventType === 'task_completed'))
-      assert.ok(mutationEvents.some(event => event.eventType === 'task_retried'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_retried' && event.payload.actor === 'cli' && event.payload.source === 'sessions.retry-task'))
+      const subAgentEvents = (await runtimeBundle.storage.listEvents(failedSubAgentSessionId, { limit: 20 })).events.filter(event => event.type === 'task_session_event') as any[]
+      assert.ok(subAgentEvents.some(event => event.eventType === 'subagent_rerun_requested' && event.payload.actor === 'cli' && event.payload.source === 'sessions.rerun-subagent'))
       assert.ok(mutationEvents.some(event => event.eventType === 'task_approved' && event.payload.previous.review.status === 'pending'))
       assert.ok(mutationEvents.some(event => event.eventType === 'task_rejected' && event.payload.previous.review.status === 'pending'))
       assert.ok(mutationEvents.some(event => event.eventType === 'task_cancelled' && event.payload.reason === 'cancel from SDK'))
@@ -1329,6 +1465,13 @@ test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async (
         transcriptPath: `nexus://sessions/${childSessionId}/events`,
       },
     })
+    await storage.appendEvent(childSessionId, {
+      type: 'assistant_delta',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId: childSessionId,
+      timestamp: iso(10),
+      text: 'child transcript detail is queryable from parent',
+    })
     await storage.saveTask({
       taskId: 'task-assets-1',
       sessionId,
@@ -1449,6 +1592,36 @@ test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async (
     assert.equal(body.permissionAudits[0].auditId, 'audit-assets-1')
     assert.equal(body.executionMetrics.metricId, 'metric-assets-1')
     assert.equal(body.executionMetrics.toolCallCount, 1)
+
+    const childrenResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/children?eventLimit=1`,
+    })
+    assert.equal(childrenResponse.statusCode, 200)
+    const childrenBody = childrenResponse.json()
+    assert.equal(childrenBody.type, 'child_sessions')
+    assert.equal(childrenBody.children[0].session.sessionId, childSessionId)
+    assert.equal(childrenBody.children[0].transcriptPath, `nexus://sessions/${childSessionId}/events`)
+    assert.equal(childrenBody.children[0].events.items[0].text, 'child transcript detail is queryable from parent')
+
+    const childEventsResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/children/${childSessionId}/events?limit=1&order=desc`,
+    })
+    assert.equal(childEventsResponse.statusCode, 200)
+    const childEventsBody = childEventsResponse.json()
+    assert.equal(childEventsBody.type, 'child_session_events')
+    assert.equal(childEventsBody.sessionId, sessionId)
+    assert.equal(childEventsBody.childSessionId, childSessionId)
+    assert.equal(childEventsBody.transcriptPath, `nexus://sessions/${childSessionId}/events`)
+    assert.equal(childEventsBody.events[0].text, 'child transcript detail is queryable from parent')
+
+    const missingChildEventsResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/children/not-a-child/events`,
+    })
+    assert.equal(missingChildEventsResponse.statusCode, 404)
+    assert.equal(missingChildEventsResponse.json().code, 'CHILD_SESSION_NOT_FOUND')
 
     const missingResponse = await app.inject({
       method: 'GET',

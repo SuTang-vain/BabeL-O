@@ -329,6 +329,7 @@ export function formatPermissionDialog(
     ? extractCommandPrefix((event.input as Record<string, unknown>).command)
     : undefined
   const lines = [
+    `${chalk.yellow('◉')} ${chalk.dim('Waiting for permission...')}`,
     chalk.yellow(' approval '),
     `│ ${chalk.yellow(`${tool} is requesting approval (${risk})`)}`,
   ]

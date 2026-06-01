@@ -1,6 +1,7 @@
 import websocket from '@fastify/websocket'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { existsSync, lstatSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchema } from '../shared/events.js'
@@ -22,6 +23,7 @@ import { analyzeContext } from '../runtime/contextAnalysis.js'
 import { buildSystemPrompt, extractAbsolutePaths, mapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
 import { buildSessionAssetsSnapshot } from './sessionAssets.js'
+import { removeWorktree } from './worktree.js'
 
 
 declare module 'fastify' {
@@ -116,6 +118,14 @@ const taskActionSchema = taskMutationAuditSchema.extend({
   reviewReason: z.string().optional(),
 })
 
+const worktreeRecoveryActionSchema = taskMutationAuditSchema.extend({
+  action: z.enum(['continue', 'abandon', 'keep']),
+})
+
+const subAgentRerunSchema = taskMutationAuditSchema.extend({
+  mode: z.enum(['retry-task']).default('retry-task').optional(),
+})
+
 const eventListQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(500).default(100),
   cursor: z.string().optional(),
@@ -140,6 +150,13 @@ const sessionAssetsQuerySchema = z.object({
   includeToolTraces: booleanQuery(true),
   includePermissionAudits: booleanQuery(true),
   includeExecutionMetrics: booleanQuery(true),
+})
+
+const childSessionsQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(500).default(200),
+  eventLimit: z.coerce.number().int().min(0).max(100).default(5),
+  failedOnly: booleanQuery(false),
+  includeEvents: booleanQuery(true),
 })
 
 const sessionResumeSchema = z.object({
@@ -249,7 +266,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.6',
+    version: '0.2.7',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -258,7 +275,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.6',
+      version: '0.2.7',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),
@@ -589,6 +606,95 @@ export async function createNexusApp(
     return {
       type: 'session_events',
       sessionId: params.sessionId,
+      events: page.events,
+      nextCursor: page.nextCursor,
+      order: query.order,
+      limit: query.limit,
+    }
+  })
+
+  app.get('/v1/sessions/:sessionId/children', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = childSessionsQuerySchema.parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+
+    const childSessions = (await options.storage.listChildSessions(params.sessionId, {
+      limit: query.limit,
+      includeEvents: false,
+    })).filter(child => !query.failedOnly || child.phase === 'failed' || child.phase === 'cancelled' || child.metadata?.status === 'failed' || child.metadata?.status === 'cancelled')
+
+    const children = await Promise.all(childSessions.map(async child => {
+      const page = query.includeEvents && query.eventLimit > 0
+        ? await options.storage.listEvents(child.sessionId, {
+            limit: query.eventLimit,
+            order: 'desc',
+          })
+        : undefined
+      return {
+        session: { ...child, events: [] },
+        transcriptPath: typeof child.metadata?.transcriptPath === 'string'
+          ? child.metadata.transcriptPath
+          : `nexus://sessions/${child.sessionId}/events`,
+        events: page
+          ? {
+              items: [...page.events].reverse(),
+              truncated: page.nextCursor !== undefined,
+              limit: query.eventLimit,
+              order: 'asc',
+            }
+          : undefined,
+      }
+    }))
+
+    return {
+      type: 'child_sessions',
+      sessionId: params.sessionId,
+      children,
+      limit: query.limit,
+      eventLimit: query.eventLimit,
+    }
+  })
+
+  app.get('/v1/sessions/:sessionId/children/:childSessionId/events', async (request, reply) => {
+    const params = z.object({ sessionId: z.string(), childSessionId: z.string() }).parse(request.params)
+    const query = eventListQuerySchema.parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const child = await options.storage.getSession(params.childSessionId, {
+      includeEvents: false,
+    })
+    if (!child || child.parentSessionId !== params.sessionId) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'CHILD_SESSION_NOT_FOUND',
+        message: `Child session not found: ${params.childSessionId}`,
+      })
+    }
+    const page = await options.storage.listEvents(params.childSessionId, query)
+    return {
+      type: 'child_session_events',
+      sessionId: params.sessionId,
+      childSessionId: params.childSessionId,
+      transcriptPath: typeof child.metadata?.transcriptPath === 'string'
+        ? child.metadata.transcriptPath
+        : `nexus://sessions/${child.sessionId}/events`,
       events: page.events,
       nextCursor: page.nextCursor,
       order: query.order,
@@ -1070,6 +1176,57 @@ export async function createNexusApp(
     })
   })
 
+  app.post('/v1/sessions/:sessionId/tasks/:taskId/rerun-subagent', async (request, reply) => {
+    const params = z
+      .object({ sessionId: z.string(), taskId: z.string() })
+      .parse(request.params)
+    const body = subAgentRerunSchema.parse(request.body ?? {})
+    const task = await options.storage.getTask(params.taskId)
+    if (!task || task.sessionId !== params.sessionId) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'TASK_NOT_FOUND',
+        message: `Task not found: ${params.taskId}`,
+      })
+    }
+    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
+    const conflict = checkTaskRevision(task, body.expectedUpdatedAt)
+    if (conflict) return reply.code(409).send(conflict)
+    const updated = await applySubAgentRerunAction(options.storage, session, task, body)
+    await appendTaskMutationAudit(options.storage, params.sessionId, 'subagent_rerun_requested', task, updated, body)
+    return {
+      type: 'subagent_rerun_requested',
+      task: updated,
+    }
+  })
+
+  app.post('/v1/sessions/:sessionId/tasks/:taskId/worktree-recovery', async (request, reply) => {
+    const params = z
+      .object({ sessionId: z.string(), taskId: z.string() })
+      .parse(request.params)
+    const body = worktreeRecoveryActionSchema.parse(request.body ?? {})
+    const task = await options.storage.getTask(params.taskId)
+    if (!task || task.sessionId !== params.sessionId) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'TASK_NOT_FOUND',
+        message: `Task not found: ${params.taskId}`,
+      })
+    }
+    const session = await getMutableSession(options.storage, params.sessionId)
+    if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
+    const conflict = checkTaskRevision(task, body.expectedUpdatedAt)
+    if (conflict) return reply.code(409).send(conflict)
+    const updated = await applyWorktreeRecoveryAction(options.storage, session, task, body)
+    await appendTaskMutationAudit(options.storage, params.sessionId, 'worktree_recovery_action', task, updated, body)
+    return {
+      type: 'worktree_recovery_action',
+      action: body.action,
+      task: updated,
+    }
+  })
+
   app.post('/v1/sessions/:sessionId/tasks/:taskId/approve', async (request, reply) => {
     return mutateTaskAction(options.storage, request.params, request.body, reply, 'task_approved', (task, body) => {
       assertPendingTaskReview(task)
@@ -1238,6 +1395,27 @@ type TaskMutationAudit = z.infer<typeof taskMutationAuditSchema>
 
 type TaskActionBody = z.infer<typeof taskActionSchema>
 
+type WorktreeRecoveryActionBody = z.infer<typeof worktreeRecoveryActionSchema>
+
+type SubAgentRerunBody = z.infer<typeof subAgentRerunSchema>
+
+type WorktreeRecoveryMetadata = {
+  type?: string
+  status?: string
+  cwd?: string
+  worktreePath?: string
+  preservedWorktreePath?: string
+  taskId?: string
+}
+
+type SubAgentReferenceMetadata = {
+  status?: string
+  subSessionId?: string
+  transcriptPath?: string
+  summary?: string
+  resultEventRange?: unknown
+}
+
 type TaskMutationHttpError = {
   statusCode: number
   payload: { type: 'error'; code: string; message: string; task?: NexusTask }
@@ -1284,6 +1462,159 @@ async function mutateTaskAction(
   await storage.saveTask(updated)
   await appendTaskMutationAudit(storage, params.sessionId, eventType, task, updated, body)
   return { type: eventType, task: updated }
+}
+
+async function applySubAgentRerunAction(
+  storage: NexusStorage,
+  session: SessionSnapshot,
+  task: NexusTask,
+  body: SubAgentRerunBody,
+): Promise<NexusTask> {
+  const subAgent = getFailedSubAgentMetadata(task)
+  if (!subAgent) {
+    throw createTaskMutationHttpError(409, 'SUBAGENT_RERUN_NOT_AVAILABLE', `Task ${task.taskId} does not reference a failed sub-agent.`, task)
+  }
+
+  const previousSubAgents = Array.isArray(task.metadata?.previousSubAgents)
+    ? [...task.metadata.previousSubAgents]
+    : []
+  const blockedTasksRestored = await restoreTasksFailedByDependency(
+    storage,
+    task.sessionId,
+    task.taskId,
+  )
+  const rerunRequest = {
+    requestedAt: nowIso(),
+    requestedBy: body.actor ?? 'external',
+    source: body.source ?? 'sdk',
+    reason: body.reason,
+    previousSubSessionId: subAgent.subSessionId,
+    previousTranscriptPath: subAgent.transcriptPath,
+    nextRetryCount: task.retryCount + 1,
+  }
+  const updated: NexusTask = {
+    ...task,
+    status: 'pending',
+    ownerAgentId: undefined,
+    retryCount: task.retryCount + 1,
+    result: undefined,
+    review: task.review?.status === 'pending' ? task.review : undefined,
+    metadata: {
+      ...(task.metadata ?? {}),
+      previousSubAgents: [...previousSubAgents, subAgent],
+      subAgentRerun: rerunRequest,
+      ...(blockedTasksRestored.length > 0 ? { blockedTasksRestored } : {}),
+    },
+    updatedAt: nowIso(),
+  }
+  await storage.saveTask(updated)
+
+  if (session.phase === 'failed' || session.phase === 'cancelled') {
+    await storage.saveSession({
+      ...session,
+      phase: 'executing',
+      terminalReason: undefined,
+      error: undefined,
+      failureReason: undefined,
+      lastUserInput: 'sub-agent rerun requested',
+      updatedAt: nowIso(),
+    })
+  }
+  return updated
+}
+
+function getFailedSubAgentMetadata(task: NexusTask): SubAgentReferenceMetadata | undefined {
+  const subAgent = task.metadata?.subAgent
+  if (typeof subAgent !== 'object' || subAgent === null) return undefined
+  const typed = subAgent as SubAgentReferenceMetadata
+  if (typed.status !== 'failed' && typed.status !== 'cancelled') return undefined
+  if (!typed.subSessionId || !typed.transcriptPath) return undefined
+  return typed
+}
+
+async function applyWorktreeRecoveryAction(
+  storage: NexusStorage,
+  session: SessionSnapshot,
+  task: NexusTask,
+  body: WorktreeRecoveryActionBody,
+): Promise<NexusTask> {
+  const recovery = getWorktreeRecoveryMetadata(task)
+  if (!recovery) {
+    throw createTaskMutationHttpError(409, 'WORKTREE_RECOVERY_NOT_AVAILABLE', `Task ${task.taskId} does not have pending worktree recovery metadata.`, task)
+  }
+
+  const nextRecovery = {
+    ...recovery,
+    status: body.action === 'continue'
+      ? 'retry_requested'
+      : body.action === 'abandon'
+        ? 'abandoned'
+        : 'kept',
+    selectedAction: body.action,
+    selectedAt: nowIso(),
+    selectedBy: body.actor ?? 'external',
+    reason: body.reason,
+  }
+
+  if (body.action === 'abandon' || body.action === 'continue') {
+    const { cwd, worktreePath } = assertRecoverableWorktreePath(session, task, recovery)
+    await removeWorktree(cwd, worktreePath, task.taskId)
+  }
+
+  const updated: NexusTask = {
+    ...task,
+    status: body.action === 'continue' ? 'pending' : task.status,
+    ownerAgentId: body.action === 'continue' ? undefined : task.ownerAgentId,
+    retryCount: body.action === 'continue' ? task.retryCount + 1 : task.retryCount,
+    result: body.action === 'continue' ? undefined : task.result,
+    review: body.action === 'continue'
+      ? task.review?.status === 'pending' ? task.review : undefined
+      : task.review,
+    metadata: {
+      ...(task.metadata ?? {}),
+      worktreeRecovery: nextRecovery,
+    },
+    updatedAt: nowIso(),
+  }
+  await storage.saveTask(updated)
+
+  const nextSession: SessionSnapshot = {
+    ...session,
+    phase: body.action === 'continue' && session.phase === 'waiting_user' ? 'executing' : session.phase,
+    pendingInput: body.action === 'continue' ? undefined : session.pendingInput,
+    lastUserInput: `worktree recovery ${body.action}`,
+    updatedAt: nowIso(),
+  }
+  await storage.saveSession(nextSession)
+  return updated
+}
+
+function getWorktreeRecoveryMetadata(task: NexusTask): WorktreeRecoveryMetadata | undefined {
+  const recovery = task.metadata?.worktreeRecovery
+  if (typeof recovery !== 'object' || recovery === null) return undefined
+  const typed = recovery as WorktreeRecoveryMetadata
+  if (typed.type !== 'worktree_merge_conflict') return undefined
+  if (typed.status && !['awaiting_manual_recovery', 'kept'].includes(typed.status)) return undefined
+  return typed
+}
+
+function assertRecoverableWorktreePath(
+  session: SessionSnapshot,
+  task: NexusTask,
+  recovery: WorktreeRecoveryMetadata,
+): { cwd: string; worktreePath: string } {
+  const cwd = recovery.cwd
+  const worktreePath = recovery.preservedWorktreePath ?? recovery.worktreePath
+  if (!cwd || !worktreePath) {
+    throw createTaskMutationHttpError(409, 'WORKTREE_RECOVERY_INVALID', `Task ${task.taskId} worktree recovery metadata is missing cwd or worktreePath.`, task)
+  }
+  const resolvedCwd = resolve(cwd)
+  const resolvedWorktreePath = resolve(worktreePath)
+  const expectedPrefix = resolve(resolvedCwd, '.babel-o', 'worktrees')
+  if (resolvedCwd !== resolve(session.cwd) || !resolvedWorktreePath.startsWith(`${expectedPrefix}/`)) {
+    throw createTaskMutationHttpError(409, 'WORKTREE_RECOVERY_INVALID', `Task ${task.taskId} worktree recovery path is outside the session worktree directory.`, task)
+  }
+  return { cwd: resolvedCwd, worktreePath: resolvedWorktreePath }
 }
 
 function pickTaskPatch(body: z.infer<typeof updateTaskSchema>): Partial<NexusTask> {

@@ -10,8 +10,10 @@ import {
   getChatPrompt,
   setActiveReadline,
   startSession,
+  startAgentStatus,
   resumeSessionHistory,
   toggleTuiMode,
+  stopAgentStatus,
   stopSpinner
 } from '../renderEvents.js'
 import { formatSessionBanner, renderWelcome } from '../welcome.js'
@@ -222,6 +224,7 @@ export function registerChatCommand(program: Command): void {
         isExecuting = true
         inputState.set('agentRunning')
         startSession()
+        startAgentStatus('working')
         const wasRaw = process.stdin.isTTY ? process.stdin.isRaw : false
         if (process.stdin.isTTY) {
           process.stdin.setRawMode(true)
@@ -563,42 +566,43 @@ export function registerChatCommand(program: Command): void {
           }
 
           if (trimmed === '/compact') {
+            startAgentStatus('compacting')
             try {
               if (options.url) {
                 const client = new NexusClient({ baseUrl: options.url })
                 const modelId = ConfigManager.getInstance().resolveSettings().modelId
-                const result = await client.compactSession(sessionId, {
+                await client.compactSession(sessionId, {
                   modelId,
                   trigger: 'manual',
                 })
-                console.log(chalk.green(`✓ Compacted session ${sessionId}`))
-                console.log(JSON.stringify(result, null, 2))
               } else {
                 const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
                 if (!fs.existsSync(storagePath)) {
+                  stopAgentStatus()
                   console.log(chalk.yellow('No local storage found to compact.'))
-                } else {
-                  const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-                  const { compactSession } = await import('../../runtime/compact.js')
-                  const { mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
-                  const storage = new SqliteStorage(storagePath)
-                  try {
-                    const modelId = ConfigManager.getInstance().resolveSettings().modelId
-                    const result = await compactSession({
-                      storage,
-                      sessionId,
-                      modelId,
-                      trigger: 'manual',
-                      mapEventsToMessages,
-                    })
-                    console.log(chalk.green(`✓ Compacted session ${sessionId}`))
-                    console.log(JSON.stringify(result, null, 2))
-                  } finally {
-                    await storage.close?.()
-                  }
+                  continue
+                }
+                const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
+                const { compactSession } = await import('../../runtime/compact.js')
+                const { mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
+                const storage = new SqliteStorage(storagePath)
+                try {
+                  const modelId = ConfigManager.getInstance().resolveSettings().modelId
+                  await compactSession({
+                    storage,
+                    sessionId,
+                    modelId,
+                    trigger: 'manual',
+                    mapEventsToMessages,
+                  })
+                } finally {
+                  await storage.close?.()
                 }
               }
+              stopAgentStatus()
+              console.log(chalk.green('✓ Context compacted'))
             } catch (e: any) {
+              stopAgentStatus()
               console.error(chalk.red(`Failed to compact session: ${e.message || e}`))
             }
             continue
@@ -988,76 +992,80 @@ function yesNo(value: unknown): string {
 }
 
 function formatContextAnalysis(analysis: ContextAnalysis): string {
-  const lines: string[] = []
-  const windowColor = analysis.window.isBlocking
-    ? chalk.red
-    : analysis.window.isWarning
-      ? chalk.yellow
-      : chalk.green
-  lines.push(chalk.cyan('\n--- Context Analysis ---'))
-  lines.push(`Session: ${chalk.dim(analysis.sessionId)}`)
-  lines.push(`Model:   ${chalk.yellow(analysis.modelId)}`)
-  lines.push(`CWD:     ${chalk.white(analysis.cwd)}`)
-  lines.push(
-    `Tokens:  ${windowColor(`${analysis.estimate.totalTokens}/${analysis.window.maxTokens}`)} ` +
-    chalk.dim(`(${analysis.window.percentUsed}%, warn ${analysis.window.warningThresholdTokens}, block ${analysis.window.blockingLimitTokens})`),
-  )
-  lines.push('')
-  lines.push(chalk.bold('Sections'))
-  lines.push(`  system prompt:   ${analysis.sections.systemPromptChars} chars`)
-  lines.push(`  project memory:  ${analysis.sections.projectMemoryChars} chars`)
-  lines.push(`  session summary: ${analysis.sections.sessionSummaryChars} chars`)
-  lines.push(`  active skills:   ${analysis.sections.activeSkillsChars} chars`)
-  lines.push(`  messages:        ${analysis.sections.messageCount}`)
-  lines.push(`  events:          selected ${analysis.sections.selectedEventCount}, omitted ${analysis.sections.omittedEventCount}, snipped ${analysis.sections.snippedEventCount}`)
-  lines.push(`  tool schemas:    ${analysis.sections.toolDefinitionCount}`)
-  lines.push('')
-  lines.push(chalk.bold('Compact'))
-  if (analysis.compact.hasBoundary) {
-    lines.push(`  boundary:        ${chalk.green('yes')} (${analysis.compact.trigger})`)
-    lines.push(`  retained events: ${analysis.compact.retainedEventCount}`)
-    lines.push(`  retained check:  ${
-      analysis.compact.retainedSegmentValid
-        ? chalk.green('valid')
-        : chalk.red('invalid')
-    }`)
-    if (analysis.compact.retainedSegmentWarning) {
-      lines.push(`  retained warn:   ${chalk.yellow(analysis.compact.retainedSegmentWarning)}`)
-    }
-    lines.push(`  event counts:    ${analysis.compact.beforeEventCount} -> ${analysis.compact.afterEventCount}`)
-  } else {
-    lines.push(`  boundary:        ${chalk.yellow('no')}`)
-  }
-  lines.push('')
-  lines.push(chalk.bold('User Intent / Runtime Policy'))
-  lines.push(`  intent:          ${analysis.userIntentGuidance.intent} (${analysis.userIntentGuidance.source}, confidence ${analysis.userIntentGuidance.confidence})`)
-  lines.push(`  action:          ${analysis.userIntentGuidance.actionHint}, scope ${analysis.userIntentGuidance.contextScope}, requires tools ${analysis.userIntentGuidance.requiresTools ? 'yes' : 'no'}`)
-  lines.push(`  explicit paths:  ${formatList(analysis.userIntentGuidance.explicitPaths)}`)
-  lines.push(`  tools visible:   ${analysis.runtimePolicy.toolsVisible ? chalk.green('yes') : chalk.yellow('no')}${analysis.runtimePolicy.toolSuppressionReason ? chalk.dim(` (${analysis.runtimePolicy.toolSuppressionReason})`) : ''}`)
-  if (analysis.runtimePolicy.recoveryBoundaryActive) {
-    lines.push(`  recovery:        ${chalk.yellow(analysis.runtimePolicy.recoveryBoundaryCode)} at ${analysis.runtimePolicy.recoveryBoundaryTimestamp}`)
-  } else {
-    lines.push(`  recovery:        ${chalk.dim('none')}`)
-  }
-  lines.push('')
-  lines.push(chalk.bold('Post-Compact State'))
-  lines.push(`  read files:      ${formatList(analysis.postCompactState.recentReadFiles)}`)
-  lines.push(`  recent tools:    ${formatList(analysis.postCompactState.activeToolNames)}`)
-  lines.push(`  active skills:   ${formatList(analysis.postCompactState.activeSkills)}`)
-  lines.push(`  agent/tasks:     ${formatList(analysis.postCompactState.taskStatusLines)}`)
-  lines.push(`  hooks:           ${formatList(analysis.postCompactState.hookLines)}`)
-  lines.push('')
-  lines.push(chalk.bold('Recommendations'))
-  for (const recommendation of analysis.recommendations) {
-    lines.push(`  - ${recommendation}`)
-  }
-  lines.push('')
-  return lines.join('\n')
+  const maxTokens = Math.max(1, analysis.window.maxTokens)
+  const usedTokens = Math.max(0, analysis.estimate.totalTokens)
+  const availableTokens = Math.max(0, maxTokens - usedTokens)
+  const compactBufferTokens = Math.max(0, maxTokens - analysis.window.compactThresholdTokens)
+  const freeTokens = Math.max(0, availableTokens - compactBufferTokens)
+  const activeSkillsTokens = estimateCharsAsTokens(analysis.sections.activeSkillsChars)
+  const systemPromptTokens = Math.max(0, analysis.estimate.systemPromptTokens - activeSkillsTokens)
+  const rows = [
+    contextSourceRow('■', 'System prompt', systemPromptTokens, maxTokens, chalk.blue),
+    contextSourceRow('■', 'System tools', analysis.estimate.toolDefinitionTokens, maxTokens, chalk.magenta),
+    contextSourceRow('■', 'Skills', activeSkillsTokens, maxTokens, chalk.cyan),
+    contextSourceRow('■', 'Messages', analysis.estimate.messageTokens, maxTokens, chalk.green),
+    contextSourceRow('~', 'Autocompact buffer', compactBufferTokens, maxTokens, chalk.yellow),
+    contextSourceRow('□', 'Free space', freeTokens, maxTokens, chalk.dim),
+  ]
+
+  return [
+    '',
+    `${chalk.dim('⎿')}  ${chalk.bold('BABEL Context')}`,
+    `   ${chalk.yellow(formatContextModelName(analysis.modelId))} · current context ${chalk.bold(formatTokenCompact(usedTokens))}/${formatTokenCompact(maxTokens)} (${formatPercent(usedTokens, maxTokens)}) · available ${formatTokenCompact(availableTokens)}`,
+    `   ${formatContextUsageBar(usedTokens, maxTokens)} ${formatPercent(usedTokens, maxTokens)} used`,
+    '',
+    `   ${chalk.bold('Current context by source')}`,
+    ...rows.map(row => `   ${row}`),
+    '',
+    `   ${chalk.bold('Skills')} · ${chalk.cyan('/skills')}`,
+    '',
+  ].join('\n')
 }
 
-function formatList(values: string[]): string {
-  if (values.length === 0) return chalk.dim('none')
-  return values.join(', ')
+function contextSourceRow(
+  marker: string,
+  label: string,
+  tokens: number,
+  maxTokens: number,
+  color: (text: string) => string,
+): string {
+  return `${color(marker)} ${label} · ${formatTokenCount(tokens)} · ${formatPercent(tokens, maxTokens)}`
+}
+
+function formatContextUsageBar(usedTokens: number, maxTokens: number): string {
+  const width = 36
+  const ratio = Math.max(0, Math.min(1, usedTokens / Math.max(1, maxTokens)))
+  const filled = usedTokens > 0 ? Math.max(1, Math.round(ratio * width)) : 0
+  const empty = Math.max(0, width - filled)
+  const color = ratio >= 0.9 ? chalk.red : ratio >= 0.7 ? chalk.yellow : chalk.green
+  return `[${color('■'.repeat(filled))}${chalk.dim('□'.repeat(empty))}]`
+}
+
+function formatContextModelName(modelId: string): string {
+  const [, name] = modelId.split('/')
+  return name || modelId
+}
+
+function formatTokenCompact(tokens: number): string {
+  if (tokens >= 1000) {
+    const value = tokens / 1000
+    return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}k`
+  }
+  return `${Math.round(tokens)}`
+}
+
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1000) return `${formatTokenCompact(tokens)} tokens`
+  return `${Math.round(tokens)} tokens`
+}
+
+function formatPercent(tokens: number, maxTokens: number): string {
+  const percent = (tokens / Math.max(1, maxTokens)) * 100
+  return `${percent >= 10 ? Math.round(percent) : Math.round(percent * 10) / 10}%`
+}
+
+function estimateCharsAsTokens(chars: number): number {
+  return Math.max(0, Math.ceil(chars / 4))
 }
 
 async function runModelConfigWizard() {

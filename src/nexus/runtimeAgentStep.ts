@@ -292,8 +292,11 @@ export function createRuntimeAgentStepRunner(
         signal: options.signal,
         maxRepairAttempts: options.maxRepairAttempts ?? 1,
       })
-      options.onUsageSummary?.(summary)
-      return parsed as TOutput
+      options.onUsageSummary?.({
+        ...summary,
+        ...(parsed.repairAttempts > 1 ? { repairAttempts: parsed.repairAttempts } : {}),
+      })
+      return parsed.output as TOutput
     } catch (err) {
       if (err instanceof RuntimeAgentStepError) {
         const failureSummary = {
@@ -309,20 +312,6 @@ export function createRuntimeAgentStepRunner(
   }
 }
 
-interface RepairContext {
-  roleDefinition: AgentRoleDefinition
-  input: unknown
-  resultPayload: unknown
-  assistantText: string
-  structuredOutputPayload: unknown
-  runtimeForRole: NexusRuntimeLike
-  sessionId: string
-  targetModelId: string
-  repairCount: number
-  diagnostics: StructuredOutputDiagnostics
-  prompt: string
-}
-
 async function tryParseWithRepair(context: {
   roleDefinition: AgentRoleDefinition
   input: unknown
@@ -334,7 +323,7 @@ async function tryParseWithRepair(context: {
   targetModelId: string
   signal?: AbortSignal
   maxRepairAttempts: number
-}): Promise<unknown> {
+}): Promise<{ output: unknown; repairAttempts: number }> {
   let attempt = 0
   let currentPrompt = buildAgentStepPrompt(context.roleDefinition, context.input)
   let currentTextParts: string[] = context.assistantText ? [context.assistantText] : []
@@ -347,11 +336,21 @@ async function tryParseWithRepair(context: {
 
     // On first attempt, we already have the parsed values; on retries, re-execute
     if (attempt > 1) {
+      const previousText = currentTextParts.join('')
+      const previousResultPayload = currentResultPayload
+      const previousStructuredOutputPayload = currentStructuredOutputPayload
       currentTextParts = []
       currentResultPayload = undefined
       currentStructuredOutputPayload = undefined
 
-      const repairPrompt = buildRepairPrompt(context.roleDefinition, context.input, attempt)
+      const repairPrompt = buildRepairPrompt({
+        roleDefinition: context.roleDefinition,
+        input: context.input,
+        attempt,
+        previousText,
+        previousResultPayload,
+        previousStructuredOutputPayload,
+      })
       currentPrompt = repairPrompt
 
       const executionResult = await executeRuntimeTurn(
@@ -363,6 +362,7 @@ async function tryParseWithRepair(context: {
         !context.roleDefinition.toolPolicy.requiresApproval,
         context.signal,
         (event) => {
+          recordTaskSessionNexusEvent(context.sessionId, event)
           if (event.type === 'assistant_delta') currentTextParts.push(event.text)
           if (event.type === 'result') {
             currentResultPayload = (event as { result?: unknown }).result
@@ -370,6 +370,9 @@ async function tryParseWithRepair(context: {
           }
         },
       )
+      if (currentTextParts.join('').trim().length === 0 && executionResult.resultMessage) {
+        currentTextParts = [executionResult.resultMessage]
+      }
 
       if (executionResult.errorEvent) {
         throw new RuntimeAgentStepError(
@@ -388,7 +391,10 @@ async function tryParseWithRepair(context: {
         currentStructuredOutputPayload,
         context.input,
       )
-      return parsed
+      if (shouldRepairPlannerFallback(context.roleDefinition, parsed, attempt, context.maxRepairAttempts)) {
+        throw new Error('Planner returned an empty plan; repair requires a smaller explicit task list.')
+      }
+      return { output: parsed, repairAttempts: attempt }
     } catch (err) {
       const diagnostics = buildStructuredOutputDiagnostics(
         err,
@@ -401,6 +407,13 @@ async function tryParseWithRepair(context: {
       const isLastAttempt = attempt >= context.maxRepairAttempts + 1
       if (isLastAttempt) {
         const rootFailure = firstFailure ?? { error: err, diagnostics }
+        const conservativeOutput = buildConservativeRoleOutput(
+          context.roleDefinition,
+          rootFailure.diagnostics,
+        )
+        if (conservativeOutput !== undefined) {
+          return { output: conservativeOutput, repairAttempts: attempt }
+        }
         const summary = buildUsageSummaryFromExecution({
           eventCount: 0,
           toolCallCount: 0,
@@ -429,16 +442,34 @@ async function tryParseWithRepair(context: {
   throw new Error('Repair loop exited unexpectedly')
 }
 
+function shouldRepairPlannerFallback(
+  roleDefinition: AgentRoleDefinition,
+  parsed: unknown,
+  attempt: number,
+  maxRepairAttempts: number,
+): boolean {
+  if (roleDefinition.role !== 'planner' || attempt > maxRepairAttempts) return false
+  if (!isRecord(parsed) || !Array.isArray(parsed.tasks)) return false
+  return parsed.tasks.some(task => {
+    if (!isRecord(task) || !isRecord(task.metadata)) return false
+    return task.metadata.generatedFallback === 'empty-planner-output'
+  })
+}
+
 function intersectAllowedTools(roleTools: string[], overrideTools: string[]): string[] {
   const allowed = new Set(overrideTools.map(tool => tool.trim().toLowerCase()))
   return roleTools.filter(tool => allowed.has(tool.trim().toLowerCase()))
 }
 
-function buildRepairPrompt(
-  roleDefinition: AgentRoleDefinition,
-  input: unknown,
-  attempt: number,
-): string {
+function buildRepairPrompt(options: {
+  roleDefinition: AgentRoleDefinition
+  input: unknown
+  attempt: number
+  previousText?: string
+  previousResultPayload?: unknown
+  previousStructuredOutputPayload?: unknown
+}): string {
+  const { roleDefinition, input, attempt } = options
   const role = roleDefinition.role
   let correctionInstruction = ''
 
@@ -446,7 +477,8 @@ function buildRepairPrompt(
     case 'planner':
       correctionInstruction = [
         'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
-        `Attempt ${attempt}: Please return ONLY a valid JSON object with "summary" (string) and "tasks" (array of objects with "title" string and optional "description" string).`,
+        `Attempt ${attempt}: Return ONLY a smaller valid JSON object with "summary" and one to three concrete "tasks".`,
+        'If the prior plan was empty or too broad, split the original goal into the smallest executable task list you can infer.',
         'Do not include any explanation, markdown formatting, or extra text.',
       ].join('\n')
       break
@@ -454,14 +486,16 @@ function buildRepairPrompt(
     case 'optimizer':
       correctionInstruction = [
         'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
-        `Attempt ${attempt}: Please return ONLY a valid JSON object with "taskId" (string), "success" (boolean), and "result" (string).`,
+        `Attempt ${attempt}: Return ONLY a valid JSON object with "taskId" (string), "success" (boolean), and "result" (string).`,
+        'Use the previous raw output to preserve the completed work summary in "result"; do not rerun tools just to restate it.',
         'Do not include any explanation, markdown formatting, or extra text.',
       ].join('\n')
       break
     case 'critic':
       correctionInstruction = [
         'IMPORTANT: Your previous response was not valid JSON or did not match the required schema.',
-        `Attempt ${attempt}: Please return ONLY a valid JSON object with "approved" (boolean) and optional "reason" (string).`,
+        `Attempt ${attempt}: Return ONLY a valid JSON object with "approved" (boolean) and optional "reason" (string).`,
+        'If you cannot make a structured approval decision, return {"approved":false,"reason":"needs-human-review"}.',
         'Do not include any explanation, markdown formatting, or extra text.',
       ].join('\n')
       break
@@ -477,6 +511,13 @@ function buildRepairPrompt(
     '',
     correctionInstruction,
     '',
+    'Previous invalid output:',
+    summarizeRepairSource({
+      text: options.previousText,
+      resultPayload: options.previousResultPayload,
+      structuredOutputPayload: options.previousStructuredOutputPayload,
+    }),
+    '',
     'Output JSON Schema:',
     JSON.stringify(outputSchema, null, 2),
     '',
@@ -486,6 +527,19 @@ function buildRepairPrompt(
     'Input:',
     JSON.stringify(input, null, 2),
   ].join('\n')
+}
+
+function summarizeRepairSource(options: {
+  text?: string
+  resultPayload?: unknown
+  structuredOutputPayload?: unknown
+}): string {
+  const parts = [
+    options.text?.trim() ? `assistantText: ${options.text.trim()}` : undefined,
+    options.resultPayload !== undefined ? `resultPayload: ${previewValue(options.resultPayload)}` : undefined,
+    options.structuredOutputPayload !== undefined ? `structuredOutput: ${previewValue(options.structuredOutputPayload)}` : undefined,
+  ].filter((part): part is string => Boolean(part))
+  return parts.join('\n').slice(0, 2000) || '(empty)'
 }
 
 async function executeRuntimeTurn(
@@ -583,6 +637,19 @@ function buildAssistantTextForParsing(
   const streamedText = textParts.join('')
   if (streamedText.trim().length > 0) return streamedText
   return resultMessage ?? ''
+}
+
+function buildConservativeRoleOutput(
+  roleDefinition: AgentRoleDefinition,
+  diagnostics: StructuredOutputDiagnostics,
+): unknown | undefined {
+  if (roleDefinition.role !== 'critic') return undefined
+  const output = {
+    approved: false,
+    reason: `needs-human-review: structured output ${diagnostics.failureType}`,
+  }
+  const parsed = roleDefinition.outputSchema.safeParse(output)
+  return parsed.success ? parsed.data : undefined
 }
 
 function buildStructuredOutputDiagnostics(

@@ -7,6 +7,44 @@ import { logger } from '../shared/logger.js'
 const gitOperationLocks = new Map<string, Promise<void>>()
 const gitOperationLockStats = new Map<string, { active: number; maxActive: number }>()
 
+export type WorktreeMergeRecoveryAction = {
+  action: 'continue' | 'abandon' | 'keep'
+  label: string
+  description: string
+  steps: string[]
+}
+
+export type WorktreeMergeConflictDiagnostic = {
+  type: 'worktree_merge_conflict'
+  taskId: string
+  taskTitle: string
+  cwd: string
+  worktreePath: string
+  parentCommit: string
+  worktreeCommit: string
+  failedCommit: string
+  conflictingFiles: string[]
+  cherryPickOutput: string
+  defaultAction: 'keep'
+  recoveryActions: WorktreeMergeRecoveryAction[]
+}
+
+export class WorktreeMergeConflictError extends Error {
+  readonly code = 'WORKTREE_MERGE_CONFLICT'
+
+  constructor(readonly diagnostic: WorktreeMergeConflictDiagnostic) {
+    const files = diagnostic.conflictingFiles.length > 0
+      ? ` Conflicting files: ${diagnostic.conflictingFiles.join(', ')}.`
+      : ''
+    super(`Cherry-pick failed with conflicts.${files}`)
+    this.name = 'WorktreeMergeConflictError'
+  }
+}
+
+export function isWorktreeMergeConflictError(error: unknown): error is WorktreeMergeConflictError {
+  return error instanceof WorktreeMergeConflictError
+}
+
 export async function withGitOperationLock<T>(cwd: string, fn: () => Promise<T>): Promise<T> {
   const key = resolve(cwd)
   const previous = gitOperationLocks.get(key) ?? Promise.resolve()
@@ -89,6 +127,50 @@ export function parsePorcelainChangedPaths(stdout: string): string[] {
     paths.add(rawPath)
   }
   return [...paths].sort()
+}
+
+function buildWorktreeConflictRecoveryActions(options: {
+  cwd: string
+  worktreePath: string
+  taskId: string
+  failedCommit: string
+  conflictingFiles: string[]
+}): WorktreeMergeRecoveryAction[] {
+  const files = options.conflictingFiles.length > 0
+    ? options.conflictingFiles.join(', ')
+    : 'the conflicting files reported by git'
+  return [
+    {
+      action: 'keep',
+      label: 'Keep conflict workspace',
+      description: 'Leave the isolated worktree intact for manual inspection before choosing a recovery path.',
+      steps: [
+        `Inspect isolated worktree: ${options.worktreePath}`,
+        `Inspect parent workspace: ${options.cwd}`,
+        `Review conflicting files: ${files}`,
+      ],
+    },
+    {
+      action: 'continue',
+      label: 'Resolve and retry',
+      description: 'Resolve the conflict manually, then clear the preserved worktree and retry the task after the parent workspace is clean.',
+      steps: [
+        `Use the preserved worktree at ${options.worktreePath} to inspect task ${options.taskId} changes.`,
+        `Apply or port the intended changes into ${options.cwd} and resolve: ${files}.`,
+        'Ensure the parent workspace has no in-progress cherry-pick and no unresolved conflicts.',
+        'Use the worktree recovery continue action to remove the preserved worktree and mark the task pending again.',
+      ],
+    },
+    {
+      action: 'abandon',
+      label: 'Abandon isolated changes',
+      description: 'Discard the isolated worktree after deciding the task changes should not be merged.',
+      steps: [
+        `Remove the preserved worktree for task ${options.taskId} after inspection: ${options.worktreePath}`,
+        'Retry, cancel, or replace the task from the session task controls.',
+      ],
+    },
+  ]
 }
 
 async function stagePorcelainChanges(worktreePath: string): Promise<string[]> {
@@ -239,8 +321,26 @@ export async function commitAndMergeWorktree(
         // If cherry-pick fails, abort it to clean up the main repo state and throw error
         await runGitCommand(cwd, ['cherry-pick', '--abort'])
 
-        const filesInfo = filesList.length > 0 ? ` Conflicting files: ${filesList.join(', ')}.` : ''
-        throw new Error(`Cherry-pick failed with conflicts.${filesInfo}\nDetails: ${cpStderr || cpStdout}`)
+        throw new WorktreeMergeConflictError({
+          type: 'worktree_merge_conflict',
+          taskId,
+          taskTitle,
+          cwd,
+          worktreePath,
+          parentCommit: parentHeadHash,
+          worktreeCommit: worktreeHeadHash,
+          failedCommit: commitHash,
+          conflictingFiles: filesList,
+          cherryPickOutput: cpStderr || cpStdout,
+          defaultAction: 'keep',
+          recoveryActions: buildWorktreeConflictRecoveryActions({
+            cwd,
+            worktreePath,
+            taskId,
+            failedCommit: commitHash,
+            conflictingFiles: filesList,
+          }),
+        })
       }
       lastCommitHash = commitHash
     }

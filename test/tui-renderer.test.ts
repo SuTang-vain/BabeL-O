@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
-import { formatSessionHistory, renderEvent, renderEventForTest, startSession } from '../src/cli/renderEvents.js'
+import { formatSessionHistory, getSessionEvents, renderEvent, renderEventForTest, startAgentStatus, startSession, stopSpinner } from '../src/cli/renderEvents.js'
 import type { NexusEvent } from '../src/shared/events.js'
 
 test('formatSessionHistory: compact mode renders correct summaries', () => {
@@ -220,7 +220,7 @@ test('formatSessionHistory: renders provider fallback policy details', () => {
   assert.ok(output.includes('silentSwitch=false'))
 })
 
-test('formatSessionHistory: renders compact boundaries and context warnings', () => {
+test('formatSessionHistory: hides compact boundary details in compact mode', () => {
   const events: NexusEvent[] = [
     {
       type: 'compact_boundary',
@@ -251,8 +251,8 @@ test('formatSessionHistory: renders compact boundaries and context warnings', ()
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('context compacted: 120 -> 18 events'))
-  assert.ok(output.includes('Old project analysis summarized.'))
+  assert.ok(!output.includes('context compacted: 120 -> 18 events'))
+  assert.ok(!output.includes('Old project analysis summarized.'))
   assert.ok(output.includes('context warning: 85%'))
   assert.ok(output.includes('/compact'))
 })
@@ -523,6 +523,121 @@ test('formatSessionHistory: compact tool rows hide raw tool parameter names', ()
   assert.ok(!output.includes('running'))
 })
 
+test('startAgentStatus renders compacting progress feedback', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    startAgentStatus('compacting')
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Compacting conversation...'))
+  assert.ok(plainOutput.includes('▰'))
+  assert.ok(plainOutput.includes('▱'))
+  assert.match(plainOutput, /\d+%/)
+})
+
+test('startAgentStatus renders immediate waiting feedback before runtime events', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    startAgentStatus('working')
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Working...'))
+  assert.ok(plainOutput.includes('[Context: OK]'))
+})
+
+test('renderEvent updates live waiting status across session, permission, and tool phases', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    startAgentStatus('working')
+    renderEventForTest({
+      type: 'session_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-status-flow',
+      timestamp: new Date().toISOString(),
+      cwd: '/repo',
+      model: 'local/coding-runtime',
+    })
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-status-flow',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-status-bash',
+      name: 'Bash',
+      input: { command: 'node -v' },
+    })
+    renderEventForTest({
+      type: 'permission_request',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-status-flow',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-status-bash',
+      name: 'Bash',
+      input: { command: 'node -v' },
+      risk: 'execute',
+      message: 'Tool Bash requires user permission to run.',
+    })
+    renderEventForTest({
+      type: 'permission_response',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-status-flow',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-status-bash',
+      approved: true,
+      reason: 'User approved',
+    })
+    renderEventForTest({
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-status-flow',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-status-bash',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'v22.0.0\n', stderr: '', exitCode: 0 },
+    })
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Working...'))
+  assert.ok(plainOutput.includes('Generating...'))
+  assert.ok(plainOutput.includes('Running Bash...'))
+  assert.ok(plainOutput.includes('● Bash(node -v)'))
+  assert.ok(plainOutput.includes('⎿  v22.0.0'))
+})
+
 test('renderEvent keeps completed tool row before compact thinking spinner', () => {
   startSession()
   const writes: string[] = []
@@ -714,6 +829,7 @@ test('renderEvent updates live tool completion on the same terminal row', () => 
       output: 'content',
     })
   } finally {
+    stopSpinner()
     process.stdout.write = originalWrite
   }
 
@@ -721,9 +837,47 @@ test('renderEvent updates live tool completion on the same terminal row', () => 
   assert.ok(output.includes('● Read(/tmp/file.txt)'))
   assert.ok(output.includes('\r\x1b[K'))
   assert.ok(!output.includes('(ctrl+o to expand)'))
-  assert.equal((output.match(/\n/g) ?? []).length, 0)
+  assert.ok(output.includes('Running Read...'))
+  assert.ok(output.includes('Generating...'))
+  const historyOutput = formatSessionHistory(getSessionEvents(), 'compact')
+  assert.equal(historyOutput.includes('Running Read...'), false)
+  assert.equal(historyOutput.includes('Generating...'), false)
+  assert.ok(!output.includes('\x1b[2A\x1b[J'))
   assert.ok(!output.includes('maxBytes'))
   assert.ok(!output.includes('running'))
+})
+
+test('renderEvent clears initial waiting overlay before first tool row', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    startAgentStatus('working')
+    renderEventForTest({
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-live-tool-status',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-read-status',
+      name: 'Read',
+      input: { path: '/tmp/file.txt', maxBytes: 2000 },
+    })
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const output = writes.join('')
+  const plainOutput = output.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Working...'))
+  assert.ok(plainOutput.includes('● Read(/tmp/file.txt)'))
+  assert.ok(output.includes('\r\x1b[K'))
+  assert.ok(!plainOutput.includes('done'))
 })
 
 test('formatSessionHistory: renders expanded thinking as a separate thought block', () => {
