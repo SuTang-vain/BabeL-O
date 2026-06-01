@@ -397,12 +397,16 @@ function isInsideCwd(path: string, cwd: string): boolean {
 
 function isGreetingPrompt(text: string): boolean {
   const normalized = normalizeLoose(text)
-  return /^(hi|hello|hey|你好|您好)$/.test(normalized)
+  if (/^(hi|hello|hey|你好|您好)$/.test(normalized)) return true
+  if (/^(?:hi|hello|hey)?(?:你是谁|你是哪个|你是什么|你能做什么|你会做什么|你可以做什么|你叫什么|你叫啥)$/.test(normalized)) return true
+  if (/^(?:hi|hello|hey)?(?:whoareyou|whatareyou|whatcanyoudo|whatdoyoudo|introduceyourself)$/.test(normalized)) return true
+  return false
 }
 
 function isStatusPrompt(text: string): boolean {
   const normalized = text.trim().toLowerCase()
   if (/^(你)?还在吗[？?!.。！`'"\s]*$/u.test(normalized)) return true
+  if (/^(还记得|记得我.*问|知道我.*问).*[？?!.。！`'"\s]*$/u.test(normalized)) return true
   if (/你.*(在干什么|正在干什么|还记得|知道我.*问|感知我.*问|听得懂).*[？?!.。！`'"\s]*$/u.test(normalized)) return true
   if (/\b(what are you doing|where are we|what were you doing|do you remember)\b/iu.test(normalized)) return true
   return false

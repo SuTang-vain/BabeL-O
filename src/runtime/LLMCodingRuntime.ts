@@ -149,7 +149,7 @@ export class LLMCodingRuntime implements NexusRuntime {
 
       // 2. Load previous session events from storage (if any)
       let previousEvents: NexusEvent[] = []
-      if (this.storage) {
+      if (this.storage && options.replaySessionHistory !== false) {
         try {
           const result = await this.storage.listEvents(options.sessionId, {
             order: 'desc',
@@ -485,6 +485,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           ],
           messages: normalizeMessages(messages),
           tools: modelVisibleTools,
+          maxTokens: options.maxOutputTokens,
           enablePromptCaching: settings.providerId === 'anthropic',
           ...(thinkingBudget &&
             thinkingBudget > 0 && {

@@ -812,6 +812,7 @@ function eventIndexPayload(event: NexusEvent): string {
   if ('toolUseId' in event && event.toolUseId !== undefined) return String(event.toolUseId)
   if ('taskId' in event && event.taskId !== undefined) return String(event.taskId)
   if ('code' in event && event.code !== undefined) return String(event.code)
+  if ('eventId' in event && event.eventId !== undefined) return String(event.eventId)
   return ''
 }
 

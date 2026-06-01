@@ -3,6 +3,7 @@ import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
+import type { NexusTask } from '../shared/task.js'
 import type {
   NexusRuntime,
   RuntimeExecuteOptions,
@@ -23,6 +24,8 @@ import {
 type ParsedIntent =
   | { kind: 'tool'; toolName: string; input: unknown }
   | { kind: 'file_question'; path: string; question: string }
+  | { kind: 'task_status' }
+  | { kind: 'task_update'; selector: string; status: 'pending' | 'in_progress' | 'completed' | 'failed'; result?: string }
   | { kind: 'text'; text: string }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
@@ -140,6 +143,16 @@ export class LocalCodingRuntime implements NexusRuntime {
 
       if (intent.kind === 'file_question') {
         yield* this.executeFileQuestion(options, intent, recordToolRun)
+        return
+      }
+
+      if (intent.kind === 'task_status') {
+        yield* this.executeTaskStatus(options)
+        return
+      }
+
+      if (intent.kind === 'task_update') {
+        yield* this.executeTaskUpdate(options, intent)
         return
       }
 
@@ -427,6 +440,84 @@ export class LocalCodingRuntime implements NexusRuntime {
     }
   }
 
+  private async *executeTaskStatus(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    const tasks = options.storage ? await options.storage.listTasks(options.sessionId) : []
+    const message = tasks.length === 0
+      ? 'No tasks in this session.'
+      : tasks.map(task => `${task.taskId} ${task.status} ${task.title}`).join('\n')
+
+    yield {
+      type: 'task_session_event',
+      ...eventBase(options.sessionId),
+      eventId: createId('event'),
+      eventType: 'task_status',
+      phase: options.sessionId,
+      payload: { tasks },
+    }
+    yield {
+      type: 'assistant_delta',
+      ...eventBase(options.sessionId),
+      text: message,
+    }
+    yield {
+      type: 'result',
+      ...eventBase(options.sessionId),
+      success: true,
+      message,
+    }
+  }
+
+  private async *executeTaskUpdate(
+    options: RuntimeExecuteOptions,
+    intent: { selector: string; status: 'pending' | 'in_progress' | 'completed' | 'failed'; result?: string },
+  ): AsyncIterable<NexusEvent> {
+    const tasks = options.storage ? await options.storage.listTasks(options.sessionId) : []
+    const task = findTaskBySelector(tasks, intent.selector)
+    if (!task || !options.storage) {
+      const message = `Task not found: ${intent.selector}`
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: message,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message,
+      }
+      return
+    }
+
+    const updated: NexusTask = {
+      ...task,
+      status: intent.status,
+      result: intent.result ?? task.result,
+      updatedAt: nowIso(),
+    }
+    await options.storage.saveTask(updated)
+    yield {
+      type: 'task_session_event',
+      ...eventBase(options.sessionId),
+      eventId: createId('event'),
+      eventType: 'task_updated',
+      phase: options.sessionId,
+      payload: { task: updated },
+    }
+    const message = `Task updated: ${updated.taskId} ${updated.status} ${updated.title}`
+    yield {
+      type: 'assistant_delta',
+      ...eventBase(options.sessionId),
+      text: message,
+    }
+    yield {
+      type: 'result',
+      ...eventBase(options.sessionId),
+      success: true,
+      message,
+    }
+  }
+
   private async *executeFileQuestion(
     options: RuntimeExecuteOptions,
     intent: { path: string; question: string },
@@ -604,6 +695,20 @@ function parseIntent(prompt: string): ParsedIntent {
   if (verb === 'bash' && arg) {
     return { kind: 'tool', toolName: 'Bash', input: { command: arg } }
   }
+  if (verb === 'task' && rest[0] === 'status') {
+    return { kind: 'task_status' }
+  }
+  if (verb === 'task' && rest[0] === 'update' && rest.length >= 3) {
+    const [, selector, status, ...resultParts] = rest
+    if (isSupportedTaskUpdateStatus(status)) {
+      return {
+        kind: 'task_update',
+        selector,
+        status,
+        result: resultParts.length > 0 ? resultParts.join(' ') : undefined,
+      }
+    }
+  }
   if (verb === 'task' && arg) {
     return { kind: 'tool', toolName: 'TaskCreate', input: { title: arg } }
   }
@@ -621,6 +726,16 @@ function parseIntent(prompt: string): ParsedIntent {
       '`grep <pattern>`, `glob <pattern>`, `bash <command>`, `task <title>`. ' +
       `You said: ${trimmed || '(empty prompt)'}`,
   }
+}
+
+function isSupportedTaskUpdateStatus(status: string | undefined): status is 'pending' | 'in_progress' | 'completed' | 'failed' {
+  return status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'failed'
+}
+
+function findTaskBySelector(tasks: NexusTask[], selector: string): NexusTask | undefined {
+  return tasks.find(task => task.taskId === selector) ??
+    tasks.find(task => task.taskId.endsWith(selector)) ??
+    tasks.find(task => task.title === selector)
 }
 
 function extractFileQuestionPath(prompt: string): string | undefined {

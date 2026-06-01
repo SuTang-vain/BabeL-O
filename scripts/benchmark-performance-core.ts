@@ -18,6 +18,7 @@ import {
   estimateContextTokens,
   getContextWindowState,
 } from '../src/runtime/tokenEstimator.js'
+import { runMockAgentLoopBenchmark } from '../src/nexus/agentLoopBenchmark.js'
 
 type BenchmarkResult = {
   name: string
@@ -239,6 +240,7 @@ async function main(): Promise<void> {
     const contextBenchmark = await benchmarkContextAssembly(cwd)
     const autoCompactBenchmark = await benchmarkAutoCompact()
     const tokenEstimatorBenchmark = benchmarkChineseTokenEstimator()
+    const agentLoopBenchmark = await runMockAgentLoopBenchmark()
 
     console.log(
       JSON.stringify(
@@ -250,6 +252,7 @@ async function main(): Promise<void> {
           context: contextBenchmark,
           autoCompact: autoCompactBenchmark,
           tokenEstimator: tokenEstimatorBenchmark,
+          agentLoop: agentLoopBenchmark,
           metrics: (await app.inject({
             method: 'GET',
             url: '/v1/runtime/metrics',

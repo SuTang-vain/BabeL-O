@@ -49,20 +49,29 @@ export function runGitCommand(
   args: string[],
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
-    // Add local user config overrides to git commit to prevent failures when global configs are missing
     const child = spawn('git', args, { cwd })
     let stdout = ''
     let stderr = ''
+    let settled = false
+    const finish = (result: { code: number; stdout: string; stderr: string }) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+
     child.stdout.on('data', (data) => {
       stdout += data.toString()
     })
     child.stderr.on('data', (data) => {
       stderr += data.toString()
     })
-    child.on('close', (code) => {
-      resolve({ code: code ?? 0, stdout: stdout.trim(), stderr: stderr.trim() })
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      finish({ code: error.errno ?? 1, stdout: stdout.trim(), stderr: error.message })
     })
-  });
+    child.on('close', (code) => {
+      finish({ code: code ?? 0, stdout: stdout.trim(), stderr: stderr.trim() })
+    })
+  })
 }
 
 export function parsePorcelainChangedPaths(stdout: string): string[] {

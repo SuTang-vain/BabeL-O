@@ -28,6 +28,8 @@ function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
   })
 }
 
+const runtimeTestConfigPath = join(tmpdir(), `babel-o-runtime-test-config-${process.pid}.json`)
+process.env.BABEL_O_CONFIG_FILE = runtimeTestConfigPath
 ConfigManager.getInstance().save({})
 
 test('execute reads a workspace file and records session events', async () => {
@@ -77,6 +79,54 @@ test('local runtime emits hook events around failed tool execution', async () =>
   assert.ok(events.some(event => event.type === 'hook_started'))
   assert.ok(events.some(event => event.type === 'hook_completed'))
   assert.ok(events.some(event => event.type === 'result'))
+})
+
+test('local runtime supports task status and update commands', async () => {
+  const { storage } = await createDefaultNexusRuntime()
+  const tools = createDefaultToolRegistry()
+  const runtime = new LocalCodingRuntime(tools, allowAllTools(), storage)
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-task-update`)
+  await mkdir(cwd, { recursive: true })
+  try {
+    const createEvents: Array<{ type: string; output?: any }> = []
+    for await (const event of runtime.executeStream({
+      sessionId: 'session-task-update',
+      prompt: 'task Verify task update smoke',
+      cwd,
+      storage,
+    })) {
+      createEvents.push(event as any)
+    }
+    const created = createEvents.find(event => event.type === 'tool_completed')?.output
+    assert.ok(created?.taskId)
+
+    const statusEvents: Array<{ type: string; text?: string }> = []
+    for await (const event of runtime.executeStream({
+      sessionId: 'session-task-update',
+      prompt: 'task status',
+      cwd,
+      storage,
+    })) {
+      statusEvents.push(event as any)
+    }
+    assert.ok(statusEvents.some(event => event.type === 'assistant_delta' && String(event.text).includes('Verify task update smoke')))
+
+    const updateEvents: Array<{ type: string; eventType?: string; payload?: any; message?: string }> = []
+    for await (const event of runtime.executeStream({
+      sessionId: 'session-task-update',
+      prompt: `task update ${created.taskId} completed done`,
+      cwd,
+      storage,
+    })) {
+      updateEvents.push(event as any)
+    }
+    const updated = await storage.getTask(created.taskId)
+    assert.equal(updated?.status, 'completed')
+    assert.ok(updateEvents.some(event => event.type === 'task_session_event' && event.eventType === 'task_updated'))
+    assert.ok(updateEvents.some(event => event.type === 'result' && String(event.message).includes('completed')))
+  } finally {
+    await storage.close?.()
+  }
 })
 
 test('local runtime answers natural-language questions about file contents', async () => {
@@ -228,6 +278,14 @@ test('sqlite storage persists sessions and events across storage instances', asy
     sessionId = body.sessionId
     assert.equal(body.success, true)
 
+    const session = await storageA.getSession(sessionId, { includeEvents: false })
+    assert.ok(session)
+    await storageA.saveSession({
+      ...session,
+      phase: 'executing',
+      updatedAt: new Date().toISOString(),
+    })
+
     const taskResponse = await appA.inject({
       method: 'POST',
       url: `/v1/sessions/${sessionId}/tasks`,
@@ -352,6 +410,341 @@ test('/v1/execute persists resolved cwd and reuses it for correction turns', asy
     assert.equal(sessionAfterSecond?.lastUserInput, '呃让你分析的就是这个项目')
   } finally {
     await app.close()
+  }
+})
+
+test('SDK task mutation API writes audit events and guards revisions', async () => {
+  for (const storageKind of ['memory', 'sqlite'] as const) {
+    const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-task-mutation-${storageKind}`)
+    await mkdir(cwd, { recursive: true })
+    const runtimeBundle = storageKind === 'sqlite'
+      ? { runtime: new LocalCodingRuntime(createDefaultToolRegistry()), storage: new SqliteStorage(join(cwd, 'nexus.sqlite')) }
+      : await createDefaultNexusRuntime()
+    const app = await createNexusApp({ runtime: runtimeBundle.runtime, storage: runtimeBundle.storage, defaultCwd: cwd })
+    try {
+      const sessionId = `session-task-mutation-${storageKind}-${Date.now()}`
+      const timestamp = new Date().toISOString()
+      await runtimeBundle.storage.saveSession({
+        sessionId,
+        cwd,
+        prompt: 'SDK task mutation smoke',
+        phase: 'executing',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+      })
+      const completedSessionId = `${sessionId}-completed`
+      await runtimeBundle.storage.saveSession({
+        sessionId: completedSessionId,
+        cwd,
+        prompt: 'completed session mutation smoke',
+        phase: 'completed',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+      })
+      const cancelledSessionId = `${sessionId}-cancelled`
+      await runtimeBundle.storage.saveSession({
+        sessionId: cancelledSessionId,
+        cwd,
+        prompt: 'cancelled session mutation smoke',
+        phase: 'cancelled',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+      })
+      const completedCreateResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${completedSessionId}/tasks`,
+        payload: { title: 'Should not create after completion' },
+      })
+      assert.equal(completedCreateResponse.statusCode, 409)
+      assert.equal(completedCreateResponse.json().code, 'SESSION_NOT_MUTABLE')
+      const cancelledCreateResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${cancelledSessionId}/tasks`,
+        payload: { title: 'Should not create after cancellation' },
+      })
+      assert.equal(cancelledCreateResponse.statusCode, 409)
+      assert.equal(cancelledCreateResponse.json().code, 'SESSION_NOT_MUTABLE')
+      const missingSessionCreateResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}-missing/tasks`,
+        payload: { title: 'Should not create without session' },
+      })
+      assert.equal(missingSessionCreateResponse.statusCode, 404)
+      assert.equal(missingSessionCreateResponse.json().code, 'SESSION_NOT_FOUND')
+      const createResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'SDK mutation task',
+          description: 'created by SDK smoke',
+          metadata: { parentTaskId: 'parent-1' },
+          actor: 'dashboard',
+          source: 'sdk-test',
+          requestId: `create-${storageKind}`,
+        },
+      })
+      assert.equal(createResponse.statusCode, 200)
+      const created = createResponse.json().task
+      assert.equal(created.description, 'created by SDK smoke')
+      assert.equal(created.metadata.mutationRequestId, `create-${storageKind}`)
+
+      const duplicateCreate = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: { title: 'duplicate title ignored', requestId: `create-${storageKind}` },
+      })
+      assert.equal(duplicateCreate.json().idempotent, true)
+      assert.equal(duplicateCreate.json().task.taskId, created.taskId)
+
+      const staleUpdate = await app.inject({
+        method: 'PATCH',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}`,
+        payload: { status: 'in_progress', expectedUpdatedAt: 'stale-revision' },
+      })
+      assert.equal(staleUpdate.statusCode, 409)
+      assert.equal(staleUpdate.json().code, 'TASK_REVISION_CONFLICT')
+
+      const updateResponse = await app.inject({
+        method: 'PATCH',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}`,
+        payload: {
+          title: 'SDK mutation task updated',
+          status: 'in_progress',
+          metadata: { priority: 'high' },
+          expectedUpdatedAt: created.updatedAt,
+          actor: 'dashboard',
+          source: 'sdk-test',
+          reason: 'claim from dashboard',
+        },
+      })
+      assert.equal(updateResponse.statusCode, 200)
+      assert.equal(updateResponse.json().task.status, 'in_progress')
+      assert.equal(updateResponse.json().task.metadata.priority, 'high')
+
+      const completedSessionTask = {
+        ...created,
+        taskId: `${created.taskId}-completed-session`,
+        sessionId: completedSessionId,
+        status: 'pending' as const,
+        updatedAt: new Date().toISOString(),
+      }
+      await runtimeBundle.storage.saveTask(completedSessionTask)
+      const completedUpdateResponse = await app.inject({
+        method: 'PATCH',
+        url: `/v1/sessions/${completedSessionId}/tasks/${completedSessionTask.taskId}`,
+        payload: { status: 'in_progress' },
+      })
+      assert.equal(completedUpdateResponse.statusCode, 409)
+      assert.equal(completedUpdateResponse.json().code, 'SESSION_NOT_MUTABLE')
+      const completedClaimResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${completedSessionId}/tasks/${completedSessionTask.taskId}/claim`,
+        payload: { ownerAgentId: 'dashboard-worker' },
+      })
+      assert.equal(completedClaimResponse.statusCode, 409)
+      assert.equal(completedClaimResponse.json().code, 'SESSION_NOT_MUTABLE')
+
+      const worktreeTaskResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'Worktree task mutation smoke',
+          metadata: { requiresIsolation: true, worktreePath: join(cwd, '.babel-o', 'worktrees', `sdk-${storageKind}`) },
+          requestId: `worktree-${storageKind}`,
+        },
+      })
+      assert.equal(worktreeTaskResponse.statusCode, 200)
+      const worktreeTask = worktreeTaskResponse.json().task
+      const worktreeClaimResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${worktreeTask.taskId}/claim`,
+        payload: { ownerAgentId: 'dashboard-worker', actor: 'dashboard', source: 'sdk-test' },
+      })
+      assert.equal(worktreeClaimResponse.statusCode, 200)
+      assert.equal(worktreeClaimResponse.json().task.metadata.requiresIsolation, true)
+      assert.equal(worktreeClaimResponse.json().task.metadata.worktreePath, join(cwd, '.babel-o', 'worktrees', `sdk-${storageKind}`))
+      assert.equal(worktreeClaimResponse.json().task.ownerAgentId, 'dashboard-worker')
+
+      const completeResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/complete`,
+        payload: { result: 'done', actor: 'dashboard', source: 'sdk-test' },
+      })
+      assert.equal(completeResponse.statusCode, 200)
+      assert.equal(completeResponse.json().task.status, 'completed')
+      assert.equal(completeResponse.json().task.result, 'done')
+
+      const retryResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/retry`,
+        payload: { reason: 'retry from SDK' },
+      })
+      assert.equal(retryResponse.statusCode, 200)
+      assert.equal(retryResponse.json().task.status, 'pending')
+      assert.equal(retryResponse.json().task.retryCount, 1)
+
+      const invalidRejectResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/reject`,
+        payload: { reviewReason: 'needs changes' },
+      })
+      assert.equal(invalidRejectResponse.statusCode, 409)
+      assert.equal(invalidRejectResponse.json().code, 'TASK_REVIEW_NOT_PENDING')
+
+      const approveReviewResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'Approve pending review task',
+          requestId: `approve-review-${storageKind}`,
+        },
+      })
+      assert.equal(approveReviewResponse.statusCode, 200)
+      const approveReviewTask = approveReviewResponse.json().task
+      await runtimeBundle.storage.saveTask({
+        ...approveReviewTask,
+        review: { status: 'pending', reason: 'Planner HITL approval required' },
+        updatedAt: new Date().toISOString(),
+      })
+      const approveResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${approveReviewTask.taskId}/approve`,
+        payload: { reviewReason: 'approved by reviewer', actor: 'dashboard', source: 'sdk-test' },
+      })
+      assert.equal(approveResponse.statusCode, 200)
+      assert.equal(approveResponse.json().task.review.status, 'approved')
+
+      const rejectReviewResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'Reject pending review task',
+          requestId: `reject-review-${storageKind}`,
+        },
+      })
+      assert.equal(rejectReviewResponse.statusCode, 200)
+      const rejectReviewTask = rejectReviewResponse.json().task
+      await runtimeBundle.storage.saveTask({
+        ...rejectReviewTask,
+        review: { status: 'pending', reason: 'Planner HITL rejection required' },
+        updatedAt: new Date().toISOString(),
+      })
+      const rejectResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${rejectReviewTask.taskId}/reject`,
+        payload: { reviewReason: 'needs changes', actor: 'dashboard', source: 'sdk-test' },
+      })
+      assert.equal(rejectResponse.statusCode, 200)
+      assert.equal(rejectResponse.json().task.review.status, 'rejected')
+
+      const failedDependencyResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'Fail propagation dependent task',
+          requestId: `failed-dependent-${storageKind}`,
+        },
+      })
+      assert.equal(failedDependencyResponse.statusCode, 200)
+      const failedDependencyTask = failedDependencyResponse.json().task
+      await runtimeBundle.storage.saveTask({
+        ...failedDependencyTask,
+        status: 'blocked',
+        dependsOn: [created.taskId],
+        updatedAt: new Date().toISOString(),
+      })
+      const failResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/fail`,
+        payload: { result: 'dependency exploded', reason: 'fail from SDK' },
+      })
+      assert.equal(failResponse.statusCode, 200)
+      assert.equal(failResponse.json().task.status, 'failed')
+      assert.deepEqual(failResponse.json().task.metadata.blockedTasksFailed, [failedDependencyTask.taskId])
+      const propagatedFailure = await runtimeBundle.storage.getTask(failedDependencyTask.taskId)
+      assert.equal(propagatedFailure?.status, 'failed')
+      assert.equal((propagatedFailure?.metadata?.failedDependencies as any[])?.[0]?.taskId, created.taskId)
+
+      const retryAfterFailResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/retry`,
+        payload: { reason: 'retry after dependency fix' },
+      })
+      assert.equal(retryAfterFailResponse.statusCode, 200)
+      assert.equal(retryAfterFailResponse.json().task.status, 'pending')
+      assert.deepEqual(retryAfterFailResponse.json().task.metadata.blockedTasksRestored, [failedDependencyTask.taskId])
+      const restoredDependent = await runtimeBundle.storage.getTask(failedDependencyTask.taskId)
+      assert.equal(restoredDependent?.status, 'blocked')
+      assert.equal(restoredDependent?.metadata?.failedDependencies, undefined)
+
+      const childSessionId = `${sessionId}-child-${storageKind}`
+      const blockedTaskResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks`,
+        payload: {
+          title: 'Blocked parent task',
+          metadata: { parentTaskId: created.taskId },
+          requestId: `blocked-${storageKind}`,
+        },
+      })
+      assert.equal(blockedTaskResponse.statusCode, 200)
+      const blockedTask = blockedTaskResponse.json().task
+      await runtimeBundle.storage.saveTask({
+        ...blockedTask,
+        status: 'blocked',
+        dependsOn: [created.taskId],
+        updatedAt: new Date().toISOString(),
+      })
+      await runtimeBundle.storage.saveSession({
+        sessionId: childSessionId,
+        cwd,
+        prompt: 'child task session',
+        phase: 'executing',
+        parentSessionId: sessionId,
+        currentTaskId: created.taskId,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        events: [],
+        metadata: {
+          agentType: 'subagent',
+          status: 'running',
+          parentTaskId: created.taskId,
+          transcriptPath: `nexus://sessions/${childSessionId}/events`,
+        },
+      })
+
+      const cancelResponse = await app.inject({
+        method: 'POST',
+        url: `/v1/sessions/${sessionId}/tasks/${created.taskId}/cancel`,
+        payload: { reason: 'cancel from SDK' },
+      })
+      assert.equal(cancelResponse.statusCode, 200)
+      assert.equal(cancelResponse.json().task.status, 'cancelled')
+      assert.deepEqual(cancelResponse.json().task.metadata.childSessionsCancelled, [childSessionId])
+      const cancelledChild = await runtimeBundle.storage.getSession(childSessionId, { includeEvents: false })
+      assert.equal(cancelledChild?.phase, 'cancelled')
+      assert.equal(cancelledChild?.metadata?.cancelledByTaskId, created.taskId)
+      const failedBlockedTask = await runtimeBundle.storage.getTask(blockedTask.taskId)
+      assert.equal(failedBlockedTask?.status, 'failed')
+      assert.equal(failedBlockedTask?.metadata?.failedDependencyTaskId, created.taskId)
+
+      const events = (await runtimeBundle.storage.listEvents(sessionId, { limit: 80 })).events
+      const mutationEvents = events.filter(event => event.type === 'task_session_event') as any[]
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_created' && event.payload.actor === 'dashboard'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_updated' && event.payload.previous.status === 'pending' && event.payload.next.status === 'in_progress'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_completed'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_retried'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_approved' && event.payload.previous.review.status === 'pending'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_rejected' && event.payload.previous.review.status === 'pending'))
+      assert.ok(mutationEvents.some(event => event.eventType === 'task_cancelled' && event.payload.reason === 'cancel from SDK'))
+      assert.ok(mutationEvents.every(event => event.payload.source))
+    } finally {
+      await app.close()
+      await runtimeBundle.storage.close?.()
+    }
   }
 })
 

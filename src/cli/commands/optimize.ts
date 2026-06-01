@@ -266,11 +266,12 @@ async function runOptimizerProviderSmokeLive(options: OptimizeCommandOptions): P
   }
 }
 
-function formatAgentLoopSmokeResult(result: any): string {
+export function formatAgentLoopSmokeResult(result: any): string {
   const provider = result.provider ?? {}
   const checks = result.checks ?? {}
   const fallbackPolicy = result.fallbackPolicy ?? {}
   const usage = Array.isArray(result.usage) ? result.usage : []
+  const roleDiagnostics = Array.isArray(result.roleDiagnostics) ? result.roleDiagnostics : []
   return [
     chalk.cyan('\n--- AgentLoop Provider Live Smoke ---'),
     `Provider:        ${provider.providerId ?? 'unknown'} model=${provider.modelId ?? 'unknown'}`,
@@ -283,10 +284,30 @@ function formatAgentLoopSmokeResult(result: any): string {
     `Task/Critic:     taskCompleted=${yesNo(result.taskCompleted)} criticCompleted=${yesNo(result.criticCompleted)}`,
     `Workspace:       created=${yesNo(result.workspaceCreated)} cleaned=${yesNo(result.workspaceCleaned)}`,
     usage.length > 0 ? `Usage roles:     ${usage.map((item: any) => `${item.role}:events=${item.eventCount},tools=${item.toolCallCount}`).join(' | ')}` : undefined,
+    roleDiagnostics.length > 0 ? `Role diagnostics:${roleDiagnostics.map(formatRoleDiagnostic).join(' |')}` : undefined,
     result.error ? `Error:           ${result.error.message}` : undefined,
+    result.error?.category ? `Failure type:    ${result.error.category}` : undefined,
     `Fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `Next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
   ].filter(Boolean).join('\n')
+}
+
+function formatRoleDiagnostic(item: any): string {
+  const details = [
+    `model=${item.model}`,
+    `tools=${item.allowedTools?.join(',') || 'none'}`,
+    `repair=${item.repairAttempts ?? 0}`,
+    item.resultSuccess !== undefined ? `success=${yesNo(item.resultSuccess)}` : undefined,
+    item.errorCode ? `error=${item.errorCode}` : undefined,
+    item.lastToolName ? `lastTool=${item.lastToolName}:${yesNo(item.lastToolSuccess)}` : undefined,
+    item.structuredOutputFailureType ? `structured=${item.structuredOutputFailureType}` : undefined,
+    item.errorMessagePreview ? `msg=${JSON.stringify(item.errorMessagePreview)}` : undefined,
+    item.assistantTextPreview ? `assistant=${JSON.stringify(item.assistantTextPreview)}` : undefined,
+    item.thinkingTextPreview ? `thinking=${JSON.stringify(item.thinkingTextPreview)}` : undefined,
+    item.lastToolOutputPreview ? `toolOut=${JSON.stringify(item.lastToolOutputPreview)}` : undefined,
+    item.structuredOutputPreview ? `structuredPreview=${JSON.stringify(item.structuredOutputPreview)}` : undefined,
+  ].filter(Boolean)
+  return ` ${item.role}{${details.join(',')}}`
 }
 
 function yesNo(value: unknown): string {

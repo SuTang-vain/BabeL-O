@@ -55,6 +55,19 @@ def wait_for(fd: int, needle: str, timeout: float, transcript: list[str]) -> boo
     return needle in visible_text(combined)
 
 
+def wait_for_count(fd: int, needle: str, count: int, timeout: float, transcript: list[str]) -> bool:
+    deadline = time.time() + timeout
+    combined = ''.join(transcript)
+    while time.time() < deadline:
+        if visible_text(combined).count(needle) >= count:
+            return True
+        chunk = read_available(fd, min(0.2, max(0.0, deadline - time.time())))
+        if chunk:
+            transcript.append(chunk)
+            combined += chunk
+    return visible_text(combined).count(needle) >= count
+
+
 def send(fd: int, text: str) -> None:
     os.write(fd, text.encode('utf-8'))
 
@@ -122,7 +135,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
     with open(config_file, 'w', encoding='utf-8') as fh:
         fh.write('{"defaultModel":"local/coding-runtime"}\n')
 
-    workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session', 'coding-question-files') else repo
+    workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session', 'coding-question-files', 'task-update-status') else repo
 
     env = os.environ.copy()
     env.update({
@@ -185,9 +198,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             if not wait_for(master_fd, 'approval', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] permission panel did not render\n'
             send(master_fd, '1')
-            if not wait_for(master_fd, 'Permission approved', timeout, transcript):
-                return 1, ''.join(transcript) + '\n[pty-smoke] numeric approve once did not approve\n'
-            if not wait_for(master_fd, 'Bash node -v done', timeout, transcript):
+            if not wait_for(master_fd, 'Bash completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] approved command did not complete\n'
             send(master_fd, '/exit\r')
         elif sequence == 'permission-approve-session':
@@ -195,10 +206,10 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             if not wait_for(master_fd, 'approval', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] permission panel did not render\n'
             send(master_fd, '2')
-            if not wait_for(master_fd, 'Bash node -v done', timeout, transcript):
+            if not wait_for(master_fd, 'Bash completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] session approval command did not complete\n'
             send(master_fd, 'bash node -p 1\r')
-            if not wait_for(master_fd, 'Bash node -p 1 done', timeout, transcript):
+            if not wait_for_count(master_fd, 'Bash completed.', 2, timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] session approval cache did not complete second command\n'
             if visible_text(''.join(transcript)).count('Bash is requesting approval') != 1:
                 return 1, ''.join(transcript) + '\n[pty-smoke] session approval did not cache permission\n'
@@ -211,7 +222,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             if not wait_for(master_fd, 'Enter allow rule prefix', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] editable rule prompt did not render\n'
             send(master_fd, 'node:*\r')
-            if not wait_for(master_fd, 'Bash node -v done', timeout, transcript):
+            if not wait_for(master_fd, 'Bash completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] editable rule approval did not complete command\n'
             send(master_fd, '/exit\r')
         elif sequence == 'permission-reject-instruction':
@@ -227,11 +238,24 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             send(master_fd, '/exit\r')
         elif sequence == 'tool-rendering-read':
             send(master_fd, 'read package.json\r')
-            if not wait_for(master_fd, 'Read package.json done', timeout, transcript):
-                return 1, ''.join(transcript) + '\n[pty-smoke] read tool did not render compact completion\n'
+            if not wait_for(master_fd, 'Read completed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] read tool did not complete\n'
             visible = visible_text(''.join(transcript))
             if 'maxBytes' in visible or 'running' in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] compact tool row leaked raw parameters/state\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'bash-output-preview':
+            send(master_fd, 'bash for i in 0 1 2 3 4; do echo line-$i; done\r')
+            if not wait_for(master_fd, 'approval', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] bash preview permission panel did not render\n'
+            send(master_fd, '1')
+            if not wait_for(master_fd, 'Bash completed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] bash preview command did not complete\n'
+            visible = visible_text(''.join(transcript))
+            if 'Bash(for i in 0 1 2 3 4; do echo line-$i; done)' not in visible or '⎿  line-0' not in visible or '⎿  line-2' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] bash preview did not render first output lines\n'
+            if '⎿  line-3' in visible or '⎿  line-4' in visible or '… +2 lines (ctrl+o to expand)' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] bash preview did not fold extra output lines\n'
             send(master_fd, '/exit\r')
         elif sequence == 'input-placeholder':
             send(master_fd, '\r')
@@ -239,12 +263,12 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             send(master_fd, '什么我可以帮你的吗？\r')
             if not wait_for(master_fd, '什么我可以帮你的吗？', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] typed prompt did not render\n'
-            if not wait_for(master_fd, '✓ done', timeout, transcript):
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] typed prompt did not complete\n'
             visible = visible_text(''.join(transcript))
             if '什么我可以帮你的吗？edit, / for commands' in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] placeholder tail remained after typing\n'
-            if visible.count('✓ done') != 1:
+            if visible.count('BabeL-O local runtime is active.') != 1:
                 return 1, ''.join(transcript) + '\n[pty-smoke] blank enter submitted unexpectedly\n'
             send(master_fd, '/exit\r')
         elif sequence == 'multiline-paste-placeholder':
@@ -255,7 +279,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             if 'Multiline Paste Buffer' in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] old paste buffer panel rendered unexpectedly\n'
             send(master_fd, ' analyze\r')
-            if not wait_for(master_fd, '✓ done', timeout, transcript):
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] pasted placeholder prompt did not submit\n'
             visible = visible_text(''.join(transcript))
             if 'beta' not in visible or '[Pasted text #1 +3 lines] analyze' not in visible:
@@ -263,24 +287,39 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             send(master_fd, '/exit\r')
         elif sequence == 'coding-question-files':
             send(master_fd, 'What does question.txt say?\r')
-            if not wait_for(master_fd, 'Read question.txt done', timeout, transcript):
-                return 1, ''.join(transcript) + '\n[pty-smoke] file question did not read fixture file\n'
             if not wait_for(master_fd, 'violet-river', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] file question answer did not include fixture token\n'
             visible = visible_text(''.join(transcript))
             if 'What does question.txt say?' not in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] file question prompt did not render\n'
             send(master_fd, '/exit\r')
+        elif sequence == 'task-update-status':
+            send(master_fd, 'task "Verify task update smoke"\r')
+            if not wait_for(master_fd, 'TaskCreate completed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task create did not complete\n'
+            send(master_fd, 'task status\r')
+            if not wait_for(master_fd, 'Verify task update smoke', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task status did not include created task\n'
+            if not wait_for(master_fd, 'pending', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task status did not include pending state\n'
+            send(master_fd, 'task update "Verify task update smoke" completed done\r')
+            if not wait_for(master_fd, 'task updated', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task update event did not render\n'
+            if not wait_for(master_fd, 'Task updated:', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task update assistant message did not render\n'
+            if not wait_for(master_fd, 'completed Verify task update smoke', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] task update did not render completed state\n'
+            send(master_fd, '/exit\r')
         elif sequence == 'programming-workflow':
             send(master_fd, 'read smoke.txt\r')
-            if not wait_for(master_fd, 'Read smoke.txt done', timeout, transcript):
+            if not wait_for(master_fd, 'Read completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] read did not complete in programming workflow\n'
 
             send(master_fd, 'edit smoke.txt beta gamma\r')
             if not wait_for(master_fd, 'approval', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] edit permission panel did not render\n'
             send(master_fd, '1')
-            if not wait_for(master_fd, 'Edit smoke.txt done', timeout, transcript):
+            if not wait_for(master_fd, 'Edit completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] edit did not complete\n'
             send(master_fd, '\x0f')
             if not wait_for(master_fd, 'Diff for Edit in smoke.txt', timeout, transcript):
@@ -289,22 +328,18 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 return 1, ''.join(transcript) + '\n[pty-smoke] edit diff added line did not render\n'
 
             send(master_fd, 'grep gamma\r')
-            if not wait_for(master_fd, 'Grep . done', timeout, transcript):
-                return 1, ''.join(transcript) + '\n[pty-smoke] grep did not complete\n'
             if not wait_for(master_fd, 'smoke.txt:1:alpha gamma', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] grep output did not include edited file\n'
             send(master_fd, 'glob **/*.ts\r')
-            if not wait_for(master_fd, 'Glob **/*.ts done', timeout, transcript):
-                return 1, ''.join(transcript) + '\n[pty-smoke] glob did not complete\n'
             if not wait_for(master_fd, 'src/smoke.ts', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] glob output did not include fixture file\n'
             send(master_fd, 'task Verify smoke workflow\r')
-            if not wait_for(master_fd, 'TaskCreate done', timeout, transcript):
+            if not wait_for(master_fd, 'TaskCreate completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] task create did not complete\n'
             send(master_fd, '/exit\r')
         elif sequence == 'resume-session':
             send(master_fd, 'read smoke.txt\r')
-            if not wait_for(master_fd, 'Read smoke.txt done', timeout, transcript):
+            if not wait_for(master_fd, 'Read completed.', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] initial read did not complete before resume\n'
             send(master_fd, '/exit\r')
             wait_for(master_fd, 'Exiting chat', 0.5, transcript)
@@ -328,7 +363,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             resumed: list[str] = []
             if not wait_for(master_fd, f'resume {resumed_session_id}', timeout, resumed):
                 return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resume banner did not render\n'
-            if not wait_for(master_fd, 'Read smoke.txt done', timeout, resumed):
+            if not wait_for(master_fd, 'Read(smoke.txt)', timeout, resumed):
                 return 1, first_run + ''.join(resumed) + '\n[pty-smoke] resumed history did not render prior read\n'
             send(master_fd, '/exit\r')
             wait_for(master_fd, 'Exiting chat', 0.5, resumed)

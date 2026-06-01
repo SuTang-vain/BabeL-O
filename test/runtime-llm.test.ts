@@ -5,18 +5,21 @@ import { dirname, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { ConfigManager } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
+import { deriveFallbackUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
-import { EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
-import { parseStructuredAgentOutput } from '../src/nexus/runtimeAgentStep.js'
+import { CRITIC_ROLE, EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
+import { parseStructuredAgentOutput, zodRoleOutputSchemaToJsonSchema } from '../src/nexus/runtimeAgentStep.js'
 
 const CONFIG_ENV_KEYS = [
   'BABEL_O_MODEL',
   'BABEL_O_PROVIDER',
   'BABEL_O_API_KEY',
   'BABEL_O_BASE_URL',
+  'BABEL_O_CONFIG_FILE',
+  'BABEL_O_TEST_CONFIG_WRITE_GUARD',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -111,9 +114,19 @@ describe('ConfigManager', () => {
     }
   })
 
+  test('refuses to write default user config from tests without isolation', () => {
+    process.env.BABEL_O_TEST_CONFIG_WRITE_GUARD = '1'
+    const configManager = new ConfigManager()
+
+    assert.throws(
+      () => configManager.save({}),
+      (error: any) => error?.code === 'BABEL_O_TEST_CONFIG_NOT_ISOLATED',
+    )
+  })
+
   test('saves and loads configuration with 0o600 permissions', () => {
     const configManager = new ConfigManager(tempConfigPath)
-    
+
     // Check loading non-existent config returns empty object
     const initial = configManager.load()
     assert.deepEqual(initial, {})
@@ -445,6 +458,30 @@ describe('ConfigManager', () => {
   })
 })
 
+describe('User intent fallback guidance', () => {
+  test('classifies identity and memory prompts as respond-only without tools', () => {
+    const identity = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '你是谁？',
+      cwd: tmpdir(),
+    })
+    assert.equal(identity.intent, 'greeting')
+    assert.equal(identity.actionHint, 'respond_only')
+    assert.equal(identity.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(identity), true)
+
+    const memory = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '还记得我刚刚问什么吗？',
+      cwd: tmpdir(),
+    })
+    assert.equal(memory.intent, 'status')
+    assert.equal(memory.actionHint, 'respond_only')
+    assert.equal(memory.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(memory), true)
+  })
+})
+
 describe('LLMCodingRuntime', () => {
   let tempConfigPath: string
   let configManager: ConfigManager
@@ -559,6 +596,32 @@ describe('LLMCodingRuntime', () => {
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
   })
 
+  test('passes maxOutputTokens to provider requests', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"short"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-max-output-tokens',
+        prompt: 'answer briefly',
+        cwd: tmpdir(),
+        maxOutputTokens: 256,
+      })
+    )
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.max_tokens, 256)
+  })
+
   test('persists user_intake_guidance and hides tools for respond-only intake', async () => {
     globalThis.fetch = async (url, init) => {
       const body = parseRequestBody(init)
@@ -613,6 +676,94 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
     assert.match(JSON.stringify(body.system), /User Intake Guidance/)
+  })
+
+  test('falls back identity prompts to respond-only intake when intake model fails', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        throw new Error('mock intake unavailable')
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"我是 BabeL-O，可以帮你处理编码任务。"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-intake-fallback-identity',
+        prompt: '你是谁？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.intent, 'greeting')
+    assert.equal(intake.actionHint, 'respond_only')
+    assert.equal(intake.requiresTools, false)
+    assert.equal(intake.source, 'fallback')
+
+    assert.equal(fetchCalls.length, 1)
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.tools, undefined)
+    assert.match(JSON.stringify(body.system), /Requires tools: no/)
+  })
+
+  test('falls back context-memory prompts to respond-only status when intake model fails', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        throw new Error('mock intake unavailable')
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"我会根据当前可见上下文回答。"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-intake-fallback-context-memory',
+        prompt: '还记得我刚刚问什么吗？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.intent, 'status')
+    assert.equal(intake.actionHint, 'respond_only')
+    assert.equal(intake.requiresTools, false)
+    assert.equal(intake.source, 'fallback')
+
+    assert.equal(fetchCalls.length, 1)
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.tools, undefined)
+    assert.match(JSON.stringify(body.system), /Requires tools: no/)
   })
 
   test('loads latest session tail before building intake guidance', async () => {
@@ -1877,6 +2028,19 @@ describe('mapEventsToMessages', () => {
 })
 
 describe('Agent role structured output', () => {
+  test('role output JSON schemas expose required fields', () => {
+    const plannerSchema = zodRoleOutputSchemaToJsonSchema(PLANNER_ROLE.outputSchema) as any
+    const executorSchema = zodRoleOutputSchemaToJsonSchema(EXECUTOR_ROLE.outputSchema) as any
+    const criticSchema = zodRoleOutputSchemaToJsonSchema(CRITIC_ROLE.outputSchema) as any
+
+    assert.deepEqual(plannerSchema.required, ['summary', 'tasks'])
+    assert.deepEqual(executorSchema.required, ['taskId', 'success', 'result'])
+    assert.deepEqual(criticSchema.required, ['approved'])
+    assert.ok(plannerSchema.properties?.tasks)
+    assert.ok(executorSchema.properties?.result)
+    assert.ok(criticSchema.properties?.approved)
+  })
+
   test('PlannerOutputSchema normalizes provider task variants', () => {
     const parsed = parseStructuredAgentOutput(
       undefined,

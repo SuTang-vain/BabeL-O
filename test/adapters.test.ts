@@ -17,6 +17,17 @@ function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
   })
 }
 
+function createHangingMockStream(chunks: string[]): ReadableStream<Uint8Array> {
+  const encoder = new TextEncoder()
+  return new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk))
+      }
+    },
+  })
+}
+
 async function collectStream<T>(iterable: AsyncIterable<T>): Promise<T[]> {
   const result: T[] = []
   for await (const item of iterable) {
@@ -176,6 +187,34 @@ describe('Model Adapters & Factory', () => {
         { type: 'tool_use_delta', id: 'tool_123', inputDelta: '{"path": "R' },
         { type: 'tool_use_delta', id: 'tool_123', inputDelta: 'EADME.md"}' },
         { type: 'tool_use_end', id: 'tool_123', input: { path: 'README.md' } },
+      ])
+    })
+
+    test('stops Anthropic-compatible streams on provider message_stop', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createHangingMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"approved\\":true}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+        'event: message_delta\n',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n\n',
+        'event: message_stop\n',
+        'data: {"type":"message_stop"}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'minimax/MiniMax-M3',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'text', text: '{"approved":true}' },
+        { type: 'finish', reason: 'end_turn' },
       ])
     })
 

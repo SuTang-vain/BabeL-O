@@ -37,6 +37,8 @@ const inputPrompt = `${chalk.dim('>')} `
 export const chatInputPlaceholder = 'Ask BabeL-O · / commands · Ctrl+E editor'
 const toolPrefix = chalk.blue('●')
 const thoughtPrefix = chalk.magenta('▸')
+const compactBashOutputLineLimit = 3
+const defaultBashTimeoutMs = 60_000
 
 export function getTuiMode(): 'compact' | 'expanded' {
   return tuiMode
@@ -491,11 +493,9 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'permission_request':
       break
     case 'permission_response':
-      console.log(
-        event.approved
-          ? chalk.green('✓ Permission approved')
-          : chalk.red(`✗ Permission denied${event.reason ? `: ${event.reason}` : ''}`),
-      )
+      if (!event.approved) {
+        console.log(chalk.red(`✗ Permission denied${event.reason ? `: ${event.reason}` : ''}`))
+      }
       break
     case 'error':
       console.log(chalk.red(`${event.code}: ${event.message}`))
@@ -527,7 +527,9 @@ function renderLiveEvent(event: NexusEvent): void {
       )
       break
     case 'result':
-      console.log(event.success ? chalk.green('✓ done') : chalk.red('✗ failed'))
+      if (!event.success) {
+        console.log(chalk.red('✗ failed'))
+      }
       console.log('')
       break
     case 'task_session_event':
@@ -588,6 +590,8 @@ interface ToolCallState {
   originalBytes?: number
   risk?: string
   denialMessage?: string
+  permissionRequest?: Extract<NexusEvent, { type: 'permission_request' }>
+  permissionResponse?: Extract<NexusEvent, { type: 'permission_response' }>
   completed: boolean
 }
 
@@ -668,6 +672,16 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         state.risk = ev.risk
         state.denialMessage = ev.message
       }
+    } else if (ev.type === 'permission_request') {
+      const state = toolsMap.get(ev.toolUseId)
+      if (state) {
+        state.permissionRequest = ev
+      }
+    } else if (ev.type === 'permission_response') {
+      const state = toolsMap.get(ev.toolUseId)
+      if (state) {
+        state.permissionResponse = ev
+      }
     }
   }
 
@@ -706,38 +720,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         if (mode === 'compact') {
           outputText += formatToolHistoryLine(state, formattedInput) + '\n'
         } else {
-          let header = chalk.cyan(`● ${state.name}`)
-          if (state.completed) header = formatToolHeader(state)
-          outputText += `${header}\n`
-          outputText += `  Input: ${JSON.stringify(state.input, null, 2)}\n`
-
-          if (state.completed) {
-            if (state.denied) {
-              outputText += `  Denied: ${state.risk} risk\n`
-              if (state.denialMessage) {
-                outputText += `  Message: ${state.denialMessage}\n`
-              }
-            } else {
-              outputText += `  Success: ${state.success}\n`
-              if (state.truncated) {
-                outputText += `  Output truncated: ${state.originalBytes ?? 'unknown'} original bytes\n`
-              }
-              if (state.success && (state.name === 'Edit' || state.name === 'Write')) {
-                const diffText = renderDiff(state.name, state.input)
-                if (diffText) {
-                  outputText += diffText
-                }
-              }
-              if (state.output !== undefined) {
-                const outputStr = String(state.output)
-                if (containsMarkdown(outputStr)) {
-                  outputText += `  Output:\n${formatToolOutputMarkdown(outputStr)}\n`
-                } else {
-                  outputText += `  Output:\n${formatOutput(state.output)}\n`
-                }
-              }
-            }
-          }
+          outputText += formatExpandedToolDetails(state) + '\n'
         }
         break
       }
@@ -745,25 +728,13 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       case 'permission_request': {
         if (mode === 'compact') {
           outputText += chalk.bold.yellow(`? Permission requested for ${ev.name} (${ev.risk} risk)\n`)
-        } else {
-          outputText += chalk.bold.yellow(`? Permission requested for ${ev.name} (${ev.risk} risk)\n`)
-          outputText += chalk.dim(`Input: ${JSON.stringify(ev.input, null, 2)}\n`)
-          if (ev.message) {
-            outputText += `${ev.message}\n`
-          }
         }
         break
       }
 
       case 'permission_response': {
-        if (mode === 'compact') {
-          outputText += ev.approved
-            ? chalk.green(`✓ Permission approved\n`)
-            : chalk.red(`✗ Permission denied\n`)
-        } else {
-          outputText += ev.approved
-            ? chalk.green(`✓ Permission approved\n`)
-            : chalk.red(`✗ Permission denied${ev.reason ? `: ${ev.reason}` : ''}\n`)
+        if (mode === 'compact' && !ev.approved) {
+          outputText += chalk.red(`✗ Permission denied\n`)
         }
         break
       }
@@ -807,7 +778,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       }
 
       case 'result':
-        outputText += ev.success ? chalk.green('✓ done\n') : chalk.red('✗ failed\n')
+        if (!ev.success) outputText += chalk.red('✗ failed\n')
         break
 
       case 'task_session_event':
@@ -815,15 +786,8 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         break
 
       case 'usage':
-        if (mode === 'expanded') {
-          outputText += chalk.dim(`usage input=${ev.inputTokens} output=${ev.outputTokens}\n`)
-        }
         break
     }
-  }
-
-  if (mode === 'compact' && hasExpandableToolDetails(toolsMap)) {
-    outputText += chalk.dim('ctrl+o to expand tool details\n')
   }
 
   outputText += formatTaskStatusPanel(events)
@@ -1093,10 +1057,6 @@ function upsertTaskBoardItem(
   Object.assign(existing, next)
 }
 
-function hasExpandableToolDetails(toolsMap: Map<string, ToolCallState>): boolean {
-  return [...toolsMap.values()].some(state => state.completed && !state.denied)
-}
-
 function findLatestIncompleteTool(toolsMap: Map<string, ToolCallState>, name: string): ToolCallState | undefined {
   return [...toolsMap.values()].findLast(state => state.name === name && !state.completed)
 }
@@ -1129,10 +1089,59 @@ function formatToolHistoryLine(state: ToolCallState, formattedInput: string): st
   if (state.denied) {
     return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(state.risk ? `${state.risk} risk` : '')}`
   }
-  const marker = state.success ? chalk.green('✓') : chalk.red('✗')
-  const status = state.success ? chalk.green('done') : chalk.red('failed')
-  const summary = formatToolOutputSummary(state.name, state.output, state.truncated)
-  return `${toolPrefix} ${marker} ${chalk.bold(label)} ${status}${summary ? ` ${chalk.dim(summary)}` : ''}`
+  const status = state.success ? '' : ` ${chalk.red('failed')}`
+  const truncated = state.truncated ? ` ${chalk.yellow('truncated')}` : ''
+  return `${toolPrefix} ${chalk.bold(label)}${status}${truncated}${formatCompactToolOutputPreview(state.name, state.output, state.input)}`
+}
+
+function formatExpandedToolDetails(state: ToolCallState): string {
+  const label = formatToolCallLabel(state.name, state.input)
+  const header = state.completed ? formatToolHeader(state) : chalk.cyan(`● ${label}`)
+  const lines = [header]
+  lines.push(`${chalk.dim('  Input')}:`)
+  lines.push(indentBlock(formatOutput(state.input), '    '))
+
+  if (state.permissionRequest || state.permissionResponse) {
+    lines.push(formatExpandedPermissionDetails(state))
+  }
+
+  if (!state.completed) return lines.join('\n')
+
+  if (state.denied) {
+    lines.push(`${chalk.red('  Denied')}: ${state.risk ?? state.permissionRequest?.risk ?? 'unknown'} risk`)
+    if (state.denialMessage) lines.push(`${chalk.dim('  Message')}: ${state.denialMessage}`)
+    return lines.join('\n')
+  }
+
+  lines.push(`${chalk.dim('  Status')}: ${state.success ? chalk.green('success') : chalk.red('failed')}`)
+  if (state.truncated) {
+    lines.push(`${chalk.yellow('  Output truncated')}: ${state.originalBytes ?? 'unknown'} original bytes`)
+  }
+  if (state.success && (state.name === 'Edit' || state.name === 'Write')) {
+    const diffText = renderDiff(state.name, state.input)
+    if (diffText) lines.push(diffText.trimEnd())
+  }
+  if (state.output !== undefined) {
+    lines.push(`${chalk.dim('  Output')}:`)
+    lines.push(indentBlock(formatOutput(state.output), '    '))
+  }
+  return lines.join('\n')
+}
+
+function formatExpandedPermissionDetails(state: ToolCallState): string {
+  const request = state.permissionRequest
+  const response = state.permissionResponse
+  const risk = request?.risk ? ` (${request.risk} risk)` : ''
+  const status = response
+    ? response.approved ? chalk.green('approved') : chalk.red('denied')
+    : chalk.yellow('requested')
+  const reason = response?.reason ? `: ${response.reason}` : ''
+  return `${chalk.dim('  Permission')}: ${status}${risk}${reason}`
+}
+
+function indentBlock(text: string, prefix: string): string {
+  if (!text) return `${prefix}(empty)`
+  return text.split('\n').map(line => `${prefix}${line}`).join('\n')
 }
 
 function formatToolLiveLine(options: {
@@ -1153,13 +1162,53 @@ function formatToolLiveLine(options: {
   if (options.status === 'denied') {
     return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(options.risk ? `${options.risk} risk` : '')} ${options.denialMessage ?? ''}`.trimEnd()
   }
-  const marker = options.status === 'completed' ? chalk.green('✓') : chalk.red('✗')
-  const status = options.status === 'completed' ? chalk.green('done') : chalk.red('failed')
-  const truncated = options.truncated ? chalk.yellow(` truncated ${options.originalBytes ?? 'unknown'}b`) : ''
-  const summary = options.status === 'completed' || options.status === 'failed'
-    ? formatToolOutputSummary(options.name, options.output, options.truncated)
-    : ''
-  return `${toolPrefix} ${marker} ${chalk.bold(label)} ${status}${truncated}${summary ? ` ${chalk.dim(summary)}` : ''}`
+  const status = options.status === 'completed' ? '' : ` ${chalk.red('failed')}`
+  const truncated = options.truncated ? ` ${chalk.yellow(`truncated ${options.originalBytes ?? 'unknown'}b`)}` : ''
+  return `${toolPrefix} ${chalk.bold(label)}${status}${truncated}${formatCompactToolOutputPreview(options.name, options.output, options.input)}`
+}
+
+function formatCompactToolOutputPreview(name: string, output: unknown, input?: unknown): string {
+  if (name !== 'Bash' || output === undefined) return ''
+  const summary = getBashOutputSummary(output)
+  if (!summary.text) return ''
+
+  const lines = summary.text.split('\n')
+  const previewLines = lines.slice(0, compactBashOutputLineLimit)
+  const hiddenLineCount = Math.max(0, lines.length - previewLines.length)
+  const renderedLines = previewLines.map(line => `${chalk.dim('  ⎿')}  ${line}`)
+  const meta: string[] = []
+  if (hiddenLineCount > 0) meta.push(`+${hiddenLineCount} lines`)
+  if (summary.exitCode !== undefined && summary.exitCode !== 0) meta.push(`exit ${summary.exitCode}`)
+  if (meta.length > 0) renderedLines.push(`${chalk.dim('  ⎿')}  ${chalk.dim(`… ${meta.join(', ')} (ctrl+o to expand)`)}`)
+  const timeoutMs = getBashTimeoutMs(input)
+  if (timeoutMs && timeoutMs !== defaultBashTimeoutMs) renderedLines.push(`${chalk.dim('  ⎿')}  ${chalk.dim(`(timeout ${formatDuration(timeoutMs)})`)}`)
+  return `\n${renderedLines.join('\n')}`
+}
+
+function getBashOutputSummary(output: unknown): { text: string; exitCode?: number } {
+  if (typeof output === 'string') return { text: output.trimEnd() }
+  if (!output || typeof output !== 'object') return { text: '' }
+  const record = output as Record<string, unknown>
+  const pieces: string[] = []
+  if (typeof record.stdout === 'string' && record.stdout.trimEnd()) pieces.push(record.stdout.trimEnd())
+  if (typeof record.stderr === 'string' && record.stderr.trimEnd()) pieces.push(record.stderr.trimEnd())
+  if (pieces.length === 0 && typeof record.message === 'string') pieces.push(record.message)
+  return {
+    text: pieces.join('\n').trimEnd(),
+    exitCode: typeof record.exitCode === 'number' ? record.exitCode : undefined,
+  }
+}
+
+function getBashTimeoutMs(input: unknown): number | undefined {
+  if (!input || typeof input !== 'object') return undefined
+  const value = (input as Record<string, unknown>).timeoutMs
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function formatDuration(ms: number): string {
+  if (ms % 60000 === 0) return `${ms / 60000}m`
+  if (ms % 1000 === 0) return `${ms / 1000}s`
+  return `${ms}ms`
 }
 
 function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): string {
@@ -1196,6 +1245,22 @@ function summarizePayload(payload: unknown): string {
     ].filter(Boolean)
     if (pieces.length > 0) return truncateMiddle(pieces.join(' | '), 240)
   }
+  const task = record.task
+  if (task && typeof task === 'object') {
+    const taskRecord = task as Record<string, unknown>
+    if (typeof taskRecord.title === 'string') {
+      return truncateMiddle(`${typeof taskRecord.status === 'string' ? `${taskRecord.status} ` : ''}${taskRecord.title}`, 120)
+    }
+    if (typeof taskRecord.taskId === 'string') return taskRecord.taskId
+  }
+  const tasks = record.tasks
+  if (Array.isArray(tasks)) {
+    const firstTask = tasks.find(item => item && typeof item === 'object') as Record<string, unknown> | undefined
+    if (!firstTask) return '0 tasks'
+    const suffix = tasks.length > 1 ? ` +${tasks.length - 1} more` : ''
+    const title = typeof firstTask.title === 'string' ? firstTask.title : String(firstTask.taskId ?? 'task')
+    return truncateMiddle(`${tasks.length} task${tasks.length === 1 ? '' : 's'}: ${typeof firstTask.status === 'string' ? `${firstTask.status} ` : ''}${title}${suffix}`, 120)
+  }
   if (typeof record.error === 'string') return truncateMiddle(record.error, 120)
   if (typeof record.title === 'string') return record.title
   if (typeof record.taskId === 'string') return record.taskId
@@ -1224,13 +1289,16 @@ function formatToolInput(name: string, input: any): string {
     return firstString(record, ['path', 'file_path', 'filePath'])
   }
   if (name === 'Glob' || name === 'Grep') {
-    return firstString(record, ['path', 'directory', 'DirectoryPath', 'pattern', 'Pattern'])
+    return firstString(record, ['pattern', 'Pattern', 'path', 'directory', 'DirectoryPath'])
   }
   if (name === 'ListDir') {
     return firstString(record, ['DirectoryPath', 'path', 'directory'])
   }
   if (name === 'Bash') {
     return firstString(record, ['command', 'CommandLine'])
+  }
+  if (name === 'TaskCreate') {
+    return firstString(record, ['title'])
   }
 
   if (typeof input === 'string') return input
@@ -1250,33 +1318,11 @@ function firstString(record: Record<string, unknown> | undefined, keys: string[]
 
 function formatToolCallName(name: string, formattedInput: string): string {
   if (!formattedInput || formattedInput === undefined) return name
-  return `${name} ${formattedInput}`
+  return `${name}(${formattedInput})`
 }
 
 function formatToolCallLabel(name: string, input: unknown): string {
   return formatToolCallName(name, formatToolInput(name, input))
-}
-
-function formatToolOutputSummary(name: string, output: unknown, truncated?: boolean): string {
-  if (!output || typeof output !== 'object') return ''
-  const record = output as Record<string, unknown>
-  const pieces: string[] = []
-  if (typeof record.exitCode === 'number') {
-    pieces.push(`exitCode=${record.exitCode}`)
-  }
-  const stdout = typeof record.stdout === 'string' ? record.stdout : ''
-  const stderr = typeof record.stderr === 'string' ? record.stderr : ''
-  const combined = stdout || stderr
-  if (combined) {
-    const firstLine = combined.split(/\r?\n/).find(line => line.trim().length > 0)
-    if (firstLine) {
-      pieces.push(truncateMiddle(firstLine.trim(), 60))
-    }
-  }
-  if (truncated) {
-    pieces.push('...')
-  }
-  return pieces.join(' ')
 }
 
 function formatOutput(output: unknown): string {

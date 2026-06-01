@@ -375,9 +375,14 @@ export class AnthropicAdapter implements ModelAdapter {
       number,
       { id: string; name: string; inputBuffer: string }
     >()
+    const activeContentBlocks = new Set<number>()
     const minimaxTextToolParser = providerId === 'minimax' ? createMinimaxTextToolParser() : undefined
+    let pendingFinishReason: FinishReason | undefined
 
     for await (const sse of parseSSE(response.body)) {
+      if (sse.data === '[DONE]') break
+      let stopAfterEvent = false
+
       if (sse.event === 'message_start') {
         const data = JSON.parse(sse.data)
         const usage = data.message?.usage
@@ -402,14 +407,23 @@ export class AnthropicAdapter implements ModelAdapter {
         }
         const stopReason = data.delta?.stop_reason
         if (stopReason) {
-          yield {
-            type: 'finish',
-            reason: stopReason as FinishReason,
+          pendingFinishReason = stopReason as FinishReason
+          if (activeContentBlocks.size === 0) {
+            if (minimaxTextToolParser) {
+              yield* minimaxTextToolParser.flush()
+            }
+            yield {
+              type: 'finish',
+              reason: pendingFinishReason,
+            }
+            pendingFinishReason = undefined
+            stopAfterEvent = true
           }
         }
       } else if (sse.event === 'content_block_start') {
         const data = JSON.parse(sse.data)
         const index = data.index
+        activeContentBlocks.add(index)
         const block = data.content_block
         if (block && block.type === 'tool_use') {
           activeToolUses.set(index, {
@@ -454,9 +468,22 @@ export class AnthropicAdapter implements ModelAdapter {
             }
           }
         }
+      } else if (sse.event === 'message_stop') {
+        if (minimaxTextToolParser) {
+          yield* minimaxTextToolParser.flush()
+        }
+        if (pendingFinishReason) {
+          yield {
+            type: 'finish',
+            reason: pendingFinishReason,
+          }
+          pendingFinishReason = undefined
+        }
+        stopAfterEvent = true
       } else if (sse.event === 'content_block_stop') {
         const data = JSON.parse(sse.data)
         const index = data.index
+        activeContentBlocks.delete(index)
         const toolUse = activeToolUses.get(index)
         if (toolUse) {
           let parsedInput: unknown = {}
@@ -472,11 +499,30 @@ export class AnthropicAdapter implements ModelAdapter {
           }
           activeToolUses.delete(index)
         }
+        if (pendingFinishReason && activeContentBlocks.size === 0) {
+          if (minimaxTextToolParser) {
+            yield* minimaxTextToolParser.flush()
+          }
+          yield {
+            type: 'finish',
+            reason: pendingFinishReason,
+          }
+          pendingFinishReason = undefined
+          stopAfterEvent = true
+        }
       }
+
+      if (stopAfterEvent) break
     }
 
     if (minimaxTextToolParser) {
       yield* minimaxTextToolParser.flush()
+    }
+    if (pendingFinishReason) {
+      yield {
+        type: 'finish',
+        reason: pendingFinishReason,
+      }
     }
   }
 }

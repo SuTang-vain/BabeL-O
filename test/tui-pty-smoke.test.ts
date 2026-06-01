@@ -55,20 +55,20 @@ test('PTY smoke: permission panel backspace rejects without approval', { skip: !
 test('PTY smoke: permission panel numeric approve once completes command', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('permission-approve-once')
   assert.match(output, /approval/)
-  assert.match(output, /Permission approved/)
-  assert.match(output, /Bash node -v done/)
+  assert.match(output, /Bash\(node -v\)/)
+  assert.doesNotMatch(output, /Permission approved/)
 })
 
 test('PTY smoke: permission panel session approval caches the tool rule', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('permission-approve-session')
-  assert.match(output, /Bash node -v done/)
-  assert.match(output, /Bash node -p 1 done/)
+  assert.match(output, /Bash\(node -v\)/)
+  assert.match(output, /Bash\(node -p 1\)/)
 })
 
 test('PTY smoke: permission panel editable rule path completes command', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('permission-editable-rule')
   assert.match(output, /Enter allow rule prefix/)
-  assert.match(output, /Bash node -v done/)
+  assert.match(output, /Bash\(node -v\)/)
 })
 
 test('PTY smoke: permission panel reject with instruction renders reason', { skip: !shouldRun || !existsSync(driver) }, () => {
@@ -79,16 +79,27 @@ test('PTY smoke: permission panel reject with instruction renders reason', { ski
 
 test('PTY smoke: compact read tool rendering hides raw state', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('tool-rendering-read')
-  assert.match(output, /Read package\.json done/)
+  assert.match(output, /Read\(package\.json\)/)
+  assert.doesNotMatch(output, /\(ctrl\+o to expand\)/)
   assert.doesNotMatch(output, /maxBytes/)
   assert.doesNotMatch(output, /running/)
+})
+
+test('PTY smoke: compact bash output preview folds long output', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('bash-output-preview')
+  assert.match(output, /Bash\(for i in 0 1 2 3 4; do echo line-\$i; done\)/)
+  assert.match(output, /⎿  line-0/)
+  assert.match(output, /⎿  line-2/)
+  assert.doesNotMatch(output, /⎿  line-3/)
+  assert.doesNotMatch(output, /⎿  line-4/)
+  assert.match(output, /… \+2 lines \(ctrl\+o to expand\)/)
 })
 
 test('PTY smoke: input placeholder clears on typing and blank enter does not submit', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('input-placeholder')
   assert.match(output, /什么我可以帮你的吗？/)
   assert.doesNotMatch(output, /什么我可以帮你的吗？edit, \/ for commands/)
-  assert.equal((output.match(/✓ done/g) ?? []).length, 1)
+  assert.equal((output.match(/BabeL-O local runtime is active\./g) ?? []).length, 1)
 })
 
 test('PTY smoke: multiline paste renders placeholder and expands on submit', { skip: !shouldRun || !existsSync(driver) }, () => {
@@ -101,27 +112,37 @@ test('PTY smoke: multiline paste renders placeholder and expands on submit', { s
 test('PTY smoke: ask coding question about files reads and answers', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('coding-question-files')
   assert.match(output, /What does question\.txt say\?/)
-  assert.match(output, /Read question\.txt done/)
+  assert.match(output, /Read\(question\.txt\)/)
   assert.match(output, /violet-river/)
+})
+
+test('PTY smoke: task status and update render in TUI', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('task-update-status')
+  assert.match(output, /TaskCreate\(Verify task update smoke\)/)
+  assert.match(output, /Verify task update smoke/)
+  assert.match(output, /pending Verify task update smoke/)
+  assert.match(output, /task updated/)
+  assert.match(output, /Task updated:/)
+  assert.match(output, /completed Verify task update smoke/)
 })
 
 test('PTY smoke: programming workflow covers read edit diff grep glob and task', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('programming-workflow')
-  assert.match(output, /Read smoke\.txt done/)
-  assert.match(output, /Edit smoke\.txt done/)
+  assert.match(output, /Read\(smoke\.txt\)/)
+  assert.match(output, /Edit\(smoke\.txt\)/)
   assert.match(output, /Diff for Edit in smoke\.txt/)
   assert.match(output, /\+ gamma/)
-  assert.match(output, /Grep \. done/)
+  assert.match(output, /Grep\(gamma\)/)
   assert.match(output, /smoke\.txt:1:alpha gamma/)
-  assert.match(output, /Glob \*\*\/\*\.ts done/)
+  assert.match(output, /Glob\(\*\*\/\*\.ts\)/)
   assert.match(output, /src\/smoke\.ts/)
-  assert.match(output, /TaskCreate done/)
+  assert.match(output, /TaskCreate\(Verify smoke workflow\)/)
 })
 
 test('PTY smoke: resume session redraws previous tool history', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('resume-session')
   assert.match(output, /session session_/)
   assert.match(output, /resume session_/)
-  assert.match(output, /Read smoke\.txt done/)
-  assert.match(output, /ctrl\+o to expand tool details/)
+  assert.match(output, /Read\(smoke\.txt\)/)
+  assert.doesNotMatch(output, /ctrl\+o to expand tool details/)
 })

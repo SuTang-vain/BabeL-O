@@ -1,5 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
-import type { NexusTask } from '../shared/task.js'
+import type { NexusTask, TaskStatus } from '../shared/task.js'
 
 export type NexusClientOptions = {
   baseUrl?: string
@@ -84,6 +84,56 @@ export class NexusClient {
     return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/tasks`) as Promise<{
       type: 'tasks_list'
       tasks: NexusTask[]
+    }>
+  }
+
+  async createTask(sessionId: string, body: {
+    title: string
+    description?: string
+    metadata?: Record<string, unknown>
+    actor?: string
+    source?: string
+    reason?: string
+    requestId?: string
+  }): Promise<{ type: 'task_created'; task: NexusTask; idempotent?: boolean }> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/tasks`, body) as Promise<{
+      type: 'task_created'
+      task: NexusTask
+      idempotent?: boolean
+    }>
+  }
+
+  async updateTask(sessionId: string, taskId: string, body: {
+    title?: string
+    description?: string
+    status?: TaskStatus
+    result?: string
+    metadata?: Record<string, unknown>
+    actor?: string
+    source?: string
+    reason?: string
+    requestId?: string
+    expectedUpdatedAt?: string
+  }): Promise<{ type: 'task_updated'; task: NexusTask }> {
+    return this.postJsonTaskMutation(sessionId, taskId, undefined, body) as Promise<{
+      type: 'task_updated'
+      task: NexusTask
+    }>
+  }
+
+  async mutateTask(sessionId: string, taskId: string, action: 'claim' | 'complete' | 'fail' | 'cancel' | 'retry' | 'approve' | 'reject', body: {
+    result?: string
+    ownerAgentId?: string
+    reviewReason?: string
+    actor?: string
+    source?: string
+    reason?: string
+    requestId?: string
+    expectedUpdatedAt?: string
+  } = {}): Promise<{ type: string; task: NexusTask }> {
+    return this.postJsonTaskMutation(sessionId, taskId, action, body) as Promise<{
+      type: string
+      task: NexusTask
     }>
   }
 
@@ -181,6 +231,29 @@ export class NexusClient {
     })
     if (!response.ok) {
       throw new Error(`GET ${path} failed: ${response.status}`)
+    }
+    return response.json()
+  }
+
+  private async postJsonTaskMutation(sessionId: string, taskId: string, action: string | undefined, body: unknown): Promise<unknown> {
+    const encodedSession = encodeURIComponent(sessionId)
+    const encodedTask = encodeURIComponent(taskId)
+    const suffix = action ? `/${encodeURIComponent(action)}` : ''
+    const path = `/v1/sessions/${encodedSession}/tasks/${encodedTask}${suffix}`
+    if (!action) return this.patchJson(path, body)
+    return this.postJson(path, body)
+  }
+
+  private async patchJson(path: string, body: unknown): Promise<unknown> {
+    const headers = this.getHeaders()
+    headers['content-type'] = 'application/json'
+    const response = await fetch(new URL(path, this.baseUrl), {
+      method: 'PATCH',
+      headers,
+      body: JSON.stringify(body),
+    })
+    if (!response.ok) {
+      throw new Error(`PATCH ${path} failed: ${response.status}`)
     }
     return response.json()
   }

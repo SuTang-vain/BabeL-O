@@ -40,6 +40,7 @@ import { closeNexusSession } from '../src/nexus/sessionLifecycle.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
 import { allowAllTools } from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
+import { logger } from '../src/shared/logger.js'
 
 test('runAgentLoop runs successfully and handles critic approval', async () => {
   resetTaskQueuesForTest()
@@ -1043,9 +1044,108 @@ test('runAgentLoopLiveSmoke uses fixed live/manual task and read-only tool surfa
     assert.equal(result.taskCompleted, true)
     assert.equal(result.criticCompleted, true)
     assert.equal(result.toolCallCount, 1)
+    assert.deepEqual(result.roleDiagnostics?.map(item => item.role), ['planner', 'optimizer', 'critic'])
+    assert.deepEqual(result.roleDiagnostics?.map(item => item.allowedTools), [['Read'], ['Read'], []])
+    assert.equal(result.roleDiagnostics?.every(item => item.model === 'anthropic/claude-3-5-sonnet'), true)
+    assert.equal(result.roleDiagnostics?.every(item => item.repairAttempts === 0), true)
+    assert.equal(JSON.stringify(result.roleDiagnostics).includes('test-agent-loop-live-smoke-key'), false)
     assert.equal(result.fallbackPolicy.allowSilentModelSwitch, false)
     assert.equal(requestBodies.some(body => latestProviderUserText(body).includes('Role:\noptimizer') && JSON.stringify(body).includes('Run arbitrary user task')), false)
     assert.equal(requestBodies.some(body => JSON.stringify(body).includes('test-agent-loop-live-smoke-key')), false)
+  } finally {
+    globalThis.fetch = originalFetch
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync(configPath, { force: true })
+  }
+})
+
+test('runAgentLoopLiveSmoke aborts provider request on timeout and records partial role progress', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const originalFetch = globalThis.fetch
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const configPath = join(tmpdir(), `babel-o-agent-loop-live-smoke-timeout-${Date.now()}.json`)
+  const configManager = new ConfigManager(configPath)
+  configManager.save({
+    defaultModel: 'anthropic/claude-3-5-sonnet',
+    providers: {
+      anthropic: {
+        apiKey: 'test-agent-loop-live-smoke-timeout-key',
+        baseUrl: 'https://agent-loop-live-smoke-timeout.invalid',
+      },
+    },
+  })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = configManager
+
+  let optimizerAbortObserved = false
+  globalThis.fetch = async (_url, init) => {
+    const body = parseProviderRequestBody(init)
+    if (isAgentLoopIntakeRequest(body)) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          intent: 'continue',
+          confidence: 0.95,
+          continuity: 0.8,
+          contextScope: 'current_task',
+          actionHint: 'normal',
+          requiresTools: true,
+          reason: 'Fixed live smoke should proceed.',
+          guidance: 'Proceed with the fixed live smoke task.',
+          explicitPaths: [],
+        })),
+        text: async () => 'mock intake',
+      } as Response
+    }
+
+    const latestText = latestProviderUserText(body)
+    if (latestText.includes('Role:\nplanner')) {
+      return {
+        ok: true,
+        status: 200,
+        body: anthropicTextResponse(JSON.stringify({
+          summary: 'Plan for timeout smoke',
+          tasks: [{ title: 'Read fixed AgentLoop live smoke fixture' }],
+        })),
+        text: async () => 'mock planner',
+      } as Response
+    }
+
+    if (latestText.includes('Role:\noptimizer')) {
+      return new Promise<Response>((_, reject) => {
+        init?.signal?.addEventListener('abort', () => {
+          optimizerAbortObserved = true
+          reject(new DOMException('The operation was aborted.', 'AbortError'))
+        })
+      })
+    }
+
+    throw new Error(`Unexpected timeout smoke request: ${latestText.slice(0, 400)}`)
+  }
+
+  try {
+    const result = await runAgentLoopLiveSmoke({
+      model: 'anthropic/claude-3-5-sonnet',
+      timeoutMs: 250,
+    })
+
+    assert.equal(result.success, false)
+    assert.equal(result.live, false)
+    assert.equal(result.error?.message, 'AgentLoop live smoke timed out after 250ms')
+    assert.equal(result.error?.category, 'agent_loop_timeout')
+    assert.equal(result.plannerCompleted, true)
+    assert.equal(result.taskCompleted, false)
+    assert.equal(result.criticCompleted, false)
+    assert.equal(result.sessionPhase, 'failed')
+    assert.equal(result.roleDiagnostics?.map(item => item.role).includes('planner'), true)
+    const optimizerDiagnostic = result.roleDiagnostics?.find(item => item.role === 'optimizer')
+    assert.ok(optimizerDiagnostic)
+    assert.equal(optimizerDiagnostic.errorCode, 'REQUEST_TIMEOUT')
+    assert.equal(optimizerDiagnostic.errorMessagePreview, 'The operation was aborted.')
+    assert.equal(optimizerAbortObserved, true)
+    assert.equal(JSON.stringify(result).includes('test-agent-loop-live-smoke-timeout-key'), false)
   } finally {
     globalThis.fetch = originalFetch
     ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
@@ -1234,6 +1334,58 @@ test('closeNexusSession cancels active child task sessions', async () => {
   assert.equal(cancelledChild.metadata?.status, 'cancelled')
   assert.equal(cancelledChild.metadata?.cancelledByParentSessionId, parent.sessionId)
   assert.equal(result.session?.phase, 'cancelled')
+})
+
+test('runAgentLoop optimizer skips git bookkeeping outside git workspaces', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+
+  const workspace = mkdtempSync(join(tmpdir(), 'babel-o-non-git-loop-'))
+  const warnings: string[] = []
+  const originalWarn = logger.warn
+  logger.warn = (message: string, meta?: unknown) => {
+    warnings.push(message)
+    originalWarn(message, meta)
+  }
+
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-loop-non-git-optimizer',
+      cwd: workspace,
+      prompt: 'Run optimizer outside git',
+      role: 'optimizer',
+      autoApprove: true,
+      stepRunner: async ({ roleDefinition, input }: any): Promise<any> => {
+        if (roleDefinition.role === 'planner') {
+          return {
+            summary: 'Non git plan',
+            tasks: [{ title: 'No git task' }],
+          }
+        }
+        if (roleDefinition.role === 'optimizer') {
+          return {
+            taskId: input.taskId,
+            success: true,
+            result: 'Completed without git bookkeeping',
+            needsReview: false,
+          }
+        }
+        throw new Error('Unexpected role')
+      },
+    })
+
+    assert.equal(finalSession.phase, 'completed')
+    assert.equal(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'git_stash_performed'), false)
+    assert.equal(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'git_commit_performed'), false)
+    assert.equal(warnings.some(message => message.includes('Git commit failed')), false)
+    assert.equal(warnings.some(message => message.includes('Git stash failed')), false)
+  } finally {
+    logger.warn = originalWarn
+    rmSync(workspace, { recursive: true, force: true })
+  }
 })
 
 test('runAgentLoop runs with requiresIsolation and successfully manages Git Worktree lifecycle', async () => {

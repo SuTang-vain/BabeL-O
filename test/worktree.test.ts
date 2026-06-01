@@ -12,6 +12,7 @@ import {
   withGitOperationLock,
   getGitOperationLockStatsForTest,
   resetGitOperationLocksForTest,
+  runGitCommand,
 } from '../src/nexus/worktree.js'
 
 function runCommand(cwd: string, cmd: string, args: string[]): Promise<void> {
@@ -27,6 +28,24 @@ function runCommand(cwd: string, cmd: string, args: string[]): Promise<void> {
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
+
+test('runGitCommand reports missing git without crashing', async () => {
+  const originalPath = process.env.PATH
+  process.env.PATH = join(resolve(process.cwd()), '.babel-o', `missing-git-${Date.now()}`)
+
+  try {
+    const result = await runGitCommand(process.cwd(), ['status'])
+
+    assert.notEqual(result.code, 0)
+    assert.match(result.stderr, /spawn git ENOENT/)
+  } finally {
+    if (originalPath === undefined) {
+      delete process.env.PATH
+    } else {
+      process.env.PATH = originalPath
+    }
+  }
+})
 
 test('per-cwd git operation lock serializes same repository operations', async () => {
   resetGitOperationLocksForTest()

@@ -15,6 +15,8 @@ export type RuntimeExecuteOptions = {
   requestId?: string
   model?: string
   budget?: number
+  maxOutputTokens?: number
+  replaySessionHistory?: boolean
   executionEnvironment?: 'local' | 'docker' | 'remote'
   storage?: NexusStorage
   allowedPaths?: string[]

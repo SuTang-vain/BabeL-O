@@ -184,6 +184,23 @@ export const BabelOConfigSchema = z.object({
 export const DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.babel-o');
 export const DEFAULT_CONFIG_FILE = path.join(DEFAULT_CONFIG_DIR, 'config.json');
 
+const TEST_CONFIG_GUARD_ERROR_CODE = 'BABEL_O_TEST_CONFIG_NOT_ISOLATED';
+
+function isNodeTestProcess(): boolean {
+  return process.env.BABEL_O_TEST_CONFIG_WRITE_GUARD === '1'
+    || process.env.NODE_TEST_CONTEXT !== undefined
+    || process.argv.some(arg => arg === '--test' || arg.startsWith('--test-'));
+}
+
+function isDefaultConfigFile(configFile: string): boolean {
+  return path.resolve(configFile) === path.resolve(DEFAULT_CONFIG_FILE);
+}
+
+function createTestConfigGuardError(): Error & { code: string } {
+  const error = new Error('Refusing to write the user BabeL-O config from a test process; set BABEL_O_CONFIG_FILE to a temporary path.');
+  return Object.assign(error, { code: TEST_CONFIG_GUARD_ERROR_CODE });
+}
+
 export class ConfigManager {
   private static instance: ConfigManager;
   private config: BabelOConfig | null = null;
@@ -231,6 +248,9 @@ export class ConfigManager {
   }
 
   public save(config?: BabelOConfig): void {
+    if (isNodeTestProcess() && isDefaultConfigFile(this.configFile)) {
+      throw createTestConfigGuardError();
+    }
     const toSave = config || this.config || {};
     const validated = BabelOConfigSchema.parse(toSave);
     const configDir = path.dirname(this.configFile);

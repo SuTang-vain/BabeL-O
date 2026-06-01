@@ -44,11 +44,12 @@ test('formatSessionHistory: compact mode renders correct summaries', () => {
   assert.ok(output.includes('hello world') || output.includes('run command'))
   assert.ok(output.includes('hello world'))
   assert.ok(output.includes('Thinking about listing directory.'))
-  // Should render compact bullet point
-  assert.ok(output.includes('✓'))
-  assert.ok(output.includes('ListDir'))
-  assert.ok(output.includes('done'))
-  assert.ok(output.includes('ctrl+o to expand tool details'))
+  // Should render compact tool call without inline expand noise
+  assert.ok(output.includes('●'))
+  assert.ok(output.includes('ListDir(/test/path)'))
+  assert.ok(!output.includes('(ctrl+o to expand)'))
+  assert.ok(!output.includes('ctrl+o to expand tool details'))
+  assert.ok(!output.includes('done'))
   // Should NOT render outputs in compact mode
   assert.ok(!output.includes('file.txt'))
   assert.ok(!output.includes('Success: true'))
@@ -87,12 +88,74 @@ test('formatSessionHistory: expanded mode renders complete details', () => {
   const output = formatSessionHistory(events, 'expanded')
   assert.ok(output.includes('hello world') || output.includes('run command'))
   assert.ok(output.includes('run command'))
-  assert.ok(output.includes('✓ Bash'))
+  assert.ok(output.includes('✓ Bash(echo hello)'))
   assert.ok(output.includes('Input:'))
   assert.ok(output.includes('CommandLine'))
-  assert.ok(output.includes('Success: true'))
+  assert.ok(output.includes('Status: success'))
   assert.ok(output.includes('Output:'))
   assert.ok(output.includes('hello from bash'))
+})
+
+test('formatSessionHistory: expanded mode groups permissions and object outputs into tool details', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expanded-tool-clean',
+      timestamp: now,
+      toolUseId: 'tool-bash-expanded',
+      name: 'Bash',
+      input: { command: 'ls project', timeoutMs: 10000 },
+    },
+    {
+      type: 'permission_request',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expanded-tool-clean',
+      timestamp: now,
+      toolUseId: 'tool-bash-expanded',
+      name: 'Bash',
+      input: { command: 'ls project', timeoutMs: 10000 },
+      risk: 'execute',
+      message: 'Tool Bash requires user permission to run.',
+    },
+    {
+      type: 'permission_response',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expanded-tool-clean',
+      timestamp: now,
+      toolUseId: 'tool-bash-expanded',
+      approved: true,
+      reason: 'User approved',
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expanded-tool-clean',
+      timestamp: now,
+      toolUseId: 'tool-bash-expanded',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'README.md\nsrc\n', stderr: '', exitCode: 0 },
+    },
+    {
+      type: 'usage',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-expanded-tool-clean',
+      timestamp: now,
+      inputTokens: 0,
+      outputTokens: 113,
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'expanded')
+  assert.ok(output.includes('✓ Bash(ls project)'))
+  assert.ok(output.includes('Permission: approved (execute risk): User approved'))
+  assert.ok(output.includes('"stdout": "README.md\\nsrc\\n"'))
+  assert.ok(!output.includes('[object Object]'))
+  assert.ok(!output.includes('? Permission requested'))
+  assert.ok(!output.includes('Tool Bash requires user permission'))
+  assert.ok(!output.includes('usage input='))
 })
 
 test('formatSessionHistory: handles tool denials and errors', () => {
@@ -300,7 +363,7 @@ test('formatSessionHistory: separates assistant text and bash tool layers', () =
       toolUseId: 'tool-bash',
       name: 'Bash',
       success: true,
-      output: 'ok',
+      output: { stdout: 'ok\n', stderr: '' },
     },
   ]
 
@@ -309,9 +372,44 @@ test('formatSessionHistory: separates assistant text and bash tool layers', () =
   assert.ok(output.includes('I will inspect the directory.'))
   assert.ok(output.includes('●'))
   assert.ok(output.includes('Bash'))
-  assert.ok(output.includes('done'))
+  assert.ok(!output.includes('(ctrl+o to expand)'))
+  assert.ok(output.includes('⎿  ok'))
+  assert.ok(!output.includes('done'))
   assert.ok(!output.includes('running'))
   assert.ok(!output.includes('Running Bash...'))
+})
+
+test('formatSessionHistory: compact mode shows folded Bash output preview', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-bash-preview',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-bash-preview',
+      name: 'Bash',
+      input: { command: 'npm test', timeoutMs: 120000 },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-bash-preview',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-bash-preview',
+      name: 'Bash',
+      success: true,
+      output: { stdout: 'line 1\nline 2\nline 3\nline 4\nline 5\n', stderr: '', exitCode: 0 },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('Bash(npm test)'))
+  assert.ok(output.includes('⎿  line 1'))
+  assert.ok(output.includes('⎿  line 2'))
+  assert.ok(output.includes('⎿  line 3'))
+  assert.ok(!output.includes('line 4'))
+  assert.ok(output.includes('… +2 lines (ctrl+o to expand)'))
+  assert.ok(output.includes('(timeout 2m)'))
 })
 
 test('formatSessionHistory: completed tools replace running state on redraw', () => {
@@ -338,12 +436,13 @@ test('formatSessionHistory: completed tools replace running state on redraw', ()
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('Read /tmp/file.txt'))
-  assert.ok(output.includes('done'))
+  assert.ok(output.includes('Read(/tmp/file.txt)'))
+  assert.ok(!output.includes('(ctrl+o to expand)'))
+  assert.ok(!output.includes('done'))
   assert.ok(!output.includes('running'))
 })
 
-test('formatSessionHistory: compact mode shows expand hint only once', () => {
+test('formatSessionHistory: compact mode omits inline expand hints', () => {
   const now = new Date().toISOString()
   const events: NexusEvent[] = [
     {
@@ -387,10 +486,10 @@ test('formatSessionHistory: compact mode shows expand hint only once', () => {
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('Read /tmp/a.md done'))
-  assert.ok(output.includes('Read /tmp/b.md done'))
-  assert.equal((output.match(/ctrl\+o to expand/g) ?? []).length, 1)
-  assert.ok(!output.includes('(ctrl+o to expand)'))
+  assert.ok(output.includes('Read(/tmp/a.md)'))
+  assert.ok(output.includes('Read(/tmp/b.md)'))
+  assert.equal((output.match(/ctrl\+o to expand/g) ?? []).length, 0)
+  assert.ok(!output.includes('ctrl+o to expand tool details'))
 })
 
 test('formatSessionHistory: compact tool rows hide raw tool parameter names', () => {
@@ -416,8 +515,8 @@ test('formatSessionHistory: compact tool rows hide raw tool parameter names', ()
   ]
 
   const output = formatSessionHistory(events, 'compact')
-  assert.ok(output.includes('Read /Users/tangyaoyue/DEV/Baidu/project/README.md'))
-  assert.ok(output.includes('Bash find /Users/tangyaoyue/DEV/Baidu -name README.md'))
+  assert.ok(output.includes('Read(/Users/tangyaoyue/DEV/Baidu/project/README.md)'))
+  assert.ok(output.includes('Bash(find /Users/tangyaoyue/DEV/Baidu -name README.md)'))
   assert.ok(!output.includes('path'))
   assert.ok(!output.includes('maxBytes'))
   assert.ok(!output.includes('timeoutMs'))
@@ -466,9 +565,10 @@ test('renderEvent keeps completed tool row before compact thinking spinner', () 
 
   const output = writes.join('')
   const plainOutput = output.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-  assert.ok(plainOutput.includes('● ✓ Bash ls -la /tmp done'))
-  assert.ok(plainOutput.includes('total 248'))
-  assert.ok(plainOutput.includes('done exitCode=0 total 248\n'))
+  assert.ok(plainOutput.includes('● Bash(ls -la /tmp)'))
+  assert.ok(plainOutput.includes('⎿  total 248'))
+  assert.ok(!plainOutput.includes('(ctrl+o to expand)'))
+  assert.ok(!plainOutput.includes('done exitCode=0 total 248\n'))
 })
 
 test('formatSessionHistory: skips standalone whitespace assistant deltas before tool rows', () => {
@@ -511,7 +611,7 @@ test('formatSessionHistory: skips standalone whitespace assistant deltas before 
 
   const output = formatSessionHistory(events, 'compact')
   assert.equal((output.match(/⏺/g) ?? []).length, 0)
-  assert.ok(output.includes('Read /tmp/file.txt failed'))
+  assert.ok(output.includes('Read(/tmp/file.txt) failed'))
 })
 
 test('renderEvent skips standalone whitespace assistant deltas before tool rows', () => {
@@ -546,7 +646,7 @@ test('renderEvent skips standalone whitespace assistant deltas before tool rows'
 
   const output = writes.join('')
   assert.equal((output.match(/⏺/g) ?? []).length, 0)
-  assert.ok(output.includes('● Read /tmp/file.txt'))
+  assert.ok(output.includes('● Read(/tmp/file.txt)'))
 })
 
 test('renderEvent does not insert blank line between newline-terminated assistant text and tool rows', () => {
@@ -580,8 +680,8 @@ test('renderEvent does not insert blank line between newline-terminated assistan
   }
 
   const output = writes.join('')
-  assert.ok(output.includes('继续读取文件：\n● Read /tmp/file.txt'))
-  assert.ok(!output.includes('继续读取文件：\n\n● Read /tmp/file.txt'))
+  assert.ok(output.includes('继续读取文件：\n● Read(/tmp/file.txt)'))
+  assert.ok(!output.includes('继续读取文件：\n\n● Read(/tmp/file.txt)'))
 })
 
 test('renderEvent updates live tool completion on the same terminal row', () => {
@@ -618,9 +718,9 @@ test('renderEvent updates live tool completion on the same terminal row', () => 
   }
 
   const output = writes.join('')
-  assert.ok(output.includes('● Read /tmp/file.txt'))
+  assert.ok(output.includes('● Read(/tmp/file.txt)'))
   assert.ok(output.includes('\r\x1b[K'))
-  assert.ok(output.includes('● ✓ Read /tmp/file.txt done'))
+  assert.ok(!output.includes('(ctrl+o to expand)'))
   assert.equal((output.match(/\n/g) ?? []).length, 0)
   assert.ok(!output.includes('maxBytes'))
   assert.ok(!output.includes('running'))

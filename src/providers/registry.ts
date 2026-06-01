@@ -116,6 +116,7 @@ export const providerRegistry: ProviderDefinition[] = [
     defaultBaseUrl: 'https://api.minimaxi.com/anthropic',
     defaultModel: 'minimax/MiniMax-M2.7',
     models: [
+      'minimax/MiniMax-M3',
       'minimax/MiniMax-M2.7',
       'minimax/MiniMax-M2.7-highspeed',
       'minimax/MiniMax-M2.5',
@@ -275,6 +276,17 @@ export const modelRegistry: ModelDefinition[] = [
     name: 'GLM 5 Turbo',
     contextWindow: 200000,
     defaultMaxTokens: 8192,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'minimax/MiniMax-M3',
+    name: 'MiniMax M3',
+    contextWindow: 200000,
+    defaultMaxTokens: 16384,
     capabilities: {
       toolCalling: true,
       jsonOutput: true,

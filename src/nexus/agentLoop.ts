@@ -238,22 +238,23 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
     metadata: sessionMetadata,
   })
 
-  // Prune any leftovers
+  let isGitWorkspace = false
   try {
-    if (await isGitRepository(cwd)) {
+    isGitWorkspace = await isGitRepository(cwd)
+    if (isGitWorkspace) {
       await pruneOrphanedWorktrees(cwd)
     }
   } catch (err) {
-    logger.warn('Failed to prune orphaned worktrees', err)
+    logger.warn('Failed to inspect git workspace', err)
   }
 
   let preStashed = false
-  if (role === 'optimizer') {
+  if (role === 'optimizer' && isGitWorkspace) {
     try {
       preStashed = await gitStash(cwd)
       recordTaskSessionEvent(sessionId, 'git_stash_performed', { preStashed })
     } catch (err) {
-      logger.warn('Git stash failed or workspace is not a git repository', err)
+      logger.warn('Git stash failed', err)
     }
   }
 
@@ -696,7 +697,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             if (approved) {
               // Commit in-place optimizer changes. Isolated worktrees already
               // produced a cherry-picked commit during merge.
-              if (role === 'optimizer' && !isolatedWorktreeMerged) {
+              if (role === 'optimizer' && isGitWorkspace && !isolatedWorktreeMerged) {
                 try {
                   await gitCommit(cwd, `bbl optimize: completed task ${task.taskId} - ${task.title}`)
                   recordTaskSessionEvent(sessionId, 'git_commit_performed', { taskId: task.taskId })
@@ -722,7 +723,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             if (isIsolated) {
               await removeWorktree(cwd, taskCwd, task.taskId)
               isIsolated = false
-            } else if (role === 'optimizer') {
+            } else if (role === 'optimizer' && isGitWorkspace) {
               try {
                 await gitRollbackTracked(cwd)
                 recordTaskSessionEvent(sessionId, 'git_rollback_performed', { taskId: task.taskId, reason: criticReason })

@@ -15,6 +15,8 @@ type RolePolicyRuntime = NexusRuntimeLike & {
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T
 }
 
+const ROLE_STEP_MAX_OUTPUT_TOKENS = 2048
+
 export type RuntimeAgentStepOptions = {
   cwd?: string
   model?: string
@@ -22,6 +24,7 @@ export type RuntimeAgentStepOptions = {
   useStructuredOutputTool?: boolean
   maxRepairAttempts?: number
   allowedToolsOverride?: string[]
+  signal?: AbortSignal
   runtimeFactory?: () => Promise<NexusRuntimeLike>
   onUsageSummary?: (usage: RuntimeAgentStepUsageSummary) => void
 }
@@ -42,6 +45,8 @@ export type RuntimeAgentStepUsageSummary = {
   resultMessage?: string
   errorCode?: string
   errorMessage?: string
+  assistantTextPreview?: string
+  thinkingTextPreview?: string
   lastToolName?: string
   lastToolSuccess?: boolean
   lastToolOutputPreview?: string
@@ -114,6 +119,8 @@ export function createRuntimeAgentStepRunner(
     let toolDeniedCount = 0
     let resultSuccess: boolean | undefined
     let resultMessage: string | undefined
+    let lastAssistantTextPreview: string | undefined
+    let lastThinkingTextPreview: string | undefined
     let lastToolName: string | undefined
     let lastToolSuccess: boolean | undefined
     let lastToolOutputPreview: string | undefined
@@ -149,47 +156,83 @@ export function createRuntimeAgentStepRunner(
       }
     }
 
-    for await (const event of runtimeForRole.executeStream({
-      sessionId,
-      prompt,
-      cwd: (input as { cwd?: string }).cwd ?? options.cwd ?? process.cwd(),
-      role: roleDefinition.role,
-      model: targetModelId,
-      skipPermissionCheck: !roleDefinition.toolPolicy.requiresApproval,
-    })) {
-      const nexusEvent = event as NexusEvent
-      eventCount += 1
+    try {
+      for await (const event of runtimeForRole.executeStream({
+        sessionId,
+        prompt,
+        cwd: (input as { cwd?: string }).cwd ?? options.cwd ?? process.cwd(),
+        role: roleDefinition.role,
+        model: targetModelId,
+        signal: options.signal,
+        timeoutSignal: options.signal,
+        replaySessionHistory: false,
+        maxOutputTokens: ROLE_STEP_MAX_OUTPUT_TOKENS,
+        skipPermissionCheck: !roleDefinition.toolPolicy.requiresApproval,
+      })) {
+        const nexusEvent = event as NexusEvent
+        eventCount += 1
 
-      // Log/persist event to session in real-time
-      recordTaskSessionNexusEvent(sessionId, nexusEvent)
+        // Log/persist event to session in real-time
+        recordTaskSessionNexusEvent(sessionId, nexusEvent)
 
-      if (nexusEvent.type === 'assistant_delta') {
-        textParts.push(nexusEvent.text)
+        if (nexusEvent.type === 'assistant_delta') {
+          textParts.push(nexusEvent.text)
+          lastAssistantTextPreview = summarizeForDiagnostics(textParts.join(''))
+        }
+        if (nexusEvent.type === 'thinking_delta') {
+          lastThinkingTextPreview = summarizeForDiagnostics(
+            `${lastThinkingTextPreview ?? ''}${nexusEvent.text}`,
+          )
+        }
+        if (nexusEvent.type === 'tool_started') toolCallCount += 1
+        if (nexusEvent.type === 'tool_denied') {
+          toolDeniedCount += 1
+          resultMessage = nexusEvent.message
+        }
+        if (nexusEvent.type === 'tool_completed') {
+          toolResultCount += 1
+          lastToolName = nexusEvent.name
+          lastToolSuccess = nexusEvent.success
+          lastToolOutputPreview = summarizeForDiagnostics(nexusEvent.output)
+          if (!nexusEvent.success) toolFailedCount += 1
+        }
+        if (nexusEvent.type === 'result') {
+          resultPayload = (nexusEvent as { result?: unknown }).result
+          structuredOutputPayload = (nexusEvent as { structuredOutput?: unknown }).structuredOutput
+          resultUsage = (nexusEvent as { usage?: unknown }).usage
+          modelUsage = (nexusEvent as { modelUsage?: unknown }).modelUsage
+          permissionDenials = (nexusEvent as { permissionDenials?: unknown }).permissionDenials
+          resultSuccess = nexusEvent.success
+          resultMessage = nexusEvent.message
+        }
+        if (nexusEvent.type === 'error') {
+          errorEvent = nexusEvent
+        }
       }
-      if (nexusEvent.type === 'tool_started') toolCallCount += 1
-      if (nexusEvent.type === 'tool_denied') {
-        toolDeniedCount += 1
-        resultMessage = nexusEvent.message
-      }
-      if (nexusEvent.type === 'tool_completed') {
-        toolResultCount += 1
-        lastToolName = nexusEvent.name
-        lastToolSuccess = nexusEvent.success
-        lastToolOutputPreview = summarizeForDiagnostics(nexusEvent.output)
-        if (!nexusEvent.success) toolFailedCount += 1
-      }
-      if (nexusEvent.type === 'result') {
-        resultPayload = (nexusEvent as { result?: unknown }).result
-        structuredOutputPayload = (nexusEvent as { structuredOutput?: unknown }).structuredOutput
-        resultUsage = (nexusEvent as { usage?: unknown }).usage
-        modelUsage = (nexusEvent as { modelUsage?: unknown }).modelUsage
-        permissionDenials = (nexusEvent as { permissionDenials?: unknown }).permissionDenials
-        resultSuccess = nexusEvent.success
-        resultMessage = nexusEvent.message
-      }
-      if (nexusEvent.type === 'error') {
-        errorEvent = nexusEvent
-      }
+    } catch (err) {
+      const summary = buildUsageSummary({
+        role: roleDefinition.role,
+        eventCount,
+        toolCallCount,
+        toolResultCount,
+        toolFailedCount,
+        toolDeniedCount,
+        resultSuccess,
+        resultMessage,
+        errorEvent,
+        lastToolName,
+        lastToolSuccess,
+        lastToolOutputPreview,
+        resultUsage,
+        modelUsage,
+        permissionDenials,
+        assistantTextPreview: lastAssistantTextPreview,
+        thinkingTextPreview: lastThinkingTextPreview,
+      })
+      const errorMessage = err instanceof Error ? err.message : String(err)
+      const errorCode = options.signal?.aborted ? 'REQUEST_TIMEOUT' : 'RUNTIME_AGENT_STEP_ERROR'
+      options.onUsageSummary?.({ ...summary, errorCode, errorMessage })
+      throw err
     }
 
     if (errorEvent) {
@@ -209,6 +252,8 @@ export function createRuntimeAgentStepRunner(
         resultUsage,
         modelUsage,
         permissionDenials,
+        assistantTextPreview: lastAssistantTextPreview,
+        thinkingTextPreview: lastThinkingTextPreview,
       })
       options.onUsageSummary?.(summary)
       throw new RuntimeAgentStepError(errorEvent.message, summary, errorEvent)
@@ -230,6 +275,8 @@ export function createRuntimeAgentStepRunner(
       resultUsage,
       modelUsage,
       permissionDenials,
+      assistantTextPreview: lastAssistantTextPreview,
+      thinkingTextPreview: lastThinkingTextPreview,
     })
     const assistantTextForParsing = buildAssistantTextForParsing(textParts, resultMessage)
     try {
@@ -242,6 +289,7 @@ export function createRuntimeAgentStepRunner(
         runtimeForRole,
         sessionId,
         targetModelId,
+        signal: options.signal,
         maxRepairAttempts: options.maxRepairAttempts ?? 1,
       })
       options.onUsageSummary?.(summary)
@@ -284,6 +332,7 @@ async function tryParseWithRepair(context: {
   runtimeForRole: NexusRuntimeLike
   sessionId: string
   targetModelId: string
+  signal?: AbortSignal
   maxRepairAttempts: number
 }): Promise<unknown> {
   let attempt = 0
@@ -312,6 +361,7 @@ async function tryParseWithRepair(context: {
         context.targetModelId,
         (context.input as { cwd?: string }).cwd ?? process.cwd(),
         !context.roleDefinition.toolPolicy.requiresApproval,
+        context.signal,
         (event) => {
           if (event.type === 'assistant_delta') currentTextParts.push(event.text)
           if (event.type === 'result') {
@@ -445,6 +495,7 @@ async function executeRuntimeTurn(
   model: string,
   cwd: string,
   skipPermissionCheck: boolean,
+  signal: AbortSignal | undefined,
   onEvent: (event: NexusEvent) => void,
 ): Promise<{
   errorEvent: RuntimeErrorEvent | null
@@ -470,6 +521,10 @@ async function executeRuntimeTurn(
     prompt,
     cwd,
     model,
+    signal,
+    timeoutSignal: signal,
+    replaySessionHistory: false,
+    maxOutputTokens: ROLE_STEP_MAX_OUTPUT_TOKENS,
     skipPermissionCheck,
   })) {
     const nexusEvent = event as NexusEvent
@@ -580,6 +635,8 @@ function buildUsageSummary(input: {
   resultUsage?: unknown
   modelUsage?: unknown
   permissionDenials?: unknown
+  assistantTextPreview?: string
+  thinkingTextPreview?: string
 }): RuntimeAgentStepUsageSummary {
   return {
     role: input.role,
@@ -592,6 +649,8 @@ function buildUsageSummary(input: {
     resultMessage: input.resultMessage,
     errorCode: input.errorEvent?.code,
     errorMessage: input.errorEvent?.message,
+    assistantTextPreview: input.assistantTextPreview,
+    thinkingTextPreview: input.thinkingTextPreview,
     lastToolName: input.lastToolName,
     lastToolSuccess: input.lastToolSuccess,
     lastToolOutputPreview: input.lastToolOutputPreview,
@@ -1105,64 +1164,9 @@ function previewValue(value: unknown): string {
   }
 }
 
-function zodRoleOutputSchemaToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
-  const converted = zodToJsonSchemaShape(schema)
+export function zodRoleOutputSchemaToJsonSchema(schema: z.ZodTypeAny): Record<string, unknown> {
+  const converted = z.toJSONSchema(schema)
   return isRecord(converted) ? converted : {}
-}
-
-function zodToJsonSchemaShape(schema: z.ZodTypeAny): unknown {
-  const definition = (schema._def as unknown) as {
-    typeName?: string
-    shape?: (() => Record<string, z.ZodTypeAny>) | Record<string, z.ZodTypeAny>
-    innerType?: z.ZodTypeAny
-    type?: z.ZodTypeAny
-    valueType?: z.ZodTypeAny
-  }
-
-  if (definition.typeName === 'ZodOptional') {
-    return zodToJsonSchemaShape(definition.innerType!)
-  }
-
-  if (definition.typeName === 'ZodString') return { type: 'string' }
-  if (definition.typeName === 'ZodBoolean') return { type: 'boolean' }
-  if (definition.typeName === 'ZodNumber') return { type: 'number' }
-  if (definition.typeName === 'ZodArray') {
-    return {
-      type: 'array',
-      items: zodToJsonSchemaShape(definition.type!),
-    }
-  }
-  if (definition.typeName === 'ZodUnknown' || definition.typeName === 'ZodAny') {
-    return { type: 'object' }
-  }
-  if (definition.typeName === 'ZodRecord') {
-    return {
-      type: 'object',
-      additionalProperties: zodToJsonSchemaShape(definition.valueType!),
-    }
-  }
-  if (definition.typeName === 'ZodObject') {
-    const shape =
-      typeof definition.shape === 'function'
-        ? definition.shape()
-        : definition.shape ?? {}
-    const properties: Record<string, unknown> = {}
-    const required: string[] = []
-
-    for (const [key, value] of Object.entries(shape)) {
-      properties[key] = zodToJsonSchemaShape(value)
-      if (!value.isOptional()) required.push(key)
-    }
-
-    return {
-      type: 'object',
-      properties,
-      required,
-      additionalProperties: false,
-    }
-  }
-
-  return { type: 'object' }
 }
 
 function tryParseJsonLike(text: string): unknown | undefined {
