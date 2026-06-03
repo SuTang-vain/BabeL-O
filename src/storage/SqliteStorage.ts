@@ -17,6 +17,7 @@ import type {
   PermissionAudit,
   ExecutionMetrics,
 } from './Storage.js'
+import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 
 type Row = Record<string, unknown>
 
@@ -256,6 +257,11 @@ export class SqliteStorage implements NexusStorage {
         }
         await this.saveToolTrace(updated)
       }
+    }
+
+    const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
+    if (embeddedMetrics) {
+      await this.saveExecutionMetrics(embeddedMetrics)
     }
   }
 
@@ -638,6 +644,27 @@ export class SqliteStorage implements NexusStorage {
         this.db.exec(`ALTER TABLE sessions ADD COLUMN metadata TEXT`)
       }
       this.db.exec('PRAGMA user_version = 5;')
+      version = 5
+    }
+
+    if (version < 6) {
+      const executionMetricsColumns = (this.db.prepare(`PRAGMA table_info(execution_metrics)`).all() as Row[]).map(r => String(r.name))
+      const addColumn = (name: string, definition: string) => {
+        if (!executionMetricsColumns.includes(name)) {
+          this.db.exec(`ALTER TABLE execution_metrics ADD COLUMN ${name} ${definition}`)
+        }
+      }
+      addColumn('input_tokens', 'INTEGER')
+      addColumn('output_tokens', 'INTEGER')
+      addColumn('cache_creation_input_tokens', 'INTEGER')
+      addColumn('cache_read_input_tokens', 'INTEGER')
+      addColumn('effective_context_ceiling', 'INTEGER')
+      addColumn('legacy_context_ceiling', 'INTEGER')
+      addColumn('cache_read_ratio', 'REAL')
+      addColumn('cache_preservation_mode', 'INTEGER')
+      addColumn('long_context_utilization_mode', 'INTEGER')
+      addColumn('compact_summary_latency_ms', 'REAL')
+      this.db.exec('PRAGMA user_version = 6;')
     }
   }
 
@@ -663,12 +690,18 @@ export class SqliteStorage implements NexusStorage {
           metric_id, session_id, execute_duration_ms, provider_first_token_ms,
           provider_request_duration_ms, stream_delta_count, tool_call_count,
           tool_roundtrip_duration_ms, context_chars_in, context_chars_out,
-          timestamp
+          input_tokens, output_tokens, cache_creation_input_tokens,
+          cache_read_input_tokens, effective_context_ceiling,
+          legacy_context_ceiling, cache_read_ratio, cache_preservation_mode,
+          long_context_utilization_mode, compact_summary_latency_ms, timestamp
         ) VALUES (
           :metricId, :sessionId, :executeDurationMs, :providerFirstTokenMs,
           :providerRequestDurationMs, :streamDeltaCount, :toolCallCount,
           :toolRoundtripDurationMs, :contextCharsIn, :contextCharsOut,
-          :timestamp
+          :inputTokens, :outputTokens, :cacheCreationInputTokens,
+          :cacheReadInputTokens, :effectiveContextCeiling,
+          :legacyContextCeiling, :cacheReadRatio, :cachePreservationMode,
+          :longContextUtilizationMode, :compactSummaryLatencyMs, :timestamp
         )
         ON CONFLICT(metric_id) DO UPDATE SET
           execute_duration_ms = excluded.execute_duration_ms,
@@ -679,6 +712,16 @@ export class SqliteStorage implements NexusStorage {
           tool_roundtrip_duration_ms = excluded.tool_roundtrip_duration_ms,
           context_chars_in = excluded.context_chars_in,
           context_chars_out = excluded.context_chars_out,
+          input_tokens = excluded.input_tokens,
+          output_tokens = excluded.output_tokens,
+          cache_creation_input_tokens = excluded.cache_creation_input_tokens,
+          cache_read_input_tokens = excluded.cache_read_input_tokens,
+          effective_context_ceiling = excluded.effective_context_ceiling,
+          legacy_context_ceiling = excluded.legacy_context_ceiling,
+          cache_read_ratio = excluded.cache_read_ratio,
+          cache_preservation_mode = excluded.cache_preservation_mode,
+          long_context_utilization_mode = excluded.long_context_utilization_mode,
+          compact_summary_latency_ms = excluded.compact_summary_latency_ms,
           timestamp = excluded.timestamp`
       )
       .run({
@@ -692,6 +735,16 @@ export class SqliteStorage implements NexusStorage {
         toolRoundtripDurationMs: metrics.toolRoundtripDurationMs ?? null,
         contextCharsIn: metrics.contextCharsIn ?? null,
         contextCharsOut: metrics.contextCharsOut ?? null,
+        inputTokens: metrics.inputTokens ?? null,
+        outputTokens: metrics.outputTokens ?? null,
+        cacheCreationInputTokens: metrics.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: metrics.cacheReadInputTokens ?? null,
+        effectiveContextCeiling: metrics.effectiveContextCeiling ?? null,
+        legacyContextCeiling: metrics.legacyContextCeiling ?? null,
+        cacheReadRatio: metrics.cacheReadRatio ?? null,
+        cachePreservationMode: booleanToDb(metrics.cachePreservationMode),
+        longContextUtilizationMode: booleanToDb(metrics.longContextUtilizationMode),
+        compactSummaryLatencyMs: metrics.compactSummaryLatencyMs ?? null,
         timestamp: metrics.timestamp,
       })
   }
@@ -712,9 +765,29 @@ export class SqliteStorage implements NexusStorage {
       toolRoundtripDurationMs: row.tool_roundtrip_duration_ms !== null && row.tool_roundtrip_duration_ms !== undefined ? Number(row.tool_roundtrip_duration_ms) : undefined,
       contextCharsIn: row.context_chars_in !== null && row.context_chars_in !== undefined ? Number(row.context_chars_in) : undefined,
       contextCharsOut: row.context_chars_out !== null && row.context_chars_out !== undefined ? Number(row.context_chars_out) : undefined,
+      inputTokens: row.input_tokens !== null && row.input_tokens !== undefined ? Number(row.input_tokens) : undefined,
+      outputTokens: row.output_tokens !== null && row.output_tokens !== undefined ? Number(row.output_tokens) : undefined,
+      cacheCreationInputTokens: row.cache_creation_input_tokens !== null && row.cache_creation_input_tokens !== undefined ? Number(row.cache_creation_input_tokens) : undefined,
+      cacheReadInputTokens: row.cache_read_input_tokens !== null && row.cache_read_input_tokens !== undefined ? Number(row.cache_read_input_tokens) : undefined,
+      effectiveContextCeiling: row.effective_context_ceiling !== null && row.effective_context_ceiling !== undefined ? Number(row.effective_context_ceiling) : undefined,
+      legacyContextCeiling: row.legacy_context_ceiling !== null && row.legacy_context_ceiling !== undefined ? Number(row.legacy_context_ceiling) : undefined,
+      cacheReadRatio: row.cache_read_ratio !== null && row.cache_read_ratio !== undefined ? Number(row.cache_read_ratio) : undefined,
+      cachePreservationMode: dbToBoolean(row.cache_preservation_mode),
+      longContextUtilizationMode: dbToBoolean(row.long_context_utilization_mode),
+      compactSummaryLatencyMs: row.compact_summary_latency_ms !== null && row.compact_summary_latency_ms !== undefined ? Number(row.compact_summary_latency_ms) : undefined,
       timestamp: String(row.timestamp),
     }
   }
+}
+
+function booleanToDb(value: boolean | undefined): number | null {
+  if (value === undefined) return null
+  return value ? 1 : 0
+}
+
+function dbToBoolean(value: unknown): boolean | undefined {
+  if (value === null || value === undefined) return undefined
+  return Number(value) === 1
 }
 
 function sessionParams(session: SessionSnapshot): Record<string, string | null> {

@@ -49,14 +49,25 @@ export function isSessionPermissionCached(
   if (approvals.has(event.name)) return true
 
   for (const entry of approvals) {
-    const separatorIndex = entry.indexOf(':')
-    if (separatorIndex === -1) continue
-    const toolName = entry.slice(0, separatorIndex)
-    const rule = entry.slice(separatorIndex + 1)
-    if (toolName !== event.name) continue
-    if (matchesPermissionRule(event.name, event.input, rule)) return true
+    const parsed = parseSessionPermissionRule(entry)
+    if (!parsed) continue
+    if (parsed.toolName !== event.name) continue
+    if (matchesPermissionRule(event.name, event.input, parsed.rule)) return true
   }
   return false
+}
+
+export function encodeSessionPermissionRule(toolName: string, rule: string): string {
+  return `${encodeURIComponent(toolName)}:${rule}`
+}
+
+function parseSessionPermissionRule(entry: string): { toolName: string; rule: string } | undefined {
+  const separatorIndex = entry.indexOf(':')
+  if (separatorIndex === -1) return undefined
+  const rawToolName = entry.slice(0, separatorIndex)
+  const rule = entry.slice(separatorIndex + 1)
+  const toolName = rawToolName.includes('%') ? decodeURIComponent(rawToolName) : rawToolName
+  return { toolName, rule }
 }
 
 export function matchesPermissionRule(
@@ -65,7 +76,7 @@ export function matchesPermissionRule(
   rule: string,
 ): boolean {
   if (!rule || rule === '*') return true
-  if (toolName !== 'Bash') return false
+  if (toolName !== 'Bash') return rule === toolName
 
   const command = typeof input === 'object' && input !== null
     ? (input as Record<string, unknown>).command
@@ -121,6 +132,7 @@ export function mapDropdownSelection(selected: string): string {
     '/help': '/help',
     '/clear': '/clear',
     '/compact': '/compact',
+    '/agentloop-smoke': '/agentloop-smoke',
     '/exit': '/exit',
     '/status': '/status',
     '/smoke': '/smoke ',
@@ -142,7 +154,7 @@ export function getAutosuggestion(line: string, history: string[]): string | und
   // 2. Check slash commands
   if (line.startsWith('/')) {
     const slashChoices = [
-      '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
+      '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
       '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e'
     ]
     const matchingSlash = slashChoices.find(c => c.startsWith(line) && c !== line)
@@ -257,6 +269,22 @@ function renderedCursorRow(text: string, logicalCursorRow: number, cursorColumn:
 
 
 
+function formatSuggestedPermissionRule(event: PermissionDialogEvent): string | undefined {
+  const tool = event.name || 'tool'
+  if (tool === 'Bash' && typeof (event.input as Record<string, unknown>)?.command === 'string') {
+    return extractCommandPrefix((event.input as Record<string, unknown>).command)
+  }
+  if (event.source?.type === 'mcp' && tool) return tool
+  return undefined
+}
+
+function formatPermissionSource(event: PermissionDialogEvent): string | undefined {
+  if (event.source?.type !== 'mcp') return undefined
+  const server = event.source.serverName ?? 'unknown'
+  const original = event.source.originalName ?? event.name ?? 'tool'
+  return `${chalk.cyan(`mcp/${server}`)} · ${original}`
+}
+
 export function formatPermissionInput(input: unknown): string {
   if (!input || typeof input !== 'object') return ''
   const record = input as Record<string, unknown>
@@ -317,22 +345,35 @@ export function permissionDecisionFromChoice(
   return { approved: false, scope: 'once', reason: 'Denied by user' }
 }
 
+type PermissionDialogEvent = {
+  name?: string
+  risk?: string
+  input?: unknown
+  source?: {
+    type?: string
+    serverName?: string
+    originalName?: string
+  }
+}
+
 export function formatPermissionDialog(
-  event: { name?: string; risk?: string; input?: unknown },
+  event: PermissionDialogEvent,
   choices: { id: PermissionChoice; label: string }[],
   activeIndex: number,
 ): string {
   const tool = event.name || 'tool'
   const risk = event.risk ? `${event.risk} risk` : 'unknown risk'
   const command = formatPermissionInput(event.input)
-  const suggestedRule = tool === 'Bash' && typeof (event.input as Record<string, unknown>)?.command === 'string'
-    ? extractCommandPrefix((event.input as Record<string, unknown>).command)
-    : undefined
+  const suggestedRule = formatSuggestedPermissionRule(event)
+  const source = formatPermissionSource(event)
   const lines = [
     `${chalk.yellow('◉')} ${chalk.dim('Waiting for permission...')}`,
     chalk.yellow(' approval '),
     `│ ${chalk.yellow(`${tool} is requesting approval (${risk})`)}`,
   ]
+  if (source) {
+    lines.push(`│ ${chalk.dim('Source:')} ${source}`)
+  }
   if (command) {
     lines.push('│')
     lines.push(`│ ${command}`)
@@ -355,7 +396,7 @@ export function formatPermissionDialog(
 
 export async function askPermission(
   rl: CliReadline,
-  event: { name?: string; risk?: string; input?: unknown },
+  event: PermissionDialogEvent,
   signal: AbortSignal,
 ): Promise<PermissionDecision> {
   const wasRaw = process.stdin.isRaw
@@ -411,9 +452,7 @@ export async function askPermission(
       const decision = permissionDecisionFromChoice(choice)
       if (decision === 'needs_rule_input') {
         cleanup()
-        const defaultRule = event.name === 'Bash' && typeof event.input === 'object' && event.input !== null
-          ? extractCommandPrefix((event.input as Record<string, unknown>).command)
-          : event.name ?? '*'
+        const defaultRule = formatSuggestedPermissionRule(event) ?? event.name ?? '*'
         const ruleInput = await questionAsync(rl, chalk.yellow(`Enter allow rule prefix (default: ${defaultRule}): `))
         const rule = ruleInput.trim() || defaultRule
         resolve(permissionDecisionFromChoice(choice, { rule }) as PermissionDecision)
@@ -475,7 +514,7 @@ export async function askPermission(
 
 export async function handleLocalPermissionRequest(
   sessionId: string,
-  event: { toolUseId: string; name?: string; risk?: string; input?: unknown },
+  event: PermissionDialogEvent & { toolUseId: string },
   rl: CliReadline,
   signal: AbortSignal,
 ): Promise<void> {
@@ -488,7 +527,7 @@ export async function handleLocalPermissionRequest(
     if (decision.approved && decision.scope === 'session' && event.name) {
       const tools = sessionPermissionApprovals.get(sessionId) ?? new Set<string>()
       if (decision.rule) {
-        tools.add(`${event.name}:${decision.rule}`)
+        tools.add(encodeSessionPermissionRule(event.name, decision.rule))
       } else {
         tools.add(event.name)
       }
@@ -528,6 +567,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/pager': { tag: 'command', description: 'Open the last output in terminal pager' },
     '/less': { tag: 'command', description: 'Open the last output in terminal pager' },
     '/context': { tag: 'session', description: 'Inspect context budget and compact state' },
+    '/agentloop-smoke': { tag: 'agent', description: 'Render mock AgentLoop sub-agent hierarchy' },
     '/exit': { tag: 'command', description: 'Exit chat' },
     '/model': { tag: 'config', description: 'Open model configuration wizard' },
     '/profile': { tag: 'config', description: 'Show, set, or add configurations profiles' },

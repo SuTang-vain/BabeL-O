@@ -1,6 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
 import { formatSessionHistory, getSessionEvents, renderEvent, renderEventForTest, startAgentStatus, startSession, stopSpinner } from '../src/cli/renderEvents.js'
+import { createMockAgentLoopTuiSmokeEvents } from '../src/cli/commands/chat.js'
 import type { NexusEvent } from '../src/shared/events.js'
 
 test('formatSessionHistory: compact mode renders correct summaries', () => {
@@ -567,6 +568,97 @@ test('startAgentStatus renders immediate waiting feedback before runtime events'
   assert.ok(plainOutput.includes('[Context: OK]'))
 })
 
+test('startAgentStatus renders retrying feedback', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    startAgentStatus('retrying')
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Retrying...'))
+  assert.ok(plainOutput.includes('[Context: OK]'))
+})
+
+test('startAgentStatus renders sub-agent progress with model and context gauge', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+
+  try {
+    renderEventForTest({
+      type: 'session_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-subagent-status',
+      timestamp: new Date().toISOString(),
+      cwd: '/repo',
+      model: 'minimax/MiniMax-M3',
+    })
+    renderEventForTest({
+      type: 'context_warning',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-subagent-status',
+      timestamp: new Date().toISOString(),
+      modelId: 'minimax/MiniMax-M3',
+      tokenEstimate: 161000,
+      maxTokens: 200000,
+      percentUsed: 81,
+      thresholdPercent: 80,
+      message: 'Context is approaching the model window.',
+    })
+    startAgentStatus('running_subagent', 'Deep visual regression child task with long title')
+  } finally {
+    stopSpinner()
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('context warning: 81%'))
+  assert.ok(plainOutput.includes('Running sub-agent Deep visual regression child task with long title...'))
+  assert.ok(plainOutput.includes('minimax/MiniMax-M3'))
+  assert.ok(plainOutput.includes('81%'))
+})
+
+test('startAgentStatus formats elapsed time over one minute as minutes and seconds', () => {
+  startSession()
+  const writes: string[] = []
+  const originalWrite = process.stdout.write
+  const originalNow = Date.now
+  let now = 1_000_000
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  Date.now = () => now
+
+  try {
+    startAgentStatus('thinking')
+    now += (15 * 60 + 24) * 1000
+    startAgentStatus('thinking')
+  } finally {
+    stopSpinner()
+    Date.now = originalNow
+    process.stdout.write = originalWrite
+  }
+
+  const plainOutput = writes.join('').replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
+  assert.ok(plainOutput.includes('Thinking... 15m 24s'))
+  assert.ok(!plainOutput.includes('Thinking... 924s'))
+})
+
 test('renderEvent updates live waiting status across session, permission, and tool phases', () => {
   startSession()
   const writes: string[] = []
@@ -1006,6 +1098,24 @@ test('formatTaskStatusPanel renders delegated subtask hierarchy', () => {
   assert.ok(output.includes('delegated #2'))
   assert.ok(output.includes('Child implementation'))
   assert.ok(output.includes('parent #1'))
+})
+
+test('formatSessionHistory renders AgentLoop sub-agent smoke hierarchy and transcript references', () => {
+  const events = createMockAgentLoopTuiSmokeEvents('sess-agentloop-smoke', '/repo')
+  const output = formatSessionHistory(events, 'compact')
+
+  assert.ok(output.includes('mock/agentloop-tui-smoke'))
+  assert.ok(output.includes('task blocked'))
+  assert.ok(output.includes('subtasks delegated'))
+  assert.ok(output.includes('subagent started'))
+  assert.ok(output.includes('subagent completed'))
+  assert.ok(output.includes('Ⅱ 等待子任务'))
+  assert.ok(output.includes('Parent blocked by delegated sub-agent'))
+  assert.ok(output.includes('Child implementation via sub-agent'))
+  assert.ok(output.includes('depth=1'))
+  assert.ok(output.includes('parentTaskId=1'))
+  assert.ok(output.includes('parent #1'))
+  assert.ok(output.includes('transcript=nexus://sessions/sess-agentloop-smoke-sub-2/events'))
 })
 
 test('formatSessionHistory: consecutive assistant_delta events produce exactly one ⏺ prefix', () => {

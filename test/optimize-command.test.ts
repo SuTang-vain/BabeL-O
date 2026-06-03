@@ -103,9 +103,16 @@ test('formatAgentLoopSmokeResult includes timeout failure diagnostics', () => {
       allowSilentModelSwitch: false,
       nextAction: 'Fix provider configuration.',
     },
+    diagnostic: {
+      domain: 'provider',
+      name: 'agent_loop_smoke',
+      status: 'blocked',
+      summary: 'minimax/MiniMax-M3 agent loop live ready=yes live=no',
+    },
   })
 
   assert.match(output, /Failure type:\s+agent_loop_timeout/)
+  assert.match(output, /Diagnostic:\s+blocked · minimax\/MiniMax-M3 agent loop live ready=yes live=no/)
   assert.match(output, /optimizer\{.*error=REQUEST_TIMEOUT/)
   assert.match(output, /lastTool=Read:yes/)
   assert.match(output, /toolOut="BABEL_O_AGENT_LOOP_SMOKE_OK"/)

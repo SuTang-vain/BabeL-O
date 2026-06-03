@@ -99,6 +99,7 @@ export function summarizeSessionEvents(
       case 'compact_boundary':
       case 'compact_failure':
       case 'context_warning':
+      case 'context_blocking':
       case 'session_memory_updated':
       case 'hook_started':
       case 'hook_completed':

@@ -14,7 +14,8 @@ import {
   resumeSessionHistory,
   toggleTuiMode,
   stopAgentStatus,
-  stopSpinner
+  stopSpinner,
+  redrawSession
 } from '../renderEvents.js'
 import { formatSessionBanner, renderWelcome } from '../welcome.js'
 import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
@@ -24,6 +25,7 @@ import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../../runtime/prov
 import { buildProviderFallbackPolicy, planProviderFallbackAction, type ProviderRecoveryKind } from '../../runtime/providerRecovery.js'
 import { createId } from '../../shared/id.js'
 import { NexusEvent } from '../../shared/events.js'
+import type { NexusTask } from '../../shared/task.js'
 import { runSessionFlow } from '../runSessionFlow.js'
 import {
   chooseInteractive,
@@ -44,8 +46,10 @@ import { inputState } from '../inputState.js'
 import { openExternalEditor } from '../editor.js'
 import { normalizeKeyEvent, terminalMouseDisableSequence } from '../keyEvent.js'
 import { consumePasteChunk, createPasteBufferState, expandPastedTextPlaceholders, flushPasteBuffer, formatPastedTextPlaceholder } from '../pasteBuffer.js'
-import { shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
+import { INPUT_NEWLINE_MARKER, restoreInputNewlines, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
 import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
+import { openContextView } from '../contextView.js'
+import { formatToolAudit } from '../toolAuditFormatter.js'
 
 interface ReadlineInternal extends readline.Interface {
   history: string[]
@@ -82,7 +86,8 @@ export function registerChatCommand(program: Command): void {
         output,
         completer,
         historySize: 1000,
-        removeHistoryDuplicates: true
+        removeHistoryDuplicates: true,
+        escapeCodeTimeout: 50,
       })
 
       const rlInt = rl as ReadlineInternal
@@ -95,7 +100,9 @@ export function registerChatCommand(program: Command): void {
       const isExecutingRef = { get current() { return isExecuting } }
       rl.setPrompt(getChatPrompt())
       const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef)
-      const slashPalette = createSlashPalette(rl)
+      const slashPalette = createSlashPalette(rl, {
+        clearInputBlock: () => inputRefresh.clearCurrentInputBlock(),
+      })
       let sessionId = ''
 
       // Enable bracketed paste mode
@@ -130,6 +137,36 @@ export function registerChatCommand(program: Command): void {
         rl.write(placeholder)
       }
 
+      const insertInputText = (text: string) => {
+        if (!text) return
+        const currentLine = rlInt.line ?? ''
+        const cursor = typeof (rlInt as any).cursor === 'number' ? (rlInt as any).cursor : currentLine.length
+        rlInt.line = `${currentLine.slice(0, cursor)}${text}${currentLine.slice(cursor)}`
+        ;(rlInt as any).cursor = cursor + text.length
+        rlInt._refreshLine?.()
+      }
+
+      const insertInputNewline = () => {
+        insertInputText(INPUT_NEWLINE_MARKER)
+      }
+
+      const consumeShiftEnterInput = (text: string): boolean => {
+        const shiftEnterPattern = /\x1b\[13;2u|\x1b\[27;2;13~/g
+        if (!shiftEnterPattern.test(text)) return false
+        shiftEnterPattern.lastIndex = 0
+        let lastIndex = 0
+        for (const match of text.matchAll(shiftEnterPattern)) {
+          const index = match.index ?? 0
+          const before = text.slice(lastIndex, index)
+          insertInputText(before)
+          insertInputNewline()
+          lastIndex = index + match[0].length
+        }
+        const after = text.slice(lastIndex)
+        insertInputText(after)
+        return true
+      }
+
       process.stdin.emit = function (event: string, ...args: any[]) {
         if (event === 'data') {
           const chunk = args[0]
@@ -151,6 +188,13 @@ export function registerChatCommand(program: Command): void {
               clearPasteTimeout()
               return originalEmit.apply(this, [event, ...args] as any)
             }
+
+            if (inputState.current === 'idle' && keyEvent.kind === 'shift_enter') {
+              insertInputNewline()
+              return true
+            }
+
+            if (inputState.current === 'idle' && consumeShiftEnterInput(str)) return true
 
             if (inputState.current === 'idle' && shouldConsumeBlankInputEnter(rlInt.line ?? '', keyEvent.kind)) {
               if (typeof rlInt._refreshLine === 'function') {
@@ -201,6 +245,7 @@ export function registerChatCommand(program: Command): void {
           } else {
             const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
             const { closeNexusSession } = await import('../../nexus/sessionLifecycle.js')
+            const { ConfigManager } = await import('../../shared/config.js')
             const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
             if (!fs.existsSync(storagePath)) return
             const storage = new SqliteStorage(storagePath)
@@ -209,6 +254,7 @@ export function registerChatCommand(program: Command): void {
                 storage,
                 sessionId,
                 reason,
+                hooks: ConfigManager.getInstance().load().hooks,
               })
             } finally {
               await storage.close?.()
@@ -243,6 +289,40 @@ export function registerChatCommand(program: Command): void {
           isExecuting = false
           inputState.set('idle')
           stopSpinner()
+        }
+      }
+
+      const showMockAgentLoopSmoke = async () => {
+        isExecuting = true
+        inputState.set('agentRunning')
+        startSession()
+        startAgentStatus('working')
+        try {
+          for (const event of createMockAgentLoopTuiSmokeEvents(sessionId, options.cwd)) {
+            renderEvent(event)
+            await new Promise(resolve => setTimeout(resolve, 20))
+          }
+          stopAgentStatus()
+          redrawSession()
+          console.log(chalk.green('✓ AgentLoop sub-agent TUI smoke completed'))
+        } finally {
+          stopAgentStatus()
+          inputState.set('idle')
+          isExecuting = false
+        }
+      }
+
+      const loadEmbeddedToolAudit = async () => {
+        const { createDefaultNexusRuntime } = await import('../../nexus/createRuntime.js')
+        const { runtime, storage } = await createDefaultNexusRuntime({
+          cwd: options.cwd,
+          allowedTools: ['*'],
+          enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
+        })
+        try {
+          return { type: 'tools_audit', tools: runtime.listTools?.() ?? [] }
+        } finally {
+          await storage.close?.()
         }
       }
 
@@ -296,7 +376,7 @@ export function registerChatCommand(program: Command): void {
             await storage.close?.()
           }
         }
-        console.log(formatContextAnalysis(analysis))
+        await openContextView(analysis)
       }
 
       const onGlobalKeypress = (chunk: any, key: any) => {
@@ -498,8 +578,8 @@ export function registerChatCommand(program: Command): void {
             pendingLineResolve = null
           }
 
-          const displayPrompt = prompt
-          prompt = expandPastedTextPlaceholders(prompt, pastedTextReplacements)
+          const displayPrompt = restoreInputNewlines(prompt)
+          prompt = expandPastedTextPlaceholders(restoreInputNewlines(prompt), pastedTextReplacements)
           let trimmed = prompt.trim()
           const displayTrimmed = displayPrompt.trim()
           inputRefresh.clearCurrentInputBlock({ afterSubmit: true })
@@ -565,6 +645,15 @@ export function registerChatCommand(program: Command): void {
             continue
           }
 
+          if (trimmed === '/agentloop-smoke' || trimmed === '/agent-loop-smoke') {
+            try {
+              await showMockAgentLoopSmoke()
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to render AgentLoop smoke: ${e.message || e}`))
+            }
+            continue
+          }
+
           if (trimmed === '/compact') {
             startAgentStatus('compacting')
             try {
@@ -609,7 +698,15 @@ export function registerChatCommand(program: Command): void {
           }
 
           if (trimmed === '/tool' || trimmed === '/tools') {
-            const selected = await pickCompletionChoice(getToolCompletionChoices())
+            let selected = ''
+            inputState.set('toolPalette')
+            try {
+              selected = await pickCompletionChoice(getToolCompletionChoices())
+            } finally {
+              if (inputState.current === 'toolPalette') {
+                inputState.set('idle')
+              }
+            }
             if (selected) {
               const mapped = mapDropdownSelection(selected)
               console.log(chalk.dim(`Inserted: ${mapped.trim()}`))
@@ -624,11 +721,15 @@ export function registerChatCommand(program: Command): void {
             const configManager = ConfigManager.getInstance()
             if (parts.length === 1) {
               isExecuting = true
+              inputState.set('modelWizard')
               try {
                 await runModelConfigWizard()
               } catch (err: any) {
                 console.error(chalk.red(`Wizard error: ${err.message || err}`))
               } finally {
+                if (inputState.current === 'modelWizard') {
+                  inputState.set('idle')
+                }
                 isExecuting = false
               }
             } else {
@@ -717,10 +818,12 @@ export function registerChatCommand(program: Command): void {
                 const client = new NexusClient({ baseUrl: options.url })
                 const stat = await client.status() as Record<string, unknown>
                 const smoke = (stat.providerSmoke ?? await client.providerSmoke()) as Record<string, unknown>
+                const audit = await client.auditTools()
                 const { provider, providerSmoke: _providerSmoke, ...statusWithoutProvider } = stat
                 console.log(chalk.cyan('\n--- Nexus Service Status ---'))
                 console.log(formatProviderDiagnostics(provider))
                 console.log(formatProviderSmoke(smoke))
+                console.log(formatToolAudit(audit))
                 console.log(JSON.stringify(statusWithoutProvider, null, 2))
               } catch (e: any) {
                 console.error(chalk.red(`Failed to get status from service: ${e.message || e}`))
@@ -730,8 +833,10 @@ export function registerChatCommand(program: Command): void {
               console.log(`Mode: ${chalk.bold('Embedded (Local)')}`)
               console.log(`Workspace CWD: ${chalk.white(options.cwd)}`)
               const configManager = ConfigManager.getInstance()
+              const audit = await loadEmbeddedToolAudit()
               console.log(formatProviderDiagnostics(configManager.getProviderDiagnostics()))
               console.log(formatProviderSmoke(runProviderSmokeDryRun()))
+              console.log(formatToolAudit(audit))
             }
             continue
           }
@@ -914,6 +1019,156 @@ export function registerChatCommand(program: Command): void {
     })
 }
 
+export function createMockAgentLoopTuiSmokeEvents(sessionId: string, cwd: string): NexusEvent[] {
+  const timestamp = new Date().toISOString()
+  const parentTask = createMockAgentLoopTask({
+    sessionId,
+    taskId: '1',
+    title: 'Parent blocked by delegated sub-agent',
+    status: 'blocked',
+    metadata: {
+      delegatedSubTaskIds: ['2'],
+    },
+    timestamp,
+  })
+  const childTask = createMockAgentLoopTask({
+    sessionId,
+    taskId: '2',
+    title: 'Child implementation via sub-agent',
+    status: 'in_progress',
+    metadata: {
+      parentTaskId: '1',
+      depth: 1,
+      delegatedBy: 'optimizer',
+      subSessionId: `${sessionId}-sub-2`,
+      transcriptPath: `nexus://sessions/${sessionId}-sub-2/events`,
+    },
+    timestamp,
+  })
+  const completedChild = { ...childTask, status: 'completed' as const }
+  const subAgentMetadata = {
+    agentId: `${sessionId}:subagent:2`,
+    parentAgentId: sessionId,
+    parentSessionId: sessionId,
+    parentTaskId: '1',
+    depth: 1,
+    agentType: 'subagent' as const,
+    role: 'optimizer' as const,
+    status: 'running' as const,
+    transcriptPath: `nexus://sessions/${sessionId}-sub-2/events`,
+    permissionInheritance: {
+      mode: 'role_policy' as const,
+      inheritedAllowRules: ['Read', 'Edit', 'Bash'],
+      inheritsOnceApprovals: false,
+      inheritsSessionApprovals: false,
+      inheritedSessionApprovalTools: [],
+      requiresApproval: true,
+    },
+  }
+
+  return [
+    {
+      type: 'session_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp,
+      cwd,
+      model: 'mock/agentloop-tui-smoke',
+    },
+    mockTaskSessionEvent(sessionId, 'planner_completed', 'planning', timestamp, {
+      plannerOutput: {
+        summary: 'Mock AgentLoop TUI smoke plan',
+        tasks: [{ title: parentTask.title }],
+      },
+    }),
+    mockTaskSessionEvent(sessionId, 'task_claimed', 'executing', timestamp, { task: { ...parentTask, status: 'in_progress' } }),
+    mockTaskSessionEvent(sessionId, 'task_blocked', 'executing', timestamp, { task: parentTask }),
+    mockTaskSessionEvent(sessionId, 'subtasks_delegated', 'executing', timestamp, {
+      parentTask,
+      parentTaskId: parentTask.taskId,
+      subTaskIds: [childTask.taskId],
+      subTasks: [childTask],
+      requested: 1,
+      accepted: 1,
+      currentDepth: 0,
+      nextDepth: 1,
+    }),
+    mockTaskSessionEvent(sessionId, 'task_claimed', 'executing', timestamp, { task: childTask }),
+    mockTaskSessionEvent(sessionId, 'sub_agent_session_started', 'executing', timestamp, {
+      taskId: childTask.taskId,
+      subSessionId: `${sessionId}-sub-2`,
+      title: childTask.title,
+      ...subAgentMetadata,
+    }),
+    mockTaskSessionEvent(sessionId, 'subagent_started', 'executing', timestamp, {
+      taskId: childTask.taskId,
+      subSessionId: `${sessionId}-sub-2`,
+      title: childTask.title,
+      ...subAgentMetadata,
+    }),
+    mockTaskSessionEvent(sessionId, 'subagent_completed', 'executing', timestamp, {
+      taskId: childTask.taskId,
+      subSessionId: `${sessionId}-sub-2`,
+      title: childTask.title,
+      result: 'Sub-agent child completed.',
+      ...subAgentMetadata,
+      status: 'completed',
+      resultEventRange: { firstEventId: `${sessionId}-sub-2:1`, lastEventId: `${sessionId}-sub-2:5`, eventCount: 5 },
+      summary: 'Sub-agent child completed.',
+    }),
+    mockTaskSessionEvent(sessionId, 'sub_agent_session_completed', 'executing', timestamp, {
+      taskId: childTask.taskId,
+      subSessionId: `${sessionId}-sub-2`,
+      result: 'Sub-agent child completed.',
+      ...subAgentMetadata,
+      status: 'completed',
+    }),
+    mockTaskSessionEvent(sessionId, 'task_completed', 'executing', timestamp, { task: completedChild }),
+  ]
+}
+
+function createMockAgentLoopTask(options: {
+  sessionId: string
+  taskId: string
+  title: string
+  status: NexusTask['status']
+  metadata?: Record<string, unknown>
+  timestamp: string
+}): NexusTask {
+  return {
+    taskId: options.taskId,
+    sessionId: options.sessionId,
+    title: options.title,
+    status: options.status,
+    source: 'executor',
+    dependsOn: [],
+    blocks: [],
+    retryCount: 0,
+    metadata: options.metadata,
+    createdAt: options.timestamp,
+    updatedAt: options.timestamp,
+  }
+}
+
+function mockTaskSessionEvent(
+  sessionId: string,
+  eventType: string,
+  phase: string,
+  timestamp: string,
+  payload?: unknown,
+): NexusEvent {
+  return {
+    type: 'task_session_event',
+    schemaVersion: '2026-05-21.babel-o.v1',
+    sessionId,
+    eventId: `${sessionId}:${eventType}`,
+    eventType,
+    phase,
+    timestamp,
+    payload,
+  }
+}
+
 function formatProviderDiagnostics(provider: any): string {
   if (!provider) return chalk.dim('Provider diagnostics unavailable.')
   const auth = provider.authConfigured ? chalk.green('configured') : chalk.red('missing')
@@ -950,9 +1205,10 @@ function formatProviderSmoke(smoke: any): string {
       : undefined,
     smoke.toolCallCount !== undefined ? `  tool calls:      ${smoke.toolCallCount}${Array.isArray(smoke.toolCalls) && smoke.toolCalls.length > 0 ? ` (${smoke.toolCalls.map((call: any) => call.name || 'unknown').join(', ')})` : ''}` : undefined,
     smoke.outputPreview ? `  output:          ${String(smoke.outputPreview).slice(0, 120)}` : undefined,
+    smoke.diagnostic ? `  diagnostic:      ${smoke.diagnostic.status ?? 'unknown'} · ${smoke.diagnostic.summary ?? ''}` : undefined,
     `  fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `  next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 function formatProviderFallbackPlan(plan: any): string {
@@ -968,9 +1224,10 @@ function formatProviderFallbackPlan(plan: any): string {
     `  silent switch:   ${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `  user confirm:    ${action.requiresUserConfirmation === true ? 'required' : 'unknown'}`,
     `  side effects:    switchModel=${yesNo(action.willSwitchModel)} switchProvider=${yesNo(action.willSwitchProvider)} mutateConfig=${yesNo(action.willMutateConfig)} callProvider=${yesNo(action.willCallProvider)} createSession=${yesNo(action.willCreateSession)}`,
+    plan.diagnostic ? `  diagnostic:      ${plan.diagnostic.status ?? 'unknown'} · ${plan.diagnostic.summary ?? ''}` : undefined,
     `  reason:          ${fallbackPolicy.reason ?? chalk.dim('none')}`,
     `  next action:     ${action.description ?? fallbackPolicy.nextAction ?? chalk.dim('none')}`,
-  ].join('\n')
+  ].filter(Boolean).join('\n')
 }
 
 function parseProviderRecoveryKind(value: string): ProviderRecoveryKind {
@@ -991,7 +1248,7 @@ function yesNo(value: unknown): string {
   return value ? 'yes' : 'no'
 }
 
-function formatContextAnalysis(analysis: ContextAnalysis): string {
+export function formatContextAnalysis(analysis: ContextAnalysis): string {
   const maxTokens = Math.max(1, analysis.window.maxTokens)
   const usedTokens = Math.max(0, analysis.estimate.totalTokens)
   const availableTokens = Math.max(0, maxTokens - usedTokens)
@@ -999,46 +1256,121 @@ function formatContextAnalysis(analysis: ContextAnalysis): string {
   const freeTokens = Math.max(0, availableTokens - compactBufferTokens)
   const activeSkillsTokens = estimateCharsAsTokens(analysis.sections.activeSkillsChars)
   const systemPromptTokens = Math.max(0, analysis.estimate.systemPromptTokens - activeSkillsTokens)
-  const rows = [
-    contextSourceRow('■', 'System prompt', systemPromptTokens, maxTokens, chalk.blue),
-    contextSourceRow('■', 'System tools', analysis.estimate.toolDefinitionTokens, maxTokens, chalk.magenta),
-    contextSourceRow('■', 'Skills', activeSkillsTokens, maxTokens, chalk.cyan),
-    contextSourceRow('■', 'Messages', analysis.estimate.messageTokens, maxTokens, chalk.green),
-    contextSourceRow('~', 'Autocompact buffer', compactBufferTokens, maxTokens, chalk.yellow),
-    contextSourceRow('□', 'Free space', freeTokens, maxTokens, chalk.dim),
+  const segments: ContextUsageSegment[] = [
+    { marker: '■', label: 'System prompt', tokens: systemPromptTokens, color: text => chalk.blue(text), barChar: '■' },
+    { marker: '■', label: 'System tools', tokens: analysis.estimate.toolDefinitionTokens, color: text => chalk.magenta(text), barChar: '■' },
+    { marker: '■', label: 'Skills', tokens: activeSkillsTokens, color: text => chalk.cyan(text), barChar: '■' },
+    { marker: '■', label: 'Messages', tokens: analysis.estimate.messageTokens, color: text => chalk.green(text), barChar: '■' },
+    { marker: '~', label: 'Autocompact buffer', tokens: compactBufferTokens, color: text => chalk.yellow(text), barChar: '■' },
+    { marker: '□', label: 'Free space', tokens: freeTokens, color: text => chalk.dim(text), barChar: '□' },
   ]
+  const usage = analysis.diagnostics.usageSummary
+  const cache = analysis.diagnostics.cacheEconomics
+  const diagnosticRows = [
+    `remaining ${formatTokenCount(analysis.diagnostics.remainingTokens)} (${analysis.diagnostics.remainingPercent}%) · compact headroom ${formatTokenCount(analysis.diagnostics.compactRemainingTokens)} · blocking headroom ${formatTokenCount(analysis.diagnostics.blockingRemainingTokens)}`,
+    `usage input=${formatTokenCompact(usage.inputTokens)} cached=${formatTokenCompact(usage.cacheReadInputTokens)} output=${formatTokenCompact(usage.outputTokens)} reasoning≈${formatTokenCompact(usage.estimatedReasoningTokens)}`,
+    `cache policy read=${formatPercent(cache.cacheReadRatio, 1)} cacheable=${formatPercent(cache.cacheableSystemPromptRatio, 1)} · preserving=${yesNo(cache.cachePreservationMode)} long-context=${yesNo(cache.longContextUtilizationMode)} · ceiling ${formatTokenCompact(cache.effectiveContextCeiling)}/${formatTokenCompact(cache.legacyContextCeiling)} legacy`,
+    `cache policy reason ${cache.reason}`,
+    `microcompact saved≈${formatTokenCompact(analysis.sections.microcompactEstimatedTokensSaved)} tokens · duplicate results=${analysis.sections.microcompactDeduplicatedToolResultCount}`,
+    `auto compact floor ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.currentTokens)}/${formatTokenCompact(analysis.diagnostics.autoCompactFloor.thresholdTokens)} (${analysis.diagnostics.autoCompactFloor.thresholdPercent}%) · budget ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens)}`,
+  ]
+  if (analysis.diagnostics.autoCompact.fuseOpen) {
+    diagnosticRows.push(`auto compact paused after ${analysis.diagnostics.autoCompact.failureCount}/${analysis.diagnostics.autoCompact.failureLimit} failures`)
+  } else if (analysis.diagnostics.autoCompact.shouldCompact) {
+    diagnosticRows.push(`auto compact threshold reached at ${analysis.diagnostics.autoCompact.thresholdPercent}%`)
+  }
+  if (analysis.diagnostics.compactRetention.hasBoundary) {
+    diagnosticRows.push(`retained segment ${analysis.diagnostics.compactRetention.retainedSegmentValid ? 'valid' : 'fallback'} · events=${analysis.diagnostics.compactRetention.retainedEventCount}${analysis.diagnostics.compactRetention.retainedSegmentWarning ? ` · ${analysis.diagnostics.compactRetention.retainedSegmentWarning}` : ''}`)
+  }
+  if (analysis.diagnostics.compactTokenDelta.hasBoundary) {
+    const delta = analysis.diagnostics.compactTokenDelta
+    diagnosticRows.push(`compact delta events ${delta.beforeEventCount}→${delta.afterEventCount} · saved≈${formatTokenCompact(delta.estimatedTokensSaved)} tokens`)
+  }
+  if (analysis.diagnostics.workingSetPaths.length > 0) {
+    const paths = analysis.diagnostics.workingSetPaths.slice(0, 3).map(entry => `${entry.path}×${entry.touches}`)
+    diagnosticRows.push(`working set paths ${paths.join(', ')}`)
+  }
+  if (analysis.diagnostics.resumeRecovery.active) {
+    diagnosticRows.push(`resume recovery boundary ${analysis.diagnostics.resumeRecovery.code} · ${analysis.diagnostics.resumeRecovery.message}`)
+  }
+  if (analysis.diagnostics.largeToolResults.length > 0) {
+    const largest = analysis.diagnostics.largeToolResults[0]!
+    diagnosticRows.push(`largest tool result ${largest.name} ${formatCharCount(largest.outputChars)} · ${largest.inputPreview}`)
+  }
+  if (analysis.diagnostics.repeatedToolInputs.length > 0) {
+    const repeated = analysis.diagnostics.repeatedToolInputs[0]!
+    diagnosticRows.push(`repeated tool input ${repeated.name} ×${repeated.count} · ${repeated.inputPreview}`)
+  }
+  if (analysis.diagnostics.memory.truncated || analysis.diagnostics.memory.pressurePercent >= 70) {
+    diagnosticRows.push(`project memory ${formatCharCount(analysis.diagnostics.memory.projectMemoryChars)}/${formatCharCount(analysis.diagnostics.memory.projectMemoryBudgetChars)} (${analysis.diagnostics.memory.pressurePercent}%)${analysis.diagnostics.memory.truncated ? ' · truncated' : ''}`)
+  }
+  const sessionMemory = analysis.diagnostics.sessionMemoryLite
+  const sessionMemoryLast = sessionMemory.lastUpdate
+    ? `last ${sessionMemory.lastUpdate.trigger}/${sessionMemory.lastUpdate.reason || 'unknown'} ${formatCharCount(sessionMemory.lastUpdate.summaryChars)} events=${sessionMemory.lastUpdate.eventCount}`
+    : 'last none'
+  diagnosticRows.push(`session memory lite ${sessionMemory.enabled ? 'enabled' : 'disabled'} · ${sessionMemoryLast} · next=${sessionMemory.nextDecision.reason}${sessionMemory.nextDecision.shouldUpdate ? ' update' : ' skip'} · policy=${sessionMemory.costPolicy.summaryMode} max=${formatCharCount(sessionMemory.costPolicy.maxSummaryChars)}`)
+  const signalRows = analysis.diagnostics.signals.map(signal => {
+    return `${formatSignalSeverity(signal.severity)} ${signal.message}`
+  })
+  const recommendationRows = analysis.recommendations.map(recommendation => `- ${recommendation}`)
 
   return [
     '',
     `${chalk.dim('⎿')}  ${chalk.bold('BABEL Context')}`,
     `   ${chalk.yellow(formatContextModelName(analysis.modelId))} · current context ${chalk.bold(formatTokenCompact(usedTokens))}/${formatTokenCompact(maxTokens)} (${formatPercent(usedTokens, maxTokens)}) · available ${formatTokenCompact(availableTokens)}`,
-    `   ${formatContextUsageBar(usedTokens, maxTokens)} ${formatPercent(usedTokens, maxTokens)} used`,
+    `   ${formatContextUsageBar(segments, maxTokens)} ${formatPercent(usedTokens, maxTokens)} used`,
     '',
     `   ${chalk.bold('Current context by source')}`,
-    ...rows.map(row => `   ${row}`),
+    ...segments.map(segment => `   ${contextSourceRow(segment, maxTokens)}`),
+    '',
+    `   ${chalk.bold('Diagnostics')}`,
+    ...diagnosticRows.map(row => `   ${row}`),
+    ...(signalRows.length > 0 ? ['', `   ${chalk.bold('Signals')}`, ...signalRows.map(row => `   ${row}`)] : []),
+    '',
+    `   ${chalk.bold('Recommendations')}`,
+    ...recommendationRows.map(row => `   ${row}`),
     '',
     `   ${chalk.bold('Skills')} · ${chalk.cyan('/skills')}`,
     '',
   ].join('\n')
 }
 
-function contextSourceRow(
-  marker: string,
-  label: string,
-  tokens: number,
-  maxTokens: number,
-  color: (text: string) => string,
-): string {
-  return `${color(marker)} ${label} · ${formatTokenCount(tokens)} · ${formatPercent(tokens, maxTokens)}`
+type ContextUsageSegment = {
+  marker: string
+  label: string
+  tokens: number
+  color: (text: string) => string
+  barChar: string
 }
 
-function formatContextUsageBar(usedTokens: number, maxTokens: number): string {
+function contextSourceRow(segment: ContextUsageSegment, maxTokens: number): string {
+  return `${segment.color(segment.marker)} ${segment.label} · ${formatTokenCount(segment.tokens)} · ${formatPercent(segment.tokens, maxTokens)}`
+}
+
+function formatContextUsageBar(segments: ContextUsageSegment[], maxTokens: number): string {
   const width = 36
-  const ratio = Math.max(0, Math.min(1, usedTokens / Math.max(1, maxTokens)))
-  const filled = usedTokens > 0 ? Math.max(1, Math.round(ratio * width)) : 0
-  const empty = Math.max(0, width - filled)
-  const color = ratio >= 0.9 ? chalk.red : ratio >= 0.7 ? chalk.yellow : chalk.green
-  return `[${color('■'.repeat(filled))}${chalk.dim('□'.repeat(empty))}]`
+  const total = Math.max(1, maxTokens)
+  const rawCounts = segments.map(segment => segment.tokens > 0 ? (segment.tokens / total) * width : 0)
+  const counts = rawCounts.map(count => Math.floor(count))
+  let remaining = width - counts.reduce((sum, count) => sum + count, 0)
+  rawCounts
+    .map((count, index) => ({ index, fraction: count - Math.floor(count) }))
+    .sort((a, b) => b.fraction - a.fraction)
+    .forEach(({ index }) => {
+      if (remaining <= 0) return
+      if (segments[index]!.tokens <= 0) return
+      counts[index]! += 1
+      remaining -= 1
+    })
+  for (let index = counts.length - 1; remaining < 0 && index >= 0; index -= 1) {
+    const removable = Math.min(counts[index]!, -remaining)
+    counts[index]! -= removable
+    remaining += removable
+  }
+  const bar = segments
+    .map((segment, index) => segment.color(segment.barChar.repeat(Math.max(0, counts[index]!))))
+    .join('')
+  return `[${bar}]`
 }
 
 function formatContextModelName(modelId: string): string {
@@ -1057,6 +1389,20 @@ function formatTokenCompact(tokens: number): string {
 function formatTokenCount(tokens: number): string {
   if (tokens >= 1000) return `${formatTokenCompact(tokens)} tokens`
   return `${Math.round(tokens)} tokens`
+}
+
+function formatCharCount(chars: number): string {
+  if (chars >= 1000) {
+    const value = chars / 1000
+    return `${Number.isInteger(value) ? value.toFixed(0) : value.toFixed(1)}k chars`
+  }
+  return `${Math.round(chars)} chars`
+}
+
+function formatSignalSeverity(severity: string): string {
+  if (severity === 'critical') return chalk.red('critical')
+  if (severity === 'warning') return chalk.yellow('warning')
+  return chalk.dim('info')
 }
 
 function formatPercent(tokens: number, maxTokens: number): string {

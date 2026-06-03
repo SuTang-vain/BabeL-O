@@ -1,5 +1,4 @@
 import { z } from 'zod'
-import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
@@ -12,6 +11,7 @@ import type {
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { classifyAction } from './classifier.js'
+import type { HooksConfig } from '../shared/config.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import {
   executeRuntimeHooks,
@@ -19,14 +19,12 @@ import {
   firstHookPermissionDecision,
   lastHookUpdatedInput,
 } from './hooks.js'
+import {
+  buildRuntimeExecutionMetricsEvent,
+  createRuntimeExecutionMetrics,
+  parseLocalRuntimeIntent,
+} from './runtimePipeline.js'
 
-
-type ParsedIntent =
-  | { kind: 'tool'; toolName: string; input: unknown }
-  | { kind: 'file_question'; path: string; question: string }
-  | { kind: 'task_status' }
-  | { kind: 'task_update'; selector: string; status: 'pending' | 'in_progress' | 'completed' | 'failed'; result?: string }
-  | { kind: 'text'; text: string }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
@@ -42,6 +40,7 @@ export class LocalCodingRuntime implements NexusRuntime {
     private readonly tools: Map<string, AnyTool>,
     private toolPolicy: ToolPolicy = allowAllTools(),
     private readonly storage?: NexusStorage,
+    private readonly hooks?: HooksConfig,
   ) {}
 
   listTools(): RuntimeToolAuditEntry[] {
@@ -52,6 +51,9 @@ export class LocalCodingRuntime implements NexusRuntime {
         risk: tool.risk,
         allowed: this.toolPolicy.isAllowed(tool),
         inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
+        requiresApproval: tool.requiresApproval ?? (tool.risk === 'write' || tool.risk === 'execute'),
+        suggestedAllowRule: tool.suggestedAllowRule ?? tool.name,
+        mcpServerAllowed: tool.mcpServerAllowed,
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
@@ -90,6 +92,9 @@ export class LocalCodingRuntime implements NexusRuntime {
     if (!options.storage && this.storage) {
       options = { ...options, storage: this.storage }
     }
+    if (!options.hooks && this.hooks) {
+      options = { ...options, hooks: this.hooks }
+    }
     yield {
       type: 'session_started',
       ...eventBase(options.sessionId),
@@ -99,25 +104,16 @@ export class LocalCodingRuntime implements NexusRuntime {
       budget: options.budget,
     }
 
-    const executionStartMs = performance.now()
-    let toolCallCount = 0
-    let totalToolDurationMs = 0
+    const metrics = createRuntimeExecutionMetrics()
 
     for await (const event of this._executeInner(options, (duration) => {
-      toolCallCount += 1
-      totalToolDurationMs += duration
+      metrics.toolCallCount += 1
+      metrics.toolRoundtripDurationMs += duration
     })) {
       yield event
     }
 
-    yield {
-      type: 'execution_metrics',
-      ...eventBase(options.sessionId),
-      requestId: options.requestId,
-      executeDurationMs: performance.now() - executionStartMs,
-      toolCallCount,
-      toolRoundtripDurationMs: totalToolDurationMs,
-    }
+    yield buildRuntimeExecutionMetricsEvent(options, metrics, { provider: false, context: false })
   }
 
   private async *_executeInner(
@@ -125,7 +121,7 @@ export class LocalCodingRuntime implements NexusRuntime {
     recordToolRun: (duration: number) => void,
   ): AsyncIterable<NexusEvent> {
     try {
-      const intent = parseIntent(options.prompt)
+      const intent = parseLocalRuntimeIntent(options.prompt)
       if (intent.kind === 'text') {
         yield {
           type: 'assistant_delta',
@@ -238,6 +234,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           role: options.role,
           signal: options.signal,
         },
+        { config: options.hooks },
       )
       for (const hookEvent of preToolHooks.events) yield hookEvent
       const hookDenyReason = firstHookDenyReason(preToolHooks)
@@ -296,6 +293,7 @@ export class LocalCodingRuntime implements NexusRuntime {
             input: toolInput,
             risk: tool.risk,
             message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+            source: tool.source,
           }
 
           const permissionHooks = await executeRuntimeHooks(
@@ -312,6 +310,7 @@ export class LocalCodingRuntime implements NexusRuntime {
               role: options.role,
               signal: options.signal,
             },
+            { config: options.hooks },
           )
           for (const hookEvent of permissionHooks.events) yield hookEvent
 
@@ -409,6 +408,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           role: options.role,
           signal: options.signal,
         },
+        { config: options.hooks },
       )
       for (const hookEvent of postToolHooks.events) yield hookEvent
 
@@ -551,7 +551,7 @@ export class LocalCodingRuntime implements NexusRuntime {
       return
     }
 
-    const toolInput = { path: intent.path }
+    const toolInput = tool.inputSchema.parse({ path: intent.path, mode: 'full' })
     const toolUseId = createId('tool')
     yield {
       type: 'tool_started',
@@ -646,113 +646,8 @@ function normalizeToolName(name: string): string {
   return name.trim().toLowerCase()
 }
 
-function parseIntent(prompt: string): ParsedIntent {
-  const trimmed = prompt.trim()
-  const [verb = '', ...rest] = splitCommand(trimmed)
-  const arg = rest.join(' ')
-
-  if (verb.includes(':') && arg) {
-    try {
-      return {
-        kind: 'tool',
-        toolName: verb,
-        input: JSON.parse(arg),
-      }
-    } catch {
-      return {
-        kind: 'tool',
-        toolName: verb,
-        input: {},
-      }
-    }
-  }
-
-  if (verb === 'read' && arg) {
-    return { kind: 'tool', toolName: 'Read', input: { path: arg } }
-  }
-  if (verb === 'write' && rest.length >= 2) {
-    const [path, ...content] = rest
-    return {
-      kind: 'tool',
-      toolName: 'Write',
-      input: { path, content: content.join(' ') },
-    }
-  }
-  if (verb === 'edit' && rest.length >= 3) {
-    const [path, oldString, ...newString] = rest
-    return {
-      kind: 'tool',
-      toolName: 'Edit',
-      input: { path, oldString, newString: newString.join(' ') },
-    }
-  }
-  if (verb === 'grep' && arg) {
-    return { kind: 'tool', toolName: 'Grep', input: { pattern: arg } }
-  }
-  if (verb === 'glob' && arg) {
-    return { kind: 'tool', toolName: 'Glob', input: { pattern: arg } }
-  }
-  if (verb === 'bash' && arg) {
-    return { kind: 'tool', toolName: 'Bash', input: { command: arg } }
-  }
-  if (verb === 'task' && rest[0] === 'status') {
-    return { kind: 'task_status' }
-  }
-  if (verb === 'task' && rest[0] === 'update' && rest.length >= 3) {
-    const [, selector, status, ...resultParts] = rest
-    if (isSupportedTaskUpdateStatus(status)) {
-      return {
-        kind: 'task_update',
-        selector,
-        status,
-        result: resultParts.length > 0 ? resultParts.join(' ') : undefined,
-      }
-    }
-  }
-  if (verb === 'task' && arg) {
-    return { kind: 'tool', toolName: 'TaskCreate', input: { title: arg } }
-  }
-
-  const fileQuestionPath = extractFileQuestionPath(trimmed)
-  if (fileQuestionPath) {
-    return { kind: 'file_question', path: fileQuestionPath, question: trimmed }
-  }
-
-  return {
-    kind: 'text',
-    text:
-      `BabeL-O local runtime is active. I can already run explicit coding tools: ` +
-      '`read <file>`, `write <file> <text>`, `edit <file> <old> <new>`, ' +
-      '`grep <pattern>`, `glob <pattern>`, `bash <command>`, `task <title>`. ' +
-      `You said: ${trimmed || '(empty prompt)'}`,
-  }
-}
-
-function isSupportedTaskUpdateStatus(status: string | undefined): status is 'pending' | 'in_progress' | 'completed' | 'failed' {
-  return status === 'pending' || status === 'in_progress' || status === 'completed' || status === 'failed'
-}
-
 function findTaskBySelector(tasks: NexusTask[], selector: string): NexusTask | undefined {
   return tasks.find(task => task.taskId === selector) ??
     tasks.find(task => task.taskId.endsWith(selector)) ??
     tasks.find(task => task.title === selector)
-}
-
-function extractFileQuestionPath(prompt: string): string | undefined {
-  if (!/(file|文件|read|读取|内容|content|about|关于|what|does|say)/i.test(prompt)) return undefined
-  const match = prompt.match(/(?:^|\s)([\w./-]+\.[A-Za-z0-9_]+)(?=$|\s|[，。！？,.!?])/)
-  return match?.[1]
-}
-
-function splitCommand(input: string): string[] {
-  const matches = input.match(/"[^"]*"|'[^']*'|\S+/g) ?? []
-  return matches.map(part => {
-    if (
-      (part.startsWith('"') && part.endsWith('"')) ||
-      (part.startsWith("'") && part.endsWith("'"))
-    ) {
-      return part.slice(1, -1)
-    }
-    return part
-  })
 }

@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import os
 import pty
 import re
 import select
 import signal
+import struct
 import subprocess
 import sys
 import termios
@@ -26,6 +28,8 @@ def screen_text(text: str) -> str:
     lines = ['']
     row = 0
     col = 0
+    saved_row = 0
+    saved_col = 0
     index = 0
     while index < len(text):
         char = text[index]
@@ -59,6 +63,14 @@ def screen_text(text: str) -> str:
                         lines.append('')
                     lines[row] = lines[row][:col]
                     del lines[row + 1:]
+                elif command == 's':
+                    saved_row = row
+                    saved_col = col
+                elif command == 'u':
+                    row = max(0, saved_row)
+                    while row >= len(lines):
+                        lines.append('')
+                    col = min(saved_col, len(lines[row]))
                 index += len(match.group(0))
                 continue
         if char == '\r':
@@ -131,6 +143,17 @@ def send(fd: int, text: str) -> None:
     os.write(fd, text.encode('utf-8'))
 
 
+def assert_single_slash_palette_preview(screen: str):
+    lines = screen.split('\n')
+    preview_lines = [line for line in lines if re.match(r'^> /[A-Za-z-]*$', line)]
+    if len(preview_lines) != 1:
+        return 'slash palette left stale preview rows while navigating'
+    separator_lines = [line for line in lines if re.fullmatch(r'─{10,}', line)]
+    if len(separator_lines) > 2:
+        return 'slash palette left stale border rows while navigating'
+    return None
+
+
 def prepare_programming_workspace(config_dir: str) -> str:
     workspace = os.path.join(config_dir, 'workspace')
     os.makedirs(os.path.join(workspace, 'src'), exist_ok=True)
@@ -152,6 +175,9 @@ def start_chat_process(command: list[str], workspace: str, env: dict[str, str]) 
     attrs = termios.tcgetattr(slave_fd)
     attrs[3] = attrs[3] | termios.ECHO
     termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
+    columns = int(env.get('COLUMNS', '100'))
+    rows = int(env.get('LINES', '30'))
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
 
     proc = subprocess.Popen(
         command,
@@ -197,13 +223,14 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
     workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session', 'coding-question-files', 'task-update-status') else repo
 
     env = os.environ.copy()
+    columns = '84' if sequence == 'slash-palette-narrow' else '100'
     env.update({
         'BABEL_O_CONFIG_FILE': config_file,
         'BABEL_O_LAUNCH_CWD': workspace,
         'HOME': config_dir,
         'NO_COLOR': '1',
         'TERM': 'xterm-256color',
-        'COLUMNS': '100',
+        'COLUMNS': columns,
         'LINES': '30',
     })
 
@@ -238,8 +265,173 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             send(master_fd, '/')
             if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not render\n'
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[B')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            palette_screen = screen_text(''.join(transcript))
+            residue = assert_single_slash_palette_preview(palette_screen)
+            if residue:
+                return 1, ''.join(transcript) + f'\n[pty-smoke] {residue}\n'
             send(master_fd, '\x1b')
             time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            send(master_fd, '\x7f')
+            time.sleep(0.05)
+            send(master_fd, '/exit\r')
+        elif sequence == 'slash-palette-narrow':
+            send(master_fd, '/')
+            if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] narrow slash palette did not render\n'
+            for _ in range(11):
+                send(master_fd, '\x1b[B')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            palette_screen = screen_text(''.join(transcript))
+            residue = assert_single_slash_palette_preview(palette_screen)
+            if residue:
+                return 1, ''.join(transcript) + f'\n[pty-smoke] narrow {residue}\n'
+            if '> /grep' not in palette_screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] narrow slash palette did not navigate to grep\n'
+            lines = palette_screen.split('\n')
+            up_index = next((index for index, line in enumerate(lines) if '↑' in line and 'more' in line), -1)
+            command_index = next((index for index, line in enumerate(lines) if re.match(r'^(?:> |  )/[A-Za-z-]+\s{2,}\S', line)), -1)
+            if up_index == -1 or command_index == -1 or up_index > command_index:
+                return 1, ''.join(transcript) + '\n[pty-smoke] narrow slash palette placed upward indicator below command rows\n'
+            send(master_fd, '\x1b')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            send(master_fd, '\x7f')
+            time.sleep(0.05)
+            send(master_fd, '/exit\r')
+        elif sequence == 'unique-input-keyboard-routing':
+            send(master_fd, '/')
+            if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not render for keyboard routing\n'
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[A')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            palette_screen = screen_text(''.join(transcript))
+            if palette_screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette rendered duplicate input shortcut rows\n'
+            send(master_fd, '\x1b')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            after_escape = screen_text(''.join(transcript))
+            if 'Navigate · tab' in after_escape or after_escape.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not close back to a single input box\n'
+            send(master_fd, '\x7f')
+            time.sleep(0.05)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+
+            send(master_fd, '/')
+            if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not reopen for tab routing\n'
+            send(master_fd, '\t')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            tab_screen = screen_text(''.join(transcript))
+            if tab_screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] tab selection rendered duplicate input shortcut rows\n'
+            send(master_fd, '\r')
+            if not wait_for(master_fd, 'AgentLoop sub-agent TUI smoke completed', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] tab-selected slash command did not execute once\n'
+            if visible_text(''.join(transcript)).count('AgentLoop sub-agent TUI smoke completed') != 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] tab-selected slash command executed more than once\n'
+
+            long_prompt = '当前用户生产的作品可能会在实际上线后发现批量化的问题，然后这些批量存在的问题需要统一回收进行再修改后才能上线；我这边考量的是依据实际项目设计一个分层机制，审核发现批量化的问题后说明原因并提交驳回。'
+            send(master_fd, long_prompt)
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            long_screen = screen_text(''.join(transcript))
+            if long_prompt[:20] not in long_screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] long input did not render in input box\n'
+            if long_screen.count('? for shortcuts') != 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] long input rendered duplicate shortcut rows\n'
+            send(master_fd, '\r')
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] long input did not submit cleanly\n'
+
+            send(master_fd, 'bash node -v\r')
+            if not wait_for(master_fd, 'approval', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] permission panel did not render in keyboard routing\n'
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[A')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            permission_screen = screen_text(''.join(transcript))
+            if permission_screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] permission panel rendered duplicate input shortcut rows\n'
+            send(master_fd, '\x7f')
+            if not wait_for(master_fd, 'Permission denied', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] permission backspace did not route to panel reject\n'
+            screen = screen_text(''.join(transcript))
+            if 'Bash(node -v)' not in screen or 'Permission denied' not in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] permission panel final state missing denied tool row\n'
+            if screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] keyboard routing final screen has duplicate input boxes\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'tool-model-overlay-routing':
+            send(master_fd, '/tool\r')
+            if not wait_for(master_fd, 'Read a file inside the workspace', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] tool palette did not render\n'
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[A')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            tool_screen = screen_text(''.join(transcript))
+            if tool_screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] tool palette rendered duplicate input shortcut rows\n'
+            send(master_fd, '\x1b')
+            time.sleep(0.2)
+            chunk = read_available(master_fd, 0.3)
+            if chunk:
+                transcript.append(chunk)
+            after_tool = screen_text(''.join(transcript))
+            if 'Read a file inside the workspace' in after_tool or after_tool.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] tool palette did not close back to a single input owner\n'
+
+            send(master_fd, '/model\r')
+            if not wait_for(master_fd, 'Select provider:', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] model wizard provider picker did not render\n'
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[A')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            model_screen = screen_text(''.join(transcript))
+            if model_screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] model wizard rendered duplicate input shortcut rows\n'
+            send(master_fd, '\x1b')
+            if not wait_for(master_fd, 'Wizard cancelled.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] model wizard escape did not cancel cleanly\n'
+            after_model = screen_text(''.join(transcript))
+            if 'Select provider:' in after_model or after_model.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] model wizard did not close back to a single input owner\n'
             send(master_fd, '/exit\r')
         elif sequence == 'permission-reject-escape':
             send(master_fd, 'bash node -v\r')
@@ -354,6 +546,22 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 if expected not in visible:
                     return 1, ''.join(transcript) + f'\n[pty-smoke] context panel missing {expected}\n'
             send(master_fd, '/exit\r')
+        elif sequence == 'agentloop-subagent-smoke':
+            send(master_fd, '/agentloop-smoke\r')
+            if not wait_for(master_fd, 'subagent started', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] sub-agent start event did not render\n'
+            if not wait_for(master_fd, 'AgentLoop sub-agent TUI smoke completed', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] AgentLoop smoke did not complete\n'
+            visible = visible_text(''.join(transcript))
+            for expected in ('task blocked', 'subtasks delegated', 'subagent completed', 'Parent blocked by delegated sub-agent', 'Child implementation via sub-agent', 'depth=1', 'parentTaskId=1', 'parent #1', 'transcript=nexus://sessions/'):
+                if expected not in visible:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] AgentLoop smoke missing {expected}\n'
+            screen = screen_text(''.join(transcript))
+            if 'Running sub-agent' in screen or 'Working...' in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] AgentLoop live running status leaked after completion\n'
+            if screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] AgentLoop smoke rendered multiple input shortcut rows\n'
+            send(master_fd, '/exit\r')
         elif sequence == 'live-waiting-status':
             send(master_fd, 'read package.json\r')
             if not wait_for(master_fd, 'Working...', timeout, transcript):
@@ -363,6 +571,28 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             visible = visible_text(''.join(transcript))
             if 'Generating...' not in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] generating status did not render\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'agent-running-terminal-states':
+            send(master_fd, 'bash node -v\r')
+            if not wait_for(master_fd, 'Waiting for permission...', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] permission waiting status did not render\n'
+            send(master_fd, '1')
+            if not wait_for(master_fd, 'Bash completed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] successful bash did not complete\n'
+            send(master_fd, 'bash node -e "process.exit(7)"\r')
+            if not wait_for(master_fd, 'approval', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] failing bash permission panel did not render\n'
+            send(master_fd, '1')
+            if not wait_for(master_fd, 'Bash failed.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] failing bash did not render failed terminal state\n'
+            screen = screen_text(''.join(transcript))
+            for leaked in ('Working...', 'Generating...', 'Running Bash...', 'Waiting for permission...'):
+                if leaked in screen:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] terminal agent status leaked after done/failed: {leaked}\n'
+            if 'Bash(node -v)' not in screen or 'Bash(node -e process.exit(7)) failed' not in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] done/failed tool rows missing from final screen\n'
+            if screen.count('? for shortcuts') > 1:
+                return 1, ''.join(transcript) + '\n[pty-smoke] terminal state smoke rendered duplicate input boxes\n'
             send(master_fd, '/exit\r')
         elif sequence == 'input-placeholder':
             send(master_fd, '\r')
@@ -377,6 +607,24 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 return 1, ''.join(transcript) + '\n[pty-smoke] placeholder tail remained after typing\n'
             if visible.count('BabeL-O local runtime is active.') != 1:
                 return 1, ''.join(transcript) + '\n[pty-smoke] blank enter submitted unexpectedly\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'shift-enter-multiline-input':
+            send(master_fd, '第一行业务场景\x1b[13;2u第二行风险分层')
+            time.sleep(0.1)
+            chunk = read_available(master_fd, 0.2)
+            if chunk:
+                transcript.append(chunk)
+            visible = visible_text(''.join(transcript))
+            if 'BabeL-O local runtime is active.' in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] shift-enter submitted unexpectedly\n'
+            if '第一行业务场景' not in visible or '第二行风险分层' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] shift-enter multiline prompt did not render\n'
+            send(master_fd, '\r')
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] shift-enter multiline prompt did not submit after enter\n'
+            visible = visible_text(''.join(transcript))
+            if '第一行业务场景' not in visible or '第二行风险分层' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] shift-enter multiline prompt was not preserved\n'
             send(master_fd, '/exit\r')
         elif sequence == 'multiline-paste-placeholder':
             send(master_fd, '\x1b[200~alpha\nbeta\ngamma\x1b[201~')

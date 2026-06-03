@@ -1,8 +1,10 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import type { ModelMessage, SystemPromptBlock } from '../providers/adapters/ModelAdapter.js'
-import { getModel } from '../providers/registry.js'
+import { resolveContextCeilingForModel } from './cacheAwareCompactPolicy.js'
 import { snipEventsWithTurnBoundary } from './compactors/snipCompactor.js'
+import { microcompactEventsWithMetrics, type MicrocompactMetrics } from './compactors/microCompact.js'
+export { microcompactEvents, microcompactEventsWithMetrics } from './compactors/microCompact.js'
 import { loadProjectMemory } from './memory.js'
 import { buildSystemPromptSections } from './systemPromptBuilder.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
@@ -10,7 +12,18 @@ import { loadAgentMdFiles } from './agentMdLoader.js'
 import { collectGitContext } from './gitContext.js'
 import { loadAllSkills } from '../skills/loader.js'
 import { matchSkills } from '../skills/matcher.js'
-import type { Skill } from '../skills/loader.js'
+import {
+  buildCompactCapabilityReminder,
+  derivePostCompactState,
+  formatPostCompactState,
+  type PostCompactState,
+} from './compactPostRestore.js'
+export {
+  buildCompactCapabilityReminder,
+  derivePostCompactState,
+  formatPostCompactState,
+  type PostCompactState,
+} from './compactPostRestore.js'
 import {
   deriveUserIntentGuidance,
   formatUserIntentGuidance,
@@ -66,6 +79,7 @@ export type AssembledContext = {
   userIntentGuidance: UserIntentGuidance
   memoryTruncated: boolean
   microcompactedEventCount: number
+  microcompactMetrics: MicrocompactMetrics
 }
 
 export type RetainedSegmentMetadata = {
@@ -111,24 +125,8 @@ export function truncateMemoryContent(raw: string): MemoryTruncation {
   }
 }
 
-export type PostCompactState = {
-  recentReadFiles: string[]
-  restoredFileContents: { path: string; content: string }[]
-  activeToolNames: string[]
-  activeSkills: string[]
-  taskStatusLines: string[]
-  hookLines: string[]
-}
-
 export function allocateBudget(modelId: string): ContextBudget {
-  let contextWindow = 8192
-  try {
-    contextWindow = getModel(modelId).contextWindow
-  } catch {
-    contextWindow = 8192
-  }
-
-  const maxTokens = Math.min(Math.floor(contextWindow * 0.8), 120_000)
+  const maxTokens = resolveContextCeilingForModel(modelId)
   const maxChars = maxTokens * 4
   const fixedBudget = 11_000
 
@@ -146,7 +144,7 @@ export function allocateBudget(modelId: string): ContextBudget {
     microcompactToolOutputChars: Math.max(500, Math.min(4_000, Math.floor(maxChars * 0.012))),
     microcompactInternalTextChars: Math.max(200, Math.min(1_000, Math.floor(maxChars * 0.004))),
     recentEventLimit: Math.max(20, Math.min(300, Math.floor(maxTokens / 400))),
-    recentTurnLimit: contextWindow >= 100_000 ? 4 : 2,
+    recentTurnLimit: maxTokens >= 100_000 ? 4 : 2,
   }
 }
 
@@ -185,7 +183,8 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     .filter(part => part.trim().length > 0)
     .join('\n')
     .trim()
-  const microcompactedEvents = microcompactEvents(selectedEvents, budget)
+  const microcompactResult = microcompactEventsWithMetrics(selectedEvents, budget)
+  const microcompactedEvents = microcompactResult.events
   const snippedEvents = snipEventsWithTurnBoundary(
     microcompactedEvents,
     budget.snipToolOutputChars,
@@ -275,13 +274,8 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     postCompactState,
     userIntentGuidance,
     memoryTruncated: memoryTruncation.wasLineTruncated || memoryTruncation.wasByteTruncated,
-    microcompactedEventCount: selectedEvents.filter((event, index) => {
-      const micro = microcompactedEvents[index]
-      if (!micro) return false
-      if (event.type !== 'tool_completed' && event.type !== 'tool_denied') return false
-      if (micro.type !== event.type) return false
-      return event !== micro
-    }).length,
+    microcompactedEventCount: microcompactResult.metrics.compactedEventCount,
+    microcompactMetrics: microcompactResult.metrics,
   }
 }
 
@@ -525,21 +519,6 @@ export function selectOmittedEvents(events: NexusEvent[], selected: NexusEvent[]
   return events.filter(e => !selectedIds.has(eventIdentity(e)))
 }
 
-export function microcompactEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
-  return events.map(event => {
-    if (event.type !== 'tool_completed') return event
-    const output = typeof event.output === 'string' ? event.output : JSON.stringify(event.output)
-    if (output.length <= budget.microcompactToolOutputChars) return event
-    const headLen = Math.floor(budget.microcompactToolOutputChars * 0.6)
-    const tailLen = budget.microcompactToolOutputChars - headLen
-    return {
-      ...event,
-      output: `${output.slice(0, headLen)}\n\n[microcompacted ${event.name} output (${output.length} chars)]\n\n${output.slice(-tailLen)}`,
-      truncated: true,
-      _originalOutputLength: output.length,
-    } as NexusEvent
-  })
-}
 
 function enforceDynamicLayerBudgets(options: {
   projectMemory: string
@@ -558,114 +537,4 @@ function enforceDynamicLayerBudgets(options: {
 function truncateToBudget(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text
   return text.slice(0, maxChars)
-}
-
-export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skill[]): PostCompactState {
-  const recentReadFiles: string[] = []
-  const restoredFileContents: { path: string; content: string }[] = []
-  const seenFiles = new Set<string>()
-  const activeToolNames: string[] = []
-  const seenTools = new Set<string>()
-  const taskStatusLines: string[] = []
-  const hookLines: string[] = []
-
-  for (let idx = events.length - 1; idx >= 0; idx--) {
-    const event = events[idx]
-    if (event.type === 'tool_completed' && event.success) {
-      const name = event.name
-      if (name && !seenTools.has(name)) {
-        seenTools.add(name)
-        activeToolNames.unshift(name)
-      }
-      if (name === 'Read' && restoredFileContents.length < 5) {
-        const output = (event as { output?: unknown }).output
-        if (typeof output === 'string' && output.length > 0 && output.length <= 5000) {
-          const toolUseId = (event as { toolUseId?: string }).toolUseId
-          const startedEvent = events.find(e => e.type === 'tool_started' && (e as { toolUseId?: string }).toolUseId === toolUseId) as { input?: { path?: string } } | undefined
-          const path = startedEvent?.input?.path
-          if (path && !seenFiles.has(path)) {
-            restoredFileContents.unshift({ path, content: output })
-          }
-        }
-      }
-    }
-    if (event.type === 'tool_started') {
-      const name = event.name
-      if (name === 'Read' || name === 'Write' || name === 'Edit') {
-        const input = (event as { input?: Record<string, unknown> }).input
-        const path = (event as { path?: string }).path
-          || (event as { filePath?: string }).filePath
-          || (input && typeof input.path === 'string' ? input.path : undefined)
-        if (path && !seenFiles.has(path)) {
-          seenFiles.add(path)
-          recentReadFiles.unshift(path)
-        }
-      }
-    }
-    if (event.type === 'task_created') {
-      const taskEvent = event as { taskId?: string; title?: string }
-      if (taskEvent.title) {
-        taskStatusLines.unshift(`- [created] ${taskEvent.title}`)
-      }
-    }
-    if (event.type === 'task_session_event') {
-      const taskEvent = event as { phase?: string; eventType?: string; eventId?: string }
-      if (taskEvent.phase || taskEvent.eventType) {
-        taskStatusLines.unshift(`- [${taskEvent.eventType ?? 'task'}] ${taskEvent.phase ?? taskEvent.eventId ?? ''}`)
-      }
-    }
-    if (event.type === 'hook_completed') {
-      const hookEvent = event as { hookName?: string; hookEvent?: string }
-      hookLines.unshift(`- ${hookEvent.hookName ?? 'hook'} (${hookEvent.hookEvent ?? 'unknown'})`)
-    }
-  }
-
-  return {
-    recentReadFiles: recentReadFiles.slice(0, 10),
-    restoredFileContents,
-    activeToolNames: activeToolNames.slice(0, 10),
-    activeSkills: matchedSkills.map(s => s.id),
-    taskStatusLines: taskStatusLines.slice(0, 10),
-    hookLines: hookLines.slice(0, 5),
-  }
-}
-
-function formatPostCompactState(state: PostCompactState): string {
-  const parts: string[] = []
-  if (state.recentReadFiles.length > 0) {
-    parts.push(`Recently accessed files: ${state.recentReadFiles.join(', ')}`)
-  }
-  if (state.activeToolNames.length > 0) {
-    parts.push(`Active tools: ${state.activeToolNames.join(', ')}`)
-  }
-  if (state.activeSkills.length > 0) {
-    parts.push(`Active skills: ${state.activeSkills.join(', ')}`)
-  }
-  if (state.taskStatusLines.length > 0) {
-    parts.push(`Task status:\n${state.taskStatusLines.join('\n')}`)
-  }
-  if (state.hookLines.length > 0) {
-    parts.push(`Hook activity:\n${state.hookLines.join('\n')}`)
-  }
-  if (state.restoredFileContents.length > 0) {
-    const fileBlocks = state.restoredFileContents.map(f => `### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``).join('\n\n')
-    parts.push(`## Restored File Contents (from pre-compact reads)\n${fileBlocks}`)
-  }
-  return parts.length > 0 ? `## Post-Compact State\n${parts.join('\n')}` : ''
-}
-
-function buildCompactCapabilityReminder(state: PostCompactState): string {
-  const lines: string[] = []
-  lines.push('## Compact Capability Reminder')
-  lines.push('The conversation above has been compacted. The summary above captures the key context.')
-  if (state.restoredFileContents.length > 0) {
-    lines.push(`File contents restored above for ${state.restoredFileContents.length} file(s). Only re-read if you need to verify changes since then.`)
-  } else if (state.recentReadFiles.length > 0) {
-    lines.push(`Previously read files: ${state.recentReadFiles.join(', ')}. Contents were too large to restore — re-read only the specific sections you need.`)
-  }
-  if (state.taskStatusLines.length > 0) {
-    lines.push('The task list above shows current progress. Continue working on incomplete items.')
-  }
-  lines.push('Important: tool_use and tool_result pairs must remain matched — do not generate one without the other.')
-  return lines.join(' ')
 }

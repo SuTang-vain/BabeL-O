@@ -178,6 +178,7 @@ export function flushStorageBridgeWalForTest(): void {
 }
 
 export function resetStorageBridgeForTest(): void {
+  nexusStorage = null
   if (scheduled) {
     clearTimeout(scheduled)
     scheduled = null

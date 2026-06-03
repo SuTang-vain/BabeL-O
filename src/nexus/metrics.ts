@@ -70,6 +70,16 @@ export class NexusMetrics {
   private toolRoundtripTotalMs = 0
   private contextCharsInTotal = 0
   private contextCharsOutTotal = 0
+  private inputTokenTotalCount = 0
+  private outputTokenTotalCount = 0
+  private cacheCreationInputTokenTotalCount = 0
+  private cacheReadInputTokenTotalCount = 0
+  private latestEffectiveContextCeiling?: number
+  private latestLegacyContextCeiling?: number
+  private cachePreservationModeCount = 0
+  private longContextUtilizationModeCount = 0
+  private compactSummaryLatencyTotalMs = 0
+  private compactSummaryLatencyCount = 0
 
   recordProviderFirstToken(ms: number): void {
     this.providerFirstTokenTotalMs += ms
@@ -93,6 +103,35 @@ export class NexusMetrics {
   recordContextChars(charsIn: number, charsOut: number): void {
     this.contextCharsInTotal += charsIn
     this.contextCharsOutTotal += charsOut
+  }
+
+  recordTokenUsage(options: {
+    inputTokens?: number
+    outputTokens?: number
+    cacheCreationInputTokens?: number
+    cacheReadInputTokens?: number
+  }): void {
+    this.inputTokenTotalCount += options.inputTokens ?? 0
+    this.outputTokenTotalCount += options.outputTokens ?? 0
+    this.cacheCreationInputTokenTotalCount += options.cacheCreationInputTokens ?? 0
+    this.cacheReadInputTokenTotalCount += options.cacheReadInputTokens ?? 0
+  }
+
+  recordContextPolicy(options: {
+    effectiveContextCeiling?: number
+    legacyContextCeiling?: number
+    cachePreservationMode?: boolean
+    longContextUtilizationMode?: boolean
+  }): void {
+    if (options.effectiveContextCeiling !== undefined) this.latestEffectiveContextCeiling = options.effectiveContextCeiling
+    if (options.legacyContextCeiling !== undefined) this.latestLegacyContextCeiling = options.legacyContextCeiling
+    if (options.cachePreservationMode) this.cachePreservationModeCount += 1
+    if (options.longContextUtilizationMode) this.longContextUtilizationModeCount += 1
+  }
+
+  recordCompactSummaryLatency(ms: number): void {
+    this.compactSummaryLatencyTotalMs += ms
+    this.compactSummaryLatencyCount += 1
   }
 
   now(): number {
@@ -202,11 +241,43 @@ export class NexusMetrics {
       },
       contextCharsIn: this.contextCharsInTotal,
       contextCharsOut: this.contextCharsOutTotal,
+      tokenUsage: {
+        inputTokens: this.inputTokenTotalCount,
+        outputTokens: this.outputTokenTotalCount,
+        cacheCreationInputTokens: this.cacheCreationInputTokenTotalCount,
+        cacheReadInputTokens: this.cacheReadInputTokenTotalCount,
+        cacheReadRatio: cacheReadRatio({
+          inputTokens: this.inputTokenTotalCount,
+          cacheCreationInputTokens: this.cacheCreationInputTokenTotalCount,
+          cacheReadInputTokens: this.cacheReadInputTokenTotalCount,
+        }),
+      },
+      contextPolicy: {
+        effectiveContextCeiling: this.latestEffectiveContextCeiling,
+        legacyContextCeiling: this.latestLegacyContextCeiling,
+        cachePreservationModeCount: this.cachePreservationModeCount,
+        longContextUtilizationModeCount: this.longContextUtilizationModeCount,
+      },
+      compactSummaryLatencyMs: {
+        totalMs: round(this.compactSummaryLatencyTotalMs),
+        count: this.compactSummaryLatencyCount,
+        avgMs: this.compactSummaryLatencyCount > 0 ? round(this.compactSummaryLatencyTotalMs / this.compactSummaryLatencyCount) : 0,
+      },
       routes: [...this.routes.values()]
         .map(withAverage)
         .sort((left, right) => left.route.localeCompare(right.route)),
     }
   }
+}
+
+function cacheReadRatio(options: {
+  inputTokens: number
+  cacheCreationInputTokens: number
+  cacheReadInputTokens: number
+}): number {
+  const denominator = options.inputTokens + options.cacheCreationInputTokens + options.cacheReadInputTokens
+  if (denominator <= 0) return 0
+  return round(options.cacheReadInputTokens / denominator)
 }
 
 function withAverage<T extends { count: number; totalMs: number }>(metric: T) {

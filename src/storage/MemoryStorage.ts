@@ -14,6 +14,7 @@ import type {
   PermissionAudit,
   ExecutionMetrics,
 } from './Storage.js'
+import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 
 export class MemoryStorage implements NexusStorage {
   private readonly sessions = new Map<string, SessionSnapshot>()
@@ -112,6 +113,11 @@ export class MemoryStorage implements NexusStorage {
         existing.durationMs =
           new Date(event.timestamp).getTime() - new Date(existing.startedAt).getTime()
       }
+    }
+
+    const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
+    if (embeddedMetrics) {
+      await this.saveExecutionMetrics(embeddedMetrics)
     }
   }
 

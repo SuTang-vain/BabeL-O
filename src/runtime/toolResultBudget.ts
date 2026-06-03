@@ -3,6 +3,7 @@ import { join } from 'node:path'
 
 const PERSIST_THRESHOLD = parseInt(process.env.BABEL_O_TOOL_RESULT_THRESHOLD ?? '50000', 10)
 const MESSAGE_BUDGET = parseInt(process.env.BABEL_O_TOOL_RESULT_MESSAGE_BUDGET ?? '200000', 10)
+const READ_MESSAGE_BUDGET_RATIO = parseFloat(process.env.BABEL_O_READ_MESSAGE_BUDGET_RATIO ?? '0.12')
 const PREVIEW_CHARS = parseInt(process.env.BABEL_O_TOOL_RESULT_PREVIEW_CHARS ?? '2000', 10)
 
 export type ToolResultReplacementState = {
@@ -52,16 +53,67 @@ export async function replaceLargeToolResult(options: {
   return buildPersistedMessage(options.content.length, persisted.preview, persisted.filepath)
 }
 
-type ContentBlock = { type: string; toolUseId?: string; content?: string; [key: string]: unknown }
+type ContentBlock = { type: string; toolUseId?: string; content?: string; toolName?: string; [key: string]: unknown }
+
+type EnforceMessageBudgetOptions = {
+  budget?: number
+  contextMaxTokens?: number
+  readBudgetChars?: number
+}
+
+type ToolResultCandidate = { idx: number; size: number; id: string; toolName?: string }
+
+function resolveBudgetOptions(budgetOrOptions?: number | EnforceMessageBudgetOptions): Required<EnforceMessageBudgetOptions> {
+  if (typeof budgetOrOptions === 'number') {
+    return {
+      budget: budgetOrOptions,
+      contextMaxTokens: 0,
+      readBudgetChars: Math.max(1, Math.floor(budgetOrOptions * READ_MESSAGE_BUDGET_RATIO)),
+    }
+  }
+  const budget = budgetOrOptions?.budget ?? MESSAGE_BUDGET
+  const contextBudget = budgetOrOptions?.contextMaxTokens
+    ? Math.max(1, Math.floor(budgetOrOptions.contextMaxTokens * 4 * READ_MESSAGE_BUDGET_RATIO))
+    : 0
+  return {
+    budget,
+    contextMaxTokens: budgetOrOptions?.contextMaxTokens ?? 0,
+    readBudgetChars: budgetOrOptions?.readBudgetChars ?? (contextBudget || Math.max(1, Math.floor(budget * READ_MESSAGE_BUDGET_RATIO))),
+  }
+}
+
+async function replaceCandidatesUntilWithinBudget(options: {
+  candidates: ToolResultCandidate[]
+  blocks: ContentBlock[]
+  excess: number
+  state: ToolResultReplacementState
+  sessionId: string
+  cwd: string
+}) {
+  const candidates = [...options.candidates].sort((a, b) => b.size - a.size)
+  let excess = options.excess
+  for (const candidate of candidates) {
+    if (excess <= 0) break
+    const block = options.blocks[candidate.idx]
+    const content = block.content as string
+    const persisted = await persistToolResult(content, candidate.id, options.sessionId, options.cwd)
+    if (persisted) {
+      const replacement = buildPersistedMessage(content.length, persisted.preview, persisted.filepath)
+      options.blocks[candidate.idx] = { ...block, content: replacement }
+      options.state.replacements.set(candidate.id, replacement)
+      excess -= (content.length - replacement.length)
+    }
+  }
+}
 
 export async function enforceMessageBudget<T extends { role: string; content: string | ContentBlock[] }>(
   messages: T[],
   state: ToolResultReplacementState,
   sessionId: string,
   cwd: string,
-  budget?: number,
+  budgetOrOptions?: number | EnforceMessageBudgetOptions,
 ): Promise<T[]> {
-  const maxChars = budget ?? MESSAGE_BUDGET
+  const budgets = resolveBudgetOptions(budgetOrOptions)
   const result: T[] = []
 
   for (const msg of messages) {
@@ -71,7 +123,9 @@ export async function enforceMessageBudget<T extends { role: string; content: st
     }
 
     let totalChars = 0
-    const freshCandidates: { idx: number; size: number; id: string }[] = []
+    let readChars = 0
+    const freshCandidates: ToolResultCandidate[] = []
+    const readCandidates: ToolResultCandidate[] = []
     const blocks = [...msg.content]
 
     for (let i = 0; i < blocks.length; i++) {
@@ -87,25 +141,35 @@ export async function enforceMessageBudget<T extends { role: string; content: st
         }
         continue
       }
-      totalChars += block.content.length
-      freshCandidates.push({ idx: i, size: block.content.length, id })
+      const candidate = { idx: i, size: block.content.length, id, toolName: block.toolName }
+      totalChars += candidate.size
+      freshCandidates.push(candidate)
+      if (candidate.toolName === 'Read') {
+        readChars += candidate.size
+        readCandidates.push(candidate)
+      }
     }
 
-    if (totalChars > maxChars && freshCandidates.length > 0) {
-      freshCandidates.sort((a, b) => b.size - a.size)
-      let excess = totalChars - maxChars
-      for (const candidate of freshCandidates) {
-        if (excess <= 0) break
-        const block = blocks[candidate.idx]
-        const content = block.content as string
-        const persisted = await persistToolResult(content, candidate.id, sessionId, cwd)
-        if (persisted) {
-          const replacement = buildPersistedMessage(content.length, persisted.preview, persisted.filepath)
-          blocks[candidate.idx] = { ...block, content: replacement }
-          state.replacements.set(candidate.id, replacement)
-          excess -= (content.length - replacement.length)
-        }
-      }
+    if (readChars > budgets.readBudgetChars && readCandidates.length > 0) {
+      await replaceCandidatesUntilWithinBudget({
+        candidates: readCandidates,
+        blocks,
+        excess: readChars - budgets.readBudgetChars,
+        state,
+        sessionId,
+        cwd,
+      })
+    }
+
+    if (totalChars > budgets.budget && freshCandidates.length > 0) {
+      await replaceCandidatesUntilWithinBudget({
+        candidates: freshCandidates.filter(candidate => !state.replacements.has(candidate.id)),
+        blocks,
+        excess: totalChars - budgets.budget,
+        state,
+        sessionId,
+        cwd,
+      })
     }
 
     for (const candidate of freshCandidates) {

@@ -68,7 +68,7 @@ export async function createDefaultNexusRuntime(
 
   const runtime =
     settings.providerId === 'local'
-      ? new LocalCodingRuntime(tools, policy, storage)
+      ? new LocalCodingRuntime(tools, policy, storage, configManager.load().hooks)
       : new LLMCodingRuntime(tools, policy, storage, configManager)
 
   return { runtime, storage, tools }

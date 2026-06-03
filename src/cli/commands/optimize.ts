@@ -4,6 +4,7 @@ import { renderEvent } from '../renderEvents.js'
 import { createId } from '../../shared/id.js'
 import { questionAsync } from '../ui.js'
 import type { CliReadline } from '../ui.js'
+import { ConfigManager } from '../../shared/config.js'
 import type { PlannerAgentResult, PlannerReviewDecision, PlannerTaskPlan } from '../../nexus/agentLoop.js'
 
 export type OptimizeCommandOptions = {
@@ -167,6 +168,7 @@ export function registerOptimizeCommand(program: Command): void {
             reviewPlan: options.autoApprove || options.yes
               ? undefined
               : plan => askPlannerReview(rl, plan),
+            hooks: ConfigManager.getInstance().load().hooks,
           })
         } finally {
           rl.close()
@@ -287,6 +289,7 @@ export function formatAgentLoopSmokeResult(result: any): string {
     roleDiagnostics.length > 0 ? `Role diagnostics:${roleDiagnostics.map(formatRoleDiagnostic).join(' |')}` : undefined,
     result.error ? `Error:           ${result.error.message}` : undefined,
     result.error?.category ? `Failure type:    ${result.error.category}` : undefined,
+    result.diagnostic ? `Diagnostic:      ${result.diagnostic.status ?? 'unknown'} · ${result.diagnostic.summary ?? ''}` : undefined,
     `Fallback:        ${fallbackPolicy.mode ?? 'unknown'} silentSwitch=${fallbackPolicy.allowSilentModelSwitch === false ? 'false' : 'unknown'}`,
     `Next action:     ${fallbackPolicy.nextAction ?? chalk.dim('none')}`,
   ].filter(Boolean).join('\n')

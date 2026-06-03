@@ -6,7 +6,7 @@ import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchema } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
-import type { SessionSnapshot } from '../shared/session.js'
+import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
@@ -266,7 +266,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.7',
+    version: '0.2.8',
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -275,7 +275,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.7',
+      version: '0.2.8',
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),
@@ -309,9 +309,11 @@ export async function createNexusApp(
       model: body.model,
       role: body.role,
     })
+    const recoveryKind = body.kind ?? 'unknown'
     return planProviderFallbackAction({
       provider,
-      policy: buildProviderFallbackPolicy(body.kind ?? 'unknown'),
+      recoveryKind,
+      policy: buildProviderFallbackPolicy(recoveryKind),
     })
   })
 
@@ -414,23 +416,28 @@ export async function createNexusApp(
     if (event.streamDeltaCount !== undefined) metrics.recordStreamDeltas(event.streamDeltaCount)
     if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
     if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
+    metrics.recordTokenUsage({
+      inputTokens: event.inputTokens,
+      outputTokens: event.outputTokens,
+      cacheCreationInputTokens: event.cacheCreationInputTokens,
+      cacheReadInputTokens: event.cacheReadInputTokens,
+    })
+    metrics.recordContextPolicy({
+      effectiveContextCeiling: event.effectiveContextCeiling,
+      legacyContextCeiling: event.legacyContextCeiling,
+      cachePreservationMode: event.cachePreservationMode,
+      longContextUtilizationMode: event.longContextUtilizationMode,
+    })
+    if (event.compactSummaryLatencyMs !== undefined) metrics.recordCompactSummaryLatency(event.compactSummaryLatencyMs)
   }
 
-  async function persistEventMetrics(sessionId: string, event: NexusEvent): Promise<void> {
-    if (event.type !== 'execution_metrics') return
-    await options.storage.saveExecutionMetrics({
-      metricId: createId('metric'),
-      sessionId,
-      executeDurationMs: event.executeDurationMs,
-      providerFirstTokenMs: event.providerFirstTokenMs,
-      providerRequestDurationMs: event.providerRequestDurationMs,
-      streamDeltaCount: event.streamDeltaCount,
-      toolCallCount: event.toolCallCount,
-      toolRoundtripDurationMs: event.toolRoundtripDurationMs,
-      contextCharsIn: event.contextCharsIn,
-      contextCharsOut: event.contextCharsOut,
-      timestamp: event.timestamp,
-    })
+  function runtimeResultStatusCode(
+    events: NexusEvent[],
+    errorEvent: NexusEvent | undefined,
+  ): number {
+    if (events.some(event => event.type === 'context_blocking')) return 413
+    if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT') return 408
+    return 200
   }
 
   app.post('/v1/execute', async (request, reply) => {
@@ -482,7 +489,6 @@ export async function createNexusApp(
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
-          await persistEventMetrics(sessionId, event)
           recordEventMetrics(event)
         }
       } finally {
@@ -491,23 +497,18 @@ export async function createNexusApp(
 
       const resultEvent = events.findLast(event => event.type === 'result')
       const errorEvent = events.findLast(event => event.type === 'error')
+      const statusCode = runtimeResultStatusCode(events, errorEvent)
       const timedOut = abortController.signal.aborted
       const timeoutEvent =
         errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT'
       const succeeded =
         !timedOut && !errorEvent && resultEvent?.type === 'result' && resultEvent.success
-      const finalSession = await options.storage.getSession(sessionId, {
-        includeEvents: false,
+      await finalizeExecutionSession(options.storage, sessionId, {
+        succeeded,
+        resultEvent,
+        errorEvent,
+        contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
       })
-      if (finalSession) {
-        if (finalSession.phase !== 'cancelled') {
-          finalSession.phase = succeeded ? 'completed' : 'failed'
-        }
-        finalSession.updatedAt = nowIso()
-        if (resultEvent?.type === 'result') finalSession.result = resultEvent.message
-        if (errorEvent?.type === 'error') finalSession.error = errorEvent.message
-        await options.storage.saveSession(finalSession)
-      }
       metrics.recordExecuteFinish({
         success: succeeded,
         timedOut: timedOut || timeoutEvent,
@@ -518,8 +519,10 @@ export async function createNexusApp(
         type: 'execute_result',
         sessionId,
         success: succeeded,
+        statusCode,
         durationMs: round(metrics.now() - startedAtMs),
         result: resultEvent ?? null,
+        error: errorEvent ?? null,
         events,
       }
     } finally {
@@ -971,6 +974,7 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       phase: 'cancelled',
       reason: body.reason ?? 'Session cancelled',
+      hooks: ConfigManager.getInstance().load().hooks,
     })
     if (!session) {
       return reply.code(404).send({
@@ -1002,6 +1006,7 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       phase: body.phase,
       reason: body.reason,
+      hooks: ConfigManager.getInstance().load().hooks,
     })
     if (!session) {
       return reply.code(404).send({
@@ -1318,6 +1323,7 @@ export async function createNexusApp(
         startedAt: nowIso(),
       })
       const timeout = prepared.timeout
+      const events: NexusEvent[] = []
 
       try {
         for await (const event of options.runtime.executeStream({
@@ -1335,8 +1341,8 @@ export async function createNexusApp(
           executionEnvironment: body.executionEnvironment,
           allowedPaths: prepared.allowedPaths,
         })) {
+          events.push(event)
           await options.storage.appendEvent(sessionId, event)
-          await persistEventMetrics(sessionId, event)
           recordEventMetrics(event)
           if (socket.readyState !== socket.OPEN) {
             abortController.abort()
@@ -1353,6 +1359,14 @@ export async function createNexusApp(
         clearTimeout(timeout)
       }
       timedOut = timedOut || abortController.signal.aborted
+      const resultEvent = events.findLast(event => event.type === 'result')
+      const errorEvent = events.findLast(event => event.type === 'error')
+      await finalizeExecutionSession(options.storage, sessionId, {
+        succeeded: success,
+        resultEvent,
+        errorEvent,
+        contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
+      })
       } finally {
         socket.off('close', markClosed)
         if (abortController) {
@@ -1389,6 +1403,115 @@ function sendJson(socket: WebSocketLike, value: unknown): void {
   if (socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(value))
   }
+}
+
+type ExecutionFinalizationOptions = {
+  succeeded: boolean
+  resultEvent?: NexusEvent
+  errorEvent?: NexusEvent
+  contextBlockingEvent?: NexusEvent
+}
+
+async function finalizeExecutionSession(
+  storage: NexusStorage,
+  sessionId: string,
+  finalization: ExecutionFinalizationOptions,
+): Promise<void> {
+  const session = await storage.getSession(sessionId, { includeEvents: false })
+  if (!session) return
+
+  if (session.phase !== 'cancelled') {
+    session.phase = finalization.succeeded ? 'completed' : 'failed'
+  }
+  session.updatedAt = nowIso()
+
+  if (finalization.resultEvent?.type === 'result') {
+    session.result = finalization.resultEvent.message
+  }
+
+  if (finalization.succeeded) {
+    session.error = undefined
+    session.failureReason = undefined
+    session.terminalReason = undefined
+    session.metadata = withRuntimeRecoveryMetadata(session.metadata)
+  } else if (finalization.errorEvent?.type === 'error') {
+    session.error = finalization.errorEvent.message
+    session.failureReason = finalization.errorEvent.message
+    session.terminalReason = runtimeTerminalReason(finalization.errorEvent)
+    session.metadata = withRuntimeRecoveryMetadata(
+      session.metadata,
+      runtimeRecoveryMetadata(finalization.errorEvent, finalization.contextBlockingEvent),
+    )
+  } else {
+    session.metadata = withRuntimeRecoveryMetadata(session.metadata)
+  }
+
+  await storage.saveSession(session)
+}
+
+function runtimeTerminalReason(event: Extract<NexusEvent, { type: 'error' }>): TaskSessionTerminalReason {
+  return {
+    category: runtimeTerminalCategoryForCode(event.code),
+    code: event.code,
+    message: event.message,
+  }
+}
+
+function runtimeTerminalCategoryForCode(code: string): TaskSessionTerminalReason['category'] {
+  if (code === 'REQUEST_TIMEOUT') return 'timeout'
+  if (code === 'REQUEST_CANCELLED') return 'cancelled'
+  if (code.startsWith('PROVIDER_')) return 'provider'
+  if (code === 'CONTEXT_LIMIT_EXCEEDED' || code.startsWith('RUNTIME_') || code === 'NEXUS_RUNTIME_ERROR') return 'runtime'
+  return 'error'
+}
+
+function runtimeRecoveryMetadata(
+  errorEvent: Extract<NexusEvent, { type: 'error' }>,
+  contextBlockingEvent?: NexusEvent,
+): Record<string, unknown> | undefined {
+  if (errorEvent.code !== 'CONTEXT_LIMIT_EXCEEDED') return undefined
+  const details = asRecord(errorEvent.details)
+  const blocking = contextBlockingEvent?.type === 'context_blocking' ? contextBlockingEvent : undefined
+  return {
+    kind: typeof details?.kind === 'string' ? details.kind : 'context_window',
+    code: errorEvent.code,
+    retryable: typeof details?.retryable === 'boolean' ? details.retryable : true,
+    recoveryReason: typeof details?.recoveryReason === 'string' ? details.recoveryReason : 'CONTEXT_BLOCKING_LIMIT',
+    httpStatus: numberValue(details?.httpStatus) ?? blocking?.httpStatus ?? 413,
+    tokenEstimate: blocking?.tokenEstimate ?? numberValue(details?.tokenEstimate),
+    maxTokens: blocking?.maxTokens ?? numberValue(details?.maxTokens),
+    blockingLimitTokens: blocking?.blockingLimitTokens ?? numberValue(details?.blockingLimitTokens),
+    recoveryActions: recoveryActionsValue(blocking?.recoveryActions ?? details?.recoveryActions),
+    suggestion: typeof details?.suggestion === 'string'
+      ? details.suggestion
+      : 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
+  }
+}
+
+function withRuntimeRecoveryMetadata(
+  metadata: Record<string, unknown> | undefined,
+  runtimeRecovery?: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const next = { ...(metadata ?? {}) }
+  delete next.runtimeRecovery
+  if (runtimeRecovery) next.runtimeRecovery = runtimeRecovery
+  return Object.keys(next).length > 0 ? next : undefined
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === 'number' ? value : undefined
+}
+
+function recoveryActionsValue(value: unknown): string[] {
+  const allowed = new Set(['compact', 'context', 'switch_model', 'reduce_tool_output'])
+  const actions = Array.isArray(value)
+    ? value.filter((action): action is string => typeof action === 'string' && allowed.has(action))
+    : []
+  return actions.length > 0 ? actions : ['compact', 'context', 'switch_model', 'reduce_tool_output']
 }
 
 type TaskMutationAudit = z.infer<typeof taskMutationAuditSchema>

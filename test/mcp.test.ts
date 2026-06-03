@@ -5,6 +5,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { createNexusApp } from '../src/nexus/app.js'
+import { PendingPermissionRegistry } from '../src/shared/session.js'
 
 test('MCP stdio tools are registered, audited, and gated by explicit allowlist', async () => {
   const cwd = join(tmpdir(), `babel-o-mcp-${Date.now()}`)
@@ -48,6 +49,9 @@ test('MCP stdio tools are registered, audited, and gated by explicit allowlist',
     })
     assert.equal(secretWrite.allowed, true)
     assert.equal(secretWrite.risk, 'write')
+    assert.equal(secretWrite.requiresApproval, true)
+    assert.equal(secretWrite.suggestedAllowRule, 'mcp:mock:secretWrite')
+    assert.equal(secretWrite.mcpServerAllowed, false)
 
     const response = await app.inject({
       method: 'POST',
@@ -63,6 +67,58 @@ test('MCP stdio tools are registered, audited, and gated by explicit allowlist',
     assert.match(JSON.stringify(body.events), /echo:hello/)
   } finally {
     await app.close()
+    await storage.close?.()
+  }
+})
+
+test('MCP write permission request carries server source identity', async () => {
+  const cwd = join(tmpdir(), `babel-o-mcp-permission-${Date.now()}`)
+  await mkdir(join(cwd, '.babel-o'), { recursive: true })
+  await writeFile(join(cwd, '.babel-o', 'mcp.json'), JSON.stringify({
+    servers: {
+      mock: {
+        command: process.execPath,
+        args: [join(process.cwd(), 'test/fixtures/mock-mcp-server.mjs')],
+        allowedTools: ['secretWrite'],
+        toolRisk: {
+          secretWrite: 'write',
+        },
+      },
+    },
+  }), 'utf8')
+
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    cwd,
+    enableMcp: true,
+    allowedTools: ['mcp:mock:secretWrite'],
+  })
+  const sessionId = `session-mcp-permission-${Date.now()}`
+  try {
+    const events = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      cwd,
+      prompt: 'mcp:mock:secretWrite {"path":"secrets.txt"}',
+      storage,
+    })) {
+      events.push(event)
+      if (event.type === 'permission_request') {
+        assert.equal(event.name, 'mcp:mock:secretWrite')
+        assert.equal(event.risk, 'write')
+        assert.deepEqual(event.source, {
+          type: 'mcp',
+          serverName: 'mock',
+          originalName: 'secretWrite',
+        })
+        PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+          approved: false,
+          reason: 'test rejection',
+        })
+      }
+    }
+    assert.ok(events.some(event => event.type === 'permission_request'))
+    assert.ok(events.some(event => event.type === 'permission_response' && event.approved === false))
+  } finally {
     await storage.close?.()
   }
 })

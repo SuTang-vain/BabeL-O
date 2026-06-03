@@ -21,7 +21,8 @@ import {
   isSessionPermissionCached,
   PermissionDecision,
   askPermission,
-  handleLocalPermissionRequest
+  handleLocalPermissionRequest,
+  encodeSessionPermissionRule
 } from './ui.js'
 
 interface CustomWebSocket {
@@ -98,7 +99,7 @@ export async function runSessionFlow(
               if (decision.approved && decision.scope === 'session' && data.name) {
                 const tools = sessionPermissionApprovals.get(data.sessionId) ?? new Set<string>()
                 if (decision.rule) {
-                  tools.add(`${data.name}:${decision.rule}`)
+                  tools.add(encodeSessionPermissionRule(data.name, decision.rule))
                 } else {
                   tools.add(data.name)
                 }
@@ -152,6 +153,8 @@ export async function runSessionFlow(
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath,
       allowedTools: ['*'],
+      cwd,
+      enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
     })
     const originalAppendEvent = storage.appendEvent.bind(storage)
 
@@ -199,17 +202,18 @@ export async function runSessionFlow(
       text: prompt,
     })
 
+    const configManager = ConfigManager.getInstance()
     const userPromptHooks = await executeRuntimeHooks(
       'UserPromptSubmit',
       { prompt },
       { sessionId, cwd: session.cwd },
+      { config: configManager.load().hooks },
     )
     for (const ev of userPromptHooks.events) {
       await storage.appendEvent(sessionId, ev)
     }
 
     try {
-      const configManager = ConfigManager.getInstance()
       const settings = configManager.resolveSettings()
       const requestId = createId('req')
       const budget = process.env.BABEL_O_THINKING_BUDGET

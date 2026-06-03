@@ -66,7 +66,7 @@ test('replaceLargeToolResult persists and replaces large content', async () => {
   await rm(cwd, { recursive: true, force: true })
 })
 
-test('replaceLargeToolResult skips Read tool', async () => {
+test('replaceLargeToolResult keeps a single Read result visible', async () => {
   const content = 'z'.repeat(60000)
   const result = await replaceLargeToolResult({
     content,
@@ -87,6 +87,34 @@ test('enforceMessageBudget leaves small messages unchanged', async () => {
   const result = await enforceMessageBudget(messages, state, 'sess', tmpdir(), 200000)
   assert.equal((result[0].content as any[])[0].content, 'short')
   assert.ok(state.seenIds.has('id-1'))
+})
+
+test('enforceMessageBudget applies aggregate Read budget', async () => {
+  const cwd = await makeTmpDir()
+  const state = createReplacementState()
+  const firstRead = 'r'.repeat(70000)
+  const secondRead = 's'.repeat(60000)
+  const messages = [
+    {
+      role: 'user' as const,
+      content: [
+        { type: 'tool_result', toolUseId: 'read-1', toolName: 'Read', content: firstRead },
+        { type: 'tool_result', toolUseId: 'read-2', toolName: 'Read', content: secondRead },
+      ],
+    },
+  ]
+
+  const result = await enforceMessageBudget(messages, state, 'sess-read-budget', cwd, {
+    budget: 200000,
+    readBudgetChars: 80000,
+  })
+  const blocks = result[0].content as any[]
+  assert.ok(blocks[0].content.includes('<persisted-output>'))
+  assert.equal(blocks[1].content, secondRead)
+  assert.ok(state.replacements.has('read-1'))
+  assert.ok(state.seenIds.has('read-1'))
+  assert.ok(state.seenIds.has('read-2'))
+  await rm(cwd, { recursive: true, force: true })
 })
 
 test('enforceMessageBudget replaces largest when over budget', async () => {

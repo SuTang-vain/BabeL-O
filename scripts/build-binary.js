@@ -46,14 +46,14 @@ async function getFallbackVersion(version) {
   try {
     const cleanVersion = version.startsWith('v') ? version : `v${version}`
     const major = cleanVersion.split('.')[0]
-    
+
     console.log(`Querying Node.js release index for fallback version in major line ${major}...`)
     const res = await fetch('https://nodejs.org/dist/index.json')
     if (!res.ok) {
       console.warn(`Failed to fetch Node.js release index: ${res.status}`)
       return null
     }
-    
+
     const list = await res.json()
     // Find the latest in the same major version
     const matches = list.filter(item => item.version.startsWith(major + '.'))
@@ -61,14 +61,14 @@ async function getFallbackVersion(version) {
       console.log(`Found matching version in index: ${matches[0].version}`)
       return matches[0].version
     }
-    
+
     // Fallback to latest LTS
     const ltsMatch = list.find(item => item.lts)
     if (ltsMatch) {
       console.log(`Using fallback LTS version: ${ltsMatch.version}`)
       return ltsMatch.version
     }
-    
+
     if (list.length > 0) {
       console.log(`Using fallback latest version: ${list[0].version}`)
       return list[0].version
@@ -83,13 +83,13 @@ async function downloadOfficialNode(version, platform, arch, versionDir) {
   const isWin = platform === 'win32'
   const ext = isWin ? '' : (platform === 'darwin' ? '.tar.gz' : '.tar.xz')
   const archiveName = isWin ? 'node.exe' : `node-${version}-${platform}-${arch}${ext}`
-  
+
   const url = isWin
     ? `https://nodejs.org/dist/${version}/win-${arch}/node.exe`
     : `https://nodejs.org/dist/${version}/${archiveName}`
 
   console.log(`Downloading official Node.js binary from ${url}...`)
-  
+
   const archivePath = join(versionDir, archiveName)
   const res = await fetch(url)
   if (!res.ok) {
@@ -103,12 +103,12 @@ async function downloadOfficialNode(version, platform, arch, versionDir) {
   if (!isWin) {
     console.log(`Extracting ${archiveName}...`)
     runCommand('tar', ['-xf', archivePath, '-C', versionDir])
-    
+
     const extractedBin = join(versionDir, `node-${version}-${platform}-${arch}`, 'bin', 'node')
     if (!existsSync(extractedBin)) {
       throw new Error(`Extraction succeeded but node executable not found at: ${extractedBin}`)
     }
-    
+
     chmodSync(extractedBin, 0o755)
     rmSync(archivePath, { force: true })
     return extractedBin
@@ -120,7 +120,7 @@ async function downloadOfficialNode(version, platform, arch, versionDir) {
 
 async function ensureSeaBaseBinary() {
   const currentBin = process.execPath
-  
+
   // 1. Check if the current node binary contains the sentinel
   if (hasSentinel(currentBin)) {
     console.log('Current Node.js binary contains the sentinel. Using it directly.')
@@ -129,11 +129,11 @@ async function ensureSeaBaseBinary() {
 
   console.log('\n--- Alert: Current Node.js binary is stripped / optimized (common with Homebrew) ---')
   console.log('A standard official Node.js binary is required to build the Single Executable Application.')
-  
+
   const version = process.version
   const platform = process.platform
   const arch = process.arch
-  
+
   const cacheDir = join(root, '.cache', 'node-sea')
   const versionDir = join(cacheDir, version)
   mkdirSync(versionDir, { recursive: true })
@@ -153,30 +153,30 @@ async function ensureSeaBaseBinary() {
     return await downloadOfficialNode(version, platform, arch, versionDir)
   } catch (err) {
     console.warn(`Download failed for version ${version}: ${err.message}`)
-    
+
     // 4. Try fallback version
     const fallbackVersion = await getFallbackVersion(version)
     if (fallbackVersion && fallbackVersion !== version) {
       console.log(`Attempting download with fallback version ${fallbackVersion}...`)
       const fallbackDir = join(cacheDir, fallbackVersion)
       mkdirSync(fallbackDir, { recursive: true })
-      
+
       const fallbackBin = platform === 'win32'
         ? join(fallbackDir, 'node.exe')
         : join(fallbackDir, `node-${fallbackVersion}-${platform}-${arch}`, 'bin', 'node')
-        
+
       if (existsSync(fallbackBin) && hasSentinel(fallbackBin)) {
         console.log(`Found valid fallback Node.js binary in cache at: ${fallbackBin}`)
         return fallbackBin
       }
-      
+
       try {
         return await downloadOfficialNode(fallbackVersion, platform, arch, fallbackDir)
       } catch (fallbackErr) {
         console.error(`Download also failed for fallback version ${fallbackVersion}:`, fallbackErr.message)
       }
     }
-    
+
     throw new Error('Could not obtain an official Node.js binary with the required SEA sentinel.')
   }
 }

@@ -38,6 +38,32 @@ test('PTY smoke: slash palette opens and exits cleanly', { skip: !shouldRun || !
   assert.match(output, /\? for shortcuts/)
 })
 
+test('PTY smoke: slash palette narrow terminal redraws without residue', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('slash-palette-narrow')
+  assert.match(output, /Insert grep prompt prefix/)
+  assert.match(output, /MiniMax M3|Embedded Local/)
+})
+
+test('PTY smoke: keyboard routing keeps a single input owner across overlays', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('unique-input-keyboard-routing')
+  assert.match(output, /Insert bash prompt prefix/)
+  assert.match(output, /AgentLoop sub-agent TUI smoke completed/)
+  assert.match(output, /当前用户生产的作品可能会在实际上线后发现批量化的问题/)
+  assert.match(output, /BabeL-O local runtime is active\./)
+  assert.match(output, /approval/)
+  assert.match(output, /Permission denied/)
+  assert.doesNotMatch(output, /Permission approved/)
+  assert.equal((output.match(/BabeL-O local runtime is active\./g) ?? []).length, 1)
+})
+
+test('PTY smoke: tool picker and model wizard keep one input owner', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('tool-model-overlay-routing')
+  assert.match(output, /Read a file inside the workspace/)
+  assert.match(output, /Select provider:/)
+  assert.match(output, /Wizard cancelled\./)
+  assert.match(output, /\? for shortcuts/)
+})
+
 test('PTY smoke: permission panel escape rejects without approval', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('permission-reject-escape')
   assert.match(output, /approval/)
@@ -95,11 +121,34 @@ test('PTY smoke: compact bash output preview folds long output', { skip: !should
   assert.match(output, /… \+2 lines \(ctrl\+o to expand\)/)
 })
 
+test('PTY smoke: AgentLoop sub-agent hierarchy renders from TUI command', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('agentloop-subagent-smoke')
+  assert.match(output, /task blocked/)
+  assert.match(output, /subtasks delegated/)
+  assert.match(output, /subagent started/)
+  assert.match(output, /subagent completed/)
+  assert.match(output, /Parent blocked by delegated sub-agent/)
+  assert.match(output, /Child implementation via sub-agent/)
+  assert.match(output, /depth=1/)
+  assert.match(output, /parentTaskId=1/)
+  assert.match(output, /parent #1/)
+  assert.match(output, /transcript=nexus:\/\/sessions\/session_[A-Za-z0-9_-]+-sub-2\/events/)
+  assert.match(output, /✓ AgentLoop sub-agent TUI smoke completed/)
+})
+
 test('PTY smoke: live waiting status renders while a prompt is running', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('live-waiting-status')
   assert.match(output, /Working\.\.\./)
   assert.match(output, /Generating\.\.\./)
   assert.match(output, /Read\(package\.json\)/)
+})
+
+test('PTY smoke: agent running indicator clears after done and failed tools', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('agent-running-terminal-states')
+  assert.match(output, /Waiting for permission\.\.\./)
+  assert.match(output, /Bash\(node -v\)/)
+  assert.match(output, /Bash\(node -e process\.exit\(7\)\) failed/)
+  assert.match(output, /Bash failed\./)
 })
 
 test('PTY smoke: compact command renders progress without internal details', { skip: !shouldRun || !existsSync(driver) }, () => {
@@ -126,6 +175,13 @@ test('PTY smoke: input placeholder clears on typing and blank enter does not sub
   const output = runPtySmoke('input-placeholder')
   assert.match(output, /什么我可以帮你的吗？/)
   assert.doesNotMatch(output, /什么我可以帮你的吗？edit, \/ for commands/)
+  assert.equal((output.match(/BabeL-O local runtime is active\./g) ?? []).length, 1)
+})
+
+test('PTY smoke: Shift+Enter inserts multiline input before submit', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('shift-enter-multiline-input')
+  assert.match(output, /第一行业务场景/)
+  assert.match(output, /第二行风险分层/)
   assert.equal((output.match(/BabeL-O local runtime is active\./g) ?? []).length, 1)
 })
 

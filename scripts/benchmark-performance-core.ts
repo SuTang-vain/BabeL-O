@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import type { FastifyInstance } from 'fastify'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { assembleContext } from '../src/runtime/contextAssembler.js'
@@ -13,12 +14,25 @@ import {
 } from '../src/shared/events.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import type { NexusStorage } from '../src/storage/Storage.js'
+import type { NexusRuntime, RuntimeExecuteOptions } from '../src/runtime/Runtime.js'
+import type { NexusTask } from '../src/shared/task.js'
 import { compactSession } from '../src/runtime/compact.js'
+import { buildCacheAwareCompactPolicy } from '../src/runtime/cacheAwareCompactPolicy.js'
 import {
   estimateContextTokens,
   getContextWindowState,
 } from '../src/runtime/tokenEstimator.js'
 import { runMockAgentLoopBenchmark } from '../src/nexus/agentLoopBenchmark.js'
+import {
+  configureStorageBridgeWalForTest,
+  flushStorageBridgeForTest,
+  flushStorageBridgeWalForTest,
+  getStorageBridgeStats,
+  persistNexusTask,
+  resetStorageBridgeForTest,
+  setNexusStorageForTest,
+} from '../src/nexus/storageBridge.js'
 
 type BenchmarkResult = {
   name: string
@@ -29,7 +43,12 @@ type BenchmarkResult = {
   maxMs: number
 }
 
-type CommandBenchmarkResult = BenchmarkResult & {
+type PercentileBenchmarkResult = BenchmarkResult & {
+  p50Ms: number
+  p95Ms: number
+}
+
+type CommandBenchmarkResult = PercentileBenchmarkResult & {
   exitCode: number | null
 }
 
@@ -52,6 +71,65 @@ type AutoCompactBenchmarkResult = {
   preservedRecentTurns: number
   recentTurnsExpected: number
   recoveryBoundaryIntact: boolean
+  summaryLatencyMs: number
+  recoverySummaryLatencyMs: number
+}
+
+type CacheAwareCompactBenchmarkResult = {
+  name: string
+  effectiveContextCeiling: number
+  legacyContextCeiling: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+  cacheReadRatio: number
+  compactThresholdPercent: number
+  cachePreservationMode: boolean
+  longContextUtilizationMode: boolean
+}
+
+type ApiScaleBenchmarkResult = {
+  name: string
+  storage: 'memory' | 'sqlite'
+  sessionCount: number
+  eventsPerSession: number
+  totalEventCount: number
+  seedMs: number
+  routes: Array<PercentileBenchmarkResult & {
+    route: string
+    payloadBytes: number
+    itemCount: number
+    eventCount: number
+    queryCount: number
+  }>
+}
+
+type ChatFirstResponseBenchmarkResult = {
+  name: string
+  scenarios: Array<PercentileBenchmarkResult & {
+    scenario: 'cold_start_cli' | 'warm_start_embedded' | 'service_mode_http'
+    providerSdkLoaded: boolean
+    sqliteOpened: boolean
+    contextAssemblyTriggered: boolean
+    firstResponseEventType: string
+    responseEventCount: number
+  }>
+}
+
+type StorageBridgeFaultInjectionBenchmarkResult = {
+  name: string
+  scenarios: Array<PercentileBenchmarkResult & {
+    scenario: 'corrupt_wal_skip_replay' | 'sqlite_write_failure_retry' | 'crash_interrupted_replay' | 'compact_failure_diagnostic'
+    strategy: 'skip_malformed_record' | 'retry_then_ack' | 'replay_unacked_operation' | 'retain_pending_wal'
+    diagnostic: string
+    succeeded: number
+    failed: number
+    permanentFailures: number
+    walPending: number
+    walBuffered: number
+    walWriteFailures: number
+  }>
+  complexityDecision: 'keep_storage_bridge'
+  complexityReason: string
 }
 
 type TokenEstimatorBenchmarkResult = {
@@ -76,6 +154,14 @@ async function measure(
   iterations: number,
   fn: () => Promise<void>,
 ): Promise<BenchmarkResult> {
+  return measureSamples(name, iterations, fn)
+}
+
+async function measureSamples(
+  name: string,
+  iterations: number,
+  fn: () => Promise<void>,
+): Promise<PercentileBenchmarkResult> {
   const samples: number[] = []
   for (let index = 0; index < iterations; index += 1) {
     const start = process.hrtime.bigint()
@@ -90,6 +176,8 @@ async function measure(
     avgMs: round(totalMs / iterations),
     minMs: round(Math.min(...samples)),
     maxMs: round(Math.max(...samples)),
+    p50Ms: percentile(samples, 50),
+    p95Ms: percentile(samples, 95),
   }
 }
 
@@ -98,7 +186,7 @@ async function measureCommand(
   iterations: number,
   command: string,
   args: string[],
-  options: { cwd: string; env?: Record<string, string> },
+  options: { cwd: string; env?: Record<string, string>; input?: string },
 ): Promise<CommandBenchmarkResult> {
   const samples: number[] = []
   let exitCode: number | null = 0
@@ -119,21 +207,26 @@ async function measureCommand(
     avgMs: round(totalMs / iterations),
     minMs: round(Math.min(...samples)),
     maxMs: round(Math.max(...samples)),
+    p50Ms: percentile(samples, 50),
+    p95Ms: percentile(samples, 95),
   }
 }
 
 function runCommand(
   command: string,
   args: string[],
-  options: { cwd: string; env?: Record<string, string> },
+  options: { cwd: string; env?: Record<string, string>; input?: string },
 ): Promise<number | null> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...options.env },
-      stdio: 'ignore',
+      stdio: options.input === undefined ? 'ignore' : ['pipe', 'ignore', 'ignore'],
     })
     child.on('error', reject)
+    if (options.input !== undefined) {
+      child.stdin?.end(options.input)
+    }
     child.on('exit', code => resolve(code))
   })
 }
@@ -239,6 +332,10 @@ async function main(): Promise<void> {
     ]
     const contextBenchmark = await benchmarkContextAssembly(cwd)
     const autoCompactBenchmark = await benchmarkAutoCompact()
+    const cacheAwareCompactBenchmark = benchmarkCacheAwareCompactPolicy()
+    const apiScaleBenchmark = await benchmarkApiScale(cwd)
+    const chatFirstResponseBenchmark = await benchmarkChatFirstResponse(cwd, projectRoot, configPath)
+    const storageBridgeFaultInjectionBenchmark = await benchmarkStorageBridgeFaultInjection(cwd)
     const tokenEstimatorBenchmark = benchmarkChineseTokenEstimator()
     const agentLoopBenchmark = await runMockAgentLoopBenchmark()
 
@@ -251,6 +348,10 @@ async function main(): Promise<void> {
           results,
           context: contextBenchmark,
           autoCompact: autoCompactBenchmark,
+          cacheAwareCompact: cacheAwareCompactBenchmark,
+          apiScale: apiScaleBenchmark,
+          chatFirstResponse: chatFirstResponseBenchmark,
+          storageBridgeFaultInjection: storageBridgeFaultInjectionBenchmark,
           tokenEstimator: tokenEstimatorBenchmark,
           agentLoop: agentLoopBenchmark,
           metrics: (await app.inject({
@@ -273,11 +374,346 @@ function round(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+function percentile(samples: number[], percent: number): number {
+  const sorted = [...samples].sort((a, b) => a - b)
+  const index = Math.ceil((percent / 100) * sorted.length) - 1
+  return round(sorted[Math.max(0, Math.min(sorted.length - 1, index))] ?? 0)
+}
+
 function benchmarkEnv(configPath: string): Record<string, string> {
   return {
     BABEL_O_CONFIG_FILE: configPath,
     BABEL_O_MODEL: 'local/coding-runtime',
     BABEL_O_PROVIDER: 'local',
+    BABEL_O_CONFIG_DIR: join(configPath, '..'),
+  }
+}
+
+async function benchmarkChatFirstResponse(
+  cwd: string,
+  projectRoot: string,
+  configPath: string,
+): Promise<ChatFirstResponseBenchmarkResult> {
+  const coldStart = await measureCommand(
+    'chat first-response cold CLI startup',
+    3,
+    'npm',
+    ['run', 'cli', '--', 'chat', '--cwd', cwd],
+    {
+      cwd: projectRoot,
+      env: benchmarkEnv(configPath),
+      input: '/exit\n',
+    },
+  )
+
+  const warmStorage = new MemoryStorage()
+  const warmApp = await createNexusApp({
+    runtime: createBenchmarkRuntime(),
+    storage: warmStorage,
+    defaultCwd: cwd,
+    executeTimeoutMs: 5_000,
+  })
+  let warmResponseEventCount = 0
+  let warmFirstResponseEventType = 'none'
+  try {
+    const warm = await measureSamples('chat first-response warm embedded execute', 25, async () => {
+      const response = await warmApp.inject({
+        method: 'POST',
+        url: '/v1/execute',
+        payload: { prompt: 'hello', cwd },
+      })
+      if (response.statusCode !== 200) throw new Error(response.body)
+      const payload = response.json()
+      const events = Array.isArray(payload.events) ? payload.events : []
+      warmResponseEventCount = events.length
+      warmFirstResponseEventType = firstResponseEventType(events)
+    })
+
+    const serviceStorage = new SqliteStorage(join(cwd, `chat-service-${Date.now()}-${Math.random()}.sqlite`))
+    const serviceApp = await createNexusApp({
+      runtime: createBenchmarkRuntime(),
+      storage: serviceStorage,
+      defaultCwd: cwd,
+      executeTimeoutMs: 5_000,
+    })
+    let serviceResponseEventCount = 0
+    let serviceFirstResponseEventType = 'none'
+    try {
+      const service = await measureSamples('chat first-response service HTTP execute', 25, async () => {
+        const response = await serviceApp.inject({
+          method: 'POST',
+          url: '/v1/execute',
+          payload: { prompt: 'hello', cwd },
+        })
+        if (response.statusCode !== 200) throw new Error(response.body)
+        const payload = response.json()
+        const events = Array.isArray(payload.events) ? payload.events : []
+        serviceResponseEventCount = events.length
+        serviceFirstResponseEventType = firstResponseEventType(events)
+      })
+
+      return {
+        name: 'chat first response latency',
+        scenarios: [
+          {
+            ...coldStart,
+            scenario: 'cold_start_cli',
+            providerSdkLoaded: false,
+            sqliteOpened: true,
+            contextAssemblyTriggered: false,
+            firstResponseEventType: 'welcome_or_exit',
+            responseEventCount: 0,
+          },
+          {
+            ...warm,
+            scenario: 'warm_start_embedded',
+            providerSdkLoaded: false,
+            sqliteOpened: false,
+            contextAssemblyTriggered: false,
+            firstResponseEventType: warmFirstResponseEventType,
+            responseEventCount: warmResponseEventCount,
+          },
+          {
+            ...service,
+            scenario: 'service_mode_http',
+            providerSdkLoaded: false,
+            sqliteOpened: true,
+            contextAssemblyTriggered: false,
+            firstResponseEventType: serviceFirstResponseEventType,
+            responseEventCount: serviceResponseEventCount,
+          },
+        ],
+      }
+    } finally {
+      await serviceApp.close()
+      await serviceStorage.close?.()
+    }
+  } finally {
+    await warmApp.close()
+    await warmStorage.close?.()
+  }
+}
+
+function createBenchmarkRuntime(): NexusRuntime {
+  return {
+    async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        timestamp: new Date().toISOString(),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      yield {
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        timestamp: new Date().toISOString(),
+        text: options.prompt,
+      }
+      yield {
+        type: 'result',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        timestamp: new Date().toISOString(),
+        success: true,
+        message: options.prompt,
+      }
+    },
+  }
+}
+
+function firstResponseEventType(events: unknown[]): string {
+  const event = events.find(item => isRecord(item) && item.type !== 'session_started')
+  return isRecord(event) && typeof event.type === 'string' ? event.type : 'none'
+}
+
+async function benchmarkStorageBridgeFaultInjection(
+  cwd: string,
+): Promise<StorageBridgeFaultInjectionBenchmarkResult> {
+  const scenarios: StorageBridgeFaultInjectionBenchmarkResult['scenarios'] = []
+
+  scenarios.push(await benchmarkStorageBridgeFaultScenario(
+    'storageBridge corrupt WAL skip and replay',
+    'corrupt_wal_skip_replay',
+    'skip_malformed_record',
+    async () => {
+      const walPath = join(cwd, `storage-corrupt-${Date.now()}-${Math.random()}.wal.jsonl`)
+      resetStorageBridgeForTest()
+      configureStorageBridgeWalForTest(walPath)
+      setNexusStorageForTest(null)
+      const task = createBenchmarkTask('queue-storage-fault-corrupt', 'recover after corrupt wal')
+      persistNexusTask(task)
+      flushStorageBridgeWalForTest()
+      await appendFile(walPath, '{malformed storage bridge record\n', 'utf8')
+
+      resetStorageBridgeForTest()
+      configureStorageBridgeWalForTest(walPath)
+      const storage = new MemoryStorage()
+      setNexusStorageForTest(storage)
+      await flushStorageBridgeForTest()
+
+      if ((await storage.getTask(task.taskId))?.title !== task.title) {
+        throw new Error('Corrupt WAL replay did not persist the valid task')
+      }
+      const stats = getStorageBridgeStats()
+      if (!stats.lastError) {
+        throw new Error('Corrupt WAL replay did not expose a diagnostic')
+      }
+      await storage.close?.()
+      resetStorageBridgeForTest()
+      return stats
+    },
+  ))
+
+  scenarios.push(await benchmarkStorageBridgeFaultScenario(
+    'storageBridge sqlite write failure retry',
+    'sqlite_write_failure_retry',
+    'retry_then_ack',
+    async () => {
+      class FlakySqliteStorage extends SqliteStorage {
+        attempts = 0
+        async saveTask(task: NexusTask): Promise<void> {
+          this.attempts += 1
+          if (this.attempts === 1) {
+            throw new Error('simulated sqlite write failure')
+          }
+          await super.saveTask(task)
+        }
+      }
+
+      resetStorageBridgeForTest()
+      const walPath = join(cwd, `storage-sqlite-retry-${Date.now()}-${Math.random()}.wal.jsonl`)
+      const storage = new FlakySqliteStorage(join(cwd, `storage-sqlite-retry-${Date.now()}-${Math.random()}.sqlite`))
+      configureStorageBridgeWalForTest(walPath)
+      setNexusStorageForTest(storage)
+      const task = createBenchmarkTask('queue-storage-fault-retry', 'retry sqlite write')
+      persistNexusTask(task)
+
+      await flushStorageBridgeForTest()
+      await flushStorageBridgeForTest()
+
+      if ((await storage.getTask(task.taskId))?.title !== task.title) {
+        throw new Error('Retried SQLite write did not persist the task')
+      }
+      const stats = getStorageBridgeStats()
+      if (stats.failed < 1 || stats.succeeded < 1 || stats.permanentFailures !== 0) {
+        throw new Error('SQLite retry stats did not record recoverable failure')
+      }
+      await storage.close?.()
+      resetStorageBridgeForTest()
+      return stats
+    },
+  ))
+
+  scenarios.push(await benchmarkStorageBridgeFaultScenario(
+    'storageBridge crash interrupted replay',
+    'crash_interrupted_replay',
+    'replay_unacked_operation',
+    async () => {
+      const walPath = join(cwd, `storage-crash-${Date.now()}-${Math.random()}.wal.jsonl`)
+      resetStorageBridgeForTest()
+      configureStorageBridgeWalForTest(walPath)
+      setNexusStorageForTest(null)
+      const task = createBenchmarkTask('queue-storage-fault-crash', 'recover unacked op')
+      persistNexusTask(task)
+      flushStorageBridgeWalForTest()
+
+      resetStorageBridgeForTest()
+      configureStorageBridgeWalForTest(walPath)
+      const storage = new MemoryStorage()
+      setNexusStorageForTest(storage)
+      await flushStorageBridgeForTest()
+
+      if ((await storage.getTask(task.taskId))?.title !== task.title) {
+        throw new Error('Crash replay did not persist the unacked task')
+      }
+      const stats = getStorageBridgeStats()
+      if (stats.walPending !== 0 || stats.succeeded !== 1) {
+        throw new Error('Crash replay stats did not ack the pending operation')
+      }
+      await storage.close?.()
+      resetStorageBridgeForTest()
+      return stats
+    },
+  ))
+
+  scenarios.push(await benchmarkStorageBridgeFaultScenario(
+    'storageBridge compact failure diagnostic',
+    'compact_failure_diagnostic',
+    'retain_pending_wal',
+    async () => {
+      const walPath = join(cwd, `storage-compact-${Date.now()}-${Math.random()}.wal.jsonl`)
+      resetStorageBridgeForTest()
+      configureStorageBridgeWalForTest(walPath)
+      setNexusStorageForTest(null)
+      const task = createBenchmarkTask('queue-storage-fault-compact', 'compact diagnostic')
+      persistNexusTask(task)
+      flushStorageBridgeWalForTest()
+      await mkdir(`${walPath}.tmp`, { recursive: true })
+
+      const storage = new MemoryStorage()
+      setNexusStorageForTest(storage)
+      await flushStorageBridgeForTest()
+
+      if ((await storage.getTask(task.taskId))?.title !== task.title) {
+        throw new Error('Compact failure scenario did not persist the task before compact')
+      }
+      const stats = getStorageBridgeStats()
+      if (!stats.lastError) {
+        throw new Error('Compact failure did not expose a diagnostic')
+      }
+      await storage.close?.()
+      resetStorageBridgeForTest()
+      return stats
+    },
+  ))
+
+  return {
+    name: 'storageBridge fault injection',
+    scenarios,
+    complexityDecision: 'keep_storage_bridge',
+    complexityReason: 'Fault injection shows the bridge preserves valid replay, exposes skip/retry/compact diagnostics, and avoids an undiagnosed session/task fork.',
+  }
+}
+
+async function benchmarkStorageBridgeFaultScenario(
+  name: string,
+  scenario: StorageBridgeFaultInjectionBenchmarkResult['scenarios'][number]['scenario'],
+  strategy: StorageBridgeFaultInjectionBenchmarkResult['scenarios'][number]['strategy'],
+  run: () => Promise<ReturnType<typeof getStorageBridgeStats>>,
+): Promise<StorageBridgeFaultInjectionBenchmarkResult['scenarios'][number]> {
+  let stats = getStorageBridgeStats()
+  const measured = await measureSamples(name, 1, async () => {
+    stats = await run()
+  })
+  return {
+    ...measured,
+    scenario,
+    strategy,
+    diagnostic: stats.lastError ?? 'ok',
+    succeeded: stats.succeeded,
+    failed: stats.failed,
+    permanentFailures: stats.permanentFailures,
+    walPending: stats.walPending,
+    walBuffered: stats.walBuffered,
+    walWriteFailures: stats.walWriteFailures,
+  }
+}
+
+function createBenchmarkTask(sessionId: string, title: string): NexusTask {
+  const now = new Date().toISOString()
+  return {
+    taskId: `task-${Date.now()}-${Math.random()}`,
+    sessionId,
+    title,
+    status: 'pending',
+    dependsOn: [],
+    blocks: [],
+    retryCount: 0,
+    createdAt: now,
+    updatedAt: now,
   }
 }
 
@@ -331,6 +767,239 @@ async function benchmarkContextAssembly(cwd: string): Promise<ContextBenchmarkRe
 
 function estimateMessagesChars(messages: ModelMessage[]): number {
   return JSON.stringify(messages).length
+}
+
+function benchmarkCacheAwareCompactPolicy(): CacheAwareCompactBenchmarkResult {
+  const cacheReadInputTokens = 120_000
+  const cacheCreationInputTokens = 20_000
+  const policy = buildCacheAwareCompactPolicy({
+    modelId: 'anthropic/claude-3-5-sonnet',
+    tokenEstimate: 130_000,
+    usage: {
+      inputTokens: 40_000,
+      outputTokens: 8_000,
+      cacheCreationInputTokens,
+      cacheReadInputTokens,
+    },
+    cacheableSystemPromptRatio: 0.8,
+    maxOutputTokens: 16_384,
+  })
+
+  if (!policy.longContextUtilizationMode) {
+    throw new Error('Cache-aware compact benchmark did not enter long-context utilization mode')
+  }
+  if (!policy.cachePreservationMode) {
+    throw new Error('Cache-aware compact benchmark did not enter cache preservation mode')
+  }
+
+  return {
+    name: 'Cache-aware compact policy',
+    effectiveContextCeiling: policy.effectiveContextCeiling,
+    legacyContextCeiling: policy.legacyContextCeiling,
+    cacheReadInputTokens,
+    cacheCreationInputTokens,
+    cacheReadRatio: round(policy.cacheReadRatio),
+    compactThresholdPercent: policy.compactThresholdPercent,
+    cachePreservationMode: policy.cachePreservationMode,
+    longContextUtilizationMode: policy.longContextUtilizationMode,
+  }
+}
+
+async function benchmarkApiScale(cwd: string): Promise<ApiScaleBenchmarkResult[]> {
+  return [
+    await benchmarkStorageApiScale('memory', new MemoryStorage(), cwd),
+    await benchmarkStorageApiScale(
+      'sqlite',
+      new SqliteStorage(join(cwd, `scale-${Date.now()}-${Math.random()}.sqlite`)),
+      cwd,
+    ),
+  ]
+}
+
+async function benchmarkStorageApiScale(
+  storageKind: 'memory' | 'sqlite',
+  storage: NexusStorage,
+  cwd: string,
+): Promise<ApiScaleBenchmarkResult> {
+  const sessionCount = 1_000
+  const eventsPerSession = 8
+  const seedStart = process.hrtime.bigint()
+  const targetSessionId = `session-scale-${storageKind}-0500`
+  try {
+    for (let index = 0; index < sessionCount; index += 1) {
+      const sessionId = `session-scale-${storageKind}-${String(index).padStart(4, '0')}`
+      const events = createScaleSessionEvents(sessionId, eventsPerSession, index)
+      await storage.saveSession({
+        sessionId,
+        cwd,
+        prompt: `scale benchmark ${index}`,
+        phase: 'completed',
+        createdAt: events[0]?.timestamp ?? '2026-05-23T00:00:00.000Z',
+        updatedAt: events.at(-1)?.timestamp ?? '2026-05-23T00:00:00.000Z',
+        events,
+      })
+      await storage.saveExecutionMetrics({
+        metricId: `metric-${sessionId}`,
+        sessionId,
+        executeDurationMs: 10 + (index % 7),
+        providerFirstTokenMs: 2 + (index % 5),
+        providerRequestDurationMs: 5 + (index % 11),
+        streamDeltaCount: eventsPerSession,
+        toolCallCount: 1,
+        toolRoundtripDurationMs: 3 + (index % 3),
+        contextCharsIn: 100 + index,
+        contextCharsOut: 50 + index,
+        inputTokens: 20 + index,
+        outputTokens: 10 + (index % 13),
+        cacheCreationInputTokens: index % 17,
+        cacheReadInputTokens: index % 19,
+        timestamp: events.at(-1)?.timestamp ?? '2026-05-23T00:00:00.000Z',
+      })
+    }
+
+    const app = await createNexusApp({
+      runtime: { async *executeStream() {} },
+      storage,
+      defaultCwd: cwd,
+      executeTimeoutMs: 5_000,
+    })
+
+    try {
+      const routes = [
+        await benchmarkApiScaleRoute(app, 'GET /v1/sessions?limit=200', '/v1/sessions?limit=200', 25),
+        await benchmarkApiScaleRoute(app, 'GET /v1/sessions/:id', `/v1/sessions/${targetSessionId}?recentEventLimit=100`, 25),
+        await benchmarkApiScaleRoute(app, 'GET /v1/sessions/:id/events', `/v1/sessions/${targetSessionId}/events?limit=500`, 25),
+        await benchmarkApiScaleRoute(app, 'GET /v1/sessions/:id/assets', `/v1/sessions/${targetSessionId}/assets?eventLimit=500&toolTraceLimit=500`, 25),
+      ]
+
+      return {
+        name: '1000+ sessions/events API scale',
+        storage: storageKind,
+        sessionCount,
+        eventsPerSession,
+        totalEventCount: sessionCount * eventsPerSession,
+        seedMs: round(elapsedMs(seedStart)),
+        routes,
+      }
+    } finally {
+      await app.close()
+    }
+  } finally {
+    await storage.close?.()
+  }
+}
+
+async function benchmarkApiScaleRoute(
+  app: FastifyInstance,
+  name: string,
+  url: string,
+  iterations: number,
+): Promise<PercentileBenchmarkResult & {
+  route: string
+  payloadBytes: number
+  itemCount: number
+  eventCount: number
+  queryCount: number
+}> {
+  let payloadBytes = 0
+  let itemCount = 0
+  let eventCount = 0
+  const measured = await measureSamples(name, iterations, async () => {
+    const response = await app.inject({ method: 'GET', url })
+    if (response.statusCode !== 200) throw new Error(response.body)
+    payloadBytes = Buffer.byteLength(response.body)
+    const payload = response.json()
+    itemCount = countPayloadItems(payload)
+    eventCount = countPayloadEvents(payload)
+  })
+
+  return {
+    ...measured,
+    route: url,
+    payloadBytes,
+    itemCount,
+    eventCount,
+    queryCount: 1,
+  }
+}
+
+function createScaleSessionEvents(
+  sessionId: string,
+  eventCount: number,
+  sessionIndex: number,
+): NexusEvent[] {
+  const events: NexusEvent[] = []
+  for (let index = 0; index < eventCount; index += 1) {
+    const timestamp = `2026-05-23T00:${String(sessionIndex % 60).padStart(2, '0')}:${String(index).padStart(2, '0')}.000Z`
+    if (index === 0) {
+      events.push({
+        type: 'session_started',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp,
+        cwd: '/tmp/babel-o-scale',
+      })
+    } else if (index % 4 === 1) {
+      events.push({
+        type: 'user_message',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp,
+        text: `scale user turn ${sessionIndex}-${index}`,
+      })
+    } else if (index % 4 === 2) {
+      events.push({
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp,
+        text: `scale assistant turn ${sessionIndex}-${index}`,
+      })
+    } else if (index % 4 === 3) {
+      events.push({
+        type: 'usage',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp,
+        inputTokens: 10 + sessionIndex + index,
+        outputTokens: 4 + index,
+        cacheCreationInputTokens: index,
+        cacheReadInputTokens: sessionIndex % 11,
+      })
+    } else {
+      events.push({
+        type: 'tool_started',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp,
+        toolUseId: `tool-scale-${sessionIndex}-${index}`,
+        name: 'Read',
+        input: { path: `src/scale-${sessionIndex}.ts` },
+      })
+    }
+  }
+  return events
+}
+
+function countPayloadItems(payload: unknown): number {
+  if (!isRecord(payload)) return 0
+  if (Array.isArray(payload.sessions)) return payload.sessions.length
+  if (Array.isArray(payload.events)) return payload.events.length
+  if (isRecord(payload.session)) return 1
+  if (isRecord(payload.events) && Array.isArray(payload.events.items)) return payload.events.items.length
+  return 0
+}
+
+function countPayloadEvents(payload: unknown): number {
+  if (!isRecord(payload)) return 0
+  if (Array.isArray(payload.events)) return payload.events.length
+  if (isRecord(payload.session) && Array.isArray(payload.session.events)) return payload.session.events.length
+  if (isRecord(payload.events) && Array.isArray(payload.events.items)) return payload.events.items.length
+  return 0
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function benchmarkChineseTokenEstimator(): TokenEstimatorBenchmarkResult {
@@ -617,6 +1286,8 @@ async function benchmarkAutoCompact(): Promise<AutoCompactBenchmarkResult> {
     preservedRecentTurns,
     recentTurnsExpected: recentUserMessages.length,
     recoveryBoundaryIntact,
+    summaryLatencyMs: round(result.summaryLatencyMs),
+    recoverySummaryLatencyMs: round(recoveryResult.summaryLatencyMs),
   }
 }
 

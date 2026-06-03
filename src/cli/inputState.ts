@@ -16,6 +16,7 @@ export type InputMode =
   | 'permissionPanel'
   | 'historySearch'
   | 'modelWizard'
+  | 'contextView'
   | 'agentRunning'
   | 'pasteBuffer'
 

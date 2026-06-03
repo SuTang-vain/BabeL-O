@@ -8,7 +8,7 @@ import readline from 'node:readline'
 import chalk from 'chalk'
 import { visibleTerminalWidth, truncateToTerminalWidth } from '../src/cli/terminalWidth.js'
 import { formatSessionBanner, formatWelcomeCardLines, formatWelcomeHintLine } from '../src/cli/welcome.js'
-import { formatInputFooter, renderBoxedInput, renderFixedInputBox, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
+import { INPUT_NEWLINE_MARKER, formatInputFooter, renderBoxedInput, renderFixedInputBox, restoreInputNewlines, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
 import { inputState, type InputMode } from '../src/cli/inputState.js'
 import { defaultPermissionChoices, permissionDecisionFromChoice, renderSubmittedPrompt, setupAutosuggestions } from '../src/cli/ui.js'
 
@@ -17,6 +17,8 @@ test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent(Buffer.from('\x05'), undefined).kind, 'ctrl_e')
   assert.equal(normalizeKeyEvent('\x0f', undefined).kind, 'ctrl_o')
   assert.equal(normalizeKeyEvent('\r', undefined).kind, 'enter')
+  assert.equal(normalizeKeyEvent('\x1b[13;2u', undefined).kind, 'shift_enter')
+  assert.equal(normalizeKeyEvent('', { name: 'return', shift: true }).kind, 'shift_enter')
   assert.equal(normalizeKeyEvent('\x1b', undefined).kind, 'escape')
   assert.equal(normalizeKeyEvent('\x7f', undefined).kind, 'backspace')
   assert.equal(normalizeKeyEvent('\t', undefined).kind, 'tab')
@@ -156,6 +158,15 @@ test('terminal width helpers count CJK and truncate by terminal cells', () => {
   assert.equal(truncateToTerminalWidth('颜色要求-abc', 5), '颜色')
 })
 
+test('terminal width helpers keep long path CJK and ANSI rows within resize bounds', () => {
+  const ansiPath = '\x1b[36m/Users/tangyaoyue/DEV/BABEL/BabeL-O/src/cli/renderEvents.ts\x1b[0m 继续分析中文路径状态'
+  const truncated = truncateToTerminalWidth(ansiPath, 48)
+
+  assert.ok(visibleTerminalWidth(truncated) <= 48)
+  assert.ok(truncated.includes('/Users/tangyaoyue/DEV/BABEL'))
+  assert.equal(visibleTerminalWidth('\x1b[35m历史搜索\x1b[0m'), 8)
+})
+
 test('welcome header keeps required identity info without outer box', () => {
   const lines = formatWelcomeCardLines({
     cwd: '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
@@ -247,6 +258,26 @@ test('boxed input wraps long mixed-width text across indented input rows', () =>
   assert.equal(rendered.truncated, true)
   assert.ok(visibleTerminalWidth(rendered.text) <= 50)
   assert.ok(rendered.cursorColumn < 50)
+})
+
+test('boxed input renders explicit newlines as separate indented rows', () => {
+  const line = `第一行业务场景${INPUT_NEWLINE_MARKER}第二行风险分层${INPUT_NEWLINE_MARKER}第三行回收修改`
+  const rendered = renderBoxedInput({
+    prompt: '> ',
+    line,
+    cursor: line.length,
+    columns: 84,
+  })
+  const lines = rendered.text.split(/\r?\n/)
+
+  assert.equal(lines.length, 6)
+  assert.equal(lines[1], '> 第一行业务场景')
+  assert.equal(lines[2], '  第二行风险分层')
+  assert.equal(lines[3], '  第三行回收修改')
+  assert.equal(rendered.cursorRow, 3)
+  assert.equal(rendered.cursorRowsFromBottom, 2)
+  assert.equal(rendered.cursorColumn, 2 + visibleTerminalWidth('第三行回收修改'))
+  assert.equal(restoreInputNewlines(line), '第一行业务场景\n第二行风险分层\n第三行回收修改')
 })
 
 test('fixed input box only renders autosuggestion when it fits', () => {
@@ -342,6 +373,10 @@ test('input state keeps readline as the only text owner while overlays are open'
       inputState.set(mode, { source: 'smoke' })
       assert.equal(inputState.isOverlayOpen(), true, `${mode} should block secondary input handling`)
     }
+
+    inputState.set('historySearch', { query: 'compact' })
+    assert.equal(inputState.getData<string>('query'), 'compact')
+    assert.equal(inputState.isOverlayOpen(), true, 'history search should keep keyboard routing in overlay mode')
 
     inputState.set('agentRunning')
     assert.equal(inputState.isOverlayOpen(), false, 'agentRunning is a status indicator, not a second input owner')
@@ -536,6 +571,56 @@ test('autosuggestion refresh renders main chat input as a boxed prompt', () => {
   assert.ok(output.includes('Enter allow rule prefix (default: node:*): node:*'))
   assert.ok(!output.includes('BabeL-O'))
   assert.ok(!output.includes('Ask BabeL-O'))
+})
+
+test('autosuggestion refresh clears three-line boxed input before redrawing shorter input', () => {
+  const writes: string[] = []
+  const moves: Array<[number, number]> = []
+  let clearCount = 0
+  const originalWrite = process.stdout.write
+  const originalCursorTo = process.stdout.cursorTo
+  const originalMoveCursor = readline.moveCursor
+  const originalClearScreenDown = readline.clearScreenDown
+  const originalColumns = process.stdout.columns
+  process.stdout.write = ((chunk: any, ...args: any[]) => {
+    writes.push(String(chunk))
+    return true
+  }) as typeof process.stdout.write
+  ;(process.stdout as any).cursorTo = () => true
+  ;(readline as any).moveCursor = (_stream: NodeJS.WritableStream, dx: number, dy: number) => {
+    moves.push([dx, dy])
+    return true
+  }
+  ;(readline as any).clearScreenDown = () => {
+    clearCount++
+    return true
+  }
+  Object.defineProperty(process.stdout, 'columns', { value: 42, configurable: true })
+
+  const multiline = `第一行业务场景${INPUT_NEWLINE_MARKER}第二行风险分层${INPUT_NEWLINE_MARKER}第三行回收修改`
+  const rl: any = {
+    _prompt: '> ',
+    line: multiline,
+    cursor: multiline.length,
+  }
+  try {
+    setupAutosuggestions(rl as any, [], { current: false })
+    rl._refreshLine()
+    rl.line = '短输入'
+    rl.cursor = rl.line.length
+    rl._refreshLine()
+  } finally {
+    process.stdout.write = originalWrite
+    ;(process.stdout as any).cursorTo = originalCursorTo
+    ;(readline as any).moveCursor = originalMoveCursor
+    ;(readline as any).clearScreenDown = originalClearScreenDown
+    Object.defineProperty(process.stdout, 'columns', { value: originalColumns, configurable: true })
+  }
+
+  assert.equal(clearCount, 2)
+  assert.ok(moves.some(([, dy]) => dy === -3))
+  assert.ok(writes.some(write => write.includes('第三行回收修改')))
+  assert.ok(writes.some(write => write.includes('短输入')))
 })
 
 test('autosuggestion refresh clears stale wrapped input rows', () => {

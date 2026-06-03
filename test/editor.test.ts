@@ -9,7 +9,7 @@ import { EventEmitter } from 'node:events'
 test('openExternalEditor successfully edits content', async (t) => {
   const cwd = path.resolve('./')
   const tempDir = path.join(cwd, '.babel-o')
-  
+
   // Clean up any old test files
   if (fs.existsSync(tempDir)) {
     const files = fs.readdirSync(tempDir)
@@ -26,10 +26,10 @@ test('openExternalEditor successfully edits content', async (t) => {
     assert.ok(fs.existsSync(filePath), 'Temp file should be created before editor spawns')
     const currentText = fs.readFileSync(filePath, 'utf8')
     assert.strictEqual(currentText, 'hello world', 'Initial content should be written to temp file')
-    
+
     // Simulate user editing the file
     fs.writeFileSync(filePath, 'hello world edited', 'utf8')
-    
+
     // Return a mock child process
     const mockChild = new EventEmitter() as any
     // Simulate exit with code 0 after a short delay
@@ -57,7 +57,7 @@ test('openExternalEditor falls back to nano and vi on failure', async (t) => {
   t.mock.method(_spawner, 'spawn', (cmd: string, args: string[], opts: any) => {
     spawnCalls.push(cmd)
     const mockChild = new EventEmitter() as any
-    
+
     if (cmd === 'broken-editor') {
       // Simulate error event (editor not found/failed to run)
       process.nextTick(() => {
@@ -179,7 +179,7 @@ test('pasting timeout recovery works as expected', async (t) => {
   let pasteBuffer = ''
   let pastedResult = ''
   let pasteTimeout: any = null
-  
+
   const handlePastedText = (text: string) => {
     pastedResult = text
   }

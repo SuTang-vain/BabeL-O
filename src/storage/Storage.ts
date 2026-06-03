@@ -62,6 +62,16 @@ export type ExecutionMetrics = {
   toolRoundtripDurationMs?: number
   contextCharsIn?: number
   contextCharsOut?: number
+  inputTokens?: number
+  outputTokens?: number
+  cacheCreationInputTokens?: number
+  cacheReadInputTokens?: number
+  effectiveContextCeiling?: number
+  legacyContextCeiling?: number
+  cacheReadRatio?: number
+  cachePreservationMode?: boolean
+  longContextUtilizationMode?: boolean
+  compactSummaryLatencyMs?: number
   timestamp: string
 }
 

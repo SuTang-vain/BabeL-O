@@ -19,7 +19,7 @@ const program = new Command()
 program
   .name('bbl')
   .description('BabeL-O: Nexus-first coding agent CLI')
-  .version('0.2.7')
+  .version('0.2.8')
 
 // Register modular commands
 registerRunCommand(program)
@@ -61,6 +61,7 @@ export {
   describeCompletionChoice,
   formatCompletionChoice,
   formatPermissionDialog,
+  encodeSessionPermissionRule,
   sessionPermissionApprovals,
 } from './ui.js'
 

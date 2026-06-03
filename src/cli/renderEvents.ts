@@ -22,7 +22,7 @@ let activeReadlineInterface: any = null
 let pendingPermissionRequest: NexusEvent | null = null
 
 // Spinner / Agent status state
-type AgentStatus = 'working' | 'thinking' | 'generating' | 'running_tool' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle'
+type AgentStatus = 'working' | 'thinking' | 'generating' | 'running_tool' | 'running_subagent' | 'waiting_permission' | 'compacting' | 'retrying' | 'idle'
 let spinnerTimer: NodeJS.Timeout | null = null
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 let spinnerFrameIndex = 0
@@ -103,7 +103,7 @@ export function resumeSessionHistory(events: NexusEvent[]): void {
   activeSessionModel = events.findLast(e => e.type === 'session_started')?.model
   currentAgentStatus = 'idle'
   currentToolName = undefined
-  lastContextWarning = events.findLast(e => e.type === 'context_warning') as { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
+  lastContextWarning = events.findLast(e => e.type === 'context_warning' || e.type === 'context_blocking') as { percentUsed: number; tokenEstimate: number; maxTokens: number } | undefined
   redrawSession()
 }
 
@@ -155,6 +155,8 @@ function formatAgentStatusText(): string {
       return 'Generating...'
     case 'running_tool':
       return currentToolName ? `Running ${currentToolName}...` : 'Running tool...'
+    case 'running_subagent':
+      return currentToolName ? `Running sub-agent ${currentToolName}...` : 'Running sub-agent...'
     case 'waiting_permission':
       return 'Waiting for permission...'
     case 'compacting':
@@ -190,8 +192,8 @@ function drawSpinnerLine() {
 
 function formatDefaultStatusLine(columns: number): string {
   const frame = spinnerFrames[spinnerFrameIndex]!
-  const elapsed = spinnerStartedAt > 0 ? Math.floor((Date.now() - spinnerStartedAt) / 1000) : 0
-  const elapsedText = elapsed > 0 ? ` ${elapsed}s` : ''
+  const elapsed = spinnerStartedAt > 0 ? Date.now() - spinnerStartedAt : 0
+  const elapsedText = elapsed >= 1000 ? ` ${formatElapsedDuration(elapsed)}` : ''
   const leftText = ` ${chalk.yellow(frame)} ${chalk.bold(spinnerStatusText)}${chalk.dim(elapsedText)}`
   const modelText = activeSessionModel ? ` ${chalk.cyan(activeSessionModel)} ` : ''
   const rightText = `${modelText}|${formatContextGauge()} `
@@ -203,7 +205,7 @@ function formatDefaultStatusLine(columns: number): string {
 
 function formatCompactingStatusLine(columns: number): string {
   const elapsed = spinnerStartedAt > 0 ? Date.now() - spinnerStartedAt : 0
-  const elapsedText = formatCompactElapsed(elapsed)
+  const elapsedText = formatElapsedDuration(elapsed)
   const progress = Math.min(95, 8 + Math.floor((elapsed / 1000) % 88))
   const prefix = ` ${chalk.yellow('◒')} ${chalk.bold(spinnerStatusText)} ${chalk.dim(`(${elapsedText})`)}`
   const suffix = ` ${chalk.dim(`${progress}%`)}`
@@ -228,7 +230,7 @@ function formatContextGauge(): string {
   return ` [${filledStr}${emptyStr}] ${percent}%`
 }
 
-function formatCompactElapsed(ms: number): string {
+function formatElapsedDuration(ms: number): string {
   const totalSeconds = Math.max(0, Math.floor(ms / 1000))
   const minutes = Math.floor(totalSeconds / 60)
   const seconds = totalSeconds % 60
@@ -501,7 +503,22 @@ function updateAgentStatusFromEvent(event: NexusEvent): void {
     case 'compact_failure':
       setAgentStatus('generating')
       break
+    case 'task_session_event':
+      if (event.eventType === 'subagent_started' || event.eventType === 'sub_agent_session_started') {
+        setAgentStatus('running_subagent', summarizeSubAgentTitle(event.payload))
+      } else if (event.eventType === 'subagent_completed' || event.eventType === 'subagent_failed' || event.eventType === 'subagent_cancelled' || event.eventType === 'sub_agent_session_completed' || event.eventType === 'sub_agent_session_failed' || event.eventType === 'sub_agent_session_error') {
+        setAgentStatus('generating')
+      }
+      break
   }
+}
+
+function summarizeSubAgentTitle(payload: unknown): string | undefined {
+  if (!payload || typeof payload !== 'object') return undefined
+  const record = payload as Record<string, unknown>
+  if (typeof record.title === 'string') return truncateMiddle(record.title, 32)
+  if (typeof record.taskId === 'string') return `#${record.taskId}`
+  return undefined
 }
 
 function updateSpinnerForCurrentStatus(): void {
@@ -584,6 +601,14 @@ function renderLiveEvent(event: NexusEvent): void {
         ),
       )
       break
+    case 'context_blocking':
+      lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
+      console.log(
+        chalk.red(
+          `context blocked: ${event.percentUsed}% of window used (${event.tokenEstimate}/${event.maxTokens} tokens). run /compact or /context before retrying.`,
+        ),
+      )
+      break
     case 'compact_failure':
       console.log(
         chalk.yellow(
@@ -600,6 +625,7 @@ function renderLiveEvent(event: NexusEvent): void {
       break
     case 'task_session_event':
       console.log(formatTaskSessionEvent(event))
+      if (hadSpinner && currentAgentStatus !== 'idle') startSpinner(formatAgentStatusText())
       break
     case 'hook_started':
       if (tuiMode === 'expanded') {
@@ -822,6 +848,12 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         )
         break
 
+      case 'context_blocking':
+        outputText += chalk.red(
+          `context blocked: ${ev.percentUsed}% of window used (${ev.tokenEstimate}/${ev.maxTokens} tokens). run /compact or /context before retrying.\n`,
+        )
+        break
+
       case 'compact_failure':
         outputText += chalk.yellow(
           `context compact failed (${ev.failureCount}/${ev.maxFailures}): ${ev.message}\n`,
@@ -884,6 +916,7 @@ type TaskBoardItem = {
   delegatedSubTaskIds?: string[]
   worktree?: boolean
   subSessionId?: string
+  transcriptPath?: string
 }
 
 export function formatTaskStatusPanel(events: NexusEvent[]): string {
@@ -973,23 +1006,38 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
             task.status = 'pending'
           }
         }
-      } else if (ev.eventType === 'sub_agent_session_started') {
-        const payload = ev.payload as { taskId?: string; subSessionId?: string; title?: string } | undefined
+      } else if (ev.eventType === 'sub_agent_session_started' || ev.eventType === 'subagent_started') {
+        const payload = ev.payload as { taskId?: string; subSessionId?: string; title?: string; transcriptPath?: string; depth?: number; parentTaskId?: string } | undefined
         if (payload?.taskId) {
-          const task = tasks.find(t => t.taskId === payload.taskId)
+          let task = tasks.find(t => t.taskId === payload.taskId)
+          if (!task && payload.title) {
+            task = {
+              taskId: payload.taskId,
+              title: payload.title,
+              status: 'in_progress',
+              parentTaskId: payload.parentTaskId,
+              depth: typeof payload.depth === 'number' ? payload.depth : 0,
+            }
+            tasks.push(task)
+          }
           if (task) {
             task.subSessionId = payload.subSessionId
+            task.transcriptPath = payload.transcriptPath
+            if (typeof payload.depth === 'number') task.depth = payload.depth
+            if (typeof payload.parentTaskId === 'string') task.parentTaskId = payload.parentTaskId
+            if (task.status !== 'completed') task.status = 'in_progress'
           }
         }
-      } else if (ev.eventType === 'sub_agent_session_completed') {
-        const payload = ev.payload as { taskId?: string } | undefined
+      } else if (ev.eventType === 'sub_agent_session_completed' || ev.eventType === 'subagent_completed') {
+        const payload = ev.payload as { taskId?: string; transcriptPath?: string } | undefined
         if (payload?.taskId) {
           const task = tasks.find(t => t.taskId === payload.taskId)
           if (task && task.status !== 'completed') {
             task.status = 'completed'
+            if (typeof payload.transcriptPath === 'string') task.transcriptPath = payload.transcriptPath
           }
         }
-      } else if (ev.eventType === 'sub_agent_session_failed' || ev.eventType === 'sub_agent_session_error') {
+      } else if (ev.eventType === 'sub_agent_session_failed' || ev.eventType === 'sub_agent_session_error' || ev.eventType === 'subagent_failed' || ev.eventType === 'subagent_cancelled') {
         const payload = ev.payload as { taskId?: string } | undefined
         if (payload?.taskId) {
           const task = tasks.find(t => t.taskId === payload.taskId)
@@ -1075,6 +1123,7 @@ export function formatTaskStatusPanel(events: NexusEvent[]): string {
     if (t.delegatedSubTaskIds?.length) meta.push(`delegated ${t.delegatedSubTaskIds.map(id => `#${id}`).join(',')}`)
     if (t.worktree) meta.push('worktree')
     if (t.subSessionId) meta.push(`sub=${shortSessionId(t.subSessionId)}`)
+    if (t.transcriptPath) meta.push(`transcript=${t.transcriptPath}`)
     const suffix = meta.length > 0 ? chalk.dim(` (${meta.join(' · ')})`) : ''
 
     const content = `  ${treePrefix}${coloredStatus}  ${t.title}${suffix}`
@@ -1105,6 +1154,11 @@ function upsertTaskBoardItem(
       : undefined,
     worktree: task.metadata?.requiresIsolation === true || typeof task.metadata?.worktreePath === 'string',
     subSessionId: typeof task.metadata?.subSessionId === 'string' ? task.metadata.subSessionId : undefined,
+    transcriptPath: typeof task.metadata?.transcriptPath === 'string'
+      ? task.metadata.transcriptPath
+      : typeof (task.metadata?.subAgent as Record<string, unknown> | undefined)?.transcriptPath === 'string'
+        ? (task.metadata?.subAgent as Record<string, unknown>).transcriptPath as string
+        : undefined,
   }
   if (!existing) {
     tasks.push(next)
@@ -1300,6 +1354,17 @@ function summarizePayload(payload: unknown): string {
       typeof structuredOutput?.assistantTextPreview === 'string' ? structuredOutput.assistantTextPreview : '',
     ].filter(Boolean)
     if (pieces.length > 0) return truncateMiddle(pieces.join(' | '), 240)
+  }
+  if (record.agentType === 'subagent' || typeof record.transcriptPath === 'string') {
+    const pieces = [
+      typeof record.status === 'string' ? record.status : '',
+      typeof record.title === 'string' ? record.title : '',
+      typeof record.depth === 'number' ? `depth=${record.depth}` : '',
+      typeof record.parentTaskId === 'string' ? `parentTaskId=${record.parentTaskId}` : '',
+      typeof record.subSessionId === 'string' ? `subSession=${shortSessionId(record.subSessionId)}` : '',
+      typeof record.transcriptPath === 'string' ? `transcript=${record.transcriptPath}` : '',
+    ].filter(Boolean)
+    if (pieces.length > 0) return truncateMiddle(pieces.join(' '), 240)
   }
   const task = record.task
   if (task && typeof task === 'object') {

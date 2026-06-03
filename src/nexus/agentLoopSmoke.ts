@@ -13,6 +13,7 @@ import { setNexusStorage } from './storageBridge.js'
 import { buildProviderSmokeChecks, type ProviderSmokeChecks, type ProviderSmokeFallbackPolicy, type ProviderSmokeRequirements } from '../runtime/providerSmoke.js'
 import { buildProviderSmokeFallbackPolicy } from '../runtime/providerSmoke.js'
 import { classifyProviderRecovery, type ProviderFallbackPolicy } from '../runtime/providerRecovery.js'
+import { buildRuntimeDiagnostics, type RuntimeDiagnosticsEnvelope } from '../runtime/runtimeDiagnostics.js'
 
 export type AgentLoopLiveSmokeOptions = {
   model?: string
@@ -42,6 +43,17 @@ export type AgentLoopLiveSmokeRoleDiagnostic = {
   structuredOutputPreview?: string
 }
 
+export type AgentLoopLiveSmokeDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
+  providerId: string
+  modelId: string
+  ready: boolean
+  live: boolean
+  success?: boolean
+  sessionId?: string
+  sessionPhase?: string
+  roleDiagnosticCount: number
+}>
+
 export type AgentLoopLiveSmokeResult = {
   type: 'agent_loop_smoke'
   mode: 'live_manual'
@@ -67,6 +79,7 @@ export type AgentLoopLiveSmokeResult = {
     recovery: ReturnType<typeof classifyProviderRecovery>
   }
   fallbackPolicy: ProviderSmokeFallbackPolicy | ProviderFallbackPolicy
+  diagnostic: AgentLoopLiveSmokeDiagnosticEnvelope
 }
 
 const SMOKE_FIXTURE = 'BABEL_O_AGENT_LOOP_SMOKE_OK\n'
@@ -83,6 +96,7 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
   const checks = buildProviderSmokeChecks(provider, requirements, options.model)
   const ready = Object.values(checks).every(Boolean)
   if (!ready) {
+    const fallbackPolicy = buildProviderSmokeFallbackPolicy(false, 'live')
     return {
       type: 'agent_loop_smoke',
       mode: 'live_manual',
@@ -91,7 +105,15 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
       provider,
       requirements,
       checks,
-      fallbackPolicy: buildProviderSmokeFallbackPolicy(false, 'live'),
+      fallbackPolicy,
+      diagnostic: buildAgentLoopLiveSmokeDiagnostic({
+        provider,
+        ready: false,
+        live: false,
+        checks,
+        roleDiagnosticCount: 0,
+        fallbackPolicy,
+      }),
     }
   }
 
@@ -150,15 +172,19 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
           },
         ],
       }),
+      hooks: configManager.load().hooks,
     })
     const finalSession = await Promise.race([loopPromise, timeout])
     const events = finalSession.events ?? []
+    const roleDiagnostics = buildRoleDiagnostics(usage, provider.modelId, ['Read'])
+    const success = finalSession.phase === 'completed'
+    const fallbackPolicy = buildProviderSmokeFallbackPolicy(success, 'live')
     result = {
       type: 'agent_loop_smoke',
       mode: 'live_manual',
       ready: true,
       live: true,
-      success: finalSession.phase === 'completed',
+      success,
       provider,
       requirements,
       checks,
@@ -170,8 +196,19 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
       taskCompleted: events.some(event => event.type === 'task_session_event' && event.eventType === 'task_completed'),
       criticCompleted: events.some(event => event.type === 'task_session_event' && event.eventType === 'critic_completed'),
       usage,
-      roleDiagnostics: buildRoleDiagnostics(usage, provider.modelId, ['Read']),
-      fallbackPolicy: buildProviderSmokeFallbackPolicy(true, 'live'),
+      roleDiagnostics,
+      fallbackPolicy,
+      diagnostic: buildAgentLoopLiveSmokeDiagnostic({
+        provider,
+        ready: true,
+        live: true,
+        success,
+        sessionId,
+        sessionPhase: finalSession.phase,
+        checks,
+        roleDiagnosticCount: roleDiagnostics.length,
+        fallbackPolicy,
+      }),
     }
   } catch (error) {
     if (didTimeout && loopPromise) {
@@ -183,6 +220,10 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
     const sessionAfterError = getSafeTaskSession(sessionId)
     const events = sessionAfterError?.events ?? []
     const recovery = classifyProviderRecovery(error)
+    const roleDiagnostics = buildRoleDiagnostics(usage, provider.modelId, ['Read'])
+    const fallbackPolicy = didTimeout
+      ? buildProviderSmokeFallbackPolicy(false, 'live')
+      : recovery?.fallbackPolicy ?? buildProviderSmokeFallbackPolicy(false, 'live')
     result = {
       type: 'agent_loop_smoke',
       mode: 'live_manual',
@@ -200,15 +241,25 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
       taskCompleted: events.some(event => event.type === 'task_session_event' && event.eventType === 'task_completed'),
       criticCompleted: events.some(event => event.type === 'task_session_event' && event.eventType === 'critic_completed'),
       usage,
-      roleDiagnostics: buildRoleDiagnostics(usage, provider.modelId, ['Read']),
+      roleDiagnostics,
       error: {
         message: error instanceof Error ? error.message : String(error),
         category: didTimeout ? 'agent_loop_timeout' : undefined,
         recovery,
       },
-      fallbackPolicy: didTimeout
-        ? buildProviderSmokeFallbackPolicy(false, 'live')
-        : recovery?.fallbackPolicy ?? buildProviderSmokeFallbackPolicy(false, 'live'),
+      fallbackPolicy,
+      diagnostic: buildAgentLoopLiveSmokeDiagnostic({
+        provider,
+        ready: true,
+        live: false,
+        success: false,
+        sessionId,
+        sessionPhase: sessionAfterError?.phase,
+        checks,
+        roleDiagnosticCount: roleDiagnostics.length,
+        fallbackPolicy,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }),
     }
   } finally {
     if (timeoutId) clearTimeout(timeoutId)
@@ -226,6 +277,72 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
     ...result!,
     workspaceCleaned,
   }
+}
+
+function buildAgentLoopLiveSmokeDiagnostic(options: {
+  provider: ProviderDiagnostics
+  ready: boolean
+  live: boolean
+  success?: boolean
+  sessionId?: string
+  sessionPhase?: string
+  checks: ProviderSmokeChecks
+  roleDiagnosticCount: number
+  fallbackPolicy: ProviderSmokeFallbackPolicy | ProviderFallbackPolicy
+  errorMessage?: string
+}): AgentLoopLiveSmokeDiagnosticEnvelope {
+  const failedChecks = Object.entries(options.checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name)
+  const signals: AgentLoopLiveSmokeDiagnosticEnvelope['signals'] = failedChecks.map(name => ({
+    type: `agent_loop_smoke_check_${name}`,
+    severity: 'critical',
+    message: `AgentLoop provider smoke check failed: ${name}.`,
+  }))
+  if (options.ready && !options.live) {
+    signals.push({
+      type: 'agent_loop_live_smoke_failed',
+      severity: 'critical',
+      message: options.errorMessage ?? 'AgentLoop provider live smoke failed.',
+    })
+  } else if (options.ready && options.success === false) {
+    signals.push({
+      type: 'agent_loop_live_smoke_incomplete',
+      severity: 'warning',
+      message: 'AgentLoop provider live smoke did not complete successfully.',
+    })
+  }
+  return buildRuntimeDiagnostics({
+    domain: 'provider',
+    name: 'agent_loop_smoke',
+    status: !options.ready || !options.live ? 'blocked' : options.success === false ? 'warning' : 'ok',
+    summary: `${options.provider.providerId}/${options.provider.modelId} agent loop live ready=${options.ready ? 'yes' : 'no'} live=${options.live ? 'yes' : 'no'}`,
+    signals,
+    recommendations: [options.fallbackPolicy.nextAction],
+    action: {
+      mode: options.fallbackPolicy.mode,
+      description: options.fallbackPolicy.nextAction,
+      requiresUserConfirmation: true,
+      allowSilentModelSwitch: false,
+      sideEffects: {
+        willSwitchModel: false,
+        willSwitchProvider: false,
+        willMutateConfig: false,
+        willCallProvider: false,
+        willCreateSession: false,
+      },
+    },
+    details: {
+      providerId: options.provider.providerId,
+      modelId: options.provider.modelId,
+      ready: options.ready,
+      live: options.live,
+      success: options.success,
+      sessionId: options.sessionId,
+      sessionPhase: options.sessionPhase,
+      roleDiagnosticCount: options.roleDiagnosticCount,
+    },
+  })
 }
 
 function getSafeTaskSession(sessionId: string) {

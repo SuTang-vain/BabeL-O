@@ -17,6 +17,7 @@ export type ToolResultContentBlock = {
   toolUseId: string
   content: string
   isError?: boolean
+  toolName?: string
 }
 
 export type ContentBlock =

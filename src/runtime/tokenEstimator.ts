@@ -9,6 +9,8 @@ export type ContextTokenEstimate = {
   systemPromptTokens: number
   messageTokens: number
   toolDefinitionTokens: number
+  conservativeBufferPercent?: number
+  baseTotalTokens?: number
 }
 
 export type ContextWindowState = {
@@ -24,27 +26,56 @@ export type ContextWindowState = {
 }
 
 const TOOL_DEFINITION_OVERHEAD_TOKENS = 500
+const PROVIDER_TOOL_SCHEMA_WRAPPER_TOKENS = 128
 const TOOL_USE_OVERHEAD_TOKENS = 24
 const TOOL_RESULT_OVERHEAD_TOKENS = 18
 const THINKING_BLOCK_OVERHEAD_TOKENS = 12
 const IMAGE_OR_DOCUMENT_TOKENS = 2_000
 const SERVER_TOOL_BLOCK_OVERHEAD_TOKENS = 64
+const JSON_LIKE_CHARS_PER_TOKEN = 3
+const TOOL_RESULT_CHARS_PER_TOKEN = 2
+const THINKING_CHARS_PER_TOKEN = 3
+const DEFAULT_CONSERVATIVE_BUFFER_PERCENT = 25
 
 export function estimateContextTokens(options: {
   systemPrompt?: string
   messages: ModelMessage[]
   tools?: ModelToolDefinition[]
+  conservative?: boolean
+  conservativeBufferPercent?: number
 }): ContextTokenEstimate {
   const systemPromptTokens = estimateTextTokens(options.systemPrompt ?? '')
   const messageTokens = estimateModelMessagesTokens(options.messages)
   const toolDefinitionTokens = estimateToolDefinitionsTokens(options.tools ?? [])
+  const baseTotalTokens = systemPromptTokens + messageTokens + toolDefinitionTokens
 
+  if (!options.conservative) {
+    return {
+      totalTokens: baseTotalTokens,
+      systemPromptTokens,
+      messageTokens,
+      toolDefinitionTokens,
+    }
+  }
+
+  const conservativeBufferPercent = normalizeConservativeBufferPercent(options.conservativeBufferPercent)
   return {
-    totalTokens: systemPromptTokens + messageTokens + toolDefinitionTokens,
+    totalTokens: estimateTokensConservative(baseTotalTokens, conservativeBufferPercent),
     systemPromptTokens,
     messageTokens,
     toolDefinitionTokens,
+    conservativeBufferPercent,
+    baseTotalTokens,
   }
+}
+
+export function estimateTokensConservative(
+  tokens: number,
+  bufferPercent = DEFAULT_CONSERVATIVE_BUFFER_PERCENT,
+): number {
+  const normalizedTokens = Math.max(0, Math.ceil(tokens))
+  const normalizedBufferPercent = normalizeConservativeBufferPercent(bufferPercent)
+  return Math.ceil(normalizedTokens * (1 + normalizedBufferPercent / 100))
 }
 
 export function getContextWindowState(options: {
@@ -90,7 +121,7 @@ export function estimateModelMessagesTokens(messages: ModelMessage[]): number {
       total += estimateContentBlocksTokens(message.content)
     }
     if (message.reasoningContent) {
-      total += THINKING_BLOCK_OVERHEAD_TOKENS + estimateTextTokens(message.reasoningContent)
+      total += THINKING_BLOCK_OVERHEAD_TOKENS + estimateThinkingTokens(message.reasoningContent)
     }
   }
   return total
@@ -99,7 +130,7 @@ export function estimateModelMessagesTokens(messages: ModelMessage[]): number {
 export function estimateToolDefinitionsTokens(tools: ModelToolDefinition[]): number {
   let total = 0
   for (const tool of tools) {
-    total += TOOL_DEFINITION_OVERHEAD_TOKENS
+    total += TOOL_DEFINITION_OVERHEAD_TOKENS + PROVIDER_TOOL_SCHEMA_WRAPPER_TOKENS
     total += estimateTextTokens(tool.name)
     total += estimateTextTokens(tool.description)
     total += estimateJsonLikeTokens(tool.inputSchema)
@@ -158,12 +189,12 @@ function estimateUnknownBlockTokens(block: unknown): number {
         estimateJsonLikeTokens(record.input)
     case 'tool_result':
       return TOOL_RESULT_OVERHEAD_TOKENS +
-        estimateTextTokens(String(record.content ?? '')) +
+        estimateToolResultTokens(String(record.content ?? '')) +
         (record.isError ? 4 : 0)
     case 'thinking':
-      return THINKING_BLOCK_OVERHEAD_TOKENS + estimateTextTokens(String(record.thinking ?? ''))
+      return THINKING_BLOCK_OVERHEAD_TOKENS + estimateThinkingTokens(String(record.thinking ?? ''))
     case 'redacted_thinking':
-      return THINKING_BLOCK_OVERHEAD_TOKENS + estimateTextTokens(String(record.data ?? ''))
+      return THINKING_BLOCK_OVERHEAD_TOKENS + estimateThinkingTokens(String(record.data ?? ''))
     case 'image':
     case 'document':
       return IMAGE_OR_DOCUMENT_TOKENS
@@ -179,10 +210,25 @@ function estimateJsonLikeTokens(value: unknown): number {
     return estimateTextTokens(String(value))
   }
   try {
-    return estimateTextTokens(JSON.stringify(value))
+    return estimateJsonLikeStringTokens(JSON.stringify(value))
   } catch {
     return estimateTextTokens(String(value))
   }
+}
+
+function estimateJsonLikeStringTokens(value: string): number {
+  if (!value) return 0
+  return Math.ceil(value.length / JSON_LIKE_CHARS_PER_TOKEN)
+}
+
+function estimateToolResultTokens(content: string): number {
+  if (!content) return 0
+  return Math.ceil(content.length / TOOL_RESULT_CHARS_PER_TOKEN)
+}
+
+function estimateThinkingTokens(thinking: string): number {
+  if (!thinking) return 0
+  return Math.ceil(thinking.length / THINKING_CHARS_PER_TOKEN)
 }
 
 function isCjk(char: string): boolean {
@@ -192,4 +238,9 @@ function isCjk(char: string): boolean {
 function clampPercent(value: number): number {
   if (!Number.isFinite(value)) return 85
   return Math.max(1, Math.min(99, value))
+}
+
+function normalizeConservativeBufferPercent(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_CONSERVATIVE_BUFFER_PERCENT
+  return Math.max(20, Math.min(30, Math.round(value)))
 }

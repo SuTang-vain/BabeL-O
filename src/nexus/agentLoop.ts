@@ -26,6 +26,7 @@ import {
   getTaskSession,
   updateTaskSession,
 } from './taskSession.js'
+import type { HooksConfig } from '../shared/config.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
 import { logger } from '../shared/logger.js'
@@ -221,6 +222,7 @@ export type RunAgentLoopOptions = {
   currentTaskId?: string
   sessionMetadata?: Record<string, unknown>
   tasks?: PlannerTaskPlan[]
+  hooks?: HooksConfig
 }
 
 export async function runAgentLoop(options: RunAgentLoopOptions): Promise<SessionSnapshot> {
@@ -242,6 +244,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
     currentTaskId,
     sessionMetadata,
     tasks,
+    hooks,
   } = options
 
   // Create Task Session
@@ -287,7 +290,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
       recordTaskSessionEvent(sessionId, 'pre_planned_tasks_loaded', { plannerOutput })
     } else {
       setTaskSessionPhase(sessionId, 'planning')
-      
+
       // Call Planner
       plannerOutput = await stepRunner<{ sessionId: string; goal: string; queueId: string; context?: string }, PlannerAgentResult>({
         roleDefinition: PLANNER_ROLE,
@@ -377,7 +380,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
       recordTaskSessionEvent(sessionId, 'task_claimed', { task })
 
       const taskRole = role === 'optimizer' ? OPTIMIZER_ROLE : EXECUTOR_ROLE
-      
+
       const requiresIsolation = task.metadata?.requiresIsolation === true
       let isIsolated = false
       let isolatedWorktreeMerged = false
@@ -423,6 +426,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               toolInput: { prompt: task.title, sessionId: subSessionId, parentSessionId: sessionId },
             },
             { sessionId, cwd: taskCwd },
+            { config: hooks },
           )
           for (const ev of subAgentHooks.events) {
             recordTaskSessionEvent(sessionId, 'hook_event', { hookEvent: ev })
@@ -469,6 +473,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                   metadata: task.metadata ? { ...task.metadata, parentTaskId: undefined } : undefined,
                 },
               ],
+              hooks,
             })
 
             const cancelledSubSession = getCancelledTaskSession(subSessionId)
@@ -582,6 +587,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 success: executorSuccess,
               },
               { sessionId, cwd: taskCwd },
+              { config: hooks },
             )
             for (const ev of subAgentStopHooks.events) {
               recordTaskSessionEvent(sessionId, 'hook_event', { hookEvent: ev })

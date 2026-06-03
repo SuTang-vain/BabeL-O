@@ -2,6 +2,7 @@ import type { ProviderDiagnostics } from '../shared/config.js'
 import { ConfigManager } from '../shared/config.js'
 import { getAdapter, getModel } from '../providers/registry.js'
 import { classifyProviderRecovery, type ProviderFallbackPolicy } from './providerRecovery.js'
+import { buildRuntimeDiagnostics, type RuntimeDiagnosticsEnvelope } from './runtimeDiagnostics.js'
 
 export type ProviderSmokeRequirements = {
   tools: boolean
@@ -34,6 +35,18 @@ export type ProviderSmokeOptions = {
   requireStructuredOutput?: boolean
 }
 
+export type ProviderSmokeDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
+  providerId: string
+  modelId: string
+  mode: 'dry_run' | 'live'
+  smokeMode?: ProviderLiveSmokeMode
+  ready: boolean
+  live?: boolean
+  success?: boolean
+  checks: ProviderSmokeChecks
+  requirements: ProviderSmokeRequirements
+}>
+
 export type ProviderSmokeResult = {
   type: 'provider_smoke'
   mode: 'dry_run'
@@ -42,6 +55,7 @@ export type ProviderSmokeResult = {
   requirements: ProviderSmokeRequirements
   checks: ProviderSmokeChecks
   fallbackPolicy: ProviderSmokeFallbackPolicy
+  diagnostic: ProviderSmokeDiagnosticEnvelope
 }
 
 export type ProviderLiveSmokeMode = 'simple_text' | 'tool_call'
@@ -74,6 +88,7 @@ export type ProviderLiveSmokeResult = {
     recovery: ReturnType<typeof classifyProviderRecovery>
   }
   fallbackPolicy: ProviderSmokeFallbackPolicy | ProviderFallbackPolicy
+  diagnostic: ProviderSmokeDiagnosticEnvelope
 }
 
 const SMOKE_TEXT = 'BABEL_O_PROVIDER_SMOKE_OK'
@@ -112,6 +127,7 @@ export function runProviderSmokeDryRun(options: ProviderSmokeOptions = {}): Prov
   }
   const checks = buildProviderSmokeChecks(provider, requirements, options.model)
   const ready = Object.values(checks).every(Boolean)
+  const fallbackPolicy = buildProviderSmokeFallbackPolicy(ready, 'dry_run')
   return {
     type: 'provider_smoke',
     mode: 'dry_run',
@@ -119,7 +135,15 @@ export function runProviderSmokeDryRun(options: ProviderSmokeOptions = {}): Prov
     provider,
     requirements,
     checks,
-    fallbackPolicy: buildProviderSmokeFallbackPolicy(ready, 'dry_run'),
+    fallbackPolicy,
+    diagnostic: buildProviderSmokeDiagnostic({
+      provider,
+      mode: 'dry_run',
+      ready,
+      requirements,
+      checks,
+      fallbackPolicy,
+    }),
   }
 }
 
@@ -142,6 +166,7 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
   const checks = buildProviderSmokeChecks(provider, requirements, options.model)
   const ready = Object.values(checks).every(Boolean)
   if (!ready) {
+    const fallbackPolicy = buildProviderSmokeFallbackPolicy(false, 'live')
     return {
       type: 'provider_smoke',
       mode: 'live',
@@ -151,7 +176,17 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
       provider,
       requirements,
       checks,
-      fallbackPolicy: buildProviderSmokeFallbackPolicy(false, 'live'),
+      fallbackPolicy,
+      diagnostic: buildProviderSmokeDiagnostic({
+        provider,
+        mode: 'live',
+        smokeMode,
+        ready: false,
+        live: false,
+        requirements,
+        checks,
+        fallbackPolicy,
+      }),
     }
   }
 
@@ -201,13 +236,15 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
     const matchedExpectedTool = toolCalls.some(call =>
       call.name === SMOKE_TOOL_NAME && matchesExpectedSmokeToolInput(call.input),
     )
+    const success = smokeMode === 'tool_call' ? matchedExpectedTool : output.length > 0
+    const fallbackPolicy = buildProviderSmokeFallbackPolicy(success, 'live')
     return {
       type: 'provider_smoke',
       mode: 'live',
       smokeMode,
       ready: true,
       live: true,
-      success: smokeMode === 'tool_call' ? matchedExpectedTool : output.length > 0,
+      success,
       matchedExpectedText: smokeMode === 'simple_text' ? output === SMOKE_TEXT : undefined,
       matchedExpectedTool: smokeMode === 'tool_call' ? matchedExpectedTool : undefined,
       toolCallCount: smokeMode === 'tool_call' ? toolCalls.length : undefined,
@@ -217,10 +254,22 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
       checks,
       outputPreview: output.slice(0, 200),
       deltas,
-      fallbackPolicy: buildProviderSmokeFallbackPolicy(true, 'live'),
+      fallbackPolicy,
+      diagnostic: buildProviderSmokeDiagnostic({
+        provider,
+        mode: 'live',
+        smokeMode,
+        ready: true,
+        live: true,
+        success,
+        requirements,
+        checks,
+        fallbackPolicy,
+      }),
     }
   } catch (error) {
     const recovery = classifyProviderRecovery(error)
+    const fallbackPolicy = recovery?.fallbackPolicy ?? buildProviderSmokeFallbackPolicy(false, 'live')
     return {
       type: 'provider_smoke',
       mode: 'live',
@@ -235,11 +284,96 @@ export async function runProviderLiveSmoke(options: ProviderLiveSmokeOptions = {
         message: error instanceof Error ? error.message : String(error),
         recovery,
       },
-      fallbackPolicy: recovery?.fallbackPolicy ?? buildProviderSmokeFallbackPolicy(false, 'live'),
+      fallbackPolicy,
+      diagnostic: buildProviderSmokeDiagnostic({
+        provider,
+        mode: 'live',
+        smokeMode,
+        ready: true,
+        live: false,
+        success: false,
+        requirements,
+        checks,
+        fallbackPolicy,
+        errorMessage: error instanceof Error ? error.message : String(error),
+      }),
     }
   } finally {
     clearTimeout(timeout)
   }
+}
+
+function buildProviderSmokeDiagnostic(options: {
+  provider: ProviderDiagnostics
+  mode: 'dry_run' | 'live'
+  smokeMode?: ProviderLiveSmokeMode
+  ready: boolean
+  live?: boolean
+  success?: boolean
+  requirements: ProviderSmokeRequirements
+  checks: ProviderSmokeChecks
+  fallbackPolicy: ProviderSmokeFallbackPolicy | ProviderFallbackPolicy
+  errorMessage?: string
+}): ProviderSmokeDiagnosticEnvelope {
+  const failedChecks = Object.entries(options.checks)
+    .filter(([, passed]) => !passed)
+    .map(([name]) => name)
+  const signals: ProviderSmokeDiagnosticEnvelope['signals'] = failedChecks.map(name => ({
+    type: `provider_check_${name}`,
+    severity: 'critical',
+    message: `Provider smoke check failed: ${name}.`,
+  }))
+  if (options.ready && options.mode === 'live' && options.live === false) {
+    signals.push({
+      type: 'provider_live_smoke_failed',
+      severity: 'critical',
+      message: options.errorMessage ?? 'Provider live smoke failed.',
+    })
+  } else if (options.ready && options.mode === 'live' && options.success === false) {
+    signals.push({
+      type: 'provider_live_smoke_mismatch',
+      severity: 'warning',
+      message: 'Provider live smoke completed but did not match the expected probe.',
+    })
+  }
+  const status = !options.ready || options.live === false
+    ? 'blocked'
+    : options.success === false
+      ? 'warning'
+      : 'ok'
+  const recommendations = [options.fallbackPolicy.nextAction]
+  return buildRuntimeDiagnostics({
+    domain: 'provider',
+    name: 'provider_smoke',
+    status,
+    summary: `${options.provider.providerId}/${options.provider.modelId} ${options.mode}${options.smokeMode ? `/${options.smokeMode}` : ''} ready=${options.ready ? 'yes' : 'no'}`,
+    signals,
+    recommendations,
+    action: {
+      mode: options.fallbackPolicy.mode,
+      description: options.fallbackPolicy.nextAction,
+      requiresUserConfirmation: true,
+      allowSilentModelSwitch: false,
+      sideEffects: {
+        willSwitchModel: false,
+        willSwitchProvider: false,
+        willMutateConfig: false,
+        willCallProvider: false,
+        willCreateSession: false,
+      },
+    },
+    details: {
+      providerId: options.provider.providerId,
+      modelId: options.provider.modelId,
+      mode: options.mode,
+      smokeMode: options.smokeMode,
+      ready: options.ready,
+      live: options.live,
+      success: options.success,
+      checks: options.checks,
+      requirements: options.requirements,
+    },
+  })
 }
 
 export function buildProviderSmokeChecks(

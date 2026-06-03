@@ -15,7 +15,7 @@ test('interactive permission approval flow via HTTP POST', async () => {
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const sessionId = `session-approve-${Date.now()}`
-  
+
   // 异步发起 execute 流程，遇到写文件会阻塞
   const executePromise = app.inject({
     method: 'POST',
@@ -82,7 +82,7 @@ test('interactive permission denial flow via HTTP POST', async () => {
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const sessionId = `session-deny-${Date.now()}`
-  
+
   // 异步发起 execute 流程
   const executePromise = app.inject({
     method: 'POST',
@@ -153,13 +153,13 @@ test('interactive permission approval via WebSocket stream', async () => {
   const wsUrl = address.replace(/^http/, 'ws') + '/v1/stream'
 
   const sessionId = `session-ws-${Date.now()}`
-  
+
   const wsModule = await import('ws')
   const wsCtor = (globalThis as any).WebSocket || wsModule.default
   const ws = new wsCtor(wsUrl)
 
   const events: any[] = []
-  
+
   await new Promise<void>((resolve, reject) => {
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({ prompt: 'write temp.txt "ws content"', cwd, sessionId }))

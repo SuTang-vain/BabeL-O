@@ -1,5 +1,11 @@
 import type { ModelMessage, ContentBlock } from '../providers/adapters/ModelAdapter.js'
 
+function stripInternalToolResultMetadata(block: ContentBlock): ContentBlock {
+  if (block.type !== 'tool_result') return block
+  const { toolName: _toolName, ...providerBlock } = block
+  return providerBlock
+}
+
 export function normalizeMessages(messages: ModelMessage[]): ModelMessage[] {
   const toolUseIds = new Set<string>()
   const toolResultIds = new Set<string>()
@@ -25,7 +31,7 @@ export function normalizeMessages(messages: ModelMessage[]): ModelMessage[] {
       return true
     })
     if (filtered.length > 0) {
-      result.push({ ...msg, content: filtered })
+      result.push({ ...msg, content: filtered.map(stripInternalToolResultMetadata) })
     }
   }
 

@@ -75,7 +75,7 @@ You can install BabeL-O either by downloading a pre-compiled native binary direc
 
 ### Method 1: Pre-compiled Native Binary (Recommended & Fastest)
 
-Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.2.7.md) for version-specific download links.
+Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.2.8.md) for version-specific download links.
 
 Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
 ```bash

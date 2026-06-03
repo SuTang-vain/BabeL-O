@@ -1,5 +1,6 @@
 import type { ProviderDiagnostics } from '../shared/config.js'
 import { ProviderError } from '../shared/errors.js'
+import { buildRuntimeDiagnostics, type RuntimeDiagnosticsEnvelope } from './runtimeDiagnostics.js'
 
 export type ProviderRecoveryKind =
   | 'max_output_tokens'
@@ -16,6 +17,14 @@ export type ProviderFallbackPolicy = {
   nextAction: string
   allowSilentModelSwitch: false
 }
+
+export type ProviderFallbackDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
+  providerId: string
+  modelId: string
+  recoveryKind: ProviderRecoveryKind
+  policyMode: ProviderFallbackPolicy['mode']
+  actionStatus: 'ready' | 'blocked' | 'needs_user_confirmation'
+}>
 
 export type ProviderRecoveryDetails = {
   providerId?: string
@@ -44,6 +53,7 @@ export type ProviderFallbackAction = {
     willCallProvider: false
     willCreateSession: false
   }
+  diagnostic: ProviderFallbackDiagnosticEnvelope
 }
 
 export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetails | undefined {
@@ -174,27 +184,104 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
 export function planProviderFallbackAction(options: {
   provider: ProviderDiagnostics
   recovery?: ProviderRecoveryDetails
+  recoveryKind?: ProviderRecoveryKind
   policy?: ProviderFallbackPolicy
 }): ProviderFallbackAction {
-  const fallbackPolicy = options.policy ?? options.recovery?.fallbackPolicy ?? buildProviderFallbackPolicy('unknown')
+  const fallbackPolicy = options.policy ?? options.recovery?.fallbackPolicy ?? buildProviderFallbackPolicy(options.recoveryKind ?? 'unknown')
+  const action: ProviderFallbackAction['action'] = {
+    mode: fallbackPolicy.mode,
+    status: fallbackPolicy.mode === 'no_auto_fallback' || fallbackPolicy.mode === 'fix_configuration'
+      ? 'blocked'
+      : 'needs_user_confirmation',
+    description: fallbackPolicy.nextAction,
+    requiresUserConfirmation: true,
+    willSwitchModel: false,
+    willSwitchProvider: false,
+    willMutateConfig: false,
+    willCallProvider: false,
+    willCreateSession: false,
+  }
   return {
     type: 'provider_fallback_plan',
     provider: options.provider,
     recovery: options.recovery,
     fallbackPolicy,
+    action,
+    diagnostic: buildProviderFallbackDiagnostic({
+      provider: options.provider,
+      recovery: options.recovery,
+      recoveryKind: options.recoveryKind,
+      fallbackPolicy,
+      action,
+    }),
+  }
+}
+
+function buildProviderFallbackDiagnostic(options: {
+  provider: ProviderDiagnostics
+  recovery?: ProviderRecoveryDetails
+  recoveryKind?: ProviderRecoveryKind
+  fallbackPolicy: ProviderFallbackPolicy
+  action: ProviderFallbackAction['action']
+}): ProviderFallbackDiagnosticEnvelope {
+  const recoveryKind = options.recovery?.kind ?? options.recoveryKind ?? inferRecoveryKindFromPolicy(options.fallbackPolicy)
+  const signals: ProviderFallbackDiagnosticEnvelope['signals'] = []
+  if (options.action.status === 'blocked') {
+    signals.push({
+      type: 'provider_fallback_blocked',
+      severity: 'critical',
+      message: options.fallbackPolicy.reason,
+    })
+  } else {
+    signals.push({
+      type: 'provider_fallback_requires_confirmation',
+      severity: 'warning',
+      message: 'Provider fallback requires explicit user confirmation.',
+    })
+  }
+  return buildRuntimeDiagnostics({
+    domain: 'provider',
+    name: 'provider_fallback_plan',
+    status: options.action.status === 'blocked' ? 'blocked' : 'warning',
+    summary: `${options.provider.providerId}/${options.provider.modelId} fallback ${options.fallbackPolicy.mode} for ${recoveryKind}`,
+    signals,
+    recommendations: [options.fallbackPolicy.nextAction],
     action: {
-      mode: fallbackPolicy.mode,
-      status: fallbackPolicy.mode === 'no_auto_fallback' || fallbackPolicy.mode === 'fix_configuration'
-        ? 'blocked'
-        : 'needs_user_confirmation',
-      description: fallbackPolicy.nextAction,
-      requiresUserConfirmation: true,
-      willSwitchModel: false,
-      willSwitchProvider: false,
-      willMutateConfig: false,
-      willCallProvider: false,
-      willCreateSession: false,
+      mode: options.action.mode,
+      status: options.action.status,
+      description: options.action.description,
+      requiresUserConfirmation: options.action.requiresUserConfirmation,
+      allowSilentModelSwitch: false,
+      sideEffects: {
+        willSwitchModel: options.action.willSwitchModel,
+        willSwitchProvider: options.action.willSwitchProvider,
+        willMutateConfig: options.action.willMutateConfig,
+        willCallProvider: options.action.willCallProvider,
+        willCreateSession: options.action.willCreateSession,
+      },
     },
+    details: {
+      providerId: options.provider.providerId,
+      modelId: options.provider.modelId,
+      recoveryKind,
+      policyMode: options.fallbackPolicy.mode,
+      actionStatus: options.action.status,
+    },
+  })
+}
+
+function inferRecoveryKindFromPolicy(policy: ProviderFallbackPolicy): ProviderRecoveryKind {
+  switch (policy.mode) {
+    case 'manual_confirm':
+      return 'max_output_tokens'
+    case 'compact_then_retry':
+      return 'context_window'
+    case 'retry_same_model':
+      return 'provider_unavailable'
+    case 'fix_configuration':
+      return 'auth_or_billing'
+    case 'no_auto_fallback':
+      return 'unknown'
   }
 }
 

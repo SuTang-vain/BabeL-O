@@ -9,6 +9,7 @@ import {
   updateTaskSession,
 } from './taskSession.js'
 import { nowIso } from '../shared/id.js'
+import type { HooksConfig } from '../shared/config.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
 
 export type CloseNexusSessionOptions = {
@@ -16,6 +17,7 @@ export type CloseNexusSessionOptions = {
   sessionId: string
   phase?: 'cancelled' | 'completed' | 'failed'
   reason?: string
+  hooks?: HooksConfig
 }
 
 export async function closeNexusSession(
@@ -62,6 +64,7 @@ export async function closeNexusSession(
       sessionId: options.sessionId,
       cwd: session?.cwd ?? '',
     },
+    { config: options.hooks },
   )
   if (session) {
     for (const event of hookResult.events) {

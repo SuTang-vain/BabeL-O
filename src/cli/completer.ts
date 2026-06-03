@@ -11,13 +11,18 @@ import {
   countRenderedLines
 } from './ui.js'
 import { inputState } from './inputState.js'
-import { visibleTerminalWidth } from './terminalWidth.js'
+import { currentInputModelLabel } from './inputBox.js'
+import { truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
 type CliReadline = readline.Interface
 
+type SlashPaletteOptions = {
+  clearInputBlock?: () => void
+}
+
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/compact', '/context', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
+    '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
     '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e',
   ]
 }
@@ -46,6 +51,8 @@ export function formatSlashPalette(
   choices: string[],
   activeIndex: number,
   totalCount = choices.length,
+  modelLabel = currentInputModelLabel(),
+  options: { showSeparator?: boolean; columns?: number } = {},
 ): string {
   if (choices.length === 0) return ''
 
@@ -56,31 +63,76 @@ export function formatSlashPalette(
   }
 
   const visible = choices.slice(scrollOffset, scrollOffset + visibleHeight)
-  const lines = [
-    chalk.dim('─'.repeat(process.stdout.columns || 80)),
-  ]
+  const terminalColumns = Math.max(24, options.columns ?? process.stdout.columns ?? 80)
+  const columns = Math.max(20, terminalColumns - 1)
+  const contentColumns = Math.max(18, columns - 2)
+  const lines = options.showSeparator === false
+    ? []
+    : [chalk.dim('─'.repeat(columns))]
+  const longestLabelWidth = Math.max(
+    0,
+    ...visible.map(choice => visibleTerminalWidth(describeCompletionChoice(choice).label)),
+  )
+  const labelColumnWidth = Math.max(
+    10,
+    Math.min(Math.max(18, longestLabelWidth + 8), Math.floor(contentColumns * 0.48)),
+  )
   for (let index = 0; index < visible.length; index++) {
     const choice = visible[index]!
     const { label, description } = describeCompletionChoice(choice)
     const selected = (index + scrollOffset) === activeIndex
     const marker = selected ? chalk.blue('>') : ' '
-    const left = selected ? chalk.blue(label) : chalk.white(label)
-    const right = chalk.dim(description)
-    lines.push(`${marker} ${left.padEnd(18)} ${right}`)
+    const labelWidth = Math.min(visibleTerminalWidth(label), Math.max(1, labelColumnWidth - 2))
+    const renderedLabel = visibleTerminalWidth(label) > labelWidth
+      ? `${truncateToTerminalWidth(label, Math.max(1, labelWidth - 1))}…`
+      : label
+    const left = selected ? chalk.blue(renderedLabel) : chalk.white(renderedLabel)
+    const padding = ' '.repeat(Math.max(2, labelColumnWidth - visibleTerminalWidth(renderedLabel)))
+    const descriptionBudget = Math.max(0, contentColumns - 2 - labelColumnWidth)
+    const renderedDescription = truncateWithEllipsis(description, descriptionBudget)
+    const right = renderedDescription ? chalk.dim(renderedDescription) : ''
+    lines.push(`${marker} ${left}${padding}${right}`.trimEnd())
   }
 
   const remainingBelow = Math.max(0, totalCount - (scrollOffset + visible.length))
   const remainingAbove = scrollOffset
 
   if (remainingAbove > 0) {
-    lines.splice(1, 0, `  ${chalk.dim(`↑ ${remainingAbove} more`)}`)
+    const insertIndex = options.showSeparator === false ? 0 : 1
+    lines.splice(insertIndex, 0, `  ${chalk.dim(`↑ ${remainingAbove} more`)}`)
   }
   if (remainingBelow > 0) {
     lines.push(`  ${chalk.dim(`↓ ${remainingBelow} more`)}`)
   }
   lines.push('')
-  lines.push(`${chalk.dim('↑/↓ Navigate ·')} ${chalk.blue('tab')} ${chalk.dim('Complete ·')} ${chalk.blue('enter')} ${chalk.dim('Run')}`)
+  lines.push(formatSlashPaletteFooter(columns, modelLabel))
   return `${lines.join('\n')}\n`
+}
+
+function formatSlashPaletteFooter(columns: number, modelLabel: string): string {
+  const navigation = columns < 54
+    ? `${chalk.dim('↑/↓ ·')} ${chalk.blue('tab')} ${chalk.dim('Complete')}`
+    : `${chalk.dim('↑/↓ Navigate ·')} ${chalk.blue('tab')} ${chalk.dim('Complete ·')} ${chalk.blue('enter')} ${chalk.dim('Run')}`
+  const cancel = chalk.dim('esc to cancel')
+  const model = chalk.dim(truncateWithEllipsis(modelLabel, Math.max(8, Math.floor(columns * 0.45))))
+  const navLine = alignRight(navigation, columns)
+  const bottomLeft = visibleTerminalWidth(cancel) + visibleTerminalWidth(model) + 1 <= columns
+    ? `${cancel}${' '.repeat(Math.max(1, columns - visibleTerminalWidth(cancel) - visibleTerminalWidth(model)))}${model}`
+    : model
+  return `${navLine}\n${bottomLeft}`
+}
+
+function alignRight(text: string, columns: number): string {
+  const width = visibleTerminalWidth(text)
+  if (width >= columns) return truncateWithEllipsis(text, columns)
+  return `${' '.repeat(columns - width)}${text}`
+}
+
+function truncateWithEllipsis(text: string, width: number): string {
+  if (width <= 0) return ''
+  if (visibleTerminalWidth(text) <= width) return text
+  if (width === 1) return '…'
+  return `${truncateToTerminalWidth(text, width - 1)}…`
 }
 
 export function makeCompleter(cwd: string) {
@@ -186,7 +238,7 @@ interface ReadlineInternal extends CliReadline {
   history: string[]
 }
 
-export function createSlashPalette(rl: CliReadline) {
+export function createSlashPalette(rl: CliReadline, options: SlashPaletteOptions = {}) {
   const rlInt = rl as ReadlineInternal
   let activeIndex = 0
   let currentChoices: string[] = []
@@ -194,7 +246,9 @@ export function createSlashPalette(rl: CliReadline) {
   let isOpen = false
   let query = ''
   let renderedLines = 0
+  let cursorRowInOverlay = 0
   let pendingRefresh: NodeJS.Timeout | null = null
+  let clearedInputBlock = false
 
   const originalTtyWrite = typeof rlInt._ttyWrite === 'function'
     ? rlInt._ttyWrite.bind(rlInt)
@@ -232,27 +286,40 @@ export function createSlashPalette(rl: CliReadline) {
   }
 
   const renderOverlay = () => {
+    if (!clearedInputBlock) {
+      options.clearInputBlock?.()
+      clearedInputBlock = true
+    }
     clear()
-    const palette = formatSlashPalette(currentChoices, activeIndex, currentChoices.length)
+    const columns = process.stdout.columns || 80
+    const palette = formatSlashPalette(currentChoices, activeIndex, currentChoices.length, currentInputModelLabel(), { showSeparator: false, columns })
     if (!palette) return
     const line = rlInt.line ?? ''
     const prompt = getChatPrompt()
-    process.stdout.write(`\r\x1b[K${prompt}${line}`)
+    const separator = chalk.dim('─'.repeat(Math.max(1, columns - 1)))
+    process.stdout.write(`\r\x1b[K${separator}`)
+    process.stdout.write(`\n\r\x1b[K${prompt}${line}`)
+    process.stdout.write(`\n\r\x1b[K${separator}`)
     process.stdout.write('\n')
     process.stdout.write(palette)
-    renderedLines = 1 + countRenderedLines(palette)
+    renderedLines = 3 + countRenderedLines(palette)
+    cursorRowInOverlay = 1
 
     const promptWidth = visibleTerminalWidth(prompt)
 
-    readline.moveCursor(process.stdout, 0, -renderedLines)
+    readline.moveCursor(process.stdout, 0, -renderedLines + 1)
     readline.cursorTo(process.stdout, promptWidth + visibleTerminalWidth(line.slice(0, rlInt.cursor ?? line.length)))
   }
 
   const clear = () => {
     if (!isOpen || renderedLines <= 0) return
+    if (cursorRowInOverlay > 0) {
+      readline.moveCursor(process.stdout, 0, -cursorRowInOverlay)
+    }
     readline.cursorTo(process.stdout, 0)
     readline.clearScreenDown(process.stdout)
     renderedLines = 0
+    cursorRowInOverlay = 0
   }
 
   const close = () => {
@@ -263,6 +330,7 @@ export function createSlashPalette(rl: CliReadline) {
     activeIndex = 0
     isOpen = false
     query = ''
+    clearedInputBlock = false
     if (inputState.current === 'slashPalette') {
       inputState.set('idle')
     }
@@ -319,10 +387,15 @@ export function createSlashPalette(rl: CliReadline) {
   }
 
   const handleKey = (chunk: any, key: any): boolean => {
-    if (consumedNavigationKey) {
+    const raw = chunk ? chunk.toString('utf8') : ''
+    const keyName = key?.name
+    const duplicateNavigationKey = keyName === 'up' || keyName === 'down' || keyName === 'tab' ||
+      raw.includes('\x1b[A') || raw.includes('\x1b[B') || raw === '\t'
+    if (consumedNavigationKey && duplicateNavigationKey) {
       consumedNavigationKey = false
       return true
     }
+    consumedNavigationKey = false
     // If permission panel is open, do not intercept keys
     if (inputState.current === 'permissionPanel') {
       return false
@@ -333,7 +406,6 @@ export function createSlashPalette(rl: CliReadline) {
       close()
       return false
     }
-    const raw = chunk ? chunk.toString('utf8') : ''
     if (raw.includes('\x1b[A')) return move(-1)
     if (raw.includes('\x1b[B')) return move(1)
     if (raw === '\t') return select()
@@ -342,7 +414,7 @@ export function createSlashPalette(rl: CliReadline) {
     if (key?.name === 'down') return move(1)
     if (key?.name === 'tab') return select()
     if (key?.name === 'return') return false
-    if (key?.name === 'escape') {
+    if (key?.name === 'escape' || raw === '\x1b') {
       // Restore original query line when escaping palette
       if (query && query !== rlInt.line) {
         setInputLine(query)

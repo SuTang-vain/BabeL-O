@@ -2,13 +2,14 @@ import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { dirname, join } from 'node:path'
-import { tmpdir } from 'node:os'
-import { ConfigManager } from '../src/shared/config.js'
+import { homedir, tmpdir } from 'node:os'
+import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { deriveFallbackUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import { flushSessionMemoryLiteQueue } from '../src/runtime/sessionMemoryLite.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 import { CRITIC_ROLE, EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
 import { parseStructuredAgentOutput, zodRoleOutputSchemaToJsonSchema } from '../src/nexus/runtimeAgentStep.js'
@@ -20,6 +21,7 @@ const CONFIG_ENV_KEYS = [
   'BABEL_O_BASE_URL',
   'BABEL_O_CONFIG_FILE',
   'BABEL_O_TEST_CONFIG_WRITE_GUARD',
+  'BABEL_O_SESSION_MEMORY_LITE',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -116,7 +118,7 @@ describe('ConfigManager', () => {
 
   test('refuses to write default user config from tests without isolation', () => {
     process.env.BABEL_O_TEST_CONFIG_WRITE_GUARD = '1'
-    const configManager = new ConfigManager()
+    const configManager = new ConfigManager(join(homedir(), '.babel-o', 'config.json'))
 
     assert.throws(
       () => configManager.save({}),
@@ -413,6 +415,90 @@ describe('ConfigManager', () => {
     }
   })
 
+  test('creates explicit BabeL-X config import plan without transcript import', () => {
+    const plan = createBabeLXConfigImportPlan({
+      version: 1,
+      activeProfile: 'minimax-work',
+      profiles: [
+        {
+          name: 'minimax-work',
+          type: 'minimax',
+          apiKey: 'legacy-minimax-key',
+          baseUrl: 'https://legacy.minimax.example/anthropic',
+          defaultModel: 'minimax-m2.7-highspeed',
+        },
+        {
+          name: 'moonshot-old',
+          type: 'moonshot',
+          apiKey: 'legacy-moonshot-key',
+          defaultModel: 'moonshot-v1-auto',
+        },
+        {
+          name: 'empty-key',
+          type: 'openai',
+          apiKey: '',
+        },
+      ],
+      settings: { telemetry: false, autoUpdate: true },
+    })
+
+    assert.equal(plan.sourceSchema, 'babel-x-config-v1')
+    assert.equal(plan.transcriptImportSupported, false)
+    assert.deepEqual(plan.importedProfiles, [
+      {
+        name: 'minimax-work',
+        providerId: 'minimax',
+        modelId: 'minimax/MiniMax-M2.7-highspeed',
+        hasApiKey: true,
+        hasBaseUrl: true,
+      },
+    ])
+    assert.deepEqual(plan.skippedProfiles, [
+      {
+        name: 'moonshot-old',
+        providerId: 'moonshot',
+        reason: 'provider is not registered in BabeL-O',
+      },
+      {
+        name: 'empty-key',
+        providerId: 'openai',
+        reason: 'profile has no API key',
+      },
+    ])
+    assert.equal(plan.config.defaultModel, 'minimax/MiniMax-M2.7-highspeed')
+    assert.equal(plan.config.activeProfile, 'minimax-work')
+    assert.equal(plan.config.profiles?.['minimax-work']?.apiKey, 'legacy-minimax-key')
+    assert.equal(plan.config.providers?.minimax?.apiKey, 'legacy-minimax-key')
+    assert.match(plan.warnings.join('\n'), /transcripts are not imported/)
+  })
+
+  test('loads BabeL-X import plan only from an explicit file path', () => {
+    const legacyConfigPath = join(tmpdir(), `babel-x-test-config-${Date.now()}-${Math.random()}.json`)
+    fs.writeFileSync(legacyConfigPath, JSON.stringify({
+      version: 1,
+      activeProfile: 'zhipu-default',
+      profiles: [
+        {
+          name: 'zhipu-default',
+          type: 'zhipu',
+          apiKey: 'legacy-zhipu-key',
+          baseUrl: 'https://open.bigmodel.cn/api/anthropic',
+          defaultModel: 'glm-5.1',
+        },
+      ],
+      settings: { telemetry: false, autoUpdate: true },
+    }), 'utf-8')
+
+    try {
+      const plan = loadBabeLXConfigImportPlan(legacyConfigPath)
+      assert.equal(plan.importedProfiles[0]?.modelId, 'zhipu/glm-5.1')
+      const isolatedConfig = new ConfigManager(tempConfigPath)
+      assert.deepEqual(isolatedConfig.load(), {})
+    } finally {
+      fs.unlinkSync(legacyConfigPath)
+    }
+  })
+
   test('resolveSettings respects request model over env, role, and profile defaults', () => {
     const configManager = new ConfigManager(tempConfigPath)
 
@@ -575,7 +661,7 @@ describe('LLMCodingRuntime', () => {
 
     // Verify events
     assert.ok(events.find(e => e.type === 'session_started'))
-    
+
     const thinkingDelta = events.find(e => e.type === 'thinking_delta')
     assert.ok(thinkingDelta)
     assert.equal((thinkingDelta as any).text, 'Analyzing task')
@@ -594,6 +680,63 @@ describe('LLMCodingRuntime', () => {
     assert.ok(fetchCalls[0].url.startsWith('https://api.test-anthropic.com'))
     const headers = fetchCalls[0].init?.headers as Record<string, string>
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
+  })
+
+  test('queues Session Memory Lite update after no-tool final response', async () => {
+    process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
+    const cwd = join(tmpdir(), `babel-o-runtime-session-memory-${Date.now()}-${Math.random()}`)
+    const sessionId = 'test-session-memory-runtime'
+    const storage = new MemoryStorage()
+    const now = '2026-05-23T00:00:00.000Z'
+    fs.mkdirSync(cwd, { recursive: true })
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'summarize current state',
+      phase: 'executing',
+      createdAt: now,
+      updatedAt: now,
+      events: [],
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:01.000Z',
+      text: 'summarize current state',
+    })
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Current state is stable."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), storage, configManager)
+    try {
+      for await (const event of runtime.executeStream({
+        sessionId,
+        prompt: 'summarize current state',
+        cwd,
+      })) {
+        await storage.appendEvent(sessionId, event)
+      }
+      await flushSessionMemoryLiteQueue()
+
+      const memoryPath = join(cwd, '.babel-o/session-memory.md')
+      assert.equal(fs.existsSync(memoryPath), true)
+      const memoryText = fs.readFileSync(memoryPath, 'utf8')
+      assert.match(memoryText, /reactive pause/)
+
+      const persisted = await storage.listEvents(sessionId, { order: 'asc', limit: 10_000 })
+      assert.equal(persisted.events.filter(event => event.type === 'session_memory_updated').length, 1)
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
   })
 
   test('passes maxOutputTokens to provider requests', async () => {
@@ -1075,8 +1218,8 @@ describe('LLMCodingRuntime', () => {
         'event: content_block_start\n',
         'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-1","name":"Write","input":{}}}\n\n',
         'event: content_block_delta\n',
-        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' + 
-          targetFile.replace(/\\/g, '\\\\') + 
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+          targetFile.replace(/\\/g, '\\\\') +
           '\\",\\"content\\":\\"Hello tool flow\\"}"}}\n\n',
         'event: content_block_stop\n',
         'data: {"index":0}\n\n',

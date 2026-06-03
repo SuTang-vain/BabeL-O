@@ -223,7 +223,7 @@ exit $_EXIT_CODE`
 
     if (context.executionEnvironment === 'docker') {
       const containerName = `babel-o-session-${context.sessionId}`
-      
+
       // 1. Ensure docker container is running
       try {
         let isRunning = false

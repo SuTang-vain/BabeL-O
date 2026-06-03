@@ -664,6 +664,78 @@ test('storageBridge batches WAL writes and flushes explicitly', async () => {
   }
 })
 
+test('storageBridge skips malformed WAL records and replays valid pending operations', async () => {
+  resetStorageBridgeForTest()
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const tempDir = mkdtempSync(join(tmpdir(), 'babel-o-storage-bridge-corrupt-'))
+  const walPath = join(tempDir, 'storage.wal.jsonl')
+
+  try {
+    configureStorageBridgeWalForTest(walPath)
+    setNexusStorage(null)
+
+    const task = createNexusTask({
+      queueId: 'queue-storage-wal-corrupt',
+      title: 'recover around corrupt wal',
+    })
+    flushStorageBridgeWalForTest()
+    writeFileSync(walPath, `${readFileSync(walPath, 'utf8')}{not-json\n`, 'utf8')
+
+    resetStorageBridgeForTest()
+    configureStorageBridgeWalForTest(walPath)
+    const storage = new MemoryStorage()
+    setNexusStorage(storage)
+
+    await flushStorageBridgeForTest()
+
+    assert.equal((await storage.getTask(task.taskId))?.title, 'recover around corrupt wal')
+    const stats = getStorageBridgeStats()
+    assert.equal(stats.queued, 0)
+    assert.equal(stats.walPending, 0)
+    assert.match(stats.lastError ?? '', /JSON/)
+  } finally {
+    resetStorageBridgeForTest()
+    rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
+test('storageBridge exposes compact failure diagnostics without dropping persisted work', async () => {
+  resetStorageBridgeForTest()
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const tempDir = mkdtempSync(join(tmpdir(), 'babel-o-storage-bridge-compact-fail-'))
+  const walPath = join(tempDir, 'storage.wal.jsonl')
+
+  try {
+    configureStorageBridgeWalForTest(walPath)
+    setNexusStorage(null)
+
+    const task = createNexusTask({
+      queueId: 'queue-storage-wal-compact-fail',
+      title: 'persist before compact failure',
+    })
+    flushStorageBridgeWalForTest()
+    mkdirSync(`${walPath}.tmp`, { recursive: true })
+
+    const storage = new MemoryStorage()
+    setNexusStorage(storage)
+
+    await flushStorageBridgeForTest()
+
+    assert.equal((await storage.getTask(task.taskId))?.title, 'persist before compact failure')
+    const stats = getStorageBridgeStats()
+    assert.equal(stats.succeeded, 1)
+    assert.equal(stats.walPending, 0)
+    assert.ok(stats.lastError)
+  } finally {
+    resetStorageBridgeForTest()
+    rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
 test('storageBridge replays a large pending WAL after restart', async () => {
   resetStorageBridgeForTest()
   resetTaskQueuesForTest()

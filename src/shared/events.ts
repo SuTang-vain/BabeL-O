@@ -128,6 +128,11 @@ export const PermissionRequestEventSchema = z.object({
   input: z.unknown(),
   risk: z.enum(['read', 'write', 'execute', 'task']),
   message: z.string().optional(),
+  source: z.object({
+    type: z.enum(['builtin', 'mcp']),
+    serverName: z.string().optional(),
+    originalName: z.string().optional(),
+  }).optional(),
 })
 
 export const PermissionResponseEventSchema = z.object({
@@ -209,6 +214,21 @@ export const ContextWarningEventSchema = z.object({
   message: z.string(),
 })
 
+export const ContextBlockingEventSchema = z.object({
+  type: z.literal('context_blocking'),
+  ...baseEventFields,
+  modelId: z.string().optional(),
+  tokenEstimate: z.number(),
+  maxTokens: z.number(),
+  percentUsed: z.number(),
+  warningThresholdTokens: z.number(),
+  compactThresholdTokens: z.number(),
+  blockingLimitTokens: z.number(),
+  httpStatus: z.literal(413),
+  recoveryActions: z.array(z.enum(['compact', 'context', 'switch_model', 'reduce_tool_output'])),
+  message: z.string(),
+})
+
 export const SessionMemoryUpdatedEventSchema = z.object({
   type: z.literal('session_memory_updated'),
   ...baseEventFields,
@@ -216,6 +236,12 @@ export const SessionMemoryUpdatedEventSchema = z.object({
   trigger: z.enum(['manual', 'auto', 'reactive']),
   summaryChars: z.number(),
   eventCount: z.number(),
+  reason: z.enum(['compact', 'pause']).optional(),
+  decisionReason: z.enum(['disabled', 'duplicate_turn', 'natural_pause', 'growth_threshold', 'forced', 'insufficient_signal']).optional(),
+  estimatedTokensSinceLastUpdate: z.number().optional(),
+  toolCallCount: z.number().optional(),
+  summaryMaxChars: z.number().optional(),
+  summaryMode: z.enum(['extractive']).optional(),
 })
 
 export const ExecutionMetricsEventSchema = z.object({
@@ -230,6 +256,16 @@ export const ExecutionMetricsEventSchema = z.object({
   toolRoundtripDurationMs: z.number().optional(),
   contextCharsIn: z.number().optional(),
   contextCharsOut: z.number().optional(),
+  inputTokens: z.number().optional(),
+  outputTokens: z.number().optional(),
+  cacheCreationInputTokens: z.number().optional(),
+  cacheReadInputTokens: z.number().optional(),
+  effectiveContextCeiling: z.number().optional(),
+  legacyContextCeiling: z.number().optional(),
+  cacheReadRatio: z.number().optional(),
+  cachePreservationMode: z.boolean().optional(),
+  longContextUtilizationMode: z.boolean().optional(),
+  compactSummaryLatencyMs: z.number().optional(),
 })
 
 export const NexusEventSchema = z.discriminatedUnion('type', [
@@ -254,6 +290,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   CompactBoundaryEventSchema,
   CompactFailureEventSchema,
   ContextWarningEventSchema,
+  ContextBlockingEventSchema,
   SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
 ])

@@ -426,7 +426,23 @@ export function recommendModelForRole(role: ModelRole): ModelRoleRecommendation 
   }
 }
 
+const adapterOverrides = new Map<string, ModelAdapter>()
+
+export function setAdapterOverrideForTest(providerId: string, adapter: ModelAdapter | null): void {
+  const isTestProcess = process.env.NODE_ENV === 'test' || Boolean(process.env.BABEL_O_CONFIG_FILE?.includes('babel-o-test') || process.env.BABEL_O_CONFIG_FILE?.includes('babel-o-runtime-test'))
+  if (!isTestProcess) {
+    throw new Error('setAdapterOverrideForTest is only available in test processes')
+  }
+  if (adapter) {
+    adapterOverrides.set(providerId, adapter)
+  } else {
+    adapterOverrides.delete(providerId)
+  }
+}
+
 export function getAdapter(providerId: string): ModelAdapter {
+  const override = adapterOverrides.get(providerId)
+  if (override) return override
   const provider = getProvider(providerId)
   switch (provider.adapter) {
     case 'anthropic-compatible':

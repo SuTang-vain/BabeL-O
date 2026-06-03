@@ -3,6 +3,12 @@ import { ConfigManager } from '../shared/config.js'
 import { modelRegistry } from '../providers/registry.js'
 import { terminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
+export const INPUT_NEWLINE_MARKER = '\uE000'
+
+export function restoreInputNewlines(line: string): string {
+  return line.split(INPUT_NEWLINE_MARKER).join('\n')
+}
+
 export interface FixedInputBoxOptions {
   prompt: string
   line: string
@@ -145,7 +151,15 @@ function wrapInputLines(line: string, cursor: number, width: number): { lines: s
       cursorColumn = currentWidth
     }
     const codePoint = line.codePointAt(i)!
+    const charLength = codePoint > 0xffff ? 2 : 1
     const char = String.fromCodePoint(codePoint)
+    if (char === INPUT_NEWLINE_MARKER || char === '\r' || char === '\n') {
+      if (char === '\r' && line[i + 1] === '\n') i += 1
+      lines.push('')
+      currentWidth = 0
+      i += charLength
+      continue
+    }
     const charWidth = terminalWidth(char)
     if (currentWidth > 0 && currentWidth + charWidth > width) {
       lines.push('')
@@ -153,7 +167,7 @@ function wrapInputLines(line: string, cursor: number, width: number): { lines: s
     }
     lines[lines.length - 1] += char
     currentWidth += charWidth
-    i += codePoint > 0xffff ? 2 : 1
+    i += charLength
   }
 
   if (clampedCursor === line.length) {

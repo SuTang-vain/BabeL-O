@@ -48,11 +48,12 @@ function createMcpTool(
 ): ToolDefinition<typeof mcpInputSchema> {
   const allowed = isMcpToolAllowed(serverConfig, remoteTool.name)
   const runtimeInputSchema = createRuntimeInputValidator(remoteTool.inputSchema)
+  const risk = resolveMcpToolRisk(serverConfig, remoteTool.name)
 
   return {
     name: registeredName,
     description: remoteTool.description || `MCP tool ${remoteTool.name} from ${serverName}.`,
-    risk: resolveMcpToolRisk(serverConfig, remoteTool.name),
+    risk,
     inputSchema: mcpInputSchema,
     modelInputSchema: remoteTool.inputSchema ?? {
       type: 'object',
@@ -63,6 +64,9 @@ function createMcpTool(
       serverName,
       originalName: remoteTool.name,
     },
+    requiresApproval: risk === 'write' || risk === 'execute',
+    suggestedAllowRule: registeredName,
+    mcpServerAllowed: allowed,
     dispose() {
       return client.shutdown()
     },

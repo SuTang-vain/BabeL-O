@@ -3,6 +3,7 @@ export type NormalizedKeyKind =
   | 'ctrl_e'
   | 'ctrl_o'
   | 'enter'
+  | 'shift_enter'
   | 'escape'
   | 'backspace'
   | 'tab'
@@ -34,6 +35,10 @@ export function normalizeKeyEvent(chunk: unknown, key: unknown): NormalizedKeyEv
   if ((ctrl && name === 'c') || raw.includes('')) return { kind: 'ctrl_c', raw, name, ctrl }
   if ((ctrl && name === 'e') || raw === '\x05') return { kind: 'ctrl_e', raw, name, ctrl }
   if ((ctrl && name === 'o') || raw === '\x0f') return { kind: 'ctrl_o', raw, name, ctrl }
+  const shift = keyRecord.shift === true
+  if (isShiftEnterSequence(raw) || ((name === 'return' || name === 'enter') && shift)) {
+    return { kind: 'shift_enter', raw, name, ctrl }
+  }
   if (name === 'return' || name === 'enter' || raw === '\r' || raw === '\n' || raw === '\r\n') {
     return { kind: 'enter', raw, name, ctrl }
   }
@@ -69,6 +74,10 @@ export function isMouseSequence(raw: string): boolean {
   return /^\x1b\[<[\d;]+[Mm]/.test(raw) ||
     (raw.startsWith('\x1b[M') && raw.length >= 6) ||
     /^\x1b\[[\d;]+[Mm]/.test(raw)
+}
+
+function isShiftEnterSequence(raw: string): boolean {
+  return raw === '\x1b[13;2u' || raw === '\x1b[27;2;13~'
 }
 
 export function terminalMouseDisableSequence(): string {

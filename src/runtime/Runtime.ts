@@ -1,4 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
+import type { HooksConfig } from '../shared/config.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ToolRisk } from '../tools/Tool.js'
 
@@ -20,6 +21,7 @@ export type RuntimeExecuteOptions = {
   executionEnvironment?: 'local' | 'docker' | 'remote'
   storage?: NexusStorage
   allowedPaths?: string[]
+  hooks?: HooksConfig
 }
 
 export interface NexusRuntime {
@@ -33,6 +35,9 @@ export type RuntimeToolAuditEntry = {
   risk: ToolRisk
   allowed: boolean
   inputSchema?: unknown
+  requiresApproval?: boolean
+  suggestedAllowRule?: string
+  mcpServerAllowed?: boolean
   source?: {
     type: 'builtin' | 'mcp'
     serverName?: string

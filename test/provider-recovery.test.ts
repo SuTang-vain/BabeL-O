@@ -93,10 +93,44 @@ test('planProviderFallbackAction returns an auditable non-executing action', () 
   assert.equal(plan.type, 'provider_fallback_plan')
   assert.equal(plan.fallbackPolicy.mode, 'compact_then_retry')
   assert.equal(plan.fallbackPolicy.allowSilentModelSwitch, false)
+  assert.equal(plan.diagnostic.domain, 'provider')
+  assert.equal(plan.diagnostic.name, 'provider_fallback_plan')
+  assert.equal(plan.diagnostic.details.recoveryKind, 'context_window')
+  assert.equal(plan.diagnostic.action?.allowSilentModelSwitch, false)
   assert.equal(plan.action.requiresUserConfirmation, true)
   assert.equal(plan.action.willSwitchModel, false)
   assert.equal(plan.action.willSwitchProvider, false)
   assert.equal(plan.action.willMutateConfig, false)
   assert.equal(plan.action.willCallProvider, false)
   assert.equal(plan.action.willCreateSession, false)
+})
+
+test('planProviderFallbackAction preserves explicit retry_same_model recovery kind', () => {
+  const plan = planProviderFallbackAction({
+    provider: {
+      providerId: 'openai',
+      providerName: 'OpenAI-compatible',
+      adapter: 'openai-compatible',
+      authMode: 'bearer',
+      authConfigured: true,
+      authSource: 'env',
+      baseUrl: 'https://api.openai.com/v1',
+      baseUrlSource: 'provider_default',
+      modelId: 'openai/gpt-4o',
+      modelName: 'GPT-4o',
+      modelSource: 'default',
+      contextWindow: 128000,
+      defaultMaxTokens: 16384,
+      capabilities: {
+        toolCalling: true,
+        jsonOutput: true,
+        structuredOutput: true,
+        streaming: true,
+      },
+    },
+    recoveryKind: 'rate_limit',
+  })
+
+  assert.equal(plan.fallbackPolicy.mode, 'retry_same_model')
+  assert.equal(plan.diagnostic.details.recoveryKind, 'rate_limit')
 })

@@ -8,15 +8,61 @@ import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
-import { LocalCodingRuntime, allowAllTools } from '../src/runtime/LocalCodingRuntime.js'
+import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import { LocalCodingRuntime, allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { createNexusTask, taskQueueStatsForTest } from '../src/nexus/taskQueue.js'
 import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSession.js'
 import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
+import { executeProviderToolCall } from '../src/runtime/runtimeToolLoop.js'
+import {
+  absorbCacheAwareCompactPolicyMetrics,
+  absorbCompactSummaryLatencyMetrics,
+  absorbProviderTurnMetrics,
+  buildContextBlockingEvents,
+  buildContextWarningEvent,
+  buildProviderAssistantMessage,
+  buildProviderLoopRequestState,
+  buildProviderLoopState,
+  buildProviderQueryParams,
+  buildProviderToolResultsMessage,
+  buildRuntimeContextBlockingEventsForLoop,
+  buildRuntimeContextRefreshState,
+  buildRuntimeExecutionMetricsEvent,
+  buildRuntimeExecutionStateBlock,
+  buildRuntimeErrorEvent,
+  buildRuntimeResultEvent,
+  createRuntimeExecutionMetrics,
+  countRuntimeTurnContextChars,
+  parseLocalRuntimeIntent,
+  reduceProviderTurnOutcome,
+  resolveProviderToolCallInput,
+  streamProviderTurn,
+} from '../src/runtime/runtimePipeline.js'
+import { compactSession } from '../src/runtime/compact.js'
+import { buildCacheAwareCompactPolicy } from '../src/runtime/cacheAwareCompactPolicy.js'
+import type { UserIntentGuidance } from '../src/runtime/intentGuidance.js'
+import { allocateBudget } from '../src/runtime/contextAssembler.js'
+import { setAdapterOverrideForTest } from '../src/providers/registry.js'
+import type { ModelAdapter, ModelQueryParams, StreamDelta } from '../src/providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../src/shared/config.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
+
+const baseRuntimeUserIntentGuidance: UserIntentGuidance = {
+  intent: 'continue',
+  confidence: 1,
+  continuity: 1,
+  contextScope: 'full',
+  actionHint: 'normal',
+  requiresTools: true,
+  reason: 'test',
+  guidance: 'Continue normally.',
+  latestUserText: 'test prompt',
+  explicitPaths: [],
+  source: 'fallback',
+}
 
 function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
   const encoder = new TextEncoder()
@@ -31,6 +77,750 @@ function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
 const runtimeTestConfigPath = join(tmpdir(), `babel-o-runtime-test-config-${process.pid}.json`)
 process.env.BABEL_O_CONFIG_FILE = runtimeTestConfigPath
 ConfigManager.getInstance().save({})
+
+test('runtime pipeline parses local tool and task intents', () => {
+  assert.deepEqual(parseLocalRuntimeIntent('read sample.txt'), {
+    kind: 'tool',
+    toolName: 'Read',
+    input: { path: 'sample.txt' },
+  })
+  assert.deepEqual(parseLocalRuntimeIntent('task update task_123 completed done'), {
+    kind: 'task_update',
+    selector: 'task_123',
+    status: 'completed',
+    result: 'done',
+  })
+  assert.equal(parseLocalRuntimeIntent('What does sample.txt say?').kind, 'file_question')
+})
+
+test('runtime pipeline resolves provider tool call inputs', () => {
+  assert.deepEqual(resolveProviderToolCallInput({
+    id: 'tool_explicit',
+    name: 'Read',
+    partialInput: '{"path":"partial.txt"}',
+    input: { path: 'explicit.txt' },
+  }), { path: 'explicit.txt' })
+  assert.deepEqual(resolveProviderToolCallInput({
+    id: 'tool_partial',
+    name: 'Read',
+    partialInput: '{"path":"partial.txt"}',
+  }), { path: 'partial.txt' })
+  assert.deepEqual(resolveProviderToolCallInput({
+    id: 'tool_bad',
+    name: 'Read',
+    partialInput: '{bad json',
+  }), {})
+  assert.equal(resolveProviderToolCallInput({
+    id: 'tool_empty',
+    name: 'Read',
+    partialInput: '',
+  }), undefined)
+})
+
+test('runtime pipeline builds provider assistant and tool result messages', () => {
+  const assistantMessage = buildProviderAssistantMessage({
+    assistantText: 'I will read it.',
+    reasoningText: 'Need file contents.',
+    toolCalls: [{
+      id: 'tool_1',
+      name: 'Read',
+      partialInput: '{"path":"a.txt"}',
+    }],
+  })
+
+  assert.deepEqual(assistantMessage, {
+    role: 'assistant',
+    content: [
+      { type: 'text', text: 'I will read it.' },
+      { type: 'tool_use', id: 'tool_1', name: 'Read', input: { path: 'a.txt' } },
+    ],
+    reasoningContent: 'Need file contents.',
+  })
+
+  assert.deepEqual(buildProviderToolResultsMessage([{
+    type: 'tool_result',
+    toolUseId: 'tool_1',
+    content: 'hello',
+    isError: false,
+  }]), {
+    role: 'user',
+    content: [{
+      type: 'tool_result',
+      toolUseId: 'tool_1',
+      content: 'hello',
+      isError: false,
+    }],
+  })
+})
+
+test('runtime pipeline builds terminal result and error events', () => {
+  const result = buildRuntimeResultEvent('session-terminal', false, 'failed')
+  assert.equal(result.type, 'result')
+  assert.equal(result.sessionId, 'session-terminal')
+  assert.equal(result.success, false)
+  assert.equal(result.message, 'failed')
+
+  const error = buildRuntimeErrorEvent({
+    sessionId: 'session-terminal',
+    code: 'FAILED',
+    message: 'failed',
+    details: { retryable: true },
+  })
+  assert.equal(error.type, 'error')
+  assert.equal(error.sessionId, 'session-terminal')
+  assert.equal(error.code, 'FAILED')
+  assert.deepEqual(error.details, { retryable: true })
+})
+
+test('runtime pipeline builds context warning and blocking event sequences', () => {
+  const windowState = {
+    tokenEstimate: 9_500,
+    maxTokens: 10_000,
+    percentUsed: 95,
+    warningThresholdTokens: 7_000,
+    compactThresholdTokens: 8_500,
+    blockingLimitTokens: 9_000,
+    isWarning: true,
+    isCompact: true,
+    isBlocking: true,
+  }
+
+  const warning = buildContextWarningEvent({
+    sessionId: 'session-context-warning',
+    modelId: 'test-model',
+    windowState,
+    thresholdPercent: 85,
+    message: 'custom warning',
+  })
+  assert.equal(warning.type, 'context_warning')
+  assert.equal(warning.tokenEstimate, 9_500)
+  assert.equal(warning.thresholdPercent, 85)
+
+  const events = buildContextBlockingEvents({
+    sessionId: 'session-context-blocking',
+    modelId: 'test-model',
+    windowState,
+    thresholdPercent: 85,
+  })
+  assert.deepEqual(events.map(event => event.type), ['context_warning', 'context_blocking', 'error', 'result'])
+  assert.equal(events[1]?.type, 'context_blocking')
+  assert.equal(events[1]?.httpStatus, 413)
+  assert.equal(events[2]?.type, 'error')
+  assert.equal(events[2]?.code, 'CONTEXT_LIMIT_EXCEEDED')
+  assert.deepEqual(events[2]?.details, {
+    kind: 'context_window',
+    recoveryReason: 'CONTEXT_BLOCKING_LIMIT',
+    retryable: true,
+    httpStatus: 413,
+    tokenEstimate: 9_500,
+    maxTokens: 10_000,
+    blockingLimitTokens: 9_000,
+    recoveryActions: ['compact', 'context', 'switch_model', 'reduce_tool_output'],
+    suggestion: 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
+    fallbackPolicy: {
+      mode: 'compact_then_retry',
+      reason: 'The input context is too large; compaction is safer than silently changing providers.',
+      nextAction: 'Run /compact or reduce context first; ask before routing to a larger-context model/profile.',
+      allowSilentModelSwitch: false,
+    },
+  })
+  assert.equal(events[3]?.type, 'result')
+  assert.equal(events[3]?.success, false)
+})
+
+test('runtime pipeline builds compact refresh state from assembled context', () => {
+  const messages = [{ role: 'user' as const, content: 'hello compact refresh' }]
+  const assembledContext = {
+    systemPrompt: 'system prompt',
+    systemPromptBlocks: [{ text: 'system prompt', cacheable: true }],
+    messages,
+    budget: allocateBudget('missing-model-for-default-budget'),
+    selectedEventCount: 1,
+    omittedEventCount: 0,
+    snippedEventCount: 0,
+    sessionSummary: '',
+    projectMemory: '',
+    activeSkills: '',
+    compactRetainedEventCount: 0,
+    compactRetainedSegmentValid: true,
+    compactRetainedSegmentWarning: '',
+    postCompactState: {
+      recentReadFiles: [],
+      restoredFileContents: [],
+      activeToolNames: [],
+      activeSkills: [],
+      skillReminderLines: [],
+      mcpToolLines: [],
+      toolContractLines: [],
+      toolFailureLines: [],
+      taskStatusLines: [],
+      agentStatusLines: [],
+      subTaskStatusLines: [],
+      hookLines: [],
+    },
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    memoryTruncated: false,
+    microcompactedEventCount: 0,
+    microcompactMetrics: {
+      compactedEventCount: 0,
+      deduplicatedToolResultCount: 0,
+      bytesBefore: 0,
+      bytesAfter: 0,
+      bytesSaved: 0,
+      estimatedTokensSaved: 0,
+    },
+  }
+  const compactFailureEvent: NexusEvent = {
+    type: 'compact_failure',
+    ...eventBase('session-refresh'),
+    trigger: 'auto',
+    failureCount: 1,
+    maxFailures: 2,
+    message: 'failed once',
+  }
+
+  const state = buildRuntimeContextRefreshState({
+    assembledContext,
+    events: [compactFailureEvent],
+    tools: [
+      { name: 'Read', description: 'Read files', inputSchema: { type: 'object' } },
+      { name: 'Bash', description: 'Run shell commands', inputSchema: { type: 'object' } },
+    ],
+    modelId: 'missing-model-for-default-budget',
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: true,
+  })
+
+  assert.equal(state.assembledContext, assembledContext)
+  assert.equal(state.messages, messages)
+  assert.equal(state.currentToolsList.length, 2)
+  assert.deepEqual(state.modelVisibleTools, [])
+  assert.equal(state.contextWindowState.tokenEstimate, state.contextEstimateTokens)
+  assert.equal(state.contextWindowState.maxTokens, assembledContext.budget.maxTokens)
+  assert.equal(state.autoCompactDecision.failureCount, 1)
+
+  const previous = process.env.BABEL_O_MAX_CONTEXT_TOKENS
+  try {
+    delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
+    const cacheAwareState = buildRuntimeContextRefreshState({
+      assembledContext,
+      events: [{
+        type: 'usage',
+        ...eventBase('session-refresh'),
+        inputTokens: 10_000,
+        outputTokens: 100,
+        cacheReadInputTokens: 30_000,
+      }],
+      tools: [],
+      modelId: 'minimax/MiniMax-M3',
+      warningPercent: 70,
+      compactPercent: 90,
+      suppressToolsForUserIntent: false,
+    })
+    assert.equal(cacheAwareState.cacheAwareCompactPolicy.longContextUtilizationMode, true)
+    assert.equal(cacheAwareState.cacheAwareCompactPolicy.cachePreservationMode, true)
+    assert.equal(cacheAwareState.contextWindowState.maxTokens, 179_616)
+    assert.equal(cacheAwareState.autoCompactDecision.thresholdPercent, 93)
+
+    const providerErrorState = buildRuntimeContextRefreshState({
+      assembledContext,
+      events: [{
+        type: 'error',
+        ...eventBase('session-refresh'),
+        code: 'PROVIDER_CONTEXT_WINDOW',
+        message: 'context window limit reached',
+      }],
+      tools: [],
+      modelId: 'minimax/MiniMax-M3',
+      warningPercent: 70,
+      compactPercent: 90,
+      suppressToolsForUserIntent: false,
+    })
+    assert.equal(providerErrorState.cacheAwareCompactPolicy.cachePreservationMode, false)
+    assert.equal(providerErrorState.autoCompactDecision.thresholdPercent, 80)
+  } finally {
+    if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
+    else process.env.BABEL_O_MAX_CONTEXT_TOKENS = previous
+  }
+})
+
+test('runtime pipeline builds provider loop state and execution state blocks', () => {
+  const messages = [
+    { role: 'user' as const, content: 'hello' },
+    {
+      role: 'assistant' as const,
+      content: [
+        { type: 'text' as const, text: 'answer' },
+        { type: 'tool_result' as const, toolUseId: 'tool_1', content: 'result', isError: false },
+      ],
+    },
+  ]
+  assert.equal(countRuntimeTurnContextChars({ systemPrompt: 'system', messages }), 23)
+
+  const readFileCache = new Map<string, { mtime: number; size: number }>([
+    ['/tmp/a.txt', { mtime: 1, size: 10 }],
+  ])
+  const loopState = buildProviderLoopState({
+    loopCount: 23,
+    maxLoops: 25,
+    readFileCache,
+    toolCallCount: 3,
+    contextTokenEstimate: 9_500,
+    contextMaxTokens: 10_000,
+    systemPrompt: 'system',
+    messages,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+  assert.equal(loopState.finalResponseOnlyMode, true)
+  assert.equal(loopState.turnContextCharsIn, 23)
+  assert.match(loopState.executionStateBlock, /iteration 23\/25/)
+  assert.match(loopState.executionStateBlock, /Files read: \/tmp\/a\.txt/)
+  assert.match(loopState.executionStateBlock, /Phase: must_respond/)
+
+  const synthesizeBlock = buildRuntimeExecutionStateBlock({
+    loopCount: 4,
+    maxLoops: 25,
+    readFileCache,
+    toolCallCount: 10,
+    contextTokenEstimate: 5_000,
+    contextMaxTokens: 10_000,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+  assert.match(synthesizeBlock, /Phase: synthesize/)
+  assert.match(synthesizeBlock, /Present your findings now/)
+})
+
+test('runtime pipeline builds provider loop request state and query params', () => {
+  const messages = [
+    { role: 'assistant' as const, content: [{ type: 'tool_use' as const, id: 'orphan_tool', name: 'Read', input: {} }] },
+  ]
+  const currentToolsList = [{ name: 'Read', description: 'Read files', inputSchema: { type: 'object' } }]
+  const requestState = buildProviderLoopRequestState({
+    loopCount: 4,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 2,
+    systemPrompt: 'system prompt',
+    messages,
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    finalResponseOnlyMode: false,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+
+  assert.equal(requestState.finalResponseOnlyMode, false)
+  assert.equal(requestState.currentToolsList, currentToolsList)
+  assert.equal(requestState.modelVisibleTools, currentToolsList)
+  assert.equal(requestState.contextWindowState.maxTokens, 10_000)
+  assert.match(requestState.executionStateBlock, /iteration 4\/25/)
+
+  const policyRequestState = buildProviderLoopRequestState({
+    loopCount: 4,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 2,
+    systemPrompt: 'system prompt',
+    messages,
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    cacheAwareCompactPolicy: buildCacheAwareCompactPolicy({
+      modelId: 'minimax/MiniMax-M3',
+      tokenEstimate: 1_000,
+      usage: { inputTokens: 10_000, cacheReadInputTokens: 30_000 },
+      cacheableSystemPromptRatio: 1,
+      compactPercent: 90,
+      maxOutputTokens: 16_384,
+    }),
+    finalResponseOnlyMode: false,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+  assert.equal(policyRequestState.contextWindowState.maxTokens, 179_616)
+  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(179_616 * 0.93))
+
+  const suppressedState = buildProviderLoopRequestState({
+    loopCount: 24,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 2,
+    systemPrompt: 'system prompt',
+    messages,
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: true,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+  assert.equal(suppressedState.finalResponseOnlyMode, true)
+  assert.deepEqual(suppressedState.modelVisibleTools, [])
+
+  const blockingEvents = buildRuntimeContextBlockingEventsForLoop({
+    sessionId: 'session-loop-blocking',
+    modelId: 'test-model',
+    windowState: {
+      tokenEstimate: 9_500,
+      maxTokens: 10_000,
+      percentUsed: 95,
+      warningThresholdTokens: 7_000,
+      compactThresholdTokens: 8_500,
+      blockingLimitTokens: 9_000,
+      isWarning: true,
+      isCompact: true,
+      isBlocking: true,
+    },
+    autoCompactDecision: {
+      enabled: false,
+      shouldCompact: false,
+      thresholdPercent: 90,
+      failureCount: 0,
+      failureLimit: 2,
+      fuseOpen: false,
+    },
+    fallbackThresholdPercent: 85,
+  })
+  assert.equal(blockingEvents[0]?.type, 'context_warning')
+  assert.equal(blockingEvents[0]?.thresholdPercent, 85)
+
+  const queryParams = buildProviderQueryParams({
+    modelId: 'test/model',
+    systemPrompt: 'system prompt',
+    systemPromptBlocks: [{ text: 'system prompt', cacheable: true }],
+    executionStateBlock: requestState.executionStateBlock,
+    messages,
+    tools: requestState.modelVisibleTools,
+    maxTokens: 123,
+    providerId: 'anthropic',
+    thinkingBudget: 456,
+  })
+  assert.equal(queryParams.model, 'test/model')
+  assert.equal(queryParams.enablePromptCaching, true)
+  assert.deepEqual(queryParams.thinking, { budgetTokens: 456 })
+  assert.equal(queryParams.systemPromptBlocks?.at(-1)?.cacheable, false)
+  assert.equal(queryParams.messages[0]?.role, 'user')
+  assert.equal(queryParams.tools, currentToolsList)
+})
+
+test('runtime pipeline reduces max-token provider turns to continuation or terminal outcomes', () => {
+  const retryOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer',
+    turn: {
+      assistantText: 'partial answer',
+      reasoningText: 'reasoning',
+      finishReason: 'max_tokens',
+      toolCalls: [],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+  })
+  assert.equal(retryOutcome.kind, 'continue')
+  assert.equal(retryOutcome.maxTokenRecoveryCount, 1)
+  assert.equal(retryOutcome.messages.length, 2)
+  assert.deepEqual(retryOutcome.eventsBeforeMessages, [])
+
+  const terminalOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer',
+    turn: {
+      assistantText: 'partial answer',
+      reasoningText: '',
+      finishReason: 'max_tokens',
+      toolCalls: [],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 3,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+  })
+  assert.equal(terminalOutcome.kind, 'terminal')
+  assert.equal(terminalOutcome.eventsBeforeMessages[0]?.type, 'error')
+  assert.equal(terminalOutcome.eventsBeforeMessages[1]?.type, 'result')
+})
+
+test('runtime pipeline reduces suppressed provider tool turns to retry prompts', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-suppressed',
+    turn: {
+      assistantText: '',
+      reasoningText: '',
+      toolCalls: [{ id: 'tool_1', name: 'Read', partialInput: '{}' }],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: true,
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你是谁？',
+    },
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+  })
+
+  assert.equal(outcome.kind, 'continue')
+  assert.equal(outcome.eventsBeforeMessages[0]?.type, 'error')
+  assert.equal(outcome.eventsBeforeMessages[0]?.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
+  assert.equal(outcome.messages[0]?.role, 'user')
+})
+
+test('runtime pipeline reduces final and tool-call provider turns', () => {
+  const finalOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-final',
+    turn: {
+      assistantText: 'done',
+      reasoningText: '',
+      toolCalls: [],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+  })
+  assert.equal(finalOutcome.kind, 'terminal')
+  assert.equal(finalOutcome.queueSessionMemoryLiteUpdate, true)
+  assert.equal(finalOutcome.eventsAfterMessages[0]?.type, 'result')
+  assert.equal(finalOutcome.messages[0]?.role, 'assistant')
+
+  const toolOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-tool',
+    turn: {
+      assistantText: 'I will read it.',
+      reasoningText: '',
+      toolCalls: [{ id: 'tool_1', name: 'Read', partialInput: '{"path":"a.txt"}' }],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+  })
+  assert.equal(toolOutcome.kind, 'tool_calls')
+  assert.equal(toolOutcome.toolCalls.length, 1)
+  assert.equal(toolOutcome.messages[0]?.role, 'assistant')
+})
+
+test('runtime tool loop executes a provider tool call and returns tool_result content', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-tool-loop-success`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'tool-loop.txt'), 'tool-loop-content', 'utf8')
+  const metrics = createRuntimeExecutionMetrics()
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_read',
+      name: 'Read',
+      partialInput: '{"path":"tool-loop.txt"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-success',
+      prompt: 'read tool-loop.txt',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics,
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.content, 'tool-loop-content')
+  assert.equal(next.value.toolResult.isError, false)
+  assert.equal(metrics.toolCallCount, 1)
+  assert.ok(metrics.toolRoundtripDurationMs >= 0)
+  assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Read'))
+  assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+})
+
+test('runtime tool loop returns recoverable result for unknown tools', async () => {
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_unknown',
+      name: 'MissingTool',
+      partialInput: '{}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-unknown',
+      prompt: 'call missing',
+      cwd: tmpdir(),
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /Unknown tool "MissingTool"/)
+  assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'MissingTool' && !event.success))
+})
+
+test('runtime tool loop returns terminal result for denied tools', async () => {
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_denied',
+      name: 'Bash',
+      partialInput: '{"command":"pwd"}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-denied',
+      prompt: 'bash pwd',
+      cwd: tmpdir(),
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'terminal')
+  assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Bash'))
+  assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
+  assert.ok(events.some(event => event.type === 'result' && !event.success))
+})
+
+test('runtime pipeline collects provider turn deltas and usage events', async () => {
+  async function* stream() {
+    yield { type: 'text' as const, text: 'hello ' }
+    yield { type: 'thinking' as const, text: 'reason' }
+    yield { type: 'tool_use_start' as const, id: 'tool_1', name: 'Read' }
+    yield { type: 'tool_use_delta' as const, id: 'tool_1', inputDelta: '{"path"' }
+    yield { type: 'tool_use_delta' as const, id: 'tool_1', inputDelta: ':"a.txt"}' }
+    yield { type: 'tool_use_end' as const, id: 'tool_1', input: { path: 'a.txt' } }
+    yield { type: 'usage' as const, inputTokens: 10, outputTokens: 4, cacheCreationInputTokens: 2, cacheReadInputTokens: 8 }
+    yield { type: 'finish' as const, reason: 'tool_use' as const }
+  }
+
+  const events: NexusEvent[] = []
+  const providerTurnStream = streamProviderTurn({
+    stream: stream(),
+    sessionId: 'session-pipeline-turn',
+    executionStartMs: 0,
+  })
+  let next = await providerTurnStream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await providerTurnStream.next()
+  }
+
+  assert.equal(next.value.assistantText, 'hello ')
+  assert.equal(next.value.reasoningText, 'reason')
+  assert.equal(next.value.finishReason, 'tool_use')
+  assert.deepEqual(next.value.toolCalls, [{
+    id: 'tool_1',
+    name: 'Read',
+    partialInput: '{"path":"a.txt"}',
+    input: { path: 'a.txt' },
+  }])
+  assert.deepEqual(next.value.usage, {
+    inputTokens: 10,
+    outputTokens: 4,
+    cacheCreationInputTokens: 2,
+    cacheReadInputTokens: 8,
+  })
+  assert.ok(events.some(event => event.type === 'assistant_delta' && event.text === 'hello '))
+  assert.ok(events.some(event => event.type === 'thinking_delta' && event.text === 'reason'))
+  assert.ok(events.some(event => event.type === 'usage' && event.inputTokens === 10 && event.cacheReadInputTokens === 8))
+})
+
+test('runtime execution metrics include cache-aware compact diagnostics', () => {
+  const metrics = createRuntimeExecutionMetrics()
+  const policy = buildCacheAwareCompactPolicy({
+    modelId: 'anthropic/claude-3-5-sonnet',
+    tokenEstimate: 130_000,
+    usage: {
+      inputTokens: 40_000,
+      outputTokens: 8_000,
+      cacheCreationInputTokens: 20_000,
+      cacheReadInputTokens: 120_000,
+    },
+    cacheableSystemPromptRatio: 0.8,
+    maxOutputTokens: 16_384,
+  })
+  absorbCacheAwareCompactPolicyMetrics(metrics, policy)
+  absorbProviderTurnMetrics(metrics, {
+    assistantText: 'done',
+    reasoningText: '',
+    toolCalls: [],
+    durationMs: 12,
+    providerFirstTokenMs: 7,
+    streamDeltaCount: 1,
+    charsOut: 4,
+    usage: {
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheCreationInputTokens: 2,
+      cacheReadInputTokens: 8,
+    },
+  })
+  absorbCompactSummaryLatencyMetrics(metrics, 15)
+
+  assert.equal(metrics.providerFirstTokenMs, 7)
+  assert.equal(metrics.cacheCreationInputTokens, 2)
+  assert.equal(metrics.cacheReadInputTokens, 8)
+  assert.equal(metrics.compactSummaryLatencyMs, 15)
+  assert.equal(metrics.effectiveContextCeiling, policy.effectiveContextCeiling)
+  assert.equal(metrics.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(metrics.cachePreservationMode, true)
+  assert.equal(metrics.longContextUtilizationMode, true)
+
+  const event = buildRuntimeExecutionMetricsEvent({ sessionId: 'session-metrics-cache-aware' }, metrics)
+  assert.equal(event.providerFirstTokenMs, 7)
+  assert.equal(event.cacheCreationInputTokens, 2)
+  assert.equal(event.cacheReadInputTokens, 8)
+  assert.equal(event.effectiveContextCeiling, policy.effectiveContextCeiling)
+  assert.equal(event.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(event.compactSummaryLatencyMs, 15)
+  assert.equal(event.cachePreservationMode, true)
+  assert.equal(event.longContextUtilizationMode, true)
+})
 
 test('execute reads a workspace file and records session events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}`)
@@ -325,7 +1115,7 @@ test('/v1/execute session reuse and history mapping', async () => {
 
   try {
     const sessionId = 'session-test-reuse'
-    
+
     // First execute
     const res1 = await app.inject({
       method: 'POST',
@@ -355,7 +1145,7 @@ test('/v1/execute session reuse and history mapping', async () => {
     const sessionAfterSecond = await storage.getSession(sessionId, { includeEvents: true })
     assert.ok(sessionAfterSecond)
     assert.equal(sessionAfterSecond.lastUserInput, 'hello second time')
-    
+
     const userMessages = sessionAfterSecond.events.filter(e => e.type === 'user_message')
     assert.equal(userMessages.length, 2)
     assert.equal((userMessages[0] as any).text, 'hello first time')
@@ -1171,6 +1961,9 @@ test('/v1/runtime/status returns redacted provider diagnostics', async () => {
     assert.equal(body.providerSmoke.provider.apiKey, undefined)
     assert.equal(body.providerSmoke.checks.authConfigured, true)
     assert.equal(body.providerSmoke.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.providerSmoke.diagnostic.domain, 'provider')
+    assert.equal(body.providerSmoke.diagnostic.name, 'provider_smoke')
+    assert.equal(body.providerSmoke.diagnostic.details.providerId, 'local')
   } finally {
     await app.close()
   }
@@ -1198,6 +1991,9 @@ test('/v1/runtime/provider-smoke returns local dry-run readiness without executi
     assert.equal(body.checks.authConfigured, true)
     assert.equal(body.checks.toolsSupported, true)
     assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.diagnostic.domain, 'provider')
+    assert.equal(body.diagnostic.name, 'provider_smoke')
+    assert.equal(body.diagnostic.status, 'ok')
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
   } finally {
     await app.close()
@@ -1227,6 +2023,10 @@ test('/v1/runtime/provider-smoke reports unmet capability without silent fallbac
     assert.equal(body.checks.structuredOutputSupported, false)
     assert.equal(body.fallbackPolicy.mode, 'fix_configuration')
     assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.diagnostic.domain, 'provider')
+    assert.equal(body.diagnostic.name, 'provider_smoke')
+    assert.equal(body.diagnostic.status, 'blocked')
+    assert.ok(body.diagnostic.signals.some((signal: { type: string }) => signal.type === 'provider_check_structuredOutputSupported'))
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
   } finally {
     await app.close()
@@ -1265,6 +2065,18 @@ test('/v1/runtime/provider-fallback/plan returns non-executing fallback action',
     assert.equal(body.action.willMutateConfig, false)
     assert.equal(body.action.willCallProvider, false)
     assert.equal(body.action.willCreateSession, false)
+    assert.equal(body.diagnostic.domain, 'provider')
+    assert.equal(body.diagnostic.name, 'provider_fallback_plan')
+    assert.equal(body.diagnostic.details.recoveryKind, 'context_window')
+    assert.equal(body.diagnostic.action.allowSilentModelSwitch, false)
+
+    const rateLimitResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/provider-fallback/plan',
+      payload: { kind: 'rate_limit' },
+    })
+    assert.equal(rateLimitResponse.statusCode, 200)
+    assert.equal(rateLimitResponse.json().diagnostic.details.recoveryKind, 'rate_limit')
     assert.equal(fetchCalled, false)
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
   } finally {
@@ -1324,6 +2136,10 @@ test('/v1/runtime/provider-smoke/live runs fixed live smoke without creating ses
     assert.equal(body.outputPreview, 'BABEL_O_PROVIDER_SMOKE_OK')
     assert.equal(body.provider.apiKey, undefined)
     assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.diagnostic.domain, 'provider')
+    assert.equal(body.diagnostic.name, 'provider_smoke')
+    assert.equal(body.diagnostic.details.mode, 'live')
+    assert.equal(body.diagnostic.details.smokeMode, 'simple_text')
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
 
     assert.equal(fetchCalls.length, 1)
@@ -1399,6 +2215,9 @@ test('/v1/runtime/provider-smoke/live tool-call mode probes provider protocol wi
     ])
     assert.equal(body.provider.apiKey, undefined)
     assert.equal(body.fallbackPolicy.allowSilentModelSwitch, false)
+    assert.equal(body.diagnostic.domain, 'provider')
+    assert.equal(body.diagnostic.name, 'provider_smoke')
+    assert.equal(body.diagnostic.details.smokeMode, 'tool_call')
     assert.deepEqual(await storage.listSessions({ limit: 10 }), [])
 
     assert.equal(fetchCalls.length, 1)
@@ -1549,9 +2368,20 @@ test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async (
       metricId: 'metric-assets-1',
       sessionId,
       executeDurationMs: 123,
+      providerFirstTokenMs: 11,
       toolCallCount: 1,
       contextCharsIn: 456,
       contextCharsOut: 78,
+      inputTokens: 100,
+      outputTokens: 20,
+      cacheCreationInputTokens: 30,
+      cacheReadInputTokens: 70,
+      effectiveContextCeiling: 179_616,
+      legacyContextCeiling: 120_000,
+      cacheReadRatio: 0.35,
+      cachePreservationMode: true,
+      longContextUtilizationMode: true,
+      compactSummaryLatencyMs: 12,
       timestamp: iso(9),
     })
 
@@ -1592,6 +2422,14 @@ test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async (
     assert.equal(body.permissionAudits[0].auditId, 'audit-assets-1')
     assert.equal(body.executionMetrics.metricId, 'metric-assets-1')
     assert.equal(body.executionMetrics.toolCallCount, 1)
+    assert.equal(body.executionMetrics.providerFirstTokenMs, 11)
+    assert.equal(body.executionMetrics.cacheCreationInputTokens, 30)
+    assert.equal(body.executionMetrics.cacheReadInputTokens, 70)
+    assert.equal(body.executionMetrics.effectiveContextCeiling, 179_616)
+    assert.equal(body.executionMetrics.legacyContextCeiling, 120_000)
+    assert.equal(body.executionMetrics.compactSummaryLatencyMs, 12)
+    assert.equal(body.executionMetrics.cachePreservationMode, true)
+    assert.equal(body.executionMetrics.longContextUtilizationMode, true)
 
     const childrenResponse = await app.inject({
       method: 'GET',
@@ -1677,7 +2515,60 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     assert.equal(typeof body.runtimePolicy.toolsVisible, 'boolean')
     assert.equal(typeof body.runtimePolicy.recoveryBoundaryActive, 'boolean')
     assert.equal(typeof body.userIntentGuidance.intent, 'string')
+    assert.equal(typeof body.diagnostics.remainingTokens, 'number')
+    assert.equal(typeof body.diagnostics.usageSummary.inputTokens, 'number')
+    assert.equal(typeof body.diagnostics.autoCompact.enabled, 'boolean')
+    assert.ok(Array.isArray(body.diagnostics.workingSetPaths))
+    assert.equal(typeof body.diagnostics.autoCompactFloor.thresholdTokens, 'number')
+    assert.equal(typeof body.diagnostics.compactTokenDelta.hasBoundary, 'boolean')
+    assert.equal(typeof body.diagnostics.sessionMemoryLite.enabled, 'boolean')
+    assert.equal(body.diagnostics.sessionMemoryLite.path, '.babel-o/session-memory.md')
+    assert.equal(body.diagnostics.sessionMemoryLite.costPolicy.modelFallback, 'extractive-only')
+    assert.equal(typeof body.diagnostics.sessionMemoryLite.nextDecision.estimatedTokensSinceLastUpdate, 'number')
+    assert.ok(Array.isArray(body.diagnostics.signals))
     assert.ok(Array.isArray(body.recommendations))
+
+    const retainedEvents: NexusEvent[] = [{
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:10.000Z',
+      text: 'retained context api turn',
+    }]
+    await storage.appendEvent(sessionId, {
+      type: 'compact_boundary',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:11.000Z',
+      trigger: 'manual',
+      summary: 'Context API compact summary.',
+      beforeEventCount: 4,
+      afterEventCount: 2,
+      summaryChars: 28,
+      snippedToolResults: 1,
+      retainedEvents,
+      modelId: 'local/coding-runtime',
+      budget: allocateBudget('local/coding-runtime'),
+    } as any)
+    await storage.appendEvent(sessionId, {
+      type: 'error',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-23T00:00:12.000Z',
+      code: 'REQUEST_CANCELLED',
+      message: 'Execution cancelled by user.',
+    })
+    const boundaryResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/context?modelId=local/coding-runtime`,
+    })
+    assert.equal(boundaryResponse.statusCode, 200)
+    const boundaryBody = boundaryResponse.json()
+    assert.equal(boundaryBody.diagnostics.compactRetention.hasBoundary, true)
+    assert.equal(boundaryBody.diagnostics.compactRetention.retainedSegmentValid, true)
+    assert.equal(boundaryBody.diagnostics.compactTokenDelta.hasBoundary, true)
+    assert.equal(boundaryBody.diagnostics.resumeRecovery.active, true)
+    assert.ok(boundaryBody.diagnostics.signals.some((signal: { type: string }) => signal.type === 'resume_recovery_boundary'))
   } finally {
     await app.close()
   }
@@ -1714,6 +2605,16 @@ test('/v1/sessions/:sessionId/compact creates a manual compact boundary', async 
     assert.equal(body.event.type, 'compact_boundary')
     assert.equal(body.event.trigger, 'manual')
     assert.ok(body.event.summary.length > 0)
+
+    const persisted = await storage.listEvents(sessionId, { order: 'asc', limit: 10_000 })
+    const memoryEvent = persisted.events.find(event => event.type === 'session_memory_updated') as any
+    if (memoryEvent) {
+      assert.equal(memoryEvent.reason, 'compact')
+      assert.equal(memoryEvent.decisionReason, 'forced')
+      assert.equal(memoryEvent.summaryMode, 'extractive')
+      assert.equal(typeof memoryEvent.estimatedTokensSinceLastUpdate, 'number')
+      assert.equal(typeof memoryEvent.toolCallCount, 'number')
+    }
   } finally {
     await app.close()
   }
@@ -2119,6 +3020,149 @@ test('websocket stream executes prompts and records stream metrics', async () =>
   }
 })
 
+test('runtime metrics aggregates cache-aware performance diagnostics', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-cache-aware-metrics-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(cwd, 'nexus.sqlite'))
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'execution_metrics',
+        ...eventBase(options.sessionId),
+        requestId: options.requestId,
+        providerFirstTokenMs: 25,
+        providerRequestDurationMs: 40,
+        streamDeltaCount: 2,
+        toolCallCount: 0,
+        toolRoundtripDurationMs: 0,
+        contextCharsIn: 100,
+        contextCharsOut: 20,
+        inputTokens: 100,
+        outputTokens: 30,
+        cacheCreationInputTokens: 50,
+        cacheReadInputTokens: 150,
+        effectiveContextCeiling: 179_616,
+        legacyContextCeiling: 120_000,
+        cacheReadRatio: 0.5,
+        cachePreservationMode: true,
+        longContextUtilizationMode: true,
+        compactSummaryLatencyMs: 12,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: 'ok',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    const sessionId = `session-cache-aware-metrics-${Date.now()}`
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { sessionId, prompt: 'metrics', cwd },
+    })
+    assert.equal(response.statusCode, 200)
+
+    const savedMetrics = await storage.getExecutionMetrics(sessionId)
+    assert.equal(savedMetrics?.providerFirstTokenMs, 25)
+    assert.equal(savedMetrics?.cacheCreationInputTokens, 50)
+    assert.equal(savedMetrics?.cacheReadInputTokens, 150)
+    assert.equal(savedMetrics?.effectiveContextCeiling, 179_616)
+    assert.equal(savedMetrics?.legacyContextCeiling, 120_000)
+    assert.equal(savedMetrics?.compactSummaryLatencyMs, 12)
+    assert.equal(savedMetrics?.cachePreservationMode, true)
+    assert.equal(savedMetrics?.longContextUtilizationMode, true)
+
+    const metricsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/metrics' })
+    const metrics = metricsResponse.json()
+    assert.equal(metrics.providerFirstTokenMs.avgMs, 25)
+    assert.equal(metrics.tokenUsage.cacheCreationInputTokens, 50)
+    assert.equal(metrics.tokenUsage.cacheReadInputTokens, 150)
+    assert.equal(metrics.tokenUsage.cacheReadRatio, 0.5)
+    assert.equal(metrics.contextPolicy.effectiveContextCeiling, 179_616)
+    assert.equal(metrics.contextPolicy.legacyContextCeiling, 120_000)
+    assert.equal(metrics.contextPolicy.cachePreservationModeCount, 1)
+    assert.equal(metrics.contextPolicy.longContextUtilizationModeCount, 1)
+    assert.equal(metrics.compactSummaryLatencyMs.avgMs, 12)
+  } finally {
+    await app.close()
+    await storage.close()
+  }
+})
+
+test('websocket stream relays and persists context blocking events', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-context-blocking-ws-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(cwd, 'nexus.sqlite'))
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      const message = 'Context estimate 1200/1000 tokens exceeds the blocking limit (900). Run /compact or /context before continuing.'
+      yield {
+        type: 'context_blocking',
+        ...eventBase(options.sessionId),
+        modelId: 'local/coding-runtime',
+        tokenEstimate: 1200,
+        maxTokens: 1000,
+        percentUsed: 120,
+        warningThresholdTokens: 700,
+        compactThresholdTokens: 850,
+        blockingLimitTokens: 900,
+        httpStatus: 413,
+        recoveryActions: ['compact', 'context', 'switch_model', 'reduce_tool_output'],
+        message,
+      }
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'CONTEXT_LIMIT_EXCEEDED',
+        message,
+        details: { httpStatus: 413, recoveryReason: 'CONTEXT_BLOCKING_LIMIT' },
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message,
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    await app.ready()
+    const ws: any = await app.injectWS('/v1/stream')
+    const events: NexusEvent[] = []
+    const sessionId = `session-context-blocking-ws-${Date.now()}`
+    ws.on('message', (data: Buffer) => {
+      events.push(JSON.parse(String(data)))
+    })
+    ws.send(JSON.stringify({ sessionId, prompt: 'continue', cwd }))
+    await waitFor(() => events.some(event => event.type === 'result'))
+    ws.terminate()
+
+    const blockingEvent = events.find(event => event.type === 'context_blocking')
+    assert.ok(blockingEvent, 'websocket should relay context_blocking')
+    assert.equal(blockingEvent.httpStatus, 413)
+    assert.equal(events.find(event => event.type === 'error')?.code, 'CONTEXT_LIMIT_EXCEEDED')
+
+    const persisted = await storage.getSession(sessionId, { includeEvents: true })
+    assert.equal(persisted?.phase, 'failed')
+    assert.equal(persisted?.terminalReason?.category, 'runtime')
+    assert.equal(persisted?.terminalReason?.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.equal((persisted?.metadata?.runtimeRecovery as any)?.retryable, true)
+    assert.equal((persisted?.metadata?.runtimeRecovery as any)?.httpStatus, 413)
+    assert.ok(persisted?.events.some(event => event.type === 'context_blocking'))
+    assert.ok(persisted?.events.some(event => event.type === 'error' && event.code === 'CONTEXT_LIMIT_EXCEEDED'))
+  } finally {
+    await app.close()
+    await storage.close()
+  }
+})
+
 test('websocket stream timeout aborts long-running tools', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-stream-timeout`)
   await mkdir(cwd, { recursive: true })
@@ -2424,6 +3468,75 @@ test('Glob tool enforces maxResults limits and appends truncation warning', asyn
   assert.ok(absoluteRes.output.includes('file1.txt'))
 })
 
+test('/v1/execute returns context blocking status in result envelope', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-context-blocking-envelope-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(cwd, 'nexus.sqlite'))
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      const message = 'Context estimate 1200/1000 tokens exceeds the blocking limit (900). Run /compact or /context before continuing.'
+      yield {
+        type: 'context_blocking',
+        ...eventBase(options.sessionId),
+        modelId: 'local/coding-runtime',
+        tokenEstimate: 1200,
+        maxTokens: 1000,
+        percentUsed: 120,
+        warningThresholdTokens: 700,
+        compactThresholdTokens: 850,
+        blockingLimitTokens: 900,
+        httpStatus: 413,
+        recoveryActions: ['compact', 'context', 'switch_model', 'reduce_tool_output'],
+        message,
+      }
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'CONTEXT_LIMIT_EXCEEDED',
+        message,
+        details: { httpStatus: 413, recoveryReason: 'CONTEXT_BLOCKING_LIMIT' },
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message,
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  try {
+    const sessionId = `session-context-blocking-http-${Date.now()}`
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { sessionId, prompt: 'continue', cwd },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'execute_result')
+    assert.equal(body.success, false)
+    assert.equal(body.statusCode, 413)
+    assert.equal(body.error.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.equal(body.error.details.httpStatus, 413)
+    assert.ok(body.events.some((event: NexusEvent) => event.type === 'context_blocking'))
+
+    const persisted = await storage.getSession(sessionId, { includeEvents: false })
+    assert.equal(persisted?.phase, 'failed')
+    assert.equal(persisted?.failureReason, body.error.message)
+    assert.equal(persisted?.terminalReason?.category, 'runtime')
+    assert.equal(persisted?.terminalReason?.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.equal((persisted?.metadata?.runtimeRecovery as any)?.retryable, true)
+    assert.equal((persisted?.metadata?.runtimeRecovery as any)?.httpStatus, 413)
+    assert.equal((persisted?.metadata?.runtimeRecovery as any)?.tokenEstimate, 1200)
+    assert.deepEqual((persisted?.metadata?.runtimeRecovery as any)?.recoveryActions, ['compact', 'context', 'switch_model', 'reduce_tool_output'])
+  } finally {
+    await app.close()
+  }
+})
+
 test('executionEnvironment parameter validation', async () => {
   const cwd = join(tmpdir(), `babel-o-test-exec-env-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
@@ -2471,6 +3584,44 @@ test('executionEnvironment parameter validation', async () => {
     assert.match(events[0].message, /Execution environment 'remote' is not implemented yet/)
   } finally {
     await app.close()
+  }
+})
+
+test('appendEvent persists embedded execution metrics side table', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-embedded-metrics-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new SqliteStorage(join(cwd, 'nexus.sqlite'))
+  const sessionId = `embedded-metrics-session-${Date.now()}`
+  const now = new Date().toISOString()
+
+  try {
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'metrics',
+      phase: 'executing',
+      createdAt: now,
+      updatedAt: now,
+      events: [],
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'execution_metrics',
+      ...eventBase(sessionId),
+      providerFirstTokenMs: 17,
+      toolCallCount: 2,
+      cacheReadInputTokens: 33,
+      effectiveContextCeiling: 8192,
+      compactSummaryLatencyMs: 4,
+    })
+
+    const savedMetrics = await storage.getExecutionMetrics(sessionId)
+    assert.equal(savedMetrics?.providerFirstTokenMs, 17)
+    assert.equal(savedMetrics?.toolCallCount, 2)
+    assert.equal(savedMetrics?.cacheReadInputTokens, 33)
+    assert.equal(savedMetrics?.effectiveContextCeiling, 8192)
+    assert.equal(savedMetrics?.compactSummaryLatencyMs, 4)
+  } finally {
+    await storage.close()
   }
 })
 
@@ -2642,34 +3793,17 @@ test('LLMCodingRuntime resolves cwd from prompt absolute path', async () => {
   }
 })
 
-test('LLMCodingRuntime blocks provider calls when compacted context still exceeds limit', async () => {
-  const tools = createDefaultToolRegistry()
+test('LLMCodingRuntime continues from a successful compact boundary', async () => {
+  const tools = new Map()
   const policy = allowAllTools()
-  const storage = new SqliteStorage(join(tmpdir(), `babel-o-context-limit-${Date.now()}.sqlite`))
-  const configManager = ConfigManager.getInstance()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-compact-boundary-recovery-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-compact-boundary-recovery-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'local/coding-runtime' })
   const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
   const sessionId = createId('session')
   const cwd = tmpdir()
   const now = new Date().toISOString()
-
-  const events: NexusEvent[] = [
-    {
-      type: 'user_message' as const,
-      schemaVersion: '2026-05-21.babel-o.v1' as const,
-      sessionId,
-      timestamp: now,
-      text: '开始一个很长的中文上下文任务。',
-    },
-  ]
-  for (let index = 0; index < 30; index += 1) {
-    events.push({
-      type: 'assistant_delta' as const,
-      schemaVersion: '2026-05-21.babel-o.v1' as const,
-      sessionId,
-      timestamp: new Date(Date.now() + index + 1).toISOString(),
-      text: '这是用于触发上下文阻塞限制的中文内容。'.repeat(500),
-    })
-  }
+  const events = createLongRuntimeContextEventsWithSmallRecentTurns(sessionId, 24, 500)
 
   await storage.saveSession({
     sessionId,
@@ -2682,7 +3816,223 @@ test('LLMCodingRuntime blocks provider calls when compacted context still exceed
   })
 
   try {
-    const emitted: Array<{ type: string; code?: string; trigger?: string }> = []
+    await compactSession({
+      storage,
+      sessionId,
+      modelId: 'local/coding-runtime',
+      trigger: 'auto',
+    })
+
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: '继续这个任务',
+      cwd,
+      model: 'local/coding-runtime',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      if (event.type === 'result') break
+    }
+
+    assert.ok(
+      emitted.some(event => event.type === 'assistant_delta'),
+      'provider path should continue after compact boundary restores context',
+    )
+    const resultEvent = emitted.find(event => event.type === 'result')
+    assert.equal(resultEvent?.success, true)
+    assert.ok(!emitted.some(event => event.type === 'context_blocking'))
+    assert.ok(!emitted.some(event => event.type === 'error' && event.code === 'CONTEXT_LIMIT_EXCEEDED'))
+  } finally {
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime attempts reactive compact after tool results exceed provider-loop context limit', async () => {
+  const tools = createDefaultToolRegistry()
+  const bashTool = tools.get('Bash')!
+  tools.clear()
+  tools.set('Bash', {
+    ...bashTool,
+    async execute() {
+      return { success: true, output: 'large tool output '.repeat(2_500) }
+    },
+  })
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-loop-compact-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-loop-compact-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'local/coding-runtime' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      if (executionInvocationCount === 1) {
+        yield { type: 'tool_use_start', id: 'tool_large_output', name: 'Bash' }
+        yield { type: 'tool_use_delta', id: 'tool_large_output', inputDelta: '{"command":"pwd"}' }
+        yield { type: 'tool_use_end', id: 'tool_large_output', input: { command: 'pwd' } }
+        yield { type: 'finish', reason: 'tool_use' }
+        return
+      }
+      yield { type: 'text', text: 'continued after compact' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  setAdapterOverrideForTest('local', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: '先运行大输出工具，再继续分析',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: '先运行大输出工具，再继续分析',
+      cwd,
+      model: 'local/coding-runtime',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'result') break
+    }
+
+    assert.ok(
+      emitted.some(event => event.type === 'compact_boundary' && event.trigger === 'reactive'),
+      `provider-loop blocking should attempt reactive compact before hard blocking; events=${emitted.map(event => event.type).join(',')}`,
+    )
+    assert.ok(!emitted.some(event => event.type === 'context_blocking'))
+    assert.ok(!emitted.some(event => event.type === 'error' && event.code === 'CONTEXT_LIMIT_EXCEEDED'))
+    assert.equal(emitted.find(event => event.type === 'result')?.success, true)
+    assert.equal(executionInvocationCount, 2)
+  } finally {
+    setAdapterOverrideForTest('local', null)
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime respects auto compact failure fuse before hard blocking', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-compact-fuse-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-compact-fuse-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'local/coding-runtime' })
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+  const events = createLongRuntimeContextEvents(sessionId, 30, 500)
+  events.push(
+    {
+      type: 'compact_failure',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + 50_000).toISOString(),
+      trigger: 'auto',
+      modelId: 'local/coding-runtime',
+      failureCount: 1,
+      maxFailures: 2,
+      message: 'first auto compact failure',
+    },
+    {
+      type: 'compact_failure',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + 50_001).toISOString(),
+      trigger: 'auto',
+      modelId: 'local/coding-runtime',
+      failureCount: 2,
+      maxFailures: 2,
+      message: 'second auto compact failure',
+    },
+  )
+
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: '继续',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events,
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: '继续这个任务',
+      cwd,
+      model: 'local/coding-runtime',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      if (event.type === 'error' || event.type === 'result') break
+    }
+
+    const warningEvent = emitted.find(event =>
+      event.type === 'context_warning' && event.message.includes('Auto compact is paused'),
+    )
+    assert.ok(warningEvent, 'runtime should surface the open auto compact fuse')
+    assert.ok(
+      !emitted.some(event => event.type === 'compact_boundary' && event.trigger === 'auto'),
+      'runtime should not run another auto compact while the fuse is open',
+    )
+    const blockingEvent = emitted.find(event => event.type === 'context_blocking')
+    assert.ok(blockingEvent, 'runtime should hard block after fuse-open context stays too large')
+    assert.equal(blockingEvent.httpStatus, 413)
+    const errorEvent = emitted.find(event => event.type === 'error')
+    assert.equal(errorEvent?.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.ok(
+      !emitted.some(event => event.type === 'assistant_delta'),
+      'provider should not be called after blocking guard fails',
+    )
+  } finally {
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime blocks provider calls when compacted context still exceeds limit', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-context-limit-${Date.now()}.sqlite`))
+  const configManager = ConfigManager.getInstance()
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+  const events = createLongRuntimeContextEvents(sessionId, 30, 500)
+
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: '继续',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events,
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
     for await (const event of runtime.executeStream({
       sessionId,
       prompt: '继续这个任务',
@@ -2702,8 +4052,16 @@ test('LLMCodingRuntime blocks provider calls when compacted context still exceed
       emitted.some(event => event.type === 'context_warning'),
       'blocking guard should emit context warning',
     )
+    const blockingEvent = emitted.find(event => event.type === 'context_blocking')
+    assert.ok(blockingEvent, 'blocking guard should emit structured context_blocking event')
+    assert.equal(blockingEvent.httpStatus, 413)
+    assert.equal(blockingEvent.blockingLimitTokens > 0, true)
+    assert.ok(blockingEvent.recoveryActions.includes('compact'))
+    assert.ok(blockingEvent.recoveryActions.includes('context'))
     const errorEvent = emitted.find(event => event.type === 'error')
     assert.equal(errorEvent?.code, 'CONTEXT_LIMIT_EXCEEDED')
+    assert.equal((errorEvent?.details as any)?.httpStatus, 413)
+    assert.equal((errorEvent?.details as any)?.recoveryReason, 'CONTEXT_BLOCKING_LIMIT')
     assert.ok(
       !emitted.some(event => event.type === 'assistant_delta'),
       'provider should not be called after blocking guard fails',
@@ -2712,6 +4070,64 @@ test('LLMCodingRuntime blocks provider calls when compacted context still exceed
     await storage.close()
   }
 })
+
+function createLongRuntimeContextEventsWithSmallRecentTurns(
+  sessionId: string,
+  oldTurnCount: number,
+  oldRepeatCount: number,
+): NexusEvent[] {
+  const events = createLongRuntimeContextEvents(sessionId, oldTurnCount, oldRepeatCount)
+  events.push(
+    {
+      type: 'user_message',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + 40_000).toISOString(),
+      text: '最近的小上下文问题。',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + 40_001).toISOString(),
+      text: '最近的小上下文回答。',
+    },
+    {
+      type: 'user_message',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + 40_002).toISOString(),
+      text: '继续最近的小上下文。',
+    },
+  )
+  return events
+}
+
+function createLongRuntimeContextEvents(
+  sessionId: string,
+  turnCount: number,
+  repeatCount: number,
+): NexusEvent[] {
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: '开始一个很长的中文上下文任务。',
+    },
+  ]
+  for (let index = 0; index < turnCount; index += 1) {
+    events.push({
+      type: 'assistant_delta',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId,
+      timestamp: new Date(Date.now() + index + 1).toISOString(),
+      text: '这是用于触发上下文阻塞限制的中文内容。'.repeat(repeatCount),
+    })
+  }
+  return events
+}
 
 async function waitFor(
   predicate: () => boolean,

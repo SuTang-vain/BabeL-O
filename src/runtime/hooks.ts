@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import type { HooksConfig } from '../shared/config.js'
 import type { ToolRisk } from '../tools/Tool.js'
 
 export type HookEventName =
@@ -46,16 +47,33 @@ export type RuntimeHookResult = {
   metadata?: Record<string, unknown>
 }
 
-type RuntimeHook = {
+export type RuntimeHook = {
   name: string
   events: HookEventName[]
   timeoutMs?: number
   run(input: RuntimeHookInput, context: RuntimeHookContext): Promise<RuntimeHookResult | void> | RuntimeHookResult | void
 }
 
+export type RuntimeHookResultEntry = { hookName: string; result: RuntimeHookResult }
+
 export type HookExecutionResult = {
   events: NexusEvent[]
-  results: Array<{ hookName: string; result: RuntimeHookResult }>
+  results: RuntimeHookResultEntry[]
+}
+
+export type HookExecutionOptions = {
+  config?: HooksConfig
+  hooks?: RuntimeHook[]
+}
+
+export type HookResultAggregate = {
+  summaries: string[]
+  retryHints: string[]
+  additionalContext: string[]
+  metadata: RuntimeHookResultEntry[]
+  denyReason?: string
+  permissionDecision?: { approved: boolean; reason?: string }
+  updatedInput?: unknown
 }
 
 const DEFAULT_HOOK_TIMEOUT_MS = 1_500
@@ -148,10 +166,11 @@ export async function executeRuntimeHooks(
   hookEvent: HookEventName,
   input: RuntimeHookInput,
   context: RuntimeHookContext,
+  options: HookExecutionOptions = {},
 ): Promise<HookExecutionResult> {
-  const hooks = builtInHooks.filter(hook => hook.events.includes(hookEvent))
+  const hooks = selectRuntimeHooks(hookEvent, options)
   const events: NexusEvent[] = []
-  const results: Array<{ hookName: string; result: RuntimeHookResult }> = []
+  const results: RuntimeHookResultEntry[] = []
 
   for (const hook of hooks) {
     events.push({
@@ -194,10 +213,35 @@ export async function executeRuntimeHooks(
   return { events, results }
 }
 
+export function aggregateHookResults(hookResult: HookExecutionResult): HookResultAggregate {
+  const aggregate: HookResultAggregate = {
+    summaries: [],
+    retryHints: [],
+    additionalContext: [],
+    metadata: [],
+  }
+
+  for (const entry of hookResult.results) {
+    const { hookName, result } = entry
+    if (result.summary?.trim()) aggregate.summaries.push(result.summary)
+    if (result.retryHint?.trim()) aggregate.retryHints.push(result.retryHint)
+    if (result.additionalContext?.trim()) aggregate.additionalContext.push(result.additionalContext)
+    if (result.metadata) aggregate.metadata.push(entry)
+    if (!aggregate.denyReason && result.denyReason) aggregate.denyReason = result.denyReason
+    if (!aggregate.permissionDecision && result.permissionDecision) {
+      aggregate.permissionDecision = {
+        approved: result.permissionDecision.approved,
+        reason: result.permissionDecision.reason ?? `Permission decided by ${hookName}`,
+      }
+    }
+    if ('updatedInput' in result) aggregate.updatedInput = result.updatedInput
+  }
+
+  return aggregate
+}
+
 export function mergeHookRetryHints(message: string, hookResult: HookExecutionResult): string {
-  const hints = hookResult.results
-    .map(({ result }) => result.retryHint)
-    .filter((hint): hint is string => Boolean(hint?.trim()))
+  const hints = aggregateHookResults(hookResult).retryHints
   if (hints.length === 0) return message
   return `${message}\n\nHook retry hints:\n${hints.map(hint => `- ${hint}`).join('\n')}`
 }
@@ -205,26 +249,30 @@ export function mergeHookRetryHints(message: string, hookResult: HookExecutionRe
 export function firstHookPermissionDecision(
   hookResult: HookExecutionResult,
 ): { approved: boolean; reason?: string } | undefined {
-  for (const { hookName, result } of hookResult.results) {
-    if (!result.permissionDecision) continue
-    return {
-      approved: result.permissionDecision.approved,
-      reason: result.permissionDecision.reason ?? `Permission decided by ${hookName}`,
-    }
-  }
-  return undefined
+  return aggregateHookResults(hookResult).permissionDecision
 }
 
 export function firstHookDenyReason(hookResult: HookExecutionResult): string | undefined {
-  return hookResult.results.find(({ result }) => result.denyReason)?.result.denyReason
+  return aggregateHookResults(hookResult).denyReason
 }
 
 export function lastHookUpdatedInput(hookResult: HookExecutionResult): unknown | undefined {
-  let updated: unknown
-  for (const { result } of hookResult.results) {
-    if ('updatedInput' in result) updated = result.updatedInput
-  }
-  return updated
+  return aggregateHookResults(hookResult).updatedInput
+}
+
+function selectRuntimeHooks(
+  hookEvent: HookEventName,
+  options: HookExecutionOptions,
+): RuntimeHook[] {
+  if (options.config?.enabled === false) return []
+  const hooks = options.hooks ?? builtInHooks
+  return hooks
+    .filter(hook => hook.events.includes(hookEvent))
+    .filter(hook => options.config?.builtins?.[hook.name]?.enabled !== false)
+    .map(hook => {
+      const timeoutMs = options.config?.builtins?.[hook.name]?.timeoutMs ?? hook.timeoutMs
+      return timeoutMs === hook.timeoutMs ? hook : { ...hook, timeoutMs }
+    })
 }
 
 async function runHookWithTimeout(

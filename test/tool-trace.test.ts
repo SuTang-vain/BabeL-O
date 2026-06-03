@@ -309,7 +309,7 @@ test('SqliteStorage tool trace lifecycle and pagination', async () => {
 test('REST API endpoint GET /v1/sessions/:sessionId/tool-traces', async () => {
   const { runtime, storage } = await createDefaultNexusRuntime()
   const sessionId = 'session-api-test'
-  
+
   await storage.saveSession({
     sessionId,
     cwd: tmpdir(),

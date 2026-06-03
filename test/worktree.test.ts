@@ -153,36 +153,36 @@ test('Git Worktree Lifecycle Integration Test', async () => {
   if (!existsSync(babelODir)) {
     mkdirSync(babelODir)
   }
-  
+
   const testRepoDir = join(babelODir, `test-repo-${Date.now()}`)
   mkdirSync(testRepoDir)
-  
+
   try {
     // 1. Initialize git repo
     await runCommand(testRepoDir, 'git', ['init'])
     await runCommand(testRepoDir, 'git', ['config', 'user.name', 'Test User'])
     await runCommand(testRepoDir, 'git', ['config', 'user.email', 'test@example.com'])
-    
+
     // 2. Commit a dummy file to have a commit history (required by worktree add)
     const dummyFile = join(testRepoDir, 'dummy.txt')
     writeFileSync(dummyFile, 'hello', 'utf8')
     await runCommand(testRepoDir, 'git', ['add', '.'])
     await runCommand(testRepoDir, 'git', ['commit', '-m', 'initial commit'])
-    
+
     // 3. Verify it is detected as a Git repo
     const isGit = await isGitRepository(testRepoDir)
     assert.equal(isGit, true)
-    
+
     // 4. Create a worktree
     const taskId = 'test-worktree-task-123'
     const worktreePath = await createWorktree(testRepoDir, taskId)
-    
+
     assert.equal(existsSync(worktreePath), true)
-    
+
     // 5. Modify files in the worktree
     const newFilePath = join(worktreePath, 'new_file.txt')
     writeFileSync(newFilePath, 'changes from worktree', 'utf8')
-    
+
     // 6. Commit and merge the worktree changes back to the main workspace
     const commitHash = await commitAndMergeWorktree(
       testRepoDir,
@@ -190,18 +190,18 @@ test('Git Worktree Lifecycle Integration Test', async () => {
       taskId,
       'Add new file from worktree',
     )
-    
+
     assert.ok(commitHash)
-    
+
     // 7. Verify the changes are merged back to the main workspace
     const mergedFile = join(testRepoDir, 'new_file.txt')
     assert.equal(existsSync(mergedFile), true)
     assert.equal(readFileSync(mergedFile, 'utf8'), 'changes from worktree')
-    
+
     // 8. Clean up the worktree
     await removeWorktree(testRepoDir, worktreePath, taskId)
     assert.equal(existsSync(worktreePath), false)
-    
+
     // Test prune functions
     await pruneOrphanedWorktrees(testRepoDir)
   } finally {
@@ -218,35 +218,35 @@ test('commitAndMergeWorktree reports conflicting files on cherry-pick failure', 
   if (!existsSync(babelODir)) {
     mkdirSync(babelODir)
   }
-  
+
   const testRepoDir = join(babelODir, `test-repo-conflict-${Date.now()}`)
   mkdirSync(testRepoDir)
-  
+
   try {
     // 1. Initialize git repo
     await runCommand(testRepoDir, 'git', ['init'])
     await runCommand(testRepoDir, 'git', ['config', 'user.name', 'Test User'])
     await runCommand(testRepoDir, 'git', ['config', 'user.email', 'test@example.com'])
-    
+
     // 2. Commit initial file
     const fileToConflict = join(testRepoDir, 'conflict.txt')
     writeFileSync(fileToConflict, 'line 1\nline 2\nline 3\n', 'utf8')
     await runCommand(testRepoDir, 'git', ['add', '.'])
     await runCommand(testRepoDir, 'git', ['commit', '-m', 'initial commit'])
-    
+
     // 3. Create isolated worktree
     const taskId = 'test-worktree-conflict-task'
     const worktreePath = await createWorktree(testRepoDir, taskId)
-    
+
     // 4. Modify conflict.txt inside the worktree (commitAndMergeWorktree will commit it)
     const worktreeConflictFile = join(worktreePath, 'conflict.txt')
     writeFileSync(worktreeConflictFile, 'line 1\nline 2 modified in worktree\nline 3\n', 'utf8')
-    
+
     // 5. Modify conflict.txt differently in the parent repository at the same line, and commit
     writeFileSync(fileToConflict, 'line 1\nline 2 modified in parent\nline 3\n', 'utf8')
     await runCommand(testRepoDir, 'git', ['add', '.'])
     await runCommand(testRepoDir, 'git', ['commit', '-m', 'parent modification'])
-    
+
     // 6. Now calling commitAndMergeWorktree should fail due to conflict
     await assert.rejects(
       async () => {
@@ -269,11 +269,11 @@ test('commitAndMergeWorktree reports conflicting files on cherry-pick failure', 
         return true
       }
     )
-    
+
     // 7. Verify the parent repository state is clean (CHERRY_PICK_HEAD does not exist)
     const cherryPickHeadPath = join(testRepoDir, '.git', 'CHERRY_PICK_HEAD')
     assert.equal(existsSync(cherryPickHeadPath), false)
-    
+
     // 8. Clean up the worktree
     await removeWorktree(testRepoDir, worktreePath, taskId)
     assert.equal(existsSync(worktreePath), false)

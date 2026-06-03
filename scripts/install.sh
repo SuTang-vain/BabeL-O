@@ -4,7 +4,7 @@
 
 set -e
 
-VERSION="v0.2.7"
+VERSION="v0.2.8"
 REPO="SuTang-vain/BabeL-O"
 
 echo "=== BabeL-O Standalone Binary Installer ==="

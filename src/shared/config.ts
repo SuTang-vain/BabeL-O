@@ -23,6 +23,16 @@ export interface ProfileConfig {
   };
 }
 
+export interface HookBuiltinConfig {
+  enabled?: boolean;
+  timeoutMs?: number;
+}
+
+export interface HooksConfig {
+  enabled?: boolean;
+  builtins?: Record<string, HookBuiltinConfig>;
+}
+
 export interface BabelOConfig {
   defaultModel?: string;
   providers?: Record<string, ProviderConfig>;
@@ -34,6 +44,30 @@ export interface BabelOConfig {
     memory?: string;
     cpus?: string;
   };
+  hooks?: HooksConfig;
+}
+
+export type BabeLXConfigImportProfile = {
+  name: string;
+  providerId: string;
+  modelId: string;
+  hasApiKey: boolean;
+  hasBaseUrl: boolean;
+}
+
+export type BabeLXConfigImportSkippedProfile = {
+  name: string;
+  providerId?: string;
+  reason: string;
+}
+
+export type BabeLXConfigImportPlan = {
+  sourceSchema: 'babel-x-config-v1';
+  transcriptImportSupported: false;
+  importedProfiles: BabeLXConfigImportProfile[];
+  skippedProfiles: BabeLXConfigImportSkippedProfile[];
+  warnings: string[];
+  config: BabelOConfig;
 }
 
 export type ResolveSettingsOptions = {
@@ -102,6 +136,16 @@ export const ProfileConfigSchema = z.object({
   }).optional(),
 });
 
+export const HookBuiltinConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  timeoutMs: z.number().int().positive().max(60_000).optional(),
+});
+
+export const HooksConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  builtins: z.record(z.string(), HookBuiltinConfigSchema).optional(),
+});
+
 export const BabelOConfigSchema = z.object({
   defaultModel: z.string().optional(),
   providers: z.record(z.string(), ProviderConfigSchema).optional(),
@@ -113,6 +157,7 @@ export const BabelOConfigSchema = z.object({
     memory: z.string().optional(),
     cpus: z.string().optional(),
   }).optional(),
+  hooks: HooksConfigSchema.optional(),
 }).superRefine((data, ctx) => {
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;
@@ -181,10 +226,35 @@ export const BabelOConfigSchema = z.object({
   }
 });
 
-export const DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.babel-o');
-export const DEFAULT_CONFIG_FILE = path.join(DEFAULT_CONFIG_DIR, 'config.json');
+const USER_DEFAULT_CONFIG_DIR = path.join(os.homedir(), '.babel-o');
+const USER_DEFAULT_CONFIG_FILE = path.join(USER_DEFAULT_CONFIG_DIR, 'config.json');
+const USER_DEFAULT_BABEL_X_CONFIG_FILE = path.join(os.homedir(), '.babel', 'config.json');
+
+export const DEFAULT_CONFIG_DIR = process.env.BABEL_O_CONFIG_DIR
+  || (process.env.BABEL_O_CONFIG_FILE ? path.dirname(process.env.BABEL_O_CONFIG_FILE) : USER_DEFAULT_CONFIG_DIR);
+export const DEFAULT_CONFIG_FILE = process.env.BABEL_O_CONFIG_FILE || path.join(DEFAULT_CONFIG_DIR, 'config.json');
+export const DEFAULT_BABEL_X_CONFIG_FILE = USER_DEFAULT_BABEL_X_CONFIG_FILE;
 
 const TEST_CONFIG_GUARD_ERROR_CODE = 'BABEL_O_TEST_CONFIG_NOT_ISOLATED';
+
+const BABEL_X_PROVIDER_ALIASES: Record<string, string> = {
+  zhipu: 'zhipu',
+  openai: 'openai',
+  anthropic: 'anthropic',
+  deepseek: 'deepseek',
+  minimax: 'minimax',
+};
+
+const BABEL_X_MODEL_ALIASES: Record<string, Record<string, string>> = {
+  minimax: {
+    'minimax-m2': 'MiniMax-M2',
+    'minimax-m2.1': 'MiniMax-M2.1',
+    'minimax-m2.5': 'MiniMax-M2.5',
+    'minimax-m2.5-highspeed': 'MiniMax-M2.5-highspeed',
+    'minimax-m2.7': 'MiniMax-M2.7',
+    'minimax-m2.7-highspeed': 'MiniMax-M2.7-highspeed',
+  },
+};
 
 function isNodeTestProcess(): boolean {
   return process.env.BABEL_O_TEST_CONFIG_WRITE_GUARD === '1'
@@ -192,13 +262,125 @@ function isNodeTestProcess(): boolean {
     || process.argv.some(arg => arg === '--test' || arg.startsWith('--test-'));
 }
 
-function isDefaultConfigFile(configFile: string): boolean {
-  return path.resolve(configFile) === path.resolve(DEFAULT_CONFIG_FILE);
+function isUserDefaultConfigFile(configFile: string): boolean {
+  return path.resolve(configFile) === path.resolve(USER_DEFAULT_CONFIG_FILE);
 }
 
 function createTestConfigGuardError(): Error & { code: string } {
   const error = new Error('Refusing to write the user BabeL-O config from a test process; set BABEL_O_CONFIG_FILE to a temporary path.');
   return Object.assign(error, { code: TEST_CONFIG_GUARD_ERROR_CODE });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function getOptionalString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+function normalizeBabeLXModelId(providerId: string, model: string | undefined): string {
+  const provider = getProvider(providerId);
+  if (!model) return provider.defaultModel;
+  const aliased = BABEL_X_MODEL_ALIASES[providerId]?.[model.toLowerCase()] ?? model;
+  const canonical = aliased.includes('/') ? aliased : `${providerId}/${aliased}`;
+  return modelRegistry.some(item => item.id === canonical) ? canonical : provider.defaultModel;
+}
+
+export function createBabeLXConfigImportPlan(rawConfig: unknown): BabeLXConfigImportPlan {
+  const warnings: string[] = [];
+  const importedProfiles: BabeLXConfigImportProfile[] = [];
+  const skippedProfiles: BabeLXConfigImportSkippedProfile[] = [];
+  const config: BabelOConfig = { profiles: {} };
+
+  if (!isRecord(rawConfig)) {
+    throw new Error('Invalid BabeL-X config: expected a JSON object.');
+  }
+
+  const profiles = rawConfig.profiles;
+  if (!Array.isArray(profiles)) {
+    throw new Error('Invalid BabeL-X config: expected profiles array.');
+  }
+
+  const activeProfile = getOptionalString(rawConfig, 'activeProfile');
+
+  for (const [index, profile] of profiles.entries()) {
+    if (!isRecord(profile)) {
+      skippedProfiles.push({ name: `profile-${index + 1}`, reason: 'profile is not an object' });
+      continue;
+    }
+
+    const name = getOptionalString(profile, 'name') ?? `profile-${index + 1}`;
+    const legacyProvider = getOptionalString(profile, 'type');
+    const providerId = legacyProvider ? BABEL_X_PROVIDER_ALIASES[legacyProvider.toLowerCase()] : undefined;
+    if (!providerId) {
+      skippedProfiles.push({ name, providerId: legacyProvider, reason: 'provider is not registered in BabeL-O' });
+      continue;
+    }
+
+    const apiKey = getOptionalString(profile, 'apiKey');
+    if (!apiKey) {
+      skippedProfiles.push({ name, providerId, reason: 'profile has no API key' });
+      continue;
+    }
+
+    const baseUrl = getOptionalString(profile, 'baseUrl');
+    const modelId = normalizeBabeLXModelId(providerId, getOptionalString(profile, 'defaultModel'));
+    config.profiles![name] = {
+      provider: providerId,
+      model: modelId,
+      apiKey,
+      ...(baseUrl ? { baseUrl } : {}),
+    };
+    config.providers = {
+      ...config.providers,
+      [providerId]: {
+        ...config.providers?.[providerId],
+        apiKey,
+        ...(baseUrl ? { baseUrl } : {}),
+      },
+    };
+    importedProfiles.push({
+      name,
+      providerId,
+      modelId,
+      hasApiKey: true,
+      hasBaseUrl: Boolean(baseUrl),
+    });
+  }
+
+  if (activeProfile && config.profiles?.[activeProfile]) {
+    config.activeProfile = activeProfile;
+    config.defaultModel = config.profiles[activeProfile]?.model;
+  } else if (importedProfiles[0]) {
+    config.activeProfile = importedProfiles[0].name;
+    config.defaultModel = importedProfiles[0].modelId;
+    if (activeProfile) {
+      warnings.push(`Active BabeL-X profile "${activeProfile}" was not imported; using "${importedProfiles[0].name}".`);
+    }
+  }
+
+  if (!importedProfiles.length) {
+    delete config.profiles;
+    warnings.push('No BabeL-X provider profiles were importable.');
+  }
+
+  warnings.push('BabeL-X transcripts are not imported; Nexus session schema stays separate.');
+
+  return {
+    sourceSchema: 'babel-x-config-v1',
+    transcriptImportSupported: false,
+    importedProfiles,
+    skippedProfiles,
+    warnings,
+    config,
+  };
+}
+
+export function loadBabeLXConfigImportPlan(configFile = DEFAULT_BABEL_X_CONFIG_FILE): BabeLXConfigImportPlan {
+  const raw = fs.readFileSync(configFile, 'utf-8');
+  return createBabeLXConfigImportPlan(JSON.parse(raw));
 }
 
 export class ConfigManager {
@@ -248,7 +430,7 @@ export class ConfigManager {
   }
 
   public save(config?: BabelOConfig): void {
-    if (isNodeTestProcess() && isDefaultConfigFile(this.configFile)) {
+    if (isNodeTestProcess() && isUserDefaultConfigFile(this.configFile)) {
       throw createTestConfigGuardError();
     }
     const toSave = config || this.config || {};
@@ -355,7 +537,7 @@ export class ConfigManager {
       modelId = conf.defaultModel || 'local/coding-runtime';
       modelSource = 'default';
     }
-    
+
     let providerId = options.provider || '';
     const slashIdx = modelId.indexOf('/');
     if (slashIdx !== -1) {

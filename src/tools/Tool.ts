@@ -31,6 +31,9 @@ export type ToolDefinition<TInput extends z.ZodType = z.ZodType> = {
     serverName?: string
     originalName?: string
   }
+  requiresApproval?: boolean
+  suggestedAllowRule?: string
+  mcpServerAllowed?: boolean
   dispose?(): Promise<void> | void
   execute(input: z.infer<TInput>, context: ToolContext): Promise<ToolResult>
 }

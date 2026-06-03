@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
@@ -10,7 +11,7 @@ import {
 } from './contextAssembler.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
 import { llmSummarizeEvents } from './compactSummary.js'
-import { updateSessionMemoryLite } from './sessionMemoryLite.js'
+import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -28,6 +29,7 @@ export type CompactSessionResult = {
   event: Extract<NexusEvent, { type: 'compact_boundary' }>
   beforeEventCount: number
   afterEventCount: number
+  summaryLatencyMs: number
 }
 
 export type AutoCompactDecision = {
@@ -63,6 +65,7 @@ export async function compactSession(
   const omittedEvents = selectOmittedEvents(compactableEvents, selectedEvents)
   const priorSummary = previousBoundary?.event.summary.trim()
   const mapFn = options.mapEventsToMessages
+  const summaryStartMs = performance.now()
   let newSummary: string
   if (mapFn && modelId !== 'local/coding-runtime') {
     newSummary = await llmSummarizeEvents(omittedEvents, modelId, {
@@ -75,6 +78,7 @@ export async function compactSession(
       budget.layerBudgets.summary * 4,
     )
   }
+  const summaryLatencyMs = performance.now() - summaryStartMs
   const summary = [priorSummary, newSummary]
     .filter((part): part is string => Boolean(part && part.trim()))
     .join('\n')
@@ -98,10 +102,16 @@ export async function compactSession(
 
   if (options.persist !== false) {
     await options.storage.appendEvent(options.sessionId, event)
+    const memoryDecision = shouldUpdateSessionMemoryLite(events, { force: true })
     const memoryEvent = await updateSessionMemoryLite({
       sessionId: options.sessionId,
       cwd: inferSessionCwd(events) ?? await inferStoredSessionCwd(options.storage, options.sessionId),
       trigger: event.trigger,
+      reason: 'compact',
+      decisionReason: memoryDecision.reason,
+      estimatedTokensSinceLastUpdate: memoryDecision.estimatedTokensSinceLastUpdate,
+      toolCallCount: memoryDecision.toolCallCount,
+      summaryMaxChars: budget.layerBudgets.summary * 4,
       summary: fallbackSummary,
       eventCount: omittedEvents.length,
     })
@@ -114,6 +124,7 @@ export async function compactSession(
     event,
     beforeEventCount: event.beforeEventCount,
     afterEventCount: event.afterEventCount,
+    summaryLatencyMs,
   }
 }
 

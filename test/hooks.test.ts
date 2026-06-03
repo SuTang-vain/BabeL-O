@@ -1,6 +1,13 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
-import { executeRuntimeHooks, mergeHookRetryHints } from '../src/runtime/hooks.js'
+import { setTimeout as delay } from 'node:timers/promises'
+import { BabelOConfigSchema } from '../src/shared/config.js'
+import {
+  aggregateHookResults,
+  executeRuntimeHooks,
+  mergeHookRetryHints,
+  type RuntimeHook,
+} from '../src/runtime/hooks.js'
 
 describe('runtime hooks', () => {
   test('returns retry hints for invalid tool input failures', async () => {
@@ -109,5 +116,166 @@ describe('runtime hooks', () => {
     )
     assert.ok(result.events.some(event => event.type === 'hook_started'))
     assert.ok(result.events.some(event => event.type === 'hook_completed'))
+  })
+
+  test('validates safe built-in hook configuration schema', () => {
+    const parsed = BabelOConfigSchema.parse({
+      hooks: {
+        enabled: true,
+        builtins: {
+          RecoverInvalidToolInputHook: {
+            enabled: false,
+            timeoutMs: 250,
+          },
+        },
+      },
+    })
+
+    assert.equal(parsed.hooks?.builtins?.RecoverInvalidToolInputHook.enabled, false)
+    assert.equal(parsed.hooks?.builtins?.RecoverInvalidToolInputHook.timeoutMs, 250)
+  })
+
+  test('can disable all configured runtime hooks', async () => {
+    const result = await executeRuntimeHooks(
+      'UserPromptSubmit',
+      { prompt: 'Hello world' },
+      {
+        sessionId: 'session-disabled',
+        cwd: '/tmp',
+      },
+      { config: { enabled: false } },
+    )
+
+    assert.deepEqual(result.events, [])
+    assert.deepEqual(result.results, [])
+  })
+
+  test('can disable one built-in hook while keeping another enabled', async () => {
+    const result = await executeRuntimeHooks(
+      'PostToolUseFailure',
+      {
+        toolName: 'Bash',
+        toolUseId: 'tool-configured',
+        errorCode: 'INVALID_TOOL_INPUT',
+        output: {
+          exitCode: 2,
+          stderr: 'bad flag\nmore detail',
+        },
+      },
+      {
+        sessionId: 'session-configured',
+        cwd: '/tmp',
+      },
+      {
+        config: {
+          builtins: {
+            RecoverInvalidToolInputHook: { enabled: false },
+          },
+        },
+      },
+    )
+
+    assert.equal(result.results.some(({ hookName }) => hookName === 'RecoverInvalidToolInputHook'), false)
+    assert.equal(result.results.some(({ hookName }) => hookName === 'BashFailureSummaryHook'), true)
+    assert.match(aggregateHookResults(result).summaries.join('\n'), /Bash failed with exit code 2/)
+  })
+
+  test('applies hook timeout override and isolates failed hooks', async () => {
+    const hooks: RuntimeHook[] = [
+      {
+        name: 'SlowHook',
+        events: ['UserPromptSubmit'],
+        timeoutMs: 1_000,
+        async run() {
+          await delay(50)
+          return { summary: 'too late' }
+        },
+      },
+      {
+        name: 'FastHook',
+        events: ['UserPromptSubmit'],
+        run() {
+          return { summary: 'fast hook completed' }
+        },
+      },
+    ]
+
+    const result = await executeRuntimeHooks(
+      'UserPromptSubmit',
+      { prompt: 'Hello world' },
+      {
+        sessionId: 'session-timeout',
+        cwd: '/tmp',
+      },
+      {
+        hooks,
+        config: {
+          builtins: {
+            SlowHook: { timeoutMs: 1 },
+          },
+        },
+      },
+    )
+
+    assert.ok(result.events.some(event => event.type === 'hook_failed' && event.hookName === 'SlowHook'))
+    assert.ok(result.events.some(event => event.type === 'hook_completed' && event.hookName === 'FastHook'))
+    assert.deepEqual(aggregateHookResults(result).summaries, ['fast hook completed'])
+  })
+
+  test('aggregates hook results with first decision and last updated input semantics', async () => {
+    const hooks: RuntimeHook[] = [
+      {
+        name: 'FirstHook',
+        events: ['PreToolUse'],
+        run() {
+          return {
+            updatedInput: { value: 1 },
+            additionalContext: 'first context',
+            denyReason: 'first deny',
+            permissionDecision: { approved: false },
+            retryHint: 'first hint',
+            summary: 'first summary',
+            metadata: { order: 1 },
+          }
+        },
+      },
+      {
+        name: 'SecondHook',
+        events: ['PreToolUse'],
+        run() {
+          return {
+            updatedInput: { value: 2 },
+            additionalContext: 'second context',
+            denyReason: 'second deny',
+            permissionDecision: { approved: true, reason: 'second decision' },
+            retryHint: 'second hint',
+            summary: 'second summary',
+            metadata: { order: 2 },
+          }
+        },
+      },
+    ]
+
+    const result = await executeRuntimeHooks(
+      'PreToolUse',
+      { toolName: 'Read', toolUseId: 'tool-aggregate' },
+      {
+        sessionId: 'session-aggregate',
+        cwd: '/tmp',
+      },
+      { hooks },
+    )
+    const aggregate = aggregateHookResults(result)
+
+    assert.deepEqual(aggregate.summaries, ['first summary', 'second summary'])
+    assert.deepEqual(aggregate.retryHints, ['first hint', 'second hint'])
+    assert.deepEqual(aggregate.additionalContext, ['first context', 'second context'])
+    assert.equal(aggregate.metadata.length, 2)
+    assert.equal(aggregate.denyReason, 'first deny')
+    assert.deepEqual(aggregate.permissionDecision, {
+      approved: false,
+      reason: 'Permission decided by FirstHook',
+    })
+    assert.deepEqual(aggregate.updatedInput, { value: 2 })
   })
 })
