@@ -2,6 +2,7 @@ import type { NexusEvent } from '../shared/events.js'
 import type { HooksConfig } from '../shared/config.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ToolRisk } from '../tools/Tool.js'
+import type { RemoteToolRunner } from './remoteRunner.js'
 
 export type RuntimeExecuteOptions = {
   sessionId: string
@@ -19,9 +20,15 @@ export type RuntimeExecuteOptions = {
   maxOutputTokens?: number
   replaySessionHistory?: boolean
   executionEnvironment?: 'local' | 'docker' | 'remote'
+  remoteRunner?: RemoteToolRunner
   storage?: NexusStorage
   allowedPaths?: string[]
   hooks?: HooksConfig
+  contextFork?: {
+    mode: string
+    inheritedItems: number
+    omittedItems: number
+  }
 }
 
 export interface NexusRuntime {

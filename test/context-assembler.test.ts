@@ -46,6 +46,7 @@ import type { ModelMessage } from '../src/providers/adapters/ModelAdapter.js'
 import { analyzeContext, type ContextAnalysis } from '../src/runtime/contextAnalysis.js'
 import { formatContextAnalysis } from '../src/cli/commands/chat.js'
 import { normalizeContextViewKey, renderContextView } from '../src/cli/contextView.js'
+import { CONTEXT_MANAGER_PHASES } from '../src/runtime/contextManager.js'
 import { stripAnsi, visibleTerminalWidth } from '../src/cli/terminalWidth.js'
 
 const schemaVersion = '2026-05-21.babel-o.v1' as const
@@ -638,6 +639,47 @@ test('assembleContext injects project memory and snips historical tool output', 
   const toolResultMessage = context.messages.findLast(message => message.role === 'user')
   assert.ok(Array.isArray(toolResultMessage?.content))
   assert.match((toolResultMessage!.content as any[])[0].content, /chars truncated|microcompacted/)
+})
+
+test('assembleContext injects working set from prior user and tool paths', async () => {
+  const cwd = join(tmpdir(), `babel-o-working-context-${Date.now()}`)
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'src', 'focus.ts'), 'export {}\n', 'utf8')
+
+  const events: NexusEvent[] = [
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      text: 'inspect src/focus.ts',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion,
+      sessionId: 'session-context',
+      timestamp: '2026-05-23T00:00:01.000Z',
+      toolUseId: 'tool-working-set',
+      name: 'Read',
+      input: { path: 'src/focus.ts' },
+    },
+  ]
+
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-context',
+      prompt: 'continue',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.match(context.systemPrompt, /Working Set:/)
+  assert.match(context.systemPrompt, /src\/focus\.ts/)
+  assert.match(context.systemPrompt, /touches=2/)
 })
 
 test('assembleContext applies dynamic system prompt layer budgets', async () => {
@@ -1587,6 +1629,8 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.equal(analysis.diagnostic.details.sessionId, 'session-analysis')
   assert.equal(analysis.diagnostic.details.modelId, 'local/coding-runtime')
   assert.equal(typeof analysis.diagnostic.details.remainingTokens, 'number')
+  assert.equal(typeof analysis.diagnostic.details.retainedContextItems, 'number')
+  assert.equal(typeof analysis.diagnostic.details.droppedContextItems, 'number')
   assert.ok(analysis.diagnostic.signals.some(signal => signal.type === 'resume_recovery_boundary'))
   assert.equal(analysis.sections.toolDefinitionCount, 1)
   assert.ok(analysis.estimate.totalTokens > 0)
@@ -1611,6 +1655,14 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.equal(typeof analysis.diagnostics.blockingRemainingTokens, 'number')
   assert.equal(analysis.diagnostics.workingSetPaths[0]?.path, 'src/runtime/contextAnalysis.ts')
   assert.equal(analysis.diagnostics.workingSetPaths[0]?.touches, 3)
+  assert.deepEqual(analysis.diagnostics.selection.phases, CONTEXT_MANAGER_PHASES)
+  assert.ok(analysis.diagnostics.selection.retained.length > 0)
+  assert.ok(analysis.diagnostics.selection.dropped.length > 0)
+  assert.ok(analysis.diagnostics.selection.retained.some(item => item.kind === 'event' && item.reason.includes('selected')))
+  assert.ok(analysis.diagnostics.selection.dropped.some(item => item.reason.includes('omitted outside recent event budget')))
+  assert.ok(analysis.diagnostics.selection.workingSetPaths.some(path => path.endsWith('src/runtime/contextAnalysis.ts')))
+  assert.equal(analysis.diagnostic.details.retainedContextItems, analysis.diagnostics.selection.retained.length)
+  assert.equal(analysis.diagnostic.details.droppedContextItems, analysis.diagnostics.selection.dropped.length)
   assert.equal(analysis.diagnostics.autoCompactFloor.thresholdPercent, analysis.diagnostics.autoCompact.thresholdPercent)
   assert.equal(analysis.diagnostics.autoCompactFloor.thresholdTokens, Math.floor(analysis.window.maxTokens * (analysis.diagnostics.autoCompact.thresholdPercent / 100)))
   assert.equal(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens, analysis.budget.maxTokens)
@@ -1887,6 +1939,8 @@ test('/context display includes matching boundary diagnostics for CLI and API pa
   assert.match(rendered, /working set paths src\/display-next\.ts×2/)
   assert.match(rendered, /cache policy read=/)
   assert.match(rendered, /cache policy reason /)
+  assert.match(rendered, /selection items retained=\d+ dropped=\d+ · phases=8/)
+  assert.match(rendered, /selection retained /)
   assert.match(rendered, /session memory lite .*last manual\/compact 256 chars events=4 · next=natural_pause update · policy=extractive max=4k chars/)
 })
 
@@ -1953,6 +2007,8 @@ test('/context view defaults to visual summary and expands diagnostics', async (
   assert.match(expanded, /Diagnostics/)
   assert.match(expanded, /Diagnostics scan full session history/)
   assert.match(expanded, /historical largest tool result Read/)
+  assert.match(expanded, /selection items retained=\d+ dropped=\d+ · phases=8/)
+  assert.match(expanded, /selection retained /)
   assert.match(expanded, /Recommendations/)
   assert.equal(normalizeContextViewKey('\x0f'), 'toggle')
   assert.equal(normalizeContextViewKey('\x1b'), 'exit')

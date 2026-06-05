@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import {
   getProvider,
   getModel,
+  inspectModelCapabilities,
   UnknownProviderError,
   UnknownModelError,
   providerRegistry,
@@ -129,4 +130,50 @@ test('role recommendations are capability-based and registry-backed', () => {
   const critic = recommendModelForRole('critic')
   assert.equal(critic.capability, 'structured_output')
   assert.equal(getModel(critic.modelId).capabilities.jsonOutput, true)
+})
+
+test('inspectModelCapabilities exposes provider and registry-backed model capabilities', () => {
+  const diagnostics = inspectModelCapabilities('openai/gpt-4o')
+
+  assert.equal(diagnostics.providerId, 'openai')
+  assert.equal(diagnostics.providerName, 'OpenAI-compatible')
+  assert.equal(diagnostics.adapter, 'openai-compatible')
+  assert.equal(diagnostics.authMode, 'bearer')
+  assert.equal(diagnostics.modelDeclared, true)
+  assert.equal(diagnostics.capabilitySource, 'registry')
+  assert.equal(diagnostics.contextWindow, 128000)
+  assert.equal(diagnostics.defaultMaxTokens, 16384)
+  assert.deepEqual(diagnostics.capabilities, {
+    toolCalling: true,
+    jsonOutput: true,
+    structuredOutput: true,
+    streaming: true,
+  })
+  assert.equal(diagnostics.suitability.longContext, true)
+  assert.equal(diagnostics.suitability.agentLoopRoles.executor.suitable, true)
+  assert.equal(diagnostics.suitability.agentLoopRoles.critic.suitable, true)
+})
+
+test('inspectModelCapabilities marks provider-scoped custom models as undeclared without hard blocking', () => {
+  const diagnostics = inspectModelCapabilities('openai/custom-model')
+
+  assert.equal(diagnostics.providerId, 'openai')
+  assert.equal(diagnostics.modelDeclared, false)
+  assert.equal(diagnostics.capabilitySource, 'undeclared')
+  assert.match(diagnostics.capabilityWarning ?? '', /not declared in the registry/)
+  assert.equal(diagnostics.contextWindow, 8192)
+  assert.equal(diagnostics.defaultMaxTokens, 4096)
+  assert.equal(diagnostics.capabilities.toolCalling, false)
+  assert.equal(diagnostics.capabilities.structuredOutput, false)
+  assert.equal(diagnostics.suitability.agentLoopRoles.executor.suitable, false)
+  assert.deepEqual(diagnostics.suitability.agentLoopRoles.executor.missingCapabilities, ['tool_calling', 'streaming'])
+})
+
+test('inspectModelCapabilities supports slashless custom models with explicit provider override', () => {
+  const diagnostics = inspectModelCapabilities('custom-gpt', 'openai')
+
+  assert.equal(diagnostics.providerId, 'openai')
+  assert.equal(diagnostics.modelId, 'custom-gpt')
+  assert.equal(diagnostics.modelDeclared, false)
+  assert.equal(diagnostics.capabilitySource, 'undeclared')
 })

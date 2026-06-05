@@ -1,8 +1,7 @@
 import readline from 'node:readline'
 import chalk from 'chalk'
-import * as path from 'node:path'
-import * as fs from 'node:fs'
 import { modelRegistry } from '../providers/registry.js'
+import { completePathMention, WorkspacePathIndex } from './pathMention.js'
 import { ConfigManager } from '../shared/config.js'
 import { getChatPrompt } from './renderEvents.js'
 import {
@@ -136,6 +135,7 @@ function truncateWithEllipsis(text: string, width: number): string {
 }
 
 export function makeCompleter(cwd: string) {
+  const pathIndex = new WorkspacePathIndex(cwd)
   return (line: string, callback?: (err: Error | null, result?: [string[], string]) => void) => {
     let hits: string[] = []
     let substring = line
@@ -174,40 +174,10 @@ export function makeCompleter(cwd: string) {
         .map(option => `/fallback ${option}`)
       substring = line
     } else {
-      const words = line.split(' ')
-      const lastWord = words[words.length - 1] || ''
-
-      if (lastWord.length > 0) {
-        let searchDir = cwd
-        let prefix = lastWord
-
-        if (lastWord.includes('/') || lastWord.includes('\\')) {
-          const lastSlashIndex = Math.max(lastWord.lastIndexOf('/'), lastWord.lastIndexOf('\\'))
-          const dirPart = lastWord.slice(0, lastSlashIndex)
-          prefix = lastWord.slice(lastSlashIndex + 1)
-          searchDir = path.resolve(cwd, dirPart)
-        }
-
-        try {
-          if (fs.existsSync(searchDir) && fs.statSync(searchDir).isDirectory()) {
-            const files = fs.readdirSync(searchDir)
-            const fileHits = files
-              .filter(f => f.startsWith(prefix))
-              .map(f => {
-                const fullPath = path.join(searchDir, f)
-                let isDir = false
-                try {
-                  isDir = fs.statSync(fullPath).isDirectory()
-                } catch {}
-                const pathPrefix = lastWord.slice(0, lastWord.length - prefix.length)
-                return pathPrefix + f + (isDir ? '/' : '')
-              })
-            hits = fileHits
-            substring = lastWord
-          }
-        } catch (e) {
-          // ignore
-        }
+      const pathCompletion = completePathMention(line, cwd, pathIndex)
+      if (pathCompletion) {
+        hits = pathCompletion.hits
+        substring = pathCompletion.substring
       }
     }
 

@@ -150,11 +150,23 @@ export async function runSessionFlow(
     fs.mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true })
     const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
     const { createDefaultNexusRuntime } = await import('../nexus/createRuntime.js')
+    const {
+      assertAgentRemoteExecutionReady,
+      assertRemoteRunnerReady,
+      configureRemoteRunnerFromEnv,
+      parseAgentExecutionEnvironment,
+    } = await import('../nexus/remoteRunnerConfig.js')
+    const agentExecutionEnvironment = parseAgentExecutionEnvironment(process.env.NEXUS_AGENT_EXECUTION_ENVIRONMENT)
+    const remoteRunner = await configureRemoteRunnerFromEnv()
+    assertRemoteRunnerReady(remoteRunner.status)
+    assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath,
       allowedTools: ['*'],
       cwd,
       enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
+      remoteRunner: remoteRunner.runner,
+      agentExecutionEnvironment,
     })
     const originalAppendEvent = storage.appendEvent.bind(storage)
 
@@ -230,6 +242,7 @@ export async function runSessionFlow(
         requestId,
         model: settings.modelId,
         budget,
+        remoteRunner: remoteRunner.runner,
       })) {
         await storage.appendEvent(sessionId, event)
       }

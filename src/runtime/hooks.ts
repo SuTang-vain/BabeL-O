@@ -10,6 +10,8 @@ export type HookEventName =
   | 'PostToolUse'
   | 'PostToolUseFailure'
   | 'PermissionRequest'
+  | 'PreInvocation'
+  | 'PostInvocation'
   | 'SubagentStart'
   | 'SubagentStop'
   | 'SessionEnd'
@@ -32,6 +34,26 @@ export type RuntimeHookInput = {
   errorCode?: string
   errorMessage?: string
   cleanup?: Record<string, unknown>
+  invocation?: {
+    providerId?: string
+    modelId?: string
+    loopCount?: number
+    maxLoops?: number
+    role?: string
+    contextTokenEstimate?: number
+    contextMaxTokens?: number
+    percentUsed?: number
+    toolCount?: number
+    visibleToolCount?: number
+    cachePreservationMode?: boolean
+    finalResponseOnlyMode?: boolean
+    durationMs?: number
+    success?: boolean
+    errorCode?: string
+    failureKind?: string
+    parentSessionId?: string
+    taskId?: string
+  }
 }
 
 export type RuntimeHookResult = {
@@ -134,6 +156,18 @@ const builtInHooks: RuntimeHook[] = [
       return {
         summary: 'Session cleanup completed.',
         metadata: input.cleanup,
+      }
+    },
+  },
+  {
+    name: 'InvocationDiagnosticsHook',
+    events: ['PreInvocation', 'PostInvocation'],
+    run(input) {
+      if (!input.invocation) return
+      const phase = input.invocation.success === undefined ? 'started' : 'completed'
+      return {
+        summary: `Provider invocation ${phase}.`,
+        metadata: input.invocation,
       }
     },
   },

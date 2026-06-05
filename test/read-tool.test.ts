@@ -45,3 +45,43 @@ test('Read supports targeted offset and limit ranges', async () => {
     await rm(cwd, { recursive: true, force: true })
   }
 })
+
+test('Read diagnoses repeated large file reads and points to targeted ranges', async () => {
+  const cwd = await makeTmpDir()
+  try {
+    const content = `${'line\n'.repeat(10_000)}needle${'b'.repeat(170_000)}`
+    await writeFile(join(cwd, 'large-repeat.txt'), content, 'utf8')
+
+    const first = await readTool.execute(
+      { path: 'large-repeat.txt', maxBytes: 200_000, mode: 'auto' },
+      { cwd, sessionId: 'session-read-repeat', maxOutputBytes: 1_000_000, bashMaxBufferBytes: 1_000_000 },
+    )
+    assert.equal(first.success, true)
+    assert.ok(String(first.output).includes('<read-preview'))
+
+    const second = await readTool.execute(
+      { path: 'large-repeat.txt', maxBytes: 200_000, mode: 'auto' },
+      { cwd, sessionId: 'session-read-repeat', maxOutputBytes: 1_000_000, bashMaxBufferBytes: 1_000_000 },
+    )
+    assert.equal(second.success, true)
+    const repeatOutput = String(second.output)
+    assert.ok(repeatOutput.includes('<read-repeat'))
+    assert.ok(repeatOutput.includes('previousRange="0-50000"'))
+    assert.ok(repeatOutput.includes('previousLines="1-10001"'))
+    assert.ok(repeatOutput.includes('currentLines="1-10001"'))
+    assert.ok(repeatOutput.includes('lastReadIndex="1"'))
+    assert.ok(repeatOutput.includes('session read #1'))
+    assert.ok(repeatOutput.includes('offset=50000'))
+    assert.ok(repeatOutput.includes('Use Grep to search for symbols/errors'))
+
+    const targeted = await readTool.execute(
+      { path: 'large-repeat.txt', offset: 50_000, limit: 6, maxBytes: 200_000, mode: 'auto' },
+      { cwd, sessionId: 'session-read-repeat', maxOutputBytes: 1_000_000, bashMaxBufferBytes: 1_000_000 },
+    )
+    assert.equal(targeted.success, true)
+    assert.ok(String(targeted.output).startsWith('needle'))
+    assert.ok(!String(targeted.output).includes('<read-repeat'))
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})

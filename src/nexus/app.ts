@@ -1,9 +1,11 @@
 import websocket from '@fastify/websocket'
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
 import { existsSync, lstatSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
+import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
+import type { RemoteRunnerStatus } from './remoteRunnerConfig.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchema } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
@@ -24,6 +26,9 @@ import { buildSystemPrompt, extractAbsolutePaths, mapEventsToMessages } from '..
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
 import { buildSessionAssetsSnapshot } from './sessionAssets.js'
 import { removeWorktree } from './worktree.js'
+import { ExploreAgentScheduler } from './agents/AgentScheduler.js'
+import { AgentJobRegistryError } from './agents/AgentJobRegistry.js'
+import type { AgentJob, AgentScheduler } from './agents/types.js'
 
 
 declare module 'fastify' {
@@ -165,6 +170,32 @@ const sessionResumeSchema = z.object({
   includeChildSessions: z.boolean().default(true).optional(),
 })
 
+const agentSpawnSchema = z.object({
+  parentSessionId: z.string().min(1),
+  prompt: z.string().min(1),
+  agentType: z.enum(['explore', 'review', 'test', 'implement', 'debug', 'general']).default('explore').optional(),
+  contextForkMode: z.enum(['minimal', 'working-set', 'task-focused', 'full-summary', 'debug-replay']).optional(),
+  isolation: z.enum(['none', 'worktree']).optional(),
+  allowedTools: z.array(z.string()).optional(),
+  maxRuntimeMs: z.number().int().positive().max(600_000).optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
+  metadata: z.record(z.string(), z.unknown()).optional(),
+})
+
+const agentListQuerySchema = z.object({
+  parentSessionId: z.string().optional(),
+  status: z.enum(['queued', 'running', 'waiting_permission', 'completed', 'failed', 'cancelled']).optional(),
+  agentType: z.enum(['explore', 'review', 'test', 'implement', 'debug', 'general']).optional(),
+})
+
+const agentWaitSchema = z.object({
+  timeoutMs: z.number().int().positive().max(600_000).optional(),
+})
+
+const agentCancelSchema = z.object({
+  reason: z.string().optional(),
+})
+
 type ActiveExecution = {
   requestId: string
   abortController: AbortController
@@ -181,6 +212,10 @@ export type CreateNexusAppOptions = {
   maxToolOutputBytes?: number
   bashMaxBufferBytes?: number
   apiKey?: string
+  remoteRunner?: RemoteToolRunner
+  remoteRunnerStatus?: RemoteRunnerStatus
+  agentScheduler?: AgentScheduler
+  agentExecutionEnvironment?: 'local' | 'remote'
 }
 
 type WebSocketLike = {
@@ -201,6 +236,12 @@ export async function createNexusApp(
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
   const activeExecutions = new Map<string, ActiveExecution>()
+  const agentScheduler = options.agentScheduler ?? new ExploreAgentScheduler({
+    storage: options.storage,
+    cwd: options.defaultCwd,
+    executionEnvironment: options.agentExecutionEnvironment,
+    remoteRunner: options.remoteRunner,
+  })
   await app.register(websocket)
 
   app.setErrorHandler((error: any, request, reply) => {
@@ -279,6 +320,14 @@ export async function createNexusApp(
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),
+    remoteRunner: options.remoteRunnerStatus ?? {
+      configured: options.remoteRunner !== undefined,
+      required: false,
+      healthy: options.remoteRunner !== undefined,
+      id: options.remoteRunner?.id,
+      capabilities: options.remoteRunner?.capabilities,
+    },
+    metrics: metrics.snapshot(),
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))
 
@@ -328,6 +377,106 @@ export async function createNexusApp(
     tools: options.runtime.listTools?.() ?? [],
   }))
 
+  app.post('/v1/agents', async (request, reply) => {
+    const body = agentSpawnSchema.parse(request.body)
+    try {
+      const job = await agentScheduler.spawnAgent(body)
+      return {
+        type: 'agent_job_spawned',
+        job,
+      }
+    } catch (error) {
+      if (error instanceof AgentJobRegistryError) {
+        return sendAgentError(reply, error)
+      }
+      throw error
+    }
+  })
+
+  app.get('/v1/agents', async request => {
+    const query = agentListQuerySchema.parse(request.query)
+    return {
+      type: 'agent_jobs',
+      jobs: await agentScheduler.listAgents(query),
+    }
+  })
+
+  app.get('/v1/agents/:jobId', async (request, reply) => {
+    const params = z.object({ jobId: z.string() }).parse(request.params)
+    const job = await findAgentJob(agentScheduler, params.jobId)
+    if (!job) return reply.code(404).send(createAgentJobNotFoundPayload(params.jobId))
+    return {
+      type: 'agent_job',
+      job,
+    }
+  })
+
+  app.post('/v1/agents/:jobId/wait', async (request, reply) => {
+    const params = z.object({ jobId: z.string() }).parse(request.params)
+    const body = agentWaitSchema.parse(request.body ?? {})
+    try {
+      return {
+        type: 'agent_job',
+        job: await agentScheduler.waitForAgent(params.jobId, body),
+      }
+    } catch (error) {
+      if (error instanceof AgentJobRegistryError) {
+        return sendAgentError(reply, error)
+      }
+      throw error
+    }
+  })
+
+  app.post('/v1/agents/:jobId/cancel', async (request, reply) => {
+    const params = z.object({ jobId: z.string() }).parse(request.params)
+    const body = agentCancelSchema.parse(request.body ?? {})
+    try {
+      return {
+        type: 'agent_job_cancelled',
+        job: await agentScheduler.cancelAgent(params.jobId, body.reason),
+      }
+    } catch (error) {
+      if (error instanceof AgentJobRegistryError) {
+        return sendAgentError(reply, error)
+      }
+      throw error
+    }
+  })
+
+  app.get('/v1/agents/:jobId/transcript', async (request, reply) => {
+    const params = z.object({ jobId: z.string() }).parse(request.params)
+    const query = eventListQuerySchema.parse(request.query)
+    const job = await findAgentJob(agentScheduler, params.jobId)
+    if (!job) return reply.code(404).send(createAgentJobNotFoundPayload(params.jobId))
+    const page = await options.storage.listEvents(job.childSessionId, query)
+    return {
+      type: 'agent_transcript',
+      jobId: job.jobId,
+      parentSessionId: job.parentSessionId,
+      childSessionId: job.childSessionId,
+      transcriptPath: job.transcriptPath ?? `nexus://sessions/${job.childSessionId}/events`,
+      events: page.events,
+      nextCursor: page.nextCursor,
+      order: query.order,
+      limit: query.limit,
+    }
+  })
+
+  app.get('/v1/sessions/:sessionId/agents', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = agentListQuerySchema.omit({ parentSessionId: true }).parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
+    return {
+      type: 'agent_jobs',
+      parentSessionId: params.sessionId,
+      jobs: await agentScheduler.listAgents({
+        ...query,
+        parentSessionId: params.sessionId,
+      }),
+    }
+  })
+
   type PreparedExecution = {
     sessionId: string
     session: SessionSnapshot
@@ -343,7 +492,7 @@ export async function createNexusApp(
   type PrepareError = { code: string; message: string; status: number }
 
   async function prepareExecution(body: z.infer<typeof executeSchema>): Promise<PreparedExecution | PrepareError> {
-    if (body.executionEnvironment && body.executionEnvironment === 'remote') {
+    if (body.executionEnvironment === 'remote' && !options.remoteRunner) {
       return { code: 'NOT_IMPLEMENTED', message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`, status: 501 }
     }
     const sessionId = body.sessionId ?? createId('session')
@@ -415,6 +564,7 @@ export async function createNexusApp(
     if (event.providerRequestDurationMs !== undefined) metrics.recordProviderRequestDuration(event.providerRequestDurationMs)
     if (event.streamDeltaCount !== undefined) metrics.recordStreamDeltas(event.streamDeltaCount)
     if (event.toolCallCount !== undefined && event.toolRoundtripDurationMs !== undefined) metrics.recordToolCalls(event.toolCallCount, event.toolRoundtripDurationMs)
+    if (event.remoteToolCallCount !== undefined && event.remoteToolRunnerDurationMs !== undefined) metrics.recordRemoteToolCalls(event.remoteToolCallCount, event.remoteToolRunnerDurationMs)
     if (event.contextCharsIn !== undefined && event.contextCharsOut !== undefined) metrics.recordContextChars(event.contextCharsIn, event.contextCharsOut)
     metrics.recordTokenUsage({
       inputTokens: event.inputTokens,
@@ -427,6 +577,9 @@ export async function createNexusApp(
       legacyContextCeiling: event.legacyContextCeiling,
       cachePreservationMode: event.cachePreservationMode,
       longContextUtilizationMode: event.longContextUtilizationMode,
+      prefixCacheImmutableRatio: event.prefixCacheImmutableRatio,
+      prefixCacheVolatileContentLast: event.prefixCacheVolatileContentLast,
+      prefixCacheFingerprint: event.prefixCacheFingerprint,
     })
     if (event.compactSummaryLatencyMs !== undefined) metrics.recordCompactSummaryLatency(event.compactSummaryLatencyMs)
   }
@@ -485,6 +638,7 @@ export async function createNexusApp(
           model: body.model,
           budget: body.budget,
           executionEnvironment: body.executionEnvironment,
+          remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
         })) {
           events.push(event)
@@ -773,6 +927,7 @@ export async function createNexusApp(
         sessionId: params.sessionId,
         prompt: query.prompt ?? session.lastUserInput ?? session.prompt,
         cwd: query.cwd ?? session.cwd,
+        contextFork: readContextForkMetadata(session.metadata),
       },
       events,
       modelId,
@@ -1339,6 +1494,7 @@ export async function createNexusApp(
           model: body.model,
           budget: body.budget,
           executionEnvironment: body.executionEnvironment,
+          remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
         })) {
           events.push(event)
@@ -1403,6 +1559,44 @@ function sendJson(socket: WebSocketLike, value: unknown): void {
   if (socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(value))
   }
+}
+
+async function findAgentJob(scheduler: AgentScheduler, jobId: string): Promise<AgentJob | undefined> {
+  try {
+    return (await scheduler.listAgents()).find(job => job.jobId === jobId)
+  } catch (error) {
+    if (error instanceof AgentJobRegistryError && error.code === 'AGENT_JOB_NOT_FOUND') return undefined
+    throw error
+  }
+}
+
+function sendAgentError(reply: FastifyReply, error: AgentJobRegistryError): unknown {
+  return reply.code(error.status).send({
+    type: 'error',
+    code: error.code,
+    message: error.message,
+  })
+}
+
+function createAgentJobNotFoundPayload(jobId: string): { type: 'error'; code: string; message: string } {
+  return {
+    type: 'error',
+    code: 'AGENT_JOB_NOT_FOUND',
+    message: `Agent job not found: ${jobId}`,
+  }
+}
+
+function readContextForkMetadata(metadata: Record<string, unknown> | undefined): { mode: string; inheritedItems: number; omittedItems: number } | undefined {
+  const contextFork = asRecord(metadata?.contextFork)
+  const mode = typeof metadata?.contextForkMode === 'string'
+    ? metadata.contextForkMode
+    : typeof contextFork?.mode === 'string'
+      ? contextFork.mode
+      : undefined
+  if (!mode) return undefined
+  const inheritedItems = typeof contextFork?.inheritedItems === 'number' ? contextFork.inheritedItems : 0
+  const omittedItems = typeof contextFork?.omittedItems === 'number' ? contextFork.omittedItems : 0
+  return { mode, inheritedItems, omittedItems }
 }
 
 type ExecutionFinalizationOptions = {

@@ -264,7 +264,20 @@ function buildDiagnosticRows(analysis: ContextAnalysis): string[] {
     `cache policy reason ${cache.reason}`,
     `microcompact saved≈${formatTokenCompact(analysis.sections.microcompactEstimatedTokensSaved)} tokens · duplicate results=${analysis.sections.microcompactDeduplicatedToolResultCount}`,
     `auto compact floor ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.currentTokens)}/${formatTokenCompact(analysis.diagnostics.autoCompactFloor.thresholdTokens)} (${analysis.diagnostics.autoCompactFloor.thresholdPercent}%) · budget ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens)}`,
+    `selection items retained=${analysis.diagnostics.selection.retained.length} dropped=${analysis.diagnostics.selection.dropped.length} · phases=${analysis.diagnostics.selection.phases.length}`,
   ]
+  const fork = analysis.diagnostics.selection.fork
+  if (fork) {
+    diagnosticRows.push(`context fork mode=${fork.mode} inherited=${fork.inheritedItems} omitted=${fork.omittedItems}`)
+  }
+  const retainedItem = analysis.diagnostics.selection.retained[0]
+  if (retainedItem) {
+    diagnosticRows.push(`selection retained ${retainedItem.kind} · ${retainedItem.reason} · ${formatTokenCompact(retainedItem.estimatedTokens)} tokens`)
+  }
+  const droppedItem = analysis.diagnostics.selection.dropped[0]
+  if (droppedItem) {
+    diagnosticRows.push(`selection dropped ${droppedItem.kind} · ${droppedItem.reason} · ${formatTokenCompact(droppedItem.estimatedTokens)} tokens`)
+  }
   if (analysis.diagnostics.autoCompact.fuseOpen) {
     diagnosticRows.push(`auto compact paused after ${analysis.diagnostics.autoCompact.failureCount}/${analysis.diagnostics.autoCompact.failureLimit} failures`)
   } else if (analysis.diagnostics.autoCompact.shouldCompact) {

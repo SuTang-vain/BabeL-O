@@ -26,7 +26,12 @@ export function executionMetricsFromEvent(
     cacheReadRatio: event.cacheReadRatio,
     cachePreservationMode: event.cachePreservationMode,
     longContextUtilizationMode: event.longContextUtilizationMode,
+    prefixCacheImmutableRatio: event.prefixCacheImmutableRatio,
+    prefixCacheVolatileContentLast: event.prefixCacheVolatileContentLast,
+    prefixCacheFingerprint: event.prefixCacheFingerprint,
     compactSummaryLatencyMs: event.compactSummaryLatencyMs,
+    remoteToolCallCount: event.remoteToolCallCount,
+    remoteToolRunnerDurationMs: event.remoteToolRunnerDurationMs,
     timestamp: event.timestamp,
   }
 }

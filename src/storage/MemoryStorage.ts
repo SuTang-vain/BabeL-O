@@ -112,6 +112,7 @@ export class MemoryStorage implements NexusStorage {
         existing.completedAt = event.timestamp
         existing.durationMs =
           new Date(event.timestamp).getTime() - new Date(existing.startedAt).getTime()
+        existing.remoteRunner = event.remoteRunner
       }
     }
 

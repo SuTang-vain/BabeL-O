@@ -20,6 +20,7 @@ export type OptimizeCommandOptions = {
   providerSmokeLive?: boolean
   model?: string
   timeoutMs?: string | number
+  executionEnvironment?: string
   yes?: boolean
 }
 
@@ -40,6 +41,7 @@ export function registerOptimizeCommand(program: Command): void {
     .option('--provider-smoke-live', 'Run the fixed live/manual AgentLoop provider smoke in a temporary workspace')
     .option('--model <model>', 'Model override for the provider smoke or optimizer run')
     .option('--timeout-ms <number>', 'Timeout in milliseconds for provider smoke live/manual runs', '120000')
+    .option('--execution-environment <environment>', 'Execution environment for optimizer tools: local or remote', 'local')
     .option('--yes', 'Approve the planner task list without prompting')
     .option('--enable-subagents', 'Allow optimizer/executor agents to delegate substantive subTasks')
     .option('--max-sub-agent-depth <number>', 'Maximum nested sub-agent delegation depth', '1')
@@ -58,8 +60,10 @@ export function registerOptimizeCommand(program: Command): void {
       }
 
       let subAgentOptions: OptimizeSubAgentOptions
+      let executionEnvironment: 'local' | 'remote'
       try {
         subAgentOptions = parseOptimizeSubAgentOptions(options)
+        executionEnvironment = parseOptimizeExecutionEnvironment(options.executionEnvironment)
       } catch (err) {
         console.error(chalk.red(`Error: ${err instanceof Error ? err.message : String(err)}`))
         process.exit(1)
@@ -73,8 +77,11 @@ export function registerOptimizeCommand(program: Command): void {
       }
 
       const { createDefaultNexusRuntime } = await import('../../nexus/createRuntime.js')
+      const { assertRemoteRunnerReady, configureRemoteRunnerFromEnv } = await import('../../nexus/remoteRunnerConfig.js')
       const { setNexusStorage } = await import('../../nexus/storageBridge.js')
-      const { runtime, storage } = await createDefaultNexusRuntime()
+      const remoteRunner = await configureRemoteRunnerFromEnv()
+      assertRemoteRunnerReady(remoteRunner.status)
+      const { runtime, storage } = await createDefaultNexusRuntime({ remoteRunner: remoteRunner.runner })
       setNexusStorage(storage)
 
       // Wrap storage.appendEvent to render events in real-time
@@ -102,6 +109,8 @@ export function registerOptimizeCommand(program: Command): void {
           const stepRunner = createRuntimeAgentStepRunner({
             cwd: options.cwd,
             model: options.model,
+            executionEnvironment,
+            remoteRunner: remoteRunner.runner,
             runtimeFactory: async () => runtime,
           })
 
@@ -149,6 +158,8 @@ export function registerOptimizeCommand(program: Command): void {
         const stepRunner = createRuntimeAgentStepRunner({
           cwd: options.cwd,
           model: options.model,
+          executionEnvironment,
+          remoteRunner: remoteRunner.runner,
           runtimeFactory: async () => runtime,
         })
         const rl = readline.createInterface({ input, output })
@@ -323,6 +334,12 @@ function formatPlannerTask(task: PlannerTaskPlan, index: number): string {
     : ''
   const description = task.description ? `: ${task.description}` : ''
   return chalk.white(`  ${index + 1}. [${task.title}]${description}`) + dependsOn
+}
+
+export function parseOptimizeExecutionEnvironment(value: string | undefined): 'local' | 'remote' {
+  const normalized = (value ?? 'local').trim().toLowerCase()
+  if (normalized === 'local' || normalized === 'remote') return normalized
+  throw new Error('--execution-environment must be local or remote.')
 }
 
 export function parseOptimizeSubAgentOptions(options: OptimizeCommandOptions): OptimizeSubAgentOptions {

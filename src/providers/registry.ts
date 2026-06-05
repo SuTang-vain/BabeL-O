@@ -40,6 +40,41 @@ export type ModelRoleRecommendation = {
   reason: string
 }
 
+export type ModelCapabilitySource = 'registry' | 'undeclared'
+
+export type ModelRoleSuitability = {
+  role: ModelRole
+  suitable: boolean
+  missingCapabilities: string[]
+}
+
+export type ModelCapabilityDiagnostics = {
+  providerId: string
+  providerName: string
+  adapter: ProviderAdapter
+  authMode: ProviderDefinition['authMode']
+  modelId: string
+  modelName: string
+  modelDeclared: boolean
+  capabilitySource: ModelCapabilitySource
+  capabilityWarning?: string
+  contextWindow: number
+  defaultMaxTokens: number
+  capabilities: {
+    toolCalling: boolean
+    jsonOutput: boolean
+    structuredOutput: boolean
+    streaming: boolean
+  }
+  suitability: {
+    longContext: boolean
+    toolCalling: boolean
+    structuredOutput: boolean
+    streaming: boolean
+    agentLoopRoles: Record<ModelRole, ModelRoleSuitability>
+  }
+}
+
 export class UnknownProviderError extends Error {
   constructor(providerId: string) {
     super(`Unknown provider: ${providerId}`)
@@ -375,6 +410,88 @@ export function getModel(id: string): ModelDefinition {
     throw new UnknownModelError(id)
   }
   return model
+}
+
+export function inspectModelCapabilities(modelId: string, providerIdOverride?: string): ModelCapabilityDiagnostics {
+  const providerId = providerIdOverride ?? (modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : modelId)
+  const provider = getProvider(providerId)
+  const declaredModel = modelRegistry.find(model => model.id === modelId)
+  const model = declaredModel ?? createUndeclaredModelDefinition(modelId)
+  const capabilities = {
+    toolCalling: model.capabilities.toolCalling,
+    jsonOutput: model.capabilities.jsonOutput,
+    structuredOutput: model.capabilities.jsonOutput,
+    streaming: model.capabilities.streaming,
+  }
+  const modelDeclared = Boolean(declaredModel)
+
+  return {
+    providerId: provider.id,
+    providerName: provider.displayName,
+    adapter: provider.adapter,
+    authMode: provider.authMode,
+    modelId,
+    modelName: model.name,
+    modelDeclared,
+    capabilitySource: modelDeclared ? 'registry' : 'undeclared',
+    capabilityWarning: modelDeclared
+      ? undefined
+      : `Model ${modelId} is not declared in the registry; capabilities are conservative placeholders and are not hard-blocked.`,
+    contextWindow: model.contextWindow,
+    defaultMaxTokens: model.defaultMaxTokens,
+    capabilities,
+    suitability: {
+      longContext: model.contextWindow >= 128000,
+      toolCalling: capabilities.toolCalling,
+      structuredOutput: capabilities.structuredOutput,
+      streaming: capabilities.streaming,
+      agentLoopRoles: {
+        planner: roleSuitability('planner', model, capabilities),
+        executor: roleSuitability('executor', model, capabilities),
+        critic: roleSuitability('critic', model, capabilities),
+        optimizer: roleSuitability('optimizer', model, capabilities),
+      },
+    },
+  }
+}
+
+function createUndeclaredModelDefinition(modelId: string): ModelDefinition {
+  return {
+    id: modelId,
+    name: modelId,
+    contextWindow: 8192,
+    defaultMaxTokens: 4096,
+    capabilities: {
+      toolCalling: false,
+      jsonOutput: false,
+      streaming: false,
+    },
+  }
+}
+
+function roleSuitability(
+  role: ModelRole,
+  model: ModelDefinition,
+  capabilities: ModelCapabilityDiagnostics['capabilities'],
+): ModelRoleSuitability {
+  const missingCapabilities: string[] = []
+  if ((role === 'planner' || role === 'optimizer') && model.contextWindow < 128000) {
+    missingCapabilities.push('long_context')
+  }
+  if ((role === 'executor' || role === 'optimizer') && !capabilities.toolCalling) {
+    missingCapabilities.push('tool_calling')
+  }
+  if ((role === 'critic' || role === 'optimizer') && !capabilities.structuredOutput) {
+    missingCapabilities.push('structured_output')
+  }
+  if (!capabilities.streaming) {
+    missingCapabilities.push('streaming')
+  }
+  return {
+    role,
+    suitable: missingCapabilities.length === 0,
+    missingCapabilities,
+  }
 }
 
 export function recommendModelForRole(role: ModelRole): ModelRoleRecommendation {

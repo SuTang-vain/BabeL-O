@@ -68,6 +68,20 @@ export const ToolStartedEventSchema = z.object({
   input: z.unknown(),
 })
 
+export const RemoteToolRunnerDiagnosticsSchema = z.object({
+  runnerId: z.string(),
+  protocolVersion: z.string(),
+  durationMs: z.number().optional(),
+  roundtripMs: z.number().optional(),
+  truncated: z.boolean().optional(),
+  originalBytes: z.number().optional(),
+  exitCode: z.number().optional(),
+  signal: z.string().optional(),
+  cancelled: z.boolean().optional(),
+  timedOut: z.boolean().optional(),
+  errorCode: z.string().optional(),
+})
+
 export const ToolCompletedEventSchema = z.object({
   type: z.literal('tool_completed'),
   ...baseEventFields,
@@ -77,6 +91,7 @@ export const ToolCompletedEventSchema = z.object({
   output: z.unknown(),
   truncated: z.boolean().optional(),
   originalBytes: z.number().optional(),
+  remoteRunner: RemoteToolRunnerDiagnosticsSchema.optional(),
 })
 
 export const ToolDeniedEventSchema = z.object({
@@ -265,7 +280,12 @@ export const ExecutionMetricsEventSchema = z.object({
   cacheReadRatio: z.number().optional(),
   cachePreservationMode: z.boolean().optional(),
   longContextUtilizationMode: z.boolean().optional(),
+  prefixCacheImmutableRatio: z.number().optional(),
+  prefixCacheVolatileContentLast: z.boolean().optional(),
+  prefixCacheFingerprint: z.string().optional(),
   compactSummaryLatencyMs: z.number().optional(),
+  remoteToolCallCount: z.number().optional(),
+  remoteToolRunnerDurationMs: z.number().optional(),
 })
 
 export const NexusEventSchema = z.discriminatedUnion('type', [

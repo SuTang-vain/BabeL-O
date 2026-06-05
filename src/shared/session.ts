@@ -63,44 +63,31 @@ export type SessionSnapshot = {
 
 export type PermissionResolution = { approved: boolean; reason?: string }
 
-type PendingPermissionEntry = {
+export type PendingPermissionEntry = {
   sessionId: string
   toolUseId: string
   resolve: (res: PermissionResolution) => void
   expiresAt: number
 }
 
-export class PendingPermissionRegistry {
-  private static instance: PendingPermissionRegistry
+export interface PendingPermissionBackend {
+  register(entry: PendingPermissionEntry): void
+  resolve(sessionId: string, toolUseId: string, resolution: PermissionResolution): boolean
+  resolveSession(sessionId: string, resolution: PermissionResolution): boolean
+  sweepExpired(nowMs: number): number
+  pendingCount(): number
+  reset(resolution: PermissionResolution): void
+}
+
+export class InMemoryPendingPermissionBackend implements PendingPermissionBackend {
   private readonly pending = new Map<string, PendingPermissionEntry>()
-  private ttlMs = 30 * 60 * 1000
-  private timer: ReturnType<typeof setInterval> | null = null
 
-  static getInstance(): PendingPermissionRegistry {
-    if (!PendingPermissionRegistry.instance) {
-      PendingPermissionRegistry.instance = new PendingPermissionRegistry()
-    }
-    return PendingPermissionRegistry.instance
-  }
-
-  private constructor() {
-    this.startSweeper()
-  }
-
-  register(sessionId: string, toolUseId: string): Promise<PermissionResolution> {
-    const key = `${sessionId}:${toolUseId}`
-    return new Promise((resolve) => {
-      this.pending.set(key, {
-        sessionId,
-        toolUseId,
-        resolve,
-        expiresAt: Date.now() + this.ttlMs,
-      })
-    })
+  register(entry: PendingPermissionEntry): void {
+    this.pending.set(pendingPermissionKey(entry.sessionId, entry.toolUseId), entry)
   }
 
   resolve(sessionId: string, toolUseId: string, resolution: PermissionResolution): boolean {
-    const key = `${sessionId}:${toolUseId}`
+    const key = pendingPermissionKey(sessionId, toolUseId)
     const entry = this.pending.get(key)
     if (entry) {
       entry.resolve(resolution)
@@ -113,7 +100,7 @@ export class PendingPermissionRegistry {
   resolveSession(sessionId: string, resolution: PermissionResolution): boolean {
     let resolvedAny = false
     for (const [key, entry] of this.pending.entries()) {
-      if (key.startsWith(`${sessionId}:`)) {
+      if (entry.sessionId === sessionId) {
         entry.resolve(resolution)
         this.pending.delete(key)
         resolvedAny = true
@@ -122,7 +109,7 @@ export class PendingPermissionRegistry {
     return resolvedAny
   }
 
-  sweepExpired(nowMs = Date.now()): number {
+  sweepExpired(nowMs: number): number {
     let expired = 0
     for (const [key, entry] of this.pending.entries()) {
       if (entry.expiresAt > nowMs) continue
@@ -140,6 +127,58 @@ export class PendingPermissionRegistry {
     return this.pending.size
   }
 
+  reset(resolution: PermissionResolution): void {
+    for (const entry of this.pending.values()) {
+      entry.resolve(resolution)
+    }
+    this.pending.clear()
+  }
+}
+
+export class PendingPermissionRegistry {
+  private static instance: PendingPermissionRegistry
+  private backend: PendingPermissionBackend = new InMemoryPendingPermissionBackend()
+  private ttlMs = 30 * 60 * 1000
+  private timer: ReturnType<typeof setInterval> | null = null
+
+  static getInstance(): PendingPermissionRegistry {
+    if (!PendingPermissionRegistry.instance) {
+      PendingPermissionRegistry.instance = new PendingPermissionRegistry()
+    }
+    return PendingPermissionRegistry.instance
+  }
+
+  private constructor() {
+    this.startSweeper()
+  }
+
+  register(sessionId: string, toolUseId: string): Promise<PermissionResolution> {
+    return new Promise((resolve) => {
+      this.backend.register({
+        sessionId,
+        toolUseId,
+        resolve,
+        expiresAt: Date.now() + this.ttlMs,
+      })
+    })
+  }
+
+  resolve(sessionId: string, toolUseId: string, resolution: PermissionResolution): boolean {
+    return this.backend.resolve(sessionId, toolUseId, resolution)
+  }
+
+  resolveSession(sessionId: string, resolution: PermissionResolution): boolean {
+    return this.backend.resolveSession(sessionId, resolution)
+  }
+
+  sweepExpired(nowMs = Date.now()): number {
+    return this.backend.sweepExpired(nowMs)
+  }
+
+  pendingCount(): number {
+    return this.backend.pendingCount()
+  }
+
   configureForTest(options: { ttlMs?: number; disableSweeper?: boolean }): void {
     if (options.ttlMs !== undefined) {
       this.ttlMs = options.ttlMs
@@ -151,14 +190,20 @@ export class PendingPermissionRegistry {
     }
   }
 
+  setBackend(backend: PendingPermissionBackend): void {
+    this.backend.reset({
+      approved: false,
+      reason: 'Permission backend replaced',
+    })
+    this.backend = backend
+  }
+
   resetForTest(): void {
-    for (const entry of this.pending.values()) {
-      entry.resolve({
-        approved: false,
-        reason: 'Permission registry reset',
-      })
-    }
-    this.pending.clear()
+    this.backend.reset({
+      approved: false,
+      reason: 'Permission registry reset',
+    })
+    this.backend = new InMemoryPendingPermissionBackend()
     this.ttlMs = 30 * 60 * 1000
     this.startSweeper()
   }
@@ -176,4 +221,8 @@ export class PendingPermissionRegistry {
     clearInterval(this.timer)
     this.timer = null
   }
+}
+
+function pendingPermissionKey(sessionId: string, toolUseId: string): string {
+  return `${sessionId}:${toolUseId}`
 }

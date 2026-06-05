@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import { existsSync, lstatSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
-import { errorMessage, ProviderError } from '../shared/errors.js'
+import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { logger } from '../shared/logger.js'
 import type { AnyTool } from '../tools/Tool.js'
@@ -37,6 +37,7 @@ import {
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
+  absorbPrefixCacheDiagnosticsMetrics,
   absorbProviderTurnMetrics,
   buildContextBlockingEvents,
   buildContextWarningEvent,
@@ -44,6 +45,7 @@ import {
   buildProviderQueryParams,
   buildProviderToolResultsMessage,
   buildRuntimeContextBlockingEventsForLoop,
+  computeProviderPrefixCacheDiagnostics,
   buildRuntimeErrorEvent,
   buildRuntimeExecutionMetricsEvent,
   buildRuntimeResultEvent,
@@ -51,8 +53,10 @@ import {
   reduceProviderTurnOutcome,
   refreshRuntimeContextState,
   streamProviderTurn,
+  type RuntimeProviderTurn,
 } from './runtimePipeline.js'
 import { executeProviderToolCall } from './runtimeToolLoop.js'
+import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -448,6 +452,13 @@ export class LLMCodingRuntime implements NexusRuntime {
         metrics.contextCharsIn += requestState.turnContextCharsIn
         finalResponseOnlyMode = requestState.finalResponseOnlyMode
 
+        const prefixCacheDiagnostics = computeProviderPrefixCacheDiagnostics({
+          systemPromptBlocks: assembledContext.systemPromptBlocks,
+          executionStateBlock: requestState.executionStateBlock,
+          tools: modelVisibleTools,
+        })
+        absorbPrefixCacheDiagnosticsMetrics(metrics, prefixCacheDiagnostics)
+
         const queryParams = buildProviderQueryParams({
           modelId: cleanedModelId,
           systemPrompt: assembledContext.systemPrompt,
@@ -465,22 +476,98 @@ export class LLMCodingRuntime implements NexusRuntime {
           apiKey: settings.apiKey,
           baseUrl: settings.baseUrl,
         }
-
-        const providerTurnStream = streamProviderTurn({
-          stream: adapter.queryStream(queryParams, adapterOptions),
-          sessionId: options.sessionId,
-          signal: options.signal,
-          executionStartMs: metrics.executionStartMs,
-        })
-        let providerTurn = await providerTurnStream.next()
-        while (!providerTurn.done) {
-          yield providerTurn.value
-          providerTurn = await providerTurnStream.next()
+        const invocationMetadata: NonNullable<RuntimeHookInput['invocation']> = {
+          providerId: settings.providerId,
+          modelId: cleanedModelId,
+          loopCount,
+          maxLoops,
+          role: options.role,
+          contextTokenEstimate: requestState.contextWindowState.tokenEstimate,
+          contextMaxTokens: requestState.contextWindowState.maxTokens,
+          percentUsed: requestState.contextWindowState.percentUsed,
+          toolCount: currentToolsList.length,
+          visibleToolCount: modelVisibleTools.length,
+          cachePreservationMode: cacheAwareCompactPolicy.cachePreservationMode,
+          finalResponseOnlyMode,
         }
-        absorbProviderTurnMetrics(metrics, providerTurn.value)
+
+        const preInvocationHooks = await executeRuntimeHooks(
+          'PreInvocation',
+          { invocation: invocationMetadata },
+          {
+            sessionId: options.sessionId,
+            cwd: options.cwd,
+            role: options.role,
+            signal: options.signal,
+          },
+          { config: options.hooks },
+        )
+        for (const hookEvent of preInvocationHooks.events) yield hookEvent
+
+        const invocationStartMs = performance.now()
+        let providerTurn: RuntimeProviderTurn
+        try {
+          const providerTurnStream = streamProviderTurn({
+            stream: adapter.queryStream(queryParams, adapterOptions),
+            sessionId: options.sessionId,
+            signal: options.signal,
+            executionStartMs: metrics.executionStartMs,
+            queryStartMs: invocationStartMs,
+          })
+          let providerTurnResult = await providerTurnStream.next()
+          while (!providerTurnResult.done) {
+            yield providerTurnResult.value
+            providerTurnResult = await providerTurnStream.next()
+          }
+          providerTurn = providerTurnResult.value
+        } catch (error) {
+          const providerRecovery = classifyProviderRecovery(error)
+          const postInvocationHooks = await executeRuntimeHooks(
+            'PostInvocation',
+            {
+              invocation: {
+                ...invocationMetadata,
+                durationMs: performance.now() - invocationStartMs,
+                success: false,
+                errorCode: providerInvocationErrorCode(error, options),
+                failureKind: providerRecovery?.kind,
+              },
+            },
+            {
+              sessionId: options.sessionId,
+              cwd: options.cwd,
+              role: options.role,
+              signal: options.signal,
+            },
+            { config: options.hooks },
+          )
+          for (const hookEvent of postInvocationHooks.events) yield hookEvent
+          throw error
+        }
+
+        const postInvocationHooks = await executeRuntimeHooks(
+          'PostInvocation',
+          {
+            invocation: {
+              ...invocationMetadata,
+              durationMs: providerTurn.durationMs,
+              success: true,
+            },
+          },
+          {
+            sessionId: options.sessionId,
+            cwd: options.cwd,
+            role: options.role,
+            signal: options.signal,
+          },
+          { config: options.hooks },
+        )
+        for (const hookEvent of postInvocationHooks.events) yield hookEvent
+
+        absorbProviderTurnMetrics(metrics, providerTurn)
         const providerOutcome = reduceProviderTurnOutcome({
           sessionId: options.sessionId,
-          turn: providerTurn.value,
+          turn: providerTurn,
           finalResponseOnlyMode,
           suppressToolsForUserIntent: shouldSuppressToolsForIntent(assembledContext.userIntentGuidance),
           userIntentGuidance: assembledContext.userIntentGuidance,
@@ -582,6 +669,13 @@ export function buildSystemPrompt(
 // extractAbsolutePaths is now exported from systemPromptBuilder.ts
 // Re-export for backward compatibility
 export { extractAbsolutePaths } from './systemPromptBuilder.js'
+
+function providerInvocationErrorCode(error: unknown, options: RuntimeExecuteOptions): string {
+  const err = error as { code?: string; message?: string; name?: string }
+  const isTimeout = options.timeoutSignal?.aborted
+  const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
+  return isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR')
+}
 
 function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
   const paths = extractAbsolutePaths(prompt)

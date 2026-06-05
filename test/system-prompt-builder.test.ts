@@ -113,6 +113,18 @@ describe('buildSystemPromptSections', () => {
     assert.ok(langSection!.content.includes('Chinese'))
   })
 
+  test('working_set section appears when workingSet is provided', () => {
+    const sections = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+      workingSet: 'Working Set:\n- /tmp/test/src/a.ts (file, touches=2, lastTurn=1, source=tool)',
+    })
+    const workingSetSection = sections.find(s => s.id === 'working_set')
+    assert.ok(workingSetSection)
+    assert.equal(workingSetSection!.cacheable, false)
+    assert.ok(workingSetSection!.content.includes('/tmp/test/src/a.ts'))
+  })
+
   test('system_rules contains latest instruction priority rule', () => {
     const sections = buildSystemPromptSections({
       cwd: '/tmp/test',
@@ -160,6 +172,25 @@ describe('buildSystemPromptSections', () => {
     })
     const ids = sections.map(s => s.id)
     assert.equal(new Set(ids).size, ids.length, 'Duplicate section ids found')
+  })
+
+  test('keeps cacheable immutable prefix before volatile sections', () => {
+    const sections = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+      userIntentGuidance: 'User Intake Guidance: continue',
+      workingSet: 'Working Set:\n- /tmp/test/src/a.ts',
+      gitStatus: 'Git Status: clean',
+      projectMemory: 'memory',
+      sessionSummary: 'summary',
+      activeSkills: 'skills',
+      language: 'English',
+      prompt: '/tmp/test/a.txt',
+    })
+    const firstVolatileIndex = sections.findIndex(section => !section.cacheable)
+    assert.ok(firstVolatileIndex > 0)
+    assert.ok(sections.slice(0, firstVolatileIndex).every(section => section.cacheable))
+    assert.ok(sections.slice(firstVolatileIndex).every(section => !section.cacheable))
   })
 })
 

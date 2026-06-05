@@ -4,6 +4,8 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir, homedir } from 'node:os'
+import { z } from 'zod'
+import { createEmptyContextSelectionDiagnostics } from '../src/runtime/contextManager.js'
 import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
@@ -20,6 +22,7 @@ import { executeProviderToolCall } from '../src/runtime/runtimeToolLoop.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
+  absorbPrefixCacheDiagnosticsMetrics,
   absorbProviderTurnMetrics,
   buildContextBlockingEvents,
   buildContextWarningEvent,
@@ -29,6 +32,7 @@ import {
   buildProviderQueryParams,
   buildProviderToolResultsMessage,
   buildRuntimeContextBlockingEventsForLoop,
+  computeProviderPrefixCacheDiagnostics,
   buildRuntimeContextRefreshState,
   buildRuntimeExecutionMetricsEvent,
   buildRuntimeExecutionStateBlock,
@@ -49,6 +53,18 @@ import { setAdapterOverrideForTest } from '../src/providers/registry.js'
 import type { ModelAdapter, ModelQueryParams, StreamDelta } from '../src/providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../src/shared/config.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
+import {
+  HttpRemoteToolRunner,
+  InMemoryRemoteToolRunner,
+  REMOTE_RUNNER_PROTOCOL_VERSION,
+  createRemoteToolRunnerServer,
+} from '../src/runtime/remoteRunner.js'
+import {
+  assertAgentRemoteExecutionReady,
+  assertRemoteRunnerReady,
+  configureRemoteRunner,
+  parseAgentExecutionEnvironment,
+} from '../src/nexus/remoteRunnerConfig.js'
 
 const baseRuntimeUserIntentGuidance: UserIntentGuidance = {
   intent: 'continue',
@@ -269,6 +285,7 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
       bytesSaved: 0,
       estimatedTokensSaved: 0,
     },
+    selectionDiagnostics: createEmptyContextSelectionDiagnostics(allocateBudget('missing-model-for-default-budget').maxTokens),
   }
   const compactFailureEvent: NexusEvent = {
     type: 'compact_failure',
@@ -811,6 +828,19 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(metrics.cachePreservationMode, true)
   assert.equal(metrics.longContextUtilizationMode, true)
 
+  const prefixCacheDiagnostics = computeProviderPrefixCacheDiagnostics({
+    systemPromptBlocks: [
+      { text: 'static-system', cacheable: true },
+      { text: 'dynamic-working-set', cacheable: false },
+    ],
+    executionStateBlock: 'runtime-state',
+    tools: [{ name: 'Read', description: 'Read files', inputSchema: {} }],
+  })
+  absorbPrefixCacheDiagnosticsMetrics(metrics, prefixCacheDiagnostics)
+  assert.equal(metrics.prefixCacheImmutableRatio, prefixCacheDiagnostics.immutablePrefixRatio)
+  assert.equal(metrics.prefixCacheVolatileContentLast, true)
+  assert.equal(metrics.prefixCacheFingerprint, prefixCacheDiagnostics.fingerprint)
+
   const event = buildRuntimeExecutionMetricsEvent({ sessionId: 'session-metrics-cache-aware' }, metrics)
   assert.equal(event.providerFirstTokenMs, 7)
   assert.equal(event.cacheCreationInputTokens, 2)
@@ -820,6 +850,9 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(event.compactSummaryLatencyMs, 15)
   assert.equal(event.cachePreservationMode, true)
   assert.equal(event.longContextUtilizationMode, true)
+  assert.equal(event.prefixCacheImmutableRatio, prefixCacheDiagnostics.immutablePrefixRatio)
+  assert.equal(event.prefixCacheVolatileContentLast, true)
+  assert.equal(event.prefixCacheFingerprint, prefixCacheDiagnostics.fingerprint)
 })
 
 test('execute reads a workspace file and records session events', async () => {
@@ -1924,6 +1957,116 @@ test('tool audit reports risk and allowlist status', async () => {
   }
 })
 
+test('remote runner env config defaults to disabled and reports optional failures', async () => {
+  const disabled = await configureRemoteRunner()
+  assert.equal(disabled.runner, undefined)
+  assert.deepEqual(disabled.status, {
+    configured: false,
+    required: false,
+    healthy: true,
+    errorCode: undefined,
+    errorMessage: undefined,
+  })
+
+  const optionalFailure = await configureRemoteRunner({
+    url: 'http://user:secret@127.0.0.1:9?token=abc',
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.equal(optionalFailure.runner, undefined)
+  assert.equal(optionalFailure.status.configured, true)
+  assert.equal(optionalFailure.status.required, false)
+  assert.equal(optionalFailure.status.healthy, false)
+  assert.equal(optionalFailure.status.url, 'http://127.0.0.1:9/?token=%3Credacted%3E')
+  assert.equal(optionalFailure.status.errorCode, 'REMOTE_RUNNER_CAPABILITIES_FAILED')
+})
+
+test('required remote runner config fails fast when unhealthy', async () => {
+  const required = await configureRemoteRunner({ required: true })
+  assert.equal(required.status.configured, false)
+  assert.equal(required.status.healthy, false)
+  assert.throws(
+    () => assertRemoteRunnerReady(required.status),
+    /NEXUS_REMOTE_RUNNER_REQUIRED failed/,
+  )
+})
+
+test('agent remote execution env requires configured healthy remote runner', async () => {
+  assert.equal(parseAgentExecutionEnvironment(undefined), undefined)
+  assert.equal(parseAgentExecutionEnvironment('local'), 'local')
+  assert.equal(parseAgentExecutionEnvironment('REMOTE'), 'remote')
+  assert.throws(
+    () => parseAgentExecutionEnvironment('docker'),
+    /NEXUS_AGENT_EXECUTION_ENVIRONMENT must be local or remote/,
+  )
+
+  const disabled = await configureRemoteRunner()
+  assert.throws(
+    () => assertAgentRemoteExecutionReady('remote', disabled.status),
+    /requires a healthy NEXUS_REMOTE_RUNNER_URL/,
+  )
+  assert.doesNotThrow(() => assertAgentRemoteExecutionReady('local', disabled.status))
+})
+
+test('remote runner config creates HttpRemoteToolRunner from capabilities', async () => {
+  const configured = await configureRemoteRunner({
+    url: 'http://127.0.0.1:3897',
+    required: true,
+    fetch: async () => new Response(JSON.stringify({
+      protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+      id: 'go-runner-test',
+      capabilities: { tools: ['Read', 'Grep', 'Glob', 'Write', 'Edit'], readOnly: false, writeEnabled: true, maxConcurrentTools: 4 },
+    }), { status: 200 }),
+  })
+
+  assert.ok(configured.runner)
+  assert.equal(configured.runner.id, 'go-runner-test')
+  assert.deepEqual(configured.runner.capabilities, { tools: ['Read', 'Grep', 'Glob', 'Write', 'Edit'], readOnly: false, writeEnabled: true, maxConcurrentTools: 4 })
+  assert.deepEqual(configured.status, {
+    configured: true,
+    required: true,
+    healthy: true,
+    url: 'http://127.0.0.1:3897/',
+    id: 'go-runner-test',
+    protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+    capabilities: { tools: ['Read', 'Grep', 'Glob', 'Write', 'Edit'], readOnly: false, writeEnabled: true, maxConcurrentTools: 4 },
+  })
+})
+
+test('/v1/runtime/status reports remote runner diagnostics', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    id: 'status-runner',
+    capabilities: { tools: ['Read'] },
+    handler: () => ({ kind: 'result', success: true, output: 'ok' }),
+  })
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    remoteRunner,
+    remoteRunnerStatus: {
+      configured: true,
+      required: false,
+      healthy: true,
+      url: 'http://127.0.0.1:3897/',
+      id: 'status-runner',
+      protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+      capabilities: { tools: ['Read'] },
+    },
+  })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/status' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.remoteRunner.configured, true)
+    assert.equal(body.remoteRunner.healthy, true)
+    assert.equal(body.remoteRunner.id, 'status-runner')
+    assert.deepEqual(body.remoteRunner.capabilities.tools, ['Read'])
+  } finally {
+    await app.close()
+  }
+})
+
 test('/v1/runtime/status returns redacted provider diagnostics', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-status`)
   await mkdir(cwd, { recursive: true })
@@ -2381,6 +2524,9 @@ test('/v1/sessions/:sessionId/assets returns SDK dashboard data assets', async (
       cacheReadRatio: 0.35,
       cachePreservationMode: true,
       longContextUtilizationMode: true,
+      prefixCacheImmutableRatio: 0.82,
+      prefixCacheVolatileContentLast: true,
+      prefixCacheFingerprint: 'assets-prefix-fingerprint',
       compactSummaryLatencyMs: 12,
       timestamp: iso(9),
     })
@@ -2527,6 +2673,35 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     assert.equal(typeof body.diagnostics.sessionMemoryLite.nextDecision.estimatedTokensSinceLastUpdate, 'number')
     assert.ok(Array.isArray(body.diagnostics.signals))
     assert.ok(Array.isArray(body.recommendations))
+
+    await storage.saveSession({
+      sessionId: 'session-child-context-api',
+      parentSessionId: sessionId,
+      cwd,
+      prompt: 'child prompt',
+      phase: 'created',
+      createdAt: '2026-05-23T00:00:09.000Z',
+      updatedAt: '2026-05-23T00:00:09.000Z',
+      events: [],
+      metadata: {
+        contextForkMode: 'task-focused',
+        contextFork: {
+          inheritedItems: 7,
+          omittedItems: 3,
+        },
+      },
+    })
+    const childContextResponse = await app.inject({
+      method: 'GET',
+      url: '/v1/sessions/session-child-context-api/context?modelId=local/coding-runtime',
+    })
+    assert.equal(childContextResponse.statusCode, 200)
+    const childContext = childContextResponse.json()
+    assert.deepEqual(childContext.diagnostics.selection.fork, {
+      mode: 'task-focused',
+      inheritedItems: 7,
+      omittedItems: 3,
+    })
 
     const retainedEvents: NexusEvent[] = [{
       type: 'user_message',
@@ -2856,6 +3031,53 @@ test('execute concurrency gate rejects excess work quickly', async () => {
   }
 })
 
+test('remote execute concurrency gate rejects excess work while runner is active', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-remote-busy`)
+  await mkdir(cwd, { recursive: true })
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    handler: (_request, context) => new Promise<never>((_resolve, reject) => {
+      context.signal.addEventListener('abort', () => reject(new Error('remote aborted')))
+    }),
+  })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'], remoteRunner })
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: cwd,
+    executeTimeoutMs: 200,
+    maxConcurrentExecutions: 1,
+    remoteRunner,
+  })
+  try {
+    const first = app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read remote.txt', cwd, executionEnvironment: 'remote' },
+    })
+    await waitFor(() => remoteRunner.requests.length === 1)
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'hello', cwd },
+    })
+
+    assert.equal(rejected.statusCode, 429)
+    assert.equal(rejected.json().code, 'EXECUTION_BUSY')
+    const firstResponse = await first
+    assert.equal(firstResponse.statusCode, 200)
+    assert.equal(firstResponse.json().statusCode, 408)
+    assert.equal(firstResponse.json().error.code, 'REQUEST_TIMEOUT')
+    assert.equal(remoteRunner.cancelRequests.length, 1)
+
+    const metricsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/metrics' })
+    const metrics = metricsResponse.json()
+    assert.equal(metrics.execute.rejectedCount, 1)
+    assert.equal(metrics.execute.timeoutCount, 1)
+  } finally {
+    await app.close()
+  }
+})
+
 test('tool output is truncated before it is stored in events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-truncate`)
   await mkdir(cwd, { recursive: true })
@@ -3046,6 +3268,9 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
         cacheReadRatio: 0.5,
         cachePreservationMode: true,
         longContextUtilizationMode: true,
+        prefixCacheImmutableRatio: 0.82,
+        prefixCacheVolatileContentLast: true,
+        prefixCacheFingerprint: 'runtime-prefix-fingerprint',
         compactSummaryLatencyMs: 12,
       }
       yield {
@@ -3076,6 +3301,9 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(savedMetrics?.compactSummaryLatencyMs, 12)
     assert.equal(savedMetrics?.cachePreservationMode, true)
     assert.equal(savedMetrics?.longContextUtilizationMode, true)
+    assert.equal(savedMetrics?.prefixCacheImmutableRatio, 0.82)
+    assert.equal(savedMetrics?.prefixCacheVolatileContentLast, true)
+    assert.equal(savedMetrics?.prefixCacheFingerprint, 'runtime-prefix-fingerprint')
 
     const metricsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/metrics' })
     const metrics = metricsResponse.json()
@@ -3087,7 +3315,18 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(metrics.contextPolicy.legacyContextCeiling, 120_000)
     assert.equal(metrics.contextPolicy.cachePreservationModeCount, 1)
     assert.equal(metrics.contextPolicy.longContextUtilizationModeCount, 1)
+    assert.equal(metrics.contextPolicy.prefixCache.immutableRatioAvg, 0.82)
+    assert.equal(metrics.contextPolicy.prefixCache.sampleCount, 1)
+    assert.equal(metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
+    assert.equal(metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
     assert.equal(metrics.compactSummaryLatencyMs.avgMs, 12)
+
+    const statusResponse = await app.inject({ method: 'GET', url: '/v1/runtime/status' })
+    const status = statusResponse.json()
+    assert.equal(status.metrics.contextPolicy.prefixCache.immutableRatioAvg, 0.82)
+    assert.equal(status.metrics.contextPolicy.prefixCache.sampleCount, 1)
+    assert.equal(status.metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
+    assert.equal(status.metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
   } finally {
     await app.close()
     await storage.close()
@@ -3424,7 +3663,8 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
   try {
     const res = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
     assert.equal(res.success, true)
-    assert.match(String(res.output), /matches truncated for context budget/)
+    assert.match(String(res.output), /matches shown; more matches truncated for context budget/)
+    assert.match(String(res.output), /Read with offset\/limit/)
     const lines = String(res.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines.length, 2)
   } finally {
@@ -3435,7 +3675,8 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
   if (oldPath) {
     const res2 = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
     assert.equal(res2.success, true)
-    assert.match(String(res2.output), /matches truncated for context budget/)
+    assert.match(String(res2.output), /matches shown; more matches truncated for context budget/)
+    assert.match(String(res2.output), /Read with offset\/limit/)
     const lines2 = String(res2.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines2.length, 2)
   }
@@ -3461,6 +3702,7 @@ test('Glob tool enforces maxResults limits and appends truncation warning', asyn
   assert.ok(Array.isArray(res.output))
   assert.equal(res.output.length, 3) // 2 sliced + 1 warning element
   assert.match(res.output[2] as string, /more results truncated/)
+  assert.match(res.output[2] as string, /Grep or targeted Read/)
 
   const absoluteRes = await globTool.execute({ pattern: cwd, maxResults: 10 }, ctx)
   assert.equal(absoluteRes.success, true)
@@ -3544,7 +3786,6 @@ test('executionEnvironment parameter validation', async () => {
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   try {
-    // 1. /v1/execute with docker
     const executeRes = await app.inject({
       method: 'POST',
       url: '/v1/execute',
@@ -3557,7 +3798,6 @@ test('executionEnvironment parameter validation', async () => {
     const hasSuccess = body.events.some((e: any) => e.type === 'tool_completed' && e.success === true && String(e.output?.stdout).includes('hello-sandbox'))
     assert.ok(hasDockerError || hasSuccess, 'Should either fail with a Docker error or succeed in a Docker sandbox container')
 
-    // 2. /v1/stream with remote
     const address = await app.listen({ port: 0 })
     const wsUrl = address.replace(/^http/, 'ws') + '/v1/stream'
 
@@ -3585,6 +3825,357 @@ test('executionEnvironment parameter validation', async () => {
   } finally {
     await app.close()
   }
+})
+
+test('remote execution uses configured RemoteToolRunner seam', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-runner-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    id: 'remote-metrics-test-runner',
+    handler: () => ({
+      kind: 'result',
+      success: true,
+      output: { remote: true },
+      metrics: {
+        runnerId: 'go-metrics-runner',
+        protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+        durationMs: 12,
+        truncated: true,
+        originalBytes: 34,
+      },
+      truncated: true,
+      originalBytes: 34,
+    }),
+  })
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+    remoteRunner,
+  })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, remoteRunner })
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read sample.txt', executionEnvironment: 'remote', cwd },
+    })
+    assert.equal(res.statusCode, 200)
+    const body = res.json()
+    assert.equal(body.success, true)
+    assert.equal(remoteRunner.requests.length, 1)
+    assert.equal(remoteRunner.requests[0].protocolVersion, REMOTE_RUNNER_PROTOCOL_VERSION)
+    assert.equal(remoteRunner.requests[0].toolName, 'Read')
+    assert.equal((remoteRunner.requests[0].toolInput as { path?: string }).path, 'sample.txt')
+    assert.equal(remoteRunner.requests[0].cwd, cwd)
+    const completed = body.events.find((e: any) => e.type === 'tool_completed')
+    assert.equal(completed.output?.remote, true)
+    assert.equal(completed.remoteRunner.runnerId, 'go-metrics-runner')
+    assert.equal(completed.remoteRunner.protocolVersion, REMOTE_RUNNER_PROTOCOL_VERSION)
+    assert.equal(completed.remoteRunner.durationMs, 12)
+    assert.equal(completed.remoteRunner.truncated, true)
+    assert.equal(completed.remoteRunner.originalBytes, 34)
+    assert.equal(completed.truncated, true)
+    assert.equal(completed.originalBytes, 34)
+
+    const metricsEvent = body.events.find((e: any) => e.type === 'execution_metrics')
+    assert.equal(metricsEvent.remoteToolCallCount, 1)
+    assert.equal(metricsEvent.remoteToolRunnerDurationMs, 12)
+    const trace = await storage.getToolTrace(completed.toolUseId)
+    assert.equal(trace?.remoteRunner?.runnerId, 'go-metrics-runner')
+    assert.equal(trace?.remoteRunner?.durationMs, 12)
+    const savedMetrics = await storage.getExecutionMetrics(body.sessionId)
+    assert.equal(savedMetrics?.remoteToolCallCount, 1)
+    assert.equal(savedMetrics?.remoteToolRunnerDurationMs, 12)
+    const metricsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/metrics' })
+    assert.equal(metricsResponse.json().remoteToolRunnerDurationMs.count, 1)
+    assert.equal(metricsResponse.json().remoteToolRunnerDurationMs.totalMs, 12)
+  } finally {
+    await app.close()
+  }
+})
+
+test('HTTP remote runner transport executes a tool through protocol server', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-http-remote-runner-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'remote.txt'), 'remote transport content')
+  const server = await createRemoteToolRunnerServer({
+    tools: createDefaultToolRegistry(),
+    capabilities: { tools: ['Read'] },
+  })
+  const address = await server.listen({ port: 0 })
+  const remoteRunner = new HttpRemoteToolRunner({
+    baseUrl: address,
+    capabilities: { tools: ['Read'] },
+  })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'], remoteRunner })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, remoteRunner })
+
+  try {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'read remote.txt', executionEnvironment: 'remote', cwd },
+    })
+    assert.equal(res.statusCode, 200)
+    const body = res.json()
+    assert.equal(body.success, true)
+    assert.ok(body.events.some((e: any) => e.type === 'tool_completed' && e.output === 'remote transport content'))
+  } finally {
+    await app.close()
+    await server.close()
+  }
+})
+
+test('HTTP remote runner transport forwards cancel to protocol server', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-http-remote-cancel-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const tools = createDefaultToolRegistry()
+  tools.set('RemoteHang', {
+    name: 'RemoteHang',
+    description: 'Test-only remote hanging tool.',
+    risk: 'read',
+    inputSchema: z.object({}),
+    async execute(_input, context) {
+      remoteHangStarted.value = true
+      return new Promise<never>((_resolve, reject) => {
+        context.signal?.addEventListener('abort', () => {
+          remoteHangAborted.value = true
+          reject(new Error('remote hang aborted'))
+        })
+      })
+    },
+  })
+  const remoteHangStarted = { value: false }
+  const remoteHangAborted = { value: false }
+  const server = await createRemoteToolRunnerServer({ tools, capabilities: { tools: ['RemoteHang'] } })
+  const address = await server.listen({ port: 0 })
+  const remoteRunner = new HttpRemoteToolRunner({ baseUrl: address, capabilities: { tools: ['RemoteHang'] } })
+  const events: NexusEvent[] = []
+  const controller = new AbortController()
+  const run = (async () => {
+    const stream = executeProviderToolCall({
+      toolCall: { id: 'tool_http_cancel', name: 'RemoteHang', input: {}, partialInput: '{}' },
+      tools,
+      toolPolicy: allowAllTools(),
+      runtimeOptions: {
+        sessionId: `http-remote-cancel-${Date.now()}`,
+        requestId: 'req-http-remote-cancel',
+        prompt: 'remote hang',
+        cwd,
+        executionEnvironment: 'remote',
+        remoteRunner,
+        signal: controller.signal,
+      },
+      storage: new MemoryStorage(),
+      metrics: createRuntimeExecutionMetrics(),
+      readFileCache: new Map(),
+    })
+    let next = await stream.next()
+    while (!next.done) {
+      events.push(next.value)
+      next = await stream.next()
+    }
+  })()
+
+  try {
+    await waitFor(() => remoteHangStarted.value)
+    controller.abort()
+    await run
+    await waitFor(() => remoteHangAborted.value)
+    const errorEvent = events.find((e): e is Extract<NexusEvent, { type: 'error' }> => e.type === 'error')
+    assert.equal(errorEvent?.code, 'REQUEST_CANCELLED')
+  } finally {
+    await server.close()
+  }
+})
+
+test('HTTP remote runner transport maps server errors through runner result', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-http-remote-error-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const tools = createDefaultToolRegistry()
+  const server = await createRemoteToolRunnerServer({ tools, capabilities: { tools: ['Read'] } })
+  const address = await server.listen({ port: 0 })
+  const remoteRunner = new HttpRemoteToolRunner({ baseUrl: address, capabilities: { tools: ['Read'] } })
+  const { runtime } = await createDefaultNexusRuntime({ allowedTools: ['*'], remoteRunner })
+  const events: NexusEvent[] = []
+
+  try {
+    for await (const event of runtime.executeStream({
+      sessionId: `http-remote-error-${Date.now()}`,
+      prompt: 'read missing.txt',
+      cwd,
+      executionEnvironment: 'remote',
+      remoteRunner,
+    })) {
+      events.push(event)
+    }
+    const completed = events.find((e): e is Extract<NexusEvent, { type: 'tool_completed' }> => e.type === 'tool_completed')
+    assert.equal(completed?.success, false)
+    assert.match(String(completed?.output), /could not find/)
+  } finally {
+    await server.close()
+  }
+})
+
+test('remote execution without runner does not fall back to local tool execution', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-no-runner-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'sample.txt'), 'local content must not leak')
+  const { runtime } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const events: NexusEvent[] = []
+
+  for await (const event of runtime.executeStream({
+    sessionId: `remote-no-runner-${Date.now()}`,
+    prompt: 'read sample.txt',
+    cwd,
+    executionEnvironment: 'remote',
+  })) {
+    events.push(event)
+  }
+
+  const errorEvent = events.find((e): e is Extract<NexusEvent, { type: 'error' }> => e.type === 'error')
+  assert.equal(errorEvent?.code, 'REMOTE_RUNNER_NOT_CONFIGURED')
+  assert.match(errorEvent?.message ?? '', /requires a configured remote runner/)
+  assert.ok(!events.some((e: any) => e.type === 'tool_completed' && String(e.output).includes('local content must not leak')))
+})
+
+test('in-memory remote runner cancels active tool execution on abort', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-cancel-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  let handlerSignal: AbortSignal | undefined
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    handler: (_request, context) => new Promise<never>((_resolve, reject) => {
+      handlerSignal = context.signal
+      context.signal.addEventListener('abort', () => reject(new Error('remote aborted')))
+    }),
+  })
+  const { runtime } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+    remoteRunner,
+  })
+  const controller = new AbortController()
+  const events: NexusEvent[] = []
+  const run = (async () => {
+    for await (const event of runtime.executeStream({
+      sessionId: `remote-cancel-${Date.now()}`,
+      requestId: 'req-remote-cancel',
+      prompt: 'read sample.txt',
+      cwd,
+      executionEnvironment: 'remote',
+      remoteRunner,
+      signal: controller.signal,
+    })) {
+      events.push(event)
+    }
+  })()
+
+  await waitFor(() => remoteRunner.requests.length === 1)
+  controller.abort()
+  await run
+
+  assert.equal(remoteRunner.cancelRequests.length, 1)
+  assert.equal(remoteRunner.cancelRequests[0].requestId, 'req-remote-cancel')
+  assert.equal(remoteRunner.cancelRequests[0].toolUseId, remoteRunner.requests[0].toolUseId)
+  assert.equal(handlerSignal?.aborted, true)
+  const errorEvent = events.find((e): e is Extract<NexusEvent, { type: 'error' }> => e.type === 'error')
+  assert.equal(errorEvent?.code, 'REQUEST_CANCELLED')
+})
+
+test('in-memory remote runner cancels active tool execution on timeout signal', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-timeout-signal-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  let handlerSignal: AbortSignal | undefined
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    handler: (_request, context) => new Promise<never>((_resolve, reject) => {
+      handlerSignal = context.signal
+      context.signal.addEventListener('abort', () => reject(new Error('remote aborted')))
+    }),
+  })
+  const { runtime } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+    remoteRunner,
+  })
+  const timeoutController = new AbortController()
+  const events: NexusEvent[] = []
+  const run = (async () => {
+    for await (const event of runtime.executeStream({
+      sessionId: `remote-timeout-signal-${Date.now()}`,
+      requestId: 'req-remote-timeout-signal',
+      prompt: 'read sample.txt',
+      cwd,
+      executionEnvironment: 'remote',
+      remoteRunner,
+      timeoutSignal: timeoutController.signal,
+    })) {
+      events.push(event)
+    }
+  })()
+
+  await waitFor(() => remoteRunner.requests.length === 1)
+  timeoutController.abort()
+  await run
+
+  assert.equal(remoteRunner.cancelRequests.length, 1)
+  assert.equal(handlerSignal?.aborted, true)
+  const errorEvent = events.find((e): e is Extract<NexusEvent, { type: 'error' }> => e.type === 'error')
+  assert.equal(errorEvent?.code, 'REQUEST_TIMEOUT')
+})
+
+test('remote runner errors and output truncation use existing runtime mapping', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-mapping-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const errorRunner = new InMemoryRemoteToolRunner({
+    handler: () => ({
+      kind: 'error',
+      code: 'REMOTE_FIXTURE_ERROR',
+      message: 'fixture failed',
+    }),
+  })
+  const { runtime: errorRuntime } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+    remoteRunner: errorRunner,
+  })
+  const errorEvents: NexusEvent[] = []
+  for await (const event of errorRuntime.executeStream({
+    sessionId: `remote-error-${Date.now()}`,
+    prompt: 'read sample.txt',
+    cwd,
+    executionEnvironment: 'remote',
+    remoteRunner: errorRunner,
+  })) {
+    errorEvents.push(event)
+  }
+  const errorEvent = errorEvents.find((e): e is Extract<NexusEvent, { type: 'error' }> => e.type === 'error')
+  assert.equal(errorEvent?.code, 'REMOTE_FIXTURE_ERROR')
+  assert.equal(errorEvent?.message, 'fixture failed')
+
+  const truncationRunner = new InMemoryRemoteToolRunner({
+    handler: () => ({
+      kind: 'result',
+      success: true,
+      output: 'remote-output-is-long',
+    }),
+  })
+  const { runtime: truncationRuntime } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+    remoteRunner: truncationRunner,
+  })
+  const truncationEvents: NexusEvent[] = []
+  for await (const event of truncationRuntime.executeStream({
+    sessionId: `remote-truncation-${Date.now()}`,
+    prompt: 'read sample.txt',
+    cwd,
+    executionEnvironment: 'remote',
+    remoteRunner: truncationRunner,
+    maxToolOutputBytes: 8,
+  })) {
+    truncationEvents.push(event)
+  }
+  const completed = truncationEvents.find((e): e is Extract<NexusEvent, { type: 'tool_completed' }> => e.type === 'tool_completed')
+  assert.equal(completed?.success, true)
+  assert.equal(completed?.truncated, true)
+  assert.equal(completed?.originalBytes, 21)
+  assert.notEqual(completed?.output, 'remote-output-is-long')
 })
 
 test('appendEvent persists embedded execution metrics side table', async () => {

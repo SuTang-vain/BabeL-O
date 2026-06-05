@@ -1,5 +1,6 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
+import type { AgentJob, AgentJobFilter, AgentSpawnRequest, AgentWaitOptions } from '../nexus/agents/types.js'
 
 export type NexusClientOptions = {
   baseUrl?: string
@@ -52,6 +53,55 @@ export class NexusClient {
     return this.getJson('/v1/tools/audit')
   }
 
+  async spawnAgent(body: AgentSpawnRequest): Promise<{ type: 'agent_job_spawned'; job: AgentJob }> {
+    return this.postJson('/v1/agents', body) as Promise<{ type: 'agent_job_spawned'; job: AgentJob }>
+  }
+
+  async listAgents(filter: AgentJobFilter = {}): Promise<{ type: 'agent_jobs'; jobs: AgentJob[] }> {
+    const params = new URLSearchParams()
+    if (filter.parentSessionId) params.set('parentSessionId', filter.parentSessionId)
+    if (filter.status) params.set('status', filter.status)
+    if (filter.agentType) params.set('agentType', filter.agentType)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/agents${query}`) as Promise<{ type: 'agent_jobs'; jobs: AgentJob[] }>
+  }
+
+  async listSessionAgents(sessionId: string, filter: Omit<AgentJobFilter, 'parentSessionId'> = {}): Promise<{ type: 'agent_jobs'; parentSessionId: string; jobs: AgentJob[] }> {
+    const params = new URLSearchParams()
+    if (filter.status) params.set('status', filter.status)
+    if (filter.agentType) params.set('agentType', filter.agentType)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/agents${query}`) as Promise<{
+      type: 'agent_jobs'
+      parentSessionId: string
+      jobs: AgentJob[]
+    }>
+  }
+
+  async getAgent(jobId: string): Promise<{ type: 'agent_job'; job: AgentJob }> {
+    return this.getJson(`/v1/agents/${encodeURIComponent(jobId)}`) as Promise<{ type: 'agent_job'; job: AgentJob }>
+  }
+
+  async waitAgent(jobId: string, options: AgentWaitOptions = {}): Promise<{ type: 'agent_job'; job: AgentJob }> {
+    return this.postJson(`/v1/agents/${encodeURIComponent(jobId)}/wait`, options) as Promise<{ type: 'agent_job'; job: AgentJob }>
+  }
+
+  async cancelAgent(jobId: string, reason?: string): Promise<{ type: 'agent_job_cancelled'; job: AgentJob }> {
+    return this.postJson(`/v1/agents/${encodeURIComponent(jobId)}/cancel`, { reason }) as Promise<{
+      type: 'agent_job_cancelled'
+      job: AgentJob
+    }>
+  }
+
+  async getAgentTranscript(jobId: string, options: { limit?: number; cursor?: string; order?: 'asc' | 'desc' } = {}): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.order) params.set('order', options.order)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/agents/${encodeURIComponent(jobId)}/transcript${query}`)
+  }
+
   async providerFallbackPlan(options: {
     model?: string
     role?: string
@@ -76,8 +126,11 @@ export class NexusClient {
     }>
   }
 
-  async listSessions(): Promise<unknown> {
-    return this.getJson('/v1/sessions')
+  async listSessions(options: { limit?: number } = {}): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions${query}`)
   }
 
   async listTasks(sessionId: string): Promise<{ type: 'tasks_list'; tasks: NexusTask[] }> {

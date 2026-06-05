@@ -8,6 +8,7 @@ import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { allowlistedTools, type ToolPolicy } from '../runtime/LocalCodingRuntime.js'
+import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 
 type NexusRuntimeLike = Awaited<ReturnType<typeof createDefaultNexusRuntime>>['runtime']
 type RuntimeErrorEvent = Extract<NexusEvent, { type: 'error' }>
@@ -25,6 +26,9 @@ export type RuntimeAgentStepOptions = {
   maxRepairAttempts?: number
   allowedToolsOverride?: string[]
   signal?: AbortSignal
+  executionEnvironment?: 'local' | 'docker' | 'remote'
+  remoteRunner?: RemoteToolRunner
+  allowedPaths?: string[]
   runtimeFactory?: () => Promise<NexusRuntimeLike>
   onUsageSummary?: (usage: RuntimeAgentStepUsageSummary) => void
 }
@@ -126,6 +130,8 @@ export function createRuntimeAgentStepRunner(
     let lastToolOutputPreview: string | undefined
 
     const sessionId = (input as { sessionId: string }).sessionId
+    const stepCwd = (input as { cwd?: string }).cwd ?? options.cwd ?? process.cwd()
+    const stepAllowedPaths = (input as { allowedPaths?: string[] }).allowedPaths ?? options.allowedPaths
 
     const configManager = ConfigManager.getInstance()
     const settings = configManager.resolveSettings({
@@ -160,7 +166,7 @@ export function createRuntimeAgentStepRunner(
       for await (const event of runtimeForRole.executeStream({
         sessionId,
         prompt,
-        cwd: (input as { cwd?: string }).cwd ?? options.cwd ?? process.cwd(),
+        cwd: stepCwd,
         role: roleDefinition.role,
         model: targetModelId,
         signal: options.signal,
@@ -168,6 +174,9 @@ export function createRuntimeAgentStepRunner(
         replaySessionHistory: false,
         maxOutputTokens: ROLE_STEP_MAX_OUTPUT_TOKENS,
         skipPermissionCheck: !roleDefinition.toolPolicy.requiresApproval,
+        executionEnvironment: options.executionEnvironment,
+        remoteRunner: options.remoteRunner,
+        allowedPaths: stepAllowedPaths,
       })) {
         const nexusEvent = event as NexusEvent
         eventCount += 1
@@ -289,7 +298,11 @@ export function createRuntimeAgentStepRunner(
         runtimeForRole,
         sessionId,
         targetModelId,
+        cwd: stepCwd,
         signal: options.signal,
+        executionEnvironment: options.executionEnvironment,
+        remoteRunner: options.remoteRunner,
+        allowedPaths: stepAllowedPaths,
         maxRepairAttempts: options.maxRepairAttempts ?? 1,
       })
       options.onUsageSummary?.({
@@ -321,7 +334,11 @@ async function tryParseWithRepair(context: {
   runtimeForRole: NexusRuntimeLike
   sessionId: string
   targetModelId: string
+  cwd: string
   signal?: AbortSignal
+  executionEnvironment?: 'local' | 'docker' | 'remote'
+  remoteRunner?: RemoteToolRunner
+  allowedPaths?: string[]
   maxRepairAttempts: number
 }): Promise<{ output: unknown; repairAttempts: number }> {
   let attempt = 0
@@ -358,9 +375,12 @@ async function tryParseWithRepair(context: {
         context.sessionId,
         currentPrompt,
         context.targetModelId,
-        (context.input as { cwd?: string }).cwd ?? process.cwd(),
+        context.cwd,
         !context.roleDefinition.toolPolicy.requiresApproval,
         context.signal,
+        context.executionEnvironment,
+        context.remoteRunner,
+        context.allowedPaths,
         (event) => {
           recordTaskSessionNexusEvent(context.sessionId, event)
           if (event.type === 'assistant_delta') currentTextParts.push(event.text)
@@ -550,6 +570,9 @@ async function executeRuntimeTurn(
   cwd: string,
   skipPermissionCheck: boolean,
   signal: AbortSignal | undefined,
+  executionEnvironment: 'local' | 'docker' | 'remote' | undefined,
+  remoteRunner: RemoteToolRunner | undefined,
+  allowedPaths: string[] | undefined,
   onEvent: (event: NexusEvent) => void,
 ): Promise<{
   errorEvent: RuntimeErrorEvent | null
@@ -580,6 +603,9 @@ async function executeRuntimeTurn(
     replaySessionHistory: false,
     maxOutputTokens: ROLE_STEP_MAX_OUTPUT_TOKENS,
     skipPermissionCheck,
+    executionEnvironment,
+    remoteRunner,
+    allowedPaths,
   })) {
     const nexusEvent = event as NexusEvent
     eventCount++

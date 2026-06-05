@@ -196,6 +196,9 @@ describe('ConfigManager', () => {
       assert.equal(diagnosticsFromConfig.authSource, 'provider_config')
       assert.equal(diagnosticsFromConfig.capabilities.toolCalling, true)
       assert.equal(diagnosticsFromConfig.capabilities.structuredOutput, true)
+      assert.equal(diagnosticsFromConfig.modelDeclared, true)
+      assert.equal(diagnosticsFromConfig.capabilitySource, 'registry')
+      assert.equal(diagnosticsFromConfig.suitability.agentLoopRoles.executor.suitable, true)
 
       // 2. Env variable fallback for API key
       process.env.OPENAI_API_KEY = 'env-openai-key'
@@ -378,6 +381,48 @@ describe('ConfigManager', () => {
       if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel
       else delete process.env.BABEL_O_MODEL
     }
+  })
+
+  test('provider diagnostics expose undeclared custom model capabilities without blocking config', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      defaultModel: 'openai/custom-gpt',
+      providers: {
+        openai: { apiKey: 'custom-openai-key' },
+      },
+    })
+
+    const diagnostics = configManager.getProviderDiagnostics()
+
+    assert.equal(diagnostics.providerId, 'openai')
+    assert.equal(diagnostics.modelId, 'openai/custom-gpt')
+    assert.equal(diagnostics.modelDeclared, false)
+    assert.equal(diagnostics.capabilitySource, 'undeclared')
+    assert.match(diagnostics.capabilityWarning ?? '', /not declared in the registry/)
+    assert.equal(diagnostics.contextWindow, 8192)
+    assert.equal(diagnostics.defaultMaxTokens, 4096)
+    assert.equal(diagnostics.capabilities.toolCalling, false)
+    assert.equal(diagnostics.capabilities.structuredOutput, false)
+    assert.equal(diagnostics.suitability.agentLoopRoles.executor.suitable, false)
+  })
+
+  test('provider diagnostics use explicit provider for slashless custom model capabilities', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+
+    configManager.save({
+      providers: {
+        openai: { apiKey: 'custom-openai-key' },
+      },
+    })
+
+    const diagnostics = configManager.getProviderDiagnostics({ model: 'custom-gpt', provider: 'openai' })
+
+    assert.equal(diagnostics.providerId, 'openai')
+    assert.equal(diagnostics.modelId, 'custom-gpt')
+    assert.equal(diagnostics.modelDeclared, false)
+    assert.equal(diagnostics.capabilitySource, 'undeclared')
+    assert.equal(diagnostics.authConfigured, true)
   })
 
   test('provider diagnostics expose role recommendation without switching models', () => {
@@ -737,6 +782,47 @@ describe('LLMCodingRuntime', () => {
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }
+  })
+
+  test('emits invocation hook events around provider calls', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Invocation hooks ran."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-invocation-hooks',
+        prompt: 'answer with one sentence',
+        cwd: tmpdir(),
+        role: 'executor',
+      })
+    )
+
+    const invocationHooks = events.filter(event =>
+      event.type === 'hook_completed' &&
+      event.hookName === 'InvocationDiagnosticsHook'
+    ) as any[]
+    assert.deepEqual(invocationHooks.map(event => event.hookEvent), ['PreInvocation', 'PostInvocation'])
+    assert.equal(invocationHooks[0].output.metadata.providerId, 'anthropic')
+    assert.equal(invocationHooks[0].output.metadata.modelId, 'anthropic/claude-3-5-sonnet')
+    assert.equal(invocationHooks[0].output.metadata.loopCount, 1)
+    assert.equal(invocationHooks[0].output.metadata.role, 'executor')
+    assert.equal(invocationHooks[0].output.metadata.visibleToolCount, toolsRegistry.size)
+    assert.equal(invocationHooks[1].output.metadata.success, true)
+    assert.equal(typeof invocationHooks[1].output.metadata.durationMs, 'number')
+
+    const preIndex = events.findIndex(event => event.type === 'hook_completed' && event.hookEvent === 'PreInvocation')
+    const deltaIndex = events.findIndex(event => event.type === 'assistant_delta')
+    const postIndex = events.findIndex(event => event.type === 'hook_completed' && event.hookEvent === 'PostInvocation')
+    assert.ok(preIndex >= 0 && deltaIndex > preIndex && postIndex > deltaIndex)
   })
 
   test('passes maxOutputTokens to provider requests', async () => {

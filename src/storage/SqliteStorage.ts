@@ -254,6 +254,7 @@ export class SqliteStorage implements NexusStorage {
           success: event.success,
           completedAt,
           durationMs,
+          remoteRunner: event.remoteRunner,
         }
         await this.saveToolTrace(updated)
       }
@@ -323,10 +324,10 @@ export class SqliteStorage implements NexusStorage {
       .prepare(
         `INSERT INTO tool_traces (
           tool_use_id, session_id, name, input, output, success,
-          started_at, completed_at, duration_ms
+          started_at, completed_at, duration_ms, remote_runner
         ) VALUES (
           :toolUseId, :sessionId, :name, :input, :output, :success,
-          :startedAt, :completedAt, :durationMs
+          :startedAt, :completedAt, :durationMs, :remoteRunner
         )
         ON CONFLICT(tool_use_id) DO UPDATE SET
           session_id = excluded.session_id,
@@ -336,7 +337,8 @@ export class SqliteStorage implements NexusStorage {
           success = excluded.success,
           started_at = excluded.started_at,
           completed_at = excluded.completed_at,
-          duration_ms = excluded.duration_ms`,
+          duration_ms = excluded.duration_ms,
+          remote_runner = excluded.remote_runner`,
       )
       .run(toolTraceParams(trace))
   }
@@ -537,7 +539,8 @@ export class SqliteStorage implements NexusStorage {
           success INTEGER,
           started_at TEXT NOT NULL,
           completed_at TEXT,
-          duration_ms INTEGER
+          duration_ms INTEGER,
+          remote_runner TEXT
         );
 
         CREATE INDEX IF NOT EXISTS tool_traces_session_started_at_idx
@@ -665,6 +668,37 @@ export class SqliteStorage implements NexusStorage {
       addColumn('long_context_utilization_mode', 'INTEGER')
       addColumn('compact_summary_latency_ms', 'REAL')
       this.db.exec('PRAGMA user_version = 6;')
+      version = 6
+    }
+
+    if (version < 7) {
+      const executionMetricsColumns = (this.db.prepare(`PRAGMA table_info(execution_metrics)`).all() as Row[]).map(r => String(r.name))
+      const addColumn = (name: string, definition: string) => {
+        if (!executionMetricsColumns.includes(name)) {
+          this.db.exec(`ALTER TABLE execution_metrics ADD COLUMN ${name} ${definition}`)
+        }
+      }
+      addColumn('prefix_cache_immutable_ratio', 'REAL')
+      addColumn('prefix_cache_volatile_content_last', 'INTEGER')
+      addColumn('prefix_cache_fingerprint', 'TEXT')
+      this.db.exec('PRAGMA user_version = 7;')
+      version = 7
+    }
+
+    if (version < 8) {
+      const toolTraceColumns = (this.db.prepare(`PRAGMA table_info(tool_traces)`).all() as Row[]).map(r => String(r.name))
+      if (!toolTraceColumns.includes('remote_runner')) {
+        this.db.exec(`ALTER TABLE tool_traces ADD COLUMN remote_runner TEXT`)
+      }
+      const executionMetricsColumns = (this.db.prepare(`PRAGMA table_info(execution_metrics)`).all() as Row[]).map(r => String(r.name))
+      const addColumn = (name: string, definition: string) => {
+        if (!executionMetricsColumns.includes(name)) {
+          this.db.exec(`ALTER TABLE execution_metrics ADD COLUMN ${name} ${definition}`)
+        }
+      }
+      addColumn('remote_tool_call_count', 'INTEGER')
+      addColumn('remote_tool_runner_duration_ms', 'REAL')
+      this.db.exec('PRAGMA user_version = 8;')
     }
   }
 
@@ -693,7 +727,10 @@ export class SqliteStorage implements NexusStorage {
           input_tokens, output_tokens, cache_creation_input_tokens,
           cache_read_input_tokens, effective_context_ceiling,
           legacy_context_ceiling, cache_read_ratio, cache_preservation_mode,
-          long_context_utilization_mode, compact_summary_latency_ms, timestamp
+          long_context_utilization_mode, prefix_cache_immutable_ratio,
+          prefix_cache_volatile_content_last, prefix_cache_fingerprint,
+          compact_summary_latency_ms, remote_tool_call_count,
+          remote_tool_runner_duration_ms, timestamp
         ) VALUES (
           :metricId, :sessionId, :executeDurationMs, :providerFirstTokenMs,
           :providerRequestDurationMs, :streamDeltaCount, :toolCallCount,
@@ -701,7 +738,10 @@ export class SqliteStorage implements NexusStorage {
           :inputTokens, :outputTokens, :cacheCreationInputTokens,
           :cacheReadInputTokens, :effectiveContextCeiling,
           :legacyContextCeiling, :cacheReadRatio, :cachePreservationMode,
-          :longContextUtilizationMode, :compactSummaryLatencyMs, :timestamp
+          :longContextUtilizationMode, :prefixCacheImmutableRatio,
+          :prefixCacheVolatileContentLast, :prefixCacheFingerprint,
+          :compactSummaryLatencyMs, :remoteToolCallCount,
+          :remoteToolRunnerDurationMs, :timestamp
         )
         ON CONFLICT(metric_id) DO UPDATE SET
           execute_duration_ms = excluded.execute_duration_ms,
@@ -721,7 +761,12 @@ export class SqliteStorage implements NexusStorage {
           cache_read_ratio = excluded.cache_read_ratio,
           cache_preservation_mode = excluded.cache_preservation_mode,
           long_context_utilization_mode = excluded.long_context_utilization_mode,
+          prefix_cache_immutable_ratio = excluded.prefix_cache_immutable_ratio,
+          prefix_cache_volatile_content_last = excluded.prefix_cache_volatile_content_last,
+          prefix_cache_fingerprint = excluded.prefix_cache_fingerprint,
           compact_summary_latency_ms = excluded.compact_summary_latency_ms,
+          remote_tool_call_count = excluded.remote_tool_call_count,
+          remote_tool_runner_duration_ms = excluded.remote_tool_runner_duration_ms,
           timestamp = excluded.timestamp`
       )
       .run({
@@ -744,7 +789,12 @@ export class SqliteStorage implements NexusStorage {
         cacheReadRatio: metrics.cacheReadRatio ?? null,
         cachePreservationMode: booleanToDb(metrics.cachePreservationMode),
         longContextUtilizationMode: booleanToDb(metrics.longContextUtilizationMode),
+        prefixCacheImmutableRatio: metrics.prefixCacheImmutableRatio ?? null,
+        prefixCacheVolatileContentLast: booleanToDb(metrics.prefixCacheVolatileContentLast),
+        prefixCacheFingerprint: metrics.prefixCacheFingerprint ?? null,
         compactSummaryLatencyMs: metrics.compactSummaryLatencyMs ?? null,
+        remoteToolCallCount: metrics.remoteToolCallCount ?? null,
+        remoteToolRunnerDurationMs: metrics.remoteToolRunnerDurationMs ?? null,
         timestamp: metrics.timestamp,
       })
   }
@@ -774,7 +824,12 @@ export class SqliteStorage implements NexusStorage {
       cacheReadRatio: row.cache_read_ratio !== null && row.cache_read_ratio !== undefined ? Number(row.cache_read_ratio) : undefined,
       cachePreservationMode: dbToBoolean(row.cache_preservation_mode),
       longContextUtilizationMode: dbToBoolean(row.long_context_utilization_mode),
+      prefixCacheImmutableRatio: row.prefix_cache_immutable_ratio !== null && row.prefix_cache_immutable_ratio !== undefined ? Number(row.prefix_cache_immutable_ratio) : undefined,
+      prefixCacheVolatileContentLast: dbToBoolean(row.prefix_cache_volatile_content_last),
+      prefixCacheFingerprint: row.prefix_cache_fingerprint !== null && row.prefix_cache_fingerprint !== undefined ? String(row.prefix_cache_fingerprint) : undefined,
       compactSummaryLatencyMs: row.compact_summary_latency_ms !== null && row.compact_summary_latency_ms !== undefined ? Number(row.compact_summary_latency_ms) : undefined,
+      remoteToolCallCount: row.remote_tool_call_count !== null && row.remote_tool_call_count !== undefined ? Number(row.remote_tool_call_count) : undefined,
+      remoteToolRunnerDurationMs: row.remote_tool_runner_duration_ms !== null && row.remote_tool_runner_duration_ms !== undefined ? Number(row.remote_tool_runner_duration_ms) : undefined,
       timestamp: String(row.timestamp),
     }
   }
@@ -900,6 +955,7 @@ function toolTraceParams(trace: ToolTrace): Record<string, string | number | nul
     startedAt: trace.startedAt,
     completedAt: trace.completedAt ?? null,
     durationMs: trace.durationMs ?? null,
+    remoteRunner: trace.remoteRunner ? JSON.stringify(trace.remoteRunner) : null,
   }
 }
 
@@ -924,5 +980,6 @@ function rowToToolTrace(row: Row): ToolTrace {
     startedAt: String(row.started_at),
     completedAt: nullableString(row.completed_at),
     durationMs: row.duration_ms !== null && row.duration_ms !== undefined ? Number(row.duration_ms) : undefined,
+    remoteRunner: row.remote_runner ? JSON.parse(String(row.remote_runner)) : undefined,
   }
 }

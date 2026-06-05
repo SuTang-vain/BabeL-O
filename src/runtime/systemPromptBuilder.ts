@@ -17,6 +17,7 @@ export type SystemPromptOptions = {
   gitStatus?: string
   agentMdContent?: string
   userIntentGuidance?: string
+  workingSet?: string
   language?: string
   prompt?: string
 }
@@ -47,6 +48,10 @@ export function buildSystemPromptSections(options: SystemPromptOptions): SystemP
     if (focusBlock) {
       sections.push({ id: 'focus', cacheable: false, content: focusBlock })
     }
+  }
+
+  if (options.workingSet) {
+    sections.push({ id: 'working_set', cacheable: false, content: options.workingSet })
   }
 
   if (options.gitStatus) {

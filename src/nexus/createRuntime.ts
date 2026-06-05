@@ -10,18 +10,24 @@ import { SqliteStorage } from '../storage/SqliteStorage.js'
 import { createDefaultToolRegistry } from '../tools/registry.js'
 import { ConfigManager } from '../shared/config.js'
 import { createMcpToolRegistry } from '../mcp/McpToolAdapter.js'
+import { ExploreAgentScheduler } from './agents/AgentScheduler.js'
+import { createAgentToolRegistry } from './agents/AgentTools.js'
 import {
   configureStorageBridgeWal,
   flushStorageBridge,
   type StorageBridgeWalOptions,
 } from './storageBridge.js'
+import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 
 export type CreateDefaultNexusRuntimeOptions = {
   storagePath?: string
   allowedTools?: string[]
   cwd?: string
   enableMcp?: boolean
+  enableAgentTools?: boolean
   storageWal?: StorageBridgeWalOptions
+  remoteRunner?: RemoteToolRunner
+  agentExecutionEnvironment?: 'local' | 'remote'
 }
 
 export async function createDefaultNexusRuntime(
@@ -37,6 +43,17 @@ export async function createDefaultNexusRuntime(
   const storage = options.storagePath
     ? new SqliteStorage(options.storagePath)
     : new MemoryStorage()
+  const agentScheduler = new ExploreAgentScheduler({
+    storage,
+    cwd: options.cwd,
+    executionEnvironment: options.agentExecutionEnvironment,
+    remoteRunner: options.remoteRunner,
+  })
+  if (options.enableAgentTools) {
+    for (const [name, tool] of createAgentToolRegistry(agentScheduler)) {
+      tools.set(name, tool)
+    }
+  }
   if (options.storagePath) {
     configureStorageBridgeWal(`${options.storagePath}.wal.jsonl`, options.storageWal)
   } else {
@@ -71,5 +88,5 @@ export async function createDefaultNexusRuntime(
       ? new LocalCodingRuntime(tools, policy, storage, configManager.load().hooks)
       : new LLMCodingRuntime(tools, policy, storage, configManager)
 
-  return { runtime, storage, tools }
+  return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner }
 }

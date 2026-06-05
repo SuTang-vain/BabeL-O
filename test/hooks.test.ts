@@ -118,6 +118,38 @@ describe('runtime hooks', () => {
     assert.ok(result.events.some(event => event.type === 'hook_completed'))
   })
 
+  test('emits invocation diagnostics hook metadata', async () => {
+    const result = await executeRuntimeHooks(
+      'PreInvocation',
+      {
+        invocation: {
+          providerId: 'anthropic',
+          modelId: 'anthropic/claude-3-5-sonnet',
+          loopCount: 1,
+          maxLoops: 25,
+          role: 'executor',
+          contextTokenEstimate: 1200,
+          contextMaxTokens: 200000,
+          percentUsed: 1,
+          toolCount: 3,
+          visibleToolCount: 3,
+          cachePreservationMode: true,
+          finalResponseOnlyMode: false,
+        },
+      },
+      {
+        sessionId: 'session-invocation',
+        cwd: '/tmp',
+        role: 'executor',
+      },
+    )
+
+    assert.ok(result.events.some(event => event.type === 'hook_started' && event.hookEvent === 'PreInvocation'))
+    assert.ok(result.events.some(event => event.type === 'hook_completed' && event.hookEvent === 'PreInvocation'))
+    assert.equal(result.results[0]?.hookName, 'InvocationDiagnosticsHook')
+    assert.equal(aggregateHookResults(result).metadata[0]?.result.metadata?.modelId, 'anthropic/claude-3-5-sonnet')
+  })
+
   test('validates safe built-in hook configuration schema', () => {
     const parsed = BabelOConfigSchema.parse({
       hooks: {

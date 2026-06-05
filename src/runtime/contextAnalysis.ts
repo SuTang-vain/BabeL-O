@@ -26,6 +26,7 @@ import {
 import { buildSessionMemoryLiteStatus, type SessionMemoryLiteStatus } from './sessionMemoryLite.js'
 import { buildRuntimeDiagnostics, statusFromSignals, type RuntimeDiagnosticsEnvelope } from './runtimeDiagnostics.js'
 import { extractAbsolutePaths } from './systemPromptBuilder.js'
+import type { ContextSelectionDiagnostics } from './contextManager.js'
 
 export type ContextDiagnosticSignal = {
   type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary'
@@ -120,6 +121,7 @@ export type ContextAnalysisDiagnostics = {
     count: number
     latestTimestamp: string
   }>
+  selection: ContextSelectionDiagnostics
   signals: ContextDiagnosticSignal[]
 }
 
@@ -132,6 +134,8 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   remainingTokens: number
   compactHasBoundary: boolean
   toolsVisible: boolean
+  retainedContextItems: number
+  droppedContextItems: number
 }>
 
 export type ContextAnalysis = {
@@ -330,6 +334,8 @@ function buildContextDiagnosticEnvelope(options: {
       remainingTokens: options.diagnostics.remainingTokens,
       compactHasBoundary: options.compact.hasBoundary,
       toolsVisible: options.runtimePolicy.toolsVisible,
+      retainedContextItems: options.diagnostics.selection.retained.length,
+      droppedContextItems: options.diagnostics.selection.dropped.length,
     },
   })
 }
@@ -417,6 +423,7 @@ function buildContextDiagnostics(options: {
     compactTokenDelta: buildCompactTokenDelta(options.events, options.compact, options.window),
     largeToolResults: findLargeToolResults(options.events, options.assembled.budget.snipToolOutputChars),
     repeatedToolInputs: findRepeatedToolInputs(options.events),
+    selection: options.assembled.selectionDiagnostics,
     signals: [],
   }
 

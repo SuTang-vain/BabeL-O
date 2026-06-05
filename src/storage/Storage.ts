@@ -71,7 +71,12 @@ export type ExecutionMetrics = {
   cacheReadRatio?: number
   cachePreservationMode?: boolean
   longContextUtilizationMode?: boolean
+  prefixCacheImmutableRatio?: number
+  prefixCacheVolatileContentLast?: boolean
+  prefixCacheFingerprint?: string
   compactSummaryLatencyMs?: number
+  remoteToolCallCount?: number
+  remoteToolRunnerDurationMs?: number
   timestamp: string
 }
 

@@ -8,6 +8,7 @@ import { registerChatCommand } from './commands/chat.js'
 import { registerNexusCommand } from './commands/nexus.js'
 import { registerToolsCommand } from './commands/tools.js'
 import { registerSessionsCommand } from './commands/sessions.js'
+import { registerAgentsCommand } from './commands/agents.js'
 import { registerConfigCommand } from './commands/config.js'
 import { registerModelsCommand } from './commands/models.js'
 import { registerOptimizeCommand } from './commands/optimize.js'
@@ -27,6 +28,7 @@ registerChatCommand(program)
 registerNexusCommand(program)
 registerToolsCommand(program)
 registerSessionsCommand(program)
+registerAgentsCommand(program)
 registerConfigCommand(program)
 registerModelsCommand(program)
 registerOptimizeCommand(program)

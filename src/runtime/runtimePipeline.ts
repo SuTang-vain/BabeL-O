@@ -1,5 +1,6 @@
 import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import type {
   ContentBlock,
   FinishReason,
@@ -19,6 +20,7 @@ import {
   type CacheAwareCompactPolicy,
   type CacheAwareCompactUsage,
 } from './cacheAwareCompactPolicy.js'
+import { computePrefixCacheDiagnostics, type PrefixCacheDiagnostics } from './prefixCache.js'
 import { normalizeMessages } from './messageNormalizer.js'
 import type { UserIntentGuidance } from './intentGuidance.js'
 import { buildProviderFallbackPolicy } from './providerRecovery.js'
@@ -49,7 +51,12 @@ export type RuntimeExecutionMetrics = {
   cacheReadRatio?: number
   cachePreservationMode?: boolean
   longContextUtilizationMode?: boolean
+  prefixCacheImmutableRatio?: number
+  prefixCacheVolatileContentLast?: boolean
+  prefixCacheFingerprint?: string
   compactSummaryLatencyMs?: number
+  remoteToolCallCount: number
+  remoteToolRunnerDurationMs: number
 }
 
 export type RuntimeProviderToolCall = {
@@ -517,6 +524,8 @@ export function createRuntimeExecutionMetrics(): RuntimeExecutionMetrics {
     outputTokens: 0,
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 0,
+    remoteToolCallCount: 0,
+    remoteToolRunnerDurationMs: 0,
   }
 }
 
@@ -548,7 +557,12 @@ export function buildRuntimeExecutionMetricsEvent(
     cacheReadRatio: includeProvider ? metrics.cacheReadRatio : undefined,
     cachePreservationMode: includeContext ? metrics.cachePreservationMode : undefined,
     longContextUtilizationMode: includeContext ? metrics.longContextUtilizationMode : undefined,
+    prefixCacheImmutableRatio: includeContext ? metrics.prefixCacheImmutableRatio : undefined,
+    prefixCacheVolatileContentLast: includeContext ? metrics.prefixCacheVolatileContentLast : undefined,
+    prefixCacheFingerprint: includeContext ? metrics.prefixCacheFingerprint : undefined,
     compactSummaryLatencyMs: metrics.compactSummaryLatencyMs,
+    remoteToolCallCount: metrics.remoteToolCallCount > 0 ? metrics.remoteToolCallCount : undefined,
+    remoteToolRunnerDurationMs: metrics.remoteToolCallCount > 0 ? metrics.remoteToolRunnerDurationMs : undefined,
   }
 }
 
@@ -580,12 +594,32 @@ export function absorbCacheAwareCompactPolicyMetrics(
   metrics.longContextUtilizationMode = policy.longContextUtilizationMode
 }
 
+export function absorbPrefixCacheDiagnosticsMetrics(
+  metrics: RuntimeExecutionMetrics,
+  diagnostics: PrefixCacheDiagnostics,
+): void {
+  metrics.prefixCacheImmutableRatio = diagnostics.immutablePrefixRatio
+  metrics.prefixCacheVolatileContentLast = diagnostics.volatileContentLast
+  metrics.prefixCacheFingerprint = diagnostics.fingerprint
+}
+
 export function absorbCompactSummaryLatencyMetrics(
   metrics: RuntimeExecutionMetrics,
   latencyMs: number,
 ): void {
   if (!Number.isFinite(latencyMs) || latencyMs < 0) return
   metrics.compactSummaryLatencyMs = (metrics.compactSummaryLatencyMs ?? 0) + latencyMs
+}
+
+export function absorbRemoteToolRunnerMetrics(
+  metrics: RuntimeExecutionMetrics,
+  diagnostics: RemoteToolRunnerDiagnostics | undefined,
+): void {
+  if (!diagnostics) return
+  metrics.remoteToolCallCount += 1
+  if (diagnostics.durationMs !== undefined && Number.isFinite(diagnostics.durationMs) && diagnostics.durationMs >= 0) {
+    metrics.remoteToolRunnerDurationMs += diagnostics.durationMs
+  }
 }
 
 function computeMetricsCacheReadRatio(metrics: RuntimeExecutionMetrics): number {
@@ -674,13 +708,11 @@ export function buildProviderQueryParams(options: {
   providerId: string
   thinkingBudget?: number
 }): ModelQueryParams {
+  const systemPromptBlocks = buildProviderSystemPromptBlocks(options.systemPromptBlocks, options.executionStateBlock)
   return {
     model: options.modelId,
     systemPrompt: options.systemPrompt,
-    systemPromptBlocks: [
-      ...(options.systemPromptBlocks ?? []),
-      { text: options.executionStateBlock, cacheable: false },
-    ],
+    systemPromptBlocks,
     messages: normalizeMessages(options.messages),
     tools: options.tools,
     maxTokens: options.maxTokens,
@@ -690,6 +722,27 @@ export function buildProviderQueryParams(options: {
         thinking: { budgetTokens: options.thinkingBudget },
       }),
   }
+}
+
+export function buildProviderSystemPromptBlocks(
+  systemPromptBlocks: { text: string; cacheable: boolean }[] | undefined,
+  executionStateBlock: string,
+): { text: string; cacheable: boolean }[] {
+  return [
+    ...(systemPromptBlocks ?? []),
+    { text: executionStateBlock, cacheable: false },
+  ]
+}
+
+export function computeProviderPrefixCacheDiagnostics(options: {
+  systemPromptBlocks?: { text: string; cacheable: boolean }[]
+  executionStateBlock: string
+  tools: ModelToolDefinition[]
+}): PrefixCacheDiagnostics {
+  return computePrefixCacheDiagnostics({
+    systemPromptBlocks: buildProviderSystemPromptBlocks(options.systemPromptBlocks, options.executionStateBlock),
+    tools: options.tools,
+  })
 }
 
 export function buildRuntimeContextBlockingEventsForLoop(options: {

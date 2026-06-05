@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import * as fs from 'node:fs'
 import { Command } from 'commander'
 import { NexusClient } from '../NexusClient.js'
+import { createEmbeddedNexusClient } from '../embedded.js'
 import {
   renderEvent,
   getChatPrompt,
@@ -47,7 +48,6 @@ import { openExternalEditor } from '../editor.js'
 import { normalizeKeyEvent, terminalMouseDisableSequence } from '../keyEvent.js'
 import { consumePasteChunk, createPasteBufferState, expandPastedTextPlaceholders, flushPasteBuffer, formatPastedTextPlaceholder } from '../pasteBuffer.js'
 import { INPUT_NEWLINE_MARKER, restoreInputNewlines, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
-import type { ContextAnalysis } from '../../runtime/contextAnalysis.js'
 import { openContextView } from '../contextView.js'
 import { formatToolAudit } from '../toolAuditFormatter.js'
 
@@ -104,6 +104,13 @@ export function registerChatCommand(program: Command): void {
         clearInputBlock: () => inputRefresh.clearCurrentInputBlock(),
       })
       let sessionId = ''
+      const localStoragePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
+      const embeddedClient = () => createEmbeddedNexusClient({
+        cwd: options.cwd,
+        storagePath: localStoragePath,
+        allowedTools: ['*'],
+        enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
+      })
 
       // Enable bracketed paste mode
       process.stdout.write('\x1b[?2004h')
@@ -238,28 +245,11 @@ export function registerChatCommand(program: Command): void {
       const closeCurrentSession = async (reason: string): Promise<void> => {
         if (!sessionId) return
         try {
-          if (options.url) {
-            await new NexusClient({ baseUrl: options.url }).closeSession(sessionId, {
-              reason,
-            })
-          } else {
-            const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-            const { closeNexusSession } = await import('../../nexus/sessionLifecycle.js')
-            const { ConfigManager } = await import('../../shared/config.js')
-            const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-            if (!fs.existsSync(storagePath)) return
-            const storage = new SqliteStorage(storagePath)
-            try {
-              await closeNexusSession({
-                storage,
-                sessionId,
-                reason,
-                hooks: ConfigManager.getInstance().load().hooks,
-              })
-            } finally {
-              await storage.close?.()
-            }
-          }
+          const client = options.url
+            ? new NexusClient({ baseUrl: options.url })
+            : embeddedClient()
+          if (!options.url && !fs.existsSync(localStoragePath)) return
+          await client.closeSession(sessionId, { reason })
         } catch {
           // Best-effort cleanup only. Chat exit must remain fast and reliable.
         }
@@ -313,69 +303,22 @@ export function registerChatCommand(program: Command): void {
       }
 
       const loadEmbeddedToolAudit = async () => {
-        const { createDefaultNexusRuntime } = await import('../../nexus/createRuntime.js')
-        const { runtime, storage } = await createDefaultNexusRuntime({
-          cwd: options.cwd,
-          allowedTools: ['*'],
-          enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
-        })
-        try {
-          return { type: 'tools_audit', tools: runtime.listTools?.() ?? [] }
-        } finally {
-          await storage.close?.()
-        }
+        return embeddedClient().auditTools()
       }
 
       const showContextAnalysis = async () => {
         const modelId = ConfigManager.getInstance().resolveSettings().modelId
-        let analysis: ContextAnalysis
-        if (options.url) {
-          analysis = await new NexusClient({ baseUrl: options.url }).analyzeContext(sessionId, {
-            modelId,
-            cwd: options.cwd,
-          }) as ContextAnalysis
-        } else {
-          const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-          if (!fs.existsSync(storagePath)) {
-            console.log(chalk.yellow('No local storage found for context analysis.'))
-            return
-          }
-            const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-            const { createDefaultToolRegistry } = await import('../../tools/registry.js')
-            const { analyzeContext } = await import('../../runtime/contextAnalysis.js')
-            const { buildSystemPrompt, mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
-            const storage = new SqliteStorage(storagePath)
-          try {
-            const session = await storage.getSession(sessionId, { includeEvents: false })
-            if (!session) {
-              console.log(chalk.yellow(`Session not found: ${sessionId}`))
-              return
-            }
-            const { events } = await storage.listEvents(sessionId, {
-              limit: 10_000,
-              order: 'asc',
-            })
-            const tools = [...createDefaultToolRegistry().values()].map(tool => ({
-              name: tool.name,
-              description: tool.description,
-              inputSchema: tool.modelInputSchema ?? {},
-            }))
-            analysis = await analyzeContext({
-              runtimeOptions: {
-                sessionId,
-                prompt: session.lastUserInput ?? session.prompt,
-                cwd: session.cwd,
-              },
-              events,
-              modelId,
-              buildSystemPrompt,
-              mapEventsToMessages,
-              tools,
-            })
-          } finally {
-            await storage.close?.()
-          }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(chalk.yellow('No local storage found for context analysis.'))
+          return
         }
+        const analysis = await client.analyzeContext(sessionId, {
+          modelId,
+          cwd: options.cwd,
+        }) as Parameters<typeof openContextView>[0]
         await openContextView(analysis)
       }
 
@@ -532,19 +475,12 @@ export function registerChatCommand(program: Command): void {
 
         try {
           let events: NexusEvent[] = []
-          if (options.url) {
-            const client = new NexusClient({ baseUrl: options.url })
+          const client = options.url
+            ? new NexusClient({ baseUrl: options.url })
+            : embeddedClient()
+          if (options.url || fs.existsSync(localStoragePath)) {
             const res = (await client.listSessionEvents(sessionId, { limit: 100, order: 'asc' })) as { events: NexusEvent[] }
             events = res.events
-          } else {
-            const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-            if (fs.existsSync(storagePath)) {
-              const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-              const storage = new SqliteStorage(storagePath)
-              const res = await storage.listEvents(sessionId, { limit: 100, order: 'asc' })
-              events = res.events
-              await storage.close?.()
-            }
           }
 
           if (events && events.length > 0) {
@@ -657,37 +593,19 @@ export function registerChatCommand(program: Command): void {
           if (trimmed === '/compact') {
             startAgentStatus('compacting')
             try {
-              if (options.url) {
-                const client = new NexusClient({ baseUrl: options.url })
-                const modelId = ConfigManager.getInstance().resolveSettings().modelId
-                await client.compactSession(sessionId, {
-                  modelId,
-                  trigger: 'manual',
-                })
-              } else {
-                const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-                if (!fs.existsSync(storagePath)) {
-                  stopAgentStatus()
-                  console.log(chalk.yellow('No local storage found to compact.'))
-                  continue
-                }
-                const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-                const { compactSession } = await import('../../runtime/compact.js')
-                const { mapEventsToMessages } = await import('../../runtime/LLMCodingRuntime.js')
-                const storage = new SqliteStorage(storagePath)
-                try {
-                  const modelId = ConfigManager.getInstance().resolveSettings().modelId
-                  await compactSession({
-                    storage,
-                    sessionId,
-                    modelId,
-                    trigger: 'manual',
-                    mapEventsToMessages,
-                  })
-                } finally {
-                  await storage.close?.()
-                }
+              const client = options.url
+                ? new NexusClient({ baseUrl: options.url })
+                : embeddedClient()
+              if (!options.url && !fs.existsSync(localStoragePath)) {
+                stopAgentStatus()
+                console.log(chalk.yellow('No local storage found to compact.'))
+                continue
               }
+              const modelId = ConfigManager.getInstance().resolveSettings().modelId
+              await client.compactSession(sessionId, {
+                modelId,
+                trigger: 'manual',
+              })
               stopAgentStatus()
               console.log(chalk.green('✓ Context compacted'))
             } catch (e: any) {
@@ -886,27 +804,15 @@ export function registerChatCommand(program: Command): void {
           }
 
           if (trimmed === '/sessions') {
-            if (options.url) {
-              try {
-                const client = new NexusClient({ baseUrl: options.url })
-                const list = await client.listSessions()
-                console.log(chalk.cyan('\n--- Recent Sessions ---'))
-                console.log(JSON.stringify(list, null, 2))
-              } catch (e: any) {
-                console.error(chalk.red(`Failed to list sessions from service: ${e.message || e}`))
-              }
-            } else {
-              try {
-                const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
-                const { SqliteStorage } = await import('../../storage/SqliteStorage.js')
-                const storage = new SqliteStorage(storagePath)
-                const list = await storage.listSessions({ limit: 10 })
-                await storage.close?.()
-                console.log(chalk.cyan('\n--- Recent Sessions (Local) ---'))
-                console.log(JSON.stringify(list, null, 2))
-              } catch (e: any) {
-                console.error(chalk.red(`Failed to list local sessions: ${e.message || e}`))
-              }
+            try {
+              const client = options.url
+                ? new NexusClient({ baseUrl: options.url })
+                : embeddedClient()
+              const list = await client.listSessions({ limit: 10 })
+              console.log(chalk.cyan(options.url ? '\n--- Recent Sessions ---' : '\n--- Recent Sessions (Local) ---'))
+              console.log(JSON.stringify(list, null, 2))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to list sessions: ${e.message || e}`))
             }
             continue
           }
@@ -1248,7 +1154,7 @@ function yesNo(value: unknown): string {
   return value ? 'yes' : 'no'
 }
 
-export function formatContextAnalysis(analysis: ContextAnalysis): string {
+export function formatContextAnalysis(analysis: Parameters<typeof openContextView>[0]): string {
   const maxTokens = Math.max(1, analysis.window.maxTokens)
   const usedTokens = Math.max(0, analysis.estimate.totalTokens)
   const availableTokens = Math.max(0, maxTokens - usedTokens)
@@ -1273,7 +1179,20 @@ export function formatContextAnalysis(analysis: ContextAnalysis): string {
     `cache policy reason ${cache.reason}`,
     `microcompact saved≈${formatTokenCompact(analysis.sections.microcompactEstimatedTokensSaved)} tokens · duplicate results=${analysis.sections.microcompactDeduplicatedToolResultCount}`,
     `auto compact floor ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.currentTokens)}/${formatTokenCompact(analysis.diagnostics.autoCompactFloor.thresholdTokens)} (${analysis.diagnostics.autoCompactFloor.thresholdPercent}%) · budget ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens)}`,
+    `selection items retained=${analysis.diagnostics.selection.retained.length} dropped=${analysis.diagnostics.selection.dropped.length} · phases=${analysis.diagnostics.selection.phases.length}`,
   ]
+  const fork = analysis.diagnostics.selection.fork
+  if (fork) {
+    diagnosticRows.push(`context fork mode=${fork.mode} inherited=${fork.inheritedItems} omitted=${fork.omittedItems}`)
+  }
+  const retainedItem = analysis.diagnostics.selection.retained[0]
+  if (retainedItem) {
+    diagnosticRows.push(`selection retained ${retainedItem.kind} · ${retainedItem.reason} · ${formatTokenCompact(retainedItem.estimatedTokens)} tokens`)
+  }
+  const droppedItem = analysis.diagnostics.selection.dropped[0]
+  if (droppedItem) {
+    diagnosticRows.push(`selection dropped ${droppedItem.kind} · ${droppedItem.reason} · ${formatTokenCompact(droppedItem.estimatedTokens)} tokens`)
+  }
   if (analysis.diagnostics.autoCompact.fuseOpen) {
     diagnosticRows.push(`auto compact paused after ${analysis.diagnostics.autoCompact.failureCount}/${analysis.diagnostics.autoCompact.failureLimit} failures`)
   } else if (analysis.diagnostics.autoCompact.shouldCompact) {

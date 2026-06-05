@@ -1,0 +1,433 @@
+import type { NexusEvent } from '../../shared/events.js'
+import { eventBase } from '../../shared/events.js'
+import { createId, nowIso } from '../../shared/id.js'
+import type { SessionSnapshot } from '../../shared/session.js'
+import type { NexusStorage } from '../../storage/Storage.js'
+import { createDefaultToolRegistry } from '../../tools/registry.js'
+import type { AnyTool, ToolResult } from '../../tools/Tool.js'
+import { LLMCodingRuntime } from '../../runtime/LLMCodingRuntime.js'
+import { LocalCodingRuntime, allowlistedTools } from '../../runtime/LocalCodingRuntime.js'
+import type { NexusRuntime } from '../../runtime/Runtime.js'
+import type { RemoteToolRunner } from '../../runtime/remoteRunner.js'
+import { ConfigManager } from '../../shared/config.js'
+import { assertAgentProfile } from './AgentProfiles.js'
+import {
+  AgentJobRegistry,
+  AgentJobRegistryError,
+  isTerminalAgentJobStatus,
+} from './AgentJobRegistry.js'
+import { forkContextForAgent } from './ContextForker.js'
+import type {
+  AgentJob,
+  AgentJobFilter,
+  AgentResult,
+  AgentScheduler,
+  AgentSpawnRequest,
+  AgentWaitOptions,
+} from './types.js'
+
+export type ExploreAgentSchedulerOptions = {
+  storage: NexusStorage
+  cwd?: string
+  registry?: AgentJobRegistry
+  runtimeFactory?: (options: ExploreAgentRuntimeFactoryOptions) => NexusRuntime
+  now?: () => string
+  executionEnvironment?: 'local' | 'remote'
+  remoteRunner?: RemoteToolRunner
+}
+
+export type ExploreAgentRuntimeFactoryOptions = {
+  agentType: AgentJob['agentType']
+  allowedTools: string[]
+  storage: NexusStorage
+  executionEnvironment?: 'local' | 'remote'
+  remoteRunner?: RemoteToolRunner
+}
+
+type RunningAgent = {
+  controller: AbortController
+  promise: Promise<void>
+}
+
+export class ExploreAgentScheduler implements AgentScheduler {
+  private readonly storage: NexusStorage
+  private readonly cwd?: string
+  private readonly registry: AgentJobRegistry
+  private readonly runtimeFactory: (options: ExploreAgentRuntimeFactoryOptions) => NexusRuntime
+  private readonly now: () => string
+  private readonly executionEnvironment?: 'local' | 'remote'
+  private readonly remoteRunner?: RemoteToolRunner
+  private readonly running = new Map<string, RunningAgent>()
+
+  constructor(options: ExploreAgentSchedulerOptions) {
+    this.storage = options.storage
+    this.cwd = options.cwd
+    this.registry = options.registry ?? new AgentJobRegistry({ now: options.now })
+    this.runtimeFactory = options.runtimeFactory ?? createExploreRuntime
+    this.now = options.now ?? nowIso
+    this.executionEnvironment = options.executionEnvironment
+    this.remoteRunner = options.remoteRunner
+  }
+
+  async spawnAgent(request: AgentSpawnRequest): Promise<AgentJob> {
+    const profile = assertAgentProfile(request.agentType ?? 'explore')
+    assertSchedulableProfile(profile.id)
+    const allowedTools = request.allowedTools ?? profile.defaultTools
+    assertProfileAllowedTools(profile.id, allowedTools)
+    const parentSession = await this.requireParentSession(request.parentSessionId)
+    const childSessionId = createId('session')
+    const job = this.registry.createJob({
+      parentSessionId: request.parentSessionId,
+      childSessionId,
+      agentType: profile.id,
+      prompt: request.prompt,
+      contextForkMode: request.contextForkMode ?? profile.defaultContextForkMode,
+      isolation: request.isolation ?? profile.defaultIsolation,
+      transcriptPath: `nexus://sessions/${childSessionId}/events`,
+      metadata: {
+        ...(request.metadata ?? {}),
+        allowedTools,
+      },
+    })
+    const fork = forkContextForAgent({ parentSession, job })
+    const childSession: SessionSnapshot = {
+      sessionId: childSessionId,
+      cwd: parentSession.cwd || this.cwd || process.cwd(),
+      prompt: fork.prompt,
+      phase: 'created',
+      createdAt: this.now(),
+      updatedAt: this.now(),
+      events: [],
+      parentSessionId: parentSession.sessionId,
+      assignedAgentId: profile.id,
+      allowedPaths: fork.allowedPaths,
+      metadata: {
+        agentJobId: job.jobId,
+        agentType: profile.id,
+        contextForkMode: fork.mode,
+        isolation: job.isolation,
+        allowedTools,
+        contextFork: {
+          inheritedItems: fork.inheritedItems,
+          omittedItems: fork.omittedItems,
+          diagnostics: fork.diagnostics,
+        },
+      },
+    }
+    await this.storage.saveSession(childSession)
+    await this.appendParentAgentEvent('agent_job_queued', job)
+
+    const controller = new AbortController()
+    const promise = this.runAgentJob(
+      job.jobId,
+      fork.prompt,
+      childSession,
+      allowedTools,
+      controller,
+      request.maxRuntimeMs ?? profile.maxRuntimeMs,
+    ).finally(() => {
+      this.running.delete(job.jobId)
+    })
+    this.running.set(job.jobId, { controller, promise })
+
+    return job
+  }
+
+  async waitForAgent(jobId: string, options?: AgentWaitOptions): Promise<AgentJob> {
+    const job = await this.registry.waitForJob(jobId, options)
+    await this.running.get(jobId)?.promise
+    return this.registry.getJob(jobId)
+  }
+
+  async listAgents(filter?: AgentJobFilter): Promise<AgentJob[]> {
+    return this.registry.listJobs(filter)
+  }
+
+  async cancelAgent(jobId: string, reason?: string): Promise<AgentJob> {
+    const existing = this.registry.getJob(jobId)
+    if (isTerminalAgentJobStatus(existing.status)) return existing
+
+    const running = this.running.get(jobId)
+    running?.controller.abort()
+    const job = this.registry.cancelJob(jobId, reason)
+    await this.finalizeChildSession(job, false, reason ?? 'Agent job cancelled.')
+    await this.appendParentAgentEvent('agent_job_cancelled', job)
+    return job
+  }
+
+  private async runAgentJob(
+    jobId: string,
+    prompt: string,
+    childSession: SessionSnapshot,
+    allowedTools: string[],
+    controller: AbortController,
+    maxRuntimeMs?: number,
+  ): Promise<void> {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    if (maxRuntimeMs !== undefined) {
+      timeout = setTimeout(() => controller.abort(), maxRuntimeMs)
+      timeout.unref?.()
+    }
+
+    let job = this.registry.markRunning(jobId)
+    await this.appendParentAgentEvent('agent_job_started', job)
+    childSession.phase = 'executing'
+    childSession.updatedAt = this.now()
+    await this.storage.saveSession(childSession)
+
+    const runtime = this.runtimeFactory({
+      agentType: job.agentType,
+      allowedTools,
+      storage: this.storage,
+      executionEnvironment: this.executionEnvironment,
+      remoteRunner: this.remoteRunner,
+    })
+    const events: NexusEvent[] = []
+    try {
+      for await (const event of runtime.executeStream({
+        sessionId: childSession.sessionId,
+        prompt,
+        cwd: childSession.cwd,
+        role: job.agentType,
+        signal: controller.signal,
+        timeoutSignal: controller.signal,
+        skipPermissionCheck: true,
+        replaySessionHistory: false,
+        storage: this.storage,
+        allowedPaths: childSession.allowedPaths,
+        executionEnvironment: this.executionEnvironment,
+        remoteRunner: this.remoteRunner,
+      })) {
+        events.push(event)
+        await this.storage.appendEvent(childSession.sessionId, event)
+      }
+
+      const errorEvent = events.findLast(event => event.type === 'error')
+      if (controller.signal.aborted) {
+        if (!isTerminalAgentJobStatus(this.registry.getJob(jobId).status)) {
+          job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
+          await this.finalizeChildSession(job, false, 'Agent job cancelled.')
+          await this.appendParentAgentEvent('agent_job_cancelled', job)
+        }
+        return
+      }
+      if (errorEvent?.type === 'error') {
+        job = this.registry.failJob(jobId, {
+          code: errorEvent.code,
+          message: errorEvent.message,
+          details: errorEvent.details,
+        })
+        await this.finalizeChildSession(job, false, errorEvent.message)
+        await this.appendParentAgentEvent('agent_job_failed', job)
+        return
+      }
+
+      const result = normalizeAgentResult(events, allowedTools)
+      job = this.registry.completeJob(jobId, result)
+      await this.finalizeChildSession(job, true, result.summary)
+      await this.appendParentAgentEvent('agent_job_completed', job)
+    } catch (error) {
+      if (controller.signal.aborted) {
+        if (!isTerminalAgentJobStatus(this.registry.getJob(jobId).status)) {
+          job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
+          await this.finalizeChildSession(job, false, 'Agent job cancelled.')
+          await this.appendParentAgentEvent('agent_job_cancelled', job)
+        }
+        return
+      }
+      job = this.registry.failJob(jobId, {
+        code: 'AGENT_RUNTIME_ERROR',
+        message: error instanceof Error ? error.message : String(error),
+      })
+      await this.finalizeChildSession(job, false, job.error?.message ?? 'Agent job failed.')
+      await this.appendParentAgentEvent('agent_job_failed', job)
+    } finally {
+      if (timeout) clearTimeout(timeout)
+    }
+  }
+
+  private async finalizeChildSession(job: AgentJob, success: boolean, message: string): Promise<void> {
+    const child = await this.storage.getSession(job.childSessionId)
+    if (!child) return
+    child.phase = success ? 'completed' : job.status === 'cancelled' ? 'cancelled' : 'failed'
+    child.updatedAt = this.now()
+    child.result = success ? message : undefined
+    child.error = success ? undefined : message
+    child.metadata = {
+      ...(child.metadata ?? {}),
+      agentJobStatus: job.status,
+    }
+    await this.storage.saveSession(child)
+  }
+
+  private async requireParentSession(parentSessionId: string): Promise<SessionSnapshot> {
+    const session = await this.storage.getSession(parentSessionId)
+    if (!session) {
+      throw new AgentJobRegistryError(
+        `Parent session not found: ${parentSessionId}`,
+        'AGENT_PARENT_SESSION_NOT_FOUND',
+        404,
+      )
+    }
+    return session
+  }
+
+  private async appendParentAgentEvent(eventType: string, job: AgentJob): Promise<void> {
+    await this.storage.appendEvent(job.parentSessionId, {
+      type: 'task_session_event',
+      ...eventBase(job.parentSessionId),
+      eventId: createId('event'),
+      eventType,
+      phase: job.status,
+      payload: {
+        jobId: job.jobId,
+        childSessionId: job.childSessionId,
+        agentType: job.agentType,
+        contextForkMode: job.contextForkMode,
+        status: job.status,
+        result: job.result,
+        error: job.error,
+      },
+    })
+  }
+}
+
+export function createExploreRuntime(options: ExploreAgentRuntimeFactoryOptions): NexusRuntime {
+  const tools = createDefaultToolRegistry()
+  if (options.agentType === 'review' || options.agentType === 'test') {
+    tools.set('Bash', createRestrictedAgentBashTool(options.agentType, tools.get('Bash')))
+  }
+  const policy = allowlistedTools(options.allowedTools)
+  const settings = ConfigManager.getInstance().resolveSettings()
+  if (settings.providerId === 'local') {
+    return new LocalCodingRuntime(tools, policy, options.storage, ConfigManager.getInstance().load().hooks)
+  }
+  return new LLMCodingRuntime(tools, policy, options.storage, ConfigManager.getInstance())
+}
+
+export function normalizeAgentResult(events: NexusEvent[], allowedTools: string[]): AgentResult {
+  const resultEvent = events.findLast(event => event.type === 'result')
+  const assistantText = events
+    .filter((event): event is Extract<NexusEvent, { type: 'assistant_delta' }> => event.type === 'assistant_delta')
+    .map(event => event.text)
+    .join('')
+    .trim()
+  const toolEvents = events.filter((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed')
+  const deniedTools = events.filter((event): event is Extract<NexusEvent, { type: 'tool_denied' }> => event.type === 'tool_denied')
+  const toolInputs = new Map(
+    events
+      .filter((event): event is Extract<NexusEvent, { type: 'tool_started' }> => event.type === 'tool_started')
+      .map(event => [event.toolUseId, event.input]),
+  )
+  const commandsRun = toolEvents
+    .filter(event => event.name === 'Bash')
+    .map(event => commandFromToolInput(toolInputs.get(event.toolUseId)))
+    .filter((command): command is string => command !== undefined)
+  const testsRun = commandsRun.filter(command => command.includes('tsx --test'))
+
+  return {
+    summary: resultEvent?.type === 'result'
+      ? resultEvent.message
+      : assistantText || 'Agent completed.',
+    findings: [
+      ...toolEvents.map(event => ({
+        severity: event.success ? 'info' as const : 'warning' as const,
+        message: `${event.name} ${event.success ? 'completed' : 'failed'}.`,
+        evidence: stringifyEvidence(event.output),
+      })),
+      ...deniedTools.map(event => ({
+        severity: 'error' as const,
+        message: event.message,
+      })),
+    ],
+    changedFiles: [],
+    testsRun,
+    commandsRun,
+    nextSteps: [],
+    confidence: deniedTools.length > 0 ? 'low' : toolEvents.length > 0 || assistantText ? 'medium' : 'low',
+  }
+}
+
+function commandFromToolInput(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object') return undefined
+  const command = (input as { command?: unknown }).command
+  return typeof command === 'string' ? command : undefined
+}
+
+function assertSchedulableProfile(profileId: AgentJob['agentType']): void {
+  if (profileId === 'explore' || profileId === 'review' || profileId === 'test') return
+  throw new AgentJobRegistryError(
+    `Agent profile is not supported by ExploreAgentScheduler: ${profileId}`,
+    'AGENT_PROFILE_UNSUPPORTED',
+    400,
+  )
+}
+
+function assertProfileAllowedTools(profileId: AgentJob['agentType'], allowedTools: string[]): void {
+  const allowed = profileId === 'explore'
+    ? new Set(['Read', 'Grep', 'Glob'])
+    : new Set(['Read', 'Grep', 'Glob', 'Bash'])
+  const disallowed = allowedTools.filter(tool => !allowed.has(tool))
+  if (disallowed.length > 0) {
+    throw new AgentJobRegistryError(
+      `${profileId} agent cannot use tools: ${disallowed.join(', ')}`,
+      'AGENT_TOOLS_NOT_ALLOWED',
+      400,
+    )
+  }
+}
+
+function createRestrictedAgentBashTool(profileId: 'review' | 'test', bashTool: AnyTool | undefined): AnyTool {
+  if (!bashTool) {
+    throw new AgentJobRegistryError('Bash tool is not registered.', 'AGENT_BASH_UNAVAILABLE', 500)
+  }
+  return {
+    ...bashTool,
+    description: `${profileId} agent restricted test/check command runner.`,
+    prompt: () => [
+      'Run only read-only validation commands for review/test work.',
+      'Allowed commands are npm run typecheck, npm run format:check, npm run deps:audit, and npx tsx --test with explicit test files or --test-name-pattern.',
+      'Do not run write, install, network, git mutation, destructive, server, or broad formatting commands.',
+    ].join('\n'),
+    async execute(input, context): Promise<ToolResult> {
+      const parsed = bashTool.inputSchema.parse(input) as { command: string }
+      if (!isAllowedAgentBashCommand(parsed.command)) {
+        return {
+          success: false,
+          output: {
+            code: 'AGENT_BASH_COMMAND_NOT_ALLOWED',
+            message: `${profileId} agents may only run focused read-only validation commands.`,
+            command: parsed.command,
+          },
+        }
+      }
+      return bashTool.execute(input, context)
+    },
+  }
+}
+
+function isAllowedAgentBashCommand(command: string): boolean {
+  let normalized = command.trim().replace(/\s+/g, ' ')
+  if (/[;&|`$<>]/.test(normalized)) return false
+  if (normalized.startsWith('BABEL_O_CONFIG_FILE=/tmp/')) {
+    const [, rest] = normalized.match(/^BABEL_O_CONFIG_FILE=\/tmp\/[A-Za-z0-9._-]+ (.+)$/) ?? []
+    if (!rest) return false
+    normalized = rest
+  }
+  if (normalized === 'npm run typecheck') return true
+  if (normalized === 'npm run format:check') return true
+  if (normalized === 'npm run deps:audit') return true
+  if (!normalized.startsWith('npx tsx --test ')) return false
+  if (normalized.includes(' --watch') || normalized.includes(' --inspect')) return false
+  return normalized.includes('.test.ts') || normalized.includes('--test-name-pattern')
+}
+
+function stringifyEvidence(output: unknown): string | undefined {
+  if (output === undefined || output === null) return undefined
+  if (typeof output === 'string') return output.slice(0, 1_000)
+  try {
+    return JSON.stringify(output).slice(0, 1_000)
+  } catch {
+    return undefined
+  }
+}

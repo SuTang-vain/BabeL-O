@@ -1,4 +1,6 @@
+import { performance } from 'node:perf_hooks'
 import { errorMessage } from '../shared/errors.js'
+import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { truncateToolOutput } from '../tools/output.js'
 import {
@@ -6,6 +8,7 @@ import {
   isWorkspacePathError,
 } from '../tools/builtin/pathSafety.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
+import { REMOTE_RUNNER_PROTOCOL_VERSION, remoteRunnerSupportsTool, remoteRunnerUnavailableResult, type RemoteToolRunnerResult } from './remoteRunner.js'
 
 const TOOL_EXECUTION_TIMEOUT_MS = 120_000
 
@@ -16,17 +19,128 @@ export type ToolExecutionResult =
       output: unknown
       truncated?: boolean
       originalBytes?: number
+      remoteRunner?: RemoteToolRunnerDiagnostics
     }
-  | { kind: 'error'; code: string; message: string; details?: unknown }
+  | { kind: 'error'; code: string; message: string; details?: unknown; remoteRunner?: RemoteToolRunnerDiagnostics }
 
 export async function executeToolSafely(
   tool: AnyTool,
   input: unknown,
   options: RuntimeExecuteOptions,
-  opts?: { timeout?: number },
+  opts?: { timeout?: number; toolUseId?: string },
 ): Promise<ToolExecutionResult> {
   const maxOutputBytes = options.maxToolOutputBytes ?? 200_000
   const useTimeout = opts?.timeout ?? 0
+
+  if (options.executionEnvironment === 'remote') {
+    if (!options.remoteRunner) return remoteRunnerUnavailableResult()
+    if (!remoteRunnerSupportsTool(options.remoteRunner, tool)) {
+      return {
+        kind: 'error',
+        code: 'REMOTE_RUNNER_TOOL_UNSUPPORTED',
+        message: `Remote runner ${options.remoteRunner.id} does not support tool ${tool.name}.`,
+      }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    let cancellationKind: 'cancelled' | 'timeout' | undefined
+    let rejectCancelled: ((error: Error) => void) | undefined
+    const cancelRequest = {
+      sessionId: options.sessionId,
+      requestId: options.requestId,
+      toolUseId: opts?.toolUseId,
+    }
+    const cancelledPromise = new Promise<never>((_, reject) => {
+      rejectCancelled = reject
+    })
+    const cancelRemoteTool = (kind: 'cancelled' | 'timeout') => {
+      if (cancelled) return
+      cancelled = true
+      cancellationKind = kind
+      void options.remoteRunner?.cancelTool?.(cancelRequest).catch(() => {})
+      rejectCancelled?.(new Error('Remote tool execution cancelled'))
+    }
+    const onParentAbort = () => cancelRemoteTool('cancelled')
+    const onTimeoutAbort = () => cancelRemoteTool('timeout')
+
+    if (useTimeout > 0) timer = setTimeout(() => cancelRemoteTool('timeout'), useTimeout)
+    options.signal?.addEventListener('abort', onParentAbort)
+    options.timeoutSignal?.addEventListener('abort', onTimeoutAbort)
+
+    try {
+      const remoteStartMs = performance.now()
+      const result = await Promise.race([
+        options.remoteRunner.executeTool({
+          protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+          sessionId: options.sessionId,
+          requestId: options.requestId,
+          toolUseId: opts?.toolUseId,
+          toolName: tool.name,
+          toolInput: input,
+          cwd: options.cwd,
+          allowedPaths: options.allowedPaths,
+          maxOutputBytes,
+          bashMaxBufferBytes: options.bashMaxBufferBytes ?? 1_000_000,
+          deadlineMs: useTimeout > 0 ? Date.now() + useTimeout : undefined,
+        }),
+        cancelledPromise,
+      ])
+      const roundtripMs = performance.now() - remoteStartMs
+      const remoteRunner = normalizeRemoteToolRunnerDiagnostics(
+        options.remoteRunner.id,
+        result,
+        roundtripMs,
+        result.kind === 'error' ? result.code : undefined,
+      )
+      if (result.kind === 'error') return { ...result, remoteRunner }
+      const truncated = truncateToolOutput(result.output, maxOutputBytes)
+      return {
+        kind: 'result',
+        success: result.success,
+        output: truncated.value,
+        truncated: result.truncated || truncated.truncated || undefined,
+        originalBytes: result.originalBytes ?? truncated.originalBytes,
+        remoteRunner: {
+          ...remoteRunner,
+          truncated: result.truncated || truncated.truncated || remoteRunner.truncated || undefined,
+          originalBytes: result.originalBytes ?? truncated.originalBytes ?? remoteRunner.originalBytes,
+        },
+      }
+    } catch (error) {
+      const isTimeout = cancellationKind === 'timeout' || options.timeoutSignal?.aborted
+      if (cancelled || options.signal?.aborted || isTimeout) {
+        return {
+          kind: 'error',
+          code: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
+          message: isTimeout
+            ? `Execution timed out while running ${tool.name}.`
+            : `Execution cancelled while running ${tool.name}.`,
+          remoteRunner: {
+            runnerId: options.remoteRunner.id,
+            protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+            timedOut: isTimeout || undefined,
+            cancelled: !isTimeout || undefined,
+            errorCode: isTimeout ? 'REQUEST_TIMEOUT' : 'REQUEST_CANCELLED',
+          },
+        }
+      }
+      return {
+        kind: 'error',
+        code: 'REMOTE_RUNNER_ERROR',
+        message: errorMessage(error),
+        details: normalizeToolErrorDetails(error, maxOutputBytes),
+        remoteRunner: {
+          runnerId: options.remoteRunner.id,
+          protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+          errorCode: 'REMOTE_RUNNER_ERROR',
+        },
+      }
+    } finally {
+      if (timer) clearTimeout(timer)
+      options.signal?.removeEventListener('abort', onParentAbort)
+      options.timeoutSignal?.removeEventListener('abort', onTimeoutAbort)
+    }
+  }
 
   let controller: AbortController | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -99,6 +213,45 @@ export async function executeToolSafely(
     if (timer) clearTimeout(timer)
     if (onParentAbort) options.signal?.removeEventListener('abort', onParentAbort)
   }
+}
+
+function normalizeRemoteToolRunnerDiagnostics(
+  runnerId: string,
+  result: RemoteToolRunnerResult,
+  roundtripMs: number,
+  errorCode?: string,
+): RemoteToolRunnerDiagnostics {
+  const metrics = result.metrics ?? {}
+  const details = result.kind === 'error' && result.details && typeof result.details === 'object'
+    ? result.details as Record<string, unknown>
+    : undefined
+  const output = result.kind === 'result' && result.output && typeof result.output === 'object'
+    ? result.output as Record<string, unknown>
+    : undefined
+  const normalized: RemoteToolRunnerDiagnostics = {
+    runnerId: typeof metrics.runnerId === 'string' ? metrics.runnerId : runnerId,
+    protocolVersion: typeof metrics.protocolVersion === 'string' ? metrics.protocolVersion : REMOTE_RUNNER_PROTOCOL_VERSION,
+    durationMs: finiteNumber(metrics.durationMs),
+    roundtripMs,
+    truncated: metrics.truncated ?? (result.kind === 'result' ? result.truncated : undefined),
+    originalBytes: finiteNumber(metrics.originalBytes) ?? (result.kind === 'result' ? result.originalBytes : undefined),
+    exitCode: finiteNumber(metrics.exitCode) ?? finiteNumber(output?.exitCode) ?? finiteNumber(details?.exitCode),
+    signal: typeof metrics.signal === 'string' ? metrics.signal : typeof output?.signal === 'string' ? output.signal : typeof details?.signal === 'string' ? details.signal : undefined,
+    cancelled: metrics.cancelled ?? (errorCode === 'REQUEST_CANCELLED' || undefined),
+    timedOut: metrics.timedOut ?? (errorCode === 'REQUEST_TIMEOUT' || undefined),
+    errorCode,
+  }
+  return compactRemoteDiagnostics(normalized)
+}
+
+function compactRemoteDiagnostics(diagnostics: RemoteToolRunnerDiagnostics): RemoteToolRunnerDiagnostics {
+  return Object.fromEntries(
+    Object.entries(diagnostics).filter(([, value]) => value !== undefined),
+  ) as RemoteToolRunnerDiagnostics
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
 export function normalizeToolErrorDetails(error: unknown, maxBytes: number): unknown {

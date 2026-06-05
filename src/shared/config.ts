@@ -2,7 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { z } from 'zod';
-import { getProvider, getModel, providerRegistry, modelRegistry, recommendModelForRole, type ModelRole, type ModelRoleRecommendation } from '../providers/registry.js';
+import { getProvider, inspectModelCapabilities, providerRegistry, modelRegistry, recommendModelForRole, type ModelCapabilityDiagnostics, type ModelRole, type ModelRoleRecommendation } from '../providers/registry.js';
 import { logger } from './logger.js';
 
 export interface ProviderConfig {
@@ -115,6 +115,10 @@ export type ProviderDiagnostics = {
     streaming: boolean;
     structuredOutput: boolean;
   };
+  modelDeclared: boolean;
+  capabilitySource: ModelCapabilityDiagnostics['capabilitySource'];
+  capabilityWarning?: string;
+  suitability: ModelCapabilityDiagnostics['suitability'];
   roleRecommendation?: ProviderRoleDiagnostics;
 }
 
@@ -639,46 +643,29 @@ export class ConfigManager {
 
   public getProviderDiagnostics(roleOrOptions?: string | ResolveSettingsOptions): ProviderDiagnostics {
     const settings = this.resolveSettings(roleOrOptions);
-    const provider = getProvider(settings.providerId);
-    let model;
-    try {
-      model = getModel(settings.modelId);
-    } catch {
-      model = {
-        id: settings.modelId,
-        name: settings.modelId,
-        contextWindow: 8192,
-        defaultMaxTokens: 4096,
-        capabilities: {
-          toolCalling: false,
-          jsonOutput: false,
-          streaming: false,
-        },
-      };
-    }
+    const modelDiagnostics = inspectModelCapabilities(settings.modelId, settings.providerId);
     const role = typeof roleOrOptions === 'string' ? roleOrOptions : roleOrOptions?.role;
     const recommendation = isModelRole(role) ? recommendModelForRole(role) : undefined;
     return {
       providerId: settings.providerId,
-      providerName: provider.displayName,
-      adapter: provider.adapter,
-      authMode: provider.authMode,
-      authConfigured: provider.authMode === 'none' || Boolean(settings.apiKey),
+      providerName: modelDiagnostics.providerName,
+      adapter: modelDiagnostics.adapter,
+      authMode: modelDiagnostics.authMode,
+      authConfigured: modelDiagnostics.authMode === 'none' || Boolean(settings.apiKey),
       authSource: settings.apiKeySource,
       baseUrl: settings.baseUrl || '',
       baseUrlSource: settings.baseUrlSource,
       modelId: settings.modelId,
-      modelName: model.name,
+      modelName: modelDiagnostics.modelName,
       modelSource: settings.modelSource,
       activeProfile: settings.activeProfile,
-      contextWindow: model.contextWindow,
-      defaultMaxTokens: model.defaultMaxTokens,
-      capabilities: {
-        toolCalling: model.capabilities.toolCalling,
-        jsonOutput: model.capabilities.jsonOutput,
-        streaming: model.capabilities.streaming,
-        structuredOutput: model.capabilities.jsonOutput,
-      },
+      contextWindow: modelDiagnostics.contextWindow,
+      defaultMaxTokens: modelDiagnostics.defaultMaxTokens,
+      capabilities: modelDiagnostics.capabilities,
+      modelDeclared: modelDiagnostics.modelDeclared,
+      capabilitySource: modelDiagnostics.capabilitySource,
+      capabilityWarning: modelDiagnostics.capabilityWarning,
+      suitability: modelDiagnostics.suitability,
       roleRecommendation: recommendation ? {
         ...recommendation,
         configured: settings.modelSource === 'role',

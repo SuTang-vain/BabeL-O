@@ -1,6 +1,12 @@
 import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
 import { logger } from '../shared/logger.js'
+import {
+  assertAgentRemoteExecutionReady,
+  assertRemoteRunnerReady,
+  configureRemoteRunnerFromEnv,
+  parseAgentExecutionEnvironment,
+} from './remoteRunnerConfig.js'
 
 const host = process.env.NEXUS_HOST ?? '127.0.0.1'
 const port = Number(process.env.NEXUS_PORT ?? 3000)
@@ -26,11 +32,30 @@ const storageWalFlushIntervalMs = parseNonNegativeInt(process.env.NEXUS_STORAGE_
 const storageWalFsync = parseBoolean(process.env.NEXUS_STORAGE_WAL_FSYNC)
 
 const enableMcp = process.env.BABEL_O_ENABLE_MCP === '1'
-const { runtime, storage } = await createDefaultNexusRuntime({
+const enableAgentTools = process.env.BABEL_O_ENABLE_AGENT_TOOLS === '1'
+let agentExecutionEnvironment: 'local' | 'remote' | undefined
+try {
+  agentExecutionEnvironment = parseAgentExecutionEnvironment(process.env.NEXUS_AGENT_EXECUTION_ENVIRONMENT)
+} catch (err: any) {
+  logger.error('Nexus server failed agent execution environment validation', err)
+  process.exit(1)
+}
+const remoteRunner = await configureRemoteRunnerFromEnv()
+try {
+  assertRemoteRunnerReady(remoteRunner.status)
+  assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
+} catch (err: any) {
+  logger.error('Nexus server failed remote runner validation', err)
+  process.exit(1)
+}
+const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,
   cwd,
   enableMcp,
+  enableAgentTools,
+  remoteRunner: remoteRunner.runner,
+  agentExecutionEnvironment,
   storageWal: {
     batchSize: storageWalBatchSize,
     flushIntervalMs: storageWalFlushIntervalMs,
@@ -40,11 +65,15 @@ const { runtime, storage } = await createDefaultNexusRuntime({
 const app = await createNexusApp({
   runtime,
   storage,
+  agentScheduler,
   defaultCwd: cwd,
   executeTimeoutMs,
   maxConcurrentExecutions,
   maxToolOutputBytes,
   bashMaxBufferBytes,
+  remoteRunner: remoteRunner.runner,
+  remoteRunnerStatus: remoteRunner.status,
+  agentExecutionEnvironment,
 })
 
 await app.listen({ host, port })
@@ -55,6 +84,9 @@ console.log(
       ? ` allowedTools=${allowedTools.join(',')}`
       : ' allowedTools=default(read,grep,glob,task)') +
     ` mcp=${enableMcp ? 'enabled' : 'disabled'}` +
+    ` agentTools=${enableAgentTools ? 'enabled' : 'disabled'}` +
+    ` agentExecution=${agentExecutionEnvironment ?? 'local'}` +
+    ` remoteRunner=${remoteRunner.status.healthy ? 'healthy' : remoteRunner.status.configured ? 'unhealthy' : 'disabled'}` +
     ` maxConcurrentExecutions=${maxConcurrentExecutions}` +
     ` maxToolOutputBytes=${maxToolOutputBytes}` +
     ` bashMaxBufferBytes=${bashMaxBufferBytes}`,

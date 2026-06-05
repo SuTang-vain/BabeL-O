@@ -29,6 +29,11 @@ import {
   formatUserIntentGuidance,
   type UserIntentGuidance,
 } from './intentGuidance.js'
+import { deriveWorkingSet, formatWorkingSet } from './workingSet.js'
+import {
+  buildContextSelectionDiagnostics,
+  type ContextSelectionDiagnostics,
+} from './contextManager.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -80,6 +85,7 @@ export type AssembledContext = {
   memoryTruncated: boolean
   microcompactedEventCount: number
   microcompactMetrics: MicrocompactMetrics
+  selectionDiagnostics: ContextSelectionDiagnostics
 }
 
 export type RetainedSegmentMetadata = {
@@ -170,9 +176,12 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     latestPrompt: options.runtimeOptions.prompt,
     cwd: options.runtimeOptions.cwd,
   })
+  const workingSetEntries = deriveWorkingSet(compactAwareEvents, options.runtimeOptions.cwd)
+  const workingSet = formatWorkingSet(workingSetEntries)
+  const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget)
   const selectedEvents = protectToolPairs(
     compactAwareEvents,
-    selectRecentEvents(compactAwareEvents, budget),
+    rawSelectedEvents,
   )
   const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
   const compactSummary = compactBoundary?.event.summary.trim() ?? ''
@@ -248,6 +257,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
     userIntentGuidance: formatUserIntentGuidance(userIntentGuidance),
+    workingSet: workingSet || undefined,
     prompt: options.runtimeOptions.prompt,
   })
   const systemPromptBlocks: SystemPromptBlock[] = sections.map(s => ({
@@ -255,6 +265,19 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     cacheable: s.cacheable,
   }))
   const systemPrompt = sections.map(s => s.content).join('\n\n')
+  const selectionDiagnostics = buildContextSelectionDiagnostics({
+    maxTokens: budget.maxTokens,
+    projectMemory: budgetedProjectMemory,
+    sessionSummary: budgetedSessionSummary,
+    activeSkills: budgetedActiveSkills,
+    workingSetEntries,
+    events: compactAwareEvents,
+    selectedEvents,
+    rawSelectedEvents,
+    compactBoundaryId: compactBoundary ? eventIdentity(compactBoundary.event) : undefined,
+    fork: options.runtimeOptions.contextFork,
+    eventIdentity,
+  })
 
   return {
     systemPrompt,
@@ -276,6 +299,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     memoryTruncated: memoryTruncation.wasLineTruncated || memoryTruncation.wasByteTruncated,
     microcompactedEventCount: microcompactResult.metrics.compactedEventCount,
     microcompactMetrics: microcompactResult.metrics,
+    selectionDiagnostics,
   }
 }
 

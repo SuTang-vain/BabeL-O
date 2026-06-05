@@ -16,7 +16,7 @@ const inputSchema = z.object({
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
-  prompt: () => 'A powerful search tool built on ripgrep. Supports full regex syntax. Use this to search file content by pattern. Prefer this tool over bash grep commands.',
+  prompt: () => 'A powerful search tool built on ripgrep. Supports full regex syntax. Use this before Read when looking for symbols, errors, or filenames in a large repository. Prefer this tool over bash grep commands, then use Read with offset/limit for targeted ranges around relevant matches.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
@@ -33,7 +33,7 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
       )
       const lines = stdout.split('\n').filter(line => line.length > 0)
       if (lines.length > input.maxMatches) {
-        const truncated = lines.slice(0, input.maxMatches).join('\n') + '\n... (matches truncated for context budget)'
+        const truncated = lines.slice(0, input.maxMatches).join('\n') + targetedGrepTruncationHint(input.maxMatches)
         return { success: true, output: truncated }
       }
       return { success: true, output: stdout }
@@ -58,6 +58,10 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
       throw error
     }
   },
+}
+
+function targetedGrepTruncationHint(maxMatches: number): string {
+  return `\n... (${maxMatches} matches shown; more matches truncated for context budget. Narrow the pattern/path, then use Read with offset/limit around the relevant file lines.)`
 }
 
 async function grepFallback(
@@ -111,7 +115,7 @@ async function grepFallback(
 
   await visit(root)
   if (results.length > maxMatches) {
-    return results.slice(0, maxMatches).join('\n') + '\n... (matches truncated for context budget)'
+    return results.slice(0, maxMatches).join('\n') + targetedGrepTruncationHint(maxMatches)
   }
   return results.join('\n')
 }

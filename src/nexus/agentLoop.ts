@@ -44,13 +44,20 @@ import {
 } from './worktree.js'
 import { RuntimeAgentStepError } from './runtimeAgentStep.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
-
-type AgentSubTask = {
-  title: string
-  description?: string
-  requiresIsolation?: boolean
-  metadata?: Record<string, unknown>
-}
+import {
+  buildPreviousSubAgentsMetadata,
+  buildSubAgentLifecycleMetadata,
+  buildSubAgentSessionId,
+  buildTaskOrchestrationContext,
+  getSubAgentStatus,
+  getTaskDepth,
+  getTaskSessionEventRange,
+  normalizeSubTasks,
+  summarizeSubAgentSession,
+  toParentSubAgentReference,
+  type AgentSubTask,
+  type SubAgentApprovalInheritanceOptions,
+} from './agentLoopSubAgents.js'
 
 export type PlannerTaskPlan = {
   title: string
@@ -79,30 +86,7 @@ type ExecutorAgentResult = {
   subTasks?: AgentSubTask[]
 }
 
-export type SubAgentApprovalInheritanceOptions = {
-  inheritSessionApprovals?: boolean
-  sessionApprovalAllowTools?: string[]
-}
-
-type SubAgentLifecycleMetadata = {
-  agentId: string
-  parentAgentId: string
-  parentSessionId: string
-  parentTaskId: string
-  depth: number
-  agentType: 'subagent'
-  role: 'executor' | 'optimizer'
-  status: 'running' | 'completed' | 'failed' | 'cancelled'
-  transcriptPath: string
-  permissionInheritance: {
-    mode: 'role_policy'
-    inheritedAllowRules: string[]
-    inheritsOnceApprovals: false
-    inheritsSessionApprovals: boolean
-    inheritedSessionApprovalTools: string[]
-    requiresApproval: boolean
-  }
-}
+export type { SubAgentApprovalInheritanceOptions } from './agentLoopSubAgents.js'
 
 export type AgentStepRunner = <TInput, TOutput>(options: {
   roleDefinition: AgentRoleDefinition
@@ -115,29 +99,6 @@ function getCancelledTaskSession(sessionId: string): SessionSnapshot | null {
     return session.phase === 'cancelled' ? session : null
   } catch {
     return null
-  }
-}
-
-function getSubAgentStatus(metadata?: Record<string, unknown>): string | undefined {
-  const subAgent = metadata?.subAgent
-  if (typeof subAgent !== 'object' || subAgent === null) return undefined
-  if (!('status' in subAgent) || typeof subAgent.status !== 'string') return undefined
-  return subAgent.status
-}
-
-function buildPreviousSubAgentsMetadata(
-  task: NexusTask,
-  executorResult?: ExecutorAgentResult | null,
-): Record<string, unknown> {
-  const subAgent = executorResult?.metadata?.subAgent
-  if (typeof subAgent !== 'object' || subAgent === null) return {}
-  const status = (subAgent as { status?: unknown }).status
-  if (status !== 'failed' && status !== 'cancelled') return {}
-  const previous = Array.isArray(task.metadata?.previousSubAgents)
-    ? task.metadata.previousSubAgents
-    : []
-  return {
-    previousSubAgents: [...previous, subAgent],
   }
 }
 
@@ -385,12 +346,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
       let isIsolated = false
       let isolatedWorktreeMerged = false
       let taskCwd = cwd
+      let taskAllowedPaths: string[] | undefined
 
       try {
         if (requiresIsolation) {
           try {
             if (await isGitRepository(cwd)) {
               taskCwd = await createWorktree(cwd, task.taskId)
+              taskAllowedPaths = [taskCwd]
               isIsolated = true
               recordTaskSessionEvent(sessionId, 'worktree_created', { taskId: task.taskId, worktreePath: taskCwd })
             } else {
@@ -610,6 +573,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                   delegatedSubTaskIds?: string[]
                 }
                 cwd?: string
+                allowedPaths?: string[]
               },
               ExecutorAgentResult
             >({
@@ -626,6 +590,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                   maxSubAgentDepth,
                 ),
                 cwd: taskCwd,
+                allowedPaths: taskAllowedPaths,
               },
             })
             executorSuccess = executorResult.success
@@ -687,7 +652,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             setTaskSessionPhase(sessionId, 'reviewing')
             try {
               const criticOutput = await stepRunner<
-                { sessionId: string; queueId: string; taskId: string; title: string; description?: string; result: string; executorMetadata?: Record<string, unknown>; cwd?: string },
+                { sessionId: string; queueId: string; taskId: string; title: string; description?: string; result: string; executorMetadata?: Record<string, unknown>; cwd?: string; allowedPaths?: string[] },
                 { approved: boolean; reason?: string; retryTaskTitle?: string; retryTaskDescription?: string }
               >({
                 roleDefinition: CRITIC_ROLE,
@@ -700,6 +665,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                   result: executorResult.result,
                   executorMetadata: executorResult.metadata,
                   cwd: taskCwd,
+                  allowedPaths: taskAllowedPaths,
                 },
               })
 
@@ -906,120 +872,6 @@ function handleWorktreeMergeConflict(options: {
   })
 }
 
-function buildSubAgentSessionId(parentSessionId: string, task: NexusTask): string {
-  return task.retryCount > 0
-    ? `${parentSessionId}-sub-${task.taskId}-retry-${task.retryCount}`
-    : `${parentSessionId}-sub-${task.taskId}`
-}
-
-function buildSubAgentLifecycleMetadata(options: {
-  parentSessionId: string
-  subSessionId: string
-  task: NexusTask
-  role: 'executor' | 'optimizer'
-  approvalInheritance?: SubAgentApprovalInheritanceOptions
-}): SubAgentLifecycleMetadata {
-  const depth = getTaskDepth(options.task)
-  const agentId = `${options.parentSessionId}:subagent:${options.task.taskId}`
-  const inheritedAllowRules = roleAllowedTools(options.role)
-  const inheritedSessionApprovalTools = resolveInheritedSessionApprovalTools(
-    inheritedAllowRules,
-    options.approvalInheritance,
-  )
-  return {
-    agentId,
-    parentAgentId: options.parentSessionId,
-    parentSessionId: options.parentSessionId,
-    parentTaskId: String(options.task.metadata?.parentTaskId ?? options.task.taskId),
-    depth,
-    agentType: 'subagent',
-    role: options.role,
-    status: 'running',
-    transcriptPath: `nexus://sessions/${options.subSessionId}/events`,
-    permissionInheritance: {
-      mode: 'role_policy',
-      inheritedAllowRules,
-      inheritsOnceApprovals: false,
-      inheritsSessionApprovals: inheritedSessionApprovalTools.length > 0,
-      inheritedSessionApprovalTools,
-      requiresApproval: roleRequiresApproval(options.role),
-    },
-  }
-}
-
-function roleAllowedTools(role: 'executor' | 'optimizer'): string[] {
-  const roleDefinition = role === 'optimizer' ? OPTIMIZER_ROLE : EXECUTOR_ROLE
-  return [...roleDefinition.toolPolicy.allowedTools]
-}
-
-function resolveInheritedSessionApprovalTools(
-  inheritedAllowRules: string[],
-  approvalInheritance?: SubAgentApprovalInheritanceOptions,
-): string[] {
-  if (!approvalInheritance?.inheritSessionApprovals) return []
-  const requested = approvalInheritance.sessionApprovalAllowTools?.length
-    ? approvalInheritance.sessionApprovalAllowTools
-    : inheritedAllowRules
-  return Array.from(new Set(requested.filter(tool => inheritedAllowRules.includes(tool)))).sort()
-}
-
-function roleRequiresApproval(role: 'executor' | 'optimizer'): boolean {
-  const roleDefinition = role === 'optimizer' ? OPTIMIZER_ROLE : EXECUTOR_ROLE
-  return roleDefinition.toolPolicy.requiresApproval
-}
-
-function getTaskSessionEventRange(session: SessionSnapshot): { firstEventId?: string; lastEventId?: string; eventCount: number } {
-  const first = session.events[0]
-  const last = session.events.at(-1)
-  return {
-    firstEventId: first && 'eventId' in first ? first.eventId : undefined,
-    lastEventId: last && 'eventId' in last ? last.eventId : undefined,
-    eventCount: session.events.length,
-  }
-}
-
-function summarizeSubAgentSession(session: SessionSnapshot): string {
-  if (session.result) return session.result
-  if (session.terminalReason?.message) return session.terminalReason.message
-  return session.phase === 'completed'
-    ? 'Completed successfully via sub-agent session'
-    : `Sub-agent session ended with phase ${session.phase}`
-}
-
-function toParentSubAgentReference(metadata: SubAgentLifecycleMetadata & Record<string, unknown>, subSessionId: string): Record<string, unknown> {
-  return {
-    agentId: metadata.agentId,
-    subSessionId,
-    parentTaskId: metadata.parentTaskId,
-    depth: metadata.depth,
-    status: metadata.status,
-    transcriptPath: metadata.transcriptPath,
-    resultEventRange: metadata.resultEventRange,
-    summary: metadata.summary,
-  }
-}
-
-function buildTaskOrchestrationContext(
-  task: NexusTask,
-  enableSubAgents: boolean,
-  maxSubAgentDepth: number,
-): {
-  enableSubAgents: boolean
-  currentDepth: number
-  maxDepth: number
-  remainingDepth: number
-  delegatedSubTaskIds?: string[]
-} {
-  const currentDepth = getTaskDepth(task)
-  return {
-    enableSubAgents,
-    currentDepth,
-    maxDepth: maxSubAgentDepth,
-    remainingDepth: Math.max(0, maxSubAgentDepth - currentDepth),
-    delegatedSubTaskIds: getDelegatedSubTaskIds(task),
-  }
-}
-
 function maybeDelegateSubTasks(options: {
   sessionId: string
   task: NexusTask
@@ -1086,38 +938,4 @@ function maybeDelegateSubTasks(options: {
 
 function getParentTaskSnapshot(queueId: string, taskId: string): NexusTask | undefined {
   return listNexusTasks(queueId).tasks.find(task => task.taskId === taskId)
-}
-
-function normalizeSubTasks(
-  subTasks: AgentSubTask[],
-  maxSubTasksPerTask: number,
-): AgentSubTask[] {
-  const seenTitles = new Set<string>()
-  const normalized: AgentSubTask[] = []
-  for (const subTask of subTasks) {
-    const title = subTask.title.trim()
-    if (!title || seenTitles.has(title)) continue
-    seenTitles.add(title)
-    normalized.push({
-      ...subTask,
-      title,
-      description: subTask.description?.trim() || undefined,
-    })
-    if (normalized.length >= maxSubTasksPerTask) break
-  }
-  return normalized
-}
-
-function getTaskDepth(task: NexusTask): number {
-  const rawDepth = task.metadata?.depth
-  return typeof rawDepth === 'number' && Number.isInteger(rawDepth) && rawDepth >= 0
-    ? rawDepth
-    : 0
-}
-
-function getDelegatedSubTaskIds(task: NexusTask): string[] | undefined {
-  const rawIds = task.metadata?.delegatedSubTaskIds
-  if (!Array.isArray(rawIds)) return undefined
-  const ids = rawIds.filter(id => typeof id === 'string')
-  return ids.length > 0 ? ids : undefined
 }

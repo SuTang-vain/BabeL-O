@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool } from '../tools/Tool.js'
 import type { NexusTask } from '../shared/task.js'
@@ -20,6 +21,7 @@ import {
   lastHookUpdatedInput,
 } from './hooks.js'
 import {
+  absorbRemoteToolRunnerMetrics,
   buildRuntimeExecutionMetricsEvent,
   createRuntimeExecutionMetrics,
   parseLocalRuntimeIntent,
@@ -106,9 +108,10 @@ export class LocalCodingRuntime implements NexusRuntime {
 
     const metrics = createRuntimeExecutionMetrics()
 
-    for await (const event of this._executeInner(options, (duration) => {
+    for await (const event of this._executeInner(options, (duration, remoteRunner) => {
       metrics.toolCallCount += 1
       metrics.toolRoundtripDurationMs += duration
+      absorbRemoteToolRunnerMetrics(metrics, remoteRunner)
     })) {
       yield event
     }
@@ -118,7 +121,7 @@ export class LocalCodingRuntime implements NexusRuntime {
 
   private async *_executeInner(
     options: RuntimeExecuteOptions,
-    recordToolRun: (duration: number) => void,
+    recordToolRun: (duration: number, remoteRunner?: RemoteToolRunnerDiagnostics) => void,
   ): AsyncIterable<NexusEvent> {
     try {
       const intent = parseLocalRuntimeIntent(options.prompt)
@@ -366,8 +369,8 @@ export class LocalCodingRuntime implements NexusRuntime {
       }
 
       const toolStartMs = performance.now()
-      const result = await executeToolSafely(tool, toolInput, options)
-      recordToolRun(performance.now() - toolStartMs)
+      const result = await executeToolSafely(tool, toolInput, options, { toolUseId })
+      recordToolRun(performance.now() - toolStartMs, result.remoteRunner)
       if (result.kind === 'error') {
         yield {
           type: 'error',
@@ -388,6 +391,7 @@ export class LocalCodingRuntime implements NexusRuntime {
         output: result.output,
         truncated: result.truncated,
         originalBytes: result.originalBytes,
+        remoteRunner: result.remoteRunner,
       }
 
       const postToolHooks = await executeRuntimeHooks(
@@ -521,7 +525,7 @@ export class LocalCodingRuntime implements NexusRuntime {
   private async *executeFileQuestion(
     options: RuntimeExecuteOptions,
     intent: { path: string; question: string },
-    recordToolRun: (duration: number) => void,
+    recordToolRun: (duration: number, remoteRunner?: RemoteToolRunnerDiagnostics) => void,
   ): AsyncIterable<NexusEvent> {
     const tool = this.tools.get('Read')
     if (!tool) {
@@ -562,8 +566,8 @@ export class LocalCodingRuntime implements NexusRuntime {
     }
 
     const toolStartMs = performance.now()
-    const result = await executeToolSafely(tool, toolInput, options)
-    recordToolRun(performance.now() - toolStartMs)
+    const result = await executeToolSafely(tool, toolInput, options, { toolUseId })
+    recordToolRun(performance.now() - toolStartMs, result.remoteRunner)
     if (result.kind === 'error') {
       yield {
         type: 'error',
@@ -584,6 +588,7 @@ export class LocalCodingRuntime implements NexusRuntime {
       output: result.output,
       truncated: result.truncated,
       originalBytes: result.originalBytes,
+      remoteRunner: result.remoteRunner,
     }
 
     const answer = result.success

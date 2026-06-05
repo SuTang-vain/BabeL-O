@@ -39,6 +39,7 @@ import { ConfigManager } from '../src/shared/config.js'
 import { closeNexusSession } from '../src/nexus/sessionLifecycle.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
 import { allowAllTools } from '../src/runtime/LocalCodingRuntime.js'
+import { InMemoryRemoteToolRunner } from '../src/runtime/remoteRunner.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { logger } from '../src/shared/logger.js'
 
@@ -1274,6 +1275,59 @@ test('runtime agent step rejects structured roles on non-json models', async () 
   }
 })
 
+test('runtime agent step passes remote runner and allowed paths to runtime tools', async () => {
+  resetTaskSessionsForTest()
+  const workspace = mkdtempSync(join(tmpdir(), 'babel-o-agent-step-remote-'))
+  const sessionId = 'test-agent-step-remote-runner'
+  createTaskSession({ sessionId, cwd: workspace })
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    capabilities: { tools: ['Write'], writeEnabled: true },
+    handler: () => ({ kind: 'result', success: true, output: 'ok' }),
+  })
+  const executeOptions: any[] = []
+
+  try {
+    const stepRunner = createRuntimeAgentStepRunner({
+      cwd: workspace,
+      executionEnvironment: 'remote',
+      remoteRunner,
+      allowedPaths: [workspace],
+      runtimeFactory: async () => ({
+        async *executeStream(options: any) {
+          executeOptions.push(options)
+          yield {
+            type: 'result',
+            schemaVersion: '2026-05-21.babel-o.v1',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            success: true,
+            message: JSON.stringify({ taskId: 'task-remote-step', success: true, result: 'remote step complete' }),
+          }
+        },
+      } as any),
+    })
+
+    const output = await stepRunner({
+      roleDefinition: EXECUTOR_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-remote-step',
+        title: 'Write remote file',
+      },
+    }) as any
+
+    assert.equal(output.success, true)
+    assert.equal(executeOptions.length, 1)
+    assert.equal(executeOptions[0].executionEnvironment, 'remote')
+    assert.equal(executeOptions[0].remoteRunner, remoteRunner)
+    assert.equal(executeOptions[0].cwd, workspace)
+    assert.deepEqual(executeOptions[0].allowedPaths, [workspace])
+  } finally {
+    rmSync(workspace, { recursive: true, force: true })
+  }
+})
+
 test('runtime agent step surfaces diagnostics on structured output parse failure', async () => {
   resetTaskSessionsForTest()
   const sessionId = 'test-agent-step-diagnostics'
@@ -1784,6 +1838,7 @@ test('runAgentLoop runs with requiresIsolation and successfully manages Git Work
         stepRunnerCwd = input.cwd
         assert.ok(input.cwd)
         assert.ok(input.cwd.includes('.babel-o/worktrees'))
+        assert.deepEqual(input.allowedPaths, [input.cwd])
 
         writeFileSync(join(input.cwd, 'isolated.txt'), 'hello isolated content', 'utf8')
 
@@ -1797,6 +1852,7 @@ test('runAgentLoop runs with requiresIsolation and successfully manages Git Work
       if (roleDefinition.role === 'critic') {
         assert.ok(input.cwd)
         assert.ok(input.cwd.includes('.babel-o/worktrees'))
+        assert.deepEqual(input.allowedPaths, [input.cwd])
 
         const fileContent = readFileSync(join(input.cwd, 'isolated.txt'), 'utf8')
         assert.equal(fileContent, 'hello isolated content')

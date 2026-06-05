@@ -19,6 +19,7 @@ import {
   mergeHookRetryHints,
 } from './hooks.js'
 import {
+  absorbRemoteToolRunnerMetrics,
   buildRuntimeErrorEvent,
   buildRuntimeResultEvent,
   resolveProviderToolCallInput,
@@ -335,8 +336,12 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  const result = await executeToolSafely(tool, parsed.data, runtimeOptions, { timeout: TOOL_EXECUTION_TIMEOUT_MS })
+  const result = await executeToolSafely(tool, parsed.data, runtimeOptions, {
+    timeout: TOOL_EXECUTION_TIMEOUT_MS,
+    toolUseId: toolCall.id,
+  })
   metrics.toolRoundtripDurationMs += performance.now() - toolStartMs
+  absorbRemoteToolRunnerMetrics(metrics, result.remoteRunner)
 
   if (tool.name === 'Read' && result.kind === 'result' && result.success && parsed.data && typeof parsed.data === 'object' && 'path' in parsed.data) {
     const readPath = resolve(runtimeOptions.cwd, String((parsed.data as { path: string }).path))
@@ -364,6 +369,7 @@ export async function* executeProviderToolCall(options: {
     output: result.output,
     truncated: result.truncated,
     originalBytes: result.originalBytes,
+    remoteRunner: result.remoteRunner,
   }
 
   const postHookName = result.success ? 'PostToolUse' : 'PostToolUseFailure'

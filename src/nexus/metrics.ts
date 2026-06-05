@@ -78,8 +78,14 @@ export class NexusMetrics {
   private latestLegacyContextCeiling?: number
   private cachePreservationModeCount = 0
   private longContextUtilizationModeCount = 0
+  private prefixCacheImmutableRatioTotal = 0
+  private prefixCacheImmutableRatioCount = 0
+  private prefixCacheVolatileContentLastCount = 0
+  private latestPrefixCacheFingerprint?: string
   private compactSummaryLatencyTotalMs = 0
   private compactSummaryLatencyCount = 0
+  private remoteToolCallTotalCount = 0
+  private remoteToolRunnerDurationTotalMs = 0
 
   recordProviderFirstToken(ms: number): void {
     this.providerFirstTokenTotalMs += ms
@@ -98,6 +104,11 @@ export class NexusMetrics {
   recordToolCalls(count: number, durationMs: number): void {
     this.toolCallTotalCount += count
     this.toolRoundtripTotalMs += durationMs
+  }
+
+  recordRemoteToolCalls(count: number, durationMs: number): void {
+    this.remoteToolCallTotalCount += count
+    this.remoteToolRunnerDurationTotalMs += durationMs
   }
 
   recordContextChars(charsIn: number, charsOut: number): void {
@@ -122,11 +133,20 @@ export class NexusMetrics {
     legacyContextCeiling?: number
     cachePreservationMode?: boolean
     longContextUtilizationMode?: boolean
+    prefixCacheImmutableRatio?: number
+    prefixCacheVolatileContentLast?: boolean
+    prefixCacheFingerprint?: string
   }): void {
     if (options.effectiveContextCeiling !== undefined) this.latestEffectiveContextCeiling = options.effectiveContextCeiling
     if (options.legacyContextCeiling !== undefined) this.latestLegacyContextCeiling = options.legacyContextCeiling
     if (options.cachePreservationMode) this.cachePreservationModeCount += 1
     if (options.longContextUtilizationMode) this.longContextUtilizationModeCount += 1
+    if (options.prefixCacheImmutableRatio !== undefined) {
+      this.prefixCacheImmutableRatioTotal += options.prefixCacheImmutableRatio
+      this.prefixCacheImmutableRatioCount += 1
+    }
+    if (options.prefixCacheVolatileContentLast) this.prefixCacheVolatileContentLastCount += 1
+    if (options.prefixCacheFingerprint !== undefined) this.latestPrefixCacheFingerprint = options.prefixCacheFingerprint
   }
 
   recordCompactSummaryLatency(ms: number): void {
@@ -239,6 +259,11 @@ export class NexusMetrics {
         count: this.toolCallTotalCount,
         avgMs: this.toolCallTotalCount > 0 ? round(this.toolRoundtripTotalMs / this.toolCallTotalCount) : 0,
       },
+      remoteToolRunnerDurationMs: {
+        totalMs: round(this.remoteToolRunnerDurationTotalMs),
+        count: this.remoteToolCallTotalCount,
+        avgMs: this.remoteToolCallTotalCount > 0 ? round(this.remoteToolRunnerDurationTotalMs / this.remoteToolCallTotalCount) : 0,
+      },
       contextCharsIn: this.contextCharsInTotal,
       contextCharsOut: this.contextCharsOutTotal,
       tokenUsage: {
@@ -257,6 +282,12 @@ export class NexusMetrics {
         legacyContextCeiling: this.latestLegacyContextCeiling,
         cachePreservationModeCount: this.cachePreservationModeCount,
         longContextUtilizationModeCount: this.longContextUtilizationModeCount,
+        prefixCache: {
+          immutableRatioAvg: this.prefixCacheImmutableRatioCount > 0 ? round(this.prefixCacheImmutableRatioTotal / this.prefixCacheImmutableRatioCount) : 0,
+          sampleCount: this.prefixCacheImmutableRatioCount,
+          volatileContentLastRatio: this.prefixCacheImmutableRatioCount > 0 ? round(this.prefixCacheVolatileContentLastCount / this.prefixCacheImmutableRatioCount) : 0,
+          latestFingerprint: this.latestPrefixCacheFingerprint,
+        },
       },
       compactSummaryLatencyMs: {
         totalMs: round(this.compactSummaryLatencyTotalMs),

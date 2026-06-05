@@ -5,7 +5,13 @@ import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
-import { PendingPermissionRegistry } from '../src/shared/session.js'
+import { InMemoryRemoteToolRunner } from '../src/runtime/remoteRunner.js'
+import {
+  PendingPermissionRegistry,
+  type PendingPermissionBackend,
+  type PendingPermissionEntry,
+  type PermissionResolution,
+} from '../src/shared/session.js'
 
 test('interactive permission approval flow via HTTP POST', async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-approve-${Date.now()}`)
@@ -140,6 +146,121 @@ test('interactive permission denial flow via HTTP POST', async () => {
   assert.ok(!events.some((e: any) => e.type === 'tool_completed'))
 
   await app.close()
+})
+
+test('remote execution waits for permission before dispatching runner', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-permission-approve-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    handler: () => ({ kind: 'result', success: true, output: { remote: true } }),
+  })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'], remoteRunner })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, remoteRunner })
+  const sessionId = `session-remote-approve-${Date.now()}`
+
+  try {
+    const executePromise = app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'write remote.txt "remote permission"', cwd, sessionId, executionEnvironment: 'remote' },
+    })
+
+    let toolUseId = ''
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 100))
+      if (remoteRunner.requests.length > 0) break
+      const sessionRes = await app.inject({ method: 'GET', url: `/v1/sessions/${sessionId}` })
+      if (sessionRes.statusCode !== 200) continue
+      const reqEvent = sessionRes.json().session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        break
+      }
+    }
+
+    assert.ok(toolUseId, 'Should request permission before remote dispatch')
+    assert.equal(remoteRunner.requests.length, 0)
+
+    const approveRes = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/approve`,
+      payload: { toolUseId },
+    })
+    assert.equal(approveRes.statusCode, 200)
+
+    const response = await executePromise
+    assert.equal(response.statusCode, 200)
+    assert.equal(response.json().success, true)
+    assert.equal(remoteRunner.requests.length, 1)
+    assert.equal(remoteRunner.requests[0].toolName, 'Write')
+
+    const auditsRes = await app.inject({ method: 'GET', url: `/v1/sessions/${sessionId}/permission-audits` })
+    const auditsBody = auditsRes.json()
+    assert.equal(auditsBody.audits.length, 1)
+    assert.equal(auditsBody.audits[0].toolName, 'Write')
+    assert.equal(auditsBody.audits[0].decision, 'approved')
+  } finally {
+    await app.close()
+  }
+})
+
+test('remote execution denial does not dispatch runner and persists audit', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-remote-permission-deny-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  const remoteRunner = new InMemoryRemoteToolRunner({
+    handler: () => ({ kind: 'result', success: true, output: { remote: true } }),
+  })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'], remoteRunner })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, remoteRunner })
+  const sessionId = `session-remote-deny-${Date.now()}`
+
+  try {
+    const executePromise = app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'write remote.txt "remote denied"', cwd, sessionId, executionEnvironment: 'remote' },
+    })
+
+    let toolUseId = ''
+    for (let i = 0; i < 30; i++) {
+      await new Promise(r => setTimeout(r, 100))
+      const sessionRes = await app.inject({ method: 'GET', url: `/v1/sessions/${sessionId}` })
+      if (sessionRes.statusCode !== 200) continue
+      const reqEvent = sessionRes.json().session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        break
+      }
+    }
+
+    assert.ok(toolUseId, 'Should request permission before remote denial')
+    const denyRes = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/deny`,
+      payload: { toolUseId, reason: 'remote denied by test' },
+    })
+    assert.equal(denyRes.statusCode, 200)
+
+    const response = await executePromise
+    assert.equal(response.statusCode, 200)
+    assert.equal(response.json().success, false)
+    assert.equal(remoteRunner.requests.length, 0)
+
+    const finalSessionRes = await app.inject({ method: 'GET', url: `/v1/sessions/${sessionId}` })
+    const events = finalSessionRes.json().session.events
+    assert.ok(events.some((e: any) => e.type === 'permission_response' && e.approved === false))
+    assert.ok(events.some((e: any) => e.type === 'tool_denied'))
+    assert.ok(!events.some((e: any) => e.type === 'tool_completed'))
+
+    const auditsRes = await app.inject({ method: 'GET', url: `/v1/sessions/${sessionId}/permission-audits` })
+    const auditsBody = auditsRes.json()
+    assert.equal(auditsBody.audits.length, 1)
+    assert.equal(auditsBody.audits[0].toolName, 'Write')
+    assert.equal(auditsBody.audits[0].decision, 'denied')
+    assert.equal(auditsBody.audits[0].reason, 'remote denied by test')
+  } finally {
+    await app.close()
+  }
 })
 
 test('interactive permission approval via WebSocket stream', async () => {
@@ -386,3 +507,82 @@ test('pending permission registry expires unresolved requests', async () => {
 
   registry.resetForTest()
 })
+
+test('pending permission registry delegates to a replaceable backend', async () => {
+  const registry = PendingPermissionRegistry.getInstance()
+  registry.resetForTest()
+  registry.configureForTest({ disableSweeper: true })
+  const backend = new RecordingPermissionBackend()
+  registry.setBackend(backend)
+
+  const pending = registry.register('session-backend', 'tool-backend')
+  assert.equal(backend.registered.length, 1)
+  assert.equal(registry.pendingCount(), 1)
+  assert.equal(registry.resolve('session-backend', 'tool-backend', {
+    approved: true,
+    reason: 'backend approved',
+  }), true)
+
+  const resolution = await pending
+  assert.deepEqual(resolution, {
+    approved: true,
+    reason: 'backend approved',
+  })
+  assert.equal(registry.pendingCount(), 0)
+
+  registry.resetForTest()
+})
+
+class RecordingPermissionBackend implements PendingPermissionBackend {
+  readonly registered: PendingPermissionEntry[] = []
+  private readonly pending = new Map<string, PendingPermissionEntry>()
+
+  register(entry: PendingPermissionEntry): void {
+    this.registered.push(entry)
+    this.pending.set(this.key(entry.sessionId, entry.toolUseId), entry)
+  }
+
+  resolve(sessionId: string, toolUseId: string, resolution: PermissionResolution): boolean {
+    const key = this.key(sessionId, toolUseId)
+    const entry = this.pending.get(key)
+    if (!entry) return false
+    entry.resolve(resolution)
+    this.pending.delete(key)
+    return true
+  }
+
+  resolveSession(sessionId: string, resolution: PermissionResolution): boolean {
+    let resolvedAny = false
+    for (const [key, entry] of this.pending.entries()) {
+      if (entry.sessionId !== sessionId) continue
+      entry.resolve(resolution)
+      this.pending.delete(key)
+      resolvedAny = true
+    }
+    return resolvedAny
+  }
+
+  sweepExpired(nowMs: number): number {
+    let expired = 0
+    for (const [key, entry] of this.pending.entries()) {
+      if (entry.expiresAt > nowMs) continue
+      entry.resolve({ approved: false, reason: 'Permission request timed out' })
+      this.pending.delete(key)
+      expired += 1
+    }
+    return expired
+  }
+
+  pendingCount(): number {
+    return this.pending.size
+  }
+
+  reset(resolution: PermissionResolution): void {
+    for (const entry of this.pending.values()) entry.resolve(resolution)
+    this.pending.clear()
+  }
+
+  private key(sessionId: string, toolUseId: string): string {
+    return `${sessionId}:${toolUseId}`
+  }
+}
