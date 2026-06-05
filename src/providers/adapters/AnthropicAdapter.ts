@@ -12,6 +12,10 @@ import { getProvider, getModel } from '../registry.js'
 import { withRetry } from '../retry.js'
 
 const MINIMAX_TOOL_CALL_OPEN = '<minimax:tool_call'
+const MINIMAX_TOOL_CALL_CLOSE = '</minimax:tool_call>'
+const MINIMAX_BRACKET_MARKER = ']<]minimax[>['
+const MINIMAX_BRACKET_TOOL_CALL_OPEN = '<tool_call'
+const MINIMAX_BRACKET_TOOL_CALL_CLOSE = '</tool_call>'
 
 const MODEL_MAPPING: Record<
   string,
@@ -88,9 +92,9 @@ function createMinimaxTextToolParser(): {
   const parseCompleteCalls = (): StreamDelta[] => {
     const deltas: StreamDelta[] = []
     while (true) {
-      const start = buffer.indexOf(MINIMAX_TOOL_CALL_OPEN)
-      if (start === -1) {
-        const keepChars = MINIMAX_TOOL_CALL_OPEN.length - 1
+      const knownCall = findNextMinimaxTextToolCall(buffer)
+      if (!knownCall) {
+        const keepChars = Math.max(MINIMAX_TOOL_CALL_OPEN.length, MINIMAX_BRACKET_MARKER.length + MINIMAX_BRACKET_TOOL_CALL_OPEN.length) - 1
         if (buffer.length > keepChars) {
           const emitText = buffer.slice(0, buffer.length - keepChars)
           if (emitText) deltas.push({ type: 'text', text: emitText })
@@ -99,14 +103,14 @@ function createMinimaxTextToolParser(): {
         break
       }
 
-      const before = buffer.slice(0, start)
+      const before = buffer.slice(0, knownCall.start)
       if (before) deltas.push({ type: 'text', text: before })
-      buffer = buffer.slice(start)
+      buffer = buffer.slice(knownCall.start)
 
-      const close = buffer.indexOf('</minimax:tool_call>')
+      const close = buffer.indexOf(knownCall.closeTag)
       if (close === -1) break
 
-      const rawCall = buffer.slice(0, close + '</minimax:tool_call>'.length)
+      const rawCall = buffer.slice(0, close + knownCall.closeTag.length)
       buffer = buffer.slice(rawCall.length)
       const parsed = parseMinimaxTextToolCall(rawCall, counter++)
       deltas.push(...parsed)
@@ -130,15 +134,21 @@ function createMinimaxTextToolParser(): {
   }
 }
 
-function parseMinimaxTextToolCall(rawCall: string, index: number): StreamDelta[] {
-  const name = extractXmlAttribute(rawCall, 'invoke', 'name')
-  if (!name) return []
-  const input: Record<string, unknown> = {}
-  const parameterPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g
-  let match: RegExpExecArray | null
-  while ((match = parameterPattern.exec(rawCall)) !== null) {
-    input[match[1]!] = decodeXmlEntities(match[2] ?? '')
+function findNextMinimaxTextToolCall(buffer: string): { start: number; closeTag: string } | undefined {
+  const standardStart = buffer.indexOf(MINIMAX_TOOL_CALL_OPEN)
+  const bracketStart = buffer.indexOf(`${MINIMAX_BRACKET_MARKER}${MINIMAX_BRACKET_TOOL_CALL_OPEN}`)
+  if (standardStart === -1 && bracketStart === -1) return undefined
+  if (bracketStart !== -1 && (standardStart === -1 || bracketStart < standardStart)) {
+    return { start: bracketStart, closeTag: `${MINIMAX_BRACKET_MARKER}${MINIMAX_BRACKET_TOOL_CALL_CLOSE}` }
   }
+  return { start: standardStart, closeTag: MINIMAX_TOOL_CALL_CLOSE }
+}
+
+function parseMinimaxTextToolCall(rawCall: string, index: number): StreamDelta[] {
+  const normalizedCall = normalizeMinimaxTextToolCall(rawCall)
+  const name = extractXmlAttribute(normalizedCall, 'invoke', 'name')
+  if (!name) return []
+  const input = extractMinimaxToolInput(normalizedCall)
   const id = `minimax_tool_${index + 1}`
   return [
     { type: 'tool_use_start', id, name },
@@ -148,10 +158,41 @@ function parseMinimaxTextToolCall(rawCall: string, index: number): StreamDelta[]
   ]
 }
 
+function normalizeMinimaxTextToolCall(rawCall: string): string {
+  if (!rawCall.includes(MINIMAX_BRACKET_MARKER)) return rawCall
+  return rawCall.split(MINIMAX_BRACKET_MARKER).join('')
+}
+
+function extractMinimaxToolInput(rawCall: string): Record<string, unknown> {
+  const input: Record<string, unknown> = {}
+  const parameterPattern = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g
+  let match: RegExpExecArray | null
+  while ((match = parameterPattern.exec(rawCall)) !== null) {
+    input[match[1]!] = decodeXmlEntities(match[2] ?? '')
+  }
+  if (Object.keys(input).length > 0) return input
+
+  const invokeBody = extractXmlBody(rawCall, 'invoke')
+  if (!invokeBody) return input
+  const directChildPattern = /<([A-Za-z_][\w.-]*)>([\s\S]*?)<\/\1>/g
+  while ((match = directChildPattern.exec(invokeBody)) !== null) {
+    input[match[1]!] = decodeXmlEntities(match[2] ?? '')
+  }
+  return input
+}
+
 function extractXmlAttribute(raw: string, tag: string, attribute: string): string | undefined {
   const pattern = new RegExp(`<${tag}\\s+[^>]*${attribute}="([^"]+)"`)
   const match = pattern.exec(raw)
   return match?.[1]
+}
+
+function extractXmlBody(raw: string, tag: string): string | undefined {
+  const pattern = new RegExp(`<${tag}\\s+[^>]*>[\\s\\S]*?<\\/${tag}>`)
+  const match = pattern.exec(raw)
+  if (!match?.[0]) return undefined
+  const openEnd = match[0].indexOf('>')
+  return match[0].slice(openEnd + 1, -`</${tag}>`.length)
 }
 
 function decodeXmlEntities(value: string): string {

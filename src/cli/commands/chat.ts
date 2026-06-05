@@ -21,7 +21,7 @@ import {
 import { formatSessionBanner, renderWelcome } from '../welcome.js'
 import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
-import { modelRegistry } from '../../providers/registry.js'
+import { getProvider, modelRegistry, providerRegistry } from '../../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction, type ProviderRecoveryKind } from '../../runtime/providerRecovery.js'
 import { createId } from '../../shared/id.js'
@@ -1176,6 +1176,8 @@ export function formatContextAnalysis(analysis: Parameters<typeof openContextVie
     `remaining ${formatTokenCount(analysis.diagnostics.remainingTokens)} (${analysis.diagnostics.remainingPercent}%) · compact headroom ${formatTokenCount(analysis.diagnostics.compactRemainingTokens)} · blocking headroom ${formatTokenCount(analysis.diagnostics.blockingRemainingTokens)}`,
     `usage input=${formatTokenCompact(usage.inputTokens)} cached=${formatTokenCompact(usage.cacheReadInputTokens)} output=${formatTokenCompact(usage.outputTokens)} reasoning≈${formatTokenCompact(usage.estimatedReasoningTokens)}`,
     `cache policy read=${formatPercent(cache.cacheReadRatio, 1)} cacheable=${formatPercent(cache.cacheableSystemPromptRatio, 1)} · preserving=${yesNo(cache.cachePreservationMode)} long-context=${yesNo(cache.longContextUtilizationMode)} · ceiling ${formatTokenCompact(cache.effectiveContextCeiling)}/${formatTokenCompact(cache.legacyContextCeiling)} legacy`,
+    `ceiling source=${cache.policySource} model.window=${formatTokenCompact(cache.modelContextWindow)} reserved_output=${formatTokenCompact(cache.reservedOutputTokens)} provider_buffer=${formatTokenCompact(cache.providerSafetyBufferTokens)}${cache.envMaxContextTokens !== undefined ? ` env_cap=${formatTokenCompact(cache.envMaxContextTokens)}` : ''}`,
+    `thresholds warning=${formatTokenCompact(cache.warningThresholdTokens)} (${cache.warningThresholdPercent}%) compact=${formatTokenCompact(cache.compactThresholdTokens)} (${cache.compactThresholdPercent}%) blocking=${formatTokenCompact(cache.blockingLimitTokens)}`,
     `cache policy reason ${cache.reason}`,
     `microcompact saved≈${formatTokenCompact(analysis.sections.microcompactEstimatedTokensSaved)} tokens · duplicate results=${analysis.sections.microcompactDeduplicatedToolResultCount}`,
     `auto compact floor ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.currentTokens)}/${formatTokenCompact(analysis.diagnostics.autoCompactFloor.thresholdTokens)} (${analysis.diagnostics.autoCompactFloor.thresholdPercent}%) · budget ${formatTokenCompact(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens)}`,
@@ -1346,7 +1348,7 @@ async function runModelConfigWizard() {
 
   console.log(chalk.bold.cyan('\n--- BabeL-O Model Config Wizard ---'))
 
-  const providers = ['anthropic', 'openai', 'deepseek', 'zhipu', 'minimax', 'local']
+  const providers = providerRegistry.map(item => item.id)
   const provider = await chooseInteractivePromise('Select provider:', providers)
   if (!provider) {
     console.log(chalk.yellow('Wizard cancelled.'))
@@ -1361,18 +1363,22 @@ async function runModelConfigWizard() {
   }
 
   const configManager = ConfigManager.getInstance()
+  const providerDef = getProvider(provider)
   const currentProviderConfig = configManager.getProviderConfig(provider)
   const existingKey = currentProviderConfig?.apiKey || ''
+  let finalApiKey: string | undefined
 
-  const keyPrompt = existingKey
-    ? `Enter API Key for ${provider} (leave empty to keep existing key): `
-    : `Enter API Key for ${provider}: `
-  const apiKey = await promptSecretPromise(keyPrompt)
+  if (providerDef.authMode !== 'none') {
+    const keyPrompt = existingKey
+      ? `Enter API Key for ${provider} (leave empty to keep existing key): `
+      : `Enter API Key for ${provider}: `
+    const apiKey = await promptSecretPromise(keyPrompt)
 
-  const finalApiKey = apiKey || existingKey
-  if (!finalApiKey) {
-    console.log(chalk.yellow('Wizard cancelled: API key is required.'))
-    return
+    finalApiKey = apiKey || existingKey
+    if (!finalApiKey) {
+      console.log(chalk.yellow('Wizard cancelled: API key is required.'))
+      return
+    }
   }
 
   const defaultBaseUrl = currentProviderConfig.baseUrl || ''
@@ -1400,7 +1406,7 @@ async function runModelConfigWizard() {
   }
 
   configManager.setProviderConfig(provider, {
-    apiKey: finalApiKey,
+    ...(finalApiKey ? { apiKey: finalApiKey } : {}),
     baseUrl: finalBaseUrl
   })
   configManager.setDefaultModel(modelId)

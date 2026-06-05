@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { dirname } from 'node:path'
 import { mkdirSync } from 'node:fs'
+import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
@@ -313,6 +314,61 @@ export class SqliteStorage implements NexusStorage {
       )
       .all(sessionId) as Row[]
     return rows.map(rowToTask)
+  }
+
+  async saveAgentJob(job: AgentJob): Promise<void> {
+    this.db
+      .prepare(
+        `INSERT INTO agent_jobs (
+          job_id, parent_session_id, child_session_id, status, agent_type,
+          created_at, updated_at, completed_at, job_json
+        ) VALUES (
+          :jobId, :parentSessionId, :childSessionId, :status, :agentType,
+          :createdAt, :updatedAt, :completedAt, :jobJson
+        )
+        ON CONFLICT(job_id) DO UPDATE SET
+          parent_session_id = excluded.parent_session_id,
+          child_session_id = excluded.child_session_id,
+          status = excluded.status,
+          agent_type = excluded.agent_type,
+          updated_at = excluded.updated_at,
+          completed_at = excluded.completed_at,
+          job_json = excluded.job_json`,
+      )
+      .run(agentJobParams(job))
+  }
+
+  async getAgentJob(jobId: string): Promise<AgentJob | null> {
+    const row = this.db
+      .prepare(`SELECT job_json FROM agent_jobs WHERE job_id = ?`)
+      .get(jobId) as Row | undefined
+    return row ? JSON.parse(String(row.job_json)) as AgentJob : null
+  }
+
+  async listAgentJobs(filter: AgentJobFilter = {}): Promise<AgentJob[]> {
+    const conditions: string[] = []
+    const params: Record<string, string> = {}
+    if (filter.parentSessionId !== undefined) {
+      conditions.push('parent_session_id = :parentSessionId')
+      params.parentSessionId = filter.parentSessionId
+    }
+    if (filter.status !== undefined) {
+      conditions.push('status = :status')
+      params.status = filter.status
+    }
+    if (filter.agentType !== undefined) {
+      conditions.push('agent_type = :agentType')
+      params.agentType = filter.agentType
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = this.db
+      .prepare(
+        `SELECT job_json FROM agent_jobs
+         ${where}
+         ORDER BY created_at ASC, job_id ASC`,
+      )
+      .all(params) as Row[]
+    return rows.map(row => JSON.parse(String(row.job_json)) as AgentJob)
   }
 
   async close(): Promise<void> {
@@ -699,6 +755,54 @@ export class SqliteStorage implements NexusStorage {
       addColumn('remote_tool_call_count', 'INTEGER')
       addColumn('remote_tool_runner_duration_ms', 'REAL')
       this.db.exec('PRAGMA user_version = 8;')
+      version = 8
+    }
+
+    if (version < 9) {
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS agent_jobs (
+          job_id TEXT PRIMARY KEY,
+          parent_session_id TEXT NOT NULL,
+          child_session_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          agent_type TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          job_json TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS agent_jobs_parent_session_idx
+          ON agent_jobs(parent_session_id, created_at ASC, job_id ASC);
+
+        CREATE INDEX IF NOT EXISTS agent_jobs_status_idx
+          ON agent_jobs(status, created_at ASC, job_id ASC);
+
+        CREATE INDEX IF NOT EXISTS agent_jobs_agent_type_idx
+          ON agent_jobs(agent_type, created_at ASC, job_id ASC);
+      `)
+      this.db.exec('PRAGMA user_version = 9;')
+      version = 9
+    }
+
+    if (version < 10) {
+      const executionMetricsColumns = (this.db.prepare(`PRAGMA table_info(execution_metrics)`).all() as Row[]).map(r => String(r.name))
+      const addColumn = (name: string, definition: string) => {
+        if (!executionMetricsColumns.includes(name)) {
+          this.db.exec(`ALTER TABLE execution_metrics ADD COLUMN ${name} ${definition}`)
+        }
+      }
+      addColumn('model_context_window', 'INTEGER')
+      addColumn('reserved_output_tokens', 'INTEGER')
+      addColumn('provider_safety_buffer_tokens', 'INTEGER')
+      addColumn('env_max_context_tokens', 'INTEGER')
+      addColumn('context_policy_source', 'TEXT')
+      addColumn('context_warning_threshold_percent', 'REAL')
+      addColumn('context_compact_threshold_percent', 'REAL')
+      addColumn('context_warning_threshold_tokens', 'INTEGER')
+      addColumn('context_compact_threshold_tokens', 'INTEGER')
+      addColumn('context_blocking_limit_tokens', 'INTEGER')
+      this.db.exec('PRAGMA user_version = 10;')
     }
   }
 
@@ -725,8 +829,13 @@ export class SqliteStorage implements NexusStorage {
           provider_request_duration_ms, stream_delta_count, tool_call_count,
           tool_roundtrip_duration_ms, context_chars_in, context_chars_out,
           input_tokens, output_tokens, cache_creation_input_tokens,
-          cache_read_input_tokens, effective_context_ceiling,
-          legacy_context_ceiling, cache_read_ratio, cache_preservation_mode,
+          cache_read_input_tokens, model_context_window,
+          reserved_output_tokens, provider_safety_buffer_tokens,
+          effective_context_ceiling, legacy_context_ceiling,
+          env_max_context_tokens, context_policy_source,
+          context_warning_threshold_percent, context_compact_threshold_percent,
+          context_warning_threshold_tokens, context_compact_threshold_tokens,
+          context_blocking_limit_tokens, cache_read_ratio, cache_preservation_mode,
           long_context_utilization_mode, prefix_cache_immutable_ratio,
           prefix_cache_volatile_content_last, prefix_cache_fingerprint,
           compact_summary_latency_ms, remote_tool_call_count,
@@ -736,8 +845,13 @@ export class SqliteStorage implements NexusStorage {
           :providerRequestDurationMs, :streamDeltaCount, :toolCallCount,
           :toolRoundtripDurationMs, :contextCharsIn, :contextCharsOut,
           :inputTokens, :outputTokens, :cacheCreationInputTokens,
-          :cacheReadInputTokens, :effectiveContextCeiling,
-          :legacyContextCeiling, :cacheReadRatio, :cachePreservationMode,
+          :cacheReadInputTokens, :modelContextWindow,
+          :reservedOutputTokens, :providerSafetyBufferTokens,
+          :effectiveContextCeiling, :legacyContextCeiling,
+          :envMaxContextTokens, :contextPolicySource,
+          :contextWarningThresholdPercent, :contextCompactThresholdPercent,
+          :contextWarningThresholdTokens, :contextCompactThresholdTokens,
+          :contextBlockingLimitTokens, :cacheReadRatio, :cachePreservationMode,
           :longContextUtilizationMode, :prefixCacheImmutableRatio,
           :prefixCacheVolatileContentLast, :prefixCacheFingerprint,
           :compactSummaryLatencyMs, :remoteToolCallCount,
@@ -756,8 +870,18 @@ export class SqliteStorage implements NexusStorage {
           output_tokens = excluded.output_tokens,
           cache_creation_input_tokens = excluded.cache_creation_input_tokens,
           cache_read_input_tokens = excluded.cache_read_input_tokens,
+          model_context_window = excluded.model_context_window,
+          reserved_output_tokens = excluded.reserved_output_tokens,
+          provider_safety_buffer_tokens = excluded.provider_safety_buffer_tokens,
           effective_context_ceiling = excluded.effective_context_ceiling,
           legacy_context_ceiling = excluded.legacy_context_ceiling,
+          env_max_context_tokens = excluded.env_max_context_tokens,
+          context_policy_source = excluded.context_policy_source,
+          context_warning_threshold_percent = excluded.context_warning_threshold_percent,
+          context_compact_threshold_percent = excluded.context_compact_threshold_percent,
+          context_warning_threshold_tokens = excluded.context_warning_threshold_tokens,
+          context_compact_threshold_tokens = excluded.context_compact_threshold_tokens,
+          context_blocking_limit_tokens = excluded.context_blocking_limit_tokens,
           cache_read_ratio = excluded.cache_read_ratio,
           cache_preservation_mode = excluded.cache_preservation_mode,
           long_context_utilization_mode = excluded.long_context_utilization_mode,
@@ -784,8 +908,18 @@ export class SqliteStorage implements NexusStorage {
         outputTokens: metrics.outputTokens ?? null,
         cacheCreationInputTokens: metrics.cacheCreationInputTokens ?? null,
         cacheReadInputTokens: metrics.cacheReadInputTokens ?? null,
+        modelContextWindow: metrics.modelContextWindow ?? null,
+        reservedOutputTokens: metrics.reservedOutputTokens ?? null,
+        providerSafetyBufferTokens: metrics.providerSafetyBufferTokens ?? null,
         effectiveContextCeiling: metrics.effectiveContextCeiling ?? null,
         legacyContextCeiling: metrics.legacyContextCeiling ?? null,
+        envMaxContextTokens: metrics.envMaxContextTokens ?? null,
+        contextPolicySource: metrics.contextPolicySource ?? null,
+        contextWarningThresholdPercent: metrics.contextWarningThresholdPercent ?? null,
+        contextCompactThresholdPercent: metrics.contextCompactThresholdPercent ?? null,
+        contextWarningThresholdTokens: metrics.contextWarningThresholdTokens ?? null,
+        contextCompactThresholdTokens: metrics.contextCompactThresholdTokens ?? null,
+        contextBlockingLimitTokens: metrics.contextBlockingLimitTokens ?? null,
         cacheReadRatio: metrics.cacheReadRatio ?? null,
         cachePreservationMode: booleanToDb(metrics.cachePreservationMode),
         longContextUtilizationMode: booleanToDb(metrics.longContextUtilizationMode),
@@ -819,8 +953,18 @@ export class SqliteStorage implements NexusStorage {
       outputTokens: row.output_tokens !== null && row.output_tokens !== undefined ? Number(row.output_tokens) : undefined,
       cacheCreationInputTokens: row.cache_creation_input_tokens !== null && row.cache_creation_input_tokens !== undefined ? Number(row.cache_creation_input_tokens) : undefined,
       cacheReadInputTokens: row.cache_read_input_tokens !== null && row.cache_read_input_tokens !== undefined ? Number(row.cache_read_input_tokens) : undefined,
+      modelContextWindow: row.model_context_window !== null && row.model_context_window !== undefined ? Number(row.model_context_window) : undefined,
+      reservedOutputTokens: row.reserved_output_tokens !== null && row.reserved_output_tokens !== undefined ? Number(row.reserved_output_tokens) : undefined,
+      providerSafetyBufferTokens: row.provider_safety_buffer_tokens !== null && row.provider_safety_buffer_tokens !== undefined ? Number(row.provider_safety_buffer_tokens) : undefined,
       effectiveContextCeiling: row.effective_context_ceiling !== null && row.effective_context_ceiling !== undefined ? Number(row.effective_context_ceiling) : undefined,
       legacyContextCeiling: row.legacy_context_ceiling !== null && row.legacy_context_ceiling !== undefined ? Number(row.legacy_context_ceiling) : undefined,
+      envMaxContextTokens: row.env_max_context_tokens !== null && row.env_max_context_tokens !== undefined ? Number(row.env_max_context_tokens) : undefined,
+      contextPolicySource: row.context_policy_source !== null && row.context_policy_source !== undefined ? String(row.context_policy_source) as ExecutionMetrics['contextPolicySource'] : undefined,
+      contextWarningThresholdPercent: row.context_warning_threshold_percent !== null && row.context_warning_threshold_percent !== undefined ? Number(row.context_warning_threshold_percent) : undefined,
+      contextCompactThresholdPercent: row.context_compact_threshold_percent !== null && row.context_compact_threshold_percent !== undefined ? Number(row.context_compact_threshold_percent) : undefined,
+      contextWarningThresholdTokens: row.context_warning_threshold_tokens !== null && row.context_warning_threshold_tokens !== undefined ? Number(row.context_warning_threshold_tokens) : undefined,
+      contextCompactThresholdTokens: row.context_compact_threshold_tokens !== null && row.context_compact_threshold_tokens !== undefined ? Number(row.context_compact_threshold_tokens) : undefined,
+      contextBlockingLimitTokens: row.context_blocking_limit_tokens !== null && row.context_blocking_limit_tokens !== undefined ? Number(row.context_blocking_limit_tokens) : undefined,
       cacheReadRatio: row.cache_read_ratio !== null && row.cache_read_ratio !== undefined ? Number(row.cache_read_ratio) : undefined,
       cachePreservationMode: dbToBoolean(row.cache_preservation_mode),
       longContextUtilizationMode: dbToBoolean(row.long_context_utilization_mode),
@@ -885,6 +1029,20 @@ function taskParams(task: NexusTask): Record<string, string | number | null> {
     retryCount: task.retryCount,
     review: task.review ? JSON.stringify(task.review) : null,
     metadata: task.metadata ? JSON.stringify(task.metadata) : null,
+  }
+}
+
+function agentJobParams(job: AgentJob): Record<string, string | null> {
+  return {
+    jobId: job.jobId,
+    parentSessionId: job.parentSessionId,
+    childSessionId: job.childSessionId,
+    status: job.status,
+    agentType: job.agentType,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    completedAt: job.completedAt ?? null,
+    jobJson: JSON.stringify(job),
   }
 }
 

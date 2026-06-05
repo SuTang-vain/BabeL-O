@@ -257,6 +257,8 @@ function summarizeEvents(events: NexusEvent[]): EventSummaries {
       const line = `${event.eventType} (${event.phase}) ${truncateLine(safeStringify(event.payload), 240)}`.trim()
       if (isChildAgentEvent(event)) summaries.childAgentEvents.push(line)
       else summaries.taskEvents.push(line)
+    } else if (event.type === 'agent_job_event') {
+      summaries.childAgentEvents.push(formatAgentJobEventSummary(event))
     } else if (event.type === 'error') {
       summaries.failureEvents.push(`${event.code}: ${event.message}`)
     } else if (event.type === 'tool_denied') {
@@ -300,8 +302,8 @@ function buildEventReferences(state: ContextForkBuilderState): ContextForkDiagno
 function isReferencedEvent(mode: ContextForkMode, event: NexusEvent): boolean {
   if (mode === 'minimal') return false
   if (mode === 'working-set') return event.type === 'user_message' || event.type === 'tool_started'
-  if (mode === 'task-focused') return event.type === 'task_created' || event.type === 'task_session_event' || event.type === 'error' || event.type === 'tool_denied' || event.type === 'permission_request' || event.type === 'permission_response'
-  if (mode === 'full-summary') return event.type === 'compact_boundary' || event.type === 'user_message' || event.type === 'task_created' || event.type === 'task_session_event' || event.type === 'error'
+  if (mode === 'task-focused') return event.type === 'task_created' || event.type === 'task_session_event' || event.type === 'agent_job_event' || event.type === 'error' || event.type === 'tool_denied' || event.type === 'permission_request' || event.type === 'permission_response'
+  if (mode === 'full-summary') return event.type === 'compact_boundary' || event.type === 'user_message' || event.type === 'task_created' || event.type === 'task_session_event' || event.type === 'agent_job_event' || event.type === 'error'
   return isDebugReplayEvent(event)
 }
 
@@ -323,6 +325,7 @@ function isDebugReplayEvent(event: NexusEvent): boolean {
     event.type === 'context_blocking' ||
     event.type === 'context_warning' ||
     (event.type === 'tool_completed' && !event.success) ||
+    (event.type === 'agent_job_event' && (event.status === 'failed' || event.status === 'cancelled')) ||
     (event.type === 'task_session_event' && (event.phase === 'failed' || event.phase === 'cancelled'))
 }
 
@@ -346,6 +349,8 @@ function formatDebugEvent(event: NexusEvent): string {
       return `context warning ${event.percentUsed}%: ${event.message}`
     case 'task_session_event':
       return `${event.eventType} (${event.phase}) ${truncateLine(safeStringify(event.payload), 240)}`.trim()
+    case 'agent_job_event':
+      return formatAgentJobEventSummary(event)
     default:
       return truncateLine(safeStringify(event), 240)
   }
@@ -354,6 +359,10 @@ function formatDebugEvent(event: NexusEvent): string {
 function isChildAgentEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): boolean {
   const text = `${event.eventType} ${safeStringify(event.payload)}`.toLowerCase()
   return text.includes('agent') || text.includes('childsession') || text.includes('transcript')
+}
+
+function formatAgentJobEventSummary(event: Extract<NexusEvent, { type: 'agent_job_event' }>): string {
+  return `${event.eventType} (${event.status}) ${event.agentType} ${event.childSessionId}`
 }
 
 function countOmittedOutsideSummaries(state: ContextForkBuilderState): number {

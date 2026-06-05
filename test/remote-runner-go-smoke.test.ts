@@ -285,8 +285,8 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
       ['Read', 'Grep', 'Glob'],
     )
     const parentEvents = await storage.listEvents('session-agent-parent')
-    const completedEvent = parentEvents.events.find(event => event.type === 'task_session_event' && event.eventType === 'agent_job_completed')
-    assert.equal(completedEvent?.type === 'task_session_event' ? (completedEvent.payload as any).result.summary : undefined, 'Explore Agent remote smoke completed.')
+    const completedEvent = parentEvents.events.find(event => event.type === 'agent_job_event' && event.eventType === 'agent_job_completed')
+    assert.equal(completedEvent?.type === 'agent_job_event' ? (completedEvent.result as any).summary : undefined, 'Explore Agent remote smoke completed.')
 
     const failureStorage = new MemoryStorage()
     await saveParentSession(failureStorage, 'session-agent-parent-failure', workspace)
@@ -315,8 +315,8 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
     const failedChild = await failureStorage.getSession(failedOutput.childSessionId)
     assert.equal(failedChild?.phase, 'failed')
     const failureParentEvents = await failureStorage.listEvents('session-agent-parent-failure')
-    const failedEvent = failureParentEvents.events.find(event => event.type === 'task_session_event' && event.eventType === 'agent_job_failed')
-    assert.equal(failedEvent?.type === 'task_session_event' ? (failedEvent.payload as any).error.code : undefined, 'WORKSPACE_PATH_DENIED')
+    const failedEvent = failureParentEvents.events.find(event => event.type === 'agent_job_event' && event.eventType === 'agent_job_failed')
+    assert.equal(failedEvent?.type === 'agent_job_event' ? (failedEvent.error as any).code : undefined, 'WORKSPACE_PATH_DENIED')
   } finally {
     await terminateChildProcessGroup(child)
     if (workspace) await rm(workspace, { recursive: true, force: true })

@@ -93,10 +93,18 @@ export type ContextAnalysisDiagnostics = {
     cacheableSystemPromptRatio: number
     cachePreservationMode: boolean
     longContextUtilizationMode: boolean
+    modelContextWindow: number
     effectiveContextCeiling: number
     legacyContextCeiling: number
+    envMaxContextTokens?: number
+    policySource: 'legacy' | 'large_context' | 'env_cap'
     reservedOutputTokens: number
     providerSafetyBufferTokens: number
+    warningThresholdPercent: number
+    compactThresholdPercent: number
+    warningThresholdTokens: number
+    compactThresholdTokens: number
+    blockingLimitTokens: number
     reason: string
   }
   compactTokenDelta: {
@@ -129,8 +137,18 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   sessionId: string
   cwd: string
   modelId: string
+  modelContextWindow: number
   maxTokens: number
   tokenEstimate: number
+  effectiveContextCeiling: number
+  legacyContextCeiling: number
+  envMaxContextTokens?: number
+  policySource: 'legacy' | 'large_context' | 'env_cap'
+  reservedOutputTokens: number
+  providerSafetyBufferTokens: number
+  warningThresholdTokens: number
+  compactThresholdTokens: number
+  blockingLimitTokens: number
   remainingTokens: number
   compactHasBoundary: boolean
   toolsVisible: boolean
@@ -329,8 +347,18 @@ function buildContextDiagnosticEnvelope(options: {
       sessionId: options.sessionId,
       cwd: options.cwd,
       modelId: options.modelId,
+      modelContextWindow: options.diagnostics.cacheEconomics.modelContextWindow,
       maxTokens: options.window.maxTokens,
       tokenEstimate: options.window.tokenEstimate,
+      effectiveContextCeiling: options.diagnostics.cacheEconomics.effectiveContextCeiling,
+      legacyContextCeiling: options.diagnostics.cacheEconomics.legacyContextCeiling,
+      envMaxContextTokens: options.diagnostics.cacheEconomics.envMaxContextTokens,
+      policySource: options.diagnostics.cacheEconomics.policySource,
+      reservedOutputTokens: options.diagnostics.cacheEconomics.reservedOutputTokens,
+      providerSafetyBufferTokens: options.diagnostics.cacheEconomics.providerSafetyBufferTokens,
+      warningThresholdTokens: options.diagnostics.cacheEconomics.warningThresholdTokens,
+      compactThresholdTokens: options.diagnostics.cacheEconomics.compactThresholdTokens,
+      blockingLimitTokens: options.diagnostics.cacheEconomics.blockingLimitTokens,
       remainingTokens: options.diagnostics.remainingTokens,
       compactHasBoundary: options.compact.hasBoundary,
       toolsVisible: options.runtimePolicy.toolsVisible,
@@ -539,10 +567,18 @@ function buildCacheEconomicsDiagnostics(policy: CacheAwareCompactPolicy): Contex
     cacheableSystemPromptRatio: policy.cacheableSystemPromptRatio,
     cachePreservationMode: policy.cachePreservationMode,
     longContextUtilizationMode: policy.longContextUtilizationMode,
+    modelContextWindow: policy.modelContextWindow,
     effectiveContextCeiling: policy.effectiveContextCeiling,
     legacyContextCeiling: policy.legacyContextCeiling,
+    envMaxContextTokens: policy.envMaxContextTokens,
+    policySource: policy.policySource,
     reservedOutputTokens: policy.reservedOutputTokens,
     providerSafetyBufferTokens: policy.providerSafetyBufferTokens,
+    warningThresholdPercent: policy.warningThresholdPercent,
+    compactThresholdPercent: policy.compactThresholdPercent,
+    warningThresholdTokens: policy.warningThresholdTokens,
+    compactThresholdTokens: policy.compactThresholdTokens,
+    blockingLimitTokens: policy.blockingLimitTokens,
     reason: policy.reason,
   }
 }

@@ -15,6 +15,8 @@ export type CacheAwareCompactPolicy = {
   providerSafetyBufferTokens: number
   legacyContextCeiling: number
   effectiveContextCeiling: number
+  envMaxContextTokens?: number
+  policySource: 'legacy' | 'large_context' | 'env_cap'
   warningThresholdPercent: number
   compactThresholdPercent: number
   warningThresholdTokens: number
@@ -68,6 +70,11 @@ export function buildCacheAwareCompactPolicy(options: {
   const policyCeiling = longContextCeiling ?? legacyContextCeiling
   const envConstrained = envMaxTokens !== undefined && envMaxTokens < policyCeiling
   const effectiveContextCeiling = Math.max(1, Math.min(policyCeiling, envMaxTokens ?? policyCeiling))
+  const policySource = envConstrained
+    ? 'env_cap'
+    : longContextCeiling !== undefined
+      ? 'large_context'
+      : 'legacy'
   const longContextUtilizationMode = effectiveContextCeiling > legacyContextCeiling
   const usage = normalizeUsage(options.usage)
   const cacheReadRatio = computeCacheReadRatio(usage)
@@ -103,6 +110,8 @@ export function buildCacheAwareCompactPolicy(options: {
     providerSafetyBufferTokens,
     legacyContextCeiling,
     effectiveContextCeiling,
+    ...(envMaxTokens !== undefined && { envMaxContextTokens: envMaxTokens }),
+    policySource,
     warningThresholdPercent,
     compactThresholdPercent,
     warningThresholdTokens,

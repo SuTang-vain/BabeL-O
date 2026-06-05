@@ -74,8 +74,18 @@ export class NexusMetrics {
   private outputTokenTotalCount = 0
   private cacheCreationInputTokenTotalCount = 0
   private cacheReadInputTokenTotalCount = 0
+  private latestModelContextWindow?: number
+  private latestReservedOutputTokens?: number
+  private latestProviderSafetyBufferTokens?: number
   private latestEffectiveContextCeiling?: number
   private latestLegacyContextCeiling?: number
+  private latestEnvMaxContextTokens?: number
+  private latestContextPolicySource?: 'legacy' | 'large_context' | 'env_cap'
+  private latestContextWarningThresholdPercent?: number
+  private latestContextCompactThresholdPercent?: number
+  private latestContextWarningThresholdTokens?: number
+  private latestContextCompactThresholdTokens?: number
+  private latestContextBlockingLimitTokens?: number
   private cachePreservationModeCount = 0
   private longContextUtilizationModeCount = 0
   private prefixCacheImmutableRatioTotal = 0
@@ -129,16 +139,36 @@ export class NexusMetrics {
   }
 
   recordContextPolicy(options: {
+    modelContextWindow?: number
+    reservedOutputTokens?: number
+    providerSafetyBufferTokens?: number
     effectiveContextCeiling?: number
     legacyContextCeiling?: number
+    envMaxContextTokens?: number
+    contextPolicySource?: 'legacy' | 'large_context' | 'env_cap'
+    contextWarningThresholdPercent?: number
+    contextCompactThresholdPercent?: number
+    contextWarningThresholdTokens?: number
+    contextCompactThresholdTokens?: number
+    contextBlockingLimitTokens?: number
     cachePreservationMode?: boolean
     longContextUtilizationMode?: boolean
     prefixCacheImmutableRatio?: number
     prefixCacheVolatileContentLast?: boolean
     prefixCacheFingerprint?: string
   }): void {
+    if (options.modelContextWindow !== undefined) this.latestModelContextWindow = options.modelContextWindow
+    if (options.reservedOutputTokens !== undefined) this.latestReservedOutputTokens = options.reservedOutputTokens
+    if (options.providerSafetyBufferTokens !== undefined) this.latestProviderSafetyBufferTokens = options.providerSafetyBufferTokens
     if (options.effectiveContextCeiling !== undefined) this.latestEffectiveContextCeiling = options.effectiveContextCeiling
     if (options.legacyContextCeiling !== undefined) this.latestLegacyContextCeiling = options.legacyContextCeiling
+    if (options.envMaxContextTokens !== undefined) this.latestEnvMaxContextTokens = options.envMaxContextTokens
+    if (options.contextPolicySource !== undefined) this.latestContextPolicySource = options.contextPolicySource
+    if (options.contextWarningThresholdPercent !== undefined) this.latestContextWarningThresholdPercent = options.contextWarningThresholdPercent
+    if (options.contextCompactThresholdPercent !== undefined) this.latestContextCompactThresholdPercent = options.contextCompactThresholdPercent
+    if (options.contextWarningThresholdTokens !== undefined) this.latestContextWarningThresholdTokens = options.contextWarningThresholdTokens
+    if (options.contextCompactThresholdTokens !== undefined) this.latestContextCompactThresholdTokens = options.contextCompactThresholdTokens
+    if (options.contextBlockingLimitTokens !== undefined) this.latestContextBlockingLimitTokens = options.contextBlockingLimitTokens
     if (options.cachePreservationMode) this.cachePreservationModeCount += 1
     if (options.longContextUtilizationMode) this.longContextUtilizationModeCount += 1
     if (options.prefixCacheImmutableRatio !== undefined) {
@@ -278,8 +308,18 @@ export class NexusMetrics {
         }),
       },
       contextPolicy: {
+        modelContextWindow: this.latestModelContextWindow,
+        reservedOutputTokens: this.latestReservedOutputTokens,
+        providerSafetyBufferTokens: this.latestProviderSafetyBufferTokens,
         effectiveContextCeiling: this.latestEffectiveContextCeiling,
         legacyContextCeiling: this.latestLegacyContextCeiling,
+        envMaxContextTokens: this.latestEnvMaxContextTokens,
+        source: this.latestContextPolicySource,
+        warningThresholdPercent: this.latestContextWarningThresholdPercent,
+        compactThresholdPercent: this.latestContextCompactThresholdPercent,
+        warningThresholdTokens: this.latestContextWarningThresholdTokens,
+        compactThresholdTokens: this.latestContextCompactThresholdTokens,
+        blockingLimitTokens: this.latestContextBlockingLimitTokens,
         cachePreservationModeCount: this.cachePreservationModeCount,
         longContextUtilizationModeCount: this.longContextUtilizationModeCount,
         prefixCache: {

@@ -1,3 +1,4 @@
+import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
@@ -19,6 +20,7 @@ import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 export class MemoryStorage implements NexusStorage {
   private readonly sessions = new Map<string, SessionSnapshot>()
   private readonly tasks = new Map<string, NexusTask>()
+  private readonly agentJobs = new Map<string, AgentJob>()
   private readonly toolTraces = new Map<string, ToolTrace>()
   private readonly permissionAudits = new Map<string, PermissionAudit[]>()
   private readonly executionMetricsMap = new Map<string, ExecutionMetrics>()
@@ -138,6 +140,26 @@ export class MemoryStorage implements NexusStorage {
       .map(task => structuredClone(task))
   }
 
+  async saveAgentJob(job: AgentJob): Promise<void> {
+    this.agentJobs.set(job.jobId, structuredClone(job))
+  }
+
+  async getAgentJob(jobId: string): Promise<AgentJob | null> {
+    const job = this.agentJobs.get(jobId)
+    return job ? structuredClone(job) : null
+  }
+
+  async listAgentJobs(filter: AgentJobFilter = {}): Promise<AgentJob[]> {
+    return [...this.agentJobs.values()]
+      .filter(job => matchesAgentJobFilter(job, filter))
+      .sort((a, b) => {
+        const cmp = a.createdAt.localeCompare(b.createdAt)
+        if (cmp !== 0) return cmp
+        return a.jobId.localeCompare(b.jobId)
+      })
+      .map(job => structuredClone(job))
+  }
+
   async saveToolTrace(trace: ToolTrace): Promise<void> {
     this.toolTraces.set(trace.toolUseId, structuredClone(trace))
   }
@@ -201,4 +223,11 @@ function cloneSession(
   const cloned = structuredClone(session)
   if (!includeEvents) cloned.events = []
   return cloned
+}
+
+function matchesAgentJobFilter(job: AgentJob, filter: AgentJobFilter): boolean {
+  if (filter.parentSessionId !== undefined && job.parentSessionId !== filter.parentSessionId) return false
+  if (filter.status !== undefined && job.status !== filter.status) return false
+  if (filter.agentType !== undefined && job.agentType !== filter.agentType) return false
+  return true
 }

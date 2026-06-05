@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { ExploreAgentScheduler, createExploreRuntime } from '../src/nexus/agents/AgentScheduler.js'
 import { AgentJobRegistryError } from '../src/nexus/agents/AgentJobRegistry.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
-import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
+import { NEXUS_EVENT_SCHEMA_VERSION, NexusEventSchema, type NexusEvent } from '../src/shared/events.js'
 import { InMemoryRemoteToolRunner } from '../src/runtime/remoteRunner.js'
 import { allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { createRuntimeExecutionMetrics, type RuntimeProviderToolCall } from '../src/runtime/runtimePipeline.js'
@@ -55,6 +55,12 @@ test('ExploreAgentScheduler spawns read-only child session and completes with st
   assert.equal(completed.result?.findings?.[0]?.message, 'Read completed.')
   assert.deepEqual(completed.result?.changedFiles, [])
   assert.deepEqual(completed.result?.commandsRun, [])
+  assert.equal(completed.governance?.maxConcurrentAgents, 4)
+  assert.equal(completed.governance?.activeAgents, 0)
+  assert.equal(completed.governance?.maxDepth, 2)
+  assert.equal(completed.governance?.depth, 1)
+  assert.equal(completed.governance?.maxRuntimeMs, 120_000)
+  assert.equal(completed.governance?.timeoutAt, '2026-06-04T00:02:00.000Z')
   assert.equal(runtime.calls[0]?.role, 'explore')
   assert.equal(runtime.calls[0]?.skipPermissionCheck, true)
   assert.equal(runtime.calls[0]?.replaySessionHistory, false)
@@ -65,18 +71,24 @@ test('ExploreAgentScheduler spawns read-only child session and completes with st
   assert.equal(child?.phase, 'completed')
   assert.equal(child?.metadata?.agentJobId, job.jobId)
   assert.equal(child?.metadata?.contextForkMode, 'minimal')
+  assert.equal(child?.metadata?.agentDepth, 1)
+  assert.deepEqual(child?.metadata?.governance, completed.governance)
 
   const parentEvents = await storage.listEvents('session-parent')
   assert.deepEqual(parentEvents.events.map(event => event.type), [
-    'task_session_event',
-    'task_session_event',
-    'task_session_event',
+    'agent_job_event',
+    'agent_job_event',
+    'agent_job_event',
   ])
-  assert.deepEqual(parentEvents.events.map(event => event.type === 'task_session_event' ? event.eventType : undefined), [
+  assert.deepEqual(parentEvents.events.map(event => event.type === 'agent_job_event' ? event.eventType : undefined), [
     'agent_job_queued',
     'agent_job_started',
     'agent_job_completed',
   ])
+  const completedEvent = parentEvents.events.find(event => event.type === 'agent_job_event' && event.eventType === 'agent_job_completed')
+  assert.equal(completedEvent?.type === 'agent_job_event' ? completedEvent.jobId : undefined, job.jobId)
+  assert.equal(completedEvent?.type === 'agent_job_event' ? completedEvent.governance?.depth : undefined, 1)
+  assert.equal(NexusEventSchema.parse(completedEvent).type, 'agent_job_event')
 })
 
 test('ExploreAgentScheduler spawns review and test profiles with task-focused context', async () => {
@@ -217,6 +229,74 @@ test('ExploreAgentScheduler cancels running jobs and child session', async () =>
   assert.equal(child?.phase, 'cancelled')
 })
 
+test('ExploreAgentScheduler restores persisted completed jobs after scheduler restart', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(parentSession())
+  const firstScheduler = new ExploreAgentScheduler({
+    storage,
+    now: fixedClock(),
+    runtimeFactory: () => new RecordingRuntime([
+      {
+        type: 'result',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: 'filled-by-runtime',
+        timestamp: '2026-06-04T00:00:03.000Z',
+        success: true,
+        message: 'Persisted explore completed.',
+      },
+    ]),
+  })
+  const spawned = await firstScheduler.spawnAgent({
+    parentSessionId: 'session-parent',
+    prompt: 'Persist this job.',
+  })
+  await firstScheduler.waitForAgent(spawned.jobId)
+
+  const restoredScheduler = new ExploreAgentScheduler({
+    storage,
+    now: fixedClock(),
+    runtimeFactory: () => new RecordingRuntime([]),
+  })
+
+  const listed = await restoredScheduler.listAgents({ parentSessionId: 'session-parent' })
+  assert.equal(listed.length, 1)
+  assert.equal(listed[0]?.jobId, spawned.jobId)
+  assert.equal(listed[0]?.status, 'completed')
+  const waited = await restoredScheduler.waitForAgent(spawned.jobId, { timeoutMs: 1 })
+  assert.equal(waited.result?.summary, 'Persisted explore completed.')
+  const persisted = await storage.getAgentJob(spawned.jobId)
+  assert.equal(persisted?.status, 'completed')
+})
+
+test('ExploreAgentScheduler exposes persisted non-terminal jobs after scheduler restart', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(parentSession())
+  await storage.saveAgentJob({
+    jobId: 'agent-job-persisted',
+    parentSessionId: 'session-parent',
+    childSessionId: 'session-child-persisted',
+    agentType: 'explore',
+    status: 'queued',
+    prompt: 'Persist queued job.',
+    contextForkMode: 'minimal',
+    isolation: 'none',
+    createdAt: '2026-06-04T00:00:00.000Z',
+    updatedAt: '2026-06-04T00:00:00.000Z',
+  })
+
+  const restoredScheduler = new ExploreAgentScheduler({
+    storage,
+    now: fixedClock(),
+    runtimeFactory: () => new RecordingRuntime([]),
+  })
+
+  const waited = await restoredScheduler.waitForAgent('agent-job-persisted', { timeoutMs: 1 })
+  assert.equal(waited.status, 'queued')
+  const cancelled = await restoredScheduler.cancelAgent('agent-job-persisted', 'Restart cleanup.')
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal((await storage.getAgentJob('agent-job-persisted'))?.status, 'cancelled')
+})
+
 test('ExploreAgentScheduler forwards remote execution context and cancel to runner', async () => {
   const storage = new MemoryStorage()
   await storage.saveSession({
@@ -262,6 +342,86 @@ test('ExploreAgentScheduler forwards remote execution context and cancel to runn
   assert.equal(remoteRunner.cancelRequests[0].toolUseId, remoteRunner.requests[0].toolUseId)
   const child = await storage.getSession(job.childSessionId)
   assert.equal(child?.phase, 'cancelled')
+})
+
+test('ExploreAgentScheduler rejects spawns beyond max concurrent agents', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(parentSession())
+  const scheduler = new ExploreAgentScheduler({
+    storage,
+    maxConcurrentAgents: 1,
+    runtimeFactory: () => new HangingRuntime(),
+  })
+
+  const running = await scheduler.spawnAgent({
+    parentSessionId: 'session-parent',
+    prompt: 'Find files slowly.',
+  })
+
+  try {
+    await assert.rejects(
+      () => scheduler.spawnAgent({
+        parentSessionId: 'session-parent',
+        prompt: 'Find more files.',
+      }),
+      (error: unknown) =>
+        error instanceof AgentJobRegistryError &&
+        error.code === 'AGENT_SCHEDULER_CAPACITY_EXCEEDED' &&
+        error.status === 429,
+    )
+  } finally {
+    await scheduler.cancelAgent(running.jobId, 'Test cleanup.')
+  }
+})
+
+test('ExploreAgentScheduler enforces max depth from parent session metadata', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession({
+    ...parentSession(),
+    metadata: { agentDepth: 2 },
+  })
+  const scheduler = new ExploreAgentScheduler({
+    storage,
+    maxDepth: 2,
+    runtimeFactory: () => new RecordingRuntime([]),
+  })
+
+  await assert.rejects(
+    () => scheduler.spawnAgent({
+      parentSessionId: 'session-parent',
+      prompt: 'Spawn too deeply.',
+    }),
+    (error: unknown) =>
+      error instanceof AgentJobRegistryError &&
+      error.code === 'AGENT_SCHEDULER_MAX_DEPTH_EXCEEDED',
+  )
+})
+
+test('ExploreAgentScheduler fails jobs that exceed max runtime', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(parentSession())
+  const runtime = new HangingRuntime()
+  const scheduler = new ExploreAgentScheduler({
+    storage,
+    now: fixedClock(),
+    runtimeFactory: () => runtime,
+  })
+
+  const job = await scheduler.spawnAgent({
+    parentSessionId: 'session-parent',
+    prompt: 'Find files too slowly.',
+    maxRuntimeMs: 5,
+  })
+  await runtime.started
+  const failed = await scheduler.waitForAgent(job.jobId, { timeoutMs: 100 })
+
+  assert.equal(failed.status, 'failed')
+  assert.equal(failed.error?.code, 'AGENT_JOB_TIMEOUT')
+  assert.equal(failed.governance?.maxRuntimeMs, 5)
+  assert.equal(failed.governance?.timeoutAt, '2026-06-04T00:00:00.005Z')
+  const child = await storage.getSession(job.childSessionId)
+  assert.equal(child?.phase, 'failed')
+  assert.match(child?.error ?? '', /timed out after 5ms/)
 })
 
 test('review and test runtime expose only restricted Bash commands', async () => {

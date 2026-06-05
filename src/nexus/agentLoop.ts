@@ -26,10 +26,12 @@ import {
   getTaskSession,
   updateTaskSession,
 } from './taskSession.js'
+import { performance } from 'node:perf_hooks'
 import type { HooksConfig } from '../shared/config.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
 import { logger } from '../shared/logger.js'
+import { estimateTextTokens } from '../runtime/tokenEstimator.js'
 import {
   isGitRepository,
   createWorktree,
@@ -92,6 +94,79 @@ export type AgentStepRunner = <TInput, TOutput>(options: {
   roleDefinition: AgentRoleDefinition
   input: TInput
 }) => Promise<TOutput>
+
+async function runAgentRoleStep<TInput, TOutput>(options: {
+  sessionId: string
+  stepRunner: AgentStepRunner
+  roleDefinition: AgentRoleDefinition
+  input: TInput
+  taskId?: string
+}): Promise<TOutput> {
+  const startedAt = performance.now()
+  try {
+    const output = await options.stepRunner<TInput, TOutput>({
+      roleDefinition: options.roleDefinition,
+      input: options.input,
+    })
+    recordAgentRoleStepMetrics({
+      sessionId: options.sessionId,
+      role: options.roleDefinition.role,
+      taskId: options.taskId,
+      input: options.input,
+      output,
+      durationMs: performance.now() - startedAt,
+      success: true,
+    })
+    return output
+  } catch (error) {
+    recordAgentRoleStepMetrics({
+      sessionId: options.sessionId,
+      role: options.roleDefinition.role,
+      taskId: options.taskId,
+      input: options.input,
+      durationMs: performance.now() - startedAt,
+      success: false,
+      errorCode: error instanceof RuntimeAgentStepError
+        ? error.summary.errorCode ?? 'RUNTIME_AGENT_STEP_ERROR'
+        : 'AGENT_ROLE_STEP_ERROR',
+      failureType: error instanceof RuntimeAgentStepError && error.summary.structuredOutput
+        ? error.summary.structuredOutput.failureType
+        : undefined,
+    })
+    throw error
+  }
+}
+
+function recordAgentRoleStepMetrics(options: {
+  sessionId: string
+  role: string
+  taskId?: string
+  input: unknown
+  output?: unknown
+  durationMs: number
+  success: boolean
+  errorCode?: string
+  failureType?: string
+}): void {
+  recordTaskSessionEvent(options.sessionId, 'agent_loop_role_step_metrics', {
+    role: options.role,
+    taskId: options.taskId,
+    durationMs: Math.round(options.durationMs * 100) / 100,
+    inputTokens: estimateTextTokens(stringifyForMetrics(options.input)),
+    outputTokens: options.output === undefined ? 0 : estimateTextTokens(stringifyForMetrics(options.output)),
+    success: options.success,
+    errorCode: options.errorCode,
+    failureType: options.failureType,
+  })
+}
+
+function stringifyForMetrics(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? null)
+  } catch {
+    return String(value)
+  }
+}
 
 function getCancelledTaskSession(sessionId: string): SessionSnapshot | null {
   try {
@@ -253,7 +328,9 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
       setTaskSessionPhase(sessionId, 'planning')
 
       // Call Planner
-      plannerOutput = await stepRunner<{ sessionId: string; goal: string; queueId: string; context?: string }, PlannerAgentResult>({
+      plannerOutput = await runAgentRoleStep<{ sessionId: string; goal: string; queueId: string; context?: string }, PlannerAgentResult>({
+        sessionId,
+        stepRunner,
         roleDefinition: PLANNER_ROLE,
         input: {
           sessionId,
@@ -558,7 +635,7 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
           }
         } else {
           try {
-            executorResult = await stepRunner<
+            executorResult = await runAgentRoleStep<
               {
                 sessionId: string
                 queueId: string
@@ -577,7 +654,10 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               },
               ExecutorAgentResult
             >({
+              sessionId,
+              stepRunner,
               roleDefinition: taskRole,
+              taskId: task.taskId,
               input: {
                 sessionId,
                 queueId: sessionId,
@@ -651,11 +731,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
           if (needsReview && !autoApprove) {
             setTaskSessionPhase(sessionId, 'reviewing')
             try {
-              const criticOutput = await stepRunner<
+              const criticOutput = await runAgentRoleStep<
                 { sessionId: string; queueId: string; taskId: string; title: string; description?: string; result: string; executorMetadata?: Record<string, unknown>; cwd?: string; allowedPaths?: string[] },
                 { approved: boolean; reason?: string; retryTaskTitle?: string; retryTaskDescription?: string }
               >({
+                sessionId,
+                stepRunner,
                 roleDefinition: CRITIC_ROLE,
+                taskId: task.taskId,
                 input: {
                   sessionId,
                   queueId: sessionId,

@@ -1,11 +1,15 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   AgentJobRegistry,
   AgentJobRegistryError,
   isTerminalAgentJobStatus,
 } from '../src/nexus/agents/AgentJobRegistry.js'
 import type { AgentResult } from '../src/nexus/agents/types.js'
+import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 
 test('agent job registry creates queued explore jobs with profile defaults', () => {
   const registry = new AgentJobRegistry({ now: fixedClock() })
@@ -208,6 +212,86 @@ test('agent job registry returns defensive copies', () => {
   const stored = registry.getJob(job.jobId)
   assert.deepEqual(stored.metadata, { nested: 'original' })
   assert.equal(stored.result?.findings?.[0]?.message, 'Found file.')
+})
+
+test('agent job registry hydrates persisted jobs and preserves generated ids', () => {
+  const restored = new AgentJobRegistry({ now: fixedClock() })
+  restored.hydrateJobs([
+    {
+      jobId: 'agent-job-7',
+      parentSessionId: 'session-parent',
+      childSessionId: 'session-child',
+      agentType: 'explore',
+      status: 'completed',
+      prompt: 'Persisted job.',
+      contextForkMode: 'minimal',
+      isolation: 'none',
+      createdAt: '2026-06-04T00:00:00.000Z',
+      updatedAt: '2026-06-04T00:00:01.000Z',
+      completedAt: '2026-06-04T00:00:01.000Z',
+      result: { summary: 'Persisted.' },
+      metadata: { source: 'storage' },
+    },
+  ])
+
+  assert.equal(restored.getJob('agent-job-7').result?.summary, 'Persisted.')
+  const next = restored.createJob({
+    parentSessionId: 'session-parent',
+    childSessionId: 'session-next',
+    prompt: 'Next job.',
+  })
+  assert.equal(next.jobId, 'agent-job-8')
+})
+
+test('agent job storage persists and filters jobs in memory and sqlite', async () => {
+  const stores = [
+    new MemoryStorage(),
+    new SqliteStorage(join(tmpdir(), `babel-o-agent-jobs-${process.pid}-${Date.now()}.sqlite`)),
+  ]
+
+  for (const storage of stores) {
+    try {
+      const registry = new AgentJobRegistry({ now: incrementingClock() })
+      const first = registry.createJob({
+        parentSessionId: 'session-a',
+        childSessionId: 'session-a-child',
+        prompt: 'Persist first job.',
+        governance: {
+          maxConcurrentAgents: 4,
+          activeAgents: 0,
+          maxDepth: 2,
+          depth: 1,
+          maxRuntimeMs: 120_000,
+          timeoutAt: '2026-06-04T00:02:00.000Z',
+        },
+      })
+      await storage.saveAgentJob(first)
+      const second = registry.createJob({
+        parentSessionId: 'session-b',
+        childSessionId: 'session-b-child',
+        prompt: 'Persist second job.',
+        agentType: 'review',
+      })
+      await storage.saveAgentJob(registry.markRunning(second.jobId))
+      await storage.saveAgentJob(registry.completeJob(second.jobId, { summary: 'Second done.' }))
+
+      assert.equal((await storage.getAgentJob(first.jobId))?.governance?.depth, 1)
+      assert.deepEqual(
+        (await storage.listAgentJobs({ parentSessionId: 'session-b' })).map(job => job.jobId),
+        [second.jobId],
+      )
+      assert.deepEqual(
+        (await storage.listAgentJobs({ status: 'completed' })).map(job => job.jobId),
+        [second.jobId],
+      )
+      assert.deepEqual(
+        (await storage.listAgentJobs({ agentType: 'explore' })).map(job => job.jobId),
+        [first.jobId],
+      )
+    } finally {
+      await storage.close?.()
+    }
+  }
 })
 
 function fixedClock(): () => string {

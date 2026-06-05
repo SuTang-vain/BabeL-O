@@ -201,26 +201,45 @@ test('runtime pipeline builds context warning and blocking event sequences', () 
     isBlocking: true,
   }
 
+  const policy = buildCacheAwareCompactPolicy({
+    modelId: 'minimax/MiniMax-M3',
+    tokenEstimate: windowState.tokenEstimate,
+    maxOutputTokens: 16_384,
+  })
   const warning = buildContextWarningEvent({
     sessionId: 'session-context-warning',
     modelId: 'test-model',
     windowState,
     thresholdPercent: 85,
     message: 'custom warning',
+    cacheAwareCompactPolicy: policy,
   })
   assert.equal(warning.type, 'context_warning')
   assert.equal(warning.tokenEstimate, 9_500)
   assert.equal(warning.thresholdPercent, 85)
+  assert.equal(warning.modelContextWindow, policy.modelContextWindow)
+  assert.equal(warning.reservedOutputTokens, policy.reservedOutputTokens)
+  assert.equal(warning.providerSafetyBufferTokens, policy.providerSafetyBufferTokens)
+  assert.equal(warning.effectiveContextCeiling, policy.effectiveContextCeiling)
+  assert.equal(warning.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(warning.contextPolicySource, policy.policySource)
 
   const events = buildContextBlockingEvents({
     sessionId: 'session-context-blocking',
     modelId: 'test-model',
     windowState,
     thresholdPercent: 85,
+    cacheAwareCompactPolicy: policy,
   })
   assert.deepEqual(events.map(event => event.type), ['context_warning', 'context_blocking', 'error', 'result'])
   assert.equal(events[1]?.type, 'context_blocking')
   assert.equal(events[1]?.httpStatus, 413)
+  assert.equal(events[1]?.modelContextWindow, policy.modelContextWindow)
+  assert.equal(events[1]?.reservedOutputTokens, policy.reservedOutputTokens)
+  assert.equal(events[1]?.providerSafetyBufferTokens, policy.providerSafetyBufferTokens)
+  assert.equal(events[1]?.effectiveContextCeiling, policy.effectiveContextCeiling)
+  assert.equal(events[1]?.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(events[1]?.contextPolicySource, policy.policySource)
   assert.equal(events[2]?.type, 'error')
   assert.equal(events[2]?.code, 'CONTEXT_LIMIT_EXCEEDED')
   assert.deepEqual(events[2]?.details, {
@@ -231,6 +250,15 @@ test('runtime pipeline builds context warning and blocking event sequences', () 
     tokenEstimate: 9_500,
     maxTokens: 10_000,
     blockingLimitTokens: 9_000,
+    contextPolicy: {
+      modelContextWindow: policy.modelContextWindow,
+      reservedOutputTokens: policy.reservedOutputTokens,
+      providerSafetyBufferTokens: policy.providerSafetyBufferTokens,
+      effectiveContextCeiling: policy.effectiveContextCeiling,
+      legacyContextCeiling: policy.legacyContextCeiling,
+      envMaxContextTokens: undefined,
+      source: policy.policySource,
+    },
     recoveryActions: ['compact', 'context', 'switch_model', 'reduce_tool_output'],
     suggestion: 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
     fallbackPolicy: {
@@ -823,8 +851,17 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(metrics.cacheCreationInputTokens, 2)
   assert.equal(metrics.cacheReadInputTokens, 8)
   assert.equal(metrics.compactSummaryLatencyMs, 15)
+  assert.equal(metrics.modelContextWindow, policy.modelContextWindow)
+  assert.equal(metrics.reservedOutputTokens, policy.reservedOutputTokens)
+  assert.equal(metrics.providerSafetyBufferTokens, policy.providerSafetyBufferTokens)
   assert.equal(metrics.effectiveContextCeiling, policy.effectiveContextCeiling)
   assert.equal(metrics.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(metrics.contextPolicySource, policy.policySource)
+  assert.equal(metrics.contextWarningThresholdPercent, policy.warningThresholdPercent)
+  assert.equal(metrics.contextCompactThresholdPercent, policy.compactThresholdPercent)
+  assert.equal(metrics.contextWarningThresholdTokens, policy.warningThresholdTokens)
+  assert.equal(metrics.contextCompactThresholdTokens, policy.compactThresholdTokens)
+  assert.equal(metrics.contextBlockingLimitTokens, policy.blockingLimitTokens)
   assert.equal(metrics.cachePreservationMode, true)
   assert.equal(metrics.longContextUtilizationMode, true)
 
@@ -845,8 +882,17 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(event.providerFirstTokenMs, 7)
   assert.equal(event.cacheCreationInputTokens, 2)
   assert.equal(event.cacheReadInputTokens, 8)
+  assert.equal(event.modelContextWindow, policy.modelContextWindow)
+  assert.equal(event.reservedOutputTokens, policy.reservedOutputTokens)
+  assert.equal(event.providerSafetyBufferTokens, policy.providerSafetyBufferTokens)
   assert.equal(event.effectiveContextCeiling, policy.effectiveContextCeiling)
   assert.equal(event.legacyContextCeiling, policy.legacyContextCeiling)
+  assert.equal(event.contextPolicySource, policy.policySource)
+  assert.equal(event.contextWarningThresholdPercent, policy.warningThresholdPercent)
+  assert.equal(event.contextCompactThresholdPercent, policy.compactThresholdPercent)
+  assert.equal(event.contextWarningThresholdTokens, policy.warningThresholdTokens)
+  assert.equal(event.contextCompactThresholdTokens, policy.compactThresholdTokens)
+  assert.equal(event.contextBlockingLimitTokens, policy.blockingLimitTokens)
   assert.equal(event.compactSummaryLatencyMs, 15)
   assert.equal(event.cachePreservationMode, true)
   assert.equal(event.longContextUtilizationMode, true)
@@ -2228,6 +2274,38 @@ test('/v1/runtime/provider-fallback/plan returns non-executing fallback action',
   }
 })
 
+test('provider smoke dry-run recognizes Moonshot and Ollama registry seeds', () => {
+  const moonshotConfig = new ConfigManager(join(tmpdir(), `babel-o-moonshot-smoke-${Date.now()}.json`))
+  moonshotConfig.save({
+    defaultModel: 'moonshot/moonshot-v1-128k',
+    providers: {
+      moonshot: { apiKey: 'moonshot-test-key' },
+    },
+  })
+
+  const moonshotSmoke = moonshotConfig.getProviderDiagnostics({ model: 'moonshot/moonshot-v1-128k' })
+  assert.equal(moonshotSmoke.providerId, 'moonshot')
+  assert.equal(moonshotSmoke.adapter, 'openai-compatible')
+  assert.equal(moonshotSmoke.authMode, 'bearer')
+  assert.equal(moonshotSmoke.authConfigured, true)
+  assert.equal(moonshotSmoke.modelDeclared, true)
+  assert.equal(moonshotSmoke.capabilities.structuredOutput, true)
+  assert.equal(moonshotSmoke.suitability.agentLoopRoles.optimizer.suitable, true)
+
+  const ollamaConfig = new ConfigManager(join(tmpdir(), `babel-o-ollama-smoke-${Date.now()}.json`))
+  ollamaConfig.save({ defaultModel: 'ollama/qwen2.5-coder:7b' })
+
+  const ollamaSmoke = ollamaConfig.getProviderDiagnostics({ model: 'ollama/qwen2.5-coder:7b' })
+  assert.equal(ollamaSmoke.providerId, 'ollama')
+  assert.equal(ollamaSmoke.adapter, 'openai-compatible')
+  assert.equal(ollamaSmoke.authMode, 'none')
+  assert.equal(ollamaSmoke.authConfigured, true)
+  assert.equal(ollamaSmoke.baseUrl, 'http://localhost:11434/v1')
+  assert.equal(ollamaSmoke.baseUrlSource, 'provider_default')
+  assert.equal(ollamaSmoke.modelDeclared, true)
+  assert.equal(ollamaSmoke.capabilities.toolCalling, true)
+})
+
 test('/v1/runtime/provider-smoke/live runs fixed live smoke without creating sessions', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-live`)
   const configPath = join(cwd, 'config.json')
@@ -3263,8 +3341,18 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
         outputTokens: 30,
         cacheCreationInputTokens: 50,
         cacheReadInputTokens: 150,
+        modelContextWindow: 200_000,
+        reservedOutputTokens: 16_384,
+        providerSafetyBufferTokens: 4_000,
         effectiveContextCeiling: 179_616,
         legacyContextCeiling: 120_000,
+        envMaxContextTokens: 180_000,
+        contextPolicySource: 'large_context',
+        contextWarningThresholdPercent: 80,
+        contextCompactThresholdPercent: 93,
+        contextWarningThresholdTokens: 143_692,
+        contextCompactThresholdTokens: 167_042,
+        contextBlockingLimitTokens: 178_616,
         cacheReadRatio: 0.5,
         cachePreservationMode: true,
         longContextUtilizationMode: true,
@@ -3272,6 +3360,84 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
         prefixCacheVolatileContentLast: true,
         prefixCacheFingerprint: 'runtime-prefix-fingerprint',
         compactSummaryLatencyMs: 12,
+      }
+      yield {
+        type: 'hook_completed',
+        ...eventBase(options.sessionId),
+        hookName: 'InvocationDiagnosticsHook',
+        hookEvent: 'PostInvocation',
+        toolUseId: 'provider-invocation-success',
+        output: {
+          summary: 'Provider invocation completed.',
+          metadata: {
+            providerId: 'test-provider',
+            modelId: 'test-model',
+            role: 'executor',
+            durationMs: 40,
+            success: true,
+          },
+        },
+      }
+      yield {
+        type: 'hook_completed',
+        ...eventBase(options.sessionId),
+        hookName: 'InvocationDiagnosticsHook',
+        hookEvent: 'PostInvocation',
+        toolUseId: 'provider-invocation-failure',
+        output: {
+          summary: 'Provider invocation completed.',
+          metadata: {
+            providerId: 'test-provider',
+            modelId: 'test-model',
+            role: 'critic',
+            durationMs: 20,
+            success: false,
+            errorCode: 'PROVIDER_ERROR',
+            failureKind: 'provider_protocol',
+          },
+        },
+      }
+      yield {
+        type: 'task_session_event',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        eventId: 'task-event-created',
+        eventType: 'task_created',
+        phase: 'executing',
+        timestamp: new Date().toISOString(),
+        payload: { task: { taskId: 'task-1', status: 'pending', retryCount: 0 } },
+      }
+      yield {
+        type: 'task_session_event',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        eventId: 'task-event-role',
+        eventType: 'agent_loop_role_step_metrics',
+        phase: 'executing',
+        timestamp: new Date().toISOString(),
+        payload: { role: 'executor', taskId: 'task-1', durationMs: 15, inputTokens: 11, outputTokens: 7, success: true },
+      }
+      yield {
+        type: 'task_session_event',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: options.sessionId,
+        eventId: 'task-event-updated',
+        eventType: 'task_updated',
+        phase: 'executing',
+        timestamp: new Date().toISOString(),
+        payload: { task: { taskId: 'task-1', status: 'failed', retryCount: 1, review: { reviewerAgentId: 'system', reason: 'Executor step returned failure or crashed' } } },
+      }
+      yield {
+        type: 'agent_job_event',
+        ...eventBase(options.sessionId),
+        eventId: 'agent-job-event-1',
+        eventType: 'agent_job_failed',
+        jobId: 'agent-job-1',
+        childSessionId: 'child-session-1',
+        agentType: 'review',
+        contextForkMode: 'task-focused',
+        status: 'failed',
+        error: { code: 'AGENT_JOB_TIMEOUT', message: 'timed out' },
       }
       yield {
         type: 'result',
@@ -3296,8 +3462,18 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(savedMetrics?.providerFirstTokenMs, 25)
     assert.equal(savedMetrics?.cacheCreationInputTokens, 50)
     assert.equal(savedMetrics?.cacheReadInputTokens, 150)
+    assert.equal(savedMetrics?.modelContextWindow, 200_000)
+    assert.equal(savedMetrics?.reservedOutputTokens, 16_384)
+    assert.equal(savedMetrics?.providerSafetyBufferTokens, 4_000)
     assert.equal(savedMetrics?.effectiveContextCeiling, 179_616)
     assert.equal(savedMetrics?.legacyContextCeiling, 120_000)
+    assert.equal(savedMetrics?.envMaxContextTokens, 180_000)
+    assert.equal(savedMetrics?.contextPolicySource, 'large_context')
+    assert.equal(savedMetrics?.contextWarningThresholdPercent, 80)
+    assert.equal(savedMetrics?.contextCompactThresholdPercent, 93)
+    assert.equal(savedMetrics?.contextWarningThresholdTokens, 143_692)
+    assert.equal(savedMetrics?.contextCompactThresholdTokens, 167_042)
+    assert.equal(savedMetrics?.contextBlockingLimitTokens, 178_616)
     assert.equal(savedMetrics?.compactSummaryLatencyMs, 12)
     assert.equal(savedMetrics?.cachePreservationMode, true)
     assert.equal(savedMetrics?.longContextUtilizationMode, true)
@@ -3311,8 +3487,18 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(metrics.tokenUsage.cacheCreationInputTokens, 50)
     assert.equal(metrics.tokenUsage.cacheReadInputTokens, 150)
     assert.equal(metrics.tokenUsage.cacheReadRatio, 0.5)
+    assert.equal(metrics.contextPolicy.modelContextWindow, 200_000)
+    assert.equal(metrics.contextPolicy.reservedOutputTokens, 16_384)
+    assert.equal(metrics.contextPolicy.providerSafetyBufferTokens, 4_000)
     assert.equal(metrics.contextPolicy.effectiveContextCeiling, 179_616)
     assert.equal(metrics.contextPolicy.legacyContextCeiling, 120_000)
+    assert.equal(metrics.contextPolicy.envMaxContextTokens, 180_000)
+    assert.equal(metrics.contextPolicy.source, 'large_context')
+    assert.equal(metrics.contextPolicy.warningThresholdPercent, 80)
+    assert.equal(metrics.contextPolicy.compactThresholdPercent, 93)
+    assert.equal(metrics.contextPolicy.warningThresholdTokens, 143_692)
+    assert.equal(metrics.contextPolicy.compactThresholdTokens, 167_042)
+    assert.equal(metrics.contextPolicy.blockingLimitTokens, 178_616)
     assert.equal(metrics.contextPolicy.cachePreservationModeCount, 1)
     assert.equal(metrics.contextPolicy.longContextUtilizationModeCount, 1)
     assert.equal(metrics.contextPolicy.prefixCache.immutableRatioAvg, 0.82)
@@ -3320,13 +3506,40 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
     assert.equal(metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
     assert.equal(metrics.compactSummaryLatencyMs.avgMs, 12)
+    assert.equal(metrics.providerInvocations.count, 2)
+    assert.equal(metrics.providerInvocations.successCount, 1)
+    assert.equal(metrics.providerInvocations.failureCount, 1)
+    assert.equal(metrics.providerInvocations.durationMs.avgMs, 30)
+    assert.equal(metrics.providerInvocations.byFailureKind.provider_protocol, 1)
+    assert.equal(metrics.providerInvocations.byErrorCode.PROVIDER_ERROR, 1)
+    assert.equal(metrics.providerInvocations.byRole.executor.successCount, 1)
+    assert.equal(metrics.providerInvocations.byRole.critic.failureCount, 1)
+    assert.equal(metrics.agentLoop.sessionsObserved, 1)
+    assert.equal(metrics.agentLoop.taskCount, 1)
+    assert.equal(metrics.agentLoop.failedTaskCount, 1)
+    assert.equal(metrics.agentLoop.retryCount, 1)
+    assert.equal(metrics.agentLoop.roleStepCount, 1)
+    assert.equal(metrics.agentLoop.roleInputTokens, 11)
+    assert.equal(metrics.agentLoop.roleOutputTokens, 7)
+    assert.equal(metrics.agentLoop.roleDurationMs.avgMs, 15)
+    assert.equal(metrics.agentLoop.byRole.executor.count, 1)
+    assert.equal(metrics.agentLoop.byFailureType.executor_failed, 1)
+    assert.equal(metrics.agentJobs.count, 1)
+    assert.equal(metrics.agentJobs.failedCount, 1)
+    assert.equal(metrics.agentJobs.byAgentType.review.failedCount, 1)
+    assert.equal(metrics.agentJobs.byFailureCode.AGENT_JOB_TIMEOUT, 1)
 
     const statusResponse = await app.inject({ method: 'GET', url: '/v1/runtime/status' })
     const status = statusResponse.json()
+    assert.equal(status.metrics.contextPolicy.modelContextWindow, 200_000)
+    assert.equal(status.metrics.contextPolicy.source, 'large_context')
     assert.equal(status.metrics.contextPolicy.prefixCache.immutableRatioAvg, 0.82)
     assert.equal(status.metrics.contextPolicy.prefixCache.sampleCount, 1)
     assert.equal(status.metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
     assert.equal(status.metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
+    assert.equal(status.metrics.providerInvocations.count, 2)
+    assert.equal(status.metrics.agentLoop.roleStepCount, 1)
+    assert.equal(status.metrics.agentJobs.failedCount, 1)
   } finally {
     await app.close()
     await storage.close()

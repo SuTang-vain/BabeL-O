@@ -1,3 +1,4 @@
+import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusTask } from '../shared/task.js'
@@ -66,8 +67,18 @@ export type ExecutionMetrics = {
   outputTokens?: number
   cacheCreationInputTokens?: number
   cacheReadInputTokens?: number
+  modelContextWindow?: number
+  reservedOutputTokens?: number
+  providerSafetyBufferTokens?: number
   effectiveContextCeiling?: number
   legacyContextCeiling?: number
+  envMaxContextTokens?: number
+  contextPolicySource?: 'legacy' | 'large_context' | 'env_cap'
+  contextWarningThresholdPercent?: number
+  contextCompactThresholdPercent?: number
+  contextWarningThresholdTokens?: number
+  contextCompactThresholdTokens?: number
+  contextBlockingLimitTokens?: number
   cacheReadRatio?: number
   cachePreservationMode?: boolean
   longContextUtilizationMode?: boolean
@@ -96,6 +107,9 @@ export interface NexusStorage {
   saveTask(task: NexusTask): Promise<void>
   getTask(taskId: string): Promise<NexusTask | null>
   listTasks(sessionId: string): Promise<NexusTask[]>
+  saveAgentJob(job: AgentJob): Promise<void>
+  getAgentJob(jobId: string): Promise<AgentJob | null>
+  listAgentJobs(filter?: AgentJobFilter): Promise<AgentJob[]>
   saveToolTrace(trace: ToolTrace): Promise<void>
   getToolTrace(toolUseId: string): Promise<ToolTrace | null>
   listToolTraces(

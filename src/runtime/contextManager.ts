@@ -243,6 +243,7 @@ export function estimateContextItemTokens(text: string): number {
 
 function contextKindForEvent(event: NexusEvent): ContextItemKind {
   if (event.type === 'tool_completed') return 'tool_result'
+  if (event.type === 'agent_job_event') return 'child_agent_state'
   if (event.type === 'task_created' || event.type === 'task_session_event') return isChildAgentStateEvent(event) ? 'child_agent_state' : 'task_state'
   if (event.type === 'compact_boundary') return 'compact_summary'
   return 'event'
@@ -282,6 +283,8 @@ function eventPreviewText(event: NexusEvent): string {
       return `${event.taskId} ${event.title}`
     case 'task_session_event':
       return `${event.eventType} ${safeStringify(event.payload)}`
+    case 'agent_job_event':
+      return `${event.eventType} ${event.status} ${event.agentType} ${event.childSessionId}`
     default:
       return safeStringify(event)
   }

@@ -25,19 +25,68 @@ export class NexusError extends Error {
   }
 }
 
+export type ProviderErrorMetadata = {
+  code?: string
+  type?: string
+  message?: string
+  requestId?: string
+}
+
 export class ProviderError extends NexusError {
+  readonly metadata: ProviderErrorMetadata
+
   constructor(
     public readonly providerId: string,
     public readonly httpStatus: number,
     public readonly rawMessage: string,
   ) {
+    const metadata = parseProviderErrorMetadata(rawMessage)
     super(
-      `Provider '${providerId}' request failed with status ${httpStatus}: ${rawMessage}`,
+      `Provider '${providerId}' request failed with status ${httpStatus}: ${formatProviderErrorMessage(rawMessage, metadata)}`,
       ErrorCodes.PROVIDER_ERROR,
       502,
     )
     this.name = 'ProviderError'
+    this.metadata = metadata
   }
+}
+
+function parseProviderErrorMetadata(rawMessage: string): ProviderErrorMetadata {
+  try {
+    const parsed = JSON.parse(rawMessage)
+    const error = isRecord(parsed.error) ? parsed.error : parsed
+    return {
+      code: stringifyProviderErrorField(error.code),
+      type: stringifyProviderErrorField(error.type),
+      message: typeof error.message === 'string' ? error.message : undefined,
+      requestId: typeof parsed.request_id === 'string'
+        ? parsed.request_id
+        : typeof parsed.requestId === 'string'
+          ? parsed.requestId
+          : undefined,
+    }
+  } catch {
+    return {}
+  }
+}
+
+function formatProviderErrorMessage(rawMessage: string, metadata: ProviderErrorMetadata): string {
+  const parts = [
+    metadata.code ? `code=${metadata.code}` : undefined,
+    metadata.type ? `type=${metadata.type}` : undefined,
+    metadata.message,
+    metadata.requestId ? `request_id=${metadata.requestId}` : undefined,
+  ].filter((part): part is string => Boolean(part))
+  return parts.length > 0 ? parts.join(' ') : rawMessage
+}
+
+function stringifyProviderErrorField(value: unknown): string | undefined {
+  if (typeof value === 'string' || typeof value === 'number') return String(value)
+  return undefined
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 export function errorMessage(error: unknown): string {

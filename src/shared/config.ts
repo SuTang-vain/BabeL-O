@@ -247,6 +247,7 @@ const BABEL_X_PROVIDER_ALIASES: Record<string, string> = {
   anthropic: 'anthropic',
   deepseek: 'deepseek',
   minimax: 'minimax',
+  moonshot: 'moonshot',
 };
 
 const BABEL_X_MODEL_ALIASES: Record<string, Record<string, string>> = {
@@ -257,6 +258,12 @@ const BABEL_X_MODEL_ALIASES: Record<string, Record<string, string>> = {
     'minimax-m2.5-highspeed': 'MiniMax-M2.5-highspeed',
     'minimax-m2.7': 'MiniMax-M2.7',
     'minimax-m2.7-highspeed': 'MiniMax-M2.7-highspeed',
+  },
+  moonshot: {
+    'moonshot-v1-8k': 'moonshot-v1-8k',
+    'moonshot-v1-32k': 'moonshot-v1-32k',
+    'moonshot-v1-128k': 'moonshot-v1-128k',
+    'moonshot-v1-auto': 'moonshot-v1-auto',
   },
 };
 
@@ -581,6 +588,10 @@ export class ConfigManager {
         apiKey = process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY;
       } else if (providerId === 'minimax') {
         apiKey = process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN;
+      } else if (providerId === 'moonshot') {
+        apiKey = process.env.MOONSHOT_API_KEY;
+      } else if (providerId === 'ollama') {
+        apiKey = process.env.OLLAMA_API_KEY;
       }
       if (apiKey) {
         apiKeySource = 'env';
@@ -611,6 +622,10 @@ export class ConfigManager {
         baseUrl = process.env.ZHIPU_BASE_URL || process.env.ZHIPUAI_BASE_URL;
       } else if (providerId === 'minimax') {
         baseUrl = process.env.MINIMAX_BASE_URL;
+      } else if (providerId === 'moonshot') {
+        baseUrl = process.env.MOONSHOT_BASE_URL;
+      } else if (providerId === 'ollama') {
+        baseUrl = process.env.OLLAMA_BASE_URL;
       }
       if (baseUrl) {
         baseUrlSource = 'env';

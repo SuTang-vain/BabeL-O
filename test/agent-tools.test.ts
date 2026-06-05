@@ -14,6 +14,14 @@ const queuedJob: AgentJob = {
   isolation: 'none',
   createdAt: '2026-06-04T00:00:00.000Z',
   updatedAt: '2026-06-04T00:00:00.000Z',
+  governance: {
+    maxConcurrentAgents: 4,
+    activeAgents: 0,
+    maxDepth: 2,
+    depth: 1,
+    maxRuntimeMs: 120_000,
+    timeoutAt: '2026-06-04T00:02:00.000Z',
+  },
 }
 
 const completedJob: AgentJob = {
@@ -55,6 +63,7 @@ test('AgentSpawn uses current session as parent and can wait for result', async 
   }])
   assert.deepEqual(scheduler.waitRequests, [{ jobId: 'agent-job-1', options: { timeoutMs: 50 } }])
   assert.equal((result.output as any).status, 'completed')
+  assert.equal((result.output as any).governance.maxConcurrentAgents, 4)
   assert.equal((result.output as any).result.summary, 'Found files.')
 })
 

@@ -24,6 +24,9 @@ import {
   getContextWindowState,
 } from '../src/runtime/tokenEstimator.js'
 import { runMockAgentLoopBenchmark } from '../src/nexus/agentLoopBenchmark.js'
+import { writeBenchmarkHistory } from '../src/nexus/benchmarkHistory.js'
+import { runRetryPolicyBenchmark } from '../src/nexus/retryPolicyBenchmark.js'
+import { runRunnerComparisonBenchmark } from '../src/nexus/runnerComparisonBenchmark.js'
 import {
   configureStorageBridgeWalForTest,
   flushStorageBridgeForTest,
@@ -338,26 +341,45 @@ async function main(): Promise<void> {
     const storageBridgeFaultInjectionBenchmark = await benchmarkStorageBridgeFaultInjection(cwd)
     const tokenEstimatorBenchmark = benchmarkChineseTokenEstimator()
     const agentLoopBenchmark = await runMockAgentLoopBenchmark()
+    const retryPolicyBenchmark = await runRetryPolicyBenchmark({ agentLoop: agentLoopBenchmark })
+    const runnerComparisonBenchmark = await runRunnerComparisonBenchmark({
+      workspaceRoot: cwd,
+      projectRoot,
+      runGoRunner: process.env.BABEL_O_RUN_GO_RUNNER_SMOKE === '1',
+    })
+
+    const benchmarkResult = {
+      type: 'performance_benchmark',
+      timestamp: new Date().toISOString(),
+      schemaVersion: 1,
+      results,
+      context: contextBenchmark,
+      autoCompact: autoCompactBenchmark,
+      cacheAwareCompact: cacheAwareCompactBenchmark,
+      apiScale: apiScaleBenchmark,
+      chatFirstResponse: chatFirstResponseBenchmark,
+      storageBridgeFaultInjection: storageBridgeFaultInjectionBenchmark,
+      tokenEstimator: tokenEstimatorBenchmark,
+      agentLoop: agentLoopBenchmark,
+      retryPolicy: retryPolicyBenchmark,
+      runnerComparison: runnerComparisonBenchmark,
+      metrics: (await app.inject({
+        method: 'GET',
+        url: '/v1/runtime/metrics',
+      })).json(),
+    }
+    const benchmarkHistory = await writeBenchmarkHistory({
+      result: benchmarkResult,
+      projectRoot,
+      outputDir: process.env.BABEL_O_BENCHMARK_HISTORY_DIR,
+      disabled: process.env.BABEL_O_BENCHMARK_HISTORY_DISABLED === '1',
+    })
 
     console.log(
       JSON.stringify(
         {
-          type: 'performance_benchmark',
-          timestamp: new Date().toISOString(),
-          schemaVersion: 1,
-          results,
-          context: contextBenchmark,
-          autoCompact: autoCompactBenchmark,
-          cacheAwareCompact: cacheAwareCompactBenchmark,
-          apiScale: apiScaleBenchmark,
-          chatFirstResponse: chatFirstResponseBenchmark,
-          storageBridgeFaultInjection: storageBridgeFaultInjectionBenchmark,
-          tokenEstimator: tokenEstimatorBenchmark,
-          agentLoop: agentLoopBenchmark,
-          metrics: (await app.inject({
-            method: 'GET',
-            url: '/v1/runtime/metrics',
-          })).json(),
+          ...benchmarkResult,
+          benchmarkHistory,
         },
         null,
         2,

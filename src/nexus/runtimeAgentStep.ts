@@ -38,6 +38,8 @@ type StructuredOutputCandidate = {
   value: unknown
 }
 
+export type ProviderNeutralAgentFailureKind = 'provider_protocol' | 'json_parse_error' | 'schema_mismatch' | 'capability_gate' | 'runtime_error'
+
 export type RuntimeAgentStepUsageSummary = {
   role: string
   eventCount: number
@@ -63,6 +65,7 @@ export type RuntimeAgentStepUsageSummary = {
 
 export type StructuredOutputDiagnostics = {
   failureType: 'no_structured_json' | 'schema_mismatch' | 'provider_error'
+  providerNeutralFailureKind: ProviderNeutralAgentFailureKind
   candidateCount: number
   candidateSources: string[]
   missingRequiredKeys?: string[]
@@ -696,12 +699,15 @@ function buildStructuredOutputDiagnostics(
     .find((providerError): providerError is string => Boolean(providerError))
   const schemaErrors = extractSchemaErrorSummaries(message)
 
+  const failureType = providerErrorCandidate
+    ? 'provider_error'
+    : candidates.length > 0
+      ? 'schema_mismatch'
+      : 'no_structured_json'
+
   return {
-    failureType: providerErrorCandidate
-      ? 'provider_error'
-      : candidates.length > 0
-        ? 'schema_mismatch'
-        : 'no_structured_json',
+    failureType,
+    providerNeutralFailureKind: mapStructuredOutputFailureKind(failureType, message),
     candidateCount: candidates.length,
     candidateSources: candidates.map(candidate => candidate.source),
     missingRequiredKeys: inferMissingRequiredKeys(candidates, outputSchema),
@@ -710,6 +716,26 @@ function buildStructuredOutputDiagnostics(
     resultPayloadPreview: previewForDiagnostics(resultPayload),
     structuredOutputPreview: previewForDiagnostics(structuredOutputPayload),
   }
+}
+
+function mapStructuredOutputFailureKind(
+  failureType: StructuredOutputDiagnostics['failureType'],
+  message: string,
+): ProviderNeutralAgentFailureKind {
+  const normalized = message.toLowerCase()
+  if (
+    failureType === 'provider_error' ||
+    normalized.includes('provider returned an error') ||
+    normalized.includes('reasoning_content') ||
+    normalized.includes('tool_call_id')
+  ) {
+    return 'provider_protocol'
+  }
+  if (normalized.includes('does not support tool calling') || normalized.includes('does not support structured output')) {
+    return 'capability_gate'
+  }
+  if (failureType === 'schema_mismatch') return 'schema_mismatch'
+  return 'json_parse_error'
 }
 
 function buildUsageSummary(input: {

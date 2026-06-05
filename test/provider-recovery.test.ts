@@ -44,6 +44,26 @@ test('classifyProviderRecovery tags auth and billing failures as non-retryable',
   assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
 })
 
+test('ProviderError preserves provider-specific error metadata', () => {
+  const error = new ProviderError('openai', 401, JSON.stringify({
+    error: {
+      code: 'invalid_api_key',
+      type: 'authentication_error',
+      message: 'Incorrect API key provided.',
+    },
+    request_id: 'req_provider_789',
+  }))
+
+  assert.deepEqual(error.metadata, {
+    code: 'invalid_api_key',
+    type: 'authentication_error',
+    message: 'Incorrect API key provided.',
+    requestId: 'req_provider_789',
+  })
+  assert.match(error.message, /code=invalid_api_key/)
+  assert.match(error.message, /request_id=req_provider_789/)
+})
+
 test('classifyProviderRecovery tags provider protocol replay mismatches', () => {
   const details = classifyProviderRecovery(
     new ProviderError(

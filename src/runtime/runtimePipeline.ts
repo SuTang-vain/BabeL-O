@@ -46,8 +46,18 @@ export type RuntimeExecutionMetrics = {
   outputTokens: number
   cacheCreationInputTokens: number
   cacheReadInputTokens: number
+  modelContextWindow?: number
+  reservedOutputTokens?: number
+  providerSafetyBufferTokens?: number
   effectiveContextCeiling?: number
   legacyContextCeiling?: number
+  envMaxContextTokens?: number
+  contextPolicySource?: 'legacy' | 'large_context' | 'env_cap'
+  contextWarningThresholdPercent?: number
+  contextCompactThresholdPercent?: number
+  contextWarningThresholdTokens?: number
+  contextCompactThresholdTokens?: number
+  contextBlockingLimitTokens?: number
   cacheReadRatio?: number
   cachePreservationMode?: boolean
   longContextUtilizationMode?: boolean
@@ -55,6 +65,9 @@ export type RuntimeExecutionMetrics = {
   prefixCacheVolatileContentLast?: boolean
   prefixCacheFingerprint?: string
   compactSummaryLatencyMs?: number
+  toolCallTextLeakSuppressedCount: number
+  finalAnswerRetryCount: number
+  toolShapedTextPattern?: string
   remoteToolCallCount: number
   remoteToolRunnerDurationMs: number
 }
@@ -66,11 +79,20 @@ export type RuntimeProviderToolCall = {
   input?: unknown
 }
 
+export type ToolCallTextLeakPhase = 'respond_only' | 'tools_hidden' | 'final_response_only' | 'max_loop' | 'unknown'
+
+export type ToolCallTextLeakSuppression = {
+  phase: ToolCallTextLeakPhase
+  pattern: string
+  redactedPreview: string
+}
+
 export type RuntimeProviderTurn = {
   assistantText: string
   reasoningText: string
   finishReason?: FinishReason
   toolCalls: RuntimeProviderToolCall[]
+  toolCallTextLeakSuppression?: ToolCallTextLeakSuppression
   durationMs: number
   turnFirstTokenMs?: number
   providerFirstTokenMs?: number
@@ -145,12 +167,37 @@ export function buildRuntimeErrorEvent(options: {
   }
 }
 
+export function buildToolCallTextLeakSuppressedEvent(options: {
+  sessionId: string
+  providerId?: string
+  modelId?: string
+  suppression: ToolCallTextLeakSuppression
+  retryAttempted: boolean
+  retrySucceeded?: boolean
+}): Extract<NexusEvent, { type: 'error' }> {
+  return buildRuntimeErrorEvent({
+    sessionId: options.sessionId,
+    code: 'TOOL_CALL_TEXT_LEAK_SUPPRESSED',
+    message: 'Suppressed tool-call-shaped assistant text while tools are unavailable for this turn.',
+    details: {
+      providerId: options.providerId,
+      modelId: options.modelId,
+      phase: options.suppression.phase,
+      pattern: options.suppression.pattern,
+      redactedPreview: options.suppression.redactedPreview,
+      retryAttempted: options.retryAttempted,
+      ...(options.retrySucceeded !== undefined && { retrySucceeded: options.retrySucceeded }),
+    },
+  })
+}
+
 export function buildContextWarningEvent(options: {
   sessionId: string
   modelId: string
   windowState: ContextWindowState
   thresholdPercent: number
   message: string
+  cacheAwareCompactPolicy?: CacheAwareCompactPolicy
 }): Extract<NexusEvent, { type: 'context_warning' }> {
   return {
     type: 'context_warning',
@@ -160,6 +207,7 @@ export function buildContextWarningEvent(options: {
     maxTokens: options.windowState.maxTokens,
     percentUsed: options.windowState.percentUsed,
     thresholdPercent: options.thresholdPercent,
+    ...contextPolicyEventFields(options.cacheAwareCompactPolicy),
     message: options.message,
   }
 }
@@ -169,6 +217,7 @@ export function buildContextBlockingEvent(options: {
   modelId: string
   windowState: ContextWindowState
   message?: string
+  cacheAwareCompactPolicy?: CacheAwareCompactPolicy
 }): Extract<NexusEvent, { type: 'context_blocking' }> {
   const message = options.message ?? buildContextBlockingMessage(options.windowState)
   return {
@@ -181,6 +230,7 @@ export function buildContextBlockingEvent(options: {
     warningThresholdTokens: options.windowState.warningThresholdTokens,
     compactThresholdTokens: options.windowState.compactThresholdTokens,
     blockingLimitTokens: options.windowState.blockingLimitTokens,
+    ...contextPolicyEventFields(options.cacheAwareCompactPolicy),
     httpStatus: 413,
     recoveryActions: ['compact', 'context', 'switch_model', 'reduce_tool_output'],
     message,
@@ -198,6 +248,7 @@ export function buildContextBlockingErrorDetails(
     tokenEstimate: event.tokenEstimate,
     maxTokens: event.maxTokens,
     blockingLimitTokens: event.blockingLimitTokens,
+    contextPolicy: contextPolicyErrorDetails(event),
     recoveryActions: event.recoveryActions,
     suggestion: 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
     fallbackPolicy: buildProviderFallbackPolicy('context_window'),
@@ -210,6 +261,7 @@ export function buildContextBlockingEvents(options: {
   windowState: ContextWindowState
   thresholdPercent: number
   message?: string
+  cacheAwareCompactPolicy?: CacheAwareCompactPolicy
 }): NexusEvent[] {
   const message = options.message ?? buildContextBlockingMessage(options.windowState)
   const blockingEvent = buildContextBlockingEvent({
@@ -217,6 +269,7 @@ export function buildContextBlockingEvents(options: {
     modelId: options.modelId,
     windowState: options.windowState,
     message,
+    cacheAwareCompactPolicy: options.cacheAwareCompactPolicy,
   })
   return [
     buildContextWarningEvent({
@@ -225,6 +278,7 @@ export function buildContextBlockingEvents(options: {
       windowState: options.windowState,
       thresholdPercent: options.thresholdPercent,
       message,
+      cacheAwareCompactPolicy: options.cacheAwareCompactPolicy,
     }),
     blockingEvent,
     buildRuntimeErrorEvent({
@@ -239,6 +293,31 @@ export function buildContextBlockingEvents(options: {
 
 export function buildContextBlockingMessage(windowState: ContextWindowState): string {
   return `Context estimate ${windowState.tokenEstimate}/${windowState.maxTokens} tokens exceeds the blocking limit (${windowState.blockingLimitTokens}). Run /compact or /context before continuing.`
+}
+
+function contextPolicyEventFields(policy: CacheAwareCompactPolicy | undefined) {
+  if (!policy) return {}
+  return {
+    modelContextWindow: policy.modelContextWindow,
+    reservedOutputTokens: policy.reservedOutputTokens,
+    providerSafetyBufferTokens: policy.providerSafetyBufferTokens,
+    effectiveContextCeiling: policy.effectiveContextCeiling,
+    legacyContextCeiling: policy.legacyContextCeiling,
+    envMaxContextTokens: policy.envMaxContextTokens,
+    contextPolicySource: policy.policySource,
+  }
+}
+
+function contextPolicyErrorDetails(event: Extract<NexusEvent, { type: 'context_blocking' }>) {
+  return {
+    modelContextWindow: event.modelContextWindow,
+    reservedOutputTokens: event.reservedOutputTokens,
+    providerSafetyBufferTokens: event.providerSafetyBufferTokens,
+    effectiveContextCeiling: event.effectiveContextCeiling,
+    legacyContextCeiling: event.legacyContextCeiling,
+    envMaxContextTokens: event.envMaxContextTokens,
+    source: event.contextPolicySource,
+  }
 }
 
 export type RuntimeContextRefreshState = {
@@ -347,10 +426,12 @@ export type RuntimeProviderTurnOutcome =
 
 export function reduceProviderTurnOutcome(options: {
   sessionId: string
-  turn: Pick<RuntimeProviderTurn, 'assistantText' | 'reasoningText' | 'finishReason' | 'toolCalls'>
+  turn: Pick<RuntimeProviderTurn, 'assistantText' | 'reasoningText' | 'finishReason' | 'toolCalls' | 'toolCallTextLeakSuppression'>
   finalResponseOnlyMode: boolean
   suppressToolsForUserIntent: boolean
   userIntentGuidance: UserIntentGuidance
+  providerId?: string
+  modelId?: string
   maxTokenRecoveryCount: number
   maxTokenRecoveries: number
   outputRetryCount: number
@@ -360,6 +441,37 @@ export function reduceProviderTurnOutcome(options: {
   const baseCounts = {
     maxTokenRecoveryCount: options.maxTokenRecoveryCount,
     outputRetryCount: options.outputRetryCount,
+  }
+
+  if (turn.toolCallTextLeakSuppression) {
+    const event = buildToolCallTextLeakSuppressedEvent({
+      sessionId: options.sessionId,
+      providerId: options.providerId,
+      modelId: options.modelId,
+      suppression: turn.toolCallTextLeakSuppression,
+      retryAttempted: options.outputRetryCount < options.maxOutputRetries,
+    })
+    if (options.outputRetryCount < options.maxOutputRetries) {
+      return {
+        kind: 'continue',
+        eventsBeforeMessages: [event],
+        eventsAfterMessages: [],
+        messages: [{
+          role: 'user',
+          content: 'The previous model response attempted to emit tool-call-shaped text while tools are disabled. Answer the latest user message directly in natural language. Do not include tool-call markup.',
+        }],
+        maxTokenRecoveryCount: options.maxTokenRecoveryCount,
+        outputRetryCount: options.outputRetryCount + 1,
+      }
+    }
+    const message = 'Suppressed a malformed tool-call-shaped response while tools were disabled.'
+    return {
+      kind: 'terminal',
+      eventsBeforeMessages: [],
+      eventsAfterMessages: [event, buildRuntimeResultEvent(options.sessionId, false, message)],
+      messages: [],
+      ...baseCounts,
+    }
   }
 
   if (turn.finishReason === 'max_tokens' && turn.toolCalls.length === 0) {
@@ -524,6 +636,8 @@ export function createRuntimeExecutionMetrics(): RuntimeExecutionMetrics {
     outputTokens: 0,
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 0,
+    toolCallTextLeakSuppressedCount: 0,
+    finalAnswerRetryCount: 0,
     remoteToolCallCount: 0,
     remoteToolRunnerDurationMs: 0,
   }
@@ -552,8 +666,18 @@ export function buildRuntimeExecutionMetricsEvent(
     outputTokens: includeProvider ? metrics.outputTokens : undefined,
     cacheCreationInputTokens: includeProvider ? metrics.cacheCreationInputTokens : undefined,
     cacheReadInputTokens: includeProvider ? metrics.cacheReadInputTokens : undefined,
+    modelContextWindow: includeContext ? metrics.modelContextWindow : undefined,
+    reservedOutputTokens: includeContext ? metrics.reservedOutputTokens : undefined,
+    providerSafetyBufferTokens: includeContext ? metrics.providerSafetyBufferTokens : undefined,
     effectiveContextCeiling: includeContext ? metrics.effectiveContextCeiling : undefined,
     legacyContextCeiling: includeContext ? metrics.legacyContextCeiling : undefined,
+    envMaxContextTokens: includeContext ? metrics.envMaxContextTokens : undefined,
+    contextPolicySource: includeContext ? metrics.contextPolicySource : undefined,
+    contextWarningThresholdPercent: includeContext ? metrics.contextWarningThresholdPercent : undefined,
+    contextCompactThresholdPercent: includeContext ? metrics.contextCompactThresholdPercent : undefined,
+    contextWarningThresholdTokens: includeContext ? metrics.contextWarningThresholdTokens : undefined,
+    contextCompactThresholdTokens: includeContext ? metrics.contextCompactThresholdTokens : undefined,
+    contextBlockingLimitTokens: includeContext ? metrics.contextBlockingLimitTokens : undefined,
     cacheReadRatio: includeProvider ? metrics.cacheReadRatio : undefined,
     cachePreservationMode: includeContext ? metrics.cachePreservationMode : undefined,
     longContextUtilizationMode: includeContext ? metrics.longContextUtilizationMode : undefined,
@@ -561,6 +685,9 @@ export function buildRuntimeExecutionMetricsEvent(
     prefixCacheVolatileContentLast: includeContext ? metrics.prefixCacheVolatileContentLast : undefined,
     prefixCacheFingerprint: includeContext ? metrics.prefixCacheFingerprint : undefined,
     compactSummaryLatencyMs: metrics.compactSummaryLatencyMs,
+    toolCallTextLeakSuppressedCount: metrics.toolCallTextLeakSuppressedCount > 0 ? metrics.toolCallTextLeakSuppressedCount : undefined,
+    finalAnswerRetryCount: metrics.finalAnswerRetryCount > 0 ? metrics.finalAnswerRetryCount : undefined,
+    toolShapedTextPattern: metrics.toolShapedTextPattern,
     remoteToolCallCount: metrics.remoteToolCallCount > 0 ? metrics.remoteToolCallCount : undefined,
     remoteToolRunnerDurationMs: metrics.remoteToolCallCount > 0 ? metrics.remoteToolRunnerDurationMs : undefined,
   }
@@ -587,8 +714,18 @@ export function absorbCacheAwareCompactPolicyMetrics(
   metrics: RuntimeExecutionMetrics,
   policy: CacheAwareCompactPolicy,
 ): void {
+  metrics.modelContextWindow = policy.modelContextWindow
+  metrics.reservedOutputTokens = policy.reservedOutputTokens
+  metrics.providerSafetyBufferTokens = policy.providerSafetyBufferTokens
   metrics.effectiveContextCeiling = policy.effectiveContextCeiling
   metrics.legacyContextCeiling = policy.legacyContextCeiling
+  metrics.envMaxContextTokens = policy.envMaxContextTokens
+  metrics.contextPolicySource = policy.policySource
+  metrics.contextWarningThresholdPercent = policy.warningThresholdPercent
+  metrics.contextCompactThresholdPercent = policy.compactThresholdPercent
+  metrics.contextWarningThresholdTokens = policy.warningThresholdTokens
+  metrics.contextCompactThresholdTokens = policy.compactThresholdTokens
+  metrics.contextBlockingLimitTokens = policy.blockingLimitTokens
   metrics.cacheReadRatio = policy.cacheReadRatio
   metrics.cachePreservationMode = policy.cachePreservationMode
   metrics.longContextUtilizationMode = policy.longContextUtilizationMode
@@ -751,6 +888,7 @@ export function buildRuntimeContextBlockingEventsForLoop(options: {
   windowState: ContextWindowState
   autoCompactDecision: AutoCompactDecision
   fallbackThresholdPercent: number
+  cacheAwareCompactPolicy?: CacheAwareCompactPolicy
 }): NexusEvent[] {
   return buildContextBlockingEvents({
     sessionId: options.sessionId,
@@ -759,6 +897,7 @@ export function buildRuntimeContextBlockingEventsForLoop(options: {
     thresholdPercent: options.autoCompactDecision.enabled
       ? options.autoCompactDecision.thresholdPercent
       : options.fallbackThresholdPercent,
+    cacheAwareCompactPolicy: options.cacheAwareCompactPolicy,
   })
 }
 
@@ -960,6 +1099,7 @@ export async function* streamProviderTurn(options: {
   signal?: AbortSignal
   executionStartMs?: number
   queryStartMs?: number
+  toolCallTextLeakGuard?: { phase: ToolCallTextLeakPhase }
 }): AsyncGenerator<NexusEvent, RuntimeProviderTurn> {
   const queryStartMs = options.queryStartMs ?? performance.now()
   let assistantText = ''
@@ -976,6 +1116,8 @@ export async function* streamProviderTurn(options: {
     cacheReadInputTokens: 0,
   }
   const toolCalls: RuntimeProviderToolCall[] = []
+  let textLeakSuppression: ToolCallTextLeakSuppression | undefined
+  let guardedTextBuffer = ''
 
   const markFirstToken = () => {
     if (turnFirstTokenMs !== undefined) return
@@ -995,6 +1137,15 @@ export async function* streamProviderTurn(options: {
       markFirstToken()
       streamDeltaCount += 1
       charsOut += delta.text.length
+      if (options.toolCallTextLeakGuard) {
+        guardedTextBuffer += delta.text
+        const leak = detectToolCallTextLeak(guardedTextBuffer, options.toolCallTextLeakGuard.phase)
+        if (leak) {
+          textLeakSuppression = leak
+          guardedTextBuffer = ''
+        }
+        continue
+      }
       assistantText += delta.text
       yield {
         type: 'assistant_delta',
@@ -1046,11 +1197,21 @@ export async function* streamProviderTurn(options: {
     }
   }
 
+  if (options.toolCallTextLeakGuard && guardedTextBuffer && !textLeakSuppression) {
+    assistantText += guardedTextBuffer
+    yield {
+      type: 'assistant_delta',
+      ...eventBase(options.sessionId),
+      text: guardedTextBuffer,
+    }
+  }
+
   return {
     assistantText,
     reasoningText,
     finishReason,
     toolCalls,
+    toolCallTextLeakSuppression: textLeakSuppression,
     durationMs: performance.now() - queryStartMs,
     turnFirstTokenMs,
     providerFirstTokenMs,
@@ -1058,6 +1219,36 @@ export async function* streamProviderTurn(options: {
     charsOut,
     usage,
   }
+}
+
+function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): ToolCallTextLeakSuppression | undefined {
+  const normalized = text.toLowerCase()
+  const patterns = [
+    '<tool_call',
+    '</tool_call>',
+    '<invoke name=',
+    '</invoke>',
+    '<minimax:tool_call',
+    '</minimax:tool_call>',
+    '"tool_calls"',
+    '"function_call"',
+    'call_tool ',
+  ]
+  const pattern = patterns.find(candidate => normalized.includes(candidate))
+  if (!pattern) return undefined
+  return {
+    phase,
+    pattern,
+    redactedPreview: redactToolCallTextPreview(text),
+  }
+}
+
+function redactToolCallTextPreview(text: string): string {
+  return text
+    .replace(/<command>[\s\S]*?<\/command>/gi, '<command>[REDACTED]</command>')
+    .replace(/"arguments"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"arguments":"[REDACTED]"')
+    .replace(/"command"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"command":"[REDACTED]"')
+    .slice(0, 300)
 }
 
 function isSupportedTaskUpdateStatus(status: string | undefined): status is 'pending' | 'in_progress' | 'completed' | 'failed' {

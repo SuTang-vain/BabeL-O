@@ -1,5 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { Command } from 'commander'
+import { registerModelsCommand } from '../src/cli/commands/models.js'
 import {
   getProvider,
   getModel,
@@ -36,6 +38,20 @@ test('getProvider returns valid provider definition', () => {
   assert.equal(minimaxProvider.adapter, 'anthropic-compatible')
   assert.equal(minimaxProvider.authMode, 'api-key')
   assert.ok(minimaxProvider.models.includes('minimax/MiniMax-M2.7'))
+
+  const moonshotProvider = getProvider('moonshot')
+  assert.equal(moonshotProvider.id, 'moonshot')
+  assert.equal(moonshotProvider.adapter, 'openai-compatible')
+  assert.equal(moonshotProvider.authMode, 'bearer')
+  assert.equal(moonshotProvider.defaultBaseUrl, 'https://api.moonshot.cn/v1')
+  assert.ok(moonshotProvider.models.includes('moonshot/moonshot-v1-128k'))
+
+  const ollamaProvider = getProvider('ollama')
+  assert.equal(ollamaProvider.id, 'ollama')
+  assert.equal(ollamaProvider.adapter, 'openai-compatible')
+  assert.equal(ollamaProvider.authMode, 'none')
+  assert.equal(ollamaProvider.defaultBaseUrl, 'http://localhost:11434/v1')
+  assert.ok(ollamaProvider.models.includes('ollama/qwen2.5-coder:7b'))
 })
 
 test('getProvider throws UnknownProviderError for unknown ids', () => {
@@ -81,6 +97,20 @@ test('getModel returns valid model definition', () => {
   assert.equal(minimaxModel.capabilities.toolCalling, true)
   assert.equal(minimaxModel.capabilities.jsonOutput, true)
   assert.equal(minimaxModel.capabilities.streaming, true)
+
+  const moonshotModel = getModel('moonshot/moonshot-v1-128k')
+  assert.equal(moonshotModel.id, 'moonshot/moonshot-v1-128k')
+  assert.equal(moonshotModel.contextWindow, 128000)
+  assert.equal(moonshotModel.capabilities.toolCalling, true)
+  assert.equal(moonshotModel.capabilities.jsonOutput, true)
+  assert.equal(moonshotModel.capabilities.streaming, true)
+
+  const ollamaModel = getModel('ollama/qwen2.5-coder:7b')
+  assert.equal(ollamaModel.id, 'ollama/qwen2.5-coder:7b')
+  assert.equal(ollamaModel.contextWindow, 32768)
+  assert.equal(ollamaModel.capabilities.toolCalling, true)
+  assert.equal(ollamaModel.capabilities.jsonOutput, true)
+  assert.equal(ollamaModel.capabilities.streaming, true)
 
   // deepseek-reasoner (R1) explicitly declares no tool-calling support
   const reasonerModel = getModel('deepseek/deepseek-reasoner')
@@ -154,6 +184,29 @@ test('inspectModelCapabilities exposes provider and registry-backed model capabi
   assert.equal(diagnostics.suitability.agentLoopRoles.critic.suitable, true)
 })
 
+test('inspectModelCapabilities exposes Moonshot and Ollama seed diagnostics', () => {
+  const moonshotDiagnostics = inspectModelCapabilities('moonshot/moonshot-v1-128k')
+  assert.equal(moonshotDiagnostics.providerId, 'moonshot')
+  assert.equal(moonshotDiagnostics.providerName, 'Moonshot AI')
+  assert.equal(moonshotDiagnostics.adapter, 'openai-compatible')
+  assert.equal(moonshotDiagnostics.authMode, 'bearer')
+  assert.equal(moonshotDiagnostics.modelDeclared, true)
+  assert.equal(moonshotDiagnostics.contextWindow, 128000)
+  assert.equal(moonshotDiagnostics.capabilities.structuredOutput, true)
+  assert.equal(moonshotDiagnostics.suitability.agentLoopRoles.optimizer.suitable, true)
+
+  const ollamaDiagnostics = inspectModelCapabilities('ollama/qwen2.5-coder:7b')
+  assert.equal(ollamaDiagnostics.providerId, 'ollama')
+  assert.equal(ollamaDiagnostics.providerName, 'Ollama local OpenAI-compatible')
+  assert.equal(ollamaDiagnostics.adapter, 'openai-compatible')
+  assert.equal(ollamaDiagnostics.authMode, 'none')
+  assert.equal(ollamaDiagnostics.modelDeclared, true)
+  assert.equal(ollamaDiagnostics.contextWindow, 32768)
+  assert.equal(ollamaDiagnostics.capabilities.toolCalling, true)
+  assert.equal(ollamaDiagnostics.suitability.agentLoopRoles.planner.suitable, false)
+  assert.deepEqual(ollamaDiagnostics.suitability.agentLoopRoles.planner.missingCapabilities, ['long_context'])
+})
+
 test('inspectModelCapabilities marks provider-scoped custom models as undeclared without hard blocking', () => {
   const diagnostics = inspectModelCapabilities('openai/custom-model')
 
@@ -176,4 +229,30 @@ test('inspectModelCapabilities supports slashless custom models with explicit pr
   assert.equal(diagnostics.modelId, 'custom-gpt')
   assert.equal(diagnostics.modelDeclared, false)
   assert.equal(diagnostics.capabilitySource, 'undeclared')
+})
+
+test('models CLI list and inspect include Moonshot and Ollama seeds', async () => {
+  const output: string[] = []
+  const originalLog = console.log
+  console.log = (...args: unknown[]) => {
+    output.push(args.map(arg => String(arg)).join(' '))
+  }
+  try {
+    const program = new Command()
+    program.exitOverride()
+    registerModelsCommand(program)
+
+    await program.parseAsync(['models', 'list'], { from: 'user' })
+    assert.match(output.join('\n'), /moonshot\/moonshot-v1-128k/)
+    assert.match(output.join('\n'), /ollama\/qwen2\.5-coder:7b/)
+
+    output.length = 0
+    await program.parseAsync(['models', 'inspect', 'ollama/qwen2.5-coder:7b'], { from: 'user' })
+    const inspectOutput = output.join('\n')
+    assert.match(inspectOutput, /Provider:\s+Ollama local OpenAI-compatible \(ollama\)/)
+    assert.match(inspectOutput, /Auth Mode:\s+none/)
+    assert.match(inspectOutput, /No automatic model switch or role recommendation is performed\./)
+  } finally {
+    console.log = originalLog
+  }
 })

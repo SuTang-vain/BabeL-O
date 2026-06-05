@@ -43,6 +43,7 @@ describe('Model Adapters & Factory', () => {
   let mockResponseBody: ReadableStream<Uint8Array> | null = null
   let mockResponseOk = true
   let mockResponseStatus = 200
+  let mockResponseText = 'Error message'
 
   beforeEach(() => {
     originalFetch = globalThis.fetch
@@ -51,6 +52,7 @@ describe('Model Adapters & Factory', () => {
     mockResponseBody = null
     mockResponseOk = true
     mockResponseStatus = 200
+    mockResponseText = 'Error message'
 
     globalThis.fetch = async (url, init) => {
       lastFetchUrl = typeof url === 'string' ? url : (url as Request).url
@@ -58,7 +60,7 @@ describe('Model Adapters & Factory', () => {
       return {
         ok: mockResponseOk,
         status: mockResponseStatus,
-        text: async () => 'Error message',
+        text: async () => mockResponseText,
         body: mockResponseBody,
       } as Response
     }
@@ -260,7 +262,7 @@ describe('Model Adapters & Factory', () => {
           })) {}
         },
         (err: any) => {
-          assert.strictEqual(err.name, 'ProviderError')
+              assert.strictEqual(err.name, 'ProviderError')
           assert.strictEqual(err.providerId, 'anthropic')
           assert.strictEqual(err.httpStatus, 400)
           return true
@@ -376,6 +378,42 @@ describe('Model Adapters & Factory', () => {
         },
         { type: 'finish', reason: 'tool_use' },
       ])
+    })
+
+    test('minimax bracket-wrapped tool calls with direct child tags are normalized', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"]<]minimax[>[<tool_call>\\n]<]minimax[>[<invoke name=\\"Bash\\">]<]minimax[>[<command>pwd</command>]"}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"]<]minimax[>[<timeoutMs>10000</timeoutMs>]\\n]<]minimax[>[</invoke>\\n]<]minimax[>[</tool_call>"}}\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'minimax/MiniMax-M3',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.deepStrictEqual(deltas, [
+        { type: 'tool_use_start', id: 'minimax_tool_1', name: 'Bash' },
+        {
+          type: 'tool_use_delta',
+          id: 'minimax_tool_1',
+          inputDelta: JSON.stringify({ command: 'pwd', timeoutMs: '10000' }),
+        },
+        {
+          type: 'tool_use_end',
+          id: 'minimax_tool_1',
+          input: { command: 'pwd', timeoutMs: '10000' },
+        },
+        { type: 'finish', reason: 'tool_use' },
+      ])
+      assert.ok(!deltas.some(delta => delta.type === 'text' && delta.text.includes(']<]minimax[>[')))
+      assert.ok(!deltas.some(delta => delta.type === 'text' && delta.text.includes('<tool_call>')))
     })
 
     test('minimax text around encoded tool calls stays text while tool XML is suppressed', async () => {
@@ -554,10 +592,77 @@ describe('Model Adapters & Factory', () => {
       ])
     })
 
-    test('throws ProviderError on non-200 response', async () => {
+    test('uses Moonshot seed defaults for OpenAI-compatible requests', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+
+      const oldOpenAiBaseUrl = process.env.OPENAI_BASE_URL
+      let deltas
+      try {
+        process.env.OPENAI_BASE_URL = 'https://wrong-openai-env.example/v1'
+        deltas = await collectStream(
+          adapter.queryStream(
+            {
+              model: 'moonshot/moonshot-v1-128k',
+              messages: [{ role: 'user', content: 'test' }],
+            },
+            { apiKey: 'sk-moonshot-test' }
+          )
+        )
+      } finally {
+        if (oldOpenAiBaseUrl === undefined) delete process.env.OPENAI_BASE_URL
+        else process.env.OPENAI_BASE_URL = oldOpenAiBaseUrl
+      }
+
+      assert.equal(lastFetchUrl, 'https://api.moonshot.cn/v1/chat/completions')
+      assert.ok(lastFetchInit)
+      const headers = lastFetchInit.headers as Record<string, string>
+      assert.equal(headers.Authorization, 'Bearer sk-moonshot-test')
+      const body = JSON.parse(lastFetchInit.body as string)
+      assert.equal(body.model, 'moonshot-v1-128k')
+      assert.equal(body.max_tokens, 8192)
+      assert.deepEqual(deltas, [{ type: 'text', text: 'ok' }])
+    })
+
+    test('uses Ollama OpenAI-compatible seed without Authorization header', async () => {
+      const adapter = new OpenAIAdapter()
+      mockResponseBody = createMockStream([
+        'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+        'data: [DONE]\n\n',
+      ])
+
+      const deltas = await collectStream(
+        adapter.queryStream({
+          model: 'ollama/qwen2.5-coder:7b',
+          messages: [{ role: 'user', content: 'test' }],
+        })
+      )
+
+      assert.equal(lastFetchUrl, 'http://localhost:11434/v1/chat/completions')
+      assert.ok(lastFetchInit)
+      const headers = lastFetchInit.headers as Record<string, string>
+      assert.equal(headers.Authorization, undefined)
+      const body = JSON.parse(lastFetchInit.body as string)
+      assert.equal(body.model, 'qwen2.5-coder:7b')
+      assert.equal(body.max_tokens, 4096)
+      assert.deepEqual(deltas, [{ type: 'text', text: 'ok' }])
+    })
+
+    test('throws ProviderError with parsed provider-specific error metadata', async () => {
       const adapter = new OpenAIAdapter()
       mockResponseOk = false
       mockResponseStatus = 401
+      mockResponseText = JSON.stringify({
+        error: {
+          code: 'invalid_api_key',
+          type: 'authentication_error',
+          message: 'Incorrect API key provided.',
+        },
+        request_id: 'req_provider_123',
+      })
 
       await assert.rejects(
         async () => {
@@ -570,6 +675,14 @@ describe('Model Adapters & Factory', () => {
           assert.strictEqual(err.name, 'ProviderError')
           assert.strictEqual(err.providerId, 'openai')
           assert.strictEqual(err.httpStatus, 401)
+          assert.deepStrictEqual(err.metadata, {
+            code: 'invalid_api_key',
+            type: 'authentication_error',
+            message: 'Incorrect API key provided.',
+            requestId: 'req_provider_123',
+          })
+          assert.match(err.message, /code=invalid_api_key/)
+          assert.match(err.message, /request_id=req_provider_123/)
           return true
         }
       )

@@ -91,6 +91,7 @@ export function summarizeSessionEvents(
         lastResult = `${event.success ? 'success' : 'failed'}: ${snippet(event.message, 160)}`
         break
       case 'task_session_event':
+      case 'agent_job_event':
         stats.taskEvents++
         break
       case 'session_started':
@@ -141,12 +142,25 @@ export function summarizeSessionEvents(
 }
 
 function formatErrorIssue(event: Extract<NexusEvent, { type: 'error' }>): string {
+  if (event.code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED') {
+    return formatToolCallTextLeakIssue(event)
+  }
   const details = event.details
   const recoveryReason = details && typeof details === 'object'
     ? (details as { recoveryReason?: unknown }).recoveryReason
     : undefined
   const suffix = typeof recoveryReason === 'string' ? ` (${recoveryReason})` : ''
   return `${event.code}: ${snippet(event.message, 120)}${suffix}`
+}
+
+function formatToolCallTextLeakIssue(event: Extract<NexusEvent, { type: 'error' }>): string {
+  const details = event.details && typeof event.details === 'object'
+    ? event.details as { phase?: unknown; pattern?: unknown; redactedPreview?: unknown }
+    : {}
+  const phase = typeof details.phase === 'string' ? details.phase : 'unknown'
+  const pattern = typeof details.pattern === 'string' ? details.pattern : 'unknown'
+  const preview = typeof details.redactedPreview === 'string' ? `; preview ${snippet(details.redactedPreview, 80)}` : ''
+  return `TOOL_CALL_TEXT_LEAK_SUPPRESSED: phase ${phase}; pattern ${pattern}${preview}`
 }
 
 function increment(counts: Map<string, number>, key: string) {

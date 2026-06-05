@@ -2,7 +2,7 @@ import chalk from 'chalk'
 import { ConfigManager } from '../shared/config.js'
 import { padToTerminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 
-const VERSION = '0.2.8'
+const VERSION = '0.2.9'
 const WELCOME_MAX_WIDTH = 96
 const PIXEL_ROWS = [
   '    M    ',

@@ -8,6 +8,16 @@ const baseEventFields = {
   timestamp: z.string(),
 }
 
+const contextPolicyFields = {
+  modelContextWindow: z.number().optional(),
+  reservedOutputTokens: z.number().optional(),
+  providerSafetyBufferTokens: z.number().optional(),
+  effectiveContextCeiling: z.number().optional(),
+  legacyContextCeiling: z.number().optional(),
+  envMaxContextTokens: z.number().optional(),
+  contextPolicySource: z.enum(['legacy', 'large_context', 'env_cap']).optional(),
+}
+
 export const SessionStartedEventSchema = z.object({
   type: z.literal('session_started'),
   ...baseEventFields,
@@ -135,6 +145,36 @@ export const TaskSessionEventSchema = z.object({
   payload: z.unknown().optional(),
 })
 
+export const AgentJobGovernanceEventSchema = z.object({
+  maxConcurrentAgents: z.number(),
+  activeAgents: z.number(),
+  maxDepth: z.number(),
+  depth: z.number(),
+  maxRuntimeMs: z.number(),
+  timeoutAt: z.string().optional(),
+})
+
+export const AgentJobEventSchema = z.object({
+  type: z.literal('agent_job_event'),
+  ...baseEventFields,
+  eventId: z.string(),
+  eventType: z.enum([
+    'agent_job_queued',
+    'agent_job_started',
+    'agent_job_completed',
+    'agent_job_failed',
+    'agent_job_cancelled',
+  ]),
+  jobId: z.string(),
+  childSessionId: z.string(),
+  agentType: z.enum(['explore', 'review', 'test', 'implement', 'debug', 'general']),
+  contextForkMode: z.enum(['minimal', 'working-set', 'task-focused', 'full-summary', 'debug-replay']),
+  status: z.enum(['queued', 'running', 'waiting_permission', 'completed', 'failed', 'cancelled']),
+  governance: AgentJobGovernanceEventSchema.optional(),
+  result: z.unknown().optional(),
+  error: z.unknown().optional(),
+})
+
 export const PermissionRequestEventSchema = z.object({
   type: z.literal('permission_request'),
   ...baseEventFields,
@@ -226,6 +266,7 @@ export const ContextWarningEventSchema = z.object({
   maxTokens: z.number(),
   percentUsed: z.number(),
   thresholdPercent: z.number(),
+  ...contextPolicyFields,
   message: z.string(),
 })
 
@@ -239,6 +280,7 @@ export const ContextBlockingEventSchema = z.object({
   warningThresholdTokens: z.number(),
   compactThresholdTokens: z.number(),
   blockingLimitTokens: z.number(),
+  ...contextPolicyFields,
   httpStatus: z.literal(413),
   recoveryActions: z.array(z.enum(['compact', 'context', 'switch_model', 'reduce_tool_output'])),
   message: z.string(),
@@ -275,8 +317,12 @@ export const ExecutionMetricsEventSchema = z.object({
   outputTokens: z.number().optional(),
   cacheCreationInputTokens: z.number().optional(),
   cacheReadInputTokens: z.number().optional(),
-  effectiveContextCeiling: z.number().optional(),
-  legacyContextCeiling: z.number().optional(),
+  ...contextPolicyFields,
+  contextWarningThresholdPercent: z.number().optional(),
+  contextCompactThresholdPercent: z.number().optional(),
+  contextWarningThresholdTokens: z.number().optional(),
+  contextCompactThresholdTokens: z.number().optional(),
+  contextBlockingLimitTokens: z.number().optional(),
   cacheReadRatio: z.number().optional(),
   cachePreservationMode: z.boolean().optional(),
   longContextUtilizationMode: z.boolean().optional(),
@@ -284,6 +330,9 @@ export const ExecutionMetricsEventSchema = z.object({
   prefixCacheVolatileContentLast: z.boolean().optional(),
   prefixCacheFingerprint: z.string().optional(),
   compactSummaryLatencyMs: z.number().optional(),
+  toolCallTextLeakSuppressedCount: z.number().optional(),
+  finalAnswerRetryCount: z.number().optional(),
+  toolShapedTextPattern: z.string().optional(),
   remoteToolCallCount: z.number().optional(),
   remoteToolRunnerDurationMs: z.number().optional(),
 })
@@ -302,6 +351,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ResultEventSchema,
   ErrorEventSchema,
   TaskSessionEventSchema,
+  AgentJobEventSchema,
   PermissionRequestEventSchema,
   PermissionResponseEventSchema,
   HookStartedEventSchema,

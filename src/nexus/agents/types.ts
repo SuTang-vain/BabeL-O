@@ -1,27 +1,24 @@
-export type ContextForkMode =
-  | 'minimal'
-  | 'working-set'
-  | 'task-focused'
-  | 'full-summary'
-  | 'debug-replay'
+export type {
+  AgentFinding,
+  AgentIsolationMode,
+  AgentJob,
+  AgentJobError,
+  AgentJobFilter,
+  AgentJobGovernance,
+  AgentJobStatus,
+  AgentProfileId,
+  AgentResult,
+  ContextForkMode,
+} from '../../shared/agentJob.js'
 
-export type AgentProfileId =
-  | 'explore'
-  | 'review'
-  | 'test'
-  | 'implement'
-  | 'debug'
-  | 'general'
-
-export type AgentJobStatus =
-  | 'queued'
-  | 'running'
-  | 'waiting_permission'
-  | 'completed'
-  | 'failed'
-  | 'cancelled'
-
-export type AgentIsolationMode = 'none' | 'worktree'
+import type {
+  AgentIsolationMode,
+  AgentJob,
+  AgentJobFilter,
+  AgentJobStatus,
+  AgentProfileId,
+  ContextForkMode,
+} from '../../shared/agentJob.js'
 
 export type AgentProfile = {
   id: AgentProfileId
@@ -34,32 +31,6 @@ export type AgentProfile = {
   requiresApproval: boolean
   maxRuntimeMs: number
   maxOutputTokens: number
-}
-
-export type AgentJob = {
-  jobId: string
-  parentSessionId: string
-  childSessionId: string
-  parentTaskId?: string
-  agentType: AgentProfileId
-  status: AgentJobStatus
-  prompt: string
-  contextForkMode: ContextForkMode
-  isolation: AgentIsolationMode
-  createdAt: string
-  updatedAt: string
-  startedAt?: string
-  completedAt?: string
-  result?: AgentResult
-  error?: AgentJobError
-  transcriptPath?: string
-  metadata?: Record<string, unknown>
-}
-
-export type AgentJobError = {
-  code: string
-  message: string
-  details?: unknown
 }
 
 export type AgentSpawnRequest = {
@@ -76,30 +47,6 @@ export type AgentSpawnRequest = {
 
 export type AgentWaitOptions = {
   timeoutMs?: number
-}
-
-export type AgentJobFilter = {
-  parentSessionId?: string
-  status?: AgentJobStatus
-  agentType?: AgentProfileId
-}
-
-export type AgentFinding = {
-  severity: 'info' | 'warning' | 'error'
-  message: string
-  file?: string
-  line?: number
-  evidence?: string
-}
-
-export type AgentResult = {
-  summary: string
-  findings?: AgentFinding[]
-  changedFiles?: string[]
-  testsRun?: string[]
-  commandsRun?: string[]
-  nextSteps?: string[]
-  confidence?: 'low' | 'medium' | 'high'
 }
 
 export interface AgentScheduler {

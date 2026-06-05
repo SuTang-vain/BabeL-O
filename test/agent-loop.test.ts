@@ -106,6 +106,21 @@ test('runAgentLoop runs successfully and handles critic approval', async () => {
   assert.equal(queue.tasks.length, 1)
   assert.equal(queue.tasks[0].status, 'completed')
   assert.equal(queue.tasks[0].retryCount, 1) // 1 rejection retry
+
+  const roleMetricEvents = finalSession.events.filter(
+    event => event.type === 'task_session_event' && event.eventType === 'agent_loop_role_step_metrics',
+  )
+  const roleMetricPayloads = roleMetricEvents.map(event => {
+    assert.equal(event.type, 'task_session_event')
+    return event.payload as Record<string, unknown>
+  })
+  assert.ok(roleMetricPayloads.some(payload => payload.role === 'planner'))
+  assert.ok(roleMetricPayloads.some(payload => payload.role === 'optimizer'))
+  assert.ok(roleMetricPayloads.some(payload => payload.role === 'critic'))
+  assert.equal(
+    roleMetricPayloads.some(payload => 'input' in payload || 'output' in payload),
+    false,
+  )
 })
 
 test('runAgentLoop stops and marks failed when retry limit is reached', async () => {
@@ -1375,8 +1390,50 @@ test('runtime agent step surfaces diagnostics on structured output parse failure
       assert.equal(err.summary.lastToolName, 'Bash')
       assert.match(err.summary.lastToolOutputPreview ?? '', /command failed/)
       assert.equal(err.summary.structuredOutput?.failureType, 'no_structured_json')
+      assert.equal(err.summary.structuredOutput?.providerNeutralFailureKind, 'json_parse_error')
       assert.equal(err.summary.structuredOutput?.candidateCount, 0)
       assert.match(err.message, /structured output/)
+      return true
+    },
+  )
+})
+
+test('runtime agent step diagnostics classify wrapped provider errors', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-provider-error-diagnostics'
+  createTaskSession({ sessionId })
+
+  const stepRunner = createRuntimeAgentStepRunner({
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        yield {
+          type: 'result',
+          schemaVersion: '2026-05-21.babel-o.v1',
+          sessionId,
+          timestamp: new Date().toISOString(),
+          success: true,
+          message: '```json\n{"error":{"code":"tool_call_id_mismatch","message":"Provider rejected tool_call_id replay"},"request_id":"req_provider_456"}\n```',
+        }
+      },
+    } as any),
+  })
+
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: OPTIMIZER_ROLE,
+      input: {
+        sessionId,
+        queueId: sessionId,
+        taskId: 'task-provider-error-diagnostics',
+        title: 'diagnose provider error',
+      },
+    }),
+    (err: unknown) => {
+      assert.ok(err instanceof RuntimeAgentStepError)
+      assert.equal(err.summary.structuredOutput?.failureType, 'provider_error')
+      assert.equal(err.summary.structuredOutput?.providerNeutralFailureKind, 'provider_protocol')
+      assert.equal(err.summary.structuredOutput?.candidateSources[0], 'assistantText')
+      assert.match(err.message, /Provider returned an error/)
       return true
     },
   )
@@ -1416,6 +1473,7 @@ test('runtime agent step diagnostics include structured output missing required 
       assert.ok(err instanceof RuntimeAgentStepError)
       assert.equal(err.summary.structuredOutput?.failureType, 'schema_mismatch')
       assert.deepEqual(err.summary.structuredOutput?.candidateSources, ['assistantText'])
+      assert.equal(err.summary.structuredOutput?.providerNeutralFailureKind, 'schema_mismatch')
       assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('taskId'))
       assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('success'))
       assert.ok(err.summary.structuredOutput?.missingRequiredKeys?.includes('result'))

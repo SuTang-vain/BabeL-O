@@ -119,6 +119,9 @@ export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skil
       const subTaskLine = formatSubTaskStatusLine(taskEvent)
       if (subTaskLine) subTaskStatusLines.unshift(subTaskLine)
     }
+    if (event.type === 'agent_job_event') {
+      agentStatusLines.unshift(`- [${event.eventType}] ${event.status} ${event.agentType} ${event.childSessionId}`)
+    }
     if (event.type === 'hook_completed') {
       const hookEvent = event as { hookName?: string; hookEvent?: string }
       hookLines.unshift(`- ${hookEvent.hookName ?? 'hook'} (${hookEvent.hookEvent ?? 'unknown'})`)

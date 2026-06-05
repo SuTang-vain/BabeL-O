@@ -54,6 +54,8 @@ test('Nexus agent API manages jobs and transcript pages', async () => {
     const spawnedBody = spawned.json()
     assert.equal(spawnedBody.type, 'agent_job_spawned')
     assert.equal(spawnedBody.job.status, 'queued')
+    assert.equal(spawnedBody.job.governance.maxConcurrentAgents, 4)
+    assert.equal(spawnedBody.job.governance.depth, 1)
     assert.deepEqual(scheduler.spawnRequests, [{
       parentSessionId: 'session-parent',
       prompt: 'Find AgentScheduler.ts',
@@ -145,6 +147,14 @@ class RecordingScheduler implements AgentScheduler {
       agentType: request.agentType,
       contextForkMode: request.contextForkMode,
       isolation: request.isolation,
+      governance: {
+        maxConcurrentAgents: 4,
+        activeAgents: 0,
+        maxDepth: 2,
+        depth: 1,
+        maxRuntimeMs: 120_000,
+        timeoutAt: '2026-06-04T00:02:00.000Z',
+      },
     })
     await this.storage.saveSession({
       sessionId: 'session-child',

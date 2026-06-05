@@ -510,6 +510,13 @@ function updateAgentStatusFromEvent(event: NexusEvent): void {
         setAgentStatus('generating')
       }
       break
+    case 'agent_job_event':
+      if (event.eventType === 'agent_job_started') {
+        setAgentStatus('running_subagent', event.agentType)
+      } else if (event.eventType === 'agent_job_completed' || event.eventType === 'agent_job_failed' || event.eventType === 'agent_job_cancelled') {
+        setAgentStatus('generating')
+      }
+      break
   }
 }
 
@@ -625,6 +632,10 @@ function renderLiveEvent(event: NexusEvent): void {
       break
     case 'task_session_event':
       console.log(formatTaskSessionEvent(event))
+      if (hadSpinner && currentAgentStatus !== 'idle') startSpinner(formatAgentStatusText())
+      break
+    case 'agent_job_event':
+      console.log(formatAgentJobEvent(event))
       if (hadSpinner && currentAgentStatus !== 'idle') startSpinner(formatAgentStatusText())
       break
     case 'hook_started':
@@ -878,6 +889,10 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
 
       case 'task_session_event':
         outputText += `${formatTaskSessionEvent(ev)}\n`
+        break
+
+      case 'agent_job_event':
+        outputText += `${formatAgentJobEvent(ev)}\n`
         break
 
       case 'usage':
@@ -1325,6 +1340,20 @@ function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session
   const label = event.eventType.replace(/_/g, ' ')
   const phase = chalk.dim(event.phase)
   const payload = summarizePayload(event.payload)
+  return `${chalk.magenta('agent')} ${phase} ${label}${payload ? ` ${chalk.dim(payload)}` : ''}`
+}
+
+function formatAgentJobEvent(event: Extract<NexusEvent, { type: 'agent_job_event' }>): string {
+  const label = event.eventType.replace(/_/g, ' ')
+  const phase = chalk.dim(event.status)
+  const payload = summarizePayload({
+    agentType: event.agentType,
+    childSessionId: event.childSessionId,
+    transcriptPath: `nexus://sessions/${event.childSessionId}/events`,
+    governance: event.governance,
+    result: event.result,
+    error: event.error,
+  })
   return `${chalk.magenta('agent')} ${phase} ${label}${payload ? ` ${chalk.dim(payload)}` : ''}`
 }
 

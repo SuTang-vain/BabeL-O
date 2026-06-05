@@ -413,6 +413,8 @@ function eventContentFingerprint(event: NexusEvent): string {
       return hashString(`${event.taskId}:${event.title}`)
     case 'task_session_event':
       return hashString(`${event.eventId}:${event.eventType}:${event.phase}:${stableStringify(event.payload)}`)
+    case 'agent_job_event':
+      return hashString(`${event.eventId}:${event.eventType}:${event.status}:${event.jobId}:${event.childSessionId}:${stableStringify(event.result)}:${stableStringify(event.error)}`)
     case 'hook_started':
       return hashString(`${event.hookName}:${event.hookEvent}:${event.toolUseId ?? ''}:${event.toolName ?? ''}`)
     case 'hook_completed':
@@ -504,7 +506,8 @@ export function isRecoveryBoundaryError(code: string | undefined): boolean {
     code === 'CONTEXT_LIMIT_EXCEEDED' ||
     code === 'MAX_LOOPS_EXCEEDED' ||
     code === 'MAX_OUTPUT_TOKENS_EXCEEDED' ||
-    code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY'
+    code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY' ||
+    code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED'
 }
 
 function trimSelectedWindow(events: NexusEvent[], maxEvents: number): NexusEvent[] {

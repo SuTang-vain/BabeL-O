@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
 import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
+import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
+import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
 import { deriveFallbackUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
@@ -35,6 +37,10 @@ const CONFIG_ENV_KEYS = [
   'MINIMAX_API_KEY',
   'MINIMAX_AUTH_TOKEN',
   'MINIMAX_BASE_URL',
+  'MOONSHOT_API_KEY',
+  'MOONSHOT_BASE_URL',
+  'OLLAMA_API_KEY',
+  'OLLAMA_BASE_URL',
 ] as const
 
 type ConfigEnvSnapshot = Partial<Record<typeof CONFIG_ENV_KEYS[number], string>>
@@ -216,6 +222,27 @@ describe('ConfigManager', () => {
       const resolvedModelOverride = configManager.resolveSettings()
       assert.equal(resolvedModelOverride.modelId, 'anthropic/claude-3-opus')
       assert.equal(resolvedModelOverride.providerId, 'anthropic')
+
+      delete process.env.BABEL_O_MODEL
+      delete process.env.BABEL_O_API_KEY
+      process.env.MOONSHOT_API_KEY = 'env-moonshot-key'
+      process.env.MOONSHOT_BASE_URL = 'https://moonshot.test/v1'
+      const resolvedMoonshot = configManager.resolveSettings({ model: 'moonshot/moonshot-v1-128k' })
+      assert.equal(resolvedMoonshot.providerId, 'moonshot')
+      assert.equal(resolvedMoonshot.apiKey, 'env-moonshot-key')
+      assert.equal(resolvedMoonshot.apiKeySource, 'env')
+      assert.equal(resolvedMoonshot.baseUrl, 'https://moonshot.test/v1')
+      assert.equal(resolvedMoonshot.baseUrlSource, 'env')
+
+      delete process.env.MOONSHOT_API_KEY
+      delete process.env.MOONSHOT_BASE_URL
+      process.env.OLLAMA_BASE_URL = 'http://127.0.0.1:11434/v1'
+      const resolvedOllama = configManager.resolveSettings({ model: 'ollama/qwen2.5-coder:7b' })
+      assert.equal(resolvedOllama.providerId, 'ollama')
+      assert.equal(resolvedOllama.apiKey, undefined)
+      assert.equal(resolvedOllama.apiKeySource, 'none')
+      assert.equal(resolvedOllama.baseUrl, 'http://127.0.0.1:11434/v1')
+      assert.equal(resolvedOllama.baseUrlSource, 'env')
     } finally {
       // Restore env
       if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel; else delete process.env.BABEL_O_MODEL
@@ -497,13 +524,15 @@ describe('ConfigManager', () => {
         hasApiKey: true,
         hasBaseUrl: true,
       },
-    ])
-    assert.deepEqual(plan.skippedProfiles, [
       {
         name: 'moonshot-old',
         providerId: 'moonshot',
-        reason: 'provider is not registered in BabeL-O',
+        modelId: 'moonshot/moonshot-v1-auto',
+        hasApiKey: true,
+        hasBaseUrl: false,
       },
+    ])
+    assert.deepEqual(plan.skippedProfiles, [
       {
         name: 'empty-key',
         providerId: 'openai',
@@ -514,6 +543,8 @@ describe('ConfigManager', () => {
     assert.equal(plan.config.activeProfile, 'minimax-work')
     assert.equal(plan.config.profiles?.['minimax-work']?.apiKey, 'legacy-minimax-key')
     assert.equal(plan.config.providers?.minimax?.apiKey, 'legacy-minimax-key')
+    assert.equal(plan.config.profiles?.['moonshot-old']?.model, 'moonshot/moonshot-v1-auto')
+    assert.equal(plan.config.providers?.moonshot?.apiKey, 'legacy-moonshot-key')
     assert.match(plan.warnings.join('\n'), /transcripts are not imported/)
   })
 
@@ -1782,6 +1813,83 @@ describe('LLMCodingRuntime', () => {
     assert.match(resultEvent.message, /final answer/)
   })
 
+  test('suppresses tool-shaped text in final-response-only mode without starting a new loop', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-final-only-text-leak-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'notes.txt')
+    fs.writeFileSync(targetFile, 'final-only leakage fixture', 'utf8')
+
+    for (let i = 1; i <= 21; i++) {
+      fetchStreamResponses.push(
+        createMockStream([
+          'event: content_block_start\n',
+          `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-${i}","name":"Read","input":{}}}\n\n`,
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+            targetFile.replace(/\\/g, '\\\\') +
+            '\\"}"}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+      )
+    }
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<tool_call><invoke name=\\"Bash\\"><command>pwd</command></invoke></tool_call>"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"I will provide the final answer without more tools."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-final-only-text-leak-suppressed',
+        prompt: 'keep inspecting until done',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    const toolStartedEvents = events.filter(event => event.type === 'tool_started')
+    assert.equal(toolStartedEvents.length, 21)
+    assert.ok(!events.some(event => event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>')))
+    assert.ok(!events.some(event => event.type === 'assistant_delta' && JSON.stringify(event).includes('pwd')))
+
+    const leakError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED') as any
+    assert.ok(leakError)
+    assert.equal(leakError.details.phase, 'final_response_only')
+    assert.equal(leakError.details.pattern, '<tool_call')
+
+    const metricsEvent = events.find(event => event.type === 'execution_metrics') as any
+    assert.ok(metricsEvent)
+    assert.equal(metricsEvent.toolCallTextLeakSuppressedCount, 1)
+    assert.equal(metricsEvent.finalAnswerRetryCount, 1)
+    assert.equal(metricsEvent.toolShapedTextPattern, '<tool_call')
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.doesNotMatch(resultEvent.message, /tool_call|invoke name|pwd/)
+  })
+
   test('hard-suppresses MiniMax text-encoded tool calls for respond-only intake', async () => {
     configManager.setProviderConfig('minimax', {
       apiKey: 'minimax-test-key',
@@ -1856,6 +1964,164 @@ describe('LLMCodingRuntime', () => {
 
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(firstBody.tools, undefined)
+  })
+
+  test('hard-suppresses MiniMax bracket-wrapped tool calls for respond-only intake', async () => {
+    configManager.setProviderConfig('minimax', {
+      apiKey: 'minimax-test-key',
+      baseUrl: 'https://api.test-minimax.com/anthropic',
+    })
+    configManager.setDefaultModel('minimax/MiniMax-M3')
+
+    let providerCallCount = 0
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Clarifying question.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      providerCallCount += 1
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: providerCallCount === 1
+          ? createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"]<]minimax[>[<tool_call>\\n]<]minimax[>[<invoke name=\\"Bash\\">]<]minimax[>[<command>pwd</command>]"}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"]<]minimax[>[<timeoutMs>10000</timeoutMs>]\\n]<]minimax[>[</invoke>\\n]<]minimax[>[</tool_call>"}}\n\n',
+            ])
+          : createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"可以，GitHub Pages 很适合托管项目文档站。"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-minimax-bracket-tool-call-suppressed-by-intent',
+        prompt: '你的意思是可以用 GitHub Pages 做文档站？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && JSON.stringify(event).includes(']<]minimax[>['),
+    ))
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>'),
+    ))
+    assert.ok(!events.some(event => event.type === 'tool_started'))
+
+    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+    assert.ok(suppressionError)
+    assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.doesNotMatch(resultEvent.message, /tool_call|invoke name|Bash|pwd/)
+  })
+
+  test('suppresses generic tool-shaped text while tools are hidden and retries final answer', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Clarifying question.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: fetchCalls.length === 1
+          ? createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"<tool_call><invoke name=\\"Bash\\"><command>pwd</command></invoke></tool_call>"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ])
+          : createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"可以，直接回答即可，不需要执行命令。"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-generic-tool-shaped-text-suppressed',
+        prompt: '你的意思是可以这样做？',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.equal(fetchCalls.length, 2)
+    assert.ok(!events.some(event =>
+      event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>'),
+    ))
+    assert.ok(!events.some(event => event.type === 'tool_started'))
+
+    const leakError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED') as any
+    assert.ok(leakError)
+    assert.equal(leakError.details.phase, 'respond_only')
+    assert.equal(leakError.details.pattern, '<tool_call')
+    assert.match(leakError.details.redactedPreview, /\[REDACTED\]/)
+    assert.equal(leakError.details.retryAttempted, true)
+
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    assert.match(JSON.stringify(secondBody), /tool-call-shaped text/)
+    assert.doesNotMatch(JSON.stringify(secondBody), /<command>pwd<\/command>/)
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.doesNotMatch(resultEvent.message, /tool_call|invoke name|pwd/)
   })
 
   test('normalizes MiniMax text-encoded tool calls before runtime rendering', async () => {
@@ -1944,6 +2210,32 @@ describe('LLMCodingRuntime', () => {
     assert.equal(toolCompleted.success, false)
     assert.equal(toolCompleted.output.code, 'PARSE_ERROR')
     assert.equal(toolCompleted.output.rawPreview, '{"path":README.md')
+  })
+
+  test('summarizes suppressed tool-shaped text without raw command bodies', () => {
+    const events: NexusEvent[] = [
+      {
+        type: 'error',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: 'session-id',
+        timestamp: '2026-06-05T00:00:00.000Z',
+        code: 'TOOL_CALL_TEXT_LEAK_SUPPRESSED',
+        message: 'Suppressed tool-call-shaped assistant text while tools are unavailable for this turn.',
+        details: {
+          phase: 'respond_only',
+          pattern: '<tool_call',
+          redactedPreview: '<tool_call><invoke name="Bash"><command>[REDACTED]</command></invoke></tool_call>',
+        },
+      },
+    ]
+
+    const summary = summarizeSessionEvents(events)
+
+    assert.match(summary, /TOOL_CALL_TEXT_LEAK_SUPPRESSED/)
+    assert.match(summary, /phase respond_only/)
+    assert.match(summary, /\[REDACTED\]/)
+    assert.doesNotMatch(summary, /pwd|cat package\.json|git remote/)
+    assert.equal(isRecoveryBoundaryError('TOOL_CALL_TEXT_LEAK_SUPPRESSED'), true)
   })
 
   test('blocks disallowed tools and yields tool_denied event', async () => {

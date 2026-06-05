@@ -9,7 +9,7 @@ import type {
 } from './ModelAdapter.js'
 import { parseSSE } from './sse.js'
 import { ProviderError } from '../../shared/errors.js'
-import { getModel } from '../registry.js'
+import { getModel, getProvider, type ProviderDefinition } from '../registry.js'
 import { withRetry } from '../retry.js'
 
 export class OpenAIAdapter implements ModelAdapter {
@@ -24,15 +24,30 @@ export class OpenAIAdapter implements ModelAdapter {
     const providerId =
       slashIndex !== -1 ? params.model.substring(0, slashIndex) : 'openai'
 
-    const apiKey = options?.apiKey || process.env.OPENAI_API_KEY || ''
+    let providerDef: Pick<ProviderDefinition, 'authMode' | 'defaultBaseUrl'>
+    let registeredProvider = true
+    try {
+      providerDef = getProvider(providerId)
+    } catch {
+      registeredProvider = false
+      providerDef = { authMode: 'bearer', defaultBaseUrl: 'https://api.openai.com/v1' }
+    }
+
+    const usesOpenAIEnv = providerId === 'openai' || !registeredProvider
+    const apiKey = options?.apiKey || (usesOpenAIEnv ? process.env.OPENAI_API_KEY : undefined) || ''
     const baseUrl =
       options?.baseUrl ||
-      process.env.OPENAI_BASE_URL ||
+      (usesOpenAIEnv ? process.env.OPENAI_BASE_URL : undefined) ||
+      providerDef.defaultBaseUrl ||
       'https://api.openai.com/v1'
 
     const headers: Record<string, string> = {
       'content-type': 'application/json',
-      Authorization: `Bearer ${apiKey}`,
+    }
+    if (providerDef.authMode === 'bearer') {
+      headers.Authorization = `Bearer ${apiKey}`
+    } else if (providerDef.authMode === 'api-key') {
+      headers['x-api-key'] = apiKey
     }
 
     // Convert system prompt and messages to OpenAI format

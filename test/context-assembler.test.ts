@@ -77,6 +77,11 @@ test('allocateBudget uses adaptive large-context ceiling and honors env cap', as
       mapEventsToMessages,
     })
     assert.equal(cappedAnalysis.window.maxTokens, 160_000)
+    assert.equal(cappedAnalysis.diagnostics.cacheEconomics.policySource, 'env_cap')
+    assert.equal(cappedAnalysis.diagnostics.cacheEconomics.envMaxContextTokens, 160_000)
+    assert.equal(cappedAnalysis.diagnostic.details.modelContextWindow, 200_000)
+    assert.equal(cappedAnalysis.diagnostic.details.effectiveContextCeiling, 160_000)
+    assert.equal(cappedAnalysis.diagnostic.details.policySource, 'env_cap')
     assert.match(cappedAnalysis.diagnostics.cacheEconomics.reason, /BABEL_O_MAX_CONTEXT_TOKENS/)
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
@@ -2056,12 +2061,25 @@ test('/context display includes cache-aware long-context diagnostics', async () 
     const rendered = stripAnsi(formatContextAnalysis(analysis))
 
     assert.equal(analysis.window.maxTokens, 179_616)
+    assert.equal(analysis.diagnostics.cacheEconomics.modelContextWindow, 200_000)
     assert.equal(analysis.diagnostics.cacheEconomics.legacyContextCeiling, 120_000)
+    assert.equal(analysis.diagnostics.cacheEconomics.effectiveContextCeiling, 179_616)
+    assert.equal(analysis.diagnostics.cacheEconomics.reservedOutputTokens, 16_384)
+    assert.equal(analysis.diagnostics.cacheEconomics.providerSafetyBufferTokens, 4_000)
+    assert.equal(analysis.diagnostics.cacheEconomics.policySource, 'large_context')
     assert.equal(analysis.diagnostics.cacheEconomics.longContextUtilizationMode, true)
     assert.equal(analysis.diagnostics.cacheEconomics.cachePreservationMode, true)
+    assert.equal(analysis.diagnostics.cacheEconomics.warningThresholdPercent, 80)
+    assert.equal(analysis.diagnostics.cacheEconomics.compactThresholdPercent, 93)
+    assert.equal(analysis.diagnostics.cacheEconomics.compactThresholdTokens, Math.floor(179_616 * 0.93))
+    assert.equal(analysis.diagnostics.cacheEconomics.blockingLimitTokens, Math.max(Math.floor(179_616 * 0.93), 179_616 - 1_000))
     assert.equal(analysis.diagnostics.autoCompact.thresholdPercent, 93)
+    assert.equal(analysis.diagnostic.details.modelContextWindow, 200_000)
+    assert.equal(analysis.diagnostic.details.policySource, 'large_context')
     assert.match(rendered, /cache policy read=75% cacheable=.*preserving=yes long-context=yes/)
     assert.match(rendered, /ceiling 179\.6k\/120k legacy/)
+    assert.match(rendered, /ceiling source=large_context model\.window=200k reserved_output=16\.4k provider_buffer=4k/)
+    assert.match(rendered, /thresholds warning=143\.7k \(80%\) compact=167\.0k \(93%\) blocking=178\.6k/)
     assert.match(rendered, /Large-context model and high prompt cache reuse detected/)
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS

@@ -249,6 +249,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             : contextWindowState.isCompact
               ? `Context has passed the compact threshold (${compactPercent}%). Auto-compact will trigger on this turn.`
               : `Context is approaching the compact threshold (${contextWarningPercent}%→${compactPercent}%). Consider /compact soon.`,
+          cacheAwareCompactPolicy,
         })
       }
       let compactAttempted = false
@@ -333,6 +334,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           thresholdPercent: autoCompactDecision.enabled
             ? autoCompactDecision.thresholdPercent
             : contextCompactPercent,
+          cacheAwareCompactPolicy,
         })) yield event
         yield buildRuntimeExecutionMetricsEvent(options, metrics)
         return
@@ -444,6 +446,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             windowState: requestState.contextWindowState,
             autoCompactDecision,
             fallbackThresholdPercent: contextCompactPercent,
+            cacheAwareCompactPolicy,
           })) yield event
           yield buildRuntimeExecutionMetricsEvent(options, metrics)
           return
@@ -507,12 +510,20 @@ export class LLMCodingRuntime implements NexusRuntime {
         const invocationStartMs = performance.now()
         let providerTurn: RuntimeProviderTurn
         try {
+          const toolCallTextLeakPhase = finalResponseOnlyMode
+            ? 'final_response_only'
+            : shouldSuppressToolsForIntent(assembledContext.userIntentGuidance)
+              ? 'respond_only'
+              : modelVisibleTools.length === 0
+                ? 'tools_hidden'
+                : undefined
           const providerTurnStream = streamProviderTurn({
             stream: adapter.queryStream(queryParams, adapterOptions),
             sessionId: options.sessionId,
             signal: options.signal,
             executionStartMs: metrics.executionStartMs,
             queryStartMs: invocationStartMs,
+            ...(toolCallTextLeakPhase && { toolCallTextLeakGuard: { phase: toolCallTextLeakPhase } }),
           })
           let providerTurnResult = await providerTurnStream.next()
           while (!providerTurnResult.done) {
@@ -565,17 +576,26 @@ export class LLMCodingRuntime implements NexusRuntime {
         for (const hookEvent of postInvocationHooks.events) yield hookEvent
 
         absorbProviderTurnMetrics(metrics, providerTurn)
+        if (providerTurn.toolCallTextLeakSuppression) {
+          metrics.toolCallTextLeakSuppressedCount += 1
+          metrics.toolShapedTextPattern = providerTurn.toolCallTextLeakSuppression.pattern
+        }
         const providerOutcome = reduceProviderTurnOutcome({
           sessionId: options.sessionId,
           turn: providerTurn,
           finalResponseOnlyMode,
           suppressToolsForUserIntent: shouldSuppressToolsForIntent(assembledContext.userIntentGuidance),
           userIntentGuidance: assembledContext.userIntentGuidance,
+          providerId: settings.providerId,
+          modelId: cleanedModelId,
           maxTokenRecoveryCount,
           maxTokenRecoveries: MAX_TOKEN_RECOVERIES,
           outputRetryCount,
           maxOutputRetries: MAX_OUTPUT_RETRIES,
         })
+        if (providerTurn.toolCallTextLeakSuppression && providerOutcome.kind === 'continue') {
+          metrics.finalAnswerRetryCount += 1
+        }
         maxTokenRecoveryCount = providerOutcome.maxTokenRecoveryCount
         outputRetryCount = providerOutcome.outputRetryCount
         for (const event of providerOutcome.eventsBeforeMessages) yield event

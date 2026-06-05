@@ -4,6 +4,7 @@ import type {
   AgentJob,
   AgentJobError,
   AgentJobFilter,
+  AgentJobGovernance,
   AgentJobStatus,
   AgentProfileId,
   AgentResult,
@@ -31,6 +32,7 @@ export type CreateAgentJobOptions = {
   contextForkMode?: ContextForkMode
   isolation?: AgentIsolationMode
   transcriptPath?: string
+  governance?: AgentJobGovernance
   metadata?: Record<string, unknown>
   createdAt?: string
 }
@@ -90,6 +92,7 @@ export class AgentJobRegistry {
       createdAt: timestamp,
       updatedAt: timestamp,
       transcriptPath: options.transcriptPath,
+      governance: cloneAgentJobGovernance(options.governance),
       metadata: cloneRecord(options.metadata),
     }
 
@@ -105,6 +108,13 @@ export class AgentJobRegistry {
     return Array.from(this.jobs.values())
       .filter(job => matchesFilter(job, filter))
       .map(cloneAgentJob)
+  }
+
+  hydrateJobs(jobs: AgentJob[]): void {
+    for (const job of jobs) {
+      this.jobs.set(job.jobId, cloneAgentJob(job))
+      this.observeJobId(job.jobId)
+    }
   }
 
   markRunning(jobId: string): AgentJob {
@@ -207,6 +217,15 @@ export class AgentJobRegistry {
     return `${this.idPrefix}-${this.nextId}`
   }
 
+  private observeJobId(jobId: string): void {
+    const prefix = `${this.idPrefix}-`
+    if (!jobId.startsWith(prefix)) return
+    const numericId = Number(jobId.slice(prefix.length))
+    if (Number.isInteger(numericId) && numericId > this.nextId) {
+      this.nextId = numericId
+    }
+  }
+
   private requireJob(jobId: string): AgentJob {
     const job = this.jobs.get(jobId)
     if (!job) {
@@ -296,6 +315,7 @@ export function cloneAgentJob(job: AgentJob): AgentJob {
     ...job,
     result: cloneAgentResult(job.result),
     error: cloneAgentJobError(job.error),
+    governance: cloneAgentJobGovernance(job.governance),
     metadata: cloneRecord(job.metadata),
   }
 }
@@ -311,6 +331,10 @@ function cloneAgentResult(result: AgentResult | undefined): AgentResult | undefi
     nextSteps: result.nextSteps ? [...result.nextSteps] : undefined,
     confidence: result.confidence,
   }
+}
+
+function cloneAgentJobGovernance(governance: AgentJobGovernance | undefined): AgentJobGovernance | undefined {
+  return governance ? { ...governance } : undefined
 }
 
 function cloneAgentJobError(error: AgentJobError | undefined): AgentJobError | undefined {

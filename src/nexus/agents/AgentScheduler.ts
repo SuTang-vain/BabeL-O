@@ -20,6 +20,7 @@ import { forkContextForAgent } from './ContextForker.js'
 import type {
   AgentJob,
   AgentJobFilter,
+  AgentJobGovernance,
   AgentResult,
   AgentScheduler,
   AgentSpawnRequest,
@@ -34,6 +35,8 @@ export type ExploreAgentSchedulerOptions = {
   now?: () => string
   executionEnvironment?: 'local' | 'remote'
   remoteRunner?: RemoteToolRunner
+  maxConcurrentAgents?: number
+  maxDepth?: number
 }
 
 export type ExploreAgentRuntimeFactoryOptions = {
@@ -49,6 +52,13 @@ type RunningAgent = {
   promise: Promise<void>
 }
 
+type AgentJobEventType =
+  | 'agent_job_queued'
+  | 'agent_job_started'
+  | 'agent_job_completed'
+  | 'agent_job_failed'
+  | 'agent_job_cancelled'
+
 export class ExploreAgentScheduler implements AgentScheduler {
   private readonly storage: NexusStorage
   private readonly cwd?: string
@@ -57,7 +67,10 @@ export class ExploreAgentScheduler implements AgentScheduler {
   private readonly now: () => string
   private readonly executionEnvironment?: 'local' | 'remote'
   private readonly remoteRunner?: RemoteToolRunner
+  private readonly maxConcurrentAgents: number
+  private readonly maxDepth: number
   private readonly running = new Map<string, RunningAgent>()
+  private loadedPersistedJobs = false
 
   constructor(options: ExploreAgentSchedulerOptions) {
     this.storage = options.storage
@@ -67,14 +80,42 @@ export class ExploreAgentScheduler implements AgentScheduler {
     this.now = options.now ?? nowIso
     this.executionEnvironment = options.executionEnvironment
     this.remoteRunner = options.remoteRunner
+    this.maxConcurrentAgents = options.maxConcurrentAgents ?? 4
+    this.maxDepth = options.maxDepth ?? 2
   }
 
   async spawnAgent(request: AgentSpawnRequest): Promise<AgentJob> {
+    await this.loadPersistedJobs()
     const profile = assertAgentProfile(request.agentType ?? 'explore')
     assertSchedulableProfile(profile.id)
     const allowedTools = request.allowedTools ?? profile.defaultTools
     assertProfileAllowedTools(profile.id, allowedTools)
     const parentSession = await this.requireParentSession(request.parentSessionId)
+    const activeAgents = this.running.size
+    if (activeAgents >= this.maxConcurrentAgents) {
+      throw new AgentJobRegistryError(
+        `Agent scheduler capacity exceeded: ${activeAgents}/${this.maxConcurrentAgents} agents are running.`,
+        'AGENT_SCHEDULER_CAPACITY_EXCEEDED',
+        429,
+      )
+    }
+    const depth = agentDepth(parentSession)
+    if (depth > this.maxDepth) {
+      throw new AgentJobRegistryError(
+        `Agent scheduler max depth exceeded: ${depth}/${this.maxDepth}.`,
+        'AGENT_SCHEDULER_MAX_DEPTH_EXCEEDED',
+        400,
+      )
+    }
+    const maxRuntimeMs = request.maxRuntimeMs ?? profile.maxRuntimeMs
+    const governance: AgentJobGovernance = {
+      maxConcurrentAgents: this.maxConcurrentAgents,
+      activeAgents,
+      maxDepth: this.maxDepth,
+      depth,
+      maxRuntimeMs,
+      timeoutAt: addMillisecondsIso(this.now(), maxRuntimeMs),
+    }
     const childSessionId = createId('session')
     const job = this.registry.createJob({
       parentSessionId: request.parentSessionId,
@@ -84,9 +125,11 @@ export class ExploreAgentScheduler implements AgentScheduler {
       contextForkMode: request.contextForkMode ?? profile.defaultContextForkMode,
       isolation: request.isolation ?? profile.defaultIsolation,
       transcriptPath: `nexus://sessions/${childSessionId}/events`,
+      governance,
       metadata: {
         ...(request.metadata ?? {}),
         allowedTools,
+        governance,
       },
     })
     const fork = forkContextForAgent({ parentSession, job })
@@ -106,7 +149,9 @@ export class ExploreAgentScheduler implements AgentScheduler {
         agentType: profile.id,
         contextForkMode: fork.mode,
         isolation: job.isolation,
+        agentDepth: depth,
         allowedTools,
+        governance,
         contextFork: {
           inheritedItems: fork.inheritedItems,
           omittedItems: fork.omittedItems,
@@ -115,6 +160,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
       },
     }
     await this.storage.saveSession(childSession)
+    await this.storage.saveAgentJob(job)
     await this.appendParentAgentEvent('agent_job_queued', job)
 
     const controller = new AbortController()
@@ -124,7 +170,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
       childSession,
       allowedTools,
       controller,
-      request.maxRuntimeMs ?? profile.maxRuntimeMs,
+      maxRuntimeMs,
     ).finally(() => {
       this.running.delete(job.jobId)
     })
@@ -134,25 +180,38 @@ export class ExploreAgentScheduler implements AgentScheduler {
   }
 
   async waitForAgent(jobId: string, options?: AgentWaitOptions): Promise<AgentJob> {
+    await this.loadPersistedJobs()
+    const existing = this.registry.getJob(jobId)
+    const running = this.running.get(jobId)
+    if (!running && !isTerminalAgentJobStatus(existing.status)) return existing
     const job = await this.registry.waitForJob(jobId, options)
-    await this.running.get(jobId)?.promise
+    await running?.promise
     return this.registry.getJob(jobId)
   }
 
   async listAgents(filter?: AgentJobFilter): Promise<AgentJob[]> {
+    await this.loadPersistedJobs()
     return this.registry.listJobs(filter)
   }
 
   async cancelAgent(jobId: string, reason?: string): Promise<AgentJob> {
+    await this.loadPersistedJobs()
     const existing = this.registry.getJob(jobId)
     if (isTerminalAgentJobStatus(existing.status)) return existing
 
     const running = this.running.get(jobId)
     running?.controller.abort()
     const job = this.registry.cancelJob(jobId, reason)
+    await this.storage.saveAgentJob(job)
     await this.finalizeChildSession(job, false, reason ?? 'Agent job cancelled.')
     await this.appendParentAgentEvent('agent_job_cancelled', job)
     return job
+  }
+
+  private async loadPersistedJobs(): Promise<void> {
+    if (this.loadedPersistedJobs) return
+    this.loadedPersistedJobs = true
+    this.registry.hydrateJobs(await this.storage.listAgentJobs())
   }
 
   private async runAgentJob(
@@ -164,12 +223,17 @@ export class ExploreAgentScheduler implements AgentScheduler {
     maxRuntimeMs?: number,
   ): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined
+    let timedOut = false
     if (maxRuntimeMs !== undefined) {
-      timeout = setTimeout(() => controller.abort(), maxRuntimeMs)
+      timeout = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, maxRuntimeMs)
       timeout.unref?.()
     }
 
     let job = this.registry.markRunning(jobId)
+    await this.storage.saveAgentJob(job)
     await this.appendParentAgentEvent('agent_job_started', job)
     childSession.phase = 'executing'
     childSession.updatedAt = this.now()
@@ -205,9 +269,20 @@ export class ExploreAgentScheduler implements AgentScheduler {
       const errorEvent = events.findLast(event => event.type === 'error')
       if (controller.signal.aborted) {
         if (!isTerminalAgentJobStatus(this.registry.getJob(jobId).status)) {
-          job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
-          await this.finalizeChildSession(job, false, 'Agent job cancelled.')
-          await this.appendParentAgentEvent('agent_job_cancelled', job)
+          if (timedOut) {
+            job = this.registry.failJob(jobId, {
+              code: 'AGENT_JOB_TIMEOUT',
+              message: `Agent job timed out after ${maxRuntimeMs}ms.`,
+            })
+            await this.storage.saveAgentJob(job)
+            await this.finalizeChildSession(job, false, job.error?.message ?? 'Agent job timed out.')
+            await this.appendParentAgentEvent('agent_job_failed', job)
+          } else {
+            job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
+            await this.storage.saveAgentJob(job)
+            await this.finalizeChildSession(job, false, 'Agent job cancelled.')
+            await this.appendParentAgentEvent('agent_job_cancelled', job)
+          }
         }
         return
       }
@@ -217,6 +292,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
           message: errorEvent.message,
           details: errorEvent.details,
         })
+        await this.storage.saveAgentJob(job)
         await this.finalizeChildSession(job, false, errorEvent.message)
         await this.appendParentAgentEvent('agent_job_failed', job)
         return
@@ -224,14 +300,26 @@ export class ExploreAgentScheduler implements AgentScheduler {
 
       const result = normalizeAgentResult(events, allowedTools)
       job = this.registry.completeJob(jobId, result)
+      await this.storage.saveAgentJob(job)
       await this.finalizeChildSession(job, true, result.summary)
       await this.appendParentAgentEvent('agent_job_completed', job)
     } catch (error) {
       if (controller.signal.aborted) {
         if (!isTerminalAgentJobStatus(this.registry.getJob(jobId).status)) {
-          job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
-          await this.finalizeChildSession(job, false, 'Agent job cancelled.')
-          await this.appendParentAgentEvent('agent_job_cancelled', job)
+          if (timedOut) {
+            job = this.registry.failJob(jobId, {
+              code: 'AGENT_JOB_TIMEOUT',
+              message: `Agent job timed out after ${maxRuntimeMs}ms.`,
+            })
+            await this.storage.saveAgentJob(job)
+            await this.finalizeChildSession(job, false, job.error?.message ?? 'Agent job timed out.')
+            await this.appendParentAgentEvent('agent_job_failed', job)
+          } else {
+            job = this.registry.cancelJob(jobId, 'Agent job cancelled.')
+            await this.storage.saveAgentJob(job)
+            await this.finalizeChildSession(job, false, 'Agent job cancelled.')
+            await this.appendParentAgentEvent('agent_job_cancelled', job)
+          }
         }
         return
       }
@@ -239,6 +327,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
         code: 'AGENT_RUNTIME_ERROR',
         message: error instanceof Error ? error.message : String(error),
       })
+      await this.storage.saveAgentJob(job)
       await this.finalizeChildSession(job, false, job.error?.message ?? 'Agent job failed.')
       await this.appendParentAgentEvent('agent_job_failed', job)
     } finally {
@@ -272,22 +361,20 @@ export class ExploreAgentScheduler implements AgentScheduler {
     return session
   }
 
-  private async appendParentAgentEvent(eventType: string, job: AgentJob): Promise<void> {
+  private async appendParentAgentEvent(eventType: AgentJobEventType, job: AgentJob): Promise<void> {
     await this.storage.appendEvent(job.parentSessionId, {
-      type: 'task_session_event',
+      type: 'agent_job_event',
       ...eventBase(job.parentSessionId),
       eventId: createId('event'),
       eventType,
-      phase: job.status,
-      payload: {
-        jobId: job.jobId,
-        childSessionId: job.childSessionId,
-        agentType: job.agentType,
-        contextForkMode: job.contextForkMode,
-        status: job.status,
-        result: job.result,
-        error: job.error,
-      },
+      jobId: job.jobId,
+      childSessionId: job.childSessionId,
+      agentType: job.agentType,
+      contextForkMode: job.contextForkMode,
+      status: job.status,
+      governance: job.governance,
+      result: job.result,
+      error: job.error,
     })
   }
 }
@@ -361,6 +448,17 @@ function assertSchedulableProfile(profileId: AgentJob['agentType']): void {
     'AGENT_PROFILE_UNSUPPORTED',
     400,
   )
+}
+
+function agentDepth(parentSession: SessionSnapshot): number {
+  const depth = parentSession.metadata?.agentDepth
+  return typeof depth === 'number' && Number.isInteger(depth) && depth >= 0 ? depth + 1 : 1
+}
+
+function addMillisecondsIso(timestamp: string, durationMs: number): string | undefined {
+  const time = new Date(timestamp).getTime()
+  if (!Number.isFinite(time)) return undefined
+  return new Date(time + durationMs).toISOString()
 }
 
 function assertProfileAllowedTools(profileId: AgentJob['agentType'], allowedTools: string[]): void {

@@ -63,6 +63,7 @@ export function createAgentTools(scheduler: AgentScheduler): AnyTool[] {
           childSessionId: job.childSessionId,
           status: waited?.status ?? job.status,
           agentType: job.agentType,
+          governance: waited?.governance ?? job.governance,
           result: waited?.result,
           message: waited
             ? `Agent job ${job.jobId} finished with status ${waited.status}.`
