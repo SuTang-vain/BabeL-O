@@ -3,7 +3,7 @@ import { ConfigManager } from '../shared/config.js'
 import { padToTerminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
 import { getTheme } from './theme.js'
 
-const VERSION = '0.2.9'
+const VERSION = '0.3.0'
 const WELCOME_MAX_WIDTH = 96
 const PIXEL_ROWS = [
   '    M    ',

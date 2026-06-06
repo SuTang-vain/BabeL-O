@@ -1028,16 +1028,17 @@ export function parseLocalRuntimeIntent(prompt: string): LocalRuntimeParsedInten
   const arg = rest.join(' ')
 
   if (verb.includes(':') && arg) {
+    const toolName = verb.endsWith(':') ? verb.slice(0, -1) : verb
     try {
       return {
         kind: 'tool',
-        toolName: verb,
+        toolName,
         input: JSON.parse(arg),
       }
     } catch {
       return {
         kind: 'tool',
-        toolName: verb,
+        toolName,
         input: {},
       }
     }

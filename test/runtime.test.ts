@@ -106,6 +106,11 @@ test('runtime pipeline parses local tool and task intents', () => {
     status: 'completed',
     result: 'done',
   })
+  assert.deepEqual(parseLocalRuntimeIntent('Bash: {"command":"pwd","timeoutMs":20}'), {
+    kind: 'tool',
+    toolName: 'Bash',
+    input: { command: 'pwd', timeoutMs: 20 },
+  })
   assert.equal(parseLocalRuntimeIntent('What does sample.txt say?').kind, 'file_question')
 })
 
@@ -2917,7 +2922,9 @@ test('Grep and Glob fall back when ripgrep is unavailable', async () => {
   await writeFile(join(cwd, 'src', 'context.ts'), 'class ContextForker {}\nfunction forkContext() {}\n', 'utf8')
 
   const oldPath = process.env.PATH
+  const oldForceGrepFallback = process.env.BABEL_O_GREP_FORCE_FALLBACK
   process.env.PATH = ''
+  process.env.BABEL_O_GREP_FORCE_FALLBACK = '1'
   try {
     const { runtime, storage } = await createDefaultNexusRuntime({
       allowedTools: ['Grep', 'Glob'],
@@ -2966,6 +2973,8 @@ test('Grep and Glob fall back when ripgrep is unavailable', async () => {
   } finally {
     if (oldPath === undefined) delete process.env.PATH
     else process.env.PATH = oldPath
+    if (oldForceGrepFallback === undefined) delete process.env.BABEL_O_GREP_FORCE_FALLBACK
+    else process.env.BABEL_O_GREP_FORCE_FALLBACK = oldForceGrepFallback
   }
 })
 
@@ -3301,6 +3310,81 @@ test('bash non-zero exit returns a recoverable failed tool result', async () => 
     assert.match(toolCompleted.output.stdout, /visible-out/)
     assert.match(toolCompleted.output.stderr, /visible-err/)
     assert.equal(toolCompleted.output.exitCode, 7)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
+  } finally {
+    await app.close()
+  }
+})
+
+test('bash command timeout returns a recoverable failed tool result', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-timeout`)
+  await mkdir(cwd, { recursive: true })
+
+  const { bashTool } = await import('../src/tools/builtin/bash.js')
+  const result = await bashTool.execute({
+    command: 'sleep 1',
+    timeoutMs: 20,
+  }, {
+    cwd,
+    sessionId: `bash-timeout-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 10_000,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal((result.output as any).code, 'COMMAND_TIMEOUT')
+  assert.equal((result.output as any).timedOut, true)
+  assert.equal((result.output as any).signal, 'SIGTERM')
+  assert.match((result.output as any).message, /timed out|terminated/)
+})
+
+test('bash discovery timeout returns guidance without fatal tool error', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-discovery-timeout`)
+  await mkdir(cwd, { recursive: true })
+
+  const { bashTool } = await import('../src/tools/builtin/bash.js')
+  const result = await bashTool.execute({
+    command: 'find . -exec sleep 1 \\;',
+    timeoutMs: 20,
+  }, {
+    cwd,
+    sessionId: `bash-discovery-timeout-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 10_000,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal((result.output as any).code, 'COMMAND_TIMEOUT')
+  assert.equal((result.output as any).guidance.code, 'BASH_AS_FILE_DISCOVERY')
+  assert.match((result.output as any).guidance.message, /ListDir|Glob|Grep|Read/)
+})
+
+test('runtime surfaces Bash command timeout as tool_completed failure', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-runtime-bash-timeout`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Bash'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'Bash: {"command":"sleep 1","timeoutMs":20}',
+        cwd,
+        skipPermissionCheck: true,
+      },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Bash',
+    )
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'COMMAND_TIMEOUT')
     assert.ok(!body.events.some((event: { type: string; code?: string }) =>
       event.type === 'error' && event.code === 'TOOL_ERROR',
     ))
@@ -3875,6 +3959,7 @@ test('bash tool ignores forged state markers and exposes session cleanup', async
   const realBaseCwd = await realpath(baseCwd)
   const forgedDir = join(baseCwd, 'forged')
   await mkdir(forgedDir, { recursive: true })
+  await writeFile(join(baseCwd, 'discover.txt'), 'discover marker file\n', 'utf8')
 
   const { bashTool, clearBashSessionState, getBashSessionStateSizeForTest, pruneBashSessionState } = await import('../src/tools/builtin/bash.js')
   await clearBashSessionState()
@@ -3891,6 +3976,16 @@ test('bash tool ignores forged state markers and exposes session cleanup', async
   }, ctx)
   assert.equal(forged.success, true)
   assert.match(String((forged.output as any).stdout), /---BABEL_O_STATE---/)
+
+  const discovery = await bashTool.execute({
+    command: 'ls',
+    timeoutMs: 10_000,
+  }, ctx)
+  assert.equal(discovery.success, true)
+  assert.match(String((discovery.output as any).stdout), /discover\.txt/)
+  assert.equal((discovery.output as any).guidance.code, 'BASH_AS_FILE_DISCOVERY')
+  assert.equal((discovery.output as any).guidance.commandKind, 'ls')
+  assert.match((discovery.output as any).guidance.message, /ListDir/)
 
   const pwd = await bashTool.execute({
     command: 'pwd',
@@ -3922,7 +4017,9 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
 
   // 1. Fallback mode
   const oldPath = process.env.PATH
+  const oldForceGrepFallback = process.env.BABEL_O_GREP_FORCE_FALLBACK
   process.env.PATH = ''
+  process.env.BABEL_O_GREP_FORCE_FALLBACK = '1'
   try {
     const res = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
     assert.equal(res.success, true)
@@ -3944,6 +4041,8 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
     assert.match(String(noResult.output), /JavaScript RegExp fallback/)
   } finally {
     process.env.PATH = oldPath
+    if (oldForceGrepFallback === undefined) delete process.env.BABEL_O_GREP_FORCE_FALLBACK
+    else process.env.BABEL_O_GREP_FORCE_FALLBACK = oldForceGrepFallback
   }
 
   // 2. Main rg mode (if rg available in current environment)

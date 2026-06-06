@@ -1,5 +1,14 @@
 # BabeL-O
 
+<p align="center">
+  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O 产品 logo" width="132" />
+  <img src="docs/assets/kezhongke_logo_3d.png" alt="壳中客 IP 品牌 logo" width="132" />
+</p>
+
+<p align="center">
+  <strong>由 KezhongKe（壳中客）提供技术支持。</strong>
+</p>
+
 > **高性能、以 Nexus 服务端为核心（Nexus-first）的通用泛化 AI 智能体（Generalized Agent）。基于 Node.js 与 Fastify 构建，拥有独立的执行运行时、原生 stdio MCP 客户端、动态上下文压缩与状态重建，支持通过轻量级交互式终端 TUI CLI 进行管控。**
 
 [English README](README.md)
@@ -73,11 +82,20 @@ graph TD
 
 ## 安装与部署
 
-你可以通过直接下载预编译的原生二进制包（推荐，最快），或通过源码构建来进行安装。
+你可以通过发布版安装脚本、直接下载预编译原生二进制包，或通过源码构建来进行安装。
 
-### 方法一：下载预编译原生二进制包（推荐，最快）
+### 方法一：发布版安装脚本（推荐，最快）
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.2.9.md) 中的对应下载链接。
+macOS 和 Linux 下，安装脚本会检测系统与架构，下载最新匹配的 GitHub release 二进制，并安装为 `bbl`：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
+bbl chat
+```
+
+### 方法二：下载预编译原生二进制包
+
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.0.md) 中的对应下载链接。
 
 将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
 ```bash
@@ -87,7 +105,7 @@ bbl chat
 
 ---
 
-### 方法二：通过源码构建安装（用于开发调试）
+### 方法三：通过源码构建安装（用于开发调试）
 
 #### 前提条件
 
@@ -101,8 +119,8 @@ bbl chat
 git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
 
-# 安装依赖
-npm install
+# 按 package-lock.json 精确安装依赖
+npm ci
 
 # 运行自动化测试
 npm test

@@ -14,6 +14,7 @@ import { defaultPermissionChoices, permissionDecisionFromChoice, renderSubmitted
 import { getPromptSuggestion } from '../src/cli/promptSuggestions.js'
 import { getTheme, resetThemeForTest } from '../src/cli/theme.js'
 import { getLiveAgentTree, resetLiveAgentTreeForTest, updateLiveAgentActivity, renderEvent } from '../src/cli/renderEvents.js'
+import { createVimInputState, reduceVimInputKey } from '../src/cli/vimMode.js'
 
 test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent('\x03', undefined).kind, 'ctrl_c')
@@ -359,6 +360,65 @@ test('input ghost helpers clear placeholder before printable input and consume b
   assert.equal(shouldConsumeBlankInputEnter('   ', 'enter'), true)
   assert.equal(shouldConsumeBlankInputEnter('read', 'enter'), false)
   assert.equal(shouldConsumeBlankInputEnter('', 'tab'), false)
+})
+
+test('vim input mode stays disabled by default', () => {
+  const state = createVimInputState(false)
+  const reduced = reduceVimInputKey(state, 'hello', 5, normalizeKeyEvent('h', undefined))
+
+  assert.equal(reduced.handled, false)
+  assert.deepEqual(reduced.state, { enabled: false, mode: 'insert' })
+})
+
+test('vim input mode switches between insert and normal mode', () => {
+  let state = createVimInputState(true)
+  let reduced = reduceVimInputKey(state, 'hello', 5, normalizeKeyEvent('\x1b', undefined))
+
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+  assert.equal(reduced.state.mode, 'normal')
+  assert.equal(reduced.cursor, 4)
+
+  state = reduced.state
+  reduced = reduceVimInputKey(state, 'hello', 4, normalizeKeyEvent('i', undefined))
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+  assert.equal(reduced.state.mode, 'insert')
+  assert.equal(reduced.cursor, 4)
+})
+
+test('vim normal mode moves and edits input without inserting command text', () => {
+  let state = createVimInputState(true)
+  let reduced = reduceVimInputKey(state, 'hello', 5, normalizeKeyEvent('\x1b', undefined))
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+
+  state = reduced.state
+  reduced = reduceVimInputKey(state, reduced.line, reduced.cursor, normalizeKeyEvent('h', undefined))
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+  assert.equal(reduced.line, 'hello')
+  assert.equal(reduced.cursor, 3)
+
+  reduced = reduceVimInputKey(state, reduced.line, reduced.cursor, normalizeKeyEvent('x', undefined))
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+  assert.equal(reduced.line, 'helo')
+  assert.equal(reduced.cursor, 3)
+
+  reduced = reduceVimInputKey(state, reduced.line, reduced.cursor, normalizeKeyEvent('a', undefined))
+  assert.equal(reduced.handled, true)
+  if (!reduced.handled) throw new Error('unreachable')
+  assert.equal(reduced.state.mode, 'insert')
+  assert.equal(reduced.cursor, 4)
+})
+
+test('vim normal mode leaves enter to readline submission', () => {
+  const state = { enabled: true, mode: 'normal' as const }
+  const reduced = reduceVimInputKey(state, 'submit this', 3, normalizeKeyEvent('\r', undefined))
+
+  assert.equal(reduced.handled, false)
+  assert.equal(reduced.state, state)
 })
 
 test('input state keeps readline as the only text owner while overlays are open', () => {

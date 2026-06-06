@@ -15,6 +15,8 @@ docs/
 docs/*
 !docs/releases/
 !docs/releases/*.md
+!docs/assets/
+!docs/assets/*.png
 *TODO*.md
 *WORK_LOG*.md
 *ANALYSIS*.md
@@ -22,3 +24,7 @@ docs/*
 *REEVALUATION*.md
 *REVIEW*.md
 *PLAN*.md
+!docs/nexus/
+!docs/nexus/**/
+!docs/nexus/*.md
+!docs/nexus/**/*.md

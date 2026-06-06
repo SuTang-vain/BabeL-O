@@ -1,5 +1,14 @@
 # BabeL-O
 
+<p align="center">
+  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O product logo" width="132" />
+  <img src="docs/assets/kezhongke_logo_3d.png" alt="KezhongKe IP brand logo" width="132" />
+</p>
+
+<p align="center">
+  <strong>Technical support provided by KezhongKe (壳中客).</strong>
+</p>
+
 > **A high-performance, Nexus-first generalized AI agent. Built with Fastify and Node.js, featuring an isolated runtime, stdio-based MCP client, dynamic context compaction, and multi-agent coordination, all controllable via a lightweight interactive TUI CLI.**
 
 [简体中文 README](README.zh-CN.md)
@@ -71,11 +80,20 @@ graph TD
 
 ## Installation
 
-You can install BabeL-O either by downloading a pre-compiled native binary directly or by building it from source.
+You can install BabeL-O by using the release installer, downloading a pre-compiled native binary directly, or building it from source.
 
-### Method 1: Pre-compiled Native Binary (Recommended & Fastest)
+### Method 1: Release Installer (Recommended & Fastest)
 
-Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.2.9.md) for version-specific download links.
+On macOS and Linux, the installer detects your platform, downloads the latest matching GitHub release binary, and installs it as `bbl`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
+bbl chat
+```
+
+### Method 2: Pre-compiled Native Binary
+
+Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.0.md) for version-specific download links.
 
 Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
 ```bash
@@ -85,7 +103,7 @@ bbl chat
 
 ---
 
-### Method 2: Build from Source (For Development)
+### Method 3: Build from Source (For Development)
 
 #### Prerequisites
 
@@ -99,8 +117,8 @@ bbl chat
 git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
 
-# Install dependencies
-npm install
+# Install dependencies exactly from package-lock.json
+npm ci
 
 # Run unit and integration tests
 npm test

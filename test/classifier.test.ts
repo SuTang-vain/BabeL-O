@@ -23,6 +23,14 @@ test('classifyAction processes Bash tool whitelist and blacklist', () => {
   const statusRes = classifyAction('Bash', { command: 'git status' })
   assert.equal(statusRes.autoApprove, true)
 
+  const recursiveGrepRes = classifyAction('Bash', { command: 'grep -rln ContextForker .' })
+  assert.equal(recursiveGrepRes.autoApprove, false)
+  assert.match(recursiveGrepRes.reason, /BASH_AS_FILE_DISCOVERY|read-only file discovery|Grep/)
+
+  const findRes = classifyAction('Bash', { command: 'find . -name "*.ts"' })
+  assert.equal(findRes.autoApprove, false)
+  assert.match(findRes.reason, /Glob|ListDir/)
+
   const testRes = classifyAction('Bash', { command: 'npm test' })
   assert.equal(testRes.autoApprove, false)
   assert.equal(testRes.reason, 'Requires manual review')

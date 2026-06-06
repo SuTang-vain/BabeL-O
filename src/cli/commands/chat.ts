@@ -53,6 +53,8 @@ import { consumePasteChunk, createPasteBufferState, expandPastedTextPlaceholders
 import { INPUT_NEWLINE_MARKER, restoreInputNewlines, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../inputBox.js'
 import { openContextView } from '../contextView.js'
 import { formatToolAudit } from '../toolAuditFormatter.js'
+import { expandAttachmentReferences } from '../attachmentReferences.js'
+import { createVimInputState, reduceVimInputKey } from '../vimMode.js'
 
 interface ReadlineInternal extends readline.Interface {
   history: string[]
@@ -129,6 +131,7 @@ export function registerChatCommand(program: Command): void {
       let pasteTimeout: NodeJS.Timeout | null = null
       let pastedTextCounter = 0
       const pastedTextReplacements = new Map<string, string>()
+      let vimInputState = createVimInputState()
 
       const clearPasteTimeout = () => {
         if (pasteTimeout) {
@@ -208,6 +211,22 @@ export function registerChatCommand(program: Command): void {
             }
 
             if (inputState.current === 'idle' && consumeShiftEnterInput(str)) return true
+
+            if (inputState.current === 'idle') {
+              const vimResult = reduceVimInputKey(
+                vimInputState,
+                rlInt.line ?? '',
+                typeof (rlInt as any).cursor === 'number' ? (rlInt as any).cursor : (rlInt.line ?? '').length,
+                keyEvent,
+              )
+              vimInputState = vimResult.state
+              if (vimResult.handled) {
+                rlInt.line = vimResult.line
+                ;(rlInt as any).cursor = vimResult.cursor
+                rlInt._refreshLine?.()
+                return true
+              }
+            }
 
             if (inputState.current === 'idle' && shouldConsumeBlankInputEnter(rlInt.line ?? '', keyEvent.kind)) {
               if (typeof rlInt._refreshLine === 'function') {
@@ -562,6 +581,10 @@ export function registerChatCommand(program: Command): void {
           const displayPrompt = restoreInputNewlines(prompt)
           prompt = expandPastedTextPlaceholders(restoreInputNewlines(prompt), pastedTextReplacements)
           let trimmed = prompt.trim()
+          if (!trimmed.startsWith('/')) {
+            prompt = expandAttachmentReferences(prompt, options.cwd).prompt
+            trimmed = prompt.trim()
+          }
           const displayTrimmed = displayPrompt.trim()
           inputRefresh.clearCurrentInputBlock({ afterSubmit: true })
           if (displayTrimmed) {

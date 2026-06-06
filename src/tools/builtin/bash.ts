@@ -3,6 +3,7 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { getBashFileDiscoveryGuidance, type BashFileDiscoveryGuidance } from '../../shared/bashDiscoveryGuidance.js'
 import { ConfigManager } from '../../shared/config.js'
 import {
   formatWorkspacePathError,
@@ -31,6 +32,8 @@ type FailedCommandResult = {
   stderr: string
   exitCode?: number
   signal?: string
+  code?: string
+  timedOut?: boolean
   message: string
 }
 
@@ -84,8 +87,17 @@ function parseStateFromStdout(
   return { cleanStdout: stdout, detectedCwd: null }
 }
 
-function isRecoverableCommandFailure(err: { code?: unknown; signal?: unknown }): boolean {
-  return typeof err.code === 'number' && (err.signal === undefined || err.signal === null)
+function isRecoverableCommandFailure(err: { code?: unknown; signal?: unknown }, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return false
+  return typeof err.code === 'number' || isCommandTimeoutFailure(err)
+}
+
+function isCommandTimeoutFailure(err: { code?: unknown; signal?: unknown }): boolean {
+  return err.code === null && typeof err.signal === 'string'
+}
+
+function commandFailureCode(err: { code?: unknown; signal?: unknown }): string | undefined {
+  return isCommandTimeoutFailure(err) ? 'COMMAND_TIMEOUT' : undefined
 }
 
 function toFailedCommandResult(
@@ -103,9 +115,13 @@ function toFailedCommandResult(
   const stdoutStr = typeof err.stdout === 'string' ? err.stdout : ''
   const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
   const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
+  const code = commandFailureCode(err)
   let cleanedMessage = err.message || 'Command failed'
   cleanedMessage = cleanedMessage.replace(wrappedCommand, originalCommand)
   cleanedMessage = cleanedMessage.replaceAll(probe.marker, '').trim()
+  if (code === 'COMMAND_TIMEOUT') {
+    cleanedMessage = `Command timed out or was terminated by signal ${String(err.signal)} before completion. Narrow the command scope or increase timeoutMs if this shell execution is necessary.`
+  }
 
   return {
     result: {
@@ -113,6 +129,8 @@ function toFailedCommandResult(
       stderr: stderrStr,
       exitCode: typeof err.code === 'number' ? err.code : undefined,
       signal: typeof err.signal === 'string' ? err.signal : undefined,
+      code,
+      timedOut: code === 'COMMAND_TIMEOUT' ? true : undefined,
       message: cleanedMessage,
     },
     detectedCwd,
@@ -211,6 +229,7 @@ export const bashTool: ToolDefinition<typeof inputSchema> = {
         },
       }
     }
+    const discoveryGuidance = getBashFileDiscoveryGuidance(input.command)
     const probe = createStateProbe()
 
     // Inject state probing code to capture the final CWD and exit code
@@ -319,7 +338,7 @@ exit $_EXIT_CODE`
 
         return {
           success: true,
-          output: { stdout: cleanStdout, stderr },
+          output: withBashDiscoveryGuidance({ stdout: cleanStdout, stderr }, discoveryGuidance),
         }
       } catch (err: any) {
         const { result, detectedCwd } = toFailedCommandResult(
@@ -329,10 +348,10 @@ exit $_EXIT_CODE`
           input.command,
         )
         updateSessionCwdFromFailure(context.sessionId, detectedCwd, context.cwd)
-        if (isRecoverableCommandFailure(err)) {
+        if (isRecoverableCommandFailure(err, context.signal)) {
           return {
             success: false,
-            output: result,
+            output: withBashDiscoveryGuidance(result, discoveryGuidance),
           }
         }
 
@@ -368,7 +387,7 @@ exit $_EXIT_CODE`
 
       return {
         success: true,
-        output: { stdout: cleanStdout, stderr },
+        output: withBashDiscoveryGuidance({ stdout: cleanStdout, stderr }, discoveryGuidance),
       }
     } catch (err: any) {
       // Even if the command fails, salvage any CWD change that occurred prior to the failure
@@ -379,10 +398,10 @@ exit $_EXIT_CODE`
         input.command,
       )
       updateSessionCwdFromFailure(context.sessionId, detectedCwd, context.cwd)
-      if (isRecoverableCommandFailure(err)) {
+      if (isRecoverableCommandFailure(err, context.signal)) {
         return {
           success: false,
-          output: result,
+          output: withBashDiscoveryGuidance(result, discoveryGuidance),
         }
       }
 
@@ -394,6 +413,14 @@ exit $_EXIT_CODE`
       throw newErr
     }
   },
+}
+
+function withBashDiscoveryGuidance<T extends Record<string, unknown>>(
+  output: T,
+  guidance: BashFileDiscoveryGuidance | null,
+): T & { guidance?: BashFileDiscoveryGuidance } {
+  if (!guidance) return output
+  return { ...output, guidance }
 }
 
 function findWorkspaceEscapeInCommand(command: string, cwd: string, allowedPaths?: string[]): WorkspacePathError | null {

@@ -2,6 +2,7 @@ import readline from 'node:readline'
 import chalk from 'chalk'
 import { modelRegistry } from '../providers/registry.js'
 import { completePathMention, WorkspacePathIndex } from './pathMention.js'
+import { completeLspContextMention, WorkspaceLspContextIndex } from './lspContextMention.js'
 import { ConfigManager } from '../shared/config.js'
 import { getChatPrompt } from './renderEvents.js'
 import {
@@ -136,6 +137,7 @@ function truncateWithEllipsis(text: string, width: number): string {
 
 export function makeCompleter(cwd: string) {
   const pathIndex = new WorkspacePathIndex(cwd)
+  const lspContextIndex = new WorkspaceLspContextIndex(cwd)
   return (line: string, callback?: (err: Error | null, result?: [string[], string]) => void) => {
     let hits: string[] = []
     let substring = line
@@ -174,10 +176,16 @@ export function makeCompleter(cwd: string) {
         .map(option => `/fallback ${option}`)
       substring = line
     } else {
-      const pathCompletion = completePathMention(line, cwd, pathIndex)
-      if (pathCompletion) {
-        hits = pathCompletion.hits
-        substring = pathCompletion.substring
+      const lspContextCompletion = completeLspContextMention(line, cwd, lspContextIndex)
+      if (lspContextCompletion) {
+        hits = lspContextCompletion.hits
+        substring = lspContextCompletion.substring
+      } else {
+        const pathCompletion = completePathMention(line, cwd, pathIndex)
+        if (pathCompletion) {
+          hits = pathCompletion.hits
+          substring = pathCompletion.substring
+        }
       }
     }
 

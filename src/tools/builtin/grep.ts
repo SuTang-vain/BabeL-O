@@ -1,63 +1,100 @@
 import { execFile } from 'node:child_process'
 import { readdir, readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { isAbsolute, relative, resolve } from 'node:path'
 import { promisify } from 'node:util'
+import { minimatch } from 'minimatch'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
 
 const execFileAsync = promisify(execFile)
+const SYSTEM_RIPGREP_BINARY = 'rg'
+const FORCE_RIPGREP_FALLBACK_ENV = 'BABEL_O_GREP_FORCE_FALLBACK'
 
 const inputSchema = z.object({
   pattern: z.string().min(1),
   path: z.string().default('.'),
+  pathMatches: z.string().optional(),
   maxMatches: z.number().int().positive().max(200).default(50),
 })
 
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
-  prompt: () => 'Grep is a content locator built on ripgrep. Supports full regex syntax. Use Grep to find candidate lines containing symbols, errors, or text inside files. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
+  prompt: () => 'Grep is a content locator built on bundled ripgrep when available, then system rg, then JavaScript RegExp fallback. Supports full regex syntax through ripgrep and basic JavaScript regex fallback; use pathMatches for file glob filters such as "**/*.ts". Use Grep to find candidate lines containing symbols, errors, or text inside files. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
-    try {
-      const probeLimit = input.maxMatches + 1
-      const { stdout } = await execFileAsync(
-        'rg',
-        ['-n', '--max-count', String(probeLimit), input.pattern, input.path],
-        {
-          cwd: context.cwd,
-          maxBuffer: 1_000_000,
-          signal: context.signal,
-        },
-      )
-      const lines = stdout.split('\n').filter(line => line.length > 0)
-      if (lines.length > input.maxMatches) {
-        const truncated = lines.slice(0, input.maxMatches).join('\n') + targetedGrepTruncationHint(input.maxMatches)
-        return { success: true, output: truncated }
+    const probeLimit = input.maxMatches + 1
+    const args = [
+      '-n',
+      '--max-count',
+      String(probeLimit),
+      ...(input.pathMatches ? ['--glob', input.pathMatches] : []),
+      input.pattern,
+      input.path,
+    ]
+    const ripgrepCandidates = await getRipgrepCandidates()
+
+    for (const candidate of ripgrepCandidates) {
+      try {
+        const { stdout } = await execFileAsync(
+          candidate,
+          args,
+          {
+            cwd: context.cwd,
+            maxBuffer: 1_000_000,
+            signal: context.signal,
+          },
+        )
+        return { success: true, output: formatRipgrepOutput(stdout, input.maxMatches) }
+      } catch (error) {
+        if (isRipgrepNoMatch(error)) return { success: true, output: '' }
+        if (isCommandNotFound(error)) continue
+        throw error
       }
-      return { success: true, output: stdout }
-    } catch (error) {
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 1
-      ) {
-        return { success: true, output: '' }
-      }
-      if (
-        typeof error === 'object' &&
-        error !== null &&
-        'code' in error &&
-        error.code === 'ENOENT'
-      ) {
-        const output = await grepFallback(context.cwd, input.path, input.pattern, input.maxMatches)
-        return { success: true, output }
-      }
-      throw error
     }
+
+    const output = await grepFallback(context.cwd, input.path, input.pattern, input.maxMatches, input.pathMatches)
+    return { success: true, output }
   },
+}
+
+async function getRipgrepCandidates(): Promise<string[]> {
+  if (process.env[FORCE_RIPGREP_FALLBACK_ENV] === '1') return []
+
+  const bundledRipgrepPath = await resolveBundledRipgrepPath()
+  const candidates = [bundledRipgrepPath, SYSTEM_RIPGREP_BINARY]
+    .filter((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0)
+  return Array.from(new Set(candidates))
+}
+
+async function resolveBundledRipgrepPath(): Promise<string | undefined> {
+  try {
+    const mod = await import('@vscode/ripgrep')
+    return typeof mod.rgPath === 'string' && mod.rgPath.length > 0 ? mod.rgPath : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function formatRipgrepOutput(stdout: string, maxMatches: number): string {
+  const lines = stdout.split('\n').filter(line => line.length > 0)
+  if (lines.length > maxMatches) {
+    return lines.slice(0, maxMatches).join('\n') + targetedGrepTruncationHint(maxMatches)
+  }
+  return stdout
+}
+
+function isRipgrepNoMatch(error: unknown): boolean {
+  return isErrorWithCode(error, 1)
+}
+
+function isCommandNotFound(error: unknown): boolean {
+  return isErrorWithCode(error, 'ENOENT')
+}
+
+function isErrorWithCode(error: unknown, code: string | number): boolean {
+  return typeof error === 'object' && error !== null && 'code' in error && error.code === code
 }
 
 function targetedGrepTruncationHint(maxMatches: number): string {
@@ -69,8 +106,9 @@ async function grepFallback(
   searchPath: string,
   pattern: string,
   maxMatches: number,
+  pathMatches?: string,
 ): Promise<string> {
-  const root = join(cwd, searchPath)
+  const root = isAbsolute(searchPath) ? resolve(searchPath) : resolve(cwd, searchPath)
   const results: string[] = []
   const probeLimit = maxMatches + 1
   let matcher: RegExp
@@ -93,7 +131,7 @@ async function grepFallback(
     for (const entry of entries) {
       if (results.length >= probeLimit) return
       if (entry.name === 'node_modules' || entry.name === '.git') continue
-      const fullPath = join(path, entry.name)
+      const fullPath = resolve(path, entry.name)
       if (entry.isDirectory()) {
         await visit(fullPath)
       } else if (entry.isFile()) {
@@ -104,6 +142,8 @@ async function grepFallback(
 
   async function scanFile(filePath: string): Promise<void> {
     if (results.length >= probeLimit) return
+    const displayPath = formatGrepPath(cwd, filePath)
+    if (pathMatches && !minimatch(displayPath, pathMatches, { dot: true })) return
     let text = ''
     try {
       text = await readFile(filePath, 'utf8')
@@ -112,8 +152,9 @@ async function grepFallback(
     }
     const lines = text.split('\n')
     for (let index = 0; index < lines.length && results.length < probeLimit; index++) {
+      matcher.lastIndex = 0
       if (matcher.test(lines[index]!)) {
-        results.push(`${filePath}:${index + 1}:${lines[index]}`)
+        results.push(`${displayPath}:${index + 1}:${lines[index]}`)
       }
     }
   }
@@ -126,6 +167,11 @@ async function grepFallback(
     return grepFallbackNoResultHint(searchPath)
   }
   return results.join('\n') + grepFallbackModeHint()
+}
+
+function formatGrepPath(cwd: string, filePath: string): string {
+  const rel = relative(cwd, filePath)
+  return rel && !rel.startsWith('..') ? rel : filePath
 }
 
 function grepFallbackModeHint(): string {

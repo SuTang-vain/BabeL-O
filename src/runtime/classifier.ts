@@ -1,4 +1,5 @@
 import { isAbsolute, relative, resolve } from 'node:path'
+import { getBashFileDiscoveryGuidance } from '../shared/bashDiscoveryGuidance.js'
 
 export type ClassificationResult = {
   autoApprove: boolean
@@ -246,6 +247,14 @@ export function classifyAction(
 
     if (dangerousPatterns.some(regex => regex.test(trimmed))) {
       return { autoApprove: false, reason: 'Potentially destructive or unauthorized action detected' }
+    }
+
+    const discoveryGuidance = getBashFileDiscoveryGuidance(trimmed)
+    if (discoveryGuidance && discoveryGuidance.commandKind !== 'ls') {
+      return {
+        autoApprove: false,
+        reason: `${discoveryGuidance.message} Bash execution requires manual review.`,
+      }
     }
 
     const safeCommand = classifySafeBashTokens(tokenized.tokens, context)

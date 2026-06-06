@@ -61,9 +61,9 @@ echo "Target Installation Path: $TARGET_PATH"
 
 # Perform download
 if command -v curl >/dev/null 2>&1; then
-  curl -L -o "$TARGET_PATH" "$DOWNLOAD_URL"
+  curl --fail --location --output "$TARGET_PATH" "$DOWNLOAD_URL"
 elif command -v wget >/dev/null 2>&1; then
-  wget -O "$TARGET_PATH" "$DOWNLOAD_URL"
+  wget --output-document="$TARGET_PATH" "$DOWNLOAD_URL"
 else
   echo "Error: curl or wget is required to run this installer."
   exit 1
