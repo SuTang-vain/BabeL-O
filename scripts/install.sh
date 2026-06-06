@@ -4,10 +4,17 @@
 
 set -e
 
-VERSION="v0.2.8"
 REPO="SuTang-vain/BabeL-O"
 
 echo "=== BabeL-O Standalone Binary Installer ==="
+
+# Fetch latest release tag from GitHub API
+VERSION=$(curl -s "https://api.github.com/repos/$REPO/releases/latest" | grep '"tag_name"' | cut -d'"' -f4)
+if [ -z "$VERSION" ]; then
+  echo "Error: Failed to determine latest release version."
+  exit 1
+fi
+echo "Latest version: $VERSION"
 
 # 1. Detect OS and architecture
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"

@@ -1,5 +1,6 @@
 import chalk from 'chalk'
 import type { NexusEvent } from '../shared/events.js'
+import type { AgentJob, AgentJobStatus } from '../shared/agentJob.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import { renderDiff } from './diff.js'
 import { renderMarkdown, containsMarkdown, formatToolOutputMarkdown, MarkdownStreamRenderer } from './markdown.js'
@@ -41,6 +42,19 @@ const toolPrefix = chalk.blue('●')
 const thoughtPrefix = chalk.magenta('▸')
 const compactBashOutputLineLimit = 3
 const defaultBashTimeoutMs = 60_000
+
+// Live agent tree state for concurrent sub-agent / agent job rendering
+type LiveAgentEntry = {
+  id: string
+  title: string
+  agentType: string
+  status: 'running' | 'completed' | 'failed' | 'cancelled'
+  toolUses: number
+  tokens: number
+  lastActivity?: string
+}
+let liveAgentTree: LiveAgentEntry[] = []
+let liveAgentTreeRenderedLines = 0
 
 export function getTuiMode(): 'compact' | 'expanded' {
   return tuiMode
@@ -179,6 +193,7 @@ export function stopSpinner(): void {
 }
 
 function drawSpinnerLine() {
+  if (liveAgentTree.length > 0 && currentAgentStatus === 'running_subagent') return
   if (spinnerRenderedLineCount > 0) {
     clearSpinnerLine()
   }
@@ -236,6 +251,102 @@ function formatElapsedDuration(ms: number): string {
   const seconds = totalSeconds % 60
   if (minutes > 0) return `${minutes}m ${seconds}s`
   return `${seconds}s`
+}
+
+// --- Live Agent Tree ---
+
+function addLiveAgentEntry(id: string, agentType: string, title: string): void {
+  if (liveAgentTree.some(e => e.id === id)) return
+  liveAgentTree.push({ id, title, agentType, status: 'running', toolUses: 0, tokens: 0, lastActivity: 'Initializing…' })
+  redrawLiveAgentTree()
+}
+
+function completeLiveAgentEntry(id: string, status: 'completed' | 'failed' | 'cancelled'): void {
+  const entry = liveAgentTree.find(e => e.id === id)
+  if (entry) {
+    entry.status = status
+    entry.lastActivity = status === 'completed' ? 'Done' : status
+  }
+  redrawLiveAgentTree()
+  if (liveAgentTree.length > 0 && liveAgentTree.every(e => e.status !== 'running')) {
+    printFinalAgentTreeSummary()
+    liveAgentTree = []
+    liveAgentTreeRenderedLines = 0
+  }
+}
+
+export function updateLiveAgentActivity(id: string, toolUses?: number, tokens?: number, activity?: string): void {
+  const entry = liveAgentTree.find(e => e.id === id)
+  if (!entry) return
+  if (toolUses !== undefined) entry.toolUses = toolUses
+  if (tokens !== undefined) entry.tokens = tokens
+  if (activity) entry.lastActivity = activity
+  redrawLiveAgentTree()
+}
+
+function clearLiveAgentTreeLines(): void {
+  if (liveAgentTreeRenderedLines > 0) {
+    process.stdout.write(`\x1b[${liveAgentTreeRenderedLines}A\x1b[J`)
+    liveAgentTreeRenderedLines = 0
+  }
+}
+
+function redrawLiveAgentTree(): void {
+  if (liveAgentTree.length === 0) return
+  clearLiveAgentTreeLines()
+  const lines = formatLiveAgentTreeLines()
+  const output = lines.join('\n') + '\n'
+  process.stdout.write(output)
+  liveAgentTreeRenderedLines = lines.length
+}
+
+function formatLiveAgentTreeLines(): string[] {
+  const running = liveAgentTree.filter(e => e.status === 'running')
+  const finished = liveAgentTree.filter(e => e.status !== 'running')
+  const allDone = running.length === 0
+  const agentTypes = [...new Set(liveAgentTree.map(e => capitalizeFirst(e.agentType)))]
+  const typeLabel = agentTypes.length === 1 ? agentTypes[0]! : 'mixed'
+  const header = allDone
+    ? `${chalk.green('⏺')} ${liveAgentTree.length} ${typeLabel} agent${liveAgentTree.length > 1 ? 's' : ''} finished ${chalk.dim('(ctrl+o to expand)')}`
+    : `${chalk.yellow('⏺')} Running ${liveAgentTree.length} ${typeLabel} agent${liveAgentTree.length > 1 ? 's' : ''}… ${chalk.dim('(ctrl+o to expand)')}`
+  const lines = [header]
+  const entries = [...running, ...finished]
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i]!
+    const isLast = i === entries.length - 1
+    const prefix = isLast ? '└' : '├'
+    const statusIcon = entry.status === 'running' ? chalk.cyan('▶') : entry.status === 'completed' ? chalk.green('✓') : chalk.red('✗')
+    const stats = `${entry.toolUses} tool use${entry.toolUses !== 1 ? 's' : ''} · ${entry.tokens} tokens`
+    lines.push(`   ${prefix} ${statusIcon} ${entry.title} · ${chalk.dim(stats)}`)
+    if (entry.lastActivity && entry.status === 'running') {
+      const actPrefix = isLast ? ' ' : '│'
+      lines.push(`   ${actPrefix} ⎿  ${chalk.dim(entry.lastActivity)}`)
+    }
+  }
+  if (!allDone) {
+    lines.push(chalk.dim('     (ctrl+b to run in background)'))
+  }
+  return lines
+}
+
+function printFinalAgentTreeSummary(): void {
+  clearLiveAgentTreeLines()
+  const lines = formatLiveAgentTreeLines()
+  process.stdout.write(lines.join('\n') + '\n\n')
+  liveAgentTreeRenderedLines = 0
+}
+
+function capitalizeFirst(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+export function getLiveAgentTree(): LiveAgentEntry[] {
+  return liveAgentTree
+}
+
+export function resetLiveAgentTreeForTest(): void {
+  liveAgentTree = []
+  liveAgentTreeRenderedLines = 0
 }
 
 function clearSpinnerLine() {
@@ -506,15 +617,29 @@ function updateAgentStatusFromEvent(event: NexusEvent): void {
     case 'task_session_event':
       if (event.eventType === 'subagent_started' || event.eventType === 'sub_agent_session_started') {
         setAgentStatus('running_subagent', summarizeSubAgentTitle(event.payload))
+        const payload = event.payload as Record<string, unknown> | undefined
+        const subId = (payload?.agentId ?? payload?.subSessionId ?? event.eventId) as string
+        const subTitle = summarizeSubAgentTitle(payload) ?? 'sub-agent'
+        addLiveAgentEntry(subId, 'subagent', subTitle)
       } else if (event.eventType === 'subagent_completed' || event.eventType === 'subagent_failed' || event.eventType === 'subagent_cancelled' || event.eventType === 'sub_agent_session_completed' || event.eventType === 'sub_agent_session_failed' || event.eventType === 'sub_agent_session_error') {
-        setAgentStatus('generating')
+        const payload = event.payload as Record<string, unknown> | undefined
+        const subId = (payload?.agentId ?? payload?.subSessionId ?? event.eventId) as string
+        const terminal = (event.eventType === 'subagent_completed' || event.eventType === 'sub_agent_session_completed') ? 'completed' : 'failed'
+        completeLiveAgentEntry(subId, terminal)
+        if (liveAgentTree.every(e => e.status !== 'running')) {
+          setAgentStatus('generating')
+        }
       }
       break
     case 'agent_job_event':
       if (event.eventType === 'agent_job_started') {
         setAgentStatus('running_subagent', event.agentType)
+        addLiveAgentEntry(event.jobId ?? event.eventId, event.agentType ?? 'agent', (event as any).prompt ?? event.agentType ?? 'agent')
       } else if (event.eventType === 'agent_job_completed' || event.eventType === 'agent_job_failed' || event.eventType === 'agent_job_cancelled') {
-        setAgentStatus('generating')
+        completeLiveAgentEntry(event.jobId ?? event.eventId, event.eventType === 'agent_job_completed' ? 'completed' : event.eventType === 'agent_job_failed' ? 'failed' : 'cancelled')
+        if (liveAgentTree.every(e => e.status !== 'running')) {
+          setAgentStatus('generating')
+        }
       }
       break
   }
@@ -932,6 +1057,214 @@ type TaskBoardItem = {
   worktree?: boolean
   subSessionId?: string
   transcriptPath?: string
+}
+
+type MultiAgentStatusRow = {
+  id: string
+  source: 'AgentJob' | 'AgentLoop'
+  agentType: string
+  status: AgentJobStatus
+  title: string
+  childSessionId?: string
+  transcriptPath?: string
+  depth?: number
+  updatedAt?: string
+  details?: string[]
+}
+
+export function formatMultiAgentStatusView(options: {
+  sessionId?: string
+  jobs?: AgentJob[]
+  events?: NexusEvent[]
+  columns?: number
+}): string {
+  const rows = [
+    ...formatAgentJobRows(options.jobs ?? []),
+    ...formatAgentLoopRows(options.events ?? []),
+  ]
+  rows.sort(compareMultiAgentRows)
+
+  const columns = Math.max(64, options.columns ?? process.stdout.columns ?? 100)
+  const width = Math.max(58, Math.min(columns - 4, 110))
+  const title = options.sessionId
+    ? ` Multi-Agent Status · ${shortSessionId(options.sessionId)} `
+    : ' Multi-Agent Status '
+  const headerPadding = '─'.repeat(Math.max(0, width - title.length))
+  let panel = `\n  ${chalk.cyan(`┌${title}${headerPadding}┐`)}\n`
+
+  if (rows.length === 0) {
+    panel += formatMultiAgentPanelLine(chalk.dim('No agent jobs or AgentLoop sub-agents found for this session.'), width)
+    panel += `  ${chalk.cyan('└' + '─'.repeat(width) + '┘')}\n`
+    return panel
+  }
+
+  const counts = summarizeMultiAgentRows(rows)
+  panel += formatMultiAgentPanelLine(chalk.dim(counts), width)
+  panel += `  ${chalk.cyan('├' + '─'.repeat(width) + '┤')}\n`
+
+  for (const row of rows) {
+    for (const line of formatMultiAgentRow(row, width).split('\n')) {
+      panel += formatMultiAgentPanelLine(line, width)
+    }
+  }
+
+  panel += `  ${chalk.cyan('└' + '─'.repeat(width) + '┘')}\n`
+  return panel
+}
+
+function formatAgentJobRows(jobs: AgentJob[]): MultiAgentStatusRow[] {
+  return jobs.map(job => ({
+    id: job.jobId,
+    source: 'AgentJob',
+    agentType: job.agentType,
+    status: job.status,
+    title: job.result?.summary || job.prompt,
+    childSessionId: job.childSessionId,
+    transcriptPath: job.transcriptPath ?? `nexus://sessions/${job.childSessionId}/events`,
+    depth: job.governance?.depth,
+    updatedAt: job.updatedAt,
+    details: compactStringList([
+      job.contextForkMode,
+      job.isolation !== 'none' ? job.isolation : '',
+      job.governance ? `active ${job.governance.activeAgents}/${job.governance.maxConcurrentAgents}` : '',
+      job.error?.code,
+    ]),
+  }))
+}
+
+function formatAgentLoopRows(events: NexusEvent[]): MultiAgentStatusRow[] {
+  const rows = new Map<string, MultiAgentStatusRow>()
+
+  for (const event of events) {
+    if (event.type !== 'task_session_event') continue
+    if (!isSubAgentLifecycleEvent(event.eventType)) continue
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {}
+    const id = firstPayloadString(payload, ['agentId', 'subSessionId', 'taskId'])
+    if (!id) continue
+
+    const existing = rows.get(id)
+    const nextStatus = statusFromSubAgentLifecycleEvent(event.eventType)
+    const title = firstPayloadString(payload, ['title', 'taskTitle', 'summary']) ?? existing?.title ?? 'sub-agent task'
+    const childSessionId = firstPayloadString(payload, ['subSessionId', 'childSessionId']) ?? existing?.childSessionId
+    const transcriptPath = firstPayloadString(payload, ['transcriptPath']) ?? existing?.transcriptPath
+    const depth = firstPayloadNumber(payload, ['depth']) ?? existing?.depth
+    const parentTaskId = firstPayloadString(payload, ['parentTaskId'])
+    const taskId = firstPayloadString(payload, ['taskId'])
+    rows.set(id, {
+      id,
+      source: 'AgentLoop',
+      agentType: 'subagent',
+      status: nextStatus,
+      title,
+      childSessionId,
+      transcriptPath,
+      depth,
+      updatedAt: event.timestamp,
+      details: compactStringList([
+        parentTaskId ? `parent #${parentTaskId}` : '',
+        taskId ? `task #${taskId}` : '',
+      ]),
+    })
+  }
+
+  return [...rows.values()]
+}
+
+function isSubAgentLifecycleEvent(eventType: string): boolean {
+  return eventType === 'sub_agent_session_started' ||
+    eventType === 'subagent_started' ||
+    eventType === 'sub_agent_session_completed' ||
+    eventType === 'subagent_completed' ||
+    eventType === 'sub_agent_session_failed' ||
+    eventType === 'sub_agent_session_error' ||
+    eventType === 'subagent_failed' ||
+    eventType === 'subagent_cancelled'
+}
+
+function statusFromSubAgentLifecycleEvent(eventType: string): AgentJobStatus {
+  if (eventType === 'sub_agent_session_completed' || eventType === 'subagent_completed') return 'completed'
+  if (eventType === 'subagent_cancelled') return 'cancelled'
+  if (eventType === 'sub_agent_session_failed' || eventType === 'sub_agent_session_error' || eventType === 'subagent_failed') return 'failed'
+  return 'running'
+}
+
+function compareMultiAgentRows(left: MultiAgentStatusRow, right: MultiAgentStatusRow): number {
+  const statusOrder = ['running', 'waiting_permission', 'queued', 'failed', 'cancelled', 'completed']
+  const leftStatus = statusOrder.indexOf(left.status)
+  const rightStatus = statusOrder.indexOf(right.status)
+  if (leftStatus !== rightStatus) return leftStatus - rightStatus
+  return (right.updatedAt ?? '').localeCompare(left.updatedAt ?? '')
+}
+
+function summarizeMultiAgentRows(rows: MultiAgentStatusRow[]): string {
+  const counts = new Map<AgentJobStatus, number>()
+  for (const row of rows) counts.set(row.status, (counts.get(row.status) ?? 0) + 1)
+  return ['running', 'waiting_permission', 'queued', 'failed', 'cancelled', 'completed']
+    .map(status => [status, counts.get(status as AgentJobStatus) ?? 0] as const)
+    .filter(([, count]) => count > 0)
+    .map(([status, count]) => `${status} ${count}`)
+    .join(' · ')
+}
+
+function formatMultiAgentRow(row: MultiAgentStatusRow, width: number): string {
+  const status = formatMultiAgentStatus(row.status)
+  const source = row.source === 'AgentJob' ? chalk.blue('job') : chalk.magenta('loop')
+  const depth = typeof row.depth === 'number' ? chalk.dim(` d${row.depth}`) : ''
+  const prefix = `${status} ${source} ${chalk.bold(row.agentType)}${depth}`
+  const titleBudget = Math.max(24, width - visibleTerminalWidth(stripAnsi(prefix)) - 4)
+  const lines = [`${prefix} ${truncateMiddle(row.title, titleBudget)}`]
+  const meta = [
+    row.childSessionId ? `child=${shortSessionId(row.childSessionId)}` : '',
+    ...(row.details ?? []),
+    row.transcriptPath ? `transcript=${row.transcriptPath}` : '',
+  ].filter(Boolean)
+  if (meta.length > 0) lines.push(chalk.dim(`  ${meta.join(' · ')}`))
+  return lines.join('\n')
+}
+
+function formatMultiAgentStatus(status: AgentJobStatus): string {
+  switch (status) {
+    case 'queued':
+      return chalk.yellow('⟳ queued')
+    case 'running':
+      return chalk.cyan('▶ running')
+    case 'waiting_permission':
+      return chalk.magenta('? permission')
+    case 'completed':
+      return chalk.green('✓ completed')
+    case 'failed':
+      return chalk.red('✗ failed')
+    case 'cancelled':
+      return chalk.red('✗ cancelled')
+  }
+}
+
+function formatMultiAgentPanelLine(content: string, width: number): string {
+  const visibleLength = visibleTerminalWidth(content)
+  const padding = ' '.repeat(Math.max(0, width - visibleLength))
+  return `  ${chalk.cyan('│')}${content}${padding}${chalk.cyan('│')}\n`
+}
+
+function compactStringList(values: Array<string | undefined>): string[] {
+  return values.filter((value): value is string => typeof value === 'string' && value.length > 0)
+}
+
+function firstPayloadString(payload: Record<string, unknown>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = payload[key]
+    if (typeof value === 'string' && value.length > 0) return value
+  }
+  return undefined
+}
+
+function firstPayloadNumber(payload: Record<string, unknown>, keys: string[]): number | undefined {
+  for (const key of keys) {
+    const value = payload[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return value
+  }
+  return undefined
 }
 
 export function formatTaskStatusPanel(events: NexusEvent[]): string {

@@ -16,12 +16,15 @@ import {
   toggleTuiMode,
   stopAgentStatus,
   stopSpinner,
-  redrawSession
+  redrawSession,
+  formatMultiAgentStatusView,
+  getSessionEvents
 } from '../renderEvents.js'
 import { formatSessionBanner, renderWelcome } from '../welcome.js'
 import { renderHelpPanel, renderCompactHelp } from '../helpPanel.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../../shared/config.js'
 import { getProvider, modelRegistry, providerRegistry } from '../../providers/registry.js'
+import { type SessionHintState } from '../promptSuggestions.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction, type ProviderRecoveryKind } from '../../runtime/providerRecovery.js'
 import { createId } from '../../shared/id.js'
@@ -98,8 +101,11 @@ export function registerChatCommand(program: Command): void {
       let isExecuting = false
 
       const isExecutingRef = { get current() { return isExecuting } }
+      const sessionHintRef: { current: SessionHintState } = {
+        current: { hasSession: false },
+      }
       rl.setPrompt(getChatPrompt())
-      const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef)
+      const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef, sessionHintRef)
       const slashPalette = createSlashPalette(rl, {
         clearInputBlock: () => inputRefresh.clearCurrentInputBlock(),
       })
@@ -279,6 +285,7 @@ export function registerChatCommand(program: Command): void {
           isExecuting = false
           inputState.set('idle')
           stopSpinner()
+          updateSessionHint()
         }
       }
 
@@ -320,6 +327,44 @@ export function registerChatCommand(program: Command): void {
           cwd: options.cwd,
         }) as Parameters<typeof openContextView>[0]
         await openContextView(analysis)
+      }
+
+      const showMultiAgentStatus = async () => {
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(formatMultiAgentStatusView({ sessionId, jobs: [], events: [] }))
+          return
+        }
+        const [agentResponse, eventResponse] = await Promise.all([
+          client.listSessionAgents(sessionId),
+          client.listSessionEvents(sessionId, { limit: 200, order: 'asc' }) as Promise<{ events?: NexusEvent[] }>,
+        ])
+        console.log(formatMultiAgentStatusView({
+          sessionId,
+          jobs: agentResponse.jobs,
+          events: eventResponse.events ?? [],
+        }))
+      }
+
+      const updateSessionHint = () => {
+        const events = getSessionEvents()
+        const turnCount = events.filter(e => e.type === 'user_message').length
+        const lastEvent = events[events.length - 1]
+        const tasks = events.filter(e => e.type === 'task_session_event' && (e as any).eventType === 'task_created')
+        const failedTasks = events.filter(e => e.type === 'task_session_event' && (e as any).eventType === 'task_updated' && (e as any).payload?.task?.status === 'failed')
+        const pendingTasks = tasks.length - failedTasks.length - events.filter(e => e.type === 'task_session_event' && (e as any).eventType === 'task_updated' && (e as any).payload?.task?.status === 'completed').length
+        sessionHintRef.current = {
+          hasSession: true,
+          turnCount,
+          lastEventType: lastEvent?.type,
+          lastToolName: lastEvent?.type === 'tool_completed' ? (lastEvent as any).name : undefined,
+          taskCount: tasks.length,
+          failedTaskCount: failedTasks.length,
+          pendingTaskCount: Math.max(0, pendingTasks),
+          agentRunning: false,
+        }
       }
 
       const onGlobalKeypress = (chunk: any, key: any) => {
@@ -799,6 +844,15 @@ export function registerChatCommand(program: Command): void {
               console.log(formatProviderFallbackPlan(plan))
             } catch (e: any) {
               console.error(chalk.red(`Failed to build provider fallback plan: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/agents' || trimmed === '/agents status') {
+            try {
+              await showMultiAgentStatus()
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show agent status: ${e.message || e}`))
             }
             continue
           }

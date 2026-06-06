@@ -38,14 +38,12 @@ import {
   commitAndMergeWorktree,
   removeWorktree,
   pruneOrphanedWorktrees,
-  runGitCommand,
-  parsePorcelainChangedPaths,
-  withGitOperationLock,
   isWorktreeMergeConflictError,
   type WorktreeMergeConflictDiagnostic,
 } from './worktree.js'
-import { RuntimeAgentStepError } from './runtimeAgentStep.js'
+import { RuntimeAgentStepError, buildAgentRoleCapabilityDiagnostics, type RuntimeAgentStepUsageSummary } from './runtimeAgentStep.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
+import { ConfigManager } from '../shared/config.js'
 import {
   buildPreviousSubAgentsMetadata,
   buildSubAgentLifecycleMetadata,
@@ -60,6 +58,16 @@ import {
   type AgentSubTask,
   type SubAgentApprovalInheritanceOptions,
 } from './agentLoopSubAgents.js'
+import {
+  gitCommit,
+  gitRollbackTracked,
+  gitStash,
+  gitStashPop,
+  recordGitStatusSnapshot,
+  requireInPlaceOptimizerApproval,
+  type GitStatusSnapshot,
+  type InPlaceOptimizerApprovalRequest,
+} from './agentLoopWorktree.js'
 
 export type PlannerTaskPlan = {
   title: string
@@ -110,7 +118,7 @@ async function runAgentRoleStep<TInput, TOutput>(options: {
     })
     recordAgentRoleStepMetrics({
       sessionId: options.sessionId,
-      role: options.roleDefinition.role,
+      roleDefinition: options.roleDefinition,
       taskId: options.taskId,
       input: options.input,
       output,
@@ -121,11 +129,14 @@ async function runAgentRoleStep<TInput, TOutput>(options: {
   } catch (error) {
     recordAgentRoleStepMetrics({
       sessionId: options.sessionId,
-      role: options.roleDefinition.role,
+      roleDefinition: options.roleDefinition,
       taskId: options.taskId,
       input: options.input,
       durationMs: performance.now() - startedAt,
       success: false,
+      capabilityDiagnostics: error instanceof RuntimeAgentStepError
+        ? error.summary.capabilityDiagnostics
+        : undefined,
       errorCode: error instanceof RuntimeAgentStepError
         ? error.summary.errorCode ?? 'RUNTIME_AGENT_STEP_ERROR'
         : 'AGENT_ROLE_STEP_ERROR',
@@ -139,18 +150,21 @@ async function runAgentRoleStep<TInput, TOutput>(options: {
 
 function recordAgentRoleStepMetrics(options: {
   sessionId: string
-  role: string
+  roleDefinition: AgentRoleDefinition
   taskId?: string
   input: unknown
   output?: unknown
   durationMs: number
   success: boolean
+  capabilityDiagnostics?: RuntimeAgentStepUsageSummary['capabilityDiagnostics']
   errorCode?: string
   failureType?: string
 }): void {
+  const capabilityDiagnostics = options.capabilityDiagnostics ?? buildRoleStepCapabilityDiagnostics(options.roleDefinition)
   recordTaskSessionEvent(options.sessionId, 'agent_loop_role_step_metrics', {
-    role: options.role,
+    role: options.roleDefinition.role,
     taskId: options.taskId,
+    capabilityDiagnostics,
     durationMs: Math.round(options.durationMs * 100) / 100,
     inputTokens: estimateTextTokens(stringifyForMetrics(options.input)),
     outputTokens: options.output === undefined ? 0 : estimateTextTokens(stringifyForMetrics(options.output)),
@@ -158,6 +172,11 @@ function recordAgentRoleStepMetrics(options: {
     errorCode: options.errorCode,
     failureType: options.failureType,
   })
+}
+
+function buildRoleStepCapabilityDiagnostics(roleDefinition: AgentRoleDefinition) {
+  const providerDiagnostics = ConfigManager.getInstance().getProviderDiagnostics(roleDefinition.role)
+  return buildAgentRoleCapabilityDiagnostics(roleDefinition.role, providerDiagnostics)
 }
 
 function stringifyForMetrics(value: unknown): string {
@@ -177,68 +196,7 @@ function getCancelledTaskSession(sessionId: string): SessionSnapshot | null {
   }
 }
 
-async function gitIsClean(cwd: string): Promise<boolean> {
-  const { code, stdout } = await runGitCommand(cwd, ['status', '--porcelain'])
-  return code === 0 && stdout === ''
-}
-
-async function gitStash(cwd: string): Promise<boolean> {
-  return withGitOperationLock(cwd, async () => {
-    const { code, stdout } = await runGitCommand(cwd, ['stash', 'push', '--include-untracked', '-m', `babel-optimize-backup-${Date.now()}`])
-    if (code === 0 && !stdout.includes('No local changes to save')) {
-      return true
-    }
-    return false
-  })
-}
-
-async function gitStashPop(cwd: string): Promise<void> {
-  await withGitOperationLock(cwd, async () => {
-    await runGitCommand(cwd, ['stash', 'pop'])
-  })
-}
-
-async function gitChangedPaths(cwd: string): Promise<string[]> {
-  const { code, stdout, stderr } = await runGitCommand(cwd, [
-    'status',
-    '--porcelain=v1',
-    '-z',
-    '--untracked-files=normal',
-  ])
-  if (code !== 0) {
-    throw new Error(`Failed to inspect git changes: ${stderr}`)
-  }
-  return parsePorcelainChangedPaths(stdout)
-}
-
-async function gitRollbackTracked(cwd: string): Promise<void> {
-  await withGitOperationLock(cwd, async () => {
-    await runGitCommand(cwd, ['restore', '--staged', '--worktree', '.'])
-  })
-}
-
-async function gitCommit(cwd: string, message: string): Promise<void> {
-  await withGitOperationLock(cwd, async () => {
-    const changedPaths = await gitChangedPaths(cwd)
-    if (changedPaths.length === 0) return
-    const { code: addCode, stderr: addStderr, stdout: addStdout } = await runGitCommand(cwd, ['add', '--', ...changedPaths])
-    if (addCode !== 0) {
-      throw new Error(`Git stage failed: ${addStderr || addStdout}`)
-    }
-    const { code, stderr, stdout } = await runGitCommand(cwd, [
-      '-c',
-      'user.name=BabeL-O Agent',
-      '-c',
-      'user.email=agent@babel-o.local',
-      'commit',
-      '-m',
-      message,
-    ])
-    if (code !== 0) {
-      throw new Error(`Git commit failed: ${stderr || stdout}`)
-    }
-  })
-}
+export type { GitStatusSnapshot, InPlaceOptimizerApprovalRequest, InPlaceOptimizerApprovalReason } from './agentLoopWorktree.js'
 
 export type RunAgentLoopOptions = {
   sessionId: string
@@ -247,6 +205,8 @@ export type RunAgentLoopOptions = {
   stepRunner: AgentStepRunner
   role?: 'executor' | 'optimizer'
   autoApprove?: boolean
+  allowInPlaceOptimizer?: boolean
+  confirmInPlaceOptimizer?: (request: InPlaceOptimizerApprovalRequest) => Promise<boolean> | boolean
   maxRetriesPerTask?: number
   enableSubAgents?: boolean
   maxSubAgentDepth?: number
@@ -269,6 +229,8 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
     stepRunner,
     role = 'executor',
     autoApprove = false,
+    allowInPlaceOptimizer = false,
+    confirmInPlaceOptimizer,
     maxRetriesPerTask = 3,
     enableSubAgents = false,
     maxSubAgentDepth = 1,
@@ -306,14 +268,6 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
   }
 
   let preStashed = false
-  if (role === 'optimizer' && isGitWorkspace) {
-    try {
-      preStashed = await gitStash(cwd)
-      recordTaskSessionEvent(sessionId, 'git_stash_performed', { preStashed })
-    } catch (err) {
-      logger.warn('Git stash failed', err)
-    }
-  }
 
   try {
     // 1. Planning Phase
@@ -422,23 +376,64 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
       const requiresIsolation = task.metadata?.requiresIsolation === true
       let isIsolated = false
       let isolatedWorktreeMerged = false
+      let inPlaceOptimizerApproved = false
       let taskCwd = cwd
       let taskAllowedPaths: string[] | undefined
 
       try {
         if (requiresIsolation) {
-          try {
-            if (await isGitRepository(cwd)) {
+          if (!isGitWorkspace) {
+            logger.warn(`Task ${task.taskId} requested isolation but workspace is not a Git repository. Falling back to in-place execution.`)
+          } else {
+            try {
               taskCwd = await createWorktree(cwd, task.taskId)
               taskAllowedPaths = [taskCwd]
               isIsolated = true
               recordTaskSessionEvent(sessionId, 'worktree_created', { taskId: task.taskId, worktreePath: taskCwd })
-            } else {
-              logger.warn(`Task ${task.taskId} requested isolation but workspace is not a Git repository. Falling back to in-place execution.`)
+            } catch (err) {
+              recordTaskSessionEvent(sessionId, 'worktree_create_failed', {
+                taskId: task.taskId,
+                title: task.title,
+                error: err instanceof Error ? err.message : String(err),
+              })
+              await requireInPlaceOptimizerApproval({
+                sessionId,
+                task,
+                cwd,
+                reason: 'worktree_unavailable',
+                allowInPlaceOptimizer,
+                confirmInPlaceOptimizer,
+              })
+              inPlaceOptimizerApproved = true
             }
-          } catch (err) {
-            logger.warn(`Failed to create worktree for task ${task.taskId}. Falling back to in-place execution.`, err)
           }
+        }
+        if (role === 'optimizer' && isGitWorkspace && !isIsolated && !inPlaceOptimizerApproved) {
+          await requireInPlaceOptimizerApproval({
+            sessionId,
+            task,
+            cwd,
+            reason: 'task_not_isolated',
+            allowInPlaceOptimizer,
+            confirmInPlaceOptimizer,
+          })
+          if (!preStashed) {
+            try {
+              preStashed = await gitStash(cwd)
+              recordTaskSessionEvent(sessionId, 'git_stash_performed', { preStashed })
+            } catch (err) {
+              logger.warn('Git stash failed', err)
+            }
+          }
+        }
+        if (isGitWorkspace || isIsolated) {
+          await recordGitStatusSnapshot({
+            sessionId,
+            eventType: 'git_status_before_task',
+            task,
+            cwd: taskCwd,
+            mode: isIsolated ? 'isolated' : 'in_place',
+          })
         }
 
         let executorSuccess = false
@@ -502,6 +497,8 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               maxSubAgentDepth,
               maxSubTasksPerTask,
               subAgentApprovalInheritance,
+              allowInPlaceOptimizer,
+              confirmInPlaceOptimizer,
               parentSessionId: sessionId,
               assignedAgentId: subAgentMetadata.agentId,
               currentTaskId: task.taskId,
@@ -684,6 +681,16 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
           }
         }
 
+        if (isGitWorkspace || isIsolated) {
+          await recordGitStatusSnapshot({
+            sessionId,
+            eventType: 'git_status_after_task',
+            task,
+            cwd: taskCwd,
+            mode: isIsolated ? 'isolated' : 'in_place',
+          })
+        }
+
         const cancelledSessionAfterExecutor = getCancelledTaskSession(sessionId)
         if (cancelledSessionAfterExecutor) return cancelledSessionAfterExecutor
 
@@ -703,6 +710,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 await commitAndMergeWorktree(cwd, taskCwd, task.taskId, task.title)
                 isolatedWorktreeMerged = true
                 recordTaskSessionEvent(sessionId, 'worktree_merged', { taskId: task.taskId })
+                await recordGitStatusSnapshot({
+                  sessionId,
+                  eventType: 'git_status_after_resolution',
+                  task,
+                  cwd,
+                  mode: 'isolated',
+                  note: 'worktree_merged',
+                })
                 await removeWorktree(cwd, taskCwd, task.taskId)
                 isIsolated = false
               } catch (err) {
@@ -769,6 +784,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 await commitAndMergeWorktree(cwd, taskCwd, task.taskId, task.title)
                 isolatedWorktreeMerged = true
                 recordTaskSessionEvent(sessionId, 'worktree_merged', { taskId: task.taskId })
+                await recordGitStatusSnapshot({
+                  sessionId,
+                  eventType: 'git_status_after_resolution',
+                  task,
+                  cwd,
+                  mode: 'isolated',
+                  note: 'worktree_merged',
+                })
                 await removeWorktree(cwd, taskCwd, task.taskId)
                 isIsolated = false
               } catch (err) {
@@ -795,6 +818,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
                 try {
                   await gitCommit(cwd, `bbl optimize: completed task ${task.taskId} - ${task.title}`)
                   recordTaskSessionEvent(sessionId, 'git_commit_performed', { taskId: task.taskId })
+                  await recordGitStatusSnapshot({
+                    sessionId,
+                    eventType: 'git_status_after_resolution',
+                    task,
+                    cwd,
+                    mode: 'in_place',
+                    note: 'git_commit_performed',
+                  })
                 } catch (err) {
                   logger.warn('Git commit failed', err)
                 }
@@ -821,6 +852,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
               try {
                 await gitRollbackTracked(cwd)
                 recordTaskSessionEvent(sessionId, 'git_rollback_performed', { taskId: task.taskId, reason: criticReason })
+                await recordGitStatusSnapshot({
+                  sessionId,
+                  eventType: 'git_status_after_resolution',
+                  task,
+                  cwd,
+                  mode: 'in_place',
+                  note: 'git_rollback_performed',
+                })
               } catch (err) {
                 logger.error('Git rollback failed', err)
               }
@@ -853,6 +892,14 @@ export async function runAgentLoop(options: RunAgentLoopOptions): Promise<Sessio
             try {
               await gitRollbackTracked(cwd)
               recordTaskSessionEvent(sessionId, 'git_rollback_performed', { taskId: task.taskId, reason: 'executor_failed' })
+              await recordGitStatusSnapshot({
+                sessionId,
+                eventType: 'git_status_after_resolution',
+                task,
+                cwd,
+                mode: 'in_place',
+                note: 'git_rollback_performed',
+              })
             } catch (err) {
               logger.error('Git rollback failed', err)
             }

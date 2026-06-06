@@ -1,5 +1,6 @@
 import { createNexusApp } from '../nexus/app.js'
 import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
+import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -55,6 +56,31 @@ export class EmbeddedNexusClient {
       'GET',
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listAgents(filter: AgentJobFilter = {}): Promise<{ type: 'agent_jobs'; jobs: AgentJob[] }> {
+    const params = new URLSearchParams()
+    if (filter.parentSessionId) params.set('parentSessionId', filter.parentSessionId)
+    if (filter.status) params.set('status', filter.status)
+    if (filter.agentType) params.set('agentType', filter.agentType)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson('GET', `/v1/agents${query}`) as Promise<{ type: 'agent_jobs'; jobs: AgentJob[] }>
+  }
+
+  async listSessionAgents(sessionId: string, filter: Omit<AgentJobFilter, 'parentSessionId'> = {}): Promise<{
+    type: 'agent_jobs'
+    parentSessionId: string
+    jobs: AgentJob[]
+  }> {
+    const params = new URLSearchParams()
+    if (filter.status) params.set('status', filter.status)
+    if (filter.agentType) params.set('agentType', filter.agentType)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson('GET', `/v1/sessions/${encodeURIComponent(sessionId)}/agents${query}`) as Promise<{
+      type: 'agent_jobs'
+      parentSessionId: string
+      jobs: AgentJob[]
+    }>
   }
 
   async compactSession(

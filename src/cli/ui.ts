@@ -5,6 +5,7 @@ import { PendingPermissionRegistry } from '../shared/session.js'
 import { getChatPrompt } from './renderEvents.js'
 import { inputState } from './inputState.js'
 import { normalizeKeyEvent } from './keyEvent.js'
+import { getPromptSuggestion, type SessionHintState } from './promptSuggestions.js'
 import {
   createPermissionPanelState,
   reducePermissionPanelKey,
@@ -171,7 +172,8 @@ export type AutosuggestionRefreshControls = {
 export function setupAutosuggestions(
   rl: any,
   history: string[],
-  isExecutingRef: { current: boolean }
+  isExecutingRef: { current: boolean },
+  sessionHintRef?: { current: SessionHintState }
 ): AutosuggestionRefreshControls {
   const rlInt = rl as any
   const defaultPrompt = rlInt._prompt ?? getChatPrompt()
@@ -208,7 +210,9 @@ export function setupAutosuggestions(
     const suggestion = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle' && cursor === currentInput.length
       ? getAutosuggestion(currentInput, history)
       : undefined
-    const placeholder = undefined
+    const placeholder = isMainPrompt && !isExecutingRef.current && inputState.current === 'idle' && !currentInput
+      ? getPromptSuggestion(sessionHintRef?.current ?? { hasSession: false })
+      : undefined
     const rendered = isMainPrompt
       ? renderBoxedInput({
         prompt,

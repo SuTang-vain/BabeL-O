@@ -56,6 +56,7 @@ export const helpCategories: HelpCategory[] = [
     title: 'Status',
     items: [
       { command: '/status', description: 'Show runtime and provider status' },
+      { command: '/agents', description: 'Show read-only multi-agent status' },
       { command: '/smoke', description: 'Run provider smoke dry-run' },
       { command: '/smoke live', description: 'Run explicit live provider smoke' },
       { command: '/smoke live tool-call', description: 'Run explicit provider tool-call smoke' },

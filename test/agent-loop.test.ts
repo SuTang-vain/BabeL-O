@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { runAgentLoop } from '../src/nexus/agentLoop.js'
 import { runAgentLoopLiveSmoke } from '../src/nexus/agentLoopSmoke.js'
 import {
@@ -43,6 +43,24 @@ import { InMemoryRemoteToolRunner } from '../src/runtime/remoteRunner.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { logger } from '../src/shared/logger.js'
 
+function runGitSync(cwd: string, args: string[]): void {
+  const result = spawnSync('git', args, { cwd, encoding: 'utf8' })
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(' ')} failed: ${result.stderr || result.stdout}`)
+  }
+}
+
+function createTempGitRepo(prefix: string): string {
+  const repo = mkdtempSync(join(tmpdir(), prefix))
+  runGitSync(repo, ['init'])
+  runGitSync(repo, ['config', 'user.name', 'Test Agent'])
+  runGitSync(repo, ['config', 'user.email', 'agent@test.com'])
+  writeFileSync(join(repo, 'main.txt'), 'original content', 'utf8')
+  runGitSync(repo, ['add', '--', 'main.txt'])
+  runGitSync(repo, ['commit', '-m', 'initial'])
+  return repo
+}
+
 test('runAgentLoop runs successfully and handles critic approval', async () => {
   resetTaskQueuesForTest()
   resetTaskSessionsForTest()
@@ -51,6 +69,12 @@ test('runAgentLoop runs successfully and handles critic approval', async () => {
   setNexusStorage(storage)
 
   const sessionId = 'test-loop-success'
+  const originalInstance = (ConfigManager as unknown as { instance?: ConfigManager }).instance
+  const oldBabelOModel = process.env.BABEL_O_MODEL
+  const tempConfig = new ConfigManager('/tmp/babel-o-agent-loop-role-diagnostics.json')
+  tempConfig.save({ defaultModel: 'local/coding-runtime' })
+  ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = tempConfig
+  delete process.env.BABEL_O_MODEL
   let criticTurns = 0
 
   const stepRunner = async ({ roleDefinition, input }: any): Promise<any> => {
@@ -85,42 +109,61 @@ test('runAgentLoop runs successfully and handles critic approval', async () => {
     throw new Error('Unknown role')
   }
 
-  const finalSession = await runAgentLoop({
-    sessionId,
-    cwd: process.cwd(),
-    prompt: 'Optimize src/nexus/app.ts',
-    stepRunner,
-    role: 'optimizer',
-    autoApprove: false,
-    maxRetriesPerTask: 3
-  })
+  const workspace = mkdtempSync(join(tmpdir(), 'babel-o-agent-loop-success-'))
 
-  // Verify phase
-  if (finalSession.phase !== 'completed') {
-    console.error('Test 1 failed with session:', finalSession)
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId,
+      cwd: workspace,
+      prompt: 'Optimize src/nexus/app.ts',
+      stepRunner,
+      role: 'optimizer',
+      autoApprove: false,
+      maxRetriesPerTask: 3
+    })
+
+    // Verify phase
+    if (finalSession.phase !== 'completed') {
+      console.error('Test 1 failed with session:', finalSession)
+    }
+    assert.equal(finalSession.phase, 'completed')
+
+    // Verify task status
+    const queue = listNexusTasks(sessionId)
+    assert.equal(queue.tasks.length, 1)
+    assert.equal(queue.tasks[0].status, 'completed')
+    assert.equal(queue.tasks[0].retryCount, 1) // 1 rejection retry
+
+    const roleMetricEvents = finalSession.events.filter(
+      event => event.type === 'task_session_event' && event.eventType === 'agent_loop_role_step_metrics',
+    )
+    const roleMetricPayloads = roleMetricEvents.map(event => {
+      assert.equal(event.type, 'task_session_event')
+      return event.payload as Record<string, unknown>
+    })
+    assert.ok(roleMetricPayloads.some(payload => payload.role === 'planner'))
+    assert.ok(roleMetricPayloads.some(payload => payload.role === 'optimizer'))
+    assert.ok(roleMetricPayloads.some(payload => payload.role === 'critic'))
+    const plannerMetrics = roleMetricPayloads.find(payload => payload.role === 'planner')
+    const plannerCapabilityDiagnostics = plannerMetrics?.capabilityDiagnostics as Record<string, any>
+    assert.equal(plannerCapabilityDiagnostics.modelId, 'local/coding-runtime')
+    assert.equal(plannerCapabilityDiagnostics.contextWindow, 8192)
+    assert.equal(plannerCapabilityDiagnostics.capabilities.toolCalling, true)
+    assert.equal(plannerCapabilityDiagnostics.capabilities.streaming, true)
+    assert.deepEqual(plannerCapabilityDiagnostics.suitability.missingCapabilities, ['long_context'])
+    assert.match(plannerCapabilityDiagnostics.manualSwitchHint, /No automatic switch will be performed/)
+    assert.equal(plannerCapabilityDiagnostics.recommendation.willAutoSwitch, false)
+    assert.equal(
+      roleMetricPayloads.some(payload => 'input' in payload || 'output' in payload),
+      false,
+    )
+  } finally {
+    ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    if (oldBabelOModel) process.env.BABEL_O_MODEL = oldBabelOModel
+    else delete process.env.BABEL_O_MODEL
+    rmSync('/tmp/babel-o-agent-loop-role-diagnostics.json', { force: true })
+    rmSync(workspace, { recursive: true, force: true })
   }
-  assert.equal(finalSession.phase, 'completed')
-
-  // Verify task status
-  const queue = listNexusTasks(sessionId)
-  assert.equal(queue.tasks.length, 1)
-  assert.equal(queue.tasks[0].status, 'completed')
-  assert.equal(queue.tasks[0].retryCount, 1) // 1 rejection retry
-
-  const roleMetricEvents = finalSession.events.filter(
-    event => event.type === 'task_session_event' && event.eventType === 'agent_loop_role_step_metrics',
-  )
-  const roleMetricPayloads = roleMetricEvents.map(event => {
-    assert.equal(event.type, 'task_session_event')
-    return event.payload as Record<string, unknown>
-  })
-  assert.ok(roleMetricPayloads.some(payload => payload.role === 'planner'))
-  assert.ok(roleMetricPayloads.some(payload => payload.role === 'optimizer'))
-  assert.ok(roleMetricPayloads.some(payload => payload.role === 'critic'))
-  assert.equal(
-    roleMetricPayloads.some(payload => 'input' in payload || 'output' in payload),
-    false,
-  )
 })
 
 test('runAgentLoop stops and marks failed when retry limit is reached', async () => {
@@ -1264,12 +1307,16 @@ test('runtime agent step rejects structured roles on non-json models', async () 
 
   ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = tempConfig
   try {
+    let runtimeCalled = false
+    const usageSummaries: any[] = []
     const stepRunner = createRuntimeAgentStepRunner({
       runtimeFactory: async () => ({
         async *executeStream() {
+          runtimeCalled = true
           throw new Error('runtime should not be called when capability gate fails')
         },
       } as any),
+      onUsageSummary: summary => usageSummaries.push(summary),
     })
 
     await assert.rejects(
@@ -1285,8 +1332,21 @@ test('runtime agent step rejects structured roles on non-json models', async () 
       }),
       /does not support structured output/,
     )
+
+    assert.equal(runtimeCalled, false)
+    assert.equal(usageSummaries.length, 1)
+    assert.equal(usageSummaries[0].role, 'critic')
+    assert.equal(usageSummaries[0].errorCode, 'AGENT_ROLE_CAPABILITY_MISMATCH')
+    assert.equal(usageSummaries[0].capabilityDiagnostics.modelId, 'anthropic/claude-3-opus')
+    assert.equal(usageSummaries[0].capabilityDiagnostics.modelSource, 'role')
+    assert.notEqual(usageSummaries[0].capabilityDiagnostics.recommendation.modelId, 'anthropic/claude-3-opus')
+    assert.equal(usageSummaries[0].capabilityDiagnostics.capabilities.structuredOutput, false)
+    assert.deepEqual(usageSummaries[0].capabilityDiagnostics.suitability.missingCapabilities, ['structured_output'])
+    assert.match(usageSummaries[0].capabilityDiagnostics.manualSwitchHint, /No automatic switch will be performed/)
+    assert.equal(usageSummaries[0].capabilityDiagnostics.recommendation.willAutoSwitch, false)
   } finally {
     ;(ConfigManager as unknown as { instance?: ConfigManager }).instance = originalInstance
+    rmSync('/tmp/babel-o-agent-step-config.json', { force: true })
   }
 })
 
@@ -1740,6 +1800,141 @@ test('runAgentLoop optimizer skips git bookkeeping outside git workspaces', asyn
   }
 })
 
+test('runAgentLoop blocks in-place optimizer in git workspaces without explicit approval', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+  const repo = createTempGitRepo('babel-o-in-place-blocked-')
+
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-in-place-optimizer-blocked',
+      cwd: repo,
+      prompt: 'Modify tracked file',
+      role: 'optimizer',
+      autoApprove: true,
+      maxRetriesPerTask: 1,
+      stepRunner: async ({ roleDefinition, input }: any): Promise<any> => {
+        if (roleDefinition.role === 'planner') {
+          return {
+            summary: 'In-place plan',
+            tasks: [{ title: 'Modify tracked file' }],
+          }
+        }
+        if (roleDefinition.role === 'optimizer') {
+          writeFileSync(join(input.cwd, 'main.txt'), 'should not run', 'utf8')
+          return { taskId: input.taskId, success: true, result: 'unexpected', needsReview: false }
+        }
+        throw new Error(`Unexpected role ${roleDefinition.role}`)
+      },
+    })
+
+    assert.equal(finalSession.phase, 'failed')
+    assert.match(finalSession.error ?? '', /In-place optimizer execution requires explicit opt-in/)
+    assert.equal(readFileSync(join(repo, 'main.txt'), 'utf8'), 'original content')
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'optimizer_in_place_blocked'))
+    assert.equal(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'git_commit_performed'), false)
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('runAgentLoop records git status around explicitly allowed in-place optimizer tasks', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+  const repo = createTempGitRepo('babel-o-in-place-approved-')
+
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-in-place-optimizer-approved',
+      cwd: repo,
+      prompt: 'Modify tracked file',
+      role: 'optimizer',
+      autoApprove: true,
+      allowInPlaceOptimizer: true,
+      maxRetriesPerTask: 1,
+      stepRunner: async ({ roleDefinition, input }: any): Promise<any> => {
+        if (roleDefinition.role === 'planner') {
+          return {
+            summary: 'In-place plan',
+            tasks: [{ title: 'Modify tracked file' }],
+          }
+        }
+        if (roleDefinition.role === 'optimizer') {
+          writeFileSync(join(input.cwd, 'main.txt'), 'agent modified content', 'utf8')
+          return { taskId: input.taskId, success: true, result: 'modified file', needsReview: false }
+        }
+        throw new Error(`Unexpected role ${roleDefinition.role}`)
+      },
+    })
+
+    assert.equal(finalSession.phase, 'completed')
+    assert.equal(readFileSync(join(repo, 'main.txt'), 'utf8'), 'agent modified content')
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'optimizer_in_place_approved'))
+    const before = finalSession.events.find(event => event.type === 'task_session_event' && event.eventType === 'git_status_before_task') as any
+    const after = finalSession.events.find(event => event.type === 'task_session_event' && event.eventType === 'git_status_after_task') as any
+    const resolution = finalSession.events.find(event => event.type === 'task_session_event' && event.eventType === 'git_status_after_resolution') as any
+    assert.ok(before)
+    assert.ok(after)
+    assert.ok(resolution)
+    assert.deepEqual(before.payload.snapshot.changedPaths, [])
+    assert.deepEqual(after.payload.snapshot.changedPaths, ['main.txt'])
+    assert.equal(resolution.payload.note, 'git_commit_performed')
+    assert.deepEqual(resolution.payload.snapshot.changedPaths, [])
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
+test('runAgentLoop does not silently fall back to in-place when requested worktree creation fails', async () => {
+  resetTaskQueuesForTest()
+  resetTaskSessionsForTest()
+
+  const storage = new MemoryStorage()
+  setNexusStorage(storage)
+  const repo = createTempGitRepo('babel-o-worktree-fail-')
+  const conflictingWorktreeDir = join(repo, '.babel-o', 'worktrees', '1')
+  mkdirSync(conflictingWorktreeDir, { recursive: true })
+  writeFileSync(join(conflictingWorktreeDir, 'occupied.txt'), 'occupied', 'utf8')
+
+  try {
+    const finalSession = await runAgentLoop({
+      sessionId: 'test-worktree-failure-no-fallback',
+      cwd: repo,
+      prompt: 'Modify isolated file',
+      role: 'optimizer',
+      autoApprove: true,
+      maxRetriesPerTask: 1,
+      stepRunner: async ({ roleDefinition, input }: any): Promise<any> => {
+        if (roleDefinition.role === 'planner') {
+          return {
+            summary: 'Isolation plan',
+            tasks: [{ title: 'Modify isolated file', metadata: { requiresIsolation: true } }],
+          }
+        }
+        if (roleDefinition.role === 'optimizer') {
+          writeFileSync(join(input.cwd, 'main.txt'), 'should not run', 'utf8')
+          return { taskId: input.taskId, success: true, result: 'unexpected', needsReview: false }
+        }
+        throw new Error(`Unexpected role ${roleDefinition.role}`)
+      },
+    })
+
+    assert.equal(finalSession.phase, 'failed')
+    assert.match(finalSession.error ?? '', /In-place optimizer execution requires explicit opt-in/)
+    assert.equal(readFileSync(join(repo, 'main.txt'), 'utf8'), 'original content')
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'worktree_create_failed'))
+    assert.ok(finalSession.events.some(event => event.type === 'task_session_event' && event.eventType === 'optimizer_in_place_blocked'))
+  } finally {
+    rmSync(repo, { recursive: true, force: true })
+  }
+})
+
 test('runAgentLoop preserves isolated worktree and records recovery metadata on merge conflict', async () => {
   resetTaskQueuesForTest()
   resetTaskSessionsForTest()
@@ -2015,6 +2210,7 @@ test('runAgentLoop optimizer rollback preserves unrelated untracked files', asyn
       prompt: 'Modify tracked file',
       stepRunner,
       role: 'optimizer',
+      allowInPlaceOptimizer: true,
       maxRetriesPerTask: 1,
     })
 

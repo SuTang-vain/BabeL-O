@@ -1,6 +1,7 @@
 import chalk from 'chalk'
 import { ConfigManager } from '../shared/config.js'
 import { padToTerminalWidth, truncateToTerminalWidth, visibleTerminalWidth } from './terminalWidth.js'
+import { getTheme } from './theme.js'
 
 const VERSION = '0.2.9'
 const WELCOME_MAX_WIDTH = 96
@@ -61,13 +62,14 @@ export function formatWelcomeCardLines(options: {
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
   const logoWidth = Math.max(...PIXEL_ROWS.map(row => visibleTerminalWidth(renderLogoRow(row))))
+  const theme = getTheme()
   const metadataWidth = Math.max(18, maxContentWidth - logoWidth - 5)
   const metadataLines = [
-    ` ${chalk.bold.hex('#ff006e')('❖ BABEL-O')}  ${chalk.dim(`v${VERSION}`)}`,
+    ` ${theme.brand('❖ BABEL-O')}  ${chalk.dim(`v${VERSION}`)}`,
     ` ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
     ` ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
     ` ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
-    ` ${chalk.magenta(truncateToTerminalWidth(mode, metadataWidth))}`,
+    ` ${theme.accent(truncateToTerminalWidth(mode, metadataWidth))}`,
   ]
   const contentWidths = PIXEL_ROWS.map((row, index) => {
     const logoCol = renderLogoRow(row)

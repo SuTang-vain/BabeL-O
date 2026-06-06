@@ -1,8 +1,9 @@
 import { test } from 'node:test'
 import assert from 'node:assert'
-import { formatSessionHistory, getSessionEvents, renderEvent, renderEventForTest, startAgentStatus, startSession, stopSpinner } from '../src/cli/renderEvents.js'
+import { formatMultiAgentStatusView, formatSessionHistory, getSessionEvents, renderEvent, renderEventForTest, startAgentStatus, startSession, stopSpinner } from '../src/cli/renderEvents.js'
 import { createMockAgentLoopTuiSmokeEvents } from '../src/cli/commands/chat.js'
 import type { NexusEvent } from '../src/shared/events.js'
+import type { AgentJob } from '../src/shared/agentJob.js'
 
 test('formatSessionHistory: compact mode renders correct summaries', () => {
   const events: NexusEvent[] = [
@@ -1193,4 +1194,85 @@ test('formatSessionHistory: usage event between assistant_delta events does not 
   // Still only one ⏺ even though there was a usage event in between
   const bulletCount = (output.match(/⏺/g) ?? []).length
   assert.strictEqual(bulletCount, 1, `Expected exactly 1 ⏺ after usage-event gap, got ${bulletCount}`)
+})
+
+test('formatMultiAgentStatusView renders AgentJob and AgentLoop sub-agent rows', () => {
+  const now = new Date().toISOString()
+  const jobs: AgentJob[] = [
+    {
+      jobId: 'job-review-1',
+      parentSessionId: 'session_parent_1',
+      childSessionId: 'session_child_review_1',
+      agentType: 'review',
+      status: 'running',
+      prompt: 'Review scheduler diagnostics',
+      contextForkMode: 'task-focused',
+      isolation: 'none',
+      createdAt: now,
+      updatedAt: now,
+      governance: {
+        maxConcurrentAgents: 3,
+        activeAgents: 1,
+        maxDepth: 2,
+        depth: 1,
+        maxRuntimeMs: 180000,
+      },
+    },
+    {
+      jobId: 'job-test-1',
+      parentSessionId: 'session_parent_1',
+      childSessionId: 'session_child_test_1',
+      agentType: 'test',
+      status: 'failed',
+      prompt: 'Run focused renderer tests',
+      contextForkMode: 'task-focused',
+      isolation: 'none',
+      createdAt: now,
+      updatedAt: now,
+      error: { code: 'AGENT_JOB_TIMEOUT', message: 'Timed out.' },
+    },
+  ]
+  const events: NexusEvent[] = [
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'session_parent_1',
+      eventId: 'event-sub-started',
+      eventType: 'subagent_started',
+      phase: 'executing',
+      timestamp: now,
+      payload: {
+        agentId: 'subagent-1',
+        taskId: 'task-2',
+        parentTaskId: 'task-1',
+        title: 'Child implementation via AgentLoop',
+        subSessionId: 'session_subagent_1',
+        transcriptPath: 'nexus://sessions/session_subagent_1/events',
+        depth: 1,
+      },
+    },
+  ]
+
+  const output = formatMultiAgentStatusView({ sessionId: 'session_parent_1', jobs, events, columns: 120 })
+
+  assert.ok(output.includes('Multi-Agent Status'))
+  assert.ok(output.includes('running 2'))
+  assert.ok(output.includes('failed 1'))
+  assert.ok(output.includes('job review'))
+  assert.ok(output.includes('job test'))
+  assert.ok(output.includes('loop subagent'))
+  assert.ok(output.includes('Review scheduler diagnostics'))
+  assert.ok(output.includes('Run focused renderer tests'))
+  assert.ok(output.includes('Child implementation via AgentLoop'))
+  assert.ok(output.includes('child=session_chil...iew_1'))
+  assert.ok(output.includes('active 1/3'))
+  assert.ok(output.includes('AGENT_JOB_TIMEOUT'))
+  assert.ok(output.includes('transcript=nexus://sessions/session_subagent_1/events'))
+})
+
+test('formatMultiAgentStatusView renders empty session state', () => {
+  const output = formatMultiAgentStatusView({ sessionId: 'session_empty', jobs: [], events: [], columns: 100 })
+
+  assert.ok(output.includes('Multi-Agent Status'))
+  assert.ok(output.includes('No agent jobs or AgentLoop sub-agents found for this session.'))
 })

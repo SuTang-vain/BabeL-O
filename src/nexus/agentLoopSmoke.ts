@@ -5,7 +5,7 @@ import { createId } from '../shared/id.js'
 import { ConfigManager, type ProviderDiagnostics } from '../shared/config.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
 import { AGENT_ROLE_DEFINITIONS, type AgentRole } from './agentRoles.js'
-import { createRuntimeAgentStepRunner, type RuntimeAgentStepUsageSummary } from './runtimeAgentStep.js'
+import { createRuntimeAgentStepRunner, type AgentRoleCapabilityDiagnostics, type RuntimeAgentStepUsageSummary } from './runtimeAgentStep.js'
 import { runAgentLoop } from './agentLoop.js'
 import { clearTaskQueue } from './taskQueue.js'
 import { getTaskSession } from './taskSession.js'
@@ -23,6 +23,7 @@ export type AgentLoopLiveSmokeOptions = {
 export type AgentLoopLiveSmokeRoleDiagnostic = {
   role: AgentRole
   model: string
+  capabilityDiagnostics?: AgentRoleCapabilityDiagnostics
   allowedTools: string[]
   structuredOutputRequired: boolean
   repairAttempts: number
@@ -161,6 +162,7 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
       stepRunner,
       role: 'optimizer',
       autoApprove: false,
+      allowInPlaceOptimizer: true,
       maxRetriesPerTask: 1,
       reviewPlan: () => ({
         approved: true,
@@ -366,7 +368,8 @@ function buildRoleDiagnostics(
       : []
     return {
       role,
-      model: model ?? 'unknown',
+      model: summary.capabilityDiagnostics?.modelId ?? model ?? 'unknown',
+      capabilityDiagnostics: summary.capabilityDiagnostics,
       allowedTools,
       structuredOutputRequired: Boolean(definition),
       repairAttempts: summary.repairAttempts ?? 0,

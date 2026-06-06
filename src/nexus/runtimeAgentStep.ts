@@ -4,7 +4,7 @@ import type { AgentRoleDefinition } from './agentRoles.js'
 import type { AgentStepRunner } from './agentLoop.js'
 import type { NexusEvent } from '../shared/events.js'
 import { recordTaskSessionNexusEvent } from './taskSession.js'
-import { ConfigManager } from '../shared/config.js'
+import { ConfigManager, type ProviderDiagnostics } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
 import { allowlistedTools, type ToolPolicy } from '../runtime/LocalCodingRuntime.js'
@@ -40,8 +40,40 @@ type StructuredOutputCandidate = {
 
 export type ProviderNeutralAgentFailureKind = 'provider_protocol' | 'json_parse_error' | 'schema_mismatch' | 'capability_gate' | 'runtime_error'
 
+export type AgentRoleCapabilityDiagnostics = {
+  role: string
+  providerId: string
+  providerName: string
+  adapter: string
+  authMode: ProviderDiagnostics['authMode']
+  modelId: string
+  modelName: string
+  modelSource: ProviderDiagnostics['modelSource']
+  activeProfile?: string
+  modelDeclared: boolean
+  capabilitySource: ProviderDiagnostics['capabilitySource']
+  capabilityWarning?: string
+  contextWindow: number
+  defaultMaxTokens: number
+  capabilities: ProviderDiagnostics['capabilities']
+  suitability: {
+    suitable: boolean
+    missingCapabilities: string[]
+  }
+  recommendation?: {
+    modelId: string
+    capability: string
+    reason: string
+    configured: boolean
+    activeModelMatchesRecommendation: boolean
+    willAutoSwitch: false
+  }
+  manualSwitchHint?: string
+}
+
 export type RuntimeAgentStepUsageSummary = {
   role: string
+  capabilityDiagnostics?: AgentRoleCapabilityDiagnostics
   eventCount: number
   toolCallCount: number
   toolResultCount: number
@@ -142,6 +174,10 @@ export function createRuntimeAgentStepRunner(
       model: options.model,
     })
     const targetModelId = options.model || settings.modelId || 'local/coding-runtime'
+    const capabilityDiagnostics = buildAgentRoleCapabilityDiagnostics(
+      roleDefinition.role,
+      configManager.getProviderDiagnostics({ role: roleDefinition.role, model: options.model }),
+    )
 
     try {
       const modelDef = getModel(targetModelId)
@@ -161,7 +197,23 @@ export function createRuntimeAgentStepRunner(
       if (err instanceof UnknownModelError) {
         // Allow unknown models to support custom models.
       } else {
-        throw err
+        const errorMessage = err instanceof Error ? err.message : String(err)
+        const summary = buildUsageSummary({
+          role: roleDefinition.role,
+          capabilityDiagnostics,
+          eventCount,
+          toolCallCount,
+          toolResultCount,
+          toolFailedCount,
+          toolDeniedCount,
+          resultSuccess,
+          resultMessage,
+          errorEvent,
+          errorCode: 'AGENT_ROLE_CAPABILITY_MISMATCH',
+          errorMessage,
+        })
+        options.onUsageSummary?.(summary)
+        throw new RuntimeAgentStepError(errorMessage, summary, err)
       }
     }
 
@@ -224,6 +276,7 @@ export function createRuntimeAgentStepRunner(
     } catch (err) {
       const summary = buildUsageSummary({
         role: roleDefinition.role,
+        capabilityDiagnostics,
         eventCount,
         toolCallCount,
         toolResultCount,
@@ -250,6 +303,7 @@ export function createRuntimeAgentStepRunner(
     if (errorEvent) {
       const summary = buildUsageSummary({
         role: roleDefinition.role,
+        capabilityDiagnostics,
         eventCount,
         toolCallCount,
         toolResultCount,
@@ -273,6 +327,7 @@ export function createRuntimeAgentStepRunner(
 
     const summary = buildUsageSummary({
       role: roleDefinition.role,
+      capabilityDiagnostics,
       eventCount,
       toolCallCount,
       toolResultCount,
@@ -738,8 +793,62 @@ function mapStructuredOutputFailureKind(
   return 'json_parse_error'
 }
 
+export function buildAgentRoleCapabilityDiagnostics(
+  role: string,
+  provider: ProviderDiagnostics,
+): AgentRoleCapabilityDiagnostics {
+  const suitability = isAgentLoopRole(role)
+    ? provider.suitability.agentLoopRoles[role]
+    : undefined
+  const missingCapabilities = suitability?.missingCapabilities ?? []
+  const recommendation = provider.roleRecommendation
+  const manualSwitchHint = missingCapabilities.length > 0
+    ? recommendation
+      ? `Model ${provider.modelId} is missing ${missingCapabilities.join(', ')} for ${role}; consider manually switching to ${recommendation.modelId}. No automatic switch will be performed.`
+      : `Model ${provider.modelId} is missing ${missingCapabilities.join(', ')} for ${role}; choose a capable model manually. No automatic switch will be performed.`
+    : undefined
+
+  return {
+    role,
+    providerId: provider.providerId,
+    providerName: provider.providerName,
+    adapter: provider.adapter,
+    authMode: provider.authMode,
+    modelId: provider.modelId,
+    modelName: provider.modelName,
+    modelSource: provider.modelSource,
+    activeProfile: provider.activeProfile,
+    modelDeclared: provider.modelDeclared,
+    capabilitySource: provider.capabilitySource,
+    capabilityWarning: provider.capabilityWarning,
+    contextWindow: provider.contextWindow,
+    defaultMaxTokens: provider.defaultMaxTokens,
+    capabilities: provider.capabilities,
+    suitability: {
+      suitable: suitability?.suitable ?? missingCapabilities.length === 0,
+      missingCapabilities,
+    },
+    recommendation: recommendation
+      ? {
+          modelId: recommendation.modelId,
+          capability: recommendation.capability,
+          reason: recommendation.reason,
+          configured: recommendation.configured,
+          activeModelMatchesRecommendation: recommendation.activeModelMatchesRecommendation,
+          willAutoSwitch: recommendation.willAutoSwitch,
+        }
+      : undefined,
+    manualSwitchHint,
+  }
+}
+
+function isAgentLoopRole(role: string): role is 'planner' | 'executor' | 'critic' | 'optimizer' {
+  return role === 'planner' || role === 'executor' || role === 'critic' || role === 'optimizer'
+}
+
 function buildUsageSummary(input: {
   role: string
+  capabilityDiagnostics?: AgentRoleCapabilityDiagnostics
   eventCount: number
   toolCallCount: number
   toolResultCount: number
@@ -748,6 +857,8 @@ function buildUsageSummary(input: {
   resultSuccess?: boolean
   resultMessage?: string
   errorEvent: RuntimeErrorEvent | null
+  errorCode?: string
+  errorMessage?: string
   lastToolName?: string
   lastToolSuccess?: boolean
   lastToolOutputPreview?: string
@@ -759,6 +870,7 @@ function buildUsageSummary(input: {
 }): RuntimeAgentStepUsageSummary {
   return {
     role: input.role,
+    capabilityDiagnostics: input.capabilityDiagnostics,
     eventCount: input.eventCount,
     toolCallCount: input.toolCallCount,
     toolResultCount: input.toolResultCount,
@@ -766,8 +878,8 @@ function buildUsageSummary(input: {
     toolDeniedCount: input.toolDeniedCount,
     resultSuccess: input.resultSuccess,
     resultMessage: input.resultMessage,
-    errorCode: input.errorEvent?.code,
-    errorMessage: input.errorEvent?.message,
+    errorCode: input.errorCode ?? input.errorEvent?.code,
+    errorMessage: input.errorMessage ?? input.errorEvent?.message,
     assistantTextPreview: input.assistantTextPreview,
     thinkingTextPreview: input.thinkingTextPreview,
     lastToolName: input.lastToolName,

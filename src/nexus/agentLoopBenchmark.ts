@@ -248,6 +248,7 @@ async function runScenario(
       },
       role: options.role,
       autoApprove: options.autoApprove,
+      allowInPlaceOptimizer: options.role === 'optimizer',
       maxRetriesPerTask: options.maxRetriesPerTask,
       enableSubAgents: options.enableSubAgents,
       maxSubAgentDepth: options.maxSubAgentDepth,

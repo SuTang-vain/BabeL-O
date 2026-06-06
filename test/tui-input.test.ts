@@ -11,6 +11,9 @@ import { formatSessionBanner, formatWelcomeCardLines, formatWelcomeHintLine } fr
 import { INPUT_NEWLINE_MARKER, formatInputFooter, renderBoxedInput, renderFixedInputBox, restoreInputNewlines, shouldClearInputGhostBeforeWrite, shouldConsumeBlankInputEnter } from '../src/cli/inputBox.js'
 import { inputState, type InputMode } from '../src/cli/inputState.js'
 import { defaultPermissionChoices, permissionDecisionFromChoice, renderSubmittedPrompt, setupAutosuggestions } from '../src/cli/ui.js'
+import { getPromptSuggestion } from '../src/cli/promptSuggestions.js'
+import { getTheme, resetThemeForTest } from '../src/cli/theme.js'
+import { getLiveAgentTree, resetLiveAgentTreeForTest, updateLiveAgentActivity, renderEvent } from '../src/cli/renderEvents.js'
 
 test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent('\x03', undefined).kind, 'ctrl_c')
@@ -672,4 +675,93 @@ test('autosuggestion refresh clears stale wrapped input rows', () => {
   assert.ok(clearCount >= 2)
   assert.ok(moves.some(([, dy]) => dy < 0))
   assert.ok(writes.filter(write => write.includes(wrappedPrompt)).length >= 2)
+})
+
+test('prompt suggestions return context-aware hints based on session state', () => {
+  assert.equal(getPromptSuggestion({ hasSession: false }), 'Ask a question about your code...')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 0 }), 'Ask a question about your code...')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 3, lastEventType: 'result' }), 'Follow up, start a new task, or type /compact')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 2, lastEventType: 'tool_completed', lastToolName: 'Read' }), 'File loaded — ask a question or request changes')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 2, lastEventType: 'tool_completed', lastToolName: 'Bash' }), 'Command finished — ask about the output or next step')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 1, failedTaskCount: 2, pendingTaskCount: 0 }), 'A task failed — ask to retry or investigate')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 1, pendingTaskCount: 3 }), '3 pending task(s) — continue or ask for status')
+  assert.equal(getPromptSuggestion({ hasSession: true, turnCount: 1, agentRunning: true }), undefined)
+})
+
+test('theme returns default and minimal variants controlled by BABEL_O_THEME', () => {
+  resetThemeForTest()
+  const oldTheme = process.env.BABEL_O_THEME
+  try {
+    delete process.env.BABEL_O_THEME
+    resetThemeForTest()
+    const defaultTheme = getTheme()
+    assert.equal(defaultTheme.name, 'default')
+    assert.equal(defaultTheme.promptSymbol, '>')
+
+    process.env.BABEL_O_THEME = 'minimal'
+    resetThemeForTest()
+    const minimalTheme = getTheme()
+    assert.equal(minimalTheme.name, 'minimal')
+    assert.equal(minimalTheme.promptSymbol, '$')
+
+    process.env.BABEL_O_THEME = 'unknown_value'
+    resetThemeForTest()
+    const fallbackTheme = getTheme()
+    assert.equal(fallbackTheme.name, 'default')
+  } finally {
+    if (oldTheme === undefined) delete process.env.BABEL_O_THEME
+    else process.env.BABEL_O_THEME = oldTheme
+    resetThemeForTest()
+  }
+})
+
+test('live agent tree tracks entries and updates activity', () => {
+  resetLiveAgentTreeForTest()
+  assert.deepEqual(getLiveAgentTree(), [])
+
+  const originalWrite = process.stdout.write
+  process.stdout.write = (() => true) as any
+  try {
+    renderEvent({
+      type: 'agent_job_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'test-session',
+      eventId: 'ev-1',
+      eventType: 'agent_job_started',
+      jobId: 'job-1',
+      childSessionId: 'child-1',
+      agentType: 'explore',
+      contextForkMode: 'minimal',
+      status: 'running',
+      timestamp: new Date().toISOString(),
+    } as any)
+
+    assert.equal(getLiveAgentTree().length, 1)
+    assert.equal(getLiveAgentTree()[0]!.agentType, 'explore')
+    assert.equal(getLiveAgentTree()[0]!.status, 'running')
+
+    updateLiveAgentActivity('job-1', 5, 120, 'Reading files…')
+    assert.equal(getLiveAgentTree()[0]!.toolUses, 5)
+    assert.equal(getLiveAgentTree()[0]!.tokens, 120)
+    assert.equal(getLiveAgentTree()[0]!.lastActivity, 'Reading files…')
+
+    renderEvent({
+      type: 'agent_job_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'test-session',
+      eventId: 'ev-2',
+      eventType: 'agent_job_completed',
+      jobId: 'job-1',
+      childSessionId: 'child-1',
+      agentType: 'explore',
+      contextForkMode: 'minimal',
+      status: 'completed',
+      timestamp: new Date().toISOString(),
+    } as any)
+
+    assert.deepEqual(getLiveAgentTree(), [])
+  } finally {
+    process.stdout.write = originalWrite
+    resetLiveAgentTreeForTest()
+  }
 })

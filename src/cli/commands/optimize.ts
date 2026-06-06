@@ -5,7 +5,7 @@ import { createId } from '../../shared/id.js'
 import { questionAsync } from '../ui.js'
 import type { CliReadline } from '../ui.js'
 import { ConfigManager } from '../../shared/config.js'
-import type { PlannerAgentResult, PlannerReviewDecision, PlannerTaskPlan } from '../../nexus/agentLoop.js'
+import type { InPlaceOptimizerApprovalRequest, PlannerAgentResult, PlannerReviewDecision, PlannerTaskPlan } from '../../nexus/agentLoop.js'
 
 export type OptimizeCommandOptions = {
   target?: string
@@ -22,6 +22,8 @@ export type OptimizeCommandOptions = {
   timeoutMs?: string | number
   executionEnvironment?: string
   yes?: boolean
+  allowInPlaceOptimizer?: boolean
+  allowInPlace?: boolean
 }
 
 export type OptimizeSubAgentOptions = {
@@ -43,6 +45,7 @@ export function registerOptimizeCommand(program: Command): void {
     .option('--timeout-ms <number>', 'Timeout in milliseconds for provider smoke live/manual runs', '120000')
     .option('--execution-environment <environment>', 'Execution environment for optimizer tools: local or remote', 'local')
     .option('--yes', 'Approve the planner task list without prompting')
+    .option('--allow-in-place-optimizer', 'Allow optimizer tasks to modify the current Git worktree instead of requiring isolation')
     .option('--enable-subagents', 'Allow optimizer/executor agents to delegate substantive subTasks')
     .option('--max-sub-agent-depth <number>', 'Maximum nested sub-agent delegation depth', '1')
     .option('--max-sub-tasks-per-task <number>', 'Maximum subTasks accepted from a single task result', '5')
@@ -61,9 +64,11 @@ export function registerOptimizeCommand(program: Command): void {
 
       let subAgentOptions: OptimizeSubAgentOptions
       let executionEnvironment: 'local' | 'remote'
+      let allowInPlaceOptimizer: boolean
       try {
         subAgentOptions = parseOptimizeSubAgentOptions(options)
         executionEnvironment = parseOptimizeExecutionEnvironment(options.executionEnvironment)
+        allowInPlaceOptimizer = parseOptimizeInPlaceOptions(options).allowInPlaceOptimizer
       } catch (err) {
         console.error(chalk.red(`Error: ${err instanceof Error ? err.message : String(err)}`))
         process.exit(1)
@@ -74,6 +79,11 @@ export function registerOptimizeCommand(program: Command): void {
         console.log(chalk.dim(`Sub-agents enabled: max depth ${subAgentOptions.maxSubAgentDepth}, max subTasks/task ${subAgentOptions.maxSubTasksPerTask}`))
       } else {
         console.log(chalk.dim('Sub-agents disabled. Use --enable-subagents to allow task delegation.'))
+      }
+      if (allowInPlaceOptimizer) {
+        console.log(chalk.yellow('In-place optimizer enabled by explicit opt-in. Git status will be recorded before and after each task.'))
+      } else {
+        console.log(chalk.dim('In-place optimizer requires per-task confirmation; isolated worktrees remain preferred.'))
       }
 
       const { createDefaultNexusRuntime } = await import('../../nexus/createRuntime.js')
@@ -173,6 +183,10 @@ export function registerOptimizeCommand(program: Command): void {
             stepRunner,
             role: 'optimizer',
             autoApprove: options.autoApprove,
+            allowInPlaceOptimizer,
+            confirmInPlaceOptimizer: allowInPlaceOptimizer
+              ? undefined
+              : request => askInPlaceOptimizerApproval(rl, request),
             enableSubAgents: subAgentOptions.enableSubAgents,
             maxSubAgentDepth: subAgentOptions.maxSubAgentDepth,
             maxSubTasksPerTask: subAgentOptions.maxSubTasksPerTask,
@@ -229,6 +243,19 @@ async function askPlannerReview(
     return { approved: true, tasks: editedTasks }
   }
   return { approved: true }
+}
+
+async function askInPlaceOptimizerApproval(
+  rl: CliReadline,
+  request: InPlaceOptimizerApprovalRequest,
+): Promise<boolean> {
+  console.log(chalk.yellow('\nOptimizer is about to run in-place in the current Git worktree.'))
+  console.log(chalk.dim(`Reason: ${request.reason}`))
+  console.log(chalk.dim(`Task: ${request.taskId} · ${request.title}`))
+  console.log(chalk.dim(`CWD: ${request.cwd}`))
+  console.log(chalk.dim(`Current changes: ${request.gitStatus.changedPaths.length === 0 ? 'clean' : request.gitStatus.changedPaths.join(', ')}`))
+  const answer = (await questionAsync(rl, chalk.cyan('Allow in-place optimizer for this task? [y/N]: '))).trim().toLowerCase()
+  return answer === 'y' || answer === 'yes'
 }
 
 async function editPlannerTasks(
@@ -340,6 +367,14 @@ export function parseOptimizeExecutionEnvironment(value: string | undefined): 'l
   const normalized = (value ?? 'local').trim().toLowerCase()
   if (normalized === 'local' || normalized === 'remote') return normalized
   throw new Error('--execution-environment must be local or remote.')
+}
+
+export function parseOptimizeInPlaceOptions(options: OptimizeCommandOptions): { allowInPlaceOptimizer: boolean } {
+  return {
+    allowInPlaceOptimizer: options.allowInPlaceOptimizer === true ||
+      options.allowInPlace === true ||
+      process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER === '1',
+  }
 }
 
 export function parseOptimizeSubAgentOptions(options: OptimizeCommandOptions): OptimizeSubAgentOptions {

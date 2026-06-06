@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { formatAgentLoopSmokeResult, parseOptimizeSubAgentOptions, parseOptimizeProviderSmokeLiveOptions } from '../src/cli/commands/optimize.js'
+import { formatAgentLoopSmokeResult, parseOptimizeInPlaceOptions, parseOptimizeSubAgentOptions, parseOptimizeProviderSmokeLiveOptions } from '../src/cli/commands/optimize.js'
 
 test('parseOptimizeSubAgentOptions keeps sub-agents disabled by default', () => {
   const parsed = parseOptimizeSubAgentOptions({
@@ -60,6 +60,61 @@ test('parseOptimizeProviderSmokeLiveOptions parses explicit timeout and model', 
     timeoutMs: 45000,
     model: 'anthropic/claude-3-5-sonnet',
   })
+})
+
+test('parseOptimizeInPlaceOptions keeps in-place optimizer disabled by default', () => {
+  const oldEnv = process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+  delete process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+
+  try {
+    const parsed = parseOptimizeInPlaceOptions({
+      focus: 'performance',
+      cwd: '/repo',
+    })
+
+    assert.deepEqual(parsed, { allowInPlaceOptimizer: false })
+  } finally {
+    if (oldEnv === undefined) delete process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+    else process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER = oldEnv
+  }
+})
+
+test('parseOptimizeInPlaceOptions enables in-place optimizer by explicit flag', () => {
+  const oldEnv = process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+  delete process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+
+  try {
+    assert.deepEqual(parseOptimizeInPlaceOptions({
+      focus: 'cleanup',
+      cwd: '/repo',
+      allowInPlaceOptimizer: true,
+    }), { allowInPlaceOptimizer: true })
+    assert.deepEqual(parseOptimizeInPlaceOptions({
+      focus: 'cleanup',
+      cwd: '/repo',
+      allowInPlace: true,
+    }), { allowInPlaceOptimizer: true })
+  } finally {
+    if (oldEnv === undefined) delete process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+    else process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER = oldEnv
+  }
+})
+
+test('parseOptimizeInPlaceOptions enables in-place optimizer by environment opt-in', () => {
+  const oldEnv = process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+  process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER = '1'
+
+  try {
+    const parsed = parseOptimizeInPlaceOptions({
+      focus: 'security',
+      cwd: '/repo',
+    })
+
+    assert.deepEqual(parsed, { allowInPlaceOptimizer: true })
+  } finally {
+    if (oldEnv === undefined) delete process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER
+    else process.env.BABEL_O_ALLOW_IN_PLACE_OPTIMIZER = oldEnv
+  }
 })
 
 test('formatAgentLoopSmokeResult includes timeout failure diagnostics', () => {
