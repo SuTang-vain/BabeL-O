@@ -74,7 +74,7 @@ export function forkContextForAgent(options: {
 function minimalContextFork(state: ContextForkBuilderState): ContextForkResult {
   const allowedPaths = mergeAllowedPaths(state.parentSession.allowedPaths, state.explicitPaths)
   const prompt = basePromptLines(state, 'You are a read-only Explore Agent.', [
-    'Use only Read, Grep, and Glob. Do not edit files, run Bash, or mutate tasks.',
+    'Use only ListDir, Glob, Grep, and Read. Use ListDir for directory inventory, Glob for path patterns, Grep for content locating, and Read for source understanding. Do not edit files, run Bash, or mutate tasks.',
   ]).join('\n')
 
   return buildForkResult(state, prompt, {
@@ -94,7 +94,7 @@ function workingSetContextFork(state: ContextForkBuilderState): ContextForkResul
   const workingSet = formatWorkingSet(state.workingSetEntries)
   const prompt = [
     ...basePromptLines(state, 'You are a focused Working Set Agent.', [
-      'Use the active working set first. Prefer targeted Read/Grep/Glob calls over broad history replay.',
+      'Use the active working set first. Prefer targeted ListDir/Glob/Grep/Read calls over broad history replay: ListDir for directory inventory, Glob for path patterns, Grep for content locating, and Read for source understanding.',
     ]),
     ...(workingSet ? ['', workingSet] : []),
     ...sectionLines('Recent user focus', state.summaries.latestUserMessages),

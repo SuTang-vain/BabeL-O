@@ -18,10 +18,11 @@ import (
 )
 
 const (
-	defaultMaxBytes       = 200_000
-	largeFilePreviewBytes = 50_000
-	defaultGlobMaxResults = 100
-	defaultGrepMaxMatches = 50
+	defaultMaxBytes          = 200_000
+	largeFilePreviewBytes    = 50_000
+	defaultListDirMaxEntries = 200
+	defaultGlobMaxResults    = 100
+	defaultGrepMaxMatches    = 50
 )
 
 var dependencyDirs = map[string]bool{
@@ -30,6 +31,12 @@ var dependencyDirs = map[string]bool{
 	"dist":         true,
 	"build":        true,
 	"coverage":     true,
+	".next":        true,
+	".nuxt":        true,
+	".turbo":       true,
+	".cache":       true,
+	"target":       true,
+	"vendor":       true,
 }
 
 type Result struct {
@@ -41,12 +48,14 @@ type Result struct {
 
 func Execute(ctx context.Context, request protocol.ExecuteRequest) (Result, *protocol.RunnerResult) {
 	switch request.ToolName {
-	case "Read":
-		return executeRead(ctx, request)
-	case "Grep":
-		return executeGrep(ctx, request)
+	case "ListDir":
+		return executeListDir(ctx, request)
 	case "Glob":
 		return executeGlob(ctx, request)
+	case "Grep":
+		return executeGrep(ctx, request)
+	case "Read":
+		return executeRead(ctx, request)
 	case "Bash":
 		return executeBash(ctx, request)
 	case "Write":
@@ -60,7 +69,7 @@ func Execute(ctx context.Context, request protocol.ExecuteRequest) (Result, *pro
 }
 
 func SupportedTools(bashEnabled bool, writeEnabled bool) []string {
-	toolNames := []string{"Read", "Grep", "Glob"}
+	toolNames := []string{"ListDir", "Glob", "Grep", "Read"}
 	if bashEnabled {
 		toolNames = append(toolNames, "Bash")
 	}
@@ -71,7 +80,251 @@ func SupportedTools(bashEnabled bool, writeEnabled bool) []string {
 }
 
 func IsSupportedTool(toolName string, bashEnabled bool, writeEnabled bool) bool {
-	return toolName == "Read" || toolName == "Grep" || toolName == "Glob" || (bashEnabled && toolName == "Bash") || (writeEnabled && (toolName == "Write" || toolName == "Edit"))
+	return toolName == "ListDir" || toolName == "Glob" || toolName == "Grep" || toolName == "Read" || (bashEnabled && toolName == "Bash") || (writeEnabled && (toolName == "Write" || toolName == "Edit"))
+}
+
+type listDirInput struct {
+	Path               string `json:"path,omitempty"`
+	MaxEntries         int    `json:"maxEntries,omitempty"`
+	IncludeHidden      bool   `json:"includeHidden,omitempty"`
+	IncludeFiles       *bool  `json:"includeFiles,omitempty"`
+	IncludeDirectories *bool  `json:"includeDirectories,omitempty"`
+	MaxDepth           int    `json:"maxDepth,omitempty"`
+}
+
+type listDirEntry struct {
+	Path  string `json:"path"`
+	Name  string `json:"name"`
+	Type  string `json:"type"`
+	Depth int    `json:"depth"`
+}
+
+type listDirCounts struct {
+	Files              int `json:"files"`
+	Directories        int `json:"directories"`
+	Symlinks           int `json:"symlinks"`
+	Other              int `json:"other"`
+	Shown              int `json:"shown"`
+	SkippedHidden      int `json:"skippedHidden"`
+	SkippedByType      int `json:"skippedByType"`
+	SkippedDirectories int `json:"skippedDirectories"`
+}
+
+type listDirOutput struct {
+	Path         string         `json:"path"`
+	ResolvedPath string         `json:"resolvedPath"`
+	MaxDepth     int            `json:"maxDepth"`
+	Entries      []listDirEntry `json:"entries"`
+	Counts       listDirCounts  `json:"counts"`
+	Truncated    bool           `json:"truncated"`
+	SkippedDirs  []string       `json:"skippedDirs"`
+	Guidance     string         `json:"guidance"`
+}
+
+type listDirState struct {
+	cwd         string
+	input       listDirInput
+	entries     []listDirEntry
+	counts      listDirCounts
+	truncated   bool
+	skippedDirs []string
+}
+
+func executeListDir(ctx context.Context, request protocol.ExecuteRequest) (Result, *protocol.RunnerResult) {
+	input := listDirInput{Path: ".", MaxEntries: defaultListDirMaxEntries, MaxDepth: 1}
+	if err := decodeToolInput(request.ToolInput, &input); err != nil {
+		invalid := protocol.ErrorResult("INVALID_TOOL_INPUT", "ListDir tool input must be an object.", map[string]string{"error": err.Error()})
+		return Result{}, &invalid
+	}
+	if input.Path == "" {
+		input.Path = "."
+	}
+	if input.MaxEntries == 0 {
+		input.MaxEntries = defaultListDirMaxEntries
+	}
+	if input.MaxDepth == 0 {
+		input.MaxDepth = 1
+	}
+	if input.MaxEntries <= 0 || input.MaxEntries > 1_000 {
+		invalid := protocol.ErrorResult("INVALID_TOOL_INPUT", "ListDir maxEntries must be between 1 and 1000.", nil)
+		return Result{}, &invalid
+	}
+	if input.MaxDepth != 1 && input.MaxDepth != 2 {
+		invalid := protocol.ErrorResult("INVALID_TOOL_INPUT", "ListDir maxDepth must be 1 or 2.", nil)
+		return Result{}, &invalid
+	}
+	includeFiles := true
+	if input.IncludeFiles != nil {
+		includeFiles = *input.IncludeFiles
+	}
+	includeDirectories := true
+	if input.IncludeDirectories != nil {
+		includeDirectories = *input.IncludeDirectories
+	}
+	if !includeFiles && !includeDirectories {
+		return Result{Success: false, Output: "ListDir requires at least one of includeFiles or includeDirectories to be true."}, nil
+	}
+
+	path, errResult := resolveInsideAllowedRoots(request.Cwd, input.Path, request.AllowedPaths)
+	if errResult != nil {
+		return Result{}, errResult
+	}
+	if err := ctx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			timedOut := protocol.ErrorResult("REQUEST_TIMEOUT", "Remote runner request exceeded deadline.", nil)
+			return Result{}, &timedOut
+		}
+		cancelled := protocol.ErrorResult("REQUEST_CANCELLED", "Remote runner request was cancelled.", nil)
+		return Result{}, &cancelled
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return Result{Success: false, Output: fmt.Sprintf("ListDir could not find directory %q. Use ListDir on an existing parent directory or Glob for pattern-based discovery.", input.Path)}, nil
+		}
+		failure := protocol.ErrorResult("REMOTE_RUNNER_TOOL_ERROR", err.Error(), nil)
+		return Result{}, &failure
+	}
+	if !info.IsDir() {
+		return Result{Success: false, Output: fmt.Sprintf("ListDir expected a directory but %q is not a directory. Use Read for file contents.", input.Path)}, nil
+	}
+
+	cleanCwd, err := canonicalPath(request.Cwd)
+	if err != nil {
+		cleanCwd = request.Cwd
+	}
+	state := &listDirState{
+		cwd:         cleanCwd,
+		input:       input,
+		entries:     []listDirEntry{},
+		skippedDirs: []string{},
+	}
+	if err := collectDirectory(ctx, state, path, 1, includeFiles, includeDirectories); err != nil {
+		if errors.Is(err, context.Canceled) {
+			cancelled := protocol.ErrorResult("REQUEST_CANCELLED", "Remote runner request was cancelled.", nil)
+			return Result{}, &cancelled
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			timedOut := protocol.ErrorResult("REQUEST_TIMEOUT", "Remote runner request exceeded deadline.", nil)
+			return Result{}, &timedOut
+		}
+		failure := protocol.ErrorResult("REMOTE_RUNNER_TOOL_ERROR", err.Error(), nil)
+		return Result{}, &failure
+	}
+
+	output := listDirOutput{
+		Path:         input.Path,
+		ResolvedPath: path,
+		MaxDepth:     input.MaxDepth,
+		Entries:      state.entries,
+		Counts:       state.counts,
+		Truncated:    state.truncated,
+		SkippedDirs:  state.skippedDirs,
+		Guidance:     "ListDir only proves directory inventory. Use Glob for pattern discovery, Grep for content matches, and Read before making source-level claims.",
+	}
+	return Result{Success: true, Output: output}, nil
+}
+
+func collectDirectory(ctx context.Context, state *listDirState, dir string, depth int, includeFiles bool, includeDirectories bool) error {
+	if state.truncated {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	sort.Slice(entries, func(left int, right int) bool {
+		leftDir := entries[left].IsDir()
+		rightDir := entries[right].IsDir()
+		if leftDir != rightDir {
+			return leftDir
+		}
+		return entries[left].Name() < entries[right].Name()
+	})
+
+	for _, entry := range entries {
+		if len(state.entries) >= state.input.MaxEntries {
+			state.truncated = true
+			return nil
+		}
+		if !state.input.IncludeHidden && strings.HasPrefix(entry.Name(), ".") {
+			state.counts.SkippedHidden += 1
+			continue
+		}
+
+		fullPath := filepath.Join(dir, entry.Name())
+		typeName := listDirEntryType(entry)
+		incrementListDirCount(state, typeName)
+		if typeName == "directory" && dependencyDirs[entry.Name()] {
+			state.counts.SkippedDirectories += 1
+			state.skippedDirs = append(state.skippedDirs, formatRelativePath(state.cwd, fullPath))
+			continue
+		}
+
+		typeAllowed := includeFiles
+		if typeName == "directory" {
+			typeAllowed = includeDirectories
+		}
+		if !typeAllowed {
+			state.counts.SkippedByType += 1
+		} else {
+			state.entries = append(state.entries, listDirEntry{
+				Path:  formatRelativePath(state.cwd, fullPath),
+				Name:  entry.Name(),
+				Type:  typeName,
+				Depth: depth,
+			})
+			state.counts.Shown = len(state.entries)
+		}
+
+		if typeName == "directory" && depth < state.input.MaxDepth {
+			if err := collectDirectory(ctx, state, fullPath, 2, includeFiles, includeDirectories); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func listDirEntryType(entry os.DirEntry) string {
+	if entry.IsDir() {
+		return "directory"
+	}
+	if entry.Type()&os.ModeSymlink != 0 {
+		return "symlink"
+	}
+	if entry.Type().IsRegular() {
+		return "file"
+	}
+	info, err := entry.Info()
+	if err == nil && info.Mode().IsRegular() {
+		return "file"
+	}
+	return "other"
+}
+
+func incrementListDirCount(state *listDirState, typeName string) {
+	switch typeName {
+	case "file":
+		state.counts.Files += 1
+	case "directory":
+		state.counts.Directories += 1
+	case "symlink":
+		state.counts.Symlinks += 1
+	default:
+		state.counts.Other += 1
+	}
+}
+
+func formatRelativePath(cwd string, path string) string {
+	rel, err := filepath.Rel(cwd, path)
+	if err != nil || rel == "" {
+		return "."
+	}
+	return filepath.ToSlash(rel)
 }
 
 type readInput struct {
@@ -133,7 +386,7 @@ func executeRead(ctx context.Context, request protocol.ExecuteRequest) (Result, 
 		return Result{}, &failure
 	}
 	if info.IsDir() {
-		return Result{Success: false, Output: fmt.Sprintf("Read expected a file but %q is a directory. Use Glob to list files or Read a specific file path inside it.", input.Path)}, nil
+		return Result{Success: false, Output: fmt.Sprintf("Read expected a file but %q is a directory. Use ListDir for directory inventory or Read a specific file path inside it.", input.Path)}, nil
 	}
 	if !info.Mode().IsRegular() {
 		return Result{Success: false, Output: fmt.Sprintf("Read expected a regular file but %q is not a file.", input.Path)}, nil

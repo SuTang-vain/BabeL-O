@@ -39,7 +39,7 @@ test('ExploreAgentScheduler spawns read-only child session and completes with st
     storage,
     now: fixedClock(),
     runtimeFactory: ({ allowedTools }) => {
-      assert.deepEqual(allowedTools, ['Read', 'Grep', 'Glob'])
+      assert.deepEqual(allowedTools, ['ListDir', 'Glob', 'Grep', 'Read'])
       return runtime
     },
   })
@@ -128,7 +128,7 @@ test('ExploreAgentScheduler spawns review and test profiles with task-focused co
     now: fixedClock(),
     runtimeFactory: ({ agentType, allowedTools }) => {
       assert.equal(agentType, 'test')
-      assert.deepEqual(allowedTools, ['Read', 'Grep', 'Glob', 'Bash'])
+      assert.deepEqual(allowedTools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
       return runtime
     },
   })
@@ -150,7 +150,7 @@ test('ExploreAgentScheduler spawns review and test profiles with task-focused co
   const child = await storage.getSession(job.childSessionId)
   assert.equal(child?.assignedAgentId, 'test')
   assert.equal(child?.metadata?.contextForkMode, 'task-focused')
-  assert.deepEqual(child?.metadata?.allowedTools, ['Read', 'Grep', 'Glob', 'Bash'])
+  assert.deepEqual(child?.metadata?.allowedTools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
 })
 
 test('ExploreAgentScheduler allows review profile but still rejects editing tools', async () => {
@@ -160,7 +160,7 @@ test('ExploreAgentScheduler allows review profile but still rejects editing tool
     storage,
     runtimeFactory: ({ agentType, allowedTools }) => {
       assert.equal(agentType, 'review')
-      assert.deepEqual(allowedTools, ['Read', 'Grep', 'Glob', 'Bash'])
+      assert.deepEqual(allowedTools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
       return new RecordingRuntime([])
     },
   })
@@ -311,7 +311,7 @@ test('ExploreAgentScheduler forwards remote execution context and cancel to runn
   })
   const runtime = new ProviderToolCallRuntime({
     storage,
-    allowedTools: ['Read', 'Grep', 'Glob'],
+    allowedTools: ['ListDir', 'Glob', 'Grep', 'Read'],
     toolCalls: [providerToolCall('tool-remote-read', 'Read', { path: 'README.md' })],
   })
   const scheduler = new ExploreAgentScheduler({
@@ -428,7 +428,7 @@ test('review and test runtime expose only restricted Bash commands', async () =>
   const storage = new MemoryStorage()
   const runtime = createExploreRuntime({
     agentType: 'test',
-    allowedTools: ['Read', 'Grep', 'Glob', 'Bash'],
+    allowedTools: ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'],
     storage,
   })
 

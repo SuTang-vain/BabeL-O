@@ -57,6 +57,40 @@ test('formatSessionHistory: compact mode renders correct summaries', () => {
   assert.ok(!output.includes('Success: true'))
 })
 
+test('formatSessionHistory: compact mode renders structured tool failure summary', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-structured-failure',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-listdir-invalid',
+      name: 'ListDir',
+      input: { path: '/test/path', maxDepth: 3 },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-structured-failure',
+      timestamp: new Date().toISOString(),
+      toolUseId: 'tool-listdir-invalid',
+      name: 'ListDir',
+      success: false,
+      output: {
+        code: 'INVALID_TOOL_INPUT',
+        message: 'Invalid input for tool ListDir.\n✖ Invalid input\n  → at maxDepth\nReturn a corrected ListDir tool call with all required fields.',
+      },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+
+  assert.ok(output.includes('ListDir(/test/path)'))
+  assert.ok(output.includes('failed'))
+  assert.ok(output.includes('INVALID_TOOL_INPUT'))
+  assert.ok(output.includes('maxDepth'))
+})
+
 test('formatSessionHistory: expanded mode renders complete details', () => {
   const events: NexusEvent[] = [
     {
@@ -1026,6 +1060,139 @@ test('formatTaskStatusPanel renders task status board correctly', () => {
   assert.ok(output.includes('Setup repository'))
   assert.ok(output.includes('⟳ 规划中'))
   assert.ok(output.includes('Run migrations'))
+})
+
+test('formatSessionHistory renders worktree flow panel and recovery hints', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-worktree-flow',
+      eventId: 'event-worktree-created',
+      eventType: 'worktree_created',
+      phase: 'executing',
+      timestamp: now,
+      payload: { taskId: 'task-1', worktreePath: '/repo/.babel-o/worktrees/task-1' },
+    },
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-worktree-flow',
+      eventId: 'event-worktree-conflict',
+      eventType: 'worktree_merge_conflict',
+      phase: 'waiting_user',
+      timestamp: now,
+      payload: {
+        taskId: 'task-1',
+        task: {
+          taskId: 'task-1',
+          sessionId: 'sess-worktree-flow',
+          title: 'Implement isolated fix',
+          status: 'failed',
+          dependsOn: [],
+          blocks: [],
+          retryCount: 0,
+          metadata: {
+            worktreeRecovery: {
+              type: 'worktree_merge_conflict',
+              status: 'awaiting_manual_recovery',
+              taskId: 'task-1',
+              worktreePath: '/repo/.babel-o/worktrees/task-1',
+              preservedWorktreePath: '/repo/.babel-o/worktrees/task-1',
+              conflictingFiles: ['src/conflict.ts'],
+              recoveryActions: [{ action: 'keep' }, { action: 'continue' }, { action: 'abandon' }],
+            },
+          },
+          review: { status: 'rejected', reason: 'conflict', reviewerAgentId: 'system' },
+          createdAt: now,
+          updatedAt: now,
+        },
+        recovery: {
+          type: 'worktree_merge_conflict',
+          status: 'awaiting_manual_recovery',
+          taskId: 'task-1',
+          taskTitle: 'Implement isolated fix',
+          worktreePath: '/repo/.babel-o/worktrees/task-1',
+          preservedWorktreePath: '/repo/.babel-o/worktrees/task-1',
+          conflictingFiles: ['src/conflict.ts'],
+          recoveryActions: [{ action: 'keep' }, { action: 'continue' }, { action: 'abandon' }],
+        },
+      },
+    },
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-worktree-flow',
+      eventId: 'event-worktree-recovery',
+      eventType: 'worktree_recovery_action',
+      phase: 'executing',
+      timestamp: now,
+      payload: {
+        taskId: 'task-1',
+        next: {
+          taskId: 'task-1',
+          title: 'Implement isolated fix',
+          status: 'pending',
+          metadata: {
+            worktreeRecovery: {
+              status: 'retry_requested',
+              selectedAction: 'continue',
+              preservedWorktreePath: '/repo/.babel-o/worktrees/task-1',
+              conflictingFiles: ['src/conflict.ts'],
+            },
+          },
+        },
+      },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('worktree executing isolated #task-1'))
+  assert.ok(output.includes('worktree waiting_user merge conflict #task-1'))
+  assert.ok(output.includes('worktree executing recovery continue #task-1'))
+  assert.ok(output.includes('Worktree Flow'))
+  assert.ok(output.includes('↻ recovery'))
+  assert.ok(output.includes('Implement isolated fix'))
+  assert.ok(output.includes('recovery=retry_requested'))
+  assert.ok(output.includes('selected=continue'))
+  assert.ok(output.includes('conflicts=src/conflict.ts'))
+  assert.ok(output.includes('bbl sessions worktree-recovery <sessionId> <taskId> continue|abandon|keep'))
+  assert.ok(output.includes('Task Status Board'))
+  assert.ok(output.includes('worktree'))
+})
+
+test('formatSessionHistory renders successful worktree merge flow', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-worktree-merged',
+      eventId: 'event-worktree-created',
+      eventType: 'worktree_created',
+      phase: 'executing',
+      timestamp: now,
+      payload: { taskId: 'task-2', worktreePath: '/repo/.babel-o/worktrees/task-2' },
+    },
+    {
+      type: 'task_session_event',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-worktree-merged',
+      eventId: 'event-worktree-merged',
+      eventType: 'worktree_merged',
+      phase: 'executing',
+      timestamp: now,
+      payload: { taskId: 'task-2' },
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('worktree executing isolated #task-2'))
+  assert.ok(output.includes('worktree executing merged #task-2'))
+  assert.ok(output.includes('Worktree Flow'))
+  assert.ok(output.includes('✓ merged'))
+  assert.ok(output.includes('task #task-2'))
 })
 
 test('formatTaskStatusPanel renders delegated subtask hierarchy', () => {

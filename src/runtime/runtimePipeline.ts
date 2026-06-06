@@ -417,6 +417,7 @@ type RuntimeProviderTurnOutcomeBase = {
   eventsAfterMessages: NexusEvent[]
   maxTokenRecoveryCount: number
   outputRetryCount: number
+  suppressedToolRetryCount: number
 }
 
 export type RuntimeProviderTurnOutcome =
@@ -436,11 +437,14 @@ export function reduceProviderTurnOutcome(options: {
   maxTokenRecoveries: number
   outputRetryCount: number
   maxOutputRetries: number
+  suppressedToolRetryCount: number
+  maxSuppressedToolRetries: number
 }): RuntimeProviderTurnOutcome {
   const { turn } = options
   const baseCounts = {
     maxTokenRecoveryCount: options.maxTokenRecoveryCount,
     outputRetryCount: options.outputRetryCount,
+    suppressedToolRetryCount: options.suppressedToolRetryCount,
   }
 
   if (turn.toolCallTextLeakSuppression) {
@@ -462,6 +466,7 @@ export function reduceProviderTurnOutcome(options: {
         }],
         maxTokenRecoveryCount: options.maxTokenRecoveryCount,
         outputRetryCount: options.outputRetryCount + 1,
+        suppressedToolRetryCount: options.suppressedToolRetryCount,
       }
     }
     const message = 'Suppressed a malformed tool-call-shaped response while tools were disabled.'
@@ -493,6 +498,7 @@ export function reduceProviderTurnOutcome(options: {
         ],
         maxTokenRecoveryCount: options.maxTokenRecoveryCount + 1,
         outputRetryCount: options.outputRetryCount,
+        suppressedToolRetryCount: options.suppressedToolRetryCount,
       }
     }
     const message = `Provider repeatedly stopped because it hit the maximum output token limit after ${options.maxTokenRecoveries} recovery attempts.`
@@ -540,7 +546,7 @@ export function reduceProviderTurnOutcome(options: {
     }
   }
 
-  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0) {
+  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
     const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
     const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
     return {
@@ -556,15 +562,19 @@ export function reduceProviderTurnOutcome(options: {
             requiresTools: options.userIntentGuidance.requiresTools,
             latestUserText: options.userIntentGuidance.latestUserText,
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
+            retryAttempted: true,
+            retryExhausted: false,
           },
         }),
       ],
       eventsAfterMessages: [],
       messages: [{
         role: 'user',
-        content: `${message}\nAnswer the latest user message directly using existing context. Do not call tools.`,
+        content: `${message}\nIf you genuinely need to execute a command or inspect files to answer the user, call the appropriate tool now. Otherwise, answer directly from existing context.`,
       }],
-      ...baseCounts,
+      maxTokenRecoveryCount: options.maxTokenRecoveryCount,
+      outputRetryCount: options.outputRetryCount,
+      suppressedToolRetryCount: options.suppressedToolRetryCount + 1,
     }
   }
 
@@ -585,6 +595,7 @@ export function reduceProviderTurnOutcome(options: {
           ],
           maxTokenRecoveryCount: options.maxTokenRecoveryCount,
           outputRetryCount: options.outputRetryCount + 1,
+          suppressedToolRetryCount: options.suppressedToolRetryCount,
         }
       }
       const message = 'Provider returned an empty assistant response with no tool calls.'
@@ -1032,6 +1043,9 @@ export function parseLocalRuntimeIntent(prompt: string): LocalRuntimeParsedInten
     }
   }
 
+  if ((verb === 'listdir' || verb === 'ls') && (arg || verb === 'ls')) {
+    return { kind: 'tool', toolName: 'ListDir', input: { path: arg || '.' } }
+  }
   if (verb === 'read' && arg) {
     return { kind: 'tool', toolName: 'Read', input: { path: arg } }
   }
@@ -1087,8 +1101,8 @@ export function parseLocalRuntimeIntent(prompt: string): LocalRuntimeParsedInten
     kind: 'text',
     text:
       `BabeL-O local runtime is active. I can already run explicit coding tools: ` +
-      '`read <file>`, `write <file> <text>`, `edit <file> <old> <new>`, ' +
-      '`grep <pattern>`, `glob <pattern>`, `bash <command>`, `task <title>`. ' +
+      '`listdir <dir>`, `glob <pattern>`, `grep <pattern>`, `read <file>`, ' +
+      '`write <file> <text>`, `edit <file> <old> <new>`, `bash <command>`, `task <title>`. ' +
       `You said: ${trimmed || '(empty prompt)'}`,
   }
 }

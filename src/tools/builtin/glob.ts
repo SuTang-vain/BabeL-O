@@ -31,7 +31,7 @@ function normalizePattern(pattern: string, cwd: string): string {
 export const globTool: ToolDefinition<typeof inputSchema> = {
   name: 'Glob',
   description: 'Find files by glob pattern or substring match.',
-  prompt: () => 'Fast file pattern matching tool. Supports glob patterns like "**/*.js" or "src/**/*.ts". Plain strings match as substrings. Use this before Read to discover candidate files or directory contents without shell ls; then use Grep or targeted Read on the most relevant paths.',
+  prompt: () => 'Glob is a pattern-based file discovery tool. Supports glob patterns like "**/*.js" or "src/**/*.ts" and plain substring matching. Use Glob when you need files matching a pattern across paths. Use ListDir for directory inventory, Grep for text matches inside files, and Read for source understanding.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {

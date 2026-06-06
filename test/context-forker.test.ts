@@ -125,7 +125,7 @@ test('minimal context fork keeps explore prompt focused and omits parent history
 
   assert.equal(fork.mode, 'minimal')
   assert.match(fork.prompt, /read-only Explore Agent/)
-  assert.match(fork.prompt, /Use only Read, Grep, and Glob/)
+  assert.match(fork.prompt, /Use only ListDir, Glob, Grep, and Read/)
   assert.match(fork.prompt, /Find src\/nexus\/agents\/AgentScheduler.ts/)
   assert.doesNotMatch(fork.prompt, /Large parent history/)
   assert.equal(fork.omittedItems, parentSession.events.length)

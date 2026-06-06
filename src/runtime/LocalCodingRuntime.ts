@@ -630,7 +630,7 @@ export function denyByDefaultTools(): ToolPolicy {
       return tool.risk === 'read' || tool.risk === 'task'
     },
     describe() {
-      return { mode: 'allowlist', allowedTools: ['read', 'grep', 'glob', 'task'] }
+      return { mode: 'allowlist', allowedTools: ['listdir', 'glob', 'grep', 'read', 'task'] }
     },
   }
 }

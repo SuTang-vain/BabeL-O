@@ -568,6 +568,8 @@ test('runtime pipeline reduces max-token provider turns to continuation or termi
     maxTokenRecoveries: 3,
     outputRetryCount: 0,
     maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
   })
   assert.equal(retryOutcome.kind, 'continue')
   assert.equal(retryOutcome.maxTokenRecoveryCount, 1)
@@ -589,6 +591,8 @@ test('runtime pipeline reduces max-token provider turns to continuation or termi
     maxTokenRecoveries: 3,
     outputRetryCount: 0,
     maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
   })
   assert.equal(terminalOutcome.kind, 'terminal')
   assert.equal(terminalOutcome.eventsBeforeMessages[0]?.type, 'error')
@@ -615,12 +619,41 @@ test('runtime pipeline reduces suppressed provider tool turns to retry prompts',
     maxTokenRecoveries: 3,
     outputRetryCount: 0,
     maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
   })
 
   assert.equal(outcome.kind, 'continue')
+  assert.equal(outcome.suppressedToolRetryCount, 1)
   assert.equal(outcome.eventsBeforeMessages[0]?.type, 'error')
   assert.equal(outcome.eventsBeforeMessages[0]?.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
+  assert.equal((outcome.eventsBeforeMessages[0]?.details as any).retryAttempted, true)
   assert.equal(outcome.messages[0]?.role, 'user')
+
+  const exhaustedOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-suppressed-exhausted',
+    turn: {
+      assistantText: '',
+      reasoningText: '',
+      toolCalls: [{ id: 'tool_1', name: 'Read', partialInput: '{}' }],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: true,
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你是谁？',
+    },
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 1,
+    maxSuppressedToolRetries: 1,
+  })
+  assert.equal(exhaustedOutcome.kind, 'tool_calls')
+  assert.equal(exhaustedOutcome.toolCalls.length, 1)
 })
 
 test('runtime pipeline reduces final and tool-call provider turns', () => {
@@ -638,6 +671,8 @@ test('runtime pipeline reduces final and tool-call provider turns', () => {
     maxTokenRecoveries: 3,
     outputRetryCount: 0,
     maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
   })
   assert.equal(finalOutcome.kind, 'terminal')
   assert.equal(finalOutcome.queueSessionMemoryLiteUpdate, true)
@@ -658,6 +693,8 @@ test('runtime pipeline reduces final and tool-call provider turns', () => {
     maxTokenRecoveries: 3,
     outputRetryCount: 0,
     maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
   })
   assert.equal(toolOutcome.kind, 'tool_calls')
   assert.equal(toolOutcome.toolCalls.length, 1)
@@ -2877,6 +2914,7 @@ test('Grep and Glob fall back when ripgrep is unavailable', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-rg-fallback`)
   await mkdir(join(cwd, 'src'), { recursive: true })
   await writeFile(join(cwd, 'src', 'fallback.txt'), 'needle appears here\n', 'utf8')
+  await writeFile(join(cwd, 'src', 'context.ts'), 'class ContextForker {}\nfunction forkContext() {}\n', 'utf8')
 
   const oldPath = process.env.PATH
   process.env.PATH = ''
@@ -2898,6 +2936,17 @@ test('Grep and Glob fall back when ripgrep is unavailable', async () => {
         ),
         /fallback\.txt/,
       )
+
+      const grepAlternationResponse = await app.inject({
+        method: 'POST',
+        url: '/v1/execute',
+        payload: { prompt: 'grep ContextForker|forkContext|contextFork', cwd },
+      })
+      assert.equal(grepAlternationResponse.statusCode, 200)
+      const grepAlternationEvent = grepAlternationResponse.json().events.find((event: { type: string }) => event.type === 'tool_completed')
+      assert.match(JSON.stringify(grepAlternationEvent), /context\.ts/)
+      assert.match(JSON.stringify(grepAlternationEvent), /ContextForker/)
+      assert.match(JSON.stringify(grepAlternationEvent), /Grep fallback/)
 
       const globResponse = await app.inject({
         method: 'POST',
@@ -3861,6 +3910,7 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-grep-limit`)
   await mkdir(cwd, { recursive: true })
   await writeFile(join(cwd, 'test.txt'), 'needle\nneedle\nneedle\nneedle\nneedle\n', 'utf8')
+  await writeFile(join(cwd, 'context.ts'), 'class ContextForker {}\nfunction forkContext() {}\n', 'utf8')
 
   const { grepTool } = await import('../src/tools/builtin/grep.js')
   const ctx = {
@@ -3880,6 +3930,18 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
     assert.match(String(res.output), /Read with offset\/limit/)
     const lines = String(res.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines.length, 2)
+
+    const alternation = await grepTool.execute({ pattern: 'ContextForker|forkContext|contextFork', path: 'context.ts', maxMatches: 10 }, ctx)
+    assert.equal(alternation.success, true)
+    assert.match(String(alternation.output), /context\.ts/)
+    assert.match(String(alternation.output), /ContextForker/)
+    assert.match(String(alternation.output), /forkContext/)
+    assert.match(String(alternation.output), /Grep fallback/)
+
+    const noResult = await grepTool.execute({ pattern: 'DefinitelyMissingSymbol', path: 'context.ts', maxMatches: 10 }, ctx)
+    assert.equal(noResult.success, true)
+    assert.match(String(noResult.output), /No matches found/)
+    assert.match(String(noResult.output), /JavaScript RegExp fallback/)
   } finally {
     process.env.PATH = oldPath
   }

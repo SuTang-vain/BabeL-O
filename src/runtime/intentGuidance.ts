@@ -145,7 +145,9 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
   if (guidance.explicitPaths.length > 0) {
     lines.push(`Explicit paths: ${guidance.explicitPaths.join(', ')}`)
   }
-  if (!guidance.requiresTools || guidance.actionHint === 'respond_only') {
+  if (guidance.intent === 'status' && (!guidance.requiresTools || guidance.actionHint === 'respond_only')) {
+    lines.push('Instruction: the user appears to be asking a status or context question. Answer from existing context unless you genuinely need to run a command to verify. Do not start multi-step tool chains for this message.')
+  } else if (!guidance.requiresTools || guidance.actionHint === 'respond_only') {
     lines.push('Instruction: respond directly to the latest user message. Do not start tool calls unless the user explicitly asks for new work in this message.')
   } else if (guidance.actionHint === 'prioritize_latest') {
     lines.push('Instruction: prioritize the latest user message as the active task. Use prior context only as background and do not continue stale tool chains.')
@@ -155,6 +157,7 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
 
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
   const normalized = normalizeGuidancePolicy(guidance)
+  if (normalized.intent === 'status') return false
   return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
 
@@ -282,7 +285,17 @@ async function queryIntakeModel(options: {
         'intent must be one of: continue, new_focus, correction, pause, greeting, status.',
         'contextScope must be one of: full, recent, new_focus.',
         'actionHint must be one of: normal, prioritize_latest, respond_only.',
-        'requiresTools must be false for greeting/status/pause unless the latest message explicitly asks for new inspection or modification.',
+        'requiresTools must be false for greeting/pause.',
+        'For status, use requiresTools=false only for pure status questions; if the latest message asks to verify, run, check, test, lint, build, inspect, or modify code, classify as continue with requiresTools=true.',
+        'Examples:',
+        '- "你在干什么" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
+        '- "当前什么状态" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
+        '- "验证当前改动是否健康" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
+        '- "检查一下测试能不能过" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
+        '- "跑一下 lint" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
+        '- "run the tests" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
+        '- "what are you doing" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
+        '- "check if tests pass" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
         `cwd: ${options.cwd}`,
         `recent user history:\n${options.history || '(none)'}`,
         `latest user message:\n${options.latestPrompt}`,
@@ -361,15 +374,28 @@ function buildGuidance(guidance: UserIntentGuidance): UserIntentGuidance {
 }
 
 function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
-  if (guidance.intent !== 'pause' && guidance.intent !== 'greeting' && guidance.intent !== 'status') {
-    return guidance
+  if (guidance.intent === 'pause') {
+    return {
+      ...guidance,
+      contextScope: 'recent',
+      actionHint: 'respond_only',
+      requiresTools: false,
+    }
   }
-  return {
-    ...guidance,
-    contextScope: guidance.intent === 'pause' ? 'recent' : guidance.contextScope,
-    actionHint: 'respond_only',
-    requiresTools: false,
+  if (guidance.intent === 'greeting') {
+    return {
+      ...guidance,
+      actionHint: 'respond_only',
+      requiresTools: false,
+    }
   }
+  if (guidance.intent === 'status' && !guidance.requiresTools) {
+    return {
+      ...guidance,
+      actionHint: 'respond_only',
+    }
+  }
+  return guidance
 }
 
 function findLatestUserText(events: NexusEvent[]): string {

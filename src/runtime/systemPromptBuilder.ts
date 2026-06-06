@@ -111,7 +111,7 @@ function getTaskGuidelinesSection(): string {
 - In general, do not propose changes to code you haven't read. Read files first.
 - **Action vs analysis**: Match your tool choice to the user's intent.
   - Action requests (start, run, build, test, execute, launch): use Bash to run the command directly.
-  - Analysis requests (review, analyze, improve, optimize, check, examine): use Read, Grep, Glob to examine code. Do NOT run the project or start servers unless the user explicitly asks.
+  - Analysis requests (review, analyze, improve, optimize, check, examine): use ListDir, Glob, Grep, and Read to examine code. Do NOT run the project or start servers unless the user explicitly asks.
   - If the user asks for analysis or review, read the relevant files and provide your assessment. Starting the project is not part of analysis.
 - **Analysis budget**: For analysis/review/comparison tasks, read at most 10-15 key files before synthesizing your findings. Present your analysis, then ask if the user wants deeper investigation. Do not exhaustively read an entire codebase before responding.
 - Do not create files unless they're absolutely necessary. Prefer editing existing files.
@@ -124,13 +124,14 @@ function getTaskGuidelinesSection(): string {
 function getToolUsageSection(): string {
   return `## Tool Usage
 
-- ALWAYS prefer dedicated tools over Bash commands for file operations. Bash requires explicit user permission approval; Read/Grep/Glob are auto-approved and faster. Using Bash cat/head/tail instead of Read wastes time waiting for permission.
-- To read files use Read instead of cat, head, or tail.
+- ALWAYS prefer dedicated tools over Bash commands for file operations. Bash requires explicit user permission approval; ListDir/Glob/Grep/Read are auto-approved and faster.
+- To inspect directory inventory use ListDir instead of ls, find, or tree.
+- To discover files by path pattern use Glob instead of find.
+- To locate text inside files use Grep instead of grep or rg; Grep is locator evidence, not source understanding.
+- To understand file contents use Read instead of cat, head, or tail.
 - To edit files use Edit instead of sed or awk.
 - To create files use Write instead of echo redirection.
-- To search for files use Glob instead of find or ls.
-- To search file content use Grep instead of grep or rg.
-- To run, start, test, build, or execute commands use Bash. Do not use Read/Glob/Grep when the user wants you to perform an action.
+- To run, start, test, build, or execute commands use Bash. Do not use ListDir/Glob/Grep/Read when the user wants you to perform an action.
 - When calling multiple independent tools in a single response, call them in parallel.
 - After reading files, proceed directly with edits or analysis. Do not summarize what you read unless the user asks.`
 }

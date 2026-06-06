@@ -3,7 +3,7 @@ import type { AgentProfile, AgentProfileId } from './types.js'
 export const EXPLORE_AGENT_PROFILE: AgentProfile = {
   id: 'explore',
   displayName: 'Explore Agent',
-  defaultTools: ['Read', 'Grep', 'Glob'],
+  defaultTools: ['ListDir', 'Glob', 'Grep', 'Read'],
   defaultContextForkMode: 'minimal',
   defaultIsolation: 'none',
   canEdit: false,
@@ -16,7 +16,7 @@ export const EXPLORE_AGENT_PROFILE: AgentProfile = {
 export const REVIEW_AGENT_PROFILE: AgentProfile = {
   id: 'review',
   displayName: 'Review Agent',
-  defaultTools: ['Read', 'Grep', 'Glob', 'Bash'],
+  defaultTools: ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'],
   defaultContextForkMode: 'task-focused',
   defaultIsolation: 'none',
   canEdit: false,
@@ -29,7 +29,7 @@ export const REVIEW_AGENT_PROFILE: AgentProfile = {
 export const TEST_AGENT_PROFILE: AgentProfile = {
   id: 'test',
   displayName: 'Test Agent',
-  defaultTools: ['Read', 'Grep', 'Glob', 'Bash'],
+  defaultTools: ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'],
   defaultContextForkMode: 'task-focused',
   defaultIsolation: 'none',
   canEdit: false,

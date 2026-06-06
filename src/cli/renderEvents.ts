@@ -629,6 +629,10 @@ function updateAgentStatusFromEvent(event: NexusEvent): void {
         if (liveAgentTree.every(e => e.status !== 'running')) {
           setAgentStatus('generating')
         }
+      } else if (event.eventType === 'worktree_merge_conflict' || event.eventType === 'worktree_create_failed') {
+        setAgentStatus('idle')
+      } else if (event.eventType === 'worktree_created' || event.eventType === 'worktree_merged' || event.eventType === 'worktree_recovery_action') {
+        setAgentStatus('generating')
       }
       break
     case 'agent_job_event':
@@ -1025,6 +1029,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
     }
   }
 
+  outputText += formatWorktreeFlowPanel(events)
   outputText += formatTaskStatusPanel(events)
   outputText += formatContextFooter()
 
@@ -1057,6 +1062,23 @@ type TaskBoardItem = {
   worktree?: boolean
   subSessionId?: string
   transcriptPath?: string
+}
+
+type WorktreeFlowStatus = 'isolated' | 'merged' | 'failed' | 'conflict' | 'recovery'
+
+type WorktreeFlowItem = {
+  taskId: string
+  title?: string
+  status: WorktreeFlowStatus
+  sessionId?: string
+  worktreePath?: string
+  preservedWorktreePath?: string
+  conflictingFiles?: string[]
+  recoveryActions?: string[]
+  recoveryStatus?: string
+  selectedAction?: string
+  error?: string
+  updatedAt?: string
 }
 
 type MultiAgentStatusRow = {
@@ -1265,6 +1287,215 @@ function firstPayloadNumber(payload: Record<string, unknown>, keys: string[]): n
     if (typeof value === 'number' && Number.isFinite(value)) return value
   }
   return undefined
+}
+
+export function formatWorktreeFlowPanel(events: NexusEvent[]): string {
+  const items = collectWorktreeFlowItems(events)
+  if (items.length === 0) return ''
+
+  const columns = process.stdout.columns || 100
+  const width = Math.max(72, Math.min(columns - 4, 120))
+  const title = ' ◆ Worktree Flow '
+  const headerPadding = '─'.repeat(Math.max(0, width - title.length))
+  let panel = `\n  ${chalk.cyan(`┌${title}${headerPadding}┐`)}\n`
+
+  for (const item of items) {
+    for (const line of formatWorktreeFlowItem(item, width).split('\n')) {
+      panel += formatWorktreePanelLine(line, width)
+    }
+  }
+
+  panel += formatWorktreePanelLine(chalk.dim('actions: bbl sessions worktree-recovery <sessionId> <taskId> continue|abandon|keep'), width)
+  panel += `  ${chalk.cyan('└' + '─'.repeat(width) + '┘')}\n`
+  return panel
+}
+
+function collectWorktreeFlowItems(events: NexusEvent[]): WorktreeFlowItem[] {
+  const items = new Map<string, WorktreeFlowItem>()
+
+  for (const event of events) {
+    if (event.type !== 'task_session_event') continue
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {}
+    const task = payload.task && typeof payload.task === 'object'
+      ? payload.task as NexusTask
+      : undefined
+    const next = worktreeFlowItemFromEvent(event, payload, task)
+    if (!next) continue
+
+    const existing = items.get(next.taskId)
+    items.set(next.taskId, {
+      ...existing,
+      ...next,
+      title: next.title ?? existing?.title,
+      conflictingFiles: next.conflictingFiles ?? existing?.conflictingFiles,
+      recoveryActions: next.recoveryActions ?? existing?.recoveryActions,
+      updatedAt: event.timestamp,
+    })
+  }
+
+  return [...items.values()].sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''))
+}
+
+function worktreeFlowItemFromEvent(
+  event: Extract<NexusEvent, { type: 'task_session_event' }>,
+  payload: Record<string, unknown>,
+  task?: NexusTask,
+): WorktreeFlowItem | undefined {
+  if (event.eventType === 'worktree_created') {
+    const taskId = firstPayloadString(payload, ['taskId'])
+    if (!taskId) return undefined
+    return {
+      taskId,
+      sessionId: event.sessionId,
+      status: 'isolated',
+      worktreePath: firstPayloadString(payload, ['worktreePath']),
+    }
+  }
+
+  if (event.eventType === 'worktree_create_failed') {
+    const taskId = firstPayloadString(payload, ['taskId'])
+    if (!taskId) return undefined
+    return {
+      taskId,
+      sessionId: event.sessionId,
+      title: firstPayloadString(payload, ['title']),
+      status: 'failed',
+      error: firstPayloadString(payload, ['error']),
+    }
+  }
+
+  if (event.eventType === 'worktree_merged') {
+    const taskId = firstPayloadString(payload, ['taskId'])
+    if (!taskId) return undefined
+    return { taskId, sessionId: event.sessionId, status: 'merged' }
+  }
+
+  if (event.eventType === 'worktree_merge_conflict') {
+    const recovery = recordValue(payload.recovery)
+    const taskId = firstPayloadString(payload, ['taskId']) ?? firstPayloadString(recovery, ['taskId']) ?? task?.taskId
+    if (!taskId) return undefined
+    return {
+      taskId,
+      sessionId: event.sessionId,
+      title: task?.title ?? firstPayloadString(recovery, ['taskTitle']),
+      status: 'conflict',
+      worktreePath: firstPayloadString(recovery, ['worktreePath']),
+      preservedWorktreePath: firstPayloadString(recovery, ['preservedWorktreePath', 'worktreePath']),
+      conflictingFiles: stringArrayValue(recovery.conflictingFiles),
+      recoveryActions: recoveryActionNames(recovery.recoveryActions),
+      recoveryStatus: firstPayloadString(recovery, ['status']),
+    }
+  }
+
+  if (event.eventType === 'worktree_recovery_action') {
+    const taskId = firstPayloadString(payload, ['taskId']) ?? task?.taskId
+    if (!taskId) return undefined
+    const next = payload.next && typeof payload.next === 'object'
+      ? payload.next as Record<string, unknown>
+      : undefined
+    const metadata = next?.metadata && typeof next.metadata === 'object'
+      ? next.metadata as Record<string, unknown>
+      : undefined
+    const recovery = metadata?.worktreeRecovery && typeof metadata.worktreeRecovery === 'object'
+      ? metadata.worktreeRecovery as Record<string, unknown>
+      : {}
+    return {
+      taskId,
+      sessionId: event.sessionId,
+      title: typeof next?.title === 'string' ? next.title : task?.title,
+      status: 'recovery',
+      recoveryStatus: firstPayloadString(recovery, ['status']),
+      selectedAction: firstPayloadString(recovery, ['selectedAction']),
+      preservedWorktreePath: firstPayloadString(recovery, ['preservedWorktreePath', 'worktreePath']),
+      conflictingFiles: stringArrayValue(recovery?.conflictingFiles),
+    }
+  }
+
+  const worktreeRecovery = task?.metadata?.worktreeRecovery
+  if (task && worktreeRecovery && typeof worktreeRecovery === 'object') {
+    const recovery = worktreeRecovery as Record<string, unknown>
+    return {
+      taskId: task.taskId,
+      sessionId: event.sessionId,
+      title: task.title,
+      status: firstPayloadString(recovery, ['status']) === 'awaiting_manual_recovery' ? 'conflict' : 'recovery',
+      worktreePath: firstPayloadString(recovery, ['worktreePath']),
+      preservedWorktreePath: firstPayloadString(recovery, ['preservedWorktreePath', 'worktreePath']),
+      conflictingFiles: stringArrayValue(recovery.conflictingFiles),
+      recoveryActions: recoveryActionNames(recovery.recoveryActions),
+      recoveryStatus: firstPayloadString(recovery, ['status']),
+      selectedAction: firstPayloadString(recovery, ['selectedAction']),
+    }
+  }
+
+  return undefined
+}
+
+function formatWorktreeFlowItem(item: WorktreeFlowItem, width: number): string {
+  const status = formatWorktreeFlowStatus(item.status)
+  const title = item.title ? ` ${truncateMiddle(item.title, Math.max(20, width - 36))}` : ''
+  const lines = [`${status} task #${item.taskId}${title}`]
+  const meta = compactStringList([
+    item.worktreePath ? `worktree=${truncateMiddle(item.worktreePath, 48)}` : '',
+    item.preservedWorktreePath ? `preserved=${truncateMiddle(item.preservedWorktreePath, 48)}` : '',
+    item.recoveryStatus ? `recovery=${item.recoveryStatus}` : '',
+    item.selectedAction ? `selected=${item.selectedAction}` : '',
+    item.error ? `error=${truncateMiddle(item.error, 64)}` : '',
+  ])
+  if (item.conflictingFiles?.length) {
+    meta.push(`conflicts=${item.conflictingFiles.map(file => truncateMiddle(file, 32)).join(',')}`)
+  }
+  if (item.recoveryActions?.length) {
+    meta.push(`choose=${item.recoveryActions.join('|')}`)
+  }
+  if (meta.length > 0) lines.push(chalk.dim(`  ${meta.join(' · ')}`))
+  return lines.join('\n')
+}
+
+function formatWorktreeFlowStatus(status: WorktreeFlowStatus): string {
+  switch (status) {
+    case 'isolated':
+      return chalk.cyan('◇ isolated')
+    case 'merged':
+      return chalk.green('✓ merged')
+    case 'failed':
+      return chalk.red('✗ create failed')
+    case 'conflict':
+      return chalk.yellow('! conflict')
+    case 'recovery':
+      return chalk.magenta('↻ recovery')
+  }
+}
+
+function formatWorktreePanelLine(content: string, width: number): string {
+  const visibleLength = visibleTerminalWidth(content)
+  const padding = ' '.repeat(Math.max(0, width - visibleLength))
+  return `  ${chalk.cyan('│')}${content}${padding}${chalk.cyan('│')}\n`
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function stringArrayValue(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const values = value.filter((item): item is string => typeof item === 'string' && item.length > 0)
+  return values.length > 0 ? values : undefined
+}
+
+function recoveryActionNames(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const actions = value.map(item => {
+    if (typeof item === 'string') return item
+    if (item && typeof item === 'object') {
+      const action = (item as Record<string, unknown>).action
+      if (typeof action === 'string') return action
+    }
+    return undefined
+  }).filter((item): item is string => typeof item === 'string' && item.length > 0)
+  return actions.length > 0 ? actions : undefined
 }
 
 export function formatTaskStatusPanel(events: NexusEvent[]): string {
@@ -1500,7 +1731,7 @@ function upsertTaskBoardItem(
     delegatedSubTaskIds: Array.isArray(task.metadata?.delegatedSubTaskIds)
       ? task.metadata.delegatedSubTaskIds.filter(id => typeof id === 'string')
       : undefined,
-    worktree: task.metadata?.requiresIsolation === true || typeof task.metadata?.worktreePath === 'string',
+    worktree: task.metadata?.requiresIsolation === true || typeof task.metadata?.worktreePath === 'string' || typeof task.metadata?.worktreeRecovery === 'object',
     subSessionId: typeof task.metadata?.subSessionId === 'string' ? task.metadata.subSessionId : undefined,
     transcriptPath: typeof task.metadata?.transcriptPath === 'string'
       ? task.metadata.transcriptPath
@@ -1626,7 +1857,12 @@ function formatToolLiveLine(options: {
 }
 
 function formatCompactToolOutputPreview(name: string, output: unknown, input?: unknown): string {
-  if (name !== 'Bash' || output === undefined) return ''
+  if (output === undefined) return ''
+  if (name !== 'Bash') {
+    const errorSummary = getStructuredToolErrorSummary(output)
+    return errorSummary ? `\n${chalk.dim('  ⎿')}  ${errorSummary}` : ''
+  }
+
   const summary = getBashOutputSummary(output)
   if (!summary.text) return ''
 
@@ -1641,6 +1877,23 @@ function formatCompactToolOutputPreview(name: string, output: unknown, input?: u
   const timeoutMs = getBashTimeoutMs(input)
   if (timeoutMs && timeoutMs !== defaultBashTimeoutMs) renderedLines.push(`${chalk.dim('  ⎿')}  ${chalk.dim(`(timeout ${formatDuration(timeoutMs)})`)}`)
   return `\n${renderedLines.join('\n')}`
+}
+
+function getStructuredToolErrorSummary(output: unknown): string {
+  if (!output || typeof output !== 'object') return ''
+  const record = output as Record<string, unknown>
+  const code = typeof record.code === 'string' ? record.code : ''
+  const message = typeof record.message === 'string' ? summarizeToolErrorMessage(record.message) : ''
+  if (!code && !message) return ''
+  if (code && message) return `${code}: ${message}`
+  return code || message
+}
+
+function summarizeToolErrorMessage(message: string): string {
+  const lines = message.split('\n').map(line => line.trim()).filter(Boolean)
+  const first = lines[0] ?? ''
+  const pathLine = lines.find(line => line.startsWith('→ at '))
+  return truncateMiddle(pathLine ? `${first} ${pathLine}` : first, 140)
 }
 
 function getBashOutputSummary(output: unknown): { text: string; exitCode?: number } {
@@ -1670,10 +1923,44 @@ function formatDuration(ms: number): string {
 }
 
 function formatTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): string {
+  const worktreeSummary = formatWorktreeTaskSessionEvent(event)
+  if (worktreeSummary) return worktreeSummary
   const label = event.eventType.replace(/_/g, ' ')
   const phase = chalk.dim(event.phase)
   const payload = summarizePayload(event.payload)
   return `${chalk.magenta('agent')} ${phase} ${label}${payload ? ` ${chalk.dim(payload)}` : ''}`
+}
+
+function formatWorktreeTaskSessionEvent(event: Extract<NexusEvent, { type: 'task_session_event' }>): string | undefined {
+  const payload = event.payload && typeof event.payload === 'object'
+    ? event.payload as Record<string, unknown>
+    : {}
+  const task = payload.task && typeof payload.task === 'object' ? payload.task as NexusTask : undefined
+  const item = worktreeFlowItemFromEvent(event, payload, task)
+  if (!item) return undefined
+
+  const phase = chalk.dim(event.phase)
+  const taskRef = `#${item.taskId}`
+  if (event.eventType === 'worktree_created') {
+    return `${chalk.magenta('worktree')} ${phase} isolated ${taskRef}${item.worktreePath ? ` ${chalk.dim(truncateMiddle(item.worktreePath, 80))}` : ''}`
+  }
+  if (event.eventType === 'worktree_merged') {
+    return `${chalk.magenta('worktree')} ${phase} merged ${taskRef}`
+  }
+  if (event.eventType === 'worktree_create_failed') {
+    return `${chalk.magenta('worktree')} ${phase} create failed ${taskRef}${item.error ? ` ${chalk.dim(item.error)}` : ''}`
+  }
+  if (event.eventType === 'worktree_merge_conflict') {
+    const conflicts = item.conflictingFiles?.length ? ` conflicts=${item.conflictingFiles.join(',')}` : ''
+    const actions = item.recoveryActions?.length ? ` choose=${item.recoveryActions.join('|')}` : ''
+    return `${chalk.magenta('worktree')} ${phase} merge conflict ${taskRef}${chalk.dim(conflicts + actions)}`
+  }
+  if (event.eventType === 'worktree_recovery_action') {
+    const selected = item.selectedAction ? ` ${item.selectedAction}` : ''
+    const status = item.recoveryStatus ? ` recovery=${item.recoveryStatus}` : ''
+    return `${chalk.magenta('worktree')} ${phase} recovery${selected} ${taskRef}${chalk.dim(status)}`
+  }
+  return undefined
 }
 
 function formatAgentJobEvent(event: Extract<NexusEvent, { type: 'agent_job_event' }>): string {

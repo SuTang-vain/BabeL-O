@@ -640,7 +640,7 @@ describe('User intent fallback guidance', () => {
     assert.equal(memory.intent, 'status')
     assert.equal(memory.actionHint, 'respond_only')
     assert.equal(memory.requiresTools, false)
-    assert.equal(shouldSuppressToolsForIntent(memory), true)
+    assert.equal(shouldSuppressToolsForIntent(memory), false)
   })
 })
 
@@ -982,7 +982,7 @@ describe('LLMCodingRuntime', () => {
     assert.match(JSON.stringify(body.system), /Requires tools: no/)
   })
 
-  test('falls back context-memory prompts to respond-only status when intake model fails', async () => {
+  test('falls back context-memory prompts to status guidance without hiding tools when intake model fails', async () => {
     globalThis.fetch = async (url, init) => {
       const body = parseRequestBody(init)
       if (isIntakeRequestBody(body)) {
@@ -1022,8 +1022,10 @@ describe('LLMCodingRuntime', () => {
 
     assert.equal(fetchCalls.length, 1)
     const body = JSON.parse(String(fetchCalls[0].init?.body))
-    assert.equal(body.tools, undefined)
+    const toolNames = body.tools.map((tool: any) => tool.name).sort()
+    assert.deepEqual(toolNames, [...toolsRegistry.keys()].sort())
     assert.match(JSON.stringify(body.system), /Requires tools: no/)
+    assert.match(JSON.stringify(body.system), /Answer from existing context unless you genuinely need to run a command to verify/)
   })
 
   test('loads latest session tail before building intake guidance', async () => {
@@ -1168,6 +1170,70 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
     assert.match(JSON.stringify(body.system), /Requires tools: no/)
+  })
+
+  test('keeps tools visible for status intake when the latest message asks to verify changes', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        const bodyText = JSON.stringify(body)
+        assert.match(bodyText, /验证当前改动是否健康/)
+        assert.match(bodyText, /check if tests pass/)
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"The user asks to verify current uncommitted changes.\\",\\"guidance\\":\\"Use tools to verify the current changes.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock status intake requiring tools',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"I will verify the current changes."}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock provider response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-status-intake-verify-keeps-tools-visible',
+        prompt: '验证当前未提交改动是否健康',
+        cwd: tmpdir(),
+      })
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.intent, 'status')
+    assert.equal(intake.actionHint, 'normal')
+    assert.equal(intake.requiresTools, true)
+    assert.ok(!events.some(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT'))
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    const toolNames = body.tools.map((tool: any) => tool.name)
+    assert.deepEqual(toolNames, ['Bash'])
+    assert.match(JSON.stringify(body.system), /Requires tools: yes/)
   })
 
   test('only exposes policy-allowed tools to provider requests', async () => {
@@ -1957,13 +2023,18 @@ describe('LLMCodingRuntime', () => {
       event.type === 'assistant_delta' && (event as any).text.includes('<minimax:tool_call>'),
     ))
     assert.ok(!events.some(event => event.type === 'tool_started'))
+    assert.equal(fetchCalls.length, 2)
 
     const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
     assert.ok(suppressionError)
     assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+    assert.equal(suppressionError.details.retryAttempted, true)
 
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(firstBody.tools, undefined)
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
+    assert.match(JSON.stringify(secondBody.messages), /genuinely need to execute a command or inspect files/)
   })
 
   test('hard-suppresses MiniMax bracket-wrapped tool calls for respond-only intake', async () => {
@@ -1984,7 +2055,7 @@ describe('LLMCodingRuntime', () => {
             'event: content_block_start\n',
             'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
             'event: content_block_delta\n',
-            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Clarifying question.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"greeting\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Greeting.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
             'event: content_block_stop\n',
             'data: {"index":0}\n\n',
           ]),
@@ -2038,15 +2109,117 @@ describe('LLMCodingRuntime', () => {
       event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>'),
     ))
     assert.ok(!events.some(event => event.type === 'tool_started'))
+    assert.equal(fetchCalls.length, 2)
 
     const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
     assert.ok(suppressionError)
     assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+    assert.equal(suppressionError.details.retryAttempted, true)
+
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(firstBody.tools, undefined)
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, true)
     assert.doesNotMatch(resultEvent.message, /tool_call|invoke name|Bash|pwd/)
+  })
+
+  test('retries suppressed respond-only tool calls once and allows tool execution on retry', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-suppressed-retry-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"greeting\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Greeting.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      const nextStream = fetchCalls.length <= 2
+        ? createMockStream([
+            'event: content_block_start\n',
+            `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-${fetchCalls.length}","name":"Bash","input":{}}}\n\n`,
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"pwd\\",\\"timeoutMs\\":15000}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ])
+        : createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"已完成验证。"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ])
+      return {
+        ok: true,
+        status: 200,
+        body: nextStream,
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-suppressed-tool-call-retry-allows-tool',
+        prompt: '你好？',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    assert.equal(fetchCalls.length, 3)
+    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+    assert.ok(suppressionError)
+    assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+    assert.equal(suppressionError.details.retryAttempted, true)
+    assert.equal(suppressionError.details.retryExhausted, false)
+
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(firstBody.tools, undefined)
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
+
+    const toolStartedEvents = events.filter(event => event.type === 'tool_started') as any[]
+    assert.equal(toolStartedEvents.length, 1)
+    assert.equal(toolStartedEvents[0]?.name, 'Bash')
+    assert.equal(toolStartedEvents[0]?.input.command, 'pwd')
+
+    const toolCompleted = events.find(event => event.type === 'tool_completed') as any
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.name, 'Bash')
+    assert.equal(toolCompleted.success, true)
+    assert.match(JSON.stringify(toolCompleted.output), new RegExp(cwd.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /已完成验证/)
   })
 
   test('suppresses generic tool-shaped text while tools are hidden and retries final answer', async () => {
@@ -2060,7 +2233,7 @@ describe('LLMCodingRuntime', () => {
             'event: content_block_start\n',
             'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
             'event: content_block_delta\n',
-            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Clarifying question.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"greeting\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Greeting.\\",\\"guidance\\":\\"Reply directly.\\",\\"explicitPaths\\":[]}"}}\n\n',
             'event: content_block_stop\n',
             'data: {"index":0}\n\n',
           ]),

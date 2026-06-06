@@ -43,7 +43,7 @@ export function createAgentTools(scheduler: AgentScheduler): AnyTool[] {
     prompt: () => [
       'Spawn a child agent job for exploration, review, or focused tests.',
       'Use agentType="explore" for locating code, "review" for read-only code review, and "test" for targeted validation.',
-      'Explore agents use Read/Grep/Glob. Review/Test agents may also use restricted Bash for focused check-only validation commands.',
+      'Explore agents use ListDir/Glob/Grep/Read with clear boundaries: directory inventory, path pattern discovery, content locating, then source reading. Review/Test agents may also use restricted Bash for focused check-only validation commands.',
     ].join('\n'),
     async execute(input, context) {
       const job = await scheduler.spawnAgent({

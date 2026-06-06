@@ -13,7 +13,7 @@ import type { AgentJob, AgentResult } from '../src/nexus/agents/types.js'
 test('explore agent profile is read-only and minimal by default', () => {
   assert.equal(EXPLORE_AGENT_PROFILE.id, 'explore')
   assert.equal(EXPLORE_AGENT_PROFILE.displayName, 'Explore Agent')
-  assert.deepEqual(EXPLORE_AGENT_PROFILE.defaultTools, ['Read', 'Grep', 'Glob'])
+  assert.deepEqual(EXPLORE_AGENT_PROFILE.defaultTools, ['ListDir', 'Glob', 'Grep', 'Read'])
   assert.equal(EXPLORE_AGENT_PROFILE.defaultContextForkMode, 'minimal')
   assert.equal(EXPLORE_AGENT_PROFILE.defaultIsolation, 'none')
   assert.equal(EXPLORE_AGENT_PROFILE.canEdit, false)
@@ -30,7 +30,7 @@ test('review and test profiles are enabled as read-only validation agents', () =
   assert.equal(getAgentProfile('test'), TEST_AGENT_PROFILE)
   assert.throws(() => assertAgentProfile('implement'), /not enabled/)
 
-  assert.deepEqual(REVIEW_AGENT_PROFILE.defaultTools, ['Read', 'Grep', 'Glob', 'Bash'])
+  assert.deepEqual(REVIEW_AGENT_PROFILE.defaultTools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
   assert.equal(REVIEW_AGENT_PROFILE.defaultContextForkMode, 'task-focused')
   assert.equal(REVIEW_AGENT_PROFILE.canEdit, false)
   assert.equal(REVIEW_AGENT_PROFILE.canRunBash, true)
@@ -38,7 +38,7 @@ test('review and test profiles are enabled as read-only validation agents', () =
   assert.equal(REVIEW_AGENT_PROFILE.maxRuntimeMs, 180_000)
   assert.equal(REVIEW_AGENT_PROFILE.maxOutputTokens, 3_000)
 
-  assert.deepEqual(TEST_AGENT_PROFILE.defaultTools, ['Read', 'Grep', 'Glob', 'Bash'])
+  assert.deepEqual(TEST_AGENT_PROFILE.defaultTools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
   assert.equal(TEST_AGENT_PROFILE.defaultContextForkMode, 'task-focused')
   assert.equal(TEST_AGENT_PROFILE.canEdit, false)
   assert.equal(TEST_AGENT_PROFILE.canRunBash, true)

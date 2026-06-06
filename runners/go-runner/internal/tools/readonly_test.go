@@ -12,10 +12,19 @@ import (
 	"github.com/babel-o/go-runner/internal/protocol"
 )
 
-func TestReadGrepGlobExecute(t *testing.T) {
+func TestListDirReadGrepGlobExecute(t *testing.T) {
 	workspace := t.TempDir()
 	writeFixtureFile(t, filepath.Join(workspace, "README.md"), "hello\nneedle one\n")
 	writeFixtureFile(t, filepath.Join(workspace, "src", "main.go"), "package main\n// needle two\n")
+
+	listDir, errResult := Execute(context.Background(), request(workspace, "ListDir", `{"path":".","maxEntries":20,"includeFiles":true,"includeDirectories":true,"maxDepth":1}`))
+	if errResult != nil || !listDir.Success {
+		t.Fatalf("unexpected ListDir result: %#v %#v", listDir, errResult)
+	}
+	listDirOutput := listDir.Output.(listDirOutput)
+	if len(listDirOutput.Entries) != 2 || listDirOutput.Entries[0].Path != "src" || listDirOutput.Entries[0].Type != "directory" || listDirOutput.Entries[1].Path != "README.md" || listDirOutput.Counts.Shown != 2 {
+		t.Fatalf("unexpected ListDir output: %#v", listDirOutput)
+	}
 
 	read, errResult := Execute(context.Background(), request(workspace, "Read", `{"path":"README.md","offset":0,"limit":5}`))
 	if errResult != nil || !read.Success || !strings.HasPrefix(read.Output.(string), "hello") {

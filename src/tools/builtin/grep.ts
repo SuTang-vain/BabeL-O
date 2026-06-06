@@ -16,7 +16,7 @@ const inputSchema = z.object({
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
-  prompt: () => 'A powerful search tool built on ripgrep. Supports full regex syntax. Use this before Read when looking for symbols, errors, or filenames in a large repository. Prefer this tool over bash grep commands, then use Read with offset/limit for targeted ranges around relevant matches.',
+  prompt: () => 'Grep is a content locator built on ripgrep. Supports full regex syntax. Use Grep to find candidate lines containing symbols, errors, or text inside files. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
@@ -73,7 +73,12 @@ async function grepFallback(
   const root = join(cwd, searchPath)
   const results: string[] = []
   const probeLimit = maxMatches + 1
-  const needle = pattern.toLowerCase()
+  let matcher: RegExp
+  try {
+    matcher = new RegExp(pattern)
+  } catch (error) {
+    return grepFallbackInvalidRegexHint(pattern, error)
+  }
 
   async function visit(path: string): Promise<void> {
     if (results.length >= probeLimit) return
@@ -107,7 +112,7 @@ async function grepFallback(
     }
     const lines = text.split('\n')
     for (let index = 0; index < lines.length && results.length < probeLimit; index++) {
-      if (lines[index]!.toLowerCase().includes(needle)) {
+      if (matcher.test(lines[index]!)) {
         results.push(`${filePath}:${index + 1}:${lines[index]}`)
       }
     }
@@ -115,7 +120,29 @@ async function grepFallback(
 
   await visit(root)
   if (results.length > maxMatches) {
-    return results.slice(0, maxMatches).join('\n') + targetedGrepTruncationHint(maxMatches)
+    return results.slice(0, maxMatches).join('\n') + targetedGrepTruncationHint(maxMatches) + grepFallbackModeHint()
   }
-  return results.join('\n')
+  if (results.length === 0) {
+    return grepFallbackNoResultHint(searchPath)
+  }
+  return results.join('\n') + grepFallbackModeHint()
+}
+
+function grepFallbackModeHint(): string {
+  return '\n[Grep fallback] ripgrep unavailable; used JavaScript RegExp scan with basic regex support. Grep results are locator-only evidence; use Read around relevant matches before source-level claims.'
+}
+
+function grepFallbackNoResultHint(searchPath: string): string {
+  return `[Grep fallback] No matches found under ${formatGrepDiagnosticValue(searchPath)} using JavaScript RegExp fallback because ripgrep is unavailable. Treat this as fallback locator evidence, not a full-source proof; narrow the path/pattern or retry Grep when ripgrep is available before using broad shell search.`
+}
+
+function grepFallbackInvalidRegexHint(pattern: string, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  return `[Grep fallback] ripgrep unavailable and fallback could not compile pattern ${formatGrepDiagnosticValue(pattern)} as JavaScript RegExp: ${message}. No search was performed; simplify the regex or retry Grep when ripgrep is available.`
+}
+
+function formatGrepDiagnosticValue(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ')
+  const preview = normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized
+  return JSON.stringify(preview)
 }

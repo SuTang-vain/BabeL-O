@@ -99,7 +99,7 @@ export const PLANNER_ROLE: AgentRoleDefinition = {
     capability: 'long-context',
   },
   toolPolicy: {
-    allowedTools: ['Read', 'Grep', 'Glob'],
+    allowedTools: ['ListDir', 'Glob', 'Grep', 'Read'],
     requiresApproval: false,
   },
   inputSchema: PlannerInputSchema,
@@ -147,7 +147,7 @@ export const OPTIMIZER_ROLE: AgentRoleDefinition = {
     capability: 'tool-stable',
   },
   toolPolicy: {
-    allowedTools: ['Read', 'Write', 'Edit', 'Bash', 'Grep', 'Glob'],
+    allowedTools: ['ListDir', 'Glob', 'Grep', 'Read', 'Write', 'Edit', 'Bash'],
     requiresApproval: false, // self-optimizing runs automatically
   },
   inputSchema: ExecutorInputSchema,

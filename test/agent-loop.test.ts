@@ -962,7 +962,7 @@ test('runAgentLoop non-dry-run provider smoke executes fixed runtime-backed task
 
     const latestText = latestProviderUserText(body)
     if (latestText.includes('Role:\nplanner')) {
-      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Glob', 'Grep', 'Read'])
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Glob', 'Grep', 'ListDir', 'Read'])
       return {
         ok: true,
         status: 200,
@@ -978,7 +978,7 @@ test('runAgentLoop non-dry-run provider smoke executes fixed runtime-backed task
     }
 
     if (latestText.includes('Role:\noptimizer') && !latestText.includes('tool_result')) {
-      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Bash', 'Edit', 'Glob', 'Grep', 'Read', 'Write'])
+      assert.deepEqual(body.tools?.map((tool: any) => tool.name).sort(), ['Bash', 'Edit', 'Glob', 'Grep', 'ListDir', 'Read', 'Write'])
       return {
         ok: true,
         status: 200,

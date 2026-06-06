@@ -33,7 +33,7 @@ func TestCapabilities(t *testing.T) {
 	if body.ID != "test-runner" {
 		t.Fatalf("id = %q", body.ID)
 	}
-	wantTools := []string{"Read", "Grep", "Glob"}
+	wantTools := []string{"ListDir", "Glob", "Grep", "Read"}
 	if len(body.Capabilities.Tools) != len(wantTools) {
 		t.Fatalf("capabilities = %#v", body.Capabilities)
 	}
@@ -341,12 +341,32 @@ func TestExecuteBashTimeout(t *testing.T) {
 	}
 }
 
-func TestExecuteReadGrepGlob(t *testing.T) {
+func TestExecuteListDirReadGrepGlob(t *testing.T) {
 	workspace := t.TempDir()
 	writeFile(t, filepath.Join(workspace, "README.md"), "hello\nneedle one\n")
 	writeFile(t, filepath.Join(workspace, "src", "main.go"), "package main\n// needle two\n")
 	server := httptest.NewServer(NewServer("test-runner").Handler())
 	defer server.Close()
+
+	listDirResult := execute(t, server.URL, protocol.ExecuteRequest{
+		ProtocolVersion:    protocol.Version,
+		SessionID:          "session-1",
+		RequestID:          "request-list-dir",
+		ToolUseID:          "tool-list-dir",
+		ToolName:           "ListDir",
+		ToolInput:          json.RawMessage(`{"path":".","maxEntries":20,"includeFiles":true,"includeDirectories":true,"maxDepth":1}`),
+		Cwd:                workspace,
+		MaxOutputBytes:     1000,
+		BashMaxBufferBytes: 1000,
+	})
+	if listDirResult.Kind != "result" || !listDirResult.Success {
+		t.Fatalf("unexpected ListDir result: %#v", listDirResult)
+	}
+	listDirOutput := listDirResult.Output.(map[string]any)
+	listDirEntries := listDirOutput["entries"].([]any)
+	if len(listDirEntries) != 2 || listDirEntries[0].(map[string]any)["path"] != "src" || listDirEntries[1].(map[string]any)["path"] != "README.md" {
+		t.Fatalf("unexpected ListDir output: %#v", listDirOutput)
+	}
 
 	readResult := execute(t, server.URL, protocol.ExecuteRequest{
 		ProtocolVersion:    protocol.Version,

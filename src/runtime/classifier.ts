@@ -215,7 +215,7 @@ export function classifyAction(
   const name = toolName.trim()
 
   // 1. Read-only query tools are safe to execute immediately
-  if (['Read', 'Grep', 'Glob'].includes(name)) {
+  if (['ListDir', 'Glob', 'Grep', 'Read'].includes(name)) {
     return { autoApprove: true, reason: 'Read-only tool' }
   }
 

@@ -51,7 +51,7 @@ test('optional Go Remote Runner Phase D smoke', { skip: runGoSmoke ? false : 'Se
     const capabilities = await fetchJson(`${baseUrl}/v1/remote-runner/capabilities`)
     assert.equal(capabilities.protocolVersion, REMOTE_RUNNER_PROTOCOL_VERSION)
     assert.equal(capabilities.id, 'go-remote-runner-smoke')
-    assert.deepEqual(capabilities.capabilities.tools, ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit'])
+    assert.deepEqual(capabilities.capabilities.tools, ['ListDir', 'Glob', 'Grep', 'Read', 'Bash', 'Write', 'Edit'])
     assert.equal(capabilities.capabilities.bashEnabled, true)
     assert.equal(capabilities.capabilities.writeEnabled, true)
 
@@ -60,7 +60,23 @@ test('optional Go Remote Runner Phase D smoke', { skip: runGoSmoke ? false : 'Se
     await writeFile(join(workspace, 'README.md'), 'hello\nneedle one\n')
     await writeFile(join(workspace, 'src', 'main.go'), 'package main\n// needle two\n')
 
-    const runner = new HttpRemoteToolRunner({ baseUrl, capabilities: { tools: ['Read', 'Grep', 'Glob', 'Bash', 'Write', 'Edit'] } })
+    const runner = new HttpRemoteToolRunner({ baseUrl, capabilities: { tools: ['ListDir', 'Glob', 'Grep', 'Read', 'Bash', 'Write', 'Edit'] } })
+    const listDir = await runner.executeTool({
+      protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
+      sessionId: 'session-go-smoke',
+      requestId: 'request-list-dir',
+      toolUseId: 'tool-list-dir',
+      toolName: 'ListDir',
+      toolInput: { path: '.', maxEntries: 20, includeFiles: true, includeDirectories: true, maxDepth: 1 },
+      cwd: workspace,
+      allowedPaths: [workspace],
+      maxOutputBytes: 1000,
+      bashMaxBufferBytes: 1000,
+    })
+    assert.equal(listDir.kind, 'result')
+    assert.equal(listDir.kind === 'result' ? listDir.success : false, true)
+    assert.deepEqual((listDir as any).output.entries.map((entry: any) => entry.path), ['src', 'README.md'])
+
     const read = await runner.executeTool({
       protocolVersion: REMOTE_RUNNER_PROTOCOL_VERSION,
       sessionId: 'session-go-smoke',
@@ -229,7 +245,7 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
     await waitForCapabilities(baseUrl, child)
     const capabilities = await fetchJson(`${baseUrl}/v1/remote-runner/capabilities`)
     assert.equal(capabilities.id, 'go-explore-agent-remote-smoke')
-    assert.deepEqual(capabilities.capabilities.tools, ['Read', 'Grep', 'Glob'])
+    assert.deepEqual(capabilities.capabilities.tools, ['ListDir', 'Glob', 'Grep', 'Read'])
 
     workspace = await mkdtemp(join(tmpdir(), 'babel-o-go-explore-agent-smoke-'))
     await mkdir(join(workspace, 'src'), { recursive: true })
@@ -238,7 +254,7 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
 
     const runner = new RecordingRemoteToolRunner(new HttpRemoteToolRunner({
       baseUrl,
-      capabilities: { tools: ['Read', 'Grep', 'Glob'] },
+      capabilities: { tools: ['ListDir', 'Glob', 'Grep', 'Read'] },
     }))
     const storage = new MemoryStorage()
     await saveParentSession(storage, 'session-agent-parent', workspace)
@@ -252,9 +268,10 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
         allowedTools: options.allowedTools,
         summary: 'Explore Agent remote smoke completed.',
         toolCalls: [
-          toolCall('tool-agent-read', 'Read', { path: 'README.md', offset: 0, limit: 5 }),
-          toolCall('tool-agent-grep', 'Grep', { pattern: 'needle', path: '.', maxMatches: 10 }),
+          toolCall('tool-agent-list-dir', 'ListDir', { path: '.', maxEntries: 20, includeFiles: true, includeDirectories: true, maxDepth: 1 }),
           toolCall('tool-agent-glob', 'Glob', { pattern: '**/*.go', maxResults: 10 }),
+          toolCall('tool-agent-grep', 'Grep', { pattern: 'needle', path: '.', maxMatches: 10 }),
+          toolCall('tool-agent-read', 'Read', { path: 'README.md', offset: 0, limit: 5 }),
         ],
       }),
     })
@@ -271,9 +288,9 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
     const output = spawned.output as any
     assert.equal(output.status, 'completed')
     assert.equal(output.result.summary, 'Explore Agent remote smoke completed.')
-    assert.deepEqual(runner.requests.map(request => request.toolName), ['Read', 'Grep', 'Glob'])
-    assert.deepEqual(runner.requests.map(request => request.cwd), [workspace, workspace, workspace])
-    assert.deepEqual(runner.requests.map(request => request.allowedPaths), [[workspace], [workspace], [workspace]])
+    assert.deepEqual(runner.requests.map(request => request.toolName), ['ListDir', 'Glob', 'Grep', 'Read'])
+    assert.deepEqual(runner.requests.map(request => request.cwd), [workspace, workspace, workspace, workspace])
+    assert.deepEqual(runner.requests.map(request => request.allowedPaths), [[workspace], [workspace], [workspace], [workspace]])
     const jobs = await scheduler.listAgents()
     assert.equal(jobs[0]?.transcriptPath, `nexus://sessions/${output.childSessionId}/events`)
     assert.equal(jobs[0]?.result?.findings?.some(finding => /Read completed/.test(finding.message)), true)
@@ -282,7 +299,7 @@ test('optional Go Explore Agent remote execution smoke', { skip: runGoSmoke ? fa
       childEvents.events
         .filter((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed')
         .map(event => event.name),
-      ['Read', 'Grep', 'Glob'],
+      ['ListDir', 'Glob', 'Grep', 'Read'],
     )
     const parentEvents = await storage.listEvents('session-agent-parent')
     const completedEvent = parentEvents.events.find(event => event.type === 'agent_job_event' && event.eventType === 'agent_job_completed')

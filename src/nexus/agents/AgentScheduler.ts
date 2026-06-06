@@ -463,8 +463,8 @@ function addMillisecondsIso(timestamp: string, durationMs: number): string | und
 
 function assertProfileAllowedTools(profileId: AgentJob['agentType'], allowedTools: string[]): void {
   const allowed = profileId === 'explore'
-    ? new Set(['Read', 'Grep', 'Glob'])
-    : new Set(['Read', 'Grep', 'Glob', 'Bash'])
+    ? new Set(['ListDir', 'Glob', 'Grep', 'Read'])
+    : new Set(['ListDir', 'Glob', 'Grep', 'Read', 'Bash'])
   const disallowed = allowedTools.filter(tool => !allowed.has(tool))
   if (disallowed.length > 0) {
     throw new AgentJobRegistryError(

@@ -351,7 +351,9 @@ export class LLMCodingRuntime implements NexusRuntime {
       let outputRetryCount = 0
       const MAX_OUTPUT_RETRIES = 2
       const MAX_TOKEN_RECOVERIES = 3
+      const MAX_SUPPRESSED_TOOL_RETRIES = 1
       let maxTokenRecoveryCount = 0
+      let suppressedToolRetryCount = 0
       const replacementState = createReplacementState()
       let providerLoopCompactAttempted = false
 
@@ -366,6 +368,9 @@ export class LLMCodingRuntime implements NexusRuntime {
           contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
         })
 
+        let suppressToolsForCurrentIntent =
+          shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+          suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
         let requestState = buildProviderLoopRequestState({
           loopCount,
           maxLoops,
@@ -377,7 +382,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           contextMaxTokens: assembledContext.budget.maxTokens,
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
-          suppressToolsForUserIntent: shouldSuppressToolsForIntent(assembledContext.userIntentGuidance),
+          suppressToolsForUserIntent: suppressToolsForCurrentIntent,
           cacheAwareCompactPolicy,
           finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
         })
@@ -411,6 +416,9 @@ export class LLMCodingRuntime implements NexusRuntime {
             messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
               contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
             })
+            suppressToolsForCurrentIntent =
+              shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+              suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
             requestState = buildProviderLoopRequestState({
               loopCount,
               maxLoops,
@@ -422,7 +430,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               contextMaxTokens: assembledContext.budget.maxTokens,
               warningPercent: contextWarningPercent,
               compactPercent: contextCompactPercent,
-              suppressToolsForUserIntent: shouldSuppressToolsForIntent(assembledContext.userIntentGuidance),
+              suppressToolsForUserIntent: suppressToolsForCurrentIntent,
               cacheAwareCompactPolicy,
               finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
             })
@@ -512,7 +520,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         try {
           const toolCallTextLeakPhase = finalResponseOnlyMode
             ? 'final_response_only'
-            : shouldSuppressToolsForIntent(assembledContext.userIntentGuidance)
+            : suppressToolsForCurrentIntent
               ? 'respond_only'
               : modelVisibleTools.length === 0
                 ? 'tools_hidden'
@@ -584,7 +592,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           sessionId: options.sessionId,
           turn: providerTurn,
           finalResponseOnlyMode,
-          suppressToolsForUserIntent: shouldSuppressToolsForIntent(assembledContext.userIntentGuidance),
+          suppressToolsForUserIntent: suppressToolsForCurrentIntent,
           userIntentGuidance: assembledContext.userIntentGuidance,
           providerId: settings.providerId,
           modelId: cleanedModelId,
@@ -592,12 +600,15 @@ export class LLMCodingRuntime implements NexusRuntime {
           maxTokenRecoveries: MAX_TOKEN_RECOVERIES,
           outputRetryCount,
           maxOutputRetries: MAX_OUTPUT_RETRIES,
+          suppressedToolRetryCount,
+          maxSuppressedToolRetries: MAX_SUPPRESSED_TOOL_RETRIES,
         })
         if (providerTurn.toolCallTextLeakSuppression && providerOutcome.kind === 'continue') {
           metrics.finalAnswerRetryCount += 1
         }
         maxTokenRecoveryCount = providerOutcome.maxTokenRecoveryCount
         outputRetryCount = providerOutcome.outputRetryCount
+        suppressedToolRetryCount = providerOutcome.suppressedToolRetryCount
         for (const event of providerOutcome.eventsBeforeMessages) yield event
         messages.push(...providerOutcome.messages)
         for (const event of providerOutcome.eventsAfterMessages) yield event
