@@ -8,6 +8,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const packageJson = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
 
 const dependencyOwnership = {
+  '@vscode/ripgrep': 'runtime',
   '@fastify/websocket': 'runtime',
   fastify: 'runtime',
   minimatch: 'runtime',
@@ -25,7 +26,10 @@ const cliOnlyDependencies = new Set(
     .filter(([, owner]) => owner === 'cli')
     .map(([name]) => name),
 )
-const directDependencies = Object.keys(packageJson.dependencies ?? {})
+const directDependencies = [
+  ...Object.keys(packageJson.dependencies ?? {}),
+  ...Object.keys(packageJson.optionalDependencies ?? {}),
+]
 const directDependencySet = new Set(directDependencies)
 const devDependencies = new Set(Object.keys(packageJson.devDependencies ?? {}))
 const missingOwnership = directDependencies.filter(name => dependencyOwnership[name] === undefined)

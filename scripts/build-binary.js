@@ -17,6 +17,7 @@ import { pipeline } from 'node:stream/promises'
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const root = join(__dirname, '..')
 const distDir = join(root, 'dist')
+const MIN_BUILD_SEA_MAJOR = 26
 
 function runCommand(command, args) {
   console.log(`Running: ${command} ${args.join(' ')}`)
@@ -79,6 +80,31 @@ async function getFallbackVersion(version) {
   return null
 }
 
+async function getLatestVersionForMajor(major) {
+  try {
+    console.log(`Querying Node.js release index for latest v${major}.x SEA builder...`)
+    const res = await fetch('https://nodejs.org/dist/index.json')
+    if (!res.ok) {
+      console.warn(`Failed to fetch Node.js release index: ${res.status}`)
+      return null
+    }
+
+    const list = await res.json()
+    const match = list.find(item => item.version.startsWith(`v${major}.`))
+    if (match) {
+      console.log(`Found latest v${major}.x SEA builder version: ${match.version}`)
+      return match.version
+    }
+  } catch (err) {
+    console.warn(`Failed to resolve latest Node.js v${major}.x version: ${err.message}`)
+  }
+  return `v${major}.0.0`
+}
+
+function nodeMajor(version) {
+  return Number(version.replace(/^v/, '').split('.')[0])
+}
+
 async function downloadOfficialNode(version, platform, arch, versionDir) {
   const isWin = platform === 'win32'
   const ext = isWin ? '' : (platform === 'darwin' ? '.tar.gz' : '.tar.xz')
@@ -120,17 +146,25 @@ async function downloadOfficialNode(version, platform, arch, versionDir) {
 
 async function ensureSeaBaseBinary() {
   const currentBin = process.execPath
+  const currentMajor = nodeMajor(process.version)
 
   // 1. Check if the current node binary contains the sentinel
-  if (hasSentinel(currentBin)) {
+  if (currentMajor >= MIN_BUILD_SEA_MAJOR && hasSentinel(currentBin)) {
     console.log('Current Node.js binary contains the sentinel. Using it directly.')
     return currentBin
   }
 
-  console.log('\n--- Alert: Current Node.js binary is stripped / optimized (common with Homebrew) ---')
-  console.log('A standard official Node.js binary is required to build the Single Executable Application.')
+  if (currentMajor < MIN_BUILD_SEA_MAJOR) {
+    console.log(`\n--- Alert: Node.js ${process.version} does not support native --build-sea ---`)
+    console.log(`An official Node.js ${MIN_BUILD_SEA_MAJOR}.x binary will be downloaded and cached for the SEA build step.`)
+  } else {
+    console.log('\n--- Alert: Current Node.js binary is stripped / optimized (common with Homebrew) ---')
+    console.log('A standard official Node.js binary is required to build the Single Executable Application.')
+  }
 
-  const version = process.version
+  const version = currentMajor < MIN_BUILD_SEA_MAJOR
+    ? await getLatestVersionForMajor(MIN_BUILD_SEA_MAJOR)
+    : process.version
   const platform = process.platform
   const arch = process.arch
 

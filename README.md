@@ -128,6 +128,8 @@ npm run build
 npm run start # Start the Nexus background daemon
 
 # Option B: Compile into a native standalone binary
+# If the current Node.js runtime lacks native --build-sea support, the build script
+# downloads and caches an official Node.js 26.x builder automatically.
 npm run build:binary
 ```
 

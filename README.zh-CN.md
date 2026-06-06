@@ -130,6 +130,7 @@ npm run build
 npm run start # 启动后台守护 Nexus 服务
 
 # 选项 B：编译为单文件原生二进制包
+# 如果当前 Node.js 运行时不支持原生 --build-sea，构建脚本会自动下载并缓存官方 Node.js 26.x builder。
 npm run build:binary
 ```
 
