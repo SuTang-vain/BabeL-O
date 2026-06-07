@@ -14,6 +14,7 @@ import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
 import { NexusMetrics, round } from './metrics.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
+import { BABEL_O_VERSION } from '../shared/version.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager } from '../shared/config.js'
 import { getModel, UnknownModelError } from '../providers/registry.js'
@@ -307,7 +308,7 @@ export async function createNexusApp(
 
   app.get('/health', async () => ({
     status: 'ok',
-    version: '0.2.8',
+    version: BABEL_O_VERSION,
     runtime: 'babel-o',
     timestamp: nowIso(),
   }))
@@ -316,7 +317,7 @@ export async function createNexusApp(
     type: 'runtime_status',
     health: {
       status: 'ok',
-      version: '0.2.8',
+      version: BABEL_O_VERSION,
     },
     provider: ConfigManager.getInstance().getProviderDiagnostics(),
     providerSmoke: runProviderSmokeDryRun(),

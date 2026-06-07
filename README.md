@@ -176,7 +176,7 @@ bbl config show           # Display configuration settings
 | `/exit` | Exits the chat session |
 | `/model <id>` | Dynamically switches the active LLM model |
 | `/status` | Details the active session configuration and health |
-| `y` / `n` | Approves or denies a pending permission request |
+| Permission picker | Selects allow/deny scope for a pending permission request |
 
 ---
 
@@ -189,7 +189,7 @@ Example configuration:
 ```json
 {
   "providerId": "anthropic",
-  "modelId": "claude-3-5-sonnet-20241022",
+  "modelId": "anthropic/claude-3-5-sonnet",
   "apiKey": "sk-ant-...",
   "baseUrl": "https://api.anthropic.com"
 }
@@ -198,7 +198,12 @@ Example configuration:
 ### Supported Providers
 
 - `anthropic` (supports native prompt caching and reasoning thinking streams)
-- `openai` (compatible with standard OpenAI and local models, e.g., Ollama/DeepSeek)
+- `openai` (standard OpenAI-compatible chat/completions)
+- `deepseek` (OpenAI-compatible DeepSeek models)
+- `moonshot` (OpenAI-compatible Moonshot/Kimi models)
+- `ollama` (local OpenAI-compatible endpoint, no API key by default)
+- `zhipu` (Anthropic-compatible GLM endpoint)
+- `minimax` (Anthropic-compatible endpoint with MiniMax text-encoded tool-call normalization)
 - `local` (mock adapter used for tests and benchmarks)
 
 ---

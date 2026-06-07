@@ -8,6 +8,8 @@ dist/
 coverage/
 .babel-o/tool-results/
 .babel-o/benchmarks/
+.babel-o/worktrees/
+.babel-o/test-*/
 
 # Local planning / technical-detail docs are intentionally not published.
 docs/

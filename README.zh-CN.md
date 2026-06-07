@@ -178,7 +178,7 @@ bbl config show           # 展示当前配置项
 | `/exit` | 退出当前会话 |
 | `/model <id>` | 动态切换当前会话所用的 LLM 模型 |
 | `/status` | 展示当前服务端配置、授权状态与健康度 |
-| `y` / `n` | 批准或拒绝当前的敏感工具权限请求 |
+| 权限选择面板 | 为当前敏感工具权限请求选择批准/拒绝范围 |
 
 ---
 
@@ -191,7 +191,7 @@ BabeL-O 在本地的 `~/.babel-o/config.json` 下维护其配置。
 ```json
 {
   "providerId": "anthropic",
-  "modelId": "claude-3-5-sonnet-20241022",
+  "modelId": "anthropic/claude-3-5-sonnet",
   "apiKey": "sk-ant-...",
   "baseUrl": "https://api.anthropic.com"
 }
@@ -200,7 +200,12 @@ BabeL-O 在本地的 `~/.babel-o/config.json` 下维护其配置。
 ### 兼容的模型供应商
 
 - `anthropic`（支持前缀缓存与原生推理思考块展示）
-- `openai`（兼容标准 OpenAI 格式，支持 Ollama/DeepSeek 等本地或第三方端点）
+- `openai`（标准 OpenAI-compatible chat/completions）
+- `deepseek`（OpenAI-compatible DeepSeek 模型）
+- `moonshot`（OpenAI-compatible Moonshot/Kimi 模型）
+- `ollama`（本地 OpenAI-compatible 端点，默认无需 API key）
+- `zhipu`（Anthropic-compatible GLM 端点）
+- `minimax`（Anthropic-compatible 端点，包含 MiniMax 文本编码 tool-call 归一化）
 - `local`（本地 Mock 适配器，用于单元测试和基准压测）
 
 ---

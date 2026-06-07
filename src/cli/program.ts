@@ -1,6 +1,7 @@
 import { Command } from 'commander'
 import * as fs from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { BABEL_O_VERSION } from '../shared/version.js'
 import { flushStartupTrace, markStartup } from './startupTrace.js'
 
 import { registerRunCommand } from './commands/run.js'
@@ -20,7 +21,7 @@ const program = new Command()
 program
   .name('bbl')
   .description('BabeL-O: Nexus-first coding agent CLI')
-  .version('0.2.8')
+  .version(BABEL_O_VERSION)
 
 // Register modular commands
 registerRunCommand(program)

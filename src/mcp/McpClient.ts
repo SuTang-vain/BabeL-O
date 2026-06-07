@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { BABEL_O_VERSION } from '../shared/version.js'
 
 export type McpToolDefinition = {
   name: string
@@ -69,7 +70,7 @@ export class McpClient {
       capabilities: {},
       clientInfo: {
         name: 'BabeL-O',
-        version: '0.2.8',
+        version: BABEL_O_VERSION,
       },
     })
     this.notify('notifications/initialized', {})
