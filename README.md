@@ -94,14 +94,14 @@ bbl chat
 To install a specific release, pass `BBL_VERSION` to the installer process:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.0 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.1 bash
 ```
 
 The installer downloads to a temporary file, retries failed downloads, validates the release asset size when GitHub provides it, and refuses to install non-binary HTTP error bodies.
 
 ### Method 2: Pre-compiled Native Binary
 
-Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.0.md) for version-specific download links.
+Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.1.md) for version-specific download links.
 
 Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
 ```bash

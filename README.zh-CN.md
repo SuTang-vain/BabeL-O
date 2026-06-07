@@ -96,14 +96,14 @@ bbl chat
 如需安装指定版本，可给安装进程传入 `BBL_VERSION`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.0 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.1 bash
 ```
 
 安装脚本会先下载到临时文件，失败下载会重试；当 GitHub 返回文件大小时会校验实际下载大小，并拒绝把非二进制的 HTTP 错误响应安装成 `bbl`。
 
 ### 方法二：下载预编译原生二进制包
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.0.md) 中的对应下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.1.md) 中的对应下载链接。
 
 将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
 ```bash
