@@ -231,7 +231,7 @@ async function main() {
     '--platform=node',
     '--target=node22',
     '--format=esm',
-    '--banner:js="import { createRequire } from \'node:module\'; const require = createRequire(import.meta.url);"',
+    '--banner:js="import { createRequire as babelOCreateRequire } from \'node:module\'; const require = babelOCreateRequire(import.meta.url);"',
     `--outfile=${bundleFile}`,
   ])
 
