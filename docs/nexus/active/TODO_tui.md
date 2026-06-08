@@ -65,6 +65,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 真实 PTY smoke 已覆盖 seeded local SessionChannel inbox：boxed input footer unread indicator、`/inbox` overlay 打开、ack selected message、quote into prompt 且不自动提交、主对话关键事件卡片、overlay 对 slash palette 的焦点互斥、resize/navigation 后 overlay 稳定以及关闭后主输入框恢复。当前 TUI 仍是消费侧入口：`/inbox` / `/inbox all` / `/inbox ack <messageId>` 用于处理 inbox；发起跨 session message 仍通过 Nexus API 或 AgentScheduler parent-child channel，不新增 raw transcript sharing 或直接跨 session 指令 UI。
 
+### P2 / Watch SessionChannel 关系可见化后续规划
+
+详细设计见 [SessionChannel TUI Relationship Visibility Plan](../reference/session-channel-tui-relationship-visibility-plan.md)。推荐分层组合：状态栏长期显示 connection / unread / high-priority 摘要，session 列表用 badge / marker 提供扫描能力，`/sessions tree` / `/agents tree` 表达 parent-child 派生链，`/activity` overlay 审阅近期跨 session 事件，`/channels graph` 只作为 debug-only 概览。Full message handling 仍以 `/inbox` 为主；inline preview 只允许摘要，不展示完整正文或自动注入 prompt。
+
+后续若重新打开实现项，按 Phase 1 状态栏增强 + session list badge、Phase 2 tree view、Phase 3 activity overlay、Phase 4 debug graph 的顺序推进。发起侧 UX 另行以 `/inbox` reply 和 `/channel send <sessionId|channelId>` 评估，但必须具备 typed message、evidence、confirmation preview 与手动提交边界。
+
 ### 持续语义边界
 
 - 不实现 raw transcript sharing UI。
@@ -72,7 +78,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - 不允许一个 session 通过 TUI 操作静默改变另一个 session 的 cwd、provider、profile、permission 或执行状态。
 - `memory_candidate` 只展示 review-only governance metadata 与 approval requirement；不提供默认自动写入长期记忆按钮。若未来加入写入入口，必须先走独立 approval / permission 规划。
 
-当前 P2 Advanced CLI/TUI 的唯一打开项为 SessionChannel Inbox overlay 真实 PTY smoke 补强；其他交互能力后续只在真实显示回归、PTY smoke drift 或新增交互状态时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
+当前 P2 Advanced CLI/TUI 无打开实现项；SessionChannel 关系可见化已进入 P2 / Watch 参考规划，后续只在真实显示回归、PTY smoke drift、dashboard/agent UX 需要、关系可见化实现启动或发起侧 UX 明确时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
 
 ## 验证命令
 
