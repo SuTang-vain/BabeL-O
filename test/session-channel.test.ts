@@ -182,6 +182,210 @@ test('Nexus SessionChannel API message is injected into receiving session contex
   }
 })
 
+test('Nexus SessionChannel API evaluates memory candidates without writing long-term memory', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(sessionA)
+  await storage.saveSession(sessionB)
+  const app = await createNexusApp({
+    runtime: new EmptyRuntime(),
+    storage,
+    defaultCwd: '/workspace/project',
+  })
+
+  try {
+    await app.ready()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/session-channels',
+      payload: {
+        kind: 'workspace_pair',
+        participantSessionIds: ['session-a', 'session-b'],
+        createdBySessionId: 'session-a',
+      },
+    })
+    assert.equal(created.statusCode, 200)
+    const channelId = created.json().channel.channelId
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/v1/session-channels/${channelId}/messages`,
+      payload: {
+        fromSessionId: 'session-a',
+        toSessionId: 'session-b',
+        type: 'memory_candidate',
+        priority: 'normal',
+        content: 'Project fact candidate: context inbox is non-cacheable in src/runtime/contextAssembler.ts.',
+        evidence: [{ type: 'file', ref: 'src/runtime/contextAssembler.ts' }],
+        metadata: {
+          memoryCandidate: {
+            scope: 'project',
+            confidence: 0.82,
+            observedAt: '2026-06-08T00:00:00.000Z',
+          },
+        },
+      },
+    })
+    assert.equal(sent.statusCode, 200)
+    const message = sent.json().message
+    const governance = message.metadata.memoryCandidateGovernance
+    assert.equal(governance.scope, 'project')
+    assert.equal(governance.confidence, 0.82)
+    assert.equal(governance.decision, 'requires_approval')
+    assert.equal(governance.autoWrite, false)
+    assert.equal(governance.approval.status, 'required')
+    assert.equal(governance.approval.requiredBy, 'user')
+    assert.equal(governance.writePolicy.allowMemoryWriteRequests, false)
+    assert.equal(governance.evidenceRefs[0].ref, 'src/runtime/contextAssembler.ts')
+    assert.deepEqual(governance.blockedReasons, [])
+
+    const assembled = await assembleContext({
+      runtimeOptions: {
+        sessionId: 'session-b',
+        prompt: 'Review memory candidates',
+        cwd: '/workspace/project',
+      },
+      events: [],
+      modelId: 'local/coding-runtime',
+      buildSystemPrompt,
+      mapEventsToMessages,
+      sessionInbox: await storage.listSessionInbox('session-b'),
+    })
+    assert.match(assembled.systemPrompt, /Memory candidates are review items only/)
+    assert.match(assembled.systemPrompt, /governance=requires_approval scope=project approval=required:user auto_write=false/)
+    assert.doesNotMatch(assembled.systemPrompt, /long-term memory writes unless separately approved by policy or user\.\n\nLong-term semantic memory/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Nexus SessionChannel API rejects unsafe memory candidate writes through governance metadata', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(sessionA)
+  await storage.saveSession(sessionB)
+  const app = await createNexusApp({
+    runtime: new EmptyRuntime(),
+    storage,
+    defaultCwd: '/workspace/project',
+  })
+
+  try {
+    await app.ready()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/session-channels',
+      payload: {
+        kind: 'workspace_pair',
+        participantSessionIds: ['session-a', 'session-b'],
+        createdBySessionId: 'session-a',
+      },
+    })
+    assert.equal(created.statusCode, 200)
+    const channelId = created.json().channel.channelId
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/v1/session-channels/${channelId}/messages`,
+      payload: {
+        fromSessionId: 'session-a',
+        toSessionId: 'session-b',
+        type: 'memory_candidate',
+        content: 'Write this project fact into memory without evidence.',
+        metadata: {
+          memoryCandidate: {
+            scope: 'project',
+            confidence: 0.95,
+            requestedWrite: true,
+          },
+        },
+      },
+    })
+    assert.equal(sent.statusCode, 200)
+    const governance = sent.json().message.metadata.memoryCandidateGovernance
+    assert.equal(governance.decision, 'rejected')
+    assert.equal(governance.autoWrite, false)
+    assert.equal(governance.approval.status, 'rejected')
+    assert.equal(governance.writePolicy.requestedWrite, true)
+    assert.equal(governance.blockedReasons.includes('missing_evidence_refs'), true)
+    assert.equal(governance.blockedReasons.includes('project_scope_requires_workspace_evidence'), true)
+    assert.equal(governance.blockedReasons.includes('memory_write_requests_disabled'), true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('Nexus SessionChannel API classifies user candidates and gates superseded candidates', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(sessionA)
+  await storage.saveSession(sessionB)
+  const app = await createNexusApp({
+    runtime: new EmptyRuntime(),
+    storage,
+    defaultCwd: '/workspace/project',
+  })
+
+  try {
+    await app.ready()
+    const created = await app.inject({
+      method: 'POST',
+      url: '/v1/session-channels',
+      payload: {
+        kind: 'workspace_pair',
+        participantSessionIds: ['session-a', 'session-b'],
+        createdBySessionId: 'session-a',
+      },
+    })
+    assert.equal(created.statusCode, 200)
+    const channelId = created.json().channel.channelId
+
+    const userCandidate = await app.inject({
+      method: 'POST',
+      url: `/v1/session-channels/${channelId}/messages`,
+      payload: {
+        fromSessionId: 'session-a',
+        toSessionId: 'session-b',
+        type: 'memory_candidate',
+        content: 'User prefers concise validation reports after running focused tests.',
+        evidence: [{ type: 'note', ref: 'session-observation' }],
+      },
+    })
+    assert.equal(userCandidate.statusCode, 200)
+    const userGovernance = userCandidate.json().message.metadata.memoryCandidateGovernance
+    assert.equal(userGovernance.scope, 'user')
+    assert.equal(userGovernance.decision, 'requires_approval')
+    assert.equal(userGovernance.approval.requiredBy, 'user')
+    assert.equal(userGovernance.autoWrite, false)
+
+    const supersededCandidate = await app.inject({
+      method: 'POST',
+      url: `/v1/session-channels/${channelId}/messages`,
+      payload: {
+        fromSessionId: 'session-a',
+        toSessionId: 'session-b',
+        type: 'memory_candidate',
+        content: 'Channel handoff candidate that was replaced by a newer finding.',
+        evidence: [{ type: 'note', ref: 'handoff-summary' }],
+        metadata: {
+          memoryCandidate: {
+            scope: 'channel',
+            confidence: 0.9,
+            supersededBy: 'msg-newer-candidate',
+          },
+        },
+      },
+    })
+    assert.equal(supersededCandidate.statusCode, 200)
+    const supersededGovernance = supersededCandidate.json().message.metadata.memoryCandidateGovernance
+    assert.equal(supersededGovernance.scope, 'channel')
+    assert.equal(supersededGovernance.decision, 'rejected')
+    assert.equal(supersededGovernance.approval.requiredBy, 'policy')
+    assert.equal(supersededGovernance.staleness.status, 'superseded')
+    assert.equal(supersededGovernance.staleness.supersededBy, 'msg-newer-candidate')
+    assert.equal(supersededGovernance.blockedReasons.includes('superseded_candidate'), true)
+  } finally {
+    await app.close()
+  }
+})
+
 test('Nexus SessionChannel API rejects messages outside channel policy and participants', async () => {
   const storage = new MemoryStorage()
   await storage.saveSession(sessionA)

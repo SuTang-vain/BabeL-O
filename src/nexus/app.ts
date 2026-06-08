@@ -13,6 +13,7 @@ import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchem
 import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
 import { DEFAULT_SESSION_CHANNEL_POLICY, type SessionChannel, type SessionChannelPolicy, type SessionMessage } from '../shared/sessionChannel.js'
+import { evaluateSessionMemoryCandidate } from '../runtime/memoryCandidateGovernance.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
@@ -851,7 +852,8 @@ export async function createNexusApp(
     if (!channel) return reply.code(404).send(createSessionChannelNotFoundPayload(params.channelId))
     const channelError = validateSessionChannelMessage(channel, body)
     if (channelError) return reply.code(400).send(channelError)
-    const message: SessionMessage = {
+    const createdAt = nowIso()
+    const message: SessionMessage = withMemoryCandidateGovernance(channel, {
       messageId: createId('msg'),
       channelId: params.channelId,
       fromSessionId: body.fromSessionId,
@@ -861,11 +863,11 @@ export async function createNexusApp(
       content: body.content,
       evidence: body.evidence,
       priority: body.priority ?? 'normal',
-      createdAt: nowIso(),
-      deliveredAt: nowIso(),
+      createdAt,
+      deliveredAt: createdAt,
       status: 'delivered',
       metadata: body.metadata,
-    }
+    })
     await options.storage.saveSessionMessage(message)
     return {
       type: 'session_message_created',
@@ -1842,6 +1844,18 @@ function mergeSessionChannelPolicy(policy: Partial<SessionChannelPolicy> | undef
   }
 }
 
+function withMemoryCandidateGovernance(channel: SessionChannel, message: SessionMessage): SessionMessage {
+  if (message.type !== 'memory_candidate') return message
+  const governance = evaluateSessionMemoryCandidate({ channel, message })
+  return {
+    ...message,
+    metadata: {
+      ...(message.metadata ?? {}),
+      memoryCandidateGovernance: governance,
+    },
+  }
+}
+
 function validateSessionChannelMessage(
   channel: SessionChannel,
   body: z.infer<typeof createSessionMessageSchema>,
@@ -1894,13 +1908,6 @@ function validateSessionChannelMessage(
       type: 'error',
       code: 'INVALID_SESSION_MESSAGE',
       message: `Message type is not allowed for this channel: ${body.type}`,
-    }
-  }
-  if (body.type === 'memory_candidate' && !channel.policy.allowMemoryWriteRequests) {
-    return {
-      type: 'error',
-      code: 'INVALID_SESSION_MESSAGE',
-      message: 'Memory candidate messages are disabled for this channel',
     }
   }
   if (body.content.length > channel.policy.maxMessageChars) {

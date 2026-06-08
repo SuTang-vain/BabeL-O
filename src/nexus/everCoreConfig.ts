@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { basename, dirname, resolve } from 'node:path'
+import { getProvider } from '../providers/registry.js'
+import type { ResolvedSettings } from '../shared/config.js'
 import { errorMessage } from '../shared/errors.js'
 import {
   HttpEverCoreClient,
@@ -41,6 +43,10 @@ export type EverCoreConfigInput = {
   managedDataDir?: string
   managedStartupTimeoutMs?: number
   managedHealthIntervalMs?: number
+  managedLlmApiKey?: string
+  managedLlmBaseUrl?: string
+  managedLlmModel?: string
+  providerSettings?: ResolvedSettings
   managedSpawn?: EverCoreSidecarOptions['spawn']
   managedPortAllocator?: EverCoreSidecarOptions['portAllocator']
   fetch?: typeof fetch
@@ -96,7 +102,7 @@ export type ConfiguredEverCore = {
 
 export async function configureEverCoreFromEnv(
   env: NodeJS.ProcessEnv = process.env,
-  options: { cwd?: string } = {},
+  options: { cwd?: string; providerSettings?: ResolvedSettings } = {},
 ): Promise<ConfiguredEverCore> {
   return configureEverCore({
     mode: parseEverCoreMode(env.BABEL_O_EVERCORE_MODE),
@@ -122,6 +128,10 @@ export async function configureEverCoreFromEnv(
     managedPort: parsePositiveInt(env.BABEL_O_EVERCORE_MANAGED_PORT),
     managedDataDir: env.BABEL_O_EVERCORE_DATA_DIR,
     managedStartupTimeoutMs: parsePositiveInt(env.BABEL_O_EVERCORE_MANAGED_STARTUP_TIMEOUT_MS),
+    managedLlmApiKey: env.BABEL_O_EVERCORE_LLM_API_KEY,
+    managedLlmBaseUrl: env.BABEL_O_EVERCORE_LLM_BASE_URL,
+    managedLlmModel: env.BABEL_O_EVERCORE_LLM_MODEL,
+    providerSettings: options.providerSettings,
   })
 }
 
@@ -160,6 +170,7 @@ export async function configureEverCore(
       dataDir: input.managedDataDir,
       startupTimeoutMs: input.managedStartupTimeoutMs,
       healthIntervalMs: input.managedHealthIntervalMs,
+      llm: resolveManagedEverCoreLlmConfig(input),
       fetch: input.fetch,
       spawn: input.managedSpawn,
       portAllocator: input.managedPortAllocator,
@@ -259,6 +270,34 @@ function createEverCoreMemoryProvider(client: EverCoreClient, config: EverCoreRu
     topK: config.topK,
     maxContentChars: config.maxContentChars,
   })
+}
+
+function resolveManagedEverCoreLlmConfig(input: EverCoreConfigInput): EverCoreSidecarOptions['llm'] | undefined {
+  const explicit = {
+    apiKey: input.managedLlmApiKey?.trim(),
+    baseUrl: input.managedLlmBaseUrl?.trim(),
+    model: input.managedLlmModel?.trim(),
+  }
+  if (explicit.apiKey || explicit.baseUrl || explicit.model) return explicit
+
+  const settings = input.providerSettings
+  if (!settings) return undefined
+  try {
+    const provider = getProvider(settings.providerId)
+    if (provider.adapter !== 'openai-compatible' && provider.adapter !== 'openai-responses') return undefined
+  } catch {
+    return undefined
+  }
+  return {
+    apiKey: settings.apiKey,
+    baseUrl: settings.baseUrl,
+    model: stripProviderPrefix(settings.modelId),
+  }
+}
+
+function stripProviderPrefix(modelId: string): string {
+  const slashIndex = modelId.indexOf('/')
+  return slashIndex === -1 ? modelId : modelId.slice(slashIndex + 1)
 }
 
 function createEverCoreRuntimeConfig(input: EverCoreConfigInput): EverCoreRuntimeConfig {

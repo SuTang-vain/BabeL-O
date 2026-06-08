@@ -8,6 +8,12 @@ import { errorMessage } from '../shared/errors.js'
 
 export type EverCoreSidecarMode = 'disabled' | 'external' | 'managed'
 
+export type EverCoreManagedLlmConfig = {
+  apiKey?: string
+  baseUrl?: string
+  model?: string
+}
+
 export type EverCoreSidecarOptions = {
   mode?: EverCoreSidecarMode
   command?: string
@@ -17,6 +23,7 @@ export type EverCoreSidecarOptions = {
   dataDir?: string
   startupTimeoutMs?: number
   healthIntervalMs?: number
+  llm?: EverCoreManagedLlmConfig
   fetch?: typeof fetch
   spawn?: EverCoreSpawn
   portAllocator?: EverCorePortAllocator
@@ -113,6 +120,7 @@ export async function startManagedEverCoreSidecar(
     child = spawnImpl(command, args, {
       env: {
         ...process.env,
+        ...buildEverCoreLlmEnv(options.llm),
         EVEROS_MEMORY__ROOT: dataDir,
         EVEROS_API__HOST: host,
         EVEROS_API__PORT: String(port),
@@ -250,6 +258,17 @@ async function allocateLocalPort(host: string): Promise<number> {
 
 function stopEverCoreProcess(child: EverCoreProcess): void {
   if (!child.killed) child.kill('SIGTERM')
+}
+
+function buildEverCoreLlmEnv(llm: EverCoreManagedLlmConfig | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  const apiKey = llm?.apiKey?.trim()
+  const baseUrl = llm?.baseUrl?.trim()
+  const model = llm?.model?.trim()
+  if (apiKey) env.EVEROS_LLM__API_KEY = apiKey
+  if (baseUrl) env.EVEROS_LLM__BASE_URL = baseUrl
+  if (model) env.EVEROS_LLM__MODEL = model
+  return env
 }
 
 function isLocalHost(host: string): boolean {

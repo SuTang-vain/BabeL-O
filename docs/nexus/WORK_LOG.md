@@ -2,6 +2,21 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-08 — Session Channel Phase E governed memory candidate MVP
+
+- **用户请求**: 推进 Session Channel + Scoped Memory Phase E。
+- **实现**:
+  - 新增 `memoryCandidateGovernance` 最小治理模型：`memory_candidate` SessionMessage 在 API 创建时会被评估为 review-only candidate，写入 message metadata，不触发 EverCore 或长期记忆写入。
+  - governance metadata 覆盖 scope classifier、evidence refs、confidence、staleness/supersession、approval requirement、blocked reasons、review reasons、write policy 与 `autoWrite=false`。
+  - `allowMemoryWriteRequests=false` 不再禁止候选消息传输，而是禁止候选请求直接写入；缺少 evidence、project scope 缺 workspace evidence、low confidence、stale/superseded、requested write disabled 等都会进入 rejected governance metadata。
+  - inbox context 会展示 `governance=<decision> scope=<scope> approval=<status>:<target> auto_write=false`，并明确 memory candidates 只是 review items，不是长期记忆写入。
+  - 本切片仍不实现完整 background dreaming、不做 raw transcript sharing、不把跨 session 消息当直接用户指令、不自动写入高影响项目事实。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-test-config.json npx tsx --test test/session-channel.test.ts test/context-assembler.test.ts`：61/61 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
 ## 2026-06-08 — Session Channel scoped diagnostics 与可行性回归
 
 - **用户请求**: 继续推进 Session Channel + Scoped Memory 的 Phase D user/channel scoped，并尝试测试 session-to-session 是否真实可行。

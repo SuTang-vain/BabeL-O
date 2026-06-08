@@ -2245,6 +2245,15 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
     },
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    providerSettings: {
+      providerId: 'openai',
+      modelId: 'openai/gpt-4o',
+      apiKey: 'openai-key',
+      baseUrl: 'https://api.openai.example/v1',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'env',
+    },
     managedSpawn(command, args, options) {
       spawnCalls.push({ command, args, env: options.env })
       return {
@@ -2279,9 +2288,89 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(spawnCalls[0]?.env.EVEROS_MEMORY__ROOT, dataDir)
   assert.equal(spawnCalls[0]?.env.EVEROS_API__HOST, '127.0.0.1')
   assert.equal(spawnCalls[0]?.env.EVEROS_API__PORT, '9876')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'openai-key')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.openai.example/v1')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'gpt-4o')
 
   await configured.dispose?.()
   assert.equal(killed, true)
+})
+
+test('EverCore managed mode does not auto-map Anthropic-compatible provider settings', async () => {
+  const spawnCalls: Array<{ env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedPort: 9877,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    providerSettings: {
+      providerId: 'minimax',
+      modelId: 'minimax/MiniMax-M3',
+      apiKey: 'minimax-key',
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'provider_default',
+    },
+    managedSpawn(_command, _args, options) {
+      spawnCalls.push({ env: options.env })
+      return {
+        pid: 12346,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+
+  assert.ok(configured.client)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, undefined)
+  await configured.dispose?.()
+})
+
+test('EverCore managed mode uses explicit LLM override for sidecar env', async () => {
+  const spawnCalls: Array<{ env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedPort: 9878,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedLlmApiKey: 'evercore-key',
+    managedLlmBaseUrl: 'https://openai-compatible.example/v1',
+    managedLlmModel: 'memory-model',
+    providerSettings: {
+      providerId: 'minimax',
+      modelId: 'minimax/MiniMax-M3',
+      apiKey: 'minimax-key',
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'provider_default',
+    },
+    managedSpawn(_command, _args, options) {
+      spawnCalls.push({ env: options.env })
+      return {
+        pid: 12347,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+
+  assert.ok(configured.client)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'evercore-key')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://openai-compatible.example/v1')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'memory-model')
+  await configured.dispose?.()
 })
 
 test('EverCore managed mode rejects non-loopback hosts without starting sidecar', async () => {

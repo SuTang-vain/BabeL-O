@@ -1,5 +1,6 @@
 import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
+import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
 import { configureEverCoreFromEnv } from './everCoreConfig.js'
 import {
@@ -49,7 +50,8 @@ try {
   logger.error('Nexus server failed remote runner validation', err)
   process.exit(1)
 }
-const everCore = await configureEverCoreFromEnv(process.env, { cwd })
+const providerSettings = ConfigManager.getInstance().resolveSettings()
+const everCore = await configureEverCoreFromEnv(process.env, { cwd, providerSettings })
 const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,

@@ -161,7 +161,9 @@ export async function runSessionFlow(
     const remoteRunner = await configureRemoteRunnerFromEnv()
     assertRemoteRunnerReady(remoteRunner.status)
     assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
-    const everCore = await configureEverCoreFromEnv(process.env, { cwd })
+    const configManager = ConfigManager.getInstance()
+    const providerSettings = configManager.resolveSettings()
+    const everCore = await configureEverCoreFromEnv(process.env, { cwd, providerSettings })
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath,
       allowedTools: ['*'],
@@ -227,7 +229,6 @@ export async function runSessionFlow(
 
     const requestId = createId('req')
     const currentTurnEvents: NexusEvent[] = []
-    const configManager = ConfigManager.getInstance()
     const userPromptHooks = await executeRuntimeHooks(
       'UserPromptSubmit',
       { prompt },
@@ -239,7 +240,7 @@ export async function runSessionFlow(
     }
 
     try {
-      const settings = configManager.resolveSettings()
+      const settings = providerSettings
       const budget = process.env.BABEL_O_THINKING_BUDGET
         ? parseInt(process.env.BABEL_O_THINKING_BUDGET, 10)
         : undefined

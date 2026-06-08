@@ -1,5 +1,6 @@
 import { createNexusApp } from '../nexus/app.js'
 import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
+import { ConfigManager } from '../shared/config.js'
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import {
   assertAgentRemoteExecutionReady,
@@ -162,7 +163,11 @@ export class EmbeddedNexusClient {
     const remoteRunner = await configureRemoteRunnerFromEnv()
     assertRemoteRunnerReady(remoteRunner.status)
     assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
-    const everCore = await configureEverCoreFromEnv(process.env, { cwd: this.options.cwd })
+    const providerSettings = ConfigManager.getInstance().resolveSettings()
+    const everCore = await configureEverCoreFromEnv(process.env, {
+      cwd: this.options.cwd,
+      providerSettings,
+    })
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath: this.options.storagePath,
       allowedTools: this.options.allowedTools,

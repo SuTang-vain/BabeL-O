@@ -201,7 +201,7 @@ Phase C.2 AgentScheduler parent-child channel 已收口：`ExploreAgentScheduler
 
 Phase D scoped MemoryProvider / channel diagnostics 已收口：Layer 2 Project memory 不按 sessionId 隔离，继续按 project/workspace identity 隔离；`projectId=default` runtime status 诊断、opt-in `BABEL_O_EVERCORE_PROJECT_ID_MODE=workspace` cwd/git-root 派生 namespace、EverCore project-scoped MemoryProvider diagnostics、user-scoped MemoryProvider diagnostics 表达与 channel-scoped inbox budget diagnostics 均已落地。`/v1/sessions/:sessionId/context`、CLI `/context` 与 context view 会展示 `scopedMemory[]` 分项；SessionChannel API→Inbox→Context focused regression 已验证两个 session 可以真实传输 typed message，并在 ack 后不再注入 receiving context。仍保持 volatile / non-authoritative hints 口径，不做 raw transcript sharing、不把跨 session message 当成直接指令、不自动写入长期记忆。
 
-- [ ] Phase E: Governed dreaming / auto-memory candidate pipeline 评估；必须先有 scope classifier、evidence refs、staleness/supersession 与用户/策略审批，默认不自动写入高影响项目事实。
+Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最小治理模型：`memory_candidate` SessionMessage 会被评估为 review-only candidate，并在 message metadata 中记录 scope classifier、evidence refs、confidence、staleness/supersession、approval requirement、blocked/review reasons 与 `autoWrite=false`；inbox context 会显式展示候选治理状态。默认不自动写入长期记忆；项目事实需要 workspace evidence 与用户审批，user memory candidate 需要用户审批，channel candidate 只允许进入策略审批的 channel/project summary 路径。完整 background dreaming、自动 EverCore 写入和 high-impact project fact auto-write 仍不启用，后续只在真实使用暴露治理缺口时按 regression-first 开项。
 
 ## 验证命令
 

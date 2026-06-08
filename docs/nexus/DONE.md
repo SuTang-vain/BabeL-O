@@ -40,6 +40,7 @@
 - EverCore projectId namespace 治理已落地：`/v1/runtime/status` 的 EverCore status 暴露 Layer 2 Project memory 使用 `projectId` 隔离且不是 session-scoped；启用 EverCore 但未显式配置 projectId 时输出 `EVERCORE_PROJECT_ID_DEFAULT` guidance；`BABEL_O_EVERCORE_PROJECT_ID_MODE=workspace` 可 opt-in 从 git root 或 cwd 派生稳定 projectId，显式 `BABEL_O_EVERCORE_PROJECT_ID` 仍最高优先级。
 - EverCore project-scoped MemoryProvider diagnostics 已落地：`MemoryProviderDiagnostics` 暴露 scope、namespaceId、namespaceSource 与 isolationKey；EverCore provider 标记 `scope=project` / `isolationKey=projectId`，context analysis、HTTP context API、CLI `/context` 与 context view 均展示 long-term memory namespace/budget 状态。
 - Session Channel scoped memory diagnostics 与可行性回归已落地：context analysis、HTTP context API、CLI `/context` 与 context view 暴露 `scopedMemory[]` 分项，覆盖 project/user/channel scope；SessionChannel API→Inbox→Context focused regression 验证两个 session 可通过 typed message 传输 collaboration context，ack 后不再注入接收方 context。
+- Session Channel Phase E governed memory candidate MVP 已落地：`memory_candidate` message 会生成 review-only governance metadata，覆盖 scope classifier、evidence refs、confidence、staleness/supersession、approval requirement、blocked/review reasons 与 `autoWrite=false`；inbox context 显示候选治理状态，默认不自动写入 EverCore 或长期记忆。
 
 ## Context / Compact / 指令跟随
 
