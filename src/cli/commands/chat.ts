@@ -31,7 +31,7 @@ import { createId } from '../../shared/id.js'
 import { NexusEvent } from '../../shared/events.js'
 import type { NexusTask } from '../../shared/task.js'
 import { runSessionFlow } from '../runSessionFlow.js'
-import { formatSessionAck, formatSessionInbox } from './sessions.js'
+import { formatSessionAck, formatSessionInbox, formatSessionsList, formatSessionsTree, loadSessionRelationshipSummary } from './sessions.js'
 import {
   chooseInteractive,
   promptSecret,
@@ -57,6 +57,10 @@ import { formatToolAudit } from '../toolAuditFormatter.js'
 import { expandAttachmentReferences } from '../attachmentReferences.js'
 import { createVimInputState, reduceVimInputKey } from '../vimMode.js'
 import { formatInboxFooterStatus, openInboxOverlay, renderInboxEventCard, shouldRenderInboxEventCard, type InboxChannelSummary } from '../inboxOverlay.js'
+import { formatActivityFeed, openActivityOverlay, type ActivityItem } from '../activityOverlay.js'
+import { formatChannelGraph } from '../channelGraph.js'
+import { channelSendUsage, createChannelSendDraft, formatChannelSendCreated, formatChannelSendPreview, parseChannelSendCommand, resolveInboxReplyDraftTarget, type ChannelSendDraft } from '../channelSend.js'
+import { openCollaborateOverlay } from '../collaborateOverlay.js'
 import type { SessionMessage } from '../../shared/sessionChannel.js'
 
 interface ReadlineInternal extends readline.Interface {
@@ -96,6 +100,12 @@ export function registerChatCommand(program: Command): void {
 
       const completer = makeCompleter(options.cwd)
 
+      if (!input.isTTY || !output.isTTY) {
+        console.error(chalk.red('Error: bbl chat requires an interactive terminal. Use `bbl run "<prompt>"` for non-interactive prompts.'))
+        process.exitCode = 1
+        return
+      }
+
       const rl = readline.createInterface({
         input,
         output,
@@ -104,6 +114,10 @@ export function registerChatCommand(program: Command): void {
         removeHistoryDuplicates: true,
         escapeCodeTimeout: 50,
       })
+
+      input.resume()
+      // SEA idle readline can otherwise leave no active event-loop handle.
+      const chatKeepAlive = setInterval(() => {}, 60_000)
 
       const rlInt = rl as ReadlineInternal
       rlInt.history = history
@@ -147,6 +161,7 @@ export function registerChatCommand(program: Command): void {
       const pastedTextReplacements = new Map<string, string>()
       let vimInputState = createVimInputState()
       let queuedPromptPrefill = ''
+      let pendingChannelSendDraft: ChannelSendDraft | null = null
 
       const clearPasteTimeout = () => {
         if (pasteTimeout) {
@@ -407,6 +422,90 @@ export function registerChatCommand(program: Command): void {
         return { messages: inbox.messages, channels }
       }
 
+      const loadSessionActivitySnapshot = async (): Promise<ActivityItem[]> => {
+        if (!options.url && !fs.existsSync(localStoragePath)) return []
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        let channels: InboxChannelSummary[] = []
+        try {
+          channels = (await client.listSessionChannels({ sessionId, limit: 100 })).channels
+        } catch {
+          channels = []
+        }
+        const messagesByChannel = await Promise.all(channels.map(async channel => {
+          try {
+            return (await client.listSessionMessages(channel.channelId, { limit: 20, order: 'desc' })).messages.map(message => ({ message, channel }))
+          } catch {
+            return []
+          }
+        }))
+        return messagesByChannel.flat()
+          .sort((left, right) => right.message.createdAt.localeCompare(left.message.createdAt) || right.message.messageId.localeCompare(left.message.messageId))
+          .slice(0, 20)
+      }
+
+      const showSessionActivity = async () => {
+        const items = await loadSessionActivitySnapshot()
+        if (!process.stdin.isTTY) {
+          console.log(formatActivityFeed({ sessionId, items, limit: 20 }))
+          return { type: 'closed' as const }
+        }
+        return openActivityOverlay({ sessionId, items })
+      }
+
+      const showCollaborateOverlay = async () => {
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(chalk.yellow('No local storage found for collaboration view.'))
+          return
+        }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        const [snapshot, channelResponse, agentResponse, sessionResponse] = await Promise.all([
+          loadSessionInboxSnapshot(false),
+          client.listSessionChannels({ sessionId, limit: 100 }).catch(() => ({ channels: [] })),
+          client.listSessionAgents(sessionId).catch(() => ({ jobs: [] })),
+          client.getSession(sessionId, { recentEventLimit: 0 }).catch(() => undefined),
+        ])
+        const phase = (sessionResponse as { session?: { phase?: string } } | undefined)?.session?.phase
+        if (!process.stdin.isTTY) {
+          console.log(`Collaborate from: ${sessionId}${phase ? `:${phase}` : ''}`)
+          console.log(`Inbox: ${snapshot.messages.length} unread`)
+          console.log(`Channels: ${channelResponse.channels.length} active`)
+          console.log(`Agents: ${agentResponse.jobs.length} jobs`)
+          return
+        }
+        const result = await openCollaborateOverlay({
+          sessionId,
+          sessionPhase: phase,
+          inboxUnreadCount: snapshot.messages.length,
+          messages: snapshot.messages,
+          channels: channelResponse.channels,
+          agentCount: agentResponse.jobs.length,
+        })
+        if (result.type === 'channel_message_preview') {
+          const draft = createChannelSendDraft({
+            command: result.command,
+            channelId: result.channel.channelId,
+            fromSessionId: sessionId,
+            toSessionId: result.target.kind === 'session' ? result.target.sessionId : undefined,
+            broadcast: result.target.kind === 'broadcast',
+            type: result.messageType,
+            priority: result.priority,
+            content: result.content,
+            replyToMessageId: result.replyToMessageId,
+          })
+          pendingChannelSendDraft = draft
+          console.log(formatChannelSendPreview(draft, { channel: result.channel, columns: process.stdout.columns ?? 100 }))
+          return
+        }
+        if (result.type !== 'open') return
+        if (result.entry.kind === 'agents') {
+          await showMultiAgentStatus()
+        }
+      }
+
       const markInboxEventCardsSeen = (messages: SessionMessage[]) => {
         for (const message of messages) {
           if (shouldRenderInboxEventCard(message)) renderedInboxEventCardMessageIds.add(message.messageId)
@@ -486,6 +585,75 @@ export function registerChatCommand(program: Command): void {
         }
         console.log(formatSessionAck(await client.ackSessionMessage(sessionId, messageId)))
         await refreshInboxFooterStatus()
+      }
+
+      const previewChannelSendCommand = async (line: string) => {
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(chalk.yellow('No local storage found for channel send.'))
+          return
+        }
+        const parsed = parseChannelSendCommand(line)
+        if (!parsed.ok) {
+          console.log(chalk.yellow(parsed.error))
+          console.log(chalk.dim(parsed.usage))
+          return
+        }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        const channelResponse = await client.listSessionChannels({ sessionId, limit: 100 })
+        const channel = channelResponse.channels.find(candidate => candidate.channelId === parsed.draft.channelId)
+        if (!channel) {
+          console.log(chalk.yellow(`Current session is not a participant in channel: ${parsed.draft.channelId}`))
+          return
+        }
+        let draft = createChannelSendDraft({ ...parsed.draft, fromSessionId: sessionId })
+        if (draft.command === 'inbox_reply' && draft.replyToMessageId) {
+          const replyMessage = (await client.listSessionMessages(draft.channelId, { limit: 100, order: 'desc' })).messages
+            .find(message => message.messageId === draft.replyToMessageId)
+          if (!replyMessage) {
+            console.log(chalk.yellow(`Inbox reply message not found in channel: ${draft.replyToMessageId}`))
+            return
+          }
+          draft = resolveInboxReplyDraftTarget(draft, replyMessage)
+        }
+        pendingChannelSendDraft = draft
+        console.log(formatChannelSendPreview(draft, { channel, columns: process.stdout.columns ?? 100 }))
+      }
+
+      const confirmChannelSendCommand = async () => {
+        if (!pendingChannelSendDraft) {
+          console.log(chalk.yellow('No pending SessionChannel send preview.'))
+          console.log(chalk.dim(channelSendUsage()))
+          return
+        }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(chalk.yellow('No local storage found for channel send.'))
+          return
+        }
+        const draft = pendingChannelSendDraft
+        const created = await client.sendSessionMessage(draft.channelId, {
+          fromSessionId: draft.fromSessionId,
+          toSessionId: draft.toSessionId,
+          broadcast: draft.broadcast,
+          type: draft.type,
+          content: draft.content,
+          priority: draft.priority,
+          metadata: draft.replyToMessageId
+            ? { replyToMessageId: draft.replyToMessageId, source: draft.command }
+            : { source: draft.command },
+        })
+        pendingChannelSendDraft = null
+        console.log(formatChannelSendCreated(created.message, { columns: process.stdout.columns ?? 100 }))
+        await refreshInboxFooterStatus()
+      }
+
+      const cancelChannelSendCommand = () => {
+        pendingChannelSendDraft = null
+        console.log(chalk.dim('Cancelled pending SessionChannel send.'))
       }
 
       const updateSessionHint = () => {
@@ -627,6 +795,7 @@ export function registerChatCommand(program: Command): void {
       }
 
       const cleanupListeners = () => {
+        clearInterval(chatKeepAlive)
         slashPalette.dispose()
         process.stdin.removeListener('keypress', onGlobalKeypress)
         if (process.stdin.isTTY) {
@@ -1009,6 +1178,92 @@ export function registerChatCommand(program: Command): void {
             continue
           }
 
+          if (trimmed === '/collaborate') {
+            try {
+              await showCollaborateOverlay()
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show collaboration view: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/channels graph' || trimmed === '/sessions graph') {
+            try {
+              const client = options.url
+                ? new NexusClient({ baseUrl: options.url })
+                : embeddedClient()
+              const [list, channelResponse] = await Promise.all([
+                client.listSessions({ limit: 200 }),
+                client.listSessionChannels({ limit: 200 }),
+              ])
+              console.log(formatChannelGraph({
+                sessions: (list as { sessions?: any[] }).sessions ?? [],
+                channels: channelResponse.channels,
+                rootSessionId: sessionId,
+              }))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show channel graph: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/sessions tree' || trimmed === '/agents tree') {
+            try {
+              const client = options.url
+                ? new NexusClient({ baseUrl: options.url })
+                : embeddedClient()
+              const list = await client.listSessions({ limit: 200 })
+              const sessions = (list as { sessions?: any[] }).sessions ?? []
+              console.log(formatSessionsTree(list, await loadSessionRelationshipSummary(client, sessions), { rootSessionId: sessionId }))
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show session tree: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/activity' || trimmed === '/sessions activity') {
+            try {
+              const result = await showSessionActivity()
+              if (result.type === 'ack') {
+                await ackSessionInboxMessage(result.messageId)
+              } else if (result.type === 'quote') {
+                queuedPromptPrefill = result.text.split(/\r?\n/).join(INPUT_NEWLINE_MARKER)
+                console.log(chalk.dim('Quoted activity context into the prompt. Review and submit manually.'))
+              }
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show session activity: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/channel send confirm') {
+            try {
+              await confirmChannelSendCommand()
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to send channel message: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/channel send cancel') {
+            cancelChannelSendCommand()
+            continue
+          }
+
+          if (trimmed === '/channel send' || trimmed === '/inbox reply') {
+            console.log(chalk.dim(channelSendUsage()))
+            continue
+          }
+
+          if (trimmed.startsWith('/channel send ') || trimmed.startsWith('/inbox reply ')) {
+            try {
+              await previewChannelSendCommand(trimmed)
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to preview channel message: ${e.message || e}`))
+            }
+            continue
+          }
+
           if (trimmed === '/inbox' || trimmed === '/sessions inbox' || trimmed === '/inbox all' || trimmed === '/sessions inbox all') {
             try {
               const result = await showSessionInbox(trimmed.endsWith(' all'))
@@ -1041,7 +1296,7 @@ export function registerChatCommand(program: Command): void {
                 : embeddedClient()
               const list = await client.listSessions({ limit: 10 })
               console.log(chalk.cyan(options.url ? '\n--- Recent Sessions ---' : '\n--- Recent Sessions (Local) ---'))
-              console.log(JSON.stringify(list, null, 2))
+              console.log(formatSessionsList(list, await loadSessionRelationshipSummary(client, (list as { sessions?: any[] }).sessions ?? [])))
             } catch (e: any) {
               console.error(chalk.red(`Failed to list sessions: ${e.message || e}`))
             }

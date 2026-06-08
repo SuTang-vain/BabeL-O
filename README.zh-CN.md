@@ -76,6 +76,8 @@ graph TD
 - **严格的工作区路径保护**：通过统一的 `pathSafety.ts` 拦截非工作区文件读写，使用 `realpath` 解析真实物理路径，彻底防范利用符号链接（Symlinks）逃逸安全区。
 - **原生 MCP Stdio 客户端**：通过 `mcp.json` 配置直接接入 Model Context Protocol 服务端，将其动态包装为经过安全分级的原生工具。
 - **Planner ➔ Executor ➔ Critic 编排**：支持在隔离的 Git Worktree 中进行复杂的智能体协作，配合工作区文件系统互斥锁（Mutex Locks）实现安全的并发开发与自动合并/回滚。
+- **SessionChannel 协作（v0.3.2）**：类型化、先预览后确认的 side-channel 消息通道，用于跨 session 共享 finding、review 请求、handoff 与决策。TUI 中体现为 Inbox / Activity / Channels graph 浮层，CLI 中通过 `bbl sessions inbox` / `bbl sessions ack` 暴露给无头消费者。side-channel 内容始终是上下文，绝不会被当作用户直接指令。
+- **更稳的 chat 启动与闲置循环**：`bbl chat` 在 stdin/stdout 任意一侧非 TTY 时直接报错并指向 `bbl run`；SEA 单文件二进制在闲置状态下会保留一个空操作定时器，避免事件循环清空后 prompt 消失。
 - **结构化审计**：所有工具输入输出、模型用量和权限变更日志均自动落盘至 SQLite 数据库（基于原生 `node:sqlite`）。
 
 ---
@@ -96,14 +98,14 @@ bbl chat
 如需安装指定版本，可给安装进程传入 `BBL_VERSION`：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.2 bash
 ```
 
 安装脚本会先下载到临时文件，失败下载会重试；当 GitHub 返回文件大小时会校验实际下载大小，并拒绝把非二进制的 HTTP 错误响应安装成 `bbl`。
 
 ### 方法二：下载预编译原生二进制包
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.1.md) 中的对应下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.2.md) 中的对应下载链接。
 
 将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
 ```bash
@@ -166,16 +168,20 @@ bbl chat
 ## 命令行客户端（bbl）用法说明
 
 ```bash
-bbl chat                  # 启动交互式终端对话会话
-bbl run <prompt>          # 执行单次 Prompt 命令
-bbl optimize              # 启动智能体自我优化流
-bbl nexus start           # 启动后台守护 Nexus 服务
-bbl nexus status          # 检查服务端健康度
-bbl sessions list         # 列出所有持久化的会话历史
-bbl sessions inspect <id> # 深入检查特定会话的事件日志与工具追踪
-bbl tools list            # 列出可用工具集及其安全状态
-bbl tools audit           # 审计过往工具执行的风险记录
-bbl config show           # 展示当前配置项
+bbl chat                         # 启动交互式终端对话会话
+bbl chat dev                     # 在源码树中以 dev 模式启动
+bbl run <prompt>                 # 执行单次 Prompt 命令
+bbl optimize                     # 启动智能体自我优化流
+bbl nexus start                  # 启动后台守护 Nexus 服务
+bbl nexus status                 # 检查服务端健康度
+bbl sessions list                # 列出所有持久化的会话历史（带关系标签）
+bbl sessions tree                # 以树形展示 parent-child 会话结构
+bbl sessions inbox <sessionId>   # 列出指定 session 的未读 SessionChannel 消息
+bbl sessions ack <sessionId> <messageId>   # 确认一条 SessionChannel 收件箱消息
+bbl sessions inspect <sessionId> # 深入检查特定会话的事件日志与工具追踪
+bbl tools list                   # 列出可用工具集及其安全状态
+bbl tools audit                  # 审计过往工具执行的风险记录
+bbl config show                  # 展示当前配置项
 ```
 
 ### 终端交互快捷键
@@ -188,7 +194,27 @@ bbl config show           # 展示当前配置项
 | `/exit` | 退出当前会话 |
 | `/model <id>` | 动态切换当前会话所用的 LLM 模型 |
 | `/status` | 展示当前服务端配置、授权状态与健康度 |
+| `/inbox` | 打开 SessionChannel 收件箱浮层 |
+| `/collaborate` | 打开统一的 Inbox / Channels / Agents 协作中心 |
+| `/channels graph` | 渲染只读的 SessionChannel 调试拓扑图 |
+| `/channel send ...` | 预览一条类型化 SessionChannel 消息 |
+| `/channel send confirm` | 真正发送刚才预览的 SessionChannel 消息 |
+| `/activity` | 展示当前 session 最近的 SessionChannel 活动 |
 | 权限选择面板 | 为当前敏感工具权限请求选择批准/拒绝范围 |
+
+### SessionChannel 协作能力
+
+v0.3.2 将 SessionChannel 提升为用户可见能力。聊天循环始终把 side-channel 消息当作**有类型的协作上下文**而非用户直接指令：`question` / `answer` / `finding` / `request_review` / `request_validation` / `hypothesis` / `decision` / `blocked` / `memory_candidate` / `handoff` 等负载统一在 Inbox / Activity / Channels graph 浮层中呈现，并且必须经过显式的 `confirm` 步骤才会真正下发。
+
+协作三步流程：
+
+1. **查看** – 通过 `/inbox`、`/activity` 或 `/collaborate` 了解当前 session 的未读消息、最近活动以及参与的 channel。
+2. **预览** – 通过 `/channel send channel=<id> [to=<sessionId>|broadcast=true] [type=...] [priority=...] -- <message>` 生成发送预览，或者用 `/inbox reply channel=<id> message=<id> -- <message>` 起草回复。
+3. **确认** – 重新执行命令并附加 `confirm`，刚才的草稿会被实际发送；追加 `cancel` 则丢弃草稿。
+
+TUI 之外，`bbl sessions inbox <sessionId>` 把同一份收件箱以 JSON / 文本形式暴露给 CI / 无头调用者；`bbl sessions ack <sessionId> <messageId>` 用于在不发回复的前提下显式确认消息；`bbl sessions tree` 渲染 session 的 parent / child 关系；`bbl sessions list` 在每一行末尾标注关系徽章（parent / child / peer / bridge）。
+
+硬性规则：side-channel 消息永远不能替代真正的用户 prompt。聊天循环不会基于 Inbox 文本自动执行任何动作，所有 `SessionChannel` 内容都被视为需要先核实再决策的协作上下文。
 
 ---
 
@@ -243,6 +269,7 @@ GET /v1/stream?sessionId=<id>
 *   `thinking_delta`（实时思维链思考块）
 *   `tool_started` / `tool_completed` / `tool_denied`（工具执行生命周期）
 *   `permission_request` / `permission_response`（交互式安全校验）
+*   `inbox_message` / `channel_activity`（SessionChannel side-channel 事件）
 *   `usage` (计费与 Token 统计遥测)
 *   `result` / `error`（最终结果或致命故障归一化）
 
@@ -261,6 +288,8 @@ BabeL-O/
 │   ├── mcp/                      # JSON-RPC MCP 协议桥接客户端
 │   ├── providers/                # LLM 模型适配层（Anthropic/OpenAI 兼容）
 │   ├── cli/                      # Commander 命令注册与 TUI 控制台渲染器
+│   │                             # 包含 inboxOverlay / activityOverlay / channelGraph /
+│   │                             # channelSend / collaborateOverlay 等 SessionChannel 浮层
 │   ├── storage/                  # SQLite 数据库底层（node:sqlite）
 │   ├── skills/                   # 系统提示词技能加载与匹配
 │   └── shared/                   # 全局类型定义、标准事件与配置单例

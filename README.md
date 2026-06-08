@@ -74,6 +74,8 @@ graph TD
 - **Strict Workspace Path Safety**: Restricts all file accesses to configured workspaces (`pathSafety.ts`). Avoids traversal escapes via symlink checks.
 - **Native MCP Stdio client**: Automatically maps stdio-based MCP servers configured in `mcp.json` into risk-classified tools.
 - **Planner ➔ Executor ➔ Critic Pipeline**: Coordinates multi-agent flows inside task-scoped Git Worktrees with mutex file locks to enable parallel execution without merge conflicts.
+- **SessionChannel Collaboration (v0.3.2)**: A typed, preview-then-confirm side-channel for sharing findings, review requests, handoffs, and decisions between sessions. Renders as Inbox / Activity / Channels graph overlays in the TUI and is exposed via `bbl sessions inbox` / `bbl sessions ack` for headless consumers. Side-channel content is always context, never a direct user instruction.
+- **Hardened Chat Launch**: `bbl chat` now refuses to start when stdin/stdout are not TTYs, and the standalone-binary build keeps a no-op event-loop interval so the prompt does not disappear when idle.
 - **Structured Persistent Audits**: Automatically saves all tool inputs, outputs, tokens, and permission logs into SQLite (`node:sqlite`).
 
 ---
@@ -94,14 +96,14 @@ bbl chat
 To install a specific release, pass `BBL_VERSION` to the installer process:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.1 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.2 bash
 ```
 
 The installer downloads to a temporary file, retries failed downloads, validates the release asset size when GitHub provides it, and refuses to install non-binary HTTP error bodies.
 
 ### Method 2: Pre-compiled Native Binary
 
-Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.1.md) for version-specific download links.
+Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.2.md) for version-specific download links.
 
 Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
 ```bash
@@ -164,16 +166,20 @@ If using Option B, you can run the generated binary directly:
 ## CLI Usage Guide
 
 ```bash
-bbl chat                  # Start an interactive CLI chat session
-bbl run <prompt>          # Run a one-shot prompt task
-bbl optimize              # Launch self-optimization workflows
-bbl nexus start           # Launch the background Nexus daemon
-bbl nexus status          # Query Nexus health status
-bbl sessions list         # List persistent sessions
-bbl sessions inspect <id> # Inspect session details and trace files
-bbl tools list            # List available tools and check permissions
-bbl tools audit           # Detailed audit logs of past tool activities
-bbl config show           # Display configuration settings
+bbl chat                         # Start an interactive CLI chat session
+bbl chat dev                     # Source-tree chat with the `dev` title marker
+bbl run <prompt>                 # Run a one-shot prompt task
+bbl optimize                     # Launch self-optimization workflows
+bbl nexus start                  # Launch the background Nexus daemon
+bbl nexus status                 # Query Nexus health status
+bbl sessions list                # List persistent sessions with relationship badges
+bbl sessions tree                # Show parent-child session tree
+bbl sessions inbox <sessionId>   # List unread SessionChannel inbox messages
+bbl sessions ack <sessionId> <messageId>   # Acknowledge a SessionChannel inbox message
+bbl sessions inspect <sessionId> # Inspect session details and trace files
+bbl tools list                   # List available tools and check permissions
+bbl tools audit                  # Detailed audit logs of past tool activities
+bbl config show                  # Display configuration settings
 ```
 
 ### Keyboard Shortcuts in Chat
@@ -186,7 +192,27 @@ bbl config show           # Display configuration settings
 | `/exit` | Exits the chat session |
 | `/model <id>` | Dynamically switches the active LLM model |
 | `/status` | Details the active session configuration and health |
+| `/inbox` | Opens the SessionChannel inbox overlay |
+| `/collaborate` | Opens the unified Inbox / Channels / Agents hub |
+| `/channels graph` | Renders a debug-only SessionChannel topology view |
+| `/channel send ...` | Previews a typed SessionChannel message send |
+| `/channel send confirm` | Sends the previously previewed SessionChannel message |
+| `/activity` | Shows the recent SessionChannel activity feed |
 | Permission picker | Selects allow/deny scope for a pending permission request |
+
+### SessionChannel Collaboration
+
+v0.3.2 promotes SessionChannel into a user-visible capability. The chat loop treats side-channel messages as **typed context, not direct user instructions**: every `question`, `answer`, `finding`, `request_review`, `request_validation`, `hypothesis`, `decision`, `blocked`, `memory_candidate`, or `handoff` payload is rendered in a dedicated overlay (Inbox / Activity / Channels graph) and must be confirmed by an explicit `confirm` step before it is dispatched.
+
+The collaboration flow:
+
+1. **Inspect** – Use `/inbox`, `/activity`, or `/collaborate` to see unread messages, recent activity, or open channels for the current session.
+2. **Preview** – Use `/channel send channel=<id> [to=<sessionId>|broadcast=true] [type=...] [priority=...] -- <message>` to render a send preview, or `/inbox reply channel=<id> message=<id> -- <message>` to draft a reply.
+3. **Confirm** – Re-issue the same command with `confirm` appended. The previous draft is sent, the new draft replaces it, or `cancel` discards it.
+
+Outside the TUI, `bbl sessions inbox <sessionId>` exposes the same inbox for CI / headless consumers, and `bbl sessions ack <sessionId> <messageId>` marks a message as acknowledged without sending a reply. `bbl sessions tree` renders the parent / child relationship of a session, and `bbl sessions list` decorates every row with relationship badges (parent, child, peer, bridge).
+
+Hard rule: side-channel messages are never a substitute for an actual user prompt. The chat loop never auto-executes actions from inbox text and always treats `SessionChannel` content as collaboration context to verify.
 
 ---
 
@@ -241,6 +267,7 @@ Yields a structured event stream (`NexusEvent`):
 *   `thinking_delta` (streaming raw reasoning blocks)
 *   `tool_started` / `tool_completed` / `tool_denied` (tool boundaries)
 *   `permission_request` / `permission_response` (interactive loops)
+*   `inbox_message` / `channel_activity` (SessionChannel side-channel events)
 *   `usage` (cost tracking telemetry)
 *   `result` / `error` (final execution state)
 
@@ -259,6 +286,8 @@ BabeL-O/
 │   ├── mcp/                      # JSON-RPC MCP clients & wrapping adapters
 │   ├── providers/                # Model adapters (Anthropic/OpenAI)
 │   ├── cli/                      # Commander commands & text/Chalk UI renderers
+│   │                             # Includes inboxOverlay, activityOverlay, channelGraph,
+│   │                             # channelSend, and collaborateOverlay for SessionChannel
 │   ├── storage/                  # SQLite storage backend
 │   ├── skills/                   # Prompt skill matcher & parser
 │   └── shared/                   # Schemas, events, and configuration types
