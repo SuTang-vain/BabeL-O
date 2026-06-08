@@ -38,12 +38,6 @@ test('PTY smoke: chat stays open while idle', { skip: !shouldRun || !existsSync(
   assert.doesNotMatch(output, /chat exited while idle/)
 })
 
-test('PTY smoke: chat dev renders dev title', { skip: !shouldRun || !existsSync(driver) }, () => {
-  const output = runPtySmoke('dev-title')
-  assert.match(output, /❖ BABEL-O\s+dev/)
-  assert.doesNotMatch(output, /❖ BABEL-O\s+v\d+\.\d+\.\d+/)
-})
-
 test('PTY smoke: slash palette opens and exits cleanly', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('slash-palette')
   assert.match(output, /Insert bash prompt prefix/)

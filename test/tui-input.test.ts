@@ -191,20 +191,6 @@ test('welcome header keeps required identity info without outer box', () => {
   assert.ok(lines.every(line => visibleTerminalWidth(line) <= 80))
 })
 
-test('welcome header supports dev title override', () => {
-  const lines = formatWelcomeCardLines({
-    cwd: '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
-    modelId: 'local/coding-runtime',
-    title: 'dev',
-    columns: 80,
-  })
-  const joined = lines.join('\n')
-
-  assert.match(joined, /❖ BABEL-O/)
-  assert.match(joined, /dev/)
-  assert.doesNotMatch(joined, /v\d+\.\d+\.\d+/)
-})
-
 test('welcome hint and session banners stay compact', () => {
   const hint = formatWelcomeHintLine(80)
   assert.match(hint, /\?/)

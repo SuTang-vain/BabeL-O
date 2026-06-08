@@ -40,7 +40,6 @@ export function renderWelcome(options: {
   cwd: string
   sessionId?: string
   url?: string
-  title?: string
 }): void {
   console.log()
   for (const line of formatWelcomeCardLines(options)) {
@@ -54,7 +53,6 @@ export function formatWelcomeCardLines(options: {
   cwd: string
   sessionId?: string
   url?: string
-  title?: string
   columns?: number
 }): string[] {
   const columns = Math.max(48, options.columns ?? process.stdout.columns ?? 80)
@@ -66,9 +64,8 @@ export function formatWelcomeCardLines(options: {
   const logoWidth = Math.max(...PIXEL_ROWS.map(row => visibleTerminalWidth(renderLogoRow(row))))
   const theme = getTheme()
   const metadataWidth = Math.max(18, maxContentWidth - logoWidth - 5)
-  const title = options.title ?? `v${BABEL_O_VERSION}`
   const metadataLines = [
-    ` ${theme.brand('❖ BABEL-O')}  ${chalk.dim(title)}`,
+    ` ${theme.brand('❖ BABEL-O')}  ${chalk.dim(`v${BABEL_O_VERSION}`)}`,
     ` ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
     ` ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
     ` ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
