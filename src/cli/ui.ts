@@ -614,6 +614,9 @@ export function runInteractiveDropdown(
 ) {
   let activeIndex = 0
   const displayChoices = choices.slice(0, 10)
+  // Number of terminal rows the dropdown widget occupies. See
+  // chooseInteractive for the rationale behind avoiding DEC save/restore.
+  let widgetRows = 0
 
   const keypressListeners = process.stdin.listeners('keypress')
   const wasRaw = process.stdin.isRaw
@@ -621,17 +624,24 @@ export function runInteractiveDropdown(
   process.stdin.removeAllListeners('keypress')
 
   const redraw = () => {
-    process.stdout.write('\x1b[s')
-    process.stdout.write('\n\x1b[J')
+    if (widgetRows > 0) {
+      process.stdout.write(`\x1b[${widgetRows}A`)
+    }
+    process.stdout.write('\x1b[J')
     for (let i = 0; i < displayChoices.length; i++) {
       const isSelected = i === activeIndex
       process.stdout.write(formatCompletionChoice(displayChoices[i]!, isSelected) + '\n')
     }
-    process.stdout.write('\x1b[u')
+    widgetRows = displayChoices.length
+    process.stdout.write(`\x1b[${widgetRows}A`)
   }
 
   const cleanup = () => {
-    process.stdout.write('\x1b[s\n\x1b[J\x1b[u')
+    if (widgetRows > 0) {
+      process.stdout.write(`\x1b[${widgetRows}A`)
+      process.stdout.write('\x1b[J')
+      widgetRows = 0
+    }
     process.stdin.removeListener('keypress', handleKey)
     for (const l of keypressListeners) {
       process.stdin.addListener('keypress', l as any)
@@ -697,6 +707,13 @@ export function chooseInteractive(
   onSelect: (selected: string) => void
 ) {
   let activeIndex = 0
+  // Number of terminal rows the dropdown widget occupies. Updated on
+  // every redraw so subsequent redraws can move the cursor back up to
+  // the widget start before clearing. We avoid DEC save/restore
+  // (ESC[s / ESC[u) because some terminals (e.g. ghostty in certain
+  // DEC modes) silently ignore it, which made the widget appear to
+  // duplicate below itself on every arrow-key press.
+  let widgetRows = 0
 
   emitKeypressEvents(process.stdin)
   process.stdin.resume()
@@ -707,8 +724,12 @@ export function chooseInteractive(
   process.stdin.removeAllListeners('keypress')
 
   const redraw = () => {
-    process.stdout.write('\x1b[s')
-    process.stdout.write('\n\x1b[J')
+    if (widgetRows > 0) {
+      // Move cursor up to the first row of the previous widget.
+      process.stdout.write(`\x1b[${widgetRows}A`)
+    }
+    // Clear from cursor to end of screen, then rewrite the widget.
+    process.stdout.write('\x1b[J')
     process.stdout.write(chalk.cyan(question) + '\n')
     for (let i = 0; i < choices.length; i++) {
       const isSelected = i === activeIndex
@@ -716,11 +737,19 @@ export function chooseInteractive(
       const text = isSelected ? chalk.black.bgCyan(choices[i]!) : chalk.dim(choices[i]!)
       process.stdout.write(prefix + text + '\n')
     }
-    process.stdout.write('\x1b[u')
+    // The cursor is now on the line below the widget. Update the
+    // tracked height and move the cursor back up to the original
+    // pre-widget row so callers (e.g. readline) keep their position.
+    widgetRows = 1 + choices.length
+    process.stdout.write(`\x1b[${widgetRows}A`)
   }
 
   const cleanup = () => {
-    process.stdout.write('\x1b[s\n\x1b[J\x1b[u')
+    if (widgetRows > 0) {
+      process.stdout.write(`\x1b[${widgetRows}A`)
+      process.stdout.write('\x1b[J')
+      widgetRows = 0
+    }
     process.stdin.removeListener('keypress', handleKey)
     for (const l of keypressListeners) {
       process.stdin.addListener('keypress', l as any)
