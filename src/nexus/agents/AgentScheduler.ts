@@ -2,6 +2,7 @@ import type { NexusEvent } from '../../shared/events.js'
 import { eventBase } from '../../shared/events.js'
 import { createId, nowIso } from '../../shared/id.js'
 import type { SessionSnapshot } from '../../shared/session.js'
+import { DEFAULT_SESSION_CHANNEL_POLICY, type SessionChannel, type SessionMessage, type SessionMessageType } from '../../shared/sessionChannel.js'
 import type { NexusStorage } from '../../storage/Storage.js'
 import { createDefaultToolRegistry } from '../../tools/registry.js'
 import type { AnyTool, ToolResult } from '../../tools/Tool.js'
@@ -117,6 +118,12 @@ export class ExploreAgentScheduler implements AgentScheduler {
       timeoutAt: addMillisecondsIso(this.now(), maxRuntimeMs),
     }
     const childSessionId = createId('session')
+    const channel = createAgentParentChildChannel({
+      parentSessionId: request.parentSessionId,
+      childSessionId,
+      agentType: profile.id,
+      createdAt: this.now(),
+    })
     const job = this.registry.createJob({
       parentSessionId: request.parentSessionId,
       childSessionId,
@@ -130,6 +137,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
         ...(request.metadata ?? {}),
         allowedTools,
         governance,
+        channelId: channel.channelId,
       },
     })
     const fork = forkContextForAgent({ parentSession, job })
@@ -152,6 +160,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
         agentDepth: depth,
         allowedTools,
         governance,
+        channelId: channel.channelId,
         contextFork: {
           inheritedItems: fork.inheritedItems,
           omittedItems: fork.omittedItems,
@@ -159,8 +168,19 @@ export class ExploreAgentScheduler implements AgentScheduler {
         },
       },
     }
+    channel.metadata = { ...(channel.metadata ?? {}), jobId: job.jobId }
     await this.storage.saveSession(childSession)
     await this.storage.saveAgentJob(job)
+    await this.storage.saveSessionChannel(channel)
+    await this.storage.saveSessionMessage(createAgentChannelMessage({
+      channelId: channel.channelId,
+      fromSessionId: request.parentSessionId,
+      toSessionId: childSessionId,
+      type: agentRequestMessageType(profile.id),
+      content: `Agent task request (${profile.id}): ${request.prompt}`,
+      createdAt: this.now(),
+      job,
+    }))
     await this.appendParentAgentEvent('agent_job_queued', job)
 
     const controller = new AbortController()
@@ -376,6 +396,24 @@ export class ExploreAgentScheduler implements AgentScheduler {
       result: job.result,
       error: job.error,
     })
+    if (eventType === 'agent_job_completed' || eventType === 'agent_job_failed' || eventType === 'agent_job_cancelled') {
+      await this.appendAgentChannelTerminalMessage(job)
+    }
+  }
+
+  private async appendAgentChannelTerminalMessage(job: AgentJob): Promise<void> {
+    const channelId = typeof job.metadata?.channelId === 'string' ? job.metadata.channelId : undefined
+    if (!channelId) return
+    if (!await this.storage.getSessionChannel(channelId)) return
+    await this.storage.saveSessionMessage(createAgentChannelMessage({
+      channelId,
+      fromSessionId: job.childSessionId,
+      toSessionId: job.parentSessionId,
+      type: job.status === 'completed' ? 'handoff' : 'blocked',
+      content: agentTerminalMessageContent(job),
+      createdAt: this.now(),
+      job,
+    }))
   }
 }
 
@@ -459,6 +497,77 @@ function addMillisecondsIso(timestamp: string, durationMs: number): string | und
   const time = new Date(timestamp).getTime()
   if (!Number.isFinite(time)) return undefined
   return new Date(time + durationMs).toISOString()
+}
+
+function createAgentParentChildChannel(input: {
+  parentSessionId: string
+  childSessionId: string
+  agentType: AgentJob['agentType']
+  createdAt: string
+}): SessionChannel {
+  return {
+    channelId: createId('channel'),
+    kind: 'parent_child',
+    participantSessionIds: [input.parentSessionId, input.childSessionId],
+    createdBySessionId: input.parentSessionId,
+    createdAt: input.createdAt,
+    status: 'open',
+    policy: {
+      ...DEFAULT_SESSION_CHANNEL_POLICY,
+      allowedMessageTypes: ['request_review', 'request_validation', 'question', 'answer', 'finding', 'handoff', 'blocked'],
+      allowMemoryWriteRequests: false,
+      requireUserApprovalForExternalProject: true,
+      contextInjectionMode: 'recent_messages',
+    },
+    metadata: {
+      agentType: input.agentType,
+      parentSessionId: input.parentSessionId,
+      childSessionId: input.childSessionId,
+    },
+  }
+}
+
+function createAgentChannelMessage(input: {
+  channelId: string
+  fromSessionId: string
+  toSessionId: string
+  type: SessionMessageType
+  content: string
+  createdAt: string
+  job: AgentJob
+}): SessionMessage {
+  return {
+    messageId: createId('msg'),
+    channelId: input.channelId,
+    fromSessionId: input.fromSessionId,
+    toSessionId: input.toSessionId,
+    broadcast: false,
+    type: input.type,
+    content: input.content,
+    priority: input.type === 'blocked' ? 'high' : 'normal',
+    createdAt: input.createdAt,
+    deliveredAt: input.createdAt,
+    status: 'delivered',
+    metadata: {
+      agentJobId: input.job.jobId,
+      agentType: input.job.agentType,
+      childSessionId: input.job.childSessionId,
+      parentSessionId: input.job.parentSessionId,
+      agentJobStatus: input.job.status,
+    },
+  }
+}
+
+function agentRequestMessageType(agentType: AgentJob['agentType']): SessionMessageType {
+  if (agentType === 'test') return 'request_validation'
+  return 'request_review'
+}
+
+function agentTerminalMessageContent(job: AgentJob): string {
+  if (job.status === 'completed') {
+    return `Agent ${job.agentType} completed: ${job.result?.summary ?? 'Agent completed.'}`
+  }
+  return `Agent ${job.agentType} ${job.status}: ${job.error?.message ?? 'Agent did not complete.'}`
 }
 
 function assertProfileAllowedTools(profileId: AgentJob['agentType'], allowedTools: string[]): void {

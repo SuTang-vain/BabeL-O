@@ -24,6 +24,9 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
   risk: 'read',
   inputSchema,
   async execute(input, context) {
+    const pathMatchesDiagnostic = validatePathMatches(input.pathMatches)
+    if (pathMatchesDiagnostic) return { success: false, output: pathMatchesDiagnostic }
+
     const probeLimit = input.maxMatches + 1
     const args = [
       '-n',
@@ -99,6 +102,17 @@ function isErrorWithCode(error: unknown, code: string | number): boolean {
 
 function targetedGrepTruncationHint(maxMatches: number): string {
   return `\n... (${maxMatches} matches shown; more matches truncated for context budget. Narrow the pattern/path, then use Read with offset/limit around the relevant file lines.)`
+}
+
+function validatePathMatches(pathMatches: string | undefined): string | undefined {
+  if (pathMatches === undefined) return undefined
+  const normalized = pathMatches.trim().toLowerCase()
+  if (normalized !== 'true' && normalized !== 'false') return undefined
+  return JSON.stringify({
+    code: 'INVALID_GREP_PATH_MATCHES_GLOB',
+    message: 'Grep pathMatches is a file glob filter, not a boolean. Omit pathMatches to search all files, or use a glob such as "**/*.ts" or "**/package.json".',
+    pathMatches,
+  })
 }
 
 async function grepFallback(

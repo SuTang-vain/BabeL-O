@@ -17,6 +17,7 @@ export type InputMode =
   | 'historySearch'
   | 'modelWizard'
   | 'contextView'
+  | 'inboxOverlay'
   | 'agentRunning'
   | 'pasteBuffer'
 

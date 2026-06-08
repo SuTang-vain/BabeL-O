@@ -8,9 +8,19 @@ Nexus 是 BabeL-O 的执行核心。这里只保留仍未收口的 runtime / API
 
 - `GET /v1/runtime/status`、`/v1/runtime/provider-smoke`、`/v1/runtime/provider-smoke/live`、`/v1/sessions/:sessionId/context`、`/v1/sessions/:sessionId/assets`、`/compact`、`/context`、Session Memory Lite 第一版、provider recovery、DeepSeek reasoning replay、hooks 最小内核都已落地。
 - Context token estimator conservative mode、blocking limit、auto/manual compact、retained segment、User Intake Guidance、final-response-only、provider protocol regression corpus、统一 diagnostics object、runtime pipeline 最小 seam、tool loop/result aggregator seam、tool loop execution helper、provider turn outcome reducer、context blocking helper、loop state / execution state helper、compact/reassemble state refresh helper 和 provider request assembly / loop guard helper 都已进入可验证状态。
-- 真实会话守门继续采用 regression-first：intake 失败时身份/能力短问、上下文记忆短追问已覆盖为 respond-only fallback；`session_93052ea7-8346-40a9-8175-db941312778c` 暴露的 provider 协议污染 assistant 文本已补 Tool-call Text Leakage 回归守门；测试进程写真实 provider config 的污染事故已补中心化 guard 与回归。后续只在真实漂移出现时补最小回归再修 runtime/config/adapter/TUI。
+- 真实会话守门继续采用 regression-first：intake 失败时身份/能力短问、上下文记忆短追问已覆盖为 respond-only fallback；`session_93052ea7-8346-40a9-8175-db941312778c` 暴露的 provider 协议污染 assistant 文本已补 Tool-call Text Leakage 回归守门；测试进程写真实 provider config 的污染事故已补中心化 guard 与回归；`session_9d985c5c-7c89-41b8-9d5e-cc672e412f00` 暴露的 current-turn finalization 污染已补最小 regression 并修复。后续仍按真实漂移先补最小回归再修 runtime/config/adapter/TUI。
 - `session_1e2299be-b988-49ea-8819-587de8258172` 暴露真实会话在大量 `Read` 后第二轮 provider call 前触发 context blocking；P1 已补 provider-loop reactive compact、adaptive `Read` preview/range 策略、live `Read` aggregate budget、embedded metrics side-table 持久化和 retryable failed session 恢复状态表达。后续只保留重复大文件读取诊断与 P2 targeted reading 地基。
 - 除上述真实会话回归外，后续阶段仍保留架构收口、权限细化和执行入口升级。
+
+## 已收口 P0 Current-turn Session Finalization Regression
+
+> 样本：`session_9d985c5c-7c89-41b8-9d5e-cc672e412f00`。第三轮用户请求已经写入 `user_message` / `session_started` / PreInvocation / `usage` / `thinking_delta`，但没有当前轮 `assistant_delta`、PostInvocation、`result`、`error` 或 `execution_metrics`；session 最终仍被标记为 `completed`，并继承上一轮 result。
+>
+> 详细规划见 [session-finalization-and-evidence-governance-plan.md](../reference/session-finalization-and-evidence-governance-plan.md)。
+
+本项已按 P0 regression-first 收口：`resolveFinalSessionOutcome()` 增加 current request boundary regression，`runSessionFlow()` 改为只使用当前轮 `executeStream()` 产出的 events 做 finalization，不再回扫整段 session 旧 terminal event；新一轮开始会清空旧 `result` / `error` / `terminalReason`，当前轮无 terminal event 时保存 `failed` 与 `REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT` 诊断，用户取消仍保存 `cancelled`。
+
+后续若真实 provider stream 中断继续出现缺失 PostInvocation / execution_metrics 的稳定样本，再单独开 runtime/provider partial invocation terminalization 项；当前 P0 先完成 session state correctness 守门。
 
 ## 已收口 P0 Tool-call Text Leakage Regression
 
@@ -83,6 +93,9 @@ Tool Discovery / Targeted Reading 第一阶段已归档到 [DONE.md](../DONE.md)
 Phase B.5 已收口：`Grep` 优先使用 optional bundled ripgrep（`@vscode/ripgrep`），其次使用系统 `rg`，最后才使用 JavaScript `RegExp` fallback；schema 显式支持 `pathMatches` glob 过滤，fallback 支持基础 regex alternation，并为 fallback mode、no-result 与 invalid-regex 返回明确 diagnostics；focused regression 覆盖 `ContextForker|forkContext|contextFork`。
 Phase B.6 已收口：Bash 普通 command timeout / SIGTERM 已返回 recoverable `tool_completed(success=false)`，输出结构化 `COMMAND_TIMEOUT`、`timedOut`、`signal`、stdout/stderr 摘要与 command summary，不再把普通 shell timeout 作为 session fatal；外部 request abort 仍保留 runtime cancellation path，不被 Bash timeout recovery 吞掉。
 Phase B.7 已收口：新增 Bash-as-file-discovery guidance，`ls`/`ls -R`/`find`/`tree`/`grep -r`/`rg` 这类只读 discovery 命令会在 Bash tool result 中追加 `BASH_AS_FILE_DISCOVERY` structured guidance，提示优先使用 `ListDir` / `Glob` / `Grep` / `Read`；classifier 对 `find`、`tree`、recursive grep/ls、`rg` 等 broad discovery 命令返回 manual-review reason 并包含同一替代工具提示，普通 `ls` 保持既有低风险执行但仍输出 guidance。
+Phase B.8 已收口：Workspace Path Drift / Tool Failure Recovery 最小诊断已落地；`Read` / `ListDir` missing path 与 `Glob` missing search root 会在 cwd-aware 候选路径存在时输出 `PATH_DRIFT_SUSPECTED` guidance，保留 recoverable failure / empty-result 语义，不自动切换 cwd、不新增路径搜索工具、不绕过 path safety。样本：`session_1cf5362d-b33f-467f-b07e-f97356652662`。
+Phase B.9 已收口：Grep `pathMatches` 参数语义诊断已落地；`pathMatches: "true"` / `"false"` 会返回 recoverable `INVALID_GREP_PATH_MATCHES_GLOB` diagnostic，提示 omit field 或使用 `**/*.ts` / `**/package.json` 这类 file glob，避免 boolean-string 被 ripgrep 当作 `--glob true` 后产生误导性空结果。样本：`session_303c7221-8cc3-4251-9436-4215244120e4`。
+`session_9d985c5c-7c89-41b8-9d5e-cc672e412f00` 同时暴露了 evidence-scope drift：项目级强声明主要基于 `Read` / `ListDir` 证据，未观察到足以支撑部分全局声明的 `Grep` / `Glob` / `Bash git status`；作为 Phase C/Phase E 的真实样本记录，详见 [session-finalization-and-evidence-governance-plan.md](../reference/session-finalization-and-evidence-governance-plan.md)。
 - [ ] Phase C: Source Coverage Ledger / Strong Claim Guard 轻量诊断评估。
   - 仅在真实会话继续暴露 evidence scope drift 时推进；避免过早引入复杂审计系统。
 - [ ] Phase E（Watch）: tool result evidence hint 评估。
@@ -164,23 +177,31 @@ Phase D implement/worktree execution backend 已收口：`GO_RUNNER_ENABLE_WRITE
 
 ## P3 Long-Term Memory / EverCore Integration
 
-> 参考规划：`/Users/tangyaoyue/DEV/EverOS/docs/babel-o-evercore-integration-plan.md`。当前只登记远期计划，不进入实现阶段；先完成 P1 Context Manager / AgentScheduler 规范化与 P2 context foundation，再启动 EverCore REST spike。
+> 参考规划：`/Users/tangyaoyue/DEV/EverOS/babel-o-evercore-integration-plan.md`。EverOS 当前实际 REST API 是 `/api/v1/memory/add|flush|search`，不是早期规划中的 `/memories/agent` 路径。
 
-- [ ] Phase A: REST Spike。
-  - 新增可选 EverCore REST client，支持 search、add agent messages、flush agent session。
-  - behind config flag，默认 disabled；EverCore 不可达时 BabeL-O 主流程不失败。
-  - 不改变 BabeL-O SQLite/session/event/tool trace 事实源。
-- [ ] Phase B: Internal MemoryProvider。
-  - 抽象 `MemoryProvider` / `NoopMemoryProvider` / `EverCoreMemoryProvider`。
-  - context assembler 可注入长期语义记忆 block，但必须作为 volatile context，不进入 immutable prefix。
-  - session lifecycle 可在 session end 上传摘要 trajectory，不上传大段原始源码或工具输出。
-- [ ] Phase C: Context Budget / Diagnostics。
-  - 为 EverCore memory block 设置独立 char/token budget、命中数量、检索耗时、截断和 lastError 诊断。
-  - `/context` 展示 EverCore enabled/baseUrl redacted/searchLatency/hitCount/injectedChars/truncated。
-  - secret redaction、per-project opt-out 和失败降级必须先于默认开启。
-- [ ] Phase D: Optional MCP Tools。
-  - 仅在 REST path 与 MemoryProvider 稳定后，再考虑 memory_search / memory_save_note / memory_flush_session 等 MCP tool。
-  - MCP 只用于模型或用户主动操作，不承担每轮自动检索或 session end 上传。
+Phase A REST Spike 已收口：BabeL-O 侧新增默认关闭的可选 EverCore REST client，支持 `search`、`addAgentMessages`、`flushAgentSession`；`GET /v1/runtime/status` 暴露 redacted EverCore diagnostics；`BABEL_O_EVERCORE_UPLOAD_ON_SESSION_END=1` 时 session close/cancel 会上传 bounded user/result messages 并 flush，失败只写入 session metadata，不影响 BabeL-O 主流程；SQLite/session/event/tool trace 仍是事实源。
+
+Phase B Internal MemoryProvider 已收口：`MemoryProvider` / `NoopMemoryProvider` / `EverCoreMemoryProvider` 已抽象完成；server、embedded client 与本地 CLI flow 都可在 EverCore healthy 时把 `/api/v1/memory/search` 结果注入 provider context；长期语义记忆 block 明确为 volatile / non-cacheable，并在 prompt 中标注为 background hints，不作为 authoritative project state；检索失败只记录 diagnostics，不污染 provider-visible context。
+
+Phase C Context Budget / Diagnostics 已收口：MemoryProvider 结果携带独立 `hitCount` / `injectedChars` / `budgetChars` / `maxHitChars` / `truncated` / `searchLatencyMs` / `error` 诊断；`analyzeContext()`、HTTP `/v1/sessions/:sessionId/context`、CLI `/context` 与 context view 均展示 long-term memory budget 状态；检索失败仍只进入 diagnostics，不污染 provider-visible context。后续 Phase D 已补 scoped diagnostics：EverCore provider 会标记 `scope=project`、`namespaceId=projectId`、`namespaceSource` 与 `isolationKey=projectId`。
+
+Phase D Optional MCP Tools 已收口：`BABEL_O_ENABLE_EVERCORE_MCP_TOOLS=1` 且 EverCore healthy 时才注册 `mcp:evercore:memory_search` / `memory_save_note` / `memory_flush_session`；search 为 read-only bounded explicit retrieval，save/flush 为 write risk 且走现有 permission 审批；这些工具只用于用户主动或模型显式调用，不承担每轮自动检索或 session end 上传。
+
+Phase E Embedded / Managed EverCore 一体化部署 Spike 已收口：新增 `BABEL_O_EVERCORE_MODE=managed`，BabeL-O/Nexus 可默认关闭地管理本地 `everos server start` sidecar，自动分配 loopback 端口与本地数据目录，向 EverOS 注入 `EVEROS_MEMORY__ROOT` / `EVEROS_API__HOST` / `EVEROS_API__PORT`，并在 `/v1/runtime/status` 暴露 mode、health、redacted endpoint、data dir、pid、upload/MCP tools 状态；managed sidecar 启动/健康检查失败保持 non-fatal diagnostics，external mode 继续保留，SQLite/session/event/tool trace 仍是 authoritative 事实源，EverCore memory 仍只是 volatile / non-cacheable / non-authoritative hints。
+
+## P2/P3 Session Channel + Scoped Memory
+
+> 详细规划见 [session-to-session-memory-channel-plan.md](../reference/session-to-session-memory-channel-plan.md)。本项把 session 视为 workspace runtime state：project/workspace memory 默认按 session/cwd 隔离，user memory / auto-memory 只承载跨项目用户习惯与配置约束，EverCore / EverOS 作为长期语义记忆与 consolidation 层，不替代 SQLite/session/event/tool trace 事实源。
+
+Phase B MVP 已收口：`SessionChannel` / `SessionMessage` shared types、MemoryStorage/SQLite persistence、Nexus API create/list/get channel、send/list message、session inbox 与 ack 已落地；`LLMCodingRuntime` 与 `/v1/sessions/:sessionId/context` 会把 unread inbox 注入 bounded non-cacheable `session_inbox` block，并明确标注跨 session 消息是 collaboration context、不是直接用户指令。MVP 仍不实现完整 dreaming、不做 raw transcript sharing、不替代 `AgentScheduler` parent-child lifecycle。
+
+Phase C.1 CLI/TUI 可见化已收口：`NexusClient` 与 embedded client 支持 list/ack session inbox；`bbl sessions inbox <sessionId>` / `bbl sessions ack <sessionId> <messageId>` 提供外部 CLI 入口；`bbl chat` 新增 `/inbox`、`/inbox all`、`/inbox ack <messageId>` slash 入口并在 help/completion 中可发现。展示继续声明跨 session message 只是 collaboration context，需要验证证据后再行动。
+
+Phase C.2 AgentScheduler parent-child channel 已收口：`ExploreAgentScheduler` 会为 parent/child session 创建 `parent_child` channel，parent→child 写入 review/validation request，child terminal 时向 parent inbox 写入 handoff/blocked；`agent_job_event` 与 child transcript 查询仍是 lifecycle/source-of-truth。
+
+Phase D scoped MemoryProvider / channel diagnostics 已收口：Layer 2 Project memory 不按 sessionId 隔离，继续按 project/workspace identity 隔离；`projectId=default` runtime status 诊断、opt-in `BABEL_O_EVERCORE_PROJECT_ID_MODE=workspace` cwd/git-root 派生 namespace、EverCore project-scoped MemoryProvider diagnostics、user-scoped MemoryProvider diagnostics 表达与 channel-scoped inbox budget diagnostics 均已落地。`/v1/sessions/:sessionId/context`、CLI `/context` 与 context view 会展示 `scopedMemory[]` 分项；SessionChannel API→Inbox→Context focused regression 已验证两个 session 可以真实传输 typed message，并在 ack 后不再注入 receiving context。仍保持 volatile / non-authoritative hints 口径，不做 raw transcript sharing、不把跨 session message 当成直接指令、不自动写入长期记忆。
+
+Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最小治理模型：`memory_candidate` SessionMessage 会被评估为 review-only candidate，并在 message metadata 中记录 scope classifier、evidence refs、confidence、staleness/supersession、approval requirement、blocked/review reasons 与 `autoWrite=false`；inbox context 会显式展示候选治理状态。默认不自动写入长期记忆；项目事实需要 workspace evidence 与用户审批，user memory candidate 需要用户审批，channel candidate 只允许进入策略审批的 channel/project summary 路径。完整 background dreaming、自动 EverCore 写入和 high-impact project fact auto-write 仍不启用，后续只在真实使用暴露治理缺口时按 regression-first 开项。
 
 ## 验证命令
 
@@ -188,6 +209,7 @@ Phase D implement/worktree execution backend 已收口：`GO_RUNNER_ENABLE_WRITE
 
 ## 参考文件
 
+- `docs/nexus/reference/session-finalization-and-evidence-governance-plan.md` — current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本
 - `docs/nexus/reference/context-and-subagent-upgrade-plan.md` — 上下文规范化、ContextForker 与模型可见 AgentScheduler 统一升级规划
 - `src/nexus/app.ts`
 - `src/nexus/server.ts`

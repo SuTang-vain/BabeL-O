@@ -1,6 +1,7 @@
 import { readFile, stat } from 'node:fs/promises'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { appendPathDriftGuidance, buildPathDriftDiagnostic } from './pathDrift.js'
 import { resolveInsideWorkspace } from './pathSafety.js'
 
 const DEFAULT_MAX_BYTES = 200_000
@@ -52,7 +53,10 @@ export const readTool: ToolDefinition<typeof inputSchema> = {
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         return {
           success: false,
-          output: `Read could not find "${input.path}". Check the path or use Glob to discover available files.`,
+          output: appendPathDriftGuidance(
+            `Read could not find "${input.path}". Check the path or use Glob to discover available files.`,
+            buildPathDriftDiagnostic({ cwd: context.cwd, requestedPath: input.path }),
+          ),
         }
       }
       throw err

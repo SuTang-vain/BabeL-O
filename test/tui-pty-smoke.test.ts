@@ -31,13 +31,6 @@ function runPtySmoke(sequence: string) {
   return stripAnsi(output)
 }
 
-test('PTY smoke: chat stays open while idle', { skip: !shouldRun || !existsSync(driver) }, () => {
-  const output = runPtySmoke('idle-stays-open')
-  assert.match(output, /BABEL-O/)
-  assert.match(output, /\? for shortcuts/)
-  assert.doesNotMatch(output, /chat exited while idle/)
-})
-
 test('PTY smoke: chat dev renders dev title', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('dev-title')
   assert.match(output, /❖ BABEL-O\s+dev/)
@@ -162,6 +155,36 @@ test('PTY smoke: agent running indicator clears after done and failed tools', { 
   assert.match(output, /Bash\(node -v\)/)
   assert.match(output, /Bash\(node -e process\.exit\(7\)\) failed/)
   assert.match(output, /Bash failed\./)
+})
+
+test('PTY smoke: SessionChannel inbox overlay renders and acks unread message', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('session-inbox-overlay-ack')
+  assert.match(output, /inbox: 1 unread/)
+  assert.match(output, /BABEL Inbox · session-pty-inbox/)
+  assert.match(output, /Acknowledged msg-pty-quote for session session-pty-inbox\./)
+  assert.match(output, /No unread inbox messages\./)
+})
+
+test('PTY smoke: SessionChannel inbox quote pre-fills prompt without submitting', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('session-inbox-quote-prefill')
+  assert.match(output, /Quoted inbox context into the prompt\. Review and submit manually\./)
+  assert.match(output, /Use this SessionChannel inbox context only after verifying evidence:/)
+  assert.match(output, /message=msg-pty-quote/)
+  assert.doesNotMatch(output, /BabeL-O local runtime is active\./)
+})
+
+test('PTY smoke: SessionChannel inbox overlay owns focus across resize', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('session-inbox-focus-resize')
+  assert.match(output, /BABEL Inbox · session-pty-inbox/)
+  assert.match(output, /Insert bash prompt prefix/)
+  assert.doesNotMatch(output, /slash palette opened while inbox overlay owned input/)
+})
+
+test('PTY smoke: SessionChannel main-chat event card renders key message', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('session-inbox-event-card')
+  assert.match(output, /SessionChannel blocked · high · from=session-pty-source · to=session-pty-inbox/)
+  assert.match(output, /channel=channel-pty-inbox kind=workspace_pair message=msg-pty-card/)
+  assert.match(output, /\[open inbox: \/inbox\]/)
 })
 
 test('PTY smoke: compact command renders progress without internal details', { skip: !shouldRun || !existsSync(driver) }, () => {

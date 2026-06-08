@@ -3,6 +3,7 @@ import { readdir, stat } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { appendPathDriftGuidance, buildPathDriftDiagnostic } from './pathDrift.js'
 import { resolveInsideWorkspace } from './pathSafety.js'
 
 const DEFAULT_MAX_ENTRIES = 200
@@ -87,7 +88,10 @@ export const listDirTool: ToolDefinition<typeof inputSchema> = {
       if (code === 'ENOENT' || code === 'ENOTDIR') {
         return {
           success: false,
-          output: `ListDir could not find directory "${input.path}". Use ListDir on an existing parent directory or Glob for pattern-based discovery.`,
+          output: appendPathDriftGuidance(
+            `ListDir could not find directory "${input.path}". Use ListDir on an existing parent directory or Glob for pattern-based discovery.`,
+            buildPathDriftDiagnostic({ cwd: context.cwd, requestedPath: input.path }),
+          ),
         }
       }
       throw err

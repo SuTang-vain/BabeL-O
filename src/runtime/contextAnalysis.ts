@@ -1,4 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
+import type { SessionMessage } from '../shared/sessionChannel.js'
 import type {
   ModelMessage,
   ModelToolDefinition,
@@ -27,6 +28,7 @@ import { buildSessionMemoryLiteStatus, type SessionMemoryLiteStatus } from './se
 import { buildRuntimeDiagnostics, statusFromSignals, type RuntimeDiagnosticsEnvelope } from './runtimeDiagnostics.js'
 import { extractAbsolutePaths } from './systemPromptBuilder.js'
 import type { ContextSelectionDiagnostics } from './contextManager.js'
+import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 
 export type ContextDiagnosticSignal = {
   type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary'
@@ -60,6 +62,8 @@ export type ContextAnalysisDiagnostics = {
     pressurePercent: number
     truncated: boolean
   }
+  longTermMemory: MemoryProviderDiagnostics
+  scopedMemory: MemoryProviderDiagnostics[]
   sessionMemoryLite: SessionMemoryLiteStatus
   compactRetention: {
     hasBoundary: boolean
@@ -154,6 +158,19 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   toolsVisible: boolean
   retainedContextItems: number
   droppedContextItems: number
+  longTermMemoryProvider: string
+  longTermMemoryEnabled: boolean
+  longTermMemoryHitCount: number
+  longTermMemoryInjectedChars: number
+  longTermMemoryBudgetChars: number
+  longTermMemoryTruncated: boolean
+  longTermMemoryScope: string
+  longTermMemoryNamespaceId?: string
+  longTermMemoryNamespaceSource?: string
+  longTermMemoryIsolationKey?: string
+  longTermMemorySearchLatencyMs?: number
+  longTermMemoryError?: string
+  scopedMemory: MemoryProviderDiagnostics[]
 }>
 
 export type ContextAnalysis = {
@@ -218,6 +235,8 @@ export async function analyzeContext(options: {
   mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
   tools?: ModelToolDefinition[]
   warningPercent?: number
+  memoryProvider?: MemoryProvider
+  sessionInbox?: SessionMessage[]
 }): Promise<ContextAnalysis> {
   const assembled = await assembleContext({
     runtimeOptions: options.runtimeOptions,
@@ -225,6 +244,8 @@ export async function analyzeContext(options: {
     modelId: options.modelId,
     buildSystemPrompt: options.buildSystemPrompt,
     mapEventsToMessages: options.mapEventsToMessages,
+    memoryProvider: options.memoryProvider,
+    sessionInbox: options.sessionInbox,
   })
   const estimate = estimateContextTokens({
     systemPrompt: assembled.systemPrompt,
@@ -364,6 +385,19 @@ function buildContextDiagnosticEnvelope(options: {
       toolsVisible: options.runtimePolicy.toolsVisible,
       retainedContextItems: options.diagnostics.selection.retained.length,
       droppedContextItems: options.diagnostics.selection.dropped.length,
+      longTermMemoryProvider: options.diagnostics.longTermMemory.provider,
+      longTermMemoryEnabled: options.diagnostics.longTermMemory.enabled,
+      longTermMemoryHitCount: options.diagnostics.longTermMemory.hitCount,
+      longTermMemoryInjectedChars: options.diagnostics.longTermMemory.injectedChars,
+      longTermMemoryBudgetChars: options.diagnostics.longTermMemory.budgetChars,
+      longTermMemoryTruncated: options.diagnostics.longTermMemory.truncated,
+      longTermMemoryScope: options.diagnostics.longTermMemory.scope,
+      longTermMemoryNamespaceId: options.diagnostics.longTermMemory.namespaceId,
+      longTermMemoryNamespaceSource: options.diagnostics.longTermMemory.namespaceSource,
+      longTermMemoryIsolationKey: options.diagnostics.longTermMemory.isolationKey,
+      longTermMemorySearchLatencyMs: options.diagnostics.longTermMemory.searchLatencyMs,
+      longTermMemoryError: options.diagnostics.longTermMemory.error,
+      scopedMemory: options.diagnostics.scopedMemory,
     },
   })
 }
@@ -431,6 +465,17 @@ function buildContextDiagnostics(options: {
       pressurePercent: Math.round((options.assembled.projectMemory.length / Math.max(1, options.assembled.budget.layerBudgets.memory * 4)) * 100),
       truncated: options.assembled.memoryTruncated,
     },
+    longTermMemory: options.assembled.memoryProviderDiagnostics ?? {
+      provider: 'noop',
+      enabled: false,
+      hitCount: 0,
+      injectedChars: 0,
+      budgetChars: 0,
+      maxHitChars: 0,
+      truncated: false,
+      scope: 'unknown',
+    },
+    scopedMemory: options.assembled.scopedMemoryDiagnostics,
     sessionMemoryLite: buildSessionMemoryLiteStatus(options.events),
     compactRetention: {
       hasBoundary: options.compact.hasBoundary,
@@ -851,6 +896,11 @@ function buildContextRecommendations(options: {
   }
   if (options.diagnostics.memory.truncated || options.diagnostics.memory.pressurePercent >= 85) {
     recommendations.push('Project memory is near its budget; trim stale memory entries before long runs.')
+  }
+  if (options.diagnostics.longTermMemory.error) {
+    recommendations.push('Long-term memory retrieval failed; continue from local session/context evidence.')
+  } else if (options.diagnostics.longTermMemory.truncated) {
+    recommendations.push('Long-term memory hits were truncated; ask a narrower follow-up or reduce memory retrieval budget pressure.')
   }
   if (!options.hasCompactBoundary) {
     recommendations.push('No compact boundary exists yet; /compact can create a recoverable summary point.')

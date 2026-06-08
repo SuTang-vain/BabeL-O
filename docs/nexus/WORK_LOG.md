@@ -2,6 +2,199 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-08 — SessionChannel TUI 真实 PTY smoke 补强
+
+- **用户请求**: 继续推进 P2 SessionChannel TUI 真实 PTY smoke 补强，并说明当前 TUI 如何开始 session-to-session 对话流。
+- **实现**:
+  - `test/tui_pty_driver.py` 新增 seeded local SessionChannel inbox fixture，使用真实 `SqliteStorage` 写入两个 session、`workspace_pair` channel 与 unread handoff/blocked message，`bbl chat --session session-pty-inbox` 通过 embedded client 读取同一 SQLite。
+  - 新增真实 PTY 序列覆盖 unread footer、`/inbox` overlay 展示 collaboration boundary/evidence/channel kind、selected message ack、ack 后 no unread state、quote into prompt 且不自动提交、主对话关键 event card、overlay 对 slash palette 的焦点互斥、resize/navigation 后 overlay 稳定以及关闭后主输入框恢复。
+  - `test/tui-pty-smoke.test.ts` 注册 4 个 gated SessionChannel PTY smoke；默认仍需 `BABEL_O_RUN_PTY_SMOKE=1` 显式启用。
+  - 文档同步当前 UX 口径：TUI 目前是 consumption-side 入口（`/inbox` / `/inbox all` / `/inbox ack <messageId>`）；发起跨 session message 仍通过 Nexus API 或 AgentScheduler parent-child channel，不提供 raw transcript sharing 或直接跨 session 指令 UI。
+- **验证**:
+  - `BABEL_O_RUN_PTY_SMOKE=1 BABEL_O_CONFIG_FILE=/tmp/babel-o-session-inbox-pty-focused-config.json npx tsx --test --test-name-pattern "SessionChannel" test/tui-pty-smoke.test.ts`：4/4 通过。
+
+## 2026-06-08 — SessionChannel 主对话关键事件卡片
+
+- **用户请求**: 继续推进 SessionChannel TUI 联系可见化。
+- **实现**:
+  - `bbl chat` 在 session flow 结束后刷新 unread inbox snapshot，并只对关键 unread side-channel message 渲染主对话 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、以及 governance rejected / requires approval 的 `memory_candidate`。
+  - 卡片展示 source/target、channel kind/id、message id、evidence refs、memory candidate governance 与 `[open inbox] [ack] [quote]` 操作提示；不把消息内容自动作为当前 user message 注入，不自动触发工具，不改变 cwd/provider/profile/permission。
+  - `bbl chat` 启动时会把既有关键 inbox message 标记为 seen，避免旧消息在主对话中重放刷屏；普通低优先级 finding/question 继续只更新 unread indicator。
+  - `src/cli/inboxOverlay.ts` 新增 `shouldRenderInboxEventCard()` / `renderInboxEventCard()`，并补 focused renderer/reducer 测试覆盖关键消息筛选、governance 展示、宽度截断和 side-channel 文案。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-test-config.json npx tsx --test test/tui-input.test.ts test/sessions-command.test.ts`：50/50 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — SessionChannel TUI unread indicator / Inbox overlay
+
+- **用户请求**: 按规划实现 unread indicator 与 Inbox overlay。
+- **实现**:
+  - `bbl chat` boxed input footer 新增 SessionChannel 状态提示，显示 linked session 数、unread inbox 数、channel kind 摘要与 high-priority/key message 类型；状态不展示消息正文、不抢占主输入框、不改变当前 session 执行状态。
+  - 新增 `src/cli/inboxOverlay.ts`，`/inbox` / `/inbox all` 在 TTY 中打开 side-channel overlay，展示 source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs 与 memory candidate governance 摘要。
+  - Overlay 遵守唯一 input owner：使用 `inputState=inboxOverlay`，Esc/Backspace/Ctrl+C 关闭，↑/↓/PageUp/PageDown 导航，Enter open/read，`a` ack，`q` quote into current prompt；quote 只预填当前 prompt，必须由用户审阅后手动提交。
+  - `NexusClient` 与 embedded client 补齐 `listSessionChannels()`，用于 footer/overlay 显示 linked sessions 与 channel kind；非 TTY 路径保留原有文本 inbox 输出。
+  - 本切片不实现 raw transcript sharing、不把跨 session message 渲染为当前用户输入、不允许跨 session 静默改变 cwd/provider/profile/permission；主对话关键事件卡片与真实 PTY smoke 补强仍保留为后续 TUI 打开项。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-test-config.json npx tsx --test test/tui-input.test.ts test/sessions-command.test.ts`：48/48 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — Session Channel Phase E governed memory candidate MVP
+
+- **用户请求**: 推进 Session Channel + Scoped Memory Phase E。
+- **实现**:
+  - 新增 `memoryCandidateGovernance` 最小治理模型：`memory_candidate` SessionMessage 在 API 创建时会被评估为 review-only candidate，写入 message metadata，不触发 EverCore 或长期记忆写入。
+  - governance metadata 覆盖 scope classifier、evidence refs、confidence、staleness/supersession、approval requirement、blocked reasons、review reasons、write policy 与 `autoWrite=false`。
+  - `allowMemoryWriteRequests=false` 不再禁止候选消息传输，而是禁止候选请求直接写入；缺少 evidence、project scope 缺 workspace evidence、low confidence、stale/superseded、requested write disabled 等都会进入 rejected governance metadata。
+  - inbox context 会展示 `governance=<decision> scope=<scope> approval=<status>:<target> auto_write=false`，并明确 memory candidates 只是 review items，不是长期记忆写入。
+  - 本切片仍不实现完整 background dreaming、不做 raw transcript sharing、不把跨 session 消息当直接用户指令、不自动写入高影响项目事实。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-test-config.json npx tsx --test test/session-channel.test.ts test/context-assembler.test.ts`：61/61 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-e-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — Session Channel scoped diagnostics 与可行性回归
+
+- **用户请求**: 继续推进 Session Channel + Scoped Memory 的 Phase D user/channel scoped，并尝试测试 session-to-session 是否真实可行。
+- **实现**:
+  - `assembleContext()` 现在会输出 `scopedMemoryDiagnostics` 聚合分项：现有 MemoryProvider diagnostics 保留 project/user/unknown scope；session inbox 会形成 `provider=session-channel`、`scope=channel`、`namespaceId=<channelId>`、`isolationKey=channelId` 的 budget diagnostics。
+  - `analyzeContext()`、HTTP `/v1/sessions/:sessionId/context`、CLI `/context` 与 expanded context view 均暴露 `scopedMemory[]`，可同时观察 project/user/channel memory 的 hits、injected/budget、namespace 与 isolation key。
+  - 新增 user-scoped MemoryProvider fixture 与 channel-scoped inbox fixture，验证 user memory diagnostics 表达和 channel inbox budget diagnostics 不改变 EverCore projectId 隔离边界。
+  - 新增 SessionChannel API→Inbox→Context focused regression：两个已存在 session 创建 `workspace_pair` channel 后，session A 发送 typed `handoff` 到 session B；session B 的 context API 和 `assembleContext()` 可看到 non-cacheable collaboration context；ack 后该 channel message 不再进入 unread inbox 或 scoped channel diagnostics。
+  - 本切片不实现 governed dreaming、不做 raw transcript sharing、不把跨 session 消息当成用户直接指令，也不自动写入长期记忆。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-channel-test-config.json npx tsx --test test/context-assembler.test.ts test/runtime.test.ts test/session-channel.test.ts`：158/158 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-channel-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-channel-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — AgentScheduler parent-child SessionChannel
+
+- **用户请求**: 继续推进 P2/P3 Session Channel + Scoped Memory，优先实现 Phase C.2 AgentScheduler parent-child channel 可选集成。
+- **实现**:
+  - `ExploreAgentScheduler` spawn Explore/Review/Test child job 时会创建 `parent_child` SessionChannel，参与者为 parent session 与 child session，并把 `channelId` 写入 AgentJob metadata 与 child session metadata。
+  - parent→child 会写入 `request_review` 或 `request_validation` typed message，child runtime 继续通过现有 `listSessionInbox()` context 注入看到该 collaboration context。
+  - child job terminal 后会向 parent inbox 写入 `handoff` 或 `blocked` message，方便 parent session 获取结果摘要；`agent_job_event` 与 child transcript 查询仍是 lifecycle/source-of-truth，不被 SessionChannel 替代。
+  - 本切片不实现 raw transcript sharing、不新增 agent transport、不实现 governed dreaming，也不改变任何 cwd/provider/profile/permission。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-agent-channel-test-config.json npx tsx --test test/agent-scheduler.test.ts test/session-channel.test.ts`：19/19 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-agent-channel-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-agent-channel-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — EverCore project-scoped MemoryProvider diagnostics
+
+- **用户请求**: 继续推进 Session Channel + Scoped Memory Phase D，在 projectId namespace 治理后补 scoped MemoryProvider diagnostics。
+- **实现**:
+  - `MemoryProviderDiagnostics` 新增 `scope`、`namespaceId`、`namespaceSource` 与 `isolationKey`，并给 noop / mock provider 保留 `scope=unknown` 默认口径。
+  - `EverCoreMemoryProvider` 接收 `projectIdSource`，检索成功、空 query 与检索失败 diagnostics 均标记 `scope=project`、`namespaceId=<projectId>`、`namespaceSource=<explicit|workspace|default>` 与 `isolationKey=projectId`。
+  - `analyzeContext()` 与 HTTP `/v1/sessions/:sessionId/context` 的 diagnostic details 透出 long-term memory scope/namespace/isolation 字段。
+  - CLI `/context` formatter 与 expanded context view 均展示 long-term memory provider、scope、namespace、source、isolation、hits、injected/budget、latency、truncated 与 error。
+  - 本切片不新增 user/channel memory provider，不实现 governed dreaming，不改变 EverCore volatile / non-cacheable / non-authoritative hints 边界。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-memory-diagnostics-test-config.json npx tsx --test test/context-assembler.test.ts test/runtime.test.ts`：151/151 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-memory-diagnostics-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-scoped-memory-diagnostics-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — EverCore workspace projectId namespace 派生
+
+- **用户请求**: 继续推进 Phase D，在默认 projectId 诊断之后补 project/workspace identity 隔离能力。
+- **实现**:
+  - 新增 opt-in `BABEL_O_EVERCORE_PROJECT_ID_MODE=workspace`；未显式配置 `BABEL_O_EVERCORE_PROJECT_ID` 时，BabeL-O 会从 workspace git root（优先）或 cwd 派生稳定 projectId：`<sanitized-root-name>-<sha256(root).slice(0,12)>`。
+  - `configureEverCoreFromEnv()` 支持接收 workspace cwd；service mode 使用 `BABEL_O_WORKSPACE ?? process.cwd()`，embedded client 与 local run flow 使用当前 workspace cwd。
+  - 显式 `BABEL_O_EVERCORE_PROJECT_ID` 仍最高优先级；默认行为仍保持 `projectId=default` 并输出既有 `EVERCORE_PROJECT_ID_DEFAULT` guidance。
+  - runtime status namespace diagnostics 继续标记 Layer 2 Project memory 使用 `projectId` 隔离、`sessionScoped=false`，workspace 派生时 `projectIdSource=workspace` 且不报警。
+  - 本切片不实现 dreaming，不把 Project memory 改为 sessionId 隔离，也不改变 EverCore volatile / non-cacheable / non-authoritative hints 边界。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-workspace-namespace-test-config.json npx tsx --test test/runtime.test.ts`：100/100 通过。
+
+## 2026-06-08 — EverCore projectId namespace 诊断
+
+- **用户请求**: 按规划继续推进 Layer 2 Project memory 隔离治理；Project memory 不按 sessionId 隔离，应做 projectId namespace 治理。
+- **实现**:
+  - `EverCoreRuntimeConfig` 记录 `projectIdSource`，区分显式 `BABEL_O_EVERCORE_PROJECT_ID` 与默认 `projectId=default`。
+  - `/v1/runtime/status` 的 EverCore status 新增 `namespace` diagnostics，明确 Layer 2 Project memory 的隔离 key 是 `projectId`，`sessionScoped=false`。
+  - EverCore 启用且仍使用默认 projectId 时输出 `EVERCORE_PROJECT_ID_DEFAULT` warning 与 guidance，提示为每个项目设置 `BABEL_O_EVERCORE_PROJECT_ID`，或等待后续 cwd/git-root 派生 namespace；禁用 EverCore 时不报警。
+  - 继续保持 EverCore memory 为 volatile / non-cacheable / non-authoritative hints，不替代 SQLite/session/event/tool trace 事实源；本切片不实现 dreaming，也不把 Project memory 改成 sessionId 隔离。
+  - `TODO.md`、`active/TODO_runtime.md` 与 `DONE.md` 已同步：默认 projectId 诊断收口，cwd/git-root 派生 namespace 与 scoped MemoryProvider 继续留作 Phase D 后续。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-namespace-test-config.json npx tsx --test test/runtime.test.ts`：100/100 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-namespace-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-namespace-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — SessionChannel Phase C.1 CLI/TUI Inbox 可见化
+
+- **用户请求**: 根据后续优先级建议推进 Session Channel Phase C，让 unread inbox / ack / handoff 在 CLI/TUI 中可见、可操作。
+- **实现**:
+  - `NexusClient` 与 `EmbeddedNexusClient` 新增 `listSessionInbox()` / `ackSessionMessage()`，复用已有 `/v1/sessions/:sessionId/inbox` 与 `/ack` API。
+  - `bbl sessions inbox <sessionId>` 支持展示 unread inbox，`--include-acknowledged` 可包含已 ack 消息，`--json` 保留 raw response；`bbl sessions ack <sessionId> <messageId>` 可确认单条 inbox message。
+  - `bbl chat` 新增 `/inbox`、`/inbox all` 与 `/inbox ack <messageId>` slash 入口，并同步 slash palette、autosuggestion 与 help panel；展示 message id、createdAt、status、type、priority、from/to/broadcast、channel、content 与 evidence refs。
+  - Inbox 展示继续声明跨 session 消息只是 collaboration context，需要验证证据后再行动；本次不做 raw transcript sharing、不实现完整 dreaming，也不把 AgentScheduler parent-child lifecycle 替换为 channel。
+  - 新增 `test/sessions-command.test.ts` 覆盖 `sessions inbox/ack` 注册与 formatter，`test/completer.test.ts` 补 `/inbox` completion 元数据；新测试已加入默认 `npm test` 列表。
+  - `TODO.md`、`active/TODO_runtime.md` 与 `DONE.md` 已同步 Phase C.1 收口，AgentScheduler parent-child channel 仍作为 Phase C.2 可选后续。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-phase-c-test-config.json npx tsx --test test/sessions-command.test.ts test/completer.test.ts test/session-channel.test.ts`：23/23 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-phase-c-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-phase-c-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — SessionChannel + Scoped Memory MVP
+
+- **用户请求**: 新增 Session-to-Session memory channel 设计文档，并先实现最小 `SessionChannel` + Inbox，不一开始做完整 dreaming。
+- **实现**:
+  - 新增 `docs/nexus/reference/session-to-session-memory-channel-plan.md`，明确 session = workspace runtime state、project/workspace memory 隔离、user memory / auto-memory 只承载跨项目习惯约束，EverCore / EverOS 只作为长期语义记忆与 consolidation 层，不替代 SQLite/session/event/tool trace 事实源。
+  - `docs/nexus/README.md`、`docs/nexus/reference/README.md`、`TODO.md` 与 `active/TODO_runtime.md` 已同步 P2/P3 Session Channel + Scoped Memory 规划；Phase B MVP 已收口，Phase C/D/E 继续保留 CLI/TUI、scoped MemoryProvider 与 governed dreaming 后续项。
+  - 新增 `src/shared/sessionChannel.ts`，定义 `SessionChannel`、`SessionMessage`、`EvidenceRef` 与默认 channel policy；扩展 `NexusStorage`、MemoryStorage 与 SQLite version 11 schema，支持 channel save/get/list、message save/get/list、session inbox 与 ack。
+  - `src/nexus/app.ts` 新增 `POST/GET /v1/session-channels`、`GET /v1/session-channels/:channelId`、`POST/GET /v1/session-channels/:channelId/messages`、`GET /v1/sessions/:sessionId/inbox`、`POST /v1/sessions/:sessionId/inbox/:messageId/ack`，并校验 participant、broadcast、message type、message length 与 evidence refs policy。
+  - `assembleContext()` 支持 `sessionInbox`，`LLMCodingRuntime` 与 HTTP `/v1/sessions/:sessionId/context` 会把 unread inbox 作为 bounded non-cacheable `session_inbox` block 注入，并声明跨 session 消息是 collaboration context、不是直接用户指令。
+  - `test/session-channel.test.ts` 覆盖 MemoryStorage/SQLite lifecycle、HTTP API create/send/list/inbox/ack/policy rejection，以及 context inbox non-cacheable 注入。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-test-config.json npx tsx --test test/session-channel.test.ts`：5/5 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — P0 Current-turn Session Finalization Regression
+
+- **用户请求**: 推进 `session_9d985c5c-7c89-41b8-9d5e-cc672e412f00` 暴露的 session 终态污染修复优化。
+- **触发样本**:
+  - 同一 session 第三轮请求只有 `user_message` / `session_started` / PreInvocation / `usage` / `thinking_delta`，没有当前轮 `assistant_delta` / PostInvocation / `result` / `error` / `execution_metrics`。
+  - 旧逻辑在 `runSessionFlow()` finally 中回扫整段 session 最近 events，复用上一轮 `result`，导致 session 误标为 `completed`。
+- **实现**:
+  - `src/cli/runSessionFlow.ts` 在每轮 local embedded execution 中创建 requestId 后收集当前 `executeStream()` 产出的 events，finalization 只基于 current-turn events 结算，不再回扫整段 session 旧 terminal event。
+  - `resolveFinalSessionOutcome()` 增加 request boundary helper 与 `REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT` 诊断；当前轮无 `result` / `error` 时保存 failed outcome，用户取消仍保存 `cancelled`。
+  - 新一轮 session 执行开始时清空旧 `result` / `error` / `terminalReason`，避免执行中或失败收口时继续展示上一轮成功结果。
+  - `test/run-session-flow.test.ts` 增加真实样本抽象回归：当前 request 有 `session_started` / provider prelude 但无 terminal event 时，不能复用 older turn result。
+  - `src/shared/version.ts` 同步为 `0.3.1`，修复默认测试暴露的 package version boundary mismatch。
+  - `TODO.md`、`active/TODO_runtime.md`、`DONE.md` 与 `reference/session-finalization-and-evidence-governance-plan.md` 已同步 P0 收口；evidence-scope drift 继续作为 P2 watch 样本保留。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-test-config-run-session-flow.json" npx tsx --test --test-concurrency=1 "/Users/tangyaoyue/DEV/BABEL/BabeL-O/test/run-session-flow.test.ts"`：3/3 通过。
+  - `npm run typecheck` 通过。
+  - `npm run format:check` 通过。
+  - `npm test`：628/628 通过。
+
+## 2026-06-07 — EverCore Phase B Internal MemoryProvider
+
+- **用户请求**: 继续推进 P3 EverCore / 长期语义记忆。
+- **实现**:
+  - 新增 `src/runtime/memoryProvider.ts`，抽象 `MemoryProvider` / `NoopMemoryProvider` / `EverCoreMemoryProvider`，并把 EverOS 当前 `/api/v1/memory/search` 的 typed response（episodes / profiles / agent_cases / agent_skills / unprocessed_messages）解析为 bounded memory hits。
+  - `assembleContext()` 支持可选 `memoryProvider`，把检索结果追加为 `long_term_memory` system prompt block；该 block 明确为 volatile / non-cacheable，并提示模型将其视为 background hints 而非 authoritative project state，检索失败只记录 diagnostics、不进入 provider-visible context。
+  - `LLMCodingRuntime`、`runtimePipeline.refreshRuntimeContextState()`、`createDefaultNexusRuntime()` 已接入可选 provider；Nexus server、embedded client 与本地 CLI flow 都复用 `configureEverCoreFromEnv()`，仅在 EverCore healthy 时创建 provider。
+  - `test/context-assembler.test.ts` 覆盖 volatile 注入、失败不污染上下文、当前 EverOS typed search response parser；Phase A status/session-close 回归保持通过。
+  - `TODO.md`、`active/TODO_runtime.md` 与 `DONE.md` 已同步 Phase B 收口，后续 P3 转入 Phase C context budget / diagnostics。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-context-test-config.json npx tsx --test test/context-assembler.test.ts`：50/50 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-runtime-test-config.json npx tsx --test test/runtime.test.ts`：96/96 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
 ## 2026-06-06 — docs/nexus 分层归档整理
 
 - **用户请求**: 根据源码核对结果，重新整理归档 `docs/nexus`，清理过时文档，并保持权威文档中心为最新状态。
@@ -4303,3 +4496,182 @@
   - `DONE.md` 归档 Tool Discovery / Targeted Reading 第一阶段。
   - `README.md` 增加新规划文档入口。
   - `context-and-subagent-upgrade-plan.md` 清理过时口径：AgentScheduler model-visible tools 已落地，剩余边界是 write-capable child agent 安全。
+
+---
+
+## 2026-06-07 — Workspace path drift governance planning
+
+- **用户请求**: 将 `session_1cf5362d-b33f-467f-b07e-f97356652662` 暴露的最后工具调用问题泛化，并写成优化规划放入文档库合适位置。
+- **真实样本结论**:
+  - session cwd 为 `/Users/tangyaoyue/DEV/BABEL/BabeL-O`，但模型在跨仓库分析中漂移到 `/Users/tangyaoyue/DEV/BabeL-O`，少了 `BABEL` segment。
+  - 后续 `Read` / `ListDir` / `Glob` 在不存在 root 下连续 file-not-found / empty result；工具本身没有 fatal，session 也没有 runtime `error` event，但最终回答存在证据退化风险。
+  - 另有一次 `ListDir maxDepth=3` schema validation failure；该问题已被工具提示纠正，不是主要根因。
+- **规划结果**:
+  - 新增 `docs/nexus/reference/workspace-path-drift-governance-plan.md`，将问题抽象为 Workspace Path Drift、Tool Failure Recovery Drift 与 Evidence Degradation Without Fatal Error。
+  - 规划建议优先补最小 `PATH_DRIFT_SUSPECTED` diagnostic：在 `Read` / `ListDir` / `Glob` missing path / empty-result 中基于 cwd、attemptedPath 与 safe candidate path 给出纠偏提示。
+  - 明确非目标：不新增路径搜索工具、不自动切换 cwd、不绕过 path safety、不立即实现完整 Source Coverage Ledger。
+- **文档同步**:
+  - `docs/nexus/reference/README.md` 与 `docs/nexus/README.md` 增加新规划入口。
+  - `docs/nexus/TODO.md` 将 P2 / Watch 工具治理扩展为 Evidence-grounded Reading 与 Path Drift 治理，并把 `session_1cf5362d-b33f-467f-b07e-f97356652662` 作为真实样本登记。
+  - `docs/nexus/active/TODO_runtime.md` 增加 Phase B.8 Workspace Path Drift / Tool Failure Recovery 轻量诊断未收口项。
+- **验证**:
+  - 本次为文档规划与索引同步，未改 runtime 代码；未运行测试。
+
+---
+
+## 2026-06-07 — Grep pathMatches parameter drift planning
+
+- **用户请求**: 查看 `session_303c...120e4` 最新会话，分析 Grep 工具调用错误，并同步文档后开始修复。
+- **真实样本结论**:
+  - 目标会话为 `session_303c7221-8cc3-4251-9436-4215244120e4`，cwd 为 `/Users/tangyaoyue/DEV`。
+  - Grep 执行本身未崩溃；失败事件主要是 provider 生成重复 `pathMatches` 字段导致 `PARSE_ERROR: Invalid JSON from model`。
+  - 后续模型修正为合法 JSON，但使用 `pathMatches: "true"`；该值被 Grep/ripgrep 当成 file glob `true`，返回空结果，容易被误读为没有匹配。
+- **规划结果**:
+  - 在 P2 Tool Granularity / Evidence-grounded Reading 下新增 Phase B.9：Grep `pathMatches` 参数语义诊断。
+  - 最小修复方向：对 boolean-string `"true"` / `"false"` 返回 recoverable diagnostic，提示省略 `pathMatches` 或使用 file glob；不新增 Search 工具，不改变 Grep locator 边界。
+- **实现结果**:
+  - `src/tools/builtin/grep.ts` 在执行 ripgrep / fallback 前校验 `pathMatches`；boolean-string 非 glob 意图返回 `INVALID_GREP_PATH_MATCHES_GLOB`，保持 recoverable tool failure。
+  - `test/grep-tool.test.ts` 覆盖 `pathMatches: "true"` 的诊断输出，并保留正常 `**/*.ts` glob 过滤回归。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-grep-pathmatches-test-config.json" npm exec -- tsx --test --test-concurrency=1 "test/grep-tool.test.ts"`：4/4 通过。
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-grep-pathmatches-typecheck-config.json" npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-grep-pathmatches-format-config.json" npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+---
+
+## 2026-06-07 — Workspace path drift minimal diagnostic closure
+
+- **用户请求**: 根据 `workspace-path-drift-governance-plan.md` 推进最小优化实现。
+- **实现结果**:
+  - 新增 `src/tools/builtin/pathDrift.ts`，在 attempted path 不存在且 cwd 下存在 safe candidate path 时生成 `PATH_DRIFT_SUSPECTED` diagnostic。
+  - `Read` missing file 与 `ListDir` missing directory 结果追加 cwd-aware guidance，提醒不要把错误根路径的 missing 当成项目不存在证据。
+  - `Glob` 在显式 `path` search root 不存在时保持 `success=true` empty-result 语义；若检测到 workspace path drift，则返回 explanatory output 与 structured guidance。
+  - 实现不新增路径搜索工具、不自动切换 cwd、不绕过 `resolveInsideWorkspace` / allowed workspace 安全边界。
+- **回归覆盖**:
+  - `test/read-tool.test.ts` 覆盖 `/tmp/.../BABEL/BabeL-O` cwd 与 `/tmp/.../BabeL-O/src/index.ts` 错误绝对路径。
+  - `test/list-dir-tool.test.ts` 覆盖同类 missing directory drift。
+  - `test/runtime.test.ts` 覆盖 `Glob` missing search root 输出 `PATH_DRIFT_SUSPECTED` 与 candidate path。
+- **文档同步**:
+  - `docs/nexus/active/TODO_runtime.md` 将 Phase B.8 改为已收口摘要，保留 Source Coverage Ledger / evidence hint 为 Watch。
+  - `docs/nexus/TODO.md`、`docs/nexus/DONE.md` 与 `workspace-path-drift-governance-plan.md` 已同步最小诊断落地状态。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-path-drift-test-config.json" npm exec -- tsx --test --test-concurrency=1 "test/read-tool.test.ts" "test/list-dir-tool.test.ts" "test/runtime.test.ts"`：102/102 通过。
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-path-drift-typecheck-config.json" npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE="/tmp/babel-o-path-drift-format-config.json" npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+---
+
+## 2026-06-07 — EverCore Phase A REST Spike
+
+- **用户请求**: 尝试推进 BabeL-O 与 `/Users/tangyaoyue/DEV/EverOS` 的结合。
+- **接口核对**:
+  - EverOS 当前实际 REST API 是 `/api/v1/memory/add`、`/api/v1/memory/flush`、`/api/v1/memory/search`，不是早期规划里的 `/api/v1/memories/agent`。
+  - EverOS 不提供内置 auth；BabeL-O 侧保持默认关闭，URL diagnostics 只输出 redacted 版本。
+- **实现**:
+  - 新增 `src/runtime/everCoreClient.ts`：`HttpEverCoreClient` 支持 `search`、`addAgentMessages`、`flushAgentSession`，带 timeout、可选 bearer token header、实际 `/api/v1/memory/*` 路由和 bounded session event mapper。
+  - 新增 `src/nexus/everCoreConfig.ts`：环境变量配置 `BABEL_O_EVERCORE_ENABLED`、`BABEL_O_EVERCORE_BASE_URL`、`BABEL_O_EVERCORE_API_KEY`、`BABEL_O_EVERCORE_UPLOAD_ON_SESSION_END` 等；默认 disabled；health check 失败只进入 status，不 fail fast。
+  - `src/nexus/app.ts` 的 `/v1/runtime/status` 增加 `everCore` diagnostics，并把可选 EverCore client/config 传给 session close/cancel。
+  - `src/nexus/server.ts` 在 service mode 配置 EverCore，并在启动日志显示 `everCore=disabled|healthy|unhealthy`。
+  - `src/nexus/sessionLifecycle.ts` 在 `uploadOnSessionEnd` 启用时，session close/cancel 会上传 bounded user/result messages 并 flush；失败仅写入 `session.metadata.everCoreSync.status = "failed"`，不影响 close/cancel 响应。
+  - 不修改 `src/shared/events.ts`、storage interface、context assembler 或 provider loop；SQLite/session/event/tool trace 仍是事实源。
+- **回归覆盖**:
+  - `test/runtime.test.ts` 覆盖默认 disabled、URL redaction、实际 `/api/v1/memory/add|flush|search` 路由、runtime status EverCore diagnostics，以及 session close 时 EverCore sync failure non-fatal。
+- **文档同步**:
+  - `docs/nexus/TODO.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/DONE.md` 已同步 Phase A 已收口，Phase B/C/D 保留为 P3 后续项。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-runtime-test-config.json npx tsx --test test/runtime.test.ts`：96/96 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-typecheck-config.json npm run typecheck` 通过。
+
+---
+
+## 2026-06-07 — EverCore Phase B Internal MemoryProvider
+
+- **用户请求**: 继续推进 P3 EverCore / 长期语义记忆。
+- **实现**:
+  - 新增 `src/runtime/memoryProvider.ts`，定义 `MemoryProvider`、`NoopMemoryProvider` 与 `EverCoreMemoryProvider`。
+  - `EverCoreMemoryProvider` 通过 EverOS 当前 `/api/v1/memory/search` 检索 typed search response，提取 `episodes`、`profiles`、`agent_cases`、`agent_skills` 与 `unprocessed_messages` 作为 bounded hits。
+  - `assembleContext()` 接收可选 `memoryProvider`，把检索结果注入 `long_term_memory` volatile / non-cacheable section，并明确提示这些内容只是 background hints，不能作为 authoritative project state。
+  - `LLMCodingRuntime`、runtime pipeline、server、embedded client 与本地 CLI flow 均完成 provider threading；EverCore healthy 时启用，disabled/unhealthy 时不影响 BabeL-O 主流程。
+  - 检索失败只返回 diagnostics/空内容，不污染 provider-visible context；SQLite/session/event/tool trace 仍是事实源。
+- **回归覆盖**:
+  - `test/context-assembler.test.ts` 覆盖 MemoryProvider 注入为 volatile long-term memory、EverOS typed search response parser，以及检索失败不进入 provider-visible context。
+  - `test/runtime.test.ts` 保持 runtime/server 路径回归通过。
+- **文档同步**:
+  - `docs/nexus/TODO.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/DONE.md` 已同步 Phase B 已收口，并保留 Phase C diagnostics 为下一步。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-context-test-config.json npx tsx --test test/context-assembler.test.ts`：50/50 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-runtime-test-config.json npx tsx --test test/runtime.test.ts`：96/96 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phaseb-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+---
+
+## 2026-06-07 — EverCore Phase C Context Budget / Diagnostics
+
+- **用户请求**: 推进 Phase C：Context Budget / Diagnostics。
+- **实现**:
+  - `MemoryProviderDiagnostics` 增加 provider/enabled/hitCount/injectedChars/budgetChars/maxHitChars/truncated/searchLatencyMs/error，EverCore search 会记录独立 memory budget、per-hit budget、命中数、注入字符数、截断状态和检索耗时。
+  - `assembleContext()` 返回 `memoryProviderDiagnostics`，`analyzeContext()` 暴露 `diagnostics.longTermMemory`，并把 long-term memory fields 写入 diagnostic envelope details。
+  - HTTP `/v1/sessions/:sessionId/context` 接入 app-level `memoryProvider`，使 API context analysis 能报告 EverCore long-term memory diagnostics。
+  - CLI `/context` formatter 与 context view 增加 `long-term memory ... hits=... injected=... latency=... truncated/error` 诊断行。
+  - 检索失败保持 non-fatal，只进入 diagnostics 和 recommendations，不把错误文本注入 provider-visible context。
+- **回归覆盖**:
+  - `test/context-assembler.test.ts` 覆盖默认 noop diagnostics、long-term memory budget diagnostics、diagnostic envelope fields、CLI rendering 和 truncated recommendation。
+  - `test/runtime.test.ts` 覆盖 `/v1/sessions/:sessionId/context` 默认 noop diagnostics，以及 app-level memory provider 的 hit/budget/latency API passthrough。
+- **文档同步**:
+  - `docs/nexus/active/TODO_runtime.md` 将 Phase C 改为已收口摘要，只保留 Phase D Optional MCP Tools。
+  - `docs/nexus/TODO.md` 与 `docs/nexus/DONE.md` 已同步 Phase C 完成状态。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phasec-context-test-config.json npx tsx --test test/context-assembler.test.ts`：51/51 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phasec-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phasec-runtime-test-config.json npx tsx --test test/runtime.test.ts`：97/97 通过。
+
+---
+
+## 2026-06-07 — EverCore Phase D Optional MCP Tools
+
+- **用户请求**: 推进 P3 EverCore Phase D Optional MCP Tools。
+- **实现**:
+  - 新增 `src/tools/everCoreMcpTools.ts`，提供 `mcp:evercore:memory_search`、`mcp:evercore:memory_save_note` 与 `mcp:evercore:memory_flush_session`。
+  - 新增 `BABEL_O_ENABLE_EVERCORE_MCP_TOOLS=1` 显式开关；只有 EverCore enabled/healthy 且存在 client 时，`createDefaultNexusRuntime()` 才注册这些工具。
+  - `memory_search` 是 read-only bounded explicit retrieval，返回 hitCount/injectedChars/budgetChars/maxHitChars/truncated/searchLatencyMs/content，并提示 EverCore memories 只是 background hints。
+  - `memory_save_note` 与 `memory_flush_session` 标记为 write risk，复用现有 permission request / permission audit / MCP source identity，不自动执行。
+  - 不改变 Phase B/C 的每轮 MemoryProvider 自动检索路径；MCP tools 只用于用户主动或模型显式调用，不承担 session end 上传。
+- **回归覆盖**:
+  - `test/mcp.test.ts` 覆盖默认不注册、显式启用后的 tool audit/source identity、bounded search diagnostics、save/flush permission gating，以及 search failure non-fatal tool result。
+  - `test/runtime.test.ts` 继续覆盖 EverCore status diagnostics，并新增 `mcpToolsEnabled` 状态断言。
+- **文档同步**:
+  - `docs/nexus/active/TODO_runtime.md` 将 Phase D 改为已收口摘要。
+  - `docs/nexus/TODO.md` 与 `docs/nexus/DONE.md` 已同步 Phase D 完成状态。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phased-mcp-test-config.json npx tsx --test test/mcp.test.ts`：8/8 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phased-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phased-runtime-test-config.json npx tsx --test test/runtime.test.ts`：97/97 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-phased-context-test-config.json npx tsx --test test/context-assembler.test.ts`：51/51 通过。
+
+---
+
+## 2026-06-08 — EverCore Phase E Embedded / Managed EverCore Spike
+
+- **用户请求**: 推进 P3 Embedded / Managed EverCore 一体化部署 Spike，采用“一体化部署、边界仍解耦”。
+- **实现**:
+  - 新增 `src/nexus/everCoreSidecar.ts`，提供默认关闭的 managed EverCore sidecar lifecycle：loopback-only host 校验、自动本地端口分配、本地数据目录创建、`everos server start` 子进程启动、`/health` readiness polling、失败 diagnostics 与 dispose 清理。
+  - `configureEverCore()` 新增 `mode: disabled | external | managed`，环境变量 `BABEL_O_EVERCORE_MODE=managed`、`BABEL_O_EVERCORE_MANAGED_*` 与 `BABEL_O_EVERCORE_DATA_DIR` 可启用/覆盖 sidecar；旧 `BABEL_O_EVERCORE_ENABLED=1` + `BABEL_O_EVERCORE_BASE_URL` 继续映射为 external mode。
+  - Managed mode 向 EverOS 注入 `EVEROS_MEMORY__ROOT`、`EVEROS_API__HOST`、`EVEROS_API__PORT`，然后复用现有 `HttpEverCoreClient` / `EverCoreMemoryProvider` / optional MCP tools，不新增 BabeL-O 对 EverCore 内部 schema/index 的直接依赖。
+  - `createDefaultNexusRuntime()` 会在 storage close 时清理 managed sidecar；service mode、embedded Nexus client 与本地 CLI flow 均传递 dispose。
+  - `/v1/runtime/status` 增加 EverCore `mode` 与 `sidecar` diagnostics，展示 redacted endpoint、data dir、pid、running/healthy、upload/MCP tools 状态。
+- **边界**:
+  - 默认仍 disabled；managed sidecar 只允许 loopback/localhost/::1，不支持非本地绑定。
+  - Sidecar 启动/健康检查失败保持 non-fatal，不创建 memory provider，但 BabeL-O 主流程继续运行。
+  - SQLite/session/event/tool trace 仍是 authoritative 事实源；EverCore memory 仍是 volatile / non-cacheable / non-authoritative hints；不做 full merge，不做 remote provider loop。
+- **回归覆盖**:
+  - `test/runtime.test.ts` 覆盖 managed mode 启动参数/env 注入、自动端口分配、diagnostics、dispose 清理、非 loopback host 拒绝，以及 `/v1/runtime/status` sidecar diagnostics passthrough。
+- **文档同步**:
+  - `docs/nexus/active/TODO_runtime.md` 将 Phase E 改为已收口摘要。
+  - `docs/nexus/TODO.md` 与 `docs/nexus/DONE.md` 已同步 Phase E 完成状态。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-managed-runtime-test-config.json npx tsx --test test/runtime.test.ts`：100/100 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-managed-typecheck-config.json npm run typecheck` 通过。

@@ -40,6 +40,7 @@ test('mapDropdownSelection preserves control commands', () => {
   assert.strictEqual(mapDropdownSelection('/exit'), '/exit')
   assert.strictEqual(mapDropdownSelection('/status'), '/status')
   assert.strictEqual(mapDropdownSelection('/sessions'), '/sessions')
+  assert.strictEqual(mapDropdownSelection('/inbox'), '/inbox')
 })
 
 test('mapDropdownSelection preserves unknown inputs', () => {
@@ -52,6 +53,7 @@ test('tool and slash completion choices expose productized metadata', () => {
   assert.ok(getSlashCompletionChoices().includes('/compact'))
   assert.ok(getSlashCompletionChoices().includes('/context'))
   assert.ok(getSlashCompletionChoices().includes('/agentloop-smoke'))
+  assert.ok(getSlashCompletionChoices().includes('/inbox'))
   assert.ok(getToolCompletionChoices().includes('/tool bash'))
 
   const bash = describeCompletionChoice('/tool bash')
@@ -69,6 +71,10 @@ test('tool and slash completion choices expose productized metadata', () => {
   const agentLoopSmoke = describeCompletionChoice('/agentloop-smoke')
   assert.strictEqual(agentLoopSmoke.tag, 'agent')
   assert.match(agentLoopSmoke.description, /AgentLoop sub-agent hierarchy/)
+
+  const inbox = describeCompletionChoice('/inbox')
+  assert.strictEqual(inbox.tag, 'session')
+  assert.match(inbox.description, /SessionChannel messages/)
 
   const formatted = formatCompletionChoice('/tool read', true)
   assert.ok(formatted.includes('/tool read'))

@@ -1,6 +1,15 @@
+import { executeRuntimeHooks } from '../runtime/hooks.js'
+import {
+  buildEverCoreMessagesFromSession,
+  type EverCoreClient,
+} from '../runtime/everCoreClient.js'
+import type { HooksConfig } from '../shared/config.js'
+import { errorMessage } from '../shared/errors.js'
+import { nowIso } from '../shared/id.js'
 import { PendingPermissionRegistry, type SessionPhase, type SessionSnapshot } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { clearBashSessionState } from '../tools/builtin/bash.js'
+import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { clearTaskQueue } from './taskQueue.js'
 import {
   cancelTaskSession,
@@ -8,9 +17,6 @@ import {
   listTaskSessions,
   updateTaskSession,
 } from './taskSession.js'
-import { nowIso } from '../shared/id.js'
-import type { HooksConfig } from '../shared/config.js'
-import { executeRuntimeHooks } from '../runtime/hooks.js'
 
 export type CloseNexusSessionOptions = {
   storage: NexusStorage
@@ -18,6 +24,10 @@ export type CloseNexusSessionOptions = {
   phase?: 'cancelled' | 'completed' | 'failed'
   reason?: string
   hooks?: HooksConfig
+  everCore?: {
+    client?: EverCoreClient
+    config: EverCoreRuntimeConfig
+  }
 }
 
 export async function closeNexusSession(
@@ -71,12 +81,70 @@ export async function closeNexusSession(
       session.events.push(event)
       await options.storage.appendEvent(options.sessionId, event)
     }
+    await syncSessionToEverCore(options.storage, session, options.everCore)
   }
 
   return {
     session,
     permissionsResolved,
     childSessionsCancelled,
+  }
+}
+
+async function syncSessionToEverCore(
+  storage: NexusStorage,
+  session: SessionSnapshot,
+  everCore: CloseNexusSessionOptions['everCore'],
+): Promise<void> {
+  if (!everCore?.client || !everCore.config.uploadOnSessionEnd) return
+
+  const { events } = await storage.listEvents(session.sessionId, {
+    limit: 500,
+    order: 'asc',
+  })
+  const messages = buildEverCoreMessagesFromSession({
+    session,
+    events,
+    ...everCore.config,
+  })
+  if (messages.length === 0) return
+
+  try {
+    await everCore.client.addAgentMessages({
+      sessionId: session.sessionId,
+      appId: everCore.config.appId,
+      projectId: everCore.config.projectId,
+      messages,
+    })
+    await everCore.client.flushAgentSession({
+      sessionId: session.sessionId,
+      appId: everCore.config.appId,
+      projectId: everCore.config.projectId,
+    })
+    await storage.saveSession({
+      ...session,
+      metadata: {
+        ...(session.metadata ?? {}),
+        everCoreSync: {
+          status: 'flushed',
+          messageCount: messages.length,
+          syncedAt: nowIso(),
+        },
+      },
+    })
+  } catch (error) {
+    await storage.saveSession({
+      ...session,
+      metadata: {
+        ...(session.metadata ?? {}),
+        everCoreSync: {
+          status: 'failed',
+          messageCount: messages.length,
+          syncedAt: nowIso(),
+          error: errorMessage(error),
+        },
+      },
+    })
   }
 }
 

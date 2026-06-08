@@ -140,7 +140,18 @@ BabeL-O 已经通过 AgentScheduler 暴露 agent job 生命周期：
 - Bash timeout / SIGTERM 对普通命令应返回结构化失败 tool result，而不是直接让 session fatal。
 - Broad workspace shell scan 应提示缩小目录或改用 `ListDir` / `Glob` / `Grep`。
 
-### 3.4 Tool Name Fragmentation
+### 3.4 Grep parameter contract drift
+
+真实样本 `session_303c7221-8cc3-4251-9436-4215244120e4` 暴露了 Grep 参数语义缺口：provider 先多次生成重复 `pathMatches` 字段导致 tool input JSON parse error，随后把 `pathMatches` 修正为字符串 `"true"`。该值满足 schema 的 string 约束，但 `pathMatches` 的真实语义是 file glob filter，会被 ripgrep 当作 `--glob true`，从而返回空结果。
+
+治理口径：
+
+- `pathMatches` 只接受 file glob 意图，例如 `**/*.ts`、`**/package.json`。
+- boolean-string `"true"` / `"false"` 不是有效 glob 意图，应返回 recoverable diagnostic，而不是执行一个极易误导的空搜索。
+- 如果要搜索所有文件，应省略 `pathMatches`，而不是传 `true`。
+- malformed tool JSON 仍属于 provider tool-call generation drift；runtime parse error 已可恢复，后续只在重复复现时考虑更强 repair diagnostics。
+
+### 3.5 Tool Name Fragmentation
 
 工具名越多，不一定越好。过细工具会带来：
 

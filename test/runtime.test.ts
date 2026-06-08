@@ -59,6 +59,8 @@ import {
   REMOTE_RUNNER_PROTOCOL_VERSION,
   createRemoteToolRunnerServer,
 } from '../src/runtime/remoteRunner.js'
+import { HttpEverCoreClient } from '../src/runtime/everCoreClient.js'
+import { configureEverCore, configureEverCoreFromEnv } from '../src/nexus/everCoreConfig.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -319,6 +321,7 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
       estimatedTokensSaved: 0,
     },
     selectionDiagnostics: createEmptyContextSelectionDiagnostics(allocateBudget('missing-model-for-default-budget').maxTokens),
+    scopedMemoryDiagnostics: [],
   }
   const compactFailureEvent: NexusEvent = {
     type: 'compact_failure',
@@ -2019,6 +2022,77 @@ test('session close cascades runtime session state cleanup', async () => {
   }
 })
 
+test('session close records non-fatal EverCore sync failures', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-close`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const sessionId = `session-evercore-close-${Date.now()}`
+  let addCalls = 0
+  let flushCalls = 0
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: cwd,
+    everCoreClient: {
+      async search() {
+        return { data: {} }
+      },
+      async addAgentMessages() {
+        addCalls += 1
+        throw new Error('EverCore unavailable')
+      },
+      async flushAgentSession() {
+        flushCalls += 1
+        return { data: {} }
+      },
+    },
+    everCoreConfig: {
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      uploadOnSessionEnd: true,
+      maxMessages: 8,
+      maxContentChars: 200,
+      mcpToolsEnabled: false,
+    },
+  })
+  try {
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'close me with EverCore sync',
+      phase: 'executing',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: [],
+    })
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      ...eventBase(sessionId),
+      text: 'remember this bounded session fact',
+    })
+
+    const closeResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${sessionId}/close`,
+      payload: { phase: 'completed', reason: 'test close' },
+    })
+    assert.equal(closeResponse.statusCode, 200)
+    assert.equal(closeResponse.json().type, 'session_closed')
+    assert.equal(addCalls, 1)
+    assert.equal(flushCalls, 0)
+
+    const session = await storage.getSession(sessionId, { includeEvents: false })
+    assert.equal(session?.phase, 'completed')
+    assert.equal((session?.metadata?.everCoreSync as any)?.status, 'failed')
+    assert.match(String((session?.metadata?.everCoreSync as any)?.error), /EverCore unavailable/)
+  } finally {
+    await app.close()
+  }
+})
+
 test('tool audit reports risk and allowlist status', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-audit`)
   await mkdir(cwd, { recursive: true })
@@ -2066,6 +2140,305 @@ test('remote runner env config defaults to disabled and reports optional failure
   assert.equal(optionalFailure.status.healthy, false)
   assert.equal(optionalFailure.status.url, 'http://127.0.0.1:9/?token=%3Credacted%3E')
   assert.equal(optionalFailure.status.errorCode, 'REMOTE_RUNNER_CAPABILITIES_FAILED')
+})
+
+test('EverCore config defaults to disabled and redacts optional failures', async () => {
+  const disabled = await configureEverCore()
+  assert.equal(disabled.client, undefined)
+  assert.equal(disabled.status.configured, false)
+  assert.equal(disabled.status.enabled, false)
+  assert.equal(disabled.status.healthy, true)
+  assert.equal(disabled.status.uploadOnSessionEnd, false)
+  assert.equal(disabled.status.agentId, 'babel-o')
+  assert.equal(disabled.status.retrieveMethod, 'hybrid')
+  assert.deepEqual(disabled.status.namespace, {
+    layer: 'project_memory',
+    isolationKey: 'projectId',
+    sessionScoped: false,
+    projectIdSource: 'default',
+  })
+
+  const optionalFailure = await configureEverCore({
+    enabled: true,
+    baseUrl: 'http://user:secret@127.0.0.1:9?token=abc',
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.ok(optionalFailure.client)
+  assert.equal(optionalFailure.status.configured, true)
+  assert.equal(optionalFailure.status.enabled, true)
+  assert.equal(optionalFailure.status.healthy, false)
+  assert.equal(optionalFailure.status.url, 'http://127.0.0.1:9/?token=%3Credacted%3E')
+  assert.equal(optionalFailure.status.errorCode, 'EVERCORE_HEALTH_CHECK_FAILED')
+  assert.equal(optionalFailure.status.namespace?.warningCode, 'EVERCORE_PROJECT_ID_DEFAULT')
+  assert.match(optionalFailure.status.namespace?.guidance ?? '', /BABEL_O_EVERCORE_PROJECT_ID/)
+
+  const explicitProject = await configureEverCore({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:9',
+    projectId: 'babel-o-dev',
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.equal(explicitProject.config.projectId, 'babel-o-dev')
+  assert.deepEqual(explicitProject.status.namespace, {
+    layer: 'project_memory',
+    isolationKey: 'projectId',
+    sessionScoped: false,
+    projectIdSource: 'explicit',
+  })
+
+  const workspace = join(tmpdir(), `babel-o-evercore-workspace-${Date.now()}`)
+  const nestedWorkspace = join(workspace, 'packages', 'child')
+  await mkdir(join(workspace, '.git'), { recursive: true })
+  await mkdir(nestedWorkspace, { recursive: true })
+  const derivedProject = await configureEverCore({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:9',
+    projectIdMode: 'workspace',
+    cwd: nestedWorkspace,
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.equal(derivedProject.status.namespace?.projectIdSource, 'workspace')
+  assert.equal(derivedProject.status.namespace?.warningCode, undefined)
+  assert.match(derivedProject.config.projectId, /^babel-o-evercore-workspace-[0-9]+-[0-9a-f]{12}$/)
+
+  const derivedFromRoot = await configureEverCore({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:9',
+    projectIdMode: 'workspace',
+    cwd: workspace,
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.equal(derivedFromRoot.config.projectId, derivedProject.config.projectId)
+
+  const explicitProjectWins = await configureEverCore({
+    enabled: true,
+    baseUrl: 'http://127.0.0.1:9',
+    projectId: 'explicit-project',
+    projectIdMode: 'workspace',
+    cwd: nestedWorkspace,
+    fetch: async () => { throw new Error('connection refused') },
+  })
+  assert.equal(explicitProjectWins.config.projectId, 'explicit-project')
+  assert.equal(explicitProjectWins.status.namespace?.projectIdSource, 'explicit')
+
+  const envDerived = await configureEverCoreFromEnv({
+    BABEL_O_EVERCORE_ENABLED: '1',
+    BABEL_O_EVERCORE_BASE_URL: 'http://127.0.0.1:9',
+    BABEL_O_EVERCORE_PROJECT_ID_MODE: 'workspace',
+  } as NodeJS.ProcessEnv, { cwd: nestedWorkspace })
+  assert.equal(envDerived.config.projectId, derivedProject.config.projectId)
+  assert.equal(envDerived.status.namespace?.projectIdSource, 'workspace')
+})
+
+test('EverCore managed mode starts local sidecar and exposes diagnostics', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-managed`)
+  const spawnCalls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = []
+  let killed = false
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async host => {
+      assert.equal(host, '127.0.0.1')
+      return 9876
+    },
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    providerSettings: {
+      providerId: 'openai',
+      modelId: 'openai/gpt-4o',
+      apiKey: 'openai-key',
+      baseUrl: 'https://api.openai.example/v1',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'env',
+    },
+    managedSpawn(command, args, options) {
+      spawnCalls.push({ command, args, env: options.env })
+      return {
+        pid: 12345,
+        killed: false,
+        kill() {
+          killed = true
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async url => {
+      assert.equal(String(url), 'http://127.0.0.1:9876/health')
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 })
+    },
+  })
+
+  assert.ok(configured.client)
+  assert.ok(configured.memoryProvider)
+  assert.equal(configured.status.mode, 'managed')
+  assert.equal(configured.status.configured, true)
+  assert.equal(configured.status.enabled, true)
+  assert.equal(configured.status.healthy, true)
+  assert.equal(configured.status.url, 'http://127.0.0.1:9876/')
+  assert.equal(configured.status.sidecar?.managed, true)
+  assert.equal(configured.status.sidecar?.running, true)
+  assert.equal(configured.status.sidecar?.dataDir, dataDir)
+  assert.equal(configured.status.sidecar?.pid, 12345)
+  assert.equal(spawnCalls[0]?.command, 'everos-test')
+  assert.deepEqual(spawnCalls[0]?.args, ['server', 'start', '--host', '127.0.0.1', '--port', '9876'])
+  assert.equal(spawnCalls[0]?.env.EVEROS_MEMORY__ROOT, dataDir)
+  assert.equal(spawnCalls[0]?.env.EVEROS_API__HOST, '127.0.0.1')
+  assert.equal(spawnCalls[0]?.env.EVEROS_API__PORT, '9876')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'openai-key')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.openai.example/v1')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'gpt-4o')
+
+  await configured.dispose?.()
+  assert.equal(killed, true)
+})
+
+test('EverCore managed mode does not auto-map Anthropic-compatible provider settings', async () => {
+  const spawnCalls: Array<{ env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedPort: 9877,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    providerSettings: {
+      providerId: 'minimax',
+      modelId: 'minimax/MiniMax-M3',
+      apiKey: 'minimax-key',
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'provider_default',
+    },
+    managedSpawn(_command, _args, options) {
+      spawnCalls.push({ env: options.env })
+      return {
+        pid: 12346,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+
+  assert.ok(configured.client)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, undefined)
+  await configured.dispose?.()
+})
+
+test('EverCore managed mode uses explicit LLM override for sidecar env', async () => {
+  const spawnCalls: Array<{ env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedPort: 9878,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedLlmApiKey: 'evercore-key',
+    managedLlmBaseUrl: 'https://openai-compatible.example/v1',
+    managedLlmModel: 'memory-model',
+    providerSettings: {
+      providerId: 'minimax',
+      modelId: 'minimax/MiniMax-M3',
+      apiKey: 'minimax-key',
+      baseUrl: 'https://api.minimaxi.com/anthropic',
+      modelSource: 'env',
+      apiKeySource: 'env',
+      baseUrlSource: 'provider_default',
+    },
+    managedSpawn(_command, _args, options) {
+      spawnCalls.push({ env: options.env })
+      return {
+        pid: 12347,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+
+  assert.ok(configured.client)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'evercore-key')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://openai-compatible.example/v1')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'memory-model')
+  await configured.dispose?.()
+})
+
+test('EverCore managed mode rejects non-loopback hosts without starting sidecar', async () => {
+  let spawned = false
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedHost: '0.0.0.0',
+    managedSpawn() {
+      spawned = true
+      throw new Error('should not spawn')
+    },
+  })
+
+  assert.equal(spawned, false)
+  assert.equal(configured.client, undefined)
+  assert.equal(configured.memoryProvider, undefined)
+  assert.equal(configured.status.mode, 'managed')
+  assert.equal(configured.status.enabled, true)
+  assert.equal(configured.status.healthy, false)
+  assert.equal(configured.status.errorCode, 'EVERCORE_MANAGED_HOST_NOT_LOCAL')
+  assert.equal(configured.status.sidecar?.healthy, false)
+})
+
+test('EverCore client calls current memory REST routes', async () => {
+  const calls: Array<{ url: string; init: RequestInit }> = []
+  const client = new HttpEverCoreClient({
+    baseUrl: 'http://evercore.local',
+    apiKey: 'secret-token',
+    fetch: async (url, init) => {
+      calls.push({ url: String(url), init: init ?? {} })
+      return new Response(JSON.stringify({ request_id: 'req-1', data: { ok: true } }), {
+        status: 200,
+      })
+    },
+  })
+
+  await client.addAgentMessages({
+    sessionId: 'session-evercore-client',
+    appId: 'babel-o',
+    projectId: 'project-1',
+    messages: [{
+      sender_id: 'babel-o',
+      role: 'assistant',
+      timestamp: 1,
+      content: 'done',
+    }],
+  })
+  await client.flushAgentSession({
+    sessionId: 'session-evercore-client',
+    appId: 'babel-o',
+    projectId: 'project-1',
+  })
+  await client.search({
+    query: 'previous work',
+    agentId: 'babel-o',
+    appId: 'babel-o',
+    projectId: 'project-1',
+  })
+
+  assert.deepEqual(calls.map(call => new URL(call.url).pathname), [
+    '/api/v1/memory/add',
+    '/api/v1/memory/flush',
+    '/api/v1/memory/search',
+  ])
+  assert.equal((calls[0]?.init.headers as Record<string, string>).authorization, 'Bearer secret-token')
+  assert.equal(JSON.parse(String(calls[0]?.init.body)).session_id, 'session-evercore-client')
+  assert.equal(JSON.parse(String(calls[2]?.init.body)).agent_id, 'babel-o')
+  assert.equal(JSON.parse(String(calls[2]?.init.body)).method, 'hybrid')
 })
 
 test('required remote runner config fails fast when unhealthy', async () => {
@@ -2150,6 +2523,95 @@ test('/v1/runtime/status reports remote runner diagnostics', async () => {
     assert.equal(body.remoteRunner.healthy, true)
     assert.equal(body.remoteRunner.id, 'status-runner')
     assert.deepEqual(body.remoteRunner.capabilities.tools, ['Read'])
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/status reports EverCore diagnostics', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    everCoreStatus: {
+      configured: true,
+      enabled: true,
+      healthy: false,
+      mode: 'external',
+      url: 'http://127.0.0.1:8000/',
+      uploadOnSessionEnd: true,
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: false,
+      namespace: {
+        layer: 'project_memory',
+        isolationKey: 'projectId',
+        sessionScoped: false,
+        projectIdSource: 'explicit',
+      },
+      errorCode: 'EVERCORE_HEALTH_CHECK_FAILED',
+    },
+  })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/status' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.everCore.configured, true)
+    assert.equal(body.everCore.enabled, true)
+    assert.equal(body.everCore.healthy, false)
+    assert.equal(body.everCore.mode, 'external')
+    assert.equal(body.everCore.uploadOnSessionEnd, true)
+    assert.equal(body.everCore.mcpToolsEnabled, false)
+    assert.equal(body.everCore.namespace?.isolationKey, 'projectId')
+    assert.equal(body.everCore.namespace?.sessionScoped, false)
+    assert.equal(body.everCore.errorCode, 'EVERCORE_HEALTH_CHECK_FAILED')
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/status reports managed EverCore sidecar diagnostics', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    everCoreStatus: {
+      configured: true,
+      enabled: true,
+      healthy: true,
+      mode: 'managed',
+      url: 'http://127.0.0.1:9876/',
+      uploadOnSessionEnd: false,
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: true,
+      sidecar: {
+        mode: 'managed',
+        managed: true,
+        running: true,
+        healthy: true,
+        url: 'http://127.0.0.1:9876/',
+        dataDir: '/tmp/babel-o-evercore',
+        pid: 12345,
+      },
+    },
+  })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/status' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.everCore.mode, 'managed')
+    assert.equal(body.everCore.sidecar.running, true)
+    assert.equal(body.everCore.sidecar.dataDir, '/tmp/babel-o-evercore')
+    assert.equal(body.everCore.mcpToolsEnabled, true)
   } finally {
     await app.close()
   }
@@ -2791,6 +3253,9 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     assert.equal(body.diagnostics.sessionMemoryLite.path, '.babel-o/session-memory.md')
     assert.equal(body.diagnostics.sessionMemoryLite.costPolicy.modelFallback, 'extractive-only')
     assert.equal(typeof body.diagnostics.sessionMemoryLite.nextDecision.estimatedTokensSinceLastUpdate, 'number')
+    assert.equal(body.diagnostics.longTermMemory.provider, 'noop')
+    assert.equal(body.diagnostics.longTermMemory.enabled, false)
+    assert.equal(body.diagnostic.details.longTermMemoryEnabled, false)
     assert.ok(Array.isArray(body.diagnostics.signals))
     assert.ok(Array.isArray(body.recommendations))
 
@@ -2868,6 +3333,84 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     await app.close()
   }
 })
+
+test('/v1/sessions/:sessionId/context reports long-term memory diagnostics', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-context-evercore`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const sessionId = `session-context-evercore-${Date.now()}`
+  let retrieveCalls = 0
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: cwd,
+    memoryProvider: {
+      name: 'evercore-test',
+      async retrieve(input) {
+        retrieveCalls += 1
+        assert.equal(input.prompt, 'What did we decide about memory?')
+        return {
+          content: '- Keep EverCore memory volatile.',
+          diagnostics: {
+            provider: 'evercore-test',
+            enabled: true,
+            hitCount: 1,
+            injectedChars: 32,
+            budgetChars: 128,
+            maxHitChars: 64,
+            truncated: false,
+            searchLatencyMs: 3,
+            scope: 'project',
+            namespaceId: 'project-api',
+            namespaceSource: 'explicit',
+            isolationKey: 'projectId',
+          },
+        }
+      },
+    },
+  })
+  try {
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'What did we decide about memory?',
+      phase: 'executing',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      events: [],
+    })
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/context?modelId=local/coding-runtime`,
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(retrieveCalls, 1)
+    assert.equal(body.diagnostics.longTermMemory.provider, 'evercore-test')
+    assert.equal(body.diagnostics.longTermMemory.enabled, true)
+    assert.equal(body.diagnostics.longTermMemory.hitCount, 1)
+    assert.equal(body.diagnostics.longTermMemory.injectedChars, 32)
+    assert.equal(body.diagnostics.longTermMemory.budgetChars, 128)
+    assert.equal(body.diagnostics.longTermMemory.scope, 'project')
+    assert.equal(body.diagnostics.longTermMemory.namespaceId, 'project-api')
+    assert.equal(body.diagnostics.longTermMemory.namespaceSource, 'explicit')
+    assert.equal(body.diagnostics.longTermMemory.isolationKey, 'projectId')
+    assert.equal(body.diagnostic.details.longTermMemoryProvider, 'evercore-test')
+    assert.equal(body.diagnostic.details.longTermMemoryHitCount, 1)
+    assert.equal(body.diagnostic.details.longTermMemoryScope, 'project')
+    assert.equal(body.diagnostic.details.longTermMemoryNamespaceId, 'project-api')
+    assert.equal(body.diagnostic.details.longTermMemoryNamespaceSource, 'explicit')
+    assert.equal(body.diagnostic.details.longTermMemoryIsolationKey, 'projectId')
+    assert.equal(body.diagnostics.scopedMemory.length, 1)
+    assert.equal(body.diagnostics.scopedMemory[0].scope, 'project')
+    assert.equal(body.diagnostics.scopedMemory[0].namespaceId, 'project-api')
+    assert.equal(body.diagnostic.details.scopedMemory[0].isolationKey, 'projectId')
+  } finally {
+    await app.close()
+  }
+})
+
 
 test('/v1/sessions/:sessionId/compact creates a manual compact boundary', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-compact-api`)
@@ -4054,6 +4597,24 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
     const lines2 = String(res2.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines2.length, 2)
   }
+})
+
+test('Glob diagnoses workspace path drift for missing search roots', async () => {
+  const root = join(tmpdir(), `babel-o-test-${Date.now()}-glob-path-drift`)
+  const cwd = join(root, 'BABEL', 'BabeL-O')
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'src', 'index.ts'), 'export {}', 'utf8')
+
+  const result = await globTool.execute(
+    { pattern: '**/*.ts', path: join(root, 'BabeL-O', 'src'), maxResults: 10 },
+    { cwd, sessionId: 'test-session-glob-path-drift', maxOutputBytes: 1000, bashMaxBufferBytes: 1000 },
+  )
+
+  assert.equal(result.success, true)
+  assert.ok(Array.isArray(result.output))
+  assert.match(String(result.output[0]), /does not exist/)
+  assert.equal((result.output[1] as any).guidance.code, 'PATH_DRIFT_SUSPECTED')
+  assert.equal((result.output[1] as any).guidance.candidatePath, join(cwd, 'src'))
 })
 
 test('Glob tool enforces maxResults limits and appends truncation warning', async () => {

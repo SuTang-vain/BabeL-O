@@ -397,6 +397,8 @@ export async function refreshRuntimeContextState(options: ContextAssemblerOption
     modelId: options.modelId,
     buildSystemPrompt: options.buildSystemPrompt,
     mapEventsToMessages: options.mapEventsToMessages,
+    memoryProvider: options.memoryProvider,
+    sessionInbox: options.sessionInbox,
   })
 
   return buildRuntimeContextRefreshState({

@@ -48,6 +48,7 @@ import { formatContextAnalysis } from '../src/cli/commands/chat.js'
 import { normalizeContextViewKey, renderContextView } from '../src/cli/contextView.js'
 import { CONTEXT_MANAGER_PHASES } from '../src/runtime/contextManager.js'
 import { stripAnsi, visibleTerminalWidth } from '../src/cli/terminalWidth.js'
+import { extractEverCoreMemoryHits } from '../src/runtime/memoryProvider.js'
 
 const schemaVersion = '2026-05-21.babel-o.v1' as const
 
@@ -1668,6 +1669,9 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.ok(analysis.diagnostics.selection.workingSetPaths.some(path => path.endsWith('src/runtime/contextAnalysis.ts')))
   assert.equal(analysis.diagnostic.details.retainedContextItems, analysis.diagnostics.selection.retained.length)
   assert.equal(analysis.diagnostic.details.droppedContextItems, analysis.diagnostics.selection.dropped.length)
+  assert.equal(analysis.diagnostics.longTermMemory.provider, 'noop')
+  assert.equal(analysis.diagnostics.longTermMemory.enabled, false)
+  assert.equal(analysis.diagnostic.details.longTermMemoryEnabled, false)
   assert.equal(analysis.diagnostics.autoCompactFloor.thresholdPercent, analysis.diagnostics.autoCompact.thresholdPercent)
   assert.equal(analysis.diagnostics.autoCompactFloor.thresholdTokens, Math.floor(analysis.window.maxTokens * (analysis.diagnostics.autoCompact.thresholdPercent / 100)))
   assert.equal(analysis.diagnostics.autoCompactFloor.assemblyBudgetTokens, analysis.budget.maxTokens)
@@ -1699,6 +1703,139 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'repeated_tool_input'))
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Large tool results')))
 })
+
+test('analyzeContext exposes long-term memory budget diagnostics', async () => {
+  const analysis = await analyzeContext({
+    runtimeOptions: {
+      sessionId: 'session-long-term-memory-context',
+      prompt: 'Use remembered EverCore constraints',
+      cwd: tmpdir(),
+    },
+    events: [],
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+    memoryProvider: {
+      name: 'evercore-test',
+      async retrieve() {
+        return {
+          content: '- Remembered constraint: volatile only.',
+          diagnostics: {
+            provider: 'evercore-test',
+            enabled: true,
+            hitCount: 2,
+            injectedChars: 39,
+            budgetChars: 64,
+            maxHitChars: 32,
+            truncated: true,
+            searchLatencyMs: 12.5,
+            scope: 'project',
+            namespaceId: 'babel-o-dev',
+            namespaceSource: 'workspace',
+            isolationKey: 'projectId',
+          },
+        }
+      },
+    },
+  })
+
+  assert.equal(analysis.diagnostics.longTermMemory.provider, 'evercore-test')
+  assert.equal(analysis.diagnostics.longTermMemory.enabled, true)
+  assert.equal(analysis.diagnostics.longTermMemory.hitCount, 2)
+  assert.equal(analysis.diagnostics.longTermMemory.injectedChars, 39)
+  assert.equal(analysis.diagnostics.longTermMemory.budgetChars, 64)
+  assert.equal(analysis.diagnostics.longTermMemory.maxHitChars, 32)
+  assert.equal(analysis.diagnostics.longTermMemory.truncated, true)
+  assert.equal(analysis.diagnostics.longTermMemory.scope, 'project')
+  assert.equal(analysis.diagnostics.longTermMemory.namespaceId, 'babel-o-dev')
+  assert.equal(analysis.diagnostics.longTermMemory.namespaceSource, 'workspace')
+  assert.equal(analysis.diagnostics.longTermMemory.isolationKey, 'projectId')
+  assert.equal(analysis.diagnostic.details.longTermMemoryProvider, 'evercore-test')
+  assert.equal(analysis.diagnostic.details.longTermMemoryHitCount, 2)
+  assert.equal(analysis.diagnostic.details.longTermMemoryInjectedChars, 39)
+  assert.equal(analysis.diagnostic.details.longTermMemoryBudgetChars, 64)
+  assert.equal(analysis.diagnostic.details.longTermMemoryTruncated, true)
+  assert.equal(analysis.diagnostic.details.longTermMemoryScope, 'project')
+  assert.equal(analysis.diagnostic.details.longTermMemoryNamespaceId, 'babel-o-dev')
+  assert.equal(analysis.diagnostic.details.longTermMemoryNamespaceSource, 'workspace')
+  assert.equal(analysis.diagnostic.details.longTermMemoryIsolationKey, 'projectId')
+  assert.equal(analysis.diagnostic.details.longTermMemorySearchLatencyMs, 12.5)
+  assert.equal(analysis.diagnostics.scopedMemory.length, 1)
+  assert.equal(analysis.diagnostics.scopedMemory[0]?.scope, 'project')
+  assert.equal(analysis.diagnostics.scopedMemory[0]?.namespaceId, 'babel-o-dev')
+  assert.equal(analysis.diagnostic.details.scopedMemory.length, 1)
+  assert.equal(analysis.diagnostic.details.scopedMemory[0]?.isolationKey, 'projectId')
+  assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Long-term memory hits were truncated')))
+
+  const rendered = formatContextAnalysis(analysis)
+  assert.match(stripAnsi(rendered), /long-term memory evercore-test scope=project namespace=babel-o-dev source=workspace isolation=projectId · hits=2 injected=39 chars\/64 chars latency=13ms · truncated/)
+  assert.match(stripAnsi(rendered), /scoped memory project evercore-test namespace=babel-o-dev source=workspace isolation=projectId · hits=2 injected=39 chars\/64 chars · truncated/)
+})
+
+
+test('analyzeContext exposes user and channel scoped memory diagnostics', async () => {
+  const analysis = await analyzeContext({
+    runtimeOptions: {
+      sessionId: 'session-scoped-memory-context',
+      prompt: 'Use scoped memory if relevant',
+      cwd: tmpdir(),
+    },
+    events: [],
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+    memoryProvider: {
+      name: 'user-memory-test',
+      async retrieve() {
+        return {
+          content: '- User prefers concise validation reports.',
+          diagnostics: {
+            provider: 'user-memory-test',
+            enabled: true,
+            hitCount: 1,
+            injectedChars: 42,
+            budgetChars: 96,
+            maxHitChars: 96,
+            truncated: false,
+            scope: 'user',
+            namespaceId: 'user-tangyaoyue',
+            namespaceSource: 'explicit',
+            isolationKey: 'userId',
+          },
+        }
+      },
+    },
+    sessionInbox: [{
+      messageId: 'msg-channel-memory',
+      channelId: 'channel-session-pair',
+      fromSessionId: 'session-a',
+      toSessionId: 'session-scoped-memory-context',
+      broadcast: false,
+      type: 'finding',
+      content: 'Sibling session verified that inbox context is collaboration-only.',
+      priority: 'normal',
+      createdAt: '2026-06-08T00:00:00.000Z',
+      deliveredAt: '2026-06-08T00:00:00.000Z',
+      status: 'delivered',
+    }],
+  })
+
+  assert.equal(analysis.diagnostics.longTermMemory.scope, 'user')
+  assert.equal(analysis.diagnostics.longTermMemory.isolationKey, 'userId')
+  assert.equal(analysis.diagnostics.scopedMemory.length, 2)
+  assert.equal(analysis.diagnostics.scopedMemory[0]?.scope, 'user')
+  assert.equal(analysis.diagnostics.scopedMemory[1]?.scope, 'channel')
+  assert.equal(analysis.diagnostics.scopedMemory[1]?.provider, 'session-channel')
+  assert.equal(analysis.diagnostics.scopedMemory[1]?.namespaceId, 'channel-session-pair')
+  assert.equal(analysis.diagnostics.scopedMemory[1]?.isolationKey, 'channelId')
+  assert.equal(analysis.diagnostic.details.scopedMemory[1]?.scope, 'channel')
+  assert.equal(analysis.diagnostic.details.scopedMemory[1]?.hitCount, 1)
+
+  const rendered = stripAnsi(formatContextAnalysis(analysis))
+  assert.match(rendered, /scoped memory user user-memory-test namespace=user-tangyaoyue source=explicit isolation=userId · hits=1 injected=42 chars\/96 chars/)
+  assert.match(rendered, /scoped memory channel session-channel namespace=channel-session-pair isolation=channelId · hits=1 injected=/)
+})
+
 
 test('analyzeContext reports compact token delta after a compact boundary', async () => {
   const cwd = join(tmpdir(), `babel-o-context-compact-delta-${Date.now()}`)
@@ -3257,6 +3394,122 @@ test('auto compact preserves recovery boundary after cancellation or failure', a
   assert.ok(messagesText.includes('Follow-up after cancellation'), 'recovery boundary user message should survive auto-compact')
   assert.ok(messagesText.includes('Final question after recovery.'), 'final user message after recovery should survive auto-compact')
 })
+
+test('assembleContext injects MemoryProvider results as volatile long-term memory', async () => {
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-memory-provider-context',
+      prompt: 'Use prior architecture context',
+      cwd: tmpdir(),
+    },
+    events: [],
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+    memoryProvider: {
+      name: 'test-memory',
+      async retrieve(input) {
+        assert.equal(input.prompt, 'Use prior architecture context')
+        return {
+          content: '- Prior decision: keep EverCore memory volatile.',
+          diagnostics: {
+            provider: 'test-memory',
+            enabled: true,
+            hitCount: 1,
+            injectedChars: 48,
+            budgetChars: 128,
+            maxHitChars: 64,
+            truncated: false,
+            scope: 'unknown',
+          },
+        }
+      },
+    },
+  })
+
+  assert.match(context.systemPrompt, /Long-term semantic memory \(volatile, retrieved for the current request\):/)
+  assert.match(context.systemPrompt, /Prior decision: keep EverCore memory volatile/)
+  assert.match(context.systemPrompt, /not authoritative project state/)
+  assert.equal(context.memoryProviderDiagnostics?.provider, 'test-memory')
+  assert.equal(context.memoryProviderDiagnostics?.hitCount, 1)
+  assert.equal(context.systemPromptBlocks?.at(-1)?.cacheable, false)
+  assert.equal(context.systemPromptBlocks?.at(-1)?.text.includes('Long-term semantic memory'), true)
+})
+
+test('extractEverCoreMemoryHits reads current EverOS typed search response', () => {
+  const hits = extractEverCoreMemoryHits({
+    request_id: 'req-1',
+    data: {
+      episodes: [{
+        id: 'episode-1',
+        summary: 'Conversation summary about runtime memory.',
+        session_id: 'session-1',
+        score: 0.91,
+      }],
+      profiles: [],
+      agent_cases: [{
+        id: 'case-1',
+        approach: 'Use volatile context instead of authoritative storage replacement.',
+        session_id: 'session-2',
+        score: 0.82,
+      }],
+      agent_skills: [{
+        id: 'skill-1',
+        content: 'Keep memory retrieval bounded and non-cacheable.',
+        name: 'bounded-memory',
+        score: 0.77,
+      }],
+      unprocessed_messages: [],
+    },
+  })
+
+  assert.deepEqual(hits.map(hit => hit.content), [
+    'Conversation summary about runtime memory.',
+    'Use volatile context instead of authoritative storage replacement.',
+    'Keep memory retrieval bounded and non-cacheable.',
+  ])
+  assert.deepEqual(hits.map(hit => hit.source), ['episode-1', 'case-1', 'skill-1'])
+  assert.deepEqual(hits.map(hit => hit.score), [0.91, 0.82, 0.77])
+})
+
+
+test('assembleContext keeps MemoryProvider failures out of provider-visible context', async () => {
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-memory-provider-failure',
+      prompt: 'Use prior context if available',
+      cwd: tmpdir(),
+    },
+    events: [],
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+    memoryProvider: {
+      name: 'test-memory',
+      async retrieve() {
+        return {
+          content: '',
+          diagnostics: {
+            provider: 'test-memory',
+            enabled: true,
+            hitCount: 0,
+            injectedChars: 0,
+            budgetChars: 128,
+            maxHitChars: 64,
+            truncated: false,
+            scope: 'unknown',
+            error: 'EverCore unavailable',
+          },
+        }
+      },
+    },
+  })
+
+  assert.doesNotMatch(context.systemPrompt, /Long-term semantic memory/)
+  assert.doesNotMatch(context.systemPrompt, /EverCore unavailable/)
+  assert.equal(context.memoryProviderDiagnostics?.error, 'EverCore unavailable')
+})
+
 
 test('buildSystemPrompt anchors focus project when prompt lacks explicit path', async () => {
   const home = homedir()

@@ -1,5 +1,6 @@
 import { createNexusApp } from '../nexus/app.js'
 import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
+import { ConfigManager } from '../shared/config.js'
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import {
   assertAgentRemoteExecutionReady,
@@ -7,6 +8,8 @@ import {
   configureRemoteRunnerFromEnv,
   parseAgentExecutionEnvironment,
 } from '../nexus/remoteRunnerConfig.js'
+import { configureEverCoreFromEnv } from '../nexus/everCoreConfig.js'
+import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 
 export type EmbeddedNexusClientOptions = {
   cwd: string
@@ -56,6 +59,53 @@ export class EmbeddedNexusClient {
       'GET',
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listSessionChannels(options: { sessionId?: string; limit?: number } = {}): Promise<{ type: 'session_channels'; channels: SessionChannel[]; limit: number }> {
+    const params = new URLSearchParams()
+    if (options.sessionId) params.set('sessionId', options.sessionId)
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson('GET', `/v1/session-channels${query}`) as Promise<{
+      type: 'session_channels'
+      channels: SessionChannel[]
+      limit: number
+    }>
+  }
+
+  async listSessionInbox(
+    sessionId: string,
+    options: { limit?: number; includeAcknowledged?: boolean } = {},
+  ): Promise<{ type: 'session_inbox'; sessionId: string; messages: SessionMessage[]; limit: number; includeAcknowledged: boolean }> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.includeAcknowledged !== undefined) params.set('includeAcknowledged', String(options.includeAcknowledged))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson(
+      'GET',
+      `/v1/sessions/${encodeURIComponent(sessionId)}/inbox${query}`,
+    ) as Promise<{
+      type: 'session_inbox'
+      sessionId: string
+      messages: SessionMessage[]
+      limit: number
+      includeAcknowledged: boolean
+    }>
+  }
+
+  async ackSessionMessage(
+    sessionId: string,
+    messageId: string,
+  ): Promise<{ type: 'session_message_acknowledged'; sessionId: string; message: SessionMessage | null }> {
+    return this.injectJson(
+      'POST',
+      `/v1/sessions/${encodeURIComponent(sessionId)}/inbox/${encodeURIComponent(messageId)}/ack`,
+      {},
+    ) as Promise<{
+      type: 'session_message_acknowledged'
+      sessionId: string
+      message: SessionMessage | null
+    }>
   }
 
   async listAgents(filter: AgentJobFilter = {}): Promise<{ type: 'agent_jobs'; jobs: AgentJob[] }> {
@@ -125,6 +175,11 @@ export class EmbeddedNexusClient {
     const remoteRunner = await configureRemoteRunnerFromEnv()
     assertRemoteRunnerReady(remoteRunner.status)
     assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
+    const providerSettings = ConfigManager.getInstance().resolveSettings()
+    const everCore = await configureEverCoreFromEnv(process.env, {
+      cwd: this.options.cwd,
+      providerSettings,
+    })
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath: this.options.storagePath,
       allowedTools: this.options.allowedTools,
@@ -132,6 +187,12 @@ export class EmbeddedNexusClient {
       enableMcp: this.options.enableMcp,
       remoteRunner: remoteRunner.runner,
       agentExecutionEnvironment,
+      memoryProvider: everCore.memoryProvider,
+      everCore: {
+        client: everCore.client,
+        config: everCore.config,
+        dispose: everCore.dispose,
+      },
     })
     const app = await createNexusApp({
       runtime,
@@ -140,6 +201,10 @@ export class EmbeddedNexusClient {
       apiKey: '',
       remoteRunner: remoteRunner.runner,
       remoteRunnerStatus: remoteRunner.status,
+      everCoreClient: everCore.client,
+      everCoreConfig: everCore.config,
+      everCoreStatus: everCore.status,
+      memoryProvider: everCore.memoryProvider,
       agentExecutionEnvironment,
     })
     try {

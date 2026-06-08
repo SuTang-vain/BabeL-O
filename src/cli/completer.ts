@@ -22,7 +22,7 @@ type SlashPaletteOptions = {
 
 export function getSlashCompletionChoices(): string[] {
   return [
-    '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/agents', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
+    '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/agents', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/inbox', '/history', '/tool',
     '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e',
   ]
 }

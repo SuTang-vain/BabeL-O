@@ -1,6 +1,8 @@
 import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime } from './createRuntime.js'
+import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
+import { configureEverCoreFromEnv } from './everCoreConfig.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -48,6 +50,8 @@ try {
   logger.error('Nexus server failed remote runner validation', err)
   process.exit(1)
 }
+const providerSettings = ConfigManager.getInstance().resolveSettings()
+const everCore = await configureEverCoreFromEnv(process.env, { cwd, providerSettings })
 const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,
@@ -56,6 +60,12 @@ const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
   enableAgentTools,
   remoteRunner: remoteRunner.runner,
   agentExecutionEnvironment,
+  memoryProvider: everCore.memoryProvider,
+  everCore: {
+    client: everCore.client,
+    config: everCore.config,
+    dispose: everCore.dispose,
+  },
   storageWal: {
     batchSize: storageWalBatchSize,
     flushIntervalMs: storageWalFlushIntervalMs,
@@ -73,6 +83,10 @@ const app = await createNexusApp({
   bashMaxBufferBytes,
   remoteRunner: remoteRunner.runner,
   remoteRunnerStatus: remoteRunner.status,
+  everCoreClient: everCore.client,
+  everCoreConfig: everCore.config,
+  everCoreStatus: everCore.status,
+  memoryProvider: everCore.memoryProvider,
   agentExecutionEnvironment,
 })
 
@@ -87,6 +101,7 @@ console.log(
     ` agentTools=${enableAgentTools ? 'enabled' : 'disabled'}` +
     ` agentExecution=${agentExecutionEnvironment ?? 'local'}` +
     ` remoteRunner=${remoteRunner.status.healthy ? 'healthy' : remoteRunner.status.configured ? 'unhealthy' : 'disabled'}` +
+    ` everCore=${everCore.status.enabled ? `${everCore.status.mode}:${everCore.status.healthy ? 'healthy' : 'unhealthy'}` : 'disabled'}` +
     ` maxConcurrentExecutions=${maxConcurrentExecutions}` +
     ` maxToolOutputBytes=${maxToolOutputBytes}` +
     ` bashMaxBufferBytes=${bashMaxBufferBytes}`,
