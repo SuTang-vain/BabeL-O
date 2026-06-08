@@ -31,6 +31,7 @@ import { createId } from '../../shared/id.js'
 import { NexusEvent } from '../../shared/events.js'
 import type { NexusTask } from '../../shared/task.js'
 import { runSessionFlow } from '../runSessionFlow.js'
+import { formatSessionAck, formatSessionInbox } from './sessions.js'
 import {
   chooseInteractive,
   promptSecret,
@@ -55,6 +56,8 @@ import { openContextView } from '../contextView.js'
 import { formatToolAudit } from '../toolAuditFormatter.js'
 import { expandAttachmentReferences } from '../attachmentReferences.js'
 import { createVimInputState, reduceVimInputKey } from '../vimMode.js'
+import { formatInboxFooterStatus, openInboxOverlay, renderInboxEventCard, shouldRenderInboxEventCard, type InboxChannelSummary } from '../inboxOverlay.js'
+import type { SessionMessage } from '../../shared/sessionChannel.js'
 
 interface ReadlineInternal extends readline.Interface {
   history: string[]
@@ -76,11 +79,6 @@ export function registerChatCommand(program: Command): void {
         process.exitCode = 1
         return
       }
-      if (!input.isTTY || !output.isTTY) {
-        console.error(chalk.red('Error: bbl chat requires an interactive terminal. Use `bbl run "<prompt>"` for non-interactive prompts.'))
-        process.exitCode = 1
-        return
-      }
 
       const historyFile = path.join(DEFAULT_CONFIG_DIR, 'history')
       let history: string[] = []
@@ -97,10 +95,6 @@ export function registerChatCommand(program: Command): void {
       }
 
       const completer = makeCompleter(options.cwd)
-
-      input.resume()
-      // SEA idle readline can otherwise leave no active event-loop handle.
-      const chatKeepAlive = setInterval(() => {}, 60_000)
 
       const rl = readline.createInterface({
         input,
@@ -122,8 +116,12 @@ export function registerChatCommand(program: Command): void {
       const sessionHintRef: { current: SessionHintState } = {
         current: { hasSession: false },
       }
+      const footerStatusRef: { current?: string } = {}
+      let inboxMessages: SessionMessage[] = []
+      let inboxChannels: InboxChannelSummary[] = []
+      const renderedInboxEventCardMessageIds = new Set<string>()
       rl.setPrompt(getChatPrompt())
-      const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef, sessionHintRef)
+      const inputRefresh = setupAutosuggestions(rl, history, isExecutingRef, sessionHintRef, footerStatusRef)
       const slashPalette = createSlashPalette(rl, {
         clearInputBlock: () => inputRefresh.clearCurrentInputBlock(),
       })
@@ -148,6 +146,7 @@ export function registerChatCommand(program: Command): void {
       let pastedTextCounter = 0
       const pastedTextReplacements = new Map<string, string>()
       let vimInputState = createVimInputState()
+      let queuedPromptPrefill = ''
 
       const clearPasteTimeout = () => {
         if (pasteTimeout) {
@@ -321,6 +320,7 @@ export function registerChatCommand(program: Command): void {
           inputState.set('idle')
           stopSpinner()
           updateSessionHint()
+          await refreshInboxFooterStatus({ renderEventCards: true })
         }
       }
 
@@ -381,6 +381,111 @@ export function registerChatCommand(program: Command): void {
           jobs: agentResponse.jobs,
           events: eventResponse.events ?? [],
         }))
+      }
+
+      const loadSessionInboxSnapshot = async (includeAcknowledged = false): Promise<{
+        messages: SessionMessage[]
+        channels: InboxChannelSummary[]
+      }> => {
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          return { messages: [], channels: [] }
+        }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        const inbox = await client.listSessionInbox(sessionId, {
+          limit: 20,
+          includeAcknowledged,
+        })
+        let channels: InboxChannelSummary[] = []
+        try {
+          const channelResponse = await client.listSessionChannels({ sessionId, limit: 100 })
+          channels = channelResponse.channels
+        } catch {
+          channels = []
+        }
+        return { messages: inbox.messages, channels }
+      }
+
+      const markInboxEventCardsSeen = (messages: SessionMessage[]) => {
+        for (const message of messages) {
+          if (shouldRenderInboxEventCard(message)) renderedInboxEventCardMessageIds.add(message.messageId)
+        }
+      }
+
+      const renderNewInboxEventCards = (messages: SessionMessage[], channels: InboxChannelSummary[]) => {
+        const channelMap = new Map(channels.map(channel => [channel.channelId, channel] as const))
+        for (const message of messages) {
+          if (renderedInboxEventCardMessageIds.has(message.messageId)) continue
+          if (!shouldRenderInboxEventCard(message)) continue
+          renderedInboxEventCardMessageIds.add(message.messageId)
+          process.stdout.write(`\n${renderInboxEventCard(message, {
+            channel: channelMap.get(message.channelId),
+            columns: process.stdout.columns ?? 80,
+          })}\n`)
+        }
+      }
+
+      const refreshInboxFooterStatus = async (options: { renderEventCards?: boolean; markEventCardsSeen?: boolean } = {}) => {
+        try {
+          const snapshot = await loadSessionInboxSnapshot(false)
+          inboxMessages = snapshot.messages
+          inboxChannels = snapshot.channels
+          footerStatusRef.current = formatInboxFooterStatus({
+            sessionId,
+            messages: inboxMessages,
+            channels: inboxChannels,
+          }) || undefined
+          if (options.markEventCardsSeen) markInboxEventCardsSeen(inboxMessages)
+          if (options.renderEventCards) renderNewInboxEventCards(inboxMessages, inboxChannels)
+        } catch {
+          inboxMessages = []
+          inboxChannels = []
+          footerStatusRef.current = undefined
+        }
+      }
+
+      const showSessionInbox = async (includeAcknowledged = false) => {
+        const snapshot = await loadSessionInboxSnapshot(includeAcknowledged)
+        inboxMessages = includeAcknowledged ? inboxMessages : snapshot.messages
+        inboxChannels = snapshot.channels
+        footerStatusRef.current = formatInboxFooterStatus({
+          sessionId,
+          messages: includeAcknowledged ? inboxMessages : snapshot.messages,
+          channels: snapshot.channels,
+        }) || undefined
+        if (!process.stdin.isTTY) {
+          console.log(formatSessionInbox({
+            type: 'session_inbox',
+            sessionId,
+            messages: snapshot.messages,
+            limit: 20,
+            includeAcknowledged,
+          }))
+          return { type: 'closed' as const }
+        }
+        return openInboxOverlay({
+          sessionId,
+          messages: snapshot.messages,
+          channels: snapshot.channels,
+          includeAcknowledged,
+        })
+      }
+
+      const ackSessionInboxMessage = async (messageId: string) => {
+        if (!messageId) {
+          console.log(chalk.yellow('Usage: /inbox ack <messageId>'))
+          return
+        }
+        const client = options.url
+          ? new NexusClient({ baseUrl: options.url })
+          : embeddedClient()
+        if (!options.url && !fs.existsSync(localStoragePath)) {
+          console.log(chalk.yellow('No local storage found for inbox ack.'))
+          return
+        }
+        console.log(formatSessionAck(await client.ackSessionMessage(sessionId, messageId)))
+        await refreshInboxFooterStatus()
       }
 
       const updateSessionHint = () => {
@@ -522,14 +627,13 @@ export function registerChatCommand(program: Command): void {
       }
 
       const cleanupListeners = () => {
-        clearInterval(chatKeepAlive)
         slashPalette.dispose()
         process.stdin.removeListener('keypress', onGlobalKeypress)
         if (process.stdin.isTTY) {
           process.stdin.setRawMode(false)
         }
-        process.stdout.write('\x1b[?2004l')
-        process.stdout.write(terminalMouseDisableSequence())
+        process.stdout.write('\x1b[?2004l')        // Disable bracketed paste
+        process.stdout.write(terminalMouseDisableSequence()) // Disable mouse tracking
         process.stdin.emit = originalEmit
       }
 
@@ -575,16 +679,24 @@ export function registerChatCommand(program: Command): void {
       }
 
       let pendingLineResolve: ((val: string) => void) | null = null
+      await refreshInboxFooterStatus({ markEventCardsSeen: true })
 
       try {
         for (;;) {
           let prompt: string
           try {
             // Readline logic wrapper to ask input with custom bbl prompt
+            await refreshInboxFooterStatus()
             prompt = await new Promise<string>((resolve) => {
               pendingLineResolve = resolve
               rl.setPrompt(getChatPrompt())
               rl.question(getChatPrompt(), resolve)
+              if (queuedPromptPrefill) {
+                rlInt.line = queuedPromptPrefill
+                ;(rlInt as any).cursor = queuedPromptPrefill.length
+                queuedPromptPrefill = ''
+                rlInt._refreshLine?.()
+              }
             })
           } catch (e: any) {
             if (e.name === 'AbortError') {
@@ -893,6 +1005,31 @@ export function registerChatCommand(program: Command): void {
               await showMultiAgentStatus()
             } catch (e: any) {
               console.error(chalk.red(`Failed to show agent status: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed === '/inbox' || trimmed === '/sessions inbox' || trimmed === '/inbox all' || trimmed === '/sessions inbox all') {
+            try {
+              const result = await showSessionInbox(trimmed.endsWith(' all'))
+              if (result.type === 'ack') {
+                await ackSessionInboxMessage(result.messageId)
+              } else if (result.type === 'quote') {
+                queuedPromptPrefill = result.text.split(/\r?\n/).join(INPUT_NEWLINE_MARKER)
+                console.log(chalk.dim('Quoted inbox context into the prompt. Review and submit manually.'))
+              }
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to show session inbox: ${e.message || e}`))
+            }
+            continue
+          }
+
+          if (trimmed.startsWith('/inbox ack ') || trimmed.startsWith('/sessions ack ')) {
+            const prefix = trimmed.startsWith('/inbox ack ') ? '/inbox ack ' : '/sessions ack '
+            try {
+              await ackSessionInboxMessage(trimmed.slice(prefix.length).trim())
+            } catch (e: any) {
+              console.error(chalk.red(`Failed to acknowledge inbox message: ${e.message || e}`))
             }
             continue
           }
@@ -1318,6 +1455,18 @@ export function formatContextAnalysis(analysis: Parameters<typeof openContextVie
   }
   if (analysis.diagnostics.memory.truncated || analysis.diagnostics.memory.pressurePercent >= 70) {
     diagnosticRows.push(`project memory ${formatCharCount(analysis.diagnostics.memory.projectMemoryChars)}/${formatCharCount(analysis.diagnostics.memory.projectMemoryBudgetChars)} (${analysis.diagnostics.memory.pressurePercent}%)${analysis.diagnostics.memory.truncated ? ' · truncated' : ''}`)
+  }
+  const longTermMemory = analysis.diagnostics.longTermMemory
+  const longTermMemoryScope = longTermMemory.scope !== 'unknown'
+    ? ` scope=${longTermMemory.scope}${longTermMemory.namespaceId ? ` namespace=${longTermMemory.namespaceId}` : ''}${longTermMemory.namespaceSource ? ` source=${longTermMemory.namespaceSource}` : ''}${longTermMemory.isolationKey ? ` isolation=${longTermMemory.isolationKey}` : ''}`
+    : ''
+  diagnosticRows.push(`long-term memory ${longTermMemory.enabled ? longTermMemory.provider : 'disabled'}${longTermMemoryScope} · hits=${longTermMemory.hitCount} injected=${formatCharCount(longTermMemory.injectedChars)}/${formatCharCount(longTermMemory.budgetChars)}${longTermMemory.searchLatencyMs !== undefined ? ` latency=${Math.round(longTermMemory.searchLatencyMs)}ms` : ''}${longTermMemory.truncated ? ' · truncated' : ''}${longTermMemory.error ? ` · error=${longTermMemory.error}` : ''}`)
+  for (const scopedMemory of analysis.diagnostics.scopedMemory) {
+    if (scopedMemory.scope === 'unknown') continue
+    const namespace = scopedMemory.namespaceId ? ` namespace=${scopedMemory.namespaceId}` : ''
+    const source = scopedMemory.namespaceSource ? ` source=${scopedMemory.namespaceSource}` : ''
+    const isolation = scopedMemory.isolationKey ? ` isolation=${scopedMemory.isolationKey}` : ''
+    diagnosticRows.push(`scoped memory ${scopedMemory.scope} ${scopedMemory.enabled ? scopedMemory.provider : 'disabled'}${namespace}${source}${isolation} · hits=${scopedMemory.hitCount} injected=${formatCharCount(scopedMemory.injectedChars)}/${formatCharCount(scopedMemory.budgetChars)}${scopedMemory.truncated ? ' · truncated' : ''}${scopedMemory.error ? ` · error=${scopedMemory.error}` : ''}`)
   }
   const sessionMemory = analysis.diagnostics.sessionMemoryLite
   const sessionMemoryLast = sessionMemory.lastUpdate

@@ -18,6 +18,10 @@ import {
   type StorageBridgeWalOptions,
 } from './storageBridge.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
+import type { MemoryProvider } from '../runtime/memoryProvider.js'
+import type { EverCoreClient } from '../runtime/everCoreClient.js'
+import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
+import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
 
 export type CreateDefaultNexusRuntimeOptions = {
   storagePath?: string
@@ -28,6 +32,12 @@ export type CreateDefaultNexusRuntimeOptions = {
   storageWal?: StorageBridgeWalOptions
   remoteRunner?: RemoteToolRunner
   agentExecutionEnvironment?: 'local' | 'remote'
+  memoryProvider?: MemoryProvider
+  everCore?: {
+    client?: EverCoreClient
+    config: EverCoreRuntimeConfig
+    dispose?(): Promise<void>
+  }
 }
 
 export async function createDefaultNexusRuntime(
@@ -37,6 +47,12 @@ export async function createDefaultNexusRuntime(
   if (options.enableMcp) {
     const mcpTools = await createMcpToolRegistry(options.cwd ?? process.cwd())
     for (const [name, tool] of mcpTools) {
+      tools.set(name, tool)
+    }
+  }
+  if (options.everCore?.config.mcpToolsEnabled && options.everCore.client) {
+    const everCoreTools = createEverCoreMcpToolRegistry(options.everCore.client, options.everCore.config)
+    for (const [name, tool] of everCoreTools) {
       tools.set(name, tool)
     }
   }
@@ -64,6 +80,7 @@ export async function createDefaultNexusRuntime(
     await flushStorageBridge()
     const disposableTools = [...tools.values()].filter(tool => tool.dispose)
     await Promise.allSettled(disposableTools.map(tool => tool.dispose?.()))
+    await options.everCore?.dispose?.()
     await originalClose?.()
   }
 
@@ -86,7 +103,7 @@ export async function createDefaultNexusRuntime(
   const runtime =
     settings.providerId === 'local'
       ? new LocalCodingRuntime(tools, policy, storage, configManager.load().hooks)
-      : new LLMCodingRuntime(tools, policy, storage, configManager)
+      : new LLMCodingRuntime(tools, policy, storage, configManager, options.memoryProvider)
 
   return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner }
 }

@@ -310,6 +310,18 @@ function buildDiagnosticRows(analysis: ContextAnalysis): string[] {
   if (analysis.diagnostics.memory.truncated || analysis.diagnostics.memory.pressurePercent >= 70) {
     diagnosticRows.push(`project memory ${formatCharCount(analysis.diagnostics.memory.projectMemoryChars)}/${formatCharCount(analysis.diagnostics.memory.projectMemoryBudgetChars)} (${analysis.diagnostics.memory.pressurePercent}%)${analysis.diagnostics.memory.truncated ? ' · truncated' : ''}`)
   }
+  const longTermMemory = analysis.diagnostics.longTermMemory
+  const longTermMemoryScope = longTermMemory.scope !== 'unknown'
+    ? ` scope=${longTermMemory.scope}${longTermMemory.namespaceId ? ` namespace=${longTermMemory.namespaceId}` : ''}${longTermMemory.namespaceSource ? ` source=${longTermMemory.namespaceSource}` : ''}${longTermMemory.isolationKey ? ` isolation=${longTermMemory.isolationKey}` : ''}`
+    : ''
+  diagnosticRows.push(`long-term memory ${longTermMemory.enabled ? longTermMemory.provider : 'disabled'}${longTermMemoryScope} · hits=${longTermMemory.hitCount} injected=${formatCharCount(longTermMemory.injectedChars)}/${formatCharCount(longTermMemory.budgetChars)}${longTermMemory.searchLatencyMs !== undefined ? ` latency=${Math.round(longTermMemory.searchLatencyMs)}ms` : ''}${longTermMemory.truncated ? ' · truncated' : ''}${longTermMemory.error ? ` · error=${longTermMemory.error}` : ''}`)
+  for (const scopedMemory of analysis.diagnostics.scopedMemory) {
+    if (scopedMemory.scope === 'unknown') continue
+    const namespace = scopedMemory.namespaceId ? ` namespace=${scopedMemory.namespaceId}` : ''
+    const source = scopedMemory.namespaceSource ? ` source=${scopedMemory.namespaceSource}` : ''
+    const isolation = scopedMemory.isolationKey ? ` isolation=${scopedMemory.isolationKey}` : ''
+    diagnosticRows.push(`scoped memory ${scopedMemory.scope} ${scopedMemory.enabled ? scopedMemory.provider : 'disabled'}${namespace}${source}${isolation} · hits=${scopedMemory.hitCount} injected=${formatCharCount(scopedMemory.injectedChars)}/${formatCharCount(scopedMemory.budgetChars)}${scopedMemory.truncated ? ' · truncated' : ''}${scopedMemory.error ? ` · error=${scopedMemory.error}` : ''}`)
+  }
   const sessionMemory = analysis.diagnostics.sessionMemoryLite
   const sessionMemoryLast = sessionMemory.lastUpdate
     ? `last ${sessionMemory.lastUpdate.trigger}/${sessionMemory.lastUpdate.reason || 'unknown'} ${formatCharCount(sessionMemory.lastUpdate.summaryChars)} events=${sessionMemory.lastUpdate.eventCount}`

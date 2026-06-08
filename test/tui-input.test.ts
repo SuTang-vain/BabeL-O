@@ -15,6 +15,8 @@ import { getPromptSuggestion } from '../src/cli/promptSuggestions.js'
 import { getTheme, resetThemeForTest } from '../src/cli/theme.js'
 import { getLiveAgentTree, resetLiveAgentTreeForTest, updateLiveAgentActivity, renderEvent } from '../src/cli/renderEvents.js'
 import { createVimInputState, reduceVimInputKey } from '../src/cli/vimMode.js'
+import { createInboxOverlayState, formatInboxFooterStatus, quoteInboxMessage, reduceInboxOverlayKey, renderInboxEventCard, renderInboxOverlay, shouldRenderInboxEventCard } from '../src/cli/inboxOverlay.js'
+import type { SessionChannel, SessionMessage } from '../src/shared/sessionChannel.js'
 
 test('normalizeKeyEvent classifies terminal keys consistently', () => {
   assert.equal(normalizeKeyEvent('\x03', undefined).kind, 'ctrl_c')
@@ -239,6 +241,151 @@ test('boxed input renders separator prompt and footer model line', () => {
   assert.equal(rendered.cursorRow, 1)
   assert.equal(rendered.cursorRowsFromBottom, 2)
   assert.equal(rendered.cursorColumn, 2)
+})
+
+test('boxed input footer renders inbox unread indicator without dropping model label', () => {
+  const rendered = renderBoxedInput({
+    prompt: '> ',
+    line: '',
+    cursor: 0,
+    placeholder: '',
+    modelId: 'local/coding-runtime',
+    footerStatus: 'linked sessions: 2 · inbox: 3 unread · channels: parent_child 1/workspace_pair 1 · high: handoff',
+    columns: 84,
+  })
+  const lines = rendered.text.split(/\r?\n/)
+
+  assert.match(lines[3]!, /\? for shortcuts/)
+  assert.match(lines[3]!, /linked sessions: 2/)
+  assert.match(lines[3]!, /Embedded Local/)
+  assert.ok(visibleTerminalWidth(lines[3]!) <= 83)
+})
+
+test('inbox footer status summarizes linked sessions unread count channel kind and key message', () => {
+  const status = formatInboxFooterStatus({
+    sessionId: 'session-b',
+    channels: [createInboxChannel()],
+    messages: [createInboxMessage()],
+  })
+
+  assert.match(status, /linked sessions: 1/)
+  assert.match(status, /inbox: 1 unread/)
+  assert.match(status, /channels: workspace_pair 1/)
+  assert.match(status, /high: handoff/)
+})
+
+test('inbox overlay renders collaboration boundary evidence and governance summary', () => {
+  const state = createInboxOverlayState({
+    sessionId: 'session-b',
+    channels: [createInboxChannel()],
+    messages: [createInboxMessage({
+      type: 'memory_candidate',
+      metadata: {
+        memoryCandidateGovernance: {
+          decision: 'requires_approval',
+          scope: 'project',
+          autoWrite: false,
+          approval: { status: 'required', requiredBy: 'user' },
+          blockedReasons: [],
+        },
+      },
+    })],
+  })
+  const rendered = renderInboxOverlay(state, { rows: 18, columns: 96 })
+
+  assert.match(rendered, /BABEL Inbox/)
+  assert.match(rendered, /Collaboration context only/)
+  assert.match(rendered, /not direct user instructions/)
+  assert.match(rendered, /memory_candidate/)
+  assert.match(rendered, /kind=workspace_pair/)
+  assert.match(rendered, /file:src\/runtime\/contextAssembler\.ts/)
+  assert.match(rendered, /decision=requires_approval scope=project approval=required:user auto_write=false/)
+  assert.ok(rendered.split('\n').every(line => visibleTerminalWidth(line) <= 95))
+})
+
+test('inbox overlay reducer supports navigation ack quote and close without editing readline text', () => {
+  const state = createInboxOverlayState({
+    sessionId: 'session-b',
+    messages: [createInboxMessage({ messageId: 'msg-1' }), createInboxMessage({ messageId: 'msg-2', type: 'blocked' })],
+  })
+
+  let reduced = reduceInboxOverlayKey(state, normalizeKeyEvent('\x1b[B', undefined))
+  assert.equal(reduced.state.selectedIndex, 1)
+  assert.deepEqual(reduced.action, { type: 'redraw' })
+
+  reduced = reduceInboxOverlayKey(reduced.state, normalizeKeyEvent('a', undefined))
+  assert.deepEqual(reduced.action, { type: 'ack', messageId: 'msg-2' })
+
+  reduced = reduceInboxOverlayKey(reduced.state, normalizeKeyEvent('q', undefined))
+  assert.equal(reduced.action.type, 'quote')
+  if (reduced.action.type !== 'quote') throw new Error('unreachable')
+  assert.equal(reduced.action.messageId, 'msg-2')
+  assert.match(reduced.action.text, /Use this SessionChannel inbox context only after verifying evidence/)
+  assert.match(reduced.action.text, /content:/)
+
+  reduced = reduceInboxOverlayKey(reduced.state, normalizeKeyEvent('\x1b', undefined))
+  assert.deepEqual(reduced.action, { type: 'close' })
+})
+
+test('inbox event cards only render key unread side-channel messages', () => {
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'handoff', priority: 'normal' })), true)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'blocked', priority: 'low' })), true)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'request_review', priority: 'normal' })), true)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'request_validation', priority: 'normal' })), true)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'finding', priority: 'high' })), true)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'finding', priority: 'normal' })), false)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ type: 'question', priority: 'high' })), false)
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({ status: 'acknowledged', acknowledgedAt: '2026-06-08T00:00:02.000Z' })), false)
+
+  assert.equal(shouldRenderInboxEventCard(createInboxMessage({
+    type: 'memory_candidate',
+    priority: 'normal',
+    metadata: {
+      memoryCandidateGovernance: {
+        decision: 'requires_approval',
+        approval: { status: 'required', requiredBy: 'user' },
+      },
+    },
+  })), true)
+})
+
+test('inbox event card renders compact action hints without transcript injection', () => {
+  const card = renderInboxEventCard(createInboxMessage({
+    type: 'memory_candidate',
+    content: 'User prefers concise Chinese summaries.',
+    metadata: {
+      memoryCandidateGovernance: {
+        decision: 'rejected',
+        scope: 'user',
+        autoWrite: false,
+        approval: { status: 'rejected', requiredBy: 'user' },
+        blockedReasons: ['missing_evidence_refs'],
+      },
+    },
+  }), {
+    channel: createInboxChannel(),
+    columns: 96,
+  })
+
+  assert.match(card, /SessionChannel memory_candidate · high · from=session-a · to=session-b/)
+  assert.match(card, /channel=channel-1 kind=workspace_pair message=msg-1/)
+  assert.match(card, /collaboration context only; verify evidence before acting/)
+  assert.match(card, /file:src\/runtime\/contextAssembler\.ts/)
+  assert.match(card, /governance: decision=rejected scope=user approval=rejected:user auto_write=false/)
+  assert.match(card, /blocked: missing_evidence_refs/)
+  assert.match(card, /\[open inbox: \/inbox\]/)
+  assert.match(card, /\[ack: \/inbox ack msg-1\]/)
+  assert.match(card, /\[quote: \/inbox then q\]/)
+  assert.doesNotMatch(card, /^> /m)
+  assert.ok(card.split('\n').every(line => visibleTerminalWidth(line) <= 95))
+})
+
+test('quoteInboxMessage preserves side-channel wording and evidence references', () => {
+  const quoted = quoteInboxMessage(createInboxMessage())
+
+  assert.match(quoted, /SessionChannel inbox context only after verifying evidence/)
+  assert.match(quoted, /message=msg-1 type=handoff priority=high from=session-a channel=channel-1/)
+  assert.match(quoted, /file:src\/runtime\/contextAssembler\.ts/)
 })
 
 test('boxed input wraps long mixed-width text across indented input rows', () => {
@@ -839,3 +986,42 @@ test('live agent tree tracks entries and updates activity', () => {
     resetLiveAgentTreeForTest()
   }
 })
+
+function createInboxChannel(overrides: Partial<SessionChannel> = {}): SessionChannel {
+  return {
+    channelId: 'channel-1',
+    kind: 'workspace_pair',
+    participantSessionIds: ['session-a', 'session-b'],
+    createdBySessionId: 'session-a',
+    createdAt: '2026-06-08T00:00:00.000Z',
+    status: 'open',
+    policy: {
+      allowedMessageTypes: ['question', 'answer', 'finding', 'request_review', 'request_validation', 'hypothesis', 'decision', 'blocked', 'memory_candidate', 'handoff'],
+      maxMessageChars: 4000,
+      maxEvidenceRefs: 8,
+      allowBroadcast: true,
+      allowMemoryWriteRequests: false,
+      requireUserApprovalForExternalProject: true,
+      contextInjectionMode: 'recent_messages',
+    },
+    ...overrides,
+  }
+}
+
+function createInboxMessage(overrides: Partial<SessionMessage> = {}): SessionMessage {
+  return {
+    messageId: 'msg-1',
+    channelId: 'channel-1',
+    fromSessionId: 'session-a',
+    toSessionId: 'session-b',
+    broadcast: false,
+    type: 'handoff',
+    content: 'Read src/runtime/contextAssembler.ts before editing context injection.',
+    evidence: [{ type: 'file', ref: 'src/runtime/contextAssembler.ts' }],
+    priority: 'high',
+    createdAt: '2026-06-08T00:00:00.000Z',
+    deliveredAt: '2026-06-08T00:00:01.000Z',
+    status: 'delivered',
+    ...overrides,
+  }
+}

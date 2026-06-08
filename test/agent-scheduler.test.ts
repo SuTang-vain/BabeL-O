@@ -91,6 +91,69 @@ test('ExploreAgentScheduler spawns read-only child session and completes with st
   assert.equal(NexusEventSchema.parse(completedEvent).type, 'agent_job_event')
 })
 
+test('ExploreAgentScheduler creates parent-child channel without replacing job events', async () => {
+  const storage = new MemoryStorage()
+  await storage.saveSession(parentSession())
+  const runtime = new RecordingRuntime([
+    {
+      type: 'result',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId: 'filled-by-runtime',
+      timestamp: '2026-06-04T00:00:03.000Z',
+      success: true,
+      message: 'Parent-child channel completed.',
+    },
+  ])
+  const scheduler = new ExploreAgentScheduler({
+    storage,
+    now: fixedClock(),
+    runtimeFactory: () => runtime,
+  })
+
+  const job = await scheduler.spawnAgent({
+    parentSessionId: 'session-parent',
+    agentType: 'review',
+    prompt: 'Review the channel integration.',
+  })
+  const childInbox = await storage.listSessionInbox(job.childSessionId)
+
+  assert.equal(childInbox.length, 1)
+  assert.equal(childInbox[0]?.fromSessionId, 'session-parent')
+  assert.equal(childInbox[0]?.toSessionId, job.childSessionId)
+  assert.equal(childInbox[0]?.type, 'request_review')
+  assert.match(childInbox[0]?.content ?? '', /Review the channel integration/)
+  assert.equal(childInbox[0]?.metadata?.agentJobId, job.jobId)
+
+  const channelId = childInbox[0]?.channelId
+  assert.equal(typeof channelId, 'string')
+  const channel = await storage.getSessionChannel(channelId ?? '')
+  assert.equal(channel?.kind, 'parent_child')
+  assert.deepEqual(channel?.participantSessionIds, ['session-parent', job.childSessionId])
+  assert.equal(channel?.metadata?.jobId, job.jobId)
+
+  const completed = await scheduler.waitForAgent(job.jobId, { timeoutMs: 100 })
+  const parentInbox = await storage.listSessionInbox('session-parent')
+  const terminalMessage = parentInbox.find(message => message.metadata?.agentJobId === job.jobId)
+
+  assert.equal(completed.status, 'completed')
+  assert.equal(terminalMessage?.fromSessionId, job.childSessionId)
+  assert.equal(terminalMessage?.toSessionId, 'session-parent')
+  assert.equal(terminalMessage?.type, 'handoff')
+  assert.match(terminalMessage?.content ?? '', /Parent-child channel completed/)
+
+  const child = await storage.getSession(job.childSessionId)
+  assert.equal(child?.metadata?.channelId, channelId)
+  const persisted = await storage.getAgentJob(job.jobId)
+  assert.equal(persisted?.metadata?.channelId, channelId)
+
+  const parentEvents = await storage.listEvents('session-parent')
+  assert.deepEqual(parentEvents.events.map(event => event.type), [
+    'agent_job_event',
+    'agent_job_event',
+    'agent_job_event',
+  ])
+})
+
 test('ExploreAgentScheduler spawns review and test profiles with task-focused context', async () => {
   const storage = new MemoryStorage()
   await storage.saveSession(parentSession())

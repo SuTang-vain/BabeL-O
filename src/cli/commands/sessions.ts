@@ -1,8 +1,7 @@
-import * as path from 'node:path'
 import chalk from 'chalk'
 import { Command } from 'commander'
 import { NexusClient } from '../NexusClient.js'
-import { DEFAULT_CONFIG_DIR } from '../../shared/config.js'
+import type { SessionMessage } from '../../shared/sessionChannel.js'
 
 export function registerSessionsCommand(program: Command): void {
   const sessions = program.command('sessions').description('Inspect Nexus sessions')
@@ -61,6 +60,41 @@ export function registerSessionsCommand(program: Command): void {
           2,
         ),
       )
+    })
+
+  sessions
+    .command('inbox')
+    .description('Show unread SessionChannel inbox messages')
+    .argument('<sessionId>', 'Session id')
+    .option('--url <url>', 'Nexus URL')
+    .option('--limit <count>', 'Inbox messages to fetch', '20')
+    .option('--include-acknowledged', 'Include acknowledged messages')
+    .option('--json', 'Print raw JSON response')
+    .action(async (
+      sessionId: string,
+      options: { url?: string; limit: string; includeAcknowledged?: boolean; json?: boolean },
+    ) => {
+      const inbox = await new NexusClient({ baseUrl: options.url }).listSessionInbox(sessionId, {
+        limit: Number(options.limit),
+        includeAcknowledged: options.includeAcknowledged === true,
+      })
+      console.log(options.json ? JSON.stringify(inbox, null, 2) : formatSessionInbox(inbox))
+    })
+
+  sessions
+    .command('ack')
+    .description('Acknowledge one SessionChannel inbox message')
+    .argument('<sessionId>', 'Session id')
+    .argument('<messageId>', 'Session message id')
+    .option('--url <url>', 'Nexus URL')
+    .option('--json', 'Print raw JSON response')
+    .action(async (
+      sessionId: string,
+      messageId: string,
+      options: { url?: string; json?: boolean },
+    ) => {
+      const ack = await new NexusClient({ baseUrl: options.url }).ackSessionMessage(sessionId, messageId)
+      console.log(options.json ? JSON.stringify(ack, null, 2) : formatSessionAck(ack))
     })
 
   sessions
@@ -226,4 +260,65 @@ export function registerSessionsCommand(program: Command): void {
         ),
       )
     })
+}
+
+export type SessionInboxResponse = {
+  type: 'session_inbox'
+  sessionId: string
+  messages: SessionMessage[]
+  limit: number
+  includeAcknowledged: boolean
+}
+
+export type SessionAckResponse = {
+  type: 'session_message_acknowledged'
+  sessionId: string
+  message: SessionMessage | null
+}
+
+export function formatSessionInbox(inbox: SessionInboxResponse): string {
+  const lines = [
+    chalk.cyan(`--- Session Inbox: ${inbox.sessionId} ---`),
+    chalk.dim('Collaboration context only. Verify claims before acting.'),
+  ]
+  if (inbox.messages.length === 0) {
+    lines.push(chalk.dim(inbox.includeAcknowledged ? 'No inbox messages.' : 'No unread inbox messages.'))
+    return lines.join('\n')
+  }
+
+  for (const message of inbox.messages) {
+    lines.push(formatSessionInboxMessage(message))
+  }
+  lines.push(chalk.dim(`Ack with: /inbox ack <messageId> or bbl sessions ack ${inbox.sessionId} <messageId>`))
+  return lines.join('\n')
+}
+
+export function formatSessionAck(response: SessionAckResponse): string {
+  if (!response.message) return chalk.yellow(`No message acknowledged for session ${response.sessionId}.`)
+  return [
+    chalk.green(`Acknowledged ${response.message.messageId} for session ${response.sessionId}.`),
+    formatSessionInboxMessage(response.message),
+  ].join('\n')
+}
+
+function formatSessionInboxMessage(message: SessionMessage): string {
+  const status = message.status === 'acknowledged'
+    ? chalk.green(message.status)
+    : chalk.yellow(message.status)
+  const target = message.toSessionId ? `to=${message.toSessionId}` : 'broadcast=true'
+  const lines = [
+    '',
+    `${chalk.bold(message.messageId)} ${chalk.dim(`[${message.createdAt}]`)} ${status}`,
+    `  ${chalk.cyan(message.type)} · ${message.priority} · from=${message.fromSessionId} · ${target} · channel=${message.channelId}`,
+    `  ${message.content}`,
+  ]
+  if (message.evidence?.length) {
+    lines.push(`  evidence: ${message.evidence.map(formatEvidenceRef).join(', ')}`)
+  }
+  return lines.join('\n')
+}
+
+function formatEvidenceRef(ref: NonNullable<SessionMessage['evidence']>[number]): string {
+  const label = ref.label ? ` (${ref.label})` : ''
+  return `${ref.type}:${ref.ref}${label}`
 }

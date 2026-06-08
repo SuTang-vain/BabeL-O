@@ -57,6 +57,7 @@ import {
 } from './runtimePipeline.js'
 import { executeProviderToolCall } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
+import type { MemoryProvider } from './memoryProvider.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -76,6 +77,7 @@ export class LLMCodingRuntime implements NexusRuntime {
     private toolPolicy: ToolPolicy,
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
+    private readonly memoryProvider?: MemoryProvider,
   ) {}
 
   listTools(): RuntimeToolAuditEntry[] {
@@ -198,6 +200,14 @@ export class LLMCodingRuntime implements NexusRuntime {
           description: tool.prompt ? tool.prompt() : tool.description,
           inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         }))
+      const loadSessionInbox = async () => {
+        try {
+          return await this.storage.listSessionInbox(options.sessionId, { limit: 20 })
+        } catch (error) {
+          logger.debug('Failed to load session inbox from storage', error)
+          return []
+        }
+      }
       const contextWarningPercent = 70
       const contextCompactPercent = 90
       let contextRefreshState = await refreshRuntimeContextState({
@@ -210,6 +220,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         warningPercent: contextWarningPercent,
         compactPercent: contextCompactPercent,
         suppressToolsForIntent: shouldSuppressToolsForIntent,
+        memoryProvider: this.memoryProvider,
       })
       let assembledContext = contextRefreshState.assembledContext
       let messages = contextRefreshState.messages
@@ -277,6 +288,8 @@ export class LLMCodingRuntime implements NexusRuntime {
             warningPercent: contextWarningPercent,
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
+            memoryProvider: this.memoryProvider,
+            sessionInbox: await loadSessionInbox(),
           }))
           autoCompactDecision = contextRefreshState.autoCompactDecision
         } catch (error) {
@@ -314,6 +327,8 @@ export class LLMCodingRuntime implements NexusRuntime {
             warningPercent: contextWarningPercent,
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
+            memoryProvider: this.memoryProvider,
+            sessionInbox: await loadSessionInbox(),
           }))
         } catch (error) {
           yield buildCompactFailureEvent({
@@ -412,6 +427,8 @@ export class LLMCodingRuntime implements NexusRuntime {
               warningPercent: contextWarningPercent,
               compactPercent: contextCompactPercent,
               suppressToolsForIntent: shouldSuppressToolsForIntent,
+              memoryProvider: this.memoryProvider,
+              sessionInbox: await loadSessionInbox(),
             }))
             messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
               contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,

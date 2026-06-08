@@ -16,6 +16,7 @@ export const helpCategories: HelpCategory[] = [
     title: 'Session',
     items: [
       { command: '/sessions', description: 'List recent sessions' },
+      { command: '/inbox', description: 'Show unread SessionChannel messages' },
       { command: '/history [query]', description: 'Search message history' },
       { command: '/history !<n>', description: 'Replay a history entry' },
       { command: '/exit', description: 'Exit chat' },
