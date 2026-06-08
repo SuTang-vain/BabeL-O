@@ -64,12 +64,19 @@ interface ReadlineInternal extends readline.Interface {
 
 export function registerChatCommand(program: Command): void {
   program
-    .command('chat')
+    .command('chat [mode]')
     .description('Start an interactive Nexus-backed chat loop')
     .option('--url <url>', 'Use a running Nexus service instead of embedded mode')
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
     .option('--session <id>', 'Resume an existing session ID')
-    .action(async (options: { url?: string; cwd: string; session?: string }) => {
+    .action(async (mode: string | undefined, options: { url?: string; cwd: string; session?: string }) => {
+      const isDevMode = mode === 'dev'
+      if (mode && !isDevMode) {
+        console.error(chalk.red(`Error: unknown chat mode "${mode}". Did you mean \`bbl chat dev\`?`))
+        process.exitCode = 1
+        return
+      }
+
       if (!input.isTTY || !output.isTTY) {
         console.error(chalk.red('Error: bbl chat requires an interactive terminal. Use `bbl run "<prompt>"` for non-interactive prompts.'))
         process.exitCode = 1
@@ -542,7 +549,7 @@ export function registerChatCommand(program: Command): void {
         }
       })
 
-      renderWelcome({ cwd: options.cwd, url: options.url })
+      renderWelcome({ cwd: options.cwd, url: options.url, title: isDevMode ? 'dev' : undefined })
 
       sessionId = options.session ?? createId('session')
       if (options.session) {

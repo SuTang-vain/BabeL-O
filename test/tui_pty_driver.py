@@ -252,6 +252,8 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         ]
     session_id = None
     command = [*base_command]
+    if sequence == 'dev-title':
+        command.append('dev')
     if session_id:
         command.extend(['--session', session_id])
     master_fd, proc = start_chat_process(command, workspace, env)
@@ -265,6 +267,13 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             time.sleep(1.0)
             if proc.poll() is not None:
                 return proc.returncode or 0, ''.join(transcript) + '\n[pty-smoke] chat exited while idle\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'dev-title':
+            visible = visible_text(''.join(transcript))
+            if '❖ BABEL-O  dev' not in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] dev title did not render\n'
+            if '❖ BABEL-O  v0.3.1' in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] release version rendered in dev title\n'
             send(master_fd, '/exit\r')
         elif sequence == 'slash-palette':
             send(master_fd, '/')
