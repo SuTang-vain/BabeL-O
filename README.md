@@ -141,12 +141,7 @@ npm run start # Start the Nexus background daemon
 npm run build:binary
 ```
 
-For contributor development, run the source CLI directly with the `dev` mode marker:
-```bash
-npm run cli -- chat dev
-```
-
-This starts the interactive TUI from the current source tree and renders the header as `❖ BABEL-O  dev`, making it clear that you are testing local development code rather than an installed release binary.
+For contributor development, see the [`dev` branch development guide](https://github.com/SuTang-vain/BabeL-O/blob/dev/docs/DEVELOPMENT.md).
 
 In a separate terminal, if using Option A, link the CLI globally and start:
 ```bash
