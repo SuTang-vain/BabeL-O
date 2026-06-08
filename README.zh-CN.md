@@ -142,12 +142,7 @@ npm run start # 启动后台守护 Nexus 服务
 npm run build:binary
 ```
 
-贡献者进行本地开发时，建议直接用源码 CLI 启动带有 `dev` 标识的交互模式：
-```bash
-npm run cli -- chat dev
-```
-
-该命令会从当前源码树启动交互式 TUI，并在欢迎标题中显示 `❖ BABEL-O  dev`，用于明确区分本地开发代码与已安装的正式 release 二进制。
+贡献者进行本地开发时，请阅读 [`dev` 分支开发指南](https://github.com/SuTang-vain/BabeL-O/blob/dev/docs/DEVELOPMENT.zh-CN.md)。
 
 如果使用**选项 A**，请在另一个终端中全局软链并启动 CLI 客户端：
 ```bash
