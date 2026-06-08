@@ -1,6 +1,6 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
-import type { SessionMessage } from '../shared/sessionChannel.js'
+import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 import type { AgentJob, AgentJobFilter, AgentSpawnRequest, AgentWaitOptions } from '../nexus/agents/types.js'
 
 export type NexusClientOptions = {
@@ -76,6 +76,18 @@ export class NexusClient {
       type: 'agent_jobs'
       parentSessionId: string
       jobs: AgentJob[]
+    }>
+  }
+
+  async listSessionChannels(options: { sessionId?: string; limit?: number } = {}): Promise<{ type: 'session_channels'; channels: SessionChannel[]; limit: number }> {
+    const params = new URLSearchParams()
+    if (options.sessionId) params.set('sessionId', options.sessionId)
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/session-channels${query}`) as Promise<{
+      type: 'session_channels'
+      channels: SessionChannel[]
+      limit: number
     }>
   }
 

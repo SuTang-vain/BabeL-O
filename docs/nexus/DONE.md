@@ -139,6 +139,9 @@
 - Agent running indicator smoke 已覆盖 Working/Generating/Running tool/Waiting permission/Compacting/Running sub-agent/Retrying，以及 successful/failed tool terminal states 不残留 live status。
 - 最小 PTY smoke 已覆盖 slash palette、permission panel、compact Read 渲染、input placeholder、read/edit/diff/Grep/Glob/TaskCreate、resume session 和 paste/input 基线，并扩展到 AgentLoop/sub-agent 层级、tool/model overlay、键盘路由和 agent terminal states 主路径。
 - `/status` 与 `bbl tools audit` 已支持 compact tool audit 展示：builtin/MCP 计数、MCP server/tool、registered name、risk、policy/server 状态、approval required 与 suggested allow rule，并避免在 TUI 主输出泄露 raw inputSchema。
+- SessionChannel TUI unread indicator / Inbox overlay 已落地：`bbl chat` boxed input footer 显示 linked sessions、unread count、channel kind 与 key message 摘要；`/inbox` / `/inbox all` 打开 side-channel overlay，展示 message/evidence/governance，支持 open/read、ack 与 quote into current prompt，quote 只预填且需用户手动提交。
+- SessionChannel 主对话关键事件卡片已落地：`bbl chat` 在 session flow 后只对关键 unread side-channel message 渲染 compact card（handoff/blocked/review/validation/high finding/governed memory_candidate），卡片只提示 open inbox/ack/quote 与 evidence/governance，不把跨 session 消息自动作为当前用户输入或工具指令。
+- SessionChannel TUI 真实 PTY smoke 已落地：覆盖 unread footer、`/inbox` overlay、ack、quote into prompt 且不自动提交、主对话事件卡片、overlay 焦点互斥、resize/navigation 稳定和关闭后主输入框恢复。
 
 ## MCP / Skills / Permissions / Hooks
 

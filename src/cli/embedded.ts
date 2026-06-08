@@ -9,7 +9,7 @@ import {
   parseAgentExecutionEnvironment,
 } from '../nexus/remoteRunnerConfig.js'
 import { configureEverCoreFromEnv } from '../nexus/everCoreConfig.js'
-import type { SessionMessage } from '../shared/sessionChannel.js'
+import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 
 export type EmbeddedNexusClientOptions = {
   cwd: string
@@ -59,6 +59,18 @@ export class EmbeddedNexusClient {
       'GET',
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listSessionChannels(options: { sessionId?: string; limit?: number } = {}): Promise<{ type: 'session_channels'; channels: SessionChannel[]; limit: number }> {
+    const params = new URLSearchParams()
+    if (options.sessionId) params.set('sessionId', options.sessionId)
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson('GET', `/v1/session-channels${query}`) as Promise<{
+      type: 'session_channels'
+      channels: SessionChannel[]
+      limit: number
+    }>
   }
 
   async listSessionInbox(

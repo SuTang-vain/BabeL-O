@@ -2,6 +2,46 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-08 — SessionChannel TUI 真实 PTY smoke 补强
+
+- **用户请求**: 继续推进 P2 SessionChannel TUI 真实 PTY smoke 补强，并说明当前 TUI 如何开始 session-to-session 对话流。
+- **实现**:
+  - `test/tui_pty_driver.py` 新增 seeded local SessionChannel inbox fixture，使用真实 `SqliteStorage` 写入两个 session、`workspace_pair` channel 与 unread handoff/blocked message，`bbl chat --session session-pty-inbox` 通过 embedded client 读取同一 SQLite。
+  - 新增真实 PTY 序列覆盖 unread footer、`/inbox` overlay 展示 collaboration boundary/evidence/channel kind、selected message ack、ack 后 no unread state、quote into prompt 且不自动提交、主对话关键 event card、overlay 对 slash palette 的焦点互斥、resize/navigation 后 overlay 稳定以及关闭后主输入框恢复。
+  - `test/tui-pty-smoke.test.ts` 注册 4 个 gated SessionChannel PTY smoke；默认仍需 `BABEL_O_RUN_PTY_SMOKE=1` 显式启用。
+  - 文档同步当前 UX 口径：TUI 目前是 consumption-side 入口（`/inbox` / `/inbox all` / `/inbox ack <messageId>`）；发起跨 session message 仍通过 Nexus API 或 AgentScheduler parent-child channel，不提供 raw transcript sharing 或直接跨 session 指令 UI。
+- **验证**:
+  - `BABEL_O_RUN_PTY_SMOKE=1 BABEL_O_CONFIG_FILE=/tmp/babel-o-session-inbox-pty-focused-config.json npx tsx --test --test-name-pattern "SessionChannel" test/tui-pty-smoke.test.ts`：4/4 通过。
+
+## 2026-06-08 — SessionChannel 主对话关键事件卡片
+
+- **用户请求**: 继续推进 SessionChannel TUI 联系可见化。
+- **实现**:
+  - `bbl chat` 在 session flow 结束后刷新 unread inbox snapshot，并只对关键 unread side-channel message 渲染主对话 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、以及 governance rejected / requires approval 的 `memory_candidate`。
+  - 卡片展示 source/target、channel kind/id、message id、evidence refs、memory candidate governance 与 `[open inbox] [ack] [quote]` 操作提示；不把消息内容自动作为当前 user message 注入，不自动触发工具，不改变 cwd/provider/profile/permission。
+  - `bbl chat` 启动时会把既有关键 inbox message 标记为 seen，避免旧消息在主对话中重放刷屏；普通低优先级 finding/question 继续只更新 unread indicator。
+  - `src/cli/inboxOverlay.ts` 新增 `shouldRenderInboxEventCard()` / `renderInboxEventCard()`，并补 focused renderer/reducer 测试覆盖关键消息筛选、governance 展示、宽度截断和 side-channel 文案。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-test-config.json npx tsx --test test/tui-input.test.ts test/sessions-command.test.ts`：50/50 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-card-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
+## 2026-06-08 — SessionChannel TUI unread indicator / Inbox overlay
+
+- **用户请求**: 按规划实现 unread indicator 与 Inbox overlay。
+- **实现**:
+  - `bbl chat` boxed input footer 新增 SessionChannel 状态提示，显示 linked session 数、unread inbox 数、channel kind 摘要与 high-priority/key message 类型；状态不展示消息正文、不抢占主输入框、不改变当前 session 执行状态。
+  - 新增 `src/cli/inboxOverlay.ts`，`/inbox` / `/inbox all` 在 TTY 中打开 side-channel overlay，展示 source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs 与 memory candidate governance 摘要。
+  - Overlay 遵守唯一 input owner：使用 `inputState=inboxOverlay`，Esc/Backspace/Ctrl+C 关闭，↑/↓/PageUp/PageDown 导航，Enter open/read，`a` ack，`q` quote into current prompt；quote 只预填当前 prompt，必须由用户审阅后手动提交。
+  - `NexusClient` 与 embedded client 补齐 `listSessionChannels()`，用于 footer/overlay 显示 linked sessions 与 channel kind；非 TTY 路径保留原有文本 inbox 输出。
+  - 本切片不实现 raw transcript sharing、不把跨 session message 渲染为当前用户输入、不允许跨 session 静默改变 cwd/provider/profile/permission；主对话关键事件卡片与真实 PTY smoke 补强仍保留为后续 TUI 打开项。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-test-config.json npx tsx --test test/tui-input.test.ts test/sessions-command.test.ts`：48/48 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-typecheck-config.json npm run typecheck` 通过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-tui-inbox-format-config.json npm run format:check` 通过。
+  - `git diff --check` 通过。
+
 ## 2026-06-08 — Session Channel Phase E governed memory candidate MVP
 
 - **用户请求**: 推进 Session Channel + Scoped Memory Phase E。

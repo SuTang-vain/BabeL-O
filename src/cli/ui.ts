@@ -174,7 +174,8 @@ export function setupAutosuggestions(
   rl: any,
   history: string[],
   isExecutingRef: { current: boolean },
-  sessionHintRef?: { current: SessionHintState }
+  sessionHintRef?: { current: SessionHintState },
+  footerStatusRef?: { current?: string }
 ): AutosuggestionRefreshControls {
   const rlInt = rl as any
   const defaultPrompt = rlInt._prompt ?? getChatPrompt()
@@ -222,6 +223,7 @@ export function setupAutosuggestions(
         suggestion,
         placeholder,
         columns,
+        footerStatus: footerStatusRef?.current,
       })
       : renderFixedInputBox({
         prompt,

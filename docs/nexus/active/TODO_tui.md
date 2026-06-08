@@ -53,33 +53,26 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 > Runtime / API 已具备 SessionChannel + Inbox；TUI 后续目标不是把多个 session 的 transcript 混成一个聊天流，而是把跨 session 联系作为 side-channel 显示，让用户知道“有其他工作区传来协作上下文”，同时保持当前 session 的主对话语义清晰。
 
-- [ ] TUI session link status / unread indicator。
-  - 在现有 agent running / context gauge 附近增加轻量状态提示，例如 `linked sessions: 2 · inbox: 3 unread`。
-  - 状态只表达联系和未读数量，不展示完整消息内容，不抢占主输入框，不改变当前 session 执行状态。
-  - 需要区分 channel kind：`parent_child`、`workspace_pair`、`project_bridge`；至少能显示是否有 unread high-priority handoff / blocked / review result。
+### 已收口 SessionChannel Unread Indicator / Inbox Overlay
 
-- [ ] TUI Inbox panel / overlay。
-  - 提供 `/inbox` 的 TUI 展开视图或 overlay，作为跨 session message 的主要阅读入口。
-  - 每条消息显示：source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs、memory candidate governance 摘要。
-  - 支持最小操作：open/read、ack、copy/quote into current prompt；后续可评估 filter unread/all、按 channel 分组、按 priority 排序。
-  - 面板必须明确提示：这些消息是 collaboration context，不是当前用户直接指令；执行前必须验证 evidence。
+`bbl chat` 已在 boxed input footer 显示轻量 SessionChannel 状态：linked session 数、unread inbox 数、channel kind 摘要与 high-priority/key message 类型；状态不展示消息正文、不抢占主输入框、不改变当前 session 执行状态。`/inbox` / `/inbox all` 已打开 TUI Inbox overlay，每条消息展示 source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs 与 memory candidate governance 摘要；overlay 明确标注 collaboration context / not direct user instructions，并支持 open/read、ack、quote into current prompt。quote 只预填当前 prompt，必须由用户审阅后手动提交；ack 只调用 inbox ack，不改变 cwd/provider/profile/permission 或其他 session 状态。
 
-- [ ] 主对话轻量事件卡片。
-  - 只对关键消息类型插入 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、`memory_candidate` governance rejected/requires approval。
-  - 卡片只做提示和跳转，例如 `[open inbox] [ack] [quote into prompt]`，不把消息内容自动作为 user message 注入，不自动触发工具或 cwd/provider/profile/permission 变化。
-  - 普通低优先级 finding/question 不应刷屏主对话，只更新 unread indicator。
+### 已收口 SessionChannel 主对话轻量事件卡片
 
-- [ ] Keyboard / ownership / PTY smoke。
-  - Inbox overlay 必须遵守唯一 input owner：打开 overlay 时快捷键只由 overlay 消费，关闭后恢复主输入框；不能和 slash palette、tool picker、permission panel、history search、vim mode 抢键盘焦点。
-  - PTY smoke 需要覆盖：unread indicator 出现、打开 inbox、ack message、quote into prompt、overlay Esc/Enter/↑/↓ 路由、长 session id/CJK/path/evidence 宽度渲染、resize 后不破坏主输入框。
+`bbl chat` 会在 session flow 后刷新 unread inbox snapshot，仅对关键 unread side-channel message 渲染 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、以及 governance rejected / requires approval 的 `memory_candidate`。卡片只展示 source/target、channel、evidence、governance 与 `[open inbox] [ack] [quote]` 操作提示，不自动注入消息正文、不自动触发工具、不改变 cwd/provider/profile/permission；启动时会把既有关键消息标记为 seen，避免旧消息在主对话中重放刷屏。普通低优先级 finding/question 只更新 unread indicator。
 
-- [ ] 安全与语义边界。
-  - 不实现 raw transcript sharing UI。
-  - 不把另一个 session 的消息渲染成当前 session 的用户输入。
-  - 不允许一个 session 通过 TUI 操作静默改变另一个 session 的 cwd、provider、profile、permission 或执行状态。
-  - `memory_candidate` 只展示 review-only governance metadata 与 approval requirement；不提供默认自动写入长期记忆按钮。若未来加入写入入口，必须先走独立 approval / permission 规划。
+### 已收口 SessionChannel Inbox Overlay PTY Smoke
 
-当前 P2 Advanced CLI/TUI 的新打开项仅为 SessionChannel 联系可见化；其他交互能力后续只在真实显示回归、PTY smoke drift 或新增交互状态时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
+真实 PTY smoke 已覆盖 seeded local SessionChannel inbox：boxed input footer unread indicator、`/inbox` overlay 打开、ack selected message、quote into prompt 且不自动提交、主对话关键事件卡片、overlay 对 slash palette 的焦点互斥、resize/navigation 后 overlay 稳定以及关闭后主输入框恢复。当前 TUI 仍是消费侧入口：`/inbox` / `/inbox all` / `/inbox ack <messageId>` 用于处理 inbox；发起跨 session message 仍通过 Nexus API 或 AgentScheduler parent-child channel，不新增 raw transcript sharing 或直接跨 session 指令 UI。
+
+### 持续语义边界
+
+- 不实现 raw transcript sharing UI。
+- 不把另一个 session 的消息渲染成当前 session 的用户输入。
+- 不允许一个 session 通过 TUI 操作静默改变另一个 session 的 cwd、provider、profile、permission 或执行状态。
+- `memory_candidate` 只展示 review-only governance metadata 与 approval requirement；不提供默认自动写入长期记忆按钮。若未来加入写入入口，必须先走独立 approval / permission 规划。
+
+当前 P2 Advanced CLI/TUI 的唯一打开项为 SessionChannel Inbox overlay 真实 PTY smoke 补强；其他交互能力后续只在真实显示回归、PTY smoke drift 或新增交互状态时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
 
 ## 验证命令
 

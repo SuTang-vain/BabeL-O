@@ -143,6 +143,13 @@ def send(fd: int, text: str) -> None:
     os.write(fd, text.encode('utf-8'))
 
 
+def flush_to_screen(fd: int, transcript: list[str], timeout: float = 0.2) -> str:
+    chunk = read_available(fd, timeout)
+    if chunk:
+        transcript.append(chunk)
+    return screen_text(''.join(transcript))
+
+
 def assert_single_slash_palette_preview(screen: str):
     lines = screen.split('\n')
     preview_lines = [line for line in lines if re.match(r'^> /[A-Za-z-]*$', line)]
@@ -168,6 +175,93 @@ def prepare_programming_workspace(config_dir: str) -> str:
     except OSError:
         pass
     return workspace
+
+
+def seed_session_channel_inbox(repo: str, config_dir: str, workspace: str, message_kind: str = 'initial') -> None:
+    seed_file = os.path.join(config_dir, f'seed-session-channel-{message_kind}.ts')
+    database_path = os.path.join(config_dir, 'db.sqlite')
+    if message_kind == 'event-card':
+        body = """
+await storage.saveSessionMessage({
+  messageId: 'msg-pty-card',
+  channelId: 'channel-pty-inbox',
+  fromSessionId: 'session-pty-source',
+  toSessionId: 'session-pty-inbox',
+  broadcast: false,
+  type: 'blocked',
+  content: 'Source session is blocked and needs validation before merge.',
+  evidence: [{ type: 'file', ref: 'src/cli/inboxOverlay.ts', label: 'event card smoke' }],
+  priority: 'high',
+  createdAt: '2026-06-08T00:00:10.000Z',
+  deliveredAt: '2026-06-08T00:00:10.000Z',
+  status: 'delivered',
+})
+"""
+    else:
+        body = f"""
+const now = '2026-06-08T00:00:00.000Z'
+for (const sessionId of ['session-pty-source', 'session-pty-inbox']) {{
+  await storage.saveSession({{
+    sessionId,
+    cwd: {workspace!r},
+    prompt: '',
+    phase: 'created',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  }})
+}}
+await storage.saveSessionChannel({{
+  channelId: 'channel-pty-inbox',
+  kind: 'workspace_pair',
+  participantSessionIds: ['session-pty-source', 'session-pty-inbox'],
+  createdBySessionId: 'session-pty-source',
+  createdAt: now,
+  status: 'open',
+  policy: DEFAULT_SESSION_CHANNEL_POLICY,
+}})
+await storage.saveSessionMessage({{
+  messageId: 'msg-pty-quote',
+  channelId: 'channel-pty-inbox',
+  fromSessionId: 'session-pty-source',
+  toSessionId: 'session-pty-inbox',
+  broadcast: false,
+  type: 'handoff',
+  content: 'Review src/cli/inboxOverlay.ts before changing the inbox overlay.',
+  evidence: [{{ type: 'file', ref: 'src/cli/inboxOverlay.ts', label: 'overlay smoke' }}],
+  priority: 'high',
+  createdAt: now,
+  deliveredAt: now,
+  status: 'delivered',
+}})
+"""
+    with open(seed_file, 'w', encoding='utf-8') as fh:
+        fh.write(f"""
+import {{ SqliteStorage }} from {os.path.join(repo, 'src', 'storage', 'SqliteStorage.js')!r}
+import {{ DEFAULT_SESSION_CHANNEL_POLICY }} from {os.path.join(repo, 'src', 'shared', 'sessionChannel.js')!r}
+
+async function main() {{
+  const storage = new SqliteStorage({database_path!r})
+{body}
+  await storage.close?.()
+}}
+
+main().catch(error => {{
+  console.error(error)
+  process.exit(1)
+}})
+""")
+    subprocess.run(
+        [os.path.join(repo, 'node_modules', '.bin', 'tsx'), seed_file],
+        cwd=repo,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def set_terminal_size(fd: int, rows: int, columns: int) -> None:
+    fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
 
 
 def start_chat_process(command: list[str], workspace: str, env: dict[str, str]) -> tuple[int, subprocess.Popen]:
@@ -220,10 +314,13 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
     with open(config_file, 'w', encoding='utf-8') as fh:
         fh.write('{"defaultModel":"local/coding-runtime"}\n')
 
+    inbox_sequences = ('session-inbox-overlay-ack', 'session-inbox-quote-prefill', 'session-inbox-focus-resize', 'session-inbox-event-card')
     workspace = prepare_programming_workspace(config_dir) if sequence in ('programming-workflow', 'resume-session', 'coding-question-files', 'task-update-status') else repo
+    if sequence in inbox_sequences:
+        seed_session_channel_inbox(repo, config_dir, workspace)
 
     env = os.environ.copy()
-    columns = '84' if sequence == 'slash-palette-narrow' else '100'
+    columns = '84' if sequence == 'slash-palette-narrow' else '120' if sequence in inbox_sequences else '100'
     env.update({
         'BABEL_O_CONFIG_FILE': config_file,
         'BABEL_O_LAUNCH_CWD': workspace,
@@ -250,7 +347,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
             '--cwd',
             workspace,
         ]
-    session_id = None
+    session_id = 'session-pty-inbox' if sequence in inbox_sequences else None
     command = [*base_command]
     if sequence == 'dev-title':
         command.append('dev')
@@ -263,12 +360,7 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         if not wait_for(master_fd, '? for shortcuts', timeout, transcript):
             return 1, ''.join(transcript) + '\n[pty-smoke] prompt did not appear\n'
 
-        if sequence == 'idle-stays-open':
-            time.sleep(1.0)
-            if proc.poll() is not None:
-                return proc.returncode or 0, ''.join(transcript) + '\n[pty-smoke] chat exited while idle\n'
-            send(master_fd, '/exit\r')
-        elif sequence == 'dev-title':
+        if sequence == 'dev-title':
             visible = visible_text(''.join(transcript))
             if '❖ BABEL-O  dev' not in visible:
                 return 1, ''.join(transcript) + '\n[pty-smoke] dev title did not render\n'
@@ -607,6 +699,84 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
                 return 1, ''.join(transcript) + '\n[pty-smoke] done/failed tool rows missing from final screen\n'
             if screen.count('? for shortcuts') > 1:
                 return 1, ''.join(transcript) + '\n[pty-smoke] terminal state smoke rendered duplicate input boxes\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'session-inbox-overlay-ack':
+            if not wait_for(master_fd, 'inbox: 1 unread', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox unread footer did not render\n'
+            send(master_fd, '/inbox\r')
+            if not wait_for(master_fd, 'BABEL Inbox · session-pty-inbox', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not open\n'
+            if not wait_for(master_fd, 'Review src/cli/inboxOverlay.ts before changing the inbox overlay.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not render message content\n'
+            visible = visible_text(''.join(transcript))
+            for expected in ('linked sessions: 1', 'channel=channel-pty-inbox', 'kind=workspace_pair', 'Collaboration context only', 'not direct user instructions', 'file:src/cli/inboxOverlay.ts'):
+                if expected not in visible:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] inbox overlay missing {expected}\n'
+            send(master_fd, 'a')
+            if not wait_for(master_fd, 'Acknowledged msg-pty-quote for session session-pty-inbox.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox ack did not acknowledge selected message\n'
+            send(master_fd, '/inbox\r')
+            if not wait_for(master_fd, 'No unread inbox messages.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not reflect acknowledged empty state\n'
+            send(master_fd, '\x1b')
+            wait_for(master_fd, '? for shortcuts', timeout, transcript)
+            send(master_fd, '/exit\r')
+        elif sequence == 'session-inbox-quote-prefill':
+            send(master_fd, '/inbox\r')
+            if not wait_for(master_fd, 'BABEL Inbox · session-pty-inbox', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not open for quote\n'
+            send(master_fd, 'q')
+            if not wait_for(master_fd, 'Quoted inbox context into the prompt. Review and submit manually.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox quote did not report manual prefill\n'
+            if not wait_for(master_fd, 'Use this SessionChannel inbox context only after verifying evidence:', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] quoted inbox context was not prefilled into input\n'
+            visible = visible_text(''.join(transcript))
+            for expected in ('message=msg-pty-quote', 'content: Review src/cli/inboxOverlay.ts before changing the inbox overlay.', 'evidence: file:src/cli/inboxOverlay.ts'):
+                if expected not in visible:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] quoted inbox prefill missing {expected}\n'
+            if 'BabeL-O local runtime is active.' in visible:
+                return 1, ''.join(transcript) + '\n[pty-smoke] quoted inbox context submitted without user confirmation\n'
+            send(master_fd, '\x03')
+        elif sequence == 'session-inbox-focus-resize':
+            send(master_fd, '/inbox\r')
+            if not wait_for(master_fd, 'BABEL Inbox · session-pty-inbox', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not open for focus smoke\n'
+            send(master_fd, '/')
+            time.sleep(0.1)
+            screen = flush_to_screen(master_fd, transcript)
+            if 'Insert bash prompt prefix' in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette opened while inbox overlay owned input\n'
+            set_terminal_size(master_fd, 18, 72)
+            send(master_fd, '\x1b[B')
+            send(master_fd, '\x1b[A')
+            time.sleep(0.1)
+            screen = flush_to_screen(master_fd, transcript)
+            if 'BABEL Inbox · session-pty-inbox' not in screen or 'Review src/cli/inboxOverlay.ts before changing the inbox overlay.' not in screen:
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not survive resize/navigation\n'
+            if screen.count('? for shortcuts') > 0:
+                return 1, ''.join(transcript) + '\n[pty-smoke] main input shortcut row leaked while inbox overlay owned input\n'
+            send(master_fd, '\x1b')
+            if not wait_for(master_fd, '? for shortcuts', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox overlay did not close back to input\n'
+            send(master_fd, '/')
+            if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not work after inbox overlay closed\n'
+            send(master_fd, '\x1b')
+            time.sleep(0.1)
+            flush_to_screen(master_fd, transcript)
+            send(master_fd, '\x7f')
+            send(master_fd, '/exit\r')
+        elif sequence == 'session-inbox-event-card':
+            seed_session_channel_inbox(repo, config_dir, workspace, 'event-card')
+            send(master_fd, 'hello\r')
+            if not wait_for(master_fd, 'BabeL-O local runtime is active.', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] event card setup prompt did not complete\n'
+            if not wait_for(master_fd, 'SessionChannel blocked · high · from=session-pty-source · to=session-pty-inbox', timeout, transcript):
+                return 1, ''.join(transcript) + '\n[pty-smoke] inbox event card did not render after session flow\n'
+            visible = visible_text(''.join(transcript))
+            for expected in ('channel=channel-pty-inbox kind=workspace_pair message=msg-pty-card', 'collaboration context only; verify evidence before acting', 'evidence: file:src/cli/inboxOverlay.ts', '[open inbox: /inbox]', '[ack: /inbox ack msg-pty-card]', '[quote: /inbox then q]'):
+                if expected not in visible:
+                    return 1, ''.join(transcript) + f'\n[pty-smoke] inbox event card missing {expected}\n'
             send(master_fd, '/exit\r')
         elif sequence == 'input-placeholder':
             send(master_fd, '\r')

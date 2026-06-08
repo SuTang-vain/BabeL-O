@@ -60,7 +60,7 @@ export function renderFixedInputBox(options: FixedInputBoxOptions): FixedInputBo
   }
 }
 
-export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: string }): FixedInputBoxRender {
+export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: string; footerStatus?: string }): FixedInputBoxRender {
   const columns = Math.max(20, options.columns ?? process.stdout.columns ?? 80)
   const lineWidth = Math.max(1, columns - 1)
   const separator = chalk.dim('─'.repeat(lineWidth))
@@ -86,7 +86,7 @@ export function renderBoxedInput(options: FixedInputBoxOptions & { modelId?: str
     const suffix = index === 0 ? renderedSuggestion || renderedPlaceholder : ''
     return `${prefix}${line}${suffix}`
   })
-  const footer = formatInputFooter(lineWidth, options.modelId)
+  const footer = formatInputFooter(lineWidth, options.modelId, options.footerStatus)
   const cursorRow = 1 + wrapped.cursorRow
   const totalRows = inputLines.length + 3
 
@@ -113,9 +113,11 @@ export function currentInputModelLabel(modelId = ConfigManager.getInstance().res
   return words.replace(/\s+(Low|Medium|High|Fast|Slow)$/i, ' ($1)')
 }
 
-export function formatInputFooter(columns = process.stdout.columns ?? 80, modelId?: string): string {
-  const left = chalk.dim('? for shortcuts')
+export function formatInputFooter(columns = process.stdout.columns ?? 80, modelId?: string, footerStatus?: string): string {
   const right = chalk.dim(currentInputModelLabel(modelId))
+  const rawLeft = footerStatus ? `? for shortcuts · ${footerStatus}` : '? for shortcuts'
+  const leftBudget = Math.max(1, columns - visibleTerminalWidth(right) - 1)
+  const left = chalk.dim(truncateToTerminalWidth(rawLeft, leftBudget))
   const gap = Math.max(1, columns - visibleTerminalWidth(left) - visibleTerminalWidth(right))
   return `${left}${' '.repeat(gap)}${right}`
 }
