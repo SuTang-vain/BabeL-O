@@ -70,6 +70,12 @@ export function registerChatCommand(program: Command): void {
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
     .option('--session <id>', 'Resume an existing session ID')
     .action(async (options: { url?: string; cwd: string; session?: string }) => {
+      if (!input.isTTY || !output.isTTY) {
+        console.error(chalk.red('Error: bbl chat requires an interactive terminal. Use `bbl run "<prompt>"` for non-interactive prompts.'))
+        process.exitCode = 1
+        return
+      }
+
       const historyFile = path.join(DEFAULT_CONFIG_DIR, 'history')
       let history: string[] = []
       try {
@@ -85,6 +91,10 @@ export function registerChatCommand(program: Command): void {
       }
 
       const completer = makeCompleter(options.cwd)
+
+      input.resume()
+      // SEA idle readline can otherwise leave no active event-loop handle.
+      const chatKeepAlive = setInterval(() => {}, 60_000)
 
       const rl = readline.createInterface({
         input,
@@ -506,13 +516,14 @@ export function registerChatCommand(program: Command): void {
       }
 
       const cleanupListeners = () => {
+        clearInterval(chatKeepAlive)
         slashPalette.dispose()
         process.stdin.removeListener('keypress', onGlobalKeypress)
         if (process.stdin.isTTY) {
           process.stdin.setRawMode(false)
         }
-        process.stdout.write('\x1b[?2004l')        // Disable bracketed paste
-        process.stdout.write(terminalMouseDisableSequence()) // Disable mouse tracking
+        process.stdout.write('\x1b[?2004l')
+        process.stdout.write(terminalMouseDisableSequence())
         process.stdin.emit = originalEmit
       }
 

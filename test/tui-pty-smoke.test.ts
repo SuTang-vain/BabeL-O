@@ -31,6 +31,13 @@ function runPtySmoke(sequence: string) {
   return stripAnsi(output)
 }
 
+test('PTY smoke: chat stays open while idle', { skip: !shouldRun || !existsSync(driver) }, () => {
+  const output = runPtySmoke('idle-stays-open')
+  assert.match(output, /BABEL-O/)
+  assert.match(output, /\? for shortcuts/)
+  assert.doesNotMatch(output, /chat exited while idle/)
+})
+
 test('PTY smoke: slash palette opens and exits cleanly', { skip: !shouldRun || !existsSync(driver) }, () => {
   const output = runPtySmoke('slash-palette')
   assert.match(output, /Insert bash prompt prefix/)

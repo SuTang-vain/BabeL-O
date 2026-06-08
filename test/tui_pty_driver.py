@@ -261,7 +261,12 @@ def run_chat_smoke(sequence: str, timeout: float) -> tuple[int, str]:
         if not wait_for(master_fd, '? for shortcuts', timeout, transcript):
             return 1, ''.join(transcript) + '\n[pty-smoke] prompt did not appear\n'
 
-        if sequence == 'slash-palette':
+        if sequence == 'idle-stays-open':
+            time.sleep(1.0)
+            if proc.poll() is not None:
+                return proc.returncode or 0, ''.join(transcript) + '\n[pty-smoke] chat exited while idle\n'
+            send(master_fd, '/exit\r')
+        elif sequence == 'slash-palette':
             send(master_fd, '/')
             if not wait_for(master_fd, 'Insert bash prompt prefix', timeout, transcript):
                 return 1, ''.join(transcript) + '\n[pty-smoke] slash palette did not render\n'
