@@ -1,6 +1,12 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
-import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
+import type {
+  EvidenceRef,
+  SessionChannel,
+  SessionMessage,
+  SessionMessagePriority,
+  SessionMessageType,
+} from '../shared/sessionChannel.js'
 import type { AgentJob, AgentJobFilter, AgentSpawnRequest, AgentWaitOptions } from '../nexus/agents/types.js'
 
 export type NexusClientOptions = {
@@ -257,6 +263,49 @@ export class NexusClient {
     return this.getJson(
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listSessionMessages(
+    channelId: string,
+    options: { limit?: number; cursor?: string; order?: 'asc' | 'desc' } = {},
+  ): Promise<{ type: 'session_messages'; channelId: string; messages: SessionMessage[]; nextCursor?: string; order: 'asc' | 'desc'; limit: number }> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.order) params.set('order', options.order)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(
+      `/v1/session-channels/${encodeURIComponent(channelId)}/messages${query}`,
+    ) as Promise<{
+      type: 'session_messages'
+      channelId: string
+      messages: SessionMessage[]
+      nextCursor?: string
+      order: 'asc' | 'desc'
+      limit: number
+    }>
+  }
+
+  async sendSessionMessage(
+    channelId: string,
+    body: {
+      fromSessionId: string
+      toSessionId?: string
+      broadcast?: boolean
+      type: SessionMessageType
+      content: string
+      evidence?: EvidenceRef[]
+      priority?: SessionMessagePriority
+      metadata?: Record<string, unknown>
+    },
+  ): Promise<{ type: 'session_message_created'; message: SessionMessage }> {
+    return this.postJson(
+      `/v1/session-channels/${encodeURIComponent(channelId)}/messages`,
+      body,
+    ) as Promise<{
+      type: 'session_message_created'
+      message: SessionMessage
+    }>
   }
 
   async listSessionInbox(

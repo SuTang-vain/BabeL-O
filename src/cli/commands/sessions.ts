@@ -1,7 +1,9 @@
 import chalk from 'chalk'
 import { Command } from 'commander'
 import { NexusClient } from '../NexusClient.js'
-import type { SessionMessage } from '../../shared/sessionChannel.js'
+import { shortSessionId, shouldRenderInboxEventCard } from '../inboxOverlay.js'
+import type { SessionSnapshot } from '../../shared/session.js'
+import type { SessionChannel, SessionMessage } from '../../shared/sessionChannel.js'
 
 export function registerSessionsCommand(program: Command): void {
   const sessions = program.command('sessions').description('Inspect Nexus sessions')
@@ -10,10 +12,31 @@ export function registerSessionsCommand(program: Command): void {
     .command('list')
     .description('List sessions')
     .option('--url <url>', 'Nexus URL')
-    .action(async (options: { url?: string }) => {
-      console.log(
-        JSON.stringify(await new NexusClient({ baseUrl: options.url }).listSessions(), null, 2),
-      )
+    .option('--json', 'Print raw JSON response')
+    .action(async (options: { url?: string; json?: boolean }) => {
+      const client = new NexusClient({ baseUrl: options.url })
+      const list = await client.listSessions()
+      if (options.json) {
+        console.log(JSON.stringify(list, null, 2))
+        return
+      }
+      console.log(formatSessionsList(list, await loadSessionRelationshipSummary(client, parseSessionsList(list))))
+    })
+
+  sessions
+    .command('tree')
+    .description('Show parent-child session tree with relationship markers')
+    .argument('[rootSessionId]', 'Optional root session id')
+    .option('--url <url>', 'Nexus URL')
+    .option('--limit <count>', 'Sessions to fetch', '200')
+    .action(async (
+      rootSessionId: string | undefined,
+      options: { url?: string; limit: string },
+    ) => {
+      const client = new NexusClient({ baseUrl: options.url })
+      const list = await client.listSessions({ limit: Number(options.limit) })
+      const sessions = parseSessionsList(list)
+      console.log(formatSessionsTree(list, await loadSessionRelationshipSummary(client, sessions), { rootSessionId }))
     })
 
   sessions
@@ -262,6 +285,106 @@ export function registerSessionsCommand(program: Command): void {
     })
 }
 
+export type SessionsListResponse = {
+  type: 'sessions_list'
+  sessions: SessionSnapshot[]
+}
+
+export type SessionRelationshipSummary = {
+  channels?: SessionChannel[]
+  inboxBySessionId?: Map<string, SessionMessage[]>
+}
+
+export type SessionsTreeOptions = {
+  rootSessionId?: string
+}
+
+export function formatSessionsList(input: unknown, relationships: SessionRelationshipSummary = {}): string {
+  const sessions = parseSessionsList(input)
+  const lines = [chalk.cyan('--- Sessions ---')]
+  if (sessions.length === 0) {
+    lines.push(chalk.dim('No sessions.'))
+    return lines.join('\n')
+  }
+
+  for (const session of sessions) {
+    const badge = formatSessionRelationshipBadge(session, relationships)
+    const cwd = session.cwd ? ` · ${session.cwd}` : ''
+    lines.push(`${chalk.bold(session.sessionId)} ${chalk.dim(session.phase)}${badge ? ` ${badge}` : ''}${cwd}`)
+  }
+  lines.push(chalk.dim('Open details with: bbl sessions inbox <sessionId> or /inbox inside bbl chat.'))
+  return lines.join('\n')
+}
+
+export function formatSessionsTree(
+  input: unknown,
+  relationships: SessionRelationshipSummary = {},
+  options: SessionsTreeOptions = {},
+): string {
+  const sessions = parseSessionsList(input)
+  const lines = [chalk.cyan('--- Session Tree ---')]
+  if (sessions.length === 0) {
+    lines.push(chalk.dim('No sessions.'))
+    return lines.join('\n')
+  }
+
+  const byParent = new Map<string, SessionSnapshot[]>()
+  const sessionIds = new Set(sessions.map(session => session.sessionId))
+  for (const session of sessions) {
+    const parentId = session.parentSessionId && sessionIds.has(session.parentSessionId)
+      ? session.parentSessionId
+      : ''
+    const siblings = byParent.get(parentId) ?? []
+    siblings.push(session)
+    byParent.set(parentId, siblings)
+  }
+  for (const siblings of byParent.values()) siblings.sort(compareSessionsForTree)
+
+  const root = options.rootSessionId ? sessions.find(session => session.sessionId === options.rootSessionId) : undefined
+  const roots = root ? [root] : (byParent.get('') ?? [])
+  if (options.rootSessionId && !root) {
+    lines.push(chalk.yellow(`Root session not found in fetched session list: ${options.rootSessionId}`))
+    return lines.join('\n')
+  }
+
+  const rendered = new Set<string>()
+  for (let index = 0; index < roots.length; index++) {
+    appendSessionTreeRows(lines, roots[index]!, {
+      byParent,
+      relationships,
+      prefix: '',
+      isLast: index === roots.length - 1,
+      rendered,
+    })
+  }
+  lines.push(chalk.dim('Tree shows parent-child session structure only; non-tree channels stay as row badges.'))
+  lines.push(chalk.dim('Open message details with: /inbox or bbl sessions inbox <sessionId>.'))
+  return lines.join('\n')
+}
+
+export async function loadSessionRelationshipSummary(
+  client: Pick<NexusClient, 'listSessionChannels' | 'listSessionInbox'>,
+  sessions: SessionSnapshot[],
+): Promise<SessionRelationshipSummary> {
+  let channels: SessionChannel[] = []
+  try {
+    channels = (await client.listSessionChannels({ limit: 200 })).channels
+  } catch {
+    channels = []
+  }
+  const channelSessionIds = new Set(channels.flatMap(channel => channel.participantSessionIds))
+  const inboxBySessionId = new Map<string, SessionMessage[]>()
+  await Promise.all(sessions.map(async session => {
+    if (!channelSessionIds.has(session.sessionId)) return
+    try {
+      inboxBySessionId.set(session.sessionId, (await client.listSessionInbox(session.sessionId, { limit: 20 })).messages)
+    } catch {
+      inboxBySessionId.set(session.sessionId, [])
+    }
+  }))
+  return { channels, inboxBySessionId }
+}
+
 export type SessionInboxResponse = {
   type: 'session_inbox'
   sessionId: string
@@ -299,6 +422,96 @@ export function formatSessionAck(response: SessionAckResponse): string {
     chalk.green(`Acknowledged ${response.message.messageId} for session ${response.sessionId}.`),
     formatSessionInboxMessage(response.message),
   ].join('\n')
+}
+
+function appendSessionTreeRows(
+  lines: string[],
+  session: SessionSnapshot,
+  options: {
+    byParent: Map<string, SessionSnapshot[]>
+    relationships: SessionRelationshipSummary
+    prefix: string
+    isLast: boolean
+    rendered: Set<string>
+  },
+): void {
+  if (options.rendered.has(session.sessionId)) return
+  options.rendered.add(session.sessionId)
+  const connector = options.prefix ? (options.isLast ? '└─ ' : '├─ ') : ''
+  lines.push(`${options.prefix}${connector}${formatSessionTreeNode(session, options.relationships)}`)
+  const children = options.byParent.get(session.sessionId) ?? []
+  const childPrefix = options.prefix + (options.isLast ? '   ' : '│  ')
+  for (let index = 0; index < children.length; index++) {
+    appendSessionTreeRows(lines, children[index]!, {
+      ...options,
+      prefix: childPrefix,
+      isLast: index === children.length - 1,
+    })
+  }
+}
+
+function formatSessionTreeNode(session: SessionSnapshot, relationships: SessionRelationshipSummary): string {
+  const badge = formatSessionRelationshipBadge(session, relationships)
+  const label = `● ${session.sessionId}`
+  const status = chalk.dim(session.phase)
+  const agent = stringFromMetadata(session.metadata, 'agentType') ?? session.assignedAgentId
+  const meta = [status, agent ? chalk.dim(`agent=${agent}`) : '', badge].filter(Boolean).join(' ')
+  return `${chalk.bold(label)} ${meta}`.trimEnd()
+}
+
+function compareSessionsForTree(left: SessionSnapshot, right: SessionSnapshot): number {
+  const created = left.createdAt.localeCompare(right.createdAt)
+  if (created !== 0) return created
+  return left.sessionId.localeCompare(right.sessionId)
+}
+
+function formatSessionRelationshipBadge(session: SessionSnapshot, relationships: SessionRelationshipSummary): string {
+  const channels = (relationships.channels ?? []).filter(channel => channel.participantSessionIds.includes(session.sessionId))
+  const messages = relationships.inboxBySessionId?.get(session.sessionId) ?? []
+  const unreadMessages = messages.filter(message => message.status !== 'acknowledged' && !message.acknowledgedAt)
+  const parts: string[] = []
+
+  const parentChannel = channels.find(channel => channel.kind === 'parent_child')
+  if (parentChannel) {
+    const parentId = session.parentSessionId ?? parentChannel.createdBySessionId
+    if (parentId && parentId !== session.sessionId) parts.push(`← ${shortSessionId(parentId)}`)
+    const children = parentChannel.participantSessionIds.filter(participant => participant !== session.sessionId && participant !== parentId)
+    if (children.length > 0) parts.push(`→ ${children.slice(0, 2).map(shortSessionId).join(',')}${children.length > 2 ? ` +${children.length - 2}` : ''}`)
+  }
+
+  for (const channel of channels) {
+    if (parts.length >= 2) break
+    if (channel.kind === 'parent_child') continue
+    const marker = markerForChannelKind(channel.kind)
+    const peers = channel.participantSessionIds.filter(participant => participant !== session.sessionId)
+    if (peers.length === 0) continue
+    parts.push(`${marker} ${peers.slice(0, 2).map(shortSessionId).join(',')}${peers.length > 2 ? ` +${peers.length - 2}` : ''}`)
+  }
+
+  if (unreadMessages.length > 0) {
+    parts.push(unreadMessages.some(message => message.priority === 'high' || shouldRenderInboxEventCard(message)) ? `!!${unreadMessages.length}` : `!${unreadMessages.length}`)
+    const keyMessage = unreadMessages.find(shouldRenderInboxEventCard) ?? unreadMessages.find(message => message.priority === 'high')
+    if (keyMessage) parts.push(keyMessage.type)
+  }
+
+  return parts.length > 0 ? chalk.dim(parts.join(' · ')) : ''
+}
+
+function markerForChannelKind(kind: SessionChannel['kind']): string {
+  if (kind === 'workspace_pair' || kind === 'group') return '⇄'
+  if (kind === 'direct') return '↔'
+  if (kind === 'project_bridge') return '↗'
+  return '⇄'
+}
+
+function stringFromMetadata(metadata: SessionSnapshot['metadata'], key: string): string | undefined {
+  const value = metadata?.[key]
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
+}
+
+function parseSessionsList(input: unknown): SessionSnapshot[] {
+  const value = input as Partial<SessionsListResponse>
+  return Array.isArray(value.sessions) ? value.sessions : []
 }
 
 function formatSessionInboxMessage(message: SessionMessage): string {

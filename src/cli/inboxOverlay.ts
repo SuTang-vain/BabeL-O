@@ -70,7 +70,8 @@ export function formatInboxFooterStatus(input: {
   }
 
   const parts: string[] = []
-  if (linkedSessionIds.size > 0) parts.push(`linked sessions: ${linkedSessionIds.size}`)
+  const linkedSummary = formatLinkedSessionSummary(linkedSessionIds)
+  if (linkedSummary) parts.push(linkedSummary)
   if (linkedSessionIds.size > 0 || unreadMessages.length > 0) parts.push(`inbox: ${unreadMessages.length} unread`)
 
   const channelKinds = summarizeChannelKinds(channels, input.sessionId)
@@ -316,6 +317,14 @@ function moveSelection(state: InboxOverlayState, delta: number): InboxOverlaySta
   return { ...state, selectedIndex, scrollOffset: Math.max(0, scrollOffset) }
 }
 
+function formatLinkedSessionSummary(linkedSessionIds: Set<string>): string {
+  if (linkedSessionIds.size === 0) return ''
+  const ids = [...linkedSessionIds].sort()
+  const shown = ids.slice(0, 3).map(shortSessionId)
+  const extra = ids.length > shown.length ? ` +${ids.length - shown.length}` : ''
+  return `linked sessions: ${ids.length} [${shown.join(', ')}${extra}]`
+}
+
 function summarizeChannelKinds(channels: InboxChannelSummary[], sessionId: string): string {
   const counts = new Map<SessionChannelKind, number>()
   for (const channel of channels) {
@@ -360,6 +369,14 @@ function formatGovernanceCardRows(message: SessionMessage, columns: number): str
     fitLine(`governance: decision=${stringValue(governance.decision) ?? 'unknown'} scope=${stringValue(governance.scope) ?? 'unknown'} approval=${stringValue(approval?.status) ?? 'unknown'}:${stringValue(approval?.requiredBy) ?? 'unknown'} auto_write=${governance.autoWrite === true ? 'true' : 'false'}`, columns),
     blockedReasons.length > 0 ? fitLine(`blocked: ${blockedReasons.join(',')}`, columns) : undefined,
   ].filter((row): row is string => Boolean(row))
+}
+
+export function shortSessionId(sessionId: string): string {
+  const normalized = sessionId.trim()
+  if (!normalized) return sessionId
+  const stripped = normalized.replace(/^session[-_]/, '')
+  if (stripped.length <= 18) return stripped
+  return `${stripped.slice(0, 8)}…${stripped.slice(-6)}`
 }
 
 function channelKindFromMetadata(message: SessionMessage): SessionChannelKind | undefined {

@@ -9,7 +9,7 @@ import {
   parseAgentExecutionEnvironment,
 } from '../nexus/remoteRunnerConfig.js'
 import { configureEverCoreFromEnv } from '../nexus/everCoreConfig.js'
-import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
+import type { EvidenceRef, SessionChannel, SessionMessage, SessionMessagePriority, SessionMessageType } from '../shared/sessionChannel.js'
 
 export type EmbeddedNexusClientOptions = {
   cwd: string
@@ -59,6 +59,66 @@ export class EmbeddedNexusClient {
       'GET',
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async getSession(
+    sessionId: string,
+    options: { recentEventLimit?: number } = {},
+  ): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.recentEventLimit !== undefined) {
+      params.set('recentEventLimit', String(options.recentEventLimit))
+    }
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson(
+      'GET',
+      `/v1/sessions/${encodeURIComponent(sessionId)}${query}`,
+    )
+  }
+
+  async listSessionMessages(
+    channelId: string,
+    options: { limit?: number; cursor?: string; order?: 'asc' | 'desc' } = {},
+  ): Promise<{ type: 'session_messages'; channelId: string; messages: SessionMessage[]; nextCursor?: string; order: 'asc' | 'desc'; limit: number }> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.cursor) params.set('cursor', options.cursor)
+    if (options.order) params.set('order', options.order)
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.injectJson(
+      'GET',
+      `/v1/session-channels/${encodeURIComponent(channelId)}/messages${query}`,
+    ) as Promise<{
+      type: 'session_messages'
+      channelId: string
+      messages: SessionMessage[]
+      nextCursor?: string
+      order: 'asc' | 'desc'
+      limit: number
+    }>
+  }
+
+  async sendSessionMessage(
+    channelId: string,
+    body: {
+      fromSessionId: string
+      toSessionId?: string
+      broadcast?: boolean
+      type: SessionMessageType
+      content: string
+      evidence?: EvidenceRef[]
+      priority?: SessionMessagePriority
+      metadata?: Record<string, unknown>
+    },
+  ): Promise<{ type: 'session_message_created'; message: SessionMessage }> {
+    return this.injectJson(
+      'POST',
+      `/v1/session-channels/${encodeURIComponent(channelId)}/messages`,
+      body,
+    ) as Promise<{
+      type: 'session_message_created'
+      message: SessionMessage
+    }>
   }
 
   async listSessionChannels(options: { sessionId?: string; limit?: number } = {}): Promise<{ type: 'session_channels'; channels: SessionChannel[]; limit: number }> {

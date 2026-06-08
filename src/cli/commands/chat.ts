@@ -435,7 +435,7 @@ export function registerChatCommand(program: Command): void {
         }
         const messagesByChannel = await Promise.all(channels.map(async channel => {
           try {
-            return (await client.listSessionMessages(channel.channelId, { limit: 20, order: 'desc' })).messages.map(message => ({ message, channel }))
+            return (await client.listSessionMessages(channel.channelId, { limit: 20, order: 'desc' })).messages.map((message: SessionMessage) => ({ message, channel }))
           } catch {
             return []
           }
