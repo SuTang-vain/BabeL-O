@@ -43,6 +43,30 @@ test('ListDir returns structured directory inventory with stable directories-fir
   }
 })
 
+test('ListDir diagnoses workspace path drift for missing absolute directories', async () => {
+  const root = await makeTmpDir()
+  const cwd = join(root, 'BABEL', 'BabeL-O')
+  try {
+    await mkdir(join(cwd, 'src'), { recursive: true })
+    await writeFile(join(cwd, 'src', 'index.ts'), 'export {}', 'utf8')
+    const wrongPath = join(root, 'BabeL-O', 'src')
+
+    const result = await listDirTool.execute(
+      { path: wrongPath, maxEntries: 20, includeHidden: false, includeFiles: true, includeDirectories: true, maxDepth: 1 },
+      toolContext(cwd),
+    )
+
+    assert.equal(result.success, false)
+    const output = String(result.output)
+    assert.match(output, /ListDir could not find directory/)
+    assert.match(output, /PATH_DRIFT_SUSPECTED/)
+    assert.ok(output.includes(join('BABEL', 'BabeL-O', 'src')))
+    assert.match(output, /current cwd/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('ListDir supports maxDepth=2 and skips dependency/build directories', async () => {
   const cwd = await makeTmpDir()
   try {

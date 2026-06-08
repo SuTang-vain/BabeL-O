@@ -10,8 +10,8 @@ import {
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../shared/config.js'
 import { createId } from '../shared/id.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
-import type { NexusEvent } from '../shared/events.js'
-import type { SessionPhase } from '../shared/session.js'
+import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../shared/events.js'
+import type { SessionPhase, TaskSessionTerminalReason } from '../shared/session.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
 import { extractAbsolutePaths } from '../runtime/LLMCodingRuntime.js'
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
@@ -150,6 +150,7 @@ export async function runSessionFlow(
     fs.mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true })
     const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
     const { createDefaultNexusRuntime } = await import('../nexus/createRuntime.js')
+    const { configureEverCoreFromEnv } = await import('../nexus/everCoreConfig.js')
     const {
       assertAgentRemoteExecutionReady,
       assertRemoteRunnerReady,
@@ -160,6 +161,7 @@ export async function runSessionFlow(
     const remoteRunner = await configureRemoteRunnerFromEnv()
     assertRemoteRunnerReady(remoteRunner.status)
     assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
+    const everCore = await configureEverCoreFromEnv(process.env, { cwd })
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath,
       allowedTools: ['*'],
@@ -167,6 +169,12 @@ export async function runSessionFlow(
       enableMcp: process.env.BABEL_O_ENABLE_MCP === '1',
       remoteRunner: remoteRunner.runner,
       agentExecutionEnvironment,
+      memoryProvider: everCore.memoryProvider,
+      everCore: {
+        client: everCore.client,
+        config: everCore.config,
+        dispose: everCore.dispose,
+      },
     })
     const originalAppendEvent = storage.appendEvent.bind(storage)
 
@@ -204,16 +212,21 @@ export async function runSessionFlow(
       session.updatedAt = new Date().toISOString()
       session.lastUserInput = prompt
     }
+    session.result = undefined
+    session.error = undefined
+    session.terminalReason = undefined
     await storage.saveSession(session)
 
     await storage.appendEvent(sessionId, {
       type: 'user_message',
-      schemaVersion: '2026-05-21.babel-o.v1',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
       sessionId,
       timestamp: new Date().toISOString(),
       text: prompt,
     })
 
+    const requestId = createId('req')
+    const currentTurnEvents: NexusEvent[] = []
     const configManager = ConfigManager.getInstance()
     const userPromptHooks = await executeRuntimeHooks(
       'UserPromptSubmit',
@@ -227,7 +240,6 @@ export async function runSessionFlow(
 
     try {
       const settings = configManager.resolveSettings()
-      const requestId = createId('req')
       const budget = process.env.BABEL_O_THINKING_BUDGET
         ? parseInt(process.env.BABEL_O_THINKING_BUDGET, 10)
         : undefined
@@ -244,6 +256,7 @@ export async function runSessionFlow(
         budget,
         remoteRunner: remoteRunner.runner,
       })) {
+        currentTurnEvents.push(event)
         await storage.appendEvent(sessionId, event)
       }
     } catch (err: any) {
@@ -253,18 +266,14 @@ export async function runSessionFlow(
     } finally {
       const finalSession = await storage.getSession(sessionId, { includeEvents: false })
       if (finalSession) {
-        if (abortController.signal.aborted) {
-          finalSession.phase = 'cancelled'
-        } else {
-          const eventsResult = await storage.listEvents(sessionId, {
-            limit: 100,
-            order: 'desc',
-          })
-          const outcome = resolveFinalSessionOutcome(eventsResult.events)
-          finalSession.phase = outcome.phase
-          if (outcome.result !== undefined) finalSession.result = outcome.result
-          if (outcome.error !== undefined) finalSession.error = outcome.error
-        }
+        const outcome = resolveFinalSessionOutcome([...currentTurnEvents].reverse(), {
+          aborted: abortController.signal.aborted,
+          requestId,
+        })
+        finalSession.phase = outcome.phase
+        finalSession.result = outcome.result
+        finalSession.error = outcome.error
+        finalSession.terminalReason = outcome.terminalReason
         finalSession.updatedAt = new Date().toISOString()
         await storage.saveSession(finalSession)
       }
@@ -298,25 +307,75 @@ function resolveExplicitPromptCwd(prompt: string): string | undefined {
   return undefined
 }
 
-export function resolveFinalSessionOutcome(eventsNewestFirst: NexusEvent[]): {
+export const REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT = 'REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT'
+
+function selectCurrentTurnEvents(eventsNewestFirst: NexusEvent[], requestId?: string): NexusEvent[] {
+  if (!requestId) return eventsNewestFirst
+  const boundaryIndex = eventsNewestFirst.findIndex(
+    event => event.type === 'session_started' && event.requestId === requestId,
+  )
+  if (boundaryIndex === -1) return []
+  return eventsNewestFirst.slice(0, boundaryIndex + 1)
+}
+
+export function resolveFinalSessionOutcome(
+  eventsNewestFirst: NexusEvent[],
+  options: { aborted?: boolean; requestId?: string } = {},
+): {
   phase: SessionPhase
   result?: string
   error?: string
+  terminalReason?: TaskSessionTerminalReason
 } {
-  const terminalEvent = eventsNewestFirst.find(event =>
+  if (options.aborted) {
+    return {
+      phase: 'cancelled',
+      terminalReason: {
+        category: 'cancelled',
+        code: 'REQUEST_CANCELLED',
+        message: 'Execution cancelled by user.',
+      },
+    }
+  }
+
+  const currentTurnEvents = selectCurrentTurnEvents(eventsNewestFirst, options.requestId)
+  const terminalEvent = currentTurnEvents.find(event =>
     event.type === 'error' || event.type === 'result'
   )
-  if (!terminalEvent) return { phase: 'failed' }
+  if (!terminalEvent) {
+    const message = 'The latest request ended without a result or error event. Previous turn results were not reused.'
+    return {
+      phase: 'failed',
+      error: message,
+      terminalReason: {
+        category: 'runtime',
+        code: REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT,
+        message,
+      },
+    }
+  }
 
   if (terminalEvent.type === 'error') {
     return {
       phase: 'failed',
       error: terminalEvent.message,
+      terminalReason: {
+        category: 'runtime',
+        code: terminalEvent.code,
+        message: terminalEvent.message,
+      },
     }
   }
 
   return {
     phase: terminalEvent.success ? 'completed' : 'failed',
     result: terminalEvent.message,
+    terminalReason: terminalEvent.success
+      ? undefined
+      : {
+          category: 'runtime',
+          code: 'RESULT_FAILED',
+          message: terminalEvent.message,
+        },
   }
 }

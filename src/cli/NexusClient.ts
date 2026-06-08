@@ -1,5 +1,6 @@
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
+import type { SessionMessage } from '../shared/sessionChannel.js'
 import type { AgentJob, AgentJobFilter, AgentSpawnRequest, AgentWaitOptions } from '../nexus/agents/types.js'
 
 export type NexusClientOptions = {
@@ -244,6 +245,34 @@ export class NexusClient {
     return this.getJson(
       `/v1/sessions/${encodeURIComponent(sessionId)}/events${query}`,
     )
+  }
+
+  async listSessionInbox(
+    sessionId: string,
+    options: { limit?: number; includeAcknowledged?: boolean } = {},
+  ): Promise<{ type: 'session_inbox'; sessionId: string; messages: SessionMessage[]; limit: number; includeAcknowledged: boolean }> {
+    const params = new URLSearchParams()
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.includeAcknowledged !== undefined) params.set('includeAcknowledged', String(options.includeAcknowledged))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/sessions/${encodeURIComponent(sessionId)}/inbox${query}`) as Promise<{
+      type: 'session_inbox'
+      sessionId: string
+      messages: SessionMessage[]
+      limit: number
+      includeAcknowledged: boolean
+    }>
+  }
+
+  async ackSessionMessage(
+    sessionId: string,
+    messageId: string,
+  ): Promise<{ type: 'session_message_acknowledged'; sessionId: string; message: SessionMessage | null }> {
+    return this.postJson(`/v1/sessions/${encodeURIComponent(sessionId)}/inbox/${encodeURIComponent(messageId)}/ack`, {}) as Promise<{
+      type: 'session_message_acknowledged'
+      sessionId: string
+      message: SessionMessage | null
+    }>
   }
 
   async listChildSessions(

@@ -23,6 +23,25 @@ test('Grep supports pathMatches file glob filtering', async () => {
   assert.doesNotMatch(output, /notes\.md/)
 })
 
+test('Grep rejects boolean-string pathMatches with recoverable guidance', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'babel-o-grep-pathmatches-invalid-'))
+  await writeFile(join(cwd, 'source.ts'), 'evercore integration\n')
+
+  const result = await grepTool.execute({
+    pattern: 'evercore',
+    path: '.',
+    pathMatches: 'true',
+    maxMatches: 10,
+  }, toolContext(cwd))
+
+  assert.equal(result.success, false)
+  const output = String(result.output)
+  assert.match(output, /INVALID_GREP_PATH_MATCHES_GLOB/)
+  assert.match(output, /file glob filter, not a boolean/)
+  assert.match(output, /Omit pathMatches to search all files/)
+  assert.match(output, /\*\*\/\*\.ts/)
+})
+
 test('Grep schema accepts pathMatches', () => {
   const result = grepTool.inputSchema.safeParse({
     pattern: 'ContextForker|forkContext|contextFork',

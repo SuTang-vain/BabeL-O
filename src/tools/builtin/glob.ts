@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { readdir } from 'node:fs/promises'
 import { isAbsolute, join, relative } from 'node:path'
 import { promisify } from 'node:util'
 import { minimatch } from 'minimatch'
 import { z } from 'zod'
 import type { ToolDefinition } from '../Tool.js'
+import { buildPathDriftDiagnostic } from './pathDrift.js'
 import { resolveInsideWorkspace } from './pathSafety.js'
 
 const execFileAsync = promisify(execFile)
@@ -38,6 +40,20 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
     const searchRoot = input.path
       ? resolveInsideWorkspace(context.cwd, input.path, context.allowedPaths)
       : context.cwd
+    if (!existsSync(searchRoot)) {
+      const diagnostic = input.path
+        ? buildPathDriftDiagnostic({ cwd: context.cwd, requestedPath: input.path })
+        : undefined
+      return {
+        success: true,
+        output: diagnostic
+          ? [
+              `No files matched because Glob path "${input.path}" does not exist.`,
+              { guidance: diagnostic },
+            ]
+          : [],
+      }
+    }
 
     const globPattern = normalizePattern(input.pattern, searchRoot)
 

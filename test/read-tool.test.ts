@@ -30,6 +30,30 @@ test('Read auto mode previews files larger than maxBytes', async () => {
   }
 })
 
+test('Read diagnoses workspace path drift for missing absolute paths', async () => {
+  const root = await makeTmpDir()
+  const cwd = join(root, 'BABEL', 'BabeL-O')
+  try {
+    await mkdir(join(cwd, 'src'), { recursive: true })
+    await writeFile(join(cwd, 'src', 'index.ts'), 'export {}', 'utf8')
+    const wrongPath = join(root, 'BabeL-O', 'src', 'index.ts')
+
+    const result = await readTool.execute(
+      { path: wrongPath, maxBytes: 200_000, mode: 'auto' },
+      { cwd, sessionId: 'session-read-path-drift', maxOutputBytes: 1_000_000, bashMaxBufferBytes: 1_000_000 },
+    )
+
+    assert.equal(result.success, false)
+    const output = String(result.output)
+    assert.match(output, /Read could not find/)
+    assert.match(output, /PATH_DRIFT_SUSPECTED/)
+    assert.match(output, new RegExp(join('BABEL', 'BabeL-O', 'src', 'index.ts').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    assert.match(output, /Do not treat the missing path as evidence/)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('Read supports targeted offset and limit ranges', async () => {
   const cwd = await makeTmpDir()
   try {

@@ -1,6 +1,7 @@
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
+import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 import type { NexusTask } from '../shared/task.js'
 import type { ToolTrace } from '../shared/toolTrace.js'
 import type {
@@ -14,6 +15,10 @@ import type {
   ToolTraceListResult,
   PermissionAudit,
   ExecutionMetrics,
+  SessionChannelListOptions,
+  SessionInboxOptions,
+  SessionMessageListOptions,
+  SessionMessageListResult,
 } from './Storage.js'
 import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 
@@ -22,6 +27,8 @@ export class MemoryStorage implements NexusStorage {
   private readonly tasks = new Map<string, NexusTask>()
   private readonly agentJobs = new Map<string, AgentJob>()
   private readonly toolTraces = new Map<string, ToolTrace>()
+  private readonly sessionChannels = new Map<string, SessionChannel>()
+  private readonly sessionMessages = new Map<string, SessionMessage>()
   private readonly permissionAudits = new Map<string, PermissionAudit[]>()
   private readonly executionMetricsMap = new Map<string, ExecutionMetrics>()
 
@@ -193,6 +200,79 @@ export class MemoryStorage implements NexusStorage {
     }
   }
 
+  async saveSessionChannel(channel: SessionChannel): Promise<void> {
+    this.sessionChannels.set(channel.channelId, structuredClone(channel))
+  }
+
+  async getSessionChannel(channelId: string): Promise<SessionChannel | null> {
+    const channel = this.sessionChannels.get(channelId)
+    return channel ? structuredClone(channel) : null
+  }
+
+  async listSessionChannels(options: SessionChannelListOptions = {}): Promise<SessionChannel[]> {
+    const limit = options.limit ?? 100
+    return [...this.sessionChannels.values()]
+      .filter(channel => !options.sessionId || channel.participantSessionIds.includes(options.sessionId))
+      .sort((a, b) => {
+        const cmp = a.createdAt.localeCompare(b.createdAt)
+        if (cmp !== 0) return cmp
+        return a.channelId.localeCompare(b.channelId)
+      })
+      .slice(0, limit)
+      .map(channel => structuredClone(channel))
+  }
+
+  async saveSessionMessage(message: SessionMessage): Promise<void> {
+    this.sessionMessages.set(message.messageId, structuredClone(message))
+  }
+
+  async getSessionMessage(messageId: string): Promise<SessionMessage | null> {
+    const message = this.sessionMessages.get(messageId)
+    return message ? structuredClone(message) : null
+  }
+
+  async listSessionMessages(
+    channelId: string,
+    options: SessionMessageListOptions = {},
+  ): Promise<SessionMessageListResult> {
+    const limit = options.limit ?? 100
+    const order = options.order ?? 'asc'
+    const startIndex = options.cursor ? Number(options.cursor) : 0
+    const messages = [...this.sessionMessages.values()]
+      .filter(message => message.channelId === channelId)
+      .sort(compareMessages)
+    const orderedMessages = order === 'asc' ? messages : [...messages].reverse()
+    const page = orderedMessages.slice(startIndex, startIndex + limit)
+    const nextIndex = startIndex + page.length
+    return {
+      messages: structuredClone(page),
+      nextCursor: nextIndex < orderedMessages.length ? String(nextIndex) : undefined,
+    }
+  }
+
+  async listSessionInbox(
+    sessionId: string,
+    options: SessionInboxOptions = {},
+  ): Promise<SessionMessage[]> {
+    const limit = options.limit ?? 20
+    const messages = [...this.sessionMessages.values()]
+      .filter(message => isInboxMessage(message, sessionId, this.sessionChannels.get(message.channelId), options.includeAcknowledged ?? false))
+      .sort(compareMessages)
+    return structuredClone(messages.slice(Math.max(0, messages.length - limit)))
+  }
+
+  async acknowledgeSessionMessage(messageId: string, acknowledgedAt: string): Promise<SessionMessage | null> {
+    const message = this.sessionMessages.get(messageId)
+    if (!message) return null
+    const acknowledged: SessionMessage = {
+      ...message,
+      acknowledgedAt,
+      status: 'acknowledged',
+    }
+    this.sessionMessages.set(messageId, structuredClone(acknowledged))
+    return structuredClone(acknowledged)
+  }
+
   async savePermissionAudit(audit: PermissionAudit): Promise<void> {
     const list = this.permissionAudits.get(audit.sessionId) ?? []
     list.push(structuredClone(audit))
@@ -230,4 +310,23 @@ function matchesAgentJobFilter(job: AgentJob, filter: AgentJobFilter): boolean {
   if (filter.status !== undefined && job.status !== filter.status) return false
   if (filter.agentType !== undefined && job.agentType !== filter.agentType) return false
   return true
+}
+
+function compareMessages(left: SessionMessage, right: SessionMessage): number {
+  const cmp = left.createdAt.localeCompare(right.createdAt)
+  if (cmp !== 0) return cmp
+  return left.messageId.localeCompare(right.messageId)
+}
+
+function isInboxMessage(
+  message: SessionMessage,
+  sessionId: string,
+  channel: SessionChannel | undefined,
+  includeAcknowledged: boolean,
+): boolean {
+  if (!channel || !channel.participantSessionIds.includes(sessionId)) return false
+  if (message.fromSessionId === sessionId) return false
+  if (!includeAcknowledged && message.acknowledgedAt) return false
+  if (message.toSessionId) return message.toSessionId === sessionId
+  return message.broadcast === true
 }

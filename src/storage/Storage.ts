@@ -1,6 +1,7 @@
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { SessionSnapshot } from '../shared/session.js'
+import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 import type { NexusTask } from '../shared/task.js'
 import type { ToolTrace } from '../shared/toolTrace.js'
 
@@ -38,6 +39,27 @@ export type ToolTraceListOptions = {
 export type ToolTraceListResult = {
   traces: ToolTrace[]
   nextCursor?: string
+}
+
+export type SessionChannelListOptions = {
+  sessionId?: string
+  limit?: number
+}
+
+export type SessionMessageListOptions = {
+  limit?: number
+  cursor?: string
+  order?: 'asc' | 'desc'
+}
+
+export type SessionMessageListResult = {
+  messages: SessionMessage[]
+  nextCursor?: string
+}
+
+export type SessionInboxOptions = {
+  limit?: number
+  includeAcknowledged?: boolean
 }
 
 export type PermissionAudit = {
@@ -116,6 +138,20 @@ export interface NexusStorage {
     sessionId: string,
     options?: ToolTraceListOptions,
   ): Promise<ToolTraceListResult>
+  saveSessionChannel(channel: SessionChannel): Promise<void>
+  getSessionChannel(channelId: string): Promise<SessionChannel | null>
+  listSessionChannels(options?: SessionChannelListOptions): Promise<SessionChannel[]>
+  saveSessionMessage(message: SessionMessage): Promise<void>
+  getSessionMessage(messageId: string): Promise<SessionMessage | null>
+  listSessionMessages(
+    channelId: string,
+    options?: SessionMessageListOptions,
+  ): Promise<SessionMessageListResult>
+  listSessionInbox(
+    sessionId: string,
+    options?: SessionInboxOptions,
+  ): Promise<SessionMessage[]>
+  acknowledgeSessionMessage(messageId: string, acknowledgedAt: string): Promise<SessionMessage | null>
   savePermissionAudit(audit: PermissionAudit): Promise<void>
   listPermissionAudits(sessionId: string): Promise<PermissionAudit[]>
   saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void>

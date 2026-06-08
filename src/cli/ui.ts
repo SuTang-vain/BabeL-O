@@ -139,6 +139,7 @@ export function mapDropdownSelection(selected: string): string {
     '/smoke': '/smoke ',
     '/fallback': '/fallback ',
     '/sessions': '/sessions',
+    '/inbox': '/inbox',
     '/editor': '/editor',
     '/e': '/editor',
   }
@@ -155,7 +156,7 @@ export function getAutosuggestion(line: string, history: string[]): string | und
   // 2. Check slash commands
   if (line.startsWith('/')) {
     const slashChoices = [
-      '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/history', '/tool',
+      '/help', '/clear', '/compact', '/context', '/agentloop-smoke', '/exit', '/model', '/profile', '/status', '/smoke', '/fallback', '/sessions', '/inbox', '/history', '/tool',
       '/read', '/write', '/edit', '/grep', '/glob', '/bash', '/task', '/pager', '/less', '/editor', '/e'
     ]
     const matchingSlash = slashChoices.find(c => c.startsWith(line) && c !== line)
@@ -579,6 +580,7 @@ export function describeCompletionChoice(choice: string): { label: string; tag: 
     '/smoke': { tag: 'status', description: 'Run provider smoke readiness or live probe' },
     '/fallback': { tag: 'status', description: 'Show non-silent provider fallback plan' },
     '/sessions': { tag: 'session', description: 'List recent sessions' },
+    '/inbox': { tag: 'session', description: 'Show unread SessionChannel messages' },
     '/history': { tag: 'history', description: 'Search and replay prompt history' },
     '/tool': { tag: 'tools', description: 'Open the tool picker' },
     '/read': { tag: 'tool', description: 'Insert read prompt prefix' },

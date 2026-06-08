@@ -52,6 +52,9 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | --- | --- |
 | [reference/context-and-subagent-upgrade-plan.md](./reference/context-and-subagent-upgrade-plan.md) | 上下文规范化、ContextForker 与模型可见 AgentScheduler 架构参考。 |
 | [reference/tool-granularity-and-evidence-governance-plan.md](./reference/tool-granularity-and-evidence-governance-plan.md) | 工具粒度与 Evidence-grounded Reading 治理：`ListDir` / `Glob` / `Grep` / `Read` 职责边界、证据语义与 Agent tool 命名边界。 |
+| [reference/workspace-path-drift-governance-plan.md](./reference/workspace-path-drift-governance-plan.md) | Workspace path drift、连续路径失败恢复与最终回答证据降级治理。 |
+| [reference/session-finalization-and-evidence-governance-plan.md](./reference/session-finalization-and-evidence-governance-plan.md) | Current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。 |
+| [reference/session-to-session-memory-channel-plan.md](./reference/session-to-session-memory-channel-plan.md) | Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。 |
 | [reference/go-runner-plan.md](./reference/go-runner-plan.md) | 可选 Go `RemoteToolRunner` 执行后端参考；Go 只负责已批准工具的执行 mechanics，不替代 TypeScript Nexus 主体。 |
 
 ### Archive
