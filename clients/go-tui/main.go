@@ -3,12 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,11 +25,12 @@ import (
 )
 
 type config struct {
-	baseURL   string
-	cwd       string
-	sessionID string
-	apiKey    string
-	altScreen bool
+	baseURL        string
+	cwd            string
+	sessionID      string
+	apiKey         string
+	altScreen      bool
+	pollIntervalMs int
 }
 
 type streamStartedMsg struct {
@@ -135,6 +139,11 @@ type profileSelectMsg struct {
 	err     error
 }
 
+// pollTickMsg fires when the background /v1/runtime/config poll is
+// due. The handler should call fetchRuntimeConfig with `?since=`
+// when m.configVersion > 0.
+type pollTickMsg struct{}
+
 type model struct {
 	cfg            config
 	input          textinput.Model
@@ -193,6 +202,7 @@ func parseFlags() config {
 	flag.StringVar(&cfg.cwd, "cwd", cwd, "workspace directory sent to Nexus")
 	flag.StringVar(&cfg.sessionID, "session", "", "optional existing session id")
 	flag.BoolVar(&cfg.altScreen, "alt", true, "use terminal alternate screen")
+	flag.IntVar(&cfg.pollIntervalMs, "poll-interval-ms", 30000, "background /v1/runtime/config poll interval in milliseconds; 0 disables polling")
 	flag.Parse()
 	cfg.apiKey = os.Getenv("NEXUS_API_KEY")
 	return cfg
@@ -225,7 +235,25 @@ func newModel(cfg config) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.spinner.Tick, fetchRuntimeConfig(m.cfg))
+	return tea.Batch(
+		textinput.Blink,
+		m.spinner.Tick,
+		fetchRuntimeConfig(m.cfg, 0),
+		fetchRuntimeProfiles(m.cfg),
+		m.schedulePollTick(),
+	)
+}
+
+// schedulePollTick arms the next background /v1/runtime/config
+// poll, when --poll-interval-ms is non-zero. The returned cmd emits a
+// pollTickMsg after the configured interval; the handler then re-arms
+// itself so polling continues until the model is destroyed.
+func (m model) schedulePollTick() tea.Cmd {
+	if m.cfg.pollIntervalMs <= 0 {
+		return nil
+	}
+	d := time.Duration(m.cfg.pollIntervalMs) * time.Millisecond
+	return tea.Tick(d, func(time.Time) tea.Msg { return pollTickMsg{} })
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -297,13 +325,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case runtimeConfigMsg:
+		if errors.Is(msg.err, errNotModified) {
+			// Background poll saw no change; reschedule and stay quiet.
+			return m, m.schedulePollTick()
+		}
 		if msg.err != nil {
 			m.appendLine("error", msg.err.Error())
-			return m, nil
+			return m, m.schedulePollTick()
 		}
+		// Distinguish a background poll from an initial / explicit fetch
+		// by inspecting whether the version moved.
+		previousVersion := m.configVersion
 		m.applyRuntimeConfig(msg.config)
-		m.appendLine("status", formatRuntimeConfig(msg.config))
-		return m, nil
+		if msg.config.Version > previousVersion {
+			m.appendLine("status", "config updated: "+formatRuntimeConfig(msg.config))
+		}
+		return m, m.schedulePollTick()
 
 	case runtimeProfilesMsg:
 		if msg.err != nil {
@@ -317,7 +354,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.profileCount = len(msg.response.Profiles)
 		m.tombstoneCount = len(msg.response.Tombstones)
 		m.appendLine("status", formatRuntimeProfiles(msg.response))
-		return m, nil
+		return m, m.schedulePollTick()
 
 	case profileSelectMsg:
 		if msg.err != nil {
@@ -327,6 +364,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyRuntimeConfig(msg.config)
 		m.appendLine("status", "profile switched: "+firstNonEmpty(msg.config.ActiveProfile, msg.profile))
 		return m, fetchRuntimeProfiles(m.cfg)
+
+	case pollTickMsg:
+		// Background poll. If we've never fetched a config, defer to the
+		// next round rather than blocking the chat loop.
+		if m.configVersion <= 0 {
+			return m, m.schedulePollTick()
+		}
+		return m, fetchRuntimeConfig(m.cfg, m.configVersion)
 
 	case streamClosedMsg:
 		if m.running {
@@ -413,7 +458,7 @@ func (m *model) handleLocalCommand(input string) tea.Cmd {
 	switch fields[0] {
 	case "/config":
 		m.appendLine("status", "refreshing shared Nexus config")
-		return tea.Batch(fetchRuntimeConfig(m.cfg), fetchRuntimeProfiles(m.cfg))
+		return tea.Batch(fetchRuntimeConfig(m.cfg, 0), fetchRuntimeProfiles(m.cfg))
 	case "/profile", "/profiles":
 		if len(fields) == 1 {
 			m.appendLine("status", "loading shared Nexus profiles")
@@ -917,12 +962,20 @@ func waitForStreamEvent(ch <-chan streamEvent) tea.Cmd {
 	}
 }
 
-func fetchRuntimeConfig(cfg config) tea.Cmd {
+func fetchRuntimeConfig(cfg config, since int) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeConfig
-		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload)
+		var query url.Values
+		if since > 0 {
+			query = url.Values{"since": {strconv.Itoa(since)}}
+		}
+		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload, query)
 		return runtimeConfigMsg{config: payload, err: err}
 	}
+}
+
+func pollTick() tea.Msg {
+	return pollTickMsg{}
 }
 
 func fetchRuntimeProfiles(cfg config) tea.Cmd {
@@ -941,10 +994,13 @@ func selectRuntimeProfile(cfg config, profile string) tea.Cmd {
 	}
 }
 
-func nexusJSON(cfg config, method string, path string, body any, out any) error {
+func nexusJSON(cfg config, method string, path string, body any, out any, query ...url.Values) error {
 	endpoint, err := apiURL(cfg.baseURL, path)
 	if err != nil {
 		return err
+	}
+	if len(query) > 0 && len(query[0]) > 0 {
+		endpoint = endpoint + "?" + query[0].Encode()
 	}
 	var reader io.Reader
 	if body != nil {
@@ -975,6 +1031,12 @@ func nexusJSON(cfg config, method string, path string, body any, out any) error 
 	if err != nil {
 		return err
 	}
+	// 304 Not Modified means the server's configVersion has not moved
+	// past `since`. Surface a sentinel so the caller can no-op without
+	// treating it as an error.
+	if res.StatusCode == http.StatusNotModified {
+		return errNotModified
+	}
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
 		return fmt.Errorf("%s %s failed: %s %s", method, path, res.Status, summarizeHTTPError(data))
 	}
@@ -986,6 +1048,10 @@ func nexusJSON(cfg config, method string, path string, body any, out any) error 
 	}
 	return nil
 }
+
+// errNotModified is returned by nexusJSON when the server replies
+// 304 Not Modified; callers compare with errors.Is.
+var errNotModified = fmt.Errorf("config not modified")
 
 func apiURL(base string, path string) (string, error) {
 	parsed, err := url.Parse(base)
@@ -1011,10 +1077,32 @@ func summarizeHTTPError(data []byte) string {
 		return ""
 	}
 	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err == nil {
-		return truncatePlain(singleLine(firstNonEmpty(stringField(payload, "message"), stringField(payload, "error"), compactJSON(payload))), 200)
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return truncatePlain(singleLine(string(data)), 200)
 	}
-	return truncatePlain(singleLine(string(data)), 200)
+	code := stringField(payload, "error")
+	if hint, ok := friendlyNexusError(code, payload); ok {
+		return hint
+	}
+	return truncatePlain(singleLine(firstNonEmpty(stringField(payload, "message"), code, compactJSON(payload))), 200)
+}
+
+// friendlyNexusError maps known §5 path C error codes to human
+// hints. Returns ok=false when the code is not in the friendly set.
+func friendlyNexusError(code string, payload map[string]any) (string, bool) {
+	switch code {
+	case "tombstoned_profile":
+		profile := stringField(payload, "profile")
+		return fmt.Sprintf("profile %q is tombstoned; restore via `bbl config profile restore %s`", profile, profile), true
+	case "unknown_profile":
+		profile := stringField(payload, "profile")
+		return fmt.Sprintf("unknown profile %q", profile), true
+	case "not_supported":
+		return "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI", true
+	case "missing_profile":
+		return "missing profile name in request body", true
+	}
+	return "", false
 }
 
 func formatRuntimeConfig(config runtimeConfig) string {
@@ -1039,27 +1127,39 @@ func formatRuntimeConfig(config runtimeConfig) string {
 }
 
 func formatRuntimeProfiles(response runtimeProfilesResponse) string {
-	if len(response.Profiles) == 0 {
-		return "profiles: none"
-	}
-	parts := make([]string, 0, len(response.Profiles))
-	for _, profile := range response.Profiles {
-		name := profile.Name
-		if profile.Active {
-			name = "*" + name
-		}
-		model := firstNonEmpty(profile.Model, "default")
-		parts = append(parts, fmt.Sprintf("%s=%s", name, model))
-	}
 	prefix := "profiles"
 	if response.Version > 0 {
 		prefix = fmt.Sprintf("profiles v=%d", response.Version)
 	}
-	suffix := ""
-	if len(response.Tombstones) > 0 {
-		suffix = fmt.Sprintf(" tombstones=%d", len(response.Tombstones))
+	lines := []string{}
+	if len(response.Profiles) == 0 {
+		lines = append(lines, prefix+": none")
+	} else {
+		parts := make([]string, 0, len(response.Profiles))
+		for _, profile := range response.Profiles {
+			name := profile.Name
+			if profile.Active {
+				name = "*" + name
+			}
+			model := firstNonEmpty(profile.Model, "default")
+			parts = append(parts, fmt.Sprintf("%s=%s", name, model))
+		}
+		lines = append(lines, prefix+": "+strings.Join(parts, ", "))
 	}
-	return prefix + ": " + strings.Join(parts, ", ") + suffix
+	if len(response.Tombstones) > 0 {
+		lines = append(lines, fmt.Sprintf("tombstones (%d):", len(response.Tombstones)))
+		// Stable ordering by name for human-friendly output.
+		names := make([]string, 0, len(response.Tombstones))
+		for name := range response.Tombstones {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			t := response.Tombstones[name]
+			lines = append(lines, fmt.Sprintf("  %s [tombstoned] deletedAt=%s", name, firstNonEmpty(t.DeletedAt, "?")))
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {

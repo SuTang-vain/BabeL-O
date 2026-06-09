@@ -115,7 +115,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `ConfigManager` 已具备 `configVersion`、`tombstones`、`deleteProfile()`、`restoreProfile()`、`isProfileTombstoned()`；重新 `setProfile()` 会清理同名 tombstone，避免同名 profile 复建后仍无法选择。
   - `bbl config profile list/use/delete/restore` 已提供 CLI-only profile 生命周期操作；Go TUI `/profile <name>` 调用 Nexus `config/select`，不会直接写 config 文件。
   - `GET /v1/runtime/models` 的 `configured` 判断覆盖 env、provider config、active profile 与其他 profile 内的 provider API key，响应仍不泄露 secret。
-  - 待补：Go TUI 对 tombstone 的完整 UX（隐藏/恢复提示/确认）、基于 `version` 的后台轮询刷新、profile 切换确认面板、错误态视觉回归。
+- [x] §5 路径 C 阶段 3：Go TUI 消费 version polling + tombstone UX 收口（2026-06-09 收口）。
+  - Go TUI 加 `--poll-interval-ms` flag（默认 30000，0 禁用）；`fetchRuntimeConfig(cfg, since int)` 在 since > 0 时附加 `?since=N` 查询；`nexusJSON` 在 304 时返回 `errNotModified` 哨兵，handler 静默 reschedule 不刷 transcript。
+  - `runtimeConfigMsg` 在 version 实际推进时打 `config updated:` 状态行；304 静默 reschedule。
+  - `friendlyNexusError` 把 `tombstoned_profile` / `unknown_profile` / `not_supported` / `missing_profile` 映射为人话 hint；`/profile <name>` 选到 tombstoned profile 时不再吐 raw JSON，而是显示"profile is tombstoned; restore via `bbl config profile restore <name>`"。
+  - `formatRuntimeProfiles` 现在把 tombstones 列在独立 `tombstones (N):` 块下，按 name 字典序，带 `[tombstoned] deletedAt=<ts>` 标记。
+  - 待补：profile 切换确认面板（带 y/n overlay）、错误态视觉回归 PTY smoke——留到 Phase 7 一并做。
 
 后续：
 

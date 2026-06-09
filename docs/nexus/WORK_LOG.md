@@ -2,6 +2,30 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — §5 路径 C 阶段 3：Go TUI 消费 version polling + tombstone UX 收口
+
+- **用户请求**: 按规划推进 §5 路径 C 阶段 3：Go TUI 上消费增量拉取 + tombstone UX polish。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - `config` 加 `pollIntervalMs` 字段；`--poll-interval-ms` flag（默认 30000，0 禁用）。
+    - `nexusJSON` 加 `query ...url.Values` 可变参数；304 走 `errNotModified` 哨兵错误（`errors.Is` 判定），不当作 generic error。
+    - `fetchRuntimeConfig(cfg, since int)` 接受 since，>0 时附加 `?since=N`。
+    - `pollTickMsg` + `schedulePollTick` 调度下一次 tick；`Init()` 把 fetchRuntimeConfig + fetchRuntimeProfiles + schedulePollTick 一并启动；`runtimeConfigMsg` 在 304 时静默 reschedule，在 version 实际增加时记录 `config updated:` 状态行。
+    - `friendlyNexusError(code, payload)` 把 Nexus 已知错误码（`tombstoned_profile` / `unknown_profile` / `not_supported` / `missing_profile`）映射为人话 hint；`summarizeHTTPError` 优先走 friendly，否则回退到 raw `message`/`error`/`compactJSON`。
+    - `formatRuntimeProfiles` 把 tombstones 列在独立 `tombstones (N):` 块下，按 name 字典序，保留 `deletedAt`，active profile 仍以 `*` 前缀标出。
+  - `clients/go-tui/main_test.go`: 11 个 phase 3 新 test 守住 `friendlyNexusError` / `summarizeHTTPError` / `fetchRuntimeConfig` since 注入 / `nexusJSON` 304 → `errNotModified` / `runtimeConfigMsg` 304 静默 + version 移动日志 / `schedulePollTick` 开/关 / `pollTickMsg` defer / `formatRuntimeProfiles` tombstone 排序。
+  - `clients/go-tui/README.md`: 文档化 `--poll-interval-ms`、`/config` / `/profile` 新行为、tombstone UX；明确 tombstone restore 仍 CLI-only（Go TUI 不写 BabelOConfig）。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `go test ./...` 32/32 pass（5 原有 + 16 Phase 2 + 11 Phase 3）。
+  - `go build -o go-tui .` 10M；新二进制可执行。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 仍过（1.8s）——polling 默认 30s，Phase 1 smoke 跑不到第一个 tick；背景 polling 与 permission approve 链路完全解耦。
+  - `test/config-endpoints.test.ts` + `test/config-profile-cli.test.ts` 22/22 pass。
+- **范围克制（按规划 §5 阶段 3 不包含项）**:
+  - profile switch 确认面板（带 y/n overlay）— 见 TODO_tui.md 后续，阶段 3 仍以错误提示 + listing 表达"已 tombstoned"为主。
+  - 错误态视觉回归 PTY smoke——留 Phase 7 一并补。
+  - Go TUI 直接写 config 文件——继续禁止（`restore` 必须走 `bbl config profile restore` CLI）。
+
 ## 2026-06-09 — §5 路径 C 阶段 2：增量拉取 + profile 切换命令 + tombstone 收口
 
 - **用户请求**: 按规划推进 §5 路径 C 阶段 2。
@@ -26,6 +50,8 @@
   - `test/config-profile-cli.test.ts` 7/7 通过（list / use happy / use tombstoned 拒绝 / delete / restore / restore 非 tombstone 拒绝 / `--help` 表面）。
   - `test/runtime.test.ts` 104/104 通过，shared runtime config 端点与主 runtime API 未回归。
   - `go test ./...` 通过。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 通过，Go TUI permission approve → Bash → done 链路未回归。
+  - `npm test` 全量回归 676/676 通过。
 - **范围克制（按规划）**:
   - 不做 Nexus → Go TUI 的 server-sent config push；增量拉取走 since 查询参数即可。
   - 不让 `bbl config profile` 暴露 `model` / `role` 切换（仍只 CLI 走 `bbl config use` 与 `bbl models inspect`，HTTP 端点继续 400 not_supported）。

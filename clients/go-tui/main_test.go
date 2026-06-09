@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,7 +129,7 @@ func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 			"old": {DeletedAt: "2026-06-09T00:00:00Z"},
 		},
 	})
-	for _, want := range []string{"profiles v=8", "*dev=openai/gpt-4o", "local=local/coding-runtime", "tombstones=1"} {
+	for _, want := range []string{"profiles v=8", "*dev=openai/gpt-4o", "local=local/coding-runtime", "tombstones (1)", "old [tombstoned] deletedAt=2026-06-09T00:00:00Z"} {
 		if !strings.Contains(profilesLine, want) {
 			t.Fatalf("profiles summary missing %q: %q", want, profilesLine)
 		}
@@ -516,5 +517,174 @@ func TestConsumeNexusEventPhase2NoLongerFallsToRawJSON(t *testing.T) {
 	}
 	if !strings.Contains(view, "task +") && !strings.Contains(view, "task   ") {
 		t.Fatalf("transcript should include task labels, got view:\n%s", view)
+	}
+}
+
+// === §5 路径 C 阶段 3: Go TUI version polling + tombstone UX ===
+
+func TestFriendlyNexusErrorProducesHumanHints(t *testing.T) {
+	cases := []struct {
+		code    string
+		payload map[string]any
+		want    string
+	}{
+		{"tombstoned_profile", map[string]any{"profile": "work"}, `profile "work" is tombstoned; restore via ` + "`bbl config profile restore work`"},
+		{"unknown_profile", map[string]any{"profile": "nope"}, `unknown profile "nope"`},
+		{"not_supported", map[string]any{}, "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI"},
+		{"missing_profile", map[string]any{}, "missing profile name in request body"},
+		{"unknown_code", map[string]any{}, ""},
+	}
+	for _, tc := range cases {
+		got, ok := friendlyNexusError(tc.code, tc.payload)
+		if !ok {
+			if tc.want != "" {
+				t.Fatalf("friendlyNexusError(%q) returned ok=false, want %q", tc.code, tc.want)
+			}
+			continue
+		}
+		if tc.want == "" {
+			t.Fatalf("friendlyNexusError(%q) returned ok=true, want ok=false", tc.code)
+		}
+		if !strings.Contains(got, tc.want) {
+			t.Fatalf("friendlyNexusError(%q) = %q, want substring %q", tc.code, got, tc.want)
+		}
+	}
+}
+
+func TestSummarizeHTTPErrorPicksUpFriendlyHints(t *testing.T) {
+	body := []byte(`{"error":"tombstoned_profile","profile":"work","tombstone":{"deletedAt":"2026-06-09T00:00:00Z"}}`)
+	got := summarizeHTTPError(body)
+	if !strings.Contains(got, "tombstoned") {
+		t.Fatalf("summarizeHTTPError = %q, want tombstone hint", got)
+	}
+	if strings.Contains(got, "tombstone=") {
+		t.Fatalf("summarizeHTTPError leaked raw field: %q", got)
+	}
+}
+
+func TestSummarizeHTTPErrorFallsBackToRaw(t *testing.T) {
+	body := []byte(`{"message":"something else","extra":1}`)
+	got := summarizeHTTPError(body)
+	if got != "something else" {
+		t.Fatalf("summarizeHTTPError = %q, want %q", got, "something else")
+	}
+}
+
+func TestFetchRuntimeConfigAppendsSinceQuery(t *testing.T) {
+	// Capture the URL that fetchRuntimeConfig would build by running
+	// it against a server that always returns 304. Use a custom
+	// http.Transport that records the request URL.
+	var gotURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	cfg := config{baseURL: srv.URL, pollIntervalMs: 0}
+	_ = fetchRuntimeConfig(cfg, 42)()
+	if gotURL != "/v1/runtime/config?since=42" {
+		t.Fatalf("fetchRuntimeConfig URL = %q, want %q", gotURL, "/v1/runtime/config?since=42")
+	}
+}
+
+func TestFetchRuntimeConfigNoSinceWhenZero(t *testing.T) {
+	var gotURL string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"runtime_config","version":1}`))
+	}))
+	defer srv.Close()
+
+	cfg := config{baseURL: srv.URL, pollIntervalMs: 0}
+	_ = fetchRuntimeConfig(cfg, 0)()
+	if gotURL != "/v1/runtime/config" {
+		t.Fatalf("fetchRuntimeConfig URL = %q, want no query", gotURL)
+	}
+}
+
+func TestNexusJSONReturnsErrNotModifiedOn304(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotModified)
+	}))
+	defer srv.Close()
+
+	cfg := config{baseURL: srv.URL}
+	var payload runtimeConfig
+	err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload)
+	if !errors.Is(err, errNotModified) {
+		t.Fatalf("expected errNotModified, got %v", err)
+	}
+}
+
+func TestRuntimeConfigMsgHandlerSilentlyReschedulesPollOn304(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	m.configVersion = 7
+
+	_, cmd := m.Update(runtimeConfigMsg{err: errNotModified})
+	if cmd == nil {
+		t.Fatalf("expected a poll reschedule cmd on 304")
+	}
+}
+
+func TestRuntimeConfigMsgHandlerLogsWhenVersionMoves(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	before := len(m.transcript)
+	updated, _ := m.Update(runtimeConfigMsg{config: runtimeConfig{Version: 9, ModelID: "x"}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.configVersion != 9 {
+		t.Fatalf("configVersion = %d, want 9", updatedModel.configVersion)
+	}
+	if len(updatedModel.transcript) <= before {
+		t.Fatalf("transcript should grow when version moves, before=%d after=%d", before, len(updatedModel.transcript))
+	}
+}
+
+func TestSchedulePollTickReturnsNilWhenDisabled(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 0})
+	if cmd := m.schedulePollTick(); cmd != nil {
+		t.Fatalf("expected nil cmd when poll disabled, got %T", cmd)
+	}
+}
+
+func TestSchedulePollTickEmitsPollTickMsg(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	cmd := m.schedulePollTick()
+	if cmd == nil {
+		t.Fatalf("expected a tick cmd")
+	}
+	msg := cmd()
+	if _, ok := msg.(pollTickMsg); !ok {
+		t.Fatalf("expected pollTickMsg, got %T", msg)
+	}
+}
+
+func TestPollTickDeferWhenConfigVersionIsZero(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	_, cmd := m.Update(pollTickMsg{})
+	if cmd == nil {
+		t.Fatalf("expected reschedule cmd when config version is 0")
+	}
+}
+
+func TestFormatRuntimeProfilesTombstoneOrderingIsStable(t *testing.T) {
+	rendered := formatRuntimeProfiles(runtimeProfilesResponse{
+		Version:       1,
+		ActiveProfile: "a",
+		Profiles:      []runtimeProfile{{Name: "a", Active: true, Model: "m1"}},
+		Tombstones: map[string]runtimeProfileTombstone{
+			"zeta":  {DeletedAt: "2026-06-09T01:00:00Z"},
+			"alpha": {DeletedAt: "2026-06-09T02:00:00Z"},
+		},
+	})
+	// alpha should appear before zeta (lexicographic).
+	alphaIdx := strings.Index(rendered, "alpha")
+	zetaIdx := strings.Index(rendered, "zeta")
+	if alphaIdx == -1 || zetaIdx == -1 || alphaIdx > zetaIdx {
+		t.Fatalf("tombstones not sorted: %q", rendered)
 	}
 }

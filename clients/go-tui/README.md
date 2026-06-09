@@ -17,7 +17,14 @@ header, input line, permission panel and layered event output.
 - Handle `permission_request` with approve/reject keyboard actions and a visible
   permission panel.
 - Fetch shared runtime config through Nexus HTTP APIs.
+- Background `?since=<version>` polling on `/v1/runtime/config` (default
+  30000ms; configure with `--poll-interval-ms=0` to disable).
 - Switch active config profiles through `POST /v1/runtime/config/select`.
+- Surface structured Nexus error codes (tombstoned_profile,
+  unknown_profile, not_supported, missing_profile) as human hints
+  rather than raw `{error: ...}` payloads.
+- Render profile tombstones in `/profile` output with stable
+  lexicographic ordering and a `[tombstoned] deletedAt=<ts>` marker.
 - Keep all provider, context, tool, permission and session ownership in Nexus.
 
 ## Run
@@ -44,6 +51,10 @@ You can also run the client directly:
 ```bash
 cd /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui
 go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O
+# Disable background /v1/runtime/config polling:
+go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=0
+# Faster polling for live config sync demos:
+go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=2000
 ```
 
 Keys:
@@ -56,9 +67,24 @@ Keys:
 
 Local commands:
 
-- `/config`: refresh shared Nexus runtime config and profile state.
-- `/profile` or `/profiles`: list shared Nexus profiles.
-- `/profile <name>`: select an existing profile through Nexus.
+- `/config`: refresh shared Nexus runtime config and profile state
+  (also re-arms the next background poll).
+- `/profile` or `/profiles`: list shared Nexus profiles (active marker
+  `*` and a dedicated `tombstones (N):` block with `deletedAt` per entry).
+- `/profile <name>`: select an existing profile through Nexus. A
+  tombstoned profile returns a friendly hint pointing at
+  `bbl config profile restore <name>`; unknown profiles get a similar
+  pointer at `bbl config profile add` and `bbl config profile use`.
+
+Tombstone UX:
+
+- A profile that has been `bbl config profile delete`d stays visible in
+  the `/profile` listing with `[tombstoned] deletedAt=<ts>` and is
+  refused by `/profile <name>` (HTTP 400 `tombstoned_profile`); the Go
+  TUI translates that into "profile is tombstoned; restore via
+  `bbl config profile restore <name>`" instead of a raw JSON error.
+- Restoration itself stays CLI-only (per the rewrite plan): the Go
+  TUI never writes to the local BabelOConfig file.
 
 These commands are handled by the Go TUI client itself and are not submitted as
 agent prompts. The Go TUI does not read BabeL-O config files directly.
