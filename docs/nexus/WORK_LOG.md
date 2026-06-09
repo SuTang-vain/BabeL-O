@@ -2,6 +2,35 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — §5 路径 C 阶段 2：增量拉取 + profile 切换命令 + tombstone 收口
+
+- **用户请求**: 按规划推进 §5 路径 C 阶段 2。
+- **实现**:
+  - `src/shared/config.ts`:
+    - `BabelOConfig` / `BabelOConfigSchema` 加 `tombstones?: { [name]: { deletedAt } }` 与 `configVersion?: number`。
+    - `ConfigManager.save` 每次写盘自增 `configVersion`（单调递增，跨进程持久）。
+    - `ConfigManager` 新增 `deleteProfile(name)`（移到 tombstones，活跃 `activeProfile === name` 时清空）、`restoreProfile(name)`（仅清 tombstone，**不**重建 profile config）、`isProfileTombstoned(name)`、`getTombstones()`、`getConfigVersion()`。
+    - `ConfigManager.setProfile(name, ...)` 会清理同名 tombstone，避免 profile 复建后仍被 `config/select` 拒绝。
+  - `src/nexus/app.ts`:
+    - `inspectResolvedRuntimeConfig` 返回值加 `version` + `tombstones` 字段。
+    - `GET /v1/runtime/config` 支持 `?since=<version>`：since >= currentVersion 返回 304 Not Modified，否则 200 + 新 version。
+    - `GET /v1/runtime/config/profiles` 与 `GET /v1/runtime/config/profiles/:name` 返回值加 `version` + `tombstones`。
+    - `GET /v1/runtime/models` 的 `configured` 判断覆盖 env、provider config、active profile 与非活跃 profile 内的 provider API key，响应仍不泄露 secret。
+    - `POST /v1/runtime/config/select` 把 tombstone 检查放在 `unknown_profile` 之前；tombstoned profile 返回 400 `tombstoned_profile` + `tombstone` 字段。
+  - `src/cli/commands/config.ts`: 新增 `bbl config profile <sub>` 子命令——`list`（展示活跃 + tombstone + version）、`use <name>`（拒绝 tombstoned）、`delete <name>`（软删除并落 tombstone）、`restore <name>`（清 tombstone，不重建 profile config）。
+  - Go TUI 侧（`clients/go-tui/main.go`）接入 `fetchRuntimeConfig` / `fetchRuntimeProfiles` / `selectRuntimeProfile` 三个 HTTP 调用；启动时拉取 config，`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus API 读取/切换 profile，不作为 agent prompt 发送。
+  - Go TUI header/摘要已显示 `profile`、`configVersion`、profile 数与 tombstone 数。
+- **验证**:
+  - `npm run typecheck` / `npm run format:check` 干净。
+  - `test/config-endpoints.test.ts` 15/15 通过（阶段 1 的 6 个 + 阶段 2 新增的 9 个：profile-key configured、version/tombstones 暴露、since 304、profiles version+tombstones、select tombstoned 拒绝、deleteProfile / restoreProfile / setProfile 清 tombstone / save 自增）。
+  - `test/config-profile-cli.test.ts` 7/7 通过（list / use happy / use tombstoned 拒绝 / delete / restore / restore 非 tombstone 拒绝 / `--help` 表面）。
+  - `test/runtime.test.ts` 104/104 通过，shared runtime config 端点与主 runtime API 未回归。
+  - `go test ./...` 通过。
+- **范围克制（按规划）**:
+  - 不做 Nexus → Go TUI 的 server-sent config push；增量拉取走 since 查询参数即可。
+  - 不让 `bbl config profile` 暴露 `model` / `role` 切换（仍只 CLI 走 `bbl config use` 与 `bbl models inspect`，HTTP 端点继续 400 not_supported）。
+  - restore 只清 tombstone，不重建 profile；用户需要重新 `bbl config add` + 写 profile，避免悄悄重建过期 secret。
+
 ## 2026-06-09 — Go TUI Phase 2 event renderer parity 收口
 
 - **用户请求**: 按规划推进 Go TUI Phase 2。

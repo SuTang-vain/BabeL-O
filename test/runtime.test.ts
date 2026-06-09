@@ -2662,6 +2662,116 @@ test('/v1/runtime/status returns redacted provider diagnostics', async () => {
   }
 })
 
+test('/v1/runtime/config endpoints expose shared redacted profile state and select profiles', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-runtime-config-shared`)
+  await mkdir(cwd, { recursive: true })
+  const configManager = ConfigManager.getInstance()
+  configManager.save({
+    defaultModel: 'local/coding-runtime',
+    providers: {
+      openai: { apiKey: 'provider-openai-key' },
+    },
+    activeProfile: 'dev',
+    profiles: {
+      dev: {
+        model: 'openai/gpt-4o',
+        provider: 'openai',
+        apiKey: 'dev-profile-key',
+        baseUrl: 'https://dev.openai.example/v1',
+        roles: {
+          planner: 'anthropic/claude-3-7-sonnet',
+        },
+      },
+      local: {
+        model: 'local/coding-runtime',
+        provider: 'local',
+      },
+    },
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const configResponse = await app.inject({ method: 'GET', url: '/v1/runtime/config' })
+    assert.equal(configResponse.statusCode, 200)
+    const configBody = configResponse.json()
+    assert.equal(configBody.type, 'runtime_config')
+    assert.equal(configBody.modelId, 'openai/gpt-4o')
+    assert.equal(configBody.activeProfile, 'dev')
+    assert.equal(configBody.hasApiKey, true)
+    assert.equal(configBody.apiKey, undefined)
+    assert.doesNotMatch(JSON.stringify(configBody), /dev-profile-key|provider-openai-key/)
+
+    const profilesResponse = await app.inject({ method: 'GET', url: '/v1/runtime/config/profiles' })
+    assert.equal(profilesResponse.statusCode, 200)
+    const profilesBody = profilesResponse.json()
+    assert.equal(profilesBody.type, 'runtime_config_profiles')
+    assert.equal(profilesBody.activeProfile, 'dev')
+    assert.equal(profilesBody.profiles.length, 2)
+    const devProfile = profilesBody.profiles.find((profile: { name: string }) => profile.name === 'dev')
+    assert.equal(devProfile.active, true)
+    assert.equal(devProfile.hasApiKey, true)
+    assert.equal(devProfile.hasBaseUrl, true)
+    assert.equal(devProfile.roles.planner, 'anthropic/claude-3-7-sonnet')
+    assert.equal(devProfile.apiKey, undefined)
+    assert.equal(devProfile.baseUrl, undefined)
+    assert.doesNotMatch(JSON.stringify(profilesBody), /dev-profile-key|provider-openai-key|dev\.openai\.example/)
+
+    const modelsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/models' })
+    assert.equal(modelsResponse.statusCode, 200)
+    const modelsBody = modelsResponse.json()
+    assert.equal(modelsBody.type, 'runtime_models')
+    assert.equal(modelsBody.activeProfile, 'dev')
+    const openaiProvider = modelsBody.providers.find((provider: { id: string }) => provider.id === 'openai')
+    assert.equal(openaiProvider.configured, true)
+    assert.equal(openaiProvider.active, true)
+    assert.doesNotMatch(JSON.stringify(modelsBody), /provider-openai-key|dev-profile-key/)
+
+    const selectResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { profile: 'local' },
+    })
+    assert.equal(selectResponse.statusCode, 200)
+    const selectedBody = selectResponse.json()
+    assert.equal(selectedBody.type, 'runtime_config')
+    assert.equal(selectedBody.activeProfile, 'local')
+    assert.equal(selectedBody.modelId, 'local/coding-runtime')
+    assert.equal(ConfigManager.getInstance().getActiveProfile(), 'local')
+  } finally {
+    await app.close()
+    configManager.save({})
+  }
+})
+
+test('/v1/runtime/config/select rejects inherited profile names', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-runtime-config-proto`)
+  await mkdir(cwd, { recursive: true })
+  const configManager = ConfigManager.getInstance()
+  configManager.save({
+    defaultModel: 'local/coding-runtime',
+    profiles: {
+      dev: { model: 'local/coding-runtime', provider: 'local' },
+    },
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['Read'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { profile: '__proto__' },
+    })
+    assert.equal(response.statusCode, 400)
+    assert.equal(response.json().error, 'unknown_profile')
+    assert.equal(ConfigManager.getInstance().getActiveProfile(), undefined)
+  } finally {
+    await app.close()
+    configManager.save({})
+  }
+})
+
 test('/v1/runtime/provider-smoke returns local dry-run readiness without executing sessions', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-smoke-local`)
   await mkdir(cwd, { recursive: true })

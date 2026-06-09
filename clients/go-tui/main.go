@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,27 +61,101 @@ type pendingPermission struct {
 	message   string
 }
 
+type runtimeCapabilities struct {
+	ToolCalling      bool `json:"toolCalling"`
+	JSONOutput       bool `json:"jsonOutput"`
+	StructuredOutput bool `json:"structuredOutput"`
+	Streaming        bool `json:"streaming"`
+}
+
+type runtimeProfileTombstone struct {
+	DeletedAt string `json:"deletedAt"`
+}
+
+type runtimeConfig struct {
+	Type             string                             `json:"type"`
+	Version          int                                `json:"version"`
+	ModelID          string                             `json:"modelId"`
+	ModelName        string                             `json:"modelName"`
+	ProviderID       string                             `json:"providerId"`
+	ProviderName     string                             `json:"providerName"`
+	ModelSource      string                             `json:"modelSource"`
+	HasAPIKey        bool                               `json:"hasApiKey"`
+	APIKeySource     string                             `json:"apiKeySource"`
+	BaseURL          string                             `json:"baseUrl"`
+	BaseURLSource    string                             `json:"baseUrlSource"`
+	ActiveProfile    string                             `json:"activeProfile"`
+	ContextWindow    int                                `json:"contextWindow"`
+	DefaultMaxTokens int                                `json:"defaultMaxTokens"`
+	Capabilities     runtimeCapabilities                `json:"capabilities"`
+	Tombstones       map[string]runtimeProfileTombstone `json:"tombstones"`
+}
+
+type runtimeProfile struct {
+	Name             string              `json:"name"`
+	Active           bool                `json:"active"`
+	Model            string              `json:"model"`
+	Provider         string              `json:"provider"`
+	Roles            map[string]string   `json:"roles"`
+	HasAPIKey        bool                `json:"hasApiKey"`
+	HasBaseURL       bool                `json:"hasBaseUrl"`
+	ModelName        string              `json:"modelName"`
+	ProviderName     string              `json:"providerName"`
+	ContextWindow    int                 `json:"contextWindow"`
+	DefaultMaxTokens int                 `json:"defaultMaxTokens"`
+	Capabilities     runtimeCapabilities `json:"capabilities"`
+}
+
+type runtimeProfilesResponse struct {
+	Type          string                             `json:"type"`
+	Version       int                                `json:"version"`
+	ActiveProfile string                             `json:"activeProfile"`
+	Profiles      []runtimeProfile                   `json:"profiles"`
+	Tombstones    map[string]runtimeProfileTombstone `json:"tombstones"`
+}
+
 type transcriptLine struct {
 	kind string
 	text string
 }
 
+type runtimeConfigMsg struct {
+	config runtimeConfig
+	err    error
+}
+
+type runtimeProfilesMsg struct {
+	response runtimeProfilesResponse
+	err      error
+}
+
+type profileSelectMsg struct {
+	profile string
+	config  runtimeConfig
+	err     error
+}
+
 type model struct {
-	cfg           config
-	input         textinput.Model
-	viewport      viewport.Model
-	spinner       spinner.Model
-	transcript    []transcriptLine
-	running       bool
-	events        <-chan streamEvent
-	decisions     chan<- permissionDecision
-	pending       *pendingPermission
-	lastEventType string
-	sessionID     string
-	modelID       string
-	startedAt     time.Time
-	width         int
-	height        int
+	cfg            config
+	input          textinput.Model
+	viewport       viewport.Model
+	spinner        spinner.Model
+	transcript     []transcriptLine
+	running        bool
+	events         <-chan streamEvent
+	decisions      chan<- permissionDecision
+	pending        *pendingPermission
+	lastEventType  string
+	sessionID      string
+	modelID        string
+	providerID     string
+	activeProfile  string
+	configVersion  int
+	profileCount   int
+	tombstoneCount int
+	startedAt      time.Time
+	width          int
+	height         int
 }
 
 var (
@@ -149,7 +225,7 @@ func newModel(cfg config) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(textinput.Blink, m.spinner.Tick)
+	return tea.Batch(textinput.Blink, m.spinner.Tick, fetchRuntimeConfig(m.cfg))
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -184,6 +260,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			m.input.SetValue("")
+			if strings.HasPrefix(prompt, "/") {
+				cmd := m.handleLocalCommand(prompt)
+				return m, cmd
+			}
 			m.appendLine("user", prompt)
 			m.running = true
 			m.pending = nil
@@ -215,6 +295,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, waitForStreamEvent(m.events)
 		}
 		return m, nil
+
+	case runtimeConfigMsg:
+		if msg.err != nil {
+			m.appendLine("error", msg.err.Error())
+			return m, nil
+		}
+		m.applyRuntimeConfig(msg.config)
+		m.appendLine("status", formatRuntimeConfig(msg.config))
+		return m, nil
+
+	case runtimeProfilesMsg:
+		if msg.err != nil {
+			m.appendLine("error", msg.err.Error())
+			return m, nil
+		}
+		m.activeProfile = msg.response.ActiveProfile
+		if msg.response.Version > 0 {
+			m.configVersion = msg.response.Version
+		}
+		m.profileCount = len(msg.response.Profiles)
+		m.tombstoneCount = len(msg.response.Tombstones)
+		m.appendLine("status", formatRuntimeProfiles(msg.response))
+		return m, nil
+
+	case profileSelectMsg:
+		if msg.err != nil {
+			m.appendLine("error", msg.err.Error())
+			return m, nil
+		}
+		m.applyRuntimeConfig(msg.config)
+		m.appendLine("status", "profile switched: "+firstNonEmpty(msg.config.ActiveProfile, msg.profile))
+		return m, fetchRuntimeProfiles(m.cfg)
 
 	case streamClosedMsg:
 		if m.running {
@@ -279,13 +391,60 @@ func (m model) renderHeader(width int) string {
 	if model == "" {
 		model = "model pending"
 	}
+	profile := firstNonEmpty(m.activeProfile, "none")
 	top := joinColumns(width, title, statusStyle.Render(state))
-	meta := fmt.Sprintf("url=%s  cwd=%s  session=%s  model=%s", m.cfg.baseURL, m.cfg.cwd, session, model)
+	meta := fmt.Sprintf("url=%s  cwd=%s  session=%s  model=%s  profile=%s", m.cfg.baseURL, m.cfg.cwd, session, model, profile)
+	if m.configVersion > 0 || m.profileCount > 0 || m.tombstoneCount > 0 {
+		meta += fmt.Sprintf("  config=v%d profiles=%d tombstones=%d", m.configVersion, m.profileCount, m.tombstoneCount)
+	}
 	return strings.Join([]string{
 		top,
 		mutedStyle.Render(truncatePlain(meta, width)),
 		divider(width),
 	}, "\n")
+}
+
+func (m *model) handleLocalCommand(input string) tea.Cmd {
+	fields := strings.Fields(input)
+	if len(fields) == 0 {
+		return nil
+	}
+	m.appendLine("user", input)
+	switch fields[0] {
+	case "/config":
+		m.appendLine("status", "refreshing shared Nexus config")
+		return tea.Batch(fetchRuntimeConfig(m.cfg), fetchRuntimeProfiles(m.cfg))
+	case "/profile", "/profiles":
+		if len(fields) == 1 {
+			m.appendLine("status", "loading shared Nexus profiles")
+			return fetchRuntimeProfiles(m.cfg)
+		}
+		if len(fields) == 2 {
+			profile := fields[1]
+			m.appendLine("status", "selecting shared Nexus profile: "+profile)
+			return selectRuntimeProfile(m.cfg, profile)
+		}
+		m.appendLine("error", "usage: /profile or /profile <name>")
+		return nil
+	case "/help":
+		m.appendLine("status", "local commands: /config, /profile, /profile <name>")
+		return nil
+	default:
+		m.appendLine("error", "unknown local command: "+fields[0])
+		return nil
+	}
+}
+
+func (m *model) applyRuntimeConfig(config runtimeConfig) {
+	if config.ModelID != "" {
+		m.modelID = config.ModelID
+	}
+	m.providerID = config.ProviderID
+	m.activeProfile = config.ActiveProfile
+	if config.Version > 0 {
+		m.configVersion = config.Version
+	}
+	m.tombstoneCount = len(config.Tombstones)
 }
 
 func (m model) renderPermission(width int) string {
@@ -756,6 +915,151 @@ func waitForStreamEvent(ch <-chan streamEvent) tea.Cmd {
 		}
 		return streamEventMsg{event: event}
 	}
+}
+
+func fetchRuntimeConfig(cfg config) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeConfig
+		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload)
+		return runtimeConfigMsg{config: payload, err: err}
+	}
+}
+
+func fetchRuntimeProfiles(cfg config) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeProfilesResponse
+		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config/profiles", nil, &payload)
+		return runtimeProfilesMsg{response: payload, err: err}
+	}
+}
+
+func selectRuntimeProfile(cfg config, profile string) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeConfig
+		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"profile": profile}, &payload)
+		return profileSelectMsg{profile: profile, config: payload, err: err}
+	}
+}
+
+func nexusJSON(cfg config, method string, path string, body any, out any) error {
+	endpoint, err := apiURL(cfg.baseURL, path)
+	if err != nil {
+		return err
+	}
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, endpoint, reader)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if cfg.apiKey != "" {
+		req.Header.Set("X-Nexus-API-Key", cfg.apiKey)
+	}
+	client := http.Client{Timeout: 10 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return err
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return fmt.Errorf("%s %s failed: %s %s", method, path, res.Status, summarizeHTTPError(data))
+	}
+	if out == nil {
+		return nil
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
+}
+
+func apiURL(base string, path string) (string, error) {
+	parsed, err := url.Parse(base)
+	if err != nil {
+		return "", err
+	}
+	switch parsed.Scheme {
+	case "http", "https":
+	case "ws":
+		parsed.Scheme = "http"
+	case "wss":
+		parsed.Scheme = "https"
+	default:
+		return "", fmt.Errorf("unsupported Nexus URL scheme %q", parsed.Scheme)
+	}
+	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/" + strings.TrimLeft(path, "/")
+	parsed.RawQuery = ""
+	return parsed.String(), nil
+}
+
+func summarizeHTTPError(data []byte) string {
+	if len(data) == 0 {
+		return ""
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err == nil {
+		return truncatePlain(singleLine(firstNonEmpty(stringField(payload, "message"), stringField(payload, "error"), compactJSON(payload))), 200)
+	}
+	return truncatePlain(singleLine(string(data)), 200)
+}
+
+func formatRuntimeConfig(config runtimeConfig) string {
+	auth := "auth=missing"
+	if config.HasAPIKey {
+		auth = "auth=configured(" + firstNonEmpty(config.APIKeySource, "unknown") + ")"
+	}
+	profile := firstNonEmpty(config.ActiveProfile, "none")
+	prefix := "config"
+	if config.Version > 0 {
+		prefix = fmt.Sprintf("config v=%d", config.Version)
+	}
+	return fmt.Sprintf(
+		"%s model=%s provider=%s profile=%s %s context=%d",
+		prefix,
+		firstNonEmpty(config.ModelID, "unknown"),
+		firstNonEmpty(config.ProviderID, "unknown"),
+		profile,
+		auth,
+		config.ContextWindow,
+	)
+}
+
+func formatRuntimeProfiles(response runtimeProfilesResponse) string {
+	if len(response.Profiles) == 0 {
+		return "profiles: none"
+	}
+	parts := make([]string, 0, len(response.Profiles))
+	for _, profile := range response.Profiles {
+		name := profile.Name
+		if profile.Active {
+			name = "*" + name
+		}
+		model := firstNonEmpty(profile.Model, "default")
+		parts = append(parts, fmt.Sprintf("%s=%s", name, model))
+	}
+	prefix := "profiles"
+	if response.Version > 0 {
+		prefix = fmt.Sprintf("profiles v=%d", response.Version)
+	}
+	suffix := ""
+	if len(response.Tombstones) > 0 {
+		suffix = fmt.Sprintf(" tombstones=%d", len(response.Tombstones))
+	}
+	return prefix + ": " + strings.Join(parts, ", ") + suffix
 }
 
 func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {

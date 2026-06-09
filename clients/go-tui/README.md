@@ -16,6 +16,8 @@ header, input line, permission panel and layered event output.
 - Merge streaming assistant/thinking deltas into the current transcript line.
 - Handle `permission_request` with approve/reject keyboard actions and a visible
   permission panel.
+- Fetch shared runtime config through Nexus HTTP APIs.
+- Switch active config profiles through `POST /v1/runtime/config/select`.
 - Keep all provider, context, tool, permission and session ownership in Nexus.
 
 ## Run
@@ -51,3 +53,12 @@ Keys:
 - `q`: quit when idle and the input is empty.
 - `a` / `y`: approve a pending permission request.
 - `r` / `n`: reject a pending permission request.
+
+Local commands:
+
+- `/config`: refresh shared Nexus runtime config and profile state.
+- `/profile` or `/profiles`: list shared Nexus profiles.
+- `/profile <name>`: select an existing profile through Nexus.
+
+These commands are handled by the Go TUI client itself and are not submitted as
+agent prompts. The Go TUI does not read BabeL-O config files directly.

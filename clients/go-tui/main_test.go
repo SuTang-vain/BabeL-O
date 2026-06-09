@@ -1,6 +1,9 @@
 package main
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -26,6 +29,124 @@ func TestStreamURL(t *testing.T) {
 				t.Fatalf("streamURL() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestAPIURL(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		path string
+		want string
+	}{
+		{name: "http", in: "http://127.0.0.1:3000", path: "/v1/runtime/config", want: "http://127.0.0.1:3000/v1/runtime/config"},
+		{name: "https path", in: "https://example.com/nexus/", path: "v1/runtime/config/profiles", want: "https://example.com/nexus/v1/runtime/config/profiles"},
+		{name: "ws maps to http", in: "ws://localhost:3000", path: "/v1/runtime/config", want: "http://localhost:3000/v1/runtime/config"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := apiURL(tt.in, tt.path)
+			if err != nil {
+				t.Fatalf("apiURL returned error: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("apiURL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestNexusJSONSendsAPIKeyAndDecodes(t *testing.T) {
+	var seenMethod string
+	var seenPath string
+	var seenAPIKey string
+	var seenProfile string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		seenAPIKey = r.Header.Get("X-Nexus-API-Key")
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		seenProfile = body["profile"]
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_config","modelId":"local/coding-runtime","providerId":"local","activeProfile":"dev","hasApiKey":false}`))
+	}))
+	defer server.Close()
+
+	var out runtimeConfig
+	err := nexusJSON(
+		config{baseURL: server.URL, apiKey: "secret-key"},
+		http.MethodPost,
+		"/v1/runtime/config/select",
+		map[string]string{"profile": "dev"},
+		&out,
+	)
+	if err != nil {
+		t.Fatalf("nexusJSON returned error: %v", err)
+	}
+	if seenMethod != http.MethodPost || seenPath != "/v1/runtime/config/select" {
+		t.Fatalf("request = %s %s", seenMethod, seenPath)
+	}
+	if seenAPIKey != "secret-key" {
+		t.Fatalf("X-Nexus-API-Key = %q", seenAPIKey)
+	}
+	if seenProfile != "dev" {
+		t.Fatalf("profile payload = %q", seenProfile)
+	}
+	if out.ModelID != "local/coding-runtime" || out.ActiveProfile != "dev" {
+		t.Fatalf("decoded runtime config = %#v", out)
+	}
+}
+
+func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
+	configLine := formatRuntimeConfig(runtimeConfig{
+		ModelID:       "openai/gpt-4o",
+		Version:       7,
+		ProviderID:    "openai",
+		ActiveProfile: "dev",
+		HasAPIKey:     true,
+		APIKeySource:  "profile",
+		ContextWindow: 128000,
+	})
+	for _, want := range []string{"config v=7", "model=openai/gpt-4o", "provider=openai", "profile=dev", "auth=configured(profile)", "context=128000"} {
+		if !strings.Contains(configLine, want) {
+			t.Fatalf("config summary missing %q: %q", want, configLine)
+		}
+	}
+
+	profilesLine := formatRuntimeProfiles(runtimeProfilesResponse{
+		ActiveProfile: "dev",
+		Version:       8,
+		Profiles: []runtimeProfile{
+			{Name: "dev", Active: true, Model: "openai/gpt-4o"},
+			{Name: "local", Model: "local/coding-runtime"},
+		},
+		Tombstones: map[string]runtimeProfileTombstone{
+			"old": {DeletedAt: "2026-06-09T00:00:00Z"},
+		},
+	})
+	for _, want := range []string{"profiles v=8", "*dev=openai/gpt-4o", "local=local/coding-runtime", "tombstones=1"} {
+		if !strings.Contains(profilesLine, want) {
+			t.Fatalf("profiles summary missing %q: %q", want, profilesLine)
+		}
+	}
+}
+
+func TestHandleLocalConfigCommandsDoNotStartAgentStream(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/profile dev")
+	if cmd == nil {
+		t.Fatalf("/profile dev should return an HTTP config command")
+	}
+	if m.running {
+		t.Fatalf("/profile dev should not start an agent stream")
+	}
+	rendered := renderTranscript(m.transcript, 100)
+	if !strings.Contains(rendered, "selecting shared Nexus profile: dev") {
+		t.Fatalf("transcript missing local command status: %q", rendered)
 	}
 }
 
@@ -272,12 +393,12 @@ func TestFormatNexusEventSessionMemoryUpdated(t *testing.T) {
 
 func TestFormatNexusEventExecutionMetrics(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
-		"type":                   "execution_metrics",
-		"executeDurationMs":      int64(1234),
-		"inputTokens":            int64(800),
-		"outputTokens":           int64(200),
-		"toolCallCount":          int64(2),
-		"providerFirstTokenMs":   int64(120),
+		"type":                 "execution_metrics",
+		"executeDurationMs":    int64(1234),
+		"inputTokens":          int64(800),
+		"outputTokens":         int64(200),
+		"toolCallCount":        int64(2),
+		"providerFirstTokenMs": int64(120),
 	})
 	if got != "dur=1234ms input=800 output=200 tools=2 firstToken=120ms" {
 		t.Fatalf("execution_metrics summary = %q", got)
@@ -345,17 +466,17 @@ func TestRenderPermissionIncludesInputAndMessage(t *testing.T) {
 
 func TestLinePresentationHasStableLabelsForPhase2Events(t *testing.T) {
 	wantLabels := map[string]string{
-		"task_created":            "task +   ",
-		"task_session_event":      "task     ",
-		"agent_job_event":         "agent    ",
-		"compact_boundary":        "compact+ ",
-		"compact_failure":         "compact! ",
-		"context_warning":         "ctx warn ",
-		"context_blocking":        "ctx stop ",
-		"session_memory_updated":  "memory   ",
-		"execution_metrics":       "metrics  ",
-		"user_message":            "you      ",
-		"user_intake_guidance":    "intake   ",
+		"task_created":           "task +   ",
+		"task_session_event":     "task     ",
+		"agent_job_event":        "agent    ",
+		"compact_boundary":       "compact+ ",
+		"compact_failure":        "compact! ",
+		"context_warning":        "ctx warn ",
+		"context_blocking":       "ctx stop ",
+		"session_memory_updated": "memory   ",
+		"execution_metrics":      "metrics  ",
+		"user_message":           "you      ",
+		"user_intake_guidance":   "intake   ",
 	}
 	for kind, want := range wantLabels {
 		got, _ := linePresentation(kind)

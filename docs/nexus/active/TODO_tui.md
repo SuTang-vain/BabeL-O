@@ -90,6 +90,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - `bbl go` 已接入 CLI，优先运行本地 Go TUI binary，缺失时 fallback 到 `go run .`。
 - MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
 - 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
+- Go TUI 已开始消费共享模型配置：启动时拉取 `GET /v1/runtime/config`，header 展示 active profile；`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus HTTP API 读取/切换 profile，不作为 agent prompt 发送。
 
 近期未收口项：
 
@@ -105,10 +106,16 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `formatToolInput(name, input)` 按工具名提取最相关字段（Bash.command / Read.path / Grep.pattern / ListDir.path / TaskCreate.title）。
   - 16 个 Go test 守住 Phase 2 行为；`go test ./...` 21/21 通过；`npm run test:go-tui:smoke` 仍过。
 - [x] §5 路径 C 阶段 1：ConfigManager 公开 + Nexus 配置拉取 HTTP 端点（2026-06-09 收口）。
-  - `src/shared/config.ts` 新增 `ConfigManager.hasProfile(name)` 公开方法（+8 行），允许外部消费方按名字查询 profile 是否存在。
-  - `src/nexus/app.ts` 新增 3 个 HTTP 端点（`GET /v1/config/profiles`、`GET /v1/config/profiles/:name`、`GET /v1/config/current`），仅做只读 config 导出；Go TUI 与其他远程客户端可走 HTTP 拉取 profile/active 信息，不再依赖 private 字段。
-  - 编译 0 errors；TypeScript 类型契约保持，Nexus 端不暴露 internal config writer / paths。
-  - 路径 C 阶段 2（增量拉取、profile 切换、tombstone）尚未启动，阶段 1 仅解锁"客户端能看见"的最小面。
+  - `src/shared/config.ts` 公开 `ConfigManager.hasProfile(name)`，允许外部消费方按名字查询 profile 是否存在。
+  - `src/nexus/app.ts` 暴露共享配置读端点：`GET /v1/runtime/config`、`GET /v1/runtime/config/profiles`、`GET /v1/runtime/config/profiles/:name`、`GET /v1/runtime/models`；响应均脱敏，不返回 `apiKey` 或 profile `baseUrl` 原文。
+  - Go TUI 与其他远程客户端只能走 Nexus HTTP 拉取 profile/active/model 视图，不依赖 private 字段，不读取本地 config 文件。
+- [x] §5 路径 C 阶段 2：真实 profile 切换 + 增量版本 + tombstone 基线（2026-06-09 收口）。
+  - `GET /v1/runtime/config?since=<version>` 支持无变化时返回 `304`，用于 Go TUI 后续增量刷新。
+  - `POST /v1/runtime/config/select` 保留为受限 profile 切换入口：只接受 `profile`，拒绝 `model` / `role` / `roleModel` 动态切换，避免远程 TUI 绕过 CLI 配置治理。
+  - `ConfigManager` 已具备 `configVersion`、`tombstones`、`deleteProfile()`、`restoreProfile()`、`isProfileTombstoned()`；重新 `setProfile()` 会清理同名 tombstone，避免同名 profile 复建后仍无法选择。
+  - `bbl config profile list/use/delete/restore` 已提供 CLI-only profile 生命周期操作；Go TUI `/profile <name>` 调用 Nexus `config/select`，不会直接写 config 文件。
+  - `GET /v1/runtime/models` 的 `configured` 判断覆盖 env、provider config、active profile 与其他 profile 内的 provider API key，响应仍不泄露 secret。
+  - 待补：Go TUI 对 tombstone 的完整 UX（隐藏/恢复提示/确认）、基于 `version` 的后台轮询刷新、profile 切换确认面板、错误态视觉回归。
 
 后续：
 
@@ -120,9 +127,9 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - Phase 8 packaging/distribution。
 - Phase 9 promotion gate。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-2 稳定后才推进：
 
-- §5 路径 C 阶段 2：增量拉取 + profile 切换命令 + tombstone 处理。
+- §5 路径 C 阶段 3：profile/tombstone UX polish + version polling + profile switch confirmation。
 - Phase 3 Input owner / overlay state machine。
 - Phase 4 slash/tool palette。
 - Phase 5 context/compact long-session UX。
@@ -137,7 +144,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - 不读取内部 SQLite，不复刻 context manager，不执行工具。
 - 不与 Go Remote Runner 合并职责：Go TUI 是客户端，Go Runner 是可选执行后端。
 - 默认安装和默认测试不强制要求 Go toolchain。
-- §5 路径 C 阶段 1 起的所有配置访问：Go TUI 只通过 Nexus 暴露的只读 HTTP 端点拿到 config profile/active 视图；不允许 Go TUI 读取本地 `ConfigManager` 私有字段，也不复制 `ConfigManager` 的 schema 决策。
+- §5 路径 C 起的所有配置访问：Go TUI 只通过 Nexus 暴露的 HTTP API 拿到 config profile/active/model 视图，并且只通过受限 `POST /v1/runtime/config/select` 切换已有 profile；不允许 Go TUI 读取本地 `ConfigManager` 私有字段，也不复制 `ConfigManager` 的 schema 决策。
 
 ## 验证命令
 

@@ -38,6 +38,8 @@ export interface BabelOConfig {
   providers?: Record<string, ProviderConfig>;
   profiles?: Record<string, ProfileConfig>;
   activeProfile?: string;
+  tombstones?: Record<string, { deletedAt: string }>;
+  configVersion?: number;
   docker?: {
     image?: string;
     network?: string;
@@ -140,6 +142,10 @@ export const ProfileConfigSchema = z.object({
   }).optional(),
 });
 
+export const ProfileTombstoneSchema = z.object({
+  deletedAt: z.string().min(1, 'deletedAt is required'),
+});
+
 export const HookBuiltinConfigSchema = z.object({
   enabled: z.boolean().optional(),
   timeoutMs: z.number().int().positive().max(60_000).optional(),
@@ -155,6 +161,8 @@ export const BabelOConfigSchema = z.object({
   providers: z.record(z.string(), ProviderConfigSchema).optional(),
   profiles: z.record(z.string(), ProfileConfigSchema).optional(),
   activeProfile: z.string().optional(),
+  tombstones: z.record(z.string(), ProfileTombstoneSchema).optional(),
+  configVersion: z.number().int().nonnegative().optional(),
   docker: z.object({
     image: z.string().optional(),
     network: z.string().optional(),
@@ -444,7 +452,13 @@ export class ConfigManager {
     if (isNodeTestProcess() && isUserDefaultConfigFile(this.configFile)) {
       throw createTestConfigGuardError();
     }
-    const toSave = config || this.config || {};
+    const incoming = config || this.config || {};
+    const previousVersion = this.config?.configVersion ?? 0;
+    const nextVersion = previousVersion + 1;
+    const toSave: BabelOConfig = {
+      ...incoming,
+      configVersion: nextVersion,
+    };
     const validated = BabelOConfigSchema.parse(toSave);
     const configDir = path.dirname(this.configFile);
     if (!fs.existsSync(configDir)) {
@@ -499,12 +513,55 @@ export class ConfigManager {
       ...conf.profiles[name],
       ...profileConfig,
     };
+    if (conf.tombstones && Object.prototype.hasOwnProperty.call(conf.tombstones, name)) {
+      delete conf.tombstones[name];
+    }
     this.save(conf);
   }
 
   public hasProfile(name: string): boolean {
     const conf = this.load();
     return Boolean(conf.profiles && Object.prototype.hasOwnProperty.call(conf.profiles, name));
+  }
+
+  public deleteProfile(name: string): void {
+    const conf = this.load();
+    if (conf.profiles) {
+      delete conf.profiles[name];
+    }
+    if (!conf.tombstones) {
+      conf.tombstones = {};
+    }
+    conf.tombstones[name] = { deletedAt: new Date().toISOString() };
+    if (conf.activeProfile === name) {
+      conf.activeProfile = undefined;
+    }
+    this.save(conf);
+  }
+
+  public restoreProfile(name: string): boolean {
+    const conf = this.load();
+    if (!conf.tombstones || !Object.prototype.hasOwnProperty.call(conf.tombstones, name)) {
+      return false;
+    }
+    delete conf.tombstones[name];
+    this.save(conf);
+    return true;
+  }
+
+  public isProfileTombstoned(name: string): boolean {
+    const conf = this.load();
+    return Boolean(conf.tombstones && Object.prototype.hasOwnProperty.call(conf.tombstones, name));
+  }
+
+  public getTombstones(): Record<string, { deletedAt: string }> {
+    const conf = this.load();
+    return conf.tombstones ? { ...conf.tombstones } : {};
+  }
+
+  public getConfigVersion(): number {
+    const conf = this.load();
+    return conf.configVersion ?? 0;
   }
 
   public getDefaultModel(): string {

@@ -98,9 +98,14 @@ type SharedRuntimeCapabilities = {
 
 function inspectResolvedRuntimeConfig(manager: ConfigManager) {
   const settings = manager.resolveSettings()
+  const base = {
+    version: manager.getConfigVersion(),
+    tombstones: manager.getTombstones(),
+  }
   try {
     const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
     return {
+      ...base,
       type: 'runtime_config',
       modelId: settings.modelId,
       modelName: diag.modelName,
@@ -118,6 +123,7 @@ function inspectResolvedRuntimeConfig(manager: ConfigManager) {
     }
   } catch {
     return {
+      ...base,
       type: 'runtime_config',
       modelId: settings.modelId,
       modelName: settings.modelId,
@@ -136,7 +142,7 @@ function inspectResolvedRuntimeConfig(manager: ConfigManager) {
         jsonOutput: false,
         structuredOutput: false,
         streaming: false,
-      } satisfies SharedRuntimeCapabilities,
+      },
     }
   }
 }
@@ -181,10 +187,25 @@ function isProviderConfiguredForSharedView(manager: ConfigManager, providerId: s
     return true
   }
 
-  const providerSettings = manager.resolveSettings({ model: provider.defaultModel })
-  return providerSettings.apiKeySource !== 'none' &&
-    providerSettings.apiKeySource !== 'profile' &&
-    Boolean(providerSettings.apiKey)
+  if (process.env.BABEL_O_API_KEY) return true
+  let providerEnvConfigured = false
+  if (providerId === 'anthropic') providerEnvConfigured = Boolean(process.env.ANTHROPIC_API_KEY)
+  if (providerId === 'openai') providerEnvConfigured = Boolean(process.env.OPENAI_API_KEY)
+  if (providerId === 'deepseek') providerEnvConfigured = Boolean(process.env.DEEPSEEK_API_KEY)
+  if (providerId === 'zhipu') providerEnvConfigured = Boolean(process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY)
+  if (providerId === 'minimax') providerEnvConfigured = Boolean(process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN)
+  if (providerId === 'moonshot') providerEnvConfigured = Boolean(process.env.MOONSHOT_API_KEY)
+  if (providerId === 'ollama') providerEnvConfigured = Boolean(process.env.OLLAMA_API_KEY)
+  if (providerEnvConfigured) return true
+  if (manager.getProviderConfig(providerId).apiKey) return true
+
+  return Object.values(manager.getProfiles()).some(profile => {
+    if (!profile.apiKey) return false
+    const profileProvider =
+      profile.provider ??
+      (profile.model?.includes('/') ? profile.model.slice(0, profile.model.indexOf('/')) : undefined)
+    return profileProvider === providerId
+  })
 }
 
 const providerFallbackPlanSchema = z.object({
@@ -568,39 +589,56 @@ export async function createNexusApp(
   // === 路径 C: Go TUI 配置拉取端点 ===
 
   // GET /v1/runtime/config — 当前 ResolvedSettings (脱敏: 不返回 apiKey)
-  app.get('/v1/runtime/config', async () => {
+  // ?since=<version> 增量拉取: since >= version 时返回 304 Not Modified
+  app.get('/v1/runtime/config', async (request, reply) => {
     const manager = ConfigManager.getInstance()
-    const settings = manager.resolveSettings()
-    let modelName = settings.modelId
-    let contextWindow = 0
-    let defaultMaxTokens = 0
-    let toolCalling = false
-    let jsonOutput = false
-    let streaming = false
-    try {
-      const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
-      modelName = diag.modelName
-      contextWindow = diag.contextWindow
-      defaultMaxTokens = diag.defaultMaxTokens
-      toolCalling = diag.capabilities.toolCalling
-      jsonOutput = diag.capabilities.jsonOutput
-      streaming = diag.capabilities.streaming
-    } catch {
-      // model 未在 registry 中 — 返回占位
+    const sinceRaw = (request.query as { since?: string | number }).since
+    const since = sinceRaw === undefined ? -1 : Number(sinceRaw)
+    if (Number.isFinite(since) && since >= 0) {
+      const version = manager.getConfigVersion()
+      if (since >= version) {
+        return reply.code(304).send()
+      }
+    }
+    return inspectResolvedRuntimeConfig(manager)
+  })
+
+  // GET /v1/runtime/config/profiles — profile 清单 (脱敏: 不返回 apiKey/baseUrl)
+  app.get('/v1/runtime/config/profiles', async () => {
+    const manager = ConfigManager.getInstance()
+    const activeProfile = manager.getActiveProfile()
+    return {
+      type: 'runtime_config_profiles',
+      version: manager.getConfigVersion(),
+      activeProfile,
+      profiles: Object.entries(manager.getProfiles()).map(([name, profile]) =>
+        sanitizeProfileConfig(name, profile, activeProfile),
+      ),
+      tombstones: manager.getTombstones(),
+    }
+  })
+
+  // GET /v1/runtime/config/profiles/:name — 单 profile 详情 (脱敏)
+  app.get('/v1/runtime/config/profiles/:name', async request => {
+    const params = runtimeConfigProfileParamsSchema.parse(request.params)
+    const manager = ConfigManager.getInstance()
+    const profile = manager.getProfiles()[params.name]
+    const base = {
+      type: 'runtime_config_profile',
+      version: manager.getConfigVersion(),
+      tombstones: manager.getTombstones(),
+    }
+    if (!manager.hasProfile(params.name) || !profile) {
+      return {
+        ...base,
+        found: false,
+        name: params.name,
+      }
     }
     return {
-      modelId: settings.modelId,
-      modelName,
-      providerId: settings.providerId,
-      modelSource: settings.modelSource,
-      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
-      apiKeySource: settings.apiKeySource,
-      baseUrl: settings.baseUrl ?? '',
-      baseUrlSource: settings.baseUrlSource,
-      activeProfile: settings.activeProfile,
-      contextWindow,
-      defaultMaxTokens,
-      capabilities: { toolCalling, jsonOutput, streaming },
+      ...base,
+      found: true,
+      profile: sanitizeProfileConfig(params.name, profile, manager.getActiveProfile()),
     }
   })
 
@@ -609,11 +647,10 @@ export async function createNexusApp(
     const manager = ConfigManager.getInstance()
     const settings = manager.resolveSettings()
     return {
+      type: 'runtime_models',
+      version: manager.getConfigVersion(),
+      tombstones: manager.getTombstones(),
       providers: providerRegistry.map((p) => {
-        const configured =
-          settings.providerId === p.id &&
-          settings.apiKeySource !== 'none' &&
-          Boolean(settings.apiKey)
         return {
           id: p.id,
           displayName: p.displayName,
@@ -621,7 +658,8 @@ export async function createNexusApp(
           authMode: p.authMode,
           defaultBaseUrl: p.defaultBaseUrl,
           defaultModel: p.defaultModel,
-          configured,
+          configured: isProviderConfiguredForSharedView(manager, p.id),
+          active: settings.providerId === p.id,
           models: p.models.map((mid) => {
             const def = modelRegistry.find((m) => m.id === mid)
             return {
@@ -644,14 +682,8 @@ export async function createNexusApp(
   })
 
   // POST /v1/runtime/config/select — 切换 profile (持久化)
-  const configSelectSchema = z.object({
-    profile: z.string().optional(),
-    model: z.string().optional(),
-    role: z.string().optional(),
-    roleModel: z.string().optional(),
-  })
   app.post('/v1/runtime/config/select', async (request, reply) => {
-    const body = configSelectSchema.parse(request.body ?? {})
+    const body = runtimeConfigSelectSchema.parse(request.body ?? {})
     const manager = ConfigManager.getInstance()
 
     if (body.model || body.role || body.roleModel) {
@@ -666,44 +698,21 @@ export async function createNexusApp(
       return reply.code(400).send({ error: 'missing_profile' })
     }
 
+    if (manager.isProfileTombstoned(body.profile)) {
+      return reply.code(400).send({
+        error: 'tombstoned_profile',
+        profile: body.profile,
+        tombstone: manager.getTombstones()[body.profile],
+      })
+    }
+
     if (!manager.hasProfile(body.profile)) {
       return reply.code(400).send({ error: 'unknown_profile', profile: body.profile })
     }
 
     manager.setActiveProfile(body.profile)
 
-    const settings = manager.resolveSettings()
-    let modelName = settings.modelId
-    let contextWindow = 0
-    let defaultMaxTokens = 0
-    let toolCalling = false
-    let jsonOutput = false
-    let streaming = false
-    try {
-      const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
-      modelName = diag.modelName
-      contextWindow = diag.contextWindow
-      defaultMaxTokens = diag.defaultMaxTokens
-      toolCalling = diag.capabilities.toolCalling
-      jsonOutput = diag.capabilities.jsonOutput
-      streaming = diag.capabilities.streaming
-    } catch {
-      // model 未在 registry 中 — 返回占位
-    }
-    return {
-      modelId: settings.modelId,
-      modelName,
-      providerId: settings.providerId,
-      modelSource: settings.modelSource,
-      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
-      apiKeySource: settings.apiKeySource,
-      baseUrl: settings.baseUrl ?? '',
-      baseUrlSource: settings.baseUrlSource,
-      activeProfile: settings.activeProfile,
-      contextWindow,
-      defaultMaxTokens,
-      capabilities: { toolCalling, jsonOutput, streaming },
-    }
+    return inspectResolvedRuntimeConfig(manager)
   })
 
   // === 路径 C: 结束 ===
