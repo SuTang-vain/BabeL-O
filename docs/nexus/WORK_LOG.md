@@ -2,6 +2,33 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 1 opt-in smoke harness 收口
+
+- **用户请求**: 按规划文档 `docs/nexus/reference/go-tui-rewrite-plan.md` Phase 1 与 `docs/nexus/active/TODO_tui.md` 唯一打开项推进：固化当前手动验证过的 local Nexus + Bash permission approve 链路，不扩大功能面。
+- **实现**:
+  - 新增 `test/go_tui_pty_driver.py`（Python PTY driver）：spawn 临时 Nexus（`local/coding-runtime`、`NEXUS_ALLOWED_TOOLS='*'`、ephemeral SQLite）、通过 PTY 跑 `bbl go --url <tmp> --no-alt --cwd <tmp>`、自动发送 `bash echo go-tui-smoke`、等待 `Permission: Bash` 面板、发送 `a` approve、等待 `Bash done success=true` + `permit approved=true` + `done success=true`、发送 `q` 退出、清理 Nexus 与 tmp dir。
+  - 新增 `test/go-tui-smoke.test.ts`（Node 端 test）：通过 `BABEL_O_RUN_GO_TUI_SMOKE=1` gated，默认 `skip`；仅当预编译 `clients/go-tui/go-tui` 二进制存在时才尝试运行，避免在没 Go 工具链的环境下意外失败。
+  - 在 `test/go-command.test.ts` 加默认运行的 `--help` 探针，验证 Python driver 自身 CLI 表面稳定（`permission-approve` sequence + `--timeout` flag）。
+  - `package.json` 新增 `test:go-tui:smoke` 脚本：`BABEL_O_RUN_GO_TUI_SMOKE=1 tsx --test ... test/go-tui-smoke.test.ts`，CI 默认不引用，与规划口径一致。
+  - 同步 `docs/nexus/active/TODO_tui.md` 把 Phase 1 标为 ✅、`docs/nexus/DONE.md` 加一条 Go TUI Phase 1 收口事实。
+- **验证**:
+  - 默认 `npm run test:go-tui:smoke` 跑通：`BabeL-O Go TUI MVP` banner → `bash echo go-tui-smoke` → `Permission: Bash` → approve → `Bash done` → `done success=true` 全链路 1.5s。
+  - 直接 `./node_modules/.bin/tsx ... test/go-tui-smoke.test.ts`（无 env）→ 测试被 skip（`Set BABEL_O_RUN_GO_TUI_SMOKE=1 to run Go TUI smoke.`），符合"CI 默认不启用"要求。
+  - `npm run typecheck` / `npm run format:check` 干净；周边 `go-command` / `chat-command` / `sessions-command` / `ui` / `tui-input` / `grep-tool` 63 个回归全过。
+- **范围克制**: 严格按 Phase 1 边界推进。`permission_request` UI 缺 `input`/`message` 渲染、`inbox_message` / `channel_activity` label、发布模式 `defaultGoTuiSourceDir` 路径问题、跨平台 CI 构建等**不**在本次范围，分别属于 Phase 2 / Phase 2 / Phase 8 / Phase 8。
+
+## 2026-06-09 — Go TUI 长期重写规划入库
+
+- **用户请求**: 将 Go TUI 重写构建列为长期计划，写详细规划并更新 TODO。
+- **实现**:
+  - 新增 `docs/nexus/reference/go-tui-rewrite-plan.md`，明确 Go TUI 为 P3 / Long-term experimental track。
+  - 规划中固定核心边界：Go TUI 只负责 terminal interaction、layout、keyboard routing 与 Nexus event rendering；TypeScript Nexus 继续拥有 runtime、context、storage、AgentScheduler、provider、permission 与 tool execution orchestration。
+  - 记录当前 `clients/go-tui/` + `bbl go` MVP 基线与已完成的 local Nexus / WebSocket / Bash permission 手动 smoke。
+  - 拆分 Phase 0-9：MVP baseline、opt-in smoke、event renderer parity、input/overlay state machine、slash/tool palette、context/compact UX、Agent/Task/SessionChannel views、PTY/visual regression、packaging/distribution、promotion gate。
+  - 同步 `docs/nexus/TODO.md`、`docs/nexus/active/TODO_tui.md`、`docs/nexus/README.md` 与 `docs/nexus/reference/README.md`，把下一步明确为 Phase 1 `BABEL_O_RUN_GO_TUI_SMOKE=1` gated smoke。
+- **验证**:
+  - 文档结构检查：新增规划位于 `docs/nexus/reference/`，TODO 细节由 `docs/nexus/active/TODO_tui.md` 承接，总控 `TODO.md` 只保留 P3 长期入口。
+
 ## 2026-06-08 — SessionChannel TUI 真实 PTY smoke 补强
 
 - **用户请求**: 继续推进 P2 SessionChannel TUI 真实 PTY smoke 补强，并说明当前 TUI 如何开始 session-to-session 对话流。

@@ -80,6 +80,43 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 当前 P2 Advanced CLI/TUI 无打开实现项；SessionChannel 关系可见化已进入 P2 / Watch 参考规划，后续只在真实显示回归、PTY smoke drift、dashboard/agent UX 需要、关系可见化实现启动或发起侧 UX 明确时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
 
+## P3 / Long-term Go TUI Rewrite
+
+> 详细规划见 [Go TUI Long-Term Rewrite Plan](../reference/go-tui-rewrite-plan.md)。Go TUI 是长期实验交互客户端，不替代当前生产默认 `bbl chat`，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
+
+当前状态：
+
+- `clients/go-tui/` 已落地 Bubble Tea MVP。
+- `bbl go` 已接入 CLI，优先运行本地 Go TUI binary，缺失时 fallback 到 `go run .`。
+- MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
+- 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
+
+近期只保留一个未收口项：
+
+- [x] Phase 1 opt-in Go TUI smoke harness（2026-06-09 收口）。
+  - `test/go_tui_pty_driver.py` + `test/go-tui-smoke.test.ts` 已落地，验证 `bbl go --no-alt` 下 `bash echo go-tui-smoke` 走通 Nexus → `Permission: Bash` → approve → `Bash done success=true` → `done success=true`。
+  - 默认 `BABEL_O_RUN_GO_TUI_SMOKE` 未设置时 skip；显式 `npm run test:go-tui:smoke` 启动。
+  - 失败时打印 cleaned transcript + raw terminal bytes。
+  - CI 默认不引用该脚本，避免强制 Go toolchain 依赖。
+
+后续只有 Phase 1 稳定后才推进：
+
+- Phase 2 Event renderer parity。
+- Phase 3 Input owner / overlay state machine。
+- Phase 4 slash/tool palette。
+- Phase 5 context/compact long-session UX。
+- Phase 6 Agent/Task/SessionChannel views。
+- Phase 7 Go TUI PTY/visual regression harness。
+- Phase 8 packaging/distribution。
+- Phase 9 promotion gate。
+
+持续边界：
+
+- Go TUI 只通过 Nexus WebSocket/HTTP API 交互。
+- 不读取内部 SQLite，不复刻 context manager，不执行工具。
+- 不与 Go Remote Runner 合并职责：Go TUI 是客户端，Go Runner 是可选执行后端。
+- 默认安装和默认测试不强制要求 Go toolchain。
+
 ## 验证命令
 
 历史验证覆盖：renderer/input/permission/paste/PTY 基线，slash palette、permission panel、compact Read、input placeholder、read/edit/diff/Grep/Glob/TaskCreate、resume session、paste/input，ask coding question about files，task update/status，sub-agent / AgentLoop，唯一输入框键盘路由，tool picker / model wizard overlay routing，agent running terminal states，MCP tool audit / permission display，history search overlay ownership，长路径/CJK/ANSI/resize 宽度，stale wrapped rows，LSP context mention，file attachment references，image reference metadata，opt-in vim mode，以及 sub-agent running + model/context gauge 组合。

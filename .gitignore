@@ -10,6 +10,8 @@ coverage/
 .babel-o/benchmarks/
 .babel-o/worktrees/
 .babel-o/test-*/
+clients/go-tui/go-tui
+clients/go-tui/go-tui.exe
 
 # Local planning / technical-detail docs are intentionally not published.
 docs/

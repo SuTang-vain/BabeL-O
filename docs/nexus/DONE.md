@@ -190,6 +190,7 @@
 - Session Memory Lite 诊断增强已收口：更新审计元数据、extractive-only 成本策略、next decision、last update 状态已进入 structured diagnostics、CLI `/context` 和 HTTP context API，并覆盖 compact/manual 与 reactive pause 路径。
 - Cache-aware compact / 长上下文利用已收口：新增纯 policy helper、adaptive assembly ceiling、runtime auto-compact policy、provider loop guard 和 `/context` cache economics 展示；focused 回归覆盖长窗口 effective ceiling、cache-preserving threshold、env hard cap、provider context error 保守路径和 CLI reason 输出。
 - Context Manager / ContextForker 规范化已收口：显式 pipeline phases、统一 ContextItem/Scored/Selected types、selection diagnostics、retained/dropped reason 与 `/context` 展示已接入；ContextForker 已支持 `minimal`、`working-set`、`task-focused`、`full-summary`、`debug-replay` 多模式 fork diagnostics。
+- Go TUI Phase 1 opt-in smoke harness 已收口：`test/go_tui_pty_driver.py` + `test/go-tui-smoke.test.ts` 在 `BABEL_O_RUN_GO_TUI_SMOKE=1` 下固化 `bbl go --no-alt` → `bash <command>` → `Permission: Bash` → `a` approve → `Bash done success=true` → `done success=true` 链路；默认 skip，CI 不强制 Go toolchain；`test/go-command.test.ts` 增加 driver `--help` 探针守住 Python 端 CLI 表面。
 
 ## 仍需守住的底线
 
