@@ -305,6 +305,120 @@ type inboxAckMsg struct {
 	err       error
 }
 
+// agentProfileId mirrors AgentProfileId in
+// src/shared/agentJob.ts. The Go TUI only renders the agentType
+// string; unknown values fall through to the raw text so a
+// server-side addition cannot crash the client.
+type agentProfileId string
+
+const (
+	agentProfileExplore   agentProfileId = "explore"
+	agentProfileReview    agentProfileId = "review"
+	agentProfileTest      agentProfileId = "test"
+	agentProfileImplement agentProfileId = "implement"
+	agentProfileDebug     agentProfileId = "debug"
+	agentProfileGeneral   agentProfileId = "general"
+)
+
+// agentJobStatus mirrors AgentJobStatus in
+// src/shared/agentJob.ts. The icon helper below turns each
+// status into a 1-line terminal-friendly marker.
+type agentJobStatus string
+
+const (
+	agentStatusQueued            agentJobStatus = "queued"
+	agentStatusRunning           agentJobStatus = "running"
+	agentStatusWaitingPermission agentJobStatus = "waiting_permission"
+	agentStatusCompleted         agentJobStatus = "completed"
+	agentStatusFailed            agentJobStatus = "failed"
+	agentStatusCancelled         agentJobStatus = "cancelled"
+)
+
+// contextForkMode mirrors ContextForkMode in
+// src/shared/agentJob.ts. Rendered in the governance summary
+// when non-default.
+type contextForkMode string
+
+const (
+	contextForkMinimal      contextForkMode = "minimal"
+	contextForkWorkingSet   contextForkMode = "working-set"
+	contextForkTaskFocused  contextForkMode = "task-focused"
+	contextForkFullSummary  contextForkMode = "full-summary"
+	contextForkDebugReplay  contextForkMode = "debug-replay"
+)
+
+// agentIsolationMode mirrors AgentIsolationMode in
+// src/shared/agentJob.ts. Rendered in the governance summary
+// when non-default (worktree).
+type agentIsolationMode string
+
+const (
+	isolationNone     agentIsolationMode = "none"
+	isolationWorktree agentIsolationMode = "worktree"
+)
+
+// agentJobGovernance mirrors AgentJobGovernance in
+// src/shared/agentJob.ts. The Go TUI uses active/max + depth
+// to render a compact "active N/M · depth D/maxD" summary in
+// each row.
+type agentJobGovernance struct {
+	MaxConcurrentAgents int    `json:"maxConcurrentAgents"`
+	ActiveAgents        int    `json:"activeAgents"`
+	MaxDepth            int    `json:"maxDepth"`
+	Depth               int    `json:"depth"`
+	MaxRuntimeMs        int    `json:"maxRuntimeMs"`
+	TimeoutAt           string `json:"timeoutAt,omitempty"`
+}
+
+// agentJob is the read-only view of an AgentJob used by the
+// agent status overlay. Only the fields the Go TUI displays
+// are surfaced as struct tags; the raw payload is preserved
+// in agentJobsMsg.raw for any future richer renderer (mirroring
+// the contextAnalysisMsg / compactResultMsg / inboxMsg pattern).
+type agentJob struct {
+	JobID           string              `json:"jobId"`
+	ParentSessionID string              `json:"parentSessionId"`
+	ChildSessionID  string              `json:"childSessionId"`
+	ParentTaskID    string              `json:"parentTaskId,omitempty"`
+	AgentType       agentProfileId      `json:"agentType"`
+	Status          agentJobStatus      `json:"status"`
+	Prompt          string              `json:"prompt"`
+	ContextForkMode contextForkMode     `json:"contextForkMode"`
+	Isolation       agentIsolationMode  `json:"isolation"`
+	CreatedAt       string              `json:"createdAt"`
+	UpdatedAt       string              `json:"updatedAt"`
+	StartedAt       string              `json:"startedAt,omitempty"`
+	CompletedAt     string              `json:"completedAt,omitempty"`
+	Governance      *agentJobGovernance `json:"governance,omitempty"`
+}
+
+// sessionAgentJobsResponse is the envelope for
+// GET /v1/sessions/:sessionId/agents. The Go TUI only reads the
+// stable top-level fields it displays; the rest of the payload
+// stays in the raw json (see agentJobsMsg.raw) so schema churn
+// upstream cannot break the client.
+type sessionAgentJobsResponse struct {
+	Type      string     `json:"type"`
+	SessionID string     `json:"sessionId"`
+	Jobs      []agentJob `json:"jobs"`
+}
+
+// agentJobsMsg is the response from
+// GET /v1/sessions/:sessionId/agents. The Go TUI decodes the
+// envelope via the typed struct above; raw bytes are retained
+// for the same reason contextAnalysisMsg / inboxMsg keep them.
+// The trigger field tells the Update handler whether to open
+// the overlay ("user" — fired by /agents) or just refresh the
+// snapshot in-place ("auto" — fired by end-of-turn auto-refresh
+// in consumeNexusEvent).
+type agentJobsMsg struct {
+	sessionID string
+	raw       []byte
+	envelope  sessionAgentJobsResponse
+	trigger   string
+	err       error
+}
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -323,6 +437,7 @@ const (
 	modeProfileConfirm inputMode = "profileConfirm" // y/n/esc only; gates selectRuntimeProfile
 	modeContextOverlay inputMode = "contextOverlay" // read-only context analysis; up/down/esc/enter
 	modeInboxOverlay   inputMode = "inboxOverlay"   // read-only SessionChannel inbox; up/down/a/esc/enter/q
+	modeAgentOverlay   inputMode = "agentOverlay"   // read-only multi-agent status; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -358,6 +473,8 @@ type model struct {
 	inboxOverlayScroll   int
 	inboxOverlayIncludeAck bool
 	seenInboxCardMessageIDs map[string]struct{}
+	agentJobs        []agentJob
+	agentOverlayScroll int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -558,10 +675,9 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/agents",
-		summary: "list agent jobs (TODO: wire to /v1/agents)",
+		summary: "open multi-agent status overlay (Phase 6 PR3)",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/agents not yet implemented in Go TUI MVP")
-			return nil
+			return m.fetchSessionAgentsWithSession()
 		},
 	},
 	// Prefix-insertion commands: when picked from the palette, the
@@ -734,6 +850,7 @@ var (
 	footerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	focusedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
+	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 )
 
 func main() {
@@ -994,6 +1111,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.quoteSelectedInboxMessage()
 			}
 			return m, nil
+
+		case modeAgentOverlay:
+			// Read-only multi-agent status overlay (Phase 6 PR3).
+			// up/k scroll back; down/j/tab scroll forward;
+			// esc/enter/q close. No per-row actions yet (ack /
+			// cancel are CLI-only via `bbl agents cancel
+			// <jobId>`; the Go TUI stays read-only for agent
+			// jobs to avoid duplicating the Nexus ownership
+			// surface). All other keys are swallowed so they
+			// never reach the textinput.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.agentOverlayScroll = 0
+				m.appendLine("status", "agent status closed")
+				return m, nil
+			case "up", "k":
+				if m.agentOverlayScroll > 0 {
+					m.agentOverlayScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildAgentOverlayLines(m.agentJobs)
+				maxScroll := max(0, len(allLines)-1)
+				if m.agentOverlayScroll < maxScroll {
+					m.agentOverlayScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -1183,6 +1330,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendLine("status", "inbox ack: "+msg.messageID)
 		return m, nil
 
+	case agentJobsMsg:
+		if msg.err != nil {
+			m.appendLine("error", "agents: "+msg.err.Error())
+			return m, nil
+		}
+		m.agentJobs = msg.envelope.Jobs
+		if msg.trigger == "auto" {
+			// Phase 6 PR3 end-of-turn auto-refresh: update the
+			// snapshot silently. Do NOT open the overlay — the
+			// user just finished a turn and shouldn't be
+			// ambushed with a modal they didn't ask for. Future
+			// PRs can wire a "running sub-agent" badge to the
+			// header / footer if the count of running jobs
+			// changes mid-turn.
+			return m, nil
+		}
+		// User-initiated /agents: reset scroll + push breadcrumb
+		// + open the overlay.
+		m.agentOverlayScroll = 0
+		summary := fmt.Sprintf("agents: %d job(s)", len(m.agentJobs))
+		m.appendLine("status", summary)
+		m.setMode(modeAgentOverlay)
+		return m, nil
+
 	case pollTickMsg:
 		// Background poll. If we've never fetched a config, defer to the
 		// next round rather than blocking the chat loop.
@@ -1232,6 +1403,7 @@ func (m model) View() string {
 	profileConfirm := m.renderProfileConfirm(width)
 	contextOverlay := m.renderContextOverlay(width)
 	inboxOverlay := m.renderInboxOverlay(width)
+	agentOverlay := m.renderAgentOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -1251,6 +1423,9 @@ func (m model) View() string {
 	}
 	if inboxOverlay != "" {
 		parts = append(parts, inboxOverlay)
+	}
+	if agentOverlay != "" {
+		parts = append(parts, agentOverlay)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -1295,6 +1470,11 @@ var helpOverlayLines = []string{
 	"  a                ack the selected message",
 	"  q / c            quote the selected message into the prompt",
 	"  esc / enter      close the overlay",
+	"",
+	"Agent status overlay (Phase 6 PR3):",
+	"  /agents          open multi-agent status for the current session",
+	"  up / down / tab  scroll through the agent jobs list",
+	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
 }
@@ -2157,6 +2337,175 @@ func quoteInboxMessageContent(message sessionMessage) string {
 // short banner + metadata + the "open inbox / ack / quote" hint)
 // so the user's main transcript stays readable. Returns "" for
 // non-key messages so callers can route through it unconditionally.
+// formatAgentStatusIcon returns a short, terminal-friendly
+// status marker (e.g. "[running]", "[done]", "[failed]"). The
+// TS TUI uses Unicode icons in chalk colors, but the Go TUI
+// keeps it plain text so the cooked-mode PTY harness can
+// assert on the literal string without stripping ANSI codes.
+// Unknown statuses fall through to the raw text so a
+// server-side addition cannot crash the client.
+func formatAgentStatusIcon(status agentJobStatus) string {
+	switch status {
+	case agentStatusQueued:
+		return "[queue]"
+	case agentStatusRunning:
+		return "[run]"
+	case agentStatusWaitingPermission:
+		return "[perm]"
+	case agentStatusCompleted:
+		return "[done]"
+	case agentStatusFailed:
+		return "[fail]"
+	case agentStatusCancelled:
+		return "[cancel]"
+	}
+	return "[" + fallbackUnknown(string(status)) + "]"
+}
+
+// formatAgentGovernanceSummary returns a compact
+// "active N/M · depth D/maxD" segment for the agent overlay
+// row. Returns "" when no governance blob is attached so the
+// row stays tight for default-nothing jobs.
+func formatAgentGovernanceSummary(governance *agentJobGovernance) string {
+	if governance == nil {
+		return ""
+	}
+	parts := []string{
+		fmt.Sprintf("active %d/%d", governance.ActiveAgents, governance.MaxConcurrentAgents),
+	}
+	if governance.MaxDepth > 0 || governance.Depth > 0 {
+		parts = append(parts, fmt.Sprintf("depth %d/%d", governance.Depth, governance.MaxDepth))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatAgentJobRow renders a single agent job for the agent
+// status overlay. The row is two physical lines:
+//   - main row: status icon + agentType + child=<shortID> +
+//     optional governance summary + optional task#<id>
+//   - indent row: first 80 chars of the prompt (single line,
+//     indent-prefixed) for human-scannability
+//
+// Mirrors the TS TUI formatMultiAgentRow shape (status + source
+// + agentType + depth + title + child + governance + transcript
+// path) but collapses the transcriptPath line since the Go
+// TUI overlay is read-only and the path is mostly useful for
+// `bbl sessions` CLI invocations.
+func formatAgentJobRow(job agentJob) []string {
+	parts := []string{
+		formatAgentStatusIcon(job.Status),
+		"job",
+		string(fallbackUnknown(string(job.AgentType))),
+	}
+	if job.Governance != nil && job.Governance.Depth > 0 {
+		parts = append(parts, fmt.Sprintf("d%d", job.Governance.Depth))
+	}
+	main := strings.Join(parts, " ")
+	if child := strings.TrimSpace(job.ChildSessionID); child != "" {
+		main += "  child=" + shortID(child)
+	}
+	if gov := formatAgentGovernanceSummary(job.Governance); gov != "" {
+		main += "  " + gov
+	}
+	if taskID := strings.TrimSpace(job.ParentTaskID); taskID != "" {
+		main += "  task=#" + taskID
+	}
+	rows := []string{main}
+	if prompt := singleLine(strings.TrimSpace(job.Prompt)); prompt != "" {
+		rows = append(rows, "  prompt: "+truncatePlain(prompt, 100))
+	}
+	return rows
+}
+
+// buildAgentOverlayLines turns the agent jobs snapshot into the
+// ordered list of lines the agent overlay will render. Each
+// job contributes 1-2 lines (main row + optional prompt row);
+// the overlay window is then clamped in renderAgentOverlay.
+// Returns a single placeholder line for the empty case so the
+// caller can show a friendly message.
+func buildAgentOverlayLines(jobs []agentJob) []string {
+	if len(jobs) == 0 {
+		return []string{"No agent jobs for this session."}
+	}
+	lines := []string{}
+	for _, job := range jobs {
+		lines = append(lines, formatAgentJobRow(job)...)
+	}
+	return lines
+}
+
+// renderAgentOverlay paints the multi-line multi-agent status
+// view. It is the Phase 6 PR3 primary UX for the /agents slash
+// command. The overlay is composed of:
+//   - titleStyle header (Phase 6 PR3 banner + session id)
+//   - summary line (running / waiting_permission / queued /
+//     failed / cancelled / completed counts)
+//   - clamped window of buildAgentOverlayLines
+//   - bottom hint (scroll + close keys)
+//
+// Outside modeAgentOverlay it returns "" so it can be
+// unconditionally spliced into the View() parts list.
+func (m model) renderAgentOverlay(width int) string {
+	if m.inputMode != modeAgentOverlay {
+		return ""
+	}
+	header := titleStyle.Render("Agent status · Phase 6 PR3 overlay · " + shortID(m.sessionID))
+	summary := summarizeAgentJobs(m.agentJobs)
+	visibleRows := max(1, m.height-10)
+	allLines := buildAgentOverlayLines(m.agentJobs)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.agentOverlayScroll > maxScroll {
+		// View() is read-only; clamp locally for the rendered
+		// slice. The next key event will reconcile
+		// m.agentOverlayScroll.
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[maxScroll:end]
+	} else {
+		end := m.agentOverlayScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[m.agentOverlayScroll:end]
+	}
+	lines := []string{header, divider(width), summary}
+	lines = append(lines, allLines...)
+	hint := "↑/↓/Tab scroll · esc/enter/q close"
+	lines = append(lines, mutedStyle.Render(hint))
+	return strings.Join([]string{divider(width), agentStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+}
+
+// summarizeAgentJobs is the per-status count line shown at the
+// top of the agent overlay. Mirrors summarizeMultiAgentRows in
+// src/cli/renderEvents.ts. Returns "no agent jobs" for an
+// empty snapshot so the summary line is never blank.
+func summarizeAgentJobs(jobs []agentJob) string {
+	counts := map[agentJobStatus]int{}
+	for _, job := range jobs {
+		counts[job.Status]++
+	}
+	statusOrder := []agentJobStatus{
+		agentStatusRunning,
+		agentStatusWaitingPermission,
+		agentStatusQueued,
+		agentStatusFailed,
+		agentStatusCancelled,
+		agentStatusCompleted,
+	}
+	parts := []string{}
+	for _, status := range statusOrder {
+		if count := counts[status]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", status, count))
+		}
+	}
+	if len(parts) == 0 {
+		return "no agent jobs"
+	}
+	return strings.Join(parts, " · ")
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -2475,6 +2824,23 @@ func (m *model) quoteSelectedInboxMessage() tea.Cmd {
 	return nil
 }
 
+// fetchSessionAgentsWithSession is the gated entry point the
+// /agents slash command uses: it requires an active session,
+// then either kicks off a fetch or short-circuits with a
+// friendly status line. Mirrors the "context: no active
+// session yet" pattern from /context / /compact and the
+// fetchInboxWithSession pattern from Phase 6 §1. The trigger
+// field is "user" so the agentJobsMsg handler opens the
+// overlay on response.
+func (m *model) fetchSessionAgentsWithSession() tea.Cmd {
+	if m.sessionID == "" {
+		m.appendLine("status", "agents: no active session yet — submit a prompt first")
+		return nil
+	}
+	m.appendLine("status", "loading shared Nexus agents: "+shortID(m.sessionID))
+	return fetchSessionAgents(m.cfg, m.sessionID, "user")
+}
+
 func (m *model) sendPermissionDecision(approved bool, reason string) {
 	if m.pending == nil || m.decisions == nil {
 		return
@@ -2541,8 +2907,13 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// already handles de-duplication across turns. The
 		// "auto" trigger tells the inboxMsg handler to refresh
 		// the snapshot in place without opening the overlay.
+		// Phase 6 PR3 also fires a parallel fetchSessionAgents
+		// so the /agents overlay stays current across turns.
 		if m.sessionID != "" {
-			return fetchInbox(m.cfg, m.sessionID, false, "auto")
+			return tea.Batch(
+				fetchInbox(m.cfg, m.sessionID, false, "auto"),
+				fetchSessionAgents(m.cfg, m.sessionID, "auto"),
+			)
 		}
 	case "assistant_delta":
 		m.appendStreamingLine("assistant", stringField(event, "text"))
@@ -3014,6 +3385,33 @@ func ackInboxMessage(cfg config, sessionID string, messageID string) tea.Cmd {
 			map[string]any{},
 		)
 		return inboxAckMsg{sessionID: sessionID, messageID: messageID, raw: raw, err: err}
+	}
+}
+
+// fetchSessionAgents issues GET /v1/sessions/:sessionId/agents
+// and decodes the stable top-level envelope
+// (type / sessionId / jobs). The raw bytes are retained so any
+// future richer renderer (or a server-side schema addition)
+// does not break the existing format / overlay code. The
+// trigger field ("user" / "auto") tells the Update handler
+// whether to open the overlay (user /agents command) or just
+// refresh the snapshot in place (Phase 6 PR3 end-of-turn
+// auto-refresh, paired with fetchInbox auto-refresh).
+func fetchSessionAgents(cfg config, sessionID string, trigger string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/agents",
+			nil,
+		)
+		out := agentJobsMsg{sessionID: sessionID, raw: raw, trigger: trigger, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
+				out.err = fmt.Errorf("decode agent jobs: %w", decodeErr)
+			}
+		}
+		return out
 	}
 }
 

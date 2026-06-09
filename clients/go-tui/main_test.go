@@ -2500,10 +2500,22 @@ func TestInboxAutoRefreshOnResultEventFiresFetchInbox(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("consumeNexusEvent on result should fire auto-refresh cmd when session is set")
 	}
+	// Phase 6 PR3: auto-refresh now fires a tea.Batch of
+	// fetchInbox + fetchSessionAgents. The cmd() may unwrap to
+	// either a BatchMsg (when Bubble Tea flattens both) or a
+	// single leaf cmd (inboxMsg / agentJobsMsg). Accept any.
 	msg := cmd()
-	_, ok := msg.(inboxMsg)
-	if !ok {
-		t.Fatalf("auto-refresh cmd should produce inboxMsg, got %T", msg)
+	switch typed := msg.(type) {
+	case tea.BatchMsg:
+		if len(typed) == 0 {
+			t.Fatalf("auto-refresh BatchMsg should not be empty")
+		}
+	default:
+		_, okInbox := msg.(inboxMsg)
+		_, okAgents := msg.(agentJobsMsg)
+		if !okInbox && !okAgents {
+			t.Fatalf("auto-refresh cmd should produce inboxMsg / agentJobsMsg / tea.BatchMsg, got %T", msg)
+		}
 	}
 }
 
@@ -2575,5 +2587,384 @@ func TestInboxAutoRefreshDedupesAcrossTurns(t *testing.T) {
 	um2 := updated.(model)
 	if len(um2.transcript) != afterFirst {
 		t.Fatalf("second auto-refresh should not re-render same cards, afterFirst=%d afterSecond=%d", afterFirst, len(um2.transcript))
+	}
+}
+
+// fullAgentJobsPayload returns a representative agent jobs
+// response with three jobs covering the running / completed /
+// failed terminal states plus a sub-agent depth>0 to exercise
+// the governance row rendering. Used by the agent overlay /
+// auto-refresh tests below.
+func fullAgentJobsPayload() []byte {
+	return []byte(`{
+		"type": "agent_jobs",
+		"sessionId": "sess_agents_smoke_xyz",
+		"jobs": [
+			{
+				"jobId": "job_explore_1",
+				"parentSessionId": "sess_agents_smoke_xyz",
+				"childSessionId": "sess_child_explore_1",
+				"parentTaskId": "task_abc_1",
+				"agentType": "explore",
+				"status": "running",
+				"prompt": "find the auth middleware and explain it",
+				"contextForkMode": "working-set",
+				"isolation": "worktree",
+				"createdAt": "2026-06-09T11:00:00Z",
+				"updatedAt": "2026-06-09T11:01:30Z",
+				"startedAt": "2026-06-09T11:00:05Z",
+				"governance": {
+					"maxConcurrentAgents": 4,
+					"activeAgents": 2,
+					"maxDepth": 3,
+					"depth": 1,
+					"maxRuntimeMs": 600000
+				}
+			},
+			{
+				"jobId": "job_review_1",
+				"parentSessionId": "sess_agents_smoke_xyz",
+				"childSessionId": "sess_child_review_1",
+				"agentType": "review",
+				"status": "completed",
+				"prompt": "review the auth refactor PR",
+				"contextForkMode": "minimal",
+				"isolation": "none",
+				"createdAt": "2026-06-09T10:30:00Z",
+				"updatedAt": "2026-06-09T10:45:00Z",
+				"startedAt": "2026-06-09T10:30:05Z",
+				"completedAt": "2026-06-09T10:45:00Z"
+			},
+			{
+				"jobId": "job_debug_1",
+				"parentSessionId": "sess_agents_smoke_xyz",
+				"childSessionId": "sess_child_debug_1",
+				"agentType": "debug",
+				"status": "failed",
+				"prompt": "reproduce the compile error",
+				"contextForkMode": "debug-replay",
+				"isolation": "none",
+				"createdAt": "2026-06-09T10:00:00Z",
+				"updatedAt": "2026-06-09T10:20:00Z",
+				"startedAt": "2026-06-09T10:00:05Z",
+				"completedAt": "2026-06-09T10:20:00Z"
+			}
+		]
+	}`)
+}
+
+func TestFormatAgentStatusIconAllValues(t *testing.T) {
+	cases := map[agentJobStatus]string{
+		agentStatusQueued:            "[queue]",
+		agentStatusRunning:           "[run]",
+		agentStatusWaitingPermission: "[perm]",
+		agentStatusCompleted:         "[done]",
+		agentStatusFailed:            "[fail]",
+		agentStatusCancelled:         "[cancel]",
+	}
+	for status, want := range cases {
+		if got := formatAgentStatusIcon(status); got != want {
+			t.Fatalf("formatAgentStatusIcon(%s) = %q, want %q", status, got, want)
+		}
+	}
+	// Unknown status falls through to the raw text inside brackets.
+	got := formatAgentStatusIcon(agentJobStatus("weird_status"))
+	if got != "[weird_status]" {
+		t.Fatalf("unknown status should fall through to bracketed raw text, got %q", got)
+	}
+}
+
+func TestBuildAgentOverlayLinesRendersJobs(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	lines := buildAgentOverlayLines(envelope.Jobs)
+	if len(lines) == 0 {
+		t.Fatalf("expected non-empty overlay lines")
+	}
+	// The first job (explore, running) has depth=1 and
+	// governance active 2/4 + task#abc_1 — the row should
+	// contain all of those markers.
+	combined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"[run]", "job", "explore", "d1",
+		"active 2/4", "depth 1/3", "task=#task_abc_1",
+		"prompt: find the auth middleware",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("buildAgentOverlayLines missing %q\nfull:\n%s", want, combined)
+		}
+	}
+}
+
+func TestBuildAgentOverlayLinesEmptyPlaceholder(t *testing.T) {
+	lines := buildAgentOverlayLines(nil)
+	if len(lines) != 1 || lines[0] != "No agent jobs for this session." {
+		t.Fatalf("expected single empty placeholder, got %v", lines)
+	}
+}
+
+func TestSummarizeAgentJobsRendersStatusCounts(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := summarizeAgentJobs(envelope.Jobs)
+	// 1 running + 1 completed + 1 failed (no queued / permission / cancelled)
+	for _, want := range []string{"running 1", "completed 1", "failed 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summarizeAgentJobs missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestSummarizeAgentJobsEmpty(t *testing.T) {
+	if got := summarizeAgentJobs(nil); got != "no agent jobs" {
+		t.Fatalf("empty summarize should report no agent jobs, got %q", got)
+	}
+}
+
+func TestRenderAgentOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderAgentOverlay(120); got != "" {
+		t.Fatalf("renderAgentOverlay outside modeAgentOverlay should be empty, got %q", got)
+	}
+}
+
+func TestRenderAgentOverlayShowsHeaderInMode(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	m.agentJobs = envelope.Jobs
+	m.inputMode = modeAgentOverlay
+	m.height = 30
+	rendered := m.renderAgentOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderAgentOverlay in modeAgentOverlay should be non-empty")
+	}
+	for _, want := range []string{
+		"Agent status · Phase 6 PR3 overlay",
+		"sess_age", // shortID of "sess_agents_smoke_xyz"
+		"running 1", "completed 1", "failed 1",
+		"scroll", "close",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered agent overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestAgentOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.inputMode != modeAgentOverlay {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeAgentOverlay)
+	}
+	if len(um.agentJobs) != 3 {
+		t.Fatalf("agentJobs = %d, want 3", len(um.agentJobs))
+	}
+	// Esc closes.
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
+	}
+}
+
+func TestAgentOverlayEscapeEnterQAllClose(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
+	um := updated.(model)
+	// esc/enter close.
+	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+		um.inputMode = modeAgentOverlay
+		closed, _ := um.Update(tea.KeyMsg{Type: keyType})
+		cm := closed.(model)
+		if cm.inputMode != modeComposing {
+			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
+		}
+	}
+	// 'q' rune also closes (no quote path for agents).
+	um.inputMode = modeAgentOverlay
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
+	}
+}
+
+func TestAgentOverlayScrollClamps(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
+	um := updated.(model)
+	// Up at 0 stays at 0.
+	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	u := up.(model)
+	if u.agentOverlayScroll != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", u.agentOverlayScroll)
+	}
+	// Down should advance and clamp at len-1.
+	cur := u
+	for i := 0; i < 200; i++ {
+		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		cur = next.(model)
+	}
+	allLines := buildAgentOverlayLines(cur.agentJobs)
+	maxScroll := len(allLines) - 1
+	if cur.agentOverlayScroll != maxScroll {
+		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.agentOverlayScroll)
+	}
+	// One more down should stay clamped.
+	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	mm := more.(model)
+	if mm.agentOverlayScroll != maxScroll {
+		t.Fatalf("scroll should remain at %d, got %d", maxScroll, mm.agentOverlayScroll)
+	}
+}
+
+func TestAgentOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
+	m = updated.(model)
+	m.input.SetValue("untouched")
+	// Press 'z' (a non-overlay key). The textinput must not change.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	um := updated.(model)
+	if um.input.Value() != "untouched" {
+		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
+	}
+	if um.inputMode != modeAgentOverlay {
+		t.Fatalf("stray key should leave mode unchanged, got %q", um.inputMode)
+	}
+}
+
+func TestAgentSlashCommandEmptySessionShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/agents")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd when no session, got %T", cmd)
+	}
+	last := m.transcript[len(m.transcript)-1]
+	if !strings.Contains(last.text, "no active session yet") {
+		t.Fatalf("expected friendly short-circuit status, got %q", last.text)
+	}
+}
+
+func TestAgentJobsMsgErrorAppendsFriendlyLine(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(agentJobsMsg{err: errors.New("dial tcp: connection refused")})
+	um := updated.(model)
+	last := um.transcript[len(um.transcript)-1]
+	if last.kind != "error" || !strings.Contains(last.text, "agents: dial tcp") {
+		t.Fatalf("expected friendly error line, got %+v", last)
+	}
+}
+
+func TestFetchSessionAgentsHTTPCmdSendsCorrectPath(t *testing.T) {
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"agent_jobs","sessionId":"sess_xyz","jobs":[]}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := fetchSessionAgents(m.cfg, "sess_xyz", "user")
+	msg := cmd()
+	agents, ok := msg.(agentJobsMsg)
+	if !ok {
+		t.Fatalf("expected agentJobsMsg, got %T", msg)
+	}
+	if agents.err != nil {
+		t.Fatalf("fetchSessionAgents returned err: %v", agents.err)
+	}
+	if seenPath != "/v1/sessions/sess_xyz/agents" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+	if agents.trigger != "user" {
+		t.Fatalf("trigger = %q, want user", agents.trigger)
+	}
+}
+
+func TestAgentAutoRefreshOnResultEventFiresBatchCmd(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_ar_agents_1"
+	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
+	if cmd == nil {
+		t.Fatalf("consumeNexusEvent on result should fire auto-refresh cmd when session is set")
+	}
+	// Phase 6 PR3: result-event auto-refresh now fires a
+	// tea.Batch of fetchInbox + fetchSessionAgents.
+	msg := cmd()
+	switch typed := msg.(type) {
+	case tea.BatchMsg:
+		if len(typed) < 2 {
+			t.Fatalf("BatchMsg should have at least 2 cmds (inbox + agents), got %d", len(typed))
+		}
+	default:
+		t.Fatalf("auto-refresh cmd should unwrap to tea.BatchMsg, got %T", msg)
+	}
+}
+
+func TestAgentAutoRefreshSkippedWhenNoSession(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
+	if cmd != nil {
+		t.Fatalf("auto-refresh should be skipped when no session, got %T", cmd)
+	}
+}
+
+func TestAgentAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_agents_smoke_xyz"
+	// Open the overlay once and close it.
+	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
+	um := updated.(model)
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um = closed.(model)
+	if um.inputMode != modeComposing {
+		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
+	}
+	// Now fire an auto-refresh and verify the overlay does NOT
+	// reopen (the user is mid-composition).
+	updated, _ = um.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "auto"})
+	um2 := updated.(model)
+	if um2.inputMode == modeAgentOverlay {
+		t.Fatalf("'auto' trigger must NOT open the overlay, got %q", um2.inputMode)
+	}
+	if len(um2.agentJobs) != 3 {
+		t.Fatalf("'auto' trigger should still update the snapshot, got %d jobs", len(um2.agentJobs))
 	}
 }

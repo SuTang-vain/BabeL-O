@@ -147,6 +147,11 @@ test('Go TUI smoke: phase 6 PR2 /inbox quote + auto-refresh', { skip: skipReason
   assert.match(output, /phase 6 PR2 inbox quote \+ auto-refresh verified/)
 })
 
+test('Go TUI smoke: phase 6 PR3 /agents overlay + auto-refresh', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('agent-status', 90)
+  assert.match(output, /phase 6 PR3 agent status overlay verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)

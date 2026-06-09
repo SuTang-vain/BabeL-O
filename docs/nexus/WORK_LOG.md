@@ -2,6 +2,33 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI Phase 6 PR3：`/agents` 多 agent status overlay + end-of-turn auto-refresh 收口
+
+- **用户请求**: 推进 Phase 6 PR3（Agent status panel：parent/child + taskId + role + depth + status + delegatedSubTaskIds），把 Go TUI 拉到 TS TUI `formatMultiAgentStatusView` 的展示能力。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 数据模型: 新增 `agentProfileId` 枚举（explore / review / test / implement / debug / general）+ `agentJobStatus` 枚举（queued / running / waiting_permission / completed / failed / cancelled）+ `contextForkMode` + `agentIsolationMode` 枚举 + `agentJobGovernance`（maxConcurrentAgents / activeAgents / maxDepth / depth / maxRuntimeMs / timeoutAt）+ `agentJob`（jobId / parentSessionId / childSessionId / parentTaskId / agentType / status / prompt / contextForkMode / isolation / createdAt / updatedAt / startedAt / completedAt / governance）+ `sessionAgentJobsResponse`（type / sessionId / jobs）+ `agentJobsMsg`（带 trigger 字段复用 inboxMsg 的 user/auto 模式）。
+    - 状态机: `modeAgentOverlay` inputMode 常量 + 模型字段 `agentJobs []agentJob` + `agentOverlayScroll int`。
+    - HTTP: `fetchSessionAgents(cfg, sessionID, trigger)` 调 `GET /v1/sessions/:id/agents`，保留 `raw []byte` envelope 抗 schema churn。
+    - end-of-turn auto-refresh: `consumeNexusEvent` 的 `case "result", "error":` 末尾把 `return fetchInbox(...)` 改成 `return tea.Batch(fetchInbox(..., "auto"), fetchSessionAgents(..., "auto"))`，两路并行静默刷新。
+    - 渲染: `agentStyle` (foreground 141) + `formatAgentStatusIcon(status)` (`[run]` / `[done]` / `[fail]` / `[perm]` / `[queue]` / `[cancel]` 终端友好 marker) + `formatAgentGovernanceSummary(*agentJobGovernance)` (`active N/M · depth D/maxD`) + `formatAgentJobRow(job)` (main row: status icon + `job` + agentType + `dN` + child=<shortID> + governance + task#<id> + 2nd row: 截断 prompt) + `buildAgentOverlayLines(jobs)` (per-job 1-2 行，空时 `No agent jobs for this session.` placeholder) + `summarizeAgentJobs(jobs)` (running / waiting_permission / queued / failed / cancelled / completed 计数排序) + `renderAgentOverlay(width)` (与 help / slash palette / profileConfirm / contextOverlay / inboxOverlay 同 viewport 风格，title `Agent status · Phase 6 PR3 overlay · <shortID>` + divider + clamped window + `↑/↓/Tab scroll · esc/enter/q close` hint)。
+    - slash 命令: 替换 `/agents` placeholder——`/agents` 调 `fetchSessionAgentsWithSession()`，无 active session 时 short-circuit 友好状态行。
+    - KeyMsg dispatch: `case modeAgentOverlay`——esc/enter/q 关闭 + 清 `agentOverlayScroll` + 写 `agent status closed` 状态行；up/k 减 scroll（clamp 0）；down/j/tab 增 scroll（clamp `len(allLines)-1`，其中 `allLines` 是 `buildAgentOverlayLines(m.agentJobs)`）；stray key 全部被吞。
+    - case agentJobsMsg Update handler: `trigger == "auto"` 路径只更新 `m.agentJobs` + return（不开 overlay、不 push breadcrumb、scroll 不重置）；`"user"` 走原路径（reset scroll + push `agents: N job(s)` breadcrumb + `setMode(modeAgentOverlay)`）。
+    - helpOverlayLines: 新增 `Agent status overlay (Phase 6 PR3):` 段。
+    - View(): 拼接 `agentOverlay` 段在 `inboxOverlay` 之后、input / footer 之前。
+- **回归覆盖**:
+  - `clients/go-tui/main_test.go`:
+    - 现有 `TestInboxAutoRefreshOnResultEventFiresFetchInbox` 更新：现在 result-event auto-refresh 走 `tea.Batch(fetchInbox, fetchSessionAgents)`，cmd() 可能 unwrap 成 `tea.BatchMsg` 或单个 `inboxMsg` / `agentJobsMsg`，三种都接受。
+    - 17 个新单测：`fullAgentJobsPayload()` helper 覆盖 explore/running + review/completed + debug/failed 三种关键状态 + governance active 2/4 depth 1/3 + parentTaskId；`TestFormatAgentStatusIconAllValues` / `TestBuildAgentOverlayLinesRendersJobs` / `TestBuildAgentOverlayLinesEmptyPlaceholder` / `TestSummarizeAgentJobsRendersStatusCounts` / `TestSummarizeAgentJobsEmpty` / `TestRenderAgentOverlayEmptyOutsideMode` / `TestRenderAgentOverlayShowsHeaderInMode` / `TestAgentOverlayOpensOnMsgAndClearsOnClose` / `TestAgentOverlayEscapeEnterQAllClose` / `TestAgentOverlayScrollClamps` / `TestAgentOverlayStrayKeyDoesNotReachTextinput` / `TestAgentSlashCommandEmptySessionShortCircuits` / `TestAgentJobsMsgErrorAppendsFriendlyLine` / `TestFetchSessionAgentsHTTPCmdSendsCorrectPath` / `TestAgentAutoRefreshOnResultEventFiresBatchCmd` / `TestAgentAutoRefreshSkippedWhenNoSession` / `TestAgentAutoRefreshTriggerDoesNotOpenOverlay`。
+  - `test/go_tui_pty_driver.py`: 新 `run_agent_status_sequence`——bash round-trip populate sessionID + approve permission + 等 `Bash done` + `done success=true`（auto-refresh 在 result 到达时静默触发；seeded local Nexus 无 agent jobs，无新 card 也无 error）；`/agents` 等 `loading shared Nexus agents` + `Agent status · Phase 6 PR3 overlay` header + `No agent jobs for this session.` placeholder + `no agent jobs` summary + 按 down 在空 list 上不能 crash + esc 关 overlay + `agent status closed` 状态行。加进 `SEQUENCES` registry。
+  - `test/go-tui-smoke.test.ts`: 加第 15 个测试——`agent-status` 跑 driver `--sequence agent-status` 并断言 `phase 6 PR3 agent status overlay verified`，90s timeout。
+- **范围克制**:
+  - AgentLoop sub-agent 聚合（`task_session_event` stream 中的 `subagent_started` / `subagent_completed` 事件推到 overlay）留到未来 PR——本次只覆盖 AgentJob REST 端点（`/v1/sessions/:id/agents`），与 TS TUI `formatAgentJobRows` 路径对齐；`formatAgentLoopRows` 的 sub-agent lifecycle 事件聚合需要 event stream 缓冲（不是单次 HTTP fetch），与 PR3 的 "快照 overlay" 模型不同，需要单独设计。
+  - ack / cancel 按钮留 CLI（`bbl agents cancel <jobId>`）——Go TUI agent overlay 保持只读，避免复制 Nexus ownership surface。
+  - transcriptPath 字段在 overlay 中省略（TS TUI 也只在 metadata 中展示，Go TUI 用户不直接消费）。
+  - "running sub-agent" 实时 badge 留到未来 PR——本次 auto-refresh 只静默 update snapshot，不主动推 header / footer 提示。
+
 ## 2026-06-09 — Go TUI Phase 6 PR2：`/inbox` quote into prompt + end-of-turn auto-refresh 收口
 
 - **用户请求**: 推进 Phase 6 PR2（`/inbox` quote into current prompt + auto-refresh on `result` event），把 PR1 的 overlay 闭合到 composing + 实时事件 card 推送。
