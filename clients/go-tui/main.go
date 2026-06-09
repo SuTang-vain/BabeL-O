@@ -419,6 +419,102 @@ type agentJobsMsg struct {
 	err       error
 }
 
+// taskStatus mirrors TaskStatus in src/shared/task.ts. The
+// Go TUI renders the status as a single-character icon in
+// the task board overlay (e.g. "▶" for in_progress, "✓" for
+// completed). Unknown statuses fall through to "?" so a
+// server-side addition cannot break the client.
+type taskStatus string
+
+const (
+	taskStatusPending    taskStatus = "pending"
+	taskStatusInProgress taskStatus = "in_progress"
+	taskStatusBlocked    taskStatus = "blocked"
+	taskStatusCompleted  taskStatus = "completed"
+	taskStatusFailed     taskStatus = "failed"
+	taskStatusCancelled  taskStatus = "cancelled"
+)
+
+// taskSource mirrors the `source` field of NexusTask in
+// src/shared/task.ts. Used as a compact tag in the task
+// board overlay row.
+type taskSource string
+
+const (
+	taskSourcePlanner taskSource = "planner"
+	taskSourceExecutor taskSource = "executor"
+	taskSourceCritic  taskSource = "critic"
+	taskSourceUser    taskSource = "user"
+	taskSourceSystem  taskSource = "system"
+)
+
+// taskReviewStatus mirrors the nested `review.status` field.
+type taskReviewStatus string
+
+const (
+	taskReviewPending  taskReviewStatus = "pending"
+	taskReviewApproved taskReviewStatus = "approved"
+	taskReviewRejected taskReviewStatus = "rejected"
+)
+
+// taskReview mirrors NexusTask.review in src/shared/task.ts.
+// nil when the task has no review row yet.
+type taskReview struct {
+	Status          taskReviewStatus `json:"status"`
+	Reason          string           `json:"reason,omitempty"`
+	ReviewerAgentID string           `json:"reviewerAgentId,omitempty"`
+}
+
+// nexusTask mirrors NexusTask in src/shared/task.ts. The Go
+// TUI only reads the stable fields it displays; the rest of
+// the payload stays in tasksListMsg.raw for any future richer
+// renderer (mirroring the inbox / context / compact pattern).
+type nexusTask struct {
+	TaskID             string            `json:"taskId"`
+	SessionID          string            `json:"sessionId"`
+	Title              string            `json:"title"`
+	Description        string            `json:"description,omitempty"`
+	Status             taskStatus        `json:"status"`
+	OwnerAgentID       string            `json:"ownerAgentId,omitempty"`
+	CreatedBySessionID string            `json:"createdBySessionId,omitempty"`
+	Source             taskSource        `json:"source,omitempty"`
+	DependsOn          []string          `json:"dependsOn"`
+	Blocks             []string          `json:"blocks"`
+	RetryCount         int               `json:"retryCount"`
+	Review             *taskReview       `json:"review,omitempty"`
+	Metadata           map[string]any    `json:"metadata,omitempty"`
+	CreatedAt          string            `json:"createdAt"`
+	UpdatedAt          string            `json:"updatedAt"`
+	Result             string            `json:"result,omitempty"`
+}
+
+// tasksListResponse is the envelope for
+// GET /v1/sessions/:sessionId/tasks. The Go TUI only reads the
+// stable top-level fields it displays; the rest of the payload
+// stays in tasksListMsg.raw so schema churn upstream cannot
+// break the client.
+type tasksListResponse struct {
+	Type      string      `json:"type"`
+	SessionID string      `json:"sessionId"`
+	Tasks     []nexusTask `json:"tasks"`
+}
+
+// tasksListMsg is the response from
+// GET /v1/sessions/:sessionId/tasks. The Go TUI decodes the
+// envelope via the typed struct above; raw bytes are retained
+// for the same reason inboxMsg / agentJobsMsg keep them. The
+// trigger field ("user" / "auto") tells the Update handler
+// whether to open the overlay (user /tasks command) or just
+// refresh the snapshot in place (Phase 6 PR4 end-of-turn
+// auto-refresh, paired with fetchInbox + fetchSessionAgents).
+type tasksListMsg struct {
+	sessionID string
+	raw       []byte
+	envelope  tasksListResponse
+	trigger   string
+	err       error
+}
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -438,6 +534,7 @@ const (
 	modeContextOverlay inputMode = "contextOverlay" // read-only context analysis; up/down/esc/enter
 	modeInboxOverlay   inputMode = "inboxOverlay"   // read-only SessionChannel inbox; up/down/a/esc/enter/q
 	modeAgentOverlay   inputMode = "agentOverlay"   // read-only multi-agent status; up/down/esc/enter/q
+	modeTaskBoard      inputMode = "taskBoard"      // read-only task board; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -475,6 +572,8 @@ type model struct {
 	seenInboxCardMessageIDs map[string]struct{}
 	agentJobs        []agentJob
 	agentOverlayScroll int
+	taskBoard        []nexusTask
+	taskBoardScroll  int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -674,6 +773,13 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
+		name:    "/tasks",
+		summary: "open task board overlay (Phase 6 PR4)",
+		run: func(m *model, _ []string) tea.Cmd {
+			return m.fetchSessionTasksWithSession()
+		},
+	},
+	{
 		name:    "/agents",
 		summary: "open multi-agent status overlay (Phase 6 PR3)",
 		run: func(m *model, _ []string) tea.Cmd {
@@ -851,6 +957,7 @@ var (
 	focusedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
 	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	taskBoardStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 )
 
 func main() {
@@ -1141,6 +1248,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeTaskBoard:
+			// Read-only task board overlay (Phase 6 PR4).
+			// up/k scroll back; down/j/tab scroll forward;
+			// esc/enter/q close. No per-row actions yet
+			// (claim / complete / fail / cancel / retry /
+			// worktree-recovery are CLI-only via
+			// `bbl sessions tasks <verb> <taskId>`; the Go TUI
+			// stays read-only to avoid duplicating the Nexus
+			// ownership surface). All other keys are swallowed
+			// so they never reach the textinput.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.taskBoardScroll = 0
+				m.appendLine("status", "task board closed")
+				return m, nil
+			case "up", "k":
+				if m.taskBoardScroll > 0 {
+					m.taskBoardScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildTaskBoardLines(m.taskBoard)
+				maxScroll := max(0, len(allLines)-1)
+				if m.taskBoardScroll < maxScroll {
+					m.taskBoardScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -1354,6 +1492,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setMode(modeAgentOverlay)
 		return m, nil
 
+	case tasksListMsg:
+		if msg.err != nil {
+			m.appendLine("error", "tasks: "+msg.err.Error())
+			return m, nil
+		}
+		m.taskBoard = msg.envelope.Tasks
+		if msg.trigger == "auto" {
+			// Phase 6 PR4 end-of-turn auto-refresh: update the
+			// snapshot silently. Do NOT open the overlay.
+			return m, nil
+		}
+		// User-initiated /tasks: reset scroll + push breadcrumb
+		// + open the overlay.
+		m.taskBoardScroll = 0
+		summary := fmt.Sprintf("tasks: %d task(s)", len(m.taskBoard))
+		m.appendLine("status", summary)
+		m.setMode(modeTaskBoard)
+		return m, nil
+
 	case pollTickMsg:
 		// Background poll. If we've never fetched a config, defer to the
 		// next round rather than blocking the chat loop.
@@ -1404,6 +1561,7 @@ func (m model) View() string {
 	contextOverlay := m.renderContextOverlay(width)
 	inboxOverlay := m.renderInboxOverlay(width)
 	agentOverlay := m.renderAgentOverlay(width)
+	taskBoard := m.renderTaskBoard(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -1426,6 +1584,9 @@ func (m model) View() string {
 	}
 	if agentOverlay != "" {
 		parts = append(parts, agentOverlay)
+	}
+	if taskBoard != "" {
+		parts = append(parts, taskBoard)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -1474,6 +1635,11 @@ var helpOverlayLines = []string{
 	"Agent status overlay (Phase 6 PR3):",
 	"  /agents          open multi-agent status for the current session",
 	"  up / down / tab  scroll through the agent jobs list",
+	"  esc / enter / q  close the overlay",
+	"",
+	"Task board overlay (Phase 6 PR4):",
+	"  /tasks           open task board for the current session",
+	"  up / down / tab  scroll through the task list",
 	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
@@ -2506,6 +2672,182 @@ func summarizeAgentJobs(jobs []agentJob) string {
 	return strings.Join(parts, " · ")
 }
 
+// formatTaskStatusIcon returns a short, terminal-friendly
+// status marker (e.g. "[run]", "[done]", "[fail]") for the
+// task board. Mirrors the formatAgentStatusIcon shape so the
+// two overlays feel like siblings.
+func formatTaskStatusIcon(status taskStatus) string {
+	switch status {
+	case taskStatusPending:
+		return "[pend]"
+	case taskStatusInProgress:
+		return "[run]"
+	case taskStatusBlocked:
+		return "[block]"
+	case taskStatusCompleted:
+		return "[done]"
+	case taskStatusFailed:
+		return "[fail]"
+	case taskStatusCancelled:
+		return "[cancel]"
+	}
+	return "[" + fallbackUnknown(string(status)) + "]"
+}
+
+// formatTaskReviewSummary renders a compact
+// "review=approved" / "review=pending" / "review=rejected"
+// segment for the task row. Returns "" when the task has no
+// review row.
+func formatTaskReviewSummary(review *taskReview) string {
+	if review == nil {
+		return ""
+	}
+	return "review=" + string(fallbackUnknown(string(review.Status)))
+}
+
+// formatTaskWorktreeRecoveryAction reads the worktree
+// recovery metadata blob (set by the worktree lifecycle hook
+// on task metadata) and renders a compact
+// "recovery=continue/abandon/keep" segment. Returns "" when
+// the task has no worktree recovery metadata. The TS TUI
+// worktree flow panel uses the same metadata convention.
+func formatTaskWorktreeRecoveryAction(metadata map[string]any) string {
+	if metadata == nil {
+		return ""
+	}
+	recovery, ok := metadata["worktreeRecovery"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	action := stringField(recovery, "action")
+	if action == "" {
+		return ""
+	}
+	preservePath := stringField(recovery, "preservePath")
+	if preservePath != "" {
+		return "recovery=" + action + " path=" + shortID(preservePath)
+	}
+	return "recovery=" + action
+}
+
+// formatTaskRow renders a single nexusTask for the task board
+// overlay. The row is one main line + optional second line
+// for the description / worktree recovery hint:
+//   - main row: status icon + task#<id> + retry=N + review
+//   - second row (optional): source + description or recovery
+//
+// Mirrors the TS TUI task board UX (status / title /
+// retryCount / review / worktree recovery action).
+func formatTaskRow(task nexusTask) []string {
+	parts := []string{
+		formatTaskStatusIcon(task.Status),
+		"#" + fallbackUnknown(task.TaskID),
+	}
+	if task.RetryCount > 0 {
+		parts = append(parts, fmt.Sprintf("retry=%d", task.RetryCount))
+	}
+	if review := formatTaskReviewSummary(task.Review); review != "" {
+		parts = append(parts, review)
+	}
+	main := strings.Join(parts, " ")
+	if title := singleLine(strings.TrimSpace(task.Title)); title != "" {
+		main += "  " + truncatePlain(title, 80)
+	}
+	rows := []string{main}
+	if recovery := formatTaskWorktreeRecoveryAction(task.Metadata); recovery != "" {
+		rows = append(rows, "  "+recovery)
+	}
+	if source := strings.TrimSpace(string(task.Source)); source != "" {
+		rows = append(rows, "  source="+source)
+	}
+	return rows
+}
+
+// buildTaskBoardLines turns the task snapshot into the ordered
+// list of lines the task board will render. Each task
+// contributes 1-3 lines (main row + optional recovery +
+// optional source); the overlay window is then clamped in
+// renderTaskBoard. Returns a single placeholder line for the
+// empty case so the caller can show a friendly message.
+func buildTaskBoardLines(tasks []nexusTask) []string {
+	if len(tasks) == 0 {
+		return []string{"No tasks for this session."}
+	}
+	lines := []string{}
+	for _, task := range tasks {
+		lines = append(lines, formatTaskRow(task)...)
+	}
+	return lines
+}
+
+// summarizeTaskBoard is the per-status count line shown at
+// the top of the task board overlay. Returns "no tasks" for
+// an empty snapshot so the summary line is never blank.
+func summarizeTaskBoard(tasks []nexusTask) string {
+	counts := map[taskStatus]int{}
+	for _, task := range tasks {
+		counts[task.Status]++
+	}
+	statusOrder := []taskStatus{
+		taskStatusInProgress,
+		taskStatusBlocked,
+		taskStatusPending,
+		taskStatusFailed,
+		taskStatusCancelled,
+		taskStatusCompleted,
+	}
+	parts := []string{}
+	for _, status := range statusOrder {
+		if count := counts[status]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", status, count))
+		}
+	}
+	if len(parts) == 0 {
+		return "no tasks"
+	}
+	return strings.Join(parts, " · ")
+}
+
+// renderTaskBoard paints the multi-line task board view. It
+// is the Phase 6 PR4 primary UX for the /tasks slash command.
+// The overlay is composed of:
+//   - titleStyle header (Phase 6 PR4 banner + session id)
+//   - summary line (in_progress / blocked / pending / failed
+//     / cancelled / completed counts)
+//   - clamped window of buildTaskBoardLines
+//   - bottom hint (scroll + close keys)
+//
+// Outside modeTaskBoard it returns "" so it can be
+// unconditionally spliced into the View() parts list.
+func (m model) renderTaskBoard(width int) string {
+	if m.inputMode != modeTaskBoard {
+		return ""
+	}
+	header := titleStyle.Render("Task board · Phase 6 PR4 overlay · " + shortID(m.sessionID))
+	summary := summarizeTaskBoard(m.taskBoard)
+	visibleRows := max(1, m.height-10)
+	allLines := buildTaskBoardLines(m.taskBoard)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.taskBoardScroll > maxScroll {
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[maxScroll:end]
+	} else {
+		end := m.taskBoardScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[m.taskBoardScroll:end]
+	}
+	lines := []string{header, divider(width), summary}
+	lines = append(lines, allLines...)
+	hint := "↑/↓/Tab scroll · esc/enter/q close"
+	lines = append(lines, mutedStyle.Render(hint))
+	return strings.Join([]string{divider(width), taskBoardStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -2841,6 +3183,19 @@ func (m *model) fetchSessionAgentsWithSession() tea.Cmd {
 	return fetchSessionAgents(m.cfg, m.sessionID, "user")
 }
 
+// fetchSessionTasksWithSession is the gated entry point the
+// /tasks slash command uses. Mirrors fetchSessionAgentsWithSession
+// — active session required, "user" trigger so the overlay
+// opens on response.
+func (m *model) fetchSessionTasksWithSession() tea.Cmd {
+	if m.sessionID == "" {
+		m.appendLine("status", "tasks: no active session yet — submit a prompt first")
+		return nil
+	}
+	m.appendLine("status", "loading shared Nexus tasks: "+shortID(m.sessionID))
+	return fetchSessionTasks(m.cfg, m.sessionID, "user")
+}
+
 func (m *model) sendPermissionDecision(approved bool, reason string) {
 	if m.pending == nil || m.decisions == nil {
 		return
@@ -2909,10 +3264,13 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// the snapshot in place without opening the overlay.
 		// Phase 6 PR3 also fires a parallel fetchSessionAgents
 		// so the /agents overlay stays current across turns.
+		// Phase 6 PR4 adds a parallel fetchSessionTasks so the
+		// /tasks board overlay stays current across turns.
 		if m.sessionID != "" {
 			return tea.Batch(
 				fetchInbox(m.cfg, m.sessionID, false, "auto"),
 				fetchSessionAgents(m.cfg, m.sessionID, "auto"),
+				fetchSessionTasks(m.cfg, m.sessionID, "auto"),
 			)
 		}
 	case "assistant_delta":
@@ -3409,6 +3767,33 @@ func fetchSessionAgents(cfg config, sessionID string, trigger string) tea.Cmd {
 		if err == nil {
 			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
 				out.err = fmt.Errorf("decode agent jobs: %w", decodeErr)
+			}
+		}
+		return out
+	}
+}
+
+// fetchSessionTasks issues GET /v1/sessions/:sessionId/tasks and
+// decodes the stable top-level envelope
+// (type / sessionId / tasks). The raw bytes are retained so any
+// future richer renderer (or a server-side schema addition)
+// does not break the existing format / overlay code. The
+// trigger field ("user" / "auto") tells the Update handler
+// whether to open the overlay (user /tasks command) or just
+// refresh the snapshot in place (Phase 6 PR4 end-of-turn
+// auto-refresh, paired with fetchInbox + fetchSessionAgents).
+func fetchSessionTasks(cfg config, sessionID string, trigger string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/tasks",
+			nil,
+		)
+		out := tasksListMsg{sessionID: sessionID, raw: raw, trigger: trigger, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
+				out.err = fmt.Errorf("decode tasks: %w", decodeErr)
 			}
 		}
 		return out

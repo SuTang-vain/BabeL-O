@@ -1106,6 +1106,85 @@ def run_agent_status_sequence(
     return True
 
 
+def run_task_board_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 6 PR4: `/tasks` opens the task board overlay wired to
+    GET /v1/sessions/:id/tasks. The seeded local Nexus has no
+    tasks, so we exercise the empty-state path:
+      - bash round-trip to populate sessionID.
+      - /tasks → "loading shared Nexus tasks" status +
+        "Task board · Phase 6 PR4 overlay" header +
+        "No tasks for this session." placeholder.
+      - down on an empty list does not crash.
+      - esc closes the overlay + "task board closed" status.
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    send(master_fd, "bash echo phase6-tasks")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] task board setup: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] task board setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] task board setup: stream did not close cleanly",
+        )
+
+    # Step 3: /tasks.
+    send(master_fd, "/tasks")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "loading shared Nexus tasks", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tasks did not surface the 'loading' status line",
+        )
+    if not wait_for(master_fd, "Task board · Phase 6 PR4 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tasks did not render the task board header",
+        )
+    if not wait_for(master_fd, "No tasks for this session.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tasks did not render the empty placeholder",
+        )
+    if not wait_for(master_fd, "no tasks", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tasks did not render the empty summary line",
+        )
+
+    # Step 4: down on empty list must not crash.
+    send(master_fd, "\x1b[B")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+
+    # Step 5: close the overlay.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "task board closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] task board did not close on Esc",
+        )
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1273,6 +1352,13 @@ SEQUENCES: dict[str, dict] = {
     "agent-status": {
         "runner": run_agent_status_sequence,
         "ok_message": "phase 6 PR3 agent status overlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "task-board": {
+        "runner": run_task_board_sequence,
+        "ok_message": "phase 6 PR4 task board overlay verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

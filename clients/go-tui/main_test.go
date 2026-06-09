@@ -2507,14 +2507,15 @@ func TestInboxAutoRefreshOnResultEventFiresFetchInbox(t *testing.T) {
 	msg := cmd()
 	switch typed := msg.(type) {
 	case tea.BatchMsg:
-		if len(typed) == 0 {
-			t.Fatalf("auto-refresh BatchMsg should not be empty")
+		if len(typed) < 3 {
+			t.Fatalf("Phase 6 PR4: auto-refresh BatchMsg should have at least 3 cmds (inbox + agents + tasks), got %d", len(typed))
 		}
 	default:
 		_, okInbox := msg.(inboxMsg)
 		_, okAgents := msg.(agentJobsMsg)
-		if !okInbox && !okAgents {
-			t.Fatalf("auto-refresh cmd should produce inboxMsg / agentJobsMsg / tea.BatchMsg, got %T", msg)
+		_, okTasks := msg.(tasksListMsg)
+		if !okInbox && !okAgents && !okTasks {
+			t.Fatalf("auto-refresh cmd should produce inboxMsg / agentJobsMsg / tasksListMsg / tea.BatchMsg, got %T", msg)
 		}
 	}
 }
@@ -2926,8 +2927,8 @@ func TestAgentAutoRefreshOnResultEventFiresBatchCmd(t *testing.T) {
 	msg := cmd()
 	switch typed := msg.(type) {
 	case tea.BatchMsg:
-		if len(typed) < 2 {
-			t.Fatalf("BatchMsg should have at least 2 cmds (inbox + agents), got %d", len(typed))
+		if len(typed) < 3 {
+			t.Fatalf("Phase 6 PR4: BatchMsg should have at least 3 cmds (inbox + agents + tasks), got %d", len(typed))
 		}
 	default:
 		t.Fatalf("auto-refresh cmd should unwrap to tea.BatchMsg, got %T", msg)
@@ -2966,5 +2967,284 @@ func TestAgentAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	}
 	if len(um2.agentJobs) != 3 {
 		t.Fatalf("'auto' trigger should still update the snapshot, got %d jobs", len(um2.agentJobs))
+	}
+}
+
+// fullTasksListPayload returns a representative tasks list
+// response with three tasks covering in_progress / blocked /
+// completed terminal states plus a worktree recovery hint on
+// one task. Used by the task board tests below.
+func fullTasksListPayload() []byte {
+	return []byte(`{
+		"type": "tasks_list",
+		"sessionId": "sess_tasks_smoke_xyz",
+		"tasks": [
+			{
+				"taskId": "task_in_progress_1",
+				"sessionId": "sess_tasks_smoke_xyz",
+				"title": "implement auth middleware",
+				"status": "in_progress",
+				"ownerAgentId": "agent_impl_1",
+				"source": "planner",
+				"dependsOn": [],
+				"blocks": ["task_review_1"],
+				"retryCount": 0,
+				"createdAt": "2026-06-10T09:00:00Z",
+				"updatedAt": "2026-06-10T09:30:00Z"
+			},
+			{
+				"taskId": "task_blocked_1",
+				"sessionId": "sess_tasks_smoke_xyz",
+				"title": "review auth refactor",
+				"status": "blocked",
+				"source": "executor",
+				"dependsOn": ["task_in_progress_1"],
+				"blocks": [],
+				"retryCount": 2,
+				"review": {"status": "pending", "reason": "waiting for human"},
+				"createdAt": "2026-06-10T08:00:00Z",
+				"updatedAt": "2026-06-10T09:15:00Z"
+			},
+			{
+				"taskId": "task_completed_1",
+				"sessionId": "sess_tasks_smoke_xyz",
+				"title": "investigate compile error",
+				"status": "completed",
+				"source": "user",
+				"dependsOn": [],
+				"blocks": [],
+				"retryCount": 0,
+				"review": {"status": "approved"},
+				"createdAt": "2026-06-10T07:00:00Z",
+				"updatedAt": "2026-06-10T07:30:00Z",
+				"result": "compile error was a missing import",
+				"metadata": {
+					"worktreeRecovery": {
+						"action": "continue",
+						"preservePath": "sess_tasks_smoke_xyz_worktree_continue"
+					}
+				}
+			}
+		]
+	}`)
+}
+
+func TestFormatTaskStatusIconAllValues(t *testing.T) {
+	cases := map[taskStatus]string{
+		taskStatusPending:    "[pend]",
+		taskStatusInProgress: "[run]",
+		taskStatusBlocked:    "[block]",
+		taskStatusCompleted:  "[done]",
+		taskStatusFailed:     "[fail]",
+		taskStatusCancelled:  "[cancel]",
+	}
+	for status, want := range cases {
+		if got := formatTaskStatusIcon(status); got != want {
+			t.Fatalf("formatTaskStatusIcon(%s) = %q, want %q", status, got, want)
+		}
+	}
+	// Unknown status falls through to the bracketed raw text.
+	if got := formatTaskStatusIcon(taskStatus("paused")); got != "[paused]" {
+		t.Fatalf("unknown status should bracket raw text, got %q", got)
+	}
+}
+
+func TestBuildTaskBoardLinesRendersTasks(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	lines := buildTaskBoardLines(envelope.Tasks)
+	combined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"[run]", "#task_in_progress_1", "implement auth middleware",
+		"[block]", "#task_blocked_1", "retry=2", "review=pending",
+		"[done]", "#task_completed_1", "review=approved",
+		"recovery=continue",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("buildTaskBoardLines missing %q\nfull:\n%s", want, combined)
+		}
+	}
+}
+
+func TestBuildTaskBoardLinesEmptyPlaceholder(t *testing.T) {
+	lines := buildTaskBoardLines(nil)
+	if len(lines) != 1 || lines[0] != "No tasks for this session." {
+		t.Fatalf("expected single empty placeholder, got %v", lines)
+	}
+}
+
+func TestSummarizeTaskBoardRendersStatusCounts(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := summarizeTaskBoard(envelope.Tasks)
+	for _, want := range []string{"in_progress 1", "blocked 1", "completed 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summarizeTaskBoard missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestRenderTaskBoardEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderTaskBoard(120); got != "" {
+		t.Fatalf("renderTaskBoard outside modeTaskBoard should be empty, got %q", got)
+	}
+}
+
+func TestRenderTaskBoardShowsHeaderInMode(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_tasks_smoke_xyz"
+	m.taskBoard = envelope.Tasks
+	m.inputMode = modeTaskBoard
+	m.height = 30
+	rendered := m.renderTaskBoard(120)
+	if rendered == "" {
+		t.Fatalf("renderTaskBoard in modeTaskBoard should be non-empty")
+	}
+	for _, want := range []string{
+		"Task board · Phase 6 PR4 overlay",
+		"sess_tas", // shortID of "sess_tasks_smoke_xyz"
+		"in_progress 1", "blocked 1", "completed 1",
+		"scroll", "close",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered task board missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestTaskBoardOpensOnMsgAndClearsOnClose(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_tasks_smoke_xyz"
+	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.inputMode != modeTaskBoard {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeTaskBoard)
+	}
+	if len(um.taskBoard) != 3 {
+		t.Fatalf("taskBoard = %d, want 3", len(um.taskBoard))
+	}
+	// Esc closes.
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
+	}
+}
+
+func TestTaskBoardScrollClamps(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_tasks_smoke_xyz"
+	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
+	um := updated.(model)
+	// Up at 0 stays at 0.
+	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	u := up.(model)
+	if u.taskBoardScroll != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", u.taskBoardScroll)
+	}
+	// Down should advance and clamp at len-1.
+	cur := u
+	for i := 0; i < 200; i++ {
+		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		cur = next.(model)
+	}
+	allLines := buildTaskBoardLines(cur.taskBoard)
+	maxScroll := len(allLines) - 1
+	if cur.taskBoardScroll != maxScroll {
+		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.taskBoardScroll)
+	}
+}
+
+func TestTaskSlashCommandEmptySessionShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/tasks")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd when no session, got %T", cmd)
+	}
+	last := m.transcript[len(m.transcript)-1]
+	if !strings.Contains(last.text, "no active session yet") {
+		t.Fatalf("expected friendly short-circuit status, got %q", last.text)
+	}
+}
+
+func TestTasksListMsgErrorAppendsFriendlyLine(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(tasksListMsg{err: errors.New("dial tcp: connection refused")})
+	um := updated.(model)
+	last := um.transcript[len(um.transcript)-1]
+	if last.kind != "error" || !strings.Contains(last.text, "tasks: dial tcp") {
+		t.Fatalf("expected friendly error line, got %+v", last)
+	}
+}
+
+func TestTasksListAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
+	envelope := tasksListResponse{}
+	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_tasks_smoke_xyz"
+	// Open then close.
+	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
+	um := updated.(model)
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um = closed.(model)
+	if um.inputMode != modeComposing {
+		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
+	}
+	// Auto-refresh should NOT reopen.
+	updated, _ = um.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "auto"})
+	um2 := updated.(model)
+	if um2.inputMode == modeTaskBoard {
+		t.Fatalf("'auto' trigger must NOT open the overlay, got %q", um2.inputMode)
+	}
+	if len(um2.taskBoard) != 3 {
+		t.Fatalf("'auto' trigger should still update the snapshot, got %d tasks", len(um2.taskBoard))
+	}
+}
+
+func TestFetchSessionTasksHTTPCmdSendsCorrectPath(t *testing.T) {
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"tasks_list","sessionId":"sess_xyz","tasks":[]}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := fetchSessionTasks(m.cfg, "sess_xyz", "user")
+	msg := cmd()
+	tasks, ok := msg.(tasksListMsg)
+	if !ok {
+		t.Fatalf("expected tasksListMsg, got %T", msg)
+	}
+	if tasks.err != nil {
+		t.Fatalf("fetchSessionTasks returned err: %v", tasks.err)
+	}
+	if seenPath != "/v1/sessions/sess_xyz/tasks" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+	if tasks.trigger != "user" {
+		t.Fatalf("trigger = %q, want user", tasks.trigger)
 	}
 }
