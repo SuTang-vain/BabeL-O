@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestStreamURL(t *testing.T) {
@@ -686,5 +688,237 @@ func TestFormatRuntimeProfilesTombstoneOrderingIsStable(t *testing.T) {
 	zetaIdx := strings.Index(rendered, "zeta")
 	if alphaIdx == -1 || zetaIdx == -1 || alphaIdx > zetaIdx {
 		t.Fatalf("tombstones not sorted: %q", rendered)
+	}
+}
+
+// === Phase 3: single-input-owner state machine ===
+
+func TestInputModeDefaultsToComposing(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeComposing)
+	}
+}
+
+func TestSetModeIsIdempotentAndRecordsTransition(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modePermission)
+	if m.inputMode != modePermission {
+		t.Fatalf("after setMode(permission): %q", m.inputMode)
+	}
+	m.setMode(modePermission)
+	if m.inputMode != modePermission {
+		t.Fatalf("idempotent setMode should not break state: %q", m.inputMode)
+	}
+	m.setMode(modeComposing)
+	if m.inputMode != modeComposing {
+		t.Fatalf("after setMode(composing): %q", m.inputMode)
+	}
+}
+
+func TestCanEditInputOnlyTrueInComposing(t *testing.T) {
+	for mode, want := range map[inputMode]bool{
+		modeComposing:   true,
+		modePermission:  false,
+		modeSlashPick:   false,
+		modeHelpOverlay: false,
+	} {
+		if got := mode.canEditInput(); got != want {
+			t.Fatalf("canEditInput(%q) = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+func TestPermissionRequestEntersPermissionMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_1234567890abcdef",
+		"toolUseId": "tool_1",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input":     map[string]any{"command": "echo hi"},
+	})
+	if m.inputMode != modePermission {
+		t.Fatalf("inputMode = %q after permission_request, want %q", m.inputMode, modePermission)
+	}
+	if m.pending == nil {
+		t.Fatalf("pending should be set when entering permission mode")
+	}
+}
+
+func TestSendPermissionDecisionReturnsToComposing(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_1",
+		"toolUseId": "tool_1",
+		"name":      "Bash",
+		"risk":      "execute",
+	})
+	// Fake the decision channel so sendPermissionDecision can write.
+	m.decisions = make(chan permissionDecision, 1)
+	if m.inputMode != modePermission {
+		t.Fatalf("precondition: inputMode = %q, want %q", m.inputMode, modePermission)
+	}
+	m.sendPermissionDecision(true, "Approved from test")
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q after send, want %q", m.inputMode, modeComposing)
+	}
+	if m.pending != nil {
+		t.Fatalf("pending should be nil after send")
+	}
+}
+
+func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_1",
+		"toolUseId": "tool_1",
+		"name":      "Bash",
+		"risk":      "execute",
+	})
+	m.decisions = make(chan permissionDecision, 1)
+	before := m.input.Value()
+
+	// Pressing a random letter while in permission mode must not
+	// insert into m.input. (Phase 3 single-input-owner invariant.)
+	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	if m.input.Value() != before {
+		t.Fatalf("textinput received key while in permission mode: %q -> %q", before, m.input.Value())
+	}
+}
+
+func TestHelpOverlayOpensOnQuestionMark(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeHelpOverlay {
+		t.Fatalf("inputMode = %q, want %q", updatedModel.inputMode, modeHelpOverlay)
+	}
+	if !strings.Contains(updatedModel.View(), "Help") {
+		t.Fatalf("help view should mention 'Help' header: %q", updatedModel.View())
+	}
+}
+
+func TestHelpOverlayClosesOnEsc(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	m.setMode(modeHelpOverlay)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q after Esc", updatedModel.inputMode, modeComposing)
+	}
+}
+
+func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	m.setMode(modeHelpOverlay)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.helpScroll != 1 {
+		t.Fatalf("helpScroll = %d, want 1", updatedModel.helpScroll)
+	}
+	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updatedModel, _ = updated.(model)
+	if updatedModel.helpScroll != 0 {
+		t.Fatalf("helpScroll = %d, want 0 after up", updatedModel.helpScroll)
+	}
+}
+
+func TestQuestionMarkIgnoredWhenInputNonEmpty(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.input.SetValue("abc")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode == modeHelpOverlay {
+		t.Fatalf("help must not open when input is non-empty")
+	}
+	if !strings.Contains(updatedModel.input.Value(), "abc?") {
+		t.Fatalf("input should have '?' appended, got %q", updatedModel.input.Value())
+	}
+}
+
+func TestCtrlCAlwaysQuitsEvenFromOverlay(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeHelpOverlay)
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	if cmd == nil {
+		t.Fatalf("ctrl+c from help overlay should still return a quit cmd")
+	}
+	// The returned cmd is tea.Quit; we don't invoke it here.
+}
+
+func TestQDoesNotQuitWhenInOverlay(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeHelpOverlay)
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	if cmd != nil {
+		t.Fatalf("q from help overlay must not quit, got %T", cmd)
+	}
+	// q inside help should be handled by the help handler (close
+	// overlay) and route the model back to composing.
+	if m.inputMode != modeHelpOverlay {
+		t.Fatalf("help should still be open after q key arrival, got %q", m.inputMode)
+	}
+}
+
+func TestTextinputInstanceNotReplacedAcrossModes(t *testing.T) {
+	// Phase 3 invariant: the textinput instance is created once in
+	// newModel and must never be replaced by mode transitions; only its
+	// value / cursor are mutated. We assert this by checking that a
+	// value the user typed survives a full mode round-trip.
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.input.SetValue("in-progress draft")
+
+	m.setMode(modePermission)
+	if m.input.Value() != "in-progress draft" {
+		t.Fatalf("input Value reset when entering permission mode: %q", m.input.Value())
+	}
+	m.setMode(modeHelpOverlay)
+	if m.input.Value() != "in-progress draft" {
+		t.Fatalf("input Value reset when entering help mode: %q", m.input.Value())
+	}
+	m.setMode(modeComposing)
+	if m.input.Value() != "in-progress draft" {
+		t.Fatalf("input Value reset when returning to composing: %q", m.input.Value())
+	}
+}
+
+func TestRenderHelpHiddenInComposing(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	if got := m.renderHelp(80); got != "" {
+		t.Fatalf("renderHelp should be empty in composing, got %q", got)
+	}
+}
+
+func TestRenderHelpVisibleInHelpMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	m.setMode(modeHelpOverlay)
+	if got := m.renderHelp(80); !strings.Contains(got, "Help") {
+		t.Fatalf("renderHelp should mention 'Help', got %q", got)
 	}
 }

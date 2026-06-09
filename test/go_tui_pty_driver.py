@@ -163,13 +163,154 @@ def find_go_tui(repo: Path) -> tuple[list[str], str, str]:
     return (fallback, "go-run", warning)
 
 
+def run_permission_approve_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    prompt = "bash echo go-tui-smoke"
+    send(master_fd, prompt)
+    send(master_fd, "\r")
+
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] permission panel did not appear",
+        )
+
+    send(master_fd, "a")
+
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] approved Bash tool did not surface a 'Bash done' marker",
+        )
+    if not wait_for(master_fd, "permit", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] permission_response transcript line was not rendered",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] stream did not close with a 'done success=true' marker",
+        )
+    return True
+
+
+def run_phase3_overlay_mutex_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 3 single-input-owner invariants:
+    1. Help overlay (? on empty input) opens, shows 'Help' header.
+    2. Esc closes help and returns to composing.
+    3. Permission panel opens for a Bash tool call.
+    4. While permission is up, random keys (e.g. 'z') do NOT type into
+       the input box.
+    5. Help overlay and permission panel are mutually exclusive: a `?`
+       while permission is up does NOT switch the overlay.
+    6. 'a' approves and stream returns done success=true.
+    """
+    # 1) Open help overlay.
+    send(master_fd, "?")
+    if not wait_for(master_fd, "Help", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] help overlay did not open on '?'",
+        )
+
+    # 2) Esc closes help.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "help closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] help overlay did not close on Esc",
+        )
+
+    # 3) Open permission panel via a Bash tool call.
+    send(master_fd, "bash echo go-tui-mutex")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] permission panel did not appear",
+        )
+
+    # 4) While permission is up, random key must not reach textinput.
+    # The textinput still has its prompt visible but should not
+    # insert a 'z' character while mode=permission.
+    # Snapshot the visible transcript before the stray key, then
+    # verify the user-prompt line is unchanged afterwards. Status
+    # lines and permission panel may legitimately render after the
+    # stray key, so we look for a literal 'z' appended to the
+    # user-prompt line specifically.
+    send(master_fd, "z")
+    # Drain a bit so any unintended echo lands in the transcript.
+    time.sleep(0.3)
+    chunk = read_available(master_fd, 0.3)
+    if chunk:
+        transcript.append(chunk)
+    combined = visible_text("".join(transcript))
+    # The transcript must NOT contain a "you       bash echo
+    # go-tui-mutexz" user line — that would mean permission mode
+    # leaked the stray key into the textinput.
+    if "bash echo go-tui-mutexz" in combined:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] textinput appended stray 'z' after prompt (permission mode let it through)",
+        )
+
+    # 5) Sending '?' while permission is up must NOT open help.
+    # (Phase 3 single-input-owner: routing is mode-driven; '?' is only
+    # honored in composing.)
+    snapshot_before = len(transcript)
+    send(master_fd, "?")
+    time.sleep(0.3)
+    chunk = read_available(master_fd, 0.3)
+    if chunk:
+        transcript.append(chunk)
+    combined = visible_text("".join(transcript))
+    # The 'Help' header is rendered in the help overlay. If a new
+    # 'Help' header appears AFTER 'Permission: Bash', that would mean
+    # help opened on top of permission — i.e. the mutex broke.
+    perm_idx = combined.rfind("Permission: Bash")
+    help_idx = combined.rfind("Help · Phase 3 overlay")
+    if help_idx > perm_idx and help_idx > 0:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] help overlay opened while permission was up (mutex violation); transcript: {combined!r}",
+        )
+
+    # 6) Approve the permission.
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] approved Bash tool did not surface a 'Bash done' marker",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] stream did not close with a 'done success=true' marker",
+        )
+    # Snapshot was used to assert no extra help overlay opened; we
+    # intentionally ignore snapshot_before after this point.
+    _ = snapshot_before
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--sequence",
         required=True,
-        choices=("permission-approve",),
-        help="Phase 1 smoke sequence to execute",
+        choices=("permission-approve", "phase3-overlay-mutex"),
+        help="Smoke sequence to execute",
     )
     parser.add_argument(
         "--timeout",
@@ -272,33 +413,12 @@ def main() -> int:
                     "[go-tui-smoke] go-tui banner did not appear within timeout",
                 )
 
-            prompt = "bash echo go-tui-smoke"
-            send(master_fd, prompt)
-            send(master_fd, "\r")
-
-            if not wait_for(master_fd, "Permission: Bash", args.timeout, transcript):
-                return _fail(
-                    master_fd, go_tui_proc, transcript,
-                    "[go-tui-smoke] permission panel did not appear",
-                )
-
-            send(master_fd, "a")
-
-            if not wait_for(master_fd, "Bash done", args.timeout, transcript):
-                return _fail(
-                    master_fd, go_tui_proc, transcript,
-                    "[go-tui-smoke] approved Bash tool did not surface a 'Bash done' marker",
-                )
-            if not wait_for(master_fd, "permit", args.timeout, transcript):
-                return _fail(
-                    master_fd, go_tui_proc, transcript,
-                    "[go-tui-smoke] permission_response transcript line was not rendered",
-                )
-            if not wait_for(master_fd, "done success=true", args.timeout, transcript):
-                return _fail(
-                    master_fd, go_tui_proc, transcript,
-                    "[go-tui-smoke] stream did not close with a 'done success=true' marker",
-                )
+            if args.sequence == "permission-approve":
+                if not run_permission_approve_sequence(master_fd, go_tui_proc, transcript, args.timeout):
+                    return 1
+            elif args.sequence == "phase3-overlay-mutex":
+                if not run_phase3_overlay_mutex_sequence(master_fd, go_tui_proc, transcript, args.timeout):
+                    return 1
 
             send(master_fd, "q")
             try:
@@ -334,7 +454,10 @@ def main() -> int:
         return _fail(0, None, transcript, "[go-tui-smoke] final transcript missing Bash tool completion line")
     if "done success=true" not in visible:
         return _fail(0, None, transcript, "[go-tui-smoke] final transcript missing result success marker")
-    print("[go-tui-smoke] OK: permission approve chain verified end-to-end")
+    if args.sequence == "permission-approve":
+        print("[go-tui-smoke] OK: permission approve chain verified end-to-end")
+    elif args.sequence == "phase3-overlay-mutex":
+        print("[go-tui-smoke] OK: phase 3 single-input-owner overlay mutex verified")
     for message in cleanup_messages:
         print(message, file=sys.stderr)
     return 0

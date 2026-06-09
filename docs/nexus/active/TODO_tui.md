@@ -121,14 +121,22 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `friendlyNexusError` 把 `tombstoned_profile` / `unknown_profile` / `not_supported` / `missing_profile` 映射为人话 hint；`/profile <name>` 选到 tombstoned profile 时不再吐 raw JSON，而是显示"profile is tombstoned; restore via `bbl config profile restore <name>`"。
   - `formatRuntimeProfiles` 现在把 tombstones 列在独立 `tombstones (N):` 块下，按 name 字典序，带 `[tombstoned] deletedAt=<ts>` 标记。
   - 待补：profile 切换确认面板（带 y/n overlay）、错误态视觉回归 PTY smoke——留到 Phase 7 一并做。
+- [x] Phase 3：Input owner / overlay state machine 收口（2026-06-09 收口）。
+  - 引入 `inputMode`（`composing` / `permission` / `slashPick` / `helpOverlay`）+ `setMode` + `canEditInput()`。textinput 实例在 `newModel` 一次性创建，跨 mode 永不替换；in-progress draft 在 permission/help round-trip 后仍保留。
+  - `Update` 的 KeyMsg 路由按 mode 分发：permission mode 吞掉 a/r/n/esc 以外所有键；help mode 走 up/down/esc/enter/q；slashPick 留占位（完整 live filter 走 Phase 4）。
+  - `?`（空 input）开 help overlay；help 渲染单独 `helpOverlayLines`（含三种 mode 的键盘参考 + 当前已知 slash 命令清单）。
+  - `permission_request` 抵达时 `setMode(modePermission)`；`sendPermissionDecision` 完成后 `setMode(modeComposing)`。phase 3 单 input owner 守住了"permission 模式下 `?` 不会打开 help 覆盖"这一关键不变量。
+  - 14 个新单测守住：默认 composing、setMode 幂等、canEditInput 唯一性、permission 模式 key 不会污染 textinput、help overlay 开/关/esc、'q' 在 overlay 内不退出、textinput 跨 mode 实例不替换等。
+  - `test/go_tui_pty_driver.py` 新增 `phase3-overlay-mutex` 序列：help 开/关 → permission 触发 → permission 模式按 'z' 不污染 textinput → '?' 在 permission 模式被吞掉 → 'a' approve → `Bash done` + `done success=true`。
+  - 待补：真正交互式 slash palette（live filter 跟随输入）、toolPalette / historySearch / contextOverlay / inboxOverlay——`inputMode` 已为这些预留常量，下个 phase 继续。
 
-后续：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / Phase 3 稳定后才推进：
 
-- Phase 3 Input owner / overlay state machine。
-- Phase 4 slash/tool palette / model UX。
+- §5 路径 C 阶段 3 polish：profile 切换确认面板 + 错误态视觉回归 PTY smoke（已留到 Phase 7）。
+- Phase 4 slash/tool palette（包含真正 live filter slash palette）。
 - Phase 5 context/compact 长会话 UX。
 - Phase 6 Agent/Task/SessionChannel views。
-- Phase 7 Go TUI PTY/visual regression harness（建议补：加 `input` 行的 PTY smoke 守住权限面板 UX 改进不回归）。
+- Phase 7 Go TUI PTY/visual regression harness。
 - Phase 8 packaging/distribution。
 - Phase 9 promotion gate。
 

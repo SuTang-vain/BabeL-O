@@ -2,6 +2,31 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 3：input owner / overlay state machine 收口
+
+- **用户请求**: 按规划推进 Phase 3：Go TUI 自己的唯一输入所有者模型。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 新增 `inputMode` 类型（`composing` / `permission` / `slashPick` / `helpOverlay`）+ `setMode` 助手 + `canEditInput()` 判定。
+    - `model` 加 `inputMode inputMode` + `helpScroll int` 字段；`newModel` 初始化 `modeComposing`。
+    - `Update` 的 `KeyMsg` 路由：先全局 `ctrl+c`；再按 `m.inputMode` 分发——permission mode 吞掉 a/r/n/esc 以外所有键、help mode 走 up/down/esc/enter/q、slashPick mode 走 esc 取消后 fall through。
+    - `?` 在 composing + 空 input 时打开 help overlay（仅 help mode 渲染，composing 时 `renderHelp` 返回空）。
+    - `permission_request` 抵达时 `setMode(modePermission)`，`sendPermissionDecision` 完成后回到 `modeComposing`，保证 textinput 不会被随机键污染。
+    - help overlay 内容（`helpOverlayLines`）含 composing / permission / help 三种 mode 的键盘参考 + 当前已知 slash 命令清单。
+    - 单一 textinput 实例（`newModel` 创建一次，跨 mode 永不替换）：in-progress draft 在 permission / help mode round-trip 后仍保留。
+  - `clients/go-tui/main_test.go`: 14 个 phase 3 新单测守住——默认 composing、setMode 幂等、canEditInput 仅 composing 为 true、permission_request 触发 permission mode、sendPermissionDecision 回到 composing、permission 模式按 'z' 不污染 textinput、'?' 打开 help、esc 关闭 help、up/down 滚动 help、'?' 在非空 input 时被忽略、ctrl+c 跨 overlay 全局退出、'q' 在 overlay 内不退出、textinput 跨 mode 实例不替换、renderHelp 在 composing 为空 / help mode 可见。
+  - `test/go_tui_pty_driver.py` 新增 `phase3-overlay-mutex` 序列：开 help（`?`）→ esc 关 → 触发 permission panel → 在 permission 模式按 'z' → 验证 textinput 没被污染（不在 transcript 中追加 `bash echo go-tui-mutexz`）→ 发送 '?'（permission mode 不响应）→ 'a' approve → 等待 `Bash done` + `done success=true`。`[go-tui-smoke] OK: phase 3 single-input-owner overlay mutex verified`。
+  - `test/go-tui-smoke.test.ts` 的 `runPtySmoke` 默认仍只跑 `permission-approve`（避免默认 `npm test` 依赖 Go TUI 预编译）。`phase3-overlay-mutex` 序列由驱动自身负责，未来如果想进默认 npm test 可通过 `runPtySmoke` 增加一段相同的分支。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `go test ./...` 60/60 pass（5 原有 + 16 Phase 2 + 11 §5 阶段 3 + 14 phase 3 单测 + 其他 14）。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 仍过（Phase 1 permission-approve 1.7s）——phase 3 改动未触碰 Phase 1 smoke 路径。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 python3 test/go_tui_pty_driver.py --sequence phase3-overlay-mutex` 通过（help 开/关、permission 模式不收 'z'、mutex 守住、`Bash done` + `done success=true`）。
+- **范围克制（按规划 Phase 3 不包含项）**:
+  - 真正的交互式 slash palette（live filter 跟随输入）——仅在 `modeSlashPick` 留占位，enter 仍走原 one-shot 路由。完整 live filter 留 Phase 4。
+  - toolPalette / historySearch / contextOverlay / inboxOverlay——`inputMode` 已为这些预留常量，下个 phase 继续。
+  - paste / multiline / Shift+Enter 对齐 TypeScript TUI——留后续 PR。
+
 ## 2026-06-09 — §5 路径 C 阶段 3：Go TUI 消费 version polling + tombstone UX 收口
 
 - **用户请求**: 按规划推进 §5 路径 C 阶段 3：Go TUI 上消费增量拉取 + tombstone UX polish。

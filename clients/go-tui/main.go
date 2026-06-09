@@ -144,12 +144,28 @@ type profileSelectMsg struct {
 // when m.configVersion > 0.
 type pollTickMsg struct{}
 
+// inputMode is the §5 / Phase 3 single-input-owner state machine.
+// Only one mode is active at a time; transitions are explicit and
+// always round-trip back to modeComposing when an overlay closes.
+type inputMode string
+
+const (
+	modeComposing   inputMode = "composing"   // textinput owns keys
+	modePermission  inputMode = "permission"  // a/y/r/n/esc only
+	modeSlashPick   inputMode = "slashPick"   // one-shot slash palette (no live filter yet)
+	modeHelpOverlay inputMode = "helpOverlay" // read-only help; up/down/esc/enter
+)
+
+func (m inputMode) canEditInput() bool { return m == modeComposing }
+
 type model struct {
 	cfg            config
 	input          textinput.Model
 	viewport       viewport.Model
 	spinner        spinner.Model
 	transcript     []transcriptLine
+	inputMode      inputMode
+	helpScroll     int
 	running        bool
 	events         <-chan streamEvent
 	decisions      chan<- permissionDecision
@@ -165,6 +181,13 @@ type model struct {
 	startedAt      time.Time
 	width          int
 	height         int
+}
+
+func (m *model) setMode(next inputMode) {
+	if m.inputMode == next {
+		return
+	}
+	m.inputMode = next
 }
 
 var (
@@ -223,10 +246,11 @@ func newModel(cfg config) model {
 	spin.Style = statusStyle
 
 	return model{
-		cfg:      cfg,
-		input:    input,
-		viewport: vp,
-		spinner:  spin,
+		cfg:       cfg,
+		input:     input,
+		viewport:  vp,
+		spinner:   spin,
+		inputMode: modeComposing,
 		transcript: []transcriptLine{
 			{kind: "status", text: "Go TUI MVP connected to the Nexus stream API."},
 			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
@@ -267,11 +291,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		key := msg.String()
-		if key == "ctrl+c" || (key == "q" && !m.running && strings.TrimSpace(m.input.Value()) == "") {
+
+		// `ctrl+c` is global: always quits, even from inside an overlay.
+		// `q` only quits when the input box is empty AND we're not in an
+		// overlay (so q inside permission / help doesn't quit by accident).
+		if key == "ctrl+c" || (key == "q" && m.inputMode == modeComposing && !m.running && strings.TrimSpace(m.input.Value()) == "") {
 			return m, tea.Quit
 		}
 
-		if m.pending != nil {
+		// Phase 3 single-input-owner: dispatch by current mode.
+		switch m.inputMode {
+		case modePermission:
 			switch strings.ToLower(key) {
 			case "a", "y":
 				m.sendPermissionDecision(true, "Approved from Go TUI MVP")
@@ -280,6 +310,47 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sendPermissionDecision(false, "Rejected from Go TUI MVP")
 				return m, nil
 			}
+			// While the permission panel is up, any other key is
+			// swallowed: textinput must NOT receive it, or it would
+			// insert characters into the input box under the panel.
+			return m, nil
+
+		case modeHelpOverlay:
+			switch key {
+			case "esc", "enter", "q":
+				m.appendLine("status", "help closed")
+				m.setMode(modeComposing)
+				return m, nil
+			case "up", "k":
+				if m.helpScroll > 0 {
+					m.helpScroll--
+				}
+				return m, nil
+			case "down", "j":
+				m.helpScroll++
+				return m, nil
+			}
+			return m, nil
+
+		case modeSlashPick:
+			// Phase 3 MVP: slash palette is one-shot — textinput keeps
+			// receiving keys, and `enter` already dispatches via the
+			// composing branch below. We only intercept esc to cancel
+			// and return to composing without running anything.
+			if key == "esc" {
+				m.input.SetValue("")
+				m.appendLine("status", "slash cancelled")
+				m.setMode(modeComposing)
+				return m, nil
+			}
+			// fall through to composing handling for typing + enter
+		}
+
+		// `?` toggles the help overlay. Only valid in composing.
+		if m.inputMode == modeComposing && key == "?" && strings.TrimSpace(m.input.Value()) == "" {
+			m.helpScroll = 0
+			m.setMode(modeHelpOverlay)
+			return m, nil
 		}
 
 		if key == "enter" {
@@ -290,6 +361,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.SetValue("")
 			if strings.HasPrefix(prompt, "/") {
 				cmd := m.handleLocalCommand(prompt)
+				m.setMode(modeComposing)
 				return m, cmd
 			}
 			m.appendLine("user", prompt)
@@ -409,13 +481,71 @@ func (m model) View() string {
 	permission := m.renderPermission(width)
 	input := m.renderInput(width)
 	footer := m.renderFooter(width)
+	help := m.renderHelp(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
 		parts = append(parts, permission)
 	}
+	if help != "" {
+		parts = append(parts, help)
+	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
+}
+
+var helpOverlayLines = []string{
+	"BabeL-O Go TUI · Local key reference",
+	"",
+	"Composing:",
+	"  enter            submit the current prompt",
+	"  /                (followed by command) open slash palette (one-shot)",
+	"  ?  (empty input) toggle this help overlay",
+	"  ctrl+c / q       quit when input is empty",
+	"",
+	"Permission panel:",
+	"  a / y            approve",
+	"  r / n / esc      reject",
+	"  (other keys)     swallowed; textinput never sees them",
+	"",
+	"Help overlay:",
+	"  up / k           scroll up",
+	"  down / j         scroll down",
+	"  esc / enter / q  close overlay and return to composing",
+	"",
+	"Local slash commands (run after the leading / and enter):",
+	"  /config          refresh shared Nexus config + profile state",
+	"  /profile [name]  list profiles, or select a profile",
+	"",
+	"Press esc / enter / q to close.",
+}
+
+func (m model) renderHelp(width int) string {
+	if m.inputMode != modeHelpOverlay {
+		return ""
+	}
+	header := titleStyle.Render("Help · Phase 3 overlay")
+	lines := []string{header, divider(width)}
+	// Clamp helpScroll so the user can't scroll past the end.
+	visibleRows := max(0, m.height-12)
+	maxScroll := max(0, len(helpOverlayLines)-visibleRows)
+	if m.helpScroll > maxScroll {
+		// Don't mutate model in a View path; clamp locally for the
+		// rendered slice. The next key event will reconcile m.helpScroll.
+		clamped := maxScroll
+		end := clamped + visibleRows
+		if end > len(helpOverlayLines) {
+			end = len(helpOverlayLines)
+		}
+		lines = append(lines, helpOverlayLines[clamped:end]...)
+	} else {
+		end := m.helpScroll + visibleRows
+		if end > len(helpOverlayLines) {
+			end = len(helpOverlayLines)
+		}
+		lines = append(lines, helpOverlayLines[m.helpScroll:end]...)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m model) renderHeader(width int) string {
@@ -563,6 +693,9 @@ func (m *model) sendPermissionDecision(approved bool, reason string) {
 	}
 	m.pending = nil
 	m.resize()
+	// Phase 3: clear the permission input mode so the textinput
+	// resumes ownership of subsequent keys.
+	m.setMode(modeComposing)
 }
 
 func (m *model) consumeNexusEvent(event map[string]any) {
@@ -583,6 +716,9 @@ func (m *model) consumeNexusEvent(event map[string]any) {
 		}
 		m.resize()
 		m.appendLine("permission", formatNexusEvent(event))
+		// Phase 3: enter the dedicated input mode so the textinput
+		// stops receiving keys while the panel is up.
+		m.setMode(modePermission)
 	case "result", "error":
 		m.appendLine(eventType, formatNexusEvent(event))
 		m.running = false
