@@ -127,6 +127,11 @@ test('Go TUI smoke: §5 path C phase 3 polish profile y/n overlay', { skip: skip
   assert.match(output, /profile y\/n overlay verified/)
 })
 
+test('Go TUI smoke: phase 5 /context + /compact wire to Nexus', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('context-and-compact')
+  assert.match(output, /phase 5 \/context and \/compact wire to Nexus verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
@@ -144,6 +149,7 @@ test('Go TUI smoke: phase 7 orchestrator runs all sequences end-to-end', { skip:
     'slash-palette-prefix',
     'tool-palette',
     'profile-confirm',
+    'context-and-compact',
     'phase3-overlay-mutex',
     'permission-approve',
   ]) {

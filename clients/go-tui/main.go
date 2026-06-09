@@ -139,6 +139,27 @@ type profileSelectMsg struct {
 	err     error
 }
 
+// contextAnalysisMsg is the response from
+// GET /v1/sessions/:sessionId/context. The Go TUI only reads the
+// stable top-level diagnostic envelope (summary / status / signals /
+// recommendations); the rest of the payload is opaque and stays in
+// the raw json for any future richer renderer.
+type contextAnalysisMsg struct {
+	sessionID string
+	raw       []byte
+	err       error
+}
+
+// compactResultMsg is the response from
+// POST /v1/sessions/:sessionId/compact. The Go TUI prints
+// beforeEventCount → afterEventCount + the boundary event type /
+// code, so we keep the raw bytes for any future richer renderer.
+type compactResultMsg struct {
+	sessionID string
+	raw       []byte
+	err       error
+}
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -294,18 +315,26 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/context",
-		summary: "show context window usage (TODO: wire to Nexus /v1/runtime/metrics)",
+		summary: "analyze current context window usage via Nexus",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/context not yet implemented in Go TUI MVP")
-			return nil
+			if m.sessionID == "" {
+				m.appendLine("status", "context: no active session yet — submit a prompt first")
+				return nil
+			}
+			m.appendLine("status", "analyzing shared Nexus context: "+shortID(m.sessionID))
+			return fetchContextAnalysis(m.cfg, m.sessionID)
 		},
 	},
 	{
 		name:    "/compact",
-		summary: "trigger context compaction (TODO: wire to Nexus compact endpoint)",
+		summary: "trigger context compaction on the active session",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/compact not yet implemented in Go TUI MVP")
-			return nil
+			if m.sessionID == "" {
+				m.appendLine("status", "compact: no active session yet — submit a prompt first")
+				return nil
+			}
+			m.appendLine("status", "compacting shared Nexus context: "+shortID(m.sessionID))
+			return triggerCompact(m.cfg, m.sessionID)
 		},
 	},
 	{
@@ -836,6 +865,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyRuntimeConfig(msg.config)
 		m.appendLine("status", "profile switched: "+firstNonEmpty(msg.config.ActiveProfile, msg.profile))
 		return m, fetchRuntimeProfiles(m.cfg)
+
+	case contextAnalysisMsg:
+		if msg.err != nil {
+			m.appendLine("error", "context: "+msg.err.Error())
+			return m, nil
+		}
+		m.appendLine("status", formatContextAnalysis(msg.raw))
+		return m, nil
+
+	case compactResultMsg:
+		if msg.err != nil {
+			m.appendLine("error", "compact: "+msg.err.Error())
+			return m, nil
+		}
+		m.appendLine("status", formatCompactResult(msg.raw))
+		return m, nil
 
 	case pollTickMsg:
 		// Background poll. If we've never fetched a config, defer to the
@@ -1628,6 +1673,25 @@ func selectRuntimeProfile(cfg config, profile string) tea.Cmd {
 	}
 }
 
+func fetchContextAnalysis(cfg config, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/context", nil)
+		return contextAnalysisMsg{sessionID: sessionID, raw: raw, err: err}
+	}
+}
+
+func triggerCompact(cfg config, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodPost,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/compact",
+			map[string]string{"trigger": "manual"},
+		)
+		return compactResultMsg{sessionID: sessionID, raw: raw, err: err}
+	}
+}
+
 func nexusJSON(cfg config, method string, path string, body any, out any, query ...url.Values) error {
 	endpoint, err := apiURL(cfg.baseURL, path)
 	if err != nil {
@@ -1681,6 +1745,53 @@ func nexusJSON(cfg config, method string, path string, body any, out any, query 
 		return fmt.Errorf("decode %s: %w", path, err)
 	}
 	return nil
+}
+
+// nexusRawJSON is the raw-bytes sibling of nexusJSON: same request
+// shape and error semantics, but the response body is returned
+// untouched so the caller can lazily decode only the fields it
+// needs (and ignore schema churn on the rest of the payload).
+func nexusRawJSON(cfg config, method string, path string, body any, query ...url.Values) ([]byte, error) {
+	endpoint, err := apiURL(cfg.baseURL, path)
+	if err != nil {
+		return nil, err
+	}
+	if len(query) > 0 && len(query[0]) > 0 {
+		endpoint = endpoint + "?" + query[0].Encode()
+	}
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, endpoint, reader)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if cfg.apiKey != "" {
+		req.Header.Set("X-Nexus-API-Key", cfg.apiKey)
+	}
+	client := http.Client{Timeout: 10 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, err
+	}
+	if res.StatusCode < 200 || res.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s %s failed: %s %s", method, path, res.Status, summarizeHTTPError(data))
+	}
+	return data, nil
 }
 
 // errNotModified is returned by nexusJSON when the server replies
@@ -1792,6 +1903,128 @@ func formatRuntimeProfiles(response runtimeProfilesResponse) string {
 			t := response.Tombstones[name]
 			lines = append(lines, fmt.Sprintf("  %s [tombstoned] deletedAt=%s", name, firstNonEmpty(t.DeletedAt, "?")))
 		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// contextAnalysisDiagnostic mirrors the stable top-level envelope
+// from analyzeContext. The Go TUI only renders these fields — the
+// rest of the payload is opaque by design.
+type contextAnalysisDiagnostic struct {
+	Name            string            `json:"name"`
+	Status          string            `json:"status"`
+	Summary         string            `json:"summary"`
+	Signals         []contextSignal   `json:"signals"`
+	Recommendations []string          `json:"recommendations"`
+}
+
+type contextSignal struct {
+	Level   string `json:"level"`
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+// formatContextAnalysis turns the raw /v1/sessions/:id/context
+// payload into a compact transcript block. The Go TUI keeps this
+// small by design: full diagnostics are 200+ lines on a busy
+// session, so we surface the summary + status + top 3 signals +
+// top 3 recommendations and leave the rest to a future richer
+// renderer (e.g. a contextOverlay).
+func formatContextAnalysis(raw []byte) string {
+	var top struct {
+		Type           string                     `json:"type"`
+		SessionID      string                     `json:"sessionId"`
+		ModelID        string                     `json:"modelId"`
+		Diagnostic     contextAnalysisDiagnostic  `json:"diagnostic"`
+		CompactHasBnd  bool                       `json:"-"` // see below
+	}
+	// We decode the compact.hasBoundary separately because it lives
+	// under payload.compact.hasBoundary, not at the top level.
+	var compactBlock struct {
+		Compact struct {
+			HasBoundary bool `json:"hasBoundary"`
+		} `json:"compact"`
+	}
+	if err := json.Unmarshal(raw, &top); err != nil {
+		return fmt.Sprintf("context: decode failed: %v", err)
+	}
+	if err := json.Unmarshal(raw, &compactBlock); err != nil {
+		return fmt.Sprintf("context: decode failed: %v", err)
+	}
+	lines := []string{}
+	headerLabel := "context_analysis"
+	if model := strings.TrimSpace(top.ModelID); model != "" {
+		headerLabel = fmt.Sprintf("context_analysis model=%s", model)
+	}
+	lines = append(lines, headerLabel)
+	if s := strings.TrimSpace(top.Diagnostic.Summary); s != "" {
+		lines = append(lines, "  "+s)
+	}
+	if status := strings.TrimSpace(top.Diagnostic.Status); status != "" {
+		lines = append(lines, fmt.Sprintf("  status: %s", status))
+	}
+	if compactBlock.Compact.HasBoundary {
+		lines = append(lines, "  compact: boundary present (post-compact state retained)")
+	}
+	if signals := top.Diagnostic.Signals; len(signals) > 0 {
+		lines = append(lines, "  signals:")
+		limit := len(signals)
+		if limit > 3 {
+			limit = 3
+		}
+		for _, sig := range signals[:limit] {
+			level := strings.TrimSpace(sig.Level)
+			if level == "" {
+				level = "info"
+			}
+			lines = append(lines, fmt.Sprintf("    [%s] %s %s",
+				level, strings.TrimSpace(sig.Code), strings.TrimSpace(sig.Message)))
+		}
+		if len(signals) > 3 {
+			lines = append(lines, fmt.Sprintf("    ... +%d more", len(signals)-3))
+		}
+	}
+	if recs := top.Diagnostic.Recommendations; len(recs) > 0 {
+		lines = append(lines, "  recommendations:")
+		limit := len(recs)
+		if limit > 3 {
+			limit = 3
+		}
+		for _, rec := range recs[:limit] {
+			lines = append(lines, "    - "+strings.TrimSpace(rec))
+		}
+		if len(recs) > 3 {
+			lines = append(lines, fmt.Sprintf("    ... +%d more", len(recs)-3))
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
+// formatCompactResult turns the raw /v1/sessions/:id/compact
+// payload into 1-2 transcript lines. The Go TUI keeps this short:
+// the most actionable numbers are beforeEventCount → afterEventCount.
+func formatCompactResult(raw []byte) string {
+	var payload struct {
+		Type             string `json:"type"`
+		BeforeEventCount int    `json:"beforeEventCount"`
+		AfterEventCount  int    `json:"afterEventCount"`
+		Event            struct {
+			Type string `json:"type"`
+			Code string `json:"code"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return fmt.Sprintf("compact: decode failed: %v", err)
+	}
+	lines := []string{
+		fmt.Sprintf("compact_result events: %d → %d", payload.BeforeEventCount, payload.AfterEventCount),
+	}
+	if payload.Event.Type != "" {
+		codePart := ""
+		if payload.Event.Code != "" {
+			codePart = " " + payload.Event.Code
+		}
+		lines = append(lines, "  boundary: "+payload.Event.Type+codePart)
 	}
 	return strings.Join(lines, "\n")
 }

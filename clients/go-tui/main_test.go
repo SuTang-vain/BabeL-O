@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1379,5 +1380,218 @@ func TestProfileConfirmWithEmptyActiveShowsNoCurrent(t *testing.T) {
 	rendered := m.renderProfileConfirm(120)
 	if !strings.Contains(rendered, "→ Switch active profile to: prod") {
 		t.Fatalf("empty activeProfile should render the single-line variant, got %q", rendered)
+	}
+}
+
+// --- Phase 5: /context + /compact wire to real Nexus endpoints ---
+
+func TestContextWithEmptySessionShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	before := len(m.transcript)
+	cmd := m.handleLocalCommand("/context")
+	if cmd != nil {
+		t.Fatalf("/context with no session should return nil (no HTTP call)")
+	}
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeComposing)
+	}
+	rendered := renderTranscript(m.transcript[before:], 200)
+	if !strings.Contains(rendered, "context: no active session yet") {
+		t.Fatalf("transcript should mention 'context: no active session yet', got %q", rendered)
+	}
+}
+
+func TestCompactWithEmptySessionShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	before := len(m.transcript)
+	cmd := m.handleLocalCommand("/compact")
+	if cmd != nil {
+		t.Fatalf("/compact with no session should return nil (no HTTP call)")
+	}
+	rendered := renderTranscript(m.transcript[before:], 200)
+	if !strings.Contains(rendered, "compact: no active session yet") {
+		t.Fatalf("transcript should mention 'compact: no active session yet', got %q", rendered)
+	}
+}
+
+func TestContextWithActiveSessionFiresHTTP(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "session_phase5_test"
+	before := len(m.transcript)
+	cmd := m.handleLocalCommand("/context")
+	if cmd == nil {
+		t.Fatalf("/context with active session should fire an HTTP command")
+	}
+	rendered := renderTranscript(m.transcript[before:], 200)
+	if !strings.Contains(rendered, "analyzing shared Nexus context") {
+		t.Fatalf("transcript should mention 'analyzing shared Nexus context', got %q", rendered)
+	}
+}
+
+func TestCompactWithActiveSessionFiresHTTP(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "session_phase5_test"
+	before := len(m.transcript)
+	cmd := m.handleLocalCommand("/compact")
+	if cmd == nil {
+		t.Fatalf("/compact with active session should fire an HTTP command")
+	}
+	rendered := renderTranscript(m.transcript[before:], 200)
+	if !strings.Contains(rendered, "compacting shared Nexus context") {
+		t.Fatalf("transcript should mention 'compacting shared Nexus context', got %q", rendered)
+	}
+}
+
+func TestFormatContextAnalysisExtractsTopLevelEnvelope(t *testing.T) {
+	raw := []byte(`{
+		"type": "context_analysis",
+		"sessionId": "session_abc",
+		"modelId": "local/coding-runtime",
+		"compact": {"hasBoundary": true},
+		"diagnostic": {
+			"name": "context_analysis",
+			"status": "warning",
+			"summary": "context 6500/8192 tokens; 1692 remaining",
+			"signals": [
+				{"level": "warning", "code": "WARN_LARGE_TOOL_RESULT", "message": "Bash output exceeded 4k chars"},
+				{"level": "warning", "code": "WARN_MEMORY_PRESSURE", "message": "long-term memory truncated"},
+				{"level": "info", "code": "INFO_REPEATED_TOOL_INPUT", "message": "Grep called 5x with same pattern"}
+			],
+			"recommendations": [
+				"Run /compact to reclaim space",
+				"Switch to a larger context model",
+				"Reduce tool output before retrying"
+			]
+		}
+	}`)
+	got := formatContextAnalysis(raw)
+	for _, want := range []string{
+		"context_analysis model=local/coding-runtime",
+		"context 6500/8192 tokens; 1692 remaining",
+		"status: warning",
+		"compact: boundary present",
+		"[warning] WARN_LARGE_TOOL_RESULT Bash output exceeded 4k chars",
+		"[info] INFO_REPEATED_TOOL_INPUT Grep called 5x with same pattern",
+		"- Run /compact to reclaim space",
+		"- Switch to a larger context model",
+		"- Reduce tool output before retrying",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatContextAnalysis missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatContextAnalysisTruncatesLongSignalsAndRecommendations(t *testing.T) {
+	signals := make([]string, 0, 6)
+	for i := 0; i < 6; i++ {
+		signals = append(signals, fmt.Sprintf(`{"level":"info","code":"S%d","message":"m%d"}`, i, i))
+	}
+	recs := make([]string, 0, 5)
+	for i := 0; i < 5; i++ {
+		recs = append(recs, fmt.Sprintf(`"rec %d"`, i))
+	}
+	raw := []byte(`{
+		"type": "context_analysis",
+		"modelId": "local/coding-runtime",
+		"compact": {"hasBoundary": false},
+		"diagnostic": {
+			"name": "context_analysis",
+			"status": "ok",
+			"summary": "context 0/8192 tokens; 8192 remaining",
+			"signals": [` + strings.Join(signals, ",") + `],
+			"recommendations": [` + strings.Join(recs, ",") + `]
+		}
+	}`)
+	got := formatContextAnalysis(raw)
+	if !strings.Contains(got, "S0") || !strings.Contains(got, "S2") {
+		t.Fatalf("first 3 signals should appear, got:\n%s", got)
+	}
+	if strings.Contains(got, "S5") {
+		t.Fatalf("S5 (4th signal) should be truncated, got:\n%s", got)
+	}
+	if !strings.Contains(got, "+3 more") {
+		t.Fatalf("expected '+3 more' for signals truncation, got:\n%s", got)
+	}
+	if !strings.Contains(got, "rec 0") || strings.Contains(got, "rec 4") {
+		t.Fatalf("first 3 recommendations should appear, rec 4 should be truncated, got:\n%s", got)
+	}
+	if !strings.Contains(got, "+2 more") {
+		t.Fatalf("expected '+2 more' for recommendations truncation, got:\n%s", got)
+	}
+}
+
+func TestFormatContextAnalysisReportsDecodeErrorOnInvalidJSON(t *testing.T) {
+	got := formatContextAnalysis([]byte(`{not json`))
+	if !strings.Contains(got, "context: decode failed") {
+		t.Fatalf("formatContextAnalysis should report decode error, got %q", got)
+	}
+}
+
+func TestFormatCompactResultExtractsEventCounts(t *testing.T) {
+	raw := []byte(`{
+		"type": "compact_result",
+		"sessionId": "session_abc",
+		"beforeEventCount": 47,
+		"afterEventCount": 12,
+		"event": {"type": "compact_boundary", "code": ""}
+	}`)
+	got := formatCompactResult(raw)
+	for _, want := range []string{
+		"compact_result events: 47 → 12",
+		"boundary: compact_boundary",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatCompactResult missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatCompactResultIncludesCodeWhenPresent(t *testing.T) {
+	raw := []byte(`{
+		"type": "compact_result",
+		"sessionId": "session_abc",
+		"beforeEventCount": 3,
+		"afterEventCount": 1,
+		"event": {"type": "compact_boundary", "code": "RETAINED_TAIL"}
+	}`)
+	got := formatCompactResult(raw)
+	if !strings.Contains(got, "boundary: compact_boundary RETAINED_TAIL") {
+		t.Fatalf("formatCompactResult should include boundary code, got %q", got)
+	}
+}
+
+func TestFormatCompactResultReportsDecodeErrorOnInvalidJSON(t *testing.T) {
+	got := formatCompactResult([]byte(`{not json`))
+	if !strings.Contains(got, "compact: decode failed") {
+		t.Fatalf("formatCompactResult should report decode error, got %q", got)
+	}
+}
+
+func TestContextAnalysisMsgErrorAppendsFriendlyLine(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	before := len(m.transcript)
+	updated, _ := m.Update(contextAnalysisMsg{err: fmt.Errorf("upstream 503")})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	rendered := renderTranscript(updatedModel.transcript[before:], 200)
+	if !strings.Contains(rendered, "context: upstream 503") {
+		t.Fatalf("transcript should mention 'context: upstream 503', got %q", rendered)
+	}
+}
+
+func TestCompactResultMsgErrorAppendsFriendlyLine(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	before := len(m.transcript)
+	updated, _ := m.Update(compactResultMsg{err: fmt.Errorf("session not found")})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	rendered := renderTranscript(updatedModel.transcript[before:], 200)
+	if !strings.Contains(rendered, "compact: session not found") {
+		t.Fatalf("transcript should mention 'compact: session not found', got %q", rendered)
 	}
 }

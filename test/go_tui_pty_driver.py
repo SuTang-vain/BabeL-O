@@ -504,6 +504,75 @@ def run_visual_regression_narrow_sequence(
     return True
 
 
+def run_context_and_compact_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 5: /context and /compact wired to real Nexus endpoints.
+
+    Sequence:
+      1. Send a bash prompt so the WebSocket stream starts and
+         session_started populates m.sessionID.
+      2. Approve the permission and wait for the tool to finish.
+      3. /context  -> expect "analyzing shared Nexus context" + the
+         context_analysis envelope header (summary / status / signals /
+         recommendations).
+      4. /compact  -> expect "compacting shared Nexus context" + the
+         compact_result events: N → M line.
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    send(master_fd, "bash echo phase5-context")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] context/compact setup: permission panel did not appear",
+        )
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] context/compact setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] context/compact setup: stream did not close cleanly",
+        )
+
+    # Step 3: /context.
+    send(master_fd, "/context")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "analyzing shared Nexus context", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /context did not surface the 'analyzing' status line",
+        )
+    if not wait_for(master_fd, "context_analysis", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /context did not render the context_analysis envelope",
+        )
+
+    # Step 4: /compact.
+    send(master_fd, "/compact")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "compacting shared Nexus context", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /compact did not surface the 'compacting' status line",
+        )
+    if not wait_for(master_fd, "compact_result events:", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /compact did not render the compact_result line",
+        )
+    return True
+
+
 def run_profile_confirm_sequence(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -630,6 +699,7 @@ def run_all_sequences(
         "slash-palette-prefix",
         "tool-palette",
         "profile-confirm",
+        "context-and-compact",
         "phase3-overlay-mutex",
         "permission-approve",
     ]
@@ -725,6 +795,13 @@ SEQUENCES: dict[str, dict] = {
     "profile-confirm": {
         "runner": run_profile_confirm_sequence,
         "ok_message": "§5 path C phase 3 polish profile y/n overlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "context-and-compact": {
+        "runner": run_context_and_compact_sequence,
+        "ok_message": "phase 5 /context and /compact wire to Nexus verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

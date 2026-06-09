@@ -169,6 +169,18 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
     - `tombstone-rejection` 序列跟随新行为：先等 confirm overlay 出现，按 `y` 后再等 `unknown profile "ghost"`。
   - `test/go-tui-smoke.test.ts`: 加 `profile-confirm` 测试 + `all` orchestrator 顺序同步。
   - 范围克制：profile 切换确认面板现在覆盖 y / n / esc / 留空重选四路径；tombstone / unknown profile 的 friendly 错误路径走同 `friendlyNexusError` 映射不变；后续若要扩展（如切换前展示 provider/model diff）留到 Phase 5/6 wire 真实 model metadata 时一并做。
+- [x] Phase 5：context/compact 长会话 UX 收口（2026-06-09 收口）。
+  - `clients/go-tui/main.go`:
+    - 替换 `/context` `/compact` 的 status-line TODO：现在两者都先检查 `m.sessionID`，无 session 时直接出 `"context: no active session yet — submit a prompt first"` / `"compact: no active session yet — submit a prompt first"` 状态行 + 不发 HTTP；有 session 时 `appendLine "analyzing shared Nexus context: <shortID>"` / `"compacting shared Nexus context: <shortID>"` + 发 HTTP。
+    - 新增 `contextAnalysisMsg` / `compactResultMsg` 类型（都带 `sessionID` + `raw []byte` + `err`），Update KeyMsg dispatch 加两个 case：err 路径 appendLine `"context: <err>"` / `"compact: <err>"`；成功路径 push `formatContextAnalysis(msg.raw)` / `formatCompactResult(msg.raw)`。
+    - 新增 `fetchContextAnalysis(cfg, sessionID) tea.Cmd` 调 `GET /v1/sessions/<id>/context`；`triggerCompact(cfg, sessionID) tea.Cmd` 调 `POST /v1/sessions/<id>/compact` 带 `{"trigger":"manual"}`。
+    - 新增 `nexusRawJSON` helper：与 `nexusJSON` 同请求 / 错误语义但返回 raw 字节，让 Go TUI 只 decode 关心的 stable envelope 字段、不被 upstream schema churn 击穿。
+    - 新增 `contextAnalysisDiagnostic` / `contextSignal` 类型 + `formatContextAnalysis(raw []byte) string`：渲染 `context_analysis model=<id>` + `summary`（如 `context 6500/8192 tokens; 1692 remaining`）+ `status: <status>` + `compact: boundary present`（当 `compact.hasBoundary == true`）+ top 3 signals（含 `+N more` 截断标记）+ top 3 recommendations（含 `+N more`）。
+    - 新增 `formatCompactResult(raw []byte) string`：渲染 `compact_result events: <before> → <after>` + `boundary: <type> <code>` 行；raw decode 失败时输出 `compact: decode failed: <err>`。
+  - `clients/go-tui/main_test.go`: 12 个新单测——`TestContextWithEmptySessionShortCircuits` / `TestCompactWithEmptySessionShortCircuits` / `TestContextWithActiveSessionFiresHTTP` / `TestCompactWithActiveSessionFiresHTTP` / `TestFormatContextAnalysisExtractsTopLevelEnvelope` / `TestFormatContextAnalysisTruncatesLongSignalsAndRecommendations` / `TestFormatContextAnalysisReportsDecodeErrorOnInvalidJSON` / `TestFormatCompactResultExtractsEventCounts` / `TestFormatCompactResultIncludesCodeWhenPresent` / `TestFormatCompactResultReportsDecodeErrorOnInvalidJSON` / `TestContextAnalysisMsgErrorAppendsFriendlyLine` / `TestCompactResultMsgErrorAppendsFriendlyLine`。
+  - `test/go_tui_pty_driver.py`: 新 `run_context_and_compact_sequence`——bash echo 让 `session_started` 事件填好 `m.sessionID`、approve permission、等 `Bash done` + `done success=true`，然后 `/context` 等 `analyzing shared Nexus context` + `context_analysis` envelope header，再 `/compact` 等 `compacting shared Nexus context` + `compact_result events:` 行。加进 `SEQUENCES` registry；`all` orchestrator 顺序里插在 `profile-confirm` 与 `phase3-overlay-mutex` 之间。
+  - `test/go-tui-smoke.test.ts`: 加 `context-and-compact` 测试 + `all` orchestrator 顺序同步。
+  - 范围克制：`/context` 只渲染 stable top-level envelope（summary / status / signals / recommendations），不做 full 200+ 行的 `contextView` 渲染（那需要 `contextOverlay inputMode` 常量 + viewport，留 Phase 6 Agent views 之后）；`/compact` 只展示 before/after event counts + boundary event type/code，不展开 compact 后状态重建细节（同 Phase 6 之后）。`/inbox` `/models` `/sessions` `/agents` 仍 status 行 TODO（Phase 6）。
 - [x] Phase 8 packaging/distribution early slice：`bbl go` managed Nexus launcher 收口（2026-06-09 收口）。
   - `bbl go` 先构建 Go TUI launch spec，避免 Go TUI binary/source 不存在时误启动 Nexus；随后探活 `GET /health`。
   - localhost / `ws://localhost` URL 不健康时自动启动 `__server` 子进程，并继承 `process.execArgv`，确保开发态 `node --import tsx src/cli/program.ts go` 也能正确拉起 TypeScript server。
@@ -176,9 +188,9 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `--no-start-nexus` 只连接不启动；远程 URL 不健康时报错，不尝试本地拉起；Go TUI 退出时只关闭本次 wrapper 自己拉起的 child，不影响用户已有 Nexus。
   - `--poll-interval-ms` 已由 wrapper 透传给 Go TUI。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 7 / Phase 8 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 7 / Phase 8 稳定后才推进：
 
-- Phase 5 context/compact 长会话 UX。
+- Phase 5 context/compact 长会话 UX 续：`/context` full `contextView` 渲染（signals / recommendations / per-section 详表、long-term memory diagnostics、cache economics）+ `contextOverlay inputMode` 留 Phase 6 之后。`/compact` post-compact 状态重建详情、retained segment / recovery boundary diagnostics 留同 phase。
 - Phase 6 Agent/Task/SessionChannel views。
 - Go TUI tool palette `/v1/tools/audit` 真实 wire（Phase 4 静态目录的下一阶段）。
 - Phase 8 packaging/distribution 剩余项：预编译 binary 发布、版本兼容矩阵、安装包策略。
