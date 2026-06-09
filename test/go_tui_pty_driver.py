@@ -795,6 +795,117 @@ def run_help_overlay_sequence(
     return True
 
 
+def run_inbox_overlay_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 6 PR1: SessionChannel inbox overlay wired to the real
+    /v1/sessions/:id/inbox Nexus HTTP endpoint.
+
+    Sequence:
+      1. Bash round-trip to populate m.sessionID (mirrors the
+         context-overlay / context-and-compact setup pattern).
+      2. /inbox  -> "loading shared Nexus inbox (unread)" status,
+         "inbox: 0 message(s)" transcript breadcrumb, and the
+         "Inbox · Phase 6 overlay" header.
+      3. The seeded local Nexus has no inbox messages, so the
+         overlay should render the "No unread inbox messages."
+         placeholder. We assert on that, then close.
+      4. Press down to ensure selection navigation does not crash
+         on an empty list.
+      5. Esc closes the overlay ("inbox closed" status).
+      6. /inbox all -> the banner should switch to
+         "Inbox · all · Phase 6 overlay" and the placeholder to
+         "No inbox messages.".
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    send(master_fd, "bash echo phase6-inbox")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox overlay setup: permission panel did not appear",
+        )
+    # Phase 3: give the bubble tea loop one tick so the next key
+    # is routed to modePermission instead of the textinput.
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox overlay setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox overlay setup: stream did not close cleanly",
+        )
+
+    # Step 3: /inbox.
+    send(master_fd, "/inbox")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "loading shared Nexus inbox (unread)", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox did not surface the 'loading' status line",
+        )
+    # The overlay header is the primary UX assertion (the transcript
+    # breadcrumb is harder to catch in cooked-mode PTY buffers).
+    if not wait_for(master_fd, "Inbox · Phase 6 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox did not render the inboxOverlay header",
+        )
+    # The seeded Nexus has no messages, so the overlay should show
+    # the "No unread inbox messages." placeholder.
+    if not wait_for(master_fd, "No unread inbox messages.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox did not render the empty-unread placeholder",
+        )
+
+    # Step 4: down arrow on an empty list must not crash.
+    send(master_fd, "\x1b[B")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+
+    # Step 5: close the overlay.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "inbox closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox overlay did not close on Esc",
+        )
+
+    # Step 6: /inbox all — the banner must switch and the
+    # placeholder must drop the "unread" qualifier.
+    send(master_fd, "/inbox all")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Inbox · all · Phase 6 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox all did not switch the overlay banner",
+        )
+    if not wait_for(master_fd, "No inbox messages.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox all did not render the empty-all placeholder",
+        )
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "inbox closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /inbox all overlay did not close on Esc",
+        )
+
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -941,6 +1052,13 @@ SEQUENCES: dict[str, dict] = {
     "context-overlay": {
         "runner": run_context_overlay_sequence,
         "ok_message": "phase 5 续 /context full contextOverlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "inbox-overlay": {
+        "runner": run_inbox_overlay_sequence,
+        "ok_message": "phase 6 inbox overlay + footer unread indicator verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

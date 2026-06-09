@@ -160,6 +160,146 @@ type compactResultMsg struct {
 	err       error
 }
 
+// sessionChannelKind mirrors the SessionChannelKind union from
+// src/shared/sessionChannel.ts. The Go TUI only renders a small
+// fixed set in the inbox footer / event cards; unknown values
+// fall through to "unknown" so a server-side addition can't
+// crash the client.
+type sessionChannelKind string
+
+const (
+	channelKindDirect       sessionChannelKind = "direct"
+	channelKindGroup        sessionChannelKind = "group"
+	channelKindParentChild  sessionChannelKind = "parent_child"
+	channelKindWorkspacePair sessionChannelKind = "workspace_pair"
+	channelKindProjectBridge sessionChannelKind = "project_bridge"
+)
+
+type sessionMessageType string
+
+const (
+	messageTypeQuestion          sessionMessageType = "question"
+	messageTypeAnswer            sessionMessageType = "answer"
+	messageTypeFinding           sessionMessageType = "finding"
+	messageTypeRequestReview     sessionMessageType = "request_review"
+	messageTypeRequestValidation sessionMessageType = "request_validation"
+	messageTypeHypothesis        sessionMessageType = "hypothesis"
+	messageTypeDecision          sessionMessageType = "decision"
+	messageTypeBlocked           sessionMessageType = "blocked"
+	messageTypeMemoryCandidate   sessionMessageType = "memory_candidate"
+	messageTypeHandoff           sessionMessageType = "handoff"
+)
+
+type sessionMessagePriority string
+
+const (
+	priorityLow    sessionMessagePriority = "low"
+	priorityNormal sessionMessagePriority = "normal"
+	priorityHigh   sessionMessagePriority = "high"
+)
+
+type sessionMessageStatus string
+
+const (
+	messageStatusQueued       sessionMessageStatus = "queued"
+	messageStatusDelivered    sessionMessageStatus = "delivered"
+	messageStatusAcknowledged sessionMessageStatus = "acknowledged"
+	messageStatusExpired      sessionMessageStatus = "expired"
+)
+
+type sessionChannelStatus string
+
+const (
+	channelStatusOpen     sessionChannelStatus = "open"
+	channelStatusClosed   sessionChannelStatus = "closed"
+	channelStatusArchived sessionChannelStatus = "archived"
+)
+
+// evidenceRef mirrors the EvidenceRef in src/shared/sessionChannel.ts.
+// It is rendered as a compact "type:ref (label)" list on inbox
+// overlay rows and event cards.
+type evidenceRef struct {
+	Type  string `json:"type"`
+	Ref   string `json:"ref"`
+	Label string `json:"label"`
+}
+
+// sessionChannel is the read-only summary view of a SessionChannel
+// used by the inbox footer and overlay. The Go TUI does not mutate
+// channels; it only reads kind / participantSessionIds / status for
+// display purposes.
+type sessionChannel struct {
+	ChannelID            string             `json:"channelId"`
+	Kind                 sessionChannelKind `json:"kind"`
+	ParticipantSessionIDs []string          `json:"participantSessionIds"`
+	CreatedBySessionID   string             `json:"createdBySessionId"`
+	CreatedAt            string             `json:"createdAt"`
+	Status               sessionChannelStatus `json:"status"`
+}
+
+// sessionMessage is the read-only view of a SessionMessage used by
+// the inbox overlay, footer status and key event card. Only the
+// fields the Go TUI displays are surfaced as struct tags; the raw
+// payload is preserved for any future richer renderer (mirroring
+// the contextAnalysisMsg / compactResultMsg pattern). Metadata is
+// kept as a generic map so optional governance blobs
+// (memoryCandidateGovernance) survive the typed decode without
+// forcing the struct to track every new server-side field.
+type sessionMessage struct {
+	MessageID      string                 `json:"messageId"`
+	ChannelID      string                 `json:"channelId"`
+	FromSessionID  string                 `json:"fromSessionId"`
+	ToSessionID    string                 `json:"toSessionId"`
+	Broadcast      bool                   `json:"broadcast"`
+	Type           sessionMessageType     `json:"type"`
+	Content        string                 `json:"content"`
+	Evidence       []evidenceRef          `json:"evidence"`
+	Priority       sessionMessagePriority `json:"priority"`
+	CreatedAt      string                 `json:"createdAt"`
+	DeliveredAt    string                 `json:"deliveredAt"`
+	AcknowledgedAt string                 `json:"acknowledgedAt"`
+	Status         sessionMessageStatus   `json:"status"`
+	Metadata       map[string]any         `json:"metadata,omitempty"`
+}
+
+// sessionInboxResponse is the envelope for
+// GET /v1/sessions/:sessionId/inbox. The Go TUI only reads the
+// stable top-level fields it displays; the rest of the payload
+// (and any future fields added by the server) stay in the raw json
+// (see inboxMsg.raw) so schema churn upstream cannot break the
+// client.
+type sessionInboxResponse struct {
+	Type               string            `json:"type"`
+	SessionID          string            `json:"sessionId"`
+	Messages           []sessionMessage  `json:"messages"`
+	Limit              int               `json:"limit"`
+	IncludeAcknowledged bool             `json:"includeAcknowledged"`
+}
+
+// inboxMsg is the response from
+// GET /v1/sessions/:sessionId/inbox. The Go TUI decodes the
+// envelope via the typed struct above; raw bytes are retained
+// for the same reason contextAnalysisMsg keeps them.
+type inboxMsg struct {
+	sessionID         string
+	raw               []byte
+	envelope          sessionInboxResponse
+	includeAck        bool
+	err               error
+}
+
+// inboxAckMsg is the response from
+// POST /v1/sessions/:sessionId/inbox/:messageId/ack. The Go TUI
+// does not need the full message body back — only a success
+// signal — so the message field is preserved as raw bytes for
+// any future audit / governance renderer.
+type inboxAckMsg struct {
+	sessionID string
+	messageID string
+	raw       []byte
+	err       error
+}
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -177,6 +317,7 @@ const (
 	modeHelpOverlay    inputMode = "helpOverlay"    // read-only help; up/down/esc/enter
 	modeProfileConfirm inputMode = "profileConfirm" // y/n/esc only; gates selectRuntimeProfile
 	modeContextOverlay inputMode = "contextOverlay" // read-only context analysis; up/down/esc/enter
+	modeInboxOverlay   inputMode = "inboxOverlay"   // read-only SessionChannel inbox; up/down/a/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -206,6 +347,12 @@ type model struct {
 	pendingProfileName string
 	contextOverlayLines  []string
 	contextOverlayScroll int
+	inboxMessages    []sessionMessage
+	inboxChannels    []sessionChannel
+	inboxOverlaySelected int
+	inboxOverlayScroll   int
+	inboxOverlayIncludeAck bool
+	seenInboxCardMessageIDs map[string]struct{}
 	startedAt      time.Time
 	width          int
 	height         int
@@ -342,10 +489,29 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/inbox",
-		summary: "list SessionChannel inbox (TODO: wire to /v1/sessions/:id/inbox)",
-		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/inbox not yet implemented in Go TUI MVP")
-			return nil
+		summary: "open SessionChannel inbox overlay (Phase 6)",
+		run: func(m *model, args []string) tea.Cmd {
+			// Sub-commands: "/inbox all" and "/inbox ack <messageId>".
+			// Bare "/inbox" fetches unread-only (matches the TS TUI
+			// default). Without an active session both variants
+			// short-circuit with a friendly status line so the user
+			// isn't confused by a 404 from the Nexus API.
+			if len(args) > 0 {
+				switch args[0] {
+				case "all":
+					return m.fetchInboxWithSession(true)
+				case "ack":
+					if len(args) < 2 {
+						m.appendLine("error", "/inbox ack requires a message id: /inbox ack <messageId>")
+						return nil
+					}
+					return m.ackInboxMessageWithSession(args[1])
+				default:
+					m.appendLine("error", "unknown /inbox sub-command: "+args[0]+" (supported: all, ack <messageId>)")
+					return nil
+				}
+			}
+			return m.fetchInboxWithSession(false)
 		},
 	},
 	{
@@ -562,6 +728,7 @@ var (
 	dividerStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	footerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	focusedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
+	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
 )
 
 func main() {
@@ -614,6 +781,7 @@ func newModel(cfg config) model {
 			{kind: "status", text: "Go TUI MVP connected to the Nexus stream API."},
 			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
 		},
+		seenInboxCardMessageIDs: map[string]struct{}{},
 	}
 }
 
@@ -787,6 +955,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeInboxOverlay:
+			// Read-only SessionChannel inbox overlay (Phase 6 §1).
+			// up/k move selection back; down/j/tab move it forward.
+			// 'a' acks the selected message; esc/enter/q close.
+			// All other keys are swallowed so they never reach the
+			// textinput (single-input-owner invariant).
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.inboxOverlayScroll = 0
+				m.inboxOverlaySelected = 0
+				m.appendLine("status", "inbox closed")
+				return m, nil
+			case "up", "k":
+				if m.inboxOverlaySelected > 0 {
+					m.inboxOverlaySelected--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if m.inboxOverlaySelected+1 < len(m.inboxMessages) {
+					m.inboxOverlaySelected++
+				}
+				return m, nil
+			case "a":
+				return m, m.ackSelectedInboxMessage()
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -919,6 +1115,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.appendLine("status", formatCompactResult(msg.raw))
 		return m, nil
 
+	case inboxMsg:
+		if msg.err != nil {
+			m.appendLine("error", "inbox: "+msg.err.Error())
+			return m, nil
+		}
+		m.inboxMessages = msg.envelope.Messages
+		m.inboxChannels = nil // /v1/sessions/:id/inbox doesn't echo channels; reset.
+		m.inboxOverlaySelected = 0
+		m.inboxOverlayScroll = 0
+		m.inboxOverlayIncludeAck = msg.includeAck
+		m.renderNewInboxEventCards()
+		// Persist a single-line summary breadcrumb in the transcript
+		// (so the user can scroll back and grep the count) AND open
+		// the overlay so the full SessionChannel inbox is visible
+		// without an extra keystroke. The overlay is the primary UX.
+		summary := fmt.Sprintf("inbox: %d message(s) (unread-only=%v)",
+			len(m.inboxMessages), !m.inboxOverlayIncludeAck)
+		m.appendLine("status", summary)
+		m.setMode(modeInboxOverlay)
+		return m, nil
+
+	case inboxAckMsg:
+		if msg.err != nil {
+			m.appendLine("error", "inbox ack: "+msg.err.Error())
+			return m, nil
+		}
+		// Mark the message as acknowledged in the local snapshot so
+		// the footer status / overlay re-render with the new count
+		// without forcing a full re-fetch. The server is already
+		// authoritative; this is purely a UX shortcut.
+		for index, message := range m.inboxMessages {
+			if message.MessageID == msg.messageID {
+				m.inboxMessages[index].Status = messageStatusAcknowledged
+				m.inboxMessages[index].AcknowledgedAt = "now"
+				break
+			}
+		}
+		m.appendLine("status", "inbox ack: "+msg.messageID)
+		return m, nil
+
 	case pollTickMsg:
 		// Background poll. If we've never fetched a config, defer to the
 		// next round rather than blocking the chat loop.
@@ -967,6 +1203,7 @@ func (m model) View() string {
 	palette := m.renderSlashPalette(width)
 	profileConfirm := m.renderProfileConfirm(width)
 	contextOverlay := m.renderContextOverlay(width)
+	inboxOverlay := m.renderInboxOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -983,6 +1220,9 @@ func (m model) View() string {
 	}
 	if contextOverlay != "" {
 		parts = append(parts, contextOverlay)
+	}
+	if inboxOverlay != "" {
+		parts = append(parts, inboxOverlay)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -1017,6 +1257,14 @@ var helpOverlayLines = []string{
 	"",
 	"Context overlay (Phase 5 续):",
 	"  up / down / tab  scroll through the context analysis",
+	"  esc / enter / q  close the overlay",
+	"",
+	"Inbox overlay (Phase 6 §1):",
+	"  /inbox           open SessionChannel inbox (unread-only)",
+	"  /inbox all       include acknowledged messages",
+	"  /inbox ack <id>  acknowledge a single message",
+	"  up / down / tab  move selection through the message list",
+	"  a                ack the selected message",
 	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
@@ -1487,6 +1735,423 @@ func ternary(cond bool, whenTrue, whenFalse string) string {
 	return whenFalse
 }
 
+// isKeyInboxMessage mirrors shouldRenderInboxEventCard in
+// src/cli/inboxOverlay.ts. Handoff / blocked / request_review /
+// request_validation are always key; finding is only key when
+// priority=high; memory_candidate is key when its governance
+// decision is rejected/requires_approval or approval.status is
+// required/rejected. Key messages trigger an event card in the
+// main conversation flow and a "high: <type>" tag in the footer.
+func isKeyInboxMessage(message sessionMessage) bool {
+	switch message.Type {
+	case messageTypeHandoff, messageTypeBlocked,
+		messageTypeRequestReview, messageTypeRequestValidation:
+		return true
+	case messageTypeFinding:
+		return message.Priority == priorityHigh
+	case messageTypeMemoryCandidate:
+		governance := asMap(message.Metadata["memoryCandidateGovernance"])
+		if governance == nil {
+			return false
+		}
+		decision := stringField(governance, "decision")
+		if decision == "rejected" || decision == "requires_approval" {
+			return true
+		}
+		approval := asMap(governance["approval"])
+		approvalStatus := stringField(approval, "status")
+		return approvalStatus == "required" || approvalStatus == "rejected"
+	}
+	return false
+}
+
+// asMap is a tiny defensive helper that returns its input as a
+// generic map. It is used by inbox governance checks that need to
+// reach into optional metadata fields without forcing the typed
+// sessionMessage struct to grow new optional fields.
+func asMap(value any) map[string]any {
+	typed, ok := value.(map[string]any)
+	if !ok {
+		return nil
+	}
+	return typed
+}
+
+// formatInboxEvidence renders the evidence list as
+// "type:ref (label), type:ref" — same shape as
+// formatEvidenceRefs in src/cli/inboxOverlay.ts. Returns "" when
+// no evidence is attached.
+func formatInboxEvidence(evidence []evidenceRef) string {
+	if len(evidence) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(evidence))
+	for _, ref := range evidence {
+		entry := strings.TrimSpace(ref.Type) + ":" + strings.TrimSpace(ref.Ref)
+		if label := strings.TrimSpace(ref.Label); label != "" {
+			entry += " (" + label + ")"
+		}
+		parts = append(parts, entry)
+	}
+	return strings.Join(parts, ", ")
+}
+
+// formatInboxGovernanceSummary renders a one-line governance
+// summary for memory_candidate messages. Mirrors
+// formatGovernanceSummary in src/cli/inboxOverlay.ts. Returns ""
+// when the message isn't a memory_candidate or when the optional
+// governance blob is missing.
+func formatInboxGovernanceSummary(message sessionMessage) string {
+	if message.Type != messageTypeMemoryCandidate {
+		return ""
+	}
+	governance := asMap(message.Metadata["memoryCandidateGovernance"])
+	if governance == nil {
+		return ""
+	}
+	approval := asMap(governance["approval"])
+	parts := []string{
+		"decision=" + fallbackUnknown(stringField(governance, "decision")),
+		"scope=" + fallbackUnknown(stringField(governance, "scope")),
+		"approval=" + fallbackUnknown(stringField(approval, "status")) +
+			":" + fallbackUnknown(stringField(approval, "requiredBy")),
+	}
+	if auto, ok := governance["autoWrite"].(bool); ok {
+		parts = append(parts, fmt.Sprintf("auto_write=%v", auto))
+	}
+	return strings.Join(parts, " ")
+}
+
+// fallbackUnknown renders "<x>" for the in-line label when a
+// missing or blank string would otherwise leave a bare "=" in the
+// summary line. Mirrors the inline `?? "unknown"` behavior in
+// formatGovernanceSummary in the TS TUI.
+func fallbackUnknown(value string) string {
+	if strings.TrimSpace(value) == "" {
+		return "unknown"
+	}
+	return value
+}
+
+// formatInboxMessageHeaderRow renders the first row of a message
+// inside the inbox overlay. It uses `›` as the selected marker
+// (mirroring the TS TUI) and a ` ` pad for unselected rows so the
+// column alignment is stable.
+func formatInboxMessageHeaderRow(message sessionMessage, selected bool) string {
+	marker := " "
+	if selected {
+		marker = "›"
+	}
+	status := strings.TrimSpace(string(message.Status))
+	if message.AcknowledgedAt != "" && status == "" {
+		status = "acknowledged"
+	}
+	if status == "" {
+		status = string(messageStatusDelivered)
+	}
+	return fmt.Sprintf("%s %s [%s] %s", marker, message.MessageID, message.CreatedAt, status)
+}
+
+// formatInboxMessageMetaRow renders the second row of a message
+// (type / priority / from / target / channel / kind). The target
+// is `to=<id>` for direct sends and `broadcast=true` for fan-out.
+func formatInboxMessageMetaRow(message sessionMessage, channel sessionChannel) string {
+	target := "broadcast=true"
+	if to := strings.TrimSpace(message.ToSessionID); to != "" {
+		target = "to=" + to
+	}
+	channelKind := string(channel.Kind)
+	if channelKind == "" {
+		channelKind = string(channelKindDirect)
+	}
+	return fmt.Sprintf("  %s · %s · from=%s · %s · kind=%s · channel=%s",
+		message.Type, message.Priority, message.FromSessionID,
+		target, channelKind, message.ChannelID)
+}
+
+// formatInboxMessageContentRow renders the content line, prefixed
+// with two spaces for indent. The text is left untouched — the
+// overlay scrolls vertically, not horizontally, and the chat TUI
+// keeps long content as a single line for grep-ability.
+func formatInboxMessageContentRow(message sessionMessage) string {
+	return "  " + message.Content
+}
+
+// buildInboxMessageRows returns the ordered list of row strings for
+// a single message in the inbox overlay. Returns an empty slice
+// for the zero-value message so callers can iterate safely.
+func buildInboxMessageRows(message sessionMessage, channel sessionChannel, selected bool) []string {
+	rows := []string{
+		formatInboxMessageHeaderRow(message, selected),
+		formatInboxMessageMetaRow(message, channel),
+		formatInboxMessageContentRow(message),
+	}
+	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
+		rows = append(rows, "  evidence: "+evidence)
+	}
+	if gov := formatInboxGovernanceSummary(message); gov != "" {
+		rows = append(rows, "  governance: "+gov)
+	}
+	return rows
+}
+
+// formatInboxFooterStatus mirrors formatInboxFooterStatus in
+// src/cli/inboxOverlay.ts. Renders a compact
+// "linked sessions: N [...]; inbox: N unread; channels: kind1 N/kind2 M; high: <type>"
+// summary used both by the persistent footer status line and the
+// "summary" line at the top of the overlay. Returns "" when there
+// is nothing to surface, so callers can no-op.
+func formatInboxFooterStatus(sessionID string, messages []sessionMessage, channels []sessionChannel) string {
+	unread := 0
+	for _, message := range messages {
+		if message.Status == messageStatusAcknowledged || message.AcknowledgedAt != "" {
+			continue
+		}
+		unread++
+	}
+	linked := map[string]struct{}{}
+	for _, channel := range channels {
+		found := false
+		for _, participant := range channel.ParticipantSessionIDs {
+			if participant == sessionID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		for _, participant := range channel.ParticipantSessionIDs {
+			if participant == sessionID {
+				continue
+			}
+			linked[participant] = struct{}{}
+		}
+	}
+	if len(linked) == 0 {
+		for _, message := range messages {
+			if message.FromSessionID == sessionID {
+				continue
+			}
+			linked[message.FromSessionID] = struct{}{}
+		}
+	}
+	parts := []string{}
+	if linkedSummary := formatLinkedSessionSummary(linked); linkedSummary != "" {
+		parts = append(parts, linkedSummary)
+	}
+	if len(linked) > 0 || unread > 0 {
+		parts = append(parts, fmt.Sprintf("inbox: %d unread", unread))
+	}
+	if kinds := summarizeChannelKinds(channels, sessionID); kinds != "" {
+		parts = append(parts, "channels: "+kinds)
+	}
+	for _, message := range messages {
+		if isKeyInboxMessage(message) {
+			parts = append(parts, "high: "+string(message.Type))
+			break
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// formatLinkedSessionSummary renders the
+// "linked sessions: N [s1, s2, s3 +X more]" segment used by
+// formatInboxFooterStatus. Caps at 3 short IDs and trims with
+// "+N" so the footer status stays on one line in narrow widths.
+func formatLinkedSessionSummary(linked map[string]struct{}) string {
+	if len(linked) == 0 {
+		return ""
+	}
+	ids := make([]string, 0, len(linked))
+	for id := range linked {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	limit := 3
+	if len(ids) < limit {
+		limit = len(ids)
+	}
+	shown := make([]string, 0, limit+1)
+	for _, id := range ids[:limit] {
+		shown = append(shown, shortID(id))
+	}
+	extra := ""
+	if len(ids) > limit {
+		extra = fmt.Sprintf(" +%d", len(ids)-limit)
+	}
+	return fmt.Sprintf("linked sessions: %d [%s%s]", len(ids), strings.Join(shown, ", "), extra)
+}
+
+// summarizeChannelKinds returns a stable
+// "direct 1/group 2/parent_child 1" segment for the channels the
+// current session participates in. The order is sorted by kind so
+// the footer string is stable across runs (mirrors the TS
+// summarizeChannelKinds helper).
+func summarizeChannelKinds(channels []sessionChannel, sessionID string) string {
+	counts := map[sessionChannelKind]int{}
+	for _, channel := range channels {
+		found := false
+		for _, participant := range channel.ParticipantSessionIDs {
+			if participant == sessionID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		counts[channel.Kind]++
+	}
+	if len(counts) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(counts))
+	for kind := range counts {
+		keys = append(keys, string(kind))
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, kind := range keys {
+		parts = append(parts, fmt.Sprintf("%s %d", kind, counts[sessionChannelKind(kind)]))
+	}
+	return strings.Join(parts, "/")
+}
+
+// buildInboxOverlayLines turns the inbox response into the ordered
+// list of lines the inbox overlay will render. Each message
+// contributes 3-5 lines (header / meta / content / optional
+// evidence / optional governance); the overlay window is then
+// clamped in renderInboxOverlay. Returns an empty slice for the
+// "no messages" case so the caller can show a friendly placeholder.
+func buildInboxOverlayLines(messages []sessionMessage, channels []sessionChannel, selected int, includeAck bool) []string {
+	if len(messages) == 0 {
+		placeholder := "No unread inbox messages."
+		if includeAck {
+			placeholder = "No inbox messages."
+		}
+		return []string{placeholder}
+	}
+	channelByID := make(map[string]sessionChannel, len(channels))
+	for _, channel := range channels {
+		channelByID[channel.ChannelID] = channel
+	}
+	lines := []string{}
+	for index, message := range messages {
+		channel := channelByID[message.ChannelID]
+		isSelected := index == selected
+		lines = append(lines, buildInboxMessageRows(message, channel, isSelected)...)
+	}
+	return lines
+}
+
+// renderInboxOverlay paints the multi-line SessionChannel inbox
+// view. It is the Phase 6 §1 primary UX for the inbox slash
+// command. The overlay is composed of:
+//   - titleStyle header (Phase 6 banner + session id)
+//   - persistent footer status summary (linked / unread / channels / high)
+//   - clamped window of buildInboxOverlayLines
+//   - bottom hint (selection marker, scroll, close, ack keys)
+//
+// Outside modeInboxOverlay it returns "" so it can be
+// unconditionally spliced into the View() parts list.
+func (m model) renderInboxOverlay(width int) string {
+	if m.inputMode != modeInboxOverlay {
+		return ""
+	}
+	banner := "Inbox · Phase 6 overlay"
+	if m.inboxOverlayIncludeAck {
+		banner = "Inbox · all · Phase 6 overlay"
+	}
+	header := titleStyle.Render(banner)
+	summary := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels)
+	if summary == "" {
+		summary = "(no inbox summary available)"
+	}
+	lines := []string{header, divider(width), summary}
+	visibleRows := max(1, m.height-10)
+	allLines := buildInboxOverlayLines(m.inboxMessages, m.inboxChannels, m.inboxOverlaySelected, m.inboxOverlayIncludeAck)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.inboxOverlayScroll > maxScroll {
+		// View() is read-only; clamp locally for the rendered slice.
+		// The next key event will reconcile m.inboxOverlayScroll.
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		lines = append(lines, allLines[maxScroll:end]...)
+	} else {
+		end := m.inboxOverlayScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		lines = append(lines, allLines[m.inboxOverlayScroll:end]...)
+	}
+	hint := "↑/↓/Tab move · a ack selected · esc/enter/q close"
+	lines = append(lines, mutedStyle.Render(hint))
+	return strings.Join([]string{divider(width), inboxStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+}
+
+// renderInboxEventCard is the main-flow event card for a single
+// key SessionChannel message. It is intentionally compact (a
+// short banner + metadata + the "open inbox / ack / quote" hint)
+// so the user's main transcript stays readable. Returns "" for
+// non-key messages so callers can route through it unconditionally.
+func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
+	if !isKeyInboxMessage(message) {
+		return ""
+	}
+	target := "broadcast=true"
+	if to := strings.TrimSpace(message.ToSessionID); to != "" {
+		target = "to=" + to
+	}
+	channelKind := string(channel.Kind)
+	if channelKind == "" {
+		channelKind = string(channelKindDirect)
+	}
+	rows := []string{
+		fmt.Sprintf("SessionChannel %s · %s · from=%s · %s",
+			message.Type, message.Priority, message.FromSessionID, target),
+		fmt.Sprintf("channel=%s kind=%s message=%s", message.ChannelID, channelKind, message.MessageID),
+		"collaboration context only; verify evidence before acting",
+	}
+	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
+		rows = append(rows, "evidence: "+evidence)
+	}
+	rows = append(rows, fmt.Sprintf("[open inbox: /inbox] [ack: /inbox ack %s] [quote: /inbox then q]", message.MessageID))
+	body := strings.Join(rows, "\n")
+	return strings.Join([]string{divider(80), inboxStyle.Render(wrapPlain(body, 78)), divider(80)}, "\n")
+}
+
+// renderNewInboxEventCards walks the current inbox snapshot and
+// pushes a compact event card into the transcript for every key
+// message that hasn't been rendered yet. Mirrors
+// renderNewInboxEventCards in src/cli/commands/chat.ts. The set
+// of seen message IDs is kept on the model so the next /inbox
+// call (or any future refresh trigger) only surfaces fresh
+// messages, not the historical ones the user already saw.
+func (m *model) renderNewInboxEventCards() {
+	if m.seenInboxCardMessageIDs == nil {
+		m.seenInboxCardMessageIDs = map[string]struct{}{}
+	}
+	channelByID := map[string]sessionChannel{}
+	for _, channel := range m.inboxChannels {
+		channelByID[channel.ChannelID] = channel
+	}
+	for _, message := range m.inboxMessages {
+		if _, seen := m.seenInboxCardMessageIDs[message.MessageID]; seen {
+			continue
+		}
+		if !isKeyInboxMessage(message) {
+			continue
+		}
+		if card := renderInboxEventCard(message, channelByID[message.ChannelID]); card != "" {
+			m.appendLine("inbox", card)
+		}
+		m.seenInboxCardMessageIDs[message.MessageID] = struct{}{}
+	}
+}
+
 // formatCharCount renders a char count in human-friendly form
 // (e.g. 1234 -> "1.2k", 12 -> "12", 0 -> "0"). The chat TUI uses
 // the same idea in contextView.
@@ -1663,7 +2328,60 @@ func (m model) renderFooter(width int) string {
 	if !m.startedAt.IsZero() && m.running {
 		elapsed = fmt.Sprintf("  elapsed=%s", time.Since(m.startedAt).Round(time.Second))
 	}
-	return footerStyle.Render(truncatePlain(fmt.Sprintf("%s%s  ctrl+c quit  q quit when idle", hint, elapsed), width))
+	inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels)
+	if inbox != "" {
+		// The footer is a single line: keep the hint short and
+		// append the inbox status with a leading "  · " so the
+		// user can still spot the keyboard hint at a glance.
+		inbox = "  · " + inbox
+	}
+	return footerStyle.Render(truncatePlain(fmt.Sprintf("%s%s%s  ctrl+c quit  q quit when idle", hint, elapsed, inbox), width))
+}
+
+// fetchInboxWithSession is the gated entry point the /inbox slash
+// command uses: it requires an active session, then either kicks
+// off a fetch (unread-only or with acknowledged) or short-circuits
+// with a friendly status line. Mirrors the "context: no active
+// session yet" pattern from /context and /compact.
+func (m *model) fetchInboxWithSession(includeAck bool) tea.Cmd {
+	if m.sessionID == "" {
+		m.appendLine("status", "inbox: no active session yet — submit a prompt first")
+		return nil
+	}
+	scope := "unread"
+	if includeAck {
+		scope = "all"
+	}
+	m.appendLine("status", "loading shared Nexus inbox ("+scope+"): "+shortID(m.sessionID))
+	return fetchInbox(m.cfg, m.sessionID, includeAck)
+}
+
+// ackInboxMessageWithSession is the gated entry point the /inbox
+// ack <messageId> sub-command uses. Like fetchInboxWithSession it
+// short-circuits without an active session, then calls
+// ackInboxMessage to issue the POST.
+func (m *model) ackInboxMessageWithSession(messageID string) tea.Cmd {
+	if m.sessionID == "" {
+		m.appendLine("status", "inbox ack: no active session yet — submit a prompt first")
+		return nil
+	}
+	m.appendLine("status", "acking inbox message: "+messageID)
+	return ackInboxMessage(m.cfg, m.sessionID, messageID)
+}
+
+// ackSelectedInboxMessage fires ackInboxMessage for the currently
+// selected message in the inbox overlay. It is called from the
+// modeInboxOverlay 'a' key dispatch so the user never has to type
+// the message id by hand when the message is on screen.
+func (m *model) ackSelectedInboxMessage() tea.Cmd {
+	if m.inputMode != modeInboxOverlay {
+		return nil
+	}
+	if m.inboxOverlaySelected < 0 || m.inboxOverlaySelected >= len(m.inboxMessages) {
+		return nil
+	}
+	message := m.inboxMessages[m.inboxOverlaySelected]
+	return ackInboxMessage(m.cfg, m.sessionID, message.MessageID)
 }
 
 func (m *model) sendPermissionDecision(approved bool, reason string) {
@@ -2141,6 +2859,50 @@ func triggerCompact(cfg config, sessionID string) tea.Cmd {
 			map[string]string{"trigger": "manual"},
 		)
 		return compactResultMsg{sessionID: sessionID, raw: raw, err: err}
+	}
+}
+
+// fetchInbox issues GET /v1/sessions/:sessionId/inbox and decodes
+// the stable top-level envelope (type / sessionId / messages /
+// limit / includeAcknowledged). The raw bytes are retained so any
+// future richer renderer (or a server-side schema addition) does
+// not break the existing format / overlay code.
+func fetchInbox(cfg config, sessionID string, includeAck bool) tea.Cmd {
+	return func() tea.Msg {
+		query := url.Values{}
+		if includeAck {
+			query.Set("includeAcknowledged", "true")
+		}
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/inbox",
+			nil,
+			query,
+		)
+		out := inboxMsg{sessionID: sessionID, raw: raw, includeAck: includeAck, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
+				out.err = fmt.Errorf("decode inbox: %w", decodeErr)
+			}
+		}
+		return out
+	}
+}
+
+// ackInboxMessage issues POST /v1/sessions/:sessionId/inbox/:messageId/ack.
+// The Go TUI does not need the full message body back — only a
+// success signal — so the message field is preserved as raw bytes
+// for any future audit / governance renderer.
+func ackInboxMessage(cfg config, sessionID string, messageID string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodPost,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/inbox/"+url.PathEscape(messageID)+"/ack",
+			map[string]any{},
+		)
+		return inboxAckMsg{sessionID: sessionID, messageID: messageID, raw: raw, err: err}
 	}
 }
 

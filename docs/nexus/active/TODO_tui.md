@@ -203,10 +203,27 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - managed Nexus child 使用 `BABEL_O_WORKSPACE=<cwd>`、URL 推导的 `NEXUS_HOST` / `NEXUS_PORT`，`NEXUS_ALLOWED_TOOLS` 默认取环境变量，未设置时为 `*`；高风险工具仍走现有 permission prompt。
   - `--no-start-nexus` 只连接不启动；远程 URL 不健康时报错，不尝试本地拉起；Go TUI 退出时只关闭本次 wrapper 自己拉起的 child，不影响用户已有 Nexus。
   - `--poll-interval-ms` 已由 wrapper 透传给 Go TUI。
+- [x] Phase 6 PR1：SessionChannel `/inbox` overlay + footer unread indicator 收口（2026-06-09 收口）。
+  - 数据模型：`SessionChannelKind` / `SessionMessageType` / `SessionMessagePriority` / `SessionMessageStatus` / `SessionChannelStatus` 枚举 + `evidenceRef` / `sessionChannel` / `sessionMessage` / `sessionInboxResponse` 类型；`sessionMessage.Metadata map[string]any` 暴露 governance blob 以便 memory_candidate 走 isKeyInboxMessage 路径。
+  - 状态机：`modeInboxOverlay` inputMode 常量 + 模型字段 `inboxMessages` / `inboxChannels` / `inboxOverlaySelected` / `inboxOverlayScroll` / `inboxOverlayIncludeAck` / `seenInboxCardMessageIDs`。
+  - HTTP：`fetchInbox(cfg, sessionID, includeAck)` 调 `GET /v1/sessions/:id/inbox?includeAcknowledged=...`；`ackInboxMessage(cfg, sessionID, messageID)` 调 `POST /v1/sessions/:id/inbox/:msgId/ack`；两者都返回 typed msg（`inboxMsg` / `inboxAckMsg`）+ `raw []byte` envelope。复用 `nexusRawJSON` 防止 schema churn 击穿。
+  - 渲染：`inboxStyle` (foreground 33) + `formatInboxFooterStatus`（linked sessions / unread / channels / high 段）+ `buildInboxOverlayLines`（每条 message 3-5 行、selected marker）+ `renderInboxOverlay`（与 help / slash palette / profileConfirm 同 viewport 风格，title `Inbox · Phase 6 overlay` / `Inbox · all · Phase 6 overlay`）+ `renderInboxEventCard`（main flow 关键事件卡片，divider 包裹）+ `renderNewInboxEventCards`（按 messageId 去重）。
+  - 协议：`isKeyInboxMessage` 复刻 TS `shouldRenderInboxEventCard`——handoff / blocked / request_review / request_validation 总是 key；finding 只在 priority=high 时 key；memory_candidate 在 governance.decision ∈ {rejected, requires_approval} 或 approval.status ∈ {required, rejected} 时 key。
+  - slash 命令：替换 `/inbox` placeholder——bare `/inbox` 调 unread-only fetch；`/inbox all` 调 includeAck fetch；`/inbox ack <id>` 直接 POST ack；都先 short-circuit 友好状态行（无 active session 时）。
+  - KeyMsg dispatch：`case modeInboxOverlay`——esc/enter/q 关闭 + 清 inboxOverlayScroll / inboxOverlaySelected + 写 `inbox closed` 状态行；up/k 减 selected（clamp 0）；down/j/tab 增 selected（clamp len-1）；`a` 调 `ackSelectedInboxMessage` 触发 ackInboxMessage HTTP；stray key 全部被吞。
+  - inboxAckMsg handler：ack 成功后只在本地 snapshot 标 status=acknowledged + acknowledgedAt="now" + 写 `inbox ack: <id>` 状态行（避免强制 re-fetch）。
+  - renderFooter：现有 hint 后追加 inbox footer 状态（`linked sessions: N [...]` / `inbox: N unread` / `channels: kind1 N/kind2 M` / `high: <type>`），用 `  · ` 分隔，宽度超限时走 truncatePlain。
+  - View()：拼接 inboxOverlay 段在 contextOverlay 之后、input / footer 之前。
+  - helpOverlayLines：新增 Inbox overlay 段。
+  - 22 个新单测 + 1 个 PTY smoke (`inbox-overlay`) + 1 个 TS smoke 入口守住 envelope 抽取 / decode error / render 隐藏性 / banner 切换 / 选中 clamp / esc/enter/q 关闭 / stray key 不污染 / ack 成功路径 / slash 命令 short-circuit / event card key 判定 / 已渲染去重 / HTTP 真实 wire；123/123 go test 通过；`BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 13/13 pass。
+  - 范围克制：自动 inbox refresh on `result` event 留到 Phase 6 PR2；`/inbox` quote into prompt 留到 Phase 6 PR2（避免 overlay ↔ composing round-trip 引入新 race）；PTY smoke 走 empty-inbox 路径（避免依赖 Nexus seed inbox fixture）。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 7 / Phase 8 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 7 / Phase 8 稳定后才推进：
 
-- Phase 6 Agent/Task/SessionChannel views。
+- Phase 6 PR2：auto-refresh inbox on `result` event + `/inbox` quote into prompt。
+- Phase 6 PR3：Agent status panel（parent/child + taskId + role + depth + status + delegatedSubTaskIds）。
+- Phase 6 PR4：Task board（pending/in_progress/blocked/completed/failed + worktree state + review/recovery）。
+- Phase 6 PR5：Activity overlay（recent tool runs / permission decisions / agent job events / context warnings）。
 - Go TUI tool palette `/v1/tools/audit` 真实 wire（Phase 4 静态目录的下一阶段）。
 - Phase 8 packaging/distribution 剩余项：预编译 binary 发布、版本兼容矩阵、安装包策略。
 - Phase 9 promotion gate。

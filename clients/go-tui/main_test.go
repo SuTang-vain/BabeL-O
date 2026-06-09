@@ -1866,3 +1866,495 @@ func TestFirstLineBoundsAndStripsTrailingNewlines(t *testing.T) {
 		t.Fatalf("firstLine should stop at first newline, got %q", got)
 	}
 }
+
+// fullInboxPayload returns a representative inbox response with
+// three messages covering the high-priority, acknowledged and
+// memory_candidate governance paths. Used by the inbox overlay /
+// footer / event-card tests below.
+func fullInboxPayload() []byte {
+	return []byte(`{
+		"type": "session_inbox",
+		"sessionId": "sess_inbox_smoke_abc123",
+		"limit": 50,
+		"includeAcknowledged": false,
+		"messages": [
+			{
+				"messageId": "msg_handoff_1",
+				"channelId": "chan_parent_child_1",
+				"fromSessionId": "sess_child_xyz789",
+				"toSessionId": "sess_inbox_smoke_abc123",
+				"type": "handoff",
+				"content": "Picking up the auth refactor; see attached diff.",
+				"evidence": [{"type": "tool_trace", "ref": "trace_001", "label": "edit run"}],
+				"priority": "high",
+				"createdAt": "2026-06-09T10:00:00Z",
+				"status": "delivered"
+			},
+			{
+				"messageId": "msg_finding_low_2",
+				"channelId": "chan_workspace_pair_1",
+				"fromSessionId": "sess_peer_aaa111",
+				"broadcast": true,
+				"type": "finding",
+				"content": "low-priority finding - not a key event",
+				"priority": "low",
+				"createdAt": "2026-06-09T10:05:00Z",
+				"status": "delivered"
+			},
+			{
+				"messageId": "msg_memory_rejected_3",
+				"channelId": "chan_direct_1",
+				"fromSessionId": "sess_peer_bbb222",
+				"toSessionId": "sess_inbox_smoke_abc123",
+				"type": "memory_candidate",
+				"content": "auto-write attempt blocked",
+				"priority": "normal",
+				"createdAt": "2026-06-09T10:10:00Z",
+				"status": "delivered",
+				"metadata": {
+					"memoryCandidateGovernance": {
+						"decision": "rejected",
+						"scope": "long_term",
+						"approval": {"status": "rejected", "requiredBy": "user"},
+						"autoWrite": false
+					}
+				}
+			}
+		]
+	}`)
+}
+
+func TestIsKeyInboxMessageFlagsHighPriorityAndGovernance(t *testing.T) {
+	messages := []sessionMessage{
+		{Type: messageTypeHandoff, Priority: priorityNormal},
+		{Type: messageTypeBlocked, Priority: priorityLow},
+		{Type: messageTypeRequestReview, Priority: priorityNormal},
+		{Type: messageTypeRequestValidation, Priority: priorityNormal},
+		{Type: messageTypeFinding, Priority: priorityHigh},
+		{Type: messageTypeFinding, Priority: priorityLow}, // not key
+		{Type: messageTypeMemoryCandidate, Metadata: map[string]any{
+			"memoryCandidateGovernance": map[string]any{"decision": "rejected"},
+		}},
+		{Type: messageTypeMemoryCandidate, Metadata: map[string]any{
+			"memoryCandidateGovernance": map[string]any{"decision": "approved", "approval": map[string]any{"status": "approved"}},
+		}},
+		{Type: messageTypeQuestion, Priority: priorityHigh}, // not key
+	}
+	want := []bool{true, true, true, true, true, false, true, false, false}
+	for i, m := range messages {
+		if got := isKeyInboxMessage(m); got != want[i] {
+			t.Fatalf("isKeyInboxMessage[%d] type=%s = %v, want %v", i, m.Type, got, want[i])
+		}
+	}
+}
+
+func TestFormatInboxFooterStatusRendersUnreadAndLinkedAndHigh(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := formatInboxFooterStatus("sess_inbox_smoke_abc123", envelope.Messages, nil)
+	// Three unread (handoff + finding-low + memory_candidate_rejected),
+	// three linked sessions (one per message FromSessionId, since the
+	// channels parameter is nil and the helper falls back to that),
+	// and the "high" segment picks up the handoff first.
+	for _, want := range []string{
+		"inbox: 3 unread",
+		"high: handoff",
+		"linked sessions: 3",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatInboxFooterStatus missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatInboxFooterStatusEmptyWhenNothingToSurface(t *testing.T) {
+	if got := formatInboxFooterStatus("sess_xyz", nil, nil); got != "" {
+		t.Fatalf("empty inbox should produce empty footer status, got %q", got)
+	}
+}
+
+func TestBuildInboxOverlayLinesRendersMessagesWithSelectedMarker(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	lines := buildInboxOverlayLines(envelope.Messages, nil, 0, false)
+	if len(lines) == 0 {
+		t.Fatalf("expected non-empty overlay lines")
+	}
+	// The first message (handoff) is selected → its header row must
+	// carry the `›` marker.
+	if !strings.Contains(lines[0], "›") {
+		t.Fatalf("selected marker missing from first row:\n%s", lines[0])
+	}
+	// The second message (finding-low) is unselected → its header
+	// row should use a space marker.
+	var secondHeader string
+	for _, line := range lines {
+		if strings.HasPrefix(line, "  msg_finding_low_2 ") {
+			secondHeader = line
+			break
+		}
+	}
+	if secondHeader == "" {
+		t.Fatalf("could not find second-message header in overlay lines")
+	}
+	if strings.HasPrefix(secondHeader, "›") {
+		t.Fatalf("unselected message should not carry `›` marker:\n%s", secondHeader)
+	}
+}
+
+func TestBuildInboxOverlayLinesPlaceholderWhenEmpty(t *testing.T) {
+	lines := buildInboxOverlayLines(nil, nil, 0, false)
+	if len(lines) != 1 || lines[0] != "No unread inbox messages." {
+		t.Fatalf("expected single unread-only placeholder, got %v", lines)
+	}
+	all := buildInboxOverlayLines(nil, nil, 0, true)
+	if len(all) != 1 || all[0] != "No inbox messages." {
+		t.Fatalf("expected single include-ack placeholder, got %v", all)
+	}
+}
+
+func TestRenderInboxOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderInboxOverlay(120); got != "" {
+		t.Fatalf("renderInboxOverlay outside modeInboxOverlay should be empty, got %q", got)
+	}
+}
+
+func TestRenderInboxOverlayShowsHeaderInMode(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	m.inboxMessages = envelope.Messages
+	m.inputMode = modeInboxOverlay
+	m.height = 30
+	rendered := m.renderInboxOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderInboxOverlay in modeInboxOverlay should be non-empty")
+	}
+	for _, want := range []string{"Inbox · Phase 6 overlay", "sess_inbox_smoke_abc123", "move", "ack", "close"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered inbox overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestRenderInboxOverlayAllVariantSwitchesBanner(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	m.inboxMessages = envelope.Messages
+	m.inboxOverlayIncludeAck = true
+	m.inputMode = modeInboxOverlay
+	m.height = 30
+	rendered := m.renderInboxOverlay(120)
+	if !strings.Contains(rendered, "Inbox · all · Phase 6 overlay") {
+		t.Fatalf("includeAck should switch the banner, got %q", rendered)
+	}
+}
+
+func TestInboxOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeInboxOverlay {
+		t.Fatalf("inputMode = %q, want %q", updatedModel.inputMode, modeInboxOverlay)
+	}
+	if len(updatedModel.inboxMessages) != 3 {
+		t.Fatalf("inboxMessages = %d, want 3", len(updatedModel.inboxMessages))
+	}
+	if updatedModel.inboxOverlaySelected != 0 {
+		t.Fatalf("inboxOverlaySelected = %d, want 0 on open", updatedModel.inboxOverlaySelected)
+	}
+	// Esc closes.
+	closed, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closedModel := closed.(model)
+	if closedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", closedModel.inputMode, modeComposing)
+	}
+}
+
+func TestInboxOverlaySelectionClampsAtBounds(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	m = updated.(model)
+	// Up at 0 stays at 0.
+	up, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = up.(model)
+	if m.inboxOverlaySelected != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", m.inboxOverlaySelected)
+	}
+	// Down advances and clamps at len-1.
+	cur := m
+	for i := 0; i < 10; i++ {
+		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		cur = next.(model)
+	}
+	if cur.inboxOverlaySelected != len(cur.inboxMessages)-1 {
+		t.Fatalf("down should clamp at %d, got %d", len(cur.inboxMessages)-1, cur.inboxOverlaySelected)
+	}
+	// One more down stays clamped.
+	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	moreModel := more.(model)
+	if moreModel.inboxOverlaySelected != len(m.inboxMessages)-1 {
+		t.Fatalf("down past end should stay clamped, got %d", moreModel.inboxOverlaySelected)
+	}
+}
+
+func TestInboxOverlayEscapeCloses(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	m = updated.(model)
+	// Try esc/enter.
+	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+		m.inputMode = modeInboxOverlay
+		closed, _ := m.Update(tea.KeyMsg{Type: keyType})
+		cm := closed.(model)
+		if cm.inputMode != modeComposing {
+			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
+		}
+	}
+	// 'q' rune should also close.
+	m.inputMode = modeInboxOverlay
+	closed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
+	}
+}
+
+func TestInboxOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	m = updated.(model)
+	m.input.SetValue("untouched")
+	// Press 'z' (a non-overlay key). The textinput must not change.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	um := updated.(model)
+	if um.input.Value() != "untouched" {
+		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
+	}
+	if um.inputMode != modeInboxOverlay {
+		t.Fatalf("stray key should leave mode unchanged, got %q", um.inputMode)
+	}
+}
+
+func TestInboxMsgErrorAppendsFriendlyLine(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(inboxMsg{err: errors.New("dial tcp: connection refused")})
+	um := updated.(model)
+	last := um.transcript[len(um.transcript)-1]
+	if last.kind != "error" || !strings.Contains(last.text, "inbox: dial tcp") {
+		t.Fatalf("expected friendly error line, got %+v", last)
+	}
+}
+
+func TestInboxAckMsgSuccessUpdatesLocalSnapshot(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	m.inboxMessages = envelope.Messages
+	updated, _ := m.Update(inboxAckMsg{sessionID: "sess_inbox_smoke_abc123", messageID: "msg_handoff_1"})
+	um := updated.(model)
+	for _, msg := range um.inboxMessages {
+		if msg.MessageID == "msg_handoff_1" {
+			if msg.Status != messageStatusAcknowledged {
+				t.Fatalf("acked message status = %q, want acknowledged", msg.Status)
+			}
+			if msg.AcknowledgedAt != "now" {
+				t.Fatalf("acked message acknowledgedAt = %q, want now", msg.AcknowledgedAt)
+			}
+			return
+		}
+	}
+	t.Fatalf("acked message disappeared from snapshot")
+}
+
+func TestInboxSlashCommandEmptySessionShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/inbox")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd when no session, got %T", cmd)
+	}
+	last := m.transcript[len(m.transcript)-1]
+	if !strings.Contains(last.text, "no active session yet") {
+		t.Fatalf("expected friendly short-circuit status, got %q", last.text)
+	}
+}
+
+func TestInboxSlashCommandAllRequiresSession(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/inbox all")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd when no session, got %T", cmd)
+	}
+}
+
+func TestInboxSlashCommandAckMissingArgShortCircuits(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_xyz"
+	cmd := m.handleLocalCommand("/inbox ack")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd for /inbox ack without id, got %T", cmd)
+	}
+	last := m.transcript[len(m.transcript)-1]
+	if !strings.Contains(last.text, "requires a message id") {
+		t.Fatalf("expected helpful /inbox ack error, got %q", last.text)
+	}
+}
+
+func TestRenderInboxEventCardEmptyForNonKeyMessage(t *testing.T) {
+	m := sessionMessage{Type: messageTypeFinding, Priority: priorityLow}
+	if got := renderInboxEventCard(m, sessionChannel{}); got != "" {
+		t.Fatalf("low-priority finding should not produce an event card, got %q", got)
+	}
+}
+
+func TestRenderInboxEventCardShowsGovernanceForMemoryCandidate(t *testing.T) {
+	m := sessionMessage{
+		MessageID: "msg_mc_1",
+		ChannelID: "chan_direct_1",
+		Type:      messageTypeMemoryCandidate,
+		Priority:  priorityNormal,
+		FromSessionID: "sess_peer_1",
+		ToSessionID:   "sess_self",
+		Content:   "blocked auto-write",
+		Metadata: map[string]any{
+			"memoryCandidateGovernance": map[string]any{
+				"decision": "rejected",
+				"scope":    "long_term",
+				"approval": map[string]any{"status": "rejected", "requiredBy": "user"},
+				"autoWrite": false,
+			},
+		},
+	}
+	card := renderInboxEventCard(m, sessionChannel{ChannelID: "chan_direct_1", Kind: channelKindDirect})
+	for _, want := range []string{
+		"SessionChannel memory_candidate",
+		"channel=chan_direct_1",
+		"kind=direct",
+		"collaboration context only",
+		"[open inbox: /inbox]",
+		"[ack: /inbox ack msg_mc_1]",
+	} {
+		if !strings.Contains(card, want) {
+			t.Fatalf("event card missing %q\nfull:\n%s", want, card)
+		}
+	}
+}
+
+func TestRenderNewInboxEventCardsSkipsAlreadySeen(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	m.inboxMessages = envelope.Messages
+	baseline := len(m.transcript)
+	m.renderNewInboxEventCards()
+	afterFirst := len(m.transcript)
+	if afterFirst <= baseline {
+		t.Fatalf("first renderNewInboxEventCards should append cards, baseline=%d after=%d", baseline, afterFirst)
+	}
+	// Re-running must not re-emit the same card.
+	m.renderNewInboxEventCards()
+	afterSecond := len(m.transcript)
+	if afterSecond != afterFirst {
+		t.Fatalf("re-running renderNewInboxEventCards should be a no-op, afterFirst=%d afterSecond=%d", afterFirst, afterSecond)
+	}
+}
+
+func TestFetchInboxHTTPCmdSendsIncludeAckQuery(t *testing.T) {
+	var seenPath string
+	var seenQuery string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenQuery = r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"session_inbox","sessionId":"sess_xyz","messages":[],"limit":50,"includeAcknowledged":true}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := fetchInbox(m.cfg, "sess_xyz", true)
+	msg := cmd()
+	inbox, ok := msg.(inboxMsg)
+	if !ok {
+		t.Fatalf("expected inboxMsg, got %T", msg)
+	}
+	if inbox.err != nil {
+		t.Fatalf("fetchInbox returned err: %v", inbox.err)
+	}
+	if seenPath != "/v1/sessions/sess_xyz/inbox" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+	if !strings.Contains(seenQuery, "includeAcknowledged=true") {
+		t.Fatalf("includeAcknowledged=true missing from query, got %q", seenQuery)
+	}
+	if !inbox.includeAck {
+		t.Fatalf("inbox.includeAck should be true")
+	}
+}
+
+func TestAckInboxMessageHTTPCmdPostsToCorrectPath(t *testing.T) {
+	var seenMethod string
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"session_message_acknowledged","sessionId":"sess_xyz","message":null}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := ackInboxMessage(m.cfg, "sess_xyz", "msg_ack_target_1")
+	msg := cmd()
+	ack, ok := msg.(inboxAckMsg)
+	if !ok {
+		t.Fatalf("expected inboxAckMsg, got %T", msg)
+	}
+	if ack.err != nil {
+		t.Fatalf("ackInboxMessage returned err: %v", ack.err)
+	}
+	if seenMethod != http.MethodPost {
+		t.Fatalf("seenMethod = %q, want POST", seenMethod)
+	}
+	if seenPath != "/v1/sessions/sess_xyz/inbox/msg_ack_target_1/ack" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+}

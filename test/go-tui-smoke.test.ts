@@ -137,6 +137,11 @@ test('Go TUI smoke: phase 5 续 /context full contextOverlay', { skip: skipReaso
   assert.match(output, /phase 5 续 \/context full contextOverlay verified/)
 })
 
+test('Go TUI smoke: phase 6 /inbox overlay + footer unread indicator', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('inbox-overlay')
+  assert.match(output, /phase 6 inbox overlay \+ footer unread indicator verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)

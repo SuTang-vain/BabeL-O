@@ -2,6 +2,36 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 6 PR1：`/inbox` overlay + footer unread indicator 收口
+
+- **用户请求**: 按文档规划推进 Phase 6 第一个 PR（`/inbox` overlay + footer unread indicator），把 Go TUI 拉到 SessionChannel consumption-side 的 TS TUI parity。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 数据模型: 新增 `SessionChannelKind` / `SessionMessageType` / `SessionMessagePriority` / `SessionMessageStatus` / `SessionChannelStatus` 枚举 + `evidenceRef` / `sessionChannel` / `sessionMessage` / `sessionInboxResponse` 类型。`sessionMessage.Metadata map[string]any` 暴露 governance blob 以便 memory_candidate 走 isKeyInboxMessage 路径。
+    - state machine: 新增 `modeInboxOverlay` inputMode 常量 + 模型字段 `inboxMessages` / `inboxChannels` / `inboxOverlaySelected` / `inboxOverlayScroll` / `inboxOverlayIncludeAck` / `seenInboxCardMessageIDs`。
+    - HTTP: 新增 `fetchInbox(cfg, sessionID, includeAck) tea.Cmd`（GET `/v1/sessions/:id/inbox?includeAcknowledged=...`） + `ackInboxMessage(cfg, sessionID, messageID) tea.Cmd`（POST `/v1/sessions/:id/inbox/:msgId/ack`），两者都返回带 `raw []byte` + decoded envelope 的 typed msg，复用 `nexusRawJSON` 防止 schema churn 击穿。
+    - 渲染: 新增 `inboxStyle` (foreground 33) + `formatInboxFooterStatus`（linked sessions / unread / channel kinds / high segment）+ `buildInboxOverlayLines`（每条 message 3-5 行，selected marker）+ `renderInboxOverlay`（与 help / slash palette / profileConfirm 同 viewport 风格，title `Inbox · Phase 6 overlay` / `Inbox · all · Phase 6 overlay`）+ `renderInboxEventCard`（main flow 关键事件卡片，divider 包裹）+ `renderNewInboxEventCards`（在 inboxMsg handler 调，按 messageId 去重）。
+    - 协议: `isKeyInboxMessage` 复刻 TS `shouldRenderInboxEventCard`——handoff / blocked / request_review / request_validation 总是 key；finding 只在 priority=high 时 key；memory_candidate 在 governance.decision ∈ {rejected, requires_approval} 或 approval.status ∈ {required, rejected} 时 key。
+    - slash 命令: 替换 `/inbox` placeholder——bare `/inbox` 调 unread-only fetch；`/inbox all` 调 includeAck fetch；`/inbox ack <id>` 直接 POST ack；都先 short-circuit 友好状态行（无 active session 时）。
+    - KeyMsg dispatch: 新增 `case modeInboxOverlay`——`esc` / `enter` / `q` 关闭 + 清 `inboxOverlayScroll` / `inboxOverlaySelected` + 写 `inbox closed` 状态行；`up` / `k` 减 selected（clamp 0）；`down` / `j` / `tab` 增 selected（clamp len-1）；`a` 调 `ackSelectedInboxMessage` 触发 ackInboxMessage HTTP；stray key 全部被吞。`submitPrompt` 仍是 `handleLocalCommand` 拥有 mode 转换、不再 defensive reset。
+    - inboxAckMsg handler: ack 成功后只在本地 snapshot 标 status=acknowledged + acknowledgedAt="now" + 写 `inbox ack: <id>` 状态行（避免强制 re-fetch）。
+    - `renderFooter`: 现有 hint 后追加 inbox footer 状态（`linked sessions: N [...]` / `inbox: N unread` / `channels: kind1 N/kind2 M` / `high: <type>`），用 `  · ` 分隔，宽度超限时走 `truncatePlain`。
+    - View(): 拼接 inboxOverlay 段在 contextOverlay 之后、input / footer 之前。
+    - helpOverlayLines: 新增 Inbox overlay 段。
+- **回归覆盖**:
+  - `clients/go-tui/main_test.go` 新增 22 个单测：`fullInboxPayload()` helper 覆盖 handoff / finding-low / memory_candidate governance 三种关键消息 + `TestIsKeyInboxMessageFlagsHighPriorityAndGovernance` / `TestFormatInboxFooterStatusRendersUnreadAndLinkedAndHigh` / `TestFormatInboxFooterStatusEmptyWhenNothingToSurface` / `TestBuildInboxOverlayLinesRendersMessagesWithSelectedMarker` / `TestBuildInboxOverlayLinesPlaceholderWhenEmpty` / `TestRenderInboxOverlayEmptyOutsideMode` / `TestRenderInboxOverlayShowsHeaderInMode` / `TestRenderInboxOverlayAllVariantSwitchesBanner` / `TestInboxOverlayOpensOnMsgAndClearsOnClose` / `TestInboxOverlaySelectionClampsAtBounds` / `TestInboxOverlayEscapeCloses` / `TestInboxOverlayStrayKeyDoesNotReachTextinput` / `TestInboxMsgErrorAppendsFriendlyLine` / `TestInboxAckMsgSuccessUpdatesLocalSnapshot` / `TestInboxSlashCommandEmptySessionShortCircuits` / `TestInboxSlashCommandAllRequiresSession` / `TestInboxSlashCommandAckMissingArgShortCircuits` / `TestRenderInboxEventCardEmptyForNonKeyMessage` / `TestRenderInboxEventCardShowsGovernanceForMemoryCandidate` / `TestRenderNewInboxEventCardsSkipsAlreadySeen` / `TestFetchInboxHTTPCmdSendsIncludeAckQuery` / `TestAckInboxMessageHTTPCmdPostsToCorrectPath`。
+  - `test/go_tui_pty_driver.py`: 新增 `run_inbox_overlay_sequence`——bash round-trip populate sessionID、approve permission、等 `Bash done` + `done success=true`，然后 `/inbox` 等 `loading shared Nexus inbox (unread)` + `Inbox · Phase 6 overlay` header + `No unread inbox messages.` placeholder + 按 down 在空 list 上不能 crash + esc 关 overlay + `inbox closed` 状态行；再 `/inbox all` 等 banner 切换到 `Inbox · all · Phase 6 overlay` + `No inbox messages.` placeholder + esc 关掉。加进 `SEQUENCES` registry。
+  - `test/go-tui-smoke.test.ts`: 加第 13 个测试——`inbox-overlay` 跑 driver `--sequence inbox-overlay` 并断言 `phase 6 inbox overlay + footer unread indicator verified`。`all` orchestrator 顺序不动——保留原 7 序列（与 context-overlay / context-and-compact 同等待遇，避免 back-to-back permission panel race）。
+- **范围克制**:
+  - 自动 inbox refresh on `result` event 留到下一 PR——本次只在 `/inbox` 首次 fetch 后渲染 event cards，避免在 bash round-trip 中 race Nexus event 循环。
+  - `/inbox` 静态 `/v1/sessions/:id/inbox` 不返回 channels 元数据（仅消息）——`inboxMsg` handler 现在把 `m.inboxChannels` 重置为 nil，footer / overlay 退回到只用 message.FromSessionID 推导 linked sessions。等下一阶段若 Nexus 暴露 channels 端点再补 channels-by-id map。
+  - PTY smoke 走 empty-inbox 路径；不强制 seed SessionChannel message（避免依赖 Nexus `seed inbox` / 临时 workspace fixture）——已通过 Go 单测 + 关键消息路径覆盖 message-driven UX。
+  - `quote into current prompt` 留 Phase 6 PR2——TS TUI 的 quote 逻辑要打开 inboxOverlay 选消息再关闭后回填 textinput，本次只做 ack / list 两条主路径。
+- **验证**:
+  - `cd clients/go-tui && go build .` 通过。
+  - `cd clients/go-tui && go test -v -count=1 ./...`：123/123 通过（101 旧 + 22 新）。
+  - 下一 PR：补 `/inbox quote`（从 inbox overlay 回到 composing 时把选中消息作为 `<attached_inbox_message>` prefill 到 textinput）+ 自动 inbox refresh on `result` event + activity overlay。
+
 ## 2026-06-09 — Go TUI Phase 5 续：contextOverlay 模式 + compact post-compact 详表 收口
 
 - **用户请求**: 按文档规划推进 Phase 5 续（`/context` full `contextView` + `contextOverlay`、`/compact` post-compact 详表）。
