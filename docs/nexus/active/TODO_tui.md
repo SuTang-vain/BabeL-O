@@ -91,13 +91,29 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
 - 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
 
-近期只保留一个未收口项：
+近期未收口项：
 
 - [x] Phase 1 opt-in Go TUI smoke harness（2026-06-09 收口）。
   - `test/go_tui_pty_driver.py` + `test/go-tui-smoke.test.ts` 已落地，验证 `bbl go --no-alt` 下 `bash echo go-tui-smoke` 走通 Nexus → `Permission: Bash` → approve → `Bash done success=true` → `done success=true`。
   - 默认 `BABEL_O_RUN_GO_TUI_SMOKE` 未设置时 skip；显式 `npm run test:go-tui:smoke` 启动。
   - 失败时打印 cleaned transcript + raw terminal bytes。
   - CI 默认不引用该脚本，避免强制 Go toolchain 依赖。
+- [x] Phase 2 event renderer parity（2026-06-09 收口）。
+  - `formatNexusEvent` 补 9 个 case：`user_message` / `user_intake_guidance` / `task_created` / `task_session_event` / `agent_job_event` / `compact_boundary` / `compact_failure` / `session_memory_updated` / `execution_metrics`，不再 fall through 到 `compactJSON`。
+  - `linePresentation` 加 11 个稳定 8 字符 label。
+  - `renderPermission` 现在显示 `input: <command>` 与 `reason: <message>`——直接收掉之前标记的 P1 安全 UX bug（用户盲批 Bash）。
+  - `formatToolInput(name, input)` 按工具名提取最相关字段（Bash.command / Read.path / Grep.pattern / ListDir.path / TaskCreate.title）。
+  - 16 个 Go test 守住 Phase 2 行为；`go test ./...` 21/21 通过；`npm run test:go-tui:smoke` 仍过。
+
+后续：
+
+- Phase 3 Input owner / overlay state machine。
+- Phase 4 slash/tool palette / model UX。
+- Phase 5 context/compact 长会话 UX。
+- Phase 6 Agent/Task/SessionChannel views。
+- Phase 7 Go TUI PTY/visual regression harness（建议补：加 `input` 行的 PTY smoke 守住权限面板 UX 改进不回归）。
+- Phase 8 packaging/distribution。
+- Phase 9 promotion gate。
 
 后续只有 Phase 1 稳定后才推进：
 

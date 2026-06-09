@@ -191,6 +191,7 @@
 - Cache-aware compact / 长上下文利用已收口：新增纯 policy helper、adaptive assembly ceiling、runtime auto-compact policy、provider loop guard 和 `/context` cache economics 展示；focused 回归覆盖长窗口 effective ceiling、cache-preserving threshold、env hard cap、provider context error 保守路径和 CLI reason 输出。
 - Context Manager / ContextForker 规范化已收口：显式 pipeline phases、统一 ContextItem/Scored/Selected types、selection diagnostics、retained/dropped reason 与 `/context` 展示已接入；ContextForker 已支持 `minimal`、`working-set`、`task-focused`、`full-summary`、`debug-replay` 多模式 fork diagnostics。
 - Go TUI Phase 1 opt-in smoke harness 已收口：`test/go_tui_pty_driver.py` + `test/go-tui-smoke.test.ts` 在 `BABEL_O_RUN_GO_TUI_SMOKE=1` 下固化 `bbl go --no-alt` → `bash <command>` → `Permission: Bash` → `a` approve → `Bash done success=true` → `done success=true` 链路；默认 skip，CI 不强制 Go toolchain；`test/go-command.test.ts` 增加 driver `--help` 探针守住 Python 端 CLI 表面。
+- Go TUI Phase 2 event renderer parity 已收口：`formatNexusEvent` 补 9 个 case（`user_message` / `user_intake_guidance` / `task_created` / `task_session_event` / `agent_job_event` / `compact_boundary` / `compact_failure` / `session_memory_updated` / `execution_metrics`），不再 fall through 到 `compactJSON`；`linePresentation` 加 11 个稳定 8 字符 label；`renderPermission` 现在展示 `input: <command>` 与 `reason: <message>`（消除 P1 安全 UX bug：`Permission: Bash (execute risk)` 不再盲批）；`formatToolInput` 按工具名提取最相关字段；21 个 Go test 全过。
 
 ## 仍需守住的底线
 

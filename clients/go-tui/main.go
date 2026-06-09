@@ -55,6 +55,8 @@ type pendingPermission struct {
 	toolUseID string
 	name      string
 	risk      string
+	input     string
+	message   string
 }
 
 type transcriptLine struct {
@@ -290,14 +292,22 @@ func (m model) renderPermission(width int) string {
 	if m.pending == nil {
 		return ""
 	}
-	line := fmt.Sprintf(
+	header := fmt.Sprintf(
 		"Permission: %s (%s risk)  a/y approve  r/n/esc reject",
 		firstNonEmpty(m.pending.name, "tool"),
 		firstNonEmpty(m.pending.risk, "unknown"),
 	)
+	parts := []string{header}
+	if input := strings.TrimSpace(m.pending.input); input != "" {
+		parts = append(parts, "  input: "+input)
+	}
+	if msg := strings.TrimSpace(m.pending.message); msg != "" {
+		parts = append(parts, "  reason: "+msg)
+	}
+	joined := strings.Join(parts, "\n")
 	return strings.Join([]string{
 		divider(width),
-		permissionStyle.Render(truncatePlain(line, width)),
+		permissionStyle.Render(wrapPlain(joined, max(0, width-2))),
 	}, "\n")
 }
 
@@ -364,6 +374,8 @@ func (m *model) consumeNexusEvent(event map[string]any) {
 			toolUseID: stringField(event, "toolUseId"),
 			name:      stringField(event, "name"),
 			risk:      stringField(event, "risk"),
+			input:     formatToolInput(stringField(event, "name"), event["input"]),
+			message:   stringField(event, "message"),
 		}
 		m.resize()
 		m.appendLine("permission", formatNexusEvent(event))
@@ -457,6 +469,28 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 		return "hook ok  ", mutedStyle
 	case "hook_failed":
 		return "hook no  ", errorStyle
+	case "task_created":
+		return "task +   ", toolStyle
+	case "task_session_event":
+		return "task     ", toolStyle
+	case "agent_job_event":
+		return "agent    ", toolStyle
+	case "user_message":
+		return "you      ", userStyle
+	case "user_intake_guidance":
+		return "intake   ", mutedStyle
+	case "compact_boundary":
+		return "compact+ ", statusStyle
+	case "compact_failure":
+		return "compact! ", errorStyle
+	case "context_warning":
+		return "ctx warn ", statusStyle
+	case "context_blocking":
+		return "ctx stop ", errorStyle
+	case "session_memory_updated":
+		return "memory   ", mutedStyle
+	case "execution_metrics":
+		return "metrics  ", mutedStyle
 	case "permission", "permission_request", "permission_response":
 		return "permit   ", permissionStyle
 	case "error":
@@ -515,6 +549,24 @@ func formatNexusEvent(event map[string]any) string {
 		))
 	case "hook_failed":
 		return fmt.Sprintf("%s %s%s failed: %s", stringField(event, "hookName"), stringField(event, "hookEvent"), formatOptionalToolName(event), stringField(event, "message"))
+	case "user_message":
+		return truncatePlain(singleLine(stringField(event, "text")), 200)
+	case "user_intake_guidance":
+		return fmt.Sprintf("intent=%s requiresTools=%v reason=%s", stringField(event, "intent"), event["requiresTools"], stringField(event, "reason"))
+	case "task_created":
+		return fmt.Sprintf("id=%s title=%s", shortID(stringField(event, "taskId")), stringField(event, "title"))
+	case "task_session_event":
+		return fmt.Sprintf("eventType=%s phase=%s%s", stringField(event, "eventType"), stringField(event, "phase"), summarizeTaskSessionPayload(event["payload"]))
+	case "agent_job_event":
+		return fmt.Sprintf("eventType=%s jobId=%s status=%s agentType=%s", stringField(event, "eventType"), shortID(stringField(event, "jobId")), stringField(event, "status"), stringField(event, "agentType"))
+	case "compact_boundary":
+		return fmt.Sprintf("trigger=%s before=%d after=%d summary=%dchars snipped=%d", stringField(event, "trigger"), anyInt(event["beforeEventCount"]), anyInt(event["afterEventCount"]), anyInt(event["summaryChars"]), anyInt(event["snippedToolResults"]))
+	case "compact_failure":
+		return fmt.Sprintf("trigger=%s failures=%d/%d: %s", stringField(event, "trigger"), anyInt(event["failureCount"]), anyInt(event["maxFailures"]), stringField(event, "message"))
+	case "session_memory_updated":
+		return fmt.Sprintf("trigger=%s reason=%s chars=%d events=%d", stringField(event, "trigger"), firstNonEmpty(stringField(event, "reason"), "n/a"), anyInt(event["summaryChars"]), anyInt(event["eventCount"]))
+	case "execution_metrics":
+		return fmt.Sprintf("dur=%dms input=%d output=%d tools=%d firstToken=%dms", anyInt(event["executeDurationMs"]), anyInt(event["inputTokens"]), anyInt(event["outputTokens"]), anyInt(event["toolCallCount"]), anyInt(event["providerFirstTokenMs"]))
 	case "result":
 		return fmt.Sprintf("success=%v %s", event["success"], firstNonEmpty(stringField(event, "message"), stringField(event, "text")))
 	case "error":
@@ -592,6 +644,96 @@ func stringAnyField(value map[string]any, key string) string {
 
 func singleLine(text string) string {
 	return strings.Join(strings.Fields(text), " ")
+}
+
+func anyInt(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int32:
+		return int(typed)
+	case int64:
+		return int(typed)
+	case float32:
+		return int(typed)
+	case float64:
+		return int(typed)
+	case json.Number:
+		parsed, _ := typed.Int64()
+		return int(parsed)
+	default:
+		return 0
+	}
+}
+
+func summarizeTaskSessionPayload(payload any) string {
+	if payload == nil {
+		return ""
+	}
+	m, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	parts := []string{}
+	if sub := stringAnyField(m, "subagent"); sub != "" {
+		parts = append(parts, "subagent="+sub)
+	}
+	if subId := stringAnyField(m, "subSessionId"); subId != "" {
+		parts = append(parts, "subSessionId="+shortID(subId))
+	}
+	if parent := stringAnyField(m, "parentTaskId"); parent != "" {
+		parts = append(parts, "parentTaskId="+parent)
+	}
+	if depth := m["depth"]; depth != nil {
+		parts = append(parts, fmt.Sprintf("depth=%d", anyInt(depth)))
+	}
+	if status := stringAnyField(m, "status"); status != "" {
+		parts = append(parts, "status="+status)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return " " + strings.Join(parts, " ")
+}
+
+// formatToolInput returns a one-line preview of the most relevant
+// field for a permission_request payload. The TUI needs this so the
+// user can see what they are about to approve.
+func formatToolInput(name string, input any) string {
+	if input == nil {
+		return ""
+	}
+	m, ok := input.(map[string]any)
+	if !ok {
+		return singleLine(truncatePlain(fmt.Sprintf("%v", input), 120))
+	}
+	switch name {
+	case "Bash":
+		if cmd := stringAnyField(m, "command"); cmd != "" {
+			return singleLine(truncatePlain(cmd, 120))
+		}
+	case "Read", "Write", "Edit":
+		if path := stringAnyField(m, "path"); path != "" {
+			return path
+		}
+	case "Grep":
+		if pattern := stringAnyField(m, "pattern"); pattern != "" {
+			return "pattern=" + pattern
+		}
+	case "Glob":
+		if pattern := stringAnyField(m, "pattern"); pattern != "" {
+			return "pattern=" + pattern
+		}
+	case "ListDir":
+		if path := stringAnyField(m, "path"); path != "" {
+			return path
+		}
+	case "TaskCreate":
+		if title := stringAnyField(m, "title"); title != "" {
+			return "title=" + title
+		}
+	}
+	return singleLine(truncatePlain(compactJSON(input), 120))
 }
 
 func startStream(cfg config, prompt string) tea.Cmd {

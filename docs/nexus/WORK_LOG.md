@@ -2,6 +2,27 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 2 event renderer parity 收口
+
+- **用户请求**: 按规划推进 Go TUI Phase 2。
+- **实现**:
+  - `clients/go-tui/main.go` `formatNexusEvent` 补 9 个 case：`user_message` / `user_intake_guidance` / `task_created` / `task_session_event` / `agent_job_event` / `compact_boundary` / `compact_failure` / `session_memory_updated` / `execution_metrics`。这 9 类事件此前都 fall through 到 `compactJSON`（裸 JSON），现在都有稳定摘要。
+  - 配套 helper：`anyInt(any)`（兼容 json.Number / int64 / float64 等 Nexus 数值编码）、`summarizeTaskSessionPayload(any)`（从 `task_session_event.payload` 抽出 subagent / parentTaskId / depth / status）。
+  - `linePresentation` 加 11 个新稳定 8 字符 label（`task +` / `task` / `agent` / `compact+` / `compact!` / `ctx warn` / `ctx stop` / `memory` / `metrics` / `you` / `intake`）。原 9 个未识别的 kind 落到 default（`padRight(kind, 8)`）现在落到稳定 label。
+  - `pendingPermission` 增 `input` / `message` 字段；`renderPermission` 多展示 `input: <command>` 与 `reason: <message>` 两行；新增 `formatToolInput(name, input)` helper 按工具名提取最相关字段（`Bash.command` / `Read.path` / `Grep.pattern` / `ListDir.path` / `TaskCreate.title` / 其它 → `compactJSON` 截断）。**直接收掉了我之前标记的 P1 安全 UX bug**——现在用户能看见自己批的是什么 Bash 命令。
+  - `clients/go-tui/main_test.go` 加 16 个 Phase 2 回归 test，覆盖：9 个新 formatter、`formatToolInput` 三种典型工具、`renderPermission` 必须含 `input:` 与 `reason:` 行、`linePresentation` 必须返回稳定 label、所有 9 类新事件不再 fall through 到 `compactJSON`。
+  - 重编译 `clients/go-tui/go-tui` 预编译二进制（9.6M）。
+- **验证**:
+  - `go test ./...` 21/21 pass（5 原有 + 16 新增）。
+  - `npm run typecheck` / `npm run format:check` 干净。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 仍通过（2.2s）——Phase 1 的 permission approve 链路在新增的 `input` 渲染下没破坏。
+  - TS 周边 65 个回归（go-command / chat-command / sessions-command / ui / tui-input / grep-tool / install-script）全过。
+- **范围克制**:
+  - 没引入 `compact/expanded` 切换键——当前 `permission_request` 的 input 已经是单行截断 120 字符的 compact 形态，未来 Phase 7 PTY harness 可以加 expand 交互。
+  - 没改 `provider recovery/fallback` 展示——TS 端不通过独立事件下发，而是用 `usage` + `tool_denied` 表达，Go TUI 已经覆盖。
+  - 没动 `SessionChannel inbox/key cards`——按规划划归 Phase 6。
+  - `permission_request` 现在会展示 input，但 `tool_started` 仍然只显示 `compactJSON(input)`——和原行为一致，不破坏可读性前提下先收 Phase 2 主线。
+
 ## 2026-06-09 — Go TUI Phase 1 opt-in smoke harness 收口
 
 - **用户请求**: 按规划文档 `docs/nexus/reference/go-tui-rewrite-plan.md` Phase 1 与 `docs/nexus/active/TODO_tui.md` 唯一打开项推进：固化当前手动验证过的 local Nexus + Bash permission approve 链路，不扩大功能面。
