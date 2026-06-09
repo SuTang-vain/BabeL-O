@@ -3248,3 +3248,186 @@ func TestFetchSessionTasksHTTPCmdSendsCorrectPath(t *testing.T) {
 		t.Fatalf("trigger = %q, want user", tasks.trigger)
 	}
 }
+
+func TestFormatActivityKindIconAllValues(t *testing.T) {
+	cases := map[activityEventKind]string{
+		activityKindToolStarted:     "[tool>]",
+		activityKindToolCompleted:   "[toolok]",
+		activityKindPermission:      "[perm]",
+		activityKindAgentJob:        "[agent]",
+		activityKindContextWarning:  "[ctx-warn]",
+		activityKindContextBlocking: "[ctx-stop]",
+	}
+	for kind, want := range cases {
+		if got := formatActivityKindIcon(kind); got != want {
+			t.Fatalf("formatActivityKindIcon(%s) = %q, want %q", kind, got, want)
+		}
+	}
+	// Unknown kind falls through to bracketed raw text.
+	if got := formatActivityKindIcon(activityEventKind("weird_event")); got != "[weird_event]" {
+		t.Fatalf("unknown kind should bracket raw text, got %q", got)
+	}
+}
+
+func TestRecordActivityEventAppendsAndCapsAtBuffer(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := len(m.activityEvents); got != 0 {
+		t.Fatalf("fresh model should have empty activity buffer, got %d", got)
+	}
+	// Push past the cap to verify the oldest entries are dropped.
+	for i := 0; i < activityBufferCap+5; i++ {
+		m.recordActivityEvent(activityKindToolStarted, fmt.Sprintf("tool-call-%d", i), "ts")
+	}
+	if got := len(m.activityEvents); got != activityBufferCap {
+		t.Fatalf("activity buffer should cap at %d, got %d", activityBufferCap, got)
+	}
+	// The oldest entries should have been dropped, so the
+	// first remaining entry is tool-call-5 (the first 5 were
+	// dropped).
+	if got := m.activityEvents[0].Summary; got != "tool-call-5" {
+		t.Fatalf("first surviving entry should be tool-call-5, got %q", got)
+	}
+	if got := m.activityEvents[activityBufferCap-1].Summary; got != fmt.Sprintf("tool-call-%d", activityBufferCap+4) {
+		t.Fatalf("last entry should be tool-call-%d, got %q", activityBufferCap+4, got)
+	}
+}
+
+func TestRecordActivityEventFallsBackToKindWhenSummaryEmpty(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.recordActivityEvent(activityKindToolStarted, "", "")
+	if got := m.activityEvents[0].Summary; got != "[tool_started]" {
+		t.Fatalf("empty summary should fall back to bracketed kind, got %q", got)
+	}
+}
+
+func TestBuildActivityOverlayLinesRendersNewestFirst(t *testing.T) {
+	entries := []activityEventEntry{
+		{Kind: activityKindToolStarted, Summary: "first", Timestamp: "ts1"},
+		{Kind: activityKindToolCompleted, Summary: "second", Timestamp: "ts2"},
+		{Kind: activityKindPermission, Summary: "third", Timestamp: "ts3"},
+	}
+	lines := buildActivityOverlayLines(entries)
+	if len(lines) != 3 {
+		t.Fatalf("expected 3 lines, got %d", len(lines))
+	}
+	// Newest first → first line should reference "third".
+	if !strings.Contains(lines[0], "third") {
+		t.Fatalf("first line should be newest (third), got %q", lines[0])
+	}
+	if !strings.Contains(lines[len(lines)-1], "first") {
+		t.Fatalf("last line should be oldest (first), got %q", lines[len(lines)-1])
+	}
+}
+
+func TestBuildActivityOverlayLinesEmptyPlaceholder(t *testing.T) {
+	lines := buildActivityOverlayLines(nil)
+	if len(lines) != 1 || lines[0] != "No recent activity recorded yet." {
+		t.Fatalf("expected single empty placeholder, got %v", lines)
+	}
+}
+
+func TestSummarizeActivityEventsRendersPerKindCounts(t *testing.T) {
+	entries := []activityEventEntry{
+		{Kind: activityKindToolStarted},
+		{Kind: activityKindToolStarted},
+		{Kind: activityKindToolCompleted},
+		{Kind: activityKindPermission},
+		{Kind: activityKindContextWarning},
+	}
+	got := summarizeActivityEvents(entries)
+	for _, want := range []string{"tool_started 2", "tool_completed 1", "permission 1", "context_warning 1"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summarizeActivityEvents missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestSummarizeActivityEventsEmpty(t *testing.T) {
+	if got := summarizeActivityEvents(nil); got != "no recent activity" {
+		t.Fatalf("empty summary should report no recent activity, got %q", got)
+	}
+}
+
+func TestRenderActivityOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderActivityOverlay(120); got != "" {
+		t.Fatalf("renderActivityOverlay outside modeActivityOverlay should be empty, got %q", got)
+	}
+}
+
+func TestRenderActivityOverlayShowsHeaderInMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.inputMode = modeActivityOverlay
+	m.height = 30
+	m.activityEvents = []activityEventEntry{
+		{Kind: activityKindToolStarted, Summary: "Bash echo hi", Timestamp: "2026-06-10T10:00:00Z"},
+		{Kind: activityKindPermission, Summary: "permit approved=true", Timestamp: "2026-06-10T10:00:01Z"},
+	}
+	rendered := m.renderActivityOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderActivityOverlay in modeActivityOverlay should be non-empty")
+	}
+	for _, want := range []string{
+		"Recent activity · Phase 6 PR5 overlay",
+		"tool_started 1", "permission 1",
+		"Bash echo hi", "permit approved=true",
+		"scroll", "close",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered activity overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestConsumeNexusEventRecordsActivityForToolEvents(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_activity_1"
+	// Fire a tool_started event with a Bash toolUseId + name +
+	// input so formatToolInput produces a useful summary.
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":      "tool_started",
+		"name":      "Bash",
+		"input":     map[string]any{"command": "echo go-tui-activity"},
+		"timestamp": "2026-06-10T10:00:00Z",
+	})
+	if got := len(m.activityEvents); got != 1 {
+		t.Fatalf("tool_started should record one activity event, got %d", got)
+	}
+	entry := m.activityEvents[0]
+	if entry.Kind != activityKindToolStarted {
+		t.Fatalf("recorded kind = %s, want tool_started", entry.Kind)
+	}
+	if !strings.Contains(entry.Summary, "echo go-tui-activity") {
+		t.Fatalf("recorded summary should include the Bash command, got %q", entry.Summary)
+	}
+}
+
+func TestConsumeNexusEventSkipsActivityForIrrelevantEvents(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_activity_2"
+	// tool_denied, usage, hook_* are intentionally NOT recorded.
+	for _, eventType := range []string{"tool_denied", "usage", "hook_started", "hook_completed", "hook_failed"} {
+		_ = m.consumeNexusEvent(map[string]any{"type": eventType})
+	}
+	if got := len(m.activityEvents); got != 0 {
+		t.Fatalf("only tool_started / tool_completed / permission_response / context_warning / context_blocking / agent_job_event should record; got %d entries", got)
+	}
+}
+
+func TestActivityOverlayOpensAndCloses(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	// /activity should open the overlay even with an empty buffer.
+	cmd := m.handleLocalCommand("/activity")
+	if cmd != nil {
+		t.Fatalf("expected nil cmd (no HTTP round-trip), got %T", cmd)
+	}
+	if m.inputMode != modeActivityOverlay {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeActivityOverlay)
+	}
+	// Esc closes.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um := updated.(model)
+	if um.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", um.inputMode, modeComposing)
+	}
+}

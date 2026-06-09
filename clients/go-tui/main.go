@@ -515,6 +515,36 @@ type tasksListMsg struct {
 	err       error
 }
 
+// activityEventKind enumerates the high-signal Nexus event
+// types the Go TUI records into the in-memory activity buffer
+// for the /activity overlay. Mirrors the TS TUI's
+// activityOverlay.ts event selection (recent tool runs /
+// permission decisions / agent job events / context warnings).
+type activityEventKind string
+
+const (
+	activityKindToolStarted     activityEventKind = "tool_started"
+	activityKindToolCompleted   activityEventKind = "tool_completed"
+	activityKindPermission      activityEventKind = "permission"
+	activityKindAgentJob        activityEventKind = "agent_job"
+	activityKindContextWarning  activityEventKind = "context_warning"
+	activityKindContextBlocking activityEventKind = "context_blocking"
+)
+
+// activityEventEntry is one row in the in-memory activity
+// buffer. Capped at activityBufferCap entries (oldest dropped
+// first) so the Go TUI can surface a recent-activity snapshot
+// without an extra Nexus round-trip.
+type activityEventEntry struct {
+	Kind      activityEventKind
+	Summary   string
+	Timestamp string
+}
+
+// activityBufferCap bounds the in-memory activity buffer so a
+// long-running session can't grow the model unbounded.
+const activityBufferCap = 50
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -535,6 +565,7 @@ const (
 	modeInboxOverlay   inputMode = "inboxOverlay"   // read-only SessionChannel inbox; up/down/a/esc/enter/q
 	modeAgentOverlay   inputMode = "agentOverlay"   // read-only multi-agent status; up/down/esc/enter/q
 	modeTaskBoard      inputMode = "taskBoard"      // read-only task board; up/down/esc/enter/q
+	modeActivityOverlay inputMode = "activityOverlay" // read-only recent activity; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -574,6 +605,8 @@ type model struct {
 	agentOverlayScroll int
 	taskBoard        []nexusTask
 	taskBoardScroll  int
+	activityEvents     []activityEventEntry
+	activityOverlayScroll int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -780,6 +813,21 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
+		name:    "/activity",
+		summary: "open recent activity overlay (Phase 6 PR5)",
+		run: func(m *model, _ []string) tea.Cmd {
+			// No HTTP round-trip — the activity buffer is
+			// populated by consumeNexusEvent as the user
+			// types and the model runs. The overlay is
+			// purely a viewport over the in-memory buffer.
+			m.activityOverlayScroll = 0
+			summary := fmt.Sprintf("activity: %d event(s) recorded", len(m.activityEvents))
+			m.appendLine("status", summary)
+			m.setMode(modeActivityOverlay)
+			return nil
+		},
+	},
+	{
 		name:    "/agents",
 		summary: "open multi-agent status overlay (Phase 6 PR3)",
 		run: func(m *model, _ []string) tea.Cmd {
@@ -958,6 +1006,7 @@ var (
 	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
 	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	taskBoardStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	activityStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
 )
 
 func main() {
@@ -1279,6 +1328,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeActivityOverlay:
+			// Read-only recent activity overlay (Phase 6 PR5).
+			// up/k scroll back; down/j/tab scroll forward;
+			// esc/enter/q close. The activity buffer is
+			// append-only from the WebSocket stream, so no
+			// per-row actions. All other keys are swallowed
+			// so they never reach the textinput.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.activityOverlayScroll = 0
+				m.appendLine("status", "activity closed")
+				return m, nil
+			case "up", "k":
+				if m.activityOverlayScroll > 0 {
+					m.activityOverlayScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildActivityOverlayLines(m.activityEvents)
+				maxScroll := max(0, len(allLines)-1)
+				if m.activityOverlayScroll < maxScroll {
+					m.activityOverlayScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -1562,6 +1639,7 @@ func (m model) View() string {
 	inboxOverlay := m.renderInboxOverlay(width)
 	agentOverlay := m.renderAgentOverlay(width)
 	taskBoard := m.renderTaskBoard(width)
+	activityOverlay := m.renderActivityOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -1587,6 +1665,9 @@ func (m model) View() string {
 	}
 	if taskBoard != "" {
 		parts = append(parts, taskBoard)
+	}
+	if activityOverlay != "" {
+		parts = append(parts, activityOverlay)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -1640,6 +1721,12 @@ var helpOverlayLines = []string{
 	"Task board overlay (Phase 6 PR4):",
 	"  /tasks           open task board for the current session",
 	"  up / down / tab  scroll through the task list",
+	"  esc / enter / q  close the overlay",
+	"",
+	"Recent activity overlay (Phase 6 PR5):",
+	"  /activity        open recent activity (tool runs, permission,",
+	"                   agent job events, context warnings)",
+	"  up / down / tab  scroll through the recent events",
 	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
@@ -2848,6 +2935,119 @@ func (m model) renderTaskBoard(width int) string {
 	return strings.Join([]string{divider(width), taskBoardStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
 }
 
+// formatActivityKindIcon returns a short, terminal-friendly
+// marker for each activity event kind. The icon list is
+// deliberately smaller than the event type list so the
+// /activity overlay rows stay scannable.
+func formatActivityKindIcon(kind activityEventKind) string {
+	switch kind {
+	case activityKindToolStarted:
+		return "[tool>]"
+	case activityKindToolCompleted:
+		return "[toolok]"
+	case activityKindPermission:
+		return "[perm]"
+	case activityKindAgentJob:
+		return "[agent]"
+	case activityKindContextWarning:
+		return "[ctx-warn]"
+	case activityKindContextBlocking:
+		return "[ctx-stop]"
+	}
+	return "[" + fallbackUnknown(string(kind)) + "]"
+}
+
+// buildActivityOverlayLines turns the in-memory activity
+// buffer into the ordered list of lines the /activity
+// overlay will render. Newest entries are shown first
+// (the buffer is appended chronologically). The overlay
+// window is then clamped in renderActivityOverlay.
+// Returns a single placeholder line for the empty case.
+func buildActivityOverlayLines(entries []activityEventEntry) []string {
+	if len(entries) == 0 {
+		return []string{"No recent activity recorded yet."}
+	}
+	lines := []string{}
+	// Newest first.
+	for index := len(entries) - 1; index >= 0; index-- {
+		entry := entries[index]
+		row := formatActivityKindIcon(entry.Kind) + "  " + truncatePlain(entry.Summary, 100)
+		if entry.Timestamp != "" {
+			row += "  " + mutedStyle.Render(entry.Timestamp)
+		}
+		lines = append(lines, row)
+	}
+	return lines
+}
+
+// summarizeActivityEvents is the per-kind count line shown
+// at the top of the activity overlay. Returns "no recent
+// activity" for an empty buffer.
+func summarizeActivityEvents(entries []activityEventEntry) string {
+	counts := map[activityEventKind]int{}
+	for _, entry := range entries {
+		counts[entry.Kind]++
+	}
+	order := []activityEventKind{
+		activityKindToolStarted,
+		activityKindToolCompleted,
+		activityKindPermission,
+		activityKindAgentJob,
+		activityKindContextWarning,
+		activityKindContextBlocking,
+	}
+	parts := []string{}
+	for _, kind := range order {
+		if count := counts[kind]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", kind, count))
+		}
+	}
+	if len(parts) == 0 {
+		return "no recent activity"
+	}
+	return strings.Join(parts, " · ")
+}
+
+// renderActivityOverlay paints the multi-line recent-activity
+// view. It is the Phase 6 PR5 primary UX for the /activity
+// slash command. The overlay is composed of:
+//   - titleStyle header (Phase 6 PR5 banner)
+//   - summary line (per-kind count)
+//   - clamped window of buildActivityOverlayLines (newest
+//     first)
+//   - bottom hint (scroll + close keys)
+//
+// Outside modeActivityOverlay it returns "" so it can be
+// unconditionally spliced into the View() parts list.
+func (m model) renderActivityOverlay(width int) string {
+	if m.inputMode != modeActivityOverlay {
+		return ""
+	}
+	header := titleStyle.Render("Recent activity · Phase 6 PR5 overlay")
+	summary := summarizeActivityEvents(m.activityEvents)
+	visibleRows := max(1, m.height-10)
+	allLines := buildActivityOverlayLines(m.activityEvents)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.activityOverlayScroll > maxScroll {
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[maxScroll:end]
+	} else {
+		end := m.activityOverlayScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[m.activityOverlayScroll:end]
+	}
+	lines := []string{header, divider(width), summary}
+	lines = append(lines, allLines...)
+	hint := "↑/↓/Tab scroll · esc/enter/q close"
+	lines = append(lines, mutedStyle.Render(hint))
+	return strings.Join([]string{divider(width), activityStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -3279,6 +3479,27 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.appendStreamingLine("thinking", stringField(event, "text"))
 	case "tool_started", "tool_completed", "tool_denied", "permission_response", "context_warning", "context_blocking", "usage", "hook_started", "hook_completed", "hook_failed":
 		m.appendLine(eventType, formatNexusEvent(event))
+		// Phase 6 PR5: record high-signal events into the
+		// in-memory activity buffer for the /activity overlay.
+		// tool_denied, usage and hook_* are intentionally NOT
+		// recorded — the TS TUI's activityOverlay only surfaces
+		// tool runs, permission decisions, agent job events,
+		// and context warnings.
+		switch eventType {
+		case "tool_started":
+			m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+		case "tool_completed":
+			m.recordActivityEvent(activityKindToolCompleted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+		case "permission_response":
+			m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
+		case "context_warning":
+			m.recordActivityEvent(activityKindContextWarning, formatNexusEvent(event), stringField(event, "timestamp"))
+		case "context_blocking":
+			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
+		}
+	case "agent_job_event":
+		m.appendLine("agent_job", formatNexusEvent(event))
+		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
 	default:
 		m.appendLine(eventType, formatNexusEvent(event))
 	}
@@ -3299,6 +3520,30 @@ func (m *model) appendStreamingLine(kind string, text string) {
 		}
 	}
 	m.appendLine(kind, text)
+}
+
+// recordActivityEvent appends a high-signal event to the
+// in-memory activity buffer, dropping the oldest entry once
+// the cap is hit. Phase 6 PR5 wires this into consumeNexusEvent
+// for tool_started / tool_completed / permission_response /
+// context_warning / context_blocking / agent_job_event so the
+// /activity overlay has a recent snapshot without an extra
+// Nexus round-trip.
+func (m *model) recordActivityEvent(kind activityEventKind, summary string, timestamp string) {
+	entry := activityEventEntry{
+		Kind:      kind,
+		Summary:   singleLine(strings.TrimSpace(summary)),
+		Timestamp: strings.TrimSpace(timestamp),
+	}
+	if entry.Summary == "" {
+		entry.Summary = "[" + string(kind) + "]"
+	}
+	m.activityEvents = append(m.activityEvents, entry)
+	if len(m.activityEvents) > activityBufferCap {
+		// Drop oldest entries. The buffer is small (cap 50)
+		// so a plain re-slice is fine.
+		m.activityEvents = append([]activityEventEntry(nil), m.activityEvents[len(m.activityEvents)-activityBufferCap:]...)
+	}
 }
 
 func (m *model) appendLine(kind string, text string) {

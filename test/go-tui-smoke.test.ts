@@ -157,6 +157,11 @@ test('Go TUI smoke: phase 6 PR4 /tasks board overlay + auto-refresh', { skip: sk
   assert.match(output, /phase 6 PR4 task board overlay verified/)
 })
 
+test('Go TUI smoke: phase 6 PR5 /activity overlay', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('activity-overlay', 90)
+  assert.match(output, /phase 6 PR5 recent activity overlay verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)

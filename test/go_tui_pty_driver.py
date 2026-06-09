@@ -1185,6 +1185,97 @@ def run_task_board_sequence(
     return True
 
 
+def run_activity_overlay_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 6 PR5: `/activity` opens the recent-activity overlay
+    over the in-memory activity buffer. The buffer is populated
+    by consumeNexusEvent for tool_started / tool_completed /
+    permission_response / context_warning / context_blocking /
+    agent_job_event. This sequence exercises:
+
+      - bash round-trip to populate sessionID AND seed the
+        activity buffer (Bash tool_started + tool_completed +
+        permission_response events all flow through).
+      - /activity → "activity: N event(s) recorded" breadcrumb
+        + "Recent activity · Phase 6 PR5 overlay" header +
+        per-kind summary line + at least one recorded row.
+      - down on a populated list does not crash.
+      - esc closes the overlay + "activity closed" status.
+    """
+    # Step 1+2: populate sessionID AND seed the activity buffer.
+    send(master_fd, "bash echo phase6-activity")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] activity overlay setup: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] activity overlay setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] activity overlay setup: stream did not close cleanly",
+        )
+
+    # Step 3: /activity.
+    send(master_fd, "/activity")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "activity:", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /activity did not surface the 'activity:' breadcrumb",
+        )
+    if not wait_for(master_fd, "Recent activity · Phase 6 PR5 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /activity did not render the overlay header",
+        )
+    # The bash round-trip must have recorded at least one
+    # tool_started + tool_completed + permission_response.
+    if not wait_for(master_fd, "tool_started", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /activity did not surface a tool_started row from the bash round-trip",
+        )
+    if not wait_for(master_fd, "permission", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /activity did not surface a permission row",
+        )
+    if not wait_for(master_fd, "phase6-activity", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /activity did not surface the recorded Bash command text",
+        )
+
+    # Step 4: down on populated list must not crash.
+    send(master_fd, "\x1b[B")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+
+    # Step 5: close the overlay.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "activity closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] activity overlay did not close on Esc",
+        )
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1359,6 +1450,13 @@ SEQUENCES: dict[str, dict] = {
     "task-board": {
         "runner": run_task_board_sequence,
         "ok_message": "phase 6 PR4 task board overlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "activity-overlay": {
+        "runner": run_activity_overlay_sequence,
+        "ok_message": "phase 6 PR5 recent activity overlay verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],
