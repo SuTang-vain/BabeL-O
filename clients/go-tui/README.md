@@ -3,9 +3,11 @@
 This is a minimal external TUI MVP for BabeL-O Nexus.
 
 It intentionally does not replace `bbl chat` and does not embed the TypeScript
-runtime. The client connects to an already running Nexus service via the public
-WebSocket stream API and renders a Bubble Tea shell with a transcript, status
-header, input line, permission panel and layered event output.
+runtime. The client connects to Nexus via the public WebSocket/HTTP APIs and
+renders a Bubble Tea shell with a transcript, status header, input line,
+permission panel and layered event output. The `bbl go` wrapper can auto-start a
+local Nexus service when the target localhost URL is not healthy; the Go binary
+itself remains a client only.
 
 ## Scope
 
@@ -29,14 +31,7 @@ header, input line, permission panel and layered event output.
 
 ## Run
 
-Start Nexus in another terminal:
-
-```bash
-cd /Users/tangyaoyue/DEV/BABEL/BabeL-O
-NEXUS_ALLOWED_TOOLS='*' npm run start
-```
-
-Then run the MVP through the BabeL-O CLI:
+Run the MVP through the BabeL-O CLI:
 
 ```bash
 cd /Users/tangyaoyue/DEV/BABEL/BabeL-O
@@ -44,7 +39,31 @@ npm run cli -- go --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/
 ```
 
 The `bbl go` entry prefers a prebuilt `clients/go-tui/go-tui` binary when it is
-present and falls back to `go run .` from this directory.
+present and falls back to `go run .` from this directory. Before launching the
+TUI it probes `GET /health`; if the target URL is local and unhealthy, it starts
+a managed Nexus child process, waits for health, then shuts that child down when
+the Go TUI exits.
+
+Useful wrapper options:
+
+```bash
+# Connect only; do not auto-start Nexus:
+npm run cli -- go --no-start-nexus --url http://127.0.0.1:3000
+
+# Forward Go TUI config polling:
+npm run cli -- go --poll-interval-ms 0
+
+# Tool allowlist for an auto-started local Nexus. Defaults to env
+# NEXUS_ALLOWED_TOOLS, or "*" when unset. Permission prompts still apply.
+npm run cli -- go --allowed-tools Read,Grep,Glob,Bash
+```
+
+You can still start Nexus yourself and let `bbl go` reuse it:
+
+```bash
+cd /Users/tangyaoyue/DEV/BABEL/BabeL-O
+NEXUS_ALLOWED_TOOLS='*' npm run start
+```
 
 You can also run the client directly:
 

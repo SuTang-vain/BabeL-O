@@ -2,6 +2,28 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 8 early slice：`bbl go` managed Nexus launcher
+
+- **用户请求**: 分析 `bbl go` 是否能直接拉起 Nexus，并按建议推进。
+- **实现**:
+  - `src/cli/commands/go.ts`:
+    - `bbl go` 现在先构建 Go TUI launch spec，再探活 `GET /health`；如果 Go TUI binary/source 本身不可用，不会误启动 Nexus。
+    - 默认 `--start-nexus`；`--no-start-nexus` 保持只连接 `--url`。
+    - localhost / `ws://localhost` URL 不健康时自动 spawn hidden `__server` child，等待健康后再启动 Go TUI；远程 URL 不健康时报错，不尝试本地拉起。
+    - auto-start child 继承 `process.execArgv`，支持开发态 `node --import tsx src/cli/program.ts go` 正确启动 TypeScript `__server`。
+    - auto-start child 设置 `NEXUS_HOST` / `NEXUS_PORT` / `BABEL_O_WORKSPACE` / `NEXUS_ALLOWED_TOOLS`；`NEXUS_ALLOWED_TOOLS` 默认取环境变量，未设置为 `*`，高风险工具仍走现有 permission prompt。
+    - Go TUI 退出或启动失败时，只关闭本次 wrapper 自己拉起的 Nexus child；复用已有 Nexus 时不关闭。
+    - 新增 `--nexus-startup-timeout-ms`、`--allowed-tools`、`--poll-interval-ms` wrapper 选项；`--poll-interval-ms` 透传给 Go TUI。
+  - `test/go-command.test.ts`: 新增 managed launcher 单测覆盖：poll flag 透传、localhost/remote URL 判定、`ws://` health probe 映射、launch spec env/execArgv、健康复用不 spawn、不健康本地启动并等待、`--no-start-nexus` 跳过、远程 URL 拒绝自动启动、health 超时 kill child、later healthy probe 成功。
+  - `clients/go-tui/README.md` 与 `docs/nexus/active/TODO_tui.md` 更新：`bbl go` 现在可自动复用/拉起本地 Nexus；Go binary 仍只是客户端。
+- **验证**:
+  - `test/go-command.test.ts` 15/15 通过。
+  - `npm run typecheck` 通过。
+- **范围克制**:
+  - 不让 Go TUI binary 直接启动 Nexus；managed launcher 只在 TypeScript CLI wrapper 层。
+  - 不自动启动远程 URL；避免把本地服务误当作远程 endpoint。
+  - 不改变 Nexus 权限模型；`NEXUS_ALLOWED_TOOLS='*'` 只开放工具可见性，write/execute 仍需要 permission approval。
+
 ## 2026-06-09 — Go TUI Phase 3：input owner / overlay state machine 收口
 
 - **用户请求**: 按规划推进 Phase 3：Go TUI 自己的唯一输入所有者模型。

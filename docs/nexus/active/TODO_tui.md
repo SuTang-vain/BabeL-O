@@ -87,7 +87,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 当前状态：
 
 - `clients/go-tui/` 已落地 Bubble Tea MVP。
-- `bbl go` 已接入 CLI，优先运行本地 Go TUI binary，缺失时 fallback 到 `go run .`。
+- `bbl go` 已接入 CLI，优先运行本地 Go TUI binary，缺失时 fallback 到 `go run .`；wrapper 会先探活 `GET /health`，本地 URL 不健康时自动拉起 managed Nexus child，远程 URL 或 `--no-start-nexus` 只连接不启动。
 - MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
 - 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
 - Go TUI 已开始消费共享模型配置：启动时拉取 `GET /v1/runtime/config`，header 展示 active profile；`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus HTTP API 读取/切换 profile，不作为 agent prompt 发送。
@@ -129,6 +129,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - 14 个新单测守住：默认 composing、setMode 幂等、canEditInput 唯一性、permission 模式 key 不会污染 textinput、help overlay 开/关/esc、'q' 在 overlay 内不退出、textinput 跨 mode 实例不替换等。
   - `test/go_tui_pty_driver.py` 新增 `phase3-overlay-mutex` 序列：help 开/关 → permission 触发 → permission 模式按 'z' 不污染 textinput → '?' 在 permission 模式被吞掉 → 'a' approve → `Bash done` + `done success=true`。
   - 待补：真正交互式 slash palette（live filter 跟随输入）、toolPalette / historySearch / contextOverlay / inboxOverlay——`inputMode` 已为这些预留常量，下个 phase 继续。
+- [x] Phase 8 packaging/distribution early slice：`bbl go` managed Nexus launcher 收口（2026-06-09 收口）。
+  - `bbl go` 先构建 Go TUI launch spec，避免 Go TUI binary/source 不存在时误启动 Nexus；随后探活 `GET /health`。
+  - localhost / `ws://localhost` URL 不健康时自动启动 `__server` 子进程，并继承 `process.execArgv`，确保开发态 `node --import tsx src/cli/program.ts go` 也能正确拉起 TypeScript server。
+  - managed Nexus child 使用 `BABEL_O_WORKSPACE=<cwd>`、URL 推导的 `NEXUS_HOST` / `NEXUS_PORT`，`NEXUS_ALLOWED_TOOLS` 默认取环境变量，未设置时为 `*`；高风险工具仍走现有 permission prompt。
+  - `--no-start-nexus` 只连接不启动；远程 URL 不健康时报错，不尝试本地拉起；Go TUI 退出时只关闭本次 wrapper 自己拉起的 child，不影响用户已有 Nexus。
+  - `--poll-interval-ms` 已由 wrapper 透传给 Go TUI。
 
 后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / Phase 3 稳定后才推进：
 
@@ -137,18 +143,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - Phase 5 context/compact 长会话 UX。
 - Phase 6 Agent/Task/SessionChannel views。
 - Phase 7 Go TUI PTY/visual regression harness。
-- Phase 8 packaging/distribution。
-- Phase 9 promotion gate。
-
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-2 稳定后才推进：
-
-- §5 路径 C 阶段 3：profile/tombstone UX polish + version polling + profile switch confirmation。
-- Phase 3 Input owner / overlay state machine。
-- Phase 4 slash/tool palette。
-- Phase 5 context/compact long-session UX。
-- Phase 6 Agent/Task/SessionChannel views。
-- Phase 7 Go TUI PTY/visual regression harness。
-- Phase 8 packaging/distribution。
+- Phase 8 packaging/distribution 剩余项：预编译 binary 发布、版本兼容矩阵、安装包策略。
 - Phase 9 promotion gate。
 
 持续边界：
