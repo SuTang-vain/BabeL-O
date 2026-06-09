@@ -2,6 +2,29 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 4：slash / tool palette 收口
+
+- **用户请求**: 按规划推进 Phase 4 slash / tool palette（含真正 live filter slash palette）。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 新增 `slashCommand` 类型（`name` / `aliases` / `summary` / `hasArgs` / `argHint` / `prefix` / `run`）+ 静态注册表覆盖 18 个命令：/help、/config、/profile(/profiles)、/clear、/exit、/context、/compact、/inbox、/models、/tools、/sessions、/agents、/bash、/read、/grep、/glob、/write、/edit。前 12 个是后端命令（无参直接执行 / 有参回退 composing），后 6 个是 prefix-insertion。
+    - 三个 helper：`filterSlashCommands(prefix)`（按 name/alias 前缀过滤，case-insensitive，registry 顺序保留）、`findSlashCommand(input)`（精确匹配含 alias）、`slashCommandNames()` 被 /help inline 使用以避免 init cycle。
+    - `handleLocalCommand` 重写为 registry 查表：未知命令输出 "unknown local command: ..."，已知命令 delegate 到 `cmd.run(m, args)`。
+    - Live-filter palette：用户键入 `/`（空 input）触发 `setMode(modeSlashPick)`，初始化 `paletteFilter` / `paletteSelected`。`modeSlashPick` 路由：esc 关闭并清空、enter 走 `runPaletteSelection`、up/down/tab 导航（clamp 到 [0, len(matched)-1]）、backspace 编辑 filter（空 filter 时退出 palette）、任意 printable rune 追加到 filter 并重置 selection。`printableRuneFromKey` 提取 KeyRunes / KeySpace，避免 textinput 误收键。
+    - `runPaletteSelection` 三种语义：prefix 命令插入 prefix 到 textinput 并回到 composing、hasArgs 但无 prefix 的命令插入 `<cmd> ` + 留 composing、零参命令直接 `cmd.run(m, nil)`。
+    - `renderSlashPalette` 渲染 header（"Slash · /<filter>"）+ divider + 至多 6 个候选（带 `>` 选中标记 + hint + summary）+ 底部 navigation hint。
+    - Tool palette：新增 `toolDescriptor` 类型 + `renderToolPalette(tools)` 方法按 name/risk/source/approval-required 列对齐。`/tools` 注册项渲染 Read/Write/Edit/Bash/Glob/Grep/TaskCreate 静态目录。Phase 7 会把静态目录换成 `/v1/tools/audit` HTTP fetch。
+  - `clients/go-tui/main_test.go`: 15 个 phase 4 新单测——registry 完整性（含必含命令）、alias 解析、live filter 顺序、backspace、esc、up-down clamp、Enter 零参、Enter prefix、palette render 隐藏性、tool palette 对齐、`handleLocalCommand` 未知命令错误路径。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `go test ./...` 76/76 pass（5 原有 + 16 phase 2 + 11 §5 path C phase 3 + 14 phase 3 + 15 phase 4 + 其他 15）。
+  - `go build -o go-tui .` 10M；重编译后预编译二进制刷新。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 仍过（2.1s）——Phase 1 的 bash → permission → approve 路径未受 Phase 4 改动影响。
+- **范围克制（按规划 Phase 4 不包含项）**:
+  - `/context` `/compact` `/inbox` `/models` `/sessions` `/agents` 仍是 status 行 TODO——Phase 5/6 才会 wire 真实 backend。
+  - tool palette 静态目录——Phase 7 才会 wire `/v1/tools/audit`。
+  - `toolPalette` / `historySearch` / `contextOverlay` / `inboxOverlay` `inputMode` 常量保留但暂未启用——Phase 6 继续。
+
 ## 2026-06-09 — Go TUI Phase 8 early slice：`bbl go` managed Nexus launcher
 
 - **用户请求**: 分析 `bbl go` 是否能直接拉起 Nexus，并按建议推进。

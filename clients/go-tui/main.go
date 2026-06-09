@@ -178,6 +178,8 @@ type model struct {
 	configVersion  int
 	profileCount   int
 	tombstoneCount int
+	paletteFilter  string
+	paletteSelected int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -188,6 +190,318 @@ func (m *model) setMode(next inputMode) {
 		return
 	}
 	m.inputMode = next
+}
+
+// slashCommand describes a single Phase 4 slash-palette entry. A command
+// either has zero args (run immediately when the user presses Enter in
+// the palette) or has args (insert the prefix and return to composing
+// so the user can type the rest of the command). The palette never
+// pre-empts the textinput when a command needs an argument.
+type slashCommand struct {
+	name    string
+	aliases []string
+	summary string
+	hasArgs bool
+	argHint string
+	prefix  string // when non-empty, the palette inserts this string into the textinput and returns to composing
+	run     func(m *model, args []string) tea.Cmd
+}
+
+// toolDescriptor is the read-only row the /tools palette renders. The
+// fields map 1:1 to /v1/tools/audit entries; the static defaults
+// below will be replaced by HTTP-fetched data in Phase 7.
+type toolDescriptor struct {
+	name     string
+	risk     string
+	source   string
+	approval bool
+	summary  string
+}
+
+// slashCommands is the static Phase 4 registry. Real backend calls
+// (profile select, config refresh) go through Nexus HTTP; placeholder
+// commands surface a status line so the user knows the entry exists
+// but is not yet wired.
+var slashCommands = []slashCommand{
+	{
+		name:    "/help",
+		summary: "show local command reference",
+		run: func(m *model, _ []string) tea.Cmd {
+			// Inline the name list to avoid the static-init cycle
+			// (slashCommands is still being constructed when this
+			// lambda is created; reading the slice from inside the
+			// body would require it to be fully built first).
+			names := []string{
+				"/help", "/config", "/profile", "/clear", "/exit",
+				"/context", "/compact", "/inbox", "/models", "/tools",
+				"/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
+				"/write", "/edit",
+			}
+			m.appendLine("status", "local commands: "+strings.Join(names, ", "))
+			return nil
+		},
+	},
+	{
+		name:    "/config",
+		summary: "refresh shared Nexus config + profile state",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "refreshing shared Nexus config")
+			return tea.Batch(fetchRuntimeConfig(m.cfg, 0), fetchRuntimeProfiles(m.cfg))
+		},
+	},
+	{
+		name:    "/profile",
+		aliases: []string{"/profiles"},
+		summary: "list profiles (no args) or select a profile",
+		hasArgs: true,
+		argHint: "[name]",
+		run: func(m *model, args []string) tea.Cmd {
+			if len(args) == 0 {
+				m.appendLine("status", "loading shared Nexus profiles")
+				return fetchRuntimeProfiles(m.cfg)
+			}
+			profile := args[0]
+			m.appendLine("status", "selecting shared Nexus profile: "+profile)
+			return selectRuntimeProfile(m.cfg, profile)
+		},
+	},
+	{
+		name:    "/clear",
+		summary: "clear transcript",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.transcript = nil
+			return nil
+		},
+	},
+	{
+		name:    "/exit",
+		aliases: []string{"/quit"},
+		summary: "quit the Go TUI",
+		run: func(_ *model, _ []string) tea.Cmd {
+			return tea.Quit
+		},
+	},
+	{
+		name:    "/context",
+		summary: "show context window usage (TODO: wire to Nexus /v1/runtime/metrics)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/context not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	{
+		name:    "/compact",
+		summary: "trigger context compaction (TODO: wire to Nexus compact endpoint)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/compact not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	{
+		name:    "/inbox",
+		summary: "list SessionChannel inbox (TODO: wire to /v1/sessions/:id/inbox)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/inbox not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	{
+		name:    "/models",
+		summary: "list models (TODO: wire to /v1/runtime/models)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/models not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	{
+		name:    "/tools",
+		summary: "list tools (read-only palette; Phase 4)",
+		run: func(m *model, _ []string) tea.Cmd {
+			// Static catalog mirroring the Go runtime's default
+			// tool registry. Phase 7 will wire this to /v1/tools/audit
+			// so MCP servers and runtime-discovered tools show up
+			// here too.
+			tools := []toolDescriptor{
+				{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a workspace file"},
+				{name: "Write", risk: "write", source: "builtin", approval: true, summary: "create or overwrite a file"},
+				{name: "Edit", risk: "write", source: "builtin", approval: true, summary: "edit an existing file"},
+				{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
+				{name: "Glob", risk: "read", source: "builtin", approval: false, summary: "expand a glob pattern"},
+				{name: "Grep", risk: "read", source: "builtin", approval: false, summary: "search for a regex in workspace"},
+				{name: "TaskCreate", risk: "task", source: "builtin", approval: true, summary: "create a tracked task"},
+			}
+			m.renderToolPalette(tools)
+			return nil
+		},
+	},
+	{
+		name:    "/sessions",
+		summary: "list sessions (TODO: wire to /v1/sessions)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/sessions not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	{
+		name:    "/agents",
+		summary: "list agent jobs (TODO: wire to /v1/agents)",
+		run: func(m *model, _ []string) tea.Cmd {
+			m.appendLine("status", "/agents not yet implemented in Go TUI MVP")
+			return nil
+		},
+	},
+	// Prefix-insertion commands: when picked from the palette, the
+	// command name + space is inserted into the textinput and the user
+	// is dropped back into composing. They never run server-side.
+	{
+		name:    "/bash",
+		summary: "insert Bash prefix",
+		hasArgs: true,
+		argHint: "<command>",
+		prefix:  "/bash ",
+	},
+	{
+		name:    "/read",
+		summary: "insert Read prefix",
+		hasArgs: true,
+		argHint: "<path>",
+		prefix:  "/read ",
+	},
+	{
+		name:    "/grep",
+		summary: "insert Grep prefix",
+		hasArgs: true,
+		argHint: "<pattern>",
+		prefix:  "/grep ",
+	},
+	{
+		name:    "/glob",
+		summary: "insert Glob prefix",
+		hasArgs: true,
+		argHint: "<pattern>",
+		prefix:  "/glob ",
+	},
+	{
+		name:    "/write",
+		summary: "insert Write prefix",
+		hasArgs: true,
+		argHint: "<path> <text>",
+		prefix:  "/write ",
+	},
+	{
+		name:    "/edit",
+		summary: "insert Edit prefix",
+		hasArgs: true,
+		argHint: "<path> <old> <new>",
+		prefix:  "/edit ",
+	},
+}
+
+// filterSlashCommands narrows the registry to entries whose name or
+// alias starts with the given prefix (case-insensitive). The order is
+// preserved so the most "intentional" match is the first listed.
+func filterSlashCommands(prefix string) []slashCommand {
+	if prefix == "" {
+		out := make([]slashCommand, len(slashCommands))
+		copy(out, slashCommands)
+		return out
+	}
+	needle := strings.ToLower(strings.TrimPrefix(prefix, "/"))
+	out := []slashCommand{}
+	for _, c := range slashCommands {
+		if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(c.name, "/")), needle) {
+			out = append(out, c)
+			continue
+		}
+		for _, a := range c.aliases {
+			if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(a, "/")), needle) {
+				out = append(out, c)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// findSlashCommand returns the slash command whose name (or alias)
+// matches input exactly (case-insensitive). Returns nil if no match.
+func findSlashCommand(input string) *slashCommand {
+	name := strings.ToLower(strings.TrimSpace(input))
+	if name == "" {
+		return nil
+	}
+	for i, c := range slashCommands {
+		if strings.ToLower(c.name) == name {
+			return &slashCommands[i]
+		}
+		for _, a := range c.aliases {
+			if strings.ToLower(a) == name {
+				return &slashCommands[i]
+			}
+		}
+	}
+	return nil
+}
+
+// printableRuneFromKey returns the leading printable rune from a
+// tea.KeyMsg, or 0 if the key is a special key (Enter, Esc, arrows,
+// etc.) and must NOT be appended to the palette filter.
+func printableRuneFromKey(msg tea.KeyMsg) rune {
+	if msg.Type == tea.KeyRunes {
+		for _, r := range msg.Runes {
+			if r >= 0x20 && r != 0x7f {
+				return r
+			}
+		}
+	}
+	if msg.Type == tea.KeySpace {
+		return ' '
+	}
+	return 0
+}
+
+// runPaletteSelection executes (or inserts the prefix of) the
+// currently selected command in the slash palette, then resets
+// palette state and returns to composing. For zero-arg commands
+// the runner fires immediately; for has-arg commands the prefix
+// (e.g. "/bash ") is dropped into the textinput so the user can
+// continue typing the rest of the command.
+func (m *model) runPaletteSelection() tea.Cmd {
+	matched := filterSlashCommands(m.paletteFilter)
+	if len(matched) == 0 {
+		m.appendLine("status", "no command matches: /"+m.paletteFilter)
+		return nil
+	}
+	idx := m.paletteSelected
+	if idx < 0 || idx >= len(matched) {
+		idx = 0
+	}
+	cmd := matched[idx]
+	m.paletteFilter = ""
+	m.paletteSelected = 0
+	m.setMode(modeComposing)
+
+	if cmd.prefix != "" {
+		// Insert the prefix into the textinput so the user can keep
+		// typing arguments.
+		m.input.SetValue(cmd.prefix)
+		m.input.CursorEnd()
+		m.appendLine("status", "inserted prefix: "+cmd.prefix)
+		return nil
+	}
+	if cmd.hasArgs {
+		// Has-arg command with no prefix means the command takes a
+		// positional arg parsed by handleLocalCommand; insert the
+		// command name + space and stay in composing.
+		inserted := cmd.name + " "
+		m.input.SetValue(inserted)
+		m.input.CursorEnd()
+		m.appendLine("status", "type the argument, then press enter: "+inserted)
+		return nil
+	}
+	// Zero-arg command: run it immediately.
+	m.appendLine("user", cmd.name)
+	return cmd.run(m, nil)
 }
 
 var (
@@ -333,23 +647,67 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case modeSlashPick:
-			// Phase 3 MVP: slash palette is one-shot — textinput keeps
-			// receiving keys, and `enter` already dispatches via the
-			// composing branch below. We only intercept esc to cancel
-			// and return to composing without running anything.
-			if key == "esc" {
+			// Phase 4 live-filter slash palette.
+			switch key {
+			case "esc":
 				m.input.SetValue("")
+				m.paletteFilter = ""
+				m.paletteSelected = 0
 				m.appendLine("status", "slash cancelled")
 				m.setMode(modeComposing)
 				return m, nil
+			case "enter":
+				cmd := m.runPaletteSelection()
+				return m, cmd
+			case "up", "ctrl+p":
+				if m.paletteSelected > 0 {
+					m.paletteSelected--
+				}
+				return m, nil
+			case "down", "ctrl+n", "tab":
+				matched := filterSlashCommands(m.paletteFilter)
+				if m.paletteSelected < len(matched)-1 {
+					m.paletteSelected++
+				}
+				return m, nil
+			case "backspace":
+				if len(m.paletteFilter) > 0 {
+					m.paletteFilter = m.paletteFilter[:len(m.paletteFilter)-1]
+					m.paletteSelected = 0
+				} else {
+					// Filter is empty: bail out of the palette entirely.
+					m.input.SetValue("")
+					m.setMode(modeComposing)
+				}
+				return m, nil
 			}
-			// fall through to composing handling for typing + enter
+			// Any printable rune is appended to the live filter. We
+			// don't let the textinput itself see the key — the palette
+			// is the single-input-owner.
+			if r := printableRuneFromKey(msg); r != 0 {
+				m.paletteFilter += string(r)
+				m.paletteSelected = 0
+				return m, nil
+			}
+			// Unrecognised key in palette mode: swallow so the textinput
+			// doesn't accidentally consume it.
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
 		if m.inputMode == modeComposing && key == "?" && strings.TrimSpace(m.input.Value()) == "" {
 			m.helpScroll = 0
 			m.setMode(modeHelpOverlay)
+			return m, nil
+		}
+
+		// `/` (empty input) opens the live-filter slash palette. We
+		// intercept the character before the textinput can render it
+		// so the palette has its own render slot.
+		if m.inputMode == modeComposing && key == "/" && strings.TrimSpace(m.input.Value()) == "" {
+			m.paletteFilter = ""
+			m.paletteSelected = 0
+			m.setMode(modeSlashPick)
 			return m, nil
 		}
 
@@ -482,6 +840,7 @@ func (m model) View() string {
 	input := m.renderInput(width)
 	footer := m.renderFooter(width)
 	help := m.renderHelp(width)
+	palette := m.renderSlashPalette(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -489,6 +848,9 @@ func (m model) View() string {
 	}
 	if help != "" {
 		parts = append(parts, help)
+	}
+	if palette != "" {
+		parts = append(parts, palette)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -520,6 +882,27 @@ var helpOverlayLines = []string{
 	"Press esc / enter / q to close.",
 }
 
+// renderToolPalette pushes the static tool catalog into the transcript
+// as a set of status lines, one tool per line. The shape (name,
+// risk, source, approval, summary) matches /v1/tools/audit so the
+// Phase 7 wiring can drop in without changing the user-facing UX.
+func (m *model) renderToolPalette(tools []toolDescriptor) {
+	m.appendLine("status", fmt.Sprintf("tools (%d, read-only):", len(tools)))
+	for _, t := range tools {
+		approval := "no-approval"
+		if t.approval {
+			approval = "approval-required"
+		}
+		// Pad name to 12 chars for column alignment.
+		name := t.name
+		for len(name) < 12 {
+			name += " "
+		}
+		line := fmt.Sprintf("  %s  risk=%-7s  source=%-8s  %s  — %s", name, t.risk, t.source, approval, t.summary)
+		m.appendLine("tool", line)
+	}
+}
+
 func (m model) renderHelp(width int) string {
 	if m.inputMode != modeHelpOverlay {
 		return ""
@@ -545,6 +928,53 @@ func (m model) renderHelp(width int) string {
 		}
 		lines = append(lines, helpOverlayLines[m.helpScroll:end]...)
 	}
+	return strings.Join(lines, "\n")
+}
+
+// renderSlashPalette paints the live-filter palette above the input
+// line. It is a compact overlay: header (current filter), up to
+// 6 candidates with the selected one highlighted, and a hint row.
+func (m model) renderSlashPalette(width int) string {
+	if m.inputMode != modeSlashPick {
+		return ""
+	}
+	matched := filterSlashCommands(m.paletteFilter)
+	visible := 6
+	if len(matched) < visible {
+		visible = len(matched)
+	}
+	header := titleStyle.Render("Slash · " + "/" + m.paletteFilter)
+	lines := []string{header, divider(width)}
+	if visible == 0 {
+		lines = append(lines, mutedStyle.Render("  (no commands match)"))
+	} else {
+		// Clamp selection to a valid range in case the filter shrank.
+		idx := m.paletteSelected
+		if idx < 0 || idx >= visible {
+			idx = 0
+		}
+		for i := 0; i < visible; i++ {
+			c := matched[i]
+			marker := "  "
+			if i == idx {
+				marker = "> "
+			}
+			hint := c.argHint
+			if c.prefix != "" {
+				hint = "→ inserts " + c.prefix
+			} else if c.hasArgs {
+				hint = "→ enter arg: " + c.argHint
+			} else {
+				hint = "→ run"
+			}
+			line := fmt.Sprintf("%s%s    %s    %s", marker, c.name, hint, mutedStyle.Render(c.summary))
+			if i == idx {
+				line = focusedLineStyle.Render(line)
+			}
+			lines = append(lines, line)
+		}
+	}
+	lines = append(lines, mutedStyle.Render("↑↓/Tab navigate · Enter select · Esc cancel"))
 	return strings.Join(lines, "\n")
 }
 
@@ -585,29 +1015,12 @@ func (m *model) handleLocalCommand(input string) tea.Cmd {
 		return nil
 	}
 	m.appendLine("user", input)
-	switch fields[0] {
-	case "/config":
-		m.appendLine("status", "refreshing shared Nexus config")
-		return tea.Batch(fetchRuntimeConfig(m.cfg, 0), fetchRuntimeProfiles(m.cfg))
-	case "/profile", "/profiles":
-		if len(fields) == 1 {
-			m.appendLine("status", "loading shared Nexus profiles")
-			return fetchRuntimeProfiles(m.cfg)
-		}
-		if len(fields) == 2 {
-			profile := fields[1]
-			m.appendLine("status", "selecting shared Nexus profile: "+profile)
-			return selectRuntimeProfile(m.cfg, profile)
-		}
-		m.appendLine("error", "usage: /profile or /profile <name>")
-		return nil
-	case "/help":
-		m.appendLine("status", "local commands: /config, /profile, /profile <name>")
-		return nil
-	default:
+	cmd := findSlashCommand(fields[0])
+	if cmd == nil {
 		m.appendLine("error", "unknown local command: "+fields[0])
 		return nil
 	}
+	return cmd.run(m, fields[1:])
 }
 
 func (m *model) applyRuntimeConfig(config runtimeConfig) {

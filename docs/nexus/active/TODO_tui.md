@@ -129,6 +129,13 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - 14 个新单测守住：默认 composing、setMode 幂等、canEditInput 唯一性、permission 模式 key 不会污染 textinput、help overlay 开/关/esc、'q' 在 overlay 内不退出、textinput 跨 mode 实例不替换等。
   - `test/go_tui_pty_driver.py` 新增 `phase3-overlay-mutex` 序列：help 开/关 → permission 触发 → permission 模式按 'z' 不污染 textinput → '?' 在 permission 模式被吞掉 → 'a' approve → `Bash done` + `done success=true`。
   - 待补：真正交互式 slash palette（live filter 跟随输入）、toolPalette / historySearch / contextOverlay / inboxOverlay——`inputMode` 已为这些预留常量，下个 phase 继续。
+- [x] Phase 4：slash / tool palette 收口（2026-06-09 收口）。
+  - 引入 `slashCommand` 类型 + 18 个静态注册表项（/help、/config、/profile(/profiles)、/clear、/exit、/context、/compact、/inbox、/models、/tools、/sessions、/agents、/bash、/read、/grep、/glob、/write、/edit）。`handleLocalCommand` 重写为 registry 查表。
+  - Live-filter palette：`/`（空 input）打开 `modeSlashPick`，按后续字符实时过滤；Up/Down/Tab 导航；Enter 运行零参 / 插入 prefix；Esc 关闭。`runPaletteSelection` 三种语义：prefix 命令 → textinput 插入 prefix + 回 composing；hasArgs 但无 prefix → 插入 `<cmd> `；零参 → 立即 `cmd.run(m, nil)`。
+  - `renderSlashPalette` 渲染 header + 至多 6 候选（带 `>` 选中标记）+ navigation hint。
+  - Tool palette：`toolDescriptor` + `renderToolPalette` 按 name/risk/source/approval-required 列对齐；`/tools` 注册项用静态目录（Read/Write/Edit/Bash/Glob/Grep/TaskCreate）。Phase 7 把静态目录换成 `/v1/tools/audit` HTTP fetch。
+  - 15 个新单测守住：registry 完整性、alias 解析、live filter、backspace、esc、up-down clamp、Enter 零参 / Enter prefix、palette render 隐藏性、tool palette 对齐、`handleLocalCommand` 未知命令错误路径。
+  - 待补：`/context` `/compact` `/inbox` `/models` `/sessions` `/agents` 仍 status 行 TODO，留 Phase 5/6 wire 真实 backend；`/v1/tools/audit` 真实 wire 留 Phase 7；其他 overlay `inputMode` 留 Phase 6。
 - [x] Phase 8 packaging/distribution early slice：`bbl go` managed Nexus launcher 收口（2026-06-09 收口）。
   - `bbl go` 先构建 Go TUI launch spec，避免 Go TUI binary/source 不存在时误启动 Nexus；随后探活 `GET /health`。
   - localhost / `ws://localhost` URL 不健康时自动启动 `__server` 子进程，并继承 `process.execArgv`，确保开发态 `node --import tsx src/cli/program.ts go` 也能正确拉起 TypeScript server。
@@ -136,13 +143,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `--no-start-nexus` 只连接不启动；远程 URL 不健康时报错，不尝试本地拉起；Go TUI 退出时只关闭本次 wrapper 自己拉起的 child，不影响用户已有 Nexus。
   - `--poll-interval-ms` 已由 wrapper 透传给 Go TUI。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / Phase 3 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / Phase 3 / Phase 4 / Phase 8 稳定后才推进：
 
 - §5 路径 C 阶段 3 polish：profile 切换确认面板 + 错误态视觉回归 PTY smoke（已留到 Phase 7）。
-- Phase 4 slash/tool palette（包含真正 live filter slash palette）。
 - Phase 5 context/compact 长会话 UX。
 - Phase 6 Agent/Task/SessionChannel views。
-- Phase 7 Go TUI PTY/visual regression harness。
+- Phase 7 Go TUI PTY/visual regression harness（含 /v1/tools/audit wire、错误态回归、tombstone polish）。
 - Phase 8 packaging/distribution 剩余项：预编译 binary 发布、版本兼容矩阵、安装包策略。
 - Phase 9 promotion gate。
 

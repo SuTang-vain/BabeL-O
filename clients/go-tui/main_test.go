@@ -922,3 +922,277 @@ func TestRenderHelpVisibleInHelpMode(t *testing.T) {
 		t.Fatalf("renderHelp should mention 'Help', got %q", got)
 	}
 }
+
+// === Phase 4: slash command registry + live-filter palette + tool palette ===
+
+func TestSlashCommandRegistryIsComplete(t *testing.T) {
+	if len(slashCommands) < 8 {
+		t.Fatalf("expected at least 8 slash commands, got %d", len(slashCommands))
+	}
+	// Names must be unique and start with '/'.
+	seen := make(map[string]bool, len(slashCommands))
+	for _, c := range slashCommands {
+		if !strings.HasPrefix(c.name, "/") {
+			t.Fatalf("command name must start with '/': %q", c.name)
+		}
+		if seen[c.name] {
+			t.Fatalf("duplicate slash command: %q", c.name)
+		}
+		seen[c.name] = true
+		for _, a := range c.aliases {
+			if seen[a] {
+				t.Fatalf("alias collides with another command name: %q", a)
+			}
+			seen[a] = true
+		}
+	}
+	// The minimum required by the rewrite plan.
+	for _, want := range []string{"/help", "/config", "/profile", "/clear", "/exit", "/bash", "/read", "/grep"} {
+		if !seen[want] {
+			t.Fatalf("required slash command %q missing from registry", want)
+		}
+	}
+}
+
+func TestFilterSlashCommandsMatchesByNameAndAlias(t *testing.T) {
+	// By name
+	got := filterSlashCommands("/prof")
+	if len(got) != 1 || got[0].name != "/profile" {
+		t.Fatalf("filterSlashCommands(/prof) = %v, want [/profile]", got)
+	}
+	// By alias
+	got = filterSlashCommands("/pro")
+	if len(got) != 1 || got[0].name != "/profile" {
+		t.Fatalf("filterSlashCommands(/pro) = %v, want [/profile]", got)
+	}
+	// Case insensitive
+	got = filterSlashCommands("/PR")
+	if len(got) != 1 || got[0].name != "/profile" {
+		t.Fatalf("filterSlashCommands(/PR) = %v, want [/profile]", got)
+	}
+	// No match
+	got = filterSlashCommands("/xyz")
+	if len(got) != 0 {
+		t.Fatalf("filterSlashCommands(/xyz) = %v, want []", got)
+	}
+	// Empty filter returns the entire registry
+	got = filterSlashCommands("")
+	if len(got) != len(slashCommands) {
+		t.Fatalf("filterSlashCommands(\"\") = %d entries, want %d", len(got), len(slashCommands))
+	}
+}
+
+func TestFindSlashCommandResolvesAlias(t *testing.T) {
+	got := findSlashCommand("/profiles")
+	if got == nil {
+		t.Fatalf("findSlashCommand(/profiles) returned nil")
+	}
+	if got.name != "/profile" {
+		t.Fatalf("findSlashCommand(/profiles).name = %q, want /profile", got.name)
+	}
+}
+
+func TestSlashPaletteOpensOnSlashFromEmptyInput(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeSlashPick {
+		t.Fatalf("inputMode = %q, want %q after '/'", updatedModel.inputMode, modeSlashPick)
+	}
+	if updatedModel.paletteFilter != "" {
+		t.Fatalf("paletteFilter = %q, want empty", updatedModel.paletteFilter)
+	}
+}
+
+func TestSlashPaletteDoesNotOpenOnSlashWhenInputNonEmpty(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.input.SetValue("abc")
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode == modeSlashPick {
+		t.Fatalf("palette must not open when input is non-empty")
+	}
+	if !strings.Contains(updatedModel.input.Value(), "abc/") {
+		t.Fatalf("input should have '/' appended, got %q", updatedModel.input.Value())
+	}
+}
+
+func TestSlashPaletteLiveFilterAppendsToFilter(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.paletteFilter != "p" {
+		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "p")
+	}
+	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	updatedModel, _ = updated.(model)
+	if updatedModel.paletteFilter != "pr" {
+		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "pr")
+	}
+}
+
+func TestSlashPaletteBackspaceEditsFilter(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "abc"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	updatedModel, _ := updated.(model)
+	if updatedModel.paletteFilter != "ab" {
+		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "ab")
+	}
+}
+
+func TestSlashPaletteBackspaceOnEmptyFilterClosesPalette(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	updatedModel, _ := updated.(model)
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want composing after backspace on empty filter", updatedModel.inputMode)
+	}
+}
+
+func TestSlashPaletteEscClosesAndClearsInput(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "pro"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updatedModel, _ := updated.(model)
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
+	}
+	if updatedModel.input.Value() != "" {
+		t.Fatalf("input.Value = %q, want empty", updatedModel.input.Value())
+	}
+	if updatedModel.paletteFilter != "" {
+		t.Fatalf("paletteFilter = %q, want empty", updatedModel.paletteFilter)
+	}
+}
+
+func TestSlashPaletteUpDownNavigatesSelection(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	// Filter matches multiple commands ("/h" -> /help + /h-prefixed entries)
+	// Actually only /help starts with "h" in our registry. Use "/b" -> /bash.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	updatedModel, _ := updated.(model)
+	if updatedModel.paletteSelected != 0 {
+		t.Fatalf("paletteSelected should start at 0, got %d", updatedModel.paletteSelected)
+	}
+	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updatedModel, _ = updated.(model)
+	// /b matches /bash only — but navigating down should stay at 0 (clamped).
+	if updatedModel.paletteSelected != 0 {
+		t.Fatalf("paletteSelected = %d, want 0 (clamped at single match)", updatedModel.paletteSelected)
+	}
+}
+
+func TestSlashPaletteEnterRunsZeroArgCommand(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "help"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updatedModel, _ := updated.(model)
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
+	}
+	// The /help runner should have appended a status line listing commands.
+	rendered := updatedModel.View()
+	if !strings.Contains(rendered, "local commands:") {
+		t.Fatalf("view should mention 'local commands:', got %q", rendered)
+	}
+}
+
+func TestSlashPaletteEnterOnPrefixCommandInsertsPrefix(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "bash"
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updatedModel, _ := updated.(model)
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
+	}
+	if got := updatedModel.input.Value(); got != "/bash " {
+		t.Fatalf("input.Value = %q, want %q", got, "/bash ")
+	}
+}
+
+func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 100
+	m.height = 24
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "p"
+	rendered := m.renderSlashPalette(100)
+	if !strings.Contains(rendered, "Slash") {
+		t.Fatalf("palette should mention 'Slash' header, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "/p") {
+		t.Fatalf("palette should show the current filter '/p', got %q", rendered)
+	}
+	// The matched command /profile should be in the rendered list.
+	if !strings.Contains(rendered, "/profile") {
+		t.Fatalf("palette should show /profile, got %q", rendered)
+	}
+}
+
+func TestSlashPaletteRenderHiddenInOtherModes(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.width = 100
+	m.height = 24
+	if got := m.renderSlashPalette(100); got != "" {
+		t.Fatalf("renderSlashPalette should be empty in composing, got %q", got)
+	}
+}
+
+func TestToolPaletteRendersRiskSourceApproval(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.renderToolPalette([]toolDescriptor{
+		{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
+		{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a file"},
+	})
+	rendered := m.View()
+	if !strings.Contains(rendered, "tools (2, read-only):") {
+		t.Fatalf("tools palette should show count, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "Bash") {
+		t.Fatalf("tools palette should list Bash, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "risk=execute") {
+		t.Fatalf("tools palette should show Bash risk=execute, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "approval-required") {
+		t.Fatalf("tools palette should show approval-required for Bash, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "no-approval") {
+		t.Fatalf("tools palette should show no-approval for Read, got %q", rendered)
+	}
+}
+
+func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	// /config is a real Nexus HTTP call; it should not error in
+	// handleLocalCommand itself, even though the URL is unreachable.
+	// The error (if any) will come from the network call.
+	m.handleLocalCommand("/config")
+	// /unknown must surface an error line.
+	before := len(m.transcript)
+	m.handleLocalCommand("/unknown-command")
+	if len(m.transcript) <= before {
+		t.Fatalf("unknown command should append an error line")
+	}
+	rendered := m.View()
+	if !strings.Contains(rendered, "unknown local command") {
+		t.Fatalf("view should mention 'unknown local command', got %q", rendered)
+	}
+}
