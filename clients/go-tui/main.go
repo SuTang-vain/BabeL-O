@@ -279,12 +279,17 @@ type sessionInboxResponse struct {
 // inboxMsg is the response from
 // GET /v1/sessions/:sessionId/inbox. The Go TUI decodes the
 // envelope via the typed struct above; raw bytes are retained
-// for the same reason contextAnalysisMsg keeps them.
+// for the same reason contextAnalysisMsg keeps them. The trigger
+// field tells the Update handler whether to open the overlay
+// ("user" — fired by /inbox / /inbox all) or just refresh the
+// snapshot in-place ("auto" — fired by end-of-turn auto-refresh
+// in consumeNexusEvent).
 type inboxMsg struct {
 	sessionID         string
 	raw               []byte
 	envelope          sessionInboxResponse
 	includeAck        bool
+	trigger           string
 	err               error
 }
 
@@ -959,11 +964,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case modeInboxOverlay:
 			// Read-only SessionChannel inbox overlay (Phase 6 §1).
 			// up/k move selection back; down/j/tab move it forward.
-			// 'a' acks the selected message; esc/enter/q close.
+			// 'a' acks the selected message; 'q' / 'c' quote the
+			// selected message into the textinput (Phase 6 PR2);
+			// esc/enter close. The user must review the quoted
+			// text in composing mode before submitting — the
+			// overlay never auto-submits.
 			// All other keys are swallowed so they never reach the
 			// textinput (single-input-owner invariant).
 			switch key {
-			case "esc", "enter", "q":
+			case "esc", "enter":
 				m.setMode(modeComposing)
 				m.inboxOverlayScroll = 0
 				m.inboxOverlaySelected = 0
@@ -981,6 +990,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "a":
 				return m, m.ackSelectedInboxMessage()
+			case "q", "c":
+				return m, m.quoteSelectedInboxMessage()
 			}
 			return m, nil
 		}
@@ -1044,11 +1055,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pending = nil
 			return m, nil
 		}
-		m.consumeNexusEvent(msg.event.payload)
+		eventCmd := m.consumeNexusEvent(msg.event.payload)
 		if m.running {
-			return m, waitForStreamEvent(m.events)
+			return m, tea.Batch(waitForStreamEvent(m.events), eventCmd)
 		}
-		return m, nil
+		return m, eventCmd
 
 	case runtimeConfigMsg:
 		if errors.Is(msg.err, errNotModified) {
@@ -1122,10 +1133,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.inboxMessages = msg.envelope.Messages
 		m.inboxChannels = nil // /v1/sessions/:id/inbox doesn't echo channels; reset.
+		m.inboxOverlayIncludeAck = msg.includeAck
+		// Render event cards for any new key messages first —
+		// this must happen before the open-overlay path so the
+		// cards land in the transcript and the overlay shows the
+		// fresh snapshot. seenInboxCardMessageIDs dedupes
+		// across re-renders.
+		m.renderNewInboxEventCards()
+		if msg.trigger == "auto" {
+			// Phase 6 PR2 end-of-turn auto-refresh: update the
+			// footer / overlay state silently. Do NOT open the
+			// overlay — the user just finished a turn and
+			// shouldn't be ambushed with a modal they didn't ask
+			// for. The footer status line will reflect the new
+			// count, and any new key message already pushed its
+			// event card into the transcript above this point.
+			return m, nil
+		}
+		// User-initiated /inbox: reset overlay selection / scroll
+		// (the user expects a clean landing) and open the overlay.
 		m.inboxOverlaySelected = 0
 		m.inboxOverlayScroll = 0
-		m.inboxOverlayIncludeAck = msg.includeAck
-		m.renderNewInboxEventCards()
 		// Persist a single-line summary breadcrumb in the transcript
 		// (so the user can scroll back and grep the count) AND open
 		// the overlay so the full SessionChannel inbox is visible
@@ -1259,13 +1287,14 @@ var helpOverlayLines = []string{
 	"  up / down / tab  scroll through the context analysis",
 	"  esc / enter / q  close the overlay",
 	"",
-	"Inbox overlay (Phase 6 §1):",
+	"Inbox overlay (Phase 6 §1 + PR2):",
 	"  /inbox           open SessionChannel inbox (unread-only)",
 	"  /inbox all       include acknowledged messages",
 	"  /inbox ack <id>  acknowledge a single message",
 	"  up / down / tab  move selection through the message list",
 	"  a                ack the selected message",
-	"  esc / enter / q  close the overlay",
+	"  q / c            quote the selected message into the prompt",
+	"  esc / enter      close the overlay",
 	"",
 	"Press esc / enter / q to close.",
 }
@@ -2092,6 +2121,37 @@ func (m model) renderInboxOverlay(width int) string {
 	return strings.Join([]string{divider(width), inboxStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
 }
 
+// quoteInboxMessageContent renders a multi-line block that can be
+// pre-filled into the textinput when the user chooses to quote a
+// SessionChannel message into the current prompt. Mirrors
+// quoteInboxMessage in src/cli/inboxOverlay.ts. The block always
+// starts with the "verify evidence" guard line so the user is
+// reminded not to act on the inbox context blindly. Missing
+// optional fields (evidence / governance) are dropped; required
+// fields fall back to "unknown" via fallbackUnknown so a
+// server-side addition cannot break the rendering.
+func quoteInboxMessageContent(message sessionMessage) string {
+	header := fmt.Sprintf("message=%s type=%s priority=%s from=%s channel=%s",
+		fallbackUnknown(message.MessageID),
+		fallbackUnknown(string(message.Type)),
+		fallbackUnknown(string(message.Priority)),
+		fallbackUnknown(message.FromSessionID),
+		fallbackUnknown(message.ChannelID),
+	)
+	parts := []string{
+		"Use this SessionChannel inbox context only after verifying evidence:",
+		header,
+		"content: " + fallbackUnknown(message.Content),
+	}
+	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
+		parts = append(parts, "evidence: "+evidence)
+	}
+	if gov := formatInboxGovernanceSummary(message); gov != "" {
+		parts = append(parts, "memory_candidate "+gov)
+	}
+	return strings.Join(parts, "\n")
+}
+
 // renderInboxEventCard is the main-flow event card for a single
 // key SessionChannel message. It is intentionally compact (a
 // short banner + metadata + the "open inbox / ack / quote" hint)
@@ -2342,7 +2402,8 @@ func (m model) renderFooter(width int) string {
 // command uses: it requires an active session, then either kicks
 // off a fetch (unread-only or with acknowledged) or short-circuits
 // with a friendly status line. Mirrors the "context: no active
-// session yet" pattern from /context and /compact.
+// session yet" pattern from /context and /compact. The trigger
+// field is "user" so the handler opens the overlay on response.
 func (m *model) fetchInboxWithSession(includeAck bool) tea.Cmd {
 	if m.sessionID == "" {
 		m.appendLine("status", "inbox: no active session yet — submit a prompt first")
@@ -2353,7 +2414,7 @@ func (m *model) fetchInboxWithSession(includeAck bool) tea.Cmd {
 		scope = "all"
 	}
 	m.appendLine("status", "loading shared Nexus inbox ("+scope+"): "+shortID(m.sessionID))
-	return fetchInbox(m.cfg, m.sessionID, includeAck)
+	return fetchInbox(m.cfg, m.sessionID, includeAck, "user")
 }
 
 // ackInboxMessageWithSession is the gated entry point the /inbox
@@ -2384,6 +2445,36 @@ func (m *model) ackSelectedInboxMessage() tea.Cmd {
 	return ackInboxMessage(m.cfg, m.sessionID, message.MessageID)
 }
 
+// quoteSelectedInboxMessage is the Phase 6 PR2 path that
+// round-trips the user from modeInboxOverlay back to
+// modeComposing with a quote of the selected message prefilled
+// in the textinput. The user reviews the quoted text before
+// submitting; the overlay never auto-submits. Mirrors the
+// `q` / `c` branch in src/cli/inboxOverlay.ts
+// reduceInboxOverlayKey. The selection / scroll state is
+// preserved across the round-trip so re-opening the inbox
+// resumes on the same row (this is just a defensive no-op for
+// now since the overlay is closed and re-opened by an explicit
+// /inbox command, but the field shape mirrors Phase 6 §1).
+func (m *model) quoteSelectedInboxMessage() tea.Cmd {
+	if m.inputMode != modeInboxOverlay {
+		return nil
+	}
+	if m.inboxOverlaySelected < 0 || m.inboxOverlaySelected >= len(m.inboxMessages) {
+		return nil
+	}
+	message := m.inboxMessages[m.inboxOverlaySelected]
+	quote := quoteInboxMessageContent(message)
+	m.input.SetValue(quote)
+	m.input.CursorEnd()
+	m.setMode(modeComposing)
+	m.inboxOverlayScroll = 0
+	// Preserve inboxOverlaySelected so a future reopen lands on
+	// the same row, matching the TS TUI "same selection" UX.
+	m.appendLine("status", "quoted inbox message: "+message.MessageID+" into prompt")
+	return nil
+}
+
 func (m *model) sendPermissionDecision(approved bool, reason string) {
 	if m.pending == nil || m.decisions == nil {
 		return
@@ -2411,7 +2502,12 @@ func (m *model) sendPermissionDecision(approved bool, reason string) {
 	m.setMode(modeComposing)
 }
 
-func (m *model) consumeNexusEvent(event map[string]any) {
+// consumeNexusEvent applies a single Nexus event to the model and
+// optionally returns a follow-up tea.Cmd. The Phase 6 PR2
+// auto-refresh hook uses this return value to fire an inbox
+// re-fetch at the end of every turn (the cmd is nil for events
+// that don't need a follow-up).
+func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 	eventType := stringField(event, "type")
 	switch eventType {
 	case "session_started":
@@ -2437,6 +2533,17 @@ func (m *model) consumeNexusEvent(event map[string]any) {
 		m.running = false
 		m.pending = nil
 		m.resize()
+		// Phase 6 PR2: end-of-turn auto-refresh. The Nexus may
+		// have queued or accepted new SessionChannel messages
+		// while the model was running, so re-pull the inbox
+		// (unread-only, since we want to surface fresh key
+		// messages via the event-card path). seenInboxCardMessageIDs
+		// already handles de-duplication across turns. The
+		// "auto" trigger tells the inboxMsg handler to refresh
+		// the snapshot in place without opening the overlay.
+		if m.sessionID != "" {
+			return fetchInbox(m.cfg, m.sessionID, false, "auto")
+		}
 	case "assistant_delta":
 		m.appendStreamingLine("assistant", stringField(event, "text"))
 	case "thinking_delta":
@@ -2447,6 +2554,7 @@ func (m *model) consumeNexusEvent(event map[string]any) {
 		m.appendLine(eventType, formatNexusEvent(event))
 	}
 	m.lastEventType = eventType
+	return nil
 }
 
 func (m *model) appendStreamingLine(kind string, text string) {
@@ -2866,8 +2974,11 @@ func triggerCompact(cfg config, sessionID string) tea.Cmd {
 // the stable top-level envelope (type / sessionId / messages /
 // limit / includeAcknowledged). The raw bytes are retained so any
 // future richer renderer (or a server-side schema addition) does
-// not break the existing format / overlay code.
-func fetchInbox(cfg config, sessionID string, includeAck bool) tea.Cmd {
+// not break the existing format / overlay code. The trigger field
+// ("user" / "auto") tells the Update handler whether to open the
+// overlay (user /inbox command) or just refresh the snapshot in
+// place (Phase 6 PR2 end-of-turn auto-refresh).
+func fetchInbox(cfg config, sessionID string, includeAck bool, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		query := url.Values{}
 		if includeAck {
@@ -2880,7 +2991,7 @@ func fetchInbox(cfg config, sessionID string, includeAck bool) tea.Cmd {
 			nil,
 			query,
 		)
-		out := inboxMsg{sessionID: sessionID, raw: raw, includeAck: includeAck, err: err}
+		out := inboxMsg{sessionID: sessionID, raw: raw, includeAck: includeAck, trigger: trigger, err: err}
 		if err == nil {
 			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
 				out.err = fmt.Errorf("decode inbox: %w", decodeErr)

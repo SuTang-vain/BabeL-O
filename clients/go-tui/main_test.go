@@ -2069,7 +2069,7 @@ func TestInboxOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 	}
 	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
-	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -2098,7 +2098,7 @@ func TestInboxOverlaySelectionClampsAtBounds(t *testing.T) {
 	}
 	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
-	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
 	// Up at 0 stays at 0.
 	up, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
@@ -2130,9 +2130,9 @@ func TestInboxOverlayEscapeCloses(t *testing.T) {
 	}
 	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
-	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
-	// Try esc/enter.
+	// esc / enter still close the overlay.
 	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
 		m.inputMode = modeInboxOverlay
 		closed, _ := m.Update(tea.KeyMsg{Type: keyType})
@@ -2141,12 +2141,21 @@ func TestInboxOverlayEscapeCloses(t *testing.T) {
 			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
 		}
 	}
-	// 'q' rune should also close.
+	// Phase 6 PR2: 'q' now QUOTES the selected message into the
+	// textinput (not closes). Verify the close path still doesn't
+	// fire for 'q' — the overlay should drop back to composing
+	// because quoteSelectedInboxMessage sets mode=composing after
+	// the prefill, but the "inbox closed" status line must NOT
+	// appear (it would mean we accidentally took the close path).
 	m.inputMode = modeInboxOverlay
 	closed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
-		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
+		t.Fatalf("'q' should land in composing after quote, got %q", cm.inputMode)
+	}
+	last := cm.transcript[len(cm.transcript)-1]
+	if !strings.Contains(last.text, "quoted inbox message") {
+		t.Fatalf("'q' should surface the quote status, got %q", last.text)
 	}
 }
 
@@ -2157,7 +2166,7 @@ func TestInboxOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	}
 	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
-	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123"})
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
 	m.input.SetValue("untouched")
 	// Press 'z' (a non-overlay key). The textinput must not change.
@@ -2311,7 +2320,7 @@ func TestFetchInboxHTTPCmdSendsIncludeAckQuery(t *testing.T) {
 	}))
 	defer server.Close()
 	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
-	cmd := fetchInbox(m.cfg, "sess_xyz", true)
+	cmd := fetchInbox(m.cfg, "sess_xyz", true, "user")
 	msg := cmd()
 	inbox, ok := msg.(inboxMsg)
 	if !ok {
@@ -2356,5 +2365,215 @@ func TestAckInboxMessageHTTPCmdPostsToCorrectPath(t *testing.T) {
 	}
 	if seenPath != "/v1/sessions/sess_xyz/inbox/msg_ack_target_1/ack" {
 		t.Fatalf("seenPath = %q", seenPath)
+	}
+}
+
+func TestQuoteInboxMessageRendersFormattedBlock(t *testing.T) {
+	message := sessionMessage{
+		MessageID:     "msg_quote_1",
+		Type:          messageTypeHandoff,
+		Priority:      priorityHigh,
+		FromSessionID: "sess_peer_quote_1",
+		ChannelID:     "chan_quote_1",
+		Content:       "Picking up the refactor — see attached diff.",
+	}
+	got := quoteInboxMessageContent(message)
+	for _, want := range []string{
+		"Use this SessionChannel inbox context only after verifying evidence:",
+		"message=msg_quote_1",
+		"type=handoff",
+		"priority=high",
+		"from=sess_peer_quote_1",
+		"channel=chan_quote_1",
+		"content: Picking up the refactor",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("quoteInboxMessageContent missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestQuoteInboxMessageFallsBackToUnknownForMissingFields(t *testing.T) {
+	message := sessionMessage{} // zero value, no fields set
+	got := quoteInboxMessageContent(message)
+	for _, want := range []string{
+		"message=unknown",
+		"type=unknown",
+		"priority=unknown",
+		"from=unknown",
+		"channel=unknown",
+		"content: unknown",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("quoteInboxMessageContent fallback missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestQuoteInboxMessageIncludesGovernanceForMemoryCandidate(t *testing.T) {
+	message := sessionMessage{
+		MessageID:     "msg_mc_quote_1",
+		Type:          messageTypeMemoryCandidate,
+		Priority:      priorityNormal,
+		FromSessionID: "sess_peer_mc",
+		ChannelID:     "chan_direct_mc",
+		Content:       "blocked auto-write",
+		Metadata: map[string]any{
+			"memoryCandidateGovernance": map[string]any{
+				"decision": "rejected",
+				"scope":    "long_term",
+				"approval": map[string]any{"status": "rejected", "requiredBy": "user"},
+				"autoWrite": false,
+			},
+		},
+	}
+	got := quoteInboxMessageContent(message)
+	if !strings.Contains(got, "memory_candidate decision=rejected") {
+		t.Fatalf("quote should include memory_candidate governance header, got %q", got)
+	}
+	if !strings.Contains(got, "approval=rejected:user") {
+		t.Fatalf("quote should include approval status, got %q", got)
+	}
+}
+
+func TestInboxOverlayQuoteKeyFillsTextinput(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
+	m = updated.(model)
+	// 'q' quotes the first (selected) message into the textinput.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(model)
+	if !strings.Contains(um.input.Value(), "Use this SessionChannel inbox context only after verifying evidence:") {
+		t.Fatalf("'q' should prefill the textinput with the quote, got %q", um.input.Value())
+	}
+	if !strings.Contains(um.input.Value(), "message=msg_handoff_1") {
+		t.Fatalf("'q' quote should reference the selected message id, got %q", um.input.Value())
+	}
+	if um.inputMode != modeComposing {
+		t.Fatalf("'q' should land in composing mode, got %q", um.inputMode)
+	}
+}
+
+func TestInboxOverlayQuoteKeyCAlsoFillsTextinput(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	um := updated.(model)
+	if !strings.Contains(um.input.Value(), "message=msg_handoff_1") {
+		t.Fatalf("'c' should prefill just like 'q', got %q", um.input.Value())
+	}
+}
+
+func TestInboxOverlayQuoteKeyEmptyListIsNoop(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_xyz"
+	m.input.SetValue("preserved")
+	m.inputMode = modeInboxOverlay
+	m.inboxMessages = nil
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	um := updated.(model)
+	if um.input.Value() != "preserved" {
+		t.Fatalf("'q' on empty list should NOT clobber textinput, got %q", um.input.Value())
+	}
+	// The mode stays in modeInboxOverlay (the user must close
+	// explicitly), not auto-drop back to composing.
+	if um.inputMode != modeInboxOverlay {
+		t.Fatalf("'q' on empty list should leave mode unchanged, got %q", um.inputMode)
+	}
+}
+
+func TestInboxAutoRefreshOnResultEventFiresFetchInbox(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_ar_1"
+	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
+	if cmd == nil {
+		t.Fatalf("consumeNexusEvent on result should fire auto-refresh cmd when session is set")
+	}
+	msg := cmd()
+	_, ok := msg.(inboxMsg)
+	if !ok {
+		t.Fatalf("auto-refresh cmd should produce inboxMsg, got %T", msg)
+	}
+}
+
+func TestInboxAutoRefreshSkippedWhenNoSession(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	// sessionID is empty.
+	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
+	if cmd != nil {
+		t.Fatalf("auto-refresh should be skipped when no session, got %T", cmd)
+	}
+}
+
+func TestInboxAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	// Compose a turn so we're not in modeInboxOverlay.
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
+	um := updated.(model)
+	// Close the overlay first.
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	um = closed.(model)
+	if um.inputMode != modeComposing {
+		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
+	}
+	// Now fire an auto-refresh inboxMsg and verify the overlay does
+	// NOT reopen (the user is mid-composition, not asking for it).
+	updated, _ = um.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
+	um2 := updated.(model)
+	if um2.inputMode != modeComposing {
+		t.Fatalf("'auto' trigger must NOT open the overlay, got %q", um2.inputMode)
+	}
+	if len(um2.inboxMessages) != 3 {
+		t.Fatalf("'auto' trigger should still update the snapshot, got %d messages", len(um2.inboxMessages))
+	}
+}
+
+func TestInboxAutoRefreshRendersEventCardsForNewMessages(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	baseline := len(m.transcript)
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
+	um := updated.(model)
+	if len(um.transcript) <= baseline {
+		t.Fatalf("'auto' trigger should still render event cards for unseen key messages, baseline=%d after=%d", baseline, len(um.transcript))
+	}
+}
+
+func TestInboxAutoRefreshDedupesAcrossTurns(t *testing.T) {
+	envelope := sessionInboxResponse{}
+	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_inbox_smoke_abc123"
+	// First auto-refresh: cards render.
+	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
+	um := updated.(model)
+	afterFirst := len(um.transcript)
+	// Second auto-refresh (same payload): no new cards.
+	updated, _ = um.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
+	um2 := updated.(model)
+	if len(um2.transcript) != afterFirst {
+		t.Fatalf("second auto-refresh should not re-render same cards, afterFirst=%d afterSecond=%d", afterFirst, len(um2.transcript))
 	}
 }

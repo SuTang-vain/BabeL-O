@@ -906,6 +906,125 @@ def run_inbox_overlay_sequence(
     return True
 
 
+def run_inbox_quote_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 6 PR2: 'q' / 'c' quote the selected message into the
+    current prompt, and end-of-turn auto-refresh re-fetches the
+    inbox silently after every result event.
+
+    The seeded local Nexus has no inbox messages, so:
+      - 'q' on an empty list must be a no-op (the textinput is
+        preserved, the mode stays in modeInboxOverlay, no crash).
+      - The auto-refresh fires after the bash round-trip below
+        and surfaces no error (the empty inbox snapshot is fine).
+
+    The actual quote content + auto-refresh with non-empty inbox
+    is covered by Go unit tests in main_test.go
+    (TestInboxOverlayQuoteKeyFillsTextinput,
+    TestInboxAutoRefreshTriggerDoesNotOpenOverlay,
+    TestInboxAutoRefreshRendersEventCardsForNewMessages).
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    # The result event from this round-trip fires the
+    # auto-refresh hook inside consumeNexusEvent.
+    send(master_fd, "bash echo phase6-inbox-quote")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote setup: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote setup: stream did not close cleanly",
+        )
+    # After "done success=true" the Go TUI fires the auto-refresh
+    # inbox fetch. The seeded local Nexus has no messages, so the
+    # response is an empty list — no event card surfaces and no
+    # error should appear. We don't assert on any specific
+    # auto-refresh line; the absence of an error and the ability
+    # to keep typing is the proof.
+
+    # Step 3: open the inbox overlay and exercise the 'q' key on
+    # the empty list. The textinput must be preserved and the
+    # mode must stay in modeInboxOverlay.
+    send(master_fd, "/inbox")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Inbox · Phase 6 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote: /inbox did not render the overlay header",
+        )
+    if not wait_for(master_fd, "No unread inbox messages.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote: /inbox did not render the empty placeholder",
+        )
+    # 'q' on an empty list is a no-op (no message to quote). The
+    # overlay must stay open and the textinput must not change.
+    send(master_fd, "q")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+    # The "inbox closed" status line must NOT appear (that would
+    # mean 'q' accidentally took the close path).
+    if any("inbox closed" in line for line in transcript[-10:]):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote: 'q' on empty list must not close the overlay",
+        )
+
+    # 'c' is an alias for 'q' and should also be a no-op on empty.
+    send(master_fd, "c")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+    if any("inbox closed" in line for line in transcript[-10:]):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote: 'c' on empty list must not close the overlay",
+        )
+
+    # Step 4: close the overlay cleanly and verify the TUI is
+    # back in composing mode (i.e. the textinput is responsive
+    # again, proving the round-trip didn't strand us in the
+    # overlay after the 'q' / 'c' no-op).
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "inbox closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote: Esc did not close the overlay",
+        )
+
+    # Step 5: the textinput must be responsive after the
+    # overlay close — type a benign character and confirm the
+    # next bash round-trip still works (auto-refresh doesn't
+    # strand subsequent turns).
+    send(master_fd, "bash echo phase6-inbox-quote-2")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] inbox-quote followup: second bash turn did not trigger permission",
+        )
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1059,6 +1178,13 @@ SEQUENCES: dict[str, dict] = {
     "inbox-overlay": {
         "runner": run_inbox_overlay_sequence,
         "ok_message": "phase 6 inbox overlay + footer unread indicator verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "inbox-quote": {
+        "runner": run_inbox_quote_sequence,
+        "ok_message": "phase 6 PR2 inbox quote + auto-refresh verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

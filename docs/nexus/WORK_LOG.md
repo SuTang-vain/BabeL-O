@@ -2,6 +2,37 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 6 PR2：`/inbox` quote into prompt + end-of-turn auto-refresh 收口
+
+- **用户请求**: 推进 Phase 6 PR2（`/inbox` quote into current prompt + auto-refresh on `result` event），把 PR1 的 overlay 闭合到 composing + 实时事件 card 推送。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - `quoteInboxMessageContent(message sessionMessage) string` 新增：复刻 TS TUI `quoteInboxMessage`（"Use this SessionChannel inbox context only after verifying evidence:" header + `message=<id> type=<type> priority=<pri> from=<from> channel=<chan>` 行 + `content: <content>` + 可选 `evidence: ...` + 可选 `memory_candidate <governance>`），所有 required 字段走 `fallbackUnknown` 兜底。
+    - `inboxMsg` 加 `trigger string` 字段（`"user"` / `"auto"`）区分用户主动 `/inbox`（开 overlay）和 end-of-turn auto-refresh（只更新 snapshot + 渲染 event card，不开 overlay）。
+    - `fetchInbox(cfg, sessionID, includeAck, trigger)` 加 trigger 参数。
+    - `consumeNexusEvent` 返回 `tea.Cmd`，signature 改成 `func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd`；`case "result", "error":` 末尾若 `m.sessionID != ""` 返回 `fetchInbox(m.cfg, m.sessionID, false, "auto")` 触发 auto-refetch；call site 改为 `tea.Batch(waitForStreamEvent(m.events), eventCmd)`。
+    - `case inboxMsg` Update handler：所有 trigger 都先 `renderNewInboxEventCards()`（按 `seenInboxCardMessageIDs` 去重）；`trigger == "auto"` 直接 return（不开 overlay、不 push "inbox: N message(s)" breadcrumb、`inboxOverlaySelected` / `inboxOverlayScroll` 不重置）；`"user"` 走原路径（reset selection / scroll + push breadcrumb + `setMode(modeInboxOverlay)`）。
+    - `modeInboxOverlay` KeyMsg dispatch：`q` / `c` 改 quote（之前误归 close）；esc/enter 仍 close。`q` / `c` 调 `quoteSelectedInboxMessage()`，新方法 `m.quoteSelectedInboxMessage() tea.Cmd` 选当前消息 → 调 `quoteInboxMessageContent` → `m.input.SetValue(quote)` + `m.input.CursorEnd()` → `setMode(modeComposing)`（保留 `inboxOverlaySelected` 让未来 re-open 落在同一行，UX 与 TS TUI 一致）→ push `quoted inbox message: <id> into prompt` 状态行。
+    - `helpOverlayLines`: Inbox overlay 段 `q / c  quote into prompt` + 改 `esc / enter  close`（去掉 `q` close 误导）。
+  - `clients/go-tui/main_test.go`:
+    - 现有 `TestInboxOverlayEscapeCloses` 更新：`q` 现在是 quote 路径，断言 `quoted inbox message` 状态行 + 仍 land in composing + 不输出 `inbox closed`。
+    - 现有 `TestInboxOverlayOpensOnMsgAndClearsOnClose` / `TestInboxOverlaySelectionClampsAtBounds` / `TestInboxOverlayStrayKeyDoesNotReachTextinput` / `TestInboxOverlayEscapeCloses` 加 `trigger: "user"`（与新签名匹配）。
+    - 11 个新单测：`TestQuoteInboxMessageRendersFormattedBlock` / `TestQuoteInboxMessageFallsBackToUnknownForMissingFields` / `TestQuoteInboxMessageIncludesGovernanceForMemoryCandidate` / `TestInboxOverlayQuoteKeyFillsTextinput` / `TestInboxOverlayQuoteKeyCAlsoFillsTextinput` / `TestInboxOverlayQuoteKeyEmptyListIsNoop` / `TestInboxAutoRefreshOnResultEventFiresFetchInbox` / `TestInboxAutoRefreshSkippedWhenNoSession` / `TestInboxAutoRefreshTriggerDoesNotOpenOverlay` / `TestInboxAutoRefreshRendersEventCardsForNewMessages` / `TestInboxAutoRefreshDedupesAcrossTurns`。
+  - `test/go_tui_pty_driver.py`:
+    - 新 `run_inbox_quote_sequence`：bash round-trip populate sessionID + approve permission + 等 `Bash done` + `done success=true`（auto-refresh 在 result 到达时静默触发；seeded local Nexus 无消息，无新 card 也无 error）；`/inbox` 等 overlay header + `No unread inbox messages.` placeholder；按 `q` 在空 list 上不关 overlay（不输出 `inbox closed`）+ textinput 不变 + mode 保持 modeInboxOverlay；按 `c` 同样行为；按 `esc` 关闭 + `inbox closed`；再发 `bash echo phase6-inbox-quote-2` 验 next bash turn 仍能拉起 permission（auto-refresh 没把模型卡住）。
+    - `SEQUENCES` registry 加 `inbox-quote` 入口；ok_message 是 `phase 6 PR2 inbox quote + auto-refresh verified`。
+  - `test/go-tui-smoke.test.ts`:
+    - 第 14 个测试：`phase 6 PR2 /inbox quote + auto-refresh`，90s timeout。
+- **回归覆盖**:
+  - `cd clients/go-tui && go test -v -count=1 ./...`：134/134 pass（123 旧 + 11 新）。
+  - `npm run typecheck` + `npm run format:check`：通过。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke`：14/14 pass（含新 `inbox-quote`）。
+- **范围克制**:
+  - 空 list 上的 `q` / `c` 是 no-op（model 中 `quoteSelectedInboxMessage` 检查 `inboxOverlaySelected` 越界则 return nil，textinput 不动、mode 不变）。真实 quote 内容由 Go 单测覆盖。
+  - auto-refresh 的 `inbox: 0 message(s)` breadcrumb 在 `"auto"` 路径不输出——只 `"user"` 路径输出，避免每次 turn 结束都 push 一行。
+  - auto-refresh 用 `includeAck=false`（unread-only）——和 TS TUI `refreshInboxFooterStatus` 默认一致，避免 ack 后又被 auto-refresh 拉回；用户主动 `/inbox all` 才看全部。
+  - 选中行跨 quote round-trip 保留：TS TUI 的 reduceInboxOverlayKey `quote` 路径也保持 selectedIndex 不变；本次 Go TUI 同样 `inboxOverlayScroll=0` 但 `inboxOverlaySelected` 不重置。
+
 ## 2026-06-09 — Go TUI Phase 6 PR1：`/inbox` overlay + footer unread indicator 收口
 
 - **用户请求**: 按文档规划推进 Phase 6 第一个 PR（`/inbox` overlay + footer unread indicator），把 Go TUI 拉到 SessionChannel consumption-side 的 TS TUI parity。

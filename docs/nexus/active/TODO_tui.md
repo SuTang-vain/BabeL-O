@@ -217,10 +217,18 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - helpOverlayLines：新增 Inbox overlay 段。
   - 22 个新单测 + 1 个 PTY smoke (`inbox-overlay`) + 1 个 TS smoke 入口守住 envelope 抽取 / decode error / render 隐藏性 / banner 切换 / 选中 clamp / esc/enter/q 关闭 / stray key 不污染 / ack 成功路径 / slash 命令 short-circuit / event card key 判定 / 已渲染去重 / HTTP 真实 wire；123/123 go test 通过；`BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 13/13 pass。
   - 范围克制：自动 inbox refresh on `result` event 留到 Phase 6 PR2；`/inbox` quote into prompt 留到 Phase 6 PR2（避免 overlay ↔ composing round-trip 引入新 race）；PTY smoke 走 empty-inbox 路径（避免依赖 Nexus seed inbox fixture）。
+- [x] Phase 6 PR2：`/inbox` quote into prompt + end-of-turn auto-refresh 收口（2026-06-09 收口）。
+  - `quoteInboxMessageContent(message) string` 新增：复刻 TS TUI `quoteInboxMessage`（`Use this SessionChannel inbox context only after verifying evidence:` 头 + `message=<id> type=<type> priority=<pri> from=<from> channel=<chan>` 行 + `content: <content>` + 可选 `evidence: ...` + 可选 `memory_candidate <governance>`），所有 required 字段走 `fallbackUnknown` 兜底。
+  - `inboxMsg` 加 `trigger string`（`"user"` / `"auto"`）；`fetchInbox(cfg, sessionID, includeAck, trigger)` 加 trigger 参数。
+  - `consumeNexusEvent` signature 改 `func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd`；`case "result", "error":` 末尾若 `m.sessionID != ""` 返回 `fetchInbox(m.cfg, m.sessionID, false, "auto")`；call site 改 `tea.Batch(waitForStreamEvent(m.events), eventCmd)`。
+  - `case inboxMsg` Update handler：`trigger == "auto"` 路径只调 `renderNewInboxEventCards()`（按 `seenInboxCardMessageIDs` 去重）+ return（不开 overlay、不 push breadcrumb、selection / scroll 不重置）；`"user"` 走原路径。
+  - `modeInboxOverlay` KeyMsg dispatch：`q` / `c` 改 quote（之前误归 close）；`quoteSelectedInboxMessage()` 新方法把选中消息的 quote 填进 textinput + `CursorEnd()` + `setMode(modeComposing)` + push `quoted inbox message: <id> into prompt` 状态行 + 保留 `inboxOverlaySelected`（UX 与 TS TUI 一致）。
+  - `helpOverlayLines`：`q / c quote into prompt` 段、`esc / enter close` 段。
+  - 11 个新 Go 单测 + 1 个 PTY smoke (`inbox-quote`) + 1 个 TS smoke 入口；134/134 go test pass；`BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 14/14 pass。
+  - 范围克制：空 list 上的 `q` / `c` 是 no-op（`quoteSelectedInboxMessage` 检查越界则 return nil，textinput 不动、mode 不变）——真实 quote 内容由 Go 单测覆盖。auto-refresh 不输出 breadcrumb，只静默 update snapshot + 渲染新 event card，避免每 turn 结束刷一行。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 7 / Phase 8 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 6 PR2 / Phase 7 / Phase 8 稳定后才推进：
 
-- Phase 6 PR2：auto-refresh inbox on `result` event + `/inbox` quote into prompt。
 - Phase 6 PR3：Agent status panel（parent/child + taskId + role + depth + status + delegatedSubTaskIds）。
 - Phase 6 PR4：Task board（pending/in_progress/blocked/completed/failed + worktree state + review/recovery）。
 - Phase 6 PR5：Activity overlay（recent tool runs / permission decisions / agent job events / context warnings）。

@@ -142,6 +142,11 @@ test('Go TUI smoke: phase 6 /inbox overlay + footer unread indicator', { skip: s
   assert.match(output, /phase 6 inbox overlay \+ footer unread indicator verified/)
 })
 
+test('Go TUI smoke: phase 6 PR2 /inbox quote + auto-refresh', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('inbox-quote', 90)
+  assert.match(output, /phase 6 PR2 inbox quote \+ auto-refresh verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
