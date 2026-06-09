@@ -459,11 +459,18 @@ def run_tombstone_rejection_sequence(
     covers the same friendly-error path as a tombstoned profile),
     the Go TUI must surface a human hint instead of raw JSON.
 
-    End-to-end: `/profile ghost` -> Nexus 400 unknown_profile
-    -> friendlyNexusError -> "unknown profile \"ghost\"".
+    End-to-end: `/profile ghost` -> confirm overlay (y) ->
+    Nexus 400 unknown_profile -> friendlyNexusError ->
+    "unknown profile \"ghost\"".
     """
     send(master_fd, "/profile ghost")
     send(master_fd, "\r")
+    if not wait_for(master_fd, "Confirm profile switch", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /profile ghost did not open the confirm overlay",
+        )
+    send(master_fd, "y")
     if not wait_for(master_fd, 'unknown profile "ghost"', timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
@@ -494,6 +501,76 @@ def run_visual_regression_narrow_sequence(
             "[go-tui-smoke] narrow-width help overlay did not render",
         )
     send(master_fd, "\x1b")
+    return True
+
+
+def run_profile_confirm_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    §5 path C phase 3 polish: `/profile <name>` parks the Go TUI in a
+    y/n confirmation overlay instead of immediately firing the
+    selectRuntimeProfile HTTP call. The driver covers the full
+    three-path surface:
+
+      1. /profile beta  ->  n  -> "profile switch cancelled" status,
+         no HTTP call attempted, mode returns to composing.
+      2. /profile beta  ->  y  -> "selecting shared Nexus profile: beta"
+         status, then on success "profile switched: beta" (the
+         upstream friendly-error path is unchanged and covered by the
+         tombstone-rejection sequence).
+      3. /profile alpha  ->  "profile already active: alpha" status
+         (no overlay opens, since alpha is the seeded activeProfile).
+    """
+    # Path 1: n cancels.
+    send(master_fd, "/profile beta")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Confirm profile switch", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /profile beta did not open the confirm overlay",
+        )
+    send(master_fd, "n")
+    if not wait_for(master_fd, "profile switch cancelled: beta", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] n on profile-confirm did not surface the cancelled status line",
+        )
+
+    # Path 2: y fires the HTTP call and (because the profile is valid)
+    # surfaces the success status line. The Nexus URL is reachable
+    # so the selectRuntimeProfile call returns 200 and the Go TUI
+    # renders "profile switched: beta".
+    send(master_fd, "/profile beta")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Confirm profile switch", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /profile beta (second time) did not open the confirm overlay",
+        )
+    send(master_fd, "y")
+    if not wait_for(master_fd, "selecting shared Nexus profile: beta", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] y on profile-confirm did not surface the 'selecting' status line",
+        )
+    if not wait_for(master_fd, "profile switched: beta", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /profile beta success path did not surface 'profile switched'",
+        )
+
+    # Path 3: re-selecting the now-active beta short-circuits.
+    send(master_fd, "/profile beta")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "profile already active: beta", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /profile <active> did not short-circuit with 'profile already active'",
+        )
     return True
 
 
@@ -552,6 +629,7 @@ def run_all_sequences(
         "slash-palette",
         "slash-palette-prefix",
         "tool-palette",
+        "profile-confirm",
         "phase3-overlay-mutex",
         "permission-approve",
     ]
@@ -644,6 +722,13 @@ SEQUENCES: dict[str, dict] = {
             "BabeL-O Go TUI MVP",
         ],
     },
+    "profile-confirm": {
+        "runner": run_profile_confirm_sequence,
+        "ok_message": "§5 path C phase 3 polish profile y/n overlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
     "visual-regression-narrow": {
         "runner": run_visual_regression_narrow_sequence,
         "ok_message": "phase 7 narrow-width visual regression verified",
@@ -692,6 +777,11 @@ def main() -> int:
             {
                 "defaultModel": "local/coding-runtime",
                 "providerId": "local",
+                "activeProfile": "alpha",
+                "profiles": {
+                    "alpha": {"model": "local/coding-runtime", "provider": "local"},
+                    "beta": {"model": "local/coding-runtime", "provider": "local"},
+                },
             }
         )
     )

@@ -141,15 +141,20 @@ func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 func TestHandleLocalConfigCommandsDoNotStartAgentStream(t *testing.T) {
 	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/profile dev")
-	if cmd == nil {
-		t.Fatalf("/profile dev should return an HTTP config command")
+	// /profile <name> now gates the HTTP call behind a y/n overlay,
+	// so handleLocalCommand itself returns nil and parks the model in
+	// modeProfileConfirm with pendingProfileName = "dev".
+	if cmd != nil {
+		t.Fatalf("/profile dev should not fire HTTP from handleLocalCommand (it gates on a y/n overlay)")
 	}
 	if m.running {
 		t.Fatalf("/profile dev should not start an agent stream")
 	}
-	rendered := renderTranscript(m.transcript, 100)
-	if !strings.Contains(rendered, "selecting shared Nexus profile: dev") {
-		t.Fatalf("transcript missing local command status: %q", rendered)
+	if m.inputMode != modeProfileConfirm {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeProfileConfirm)
+	}
+	if m.pendingProfileName != "dev" {
+		t.Fatalf("pendingProfileName = %q, want dev", m.pendingProfileName)
 	}
 }
 
@@ -1194,5 +1199,185 @@ func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
 	rendered := m.View()
 	if !strings.Contains(rendered, "unknown local command") {
 		t.Fatalf("view should mention 'unknown local command', got %q", rendered)
+	}
+}
+
+// --- Profile confirm overlay (§5 path C phase 3 polish continuation) ---
+
+func TestProfileAlreadyActiveShortCircuitsConfirmOverlay(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.activeProfile = "dev"
+	before := len(m.transcript)
+	cmd := m.handleLocalCommand("/profile dev")
+	if cmd != nil {
+		t.Fatalf("/profile <active> should return nil (no HTTP, no overlay)")
+	}
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q (already-active must not open overlay)", m.inputMode, modeComposing)
+	}
+	if m.pendingProfileName != "" {
+		t.Fatalf("pendingProfileName = %q, want empty", m.pendingProfileName)
+	}
+	rendered := renderTranscript(m.transcript[before:], 100)
+	if !strings.Contains(rendered, "profile already active: dev") {
+		t.Fatalf("transcript should mention 'profile already active: dev', got %q", rendered)
+	}
+}
+
+func TestProfileConfirmYKeyFiresHTTPCommand(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.activeProfile = "dev"
+	if cmd := m.handleLocalCommand("/profile staging"); cmd != nil {
+		t.Fatalf("/profile staging should return nil (parked in confirm)")
+	}
+	if m.inputMode != modeProfileConfirm {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeProfileConfirm)
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if cmd == nil {
+		t.Fatalf("y in profile-confirm should return the selectRuntimeProfile HTTP command")
+	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after y = %q, want %q", updatedModel.inputMode, modeComposing)
+	}
+	if updatedModel.pendingProfileName != "" {
+		t.Fatalf("pendingProfileName after y = %q, want empty", updatedModel.pendingProfileName)
+	}
+	rendered := renderTranscript(updatedModel.transcript, 200)
+	if !strings.Contains(rendered, "selecting shared Nexus profile: staging") {
+		t.Fatalf("transcript should mention 'selecting shared Nexus profile: staging', got %q", rendered)
+	}
+}
+
+func TestProfileConfirmEnterKeyFiresHTTPCommand(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("enter in profile-confirm should fire the HTTP command")
+	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after enter = %q, want %q", updatedModel.inputMode, modeComposing)
+	}
+	if updatedModel.pendingProfileName != "" {
+		t.Fatalf("pendingProfileName after enter = %q, want empty", updatedModel.pendingProfileName)
+	}
+}
+
+func TestProfileConfirmNKeyCancelsWithoutHTTP(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	if cmd != nil {
+		t.Fatalf("n in profile-confirm should NOT fire any HTTP command, got %v", cmd)
+	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after n = %q, want %q", updatedModel.inputMode, modeComposing)
+	}
+	if updatedModel.pendingProfileName != "" {
+		t.Fatalf("pendingProfileName after n = %q, want empty", updatedModel.pendingProfileName)
+	}
+	rendered := renderTranscript(updatedModel.transcript, 200)
+	if !strings.Contains(rendered, "profile switch cancelled: prod") {
+		t.Fatalf("transcript should mention 'profile switch cancelled: prod', got %q", rendered)
+	}
+}
+
+func TestProfileConfirmEscKeyCancels(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if cmd != nil {
+		t.Fatalf("esc in profile-confirm should NOT fire any HTTP command, got %v", cmd)
+	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", updatedModel.inputMode, modeComposing)
+	}
+	if updatedModel.pendingProfileName != "" {
+		t.Fatalf("pendingProfileName after esc = %q, want empty", updatedModel.pendingProfileName)
+	}
+	rendered := renderTranscript(updatedModel.transcript, 200)
+	if !strings.Contains(rendered, "profile switch cancelled: prod") {
+		t.Fatalf("transcript should mention 'profile switch cancelled: prod', got %q", rendered)
+	}
+}
+
+func TestProfileConfirmStrayKeyDoesNotReachTextinput(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	before := m.input.Value()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeProfileConfirm {
+		t.Fatalf("stray key should NOT exit profile-confirm mode")
+	}
+	if updatedModel.input.Value() != before {
+		t.Fatalf("stray key should NOT reach textinput (was %q, now %q)", before, updatedModel.input.Value())
+	}
+	if updatedModel.pendingProfileName != "prod" {
+		t.Fatalf("pendingProfileName = %q, want prod (stray key must not clear pending)", updatedModel.pendingProfileName)
+	}
+}
+
+func TestRenderProfileConfirmEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.activeProfile = "dev"
+	if got := m.renderProfileConfirm(100); got != "" {
+		t.Fatalf("renderProfileConfirm in composing mode should return empty, got %q", got)
+	}
+}
+
+func TestRenderProfileConfirmShowsHeaderInMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.activeProfile = "dev"
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	rendered := m.renderProfileConfirm(120)
+	if rendered == "" {
+		t.Fatalf("renderProfileConfirm in profile-confirm mode should be non-empty")
+	}
+	for _, want := range []string{"Confirm profile switch", "current: dev", "→ new:   prod", "y / enter", "n / esc"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered profile-confirm missing %q\nfull: %q", want, rendered)
+		}
+	}
+}
+
+func TestProfileConfirmWithEmptyActiveShowsNoCurrent(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
+		t.Fatalf("/profile prod should return nil (parked in confirm)")
+	}
+	rendered := m.renderProfileConfirm(120)
+	if !strings.Contains(rendered, "→ Switch active profile to: prod") {
+		t.Fatalf("empty activeProfile should render the single-line variant, got %q", rendered)
 	}
 }

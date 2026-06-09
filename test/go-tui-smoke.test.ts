@@ -122,6 +122,11 @@ test('Go TUI smoke: phase 7 §5 path C phase 3 friendly profile-rejection', { sk
   assert.match(output, /phase 7 .* friendly profile-rejection verified/)
 })
 
+test('Go TUI smoke: §5 path C phase 3 polish profile y/n overlay', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('profile-confirm')
+  assert.match(output, /profile y\/n overlay verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
@@ -138,6 +143,7 @@ test('Go TUI smoke: phase 7 orchestrator runs all sequences end-to-end', { skip:
     'slash-palette',
     'slash-palette-prefix',
     'tool-palette',
+    'profile-confirm',
     'phase3-overlay-mutex',
     'permission-approve',
   ]) {

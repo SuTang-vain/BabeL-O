@@ -2,6 +2,36 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — §5 路径 C 阶段 3 polish 续：profile 切换 y/n overlay 收口
+
+- **用户请求**: 按文档规划继续推进（已选 profile y/n overlay）。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 新增 `modeProfileConfirm` inputMode 常量 + `pendingProfileName string` 字段；`/profile <name>` 不再直接发 `selectRuntimeProfile` HTTP，先 `setMode(modeProfileConfirm)` + 写 `pendingProfileName`。
+    - `profile == m.activeProfile && profile != ""` 时短路：appendLine `"profile already active: <name>"` + 不开 overlay。
+    - `Update` 的 KeyMsg dispatch 加 `case modeProfileConfirm`：`y` / `enter` 调 `selectRuntimeProfile` + 回 composing；`n` / `esc` 清 pending + 写 `"profile switch cancelled: <name>"` + 回 composing；其他键被吞（textinput 不会收 stray key）。
+    - 新增 `renderProfileConfirm(width int) string`：title "Confirm profile switch" + divider + `current: <from>` / `→ new: <to>`（activeProfile 为空时单行 `→ Switch active profile to: <name>`） + y/enter / n/esc hint；非 modeProfileConfirm 时返回空字符串。`View()` 拼接在 permission / help / palette 之间、input / footer 之前。
+    - 新增 `confirmStyle` (foreground 215, bold)；`helpOverlayLines` 加 Profile confirm overlay 段。
+    - 修一个 Phase 3 引入的 `submitPrompt` defensive 行为：去掉 `m.setMode(modeComposing)` 强制重置（之前是 Phase 3 defensive 逻辑，但现在 /profile <name> 需要保留 modeProfileConfirm，否则 y/n overlay 永远进不去）。`handleLocalCommand` 自己拥有 mode 转换。
+  - `clients/go-tui/main_test.go`:
+    - `TestHandleLocalConfigCommandsDoNotStartAgentStream` 改为断言 `/profile dev` 返回 nil、进入 modeProfileConfirm、`pendingProfileName == "dev"`。
+    - 新增 9 个单测：`TestProfileAlreadyActiveShortCircuitsConfirmOverlay` / `TestProfileConfirmYKeyFiresHTTPCommand` / `TestProfileConfirmEnterKeyFiresHTTPCommand` / `TestProfileConfirmNKeyCancelsWithoutHTTP` / `TestProfileConfirmEscKeyCancels` / `TestProfileConfirmStrayKeyDoesNotReachTextinput` / `TestRenderProfileConfirmEmptyOutsideMode` / `TestRenderProfileConfirmShowsHeaderInMode` / `TestProfileConfirmWithEmptyActiveShowsNoCurrent`。
+  - `test/go_tui_pty_driver.py`:
+    - seeded config 加 `activeProfile: "alpha"` + `profiles: {alpha, beta}`（都指向 `local/coding-runtime`），让 `*alpha` 标志位 + `beta` 可切换都可在 PTY 中触发。
+    - 新增 `run_profile_confirm_sequence` 三路径：path1 `/profile beta` → n → "profile switch cancelled: beta"；path2 `/profile beta` → y → "selecting shared Nexus profile: beta" + "profile switched: beta"；path3 `/profile beta` 重选已 active → "profile already active: beta" 短路。
+    - 加进 `SEQUENCES` registry（`"profile-confirm"` entry），`all` orchestrator 顺序里插在 `tool-palette` 与 `phase3-overlay-mutex` 之间。
+    - `tombstone-rejection` 序列跟随新行为：先等 `Confirm profile switch` overlay 出现，按 y 后再等 `unknown profile "ghost"`。
+  - `test/go-tui-smoke.test.ts`: 加 `profile-confirm` 测试 + `all` orchestrator 顺序同步。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `cd clients/go-tui && go test ./...` 79/79 pass（原 70 + 9 新）。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 10/10 pass：permission-approve 1.7s / help-overlay 1.8s / phase3-overlay-mutex 2.8s / slash-palette 1.7s / slash-palette-prefix 4.5s / tool-palette 1.4s / tombstone-rejection 1.4s（overlay + y 路径） / profile-confirm 1.5s / visual-regression-narrow 4.5s / all-orchestrator 9.7s。
+- **范围克制**:
+  - profile 切换确认面板现在覆盖 y / n / esc / 重选已 active 四路径；tombstone / unknown profile 的 friendly 错误路径走同 `friendlyNexusError` 映射不变。
+  - provider/model diff 在 overlay 里仍只展示 profile name；后续若要展示 provider/model 列表留到 Phase 5/6 wire 真实 model metadata 时一并做。
+  - `/v1/tools/audit` 真实 wire 仍留未来 phase。
+  - paste / multiline / Shift+Enter 仍留后续 PR。
+
 ## 2026-06-09 — Go TUI Phase 7：PTY / visual regression harness 收口
 
 - **用户请求**: 推进 Phase 7 PTY/visual regression harness + 错误态回归。

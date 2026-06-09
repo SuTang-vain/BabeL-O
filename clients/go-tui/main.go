@@ -150,10 +150,11 @@ type pollTickMsg struct{}
 type inputMode string
 
 const (
-	modeComposing   inputMode = "composing"   // textinput owns keys
-	modePermission  inputMode = "permission"  // a/y/r/n/esc only
-	modeSlashPick   inputMode = "slashPick"   // one-shot slash palette (no live filter yet)
-	modeHelpOverlay inputMode = "helpOverlay" // read-only help; up/down/esc/enter
+	modeComposing      inputMode = "composing"      // textinput owns keys
+	modePermission     inputMode = "permission"     // a/y/r/n/esc only
+	modeSlashPick      inputMode = "slashPick"      // one-shot slash palette (no live filter yet)
+	modeHelpOverlay    inputMode = "helpOverlay"    // read-only help; up/down/esc/enter
+	modeProfileConfirm inputMode = "profileConfirm" // y/n/esc only; gates selectRuntimeProfile
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -180,6 +181,7 @@ type model struct {
 	tombstoneCount int
 	paletteFilter  string
 	paletteSelected int
+	pendingProfileName string
 	startedAt      time.Time
 	width          int
 	height         int
@@ -261,8 +263,17 @@ var slashCommands = []slashCommand{
 				return fetchRuntimeProfiles(m.cfg)
 			}
 			profile := args[0]
-			m.appendLine("status", "selecting shared Nexus profile: "+profile)
-			return selectRuntimeProfile(m.cfg, profile)
+			if profile == m.activeProfile && profile != "" {
+				m.appendLine("status", "profile already active: "+profile)
+				return nil
+			}
+			// Profile switch is a session-affecting action: gate it
+			// behind a y/n overlay so an accidental submit can't
+			// change provider/model mid-conversation. The HTTP call
+			// is deferred to the y/enter branch in the mode dispatch.
+			m.pendingProfileName = profile
+			m.setMode(modeProfileConfirm)
+			return nil
 		},
 	},
 	{
@@ -511,6 +522,7 @@ var (
 	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	permissionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	confirmStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
 	assistantStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	userStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	thinkingStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
@@ -692,6 +704,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Unrecognised key in palette mode: swallow so the textinput
 			// doesn't accidentally consume it.
 			return m, nil
+
+		case modeProfileConfirm:
+			// Profile switch is gated: y/enter fires the HTTP call,
+			// n/esc cancels. Anything else is swallowed so the
+			// textinput never sees a stray key while the prompt is
+			// up.
+			switch strings.ToLower(key) {
+			case "y", "enter":
+				profile := m.pendingProfileName
+				m.pendingProfileName = ""
+				m.setMode(modeComposing)
+				if profile == "" {
+					m.appendLine("error", "no pending profile to confirm")
+					return m, nil
+				}
+				m.appendLine("status", "selecting shared Nexus profile: "+profile)
+				return m, selectRuntimeProfile(m.cfg, profile)
+			case "n", "esc":
+				cancelled := m.pendingProfileName
+				m.pendingProfileName = ""
+				m.setMode(modeComposing)
+				m.appendLine("status", "profile switch cancelled: "+cancelled)
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -718,8 +755,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.input.SetValue("")
 			if strings.HasPrefix(prompt, "/") {
+				// Note: do NOT m.setMode(modeComposing) here — some
+				// slash commands (e.g. /profile <name>) intentionally
+				// transition to modeProfileConfirm, and clobbering
+				// that would skip the y/n overlay. Other commands
+				// stay in composing by default (no setMode call),
+				// which matches the previous behavior.
 				cmd := m.handleLocalCommand(prompt)
-				m.setMode(modeComposing)
 				return m, cmd
 			}
 			m.appendLine("user", prompt)
@@ -841,6 +883,7 @@ func (m model) View() string {
 	footer := m.renderFooter(width)
 	help := m.renderHelp(width)
 	palette := m.renderSlashPalette(width)
+	profileConfirm := m.renderProfileConfirm(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -851,6 +894,9 @@ func (m model) View() string {
 	}
 	if palette != "" {
 		parts = append(parts, palette)
+	}
+	if profileConfirm != "" {
+		parts = append(parts, profileConfirm)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -878,6 +924,10 @@ var helpOverlayLines = []string{
 	"Local slash commands (run after the leading / and enter):",
 	"  /config          refresh shared Nexus config + profile state",
 	"  /profile [name]  list profiles, or select a profile",
+	"",
+	"Profile confirm overlay:",
+	"  y / enter        confirm the pending profile switch",
+	"  n / esc          cancel and stay on the current profile",
 	"",
 	"Press esc / enter / q to close.",
 }
@@ -929,6 +979,33 @@ func (m model) renderHelp(width int) string {
 		lines = append(lines, helpOverlayLines[m.helpScroll:end]...)
 	}
 	return strings.Join(lines, "\n")
+}
+
+// renderProfileConfirm paints the y/n confirmation overlay for a
+// pending /profile <name> switch. The prompt explains what is about
+// to change (current -> new profile) and lists the y/n/esc key
+// reference so the user never has to guess. Like renderHelp, it
+// returns "" outside the matching mode so it can be unconditionally
+// spliced into the View() parts list.
+func (m model) renderProfileConfirm(width int) string {
+	if m.inputMode != modeProfileConfirm {
+		return ""
+	}
+	name := firstNonEmpty(m.pendingProfileName, "<name>")
+	from := m.activeProfile
+	header := titleStyle.Render("Confirm profile switch")
+	lines := []string{header, divider(width)}
+	if from == "" {
+		lines = append(lines, fmt.Sprintf("  → Switch active profile to: %s", name))
+	} else {
+		lines = append(lines, fmt.Sprintf("  current: %s", from))
+		lines = append(lines, fmt.Sprintf("  → new:   %s", name))
+	}
+	lines = append(lines, "")
+	lines = append(lines, "  y / enter   confirm and switch")
+	lines = append(lines, "  n / esc     cancel and stay on the current profile")
+	body := strings.Join(lines, "\n")
+	return strings.Join([]string{divider(width), confirmStyle.Render(wrapPlain(body, max(0, width-2)))}, "\n")
 }
 
 // renderSlashPalette paints the live-filter palette above the input

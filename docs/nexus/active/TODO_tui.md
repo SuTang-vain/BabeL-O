@@ -151,6 +151,24 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `test/go-tui-smoke.test.ts` 扩展到 9 个测试：8 个独立序列各一条 + 1 条 `all` orchestrator，orchestrator 测试额外断言每个 `running <name>` 行都打出来。`runGoTuiSmoke(sequence, timeoutSeconds)` 参数化 helper，opt-in 仍由 `BABEL_O_RUN_GO_TUI_SMOKE=1` 控制。
   - `BABEL_O_GO_TUI_SMOKE_CONFIG` 环境变量：driver 在 main() 把 PTY session 用的 config 路径注入到 Go TUI 子进程与 parent process，方便未来 tombstone / 错误态 PTY 序列做 pre-seed；当前 `tombstone-rejection` 序列不依赖它（友好错误路径等价）。
   - 范围克制：tool palette 仍走静态目录（`/v1/tools/audit` 真实 wire 留到未来 phase）、`/context` `/compact` `/inbox` `/models` `/sessions` `/agents` 仍 status 行 TODO（Phase 5/6 wire）、paste / multiline / Shift+Enter 仍留后续 PR。
+- [x] §5 路径 C 阶段 3 polish 续：profile 切换 y/n overlay 收口（2026-06-09 收口）。
+  - `clients/go-tui/main.go`:
+    - 新增 `modeProfileConfirm` inputMode 常量 + `pendingProfileName` 字段；与 `modePermission` / `modeHelpOverlay` / `modeSlashPick` 共用 single-input-owner 状态机。
+    - `submitPrompt` 取消 `m.setMode(modeComposing)` 强制重置（之前是 Phase 3 defensive 行为，但现在 /profile <name> 需要保留 modeProfileConfirm）；`handleLocalCommand` 自己拥有 mode 转换。
+    - `/profile <name>` 重新实现：`profile == m.activeProfile` 时 short-circuit 出 `profile already active: <name>` 状态行并不开 overlay；否则把 `pendingProfileName` 写入 + `setMode(modeProfileConfirm)`，不直接发 HTTP。
+    - `Update` 的 KeyMsg dispatch 加 `case modeProfileConfirm`：`y` / `enter` 调 `selectRuntimeProfile` 后回 composing；`n` / `esc` 清 pending + 写 `profile switch cancelled: <name>` 状态行 + 回 composing；其他键被吞（textinput 不会收到 stray key）。
+    - 新增 `renderProfileConfirm(width int) string`：title "Confirm profile switch" + `current: <from>` / `→ new: <to>`（activeProfile 为空时单行 `→ Switch active profile to: <name>`） + y/enter / n/esc hint；与 help / slash palette 同一渲染风格，非 modeProfileConfirm 时返回空字符串。
+    - `View()` 拼接 `profileConfirm` 在 permission / help / palette 之间、input / footer 之前；`helpOverlayLines` 加 Profile confirm overlay 段。
+  - `clients/go-tui/main_test.go`:
+    - 修改 `TestHandleLocalConfigCommandsDoNotStartAgentStream`：现在断言 `/profile dev` 返回 nil、进入 modeProfileConfirm、`pendingProfileName == "dev"`。
+    - 新增 9 个单测：`TestProfileAlreadyActiveShortCircuitsConfirmOverlay` / `TestProfileConfirmYKeyFiresHTTPCommand` / `TestProfileConfirmEnterKeyFiresHTTPCommand` / `TestProfileConfirmNKeyCancelsWithoutHTTP` / `TestProfileConfirmEscKeyCancels` / `TestProfileConfirmStrayKeyDoesNotReachTextinput` / `TestRenderProfileConfirmEmptyOutsideMode` / `TestRenderProfileConfirmShowsHeaderInMode` / `TestProfileConfirmWithEmptyActiveShowsNoCurrent`。
+  - `test/go_tui_pty_driver.py`:
+    - seeded config 加 `activeProfile: alpha` + `profiles: {alpha, beta}`（都指向 local/coding-runtime）。
+    - 新增 `run_profile_confirm_sequence` 三路径：n 取消 → "profile switch cancelled: beta"；y 确认 → "selecting shared Nexus profile: beta" + "profile switched: beta"；再选已 active → "profile already active: beta" 短路。
+    - 加进 `SEQUENCES` registry；`all` orchestrator 顺序里插在 `tool-palette` 与 `phase3-overlay-mutex` 之间。
+    - `tombstone-rejection` 序列跟随新行为：先等 confirm overlay 出现，按 `y` 后再等 `unknown profile "ghost"`。
+  - `test/go-tui-smoke.test.ts`: 加 `profile-confirm` 测试 + `all` orchestrator 顺序同步。
+  - 范围克制：profile 切换确认面板现在覆盖 y / n / esc / 留空重选四路径；tombstone / unknown profile 的 friendly 错误路径走同 `friendlyNexusError` 映射不变；后续若要扩展（如切换前展示 provider/model diff）留到 Phase 5/6 wire 真实 model metadata 时一并做。
 - [x] Phase 8 packaging/distribution early slice：`bbl go` managed Nexus launcher 收口（2026-06-09 收口）。
   - `bbl go` 先构建 Go TUI launch spec，避免 Go TUI binary/source 不存在时误启动 Nexus；随后探活 `GET /health`。
   - localhost / `ws://localhost` URL 不健康时自动启动 `__server` 子进程，并继承 `process.execArgv`，确保开发态 `node --import tsx src/cli/program.ts go` 也能正确拉起 TypeScript server。
@@ -158,9 +176,8 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `--no-start-nexus` 只连接不启动；远程 URL 不健康时报错，不尝试本地拉起；Go TUI 退出时只关闭本次 wrapper 自己拉起的 child，不影响用户已有 Nexus。
   - `--poll-interval-ms` 已由 wrapper 透传给 Go TUI。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / Phase 3 / Phase 4 / Phase 7 / Phase 8 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 7 / Phase 8 稳定后才推进：
 
-- §5 路径 C 阶段 3 polish 续：profile 切换确认面板（带 y/n overlay）——已在 Phase 7 用 `/profile ghost` 验证 friendly 错误路径，但带显式 y/n 的确认面板本身仍待补。
 - Phase 5 context/compact 长会话 UX。
 - Phase 6 Agent/Task/SessionChannel views。
 - Go TUI tool palette `/v1/tools/audit` 真实 wire（Phase 4 静态目录的下一阶段）。
