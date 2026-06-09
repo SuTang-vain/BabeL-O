@@ -2,6 +2,37 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 7：PTY / visual regression harness 收口
+
+- **用户请求**: 推进 Phase 7 PTY/visual regression harness + 错误态回归。
+- **实现**:
+  - `test/go_tui_pty_driver.py`:
+    - 重构为 `SEQUENCES` 注册表驱动：每个 entry 含 `runner` / `ok_message` / `required_invariants`，`main()` 按 `--sequence` name 派发。
+    - 8 个独立序列 + 1 个 orchestrator：
+      - `permission-approve`：Phase 1 baseline（bash echo → Permission: Bash → approve → Bash done → done success=true）。
+      - `phase3-overlay-mutex`：Phase 3 单 input owner + overlay 互斥（help 开/关、permission 模式按 stray key 不污染 textinput、'?' 在 permission 模式被吞、'a' approve 收尾）。
+      - `slash-palette`：Phase 4 `/` live-filter → Enter 跑 /help。
+      - `slash-palette-prefix`：Phase 4 `/bash` prefix 插入 textinput，transcript 出现 `inserted prefix:` 状态行。
+      - `tool-palette`：Phase 4 `/tools` 静态目录（含 Bash risk=execute + approval-required 标记 + Bash/Read/Grep/Glob）。
+      - `help-overlay`：Phase 3/4 `?` 开/关 help overlay。
+      - `tombstone-rejection`：§5 path C phase 3 polish——`/profile ghost` 走 friendlyNexusError 出 `unknown profile "ghost"`。
+      - `visual-regression-narrow`：driver 启动时设 `COLUMNS=40 LINES=20`，验证 banner + help overlay 在窄宽度下不破坏 layout。
+      - `all` = orchestrator：在一个 PTY session 内顺序跑其余 6 个真实序列（help-overlay / slash-palette / slash-palette-prefix / tool-palette / phase3-overlay-mutex / permission-approve），每个序列后用 `Esc` + 60 次 `\x7f`（DEL/backspace）重置 textinput 回 composing。
+    - `BABEL_O_GO_TUI_SMOKE_CONFIG` 环境变量：driver 在 main() 把 PTY session 用的 config 路径注入到 Go TUI 子进程 + parent process，方便未来 tombstone / 错误态 PTY 序列做 pre-seed（当前 `tombstone-rejection` 序列走 `/profile ghost` friendly 路径，不依赖 pre-seed）。
+    - `visual-regression-narrow` 在 spawn 前给 `go_tui_env` 注入 `COLUMNS=40` / `LINES=20`，Bubble Tea 启动即按窄视口 layout。
+  - `clients/go-tui/main.go`:
+    - 修一个 Phase 4 引入的 `handleLocalCommand` panic：prefix-insertion 命令（如 `/bash`）的 `cmd.run == nil`，但 Phase 4 直接 submit 路径没保护。`handleLocalCommand` 现在显式判定 `cmd.run == nil` 并返回 `command is not executable via direct submit: <name> (open the slash palette to use it)`，避免 nil-pointer-dereference（orchestrator 在 phase3 阶段就被这条 path 触发过一次）。
+  - `test/go-tui-smoke.test.ts`: 扩展到 9 个测试（8 个独立序列 + 1 个 `all` orchestrator），`runGoTuiSmoke(sequence, timeoutSeconds)` 参数化 helper；`all` 测试额外断言每个 `running <name>` 行都打出来；`BABEL_O_RUN_GO_TUI_SMOKE=1` opt-in gate 不变。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `cd clients/go-tui && go test ./...` 76/76 pass。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 9/9 pass（28.5s 总时长：permission-approve 1.6s / help-overlay 1.8s / phase3-overlay-mutex 2.8s / slash-palette 1.7s / slash-palette-prefix 4.6s / tool-palette 1.3s / tombstone-rejection 1.3s / visual-regression-narrow 4.3s / all-orchestrator 8.8s）。
+- **范围克制**:
+  - tool palette 仍走静态目录（`/v1/tools/audit` HTTP wire 留未来 phase）。
+  - `/context` `/compact` `/inbox` `/models` `/sessions` `/agents` 仍 status 行 TODO，留 Phase 5/6 wire 真实 backend。
+  - paste / multiline / Shift+Enter 仍留后续 PR。
+  - profile 切换确认面板（带 y/n overlay）本身仍待补；friendly 错误路径已在 `/profile ghost` 覆盖，tombstoned profile 走同 friendly 路径。
+
 ## 2026-06-09 — Go TUI Phase 4：slash / tool palette 收口
 
 - **用户请求**: 按规划推进 Phase 4 slash / tool palette（含真正 live filter slash palette）。

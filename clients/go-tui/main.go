@@ -1020,6 +1020,14 @@ func (m *model) handleLocalCommand(input string) tea.Cmd {
 		m.appendLine("error", "unknown local command: "+fields[0])
 		return nil
 	}
+	if cmd.run == nil {
+		// Prefix-insertion commands (e.g. /bash) have no server-side
+		// runner; they only fire from the slash palette. If a user
+		// somehow submits them directly, surface a helpful error
+		// instead of nil-pointer-dereferencing.
+		m.appendLine("error", "command is not executable via direct submit: "+fields[0]+" (open the slash palette to use it)")
+		return nil
+	}
 	return cmd.run(m, fields[1:])
 }
 
