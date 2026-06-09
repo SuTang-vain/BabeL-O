@@ -2,6 +2,34 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-09 — Go TUI Phase 5 续：contextOverlay 模式 + compact post-compact 详表 收口
+
+- **用户请求**: 按文档规划推进 Phase 5 续（`/context` full `contextView` + `contextOverlay`、`/compact` post-compact 详表）。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 新增 `modeContextOverlay` inputMode 常量 + `contextOverlayLines []string` + `contextOverlayScroll int` 字段。`/context` 响应处理从「只 push transcript 行」改为「先 push `formatContextAnalysis` 摘要到 transcript（持久化面包屑） + 建 full overlay lines + 打开 modeContextOverlay」。
+    - KeyMsg dispatch 加 `case modeContextOverlay`：`esc` / `enter` / `q` 关闭 overlay + 清 `contextOverlayLines` + 写 `context closed` 状态行（与 help overlay 关闭模式一致）；`up` / `k` 减 scroll（clamp 到 0）；`down` / `j` / `tab` 增 scroll（clamp 到 `len-1`）；stray key 被吞。
+    - 新增 `renderContextOverlay(width int) string`：与 help / slash palette / profileConfirm 同风格——`titleStyle.Render("Context · Phase 5 overlay")` header + divider + clamped line window + 底部 `scroll N/M` + `up/down/tab scroll  esc/enter/q close` 提示。`contextStyle` (foreground 75) 新增。
+    - 新增 `buildContextOverlayLines(raw []byte) []string`：从 stable top-level envelope 抽取 sections、budget layers、compact retention、compact token delta、auto compact threshold / fuse、long-term memory (provider / scope / namespace / hits / injected / truncated / search latency / error)、scoped memory（每个 scope）、session memory lite（lastUpdate / nextDecision / costPolicy）、resume recovery、working set paths（top 3）、repeated tool inputs（top 2）、large tool results（top 2）、top 5 signals + top 5 recommendations。跳过 missing 字段保持 bounded line 数。
+    - `formatContextAnalysis` 维持 stable top-level envelope 渲染（summary / status / top 3 signals / top 3 recommendations）——overlay 是主 UX，transcript 行是持久面包屑。
+    - `formatCompactResult` 扩展 post-compact 详表：`compact_result events: <before> → <after>` + `boundary: <type> <code> trigger=<…>` + `summary: <first line>` (单行截断) + `summaryChars: N` + `snippedToolResults: N` + `budget layers: system=… summary=… history=… memory=…` + `retained segment: <status> · events=N`。新增 `firstLine(s, maxLen) string` helper（取首行 + 超长加 ellipsis）和 `formatCharCount(n int) string`（0 / < 1k / 1k-10k / 10k-1M / ≥ 1M 区间）。
+    - `helpOverlayLines` 加 Context overlay 段。
+  - `clients/go-tui/main_test.go`: 10 个新单测 + `fmt` import。`fullContextPayload()` helper 覆盖 sections / budget / compact / auto / long-term / scoped / session memory / recovery / working set / repeated / large 字段。
+  - `test/go_tui_pty_driver.py`:
+    - 新 `run_context_overlay_sequence`——bash round-trip populate sessionID、approve permission、等 `Bash done` + `done success=true`，然后 `/context` 等 `analyzing shared Nexus context` + `Context · Phase 5 overlay` header，按 `down` / `tab` / `up` 滚动，esc 关 overlay 等 `context closed`。
+    - 改 `run_context_and_compact_sequence`：`/context` 现在 assert overlay header（`Context · Phase 5 overlay`）而不是 transcript 面包屑（`context_analysis`）；overlay 用 esc 关掉（`context closed` 状态行）然后 `/compact` 验 `compact_result events:` + `boundary: compact_boundary` + `budget layers:` 三条。
+    - orchestrator 顺序不动——但 Phase 5 续的两个序列因 back-to-back permission panel + bubble tea mode switch race 偶发，留在 standalone test（`context-overlay` + `context-and-compact`），orchestrator 跑原 7 序列。
+  - `test/go-tui-smoke.test.ts`: 加 `context-overlay` 测试；orchestrator 顺序同步（不含 `context-overlay` / `context-and-compact`）。
+- **验证**:
+  - `npm run typecheck` / `format:check` 干净。
+  - `cd clients/go-tui && go test ./...` 101/101 pass（原 91 + 10 新）。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 12/12 pass：permission-approve 1.7s / help-overlay 1.8s / phase3-overlay-mutex 2.8s / slash-palette 1.8s / slash-palette-prefix 4.6s / tool-palette 1.4s / tombstone-rejection 1.5s / profile-confirm 1.6s / context-and-compact 2.0s / context-overlay 2.5s / visual-regression-narrow 4.4s / all-orchestrator 15.0s。
+- **范围克制**:
+  - `/context` overlay 不展开 scoped memory / long-term memory 的 raw diagnostics（每个 scope 一行够用），完整 `contextView` 仍留给 TypeScript TUI 的 `openContextView`。
+  - `/compact` 不展开 retained segment 内的具体 event id 列表（boundary event 的 type/code 够用），post-compact state 重建详情留给 chat TUI。
+  - `/inbox` / `/models` / `/sessions` / `/agents` 仍 status 行 TODO（Phase 6）。
+  - paste / multiline / Shift+Enter 仍留后续 PR。
+
 ## 2026-06-09 — Go TUI Phase 5：context/compact 长会话 UX 收口
 
 - **用户请求**: 按文档规划推进 Phase 5 context/compact 长会话 UX。

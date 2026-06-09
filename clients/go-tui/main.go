@@ -176,6 +176,7 @@ const (
 	modeSlashPick      inputMode = "slashPick"      // one-shot slash palette (no live filter yet)
 	modeHelpOverlay    inputMode = "helpOverlay"    // read-only help; up/down/esc/enter
 	modeProfileConfirm inputMode = "profileConfirm" // y/n/esc only; gates selectRuntimeProfile
+	modeContextOverlay inputMode = "contextOverlay" // read-only context analysis; up/down/esc/enter
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -203,6 +204,8 @@ type model struct {
 	paletteFilter  string
 	paletteSelected int
 	pendingProfileName string
+	contextOverlayLines  []string
+	contextOverlayScroll int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -552,6 +555,7 @@ var (
 	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
 	permissionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	confirmStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
+	contextStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	assistantStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
 	userStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	thinkingStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
@@ -758,6 +762,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeContextOverlay:
+			// Read-only context analysis overlay (Phase 5 续).
+			// up/down/tab/pgdn scroll forward; up/tab/pgup scroll
+			// back. esc/enter/q close and clear the lines buffer.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.contextOverlayLines = nil
+				m.contextOverlayScroll = 0
+				m.appendLine("status", "context closed")
+				return m, nil
+			case "up", "k":
+				if m.contextOverlayScroll > 0 {
+					m.contextOverlayScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				maxScroll := max(0, len(m.contextOverlayLines)-1)
+				if m.contextOverlayScroll < maxScroll {
+					m.contextOverlayScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -871,7 +900,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("error", "context: "+msg.err.Error())
 			return m, nil
 		}
+		// Push the stable top-level envelope to the transcript (so
+		// it survives in the scrollback + PTY harnesses can assert
+		// on it) AND open the full context overlay with the rest of
+		// the diagnostics. The overlay is the primary UX; the
+		// transcript line is the persistent breadcrumb.
 		m.appendLine("status", formatContextAnalysis(msg.raw))
+		m.contextOverlayLines = buildContextOverlayLines(msg.raw)
+		m.contextOverlayScroll = 0
+		m.setMode(modeContextOverlay)
 		return m, nil
 
 	case compactResultMsg:
@@ -929,6 +966,7 @@ func (m model) View() string {
 	help := m.renderHelp(width)
 	palette := m.renderSlashPalette(width)
 	profileConfirm := m.renderProfileConfirm(width)
+	contextOverlay := m.renderContextOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -942,6 +980,9 @@ func (m model) View() string {
 	}
 	if profileConfirm != "" {
 		parts = append(parts, profileConfirm)
+	}
+	if contextOverlay != "" {
+		parts = append(parts, contextOverlay)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -973,6 +1014,10 @@ var helpOverlayLines = []string{
 	"Profile confirm overlay:",
 	"  y / enter        confirm the pending profile switch",
 	"  n / esc          cancel and stay on the current profile",
+	"",
+	"Context overlay (Phase 5 续):",
+	"  up / down / tab  scroll through the context analysis",
+	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
 }
@@ -1051,6 +1096,413 @@ func (m model) renderProfileConfirm(width int) string {
 	lines = append(lines, "  n / esc     cancel and stay on the current profile")
 	body := strings.Join(lines, "\n")
 	return strings.Join([]string{divider(width), confirmStyle.Render(wrapPlain(body, max(0, width-2)))}, "\n")
+}
+
+// renderContextOverlay paints the multi-line context analysis
+// (Phase 5 续). It is a read-only scrollable overlay, similar in
+// shape to renderHelp: header + divider + clamped line window +
+// bottom hint. Outside modeContextOverlay it returns "" so the
+// View() parts list can splice it unconditionally.
+func (m model) renderContextOverlay(width int) string {
+	if m.inputMode != modeContextOverlay {
+		return ""
+	}
+	if len(m.contextOverlayLines) == 0 {
+		return ""
+	}
+	header := titleStyle.Render("Context · Phase 5 overlay")
+	divider := divider(width)
+	// Reserve one row for header, one for the bottom hint, and one
+	// for a scroll indicator. The remaining rows are the visible
+	// window of contextOverlayLines.
+	reserved := 4
+	visibleRows := max(0, m.height-reserved)
+	if visibleRows == 0 {
+		visibleRows = max(1, len(m.contextOverlayLines))
+	}
+	maxScroll := max(0, len(m.contextOverlayLines)-visibleRows)
+	if m.contextOverlayScroll > maxScroll {
+		m.contextOverlayScroll = maxScroll
+	}
+	start := m.contextOverlayScroll
+	end := start + visibleRows
+	if end > len(m.contextOverlayLines) {
+		end = len(m.contextOverlayLines)
+	}
+	body := strings.Join(m.contextOverlayLines[start:end], "\n")
+	scrollHint := fmt.Sprintf("  scroll %d/%d", start+1, len(m.contextOverlayLines))
+	footerHint := "  up/down/tab scroll  esc/enter/q close"
+	plain := strings.Join([]string{body, scrollHint, footerHint}, "\n")
+	return strings.Join([]string{divider, contextStyle.Render(wrapPlain(plain, max(0, width-2)))}, "\n") + "\n" + header + "\n" + divider
+}
+
+// buildContextOverlayLines turns the raw /v1/sessions/:id/context
+// payload into the line buffer that the contextOverlay renders. It
+// pulls a stable subset of the diagnostics (sections, compact
+// retention, long-term memory, scoped memory, session memory lite,
+// auto compact, recovery, repeated tool inputs, working set paths)
+// plus the top signals and recommendations. Unknown / missing
+// fields are silently skipped so the line count stays bounded.
+func buildContextOverlayLines(raw []byte) []string {
+	var payload struct {
+		Type         string `json:"type"`
+		SessionID    string `json:"sessionId"`
+		Cwd          string `json:"cwd"`
+		ModelID      string `json:"modelId"`
+		Budget       struct {
+			MaxTokens   int `json:"maxTokens"`
+			LayerBudgets struct {
+				System   int `json:"system"`
+				Summary  int `json:"summary"`
+				History  int `json:"history"`
+				Memory   int `json:"memory"`
+				ReservedOutput int `json:"reservedOutput"`
+			} `json:"layerBudgets"`
+		} `json:"budget"`
+		Window struct {
+			MaxTokens     int `json:"maxTokens"`
+			TokenEstimate int `json:"tokenEstimate"`
+		} `json:"window"`
+		Sections struct {
+			SystemPromptChars     int  `json:"systemPromptChars"`
+			ProjectMemoryChars    int  `json:"projectMemoryChars"`
+			SessionSummaryChars   int  `json:"sessionSummaryChars"`
+			ActiveSkillsChars     int  `json:"activeSkillsChars"`
+			MessageCount          int  `json:"messageCount"`
+			SelectedEventCount    int  `json:"selectedEventCount"`
+			OmittedEventCount     int  `json:"omittedEventCount"`
+			SnippedEventCount     int  `json:"snippedEventCount"`
+			MicrocompactedEventCount int `json:"microcompactedEventCount"`
+			MemoryTruncated       bool `json:"memoryTruncated"`
+			ToolDefinitionCount   int  `json:"toolDefinitionCount"`
+		} `json:"sections"`
+		Compact struct {
+			HasBoundary            bool   `json:"hasBoundary"`
+			Trigger                string `json:"trigger"`
+			SummaryChars           int    `json:"summaryChars"`
+			RetainedEventCount     int    `json:"retainedEventCount"`
+			RetainedSegmentValid   bool   `json:"retainedSegmentValid"`
+			RetainedSegmentWarning string `json:"retainedSegmentWarning"`
+			BeforeEventCount       int    `json:"beforeEventCount"`
+			AfterEventCount        int    `json:"afterEventCount"`
+		} `json:"compact"`
+		Diagnostics struct {
+			RemainingTokens   int  `json:"remainingTokens"`
+			RemainingPercent  int  `json:"remainingPercent"`
+			AutoCompact       struct {
+				ShouldCompact    bool `json:"shouldCompact"`
+				ThresholdPercent int  `json:"thresholdPercent"`
+				FuseOpen         bool `json:"fuseOpen"`
+				FailureCount     int  `json:"failureCount"`
+				FailureLimit     int  `json:"failureLimit"`
+			} `json:"autoCompact"`
+			LongTermMemory struct {
+				Provider      string `json:"provider"`
+				Enabled       bool   `json:"enabled"`
+				HitCount      int    `json:"hitCount"`
+				InjectedChars int    `json:"injectedChars"`
+				BudgetChars   int    `json:"budgetChars"`
+				Truncated     bool   `json:"truncated"`
+				Scope         string `json:"scope"`
+				NamespaceID   string `json:"namespaceId"`
+				SearchLatencyMs float64 `json:"searchLatencyMs"`
+				Error         string `json:"error"`
+			} `json:"longTermMemory"`
+			ScopedMemory []struct {
+				Scope        string `json:"scope"`
+				Provider     string `json:"provider"`
+				Enabled      bool   `json:"enabled"`
+				HitCount     int    `json:"hitCount"`
+				InjectedChars int   `json:"injectedChars"`
+				BudgetChars  int    `json:"budgetChars"`
+				Truncated    bool   `json:"truncated"`
+				NamespaceID  string `json:"namespaceId"`
+			} `json:"scopedMemory"`
+			SessionMemoryLite struct {
+				Enabled bool `json:"enabled"`
+				LastUpdate struct {
+					Trigger      string `json:"trigger"`
+					Reason       string `json:"reason"`
+					SummaryChars int    `json:"summaryChars"`
+					EventCount   int    `json:"eventCount"`
+				} `json:"lastUpdate"`
+				NextDecision struct {
+					ShouldUpdate bool   `json:"shouldUpdate"`
+					Reason       string `json:"reason"`
+				} `json:"nextDecision"`
+				CostPolicy struct {
+					SummaryMode    string `json:"summaryMode"`
+					MaxSummaryChars int   `json:"maxSummaryChars"`
+				} `json:"costPolicy"`
+			} `json:"sessionMemoryLite"`
+			CompactRetention struct {
+				HasBoundary          bool   `json:"hasBoundary"`
+				RetainedEventCount   int    `json:"retainedEventCount"`
+				RetainedSegmentValid bool   `json:"retainedSegmentValid"`
+				RetainedSegmentWarning string `json:"retainedSegmentWarning"`
+				FallbackToFullHistory bool  `json:"fallbackToFullHistory"`
+			} `json:"compactRetention"`
+			CompactTokenDelta struct {
+				HasBoundary            bool `json:"hasBoundary"`
+				BeforeEventCount       int  `json:"beforeEventCount"`
+				AfterEventCount        int  `json:"afterEventCount"`
+				EstimatedTokensSaved   int  `json:"estimatedTokensSaved"`
+			} `json:"compactTokenDelta"`
+			ResumeRecovery struct {
+				Active   bool   `json:"active"`
+				Code     string `json:"code"`
+				Message  string `json:"message"`
+				Timestamp string `json:"timestamp"`
+			} `json:"resumeRecovery"`
+			WorkingSetPaths []struct {
+				Path   string `json:"path"`
+				Touches int   `json:"touches"`
+			} `json:"workingSetPaths"`
+			RepeatedToolInputs []struct {
+				Name         string `json:"name"`
+				Count        int    `json:"count"`
+				InputPreview string `json:"inputPreview"`
+			} `json:"repeatedToolInputs"`
+			LargeToolResults []struct {
+				Name        string `json:"name"`
+				OutputChars int    `json:"outputChars"`
+				InputPreview string `json:"inputPreview"`
+			} `json:"largeToolResults"`
+		} `json:"diagnostics"`
+		Diagnostic struct {
+			Name            string          `json:"name"`
+			Status          string          `json:"status"`
+			Summary         string          `json:"summary"`
+			Signals         []contextSignal `json:"signals"`
+			Recommendations []string        `json:"recommendations"`
+		} `json:"diagnostic"`
+		Recommendations []string `json:"recommendations"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return []string{fmt.Sprintf("context overlay: decode failed: %v", err)}
+	}
+	lines := []string{}
+	// Header.
+	modelPart := strings.TrimSpace(payload.ModelID)
+	if modelPart == "" {
+		modelPart = "default"
+	}
+	lines = append(lines, fmt.Sprintf("Context · %s · %s", shortID(payload.SessionID), modelPart))
+	// Summary + status.
+	if s := strings.TrimSpace(payload.Diagnostic.Summary); s != "" {
+		lines = append(lines, "  "+s)
+	}
+	if status := strings.TrimSpace(payload.Diagnostic.Status); status != "" {
+		lines = append(lines, fmt.Sprintf("  status: %s", status))
+	}
+	// Sections.
+	if payload.Sections.MessageCount > 0 || payload.Sections.SelectedEventCount > 0 || payload.Sections.ToolDefinitionCount > 0 {
+		lines = append(lines, "  sections:")
+		lines = append(lines, fmt.Sprintf("    messages: %d (selected=%d omitted=%d snipped=%d microcompact=%d)",
+			payload.Sections.MessageCount, payload.Sections.SelectedEventCount,
+			payload.Sections.OmittedEventCount, payload.Sections.SnippedEventCount,
+			payload.Sections.MicrocompactedEventCount))
+		lines = append(lines, fmt.Sprintf("    chars: system=%s project-memory=%s session-summary=%s skills=%s",
+			formatCharCount(payload.Sections.SystemPromptChars),
+			formatCharCount(payload.Sections.ProjectMemoryChars),
+			formatCharCount(payload.Sections.SessionSummaryChars),
+			formatCharCount(payload.Sections.ActiveSkillsChars),
+		))
+		lines = append(lines, fmt.Sprintf("    tools visible: %d%s",
+			payload.Sections.ToolDefinitionCount,
+			ternary(payload.Sections.MemoryTruncated, " (memory truncated)", "")))
+	}
+	// Budget breakdown (only when populated).
+	if lb := payload.Budget.LayerBudgets; lb.System+lb.Summary+lb.History+lb.Memory > 0 {
+		lines = append(lines, "  budget layers (tokens):")
+		lines = append(lines, fmt.Sprintf("    system=%d summary=%d history=%d memory=%d reserved-output=%d",
+			lb.System, lb.Summary, lb.History, lb.Memory, lb.ReservedOutput))
+	}
+	// Compact retention + token delta.
+	if payload.Diagnostics.CompactRetention.HasBoundary {
+		validity := "valid"
+		if !payload.Diagnostics.CompactRetention.RetainedSegmentValid {
+			validity = "fallback"
+		}
+		warning := ""
+		if w := strings.TrimSpace(payload.Diagnostics.CompactRetention.RetainedSegmentWarning); w != "" {
+			warning = " · " + w
+		}
+		lines = append(lines, fmt.Sprintf("  compact retention: %s · events=%d%s",
+			validity, payload.Diagnostics.CompactRetention.RetainedEventCount, warning))
+	}
+	if payload.Diagnostics.CompactTokenDelta.HasBoundary {
+		lines = append(lines, fmt.Sprintf("  compact delta: events %d→%d · saved≈%d tokens",
+			payload.Diagnostics.CompactTokenDelta.BeforeEventCount,
+			payload.Diagnostics.CompactTokenDelta.AfterEventCount,
+			payload.Diagnostics.CompactTokenDelta.EstimatedTokensSaved,
+		))
+	}
+	// Auto compact.
+	if payload.Diagnostics.AutoCompact.ShouldCompact {
+		lines = append(lines, fmt.Sprintf("  auto compact: threshold reached at %d%%",
+			payload.Diagnostics.AutoCompact.ThresholdPercent))
+	}
+	if payload.Diagnostics.AutoCompact.FuseOpen {
+		lines = append(lines, fmt.Sprintf("  auto compact: fuse open after %d/%d failures",
+			payload.Diagnostics.AutoCompact.FailureCount,
+			payload.Diagnostics.AutoCompact.FailureLimit))
+	}
+	// Long-term memory.
+	ltm := payload.Diagnostics.LongTermMemory
+	ltmProvider := ltm.Provider
+	if !ltm.Enabled || ltmProvider == "" {
+		ltmProvider = "disabled"
+	}
+	ltmScopePart := ""
+	if ltm.Scope != "" && ltm.Scope != "unknown" {
+		ltmScopePart = fmt.Sprintf(" scope=%s%s", ltm.Scope,
+			ternary(ltm.NamespaceID != "", " namespace="+ltm.NamespaceID, ""))
+	}
+	lines = append(lines, fmt.Sprintf("  long-term memory: %s%s · hits=%d injected=%s/%s",
+		ltmProvider, ltmScopePart, ltm.HitCount,
+		formatCharCount(ltm.InjectedChars), formatCharCount(ltm.BudgetChars)))
+	if ltm.Truncated {
+		lines = append(lines, "  long-term memory: truncated (budget pressure)")
+	}
+	if ltm.SearchLatencyMs > 0 {
+		lines = append(lines, fmt.Sprintf("  long-term memory: search latency=%dms",
+			int(ltm.SearchLatencyMs)))
+	}
+	if ltm.Error != "" {
+		lines = append(lines, "  long-term memory: error="+ltm.Error)
+	}
+	// Scoped memory.
+	for _, sm := range payload.Diagnostics.ScopedMemory {
+		if sm.Scope == "unknown" {
+			continue
+		}
+		provider := sm.Provider
+		if !sm.Enabled || provider == "" {
+			provider = "disabled"
+		}
+		lines = append(lines, fmt.Sprintf("  scoped memory: %s %s · hits=%d injected=%s/%s%s",
+			sm.Scope, provider, sm.HitCount,
+			formatCharCount(sm.InjectedChars), formatCharCount(sm.BudgetChars),
+			ternary(sm.NamespaceID != "", " namespace="+sm.NamespaceID, "")))
+	}
+	// Session memory lite.
+	sml := payload.Diagnostics.SessionMemoryLite
+	if sml.Enabled || sml.LastUpdate.Trigger != "" {
+		lastLine := "none"
+		if sml.LastUpdate.Trigger != "" {
+			lastLine = fmt.Sprintf("%s/%s events=%d summary=%s",
+				sml.LastUpdate.Trigger,
+				ternary(sml.LastUpdate.Reason == "", "unknown", sml.LastUpdate.Reason),
+				sml.LastUpdate.EventCount,
+				formatCharCount(sml.LastUpdate.SummaryChars))
+		}
+		lines = append(lines, fmt.Sprintf("  session memory lite: enabled=%v last=%s next=%s policy=%s",
+			sml.Enabled, lastLine,
+			ternary(sml.NextDecision.ShouldUpdate, "update", "skip")+"·"+sml.NextDecision.Reason,
+			sml.CostPolicy.SummaryMode))
+	}
+	// Resume recovery.
+	if payload.Diagnostics.ResumeRecovery.Active {
+		lines = append(lines, fmt.Sprintf("  resume recovery: %s · %s",
+			payload.Diagnostics.ResumeRecovery.Code,
+			payload.Diagnostics.ResumeRecovery.Message))
+	}
+	// Working set paths.
+	if len(payload.Diagnostics.WorkingSetPaths) > 0 {
+		parts := []string{}
+		limit := len(payload.Diagnostics.WorkingSetPaths)
+		if limit > 3 {
+			limit = 3
+		}
+		for _, entry := range payload.Diagnostics.WorkingSetPaths[:limit] {
+			parts = append(parts, fmt.Sprintf("%s×%d", entry.Path, entry.Touches))
+		}
+		lines = append(lines, "  working set paths: "+strings.Join(parts, ", "))
+	}
+	// Repeated tool inputs.
+	if len(payload.Diagnostics.RepeatedToolInputs) > 0 {
+		limit := len(payload.Diagnostics.RepeatedToolInputs)
+		if limit > 2 {
+			limit = 2
+		}
+		for _, entry := range payload.Diagnostics.RepeatedToolInputs[:limit] {
+			lines = append(lines, fmt.Sprintf("  repeated tool input: %s ×%d · %s",
+				entry.Name, entry.Count, entry.InputPreview))
+		}
+	}
+	// Large tool results.
+	if len(payload.Diagnostics.LargeToolResults) > 0 {
+		limit := len(payload.Diagnostics.LargeToolResults)
+		if limit > 2 {
+			limit = 2
+		}
+		for _, entry := range payload.Diagnostics.LargeToolResults[:limit] {
+			lines = append(lines, fmt.Sprintf("  large tool result: %s %s · %s",
+				entry.Name, formatCharCount(entry.OutputChars), entry.InputPreview))
+		}
+	}
+	// Signals.
+	if signals := payload.Diagnostic.Signals; len(signals) > 0 {
+		lines = append(lines, "  signals:")
+		limit := len(signals)
+		if limit > 5 {
+			limit = 5
+		}
+		for _, sig := range signals[:limit] {
+			level := strings.TrimSpace(sig.Level)
+			if level == "" {
+				level = "info"
+			}
+			lines = append(lines, fmt.Sprintf("    [%s] %s %s",
+				level, strings.TrimSpace(sig.Code), strings.TrimSpace(sig.Message)))
+		}
+		if len(signals) > 5 {
+			lines = append(lines, fmt.Sprintf("    ... +%d more", len(signals)-5))
+		}
+	}
+	// Recommendations.
+	if recs := payload.Diagnostic.Recommendations; len(recs) > 0 {
+		lines = append(lines, "  recommendations:")
+		limit := len(recs)
+		if limit > 5 {
+			limit = 5
+		}
+		for _, rec := range recs[:limit] {
+			lines = append(lines, "    - "+strings.TrimSpace(rec))
+		}
+		if len(recs) > 5 {
+			lines = append(lines, fmt.Sprintf("    ... +%d more", len(recs)-5))
+		}
+	}
+	return lines
+}
+
+// ternary is a small inline helper to keep the buildContextOverlayLines
+// body readable when picking between two short strings.
+func ternary(cond bool, whenTrue, whenFalse string) string {
+	if cond {
+		return whenTrue
+	}
+	return whenFalse
+}
+
+// formatCharCount renders a char count in human-friendly form
+// (e.g. 1234 -> "1.2k", 12 -> "12", 0 -> "0"). The chat TUI uses
+// the same idea in contextView.
+func formatCharCount(n int) string {
+	switch {
+	case n <= 0:
+		return "0"
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 10_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dk", n/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000.0)
+	}
 }
 
 // renderSlashPalette paints the live-filter palette above the input
@@ -2001,16 +2453,40 @@ func formatContextAnalysis(raw []byte) string {
 }
 
 // formatCompactResult turns the raw /v1/sessions/:id/compact
-// payload into 1-2 transcript lines. The Go TUI keeps this short:
-// the most actionable numbers are beforeEventCount → afterEventCount.
+// payload into a compact post-compact summary. The Go TUI keeps
+// this short — the full retained segment / snipped tool results
+// breakdown lives in the response payload and the chat TUI's
+// contextView; we surface the most actionable numbers plus the
+// boundary event metadata so the user can verify the compact
+// actually fired.
 func formatCompactResult(raw []byte) string {
 	var payload struct {
 		Type             string `json:"type"`
 		BeforeEventCount int    `json:"beforeEventCount"`
 		AfterEventCount  int    `json:"afterEventCount"`
 		Event            struct {
-			Type string `json:"type"`
-			Code string `json:"code"`
+			Type              string `json:"type"`
+			Code              string `json:"code"`
+			Trigger           string `json:"trigger"`
+			Summary           string `json:"summary"`
+			SummaryChars      int    `json:"summaryChars"`
+			SnippedToolResults int   `json:"snippedToolResults"`
+			RetainedEvents    []struct {
+				Type string `json:"type"`
+			} `json:"retainedEvents"`
+			RetainedSegment struct {
+				Status            string `json:"status"`
+				RetainedEventCount int    `json:"retainedEventCount"`
+				Warning           string `json:"warning"`
+			} `json:"retainedSegment"`
+			Budget struct {
+				LayerBudgets struct {
+					System  int `json:"system"`
+					Summary int `json:"summary"`
+					History int `json:"history"`
+					Memory  int `json:"memory"`
+				} `json:"layerBudgets"`
+			} `json:"budget"`
 		} `json:"event"`
 	}
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -2019,14 +2495,55 @@ func formatCompactResult(raw []byte) string {
 	lines := []string{
 		fmt.Sprintf("compact_result events: %d → %d", payload.BeforeEventCount, payload.AfterEventCount),
 	}
-	if payload.Event.Type != "" {
+	evt := payload.Event
+	if evt.Type != "" {
 		codePart := ""
-		if payload.Event.Code != "" {
-			codePart = " " + payload.Event.Code
+		if evt.Code != "" {
+			codePart = " " + evt.Code
 		}
-		lines = append(lines, "  boundary: "+payload.Event.Type+codePart)
+		triggerPart := ""
+		if evt.Trigger != "" {
+			triggerPart = " trigger=" + evt.Trigger
+		}
+		lines = append(lines, "  boundary: "+evt.Type+codePart+triggerPart)
+	}
+	if summary := strings.TrimSpace(firstLine(evt.Summary, 160)); summary != "" {
+		lines = append(lines, "  summary: "+summary)
+	}
+	if evt.SummaryChars > 0 {
+		lines = append(lines, fmt.Sprintf("  summaryChars: %d", evt.SummaryChars))
+	}
+	if evt.SnippedToolResults > 0 {
+		lines = append(lines, fmt.Sprintf("  snippedToolResults: %d", evt.SnippedToolResults))
+	}
+	if lb := evt.Budget.LayerBudgets; lb.System+lb.Summary+lb.History+lb.Memory > 0 {
+		lines = append(lines, fmt.Sprintf("  budget layers: system=%d summary=%d history=%d memory=%d",
+			lb.System, lb.Summary, lb.History, lb.Memory))
+	}
+	if seg := evt.RetainedSegment; seg.Status != "" || seg.RetainedEventCount > 0 {
+		warning := ""
+		if w := strings.TrimSpace(seg.Warning); w != "" {
+			warning = " · " + w
+		}
+		lines = append(lines, fmt.Sprintf("  retained segment: %s · events=%d%s",
+			ternary(seg.Status == "", "n/a", seg.Status),
+			seg.RetainedEventCount, warning))
 	}
 	return strings.Join(lines, "\n")
+}
+
+// firstLine trims a string to its first \n and bounds the length
+// to maxLen (with a trailing ellipsis when truncated). Used by
+// formatCompactResult to keep the summary preview to a single
+// transcript line.
+func firstLine(s string, maxLen int) string {
+	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
+		s = s[:idx]
+	}
+	if maxLen > 0 && len(s) > maxLen {
+		return s[:maxLen] + "…"
+	}
+	return s
 }
 
 func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {

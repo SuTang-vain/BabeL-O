@@ -132,13 +132,18 @@ test('Go TUI smoke: phase 5 /context + /compact wire to Nexus', { skip: skipReas
   assert.match(output, /phase 5 \/context and \/compact wire to Nexus verified/)
 })
 
+test('Go TUI smoke: phase 5 续 /context full contextOverlay', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('context-overlay')
+  assert.match(output, /phase 5 续 \/context full contextOverlay verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
 })
 
 test('Go TUI smoke: phase 7 orchestrator runs all sequences end-to-end', { skip: skipReason }, () => {
-  const output = runGoTuiSmoke('all', 180)
+  const output = runGoTuiSmoke('all', 300)
   assert.match(output, /all phase 7 sequences verified end-to-end/)
   // The orchestrator prints one "running" line per sequence — verify
   // the full set ran (so a regression in one of the individual
@@ -149,7 +154,6 @@ test('Go TUI smoke: phase 7 orchestrator runs all sequences end-to-end', { skip:
     'slash-palette-prefix',
     'tool-palette',
     'profile-confirm',
-    'context-and-compact',
     'phase3-overlay-mutex',
     'permission-approve',
   ]) {

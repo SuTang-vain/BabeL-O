@@ -1595,3 +1595,274 @@ func TestCompactResultMsgErrorAppendsFriendlyLine(t *testing.T) {
 		t.Fatalf("transcript should mention 'compact: session not found', got %q", rendered)
 	}
 }
+
+// --- Phase 5 续: /context full overlay + /compact post-compact details ---
+
+// fullContextPayload is a representative /v1/sessions/:id/context
+// payload used by the overlay + post-compact tests below. It covers
+// every section buildContextOverlayLines knows about, so each test
+// can assert on its slice without rebuilding the JSON.
+func fullContextPayload() []byte {
+	return []byte(`{
+		"type": "context_analysis",
+		"sessionId": "session_phase5_overlay",
+		"cwd": "/workspace",
+		"modelId": "local/coding-runtime",
+		"budget": {
+			"maxTokens": 8192,
+			"layerBudgets": {"system": 2048, "summary": 1024, "history": 4096, "memory": 512, "reservedOutput": 512}
+		},
+		"window": {"maxTokens": 8192, "tokenEstimate": 1234},
+		"sections": {
+			"systemPromptChars": 1500, "projectMemoryChars": 200, "sessionSummaryChars": 80,
+			"activeSkillsChars": 0, "messageCount": 5, "selectedEventCount": 7,
+			"omittedEventCount": 0, "snippedEventCount": 0, "microcompactedEventCount": 1,
+			"memoryTruncated": false, "toolDefinitionCount": 4
+		},
+		"compact": {
+			"hasBoundary": true, "trigger": "manual", "summaryChars": 256,
+			"retainedEventCount": 3, "retainedSegmentValid": true, "retainedSegmentWarning": "",
+			"beforeEventCount": 47, "afterEventCount": 12
+		},
+		"diagnostics": {
+			"remainingTokens": 6958, "remainingPercent": 85,
+			"autoCompact": {"shouldCompact": false, "thresholdPercent": 80, "fuseOpen": false, "failureCount": 0, "failureLimit": 3},
+			"longTermMemory": {
+				"provider": "evercore", "enabled": true, "hitCount": 2, "injectedChars": 240,
+				"budgetChars": 1200, "truncated": false, "scope": "project",
+				"namespaceId": "ws-phase5", "searchLatencyMs": 18.5
+			},
+			"scopedMemory": [
+				{"scope": "project", "provider": "evercore", "enabled": true, "hitCount": 2, "injectedChars": 240, "budgetChars": 1200, "namespaceId": "ws-phase5"}
+			],
+			"sessionMemoryLite": {
+				"enabled": true,
+				"lastUpdate": {"trigger": "compact", "reason": "summary", "summaryChars": 256, "eventCount": 47},
+				"nextDecision": {"shouldUpdate": false, "reason": "below threshold"},
+				"costPolicy": {"summaryMode": "extractive-only", "maxSummaryChars": 1024}
+			},
+			"compactRetention": {"hasBoundary": true, "retainedEventCount": 3, "retainedSegmentValid": true, "retainedSegmentWarning": "", "fallbackToFullHistory": false},
+			"compactTokenDelta": {"hasBoundary": true, "beforeEventCount": 47, "afterEventCount": 12, "estimatedTokensSaved": 1820},
+			"resumeRecovery": {"active": false, "code": "", "message": "", "timestamp": ""},
+			"workingSetPaths": [
+				{"path": "/workspace/src/runtime/compact.ts", "touches": 4},
+				{"path": "/workspace/src/cli/contextView.ts", "touches": 2}
+			],
+			"repeatedToolInputs": [
+				{"name": "Grep", "count": 5, "inputPreview": "context"},
+				{"name": "Read", "count": 2, "inputPreview": "/workspace/src/runtime/compact.ts"}
+			],
+			"largeToolResults": [
+				{"name": "Bash", "outputChars": 4820, "inputPreview": "cat src/cli/contextView.ts"}
+			]
+		},
+		"diagnostic": {
+			"name": "context_analysis", "status": "ok",
+			"summary": "context 1234/8192 tokens; 6958 remaining",
+			"signals": [
+				{"level": "info", "code": "INFO_OK", "message": "no warnings"}
+			],
+			"recommendations": [
+				"Continue without changes"
+			]
+		},
+		"recommendations": ["Continue without changes"]
+	}`)
+}
+
+func TestBuildContextOverlayLinesExtractsTopLevelEnvelope(t *testing.T) {
+	lines := buildContextOverlayLines(fullContextPayload())
+	joined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"Context · session_",
+		"· local/coding-runtime",
+		"context 1234/8192 tokens; 6958 remaining",
+		"status: ok",
+		"sections:",
+		"messages: 5 (selected=7",
+		"tools visible: 4",
+		"budget layers (tokens):",
+		"system=2048 summary=1024",
+		"compact retention: valid · events=3",
+		"compact delta: events 47→12 · saved≈1820 tokens",
+		"long-term memory: evercore scope=project",
+		"hits=2 injected=240/1.2k",
+		"working set paths: /workspace/src/runtime/compact.ts×4",
+		"repeated tool input: Grep ×5 · context",
+		"large tool result: Bash 4.8k",
+		"session memory lite: enabled=true last=compact/summary",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("buildContextOverlayLines missing %q\nfull:\n%s", want, joined)
+		}
+	}
+}
+
+func TestBuildContextOverlayLinesReportsDecodeErrorOnInvalidJSON(t *testing.T) {
+	lines := buildContextOverlayLines([]byte(`{not json`))
+	if len(lines) != 1 || !strings.Contains(lines[0], "context overlay: decode failed") {
+		t.Fatalf("expected single decode-error line, got %v", lines)
+	}
+}
+
+func TestContextOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeContextOverlay {
+		t.Fatalf("inputMode = %q, want %q", updatedModel.inputMode, modeContextOverlay)
+	}
+	if len(updatedModel.contextOverlayLines) == 0 {
+		t.Fatalf("contextOverlayLines should be populated")
+	}
+	if updatedModel.contextOverlayScroll != 0 {
+		t.Fatalf("contextOverlayScroll = %d, want 0 on open", updatedModel.contextOverlayScroll)
+	}
+	// esc closes and clears.
+	closed, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closedModel, ok := closed.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", closed)
+	}
+	if closedModel.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", closedModel.inputMode, modeComposing)
+	}
+	if closedModel.contextOverlayLines != nil {
+		t.Fatalf("contextOverlayLines should be nil after close, got %d lines", len(closedModel.contextOverlayLines))
+	}
+}
+
+func TestContextOverlayScrollClamps(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	updatedModel := updated.(model)
+	// Up at 0 should stay at 0.
+	up, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	upModel := up.(model)
+	if upModel.contextOverlayScroll != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", upModel.contextOverlayScroll)
+	}
+	// Down should advance and clamp at len-1.
+	cur := upModel
+	for i := 0; i < 200; i++ {
+		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		cur = next.(model)
+	}
+	maxScroll := len(cur.contextOverlayLines) - 1
+	if cur.contextOverlayScroll != maxScroll {
+		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.contextOverlayScroll)
+	}
+	// One more down should stay clamped.
+	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	moreModel := more.(model)
+	if moreModel.contextOverlayScroll != maxScroll {
+		t.Fatalf("scroll should remain at %d, got %d", maxScroll, moreModel.contextOverlayScroll)
+	}
+}
+
+func TestRenderContextOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderContextOverlay(120); got != "" {
+		t.Fatalf("renderContextOverlay in composing mode should be empty, got %q", got)
+	}
+}
+
+func TestRenderContextOverlayShowsHeaderInMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	updatedModel := updated.(model)
+	// Force a small height so the overlay has a finite window.
+	updatedModel.height = 30
+	rendered := updatedModel.renderContextOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderContextOverlay in modeContextOverlay should be non-empty")
+	}
+	for _, want := range []string{"Context · Phase 5 overlay", "· local/coding-runtime", "scroll"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered context overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestFormatCompactResultExtendedDetails(t *testing.T) {
+	raw := []byte(`{
+		"type": "compact_result",
+		"sessionId": "session_abc",
+		"beforeEventCount": 47,
+		"afterEventCount": 12,
+		"event": {
+			"type": "compact_boundary",
+			"code": "BOUNDARY_OK",
+			"trigger": "manual",
+			"summary": "Compacted 47 events to 12 retained + 1 boundary; saved 1820 tokens",
+			"summaryChars": 256,
+			"snippedToolResults": 3,
+			"retainedSegment": {"status": "valid", "retainedEventCount": 12, "warning": ""},
+			"budget": {"layerBudgets": {"system": 2048, "summary": 1024, "history": 4096, "memory": 512}}
+		}
+	}`)
+	got := formatCompactResult(raw)
+	for _, want := range []string{
+		"compact_result events: 47 → 12",
+		"boundary: compact_boundary BOUNDARY_OK trigger=manual",
+		"summary: Compacted 47 events to 12 retained + 1 boundary",
+		"summaryChars: 256",
+		"snippedToolResults: 3",
+		"budget layers: system=2048 summary=1024 history=4096 memory=512",
+		"retained segment: valid · events=12",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatCompactResult missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestFormatCompactResultSummaryTruncatedToFirstLine(t *testing.T) {
+	raw := []byte(`{
+		"type": "compact_result",
+		"beforeEventCount": 3, "afterEventCount": 1,
+		"event": {
+			"type": "compact_boundary",
+			"summary": "line one of summary\nline two that should be dropped"
+		}
+	}`)
+	got := formatCompactResult(raw)
+	if !strings.Contains(got, "summary: line one of summary") {
+		t.Fatalf("expected first-line summary preview, got %q", got)
+	}
+	if strings.Contains(got, "line two that should be dropped") {
+		t.Fatalf("second line of summary should be dropped, got %q", got)
+	}
+}
+
+func TestFormatCharCountHumanFriendly(t *testing.T) {
+	cases := map[int]string{
+		0:   "0",
+		12:  "12",
+		999: "999",
+		1234: "1.2k",
+		9999: "10.0k",
+		12345: "12k",
+		1234567: "1.2M",
+	}
+	for n, want := range cases {
+		if got := formatCharCount(n); got != want {
+			t.Fatalf("formatCharCount(%d) = %q, want %q", n, got, want)
+		}
+	}
+}
+
+func TestFirstLineBoundsAndStripsTrailingNewlines(t *testing.T) {
+	if got := firstLine("hello", 100); got != "hello" {
+		t.Fatalf("firstLine(hello) = %q, want hello", got)
+	}
+	if got := firstLine("hello world", 5); got != "hello…" {
+		t.Fatalf("firstLine bounded should add ellipsis, got %q", got)
+	}
+	if got := firstLine("line1\nline2", 100); got != "line1" {
+		t.Fatalf("firstLine should stop at first newline, got %q", got)
+	}
+}
