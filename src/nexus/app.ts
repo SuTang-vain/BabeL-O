@@ -21,8 +21,8 @@ import { NexusMetrics, round } from './metrics.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { BABEL_O_VERSION } from '../shared/version.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
-import { ConfigManager } from '../shared/config.js'
-import { getModel, UnknownModelError } from '../providers/registry.js'
+import { ConfigManager, type ProfileConfig } from '../shared/config.js'
+import { getModel, inspectModelCapabilities, modelRegistry, providerRegistry, UnknownModelError } from '../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runtime/providerRecovery.js'
 import { closeNexusSession } from './sessionLifecycle.js'
@@ -77,6 +77,115 @@ const providerLiveSmokeSchema = z.object({
   mode: z.enum(['simple_text', 'tool_call']).default('simple_text').optional(),
   timeoutMs: z.number().int().positive().max(60_000).default(30_000).optional(),
 })
+
+const runtimeConfigSelectSchema = z.object({
+  profile: z.string().min(1).max(120).optional(),
+  model: z.string().optional(),
+  role: z.string().optional(),
+  roleModel: z.string().optional(),
+}).strict()
+
+const runtimeConfigProfileParamsSchema = z.object({
+  name: z.string().min(1).max(120),
+})
+
+type SharedRuntimeCapabilities = {
+  toolCalling: boolean
+  jsonOutput: boolean
+  structuredOutput: boolean
+  streaming: boolean
+}
+
+function inspectResolvedRuntimeConfig(manager: ConfigManager) {
+  const settings = manager.resolveSettings()
+  try {
+    const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
+    return {
+      type: 'runtime_config',
+      modelId: settings.modelId,
+      modelName: diag.modelName,
+      providerId: settings.providerId,
+      providerName: diag.providerName,
+      modelSource: settings.modelSource,
+      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
+      apiKeySource: settings.apiKeySource,
+      baseUrl: settings.baseUrl ?? '',
+      baseUrlSource: settings.baseUrlSource,
+      activeProfile: settings.activeProfile,
+      contextWindow: diag.contextWindow,
+      defaultMaxTokens: diag.defaultMaxTokens,
+      capabilities: diag.capabilities,
+    }
+  } catch {
+    return {
+      type: 'runtime_config',
+      modelId: settings.modelId,
+      modelName: settings.modelId,
+      providerId: settings.providerId,
+      providerName: settings.providerId,
+      modelSource: settings.modelSource,
+      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
+      apiKeySource: settings.apiKeySource,
+      baseUrl: settings.baseUrl ?? '',
+      baseUrlSource: settings.baseUrlSource,
+      activeProfile: settings.activeProfile,
+      contextWindow: 0,
+      defaultMaxTokens: 0,
+      capabilities: {
+        toolCalling: false,
+        jsonOutput: false,
+        structuredOutput: false,
+        streaming: false,
+      } satisfies SharedRuntimeCapabilities,
+    }
+  }
+}
+
+function sanitizeProfileConfig(name: string, profile: ProfileConfig, activeProfile: string | undefined) {
+  const modelId = profile.model ?? ''
+  const providerId = profile.provider ?? (modelId.includes('/') ? modelId.slice(0, modelId.indexOf('/')) : '')
+  const base = {
+    name,
+    active: name === activeProfile,
+    model: profile.model,
+    provider: profile.provider,
+    roles: profile.roles,
+    hasApiKey: Boolean(profile.apiKey),
+    hasBaseUrl: Boolean(profile.baseUrl),
+  }
+  if (!modelId || !providerId) {
+    return base
+  }
+  try {
+    const diag = inspectModelCapabilities(modelId, providerId)
+    return {
+      ...base,
+      modelName: diag.modelName,
+      providerName: diag.providerName,
+      contextWindow: diag.contextWindow,
+      defaultMaxTokens: diag.defaultMaxTokens,
+      capabilities: diag.capabilities,
+    }
+  } catch {
+    return base
+  }
+}
+
+function isProviderConfiguredForSharedView(manager: ConfigManager, providerId: string): boolean {
+  const provider = providerRegistry.find(item => item.id === providerId)
+  if (!provider) return false
+  if (provider.authMode === 'none') return true
+
+  const activeSettings = manager.resolveSettings()
+  if (activeSettings.providerId === providerId && activeSettings.apiKeySource !== 'none' && Boolean(activeSettings.apiKey)) {
+    return true
+  }
+
+  const providerSettings = manager.resolveSettings({ model: provider.defaultModel })
+  return providerSettings.apiKeySource !== 'none' &&
+    providerSettings.apiKeySource !== 'profile' &&
+    Boolean(providerSettings.apiKey)
+}
 
 const providerFallbackPlanSchema = z.object({
   model: z.string().optional(),
@@ -455,6 +564,149 @@ export async function createNexusApp(
   })
 
   app.get('/v1/runtime/metrics', async () => buildRuntimeMetricsSnapshot(metrics, options.storage))
+
+  // === 路径 C: Go TUI 配置拉取端点 ===
+
+  // GET /v1/runtime/config — 当前 ResolvedSettings (脱敏: 不返回 apiKey)
+  app.get('/v1/runtime/config', async () => {
+    const manager = ConfigManager.getInstance()
+    const settings = manager.resolveSettings()
+    let modelName = settings.modelId
+    let contextWindow = 0
+    let defaultMaxTokens = 0
+    let toolCalling = false
+    let jsonOutput = false
+    let streaming = false
+    try {
+      const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
+      modelName = diag.modelName
+      contextWindow = diag.contextWindow
+      defaultMaxTokens = diag.defaultMaxTokens
+      toolCalling = diag.capabilities.toolCalling
+      jsonOutput = diag.capabilities.jsonOutput
+      streaming = diag.capabilities.streaming
+    } catch {
+      // model 未在 registry 中 — 返回占位
+    }
+    return {
+      modelId: settings.modelId,
+      modelName,
+      providerId: settings.providerId,
+      modelSource: settings.modelSource,
+      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
+      apiKeySource: settings.apiKeySource,
+      baseUrl: settings.baseUrl ?? '',
+      baseUrlSource: settings.baseUrlSource,
+      activeProfile: settings.activeProfile,
+      contextWindow,
+      defaultMaxTokens,
+      capabilities: { toolCalling, jsonOutput, streaming },
+    }
+  })
+
+  // GET /v1/runtime/models — provider + model 清单 (含配置状态)
+  app.get('/v1/runtime/models', async () => {
+    const manager = ConfigManager.getInstance()
+    const settings = manager.resolveSettings()
+    return {
+      providers: providerRegistry.map((p) => {
+        const configured =
+          settings.providerId === p.id &&
+          settings.apiKeySource !== 'none' &&
+          Boolean(settings.apiKey)
+        return {
+          id: p.id,
+          displayName: p.displayName,
+          adapter: p.adapter,
+          authMode: p.authMode,
+          defaultBaseUrl: p.defaultBaseUrl,
+          defaultModel: p.defaultModel,
+          configured,
+          models: p.models.map((mid) => {
+            const def = modelRegistry.find((m) => m.id === mid)
+            return {
+              id: mid,
+              name: def?.name ?? mid,
+              contextWindow: def?.contextWindow ?? 0,
+              defaultMaxTokens: def?.defaultMaxTokens ?? 0,
+              capabilities: def?.capabilities ?? {
+                toolCalling: false,
+                jsonOutput: false,
+                streaming: false,
+              },
+            }
+          }),
+        }
+      }),
+      defaultModel: settings.modelId,
+      activeProfile: settings.activeProfile,
+    }
+  })
+
+  // POST /v1/runtime/config/select — 切换 profile (持久化)
+  const configSelectSchema = z.object({
+    profile: z.string().optional(),
+    model: z.string().optional(),
+    role: z.string().optional(),
+    roleModel: z.string().optional(),
+  })
+  app.post('/v1/runtime/config/select', async (request, reply) => {
+    const body = configSelectSchema.parse(request.body ?? {})
+    const manager = ConfigManager.getInstance()
+
+    if (body.model || body.role || body.roleModel) {
+      return reply.code(400).send({
+        error: 'not_supported',
+        message:
+          'model / role / roleModel switching is not supported in this endpoint; use `bbl config` CLI',
+      })
+    }
+
+    if (!body.profile) {
+      return reply.code(400).send({ error: 'missing_profile' })
+    }
+
+    if (!manager.hasProfile(body.profile)) {
+      return reply.code(400).send({ error: 'unknown_profile', profile: body.profile })
+    }
+
+    manager.setActiveProfile(body.profile)
+
+    const settings = manager.resolveSettings()
+    let modelName = settings.modelId
+    let contextWindow = 0
+    let defaultMaxTokens = 0
+    let toolCalling = false
+    let jsonOutput = false
+    let streaming = false
+    try {
+      const diag = inspectModelCapabilities(settings.modelId, settings.providerId)
+      modelName = diag.modelName
+      contextWindow = diag.contextWindow
+      defaultMaxTokens = diag.defaultMaxTokens
+      toolCalling = diag.capabilities.toolCalling
+      jsonOutput = diag.capabilities.jsonOutput
+      streaming = diag.capabilities.streaming
+    } catch {
+      // model 未在 registry 中 — 返回占位
+    }
+    return {
+      modelId: settings.modelId,
+      modelName,
+      providerId: settings.providerId,
+      modelSource: settings.modelSource,
+      hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
+      apiKeySource: settings.apiKeySource,
+      baseUrl: settings.baseUrl ?? '',
+      baseUrlSource: settings.baseUrlSource,
+      activeProfile: settings.activeProfile,
+      contextWindow,
+      defaultMaxTokens,
+      capabilities: { toolCalling, jsonOutput, streaming },
+    }
+  })
+
+  // === 路径 C: 结束 ===
 
   app.get('/v1/schema/events', async () => {
     return z.toJSONSchema(NexusEventSchema)

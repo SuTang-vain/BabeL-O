@@ -104,6 +104,11 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - `renderPermission` 现在显示 `input: <command>` 与 `reason: <message>`——直接收掉之前标记的 P1 安全 UX bug（用户盲批 Bash）。
   - `formatToolInput(name, input)` 按工具名提取最相关字段（Bash.command / Read.path / Grep.pattern / ListDir.path / TaskCreate.title）。
   - 16 个 Go test 守住 Phase 2 行为；`go test ./...` 21/21 通过；`npm run test:go-tui:smoke` 仍过。
+- [x] §5 路径 C 阶段 1：ConfigManager 公开 + Nexus 配置拉取 HTTP 端点（2026-06-09 收口）。
+  - `src/shared/config.ts` 新增 `ConfigManager.hasProfile(name)` 公开方法（+8 行），允许外部消费方按名字查询 profile 是否存在。
+  - `src/nexus/app.ts` 新增 3 个 HTTP 端点（`GET /v1/config/profiles`、`GET /v1/config/profiles/:name`、`GET /v1/config/current`），仅做只读 config 导出；Go TUI 与其他远程客户端可走 HTTP 拉取 profile/active 信息，不再依赖 private 字段。
+  - 编译 0 errors；TypeScript 类型契约保持，Nexus 端不暴露 internal config writer / paths。
+  - 路径 C 阶段 2（增量拉取、profile 切换、tombstone）尚未启动，阶段 1 仅解锁"客户端能看见"的最小面。
 
 后续：
 
@@ -115,9 +120,9 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - Phase 8 packaging/distribution。
 - Phase 9 promotion gate。
 
-后续只有 Phase 1 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1 稳定后才推进：
 
-- Phase 2 Event renderer parity。
+- §5 路径 C 阶段 2：增量拉取 + profile 切换命令 + tombstone 处理。
 - Phase 3 Input owner / overlay state machine。
 - Phase 4 slash/tool palette。
 - Phase 5 context/compact long-session UX。
@@ -132,6 +137,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - 不读取内部 SQLite，不复刻 context manager，不执行工具。
 - 不与 Go Remote Runner 合并职责：Go TUI 是客户端，Go Runner 是可选执行后端。
 - 默认安装和默认测试不强制要求 Go toolchain。
+- §5 路径 C 阶段 1 起的所有配置访问：Go TUI 只通过 Nexus 暴露的只读 HTTP 端点拿到 config profile/active 视图；不允许 Go TUI 读取本地 `ConfigManager` 私有字段，也不复制 `ConfigManager` 的 schema 决策。
 
 ## 验证命令
 

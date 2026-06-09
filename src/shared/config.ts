@@ -220,7 +220,7 @@ export const BabelOConfigSchema = z.object({
   }
 
   if (data.activeProfile && data.activeProfile !== '') {
-    if (!data.profiles || !data.profiles[data.activeProfile]) {
+    if (!data.profiles || !Object.prototype.hasOwnProperty.call(data.profiles, data.activeProfile)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message: `activeProfile "${data.activeProfile}" does not exist in profiles`,
@@ -500,6 +500,11 @@ export class ConfigManager {
       ...profileConfig,
     };
     this.save(conf);
+  }
+
+  public hasProfile(name: string): boolean {
+    const conf = this.load();
+    return Boolean(conf.profiles && Object.prototype.hasOwnProperty.call(conf.profiles, name));
   }
 
   public getDefaultModel(): string {
