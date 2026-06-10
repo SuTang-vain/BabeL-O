@@ -244,6 +244,14 @@ export async function runSessionFlow(
       const budget = process.env.BABEL_O_THINKING_BUDGET
         ? parseInt(process.env.BABEL_O_THINKING_BUDGET, 10)
         : undefined
+      // `timeoutController` is intentionally a dead signal in the local
+      // CLI path: `bbl` is a per-process one-shot runner where the user
+      // already has a clean cancellation channel via Ctrl-C / signal,
+      // and stacking a second timeout on top would only re-classify a
+      // user-initiated cancel as REQUEST_TIMEOUT (see
+      // docs/nexus/reference/go-tui-execute-timeout-governance-plan.md
+      // Phase E). The Nexus HTTP / WebSocket path *does* arm a real
+      // timeout via its own constructor option; CLI does not.
       const timeoutController = new AbortController()
 
       for await (const event of runtime.executeStream({

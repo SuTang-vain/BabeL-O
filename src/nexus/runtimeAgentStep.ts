@@ -26,6 +26,7 @@ export type RuntimeAgentStepOptions = {
   maxRepairAttempts?: number
   allowedToolsOverride?: string[]
   signal?: AbortSignal
+  timeoutSignal?: AbortSignal
   executionEnvironment?: 'local' | 'docker' | 'remote'
   remoteRunner?: RemoteToolRunner
   allowedPaths?: string[]
@@ -225,7 +226,7 @@ export function createRuntimeAgentStepRunner(
         role: roleDefinition.role,
         model: targetModelId,
         signal: options.signal,
-        timeoutSignal: options.signal,
+        timeoutSignal: options.timeoutSignal,
         replaySessionHistory: false,
         maxOutputTokens: ROLE_STEP_MAX_OUTPUT_TOKENS,
         skipPermissionCheck: !roleDefinition.toolPolicy.requiresApproval,
@@ -295,7 +296,22 @@ export function createRuntimeAgentStepRunner(
         thinkingTextPreview: lastThinkingTextPreview,
       })
       const errorMessage = err instanceof Error ? err.message : String(err)
-      const errorCode = options.signal?.aborted ? 'REQUEST_TIMEOUT' : 'RUNTIME_AGENT_STEP_ERROR'
+      // Align error classification with LLMCodingRuntime: distinguish a
+      // server-side timeoutSignal (REQUEST_TIMEOUT) from a user-initiated
+      // signal abort (REQUEST_CANCELLED) so observability + telemetry are
+      // not collapsed. Both are preferred over the catch-all
+      // RUNTIME_AGENT_STEP_ERROR.
+      const isTimeout = options.timeoutSignal?.aborted
+      const isCancelled = !isTimeout && (
+        options.signal?.aborted ||
+        (err as { name?: string })?.name === 'AbortError' ||
+        (typeof errorMessage === 'string' && errorMessage.includes('Abort'))
+      )
+      const errorCode = isTimeout
+        ? 'REQUEST_TIMEOUT'
+        : isCancelled
+          ? 'REQUEST_CANCELLED'
+          : 'RUNTIME_AGENT_STEP_ERROR'
       options.onUsageSummary?.({ ...summary, errorCode, errorMessage })
       throw err
     }

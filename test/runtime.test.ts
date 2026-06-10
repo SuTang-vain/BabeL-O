@@ -965,9 +965,28 @@ test('execute reads a workspace file and records session events', async () => {
     assert.equal(body.success, true)
     assert.ok(body.events.some((event: { type: string }) => event.type === 'tool_completed'))
 
+    // Phase B execute-timeout observability: execute_result envelope exposes
+    // timeoutMs / executeDurationMs / nearTimeout / outcome so callers can
+    // monitor turn duration vs timeout budget without scraping internal state.
+    assert.equal(typeof body.timeoutMs, 'number')
+    assert.equal(typeof body.executeDurationMs, 'number')
+    assert.equal(typeof body.nearTimeout, 'boolean')
+    assert.ok(['success', 'error', 'cancelled', 'timeout'].includes(body.outcome))
+    assert.equal(body.outcome, 'success')
+    assert.ok(body.timeoutMs > 0)
+    assert.ok(body.executeDurationMs >= 0)
+
+    const summaryEvent = body.events.find((event: { type: string }) => event.type === 'execute_summary')
+    assert.ok(summaryEvent, 'execute_summary event should be appended to events array')
+    assert.equal(summaryEvent.timeoutMs, body.timeoutMs)
+    assert.equal(summaryEvent.executeDurationMs, body.executeDurationMs)
+    assert.equal(summaryEvent.nearTimeout, body.nearTimeout)
+    assert.equal(summaryEvent.outcome, body.outcome)
+
     const session = await storage.getSession(body.sessionId)
     assert.ok(session)
     assert.ok(session.events.length >= 3)
+    assert.ok(session.events.some(e => e.type === 'execute_summary'))
   } finally {
     await app.close()
   }
@@ -3646,10 +3665,15 @@ test('allowlisted runtime executes allowed tools and denies blocked tools', asyn
     assert.equal(readResponse.statusCode, 200)
     assert.equal(readResponse.json().success, true)
 
+    // Phase A of docs/nexus/reference/go-tui-permission-policy-governance-plan.md
+    // downgrades read-only Bash subcommands (`ls`, `pwd`, `git status`, ...)
+    // to `risk: 'read'`, so they bypass the allowlist at the policy layer.
+    // To exercise the original deny path, use a command the classifier
+    // escalates to `risk: 'execute'` (here: `bash "rm file"`).
     const bashResponse = await app.inject({
       method: 'POST',
       url: '/v1/execute',
-      payload: { prompt: 'bash pwd', cwd },
+      payload: { prompt: 'bash "rm sample.txt"', cwd, skipPermissionCheck: true },
     })
     assert.equal(bashResponse.statusCode, 200)
     const body = bashResponse.json()
@@ -3769,6 +3793,21 @@ test('execute timeout aborts long-running tools and records metrics', async () =
       ),
     )
 
+    // Phase B execute-timeout observability: timeout path classifies the
+    // execute_summary outcome as 'timeout' and marks nearTimeout=true so
+    // dashboards can distinguish a hard timeout from a slow-but-completed
+    // turn. timeoutMs echoes the configured executeTimeoutMs (50) so the
+    // caller can confirm which budget was hit.
+    assert.equal(body.outcome, 'timeout')
+    assert.equal(body.timeoutMs, 50)
+    assert.equal(body.nearTimeout, true)
+    assert.ok(body.executeDurationMs >= 0)
+    const summaryEvent = body.events.find((event: { type: string }) => event.type === 'execute_summary')
+    assert.ok(summaryEvent, 'execute_summary event should be appended even on timeout')
+    assert.equal(summaryEvent.outcome, 'timeout')
+    assert.equal(summaryEvent.timeoutMs, 50)
+    assert.equal(summaryEvent.nearTimeout, true)
+
     const metricsResponse = await app.inject({
       method: 'GET',
       url: '/v1/runtime/metrics',
@@ -3780,6 +3819,167 @@ test('execute timeout aborts long-running tools and records metrics', async () =
   } finally {
     await app.close()
   }
+})
+
+test('execute honours per-request timeoutMs from Go TUI WebSocket payload', async () => {
+  // Phase C regression: when the WebSocket / HTTP body sends a per-request
+  // timeoutMs that overrides the server default, Nexus must honour it AND
+  // echo the effective value in the execute_result envelope + execute_summary
+  // event so the caller (Go TUI) can confirm which budget was applied.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-per-request-timeout`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: cwd,
+    executeTimeoutMs: 30_000, // server default kept generous; per-request should win
+  })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'bash "sleep 1"',
+        cwd,
+        skipPermissionCheck: true,
+        timeoutMs: 200, // per-request override; shorter than the bash sleep
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, false)
+    assert.ok(
+      body.events.some(
+        (event: { type: string; code?: string }) =>
+          event.type === 'error' && event.code === 'REQUEST_TIMEOUT',
+      ),
+      'expected REQUEST_TIMEOUT error event in body.events',
+    )
+
+    // The per-request timeoutMs must win over the server default 30_000
+    // both in the envelope and in the persisted execute_summary event.
+    assert.equal(body.timeoutMs, 200, 'envelope should echo the per-request timeoutMs, not the server default')
+    assert.equal(body.outcome, 'timeout')
+    const summary = body.events.find((event: { type: string }) => event.type === 'execute_summary')
+    assert.ok(summary, 'execute_summary should still be emitted on per-request timeout')
+    assert.equal(summary.timeoutMs, 200)
+    assert.equal(summary.outcome, 'timeout')
+    assert.equal(summary.nearTimeout, true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute honours per-request policy=soft-deny for write/execute tools', async () => {
+  // Phase B of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+  // when the request body carries `policy: 'soft-deny'`, the hard-deny
+  // for tools not in the allowlist is bypassed. The existing approval
+  // gate then emits `permission_request` for write/execute-risk tools
+  // (here: Bash with `git commit -m x`), giving the user (Go TUI
+  // permission panel) a chance to approve / deny. Under the default
+  // `'strict'` policy the same call would be hard-denied with no
+  // permission_request.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-deny-bash`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-soft-deny-bash-${Date.now()}`
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m x"',
+      cwd,
+      sessionId,
+      policy: 'soft-deny',
+      skipPermissionCheck: false,
+    },
+  })
+
+  // Wait for permission_request to appear; auto-approve via /approve.
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      const reqEvent = data.session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        break
+      }
+    }
+  }
+  assert.ok(toolUseId, 'soft-deny should emit permission_request for execute-risk Bash')
+
+  // Approve and await the result.
+  const approveRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/approve`,
+    payload: { toolUseId, reason: 'auto-approve test' },
+  })
+  assert.equal(approveRes.statusCode, 200)
+
+  const response = await executePromise
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  // The body.success is what the runtime reports; the tool itself may
+  // fail (e.g. `git commit` outside a git repo) but the key claim is
+  // that the tool was allowed to run instead of being hard-denied.
+  const events = body.events
+  assert.ok(
+    events.some((e: any) => e.type === 'permission_request' && e.toolUseId === toolUseId),
+    'permission_request event should be present in the events stream',
+  )
+  // No tool_denied from the hard-deny path; a downstream tool failure
+  // would still emit tool_completed with success=false, not tool_denied.
+  assert.ok(
+    !events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
+    'soft-deny should NOT emit policy-based tool_denied',
+  )
+
+  await app.close()
+})
+
+test('execute with default strict policy still hard-denies execute-risk Bash', async () => {
+  // Back-compat: when `policy` is omitted (server-side default 'strict'),
+  // Bash with execute subcommands is hard-denied with no
+  // permission_request, matching pre-Phase-B behaviour. This pins the
+  // back-compat surface for `bbl chat` and other non-Go-TUI clients.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-strict-deny`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m x"',
+      cwd,
+      sessionId: `session-strict-deny-${Date.now()}`,
+    },
+  })
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  const events = body.events
+  assert.ok(
+    events.some(
+      (e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message),
+    ),
+    'default strict policy should hard-deny execute-risk Bash with policy message',
+  )
+  assert.ok(
+    !events.some((e: any) => e.type === 'permission_request'),
+    'default strict policy must NOT emit permission_request (back-compat)',
+  )
+
+  await app.close()
 })
 
 test('execute concurrency gate rejects excess work quickly', async () => {

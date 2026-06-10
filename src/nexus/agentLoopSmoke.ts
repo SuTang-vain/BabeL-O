@@ -128,6 +128,12 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
   let didTimeout = false
   let loopPromise: Promise<Awaited<ReturnType<typeof runAgentLoop>>> | undefined
   const abortController = new AbortController()
+  // Separate controller so the smoke harness can distinguish a
+  // user-initiated cancel (signal) from the harness-side timeout
+  // (timeoutSignal) — see RuntimeAgentStepOptions.timeoutSignal and
+  // runtimeAgentStep.ts error classification (REQUEST_TIMEOUT vs
+  // REQUEST_CANCELLED).
+  const timeoutController = new AbortController()
 
   try {
     await writeFile(join(workspace, 'fixture.txt'), SMOKE_FIXTURE, 'utf8')
@@ -144,6 +150,7 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
       model: options.model,
       allowedToolsOverride: ['Read'],
       signal: abortController.signal,
+      timeoutSignal: timeoutController.signal,
       runtimeFactory: async () => runtimeBundle.runtime,
       onUsageSummary: summary => usage.push(summary),
     })
@@ -151,6 +158,11 @@ export async function runAgentLoopLiveSmoke(options: AgentLoopLiveSmokeOptions =
     const timeout = new Promise<never>((_, reject) => {
       timeoutId = setTimeout(() => {
         didTimeout = true
+        // Fire the dedicated timeoutController so the runtime classifies
+        // this as REQUEST_TIMEOUT (not REQUEST_CANCELLED). The main
+        // abortController is also aborted so in-flight provider calls
+        // (which only listen to options.signal) tear down promptly.
+        timeoutController.abort()
         abortController.abort()
         reject(new Error(`AgentLoop live smoke timed out after ${timeoutMs}ms`))
       }, timeoutMs)

@@ -2481,3 +2481,112 @@ test('runAgentLoop runs sub-agent session with isolation and merges changes back
     }
   }
 })
+
+test('runtime agent step classifies user-initiated signal abort as REQUEST_CANCELLED', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-cancel-classification'
+  createTaskSession({ sessionId })
+
+  const directController = new AbortController()
+  const usage: any[] = []
+  const stepRunner = createRuntimeAgentStepRunner({
+    signal: directController.signal,
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        // Simulate a long-running provider call that gets aborted by the
+        // user pressing Ctrl-C. Without a dedicated timeoutSignal, the
+        // runner should classify this as REQUEST_CANCELLED (NOT the
+        // legacy REQUEST_TIMEOUT fallback that previously conflated the
+        // two signals).
+        directController.abort()
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      },
+    }) as any,
+    onUsageSummary: summary => usage.push(summary),
+  })
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: PLANNER_ROLE,
+      input: { sessionId, cwd: process.cwd(), prompt: 'noop' },
+    }),
+  )
+  assert.ok(usage.length > 0, 'onUsageSummary should have been called')
+  assert.equal(
+    usage[0].errorCode,
+    'REQUEST_CANCELLED',
+    'user signal abort must NOT be classified as REQUEST_TIMEOUT',
+  )
+  assert.equal(usage[0].errorMessage, 'The operation was aborted.')
+})
+
+test('runtime agent step classifies timeoutSignal abort as REQUEST_TIMEOUT', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-timeout-classification'
+  createTaskSession({ sessionId })
+
+  const signalController = new AbortController()
+  const timeoutController = new AbortController()
+  const usage: any[] = []
+  const stepRunner = createRuntimeAgentStepRunner({
+    signal: signalController.signal,
+    timeoutSignal: timeoutController.signal,
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        // Simulate a server-side budget expiry: only the dedicated
+        // timeoutController fires (the user-facing signal stays clear).
+        // The runner should classify this as REQUEST_TIMEOUT via the
+        // new timeoutSignal wiring.
+        timeoutController.abort()
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      },
+    }) as any,
+    onUsageSummary: summary => usage.push(summary),
+  })
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: PLANNER_ROLE,
+      input: { sessionId, cwd: process.cwd(), prompt: 'noop' },
+    }),
+  )
+  assert.ok(usage.length > 0, 'onUsageSummary should have been called')
+  assert.equal(
+    usage[0].errorCode,
+    'REQUEST_TIMEOUT',
+    'timeoutSignal abort must be classified as REQUEST_TIMEOUT',
+  )
+})
+
+test('runtime agent step timeoutSignal wins over concurrent signal abort', async () => {
+  resetTaskSessionsForTest()
+  const sessionId = 'test-agent-step-timeout-wins'
+  createTaskSession({ sessionId })
+
+  const signalController = new AbortController()
+  const timeoutController = new AbortController()
+  const usage: any[] = []
+  const stepRunner = createRuntimeAgentStepRunner({
+    signal: signalController.signal,
+    timeoutSignal: timeoutController.signal,
+    runtimeFactory: async () => ({
+      async *executeStream() {
+        // Both controllers fire concurrently (mirrors the smoke harness
+        // where the timeout also aborts the main controller to tear down
+        // in-flight provider calls). The timeoutSignal must take
+        // precedence so the error is tagged REQUEST_TIMEOUT, not
+        // REQUEST_CANCELLED.
+        timeoutController.abort()
+        signalController.abort()
+        throw new DOMException('The operation was aborted.', 'AbortError')
+      },
+    }) as any,
+    onUsageSummary: summary => usage.push(summary),
+  })
+  await assert.rejects(
+    stepRunner({
+      roleDefinition: PLANNER_ROLE,
+      input: { sessionId, cwd: process.cwd(), prompt: 'noop' },
+    }),
+  )
+  assert.ok(usage.length > 0)
+  assert.equal(usage[0].errorCode, 'REQUEST_TIMEOUT')
+})

@@ -143,6 +143,40 @@ type runtimeProfilesMsg struct {
 	err      error
 }
 
+type registeredModel struct {
+	ID               string              `json:"id"`
+	Name             string              `json:"name"`
+	ContextWindow    int                 `json:"contextWindow"`
+	DefaultMaxTokens int                 `json:"defaultMaxTokens"`
+	Capabilities     runtimeCapabilities `json:"capabilities"`
+}
+
+type registeredProvider struct {
+	ID             string            `json:"id"`
+	DisplayName    string            `json:"displayName"`
+	Adapter        string            `json:"adapter"`
+	AuthMode       string            `json:"authMode"`
+	DefaultBaseURL string            `json:"defaultBaseUrl"`
+	DefaultModel   string            `json:"defaultModel"`
+	Configured     bool              `json:"configured"`
+	Active         bool              `json:"active"`
+	Models         []registeredModel `json:"models"`
+}
+
+type runtimeModelsResponse struct {
+	Type          string                             `json:"type"`
+	Version       int                                `json:"version"`
+	Providers     []registeredProvider               `json:"providers"`
+	DefaultModel  string                             `json:"defaultModel"`
+	ActiveProfile string                             `json:"activeProfile"`
+	Tombstones    map[string]runtimeProfileTombstone `json:"tombstones"`
+}
+
+type runtimeModelsMsg struct {
+	response runtimeModelsResponse
+	err      error
+}
+
 type profileSelectMsg struct {
 	profile string
 	config  runtimeConfig
@@ -977,10 +1011,10 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/models",
-		summary: "list models (TODO: wire to /v1/runtime/models)",
+		summary: "list models from shared Nexus registry",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/models not yet implemented in Go TUI")
-			return nil
+			m.appendLine("status", "loading shared Nexus models capability matrix")
+			return fetchRuntimeModels(m.cfg)
 		},
 	},
 	{
@@ -1808,6 +1842,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("status", rendered)
 		}
 		return m, m.schedulePollTick()
+
+	case runtimeModelsMsg:
+		if msg.err != nil {
+			m.appendLine("error", "models: "+msg.err.Error())
+			return m, nil
+		}
+		lines := formatRuntimeModels(msg.response)
+		for _, line := range lines {
+			m.appendLine("status", line)
+		}
+		return m, nil
 
 	case runtimeVersionMsg:
 		// Phase 8 PR1: startup version-compat sanity check.
@@ -5144,6 +5189,14 @@ func fetchRuntimeProfiles(cfg Config) tea.Cmd {
 	}
 }
 
+func fetchRuntimeModels(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeModelsResponse
+		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/models", nil, &payload)
+		return runtimeModelsMsg{response: payload, err: err}
+	}
+}
+
 func selectRuntimeProfile(cfg Config, profile string) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeConfig
@@ -6205,4 +6258,41 @@ func (m *model) expandPromptPlaceholders(prompt string) string {
 		expanded = strings.ReplaceAll(expanded, placeholder, rawText)
 	}
 	return expanded
+}
+
+func formatRuntimeModels(response runtimeModelsResponse) []string {
+	var lines []string
+	lines = append(lines, "models (capability matrix):")
+	for _, provider := range response.Providers {
+		configuredStr := "unconfigured"
+		if provider.Configured {
+			configuredStr = "configured"
+		}
+		activeStr := ""
+		if provider.Active {
+			activeStr = " (active)"
+		}
+		lines = append(lines, fmt.Sprintf("  provider %s (%s, %s)%s:", provider.ID, provider.DisplayName, configuredStr, activeStr))
+		for _, model := range provider.Models {
+			toolSupport := "✗ tool-call"
+			if model.Capabilities.ToolCalling {
+				toolSupport = "✓ tool-call"
+			}
+			jsonSupport := "✗ json"
+			if model.Capabilities.JSONOutput {
+				jsonSupport = "✓ json"
+			}
+			streamingSupport := "✗ stream"
+			if model.Capabilities.Streaming {
+				streamingSupport = "✓ stream"
+			}
+			paddedID := model.ID
+			if len(paddedID) < 30 {
+				paddedID = paddedID + strings.Repeat(" ", 30-len(paddedID))
+			}
+			line := fmt.Sprintf("    %s · context=%-7d · %s · %s · %s", paddedID, model.ContextWindow, toolSupport, jsonSupport, streamingSupport)
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }

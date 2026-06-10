@@ -76,6 +76,14 @@ export const ToolStartedEventSchema = z.object({
   toolUseId: z.string(),
   name: z.string(),
   input: z.unknown(),
+  /**
+   * Per-input effective risk after the tool's `riskForInput` override is
+   * applied. Differs from the tool's static `risk` for tools like Bash
+   * whose classifier downgrades read-only subcommands. Populated by
+   * the runtime when the tool defines `riskForInput`; otherwise omitted
+   * (callers should fall back to the tool's static risk).
+   */
+  effectiveRisk: z.enum(['read', 'write', 'execute', 'task']).optional(),
 })
 
 export const RemoteToolRunnerDiagnosticsSchema = z.object({
@@ -132,6 +140,16 @@ export const ErrorEventSchema = z.object({
   code: z.string(),
   message: z.string(),
   details: z.unknown().optional(),
+})
+
+export const ExecuteSummaryEventSchema = z.object({
+  type: z.literal('execute_summary'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  timeoutMs: z.number().int().nonnegative(),
+  executeDurationMs: z.number().nonnegative(),
+  nearTimeout: z.boolean(),
+  outcome: z.enum(['success', 'error', 'cancelled', 'timeout']),
 })
 
 export const TaskSessionEventSchema = z.object({
@@ -363,6 +381,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ContextBlockingEventSchema,
   SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
+  ExecuteSummaryEventSchema,
 ])
 
 export type NexusEvent = z.infer<typeof NexusEventSchema>

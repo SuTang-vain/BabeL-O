@@ -24,6 +24,16 @@ export type RuntimeExecuteOptions = {
   storage?: NexusStorage
   allowedPaths?: string[]
   hooks?: HooksConfig
+  /**
+   * Per-request policy mode (Phase B of
+   * docs/nexus/reference/go-tui-permission-policy-governance-plan.md).
+   *   - 'strict' (default): tools not in the allowlist are hard-denied
+   *     and `permission_request` never fires for them (back-compat).
+   *   - 'soft-deny': the hard-deny is bypassed; the existing approval
+   *     gate then emits `permission_request` for write/execute-risk
+   *     tools so the user can approve via the Go TUI permission panel.
+   */
+  policyMode?: 'strict' | 'soft-deny'
   contextFork?: {
     mode: string
     inheritedItems: number

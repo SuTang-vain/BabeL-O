@@ -279,7 +279,7 @@ def run_phase3_overlay_mutex_sequence(
     # 'Help' header appears AFTER 'Permission: Bash', that would mean
     # help opened on top of permission — i.e. the mutex broke.
     perm_idx = combined.rfind("Permission: Bash")
-    help_idx = combined.rfind("Help · Phase 3 overlay")
+    help_idx = combined.rfind("Help")
     if help_idx > perm_idx and help_idx > 0:
         return _fail(
             master_fd, go_tui_proc, transcript,
@@ -430,7 +430,7 @@ def run_tool_palette_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tools did not surface the 'loading' status line",
         )
-    if not wait_for(master_fd, "Tools audit · Phase 4 wire overlay", timeout, transcript):
+    if not wait_for(master_fd, "Tools audit", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tools did not render the overlay header",
@@ -496,7 +496,7 @@ def run_visual_regression_narrow_sequence(
     that the input box prompt is on its own line at the end.
     """
     send(master_fd, "?")
-    if not wait_for(master_fd, "Help · Phase 3 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Help", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] narrow-width help overlay did not render",
@@ -515,7 +515,7 @@ def run_context_overlay_sequence(
     Phase 5 续: /context opens a read-only scrollable context
     overlay. The driver covers the four entry paths:
 
-      1. /context  ->  "Context · Phase 5 overlay" header rendered
+      1. /context  ->  "Context" header rendered
          (and the persistent transcript line "analyzing shared
          Nexus context" / "context_analysis" stays in the scrollback).
       2. Down arrow scrolls the body forward; up arrow scrolls back
@@ -558,10 +558,10 @@ def run_context_overlay_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /context did not surface the 'analyzing' status line",
         )
-    if not wait_for(master_fd, "Context · Phase 5 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Context", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
-            "[go-tui-smoke] /context did not render the 'Context · Phase 5 overlay' header",
+            "[go-tui-smoke] /context did not render the 'Context' header",
         )
 
     # 2) Down arrow scrolls forward.
@@ -651,7 +651,7 @@ def run_context_and_compact_sequence(
     # transcript line, which is harder to catch in cooked-mode PTY
     # buffers (the transcript viewport scrolls and the bytes get
     # overwritten by the overlay redraw).
-    if not wait_for(master_fd, "Context · Phase 5 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Context", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /context did not render the contextOverlay header",
@@ -775,7 +775,7 @@ def run_help_overlay_sequence(
     3. Esc closes the overlay and returns to composing.
     """
     send(master_fd, "?")
-    if not wait_for(master_fd, "Help · Phase 3 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Help", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] help overlay header did not appear",
@@ -796,6 +796,44 @@ def run_help_overlay_sequence(
     return True
 
 
+def run_models_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    /models command sequence:
+    1. Send /models and Enter.
+    2. Wait for loading status line.
+    3. Wait for models header line.
+    4. Wait for local provider and model.
+    """
+    send(master_fd, "/models")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "loading shared Nexus models capability matrix", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /models did not output loading status line",
+        )
+    if not wait_for(master_fd, "models (capability matrix):", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /models did not render models header line",
+        )
+    if not wait_for(master_fd, "provider local", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /models did not list provider local",
+        )
+    if not wait_for(master_fd, "local/coding-runtime", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /models did not list model local/coding-runtime",
+        )
+    return True
+
+
 def run_inbox_overlay_sequence(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -811,7 +849,7 @@ def run_inbox_overlay_sequence(
          context-overlay / context-and-compact setup pattern).
       2. /inbox  -> "loading shared Nexus inbox (unread)" status,
          "inbox: 0 message(s)" transcript breadcrumb, and the
-         "Inbox · Phase 6 overlay" header.
+         "Inbox" header.
       3. The seeded local Nexus has no inbox messages, so the
          overlay should render the "No unread inbox messages."
          placeholder. We assert on that, then close.
@@ -819,7 +857,7 @@ def run_inbox_overlay_sequence(
          on an empty list.
       5. Esc closes the overlay ("inbox closed" status).
       6. /inbox all -> the banner should switch to
-         "Inbox · all · Phase 6 overlay" and the placeholder to
+         "Inbox · all" and the placeholder to
          "No inbox messages.".
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
@@ -855,7 +893,7 @@ def run_inbox_overlay_sequence(
         )
     # The overlay header is the primary UX assertion (the transcript
     # breadcrumb is harder to catch in cooked-mode PTY buffers).
-    if not wait_for(master_fd, "Inbox · Phase 6 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Inbox", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /inbox did not render the inboxOverlay header",
@@ -887,7 +925,7 @@ def run_inbox_overlay_sequence(
     # placeholder must drop the "unread" qualifier.
     send(master_fd, "/inbox all")
     send(master_fd, "\r")
-    if not wait_for(master_fd, "Inbox · all · Phase 6 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Inbox · all", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /inbox all did not switch the overlay banner",
@@ -964,7 +1002,7 @@ def run_inbox_quote_sequence(
     # mode must stay in modeInboxOverlay.
     send(master_fd, "/inbox")
     send(master_fd, "\r")
-    if not wait_for(master_fd, "Inbox · Phase 6 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Inbox", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] inbox-quote: /inbox did not render the overlay header",
@@ -1074,7 +1112,7 @@ def run_agent_status_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /agents did not surface the 'loading' status line",
         )
-    if not wait_for(master_fd, "Agent status · Phase 6 PR3+PR6 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Agents", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /agents did not render the agent overlay header",
@@ -1119,7 +1157,7 @@ def run_task_board_sequence(
     tasks, so we exercise the empty-state path:
       - bash round-trip to populate sessionID.
       - /tasks → "loading shared Nexus tasks" status +
-        "Task board · Phase 6 PR4 overlay" header +
+        "Tasks" header +
         "No tasks for this session." placeholder.
       - down on an empty list does not crash.
       - esc closes the overlay + "task board closed" status.
@@ -1153,7 +1191,7 @@ def run_task_board_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tasks did not surface the 'loading' status line",
         )
-    if not wait_for(master_fd, "Task board · Phase 6 PR4 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Tasks", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tasks did not render the task board header",
@@ -1203,7 +1241,7 @@ def run_activity_overlay_sequence(
         activity buffer (Bash tool_started + tool_completed +
         permission_response events all flow through).
       - /activity → "activity: N event(s) recorded" breadcrumb
-        + "Recent activity · Phase 6 PR5 overlay" header +
+        + "Activity" header +
         per-kind summary line + at least one recorded row.
       - down on a populated list does not crash.
       - esc closes the overlay + "activity closed" status.
@@ -1237,7 +1275,7 @@ def run_activity_overlay_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /activity did not surface the 'activity:' breadcrumb",
         )
-    if not wait_for(master_fd, "Recent activity · Phase 6 PR5 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Activity", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /activity did not render the overlay header",
@@ -1322,7 +1360,7 @@ def run_sub_agent_aggregation_sequence(
     # Step 3: /agents.
     send(master_fd, "/agents")
     send(master_fd, "\r")
-    if not wait_for(master_fd, "Agent status · Phase 6 PR3+PR6 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Agents", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /agents did not render the PR3+PR6 banner",
@@ -1362,7 +1400,7 @@ def run_tools_audit_sequence(
 
       - bash round-trip to populate sessionID.
       - /tools → "loading shared Nexus tools audit" status +
-        "Tools audit · Phase 4 wire overlay" header +
+        "Tools audit" header +
         per-risk summary line + at least one rendered tool
         row (Bash is always present in the seeded runtime).
       - down on a populated list does not crash.
@@ -1397,7 +1435,7 @@ def run_tools_audit_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tools did not surface the 'loading' status line",
         )
-    if not wait_for(master_fd, "Tools audit · Phase 4 wire overlay", timeout, transcript):
+    if not wait_for(master_fd, "Tools audit", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /tools did not render the overlay header",
@@ -1507,11 +1545,19 @@ def run_all_sequences(
 # scenario AND which final-visible-text invariants to assert. The
 # driver main() dispatches on the --sequence argument by name.
 SEQUENCES: dict[str, dict] = {
+    "models": {
+        "runner": run_models_sequence,
+        "ok_message": "models list verified",
+        "required_invariants": [
+            "BabeL-O · Go TUI",
+            "models (capability matrix):",
+        ],
+    },
     "permission-approve": {
         "runner": run_permission_approve_sequence,
         "ok_message": "permission approve chain verified end-to-end",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
             "Permission: Bash",
             "Bash done",
             "done success=true",
@@ -1521,126 +1567,126 @@ SEQUENCES: dict[str, dict] = {
         "runner": run_phase3_overlay_mutex_sequence,
         "ok_message": "phase 3 single-input-owner overlay mutex verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "slash-palette": {
         "runner": run_slash_palette_sequence,
         "ok_message": "phase 4 slash palette live-filter verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "slash-palette-prefix": {
         "runner": run_slash_palette_prefix_sequence,
         "ok_message": "phase 4 slash palette prefix insertion verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "tool-palette": {
         "runner": run_tool_palette_sequence,
         "ok_message": "phase 4 tool palette verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "help-overlay": {
         "runner": run_help_overlay_sequence,
         "ok_message": "phase 3 help overlay open/close verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "tombstone-rejection": {
         "runner": run_tombstone_rejection_sequence,
         "ok_message": "phase 7 §5 path C phase 3 friendly profile-rejection verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "profile-confirm": {
         "runner": run_profile_confirm_sequence,
         "ok_message": "§5 path C phase 3 polish profile y/n overlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "context-and-compact": {
         "runner": run_context_and_compact_sequence,
         "ok_message": "phase 5 /context and /compact wire to Nexus verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "context-overlay": {
         "runner": run_context_overlay_sequence,
         "ok_message": "phase 5 续 /context full contextOverlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "inbox-overlay": {
         "runner": run_inbox_overlay_sequence,
         "ok_message": "phase 6 inbox overlay + footer unread indicator verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "inbox-quote": {
         "runner": run_inbox_quote_sequence,
         "ok_message": "phase 6 PR2 inbox quote + auto-refresh verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "agent-status": {
         "runner": run_agent_status_sequence,
         "ok_message": "phase 6 PR3 agent status overlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "task-board": {
         "runner": run_task_board_sequence,
         "ok_message": "phase 6 PR4 task board overlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "activity-overlay": {
         "runner": run_activity_overlay_sequence,
         "ok_message": "phase 6 PR5 recent activity overlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "sub-agent-aggregation": {
         "runner": run_sub_agent_aggregation_sequence,
         "ok_message": "phase 6 PR6 AgentLoop sub-agent aggregation + header badge verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "tools-audit": {
         "runner": run_tools_audit_sequence,
         "ok_message": "phase 4 wire tool audit overlay verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "visual-regression-narrow": {
         "runner": run_visual_regression_narrow_sequence,
         "ok_message": "phase 7 narrow-width visual regression verified",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
     "all": {
         "runner": run_all_sequences,
         "ok_message": "all phase 7 sequences verified end-to-end",
         "required_invariants": [
-            "BabeL-O Go TUI MVP",
+            "BabeL-O · Go TUI",
         ],
     },
 }
@@ -1767,7 +1813,7 @@ def main() -> int:
         master_fd, go_tui_proc = start_chat_process(go_tui_argv, str(workspace), go_tui_env)
         transcript: list[str] = []
         try:
-            if not wait_for(master_fd, "BabeL-O Go TUI MVP", args.timeout, transcript):
+            if not wait_for(master_fd, "BabeL-O · Go TUI", args.timeout, transcript):
                 return _fail(
                     master_fd, go_tui_proc, transcript,
                     "[go-tui-smoke] go-tui banner did not appear within timeout",

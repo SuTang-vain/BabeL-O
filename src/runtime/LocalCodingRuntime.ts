@@ -2,7 +2,7 @@ import { z } from 'zod'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import { createId, nowIso } from '../shared/id.js'
-import type { AnyTool } from '../tools/Tool.js'
+import type { AnyTool, ToolRisk } from '../tools/Tool.js'
 import type { NexusTask } from '../shared/task.js'
 import type {
   NexusRuntime,
@@ -59,6 +59,22 @@ export class LocalCodingRuntime implements NexusRuntime {
         source: tool.source ?? { type: 'builtin' as const },
       }))
       .sort((left, right) => left.name.localeCompare(right.name))
+  }
+
+  /**
+   * Compute the effective risk for a tool invocation, honouring any
+   * per-input risk override (e.g. Bash's read-only subcommand classifier).
+   * Falls back to the tool's static `risk` field when no override exists.
+   */
+  private effectiveRisk(tool: AnyTool, input: unknown): ToolRisk {
+    if (typeof tool.riskForInput === 'function') {
+      try {
+        return tool.riskForInput(input as Parameters<typeof tool.riskForInput>[0])
+      } catch {
+        return tool.risk
+      }
+    }
+    return tool.risk
   }
 
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
@@ -166,13 +182,42 @@ export class LocalCodingRuntime implements NexusRuntime {
         return
       }
 
-      if (!this.toolPolicy.isAllowed(tool)) {
+      const parsed = tool.inputSchema.safeParse(intent.input)
+      if (!parsed.success) {
+        yield {
+          type: 'error',
+          ...eventBase(options.sessionId),
+          code: 'INVALID_TOOL_INPUT',
+          message: z.prettifyError(parsed.error),
+        }
+        return
+      }
+      let toolInput = parsed.data
+      let effectiveRisk: ToolRisk = this.effectiveRisk(tool, toolInput)
+      // Compute per-input effective risk (e.g. Bash's read-only
+      // subcommand classifier). The policy hard-deny and approval gate
+      // both key off this value, not the static `tool.risk`. Read-only
+      // subcommands of otherwise-execute tools therefore skip both gates
+      // without losing the tool's identity in audit logs.
+      //
+      // Phase B of
+      // docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+      // when `options.policyMode === 'soft-deny'`, bypass this hard-deny
+      // for tools not in the allowlist. The approval gate below then
+      // emits `permission_request` for write/execute-risk tools so the
+      // user can approve via the Go TUI permission panel. Under
+      // `'strict'` (the default), behaviour is unchanged.
+      if (
+        effectiveRisk !== 'read' &&
+        !this.toolPolicy.isAllowed(tool) &&
+        options.policyMode !== 'soft-deny'
+      ) {
         const message = `Tool denied by Nexus policy: ${tool.name}`
         yield {
           type: 'tool_denied',
           ...eventBase(options.sessionId),
           name: tool.name,
-          risk: tool.risk,
+          risk: effectiveRisk,
           message,
         }
         yield {
@@ -184,25 +229,14 @@ export class LocalCodingRuntime implements NexusRuntime {
         return
       }
 
-      const parsed = tool.inputSchema.safeParse(intent.input)
-      if (!parsed.success) {
-        yield {
-          type: 'error',
-          ...eventBase(options.sessionId),
-          code: 'INVALID_TOOL_INPUT',
-          message: z.prettifyError(parsed.error),
-        }
-        return
-      }
-
-      const safetyCheck = checkOptimizerSafety(tool.name, parsed.data, options.role)
+      const safetyCheck = checkOptimizerSafety(tool.name, toolInput, options.role)
       if (!safetyCheck.allowed) {
         const message = safetyCheck.reason!
         yield {
           type: 'tool_denied',
           ...eventBase(options.sessionId),
           name: tool.name,
-          risk: tool.risk,
+          risk: effectiveRisk,
           message,
         }
         yield {
@@ -220,7 +254,8 @@ export class LocalCodingRuntime implements NexusRuntime {
         ...eventBase(options.sessionId),
         toolUseId,
         name: tool.name,
-        input: parsed.data,
+        input: toolInput,
+        ...(effectiveRisk !== tool.risk && { effectiveRisk }),
       }
 
       const preToolHooks = await executeRuntimeHooks(
@@ -228,8 +263,8 @@ export class LocalCodingRuntime implements NexusRuntime {
         {
           toolUseId,
           toolName: tool.name,
-          toolRisk: tool.risk,
-          toolInput: parsed.data,
+          toolRisk: effectiveRisk,
+          toolInput,
         },
         {
           sessionId: options.sessionId,
@@ -246,7 +281,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           type: 'tool_denied',
           ...eventBase(options.sessionId),
           name: tool.name,
-          risk: tool.risk,
+          risk: effectiveRisk,
           message: hookDenyReason,
         }
         yield {
@@ -258,12 +293,17 @@ export class LocalCodingRuntime implements NexusRuntime {
         return
       }
       const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
-      const toolInput = hookUpdatedInput === undefined
-        ? parsed.data
-        : tool.inputSchema.parse(hookUpdatedInput)
+      if (hookUpdatedInput !== undefined) {
+        toolInput = tool.inputSchema.parse(hookUpdatedInput)
+        // Hooks can rewrite the input, which can change the per-input
+        // risk (e.g. a hook that strips dangerous patterns from a Bash
+        // command). Recompute so the approval gate matches the
+        // post-hook input.
+        effectiveRisk = this.effectiveRisk(tool, toolInput)
+      }
 
       // Check if the tool requires authorization.
-      if ((tool.risk === 'write' || tool.risk === 'execute') && !options.skipPermissionCheck) {
+      if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !options.skipPermissionCheck) {
         const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: options.cwd })
         let approved = autoApprove
         let decisionReason = `Auto-approved: ${reason}`
@@ -275,7 +315,7 @@ export class LocalCodingRuntime implements NexusRuntime {
               sessionId: options.sessionId,
               toolUseId,
               toolName: tool.name,
-              toolRisk: tool.risk,
+              toolRisk: effectiveRisk,
               toolInput,
               decision: 'approved',
               reason: decisionReason,
@@ -294,7 +334,7 @@ export class LocalCodingRuntime implements NexusRuntime {
             toolUseId,
             name: tool.name,
             input: toolInput,
-            risk: tool.risk,
+            risk: effectiveRisk,
             message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
             source: tool.source,
           }
@@ -304,7 +344,7 @@ export class LocalCodingRuntime implements NexusRuntime {
             {
               toolUseId,
               toolName: tool.name,
-              toolRisk: tool.risk,
+              toolRisk: effectiveRisk,
               toolInput,
             },
             {
@@ -332,7 +372,7 @@ export class LocalCodingRuntime implements NexusRuntime {
                 sessionId: options.sessionId,
                 toolUseId,
                 toolName: tool.name,
-                toolRisk: tool.risk,
+                toolRisk: effectiveRisk,
                 toolInput,
                 decision: approved ? 'approved' : 'denied',
                 reason: decisionReason,
@@ -355,7 +395,7 @@ export class LocalCodingRuntime implements NexusRuntime {
             type: 'tool_denied',
             ...eventBase(options.sessionId),
             name: tool.name,
-            risk: tool.risk,
+            risk: effectiveRisk,
             message: denyMessage,
           }
           yield {
@@ -399,7 +439,7 @@ export class LocalCodingRuntime implements NexusRuntime {
         {
           toolUseId,
           toolName: tool.name,
-          toolRisk: tool.risk,
+          toolRisk: effectiveRisk,
           toolInput,
           success: result.success,
           output: result.output,

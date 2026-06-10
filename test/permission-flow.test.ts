@@ -1,4 +1,4 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
@@ -318,16 +318,22 @@ test('interactive permission approval via WebSocket stream', async () => {
   await app.close()
 })
 
-test('smart permissions: auto-approves safe commands and persists audit log', async () => {
+test('smart permissions: read-only Bash subcommands skip the approval gate entirely', async () => {
+  // Phase A of docs/nexus/reference/go-tui-permission-policy-governance-plan.md
+  // downgrades read-only Bash subcommands (`ls`, `cat`, `git status`, ...) to
+  // `risk: 'read'` at the classifier layer, so the runtime skips BOTH the
+  // policy hard-deny and the approval gate. There is no permission_request
+  // event and no permission_audit row — the command runs as a normal
+  // read-only tool call, just like `Read` or `ListDir`.
   const cwd = join(tmpdir(), `babel-o-test-smart-approve-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'sample.txt'), 'hello smart-approve\n', 'utf8')
 
   const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const sessionId = `session-smart-approve-${Date.now()}`
 
-  // Execute a whitelisted safe command 'ls'
   const response = await app.inject({
     method: 'POST',
     url: '/v1/execute',
@@ -336,9 +342,8 @@ test('smart permissions: auto-approves safe commands and persists audit log', as
 
   assert.equal(response.statusCode, 200)
   const body = response.json()
-  assert.equal(body.success, true)
+  assert.equal(body.success, true, `expected success, got body=${JSON.stringify(body).slice(0, 400)}`)
 
-  // Verify that it auto-approved: there should be NO permission_request event
   const sessionRes = await app.inject({
     method: 'GET',
     url: `/v1/sessions/${sessionId}`,
@@ -346,83 +351,89 @@ test('smart permissions: auto-approves safe commands and persists audit log', as
   assert.equal(sessionRes.statusCode, 200)
   const sessionData = sessionRes.json()
   const events = sessionData.session.events
-  assert.ok(!events.some((e: any) => e.type === 'permission_request'), 'Should not have asked for permission')
 
-  // Verify the audit log exists in SQLite storage and is marked as approved with reason Auto-approved
+  // No permission_request because the read-only subcommand bypasses the
+  // approval gate entirely.
+  assert.ok(
+    !events.some((e: any) => e.type === 'permission_request'),
+    'read-only Bash subcommand should not raise permission_request',
+  )
+  // tool_started should record effectiveRisk=read (classifier downgrade).
+  const started = events.find((e: any) => e.type === 'tool_started' && e.name === 'Bash')
+  assert.ok(started, 'expected tool_started for Bash')
+  assert.equal(started.effectiveRisk, 'read')
+
+  // No permission audit row — approval gate was never entered.
   const auditsRes = await app.inject({
     method: 'GET',
     url: `/v1/sessions/${sessionId}/permission-audits`,
   })
   assert.equal(auditsRes.statusCode, 200)
   const auditsBody = auditsRes.json()
-  assert.equal(auditsBody.type, 'permission_audits')
-  assert.equal(auditsBody.sessionId, sessionId)
-  assert.ok(Array.isArray(auditsBody.audits))
-  assert.equal(auditsBody.audits.length, 1)
-  assert.equal(auditsBody.audits[0].toolName, 'Bash')
-  assert.equal(auditsBody.audits[0].decision, 'approved')
-  assert.match(auditsBody.audits[0].reason, /Auto-approved: Known safe command/)
+  assert.equal(auditsBody.audits.length, 0, 'no permission_audit should be written for auto-allowed read-only Bash')
 
   await app.close()
 })
 
-test('smart permissions: prompts user for cat paths outside workspace', async () => {
+test('smart permissions: workspace path safety blocks cat outside workspace', async () => {
+  // Phase A of docs/nexus/reference/go-tui-permission-policy-governance-plan.md
+  // downgrades `cat` to `risk: 'read'`, so the smart-permissions layer no
+  // longer asks for a permission_request for `cat /tmp/secret.txt`.
+  // However, the workspace path safety check in `findWorkspaceEscapeInCommand`
+  // (src/tools/builtin/bash.ts) still runs first and returns a
+  // WORKSPACE_PATH_ESCAPE failure that the runtime surfaces as a
+  // tool_completed event with success=false — the cat never runs and
+  // no permission_request is raised. This test pins that new contract.
   const cwd = join(tmpdir(), `babel-o-test-smart-cat-outside-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
+  // Restrict allowed paths to cwd so the workspace-escape check fires.
+  process.env.NEXUS_ALLOWED_WORKSPACES = cwd
+  try {
+    const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+    const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
-  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
-  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+    const sessionId = `session-smart-cat-outside-${Date.now()}`
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'bash "cat /tmp/secret.txt"', cwd, sessionId },
+    })
 
-  const sessionId = `session-smart-cat-outside-${Date.now()}`
-  const executePromise = app.inject({
-    method: 'POST',
-    url: '/v1/execute',
-    payload: { prompt: 'bash "cat /tmp/secret.txt"', cwd, sessionId },
-  })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, false, 'workspace-escape cat should fail')
 
-  let toolUseId = ''
-  for (let i = 0; i < 30; i++) {
-    await new Promise(r => setTimeout(r, 100))
+    // No permission_request — read-only Bash subcommand bypasses the
+    // approval gate; the workspace-safety check is enforced inside the
+    // Bash tool itself.
     const sessionRes = await app.inject({
       method: 'GET',
       url: `/v1/sessions/${sessionId}`,
     })
-    if (sessionRes.statusCode === 200) {
-      const data = sessionRes.json()
-      const reqEvent = data.session?.events?.find((e: any) => e.type === 'permission_request')
-      if (reqEvent) {
-        toolUseId = reqEvent.toolUseId
-        assert.match(reqEvent.message, /manual review/i)
-        break
-      }
-    }
+    assert.equal(sessionRes.statusCode, 200)
+    const events = sessionRes.json().session.events
+    assert.ok(
+      !events.some((e: any) => e.type === 'permission_request'),
+      'cat outside workspace should not raise permission_request under Phase A',
+    )
+
+    // tool_completed with success=false is the workspace-escape failure.
+    const toolCompleted = events.find((e: any) => e.type === 'tool_completed' && e.name === 'Bash')
+    assert.ok(toolCompleted, 'expected tool_completed for Bash')
+    assert.equal(toolCompleted.success, false)
+
+    // No permission_audit row — the approval gate was never entered.
+    const auditsRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}/permission-audits`,
+    })
+    const auditsBody = auditsRes.json()
+    assert.equal(auditsBody.audits.length, 0)
+
+    await app.close()
+  } finally {
+    delete process.env.NEXUS_ALLOWED_WORKSPACES
   }
-
-  assert.ok(toolUseId, 'Should have received permission request for cat outside workspace')
-
-  const denyRes = await app.inject({
-    method: 'POST',
-    url: `/v1/sessions/${sessionId}/deny`,
-    payload: { toolUseId, reason: 'outside workspace cat requires review' },
-  })
-  assert.equal(denyRes.statusCode, 200)
-
-  const response = await executePromise
-  assert.equal(response.statusCode, 200)
-  const body = response.json()
-  assert.equal(body.success, false)
-
-  const auditsRes = await app.inject({
-    method: 'GET',
-    url: `/v1/sessions/${sessionId}/permission-audits`,
-  })
-  assert.equal(auditsRes.statusCode, 200)
-  const auditsBody = auditsRes.json()
-  assert.equal(auditsBody.audits.length, 1)
-  assert.equal(auditsBody.audits[0].toolName, 'Bash')
-  assert.equal(auditsBody.audits[0].decision, 'denied')
-
-  await app.close()
 })
 
 test('smart permissions: prompts user on non-whitelisted/dangerous command', async () => {

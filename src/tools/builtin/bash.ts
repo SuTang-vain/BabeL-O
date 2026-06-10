@@ -10,6 +10,7 @@ import {
   resolveInsideWorkspace,
   WorkspacePathError,
 } from './pathSafety.js'
+import { classifyBashRisk } from './bashClassifier.js'
 
 const spawnedContainers = new Set<string>()
 
@@ -214,6 +215,14 @@ export const bashTool: ToolDefinition<typeof inputSchema> = {
   prompt: () => 'Executes a bash command in the working directory. The shell state does not persist between commands. Use this for system commands and terminal operations that require shell execution. Prefer dedicated tools (Read, Edit, Glob, Grep) for file operations instead of shell commands.',
   risk: 'execute',
   inputSchema,
+  // Per-input risk override: read-only subcommands (git status, ls, cat,
+  // find -type f, ...) return 'read' so the runtime policy hard-deny and
+  // approval gate skip them. Write/execute patterns (rm, git commit,
+  // command chains, redirects, dangerous-pattern hits) stay at 'execute'
+  // and follow the existing approval flow. See bashClassifier.ts and
+  // docs/nexus/reference/go-tui-permission-policy-governance-plan.md
+  // Phase A.
+  riskForInput: (input) => classifyBashRisk(input.command).kind,
   async execute(input, context) {
     const currentCwd = resolveShellCwd(context.sessionId, context.cwd)
     const workspaceEscape = findWorkspaceEscapeInCommand(input.command, context.cwd, context.allowedPaths)

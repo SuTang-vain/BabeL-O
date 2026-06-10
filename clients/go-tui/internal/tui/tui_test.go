@@ -139,6 +139,50 @@ func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 	}
 }
 
+func TestFormatRuntimeModels(t *testing.T) {
+	lines := formatRuntimeModels(runtimeModelsResponse{
+		Type:          "runtime_models",
+		Version:       4,
+		DefaultModel:  "minimax/MiniMax-M3",
+		ActiveProfile: "alpha",
+		Providers: []registeredProvider{
+			{
+				ID:          "minimax",
+				DisplayName: "MiniMax",
+				Configured:  true,
+				Active:      true,
+				Models: []registeredModel{
+					{
+						ID:            "minimax/MiniMax-M3",
+						ContextWindow: 245760,
+						Capabilities: runtimeCapabilities{
+							ToolCalling: true,
+							JSONOutput:  true,
+							Streaming:   true,
+						},
+					},
+				},
+			},
+		},
+	})
+
+	joined := strings.Join(lines, "\n")
+	wants := []string{
+		"models (capability matrix):",
+		"provider minimax (MiniMax, configured) (active):",
+		"minimax/MiniMax-M3",
+		"context=245760",
+		"✓ tool-call",
+		"✓ json",
+		"✓ stream",
+	}
+	for _, want := range wants {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("models matrix missing %q:\n%s", want, joined)
+		}
+	}
+}
+
 func TestHandleLocalConfigCommandsDoNotStartAgentStream(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/profile dev")
@@ -156,6 +200,25 @@ func TestHandleLocalConfigCommandsDoNotStartAgentStream(t *testing.T) {
 	}
 	if m.pendingProfileName != "dev" {
 		t.Fatalf("pendingProfileName = %q, want dev", m.pendingProfileName)
+	}
+}
+
+func TestHandleModelsSlashCommand(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/models")
+	if cmd == nil {
+		t.Fatalf("/models command should return a non-nil fetch Command")
+	}
+	// Verify it outputs the status line
+	found := false
+	for _, line := range m.transcript {
+		if line.kind == "status" && strings.Contains(line.text, "loading shared Nexus models capability matrix") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("transcript missing loading status message, got: %#v", m.transcript)
 	}
 }
 

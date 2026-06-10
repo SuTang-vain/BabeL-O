@@ -296,6 +296,16 @@ BabeL-O/
 
 ---
 
+## Roadmap & Future Plan
+
+In the upcoming phases (Phase 10), the project’s strategic direction will focus on:
+* **Go TUI (`bbl go`) as the Production Release Client**: Promoted to the default user interface (via the main `bbl` command). It will be compiled into a zero-dependency, ultra-lightweight standalone binary (~10MB) for distribution, handling silent local Nexus daemon startup and offering high-performance viewport rendering.
+* **TypeScript TUI (`bbl chat`) as the Developer Playground**: Retained inside the source repository for core contributors. It will prioritize quick prototyping, testing new API changes, and serving as a lightweight developer shell/debug console without cross-compilation overhead.
+
+For further long-term details, please refer to the [Go TUI Long-Term Rewrite Plan](docs/nexus/reference/go-tui-rewrite-plan.md).
+
+---
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

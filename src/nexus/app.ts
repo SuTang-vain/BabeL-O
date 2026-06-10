@@ -51,6 +51,21 @@ const executeSchema = z.object({
   timeoutMs: z.number().int().positive().max(300_000).optional(),
   maxToolOutputBytes: z.number().int().positive().max(10_000_000).optional(),
   skipPermissionCheck: z.boolean().optional(),
+  /**
+   * Per-request policy override (Phase B of
+   * docs/nexus/reference/go-tui-permission-policy-governance-plan.md).
+   * When omitted, the server-side `executePolicyMode` default applies
+   * (which itself defaults to `'strict'` for back-compat with `bbl
+   * chat` and HTTP API consumers).
+   *   - 'strict': tools not in the allowlist are hard-denied (existing
+   *     behavior; `permission_request` never fires for them).
+   *   - 'soft-deny': the hard-deny is bypassed; the existing approval
+   *     gate then emits `permission_request` for write/execute-risk
+   *     tools so the user can approve via the Go TUI permission panel.
+   * Read-only Bash subcommands (Phase A classifier) always auto-allow
+   * regardless of policy mode.
+   */
+  policy: z.enum(['strict', 'soft-deny']).optional(),
   requestId: z.string().optional(),
   model: z.string().optional(),
   budget: z.number().int().positive().optional(),
@@ -438,6 +453,13 @@ export type CreateNexusAppOptions = {
   storage: NexusStorage
   defaultCwd: string
   executeTimeoutMs?: number
+  /**
+   * Server-side default for the per-request `policy` body field. When a
+   * request body omits `policy`, this value is used. Defaults to
+   * `'strict'` to preserve the existing behavior of `bbl chat` / HTTP
+   * API consumers. Go TUI overrides per-request to `'soft-deny'`.
+   */
+  executePolicyMode?: 'strict' | 'soft-deny'
   maxConcurrentExecutions?: number
   maxToolOutputBytes?: number
   bashMaxBufferBytes?: number
@@ -466,6 +488,7 @@ export async function createNexusApp(
   const metrics = new NexusMetrics()
   const apiKey = options.apiKey ?? process.env.NEXUS_API_KEY
   const executeTimeoutMs = options.executeTimeoutMs ?? 30_000
+  const executePolicyMode = options.executePolicyMode ?? 'strict'
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
@@ -892,6 +915,7 @@ export async function createNexusApp(
     abortController: AbortController
     timeoutController: AbortController
     timeout: ReturnType<typeof setTimeout>
+    policyMode: 'strict' | 'soft-deny'
     allowedPaths?: string[]
   }
 
@@ -932,6 +956,11 @@ export async function createNexusApp(
     const abortController = new AbortController()
     const timeoutController = new AbortController()
     const timeout = setTimeout(() => { timeoutController.abort(); abortController.abort() }, body.timeoutMs ?? executeTimeoutMs)
+    // Resolve effective policy mode: per-request body field overrides
+    // server-side default. Defaults to 'strict' to preserve `bbl chat`
+    // / HTTP API back-compat. See Phase B of
+    // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+    const policyMode = body.policy ?? executePolicyMode
     if (!session) {
       session = createSessionSnapshot(sessionId, cwd, body.prompt)
     } else {
@@ -944,7 +973,7 @@ export async function createNexusApp(
     await options.storage.saveSession(session)
     await options.storage.appendEvent(sessionId, { type: 'user_message', ...eventBase(sessionId), text: body.prompt })
     const requestId = body.requestId ?? createId('req')
-    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
+    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, policyMode, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
   }
 
   function isPrepareError(r: PreparedExecution | PrepareError): r is PrepareError {
@@ -1056,6 +1085,7 @@ export async function createNexusApp(
           executionEnvironment: body.executionEnvironment,
           remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
+          policyMode: prepared.policyMode,
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
@@ -1079,6 +1109,17 @@ export async function createNexusApp(
         errorEvent,
         contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
       })
+      const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
+      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const summaryEvent = buildExecuteSummaryEvent({
+        sessionId,
+        requestId,
+        timeoutMs: effectiveTimeoutMs,
+        executeDurationMs,
+        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut),
+      })
+      events.push(summaryEvent)
+      await options.storage.appendEvent(sessionId, summaryEvent)
       metrics.recordExecuteFinish({
         success: succeeded,
         timedOut: timedOut || timeoutEvent,
@@ -1090,9 +1131,13 @@ export async function createNexusApp(
         sessionId,
         success: succeeded,
         statusCode,
-        durationMs: round(metrics.now() - startedAtMs),
+        durationMs: executeDurationMs,
         result: resultEvent ?? null,
         error: errorEvent ?? null,
+        timeoutMs: effectiveTimeoutMs,
+        executeDurationMs,
+        nearTimeout: summaryEvent.nearTimeout,
+        outcome: summaryEvent.outcome,
         events,
       }
     } finally {
@@ -2048,6 +2093,7 @@ export async function createNexusApp(
           executionEnvironment: body.executionEnvironment,
           remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
+          policyMode: prepared.policyMode,
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
@@ -2075,6 +2121,19 @@ export async function createNexusApp(
         errorEvent,
         contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
       })
+      const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
+      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const summaryEvent = buildExecuteSummaryEvent({
+        sessionId,
+        requestId,
+        timeoutMs: effectiveTimeoutMs,
+        executeDurationMs,
+        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut),
+      })
+      events.push(summaryEvent)
+      await options.storage.appendEvent(sessionId, summaryEvent)
+      sendJson(socket, summaryEvent)
+      metrics.recordStreamEvent(socket.bufferedAmount)
       } finally {
         socket.off('close', markClosed)
         if (abortController) {
@@ -2327,6 +2386,46 @@ function runtimeTerminalCategoryForCode(code: string): TaskSessionTerminalReason
   if (code.startsWith('PROVIDER_')) return 'provider'
   if (code === 'CONTEXT_LIMIT_EXCEEDED' || code.startsWith('RUNTIME_') || code === 'NEXUS_RUNTIME_ERROR') return 'runtime'
   return 'error'
+}
+
+const EXECUTE_TIMEOUT_NEAR_RATIO = 0.8
+
+function executeTimeoutNear(durationMs: number, timeoutMs: number): boolean {
+  if (timeoutMs <= 0) return false
+  return durationMs / timeoutMs >= EXECUTE_TIMEOUT_NEAR_RATIO
+}
+
+function executeSummaryOutcome(
+  resultEvent: NexusEvent | undefined,
+  errorEvent: NexusEvent | undefined,
+  timedOutByAbort: boolean,
+): 'success' | 'error' | 'cancelled' | 'timeout' {
+  if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT') return 'timeout'
+  if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_CANCELLED') return 'cancelled'
+  if (timedOutByAbort) return 'cancelled'
+  if (errorEvent?.type === 'error') return 'error'
+  if (resultEvent?.type === 'result' && resultEvent.success) return 'success'
+  return 'error'
+}
+
+type ExecuteSummaryOptions = {
+  sessionId: string
+  requestId?: string
+  timeoutMs: number
+  executeDurationMs: number
+  outcome: 'success' | 'error' | 'cancelled' | 'timeout'
+}
+
+function buildExecuteSummaryEvent(options: ExecuteSummaryOptions): Extract<NexusEvent, { type: 'execute_summary' }> {
+  return {
+    type: 'execute_summary',
+    ...eventBase(options.sessionId),
+    ...(options.requestId !== undefined && { requestId: options.requestId }),
+    timeoutMs: options.timeoutMs,
+    executeDurationMs: options.executeDurationMs,
+    nearTimeout: executeTimeoutNear(options.executeDurationMs, options.timeoutMs),
+    outcome: options.outcome,
+  }
 }
 
 function runtimeRecoveryMetadata(

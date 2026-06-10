@@ -19,5 +19,5 @@ export function createDefaultToolRegistry(): Map<string, AnyTool> {
     bashTool,
     taskTool,
   ]
-  return new Map(tools.map(tool => [tool.name, tool]))
+  return new Map(tools.map(tool => [tool.name, tool as AnyTool]))
 }

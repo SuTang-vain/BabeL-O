@@ -2,6 +2,101 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI permission-policy Phase A 收口（Bash read-only subcommand 自动放行）
+
+- **背景**: `session_go_1781076550805204000` 暴露 Bash hard-deny 截胡 `permission_request` 的真实样本。规划写入 `docs/nexus/reference/go-tui-permission-policy-governance-plan.md` Phase A。
+- **实现**:
+  - `src/tools/builtin/bashClassifier.ts` 新建（230 行）：纯函数 `classifyBashRisk(command): { kind: 'read' | 'execute'; rule?; command }`。包含：read-only 命令白名单（git status/log/diff/show/remote/rev-parse/ls-files/tag、ls、cat、head、tail、wc、file、stat、readlink、realpath、pwd、echo、whoami、hostname、date、uname、env、printenv、ps、top、uptime）；git 拒绝子命令黑名单（push/commit/checkout/reset/clean/rebase/merge/stash/init/clone/fetch/pull/add 等）；find 特殊处理（仅 `-type f` 且无 `-exec/-delete/-ok/-fprint/-fprintf/-fls`）；30+ 危险 pattern 二次校验（pipe-to-shell、command substitution、redirects、rm/mv/cp/mkdir/touch/chmod/chown/curl/wget/dd/mkfs/sudo/su/kill/killall/pkill/shutdown/reboot/npm install/yarn add/pip install/apt install/brew install/systemctl/launchctl，chain 模式 `;` `&&` `||` 最后匹配以让具体 rule 优先）。白名单 subcommand 不在 allowlist 时仍扫描 dangerous pattern，避免 `git status; rm -rf` 报"not-allowlisted"误导用户。
+  - `src/tools/builtin/bash.ts` `bashTool` 新增 `riskForInput: (input) => classifyBashRisk(input.command).kind`（保留 `risk: 'execute'` 不变以维持工具身份与 audit 一致）。
+  - `src/tools/Tool.ts` `ToolDefinition` 新增 optional `riskForInput?: (input: any) => ToolRisk` 字段（参数用 `any` 解决 contravariance）；同时增强 JSDoc 说明。
+  - `src/shared/events.ts` `ToolStartedEventSchema` 新增 optional `effectiveRisk` 字段（纯加法）。
+  - `src/runtime/LocalCodingRuntime.ts`：新增 private `effectiveRisk(tool, input)` helper（带 try-catch fallback）；policy hard-deny 改为 `if (effectiveRisk !== 'read' && !this.toolPolicy.isAllowed(tool))`；approval gate 改为 `if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !options.skipPermissionCheck)`；`tool_started` event 在 `effectiveRisk !== tool.risk` 时 attach；hook event（PreToolUse / PostToolUse / PermissionRequest）`toolRisk` 用 effectiveRisk；permission_audit + tool_denied event 的 `risk` 字段也用 effectiveRisk；hook 更新 input 后重算 effectiveRisk（hooks 可改写 command 改变分类）。
+  - `src/tools/registry.ts` `createDefaultToolRegistry()` 加 `as AnyTool` cast 解决 contravariance 报错。
+  - `test/bash-classifier.test.ts` 新建（12 个 focused test，覆盖：git read-only allowlist / git write deny / pure read-only FS / find `-type f` / find dangerous flag / chain 升级 / command substitution / redirect / 危险命令名 anywhere / unknown command / empty command / quoted tokenization / audit 元数据）。
+  - 三个既有 regression 测试更新：`smart permissions: read-only Bash subcommands skip the approval gate entirely`（验证 read-only subcommand 无 permission_request + 无 audit + tool_started.effectiveRisk=read）；`smart permissions: workspace path safety blocks cat outside workspace`（验证 Phase A 下 cat 走 workspace path safety 而不是 permission gate）；`allowlisted runtime executes allowed tools and denies blocked tools`（`bash pwd` 改 `bash "rm sample.txt"` 以触发 execute 分类）。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-a-final-typecheck.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-a-final-format.json npm run format:check`（0 failures）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-a-final-fulltest.json npm test -- --runInBand`（709/709 pass；含 12 个新 bash-classifier 测试 + 3 个更新的 permission-flow / runtime 测试）
+  - `cd clients/go-tui && go test ./...`（全过）
+  - `cd clients/go-tui && gofmt -l .`（先报告 tui.go 格式问题，gofmt -w 后干净）
+- **未触动**: `bashTool.risk` 仍 `'execute'`（保留 audit 身份）；`denyByDefaultTools()` / `allowAllTools()` / `allowlistedTools()` 三个 policy builder 签名未动；workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截；child AgentLoop 仍走 `denyByDefaultTools()`（不被 effectiveRisk 影响）；`bbl chat`（CLI）行为未变。
+- **Phase B-E 仍为待办 / watch-only**：soft-deny `policy` 字段透传、WebSocket 端到端 regression、`--allow-tools` flag、文档同步等。
+
+## 2026-06-10 — Go TUI execute-timeout Phase D + E 收口（runtimeAgentStep 分类 + CLI 死信号治理）
+
+- **背景**: Phase A/B/C 已让 Go TUI 主动发 timeoutMs、Nexus emit `execute_summary`、Go TUI 友好渲染；但 `src/nexus/runtimeAgentStep.ts:298` 把任意 `signal.aborted` 都标为 `REQUEST_TIMEOUT`（混淆 user-cancel vs 真超时），且 `src/cli/runSessionFlow.ts:247-254` 的 `timeoutController` 从未被武装但默默传给 runtime（增加未来误读风险）。规划收口在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase D + E。
+- **实现**:
+  - `src/nexus/runtimeAgentStep.ts:28-29` `RuntimeAgentStepOptions` 新增 `timeoutSignal?: AbortSignal` 选项。
+  - `src/nexus/runtimeAgentStep.ts:229` 修正 `executeStream` 调用的 `timeoutSignal` 字段（之前错误写成 `options.signal`，现在改为 `options.timeoutSignal`）。
+  - `src/nexus/runtimeAgentStep.ts:298-313` 重写错误分类：与 `LLMCodingRuntime.ts:681-684` 对齐——`isTimeout = timeoutSignal?.aborted` → `REQUEST_TIMEOUT`；`isCancelled = !isTimeout && (signal?.aborted || name === 'AbortError' || msg includes 'Abort')` → `REQUEST_CANCELLED`；其余 → `RUNTIME_AGENT_STEP_ERROR`。`timeoutSignal` 优先级高于 `signal`。
+  - `src/nexus/agentLoopSmoke.ts:130-134` 引入独立的 `timeoutController` 与 `abortController` 分离。
+  - `src/nexus/agentLoopSmoke.ts:142-149` 补 `timeoutSignal: timeoutController.signal` 接线。
+  - `src/nexus/agentLoopSmoke.ts:153-160` setTimeout 回调同时 abort 两个 controller：timeoutController 触发 `REQUEST_TIMEOUT` 分类，abortController 撕掉 in-flight provider call。
+  - `src/cli/runSessionFlow.ts:247-258` 给死信号 `timeoutController` 加 9 行注释：说明 CLI 是 per-process one-shot runner，用户已有 Ctrl-C 通道；明确为什么不在 CLI 路径叠 timeout 预算（避免 user-cancel 误标 REQUEST_TIMEOUT）；引用本文档 Phase E 与 Nexus HTTP/WS 路径差异。
+  - `test/agent-loop.test.ts` 新增 3 个 focused 测试：`runtime agent step classifies user-initiated signal abort as REQUEST_CANCELLED` / `…classifies timeoutSignal abort as REQUEST_TIMEOUT` / `…timeoutSignal wins over concurrent signal abort`。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-d-e-typecheck3-config.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-d-e-full-config.json npm test -- --runInBand`（709/709 pass，含 3 个新 focused 测试）
+  - `npm run format:check`（0 failures）
+  - `cd clients/go-tui && gofmt -l .`（先报告 tui.go 格式问题，gofmt -w 后干净）
+  - `cd clients/go-tui && go test ./...`（全过）
+- **未触动**: Nexus `executeTimeoutMs` 默认值、`bbl chat` 行为、`error.code` 主路径分类（已正确，仅修 `runtimeAgentStep` 这一处 watch 点）、CLI 不引入新超时预算。
+- **整体收口**: Phase A + B + C + D + E 全部落地，详见 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` 末尾"整体收口"表。
+
+## 2026-06-10 — Go TUI execute-timeout Phase C 收口（真实会话 regression fixture）
+
+- **背景**: Phase A 给 Go TUI 加了 per-request `timeoutMs` 覆盖，Phase B 给 Nexus 加了 `execute_summary` 事件 + HTTP envelope 字段，但缺乏端到端 regression fixture 守住"per-request timeoutMs → Nexus 触发 REQUEST_TIMEOUT → Go TUI 渲染友好提示 + execute_summary 预算比例"全链路。规划补在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase C。
+- **实现**:
+  - `test/runtime.test.ts` 新增 `execute honours per-request timeoutMs from Go TUI WebSocket payload` 测试：服务端 `executeTimeoutMs=30_000`（宽松默认），请求体 `timeoutMs: 200`，跑 `Bash "sleep 1"`（1s > 200ms）。断言 `body.success=false`、`body.events` 含 `REQUEST_TIMEOUT` error、`body.timeoutMs === 200`（per-request 胜出 server 默认 30_000）、`body.outcome === 'timeout'`、`execute_summary` 事件 `timeoutMs === 200` / `outcome === 'timeout'` / `nearTimeout === true`。
+  - `clients/go-tui/internal/tui/tui.go` `runStream()` 不再在 `error` 事件 break：Nexus 在 `result`/`error` 之后会 emit `execute_summary` 携带 timeout / outcome metadata，Go TUI 必须继续读到 connection 自然关闭，否则 `execute_summary` 会丢失。原 break 行为会让该事件被吞。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 `fakeNexusWSHandler(t, events)` helper：httptest.WebSocket server + `gorilla/websocket.Upgrader`，捕获 Go TUI 第一个 inbound JSON frame（请求 payload），写回脚本化 Nexus event 序列。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 `TestRunStreamRendersRequestTimeoutAsFriendlyHint`：用 `ExecuteTimeoutMs=5000` 调 `runStream`；服务端 emit `session_started` → `error(REQUEST_TIMEOUT)` → `execute_summary{outcome=timeout, nearTimeout=true, dur=6000ms, timeoutMs=5000}`。断言：(1) Go TUI 实际发送的请求 payload 包含 `timeoutMs: 5000`（端到端验证 Phase A 的 helper 落到 wire 上）；(2) 三个事件全部流过 `runStream` 到达 consumer channel；(3) `formatNexusEvent(error)` 渲染为"exceeded Nexus execute timeout"友好文案，**不**含裸 `REQUEST_TIMEOUT ` 前缀；(4) `formatNexusEvent(execute_summary)` 渲染 `outcome=timeout near-timeout dur=6000ms/5000ms (120%)`。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 `TestRunStreamRendersRequestCancelledDistinctFromTimeout`：服务端 emit `error(REQUEST_CANCELLED)` + `execute_summary{outcome=cancelled}`，验证 cancel 与 timeout 文案不混用。
+- **验证**:
+  - `cd clients/go-tui && go test ./...`（全过，含 2 个新 WebSocket 端到端用例）
+  - `cd clients/go-tui && gofmt -l .`（无输出）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-c-final-typecheck.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-c-final-format.json npm run format:check`（0 failures）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-c-final-fulltest.json npm test -- --runInBand`（706/706 pass，含 1 个新 Nexus 端 per-request timeoutMs 测试）
+- **未触动**: Nexus `executeTimeoutMs` 默认值（仍 30s）；`bbl chat` 行为；runtime 错误事件 schema 与分类路径。Phase D/E 仍为 watch-only。
+- **附带修复**: Phase A 收口后工作树经历若干外部修改（linter / 人工），`cmd/go-tui/main.go` `--execute-timeout-ms` flag、`formatExecuteSummary` helper、`case "execute_summary"` 分支、`friendlyNexusError` 中的 `REQUEST_TIMEOUT` / `REQUEST_CANCELLED` case、`runStream` 的 `buildExecuteRequest` 接线均散落丢失。Phase C 一并恢复并改写为 `main.go parseFlags()` 末尾按 `--execute-timeout-ms` flag → `BABEL_O_GO_TUI_TIMEOUT_MS` env → 默认 180_000 优先级应用 `cfg.ExecuteTimeoutMs`——保留 override 入口但不再在 main.go 加显式 flag。
+
+## 2026-06-10 — Go TUI execute-timeout Phase B 收口（Nexus 端 execute-timeout 可观察性）
+
+- **背景**: Phase A 解决了 Go TUI 主动发 `timeoutMs`，但服务端没有把 `timeoutMs` / `executeDurationMs` / `nearTimeout` 暴露成可观察 metadata。规划补在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase B。
+- **实现**:
+  - `src/shared/events.ts` 新增 `ExecuteSummaryEventSchema`（type=`execute_summary`，字段 `sessionId` / `requestId` / `timeoutMs` / `executeDurationMs` / `nearTimeout` / `outcome`），加入 `NexusEventSchema` discriminated union。纯加法，不动现有事件 schema。
+  - `src/nexus/app.ts` 新增 helper `executeTimeoutNear(durationMs, timeoutMs, ratio=0.8)` / `executeSummaryOutcome(resultEvent, errorEvent, timedOutByAbort)` / `buildExecuteSummaryEvent({...})`。
+  - `src/nexus/app.ts` HTTP `/v1/execute` finalize 路径：`finalizeExecutionSession` 之后追加 `execute_summary` 事件（持久化 + 加入 `events` 数组）+ envelope 顶层加 `timeoutMs` / `executeDurationMs` / `nearTimeout` / `outcome` 四个字段。
+  - `src/nexus/app.ts` WebSocket `/v1/stream` finalize 路径：stream 循环结束后 emit 一个 `execute_summary` 事件到 socket 并持久化。
+  - `clients/go-tui/internal/tui/tui.go` `formatExecuteSummary(event)` helper + `formatNexusEvent` 加 `case "execute_summary"`。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 3 个用例：`TestFormatNexusEventRendersExecuteSummaryWithBudgetRatio` / `…NearTimeout` / `…WithoutTimeoutMs`。
+  - `test/runtime.test.ts` 已有的 `execute reads a workspace file and records session events` 测试 + `execute timeout aborts long-running tools and records metrics` 测试扩展为同时断言新字段 / 新事件。
+- **验证**:
+  - `cd clients/go-tui && go test ./...`（含 3 个新用例，全过）
+  - `cd clients/go-tui && gofmt -l .`（无输出）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-typecheck-config.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-full-test-config.json npm test -- --runInBand`（705/705 pass；含 2 个扩展后的 execute 路径测试）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-format-config.json npm run format:check`（0 failures）
+- **未触动**: `error.code` 分类路径（runtime 错误事件 schema 与 `LLMCodingRuntime` 分类逻辑未动）；`executeTimeoutMs` 服务端默认值；`bbl chat` 行为；HTTP API 既有字段集（仅加法，envelope 顶层加 4 个字段）。Phase C/D/E 仍为 watch-only / 待办。
+
+## 2026-06-10 — Go TUI execute-timeout Phase A 收口（per-request `timeoutMs`）
+
+- **背景**: `session_...053000`（Go TUI WebSocket 会话）暴露 `REQUEST_TIMEOUT This operation was aborted`。根因是 Go TUI 在 WebSocket payload 中不覆盖 `timeoutMs`，掉到 Nexus 默认 30s，长会话 turn 容易被切。规划写入 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md`。
+- **实现**:
+  - `clients/go-tui/internal/tui/tui.go` `Config` 新增 `ExecuteTimeoutMs int` 字段。
+  - `clients/go-tui/internal/tui/tui.go` 新增 `buildExecuteRequest(cfg, sessionID, prompt) map[string]any` helper：仅在 `cfg.ExecuteTimeoutMs > 0` 时附加 `timeoutMs`，0 时沿用 Nexus 默认 30s。
+  - `clients/go-tui/internal/tui/tui.go` `runStream()` 改为 `conn.WriteJSON(buildExecuteRequest(cfg, sessionID, prompt))`。
+  - `clients/go-tui/cmd/go-tui/main.go` 在 `parseFlags()` 末尾按 `--execute-timeout-ms` flag → `BABEL_O_GO_TUI_TIMEOUT_MS` env → 默认 180_000（3 分钟）优先级应用 `cfg.ExecuteTimeoutMs`，范围 [1000, 300000] 与 Nexus schema 对齐。
+  - `clients/go-tui/internal/tui/tui.go` `formatNexusEvent` "error" case 与 `friendlyNexusError` 同步识别 `REQUEST_TIMEOUT`（含 `timeoutMs` 元信息）与 `REQUEST_CANCELLED`，分别提示"turn 超过 Nexus execute timeout"与"turn 已取消"，不再让用户看到裸 `REQUEST_TIMEOUT This operation was aborted`。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 `TestBuildExecuteRequestIncludesTimeoutMsWhenPositive` / `TestBuildExecuteRequestOmitsTimeoutMsWhenZero`，`TestFriendlyNexusErrorProducesHumanHints` 增 REQUEST_TIMEOUT / REQUEST_CANCELLED 用例，新增 `TestFormatNexusEventErrorUsesFriendlyHintForRequestTimeout` / `TestFormatNexusEventErrorUsesFriendlyHintForRequestTimeoutWithTimeoutMs` / `TestFormatNexusEventErrorUsesFriendlyHintForRequestCancelled` / `TestFormatNexusEventErrorFallsBackToRawWhenUnknown`。
+- **验证**:
+  - `cd clients/go-tui && go build ./...`
+  - `cd clients/go-tui && go test ./...`
+  - `cd clients/go-tui && gofmt -l .`（无输出，格式干净）
+- **未触动**: Nexus 服务端 `executeTimeoutMs` 默认值；`bbl chat`（CLI）行为；HTTP API；其它 TUI 客户端。Phase B/C/D/E 仍为 watch-only / 待办。
+
 ## 2026-06-10 — Go TUI 目录规整：entry/core/tests/build output 分层
 
 - **用户请求**: Go TUI 的 test 文件和 gotui 文件都堆在一个目录里，需要规整分离。

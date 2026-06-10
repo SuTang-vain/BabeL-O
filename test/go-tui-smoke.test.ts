@@ -172,6 +172,11 @@ test('Go TUI smoke: phase 4 wire /v1/tools/audit overlay', { skip: skipReason },
   assert.match(output, /phase 4 wire tool audit overlay verified/)
 })
 
+test('Go TUI smoke: /models command list capability matrix', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('models')
+  assert.match(output, /models list verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
