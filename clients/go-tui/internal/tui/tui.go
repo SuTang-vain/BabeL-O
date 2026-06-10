@@ -1264,6 +1264,13 @@ func newModel(cfg Config) model {
 	input.FocusedStyle.Base = lipgloss.NewStyle()
 	input.BlurredStyle.Base = lipgloss.NewStyle()
 	input.Cursor.Style = lipgloss.NewStyle()
+	// The bubbles textarea's `CursorLine` style has a default
+	// background fill on the row containing the cursor, which
+	// read as a chrome panel underneath the typed text. Strip
+	// the background so the input line stays a clean
+	// `> cursor` row matching the surrounding transcript.
+	input.FocusedStyle.CursorLine = lipgloss.NewStyle()
+	input.BlurredStyle.CursorLine = lipgloss.NewStyle()
 	input.SetWidth(80)
 	// Single-line input: SetHeight(1) collapses the textarea
 	// to a single row, so only one `>` prompt icon is
