@@ -97,7 +97,9 @@ def start_chat_process(
     attrs = termios.tcgetattr(slave_fd)
     attrs[3] = attrs[3] | termios.ECHO
     termios.tcsetattr(slave_fd, termios.TCSANOW, attrs)
-    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct_pack(30, 120))
+    rows = int(env.get("LINES", "30"))
+    cols = int(env.get("COLUMNS", "120"))
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct_pack(rows, cols))
 
     proc = subprocess.Popen(
         command,
@@ -1801,6 +1803,11 @@ def main() -> int:
             # startup sees the narrow dimensions immediately.
             go_tui_env["COLUMNS"] = "40"
             go_tui_env["LINES"] = "20"
+        elif args.sequence == "models":
+            # /models outputs a long list of providers and models (the capability matrix).
+            # We set a tall terminal height to prevent the list from scrolling out of the viewport.
+            go_tui_env["COLUMNS"] = "120"
+            go_tui_env["LINES"] = "120"
         go_tui_argv = [
             *go_tui_cmd,
             "--url",
@@ -1814,10 +1821,11 @@ def main() -> int:
         transcript: list[str] = []
         try:
             if not wait_for(master_fd, "BabeL-O · Go TUI", args.timeout, transcript):
-                return _fail(
+                _fail(
                     master_fd, go_tui_proc, transcript,
                     "[go-tui-smoke] go-tui banner did not appear within timeout",
                 )
+                return 1
 
             if not sequence["runner"](master_fd, go_tui_proc, transcript, args.timeout):
                 return 1
@@ -1850,17 +1858,18 @@ def main() -> int:
     visible = visible_text("".join(transcript))
     for needle in sequence["required_invariants"]:
         if needle not in visible:
-            return _fail(
+            _fail(
                 0, None, transcript,
                 f"[go-tui-smoke] final transcript missing required invariant: {needle!r}",
             )
+            return 1
     print(f"[go-tui-smoke] OK: {sequence['ok_message']}")
     for message in cleanup_messages:
         print(message, file=sys.stderr)
     return 0
 
 
-def _fail(master_fd, proc, transcript: list[str], message: str) -> int:
+def _fail(master_fd, proc, transcript: list[str], message: str) -> bool:
     print(message, file=sys.stderr)
     print("---- cleaned transcript ----", file=sys.stderr)
     print(visible_text("".join(transcript)), file=sys.stderr)
@@ -1868,7 +1877,7 @@ def _fail(master_fd, proc, transcript: list[str], message: str) -> int:
     print(repr("".join(transcript))[:4000], file=sys.stderr)
     if proc is not None and master_fd:
         stop_process(master_fd, proc)
-    return 1
+    return False
 
 
 if __name__ == "__main__":
