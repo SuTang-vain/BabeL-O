@@ -20,6 +20,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
+	"github.com/mattn/go-runewidth"
 )
 
 type Config struct {
@@ -4300,14 +4301,21 @@ func renderTranscript(lines []transcriptLine, width int) string {
 	}
 	rendered := make([]string, 0, len(lines)*2)
 	for i, line := range lines {
-		rendered = append(rendered, formatLine(line.kind, line.text, width))
+		formatted := formatLine(line.kind, line.text, width)
+		rendered = append(rendered, formatted)
 		// Insert a blank line between rows (but not after the
 		// last one) to give the chat log the breathing room
 		// bbl chat's transcript has — multi-line tool args and
 		// wrapped assistant prose no longer run into the next
-		// row.
+		// row. Skip the gap when the previous formatted row
+		// already ends in a blank line (the source text had
+		// its own paragraph break) so we don't produce a
+		// double blank.
 		if i < len(lines)-1 {
-			rendered = append(rendered, "")
+			last := rendered[len(rendered)-1]
+			if last != "" && !strings.HasSuffix(last, "\n\n") {
+				rendered = append(rendered, "")
+			}
 		}
 	}
 	return strings.Join(rendered, "\n")
@@ -5619,25 +5627,58 @@ func wrapPlain(text string, width int) string {
 	return strings.Join(out, "\n")
 }
 
+// visualWidth returns the on-screen column count of a single
+// rune. East Asian wide / fullwidth characters (CJK, kana,
+// hangul) count as 2; everything else counts as 1. Wraps
+// delegated through `wrapParagraph` use this so a Chinese
+// character doesn't get treated as half a column.
+func visualWidth(r rune) int {
+	if w := runewidth.RuneWidth(r); w > 0 {
+		return w
+	}
+	return 1
+}
+
 func wrapParagraph(text string, width int) []string {
 	if text == "" {
 		return []string{""}
 	}
 	runes := []rune(text)
 	lines := make([]string, 0, len(runes)/max(1, width)+1)
-	for len(runes) > width {
-		cut := width
-		for cut > 12 && !isBreakRune(runes[cut-1]) && !isBreakRune(runes[cut]) {
+	for visualLen(runes) > width {
+		cut := len(runes)
+		// Walk back until the prefix's visual width fits.
+		for cut > 0 && visualLen(runes[:cut]) > width {
 			cut--
 		}
-		if cut <= 12 {
-			cut = width
+		// Try to break on a nearby whitespace / punctuation
+		// boundary for readability.
+		breakAt := cut
+		for breakAt > 0 && breakAt > cut-24 && !isBreakRune(runes[breakAt-1]) && !isBreakRune(runes[breakAt]) {
+			breakAt--
 		}
-		lines = append(lines, strings.TrimSpace(string(runes[:cut])))
+		if breakAt > 0 && visualLen(runes[:breakAt]) >= width*3/4 {
+			cut = breakAt
+		}
+		if cut <= 0 {
+			cut = len(runes)
+		}
+		lines = append(lines, strings.TrimRight(string(runes[:cut]), " \t"))
 		runes = []rune(strings.TrimLeft(string(runes[cut:]), " \t"))
 	}
 	lines = append(lines, string(runes))
 	return lines
+}
+
+// visualLen returns the sum of the on-screen column widths of
+// every rune in `rs`. Used by wrapParagraph to decide where to
+// cut so a Chinese character doesn't get sliced in half visually.
+func visualLen(rs []rune) int {
+	total := 0
+	for _, r := range rs {
+		total += visualWidth(r)
+	}
+	return total
 }
 
 func truncateVisible(text string, width int) string {
