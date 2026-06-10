@@ -3690,7 +3690,7 @@ func (m model) renderSlashPalette(width int) string {
 		scrollOffset = max(0, total-visible)
 	}
 	header := titleStyle.Render("Slash · " + "/" + m.paletteFilter)
-	lines := []string{header, divider(width)}
+	lines := []string{header, divider(width), mutedStyle.Render("  command     kind                       summary")}
 	if total == 0 {
 		lines = append(lines, mutedStyle.Render("  (no commands match)"))
 	} else {
@@ -3718,7 +3718,7 @@ func (m model) renderSlashPalette(width int) string {
 			} else {
 				hint = "→ run"
 			}
-			line := fmt.Sprintf("%s%s    %s    %s", marker, c.name, hint, mutedStyle.Render(c.summary))
+			line := fmt.Sprintf("%s%-12s  %-26s  %s", marker, c.name, hint, mutedStyle.Render(c.summary))
 			if actualIdx == idx {
 				line = focusedLineStyle.Render(line)
 			}
