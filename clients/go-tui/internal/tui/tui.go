@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -32,7 +32,15 @@ type Config struct {
 	AltScreen        bool
 	PollIntervalMs   int
 	ExecuteTimeoutMs int
-	PrintVersion     bool
+	// PolicyMode controls the per-request `policy` body field sent to
+	// Nexus /v1/stream. Phase B of
+	// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+	// Defaults to "soft-deny" (via buildExecuteRequest) so Go TUI users
+	// can run write/execute Bash subcommands (git commit, npm install,
+	// etc.) via the existing permission panel. Set to "strict" to
+	// preserve the old hard-deny behaviour for a specific session.
+	PolicyMode  string
+	PrintVersion bool
 }
 
 type streamStartedMsg struct {
@@ -724,7 +732,9 @@ func (m inputMode) canEditInput() bool { return m == modeComposing }
 
 type model struct {
 	cfg                     Config
-	input                   textinput.Model
+	input                   textarea.Model
+	pastedTextReplacements  map[string]string
+	pastedTextCounter       int
 	viewport                viewport.Model
 	spinner                 spinner.Model
 	transcript              []transcriptLine
@@ -765,8 +775,16 @@ type model struct {
 	startedAt               time.Time
 	connected               bool
 	latestUsage             *usageSnapshot
-	width                   int
-	height                  int
+	// promptHistory is the per-session list of submitted
+	// prompts; up/down in composing mode walks it so the
+	// operator can recall a prior turn without leaving the
+	// input box. historyIndex == -1 means "no history
+	// selected" (i.e. the live current draft).
+	promptHistory []string
+	historyIndex  int
+	historySaved  string
+	width         int
+	height        int
 }
 
 // usageSnapshot captures the most recent token usage event from
@@ -1229,12 +1247,14 @@ func Run(cfg Config) error {
 }
 
 func newModel(cfg Config) model {
-	input := textinput.New()
+	input := textarea.New()
 	input.Placeholder = "Ask BabeL-O"
 	input.Focus()
 	input.CharLimit = 4000
 	input.Prompt = "> "
-	input.Width = 80
+	input.ShowLineNumbers = false
+	input.SetWidth(80)
+	input.SetHeight(3)
 
 	vp := viewport.New(80, 20)
 
@@ -1251,12 +1271,15 @@ func newModel(cfg Config) model {
 		transcript:              []transcriptLine{},
 		seenInboxCardMessageIDs: map[string]struct{}{},
 		subAgents:               map[string]subAgentEntry{},
+		pastedTextReplacements:  make(map[string]string),
+		pastedTextCounter:       0,
+		historyIndex:            -1,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return tea.Batch(
-		textinput.Blink,
+		textarea.Blink,
 		m.spinner.Tick,
 		fetchRuntimeConfig(m.cfg, 0),
 		fetchRuntimeProfiles(m.cfg),
@@ -1293,6 +1316,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if msg.Paste {
+			pastedStr := string(msg.Runes)
+			if strings.Contains(pastedStr, "\n") || strings.Contains(pastedStr, "\r") {
+				m.pastedTextCounter++
+				lines := strings.Split(strings.ReplaceAll(pastedStr, "\r\n", "\n"), "\n")
+				lineCount := len(lines)
+				placeholder := fmt.Sprintf("[Pasted text #%d +%d lines]", m.pastedTextCounter, lineCount)
+				if m.pastedTextReplacements == nil {
+					m.pastedTextReplacements = make(map[string]string)
+				}
+				m.pastedTextReplacements[placeholder] = pastedStr
+				m.input.InsertString(placeholder)
+			} else {
+				m.input.InsertString(pastedStr)
+			}
+			return m, nil
+		}
+
 		key := msg.String()
 
 		// `ctrl+c` is global: always quits, even from inside an overlay.
@@ -1300,6 +1341,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// overlay (so q inside permission / help doesn't quit by accident).
 		if key == "ctrl+c" || (key == "q" && m.inputMode == modeComposing && !m.running && strings.TrimSpace(m.input.Value()) == "") {
 			return m, tea.Quit
+		}
+
+		// Prompt history: when the user is composing and the
+		// input is single-line, up/down walks the per-session
+		// promptHistory instead of scrolling the viewport
+		// (the textarea.Model would otherwise consume the
+		// up/down as multi-line cursor moves). Down past
+		// the bottom restores the live draft.
+		if m.inputMode == modeComposing {
+			if key == "up" || key == "ctrl+p" {
+				if len(m.promptHistory) > 0 && m.historyIndex < len(m.promptHistory)-1 {
+					if m.historyIndex == -1 {
+						m.historySaved = m.input.Value()
+					}
+					m.historyIndex++
+					m.input.SetValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
+					m.input.CursorEnd()
+					return m, nil
+				}
+				return m, nil
+			}
+			if key == "down" || key == "ctrl+n" {
+				if m.historyIndex > -1 {
+					m.historyIndex--
+					if m.historyIndex == -1 {
+						m.input.SetValue(m.historySaved)
+					} else {
+						m.input.SetValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
+					}
+					m.input.CursorEnd()
+					return m, nil
+				}
+				return m, nil
+			}
 		}
 
 		// Phase 3 single-input-owner: dispatch by current mode.
@@ -1604,27 +1679,44 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key == "enter" {
-			prompt := strings.TrimSpace(m.input.Value())
-			if prompt == "" || m.running {
+			rawPrompt := m.input.Value()
+			trimmed := strings.TrimSpace(rawPrompt)
+			if trimmed == "" || m.running {
 				return m, nil
 			}
+			// Push to the per-session prompt history so the
+			// operator can recall a prior turn with up/down.
+			// Skip the entry if the last submitted prompt was
+			// identical (avoids stacking duplicates when the
+			// user re-submits the same turn). Reset the
+			// history cursor so the next up navigates from
+			// the live draft.
+			if len(m.promptHistory) == 0 || m.promptHistory[len(m.promptHistory)-1] != rawPrompt {
+				m.promptHistory = append(m.promptHistory, rawPrompt)
+			}
+			m.historyIndex = -1
+			m.historySaved = ""
 			m.input.SetValue("")
-			if strings.HasPrefix(prompt, "/") {
+			expandedPrompt := m.expandPromptPlaceholders(rawPrompt)
+			m.pastedTextReplacements = make(map[string]string)
+			m.pastedTextCounter = 0
+
+			if strings.HasPrefix(trimmed, "/") {
 				// Note: do NOT m.setMode(modeComposing) here — some
 				// slash commands (e.g. /profile <name>) intentionally
 				// transition to modeProfileConfirm, and clobbering
 				// that would skip the y/n overlay. Other commands
 				// stay in composing by default (no setMode call),
 				// which matches the previous behavior.
-				cmd := m.handleLocalCommand(prompt)
+				cmd := m.handleLocalCommand(trimmed)
 				return m, cmd
 			}
-			m.appendLine("user", prompt)
+			m.appendLine("user", trimmed)
 			m.running = true
 			m.pending = nil
 			m.lastEventType = ""
 			m.startedAt = time.Now()
-			return m, startStream(m.cfg, prompt)
+			return m, startStream(m.cfg, expandedPrompt)
 		}
 
 	case spinner.TickMsg:
@@ -1911,7 +2003,8 @@ func (m *model) resize() {
 	}
 	inputHeight := 3
 	footerHeight := 2
-	m.input.Width = max(20, width-4)
+	m.input.SetWidth(max(20, width-4))
+	m.input.SetHeight(3)
 	m.viewport.Width = width
 	m.viewport.Height = max(6, m.height-headerHeight-permissionHeight-inputHeight-footerHeight)
 }
@@ -4329,12 +4422,20 @@ func (m *model) appendLine(kind string, text string) {
 func (m *model) refreshViewport() {
 	welcome := m.renderWelcomeCard(max(40, m.viewport.Width))
 	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width))
+	// Capture whether the operator had scrolled up before
+	// the new content arrived. We only auto-scroll to the
+	// bottom when they were already at the bottom — otherwise
+	// we'd yank them out of whatever they were inspecting
+	// every time a new tool call or streaming delta lands.
+	wasAtBottom := m.viewport.AtBottom()
 	if transcript != "" {
 		m.viewport.SetContent(welcome + "\n\n" + transcript)
 	} else {
 		m.viewport.SetContent(welcome)
 	}
-	m.viewport.GotoBottom()
+	if wasAtBottom {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m model) renderWelcomeCard(width int) string {
@@ -5615,6 +5716,10 @@ func firstLine(s string, maxLen int) string {
 // buildExecuteRequest assembles the WebSocket payload sent to /v1/stream.
 // timeoutMs is only emitted when positive so the Nexus default 30s budget
 // remains the fallback for callers that explicitly opt out (cfg.ExecuteTimeoutMs = 0).
+// policy defaults to 'soft-deny' so Go TUI users can run write/execute
+// Bash subcommands (git commit, npm install, etc.) via the existing
+// permission panel; Phase B of
+// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
 func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
 	payload := map[string]any{
 		"prompt":    prompt,
@@ -5624,6 +5729,11 @@ func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
 	if cfg.ExecuteTimeoutMs > 0 {
 		payload["timeoutMs"] = cfg.ExecuteTimeoutMs
 	}
+	policy := cfg.PolicyMode
+	if policy == "" {
+		policy = "soft-deny"
+	}
+	payload["policy"] = policy
 	return payload
 }
 
@@ -6055,4 +6165,15 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func (m *model) expandPromptPlaceholders(prompt string) string {
+	expanded := prompt
+	if m.pastedTextReplacements == nil {
+		return expanded
+	}
+	for placeholder, rawText := range m.pastedTextReplacements {
+		expanded = strings.ReplaceAll(expanded, placeholder, rawText)
+	}
+	return expanded
 }
