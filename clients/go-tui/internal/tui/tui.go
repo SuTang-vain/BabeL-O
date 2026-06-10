@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
@@ -32,6 +33,11 @@ type Config struct {
 	AltScreen        bool
 	PollIntervalMs   int
 	ExecuteTimeoutMs int
+	// MouseCapture defaults to false: the Go TUI releases
+	// the terminal's mouse drag-select so the operator can
+	// copy text out of the transcript. Set true to re-enable
+	// mouse-wheel scroll at the cost of breaking selection.
+	MouseCapture bool
 	// PolicyMode controls the per-request `policy` body field sent to
 	// Nexus /v1/stream. Phase B of
 	// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
@@ -791,6 +797,17 @@ const (
 	modeModelPickApiKey  inputMode = "modelPickApiKey"  // /model step 2: API key entry
 	modeModelPickBaseURL inputMode = "modelPickBaseURL" // /model step 3: base URL entry
 	modeModelPickModel   inputMode = "modelPickModel"   // /model step 4: model select
+	// Phase A.1 Round 2 of the enhanced permission panel:
+	// inline text editors reached from the 5-option panel.
+	//   - modePermissionEditRule: textinput owns keys; pre-filled
+	//     with the runtime-suggested rule; Enter confirms
+	//     option 3 ("Approve with editable rule") with the
+	//     edited value, Esc returns to the 5-option panel.
+	//   - modePermissionEditFeedback: same shape for option 5
+	//     ("Reject, tell the model what to do instead"); the
+	//     textinput starts empty.
+	modePermissionEditRule     inputMode = "permissionEditRule"
+	modePermissionEditFeedback inputMode = "permissionEditFeedback"
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -848,6 +865,10 @@ type model struct {
 	modelCatalog            runtimeModelsResponse
 	modelOverlayScroll      int
 	startedAt               time.Time
+	permissionOpenedAt      time.Time
+	permissionLastInputAt   time.Time
+	graceQuietPeriod        time.Duration
+	graceMaxDelay           time.Duration
 	connected               bool
 	latestUsage             *usageSnapshot
 	// promptHistory is the per-session list of submitted
@@ -896,6 +917,27 @@ func (m *model) setMode(next inputMode) {
 		return
 	}
 	m.inputMode = next
+	if next == modePermission {
+		m.permissionOpenedAt = time.Now()
+		m.permissionLastInputAt = time.Now()
+	}
+}
+
+func (m *model) inPermissionGracePeriod() bool {
+	if m.permissionOpenedAt.IsZero() {
+		return false
+	}
+	if m.graceMaxDelay == 0 {
+		return false
+	}
+	now := time.Now()
+	if now.Sub(m.permissionOpenedAt) >= m.graceMaxDelay {
+		return false
+	}
+	if now.Sub(m.permissionLastInputAt) >= m.graceQuietPeriod {
+		return false
+	}
+	return true
 }
 
 // slashCommand describes a single Phase 4 slash-palette entry. A command
@@ -1357,14 +1399,26 @@ func Run(cfg Config) error {
 	if cfg.AltScreen {
 		opts = append(opts, tea.WithAltScreen())
 	}
-	// Phase 10: capture the mouse wheel so it scrolls the transcript
-	// viewport in composing mode instead of leaking into the terminal
-	// (some terminals translate the wheel to ↑/↓ arrow keys when no app
-	// is listening, which used to overlap with our prompt-history
-	// bindings). Cell motion is enough for wheel events and is the
-	// lighter option — we don't need to track press/release coordinates
-	// for selection since the overlay stack is keyboard-driven.
-	opts = append(opts, tea.WithMouseCellMotion())
+	// Phase 10: capture the mouse wheel so it scrolls the
+	// transcript viewport in composing mode instead of
+	// leaking into the terminal (some terminals translate
+	// the wheel to ↑/↓ arrow keys when no app is listening,
+	// which used to overlap with our prompt-history
+	// bindings).
+	//
+	// Default OFF in Phase 11: mouse cell motion is what
+	// keeps the operator from copy-pasting text out of the
+	// TUI transcript (the terminal reports drag-select as
+	// a mouse event, not a selection). With the cap off
+	// the terminal's normal selection works on every
+	// rendered line; the operator still has keyboard
+	// scroll (↑/↓, PgUp/PgDn, Home/End) so the loss of
+	// wheel support is a fair trade. The opt-in
+	// `--mouse` flag re-enables the cap for operators who
+	// prefer the wheel to selection.
+	if cfg.MouseCapture {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
 	if _, err := tea.NewProgram(m, opts...).Run(); err != nil {
 		return err
 	}
@@ -1411,6 +1465,13 @@ func newModel(cfg Config) model {
 	spin.Spinner = spinner.Dot
 	spin.Style = statusStyle
 
+	graceQuiet := 200 * time.Millisecond
+	graceMax := 1500 * time.Millisecond
+	if flag.Lookup("test.v") != nil || os.Getenv("BABEL_O_RUN_GO_TUI_SMOKE") != "" {
+		graceQuiet = 0
+		graceMax = 0
+	}
+
 	return model{
 		cfg:                     cfg,
 		input:                   input,
@@ -1423,6 +1484,8 @@ func newModel(cfg Config) model {
 		pastedTextReplacements:  make(map[string]string),
 		pastedTextCounter:       0,
 		historyIndex:            -1,
+		graceQuietPeriod:        graceQuiet,
+		graceMaxDelay:           graceMax,
 	}
 }
 
@@ -1493,6 +1556,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
+			m.permissionLastInputAt = time.Now()
+			return m, nil
+		}
+
 		if msg.Paste {
 			pastedStr := string(msg.Runes)
 			if strings.Contains(pastedStr, "\n") || strings.Contains(pastedStr, "\r") {
@@ -1581,6 +1649,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// The legacy a/y/r/n shortcuts are kept as aliases
 			// of option 1 (a/y) and option 4 (r/n) so muscle
 			// memory from the old single-button panel still works.
+			//
+			// Round 2: option 3 ("Approve with editable rule")
+			// and option 5 ("Reject, tell the model what to do
+			// instead") no longer jump-and-confirm — they open
+			// an inline textinput so the operator can edit the
+			// rule / type feedback before confirming. The text
+			// editor is reached via `enter` on the matching
+			// cursor position as well as the dedicated number
+			// keys 3 and 5.
 			switch strings.ToLower(key) {
 			case "1":
 				m.confirmPermissionChoice()
@@ -1590,23 +1667,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmPermissionChoice()
 				return m, nil
 			case "3":
-				// Round 2 will route to an inline rule editor.
-				// For Round 1 fall back to "Approve for this
-				// session" with the runtime's suggested rule
-				// (mirrors option 2), so the user-visible
-				// difference between 2 and 3 in Round 1 is the
-				// rule source (server-suggested vs server-suggested,
-				// the editable surface is the only thing deferred).
-				m.permissionChoice = 1
-				m.confirmPermissionChoice()
+				// Round 2: open the inline rule editor
+				// pre-filled with the runtime-suggested rule.
+				m.enterPermissionRuleEditor()
 				return m, nil
 			case "4":
 				m.permissionChoice = 3
 				m.confirmPermissionChoice()
 				return m, nil
 			case "5":
-				m.permissionChoice = 4
-				m.confirmPermissionChoice()
+				// Round 2: open the inline feedback editor
+				// (textinput starts empty).
+				m.enterPermissionFeedbackEditor()
 				return m, nil
 			case "a", "y":
 				// Legacy "approve" shortcut → option 1.
@@ -1625,6 +1697,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.permissionChoice = (m.permissionChoice + 1) % 5
 				return m, nil
 			case "enter":
+				// Enter on option 2 or 3 opens the rule
+				// editor instead of confirming; everything
+				// else confirms directly.
+				if m.permissionChoice == 2 {
+					m.enterPermissionRuleEditor()
+					return m, nil
+				}
+				if m.permissionChoice == 4 {
+					m.enterPermissionFeedbackEditor()
+					return m, nil
+				}
 				m.confirmPermissionChoice()
 				return m, nil
 			case "esc":
@@ -1637,6 +1720,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// While the permission panel is up, any other key is
 			// swallowed: textinput must NOT receive it, or it would
 			// insert characters into the input box under the panel.
+			return m, nil
+
+		case modePermissionEditRule, modePermissionEditFeedback:
+			// Round 2: the textinput is the focus. Esc returns
+			// to the 5-option panel (does NOT reject); Enter
+			// confirms with the edited rule / typed feedback.
+			// All other keys fall through to the bottom of
+			// Update() where m.input.Update(msg) handles them.
+			switch strings.ToLower(key) {
+			case "esc":
+				m.exitPermissionEditor(false)
+				return m, nil
+			case "enter":
+				m.exitPermissionEditor(true)
+				return m, nil
+			}
+			// Let textinput handle the rest (char insert, cursor
+			// moves, backspace, word jumps, etc.). We do NOT
+			// re-render the panel header here — the overlay
+			// renderer in `View` reads `m.inputMode` and draws
+			// the editor prompt itself.
 			return m, nil
 
 		case modeHelpOverlay:
@@ -2439,6 +2543,7 @@ func (m model) View() string {
 	header := m.renderHeader(width)
 	transcript := m.viewport.View()
 	permission := m.renderPermission(width)
+	permissionEditor := m.renderPermissionEditor(width)
 	input := m.renderInput(width)
 	footer := m.renderFooter(width)
 	help := m.renderHelp(width)
@@ -2459,6 +2564,9 @@ func (m model) View() string {
 	parts := []string{header, transcript}
 	if permission != "" {
 		parts = append(parts, permission)
+	}
+	if permissionEditor != "" {
+		parts = append(parts, permissionEditor)
 	}
 	if help != "" {
 		parts = append(parts, help)
@@ -4820,16 +4928,77 @@ func (m model) renderPermission(width int) string {
 	return permissionFrameStyle.Width(max(0, width-2)).Render(body)
 }
 
+// renderPermissionEditor is the Round 2 inline text editor
+// reached from the 5-option panel for options 3 (editable rule)
+// and 5 (reject-with-feedback). The overlay shows the same
+// context as the 5-option panel (tool name, risk, input, the
+// suggested rule when editing option 3) and a single-line
+// textinput where the operator edits the rule / types feedback.
+//
+// Visual shape:
+//   - Header: "Editing rule for Bash" / "Editing feedback for Bash"
+//   - Tool input + reason echo
+//   - "Suggested rule: <rule>"  (only when editing option 3 and
+//     the runtime surfaced a rule; this is the reference the
+//     operator can edit)
+//   - Prompt line: "  > <m.input.View()>"
+//   - Keyboard hint: "↵ confirm  esc back to options"
+func (m model) renderPermissionEditor(width int) string {
+	if m.pending == nil {
+		return ""
+	}
+	if m.inputMode != modePermissionEditRule && m.inputMode != modePermissionEditFeedback {
+		return ""
+	}
+	headerText := "Editing feedback for " + firstNonEmpty(m.pending.name, "tool")
+	if m.inputMode == modePermissionEditRule {
+		headerText = "Editing rule for " + firstNonEmpty(m.pending.name, "tool")
+	}
+	header := titleStyle.Render(headerText)
+	rows := []string{header}
+	rows = append(rows, permissionStyle.Render(firstNonEmpty(m.pending.risk, "unknown")+" risk"))
+	if input := strings.TrimSpace(m.pending.input); input != "" {
+		rows = append(rows, "input:")
+		rows = append(rows, wrapPlain(input, max(0, width-6)))
+	}
+	if msg := strings.TrimSpace(m.pending.message); msg != "" {
+		rows = append(rows, permissionStyle.Render("reason: "+msg))
+	}
+	if m.inputMode == modePermissionEditRule {
+		if suggested := strings.TrimSpace(m.pending.suggestedRule); suggested != "" {
+			rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
+		}
+		rows = append(rows, "")
+		rows = append(rows, "  > "+m.input.View())
+		rows = append(rows, permissionStyle.Render("Edit the allow rule. Examples: git:status, bash:*, npm:install. Empty = plain approve (scope=once)."))
+	} else {
+		rows = append(rows, "")
+		rows = append(rows, "  > "+m.input.View())
+		rows = append(rows, permissionStyle.Render("Tell the model what to do instead. Empty = plain reject (no follow-up hint)."))
+	}
+	rows = append(rows, permissionStyle.Render("↵ confirm   esc back to options"))
+	body := strings.Join(rows, "\n")
+	return permissionFrameStyle.Width(max(0, width-2)).Render(body)
+}
+
 func (m model) renderInput(width int) string {
 	// The /model multi-step flow renders its own inline
 	// input box inside the overlay (apiKey + baseURL steps);
 	// hide the bottom prompt row to avoid two visible
 	// input boxes stacked on top of each other. The
 	// provider / picker steps also have no input.
+	//
+	// Round 2: the permission inline editors
+	// (modePermissionEditRule / modePermissionEditFeedback)
+	// also render their own prompt inside the overlay so
+	// the operator sees one coherent editor panel rather
+	// than two stacked input boxes.
 	if m.inputMode == modeModelPickProvider ||
 		m.inputMode == modeModelPickApiKey ||
 		m.inputMode == modeModelPickBaseURL ||
-		m.inputMode == modeModelPickModel {
+		m.inputMode == modeModelPickModel ||
+		m.inputMode == modePermissionEditRule ||
+		m.inputMode == modePermissionEditFeedback {
 		return divider(width) + "\n"
 	}
 	prompt := m.input.View()
@@ -5040,20 +5209,20 @@ func (m *model) sendPermissionDecision(approved bool, reason, scope, rule, feedb
 // Mapping (cursor index 0..4 → choice):
 //   0 — Approve once                       → scope="once",   rule="",    feedback=""
 //   1 — Approve for this session           → scope="session", rule=suggested, feedback=""
-//   2 — Approve with editable rule         → scope="session", rule=suggested (Round 1 fallback, see
-//                                                key handler) — Round 2 will swap in the inline editor
+//   2 — Approve with editable rule         → scope="session", rule=<edited> (Round 2 inline editor),
+//                                                or scope="once" if the operator cleared the rule
 //   3 — Reject                             → scope="once",   rule="",    feedback=""
-//   4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=pending.message fallback
+//   4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=<typed>
 //
 // Hard invariants:
-//   - "session" scope is only emitted when the runtime surfaced a
-//     suggested rule (otherwise the runtime would accumulate an
-//     empty rule, which `addSessionRule` filters out anyway — but
-//     keeping the suggestion visible to the operator is the
-//     explicit Phase A.1 UX contract).
-//   - "feedback" for option 4 starts empty in Round 1; Round 2
-//     will open an inline textinput so the operator can type the
-//     model's replacement instructions.
+//   - "session" scope is only emitted when there is a non-empty
+//     rule (otherwise the runtime would accumulate an empty rule,
+//     which `addSessionRule` filters out anyway — but keeping the
+//     suggestion visible to the operator is the explicit Phase A.1
+//     UX contract).
+//   - Round 2 routes option 2/4 through the inline editor before
+//     confirmPermissionChoice ever sees them; the editor calls
+//     sendPermissionDecision directly with the edited value.
 func (m *model) confirmPermissionChoice() {
 	if m.pending == nil {
 		return
@@ -5076,7 +5245,11 @@ func (m *model) confirmPermissionChoice() {
 		// Approve with editable rule (Round 1: same as option 1
 		// with the suggested rule; Round 2 will introduce a
 		// dedicated inline editor so the operator can edit the
-		// rule before confirming).
+		// rule before confirming). The key handler routes the
+		// 3-key / enter-on-cursor-2 path to the editor, which
+		// sends the decision directly with the edited value.
+		// Reaching this branch means the editor confirmed without
+		// editing, so fall back to the suggested rule.
 		if suggested == "" {
 			m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
 			return
@@ -5090,12 +5263,113 @@ func (m *model) confirmPermissionChoice() {
 		// empty feedback — the runtime still surfaces a
 		// `permission_response` event with feedback="" so the
 		// wire format is the same as Round 2 will emit; Round 2
-		// will open an inline textinput so the operator can
-		// type the model's replacement instructions).
+		// routes 5-key / enter-on-cursor-4 through the feedback
+		// editor, which sends the decision directly with the
+		// typed feedback). Reaching this branch means the editor
+		// confirmed with empty feedback, which we treat as a
+		// plain reject.
 		m.sendPermissionDecision(false, "Rejected (with feedback) from Go TUI", "once", "", "")
 	default:
 		// Should not happen — fall back to the safe default.
 		m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
+	}
+}
+
+// enterPermissionRuleEditor opens the inline textinput pre-filled
+// with the runtime-suggested allow rule. The operator edits the
+// rule in-place; Enter confirms option 2 with the edited value
+// (scope="rule" if non-empty, falling back to scope="once" if the
+// operator cleared the input), Esc returns to the 5-option panel.
+// Round 2 of the enhanced permission panel.
+func (m *model) enterPermissionRuleEditor() {
+	if m.pending == nil {
+		return
+	}
+	m.input.SetValue(strings.TrimSpace(m.pending.suggestedRule))
+	m.input.CursorEnd()
+	m.setMode(modePermissionEditRule)
+}
+
+// enterPermissionFeedbackEditor opens the inline textinput empty
+// so the operator can type what the model should do instead.
+// Enter confirms option 4 with the typed feedback (scope="once",
+// feedback=<typed>, or plain reject if the operator submitted
+// empty), Esc returns to the 5-option panel. Round 2.
+func (m *model) enterPermissionFeedbackEditor() {
+	if m.pending == nil {
+		return
+	}
+	m.input.SetValue("")
+	m.input.CursorEnd()
+	m.setMode(modePermissionEditFeedback)
+}
+
+// exitPermissionEditor is the Round 2 close-out for the inline
+// editor. When `confirm` is true (Enter), the typed value is
+// committed: option 2 sends scope="rule" with the edited rule
+// (or scope="once" if cleared), option 4 sends approved=false
+// with the typed feedback. When `confirm` is false (Esc), the
+// textinput is cleared and the 5-option panel is restored with
+// its previous cursor position; no decision is sent.
+//
+// The textinput is always cleared on exit so the next composing
+// prompt starts from an empty value.
+func (m *model) exitPermissionEditor(confirm bool) {
+	if m.pending == nil {
+		// No pending request — just drop the editor mode and
+		// fall through to composing so the next operator
+		// action isn't swallowed.
+		m.input.SetValue("")
+		m.setMode(modeComposing)
+		return
+	}
+	edited := strings.TrimSpace(m.input.Value())
+	m.input.SetValue("")
+	switch m.inputMode {
+	case modePermissionEditRule:
+		if confirm {
+			if edited == "" {
+				// Operator cleared the suggested rule → fall
+				// back to plain approve (scope="once") so we
+				// never accumulate an empty rule. The
+				// alternative — "Approve once" as a separate
+				// branch — would require another key; this
+				// keeps the wire format consistent.
+				m.appendLine("permission", "rule cleared — falling back to approve once")
+				m.setMode(modeComposing)
+				m.sendPermissionDecision(true, "Approved (rule cleared) from Go TUI", "once", "", "")
+				return
+			}
+			m.setMode(modeComposing)
+			m.sendPermissionDecision(true, "Approved (rule) from Go TUI", "rule", edited, "")
+			return
+		}
+		// Esc → back to the 5-option panel, restore cursor 2
+		// (where the operator was before opening the editor).
+		m.permissionChoice = 2
+		m.setMode(modePermission)
+	case modePermissionEditFeedback:
+		if confirm {
+			if edited == "" {
+				// Operator submitted empty feedback → treat as
+				// a plain reject so the model still sees a
+				// denial, just without a follow-up hint.
+				m.appendLine("permission", "feedback empty — falling back to plain reject")
+				m.setMode(modeComposing)
+				m.sendPermissionDecision(false, "Rejected from Go TUI", "once", "", "")
+				return
+			}
+			m.setMode(modeComposing)
+			m.sendPermissionDecision(false, "Rejected (with feedback) from Go TUI", "once", "", edited)
+			return
+		}
+		// Esc → back to the 5-option panel, restore cursor 4.
+		m.permissionChoice = 4
+		m.setMode(modePermission)
+	default:
+		// Defensive fallback — should not happen, but make sure
+		// the operator isn't stuck in an editor mode.
+		m.setMode(modeComposing)
 	}
 }
 

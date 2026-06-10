@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/sutang-vain/babel-o/clients/go-tui/internal/tui"
 )
@@ -28,9 +29,29 @@ func parseFlags() tui.Config {
 	flag.StringVar(&cfg.Cwd, "cwd", cwd, "workspace directory sent to Nexus")
 	flag.StringVar(&cfg.SessionID, "session", "", "optional existing session id")
 	flag.BoolVar(&cfg.AltScreen, "alt", true, "use terminal alternate screen")
+	flag.BoolVar(&cfg.MouseCapture, "mouse", false, "capture mouse drag / wheel (default off so the operator can copy text from the transcript)")
 	flag.IntVar(&cfg.PollIntervalMs, "poll-interval-ms", 30000, "background /v1/runtime/config poll interval in milliseconds; 0 disables polling")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.PrintVersion, "v", false, "print version and exit (shorthand)")
+	// Phase D of
+	// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+	// Comma-separated; pass multiple times to extend the list. Empty
+	// (default) → per-turn `allowedTools` override off; server-startup
+	// policy applies. Use "*" or "all" for the wildcard that maps
+	// to allowAllTools on the Nexus side. Examples:
+	//   --allow-tools Bash,Edit
+	//   --allow-tools Bash --allow-tools Edit
+	//   --allow-tools "*"
+	flag.Func("allow-tools", "comma-separated per-turn tool allowlist (Phase D); '*' or 'all' for wildcard", func(v string) error {
+		for _, name := range strings.Split(v, ",") {
+			trimmed := strings.TrimSpace(name)
+			if trimmed == "" {
+				continue
+			}
+			cfg.AllowTools = append(cfg.AllowTools, trimmed)
+		}
+		return nil
+	})
 	flag.Parse()
 	cfg.APIKey = os.Getenv("NEXUS_API_KEY")
 	// Apply the default per-turn execute timeout for the WebSocket /v1/stream
