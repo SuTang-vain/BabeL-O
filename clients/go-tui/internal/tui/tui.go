@@ -1174,7 +1174,7 @@ var (
 	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
 	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
@@ -1190,6 +1190,14 @@ var (
 	overlayFrameStyle = lipgloss.NewStyle().
 				Border(lipgloss.NormalBorder()).
 				BorderForeground(lipgloss.Color("238")).
+				Padding(0, 1)
+	// permissionFrameStyle is a louder variant of overlayFrame
+	// for the live permission_request panel: a yellow border
+	// draws the eye to the decision prompt without the operator
+	// needing to scan the transcript.
+	permissionFrameStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("220")).
 				Padding(0, 1)
 	focusedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
@@ -3791,23 +3799,20 @@ func (m model) renderPermission(width int) string {
 	if m.pending == nil {
 		return ""
 	}
-	header := fmt.Sprintf(
-		"Permission: %s (%s risk)  a/y approve  r/n/esc reject",
-		firstNonEmpty(m.pending.name, "tool"),
-		firstNonEmpty(m.pending.risk, "unknown"),
-	)
-	parts := []string{header}
+	header := titleStyle.Render("Permission: " + firstNonEmpty(m.pending.name, "tool") +
+		"  (" + firstNonEmpty(m.pending.risk, "unknown") + " risk)")
+	var rows []string
+	rows = append(rows, header)
+	rows = append(rows, permissionStyle.Render("a/y approve   r/n/esc reject"))
 	if input := strings.TrimSpace(m.pending.input); input != "" {
-		parts = append(parts, "  input: "+input)
+		rows = append(rows, "input:")
+		rows = append(rows, wrapPlain(input, max(0, width-6)))
 	}
 	if msg := strings.TrimSpace(m.pending.message); msg != "" {
-		parts = append(parts, "  reason: "+msg)
+		rows = append(rows, permissionStyle.Render("reason: "+msg))
 	}
-	joined := strings.Join(parts, "\n")
-	return strings.Join([]string{
-		divider(width),
-		permissionStyle.Render(wrapPlain(joined, max(0, width-2))),
-	}, "\n")
+	body := strings.Join(rows, "\n")
+	return permissionFrameStyle.Width(max(0, width-2)).Render(body)
 }
 
 func (m model) renderInput(width int) string {
@@ -4283,9 +4288,17 @@ func renderTranscript(lines []transcriptLine, width int) string {
 	if len(lines) == 0 {
 		return mutedStyle.Render("No messages yet.")
 	}
-	rendered := make([]string, 0, len(lines))
-	for _, line := range lines {
+	rendered := make([]string, 0, len(lines)*2)
+	for i, line := range lines {
 		rendered = append(rendered, formatLine(line.kind, line.text, width))
+		// Insert a blank line between rows (but not after the
+		// last one) to give the chat log the breathing room
+		// bbl chat's transcript has — multi-line tool args and
+		// wrapped assistant prose no longer run into the next
+		// row.
+		if i < len(lines)-1 {
+			rendered = append(rendered, "")
+		}
 	}
 	return strings.Join(rendered, "\n")
 }
@@ -4343,6 +4356,29 @@ func formatLine(kind string, text string, width int) string {
 		}
 		out := make([]string, 0, len(bodyLines))
 		out = append(out, style.Render(bodyLines[0]))
+		for _, c := range bodyLines[1:] {
+			out = append(out, "  "+style.Render(c))
+		}
+		return strings.Join(out, "\n")
+	case "result":
+		// result events emit just `done` (success) or
+		// `failed: <message>` (failure) as body text. Use a
+		// muted 2-space indent so it reads as a quiet
+		// turn-end marker; the header's running indicator
+		// has already flipped back to idle by the time the
+		// transcript catches up.
+		bodyWidth := max(10, width-2)
+		body := wrapPlain(text, bodyWidth)
+		bodyLines := strings.Split(body, "\n")
+		if len(bodyLines) == 0 {
+			bodyLines = []string{""}
+		}
+		style := mutedStyle
+		if strings.HasPrefix(body, "failed") {
+			style = errorStyle
+		}
+		out := make([]string, 0, len(bodyLines))
+		out = append(out, "  "+style.Render(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
 			out = append(out, "  "+style.Render(c))
 		}
