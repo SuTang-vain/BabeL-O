@@ -100,29 +100,55 @@ export function registerGoCommand(program: Command): void {
 
 export function createGoTuiLaunchSpec(
   options: GoTuiCommandOptions,
-  deps: { exists?: ExistsFn; packageRoot?: string; platform?: NodeJS.Platform } = {},
+  deps: {
+    exists?: ExistsFn
+    packageRoot?: string
+    platform?: NodeJS.Platform
+    env?: NodeJS.ProcessEnv
+    homeDir?: string
+  } = {},
 ): GoTuiLaunchSpec {
   const exists = deps.exists ?? existsSync
+  const platform = deps.platform ?? process.platform
+  const env = deps.env ?? process.env
   const packageRoot = deps.packageRoot ?? defaultPackageRoot()
   const sourceDir = resolve(options.sourceDir ?? defaultGoTuiSourceDir(packageRoot))
   const args = buildGoTuiArgs(options)
-  const binary = resolve(options.binary ?? defaultGoTuiBinary(sourceDir, deps.platform ?? process.platform))
-
-  if (exists(binary)) {
-    return {
-      command: binary,
-      args,
-      cwd: sourceDir,
-      mode: 'binary',
+  const candidates = collectGoTuiBinaryCandidates({
+    options,
+    platform,
+    packageRoot,
+    sourceDir,
+    env,
+    homeDir: deps.homeDir,
+  })
+  for (const candidate of candidates) {
+    if (exists(candidate)) {
+      return {
+        command: candidate,
+        args,
+        cwd: sourceDir,
+        mode: 'binary',
+      }
     }
   }
 
   if (options.binary) {
-    throw new Error(`Go TUI binary not found: ${binary}`)
+    // Explicit --binary is treated as a hard requirement
+    // even if the user has a BABEL_O_GO_TUI_BINARY that
+    // would otherwise match — the user asked for a specific
+    // path and we should error rather than silently swap.
+    throw new Error(
+      `Go TUI binary not found: ${options.binary}. ` +
+        `Install a prebuilt via 'npm install -g @bablel/babel-o' or set BABEL_O_GO_TUI_BINARY to a release asset.`,
+    )
   }
 
   if (!exists(sourceDir)) {
-    throw new Error(`Go TUI source directory not found: ${sourceDir}`)
+    throw new Error(
+      `Go TUI source directory not found: ${sourceDir}. ` +
+        `Install a prebuilt via 'npm install -g @bablel/babel-o' or set BABEL_O_GO_TUI_BINARY.`,
+    )
   }
 
   return {
@@ -130,6 +156,106 @@ export function createGoTuiLaunchSpec(
     args: ['run', '.', ...args],
     cwd: sourceDir,
     mode: 'go-run',
+  }
+}
+
+// collectGoTuiBinaryCandidates returns the ordered list of
+// prebuilt Go TUI binary paths to probe, highest-priority
+// first. The order matches the Phase 8 PR2 spec:
+//
+//   1. explicit `--binary` flag (from GoTuiCommandOptions)
+//   2. $BABEL_O_GO_TUI_BINARY env var
+//   3. $BABEL_O_GO_TUI_PACKAGE_BINARY env var (lets npm
+//      package consumers pin a specific prebuilt asset
+//      without touching the launcher)
+//   4. package-bundled default
+//      (`<packageRoot>/bin/go-tui-<platform>-<arch>`)
+//   5. source-relative in-tree dev build
+//      (`<sourceDir>/go-tui` or `go-tui.exe`)
+//   6. XDG user-local
+//      (`~/.local/share/babel-o/bin/go-tui-<platform>-<arch>`)
+//
+// The function is pure (no filesystem access) so it's easy
+// to unit test — the caller is responsible for `existsSync`
+// checks on the returned list.
+export function collectGoTuiBinaryCandidates(input: {
+  options: Pick<GoTuiCommandOptions, 'binary' | 'sourceDir'>
+  platform: NodeJS.Platform
+  packageRoot: string
+  sourceDir: string
+  env: NodeJS.ProcessEnv
+  homeDir?: string
+}): string[] {
+  const candidates: string[] = []
+  if (input.options.binary) {
+    candidates.push(resolve(input.options.binary))
+  }
+  const envBinary = input.env.BABEL_O_GO_TUI_BINARY
+  if (envBinary) {
+    candidates.push(resolve(envBinary))
+  }
+  const packageEnvBinary = input.env.BABEL_O_GO_TUI_PACKAGE_BINARY
+  if (packageEnvBinary) {
+    candidates.push(resolve(packageEnvBinary))
+  }
+  const packageBundled = join(
+    input.packageRoot,
+    'bin',
+    `go-tui-${platformSuffix(input.platform)}`,
+  )
+  candidates.push(packageBundled)
+  // In-tree dev build (e.g. `make build` then `bbl go` from
+  // a source checkout). The Go TUI Makefile drops the
+  // binary at <sourceDir>/bin/go-tui, but the launcher
+  // also accepts the source-relative go-tui as a fallback
+  // for hand-rolled local builds.
+  candidates.push(join(input.sourceDir, defaultGoTuiBinaryName(input.platform)))
+  if (input.homeDir) {
+    const xdgLocal = join(
+      input.homeDir,
+      '.local',
+      'share',
+      'babel-o',
+      'bin',
+      `go-tui-${platformSuffix(input.platform)}`,
+    )
+    candidates.push(xdgLocal)
+  }
+  return candidates
+}
+
+// defaultGoTuiBinaryName returns the platform-specific
+// legacy binary name ("go-tui" or "go-tui.exe"). Kept as a
+// thin wrapper so the Phase 8 PR2 launcher's multi-path
+// discovery can also probe the in-tree dev build.
+export function defaultGoTuiBinaryName(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? 'go-tui.exe' : 'go-tui'
+}
+
+// platformSuffix returns the `<os>-<arch>` segment used in
+// the prebuilt asset naming convention
+// (e.g. "darwin-arm64", "linux-x64", "windows-x64.exe").
+// Centralized here so the launcher, the docs, and the
+// release workflow all stay aligned.
+//
+// Note: the Phase 8 PR2 release pipeline ships only
+// darwin-arm64 for macOS (the Go 1.23 macOS tier dropped
+// 10.15 support; x64 darwin users must build from source).
+// Linux ships both amd64 + arm64; Windows ships only x64.
+export function platformSuffix(platform: NodeJS.Platform): string {
+  switch (platform) {
+    case 'darwin':
+      return 'darwin-arm64'
+    case 'linux':
+      return 'linux-x64'
+    case 'win32':
+      return 'windows-x64.exe'
+    case 'freebsd':
+      return 'freebsd-x64'
+    case 'openbsd':
+      return 'openbsd-x64'
+    default:
+      return `${platform}-x64`
   }
 }
 

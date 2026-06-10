@@ -5,12 +5,15 @@ import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import {
   buildGoTuiArgs,
+  collectGoTuiBinaryCandidates,
   createManagedNexusLaunchSpec,
   createGoTuiLaunchSpec,
   defaultGoTuiBinary,
+  defaultGoTuiBinaryName,
   ensureNexusForGoTui,
   isLocalNexusUrl,
   isNexusHealthy,
+  platformSuffix,
   waitForNexusHealth,
 } from '../src/cli/commands/go.js'
 
@@ -326,4 +329,240 @@ test('go_tui_pty_driver.py exposes the Phase 1 permission-approve sequence', { s
   assert.equal(probe.status, 0, output)
   assert.match(output, /permission-approve/)
   assert.match(output, /--timeout/)
+})
+
+/**
+ * Phase 8 PR2: collectGoTuiBinaryCandidates returns the
+ * ordered prebuilt-asset search list the `bbl go` launcher
+ * probes at startup. The order is the spec from the PR2
+ * plan (highest-priority first):
+ *   1. explicit `--binary`
+ *   2. $BABEL_O_GO_TUI_BINARY
+ *   3. $BABEL_O_GO_TUI_PACKAGE_BINARY
+ *   4. package-bundled default
+ *   5. source-relative in-tree dev build
+ *   6. XDG user-local
+ */
+test('collectGoTuiBinaryCandidates returns candidates in the spec order', () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: undefined, sourceDir },
+    platform: 'darwin',
+    packageRoot,
+    sourceDir,
+    env: {
+      BABEL_O_GO_TUI_BINARY: '/env/bin/go-tui',
+      BABEL_O_GO_TUI_PACKAGE_BINARY: '/env/bin/go-tui-package',
+    },
+    homeDir: '/home/user',
+  })
+  // Expected ordered list:
+  //   1. BABEL_O_GO_TUI_BINARY
+  //   2. BABEL_O_GO_TUI_PACKAGE_BINARY
+  //   3. /repo/bin/go-tui-darwin-arm64 (platformSuffix darwin)
+  //   4. /repo/clients/go-tui/go-tui (source-relative)
+  //   5. /home/user/.local/share/babel-o/bin/go-tui-darwin-arm64
+  const expected = [
+    '/env/bin/go-tui',
+    '/env/bin/go-tui-package',
+    '/repo/bin/go-tui-darwin-arm64',
+    join(sourceDir, 'go-tui'),
+    '/home/user/.local/share/babel-o/bin/go-tui-darwin-arm64',
+  ]
+  assert.deepEqual(candidates, expected)
+})
+
+test('collectGoTuiBinaryCandidates pushes explicit --binary ahead of env', () => {
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: '/explicit/go-tui', sourceDir: '/src' },
+    platform: 'linux',
+    packageRoot: '/repo',
+    sourceDir: '/src',
+    env: { BABEL_O_GO_TUI_BINARY: '/env/go-tui' },
+  })
+  assert.equal(candidates[0], '/explicit/go-tui', 'explicit --binary wins')
+  assert.equal(candidates[1], '/env/go-tui', 'env var comes second')
+})
+
+test('collectGoTuiBinaryCandidates omits missing env vars', () => {
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: undefined, sourceDir: '/src' },
+    platform: 'linux',
+    packageRoot: '/repo',
+    sourceDir: '/src',
+    env: {},
+  })
+  // Without env, the order is: package-bundled default,
+  // source-relative. No XDG entry (no homeDir).
+  assert.deepEqual(candidates, [
+    '/repo/bin/go-tui-linux-x64',
+    join('/src', 'go-tui'),
+  ])
+})
+
+test('collectGoTuiBinaryCandidates omits XDG entry when homeDir is missing', () => {
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: undefined, sourceDir: '/src' },
+    platform: 'darwin',
+    packageRoot: '/repo',
+    sourceDir: '/src',
+    env: {},
+  })
+  // No XDG (no homeDir), so the list is just package-bundled
+  // + source-relative.
+  assert.deepEqual(candidates, [
+    '/repo/bin/go-tui-darwin-arm64',
+    join('/src', 'go-tui'),
+  ])
+})
+
+test('platformSuffix returns the canonical platform-arch segment', () => {
+  assert.equal(platformSuffix('darwin'), 'darwin-arm64')
+  assert.equal(platformSuffix('linux'), 'linux-x64')
+  assert.equal(platformSuffix('win32'), 'windows-x64.exe')
+  assert.equal(platformSuffix('freebsd'), 'freebsd-x64')
+  // Unknown platform falls through to `${platform}-x64`
+  // so a future port still gets a reasonable default
+  // (the launcher will just fail to find the file and
+  // fall back to source / go run .).
+  assert.equal(platformSuffix('aix' as NodeJS.Platform), 'aix-x64')
+})
+
+test('defaultGoTuiBinaryName returns the legacy go-tui/go-tui.exe name', () => {
+  assert.equal(defaultGoTuiBinaryName('darwin'), 'go-tui')
+  assert.equal(defaultGoTuiBinaryName('linux'), 'go-tui')
+  assert.equal(defaultGoTuiBinaryName('win32'), 'go-tui.exe')
+})
+
+/**
+ * Phase 8 PR2: createGoTuiLaunchSpec honors the new search
+ * order. A binary at the second-priority env var path wins
+ * even when the in-tree dev build is also present.
+ */
+test('createGoTuiLaunchSpec prefers BABEL_O_GO_TUI_BINARY over the in-tree dev build', () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const envPath = '/usr/local/bin/bbl-go-tui'
+  // exists() reports ONLY the env path as a real file —
+  // the source-relative in-tree dev build is missing.
+  const exists = (p: string) => p === envPath
+  const launch = createGoTuiLaunchSpec(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      packageRoot,
+      platform: 'darwin',
+      env: { BABEL_O_GO_TUI_BINARY: envPath },
+    },
+  )
+  assert.equal(launch.command, envPath)
+  assert.equal(launch.mode, 'binary')
+  assert.equal(launch.cwd, sourceDir)
+})
+
+test('createGoTuiLaunchSpec falls back to the in-tree dev build when no env var is set', () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const inTreeBinary = join(sourceDir, 'go-tui')
+  const exists = (p: string) => p === inTreeBinary
+  const launch = createGoTuiLaunchSpec(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      packageRoot,
+      platform: 'darwin',
+      env: {},
+    },
+  )
+  assert.equal(launch.command, inTreeBinary)
+  assert.equal(launch.mode, 'binary')
+})
+
+test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tree dev build', () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
+  const inTreeBinary = join(sourceDir, 'go-tui')
+  const exists = (p: string) => p === packageBundled || p === inTreeBinary
+  const launch = createGoTuiLaunchSpec(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      packageRoot,
+      platform: 'darwin',
+      env: {},
+    },
+  )
+  // Package-bundled wins because it comes earlier in the
+  // candidate list (priority 4) than the source-relative
+  // in-tree dev build (priority 5).
+  assert.equal(launch.command, packageBundled)
+  assert.equal(launch.mode, 'binary')
+})
+
+test('createGoTuiLaunchSpec falls back to go run . when no binary exists', () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  // exists() returns true ONLY for the sourceDir itself
+  // (the directory is present, the candidates aren't).
+  const exists = (p: string) => p === sourceDir
+  const launch = createGoTuiLaunchSpec(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      packageRoot,
+      platform: 'darwin',
+      env: {},
+    },
+  )
+  assert.equal(launch.command, 'go')
+  assert.equal(launch.args[0], 'run')
+  assert.equal(launch.args[1], '.')
+  // The remaining args are the standard Go TUI flags
+  // (--url, --cwd, ...).
+  assert.equal(launch.mode, 'go-run')
+})
+
+test('createGoTuiLaunchSpec errors with an actionable hint when explicit --binary is missing', () => {
+  // exists() returns false for every candidate.
+  const exists = () => false
+  // existsSync will still return true for the sourceDir
+  // itself — the launcher only checks sourceDir presence
+  // for the source-fallback path, not for the explicit
+  // --binary path. So we need a real temp sourceDir.
+  assert.throws(
+    () =>
+      createGoTuiLaunchSpec(
+        {
+          url: 'http://nexus.local',
+          cwd: '/workspace',
+          alt: true,
+          binary: '/nonexistent/go-tui',
+        },
+        {
+          exists,
+          packageRoot: '/repo',
+          platform: 'darwin',
+          env: {},
+        },
+      ),
+    /Go TUI binary not found.*Install a prebuilt via 'npm install -g/,
+  )
 })

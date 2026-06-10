@@ -1,0 +1,125 @@
+name: Go TUI release
+
+# Phase 8 PR2: prebuilt Go TUI binary release pipeline.
+#
+# Triggers on a `go-tui-v*` tag push (separate from the Node
+# `v*` tag push handled by the parent release.yml). The
+# `bbl go` launcher (src/cli/commands/go.ts) discovers the
+# resulting assets in the standard search order:
+#
+#   1. explicit `--binary` flag
+#   2. $BABEL_O_GO_TUI_BINARY env var
+#   3. package-bundled (BABEL_O_GO_TUI_PACKAGE_BINARY env var,
+#      or `<packageRoot>/bin/go-tui-<platform>-<arch>`)
+#   4. user-local XDG-ish (e.g.
+#      ~/.local/share/babel-o/bin/go-tui-<platform>-<arch>)
+#   5. source fallback `go run .`
+#
+# Each matrix entry runs `make build` (the canonical build
+# recipe from clients/go-tui/Makefile) which embeds the npm
+# package.json `version` + the current short git commit +
+# an ISO 8601 UTC build timestamp via -ldflags, then
+# renames the resulting bin/go-tui to the release asset
+# naming convention and attaches it to a GitHub Release
+# whose tag matches the push event.
+#
+# Naming convention: bbl-go-tui-<os>-<arch> matches the TS
+# release's bbl-<os>-<arch> scheme so the two artifact
+# families can coexist in the same release without
+# confusion.
+
+on:
+  push:
+    tags:
+      - 'go-tui-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+            goarch: arm64
+            artifact: bbl-go-tui-darwin-arm64
+            binary_name: go-tui
+          - os: macos-13
+            goos: darwin
+            goarch: amd64
+            artifact: bbl-go-tui-darwin-x64
+            binary_name: go-tui
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact: bbl-go-tui-linux-x64
+            binary_name: go-tui
+          - os: ubuntu-22.04-arm
+            goos: linux
+            goarch: arm64
+            artifact: bbl-go-tui-linux-arm64
+            binary_name: go-tui
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact: bbl-go-tui-windows-x64.exe
+            binary_name: go-tui.exe
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: clients/go-tui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: clients/go-tui/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build prebuilt Go TUI binary
+        run: make build
+      - name: Verify --version prints build metadata
+        run: ./bin/go-tui --version
+      - name: Rename to release asset name
+        shell: bash
+        run: |
+          mv bin/${{ matrix.binary_name }} bin/${{ matrix.artifact }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: clients/go-tui/bin/${{ matrix.artifact }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create release and upload Go TUI assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/*
+
+      - name: Mirror to dist/ for npm package consumers
+        run: |
+          mkdir -p dist/go-tui
+          for asset in artifacts/*; do
+            cp "$asset" "dist/go-tui/$(basename "$asset")"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbl-go-tui-dist
+          path: dist/go-tui/
