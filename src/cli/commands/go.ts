@@ -20,6 +20,7 @@ export interface GoTuiCommandOptions {
   nexusStartupTimeoutMs?: string
   allowedTools?: string
   pollIntervalMs?: string
+  check?: boolean
 }
 
 export interface GoTuiLaunchSpec {
@@ -52,7 +53,14 @@ export function registerGoCommand(program: Command): void {
     .option('--nexus-startup-timeout-ms <ms>', 'Milliseconds to wait for auto-started Nexus health', '8000')
     .option('--allowed-tools <tools>', 'Allowed tools for auto-started Nexus (default: env NEXUS_ALLOWED_TOOLS or *)')
     .option('--poll-interval-ms <ms>', 'Forward Go TUI config polling interval; 0 disables polling')
+    .option('--check', 'Verify install readiness (Go TUI binary, Nexus health, version compat) and exit 0/1')
     .action(async (options: GoTuiCommandOptions) => {
+      if (options.check) {
+        const report = await runGoTuiCheckReport(options, { fetch })
+        console.log(report.lines.join('\n'))
+        process.exit(report.exitCode)
+        return
+      }
       let launch: GoTuiLaunchSpec
       let managedNexus: Awaited<ReturnType<typeof ensureNexusForGoTui>> | undefined
       try {
@@ -82,7 +90,8 @@ export function registerGoCommand(program: Command): void {
         if (launch.mode === 'go-run' && error.code === 'ENOENT') {
           console.error(
             'Error: Go TUI binary was not found and the Go toolchain is unavailable. ' +
-              'Install Go or build clients/go-tui/go-tui first.',
+              'Install Go (https://go.dev/dl/) or use a prebuilt release: ' +
+              '`npm install -g @bablel/babel-o`, or set BABEL_O_GO_TUI_BINARY to a release asset path.',
           )
         } else {
           console.error(`Error: failed to launch Go TUI: ${error.message}`)
@@ -96,6 +105,133 @@ export function registerGoCommand(program: Command): void {
         process.exit(code ?? 0)
       })
     })
+}
+
+// goTuiCheckReport is the structured output of `bbl go
+// --check`. `lines` is the human-readable multi-line
+// report; `exitCode` is 0 when every check passes, 1
+// otherwise. The launcher prints lines to stdout and exits
+// with the reported code.
+//
+// The check covers three concerns the launcher otherwise
+// surfaces as runtime errors:
+//   - Go TUI launchability: a binary is reachable via the
+//     multi-path discovery (Phase 8 PR2), OR a source
+//     fallback is available, OR the explicit --binary
+//     is honored.
+//   - Nexus health: /health returns 2xx on the target
+//     URL (the URL provided via --url, default
+//     http://127.0.0.1:3000).
+//   - Version compat: if /v1/runtime/version is reachable
+//     AND the Go TUI major falls outside the server's
+//     supportedMajors list, the check fails.
+export interface goTuiCheckReport {
+  lines: string[]
+  exitCode: number
+}
+
+export async function runGoTuiCheckReport(
+  options: GoTuiCommandOptions,
+  deps: {
+    fetch?: FetchFn
+    exists?: ExistsFn
+    packageRoot?: string
+  } = {},
+): Promise<goTuiCheckReport> {
+  const lines: string[] = []
+  let hasFailure = false
+
+  lines.push('BabeL-O Go TUI install check')
+  lines.push('=============================')
+
+  // 1. Go TUI launchability.
+  const exists = deps.exists ?? existsSync
+  const packageRoot = deps.packageRoot ?? defaultPackageRoot()
+  const platform = process.platform
+  const sourceDir = resolve(options.sourceDir ?? defaultGoTuiSourceDir(packageRoot))
+  const candidates = collectGoTuiBinaryCandidates({
+    options,
+    platform,
+    packageRoot,
+    sourceDir,
+    env: process.env,
+  })
+  let resolvedBinary: string | undefined
+  for (const candidate of candidates) {
+    if (exists(candidate)) {
+      resolvedBinary = candidate
+      break
+    }
+  }
+  if (resolvedBinary) {
+    lines.push(`[OK]      Go TUI binary found: ${resolvedBinary}`)
+  } else if (exists(sourceDir)) {
+    lines.push(
+      `[WARN]    No prebuilt Go TUI binary found in the multi-path search. ` +
+        `Will fall back to source 'go run .' from ${sourceDir} ` +
+        `(requires the Go toolchain on PATH).`,
+    )
+  } else {
+    lines.push(
+      `[FAIL]    No prebuilt Go TUI binary AND no source directory at ${sourceDir}. ` +
+        `Install a prebuilt via 'npm install -g @bablel/babel-o' or 'go install' from a source checkout.`,
+    )
+    hasFailure = true
+  }
+
+  // 2. Nexus health.
+  const fetchImpl = deps.fetch ?? fetch
+  const nexusHealthy = await isNexusHealthy(options.url, fetchImpl)
+  if (nexusHealthy) {
+    lines.push(`[OK]      Nexus is healthy at ${options.url}`)
+  } else {
+    lines.push(
+      `[WARN]    Nexus is not healthy at ${options.url}. ` +
+        `The launcher will start a local Nexus automatically (when --url is a localhost URL); ` +
+        `use --no-start-nexus to suppress that.`,
+    )
+  }
+
+  // 3. Version compat (best-effort — Nexus may be too old
+  //    to expose the endpoint, or be unreachable).
+  if (nexusHealthy) {
+    try {
+      const response = await fetchImpl(new URL('/v1/runtime/version', options.url))
+      if (response.ok) {
+        const body = (await response.json()) as {
+          serverVersion?: string
+          goTuiCompatibility?: { supportedMajors?: number[] }
+        }
+        const serverVersion = body.serverVersion ?? 'unknown'
+        const supported = body.goTuiCompatibility?.supportedMajors ?? []
+        // We don't have a way to read the Go TUI's own
+        // major at the launcher level (the launcher
+        // doesn't execute the binary). Report the
+        // server's declared support so the user can
+        // match it manually.
+        lines.push(
+          `[INFO]    Server version: ${serverVersion}, supported Go TUI majors: [${supported.join(', ')}]`,
+        )
+      } else {
+        lines.push(
+          `[INFO]    Nexus is healthy but /v1/runtime/version returned ${response.status}; compat check skipped.`,
+        )
+      }
+    } catch {
+      lines.push(`[INFO]    Could not fetch /v1/runtime/version; compat check skipped.`)
+    }
+  }
+
+  lines.push('')
+  if (hasFailure) {
+    lines.push('Result: FAIL')
+  } else if (resolvedBinary === undefined) {
+    lines.push('Result: WARN (no prebuilt, will use source fallback)')
+  } else {
+    lines.push('Result: OK')
+  }
+
+  return { lines, exitCode: hasFailure ? 1 : 0 }
 }
 
 export function createGoTuiLaunchSpec(

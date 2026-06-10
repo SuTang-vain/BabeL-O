@@ -14,6 +14,7 @@ import {
   isLocalNexusUrl,
   isNexusHealthy,
   platformSuffix,
+  runGoTuiCheckReport,
   waitForNexusHealth,
 } from '../src/cli/commands/go.js'
 
@@ -565,4 +566,143 @@ test('createGoTuiLaunchSpec errors with an actionable hint when explicit --binar
       ),
     /Go TUI binary not found.*Install a prebuilt via 'npm install -g/,
   )
+})
+
+/**
+ * Phase 8 PR3: `bbl go --check` reports install readiness.
+ * The check covers three concerns:
+ *   - Go TUI launchability (binary found via the
+ *     multi-path discovery, OR source fallback OK,
+ *     OR explicit --binary honored)
+ *   - Nexus health at the target URL
+ *   - version compat (best-effort, server is healthy)
+ *
+ * The exit code is 0 when no FAIL row was emitted, 1
+ * otherwise. WARN rows do NOT bump the exit code so the
+ * check can be used in CI even when the user is running
+ * against a remote Nexus.
+ */
+test('bbl go --check: passes when a prebuilt binary is present and Nexus is healthy', async () => {
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
+  const exists = (p: string) => p === packageBundled || p === sourceDir
+  const fetchImpl = (async () => new Response(
+    JSON.stringify({
+      type: 'runtime_version',
+      serverVersion: '0.3.2',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      goTuiCompatibility: { supportedMajors: [0], latestSupported: '0.3.2' },
+      nodeCliCompatibility: { supportedMajors: [0], latestSupported: '0.3.2' },
+    }),
+    { status: 200, headers: { 'content-type': 'application/json' } },
+  )) as unknown as typeof fetch
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    { exists, fetch: fetchImpl, packageRoot },
+  )
+  assert.equal(report.exitCode, 0)
+  const combined = report.lines.join('\n')
+  assert.match(combined, /Go TUI binary found: .*go-tui-darwin-arm64/)
+  assert.match(combined, /Nexus is healthy at http:\/\/nexus\.local/)
+  assert.match(combined, /Server version: 0\.3\.2, supported Go TUI majors: \[0\]/)
+  assert.match(combined, /Result: OK/)
+})
+
+test('bbl go --check: warns (does not fail) when no prebuilt but source is present', async () => {
+  // exists() returns true ONLY for the sourceDir (so the
+  // source-fallback branch fires), and false for all
+  // binary candidates.
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const exists = (p: string) => p === sourceDir
+  const fetchImpl = (async () => new Response('ok', { status: 200 })) as unknown as typeof fetch
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    { exists, fetch: fetchImpl, packageRoot },
+  )
+  assert.equal(report.exitCode, 0)
+  const combined = report.lines.join('\n')
+  assert.match(combined, /No prebuilt Go TUI binary found in the multi-path search\./)
+  assert.match(combined, /Will fall back to source 'go run \.'/)
+  assert.match(combined, /Result: WARN/)
+})
+
+test('bbl go --check: fails when no prebuilt AND no source directory', async () => {
+  // Both prebuilt candidates AND the sourceDir are missing.
+  // The mock exists() returns false for everything, so
+  // the launcher hits the FAIL branch.
+  const packageRoot = '/repo/that/does/not/exist'
+  const exists = () => false
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    { exists, fetch: async () => new Response('ok', { status: 200 }), packageRoot },
+  )
+  assert.equal(report.exitCode, 1)
+  const combined = report.lines.join('\n')
+  assert.match(combined, /No prebuilt Go TUI binary AND no source directory/)
+  assert.match(combined, /Install a prebuilt via 'npm install -g @bablel\/babel-o'/)
+  assert.match(combined, /Result: FAIL/)
+})
+
+test('bbl go --check: warns (does not fail) when Nexus is not healthy', async () => {
+  // The launcher auto-starts a local Nexus when --url is
+  // a localhost URL, so an unhealthy Nexus is a WARN
+  // rather than a FAIL.
+  const exists = (p: string) => p === '/some/binary'
+  const fetchImpl = (async () => {
+    throw new Error('connection refused')
+  }) as unknown as typeof fetch
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      alt: true,
+      binary: '/some/binary',
+    },
+    { exists, fetch: fetchImpl },
+  )
+  assert.equal(report.exitCode, 0)
+  const combined = report.lines.join('\n')
+  assert.match(combined, /Nexus is not healthy at http:\/\/127\.0\.0\.1:3000/)
+  assert.match(combined, /The launcher will start a local Nexus automatically/)
+  assert.match(combined, /Result: OK/)
+})
+
+test('bbl go --check: skips the compat INFO row when /v1/runtime/version returns 500', async () => {
+  const exists = (p: string) => p === '/some/binary'
+  const fetchImpl = (url: string | URL | Request) => {
+    if (String(url).endsWith('/health')) {
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }
+    if (String(url).endsWith('/v1/runtime/version')) {
+      return Promise.resolve(new Response('server error', { status: 500 }))
+    }
+    return Promise.resolve(new Response('not found', { status: 404 }))
+  }
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+      binary: '/some/binary',
+    },
+    { exists, fetch: fetchImpl as unknown as typeof fetch },
+  )
+  const combined = report.lines.join('\n')
+  assert.match(combined, /\/v1\/runtime\/version returned 500; compat check skipped\./)
+  // The exit code stays 0 because no FAIL row was emitted.
+  assert.equal(report.exitCode, 0)
 })

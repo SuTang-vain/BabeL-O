@@ -2,6 +2,43 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI Phase 8 PR1+PR2+PR3: version reporting / prebuilt release / install check
+
+- **用户请求**: 按 TODO_tui.md 收尾项推进 Phase 8 剩余（版本兼容矩阵 / 预编译 binary 发布 / 安装包策略），3 个 commit 一起推完。
+- **实现 (PR1 — version reporting)**:
+  - `clients/go-tui/version.go` (new): Version / Commit / BuildDate 包变量（dev fallback），`versionString()` 格式化为 `bbl-go-tui <ver> (commit <hash>) built <date>`，`majorVersion()` 解析 semver 头整数（dev/空 = 0），`isGoTuiMajorCompatible(supportedMajors)` 校验本地的 major 是否在 server 列表里（dev/empty list 自动 pass）。
+  - `clients/go-tui/Makefile` (new): canonical build recipe——`make build` 从 `package.json` 的 `version` + 当前 `git rev-parse --short HEAD` + `date -u +%Y-%m-%dT%H:%M:%SZ` 构造 -ldflags 把三个变量嵌入 binary。`make dev` / `make test` / `make version` / `make clean` 辅助目标。Phase 8 PR2 release pipeline 会从 GitHub Actions runner 调 `make build`。
+  - `clients/go-tui/main.go`: config struct 加 `printVersion bool`；`parseFlags` 加 `--version` / `-v` flag；`main()` 在 `printVersion` 时打印 `versionString()` 并退出。`runtimeVersionCompat` / `runtimeVersionResponse` / `runtimeVersionMsg` typed msg 配套结构。`checkRuntimeVersion(cfg)` HTTP command 调 `GET /v1/runtime/version`，保留 `raw []byte` envelope 抗 schema churn。`Init()` 多 fire 一发 `checkRuntimeVersion` 启动时单次校验。`case runtimeVersionMsg` Update handler：silent on error（让 `runtimeConfigMsg` 路径暴露真实连通性错误）；mismatch 时 appendLine "Go TUI major version mismatch: local=..., server supports majors ..., latest=..."。
+  - `src/nexus/app.ts`: 新增 `GET /v1/runtime/version` 端点。返回 `serverVersion`（从 `package.json` 读，由新的 `readOwnPackageVersion()` helper 负责，fallback "0.0.0-unknown"）+ `schemaVersion` + `goTuiCompatibility` / `nodeCliCompatibility` 兼容范围（`supportedMajors: [0]`，未来 major bump 手动维护）。响应脱敏不返回 secret。
+  - `clients/go-tui/main_test.go`: 8 个新单测：versionString dev fallback / 包含 commit+buildDate、majorVersion 解析标准 semver（含 0.0.0 / 1.0.0 / 1.2.3-pre.4+abc / dev / empty）、isGoTuiMajorCompatible 匹配 supportedMajors + dev-build / empty-supported-list 安全网、checkRuntimeVersion HTTP path + envelope decode、runtimeVersionMsg compat mismatch appends error line、runtimeVersionMsg compat match is silent、runtimeVersionMsg fetch error is silent。
+  - `test/config-endpoints.test.ts`: 2 个新 TS 单测——`/v1/runtime/version` 返回 server version + goTui 兼容范围；响应不泄漏 secret（apiKey / api_key 子串缺席）。
+- **实现 (PR2 — prebuilt binary release pipeline + multi-path discovery)**:
+  - `.github/workflows/go-tui-release.yml` (new): triggers on `go-tui-v*` tag push。matrix-builds darwin-arm64 / darwin-x64 / linux-x64 / linux-arm64 / windows-x64.exe 5 个目标。每个 matrix entry 调 `make build`、跑 `./bin/go-tui --version` 验证 build metadata 嵌入成功、重命名为 `bbl-go-tui-<os>-<arch>`、上传到 GitHub Release（与 Node SEA `bbl-*` 同 release 友好共存）+ mirror 到 `dist/go-tui/` 供 npm package 消费。
+  - `src/cli/commands/go.ts`:
+    - `collectGoTuiBinaryCandidates(input)` 返回 6 步搜索的 prebuilt 路径列表（按优先级）：`--binary` / `BABEL_O_GO_TUI_BINARY` / `BABEL_O_GO_TUI_PACKAGE_BINARY` / `<packageRoot>/bin/go-tui-<platform>-<arch>` / `<sourceDir>/go-tui`（dev in-tree build）/ `~/.local/share/babel-o/bin/go-tui-<platform>-<arch>`（XDG user-local）。Pure function 便于单测。
+    - `createGoTuiLaunchSpec` 改用 6 步候选列表迭代，返回第一个存在的 binary。explicit `--binary` 仍是硬要求——找不到时 throw 友好错误（"Install a prebuilt via 'npm install -g @bablel/babel-o' or set BABEL_O_GO_TUI_BINARY to a release asset."），不静默 fallback。
+    - `platformSuffix(platform)` 集中管理 canonical `<os>-<arch>` 段（`darwin-arm64` / `linux-x64` / `windows-x64.exe` / 兜底 `${platform}-x64`）。
+    - `defaultGoTuiBinaryName(platform)` 保留 legacy `go-tui` / `go-tui.exe` 名字，让 in-tree dev build 候选也能命中。
+  - `test/go-command.test.ts`: 9 个新单测：collectGoTuiBinaryCandidates 候选顺序、explicit `--binary` 优先于 env、missing env vars omitted、XDG omitted when homeDir missing、platformSuffix canonical 段、defaultGoTuiBinaryName legacy 名字、createGoTuiLaunchSpec 各优先级行为（BABEL_O_GO_TUI_BINARY > in-tree dev > package-bundled > `go run .` fallback）、actionable hint on explicit `--binary` missing。
+- **实现 (PR3 — bbl go --check + install strategy + clearer errors)**:
+  - `src/cli/commands/go.ts`:
+    - 新增 `goTuiCommandOptions.check?: boolean` flag + `registerGoCommand` 注册 `--check` option。`bbl go --check` 立即跑 `runGoTuiCheckReport(options)` 后打印报告 + `process.exit(report.exitCode)`。
+    - `runGoTuiCheckReport(options, deps)` 返回 `{ lines: string[], exitCode: 0|1 }`。报告三块：(a) Go TUI launchability（binary 多路径搜索 → OK / WARN-source-fallback / FAIL-no-source-dir）、(b) Nexus health（`/health` → OK / WARN-unhealthy-uses-managed-launcher）、(c) version compat（Nexus healthy 时拉 `/v1/runtime/version`，打印 server version + supported majors）。WARN 不 bump exit code（CI 友好），FAIL exit code = 1。
+    - `child.on('error')` 错误消息重写——之前只说 "Install Go or build ... first"（对没 Go toolchain 的人没指导意义）。新消息明确指引："Install Go (https://go.dev/dl/) or use a prebuilt release: `npm install -g @bablel/babel-o`, or set BABEL_O_GO_TUI_BINARY to a release asset path."
+  - `test/go-command.test.ts`: 5 个新单测——prebuilt + healthy → OK exit 0；no prebuilt + source present → WARN exit 0；no prebuilt + no source dir → FAIL exit 1；Nexus unhealthy → WARN（不 fail）exit 0；`/v1/runtime/version` 返回 500 → INFO row "compat check skipped"。
+- **范围克制**:
+  - PR1：major mismatch 永远是 error 行（不 panic / 不阻止用户输入）——保留 TUI 启动能力，但 banner 警告用户。
+  - PR2：候选路径顺序由 `--binary > env > package-bundled > in-tree > XDG` 决定——`bbl go` 不动 source-fallback 行为，只是新增 env / package-bundled 路径。
+  - PR3：`bbl go --check` 是非交互式命令，不在 TUI 启动时自动跑——用户可以放进 CI 流水线或 release 前置步骤。
+- **回归覆盖**:
+  - `cd clients/go-tui && go build . / go test ./...`: 211/211 pass（PR1 +8）。
+  - `npm run typecheck` + `npm run format:check`: 通过。
+  - `npm test`: 704/704 pass（686 旧 + PR1 +2 / PR2 +11 / PR3 +5 = 18 新）。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke`: 19/19 pass（不变——本系列 PR 不动 overlay 栈）。
+- **遗留**:
+  - 真正的 GitHub release 资产需要打 `go-tui-v0.3.2` tag 才会上传（不能本地复现）；未来 release 时由 maintainer 触发。
+  - XDG user-local install 路径文档化在 install strategy（README 段），但 launcher 不自动 mkdir——用户需手动 `mkdir -p ~/.local/share/babel-o/bin/` 再放 asset。
+
 ## 2026-06-10 — Go TUI tool palette `/v1/tools/audit` 真实 wire 收口
 
 - **用户请求**: 按 TODO_tui.md 收尾项推进 Go TUI tool palette 真实 wire（Phase 4 静态目录的下一阶段），把 `/tools` 从 7 条硬编码 builtin 列表升级为调真实 `GET /v1/tools/audit` Nexus HTTP 端点。
