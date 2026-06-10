@@ -63,16 +63,31 @@ export function formatWelcomeCardLines(options: {
   const username = process.env.USER || process.env.USERNAME || 'User'
   const configManager = ConfigManager.getInstance()
   const defaultModel = options.modelId || configManager.resolveSettings().modelId || 'local/coding-runtime'
+  // `session` is a snapshot at the moment the welcome card is
+  // rendered. Callers (chat.ts) must invoke renderWelcome AFTER
+  // the session id is generated so the card shows the real id
+  // rather than the `new session` placeholder. When the
+  // optional sessionId is omitted (e.g. for a /config card),
+  // fall back to the placeholder so the layout doesn't shift.
+  const sessionLabel = options.sessionId
+    ? truncateToTerminalWidth(shortenSessionId(options.sessionId), 22)
+    : 'new session'
   const logoWidth = Math.max(...PIXEL_ROWS.map(row => visibleTerminalWidth(renderLogoRow(row))))
   const theme = getTheme()
   const metadataWidth = Math.max(18, maxContentWidth - logoWidth - 5)
   const title = options.title ?? `v${BABEL_O_VERSION}`
+  // Labeled rows: each metadata line starts with a short grey
+  // label so the operator can read the card at a glance.
+  // `user` / `model` / `cwd` / `session` / `mode` mirror the
+  // /status output the user sees mid-session.
+  const labelStyle = chalk.dim
   const metadataLines = [
     ` ${theme.brand('❖ BABEL-O')}  ${chalk.dim(title)}`,
-    ` ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
-    ` ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
-    ` ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
-    ` ${theme.accent(truncateToTerminalWidth(mode, metadataWidth))}`,
+    ` ${labelStyle('user')}    ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
+    ` ${labelStyle('model')}   ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
+    ` ${labelStyle('cwd')}     ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
+    ` ${labelStyle('session')} ${theme.accent(sessionLabel)}`,
+    ` ${labelStyle('mode')}    ${theme.accent(truncateToTerminalWidth(mode, metadataWidth))}`,
   ]
   const contentWidths = PIXEL_ROWS.map((row, index) => {
     const logoCol = renderLogoRow(row)
@@ -110,4 +125,14 @@ function formatCwd(cwd: string): string {
   if (home && cwd === home) return '~'
   if (home && cwd.startsWith(`${home}/`)) return `~/${cwd.slice(home.length + 1)}`
   return cwd
+}
+
+// shortenSessionId renders a session id in the same compact
+// form the Go TUI uses (8 chars + "..." + 6 chars tail) so the
+// welcome card and the transcript row reference the same
+// canonical short id. Falls back to the full id when it's
+// already short enough that no truncation is needed.
+function shortenSessionId(id: string): string {
+  if (id.length <= 18) return id
+  return `${id.slice(0, 8)}…${id.slice(-6)}`
 }

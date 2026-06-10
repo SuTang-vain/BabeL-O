@@ -821,9 +821,20 @@ export function registerChatCommand(program: Command): void {
         }
       })
 
-      renderWelcome({ cwd: options.cwd, url: options.url, title: isDevMode ? 'dev' : undefined })
-
+      // Generate the session id BEFORE the welcome card so the
+      // `session` field on the card shows the real id rather
+      // than a `new session` placeholder. The card is then a
+      // truthful snapshot of the runtime state at the moment
+      // the user is dropped into the readline loop.
       sessionId = options.session ?? createId('session')
+
+      renderWelcome({
+        cwd: options.cwd,
+        sessionId,
+        url: options.url,
+        title: isDevMode ? 'dev' : undefined,
+      })
+
       if (options.session) {
         console.log(formatSessionBanner('resuming', sessionId))
 
