@@ -3746,13 +3746,28 @@ func (m model) renderHeader(width int) string {
 	}
 	build := mutedStyle.Render("· " + versionString())
 	stateLabel := "idle"
+	stateKind := stateStyle(false, nil)
 	if m.running {
-		stateLabel = m.spinner.View() + " running"
+		// Surface a separate "thinking" state when the model
+		// is in its reasoning phase (last event was a
+		// thinking_delta) so the operator can tell at a
+		// glance that the spinner is for reasoning, not for
+		// the final reply. Mirrors the `✻ Sautéed for 26s`
+		// pattern in Claude Code: a transient state pill
+		// that shows what's actually happening.
+		if m.lastEventType == "thinking_delta" {
+			stateLabel = m.spinner.View() + " thinking"
+			stateKind = thinkingStyle
+		} else {
+			stateLabel = m.spinner.View() + " running"
+			stateKind = statusStyle
+		}
 	}
 	if m.pending != nil {
 		stateLabel = "permission pending"
+		stateKind = permissionStyle
 	}
-	state := stateStyle(m.running, m.pending).Render(stateLabel)
+	state := stateKind.Render(stateLabel)
 	top := joinColumns(width, title+" "+build, state)
 
 	// Row 2: workspace path + session id only. URL is omitted
@@ -4303,10 +4318,12 @@ func (m *model) appendLine(kind string, text string) {
 }
 
 func (m *model) refreshViewport() {
-	if len(m.transcript) == 0 {
-		m.viewport.SetContent(m.renderWelcomeCard(max(40, m.viewport.Width)))
+	welcome := m.renderWelcomeCard(max(40, m.viewport.Width))
+	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width))
+	if transcript != "" {
+		m.viewport.SetContent(welcome + "\n\n" + transcript)
 	} else {
-		m.viewport.SetContent(renderTranscript(m.transcript, max(40, m.viewport.Width)))
+		m.viewport.SetContent(welcome)
 	}
 	m.viewport.GotoBottom()
 }
@@ -4340,9 +4357,12 @@ func (m model) renderWelcomeCard(width int) string {
 		defaultModel = "local/coding-runtime"
 	}
 
-	versionStr := Version
-	if versionStr == "" {
-		versionStr = "dev"
+	sessionVal := m.sessionID
+	if sessionVal == "" {
+		sessionVal = m.cfg.SessionID
+	}
+	if sessionVal == "" {
+		sessionVal = "new session"
 	}
 
 	pixelRows := []string{
@@ -4379,18 +4399,18 @@ func (m model) renderWelcomeCard(width int) string {
 		return sb.String()
 	}
 
-	brandStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
 	accentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	cyanBoldStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
 	yellowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
 	whiteItalicStyle := lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("255"))
+	sessionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 
 	metadataLines := []string{
-		brandStyle.Render("❖ BABEL-O") + "  " + mutedStyle.Render("v"+versionStr),
-		cyanBoldStyle.Render(username),
-		yellowStyle.Render(defaultModel),
-		whiteItalicStyle.Render(formattedCwd),
-		accentStyle.Render(mode),
+		mutedStyle.Render("user    = ") + cyanBoldStyle.Render(username),
+		mutedStyle.Render("model   = ") + yellowStyle.Render(defaultModel),
+		mutedStyle.Render("cwd     = ") + whiteItalicStyle.Render(m.cfg.Cwd),
+		mutedStyle.Render("session = ") + sessionStyle.Render(sessionVal),
+		mutedStyle.Render("mode    = ") + accentStyle.Render(mode),
 	}
 
 	var cardLines []string
