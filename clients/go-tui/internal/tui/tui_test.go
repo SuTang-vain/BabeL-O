@@ -256,7 +256,7 @@ func TestConsumeNexusEventUpdatesSessionAndPermissionPanel(t *testing.T) {
 		t.Fatalf("pending permission = %#v, want Bash", m.pending)
 	}
 	view := m.View()
-	if !strings.Contains(view, "BabeL-O Go TUI MVP") {
+	if !strings.Contains(view, "BabeL-O · Go TUI") {
 		t.Fatalf("view does not include title: %q", view)
 	}
 	if !strings.Contains(view, "Permission: Bash") {
@@ -1780,7 +1780,7 @@ func TestRenderContextOverlayShowsHeaderInMode(t *testing.T) {
 	if rendered == "" {
 		t.Fatalf("renderContextOverlay in modeContextOverlay should be non-empty")
 	}
-	for _, want := range []string{"Context · Phase 5 overlay", "· local/coding-runtime", "scroll"} {
+	for _, want := range []string{"Context", "· local/coding-runtime", "scroll"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered context overlay missing %q\nfull:\n%s", want, rendered)
 		}
@@ -2038,7 +2038,7 @@ func TestRenderInboxOverlayShowsHeaderInMode(t *testing.T) {
 	if rendered == "" {
 		t.Fatalf("renderInboxOverlay in modeInboxOverlay should be non-empty")
 	}
-	for _, want := range []string{"Inbox · Phase 6 overlay", "sess_inbox_smoke_abc123", "move", "ack", "close"} {
+	for _, want := range []string{"Inbox", "sess_inbox_smoke_abc123", "move", "ack", "close"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered inbox overlay missing %q\nfull:\n%s", want, rendered)
 		}
@@ -2057,7 +2057,7 @@ func TestRenderInboxOverlayAllVariantSwitchesBanner(t *testing.T) {
 	m.inputMode = modeInboxOverlay
 	m.height = 30
 	rendered := m.renderInboxOverlay(120)
-	if !strings.Contains(rendered, "Inbox · all · Phase 6 overlay") {
+	if !strings.Contains(rendered, "Inbox · all") {
 		t.Fatalf("includeAck should switch the banner, got %q", rendered)
 	}
 }
@@ -2748,7 +2748,7 @@ func TestRenderAgentOverlayShowsHeaderInMode(t *testing.T) {
 		t.Fatalf("renderAgentOverlay in modeAgentOverlay should be non-empty")
 	}
 	for _, want := range []string{
-		"Agent status · Phase 6 PR3+PR6 overlay",
+		"Agents",
 		"sess_age", // shortID of "sess_agents_smoke_xyz"
 		"running 1", "completed 1", "failed 1",
 		"scroll", "close",
@@ -3110,7 +3110,7 @@ func TestRenderTaskBoardShowsHeaderInMode(t *testing.T) {
 		t.Fatalf("renderTaskBoard in modeTaskBoard should be non-empty")
 	}
 	for _, want := range []string{
-		"Task board · Phase 6 PR4 overlay",
+		"Tasks",
 		"sess_tas", // shortID of "sess_tasks_smoke_xyz"
 		"in_progress 1", "blocked 1", "completed 1",
 		"scroll", "close",
@@ -3368,7 +3368,7 @@ func TestRenderActivityOverlayShowsHeaderInMode(t *testing.T) {
 		t.Fatalf("renderActivityOverlay in modeActivityOverlay should be non-empty")
 	}
 	for _, want := range []string{
-		"Recent activity · Phase 6 PR5 overlay",
+		"Activity",
 		"tool_started 1", "permission 1",
 		"Bash echo hi", "permit approved=true",
 		"scroll", "close",
@@ -3565,25 +3565,32 @@ func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
 	}
 }
 
-func TestHeaderIncludesRunningSubAgentBadge(t *testing.T) {
-	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
-	m.sessionID = "sess_sub_agg_2"
+// TestHeaderIsCompactKeepsPathAndSession verifies the slimmed
+// header chrome: title + build metadata + state on row 1, only
+// cwd + session id on row 2. Sub-agent counts are surfaced via
+// the /agents overlay instead of the header.
+func TestHeaderIsCompactKeepsPathAndSession(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
+	m.sessionID = "session_compact_abcdef108000"
 	m.width = 120
 	m.height = 30
 	m.subAgents["agent_sub_1"] = subAgentEntry{ID: "agent_sub_1", Status: subAgentStatusRunning, Title: "investigate"}
-	m.subAgents["agent_sub_2"] = subAgentEntry{ID: "agent_sub_2", Status: subAgentStatusCompleted, Title: "done"}
-	m.subAgents["agent_sub_3"] = subAgentEntry{ID: "agent_sub_3", Status: subAgentStatusRunning, Title: "investigate 2"}
+	m.subAgents["agent_sub_2"] = subAgentEntry{ID: "agent_sub_2", Status: subAgentStatusRunning, Title: "investigate 2"}
 	rendered := m.renderHeader(m.width)
-	if !strings.Contains(rendered, "sub: 2 running") {
-		t.Fatalf("header should surface 'sub: 2 running' badge, got:\n%s", rendered)
+	for _, want := range []string{
+		"BabeL-O · Go TUI",
+		"bbl-go-tui",
+		"cwd=/Users/tangyaoyue/DEV/BABEL/BabeL-O",
+		"session=sess",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("header should include %q, got:\n%s", want, rendered)
+		}
 	}
-	// No sub-agents running: badge must NOT appear.
-	m.subAgents = map[string]subAgentEntry{
-		"agent_sub_1": {ID: "agent_sub_1", Status: subAgentStatusCompleted, Title: "done"},
-	}
-	rendered2 := m.renderHeader(m.width)
-	if strings.Contains(rendered2, "sub: ") {
-		t.Fatalf("header should not include sub badge when no sub-agents running, got:\n%s", rendered2)
+	for _, banned := range []string{"url=", "model=", "profile=", "sub: "} {
+		if strings.Contains(rendered, banned) {
+			t.Fatalf("header should NOT include %q in slimmed chrome, got:\n%s", banned, rendered)
+		}
 	}
 }
 
@@ -3805,7 +3812,7 @@ func TestRenderToolAuditOverlayShowsHeaderInMode(t *testing.T) {
 		t.Fatalf("renderToolAuditOverlay in modeToolAuditOverlay should be non-empty")
 	}
 	for _, want := range []string{
-		"Tools audit · Phase 4 wire overlay",
+		"Tools audit",
 		"execute 1", "read 2",
 		"Read", "Bash", "mcp_filesystem_list",
 		"scroll", "close",

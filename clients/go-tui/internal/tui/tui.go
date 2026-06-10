@@ -23,13 +23,14 @@ import (
 )
 
 type Config struct {
-	BaseURL        string
-	Cwd            string
-	SessionID      string
-	APIKey         string
-	AltScreen      bool
-	PollIntervalMs int
-	PrintVersion   bool
+	BaseURL          string
+	Cwd              string
+	SessionID        string
+	APIKey           string
+	AltScreen        bool
+	PollIntervalMs   int
+	ExecuteTimeoutMs int
+	PrintVersion     bool
 }
 
 type streamStartedMsg struct {
@@ -916,7 +917,7 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/inbox",
-		summary: "open SessionChannel inbox overlay (Phase 6)",
+		summary: "open SessionChannel inbox overlay",
 		run: func(m *model, args []string) tea.Cmd {
 			// Sub-commands: "/inbox all" and "/inbox ack <messageId>".
 			// Bare "/inbox" fetches unread-only (matches the TS TUI
@@ -945,13 +946,13 @@ var slashCommands = []slashCommand{
 		name:    "/models",
 		summary: "list models (TODO: wire to /v1/runtime/models)",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/models not yet implemented in Go TUI MVP")
+			m.appendLine("status", "/models not yet implemented in Go TUI")
 			return nil
 		},
 	},
 	{
 		name:    "/tools",
-		summary: "open tool audit overlay (Phase 4 wire)",
+		summary: "open tool audit overlay",
 		run: func(m *model, _ []string) tea.Cmd {
 			// Phase 4 wire: GET /v1/tools/audit replaces the
 			// static catalog. On wire success the overlay shows
@@ -968,20 +969,20 @@ var slashCommands = []slashCommand{
 		name:    "/sessions",
 		summary: "list sessions (TODO: wire to /v1/sessions)",
 		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/sessions not yet implemented in Go TUI MVP")
+			m.appendLine("status", "/sessions not yet implemented in Go TUI")
 			return nil
 		},
 	},
 	{
 		name:    "/tasks",
-		summary: "open task board overlay (Phase 6 PR4)",
+		summary: "open task board overlay",
 		run: func(m *model, _ []string) tea.Cmd {
 			return m.fetchSessionTasksWithSession()
 		},
 	},
 	{
 		name:    "/activity",
-		summary: "open recent activity overlay (Phase 6 PR5)",
+		summary: "open recent activity overlay",
 		run: func(m *model, _ []string) tea.Cmd {
 			// No HTTP round-trip — the activity buffer is
 			// populated by consumeNexusEvent as the user
@@ -996,7 +997,7 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/agents",
-		summary: "open multi-agent status overlay (Phase 6 PR3)",
+		summary: "open multi-agent status overlay",
 		run: func(m *model, _ []string) tea.Cmd {
 			return m.fetchSessionAgentsWithSession()
 		},
@@ -1156,19 +1157,27 @@ func (m *model) runPaletteSelection() tea.Cmd {
 }
 
 var (
-	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	statusStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
-	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	toolStyle        = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
-	permissionStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	confirmStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
-	contextStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	assistantStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	userStyle        = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	thinkingStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-	dividerStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	footerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("39"))
+	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
+	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	assistantStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	userStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	thinkingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	dividerStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	footerStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	// overlayFrameStyle wraps every read-only overlay (help,
+	// profile confirm, context, inbox, agents, tasks, activity,
+	// tools audit) in a muted normal border so they read as
+	// distinct panels instead of running into the transcript.
+	overlayFrameStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("238")).
+				Padding(0, 1)
 	focusedLineStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("252"))
 	inboxStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("33"))
 	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
@@ -1210,7 +1219,7 @@ func newModel(cfg Config) model {
 		spinner:   spin,
 		inputMode: modeComposing,
 		transcript: []transcriptLine{
-			{kind: "status", text: "Go TUI MVP connected to the Nexus stream API."},
+			{kind: "status", text: "Go TUI connected to the Nexus stream API."},
 			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
 		},
 		seenInboxCardMessageIDs: map[string]struct{}{},
@@ -1271,10 +1280,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case modePermission:
 			switch strings.ToLower(key) {
 			case "a", "y":
-				m.sendPermissionDecision(true, "Approved from Go TUI MVP")
+				m.sendPermissionDecision(true, "Approved from Go TUI")
 				return m, nil
 			case "r", "n", "esc":
-				m.sendPermissionDecision(false, "Rejected from Go TUI MVP")
+				m.sendPermissionDecision(false, "Rejected from Go TUI")
 				return m, nil
 			}
 			// While the permission panel is up, any other key is
@@ -1948,11 +1957,11 @@ var helpOverlayLines = []string{
 	"  y / enter        confirm the pending profile switch",
 	"  n / esc          cancel and stay on the current profile",
 	"",
-	"Context overlay (Phase 5 续):",
+	"Context overlay:",
 	"  up / down / tab  scroll through the context analysis",
 	"  esc / enter / q  close the overlay",
 	"",
-	"Inbox overlay (Phase 6 §1 + PR2):",
+	"Inbox overlay:",
 	"  /inbox           open SessionChannel inbox (unread-only)",
 	"  /inbox all       include acknowledged messages",
 	"  /inbox ack <id>  acknowledge a single message",
@@ -1961,23 +1970,23 @@ var helpOverlayLines = []string{
 	"  q / c            quote the selected message into the prompt",
 	"  esc / enter      close the overlay",
 	"",
-	"Agent status overlay (Phase 6 PR3):",
+	"Agent status overlay:",
 	"  /agents          open multi-agent status for the current session",
 	"  up / down / tab  scroll through the agent jobs list",
 	"  esc / enter / q  close the overlay",
 	"",
-	"Task board overlay (Phase 6 PR4):",
+	"Task board overlay:",
 	"  /tasks           open task board for the current session",
 	"  up / down / tab  scroll through the task list",
 	"  esc / enter / q  close the overlay",
 	"",
-	"Recent activity overlay (Phase 6 PR5):",
+	"Recent activity overlay:",
 	"  /activity        open recent activity (tool runs, permission,",
 	"                   agent job events, context warnings)",
 	"  up / down / tab  scroll through the recent events",
 	"  esc / enter / q  close the overlay",
 	"",
-	"Tool audit overlay (Phase 4 wire):",
+	"Tool audit overlay:",
 	"  /tools           open /v1/tools/audit (real Nexus wire;",
 	"                   static fallback if the endpoint is down)",
 	"  up / down / tab  scroll through the tool entries",
@@ -2011,7 +2020,7 @@ func (m model) renderHelp(width int) string {
 	if m.inputMode != modeHelpOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Help · Phase 3 overlay")
+	header := titleStyle.Render("Help")
 	lines := []string{header, divider(width)}
 	// Clamp helpScroll so the user can't scroll past the end.
 	visibleRows := max(0, m.height-12)
@@ -2032,7 +2041,7 @@ func (m model) renderHelp(width int) string {
 		}
 		lines = append(lines, helpOverlayLines[m.helpScroll:end]...)
 	}
-	return strings.Join(lines, "\n")
+	return renderOverlayFrame(width, strings.Join(lines, "\n"))
 }
 
 // renderProfileConfirm paints the y/n confirmation overlay for a
@@ -2059,7 +2068,7 @@ func (m model) renderProfileConfirm(width int) string {
 	lines = append(lines, "  y / enter   confirm and switch")
 	lines = append(lines, "  n / esc     cancel and stay on the current profile")
 	body := strings.Join(lines, "\n")
-	return strings.Join([]string{divider(width), confirmStyle.Render(wrapPlain(body, max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, confirmStyle.Render(wrapPlain(body, max(0, width-2))))
 }
 
 // renderContextOverlay paints the multi-line context analysis
@@ -2074,8 +2083,7 @@ func (m model) renderContextOverlay(width int) string {
 	if len(m.contextOverlayLines) == 0 {
 		return ""
 	}
-	header := titleStyle.Render("Context · Phase 5 overlay")
-	divider := divider(width)
+	header := titleStyle.Render("Context")
 	// Reserve one row for header, one for the bottom hint, and one
 	// for a scroll indicator. The remaining rows are the visible
 	// window of contextOverlayLines.
@@ -2097,7 +2105,8 @@ func (m model) renderContextOverlay(width int) string {
 	scrollHint := fmt.Sprintf("  scroll %d/%d", start+1, len(m.contextOverlayLines))
 	footerHint := "  up/down/tab scroll  esc/enter/q close"
 	plain := strings.Join([]string{body, scrollHint, footerHint}, "\n")
-	return strings.Join([]string{divider, contextStyle.Render(wrapPlain(plain, max(0, width-2)))}, "\n") + "\n" + header + "\n" + divider
+	content := strings.Join([]string{header, contextStyle.Render(wrapPlain(plain, max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, content)
 }
 
 // buildContextOverlayLines turns the raw /v1/sessions/:id/context
@@ -2775,9 +2784,9 @@ func (m model) renderInboxOverlay(width int) string {
 	if m.inputMode != modeInboxOverlay {
 		return ""
 	}
-	banner := "Inbox · Phase 6 overlay"
+	banner := "Inbox"
 	if m.inboxOverlayIncludeAck {
-		banner = "Inbox · all · Phase 6 overlay"
+		banner = "Inbox · all"
 	}
 	header := titleStyle.Render(banner)
 	summary := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels)
@@ -2805,7 +2814,7 @@ func (m model) renderInboxOverlay(width int) string {
 	}
 	hint := "↑/↓/Tab move · a ack selected · esc/enter/q close"
 	lines = append(lines, mutedStyle.Render(hint))
-	return strings.Join([]string{divider(width), inboxStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, inboxStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
 // quoteInboxMessageContent renders a multi-line block that can be
@@ -3017,7 +3026,7 @@ func (m model) renderAgentOverlay(width int) string {
 	if m.inputMode != modeAgentOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Agent status · Phase 6 PR3+PR6 overlay · " + shortID(m.sessionID))
+	header := titleStyle.Render("Agents · " + shortID(m.sessionID))
 	summary := summarizeAgentJobs(m.agentJobs)
 	if subCount := m.subAgentRunningCount(); subCount > 0 {
 		// Phase 6 PR6: include the running sub-agent count in
@@ -3048,7 +3057,7 @@ func (m model) renderAgentOverlay(width int) string {
 	lines = append(lines, allLines...)
 	hint := "↑/↓/Tab scroll · esc/enter/q close"
 	lines = append(lines, mutedStyle.Render(hint))
-	return strings.Join([]string{divider(width), agentStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, agentStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
 // summarizeAgentJobs is the per-status count line shown at the
@@ -3231,7 +3240,7 @@ func (m model) renderTaskBoard(width int) string {
 	if m.inputMode != modeTaskBoard {
 		return ""
 	}
-	header := titleStyle.Render("Task board · Phase 6 PR4 overlay · " + shortID(m.sessionID))
+	header := titleStyle.Render("Tasks · " + shortID(m.sessionID))
 	summary := summarizeTaskBoard(m.taskBoard)
 	visibleRows := max(1, m.height-10)
 	allLines := buildTaskBoardLines(m.taskBoard)
@@ -3253,7 +3262,7 @@ func (m model) renderTaskBoard(width int) string {
 	lines = append(lines, allLines...)
 	hint := "↑/↓/Tab scroll · esc/enter/q close"
 	lines = append(lines, mutedStyle.Render(hint))
-	return strings.Join([]string{divider(width), taskBoardStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, taskBoardStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
 // formatActivityKindIcon returns a short, terminal-friendly
@@ -3344,7 +3353,7 @@ func (m model) renderActivityOverlay(width int) string {
 	if m.inputMode != modeActivityOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Recent activity · Phase 6 PR5 overlay")
+	header := titleStyle.Render("Activity")
 	summary := summarizeActivityEvents(m.activityEvents)
 	visibleRows := max(1, m.height-10)
 	allLines := buildActivityOverlayLines(m.activityEvents)
@@ -3366,7 +3375,7 @@ func (m model) renderActivityOverlay(width int) string {
 	lines = append(lines, allLines...)
 	hint := "↑/↓/Tab scroll · esc/enter/q close"
 	lines = append(lines, mutedStyle.Render(hint))
-	return strings.Join([]string{divider(width), activityStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, activityStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
 // formatToolRiskIcon returns a short, terminal-friendly risk
@@ -3516,7 +3525,7 @@ func (m model) renderToolAuditOverlay(width int) string {
 	if m.inputMode != modeToolAuditOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Tools audit · Phase 4 wire overlay")
+	header := titleStyle.Render("Tools audit")
 	summary := summarizeToolAudit(m.toolAuditEntries)
 	visibleRows := max(1, m.height-10)
 	allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
@@ -3538,7 +3547,7 @@ func (m model) renderToolAuditOverlay(width int) string {
 	lines = append(lines, allLines...)
 	hint := "↑/↓/Tab scroll · esc/enter/q close"
 	lines = append(lines, mutedStyle.Render(hint))
-	return strings.Join([]string{divider(width), toolPaletteStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+	return renderOverlayFrame(width, toolPaletteStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
@@ -3622,24 +3631,42 @@ func (m model) renderSlashPalette(width int) string {
 		return ""
 	}
 	matched := filterSlashCommands(m.paletteFilter)
-	visible := 6
-	if len(matched) < visible {
-		visible = len(matched)
+	// visibleHeight mirrors the TS TUI's slash palette (8 rows);
+	// it keeps the palette compact enough to read at a glance
+	// while letting the user scroll through longer filtered lists
+	// (the static catalog has ~20 entries, so we need paging).
+	const visibleHeight = 8
+	total := len(matched)
+	visible := total
+	if visible > visibleHeight {
+		visible = visibleHeight
+	}
+	scrollOffset := 0
+	if m.paletteSelected >= visibleHeight {
+		scrollOffset = m.paletteSelected - visibleHeight + 1
+	}
+	if scrollOffset+visible > total {
+		scrollOffset = max(0, total-visible)
 	}
 	header := titleStyle.Render("Slash · " + "/" + m.paletteFilter)
 	lines := []string{header, divider(width)}
-	if visible == 0 {
+	if total == 0 {
 		lines = append(lines, mutedStyle.Render("  (no commands match)"))
 	} else {
 		// Clamp selection to a valid range in case the filter shrank.
 		idx := m.paletteSelected
-		if idx < 0 || idx >= visible {
+		if idx < 0 || idx >= total {
 			idx = 0
 		}
+		remainingAbove := scrollOffset
+		if remainingAbove > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", remainingAbove)))
+		}
 		for i := 0; i < visible; i++ {
-			c := matched[i]
+			actualIdx := scrollOffset + i
+			c := matched[actualIdx]
 			marker := "  "
-			if i == idx {
+			if actualIdx == idx {
 				marker = "> "
 			}
 			hint := c.argHint
@@ -3651,10 +3678,14 @@ func (m model) renderSlashPalette(width int) string {
 				hint = "→ run"
 			}
 			line := fmt.Sprintf("%s%s    %s    %s", marker, c.name, hint, mutedStyle.Render(c.summary))
-			if i == idx {
+			if actualIdx == idx {
 				line = focusedLineStyle.Render(line)
 			}
 			lines = append(lines, line)
+		}
+		remainingBelow := total - (scrollOffset + visible)
+		if remainingBelow > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
 		}
 	}
 	lines = append(lines, mutedStyle.Render("↑↓/Tab navigate · Enter select · Esc cancel"))
@@ -3662,41 +3693,35 @@ func (m model) renderSlashPalette(width int) string {
 }
 
 func (m model) renderHeader(width int) string {
-	title := titleStyle.Render("BabeL-O Go TUI MVP")
-	state := "idle"
+	// Row 1: brand title + build metadata + run state. `dev`
+	// lives next to the title so the user sees the build tag
+	// without scanning a third line.
+	title := titleStyle.Render("BabeL-O · Go TUI")
+	build := mutedStyle.Render("· " + versionString())
+	stateLabel := "idle"
 	if m.running {
-		state = m.spinner.View() + " running"
+		stateLabel = m.spinner.View() + " running"
 	}
 	if m.pending != nil {
-		state = "permission pending"
+		stateLabel = "permission pending"
 	}
+	state := stateStyle(m.running, m.pending).Render(stateLabel)
+	top := joinColumns(width, title+" "+build, state)
 
+	// Row 2: workspace path + session id only. URL is omitted
+	// from the header chrome — it lives in /config output and
+	// the bbl CLI; the header just needs enough to identify
+	// which cwd / session this TUI is bound to.
 	session := "new session"
 	if m.sessionID != "" {
 		session = shortID(m.sessionID)
 	}
-	model := m.modelID
-	if model == "" {
-		model = "model pending"
-	}
-	profile := firstNonEmpty(m.activeProfile, "none")
-	top := joinColumns(width, title, statusStyle.Render(state))
-	meta := fmt.Sprintf("url=%s  cwd=%s  session=%s  model=%s  profile=%s", m.cfg.BaseURL, m.cfg.Cwd, session, model, profile)
-	if m.configVersion > 0 || m.profileCount > 0 || m.tombstoneCount > 0 {
-		meta += fmt.Sprintf("  config=v%d profiles=%d tombstones=%d", m.configVersion, m.profileCount, m.tombstoneCount)
-	}
-	// Phase 6 PR6: surface a running sub-agent badge in the
-	// header meta line so the user can see AgentLoop
-	// sub-agents in flight without opening the /agents
-	// overlay. The badge is only appended when at least one
-	// sub-agent is running; the count comes from the
-	// in-memory aggregator (no Nexus round-trip).
-	if subRunning := m.subAgentRunningCount(); subRunning > 0 {
-		meta += fmt.Sprintf("  sub: %d running", subRunning)
-	}
+	pathLine := mutedStyle.Render(truncatePlain(
+		fmt.Sprintf("cwd=%s  session=%s", m.cfg.Cwd, session), width))
+
 	return strings.Join([]string{
 		top,
-		mutedStyle.Render(truncatePlain(meta, width)),
+		pathLine,
 		divider(width),
 	}, "\n")
 }
@@ -3770,6 +3795,9 @@ func (m model) renderInput(width int) string {
 }
 
 func (m model) renderFooter(width int) string {
+	// Row 1: the keyboard hint + elapsed time + quit reminder.
+	// Coloured by run state so idle / running / permission-pending
+	// read distinctly without scanning the header.
 	hint := "enter submit"
 	if m.running {
 		hint = "waiting for Nexus events"
@@ -3781,14 +3809,27 @@ func (m model) renderFooter(width int) string {
 	if !m.startedAt.IsZero() && m.running {
 		elapsed = fmt.Sprintf("  elapsed=%s", time.Since(m.startedAt).Round(time.Second))
 	}
-	inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels)
-	if inbox != "" {
-		// The footer is a single line: keep the hint short and
-		// append the inbox status with a leading "  · " so the
-		// user can still spot the keyboard hint at a glance.
-		inbox = "  · " + inbox
+	topRow := footerStyle.Render(truncatePlain(
+		fmt.Sprintf("%s%s  ctrl+c quit  q quit when idle", hint, elapsed), width))
+
+	// Row 2: side-channel summary — inbox / agents / pending
+	// reminders. Kept as a separate muted line so the keyboard
+	// hint on row 1 stays scannable.
+	var sideParts []string
+	if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
+		sideParts = append(sideParts, inbox)
 	}
-	return footerStyle.Render(truncatePlain(fmt.Sprintf("%s%s%s  ctrl+c quit  q quit when idle", hint, elapsed, inbox), width))
+	if subRunning := m.subAgentRunningCount(); subRunning > 0 {
+		sideParts = append(sideParts, fmt.Sprintf("sub-agents running: %d", subRunning))
+	}
+	bottomRow := ""
+	if len(sideParts) > 0 {
+		bottomRow = mutedStyle.Render(truncatePlain(strings.Join(sideParts, "  · "), width))
+	}
+	if bottomRow == "" {
+		return topRow
+	}
+	return topRow + "\n" + bottomRow
 }
 
 // fetchInboxWithSession is the gated entry point the /inbox slash
@@ -3979,7 +4020,7 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.appendStreamingLine("assistant", stringField(event, "text"))
 	case "thinking_delta":
 		m.appendStreamingLine("thinking", stringField(event, "text"))
-	case "tool_started", "tool_completed", "tool_denied", "permission_response", "context_warning", "context_blocking", "usage", "hook_started", "hook_completed", "hook_failed":
+	case "tool_started", "tool_denied", "permission_response", "context_warning", "context_blocking", "usage":
 		m.appendLine(eventType, formatNexusEvent(event))
 		// Phase 6 PR5: record high-signal events into the
 		// in-memory activity buffer for the /activity overlay.
@@ -3990,8 +4031,6 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		switch eventType {
 		case "tool_started":
 			m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
-		case "tool_completed":
-			m.recordActivityEvent(activityKindToolCompleted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
 		case "permission_response":
 			m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
 		case "context_warning":
@@ -3999,6 +4038,18 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
+	case "tool_completed":
+		// Compact transcript: skip tool completion lines so the
+		// transcript shows one row per tool call (the started
+		// row stays). The activity overlay still records the
+		// completion so /activity remains useful for triage.
+		m.recordActivityEvent(activityKindToolCompleted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+	case "hook_started", "hook_completed", "hook_failed":
+		// Hook events are intentionally NOT rendered in the
+		// transcript: InvocationDiagnosticsHook fires before /
+		// after every tool call and clutters the chat log
+		// without informing the operator. Activity overlay
+		// and tool audit ignore them too.
 	case "agent_job_event":
 		m.appendLine("agent_job", formatNexusEvent(event))
 		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
@@ -4251,6 +4302,23 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 	}
 }
 
+func formatExecuteSummary(event map[string]any) string {
+	duration := anyInt(event["executeDurationMs"])
+	timeoutMs := anyInt(event["timeoutMs"])
+	outcome := firstNonEmpty(stringField(event, "outcome"), "unknown")
+	near := event["nearTimeout"] == true
+	budget := fmt.Sprintf("dur=%dms timeoutMs=%d", duration, timeoutMs)
+	if timeoutMs > 0 {
+		pct := duration * 100 / timeoutMs
+		budget = fmt.Sprintf("dur=%dms/%dms (%d%%)", duration, timeoutMs, pct)
+	}
+	hint := ""
+	if near {
+		hint = " near-timeout"
+	}
+	return fmt.Sprintf("execute_summary outcome=%s%s %s", outcome, hint, budget)
+}
+
 func formatNexusEvent(event map[string]any) string {
 	eventType := stringField(event, "type")
 	switch eventType {
@@ -4259,8 +4327,19 @@ func formatNexusEvent(event map[string]any) string {
 	case "thinking_delta":
 		return stringField(event, "text")
 	case "tool_started":
-		return fmt.Sprintf("%s running %s", stringField(event, "name"), compactJSON(event["input"]))
+		// Compact single-line form mirroring the bbl chat TS TUI:
+		// "● ToolName(args) (ctrl+o to expand)". The args string
+		// comes from formatToolInput so the most useful field
+		// (path / pattern / command) is highlighted without the
+		// caller scanning raw JSON.
+		name := stringField(event, "name")
+		args := formatToolInput(name, event["input"])
+		return fmt.Sprintf("● %s(%s)  (ctrl+o to expand)", name, args)
 	case "tool_completed":
+		// Kept here so formatNexusEvent remains callable from
+		// tests / future renderers; consumeNexusEvent no longer
+		// appends tool_completed to the transcript (the
+		// compact tool_started row is the only chat line).
 		return strings.TrimSpace(fmt.Sprintf(
 			"%s done success=%v %s",
 			stringField(event, "name"),
@@ -4268,7 +4347,9 @@ func formatNexusEvent(event map[string]any) string {
 			summarizeToolOutput(event["output"]),
 		))
 	case "tool_denied":
-		return fmt.Sprintf("%s denied %s", stringField(event, "name"), stringField(event, "reason"))
+		name := stringField(event, "name")
+		args := formatToolInput(name, event["input"])
+		return fmt.Sprintf("● %s(%s)  denied: %s", name, args, stringField(event, "reason"))
 	case "permission_request":
 		return fmt.Sprintf("%s (%s risk)", stringField(event, "name"), stringField(event, "risk"))
 	case "permission_response":
@@ -4307,10 +4388,16 @@ func formatNexusEvent(event map[string]any) string {
 		return fmt.Sprintf("trigger=%s reason=%s chars=%d events=%d", stringField(event, "trigger"), firstNonEmpty(stringField(event, "reason"), "n/a"), anyInt(event["summaryChars"]), anyInt(event["eventCount"]))
 	case "execution_metrics":
 		return fmt.Sprintf("dur=%dms input=%d output=%d tools=%d firstToken=%dms", anyInt(event["executeDurationMs"]), anyInt(event["inputTokens"]), anyInt(event["outputTokens"]), anyInt(event["toolCallCount"]), anyInt(event["providerFirstTokenMs"]))
+	case "execute_summary":
+		return formatExecuteSummary(event)
 	case "result":
 		return fmt.Sprintf("success=%v %s", event["success"], firstNonEmpty(stringField(event, "message"), stringField(event, "text")))
 	case "error":
-		return strings.TrimSpace(fmt.Sprintf("%s %s", stringField(event, "code"), stringField(event, "message")))
+		code := stringField(event, "code")
+		if hint, ok := friendlyNexusError(code, event); ok {
+			return hint
+		}
+		return strings.TrimSpace(fmt.Sprintf("%s %s", code, stringField(event, "message")))
 	default:
 		return compactJSON(event)
 	}
@@ -4864,6 +4951,14 @@ func friendlyNexusError(code string, payload map[string]any) (string, bool) {
 		return "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI", true
 	case "missing_profile":
 		return "missing profile name in request body", true
+	case "REQUEST_TIMEOUT":
+		timeout := anyInt(payload["timeoutMs"])
+		if timeout > 0 {
+			return fmt.Sprintf("turn exceeded %dms execute timeout (REQUEST_TIMEOUT); consider shorter context, fewer tool calls, or a higher --execute-timeout-ms", timeout), true
+		}
+		return "turn exceeded Nexus execute timeout (REQUEST_TIMEOUT); consider shorter context, fewer tool calls, or a higher --execute-timeout-ms", true
+	case "REQUEST_CANCELLED":
+		return "turn was cancelled (REQUEST_CANCELLED); no retry needed", true
 	}
 	return "", false
 }
@@ -5112,6 +5207,21 @@ func firstLine(s string, maxLen int) string {
 	return s
 }
 
+// buildExecuteRequest assembles the WebSocket payload sent to /v1/stream.
+// timeoutMs is only emitted when positive so the Nexus default 30s budget
+// remains the fallback for callers that explicitly opt out (cfg.ExecuteTimeoutMs = 0).
+func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
+	payload := map[string]any{
+		"prompt":    prompt,
+		"cwd":       cfg.Cwd,
+		"sessionId": sessionID,
+	}
+	if cfg.ExecuteTimeoutMs > 0 {
+		payload["timeoutMs"] = cfg.ExecuteTimeoutMs
+	}
+	return payload
+}
+
 func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
 	defer close(eventCh)
 
@@ -5164,11 +5274,7 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 	}
 
 	writeMu.Lock()
-	err = conn.WriteJSON(map[string]any{
-		"prompt":    prompt,
-		"cwd":       cfg.Cwd,
-		"sessionId": sessionID,
-	})
+	err = conn.WriteJSON(buildExecuteRequest(cfg, sessionID, prompt))
 	writeMu.Unlock()
 	if err != nil {
 		eventCh <- streamEvent{err: err}
@@ -5259,6 +5365,30 @@ func shortID(id string) string {
 
 func divider(width int) string {
 	return dividerStyle.Render(strings.Repeat("-", max(0, width)))
+}
+
+// renderOverlayFrame wraps a single block of overlay text in the
+// shared overlayFrameStyle border. The inner content is sized to
+// width-2 so it fits inside the left/right border columns; lines
+// are joined with "\n" so callers can keep returning a string.
+func renderOverlayFrame(width int, content string) string {
+	return overlayFrameStyle.Width(max(0, width-2)).Render(content)
+}
+
+// stateStyle returns the colour for the current run state. Idle
+// uses mutedStyle so the header chrome is quiet when nothing is
+// happening; running switches to statusStyle (cyan) to mirror the
+// spinner colour; a pending permission switches to permissionStyle
+// (yellow) so the operator sees the decision is on them.
+func stateStyle(running bool, pending *pendingPermission) lipgloss.Style {
+	switch {
+	case pending != nil:
+		return permissionStyle
+	case running:
+		return statusStyle
+	default:
+		return mutedStyle
+	}
 }
 
 func joinColumns(width int, left string, right string) string {

@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/sutang-vain/babel-o/clients/go-tui/internal/tui"
 )
@@ -32,5 +33,20 @@ func parseFlags() tui.Config {
 	flag.BoolVar(&cfg.PrintVersion, "v", false, "print version and exit (shorthand)")
 	flag.Parse()
 	cfg.APIKey = os.Getenv("NEXUS_API_KEY")
+	// Apply the default per-turn execute timeout for the WebSocket /v1/stream
+	// payload. The Nexus server-side default is 30s which is too tight for
+	// long multi-tool turns, so we send a 3-minute budget by default and
+	// still let explicit --execute-timeout-ms (or env BABEL_O_GO_TUI_TIMEOUT_MS)
+	// override it via Config.ExecuteTimeoutMs.
+	if cfg.ExecuteTimeoutMs <= 0 {
+		if v := os.Getenv("BABEL_O_GO_TUI_TIMEOUT_MS"); v != "" {
+			if parsed, err := strconv.Atoi(v); err == nil && parsed > 0 {
+				cfg.ExecuteTimeoutMs = parsed
+			}
+		}
+		if cfg.ExecuteTimeoutMs <= 0 {
+			cfg.ExecuteTimeoutMs = 180_000
+		}
+	}
 	return cfg
 }
