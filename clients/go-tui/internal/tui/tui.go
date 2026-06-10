@@ -1176,7 +1176,7 @@ var (
 	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18"))
 	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
 	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
@@ -4192,7 +4192,7 @@ func (m *model) appendStreamingLine(kind string, text string) {
 	if text == "" {
 		return
 	}
-	if m.lastEventType == kind+"_delta" && len(m.transcript) > 0 {
+	if len(m.transcript) > 0 {
 		last := &m.transcript[len(m.transcript)-1]
 		if last.kind == kind {
 			last.text += text
@@ -4405,18 +4405,12 @@ func (m model) renderWelcomeCard(width int) string {
 		return sb.String()
 	}
 
-	accentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
-	cyanBoldStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
-	yellowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
-	whiteItalicStyle := lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("255"))
-	sessionStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-
 	metadataLines := []string{
-		mutedStyle.Render("user    = ") + cyanBoldStyle.Render(username),
-		mutedStyle.Render("model   = ") + yellowStyle.Render(defaultModel),
-		mutedStyle.Render("cwd     = ") + whiteItalicStyle.Render(m.cfg.Cwd),
-		mutedStyle.Render("session = ") + sessionStyle.Render(sessionVal),
-		mutedStyle.Render("mode    = ") + accentStyle.Render(mode),
+		"user    " + username,
+		"model   " + defaultModel,
+		"cwd     " + formattedCwd,
+		"session " + sessionVal,
+		"mode    " + mode,
 	}
 
 	var cardLines []string
@@ -5838,6 +5832,24 @@ func visualWidth(r rune) int {
 	return 1
 }
 
+func canBreakAt(runes []rune, idx int) bool {
+	if idx <= 0 || idx >= len(runes) {
+		return true
+	}
+	rLeft := runes[idx-1]
+	rRight := runes[idx]
+	if isBreakRune(rLeft) || rLeft == '\n' || rLeft == '\r' {
+		return true
+	}
+	if isBreakRune(rRight) || rRight == '\n' || rRight == '\r' {
+		return true
+	}
+	if visualWidth(rLeft) == 2 || visualWidth(rRight) == 2 {
+		return true
+	}
+	return false
+}
+
 func wrapParagraph(text string, width int) []string {
 	if text == "" {
 		return []string{""}
@@ -5853,10 +5865,10 @@ func wrapParagraph(text string, width int) []string {
 		// Try to break on a nearby whitespace / punctuation
 		// boundary for readability.
 		breakAt := cut
-		for breakAt > 0 && breakAt > cut-24 && !isBreakRune(runes[breakAt-1]) && !isBreakRune(runes[breakAt]) {
+		for breakAt > 0 && !canBreakAt(runes, breakAt) {
 			breakAt--
 		}
-		if breakAt > 0 && visualLen(runes[:breakAt]) >= width*3/4 {
+		if breakAt > 0 {
 			cut = breakAt
 		}
 		if cut <= 0 {
@@ -5909,7 +5921,7 @@ func padRight(text string, width int) string {
 }
 
 func isBreakRune(value rune) bool {
-	return value == ' ' || value == '\t' || value == '/' || value == ',' || value == ';' || value == ':'
+	return value == ' ' || value == '\t' || value == '/' || value == ',' || value == ';' || value == ':' || value == '-'
 }
 
 func max(a, b int) int {
