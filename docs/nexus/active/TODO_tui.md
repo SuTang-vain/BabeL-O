@@ -80,14 +80,14 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 当前 P2 Advanced CLI/TUI 无打开实现项；SessionChannel 关系可见化已进入 P2 / Watch 参考规划，后续只在真实显示回归、PTY smoke drift、dashboard/agent UX 需要、关系可见化实现启动或发起侧 UX 明确时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
 
-## P3 / Long-term Go TUI Rewrite
+## Watch / Stable Go TUI Maintenance
 
-> 详细规划见 [Go TUI Long-Term Rewrite Plan](../reference/go-tui-rewrite-plan.md)。Go TUI 是长期实验交互客户端，不替代当前生产默认 `bbl chat`，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
+> 详细规划见 [Go TUI Long-Term Rewrite Plan](../reference/go-tui-rewrite-plan.md)。Go TUI 已通过 Phase 9 promotion gate，作为 `bbl chat` 的 stable opt-in alternative；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
 
 当前状态：
 
-- `clients/go-tui/` 已落地 Bubble Tea MVP。
-- `bbl go` 已接入 CLI，优先运行本地 Go TUI binary，缺失时 fallback 到 `go run .`；wrapper 会先探活 `GET /health`，本地 URL 不健康时自动拉起 managed Nexus child，远程 URL 或 `--no-start-nexus` 只连接不启动。
+- `clients/go-tui/` 已采用标准 Go layout：`cmd/go-tui/` 为 executable entry，`internal/tui/` 为核心 TUI package 与白盒状态机测试，`bin/` 为本地 build output 且被 git ignore。
+- `bbl go` 已接入 CLI，优先运行本地 Go TUI binary（source checkout 下为 `clients/go-tui/bin/go-tui`），缺失时 fallback 到 `go run ./cmd/go-tui`；wrapper 会先探活 `GET /health`，本地 URL 不健康时自动拉起 managed Nexus child，远程 URL 或 `--no-start-nexus` 只连接不启动。
 - MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
 - 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
 - Go TUI 已开始消费共享模型配置：启动时拉取 `GET /v1/runtime/config`，header 展示 active profile；`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus HTTP API 读取/切换 profile，不作为 agent prompt 发送。
@@ -254,7 +254,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - 范围克制：ack / cancel 按钮（per-tool approval gate、allow-rule editing）留 CLI（`bbl tools policy`），Go TUI 保持只读。`inputSchema` 字段以 `map[string]any` 形式保留在 typed struct 里但不在 overlay 行展示。`/v1/tools/audit` 是全局端点不**走** end-of-turn auto-refresh——audit 是 runtime 视图不是 session 视图。
 - [x] Phase 8 剩余：version reporting + prebuilt release pipeline + bbl go --check（2026-06-10 收口）。
   - **PR1 (version reporting)**: Go TUI `--version` / `-v` flag + `versionString()` + `majorVersion()` + `isGoTuiMajorCompatible()`（`clients/go-tui/version.go`）；`Makefile` 嵌入 -ldflags 注入 `Version` / `Commit` / `BuildDate`（`make build` 从 `package.json` + `git rev-parse --short HEAD` + `date -u` 构造）；`config.printVersion` 短路 main()；`runtimeVersionCompat` / `runtimeVersionResponse` / `runtimeVersionMsg` typed msg + `checkRuntimeVersion(cfg)` HTTP command + `Init()` 启动时 fire + `case runtimeVersionMsg` mismatch 警告。Nexus 端：`GET /v1/runtime/version` 返回 `serverVersion`（`readOwnPackageVersion()` helper 从 `package.json` 读）+ `schemaVersion` + `goTuiCompatibility` / `nodeCliCompatibility` 兼容范围（当前 `[0]`，未来 bump 手动维护）。
-  - **PR2 (prebuilt release + multi-path discovery)**: `.github/workflows/go-tui-release.yml` triggers on `go-tui-v*` tag push，matrix-builds 5 个目标（darwin-arm64 / darwin-x64 / linux-x64 / linux-arm64 / windows-x64.exe），`make build` + `--version` 验证 build metadata + 重命名为 `bbl-go-tui-<os>-<arch>` + 上传 GitHub Release + mirror `dist/go-tui/`。Launcher: `collectGoTuiBinaryCandidates(input)` 6 步搜索（`--binary` / `BABEL_O_GO_TUI_BINARY` / `BABEL_O_GO_TUI_PACKAGE_BINARY` / `<packageRoot>/bin/go-tui-<platform>-<arch>` / `<sourceDir>/go-tui` / XDG user-local）；`createGoTuiLaunchSpec` 改用候选列表迭代；`platformSuffix(platform)` 集中管理 canonical 段；`defaultGoTuiBinaryName(platform)` 保留 legacy 名字。
+  - **PR2 (prebuilt release + multi-path discovery)**: `.github/workflows/go-tui-release.yml` triggers on `go-tui-v*` tag push，matrix-builds 5 个目标（darwin-arm64 / darwin-x64 / linux-x64 / linux-arm64 / windows-x64.exe），`make build` + `--version` 验证 build metadata + 重命名为 `bbl-go-tui-<os>-<arch>` + 上传 GitHub Release + mirror `dist/go-tui/`。Launcher: `collectGoTuiBinaryCandidates(input)` 6 步搜索（`--binary` / `BABEL_O_GO_TUI_BINARY` / `BABEL_O_GO_TUI_PACKAGE_BINARY` / `<packageRoot>/bin/go-tui-<platform>-<arch>` / `<sourceDir>/bin/go-tui` / XDG user-local）；`createGoTuiLaunchSpec` 改用候选列表迭代；`platformSuffix(platform)` 集中管理 canonical 段；`defaultGoTuiBinaryName(platform)` 保留平台二进制文件名。
   - **PR3 (bbl go --check + clearer errors)**: `bbl go --check` 子命令 + `goTuiCheckReport` 函数：3 块报告（Go TUI launchability / Nexus health / version compat），FAIL exit 1、WARN exit 0（CI 友好）。改进 `child.on('error')` 错误消息：之前只说 "Install Go or build..."，新消息明确指引 prebuilt release 路径。
   - 18 个新单测（8 Go + 2 TS endpoint + 9 launcher + 5 --check = 24，但 8 Go 与 9 launcher 有重叠 = 18 unique）。`go test` 211/211 pass；`npm test` 704/704 pass；`npm run test:go-tui:smoke` 19/19 pass。
   - 范围克制：真实 release 资产需要打 `go-tui-v0.3.2` tag 才会上传（不能本地复现）；XDG user-local install 路径文档化在 install strategy 但 launcher 不自动 mkdir；`bbl go --check` 是非交互式命令不在 TUI 启动时自动跑。

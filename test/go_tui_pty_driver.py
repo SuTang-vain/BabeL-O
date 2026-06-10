@@ -152,13 +152,13 @@ def find_go_tui(repo: Path) -> tuple[list[str], str, str]:
     Returns (command_prefix, mode_label, fallback_warning).
     """
     go_tui_dir = repo / "clients" / "go-tui"
-    prebuilt = go_tui_dir / "go-tui"
+    prebuilt = go_tui_dir / "bin" / "go-tui"
     if prebuilt.exists() and os.access(prebuilt, os.X_OK):
         return ([str(prebuilt)], "binary", "")
-    fallback = ["go", "run", "."]
+    fallback = ["go", "run", "./cmd/go-tui"]
     warning = (
-        "[go-tui-smoke] no prebuilt clients/go-tui/go-tui binary; "
-        "falling back to `go run .` (requires Go toolchain in PATH)."
+        "[go-tui-smoke] no prebuilt clients/go-tui/bin/go-tui binary; "
+        "falling back to `go run ./cmd/go-tui` (requires Go toolchain in PATH)."
     )
     return (fallback, "go-run", warning)
 

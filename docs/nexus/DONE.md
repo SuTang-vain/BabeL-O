@@ -126,6 +126,7 @@
 ## CLI / TUI
 
 - `bbl run`、`bbl chat`、`bbl nexus`、`bbl sessions`、`bbl tools audit`、`bbl config`、`bbl models` 已落地。
+- Go TUI 目录规整已落地：`clients/go-tui/cmd/go-tui/` 只放 executable entry，`clients/go-tui/internal/tui/` 放核心 TUI package 与白盒状态机测试，`clients/go-tui/bin/` 放本地 build output 且不入仓；`bbl go` source fallback 改为 `go run ./cmd/go-tui`，source checkout dev binary 改为 `clients/go-tui/bin/go-tui`。
 - CLI embedded local boundary 已收口：`createEmbeddedNexusClient()` 通过 `createNexusApp().inject()` 复用 Nexus API，`chat.ts` 不再直接 import SQLite storage、session lifecycle、compact/context runtime internals。
 - Local runtime 已支持自然语言文件问答，同时显式 `read/write/edit/grep/glob/bash/task` 工具命令保持最高解析优先级。
 - Slash palette、tool palette、history search、model wizard、status/smoke/context/compact 命令已落地。

@@ -10,6 +10,7 @@ coverage/
 .babel-o/benchmarks/
 .babel-o/worktrees/
 .babel-o/test-*/
+clients/go-tui/bin/
 clients/go-tui/go-tui
 clients/go-tui/go-tui.exe
 

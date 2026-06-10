@@ -1,4 +1,4 @@
-package main
+package tui
 
 import (
 	"fmt"
@@ -9,7 +9,7 @@ import (
 // vars below are set via -ldflags at build time (see the
 // Makefile in this directory for the canonical build recipe).
 // When the binary is built without -ldflags (e.g. via plain
-// `go build .` or `go run .` during development) the values
+// `go build ./cmd/go-tui` or `go run ./cmd/go-tui` during development) the values
 // fall back to the "dev" defaults so the binary still works.
 //
 // The build pipeline (Phase 8 PR2) will set these from the
@@ -30,9 +30,14 @@ var (
 	BuildDate = ""
 )
 
-// versionString is the human-readable form printed by
-// `--version` and used in the runtime-version-compat check
-// at startup.
+// VersionString is the human-readable form printed by
+// `--version`.
+func VersionString() string {
+	return versionString()
+}
+
+// versionString is used by the runtime-version-compat check at startup and
+// kept unexported for white-box tests inside this package.
 func versionString() string {
 	out := "bbl-go-tui " + Version
 	if Commit != "" {
@@ -77,7 +82,7 @@ func majorVersion() int {
 // isGoTuiMajorCompatible reports whether the local Go TUI
 // major version is in the server's supportedMajors list. A
 // dev build (major == 0) is always considered compatible so
-// the warning never fires in `go run .` dev loops. An empty
+// the warning never fires in `go run ./cmd/go-tui` dev loops. An empty
 // supportedMajors list is treated as "no policy declared"
 // and the check passes (the Nexus is just saying "we don't
 // know what's compatible, use at your own risk").

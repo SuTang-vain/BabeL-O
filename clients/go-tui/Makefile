@@ -15,18 +15,20 @@
 PACKAGE_VERSION ?= $(shell node -p "require('../../package.json').version" 2>/dev/null || echo "0.0.0-dev")
 COMMIT         ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 BUILD_DATE     ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS        := -X main.Version=$(PACKAGE_VERSION) \
-                 -X main.Commit=$(COMMIT) \
-                 -X main.BuildDate=$(BUILD_DATE)
+VERSION_PKG    := github.com/sutang-vain/babel-o/clients/go-tui/internal/tui
+LDFLAGS        := -X $(VERSION_PKG).Version=$(PACKAGE_VERSION) \
+                 -X $(VERSION_PKG).Commit=$(COMMIT) \
+                 -X $(VERSION_PKG).BuildDate=$(BUILD_DATE)
 
 .PHONY: dev build test version clean
 
 dev:
-	go build -o bin/go-tui .
+	mkdir -p bin
+	go build -o bin/go-tui ./cmd/go-tui
 
 build:
 	mkdir -p bin
-	go build -ldflags "$(LDFLAGS)" -o bin/go-tui .
+	go build -ldflags "$(LDFLAGS)" -o bin/go-tui ./cmd/go-tui
 	@echo "Built bin/go-tui (version=$(PACKAGE_VERSION) commit=$(COMMIT) built=$(BUILD_DATE))"
 
 test:

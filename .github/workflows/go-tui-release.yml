@@ -13,7 +13,7 @@ name: Go TUI release
 #      or `<packageRoot>/bin/go-tui-<platform>-<arch>`)
 #   4. user-local XDG-ish (e.g.
 #      ~/.local/share/babel-o/bin/go-tui-<platform>-<arch>)
-#   5. source fallback `go run .`
+#   5. source fallback `go run ./cmd/go-tui`
 #
 # Each matrix entry runs `make build` (the canonical build
 # recipe from clients/go-tui/Makefile) which embeds the npm

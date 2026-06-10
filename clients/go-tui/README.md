@@ -38,6 +38,16 @@ model.
   lexicographic ordering and a `[tombstoned] deletedAt=<ts>` marker.
 - Keep all provider, context, tool, permission and session ownership in Nexus.
 
+## Source Layout
+
+- `cmd/go-tui/`: executable entrypoint, flag parsing, environment handoff and
+  process exit handling.
+- `internal/tui/`: Bubble Tea model, event rendering, overlays, Nexus client
+  helpers and white-box tests for the internal state machine.
+- `bin/`: local build output from `make dev` / `make build`; ignored by git.
+- Root files (`go.mod`, `go.sum`, `Makefile`, `README.md`) keep module,
+  dependency and build metadata outside the runtime package.
+
 ## Run
 
 Run the MVP through the BabeL-O CLI:
@@ -47,8 +57,8 @@ cd /Users/tangyaoyue/DEV/BABEL/BabeL-O
 npm run cli -- go --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O
 ```
 
-The `bbl go` entry prefers a prebuilt `clients/go-tui/go-tui` binary when it is
-present and falls back to `go run .` from this directory. Before launching the
+The `bbl go` entry prefers a prebuilt `clients/go-tui/bin/go-tui` binary when it
+is present and falls back to `go run ./cmd/go-tui` from this directory. Before launching the
 TUI it probes `GET /health`; if the target URL is local and unhealthy, it starts
 a managed Nexus child process, waits for health, then shuts that child down when
 the Go TUI exits.
@@ -78,11 +88,11 @@ You can also run the client directly:
 
 ```bash
 cd /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui
-go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O
+go run ./cmd/go-tui --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O
 # Disable background /v1/runtime/config polling:
-go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=0
+go run ./cmd/go-tui --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=0
 # Faster polling for live config sync demos:
-go run . --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=2000
+go run ./cmd/go-tui --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABEL/BabeL-O --poll-interval-ms=2000
 ```
 
 Keys:

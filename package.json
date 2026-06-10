@@ -10,9 +10,12 @@
     "dist",
     "bin",
     "clients/go-tui/README.md",
+    "clients/go-tui/Makefile",
+    "clients/go-tui/cmd/go-tui/*.go",
     "clients/go-tui/go.mod",
     "clients/go-tui/go.sum",
-    "clients/go-tui/main.go",
+    "clients/go-tui/internal/tui/*.go",
+    "!clients/go-tui/internal/tui/*_test.go",
     "LICENSE",
     "README.md",
     "README.zh-CN.md"

@@ -50,14 +50,14 @@ const repoRoot = path.resolve(import.meta.dirname, '..')
 const driver = path.join(repoRoot, 'test', 'go_tui_pty_driver.py')
 const shouldRun = process.env.BABEL_O_RUN_GO_TUI_SMOKE === '1'
 const python = process.env.PYTHON ?? 'python3'
-const prebuilt = path.join(repoRoot, 'clients', 'go-tui', 'go-tui')
+const prebuilt = path.join(repoRoot, 'clients', 'go-tui', 'bin', 'go-tui')
 
 const skipReason = !shouldRun
   ? 'Set BABEL_O_RUN_GO_TUI_SMOKE=1 to run Go TUI smoke.'
   : !existsSync(driver)
   ? 'go_tui_pty_driver.py not found'
   : !existsSync(prebuilt)
-  ? 'prebuilt clients/go-tui/go-tui binary missing; the smoke requires the local Go toolchain as a separate concern (see Phase 8 packaging).'
+  ? 'prebuilt clients/go-tui/bin/go-tui binary missing; the smoke requires the local Go toolchain as a separate concern (see Phase 8 packaging).'
   : undefined
 
 const OK_LINE = (sequence: string) =>

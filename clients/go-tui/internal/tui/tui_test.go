@@ -1,4 +1,4 @@
-package main
+package tui
 
 import (
 	"encoding/json"
@@ -82,7 +82,7 @@ func TestNexusJSONSendsAPIKeyAndDecodes(t *testing.T) {
 
 	var out runtimeConfig
 	err := nexusJSON(
-		config{baseURL: server.URL, apiKey: "secret-key"},
+		Config{BaseURL: server.URL, APIKey: "secret-key"},
 		http.MethodPost,
 		"/v1/runtime/config/select",
 		map[string]string{"profile": "dev"},
@@ -140,7 +140,7 @@ func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 }
 
 func TestHandleLocalConfigCommandsDoNotStartAgentStream(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/profile dev")
 	// /profile <name> now gates the HTTP call behind a y/n overlay,
 	// so handleLocalCommand itself returns nil and parks the model in
@@ -214,7 +214,7 @@ func TestFormatNexusEventSummarizesHookCompletedOutput(t *testing.T) {
 }
 
 func TestConsumeNexusEventMergesStreamingAssistantDeltas(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	m.consumeNexusEvent(map[string]any{"type": "assistant_delta", "text": "hello "})
 	m.consumeNexusEvent(map[string]any{"type": "assistant_delta", "text": "world"})
 
@@ -228,7 +228,7 @@ func TestConsumeNexusEventMergesStreamingAssistantDeltas(t *testing.T) {
 }
 
 func TestConsumeNexusEventUpdatesSessionAndPermissionPanel(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	m.resize()
@@ -436,7 +436,7 @@ func TestFormatToolInputExtractsGrepPattern(t *testing.T) {
 }
 
 func TestRenderPermissionIncludesInputAndMessage(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	m.width = 100
 	m.height = 24
 	m.resize()
@@ -496,7 +496,7 @@ func TestLinePresentationHasStableLabelsForPhase2Events(t *testing.T) {
 }
 
 func TestConsumeNexusEventPhase2NoLongerFallsToRawJSON(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:3000", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	events := []map[string]any{
 		{"type": "user_message", "text": "hi"},
 		{"type": "user_intake_guidance", "intent": "status", "requiresTools": false, "reason": "greeting"},
@@ -589,7 +589,7 @@ func TestFetchRuntimeConfigAppendsSinceQuery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := config{baseURL: srv.URL, pollIntervalMs: 0}
+	cfg := Config{BaseURL: srv.URL, PollIntervalMs: 0}
 	_ = fetchRuntimeConfig(cfg, 42)()
 	if gotURL != "/v1/runtime/config?since=42" {
 		t.Fatalf("fetchRuntimeConfig URL = %q, want %q", gotURL, "/v1/runtime/config?since=42")
@@ -605,7 +605,7 @@ func TestFetchRuntimeConfigNoSinceWhenZero(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := config{baseURL: srv.URL, pollIntervalMs: 0}
+	cfg := Config{BaseURL: srv.URL, PollIntervalMs: 0}
 	_ = fetchRuntimeConfig(cfg, 0)()
 	if gotURL != "/v1/runtime/config" {
 		t.Fatalf("fetchRuntimeConfig URL = %q, want no query", gotURL)
@@ -618,7 +618,7 @@ func TestNexusJSONReturnsErrNotModifiedOn304(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := config{baseURL: srv.URL}
+	cfg := Config{BaseURL: srv.URL}
 	var payload runtimeConfig
 	err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload)
 	if !errors.Is(err, errNotModified) {
@@ -627,7 +627,7 @@ func TestNexusJSONReturnsErrNotModifiedOn304(t *testing.T) {
 }
 
 func TestRuntimeConfigMsgHandlerSilentlyReschedulesPollOn304(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 5})
 	m.configVersion = 7
 
 	_, cmd := m.Update(runtimeConfigMsg{err: errNotModified})
@@ -637,7 +637,7 @@ func TestRuntimeConfigMsgHandlerSilentlyReschedulesPollOn304(t *testing.T) {
 }
 
 func TestRuntimeConfigMsgHandlerLogsWhenVersionMoves(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 5})
 	before := len(m.transcript)
 	updated, _ := m.Update(runtimeConfigMsg{config: runtimeConfig{Version: 9, ModelID: "x"}})
 	updatedModel, ok := updated.(model)
@@ -653,14 +653,14 @@ func TestRuntimeConfigMsgHandlerLogsWhenVersionMoves(t *testing.T) {
 }
 
 func TestSchedulePollTickReturnsNilWhenDisabled(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 0})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 0})
 	if cmd := m.schedulePollTick(); cmd != nil {
 		t.Fatalf("expected nil cmd when poll disabled, got %T", cmd)
 	}
 }
 
 func TestSchedulePollTickEmitsPollTickMsg(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 5})
 	cmd := m.schedulePollTick()
 	if cmd == nil {
 		t.Fatalf("expected a tick cmd")
@@ -672,7 +672,7 @@ func TestSchedulePollTickEmitsPollTickMsg(t *testing.T) {
 }
 
 func TestPollTickDeferWhenConfigVersionIsZero(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", pollIntervalMs: 5})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 5})
 	_, cmd := m.Update(pollTickMsg{})
 	if cmd == nil {
 		t.Fatalf("expected reschedule cmd when config version is 0")
@@ -700,14 +700,14 @@ func TestFormatRuntimeProfilesTombstoneOrderingIsStable(t *testing.T) {
 // === Phase 3: single-input-owner state machine ===
 
 func TestInputModeDefaultsToComposing(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if m.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeComposing)
 	}
 }
 
 func TestSetModeIsIdempotentAndRecordsTransition(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modePermission)
 	if m.inputMode != modePermission {
 		t.Fatalf("after setMode(permission): %q", m.inputMode)
@@ -736,7 +736,7 @@ func TestCanEditInputOnlyTrueInComposing(t *testing.T) {
 }
 
 func TestPermissionRequestEntersPermissionMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.consumeNexusEvent(map[string]any{
 		"type":      "permission_request",
 		"sessionId": "session_1234567890abcdef",
@@ -754,7 +754,7 @@ func TestPermissionRequestEntersPermissionMode(t *testing.T) {
 }
 
 func TestSendPermissionDecisionReturnsToComposing(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.consumeNexusEvent(map[string]any{
 		"type":      "permission_request",
 		"sessionId": "session_1",
@@ -777,7 +777,7 @@ func TestSendPermissionDecisionReturnsToComposing(t *testing.T) {
 }
 
 func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.consumeNexusEvent(map[string]any{
 		"type":      "permission_request",
 		"sessionId": "session_1",
@@ -797,7 +797,7 @@ func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
 }
 
 func TestHelpOverlayOpensOnQuestionMark(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
@@ -814,7 +814,7 @@ func TestHelpOverlayOpensOnQuestionMark(t *testing.T) {
 }
 
 func TestHelpOverlayClosesOnEsc(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	m.setMode(modeHelpOverlay)
@@ -829,7 +829,7 @@ func TestHelpOverlayClosesOnEsc(t *testing.T) {
 }
 
 func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	m.setMode(modeHelpOverlay)
@@ -849,7 +849,7 @@ func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
 }
 
 func TestQuestionMarkIgnoredWhenInputNonEmpty(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.input.SetValue("abc")
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
 	updatedModel, ok := updated.(model)
@@ -865,7 +865,7 @@ func TestQuestionMarkIgnoredWhenInputNonEmpty(t *testing.T) {
 }
 
 func TestCtrlCAlwaysQuitsEvenFromOverlay(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeHelpOverlay)
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
 	if cmd == nil {
@@ -875,7 +875,7 @@ func TestCtrlCAlwaysQuitsEvenFromOverlay(t *testing.T) {
 }
 
 func TestQDoesNotQuitWhenInOverlay(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeHelpOverlay)
 	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
 	if cmd != nil {
@@ -893,7 +893,7 @@ func TestTextinputInstanceNotReplacedAcrossModes(t *testing.T) {
 	// newModel and must never be replaced by mode transitions; only its
 	// value / cursor are mutated. We assert this by checking that a
 	// value the user typed survives a full mode round-trip.
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.input.SetValue("in-progress draft")
 
 	m.setMode(modePermission)
@@ -911,7 +911,7 @@ func TestTextinputInstanceNotReplacedAcrossModes(t *testing.T) {
 }
 
 func TestRenderHelpHiddenInComposing(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	if got := m.renderHelp(80); got != "" {
@@ -920,7 +920,7 @@ func TestRenderHelpHiddenInComposing(t *testing.T) {
 }
 
 func TestRenderHelpVisibleInHelpMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
 	m.setMode(modeHelpOverlay)
@@ -999,7 +999,7 @@ func TestFindSlashCommandResolvesAlias(t *testing.T) {
 }
 
 func TestSlashPaletteOpensOnSlashFromEmptyInput(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	updatedModel, ok := updated.(model)
 	if !ok {
@@ -1014,7 +1014,7 @@ func TestSlashPaletteOpensOnSlashFromEmptyInput(t *testing.T) {
 }
 
 func TestSlashPaletteDoesNotOpenOnSlashWhenInputNonEmpty(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.input.SetValue("abc")
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
 	updatedModel, ok := updated.(model)
@@ -1030,7 +1030,7 @@ func TestSlashPaletteDoesNotOpenOnSlashWhenInputNonEmpty(t *testing.T) {
 }
 
 func TestSlashPaletteLiveFilterAppendsToFilter(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
 	updatedModel, ok := updated.(model)
@@ -1048,7 +1048,7 @@ func TestSlashPaletteLiveFilterAppendsToFilter(t *testing.T) {
 }
 
 func TestSlashPaletteBackspaceEditsFilter(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "abc"
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
@@ -1059,7 +1059,7 @@ func TestSlashPaletteBackspaceEditsFilter(t *testing.T) {
 }
 
 func TestSlashPaletteBackspaceOnEmptyFilterClosesPalette(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
 	updatedModel, _ := updated.(model)
@@ -1069,7 +1069,7 @@ func TestSlashPaletteBackspaceOnEmptyFilterClosesPalette(t *testing.T) {
 }
 
 func TestSlashPaletteEscClosesAndClearsInput(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "pro"
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
@@ -1086,7 +1086,7 @@ func TestSlashPaletteEscClosesAndClearsInput(t *testing.T) {
 }
 
 func TestSlashPaletteUpDownNavigatesSelection(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	// Filter matches multiple commands ("/h" -> /help + /h-prefixed entries)
 	// Actually only /help starts with "h" in our registry. Use "/b" -> /bash.
@@ -1104,7 +1104,7 @@ func TestSlashPaletteUpDownNavigatesSelection(t *testing.T) {
 }
 
 func TestSlashPaletteEnterRunsZeroArgCommand(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "help"
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1120,7 +1120,7 @@ func TestSlashPaletteEnterRunsZeroArgCommand(t *testing.T) {
 }
 
 func TestSlashPaletteEnterOnPrefixCommandInsertsPrefix(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "bash"
 	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
@@ -1134,7 +1134,7 @@ func TestSlashPaletteEnterOnPrefixCommandInsertsPrefix(t *testing.T) {
 }
 
 func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 100
 	m.height = 24
 	m.setMode(modeSlashPick)
@@ -1153,7 +1153,7 @@ func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
 }
 
 func TestSlashPaletteRenderHiddenInOtherModes(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 100
 	m.height = 24
 	if got := m.renderSlashPalette(100); got != "" {
@@ -1162,7 +1162,7 @@ func TestSlashPaletteRenderHiddenInOtherModes(t *testing.T) {
 }
 
 func TestToolPaletteRendersRiskSourceApproval(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.renderToolPalette([]toolDescriptor{
 		{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
 		{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a file"},
@@ -1186,7 +1186,7 @@ func TestToolPaletteRendersRiskSourceApproval(t *testing.T) {
 }
 
 func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	// /config is a real Nexus HTTP call; it should not error in
 	// handleLocalCommand itself, even though the URL is unreachable.
 	// The error (if any) will come from the network call.
@@ -1206,7 +1206,7 @@ func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
 // --- Profile confirm overlay (§5 path C phase 3 polish continuation) ---
 
 func TestProfileAlreadyActiveShortCircuitsConfirmOverlay(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.activeProfile = "dev"
 	before := len(m.transcript)
 	cmd := m.handleLocalCommand("/profile dev")
@@ -1226,7 +1226,7 @@ func TestProfileAlreadyActiveShortCircuitsConfirmOverlay(t *testing.T) {
 }
 
 func TestProfileConfirmYKeyFiresHTTPCommand(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.activeProfile = "dev"
 	if cmd := m.handleLocalCommand("/profile staging"); cmd != nil {
 		t.Fatalf("/profile staging should return nil (parked in confirm)")
@@ -1255,7 +1255,7 @@ func TestProfileConfirmYKeyFiresHTTPCommand(t *testing.T) {
 }
 
 func TestProfileConfirmEnterKeyFiresHTTPCommand(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
@@ -1276,7 +1276,7 @@ func TestProfileConfirmEnterKeyFiresHTTPCommand(t *testing.T) {
 }
 
 func TestProfileConfirmNKeyCancelsWithoutHTTP(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
@@ -1301,7 +1301,7 @@ func TestProfileConfirmNKeyCancelsWithoutHTTP(t *testing.T) {
 }
 
 func TestProfileConfirmEscKeyCancels(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
@@ -1326,7 +1326,7 @@ func TestProfileConfirmEscKeyCancels(t *testing.T) {
 }
 
 func TestProfileConfirmStrayKeyDoesNotReachTextinput(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
@@ -1348,7 +1348,7 @@ func TestProfileConfirmStrayKeyDoesNotReachTextinput(t *testing.T) {
 }
 
 func TestRenderProfileConfirmEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.activeProfile = "dev"
 	if got := m.renderProfileConfirm(100); got != "" {
 		t.Fatalf("renderProfileConfirm in composing mode should return empty, got %q", got)
@@ -1356,7 +1356,7 @@ func TestRenderProfileConfirmEmptyOutsideMode(t *testing.T) {
 }
 
 func TestRenderProfileConfirmShowsHeaderInMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.activeProfile = "dev"
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
@@ -1373,7 +1373,7 @@ func TestRenderProfileConfirmShowsHeaderInMode(t *testing.T) {
 }
 
 func TestProfileConfirmWithEmptyActiveShowsNoCurrent(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
@@ -1386,7 +1386,7 @@ func TestProfileConfirmWithEmptyActiveShowsNoCurrent(t *testing.T) {
 // --- Phase 5: /context + /compact wire to real Nexus endpoints ---
 
 func TestContextWithEmptySessionShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	before := len(m.transcript)
 	cmd := m.handleLocalCommand("/context")
 	if cmd != nil {
@@ -1402,7 +1402,7 @@ func TestContextWithEmptySessionShortCircuits(t *testing.T) {
 }
 
 func TestCompactWithEmptySessionShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	before := len(m.transcript)
 	cmd := m.handleLocalCommand("/compact")
 	if cmd != nil {
@@ -1415,7 +1415,7 @@ func TestCompactWithEmptySessionShortCircuits(t *testing.T) {
 }
 
 func TestContextWithActiveSessionFiresHTTP(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "session_phase5_test"
 	before := len(m.transcript)
 	cmd := m.handleLocalCommand("/context")
@@ -1429,7 +1429,7 @@ func TestContextWithActiveSessionFiresHTTP(t *testing.T) {
 }
 
 func TestCompactWithActiveSessionFiresHTTP(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "session_phase5_test"
 	before := len(m.transcript)
 	cmd := m.handleLocalCommand("/compact")
@@ -1569,7 +1569,7 @@ func TestFormatCompactResultReportsDecodeErrorOnInvalidJSON(t *testing.T) {
 }
 
 func TestContextAnalysisMsgErrorAppendsFriendlyLine(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	before := len(m.transcript)
 	updated, _ := m.Update(contextAnalysisMsg{err: fmt.Errorf("upstream 503")})
 	updatedModel, ok := updated.(model)
@@ -1583,7 +1583,7 @@ func TestContextAnalysisMsgErrorAppendsFriendlyLine(t *testing.T) {
 }
 
 func TestCompactResultMsgErrorAppendsFriendlyLine(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	before := len(m.transcript)
 	updated, _ := m.Update(compactResultMsg{err: fmt.Errorf("session not found")})
 	updatedModel, ok := updated.(model)
@@ -1706,7 +1706,7 @@ func TestBuildContextOverlayLinesReportsDecodeErrorOnInvalidJSON(t *testing.T) {
 }
 
 func TestContextOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
 	updatedModel, ok := updated.(model)
 	if !ok {
@@ -1736,7 +1736,7 @@ func TestContextOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 }
 
 func TestContextOverlayScrollClamps(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
 	updatedModel := updated.(model)
 	// Up at 0 should stay at 0.
@@ -1764,14 +1764,14 @@ func TestContextOverlayScrollClamps(t *testing.T) {
 }
 
 func TestRenderContextOverlayEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderContextOverlay(120); got != "" {
 		t.Fatalf("renderContextOverlay in composing mode should be empty, got %q", got)
 	}
 }
 
 func TestRenderContextOverlayShowsHeaderInMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
 	updatedModel := updated.(model)
 	// Force a small height so the overlay has a finite window.
@@ -1840,12 +1840,12 @@ func TestFormatCompactResultSummaryTruncatedToFirstLine(t *testing.T) {
 
 func TestFormatCharCountHumanFriendly(t *testing.T) {
 	cases := map[int]string{
-		0:   "0",
-		12:  "12",
-		999: "999",
-		1234: "1.2k",
-		9999: "10.0k",
-		12345: "12k",
+		0:       "0",
+		12:      "12",
+		999:     "999",
+		1234:    "1.2k",
+		9999:    "10.0k",
+		12345:   "12k",
 		1234567: "1.2M",
 	}
 	for n, want := range cases {
@@ -2018,7 +2018,7 @@ func TestBuildInboxOverlayLinesPlaceholderWhenEmpty(t *testing.T) {
 }
 
 func TestRenderInboxOverlayEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderInboxOverlay(120); got != "" {
 		t.Fatalf("renderInboxOverlay outside modeInboxOverlay should be empty, got %q", got)
 	}
@@ -2029,7 +2029,7 @@ func TestRenderInboxOverlayShowsHeaderInMode(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	m.inboxMessages = envelope.Messages
 	m.inputMode = modeInboxOverlay
@@ -2050,7 +2050,7 @@ func TestRenderInboxOverlayAllVariantSwitchesBanner(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	m.inboxMessages = envelope.Messages
 	m.inboxOverlayIncludeAck = true
@@ -2067,7 +2067,7 @@ func TestInboxOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	updatedModel, ok := updated.(model)
@@ -2096,7 +2096,7 @@ func TestInboxOverlaySelectionClampsAtBounds(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
@@ -2128,7 +2128,7 @@ func TestInboxOverlayEscapeCloses(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
@@ -2164,7 +2164,7 @@ func TestInboxOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
@@ -2181,7 +2181,7 @@ func TestInboxOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 }
 
 func TestInboxMsgErrorAppendsFriendlyLine(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(inboxMsg{err: errors.New("dial tcp: connection refused")})
 	um := updated.(model)
 	last := um.transcript[len(um.transcript)-1]
@@ -2195,7 +2195,7 @@ func TestInboxAckMsgSuccessUpdatesLocalSnapshot(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	m.inboxMessages = envelope.Messages
 	updated, _ := m.Update(inboxAckMsg{sessionID: "sess_inbox_smoke_abc123", messageID: "msg_handoff_1"})
@@ -2215,7 +2215,7 @@ func TestInboxAckMsgSuccessUpdatesLocalSnapshot(t *testing.T) {
 }
 
 func TestInboxSlashCommandEmptySessionShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/inbox")
 	if cmd != nil {
 		t.Fatalf("expected nil cmd when no session, got %T", cmd)
@@ -2227,7 +2227,7 @@ func TestInboxSlashCommandEmptySessionShortCircuits(t *testing.T) {
 }
 
 func TestInboxSlashCommandAllRequiresSession(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/inbox all")
 	if cmd != nil {
 		t.Fatalf("expected nil cmd when no session, got %T", cmd)
@@ -2235,7 +2235,7 @@ func TestInboxSlashCommandAllRequiresSession(t *testing.T) {
 }
 
 func TestInboxSlashCommandAckMissingArgShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_xyz"
 	cmd := m.handleLocalCommand("/inbox ack")
 	if cmd != nil {
@@ -2256,18 +2256,18 @@ func TestRenderInboxEventCardEmptyForNonKeyMessage(t *testing.T) {
 
 func TestRenderInboxEventCardShowsGovernanceForMemoryCandidate(t *testing.T) {
 	m := sessionMessage{
-		MessageID: "msg_mc_1",
-		ChannelID: "chan_direct_1",
-		Type:      messageTypeMemoryCandidate,
-		Priority:  priorityNormal,
+		MessageID:     "msg_mc_1",
+		ChannelID:     "chan_direct_1",
+		Type:          messageTypeMemoryCandidate,
+		Priority:      priorityNormal,
 		FromSessionID: "sess_peer_1",
 		ToSessionID:   "sess_self",
-		Content:   "blocked auto-write",
+		Content:       "blocked auto-write",
 		Metadata: map[string]any{
 			"memoryCandidateGovernance": map[string]any{
-				"decision": "rejected",
-				"scope":    "long_term",
-				"approval": map[string]any{"status": "rejected", "requiredBy": "user"},
+				"decision":  "rejected",
+				"scope":     "long_term",
+				"approval":  map[string]any{"status": "rejected", "requiredBy": "user"},
 				"autoWrite": false,
 			},
 		},
@@ -2292,7 +2292,7 @@ func TestRenderNewInboxEventCardsSkipsAlreadySeen(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	m.inboxMessages = envelope.Messages
 	baseline := len(m.transcript)
@@ -2319,7 +2319,7 @@ func TestFetchInboxHTTPCmdSendsIncludeAckQuery(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"session_inbox","sessionId":"sess_xyz","messages":[],"limit":50,"includeAcknowledged":true}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := fetchInbox(m.cfg, "sess_xyz", true, "user")
 	msg := cmd()
 	inbox, ok := msg.(inboxMsg)
@@ -2350,7 +2350,7 @@ func TestAckInboxMessageHTTPCmdPostsToCorrectPath(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"session_message_acknowledged","sessionId":"sess_xyz","message":null}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := ackInboxMessage(m.cfg, "sess_xyz", "msg_ack_target_1")
 	msg := cmd()
 	ack, ok := msg.(inboxAckMsg)
@@ -2420,9 +2420,9 @@ func TestQuoteInboxMessageIncludesGovernanceForMemoryCandidate(t *testing.T) {
 		Content:       "blocked auto-write",
 		Metadata: map[string]any{
 			"memoryCandidateGovernance": map[string]any{
-				"decision": "rejected",
-				"scope":    "long_term",
-				"approval": map[string]any{"status": "rejected", "requiredBy": "user"},
+				"decision":  "rejected",
+				"scope":     "long_term",
+				"approval":  map[string]any{"status": "rejected", "requiredBy": "user"},
 				"autoWrite": false,
 			},
 		},
@@ -2441,7 +2441,7 @@ func TestInboxOverlayQuoteKeyFillsTextinput(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
@@ -2464,7 +2464,7 @@ func TestInboxOverlayQuoteKeyCAlsoFillsTextinput(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
@@ -2476,7 +2476,7 @@ func TestInboxOverlayQuoteKeyCAlsoFillsTextinput(t *testing.T) {
 }
 
 func TestInboxOverlayQuoteKeyEmptyListIsNoop(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_xyz"
 	m.input.SetValue("preserved")
 	m.inputMode = modeInboxOverlay
@@ -2494,7 +2494,7 @@ func TestInboxOverlayQuoteKeyEmptyListIsNoop(t *testing.T) {
 }
 
 func TestInboxAutoRefreshOnResultEventFiresFetchInbox(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_ar_1"
 	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
 	if cmd == nil {
@@ -2521,7 +2521,7 @@ func TestInboxAutoRefreshOnResultEventFiresFetchInbox(t *testing.T) {
 }
 
 func TestInboxAutoRefreshSkippedWhenNoSession(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	// sessionID is empty.
 	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
 	if cmd != nil {
@@ -2534,7 +2534,7 @@ func TestInboxAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	// Compose a turn so we're not in modeInboxOverlay.
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
@@ -2562,7 +2562,7 @@ func TestInboxAutoRefreshRendersEventCardsForNewMessages(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	baseline := len(m.transcript)
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
@@ -2577,7 +2577,7 @@ func TestInboxAutoRefreshDedupesAcrossTurns(t *testing.T) {
 	if err := json.Unmarshal(fullInboxPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_inbox_smoke_abc123"
 	// First auto-refresh: cards render.
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "auto"})
@@ -2727,7 +2727,7 @@ func TestSummarizeAgentJobsEmpty(t *testing.T) {
 }
 
 func TestRenderAgentOverlayEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderAgentOverlay(120); got != "" {
 		t.Fatalf("renderAgentOverlay outside modeAgentOverlay should be empty, got %q", got)
 	}
@@ -2738,7 +2738,7 @@ func TestRenderAgentOverlayShowsHeaderInMode(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	m.agentJobs = envelope.Jobs
 	m.inputMode = modeAgentOverlay
@@ -2764,7 +2764,7 @@ func TestAgentOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um, ok := updated.(model)
@@ -2790,7 +2790,7 @@ func TestAgentOverlayEscapeEnterQAllClose(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um := updated.(model)
@@ -2817,7 +2817,7 @@ func TestAgentOverlayScrollClamps(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um := updated.(model)
@@ -2851,7 +2851,7 @@ func TestAgentOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	m = updated.(model)
@@ -2868,7 +2868,7 @@ func TestAgentOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 }
 
 func TestAgentSlashCommandEmptySessionShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/agents")
 	if cmd != nil {
 		t.Fatalf("expected nil cmd when no session, got %T", cmd)
@@ -2880,7 +2880,7 @@ func TestAgentSlashCommandEmptySessionShortCircuits(t *testing.T) {
 }
 
 func TestAgentJobsMsgErrorAppendsFriendlyLine(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(agentJobsMsg{err: errors.New("dial tcp: connection refused")})
 	um := updated.(model)
 	last := um.transcript[len(um.transcript)-1]
@@ -2897,7 +2897,7 @@ func TestFetchSessionAgentsHTTPCmdSendsCorrectPath(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"agent_jobs","sessionId":"sess_xyz","jobs":[]}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := fetchSessionAgents(m.cfg, "sess_xyz", "user")
 	msg := cmd()
 	agents, ok := msg.(agentJobsMsg)
@@ -2916,7 +2916,7 @@ func TestFetchSessionAgentsHTTPCmdSendsCorrectPath(t *testing.T) {
 }
 
 func TestAgentAutoRefreshOnResultEventFiresBatchCmd(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_ar_agents_1"
 	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
 	if cmd == nil {
@@ -2936,7 +2936,7 @@ func TestAgentAutoRefreshOnResultEventFiresBatchCmd(t *testing.T) {
 }
 
 func TestAgentAutoRefreshSkippedWhenNoSession(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.consumeNexusEvent(map[string]any{"type": "result"})
 	if cmd != nil {
 		t.Fatalf("auto-refresh should be skipped when no session, got %T", cmd)
@@ -2948,7 +2948,7 @@ func TestAgentAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_agents_smoke_xyz"
 	// Open the overlay once and close it.
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
@@ -3089,7 +3089,7 @@ func TestSummarizeTaskBoardRendersStatusCounts(t *testing.T) {
 }
 
 func TestRenderTaskBoardEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderTaskBoard(120); got != "" {
 		t.Fatalf("renderTaskBoard outside modeTaskBoard should be empty, got %q", got)
 	}
@@ -3100,7 +3100,7 @@ func TestRenderTaskBoardShowsHeaderInMode(t *testing.T) {
 	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_tasks_smoke_xyz"
 	m.taskBoard = envelope.Tasks
 	m.inputMode = modeTaskBoard
@@ -3126,7 +3126,7 @@ func TestTaskBoardOpensOnMsgAndClearsOnClose(t *testing.T) {
 	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_tasks_smoke_xyz"
 	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
 	um, ok := updated.(model)
@@ -3152,7 +3152,7 @@ func TestTaskBoardScrollClamps(t *testing.T) {
 	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_tasks_smoke_xyz"
 	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
 	um := updated.(model)
@@ -3176,7 +3176,7 @@ func TestTaskBoardScrollClamps(t *testing.T) {
 }
 
 func TestTaskSlashCommandEmptySessionShortCircuits(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/tasks")
 	if cmd != nil {
 		t.Fatalf("expected nil cmd when no session, got %T", cmd)
@@ -3188,7 +3188,7 @@ func TestTaskSlashCommandEmptySessionShortCircuits(t *testing.T) {
 }
 
 func TestTasksListMsgErrorAppendsFriendlyLine(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(tasksListMsg{err: errors.New("dial tcp: connection refused")})
 	um := updated.(model)
 	last := um.transcript[len(um.transcript)-1]
@@ -3202,7 +3202,7 @@ func TestTasksListAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	if err := json.Unmarshal(fullTasksListPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_tasks_smoke_xyz"
 	// Open then close.
 	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
@@ -3231,7 +3231,7 @@ func TestFetchSessionTasksHTTPCmdSendsCorrectPath(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"tasks_list","sessionId":"sess_xyz","tasks":[]}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := fetchSessionTasks(m.cfg, "sess_xyz", "user")
 	msg := cmd()
 	tasks, ok := msg.(tasksListMsg)
@@ -3270,7 +3270,7 @@ func TestFormatActivityKindIconAllValues(t *testing.T) {
 }
 
 func TestRecordActivityEventAppendsAndCapsAtBuffer(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := len(m.activityEvents); got != 0 {
 		t.Fatalf("fresh model should have empty activity buffer, got %d", got)
 	}
@@ -3293,7 +3293,7 @@ func TestRecordActivityEventAppendsAndCapsAtBuffer(t *testing.T) {
 }
 
 func TestRecordActivityEventFallsBackToKindWhenSummaryEmpty(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.recordActivityEvent(activityKindToolStarted, "", "")
 	if got := m.activityEvents[0].Summary; got != "[tool_started]" {
 		t.Fatalf("empty summary should fall back to bracketed kind, got %q", got)
@@ -3349,14 +3349,14 @@ func TestSummarizeActivityEventsEmpty(t *testing.T) {
 }
 
 func TestRenderActivityOverlayEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderActivityOverlay(120); got != "" {
 		t.Fatalf("renderActivityOverlay outside modeActivityOverlay should be empty, got %q", got)
 	}
 }
 
 func TestRenderActivityOverlayShowsHeaderInMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.inputMode = modeActivityOverlay
 	m.height = 30
 	m.activityEvents = []activityEventEntry{
@@ -3380,7 +3380,7 @@ func TestRenderActivityOverlayShowsHeaderInMode(t *testing.T) {
 }
 
 func TestConsumeNexusEventRecordsActivityForToolEvents(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_activity_1"
 	// Fire a tool_started event with a Bash toolUseId + name +
 	// input so formatToolInput produces a useful summary.
@@ -3403,7 +3403,7 @@ func TestConsumeNexusEventRecordsActivityForToolEvents(t *testing.T) {
 }
 
 func TestConsumeNexusEventSkipsActivityForIrrelevantEvents(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_activity_2"
 	// tool_denied, usage, hook_* are intentionally NOT recorded.
 	for _, eventType := range []string{"tool_denied", "usage", "hook_started", "hook_completed", "hook_failed"} {
@@ -3415,7 +3415,7 @@ func TestConsumeNexusEventSkipsActivityForIrrelevantEvents(t *testing.T) {
 }
 
 func TestActivityOverlayOpensAndCloses(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	// /activity should open the overlay even with an empty buffer.
 	cmd := m.handleLocalCommand("/activity")
 	if cmd != nil {
@@ -3462,7 +3462,7 @@ func TestSubAgentStatusFromTaskSessionEventMapsLifecycleTypes(t *testing.T) {
 }
 
 func TestRecordSubAgentEventCreatesEntryWithRunningStatus(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.recordSubAgentEvent(map[string]any{
 		"type":      "task_session_event",
 		"eventType": "subagent_started",
@@ -3492,7 +3492,7 @@ func TestRecordSubAgentEventCreatesEntryWithRunningStatus(t *testing.T) {
 }
 
 func TestRecordSubAgentEventUpdatesExistingEntryOnCompletion(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	// Started.
 	m.recordSubAgentEvent(map[string]any{
 		"type": "task_session_event", "eventType": "subagent_started",
@@ -3505,7 +3505,7 @@ func TestRecordSubAgentEventUpdatesExistingEntryOnCompletion(t *testing.T) {
 	m.recordSubAgentEvent(map[string]any{
 		"type": "task_session_event", "eventType": "subagent_completed",
 		"timestamp": "2026-06-10T10:05:00Z",
-		"payload": map[string]any{"agentId": "agent_sub_1"},
+		"payload":   map[string]any{"agentId": "agent_sub_1"},
 	}, subAgentStatusCompleted)
 	entry := m.subAgents["agent_sub_1"]
 	if entry.Status != subAgentStatusCompleted {
@@ -3517,7 +3517,7 @@ func TestRecordSubAgentEventUpdatesExistingEntryOnCompletion(t *testing.T) {
 }
 
 func TestRecordSubAgentEventSkipsWhenNoID(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.recordSubAgentEvent(map[string]any{
 		"type":      "task_session_event",
 		"eventType": "subagent_started",
@@ -3529,7 +3529,7 @@ func TestRecordSubAgentEventSkipsWhenNoID(t *testing.T) {
 }
 
 func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_sub_agg_1"
 	// Fire subagent_started.
 	_ = m.consumeNexusEvent(map[string]any{
@@ -3566,7 +3566,7 @@ func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
 }
 
 func TestHeaderIncludesRunningSubAgentBadge(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_sub_agg_2"
 	m.width = 120
 	m.height = 30
@@ -3637,9 +3637,9 @@ func TestBuildMergedAgentOverlayLinesEmptyWhenBothSourcesEmpty(t *testing.T) {
 
 func TestBuildMergedAgentOverlayLinesOrdersSubAgentsAlphabetically(t *testing.T) {
 	subs := map[string]subAgentEntry{
-		"agent_zeta": {ID: "agent_zeta", Status: subAgentStatusRunning, Title: "z"},
+		"agent_zeta":  {ID: "agent_zeta", Status: subAgentStatusRunning, Title: "z"},
 		"agent_alpha": {ID: "agent_alpha", Status: subAgentStatusRunning, Title: "a"},
-		"agent_mu": {ID: "agent_mu", Status: subAgentStatusRunning, Title: "m"},
+		"agent_mu":    {ID: "agent_mu", Status: subAgentStatusRunning, Title: "m"},
 	}
 	lines := buildMergedAgentOverlayLines(nil, subs)
 	combined := strings.Join(lines, "\n")
@@ -3785,7 +3785,7 @@ func TestSummarizeToolAuditEmpty(t *testing.T) {
 }
 
 func TestRenderToolAuditOverlayEmptyOutsideMode(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	if got := m.renderToolAuditOverlay(120); got != "" {
 		t.Fatalf("renderToolAuditOverlay outside modeToolAuditOverlay should be empty, got %q", got)
 	}
@@ -3796,7 +3796,7 @@ func TestRenderToolAuditOverlayShowsHeaderInMode(t *testing.T) {
 	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.toolAuditEntries = envelope.Tools
 	m.inputMode = modeToolAuditOverlay
 	m.height = 30
@@ -3821,7 +3821,7 @@ func TestToolAuditOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	um, ok := updated.(model)
 	if !ok {
@@ -3846,7 +3846,7 @@ func TestToolAuditOverlayEscapeEnterQAllClose(t *testing.T) {
 	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	um := updated.(model)
 	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
@@ -3870,7 +3870,7 @@ func TestToolAuditOverlayScrollClamps(t *testing.T) {
 	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	um := updated.(model)
 	// Up at 0 stays at 0.
@@ -3897,7 +3897,7 @@ func TestToolAuditOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	m = updated.(model)
 	m.input.SetValue("untouched")
@@ -3920,7 +3920,7 @@ func TestToolsSlashCommandFetchesAuditOnSuccess(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"tools_audit","tools":[{"name":"Read","description":"read a workspace file","risk":"read","allowed":true,"requiresApproval":false}]}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/tools")
 	if cmd == nil {
 		t.Fatalf("expected non-nil cmd from /tools")
@@ -3947,7 +3947,7 @@ func TestToolsSlashCommandFetchesAuditOnSuccess(t *testing.T) {
 func TestToolsSlashCommandFallsBackToStaticOnFetchError(t *testing.T) {
 	// Point at a port nothing is listening on to force a
 	// connection refused.
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	cmd := m.handleLocalCommand("/tools")
 	if cmd == nil {
 		t.Fatalf("expected non-nil cmd from /tools")
@@ -3976,7 +3976,7 @@ func TestToolsSlashCommandFallsBackToStaticOnFetchError(t *testing.T) {
 }
 
 func TestToolAuditMsgErrorFallsBackToStaticCatalogInTranscript(t *testing.T) {
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{err: errors.New("dial tcp: connection refused")})
 	um := updated.(model)
 	// The error must surface in the transcript so the user
@@ -4015,7 +4015,7 @@ func TestFetchToolAuditHTTPCmdSendsCorrectPath(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"tools_audit","tools":[]}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := fetchToolAudit(m.cfg, "user")
 	msg := cmd()
 	audit, ok := msg.(toolAuditMsg)
@@ -4093,13 +4093,13 @@ func TestMajorVersionParsesStandardSemver(t *testing.T) {
 	prevVersion := Version
 	t.Cleanup(func() { Version = prevVersion })
 	cases := map[string]int{
-		"0.0.0":          0,
-		"0.3.2":          0,
-		"1.0.0":          1,
-		"2.5.7":          2,
-		"10.20.30":       10,
-		"dev":            0, // dev fallback is treated as major 0
-		"":               0, // empty fallback is treated as major 0
+		"0.0.0":           0,
+		"0.3.2":           0,
+		"1.0.0":           1,
+		"2.5.7":           2,
+		"10.20.30":        10,
+		"dev":             0, // dev fallback is treated as major 0
+		"":                0, // empty fallback is treated as major 0
 		"1.2.3-pre.4+abc": 1,
 	}
 	for version, want := range cases {
@@ -4114,9 +4114,9 @@ func TestIsGoTuiMajorCompatibleMatchesSupportedMajors(t *testing.T) {
 	prevVersion := Version
 	t.Cleanup(func() { Version = prevVersion })
 	cases := []struct {
-		name             string
-		localVersion     string
-		supportedMajors  []int
+		name            string
+		localVersion    string
+		supportedMajors []int
 		want            bool
 	}{
 		{name: "dev build always passes", localVersion: "dev", supportedMajors: []int{1, 2, 3}, want: true},
@@ -4143,7 +4143,7 @@ func TestCheckRuntimeVersionHTTPCmdSendsCorrectPath(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"runtime_version","serverVersion":"0.3.2","schemaVersion":"2026-05-21.babel-o.v1","goTuiCompatibility":{"supportedMajors":[0],"latestSupported":"0.3.2"},"nodeCliCompatibility":{"supportedMajors":[0],"latestSupported":"0.3.2"}}`))
 	}))
 	defer server.Close()
-	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
 	cmd := checkRuntimeVersion(m.cfg)
 	msg := cmd()
 	rv, ok := msg.(runtimeVersionMsg)
@@ -4168,14 +4168,14 @@ func TestRuntimeVersionMsgCompatMismatchAppendsErrorLine(t *testing.T) {
 	prevVersion := Version
 	t.Cleanup(func() { Version = prevVersion })
 	Version = "2.5.0"
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	envelope := runtimeVersionResponse{
 		Type:          "runtime_version",
 		ServerVersion: "3.0.0",
 		SchemaVersion: "2026-05-21.babel-o.v1",
 		GoTuiCompatibility: runtimeVersionCompat{
 			SupportedMajors: []int{1, 3},
-			LatestSupported:  "3.0.0",
+			LatestSupported: "3.0.0",
 		},
 	}
 	updated, _ := m.Update(runtimeVersionMsg{raw: []byte(`{}`), envelope: envelope})
@@ -4193,14 +4193,14 @@ func TestRuntimeVersionMsgCompatMatchIsSilent(t *testing.T) {
 	prevVersion := Version
 	t.Cleanup(func() { Version = prevVersion })
 	Version = "1.2.3"
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	envelope := runtimeVersionResponse{
 		Type:          "runtime_version",
 		ServerVersion: "1.2.3",
 		SchemaVersion: "2026-05-21.babel-o.v1",
 		GoTuiCompatibility: runtimeVersionCompat{
 			SupportedMajors: []int{0, 1, 2},
-			LatestSupported:  "1.2.3",
+			LatestSupported: "1.2.3",
 		},
 	}
 	baseline := len(m.transcript)
@@ -4216,7 +4216,7 @@ func TestRuntimeVersionMsgErrorIsSilent(t *testing.T) {
 	// the Nexus may be booting or the binary may be older
 	// than the endpoint. The existing runtimeConfigMsg path
 	// surfaces the real connectivity error.
-	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	baseline := len(m.transcript)
 	updated, _ := m.Update(runtimeVersionMsg{err: errors.New("connection refused")})
 	um := updated.(model)

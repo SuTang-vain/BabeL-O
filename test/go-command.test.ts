@@ -86,7 +86,7 @@ test('createGoTuiLaunchSpec falls back to go run when no binary is built', () =>
 
   assert.deepEqual(launch, {
     command: 'go',
-    args: ['run', '.', '--url', 'http://nexus.local', '--cwd', '/workspace'],
+    args: ['run', './cmd/go-tui', '--url', 'http://nexus.local', '--cwd', '/workspace'],
     cwd: sourceDir,
     mode: 'go-run',
   })
@@ -364,13 +364,13 @@ test('collectGoTuiBinaryCandidates returns candidates in the spec order', () => 
   //   1. BABEL_O_GO_TUI_BINARY
   //   2. BABEL_O_GO_TUI_PACKAGE_BINARY
   //   3. /repo/bin/go-tui-darwin-arm64 (platformSuffix darwin)
-  //   4. /repo/clients/go-tui/go-tui (source-relative)
+  //   4. /repo/clients/go-tui/bin/go-tui (source-relative)
   //   5. /home/user/.local/share/babel-o/bin/go-tui-darwin-arm64
   const expected = [
     '/env/bin/go-tui',
     '/env/bin/go-tui-package',
     '/repo/bin/go-tui-darwin-arm64',
-    join(sourceDir, 'go-tui'),
+    join(sourceDir, 'bin', 'go-tui'),
     '/home/user/.local/share/babel-o/bin/go-tui-darwin-arm64',
   ]
   assert.deepEqual(candidates, expected)
@@ -400,7 +400,7 @@ test('collectGoTuiBinaryCandidates omits missing env vars', () => {
   // source-relative. No XDG entry (no homeDir).
   assert.deepEqual(candidates, [
     '/repo/bin/go-tui-linux-x64',
-    join('/src', 'go-tui'),
+    join('/src', 'bin', 'go-tui'),
   ])
 })
 
@@ -416,7 +416,7 @@ test('collectGoTuiBinaryCandidates omits XDG entry when homeDir is missing', () 
   // + source-relative.
   assert.deepEqual(candidates, [
     '/repo/bin/go-tui-darwin-arm64',
-    join('/src', 'go-tui'),
+    join('/src', 'bin', 'go-tui'),
   ])
 })
 
@@ -428,11 +428,11 @@ test('platformSuffix returns the canonical platform-arch segment', () => {
   // Unknown platform falls through to `${platform}-x64`
   // so a future port still gets a reasonable default
   // (the launcher will just fail to find the file and
-  // fall back to source / go run .).
+  // fall back to source / go run ./cmd/go-tui).
   assert.equal(platformSuffix('aix' as NodeJS.Platform), 'aix-x64')
 })
 
-test('defaultGoTuiBinaryName returns the legacy go-tui/go-tui.exe name', () => {
+test('defaultGoTuiBinaryName returns the platform go-tui/go-tui.exe name', () => {
   assert.equal(defaultGoTuiBinaryName('darwin'), 'go-tui')
   assert.equal(defaultGoTuiBinaryName('linux'), 'go-tui')
   assert.equal(defaultGoTuiBinaryName('win32'), 'go-tui.exe')
@@ -471,7 +471,7 @@ test('createGoTuiLaunchSpec prefers BABEL_O_GO_TUI_BINARY over the in-tree dev b
 test('createGoTuiLaunchSpec falls back to the in-tree dev build when no env var is set', () => {
   const packageRoot = '/repo'
   const sourceDir = join(packageRoot, 'clients', 'go-tui')
-  const inTreeBinary = join(sourceDir, 'go-tui')
+  const inTreeBinary = join(sourceDir, 'bin', 'go-tui')
   const exists = (p: string) => p === inTreeBinary
   const launch = createGoTuiLaunchSpec(
     {
@@ -494,7 +494,7 @@ test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tre
   const packageRoot = '/repo'
   const sourceDir = join(packageRoot, 'clients', 'go-tui')
   const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
-  const inTreeBinary = join(sourceDir, 'go-tui')
+  const inTreeBinary = join(sourceDir, 'bin', 'go-tui')
   const exists = (p: string) => p === packageBundled || p === inTreeBinary
   const launch = createGoTuiLaunchSpec(
     {
@@ -516,7 +516,7 @@ test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tre
   assert.equal(launch.mode, 'binary')
 })
 
-test('createGoTuiLaunchSpec falls back to go run . when no binary exists', () => {
+test('createGoTuiLaunchSpec falls back to go run ./cmd/go-tui when no binary exists', () => {
   const packageRoot = '/repo'
   const sourceDir = join(packageRoot, 'clients', 'go-tui')
   // exists() returns true ONLY for the sourceDir itself
@@ -537,7 +537,7 @@ test('createGoTuiLaunchSpec falls back to go run . when no binary exists', () =>
   )
   assert.equal(launch.command, 'go')
   assert.equal(launch.args[0], 'run')
-  assert.equal(launch.args[1], '.')
+  assert.equal(launch.args[1], './cmd/go-tui')
   // The remaining args are the standard Go TUI flags
   // (--url, --cwd, ...).
   assert.equal(launch.mode, 'go-run')
@@ -634,7 +634,7 @@ test('bbl go --check: warns (does not fail) when no prebuilt but source is prese
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
   assert.match(combined, /No prebuilt Go TUI binary found in the multi-path search\./)
-  assert.match(combined, /Will fall back to source 'go run \.'/)
+  assert.match(combined, /Will fall back to source 'go run \.\/cmd\/go-tui'/)
   assert.match(combined, /Result: WARN/)
 })
 
@@ -735,5 +735,4 @@ test('bbl go --help describes the Go TUI as a stable alternative (Phase 9 promot
   // creep back in unless Phase 9 is explicitly re-opened.
   assert.doesNotMatch(description ?? '', /experimental/)
 })
-
 

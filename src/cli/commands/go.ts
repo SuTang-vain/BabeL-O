@@ -168,7 +168,7 @@ export async function runGoTuiCheckReport(
   } else if (exists(sourceDir)) {
     lines.push(
       `[WARN]    No prebuilt Go TUI binary found in the multi-path search. ` +
-        `Will fall back to source 'go run .' from ${sourceDir} ` +
+        `Will fall back to source 'go run ./cmd/go-tui' from ${sourceDir} ` +
         `(requires the Go toolchain on PATH).`,
     )
   } else {
@@ -289,7 +289,7 @@ export function createGoTuiLaunchSpec(
 
   return {
     command: 'go',
-    args: ['run', '.', ...args],
+    args: ['run', './cmd/go-tui', ...args],
     cwd: sourceDir,
     mode: 'go-run',
   }
@@ -307,7 +307,7 @@ export function createGoTuiLaunchSpec(
 //   4. package-bundled default
 //      (`<packageRoot>/bin/go-tui-<platform>-<arch>`)
 //   5. source-relative in-tree dev build
-//      (`<sourceDir>/go-tui` or `go-tui.exe`)
+//      (`<sourceDir>/bin/go-tui` or `bin/go-tui.exe`)
 //   6. XDG user-local
 //      (`~/.local/share/babel-o/bin/go-tui-<platform>-<arch>`)
 //
@@ -342,10 +342,8 @@ export function collectGoTuiBinaryCandidates(input: {
   candidates.push(packageBundled)
   // In-tree dev build (e.g. `make build` then `bbl go` from
   // a source checkout). The Go TUI Makefile drops the
-  // binary at <sourceDir>/bin/go-tui, but the launcher
-  // also accepts the source-relative go-tui as a fallback
-  // for hand-rolled local builds.
-  candidates.push(join(input.sourceDir, defaultGoTuiBinaryName(input.platform)))
+  // binary at <sourceDir>/bin/go-tui.
+  candidates.push(defaultGoTuiBinary(input.sourceDir, input.platform))
   if (input.homeDir) {
     const xdgLocal = join(
       input.homeDir,
@@ -361,9 +359,9 @@ export function collectGoTuiBinaryCandidates(input: {
 }
 
 // defaultGoTuiBinaryName returns the platform-specific
-// legacy binary name ("go-tui" or "go-tui.exe"). Kept as a
-// thin wrapper so the Phase 8 PR2 launcher's multi-path
-// discovery can also probe the in-tree dev build.
+// binary filename ("go-tui" or "go-tui.exe"). Kept as a
+// thin wrapper so the launcher's multi-path discovery can
+// probe the in-tree dev build under <sourceDir>/bin.
 export function defaultGoTuiBinaryName(platform: NodeJS.Platform): string {
   return platform === 'win32' ? 'go-tui.exe' : 'go-tui'
 }
@@ -570,5 +568,5 @@ export function defaultGoTuiSourceDir(packageRoot = defaultPackageRoot()): strin
 }
 
 export function defaultGoTuiBinary(sourceDir = defaultGoTuiSourceDir(), platform: NodeJS.Platform = process.platform): string {
-  return join(sourceDir, platform === 'win32' ? 'go-tui.exe' : 'go-tui')
+  return join(sourceDir, 'bin', defaultGoTuiBinaryName(platform))
 }

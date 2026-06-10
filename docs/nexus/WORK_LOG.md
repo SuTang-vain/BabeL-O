@@ -2,6 +2,28 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI 目录规整：entry/core/tests/build output 分层
+
+- **用户请求**: Go TUI 的 test 文件和 gotui 文件都堆在一个目录里，需要规整分离。
+- **实现**:
+  - `clients/go-tui/cmd/go-tui/main.go`: 新增 executable entrypoint，只负责 flag parsing、env handoff、`--version` 短路和 `os.Exit`。
+  - `clients/go-tui/internal/tui/tui.go`: 核心 Bubble Tea TUI 包迁入 `internal/tui`，提供 `tui.Run(cfg)` public entrypoint；`Config` 字段导出给 `cmd/go-tui` 使用。
+  - `clients/go-tui/internal/tui/version.go`: 版本元数据迁入 `internal/tui`，导出 `VersionString()`，继续保留包内白盒 helper 供测试覆盖。
+  - `clients/go-tui/internal/tui/tui_test.go`: 白盒状态机测试保留在同一 Go package 内。这里是刻意选择：这些测试覆盖大量未导出的 mode / overlay / event reducer 状态；若强行搬到外部 package，需要把内部状态机 API 大量导出，反而削弱封装。
+  - `clients/go-tui/bin/`: 本地 `make dev` / `make build` 输出目录，已加入 `.gitignore`，旧顶层 `clients/go-tui/go-tui` / `.exe` 仍保持 ignore 兼容。
+  - `clients/go-tui/Makefile`: build/dev 目标改为 `go build ./cmd/go-tui`，ldflags 注入包路径改为 `github.com/sutang-vain/babel-o/clients/go-tui/internal/tui`。
+  - `src/cli/commands/go.ts`: source fallback 改为 `go run ./cmd/go-tui`，source checkout dev binary 改为 `<sourceDir>/bin/go-tui`。
+  - `test/go_tui_pty_driver.py`、`test/go-tui-smoke.test.ts`、`test/go-command.test.ts`: smoke harness、prebuilt 检测和 launcher 断言同步新路径。
+  - `package.json` 发布清单加入 `clients/go-tui/cmd/go-tui/*.go` 与 `clients/go-tui/internal/tui/*.go`，并排除 `*_test.go`；source fallback 需要可运行源码，不需要把白盒测试打进 npm 包。
+  - 文档同步：`clients/go-tui/README.md` 新增 Source Layout，`docs/nexus/TODO.md`、`docs/nexus/active/TODO_tui.md`、`docs/nexus/reference/go-tui-rewrite-plan.md` 改为 stable opt-in + 标准 Go layout 口径。
+- **验证**:
+  - `cd clients/go-tui && go test ./...`
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-go-layout-test-config.json npm exec -- tsx --test --test-concurrency=1 test/go-command.test.ts`
+  - `npm run typecheck`
+  - `npm run format:check`
+  - `cd clients/go-tui && make dev && ./bin/go-tui --version`
+  - `npm pack --dry-run --json --silent` 确认包内只包含 `clients/go-tui/cmd/go-tui/main.go`、`clients/go-tui/internal/tui/tui.go`、`clients/go-tui/internal/tui/version.go`、`go.mod`、`go.sum`、`Makefile` 和 README，不包含 `*_test.go` 或本地 `bin/`。
+
 ## 2026-06-10 — Go TUI Phase 9 promotion gate：决策收口（stable alternative to `bbl chat`）
 
 - **用户请求**: 按 TODO_tui.md 收尾项推进 Phase 9 promotion gate，3 个 commit 一起推完。

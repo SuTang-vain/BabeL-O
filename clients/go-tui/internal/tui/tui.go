@@ -1,15 +1,13 @@
-package main
+package tui
 
 import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -24,14 +22,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type config struct {
-	baseURL        string
-	cwd            string
-	sessionID      string
-	apiKey         string
-	altScreen      bool
-	pollIntervalMs int
-	printVersion   bool
+type Config struct {
+	BaseURL        string
+	Cwd            string
+	SessionID      string
+	APIKey         string
+	AltScreen      bool
+	PollIntervalMs int
+	PrintVersion   bool
 }
 
 type streamStartedMsg struct {
@@ -169,9 +167,9 @@ type compactResultMsg struct {
 type sessionChannelKind string
 
 const (
-	channelKindDirect       sessionChannelKind = "direct"
-	channelKindGroup        sessionChannelKind = "group"
-	channelKindParentChild  sessionChannelKind = "parent_child"
+	channelKindDirect        sessionChannelKind = "direct"
+	channelKindGroup         sessionChannelKind = "group"
+	channelKindParentChild   sessionChannelKind = "parent_child"
 	channelKindWorkspacePair sessionChannelKind = "workspace_pair"
 	channelKindProjectBridge sessionChannelKind = "project_bridge"
 )
@@ -230,12 +228,12 @@ type evidenceRef struct {
 // channels; it only reads kind / participantSessionIds / status for
 // display purposes.
 type sessionChannel struct {
-	ChannelID            string             `json:"channelId"`
-	Kind                 sessionChannelKind `json:"kind"`
-	ParticipantSessionIDs []string          `json:"participantSessionIds"`
-	CreatedBySessionID   string             `json:"createdBySessionId"`
-	CreatedAt            string             `json:"createdAt"`
-	Status               sessionChannelStatus `json:"status"`
+	ChannelID             string               `json:"channelId"`
+	Kind                  sessionChannelKind   `json:"kind"`
+	ParticipantSessionIDs []string             `json:"participantSessionIds"`
+	CreatedBySessionID    string               `json:"createdBySessionId"`
+	CreatedAt             string               `json:"createdAt"`
+	Status                sessionChannelStatus `json:"status"`
 }
 
 // sessionMessage is the read-only view of a SessionMessage used by
@@ -270,10 +268,10 @@ type sessionMessage struct {
 // (see inboxMsg.raw) so schema churn upstream cannot break the
 // client.
 type sessionInboxResponse struct {
-	Type               string            `json:"type"`
-	SessionID          string            `json:"sessionId"`
-	Messages           []sessionMessage  `json:"messages"`
-	Limit              int               `json:"limit"`
+	Type                string           `json:"type"`
+	SessionID           string           `json:"sessionId"`
+	Messages            []sessionMessage `json:"messages"`
+	Limit               int              `json:"limit"`
 	IncludeAcknowledged bool             `json:"includeAcknowledged"`
 }
 
@@ -286,12 +284,12 @@ type sessionInboxResponse struct {
 // snapshot in-place ("auto" — fired by end-of-turn auto-refresh
 // in consumeNexusEvent).
 type inboxMsg struct {
-	sessionID         string
-	raw               []byte
-	envelope          sessionInboxResponse
-	includeAck        bool
-	trigger           string
-	err               error
+	sessionID  string
+	raw        []byte
+	envelope   sessionInboxResponse
+	includeAck bool
+	trigger    string
+	err        error
 }
 
 // inboxAckMsg is the response from
@@ -341,11 +339,11 @@ const (
 type contextForkMode string
 
 const (
-	contextForkMinimal      contextForkMode = "minimal"
-	contextForkWorkingSet   contextForkMode = "working-set"
-	contextForkTaskFocused  contextForkMode = "task-focused"
-	contextForkFullSummary  contextForkMode = "full-summary"
-	contextForkDebugReplay  contextForkMode = "debug-replay"
+	contextForkMinimal     contextForkMode = "minimal"
+	contextForkWorkingSet  contextForkMode = "working-set"
+	contextForkTaskFocused contextForkMode = "task-focused"
+	contextForkFullSummary contextForkMode = "full-summary"
+	contextForkDebugReplay contextForkMode = "debug-replay"
 )
 
 // agentIsolationMode mirrors AgentIsolationMode in
@@ -516,11 +514,11 @@ const (
 type taskSource string
 
 const (
-	taskSourcePlanner taskSource = "planner"
+	taskSourcePlanner  taskSource = "planner"
 	taskSourceExecutor taskSource = "executor"
-	taskSourceCritic  taskSource = "critic"
-	taskSourceUser    taskSource = "user"
-	taskSourceSystem  taskSource = "system"
+	taskSourceCritic   taskSource = "critic"
+	taskSourceUser     taskSource = "user"
+	taskSourceSystem   taskSource = "system"
 )
 
 // taskReviewStatus mirrors the nested `review.status` field.
@@ -545,22 +543,22 @@ type taskReview struct {
 // the payload stays in tasksListMsg.raw for any future richer
 // renderer (mirroring the inbox / context / compact pattern).
 type nexusTask struct {
-	TaskID             string            `json:"taskId"`
-	SessionID          string            `json:"sessionId"`
-	Title              string            `json:"title"`
-	Description        string            `json:"description,omitempty"`
-	Status             taskStatus        `json:"status"`
-	OwnerAgentID       string            `json:"ownerAgentId,omitempty"`
-	CreatedBySessionID string            `json:"createdBySessionId,omitempty"`
-	Source             taskSource        `json:"source,omitempty"`
-	DependsOn          []string          `json:"dependsOn"`
-	Blocks             []string          `json:"blocks"`
-	RetryCount         int               `json:"retryCount"`
-	Review             *taskReview       `json:"review,omitempty"`
-	Metadata           map[string]any    `json:"metadata,omitempty"`
-	CreatedAt          string            `json:"createdAt"`
-	UpdatedAt          string            `json:"updatedAt"`
-	Result             string            `json:"result,omitempty"`
+	TaskID             string         `json:"taskId"`
+	SessionID          string         `json:"sessionId"`
+	Title              string         `json:"title"`
+	Description        string         `json:"description,omitempty"`
+	Status             taskStatus     `json:"status"`
+	OwnerAgentID       string         `json:"ownerAgentId,omitempty"`
+	CreatedBySessionID string         `json:"createdBySessionId,omitempty"`
+	Source             taskSource     `json:"source,omitempty"`
+	DependsOn          []string       `json:"dependsOn"`
+	Blocks             []string       `json:"blocks"`
+	RetryCount         int            `json:"retryCount"`
+	Review             *taskReview    `json:"review,omitempty"`
+	Metadata           map[string]any `json:"metadata,omitempty"`
+	CreatedAt          string         `json:"createdAt"`
+	UpdatedAt          string         `json:"updatedAt"`
+	Result             string         `json:"result,omitempty"`
 }
 
 // tasksListResponse is the envelope for
@@ -706,64 +704,64 @@ type runtimeVersionMsg struct {
 type inputMode string
 
 const (
-	modeComposing      inputMode = "composing"      // textinput owns keys
-	modePermission     inputMode = "permission"     // a/y/r/n/esc only
-	modeSlashPick      inputMode = "slashPick"      // one-shot slash palette (no live filter yet)
-	modeHelpOverlay    inputMode = "helpOverlay"    // read-only help; up/down/esc/enter
-	modeProfileConfirm inputMode = "profileConfirm" // y/n/esc only; gates selectRuntimeProfile
-	modeContextOverlay inputMode = "contextOverlay" // read-only context analysis; up/down/esc/enter
-	modeInboxOverlay   inputMode = "inboxOverlay"   // read-only SessionChannel inbox; up/down/a/esc/enter/q
-	modeAgentOverlay   inputMode = "agentOverlay"   // read-only multi-agent status; up/down/esc/enter/q
-	modeTaskBoard      inputMode = "taskBoard"      // read-only task board; up/down/esc/enter/q
-	modeActivityOverlay inputMode = "activityOverlay" // read-only recent activity; up/down/esc/enter/q
+	modeComposing        inputMode = "composing"        // textinput owns keys
+	modePermission       inputMode = "permission"       // a/y/r/n/esc only
+	modeSlashPick        inputMode = "slashPick"        // one-shot slash palette (no live filter yet)
+	modeHelpOverlay      inputMode = "helpOverlay"      // read-only help; up/down/esc/enter
+	modeProfileConfirm   inputMode = "profileConfirm"   // y/n/esc only; gates selectRuntimeProfile
+	modeContextOverlay   inputMode = "contextOverlay"   // read-only context analysis; up/down/esc/enter
+	modeInboxOverlay     inputMode = "inboxOverlay"     // read-only SessionChannel inbox; up/down/a/esc/enter/q
+	modeAgentOverlay     inputMode = "agentOverlay"     // read-only multi-agent status; up/down/esc/enter/q
+	modeTaskBoard        inputMode = "taskBoard"        // read-only task board; up/down/esc/enter/q
+	modeActivityOverlay  inputMode = "activityOverlay"  // read-only recent activity; up/down/esc/enter/q
 	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
 
 type model struct {
-	cfg            config
-	input          textinput.Model
-	viewport       viewport.Model
-	spinner        spinner.Model
-	transcript     []transcriptLine
-	inputMode      inputMode
-	helpScroll     int
-	running        bool
-	events         <-chan streamEvent
-	decisions      chan<- permissionDecision
-	pending        *pendingPermission
-	lastEventType  string
-	sessionID      string
-	modelID        string
-	providerID     string
-	activeProfile  string
-	configVersion  int
-	profileCount   int
-	tombstoneCount int
-	paletteFilter  string
-	paletteSelected int
-	pendingProfileName string
-	contextOverlayLines  []string
-	contextOverlayScroll int
-	inboxMessages    []sessionMessage
-	inboxChannels    []sessionChannel
-	inboxOverlaySelected int
-	inboxOverlayScroll   int
-	inboxOverlayIncludeAck bool
+	cfg                     Config
+	input                   textinput.Model
+	viewport                viewport.Model
+	spinner                 spinner.Model
+	transcript              []transcriptLine
+	inputMode               inputMode
+	helpScroll              int
+	running                 bool
+	events                  <-chan streamEvent
+	decisions               chan<- permissionDecision
+	pending                 *pendingPermission
+	lastEventType           string
+	sessionID               string
+	modelID                 string
+	providerID              string
+	activeProfile           string
+	configVersion           int
+	profileCount            int
+	tombstoneCount          int
+	paletteFilter           string
+	paletteSelected         int
+	pendingProfileName      string
+	contextOverlayLines     []string
+	contextOverlayScroll    int
+	inboxMessages           []sessionMessage
+	inboxChannels           []sessionChannel
+	inboxOverlaySelected    int
+	inboxOverlayScroll      int
+	inboxOverlayIncludeAck  bool
 	seenInboxCardMessageIDs map[string]struct{}
-	agentJobs        []agentJob
-	agentOverlayScroll int
-	taskBoard        []nexusTask
-	taskBoardScroll  int
-	activityEvents     []activityEventEntry
-	activityOverlayScroll int
-	subAgents         map[string]subAgentEntry
-	toolAuditEntries     []runtimeToolAuditEntry
-	toolAuditScroll     int
-	startedAt      time.Time
-	width          int
-	height         int
+	agentJobs               []agentJob
+	agentOverlayScroll      int
+	taskBoard               []nexusTask
+	taskBoardScroll         int
+	activityEvents          []activityEventEntry
+	activityOverlayScroll   int
+	subAgents               map[string]subAgentEntry
+	toolAuditEntries        []runtimeToolAuditEntry
+	toolAuditScroll         int
+	startedAt               time.Time
+	width                   int
+	height                  int
 }
 
 func (m *model) setMode(next inputMode) {
@@ -1179,39 +1177,19 @@ var (
 	toolPaletteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
 )
 
-func main() {
-	cfg := parseFlags()
-	if cfg.printVersion {
-		fmt.Println(versionString())
-		return
-	}
+func Run(cfg Config) error {
 	m := newModel(cfg)
 	opts := []tea.ProgramOption{}
-	if cfg.altScreen {
+	if cfg.AltScreen {
 		opts = append(opts, tea.WithAltScreen())
 	}
 	if _, err := tea.NewProgram(m, opts...).Run(); err != nil {
-		fmt.Fprintf(os.Stderr, "go-tui failed: %v\n", err)
-		os.Exit(1)
+		return err
 	}
+	return nil
 }
 
-func parseFlags() config {
-	cwd, _ := os.Getwd()
-	cfg := config{}
-	flag.StringVar(&cfg.baseURL, "url", "http://127.0.0.1:3000", "BabeL-O Nexus base URL")
-	flag.StringVar(&cfg.cwd, "cwd", cwd, "workspace directory sent to Nexus")
-	flag.StringVar(&cfg.sessionID, "session", "", "optional existing session id")
-	flag.BoolVar(&cfg.altScreen, "alt", true, "use terminal alternate screen")
-	flag.IntVar(&cfg.pollIntervalMs, "poll-interval-ms", 30000, "background /v1/runtime/config poll interval in milliseconds; 0 disables polling")
-	flag.BoolVar(&cfg.printVersion, "version", false, "print version and exit")
-	flag.BoolVar(&cfg.printVersion, "v", false, "print version and exit (shorthand)")
-	flag.Parse()
-	cfg.apiKey = os.Getenv("NEXUS_API_KEY")
-	return cfg
-}
-
-func newModel(cfg config) model {
+func newModel(cfg Config) model {
 	input := textinput.New()
 	input.Placeholder = "Ask BabeL-O"
 	input.Focus()
@@ -1236,7 +1214,7 @@ func newModel(cfg config) model {
 			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
 		},
 		seenInboxCardMessageIDs: map[string]struct{}{},
-		subAgents:                map[string]subAgentEntry{},
+		subAgents:               map[string]subAgentEntry{},
 	}
 }
 
@@ -1262,10 +1240,10 @@ func (m model) Init() tea.Cmd {
 // pollTickMsg after the configured interval; the handler then re-arms
 // itself so polling continues until the model is destroyed.
 func (m model) schedulePollTick() tea.Cmd {
-	if m.cfg.pollIntervalMs <= 0 {
+	if m.cfg.PollIntervalMs <= 0 {
 		return nil
 	}
-	d := time.Duration(m.cfg.pollIntervalMs) * time.Millisecond
+	d := time.Duration(m.cfg.PollIntervalMs) * time.Millisecond
 	return tea.Tick(d, func(time.Time) tea.Msg { return pollTickMsg{} })
 }
 
@@ -1855,7 +1833,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case pollTickMsg:
-		// Background poll. If we've never fetched a config, defer to the
+		// Background poll. If we've never fetched a Config, defer to the
 		// next round rather than blocking the chat loop.
 		if m.configVersion <= 0 {
 			return m, m.schedulePollTick()
@@ -2131,17 +2109,17 @@ func (m model) renderContextOverlay(width int) string {
 // fields are silently skipped so the line count stays bounded.
 func buildContextOverlayLines(raw []byte) []string {
 	var payload struct {
-		Type         string `json:"type"`
-		SessionID    string `json:"sessionId"`
-		Cwd          string `json:"cwd"`
-		ModelID      string `json:"modelId"`
-		Budget       struct {
-			MaxTokens   int `json:"maxTokens"`
+		Type      string `json:"type"`
+		SessionID string `json:"sessionId"`
+		Cwd       string `json:"cwd"`
+		ModelID   string `json:"modelId"`
+		Budget    struct {
+			MaxTokens    int `json:"maxTokens"`
 			LayerBudgets struct {
-				System   int `json:"system"`
-				Summary  int `json:"summary"`
-				History  int `json:"history"`
-				Memory   int `json:"memory"`
+				System         int `json:"system"`
+				Summary        int `json:"summary"`
+				History        int `json:"history"`
+				Memory         int `json:"memory"`
 				ReservedOutput int `json:"reservedOutput"`
 			} `json:"layerBudgets"`
 		} `json:"budget"`
@@ -2150,17 +2128,17 @@ func buildContextOverlayLines(raw []byte) []string {
 			TokenEstimate int `json:"tokenEstimate"`
 		} `json:"window"`
 		Sections struct {
-			SystemPromptChars     int  `json:"systemPromptChars"`
-			ProjectMemoryChars    int  `json:"projectMemoryChars"`
-			SessionSummaryChars   int  `json:"sessionSummaryChars"`
-			ActiveSkillsChars     int  `json:"activeSkillsChars"`
-			MessageCount          int  `json:"messageCount"`
-			SelectedEventCount    int  `json:"selectedEventCount"`
-			OmittedEventCount     int  `json:"omittedEventCount"`
-			SnippedEventCount     int  `json:"snippedEventCount"`
-			MicrocompactedEventCount int `json:"microcompactedEventCount"`
-			MemoryTruncated       bool `json:"memoryTruncated"`
-			ToolDefinitionCount   int  `json:"toolDefinitionCount"`
+			SystemPromptChars        int  `json:"systemPromptChars"`
+			ProjectMemoryChars       int  `json:"projectMemoryChars"`
+			SessionSummaryChars      int  `json:"sessionSummaryChars"`
+			ActiveSkillsChars        int  `json:"activeSkillsChars"`
+			MessageCount             int  `json:"messageCount"`
+			SelectedEventCount       int  `json:"selectedEventCount"`
+			OmittedEventCount        int  `json:"omittedEventCount"`
+			SnippedEventCount        int  `json:"snippedEventCount"`
+			MicrocompactedEventCount int  `json:"microcompactedEventCount"`
+			MemoryTruncated          bool `json:"memoryTruncated"`
+			ToolDefinitionCount      int  `json:"toolDefinitionCount"`
 		} `json:"sections"`
 		Compact struct {
 			HasBoundary            bool   `json:"hasBoundary"`
@@ -2173,9 +2151,9 @@ func buildContextOverlayLines(raw []byte) []string {
 			AfterEventCount        int    `json:"afterEventCount"`
 		} `json:"compact"`
 		Diagnostics struct {
-			RemainingTokens   int  `json:"remainingTokens"`
-			RemainingPercent  int  `json:"remainingPercent"`
-			AutoCompact       struct {
+			RemainingTokens  int `json:"remainingTokens"`
+			RemainingPercent int `json:"remainingPercent"`
+			AutoCompact      struct {
 				ShouldCompact    bool `json:"shouldCompact"`
 				ThresholdPercent int  `json:"thresholdPercent"`
 				FuseOpen         bool `json:"fuseOpen"`
@@ -2183,29 +2161,29 @@ func buildContextOverlayLines(raw []byte) []string {
 				FailureLimit     int  `json:"failureLimit"`
 			} `json:"autoCompact"`
 			LongTermMemory struct {
+				Provider        string  `json:"provider"`
+				Enabled         bool    `json:"enabled"`
+				HitCount        int     `json:"hitCount"`
+				InjectedChars   int     `json:"injectedChars"`
+				BudgetChars     int     `json:"budgetChars"`
+				Truncated       bool    `json:"truncated"`
+				Scope           string  `json:"scope"`
+				NamespaceID     string  `json:"namespaceId"`
+				SearchLatencyMs float64 `json:"searchLatencyMs"`
+				Error           string  `json:"error"`
+			} `json:"longTermMemory"`
+			ScopedMemory []struct {
+				Scope         string `json:"scope"`
 				Provider      string `json:"provider"`
 				Enabled       bool   `json:"enabled"`
 				HitCount      int    `json:"hitCount"`
 				InjectedChars int    `json:"injectedChars"`
 				BudgetChars   int    `json:"budgetChars"`
 				Truncated     bool   `json:"truncated"`
-				Scope         string `json:"scope"`
 				NamespaceID   string `json:"namespaceId"`
-				SearchLatencyMs float64 `json:"searchLatencyMs"`
-				Error         string `json:"error"`
-			} `json:"longTermMemory"`
-			ScopedMemory []struct {
-				Scope        string `json:"scope"`
-				Provider     string `json:"provider"`
-				Enabled      bool   `json:"enabled"`
-				HitCount     int    `json:"hitCount"`
-				InjectedChars int   `json:"injectedChars"`
-				BudgetChars  int    `json:"budgetChars"`
-				Truncated    bool   `json:"truncated"`
-				NamespaceID  string `json:"namespaceId"`
 			} `json:"scopedMemory"`
 			SessionMemoryLite struct {
-				Enabled bool `json:"enabled"`
+				Enabled    bool `json:"enabled"`
 				LastUpdate struct {
 					Trigger      string `json:"trigger"`
 					Reason       string `json:"reason"`
@@ -2217,32 +2195,32 @@ func buildContextOverlayLines(raw []byte) []string {
 					Reason       string `json:"reason"`
 				} `json:"nextDecision"`
 				CostPolicy struct {
-					SummaryMode    string `json:"summaryMode"`
-					MaxSummaryChars int   `json:"maxSummaryChars"`
+					SummaryMode     string `json:"summaryMode"`
+					MaxSummaryChars int    `json:"maxSummaryChars"`
 				} `json:"costPolicy"`
 			} `json:"sessionMemoryLite"`
 			CompactRetention struct {
-				HasBoundary          bool   `json:"hasBoundary"`
-				RetainedEventCount   int    `json:"retainedEventCount"`
-				RetainedSegmentValid bool   `json:"retainedSegmentValid"`
+				HasBoundary            bool   `json:"hasBoundary"`
+				RetainedEventCount     int    `json:"retainedEventCount"`
+				RetainedSegmentValid   bool   `json:"retainedSegmentValid"`
 				RetainedSegmentWarning string `json:"retainedSegmentWarning"`
-				FallbackToFullHistory bool  `json:"fallbackToFullHistory"`
+				FallbackToFullHistory  bool   `json:"fallbackToFullHistory"`
 			} `json:"compactRetention"`
 			CompactTokenDelta struct {
-				HasBoundary            bool `json:"hasBoundary"`
-				BeforeEventCount       int  `json:"beforeEventCount"`
-				AfterEventCount        int  `json:"afterEventCount"`
-				EstimatedTokensSaved   int  `json:"estimatedTokensSaved"`
+				HasBoundary          bool `json:"hasBoundary"`
+				BeforeEventCount     int  `json:"beforeEventCount"`
+				AfterEventCount      int  `json:"afterEventCount"`
+				EstimatedTokensSaved int  `json:"estimatedTokensSaved"`
 			} `json:"compactTokenDelta"`
 			ResumeRecovery struct {
-				Active   bool   `json:"active"`
-				Code     string `json:"code"`
-				Message  string `json:"message"`
+				Active    bool   `json:"active"`
+				Code      string `json:"code"`
+				Message   string `json:"message"`
 				Timestamp string `json:"timestamp"`
 			} `json:"resumeRecovery"`
 			WorkingSetPaths []struct {
-				Path   string `json:"path"`
-				Touches int   `json:"touches"`
+				Path    string `json:"path"`
+				Touches int    `json:"touches"`
 			} `json:"workingSetPaths"`
 			RepeatedToolInputs []struct {
 				Name         string `json:"name"`
@@ -2250,8 +2228,8 @@ func buildContextOverlayLines(raw []byte) []string {
 				InputPreview string `json:"inputPreview"`
 			} `json:"repeatedToolInputs"`
 			LargeToolResults []struct {
-				Name        string `json:"name"`
-				OutputChars int    `json:"outputChars"`
+				Name         string `json:"name"`
+				OutputChars  int    `json:"outputChars"`
 				InputPreview string `json:"inputPreview"`
 			} `json:"largeToolResults"`
 		} `json:"diagnostics"`
@@ -3703,7 +3681,7 @@ func (m model) renderHeader(width int) string {
 	}
 	profile := firstNonEmpty(m.activeProfile, "none")
 	top := joinColumns(width, title, statusStyle.Render(state))
-	meta := fmt.Sprintf("url=%s  cwd=%s  session=%s  model=%s  profile=%s", m.cfg.baseURL, m.cfg.cwd, session, model, profile)
+	meta := fmt.Sprintf("url=%s  cwd=%s  session=%s  model=%s  profile=%s", m.cfg.BaseURL, m.cfg.Cwd, session, model, profile)
 	if m.configVersion > 0 || m.profileCount > 0 || m.tombstoneCount > 0 {
 		meta += fmt.Sprintf("  config=v%d profiles=%d tombstones=%d", m.configVersion, m.profileCount, m.tombstoneCount)
 	}
@@ -4498,7 +4476,7 @@ func formatToolInput(name string, input any) string {
 	return singleLine(truncatePlain(compactJSON(input), 120))
 }
 
-func startStream(cfg config, prompt string) tea.Cmd {
+func startStream(cfg Config, prompt string) tea.Cmd {
 	return func() tea.Msg {
 		eventCh := make(chan streamEvent, 128)
 		decisionCh := make(chan permissionDecision, 8)
@@ -4520,7 +4498,7 @@ func waitForStreamEvent(ch <-chan streamEvent) tea.Cmd {
 	}
 }
 
-func fetchRuntimeConfig(cfg config, since int) tea.Cmd {
+func fetchRuntimeConfig(cfg Config, since int) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeConfig
 		var query url.Values
@@ -4536,7 +4514,7 @@ func pollTick() tea.Msg {
 	return pollTickMsg{}
 }
 
-func fetchRuntimeProfiles(cfg config) tea.Cmd {
+func fetchRuntimeProfiles(cfg Config) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeProfilesResponse
 		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config/profiles", nil, &payload)
@@ -4544,7 +4522,7 @@ func fetchRuntimeProfiles(cfg config) tea.Cmd {
 	}
 }
 
-func selectRuntimeProfile(cfg config, profile string) tea.Cmd {
+func selectRuntimeProfile(cfg Config, profile string) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeConfig
 		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"profile": profile}, &payload)
@@ -4552,14 +4530,14 @@ func selectRuntimeProfile(cfg config, profile string) tea.Cmd {
 	}
 }
 
-func fetchContextAnalysis(cfg config, sessionID string) tea.Cmd {
+func fetchContextAnalysis(cfg Config, sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/context", nil)
 		return contextAnalysisMsg{sessionID: sessionID, raw: raw, err: err}
 	}
 }
 
-func triggerCompact(cfg config, sessionID string) tea.Cmd {
+func triggerCompact(cfg Config, sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4579,7 +4557,7 @@ func triggerCompact(cfg config, sessionID string) tea.Cmd {
 // ("user" / "auto") tells the Update handler whether to open the
 // overlay (user /inbox command) or just refresh the snapshot in
 // place (Phase 6 PR2 end-of-turn auto-refresh).
-func fetchInbox(cfg config, sessionID string, includeAck bool, trigger string) tea.Cmd {
+func fetchInbox(cfg Config, sessionID string, includeAck bool, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		query := url.Values{}
 		if includeAck {
@@ -4606,7 +4584,7 @@ func fetchInbox(cfg config, sessionID string, includeAck bool, trigger string) t
 // The Go TUI does not need the full message body back — only a
 // success signal — so the message field is preserved as raw bytes
 // for any future audit / governance renderer.
-func ackInboxMessage(cfg config, sessionID string, messageID string) tea.Cmd {
+func ackInboxMessage(cfg Config, sessionID string, messageID string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4627,7 +4605,7 @@ func ackInboxMessage(cfg config, sessionID string, messageID string) tea.Cmd {
 // whether to open the overlay (user /agents command) or just
 // refresh the snapshot in place (Phase 6 PR3 end-of-turn
 // auto-refresh, paired with fetchInbox auto-refresh).
-func fetchSessionAgents(cfg config, sessionID string, trigger string) tea.Cmd {
+func fetchSessionAgents(cfg Config, sessionID string, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4654,7 +4632,7 @@ func fetchSessionAgents(cfg config, sessionID string, trigger string) tea.Cmd {
 // whether to open the overlay (user /tasks command) or just
 // refresh the snapshot in place (Phase 6 PR4 end-of-turn
 // auto-refresh, paired with fetchInbox + fetchSessionAgents).
-func fetchSessionTasks(cfg config, sessionID string, trigger string) tea.Cmd {
+func fetchSessionTasks(cfg Config, sessionID string, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4680,7 +4658,7 @@ func fetchSessionTasks(cfg config, sessionID string, trigger string) tea.Cmd {
 // server-side schema addition) does not break the existing
 // format / compat check. Called once at startup from
 // Init() as a non-blocking version-compat sanity check.
-func checkRuntimeVersion(cfg config) tea.Cmd {
+func checkRuntimeVersion(cfg Config) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4714,7 +4692,7 @@ func checkRuntimeVersion(cfg config) tea.Cmd {
 // registry, not a per-session view); a future PR can wire
 // an "auto" trigger if the runtime ever signals a registry
 // change via the stream.
-func fetchToolAudit(cfg config, trigger string) tea.Cmd {
+func fetchToolAudit(cfg Config, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(
 			cfg,
@@ -4732,8 +4710,8 @@ func fetchToolAudit(cfg config, trigger string) tea.Cmd {
 	}
 }
 
-func nexusJSON(cfg config, method string, path string, body any, out any, query ...url.Values) error {
-	endpoint, err := apiURL(cfg.baseURL, path)
+func nexusJSON(cfg Config, method string, path string, body any, out any, query ...url.Values) error {
+	endpoint, err := apiURL(cfg.BaseURL, path)
 	if err != nil {
 		return err
 	}
@@ -4756,8 +4734,8 @@ func nexusJSON(cfg config, method string, path string, body any, out any, query 
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if cfg.apiKey != "" {
-		req.Header.Set("X-Nexus-API-Key", cfg.apiKey)
+	if cfg.APIKey != "" {
+		req.Header.Set("X-Nexus-API-Key", cfg.APIKey)
 	}
 	client := http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
@@ -4791,8 +4769,8 @@ func nexusJSON(cfg config, method string, path string, body any, out any, query 
 // shape and error semantics, but the response body is returned
 // untouched so the caller can lazily decode only the fields it
 // needs (and ignore schema churn on the rest of the payload).
-func nexusRawJSON(cfg config, method string, path string, body any, query ...url.Values) ([]byte, error) {
-	endpoint, err := apiURL(cfg.baseURL, path)
+func nexusRawJSON(cfg Config, method string, path string, body any, query ...url.Values) ([]byte, error) {
+	endpoint, err := apiURL(cfg.BaseURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -4815,8 +4793,8 @@ func nexusRawJSON(cfg config, method string, path string, body any, query ...url
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if cfg.apiKey != "" {
-		req.Header.Set("X-Nexus-API-Key", cfg.apiKey)
+	if cfg.APIKey != "" {
+		req.Header.Set("X-Nexus-API-Key", cfg.APIKey)
 	}
 	client := http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
@@ -4951,11 +4929,11 @@ func formatRuntimeProfiles(response runtimeProfilesResponse) string {
 // from analyzeContext. The Go TUI only renders these fields — the
 // rest of the payload is opaque by design.
 type contextAnalysisDiagnostic struct {
-	Name            string            `json:"name"`
-	Status          string            `json:"status"`
-	Summary         string            `json:"summary"`
-	Signals         []contextSignal   `json:"signals"`
-	Recommendations []string          `json:"recommendations"`
+	Name            string          `json:"name"`
+	Status          string          `json:"status"`
+	Summary         string          `json:"summary"`
+	Signals         []contextSignal `json:"signals"`
+	Recommendations []string        `json:"recommendations"`
 }
 
 type contextSignal struct {
@@ -4972,11 +4950,11 @@ type contextSignal struct {
 // renderer (e.g. a contextOverlay).
 func formatContextAnalysis(raw []byte) string {
 	var top struct {
-		Type           string                     `json:"type"`
-		SessionID      string                     `json:"sessionId"`
-		ModelID        string                     `json:"modelId"`
-		Diagnostic     contextAnalysisDiagnostic  `json:"diagnostic"`
-		CompactHasBnd  bool                       `json:"-"` // see below
+		Type          string                    `json:"type"`
+		SessionID     string                    `json:"sessionId"`
+		ModelID       string                    `json:"modelId"`
+		Diagnostic    contextAnalysisDiagnostic `json:"diagnostic"`
+		CompactHasBnd bool                      `json:"-"` // see below
 	}
 	// We decode the compact.hasBoundary separately because it lives
 	// under payload.compact.hasBoundary, not at the top level.
@@ -5053,19 +5031,19 @@ func formatCompactResult(raw []byte) string {
 		BeforeEventCount int    `json:"beforeEventCount"`
 		AfterEventCount  int    `json:"afterEventCount"`
 		Event            struct {
-			Type              string `json:"type"`
-			Code              string `json:"code"`
-			Trigger           string `json:"trigger"`
-			Summary           string `json:"summary"`
-			SummaryChars      int    `json:"summaryChars"`
-			SnippedToolResults int   `json:"snippedToolResults"`
-			RetainedEvents    []struct {
+			Type               string `json:"type"`
+			Code               string `json:"code"`
+			Trigger            string `json:"trigger"`
+			Summary            string `json:"summary"`
+			SummaryChars       int    `json:"summaryChars"`
+			SnippedToolResults int    `json:"snippedToolResults"`
+			RetainedEvents     []struct {
 				Type string `json:"type"`
 			} `json:"retainedEvents"`
 			RetainedSegment struct {
-				Status            string `json:"status"`
+				Status             string `json:"status"`
 				RetainedEventCount int    `json:"retainedEventCount"`
-				Warning           string `json:"warning"`
+				Warning            string `json:"warning"`
 			} `json:"retainedSegment"`
 			Budget struct {
 				LayerBudgets struct {
@@ -5134,18 +5112,18 @@ func firstLine(s string, maxLen int) string {
 	return s
 }
 
-func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
+func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
 	defer close(eventCh)
 
-	wsURL, err := streamURL(cfg.baseURL)
+	wsURL, err := streamURL(cfg.BaseURL)
 	if err != nil {
 		eventCh <- streamEvent{err: err}
 		return
 	}
 
 	headers := http.Header{}
-	if cfg.apiKey != "" {
-		headers.Set("X-Nexus-API-Key", cfg.apiKey)
+	if cfg.APIKey != "" {
+		headers.Set("X-Nexus-API-Key", cfg.APIKey)
 	}
 
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
@@ -5180,7 +5158,7 @@ func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions 
 		}
 	}()
 
-	sessionID := cfg.sessionID
+	sessionID := cfg.SessionID
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
 	}
@@ -5188,7 +5166,7 @@ func runStream(cfg config, prompt string, eventCh chan<- streamEvent, decisions 
 	writeMu.Lock()
 	err = conn.WriteJSON(map[string]any{
 		"prompt":    prompt,
-		"cwd":       cfg.cwd,
+		"cwd":       cfg.Cwd,
 		"sessionId": sessionID,
 	})
 	writeMu.Unlock()
