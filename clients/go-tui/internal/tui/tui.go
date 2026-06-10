@@ -1177,6 +1177,13 @@ var (
 	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
 	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
 	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18"))
+	// toolBulletStyle colours the leading `●` glyph on a tool
+	// invocation row. The bullet stays sky blue (the
+	// pre-#ff7a18 brand colour for the kind marker) so the
+	// operator can scan a transcript for `● ` to count tool
+	// runs without the warm orange drowning the glyph; the
+	// tool name that follows is the warm orange accent.
+	toolBulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
 	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
 	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
 	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
@@ -4517,24 +4524,45 @@ func formatLine(kind string, text string, width int) string {
 		}
 		return strings.Join(out, "\n")
 	case "tool_started", "tool_denied":
-		// Body already starts with `● ToolName(...)` from
-		// formatNexusEvent; render flat with a 2-space indent
-		// for any wrapped continuation.
-		style := toolStyle
+		// Body starts with `● ToolName(...)` from
+		// formatNexusEvent. Split the body into three visual
+		// parts so each gets its own colour:
+		//   `●`        → toolBulletStyle (sky blue, kind marker)
+		//   ToolName   → toolStyle (warm orange #ff7a18, accent)
+		//   `(args) (ctrl+o to expand)` → default foreground
+		//   (no style), so the operator can read the path /
+		//   pattern / command without straining through a
+		//   saturated colour.
+		// Fall back to the all-warm-orange render when the
+		// body doesn't match the expected `● Name(` shape
+		// (older events, custom tool names, etc.).
 		bodyWidth := max(10, width)
 		body := wrapPlain(text, bodyWidth)
 		bodyLines := strings.Split(body, "\n")
 		if len(bodyLines) == 0 {
 			bodyLines = []string{""}
 		}
+		renderToolRow := func(line string) string {
+			stripped := strings.TrimPrefix(line, "● ")
+			if stripped == line || !strings.HasPrefix(line, "● ") {
+				return toolStyle.Render(line)
+			}
+			open := strings.Index(stripped, "(")
+			if open < 0 {
+				return toolBulletStyle.Render("● ") + toolStyle.Render(stripped)
+			}
+			name := stripped[:open]
+			rest := stripped[open:]
+			return toolBulletStyle.Render("● ") + toolStyle.Render(name) + rest
+		}
 		out := make([]string, 0, len(bodyLines))
-		out = append(out, style.Render(bodyLines[0]))
+		out = append(out, renderToolRow(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
 			if c == "" {
 				out = append(out, "")
 				continue
 			}
-			out = append(out, "  "+style.Render(c))
+			out = append(out, "  "+renderToolRow(c))
 		}
 		return strings.Join(out, "\n")
 	case "result":
