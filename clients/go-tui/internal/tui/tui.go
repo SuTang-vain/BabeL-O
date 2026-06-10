@@ -4623,8 +4623,6 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 		return "error    ", errorStyle
 	case "user":
 		return "you      ", userStyle
-	case "result":
-		return "done     ", statusStyle
 	case "session":
 		return "session  ", mutedStyle
 	case "status":
