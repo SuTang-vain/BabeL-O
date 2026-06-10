@@ -1996,10 +1996,11 @@ func TestBuildInboxOverlayLinesRendersMessagesWithSelectedMarker(t *testing.T) {
 	if len(lines) == 0 {
 		t.Fatalf("expected non-empty overlay lines")
 	}
-	// The first message (handoff) is selected → its header row must
-	// carry the `›` marker.
-	if !strings.Contains(lines[0], "›") {
-		t.Fatalf("selected marker missing from first row:\n%s", lines[0])
+	// Index 0 is the column header row; the first message's
+	// header row sits at index 1. The first message (handoff)
+	// is selected → its header row must carry the `›` marker.
+	if !strings.Contains(lines[1], "›") {
+		t.Fatalf("selected marker missing from first message row:\n%s", lines[1])
 	}
 	// The second message (finding-low) is unselected → its header
 	// row should use a space marker.

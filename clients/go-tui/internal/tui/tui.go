@@ -2791,7 +2791,7 @@ func buildInboxOverlayLines(messages []sessionMessage, channels []sessionChannel
 	for _, channel := range channels {
 		channelByID[channel.ChannelID] = channel
 	}
-	lines := []string{}
+	lines := []string{mutedStyle.Render("  message_id · created_at · status · type · priority · from · target · kind · channel")}
 	for index, message := range messages {
 		channel := channelByID[message.ChannelID]
 		isSelected := index == selected
