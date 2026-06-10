@@ -5845,7 +5845,13 @@ func renderInlineMarkdown(base lipgloss.Style, text string) string {
 	for i < len(runes) {
 		r := runes[i]
 		// Inline code: `…` (single backtick). Skip empty
-		// matches and unterminated tails.
+		// matches and unterminated tails. The chip keeps the
+		// muted background highlight so the operator can still
+		// scan a transcript for `…` to count code spans, but
+		// the foreground moves to sky blue (75) — the same
+		// brand-aligned tool accent — so the path / identifier
+		// inside the chip is easier to read at a glance than
+		// the previous near-white (252) on the muted bg.
 		if r == '`' {
 			end := -1
 			for j := i + 1; j < len(runes); j++ {
@@ -5856,7 +5862,7 @@ func renderInlineMarkdown(base lipgloss.Style, text string) string {
 			}
 			if end > i+1 {
 				code := string(runes[i+1 : end])
-				chip := base.Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238")).Render(code)
+				chip := base.Foreground(lipgloss.Color("75")).Background(lipgloss.Color("238")).Render(code)
 				out.WriteString(chip)
 				i = end + 1
 				continue
