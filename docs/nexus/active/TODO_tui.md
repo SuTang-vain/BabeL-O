@@ -258,10 +258,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - **PR3 (bbl go --check + clearer errors)**: `bbl go --check` 子命令 + `goTuiCheckReport` 函数：3 块报告（Go TUI launchability / Nexus health / version compat），FAIL exit 1、WARN exit 0（CI 友好）。改进 `child.on('error')` 错误消息：之前只说 "Install Go or build..."，新消息明确指引 prebuilt release 路径。
   - 18 个新单测（8 Go + 2 TS endpoint + 9 launcher + 5 --check = 24，但 8 Go 与 9 launcher 有重叠 = 18 unique）。`go test` 211/211 pass；`npm test` 704/704 pass；`npm run test:go-tui:smoke` 19/19 pass。
   - 范围克制：真实 release 资产需要打 `go-tui-v0.3.2` tag 才会上传（不能本地复现）；XDG user-local install 路径文档化在 install strategy 但 launcher 不自动 mkdir；`bbl go --check` 是非交互式命令不在 TUI 启动时自动跑。
+- [x] Phase 9 promotion gate：Go TUI 提升为可选推荐入口（stable alternative to `bbl chat`）（2026-06-10 决策收口）。
+  - 决策结论（详见 `docs/nexus/PHASE_9_DECISION.md`）：Go TUI 不再标 "experimental / MVP"，而**提升为 stable alternative**。两 TUI 并存：`bbl chat`（TypeScript）仍为默认；`bbl go`（Go）opt-in。提升条件 5 条全部满足（日常 coding loop usability ≥ TS TUI / 真实长会话改进 / 一个 release 周期无 TTY 回归 / 测试发布维护成本可接受 / 用户能稳定二选一）。
+  - 行动项：(1) `src/cli/commands/go.ts` 把 `bbl go` command description 从 "Launch the experimental Go TUI client" 改为 "Launch the Go TUI client (stable alternative to bbl chat; see docs/nexus/PHASE_9_DECISION.md)"（在 `bbl go --help` 展示）；(2) `clients/go-tui/README.md` 去掉 "intentionally does not replace `bbl chat`" 免责，文档化稳定状态；(3) `docs/nexus/reference/go-tui-rewrite-plan.md` Status 改 "Stable alternative (promoted 2026-06-10 via Phase 9)" + 风险表对应行更新；(4) `test/go-command.test.ts` 加回归 guard——`bbl go --help` 必须保持 "stable alternative to bbl chat" 用词且不能回退到 "experimental"（否则 trip smoke step）。
+  - 范围克制：默认命令不变（`bbl` 仍启动 `bbl chat`）；不在 Go TUI 里实现 per-tool approval gate（CLI 独占）；Activity overlay 已包含 AgentLoop sub-agent 聚合路径，TS TUI 的 `bbl inbox` footer summary 是同形等价物不需要 cross-port；Go TUI 后续以 bug 修 + 安全补丁 + overlay-stack 改进为主，**不**主动替代 `bbl chat` 为默认。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 6 PR2 / Phase 6 PR3 / Phase 6 PR4 / Phase 6 PR5 / Phase 6 PR6 / Phase 7 / Phase 8（early slice + 剩余 全部收口）稳定后才推进：
-
-- Phase 9 promotion gate。
+后续：Phase 1-9 全部收口。BabeL-O Go TUI 长期重写计划闭环。Go TUI 进入 "稳定维护" 阶段——后续若有新交互需求优先落在 `bbl chat`（TypeScript TUI），Go TUI 通过 `bbl go --check` 持续验证 install readiness。
 
 持续边界：
 

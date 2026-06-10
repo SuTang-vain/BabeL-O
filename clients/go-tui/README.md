@@ -1,13 +1,22 @@
-# BabeL-O Go TUI MVP
+# BabeL-O Go TUI
 
-This is a minimal external TUI MVP for BabeL-O Nexus.
+This is a stable, opt-in TUI client for BabeL-O Nexus (promoted from
+"experimental / MVP" to "stable alternative to `bbl chat`" in 2026-06-10 via
+Phase 9 promotion gate; see `docs/nexus/PHASE_9_DECISION.md`).
 
-It intentionally does not replace `bbl chat` and does not embed the TypeScript
-runtime. The client connects to Nexus via the public WebSocket/HTTP APIs and
-renders a Bubble Tea shell with a transcript, status header, input line,
-permission panel and layered event output. The `bbl go` wrapper can auto-start a
-local Nexus service when the target localhost URL is not healthy; the Go binary
-itself remains a client only.
+It is a fully supported companion to `bbl chat` (the TypeScript TUI, default).
+The two clients share the same Nexus protocol; the user can swap between them
+per-session without state loss. The Go binary does not embed the TypeScript
+runtime — it connects to Nexus via the public WebSocket/HTTP APIs and renders
+a Bubble Tea shell with a transcript, status header, input line, permission
+panel, layered event output, and six read-only overlays (inbox / agents /
+tasks / activity / tools audit / context). The `bbl go` wrapper can
+auto-start a local Nexus service when the target localhost URL is not
+healthy; the Go binary itself remains a client only.
+
+The default for `bbl` is still `bbl chat`. Use `bbl go` when you prefer the
+Bubble Tea viewport + read-only overlay stack + prebuilt-binary install
+model.
 
 ## Scope
 

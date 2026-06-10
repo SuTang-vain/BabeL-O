@@ -41,7 +41,7 @@ export interface ManagedNexusLaunchSpec {
 export function registerGoCommand(program: Command): void {
   program
     .command('go')
-    .description('Launch the experimental Go TUI client')
+    .description('Launch the Go TUI client (stable alternative to bbl chat; see docs/nexus/PHASE_9_DECISION.md)')
     .option('--url <url>', 'Nexus base URL', 'http://127.0.0.1:3000')
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
     .option('--session <id>', 'Reuse an existing Nexus session id')

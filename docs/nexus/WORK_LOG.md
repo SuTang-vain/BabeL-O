@@ -2,6 +2,27 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI Phase 9 promotion gate：决策收口（stable alternative to `bbl chat`）
+
+- **用户请求**: 按 TODO_tui.md 收尾项推进 Phase 9 promotion gate，3 个 commit 一起推完。
+- **决策**: **提升为可选推荐入口**。`bbl go` 不再标 "experimental / MVP"，而是 `bbl chat` 的 stable alternative。两 TUI 并存；`bbl chat`（TypeScript）仍为默认；`bbl go`（Go）opt-in。决策细节、证据（5 条提升条件 + 各自评估）、out-of-scope 列表、回滚策略、行动项全部记入 `docs/nexus/PHASE_9_DECISION.md`。
+- **实现**:
+  - `src/cli/commands/go.ts`: `bbl go` command description 从 `"Launch the experimental Go TUI client"` 改为 `"Launch the Go TUI client (stable alternative to bbl chat; see docs/nexus/PHASE_9_DECISION.md)"`（在 `bbl go --help` 展示）。一字之差但语义改变：用户能通过 `--help` 一眼看出 Go TUI 是 stable 而非 experimental。
+  - `clients/go-tui/README.md`: 去掉 "intentionally does not replace `bbl chat`" 免责段落；新增 Phase 9 promotion banner；文档化六块 read-only overlay 栈（inbox / agents / tasks / activity / tools audit / context）。
+  - `docs/nexus/reference/go-tui-rewrite-plan.md`: Status 从 "P3 / Long-term experimental track" 改为 "**Stable alternative to `bbl chat` (promoted 2026-06-10 via Phase 9)**"；风险表对应行更新——Phase 1-8 收口后于 2026-06-10 经 Phase 9 promotion gate 决策保持双 TUI 并存，共享 Nexus 协议 + 公共测试。
+- **回归覆盖**:
+  - `test/go-command.test.ts`: 加 `bbl go --help describes the Go TUI as a stable alternative (Phase 9 promotion guard)` 回归测试。直接调 `registerGoCommand(program)` inspect `program.commands.find(c => c.name() === 'go').description()`——绕开 tsx loader 依赖，确保在 `npm test` 默认配置下也能跑。断言：(1) description 包含 "Launch the Go TUI client"；(2) 包含 "stable alternative to bbl chat"；(3) **不**包含 "experimental"（防御性 guard，未来的 revert 必须显式重开 Phase 9 才能 trip 这个测试）。
+  - `cd clients/go-tui && go test ./...`: 211/211 pass（不变）。
+  - `npm test`: 705/705 pass（704 旧 + 1 新 Phase 9 回归 guard）。
+  - `npm run test:go-tui:smoke`: 19/19 pass（不变）。
+- **范围克制**（详见 `PHASE_9_DECISION.md` 第 3 节）:
+  - 默认命令**不**变——`bbl` 仍启动 `bbl chat`。Switching default 需要独立 RFC 覆盖文档迁移 / 生态影响。
+  - per-tool approval gate / allow-rule editing 在 Go TUI 中**不**实现——CLI 独占（`bbl tools policy`）。
+  - TypeScript TUI 的 `bbl inbox` footer summary 与 Go TUI 的 `sub: N running` header badge 是同形等价物，不做 cross-port。
+- **遗留**:
+  - 真实 GitHub release 资产仍需要打 `go-tui-v0.3.2` tag 才会上传；`docs/nexus/PHASE_9_DECISION.md` 第 4 节 "Rollback" 段明确写明本次提升是可逆的（只需 revert `--help` description + 文档）。
+  - 长期重写计划 1-9 全部子项收口；后续 Go TUI 进入 "稳定维护" 阶段——bug 修 + 安全补丁 + overlay-stack 改进，新交互需求优先落 `bbl chat`。
+
 ## 2026-06-10 — Go TUI Phase 8 PR1+PR2+PR3: version reporting / prebuilt release / install check
 
 - **用户请求**: 按 TODO_tui.md 收尾项推进 Phase 8 剩余（版本兼容矩阵 / 预编译 binary 发布 / 安装包策略），3 个 commit 一起推完。
