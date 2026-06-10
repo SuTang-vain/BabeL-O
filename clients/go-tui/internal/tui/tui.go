@@ -2007,10 +2007,15 @@ func (m *model) resize() {
 	if m.pending != nil {
 		permissionHeight = 3
 	}
-	inputHeight := 3
+	// Single-line input row (the prompt is always one row
+	// tall, regardless of the overall terminal height). The
+	// 3-row setup was a vestige of the multi-line textarea
+	// days; on a single-line prompt it produced a triple
+	// `>` box on every resize.
+	inputHeight := 1
 	footerHeight := 2
 	m.input.SetWidth(max(20, width-4))
-	m.input.SetHeight(3)
+	m.input.SetHeight(1)
 	m.viewport.Width = width
 	m.viewport.Height = max(6, m.height-headerHeight-permissionHeight-inputHeight-footerHeight)
 }
