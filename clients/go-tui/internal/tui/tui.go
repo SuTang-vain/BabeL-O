@@ -761,6 +761,7 @@ type model struct {
 	toolAuditEntries        []runtimeToolAuditEntry
 	toolAuditScroll         int
 	startedAt               time.Time
+	connected               bool
 	width                   int
 	height                  int
 }
@@ -1216,14 +1217,11 @@ func newModel(cfg Config) model {
 		cfg:       cfg,
 		input:     input,
 		viewport:  vp,
-		spinner:   spin,
-		inputMode: modeComposing,
-		transcript: []transcriptLine{
-			{kind: "status", text: "Go TUI connected to the Nexus stream API."},
-			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
-		},
-		seenInboxCardMessageIDs: map[string]struct{}{},
-		subAgents:               map[string]subAgentEntry{},
+		spinner:                  spin,
+		inputMode:                modeComposing,
+		transcript:               []transcriptLine{},
+		seenInboxCardMessageIDs:  map[string]struct{}{},
+		subAgents:                map[string]subAgentEntry{},
 	}
 }
 
@@ -1653,7 +1651,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.profileCount = len(msg.response.Profiles)
 		m.tombstoneCount = len(msg.response.Tombstones)
-		m.appendLine("status", formatRuntimeProfiles(msg.response))
+		// Skip the "profiles: none" status line when the catalog
+		// is empty: an empty list is the steady state and
+		// informing the operator about it on every config poll
+		// clutters the chat. The /profile slash command still
+		// surfaces the full list (or absence) on demand.
+		if rendered := formatRuntimeProfiles(msg.response); rendered != "" && !strings.HasSuffix(rendered, ": none") {
+			m.appendLine("status", rendered)
+		}
 		return m, m.schedulePollTick()
 
 	case runtimeVersionMsg:
@@ -3697,6 +3702,12 @@ func (m model) renderHeader(width int) string {
 	// lives next to the title so the user sees the build tag
 	// without scanning a third line.
 	title := titleStyle.Render("BabeL-O · Go TUI")
+	// ✓ marker is rendered in statusStyle (cyan) once the first
+	// session_started event has been observed; before that the
+	// TUI is still in the post-`bbl go` connect window.
+	if m.connected {
+		title = title + " " + statusStyle.Render("✓")
+	}
 	build := mutedStyle.Render("· " + versionString())
 	stateLabel := "idle"
 	if m.running {
@@ -3977,6 +3988,12 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 	case "session_started":
 		m.sessionID = stringField(event, "sessionId")
 		m.modelID = stringField(event, "model")
+		// Mark the Go TUI as connected to Nexus so the header
+		// can render a `✓` indicator next to the title; the old
+		// status lines lived in the initial transcript but
+		// cluttered the chat log without adding information the
+		// operator can't already see from the header chrome.
+		m.connected = true
 		m.appendLine("session", formatNexusEvent(event))
 	case "permission_request":
 		m.pending = &pendingPermission{
@@ -4391,7 +4408,16 @@ func formatNexusEvent(event map[string]any) string {
 	case "execute_summary":
 		return formatExecuteSummary(event)
 	case "result":
-		return fmt.Sprintf("success=%v %s", event["success"], firstNonEmpty(stringField(event, "message"), stringField(event, "text")))
+		// Suppress the message text on success: streaming
+		// assistant_delta events already produced the full reply
+		// line, and re-emitting the text on the result event was
+		// duplicating the operator-visible chat. Surface the
+		// message only on failure so the user still sees why a
+		// turn ended with success=false.
+		if event["success"] == false {
+			return "failed: " + firstNonEmpty(stringField(event, "message"), stringField(event, "text"))
+		}
+		return "done"
 	case "error":
 		code := stringField(event, "code")
 		if hint, ok := friendlyNexusError(code, event); ok {
