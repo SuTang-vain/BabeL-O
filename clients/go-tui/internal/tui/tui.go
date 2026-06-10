@@ -770,6 +770,10 @@ const (
 	modeActivityOverlay  inputMode = "activityOverlay"  // read-only recent activity; up/down/esc/enter/q
 	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
 	modeModelOverlay     inputMode = "modelOverlay"     // read-only model config/catalog; up/down/esc/enter/q
+	modeModelPickProvider inputMode = "modelPickProvider" // /model step 1: provider select
+	modeModelPickApiKey  inputMode = "modelPickApiKey"  // /model step 2: API key entry
+	modeModelPickBaseURL inputMode = "modelPickBaseURL" // /model step 3: base URL entry
+	modeModelPickModel   inputMode = "modelPickModel"   // /model step 4: model select
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -829,8 +833,18 @@ type model struct {
 	promptHistory []string
 	historyIndex  int
 	historySaved  string
-	width         int
-	height        int
+	// /model multi-step state. The flow is:
+	//   1) modeModelPickProvider — pick a provider
+	//   2) modeModelPickApiKey  — paste API key (or accept default)
+	//   3) modeModelPickBaseURL — confirm or override base URL
+	//   4) modeModelPickModel   — pick a model
+	// Each mode holds its own scroll / selected state.
+	modelPickProviderIdx    int
+	modelPickProviderDraft  string // pending apiKey / baseURL typed by the operator
+	modelPickSelectedID     string
+	modelPickSelectedIdx    int
+	width                    int
+	height                   int
 }
 
 // usageSnapshot captures the most recent token usage event from
@@ -1023,17 +1037,24 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/model",
-		summary: "open model configuration view or show set-model hint",
+		summary: "open interactive model registry (provider → api key → base URL → model)",
 		hasArgs: true,
 		argHint: "[id]",
 		run: func(m *model, args []string) tea.Cmd {
-			if len(args) == 0 {
+			if len(m.modelCatalog.Providers) == 0 {
 				m.appendLine("status", "loading shared Nexus model configuration")
 				return fetchRuntimeModels(m.cfg, "model")
 			}
-			modelID := args[0]
-			m.appendLine("status", fmt.Sprintf("model switch requested: %s", modelID))
-			m.appendLine("status", fmt.Sprintf("Go TUI keeps model writes CLI-only; run `bbl config use %s` or `bbl chat /model`.", modelID))
+			m.openModelRegistry()
+			// /model <id> is a quick direct-select: seed the
+			// draft input with the requested model id so the
+			// operator can override or accept the default
+			// values in the subsequent apiKey / baseURL
+			// steps. openModelRegistry() reset the draft
+			// above, so set it AFTER.
+			if len(args) > 0 {
+				m.modelPickProviderDraft = args[0]
+			}
 			return nil
 		},
 	},
@@ -1303,6 +1324,14 @@ func Run(cfg Config) error {
 	if cfg.AltScreen {
 		opts = append(opts, tea.WithAltScreen())
 	}
+	// Phase 10: capture the mouse wheel so it scrolls the transcript
+	// viewport in composing mode instead of leaking into the terminal
+	// (some terminals translate the wheel to ↑/↓ arrow keys when no app
+	// is listening, which used to overlap with our prompt-history
+	// bindings). Cell motion is enough for wheel events and is the
+	// lighter option — we don't need to track press/release coordinates
+	// for selection since the overlay stack is keyboard-driven.
+	opts = append(opts, tea.WithMouseCellMotion())
 	if _, err := tea.NewProgram(m, opts...).Run(); err != nil {
 		return err
 	}
@@ -1402,6 +1431,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
+	case tea.MouseMsg:
+		// Phase 10: route the scroll wheel to the transcript
+		// viewport in composing mode only. Overlay modes
+		// (help / slash palette / permission / profile
+		// confirm / context / inbox / agents / tasks /
+		// activity / tools audit / model) are silent on wheel
+		// input — the operator is supposed to dismiss them
+		// before scrolling the transcript, and we don't want
+		// the wheel to also yank the overlay's own scroll
+		// state. We also bail on non-wheel events (press,
+		// release, motion) so we don't accidentally steal
+		// selection drags.
+		if m.inputMode != modeComposing {
+			return m, nil
+		}
+		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.viewport.LineUp(1)
+			return m, nil
+		case tea.MouseButtonWheelDown:
+			m.viewport.LineDown(1)
+			return m, nil
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		if msg.Paste {
 			pastedStr := string(msg.Runes)
@@ -1460,6 +1517,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.input.CursorEnd()
 					return m, nil
 				}
+				return m, nil
+			}
+			// Phase 10: PgUp / PgDn page-scroll the transcript
+			// viewport in composing mode. They were already
+			// handled by the viewport itself via Update, but
+			// we intercept them here so the textinput never
+			// sees them (single-line input can't really act
+			// on them, but we keep the single-input-owner
+			// invariant explicit).
+			if key == "pgup" {
+				m.viewport.PageUp()
+				return m, nil
+			}
+			if key == "pgdown" {
+				m.viewport.PageDown()
 				return m, nil
 			}
 		}
@@ -1775,6 +1847,116 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// /model multi-step flow (Phase 1: hardcoded model
+		// list per provider; Phase 2 will swap the picker for
+		// a live API call against the freshly-entered base
+		// URL).
+		switch m.inputMode {
+		case modeModelPickProvider:
+			switch key {
+			case "esc", "q":
+				m.openModelRegistry()
+				m.setMode(modeComposing)
+				m.appendLine("status", "model registry closed")
+				return m, nil
+			case "up", "k":
+				if m.modelPickProviderIdx > 0 {
+					m.modelPickProviderIdx--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if m.modelPickProviderIdx < len(m.modelCatalog.Providers)-1 {
+					m.modelPickProviderIdx++
+				}
+				return m, nil
+			case "enter":
+				if m.modelPickProviderIdx >= 0 && m.modelPickProviderIdx < len(m.modelCatalog.Providers) {
+					p := m.modelCatalog.Providers[m.modelPickProviderIdx]
+					m.modelPickSelectedID = p.ID
+					// Skip the apiKey / baseURL steps for
+					// providers that are already configured
+					// — the operator can re-enter /model to
+					// reconfigure later.
+					if p.Configured {
+						m.setMode(modeModelPickModel)
+					} else {
+						m.modelPickProviderDraft = ""
+						m.input.SetValue("")
+						m.setMode(modeModelPickApiKey)
+					}
+				}
+				return m, nil
+			}
+			return m, nil
+
+		case modeModelPickApiKey:
+			switch key {
+			case "esc":
+				m.setMode(modeModelPickProvider)
+				return m, nil
+			case "enter":
+				m.modelPickProviderDraft = m.input.Value()
+				m.input.SetValue("")
+				m.setMode(modeModelPickBaseURL)
+				return m, nil
+			}
+			return m, nil
+
+		case modeModelPickBaseURL:
+			switch key {
+			case "esc":
+				m.setMode(modeModelPickApiKey)
+				return m, nil
+			case "enter":
+				// Accept the default base URL when the
+				// operator pressed Enter without typing.
+				typed := m.input.Value()
+				provider := m.currentModelProvider()
+				if typed == "" && provider != nil {
+					typed = provider.DefaultBaseURL
+				}
+				m.modelPickProviderDraft = typed
+				m.input.SetValue("")
+				m.modelPickSelectedIdx = 0
+				m.setMode(modeModelPickModel)
+				return m, nil
+			}
+			return m, nil
+
+		case modeModelPickModel:
+			provider := m.currentModelProvider()
+			total := 0
+			if provider != nil {
+				total = len(provider.Models)
+			}
+			switch key {
+			case "esc":
+				m.setMode(modeModelPickBaseURL)
+				return m, nil
+			case "up", "k":
+				if m.modelPickSelectedIdx > 0 {
+					m.modelPickSelectedIdx--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if m.modelPickSelectedIdx < total-1 {
+					m.modelPickSelectedIdx++
+				}
+				return m, nil
+			case "enter":
+				if provider != nil && m.modelPickSelectedIdx >= 0 && m.modelPickSelectedIdx < len(provider.Models) {
+					selectedModel := provider.Models[m.modelPickSelectedIdx]
+					m.appendLine("status", fmt.Sprintf("selected model: %s (provider %s, model writeback is CLI-only in Phase 1; run `bbl config use %s` or `bbl chat /model` to persist)", selectedModel.ID, provider.ID, selectedModel.ID))
+					// Update the local model id so the header
+					// reflects the new selection immediately.
+					m.modelID = selectedModel.ID
+					m.setMode(modeComposing)
+				}
+				return m, nil
+			}
+			return m, nil
+		}
+
 		// `?` toggles the help overlay. Only valid in composing.
 		if m.inputMode == modeComposing && key == "?" && strings.TrimSpace(m.input.Value()) == "" {
 			m.helpScroll = 0
@@ -1906,9 +2088,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.modelCatalog = msg.response
 		if msg.trigger == "model" {
-			m.modelOverlayScroll = 0
-			m.appendLine("status", formatRuntimeModelConfigSummary(msg.response))
-			m.setMode(modeModelOverlay)
+			// /model flow: open the interactive registry
+			// now that the catalog is in hand.
+			m.openModelRegistry()
 			return m, nil
 		}
 		for _, line := range formatRuntimeModels(msg.response) {
@@ -2162,6 +2344,10 @@ func (m model) View() string {
 	activityOverlay := m.renderActivityOverlay(width)
 	toolAuditOverlay := m.renderToolAuditOverlay(width)
 	modelOverlay := m.renderModelOverlay(width)
+	modelPickProvider := m.renderModelPickProvider(width)
+	modelPickApiKey := m.renderModelPickApiKey(width)
+	modelPickBaseURL := m.renderModelPickBaseURL(width)
+	modelPickModel := m.renderModelPickModel(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -2197,6 +2383,18 @@ func (m model) View() string {
 	if modelOverlay != "" {
 		parts = append(parts, modelOverlay)
 	}
+	if modelPickProvider != "" {
+		parts = append(parts, modelPickProvider)
+	}
+	if modelPickApiKey != "" {
+		parts = append(parts, modelPickApiKey)
+	}
+	if modelPickBaseURL != "" {
+		parts = append(parts, modelPickBaseURL)
+	}
+	if modelPickModel != "" {
+		parts = append(parts, modelPickModel)
+	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
 }
@@ -2209,6 +2407,10 @@ var helpOverlayLines = []string{
 	"  /                (followed by command) open slash palette (one-shot)",
 	"  ?  (empty input) toggle this help overlay",
 	"  ctrl+c / q       quit when input is empty",
+	"  up / down        walk per-session prompt history (single-line input)",
+	"  pgup / pgdown    page-scroll the transcript viewport",
+	"  mouse wheel      scroll the transcript viewport (composing only;",
+	"                   overlay modes stay silent)",
 	"",
 	"Permission panel:",
 	"  a / y            approve",
@@ -3968,6 +4170,243 @@ func (m model) renderModelOverlay(width int) string {
 	return renderOverlayFrame(width, statusStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
+// openModelRegistry kicks off the /model multi-step flow.
+// Reset per-step state (selection index, draft input) so
+// re-entering /model from a previous partially-completed
+// flow doesn't carry stale state.
+func (m *model) openModelRegistry() {
+	m.modelPickProviderIdx = 0
+	m.modelPickSelectedIdx = 0
+	m.modelPickSelectedID = ""
+	m.modelPickProviderDraft = ""
+	m.setMode(modeModelPickProvider)
+}
+
+// currentModelProvider resolves the provider the multi-step
+// flow is currently bound to. Returns nil if the operator
+// somehow advanced past provider selection without a chosen
+// id.
+func (m model) currentModelProvider() *registeredProvider {
+	if m.modelPickSelectedID == "" {
+		return nil
+	}
+	for i := range m.modelCatalog.Providers {
+		if m.modelCatalog.Providers[i].ID == m.modelPickSelectedID {
+			return &m.modelCatalog.Providers[i]
+		}
+	}
+	return nil
+}
+
+// renderModelPickProvider is step 1 of the /model flow: a
+// scrollable list of providers, each row tagged with the
+// configured / needs-API-key status. enter advances to the
+// API key step (or to the picker directly when the provider
+// is already configured and the operator chooses to skip
+// the key / base URL steps via the hint chip).
+func (m model) renderModelPickProvider(width int) string {
+	if m.inputMode != modeModelPickProvider {
+		return ""
+	}
+	header := titleStyle.Render("BABEL Model Registry")
+	subtitle := mutedStyle.Render("Select provider, configure API access, then choose a model.")
+	lines := []string{header, subtitle, ""}
+	if len(m.modelCatalog.Providers) == 0 {
+		lines = append(lines, mutedStyle.Render("  No providers reported by the current Nexus runtime."))
+	} else {
+		lines = append(lines, mutedStyle.Render("  provider                adapter                  default                status"))
+		// Compute column widths from the visible set so a
+		// longer default model id doesn't push the status
+		// column off the right edge on narrow terminals. Only
+		// expand — never shrink — so short values like
+		// `Local` keep their column padded and don't get
+		// truncated by their own width.
+		idWidth := 24
+		adapterWidth := 22
+		defaultWidth := 22
+		for _, p := range m.modelCatalog.Providers {
+			if v := visibleLen(p.DisplayName); v > idWidth {
+				idWidth = v
+			}
+			if v := visibleLen(p.Adapter); v > adapterWidth {
+				adapterWidth = v
+			}
+			if v := visibleLen(p.DefaultModel); v > defaultWidth {
+				defaultWidth = v
+			}
+		}
+		visibleRows := max(1, m.height-12)
+		scrollOffset := 0
+		if m.modelPickProviderIdx >= visibleRows {
+			scrollOffset = m.modelPickProviderIdx - visibleRows + 1
+		}
+		if scrollOffset+visibleRows > len(m.modelCatalog.Providers) {
+			scrollOffset = max(0, len(m.modelCatalog.Providers)-visibleRows)
+		}
+		if scrollOffset > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
+		}
+		for i := 0; i < visibleRows && scrollOffset+i < len(m.modelCatalog.Providers); i++ {
+			actualIdx := scrollOffset + i
+			p := m.modelCatalog.Providers[actualIdx]
+			marker := "  "
+			if actualIdx == m.modelPickProviderIdx {
+				marker = "> "
+			}
+			name := padRightPlain(p.DisplayName, idWidth)
+			adapter := padRightPlain(p.Adapter, adapterWidth)
+			defaultModel := padRightPlain(p.DefaultModel, defaultWidth)
+			status := "needs API key"
+			if p.Configured {
+				status = "configured"
+			}
+			row := fmt.Sprintf("%s%s  %s  %s  %s", marker, name, adapter, defaultModel, status)
+			if actualIdx == m.modelPickProviderIdx {
+				row = focusedLineStyle.Render(row)
+			}
+			lines = append(lines, "  "+row)
+		}
+		remainingBelow := len(m.modelCatalog.Providers) - (scrollOffset + visibleRows)
+		if remainingBelow > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc cancel"))
+	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+}
+
+// renderModelPickApiKey is step 2: paste the API key. The
+// key is echoed in plaintext for parity with the bbl chat
+// TS TUI (operator sees what they type) and cleared from
+// memory after the picker step resolves.
+func (m model) renderModelPickApiKey(width int) string {
+	if m.inputMode != modeModelPickApiKey {
+		return ""
+	}
+	provider := m.currentModelProvider()
+	providerID := ""
+	if provider != nil {
+		providerID = provider.ID
+	}
+	header := titleStyle.Render(fmt.Sprintf("%s API key", firstNonEmpty(providerID, "Provider")))
+	hint := mutedStyle.Render("Paste API key (Press Enter to confirm, esc to go back.)")
+	lines := []string{header, hint, ""}
+	if provider != nil {
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  default model: %s", provider.DefaultModel)))
+		lines = append(lines, "")
+	}
+	// Render the input box via the standard input model.
+	lines = append(lines, "  > "+m.input.View())
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
+	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+}
+
+// renderModelPickBaseURL is step 3: confirm or override the
+// base URL. The provider's default URL is pre-filled into
+// the input box; pressing Enter without editing accepts the
+// default.
+func (m model) renderModelPickBaseURL(width int) string {
+	if m.inputMode != modeModelPickBaseURL {
+		return ""
+	}
+	provider := m.currentModelProvider()
+	defaultURL := ""
+	if provider != nil {
+		defaultURL = provider.DefaultBaseURL
+	}
+	header := titleStyle.Render(fmt.Sprintf("%s base URL", firstNonEmpty(provider.ID, "Provider")))
+	hint := mutedStyle.Render(fmt.Sprintf("Press Enter to use %s.", firstNonEmpty(defaultURL, "<provider default>")))
+	lines := []string{header, hint, ""}
+	lines = append(lines, "  > "+m.input.View())
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
+	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+}
+
+// renderModelPickModel is step 4: pick a model from the
+// hardcoded list baked into the catalog response. Phase 2
+// will replace this list with a live API call against the
+// freshly-entered base URL.
+func (m model) renderModelPickModel(width int) string {
+	if m.inputMode != modeModelPickModel {
+		return ""
+	}
+	provider := m.currentModelProvider()
+	providerID := ""
+	if provider != nil {
+		providerID = provider.ID
+	}
+	header := titleStyle.Render(fmt.Sprintf("%s models", firstNonEmpty(providerID, "Provider")))
+	subtitle := mutedStyle.Render("Pick a model. enter selects; esc back to base URL.")
+	lines := []string{header, subtitle, ""}
+	models := []registeredModel{}
+	if provider != nil {
+		models = provider.Models
+	}
+	if len(models) == 0 {
+		lines = append(lines, mutedStyle.Render("  No models registered for this provider (Phase 1: live list pending)."))
+	} else {
+		lines = append(lines, mutedStyle.Render("  model_id                name                     ctx"))
+		visibleRows := max(1, m.height-12)
+		scrollOffset := 0
+		if m.modelPickSelectedIdx >= visibleRows {
+			scrollOffset = m.modelPickSelectedIdx - visibleRows + 1
+		}
+		if scrollOffset+visibleRows > len(models) {
+			scrollOffset = max(0, len(models)-visibleRows)
+		}
+		if scrollOffset > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
+		}
+		for i := 0; i < visibleRows && scrollOffset+i < len(models); i++ {
+			actualIdx := scrollOffset + i
+			entry := models[actualIdx]
+			marker := "  "
+			if actualIdx == m.modelPickSelectedIdx {
+				marker = "> "
+			}
+			id := padRightPlain(entry.ID, 22)
+			name := padRightPlain(firstNonEmpty(entry.Name, "—"), 22)
+			row := fmt.Sprintf("%s%s  %s  %d", marker, id, name, entry.ContextWindow)
+			if actualIdx == m.modelPickSelectedIdx {
+				row = focusedLineStyle.Render(row)
+			}
+			lines = append(lines, "  "+row)
+		}
+		remainingBelow := len(models) - (scrollOffset + visibleRows)
+		if remainingBelow > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
+		}
+	}
+	lines = append(lines, "")
+	lines = append(lines, mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc back"))
+	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+}
+
+// padRightPlain pads a string with spaces to the given
+// visible width. Truncates with a trailing `…` when the
+// input already exceeds the target so the column never
+// overflows.
+func padRightPlain(s string, width int) string {
+	if len(s) >= width {
+		if width <= 1 {
+			return s[:width]
+		}
+		return s[:width-1] + "…"
+	}
+	return s + strings.Repeat(" ", width-len(s))
+}
+
+// visibleLen returns the on-screen column width of a
+// string, stripping ANSI / using lipgloss.Width so a model
+// id with embedded CJK or escape codes doesn't inflate the
+// calculated column width.
+func visibleLen(s string) int {
+	return lipgloss.Width(s)
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -4232,6 +4671,17 @@ func (m model) renderPermission(width int) string {
 }
 
 func (m model) renderInput(width int) string {
+	// The /model multi-step flow renders its own inline
+	// input box inside the overlay (apiKey + baseURL steps);
+	// hide the bottom prompt row to avoid two visible
+	// input boxes stacked on top of each other. The
+	// provider / picker steps also have no input.
+	if m.inputMode == modeModelPickProvider ||
+		m.inputMode == modeModelPickApiKey ||
+		m.inputMode == modeModelPickBaseURL ||
+		m.inputMode == modeModelPickModel {
+		return divider(width) + "\n"
+	}
 	prompt := m.input.View()
 	if m.running {
 		prompt = focusedLineStyle.Render(prompt)

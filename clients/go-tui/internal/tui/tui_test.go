@@ -7,9 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/gorilla/websocket"
 )
 
 func TestStreamURL(t *testing.T) {
@@ -140,7 +143,7 @@ func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 }
 
 func TestFormatRuntimeModels(t *testing.T) {
-	lines := formatRuntimeModels(runtimeModelsResponse{
+	response := runtimeModelsResponse{
 		Type:          "runtime_models",
 		Version:       4,
 		DefaultModel:  "minimax/MiniMax-M3",
@@ -164,7 +167,8 @@ func TestFormatRuntimeModels(t *testing.T) {
 				},
 			},
 		},
-	})
+	}
+	lines := formatRuntimeModels(response)
 
 	joined := strings.Join(lines, "\n")
 	wants := []string{
@@ -180,6 +184,131 @@ func TestFormatRuntimeModels(t *testing.T) {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("models matrix missing %q:\n%s", want, joined)
 		}
+	}
+}
+
+func TestBuildModelOverlayLinesMirrorsChatModelConfigSemantics(t *testing.T) {
+	response := runtimeModelsResponse{
+		Type:          "runtime_models",
+		Version:       4,
+		DefaultModel:  "minimax/MiniMax-M3",
+		ActiveProfile: "alpha",
+		Providers: []registeredProvider{
+			{
+				ID:           "minimax",
+				DisplayName:  "MiniMax",
+				AuthMode:     "apiKey",
+				DefaultModel: "minimax/MiniMax-M3",
+				Configured:   true,
+				Active:       true,
+				Models: []registeredModel{
+					{
+						ID:               "minimax/MiniMax-M3",
+						Name:             "MiniMax M3",
+						ContextWindow:    245760,
+						DefaultMaxTokens: 4096,
+						Capabilities: runtimeCapabilities{
+							ToolCalling:      true,
+							JSONOutput:       true,
+							StructuredOutput: true,
+							Streaming:        true,
+						},
+					},
+				},
+			},
+		},
+	}
+	combined := strings.Join(buildModelOverlayLines(response), "\n")
+	for _, want := range []string{
+		"Active model: minimax/MiniMax-M3",
+		"Active profile: alpha",
+		"Configuration writes stay CLI-owned in Go TUI",
+		"bbl config use <modelId>",
+		"bbl chat /model",
+		"minimax (MiniMax) · active · configured · auth=apiKey",
+		"* minimax/MiniMax-M3",
+		"ctx=245760",
+		"tool-call,json,structured,stream",
+		"MiniMax M3",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("model overlay missing %q:\n%s", want, combined)
+		}
+	}
+}
+
+func TestModelRegistryOpensOnModelTriggerAndCloses(t *testing.T) {
+	response := runtimeModelsResponse{
+		Type:         "runtime_models",
+		DefaultModel: "local/coding-runtime",
+		Providers: []registeredProvider{
+			{
+				ID:             "local",
+				DisplayName:    "Local",
+				Adapter:        "native",
+				AuthMode:       "none",
+				DefaultBaseURL: "",
+				DefaultModel:   "local/coding-runtime",
+				Configured:     true,
+				Active:         true,
+				Models: []registeredModel{
+					{ID: "local/coding-runtime", ContextWindow: 8192},
+				},
+			},
+		},
+	}
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	updated, _ := m.Update(runtimeModelsMsg{response: response, trigger: "model"})
+	um := updated.(model)
+	um.height = 30
+	if um.inputMode != modeModelPickProvider {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeModelPickProvider)
+	}
+	if um.modelCatalog.DefaultModel != "local/coding-runtime" {
+		t.Fatalf("modelCatalog default = %q", um.modelCatalog.DefaultModel)
+	}
+	rendered := um.renderModelPickProvider(100)
+	for _, want := range []string{"BABEL Model Registry", "Select provider", "Local", "configured"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered model registry missing %q:\n%s", want, rendered)
+		}
+	}
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
+	}
+}
+
+func TestModelSlashCommandWithArgumentEntersRegistry(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	// Pre-load a fake catalog so openModelRegistry has
+	// something to display. handleLocalCommand requires
+	// the catalog to be non-empty; if it isn't, it
+	// re-fetches via fetchRuntimeModels and returns a tea.Cmd.
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{
+			{ID: "openai", DisplayName: "OpenAI", Adapter: "openai-compatible", DefaultBaseURL: "https://api.openai.com/v1", DefaultModel: "openai/gpt-4o", Configured: true},
+		},
+	}
+	cmd := m.handleLocalCommand("/model openai/gpt-4o")
+	if cmd != nil {
+		t.Fatalf("/model <id> should not produce a tea.Cmd when catalog is pre-loaded")
+	}
+	// The model id passed on the slash command is staged
+	// as the apiKey/baseURL draft so the operator can
+	// override or accept the default values. The /model
+	// flow is interactive; the in-memory modelID is only
+	// set after the operator explicitly picks a model
+	// from the picker.
+	if m.modelPickProviderDraft != "openai/gpt-4o" {
+		t.Fatalf("expected draft to be seeded with the slash arg, got %q", m.modelPickProviderDraft)
+	}
+	if m.inputMode != modeModelPickProvider {
+		t.Fatalf("expected modeModelPickProvider, got %v", m.inputMode)
+	}
+	if m.modelID == "openai/gpt-4o" {
+		t.Fatalf("/model <id> must not commit a model id without the picker confirm step")
 	}
 }
 
@@ -219,6 +348,24 @@ func TestHandleModelsSlashCommand(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("transcript missing loading status message, got: %#v", m.transcript)
+	}
+}
+
+func TestHandleModelSlashCommandOpensModelOverlayFetch(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/model")
+	if cmd == nil {
+		t.Fatalf("/model command should return a non-nil fetch Command")
+	}
+	found := false
+	for _, line := range m.transcript {
+		if line.kind == "status" && strings.Contains(line.text, "loading shared Nexus model configuration") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("transcript missing model loading status, got: %#v", m.transcript)
 	}
 }
 
@@ -4305,5 +4452,633 @@ func TestRuntimeVersionMsgErrorIsSilent(t *testing.T) {
 	um := updated.(model)
 	if len(um.transcript) != baseline {
 		t.Fatalf("version check fetch error should be silent, transcript grew from %d to %d", baseline, len(um.transcript))
+	}
+}
+
+func TestBuildExecuteRequestEmitsSoftDenyPolicyByDefault(t *testing.T) {
+	// Phase B of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+	// Go TUI defaults to `policy: 'soft-deny'` so write/execute Bash
+	// subcommands (git commit, npm install, etc.) reach the approval
+	// gate instead of being hard-denied.
+	cfg := Config{Cwd: "/workspace"}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	if got := payload["policy"]; got != "soft-deny" {
+		t.Fatalf("default policy = %v, want 'soft-deny'", got)
+	}
+}
+
+func TestBuildExecuteRequestHonoursExplicitPolicyMode(t *testing.T) {
+	cfg := Config{Cwd: "/workspace", PolicyMode: "strict"}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	if got := payload["policy"]; got != "strict" {
+		t.Fatalf("explicit policy = %v, want 'strict'", got)
+	}
+}
+
+func TestBuildExecuteRequestEmitsPolicyAlongsideTimeoutMs(t *testing.T) {
+	// policy and timeoutMs are independent knobs; both should appear in
+	// the payload when set.
+	cfg := Config{Cwd: "/workspace", ExecuteTimeoutMs: 180000}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	if got := anyInt(payload["timeoutMs"]); got != 180000 {
+		t.Fatalf("timeoutMs = %d, want 180000", got)
+	}
+	if got := payload["policy"]; got != "soft-deny" {
+		t.Fatalf("policy = %v, want 'soft-deny'", got)
+	}
+}
+
+// fakeNexusWSPermissionHandler spins up an httptest WebSocket server that
+// (1) captures the first inbound frame (Go TUI's request payload) and
+// (2) replies with a scripted sequence of Nexus events. Used by the
+// soft-deny end-to-end test below.
+func fakeNexusWSPermissionHandler(t *testing.T, events []map[string]any) (*httptest.Server, func() *map[string]any) {
+	t.Helper()
+	upgrader := websocket.Upgrader{}
+	captured := &map[string]any{}
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(data, &payload); err == nil {
+			mu.Lock()
+			*captured = payload
+			mu.Unlock()
+		}
+		for _, ev := range events {
+			if err := conn.WriteJSON(ev); err != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}))
+	return srv, func() *map[string]any { return captured }
+}
+
+func TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest(t *testing.T) {
+	// End-to-end smoke for Phase B of
+	// docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+	// Go TUI sends `policy: 'soft-deny'` on the wire; the fake Nexus
+	// backend emits a `permission_request`; runStream forwards it to
+	// the consumer channel (where the Go TUI permission panel would
+	// pop up and ask the user to approve / deny).
+	events := []map[string]any{
+		{
+			"type":      "session_started",
+			"sessionId": "session_soft_deny",
+			"model":     "mock-model",
+		},
+		{
+			"type":          "tool_started",
+			"toolUseId":     "tool_1",
+			"name":          "Bash",
+			"input":         map[string]any{"command": "git commit -m x"},
+			"effectiveRisk": "execute",
+		},
+		{
+			"type":      "permission_request",
+			"toolUseId": "tool_1",
+			"name":      "Bash",
+			"input":     map[string]any{"command": "git commit -m x"},
+			"risk":      "execute",
+			"message":   "Tool Bash requires user permission to run.",
+		},
+	}
+	srv, getCaptured := fakeNexusWSPermissionHandler(t, events)
+	defer srv.Close()
+
+	eventCh := make(chan streamEvent, 8)
+	decisions := make(chan permissionDecision)
+	cfg := Config{BaseURL: srv.URL}
+
+	doneCh := make(chan struct{})
+	go func() {
+		runStream(cfg, "git commit", eventCh, decisions)
+		close(doneCh)
+	}()
+
+	// 1. Poll the captured payload until the runStream goroutine has
+	// finished writing the request frame. The capture pointer is
+	// pre-allocated as an empty map, so we need to check for the
+	// presence of a known field rather than nil.
+	var captured map[string]any
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatalf("timed out waiting for Go TUI to send request frame")
+		default:
+		}
+		captured = *getCaptured()
+		if _, hasPrompt := captured["prompt"]; hasPrompt {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := captured["policy"]; got != "soft-deny" {
+		t.Fatalf("captured policy = %v, want 'soft-deny'; full payload = %+v", got, captured)
+	}
+
+	// 2. Drain events until we see the permission_request.
+	var permEvent map[string]any
+	eventDeadline := time.After(2 * time.Second)
+	for permEvent == nil {
+		select {
+		case ev := <-eventCh:
+			if ev.err != nil {
+				t.Fatalf("stream err: %v", ev.err)
+			}
+			if stringField(ev.payload, "type") == "permission_request" {
+				permEvent = ev.payload
+			}
+		case <-eventDeadline:
+			t.Fatalf("timed out waiting for permission_request")
+		}
+	}
+	if got := stringField(permEvent, "name"); got != "Bash" {
+		t.Fatalf("permission_request.name = %q, want Bash", got)
+	}
+	<-doneCh
+}
+
+func TestBuildExecuteRequestEmitsAllowedToolsWhenConfigured(t *testing.T) {
+	// Phase D of docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+	cfg := Config{Cwd: "/workspace", AllowTools: []string{"Bash", "Edit"}}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	raw, ok := payload["allowedTools"]
+	if !ok {
+		t.Fatalf("allowedTools should be present in payload, got keys %v", mapKeys(payload))
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("allowedTools should be a []any, got %T", raw)
+	}
+	got := make([]string, 0, len(arr))
+	for _, item := range arr {
+		s, ok := item.(string)
+		if !ok {
+			t.Fatalf("allowedTools items should be strings, got %T", item)
+		}
+		got = append(got, s)
+	}
+	want := []string{"Bash", "Edit"}
+	if len(got) != len(want) {
+		t.Fatalf("allowedTools = %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("allowedTools[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildExecuteRequestOmitsAllowedToolsWhenUnset(t *testing.T) {
+	// No AllowTools on Config → the per-turn override is off; the
+	// server-startup policy applies. The payload must not carry a
+	// null / empty `allowedTools` array.
+	cfg := Config{Cwd: "/workspace"}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	if raw, ok := payload["allowedTools"]; ok {
+		t.Fatalf("allowedTools should be omitted when Config.AllowTools is empty, got %v", raw)
+	}
+}
+
+func TestBuildExecuteRequestStripsWhitespaceAndEmptyFromAllowedTools(t *testing.T) {
+	// The CLI flag passes comma-separated values that may include
+	// stray spaces and trailing commas; buildExecuteRequest should
+	// trim / drop empty entries so the Nexus schema receives a
+	// clean array.
+	cfg := Config{Cwd: "/workspace", AllowTools: []string{" Bash ", ",Edit,", "  ", "Glob"}}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	raw := payload["allowedTools"].([]any)
+	got := make([]string, 0, len(raw))
+	for _, item := range raw {
+		got = append(got, item.(string))
+	}
+	want := []string{"Bash", "Edit", "Glob"}
+	if len(got) != len(want) {
+		t.Fatalf("allowedTools = %v, want %v", got, want)
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			t.Fatalf("allowedTools[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestBuildExecuteRequestAllowlistWildcardPassesThrough(t *testing.T) {
+	// "*" / "all" are passed verbatim to Nexus, where they map to
+	// allowAllTools via buildPerRequestAllowedToolsPolicy. The
+	// Go TUI side does NOT pre-translate them — that translation
+	// happens in the runtime's policy builder.
+	cfg := Config{Cwd: "/workspace", AllowTools: []string{"*"}}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	raw := payload["allowedTools"].([]any)
+	if len(raw) != 1 || raw[0] != "*" {
+		t.Fatalf("wildcard allowlist should pass through verbatim, got %v", raw)
+	}
+}
+
+// mapKeys is a tiny helper used by the buildExecuteRequest tests
+// to surface a useful diagnostic when a payload key is missing.
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// === Phase C end-to-end permission flow tests ===
+//
+// Phase C of
+// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+// These tests cover the two terminal paths of the permission flow:
+// (1) `permission_request` → user approves → tool runs to completion
+// → `result` → model back in `modeComposing`;
+// (2) `permission_request` → user denies → `tool dened` → `result`
+// → model back in `modeComposing`.
+//
+// They also pin the bug fix in `consumeNexusEvent`: the `result`
+// case now explicitly calls `m.setMode(modeComposing)` so the
+// model exits `modePermission` cleanly after every turn that
+// involved a permission gate.
+
+func TestModelEntersPermissionModeOnPermissionRequest(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+
+	if m.inputMode != modeComposing {
+		t.Fatalf("model should start in modeComposing, got %s", m.inputMode)
+	}
+
+	// `Update` is a value receiver, so the returned model carries
+	// the post-event state; capture it for the assertions below.
+	updated, _ := m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":      "permission_request",
+		"toolUseId": "tool_phase_c_1",
+		"sessionId": "session_phase_c",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input":     map[string]any{"command": "git commit -m x"},
+		"message":   "Tool Bash requires user permission to run.",
+	}}})
+	m = updated.(model)
+
+	if m.pending == nil {
+		t.Fatalf("pending permission should be recorded after permission_request")
+	}
+	if m.inputMode != modePermission {
+		t.Fatalf("mode should be modePermission after permission_request, got %s", m.inputMode)
+	}
+	if got := len(m.transcript); got == 0 {
+		t.Fatalf("permission_request should append at least one transcript row")
+	}
+	last := m.transcript[len(m.transcript)-1].text
+	if !strings.Contains(last, "Bash") {
+		t.Fatalf("transcript row should mention the tool name Bash, got %q", last)
+	}
+	if !strings.Contains(last, "execute") {
+		t.Fatalf("transcript row should mention the risk 'execute', got %q", last)
+	}
+}
+
+func TestModelExitsPermissionModeOnResultAfterApproval(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+
+	updated, _ := m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":      "permission_request",
+		"toolUseId": "tool_phase_c_2",
+		"sessionId": "session_phase_c",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input":     map[string]any{"command": "git commit -m x"},
+	}}})
+	m = updated.(model)
+	if m.inputMode != modePermission {
+		t.Fatalf("setup: mode should be modePermission, got %s", m.inputMode)
+	}
+
+	updated, _ = m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":    "tool_completed",
+		"name":    "Bash",
+		"success": true,
+		"output":  map[string]any{"stdout": "[main abc1234] x\n", "stderr": ""},
+	}}})
+	updated, _ = m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":    "result",
+		"success": true,
+		"message": "done",
+	}}})
+	m = updated.(model)
+
+	if m.inputMode != modeComposing {
+		t.Fatalf("after result, mode should be modeComposing, got %s", m.inputMode)
+	}
+	if m.running {
+		t.Fatalf("after result, running should be false")
+	}
+	if m.pending != nil {
+		t.Fatalf("after result, pending should be nil")
+	}
+}
+
+func TestModelExitsPermissionModeOnResultAfterDenial(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+
+	updated, _ := m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":      "permission_request",
+		"toolUseId": "tool_phase_c_3",
+		"sessionId": "session_phase_c",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input":     map[string]any{"command": "git commit -m x"},
+	}}})
+	m = updated.(model)
+	if m.inputMode != modePermission {
+		t.Fatalf("setup: mode should be modePermission, got %s", m.inputMode)
+	}
+
+	updated, _ = m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":   "tool_denied",
+		"name":   "Bash",
+		"risk":   "execute",
+		"reason": "Tool execution denied by user: Bash",
+	}}})
+	updated, _ = m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":    "result",
+		"success": false,
+		"message": "Tool execution denied by user: Bash",
+	}}})
+	m = updated.(model)
+
+	if m.inputMode != modeComposing {
+		t.Fatalf("after denial result, mode should be modeComposing, got %s", m.inputMode)
+	}
+	if m.running {
+		t.Fatalf("after denial result, running should be false")
+	}
+	if m.pending != nil {
+		t.Fatalf("after denial result, pending should be nil")
+	}
+}
+
+// fillScrollableViewport primes the model so the transcript viewport
+// has enough content to scroll. The bubble viewport's YOffset is what
+// every scroll test asserts against, and without enough lines the
+// viewport's maxYOffset is 0 and LineUp / LineDown are no-ops.
+func fillScrollableViewport(m *model) {
+	m.width = 80
+	m.height = 24
+	// Force a resize so the viewport picks up the new height and
+	// width before we inject content. refreshViewport() also
+	// auto-goto-bottoms when wasAtBottom=true, which is the
+	// default; SetYOffset below then drops us to a known
+	// starting position for the assertion.
+	m.resize()
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		fmt.Fprintf(&b, "transcript line %d\n", i)
+	}
+	m.viewport.SetContent(b.String())
+	m.viewport.SetYOffset(100)
+}
+
+// TestMouseWheelScrollsViewportInComposingMode verifies the
+// fix for the up/down vs mouse-wheel overlap: the wheel must
+// scroll the transcript viewport by exactly one line per tick
+// in composing mode (where the keyboard ↑/↓ binding is still
+// reserved for prompt history).
+func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset
+
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelUp,
+	})
+	afterUp, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if got, want := afterUp.viewport.YOffset, startingYOffset-1; got != want {
+		t.Fatalf("after wheel up, YOffset = %d, want %d (one line up from %d)", got, want, startingYOffset)
+	}
+
+	updated, _ = afterUp.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	afterDown, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if got, want := afterDown.viewport.YOffset, startingYOffset; got != want {
+		t.Fatalf("after wheel up+down round trip, YOffset = %d, want %d (back to %d)", got, want, startingYOffset)
+	}
+}
+
+// TestMouseWheelInOverlayModeIsNoOp verifies that opening
+// any overlay silences the wheel — the transcript viewport
+// should not jump underneath the operator while they
+// navigate a help / inbox / tasks panel. The first overlay
+// from the user-facing list is exercised here; the
+// implementation routes all overlay modes through the same
+// `m.inputMode != modeComposing` gate, so one example
+// mode is enough to lock the invariant.
+func TestMouseWheelInOverlayModeIsNoOp(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset
+
+	m.setMode(modeHelpOverlay)
+
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelUp,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.viewport.YOffset != startingYOffset {
+		t.Fatalf("help overlay: wheel up changed YOffset from %d to %d; want no change", startingYOffset, after.viewport.YOffset)
+	}
+
+	updated, _ = after.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	after, ok = updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.viewport.YOffset != startingYOffset {
+		t.Fatalf("help overlay: wheel down changed YOffset from %d to %d; want no change", startingYOffset, after.viewport.YOffset)
+	}
+	if after.inputMode != modeHelpOverlay {
+		t.Fatalf("wheel in overlay should not change inputMode; got %s", after.inputMode)
+	}
+}
+
+// TestMouseWheelMotionAndPressFiltering verifies that
+// only the Press action on WheelUp/WheelDown is treated
+// as a scroll tick; motion and release events must be
+// ignored so the operator can still move the mouse over
+// the transcript without the viewport yanking itself.
+func TestMouseWheelMotionAndPressFiltering(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset
+
+	for _, action := range []tea.MouseAction{tea.MouseActionMotion, tea.MouseActionRelease} {
+		updated, _ := m.Update(tea.MouseMsg{
+			Action: action,
+			Button: tea.MouseButtonWheelUp,
+		})
+		after, ok := updated.(model)
+		if !ok {
+			t.Fatalf("expected model, got %T", updated)
+		}
+		if after.viewport.YOffset != startingYOffset {
+			t.Fatalf("action=%v: YOffset changed from %d to %d; only Press should scroll", action, startingYOffset, after.viewport.YOffset)
+		}
+	}
+}
+
+// TestMousePressOnNonWheelButtonIsNoOp verifies that a
+// plain left-click press on the transcript does not
+// scroll — only the wheel is wired up. Selecting text
+// should still feel "free" to the operator when the
+// terminal forwards drag events to the app.
+func TestMousePressOnNonWheelButtonIsNoOp(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset
+
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.viewport.YOffset != startingYOffset {
+		t.Fatalf("left-click press changed YOffset from %d to %d; only wheel should scroll", startingYOffset, after.viewport.YOffset)
+	}
+}
+
+// TestPgUpPgDownInComposingScrollsViewport verifies the
+// keyboard companion to the wheel: PgUp / PgDn page-scroll
+// the transcript in composing mode. The bubble viewport
+// already handles these via Update, but the handler
+// intercepts them here to make the single-input-owner
+// invariant explicit (the textinput never sees the key).
+func TestPgUpPgDownInComposingScrollsViewport(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	afterUp := after.viewport.YOffset
+	if afterUp >= startingYOffset {
+		t.Fatalf("after PgUp, YOffset = %d; want strictly less than %d", afterUp, startingYOffset)
+	}
+	if afterUp != startingYOffset-after.viewport.Height && after.viewport.Height > 0 {
+		// bubbles PageUp advances by Height, so the
+		// delta should match the viewport height
+		// (allow off-by-one due to clamping at top=0).
+		if afterUp > 0 {
+			t.Fatalf("after PgUp, YOffset = %d; want roughly %d (start - Height=%d)",
+				afterUp, startingYOffset-after.viewport.Height, after.viewport.Height)
+		}
+	}
+
+	updated, _ = after.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	after2, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after2.viewport.YOffset <= afterUp {
+		t.Fatalf("after PgUp+PgDown, YOffset = %d; want strictly greater than %d", after2.viewport.YOffset, afterUp)
+	}
+}
+
+// TestUpDownStillWalkPromptHistoryAfterMouseFix is the
+// regression guard for the wheel fix: even with mouse
+// capture now enabled, ↑/↓ in composing mode must keep
+// walking the per-session prompt history (not scroll
+// the viewport). This is the historical binding; if
+// the wheel fix ever crept in and stole the keys, this
+// test would catch it.
+func TestUpDownStillWalkPromptHistoryAfterMouseFix(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	m.resize()
+	// Seed two historical prompts.
+	m.promptHistory = []string{"first turn", "second turn"}
+
+	// `up` should restore the most recent prompt into
+	// the input box and bump the history index, NOT
+	// scroll the transcript.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if got, want := after.input.Value(), "second turn"; got != want {
+		t.Fatalf("after up, input = %q, want %q (most recent prompt)", got, want)
+	}
+	if after.historyIndex != 0 {
+		t.Fatalf("after up, historyIndex = %d, want 0", after.historyIndex)
+	}
+
+	// Second `up` walks one further back in history.
+	updated, _ = after.Update(tea.KeyMsg{Type: tea.KeyUp})
+	after2, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if got, want := after2.input.Value(), "first turn"; got != want {
+		t.Fatalf("after second up, input = %q, want %q (older prompt)", got, want)
+	}
+	if after2.historyIndex != 1 {
+		t.Fatalf("after second up, historyIndex = %d, want 1", after2.historyIndex)
+	}
+
+	// `down` walks forward and restores the live draft
+	// once the cursor returns to the bottom.
+	updated, _ = after2.Update(tea.KeyMsg{Type: tea.KeyDown})
+	after3, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	updated, _ = after3.Update(tea.KeyMsg{Type: tea.KeyDown})
+	after4, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after4.historyIndex != -1 {
+		t.Fatalf("after walking back to live draft, historyIndex = %d, want -1", after4.historyIndex)
+	}
+	if after4.input.Value() != "" {
+		t.Fatalf("after walking back to live draft, input = %q, want empty", after4.input.Value())
 	}
 }
