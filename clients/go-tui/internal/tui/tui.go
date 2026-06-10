@@ -762,8 +762,20 @@ type model struct {
 	toolAuditScroll         int
 	startedAt               time.Time
 	connected               bool
+	latestUsage             *usageSnapshot
 	width                   int
 	height                  int
+}
+
+// usageSnapshot captures the most recent token usage event from
+// the Nexus stream so the footer can render a single transient
+// status line (like the `✻ Sautéed for 26s` pattern) instead of
+// appending a new transcript row per usage event. Cleared on
+// every result / error event so the next turn starts clean.
+type usageSnapshot struct {
+	InputTokens  int
+	OutputTokens int
+	CacheRead    int
 }
 
 func (m *model) setMode(next inputMode) {
@@ -1606,7 +1618,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamStartedMsg:
 		m.events = msg.events
 		m.decisions = msg.decisions
-		m.appendLine("status", "stream started")
+		// Drop the "stream started" status line: the spinning
+		// `running` indicator in the header already shows that
+		// the WebSocket is up, and an extra transcript row for
+		// every turn adds noise without information.
 		return m, waitForStreamEvent(msg.events)
 
 	case streamEventMsg:
@@ -1855,9 +1870,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, fetchRuntimeConfig(m.cfg, m.configVersion)
 
 	case streamClosedMsg:
-		if m.running {
-			m.appendLine("status", "stream closed")
-		}
+		// Drop the "stream closed" status line to mirror the
+		// "stream started" removal above; the running indicator
+		// in the header is the canonical source of truth for
+		// stream liveness.
 		m.running = false
 		m.pending = nil
 		return m, nil
@@ -3823,15 +3839,22 @@ func (m model) renderFooter(width int) string {
 	topRow := footerStyle.Render(truncatePlain(
 		fmt.Sprintf("%s%s  ctrl+c quit  q quit when idle", hint, elapsed), width))
 
-	// Row 2: side-channel summary — inbox / agents / pending
-	// reminders. Kept as a separate muted line so the keyboard
-	// hint on row 1 stays scannable.
+	// Row 2: side-channel summary — inbox / agents / usage.
+	// Kept as a separate muted line so the keyboard hint on row 1
+	// stays scannable. The latest usage snapshot is rendered
+	// here as a transient counter (the `✻ Sautéed for 26s`
+	// pattern): the line updates in place as new usage events
+	// arrive, and disappears on result / error when the turn
+	// ends.
 	var sideParts []string
 	if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
 		sideParts = append(sideParts, inbox)
 	}
 	if subRunning := m.subAgentRunningCount(); subRunning > 0 {
 		sideParts = append(sideParts, fmt.Sprintf("sub-agents running: %d", subRunning))
+	}
+	if m.latestUsage != nil {
+		sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
 	}
 	bottomRow := ""
 	if len(sideParts) > 0 {
@@ -3993,8 +4016,11 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// status lines lived in the initial transcript but
 		// cluttered the chat log without adding information the
 		// operator can't already see from the header chrome.
+		// session_started is intentionally NOT appended to the
+		// transcript anymore: the header slimmed line already
+		// shows `session=sess_...` and the model is visible
+		// in the title state, so the standalone row is noise.
 		m.connected = true
-		m.appendLine("session", formatNexusEvent(event))
 	case "permission_request":
 		m.pending = &pendingPermission{
 			sessionID: stringField(event, "sessionId"),
@@ -4013,6 +4039,9 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.appendLine(eventType, formatNexusEvent(event))
 		m.running = false
 		m.pending = nil
+		// Clear the transient usage snapshot so the footer
+		// drops the in-flight token counter when the turn ends.
+		m.latestUsage = nil
 		m.resize()
 		// Phase 6 PR2: end-of-turn auto-refresh. The Nexus may
 		// have queued or accepted new SessionChannel messages
@@ -4037,14 +4066,14 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.appendStreamingLine("assistant", stringField(event, "text"))
 	case "thinking_delta":
 		m.appendStreamingLine("thinking", stringField(event, "text"))
-	case "tool_started", "tool_denied", "permission_response", "context_warning", "context_blocking", "usage":
+	case "tool_started", "tool_denied", "permission_response", "context_warning", "context_blocking":
 		m.appendLine(eventType, formatNexusEvent(event))
 		// Phase 6 PR5: record high-signal events into the
 		// in-memory activity buffer for the /activity overlay.
-		// tool_denied, usage and hook_* are intentionally NOT
-		// recorded — the TS TUI's activityOverlay only surfaces
-		// tool runs, permission decisions, agent job events,
-		// and context warnings.
+		// tool_denied and hook_* are intentionally NOT recorded
+		// — the TS TUI's activityOverlay only surfaces tool runs,
+		// permission decisions, agent job events, and context
+		// warnings.
 		switch eventType {
 		case "tool_started":
 			m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
@@ -4055,6 +4084,27 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
+	case "usage":
+		// `usage` events arrive several times per turn (often
+		// once after every tool call). Appending each one as a
+		// transcript row fills the chat log with a stream of
+		// one-liners the operator doesn't act on. Mirror the
+		// `✻ Sautéed for 26s` pattern: keep the most recent
+		// snapshot on the model and render it as a single
+		// transient line in the footer; result / error events
+		// clear it so the next turn starts clean.
+		m.latestUsage = &usageSnapshot{
+			InputTokens:  anyInt(event["inputTokens"]),
+			OutputTokens: anyInt(event["outputTokens"]),
+			CacheRead:    anyInt(event["cacheReadInputTokens"]),
+		}
+	case "user_intake_guidance":
+		// Intake classifier metadata (intent / requiresTools /
+		// reason) is useful for audit but the operator doesn't
+		// need to see it inline. Skip the transcript append.
+		// The /activity overlay and the prompt triage flow keep
+		// the same surface; tests still call formatNexusEvent
+		// directly to verify the formatter.
 	case "tool_completed":
 		// Compact transcript: skip tool completion lines so the
 		// transcript shows one row per tool call (the started
@@ -5406,6 +5456,31 @@ func renderOverlayFrame(width int, content string) string {
 // happening; running switches to statusStyle (cyan) to mirror the
 // spinner colour; a pending permission switches to permissionStyle
 // (yellow) so the operator sees the decision is on them.
+// formatUsageFooter renders a one-line token usage summary used
+// as a transient footer status while a turn is in flight. The
+// snapshot is cleared on result / error, so the line disappears
+// when the turn ends — that's how the operator knows the turn
+// completed without us re-emitting a "done" transcript row.
+func formatUsageFooter(u *usageSnapshot) string {
+	if u == nil {
+		return ""
+	}
+	parts := []string{}
+	if u.InputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("in=%d", u.InputTokens))
+	}
+	if u.OutputTokens > 0 {
+		parts = append(parts, fmt.Sprintf("out=%d", u.OutputTokens))
+	}
+	if u.CacheRead > 0 {
+		parts = append(parts, fmt.Sprintf("cache=%d", u.CacheRead))
+	}
+	if len(parts) == 0 {
+		return "tokens: 0"
+	}
+	return "tokens " + strings.Join(parts, " ")
+}
+
 func stateStyle(running bool, pending *pendingPermission) lipgloss.Style {
 	switch {
 	case pending != nil:
