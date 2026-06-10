@@ -1254,7 +1254,13 @@ func newModel(cfg Config) model {
 	input.Prompt = "> "
 	input.ShowLineNumbers = false
 	input.SetWidth(80)
-	input.SetHeight(3)
+	// Single-line input: SetHeight(1) collapses the textarea
+	// to a single row, so only one `>` prompt icon is
+	// rendered instead of three (the previous height was a
+	// vestige of the multi-line textarea setup and produced
+	// a confusing triple-prompt box for what is in practice
+	// a single-line prompt).
+	input.SetHeight(1)
 
 	vp := viewport.New(80, 20)
 
