@@ -868,8 +868,16 @@ type model struct {
 	modelPickProviderDraft  string // pending apiKey / baseURL typed by the operator
 	modelPickSelectedID     string
 	modelPickSelectedIdx    int
-	width                    int
-	height                   int
+	// modelPickerLive is the latest live-fetched model
+	// list for the picked provider, populated on entry to
+	// Step 4 by re-fetching /v1/runtime/models and filtering
+	// to the chosen provider. While the re-fetch is in
+	// flight, modelPickerLoading is true and the picker
+	// renders a spinner instead of the list.
+	modelPickerLive    []registeredModel
+	modelPickerLoading bool
+	width              int
+	height             int
 }
 
 // usageSnapshot captures the most recent token usage event from
@@ -1957,12 +1965,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// — the operator can re-enter /model to
 					// reconfigure later.
 					if p.Configured {
-						m.setMode(modeModelPickModel)
-					} else {
-						m.modelPickProviderDraft = ""
-						m.input.SetValue("")
-						m.setMode(modeModelPickApiKey)
+						return m, m.enterModelPicker()
 					}
+					m.modelPickProviderDraft = ""
+					m.input.SetValue("")
+					m.setMode(modeModelPickApiKey)
 				}
 				return m, nil
 			}
@@ -1997,8 +2004,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.modelPickProviderDraft = typed
 				m.input.SetValue("")
 				m.modelPickSelectedIdx = 0
-				m.setMode(modeModelPickModel)
-				return m, nil
+				return m, m.enterModelPicker()
 			}
 			return m, nil
 
@@ -2163,6 +2169,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case runtimeModelsMsg:
 		if msg.err != nil {
 			m.appendLine("error", "models: "+msg.err.Error())
+			// Even on failure, the Step 4 picker can fall
+			// back to the hardcoded catalog that was
+			// already loaded; clear the loading flag so
+			// the picker shows that fallback list instead
+			// of a perpetual spinner.
+			if msg.trigger == "model-picker" {
+				m.modelPickerLoading = false
+			}
 			return m, nil
 		}
 		m.modelCatalog = msg.response
@@ -2170,6 +2184,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// /model flow: open the interactive registry
 			// now that the catalog is in hand.
 			m.openModelRegistry()
+			return m, nil
+		}
+		if msg.trigger == "model-picker" {
+			// Re-fetch landing inside Step 4: filter the
+			// refreshed catalog down to the picked
+			// provider, store as the live picker list, and
+			// clear the loading flag.
+			for _, p := range msg.response.Providers {
+				if p.ID == m.modelPickSelectedID {
+					m.modelPickerLive = p.Models
+					break
+				}
+			}
+			m.modelPickerLoading = false
 			return m, nil
 		}
 		for _, line := range formatRuntimeModels(msg.response) {
@@ -4277,6 +4305,20 @@ func (m model) currentModelProvider() *registeredProvider {
 	return nil
 }
 
+// enterModelPicker transitions into the Step 4 model
+// picker. Resets the cursor, clears the prior live list,
+// marks the picker as loading, fires a fresh
+// `/v1/runtime/models` request, and switches the input
+// mode. The runtimeModelsMsg handler routes the response
+// back into `modelPickerLive` and clears the loading flag.
+func (m *model) enterModelPicker() tea.Cmd {
+	m.modelPickSelectedIdx = 0
+	m.modelPickerLive = nil
+	m.modelPickerLoading = true
+	m.setMode(modeModelPickModel)
+	return fetchRuntimeModels(m.cfg, "model-picker")
+}
+
 // renderModelPickProvider is step 1 of the /model flow: a
 // scrollable list of providers, each row tagged with the
 // configured / needs-API-key status. enter advances to the
@@ -4399,12 +4441,31 @@ func (m model) renderModelPickModel(width int) string {
 	header := titleStyle.Render(fmt.Sprintf("%s models", firstNonEmpty(providerID, "Provider")))
 	subtitle := mutedStyle.Render("Pick a model. enter selects; esc back to base URL.")
 	lines := []string{header, subtitle, ""}
-	models := []registeredModel{}
-	if provider != nil {
+
+	// Loading state: the picker step fires a fresh
+	// /v1/runtime/models request on entry. While that
+	// request is in flight, render a spinner + status
+	// hint so the operator sees progress instead of an
+	// empty list. The runtimeModelsMsg handler clears
+	// `modelPickerLoading` when the response lands (or
+	// when the request errors out and we fall back to
+	// the hardcoded catalog).
+	if m.modelPickerLoading {
+		lines = append(lines, "  "+m.spinner.View()+"  refreshing model list…")
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("  esc back · cancel re-fetch"))
+		return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	}
+
+	// Prefer the live-fetched list when present. Falls
+	// back to the hardcoded catalog entry on the picked
+	// provider when the live fetch never landed.
+	models := m.modelPickerLive
+	if len(models) == 0 && provider != nil {
 		models = provider.Models
 	}
 	if len(models) == 0 {
-		lines = append(lines, mutedStyle.Render("  No models registered for this provider (Phase 1: live list pending)."))
+		lines = append(lines, mutedStyle.Render("  No models registered for this provider."))
 	} else {
 		// Single-column model list: just the display name.
 		// The picker commits the underlying ID on Enter, so
