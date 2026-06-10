@@ -75,21 +75,14 @@ export function formatWelcomeCardLines(options: {
   const logoWidth = Math.max(...PIXEL_ROWS.map(row => visibleTerminalWidth(renderLogoRow(row))))
   const theme = getTheme()
   const metadataWidth = Math.max(18, maxContentWidth - logoWidth - 5)
-  // The build tag is surfaced as a labeled `version` row on
-  // the right side of the card (top of the metadata column)
-  // rather than a dim suffix on the title row, so it lines
-  // up with the other `user` / `model` / `cwd` / `session` /
-  // `mode` fields. The title row is now a clean ❖ BABEL-O
-  // brand mark.
-  const versionLabel = options.title ?? BABEL_O_VERSION
+  const title = options.title ?? `v${BABEL_O_VERSION}`
   // Labeled rows: each metadata line starts with a short grey
   // label so the operator can read the card at a glance.
-  // `version` / `user` / `model` / `cwd` / `session` / `mode`
-  // mirror the /status output the user sees mid-session.
+  // `user` / `model` / `cwd` / `session` / `mode` mirror the
+  // /status output the user sees mid-session.
   const labelStyle = chalk.dim
   const metadataLines = [
-    ` ${theme.brand('❖ BABEL-O')}`,
-    ` ${labelStyle('version')} ${chalk.dim(truncateToTerminalWidth(`v${versionLabel}`, metadataWidth))}`,
+    ` ${theme.brand('❖ BABEL-O')}  ${chalk.dim(title)}`,
     ` ${labelStyle('user')}    ${chalk.bold.cyan(truncateToTerminalWidth(username, metadataWidth))}`,
     ` ${labelStyle('model')}   ${chalk.yellow(truncateToTerminalWidth(defaultModel, metadataWidth))}`,
     ` ${labelStyle('cwd')}     ${chalk.italic.white(truncateToTerminalWidth(formatCwd(options.cwd), metadataWidth))}`,
@@ -103,17 +96,11 @@ export function formatWelcomeCardLines(options: {
   })
   const contentWidth = Math.min(maxContentWidth, Math.max(55, ...contentWidths))
   const lines = []
-  // Iterate over the longer of the two columns so a metadata
-  // line that doesn't have a paired logo row (e.g. the
-  // `version` row that sits above the first logo row) still
-  // renders, just without the left-side pixel art.
-  const totalRows = Math.max(PIXEL_ROWS.length, metadataLines.length)
-  for (let i = 0; i < totalRows; i++) {
-    const logoCol = i < PIXEL_ROWS.length ? renderLogoRow(PIXEL_ROWS[i]!) : ''
+
+  for (let i = 0; i < PIXEL_ROWS.length; i++) {
+    const logoCol = renderLogoRow(PIXEL_ROWS[i]!)
     const metaCol = metadataLines[i] ?? ''
-    const content = logoCol
-      ? ` ${logoCol}   ${metaCol}`
-      : `        ${metaCol}`
+    const content = ` ${logoCol}   ${metaCol}`
     lines.push(padToTerminalWidth(content, contentWidth))
   }
 
