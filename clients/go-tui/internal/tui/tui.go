@@ -2973,7 +2973,7 @@ func buildAgentOverlayLines(jobs []agentJob) []string {
 	if len(jobs) == 0 {
 		return []string{"No agent jobs for this session."}
 	}
-	lines := []string{}
+	lines := []string{mutedStyle.Render("  job_id · type · status · active/max · depth/max · isolation · fork_mode")}
 	for _, job := range jobs {
 		lines = append(lines, formatAgentJobRow(job)...)
 	}
@@ -3220,7 +3220,7 @@ func buildTaskBoardLines(tasks []nexusTask) []string {
 	if len(tasks) == 0 {
 		return []string{"No tasks for this session."}
 	}
-	lines := []string{}
+	lines := []string{mutedStyle.Render("  task_id · status · source · owner · title")}
 	for _, task := range tasks {
 		lines = append(lines, formatTaskRow(task)...)
 	}
@@ -3327,7 +3327,7 @@ func buildActivityOverlayLines(entries []activityEventEntry) []string {
 	if len(entries) == 0 {
 		return []string{"No recent activity recorded yet."}
 	}
-	lines := []string{}
+	lines := []string{mutedStyle.Render("  kind · summary · timestamp")}
 	// Newest first.
 	for index := len(entries) - 1; index >= 0; index-- {
 		entry := entries[index]

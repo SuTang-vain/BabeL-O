@@ -3320,12 +3320,14 @@ func TestBuildActivityOverlayLinesRendersNewestFirst(t *testing.T) {
 		{Kind: activityKindPermission, Summary: "third", Timestamp: "ts3"},
 	}
 	lines := buildActivityOverlayLines(entries)
-	if len(lines) != 3 {
-		t.Fatalf("expected 3 lines, got %d", len(lines))
+	// 1 column header + 3 entries = 4 lines.
+	if len(lines) != 4 {
+		t.Fatalf("expected 4 lines, got %d", len(lines))
 	}
-	// Newest first → first line should reference "third".
-	if !strings.Contains(lines[0], "third") {
-		t.Fatalf("first line should be newest (third), got %q", lines[0])
+	// Newest first → first event line (lines[1], after the
+	// column header at lines[0]) should reference "third".
+	if !strings.Contains(lines[1], "third") {
+		t.Fatalf("first event line should be newest (third), got %q", lines[1])
 	}
 	if !strings.Contains(lines[len(lines)-1], "first") {
 		t.Fatalf("last line should be oldest (first), got %q", lines[len(lines)-1])
