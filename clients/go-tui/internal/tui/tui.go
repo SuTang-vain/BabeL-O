@@ -4341,6 +4341,16 @@ func formatLine(kind string, text string, width int) string {
 		out := make([]string, 0, len(bodyLines))
 		out = append(out, userStyle.Render("> ")+userStyle.Render(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
+			// Preserve truly empty lines (paragraph breaks
+			// from the source text) so the breathing-room
+			// logic in renderTranscript can de-duplicate
+			// them — without this, the empty line becomes
+			// `  ` (2 spaces) and looks like a blank but
+			// isn't recognised as one.
+			if c == "" {
+				out = append(out, "")
+				continue
+			}
 			out = append(out, "  "+userStyle.Render(c))
 		}
 		return strings.Join(out, "\n")
@@ -4358,6 +4368,10 @@ func formatLine(kind string, text string, width int) string {
 		out := make([]string, 0, len(bodyLines))
 		out = append(out, "  "+style.Render(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
+			if c == "" {
+				out = append(out, "")
+				continue
+			}
 			out = append(out, "  "+style.Render(c))
 		}
 		return strings.Join(out, "\n")
@@ -4375,6 +4389,10 @@ func formatLine(kind string, text string, width int) string {
 		out := make([]string, 0, len(bodyLines))
 		out = append(out, style.Render(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
+			if c == "" {
+				out = append(out, "")
+				continue
+			}
 			out = append(out, "  "+style.Render(c))
 		}
 		return strings.Join(out, "\n")
@@ -4398,6 +4416,10 @@ func formatLine(kind string, text string, width int) string {
 		out := make([]string, 0, len(bodyLines))
 		out = append(out, "  "+style.Render(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
+			if c == "" {
+				out = append(out, "")
+				continue
+			}
 			out = append(out, "  "+style.Render(c))
 		}
 		return strings.Join(out, "\n")
