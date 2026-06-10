@@ -31,6 +31,7 @@ type config struct {
 	apiKey         string
 	altScreen      bool
 	pollIntervalMs int
+	printVersion   bool
 }
 
 type streamStartedMsg struct {
@@ -656,6 +657,49 @@ type subAgentEntry struct {
 // when m.configVersion > 0.
 type pollTickMsg struct{}
 
+// runtimeVersionCompat mirrors the nested
+// `goTuiCompatibility` block of /v1/runtime/version. The Go
+// TUI uses it for the major-version check at startup
+// (Phase 8 PR1). Only `supportedMajors` is used today;
+// `latestSupported` is surfaced in the version banner for
+// future "your Go TUI is behind" UX.
+type runtimeVersionCompat struct {
+	SupportedMajors []int  `json:"supportedMajors"`
+	LatestSupported string `json:"latestSupported"`
+}
+
+// runtimeVersionResponse is the envelope for
+// GET /v1/runtime/version. The Go TUI only reads the stable
+// fields it uses for the compat check; raw bytes are
+// retained for any future richer renderer.
+//
+// SchemaVersion is a date-based semantic string
+// (e.g. "2026-05-21.babel-o.v1") matching the upstream
+// Nexus event schema version, NOT a numeric field. The
+// field is decoded but currently unused by the runtime
+// compat check (which only consults supportedMajors); it
+// is kept on the typed struct so any future richer
+// renderer can surface it without breaking the existing
+// decode path.
+type runtimeVersionResponse struct {
+	Type                 string               `json:"type"`
+	ServerVersion        string               `json:"serverVersion"`
+	SchemaVersion        string               `json:"schemaVersion"`
+	GoTuiCompatibility   runtimeVersionCompat `json:"goTuiCompatibility"`
+	NodeCliCompatibility runtimeVersionCompat `json:"nodeCliCompatibility"`
+}
+
+// runtimeVersionMsg is the response from
+// GET /v1/runtime/version. The Go TUI only reads the
+// supportedMajors + latestSupported fields; raw bytes are
+// retained for the same schema-churn reason as
+// contextAnalysisMsg / inboxMsg.
+type runtimeVersionMsg struct {
+	raw      []byte
+	envelope runtimeVersionResponse
+	err      error
+}
+
 // inputMode is the §5 / Phase 3 single-input-owner state machine.
 // Only one mode is active at a time; transitions are explicit and
 // always round-trip back to modeComposing when an overlay closes.
@@ -1137,6 +1181,10 @@ var (
 
 func main() {
 	cfg := parseFlags()
+	if cfg.printVersion {
+		fmt.Println(versionString())
+		return
+	}
 	m := newModel(cfg)
 	opts := []tea.ProgramOption{}
 	if cfg.altScreen {
@@ -1156,6 +1204,8 @@ func parseFlags() config {
 	flag.StringVar(&cfg.sessionID, "session", "", "optional existing session id")
 	flag.BoolVar(&cfg.altScreen, "alt", true, "use terminal alternate screen")
 	flag.IntVar(&cfg.pollIntervalMs, "poll-interval-ms", 30000, "background /v1/runtime/config poll interval in milliseconds; 0 disables polling")
+	flag.BoolVar(&cfg.printVersion, "version", false, "print version and exit")
+	flag.BoolVar(&cfg.printVersion, "v", false, "print version and exit (shorthand)")
 	flag.Parse()
 	cfg.apiKey = os.Getenv("NEXUS_API_KEY")
 	return cfg
@@ -1197,6 +1247,13 @@ func (m model) Init() tea.Cmd {
 		fetchRuntimeConfig(m.cfg, 0),
 		fetchRuntimeProfiles(m.cfg),
 		m.schedulePollTick(),
+		// Phase 8 PR1: fire a one-shot /v1/runtime/version
+		// check at startup. The handler compares our
+		// major against the server's supportedMajors list
+		// and surfaces a friendly warning when they don't
+		// match. Major mismatch on a "dev" build is
+		// silently ignored.
+		checkRuntimeVersion(m.cfg),
 	)
 }
 
@@ -1611,6 +1668,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.tombstoneCount = len(msg.response.Tombstones)
 		m.appendLine("status", formatRuntimeProfiles(msg.response))
 		return m, m.schedulePollTick()
+
+	case runtimeVersionMsg:
+		// Phase 8 PR1: startup version-compat sanity check.
+		// A failed fetch is NOT a hard error — the Nexus
+		// may still be booting, or the user is on a stale
+		// build that doesn't know about the endpoint. We
+		// silently no-op on error and let the existing
+		// runtimeConfigMsg path surface the underlying
+		// health. A successful response is compared against
+		// our own major; mismatch surfaces a warning line.
+		if msg.err != nil {
+			return m, nil
+		}
+		if !isGoTuiMajorCompatible(msg.envelope.GoTuiCompatibility.SupportedMajors) {
+			banner := fmt.Sprintf(
+				"Go TUI major version mismatch: local=%s, server supports majors %v (latest=%s). "+
+					"Upgrade the Go TUI binary or downgrade the Nexus server.",
+				Version, msg.envelope.GoTuiCompatibility.SupportedMajors,
+				msg.envelope.GoTuiCompatibility.LatestSupported,
+			)
+			m.appendLine("error", banner)
+		}
+		return m, nil
 
 	case profileSelectMsg:
 		if msg.err != nil {
@@ -4586,6 +4666,32 @@ func fetchSessionTasks(cfg config, sessionID string, trigger string) tea.Cmd {
 		if err == nil {
 			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
 				out.err = fmt.Errorf("decode tasks: %w", decodeErr)
+			}
+		}
+		return out
+	}
+}
+
+// checkRuntimeVersion issues GET /v1/runtime/version and
+// decodes the stable top-level envelope
+// (type / serverVersion / schemaVersion /
+// goTuiCompatibility / nodeCliCompatibility). The raw bytes
+// are retained so any future richer renderer (or a
+// server-side schema addition) does not break the existing
+// format / compat check. Called once at startup from
+// Init() as a non-blocking version-compat sanity check.
+func checkRuntimeVersion(cfg config) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/runtime/version",
+			nil,
+		)
+		out := runtimeVersionMsg{raw: raw, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
+				out.err = fmt.Errorf("decode runtime version: %w", decodeErr)
 			}
 		}
 		return out

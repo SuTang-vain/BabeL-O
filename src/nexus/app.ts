@@ -1,7 +1,8 @@
 import websocket from '@fastify/websocket'
 import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify'
-import { existsSync, lstatSync } from 'node:fs'
+import { existsSync, lstatSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
 import type { EverCoreClient } from '../runtime/everCoreClient.js'
@@ -94,6 +95,35 @@ type SharedRuntimeCapabilities = {
   jsonOutput: boolean
   structuredOutput: boolean
   streaming: boolean
+}
+
+// readOwnPackageVersion returns the BabeL-O package.json
+// `version` field for /v1/runtime/version self-reporting. The
+// resolve uses the same import.meta.url anchor that the rest
+// of the Nexus process uses, so the value tracks the actual
+// installed package (not the process cwd). Falls back to
+// "0.0.0-unknown" if the package.json cannot be read (e.g.
+// unusual install layout) so the endpoint still returns a
+// well-formed response.
+function readOwnPackageVersion(): string {
+  try {
+    const candidates = [
+      fileURLToPath(new URL('../../package.json', import.meta.url)),
+      fileURLToPath(new URL('../package.json', import.meta.url)),
+    ]
+    for (const candidate of candidates) {
+      if (existsSync(candidate)) {
+        const raw = readFileSync(candidate, 'utf8')
+        const parsed = JSON.parse(raw) as { version?: unknown }
+        if (typeof parsed.version === 'string' && parsed.version.length > 0) {
+          return parsed.version
+        }
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return '0.0.0-unknown'
 }
 
 function inspectResolvedRuntimeConfig(manager: ConfigManager) {
@@ -602,6 +632,33 @@ export async function createNexusApp(
     }
     return inspectResolvedRuntimeConfig(manager)
   })
+
+  // GET /v1/runtime/version — Phase 8 PR1: 客户端版本协商端点
+  // 返回 BabeL-O Nexus server 自己的版本、当前 Nexus schema
+  // 版本（用于客户端做兼容性检查）、以及 CLI / Go TUI
+  // 兼容性范围。客户端启动时拉这个端点做 major-version
+  // 校验；major 必须落在兼容范围内。响应脱敏，不返回
+  // 任何 secret。
+  app.get('/v1/runtime/version', async () => {
+    const rawVersion = readOwnPackageVersion()
+    return {
+      type: 'runtime_version' as const,
+      serverVersion: rawVersion,
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      goTuiCompatibility: {
+        // 当前 Nexus 兼容的 Go TUI 客户端 major 范围。
+        // Phase 8 PR1 阶段只有一个 major（0），bump 时
+        // 手动维护即可；未来可以加 "min / max" 二元组。
+        supportedMajors: [0],
+        latestSupported: rawVersion,
+      },
+      nodeCliCompatibility: {
+        supportedMajors: [0],
+        latestSupported: rawVersion,
+      },
+    }
+  })
+
 
   // GET /v1/runtime/config/profiles — profile 清单 (脱敏: 不返回 apiKey/baseUrl)
   app.get('/v1/runtime/config/profiles', async () => {

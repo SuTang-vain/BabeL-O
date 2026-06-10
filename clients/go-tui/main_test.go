@@ -4057,3 +4057,170 @@ func TestStaticToolDescriptorCatalogIsStableReferenceShape(t *testing.T) {
 		t.Fatalf("Bash should be execute-risk + approval-required, got risk=%q approval=%v", tools[3].risk, tools[3].approval)
 	}
 }
+
+func TestVersionStringFallsBackToDevWhenLDFlagsEmpty(t *testing.T) {
+	// Snapshot the package-level version vars so we can
+	// restore them after the test (the test is parallel-
+	// unsafe; the rest of the suite assumes the "dev"
+	// defaults).
+	prevVersion, prevCommit, prevBuildDate := Version, Commit, BuildDate
+	t.Cleanup(func() {
+		Version, Commit, BuildDate = prevVersion, prevCommit, prevBuildDate
+	})
+	Version, Commit, BuildDate = "dev", "", ""
+	if got := versionString(); got != "bbl-go-tui dev" {
+		t.Fatalf("dev build should print 'bbl-go-tui dev', got %q", got)
+	}
+}
+
+func TestVersionStringIncludesCommitAndBuildDateWhenSet(t *testing.T) {
+	prevVersion, prevCommit, prevBuildDate := Version, Commit, BuildDate
+	t.Cleanup(func() {
+		Version, Commit, BuildDate = prevVersion, prevCommit, prevBuildDate
+	})
+	Version = "1.2.3"
+	Commit = "abc1234"
+	BuildDate = "2026-06-10T10:00:00Z"
+	got := versionString()
+	for _, want := range []string{"1.2.3", "abc1234", "2026-06-10T10:00:00Z"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("versionString missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestMajorVersionParsesStandardSemver(t *testing.T) {
+	prevVersion := Version
+	t.Cleanup(func() { Version = prevVersion })
+	cases := map[string]int{
+		"0.0.0":          0,
+		"0.3.2":          0,
+		"1.0.0":          1,
+		"2.5.7":          2,
+		"10.20.30":       10,
+		"dev":            0, // dev fallback is treated as major 0
+		"":               0, // empty fallback is treated as major 0
+		"1.2.3-pre.4+abc": 1,
+	}
+	for version, want := range cases {
+		Version = version
+		if got := majorVersion(); got != want {
+			t.Fatalf("majorVersion(%q) = %d, want %d", version, got, want)
+		}
+	}
+}
+
+func TestIsGoTuiMajorCompatibleMatchesSupportedMajors(t *testing.T) {
+	prevVersion := Version
+	t.Cleanup(func() { Version = prevVersion })
+	cases := []struct {
+		name             string
+		localVersion     string
+		supportedMajors  []int
+		want            bool
+	}{
+		{name: "dev build always passes", localVersion: "dev", supportedMajors: []int{1, 2, 3}, want: true},
+		{name: "empty build always passes", localVersion: "", supportedMajors: []int{1, 2, 3}, want: true},
+		{name: "empty supported list = no policy = pass", localVersion: "1.2.3", supportedMajors: nil, want: true},
+		{name: "matching major passes", localVersion: "1.2.3", supportedMajors: []int{1, 2, 3}, want: true},
+		{name: "non-matching major fails", localVersion: "2.5.0", supportedMajors: []int{1, 3}, want: false},
+		{name: "major 0 in supported = dev build always passes", localVersion: "0.3.2", supportedMajors: []int{0, 1}, want: true},
+	}
+	for _, tc := range cases {
+		Version = tc.localVersion
+		if got := isGoTuiMajorCompatible(tc.supportedMajors); got != tc.want {
+			t.Fatalf("%s: isGoTuiMajorCompatible(%v) for Version=%q = %v, want %v",
+				tc.name, tc.supportedMajors, tc.localVersion, got, tc.want)
+		}
+	}
+}
+
+func TestCheckRuntimeVersionHTTPCmdSendsCorrectPath(t *testing.T) {
+	var seenPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_version","serverVersion":"0.3.2","schemaVersion":"2026-05-21.babel-o.v1","goTuiCompatibility":{"supportedMajors":[0],"latestSupported":"0.3.2"},"nodeCliCompatibility":{"supportedMajors":[0],"latestSupported":"0.3.2"}}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := checkRuntimeVersion(m.cfg)
+	msg := cmd()
+	rv, ok := msg.(runtimeVersionMsg)
+	if !ok {
+		t.Fatalf("expected runtimeVersionMsg, got %T", msg)
+	}
+	if rv.err != nil {
+		t.Fatalf("checkRuntimeVersion returned err: %v", rv.err)
+	}
+	if seenPath != "/v1/runtime/version" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+	if rv.envelope.ServerVersion != "0.3.2" {
+		t.Fatalf("ServerVersion = %q, want 0.3.2", rv.envelope.ServerVersion)
+	}
+	if len(rv.envelope.GoTuiCompatibility.SupportedMajors) != 1 || rv.envelope.GoTuiCompatibility.SupportedMajors[0] != 0 {
+		t.Fatalf("SupportedMajors = %v, want [0]", rv.envelope.GoTuiCompatibility.SupportedMajors)
+	}
+}
+
+func TestRuntimeVersionMsgCompatMismatchAppendsErrorLine(t *testing.T) {
+	prevVersion := Version
+	t.Cleanup(func() { Version = prevVersion })
+	Version = "2.5.0"
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	envelope := runtimeVersionResponse{
+		Type:          "runtime_version",
+		ServerVersion: "3.0.0",
+		SchemaVersion: "2026-05-21.babel-o.v1",
+		GoTuiCompatibility: runtimeVersionCompat{
+			SupportedMajors: []int{1, 3},
+			LatestSupported:  "3.0.0",
+		},
+	}
+	updated, _ := m.Update(runtimeVersionMsg{raw: []byte(`{}`), envelope: envelope})
+	um := updated.(model)
+	last := um.transcript[len(um.transcript)-1]
+	if last.kind != "error" || !strings.Contains(last.text, "Go TUI major version mismatch") {
+		t.Fatalf("expected compat mismatch error line, got %+v", last)
+	}
+	if !strings.Contains(last.text, "local=2.5.0") {
+		t.Fatalf("error should include local version 2.5.0, got %q", last.text)
+	}
+}
+
+func TestRuntimeVersionMsgCompatMatchIsSilent(t *testing.T) {
+	prevVersion := Version
+	t.Cleanup(func() { Version = prevVersion })
+	Version = "1.2.3"
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	envelope := runtimeVersionResponse{
+		Type:          "runtime_version",
+		ServerVersion: "1.2.3",
+		SchemaVersion: "2026-05-21.babel-o.v1",
+		GoTuiCompatibility: runtimeVersionCompat{
+			SupportedMajors: []int{0, 1, 2},
+			LatestSupported:  "1.2.3",
+		},
+	}
+	baseline := len(m.transcript)
+	updated, _ := m.Update(runtimeVersionMsg{raw: []byte(`{}`), envelope: envelope})
+	um := updated.(model)
+	if len(um.transcript) != baseline {
+		t.Fatalf("matching compat should be silent, transcript grew from %d to %d", baseline, len(um.transcript))
+	}
+}
+
+func TestRuntimeVersionMsgErrorIsSilent(t *testing.T) {
+	// A failed version check should NOT add an error line —
+	// the Nexus may be booting or the binary may be older
+	// than the endpoint. The existing runtimeConfigMsg path
+	// surfaces the real connectivity error.
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	baseline := len(m.transcript)
+	updated, _ := m.Update(runtimeVersionMsg{err: errors.New("connection refused")})
+	um := updated.(model)
+	if len(um.transcript) != baseline {
+		t.Fatalf("version check fetch error should be silent, transcript grew from %d to %d", baseline, len(um.transcript))
+	}
+}

@@ -342,3 +342,59 @@ test('ConfigManager.save bumps configVersion on every call', () => {
   assert.ok(v1 > v0)
   assert.ok(v2 > v1)
 })
+
+/**
+ * Phase 8 PR1: GET /v1/runtime/version 端点。
+ * 客户端启动时拉这个端点做 major-version 兼容性检查。
+ * 响应脱敏，不返回 secret；schemaVersion 用于客户端决定
+ * 它跟 Nexus 协议层是否还在同代。
+ */
+test('GET /v1/runtime/version returns server version + goTui compatibility range', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/version' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'runtime_version')
+    assert.equal(typeof body.serverVersion, 'string')
+    assert.ok(body.serverVersion.length > 0, 'serverVersion should be a non-empty string')
+    assert.equal(typeof body.schemaVersion, 'string')
+    assert.ok(body.schemaVersion.length > 0, 'schemaVersion should be a non-empty string')
+    // supportedMajors + latestSupported must be present
+    // and well-typed so the Go TUI can iterate without
+    // runtime guards.
+    assert.ok(Array.isArray(body.goTuiCompatibility.supportedMajors))
+    assert.equal(typeof body.goTuiCompatibility.latestSupported, 'string')
+    assert.ok(Array.isArray(body.nodeCliCompatibility.supportedMajors))
+    assert.equal(typeof body.nodeCliCompatibility.latestSupported, 'string')
+  } finally {
+    await app.close()
+  }
+})
+
+test('GET /v1/runtime/version does not leak secrets', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/version' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const serialized = JSON.stringify(body)
+    // The version response should never carry any secret-like
+    // fields. apiKey is the canonical secret; we assert on
+    // its absence explicitly.
+    assert.equal(
+      serialized.includes('apiKey'),
+      false,
+      '/v1/runtime/version response must not include apiKey',
+    )
+    assert.equal(
+      serialized.includes('api_key'),
+      false,
+      '/v1/runtime/version response must not include api_key',
+    )
+  } finally {
+    await app.close()
+  }
+})
