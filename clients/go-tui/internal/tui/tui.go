@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -4052,7 +4053,18 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// stops receiving keys while the panel is up.
 		m.setMode(modePermission)
 	case "result", "error":
-		m.appendLine(eventType, formatNexusEvent(event))
+		// Suppress the success-time `done` transcript row: the
+		// header has already flipped from `running` back to
+		// `idle`, and the streaming assistant_delta events
+		// already produced the full reply. Re-emitting `done`
+		// was a redundant noise line. The body still shows on
+		// failure (`failed: <message>`) and on raw `error`
+		// events so the operator can see why a turn ended in
+		// failure.
+		body := formatNexusEvent(event)
+		if body != "" {
+			m.appendLine(eventType, body)
+		}
 		m.running = false
 		m.pending = nil
 		// Clear the transient usage snapshot so the footer
@@ -4291,8 +4303,126 @@ func (m *model) appendLine(kind string, text string) {
 }
 
 func (m *model) refreshViewport() {
-	m.viewport.SetContent(renderTranscript(m.transcript, max(40, m.viewport.Width)))
+	if len(m.transcript) == 0 {
+		m.viewport.SetContent(m.renderWelcomeCard(max(40, m.viewport.Width)))
+	} else {
+		m.viewport.SetContent(renderTranscript(m.transcript, max(40, m.viewport.Width)))
+	}
 	m.viewport.GotoBottom()
+}
+
+func (m model) renderWelcomeCard(width int) string {
+	username := os.Getenv("USER")
+	if username == "" {
+		username = os.Getenv("USERNAME")
+	}
+	if username == "" {
+		username = "User"
+	}
+
+	formattedCwd := m.cfg.Cwd
+	home := os.Getenv("HOME")
+	if home != "" {
+		if formattedCwd == home {
+			formattedCwd = "~"
+		} else if strings.HasPrefix(formattedCwd, home+"/") {
+			formattedCwd = "~/" + formattedCwd[len(home)+1:]
+		}
+	}
+
+	mode := "Embedded (Local)"
+	if m.cfg.BaseURL != "" && !strings.Contains(m.cfg.BaseURL, "127.0.0.1") && !strings.Contains(m.cfg.BaseURL, "localhost") {
+		mode = "Service (" + m.cfg.BaseURL + ")"
+	}
+
+	defaultModel := m.modelID
+	if defaultModel == "" {
+		defaultModel = "local/coding-runtime"
+	}
+
+	versionStr := Version
+	if versionStr == "" {
+		versionStr = "dev"
+	}
+
+	pixelRows := []string{
+		"    M    ",
+		"   M M   ",
+		"    R    ",
+		"   R R   ",
+		"  R   R  ",
+		"O O P V V",
+	}
+
+	colors := map[rune]string{
+		'M': "#ff006e",
+		'P': "#ff4f9a",
+		'R': "#c72d68",
+		'O': "#ff7a18",
+		'V': "#8b5cf6",
+	}
+
+	renderLogoRow := func(row string) string {
+		var sb strings.Builder
+		for _, r := range row {
+			if r == ' ' {
+				sb.WriteByte(' ')
+			} else {
+				hex, ok := colors[r]
+				if !ok {
+					hex = "#ff006e"
+				}
+				style := lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
+				sb.WriteString(style.Render("█"))
+			}
+		}
+		return sb.String()
+	}
+
+	brandStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	accentStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	cyanBoldStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("81"))
+	yellowStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("220"))
+	whiteItalicStyle := lipgloss.NewStyle().Italic(true).Foreground(lipgloss.Color("255"))
+
+	metadataLines := []string{
+		brandStyle.Render("❖ BABEL-O") + "  " + mutedStyle.Render("v"+versionStr),
+		cyanBoldStyle.Render(username),
+		yellowStyle.Render(defaultModel),
+		whiteItalicStyle.Render(formattedCwd),
+		accentStyle.Render(mode),
+	}
+
+	var cardLines []string
+	for i := 0; i < 6; i++ {
+		logoCol := renderLogoRow(pixelRows[i])
+		metaCol := ""
+		if i < len(metadataLines) {
+			metaCol = metadataLines[i]
+		}
+		combined := " " + logoCol + "   " + metaCol
+		cardLines = append(cardLines, combined)
+	}
+
+	maxCardWidth := 0
+	for _, line := range cardLines {
+		w := lipgloss.Width(line)
+		if w > maxCardWidth {
+			maxCardWidth = w
+		}
+	}
+
+	hPad := max(0, (width-maxCardWidth)/2)
+	hSpace := strings.Repeat(" ", hPad)
+
+	var outputLines []string
+	outputLines = append(outputLines, "", "")
+	for _, line := range cardLines {
+		outputLines = append(outputLines, hSpace+line)
+	}
+	outputLines = append(outputLines, "")
+
+	return strings.Join(outputLines, "\n")
 }
 
 func renderTranscript(lines []transcriptLine, width int) string {
@@ -4596,16 +4726,16 @@ func formatNexusEvent(event map[string]any) string {
 	case "execute_summary":
 		return formatExecuteSummary(event)
 	case "result":
-		// Suppress the message text on success: streaming
-		// assistant_delta events already produced the full reply
-		// line, and re-emitting the text on the result event was
-		// duplicating the operator-visible chat. Surface the
-		// message only on failure so the user still sees why a
-		// turn ended with success=false.
+		// On success: return empty so the consumeNexusEvent
+		// result branch skips the append entirely (the header
+		// already flipped from running back to idle, the
+		// streaming deltas already produced the reply). On
+		// failure: surface the message so the operator sees
+		// why the turn ended with success=false.
 		if event["success"] == false {
 			return "failed: " + firstNonEmpty(stringField(event, "message"), stringField(event, "text"))
 		}
-		return "done"
+		return ""
 	case "error":
 		code := stringField(event, "code")
 		if hint, ok := friendlyNexusError(code, event); ok {
