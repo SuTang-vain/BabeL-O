@@ -3734,9 +3734,13 @@ func (m model) renderSlashPalette(width int) string {
 }
 
 func (m model) renderHeader(width int) string {
-	// Row 1: brand title + build metadata + run state. `dev`
-	// lives next to the title so the user sees the build tag
-	// without scanning a third line.
+	// Single-row header: title + run state. The earlier chrome
+	// (build tag, cwd, session id) was dropped: the build tag
+	// is `--version` output, cwd is what `bbl go --cwd` was
+	// given on launch, and the session id is a short id that's
+	// already attached to every message the user submits —
+	// surfacing them in the header didn't help the operator
+	// make a decision, it just widened the chrome.
 	title := titleStyle.Render("BabeL-O · Go TUI")
 	// ✓ marker is rendered in statusStyle (cyan) once the first
 	// session_started event has been observed; before that the
@@ -3744,7 +3748,6 @@ func (m model) renderHeader(width int) string {
 	if m.connected {
 		title = title + " " + statusStyle.Render("✓")
 	}
-	build := mutedStyle.Render("· " + versionString())
 	stateLabel := "idle"
 	stateKind := stateStyle(false, nil)
 	if m.running {
@@ -3774,22 +3777,10 @@ func (m model) renderHeader(width int) string {
 		stateKind = permissionStyle
 	}
 	state := stateKind.Render(stateLabel)
-	top := joinColumns(width, title+" "+build, state)
-
-	// Row 2: workspace path + session id only. URL is omitted
-	// from the header chrome — it lives in /config output and
-	// the bbl CLI; the header just needs enough to identify
-	// which cwd / session this TUI is bound to.
-	session := "new session"
-	if m.sessionID != "" {
-		session = shortID(m.sessionID)
-	}
-	pathLine := mutedStyle.Render(truncatePlain(
-		fmt.Sprintf("cwd=%s  session=%s", m.cfg.Cwd, session), width))
+	top := joinColumns(width, title, state)
 
 	return strings.Join([]string{
 		top,
-		pathLine,
 		divider(width),
 	}, "\n")
 }
@@ -4406,11 +4397,11 @@ func (m model) renderWelcomeCard(width int) string {
 	}
 
 	metadataLines := []string{
-		"user    " + username,
-		"model   " + defaultModel,
-		"cwd     " + formattedCwd,
-		"session " + sessionVal,
-		"mode    " + mode,
+		mutedStyle.Render("user    " + username),
+		mutedStyle.Render("model   " + defaultModel),
+		mutedStyle.Render("cwd     " + formattedCwd),
+		mutedStyle.Render("session " + sessionVal),
+		mutedStyle.Render("mode    " + mode),
 	}
 
 	var cardLines []string

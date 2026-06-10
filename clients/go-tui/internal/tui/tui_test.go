@@ -3580,11 +3580,11 @@ func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
 	}
 }
 
-// TestHeaderIsCompactKeepsPathAndSession verifies the slimmed
-// header chrome: title + build metadata + state on row 1, only
-// cwd + session id on row 2. Sub-agent counts are surfaced via
-// the /agents overlay instead of the header.
-func TestHeaderIsCompactKeepsPathAndSession(t *testing.T) {
+// TestHeaderIsMinimalTitleAndStateOnly verifies the
+// minimal header: title + state on a single row, no build
+// tag, no cwd, no session id. Sub-agent counts are surfaced
+// via the /agents overlay instead of the header.
+func TestHeaderIsMinimalTitleAndStateOnly(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
 	m.sessionID = "session_compact_abcdef108000"
 	m.width = 120
@@ -3594,17 +3594,15 @@ func TestHeaderIsCompactKeepsPathAndSession(t *testing.T) {
 	rendered := m.renderHeader(m.width)
 	for _, want := range []string{
 		"BabeL-O · Go TUI",
-		"bbl-go-tui",
-		"cwd=/Users/tangyaoyue/DEV/BABEL/BabeL-O",
-		"session=sess",
+		"idle",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("header should include %q, got:\n%s", want, rendered)
 		}
 	}
-	for _, banned := range []string{"url=", "model=", "profile=", "sub: "} {
+	for _, banned := range []string{"bbl-go-tui", "cwd=", "session=", "url=", "model=", "profile=", "sub: "} {
 		if strings.Contains(rendered, banned) {
-			t.Fatalf("header should NOT include %q in slimmed chrome, got:\n%s", banned, rendered)
+			t.Fatalf("header should NOT include %q in minimal chrome, got:\n%s", banned, rendered)
 		}
 	}
 }
