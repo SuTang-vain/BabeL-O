@@ -268,7 +268,7 @@ func TestModelRegistryOpensOnModelTriggerAndCloses(t *testing.T) {
 		t.Fatalf("modelCatalog default = %q", um.modelCatalog.DefaultModel)
 	}
 	rendered := um.renderModelPickProvider(100)
-	for _, want := range []string{"BABEL Model Registry", "Select provider", "Local", "configured"} {
+	for _, want := range []string{"BABEL Model Registry", "Select provider", "Local"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered model registry missing %q:\n%s", want, rendered)
 		}

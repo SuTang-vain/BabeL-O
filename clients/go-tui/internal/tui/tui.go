@@ -72,6 +72,19 @@ type permissionDecision struct {
 	toolUseID string
 	approved  bool
 	reason    string
+	// Phase A.1 of the enhanced permission panel:
+	//   - scope: 'once' (default), 'session' (accumulate rule for
+	//     the remaining turns), or 'rule' (Round 2 inline editor
+	//     for a custom rule).
+	//   - rule: the allow-rule string for scope='session'/'rule';
+	//     ignored otherwise. The runtime accumulates it into the
+	//     per-session rules map.
+	//   - feedback: free-form text the model should act on
+	//     (typically paired with approved=false for the
+	//     "Reject, tell the model what to do instead" path).
+	scope     string
+	rule      string
+	feedback  string
 }
 
 type pendingPermission struct {
@@ -81,6 +94,10 @@ type pendingPermission struct {
 	risk      string
 	input     string
 	message   string
+	// Phase A.1: model-suggested allow rule (e.g. "cd:*",
+	// "git:status"). Surfaced from the runtime's
+	// `permission_request` event's `suggestedRule` field.
+	suggestedRule string
 }
 
 type runtimeCapabilities struct {
@@ -792,6 +809,14 @@ type model struct {
 	events                  <-chan streamEvent
 	decisions               chan<- permissionDecision
 	pending                 *pendingPermission
+	// Phase A.1: 0..4 selector on the 5-option permission panel
+	// ("Approve once" / "Approve for session" / "Approve with
+	// editable rule" / "Reject" / "Reject, tell the model what
+	// to do instead"). Driven by 1-5, up/down, and (on selection)
+	// enter; esc cancels as before. Always re-initialised to 0
+	// (default cursor on "Approve once") on every fresh
+	// `permission_request` event.
+	permissionChoice        int
 	lastEventType           string
 	sessionID               string
 	modelID                 string
@@ -1539,12 +1564,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Phase 3 single-input-owner: dispatch by current mode.
 		switch m.inputMode {
 		case modePermission:
+			// Phase A.1 of the enhanced permission panel: 5-option
+			// routing. 1-5 jump straight to the corresponding
+			// choice; ↑/↓ move the cursor (0..4, wrapping); enter
+			// confirms the current cursor; esc cancels (treated
+			// as "Reject" without feedback, matching the prior
+			// r/n/esc behaviour for operators who just want out).
+			// The legacy a/y/r/n shortcuts are kept as aliases
+			// of option 1 (a/y) and option 4 (r/n) so muscle
+			// memory from the old single-button panel still works.
 			switch strings.ToLower(key) {
-			case "a", "y":
-				m.sendPermissionDecision(true, "Approved from Go TUI")
+			case "1":
+				m.confirmPermissionChoice()
 				return m, nil
-			case "r", "n", "esc":
-				m.sendPermissionDecision(false, "Rejected from Go TUI")
+			case "2":
+				m.permissionChoice = 1
+				m.confirmPermissionChoice()
+				return m, nil
+			case "3":
+				// Round 2 will route to an inline rule editor.
+				// For Round 1 fall back to "Approve for this
+				// session" with the runtime's suggested rule
+				// (mirrors option 2), so the user-visible
+				// difference between 2 and 3 in Round 1 is the
+				// rule source (server-suggested vs server-suggested,
+				// the editable surface is the only thing deferred).
+				m.permissionChoice = 1
+				m.confirmPermissionChoice()
+				return m, nil
+			case "4":
+				m.permissionChoice = 3
+				m.confirmPermissionChoice()
+				return m, nil
+			case "5":
+				m.permissionChoice = 4
+				m.confirmPermissionChoice()
+				return m, nil
+			case "a", "y":
+				// Legacy "approve" shortcut → option 1.
+				m.permissionChoice = 0
+				m.confirmPermissionChoice()
+				return m, nil
+			case "r", "n":
+				// Legacy "reject" shortcut → option 4.
+				m.permissionChoice = 3
+				m.confirmPermissionChoice()
+				return m, nil
+			case "up", "k":
+				m.permissionChoice = (m.permissionChoice + 4) % 5
+				return m, nil
+			case "down", "j":
+				m.permissionChoice = (m.permissionChoice + 1) % 5
+				return m, nil
+			case "enter":
+				m.confirmPermissionChoice()
+				return m, nil
+			case "esc":
+				// Cancel = reject without feedback. The legacy
+				// "esc rejects" semantics for operators who just
+				// want to close the panel are preserved exactly.
+				m.sendPermissionDecision(false, "Cancelled from Go TUI", "", "", "")
 				return m, nil
 			}
 			// While the permission panel is up, any other key is
@@ -4214,19 +4293,13 @@ func (m model) renderModelPickProvider(width int) string {
 	if len(m.modelCatalog.Providers) == 0 {
 		lines = append(lines, mutedStyle.Render("  No providers reported by the current Nexus runtime."))
 	} else {
-		// Two-column layout: provider name + status. Drop
-		// the adapter / default model columns — the operator
-		// doesn't need them in the picker; they're surfaced
-		// later in the apiKey / baseURL / picker steps. The
-		// narrower table is also easier to scan on small
-		// terminals.
-		lines = append(lines, mutedStyle.Render("  provider                                            status"))
-		idWidth := 32
-		for _, p := range m.modelCatalog.Providers {
-			if v := visibleLen(p.DisplayName); v > idWidth {
-				idWidth = v
-			}
-		}
+		// Single-column layout: just the provider name. The
+		// configured / needs-api-key state is implied by
+		// the next step's prompt (step 2 asks for an API
+		// key when the provider is unconfigured, skips
+		// straight to step 4 when it's already configured),
+		// so the list itself doesn't need a status column.
+		lines = append(lines, mutedStyle.Render("  provider"))
 		visibleRows := max(1, m.height-12)
 		scrollOffset := 0
 		if m.modelPickProviderIdx >= visibleRows {
@@ -4245,11 +4318,7 @@ func (m model) renderModelPickProvider(width int) string {
 			if actualIdx == m.modelPickProviderIdx {
 				marker = "> "
 			}
-			status := "needs API key"
-			if p.Configured {
-				status = "configured"
-			}
-			row := fmt.Sprintf("%s%s  %s", marker, padRightPlain(p.DisplayName, idWidth), status)
+			row := marker + p.DisplayName
 			if actualIdx == m.modelPickProviderIdx {
 				row = focusedLineStyle.Render(row)
 			}
