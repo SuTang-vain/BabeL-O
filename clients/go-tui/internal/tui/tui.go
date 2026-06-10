@@ -5863,7 +5863,7 @@ func renderInlineMarkdown(base lipgloss.Style, text string) string {
 			}
 			if end > i+1 {
 				code := string(runes[i+1 : end])
-				chip := base.Foreground(lipgloss.Color("75")).Background(lipgloss.Color("234")).Render(code)
+				chip := base.Foreground(lipgloss.Color("75")).Render(code)
 				out.WriteString(chip)
 				i = end + 1
 				continue
