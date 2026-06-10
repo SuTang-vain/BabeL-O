@@ -3502,16 +3502,26 @@ func formatToolAuditRow(entry runtimeToolAuditEntry) []string {
 // the ordered list of lines the /tools overlay will render.
 // Each tool contributes 1-3 lines; the overlay window is
 // then clamped in renderToolAuditOverlay. Returns a single
-// placeholder line for the empty case.
+// placeholder line for the empty case. A column header row
+// is prepended when the catalog is non-empty so the operator
+// can scan the columns at a glance.
 func buildToolAuditOverlayLines(entries []runtimeToolAuditEntry) []string {
 	if len(entries) == 0 {
 		return []string{"No tools registered in the current runtime."}
 	}
-	lines := []string{}
+	lines := []string{formatToolAuditColumnHeader()}
 	for _, entry := range entries {
 		lines = append(lines, formatToolAuditRow(entry)...)
 	}
 	return lines
+}
+
+// formatToolAuditColumnHeader mirrors the column structure of
+// formatToolAuditRow so the header aligns with the data rows.
+// The header uses mutedStyle (gray) so it doesn't compete with
+// the tool name column.
+func formatToolAuditColumnHeader() string {
+	return mutedStyle.Render("RISK  SOURCE       APPROVAL          NAME              DESCRIPTION")
 }
 
 // summarizeToolAudit is the per-risk count line shown at the
