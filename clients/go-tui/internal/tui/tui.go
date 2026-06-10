@@ -1253,6 +1253,17 @@ func newModel(cfg Config) model {
 	input.CharLimit = 4000
 	input.Prompt = "> "
 	input.ShowLineNumbers = false
+	// Strip the default background fill from the focused /
+	// blurred base style. The bubbles textarea renders a
+	// dark fill behind the prompt row by default, which
+	// looks like a chrome panel sitting below the
+	// transcript. Setting the base style to an empty
+	// lipgloss.Style removes the fill so the input box is
+	// a clean prefix-cursor-row matching the rest of the
+	// transcript.
+	input.FocusedStyle.Base = lipgloss.NewStyle()
+	input.BlurredStyle.Base = lipgloss.NewStyle()
+	input.Cursor.Style = lipgloss.NewStyle()
 	input.SetWidth(80)
 	// Single-line input: SetHeight(1) collapses the textarea
 	// to a single row, so only one `>` prompt icon is
