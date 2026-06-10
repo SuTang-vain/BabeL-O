@@ -3754,12 +3754,18 @@ func (m model) renderHeader(width int) string {
 		// glance that the spinner is for reasoning, not for
 		// the final reply. Mirrors the `✻ Sautéed for 26s`
 		// pattern in Claude Code: a transient state pill
-		// that shows what's actually happening.
+		// that shows what's actually happening plus the
+		// elapsed time so the operator can sanity-check
+		// that the reasoning phase is making progress.
+		elapsed := ""
+		if !m.startedAt.IsZero() {
+			elapsed = " " + time.Since(m.startedAt).Round(time.Second).String()
+		}
 		if m.lastEventType == "thinking_delta" {
-			stateLabel = m.spinner.View() + " thinking"
+			stateLabel = m.spinner.View() + " thinking" + elapsed
 			stateKind = thinkingStyle
 		} else {
-			stateLabel = m.spinner.View() + " running"
+			stateLabel = m.spinner.View() + " running" + elapsed
 			stateKind = statusStyle
 		}
 	}
