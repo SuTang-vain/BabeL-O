@@ -265,15 +265,27 @@ func TestConsumeNexusEventUpdatesSessionAndPermissionPanel(t *testing.T) {
 }
 
 func TestRenderTranscriptLabelsLayeredEvents(t *testing.T) {
+	// Mirrors the bbl chat TS TUI transcript layout:
+	//   > please inspect this project
+	//   ● Bash(ls) (ctrl+o to expand)
+	//     Done.
 	rendered := renderTranscript([]transcriptLine{
 		{kind: "user", text: "please inspect this project"},
-		{kind: "tool_started", text: `Bash running {"command":"ls"}`},
+		{kind: "tool_started", text: `● Bash(ls)  (ctrl+o to expand)`},
 		{kind: "assistant", text: "Done."},
 	}, 80)
 
-	for _, want := range []string{"you", "tool >", "assistant"} {
+	for _, want := range []string{">", "●", "  Done."} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered transcript missing %q: %q", want, rendered)
+		}
+	}
+	// The old label-style prefixes ("you", "tool >", "assistant")
+	// must NOT appear — they would clutter the chat log with
+	// a coloured label column on every row.
+	for _, banned := range []string{"you      ", "tool >   ", " assistant "} {
+		if strings.Contains(rendered, banned) {
+			t.Fatalf("rendered transcript should NOT contain %q: %q", banned, rendered)
 		}
 	}
 }

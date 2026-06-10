@@ -1226,14 +1226,14 @@ func newModel(cfg Config) model {
 	spin.Style = statusStyle
 
 	return model{
-		cfg:       cfg,
-		input:     input,
-		viewport:  vp,
-		spinner:                  spin,
-		inputMode:                modeComposing,
-		transcript:               []transcriptLine{},
-		seenInboxCardMessageIDs:  map[string]struct{}{},
-		subAgents:                map[string]subAgentEntry{},
+		cfg:                     cfg,
+		input:                   input,
+		viewport:                vp,
+		spinner:                 spin,
+		inputMode:               modeComposing,
+		transcript:              []transcriptLine{},
+		seenInboxCardMessageIDs: map[string]struct{}{},
+		subAgents:               map[string]subAgentEntry{},
 	}
 }
 
@@ -4291,6 +4291,68 @@ func renderTranscript(lines []transcriptLine, width int) string {
 }
 
 func formatLine(kind string, text string, width int) string {
+	// The bbl chat TS TUI renders user prompts, assistant /
+	// thinking prose, and tool invocations as flat blocks
+	// without a coloured label column:
+	//   > <prompt>
+	//     <2-space-indented assistant / thinking prose>
+	//   ● ToolName(args) (ctrl+o to expand)
+	// Mirroring that here keeps the chat log scannable instead
+	// of forcing the eye to skip a label column for every row.
+	switch kind {
+	case "user", "user_message":
+		bodyWidth := max(10, width-2)
+		body := wrapPlain(text, bodyWidth)
+		bodyLines := strings.Split(body, "\n")
+		if len(bodyLines) == 0 {
+			bodyLines = []string{""}
+		}
+		out := make([]string, 0, len(bodyLines))
+		out = append(out, userStyle.Render("> ")+userStyle.Render(bodyLines[0]))
+		for _, c := range bodyLines[1:] {
+			out = append(out, "  "+userStyle.Render(c))
+		}
+		return strings.Join(out, "\n")
+	case "assistant", "thinking":
+		style := assistantStyle
+		if kind == "thinking" {
+			style = thinkingStyle
+		}
+		bodyWidth := max(10, width-2)
+		body := wrapPlain(text, bodyWidth)
+		bodyLines := strings.Split(body, "\n")
+		if len(bodyLines) == 0 {
+			bodyLines = []string{""}
+		}
+		out := make([]string, 0, len(bodyLines))
+		out = append(out, "  "+style.Render(bodyLines[0]))
+		for _, c := range bodyLines[1:] {
+			out = append(out, "  "+style.Render(c))
+		}
+		return strings.Join(out, "\n")
+	case "tool_started", "tool_denied":
+		// Body already starts with `● ToolName(...)` from
+		// formatNexusEvent; render flat with a 2-space indent
+		// for any wrapped continuation.
+		style := toolStyle
+		bodyWidth := max(10, width)
+		body := wrapPlain(text, bodyWidth)
+		bodyLines := strings.Split(body, "\n")
+		if len(bodyLines) == 0 {
+			bodyLines = []string{""}
+		}
+		out := make([]string, 0, len(bodyLines))
+		out = append(out, style.Render(bodyLines[0]))
+		for _, c := range bodyLines[1:] {
+			out = append(out, "  "+style.Render(c))
+		}
+		return strings.Join(out, "\n")
+	}
+
+	// Default label-style for status, error, hook, agent, task,
+	// permission, result, etc. — kinds that still benefit from
+	// a short coloured label so the operator can scan the kind
+	// without reading the body.
 	label, style := linePresentation(kind)
 	prefix := style.Render(label)
 	bodyWidth := max(10, width-lipgloss.Width(label)-1)
