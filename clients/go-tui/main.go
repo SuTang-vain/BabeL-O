@@ -545,6 +545,38 @@ type activityEventEntry struct {
 // long-running session can't grow the model unbounded.
 const activityBufferCap = 50
 
+// subAgentStatus mirrors the per-event lifecycle status we
+// derive from a task_session_event with a subagent_* eventType.
+// The Go TUI uses these as the in-memory tracker state for
+// each running / completed / failed / cancelled sub-agent
+// surfaced in the /agents overlay and the header running
+// badge. The TS TUI's formatAgentLoopRows path uses the same
+// status enum for the same set of event types.
+type subAgentStatus string
+
+const (
+	subAgentStatusRunning   subAgentStatus = "running"
+	subAgentStatusCompleted subAgentStatus = "completed"
+	subAgentStatusFailed    subAgentStatus = "failed"
+	subAgentStatusCancelled subAgentStatus = "cancelled"
+)
+
+// subAgentEntry is the in-memory tracker for one
+// sub-agent (AgentLoop) lifecycle. The aggregator is keyed
+// by the agentId / subSessionId / taskId that the upstream
+// event payload carries; on the first subagent_started
+// event we insert a new entry, and on subagent_completed /
+// subagent_failed / subagent_cancelled we update the status
+// in place. Entries that are still in the running status
+// drive the header "sub: N running" badge (Phase 6 PR6).
+type subAgentEntry struct {
+	ID         string         // agentId / subSessionId / taskId (whichever the event payload carries)
+	ParentTask string         // optional parentTaskId
+	Title      string         // task title or prompt preview (single line)
+	Status     subAgentStatus // running / completed / failed / cancelled
+	UpdatedAt  string         // last event timestamp
+}
+
 // pollTickMsg fires when the background /v1/runtime/config poll is
 // due. The handler should call fetchRuntimeConfig with `?since=`
 // when m.configVersion > 0.
@@ -607,6 +639,7 @@ type model struct {
 	taskBoardScroll  int
 	activityEvents     []activityEventEntry
 	activityOverlayScroll int
+	subAgents         map[string]subAgentEntry
 	startedAt      time.Time
 	width          int
 	height         int
@@ -1060,6 +1093,7 @@ func newModel(cfg config) model {
 			{kind: "status", text: "Runtime, tools, permissions and context stay owned by BabeL-O Nexus."},
 		},
 		seenInboxCardMessageIDs: map[string]struct{}{},
+		subAgents:                map[string]subAgentEntry{},
 	}
 }
 
@@ -2687,6 +2721,67 @@ func buildAgentOverlayLines(jobs []agentJob) []string {
 	return lines
 }
 
+// formatSubAgentRow renders a single subAgentEntry (Phase 6
+// PR6) for the merged /agents overlay. The source tag is
+// "loop" so the user can tell at a glance which rows came
+// from the AgentJob REST endpoint vs the AgentLoop event
+// aggregator. Status uses the same agentJobStatus icon set
+// as formatAgentJobRow so the two sources feel like a single
+// list.
+func formatSubAgentRow(entry subAgentEntry) []string {
+	status := agentJobStatus(entry.Status)
+	icon := formatAgentStatusIcon(status)
+	parts := []string{
+		icon,
+		"loop",
+		"subagent",
+	}
+	if entry.ParentTask != "" {
+		parts = append(parts, "task=#"+entry.ParentTask)
+	}
+	main := strings.Join(parts, " ")
+	main += "  id=" + shortID(entry.ID)
+	if entry.Title != "" {
+		main += "  " + truncatePlain(entry.Title, 80)
+	}
+	rows := []string{main}
+	if entry.UpdatedAt != "" {
+		rows = append(rows, "  updated="+entry.UpdatedAt)
+	}
+	return rows
+}
+
+// buildMergedAgentOverlayLines merges the AgentJob REST rows
+// (Phase 6 PR3) with the in-memory subAgentEntry rows (Phase
+// 6 PR6) for the /agents overlay. Jobs come first (they have
+// stable session-bound identity); sub-agent rows are appended
+// after with a `---` separator so the user can distinguish
+// the two sources. The placeholder falls through to the
+// "No agent jobs for this session." message when both
+// sources are empty.
+func buildMergedAgentOverlayLines(jobs []agentJob, subs map[string]subAgentEntry) []string {
+	jobLines := buildAgentOverlayLines(jobs)
+	if len(subs) == 0 {
+		return jobLines
+	}
+	lines := append([]string{}, jobLines...)
+	if len(jobs) > 0 {
+		lines = append(lines, mutedStyle.Render("  --- AgentLoop sub-agents (event-aggregated) ---"))
+	}
+	// Stable order: alphabetical by id. (The map is
+	// insertion-ordered, but Go intentionally randomizes
+	// iteration; sort for deterministic PTY assertions.)
+	ids := make([]string, 0, len(subs))
+	for id := range subs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		lines = append(lines, formatSubAgentRow(subs[id])...)
+	}
+	return lines
+}
+
 // renderAgentOverlay paints the multi-line multi-agent status
 // view. It is the Phase 6 PR3 primary UX for the /agents slash
 // command. The overlay is composed of:
@@ -2702,10 +2797,16 @@ func (m model) renderAgentOverlay(width int) string {
 	if m.inputMode != modeAgentOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Agent status · Phase 6 PR3 overlay · " + shortID(m.sessionID))
+	header := titleStyle.Render("Agent status · Phase 6 PR3+PR6 overlay · " + shortID(m.sessionID))
 	summary := summarizeAgentJobs(m.agentJobs)
+	if subCount := m.subAgentRunningCount(); subCount > 0 {
+		// Phase 6 PR6: include the running sub-agent count in
+		// the summary so the user can correlate the running
+		// badge with the rows in the overlay.
+		summary += " · sub running " + strconv.Itoa(subCount)
+	}
 	visibleRows := max(1, m.height-10)
-	allLines := buildAgentOverlayLines(m.agentJobs)
+	allLines := buildMergedAgentOverlayLines(m.agentJobs, m.subAgents)
 	maxScroll := max(0, len(allLines)-visibleRows)
 	if m.agentOverlayScroll > maxScroll {
 		// View() is read-only; clamp locally for the rendered
@@ -3192,6 +3293,15 @@ func (m model) renderHeader(width int) string {
 	if m.configVersion > 0 || m.profileCount > 0 || m.tombstoneCount > 0 {
 		meta += fmt.Sprintf("  config=v%d profiles=%d tombstones=%d", m.configVersion, m.profileCount, m.tombstoneCount)
 	}
+	// Phase 6 PR6: surface a running sub-agent badge in the
+	// header meta line so the user can see AgentLoop
+	// sub-agents in flight without opening the /agents
+	// overlay. The badge is only appended when at least one
+	// sub-agent is running; the count comes from the
+	// in-memory aggregator (no Nexus round-trip).
+	if subRunning := m.subAgentRunningCount(); subRunning > 0 {
+		meta += fmt.Sprintf("  sub: %d running", subRunning)
+	}
 	return strings.Join([]string{
 		top,
 		mutedStyle.Render(truncatePlain(meta, width)),
@@ -3500,6 +3610,18 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 	case "agent_job_event":
 		m.appendLine("agent_job", formatNexusEvent(event))
 		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
+	case "task_session_event":
+		m.appendLine("task_session_event", formatNexusEvent(event))
+		// Phase 6 PR6: aggregate subagent lifecycle events into
+		// the in-memory subAgents tracker. Mirrors the TS TUI
+		// formatAgentLoopRows path in src/cli/renderEvents.ts
+		// (subagent_started / subagent_completed / subagent_failed
+		// / subagent_cancelled are the canonical lifecycle set;
+		// the `sub_agent_session_*` aliases are accepted for
+		// back-compat with older Nexus events).
+		if subAgentStatus, ok := subAgentStatusFromTaskSessionEvent(event); ok {
+			m.recordSubAgentEvent(event, subAgentStatus)
+		}
 	default:
 		m.appendLine(eventType, formatNexusEvent(event))
 	}
@@ -3544,6 +3666,97 @@ func (m *model) recordActivityEvent(kind activityEventKind, summary string, time
 		// so a plain re-slice is fine.
 		m.activityEvents = append([]activityEventEntry(nil), m.activityEvents[len(m.activityEvents)-activityBufferCap:]...)
 	}
+}
+
+// subAgentStatusFromTaskSessionEvent maps a task_session_event
+// eventType to the canonical subAgentStatus enum. Returns
+// (status, true) when the eventType is a sub-agent lifecycle
+// event; returns ("", false) for unrelated task_session_event
+// types so the caller can no-op.
+//
+// Mirrors the TS TUI isSubAgentLifecycleEvent +
+// statusFromSubAgentLifecycleEvent helpers in
+// src/cli/renderEvents.ts (Phase 6 PR6).
+func subAgentStatusFromTaskSessionEvent(event map[string]any) (subAgentStatus, bool) {
+	eventType := stringField(event, "eventType")
+	switch eventType {
+	case "subagent_started", "sub_agent_session_started":
+		return subAgentStatusRunning, true
+	case "subagent_completed", "sub_agent_session_completed":
+		return subAgentStatusCompleted, true
+	case "subagent_failed", "sub_agent_session_failed", "sub_agent_session_error", "subagent_failed_v2":
+		return subAgentStatusFailed, true
+	case "subagent_cancelled":
+		return subAgentStatusCancelled, true
+	}
+	return "", false
+}
+
+// recordSubAgentEvent updates the in-memory subAgents tracker
+// from a task_session_event payload. The id is taken from the
+// first non-empty field among agentId / subSessionId /
+// taskId; the parentTaskId is taken from the payload if
+// present; the title is taken from the first non-empty
+// title / taskTitle / summary field. Phase 6 PR6 wires this
+// into consumeNexusEvent for subagent lifecycle events.
+func (m *model) recordSubAgentEvent(event map[string]any, status subAgentStatus) {
+	if m.subAgents == nil {
+		m.subAgents = map[string]subAgentEntry{}
+	}
+	payload := asMap(event["payload"])
+	// eventType / sessionId / eventId / phase / timestamp
+	// live at the top level (TaskSessionEventSchema in
+	// src/shared/events.ts).
+	agentID := stringField(event, "agentId")
+	if agentID == "" {
+		agentID = stringField(payload, "agentId")
+	}
+	if agentID == "" {
+		agentID = stringField(payload, "subSessionId")
+	}
+	if agentID == "" {
+		agentID = stringField(payload, "taskId")
+	}
+	if agentID == "" {
+		// The payload sometimes carries a unique id nested
+		// one level deeper; fall back to that before
+		// giving up.
+		agentID = stringField(payload, "id")
+	}
+	if agentID == "" {
+		// Without an id we can't dedupe; skip the event.
+		return
+	}
+	parentTask := stringField(payload, "parentTaskId")
+	title := firstNonEmpty(
+		stringField(payload, "title"),
+		stringField(payload, "taskTitle"),
+		stringField(payload, "summary"),
+	)
+	entry := subAgentEntry{
+		ID:         agentID,
+		ParentTask: parentTask,
+		Title:      singleLine(title),
+		Status:     status,
+		UpdatedAt:  stringField(event, "timestamp"),
+	}
+	if entry.Title == "" {
+		entry.Title = "sub-agent task"
+	}
+	m.subAgents[agentID] = entry
+}
+
+// subAgentRunningCount returns the number of subAgents
+// currently in the running status. Used by the header badge
+// (Phase 6 PR6).
+func (m *model) subAgentRunningCount() int {
+	count := 0
+	for _, entry := range m.subAgents {
+		if entry.Status == subAgentStatusRunning {
+			count++
+		}
+	}
+	return count
 }
 
 func (m *model) appendLine(kind string, text string) {

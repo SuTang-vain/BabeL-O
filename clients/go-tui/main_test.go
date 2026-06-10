@@ -2748,7 +2748,7 @@ func TestRenderAgentOverlayShowsHeaderInMode(t *testing.T) {
 		t.Fatalf("renderAgentOverlay in modeAgentOverlay should be non-empty")
 	}
 	for _, want := range []string{
-		"Agent status · Phase 6 PR3 overlay",
+		"Agent status · Phase 6 PR3+PR6 overlay",
 		"sess_age", // shortID of "sess_agents_smoke_xyz"
 		"running 1", "completed 1", "failed 1",
 		"scroll", "close",
@@ -3429,5 +3429,224 @@ func TestActivityOverlayOpensAndCloses(t *testing.T) {
 	um := updated.(model)
 	if um.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", um.inputMode, modeComposing)
+	}
+}
+
+func TestSubAgentStatusFromTaskSessionEventMapsLifecycleTypes(t *testing.T) {
+	cases := map[string]subAgentStatus{
+		"subagent_started":            subAgentStatusRunning,
+		"sub_agent_session_started":   subAgentStatusRunning,
+		"subagent_completed":          subAgentStatusCompleted,
+		"sub_agent_session_completed": subAgentStatusCompleted,
+		"subagent_failed":             subAgentStatusFailed,
+		"sub_agent_session_failed":    subAgentStatusFailed,
+		"sub_agent_session_error":     subAgentStatusFailed,
+		"subagent_cancelled":          subAgentStatusCancelled,
+	}
+	for eventType, want := range cases {
+		event := map[string]any{"type": "task_session_event", "eventType": eventType}
+		got, ok := subAgentStatusFromTaskSessionEvent(event)
+		if !ok {
+			t.Fatalf("subAgentStatusFromTaskSessionEvent(%s) should map", eventType)
+		}
+		if got != want {
+			t.Fatalf("subAgentStatusFromTaskSessionEvent(%s) = %s, want %s", eventType, got, want)
+		}
+	}
+	// Unrelated event types return ("", false) so the caller
+	// can no-op.
+	got, ok := subAgentStatusFromTaskSessionEvent(map[string]any{"type": "task_session_event", "eventType": "task_progressed"})
+	if ok {
+		t.Fatalf("unrelated eventType should not map, got %s", got)
+	}
+}
+
+func TestRecordSubAgentEventCreatesEntryWithRunningStatus(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.recordSubAgentEvent(map[string]any{
+		"type":      "task_session_event",
+		"eventType": "subagent_started",
+		"timestamp": "2026-06-10T10:00:00Z",
+		"payload": map[string]any{
+			"agentId":      "agent_sub_1",
+			"parentTaskId": "task_abc_1",
+			"title":        "investigate compile error",
+		},
+	}, subAgentStatusRunning)
+	entry, ok := m.subAgents["agent_sub_1"]
+	if !ok {
+		t.Fatalf("sub-agent entry should be inserted")
+	}
+	if entry.Status != subAgentStatusRunning {
+		t.Fatalf("status = %s, want running", entry.Status)
+	}
+	if entry.ParentTask != "task_abc_1" {
+		t.Fatalf("parentTask = %q, want task_abc_1", entry.ParentTask)
+	}
+	if entry.Title != "investigate compile error" {
+		t.Fatalf("title = %q, want 'investigate compile error'", entry.Title)
+	}
+	if entry.UpdatedAt != "2026-06-10T10:00:00Z" {
+		t.Fatalf("updatedAt = %q", entry.UpdatedAt)
+	}
+}
+
+func TestRecordSubAgentEventUpdatesExistingEntryOnCompletion(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	// Started.
+	m.recordSubAgentEvent(map[string]any{
+		"type": "task_session_event", "eventType": "subagent_started",
+		"payload": map[string]any{"agentId": "agent_sub_1"},
+	}, subAgentStatusRunning)
+	if m.subAgentRunningCount() != 1 {
+		t.Fatalf("expected 1 running sub-agent, got %d", m.subAgentRunningCount())
+	}
+	// Completed.
+	m.recordSubAgentEvent(map[string]any{
+		"type": "task_session_event", "eventType": "subagent_completed",
+		"timestamp": "2026-06-10T10:05:00Z",
+		"payload": map[string]any{"agentId": "agent_sub_1"},
+	}, subAgentStatusCompleted)
+	entry := m.subAgents["agent_sub_1"]
+	if entry.Status != subAgentStatusCompleted {
+		t.Fatalf("status should be completed, got %s", entry.Status)
+	}
+	if m.subAgentRunningCount() != 0 {
+		t.Fatalf("expected 0 running sub-agents after completion, got %d", m.subAgentRunningCount())
+	}
+}
+
+func TestRecordSubAgentEventSkipsWhenNoID(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.recordSubAgentEvent(map[string]any{
+		"type":      "task_session_event",
+		"eventType": "subagent_started",
+		"payload":   map[string]any{}, // no agentId / subSessionId / taskId
+	}, subAgentStatusRunning)
+	if got := len(m.subAgents); got != 0 {
+		t.Fatalf("sub-agent without id should be dropped, got %d entries", got)
+	}
+}
+
+func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_sub_agg_1"
+	// Fire subagent_started.
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":      "task_session_event",
+		"eventType": "subagent_started",
+		"timestamp": "2026-06-10T10:00:00Z",
+		"payload": map[string]any{
+			"agentId":      "agent_sub_1",
+			"parentTaskId": "task_abc_1",
+			"title":        "investigate compile error",
+		},
+	})
+	// Fire subagent_completed.
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":      "task_session_event",
+		"eventType": "subagent_completed",
+		"timestamp": "2026-06-10T10:05:00Z",
+		"payload":   map[string]any{"agentId": "agent_sub_1"},
+	})
+	// Fire an unrelated task_session_event — should NOT add a sub-agent.
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":      "task_session_event",
+		"eventType": "task_progressed",
+		"timestamp": "2026-06-10T10:06:00Z",
+		"payload":   map[string]any{"agentId": "agent_should_not_exist"},
+	})
+	if got := len(m.subAgents); got != 1 {
+		t.Fatalf("expected 1 sub-agent entry, got %d", got)
+	}
+	entry := m.subAgents["agent_sub_1"]
+	if entry.Status != subAgentStatusCompleted {
+		t.Fatalf("expected completed status, got %s", entry.Status)
+	}
+}
+
+func TestHeaderIncludesRunningSubAgentBadge(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.sessionID = "sess_sub_agg_2"
+	m.width = 120
+	m.height = 30
+	m.subAgents["agent_sub_1"] = subAgentEntry{ID: "agent_sub_1", Status: subAgentStatusRunning, Title: "investigate"}
+	m.subAgents["agent_sub_2"] = subAgentEntry{ID: "agent_sub_2", Status: subAgentStatusCompleted, Title: "done"}
+	m.subAgents["agent_sub_3"] = subAgentEntry{ID: "agent_sub_3", Status: subAgentStatusRunning, Title: "investigate 2"}
+	rendered := m.renderHeader(m.width)
+	if !strings.Contains(rendered, "sub: 2 running") {
+		t.Fatalf("header should surface 'sub: 2 running' badge, got:\n%s", rendered)
+	}
+	// No sub-agents running: badge must NOT appear.
+	m.subAgents = map[string]subAgentEntry{
+		"agent_sub_1": {ID: "agent_sub_1", Status: subAgentStatusCompleted, Title: "done"},
+	}
+	rendered2 := m.renderHeader(m.width)
+	if strings.Contains(rendered2, "sub: ") {
+		t.Fatalf("header should not include sub badge when no sub-agents running, got:\n%s", rendered2)
+	}
+}
+
+func TestFormatSubAgentRowRendersLoopSourceTag(t *testing.T) {
+	entry := subAgentEntry{
+		ID:         "agent_sub_1",
+		ParentTask: "task_abc_1",
+		Title:      "investigate compile error",
+		Status:     subAgentStatusRunning,
+		UpdatedAt:  "2026-06-10T10:00:00Z",
+	}
+	rows := formatSubAgentRow(entry)
+	combined := strings.Join(rows, "\n")
+	for _, want := range []string{"[run]", "loop", "subagent", "task=#task_abc_1", "id=agent_sub_1", "investigate compile error", "updated=2026-06-10T10:00:00Z"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("formatSubAgentRow missing %q\nfull:\n%s", want, combined)
+		}
+	}
+}
+
+func TestBuildMergedAgentOverlayLinesJoinsJobsAndSubAgents(t *testing.T) {
+	envelope := sessionAgentJobsResponse{}
+	if err := json.Unmarshal(fullAgentJobsPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	subs := map[string]subAgentEntry{
+		"agent_sub_1": {ID: "agent_sub_1", Status: subAgentStatusRunning, Title: "investigate"},
+	}
+	lines := buildMergedAgentOverlayLines(envelope.Jobs, subs)
+	combined := strings.Join(lines, "\n")
+	// Job row markers (from PR3 fixture).
+	for _, want := range []string{"[run] job explore", "task=#task_abc_1", "prompt: find the auth middleware"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("merged overlay missing job row %q\nfull:\n%s", want, combined)
+		}
+	}
+	// Sub-agent row markers.
+	for _, want := range []string{"--- AgentLoop sub-agents (event-aggregated) ---", "[run] loop subagent", "id=agent_sub_1", "investigate"} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("merged overlay missing sub-agent row %q\nfull:\n%s", want, combined)
+		}
+	}
+}
+
+func TestBuildMergedAgentOverlayLinesEmptyWhenBothSourcesEmpty(t *testing.T) {
+	lines := buildMergedAgentOverlayLines(nil, nil)
+	if len(lines) != 1 || lines[0] != "No agent jobs for this session." {
+		t.Fatalf("expected single empty placeholder, got %v", lines)
+	}
+}
+
+func TestBuildMergedAgentOverlayLinesOrdersSubAgentsAlphabetically(t *testing.T) {
+	subs := map[string]subAgentEntry{
+		"agent_zeta": {ID: "agent_zeta", Status: subAgentStatusRunning, Title: "z"},
+		"agent_alpha": {ID: "agent_alpha", Status: subAgentStatusRunning, Title: "a"},
+		"agent_mu": {ID: "agent_mu", Status: subAgentStatusRunning, Title: "m"},
+	}
+	lines := buildMergedAgentOverlayLines(nil, subs)
+	combined := strings.Join(lines, "\n")
+	idxAlpha := strings.Index(combined, "id=agent_alpha")
+	idxMu := strings.Index(combined, "id=agent_mu")
+	idxZeta := strings.Index(combined, "id=agent_zeta")
+	if !(idxAlpha < idxMu && idxMu < idxZeta) {
+		t.Fatalf("sub-agent rows should be alphabetical, got alpha=%d mu=%d zeta=%d", idxAlpha, idxMu, idxZeta)
 	}
 }

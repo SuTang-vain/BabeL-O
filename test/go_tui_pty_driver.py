@@ -1073,7 +1073,7 @@ def run_agent_status_sequence(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /agents did not surface the 'loading' status line",
         )
-    if not wait_for(master_fd, "Agent status · Phase 6 PR3 overlay", timeout, transcript):
+    if not wait_for(master_fd, "Agent status · Phase 6 PR3+PR6 overlay", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] /agents did not render the agent overlay header",
@@ -1276,6 +1276,77 @@ def run_activity_overlay_sequence(
     return True
 
 
+def run_sub_agent_aggregation_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 6 PR6: AgentLoop sub-agent aggregation + header
+    running badge. The seeded local Nexus does not emit
+    subagent lifecycle events, so this sequence exercises the
+    empty-state path:
+
+      - bash round-trip to populate sessionID.
+      - /agents still opens with the PR3+PR6 banner
+        (verifies the merged builder fallback path).
+      - The seeded Nexus has no AgentJob AND no sub-agent
+        entries, so the overlay shows the "No agent jobs for
+        this session." placeholder. The header MUST NOT show
+        the `sub: N running` badge (no sub-agents running).
+      - esc closes the overlay + "agent status closed" status.
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    send(master_fd, "bash echo phase6-subagent")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] sub-agent aggregation setup: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] sub-agent aggregation setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] sub-agent aggregation setup: stream did not close cleanly",
+        )
+
+    # Step 3: /agents.
+    send(master_fd, "/agents")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Agent status · Phase 6 PR3+PR6 overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /agents did not render the PR3+PR6 banner",
+        )
+    if not wait_for(master_fd, "No agent jobs for this session.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /agents did not render the empty placeholder",
+        )
+    if not wait_for(master_fd, "no agent jobs", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /agents did not render the empty summary line",
+        )
+
+    # Step 4: close the overlay.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "agent status closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] sub-agent aggregation: agent overlay did not close on Esc",
+        )
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1457,6 +1528,13 @@ SEQUENCES: dict[str, dict] = {
     "activity-overlay": {
         "runner": run_activity_overlay_sequence,
         "ok_message": "phase 6 PR5 recent activity overlay verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "sub-agent-aggregation": {
+        "runner": run_sub_agent_aggregation_sequence,
+        "ok_message": "phase 6 PR6 AgentLoop sub-agent aggregation + header badge verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

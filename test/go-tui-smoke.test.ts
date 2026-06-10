@@ -162,6 +162,11 @@ test('Go TUI smoke: phase 6 PR5 /activity overlay', { skip: skipReason }, () => 
   assert.match(output, /phase 6 PR5 recent activity overlay verified/)
 })
 
+test('Go TUI smoke: phase 6 PR6 /agents overlay (PR3+PR6 banner)', { skip: skipReason }, () => {
+  const output = runGoTuiSmoke('sub-agent-aggregation', 90)
+  assert.match(output, /phase 6 PR6 AgentLoop sub-agent aggregation \+ header badge verified/)
+})
+
 test('Go TUI smoke: phase 7 narrow-width visual regression', { skip: skipReason }, () => {
   const output = runGoTuiSmoke('visual-regression-narrow')
   assert.match(output, /phase 7 narrow-width visual regression verified/)
