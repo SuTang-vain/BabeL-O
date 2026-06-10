@@ -4406,7 +4406,14 @@ func (m model) renderModelPickModel(width int) string {
 	if len(models) == 0 {
 		lines = append(lines, mutedStyle.Render("  No models registered for this provider (Phase 1: live list pending)."))
 	} else {
-		lines = append(lines, mutedStyle.Render("  model_id                name                     ctx"))
+		// Single-column model list: just the display name.
+		// The picker commits the underlying ID on Enter, so
+		// showing the long `provider/model-id` slug in the
+		// row would be redundant chrome — the operator only
+		// needs to recognise the model. Falls back to the
+		// id when the provider's catalog doesn't include a
+		// friendly name.
+		lines = append(lines, mutedStyle.Render("  model"))
 		visibleRows := max(1, m.height-12)
 		scrollOffset := 0
 		if m.modelPickSelectedIdx >= visibleRows {
@@ -4425,9 +4432,8 @@ func (m model) renderModelPickModel(width int) string {
 			if actualIdx == m.modelPickSelectedIdx {
 				marker = "> "
 			}
-			id := padRightPlain(entry.ID, 22)
-			name := padRightPlain(firstNonEmpty(entry.Name, "—"), 22)
-			row := fmt.Sprintf("%s%s  %s  %d", marker, id, name, entry.ContextWindow)
+			display := firstNonEmpty(entry.Name, entry.ID)
+			row := marker + display
 			if actualIdx == m.modelPickSelectedIdx {
 				row = focusedLineStyle.Render(row)
 			}
@@ -4716,11 +4722,36 @@ func (m model) renderPermission(width int) string {
 		"  (" + firstNonEmpty(m.pending.risk, "unknown") + " risk)")
 	var rows []string
 	rows = append(rows, header)
-	rows = append(rows, permissionStyle.Render("a/y approve   r/n/esc reject"))
+	// Phase A.1 of the enhanced permission panel: 5-option
+	// multi-choice panel with a `~` cursor on the active row and
+	// the runtime-suggested allow rule surfaced above the
+	// choices. The header is `Waiting for permission...` with
+	// the tool name + risk, then the rendered tool input, then
+	// `Suggested rule: …`, then the 5 choices, then a one-line
+	// keyboard hint footer.
+	rows = append(rows, permissionStyle.Render("Waiting for permission..."))
 	if input := strings.TrimSpace(m.pending.input); input != "" {
 		rows = append(rows, "input:")
 		rows = append(rows, wrapPlain(input, max(0, width-6)))
 	}
+	if suggested := strings.TrimSpace(m.pending.suggestedRule); suggested != "" {
+		rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
+	}
+	choices := []string{
+		"Approve once",
+		"Approve for this session",
+		"Approve with editable rule",
+		"Reject",
+		"Reject, tell the model what to do instead",
+	}
+	for i, choice := range choices {
+		marker := " "
+		if i == m.permissionChoice {
+			marker = "~"
+		}
+		rows = append(rows, fmt.Sprintf(" %s [%d] %s", marker, i+1, choice))
+	}
+	rows = append(rows, permissionStyle.Render("▲/▼ select   1/2/3/4/5 choose   ↵ confirm   esc cancel"))
 	if msg := strings.TrimSpace(m.pending.message); msg != "" {
 		rows = append(rows, permissionStyle.Render("reason: "+msg))
 	}
@@ -4902,7 +4933,7 @@ func (m *model) fetchSessionTasksWithSession() tea.Cmd {
 	return fetchSessionTasks(m.cfg, m.sessionID, "user")
 }
 
-func (m *model) sendPermissionDecision(approved bool, reason string) {
+func (m *model) sendPermissionDecision(approved bool, reason, scope, rule, feedback string) {
 	if m.pending == nil || m.decisions == nil {
 		return
 	}
@@ -4911,13 +4942,24 @@ func (m *model) sendPermissionDecision(approved bool, reason string) {
 		toolUseID: m.pending.toolUseID,
 		approved:  approved,
 		reason:    reason,
+		scope:     scope,
+		rule:      rule,
+		feedback:  feedback,
 	}
 	select {
 	case m.decisions <- decision:
 		if approved {
-			m.appendLine("permission", "approved")
+			if scope == "session" {
+				m.appendLine("permission", "approved (session)")
+			} else {
+				m.appendLine("permission", "approved")
+			}
 		} else {
-			m.appendLine("permission", "rejected")
+			if feedback != "" {
+				m.appendLine("permission", "rejected (with feedback)")
+			} else {
+				m.appendLine("permission", "rejected")
+			}
 		}
 	default:
 		m.appendLine("error", "permission decision queue is full")
@@ -4927,6 +4969,73 @@ func (m *model) sendPermissionDecision(approved bool, reason string) {
 	// Phase 3: clear the permission input mode so the textinput
 	// resumes ownership of subsequent keys.
 	m.setMode(modeComposing)
+}
+
+// confirmPermissionChoice is the Phase A.1 entry point invoked
+// when the operator presses enter (or a number key 1-5) on the
+// 5-option permission panel. It maps the cursor to the right
+// scope/rule/feedback combination and calls sendPermissionDecision.
+//
+// Mapping (cursor index 0..4 → choice):
+//   0 — Approve once                       → scope="once",   rule="",    feedback=""
+//   1 — Approve for this session           → scope="session", rule=suggested, feedback=""
+//   2 — Approve with editable rule         → scope="session", rule=suggested (Round 1 fallback, see
+//                                                key handler) — Round 2 will swap in the inline editor
+//   3 — Reject                             → scope="once",   rule="",    feedback=""
+//   4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=pending.message fallback
+//
+// Hard invariants:
+//   - "session" scope is only emitted when the runtime surfaced a
+//     suggested rule (otherwise the runtime would accumulate an
+//     empty rule, which `addSessionRule` filters out anyway — but
+//     keeping the suggestion visible to the operator is the
+//     explicit Phase A.1 UX contract).
+//   - "feedback" for option 4 starts empty in Round 1; Round 2
+//     will open an inline textinput so the operator can type the
+//     model's replacement instructions.
+func (m *model) confirmPermissionChoice() {
+	if m.pending == nil {
+		return
+	}
+	suggested := strings.TrimSpace(m.pending.suggestedRule)
+	switch m.permissionChoice {
+	case 0:
+		// Approve once
+		m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
+	case 1:
+		// Approve for this session
+		if suggested == "" {
+			// No suggested rule → fall back to "once" so we
+			// never accumulate an empty rule.
+			m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
+			return
+		}
+		m.sendPermissionDecision(true, "Approved (session) from Go TUI", "session", suggested, "")
+	case 2:
+		// Approve with editable rule (Round 1: same as option 1
+		// with the suggested rule; Round 2 will introduce a
+		// dedicated inline editor so the operator can edit the
+		// rule before confirming).
+		if suggested == "" {
+			m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
+			return
+		}
+		m.sendPermissionDecision(true, "Approved (rule) from Go TUI", "rule", suggested, "")
+	case 3:
+		// Reject
+		m.sendPermissionDecision(false, "Rejected from Go TUI", "once", "", "")
+	case 4:
+		// Reject, tell the model what to do instead (Round 1:
+		// empty feedback — the runtime still surfaces a
+		// `permission_response` event with feedback="" so the
+		// wire format is the same as Round 2 will emit; Round 2
+		// will open an inline textinput so the operator can
+		// type the model's replacement instructions).
+		m.sendPermissionDecision(false, "Rejected (with feedback) from Go TUI", "once", "", "")
+	default:
+		// Should not happen — fall back to the safe default.
+		m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
+	}
 }
 
 // consumeNexusEvent applies a single Nexus event to the model and
@@ -4952,13 +5061,27 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.connected = true
 	case "permission_request":
 		m.pending = &pendingPermission{
-			sessionID: stringField(event, "sessionId"),
-			toolUseID: stringField(event, "toolUseId"),
-			name:      stringField(event, "name"),
-			risk:      stringField(event, "risk"),
-			input:     formatToolInput(stringField(event, "name"), event["input"]),
-			message:   stringField(event, "message"),
+			sessionID:     stringField(event, "sessionId"),
+			toolUseID:     stringField(event, "toolUseId"),
+			name:          stringField(event, "name"),
+			risk:          stringField(event, "risk"),
+			input:         formatToolInput(stringField(event, "name"), event["input"]),
+			message:       stringField(event, "message"),
+			// Phase A.1: surface the model-suggested allow rule
+			// so the operator sees `git:status` / `cd:*` /
+			// `bash:*` above the 5-option panel. The runtime
+			// omits this field for tools without a per-input
+			// deriver; we leave it empty in that case (the
+			// `Suggested rule:` row is hidden by renderPermission
+			// when the value is blank).
+			suggestedRule: stringField(event, "suggestedRule"),
 		}
+		// Reset the cursor to the safe default ("Approve once")
+		// on every fresh permission request so a stale cursor
+		// from the previous prompt can't accidentally confirm
+		// the wrong option (e.g. session scope on a destructive
+		// command).
+		m.permissionChoice = 0
 		m.resize()
 		m.appendLine("permission", formatNexusEvent(event))
 		// Phase 3: enter the dedicated input mode so the textinput
@@ -6599,14 +6722,30 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 				if !ok {
 					return
 				}
-				writeMu.Lock()
-				_ = conn.WriteJSON(map[string]any{
+				// Phase A.1: include scope/rule/feedback in the
+				// permission_response payload so the runtime can
+				// (a) accumulate session-scope rules into the
+				// per-session map, and (b) surface the user's
+				// "tell the model what to do instead" text in
+				// the next turn.
+				payload := map[string]any{
 					"type":      "permission_response",
 					"sessionId": decision.sessionID,
 					"toolUseId": decision.toolUseID,
 					"approved":  decision.approved,
 					"reason":    decision.reason,
-				})
+				}
+				if decision.scope != "" {
+					payload["scope"] = decision.scope
+				}
+				if decision.rule != "" {
+					payload["rule"] = decision.rule
+				}
+				if decision.feedback != "" {
+					payload["feedback"] = decision.feedback
+				}
+				writeMu.Lock()
+				_ = conn.WriteJSON(payload)
 				writeMu.Unlock()
 			case <-done:
 				return
