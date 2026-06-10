@@ -1172,11 +1172,11 @@ func (m *model) runPaletteSelection() tea.Cmd {
 }
 
 var (
-	titleStyle      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	mutedStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
-	statusStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
-	errorStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	toolStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18"))
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	mutedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("81"))
+	errorStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	toolStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18"))
 	// toolBulletStyle colours the leading `●` glyph on a tool
 	// invocation row. The bullet stays sky blue (the
 	// pre-#ff7a18 brand colour for the kind marker) so the
@@ -5826,9 +5826,10 @@ func joinColumns(width int, left string, right string) string {
 
 // renderInlineMarkdown applies a small set of inline markdown
 // spans on top of the base style. The walker recognises:
-//   `code`           → inline code (muted chip with bg 238)
-//   **bold** / __bold__ → bold (lipgloss.Bold)
-//   *em* / _em_       → italic (lipgloss.Italic)
+//
+//	`code`           → inline code (muted chip with bg 238)
+//	**bold** / __bold__ → bold (lipgloss.Bold)
+//	*em* / _em_       → italic (lipgloss.Italic)
 //
 // Headers (`# …`) and code fences (```) are handled at the
 // block level in formatLine, not here. CJK is safe: the walker
@@ -5862,7 +5863,7 @@ func renderInlineMarkdown(base lipgloss.Style, text string) string {
 			}
 			if end > i+1 {
 				code := string(runes[i+1 : end])
-				chip := base.Foreground(lipgloss.Color("75")).Background(lipgloss.Color("238")).Render(code)
+				chip := base.Foreground(lipgloss.Color("75")).Background(lipgloss.Color("234")).Render(code)
 				out.WriteString(chip)
 				i = end + 1
 				continue
