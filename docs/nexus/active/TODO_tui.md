@@ -239,13 +239,22 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - View()：拼接 `agentOverlay` 段在 `inboxOverlay` 之后、input / footer 之前。
   - 17 个新 Go 单测 + 1 个 PTY smoke (`agent-status`) + 1 个 TS smoke 入口；151/151 go test pass；`BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 15/15 pass。
   - 范围克制：AgentLoop sub-agent 聚合（`task_session_event` stream 中的 subagent lifecycle 事件）留到未来 PR——本次只覆盖 AgentJob REST 端点。ack / cancel 按钮留 CLI（`bbl agents cancel <jobId>`），Go TUI agent overlay 保持只读。transcriptPath 字段省略（TS TUI 也只在 metadata 中展示）。"running sub-agent" 实时 badge 留到未来 PR。
+- [x] Phase 4 wire：Go TUI tool palette `/v1/tools/audit` 真实 wire 收口（2026-06-10 收口）。
+  - 数据模型：`toolRisk` / `toolSourceType` 枚举 + `toolAuditSource` struct + `runtimeToolAuditEntry`（name / description / risk / allowed / inputSchema / requiresApproval / suggestedAllowRule / mcpServerAllowed / source）+ `toolsAuditResponse` envelope + `toolAuditMsg` typed msg。
+  - 状态机：`modeToolAuditOverlay` inputMode 常量 + 模型字段 `toolAuditEntries` / `toolAuditScroll`。
+  - HTTP：`fetchToolAudit(cfg, trigger)` 调 `GET /v1/tools/audit`（**全局端点，无 sessionID**），保留 `raw []byte` envelope 抗 schema churn。
+  - 静态 fallback：`staticToolDescriptorCatalog()` helper 把原 Phase 4 硬编码 7 条 builtin 列表抽成函数，wire 失败时通过 `renderToolPalette` 推回 transcript 让用户能继续看到 known-good 列表。
+  - 渲染：`toolPaletteStyle` (foreground 117) + `formatToolRiskIcon(risk)` (`[read]`/`[write]`/`[execute]`/`[task]`) + `formatToolSourceTag(source)` (builtin / `mcp:<serverName>` / 空 / unknown) + `formatToolApprovalStatus(requiresApproval)` (`no-approval` / `approval-required`) + `formatToolAuditRow(entry)` (风险 + 来源 tag + 审批状态 + name + 截断 description + 可选 MCP server allowed 第二行 + 可选 suggested allow rule 第二行) + `buildToolAuditOverlayLines(entries)` + `summarizeToolAudit(entries)` (execute / write / task / read 排序计数) + `renderToolAuditOverlay(width)` (title `Tools audit · Phase 4 wire overlay` + divider + clamped window + scroll/close hint)。
+  - slash 命令：替换 `/tools` placeholder——`/tools` 调 `fetchToolAudit(m.cfg, "user")`；wire 成功打开 overlay；wire 失败时 push `tools audit: <err>` error 行 + 走 static fallback。
+  - KeyMsg dispatch：`case modeToolAuditOverlay`——esc/enter/q 关闭 + 清 scroll + 写 `tools audit closed` 状态行；up/k 减 scroll clamp 0；down/j/tab 增 scroll clamp `len-1`；stray key 全部被吞。
+  - case toolAuditMsg Update handler：`err != nil` 走 fallback 路径；`trigger == "auto"` 静默 update `m.toolAuditEntries`；`"user"` 走原路径（reset scroll + push breadcrumb + open overlay）。
+  - helpOverlayLines：新增 `Tool audit overlay (Phase 4 wire):` 段。
+  - View()：拼接 `toolAuditOverlay` 段在 `activityOverlay` 之后、input / footer 之前。
+  - 18 个新 Go 单测 + 1 个 PTY smoke (`tools-audit`) + 1 个 TS smoke 入口；`run_tool_palette_sequence` orchestrator 序列升级为 wire 行为（保留在 `all` 里）；203/203 go test pass；`BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke` 19/19 pass。
+  - 范围克制：ack / cancel 按钮（per-tool approval gate、allow-rule editing）留 CLI（`bbl tools policy`），Go TUI 保持只读。`inputSchema` 字段以 `map[string]any` 形式保留在 typed struct 里但不在 overlay 行展示。`/v1/tools/audit` 是全局端点不**走** end-of-turn auto-refresh——audit 是 runtime 视图不是 session 视图。
 
-后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4 / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 6 PR2 / Phase 6 PR3 / Phase 7 / Phase 8 稳定后才推进：
+后续只有 Phase 1 / Phase 2 / §5 路径 C 阶段 1-3 / §5 path C 阶段 3 polish y/n overlay / Phase 3 / Phase 4（静态目录 + 真实 wire 全部收口） / Phase 5 / Phase 5 续 / Phase 6 PR1 / Phase 6 PR2 / Phase 6 PR3 / Phase 6 PR4 / Phase 6 PR5 / Phase 6 PR6 / Phase 7 / Phase 8 稳定后才推进：
 
-- Phase 6 PR4：Task board（pending/in_progress/blocked/completed/failed + worktree state + review/recovery）。
-- Phase 6 PR5：Activity overlay（recent tool runs / permission decisions / agent job events / context warnings）。
-- Phase 6 PR6 (future): AgentLoop sub-agent 聚合（`task_session_event` stream → overlay）+ "running sub-agent" 实时 badge。
-- Go TUI tool palette `/v1/tools/audit` 真实 wire（Phase 4 静态目录的下一阶段）。
 - Phase 8 packaging/distribution 剩余项：预编译 binary 发布、版本兼容矩阵、安装包策略。
 - Phase 9 promotion gate。
 

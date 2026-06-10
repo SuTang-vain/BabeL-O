@@ -412,35 +412,36 @@ def run_tool_palette_sequence(
     timeout: float,
 ) -> bool:
     """
-    Phase 4 tool palette: /tools renders the static builtin
-    catalog with risk + source + approval columns.
+    Phase 4 wire: /tools opens the /v1/tools/audit overlay
+    wired to the real Nexus endpoint. The seeded local Nexus
+    exposes the runtime tool registry, so this sequence
+    exercises the populated-list path. (The static-catalog
+    fallback is covered by the Go unit tests
+    TestToolsSlashCommandFallsBackToStaticOnFetchError +
+    TestToolAuditMsgErrorFallsBackToStaticCatalogInTranscript.)
     """
     # Submit /tools as a normal slash command (zero-arg, runs
-    # immediately). This exercises the registry / handleLocalCommand
-    # path the same way the chat TUI would.
+    # immediately). The fetch hits /v1/tools/audit; the
+    # overlay header is the primary UX assertion.
     send(master_fd, "/tools")
     send(master_fd, "\r")
-    if not wait_for(master_fd, "tools (", timeout, transcript):
+    if not wait_for(master_fd, "loading shared Nexus tools audit", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
-            "[go-tui-smoke] /tools did not surface the catalog header",
+            "[go-tui-smoke] /tools did not surface the 'loading' status line",
         )
-    combined = visible_text("".join(transcript))
-    for needle in ("Bash", "Read", "Grep", "Glob"):
-        if needle not in combined:
-            return _fail(
-                master_fd, go_tui_proc, transcript,
-                f"[go-tui-smoke] /tools catalog missing {needle!r}",
-            )
-    if "risk=execute" not in combined:
+    if not wait_for(master_fd, "Tools audit · Phase 4 wire overlay", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
-            "[go-tui-smoke] /tools catalog missing Bash risk=execute",
+            "[go-tui-smoke] /tools did not render the overlay header",
         )
-    if "approval-required" not in combined:
+    # Close the overlay so the next orchestrator sequence
+    # starts in composing mode.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "tools audit closed", timeout, transcript):
         return _fail(
             master_fd, go_tui_proc, transcript,
-            "[go-tui-smoke] /tools catalog missing approval-required marker",
+            "[go-tui-smoke] /tools overlay did not close on Esc",
         )
     return True
 
@@ -1347,6 +1348,88 @@ def run_sub_agent_aggregation_sequence(
     return True
 
 
+def run_tools_audit_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 4 wire: `/tools` opens the /v1/tools/audit overlay
+    wired to the real Nexus endpoint. The seeded local Nexus
+    exposes the runtime tool registry, so this sequence
+    exercises the populated-list path:
+
+      - bash round-trip to populate sessionID.
+      - /tools → "loading shared Nexus tools audit" status +
+        "Tools audit · Phase 4 wire overlay" header +
+        per-risk summary line + at least one rendered tool
+        row (Bash is always present in the seeded runtime).
+      - down on a populated list does not crash.
+      - esc closes the overlay + "tools audit closed" status.
+    """
+    # Step 1+2: populate sessionID via a real bash round-trip.
+    send(master_fd, "bash echo phase4-tools-audit")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] tools audit setup: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    if not wait_for(master_fd, "Bash done", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] tools audit setup: bash tool did not finish",
+        )
+    if not wait_for(master_fd, "done success=true", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] tools audit setup: stream did not close cleanly",
+        )
+
+    # Step 3: /tools.
+    send(master_fd, "/tools")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "loading shared Nexus tools audit", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tools did not surface the 'loading' status line",
+        )
+    if not wait_for(master_fd, "Tools audit · Phase 4 wire overlay", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tools did not render the overlay header",
+        )
+    if not wait_for(master_fd, "Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tools did not surface the Bash tool row from the wire",
+        )
+    if not wait_for(master_fd, "approval-required", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /tools did not surface the approval-required column for Bash",
+        )
+
+    # Step 4: down on populated list must not crash.
+    send(master_fd, "\x1b[B")
+    time.sleep(0.2)
+    chunk = read_available(master_fd, 0.2)
+    if chunk:
+        transcript.append(chunk)
+
+    # Step 5: close the overlay.
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "tools audit closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] tools audit overlay did not close on Esc",
+        )
+    return True
+
+
 def run_all_sequences(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1535,6 +1618,13 @@ SEQUENCES: dict[str, dict] = {
     "sub-agent-aggregation": {
         "runner": run_sub_agent_aggregation_sequence,
         "ok_message": "phase 6 PR6 AgentLoop sub-agent aggregation + header badge verified",
+        "required_invariants": [
+            "BabeL-O Go TUI MVP",
+        ],
+    },
+    "tools-audit": {
+        "runner": run_tools_audit_sequence,
+        "ok_message": "phase 4 wire tool audit overlay verified",
         "required_invariants": [
             "BabeL-O Go TUI MVP",
         ],

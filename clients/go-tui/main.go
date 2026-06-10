@@ -419,6 +419,80 @@ type agentJobsMsg struct {
 	err       error
 }
 
+// toolRisk mirrors ToolRisk in src/tools/Tool.ts. The Go TUI
+// uses these as the per-row risk tag in the /tools audit
+// overlay. Unknown values fall through to the raw text so a
+// server-side addition cannot break the client.
+type toolRisk string
+
+const (
+	toolRiskRead    toolRisk = "read"
+	toolRiskWrite   toolRisk = "write"
+	toolRiskExecute toolRisk = "execute"
+	toolRiskTask    toolRisk = "task"
+)
+
+// toolSourceType mirrors the nested `source.type` field of
+// RuntimeToolAuditEntry in src/runtime/Runtime.ts. The Go TUI
+// uses it to switch between the "builtin" and "mcp"
+// presentation in the /tools audit row.
+type toolSourceType string
+
+const (
+	toolSourceBuiltin toolSourceType = "builtin"
+	toolSourceMCP     toolSourceType = "mcp"
+)
+
+// toolAuditSource is the nested `source` field of
+// RuntimeToolAuditEntry. nil when the upstream tool audit
+// entry has no source attribution.
+type toolAuditSource struct {
+	Type         toolSourceType `json:"type"`
+	ServerName   string         `json:"serverName,omitempty"`
+	OriginalName string         `json:"originalName,omitempty"`
+}
+
+// runtimeToolAuditEntry mirrors RuntimeToolAuditEntry in
+// src/runtime/Runtime.ts. The Go TUI only reads the stable
+// fields it displays; inputSchema stays as a generic map so
+// schema churn upstream cannot break the typed decode.
+type runtimeToolAuditEntry struct {
+	Name               string           `json:"name"`
+	Description        string           `json:"description"`
+	Risk               toolRisk         `json:"risk"`
+	Allowed            bool             `json:"allowed"`
+	InputSchema        map[string]any   `json:"inputSchema,omitempty"`
+	RequiresApproval   bool             `json:"requiresApproval,omitempty"`
+	SuggestedAllowRule string           `json:"suggestedAllowRule,omitempty"`
+	MCPServerAllowed   bool             `json:"mcpServerAllowed,omitempty"`
+	Source             *toolAuditSource `json:"source,omitempty"`
+}
+
+// toolsAuditResponse is the envelope for
+// GET /v1/tools/audit. The Go TUI only reads the stable
+// top-level fields it displays; the rest of the payload
+// stays in toolAuditMsg.raw so schema churn upstream cannot
+// break the client.
+type toolsAuditResponse struct {
+	Type  string                  `json:"type"`
+	Tools []runtimeToolAuditEntry `json:"tools"`
+}
+
+// toolAuditMsg is the response from
+// GET /v1/tools/audit. The Go TUI decodes the envelope via
+// the typed struct above; raw bytes are retained for the
+// same reason contextAnalysisMsg / inboxMsg / agentJobsMsg
+// keep them. The trigger field ("user" / "auto") tells the
+// Update handler whether to open the overlay (user /tools
+// command) or just refresh the snapshot in place (a future
+// end-of-turn auto-refresh).
+type toolAuditMsg struct {
+	raw      []byte
+	envelope toolsAuditResponse
+	trigger  string
+	err      error
+}
+
 // taskStatus mirrors TaskStatus in src/shared/task.ts. The
 // Go TUI renders the status as a single-character icon in
 // the task board overlay (e.g. "▶" for in_progress, "✓" for
@@ -598,6 +672,7 @@ const (
 	modeAgentOverlay   inputMode = "agentOverlay"   // read-only multi-agent status; up/down/esc/enter/q
 	modeTaskBoard      inputMode = "taskBoard"      // read-only task board; up/down/esc/enter/q
 	modeActivityOverlay inputMode = "activityOverlay" // read-only recent activity; up/down/esc/enter/q
+	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -640,6 +715,8 @@ type model struct {
 	activityEvents     []activityEventEntry
 	activityOverlayScroll int
 	subAgents         map[string]subAgentEntry
+	toolAuditEntries     []runtimeToolAuditEntry
+	toolAuditScroll     int
 	startedAt      time.Time
 	width          int
 	height         int
@@ -668,14 +745,35 @@ type slashCommand struct {
 }
 
 // toolDescriptor is the read-only row the /tools palette renders. The
-// fields map 1:1 to /v1/tools/audit entries; the static defaults
-// below will be replaced by HTTP-fetched data in Phase 7.
+// fields map 1:1 to /v1/tools/audit entries. The Phase 4
+// wire path (fetchToolAudit) hydrates toolDescriptor from
+// runtimeToolAuditEntry; staticToolDescriptorCatalog remains
+// as the offline fallback when the Nexus endpoint is
+// unreachable.
 type toolDescriptor struct {
 	name     string
 	risk     string
 	source   string
 	approval bool
 	summary  string
+}
+
+// staticToolDescriptorCatalog returns the Phase 4 hard-coded
+// tool list as a slice of toolDescriptor. Used as the offline
+// fallback when /v1/tools/audit is unreachable and as a
+// reference shape for tests that compare the static catalog to
+// the wire result. Mirrors the static catalog the Go TUI
+// rendered before the Phase 4 wire.
+func staticToolDescriptorCatalog() []toolDescriptor {
+	return []toolDescriptor{
+		{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a workspace file"},
+		{name: "Write", risk: "write", source: "builtin", approval: true, summary: "create or overwrite a file"},
+		{name: "Edit", risk: "write", source: "builtin", approval: true, summary: "edit an existing file"},
+		{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
+		{name: "Glob", risk: "read", source: "builtin", approval: false, summary: "expand a glob pattern"},
+		{name: "Grep", risk: "read", source: "builtin", approval: false, summary: "search for a regex in workspace"},
+		{name: "TaskCreate", risk: "task", source: "builtin", approval: true, summary: "create a tracked task"},
+	}
 }
 
 // slashCommands is the static Phase 4 registry. Real backend calls
@@ -811,23 +909,17 @@ var slashCommands = []slashCommand{
 	},
 	{
 		name:    "/tools",
-		summary: "list tools (read-only palette; Phase 4)",
+		summary: "open tool audit overlay (Phase 4 wire)",
 		run: func(m *model, _ []string) tea.Cmd {
-			// Static catalog mirroring the Go runtime's default
-			// tool registry. Phase 7 will wire this to /v1/tools/audit
-			// so MCP servers and runtime-discovered tools show up
-			// here too.
-			tools := []toolDescriptor{
-				{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a workspace file"},
-				{name: "Write", risk: "write", source: "builtin", approval: true, summary: "create or overwrite a file"},
-				{name: "Edit", risk: "write", source: "builtin", approval: true, summary: "edit an existing file"},
-				{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
-				{name: "Glob", risk: "read", source: "builtin", approval: false, summary: "expand a glob pattern"},
-				{name: "Grep", risk: "read", source: "builtin", approval: false, summary: "search for a regex in workspace"},
-				{name: "TaskCreate", risk: "task", source: "builtin", approval: true, summary: "create a tracked task"},
-			}
-			m.renderToolPalette(tools)
-			return nil
+			// Phase 4 wire: GET /v1/tools/audit replaces the
+			// static catalog. On wire success the overlay shows
+			// the real runtime tool registry (builtin + MCP
+			// tools, risk + approval + suggested allow rule).
+			// On wire failure the slash handler falls back to
+			// the static catalog so the user can still see a
+			// known-good list when the Nexus is unreachable.
+			m.appendLine("status", "loading shared Nexus tools audit")
+			return fetchToolAudit(m.cfg, "user")
 		},
 	},
 	{
@@ -1040,6 +1132,7 @@ var (
 	agentStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
 	taskBoardStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	activityStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
+	toolPaletteStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("117"))
 )
 
 func main() {
@@ -1390,6 +1483,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeToolAuditOverlay:
+			// Read-only /v1/tools/audit overlay (Phase 4
+			// wire). up/k scroll back; down/j/tab scroll
+			// forward; esc/enter/q close. No per-row actions
+			// yet (the Go TUI stays read-only for the tool
+			// audit to avoid duplicating the Nexus ownership
+			// surface; `bbl tools audit` / `bbl tools
+			// policy` are CLI-only). All other keys are
+			// swallowed so they never reach the textinput.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.toolAuditScroll = 0
+				m.appendLine("status", "tools audit closed")
+				return m, nil
+			case "up", "k":
+				if m.toolAuditScroll > 0 {
+					m.toolAuditScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
+				maxScroll := max(0, len(allLines)-1)
+				if m.toolAuditScroll < maxScroll {
+					m.toolAuditScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -1622,6 +1745,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setMode(modeTaskBoard)
 		return m, nil
 
+	case toolAuditMsg:
+		if msg.err != nil {
+			// Phase 4 wire: on Nexus HTTP failure, fall back
+			// to the static catalog so the user still sees a
+			// known-good tool list. The error line stays in
+			// the transcript so the user can see why the wire
+			// failed (and the static catalog gets pushed via
+			// the existing renderToolPalette path so the
+			// transcript shows BOTH the error + the fallback).
+			m.appendLine("error", "tools audit: "+msg.err.Error())
+			tools := staticToolDescriptorCatalog()
+			m.renderToolPalette(tools)
+			return m, nil
+		}
+		m.toolAuditEntries = msg.envelope.Tools
+		if msg.trigger == "auto" {
+			// Future: end-of-turn auto-refresh. Currently
+			// no caller fires "auto" — /tools is always
+			// user-initiated.
+			return m, nil
+		}
+		// User-initiated /tools: reset scroll + push
+		// breadcrumb + open the overlay.
+		m.toolAuditScroll = 0
+		summary := fmt.Sprintf("tools audit: %d tool(s)", len(m.toolAuditEntries))
+		m.appendLine("status", summary)
+		m.setMode(modeToolAuditOverlay)
+		return m, nil
+
 	case pollTickMsg:
 		// Background poll. If we've never fetched a config, defer to the
 		// next round rather than blocking the chat loop.
@@ -1674,6 +1826,7 @@ func (m model) View() string {
 	agentOverlay := m.renderAgentOverlay(width)
 	taskBoard := m.renderTaskBoard(width)
 	activityOverlay := m.renderActivityOverlay(width)
+	toolAuditOverlay := m.renderToolAuditOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -1702,6 +1855,9 @@ func (m model) View() string {
 	}
 	if activityOverlay != "" {
 		parts = append(parts, activityOverlay)
+	}
+	if toolAuditOverlay != "" {
+		parts = append(parts, toolAuditOverlay)
 	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
@@ -1761,6 +1917,12 @@ var helpOverlayLines = []string{
 	"  /activity        open recent activity (tool runs, permission,",
 	"                   agent job events, context warnings)",
 	"  up / down / tab  scroll through the recent events",
+	"  esc / enter / q  close the overlay",
+	"",
+	"Tool audit overlay (Phase 4 wire):",
+	"  /tools           open /v1/tools/audit (real Nexus wire;",
+	"                   static fallback if the endpoint is down)",
+	"  up / down / tab  scroll through the tool entries",
 	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
@@ -3149,6 +3311,178 @@ func (m model) renderActivityOverlay(width int) string {
 	return strings.Join([]string{divider(width), activityStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
 }
 
+// formatToolRiskIcon returns a short, terminal-friendly risk
+// marker (e.g. "[read]", "[write]") for the /tools audit row.
+// Matches the formatToolAudit column header convention in
+// src/cli/toolAuditFormatter.ts (read / write / execute / task).
+func formatToolRiskIcon(risk toolRisk) string {
+	switch risk {
+	case toolRiskRead:
+		return "[read]"
+	case toolRiskWrite:
+		return "[write]"
+	case toolRiskExecute:
+		return "[execute]"
+	case toolRiskTask:
+		return "[task]"
+	}
+	return "[" + fallbackUnknown(string(risk)) + "]"
+}
+
+// formatToolSourceTag renders the `source` attribution for
+// the audit row. builtin tools get a plain `builtin` tag;
+// MCP tools get a `mcp:<serverName>` tag so the user can see
+// which MCP server backs each tool. Returns "" when the entry
+// has no source attribution.
+func formatToolSourceTag(source *toolAuditSource) string {
+	if source == nil {
+		return ""
+	}
+	switch source.Type {
+	case toolSourceBuiltin:
+		return "builtin"
+	case toolSourceMCP:
+		if server := strings.TrimSpace(source.ServerName); server != "" {
+			return "mcp:" + server
+		}
+		return "mcp"
+	}
+	return fallbackUnknown(string(source.Type))
+}
+
+// formatToolApprovalStatus returns a compact
+// "no-approval" / "approval-required" segment for the audit
+// row. Matches the formatToolAudit column convention in
+// src/cli/toolAuditFormatter.ts.
+func formatToolApprovalStatus(requiresApproval bool) string {
+	if requiresApproval {
+		return "approval-required"
+	}
+	return "no-approval"
+}
+
+// formatToolAuditRow renders a single runtimeToolAuditEntry
+// for the /tools audit overlay. The row is one main line +
+// optional MCP allow / suggested allow rule second line:
+//   - main row: risk + source tag + approval status + name +
+//     truncated description
+//   - second line (optional): MCP server / allow rule hint
+//
+// Mirrors the TS TUI toolAuditFormatter formatMcpToolRow +
+// formatBuiltinToolRow columns (risk / source / approval /
+// name / description / suggested allow rule).
+func formatToolAuditRow(entry runtimeToolAuditEntry) []string {
+	parts := []string{
+		formatToolRiskIcon(entry.Risk),
+	}
+	if source := formatToolSourceTag(entry.Source); source != "" {
+		parts = append(parts, source)
+	} else {
+		parts = append(parts, "unknown")
+	}
+	parts = append(parts, formatToolApprovalStatus(entry.RequiresApproval))
+	main := strings.Join(parts, " ")
+	name := fallbackUnknown(entry.Name)
+	// Pad name to a fixed width so the description lines up
+	// across rows.
+	for len(name) < 14 {
+		name += " "
+	}
+	main += "  " + name
+	if description := singleLine(strings.TrimSpace(entry.Description)); description != "" {
+		main += "  — " + truncatePlain(description, 80)
+	}
+	rows := []string{main}
+	if entry.MCPServerAllowed {
+		rows = append(rows, "  mcp server: allowed")
+	}
+	if rule := strings.TrimSpace(entry.SuggestedAllowRule); rule != "" {
+		rows = append(rows, "  suggested allow rule: "+truncatePlain(rule, 80))
+	}
+	return rows
+}
+
+// buildToolAuditOverlayLines turns the audit snapshot into
+// the ordered list of lines the /tools overlay will render.
+// Each tool contributes 1-3 lines; the overlay window is
+// then clamped in renderToolAuditOverlay. Returns a single
+// placeholder line for the empty case.
+func buildToolAuditOverlayLines(entries []runtimeToolAuditEntry) []string {
+	if len(entries) == 0 {
+		return []string{"No tools registered in the current runtime."}
+	}
+	lines := []string{}
+	for _, entry := range entries {
+		lines = append(lines, formatToolAuditRow(entry)...)
+	}
+	return lines
+}
+
+// summarizeToolAudit is the per-risk count line shown at the
+// top of the /tools audit overlay. Returns "no tools" for an
+// empty snapshot so the summary line is never blank.
+func summarizeToolAudit(entries []runtimeToolAuditEntry) string {
+	counts := map[toolRisk]int{}
+	for _, entry := range entries {
+		counts[entry.Risk]++
+	}
+	riskOrder := []toolRisk{
+		toolRiskExecute,
+		toolRiskWrite,
+		toolRiskTask,
+		toolRiskRead,
+	}
+	parts := []string{}
+	for _, risk := range riskOrder {
+		if count := counts[risk]; count > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", risk, count))
+		}
+	}
+	if len(parts) == 0 {
+		return "no tools"
+	}
+	return strings.Join(parts, " · ")
+}
+
+// renderToolAuditOverlay paints the multi-line /v1/tools/audit
+// view. It is the Phase 4 wire primary UX for the /tools
+// slash command. The overlay is composed of:
+//   - titleStyle header (Phase 4 wire banner)
+//   - summary line (read / write / execute / task counts)
+//   - clamped window of buildToolAuditOverlayLines
+//   - bottom hint (scroll + close keys)
+//
+// Outside modeToolAuditOverlay it returns "" so it can be
+// unconditionally spliced into the View() parts list.
+func (m model) renderToolAuditOverlay(width int) string {
+	if m.inputMode != modeToolAuditOverlay {
+		return ""
+	}
+	header := titleStyle.Render("Tools audit · Phase 4 wire overlay")
+	summary := summarizeToolAudit(m.toolAuditEntries)
+	visibleRows := max(1, m.height-10)
+	allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.toolAuditScroll > maxScroll {
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[maxScroll:end]
+	} else {
+		end := m.toolAuditScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[m.toolAuditScroll:end]
+	}
+	lines := []string{header, divider(width), summary}
+	lines = append(lines, allLines...)
+	hint := "↑/↓/Tab scroll · esc/enter/q close"
+	lines = append(lines, mutedStyle.Render(hint))
+	return strings.Join([]string{divider(width), toolPaletteStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2)))}, "\n")
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -4252,6 +4586,40 @@ func fetchSessionTasks(cfg config, sessionID string, trigger string) tea.Cmd {
 		if err == nil {
 			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
 				out.err = fmt.Errorf("decode tasks: %w", decodeErr)
+			}
+		}
+		return out
+	}
+}
+
+// fetchToolAudit issues GET /v1/tools/audit and decodes the
+// stable top-level envelope (type / tools). The raw bytes are
+// retained so any future richer renderer (or a server-side
+// schema addition) does not break the existing format /
+// overlay code. The trigger field ("user" / "auto") tells the
+// Update handler whether to open the overlay (user /tools
+// command) or just refresh the snapshot in place (a future
+// end-of-turn auto-refresh).
+//
+// /v1/tools/audit is a GLOBAL endpoint — it does NOT take a
+// session id, so the command is parameter-free on that
+// dimension. The Go TUI does not auto-refresh it on result
+// events (the audit is a snapshot of the runtime tool
+// registry, not a per-session view); a future PR can wire
+// an "auto" trigger if the runtime ever signals a registry
+// change via the stream.
+func fetchToolAudit(cfg config, trigger string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/tools/audit",
+			nil,
+		)
+		out := toolAuditMsg{raw: raw, trigger: trigger, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
+				out.err = fmt.Errorf("decode tool audit: %w", decodeErr)
 			}
 		}
 		return out

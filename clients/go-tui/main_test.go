@@ -3650,3 +3650,410 @@ func TestBuildMergedAgentOverlayLinesOrdersSubAgentsAlphabetically(t *testing.T)
 		t.Fatalf("sub-agent rows should be alphabetical, got alpha=%d mu=%d zeta=%d", idxAlpha, idxMu, idxZeta)
 	}
 }
+
+// fullToolAuditPayload returns a representative tool audit
+// response with three tools: a builtin read tool, a builtin
+// execute tool with approval + suggested allow rule, and an
+// MCP tool with server name + MCP server allowed flag. Used
+// by the tool audit overlay + fetch / fallback tests below.
+func fullToolAuditPayload() []byte {
+	return []byte(`{
+		"type": "tools_audit",
+		"tools": [
+			{
+				"name": "Read",
+				"description": "read a workspace file",
+				"risk": "read",
+				"allowed": true,
+				"requiresApproval": false,
+				"source": {"type": "builtin"}
+			},
+			{
+				"name": "Bash",
+				"description": "run a shell command",
+				"risk": "execute",
+				"allowed": true,
+				"requiresApproval": true,
+				"suggestedAllowRule": "allow:bash:read-only",
+				"source": {"type": "builtin"}
+			},
+			{
+				"name": "mcp_filesystem_list",
+				"description": "list workspace entries via filesystem MCP server",
+				"risk": "read",
+				"allowed": true,
+				"requiresApproval": false,
+				"mcpServerAllowed": true,
+				"source": {
+					"type": "mcp",
+					"serverName": "filesystem",
+					"originalName": "list"
+				}
+			}
+		]
+	}`)
+}
+
+func TestFormatToolRiskIconAllValues(t *testing.T) {
+	cases := map[toolRisk]string{
+		toolRiskRead:    "[read]",
+		toolRiskWrite:   "[write]",
+		toolRiskExecute: "[execute]",
+		toolRiskTask:    "[task]",
+	}
+	for risk, want := range cases {
+		if got := formatToolRiskIcon(risk); got != want {
+			t.Fatalf("formatToolRiskIcon(%s) = %q, want %q", risk, got, want)
+		}
+	}
+	// Unknown risk falls through to the bracketed raw text.
+	if got := formatToolRiskIcon(toolRisk("destructive")); got != "[destructive]" {
+		t.Fatalf("unknown risk should bracket raw text, got %q", got)
+	}
+}
+
+func TestFormatToolSourceTagBuiltinAndMcp(t *testing.T) {
+	cases := []struct {
+		name   string
+		source *toolAuditSource
+		want   string
+	}{
+		{name: "builtin", source: &toolAuditSource{Type: toolSourceBuiltin}, want: "builtin"},
+		{name: "mcp with serverName", source: &toolAuditSource{Type: toolSourceMCP, ServerName: "filesystem"}, want: "mcp:filesystem"},
+		{name: "mcp without serverName", source: &toolAuditSource{Type: toolSourceMCP}, want: "mcp"},
+		{name: "nil source", source: nil, want: ""},
+		{name: "unknown source type", source: &toolAuditSource{Type: toolSourceType("plugin")}, want: "plugin"},
+	}
+	for _, tc := range cases {
+		if got := formatToolSourceTag(tc.source); got != tc.want {
+			t.Fatalf("%s: formatToolSourceTag = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestFormatToolApprovalStatus(t *testing.T) {
+	if got := formatToolApprovalStatus(true); got != "approval-required" {
+		t.Fatalf("approval-required = %q", got)
+	}
+	if got := formatToolApprovalStatus(false); got != "no-approval" {
+		t.Fatalf("no-approval = %q", got)
+	}
+}
+
+func TestBuildToolAuditOverlayLinesRendersEntries(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	lines := buildToolAuditOverlayLines(envelope.Tools)
+	combined := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"[read]", "builtin", "no-approval", "Read", "read a workspace file",
+		"[execute]", "approval-required", "Bash", "suggested allow rule: allow:bash:read-only",
+		"[read]", "mcp:filesystem", "mcp server: allowed", "mcp_filesystem_list",
+	} {
+		if !strings.Contains(combined, want) {
+			t.Fatalf("buildToolAuditOverlayLines missing %q\nfull:\n%s", want, combined)
+		}
+	}
+}
+
+func TestBuildToolAuditOverlayLinesEmptyPlaceholder(t *testing.T) {
+	lines := buildToolAuditOverlayLines(nil)
+	if len(lines) != 1 || lines[0] != "No tools registered in the current runtime." {
+		t.Fatalf("expected single empty placeholder, got %v", lines)
+	}
+}
+
+func TestSummarizeToolAuditRendersRiskCounts(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	got := summarizeToolAudit(envelope.Tools)
+	for _, want := range []string{"execute 1", "read 2"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("summarizeToolAudit missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
+func TestSummarizeToolAuditEmpty(t *testing.T) {
+	if got := summarizeToolAudit(nil); got != "no tools" {
+		t.Fatalf("empty summary should report no tools, got %q", got)
+	}
+}
+
+func TestRenderToolAuditOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	if got := m.renderToolAuditOverlay(120); got != "" {
+		t.Fatalf("renderToolAuditOverlay outside modeToolAuditOverlay should be empty, got %q", got)
+	}
+}
+
+func TestRenderToolAuditOverlayShowsHeaderInMode(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	m.toolAuditEntries = envelope.Tools
+	m.inputMode = modeToolAuditOverlay
+	m.height = 30
+	rendered := m.renderToolAuditOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderToolAuditOverlay in modeToolAuditOverlay should be non-empty")
+	}
+	for _, want := range []string{
+		"Tools audit · Phase 4 wire overlay",
+		"execute 1", "read 2",
+		"Read", "Bash", "mcp_filesystem_list",
+		"scroll", "close",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered tool audit overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestToolAuditOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.inputMode != modeToolAuditOverlay {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeToolAuditOverlay)
+	}
+	if len(um.toolAuditEntries) != 3 {
+		t.Fatalf("toolAuditEntries = %d, want 3", len(um.toolAuditEntries))
+	}
+	// Esc closes.
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
+	}
+}
+
+func TestToolAuditOverlayEscapeEnterQAllClose(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
+	um := updated.(model)
+	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+		um.inputMode = modeToolAuditOverlay
+		closed, _ := um.Update(tea.KeyMsg{Type: keyType})
+		cm := closed.(model)
+		if cm.inputMode != modeComposing {
+			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
+		}
+	}
+	um.inputMode = modeToolAuditOverlay
+	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
+	}
+}
+
+func TestToolAuditOverlayScrollClamps(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
+	um := updated.(model)
+	// Up at 0 stays at 0.
+	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	u := up.(model)
+	if u.toolAuditScroll != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", u.toolAuditScroll)
+	}
+	// Down advances and clamps at len-1.
+	cur := u
+	for i := 0; i < 200; i++ {
+		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		cur = next.(model)
+	}
+	allLines := buildToolAuditOverlayLines(cur.toolAuditEntries)
+	maxScroll := len(allLines) - 1
+	if cur.toolAuditScroll != maxScroll {
+		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.toolAuditScroll)
+	}
+}
+
+func TestToolAuditOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
+	envelope := toolsAuditResponse{}
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
+	m = updated.(model)
+	m.input.SetValue("untouched")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	um := updated.(model)
+	if um.input.Value() != "untouched" {
+		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
+	}
+	if um.inputMode != modeToolAuditOverlay {
+		t.Fatalf("stray key should leave mode unchanged, got %q", um.inputMode)
+	}
+}
+
+func TestToolsSlashCommandFetchesAuditOnSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/tools/audit" {
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"tools_audit","tools":[{"name":"Read","description":"read a workspace file","risk":"read","allowed":true,"requiresApproval":false}]}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/tools")
+	if cmd == nil {
+		t.Fatalf("expected non-nil cmd from /tools")
+	}
+	msg := cmd()
+	audit, ok := msg.(toolAuditMsg)
+	if !ok {
+		t.Fatalf("expected toolAuditMsg, got %T", msg)
+	}
+	if audit.err != nil {
+		t.Fatalf("audit err: %v", audit.err)
+	}
+	if len(audit.envelope.Tools) != 1 {
+		t.Fatalf("envelope.Tools len = %d, want 1", len(audit.envelope.Tools))
+	}
+	if audit.envelope.Tools[0].Name != "Read" {
+		t.Fatalf("first tool name = %q, want Read", audit.envelope.Tools[0].Name)
+	}
+	if audit.trigger != "user" {
+		t.Fatalf("trigger = %q, want user", audit.trigger)
+	}
+}
+
+func TestToolsSlashCommandFallsBackToStaticOnFetchError(t *testing.T) {
+	// Point at a port nothing is listening on to force a
+	// connection refused.
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	cmd := m.handleLocalCommand("/tools")
+	if cmd == nil {
+		t.Fatalf("expected non-nil cmd from /tools")
+	}
+	msg := cmd()
+	audit, ok := msg.(toolAuditMsg)
+	if !ok {
+		t.Fatalf("expected toolAuditMsg, got %T", msg)
+	}
+	if audit.err == nil {
+		t.Fatalf("expected fetch error, got nil")
+	}
+	// Verify the static catalog fallback is reachable and
+	// contains Bash (always present in the offline list).
+	static := staticToolDescriptorCatalog()
+	found := false
+	for _, t := range static {
+		if t.name == "Bash" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("static catalog should include Bash as a known-good fallback")
+	}
+}
+
+func TestToolAuditMsgErrorFallsBackToStaticCatalogInTranscript(t *testing.T) {
+	m := newModel(config{baseURL: "http://127.0.0.1:1", cwd: "/workspace"})
+	updated, _ := m.Update(toolAuditMsg{err: errors.New("dial tcp: connection refused")})
+	um := updated.(model)
+	// The error must surface in the transcript so the user
+	// can see why the wire failed. Walk the transcript
+	// because the static catalog fallback pushes additional
+	// lines after the error line.
+	combined := ""
+	foundError := false
+	for _, line := range um.transcript {
+		combined += line.text + "\n"
+		if line.kind == "error" && strings.Contains(line.text, "tools audit: dial tcp") {
+			foundError = true
+		}
+	}
+	if !foundError {
+		t.Fatalf("expected friendly error line in transcript, got:\n%s", combined)
+	}
+	// The static catalog rows should also be in the transcript
+	// (the test for /tools on a bad URL must still show a
+	// usable list).
+	if !strings.Contains(combined, "Bash") {
+		t.Fatalf("static catalog fallback should push Bash into the transcript, got:\n%s", combined)
+	}
+	if !strings.Contains(combined, "approval-required") {
+		t.Fatalf("static catalog fallback should preserve the approval column, got:\n%s", combined)
+	}
+}
+
+func TestFetchToolAuditHTTPCmdSendsCorrectPath(t *testing.T) {
+	var seenPath string
+	var seenMethod string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenPath = r.URL.Path
+		seenMethod = r.Method
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"tools_audit","tools":[]}`))
+	}))
+	defer server.Close()
+	m := newModel(config{baseURL: server.URL, cwd: "/workspace"})
+	cmd := fetchToolAudit(m.cfg, "user")
+	msg := cmd()
+	audit, ok := msg.(toolAuditMsg)
+	if !ok {
+		t.Fatalf("expected toolAuditMsg, got %T", msg)
+	}
+	if audit.err != nil {
+		t.Fatalf("fetchToolAudit returned err: %v", audit.err)
+	}
+	if seenPath != "/v1/tools/audit" {
+		t.Fatalf("seenPath = %q", seenPath)
+	}
+	if seenMethod != http.MethodGet {
+		t.Fatalf("seenMethod = %q, want GET", seenMethod)
+	}
+	if audit.trigger != "user" {
+		t.Fatalf("trigger = %q, want user", audit.trigger)
+	}
+}
+
+func TestStaticToolDescriptorCatalogIsStableReferenceShape(t *testing.T) {
+	// The static catalog is the offline fallback. The names
+	// and risk levels must remain stable so a future refactor
+	// that re-orders the slice (or drops a tool) trips this
+	// test and forces an explicit decision.
+	tools := staticToolDescriptorCatalog()
+	wantNames := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", "TaskCreate"}
+	if len(tools) != len(wantNames) {
+		t.Fatalf("static catalog should have %d tools, got %d", len(wantNames), len(tools))
+	}
+	for index, want := range wantNames {
+		if tools[index].name != want {
+			t.Fatalf("static catalog[%d].name = %q, want %q", index, tools[index].name, want)
+		}
+	}
+	// Bash is the only execute-risk tool and the only one
+	// that requires approval.
+	if tools[3].risk != "execute" || !tools[3].approval {
+		t.Fatalf("Bash should be execute-risk + approval-required, got risk=%q approval=%v", tools[3].risk, tools[3].approval)
+	}
+}

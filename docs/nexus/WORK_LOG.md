@@ -2,6 +2,39 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI tool palette `/v1/tools/audit` 真实 wire 收口
+
+- **用户请求**: 按 TODO_tui.md 收尾项推进 Go TUI tool palette 真实 wire（Phase 4 静态目录的下一阶段），把 `/tools` 从 7 条硬编码 builtin 列表升级为调真实 `GET /v1/tools/audit` Nexus HTTP 端点。
+- **实现**:
+  - `clients/go-tui/main.go`:
+    - 数据模型: 新增 `toolRisk` 枚举（read / write / execute / task）+ `toolSourceType` 枚举（builtin / mcp）+ `toolAuditSource` struct + `runtimeToolAuditEntry` struct（name / description / risk / allowed / inputSchema / requiresApproval / suggestedAllowRule / mcpServerAllowed / source）+ `toolsAuditResponse` envelope（type / tools）+ `toolAuditMsg` typed msg（带 trigger 字段复用 Phase 6 的 user/auto 模式）。
+    - 状态机: `modeToolAuditOverlay` inputMode 常量 + 模型字段 `toolAuditEntries` / `toolAuditScroll`。
+    - HTTP: `fetchToolAudit(cfg, trigger)` 调 `GET /v1/tools/audit`（**全局端点**，无 sessionID 参数——audit 是 runtime 视图不是 session 视图），保留 `raw []byte` envelope 抗 schema churn。
+    - 静态 fallback: `staticToolDescriptorCatalog()` helper 把原 Phase 4 硬编码 7 条 builtin 列表抽成函数，wire 失败时通过 `renderToolPalette` 推回 transcript 让用户能继续看到 known-good 列表。
+    - 渲染: `toolPaletteStyle` (foreground 117) + `formatToolRiskIcon(risk)` (`[read]`/`[write]`/`[execute]`/`[task]` 终端友好 marker) + `formatToolSourceTag(source)` (builtin / `mcp:<serverName>` / 空 / unknown) + `formatToolApprovalStatus(requiresApproval)` (`no-approval` / `approval-required`) + `formatToolAuditRow(entry)` (风险 + 来源 tag + 审批状态 + name + 截断 description + 可选 MCP server allowed 第二行 + 可选 suggested allow rule 第二行) + `buildToolAuditOverlayLines(entries)` + `summarizeToolAudit(entries)` (execute / write / task / read 排序计数) + `renderToolAuditOverlay(width)` (title `Tools audit · Phase 4 wire overlay` + divider + clamped window + scroll/close hint)。
+    - slash 命令: 替换 `/tools` placeholder——`/tools` 调 `fetchToolAudit(m.cfg, "user")`，无 active session 时不强求 gate（audit 是全局的）；wire 成功打开 overlay；wire 失败时 push `tools audit: <err>` error 行 + 走 static fallback 把 7 条 builtin 推回 transcript。
+    - case toolAuditMsg Update handler: `err != nil` 走 fallback 路径；`trigger == "auto"` 静默 update `m.toolAuditEntries`（目前没有 caller 触发，未来 auto-refresh 留接口）；`"user"` 走原路径（reset scroll + push `tools audit: N tool(s)` breadcrumb + `setMode(modeToolAuditOverlay)`）。
+    - KeyMsg dispatch: `case modeToolAuditOverlay`——esc/enter/q 关闭 + 清 `toolAuditScroll` + 写 `tools audit closed` 状态行；up/k 减 scroll clamp 0；down/j/tab 增 scroll clamp `len(buildToolAuditOverlayLines(...))-1`；stray key 全部被吞。
+    - helpOverlayLines: 新增 `Tool audit overlay (Phase 4 wire):` 段。
+    - View(): 拼接 `toolAuditOverlay` 段在 `activityOverlay` 之后、input / footer 之前。
+  - `clients/go-tui/main_test.go`: 18 个新单测 + `fullToolAuditPayload()` helper 覆盖 builtin Read + builtin Bash（approval + suggested allow rule）+ MCP filesystem tool（`mcp:filesystem` source tag + mcp server allowed）：
+    - `TestFormatToolRiskIconAllValues` / `TestFormatToolSourceTagBuiltinAndMcp` / `TestFormatToolApprovalStatus` / `TestBuildToolAuditOverlayLinesRendersEntries` / `TestBuildToolAuditOverlayLinesEmptyPlaceholder` / `TestSummarizeToolAuditRendersRiskCounts` / `TestSummarizeToolAuditEmpty` / `TestRenderToolAuditOverlayEmptyOutsideMode` / `TestRenderToolAuditOverlayShowsHeaderInMode` / `TestToolAuditOverlayOpensOnMsgAndClearsOnClose` / `TestToolAuditOverlayEscapeEnterQAllClose` / `TestToolAuditOverlayScrollClamps` / `TestToolAuditOverlayStrayKeyDoesNotReachTextinput` / `TestToolsSlashCommandFetchesAuditOnSuccess` / `TestToolsSlashCommandFallsBackToStaticOnFetchError` / `TestToolAuditMsgErrorFallsBackToStaticCatalogInTranscript` / `TestFetchToolAuditHTTPCmdSendsCorrectPath` / `TestStaticToolDescriptorCatalogIsStableReferenceShape`。
+  - `test/go_tui_pty_driver.py`:
+    - 新 `run_tools_audit_sequence`: bash round-trip populate sessionID + approve permission + 等 `Bash done` + `done success=true` + `/tools` 等 `loading shared Nexus tools audit` + `Tools audit · Phase 4 wire overlay` header + `Bash` 行（seeded Nexus runtime 工具） + `approval-required` 列 + 按 down 在 populated list 上不能 crash + esc 关 overlay + `tools audit closed` 状态行。加进 `SEQUENCES` registry。
+    - 现有 `run_tool_palette_sequence` 更新：原 Phase 4 静态目录断言改成新 wire 行为（`loading` 状态行 + overlay header + esc 关闭）——同一个 sequence 名保留在 `all` orchestrator 里，行为升级为 wire。
+  - `test/go-tui-smoke.test.ts`: 加第 19 个测试——`tools-audit` 跑 driver `--sequence tools-audit` 并断言 `phase 4 wire tool audit overlay verified`，90s timeout。
+- **回归覆盖**:
+  - `cd clients/go-tui && go build . / go test ./...`: 203/203 pass（185 旧 + 18 新）。
+  - `npm run typecheck` + `npm run format:check`: 通过。
+  - `npm test`: 686/686 pass。
+  - `BABEL_O_RUN_GO_TUI_SMOKE=1 npm run test:go-tui:smoke`: 19/19 pass（含新 `tools-audit` + 升级后的 `tool-palette`）。
+- **范围克制**:
+  - 静态 catalog 仅作 wire 失败的 fallback，不在成功路径上使用（成功路径全部走真实 audit 数据）。
+  - `/v1/tools/audit` 是全局端点，**不**走 end-of-turn auto-refresh——audit 是 runtime 视图不是 session 视图，未来若 runtime 通过 stream 推送 registry 变化事件再补 auto-refresh hook。
+  - ack / cancel 按钮（per-tool approval gate、allow-rule editing）留 CLI（`bbl tools policy`），Go TUI 保持只读避免复制 Nexus ownership surface。
+  - `inputSchema` 字段以 `map[string]any` 形式保留在 typed struct 里但不在 overlay 行展示（仅 source 描述，schema 详情留给 `bbl tools audit --verbose` CLI）。
+  - `mcpServerAllowed: false` 不强制报错——一些 MCP server 可能未在本次 runtime 注册，运行时由 Nexus 决定具体 allowed 状态。
+
 ## 2026-06-10 — Go TUI Phase 6 PR3：`/agents` 多 agent status overlay + end-of-turn auto-refresh 收口
 
 - **用户请求**: 推进 Phase 6 PR3（Agent status panel：parent/child + taskId + role + depth + status + delegatedSubTaskIds），把 Go TUI 拉到 TS TUI `formatMultiAgentStatusView` 的展示能力。
