@@ -4513,14 +4513,33 @@ func formatLine(kind string, text string, width int) string {
 		if len(bodyLines) == 0 {
 			bodyLines = []string{""}
 		}
+		// Block-level markdown: a line that starts with `#` /
+		// `##` / `###` is rendered as a header with the
+		// title style. The `#` markers are stripped from the
+		// body so the inline walker can do its work on the
+		// remaining text.
+		renderAssistantLine := func(line string) string {
+			trimmed := strings.TrimLeft(line, " ")
+			if strings.HasPrefix(trimmed, "# ") {
+				headerLevel := 1
+				for strings.HasPrefix(trimmed, "#") {
+					headerLevel++
+					trimmed = strings.TrimPrefix(trimmed, "#")
+				}
+				trimmed = strings.TrimPrefix(trimmed, " ")
+				_ = headerLevel
+				return "  " + titleStyle.Render(renderInlineMarkdown(style, trimmed))
+			}
+			return "  " + renderInlineMarkdown(style, line)
+		}
 		out := make([]string, 0, len(bodyLines))
-		out = append(out, "  "+style.Render(bodyLines[0]))
+		out = append(out, renderAssistantLine(bodyLines[0]))
 		for _, c := range bodyLines[1:] {
 			if c == "" {
 				out = append(out, "")
 				continue
 			}
-			out = append(out, "  "+style.Render(c))
+			out = append(out, renderAssistantLine(c))
 		}
 		return strings.Join(out, "\n")
 	case "tool_started", "tool_denied":
@@ -5803,6 +5822,82 @@ func joinColumns(width int, left string, right string) string {
 		return truncateVisible(left+" "+right, width)
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// renderInlineMarkdown applies a small set of inline markdown
+// spans on top of the base style. The walker recognises:
+//   `code`           → inline code (muted chip with bg 238)
+//   **bold** / __bold__ → bold (lipgloss.Bold)
+//   *em* / _em_       → italic (lipgloss.Italic)
+//
+// Headers (`# …`) and code fences (```) are handled at the
+// block level in formatLine, not here. CJK is safe: the walker
+// only treats ASCII punctuation as markers, so Chinese /
+// kana / hangul content never collides with the span
+// delimiters.
+func renderInlineMarkdown(base lipgloss.Style, text string) string {
+	if text == "" {
+		return ""
+	}
+	var out strings.Builder
+	runes := []rune(text)
+	i := 0
+	for i < len(runes) {
+		r := runes[i]
+		// Inline code: `…` (single backtick). Skip empty
+		// matches and unterminated tails.
+		if r == '`' {
+			end := -1
+			for j := i + 1; j < len(runes); j++ {
+				if runes[j] == '`' {
+					end = j
+					break
+				}
+			}
+			if end > i+1 {
+				code := string(runes[i+1 : end])
+				chip := base.Foreground(lipgloss.Color("252")).Background(lipgloss.Color("238")).Render(code)
+				out.WriteString(chip)
+				i = end + 1
+				continue
+			}
+		}
+		// Bold: **…** or __…__
+		if (r == '*' || r == '_') && i+1 < len(runes) && runes[i+1] == r {
+			end := -1
+			for j := i + 2; j+1 < len(runes); j++ {
+				if runes[j] == r && runes[j+1] == r {
+					end = j
+					break
+				}
+			}
+			if end > i+1 {
+				bold := base.Bold(true).Render(string(runes[i+2 : end]))
+				out.WriteString(bold)
+				i = end + 2
+				continue
+			}
+		}
+		// Italic: *…* or _…_ (single, not double).
+		if r == '*' || r == '_' {
+			end := -1
+			for j := i + 1; j < len(runes); j++ {
+				if runes[j] == r {
+					end = j
+					break
+				}
+			}
+			if end > i+1 {
+				italic := base.Italic(true).Render(string(runes[i+1 : end]))
+				out.WriteString(italic)
+				i = end + 1
+				continue
+			}
+		}
+		out.WriteRune(r)
+		i++
+	}
+	return out.String()
 }
 
 func wrapPlain(text string, width int) string {
