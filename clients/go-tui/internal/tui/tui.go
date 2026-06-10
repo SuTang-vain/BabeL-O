@@ -39,7 +39,15 @@ type Config struct {
 	// can run write/execute Bash subcommands (git commit, npm install,
 	// etc.) via the existing permission panel. Set to "strict" to
 	// preserve the old hard-deny behaviour for a specific session.
-	PolicyMode  string
+	PolicyMode string
+	// AllowTools is the comma-separated list of tool names that the
+	// current turn's `allowedTools` body field should declare. Phase D
+	// of docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+	// When non-empty, those tools auto-execute (no `permission_request`)
+	// for this turn only; the next turn re-evaluates from the body.
+	// Use "*" or "all" for a wildcard that mirrors the server-startup
+	// allowAllTools semantics. Default empty: per-turn override off.
+	AllowTools   []string
 	PrintVersion bool
 }
 
@@ -174,6 +182,7 @@ type runtimeModelsResponse struct {
 
 type runtimeModelsMsg struct {
 	response runtimeModelsResponse
+	trigger  string
 	err      error
 }
 
@@ -760,6 +769,7 @@ const (
 	modeTaskBoard        inputMode = "taskBoard"        // read-only task board; up/down/esc/enter/q
 	modeActivityOverlay  inputMode = "activityOverlay"  // read-only recent activity; up/down/esc/enter/q
 	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
+	modeModelOverlay     inputMode = "modelOverlay"     // read-only model config/catalog; up/down/esc/enter/q
 )
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
@@ -806,6 +816,8 @@ type model struct {
 	subAgents               map[string]subAgentEntry
 	toolAuditEntries        []runtimeToolAuditEntry
 	toolAuditScroll         int
+	modelCatalog            runtimeModelsResponse
+	modelOverlayScroll      int
 	startedAt               time.Time
 	connected               bool
 	latestUsage             *usageSnapshot
@@ -901,7 +913,7 @@ var slashCommands = []slashCommand{
 			// body would require it to be fully built first).
 			names := []string{
 				"/help", "/config", "/profile", "/clear", "/exit",
-				"/context", "/compact", "/inbox", "/models", "/tools",
+				"/context", "/compact", "/inbox", "/model", "/models", "/tool", "/tools",
 				"/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
 				"/write", "/edit",
 			}
@@ -1010,15 +1022,32 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
+		name:    "/model",
+		summary: "open model configuration view or show set-model hint",
+		hasArgs: true,
+		argHint: "[id]",
+		run: func(m *model, args []string) tea.Cmd {
+			if len(args) == 0 {
+				m.appendLine("status", "loading shared Nexus model configuration")
+				return fetchRuntimeModels(m.cfg, "model")
+			}
+			modelID := args[0]
+			m.appendLine("status", fmt.Sprintf("model switch requested: %s", modelID))
+			m.appendLine("status", fmt.Sprintf("Go TUI keeps model writes CLI-only; run `bbl config use %s` or `bbl chat /model`.", modelID))
+			return nil
+		},
+	},
+	{
 		name:    "/models",
 		summary: "list models from shared Nexus registry",
 		run: func(m *model, _ []string) tea.Cmd {
 			m.appendLine("status", "loading shared Nexus models capability matrix")
-			return fetchRuntimeModels(m.cfg)
+			return fetchRuntimeModels(m.cfg, "models")
 		},
 	},
 	{
 		name:    "/tools",
+		aliases: []string{"/tool"},
 		summary: "open tool audit overlay",
 		run: func(m *model, _ []string) tea.Cmd {
 			// Phase 4 wire: GET /v1/tools/audit replaces the
@@ -1717,6 +1746,33 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeModelOverlay:
+			// Read-only model configuration/catalog overlay. The
+			// TypeScript TUI's /model command can write the local
+			// ConfigManager after prompting for provider secrets; the
+			// Go TUI stays remote-client only and shows the active
+			// model/profile plus the CLI path for writes.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.modelOverlayScroll = 0
+				m.appendLine("status", "model view closed")
+				return m, nil
+			case "up", "k":
+				if m.modelOverlayScroll > 0 {
+					m.modelOverlayScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildModelOverlayLines(m.modelCatalog)
+				maxScroll := max(0, len(allLines)-1)
+				if m.modelOverlayScroll < maxScroll {
+					m.modelOverlayScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -1848,8 +1904,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("error", "models: "+msg.err.Error())
 			return m, nil
 		}
-		lines := formatRuntimeModels(msg.response)
-		for _, line := range lines {
+		m.modelCatalog = msg.response
+		if msg.trigger == "model" {
+			m.modelOverlayScroll = 0
+			m.appendLine("status", formatRuntimeModelConfigSummary(msg.response))
+			m.setMode(modeModelOverlay)
+			return m, nil
+		}
+		for _, line := range formatRuntimeModels(msg.response) {
 			m.appendLine("status", line)
 		}
 		return m, nil
@@ -2099,6 +2161,7 @@ func (m model) View() string {
 	taskBoard := m.renderTaskBoard(width)
 	activityOverlay := m.renderActivityOverlay(width)
 	toolAuditOverlay := m.renderToolAuditOverlay(width)
+	modelOverlay := m.renderModelOverlay(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -2131,6 +2194,9 @@ func (m model) View() string {
 	if toolAuditOverlay != "" {
 		parts = append(parts, toolAuditOverlay)
 	}
+	if modelOverlay != "" {
+		parts = append(parts, modelOverlay)
+	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
 }
@@ -2157,6 +2223,8 @@ var helpOverlayLines = []string{
 	"Local slash commands (run after the leading / and enter):",
 	"  /config          refresh shared Nexus config + profile state",
 	"  /profile [name]  list profiles, or select a profile",
+	"  /model [id]      open model config view, or show CLI set hint",
+	"  /models          print model capability matrix",
 	"",
 	"Profile confirm overlay:",
 	"  y / enter        confirm the pending profile switch",
@@ -2192,9 +2260,15 @@ var helpOverlayLines = []string{
 	"  esc / enter / q  close the overlay",
 	"",
 	"Tool audit overlay:",
-	"  /tools           open /v1/tools/audit (real Nexus wire;",
+	"  /tool, /tools    open /v1/tools/audit (real Nexus wire;",
 	"                   static fallback if the endpoint is down)",
 	"  up / down / tab  scroll through the tool entries",
+	"  esc / enter / q  close the overlay",
+	"",
+	"Model config overlay:",
+	"  /model           open the shared Nexus model/config view",
+	"  /model <id>      show the CLI-only set-model command",
+	"  up / down / tab  scroll through provider/model rows",
 	"  esc / enter / q  close the overlay",
 	"",
 	"Press esc / enter / q to close.",
@@ -3765,6 +3839,135 @@ func (m model) renderToolAuditOverlay(width int) string {
 	return renderOverlayFrame(width, toolPaletteStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
 }
 
+func formatRuntimeModelConfigSummary(response runtimeModelsResponse) string {
+	activeModel := firstNonEmpty(response.DefaultModel, "unknown")
+	activeProfile := firstNonEmpty(response.ActiveProfile, "none")
+	providerCount := len(response.Providers)
+	modelCount := 0
+	configuredCount := 0
+	for _, provider := range response.Providers {
+		modelCount += len(provider.Models)
+		if provider.Configured {
+			configuredCount++
+		}
+	}
+	prefix := "model config"
+	if response.Version > 0 {
+		prefix = fmt.Sprintf("model config v=%d", response.Version)
+	}
+	return fmt.Sprintf("%s active=%s profile=%s providers=%d configured=%d models=%d",
+		prefix, activeModel, activeProfile, providerCount, configuredCount, modelCount)
+}
+
+func formatModelCapabilityFlags(capabilities runtimeCapabilities) string {
+	flags := []string{}
+	if capabilities.ToolCalling {
+		flags = append(flags, "tool-call")
+	}
+	if capabilities.JSONOutput {
+		flags = append(flags, "json")
+	}
+	if capabilities.StructuredOutput {
+		flags = append(flags, "structured")
+	}
+	if capabilities.Streaming {
+		flags = append(flags, "stream")
+	}
+	if len(flags) == 0 {
+		return "basic"
+	}
+	return strings.Join(flags, ",")
+}
+
+func formatModelProviderStatus(provider registeredProvider) string {
+	parts := []string{}
+	if provider.Active {
+		parts = append(parts, "active")
+	}
+	if provider.Configured {
+		parts = append(parts, "configured")
+	} else {
+		parts = append(parts, "unconfigured")
+	}
+	if provider.AuthMode != "" {
+		parts = append(parts, "auth="+provider.AuthMode)
+	}
+	if len(parts) == 0 {
+		return "unknown"
+	}
+	return strings.Join(parts, " · ")
+}
+
+func buildModelOverlayLines(response runtimeModelsResponse) []string {
+	if len(response.Providers) == 0 {
+		return []string{"No providers reported by the current Nexus runtime."}
+	}
+	lines := []string{
+		"Active model: " + firstNonEmpty(response.DefaultModel, "unknown"),
+		"Active profile: " + firstNonEmpty(response.ActiveProfile, "none"),
+		"",
+		"Configuration writes stay CLI-owned in Go TUI:",
+		"  bbl config use <modelId>",
+		"  bbl chat /model",
+		"",
+		"Providers:",
+	}
+	for _, provider := range response.Providers {
+		displayName := firstNonEmpty(provider.DisplayName, provider.ID)
+		lines = append(lines, fmt.Sprintf("  %s (%s) · %s",
+			provider.ID, displayName, formatModelProviderStatus(provider)))
+		if provider.DefaultModel != "" {
+			lines = append(lines, "    default: "+provider.DefaultModel)
+		}
+		if len(provider.Models) == 0 {
+			lines = append(lines, "    no registered models")
+			continue
+		}
+		for _, model := range provider.Models {
+			marker := " "
+			if model.ID == response.DefaultModel {
+				marker = "*"
+			}
+			name := firstNonEmpty(model.Name, model.ID)
+			lines = append(lines, fmt.Sprintf("    %s %s · ctx=%d · max=%d · %s",
+				marker, model.ID, model.ContextWindow, model.DefaultMaxTokens,
+				formatModelCapabilityFlags(model.Capabilities)))
+			if name != model.ID {
+				lines = append(lines, "      "+name)
+			}
+		}
+	}
+	return lines
+}
+
+func (m model) renderModelOverlay(width int) string {
+	if m.inputMode != modeModelOverlay {
+		return ""
+	}
+	header := titleStyle.Render("Model configuration")
+	summary := formatRuntimeModelConfigSummary(m.modelCatalog)
+	visibleRows := max(1, m.height-10)
+	allLines := buildModelOverlayLines(m.modelCatalog)
+	maxScroll := max(0, len(allLines)-visibleRows)
+	if m.modelOverlayScroll > maxScroll {
+		end := maxScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[maxScroll:end]
+	} else {
+		end := m.modelOverlayScroll + visibleRows
+		if end > len(allLines) {
+			end = len(allLines)
+		}
+		allLines = allLines[m.modelOverlayScroll:end]
+	}
+	lines := []string{header, divider(width), summary}
+	lines = append(lines, allLines...)
+	lines = append(lines, mutedStyle.Render("↑/↓/Tab scroll · esc/enter/q close"))
+	return renderOverlayFrame(width, statusStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
+}
+
 func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
 	if !isKeyInboxMessage(message) {
 		return ""
@@ -3864,7 +4067,14 @@ func (m model) renderSlashPalette(width int) string {
 		scrollOffset = max(0, total-visible)
 	}
 	header := titleStyle.Render("Slash · " + "/" + m.paletteFilter)
-	lines := []string{header, divider(width), mutedStyle.Render("  command     kind                       summary")}
+	// Two-column layout (command + summary). The earlier
+	// `kind` column was redundant — `→ run` / `→ enter arg:
+	// …` is implied by whether the command has args, and
+	// dropping the middle column frees ~28 columns for the
+	// summary text on narrow terminals so the operator can
+	// read the description without the trailing
+	// truncation eating the first two words.
+	lines := []string{header, divider(width), mutedStyle.Render("  command                summary")}
 	if total == 0 {
 		lines = append(lines, mutedStyle.Render("  (no commands match)"))
 	} else {
@@ -3873,6 +4083,12 @@ func (m model) renderSlashPalette(width int) string {
 		if idx < 0 || idx >= total {
 			idx = 0
 		}
+		// command column: 20 chars wide (covers `/profile`,
+		// `/compact`, `/inbox`, etc. plus the trailing space).
+		// Summary column gets the remainder of the row width
+		// and is truncated with `…` when it overflows.
+		const commandColumnWidth = 20
+		summaryWidth := max(8, width-commandColumnWidth-4)
 		remainingAbove := scrollOffset
 		if remainingAbove > 0 {
 			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", remainingAbove)))
@@ -3884,15 +4100,12 @@ func (m model) renderSlashPalette(width int) string {
 			if actualIdx == idx {
 				marker = "> "
 			}
-			hint := c.argHint
-			if c.prefix != "" {
-				hint = "→ inserts " + c.prefix
-			} else if c.hasArgs {
-				hint = "→ enter arg: " + c.argHint
-			} else {
-				hint = "→ run"
+			name := c.name
+			if len(name) < commandColumnWidth-1 {
+				name = name + strings.Repeat(" ", commandColumnWidth-1-len(name))
 			}
-			line := fmt.Sprintf("%s%-12s  %-26s  %s", marker, c.name, hint, mutedStyle.Render(c.summary))
+			summary := truncatePlain(c.summary, summaryWidth)
+			line := fmt.Sprintf("%s%s  %s", marker, name, mutedStyle.Render(summary))
 			if actualIdx == idx {
 				line = focusedLineStyle.Render(line)
 			}
@@ -4258,6 +4471,15 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		}
 		m.running = false
 		m.pending = nil
+		// Phase C of
+		// docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+		// exit `modePermission` so the next turn enters via the
+		// composing flow (not stuck in the permission panel with
+		// a stale `pending`). Without this, after a
+		// `tool_denied` / `result` sequence the model stays in
+		// `modePermission` and the textinput swallows
+		// non-a/y/n/r/esc keys.
+		m.setMode(modeComposing)
 		// Clear the transient usage snapshot so the footer
 		// drops the in-flight token counter when the turn ends.
 		m.latestUsage = nil
@@ -5189,11 +5411,11 @@ func fetchRuntimeProfiles(cfg Config) tea.Cmd {
 	}
 }
 
-func fetchRuntimeModels(cfg Config) tea.Cmd {
+func fetchRuntimeModels(cfg Config, trigger string) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeModelsResponse
 		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/models", nil, &payload)
-		return runtimeModelsMsg{response: payload, err: err}
+		return runtimeModelsMsg{response: payload, trigger: trigger, err: err}
 	}
 }
 
@@ -5816,6 +6038,25 @@ func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
 		policy = "soft-deny"
 	}
 	payload["policy"] = policy
+	// Phase D: emit per-turn `allowedTools` override when configured.
+	// Empty / unset: per-turn override off; the server-side startup
+	// policy applies. Scoped to this turn only; the next turn
+	// re-evaluates from the body. Each entry is comma-split (so
+	// programmatic Config.AllowTools can carry comma-laden values
+	// the same way the --allow-tools CLI flag does) and trimmed.
+	if len(cfg.AllowTools) > 0 {
+		allow := make([]any, 0, len(cfg.AllowTools))
+		for _, raw := range cfg.AllowTools {
+			for _, part := range strings.Split(raw, ",") {
+				if trimmed := strings.TrimSpace(part); trimmed != "" {
+					allow = append(allow, trimmed)
+				}
+			}
+		}
+		if len(allow) > 0 {
+			payload["allowedTools"] = allow
+		}
+	}
 	return payload
 }
 
