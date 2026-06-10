@@ -4214,25 +4214,17 @@ func (m model) renderModelPickProvider(width int) string {
 	if len(m.modelCatalog.Providers) == 0 {
 		lines = append(lines, mutedStyle.Render("  No providers reported by the current Nexus runtime."))
 	} else {
-		lines = append(lines, mutedStyle.Render("  provider                adapter                  default                status"))
-		// Compute column widths from the visible set so a
-		// longer default model id doesn't push the status
-		// column off the right edge on narrow terminals. Only
-		// expand — never shrink — so short values like
-		// `Local` keep their column padded and don't get
-		// truncated by their own width.
-		idWidth := 24
-		adapterWidth := 22
-		defaultWidth := 22
+		// Two-column layout: provider name + status. Drop
+		// the adapter / default model columns — the operator
+		// doesn't need them in the picker; they're surfaced
+		// later in the apiKey / baseURL / picker steps. The
+		// narrower table is also easier to scan on small
+		// terminals.
+		lines = append(lines, mutedStyle.Render("  provider                                            status"))
+		idWidth := 32
 		for _, p := range m.modelCatalog.Providers {
 			if v := visibleLen(p.DisplayName); v > idWidth {
 				idWidth = v
-			}
-			if v := visibleLen(p.Adapter); v > adapterWidth {
-				adapterWidth = v
-			}
-			if v := visibleLen(p.DefaultModel); v > defaultWidth {
-				defaultWidth = v
 			}
 		}
 		visibleRows := max(1, m.height-12)
@@ -4253,14 +4245,11 @@ func (m model) renderModelPickProvider(width int) string {
 			if actualIdx == m.modelPickProviderIdx {
 				marker = "> "
 			}
-			name := padRightPlain(p.DisplayName, idWidth)
-			adapter := padRightPlain(p.Adapter, adapterWidth)
-			defaultModel := padRightPlain(p.DefaultModel, defaultWidth)
 			status := "needs API key"
 			if p.Configured {
 				status = "configured"
 			}
-			row := fmt.Sprintf("%s%s  %s  %s  %s", marker, name, adapter, defaultModel, status)
+			row := fmt.Sprintf("%s%s  %s", marker, padRightPlain(p.DisplayName, idWidth), status)
 			if actualIdx == m.modelPickProviderIdx {
 				row = focusedLineStyle.Render(row)
 			}
