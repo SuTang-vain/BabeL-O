@@ -5641,12 +5641,35 @@ func joinColumns(width int, left string, right string) string {
 func wrapPlain(text string, width int) string {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	text = strings.ReplaceAll(text, "\r", "\n")
+	// Collapse runs of newlines down to a single space so the
+	// model-written paragraph break (\n\n) renders as a soft
+	// separator instead of a full blank line. Without this
+	// collapse, a sentence like "package.\n\njson 内容" was
+	// displayed as "package. [blank] json 内容" — the operator
+	// read that as the text being truncated mid-word. Joining
+	// the paragraphs with a single space keeps the visible
+	// sentence flow continuous while preserving the model's
+	// intent that the two halves belong to the same reply.
+	text = collapseParagraphBreaks(text)
 	paragraphs := strings.Split(text, "\n")
 	out := make([]string, 0, len(paragraphs))
 	for _, paragraph := range paragraphs {
 		out = append(out, wrapParagraph(paragraph, width)...)
 	}
 	return strings.Join(out, "\n")
+}
+
+// collapseParagraphBreaks replaces any run of two-or-more
+// newlines with a single space. Single newlines are kept
+// intact so the model can still produce hard line breaks.
+func collapseParagraphBreaks(text string) string {
+	for {
+		collapsed := strings.ReplaceAll(text, "\n\n", "\n ")
+		if collapsed == text {
+			return text
+		}
+		text = collapsed
+	}
 }
 
 // visualWidth returns the on-screen column count of a single
