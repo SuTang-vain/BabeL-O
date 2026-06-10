@@ -3755,6 +3755,11 @@ func (m model) renderHeader(width int) string {
 	if m.connected {
 		title = title + " " + statusStyle.Render("✓")
 	}
+	// Version suffix in muted gray so the operator can
+	// confirm the build they're running at a glance (bbl-go-tui
+	// was previously a separate subtitle row; the operator still
+	// wants the build tag visible, just inline with the title).
+	title = title + " " + mutedStyle.Render("v"+Version)
 	stateLabel := "idle"
 	stateKind := stateStyle(false, nil)
 	if m.running {
