@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { homedir } from 'node:os'
 import chalk from 'chalk'
 import { Command } from 'commander'
 import { DatabaseSync } from 'node:sqlite'
@@ -78,8 +79,7 @@ export function resolveConfigDir(): string {
   // Fall back to the user default (`~/.babel-o`) for non-test paths.
   // We avoid importing the module-level `DEFAULT_CONFIG_DIR` so
   // tests that mutate `BABEL_O_CONFIG_DIR` mid-process take effect.
-  const os = require('node:os') as typeof import('node:os')
-  return join(os.homedir(), '.babel-o')
+  return join(homedir(), '.babel-o')
 }
 
 /**
@@ -293,6 +293,20 @@ export function inspectSession(sessionId: string): InspectSessionTier {
     return { tier: 'found-in-sqlite', row }
   }
 
+  // Tier 1: client-session log reverse-lookup (Phase 3). If the
+  // operator passed a `session_go_<unixnano>` id, scan the
+  // client log to find the server-allocated `session_<uuid>`
+  // it maps to, then re-run the inspection against that uuid.
+  // This makes `bbl inspect-session session_go_1781146359507755000`
+  // "just work" when the embedded Nexus successfully persisted
+  // the session under its server-allocated uuid.
+  if (sessionId.startsWith('session_go_')) {
+    const serverId = reverseResolveClientSessionId(clientLogPath, sessionId)
+    if (serverId) {
+      return inspectSession(serverId)
+    }
+  }
+
   // Tier 2: client log mentions this sessionId but SQLite doesn't.
   // That matches the Phase 2 root cause: embedded Nexus died before
   // persisting.
@@ -308,6 +322,41 @@ export function inspectSession(sessionId: string): InspectSessionTier {
   // a recent-Nexus hint.
   const recentEmbeddedStarts = grepRecentEmbeddedNexusStarts(embeddedNexusLogPath)
   return { tier: 'not-found', clientHits: [], recentEmbeddedStarts }
+}
+
+/**
+ * Phase 3 reverse-resolve: given a `session_go_<unixnano>` client
+ * id, look it up in `~/.babel-o/log/go-tui-session.log` (the
+ * Phase 1 client-side mapping log written by
+ * `appendClientSessionLog`) and return the server-allocated
+ * `session_<uuid>` it maps to, or `null` if not found.
+ *
+ * Pure function: read-only, no I/O outside the given log path.
+ */
+export function reverseResolveClientSessionId(
+  clientLogPath: string,
+  clientSessionId: string,
+): string | null {
+  if (!existsSync(clientLogPath)) return null
+  let content: string
+  try {
+    content = readFileSync(clientLogPath, 'utf-8')
+  } catch {
+    return null
+  }
+  // Each line: `[RFC3339]\tclientSessionId=<id>\tserverSessionId=<id>`.
+  // We scan the file in reverse chronological order (newest first)
+  // because the most recent mapping is the most likely to be
+  // relevant. The log is small (a few lines per Go TUI session),
+  // so a linear scan is fine.
+  const lines = content.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]
+    if (!line.includes(`clientSessionId=${clientSessionId}`)) continue
+    const m = line.match(/serverSessionId=(\S+)/)
+    if (m) return m[1]
+  }
+  return null
 }
 
 export function registerInspectSessionCommand(program: Command): void {

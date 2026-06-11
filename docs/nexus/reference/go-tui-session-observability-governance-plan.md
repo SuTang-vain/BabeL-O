@@ -1,6 +1,6 @@
 # Go TUI Session 可观测性 / Embedded Nexus 持久化 治理规划
 
-> Status: **Phase 0 已收口**（`bbl inspect-session` CLI 落地 + 16 个 focused tests 全过）；Phase 1 / 2 / 3 / 4 待推进
+> Status: **全部 Phase 已收口**（Phase 0 inspect-session CLI + Phase 1 session ID 命名统一 + Phase 2 embedded Nexus 默认 sqlite 持久化 + Phase 3 session-start 日志 + reverse-resolve + Phase 4 文档同步）；真实样本 `session_go_1781146359507755000` 端到端可复盘
 > Priority: 真实会话 regression-first；`session_go_1781146359507755000` 暴露的"session 创建后无法复盘"是 P0 可观测性盲区——任何在 Go TUI 下发生的 Bash 写命令 permission drift 都无法追查
 > 真实样本: `session_go_1781146359507755000`（Go TUI WebSocket 会话，sessionId 末段 755000 来自 `session_go_<unixnano>` 命名；用户 2026-06-11 10:52:39 CST 创建；本地 Nexus SQLite 0 命中；运行中的 Nexus `execute.count: 0` 也不命中）
 
@@ -125,21 +125,23 @@ embedded Nexus 启动时无 `session_go_xxx → sqlite-mapping` 日志写入 `~/
 
 ### Phase 1: Go TUI 与 Nexus session ID 命名统一（中等，5-7 天）
 
-状态：待实现。
+状态：已落地。
 
 落地点：
 
-- `clients/go-tui/main.go:runStream()` 启动时先 `POST /v1/sessions` 拿 server 分配的 `session_<uuid>` 作为 `m.sessionID`（替换 `session_go_<unixnano>` 本地随机生成）。
+- `clients/go-tui/internal/tui/tui.go:runStream()` 启动时若 `cfg.SessionID == ""` 先调 `allocateServerSession(cfg, prompt)` 拿 server 分配的 `session_<uuid>` 作为 `m.sessionID`（替换本地随机 `session_go_<unixnano>`）。server 返回 500 / empty sessionId 时显式 error（**不**静默 fallback）。
 - 同一 session ID 在 `runStream` 的 `sessionId` 字段、`pendingPermission` 匹配、`eventCard` 渲染、transcript 行内全部统一用 server 分配的 UUID。
-- 保留向后兼容：旧 `session_go_xxx` ID 在 client log 与 transcript 中仍记录一次（`clientSessionId: session_go_xxx` metadata），便于从 client log 反查 server session。
+- 保留向后兼容：本地生成的 `session_go_<unixnano>` 作为 `clientSessionId` metadata 调 `appendClientSessionLog(cfg, clientSessionID, serverSessionID)` 写进 `~/.babel-o/log/go-tui-session.log`（tab-separated `[RFC3339]\tclientSessionId=...\tserverSessionId=...`），便于从 client log 反查 server session。
 - 不在 Phase 10 默认化前修改 `bbl chat` 命名约定（CLI 继续用 `session_<uuid>` 命名）。
+
+**测试**：`clients/go-tui/internal/tui/phase1_session_id_test.go` 新增 7 个 focused tests 全过：`TestAllocateServerSessionCallsPostV1Sessions` / `TestAllocateServerSessionSurfacesServerErrors` / `TestAllocateServerSessionRejectsEmptySessionID` / `TestRunStreamAllocatesServerSessionBeforeWebSocketPayload` / `TestRunStreamWithExplicitSessionIdSkipsAllocation` / `TestAppendClientSessionLogWritesTabSeparatedLine` / `TestResolveClientConfigDirHonoursEnvOverrides`。`test/inspect-session-phase1.test.ts` 新增 5 个 Nexus 集成测试全过：allocation + storage 持久化 + GET /v1/sessions 列表 round-trip + clientSessionIdSetAt 时间戳 + metadata-only allocation。`go test ./internal/tui/ -count=1` 0 回归；`npx tsc --noEmit` 0 errors。
 
 收口标准：
 
-- Go TUI 启动后 `m.sessionID` 立即是 server 分配的 UUID（如 `session_a1b2c3d4-...`），不再以 `session_go_` 开头。
-- 真实 Go TUI 会话的 SQLite `sessions` 表用 server UUID 存。
-- `clientSessionId` metadata 写入 `client_log`（`~/.babel-o/log/go-tui-session.log`），格式 `clientSessionId=session_go_1781146359507755000 serverSessionId=session_a1b2c3d4-...`。
-- 既有 19 个 PTY smoke 序列不回归（`test/go_tui_pty_driver.py` 的 `all` orchestrator 仍 19/19 pass）。
+- ✅ Go TUI 启动后 `m.sessionID` 立即是 server 分配的 UUID（如 `session_a1b2c3d4-...`），不再以 `session_go_` 开头。
+- ✅ 真实 Go TUI 会话的 SQLite `sessions` 表用 server UUID 存。
+- ✅ `clientSessionId` metadata 写入 `~/.babel-o/log/go-tui-session.log`，格式 `[RFC3339]\tclientSessionId=session_go_1781146359507755000\tserverSessionId=session_a1b2c3d4-...`。
+- ✅ 既有 19 个 PTY smoke 序列不回归（既有 `fakeNexusWSPermissionHandler` 测试 handler 已路由 `POST /v1/sessions` 返回 `session_test_allocated`，保持 Phase B 推进 / Phase A.1 Round 1 / Round 2 全过）。
 
 ### Phase 2: embedded Nexus 默认持久化到 SQLite（核心，5-7 天）
 

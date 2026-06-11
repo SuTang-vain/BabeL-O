@@ -3456,28 +3456,13 @@ func (m model) renderHelp(width int) string {
 	if m.inputMode != modeHelpOverlay {
 		return ""
 	}
-	header := titleStyle.Render("Help")
-	lines := []string{header, divider(width)}
-	// Clamp helpScroll so the user can't scroll past the end.
-	visibleRows := max(0, m.height-12)
-	maxScroll := max(0, len(helpOverlayLines)-visibleRows)
-	if m.helpScroll > maxScroll {
-		// Don't mutate model in a View path; clamp locally for the
-		// rendered slice. The next key event will reconcile m.helpScroll.
-		clamped := maxScroll
-		end := clamped + visibleRows
-		if end > len(helpOverlayLines) {
-			end = len(helpOverlayLines)
-		}
-		lines = append(lines, helpOverlayLines[clamped:end]...)
-	} else {
-		end := m.helpScroll + visibleRows
-		if end > len(helpOverlayLines) {
-			end = len(helpOverlayLines)
-		}
-		lines = append(lines, helpOverlayLines[m.helpScroll:end]...)
-	}
-	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	// Phase C.2: structure migration to the Dialog system.
+	// helpDialog.View produces the same layout as the pre-migration
+	// inline rendering (title + divider + visible window, all
+	// wrapped in overlayFrameStyle). Existing key handling stays in
+	// the modeHelpOverlay case of Update — see help_dialog.go for
+	// the migration rationale.
+	return newHelpDialog(m.helpScroll, m.height).View(width)
 }
 
 // renderProfileConfirm paints the y/n confirmation overlay for a

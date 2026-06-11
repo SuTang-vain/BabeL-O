@@ -123,20 +123,20 @@ await app.listen({ host, port })
 // `BABEL_O_CONFIG_DIR` to a read-only path). We never throw from
 // here because it would prevent Nexus from starting.
 try {
-  const { resolveDefaultStoragePath } = await import('./createRuntime.js')
+  const { mkdirSync, appendFileSync } = await import('node:fs')
+  const { dirname, join } = await import('node:path')
+  const { homedir } = await import('node:os')
   const resolved = resolveDefaultStoragePath(storagePath)
   const storageKindLabel = resolved.kind === 'sqlite' ? resolved.path : resolved.kind
   const policyMode = process.env.BABEL_O_NEXUS_DEFAULT_POLICY_MODE ?? 'strict'
   // ISO 8601 with timezone offset, RFC3339.
   const startedAt = new Date().toISOString()
   const configDir = process.env.BABEL_O_CONFIG_DIR
-    ?? (process.env.BABEL_O_CONFIG_FILE
-      ? require('node:path').dirname(process.env.BABEL_O_CONFIG_FILE)
-      : require('node:path').join(require('node:os').homedir(), '.babel-o'))
-  const logPath = require('node:path').join(configDir, 'log', 'embedded-nexus.log')
+    ?? (process.env.BABEL_O_CONFIG_FILE ? dirname(process.env.BABEL_O_CONFIG_FILE) : join(homedir(), '.babel-o'))
+  const logPath = join(configDir, 'log', 'embedded-nexus.log')
   const line = `[${startedAt}] nexus[pid=${process.pid}] listen=http://${host}:${port} storage=${storageKindLabel} executePolicyMode=${policyMode} cwd=${cwd}\n`
-  require('node:fs').mkdirSync(require('node:path').dirname(logPath), { recursive: true })
-  require('node:fs').appendFileSync(logPath, line, 'utf-8')
+  mkdirSync(dirname(logPath), { recursive: true })
+  appendFileSync(logPath, line, 'utf-8')
 } catch {
   // Best-effort: never block Nexus startup on log-write failure.
 }

@@ -13,7 +13,9 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/gorilla/websocket"
+	"github.com/muesli/termenv"
 )
 
 func TestStreamURL(t *testing.T) {
@@ -6896,4 +6898,293 @@ func makeTranscriptForBench(n, width int) []*transcriptItem {
 		})
 	}
 	return out
+}
+
+// fakeDialog is a minimal Dialog used by the RenderContext /
+// InputCursor tests. It returns canned values for ID() and
+// View(), and a no-op HandleMsg. The point of these tests is
+// to exercise the RenderContext builder and the InputCursor
+// helper, not to drive the full dialog flow.
+type fakeDialog struct {
+	id      string
+	view    string
+	cmdSeen int
+}
+
+func (f *fakeDialog) ID() string                  { return f.id }
+func (f *fakeDialog) HandleMsg(_ tea.Msg) tea.Cmd { f.cmdSeen++; return nil }
+func (f *fakeDialog) View(_ int) string           { return f.view }
+
+// TestDialogInterfaceImplements: a smoke check that the
+// Dialog interface is satisfied by a value with the three
+// required methods. The compiler enforces this; the test
+// pins the contract down so future refactors don't
+// accidentally drop a method.
+func TestDialogInterfaceImplements(t *testing.T) {
+	var d Dialog = &fakeDialog{id: "fake", view: "body"}
+	if d.ID() != "fake" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "fake")
+	}
+	if d.View(80) != "body" {
+		t.Fatalf("View(80) = %q, want %q", d.View(80), "body")
+	}
+	if d.HandleMsg(tea.KeyMsg{Type: tea.KeyEnter}) != nil {
+		t.Fatalf("HandleMsg should return nil for a no-op fake")
+	}
+}
+
+// TestRenderContextRendersTitleBodyHelp: the canonical
+// 3-part dialog (title + body + help) produces all three
+// pieces in the expected order, separated by newlines.
+func TestRenderContextRendersTitleBodyHelp(t *testing.T) {
+	rc := NewRenderContext(80)
+	rc.Title = "Editing rule for Bash"
+	rc.AddPart("rule line")
+	rc.AddPart("hint line")
+	rc.Help = "↵ confirm  esc back"
+	out := rc.Render()
+	for _, want := range []string{"Editing rule for Bash", "rule line", "hint line", "↵ confirm  esc back"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("Render() missing %q\nfull:\n%s", want, out)
+		}
+	}
+}
+
+// TestRenderContextTitleInfoRightAligned: TitleInfo renders
+// on the same row as Title, right-aligned via joinColumns.
+// We assert the title and the titleInfo both appear in the
+// output (their exact column positions depend on
+// joinColumns' implementation; we just check both surface).
+func TestRenderContextTitleInfoRightAligned(t *testing.T) {
+	rc := NewRenderContext(80)
+	rc.Title = "step 1"
+	rc.TitleInfo = "1/3"
+	out := rc.Render()
+	if !strings.Contains(out, "step 1") {
+		t.Fatalf("missing title %q in %q", "step 1", out)
+	}
+	if !strings.Contains(out, "1/3") {
+		t.Fatalf("missing titleInfo %q in %q", "1/3", out)
+	}
+}
+
+// TestRenderContextEmptyTitleSkipsTitleRow: when Title is
+// empty the output should not contain an empty leading
+// line — useful for overlays like the help card that don't
+// need a title.
+func TestRenderContextEmptyTitleSkipsTitleRow(t *testing.T) {
+	rc := NewRenderContext(80)
+	rc.AddPart("body only")
+	rc.Help = "esc back"
+	out := rc.Render()
+	if strings.HasPrefix(out, "\n") {
+		t.Fatalf("output should not start with newline, got %q", out)
+	}
+	if !strings.Contains(out, "body only") {
+		t.Fatalf("missing body %q in %q", "body only", out)
+	}
+}
+
+// TestRenderContextEmptyHelpSkipsHelpRow: when Help is
+// empty (some dialogs have no key hints) the output should
+// not contain a trailing empty line.
+func TestRenderContextEmptyHelpSkipsHelpRow(t *testing.T) {
+	rc := NewRenderContext(80)
+	rc.Title = "only title"
+	rc.AddPart("body")
+	out := rc.Render()
+	if strings.HasSuffix(out, "\n") {
+		t.Fatalf("output should not end with newline, got %q", out)
+	}
+}
+
+// TestRenderContextEmptyInputProducesEmptyOutput: defensive
+// — when nothing is added (no title, no body, no help), the
+// result is an empty string. The main model's overlay stack
+// relies on this to skip rendering a "ghost" dialog.
+func TestRenderContextEmptyInputProducesEmptyOutput(t *testing.T) {
+	rc := NewRenderContext(80)
+	if got := rc.Render(); got != "" {
+		t.Fatalf("empty RenderContext should produce empty string, got %q", got)
+	}
+}
+
+// TestInputCursorAccountsForTitleAndPrompt: a dialog with
+// a title + a "> " prompt input box should land the cursor
+// at (x0 + 2, y0 + 2) — one row down for the title, one
+// row down for the frame top border, two columns right for
+// the "> " prompt.
+func TestInputCursorAccountsForTitleAndPrompt(t *testing.T) {
+	x, y := InputCursor(0, 0, true /*hasTitle*/, ">  Ask BabeL-O")
+	if x != 2 {
+		t.Fatalf("x = %d, want 2 (x0 + 2 for the prompt)", x)
+	}
+	if y != 2 {
+		t.Fatalf("y = %d, want 2 (y0 + 1 title + 1 frame top)", y)
+	}
+}
+
+// TestInputCursorNoTitleStillAddsFrameBorder: a dialog
+// without a title still gets the +1 for the frame's top
+// border. Cursor lands at (x0 + 2, y0 + 1).
+func TestInputCursorNoTitleStillAddsFrameBorder(t *testing.T) {
+	x, y := InputCursor(0, 0, false /*no title*/, ">  Ask BabeL-O")
+	if x != 2 {
+		t.Fatalf("x = %d, want 2", x)
+	}
+	if y != 1 {
+		t.Fatalf("y = %d, want 1 (no title, just the frame border)", y)
+	}
+}
+
+// TestInputCursorNoPrompt: an input view that doesn't start
+// with a recognised prompt should land at x=x0 (no prompt
+// width added).
+func TestInputCursorNoPrompt(t *testing.T) {
+	x, y := InputCursor(5, 5, true, "no prompt here")
+	if x != 5 {
+		t.Fatalf("x = %d, want 5 (no prompt)", x)
+	}
+	if y != 7 {
+		t.Fatalf("y = %d, want 7 (5 + 1 title + 1 frame)", y)
+	}
+}
+
+// === Phase C.2: helpDialog (renderHelp migration) ===
+
+// TestHelpDialogIDIsHelpOverlay: the dialog's stable id must
+// match the modeHelpOverlay inputMode constant so logs and
+// tests can correlate the overlay frame with its mode.
+func TestHelpDialogIDIsHelpOverlay(t *testing.T) {
+	d := newHelpDialog(0, 24)
+	if d.ID() != "helpOverlay" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "helpOverlay")
+	}
+}
+
+// TestHelpDialogHandleMsgIsNoOp: per C.2 (structure migration
+// only) HandleMsg must return nil for every msg type. The main
+// model still owns helpScroll mutation via its Update dispatch;
+// C.3 will move that logic into HandleMsg.
+func TestHelpDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newHelpDialog(0, 24)
+	if cmd := d.HandleMsg(nil); cmd != nil {
+		t.Fatalf("HandleMsg(nil) cmd = %v, want nil", cmd)
+	}
+	if cmd := d.HandleMsg(tea.KeyMsg{Type: tea.KeyDown}); cmd != nil {
+		t.Fatalf("HandleMsg(KeyDown) cmd = %v, want nil", cmd)
+	}
+}
+
+// TestHelpDialogViewContainsTitleAndFirstLine: the canonical
+// case — a fresh dialog at scroll=0 must render the "Help"
+// title and the first helpOverlayLines entry. This is the
+// substring contract that TestRenderHelpVisibleInHelpMode
+// relies on.
+func TestHelpDialogViewContainsTitleAndFirstLine(t *testing.T) {
+	d := newHelpDialog(0, 30) // height=30 → visibleRows=18, enough for the first line
+	out := d.View(80)
+	if !strings.Contains(out, "Help") {
+		t.Fatalf("View(80) missing 'Help' title:\n%s", out)
+	}
+	if !strings.Contains(out, helpOverlayLines[0]) {
+		t.Fatalf("View(80) missing first helpOverlayLine %q:\n%s", helpOverlayLines[0], out)
+	}
+}
+
+// TestHelpDialogViewHonorsScroll: scroll=N must skip the first
+// N lines of helpOverlayLines. We check that the line at index
+// 0 no longer appears (it was scrolled past) and the line at
+// index N appears.
+func TestHelpDialogViewHonorsScroll(t *testing.T) {
+	// Pick a non-empty line further down to avoid the leading
+	// blank entries that would match an empty substring.
+	scroll := 4
+	target := ""
+	for i := scroll; i < len(helpOverlayLines); i++ {
+		if strings.TrimSpace(helpOverlayLines[i]) != "" {
+			target = helpOverlayLines[i]
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("no non-empty line after scroll point — helpOverlayLines shape changed?")
+	}
+	d := newHelpDialog(scroll, 30)
+	out := d.View(80)
+	if !strings.Contains(out, target) {
+		t.Fatalf("View at scroll=%d missing %q:\n%s", scroll, target, out)
+	}
+	// helpOverlayLines[0] is "BabeL-O Go TUI · Local key reference" —
+	// scrolling past it should drop it from the visible window.
+	if strings.Contains(out, helpOverlayLines[0]) {
+		t.Fatalf("View at scroll=%d still shows helpOverlayLines[0] %q:\n%s",
+			scroll, helpOverlayLines[0], out)
+	}
+}
+
+// TestHelpDialogViewClampsScrollPastEnd: scroll values far
+// beyond the maximum must clamp to maxScroll (rather than
+// panicking or returning empty). The dialog should still
+// render — showing the tail of helpOverlayLines.
+func TestHelpDialogViewClampsScrollPastEnd(t *testing.T) {
+	d := newHelpDialog(9999, 30)
+	out := d.View(80)
+	if out == "" {
+		t.Fatalf("View at scroll=9999 returned empty output")
+	}
+	// The very last line is the "Press esc / enter / q" footer
+	// hint — at clamped scroll, it should be visible.
+	last := helpOverlayLines[len(helpOverlayLines)-1]
+	if !strings.Contains(out, last) {
+		t.Fatalf("View at scroll=9999 missing last line %q:\n%s", last, out)
+	}
+}
+
+// TestHelpDialogViewClampsNegativeScroll: negative scroll
+// values must clamp to 0 (paranoid defence — the main model
+// never sets negative, but a future caller might).
+func TestHelpDialogViewClampsNegativeScroll(t *testing.T) {
+	d := newHelpDialog(-5, 30)
+	out := d.View(80)
+	if !strings.Contains(out, helpOverlayLines[0]) {
+		t.Fatalf("View at scroll=-5 missing helpOverlayLines[0] %q:\n%s",
+			helpOverlayLines[0], out)
+	}
+}
+
+// TestHelpDialogViewWrapsInOverlayFrame: the rendered output
+// must be wrapped in the overlayFrameStyle border. We detect
+// the border by looking for the box-drawing characters
+// lipgloss.NormalBorder() emits (the corner glyphs ┌ ┐ └ ┘).
+func TestHelpDialogViewWrapsInOverlayFrame(t *testing.T) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(termenv.Ascii) })
+	d := newHelpDialog(0, 30)
+	out := d.View(80)
+	for _, glyph := range []string{"┌", "┐", "└", "┘"} {
+		if !strings.Contains(out, glyph) {
+			t.Fatalf("View missing border glyph %q:\n%s", glyph, out)
+		}
+	}
+}
+
+// TestRenderHelpStillDelegatesToHelpDialog: model.renderHelp
+// in helpOverlay mode must produce the same output as
+// helpDialog.View(width) with the model's snapshot. This is a
+// regression guard for the C.2 migration: if someone reverts
+// renderHelp to inline rendering, the two outputs would
+// diverge.
+func TestRenderHelpStillDelegatesToHelpDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 24
+	m.setMode(modeHelpOverlay)
+	m.helpScroll = 3
+	got := m.renderHelp(80)
+	want := newHelpDialog(3, 24).View(80)
+	if got != want {
+		t.Fatalf("renderHelp(80) diverges from helpDialog.View(80):\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
 }

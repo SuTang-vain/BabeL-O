@@ -21,5 +21,12 @@ jobs:
       - run: npm run typecheck
       - run: npm run format:check
       - run: npm run deps:audit
-      - run: npm test
+      - name: Run npm test
+        shell: bash
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/babel-o-npm-test.log
+      - name: Print npm test failure tail
+        if: failure()
+        run: tail -200 /tmp/babel-o-npm-test.log || true
       - run: npm run build:smoke
