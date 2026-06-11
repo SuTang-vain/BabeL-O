@@ -3,6 +3,7 @@ import { eventBase, type NexusEvent } from '../shared/events.js'
 import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool, ToolRisk } from '../tools/Tool.js'
+import { classifyBashRisk, tokenizeBashCommand } from '../tools/builtin/bashClassifier.js'
 import type { NexusTask } from '../shared/task.js'
 import type {
   NexusRuntime,
@@ -827,18 +828,21 @@ function normalizeToolName(name: string): string {
  * risk classification.
  */
 export function deriveBashSuggestedRule(input: unknown): string | undefined {
-  if (!input || typeof input !== 'object' || !('command' in input)) {
-    return undefined
+  const command = getBashCommand(input)
+  if (!command) return undefined
+  const tokens = tokenizeBashCommand(command)
+  if (tokens.length === 0) return undefined
+  const [head] = tokens
+  const normalizedHead = head.toLowerCase()
+  const bashRisk = classifyBashRisk(command)
+
+  if (normalizedHead === 'sed') {
+    return bashRisk.kind === 'read' ? 'bash:sed-read' : 'bash:*'
   }
-  const command = (input as { command: unknown }).command
-  if (typeof command !== 'string' || command.trim() === '') {
-    return undefined
+  if (normalizedHead === 'grep') {
+    return bashRisk.kind === 'read' ? 'bash:grep-read' : 'bash:*'
   }
-  const tokens = command.trim().split(/\s+/).filter(t => t.length > 0)
-  if (tokens.length === 0) {
-    return undefined
-  }
-  const head = tokens[0].toLowerCase()
+
   // Per-subcommand granularity for known subcommand-style tools.
   // Empty Set means "any subcommand of this command".
   const BASH_SUB_RULES: Record<string, Set<string> | null> = {
@@ -864,22 +868,23 @@ export function deriveBashSuggestedRule(input: unknown): string | undefined {
     top: new Set(),
     uptime: new Set(),
   }
-  if (Object.prototype.hasOwnProperty.call(BASH_SUB_RULES, head)) {
-    const subs = BASH_SUB_RULES[head]
+  if (Object.prototype.hasOwnProperty.call(BASH_SUB_RULES, normalizedHead)) {
+    const subs = BASH_SUB_RULES[normalizedHead]
     if (subs !== null) {
       // Find first non-flag token to use as the subcommand.
       const sub = tokens.slice(1).find(t => !t.startsWith('-'))
       if (sub && subs.has(sub)) {
-        return `${head}:${sub}`
+        return bashRisk.kind === 'read' ? `${normalizedHead}:${sub}` : 'bash:*'
       }
       if (sub && !subs.has(sub)) {
         // Subcommand is known-dangerous (e.g. `git push`); still
         // suggest a default rule so the user can decide.
-        return `${head}:${sub}`
+        return `${normalizedHead}:${sub}`
       }
     }
-    return `${head}:*`
+    return bashRisk.kind === 'read' ? `${normalizedHead}:*` : 'bash:*'
   }
+
   // Fall back to the whole tool (any arguments) when the command
   // is something we don't model in the classifier.
   return `bash:*`
@@ -915,27 +920,54 @@ export function buildSessionRulesPolicy(rules: readonly string[]): ToolPolicy {
       // name canonical: `Bash` → `bash`, `Write` → `write`.
       const toolNeedle = (tool.suggestedAllowRule ?? tool.name).toLowerCase()
       const inputBlob = safeStringify(input).toLowerCase()
+      const derivedRule = tool.name === 'Bash' ? deriveBashSuggestedRule(input)?.toLowerCase() : undefined
       return normalised.some(rule => {
         const lower = rule.toLowerCase()
-        // Two match modes:
-        //  1. `tool:command` rules (e.g. `git:status`): both the
-        //     tool part and the command part must be present.
-        //  2. Bare rules (e.g. `bash:*`, or whole tool name):
-        //     just substring match on the input blob.
-        if (lower.includes(':')) {
-          const [toolPart, ...rest] = lower.split(':')
-          const cmdPart = rest.join(':')
-          if (toolPart !== toolNeedle) return false
-          if (cmdPart === '*' || cmdPart === '') return true
-          return inputBlob.includes(cmdPart)
-        }
-        return inputBlob.includes(lower) || toolNeedle.includes(lower)
+        if (matchesStructuredSessionRule(lower, toolNeedle, derivedRule)) return true
+        return matchesLegacySessionRule(lower, toolNeedle, inputBlob)
       })
     },
     describe() {
       return { mode: 'session_rules', allowedTools: [...normalised] }
     },
   }
+}
+
+function matchesStructuredSessionRule(
+  rule: string,
+  toolNeedle: string,
+  derivedRule: string | undefined,
+): boolean {
+  if (!rule.includes(':')) return false
+  const [toolPart, ...rest] = rule.split(':')
+  const rulePart = rest.join(':')
+  if (toolPart === 'bash') {
+    if (!derivedRule) return false
+    if (rulePart === '*' || rulePart === '') return true
+    return derivedRule === rule
+  }
+  if (derivedRule && derivedRule === rule) return true
+  if (toolPart !== toolNeedle) return false
+  return rulePart === '*' || rulePart === ''
+}
+
+function matchesLegacySessionRule(rule: string, toolNeedle: string, inputBlob: string): boolean {
+  if (rule.includes(':')) {
+    const [toolPart, ...rest] = rule.split(':')
+    const commandPart = rest.join(':')
+    if (toolPart !== toolNeedle) return false
+    if (commandPart === '*' || commandPart === '') return true
+    return inputBlob.includes(commandPart)
+  }
+  return inputBlob.includes(rule) || toolNeedle.includes(rule)
+}
+
+function getBashCommand(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object' || !('command' in input)) return undefined
+  const command = (input as { command: unknown }).command
+  if (typeof command !== 'string') return undefined
+  const trimmed = command.trim()
+  return trimmed.length > 0 ? trimmed : undefined
 }
 
 /**

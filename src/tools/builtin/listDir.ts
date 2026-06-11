@@ -66,6 +66,7 @@ export const listDirTool: ToolDefinition<typeof inputSchema> = {
     'Set maxDepth to 1 for direct children or 2 for one nested level; never use maxDepth 3 or higher.',
     'Use Glob for pattern-based file discovery across paths, Grep for locating text inside files, and Read for understanding file contents.',
     'Prefer ListDir over Bash ls/find/tree for directory inventory because it is workspace-safe, depth-limited, structured, and auto-approved as read-only.',
+    'For ordinary source inspection, pair ListDir with Grep and Read instead of Bash sed/head/grep pipelines.',
   ].join(' '),
   risk: 'read',
   inputSchema,

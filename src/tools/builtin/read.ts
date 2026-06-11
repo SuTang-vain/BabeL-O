@@ -38,7 +38,7 @@ const inputSchema = z.object({
 export const readTool: ToolDefinition<typeof inputSchema> = {
   name: 'Read',
   description: 'Read a text file inside the workspace.',
-  prompt: () => 'Read is the source-understanding tool for file contents. Use Read only after you know the file path, with offset/limit for targeted ranges and mode="preview" for large files. Use ListDir for directory inventory, Glob for pattern-based file discovery, and Grep for locating text before reading relevant ranges.',
+  prompt: () => 'Read is the source-understanding tool for file contents. Use Read only after you know the file path, with offset/limit for targeted ranges and mode="preview" for large files. Prefer Read over Bash cat, sed -n, head, or tail for ordinary source code reading. Use ListDir for directory inventory, Glob for pattern-based file discovery, and Grep for locating text before reading relevant ranges.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {

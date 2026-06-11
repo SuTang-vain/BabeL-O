@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
+import { buildSystemPromptSections } from '../src/runtime/systemPromptBuilder.js'
 
 describe('Tool prompt()', () => {
   test('every builtin tool has a prompt() that returns non-empty string longer than description', async () => {
@@ -30,5 +31,37 @@ describe('Tool prompt()', () => {
         `Tool ${tool.name} prompt() is identical to description`,
       )
     }
+  })
+
+  test('source inspection guidance discourages Bash sed grep head', async () => {
+    const registry = await createDefaultToolRegistry()
+    const bashPrompt = registry.get('Bash')!.prompt!()
+    const readPrompt = registry.get('Read')!.prompt!()
+    const grepPrompt = registry.get('Grep')!.prompt!()
+    const listDirPrompt = registry.get('ListDir')!.prompt!()
+
+    assert.match(bashPrompt, /Do NOT use Bash for ordinary source code reading/)
+    assert.match(bashPrompt, /sed -n/)
+    assert.match(bashPrompt, /grep \| head/)
+    assert.match(bashPrompt, /Read with offset\/limit/)
+    assert.match(bashPrompt, /Grep to locate text/)
+    assert.match(bashPrompt, /ListDir for directory inventory/)
+
+    assert.match(readPrompt, /Prefer Read over Bash cat, sed -n, head, or tail/)
+    assert.match(grepPrompt, /prefer it over Bash grep, rg, or grep \| head/)
+    assert.match(listDirPrompt, /pair ListDir with Grep and Read instead of Bash sed\/head\/grep pipelines/)
+  })
+
+  test('system prompt pins source inspection tool boundaries', () => {
+    const toolUsage = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+    }).find(section => section.id === 'tool_usage')
+
+    assert.ok(toolUsage)
+    assert.match(toolUsage!.content, /ordinary source code inspection/)
+    assert.match(toolUsage!.content, /do NOT use Bash commands such as sed, head, grep, rg, or shell pipelines/)
+    assert.match(toolUsage!.content, /use Grep instead of grep, rg, or grep \| head/)
+    assert.match(toolUsage!.content, /use Read instead of cat, sed -n, head, or tail/)
   })
 })

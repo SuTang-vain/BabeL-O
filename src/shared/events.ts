@@ -152,6 +152,17 @@ export const ExecuteSummaryEventSchema = z.object({
   outcome: z.enum(['success', 'error', 'cancelled', 'timeout']),
 })
 
+export const NearTimeoutWarningEventSchema = z.object({
+  type: z.literal('near_timeout_warning'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  timeoutMs: z.number().int().positive(),
+  elapsedMs: z.number().nonnegative(),
+  thresholdRatio: z.number(),
+  partialSummary: z.string().optional(),
+  message: z.string(),
+})
+
 export const TaskSessionEventSchema = z.object({
   type: z.literal('task_session_event'),
   schemaVersion: z.literal(NEXUS_EVENT_SCHEMA_VERSION),
@@ -413,6 +424,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
   ExecuteSummaryEventSchema,
+  NearTimeoutWarningEventSchema,
 ])
 
 export type NexusEvent = z.infer<typeof NexusEventSchema>

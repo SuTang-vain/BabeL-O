@@ -19,13 +19,16 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/charmbracelet/bubbles/spinner"
-	"github.com/charmbracelet/bubbles/textarea"
-	"github.com/charmbracelet/bubbles/viewport"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/bubbles/v2/textarea"
+	"charm.land/bubbles/v2/viewport"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
+	"github.com/charmbracelet/x/term"
 	"github.com/gorilla/websocket"
 	"github.com/mattn/go-runewidth"
+	"github.com/sahilm/fuzzy"
 )
 
 type Config struct {
@@ -71,6 +74,10 @@ type streamEventMsg struct {
 
 type streamClosedMsg struct{}
 
+type copyToastExpiredMsg struct {
+	copiedAt time.Time
+}
+
 type streamEvent struct {
 	payload map[string]any
 	err     error
@@ -91,9 +98,9 @@ type permissionDecision struct {
 	//   - feedback: free-form text the model should act on
 	//     (typically paired with approved=false for the
 	//     "Reject, tell the model what to do instead" path).
-	scope     string
-	rule      string
-	feedback  string
+	scope    string
+	rule     string
+	feedback string
 }
 
 type pendingPermission struct {
@@ -107,6 +114,16 @@ type pendingPermission struct {
 	// "git:status"). Surfaced from the runtime's
 	// `permission_request` event's `suggestedRule` field.
 	suggestedRule string
+	// Phase 3 of docs/nexus/reference/go-tui-tool-permission-timeout-optimization-plan.md:
+	// repeatedRuleCount is the number of times this same suggestedRule
+	// has appeared in a short recent window, including the current
+	// request. Values >1 nudge the operator toward session approval.
+	repeatedRuleCount int
+}
+
+type permissionRuleSeen struct {
+	count int
+	last  time.Time
 }
 
 type runtimeCapabilities struct {
@@ -166,7 +183,9 @@ type transcriptItem struct {
 	kind string
 	text string
 	*Versioned
-	cache renderCache
+	baseHighlightable
+	cache         renderCache
+	markdownCache streamingMarkdownCache
 }
 
 type runtimeConfigMsg struct {
@@ -799,23 +818,26 @@ type runtimeVersionMsg struct {
 // always round-trip back to modeComposing when an overlay closes.
 type inputMode string
 
+const repeatedPermissionRuleWindow = 2 * time.Minute
+
 const (
-	modeComposing        inputMode = "composing"        // textinput owns keys
-	modePermission       inputMode = "permission"       // a/y/r/n/esc only
-	modeSlashPick        inputMode = "slashPick"        // one-shot slash palette (no live filter yet)
-	modeHelpOverlay      inputMode = "helpOverlay"      // read-only help; up/down/esc/enter
-	modeProfileConfirm   inputMode = "profileConfirm"   // y/n/esc only; gates selectRuntimeProfile
-	modeContextOverlay   inputMode = "contextOverlay"   // read-only context analysis; up/down/esc/enter
-	modeInboxOverlay     inputMode = "inboxOverlay"     // read-only SessionChannel inbox; up/down/a/esc/enter/q
-	modeAgentOverlay     inputMode = "agentOverlay"     // read-only multi-agent status; up/down/esc/enter/q
-	modeTaskBoard        inputMode = "taskBoard"        // read-only task board; up/down/esc/enter/q
-	modeActivityOverlay  inputMode = "activityOverlay"  // read-only recent activity; up/down/esc/enter/q
-	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
-	modeModelOverlay     inputMode = "modelOverlay"     // read-only model config/catalog; up/down/esc/enter/q
+	modeComposing         inputMode = "composing"         // textinput owns keys
+	modePermission        inputMode = "permission"        // a/y/r/n/esc only
+	modeSlashPick         inputMode = "slashPick"         // one-shot slash palette (no live filter yet)
+	modeHelpOverlay       inputMode = "helpOverlay"       // read-only help; up/down/esc/enter
+	modeProfileConfirm    inputMode = "profileConfirm"    // y/n/esc only; gates selectRuntimeProfile
+	modeContextOverlay    inputMode = "contextOverlay"    // read-only context analysis; up/down/esc/enter
+	modeInboxOverlay      inputMode = "inboxOverlay"      // read-only SessionChannel inbox; up/down/a/esc/enter/q
+	modeAgentOverlay      inputMode = "agentOverlay"      // read-only multi-agent status; up/down/esc/enter/q
+	modeTaskBoard         inputMode = "taskBoard"         // read-only task board; up/down/esc/enter/q
+	modeActivityOverlay   inputMode = "activityOverlay"   // read-only recent activity; up/down/esc/enter/q
+	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
+	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
 	modeModelPickProvider inputMode = "modelPickProvider" // /model step 1: provider select
-	modeModelPickApiKey  inputMode = "modelPickApiKey"  // /model step 2: API key entry
-	modeModelPickBaseURL inputMode = "modelPickBaseURL" // /model step 3: base URL entry
-	modeModelPickModel   inputMode = "modelPickModel"   // /model step 4: model select
+	modeModelPickApiKey   inputMode = "modelPickApiKey"   // /model step 2: API key entry
+	modeModelPickBaseURL  inputMode = "modelPickBaseURL"  // /model step 3: base URL entry
+	modeModelPickModel    inputMode = "modelPickModel"    // /model step 4: model select
+	modeQuitConfirm       inputMode = "quitConfirm"       // y/enter confirms quit, esc/n cancels
 	// Phase A.1 Round 2 of the enhanced permission panel:
 	// inline text editors reached from the 5-option panel.
 	//   - modePermissionEditRule: textinput owns keys; pre-filled
@@ -857,6 +879,11 @@ const (
 	compactModeHeightBreakpoint = 30
 )
 
+const (
+	inputMinHeight = 3
+	inputMaxHeight = 15
+)
+
 // isCompact reports whether the current terminal dimensions
 // trigger the compact layout (drop secondary chrome to free up
 // rows / columns for the primary transcript + input).
@@ -867,20 +894,21 @@ func (m model) isCompact() bool {
 func (m inputMode) canEditInput() bool { return m == modeComposing }
 
 type model struct {
-	cfg                     Config
-	input                   textarea.Model
-	pastedTextReplacements  map[string]string
-	pastedTextCounter       int
-	viewport                viewport.Model
-	spinner                 spinner.Model
-	gradientSpinner         gradientSpinner
-	transcript              []*transcriptItem
-	inputMode               inputMode
-	helpScroll              int
-	running                 bool
-	events                  <-chan streamEvent
-	decisions               chan<- permissionDecision
-	pending                 *pendingPermission
+	cfg                    Config
+	input                  textarea.Model
+	pastedTextReplacements map[string]string
+	pastedTextCounter      int
+	viewport               viewport.Model
+	spinner                spinner.Model
+	gradientSpinner        gradientSpinner
+	transcript             []*transcriptItem
+	inputMode              inputMode
+	helpScroll             int
+	running                bool
+	events                 <-chan streamEvent
+	decisions              chan<- permissionDecision
+	pending                *pendingPermission
+	recentPermissionRules  map[string]permissionRuleSeen
 	// Phase A.1: 0..4 selector on the 5-option permission panel
 	// ("Approve once" / "Approve for session" / "Approve with
 	// editable rule" / "Reject" / "Reject, tell the model what
@@ -894,9 +922,11 @@ type model struct {
 	modelID                 string
 	providerID              string
 	activeProfile           string
+	contextWindow           int
 	configVersion           int
 	profileCount            int
 	tombstoneCount          int
+	topCardOpen             bool
 	paletteFilter           string
 	paletteSelected         int
 	pendingProfileName      string
@@ -919,6 +949,7 @@ type model struct {
 	toolAuditScroll         int
 	modelCatalog            runtimeModelsResponse
 	modelOverlayScroll      int
+	quitChoice              int
 	startedAt               time.Time
 	permissionOpenedAt      time.Time
 	permissionLastInputAt   time.Time
@@ -926,6 +957,8 @@ type model struct {
 	graceMaxDelay           time.Duration
 	connected               bool
 	latestUsage             *usageSnapshot
+	lastUsage               *usageSnapshot
+	currentTimeout          timeoutDecision
 	// Phase 11 in-app selection. With --mouse the Go TUI
 	// captures SGR mouse events and the terminal can no
 	// longer do native drag-select. We compensate with an
@@ -953,9 +986,12 @@ type model struct {
 	// "copied N chars" line for a few seconds so the
 	// operator has feedback that the gesture worked even
 	// when their terminal hides OSC 52 echoing.
-	lastSelectionCopy     string
-	lastSelectionCopyAt   time.Time
-	lastMouseEventTime    time.Time
+	lastSelectionCopy   string
+	lastSelectionCopyAt time.Time
+	copyToastMessage    string
+	copyToastShownAt    time.Time
+	lastMouseEventTime  time.Time
+	mouseEscapeBuffer   string
 	// promptHistory is the per-session list of submitted
 	// prompts; up/down in composing mode walks it so the
 	// operator can recall a prior turn without leaving the
@@ -970,10 +1006,10 @@ type model struct {
 	//   3) modeModelPickBaseURL — confirm or override base URL
 	//   4) modeModelPickModel   — pick a model
 	// Each mode holds its own scroll / selected state.
-	modelPickProviderIdx    int
-	modelPickProviderDraft  string // pending apiKey / baseURL typed by the operator
-	modelPickSelectedID     string
-	modelPickSelectedIdx    int
+	modelPickProviderIdx   int
+	modelPickProviderDraft string // pending apiKey / baseURL typed by the operator
+	modelPickSelectedID    string
+	modelPickSelectedIdx   int
 	// modelPickerLive is the latest live-fetched model
 	// list for the picked provider, populated on entry to
 	// Step 4 by re-fetching /v1/runtime/models and filtering
@@ -989,8 +1025,22 @@ type model struct {
 	// second press can't fire a duplicate POST, and the
 	// renderer swaps the list for a "saving…" line.
 	modelPickSubmitting bool
-	width              int
-	height             int
+	width               int
+	height              int
+}
+
+type selectionMouseAction int
+
+const (
+	selectionMousePress selectionMouseAction = iota
+	selectionMouseMotion
+	selectionMouseRelease
+)
+
+type selectionMouseEvent struct {
+	action selectionMouseAction
+	x      int
+	y      int
 }
 
 // usageSnapshot captures the most recent token usage event from
@@ -1002,6 +1052,23 @@ type usageSnapshot struct {
 	InputTokens  int
 	OutputTokens int
 	CacheRead    int
+}
+
+type timeoutDecision struct {
+	TimeoutMs int
+	Reason    string
+	Adaptive  bool
+}
+
+func (d timeoutDecision) Label() string {
+	if d.TimeoutMs <= 0 {
+		return ""
+	}
+	seconds := d.TimeoutMs / 1000
+	if d.Adaptive && d.Reason != "" {
+		return fmt.Sprintf("timeout=%ds (%s)", seconds, d.Reason)
+	}
+	return fmt.Sprintf("timeout=%ds", seconds)
 }
 
 func (m *model) setMode(next inputMode) {
@@ -1134,29 +1201,64 @@ func (m *model) scrollOverlay(delta int) bool {
 	return false
 }
 
+func inputPrompt(info textarea.PromptInfo) string {
+	if info.LineNumber == 0 {
+		return "  > "
+	}
+	return "::: "
+}
+
+func desiredInputHeight(input textarea.Model) int {
+	return clamp(input.Height(), inputMinHeight, inputMaxHeight)
+}
+
+func (m *model) syncInputHeight() {
+	m.input.SetHeight(desiredInputHeight(m.input))
+}
+
+func (m *model) setInputValue(value string) {
+	m.input.SetValue(value)
+	m.input.CursorEnd()
+	m.syncInputHeight()
+	m.resize()
+}
+
+// viewportTopY returns the screen row where the transcript
+// viewport begins. Keep this in one place so header chrome
+// changes (for example adding the input-style divider) do not
+// desync mouse selection coordinates.
+func (m *model) viewportTopY() int {
+	return lipgloss.Height(m.renderHeader(max(40, m.width)))
+}
+
 // selectionInViewport reports whether a screen-relative
 // mouse coordinate lands inside the transcript viewport.
-// The viewport occupies screen lines [1, 1+height) of the
-// rendered output, i.e. just below the single-line header
-// and above any overlay / permission / editor / input /
-// footer rows. The horizontal bounds match the width of
-// the rendered content (which is bounded by `m.width`).
+// The viewport starts immediately below renderHeader(); the
+// horizontal bounds match the rendered content width.
 func (m *model) selectionInViewport(x, y int) bool {
 	if m.cfg.MouseCapture == false {
 		return false
 	}
-	if y < 1 {
+	if m.topCardOpen {
 		return false
 	}
-	vpTopY := 1
-	vpBottomY := vpTopY + m.viewport.Height
+	vpTopY := m.viewportTopY()
+	if y < vpTopY {
+		return false
+	}
+	vpBottomY := vpTopY + m.viewport.Height()
 	if y >= vpBottomY {
 		return false
 	}
-	if x < 0 || x >= m.width {
+	if x < 0 || x > m.viewport.Width() {
 		return false
 	}
 	return true
+}
+
+func (m *model) maxSelectionLine() int {
+	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
+	return max(0, len(lines)-1)
 }
 
 // startSelection anchors a new selection at the given
@@ -1165,8 +1267,8 @@ func (m *model) selectionInViewport(x, y int) bool {
 // i.e. line 0 is the welcome card's first line, col 0
 // is the leftmost column. Both bounds are clamped.
 func (m *model) startSelection(line, col int) {
-	m.selectionStartLine = clamp(line, 0, m.viewport.Height)
-	m.selectionStartCol = clamp(col, 0, max(0, m.width-1))
+	m.selectionStartLine = clamp(line, 0, m.maxSelectionLine())
+	m.selectionStartCol = m.clampSelectionCol(m.selectionStartLine, col)
 	m.selectionEndLine = m.selectionStartLine
 	m.selectionEndCol = m.selectionStartCol
 	m.selectionActive = true
@@ -1179,8 +1281,8 @@ func (m *model) extendSelection(line, col int) {
 	if !m.selectionActive {
 		return
 	}
-	m.selectionEndLine = clamp(line, 0, m.viewport.Height)
-	m.selectionEndCol = clamp(col, 0, max(0, m.width-1))
+	m.selectionEndLine = clamp(line, 0, m.maxSelectionLine())
+	m.selectionEndCol = m.clampSelectionCol(m.selectionEndLine, col)
 }
 
 // clearSelection resets the selection anchors without
@@ -1212,16 +1314,27 @@ func (m *model) normalizedSelection() (sl, sc, el, ec int, ok bool) {
 	return sl, sc, el, ec, true
 }
 
+func (m *model) clampSelectionCol(line, col int) int {
+	lineWidth := m.selectionLineWidth(line)
+	return clamp(col, 0, max(0, lineWidth))
+}
+
+func (m *model) selectionLineWidth(line int) int {
+	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
+	if line < 0 || line >= len(lines) {
+		return m.viewport.Width()
+	}
+	return min(m.viewport.Width(), visibleWidth(lines[line]))
+}
+
 // handleSelectionMouse routes a left-button MouseMsg to
 // the in-app selection state machine. Returns the model
 // and an optional OSC 52 copy command.
 //
-// Coord mapping: msg.X / msg.Y are screen-relative. The
-// viewport sits at screen Y ∈ [1, 1+height). We translate
-// to viewport-content (line, col) by subtracting the
-// header (1 row) so the same content line keeps the same
-// line index even if the welcome card grows.
-func (m *model) handleSelectionMouse(msg tea.MouseMsg) (model, tea.Cmd) {
+// Coord mapping: msg.X / msg.Y are screen-relative. We translate
+// to viewport-content (line, col) by subtracting the current
+// header height, mirroring Crush's layout-relative mouse routing.
+func (m *model) handleSelectionMouse(msg selectionMouseEvent) (model, tea.Cmd) {
 	// Only the transcript viewport accepts selection; an
 	// overlay / permission / editor / input has its own
 	// single-input-owner and we don't want a stray drag to
@@ -1230,24 +1343,24 @@ func (m *model) handleSelectionMouse(msg tea.MouseMsg) (model, tea.Cmd) {
 		m.mouseDownInViewport = false
 		return *m, nil
 	}
-	if !m.selectionInViewport(msg.X, msg.Y) {
+	if !m.selectionInViewport(msg.x, msg.y) {
 		// A press / motion / release outside the viewport
 		// ends any in-progress drag without committing a
 		// copy.
 		m.mouseDownInViewport = false
 		return *m, nil
 	}
-	contentLine := m.viewport.YOffset + (msg.Y - 1)
-	contentCol := msg.X
+	contentLine := m.viewport.YOffset() + (msg.y - m.viewportTopY())
+	contentCol := msg.x
 	switch {
-	case msg.Action == tea.MouseActionPress:
+	case msg.action == selectionMousePress:
 		m.mouseDownInViewport = true
 		m.startSelection(contentLine, contentCol)
 		return *m, nil
-	case msg.Action == tea.MouseActionMotion && m.mouseDownInViewport:
+	case msg.action == selectionMouseMotion && m.mouseDownInViewport:
 		m.extendSelection(contentLine, contentCol)
 		return *m, nil
-	case msg.Action == tea.MouseActionRelease && m.mouseDownInViewport:
+	case msg.action == selectionMouseRelease && m.mouseDownInViewport:
 		m.mouseDownInViewport = false
 		m.extendSelection(contentLine, contentCol)
 		sl, sc, el, ec, ok := m.normalizedSelection()
@@ -1263,9 +1376,18 @@ func (m *model) handleSelectionMouse(msg tea.MouseMsg) (model, tea.Cmd) {
 		}
 		m.lastSelectionCopy = text
 		m.lastSelectionCopyAt = time.Now()
-		return *m, osC52CopyCmd(text)
+		m.copyToastMessage = "Selected text copied to clipboard"
+		m.copyToastShownAt = m.lastSelectionCopyAt
+		m.clearSelection()
+		return *m, tea.Sequence(osC52CopyCmd(text), expireCopyToastCmd(m.copyToastShownAt))
 	}
 	return *m, nil
+}
+
+func expireCopyToastCmd(copiedAt time.Time) tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return copyToastExpiredMsg{copiedAt: copiedAt}
+	})
 }
 
 // extractSelectedText walks the viewport's plain-text
@@ -1275,8 +1397,6 @@ func (m *model) handleSelectionMouse(msg tea.MouseMsg) (model, tea.Cmd) {
 // operator saw (modulo any leading whitespace padding
 // baked in by the welcome card).
 func (m *model) extractSelectedText(sl, sc, el, ec int) string {
-	content := m.viewport.View() // not enough — use full content
-	_ = content
 	full := m.fullViewportContent()
 	plain := stripANSICodes(full)
 	lines := strings.Split(plain, "\n")
@@ -1287,31 +1407,17 @@ func (m *model) extractSelectedText(sl, sc, el, ec int) string {
 		el = len(lines) - 1
 	}
 	if sl == el {
-		line := lines[sl]
-		if sc >= len(line) {
-			return ""
-		}
-		if ec > len(line) {
-			ec = len(line)
-		}
-		return line[sc:ec]
+		return sliceVisibleColumns(lines[sl], sc, ec)
 	}
 	var b strings.Builder
 	for i := sl; i <= el && i < len(lines); i++ {
 		line := lines[i]
 		switch i {
 		case sl:
-			if sc < len(line) {
-				b.WriteString(line[sc:])
-			}
+			b.WriteString(sliceVisibleColumns(line, sc, visibleWidth(line)))
 			b.WriteByte('\n')
 		case el:
-			if ec > len(line) {
-				ec = len(line)
-			}
-			if ec > 0 {
-				b.WriteString(line[:ec])
-			}
+			b.WriteString(sliceVisibleColumns(line, 0, ec))
 		default:
 			b.WriteString(line)
 			b.WriteByte('\n')
@@ -1327,160 +1433,12 @@ func (m *model) extractSelectedText(sl, sc, el, ec int) string {
 // stay anchored to the same text even if they release the
 // mouse on a frame that hasn't been refreshed.
 func (m *model) fullViewportContent() string {
-	welcome := m.renderWelcomeCard(max(40, m.viewport.Width))
-	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width))
+	welcome := m.renderWelcomeCard(max(40, m.viewport.Width()))
+	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width()))
 	if transcript != "" {
 		return welcome + "\n\n" + transcript
 	}
 	return welcome
-}
-
-// applySelectionHighlight walks the viewport's visible
-// output and applies a muted gray background to the
-// cells inside the current selection. ANSI escape codes
-// in the source are preserved (we count visible columns
-// while skipping CSI sequences), so foreground colors
-// inside the selected range are not overwritten.
-func (m *model) applySelectionHighlight(viewportView string) string {
-	sl, sc, el, ec, ok := m.normalizedSelection()
-	if !ok {
-		return viewportView
-	}
-	lines := strings.Split(viewportView, "\n")
-	const bg = "\x1b[48;5;240m"
-	const bgReset = "\x1b[49m"
-	// First visible line of the viewport is content line
-	// m.viewport.YOffset. We translate the selection's
-	// (sl, el) content-line range to the visible-line
-	// range by subtracting that offset.
-	first := m.viewport.YOffset
-	for vis := 0; vis < len(lines); vis++ {
-		contentLine := first + vis
-		if contentLine < sl || contentLine > el {
-			continue
-		}
-		var colStart, colEnd int
-		switch contentLine {
-		case sl:
-			colStart = sc
-		default:
-			colStart = 0
-		}
-		switch contentLine {
-		case el:
-			colEnd = ec
-		default:
-			colEnd = visibleWidth(lines[vis])
-		}
-		if colStart >= colEnd {
-			continue
-		}
-		lines[vis] = paintColumnRange(lines[vis], colStart, colEnd, bg, bgReset)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// paintColumnRange injects a background-color span over
-// the visual columns [start, end) of an ANSI-styled
-// string, preserving the existing colors. This is
-// column-aware (we skip CSI sequences while counting)
-// and byte-aware (we splice at exact byte positions).
-func paintColumnRange(s string, start, end int, bgStart, bgEnd string) string {
-	if start >= end {
-		return s
-	}
-	// Walk to the byte position of column `start`.
-	byteStart, _ := columnToByteRange(s, start, -1)
-	if byteStart < 0 {
-		return s
-	}
-	// Walk from there to the byte position of column `end`,
-	// measured from byteStart forward.
-	byteEnd, _ := columnToByteRange(s[byteStart:], end-start, 0)
-	if byteEnd < 0 {
-		return s
-	}
-	byteEnd += byteStart
-	if byteEnd > len(s) {
-		byteEnd = len(s)
-	}
-	if byteStart >= byteEnd {
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s) + len(bgStart) + len(bgEnd))
-	b.WriteString(s[:byteStart])
-	b.WriteString(bgStart)
-	b.WriteString(s[byteStart:byteEnd])
-	b.WriteString(bgEnd)
-	b.WriteString(s[byteEnd:])
-	return b.String()
-}
-
-// columnToByteRange walks a (potentially ANSI-styled)
-// string and returns the byte index corresponding to the
-// Nth visible column. If `fromCol` is non-negative the
-// walk starts at that column (which lets the caller
-// chain byte-relative walks cheaply). If the column is
-// out of range, -1 is returned.
-func columnToByteRange(s string, target int, fromCol int) (int, int) {
-	col := 0
-	if fromCol >= 0 {
-		col = fromCol
-	}
-	i := 0
-	for i < len(s) {
-		if col == target {
-			return i, col
-		}
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == 0x1b {
-			// Skip CSI: ESC [ ... <final>
-			j := i + 1
-			if j < len(s) && s[j] == '[' {
-				j++
-				for j < len(s) {
-					c := s[j]
-					j++
-					if c >= 0x40 && c <= 0x7e {
-						break
-					}
-				}
-				i = j
-				continue
-			}
-			// Non-CSI escape: skip the introducer and
-			// a single following byte.
-			i += 2
-			continue
-		}
-		// East Asian wide chars count as 2 columns; ASCII
-		// is 1 column. We use runewidth from the bubbles
-		// dependency tree.
-		w := visualWidth(r)
-		col += w
-		i += size
-		if col > target {
-			// We overshot the target column (the rune
-			// was a wide char that straddles the
-			// boundary). Anchor the splice to the
-			// start of this rune so the highlight
-			// doesn't slice a wide glyph in half.
-			return i - size, col - w
-		}
-	}
-	if col == target {
-		return len(s), col
-	}
-	return -1, col
-}
-
-// visibleWidth sums the on-screen column widths of every
-// rune in `s`, skipping CSI sequences. Used to compute
-// the right edge of a full-line selection range.
-func visibleWidth(s string) int {
-	_, col := columnToByteRange(s, 1<<30, 0)
-	return col
 }
 
 // stripANSICodes removes CSI (\x1b[...m) and OSC (\x1b]...BEL
@@ -1555,7 +1513,13 @@ func buildOSC52Sequence(text string) string {
 // redraw cycle; printing via os.Stdout would corrupt the
 // current frame.
 func osC52CopyCmd(text string) tea.Cmd {
-	return tea.Printf("%s", buildOSC52Sequence(text))
+	return tea.Sequence(
+		tea.Printf("%s", buildOSC52Sequence(text)),
+		func() tea.Msg {
+			_ = clipboard.WriteAll(text)
+			return nil
+		},
+	)
 }
 
 // slashCommand describes a single Phase 4 slash-palette entry. A command
@@ -1564,14 +1528,17 @@ func osC52CopyCmd(text string) tea.Cmd {
 // so the user can type the rest of the command). The palette never
 // pre-empts the textinput when a command needs an argument.
 type slashCommand struct {
-	name    string
-	aliases []string
-	summary string
-	hasArgs bool
-	argHint string
-	prefix  string // when non-empty, the palette inserts this string into the textinput and returns to composing
-	run     func(m *model, args []string) tea.Cmd
+	name     string
+	aliases  []string
+	summary  string
+	shortcut string
+	hasArgs  bool
+	argHint  string
+	prefix   string // when non-empty, the palette inserts this string into the textinput and returns to composing
+	run      func(m *model, args []string) tea.Cmd
 }
+
+func (c slashCommand) Shortcut() string { return c.shortcut }
 
 // toolDescriptor is the read-only row the /tools palette renders. The
 // fields map 1:1 to /v1/tools/audit entries. The Phase 4
@@ -1670,9 +1637,10 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
-		name:    "/exit",
-		aliases: []string{"/quit"},
-		summary: "quit the Go TUI",
+		name:     "/exit",
+		aliases:  []string{"/quit"},
+		summary:  "quit the Go TUI",
+		shortcut: "ctrl+q",
 		run: func(_ *model, _ []string) tea.Cmd {
 			return tea.Quit
 		},
@@ -1729,10 +1697,11 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
-		name:    "/model",
-		summary: "open interactive model registry (provider → api key → base URL → model)",
-		hasArgs: true,
-		argHint: "[id]",
+		name:     "/model",
+		summary:  "open interactive model registry (provider → api key → base URL → model)",
+		shortcut: "ctrl+l",
+		hasArgs:  true,
+		argHint:  "[id]",
 		run: func(m *model, args []string) tea.Cmd {
 			if len(m.modelCatalog.Providers) == 0 {
 				m.appendLine("status", "loading shared Nexus model configuration")
@@ -1760,9 +1729,10 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
-		name:    "/tools",
-		aliases: []string{"/tool"},
-		summary: "open tool audit overlay",
+		name:     "/tools",
+		aliases:  []string{"/tool"},
+		summary:  "open tool audit overlay",
+		shortcut: "ctrl+o",
 		run: func(m *model, _ []string) tea.Cmd {
 			// Phase 4 wire: GET /v1/tools/audit replaces the
 			// static catalog. On wire success the overlay shows
@@ -1784,8 +1754,9 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
-		name:    "/tasks",
-		summary: "open task board overlay",
+		name:     "/tasks",
+		summary:  "open task board overlay",
+		shortcut: "ctrl+t",
 		run: func(m *model, _ []string) tea.Cmd {
 			return m.fetchSessionTasksWithSession()
 		},
@@ -1806,8 +1777,9 @@ var slashCommands = []slashCommand{
 		},
 	},
 	{
-		name:    "/agents",
-		summary: "open multi-agent status overlay",
+		name:     "/agents",
+		summary:  "open multi-agent status overlay",
+		shortcut: "ctrl+g",
 		run: func(m *model, _ []string) tea.Cmd {
 			return m.fetchSessionAgentsWithSession()
 		},
@@ -1859,28 +1831,163 @@ var slashCommands = []slashCommand{
 	},
 }
 
-// filterSlashCommands narrows the registry to entries whose name or
-// alias starts with the given prefix (case-insensitive). The order is
-// preserved so the most "intentional" match is the first listed.
-func filterSlashCommands(prefix string) []slashCommand {
-	if prefix == "" {
-		out := make([]slashCommand, len(slashCommands))
-		copy(out, slashCommands)
+type slashCommandMatch struct {
+	command slashCommand
+	match   fuzzy.Match
+}
+
+func (m slashCommandMatch) Filter() string {
+	return m.commandFilter()
+}
+
+func (m slashCommandMatch) commandFilter() string {
+	parts := []string{strings.TrimPrefix(m.command.name, "/")}
+	for _, alias := range m.command.aliases {
+		parts = append(parts, strings.TrimPrefix(alias, "/"))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m *slashCommandMatch) SetMatch(match fuzzy.Match) {
+	m.match = match
+}
+
+// filterSlashCommandMatches narrows the registry with fuzzy matching.
+// Empty query preserves registry order. Non-empty query is ranked by
+// sahilm/fuzzy so non-prefix but useful matches (e.g. "mdl" → /model)
+// still appear.
+func filterSlashCommandMatches(prefix string) []slashCommandMatch {
+	items := make([]slashCommandMatch, len(slashCommands))
+	for i, command := range slashCommands {
+		items[i] = slashCommandMatch{command: command}
+	}
+	query := strings.ToLower(strings.TrimPrefix(prefix, "/"))
+	if query == "" {
+		return items
+	}
+
+	// Preserve the old prefix-filter feel first: when the user types
+	// "prof", /profile should be the only result even though another
+	// command's summary contains similar letters.
+	prefixMatches := make([]slashCommandMatch, 0, len(items))
+	for _, item := range items {
+		if slashCommandHasPrefix(item.command, query) {
+			prefixMatches = append(prefixMatches, withSlashCommandNameMatch(item, query))
+		}
+	}
+	if len(prefixMatches) > 0 {
+		return prefixMatches
+	}
+
+	// Next, fuzzy-match command names and aliases only. This enables
+	// shorthand like "mdl" → /model without summary text outranking the
+	// command the operator likely intended.
+	commandFilters := make([]string, len(items))
+	for i, item := range items {
+		commandFilters[i] = item.commandFilter()
+	}
+	commandMatches := fuzzy.Find(query, commandFilters)
+	if len(commandMatches) > 0 {
+		out := make([]slashCommandMatch, 0, len(commandMatches))
+		for _, match := range commandMatches {
+			item := items[match.Index]
+			item.match = match
+			out = append(out, item)
+		}
 		return out
 	}
-	needle := strings.ToLower(strings.TrimPrefix(prefix, "/"))
-	out := []slashCommand{}
-	for _, c := range slashCommands {
-		if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(c.name, "/")), needle) {
-			out = append(out, c)
+
+	return nil
+}
+
+func slashCommandHasPrefix(command slashCommand, query string) bool {
+	if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(command.name, "/")), query) {
+		return true
+	}
+	for _, alias := range command.aliases {
+		if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(alias, "/")), query) {
+			return true
+		}
+	}
+	return false
+}
+
+func withSlashCommandNameMatch(item slashCommandMatch, query string) slashCommandMatch {
+	name := strings.ToLower(strings.TrimPrefix(item.command.name, "/"))
+	if strings.HasPrefix(name, query) {
+		item.match = fuzzy.Match{Str: item.command.name, MatchedIndexes: sequentialIndexes(len(query))}
+		return item
+	}
+	for _, alias := range item.command.aliases {
+		trimmed := strings.ToLower(strings.TrimPrefix(alias, "/"))
+		if strings.HasPrefix(trimmed, query) {
+			item.match = fuzzy.Match{Str: alias, MatchedIndexes: nil}
+			return item
+		}
+	}
+	return item
+}
+
+func sequentialIndexes(n int) []int {
+	indexes := make([]int, n)
+	for i := range indexes {
+		indexes[i] = i
+	}
+	return indexes
+}
+
+func ptrsToSlashCommandMatches(items []slashCommandMatch) []*slashCommandMatch {
+	out := make([]*slashCommandMatch, len(items))
+	for i := range items {
+		out[i] = &items[i]
+	}
+	return out
+}
+
+func slashCommandMatchValues(items []*slashCommandMatch) []slashCommandMatch {
+	out := make([]slashCommandMatch, len(items))
+	for i, item := range items {
+		out[i] = *item
+	}
+	return out
+}
+
+func highlightSlashCommandName(item slashCommandMatch) string {
+	name := item.command.name
+	if len(item.match.MatchedIndexes) == 0 {
+		return name
+	}
+	matched := make(map[int]bool, len(item.match.MatchedIndexes))
+	for _, idx := range item.match.MatchedIndexes {
+		// Match indexes are relative to Filter(), whose first segment is
+		// the command name without the leading slash. Shift by one so
+		// highlighted columns line up with the rendered slash command.
+		if idx+1 < len(name) {
+			matched[idx+1] = true
+		}
+	}
+	var out strings.Builder
+	out.Grow(len(name) + len(item.match.MatchedIndexes)*(len(buttonHotkeyOpen)+len(buttonHotkeyClose)))
+	for idx, r := range name {
+		if matched[idx] {
+			out.WriteString(buttonHotkeyOpen)
+			out.WriteRune(r)
+			out.WriteString(buttonHotkeyClose)
 			continue
 		}
-		for _, a := range c.aliases {
-			if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(a, "/")), needle) {
-				out = append(out, c)
-				break
-			}
-		}
+		out.WriteRune(r)
+	}
+	return out.String()
+}
+
+// filterSlashCommands preserves the legacy API used by command
+// execution/tests while the renderer consumes filterSlashCommandMatches
+// to access matched indexes for highlighting.
+func filterSlashCommands(prefix string) []slashCommand {
+	matched := filterSlashCommandMatches(prefix)
+	out := make([]slashCommand, len(matched))
+	for i, item := range matched {
+		out[i] = item.command
 	}
 	return out
 }
@@ -1905,18 +2012,290 @@ func findSlashCommand(input string) *slashCommand {
 	return nil
 }
 
+func findSlashCommandByShortcut(shortcut string) *slashCommand {
+	shortcut = strings.ToLower(strings.TrimSpace(shortcut))
+	if shortcut == "" {
+		return nil
+	}
+	for i, c := range slashCommands {
+		if strings.ToLower(c.Shortcut()) == shortcut {
+			return &slashCommands[i]
+		}
+	}
+	return nil
+}
+
+func shortcutKeyString(msg tea.KeyMsg) string {
+	return msg.String()
+}
+
+func (m *model) dispatchCommandShortcut(msg tea.KeyMsg) (tea.Cmd, bool) {
+	cmd := findSlashCommandByShortcut(shortcutKeyString(msg))
+	if cmd == nil {
+		return nil, false
+	}
+	m.paletteFilter = ""
+	m.paletteSelected = 0
+	m.setMode(modeComposing)
+	if cmd.prefix != "" {
+		m.setInputValue(cmd.prefix)
+		m.appendLine("status", "inserted prefix: "+cmd.prefix)
+		return nil, true
+	}
+	return cmd.run(m, nil), true
+}
+
+func (m *model) handlePaste(content string) {
+	if m.handleMouseEscapeString(content) {
+		return
+	}
+	if strings.Contains(content, "\n") || strings.Contains(content, "\r") {
+		m.pastedTextCounter++
+		lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+		lineCount := len(lines)
+		placeholder := fmt.Sprintf("[Pasted text #%d +%d lines]", m.pastedTextCounter, lineCount)
+		if m.pastedTextReplacements == nil {
+			m.pastedTextReplacements = make(map[string]string)
+		}
+		m.pastedTextReplacements[placeholder] = content
+		m.input.InsertString(placeholder)
+	} else {
+		m.input.InsertString(content)
+	}
+	m.syncInputHeight()
+	m.resize()
+}
+
+func (m *model) handleMouseEscapeString(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if m.mouseEscapeBuffer != "" {
+		m.mouseEscapeBuffer += raw
+		if m.completeMouseEscapeBuffer() {
+			return true
+		}
+		if len(m.mouseEscapeBuffer) > 32 || !looksLikeMouseEscapePrefix(m.mouseEscapeBuffer) {
+			m.mouseEscapeBuffer = ""
+		}
+		return true
+	}
+	// Some terminals can leak mouse reports as ordinary key
+	// fragments when mouse tracking toggles around focus/scroll.
+	// Bubble Tea normally parses these as MouseMsg; when it does not,
+	// swallowing them here prevents protocol bytes from landing in the
+	// textarea. Wheel reports still scroll the active view.
+	if startsMouseEscape(raw) {
+		m.mouseEscapeBuffer = raw
+		if m.completeMouseEscapeBuffer() {
+			return true
+		}
+		return true
+	}
+	start := strings.Index(raw, "<")
+	x10Start := strings.Index(raw, "[M")
+	if start < 0 && x10Start < 0 {
+		return false
+	}
+	if x10Start >= 0 && (start < 0 || x10Start < start) {
+		m.mouseEscapeBuffer = raw[x10Start:]
+		_ = m.completeMouseEscapeBuffer()
+		return true
+	}
+	report := raw[start:]
+	if !strings.HasSuffix(report, "M") && !strings.HasSuffix(report, "m") {
+		if strings.HasPrefix(report, "<64;") || strings.HasPrefix(report, "<65;") || looksLikeMouseEscapePrefix(report) {
+			m.mouseEscapeBuffer = report
+			return true
+		}
+		return false
+	}
+	if strings.HasPrefix(report, "<64;") {
+		m.scrollByMouseEscape(-mouseWheelStepLines)
+		return true
+	}
+	if strings.HasPrefix(report, "<65;") {
+		m.scrollByMouseEscape(mouseWheelStepLines)
+		return true
+	}
+	return strings.HasPrefix(report, "<")
+}
+
+func (m *model) completeMouseEscapeBuffer() bool {
+	report := m.mouseEscapeBuffer
+	if idx := strings.Index(report, "[M"); idx >= 0 {
+		x10 := report[idx:]
+		if len([]rune(x10)) < 5 {
+			return false
+		}
+		m.mouseEscapeBuffer = ""
+		m.scrollByX10MouseEscape(x10)
+		return true
+	}
+	if idx := strings.Index(report, "<"); idx >= 0 {
+		report = report[idx:]
+	}
+	if !(strings.HasSuffix(report, "M") || strings.HasSuffix(report, "m")) {
+		return false
+	}
+	m.mouseEscapeBuffer = ""
+	if strings.HasPrefix(report, "<64;") {
+		m.scrollByMouseEscape(-mouseWheelStepLines)
+		return true
+	}
+	if strings.HasPrefix(report, "<65;") {
+		m.scrollByMouseEscape(mouseWheelStepLines)
+		return true
+	}
+	return true
+}
+
+func startsMouseEscape(raw string) bool {
+	return raw == "[" ||
+		raw == "\x1b[" ||
+		raw == "\x1b[<" ||
+		raw == "[<" ||
+		raw == "\x1b[M" ||
+		raw == "[M" ||
+		strings.HasPrefix(raw, "\x1b[<") ||
+		strings.HasPrefix(raw, "[<") ||
+		strings.HasPrefix(raw, "\x1b[M") ||
+		strings.HasPrefix(raw, "[M")
+}
+
+func looksLikeMouseEscapePrefix(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.HasPrefix(raw, "\x1b[") {
+		raw = strings.TrimPrefix(raw, "\x1b[")
+	}
+	if strings.HasPrefix(raw, "[") {
+		raw = strings.TrimPrefix(raw, "[")
+	}
+	if strings.HasPrefix(raw, "M") {
+		return true
+	}
+	if strings.HasPrefix(raw, "<") {
+		raw = strings.TrimPrefix(raw, "<")
+	}
+	if raw == "" {
+		return true
+	}
+	for _, r := range raw {
+		if (r >= '0' && r <= '9') || r == ';' {
+			continue
+		}
+		return r == 'M' || r == 'm'
+	}
+	return true
+}
+
+func (m *model) scrollByX10MouseEscape(report string) {
+	runes := []rune(report)
+	if len(runes) < 5 {
+		return
+	}
+	button := int(runes[2]) - 32
+	if button&0b01_000000 == 0 {
+		return
+	}
+	if button&1 == 0 {
+		m.scrollByMouseEscape(-mouseWheelStepLines)
+	} else {
+		m.scrollByMouseEscape(mouseWheelStepLines)
+	}
+}
+
+func (m *model) scrollByMouseEscape(delta int) {
+	if m.inputMode == modeComposing {
+		if delta < 0 {
+			m.viewport.ScrollUp(-delta)
+		} else {
+			m.viewport.ScrollDown(delta)
+		}
+		return
+	}
+	m.scrollOverlay(delta)
+}
+
+func isInputNewlineKey(key string) bool {
+	if key == "ctrl+j" || key == "shift+enter" || key == "alt+enter" {
+		return true
+	}
+	raw := key
+	switch raw {
+	case "\x1b[13;2u", "\x1b[13;2~", "\x1b[27;2;13~", "[13;2u", "[13;2~", "[27;2;13~":
+		return true
+	default:
+		return false
+	}
+}
+
+func decodeUnknownCSIString(raw string) (string, bool) {
+	if !strings.HasPrefix(raw, "?CSI[") || !strings.HasSuffix(raw, "]?") {
+		return "", false
+	}
+	body := strings.TrimSuffix(strings.TrimPrefix(raw, "?CSI["), "]?")
+	fields := strings.Fields(body)
+	bytes := make([]byte, 0, len(fields)+2)
+	bytes = append(bytes, '\x1b', '[')
+	for _, field := range fields {
+		value, err := strconv.Atoi(field)
+		if err != nil || value < 0 || value > 255 {
+			return "", false
+		}
+		bytes = append(bytes, byte(value))
+	}
+	return string(bytes), true
+}
+
+func isUnknownShiftEnterCSI(raw string) bool {
+	if raw == "" {
+		return false
+	}
+	if strings.Contains(raw, "13;2u") ||
+		strings.Contains(raw, "13;2~") ||
+		strings.Contains(raw, "27;2;13~") {
+		return true
+	}
+	if decoded, ok := decodeUnknownCSIString(raw); ok {
+		return isUnknownShiftEnterCSI(decoded)
+	}
+	return false
+}
+
+func (m *model) insertInputNewline() {
+	m.input.InsertRune('\n')
+	m.syncInputHeight()
+	m.resize()
+}
+
+func (m *model) handleUnknownCSIMessage(raw string) bool {
+	decoded, ok := decodeUnknownCSIString(raw)
+	if !ok {
+		return false
+	}
+	if isUnknownShiftEnterCSI(decoded) {
+		m.insertInputNewline()
+		return true
+	}
+	return m.handleMouseEscapeString(decoded)
+}
+
 // printableRuneFromKey returns the leading printable rune from a
 // tea.KeyMsg, or 0 if the key is a special key (Enter, Esc, arrows,
 // etc.) and must NOT be appended to the palette filter.
 func printableRuneFromKey(msg tea.KeyMsg) rune {
-	if msg.Type == tea.KeyRunes {
-		for _, r := range msg.Runes {
+	key := msg.Key()
+	if key.Text != "" {
+		for _, r := range key.Text {
 			if r >= 0x20 && r != 0x7f {
 				return r
 			}
 		}
 	}
-	if msg.Type == tea.KeySpace {
+	if key.Code == tea.KeySpace {
 		return ' '
 	}
 	return 0
@@ -1946,8 +2325,7 @@ func (m *model) runPaletteSelection() tea.Cmd {
 	if cmd.prefix != "" {
 		// Insert the prefix into the textinput so the user can keep
 		// typing arguments.
-		m.input.SetValue(cmd.prefix)
-		m.input.CursorEnd()
+		m.setInputValue(cmd.prefix)
 		m.appendLine("status", "inserted prefix: "+cmd.prefix)
 		return nil
 	}
@@ -1956,8 +2334,7 @@ func (m *model) runPaletteSelection() tea.Cmd {
 		// positional arg parsed by handleLocalCommand; insert the
 		// command name + space and stay in composing.
 		inserted := cmd.name + " "
-		m.input.SetValue(inserted)
-		m.input.CursorEnd()
+		m.setInputValue(inserted)
 		m.appendLine("status", "type the argument, then press enter: "+inserted)
 		return nil
 	}
@@ -1978,15 +2355,21 @@ var (
 	// operator can scan a transcript for `● ` to count tool
 	// runs without the warm orange drowning the glyph; the
 	// tool name that follows is the warm orange accent.
-	toolBulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
-	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	assistantStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	userStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	thinkingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-	dividerStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
-	footerStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	toolBulletStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	permissionStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	confirmStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
+	contextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	userStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	thinkingStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	inputBlockStyle   = lipgloss.NewStyle()
+	topCardFrameStyle = lipgloss.NewStyle().
+				Border(lipgloss.NormalBorder()).
+				BorderForeground(lipgloss.Color("99")).
+				Padding(0, 1)
+	topCardAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
 	// overlayFrameStyle wraps every read-only overlay (help,
 	// profile confirm, context, inbox, agents, tasks, activity,
 	// tools audit) in a muted normal border so they read as
@@ -2013,10 +2396,6 @@ var (
 
 func Run(cfg Config) error {
 	m := newModel(cfg)
-	opts := []tea.ProgramOption{}
-	if cfg.AltScreen {
-		opts = append(opts, tea.WithAltScreen())
-	}
 	// Phase 10: capture the mouse wheel so it scrolls the
 	// transcript viewport in composing mode instead of
 	// leaking into the terminal (some terminals translate
@@ -2034,10 +2413,7 @@ func Run(cfg Config) error {
 	// wheel support is a fair trade. The opt-in
 	// `--mouse` flag re-enables the cap for operators who
 	// prefer the wheel to selection.
-	if cfg.MouseCapture {
-		opts = append(opts, tea.WithMouseCellMotion())
-	}
-	if _, err := tea.NewProgram(m, opts...).Run(); err != nil {
+	if _, err := tea.NewProgram(m).Run(); err != nil {
 		return err
 	}
 	return nil
@@ -2048,8 +2424,14 @@ func newModel(cfg Config) model {
 	input.Placeholder = "Ask BabeL-O"
 	input.Focus()
 	input.CharLimit = 4000
-	input.Prompt = "> "
+	input.Prompt = "  > "
+	input.SetPromptFunc(4, inputPrompt)
 	input.ShowLineNumbers = false
+	input.DynamicHeight = true
+	input.MinHeight = inputMinHeight
+	input.MaxHeight = inputMaxHeight
+	input.KeyMap.InsertNewline.SetKeys("ctrl+j")
+	input.KeyMap.InsertNewline.SetHelp("ctrl+j", "newline")
 	// Strip the default background fill from the focused /
 	// blurred base style. The bubbles textarea renders a
 	// dark fill behind the prompt row by default, which
@@ -2058,26 +2440,29 @@ func newModel(cfg Config) model {
 	// lipgloss.Style removes the fill so the input box is
 	// a clean prefix-cursor-row matching the rest of the
 	// transcript.
-	input.FocusedStyle.Base = lipgloss.NewStyle()
-	input.BlurredStyle.Base = lipgloss.NewStyle()
-	input.Cursor.Style = lipgloss.NewStyle()
+	inputStyles := input.Styles()
+	inputStyles.Focused.Base = lipgloss.NewStyle()
+	inputStyles.Blurred.Base = lipgloss.NewStyle()
+	inputStyles.Cursor = textarea.CursorStyle{}
 	// The bubbles textarea's `CursorLine` style has a default
 	// background fill on the row containing the cursor, which
 	// read as a chrome panel underneath the typed text. Strip
 	// the background so the input line stays a clean
 	// `> cursor` row matching the surrounding transcript.
-	input.FocusedStyle.CursorLine = lipgloss.NewStyle()
-	input.BlurredStyle.CursorLine = lipgloss.NewStyle()
+	inputStyles.Focused.CursorLine = lipgloss.NewStyle()
+	inputStyles.Blurred.CursorLine = lipgloss.NewStyle()
+	inputStyles.Focused.Placeholder = mutedStyle
+	inputStyles.Blurred.Placeholder = mutedStyle
+	inputStyles.Focused.Prompt = statusStyle
+	inputStyles.Blurred.Prompt = mutedStyle
+	inputStyles.Focused.Text = focusedLineStyle
+	inputStyles.Blurred.Text = mutedStyle
+	input.SetStyles(inputStyles)
 	input.SetWidth(80)
-	// Single-line input: SetHeight(1) collapses the textarea
-	// to a single row, so only one `>` prompt icon is
-	// rendered instead of three (the previous height was a
-	// vestige of the multi-line textarea setup and produced
-	// a confusing triple-prompt box for what is in practice
-	// a single-line prompt).
-	input.SetHeight(1)
+	input.SetHeight(inputMinHeight)
 
-	vp := viewport.New(80, 20)
+	vp := viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
+	vp.FillHeight = true
 
 	spin := spinner.New()
 	spin.Spinner = spinner.Dot
@@ -2092,7 +2477,7 @@ func newModel(cfg Config) model {
 		graceMax = 0
 	}
 
-	return model{
+	m := model{
 		cfg:                     cfg,
 		input:                   input,
 		viewport:                vp,
@@ -2100,6 +2485,7 @@ func newModel(cfg Config) model {
 		gradientSpinner:         gSpin,
 		inputMode:               modeComposing,
 		transcript:              []*transcriptItem{},
+		recentPermissionRules:   map[string]permissionRuleSeen{},
 		seenInboxCardMessageIDs: map[string]struct{}{},
 		subAgents:               map[string]subAgentEntry{},
 		pastedTextReplacements:  make(map[string]string),
@@ -2108,6 +2494,13 @@ func newModel(cfg Config) model {
 		graceQuietPeriod:        graceQuiet,
 		graceMaxDelay:           graceMax,
 	}
+	if width, height, err := term.GetSize(os.Stdout.Fd()); err == nil && width > 0 && height > 0 {
+		m.width = width
+		m.height = height
+		m.resize()
+		m.refreshViewport()
+	}
+	return m
 }
 
 func (m model) Init() tea.Cmd {
@@ -2124,6 +2517,7 @@ func (m model) Init() tea.Cmd {
 		// match. Major mismatch on a "dev" build is
 		// silently ignored.
 		checkRuntimeVersion(m.cfg),
+		fetchToolAudit(m.cfg, "auto"),
 	)
 }
 
@@ -2148,7 +2542,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshViewport()
 		return m, nil
 
-	case tea.MouseMsg:
+	case tea.KeyboardEnhancementsMsg:
+		if msg.SupportsKeyDisambiguation() {
+			m.input.KeyMap.InsertNewline.SetHelp("shift+enter", "newline")
+		}
+		return m, nil
+
+	case tea.PasteMsg:
+		m.handlePaste(msg.Content)
+		return m, nil
+
+	case tea.MouseClickMsg:
 		// Phase 11 wheel routing. Only active when the
 		// operator explicitly opted into mouse capture via
 		// --mouse; otherwise the terminal's own
@@ -2176,42 +2580,78 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.cfg.MouseCapture {
 			return m, nil
 		}
-		// Anti-jitter: drop trackpad / mouse scroll and motion events that arrive too quickly.
-		if msg.Action == tea.MouseActionMotion || msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
-			if flag.Lookup("test.v") == nil {
-				now := time.Now()
-				if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
-					return m, nil
-				}
-				m.lastMouseEventTime = now
-			}
+		mouse := msg.Mouse()
+		if mouse.Button == tea.MouseLeft {
+			return m.handleSelectionMouse(selectionMouseEvent{
+				action: selectionMousePress,
+				x:      mouse.X,
+				y:      mouse.Y,
+			})
 		}
-		// Left button: in-app drag-select. The handler is
-		// the only place that consumes motion / release
-		// events; the wheel branch below only handles
-		// Press, so there's no double-handling.
-		if msg.Button == tea.MouseButtonLeft {
-			return m.handleSelectionMouse(msg)
-		}
-		// Wheel: Press only.
-		if msg.Action != tea.MouseActionPress {
+		return m, nil
+
+	case tea.MouseMotionMsg:
+		if !m.cfg.MouseCapture {
 			return m, nil
+		}
+		mouse := msg.Mouse()
+		if flag.Lookup("test.v") == nil {
+			now := time.Now()
+			if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
+				return m, nil
+			}
+			m.lastMouseEventTime = now
+		}
+		if mouse.Button == tea.MouseLeft {
+			return m.handleSelectionMouse(selectionMouseEvent{
+				action: selectionMouseMotion,
+				x:      mouse.X,
+				y:      mouse.Y,
+			})
+		}
+		return m, nil
+
+	case tea.MouseReleaseMsg:
+		if !m.cfg.MouseCapture {
+			return m, nil
+		}
+		mouse := msg.Mouse()
+		if mouse.Button == tea.MouseLeft {
+			return m.handleSelectionMouse(selectionMouseEvent{
+				action: selectionMouseRelease,
+				x:      mouse.X,
+				y:      mouse.Y,
+			})
+		}
+		return m, nil
+
+	case tea.MouseWheelMsg:
+		if !m.cfg.MouseCapture {
+			return m, nil
+		}
+		mouse := msg.Mouse()
+		if flag.Lookup("test.v") == nil {
+			now := time.Now()
+			if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
+				return m, nil
+			}
+			m.lastMouseEventTime = now
 		}
 		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
 			m.permissionLastInputAt = time.Now()
 			return m, nil
 		}
-		switch msg.Button {
-		case tea.MouseButtonWheelUp:
+		switch mouse.Button {
+		case tea.MouseWheelUp:
 			if m.inputMode == modeComposing {
-				m.viewport.LineUp(mouseWheelStepLines)
+				m.viewport.ScrollUp(mouseWheelStepLines)
 			} else {
 				m.scrollOverlay(-mouseWheelStepLines)
 			}
 			return m, nil
-		case tea.MouseButtonWheelDown:
+		case tea.MouseWheelDown:
 			if m.inputMode == modeComposing {
-				m.viewport.LineDown(mouseWheelStepLines)
+				m.viewport.ScrollDown(mouseWheelStepLines)
 			} else {
 				m.scrollOverlay(mouseWheelStepLines)
 			}
@@ -2219,36 +2659,37 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
 			m.permissionLastInputAt = time.Now()
 			return m, nil
 		}
 
-		if msg.Paste {
-			pastedStr := string(msg.Runes)
-			if strings.Contains(pastedStr, "\n") || strings.Contains(pastedStr, "\r") {
-				m.pastedTextCounter++
-				lines := strings.Split(strings.ReplaceAll(pastedStr, "\r\n", "\n"), "\n")
-				lineCount := len(lines)
-				placeholder := fmt.Sprintf("[Pasted text #%d +%d lines]", m.pastedTextCounter, lineCount)
-				if m.pastedTextReplacements == nil {
-					m.pastedTextReplacements = make(map[string]string)
-				}
-				m.pastedTextReplacements[placeholder] = pastedStr
-				m.input.InsertString(placeholder)
-			} else {
-				m.input.InsertString(pastedStr)
-			}
+		key := msg.String()
+		if handled := m.handleMouseEscapeString(key); handled {
 			return m, nil
 		}
 
-		key := msg.String()
+		if cmd, handled := m.dispatchCommandShortcut(msg); handled {
+			return m, cmd
+		}
 
-		// `ctrl+c` is global: always quits, even from inside an overlay.
-		// `q` only quits when the input box is empty AND we're not in an
-		// overlay (so q inside permission / help doesn't quit by accident).
-		if key == "ctrl+c" || (key == "q" && m.inputMode == modeComposing && !m.running && strings.TrimSpace(m.input.Value()) == "") {
+		// `ctrl+c` is global: open a confirmation overlay, even
+		// from inside another overlay. `q` only quits when the
+		// input box is empty AND we're not in an overlay (so q
+		// inside permission / help doesn't quit by accident).
+		if key == "ctrl+c" {
+			m.quitChoice = 1
+			m.setMode(modeQuitConfirm)
+			m.resize()
+			return m, nil
+		}
+		if key == "ctrl+d" {
+			m.topCardOpen = !m.topCardOpen
+			m.resize()
+			return m, nil
+		}
+		if key == "q" && m.inputMode == modeComposing && !m.running && strings.TrimSpace(m.input.Value()) == "" {
 			return m, tea.Quit
 		}
 
@@ -2259,27 +2700,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// up/down as multi-line cursor moves). Down past
 		// the bottom restores the live draft.
 		if m.inputMode == modeComposing {
-			if key == "up" || key == "ctrl+p" {
+			if key == "ctrl+p" && strings.TrimSpace(m.input.Value()) == "" {
+				m.paletteFilter = ""
+				m.paletteSelected = 0
+				m.setMode(modeSlashPick)
+				return m, nil
+			}
+			if isInputNewlineKey(key) {
+				m.insertInputNewline()
+				return m, nil
+			}
+			if key == "up" {
 				if len(m.promptHistory) > 0 && m.historyIndex < len(m.promptHistory)-1 {
 					if m.historyIndex == -1 {
 						m.historySaved = m.input.Value()
 					}
 					m.historyIndex++
-					m.input.SetValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
-					m.input.CursorEnd()
+					m.setInputValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
 					return m, nil
 				}
 				return m, nil
 			}
-			if key == "down" || key == "ctrl+n" {
+			if key == "down" {
 				if m.historyIndex > -1 {
 					m.historyIndex--
 					if m.historyIndex == -1 {
-						m.input.SetValue(m.historySaved)
+						m.setInputValue(m.historySaved)
 					} else {
-						m.input.SetValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
+						m.setInputValue(m.promptHistory[len(m.promptHistory)-1-m.historyIndex])
 					}
-					m.input.CursorEnd()
 					return m, nil
 				}
 				return m, nil
@@ -2428,7 +2877,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Phase 4 live-filter slash palette.
 			switch key {
 			case "esc":
-				m.input.SetValue("")
+				m.setInputValue("")
 				m.paletteFilter = ""
 				m.paletteSelected = 0
 				m.appendLine("status", "slash cancelled")
@@ -2454,7 +2903,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.paletteSelected = 0
 				} else {
 					// Filter is empty: bail out of the palette entirely.
-					m.input.SetValue("")
+					m.setInputValue("")
 					m.setMode(modeComposing)
 				}
 				return m, nil
@@ -2492,6 +2941,38 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.pendingProfileName = ""
 				m.setMode(modeComposing)
 				m.appendLine("status", "profile switch cancelled: "+cancelled)
+				return m, nil
+			}
+			return m, nil
+
+		case modeQuitConfirm:
+			// Quit confirmation mirrors Crush-style choice panels:
+			// up/down toggles the selected action, enter confirms
+			// the current row, and esc cancels. y/n remain accepted
+			// as compatibility shortcuts.
+			switch strings.ToLower(key) {
+			case "up", "down", "tab", "shift+tab":
+				if m.quitChoice == 0 {
+					m.quitChoice = 1
+				} else {
+					m.quitChoice = 0
+				}
+			case "y":
+				m.quitChoice = 0
+				return m, tea.Quit
+			case "enter":
+				if m.quitChoice == 0 {
+					return m, tea.Quit
+				}
+				m.setMode(modeComposing)
+				m.appendLine("status", "quit cancelled")
+				m.resize()
+				return m, nil
+			case "n", "esc":
+				m.quitChoice = 1
+				m.setMode(modeComposing)
+				m.appendLine("status", "quit cancelled")
+				m.resize()
 				return m, nil
 			}
 			return m, nil
@@ -2736,7 +3217,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.enterModelPicker()
 					}
 					m.modelPickProviderDraft = ""
-					m.input.SetValue("")
+					m.setInputValue("")
 					m.setMode(modeModelPickApiKey)
 				}
 				return m, nil
@@ -2750,7 +3231,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			case "enter":
 				m.modelPickProviderDraft = m.input.Value()
-				m.input.SetValue("")
+				m.setInputValue("")
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
 			}
@@ -2770,7 +3251,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					typed = provider.DefaultBaseURL
 				}
 				m.modelPickProviderDraft = typed
-				m.input.SetValue("")
+				m.setInputValue("")
 				m.modelPickSelectedIdx = 0
 				return m, m.enterModelPicker()
 			}
@@ -2845,6 +3326,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if key == "enter" {
 			rawPrompt := m.input.Value()
+			if before, ok := strings.CutSuffix(rawPrompt, "\\"); ok {
+				m.setInputValue(before)
+				m.insertInputNewline()
+				return m, nil
+			}
 			trimmed := strings.TrimSpace(rawPrompt)
 			if trimmed == "" || m.running {
 				return m, nil
@@ -2861,7 +3347,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.historyIndex = -1
 			m.historySaved = ""
-			m.input.SetValue("")
+			m.setInputValue("")
 			expandedPrompt := m.expandPromptPlaceholders(rawPrompt)
 			m.pastedTextReplacements = make(map[string]string)
 			m.pastedTextCounter = 0
@@ -2877,11 +3363,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, cmd
 			}
 			m.appendLine("user", trimmed)
+			timeout := resolveGoTuiTimeout(m.cfg, expandedPrompt, m.latestUsage)
+			m.currentTimeout = timeout
+			if timeout.Adaptive {
+				m.appendLine("status", timeout.Label())
+			}
 			m.running = true
 			m.pending = nil
 			m.lastEventType = ""
 			m.startedAt = time.Now()
-			return m, tea.Batch(startStream(m.cfg, expandedPrompt), m.gradientSpinner.Tick)
+			m.resize()
+			return m, tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
+		}
+
+	default:
+		if m.inputMode == modeComposing && m.handleUnknownCSIMessage(fmt.Sprint(msg)) {
+			return m, nil
 		}
 
 	case spinner.TickMsg:
@@ -3183,6 +3680,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolAuditMsg:
 		if msg.err != nil {
+			if msg.trigger == "auto" {
+				return m, nil
+			}
 			// Phase 4 wire: on Nexus HTTP failure, fall back
 			// to the static catalog so the user still sees a
 			// known-good tool list. The error line stays in
@@ -3226,59 +3726,95 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.running = false
 		m.pending = nil
 		return m, nil
+
+	case copyToastExpiredMsg:
+		if !m.copyToastShownAt.IsZero() && m.copyToastShownAt.Equal(msg.copiedAt) {
+			m.copyToastMessage = ""
+			m.copyToastShownAt = time.Time{}
+		}
+		return m, nil
 	}
 
 	var inputCmd tea.Cmd
+	oldInputHeight := m.input.Height()
 	m.input, inputCmd = m.input.Update(msg)
+	m.syncInputHeight()
+	if m.input.Height() != oldInputHeight {
+		m.resize()
+	}
 	m.viewport, _ = m.viewport.Update(msg)
 	return m, inputCmd
 }
 
 func (m *model) resize() {
 	width := max(40, m.width)
-	headerHeight := 3
-	permissionHeight := 0
-	if m.pending != nil {
-		permissionHeight = 3
-	}
-	// Single-line input row (the prompt is always one row
-	// tall, regardless of the overall terminal height). The
-	// 3-row setup was a vestige of the multi-line textarea
-	// days; on a single-line prompt it produced a triple
-	// `>` box on every resize.
-	inputHeight := 1
-	if m.running {
-		inputHeight = 2
-	}
-	footerHeight := 2
 	m.input.SetWidth(max(20, width-4))
-	m.input.SetHeight(1)
-	// Reserve a 1-column gutter on the right of the transcript
-	// for the vertical scrollbar. See Scrollbar() in scrollbar.go.
+	m.syncInputHeight()
+	chromeHeight := m.nonTranscriptChromeHeight(width)
 	// Cap at maxTranscriptWidth so very wide terminals (4K) don't
 	// stretch the prose to unreadable line lengths; header / footer
 	// / input still use the full terminal width because their
 	// content is short.
-	m.viewport.Width = max(20, min(width-1, maxTranscriptWidth))
-	m.viewport.Height = max(6, m.height-headerHeight-permissionHeight-inputHeight-footerHeight)
+	m.viewport.SetWidth(max(20, min(width, maxTranscriptWidth)))
+	if m.topCardOpen {
+		m.viewport.SetHeight(max(0, m.height-chromeHeight))
+		return
+	}
+	m.viewport.SetHeight(max(0, m.height-chromeHeight))
 }
 
-func (m model) View() string {
+func (m model) nonTranscriptChromeHeight(width int) int {
+	if m.topCardOpen {
+		parts := []string{m.renderHeader(width), m.renderTopCard(width), m.renderFooter(width)}
+		height := 0
+		for _, part := range parts {
+			height += lipgloss.Height(part)
+		}
+		return height + max(0, len(parts)-1)
+	}
+	parts := []string{m.renderHeader(width)}
+	if topCard := m.renderTopCard(width); topCard != "" {
+		parts = append(parts, topCard)
+	}
+	for _, part := range []string{
+		m.renderPermission(width),
+		m.renderPermissionEditor(width),
+		m.renderHelp(width),
+		m.renderSlashPalette(width),
+		m.renderProfileConfirm(width),
+		m.renderContextOverlay(width),
+		m.renderInboxOverlay(width),
+		m.renderAgentOverlay(width),
+		m.renderTaskBoard(width),
+		m.renderActivityOverlay(width),
+		m.renderToolAuditOverlay(width),
+		m.renderModelOverlay(width),
+		m.renderModelPickProvider(width),
+		m.renderModelPickApiKey(width),
+		m.renderModelPickBaseURL(width),
+		m.renderModelPickModel(width),
+		m.renderQuitConfirm(width),
+	} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	parts = append(parts, m.renderInput(width), m.renderFooter(width))
+	height := 0
+	for _, part := range parts {
+		height += lipgloss.Height(part)
+	}
+	return height
+}
+
+func (m model) viewString() string {
 	width := max(40, m.width)
 	header := m.renderHeader(width)
-	transcriptView := m.applySelectionHighlight(m.viewport.View())
-	// Vertical scrollbar column. Always render (track-only when
-	// the content fits in the viewport) so the operator can see
-	// the scroll position at a glance. m.viewport.Width is set
-	// to width-1 in resize() to leave this column blank in the
-	// viewport; the scrollbar then fills it.
-	scrollbar := Scrollbar(
-		m.viewport.TotalLineCount(),
-		m.viewport.VisibleLineCount(),
-		m.viewport.YOffset,
-		m.viewport.Height,
-	)
-	transcript := lipgloss.JoinHorizontal(lipgloss.Top, transcriptView, scrollbar)
+	topCard := m.renderTopCard(width)
+	if topCard != "" {
+		return strings.Join([]string{header, topCard, m.renderFooter(width)}, "\n")
+	}
+	transcript := m.highlightedViewportView()
 	permission := m.renderPermission(width)
 	permissionEditor := m.renderPermissionEditor(width)
 	input := m.renderInput(width)
@@ -3297,6 +3833,7 @@ func (m model) View() string {
 	modelPickApiKey := m.renderModelPickApiKey(width)
 	modelPickBaseURL := m.renderModelPickBaseURL(width)
 	modelPickModel := m.renderModelPickModel(width)
+	quitConfirm := m.renderQuitConfirm(width)
 
 	parts := []string{header, transcript}
 	if permission != "" {
@@ -3347,8 +3884,24 @@ func (m model) View() string {
 	if modelPickModel != "" {
 		parts = append(parts, modelPickModel)
 	}
+	if quitConfirm != "" {
+		parts = append(parts, quitConfirm)
+	}
 	parts = append(parts, input, footer)
 	return strings.Join(parts, "\n")
+}
+
+func (m model) View() tea.View {
+	view := tea.NewView(m.viewString())
+	if m.cfg.AltScreen {
+		view.AltScreen = true
+	}
+	if m.cfg.MouseCapture {
+		view.MouseMode = tea.MouseModeCellMotion
+	}
+	view.KeyboardEnhancements.ReportAlternateKeys = true
+	view.KeyboardEnhancements.ReportAllKeysAsEscapeCodes = false
+	return view
 }
 
 var helpOverlayLines = []string{
@@ -3358,7 +3911,9 @@ var helpOverlayLines = []string{
 	"  enter            submit the current prompt",
 	"  /                (followed by command) open slash palette (one-shot)",
 	"  ?  (empty input) toggle this help overlay",
-	"  ctrl+c / q       quit when input is empty",
+	"  ctrl+d           toggle the top context card",
+	"  ctrl+c           open quit confirmation",
+	"  q                quit when input is empty",
 	"  up / down        walk per-session prompt history (single-line input)",
 	"  pgup / pgdown    page-scroll the transcript viewport",
 	"  mouse wheel      scroll 5 lines per tick — transcript viewport in",
@@ -3490,6 +4045,14 @@ func (m model) renderProfileConfirm(width int) string {
 	lines = append(lines, "  n / esc     cancel and stay on the current profile")
 	body := strings.Join(lines, "\n")
 	return renderOverlayFrame(width, confirmStyle.Render(wrapPlain(body, max(0, width-2))))
+}
+
+// renderQuitConfirm paints the confirmation overlay shown during quit.
+func (m model) renderQuitConfirm(width int) string {
+	if m.inputMode != modeQuitConfirm {
+		return ""
+	}
+	return newQuitDialog(m.quitChoice).View(width)
 }
 
 // renderContextOverlay paints the multi-line context analysis
@@ -5217,25 +5780,7 @@ func (m model) renderModelPickApiKey(width int) string {
 	if m.inputMode != modeModelPickApiKey {
 		return ""
 	}
-	provider := m.currentModelProvider()
-	providerID := ""
-	if provider != nil {
-		providerID = provider.ID
-	}
-	header := titleStyle.Render(fmt.Sprintf("%s API key", firstNonEmpty(providerID, "Provider")))
-	hint := mutedStyle.Render("Paste API key (Press Enter to confirm, esc to go back.)")
-	lines := []string{header, hint, ""}
-	if provider != nil {
-		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  default model: %s", provider.DefaultModel)))
-		lines = append(lines, "")
-	}
-	// Render the input box via the standard input model.
-	// m.input.Prompt is already "> " so we don't add a second
-	// prompt prefix here — that would render as "  > > …".
-	lines = append(lines, "  "+m.input.View())
-	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
-	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	return newModelPickApiKeyDialog(m.currentModelProvider(), m.input.View()).View(width)
 }
 
 // renderModelPickBaseURL is step 3: confirm or override the
@@ -5246,20 +5791,7 @@ func (m model) renderModelPickBaseURL(width int) string {
 	if m.inputMode != modeModelPickBaseURL {
 		return ""
 	}
-	provider := m.currentModelProvider()
-	providerID := ""
-	defaultURL := ""
-	if provider != nil {
-		providerID = provider.ID
-		defaultURL = provider.DefaultBaseURL
-	}
-	header := titleStyle.Render(fmt.Sprintf("%s base URL", firstNonEmpty(providerID, "Provider")))
-	hint := mutedStyle.Render(fmt.Sprintf("Press Enter to use %s.", firstNonEmpty(defaultURL, "<provider default>")))
-	lines := []string{header, hint, ""}
-	lines = append(lines, "  "+m.input.View())
-	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
-	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	return newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View()).View(width)
 }
 
 // renderModelPickModel is step 4: pick a model from the
@@ -5270,95 +5802,15 @@ func (m model) renderModelPickModel(width int) string {
 	if m.inputMode != modeModelPickModel {
 		return ""
 	}
-	provider := m.currentModelProvider()
-	providerID := ""
-	if provider != nil {
-		providerID = provider.ID
-	}
-	header := titleStyle.Render(fmt.Sprintf("%s models", firstNonEmpty(providerID, "Provider")))
-	subtitle := mutedStyle.Render("Pick a model. enter selects; esc back to base URL.")
-	lines := []string{header, subtitle, ""}
-
-	// Loading state: the picker step fires a fresh
-	// /v1/runtime/models request on entry. While that
-	// request is in flight, render a spinner + status
-	// hint so the operator sees progress instead of an
-	// empty list. The runtimeModelsMsg handler clears
-	// `modelPickerLoading` when the response lands (or
-	// when the request errors out and we fall back to
-	// the hardcoded catalog).
-	if m.modelPickerLoading {
-		lines = append(lines, "  "+m.spinner.View()+"  refreshing model list…")
-		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("  esc back · cancel re-fetch"))
-		return renderOverlayFrame(width, strings.Join(lines, "\n"))
-	}
-
-	// Submitting state: the operator pressed Enter and the
-	// POST /v1/runtime/config/select request is in flight.
-	// Hide the list (the row they picked is now committed)
-	// and show a "saving…" line. Esc is intentionally still
-	// allowed in the Update handler — the server-side write
-	// usually lands in <50ms and the operator can use esc to
-	// back out of the picker frame if the network is slow.
-	if m.modelPickSubmitting {
-		lines = append(lines, "  "+m.spinner.View()+"  saving model…")
-		lines = append(lines, "")
-		lines = append(lines, mutedStyle.Render("  esc back to base URL (request still in flight)"))
-		return renderOverlayFrame(width, strings.Join(lines, "\n"))
-	}
-
-	// Prefer the live-fetched list when present. Falls
-	// back to the hardcoded catalog entry on the picked
-	// provider when the live fetch never landed.
-	models := m.modelPickerLive
-	if len(models) == 0 && provider != nil {
-		models = provider.Models
-	}
-	if len(models) == 0 {
-		lines = append(lines, mutedStyle.Render("  No models registered for this provider."))
-	} else {
-		// Single-column model list: just the display name.
-		// The picker commits the underlying ID on Enter, so
-		// showing the long `provider/model-id` slug in the
-		// row would be redundant chrome — the operator only
-		// needs to recognise the model. Falls back to the
-		// id when the provider's catalog doesn't include a
-		// friendly name.
-		lines = append(lines, mutedStyle.Render("  model"))
-		visibleRows := max(1, m.height-12)
-		scrollOffset := 0
-		if m.modelPickSelectedIdx >= visibleRows {
-			scrollOffset = m.modelPickSelectedIdx - visibleRows + 1
-		}
-		if scrollOffset+visibleRows > len(models) {
-			scrollOffset = max(0, len(models)-visibleRows)
-		}
-		if scrollOffset > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
-		}
-		for i := 0; i < visibleRows && scrollOffset+i < len(models); i++ {
-			actualIdx := scrollOffset + i
-			entry := models[actualIdx]
-			marker := "  "
-			if actualIdx == m.modelPickSelectedIdx {
-				marker = "> "
-			}
-			display := firstNonEmpty(entry.Name, entry.ID)
-			row := marker + display
-			if actualIdx == m.modelPickSelectedIdx {
-				row = focusedLineStyle.Render(row)
-			}
-			lines = append(lines, "  "+row)
-		}
-		remainingBelow := len(models) - (scrollOffset + visibleRows)
-		if remainingBelow > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
-		}
-	}
-	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc back"))
-	return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	return newModelPickModelDialog(
+		m.currentModelProvider(),
+		m.modelPickerLive,
+		m.modelPickSelectedIdx,
+		m.height,
+		m.modelPickerLoading,
+		m.modelPickSubmitting,
+		m.spinner.View(),
+	).View(width)
 }
 
 // padRightPlain pads a string with spaces to the given
@@ -5456,6 +5908,104 @@ func formatCharCount(n int) string {
 	}
 }
 
+func formatTokenCount(n int) string {
+	switch {
+	case n <= 0:
+		return "0"
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 10_000:
+		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
+	case n < 1_000_000:
+		return fmt.Sprintf("%dk", n/1000)
+	default:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000.0)
+	}
+}
+
+func shortCwd(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		if cwd == home {
+			return "~"
+		}
+		if strings.HasPrefix(cwd, home+string(os.PathSeparator)) {
+			cwd = "~" + strings.TrimPrefix(cwd, home)
+		}
+	}
+	if lipgloss.Width(cwd) <= 28 {
+		return cwd
+	}
+	parts := strings.Split(filepath.ToSlash(cwd), "/")
+	filtered := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if part != "" {
+			filtered = append(filtered, part)
+		}
+	}
+	if len(filtered) >= 2 {
+		return "…/" + strings.Join(filtered[len(filtered)-2:], "/")
+	}
+	return truncatePlain(cwd, 28)
+}
+
+func joinTopCardColumns(width int, headersAndRows ...any) string {
+	if width < 72 {
+		lines := []string{}
+		for i := 0; i+1 < len(headersAndRows); i += 2 {
+			header, _ := headersAndRows[i].(string)
+			rows, _ := headersAndRows[i+1].([]string)
+			lines = append(lines, mutedStyle.Render(header))
+			for _, row := range rows {
+				lines = append(lines, "  "+truncatePlain(row, max(8, width-2)))
+			}
+		}
+		return strings.Join(lines, "\n")
+	}
+	columnCount := len(headersAndRows) / 2
+	columnWidth := max(12, (width-(columnCount-1)*3)/columnCount)
+	maxRows := 0
+	for i := 1; i < len(headersAndRows); i += 2 {
+		rows, _ := headersAndRows[i].([]string)
+		maxRows = max(maxRows, len(rows))
+	}
+	renderCell := func(text string, cellWidth int) string {
+		return padVisible(truncatePlain(text, cellWidth), cellWidth)
+	}
+	lines := []string{}
+	headerCells := make([]string, 0, columnCount)
+	for i := 0; i+1 < len(headersAndRows); i += 2 {
+		header, _ := headersAndRows[i].(string)
+		headerCells = append(headerCells, mutedStyle.Render(renderCell(header, columnWidth)))
+	}
+	lines = append(lines, strings.Join(headerCells, "   "))
+	for rowIdx := 0; rowIdx < maxRows; rowIdx++ {
+		cells := make([]string, 0, columnCount)
+		for i := 1; i < len(headersAndRows); i += 2 {
+			rows, _ := headersAndRows[i].([]string)
+			value := ""
+			if rowIdx < len(rows) {
+				value = rows[rowIdx]
+			}
+			cells = append(cells, renderCell(value, columnWidth))
+		}
+		lines = append(lines, strings.Join(cells, "   "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func padVisible(text string, width int) string {
+	pad := width - lipgloss.Width(text)
+	if pad <= 0 {
+		return text
+	}
+	return text + strings.Repeat(" ", pad)
+}
+
 // renderSlashPalette paints the live-filter palette above the input
 // line. It is a compact overlay: header (current filter), up to
 // 6 candidates with the selected one highlighted, and a hint row.
@@ -5463,7 +6013,7 @@ func (m model) renderSlashPalette(width int) string {
 	if m.inputMode != modeSlashPick {
 		return ""
 	}
-	matched := filterSlashCommands(m.paletteFilter)
+	matched := filterSlashCommandMatches(m.paletteFilter)
 	// visibleHeight mirrors the TS TUI's slash palette (8 rows);
 	// it keeps the palette compact enough to read at a glance
 	// while letting the user scroll through longer filtered lists
@@ -5515,11 +6065,12 @@ func (m model) renderSlashPalette(width int) string {
 			if actualIdx == idx {
 				marker = "> "
 			}
-			name := c.name
-			if len(name) < commandColumnWidth-1 {
-				name = name + strings.Repeat(" ", commandColumnWidth-1-len(name))
+			name := highlightSlashCommandName(c)
+			plainName := c.command.name
+			if len(plainName) < commandColumnWidth-1 {
+				name = name + strings.Repeat(" ", commandColumnWidth-1-len(plainName))
 			}
-			summary := truncatePlain(c.summary, summaryWidth)
+			summary := truncatePlain(c.command.summary, summaryWidth)
 			line := fmt.Sprintf("%s%s  %s", marker, name, mutedStyle.Render(summary))
 			if actualIdx == idx {
 				line = focusedLineStyle.Render(line)
@@ -5536,25 +6087,13 @@ func (m model) renderSlashPalette(width int) string {
 }
 
 func (m model) renderHeader(width int) string {
-	// Single-row header: title + run state. The earlier chrome
-	// (build tag, cwd, session id) was dropped: the build tag
-	// is `--version` output, cwd is what `bbl go --cwd` was
-	// given on launch, and the session id is a short id that's
-	// already attached to every message the user submits —
-	// surfacing them in the header didn't help the operator
-	// make a decision, it just widened the chrome.
+	// Header chrome: a quiet guard divider first, then title + run
+	// state. Rendering the title below the first row keeps it visible
+	// in terminals that clip the very top scanline/row.
 	title := titleStyle.Render("BabeL-O · Go TUI")
-	// ✓ marker is rendered in statusStyle (cyan) once the first
-	// session_started event has been observed; before that the
-	// TUI is still in the post-`bbl go` connect window.
 	if m.connected {
 		title = title + " " + statusStyle.Render("✓")
 	}
-	// Version suffix in muted gray so the operator can
-	// confirm the build they're running at a glance (bbl-go-tui
-	// was previously a separate subtitle row; the operator still
-	// wants the build tag visible, just inline with the title).
-	title = title + " " + mutedStyle.Render("v"+Version)
 	stateLabel := "idle"
 	stateKind := stateStyle(false, nil)
 	if m.running {
@@ -5584,18 +6123,175 @@ func (m model) renderHeader(width int) string {
 		stateKind = permissionStyle
 	}
 	state := stateKind.Render(stateLabel)
-	top := joinColumns(width, title, state)
-
-	// Compact mode: drop the divider so the header fits in a
-	// single line. The title + state column is already one
-	// line; we just skip the underline. Phase A.4.
-	if m.isCompact() {
-		return top
+	slashWidth := max(4, min(24, width-lipgloss.Width(title)-lipgloss.Width(state)-36))
+	slashes := topCardAccentStyle.Render(strings.Repeat("/", slashWidth))
+	context := m.formatContextUsageLabel()
+	toggle := "ctrl+d open"
+	if m.topCardOpen {
+		toggle = "ctrl+d close"
 	}
+	metaParts := []string{}
+	metaParts = append(metaParts, context, toggle)
+	metaPlain := strings.Join(metaParts, " · ")
+	stateWidth := lipgloss.Width(state)
+	leftBudget := max(0, width-stateWidth-1)
+	metaBudget := leftBudget - lipgloss.Width(title) - slashWidth - 2
+	if metaBudget < 0 {
+		slashWidth = max(0, leftBudget-lipgloss.Width(title)-1)
+		metaBudget = 0
+	}
+	slashes = topCardAccentStyle.Render(strings.Repeat("/", slashWidth))
+	meta := mutedStyle.Render(truncatePlain(metaPlain, metaBudget))
+	left := strings.TrimSpace(title + " " + slashes + " " + meta)
+	top := joinColumns(width, left, state)
+
 	return strings.Join([]string{
+		divider(width),
 		top,
 		divider(width),
 	}, "\n")
+}
+
+func (m model) renderTopCard(width int) string {
+	if !m.topCardOpen {
+		return ""
+	}
+	innerWidth := max(20, width-4)
+	title := focusedLineStyle.Render(truncatePlain(firstNonEmpty(m.input.Value(), "Ready for the next turn"), innerWidth))
+	modelLine := strings.TrimSpace(strings.Join([]string{
+		firstNonEmpty(m.modelID, "model pending"),
+		firstNonEmpty(m.providerID, "provider pending"),
+		firstNonEmpty(m.activeProfile, "profile pending"),
+	}, " · "))
+	if m.sessionID != "" {
+		modelLine += " · session " + shortID(m.sessionID)
+	}
+	usage := m.formatContextUsageDetail()
+	columns := joinTopCardColumns(innerWidth,
+		"MCPs", m.topCardMCPRows(),
+		"Skills", []string{"reserved: runtime skills"},
+		"Session to session", m.topCardSessionRows(),
+		"Memory", []string{"reserved: memory"},
+	)
+	content := strings.Join([]string{
+		title,
+		mutedStyle.Render(truncatePlain(modelLine, innerWidth)),
+		statusStyle.Render(truncatePlain(usage, innerWidth)),
+		"",
+		columns,
+		mutedStyle.Render(truncatePlain("ctrl+d close · /tools audit · /context inspect", innerWidth)),
+	}, "\n")
+	frameWidth := max(0, width-2)
+	frame := topCardFrameStyle.Width(frameWidth)
+	if m.height > 0 {
+		available := m.height - lipgloss.Height(m.renderHeader(width)) - lipgloss.Height(m.renderFooter(width))
+		if available > lipgloss.Height(content)+2 {
+			frame = frame.Height(available)
+		}
+	}
+	return frame.Render(content)
+}
+
+func (m model) formatContextUsageLabel() string {
+	used := 0
+	if m.latestUsage != nil {
+		used = m.latestUsage.InputTokens
+	} else if m.lastUsage != nil {
+		used = m.lastUsage.InputTokens
+	}
+	if used <= 0 && m.contextWindow <= 0 {
+		return "context --"
+	}
+	if m.contextWindow <= 0 {
+		return fmt.Sprintf("context %s", formatTokenCount(used))
+	}
+	percent := clamp((used*100+m.contextWindow/2)/m.contextWindow, 0, 999)
+	return fmt.Sprintf("context %d%%", percent)
+}
+
+func (m model) formatContextUsageDetail() string {
+	used := 0
+	cache := 0
+	if m.latestUsage != nil {
+		used = m.latestUsage.InputTokens
+		cache = m.latestUsage.CacheRead
+	} else if m.lastUsage != nil {
+		used = m.lastUsage.InputTokens
+		cache = m.lastUsage.CacheRead
+	}
+	if used <= 0 && m.contextWindow <= 0 {
+		return "context: waiting for usage snapshot"
+	}
+	if m.contextWindow <= 0 {
+		if cache > 0 {
+			return fmt.Sprintf("context: %s input · %s cache", formatTokenCount(used), formatTokenCount(cache))
+		}
+		return fmt.Sprintf("context: %s input", formatTokenCount(used))
+	}
+	percent := clamp((used*100+m.contextWindow/2)/m.contextWindow, 0, 999)
+	remaining := max(0, m.contextWindow-used)
+	detail := fmt.Sprintf("context: %s / %s used · %d%% · %s remaining",
+		formatTokenCount(used), formatTokenCount(m.contextWindow), percent, formatTokenCount(remaining))
+	if cache > 0 {
+		detail += " · " + formatTokenCount(cache) + " cache"
+	}
+	return detail
+}
+
+func (m model) topCardMCPRows() []string {
+	servers := map[string]int{}
+	for _, entry := range m.toolAuditEntries {
+		if entry.Source == nil || entry.Source.Type != toolSourceMCP {
+			continue
+		}
+		server := strings.TrimSpace(entry.Source.ServerName)
+		if server == "" {
+			server = "mcp"
+		}
+		servers[server]++
+	}
+	if len(servers) == 0 {
+		return []string{"none detected"}
+	}
+	names := make([]string, 0, len(servers))
+	for server := range servers {
+		names = append(names, server)
+	}
+	sort.Strings(names)
+	rows := make([]string, 0, min(len(names), 3))
+	for _, server := range names {
+		rows = append(rows, fmt.Sprintf("● %s (%d)", server, servers[server]))
+		if len(rows) == 3 {
+			break
+		}
+	}
+	if remaining := len(names) - len(rows); remaining > 0 {
+		rows = append(rows, fmt.Sprintf("+%d more", remaining))
+	}
+	return rows
+}
+
+func (m model) topCardSessionRows() []string {
+	rows := []string{}
+	if m.sessionID != "" {
+		rows = append(rows, "session "+shortID(m.sessionID))
+	}
+	unread := 0
+	for _, message := range m.inboxMessages {
+		if message.Status != messageStatusAcknowledged {
+			unread++
+		}
+	}
+	if len(m.inboxMessages) > 0 {
+		rows = append(rows, fmt.Sprintf("inbox %d unread / %d total", unread, len(m.inboxMessages)))
+	}
+	if len(m.inboxChannels) > 0 {
+		rows = append(rows, fmt.Sprintf("channels %d", len(m.inboxChannels)))
+	}
+	if len(rows) == 0 {
+		rows = append(rows, "reserved for session links")
+	}
+	return rows
 }
 
 func (m *model) handleLocalCommand(input string) tea.Cmd {
@@ -5624,6 +6320,9 @@ func (m *model) applyRuntimeConfig(config runtimeConfig) {
 	if config.ModelID != "" {
 		m.modelID = config.ModelID
 	}
+	if config.ContextWindow > 0 {
+		m.contextWindow = config.ContextWindow
+	}
 	m.providerID = config.ProviderID
 	m.activeProfile = config.ActiveProfile
 	if config.Version > 0 {
@@ -5633,48 +6332,7 @@ func (m *model) applyRuntimeConfig(config runtimeConfig) {
 }
 
 func (m model) renderPermission(width int) string {
-	if m.pending == nil {
-		return ""
-	}
-	header := titleStyle.Render("Permission: " + firstNonEmpty(m.pending.name, "tool") +
-		"  (" + firstNonEmpty(m.pending.risk, "unknown") + " risk)")
-	var rows []string
-	rows = append(rows, header)
-	// Phase A.1 of the enhanced permission panel: 5-option
-	// multi-choice panel with a `~` cursor on the active row and
-	// the runtime-suggested allow rule surfaced above the
-	// choices. The header is `Waiting for permission...` with
-	// the tool name + risk, then the rendered tool input, then
-	// `Suggested rule: …`, then the 5 choices, then a one-line
-	// keyboard hint footer.
-	rows = append(rows, permissionStyle.Render("Waiting for permission..."))
-	if input := strings.TrimSpace(m.pending.input); input != "" {
-		rows = append(rows, "input:")
-		rows = append(rows, wrapPlain(input, max(0, width-6)))
-	}
-	if suggested := strings.TrimSpace(m.pending.suggestedRule); suggested != "" {
-		rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
-	}
-	choices := []string{
-		"Approve once",
-		"Approve for this session",
-		"Approve with editable rule",
-		"Reject",
-		"Reject, tell the model what to do instead",
-	}
-	for i, choice := range choices {
-		marker := " "
-		if i == m.permissionChoice {
-			marker = "~"
-		}
-		rows = append(rows, fmt.Sprintf(" %s [%d] %s", marker, i+1, choice))
-	}
-	rows = append(rows, permissionStyle.Render("▲/▼ select   1/2/3/4/5 choose   ↵ confirm   esc cancel"))
-	if msg := strings.TrimSpace(m.pending.message); msg != "" {
-		rows = append(rows, permissionStyle.Render("reason: "+msg))
-	}
-	body := strings.Join(rows, "\n")
-	return permissionFrameStyle.Width(max(0, width-2)).Render(body)
+	return newPermissionDialog(m.pending, m.permissionChoice).View(width)
 }
 
 // renderPermissionEditor is the Round 2 inline text editor
@@ -5700,37 +6358,7 @@ func (m model) renderPermissionEditor(width int) string {
 	if m.inputMode != modePermissionEditRule && m.inputMode != modePermissionEditFeedback {
 		return ""
 	}
-	headerText := "Editing feedback for " + firstNonEmpty(m.pending.name, "tool")
-	if m.inputMode == modePermissionEditRule {
-		headerText = "Editing rule for " + firstNonEmpty(m.pending.name, "tool")
-	}
-	header := titleStyle.Render(headerText)
-	rows := []string{header}
-	rows = append(rows, permissionStyle.Render(firstNonEmpty(m.pending.risk, "unknown")+" risk"))
-	if input := strings.TrimSpace(m.pending.input); input != "" {
-		rows = append(rows, "input:")
-		rows = append(rows, wrapPlain(input, max(0, width-6)))
-	}
-	if msg := strings.TrimSpace(m.pending.message); msg != "" {
-		rows = append(rows, permissionStyle.Render("reason: "+msg))
-	}
-	if m.inputMode == modePermissionEditRule {
-		if suggested := strings.TrimSpace(m.pending.suggestedRule); suggested != "" {
-			rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
-		}
-		rows = append(rows, "")
-		// m.input.Prompt is already "> " so don't add a second
-		// one — would otherwise render as "  > > …".
-		rows = append(rows, "  "+m.input.View())
-		rows = append(rows, permissionStyle.Render("Edit the allow rule. Examples: git:status, bash:*, npm:install. Empty = plain approve (scope=once)."))
-	} else {
-		rows = append(rows, "")
-		rows = append(rows, "  "+m.input.View())
-		rows = append(rows, permissionStyle.Render("Tell the model what to do instead. Empty = plain reject (no follow-up hint)."))
-	}
-	rows = append(rows, permissionStyle.Render("↵ confirm   esc back to options"))
-	body := strings.Join(rows, "\n")
-	return permissionFrameStyle.Width(max(0, width-2)).Render(body)
+	return newPermissionEditorDialog(m.pending, m.inputMode, m.input.View()).View(width)
 }
 
 func (m model) renderInput(width int) string {
@@ -5753,33 +6381,37 @@ func (m model) renderInput(width int) string {
 		m.inputMode == modePermissionEditFeedback {
 		return divider(width) + "\n"
 	}
-	prompt := m.input.View()
-	if m.running {
-		prompt = focusedLineStyle.Render(prompt)
-	}
-	loader := ""
-	if m.running {
-		loader = "  " + m.gradientSpinner.View() + "\n"
-	}
+	inputView := m.input.View()
+	prompt := inputBlockStyle.Width(max(0, width)).Render(inputView)
 	return strings.Join([]string{
-		loader + divider(width),
+		divider(width),
 		prompt,
 	}, "\n")
 }
 
 func (m model) renderFooter(width int) string {
-	// Row 1: the keyboard hint + elapsed time + quit reminder.
-	// Coloured by run state so idle / running / permission-pending
-	// read distinctly without scanning the header.
-	//
-	// Phase A.1: hint + quit reminders are now rendered through
-	// ButtonGroup so the hotkey character (e for "enter submit",
-	// c for "ctrl+c", q for "quit") is underlined. The operator
-	// can spot the binding without scanning every key in the
-	// help card.
-	hint := ButtonGroup([]ButtonOpt{
-		{Text: "enter submit", UnderlineIndex: 0},
-	}, "")
+	// Row 1 follows Crush's status-bar shape: normal operation
+	// shows compact keyboard help; transient info messages (like
+	// clipboard copy success) temporarily replace that help.
+	if msg := strings.TrimSpace(m.copyToastMessage); msg != "" && !m.copyToastShownAt.IsZero() {
+		topRow := confirmStyle.Render(truncatePlain("✓ "+msg, width))
+		if m.isCompact() {
+			return topRow
+		}
+		if bottomRow := m.renderFooterSummary(width); bottomRow != "" {
+			return topRow + "\n" + bottomRow
+		}
+		return topRow
+	}
+
+	hint := strings.Join([]string{
+		"/ or ctrl+p commands",
+		"ctrl+d panel",
+		"ctrl+l models",
+		"shift+enter newline",
+		"ctrl+c quit",
+		"? help",
+	}, " · ")
 	if m.running {
 		hint = "waiting for Nexus events"
 	}
@@ -5790,13 +6422,16 @@ func (m model) renderFooter(width int) string {
 	if !m.startedAt.IsZero() && m.running {
 		elapsed = fmt.Sprintf("  elapsed=%s", time.Since(m.startedAt).Round(time.Second))
 	}
-	quitHints := ButtonGroup([]ButtonOpt{
-		{Text: "ctrl+c quit", UnderlineIndex: 5},     // "ctrl+" is 5 chars, then "c"
-		{Text: "q quit when idle", UnderlineIndex: 0}, // "q" is the hotkey
-	}, "  ")
 	topRow := footerStyle.Render(truncatePlain(
-		fmt.Sprintf("%s%s  %s", hint, elapsed, quitHints), width))
+		"  "+strings.TrimSpace(strings.Join([]string{hint, strings.TrimSpace(elapsed)}, " ")), width))
 
+	if bottomRow := m.renderFooterSummary(width); bottomRow != "" {
+		return topRow + "\n" + bottomRow
+	}
+	return topRow
+}
+
+func (m model) renderFooterSummary(width int) string {
 	// Row 2: side-channel summary — inbox / agents / usage.
 	// Kept as a separate muted line so the keyboard hint on row 1
 	// stays scannable. The latest usage snapshot is rendered
@@ -5819,14 +6454,10 @@ func (m model) renderFooter(width int) string {
 			sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
 		}
 	}
-	bottomRow := ""
 	if len(sideParts) > 0 {
-		bottomRow = mutedStyle.Render(truncatePlain(strings.Join(sideParts, "  · "), width))
+		return mutedStyle.Render(truncatePlain(strings.Join(sideParts, "  · "), width))
 	}
-	if bottomRow == "" {
-		return topRow
-	}
-	return topRow + "\n" + bottomRow
+	return ""
 }
 
 // fetchInboxWithSession is the gated entry point the /inbox slash
@@ -5896,8 +6527,7 @@ func (m *model) quoteSelectedInboxMessage() tea.Cmd {
 	}
 	message := m.inboxMessages[m.inboxOverlaySelected]
 	quote := quoteInboxMessageContent(message)
-	m.input.SetValue(quote)
-	m.input.CursorEnd()
+	m.setInputValue(quote)
 	m.setMode(modeComposing)
 	m.inboxOverlayScroll = 0
 	// Preserve inboxOverlaySelected so a future reopen lands on
@@ -5974,18 +6604,42 @@ func (m *model) sendPermissionDecision(approved bool, reason, scope, rule, feedb
 	m.setMode(modeComposing)
 }
 
+func (m *model) recordPermissionRuleSeen(rule string, now time.Time) int {
+	rule = strings.TrimSpace(rule)
+	if rule == "" {
+		return 0
+	}
+	if m.recentPermissionRules == nil {
+		m.recentPermissionRules = map[string]permissionRuleSeen{}
+	}
+	for key, seen := range m.recentPermissionRules {
+		if now.Sub(seen.last) > repeatedPermissionRuleWindow {
+			delete(m.recentPermissionRules, key)
+		}
+	}
+	seen := m.recentPermissionRules[rule]
+	if seen.count == 0 || now.Sub(seen.last) > repeatedPermissionRuleWindow {
+		seen.count = 0
+	}
+	seen.count++
+	seen.last = now
+	m.recentPermissionRules[rule] = seen
+	return seen.count
+}
+
 // confirmPermissionChoice is the Phase A.1 entry point invoked
 // when the operator presses enter (or a number key 1-5) on the
 // 5-option permission panel. It maps the cursor to the right
 // scope/rule/feedback combination and calls sendPermissionDecision.
 //
 // Mapping (cursor index 0..4 → choice):
-//   0 — Approve once                       → scope="once",   rule="",    feedback=""
-//   1 — Approve for this session           → scope="session", rule=suggested, feedback=""
-//   2 — Approve with editable rule         → scope="session", rule=<edited> (Round 2 inline editor),
-//                                                or scope="once" if the operator cleared the rule
-//   3 — Reject                             → scope="once",   rule="",    feedback=""
-//   4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=<typed>
+//
+//	0 — Approve once                       → scope="once",   rule="",    feedback=""
+//	1 — Approve for this session           → scope="session", rule=suggested, feedback=""
+//	2 — Approve with editable rule         → scope="session", rule=<edited> (Round 2 inline editor),
+//	                                             or scope="once" if the operator cleared the rule
+//	3 — Reject                             → scope="once",   rule="",    feedback=""
+//	4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=<typed>
 //
 // Hard invariants:
 //   - "session" scope is only emitted when there is a non-empty
@@ -6058,8 +6712,7 @@ func (m *model) enterPermissionRuleEditor() {
 	if m.pending == nil {
 		return
 	}
-	m.input.SetValue(strings.TrimSpace(m.pending.suggestedRule))
-	m.input.CursorEnd()
+	m.setInputValue(strings.TrimSpace(m.pending.suggestedRule))
 	m.setMode(modePermissionEditRule)
 }
 
@@ -6072,8 +6725,7 @@ func (m *model) enterPermissionFeedbackEditor() {
 	if m.pending == nil {
 		return
 	}
-	m.input.SetValue("")
-	m.input.CursorEnd()
+	m.setInputValue("")
 	m.setMode(modePermissionEditFeedback)
 }
 
@@ -6092,12 +6744,12 @@ func (m *model) exitPermissionEditor(confirm bool) {
 		// No pending request — just drop the editor mode and
 		// fall through to composing so the next operator
 		// action isn't swallowed.
-		m.input.SetValue("")
+		m.setInputValue("")
 		m.setMode(modeComposing)
 		return
 	}
 	edited := strings.TrimSpace(m.input.Value())
-	m.input.SetValue("")
+	m.setInputValue("")
 	switch m.inputMode {
 	case modePermissionEditRule:
 		if confirm {
@@ -6168,21 +6820,17 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// in the title state, so the standalone row is noise.
 		m.connected = true
 	case "permission_request":
+		suggestedRule := strings.TrimSpace(stringField(event, "suggestedRule"))
+		repeatedRuleCount := m.recordPermissionRuleSeen(suggestedRule, time.Now())
 		m.pending = &pendingPermission{
-			sessionID:     stringField(event, "sessionId"),
-			toolUseID:     stringField(event, "toolUseId"),
-			name:          stringField(event, "name"),
-			risk:          stringField(event, "risk"),
-			input:         formatToolInput(stringField(event, "name"), event["input"]),
-			message:       stringField(event, "message"),
-			// Phase A.1: surface the model-suggested allow rule
-			// so the operator sees `git:status` / `cd:*` /
-			// `bash:*` above the 5-option panel. The runtime
-			// omits this field for tools without a per-input
-			// deriver; we leave it empty in that case (the
-			// `Suggested rule:` row is hidden by renderPermission
-			// when the value is blank).
-			suggestedRule: stringField(event, "suggestedRule"),
+			sessionID:         stringField(event, "sessionId"),
+			toolUseID:         stringField(event, "toolUseId"),
+			name:              stringField(event, "name"),
+			risk:              stringField(event, "risk"),
+			input:             formatToolInput(stringField(event, "name"), event["input"]),
+			message:           stringField(event, "message"),
+			suggestedRule:     suggestedRule,
+			repeatedRuleCount: repeatedRuleCount,
 		}
 		// Reset the cursor to the safe default ("Approve once")
 		// on every fresh permission request so a stale cursor
@@ -6278,6 +6926,7 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 			OutputTokens: anyInt(event["outputTokens"]),
 			CacheRead:    anyInt(event["cacheReadInputTokens"]),
 		}
+		m.lastUsage = m.latestUsage
 	case "user_intake_guidance":
 		// Intake classifier metadata (intent / requiresTools /
 		// reason) is useful for audit but the operator doesn't
@@ -6467,8 +7116,8 @@ func (m *model) appendLine(kind string, text string) {
 }
 
 func (m *model) refreshViewport() {
-	welcome := m.renderWelcomeCard(max(40, m.viewport.Width))
-	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width))
+	welcome := m.renderWelcomeCard(max(40, m.viewport.Width()))
+	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width()))
 	// Capture whether the operator had scrolled up before
 	// the new content arrived. We only auto-scroll to the
 	// bottom when they were already at the bottom — otherwise
@@ -6486,14 +7135,6 @@ func (m *model) refreshViewport() {
 }
 
 func (m model) renderWelcomeCard(width int) string {
-	username := os.Getenv("USER")
-	if username == "" {
-		username = os.Getenv("USERNAME")
-	}
-	if username == "" {
-		username = "User"
-	}
-
 	formattedCwd := m.cfg.Cwd
 	home := os.Getenv("HOME")
 	if home != "" {
@@ -6556,13 +7197,20 @@ func (m model) renderWelcomeCard(width int) string {
 		return sb.String()
 	}
 
+	modelSummary := truncatePlain(defaultModel, 42)
+	cwdSummary := truncatePlain(formattedCwd, 42)
+	sessionSummary := truncatePlain(shortID(sessionVal), 42)
+	modeSummary := truncatePlain(mode, 42)
+	titleLine := titleStyle.Render("v"+Version) + mutedStyle.Render("  Welcome back!")
 	metadataLines := []string{
-		mutedStyle.Render("user    " + username),
-		mutedStyle.Render("model   " + defaultModel),
-		mutedStyle.Render("cwd     " + formattedCwd),
-		mutedStyle.Render("session " + sessionVal),
-		mutedStyle.Render("mode    " + mode),
+		titleLine,
+		welcomeMetaLine("model", modelSummary, statusStyle.Render("●")),
+		welcomeMetaLine("work", cwdSummary, contextStyle.Render("○")),
+		welcomeMetaLine("session", sessionSummary, mutedStyle.Render("•")),
+		welcomeMetaLine("mode", modeSummary, mutedStyle.Render("•")),
 	}
+	infoGap := 10
+	infoOffset := 1 + lipgloss.Width(pixelRows[0]) + infoGap
 
 	var cardLines []string
 	for i := 0; i < 6; i++ {
@@ -6571,7 +7219,7 @@ func (m model) renderWelcomeCard(width int) string {
 		if i < len(metadataLines) {
 			metaCol = metadataLines[i]
 		}
-		combined := " " + logoCol + "   " + metaCol
+		combined := " " + logoCol + strings.Repeat(" ", infoGap) + metaCol
 		cardLines = append(cardLines, combined)
 	}
 
@@ -6582,6 +7230,15 @@ func (m model) renderWelcomeCard(width int) string {
 			maxCardWidth = w
 		}
 	}
+
+	navLine := strings.Join([]string{
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18")).Render("◆") + " chat",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render("◆") + " nexus",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Render("◆") + " config",
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#ff4f9a")).Render("◆") + " models",
+	}, "   ")
+	cardLines = append(cardLines, strings.Repeat(" ", infoOffset)+focusedLineStyle.Render(navLine))
+	maxCardWidth = max(maxCardWidth, lipgloss.Width(cardLines[len(cardLines)-1]))
 
 	hPad := max(0, (width-maxCardWidth)/2)
 	hSpace := strings.Repeat(" ", hPad)
@@ -6596,9 +7253,18 @@ func (m model) renderWelcomeCard(width int) string {
 	return strings.Join(outputLines, "\n")
 }
 
+func welcomeMetaLine(label string, value string, marker string) string {
+	labelStyle := mutedStyle.Width(8)
+	valueStyle := contextStyle
+	if marker == "" {
+		marker = mutedStyle.Render("•")
+	}
+	return marker + " " + labelStyle.Render(label) + " " + valueStyle.Render(value)
+}
+
 func renderTranscript(lines []*transcriptItem, width int) string {
 	if len(lines) == 0 {
-		return mutedStyle.Render("No messages yet.")
+		return mutedStyle.Render("  No messages yet.")
 	}
 	rendered := make([]string, 0, len(lines)*2)
 	for i, line := range lines {
@@ -6608,13 +7274,7 @@ func renderTranscript(lines []*transcriptItem, width int) string {
 		// without re-running formatLine. Width changes (terminal
 		// resize) and Bump() calls (content mutation) both
 		// invalidate the entry.
-		version := uint64(0)
-		if line.Versioned != nil {
-			version = line.Version()
-		}
-		formatted := line.cache.GetOrCompute(width, version, func() string {
-			return formatLine(line.kind, line.text, width)
-		})
+		formatted := renderTranscriptItemCached(line, width)
 		rendered = append(rendered, formatted)
 		// Insert a blank line between rows (but not after the
 		// last one) to give the chat log the breathing room
@@ -6632,6 +7292,32 @@ func renderTranscript(lines []*transcriptItem, width int) string {
 		}
 	}
 	return strings.Join(rendered, "\n")
+}
+
+func renderTranscriptItemCached(line *transcriptItem, width int) string {
+	if line == nil {
+		return ""
+	}
+	version := uint64(0)
+	if line.Versioned != nil {
+		version = line.Version()
+	}
+	return line.cache.GetOrCompute(width, version, func() string {
+		return formatTranscriptItem(line, width)
+	})
+}
+
+func formatTranscriptItem(line *transcriptItem, width int) string {
+	if line == nil {
+		return ""
+	}
+	view := ""
+	if line.kind == "assistant" || line.kind == "thinking" {
+		view = line.markdownCache.Render(line.kind, line.text, width)
+	} else {
+		view = formatLine(line.kind, line.text, width)
+	}
+	return line.renderHighlight(view)
 }
 
 func formatLine(kind string, text string, width int) string {
@@ -6668,45 +7354,7 @@ func formatLine(kind string, text string, width int) string {
 		}
 		return strings.Join(out, "\n")
 	case "assistant", "thinking":
-		style := assistantStyle
-		if kind == "thinking" {
-			style = thinkingStyle
-		}
-		bodyWidth := max(10, width-2)
-		body := wrapPlain(text, bodyWidth)
-		bodyLines := strings.Split(body, "\n")
-		if len(bodyLines) == 0 {
-			bodyLines = []string{""}
-		}
-		// Block-level markdown: a line that starts with `#` /
-		// `##` / `###` is rendered as a header with the
-		// title style. The `#` markers are stripped from the
-		// body so the inline walker can do its work on the
-		// remaining text.
-		renderAssistantLine := func(line string) string {
-			trimmed := strings.TrimLeft(line, " ")
-			if strings.HasPrefix(trimmed, "# ") {
-				headerLevel := 1
-				for strings.HasPrefix(trimmed, "#") {
-					headerLevel++
-					trimmed = strings.TrimPrefix(trimmed, "#")
-				}
-				trimmed = strings.TrimPrefix(trimmed, " ")
-				_ = headerLevel
-				return "  " + titleStyle.Render(renderInlineMarkdown(style, trimmed))
-			}
-			return "  " + renderInlineMarkdown(style, line)
-		}
-		out := make([]string, 0, len(bodyLines))
-		out = append(out, renderAssistantLine(bodyLines[0]))
-		for _, c := range bodyLines[1:] {
-			if c == "" {
-				out = append(out, "")
-				continue
-			}
-			out = append(out, renderAssistantLine(c))
-		}
-		return strings.Join(out, "\n")
+		return renderAssistantMarkdownText(kind, text, width)
 	case "tool_started", "tool_denied":
 		// Body starts with `● ToolName(...)` from
 		// formatNexusEvent. Split the body into three visual
@@ -6834,6 +7482,8 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 		return "compact! ", errorStyle
 	case "context_warning":
 		return "ctx warn ", statusStyle
+	case "near_timeout_warning":
+		return "timeout ", permissionStyle
 	case "context_blocking":
 		return "ctx stop ", errorStyle
 	case "session_memory_updated":
@@ -6912,6 +7562,8 @@ func formatNexusEvent(event map[string]any) string {
 		return fmt.Sprintf("approved=%v reason=%s", event["approved"], stringField(event, "reason"))
 	case "context_warning", "context_blocking":
 		return fmt.Sprintf("%s tokens=%v max=%v", eventType, event["tokenEstimate"], event["maxTokens"])
+	case "near_timeout_warning":
+		return fmt.Sprintf("near timeout elapsed=%dms/%dms %s", anyInt(event["elapsedMs"]), anyInt(event["timeoutMs"]), stringField(event, "message"))
 	case "usage":
 		return fmt.Sprintf("input=%v output=%v cacheRead=%v", event["inputTokens"], event["outputTokens"], event["cacheReadInputTokens"])
 	case "hook_started":
@@ -7128,11 +7780,11 @@ func formatToolInput(name string, input any) string {
 	return singleLine(truncatePlain(compactJSON(input), 120))
 }
 
-func startStream(cfg Config, prompt string) tea.Cmd {
+func startStream(cfg Config, prompt string, timeout timeoutDecision) tea.Cmd {
 	return func() tea.Msg {
 		eventCh := make(chan streamEvent, 128)
 		decisionCh := make(chan permissionDecision, 8)
-		go runStream(cfg, prompt, eventCh, decisionCh)
+		go runStream(cfg, prompt, timeout, eventCh, decisionCh)
 		return streamStartedMsg{events: eventCh, decisions: decisionCh}
 	}
 }
@@ -7797,6 +8449,50 @@ func firstLine(s string, maxLen int) string {
 	return s
 }
 
+const (
+	DefaultGoTuiExecuteTimeoutMs     = 180_000
+	longContextGoTuiExecuteTimeoutMs = 300_000
+	longContextTokenThreshold        = 100_000
+)
+
+func resolveGoTuiTimeout(cfg Config, prompt string, usage *usageSnapshot) timeoutDecision {
+	base := cfg.ExecuteTimeoutMs
+	if base <= 0 {
+		base = DefaultGoTuiExecuteTimeoutMs
+	}
+	decision := timeoutDecision{TimeoutMs: base}
+	if base != DefaultGoTuiExecuteTimeoutMs {
+		return decision
+	}
+	if usage != nil && usage.InputTokens > longContextTokenThreshold {
+		return timeoutDecision{TimeoutMs: longContextGoTuiExecuteTimeoutMs, Reason: "long-context", Adaptive: true}
+	}
+	if looksLikeLongContextPrompt(prompt) {
+		return timeoutDecision{TimeoutMs: longContextGoTuiExecuteTimeoutMs, Reason: "long-context", Adaptive: true}
+	}
+	return decision
+}
+
+func looksLikeLongContextPrompt(prompt string) bool {
+	lower := strings.ToLower(prompt)
+	markers := []string{
+		"long-context",
+		"large context",
+		"100k",
+		"大上下文",
+		"长上下文",
+		"深度分析",
+		"全面分析",
+		"完整分析",
+	}
+	for _, marker := range markers {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // buildExecuteRequest assembles the WebSocket payload sent to /v1/stream.
 // timeoutMs is only emitted when positive so the Nexus default 30s budget
 // remains the fallback for callers that explicitly opt out (cfg.ExecuteTimeoutMs = 0).
@@ -7805,13 +8501,17 @@ func firstLine(s string, maxLen int) string {
 // permission panel; Phase B of
 // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
 func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
+	return buildExecuteRequestWithTimeout(cfg, sessionID, prompt, resolveGoTuiTimeout(cfg, prompt, nil))
+}
+
+func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeout timeoutDecision) map[string]any {
 	payload := map[string]any{
 		"prompt":    prompt,
 		"cwd":       cfg.Cwd,
 		"sessionId": sessionID,
 	}
-	if cfg.ExecuteTimeoutMs > 0 {
-		payload["timeoutMs"] = cfg.ExecuteTimeoutMs
+	if timeout.TimeoutMs > 0 {
+		payload["timeoutMs"] = timeout.TimeoutMs
 	}
 	policy := cfg.PolicyMode
 	if policy == "" {
@@ -7840,7 +8540,7 @@ func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
 	return payload
 }
 
-func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
+func runStream(cfg Config, prompt string, timeout timeoutDecision, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
 	defer close(eventCh)
 
 	// Phase 1 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
@@ -7933,7 +8633,7 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 	_ = clientSessionID // reserved for future use (e.g. local transcript)
 
 	writeMu.Lock()
-	err = conn.WriteJSON(buildExecuteRequest(cfg, sessionID, prompt))
+	err = conn.WriteJSON(buildExecuteRequestWithTimeout(cfg, sessionID, prompt, timeout))
 	writeMu.Unlock()
 	if err != nil {
 		eventCh <- streamEvent{err: err}
@@ -7969,17 +8669,17 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 // the governance plan is trying to prevent.
 func allocateServerSession(cfg Config, prompt string) (string, error) {
 	type sessionCreatedResponse struct {
-		Type           string `json:"type"`
-		SessionID      string `json:"sessionId"`
+		Type            string `json:"type"`
+		SessionID       string `json:"sessionId"`
 		ClientSessionID string `json:"clientSessionId"`
-		CreatedAt      string `json:"createdAt"`
+		CreatedAt       string `json:"createdAt"`
 	}
 	// We don't have a client-side session id yet at this point; the
 	// call site generates it as `session_go_<unixnano>` and passes it
 	// back via a follow-up log line. We still want the server to know
 	// we have a stable Go TUI client, so we send a minimal marker.
 	body := map[string]any{
-		"cwd":    cfg.Cwd,
+		"cwd": cfg.Cwd,
 		"metadata": map[string]any{
 			"client": "go-tui",
 			"phase":  "session_allocate",
@@ -8002,7 +8702,8 @@ func allocateServerSession(cfg Config, prompt string) (string, error) {
 // server-allocated uuid.
 //
 // Line format (tab-separated, line-prefixed timestamp):
-//   [YYYY-MM-DDTHH:MM:SS+ZZ:ZZ]\tclientSessionId=session_go_xxx\tserverSessionId=session_<uuid>
+//
+//	[YYYY-MM-DDTHH:MM:SS+ZZ:ZZ]\tclientSessionId=session_go_xxx\tserverSessionId=session_<uuid>
 func appendClientSessionLog(cfg Config, clientSessionID, serverSessionID string) {
 	// Honour BABEL_O_CONFIG_DIR override (mirrors `inspectSession.ts`
 	// Phase 0 logic) so tests can redirect the log path.

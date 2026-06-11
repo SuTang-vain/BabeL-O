@@ -12,11 +12,50 @@ import (
 	"testing"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"github.com/gorilla/websocket"
-	"github.com/muesli/termenv"
 )
+
+type fmtString string
+
+func (s fmtString) String() string { return string(s) }
+
+func viewContent(view tea.View) string {
+	return view.Content
+}
+
+func keyPress(code rune) tea.KeyPressMsg {
+	return tea.KeyPressMsg(tea.Key{Code: code})
+}
+
+func ctrlKey(r rune) tea.KeyPressMsg {
+	return tea.KeyPressMsg(tea.Key{Code: r, Mod: tea.ModCtrl})
+}
+
+func textKey(text string) tea.KeyPressMsg {
+	code := tea.KeyExtended
+	if r := []rune(text); len(r) == 1 {
+		code = r[0]
+	}
+	return tea.KeyPressMsg(tea.Key{Code: code, Text: text})
+}
+
+func mouseClick(button tea.MouseButton, x, y int) tea.MouseClickMsg {
+	return tea.MouseClickMsg(tea.Mouse{Button: button, X: x, Y: y})
+}
+
+func mouseMotion(button tea.MouseButton, x, y int) tea.MouseMotionMsg {
+	return tea.MouseMotionMsg(tea.Mouse{Button: button, X: x, Y: y})
+}
+
+func mouseRelease(button tea.MouseButton, x, y int) tea.MouseReleaseMsg {
+	return tea.MouseReleaseMsg(tea.Mouse{Button: button, X: x, Y: y})
+}
+
+func mouseWheel(button tea.MouseButton, x, y int) tea.MouseWheelMsg {
+	return tea.MouseWheelMsg(tea.Mouse{Button: button, X: x, Y: y})
+}
 
 func TestStreamURL(t *testing.T) {
 	tests := []struct {
@@ -276,7 +315,7 @@ func TestModelRegistryOpensOnModelTriggerAndCloses(t *testing.T) {
 			t.Fatalf("rendered model registry missing %q:\n%s", want, rendered)
 		}
 	}
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
@@ -468,7 +507,7 @@ func TestConsumeNexusEventUpdatesSessionAndPermissionPanel(t *testing.T) {
 	if m.pending == nil || m.pending.name != "Bash" {
 		t.Fatalf("pending permission = %#v, want Bash", m.pending)
 	}
-	view := m.View()
+	view := viewContent(m.View())
 	if !strings.Contains(view, "BabeL-O · Go TUI") {
 		t.Fatalf("view does not include title: %q", view)
 	}
@@ -677,7 +716,7 @@ func TestRenderPermissionIncludesInputAndMessage(t *testing.T) {
 		"message": "Tool Bash requires user permission to run. Reason: write outside workspace",
 	})
 
-	view := m.View()
+	view := viewContent(m.View())
 	if !strings.Contains(view, "Permission: Bash") {
 		t.Fatalf("permission panel missing tool name: %q", view)
 	}
@@ -736,7 +775,7 @@ func TestConsumeNexusEventPhase2NoLongerFallsToRawJSON(t *testing.T) {
 	for _, ev := range events {
 		m.consumeNexusEvent(ev)
 	}
-	view := m.View()
+	view := viewContent(m.View())
 	for _, line := range m.transcript {
 		text := line.text
 		// Raw-JSON sentinel: an unrendered compactJSON starts with `{` or `[`.
@@ -1015,7 +1054,7 @@ func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
 
 	// Pressing a random letter while in permission mode must not
 	// insert into m.input. (Phase 3 single-input-owner invariant.)
-	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+	_, _ = m.Update(textKey("x"))
 	if m.input.Value() != before {
 		t.Fatalf("textinput received key while in permission mode: %q -> %q", before, m.input.Value())
 	}
@@ -1039,7 +1078,7 @@ func TestPermissionPanelRendersFiveOptionsWithCursor(t *testing.T) {
 		"suggestedRule": "git:status",
 		"message":       "Tool Bash requires user permission to run.",
 	})
-	view := m.View()
+	view := viewContent(m.View())
 	for _, fragment := range []string{
 		"Waiting for permission",
 		"Approve once",
@@ -1064,6 +1103,81 @@ func TestPermissionPanelRendersFiveOptionsWithCursor(t *testing.T) {
 	}
 }
 
+func TestPermissionPanelHighlightsRepeatedSuggestedRule(t *testing.T) {
+	pending := &pendingPermission{
+		name:              "Bash",
+		risk:              "execute",
+		input:             "grep -n needle file.go",
+		message:           "Tool Bash requires user permission to run.",
+		suggestedRule:     "bash:grep-read",
+		repeatedRuleCount: 2,
+	}
+	d := newPermissionDialog(pending, 1)
+	out := d.View(120)
+	for _, want := range []string{
+		"Repeated rule seen 2 times recently",
+		"consider session approval",
+		"~ [2] Approve for this session",
+		"recommended for repeated bash:grep-read",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("repeated-rule permission view missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestPermissionPanelDoesNotRecommendSessionWithoutSuggestedRule(t *testing.T) {
+	pending := &pendingPermission{
+		name:              "Bash",
+		risk:              "execute",
+		input:             "sleep 0",
+		message:           "Tool Bash requires user permission to run.",
+		repeatedRuleCount: 3,
+	}
+	d := newPermissionDialog(pending, 1)
+	out := d.View(100)
+	for _, forbidden := range []string{
+		"Repeated rule seen",
+		"recommended for repeated",
+	} {
+		if strings.Contains(out, forbidden) {
+			t.Fatalf("permission view should not include %q without suggestedRule:\n%s", forbidden, out)
+		}
+	}
+}
+
+func TestPermissionRequestTracksRepeatedSuggestedRule(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "bash:grep-read",
+	})
+	if m.pending == nil || m.pending.repeatedRuleCount != 1 {
+		t.Fatalf("first repeatedRuleCount = %v, want 1", m.pending)
+	}
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_2",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "bash:grep-read",
+	})
+	if m.pending == nil || m.pending.repeatedRuleCount != 2 {
+		t.Fatalf("second repeatedRuleCount = %v, want 2", m.pending)
+	}
+	view := viewContent(m.View())
+	if !strings.Contains(view, "Repeated rule seen 2 times recently") {
+		t.Fatalf("permission view missing repeated-rule hint:\n%s", view)
+	}
+}
+
 func TestPermissionChoiceArrowKeysCycleCursor(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
@@ -1077,30 +1191,30 @@ func TestPermissionChoiceArrowKeysCycleCursor(t *testing.T) {
 		"suggestedRule": "git:status",
 	})
 	// Down arrow → cursor 1
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ := m.Update(keyPress(tea.KeyDown))
 	m = updated.(model)
 	if m.permissionChoice != 1 {
 		t.Fatalf("after down, permissionChoice = %d, want 1", m.permissionChoice)
 	}
 	// Down again → cursor 2
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = m.Update(keyPress(tea.KeyDown))
 	m = updated.(model)
 	if m.permissionChoice != 2 {
 		t.Fatalf("after second down, permissionChoice = %d, want 2", m.permissionChoice)
 	}
 	// Up → cursor 1
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = m.Update(keyPress(tea.KeyUp))
 	m = updated.(model)
 	if m.permissionChoice != 1 {
 		t.Fatalf("after up, permissionChoice = %d, want 1", m.permissionChoice)
 	}
 	// Up past zero wraps to 4
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = m.Update(keyPress(tea.KeyUp))
 	m = updated.(model)
 	if m.permissionChoice != 0 {
 		t.Fatalf("after up at 0, permissionChoice = %d, want 0", m.permissionChoice)
 	}
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = m.Update(keyPress(tea.KeyUp))
 	m = updated.(model)
 	if m.permissionChoice != 4 {
 		t.Fatalf("after up at 0 again (wrap), permissionChoice = %d, want 4", m.permissionChoice)
@@ -1154,7 +1268,7 @@ func TestPermissionChoiceNumberKeysJumpAndConfirm(t *testing.T) {
 			// so we keep a bidirectional local handle for receiving.
 			decisions := make(chan permissionDecision, 1)
 			m.decisions = decisions
-			key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune('1' + tc.keyIdx)}}
+			key := textKey(string(rune('1' + tc.keyIdx)))
 			updated, _ := m.Update(key)
 			m = updated.(model)
 			if tc.confirmsNow {
@@ -1215,7 +1329,7 @@ func TestPermissionRequestResetsChoiceCursor(t *testing.T) {
 	})
 	// Move cursor to option 3 (editable rule)
 	for i := 0; i < 3; i++ {
-		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		updated, _ := m.Update(keyPress(tea.KeyDown))
 		m = updated.(model)
 	}
 	if m.permissionChoice != 3 {
@@ -1251,7 +1365,7 @@ func TestPermissionPanelEscCancelsAsReject(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.Update(keyPress(tea.KeyEsc))
 	m = updated.(model)
 	select {
 	case d := <-decisions:
@@ -1283,7 +1397,7 @@ func TestPermissionOption3OpensRuleEditor(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	updated, _ := m.Update(textKey("3"))
 	m = updated.(model)
 	if m.inputMode != modePermissionEditRule {
 		t.Fatalf("after '3', inputMode = %q, want %q", m.inputMode, modePermissionEditRule)
@@ -1302,7 +1416,7 @@ func TestPermissionOption3OpensRuleEditor(t *testing.T) {
 	default:
 	}
 	// The overlay should advertise the editing context.
-	view := m.View()
+	view := viewContent(m.View())
 	for _, fragment := range []string{"Editing rule for Bash", "Suggested rule: git:status", "↵ confirm", "esc back to options"} {
 		if !strings.Contains(view, fragment) {
 			t.Fatalf("rule editor view missing %q; full view:\n%s", fragment, view)
@@ -1329,12 +1443,12 @@ func TestPermissionRuleEditorEnterCommitsEditedRule(t *testing.T) {
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
 	// Open the editor.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	updated, _ := m.Update(textKey("3"))
 	m = updated.(model)
 	// Type a new rule.
 	m.input.SetValue("bash:git:diff")
 	// Press Enter to confirm.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
 	if m.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want %q after commit", m.inputMode, modeComposing)
@@ -1378,12 +1492,12 @@ func TestPermissionRuleEditorEscReturnsToFiveOptionPanel(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	updated, _ := m.Update(textKey("3"))
 	m = updated.(model)
 	if m.inputMode != modePermissionEditRule {
 		t.Fatalf("setup: inputMode = %q, want %q", m.inputMode, modePermissionEditRule)
 	}
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ = m.Update(keyPress(tea.KeyEsc))
 	m = updated.(model)
 	if m.inputMode != modePermission {
 		t.Fatalf("after esc, inputMode = %q, want %q (back to 5-option panel)", m.inputMode, modePermission)
@@ -1420,11 +1534,11 @@ func TestPermissionRuleEditorEmptyValueFallsBackToApproveOnce(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	updated, _ := m.Update(textKey("3"))
 	m = updated.(model)
 	// Clear the pre-filled value.
 	m.input.SetValue("")
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
 	select {
 	case d := <-decisions:
@@ -1458,7 +1572,7 @@ func TestPermissionOption5OpensFeedbackEditor(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	updated, _ := m.Update(textKey("5"))
 	m = updated.(model)
 	if m.inputMode != modePermissionEditFeedback {
 		t.Fatalf("after '5', inputMode = %q, want %q", m.inputMode, modePermissionEditFeedback)
@@ -1474,7 +1588,7 @@ func TestPermissionOption5OpensFeedbackEditor(t *testing.T) {
 		t.Fatalf("editor should not emit a decision yet, got %+v", d)
 	default:
 	}
-	view := m.View()
+	view := viewContent(m.View())
 	for _, fragment := range []string{"Editing feedback for Bash", "Tell the model what to do instead", "↵ confirm", "esc back to options"} {
 		if !strings.Contains(view, fragment) {
 			t.Fatalf("feedback editor view missing %q; full view:\n%s", fragment, view)
@@ -1500,10 +1614,10 @@ func TestPermissionFeedbackEditorEnterCommitsFeedback(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	updated, _ := m.Update(textKey("5"))
 	m = updated.(model)
 	m.input.SetValue("use a sandboxed test repo instead")
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
 	if m.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want %q after commit", m.inputMode, modeComposing)
@@ -1546,9 +1660,9 @@ func TestPermissionFeedbackEditorEmptyValueFallsBackToPlainReject(t *testing.T) 
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	updated, _ := m.Update(textKey("5"))
 	m = updated.(model)
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
 	select {
 	case d := <-decisions:
@@ -1583,9 +1697,9 @@ func TestPermissionFeedbackEditorEscReturnsToFiveOptionPanel(t *testing.T) {
 	})
 	decisions := make(chan permissionDecision, 1)
 	m.decisions = decisions
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	updated, _ := m.Update(textKey("5"))
 	m = updated.(model)
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ = m.Update(keyPress(tea.KeyEsc))
 	m = updated.(model)
 	if m.inputMode != modePermission {
 		t.Fatalf("after esc, inputMode = %q, want %q (back to 5-option panel)", m.inputMode, modePermission)
@@ -1620,10 +1734,10 @@ func TestPermissionEditorClearsInputOnExit(t *testing.T) {
 		"suggestedRule": "git:status",
 	})
 	// Open rule editor, type, esc.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	updated, _ := m.Update(textKey("3"))
 	m = updated.(model)
 	m.input.SetValue("bash:something")
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ = m.Update(keyPress(tea.KeyEsc))
 	m = updated.(model)
 	if got := m.input.Value(); got != "" {
 		t.Fatalf("after esc, textinput = %q, want empty (stale text would leak into next prompt)", got)
@@ -1634,7 +1748,7 @@ func TestHelpOverlayOpensOnQuestionMark(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 80
 	m.height = 24
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	updated, _ := m.Update(textKey("?"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1642,8 +1756,8 @@ func TestHelpOverlayOpensOnQuestionMark(t *testing.T) {
 	if updatedModel.inputMode != modeHelpOverlay {
 		t.Fatalf("inputMode = %q, want %q", updatedModel.inputMode, modeHelpOverlay)
 	}
-	if !strings.Contains(updatedModel.View(), "Help") {
-		t.Fatalf("help view should mention 'Help' header: %q", updatedModel.View())
+	if !strings.Contains(viewContent(updatedModel.View()), "Help") {
+		t.Fatalf("help view should mention 'Help' header: %q", viewContent(updatedModel.View()))
 	}
 }
 
@@ -1652,7 +1766,7 @@ func TestHelpOverlayClosesOnEsc(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.setMode(modeHelpOverlay)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.Update(keyPress(tea.KeyEsc))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1667,7 +1781,7 @@ func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
 	m.width = 80
 	m.height = 24
 	m.setMode(modeHelpOverlay)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ := m.Update(keyPress(tea.KeyDown))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1675,7 +1789,7 @@ func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
 	if updatedModel.helpScroll != 1 {
 		t.Fatalf("helpScroll = %d, want 1", updatedModel.helpScroll)
 	}
-	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = updatedModel.Update(keyPress(tea.KeyUp))
 	updatedModel, _ = updated.(model)
 	if updatedModel.helpScroll != 0 {
 		t.Fatalf("helpScroll = %d, want 0 after up", updatedModel.helpScroll)
@@ -1685,7 +1799,7 @@ func TestHelpOverlayScrollMovesHelpScroll(t *testing.T) {
 func TestQuestionMarkIgnoredWhenInputNonEmpty(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.input.SetValue("abc")
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'?'}})
+	updated, _ := m.Update(textKey("?"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1698,27 +1812,114 @@ func TestQuestionMarkIgnoredWhenInputNonEmpty(t *testing.T) {
 	}
 }
 
-func TestCtrlCAlwaysQuitsEvenFromOverlay(t *testing.T) {
+func TestCtrlCOpensQuitConfirmFromOverlay(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeHelpOverlay)
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
-	if cmd == nil {
-		t.Fatalf("ctrl+c from help overlay should still return a quit cmd")
+	updated, cmd := m.Update(ctrlKey('c'))
+	if cmd != nil {
+		t.Fatalf("ctrl+c from help overlay should open confirm without quit cmd, got %T", cmd)
 	}
-	// The returned cmd is tea.Quit; we don't invoke it here.
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeQuitConfirm {
+		t.Fatalf("ctrl+c should open quit confirm, got %q", updatedModel.inputMode)
+	}
+	if updatedModel.quitChoice != 1 {
+		t.Fatalf("quit confirm should default to cancel, got choice %d", updatedModel.quitChoice)
+	}
+	rendered := stripANSICodes(updatedModel.renderQuitConfirm(80))
+	if !strings.Contains(rendered, "Quit BabeL-O?") {
+		t.Fatalf("quit confirm should render title, got:\n%s", rendered)
+	}
 }
 
 func TestQDoesNotQuitWhenInOverlay(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeHelpOverlay)
-	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, cmd := m.Update(textKey("q"))
 	if cmd != nil {
 		t.Fatalf("q from help overlay must not quit, got %T", cmd)
 	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
 	// q inside help should be handled by the help handler (close
 	// overlay) and route the model back to composing.
-	if m.inputMode != modeHelpOverlay {
-		t.Fatalf("help should still be open after q key arrival, got %q", m.inputMode)
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("help should close after q key arrival, got %q", updatedModel.inputMode)
+	}
+}
+
+func TestQuitDialogConfirmQuits(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeQuitConfirm)
+	m.quitChoice = 1
+	updated, cmd := m.Update(keyPress(tea.KeyUp))
+	if cmd != nil {
+		t.Fatalf("up in quit confirm should not return cmd, got %T", cmd)
+	}
+	m = updated.(model)
+	if m.quitChoice != 0 {
+		t.Fatalf("up should select quit now, got choice %d", m.quitChoice)
+	}
+	_, cmd = m.Update(keyPress(tea.KeyEnter))
+	if cmd == nil {
+		t.Fatalf("enter on selected quit should return quit cmd")
+	}
+	if msg := cmd(); msg == nil {
+		t.Fatalf("quit cmd should emit a message")
+	}
+}
+
+func TestQuitDialogCancelReturnsToComposing(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.input.SetValue("draft prompt")
+	m.setMode(modeQuitConfirm)
+	m.quitChoice = 1
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	if cmd != nil {
+		t.Fatalf("enter on cancel in quit confirm should not return cmd, got %T", cmd)
+	}
+	updatedModel, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if updatedModel.inputMode != modeComposing {
+		t.Fatalf("cancel selection should return to composing, got %q", updatedModel.inputMode)
+	}
+	if updatedModel.input.Value() != "draft prompt" {
+		t.Fatalf("quit cancel should preserve draft, got %q", updatedModel.input.Value())
+	}
+}
+
+func TestQuitDialogRendersAboveInputAndFitsView(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.setMode(modeQuitConfirm)
+	m.quitChoice = 1
+	m.resize()
+
+	plain := stripANSICodes(viewContent(m.View()))
+	if got := lipgloss.Height(plain); got != m.height {
+		t.Fatalf("quit view height = %d, want %d:\n%s", got, m.height, plain)
+	}
+	quitIdx := strings.Index(plain, "Quit BabeL-O?")
+	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	footerIdx := strings.Index(plain, "/ or ctrl+p commands")
+	if quitIdx < 0 || inputIdx < 0 || footerIdx < 0 {
+		t.Fatalf("quit view should contain dialog, input, and footer:\n%s", plain)
+	}
+	if !(quitIdx < inputIdx && inputIdx < footerIdx) {
+		t.Fatalf("quit dialog should render above input and footer, got quit=%d input=%d footer=%d:\n%s",
+			quitIdx, inputIdx, footerIdx, plain)
+	}
+	if !strings.Contains(plain, "> Cancel") {
+		t.Fatalf("quit dialog should show selected cancel row, got:\n%s", plain)
 	}
 }
 
@@ -1822,6 +2023,33 @@ func TestFilterSlashCommandsMatchesByNameAndAlias(t *testing.T) {
 	}
 }
 
+func TestFuzzyFilterRanksPrefixMatchFirst(t *testing.T) {
+	got := filterSlashCommands("mod")
+	if len(got) == 0 {
+		t.Fatalf("filterSlashCommands(mod) returned no matches")
+	}
+	if got[0].name != "/model" {
+		t.Fatalf("filterSlashCommands(mod)[0] = %q, want /model; full=%v", got[0].name, got)
+	}
+	fuzzyGot := filterSlashCommands("mdl")
+	if len(fuzzyGot) == 0 || fuzzyGot[0].name != "/model" {
+		t.Fatalf("filterSlashCommands(mdl) = %v, want /model fuzzy match first", fuzzyGot)
+	}
+}
+
+func TestFuzzyFilterHighlightsMatchedIndexes(t *testing.T) {
+	got := filterSlashCommandMatches("mod")
+	if len(got) == 0 || got[0].command.name != "/model" {
+		t.Fatalf("filterSlashCommandMatches(mod) = %v, want /model first", got)
+	}
+	name := highlightSlashCommandName(got[0])
+	if !strings.Contains(name, buttonHotkeyOpen+"m"+buttonHotkeyClose) ||
+		!strings.Contains(name, buttonHotkeyOpen+"o"+buttonHotkeyClose) ||
+		!strings.Contains(name, buttonHotkeyOpen+"d"+buttonHotkeyClose) {
+		t.Fatalf("highlightSlashCommandName did not highlight matched runes in %q", name)
+	}
+}
+
 func TestFindSlashCommandResolvesAlias(t *testing.T) {
 	got := findSlashCommand("/profiles")
 	if got == nil {
@@ -1832,9 +2060,92 @@ func TestFindSlashCommandResolvesAlias(t *testing.T) {
 	}
 }
 
+func TestCommandShortcutsResolveTargets(t *testing.T) {
+	cases := []struct {
+		shortcut string
+		want     string
+	}{
+		{"ctrl+l", "/model"},
+		{"ctrl+g", "/agents"},
+		{"ctrl+t", "/tasks"},
+		{"ctrl+o", "/tools"},
+		{"ctrl+q", "/exit"},
+	}
+	for _, tc := range cases {
+		got := findSlashCommandByShortcut(tc.shortcut)
+		if got == nil {
+			t.Fatalf("findSlashCommandByShortcut(%q) returned nil", tc.shortcut)
+		}
+		if got.name != tc.want {
+			t.Fatalf("findSlashCommandByShortcut(%q).name = %q, want %q", tc.shortcut, got.name, tc.want)
+		}
+	}
+}
+
+func TestCommandShortcutFiresDirectly(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	updated, cmd := m.Update(ctrlKey('o'))
+	if cmd == nil {
+		t.Fatalf("ctrl+o should dispatch /tools fetch cmd")
+	}
+	um := updated.(model)
+	if um.inputMode != modeComposing {
+		t.Fatalf("ctrl+o should leave mode composing until response, got %q", um.inputMode)
+	}
+}
+
+func TestCtrlDTogglesTopCard(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+
+	updated, cmd := m.Update(ctrlKey('d'))
+	if cmd != nil {
+		t.Fatalf("ctrl+d should not emit a command, got %T", cmd)
+	}
+	um := updated.(model)
+	if !um.topCardOpen {
+		t.Fatalf("ctrl+d should open top card")
+	}
+	if card := stripANSICodes(um.renderTopCard(120)); !strings.Contains(card, "MCPs") {
+		t.Fatalf("open top card should render details, got:\n%s", card)
+	}
+
+	updated, _ = um.Update(ctrlKey('d'))
+	um = updated.(model)
+	if um.topCardOpen {
+		t.Fatalf("second ctrl+d should close top card")
+	}
+}
+
+func TestCommandShortcutCtrlMDoesNotStealEnter(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{ID: "local", DisplayName: "Local", Configured: true}},
+	}
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	if cmd != nil {
+		t.Fatalf("Enter must not dispatch ctrl+m /model shortcut, got %T", cmd)
+	}
+	um := updated.(model)
+	if um.inputMode == modeModelPickProvider {
+		t.Fatalf("Enter must not enter model picker via ctrl+m shortcut")
+	}
+}
+
+func TestCommandShortcutQuitFiresDirectly(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeHelpOverlay)
+	_, cmd := m.Update(ctrlKey('q'))
+	if cmd == nil {
+		t.Fatalf("ctrl+q should return quit cmd")
+	}
+}
+
 func TestSlashPaletteOpensOnSlashFromEmptyInput(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	updated, _ := m.Update(textKey("/"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1850,7 +2161,7 @@ func TestSlashPaletteOpensOnSlashFromEmptyInput(t *testing.T) {
 func TestSlashPaletteDoesNotOpenOnSlashWhenInputNonEmpty(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.input.SetValue("abc")
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	updated, _ := m.Update(textKey("/"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1866,7 +2177,7 @@ func TestSlashPaletteDoesNotOpenOnSlashWhenInputNonEmpty(t *testing.T) {
 func TestSlashPaletteLiveFilterAppendsToFilter(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	updated, _ := m.Update(textKey("p"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -1874,7 +2185,7 @@ func TestSlashPaletteLiveFilterAppendsToFilter(t *testing.T) {
 	if updatedModel.paletteFilter != "p" {
 		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "p")
 	}
-	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	updated, _ = updatedModel.Update(textKey("r"))
 	updatedModel, _ = updated.(model)
 	if updatedModel.paletteFilter != "pr" {
 		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "pr")
@@ -1885,7 +2196,7 @@ func TestSlashPaletteBackspaceEditsFilter(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "abc"
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	updated, _ := m.Update(keyPress(tea.KeyBackspace))
 	updatedModel, _ := updated.(model)
 	if updatedModel.paletteFilter != "ab" {
 		t.Fatalf("paletteFilter = %q, want %q", updatedModel.paletteFilter, "ab")
@@ -1895,7 +2206,7 @@ func TestSlashPaletteBackspaceEditsFilter(t *testing.T) {
 func TestSlashPaletteBackspaceOnEmptyFilterClosesPalette(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyBackspace})
+	updated, _ := m.Update(keyPress(tea.KeyBackspace))
 	updatedModel, _ := updated.(model)
 	if updatedModel.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want composing after backspace on empty filter", updatedModel.inputMode)
@@ -1906,7 +2217,7 @@ func TestSlashPaletteEscClosesAndClearsInput(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "pro"
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.Update(keyPress(tea.KeyEsc))
 	updatedModel, _ := updated.(model)
 	if updatedModel.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
@@ -1924,12 +2235,12 @@ func TestSlashPaletteUpDownNavigatesSelection(t *testing.T) {
 	m.setMode(modeSlashPick)
 	// Filter matches multiple commands ("/h" -> /help + /h-prefixed entries)
 	// Actually only /help starts with "h" in our registry. Use "/b" -> /bash.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+	updated, _ := m.Update(textKey("b"))
 	updatedModel, _ := updated.(model)
 	if updatedModel.paletteSelected != 0 {
 		t.Fatalf("paletteSelected should start at 0, got %d", updatedModel.paletteSelected)
 	}
-	updated, _ = updatedModel.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = updatedModel.Update(keyPress(tea.KeyDown))
 	updatedModel, _ = updated.(model)
 	// /b matches /bash only — but navigating down should stay at 0 (clamped).
 	if updatedModel.paletteSelected != 0 {
@@ -1941,13 +2252,13 @@ func TestSlashPaletteEnterRunsZeroArgCommand(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "help"
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
 	updatedModel, _ := updated.(model)
 	if updatedModel.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
 	}
 	// The /help runner should have appended a status line listing commands.
-	rendered := updatedModel.View()
+	rendered := viewContent(updatedModel.View())
 	if !strings.Contains(rendered, "local commands:") {
 		t.Fatalf("view should mention 'local commands:', got %q", rendered)
 	}
@@ -1957,7 +2268,7 @@ func TestSlashPaletteEnterOnPrefixCommandInsertsPrefix(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeSlashPick)
 	m.paletteFilter = "bash"
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
 	updatedModel, _ := updated.(model)
 	if updatedModel.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q, want composing", updatedModel.inputMode)
@@ -1981,7 +2292,8 @@ func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
 		t.Fatalf("palette should show the current filter '/p', got %q", rendered)
 	}
 	// The matched command /profile should be in the rendered list.
-	if !strings.Contains(rendered, "/profile") {
+	// D.1 may ANSI-highlight the matched rune, so assert on visible text.
+	if !strings.Contains(stripANSICodes(rendered), "/profile") {
 		t.Fatalf("palette should show /profile, got %q", rendered)
 	}
 }
@@ -2001,7 +2313,7 @@ func TestToolPaletteRendersRiskSourceApproval(t *testing.T) {
 		{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
 		{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a file"},
 	})
-	rendered := m.View()
+	rendered := viewContent(m.View())
 	if !strings.Contains(rendered, "tools (2, read-only):") {
 		t.Fatalf("tools palette should show count, got %q", rendered)
 	}
@@ -2031,7 +2343,7 @@ func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
 	if len(m.transcript) <= before {
 		t.Fatalf("unknown command should append an error line")
 	}
-	rendered := m.View()
+	rendered := viewContent(m.View())
 	if !strings.Contains(rendered, "unknown local command") {
 		t.Fatalf("view should mention 'unknown local command', got %q", rendered)
 	}
@@ -2068,7 +2380,7 @@ func TestProfileConfirmYKeyFiresHTTPCommand(t *testing.T) {
 	if m.inputMode != modeProfileConfirm {
 		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeProfileConfirm)
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated, cmd := m.Update(textKey("y"))
 	if cmd == nil {
 		t.Fatalf("y in profile-confirm should return the selectRuntimeProfile HTTP command")
 	}
@@ -2093,7 +2405,7 @@ func TestProfileConfirmEnterKeyFiresHTTPCommand(t *testing.T) {
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	if cmd == nil {
 		t.Fatalf("enter in profile-confirm should fire the HTTP command")
 	}
@@ -2114,7 +2426,7 @@ func TestProfileConfirmNKeyCancelsWithoutHTTP(t *testing.T) {
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	updated, cmd := m.Update(textKey("n"))
 	if cmd != nil {
 		t.Fatalf("n in profile-confirm should NOT fire any HTTP command, got %v", cmd)
 	}
@@ -2139,7 +2451,7 @@ func TestProfileConfirmEscKeyCancels(t *testing.T) {
 	if cmd := m.handleLocalCommand("/profile prod"); cmd != nil {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, cmd := m.Update(keyPress(tea.KeyEsc))
 	if cmd != nil {
 		t.Fatalf("esc in profile-confirm should NOT fire any HTTP command, got %v", cmd)
 	}
@@ -2165,7 +2477,7 @@ func TestProfileConfirmStrayKeyDoesNotReachTextinput(t *testing.T) {
 		t.Fatalf("/profile prod should return nil (parked in confirm)")
 	}
 	before := m.input.Value()
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	updated, _ := m.Update(textKey("z"))
 	updatedModel, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -2556,7 +2868,7 @@ func TestContextOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 		t.Fatalf("contextOverlayScroll = %d, want 0 on open", updatedModel.contextOverlayScroll)
 	}
 	// esc closes and clears.
-	closed, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := updatedModel.Update(keyPress(tea.KeyEsc))
 	closedModel, ok := closed.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", closed)
@@ -2574,7 +2886,7 @@ func TestContextOverlayScrollClamps(t *testing.T) {
 	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
 	updatedModel := updated.(model)
 	// Up at 0 should stay at 0.
-	up, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up, _ := updatedModel.Update(keyPress(tea.KeyUp))
 	upModel := up.(model)
 	if upModel.contextOverlayScroll != 0 {
 		t.Fatalf("up at 0 should stay at 0, got %d", upModel.contextOverlayScroll)
@@ -2582,7 +2894,7 @@ func TestContextOverlayScrollClamps(t *testing.T) {
 	// Down should advance and clamp at len-1.
 	cur := upModel
 	for i := 0; i < 200; i++ {
-		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := cur.Update(keyPress(tea.KeyDown))
 		cur = next.(model)
 	}
 	maxScroll := len(cur.contextOverlayLines) - 1
@@ -2590,7 +2902,7 @@ func TestContextOverlayScrollClamps(t *testing.T) {
 		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.contextOverlayScroll)
 	}
 	// One more down should stay clamped.
-	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	more, _ := cur.Update(keyPress(tea.KeyDown))
 	moreModel := more.(model)
 	if moreModel.contextOverlayScroll != maxScroll {
 		t.Fatalf("scroll should remain at %d, got %d", maxScroll, moreModel.contextOverlayScroll)
@@ -2919,7 +3231,7 @@ func TestInboxOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 		t.Fatalf("inboxOverlaySelected = %d, want 0 on open", updatedModel.inboxOverlaySelected)
 	}
 	// Esc closes.
-	closed, _ := updatedModel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := updatedModel.Update(keyPress(tea.KeyEsc))
 	closedModel := closed.(model)
 	if closedModel.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", closedModel.inputMode, modeComposing)
@@ -2936,7 +3248,7 @@ func TestInboxOverlaySelectionClampsAtBounds(t *testing.T) {
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
 	// Up at 0 stays at 0.
-	up, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up, _ := m.Update(keyPress(tea.KeyUp))
 	m = up.(model)
 	if m.inboxOverlaySelected != 0 {
 		t.Fatalf("up at 0 should stay at 0, got %d", m.inboxOverlaySelected)
@@ -2944,14 +3256,14 @@ func TestInboxOverlaySelectionClampsAtBounds(t *testing.T) {
 	// Down advances and clamps at len-1.
 	cur := m
 	for i := 0; i < 10; i++ {
-		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := cur.Update(keyPress(tea.KeyDown))
 		cur = next.(model)
 	}
 	if cur.inboxOverlaySelected != len(cur.inboxMessages)-1 {
 		t.Fatalf("down should clamp at %d, got %d", len(cur.inboxMessages)-1, cur.inboxOverlaySelected)
 	}
 	// One more down stays clamped.
-	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	more, _ := cur.Update(keyPress(tea.KeyDown))
 	moreModel := more.(model)
 	if moreModel.inboxOverlaySelected != len(m.inboxMessages)-1 {
 		t.Fatalf("down past end should stay clamped, got %d", moreModel.inboxOverlaySelected)
@@ -2968,9 +3280,9 @@ func TestInboxOverlayEscapeCloses(t *testing.T) {
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
 	// esc / enter still close the overlay.
-	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+	for _, keyType := range []rune{tea.KeyEsc, tea.KeyEnter} {
 		m.inputMode = modeInboxOverlay
-		closed, _ := m.Update(tea.KeyMsg{Type: keyType})
+		closed, _ := m.Update(keyPress(keyType))
 		cm := closed.(model)
 		if cm.inputMode != modeComposing {
 			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
@@ -2983,7 +3295,7 @@ func TestInboxOverlayEscapeCloses(t *testing.T) {
 	// the prefill, but the "inbox closed" status line must NOT
 	// appear (it would mean we accidentally took the close path).
 	m.inputMode = modeInboxOverlay
-	closed, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	closed, _ := m.Update(textKey("q"))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("'q' should land in composing after quote, got %q", cm.inputMode)
@@ -3005,7 +3317,7 @@ func TestInboxOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	m = updated.(model)
 	m.input.SetValue("untouched")
 	// Press 'z' (a non-overlay key). The textinput must not change.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	updated, _ = m.Update(textKey("z"))
 	um := updated.(model)
 	if um.input.Value() != "untouched" {
 		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
@@ -3281,7 +3593,7 @@ func TestInboxOverlayQuoteKeyFillsTextinput(t *testing.T) {
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
 	// 'q' quotes the first (selected) message into the textinput.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, _ = m.Update(textKey("q"))
 	um := updated.(model)
 	if !strings.Contains(um.input.Value(), "Use this SessionChannel inbox context only after verifying evidence:") {
 		t.Fatalf("'q' should prefill the textinput with the quote, got %q", um.input.Value())
@@ -3303,7 +3615,7 @@ func TestInboxOverlayQuoteKeyCAlsoFillsTextinput(t *testing.T) {
 	m.sessionID = "sess_inbox_smoke_abc123"
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	m = updated.(model)
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	updated, _ = m.Update(textKey("c"))
 	um := updated.(model)
 	if !strings.Contains(um.input.Value(), "message=msg_handoff_1") {
 		t.Fatalf("'c' should prefill just like 'q', got %q", um.input.Value())
@@ -3316,7 +3628,7 @@ func TestInboxOverlayQuoteKeyEmptyListIsNoop(t *testing.T) {
 	m.input.SetValue("preserved")
 	m.inputMode = modeInboxOverlay
 	m.inboxMessages = nil
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	updated, _ := m.Update(textKey("q"))
 	um := updated.(model)
 	if um.input.Value() != "preserved" {
 		t.Fatalf("'q' on empty list should NOT clobber textinput, got %q", um.input.Value())
@@ -3375,7 +3687,7 @@ func TestInboxAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	updated, _ := m.Update(inboxMsg{raw: fullInboxPayload(), envelope: envelope, sessionID: "sess_inbox_smoke_abc123", trigger: "user"})
 	um := updated.(model)
 	// Close the overlay first.
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	um = closed.(model)
 	if um.inputMode != modeComposing {
 		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
@@ -3613,7 +3925,7 @@ func TestAgentOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 		t.Fatalf("agentJobs = %d, want 3", len(um.agentJobs))
 	}
 	// Esc closes.
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
@@ -3630,9 +3942,9 @@ func TestAgentOverlayEscapeEnterQAllClose(t *testing.T) {
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um := updated.(model)
 	// esc/enter close.
-	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+	for _, keyType := range []rune{tea.KeyEsc, tea.KeyEnter} {
 		um.inputMode = modeAgentOverlay
-		closed, _ := um.Update(tea.KeyMsg{Type: keyType})
+		closed, _ := um.Update(keyPress(keyType))
 		cm := closed.(model)
 		if cm.inputMode != modeComposing {
 			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
@@ -3640,7 +3952,7 @@ func TestAgentOverlayEscapeEnterQAllClose(t *testing.T) {
 	}
 	// 'q' rune also closes (no quote path for agents).
 	um.inputMode = modeAgentOverlay
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	closed, _ := um.Update(textKey("q"))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
@@ -3657,7 +3969,7 @@ func TestAgentOverlayScrollClamps(t *testing.T) {
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um := updated.(model)
 	// Up at 0 stays at 0.
-	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up, _ := um.Update(keyPress(tea.KeyUp))
 	u := up.(model)
 	if u.agentOverlayScroll != 0 {
 		t.Fatalf("up at 0 should stay at 0, got %d", u.agentOverlayScroll)
@@ -3665,7 +3977,7 @@ func TestAgentOverlayScrollClamps(t *testing.T) {
 	// Down should advance and clamp at len-1.
 	cur := u
 	for i := 0; i < 200; i++ {
-		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := cur.Update(keyPress(tea.KeyDown))
 		cur = next.(model)
 	}
 	allLines := buildAgentOverlayLines(cur.agentJobs)
@@ -3674,7 +3986,7 @@ func TestAgentOverlayScrollClamps(t *testing.T) {
 		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.agentOverlayScroll)
 	}
 	// One more down should stay clamped.
-	more, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+	more, _ := cur.Update(keyPress(tea.KeyDown))
 	mm := more.(model)
 	if mm.agentOverlayScroll != maxScroll {
 		t.Fatalf("scroll should remain at %d, got %d", maxScroll, mm.agentOverlayScroll)
@@ -3692,7 +4004,7 @@ func TestAgentOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	m = updated.(model)
 	m.input.SetValue("untouched")
 	// Press 'z' (a non-overlay key). The textinput must not change.
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	updated, _ = m.Update(textKey("z"))
 	um := updated.(model)
 	if um.input.Value() != "untouched" {
 		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
@@ -3788,7 +4100,7 @@ func TestAgentAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	// Open the overlay once and close it.
 	updated, _ := m.Update(agentJobsMsg{raw: fullAgentJobsPayload(), envelope: envelope, sessionID: "sess_agents_smoke_xyz", trigger: "user"})
 	um := updated.(model)
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	um = closed.(model)
 	if um.inputMode != modeComposing {
 		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
@@ -3975,7 +4287,7 @@ func TestTaskBoardOpensOnMsgAndClearsOnClose(t *testing.T) {
 		t.Fatalf("taskBoard = %d, want 3", len(um.taskBoard))
 	}
 	// Esc closes.
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
@@ -3992,7 +4304,7 @@ func TestTaskBoardScrollClamps(t *testing.T) {
 	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
 	um := updated.(model)
 	// Up at 0 stays at 0.
-	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up, _ := um.Update(keyPress(tea.KeyUp))
 	u := up.(model)
 	if u.taskBoardScroll != 0 {
 		t.Fatalf("up at 0 should stay at 0, got %d", u.taskBoardScroll)
@@ -4000,7 +4312,7 @@ func TestTaskBoardScrollClamps(t *testing.T) {
 	// Down should advance and clamp at len-1.
 	cur := u
 	for i := 0; i < 200; i++ {
-		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := cur.Update(keyPress(tea.KeyDown))
 		cur = next.(model)
 	}
 	allLines := buildTaskBoardLines(cur.taskBoard)
@@ -4042,7 +4354,7 @@ func TestTasksListAutoRefreshTriggerDoesNotOpenOverlay(t *testing.T) {
 	// Open then close.
 	updated, _ := m.Update(tasksListMsg{raw: fullTasksListPayload(), envelope: envelope, sessionID: "sess_tasks_smoke_xyz", trigger: "user"})
 	um := updated.(model)
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	um = closed.(model)
 	if um.inputMode != modeComposing {
 		t.Fatalf("precondition: should be in composing, got %q", um.inputMode)
@@ -4262,7 +4574,7 @@ func TestActivityOverlayOpensAndCloses(t *testing.T) {
 		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeActivityOverlay)
 	}
 	// Esc closes.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	updated, _ := m.Update(keyPress(tea.KeyEsc))
 	um := updated.(model)
 	if um.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", um.inputMode, modeComposing)
@@ -4402,30 +4714,103 @@ func TestConsumeNexusEventAggregatesSubAgentLifecycle(t *testing.T) {
 	}
 }
 
-// TestHeaderIsMinimalTitleAndStateOnly verifies the
-// minimal header: title + state on a single row, no build
-// tag, no cwd, no session id. Sub-agent counts are surfaced
-// via the /agents overlay instead of the header.
-func TestHeaderIsMinimalTitleAndStateOnly(t *testing.T) {
+func TestHeaderShowsStyledTopBarAndContextToggle(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
 	m.sessionID = "session_compact_abcdef108000"
 	m.width = 120
 	m.height = 30
+	m.contextWindow = 128000
+	m.lastUsage = &usageSnapshot{InputTokens: 11900}
 	m.subAgents["agent_sub_1"] = subAgentEntry{ID: "agent_sub_1", Status: subAgentStatusRunning, Title: "investigate"}
 	m.subAgents["agent_sub_2"] = subAgentEntry{ID: "agent_sub_2", Status: subAgentStatusRunning, Title: "investigate 2"}
 	rendered := m.renderHeader(m.width)
 	for _, want := range []string{
 		"BabeL-O · Go TUI",
 		"idle",
+		"context 9%",
+		"ctrl+d open",
 	} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("header should include %q, got:\n%s", want, rendered)
 		}
 	}
-	for _, banned := range []string{"bbl-go-tui", "cwd=", "session=", "url=", "model=", "profile=", "sub: "} {
+	for _, banned := range []string{"v" + Version, "~/DEV/BABEL/BabeL-O", "/Users/tangyaoyue", "bbl-go-tui", "session=", "url=", "model=", "profile=", "sub: "} {
 		if strings.Contains(rendered, banned) {
-			t.Fatalf("header should NOT include %q in minimal chrome, got:\n%s", banned, rendered)
+			t.Fatalf("header should not include verbose legacy field %q, got:\n%s", banned, rendered)
 		}
+	}
+	lines := strings.Split(stripANSICodes(rendered), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("header should render guard divider plus title row plus divider, got %d line(s):\n%s", len(lines), rendered)
+	}
+	if strings.Trim(lines[0], "-") != "" || len(lines[0]) != m.width {
+		t.Fatalf("header guard divider should span width %d, got %q", m.width, lines[0])
+	}
+	if !strings.Contains(lines[1], "BabeL-O · Go TUI") {
+		t.Fatalf("header title row missing title, got %q", lines[1])
+	}
+	if strings.Count(lines[1], "/") > 24 {
+		t.Fatalf("header accent slash run should stay compact, got %q", lines[1])
+	}
+	if strings.Trim(lines[2], "-") != "" || len(lines[2]) != m.width {
+		t.Fatalf("header divider should span width %d, got %q", m.width, lines[2])
+	}
+}
+
+func TestWelcomeCardShowsVersionOnTopRight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
+	m.width = 120
+	rendered := stripANSICodes(m.renderWelcomeCard(120))
+	if !strings.Contains(rendered, "v"+Version) {
+		t.Fatalf("welcome card should show version, got:\n%s", rendered)
+	}
+	for _, want := range []string{"Welcome back!", "model", "work", "session", "mode", "chat", "nexus", "config", "models"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("welcome card missing %q, got:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "BABEL-O") {
+		t.Fatalf("welcome card should show version in the title slot instead of BABEL-O, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "────") {
+		t.Fatalf("welcome card should not render the middle divider, got:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "user ") {
+		t.Fatalf("welcome card should not mix user/session into one noisy row, got:\n%s", rendered)
+	}
+}
+
+func TestHeaderKeepsDividerInCompactMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = compactModeWidthBreakpoint - 1
+	m.height = compactModeHeightBreakpoint - 1
+
+	rendered := m.renderHeader(m.width)
+	lines := strings.Split(stripANSICodes(rendered), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("compact header should keep guard divider plus title row plus divider, got %d line(s):\n%s", len(lines), rendered)
+	}
+	if strings.Trim(lines[0], "-") != "" || len(lines[0]) != m.width {
+		t.Fatalf("compact header guard divider should span width %d, got %q", m.width, lines[0])
+	}
+	if strings.Trim(lines[2], "-") != "" || len(lines[2]) != m.width {
+		t.Fatalf("compact header divider should span width %d, got %q", m.width, lines[2])
+	}
+}
+
+func TestHeaderTitleIsBelowTopGuardDivider(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 100
+	rendered := stripANSICodes(m.renderHeader(m.width))
+	lines := strings.Split(rendered, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("header should have guard divider and title row, got:\n%s", rendered)
+	}
+	if strings.Contains(lines[0], "BabeL-O · Go TUI") {
+		t.Fatalf("header title must not be on the clipped top row, got first line %q", lines[0])
+	}
+	if !strings.Contains(lines[1], "BabeL-O · Go TUI") {
+		t.Fatalf("header title should be on visible second row, got %q", lines[1])
 	}
 }
 
@@ -4534,6 +4919,67 @@ func fullToolAuditPayload() []byte {
 			}
 		]
 	}`)
+}
+
+func TestTopCardShowsContextAndReservedSections(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
+	m.width = 132
+	m.height = 36
+	m.topCardOpen = true
+	m.modelID = "openai/gpt-5"
+	m.providerID = "openai"
+	m.activeProfile = "default"
+	m.sessionID = "sess_top_card_abcdef123456"
+	m.contextWindow = 128000
+	m.lastUsage = &usageSnapshot{InputTokens: 11900, OutputTokens: 400, CacheRead: 2000}
+	var envelope toolsAuditResponse
+	if err := json.Unmarshal(fullToolAuditPayload(), &envelope); err != nil {
+		t.Fatalf("decode fullToolAuditPayload: %v", err)
+	}
+	m.toolAuditEntries = envelope.Tools
+	m.inboxMessages = []sessionMessage{
+		{MessageID: "msg_1", Status: messageStatusDelivered},
+		{MessageID: "msg_2", Status: messageStatusAcknowledged},
+	}
+	m.inboxChannels = []sessionChannel{{ChannelID: "ch_1", Status: channelStatusOpen}}
+
+	rendered := stripANSICodes(m.renderTopCard(132))
+	for _, want := range []string{
+		"context: 11k / 128k used",
+		"MCPs",
+		"filesystem (1)",
+		"Skills",
+		"reserved: runtime skills",
+		"Session to session",
+		"inbox 1 unread / 2 total",
+		"Memory",
+		"reserved: memory",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("top card missing %q, got:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestViewHeightBudgetAccountsForTopCard(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.topCardOpen = true
+	m.contextWindow = 128000
+	m.lastUsage = &usageSnapshot{InputTokens: 11900}
+	m.resize()
+
+	view := viewContent(m.View())
+	if got := lipgloss.Height(view); got != m.height {
+		t.Fatalf("view height = %d, want terminal height %d; full view:\n%s", got, m.height, stripANSICodes(view))
+	}
+	if !strings.Contains(stripANSICodes(view), "BabeL-O · Go TUI") {
+		t.Fatalf("view should keep header title visible with top card open; got:\n%s", stripANSICodes(view))
+	}
+	if strings.Contains(stripANSICodes(view), "Ask BabeL-O") {
+		t.Fatalf("top card open should not reserve space for the bottom input box; got:\n%s", stripANSICodes(view))
+	}
 }
 
 func TestFormatToolRiskIconAllValues(t *testing.T) {
@@ -4676,7 +5122,7 @@ func TestToolAuditOverlayOpensOnMsgAndClearsOnClose(t *testing.T) {
 		t.Fatalf("toolAuditEntries = %d, want 3", len(um.toolAuditEntries))
 	}
 	// Esc closes.
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	closed, _ := um.Update(keyPress(tea.KeyEsc))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("inputMode after esc = %q, want %q", cm.inputMode, modeComposing)
@@ -4691,16 +5137,16 @@ func TestToolAuditOverlayEscapeEnterQAllClose(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	um := updated.(model)
-	for _, keyType := range []tea.KeyType{tea.KeyEsc, tea.KeyEnter} {
+	for _, keyType := range []rune{tea.KeyEsc, tea.KeyEnter} {
 		um.inputMode = modeToolAuditOverlay
-		closed, _ := um.Update(tea.KeyMsg{Type: keyType})
+		closed, _ := um.Update(keyPress(keyType))
 		cm := closed.(model)
 		if cm.inputMode != modeComposing {
 			t.Fatalf("key %v should close the overlay, got %q", keyType, cm.inputMode)
 		}
 	}
 	um.inputMode = modeToolAuditOverlay
-	closed, _ := um.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'q'}})
+	closed, _ := um.Update(textKey("q"))
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
@@ -4716,7 +5162,7 @@ func TestToolAuditOverlayScrollClamps(t *testing.T) {
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	um := updated.(model)
 	// Up at 0 stays at 0.
-	up, _ := um.Update(tea.KeyMsg{Type: tea.KeyUp})
+	up, _ := um.Update(keyPress(tea.KeyUp))
 	u := up.(model)
 	if u.toolAuditScroll != 0 {
 		t.Fatalf("up at 0 should stay at 0, got %d", u.toolAuditScroll)
@@ -4724,7 +5170,7 @@ func TestToolAuditOverlayScrollClamps(t *testing.T) {
 	// Down advances and clamps at len-1.
 	cur := u
 	for i := 0; i < 200; i++ {
-		next, _ := cur.Update(tea.KeyMsg{Type: tea.KeyDown})
+		next, _ := cur.Update(keyPress(tea.KeyDown))
 		cur = next.(model)
 	}
 	allLines := buildToolAuditOverlayLines(cur.toolAuditEntries)
@@ -4743,7 +5189,7 @@ func TestToolAuditOverlayStrayKeyDoesNotReachTextinput(t *testing.T) {
 	updated, _ := m.Update(toolAuditMsg{raw: fullToolAuditPayload(), envelope: envelope, trigger: "user"})
 	m = updated.(model)
 	m.input.SetValue("untouched")
-	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'z'}})
+	updated, _ = m.Update(textKey("z"))
 	um := updated.(model)
 	if um.input.Value() != "untouched" {
 		t.Fatalf("stray key reached textinput, got %q", um.input.Value())
@@ -5087,6 +5533,58 @@ func TestBuildExecuteRequestHonoursExplicitPolicyMode(t *testing.T) {
 	}
 }
 
+func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
+	decision := resolveGoTuiTimeout(Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}, "hello", nil)
+	if decision.TimeoutMs != DefaultGoTuiExecuteTimeoutMs || decision.Adaptive {
+		t.Fatalf("ordinary timeout decision = %+v, want default non-adaptive", decision)
+	}
+}
+
+func TestResolveGoTuiTimeoutRaisesLongContextTo300s(t *testing.T) {
+	for name, tc := range map[string]struct {
+		prompt string
+		usage  *usageSnapshot
+	}{
+		"prompt-marker": {prompt: "请深度分析这个大上下文 session"},
+		"usage-tokens":  {prompt: "continue", usage: &usageSnapshot{InputTokens: 149378}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			decision := resolveGoTuiTimeout(Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}, tc.prompt, tc.usage)
+			if decision.TimeoutMs != longContextGoTuiExecuteTimeoutMs || !decision.Adaptive || decision.Reason != "long-context" {
+				t.Fatalf("long-context timeout decision = %+v", decision)
+			}
+		})
+	}
+}
+
+func TestResolveGoTuiTimeoutHonoursExplicitNonDefaultTimeout(t *testing.T) {
+	decision := resolveGoTuiTimeout(Config{Cwd: "/workspace", ExecuteTimeoutMs: 240000}, "请深度分析这个大上下文 session", &usageSnapshot{InputTokens: 149378})
+	if decision.TimeoutMs != 240000 || decision.Adaptive {
+		t.Fatalf("explicit timeout decision = %+v, want 240000 non-adaptive", decision)
+	}
+}
+
+func TestBuildExecuteRequestRaisesLongContextTimeout(t *testing.T) {
+	cfg := Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}
+	decision := resolveGoTuiTimeout(cfg, "long-context analysis", nil)
+	payload := buildExecuteRequestWithTimeout(cfg, "session_abc", "long-context analysis", decision)
+	if got := anyInt(payload["timeoutMs"]); got != longContextGoTuiExecuteTimeoutMs {
+		t.Fatalf("timeoutMs = %d, want %d", got, longContextGoTuiExecuteTimeoutMs)
+	}
+}
+
+func TestHeaderHidesAdaptiveTimeout(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 100
+	m.running = true
+	m.startedAt = time.Now()
+	m.currentTimeout = timeoutDecision{TimeoutMs: longContextGoTuiExecuteTimeoutMs, Reason: "long-context", Adaptive: true}
+	rendered := m.renderHeader(m.width)
+	if strings.Contains(rendered, "timeout=") || strings.Contains(rendered, "long-context") {
+		t.Fatalf("header should hide adaptive timeout, got:\n%s", rendered)
+	}
+}
+
 func TestBuildExecuteRequestEmitsPolicyAlongsideTimeoutMs(t *testing.T) {
 	// policy and timeoutMs are independent knobs; both should appear in
 	// the payload when set.
@@ -5188,7 +5686,7 @@ func TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest(t *testing.T) {
 
 	doneCh := make(chan struct{})
 	go func() {
-		runStream(cfg, "git commit", eventCh, decisions)
+		runStream(cfg, "git commit", resolveGoTuiTimeout(cfg, "git commit", nil), eventCh, decisions)
 		close(doneCh)
 	}()
 
@@ -5488,29 +5986,23 @@ func fillScrollableViewport(m *model) {
 func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	fillScrollableViewport(&m)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelUp,
-	})
+	updated, _ := m.Update(mouseWheel(tea.MouseWheelUp, 0, 0))
 	afterUp, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if got, want := afterUp.viewport.YOffset, startingYOffset-mouseWheelStepLines; got != want {
+	if got, want := afterUp.viewport.YOffset(), startingYOffset-mouseWheelStepLines; got != want {
 		t.Fatalf("after wheel up, YOffset = %d, want %d (one line up from %d)", got, want, startingYOffset)
 	}
 
-	updated, _ = afterUp.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-	})
+	updated, _ = afterUp.Update(mouseWheel(tea.MouseWheelDown, 0, 0))
 	afterDown, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if got, want := afterDown.viewport.YOffset, startingYOffset; got != want {
+	if got, want := afterDown.viewport.YOffset(), startingYOffset; got != want {
 		t.Fatalf("after wheel up+down round trip, YOffset = %d, want %d (back to %d)", got, want, startingYOffset)
 	}
 }
@@ -5529,13 +6021,10 @@ func TestMouseWheelRoutesToHelpOverlay(t *testing.T) {
 	m.height = 24
 	m.resize()
 	m.setMode(modeHelpOverlay)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 	startingHelpScroll := m.helpScroll
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-	})
+	updated, _ := m.Update(mouseWheel(tea.MouseWheelDown, 0, 0))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5544,9 +6033,9 @@ func TestMouseWheelRoutesToHelpOverlay(t *testing.T) {
 		t.Fatalf("help overlay: wheel down should bump helpScroll by %d, got %d (from %d)",
 			mouseWheelStepLines, after.helpScroll, startingHelpScroll)
 	}
-	if after.viewport.YOffset != startingYOffset {
+	if after.viewport.YOffset() != startingYOffset {
 		t.Fatalf("help overlay: wheel must NOT scroll the underlying transcript, YOffset %d -> %d",
-			startingYOffset, after.viewport.YOffset)
+			startingYOffset, after.viewport.YOffset())
 	}
 	if after.inputMode != modeHelpOverlay {
 		t.Fatalf("wheel in help overlay should not change inputMode; got %s", after.inputMode)
@@ -5566,19 +6055,70 @@ func TestMouseWheelDisabledWhenMouseCaptureOff(t *testing.T) {
 		t.Fatalf("test precondition: cfg.MouseCapture must default to false")
 	}
 	fillScrollableViewport(&m)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelUp,
-	})
+	updated, _ := m.Update(mouseWheel(tea.MouseWheelUp, 0, 0))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if after.viewport.YOffset != startingYOffset {
+	if after.viewport.YOffset() != startingYOffset {
 		t.Fatalf("MouseCapture=off: wheel up should be a no-op, YOffset %d -> %d",
-			startingYOffset, after.viewport.YOffset)
+			startingYOffset, after.viewport.YOffset())
+	}
+}
+
+func TestLeakedSGRMouseWheelDoesNotTypeIntoInput(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset()
+
+	for _, fragment := range []string{"[", "<64;45;5M"} {
+		updated, _ := m.Update(textKey(fragment))
+		m = updated.(model)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("leaked SGR mouse report should not type into input, got %q", got)
+	}
+	if got, want := m.viewport.YOffset(), startingYOffset-mouseWheelStepLines; got != want {
+		t.Fatalf("leaked SGR wheel up should scroll viewport, got YOffset %d want %d", got, want)
+	}
+}
+
+func TestLeakedMouseReportsDoNotTypeIntoInputAcrossProtocols(t *testing.T) {
+	cases := []struct {
+		name      string
+		fragments []string
+		paste     bool
+		wantDelta int
+	}{
+		{name: "sgr complete wheel up", fragments: []string{"\x1b[<64;45;5M"}, wantDelta: -mouseWheelStepLines},
+		{name: "sgr split wheel down", fragments: []string{"\x1b[", "<65;45;5M"}, wantDelta: mouseWheelStepLines},
+		{name: "x10 complete wheel up", fragments: []string{"\x1b[M`MM"}, wantDelta: -mouseWheelStepLines},
+		{name: "x10 split wheel down", fragments: []string{"\x1b[M", "aMM"}, wantDelta: mouseWheelStepLines},
+		{name: "paste sgr wheel up", fragments: []string{"\x1b[<64;45;5M"}, paste: true, wantDelta: -mouseWheelStepLines},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			fillScrollableViewport(&m)
+			startingYOffset := m.viewport.YOffset()
+			for _, fragment := range tc.fragments {
+				var updated tea.Model
+				if tc.paste {
+					updated, _ = m.Update(tea.PasteMsg{Content: fragment})
+				} else {
+					updated, _ = m.Update(textKey(fragment))
+				}
+				m = updated.(model)
+			}
+			if got := m.input.Value(); got != "" {
+				t.Fatalf("leaked mouse report should not type into input, got %q", got)
+			}
+			if got, want := m.viewport.YOffset(), startingYOffset+tc.wantDelta; got != want {
+				t.Fatalf("leaked mouse wheel should scroll viewport, got YOffset %d want %d", got, want)
+			}
+		})
 	}
 }
 
@@ -5595,10 +6135,7 @@ func TestPermissionWheelRoutesToChoiceRing(t *testing.T) {
 	m.setMode(modePermission)
 	m.permissionChoice = 0
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelDown,
-	})
+	updated, _ := m.Update(mouseWheel(tea.MouseWheelDown, 0, 0))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5609,10 +6146,7 @@ func TestPermissionWheelRoutesToChoiceRing(t *testing.T) {
 	}
 
 	// A second wheel up should walk back to 0.
-	updated, _ = after.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonWheelUp,
-	})
+	updated, _ = after.Update(mouseWheel(tea.MouseWheelUp, 0, 0))
 	after, ok = updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5652,7 +6186,7 @@ func TestPermissionGracePeriodAbsorbsKeystrokes(t *testing.T) {
 	// `y` would normally approve, but during grace it must
 	// be absorbed (no change in permissionChoice, no
 	// permission decision sent).
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated, _ := m.Update(textKey("y"))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5690,19 +6224,19 @@ func TestPermissionGracePeriodMaxDelayReleasesAfter1p5s(t *testing.T) {
 func TestMouseWheelMotionAndPressFiltering(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	fillScrollableViewport(&m)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 
-	for _, action := range []tea.MouseAction{tea.MouseActionMotion, tea.MouseActionRelease} {
-		updated, _ := m.Update(tea.MouseMsg{
-			Action: action,
-			Button: tea.MouseButtonWheelUp,
-		})
+	for _, msg := range []tea.Msg{
+		mouseMotion(tea.MouseWheelUp, 0, 0),
+		mouseRelease(tea.MouseWheelUp, 0, 0),
+	} {
+		updated, _ := m.Update(msg)
 		after, ok := updated.(model)
 		if !ok {
 			t.Fatalf("expected model, got %T", updated)
 		}
-		if after.viewport.YOffset != startingYOffset {
-			t.Fatalf("action=%v: YOffset changed from %d to %d; only Press should scroll", action, startingYOffset, after.viewport.YOffset)
+		if after.viewport.YOffset() != startingYOffset {
+			t.Fatalf("msg=%T: YOffset changed from %d to %d; only MouseWheelMsg should scroll", msg, startingYOffset, after.viewport.YOffset())
 		}
 	}
 }
@@ -5715,18 +6249,15 @@ func TestMouseWheelMotionAndPressFiltering(t *testing.T) {
 func TestMousePressOnNonWheelButtonIsNoOp(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	fillScrollableViewport(&m)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-	})
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, 0, 0))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if after.viewport.YOffset != startingYOffset {
-		t.Fatalf("left-click press changed YOffset from %d to %d; only wheel should scroll", startingYOffset, after.viewport.YOffset)
+	if after.viewport.YOffset() != startingYOffset {
+		t.Fatalf("left-click press changed YOffset from %d to %d; only wheel should scroll", startingYOffset, after.viewport.YOffset())
 	}
 }
 
@@ -5739,34 +6270,34 @@ func TestMousePressOnNonWheelButtonIsNoOp(t *testing.T) {
 func TestPgUpPgDownInComposingScrollsViewport(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	fillScrollableViewport(&m)
-	startingYOffset := m.viewport.YOffset
+	startingYOffset := m.viewport.YOffset()
 
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyPgUp})
+	updated, _ := m.Update(keyPress(tea.KeyPgUp))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	afterUp := after.viewport.YOffset
+	afterUp := after.viewport.YOffset()
 	if afterUp >= startingYOffset {
 		t.Fatalf("after PgUp, YOffset = %d; want strictly less than %d", afterUp, startingYOffset)
 	}
-	if afterUp != startingYOffset-after.viewport.Height && after.viewport.Height > 0 {
+	if afterUp != startingYOffset-after.viewport.Height() && after.viewport.Height() > 0 {
 		// bubbles PageUp advances by Height, so the
 		// delta should match the viewport height
 		// (allow off-by-one due to clamping at top=0).
 		if afterUp > 0 {
 			t.Fatalf("after PgUp, YOffset = %d; want roughly %d (start - Height=%d)",
-				afterUp, startingYOffset-after.viewport.Height, after.viewport.Height)
+				afterUp, startingYOffset-after.viewport.Height(), after.viewport.Height())
 		}
 	}
 
-	updated, _ = after.Update(tea.KeyMsg{Type: tea.KeyPgDown})
+	updated, _ = after.Update(keyPress(tea.KeyPgDown))
 	after2, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if after2.viewport.YOffset <= afterUp {
-		t.Fatalf("after PgUp+PgDown, YOffset = %d; want strictly greater than %d", after2.viewport.YOffset, afterUp)
+	if after2.viewport.YOffset() <= afterUp {
+		t.Fatalf("after PgUp+PgDown, YOffset = %d; want strictly greater than %d", after2.viewport.YOffset(), afterUp)
 	}
 }
 
@@ -5788,7 +6319,7 @@ func TestUpDownStillWalkPromptHistoryAfterMouseFix(t *testing.T) {
 	// `up` should restore the most recent prompt into
 	// the input box and bump the history index, NOT
 	// scroll the transcript.
-	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ := m.Update(keyPress(tea.KeyUp))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5801,7 +6332,7 @@ func TestUpDownStillWalkPromptHistoryAfterMouseFix(t *testing.T) {
 	}
 
 	// Second `up` walks one further back in history.
-	updated, _ = after.Update(tea.KeyMsg{Type: tea.KeyUp})
+	updated, _ = after.Update(keyPress(tea.KeyUp))
 	after2, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5815,12 +6346,12 @@ func TestUpDownStillWalkPromptHistoryAfterMouseFix(t *testing.T) {
 
 	// `down` walks forward and restores the live draft
 	// once the cursor returns to the bottom.
-	updated, _ = after2.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = after2.Update(keyPress(tea.KeyDown))
 	after3, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	updated, _ = after3.Update(tea.KeyMsg{Type: tea.KeyDown})
+	updated, _ = after3.Update(keyPress(tea.KeyDown))
 	after4, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -5858,10 +6389,11 @@ func TestModelPickApiKeyRendersSinglePromptArrow(t *testing.T) {
 	if strings.Contains(rendered, "> >") {
 		t.Fatalf("renderModelPickApiKey rendered a double-prompt line; the input line is duplicated.\nfull:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "> paste API key (or accept default)") {
+	visible := stripANSICodes(rendered)
+	if !strings.Contains(visible, "> paste API key (or accept default)") {
 		t.Fatalf("renderModelPickApiKey missing the mode-specific placeholder; the user should see `> paste API key …`.\nfull:\n%s", rendered)
 	}
-	if strings.Contains(rendered, "Ask BabeL-O") {
+	if strings.Contains(visible, "Ask BabeL-O") {
 		t.Fatalf("renderModelPickApiKey still shows the default 'Ask BabeL-O' placeholder; the /model context should override it.\nfull:\n%s", rendered)
 	}
 }
@@ -5877,10 +6409,11 @@ func TestModelPickBaseURLRendersSinglePromptArrow(t *testing.T) {
 	if strings.Contains(rendered, "> >") {
 		t.Fatalf("renderModelPickBaseURL rendered a double-prompt line.\nfull:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "> https://api.example.com") {
+	visible := stripANSICodes(rendered)
+	if !strings.Contains(visible, "> https://api.example.com") {
 		t.Fatalf("renderModelPickBaseURL missing the mode-specific placeholder.\nfull:\n%s", rendered)
 	}
-	if strings.Contains(rendered, "Ask BabeL-O") {
+	if strings.Contains(visible, "Ask BabeL-O") {
 		t.Fatalf("renderModelPickBaseURL still shows the default 'Ask BabeL-O' placeholder.\nfull:\n%s", rendered)
 	}
 }
@@ -5982,15 +6515,12 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	primeSelectionViewport(&m)
 
-	// press at screen (5, 2) which lands inside the
-	// transcript area (header is row 0, welcome has 2
-	// blank lines on top, then 4 transcript lines).
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-		X:      5,
-		Y:      2,
-	})
+	viewportTop := m.viewportTopY()
+
+	// press inside the transcript area. The header is currently
+	// two rows (title + divider), so use viewportTopY instead of
+	// baking a row number into the test.
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, 5, viewportTop))
 	afterPress, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -6002,13 +6532,8 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 		t.Fatalf("press should activate selection")
 	}
 
-	// drag to (12, 3) — should extend end (but not move start).
-	updated, _ = afterPress.Update(tea.MouseMsg{
-		Action: tea.MouseActionMotion,
-		Button: tea.MouseButtonLeft,
-		X:      12,
-		Y:      3,
-	})
+	// drag one viewport row down — should extend end (but not move start).
+	updated, _ = afterPress.Update(mouseMotion(tea.MouseLeft, 12, viewportTop+1))
 	afterDrag, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -6028,16 +6553,9 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 			afterPress.selectionStartLine, sl)
 	}
 
-	// release — should produce an OSC 52 cmd and clear
-	// mouseDownInViewport. The selection stays active so
-	// the operator can see the highlight persist for a
-	// moment after the copy.
-	updated, cmd := afterDrag.Update(tea.MouseMsg{
-		Action: tea.MouseActionRelease,
-		Button: tea.MouseButtonLeft,
-		X:      12,
-		Y:      3,
-	})
+	// release — should produce a clipboard cmd and clear mouse
+	// state, matching Crush's copy-then-ClearMouse flow.
+	updated, cmd := afterDrag.Update(mouseRelease(tea.MouseLeft, 12, viewportTop+1))
 	afterRelease, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -6048,11 +6566,79 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 	if afterRelease.mouseDownInViewport {
 		t.Fatalf("release should clear mouseDownInViewport")
 	}
+	if afterRelease.selectionActive {
+		t.Fatalf("release after copy should clear selectionActive")
+	}
 	if afterRelease.lastSelectionCopy == "" {
 		t.Fatalf("release should record lastSelectionCopy for the footer feedback")
 	}
 	if afterRelease.lastSelectionCopyAt.IsZero() {
 		t.Fatalf("release should stamp lastSelectionCopyAt")
+	}
+	if afterRelease.copyToastMessage != "Selected text copied to clipboard" {
+		t.Fatalf("release should show copy toast, got %q", afterRelease.copyToastMessage)
+	}
+	if !strings.Contains(afterRelease.renderFooter(80), "Selected text copied to clipboard") {
+		t.Fatalf("footer status should include English clipboard message, got:\n%s", afterRelease.renderFooter(80))
+	}
+}
+
+func TestExtractSelectedTextUsesVisibleColumnsForWideRunes(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.transcript = []*transcriptItem{
+		{kind: "status", text: "你好abcdef", Versioned: NewVersioned()},
+	}
+	m.refreshViewport()
+
+	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
+	targetLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "你好abcdef") {
+			targetLine = i
+			break
+		}
+	}
+	if targetLine < 0 {
+		t.Fatalf("test setup could not find wide-rune transcript line in:\n%s", strings.Join(lines, "\n"))
+	}
+	start := strings.Index(lines[targetLine], "你好abcdef")
+	if start < 0 {
+		t.Fatalf("test setup could not find target text in line %q", lines[targetLine])
+	}
+	startCol := visibleWidth(lines[targetLine][:start]) + 4
+	got := m.extractSelectedText(targetLine, startCol, targetLine, startCol+3)
+	if got != "abc" {
+		t.Fatalf("selected text = %q, want %q", got, "abc")
+	}
+}
+
+func TestCopyToastExpiresOnlyMatchingCopy(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	first := time.Unix(10, 0)
+	second := time.Unix(20, 0)
+	m.copyToastMessage = "Selected text copied to clipboard"
+	m.copyToastShownAt = second
+
+	updated, _ := m.Update(copyToastExpiredMsg{copiedAt: first})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.copyToastMessage == "" {
+		t.Fatalf("stale copy toast expiry should not clear newer toast")
+	}
+
+	updated, _ = after.Update(copyToastExpiredMsg{copiedAt: second})
+	after, ok = updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.copyToastMessage != "" || !after.copyToastShownAt.IsZero() {
+		t.Fatalf("matching copy toast expiry should clear toast, got message=%q shownAt=%v",
+			after.copyToastMessage, after.copyToastShownAt)
 	}
 }
 
@@ -6068,12 +6654,7 @@ func TestInAppSelectionOutsideViewportDoesNothing(t *testing.T) {
 	primeSelectionViewport(&m)
 
 	// y=0 is the header row, outside the viewport.
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-		X:      5,
-		Y:      0,
-	})
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, 5, 0))
 	after, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -6083,6 +6664,26 @@ func TestInAppSelectionOutsideViewportDoesNothing(t *testing.T) {
 	}
 	if after.mouseDownInViewport {
 		t.Fatalf("press on header should not arm mouseDownInViewport")
+	}
+}
+
+func TestInAppSelectionHeaderDividerOutsideViewport(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+	if m.viewportTopY() < 2 {
+		t.Fatalf("test expects header title + divider, viewportTopY=%d", m.viewportTopY())
+	}
+
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, 5, m.viewportTopY()-1))
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.selectionActive {
+		t.Fatalf("press on header divider should not start selection")
+	}
+	if after.mouseDownInViewport {
+		t.Fatalf("press on header divider should not arm mouseDownInViewport")
 	}
 }
 
@@ -6097,20 +6698,10 @@ func TestInAppSelectionClearsOnEmptyRelease(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	primeSelectionViewport(&m)
 
-	updated, _ := m.Update(tea.MouseMsg{
-		Action: tea.MouseActionPress,
-		Button: tea.MouseButtonLeft,
-		X:      5,
-		Y:      2,
-	})
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, 5, m.viewportTopY()))
 	afterPress := updated.(model)
 
-	updated, cmd := afterPress.Update(tea.MouseMsg{
-		Action: tea.MouseActionRelease,
-		Button: tea.MouseButtonLeft,
-		X:      5,
-		Y:      2,
-	})
+	updated, cmd := afterPress.Update(mouseRelease(tea.MouseLeft, 5, m.viewportTopY()))
 	after, _ := updated.(model)
 	if cmd != nil {
 		t.Fatalf("single-cell click should not return a copy cmd")
@@ -6133,15 +6724,19 @@ func TestApplySelectionHighlightAddsBackgroundSpan(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	primeSelectionViewport(&m)
 
-	// Manually arm a selection over a visible line so we
-	// can assert the renderer paints the highlight.
+	// Manually arm a selection over a real transcript line so we
+	// can assert the renderer paints the highlight. Selecting the
+	// welcome card's blank padding is brittle because the viewport
+	// may trim invisible trailing spaces before they reach View().
+	transcriptStart := lineCount(m.renderWelcomeCard(max(40, m.viewport.Width()))) + 2
 	m.selectionActive = true
-	m.selectionStartLine = m.viewport.YOffset
+	m.selectionStartLine = transcriptStart
 	m.selectionStartCol = 2
-	m.selectionEndLine = m.viewport.YOffset
+	m.selectionEndLine = transcriptStart
 	m.selectionEndCol = 8
+	m.viewport.SetYOffset(transcriptStart)
 
-	view := m.View()
+	view := viewContent(m.View())
 	if !strings.Contains(view, "\x1b[48;5;240m") {
 		t.Fatalf("expected gray-background span in View output, got: %q", view)
 	}
@@ -6248,7 +6843,7 @@ func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 	m.modelPickSelectedIdx = 0
 	m.modelID = "openai/gpt-4o" // pre-existing id; should NOT change until response
 
-	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	if cmd == nil {
 		t.Fatalf("Enter in Step 4 must return the selectRuntimeModel HTTP command")
 	}
@@ -6269,7 +6864,7 @@ func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 	// Re-pressing Enter while submitting must NOT dispatch
 	// another cmd (the picker is locked until the response
 	// lands).
-	_, cmd2 := um.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	_, cmd2 := um.Update(keyPress(tea.KeyEnter))
 	if cmd2 != nil {
 		t.Fatalf("Enter while modelPickSubmitting=true must be a no-op; got %T", cmd2)
 	}
@@ -6449,11 +7044,11 @@ func TestScrollbarZeroContentReturnsTrackOnly(t *testing.T) {
 func TestButtonGroupRendersAllLabels(t *testing.T) {
 	got := ButtonGroup([]ButtonOpt{
 		{Text: "enter submit", UnderlineIndex: 0},
-		{Text: "ctrl+c quit", UnderlineIndex: 5},
+		{Text: "ctrl+c confirm", UnderlineIndex: 5},
 		{Text: "q quit when idle", UnderlineIndex: 0},
 	}, "  ")
 	visible := stripANSICodes(got)
-	for _, want := range []string{"enter submit", "ctrl+c quit", "q quit when idle"} {
+	for _, want := range []string{"enter submit", "ctrl+c confirm", "q quit when idle"} {
 		if !strings.Contains(visible, want) {
 			t.Fatalf("ButtonGroup visible output missing %q; visible=%q raw=%q", want, visible, got)
 		}
@@ -6540,9 +7135,9 @@ func TestTranscriptWidthCapsAt120OnWideTerminal(t *testing.T) {
 	m.height = 40
 	m.resize()
 
-	if m.viewport.Width != maxTranscriptWidth {
+	if m.viewport.Width() != maxTranscriptWidth {
 		t.Fatalf("viewport.Width = %d, want capped to %d on 200-col terminal",
-			m.viewport.Width, maxTranscriptWidth)
+			m.viewport.Width(), maxTranscriptWidth)
 	}
 
 	// A long single word longer than the cap should still be
@@ -6551,7 +7146,7 @@ func TestTranscriptWidthCapsAt120OnWideTerminal(t *testing.T) {
 	m.transcript = []*transcriptItem{
 		{kind: "status", text: longText},
 	}
-	rendered := renderTranscript(m.transcript, m.viewport.Width)
+	rendered := renderTranscript(m.transcript, m.viewport.Width())
 	for i, line := range strings.Split(rendered, "\n") {
 		// strip ANSI escapes for the width check
 		visible := stripANSICodes(line)
@@ -6622,6 +7217,267 @@ func TestFooterInCompactModeOmitsSecondaryHints(t *testing.T) {
 	lines := strings.Split(footer, "\n")
 	if len(lines) > 1 {
 		t.Fatalf("compact footer should be 1 line, got %d:\n%q", len(lines), footer)
+	}
+}
+
+func TestFooterShowsCrushStyleHelpHints(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+
+	footer := stripANSICodes(m.renderFooter(120))
+	for _, want := range []string{"/ or ctrl+p commands", "ctrl+l models", "shift+enter newline", "ctrl+c quit", "? help"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("footer missing %q, got:\n%s", want, footer)
+		}
+	}
+	if !strings.HasPrefix(footer, "  / or ctrl+p") {
+		t.Fatalf("footer help should align with input content, got:\n%s", footer)
+	}
+	if strings.Contains(footer, "...") || strings.Contains(footer, "…") {
+		t.Fatalf("footer help should not append a decorative ellipsis, got:\n%s", footer)
+	}
+}
+
+func TestEmptyTranscriptPlaceholderAlignsWithContent(t *testing.T) {
+	rendered := stripANSICodes(renderTranscript(nil, 120))
+	if rendered != "  No messages yet." {
+		t.Fatalf("empty transcript placeholder = %q, want content-aligned placeholder", rendered)
+	}
+}
+
+func TestFooterCopyStatusOverridesHelp(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.copyToastMessage = "Selected text copied to clipboard"
+	m.copyToastShownAt = time.Unix(20, 0)
+
+	footer := stripANSICodes(m.renderFooter(120))
+	if !strings.Contains(footer, "Selected text copied to clipboard") {
+		t.Fatalf("copy status missing from footer:\n%s", footer)
+	}
+	if strings.Contains(footer, "enter send") {
+		t.Fatalf("copy status should temporarily replace help row, got:\n%s", footer)
+	}
+}
+
+func TestInputUsesCrushStyleMultilinePrompt(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+
+	rendered := stripANSICodes(m.renderInput(120))
+	for _, want := range []string{"> Ask BabeL-O"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("input missing %q, got:\n%s", want, rendered)
+		}
+	}
+	if got := strings.Count(rendered, ":::"); got != inputMinHeight-1 {
+		t.Fatalf("empty input should render Crush-style continuation rows = %d, want %d:\n%s",
+			got, inputMinHeight-1, rendered)
+	}
+	if got, want := lipgloss.Height(m.renderInput(120)), inputMinHeight+1; got != want {
+		t.Fatalf("empty input chrome height = %d, want divider + textarea min height %d", got, want)
+	}
+	if got := m.input.Height(); got != inputMinHeight {
+		t.Fatalf("empty input height = %d, want %d", got, inputMinHeight)
+	}
+}
+
+func TestViewHeightBudgetAccountsForMultilineInputChrome(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+
+	view := viewContent(m.View())
+	if got := lipgloss.Height(view); got != m.height {
+		t.Fatalf("view height = %d, want terminal height %d; full view:\n%s", got, m.height, stripANSICodes(view))
+	}
+	if !strings.Contains(stripANSICodes(view), "BabeL-O · Go TUI") {
+		t.Fatalf("view should keep header title visible after multiline input layout; got:\n%s", stripANSICodes(view))
+	}
+}
+
+func TestViewHeightBudgetKeepsRunningFooterVisible(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("hello")
+	m.syncInputHeight()
+
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
+	after := updated.(model)
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("running view height = %d, want terminal height %d; full view:\n%s", got, after.height, plain)
+	}
+	if !strings.Contains(plain, "waiting for Nexus events") {
+		t.Fatalf("running footer should remain visible, got:\n%s", plain)
+	}
+	if !strings.HasSuffix(plain, stripANSICodes(after.renderFooter(after.width))) {
+		t.Fatalf("running footer should be the final rendered row, got:\n%s", plain)
+	}
+}
+
+func TestViewHeightBudgetDoesNotLeaveBottomOverflowAtMediumHeight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/Users/tangyaoyue/DEV/BABEL/BabeL-O"})
+	m.width = 132
+	m.height = 40
+	m.resize()
+
+	view := viewContent(m.View())
+	if got := lipgloss.Height(view); got > m.height {
+		t.Fatalf("view height = %d exceeds terminal height %d; full view:\n%s", got, m.height, stripANSICodes(view))
+	}
+	plain := stripANSICodes(view)
+	footer := stripANSICodes(m.renderFooter(m.width))
+	if !strings.HasSuffix(plain, footer) {
+		t.Fatalf("footer should be the final rendered row with no extra bottom blank area; got tail:\n%s", plain)
+	}
+}
+
+func TestViewDoesNotRenderRightScrollbar(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+
+	plain := stripANSICodes(viewContent(m.View()))
+	for _, line := range strings.Split(plain, "\n") {
+		if strings.HasSuffix(line, "┃") || strings.HasSuffix(line, "│") {
+			t.Fatalf("view should not render right-side scrollbar, got line %q in:\n%s", line, plain)
+		}
+	}
+}
+
+func TestInputCtrlJInsertsNewlineAndGrows(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("first")
+	m.syncInputHeight()
+
+	updated, cmd := m.Update(ctrlKey('j'))
+	if cmd != nil {
+		t.Fatalf("ctrl+j newline should not send a prompt, got cmd %T", cmd)
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "first\n" {
+		t.Fatalf("ctrl+j input = %q, want %q", got, "first\n")
+	}
+	if after.input.Height() < inputMinHeight || after.input.Height() > inputMaxHeight {
+		t.Fatalf("input height after newline = %d, want within [%d,%d]",
+			after.input.Height(), inputMinHeight, inputMaxHeight)
+	}
+}
+
+func TestInputShiftEnterCSIInsertsNewlineAndDoesNotSend(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("first")
+	m.syncInputHeight()
+
+	updated, cmd := m.Update(textKey("\x1b[13;2u"))
+	if cmd != nil {
+		t.Fatalf("shift+enter CSI newline should not send a prompt, got cmd %T", cmd)
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "first\n" {
+		t.Fatalf("shift+enter CSI input = %q, want %q", got, "first\n")
+	}
+}
+
+func TestInputUnknownShiftEnterCSIInsertsNewline(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("first")
+	m.syncInputHeight()
+
+	updated, cmd := m.Update(fmt.Stringer(fmtString("?CSI[49 51 59 50 117]?")))
+	if cmd != nil {
+		t.Fatalf("unknown shift+enter CSI newline should not send a prompt, got cmd %T", cmd)
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "first\n" {
+		t.Fatalf("unknown shift+enter CSI input = %q, want %q", got, "first\n")
+	}
+}
+
+func TestUnknownCSIMouseWheelDoesNotTypeIntoInput(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.viewport.SetContent(strings.Repeat("line\n", 80))
+	m.viewport.SetYOffset(20)
+	startingYOffset := m.viewport.YOffset()
+
+	updated, cmd := m.Update(fmt.Stringer(fmtString("?CSI[60 54 53 59 52 53 59 53 77]?")))
+	if cmd != nil {
+		t.Fatalf("unknown CSI mouse wheel should not produce cmd, got %T", cmd)
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "" {
+		t.Fatalf("unknown CSI mouse wheel typed into input: %q", got)
+	}
+	if got, want := after.viewport.YOffset(), startingYOffset+mouseWheelStepLines; got != want {
+		t.Fatalf("unknown CSI wheel YOffset = %d, want %d", got, want)
+	}
+}
+
+func TestInputBackslashEnterInsertsNewline(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("first\\")
+	m.syncInputHeight()
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	if cmd != nil {
+		t.Fatalf("backslash-enter newline should not send a prompt, got cmd %T", cmd)
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "first\n" {
+		t.Fatalf("backslash-enter input = %q, want %q", got, "first\n")
+	}
+}
+
+func TestEnterSendsMultilinePromptAndResetsHeight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.input.SetValue("first\nsecond\nthird\nfourth")
+	m.syncInputHeight()
+	if m.input.Height() <= inputMinHeight {
+		t.Fatalf("test setup expected grown input height, got %d", m.input.Height())
+	}
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	if cmd == nil {
+		t.Fatalf("enter should send multiline prompt and return stream cmd")
+	}
+	after := updated.(model)
+	if got := after.input.Value(); got != "" {
+		t.Fatalf("enter should clear input, got %q", got)
+	}
+	if got := after.input.Height(); got != inputMinHeight {
+		t.Fatalf("input height after send = %d, want %d", got, inputMinHeight)
+	}
+	rendered := stripANSICodes(renderTranscript(after.transcript, 120))
+	if !strings.Contains(rendered, "first") || !strings.Contains(rendered, "second") {
+		t.Fatalf("transcript should include multiline prompt, got:\n%s", rendered)
 	}
 }
 
@@ -6928,7 +7784,7 @@ func TestDialogInterfaceImplements(t *testing.T) {
 	if d.View(80) != "body" {
 		t.Fatalf("View(80) = %q, want %q", d.View(80), "body")
 	}
-	if d.HandleMsg(tea.KeyMsg{Type: tea.KeyEnter}) != nil {
+	if d.HandleMsg(keyPress(tea.KeyEnter)) != nil {
 		t.Fatalf("HandleMsg should return nil for a no-op fake")
 	}
 }
@@ -7071,7 +7927,7 @@ func TestHelpDialogHandleMsgIsNoOp(t *testing.T) {
 	if cmd := d.HandleMsg(nil); cmd != nil {
 		t.Fatalf("HandleMsg(nil) cmd = %v, want nil", cmd)
 	}
-	if cmd := d.HandleMsg(tea.KeyMsg{Type: tea.KeyDown}); cmd != nil {
+	if cmd := d.HandleMsg(keyPress(tea.KeyDown)); cmd != nil {
 		t.Fatalf("HandleMsg(KeyDown) cmd = %v, want nil", cmd)
 	}
 }
@@ -7158,8 +8014,6 @@ func TestHelpDialogViewClampsNegativeScroll(t *testing.T) {
 // the border by looking for the box-drawing characters
 // lipgloss.NormalBorder() emits (the corner glyphs ┌ ┐ └ ┘).
 func TestHelpDialogViewWrapsInOverlayFrame(t *testing.T) {
-	lipgloss.SetColorProfile(termenv.TrueColor)
-	t.Cleanup(func() { lipgloss.SetColorProfile(termenv.Ascii) })
 	d := newHelpDialog(0, 30)
 	out := d.View(80)
 	for _, glyph := range []string{"┌", "┐", "└", "┘"} {
@@ -7185,6 +8039,359 @@ func TestRenderHelpStillDelegatesToHelpDialog(t *testing.T) {
 	want := newHelpDialog(3, 24).View(80)
 	if got != want {
 		t.Fatalf("renderHelp(80) diverges from helpDialog.View(80):\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+}
+
+// === Phase C.2: modelPickApiKeyDialog (renderModelPickApiKey migration) ===
+
+func TestModelPickApiKeyDialogID(t *testing.T) {
+	d := newModelPickApiKeyDialog(nil, "> paste API key (or accept default)")
+	if d.ID() != "modelPickApiKey" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "modelPickApiKey")
+	}
+}
+
+func TestModelPickApiKeyDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newModelPickApiKeyDialog(nil, "> paste API key (or accept default)")
+	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
+		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestModelPickApiKeyDialogViewContainsProviderDefaultAndInput(t *testing.T) {
+	provider := &registeredProvider{
+		ID:           "anthropic",
+		DefaultModel: "claude-sonnet-4-6",
+	}
+	d := newModelPickApiKeyDialog(provider, "> paste API key (or accept default)")
+	out := d.View(100)
+	for _, want := range []string{
+		"anthropic API key",
+		"Paste API key",
+		"default model: claude-sonnet-4-6",
+		"> paste API key (or accept default)",
+		"enter confirm · esc back",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("View(100) missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "> >") {
+		t.Fatalf("View(100) rendered a double-prompt line:\n%s", out)
+	}
+}
+
+func TestRenderModelPickApiKeyStillDelegatesToDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:           "anthropic",
+			DisplayName:  "Anthropic",
+			DefaultModel: "claude-sonnet-4-6",
+		}},
+	}
+	m.modelPickSelectedID = "anthropic"
+	m.setMode(modeModelPickApiKey)
+	got := m.renderModelPickApiKey(100)
+	want := newModelPickApiKeyDialog(m.currentModelProvider(), m.input.View()).View(100)
+	if got != want {
+		t.Fatalf("renderModelPickApiKey(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+}
+
+// === Phase C.2: modelPickBaseURLDialog (renderModelPickBaseURL migration) ===
+
+func TestModelPickBaseURLDialogID(t *testing.T) {
+	d := newModelPickBaseURLDialog(nil, "> https://api.example.com")
+	if d.ID() != "modelPickBaseURL" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "modelPickBaseURL")
+	}
+}
+
+func TestModelPickBaseURLDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newModelPickBaseURLDialog(nil, "> https://api.example.com")
+	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
+		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestModelPickBaseURLDialogViewContainsProviderDefaultAndInput(t *testing.T) {
+	provider := &registeredProvider{
+		ID:             "anthropic",
+		DefaultBaseURL: "https://api.anthropic.com",
+	}
+	d := newModelPickBaseURLDialog(provider, "> https://api.example.com")
+	out := d.View(100)
+	for _, want := range []string{
+		"anthropic base URL",
+		"Press Enter to use https://api.anthropic.com.",
+		"> https://api.example.com",
+		"enter confirm · esc back",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("View(100) missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "> >") {
+		t.Fatalf("View(100) rendered a double-prompt line:\n%s", out)
+	}
+}
+
+func TestRenderModelPickBaseURLStillDelegatesToDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:             "anthropic",
+			DisplayName:    "Anthropic",
+			DefaultBaseURL: "https://api.anthropic.com",
+		}},
+	}
+	m.modelPickSelectedID = "anthropic"
+	m.setMode(modeModelPickBaseURL)
+	got := m.renderModelPickBaseURL(100)
+	want := newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View()).View(100)
+	if got != want {
+		t.Fatalf("renderModelPickBaseURL(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+}
+
+// === Phase C.2: modelPickModelDialog (renderModelPickModel migration) ===
+
+func TestModelPickModelDialogID(t *testing.T) {
+	d := newModelPickModelDialog(nil, nil, 0, 24, false, false, "")
+	if d.ID() != "modelPickModel" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "modelPickModel")
+	}
+}
+
+func TestModelPickModelDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newModelPickModelDialog(nil, nil, 0, 24, false, false, "")
+	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
+		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestModelPickModelDialogViewListsModels(t *testing.T) {
+	provider := &registeredProvider{
+		ID: "anthropic",
+		Models: []registeredModel{
+			{ID: "anthropic/claude-sonnet", Name: "Claude Sonnet"},
+			{ID: "anthropic/claude-opus", Name: "Claude Opus"},
+		},
+	}
+	d := newModelPickModelDialog(provider, nil, 1, 30, false, false, "")
+	out := d.View(100)
+	for _, want := range []string{
+		"anthropic models",
+		"Pick a model. enter selects; esc back to base URL.",
+		"model",
+		"Claude Sonnet",
+		"Claude Opus",
+		"↑↓/Tab navigate · enter select · esc back",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("View(100) missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(out, "> Claude Opus") {
+		t.Fatalf("selected model row should be focused with > marker:\n%s", out)
+	}
+}
+
+func TestModelPickModelDialogViewLoadingAndSubmitting(t *testing.T) {
+	provider := &registeredProvider{ID: "anthropic"}
+	loading := newModelPickModelDialog(provider, nil, 0, 30, true, false, "⠋").View(100)
+	if !strings.Contains(loading, "refreshing model list…") || !strings.Contains(loading, "esc back · cancel re-fetch") {
+		t.Fatalf("loading view missing status/hint:\n%s", loading)
+	}
+	submitting := newModelPickModelDialog(provider, nil, 0, 30, false, true, "⠋").View(100)
+	if !strings.Contains(submitting, "saving model…") || !strings.Contains(submitting, "request still in flight") {
+		t.Fatalf("submitting view missing status/hint:\n%s", submitting)
+	}
+}
+
+func TestRenderModelPickModelStillDelegatesToDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:          "anthropic",
+			DisplayName: "Anthropic",
+			Models: []registeredModel{
+				{ID: "anthropic/claude-sonnet", Name: "Claude Sonnet"},
+				{ID: "anthropic/claude-opus", Name: "Claude Opus"},
+			},
+		}},
+	}
+	m.modelPickSelectedID = "anthropic"
+	m.modelPickSelectedIdx = 1
+	m.height = 30
+	m.setMode(modeModelPickModel)
+	got := m.renderModelPickModel(100)
+	want := newModelPickModelDialog(
+		m.currentModelProvider(),
+		m.modelPickerLive,
+		m.modelPickSelectedIdx,
+		m.height,
+		m.modelPickerLoading,
+		m.modelPickSubmitting,
+		m.spinner.View(),
+	).View(100)
+	if got != want {
+		t.Fatalf("renderModelPickModel(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+}
+
+// === Phase C.2: permissionDialog (renderPermission migration) ===
+
+func TestPermissionDialogID(t *testing.T) {
+	d := newPermissionDialog(nil, 0)
+	if d.ID() != "permission" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "permission")
+	}
+}
+
+func TestPermissionDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newPermissionDialog(nil, 0)
+	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
+		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestPermissionDialogViewContainsChoicesAndReason(t *testing.T) {
+	pending := &pendingPermission{
+		name:          "Bash",
+		risk:          "execute",
+		input:         "{\"command\":\"git status\"}",
+		message:       "Tool Bash requires user permission to run.",
+		suggestedRule: "git:status",
+	}
+	d := newPermissionDialog(pending, 2)
+	out := d.View(100)
+	for _, want := range []string{
+		"Permission: Bash",
+		"execute risk",
+		"Waiting for permission",
+		"input:",
+		"git status",
+		"Suggested rule: git:status",
+		"[1] Approve once",
+		"[2] Approve for this session",
+		"~ [3] Approve with editable rule",
+		"[4] Reject",
+		"[5] Reject, tell the model what to do instead",
+		"esc cancel",
+		"reason: Tool Bash requires user permission to run.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("View(100) missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderPermissionStillDelegatesToDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.pending = &pendingPermission{
+		name:          "Bash",
+		risk:          "execute",
+		input:         "{\"command\":\"git status\"}",
+		message:       "Tool Bash requires user permission to run.",
+		suggestedRule: "git:status",
+	}
+	m.permissionChoice = 4
+	got := m.renderPermission(100)
+	want := newPermissionDialog(m.pending, m.permissionChoice).View(100)
+	if got != want {
+		t.Fatalf("renderPermission(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
+			got, want)
+	}
+}
+
+// === Phase C.2: permissionEditorDialog (renderPermissionEditor migration) ===
+
+func TestPermissionEditorDialogID(t *testing.T) {
+	d := newPermissionEditorDialog(nil, modePermissionEditRule, "> git:status")
+	if d.ID() != "permissionEditor" {
+		t.Fatalf("ID() = %q, want %q", d.ID(), "permissionEditor")
+	}
+}
+
+func TestPermissionEditorDialogHandleMsgIsNoOp(t *testing.T) {
+	d := newPermissionEditorDialog(nil, modePermissionEditRule, "> git:status")
+	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
+		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
+	}
+}
+
+func TestPermissionEditorDialogViewRuleAndFeedbackModes(t *testing.T) {
+	pending := &pendingPermission{
+		name:          "Bash",
+		risk:          "execute",
+		input:         "{\"command\":\"git status\"}",
+		message:       "Tool Bash requires user permission to run.",
+		suggestedRule: "git:status",
+	}
+	rule := newPermissionEditorDialog(pending, modePermissionEditRule, "> git:status").View(100)
+	for _, want := range []string{
+		"Editing rule for Bash",
+		"execute risk",
+		"input:",
+		"git status",
+		"reason: Tool Bash requires user permission to run.",
+		"Suggested rule: git:status",
+		"> git:status",
+		"Edit the allow rule",
+		"↵ confirm   esc back to options",
+	} {
+		if !strings.Contains(rule, want) {
+			t.Fatalf("rule View(100) missing %q:\n%s", want, rule)
+		}
+	}
+	if strings.Contains(rule, "> >") {
+		t.Fatalf("rule View(100) rendered a double-prompt line:\n%s", rule)
+	}
+
+	feedback := newPermissionEditorDialog(pending, modePermissionEditFeedback, "> tell the model").View(100)
+	for _, want := range []string{
+		"Editing feedback for Bash",
+		"execute risk",
+		"input:",
+		"git status",
+		"reason: Tool Bash requires user permission to run.",
+		"> tell the model",
+		"Tell the model what to do instead",
+		"↵ confirm   esc back to options",
+	} {
+		if !strings.Contains(feedback, want) {
+			t.Fatalf("feedback View(100) missing %q:\n%s", want, feedback)
+		}
+	}
+	if strings.Contains(feedback, "Suggested rule:") {
+		t.Fatalf("feedback View(100) should not show suggested rule:\n%s", feedback)
+	}
+	if strings.Contains(feedback, "> >") {
+		t.Fatalf("feedback View(100) rendered a double-prompt line:\n%s", feedback)
+	}
+}
+
+func TestRenderPermissionEditorStillDelegatesToDialog(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.pending = &pendingPermission{
+		name:          "Bash",
+		risk:          "execute",
+		input:         "{\"command\":\"git status\"}",
+		message:       "Tool Bash requires user permission to run.",
+		suggestedRule: "git:status",
+	}
+	m.setMode(modePermissionEditRule)
+	m.input.SetValue("git:status")
+	got := m.renderPermissionEditor(100)
+	want := newPermissionEditorDialog(m.pending, m.inputMode, m.input.View()).View(100)
+	if got != want {
+		t.Fatalf("renderPermissionEditor(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
 			got, want)
 	}
 }

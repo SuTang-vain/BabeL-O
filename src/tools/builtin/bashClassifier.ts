@@ -128,6 +128,15 @@ const FIND_DENIED_FLAGS = [
   '-print0',
 ]
 
+const SAFE_GREP_FLAGS = new Set([
+  '--line-number',
+  '--extended-regexp',
+  '--fixed-strings',
+  '--ignore-case',
+  '--binary-files=without-match',
+])
+const SAFE_SED_FLAGS = new Set(['-n', '--quiet', '--silent'])
+
 /**
  * Regex escalations applied to the *entire* command string. A match
  * forces `kind: 'execute'`. They are intentionally conservative:
@@ -185,7 +194,7 @@ const DANGEROUS_PATTERNS: { pattern: RegExp; rule: string }[] = [
  * dangerous-pattern layer flags them so the classifier never sees a
  * confused token stream.
  */
-function tokenize(command: string): string[] {
+export function tokenizeBashCommand(command: string): string[] {
   const out: string[] = []
   let buf = ''
   let quote: '"' | "'" | null = null
@@ -248,6 +257,92 @@ function classifyFind(tokens: string[]): BashRiskKind | { kind: 'execute'; rule:
   return 'read'
 }
 
+function classifySafeSourceInspection(
+  tokens: string[],
+  command: string,
+): 'read' | { kind: 'execute'; rule: string } | null {
+  const dangerous = findDangerousPattern(command)
+  if (dangerous) return { kind: 'execute', rule: dangerous }
+
+  const pipeIndex = tokens.indexOf('|')
+  if (pipeIndex >= 0 && !isSafeTruncationPipe(tokens.slice(pipeIndex + 1))) {
+    return { kind: 'execute', rule: 'pipeline-not-allowlisted' }
+  }
+  const commandTokens = pipeIndex >= 0 ? tokens.slice(0, pipeIndex) : tokens
+  const [head, ...args] = commandTokens
+  if (head === 'sed') return classifySafeSed(args)
+  if (head === 'grep') return classifySafeGrep(args)
+  return null
+}
+
+function isSafeTruncationPipe(tokens: string[]): boolean {
+  const [command, ...args] = tokens
+  if (command !== 'head' && command !== 'tail') return false
+  if (args.length === 0) return true
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]
+    if (/^-[0-9]+$/.test(arg)) continue
+    if ((arg === '-n' || arg === '-c') && /^\d+$/.test(args[i + 1] ?? '')) {
+      i += 1
+      continue
+    }
+    return false
+  }
+  return true
+}
+
+function classifySafeSed(args: string[]): 'read' | { kind: 'execute'; rule: string } {
+  if (args.some(arg => arg === '-i' || arg.startsWith('-i'))) {
+    return { kind: 'execute', rule: 'sed-in-place-denied' }
+  }
+  const invalidFlag = args.find(arg => arg.startsWith('-') && !SAFE_SED_FLAGS.has(arg))
+  if (invalidFlag) return { kind: 'execute', rule: `sed-flag-${invalidFlag.replace(/^--?/, '')}-not-allowlisted` }
+
+  const scriptAndPaths = args.filter(arg => !SAFE_SED_FLAGS.has(arg))
+  if (!args.some(arg => SAFE_SED_FLAGS.has(arg))) {
+    return { kind: 'execute', rule: 'sed-requires-print-only-mode' }
+  }
+  if (scriptAndPaths.length < 2) {
+    return { kind: 'execute', rule: 'sed-requires-script-and-file' }
+  }
+  const [script, ...paths] = scriptAndPaths
+  if (!/^\d+(?:,\d+)?p$/.test(script)) {
+    return { kind: 'execute', rule: 'sed-script-not-allowlisted' }
+  }
+  if (paths.some(path => path.startsWith('-'))) {
+    return { kind: 'execute', rule: 'sed-path-not-allowlisted' }
+  }
+  return 'read'
+}
+
+function classifySafeGrep(args: string[]): 'read' | { kind: 'execute'; rule: string } {
+  const positional: string[] = []
+  for (const arg of args) {
+    if (arg === '--') continue
+    if (arg.startsWith('--')) {
+      if (!SAFE_GREP_FLAGS.has(arg)) {
+        return { kind: 'execute', rule: `grep-flag-${arg.replace(/^--/, '')}-not-allowlisted` }
+      }
+      continue
+    }
+    if (arg.startsWith('-')) {
+      if (!/^-[nEFiHhIo]+$/.test(arg)) {
+        return { kind: 'execute', rule: `grep-flag-${arg.replace(/^-/, '')}-not-allowlisted` }
+      }
+      continue
+    }
+    positional.push(arg)
+  }
+  if (positional.length < 2) {
+    return { kind: 'execute', rule: 'grep-requires-pattern-and-file' }
+  }
+  const paths = positional.slice(1)
+  if (paths.some(path => path.includes('*') || path.includes('?'))) {
+    return { kind: 'execute', rule: 'grep-glob-path-not-allowlisted' }
+  }
+  return 'read'
+}
+
 /**
  * Classify a Bash command string as `read` (auto-allow under
  * `denyByDefaultTools()`) or `execute` (keep current hard-deny /
@@ -258,7 +353,7 @@ export function classifyBashRisk(command: string): BashRiskClassification {
   if (!trimmed) {
     return { kind: 'execute', rule: 'empty-command', command }
   }
-  const tokens = tokenize(trimmed)
+  const tokens = tokenizeBashCommand(trimmed)
   if (tokens.length === 0) {
     return { kind: 'execute', rule: 'no-tokens', command }
   }
@@ -271,6 +366,14 @@ export function classifyBashRisk(command: string): BashRiskClassification {
     }
     // findResult is the discriminated union of { kind: 'execute'; rule: string }.
     return { kind: 'execute', rule: (findResult as { rule: string }).rule, command }
+  }
+
+  const sourceInspection = classifySafeSourceInspection(tokens, trimmed)
+  if (sourceInspection === 'read') {
+    return { kind: 'read', command }
+  }
+  if (sourceInspection) {
+    return { kind: 'execute', rule: sourceInspection.rule, command }
   }
 
   const allowedSubs = Object.prototype.hasOwnProperty.call(BASH_READ_ONLY_COMMANDS, first)

@@ -50,7 +50,7 @@ model.
 
 ## Run
 
-Run the MVP through the BabeL-O CLI:
+Run the client through the BabeL-O CLI:
 
 ```bash
 cd /Users/tangyaoyue/DEV/BABEL/BabeL-O
@@ -98,10 +98,23 @@ go run ./cmd/go-tui --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue/DEV/BABE
 Keys:
 
 - `enter`: submit the current input.
-- `ctrl+c`: quit.
+- `/`: open the fuzzy slash-command palette; continue typing to filter.
+- `?`: open the local help overlay when the input is empty.
+- `ctrl+c`: open the quit confirmation dialog (`y` / `enter` quits, `n` / `esc` cancels).
+- `ctrl+o` / `ctrl+t` / `ctrl+g`: open tools, tasks, and agents directly.
+- `ctrl+q`: direct quit through the `/quit` shortcut.
 - `q`: quit when idle and the input is empty.
 - `a` / `y`: approve a pending permission request.
 - `r` / `n`: reject a pending permission request.
+
+UI features:
+
+- Right-side transcript scrollbar with compact layout behavior for small terminals.
+- Underlined button hotkeys in footer and dialog hints.
+- RenderContext-backed help, permission, model-pick, and quit dialogs.
+- Fuzzy slash-command filtering with highlighted matched command names.
+- Stable-prefix streaming markdown rendering for assistant/thinking output.
+- Mouse drag selection with item-local highlight rendering and OSC 52 copy feedback when `--mouse` is enabled.
 
 Local commands:
 

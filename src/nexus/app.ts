@@ -1086,6 +1086,46 @@ export async function createNexusApp(
     return 200
   }
 
+  async function maybeAppendNearTimeoutWarning(state: {
+    events: NexusEvent[]
+    sessionId: string
+    requestId: string
+    timeoutMs: number
+    elapsedMs: number
+    send?: (event: NexusEvent) => void
+  }): Promise<void> {
+    if (state.events.some(event => event.type === 'near_timeout_warning')) return
+    if (!executeTimeoutNear(state.elapsedMs, state.timeoutMs)) return
+    if (!hasPartialTimeoutEvidence(state.events)) return
+    const warning = buildNearTimeoutWarningEvent({
+      sessionId: state.sessionId,
+      requestId: state.requestId,
+      timeoutMs: state.timeoutMs,
+      elapsedMs: state.elapsedMs,
+      partialSummary: buildPartialTimeoutSummary(state.events),
+    })
+    state.events.push(warning)
+    await options.storage.appendEvent(state.sessionId, warning)
+    state.send?.(warning)
+  }
+
+  function startNearTimeoutWatcher(state: {
+    events: NexusEvent[]
+    sessionId: string
+    requestId: string
+    timeoutMs: number
+    startedAtMs: number
+    send?: (event: NexusEvent) => void
+  }): ReturnType<typeof setTimeout> {
+    const delayMs = Math.max(0, Math.floor(state.timeoutMs * EXECUTE_TIMEOUT_NEAR_RATIO))
+    return setTimeout(() => {
+      void maybeAppendNearTimeoutWarning({
+        ...state,
+        elapsedMs: Math.max(0, Math.round(metrics.now() - state.startedAtMs)),
+      })
+    }, delayMs)
+  }
+
   app.post('/v1/execute', async (request, reply) => {
     const releaseExecution = executionGate.tryAcquire()
     if (!releaseExecution) {
@@ -1117,6 +1157,14 @@ export async function createNexusApp(
       })
 
       const events: NexusEvent[] = []
+      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const nearTimeoutWatcher = startNearTimeoutWatcher({
+        events,
+        sessionId,
+        requestId,
+        timeoutMs: effectiveTimeoutMs,
+        startedAtMs,
+      })
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -1139,17 +1187,33 @@ export async function createNexusApp(
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
           recordEventMetrics(event)
+          await maybeAppendNearTimeoutWarning({
+            events,
+            sessionId,
+            requestId,
+            timeoutMs: effectiveTimeoutMs,
+            elapsedMs: Math.max(0, Math.round(metrics.now() - startedAtMs)),
+          })
         }
       } finally {
+        clearTimeout(nearTimeoutWatcher)
         clearTimeout(timeout)
       }
 
-      const resultEvent = events.findLast(event => event.type === 'result')
+      let resultEvent = events.findLast(event => event.type === 'result')
       const errorEvent = events.findLast(event => event.type === 'error')
       const statusCode = runtimeResultStatusCode(events, errorEvent)
       const timedOut = abortController.signal.aborted
       const timeoutEvent =
         errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT'
+      const partialResultEvent = await appendTimeoutPartialResult({
+        storage: options.storage,
+        sessionId,
+        events,
+        resultEvent,
+        errorEvent,
+      })
+      resultEvent = partialResultEvent ?? resultEvent
       const succeeded =
         !timedOut && !errorEvent && resultEvent?.type === 'result' && resultEvent.success
       await finalizeExecutionSession(options.storage, sessionId, {
@@ -1159,7 +1223,6 @@ export async function createNexusApp(
         contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
       })
       const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
-      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
       const summaryEvent = buildExecuteSummaryEvent({
         sessionId,
         requestId,
@@ -2204,6 +2267,20 @@ export async function createNexusApp(
       })
       const timeout = prepared.timeout
       const events: NexusEvent[] = []
+      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const nearTimeoutWatcher = startNearTimeoutWatcher({
+        events,
+        sessionId,
+        requestId,
+        timeoutMs: effectiveTimeoutMs,
+        startedAtMs,
+        send: event => {
+          if (socket.readyState === socket.OPEN) {
+            sendJson(socket, event)
+            metrics.recordStreamEvent(socket.bufferedAmount)
+          }
+        },
+      })
 
       try {
         for await (const event of options.runtime.executeStream({
@@ -2233,17 +2310,48 @@ export async function createNexusApp(
           }
           sendJson(socket, event)
           metrics.recordStreamEvent(socket.bufferedAmount)
+          await maybeAppendNearTimeoutWarning({
+            events,
+            sessionId,
+            requestId,
+            timeoutMs: effectiveTimeoutMs,
+            elapsedMs: Math.max(0, Math.round(metrics.now() - startedAtMs)),
+            send: warning => {
+              if (socket.readyState === socket.OPEN) {
+                sendJson(socket, warning)
+                metrics.recordStreamEvent(socket.bufferedAmount)
+              }
+            },
+          })
           if (event.type === 'result') success = event.success
           if (event.type === 'error' && event.code === 'REQUEST_TIMEOUT') {
             timedOut = true
           }
         }
       } finally {
+        clearTimeout(nearTimeoutWatcher)
         clearTimeout(timeout)
       }
       timedOut = timedOut || abortController.signal.aborted
-      const resultEvent = events.findLast(event => event.type === 'result')
+      let resultEvent = events.findLast(event => event.type === 'result')
       const errorEvent = events.findLast(event => event.type === 'error')
+      const partialResultEvent = await appendTimeoutPartialResult({
+        storage: options.storage,
+        sessionId,
+        events,
+        resultEvent,
+        errorEvent,
+        send: event => {
+          if (socket.readyState === socket.OPEN) {
+            sendJson(socket, event)
+            metrics.recordStreamEvent(socket.bufferedAmount)
+          }
+        },
+      })
+      if (partialResultEvent) {
+        resultEvent = partialResultEvent
+        success = false
+      }
       await finalizeExecutionSession(options.storage, sessionId, {
         succeeded: success,
         resultEvent,
@@ -2251,7 +2359,6 @@ export async function createNexusApp(
         contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
       })
       const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
-      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
       const summaryEvent = buildExecuteSummaryEvent({
         sessionId,
         requestId,
@@ -2518,6 +2625,95 @@ function runtimeTerminalCategoryForCode(code: string): TaskSessionTerminalReason
 }
 
 const EXECUTE_TIMEOUT_NEAR_RATIO = 0.8
+
+function hasPartialTimeoutEvidence(events: readonly NexusEvent[]): boolean {
+  return events.some(event =>
+    (event.type === 'assistant_delta' && event.text.trim().length > 0) ||
+    event.type === 'tool_completed' ||
+    event.type === 'tool_denied' ||
+    event.type === 'permission_response',
+  )
+}
+
+function buildPartialTimeoutSummary(events: readonly NexusEvent[]): string | undefined {
+  const assistantText = events
+    .filter((event): event is Extract<NexusEvent, { type: 'assistant_delta' }> => event.type === 'assistant_delta')
+    .map(event => event.text)
+    .join('')
+    .trim()
+  if (assistantText) {
+    return truncateForTimeoutSummary(assistantText)
+  }
+  const toolEvidence = events
+    .filter((event): event is Extract<NexusEvent, { type: 'tool_completed' | 'tool_denied' }> => event.type === 'tool_completed' || event.type === 'tool_denied')
+    .map(event => {
+      if (event.type === 'tool_denied') return `${event.name} denied: ${event.message}`
+      return `${event.name} ${event.success ? 'completed' : 'failed'}`
+    })
+  if (toolEvidence.length > 0) {
+    return truncateForTimeoutSummary(`Tool evidence before timeout: ${toolEvidence.slice(-3).join('; ')}`)
+  }
+  return undefined
+}
+
+function truncateForTimeoutSummary(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized.length > 800 ? `${normalized.slice(0, 797)}...` : normalized
+}
+
+function buildNearTimeoutWarningEvent(options: {
+  sessionId: string
+  requestId?: string
+  timeoutMs: number
+  elapsedMs: number
+  partialSummary?: string
+}): Extract<NexusEvent, { type: 'near_timeout_warning' }> {
+  const message = options.partialSummary
+    ? 'Execution is near its timeout budget; preserve a concise partial answer now.'
+    : 'Execution is near its timeout budget; wrap up as soon as possible.'
+  return {
+    type: 'near_timeout_warning',
+    ...eventBase(options.sessionId),
+    ...(options.requestId !== undefined && { requestId: options.requestId }),
+    timeoutMs: options.timeoutMs,
+    elapsedMs: options.elapsedMs,
+    thresholdRatio: EXECUTE_TIMEOUT_NEAR_RATIO,
+    ...(options.partialSummary !== undefined && { partialSummary: options.partialSummary }),
+    message,
+  }
+}
+
+function buildTimeoutPartialResultMessage(baseMessage: string, events: readonly NexusEvent[]): string {
+  const partialSummary = buildPartialTimeoutSummary(events)
+  if (!partialSummary) return baseMessage
+  return `${baseMessage}\n\nPartial result preserved before timeout:\n${partialSummary}`
+}
+
+async function appendTimeoutPartialResult(options: {
+  storage: NexusStorage
+  sessionId: string
+  events: NexusEvent[]
+  resultEvent: NexusEvent | undefined
+  errorEvent: NexusEvent | undefined
+  send?: (event: NexusEvent) => void
+}): Promise<Extract<NexusEvent, { type: 'result' }> | undefined> {
+  if (options.errorEvent?.type !== 'error' || options.errorEvent.code !== 'REQUEST_TIMEOUT') return undefined
+  const baseMessage = options.resultEvent?.type === 'result'
+    ? options.resultEvent.message
+    : options.errorEvent.message
+  const message = buildTimeoutPartialResultMessage(baseMessage, options.events)
+  if (message === baseMessage) return undefined
+  const partialResult: Extract<NexusEvent, { type: 'result' }> = {
+    type: 'result',
+    ...eventBase(options.sessionId),
+    success: false,
+    message,
+  }
+  options.events.push(partialResult)
+  await options.storage.appendEvent(options.sessionId, partialResult)
+  options.send?.(partialResult)
+  return partialResult
+}
 
 function executeTimeoutNear(durationMs: number, timeoutMs: number): boolean {
   if (timeoutMs <= 0) return false

@@ -125,10 +125,11 @@ function getToolUsageSection(): string {
   return `## Tool Usage
 
 - ALWAYS prefer dedicated tools over Bash commands for file operations. Bash requires explicit user permission approval; ListDir/Glob/Grep/Read are auto-approved and faster.
+- For ordinary source code inspection, do NOT use Bash commands such as sed, head, grep, rg, or shell pipelines unless the user explicitly asks for shell syntax or the task needs shell-only behavior.
 - To inspect directory inventory use ListDir instead of ls, find, or tree.
 - To discover files by path pattern use Glob instead of find.
-- To locate text inside files use Grep instead of grep or rg; Grep is locator evidence, not source understanding.
-- To understand file contents use Read instead of cat, head, or tail.
+- To locate text inside files use Grep instead of grep, rg, or grep | head; Grep is locator evidence, not source understanding.
+- To understand file contents use Read instead of cat, sed -n, head, or tail.
 - To edit files use Edit instead of sed or awk.
 - To create files use Write instead of echo redirection.
 - To run, start, test, build, or execute commands use Bash. Do not use ListDir/Glob/Grep/Read when the user wants you to perform an action.

@@ -737,6 +737,9 @@ function renderLiveEvent(event: NexusEvent): void {
         ),
       )
       break
+    case 'near_timeout_warning':
+      console.log(chalk.yellow(`near timeout: ${event.elapsedMs}/${event.timeoutMs}ms. ${event.message}`))
+      break
     case 'context_blocking':
       lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
       console.log(
@@ -986,6 +989,10 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         outputText += chalk.yellow(
           `context warning: ${ev.percentUsed}% of window used (${ev.tokenEstimate}/${ev.maxTokens} tokens). consider /compact.\n`,
         )
+        break
+
+      case 'near_timeout_warning':
+        outputText += chalk.yellow(`near timeout: ${ev.elapsedMs}/${ev.timeoutMs}ms. ${ev.message}\n`)
         break
 
       case 'context_blocking':

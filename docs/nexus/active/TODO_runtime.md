@@ -12,6 +12,33 @@ Nexus 是 BabeL-O 的执行核心。这里只保留仍未收口的 runtime / API
 - `session_1e2299be-b988-49ea-8819-587de8258172` 暴露真实会话在大量 `Read` 后第二轮 provider call 前触发 context blocking；P1 已补 provider-loop reactive compact、adaptive `Read` preview/range 策略、live `Read` aggregate budget、embedded metrics side-table 持久化和 retryable failed session 恢复状态表达。后续只保留重复大文件读取诊断与 P2 targeted reading 地基。
 - 除上述真实会话回归外，后续阶段仍保留架构收口、权限细化和执行入口升级。
 
+## P1 Task-adaptive Recoverable Timeout
+
+> 详细规划见 [Task-adaptive Recoverable Timeout 规划](../reference/task-adaptive-recoverable-timeout-plan.md)。真实样本：`session_791b10ce-0d41-409d-b2de-1e5d14eb19b3`；用户请求“查看当前项目分析潜在的bug”，session 在 180s 顶层 cutoff 时仍在推进，最后一个已获批 Bash 未完成，最终 `REQUEST_TIMEOUT` 直接终止 workflow。
+
+目标口径：普通 timeout 是模型可见、可恢复、可扩展的 soft deadline，不是默认杀死整个 workflow 的控制流；系统仍保留 hard watchdog，但它只用于防止进程泄漏、无限挂起、资源失控或断连后无人消费。
+
+- [ ] Phase 0: 真实样本与语义回归。
+  - 固化 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3` 的失败形状：41 tools / 40 completed / 最后 Bash 已 approve 但未 complete / `execute_summary.outcome=timeout` / partial assistant 内容已产生。
+  - 测试必须区分 tool timeout、request timeout、watchdog timeout、provider error，避免继续把普通 soft deadline 当 fatal session failure。
+- [ ] Phase 1: 协议语义拆分。
+  - `/v1/execute` / `/v1/stream` 增加 optional timeout policy（如 `timeoutPolicy='fatal'|'soft'`、`softTimeoutMs`、`watchdogTimeoutMs`），旧 HTTP 客户端默认保持 fatal back-compat，Go TUI 先 opt-in soft policy。
+  - Nexus 内部拆 soft timer 与 hard watchdog，不再只有一个 `setTimeout(() => timeoutController.abort(); abortController.abort())`。
+- [ ] Phase 2: Runtime 可恢复事件。
+  - 到达 soft deadline 时 append runtime-visible event（如 `timeout_budget_exceeded`），持久化并推给客户端，但不 abort runtime loop。
+  - 事件进入后续模型上下文，模型可选择 summarize / narrow scope / continue / retry last tool。
+- [ ] Phase 3: 模型预算决策与 extension 策略。
+  - system prompt 明确 soft timeout 后必须主动选择收口、缩小范围或继续并解释理由。
+  - 可允许有限次数/总预算的自动 extension；超过上限必须用户确认或收口。
+- [ ] Phase 4: Go TUI 展示与交互。
+  - soft timeout 渲染为 warning/status（例如 `soft timeout reached; workflow continues`），不关闭 session、不把 input mode 卡死。
+  - 只有 hard watchdog 才显示 fatal timeout 文案；普通 soft timeout 不再建议单纯提高 `--execute-timeout-ms`。
+- [ ] Phase 5: Hard watchdog 与 cleanup。
+  - 用户 cancel、client disconnect、server shutdown、watchdog 到达仍要正确 abort、清理 active execution、取消 pending permission。
+  - fatal watchdog 事件与 soft timeout 事件在 schema、metrics、TUI 文案中可区分。
+- [ ] Phase 6: DONE 与跨文档同步。
+  - 落地后同步 [DONE.md](../DONE.md)、本 TODO、总控 TODO，并在旧 [go-tui-tool-permission-timeout-optimization-plan.md](../reference/go-tui-tool-permission-timeout-optimization-plan.md) 中标明：旧规划解决“权限/工具噪音”，本规划解决“fatal timeout 语义”。
+
 ## 已收口 P0 Current-turn Session Finalization Regression
 
 > 样本：`session_9d985c5c-7c89-41b8-9d5e-cc672e412f00`。第三轮用户请求已经写入 `user_message` / `session_started` / PreInvocation / `usage` / `thinking_delta`，但没有当前轮 `assistant_delta`、PostInvocation、`result`、`error` 或 `execution_metrics`；session 最终仍被标记为 `completed`，并继承上一轮 result。

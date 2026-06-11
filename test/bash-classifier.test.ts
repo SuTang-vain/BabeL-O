@@ -105,6 +105,21 @@ test('classifyBashRisk denies find without -type f or with action flags', () => 
   expectExecute('find . -type f -ok rm {} \\;', { ruleSubstring: 'find-ok-denied' })
 })
 
+test('classifyBashRisk auto-allows narrow read-only source inspection commands', () => {
+  expectRead("sed -n '2200,2650p' /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go")
+  expectRead("sed -n '2200,2650p' /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go | head -c 30000")
+  expectRead('grep -n "permission_request\\|streamEvent" /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go | head -80')
+  expectRead('grep -nE "Test[A-Z][a-zA-Z_]+" /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui_test.go')
+})
+
+test('classifyBashRisk keeps mutating or broad source inspection variants gated', () => {
+  expectExecute("sed -i 's/a/b/' file.go", { ruleSubstring: 'sed-in-place-denied' })
+  expectExecute("sed -n '1,20p' file.go > out.txt", { ruleSubstring: 'output-redirect' })
+  expectExecute("sed -n '1,20p' file.go | sh", { ruleSubstring: 'pipe-to-shell' })
+  expectExecute('grep -r needle .', { ruleSubstring: 'grep-flag-r-not-allowlisted' })
+  expectExecute('grep needle *.ts', { ruleSubstring: 'grep-glob-path-not-allowlisted' })
+})
+
 test('classifyBashRisk escalates command chains and pipes to shell', () => {
   // When a chained command contains a specifically dangerous name (rm,
   // curl, etc.), the more specific rule wins. Plain chains without a

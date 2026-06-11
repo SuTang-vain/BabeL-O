@@ -66,7 +66,7 @@ func parseFlags() tui.Config {
 			}
 		}
 		if cfg.ExecuteTimeoutMs <= 0 {
-			cfg.ExecuteTimeoutMs = 180_000
+			cfg.ExecuteTimeoutMs = tui.DefaultGoTuiExecuteTimeoutMs
 		}
 	}
 	return cfg

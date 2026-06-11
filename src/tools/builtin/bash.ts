@@ -212,7 +212,7 @@ const inputSchema = z.object({
 export const bashTool: ToolDefinition<typeof inputSchema> = {
   name: 'Bash',
   description: 'Run a shell command in the workspace.',
-  prompt: () => 'Executes a bash command in the working directory. The shell state does not persist between commands. Use this for system commands and terminal operations that require shell execution. Prefer dedicated tools (Read, Edit, Glob, Grep) for file operations instead of shell commands.',
+  prompt: () => 'Executes a bash command in the working directory. The shell state does not persist between commands. Use this for system commands and terminal operations that require shell execution, such as build, test, install, git, or shell-only workflows. Do NOT use Bash for ordinary source code reading (for example sed -n, head, grep, rg, or grep | head); use Read with offset/limit for file snippets, Grep to locate text, ListDir for directory inventory, and Glob for path discovery. Prefer dedicated tools (Read, Edit, Glob, Grep, ListDir) for file operations instead of shell commands.',
   risk: 'execute',
   inputSchema,
   // Per-input risk override: read-only subcommands (git status, ls, cat,

@@ -1,5 +1,6 @@
 import { isAbsolute, relative, resolve } from 'node:path'
 import { getBashFileDiscoveryGuidance } from '../shared/bashDiscoveryGuidance.js'
+import { classifyBashRisk } from '../tools/builtin/bashClassifier.js'
 
 export type ClassificationResult = {
   autoApprove: boolean
@@ -230,6 +231,10 @@ export function classifyAction(
       return { autoApprove: false, reason: 'Invalid bash command input' }
     }
     const trimmed = cmd.trim()
+    const bashRisk = classifyBashRisk(trimmed)
+    if (bashRisk.kind === 'read' && /^(sed|grep)\b/.test(trimmed)) {
+      return { autoApprove: true, reason: 'Known safe command' }
+    }
     const tokenized = tokenizeShellCommand(trimmed)
     if (tokenized.unsafeSyntax) {
       return { autoApprove: false, reason: tokenized.unsafeSyntax }

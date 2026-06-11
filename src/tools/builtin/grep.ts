@@ -20,7 +20,7 @@ const inputSchema = z.object({
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
-  prompt: () => 'Grep is a content locator built on bundled ripgrep when available, then system rg, then JavaScript RegExp fallback. Supports full regex syntax through ripgrep and basic JavaScript regex fallback; use pathMatches for file glob filters such as "**/*.ts". Use Grep to find candidate lines containing symbols, errors, or text inside files. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
+  prompt: () => 'Grep is a content locator built on bundled ripgrep when available, then system rg, then JavaScript RegExp fallback. Supports full regex syntax through ripgrep and basic JavaScript regex fallback; use pathMatches for file glob filters such as "**/*.ts". Use Grep to find candidate lines containing symbols, errors, or text inside files; prefer it over Bash grep, rg, or grep | head for ordinary source code search. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {

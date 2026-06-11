@@ -11,7 +11,13 @@ import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
-import { LocalCodingRuntime, allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
+import {
+  LocalCodingRuntime,
+  allowAllTools,
+  allowlistedTools,
+  buildSessionRulesPolicy,
+  deriveBashSuggestedRule,
+} from '../src/runtime/LocalCodingRuntime.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { createNexusTask, taskQueueStatsForTest } from '../src/nexus/taskQueue.js'
 import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSession.js'
@@ -3691,6 +3697,40 @@ test('allowlisted runtime executes allowed tools and denies blocked tools', asyn
   }
 })
 
+test('read-only Bash source inspection skips permission gate', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-source-inspection`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'state-machine.go'), Array.from({ length: 80 }, (_, i) => `line ${i + 1}`).join('\n'), 'utf8')
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    for (const command of [
+      "sed -n '1,20p' state-machine.go | head -c 30000",
+      'grep -n "line" state-machine.go | head -20',
+    ]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/execute',
+        payload: { prompt: `Bash: ${JSON.stringify({ command })}`, cwd },
+      })
+      assert.equal(response.statusCode, 200)
+      const body = response.json()
+      assert.equal(body.success, true)
+      assert.ok(
+        body.events.some((event: { type: string; name?: string; effectiveRisk?: string }) =>
+          event.type === 'tool_started' && event.name === 'Bash' && event.effectiveRisk === 'read'),
+        `expected Bash effectiveRisk=read for ${command}`,
+      )
+      assert.ok(
+        !body.events.some((event: { type: string }) => event.type === 'permission_request'),
+        `safe source inspection should not ask permission for ${command}`,
+      )
+    }
+  } finally {
+    await app.close()
+  }
+})
+
 test('session list stays lightweight while session detail keeps events', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-session-list`)
   await mkdir(cwd, { recursive: true })
@@ -3816,6 +3856,71 @@ test('execute timeout aborts long-running tools and records metrics', async () =
     assert.equal(metrics.execute.count, 1)
     assert.equal(metrics.execute.timeoutCount, 1)
     assert.ok(metrics.execute.avgMs >= 0)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute timeout preserves partial result and emits near-timeout warning', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-partial-timeout`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: 'Partial analysis: inspected state machine setup.',
+      }
+      await new Promise<void>(resolve => {
+        options.timeoutSignal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'REQUEST_TIMEOUT',
+        message: 'This operation was aborted',
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: false,
+        message: 'This operation was aborted',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 80 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'long analysis', cwd },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.statusCode, 408)
+    assert.equal(body.success, false)
+    assert.equal(body.outcome, 'timeout')
+    const warning = body.events.find((event: { type: string }) => event.type === 'near_timeout_warning')
+    assert.ok(warning, 'near_timeout_warning should be emitted before timeout')
+    assert.match(warning.partialSummary, /Partial analysis/)
+    const resultEvents = body.events.filter((event: { type: string }) => event.type === 'result')
+    const finalResult = resultEvents.at(-1)
+    assert.ok(finalResult, 'timeout should still emit a result event')
+    assert.match(finalResult.message, /Partial result preserved before timeout/)
+    assert.match(finalResult.message, /inspected state machine setup/)
+    assert.notEqual(finalResult.message, 'This operation was aborted')
+    assert.equal(body.result.message, finalResult.message)
+
+    const session = await storage.getSession(body.sessionId)
+    assert.ok(session)
+    assert.match(session.result ?? '', /Partial result preserved before timeout/)
   } finally {
     await app.close()
   }
@@ -6268,6 +6373,70 @@ test('Phase A.1: permission_request surfaces suggestedRule for Bash', async () =
   await app.close()
 })
 
+test('Phase 3: Bash suggestedRule uses structured source-inspection rules', () => {
+  assert.equal(
+    deriveBashSuggestedRule({ command: "sed -n '1,20p' file.go | head -c 30000" }),
+    'bash:sed-read',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: 'grep -nE "Test[A-Z]+" file_test.go | head -40' }),
+    'bash:grep-read',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: "sed -i 's/a/b/' file.go" }),
+    'bash:*',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: 'grep -r needle .' }),
+    'bash:*',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: 'git status --short' }),
+    'git:status',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: 'git status && rm -rf dist' }),
+    'bash:*',
+  )
+  assert.equal(
+    deriveBashSuggestedRule({ command: 'sleep 0' }),
+    'bash:*',
+  )
+})
+
+test('Phase 3: session rules match structured Bash rule classes', () => {
+  const bash = createDefaultToolRegistry().get('Bash')!
+  const grepPolicy = buildSessionRulesPolicy(['bash:grep-read'])
+  assert.equal(
+    grepPolicy.isAllowed(bash, { command: 'grep -n "needle" file.go | head -20' }),
+    true,
+  )
+  assert.equal(
+    grepPolicy.isAllowed(bash, { command: "sed -n '1,20p' file.go | head -c 30000" }),
+    false,
+  )
+  assert.equal(
+    grepPolicy.isAllowed(bash, { command: 'grep -r needle .' }),
+    false,
+  )
+
+  const sedPolicy = buildSessionRulesPolicy(['bash:sed-read'])
+  assert.equal(
+    sedPolicy.isAllowed(bash, { command: "sed -n '1,20p' file.go | tail -n 5" }),
+    true,
+  )
+  assert.equal(
+    sedPolicy.isAllowed(bash, { command: "sed -i 's/a/b/' file.go" }),
+    false,
+  )
+
+  const broadBashPolicy = buildSessionRulesPolicy(['bash:*'])
+  assert.equal(
+    broadBashPolicy.isAllowed(bash, { command: 'sleep 0' }),
+    true,
+  )
+})
+
 test('Phase A.1: scope=session accumulates rules and second turn auto-allows', async () => {
   // Hard invariants for `scope: 'session'` accumulation:
   //   1. The runtime must add the suggested rule to the per-session
@@ -6373,6 +6542,15 @@ test('Phase A.1: scope=session accumulates rules and second turn auto-allows', a
   assert.ok(
     secondBashCompleted.length > 0,
     'turn 2: Bash "sleep 0" should have completed (auto-allowed by session rule)',
+  )
+  const auditsRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}/permission-audits`,
+  })
+  const auditsBody = auditsRes.json()
+  assert.ok(
+    auditsBody.audits.some((audit: any) => audit.reason === 'Approved by session rule'),
+    'session-rule auto-approval should be recorded in permission audit reason',
   )
 
   // Invariant: a `scope: 'once'` approval on a different tool

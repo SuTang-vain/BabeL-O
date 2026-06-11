@@ -1,6 +1,6 @@
 # Go TUI Session 可观测性 / Embedded Nexus 持久化 治理规划
 
-> Status: **全部 Phase 已收口**（Phase 0 inspect-session CLI + Phase 1 session ID 命名统一 + Phase 2 embedded Nexus 默认 sqlite 持久化 + Phase 3 session-start 日志 + reverse-resolve + Phase 4 文档同步）；真实样本 `session_go_1781146359507755000` 端到端可复盘
+> Status: **源码核对后：部分收口 / 文档曾过度收口**（Phase 0 已收口；Phase 1 server UUID 分配与本地映射日志部分落地；Phase 2 生产默认 SQLite 已落地但 launcher/check 仍未收口；Phase 3 Nexus 启动日志与 reverse-resolve 部分落地；Phase 4 跨文档状态已同步但 PTY/e2e 守门仍未补齐）。原始真实样本 `session_go_1781146359507755000` 仍不能保证端到端复盘；新会话只有在 client log + SQLite row 同时存在时才能 reverse-resolve。
 > Priority: 真实会话 regression-first；`session_go_1781146359507755000` 暴露的"session 创建后无法复盘"是 P0 可观测性盲区——任何在 Go TUI 下发生的 Bash 写命令 permission drift 都无法追查
 > 真实样本: `session_go_1781146359507755000`（Go TUI WebSocket 会话，sessionId 末段 755000 来自 `session_go_<unixnano>` 命名；用户 2026-06-11 10:52:39 CST 创建；本地 Nexus SQLite 0 命中；运行中的 Nexus `execute.count: 0` 也不命中）
 
@@ -125,80 +125,82 @@ embedded Nexus 启动时无 `session_go_xxx → sqlite-mapping` 日志写入 `~/
 
 ### Phase 1: Go TUI 与 Nexus session ID 命名统一（中等，5-7 天）
 
-状态：已落地。
+状态：**部分落地；原文“已落地”过度乐观**。
 
-落地点：
+源码核对结果：
 
-- `clients/go-tui/internal/tui/tui.go:runStream()` 启动时若 `cfg.SessionID == ""` 先调 `allocateServerSession(cfg, prompt)` 拿 server 分配的 `session_<uuid>` 作为 `m.sessionID`（替换本地随机 `session_go_<unixnano>`）。server 返回 500 / empty sessionId 时显式 error（**不**静默 fallback）。
-- 同一 session ID 在 `runStream` 的 `sessionId` 字段、`pendingPermission` 匹配、`eventCard` 渲染、transcript 行内全部统一用 server 分配的 UUID。
-- 保留向后兼容：本地生成的 `session_go_<unixnano>` 作为 `clientSessionId` metadata 调 `appendClientSessionLog(cfg, clientSessionID, serverSessionID)` 写进 `~/.babel-o/log/go-tui-session.log`（tab-separated `[RFC3339]\tclientSessionId=...\tserverSessionId=...`），便于从 client log 反查 server session。
+- `clients/go-tui/internal/tui/tui.go:7843` 的 `runStream()` 在 `cfg.SessionID == ""` 时会先调用 `allocateServerSession(cfg, prompt)`，把 WebSocket `buildExecuteRequest(..., sessionID, ...)` 的 `sessionId` 改为服务端分配的 `session_<uuid>`；server 返回错误 / empty `sessionId` 时会显式 error，不静默 fallback。
+- `src/nexus/app.ts:1219` 已有 `POST /v1/sessions`，支持分配 `session_<uuid>` 并在 body 带 `clientSessionId` 时写入 session metadata；`test/inspect-session-phase1.test.ts` 覆盖 allocation、list round-trip、`clientSessionIdSetAt`。
+- **但 Go TUI 当前并没有把本地 `session_go_<unixnano>` 传给 `POST /v1/sessions`**：`allocateServerSession()` 只发送 `metadata: { client: 'go-tui', phase: 'session_allocate' }`，随后 `runStream()` 才生成 `clientSessionID := fmt.Sprintf("session_go_%d", time.Now().UnixNano())` 并写本地 `~/.babel-o/log/go-tui-session.log`。因此服务端 SQLite metadata 不含 Go TUI 生成的 clientSessionId，反查依赖本地 client log。
+- `m.sessionID` 不是 allocation 后立即更新；Go TUI model 在 `consumeNexusEvent()` 收到 `session_started` 后用事件里的 `sessionId` 更新 UI 状态。可以确认的是 WebSocket payload 使用 server UUID。
+- 仓库中没有 `clients/go-tui/internal/tui/phase1_session_id_test.go`，也没有原文列出的 7 个 Go 专名测试；只有既有 `fakeNexusWSPermissionHandler` 支持 `POST /v1/sessions`，并在 permission-policy 相关 runStream 测试中间接覆盖。
+
+收口标准核对：
+
+- ✅ WebSocket execute payload 使用服务端 UUID，不再默认发送 `session_go_<unixnano>`。
+- ⚠️ Go TUI 本地 `clientSessionId → serverSessionId` 只写 `~/.babel-o/log/go-tui-session.log`，未写入服务端 session metadata。
+- ⚠️ UI `m.sessionID` 随 `session_started` 更新，不是 allocation 后立即更新。
+- ❌ 原文列出的 7 个 Go focused tests 文件/用例不存在；应补测试或删掉该收口断言。
 - 不在 Phase 10 默认化前修改 `bbl chat` 命名约定（CLI 继续用 `session_<uuid>` 命名）。
-
-**测试**：`clients/go-tui/internal/tui/phase1_session_id_test.go` 新增 7 个 focused tests 全过：`TestAllocateServerSessionCallsPostV1Sessions` / `TestAllocateServerSessionSurfacesServerErrors` / `TestAllocateServerSessionRejectsEmptySessionID` / `TestRunStreamAllocatesServerSessionBeforeWebSocketPayload` / `TestRunStreamWithExplicitSessionIdSkipsAllocation` / `TestAppendClientSessionLogWritesTabSeparatedLine` / `TestResolveClientConfigDirHonoursEnvOverrides`。`test/inspect-session-phase1.test.ts` 新增 5 个 Nexus 集成测试全过：allocation + storage 持久化 + GET /v1/sessions 列表 round-trip + clientSessionIdSetAt 时间戳 + metadata-only allocation。`go test ./internal/tui/ -count=1` 0 回归；`npx tsc --noEmit` 0 errors。
-
-收口标准：
-
-- ✅ Go TUI 启动后 `m.sessionID` 立即是 server 分配的 UUID（如 `session_a1b2c3d4-...`），不再以 `session_go_` 开头。
-- ✅ 真实 Go TUI 会话的 SQLite `sessions` 表用 server UUID 存。
-- ✅ `clientSessionId` metadata 写入 `~/.babel-o/log/go-tui-session.log`，格式 `[RFC3339]\tclientSessionId=session_go_1781146359507755000\tserverSessionId=session_a1b2c3d4-...`。
-- ✅ 既有 19 个 PTY smoke 序列不回归（既有 `fakeNexusWSPermissionHandler` 测试 handler 已路由 `POST /v1/sessions` 返回 `session_test_allocated`，保持 Phase B 推进 / Phase A.1 Round 1 / Round 2 全过）。
 
 ### Phase 2: embedded Nexus 默认持久化到 SQLite（核心，5-7 天）
 
-状态：待实现。
+状态：**部分落地；仍需 launcher / check / e2e 守门补齐**。
 
-落地点：
+源码核对结果：
 
-- `src/nexus/createRuntime.ts` `createDefaultNexusRuntime`：当 `storagePath` 未设时，**不再**回退 `MemoryStorage`——回退到 `~/.babel-o/db.sqlite`（与 Go TUI / `bbl chat` 共享），并把 `storagePath` 写入 startup log。
-- `clients/go-tui/main.go` 启动 embedded `__server` 之前，先确保 `~/.babel-o/` 目录存在；通过 `BABEL_O_STORAGE_PATH` env var 显式传入（默认值 `~/.babel-o/db.sqlite`），不再依赖隐式 `MemoryStorage` fallback。
-- `src/nexus/server.ts:23-24`：保留 `NEXUS_STORAGE_PATH` 优先级；`storagePath` 解析为绝对路径（避免 embedded 进程的 cwd 不一致导致 `db.sqlite` 被写到错误位置）。
-- `src/nexus/createRuntime.ts` 新增 `startupDiagnostics` helper：把 `storageBackend`（'sqlite' / 'memory'）写到 startup log；MemoryStorage 在生产路径（service / embedded）下应被视为**异常**（仅 unit test / temp runner 允许）。
+- ✅ `src/nexus/createRuntime.ts:73` 已新增 `resolveDefaultStoragePath()`：生产路径（`NODE_ENV !== 'test'` 且无显式 `storagePath`）默认 `~/.babel-o/db.sqlite`，并尊重 `BABEL_O_CONFIG_DIR` / `BABEL_O_CONFIG_FILE`；显式 `:memory:` 与 `NODE_ENV=test` 仍使用 `MemoryStorage`，守住测试隔离。
+- ✅ 显式 sqlite path 会解析为绝对路径；`SqliteStorage` 构造器会创建父目录，不需要 launcher 额外 mkdir。
+- ✅ `test/inspect-session-phase2.test.ts` 覆盖 explicit `:memory:`、显式 sqlite、relative path absolute、test-mode memory、production default sqlite、`BABEL_O_CONFIG_DIR` override。
+- ⚠️ `src/cli/commands/go.ts:createManagedNexusLaunchSpec()` 没有显式设置 `NEXUS_STORAGE_PATH` 或 `BABEL_O_STORAGE_PATH`；`bbl go` 目前依赖 runtime 生产默认 SQLite，而不是 launcher 显式传 storage env。
+- ⚠️ `src/nexus/server.ts` 的启动 console 文案仍在 `storagePath` 未设时打印 `storage=memory`，与实际 `resolveDefaultStoragePath(undefined)` 的生产默认 SQLite 不一致。
+- ❌ 没有 `startupDiagnostics` helper；没有统一 `storageBackend` 字段模型。
+- ❌ 尚未看到真实 `bbl go` 启动 embedded `__server` 后“退出再重启仍能 inspect”的端到端测试。
 
-收口标准：
+收口标准核对：
 
-- `bbl go` 启动 embedded `__server` 后，`~/.babel-o/db.sqlite` 的 `sessions` 表能查到 Go TUI 的 session（用 server UUID）。
-- embedded Nexus 进程退出后，session 数据不丢（重启 `bbl go` 后用相同 clientSessionId 仍能恢复）。
-- `storageBackend` 诊断出现在 `~/.babel-o/log/embedded-nexus.log`。
-- 既有 472 sessions（`session_<uuid>` 命名）**继续可用**——不破坏现有 SQLite schema。
-- `npm test` 全过（service 与 embedded 路径测试覆盖）；`createDefaultNexusRuntime` 的 `storagePath` 缺省行为单测。
+- ✅ production/runtime 默认不再回退 MemoryStorage。
+- ⚠️ Go TUI embedded launcher 未显式传 storage env；可接受作为实现策略，但需更新规划或补 launcher env 守门。
+- ⚠️ `storageBackend` 诊断不是稳定结构化字段；server startup log 写的是 `storage=<path|kind>`。
+- ❌ `bbl go --check` 未报告 `embedded-nexus-storage: <path>`。
+- ❌ 缺少 Phase 2 的真实 embedded restart / inspect e2e 守门。
 
 ### Phase 3: session-start 日志与端到端映射（收尾，3-4 天）
 
-状态：待实现。
+状态：**部分落地；server log + reverse-resolve 已有，client/startup UX 未收口**。
 
-落地点：
+源码核对结果：
 
-- `clients/go-tui/main.go` 启动 `__server` 之前写一条日志到 `~/.babel-o/log/embedded-nexus.log`：`[YYYY-MM-DDTHH:MM:SS+08:00] bbl-go[pid=<pid>] starting embedded Nexus storage=<path> cwd=<cwd>`。
-- `src/nexus/server.ts` 启动时写第二条日志：`[YYYY-MM-DDTHH:MM:SS+08:00] nexus[pid=<pid>] listen=http://<host>:<port> storage=<path> executePolicyMode=<strict|soft-deny>`。
-- Go TUI transcript header 在每个 session 开头展示 `Session persisted: ~/.babel-o/db.sqlite#session_<uuid>` 链接（一行可点击 / 可复制），让用户随时知道这条 session 在哪。
-- `bbl inspect-session <id>` 子命令：先用 `session_go_xxx` 查 `~/.babel-o/log/embedded-nexus.log` 反查 server UUID，再用 UUID 查 SQLite；找不到时给出三档 hint：(a) 完全没找到 → "session not persisted"；(b) 找到 client log 但 sqlite 没有 → "embedded Nexus crashed before save"；(c) sqlite 有但 events 为空 → "session 还在 running 或被 force-killed"。
+- ❌ `clients/go-tui/cmd/go-tui/main.go` 只是 flag parsing / `tui.Run(cfg)`，没有启动 `__server`，也没有写 `bbl-go[pid=...] starting embedded Nexus ...` 日志。embedded Nexus auto-start 实际在 `src/cli/commands/go.ts`，该文件也没有写 `bbl-go[...]` startup log。
+- ✅ `src/nexus/server.ts:112` 在 `app.listen()` 后 best-effort 追加 `~/.babel-o/log/embedded-nexus.log`：`nexus[pid=...] listen=... storage=... executePolicyMode=... cwd=...`。
+- ⚠️ `src/nexus/server.ts` 里 `executePolicyMode` 日志读取的是 `BABEL_O_NEXUS_DEFAULT_POLICY_MODE ?? 'strict'`，但实际配置变量是 `NEXUS_DEFAULT_POLICY_MODE`；日志字段可能与真实 policy mode 不一致。
+- ❌ Go TUI transcript/header 未发现 `Session persisted: ~/.babel-o/db.sqlite#session_<uuid>` 文案或持久化路径展示。
+- ✅ `src/cli/commands/inspectSession.ts` 已有 `reverseResolveClientSessionId()`，但它扫描的是 `~/.babel-o/log/go-tui-session.log`，不是 `embedded-nexus.log`；`test/inspect-session-phase3.test.ts` 覆盖 client log reverse-resolve 到 SQLite row。
+- ❌ `/v1/sessions/:sessionId` 404 仍返回普通 `SESSION_NOT_FOUND`，未给 `session_go_xxx` 的 redacted persistence hint。
 
-收口标准：
+收口标准核对：
 
-- `~/.babel-o/log/embedded-nexus.log` 在每次 `bbl go` 启动后立即有新行（含 pid / storage / listen）。
-- `bbl inspect-session session_go_1781146359507755000`（用户原 query 用的 ID）现在能给出 3 档 hint 中的至少 1 档（即便全 0 命中也要给"suggested next steps"）。
-- 真实 Bash 写命令的 regression session 跑完后，重启 `bbl go`，session 仍能 resume / 复盘。
+- ⚠️ 每次 Nexus server 启动会有 `nexus[pid=...]` 行；没有 `bbl-go[pid=...]` 行。
+- ✅ `bbl inspect-session session_go_xxx` 可在 client log 存在映射时 reverse-resolve；全 0 命中时给 suggested next steps。
+- ❌ 尚未证明真实 Bash 写命令 regression 跑完、重启 `bbl go` 后仍能 resume / 复盘。
 
 ### Phase 4: 文档与守门标准同步（守门，1-2 天）
 
-状态：待实现。
+状态：**文档状态已同步到“部分收口”事实；PTY/e2e 守门仍未补齐**。
 
-落地点：
+源码/文档核对结果：
 
-- `docs/nexus/TODO.md` P0 行追加本文件链接 + watch 状态。
-- `docs/nexus/DONE.md` 追加 Phase 0 / 1 / 2 / 3 / 4 收口条目。
-- `docs/nexus/WORK_LOG.md` 追加 `session_go_1781146359507755000` 复盘流水（root cause = "embedded Nexus memory storage 不持久化 + session ID 双轨命名"）。
-- `docs/nexus/reference/README.md` 把本文件登记到索引。
-- `test/go_tui_pty_driver.py` 新增 2-3 个序列守门 Phase 2 持久化：
-  - `embedded-nexus-persists-session`：bash round-trip + approve permission + 杀 `bbl go` + 重启 + `bbl inspect-session` 能找到。
-  - `embedded-nexus-startup-log`：bash round-trip → `cat ~/.babel-o/log/embedded-nexus.log` 至少有最新一行。
-  - `go-tui-session-id-is-server-uuid`：bash round-trip 后 transcript header 含 `Session persisted: ...session_<uuid>`。
+- ✅ `docs/nexus/reference/README.md` 已登记本文件，并改为“Phase 0 已收口、Phase 1/2/3 部分落地、Phase 4 仍需守门”的描述。
+- ✅ `docs/nexus/TODO.md:33` 已从“Phase 1/2/3/4 待办”更新为源码核对后的部分落地状态和剩余优先项。
+- ✅ `docs/nexus/WORK_LOG.md:5352` 已追加 Phase 1/2/3 部分落地与 Phase 4 待补守门的核对流水。
+- ✅ `docs/nexus/DONE.md` 已保留 Phase 0 收口条目，并新增“源码核对同步”条目；没有虚构 Phase 1/2/3/4 全部收口。
+- ❌ `test/go_tui_pty_driver.py` 未发现 `embedded-nexus-persists-session` / `embedded-nexus-startup-log` / `go-tui-session-id-is-server-uuid` 三个序列；当前 smoke driver 仍由测试进程显式启动 Nexus，并传 `NEXUS_STORAGE_PATH` 到临时 db，不能守住 `bbl go` embedded 默认持久化。
+- ❌ `bbl go --check` 未输出 `embedded-nexus-storage: <path>`。
 
 收口标准：
 
-- 4 份文档（TODO / DONE / WORK_LOG / reference/README）同步。
-- 不引入新 reference 规划文件之外的文档（避免规划文件碎片化——本文件是 reference 唯一入口）。
-- `bbl go --check` 新增一行 `embedded-nexus-storage: <path>`，让 `--check` 报告知道 Nexus 走哪个 storage。
+- 补 PTY 或等价 e2e 守门，覆盖 embedded default storage、startup log、clientId→serverId→SQLite inspect。
+- `bbl go --check` 新增 storage 诊断。
 
 ---
 
@@ -247,29 +249,24 @@ BABEL_O_CONFIG_FILE=/tmp/babel-o-permission-policy-regression.json \
 
 ---
 
-## 8. 收口标准
+## 8. 源码核对后的收口状态
 
-整体收口必须满足：
+已满足：
 
-- `bbl inspect-session <any-id>` 子命令上线，给出"已找到 / 找到 client log 但 sqlite 缺 / 完全未找到"三档 hint。
-- Go TUI 启动 embedded Nexus 时默认走 `~/.babel-o/db.sqlite`（不再回退 `MemoryStorage`），session 持久化不依赖 `NEXUS_STORAGE_PATH`。
-- Go TUI 用 server 分配的 `session_<uuid>` 作 `m.sessionID`，`clientSessionId` metadata 写入 `~/.babel-o/log/go-tui-session.log`。
-- `~/.babel-o/log/embedded-nexus.log` 至少含 `bbl-go[pid=...]` 与 `nexus[pid=...]` 两类启动行。
-- 4 份文档（TODO / DONE / WORK_LOG / reference/README）同步。
+- `bbl inspect-session <any-id>` 子命令上线，能给出"已找到 / 找到 client log 但 sqlite 缺 / 完全未找到"三档 hint。
+- `createDefaultNexusRuntime()` 生产默认 storage 已从隐式 `MemoryStorage` 改为 `~/.babel-o/db.sqlite`；`NODE_ENV=test` 和显式 `:memory:` 仍保持测试隔离。
+- Go TUI 默认 WebSocket execute payload 使用 `POST /v1/sessions` 分配的 server UUID。
+- `~/.babel-o/log/go-tui-session.log` 可记录 `clientSessionId → serverSessionId`，`inspectSession()` 可据此 reverse-resolve 到 SQLite row。
+- Nexus server 启动后会 best-effort 写 `nexus[pid=...] listen=... storage=...` 到 `~/.babel-o/log/embedded-nexus.log`。
 
-P0 收口必须满足（Phase 0）：
+仍未满足 / 需补齐：
 
-- `bbl inspect-session session_go_1781146359507755000` 给出明确"不可复盘"reason + 最近 7 天 embedded Nexus 启动记录。
-- 用户复盘 `session_go_1781146359507755000` 类型的真实 drift 不再需要"猜 server 在哪"。
-
-P1 收口必须满足（Phase 1 + 2 + 3）：
-
-- Go TUI 真实 session 跑完后，`~/.babel-o/db.sqlite` 能用 server UUID 查到。
-- 嵌入式 Nexus 进程退出后 session 不丢。
-- `clientSessionId → serverSessionId` 映射在 `~/.babel-o/log/go-tui-session.log` 可查。
-
-P2 收口必须满足（Phase 4 文档）：
-
-- TODO / DONE / WORK_LOG / reference/README 同步；新增 2-3 个 PTY smoke 序列守门 Phase 2 持久化。
+- Go TUI 没有把本地 `session_go_<unixnano>` 作为 `clientSessionId` 传给 `POST /v1/sessions`，server SQLite metadata 不能直接反查 client id。
+- embedded launcher 没有写 `bbl-go[pid=...]` 启动行，也没有显式传 `NEXUS_STORAGE_PATH`；当前依赖 runtime 默认值。
+- Go TUI transcript/header 未展示 `Session persisted: ~/.babel-o/db.sqlite#session_<uuid>`。
+- `/v1/sessions/:sessionId` 对 `session_go_xxx` 的 404 仍是普通 `SESSION_NOT_FOUND`，没有 redacted persistence hint。
+- `bbl go --check` 未输出 `embedded-nexus-storage: <path>`。
+- TODO / DONE / WORK_LOG / reference README 已同步到“部分收口”事实，但 Phase 4 的 PTY/e2e 守门仍未补齐。
+- `test/go_tui_pty_driver.py` 未新增 embedded persistence / startup log / server UUID transcript 三条 smoke 序列。
 
 完成事实按 [../README.md 维护规则](../README.md) 写入 [../DONE.md](../DONE.md)。

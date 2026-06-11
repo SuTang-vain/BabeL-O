@@ -44,6 +44,19 @@ test('classifyAction processes Bash tool whitelist and blacklist', () => {
   const unsafeTscRes = classifyAction('Bash', { command: 'npx tsc --watch' })
   assert.equal(unsafeTscRes.autoApprove, false)
 
+  const safeSedRead = classifyAction('Bash', {
+    command: "sed -n '2200,2650p' /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go | head -c 30000",
+  })
+  assert.equal(safeSedRead.autoApprove, true)
+
+  const safeGrepRead = classifyAction('Bash', {
+    command: 'grep -n "permission_request\\|streamEvent" /Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go | head -80',
+  })
+  assert.equal(safeGrepRead.autoApprove, true)
+
+  const unsafeSedWrite = classifyAction('Bash', { command: "sed -i 's/a/b/' file.go" })
+  assert.equal(unsafeSedWrite.autoApprove, false)
+
   // Blacklist dangerous commands
   const rmRes = classifyAction('Bash', { command: 'rm -rf node_modules' })
   assert.equal(rmRes.autoApprove, false)
