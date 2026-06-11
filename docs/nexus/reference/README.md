@@ -12,8 +12,8 @@
 - [go-runner-plan.md](./go-runner-plan.md): 可选 Go `RemoteToolRunner` 执行后端参考。
 - [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。
 - [go-tui-execute-timeout-governance-plan.md](./go-tui-execute-timeout-governance-plan.md): Go TUI WebSocket 请求未覆盖 `timeoutMs` 撞 Nexus 30s 默认导致 `REQUEST_TIMEOUT` 的治理规划；推荐 Go TUI per-request `timeoutMs` 修复。
-- [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md): Bash 在 `denyByDefaultTools()` 下 hard-deny 跳过 `permission_request` 致 Go TUI 权限面板缺位的治理规划；推荐 read-only subcommand 自动放行 + `policy: 'soft-deny'` per-request override 组合。
-- [go-tui-model-persistence-plan.md](./go-tui-model-persistence-plan.md): Go TUI `/model` Step 4 提交在 Phase 1 仍是 in-memory only（重启 `bbl go` 即丢失），需在 `POST /v1/runtime/config/select` 接受 `model` 字段并扩展 TUI 端 Step 4 state machine。
+- [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md): Bash 在 `denyByDefaultTools()` 下 hard-deny 跳过 `permission_request` 致 Go TUI 权限面板缺位的治理规划。Phase A — Bash read-only subcommand 自动放行（`src/tools/builtin/bashClassifier.ts` 纯函数分类器 + 30+ 危险 pattern 二次校验）；Phase B — `policy: 'soft-deny'` per-request override 组合；Phase C — 端到端 mock provider regression（含 `result`/`error` 不重置 mode 的 bug 修复）；Phase D — Go TUI `--allow-tools` flag（power-user opt-in，per-turn allowlist override）。四 Phase 全部收口，726 TS tests + Go TUI tests 全过。
+- [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md): Go TUI session 可观测性 / Embedded Nexus 持久化治理规划。基于 `session_go_1781146359507755000` 复盘失败的真实样本：session ID 双轨命名（`session_go_<unixnano>` 客户端 vs `session_<uuid>` 服务端）+ embedded Nexus 走 `MemoryStorage` 进程退出即丢 + 无 session-start 日志。Phase 0 文档守门 + `bbl inspect-session` 工具；Phase 1 session ID 命名统一；Phase 2 embedded Nexus 默认持久化到 `~/.babel-o/db.sqlite`；Phase 3 session-start 日志与端到端映射；Phase 4 文档与守门标准同步。
 
 ## 维护规则
 

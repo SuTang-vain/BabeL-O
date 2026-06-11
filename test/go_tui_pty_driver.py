@@ -171,7 +171,7 @@ def run_permission_approve_sequence(
     transcript: list[str],
     timeout: float,
 ) -> bool:
-    prompt = "bash echo go-tui-smoke"
+    prompt = "bash touch go-tui-smoke"
     send(master_fd, prompt)
     send(master_fd, "\r")
 
@@ -235,7 +235,7 @@ def run_phase3_overlay_mutex_sequence(
         )
 
     # 3) Open permission panel via a Bash tool call.
-    send(master_fd, "bash echo go-tui-mutex")
+    send(master_fd, "bash touch go-tui-mutex")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -258,10 +258,10 @@ def run_phase3_overlay_mutex_sequence(
     if chunk:
         transcript.append(chunk)
     combined = visible_text("".join(transcript))
-    # The transcript must NOT contain a "you       bash echo
+    # The transcript must NOT contain a "you       bash touch
     # go-tui-mutexz" user line — that would mean permission mode
     # leaked the stray key into the textinput.
-    if "bash echo go-tui-mutexz" in combined:
+    if "bash touch go-tui-mutexz" in combined:
         return _fail(
             master_fd, go_tui_proc, transcript,
             "[go-tui-smoke] textinput appended stray 'z' after prompt (permission mode let it through)",
@@ -530,7 +530,7 @@ def run_context_overlay_sequence(
     round-trip first so m.sessionID is populated.
     """
     # Setup: bash round-trip to populate m.sessionID.
-    send(master_fd, "bash echo phase5-overlay")
+    send(master_fd, "bash touch phase5-overlay")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -615,7 +615,7 @@ def run_context_and_compact_sequence(
          compact_result events: N → M line.
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase5-context")
+    send(master_fd, "bash touch phase5-context")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -805,12 +805,31 @@ def run_models_sequence(
     timeout: float,
 ) -> bool:
     """
-    /models command sequence:
-    1. Send /models and Enter.
-    2. Wait for loading status line.
-    3. Wait for models header line.
-    4. Wait for local provider and model.
+    /model + /models command sequence:
+    1. Send /model and Enter.
+    2. Wait for the model configuration overlay.
+    3. Close it, then send /models and Enter.
+    4. Wait for the capability matrix and local provider/model.
     """
+    send(master_fd, "/model")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Model configuration", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /model did not render model configuration overlay",
+        )
+    if not wait_for(master_fd, "bbl config use <modelId>", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /model overlay did not show CLI-owned config hint",
+        )
+    send(master_fd, "\x1b")
+    if not wait_for(master_fd, "model view closed", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] /model overlay did not close on Esc",
+        )
+
     send(master_fd, "/models")
     send(master_fd, "\r")
     if not wait_for(master_fd, "loading shared Nexus models capability matrix", timeout, transcript):
@@ -863,7 +882,7 @@ def run_inbox_overlay_sequence(
          "No inbox messages.".
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase6-inbox")
+    send(master_fd, "bash touch phase6-inbox")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -973,7 +992,7 @@ def run_inbox_quote_sequence(
     # Step 1+2: populate sessionID via a real bash round-trip.
     # The result event from this round-trip fires the
     # auto-refresh hook inside consumeNexusEvent.
-    send(master_fd, "bash echo phase6-inbox-quote")
+    send(master_fd, "bash touch phase6-inbox-quote")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1056,7 +1075,7 @@ def run_inbox_quote_sequence(
     # overlay close — type a benign character and confirm the
     # next bash round-trip still works (auto-refresh doesn't
     # strand subsequent turns).
-    send(master_fd, "bash echo phase6-inbox-quote-2")
+    send(master_fd, "bash touch phase6-inbox-quote-2")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1086,7 +1105,7 @@ def run_agent_status_sequence(
       - esc closes the overlay + "agent status closed" status.
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase6-agents")
+    send(master_fd, "bash touch phase6-agents")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1165,7 +1184,7 @@ def run_task_board_sequence(
       - esc closes the overlay + "task board closed" status.
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase6-tasks")
+    send(master_fd, "bash touch phase6-tasks")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1249,7 +1268,7 @@ def run_activity_overlay_sequence(
       - esc closes the overlay + "activity closed" status.
     """
     # Step 1+2: populate sessionID AND seed the activity buffer.
-    send(master_fd, "bash echo phase6-activity")
+    send(master_fd, "bash touch phase6-activity")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1339,7 +1358,7 @@ def run_sub_agent_aggregation_sequence(
       - esc closes the overlay + "agent status closed" status.
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase6-subagent")
+    send(master_fd, "bash touch phase6-subagent")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1409,7 +1428,7 @@ def run_tools_audit_sequence(
       - esc closes the overlay + "tools audit closed" status.
     """
     # Step 1+2: populate sessionID via a real bash round-trip.
-    send(master_fd, "bash echo phase4-tools-audit")
+    send(master_fd, "bash touch phase4-tools-audit")
     send(master_fd, "\r")
     if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
         return _fail(
@@ -1509,6 +1528,7 @@ def run_all_sequences(
         if not ok:
             failed.append(name)
             print(f"[go-tui-smoke] all: {name} FAILED", file=sys.stderr)
+            break
         # Reset to composing. ESC closes any open palette/overlay;
         # a long backspace stream wipes the textinput in case a
         # previous sequence (e.g. slash-palette-prefix) inserted a
@@ -1536,10 +1556,8 @@ def run_all_sequences(
         if chunk:
             transcript.append(chunk)
     if failed:
-        return _fail(
-            master_fd, go_tui_proc, transcript,
-            f"[go-tui-smoke] all: failed sequences: {', '.join(failed)}",
-        )
+        print(f"[go-tui-smoke] all FAILED: failed sequences: {', '.join(failed)}", file=sys.stderr)
+        return False
     return True
 
 

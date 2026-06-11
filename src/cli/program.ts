@@ -14,6 +14,7 @@ import { registerConfigCommand } from './commands/config.js'
 import { registerModelsCommand } from './commands/models.js'
 import { registerOptimizeCommand } from './commands/optimize.js'
 import { registerGoCommand } from './commands/go.js'
+import { registerInspectSessionCommand } from './commands/inspectSession.js'
 
 markStartup('cli.imported')
 
@@ -35,6 +36,7 @@ registerConfigCommand(program)
 registerModelsCommand(program)
 registerOptimizeCommand(program)
 registerGoCommand(program)
+registerInspectSessionCommand(program)
 
 program
   .command('__server', { hidden: true })

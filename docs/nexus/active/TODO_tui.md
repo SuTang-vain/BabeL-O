@@ -80,6 +80,26 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 当前 P2 Advanced CLI/TUI 无打开实现项；SessionChannel 关系可见化已进入 P2 / Watch 参考规划，后续只在真实显示回归、PTY smoke drift、dashboard/agent UX 需要、关系可见化实现启动或发起侧 UX 明确时重新开未收口项。provider role defaults/fallback 仍按总控无限期 delay，不作为当前 TUI 前置项。
 
+## 已收口 Go TUI Permission Policy / Bash Hard-Deny 治理
+
+> 详细规划见 [Go TUI Permission Policy / Bash Hard-Deny 治理规划](../reference/go-tui-permission-policy-governance-plan.md)。真实样本：`session_go_1781076550805204000`（Go TUI WebSocket session，sessionId 末段 204000）。
+
+- Phase A — Bash read-only subcommand 自动放行已收口：`src/tools/builtin/bashClassifier.ts` 新建 230 行纯函数 `classifyBashRisk`（read-only 白名单 + git 拒绝子命令 + find `-type f` 特殊处理 + 30+ 危险 pattern 二次校验）；`src/tools/builtin/bash.ts` `bashTool` 加 `riskForInput` 钩子（`risk` 仍 `'execute'` 保留 audit 身份）；`src/tools/Tool.ts` `ToolDefinition` 加 `riskForInput?: (input: any) => ToolRisk` 字段；`src/shared/events.ts` `ToolStartedEventSchema` 加 optional `effectiveRisk` 字段；`src/runtime/LocalCodingRuntime.ts` 与 `src/runtime/LLMCodingRuntime.ts` 新增 private `effectiveRisk` helper，hard-deny gate + approval gate 都用 `effectiveRisk` 判定；`test/bash-classifier.test.ts` 新建 12 个 focused test；既有 regression 测试更新为反映新语义。
+- Phase B — soft-deny policy per-request override 已收口：`src/nexus/app.ts` `executeSchema` 加 `policy: z.enum(['strict', 'soft-deny']).optional()`；`CreateNexusAppOptions` 加 `executePolicyMode?: 'strict' | 'soft-deny'`（server-side 默认值，默认 `'strict'` 保 back-compat）；`prepareExecution` 解析 `policyMode = body.policy ?? executePolicyMode`；`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `policyMode?: 'strict' | 'soft-deny'`；`src/runtime/LocalCodingRuntime.ts` hard-deny gate 改为 `if (effectiveRisk !== 'read' && !this.toolPolicy.isAllowed(tool) && options.policyMode !== 'soft-deny')`——**核心改动仅一行**，soft-deny 仅 bypass hard-deny 让既有 approval gate 自然触发 `permission_request`；`clients/go-tui/internal/tui/tui.go` `Config` 加 `PolicyMode string`，`buildExecuteRequest` 总是附加 `policy` 字段（默认 `'soft-deny'`）；`test/runtime.test.ts` 新增 2 个 Nexus focused 测试 + 4 个 Go TUI `buildExecuteRequest` / `runStream` 测试。
+- Phase C — 端到端 mock provider regression 已收口（含 bug 修复）：`src/runtime/LocalCodingRuntime.ts:4465` `case "result", "error"` 之前不重置 `m.inputMode`，导致 permission denied 流程后 model 卡在 `modePermission` 不出来，textinput 吞掉非 `a/y/n/r/esc` 键；修复为显式 `m.setMode(modeComposing)`。`clients/go-tui/internal/tui/tui_test.go` 新增 3 个 model-level 测试守住 `permission_request → modePermission` 与 `result → modeComposing` 双向 transition（含 approve / deny 两条路径）。`test/runtime.test.ts` 新增 `execute permission denial: user denies → tool denied + result(false)` 端到端测试。
+- Phase D — Go TUI `--allow-tools` flag 已收口：`src/runtime/perRequestPolicy.ts` 新建独立模块（避免 `LLMCodingRuntime` ↔ `LocalCodingRuntime` 循环 import）——导出 `buildPerRequestAllowedToolsPolicy(allowedTools)` helper，镜像 server-startup policy 解析（`*` / `all` → `allowAllTools`；否则 → `allowlistedTools`）。`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `allowedTools?: readonly string[]` 字段。`src/runtime/LLMCodingRuntime.ts:128-143` 与 `src/runtime/LocalCodingRuntime.ts:109-127` `executeStream` wrapper：`options.allowedTools` 非空时构造 override policy、用 `withToolPolicy` 包裹 inner body（`runExecuteStreamInner` 抽到私有方法）。`src/nexus/app.ts` `executeSchema` 加 `allowedTools: z.array(z.string().min(1)).optional()`；HTTP + WebSocket 两条 `runtime.executeStream()` 调用都透传。`clients/go-tui/internal/tui/tui.go:42-50` `Config` 加 `AllowTools []string`；`buildExecuteRequest` 总是 trim / 空字符串过滤 / comma-split 后附加 `allowedTools` 数组。`clients/go-tui/cmd/go-tui/main.go` 加 `--allow-tools` flag（`flag.Func` 接收重复 + 逗号分隔）。`test/runtime.test.ts` 新增 2 个 Nexus focused 测试（soft-deny + allowlist 组合、turn 边界）；`clients/go-tui/internal/tui/tui_test.go` 新增 4 个 `buildExecuteRequest` 测试（include、omit、trim、wildcard）。
+
+**守住的边界**：
+- `bbl chat` 与 HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）
+- Go TUI 权限面板 `a/y/n/r/esc` 流程未改（不传 `--allow-tools` 时仍走流程）
+- child AgentLoop 仍走 server-startup policy，不被 per-request `policy` / `allowedTools` 影响
+- workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截（独立机制）
+- 不新增工具，不拆 Bash
+- 不在 Nexus 主路径上改变 `denyByDefaultTools()` 默认 policy
+- 端到端验证：721+ → 726 TS tests；Go TUI tests 全过；typecheck + format 0 failures
+
+后续只在以下情形重新开项：(1) 真实会话继续暴露 Go TUI 权限 / policy drift；(2) 真实 PTY smoke 暴露 mode transition 边界 bug；(3) 真实用户反馈"需要 approval gate 区分 read / write / execute 三档"或类似 UX 增强。
+
 ## Watch / Stable Go TUI Maintenance
 
 > 详细规划见 [Go TUI Long-Term Rewrite Plan](../reference/go-tui-rewrite-plan.md)。Go TUI 已通过 Phase 9 promotion gate，作为 `bbl chat` 的 stable opt-in alternative；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。

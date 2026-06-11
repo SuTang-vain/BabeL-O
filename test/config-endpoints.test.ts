@@ -14,12 +14,15 @@ import { ConfigManager } from '../src/shared/config.js'
  * 端点：
  * - GET  /v1/runtime/config         当前 ResolvedSettings (脱敏: 不返回 apiKey)
  * - GET  /v1/runtime/models         provider + model 清单 (含配置状态)
- * - POST /v1/runtime/config/select  切换 profile (持久化)
+ * - POST /v1/runtime/config/select  切换 active profile 或 default model (持久化)
  *
  * 收口标准：
  * - profile 列表与 active 状态可被远程客户端读取。
  * - apiKey 不出现在响应中。
- * - select 拒绝未知 profile，拒绝 model/role/roleModel 切换。
+ * - select 接受 `profile` (切换 active profile) 或 `model` (切换 default
+ *   model，供 Go TUI /model Step 4 一类 Picker 写入)；二者互斥。
+ * - select 拒绝 role/roleModel 切换 (CLI-only)。
+ * - select 拒绝未知 profile / 未知 model。
  *
  * 注意：ConfigManager.getInstance() 是进程级单例；本文件与
  * runtime.test.ts 等共享同一份单例。所有写入 / 读取都通过单例
@@ -151,13 +154,13 @@ test('POST /v1/runtime/config/select rejects unknown profile with 400', async ()
   }
 })
 
-test('POST /v1/runtime/config/select rejects model / role switching (CLI-only)', async () => {
+test('POST /v1/runtime/config/select rejects role / roleModel switching (CLI-only)', async () => {
   resetProfiles()
 
   const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
   try {
-    for (const payload of [{ model: 'x' }, { role: 'planner' }, { roleModel: 'x' }]) {
+    for (const payload of [{ role: 'planner' }, { roleModel: 'x' }]) {
       const response = await app.inject({
         method: 'POST',
         url: '/v1/runtime/config/select',
@@ -166,6 +169,124 @@ test('POST /v1/runtime/config/select rejects model / role switching (CLI-only)',
       assert.equal(response.statusCode, 400, JSON.stringify(payload))
       assert.equal(response.json().error, 'not_supported')
     }
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select rejects empty / missing field with 400', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    for (const payload of [{}, { model: '' }]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/runtime/config/select',
+        payload,
+      })
+      assert.equal(response.statusCode, 400, JSON.stringify(payload))
+      assert.equal(response.json().error, 'missing_field')
+    }
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select rejects profile + model at the same time', async () => {
+  resetProfiles()
+  manager.setProfile('alpha', { provider: 'openai', model: 'openai/gpt-4o' })
+  manager.setActiveProfile('alpha')
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { profile: 'alpha', model: 'openai/gpt-4o' },
+    })
+    assert.equal(response.statusCode, 400)
+    assert.equal(response.json().error, 'mutually_exclusive')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select switches default model and persists', async () => {
+  // No active profile so the resolved view reflects the new
+  // defaultModel directly (resolveSettings falls through to
+  // defaultModel when no profile is active).
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { model: 'anthropic/claude-3-5-sonnet' },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.modelId, 'anthropic/claude-3-5-sonnet')
+    assert.equal(body.providerId, 'anthropic')
+    assert.equal(body.modelSource, 'default')
+
+    // Confirm persistence: a fresh manager reading the same file
+    // must observe the new default model.
+    const reloaded = new ConfigManager(sharedConfigPath)
+    assert.equal(reloaded.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select model switch preserves an active profile binding', async () => {
+  // When an active profile pins a model, the profile wins in
+  // resolveSettings(); switching defaultModel is still recorded
+  // but does not silently clobber the active profile.
+  resetProfiles()
+  manager.setProfile('alpha', { provider: 'openai', model: 'openai/gpt-4o' })
+  manager.setActiveProfile('alpha')
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { model: 'anthropic/claude-3-5-sonnet' },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.modelId, 'openai/gpt-4o', 'profile model still wins at resolve time')
+    assert.equal(body.activeProfile, 'alpha')
+
+    const reloaded = new ConfigManager(sharedConfigPath)
+    assert.equal(reloaded.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
+    assert.equal(reloaded.getActiveProfile(), 'alpha')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select rejects unknown model with 400', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { model: 'definitely/not-a-model' },
+    })
+    assert.equal(response.statusCode, 400)
+    const body = response.json()
+    assert.equal(body.error, 'unknown_model')
+    assert.equal(body.model, 'definitely/not-a-model')
   } finally {
     await app.close()
   }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -479,7 +480,7 @@ func TestRenderTranscriptLabelsLayeredEvents(t *testing.T) {
 	//   > please inspect this project
 	//   ● Bash(ls) (ctrl+o to expand)
 	//     Done.
-	rendered := renderTranscript([]transcriptLine{
+	rendered := renderTranscript([]*transcriptItem{
 		{kind: "user", text: "please inspect this project"},
 		{kind: "tool_started", text: `● Bash(ls)  (ctrl+o to expand)`},
 		{kind: "assistant", text: "Done."},
@@ -1015,6 +1016,615 @@ func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
 	_, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
 	if m.input.Value() != before {
 		t.Fatalf("textinput received key while in permission mode: %q -> %q", before, m.input.Value())
+	}
+}
+
+func TestPermissionPanelRendersFiveOptionsWithCursor(t *testing.T) {
+	// Phase A.1 of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+	// the permission panel must render 5 numbered choices with a
+	// `~` cursor on the active row, plus a "Suggested rule:" line
+	// when the runtime surfaced one.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"input":         map[string]any{"command": "cd /tmp && git status"},
+		"suggestedRule": "git:status",
+		"message":       "Tool Bash requires user permission to run.",
+	})
+	view := m.View()
+	for _, fragment := range []string{
+		"Waiting for permission",
+		"Approve once",
+		"Approve for this session",
+		"Approve with editable rule",
+		"Reject",
+		"Reject, tell the model what to do instead",
+		"Suggested rule: git:status",
+		"~ [1]",
+		"[2]",
+		"[3]",
+		"[4]",
+		"[5]",
+		"esc cancel",
+	} {
+		if !strings.Contains(view, fragment) {
+			t.Fatalf("permission view missing %q; full view:\n%s", fragment, view)
+		}
+	}
+	if m.permissionChoice != 0 {
+		t.Fatalf("permissionChoice = %d, want 0 (default cursor on Approve once)", m.permissionChoice)
+	}
+}
+
+func TestPermissionChoiceArrowKeysCycleCursor(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	// Down arrow → cursor 1
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(model)
+	if m.permissionChoice != 1 {
+		t.Fatalf("after down, permissionChoice = %d, want 1", m.permissionChoice)
+	}
+	// Down again → cursor 2
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(model)
+	if m.permissionChoice != 2 {
+		t.Fatalf("after second down, permissionChoice = %d, want 2", m.permissionChoice)
+	}
+	// Up → cursor 1
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(model)
+	if m.permissionChoice != 1 {
+		t.Fatalf("after up, permissionChoice = %d, want 1", m.permissionChoice)
+	}
+	// Up past zero wraps to 4
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(model)
+	if m.permissionChoice != 0 {
+		t.Fatalf("after up at 0, permissionChoice = %d, want 0", m.permissionChoice)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(model)
+	if m.permissionChoice != 4 {
+		t.Fatalf("after up at 0 again (wrap), permissionChoice = %d, want 4", m.permissionChoice)
+	}
+}
+
+func TestPermissionChoiceNumberKeysJumpAndConfirm(t *testing.T) {
+	// Phase A.1 Round 1 + Round 2 contract:
+	//   1, 2, 4 → jump-and-confirm (sends a permissionDecision
+	//     on the channel; pending cleared; mode returns to
+	//     composing).
+	//   3 → opens the inline rule editor (mode =
+	//     modePermissionEditRule), pre-filled with the
+	//     runtime-suggested rule. No decision is sent yet;
+	//     pending stays set; the operator must press Enter
+	//     to commit or Esc to return.
+	//   5 → opens the inline feedback editor (mode =
+	//     modePermissionEditFeedback), empty. Same editor
+	//     flow as option 3.
+	// Verified by reading the channel after the keypress and
+	// checking mode + pending state.
+	cases := []struct {
+		keyIdx       int
+		confirmsNow  bool
+		editorMode   inputMode
+		wantApproved bool
+		wantScope    string
+		wantRule     string
+	}{
+		{0, true, "", true, "once", ""},
+		{1, true, "", true, "session", "git:status"},
+		{2, false, modePermissionEditRule, false, "", ""},
+		{3, true, "", false, "once", ""},
+		{4, false, modePermissionEditFeedback, false, "", ""},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(fmt.Sprintf("key-%d", tc.keyIdx+1), func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			m.width = 80
+			m.height = 30
+			m.consumeNexusEvent(map[string]any{
+				"type":          "permission_request",
+				"sessionId":     "session_1",
+				"toolUseId":     "tool_1",
+				"name":          "Bash",
+				"risk":          "execute",
+				"suggestedRule": "git:status",
+			})
+			// m.decisions is `chan<- permissionDecision` (send-only),
+			// so we keep a bidirectional local handle for receiving.
+			decisions := make(chan permissionDecision, 1)
+			m.decisions = decisions
+			key := tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{rune('1' + tc.keyIdx)}}
+			updated, _ := m.Update(key)
+			m = updated.(model)
+			if tc.confirmsNow {
+				if m.pending != nil {
+					t.Fatalf("choice %d: pending should be cleared after confirming", tc.keyIdx+1)
+				}
+				if m.inputMode != modeComposing {
+					t.Fatalf("choice %d: inputMode = %q, want %q", tc.keyIdx+1, m.inputMode, modeComposing)
+				}
+				select {
+				case d := <-decisions:
+					if d.approved != tc.wantApproved {
+						t.Fatalf("choice %d: approved = %v, want %v", tc.keyIdx+1, d.approved, tc.wantApproved)
+					}
+					if d.scope != tc.wantScope {
+						t.Fatalf("choice %d: scope = %q, want %q", tc.keyIdx+1, d.scope, tc.wantScope)
+					}
+					if d.rule != tc.wantRule {
+						t.Fatalf("choice %d: rule = %q, want %q", tc.keyIdx+1, d.rule, tc.wantRule)
+					}
+					if d.sessionID != "session_1" || d.toolUseID != "tool_1" {
+						t.Fatalf("choice %d: decision routing wrong: %+v", tc.keyIdx+1, d)
+					}
+				default:
+					t.Fatalf("choice %d: expected decision on channel", tc.keyIdx+1)
+				}
+			} else {
+				// Editor path: no decision yet, mode flips, pending stays.
+				if m.pending == nil {
+					t.Fatalf("choice %d: pending should remain set while editor is open", tc.keyIdx+1)
+				}
+				if m.inputMode != tc.editorMode {
+					t.Fatalf("choice %d: inputMode = %q, want %q (editor open)", tc.keyIdx+1, m.inputMode, tc.editorMode)
+				}
+				select {
+				case d := <-decisions:
+					t.Fatalf("choice %d: editor should not emit a decision yet, got %+v", tc.keyIdx+1, d)
+				default:
+				}
+			}
+		})
+	}
+}
+
+func TestPermissionRequestResetsChoiceCursor(t *testing.T) {
+	// A stale cursor from a previous prompt must not confirm the
+	// wrong option. The cursor is reset to 0 on every fresh
+	// `permission_request`.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_1",
+		"toolUseId": "tool_1",
+		"name":      "Bash",
+		"risk":      "execute",
+	})
+	// Move cursor to option 3 (editable rule)
+	for i := 0; i < 3; i++ {
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+		m = updated.(model)
+	}
+	if m.permissionChoice != 3 {
+		t.Fatalf("setup: permissionChoice = %d, want 3", m.permissionChoice)
+	}
+	// New permission request from the runtime — cursor must reset.
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_1",
+		"toolUseId": "tool_2",
+		"name":      "Write",
+		"risk":      "write",
+	})
+	if m.permissionChoice != 0 {
+		t.Fatalf("permissionChoice = %d after second request, want 0 (reset)", m.permissionChoice)
+	}
+}
+
+func TestPermissionPanelEscCancelsAsReject(t *testing.T) {
+	// Esc keeps its old "just close the panel" semantics: it
+	// emits a `permissionDecision` with approved=false and
+	// scope=once (no feedback, no rule).
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	select {
+	case d := <-decisions:
+		if d.approved {
+			t.Fatalf("esc should reject, got approved=true")
+		}
+		if d.scope == "session" {
+			t.Fatalf("esc should not accumulate session rules")
+		}
+	default:
+		t.Fatalf("esc should send a decision")
+	}
+}
+
+func TestPermissionOption3OpensRuleEditor(t *testing.T) {
+	// Round 2: pressing `3` on the 5-option panel opens the
+	// inline rule editor pre-filled with the runtime-suggested
+	// rule. No decision is sent yet.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(model)
+	if m.inputMode != modePermissionEditRule {
+		t.Fatalf("after '3', inputMode = %q, want %q", m.inputMode, modePermissionEditRule)
+	}
+	if m.pending == nil {
+		t.Fatalf("pending should remain set while editor is open")
+	}
+	// Pre-fill: the textinput should hold the suggested rule.
+	if got := m.input.Value(); got != "git:status" {
+		t.Fatalf("editor pre-fill = %q, want %q", got, "git:status")
+	}
+	// No decision yet on the channel.
+	select {
+	case d := <-decisions:
+		t.Fatalf("editor should not emit a decision yet, got %+v", d)
+	default:
+	}
+	// The overlay should advertise the editing context.
+	view := m.View()
+	for _, fragment := range []string{"Editing rule for Bash", "Suggested rule: git:status", "↵ confirm", "esc back to options"} {
+		if !strings.Contains(view, fragment) {
+			t.Fatalf("rule editor view missing %q; full view:\n%s", fragment, view)
+		}
+	}
+}
+
+func TestPermissionRuleEditorEnterCommitsEditedRule(t *testing.T) {
+	// Round 2: while in the rule editor, pressing Enter commits
+	// the edited rule with scope="rule" (not "session" — "rule"
+	// is the explicit user-edited scope). Pressing Esc returns
+	// to the 5-option panel without sending a decision.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	// Open the editor.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(model)
+	// Type a new rule.
+	m.input.SetValue("bash:git:diff")
+	// Press Enter to confirm.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q after commit", m.inputMode, modeComposing)
+	}
+	if m.pending != nil {
+		t.Fatalf("pending should be cleared after commit")
+	}
+	select {
+	case d := <-decisions:
+		if !d.approved {
+			t.Fatalf("commit should approve, got approved=false")
+		}
+		if d.scope != "rule" {
+			t.Fatalf("commit scope = %q, want %q (user-edited)", d.scope, "rule")
+		}
+		if d.rule != "bash:git:diff" {
+			t.Fatalf("commit rule = %q, want %q", d.rule, "bash:git:diff")
+		}
+		if d.feedback != "" {
+			t.Fatalf("commit feedback = %q, want empty (rule editor, not feedback)", d.feedback)
+		}
+	default:
+		t.Fatalf("expected decision on channel after commit")
+	}
+}
+
+func TestPermissionRuleEditorEscReturnsToFiveOptionPanel(t *testing.T) {
+	// Round 2: pressing Esc in the rule editor returns to the
+	// 5-option panel without sending a decision. The cursor
+	// is restored to option 2 (where the operator was).
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(model)
+	if m.inputMode != modePermissionEditRule {
+		t.Fatalf("setup: inputMode = %q, want %q", m.inputMode, modePermissionEditRule)
+	}
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.inputMode != modePermission {
+		t.Fatalf("after esc, inputMode = %q, want %q (back to 5-option panel)", m.inputMode, modePermission)
+	}
+	if m.permissionChoice != 2 {
+		t.Fatalf("after esc, permissionChoice = %d, want 2 (cursor restored)", m.permissionChoice)
+	}
+	if m.pending == nil {
+		t.Fatalf("pending should still be set after esc (no decision sent)")
+	}
+	select {
+	case d := <-decisions:
+		t.Fatalf("esc should NOT emit a decision from the editor, got %+v", d)
+	default:
+	}
+}
+
+func TestPermissionRuleEditorEmptyValueFallsBackToApproveOnce(t *testing.T) {
+	// Round 2 invariant: if the operator clears the suggested
+	// rule in the editor and presses Enter, we fall back to
+	// `scope: 'once'` (no rule accumulated) rather than emit an
+	// empty rule. This keeps `addSessionRule` from being called
+	// with whitespace.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(model)
+	// Clear the pre-filled value.
+	m.input.SetValue("")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	select {
+	case d := <-decisions:
+		if !d.approved {
+			t.Fatalf("cleared rule should still approve, got approved=false")
+		}
+		if d.scope != "once" {
+			t.Fatalf("cleared rule scope = %q, want %q (fall back to once)", d.scope, "once")
+		}
+		if d.rule != "" {
+			t.Fatalf("cleared rule value = %q, want empty", d.rule)
+		}
+	default:
+		t.Fatalf("expected decision on channel after commit with cleared rule")
+	}
+}
+
+func TestPermissionOption5OpensFeedbackEditor(t *testing.T) {
+	// Round 2: pressing `5` opens the inline feedback editor
+	// (textinput starts empty, no pre-fill).
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(model)
+	if m.inputMode != modePermissionEditFeedback {
+		t.Fatalf("after '5', inputMode = %q, want %q", m.inputMode, modePermissionEditFeedback)
+	}
+	if m.pending == nil {
+		t.Fatalf("pending should remain set while feedback editor is open")
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("feedback editor should start empty, got %q", got)
+	}
+	select {
+	case d := <-decisions:
+		t.Fatalf("editor should not emit a decision yet, got %+v", d)
+	default:
+	}
+	view := m.View()
+	for _, fragment := range []string{"Editing feedback for Bash", "Tell the model what to do instead", "↵ confirm", "esc back to options"} {
+		if !strings.Contains(view, fragment) {
+			t.Fatalf("feedback editor view missing %q; full view:\n%s", fragment, view)
+		}
+	}
+}
+
+func TestPermissionFeedbackEditorEnterCommitsFeedback(t *testing.T) {
+	// Round 2: while in the feedback editor, pressing Enter
+	// commits the typed feedback with approved=false and
+	// scope=once. The model should see the feedback in the
+	// next turn via the `permission_response` event.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(model)
+	m.input.SetValue("use a sandboxed test repo instead")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q, want %q after commit", m.inputMode, modeComposing)
+	}
+	select {
+	case d := <-decisions:
+		if d.approved {
+			t.Fatalf("feedback commit should reject, got approved=true")
+		}
+		if d.scope != "once" {
+			t.Fatalf("feedback commit scope = %q, want %q", d.scope, "once")
+		}
+		if d.feedback != "use a sandboxed test repo instead" {
+			t.Fatalf("feedback commit feedback = %q, want %q", d.feedback, "use a sandboxed test repo instead")
+		}
+		if d.rule != "" {
+			t.Fatalf("feedback commit rule = %q, want empty (feedback editor, not rule)", d.rule)
+		}
+	default:
+		t.Fatalf("expected decision on channel after feedback commit")
+	}
+}
+
+func TestPermissionFeedbackEditorEmptyValueFallsBackToPlainReject(t *testing.T) {
+	// Round 2 invariant: if the operator submits the feedback
+	// editor empty (just pressed Enter), we fall back to a
+	// plain reject (no follow-up hint to the model). The
+	// model still gets a denial — just without a "what to do
+	// instead" prompt.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(model)
+	select {
+	case d := <-decisions:
+		if d.approved {
+			t.Fatalf("empty feedback should still reject, got approved=true")
+		}
+		if d.scope != "once" {
+			t.Fatalf("empty feedback scope = %q, want %q", d.scope, "once")
+		}
+		if d.feedback != "" {
+			t.Fatalf("empty feedback feedback = %q, want empty (fall back to plain reject)", d.feedback)
+		}
+	default:
+		t.Fatalf("expected decision on channel after empty feedback commit")
+	}
+}
+
+func TestPermissionFeedbackEditorEscReturnsToFiveOptionPanel(t *testing.T) {
+	// Round 2: Esc in the feedback editor returns to the
+	// 5-option panel without sending a decision. Cursor
+	// restored to option 4.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	decisions := make(chan permissionDecision, 1)
+	m.decisions = decisions
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	m = updated.(model)
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if m.inputMode != modePermission {
+		t.Fatalf("after esc, inputMode = %q, want %q (back to 5-option panel)", m.inputMode, modePermission)
+	}
+	if m.permissionChoice != 4 {
+		t.Fatalf("after esc, permissionChoice = %d, want 4 (cursor restored)", m.permissionChoice)
+	}
+	if m.pending == nil {
+		t.Fatalf("pending should still be set after esc (no decision sent)")
+	}
+	select {
+	case d := <-decisions:
+		t.Fatalf("esc should NOT emit a decision from the feedback editor, got %+v", d)
+	default:
+	}
+}
+
+func TestPermissionEditorClearsInputOnExit(t *testing.T) {
+	// Round 2: the textinput must be cleared on every editor
+	// exit (Enter or Esc) so the next composing prompt starts
+	// from an empty value. This avoids stale text leaking
+	// into a subsequent user prompt after the panel closes.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	// Open rule editor, type, esc.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'3'}})
+	m = updated.(model)
+	m.input.SetValue("bash:something")
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(model)
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("after esc, textinput = %q, want empty (stale text would leak into next prompt)", got)
 	}
 }
 
@@ -4498,6 +5108,20 @@ func fakeNexusWSPermissionHandler(t *testing.T, events []map[string]any) (*httpt
 	captured := &map[string]any{}
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Phase 1 of go-tui-session-observability-governance-plan.md:
+		// Go TUI now first calls `POST /v1/sessions` to allocate a
+		// server-side `session_<uuid>`. The fake server returns a
+		// stable fake id without going through real SQLite.
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{
+				"type": "session_created",
+				"sessionId": "session_test_allocated",
+				"createdAt": "2026-06-11T02:52:39.000Z"
+			}`))
+			return
+		}
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -4860,7 +5484,7 @@ func fillScrollableViewport(m *model) {
 // in composing mode (where the keyboard ↑/↓ binding is still
 // reserved for prompt history).
 func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
-	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	fillScrollableViewport(&m)
 	startingYOffset := m.viewport.YOffset
 
@@ -4872,7 +5496,7 @@ func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if got, want := afterUp.viewport.YOffset, startingYOffset-1; got != want {
+	if got, want := afterUp.viewport.YOffset, startingYOffset-mouseWheelStepLines; got != want {
 		t.Fatalf("after wheel up, YOffset = %d, want %d (one line up from %d)", got, want, startingYOffset)
 	}
 
@@ -4889,20 +5513,58 @@ func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
 	}
 }
 
-// TestMouseWheelInOverlayModeIsNoOp verifies that opening
-// any overlay silences the wheel — the transcript viewport
-// should not jump underneath the operator while they
-// navigate a help / inbox / tasks panel. The first overlay
-// from the user-facing list is exercised here; the
-// implementation routes all overlay modes through the same
-// `m.inputMode != modeComposing` gate, so one example
-// mode is enough to lock the invariant.
-func TestMouseWheelInOverlayModeIsNoOp(t *testing.T) {
+// TestMouseWheelRoutesToHelpOverlay verifies the Phase 11
+// overlay-wheel routing: when the help overlay is open the
+// wheel drives the overlay's own internal scroll (helpScroll)
+// rather than the transcript viewport underneath. The
+// viewport's YOffset is asserted unchanged so the operator
+// can't accidentally yank themselves out of whatever they
+// were reading on the transcript while navigating the
+// help text.
+func TestMouseWheelRoutesToHelpOverlay(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.setMode(modeHelpOverlay)
+	startingYOffset := m.viewport.YOffset
+	startingHelpScroll := m.helpScroll
+
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelDown,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.helpScroll != startingHelpScroll+mouseWheelStepLines {
+		t.Fatalf("help overlay: wheel down should bump helpScroll by %d, got %d (from %d)",
+			mouseWheelStepLines, after.helpScroll, startingHelpScroll)
+	}
+	if after.viewport.YOffset != startingYOffset {
+		t.Fatalf("help overlay: wheel must NOT scroll the underlying transcript, YOffset %d -> %d",
+			startingYOffset, after.viewport.YOffset)
+	}
+	if after.inputMode != modeHelpOverlay {
+		t.Fatalf("wheel in help overlay should not change inputMode; got %s", after.inputMode)
+	}
+}
+
+// TestMouseWheelDisabledWhenMouseCaptureOff verifies that
+// the wheel is a complete no-op when the operator has not
+// opted in via --mouse. In that mode the terminal owns the
+// wheel-to-arrow conversion (or just scrolls its own
+// scrollback), and the app must ignore any stray MouseMsg
+// it still sees. This is the gate that preserves
+// terminal-native drag-to-select text selection.
+func TestMouseWheelDisabledWhenMouseCaptureOff(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	if m.cfg.MouseCapture {
+		t.Fatalf("test precondition: cfg.MouseCapture must default to false")
+	}
 	fillScrollableViewport(&m)
 	startingYOffset := m.viewport.YOffset
-
-	m.setMode(modeHelpOverlay)
 
 	updated, _ := m.Update(tea.MouseMsg{
 		Action: tea.MouseActionPress,
@@ -4913,22 +5575,108 @@ func TestMouseWheelInOverlayModeIsNoOp(t *testing.T) {
 		t.Fatalf("expected model, got %T", updated)
 	}
 	if after.viewport.YOffset != startingYOffset {
-		t.Fatalf("help overlay: wheel up changed YOffset from %d to %d; want no change", startingYOffset, after.viewport.YOffset)
+		t.Fatalf("MouseCapture=off: wheel up should be a no-op, YOffset %d -> %d",
+			startingYOffset, after.viewport.YOffset)
 	}
+}
 
-	updated, _ = after.Update(tea.MouseMsg{
+// TestPermissionWheelRoutesToChoiceRing verifies the
+// permission-mode branch of scrollOverlay: the wheel
+// advances permissionChoice modulo 5, so a 5-tick wheel
+// lands back on the same option while a single tick
+// moves it forward (or back) by one.
+func TestPermissionWheelRoutesToChoiceRing(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.setMode(modePermission)
+	m.permissionChoice = 0
+
+	updated, _ := m.Update(tea.MouseMsg{
 		Action: tea.MouseActionPress,
 		Button: tea.MouseButtonWheelDown,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.permissionChoice != mouseWheelStepLines%5 {
+		t.Fatalf("permission ring: wheel down once should land on choice %d, got %d",
+			mouseWheelStepLines%5, after.permissionChoice)
+	}
+
+	// A second wheel up should walk back to 0.
+	updated, _ = after.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonWheelUp,
 	})
 	after, ok = updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
 	}
-	if after.viewport.YOffset != startingYOffset {
-		t.Fatalf("help overlay: wheel down changed YOffset from %d to %d; want no change", startingYOffset, after.viewport.YOffset)
+	if after.permissionChoice != 0 {
+		t.Fatalf("permission ring: wheel up should land on choice 0, got %d", after.permissionChoice)
 	}
-	if after.inputMode != modeHelpOverlay {
-		t.Fatalf("wheel in overlay should not change inputMode; got %s", after.inputMode)
+}
+
+// TestPermissionGracePeriodAbsorbsKeystrokes verifies the
+// crush-style async-dialog grace period: when the
+// permission panel opens, keystrokes arriving in the
+// following 200ms-quiet / 1.5s-max window are absorbed
+// (not dispatched) so an in-flight 'y' from the main
+// input box can't accidentally approve a tool prompt
+// the operator never saw.
+func TestPermissionGracePeriodAbsorbsKeystrokes(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	// newModel disables the grace period under `go test`
+	// (so existing permission tests can drive the panel
+	// deterministically). Re-arm it here for this single
+	// assertion.
+	m.graceQuietPeriod = 200 * time.Millisecond
+	m.graceMaxDelay = 1500 * time.Millisecond
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.setMode(modePermission)
+	m.permissionChoice = 2
+	// m.setMode armed permissionOpenedAt at time.Now(); the
+	// grace period is therefore active for the next
+	// graceMaxDelay.
+	if !m.inPermissionGracePeriod() {
+		t.Fatalf("test precondition: permission grace period should be active immediately after setMode")
+	}
+
+	// `y` would normally approve, but during grace it must
+	// be absorbed (no change in permissionChoice, no
+	// permission decision sent).
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.permissionChoice != 2 {
+		t.Fatalf("grace period: 'y' should be absorbed, permissionChoice moved to %d", after.permissionChoice)
+	}
+	if after.inputMode != modePermission {
+		t.Fatalf("grace period: panel should still be open, got mode %s", after.inputMode)
+	}
+}
+
+// TestPermissionGracePeriodMaxDelayReleasesAfter1p5s verifies
+// the upper bound: even with continuous keystrokes that
+// keep resetting the quiet timer, the panel arms itself
+// after graceMaxDelay has elapsed. We simulate this by
+// pushing permissionOpenedAt 2 seconds into the past and
+// re-checking inPermissionGracePeriod.
+func TestPermissionGracePeriodMaxDelayReleasesAfter1p5s(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.graceQuietPeriod = 200 * time.Millisecond
+	m.graceMaxDelay = 1500 * time.Millisecond
+	m.permissionOpenedAt = time.Now().Add(-2 * time.Second)
+	m.permissionLastInputAt = time.Now()
+	if m.inPermissionGracePeriod() {
+		t.Fatalf("after graceMaxDelay the panel should be armed (grace period over)")
 	}
 }
 
@@ -5199,4 +5947,953 @@ func TestPlaceholderFollowsMode(t *testing.T) {
 	if got := m.input.Placeholder; got != "Ask BabeL-O" {
 		t.Fatalf("after setMode(modeComposing) placeholder = %q, want %q", got, "Ask BabeL-O")
 	}
+}
+
+// primeSelectionViewport fills the transcript with a few
+// plain-text lines so the in-app selection tests can press
+// / drag / release and read back the extracted text. The
+// lines are short enough to fit on a single visual row
+// (no wrap) so the column math stays simple.
+func primeSelectionViewport(m *model) {
+	m.width = 80
+	m.height = 24
+	m.resize()
+	m.transcript = []*transcriptItem{
+		{kind: "status", text: "alpha line"},
+		{kind: "status", text: "beta line"},
+		{kind: "status", text: "gamma line"},
+		{kind: "status", text: "delta line"},
+	}
+	m.refreshViewport()
+	m.viewport.GotoTop()
+}
+
+// TestInAppSelectionDragAndCopy verifies the full
+// Phase 11.3 in-app selection pipeline: left-button press
+// starts a selection, motion updates the end anchor,
+// release with a non-empty range returns an OSC 52
+// copy command and stamps the feedback timestamp on
+// the model. The selection rect itself is checked via
+// normalizedSelection() so this test does not depend on
+// the highlight-rendering path.
+func TestInAppSelectionDragAndCopy(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+
+	// press at screen (5, 2) which lands inside the
+	// transcript area (header is row 0, welcome has 2
+	// blank lines on top, then 4 transcript lines).
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      5,
+		Y:      2,
+	})
+	afterPress, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if !afterPress.mouseDownInViewport {
+		t.Fatalf("press should arm mouseDownInViewport")
+	}
+	if !afterPress.selectionActive {
+		t.Fatalf("press should activate selection")
+	}
+
+	// drag to (12, 3) — should extend end (but not move start).
+	updated, _ = afterPress.Update(tea.MouseMsg{
+		Action: tea.MouseActionMotion,
+		Button: tea.MouseButtonLeft,
+		X:      12,
+		Y:      3,
+	})
+	afterDrag, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if !afterDrag.mouseDownInViewport {
+		t.Fatalf("motion should keep mouseDownInViewport armed")
+	}
+	sl, sc, el, ec, ok := afterDrag.normalizedSelection()
+	if !ok {
+		t.Fatalf("after drag, selection should be non-empty")
+	}
+	if sl == el && sc == ec {
+		t.Fatalf("after drag, selection should span more than one cell")
+	}
+	if sl != afterPress.selectionStartLine {
+		t.Fatalf("drag must not move start line: %d -> %d",
+			afterPress.selectionStartLine, sl)
+	}
+
+	// release — should produce an OSC 52 cmd and clear
+	// mouseDownInViewport. The selection stays active so
+	// the operator can see the highlight persist for a
+	// moment after the copy.
+	updated, cmd := afterDrag.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		Button: tea.MouseButtonLeft,
+		X:      12,
+		Y:      3,
+	})
+	afterRelease, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if cmd == nil {
+		t.Fatalf("release with non-empty selection should return an OSC 52 copy cmd")
+	}
+	if afterRelease.mouseDownInViewport {
+		t.Fatalf("release should clear mouseDownInViewport")
+	}
+	if afterRelease.lastSelectionCopy == "" {
+		t.Fatalf("release should record lastSelectionCopy for the footer feedback")
+	}
+	if afterRelease.lastSelectionCopyAt.IsZero() {
+		t.Fatalf("release should stamp lastSelectionCopyAt")
+	}
+}
+
+// TestInAppSelectionOutsideViewportDoesNothing verifies
+// that a left-button press outside the viewport (e.g.
+// on the input box, or above the header) does NOT start
+// a selection. This is the single-input-owner invariant:
+// the input box still owns its own mouse events for
+// cursor positioning, and the header / footer are
+// non-interactive chrome.
+func TestInAppSelectionOutsideViewportDoesNothing(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+
+	// y=0 is the header row, outside the viewport.
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      5,
+		Y:      0,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.selectionActive {
+		t.Fatalf("press on header should not start a selection")
+	}
+	if after.mouseDownInViewport {
+		t.Fatalf("press on header should not arm mouseDownInViewport")
+	}
+}
+
+// TestInAppSelectionClearsOnEmptyRelease verifies that
+// clicking a single cell (press + release with no
+// motion) clears the selection instead of pushing an
+// empty string through OSC 52. We don't want OSC 52
+// to fire for a bare click — that would overwrite the
+// clipboard with "" and erase whatever the operator had
+// there.
+func TestInAppSelectionClearsOnEmptyRelease(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+
+	updated, _ := m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress,
+		Button: tea.MouseButtonLeft,
+		X:      5,
+		Y:      2,
+	})
+	afterPress := updated.(model)
+
+	updated, cmd := afterPress.Update(tea.MouseMsg{
+		Action: tea.MouseActionRelease,
+		Button: tea.MouseButtonLeft,
+		X:      5,
+		Y:      2,
+	})
+	after, _ := updated.(model)
+	if cmd != nil {
+		t.Fatalf("single-cell click should not return a copy cmd")
+	}
+	if after.selectionActive {
+		t.Fatalf("single-cell click should clear the selection")
+	}
+	if after.lastSelectionCopy != "" {
+		t.Fatalf("single-cell click should not update lastSelectionCopy")
+	}
+}
+
+// TestApplySelectionHighlightAddsBackgroundSpan verifies
+// that the highlight path injects a gray-background span
+// inside the selected row of the viewport output, without
+// disturbing the foreground colors of the surrounding
+// cells. This locks the rendering contract that the
+// operator sees.
+func TestApplySelectionHighlightAddsBackgroundSpan(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+
+	// Manually arm a selection over a visible line so we
+	// can assert the renderer paints the highlight.
+	m.selectionActive = true
+	m.selectionStartLine = m.viewport.YOffset
+	m.selectionStartCol = 2
+	m.selectionEndLine = m.viewport.YOffset
+	m.selectionEndCol = 8
+
+	view := m.View()
+	if !strings.Contains(view, "\x1b[48;5;240m") {
+		t.Fatalf("expected gray-background span in View output, got: %q", view)
+	}
+	if !strings.Contains(view, "\x1b[49m") {
+		t.Fatalf("expected background-reset span in View output, got: %q", view)
+	}
+}
+
+// TestStripANSICodesRoundTrip is a utility guard: every
+// copy that goes through OSC 52 should be plain text,
+// free of CSI / OSC escapes. This locks the contract
+// without binding to a specific transcript fixture.
+func TestStripANSICodesRoundTrip(t *testing.T) {
+	in := "\x1b[31mhello\x1b[0m \x1b]52;c;abc\x07world"
+	out := stripANSICodes(in)
+	if strings.Contains(out, "\x1b") {
+		t.Fatalf("stripANSICodes left an ESC byte: %q", out)
+	}
+	if out != "hello world" {
+		t.Fatalf("stripANSICodes result = %q, want %q", out, "hello world")
+	}
+}
+
+// TestPaintColumnRangePreservesForeground verifies that
+// splicing a background span into a styled line does not
+// clobber the foreground color of the substring being
+// highlighted. We construct a string with red on the
+// selected span and assert the red is still in the
+// output after the splice.
+func TestPaintColumnRangePreservesForeground(t *testing.T) {
+	in := "\x1b[31mABCDE\x1b[0m"
+	got := paintColumnRange(in, 1, 3, "\x1b[48;5;240m", "\x1b[49m")
+	if !strings.Contains(got, "\x1b[31m") {
+		t.Fatalf("paintColumnRange stripped the foreground red: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[48;5;240m") {
+		t.Fatalf("paintColumnRange did not insert the background start: %q", got)
+	}
+	if !strings.Contains(got, "\x1b[49m") {
+		t.Fatalf("paintColumnRange did not insert the background reset: %q", got)
+	}
+}
+
+// TestOsC52CopyCmdEmitsBase64 is the smoke test for the
+// OSC 52 payload: the raw sequence must start with
+// ESC]52;c;, contain a base64 blob, and end in BEL. The
+// base64 must decode back to the original text. We test
+// the builder directly because tea.Printf's returned
+// tea.Cmd hides its inner printLineMessage type from
+// outside callers.
+func TestOsC52CopyCmdEmitsBase64(t *testing.T) {
+	body := buildOSC52Sequence("hello world")
+	if !strings.HasPrefix(body, "\x1b]52;c;") {
+		t.Fatalf("OSC 52 prefix missing: %q", body)
+	}
+	if !strings.HasSuffix(body, "\x07") {
+		t.Fatalf("OSC 52 terminator (BEL) missing: %q", body)
+	}
+	blob := strings.TrimSuffix(strings.TrimPrefix(body, "\x1b]52;c;"), "\x07")
+	decoded, err := base64.StdEncoding.DecodeString(blob)
+	if err != nil {
+		t.Fatalf("OSC 52 payload is not valid base64: %v", err)
+	}
+	if string(decoded) != "hello world" {
+		t.Fatalf("OSC 52 decoded to %q, want %q", decoded, "hello world")
+	}
+	// And the cmd itself must be non-nil.
+	if osC52CopyCmd("hello world") == nil {
+		t.Fatalf("osC52CopyCmd must return a non-nil tea.Cmd")
+	}
+}
+
+// TestModelPickStep4EnterFiresSelectCommand verifies that pressing
+// Enter in the /model Step 4 picker dispatches the
+// selectRuntimeModel HTTP command, flips modelPickSubmitting on,
+// and seeds the transcript with a "saving model: …" line — but does
+// not commit the model id locally (the model id is only updated
+// after the server response lands).
+func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{
+			{
+				ID:             "anthropic",
+				DisplayName:    "Anthropic",
+				Adapter:        "anthropic-compatible",
+				DefaultBaseURL: "https://api.anthropic.com",
+				DefaultModel:   "anthropic/claude-3-5-sonnet",
+				Configured:     true,
+				Models: []registeredModel{
+					{ID: "anthropic/claude-3-5-sonnet", Name: "Claude 3.5 Sonnet"},
+					{ID: "anthropic/claude-3-opus", Name: "Claude 3 Opus"},
+				},
+			},
+		},
+	}
+	// Drive the picker to Step 4 with the cursor on the
+	// first model: provider pick → base URL confirm (default) →
+	// enterModelPicker (clears modelPickerLive + sets
+	// modelPickSubmitting=false; the live list is empty so the
+	// picker falls back to provider.Models).
+	m.modelPickSelectedID = "anthropic"
+	m.setMode(modeModelPickModel)
+	m.modelPickSelectedIdx = 0
+	m.modelID = "openai/gpt-4o" // pre-existing id; should NOT change until response
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatalf("Enter in Step 4 must return the selectRuntimeModel HTTP command")
+	}
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if !um.modelPickSubmitting {
+		t.Fatalf("modelPickSubmitting = false, want true while POST is in flight")
+	}
+	if um.modelID == "anthropic/claude-3-5-sonnet" {
+		t.Fatalf("modelID must not flip to the picked model until the POST resolves")
+	}
+	rendered := renderTranscript(um.transcript, 200)
+	if !strings.Contains(rendered, "saving model: anthropic/claude-3-5-sonnet") {
+		t.Fatalf("transcript should announce the in-flight save, got %q", rendered)
+	}
+	// Re-pressing Enter while submitting must NOT dispatch
+	// another cmd (the picker is locked until the response
+	// lands).
+	_, cmd2 := um.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd2 != nil {
+		t.Fatalf("Enter while modelPickSubmitting=true must be a no-op; got %T", cmd2)
+	}
+}
+
+// TestModelSelectMsgAppliesConfigAndClosesPicker verifies the
+// success path: a modelSelectMsg with a resolved runtimeConfig
+// flips m.modelID, drops the submitting flag, returns the
+// operator to composing mode, and announces the save in the
+// transcript.
+func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelPickSubmitting = true
+	m.setMode(modeModelPickModel)
+	m.modelID = "openai/gpt-4o"
+
+	updated, cmd := m.Update(modelSelectMsg{
+		modelID: "anthropic/claude-3-5-sonnet",
+		config: runtimeConfig{
+			Type:         "runtime_config",
+			Version:      7,
+			ModelID:      "anthropic/claude-3-5-sonnet",
+			ModelName:    "Claude 3.5 Sonnet",
+			ProviderID:   "anthropic",
+			ProviderName: "Anthropic",
+		},
+	})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.modelPickSubmitting {
+		t.Fatalf("modelPickSubmitting must clear on response")
+	}
+	if um.modelID != "anthropic/claude-3-5-sonnet" {
+		t.Fatalf("modelID = %q, want %q", um.modelID, "anthropic/claude-3-5-sonnet")
+	}
+	if um.configVersion != 7 {
+		t.Fatalf("configVersion = %d, want 7", um.configVersion)
+	}
+	if um.inputMode != modeComposing {
+		t.Fatalf("inputMode after success = %q, want %q", um.inputMode, modeComposing)
+	}
+	if cmd != nil {
+		t.Fatalf("modelSelectMsg success should not return a follow-up cmd, got %T", cmd)
+	}
+	rendered := renderTranscript(um.transcript, 200)
+	if !strings.Contains(rendered, "model saved: Claude 3.5 Sonnet") {
+		t.Fatalf("transcript should announce the saved model by display name, got %q", rendered)
+	}
+	if !strings.Contains(rendered, "provider anthropic") {
+		t.Fatalf("transcript should mention the new provider id, got %q", rendered)
+	}
+}
+
+// TestModelSelectMsgErrorStaysInPicker verifies the failure
+// path: a modelSelectMsg with err keeps modelPickSubmitting
+// cleared, surfaces the error in the transcript, and does not
+// flip m.modelID or transition to composing mode (the operator
+// can pick a different model).
+func TestModelSelectMsgErrorStaysInPicker(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelPickSubmitting = true
+	m.setMode(modeModelPickModel)
+	m.modelID = "openai/gpt-4o"
+	preMode := m.inputMode
+
+	updated, cmd := m.Update(modelSelectMsg{
+		modelID: "anthropic/claude-3-5-sonnet",
+		err:     fmt.Errorf("unknown_model: anthropic/claude-3-5-sonnet"),
+	})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.modelPickSubmitting {
+		t.Fatalf("modelPickSubmitting must clear on error so the operator can pick again")
+	}
+	if um.modelID != "openai/gpt-4o" {
+		t.Fatalf("modelID must not change on error, got %q", um.modelID)
+	}
+	if um.inputMode != preMode {
+		t.Fatalf("inputMode changed on error: %q → %q", preMode, um.inputMode)
+	}
+	if cmd != nil {
+		t.Fatalf("modelSelectMsg error should not return a follow-up cmd, got %T", cmd)
+	}
+	rendered := renderTranscript(um.transcript, 200)
+	if !strings.Contains(rendered, "unknown_model") {
+		t.Fatalf("transcript should surface the error, got %q", rendered)
+	}
+}
+
+// TestScrollbarAtTop: with offset=0 the thumb sits at the top
+// row. We assert the first line of the rendered scrollbar is the
+// thumb glyph and the rest are track glyphs.
+func TestScrollbarAtTop(t *testing.T) {
+	got := Scrollbar(100, 20, 0, 20)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 20 {
+		t.Fatalf("scrollbar should have 20 lines, got %d", len(lines))
+	}
+	if !strings.Contains(lines[0], "┃") {
+		t.Fatalf("at offset=0, first line should be thumb; got %q", lines[0])
+	}
+	// last line should be track, not thumb
+	if !strings.Contains(lines[19], "│") {
+		t.Fatalf("at offset=0, last line should be track; got %q", lines[19])
+	}
+}
+
+// TestScrollbarAtBottom: with offset=maxOffset the thumb sits at
+// the bottom. We assert the last line is the thumb.
+func TestScrollbarAtBottom(t *testing.T) {
+	got := Scrollbar(100, 20, 80, 20)
+	lines := strings.Split(got, "\n")
+	if !strings.Contains(lines[19], "┃") {
+		t.Fatalf("at offset=maxOffset, last line should be thumb; got %q", lines[19])
+	}
+	if !strings.Contains(lines[0], "│") {
+		t.Fatalf("at offset=maxOffset, first line should be track; got %q", lines[0])
+	}
+}
+
+// TestScrollbarClampsThumbSize: when viewport ≫ total (extreme
+// zoom-out) the thumb would otherwise consume the whole track.
+// The helper must clamp thumbSize to height to avoid overflow.
+func TestScrollbarClampsThumbSize(t *testing.T) {
+	// total=10, viewport=20 — content is shorter than viewport,
+	// early return: track-only, no thumb.
+	got := Scrollbar(10, 20, 0, 20)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 20 {
+		t.Fatalf("short content should still return 20 lines, got %d", len(lines))
+	}
+	for i, l := range lines {
+		if !strings.Contains(l, "│") {
+			t.Fatalf("short content line %d should be track, got %q", i, l)
+		}
+	}
+	// total=200, viewport=2000 — degenerate but possible; thumb
+	// would compute to 100, must clamp to 20.
+	got2 := Scrollbar(200, 2000, 0, 20)
+	thumbCount := 0
+	for _, l := range strings.Split(got2, "\n") {
+		if strings.Contains(l, "┃") {
+			thumbCount++
+		}
+	}
+	if thumbCount > 20 {
+		t.Fatalf("thumb should be clamped to height, got %d thumb rows", thumbCount)
+	}
+}
+
+// TestScrollbarZeroContentReturnsTrackOnly: total=0 (empty
+// transcript before any user input) should render track-only.
+func TestScrollbarZeroContentReturnsTrackOnly(t *testing.T) {
+	got := Scrollbar(0, 0, 0, 10)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 10 {
+		t.Fatalf("empty content should return 10 track lines, got %d", len(lines))
+	}
+	for i, l := range lines {
+		if !strings.Contains(l, "│") {
+			t.Fatalf("empty content line %d should be track, got %q", i, l)
+		}
+	}
+	// height=0 must short-circuit to empty string.
+	if got := Scrollbar(100, 20, 0, 0); got != "" {
+		t.Fatalf("height=0 should return empty string, got %q", got)
+	}
+}
+
+// TestButtonGroupRendersAllLabels: a group of three buttons
+// joins every label into the output, separated by the configured
+// spacing, regardless of the underline setting.
+func TestButtonGroupRendersAllLabels(t *testing.T) {
+	got := ButtonGroup([]ButtonOpt{
+		{Text: "enter submit", UnderlineIndex: 0},
+		{Text: "ctrl+c quit", UnderlineIndex: 5},
+		{Text: "q quit when idle", UnderlineIndex: 0},
+	}, "  ")
+	visible := stripANSICodes(got)
+	for _, want := range []string{"enter submit", "ctrl+c quit", "q quit when idle"} {
+		if !strings.Contains(visible, want) {
+			t.Fatalf("ButtonGroup visible output missing %q; visible=%q raw=%q", want, visible, got)
+		}
+	}
+	// Two-space spacing between the three labels means exactly
+	// two separator runs in the output.
+	if c := strings.Count(got, "  "); c < 2 {
+		t.Fatalf("ButtonGroup should contain 2+ separator runs, got %d in %q", c, got)
+	}
+}
+
+// TestButtonGroupEmitsUnderlineEscapeOnHotkey: the underlined
+// character position should carry an underline SGR escape so
+// the terminal renders it as underlined. We don't care which
+// exact escape sequence is not important; we just need an
+// underline-related SGR (ESC [ … 4 … m) to be present in the
+// output in both CI and real terminals.
+func TestButtonGroupEmitsUnderlineEscapeOnHotkey(t *testing.T) {
+	got := ButtonGroup([]ButtonOpt{
+		{Text: "enter submit", UnderlineIndex: 0},
+	}, "")
+	if !strings.Contains(got, "\x1b[") {
+		t.Fatalf("ButtonGroup should emit ANSI escapes for the underline, got %q", got)
+	}
+	// The SGR for the underlined rune must include the underline
+	// attribute (4 in SGR). lipgloss combines Bold + Underline
+	// into a single SGR like ESC[1;4m or ESC[1;4;4m, so we check
+	// the first SGR segment after the opening ESC[ for the digit
+	// 4, rather than the exact byte sequence (which is an
+	// implementation detail of the active termenv profile).
+	if !strings.HasPrefix(got, "\x1b[") {
+		t.Fatalf("first chars should be an SGR opener, got %q", got)
+	}
+	if !strings.Contains(got[1:], "4") {
+		t.Fatalf("first SGR should include underline (4), got %q", got)
+	}
+	// The visible text is broken by ANSI SGRs around the
+	// underlined char, so strip them before checking the
+	// surface text.
+	stripped := stripANSICodes(got)
+	if !strings.Contains(stripped, "enter submit") {
+		t.Fatalf("ButtonGroup should still surface the original label text, got stripped=%q raw=%q", stripped, got)
+	}
+}
+
+// TestButtonGroupEmptyInputReturnsEmptyString: defensive — an
+// empty slice must short-circuit to "" so callers can pass a
+// possibly-empty list (e.g. when no permission panel is open).
+func TestButtonGroupEmptyInputReturnsEmptyString(t *testing.T) {
+	if got := ButtonGroup(nil, "  "); got != "" {
+		t.Fatalf("empty input should return empty string, got %q", got)
+	}
+}
+
+// TestButtonGroupOutOfRangeUnderlineIsNoop: passing an
+// UnderlineIndex beyond the label length is a no-op — the
+// label renders unchanged, no panic, no spurious escape codes.
+func TestButtonGroupOutOfRangeUnderlineIsNoop(t *testing.T) {
+	got := ButtonGroup([]ButtonOpt{
+		{Text: "ab", UnderlineIndex: 10}, // 10 > len("ab")
+	}, "")
+	if strings.Contains(got, "\x1b[") {
+		t.Fatalf("out-of-range UnderlineIndex should not emit escapes, got %q", got)
+	}
+	if !strings.Contains(got, "ab") {
+		t.Fatalf("label should still render, got %q", got)
+	}
+	// -1 also disables underlining.
+	got2 := ButtonGroup([]ButtonOpt{
+		{Text: "ab", UnderlineIndex: -1},
+	}, "")
+	if strings.Contains(got2, "\x1b[") {
+		t.Fatalf("UnderlineIndex=-1 should not emit escapes, got %q", got2)
+	}
+}
+
+// TestTranscriptWidthCapsAt120OnWideTerminal: when the terminal
+// is 200 columns wide, the transcript content is wrapped to
+// maxTranscriptWidth (120). Long lines should be split; no line
+// in the rendered transcript should exceed 120 visible chars.
+func TestTranscriptWidthCapsAt120OnWideTerminal(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 200
+	m.height = 40
+	m.resize()
+
+	if m.viewport.Width != maxTranscriptWidth {
+		t.Fatalf("viewport.Width = %d, want capped to %d on 200-col terminal",
+			m.viewport.Width, maxTranscriptWidth)
+	}
+
+	// A long single word longer than the cap should still be
+	// wrapped (formatLine / lipgloss.WordWrap will break it).
+	longText := strings.Repeat("a", 200)
+	m.transcript = []*transcriptItem{
+		{kind: "status", text: longText},
+	}
+	rendered := renderTranscript(m.transcript, m.viewport.Width)
+	for i, line := range strings.Split(rendered, "\n") {
+		// strip ANSI escapes for the width check
+		visible := stripANSICodes(line)
+		if len(visible) > maxTranscriptWidth {
+			t.Fatalf("transcript line %d length=%d exceeds cap %d: %q",
+				i, len(visible), maxTranscriptWidth, visible)
+		}
+	}
+}
+
+// TestIsCompactTriggersAtWidthBelow120: terminal narrower than
+// the width breakpoint enters compact mode regardless of height.
+func TestIsCompactTriggersAtWidthBelow120(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 119
+	m.height = 50
+	if !m.isCompact() {
+		t.Fatalf("width=119 should be compact, got isCompact=false")
+	}
+	m.width = 120
+	if m.isCompact() {
+		t.Fatalf("width=120 is the breakpoint boundary, should NOT be compact (>= 120)")
+	}
+	m.width = 200
+	if m.isCompact() {
+		t.Fatalf("width=200 should not be compact")
+	}
+}
+
+// TestIsCompactTriggersAtHeightBelow30: short terminals enter
+// compact mode regardless of width.
+func TestIsCompactTriggersAtHeightBelow30(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 200
+	m.height = 29
+	if !m.isCompact() {
+		t.Fatalf("height=29 should be compact, got isCompact=false")
+	}
+	m.height = 30
+	if m.isCompact() {
+		t.Fatalf("height=30 is the breakpoint boundary, should NOT be compact (>= 30)")
+	}
+	m.height = 50
+	if m.isCompact() {
+		t.Fatalf("height=50 should not be compact")
+	}
+}
+
+// TestFooterInCompactModeOmitsSecondaryHints: in compact mode
+// the footer should not surface inbox / sub-agents / usage
+// counters — those go on a separate row that's hidden in
+// compact to free vertical space.
+func TestFooterInCompactModeOmitsSecondaryHints(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 100 // triggers compact
+	m.height = 24
+
+	// Populate side-channel state that would normally appear
+	// on the second footer row. We don't need to fully populate
+	// usage / inbox — the contract is that in compact mode, the
+	// footer is a single line (no "\n"), so the side-channel
+	// row simply cannot appear regardless of input.
+	m.subAgents = map[string]subAgentEntry{
+		"agent-1": {Status: subAgentStatusRunning},
+	}
+
+	footer := m.renderFooter(100)
+	lines := strings.Split(footer, "\n")
+	if len(lines) > 1 {
+		t.Fatalf("compact footer should be 1 line, got %d:\n%q", len(lines), footer)
+	}
+}
+
+// TestVersionedBumpAdvancesCounter: Bump is the contract that
+// invalidates the render cache. This is a one-liner but
+// worth pinning down.
+func TestVersionedBumpAdvancesCounter(t *testing.T) {
+	v := NewVersioned()
+	if v.Version() != 0 {
+		t.Fatalf("fresh Versioned should start at 0, got %d", v.Version())
+	}
+	v.Bump()
+	if v.Version() != 1 {
+		t.Fatalf("after one Bump, version = %d, want 1", v.Version())
+	}
+	v.Bump()
+	v.Bump()
+	if v.Version() != 3 {
+		t.Fatalf("after three Bumps, version = %d, want 3", v.Version())
+	}
+}
+
+// TestRenderCacheHitsOnSameInputs: the second GetOrCompute
+// call with the same (width, version) returns the cached
+// view and does NOT call render again.
+func TestRenderCacheHitsOnSameInputs(t *testing.T) {
+	var c renderCache
+	calls := 0
+	render := func() string {
+		calls++
+		return "hello"
+	}
+	if got := c.GetOrCompute(80, 1, render); got != "hello" {
+		t.Fatalf("first call: got %q, want %q", got, "hello")
+	}
+	if calls != 1 {
+		t.Fatalf("first call should invoke render once, got %d", calls)
+	}
+	if got := c.GetOrCompute(80, 1, render); got != "hello" {
+		t.Fatalf("second call: got %q, want %q", got, "hello")
+	}
+	if calls != 1 {
+		t.Fatalf("second call should hit the cache, got %d render invocations", calls)
+	}
+}
+
+// TestRenderCacheMissesOnBump: a version bump (via Bump())
+// invalidates the cache and the next call re-renders.
+func TestRenderCacheMissesOnBump(t *testing.T) {
+	var c renderCache
+	calls := 0
+	render := func() string {
+		calls++
+		return fmt.Sprintf("v%d", calls)
+	}
+	_ = c.GetOrCompute(80, 1, render)
+	if got := c.GetOrCompute(80, 2, render); got != "v2" {
+		t.Fatalf("after version bump: got %q, want %q (re-rendered)", got, "v2")
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 render invocations, got %d", calls)
+	}
+}
+
+// TestRenderCacheMissesOnWidthChange: a width change
+// (terminal resize) invalidates the cache and the next call
+// re-renders at the new width.
+func TestRenderCacheMissesOnWidthChange(t *testing.T) {
+	var c renderCache
+	calls := 0
+	render := func() string {
+		calls++
+		return fmt.Sprintf("w%d", calls)
+	}
+	_ = c.GetOrCompute(80, 1, render)
+	if got := c.GetOrCompute(120, 1, render); got != "w2" {
+		t.Fatalf("after width change: got %q, want %q (re-rendered)", got, "w2")
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 render invocations, got %d", calls)
+	}
+}
+
+// TestRenderCacheInvalidate: Invalidate() drops the entry so
+// the next call re-renders, even at the same width and
+// version. This is the escape hatch for paths that mutate the
+// item without going through Bump.
+func TestRenderCacheInvalidate(t *testing.T) {
+	var c renderCache
+	calls := 0
+	render := func() string {
+		calls++
+		return fmt.Sprintf("v%d", calls)
+	}
+	_ = c.GetOrCompute(80, 1, render)
+	c.Invalidate()
+	if got := c.GetOrCompute(80, 1, render); got != "v2" {
+		t.Fatalf("after Invalidate: got %q, want %q (re-rendered)", got, "v2")
+	}
+}
+
+// TestTranscriptItemRendersIdenticalOutputBeforeAndAfterCache:
+// the cache must be a transparent optimization — the rendered
+// transcript must be byte-identical whether the cache is hot
+// or cold. We render twice in a row and compare.
+func TestTranscriptItemRendersIdenticalOutputBeforeAndAfterCache(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.transcript = []*transcriptItem{
+		{kind: "user", text: "hello", Versioned: NewVersioned()},
+		{kind: "assistant", text: "world", Versioned: NewVersioned()},
+	}
+	width := 80
+	first := renderTranscript(m.transcript, width)
+	// Mutate Bump manually between renders? No — that would
+	// change the version and force a re-render. Instead, just
+	// render again with the same inputs and compare. The
+	// second render must hit the cache.
+	second := renderTranscript(m.transcript, width)
+	if first != second {
+		t.Fatalf("cached render should be byte-identical to fresh render\nfirst:\n%s\nsecond:\n%s", first, second)
+	}
+}
+
+// TestTranscriptItemBumpInvalidatesCache: bumping the version
+// on a single item forces that item's row to re-render while
+// leaving other items' cached views intact.
+func TestTranscriptItemBumpInvalidatesCache(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	a := &transcriptItem{kind: "user", text: "alpha", Versioned: NewVersioned()}
+	b := &transcriptItem{kind: "user", text: "beta", Versioned: NewVersioned()}
+	m.transcript = []*transcriptItem{a, b}
+	width := 80
+
+	// Cold render populates both caches.
+	_ = renderTranscript(m.transcript, width)
+	if a.cache.view == "" || b.cache.view == "" {
+		t.Fatalf("cold render should populate both caches; a=%q b=%q", a.cache.view, b.cache.view)
+	}
+
+	// Bump `a` only; the next render should re-render `a` and
+	// leave `b` alone. We can observe this by mutating the
+	// render output via a side-channel counter — but since
+	// renderTranscript doesn't expose a counter, we just
+	// assert that the rendered output stays correct and `b`'s
+	// cached view string pointer is unchanged.
+	bViewBefore := b.cache.view
+	a.Bump()
+	out := renderTranscript(m.transcript, width)
+	if !strings.Contains(out, "alpha") || !strings.Contains(out, "beta") {
+		t.Fatalf("render after bump should still surface both items, got %q", out)
+	}
+	// b was not bumped; its cached view should be untouched.
+	if b.cache.view != bViewBefore {
+		t.Fatalf("b's cache should be untouched by a.Bump, got %q want %q", b.cache.view, bViewBefore)
+	}
+	// a's cache version should now be 1.
+	if a.cache.cachedVersion != 1 {
+		t.Fatalf("a's cache version should be 1 after Bump, got %d", a.cache.cachedVersion)
+	}
+}
+
+// TestStreamingOnlyInvalidatesTailItem: the canonical
+// streaming scenario — a long transcript where the last item
+// is being incrementally appended. Only the tail item should
+// re-render on each Bump; all preceding items should hit the
+// cache. We assert this by snapshotting each prior item's
+// cached view pointer and checking it's untouched across 10
+// streaming chunks.
+func TestStreamingOnlyInvalidatesTailItem(t *testing.T) {
+	const N = 50
+	tail := &transcriptItem{kind: "assistant", text: "", Versioned: NewVersioned()}
+	transcript := make([]*transcriptItem, 0, N+1)
+	for i := 0; i < N; i++ {
+		transcript = append(transcript, &transcriptItem{
+			kind:      "user",
+			text:      fmt.Sprintf("prior line %d", i),
+			Versioned: NewVersioned(),
+		})
+	}
+	transcript = append(transcript, tail)
+	width := 80
+
+	// Cold render: every item is rendered for the first time.
+	_ = renderTranscript(transcript, width)
+
+	// Snapshot every prior item's cached view string. After
+	// streaming, all of these should be byte-identical
+	// (cache hits, no re-render).
+	priorViews := make([]string, N)
+	for i := 0; i < N; i++ {
+		priorViews[i] = transcript[i].cache.view
+	}
+
+	// 10 streaming chunks — each Bumps the tail.
+	for i := 0; i < 10; i++ {
+		tail.text += fmt.Sprintf(" chunk%d", i)
+		tail.Bump()
+		_ = renderTranscript(transcript, width)
+	}
+
+	// Verify every prior item's cached view is unchanged.
+	for i := 0; i < N; i++ {
+		if transcript[i].cache.view != priorViews[i] {
+			t.Fatalf("prior item %d cache should be untouched across 10 streaming chunks; got %q want %q",
+				i, transcript[i].cache.view, priorViews[i])
+		}
+	}
+	// Tail's cache version should equal the number of Bumps
+	// (initial 0, then 10 Bumps → 10).
+	if tail.cache.cachedVersion != 10 {
+		t.Fatalf("tail cache version should be 10 after 10 Bumps, got %d", tail.cache.cachedVersion)
+	}
+}
+
+// BenchmarkTranscriptRenderCold / BenchmarkTranscriptRenderWarm:
+// measures the per-frame cost of rendering a 100-line transcript
+// before and after the cache is populated. With Phase B.2 the
+// warm case should be substantially cheaper than the cold case
+// because formatLine is only called for the items whose version
+// was bumped between frames. The "warm" benchmark calls
+// renderTranscript repeatedly with no Bump, so every call is a
+// pure cache hit — this is the upper bound on what the cache
+// can save.
+func BenchmarkTranscriptRenderCold100Lines(b *testing.B) {
+	transcript := makeTranscriptForBench(100, 80)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, it := range transcript {
+			it.cache.Invalidate()
+		}
+		_ = renderTranscript(transcript, 80)
+	}
+}
+
+func BenchmarkTranscriptRenderWarm100Lines(b *testing.B) {
+	transcript := makeTranscriptForBench(100, 80)
+	// Warm up: populate the cache.
+	_ = renderTranscript(transcript, 80)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = renderTranscript(transcript, 80)
+	}
+}
+
+// BenchmarkTranscriptRenderStreaming: simulates the streaming
+// pattern — a long transcript with a tail item being
+// repeatedly Bumped. Each iteration re-renders the full
+// transcript, but only the tail should re-execute formatLine.
+// This is the realistic per-frame cost during a stream.
+func BenchmarkTranscriptRenderStreaming100Lines(b *testing.B) {
+	transcript := makeTranscriptForBench(100, 80)
+	tail := transcript[len(transcript)-1]
+	// Warm up: populate the cache for the initial state.
+	_ = renderTranscript(transcript, 80)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tail.text += "x"
+		tail.Bump()
+		_ = renderTranscript(transcript, 80)
+	}
+}
+
+// makeTranscriptForBench is a helper that builds a synthetic
+// transcript of n user-kind lines for use by the render
+// benchmarks. The text is wrap-friendly to mimic a real
+// transcript where most rows are single-line.
+func makeTranscriptForBench(n, width int) []*transcriptItem {
+	out := make([]*transcriptItem, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, &transcriptItem{
+			kind:      "user",
+			text:      fmt.Sprintf("line %d %s", i, strings.Repeat("a", max(0, width-8))),
+			Versioned: NewVersioned(),
+		})
+	}
+	return out
 }

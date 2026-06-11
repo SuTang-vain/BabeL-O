@@ -66,6 +66,18 @@ const executeSchema = z.object({
    * regardless of policy mode.
    */
   policy: z.enum(['strict', 'soft-deny']).optional(),
+  /**
+   * Per-request tool allowlist (Phase D of
+   * docs/nexus/reference/go-tui-permission-policy-governance-plan.md).
+   * When set, the runtime applies an allowlist-based policy for this
+   * turn only (next turn re-evaluates from the body). The override
+   * scopes to a single `executeStream` call. Empty / omitted → no
+   * per-turn override; server-startup `denyByDefaultTools()` (or
+   * whichever policy the runtime was constructed with) applies.
+   * `*` / `all` → allowAllTools. Works orthogonally with
+   * `policy: 'soft-deny'`.
+   */
+  allowedTools: z.array(z.string().min(1)).optional(),
   requestId: z.string().optional(),
   model: z.string().optional(),
   budget: z.number().int().positive().optional(),
@@ -761,37 +773,69 @@ export async function createNexusApp(
     }
   })
 
-  // POST /v1/runtime/config/select — 切换 profile (持久化)
+  // POST /v1/runtime/config/select — 切换 active profile / default model (持久化)
+  //
+  // 三种互斥形态:
+  //   1) {profile: "<name>"}      — 切换 active profile
+  //   2) {model: "<provider>/<id>"} — 切换 default model (供 Go TUI /model Step 4
+  //                                   一类 Picker 写入),不修改 active profile;
+  //                                   若 model 不在 modelRegistry 中 → 400
+  //   3) 字段都缺 — 400
+  // role / roleModel 仍由 `bbl config` CLI 处理。
   app.post('/v1/runtime/config/select', async (request, reply) => {
     const body = runtimeConfigSelectSchema.parse(request.body ?? {})
     const manager = ConfigManager.getInstance()
 
-    if (body.model || body.role || body.roleModel) {
+    if (body.role || body.roleModel) {
       return reply.code(400).send({
         error: 'not_supported',
-        message:
-          'model / role / roleModel switching is not supported in this endpoint; use `bbl config` CLI',
+        message: 'role / roleModel switching is not supported in this endpoint; use `bbl config` CLI',
       })
     }
 
-    if (!body.profile) {
-      return reply.code(400).send({ error: 'missing_profile' })
-    }
+    const hasProfile = typeof body.profile === 'string' && body.profile.length > 0
+    const hasModel = typeof body.model === 'string' && body.model.length > 0
 
-    if (manager.isProfileTombstoned(body.profile)) {
+    if (hasProfile && hasModel) {
       return reply.code(400).send({
-        error: 'tombstoned_profile',
-        profile: body.profile,
-        tombstone: manager.getTombstones()[body.profile],
+        error: 'mutually_exclusive',
+        message: 'pass either `profile` or `model`, not both',
       })
     }
 
-    if (!manager.hasProfile(body.profile)) {
-      return reply.code(400).send({ error: 'unknown_profile', profile: body.profile })
+    if (!hasProfile && !hasModel) {
+      return reply.code(400).send({ error: 'missing_field', message: 'pass `profile` or `model`' })
     }
 
-    manager.setActiveProfile(body.profile)
+    if (hasProfile) {
+      const profileName = body.profile as string
+      if (manager.isProfileTombstoned(profileName)) {
+        return reply.code(400).send({
+          error: 'tombstoned_profile',
+          profile: profileName,
+          tombstone: manager.getTombstones()[profileName],
+        })
+      }
 
+      if (!manager.hasProfile(profileName)) {
+        return reply.code(400).send({ error: 'unknown_profile', profile: profileName })
+      }
+
+      manager.setActiveProfile(profileName)
+      return inspectResolvedRuntimeConfig(manager)
+    }
+
+    // hasModel
+    const modelId = body.model as string
+    if (!modelRegistry.some(entry => entry.id === modelId)) {
+      return reply.code(400).send({
+        error: 'unknown_model',
+        model: modelId,
+        message: 'model id is not present in the modelRegistry',
+      })
+    }
+
+    manager.setDefaultModel(modelId)
     return inspectResolvedRuntimeConfig(manager)
   })
 
@@ -916,6 +960,7 @@ export async function createNexusApp(
     timeoutController: AbortController
     timeout: ReturnType<typeof setTimeout>
     policyMode: 'strict' | 'soft-deny'
+    allowedTools?: readonly string[]
     allowedPaths?: string[]
   }
 
@@ -961,6 +1006,9 @@ export async function createNexusApp(
     // / HTTP API back-compat. See Phase B of
     // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
     const policyMode = body.policy ?? executePolicyMode
+    // Per-request allowlist (Phase D): scoped to this turn only. When
+    // omitted, the runtime falls back to its server-startup policy.
+    const allowedTools = body.allowedTools
     if (!session) {
       session = createSessionSnapshot(sessionId, cwd, body.prompt)
     } else {
@@ -973,7 +1021,7 @@ export async function createNexusApp(
     await options.storage.saveSession(session)
     await options.storage.appendEvent(sessionId, { type: 'user_message', ...eventBase(sessionId), text: body.prompt })
     const requestId = body.requestId ?? createId('req')
-    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, policyMode, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
+    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, policyMode, allowedTools, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
   }
 
   function isPrepareError(r: PreparedExecution | PrepareError): r is PrepareError {
@@ -1086,6 +1134,7 @@ export async function createNexusApp(
           remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
           policyMode: prepared.policyMode,
+          ...(prepared.allowedTools && { allowedTools: prepared.allowedTools }),
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)
@@ -1156,6 +1205,49 @@ export async function createNexusApp(
       type: 'sessions_list',
       sessions: await options.storage.listSessions({ limit: query.limit }),
     }
+  })
+
+  // Phase 1 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
+  // `POST /v1/sessions` allocates a server-side `session_<uuid>` so Go TUI (and
+  // any other client) can use a single canonical sessionId in
+  // `runStream.sessionId`, `pendingPermission` matching, and event card
+  // rendering. The body may include a `clientSessionId` (typically the
+  // client's local `session_go_<unixnano>`) which we record as metadata
+  // for cross-reference: `bbl inspect-session <serverSessionId>` can
+  // surface the clientSessionId, and `bbl inspect-session <clientSessionId>`
+  // (Phase 0) can scan the same metadata for the reverse lookup.
+  app.post('/v1/sessions', async (request, reply) => {
+    const body = z
+      .object({
+        cwd: z.string().optional(),
+        clientSessionId: z.string().optional(),
+        metadata: z.record(z.string(), z.unknown()).optional(),
+      })
+      .parse(request.body ?? {})
+    const sessionId = createId('session')
+    const now = new Date().toISOString()
+    const sessionMeta: Record<string, unknown> = { ...(body.metadata ?? {}) }
+    if (body.clientSessionId) {
+      sessionMeta.clientSessionId = body.clientSessionId
+      sessionMeta.clientSessionIdSetAt = now
+    }
+    const session: SessionSnapshot = {
+      sessionId,
+      cwd: body.cwd ?? options.defaultCwd,
+      prompt: '',
+      phase: 'created',
+      createdAt: now,
+      updatedAt: now,
+      events: [],
+      ...(Object.keys(sessionMeta).length > 0 && { metadata: sessionMeta }),
+    }
+    await options.storage.saveSession(session)
+    return reply.code(201).send({
+      type: 'session_created',
+      sessionId,
+      clientSessionId: body.clientSessionId,
+      createdAt: now,
+    })
   })
 
   app.post('/v1/session-channels', async (request, reply) => {
@@ -1664,11 +1756,27 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/approve', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const body = z.object({ toolUseId: z.string() }).parse(request.body)
+    // Phase A.1 of the enhanced permission panel: the Go TUI sends
+    // `scope: 'session' | 'rule'` with an associated `rule` string
+    // for "Approve for this session" / "Approve with editable rule".
+    // The runtime's `executeStream` accumulates `scope: 'session'`
+    // rules into the per-session map so the remaining turns of the
+    // session auto-allow matching tool calls.
+    const body = z.object({
+      toolUseId: z.string(),
+      scope: z.enum(['once', 'session', 'rule']).optional(),
+      rule: z.string().optional(),
+      feedback: z.string().optional(),
+    }).parse(request.body)
     const resolved = PendingPermissionRegistry.getInstance().resolve(
       params.sessionId,
       body.toolUseId,
-      { approved: true }
+      {
+        approved: true,
+        scope: body.scope ?? 'once',
+        ...(body.rule && { rule: body.rule }),
+        ...(body.feedback && { feedback: body.feedback }),
+      }
     )
     if (!resolved) {
       return reply.code(404).send({
@@ -1682,16 +1790,34 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       toolUseId: body.toolUseId,
       approved: true,
+      scope: body.scope ?? 'once',
+      ...(body.rule && { rule: body.rule }),
+      ...(body.feedback && { feedback: body.feedback }),
     }
   })
 
   app.post('/v1/sessions/:sessionId/deny', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const body = z.object({ toolUseId: z.string(), reason: z.string().optional() }).parse(request.body)
+    // Phase A.1: the `feedback` field is the "Reject, tell the model
+    // what to do instead" text. It's surfaced in the runtime's
+    // `permission_response` event so the next turn can act on it.
+    const body = z.object({
+      toolUseId: z.string(),
+      reason: z.string().optional(),
+      scope: z.enum(['once', 'session', 'rule']).optional(),
+      rule: z.string().optional(),
+      feedback: z.string().optional(),
+    }).parse(request.body)
     const resolved = PendingPermissionRegistry.getInstance().resolve(
       params.sessionId,
       body.toolUseId,
-      { approved: false, reason: body.reason }
+      {
+        approved: false,
+        reason: body.reason,
+        ...(body.scope && { scope: body.scope }),
+        ...(body.rule && { rule: body.rule }),
+        ...(body.feedback && { feedback: body.feedback }),
+      }
     )
     if (!resolved) {
       return reply.code(404).send({
@@ -1705,6 +1831,8 @@ export async function createNexusApp(
       sessionId: params.sessionId,
       toolUseId: body.toolUseId,
       approved: false,
+      ...(body.reason && { reason: body.reason }),
+      ...(body.feedback && { feedback: body.feedback }),
     }
   })
 
@@ -2094,6 +2222,7 @@ export async function createNexusApp(
           remoteRunner: options.remoteRunner,
           allowedPaths: prepared.allowedPaths,
           policyMode: prepared.policyMode,
+          ...(prepared.allowedTools && { allowedTools: prepared.allowedTools }),
         })) {
           events.push(event)
           await options.storage.appendEvent(sessionId, event)

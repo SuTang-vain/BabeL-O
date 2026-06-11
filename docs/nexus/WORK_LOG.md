@@ -2,6 +2,32 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-10 — Go TUI permission-policy Phase B 收口（soft-deny policy per-request override）
+
+- **背景**: Phase A 让 read-only Bash subcommand 跳过 policy + approval gate，但 write/execute 工具（`git commit`、`npm install`、`Write`/`Edit`）在 `denyByDefaultTools()` 默认下仍 hard-deny，根本发不出 `permission_request`。规划写入 `docs/nexus/reference/go-tui-permission-policy-governance-plan.md` Phase B。
+- **实现**（**核心改动仅一行**——在 hard-deny gate 加一个 `&& options.policyMode !== 'soft-deny'` 判断，approval gate 完全不动）：
+  - `src/nexus/app.ts:47-58` `executeSchema` 新增 `policy: z.enum(['strict', 'soft-deny']).optional()`
+  - `src/nexus/app.ts:455-462` `CreateNexusAppOptions` 新增 `executePolicyMode?: 'strict' | 'soft-deny'`（server-side 默认值，默认 `'strict'` 保 back-compat）
+  - `src/nexus/app.ts:475` 读取 `executePolicyMode = options.executePolicyMode ?? 'strict'`
+  - `src/nexus/app.ts:957-961` `prepareExecution` 解析 `policyMode = body.policy ?? executePolicyMode` 并准备回写
+  - `src/nexus/app.ts:919-928` `PreparedExecution` 类型加 `policyMode`
+  - `src/nexus/app.ts:1086 + 2090` HTTP / WebSocket 两条 `runtime.executeStream()` 调用都透传 `policyMode: prepared.policyMode`
+  - `src/runtime/Runtime.ts:31-39` `RuntimeExecuteOptions` 新增 `policyMode?: 'strict' | 'soft-deny'`
+  - `src/runtime/LocalCodingRuntime.ts:202-228` hard-deny gate 改为 `if (effectiveRisk !== 'read' && !this.toolPolicy.isAllowed(tool) && options.policyMode !== 'soft-deny')`——soft-deny 仅 bypass hard-deny，让 approval gate 自然触发 `permission_request`
+  - `clients/go-tui/internal/tui/tui.go:27-42` `Config` 新增 `PolicyMode string` 字段
+  - `clients/go-tui/internal/tui/tui.go:5996-6014` `buildExecuteRequest` 总是附加 `policy` 字段（默认 `'soft-deny'`，可被 `Config.PolicyMode` 覆盖）
+- **测试**:
+  - `test/runtime.test.ts` 新增 2 个 Nexus focused 测试：`execute honours per-request policy=soft-deny for write/execute tools`（mock Nexus + body `policy: 'soft-deny'` + `bash "git commit -m x"` → 事件流含 `permission_request`、无 policy-based `tool_denied`、用户通过 `/approve` 后工具正常执行）；`execute with default strict policy still hard-denies execute-risk Bash`（默认 server-side `'strict'` 默认下 Bash `git commit` 直接 hard-deny、无 `permission_request`——back-compat 守门）
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 4 个测试：`TestBuildExecuteRequestEmitsSoftDenyPolicyByDefault`（默认 `Config` payload 含 `policy: 'soft-deny'`）；`TestBuildExecuteRequestHonoursExplicitPolicyMode`（`PolicyMode: "strict"` payload 含 `policy: 'strict'`）；`TestBuildExecuteRequestEmitsPolicyAlongsideTimeoutMs`（`policy` 与 `timeoutMs` 独立并存）；`TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest`（fake Nexus WebSocket 端到端：Go TUI 在 wire 上发 `policy: 'soft-deny'`、fake Nexus emit `permission_request` 后 `runStream` 透传到 consumer channel）
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-FINAL2-config.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-FINAL2-format.json npm run format:check`（0 failures）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-b-FINAL2-fulltest.json npm test -- --runInBand`（723/723 pass；含 2 个新 Nexus soft-deny 测试）
+  - `cd clients/go-tui && go test -count=1 ./...`（全过，含 4 个新 Go TUI 测试）
+  - `cd clients/go-tui && gofmt -l .`（先报告 tui_test.go 格式问题，gofmt -w 后干净）
+- **未触动**: `denyByDefaultTools()` / `allowAllTools()` / `allowlistedTools()` 三个 policy builder 签名未动；approval gate 自身完全未动；`permission_request` / `permission_response` / `tool_denied` 事件 schema 未改；Go TUI 权限面板 `a/y/n/r/esc` 流程未改；`bbl chat` 与 HTTP API 既有客户端完全 back-compat；child AgentLoop 仍走 server-side 默认（`'strict'`）不被 per-request `policy` 影响。
+- **核心设计点**: Phase B 是"墙拆掉让既有管道接管"的最小改动。approval gate 本来就能正确发 `permission_request`、等 `permission_response`、按 approved/denied 走——只是被 hard-deny 截胡。soft-deny 仅 bypass hard-deny 一个条件，让 approval gate 接手。
+
 ## 2026-06-10 — Go TUI permission-policy Phase A 收口（Bash read-only subcommand 自动放行）
 
 - **背景**: `session_go_1781076550805204000` 暴露 Bash hard-deny 截胡 `permission_request` 的真实样本。规划写入 `docs/nexus/reference/go-tui-permission-policy-governance-plan.md` Phase A。
@@ -5257,3 +5283,74 @@
 - **验证**:
   - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-managed-runtime-test-config.json npx tsx --test test/runtime.test.ts`：100/100 通过。
   - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-managed-typecheck-config.json npm run typecheck` 通过。
+
+## 2026-06-10 — Go TUI permission-policy Phase D 收口（per-turn `--allow-tools` flag）
+
+- **背景**: Phase B 让 write/execute 工具走 soft-deny 路径到达 `permission_request`，但每个 execute 风险工具调用都需要用户手动 `a` 审批——power-user 写长任务时仍嫌繁琐。规划写入 `docs/nexus/reference/go-tui-permission-policy-governance-plan.md` Phase D：让用户能一次性声明"我这次要 Bash + Edit"，turn 范围内直接执行。
+- **实现**:
+  - `src/runtime/perRequestPolicy.ts` 新建独立模块（避免循环 import）：导出 `buildPerRequestAllowedToolsPolicy(allowedTools)` helper。`*` / `all` → `allowAllTools`；否则 → `allowlistedTools(allowedTools)`。镜像 server-startup policy 解析口径。
+  - `src/runtime/Runtime.ts` `RuntimeExecuteOptions` 新增 `allowedTools?: readonly string[]` 字段。
+  - `src/runtime/LLMCodingRuntime.ts:128-143` `executeStream` wrapper：在 `options.allowedTools` 非空时构造 override policy、用 `withToolPolicy` 包裹 inner body（`runExecuteStreamInner` 抽到私有方法）。
+  - `src/runtime/LocalCodingRuntime.ts:109-127` 同样的 wrapper——**关键修复**：plan 之前只 wrap 了 `LLMCodingRuntime`，但 `createDefaultNexusRuntime` 默认走 local runtime，测试用 local runtime 跑时 `allowedTools` 实际未生效；这次把 LocalCodingRuntime 一起补上。
+  - `src/nexus/app.ts` `executeSchema` 新增 `allowedTools: z.array(z.string().min(1)).optional()`；`prepareExecution` 解析 `body.allowedTools` → `prepared.allowedTools`；HTTP + WebSocket 两条 `runtime.executeStream()` 调用都 spread `...(prepared.allowedTools && { allowedTools: prepared.allowedTools })`。
+  - `clients/go-tui/internal/tui/tui.go:42-50` `Config` 新增 `AllowTools []string`；`buildExecuteRequest` 总是 trim / 空字符串过滤 / comma-split 后附加 `allowedTools` 数组（防御性处理程序化 Config 与 CLI flag 两种来源）。
+  - `clients/go-tui/cmd/go-tui/main.go` 加 `--allow-tools` flag（用 `flag.Func` 接收重复 + 逗号分隔；空字符串 trim / 跳过）。
+- **测试**:
+  - `test/runtime.test.ts` 新增 2 个 Nexus focused 测试：`execute honours per-request allowedTools for Bash in soft-deny mode`（mock Nexus + body `allowedTools: ['Bash']` + `policy: 'soft-deny'` + `bash "git commit -m x"` → Bash 在 allowlist 跳过 hard-deny + soft-deny 让 approval gate 发 `permission_request`；用户 `/approve` 后工具正常执行；事件流无 policy-based `tool_denied`）；`execute with allowedTools scopes to a single turn`（两 turn 都用 `skipPermissionCheck: true` + 默认 strict 政策。第一 turn `allowedTools: ['Bash']` → Bash 不被 hard-deny；第二 turn 不发 `allowedTools` → 走 server-startup `denyByDefaultTools()` → Bash 被 hard-deny。证明 override 仅作用于当前 turn）。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 4 个 `buildExecuteRequest` 测试：`TestBuildExecuteRequestEmitsAllowedToolsWhenConfigured`（含 `["Bash", "Edit"]`）、`TestBuildExecuteRequestOmitsAllowedToolsWhenUnset`（空 Config 不发）、`TestBuildExecuteRequestStripsWhitespaceAndEmptyFromAllowedTools`（trim + 跳过空 + 拆分逗号——`" Bash "`, `",Edit,"`, `"  "`, `"Glob"` → `["Bash", "Edit", "Glob"]`）、`TestBuildExecuteRequestAllowlistWildcardPassesThrough`（`*` 透传不预翻译）。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-d-FINAL-typecheck.json npm run typecheck`（过）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-d-FINAL-format.json npm run format:check`（0 failures）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-phase-d-FINAL-FULL-config.json npm test -- --runInBand`（725/725 pass；含 2 个新 Nexus allowlist 测试）
+  - `cd clients/go-tui && go test -count=1 ./...`（全过，含 4 个新 `buildExecuteRequest` 测试）
+  - `cd clients/go-tui && gofmt -l .`（先报告格式问题，gofmt -w 后干净）
+- **未触动**: `createDefaultNexusRuntime` server-side 默认 `denyByDefaultTools()` 未动；`RuntimeExecuteOptions.allowedTools` 是 per-turn 字段；`policyMode` / `timeoutMs` / `skipPermissionCheck` 既有 per-turn 字段未动；`permission_request` / `permission_response` / `tool_denied` 事件 schema 未动；Go TUI 权限面板 `a/y/n/r/esc` 流程未改（不传 `--allow-tools` 时仍走流程）；`bbl chat` 与 HTTP API 既有客户端完全 back-compat；child AgentLoop 仍走 server-startup policy。
+- **Phase D 边界守住**: `allowedTools` 仅作用于当前 turn（`withToolPolicy` 包裹确保 inner body 跑完 / 异常后 policy 自动 restore；下个 turn 重新评估）；`*` / `all` 通配在 `buildPerRequestAllowedToolsPolicy` 翻译为 `allowAllTools`，与 server-startup policy 解析口径一致；`policyMode: 'soft-deny'` 与 `allowedTools` 正交工作（前者决定 allowlist 外的工具是否走 `permission_request` 而非 `tool_denied`，后者决定哪些工具在 allowlist 内）；CLI flag 与 programmatic Config 统一（`buildExecuteRequest` 内部 trim / 拆分 / 过滤）；`buildPerRequestAllowedToolsPolicy` 抽到独立模块避免 `LLMCodingRuntime` ↔ `LocalCodingRuntime` 循环 import。
+- **关键设计陷阱**: plan 阶段只 wrap 了 `LLMCodingRuntime`，但 `createDefaultNexusRuntime` 默认 provider 是 `local` 走 `LocalCodingRuntime`。第一个 Nexus focused 测试 (`execute honours per-request allowedTools for Bash in soft-deny mode`) 因 soft-deny 模式绕过了 hard-deny 而侥幸通过，但第二个测试 (`execute with allowedTools scopes to a single turn`) 暴露了真正的 bug——`LocalCodingRuntime` 也有同样的 wrapper 需要。修复后两 runtimes 都正确支持 per-turn allowlist。
+
+## 2026-06-11 — Go TUI Session 可观测性盲区（`session_go_1781146359507755000`）
+
+### 真实样本
+用户在 2026-06-11 10:52:39 CST（unixnano `1781146359507755000`）触发 Go TUI session 后，要求分析该 session 的潜在问题。
+
+**全盘搜索结果（7 个存储后端）**：
+- `/Users/tangyaoyue/.babel-o/db.sqlite`（472 sessions）→ 0 命中（全部 `session_<uuid>` 命名）
+- `/Users/tangyaoyue/DEV/BABEL/BabeL-O/.babel-o/` → 无 db.sqlite
+- `~/.crush/crush.db` → 不存在
+- `~/.codex/sessions/2026/05/*` → 0 命中
+- `~/.agent_cli/projects/*/` → 0 命中
+- `~/.gemini/antigravity-cli/db.sqlite` → 空文件
+- 当前运行 `http://127.0.0.1:3000` Nexus（v0.3.2, uptime 4 秒）→ `SESSION_NOT_FOUND`；`execute.count: 0`
+
+### 根因诊断
+- **session ID 双轨命名**：Go TUI 客户端生成 `session_go_<unixnano>`（`clients/go-tui/main.go:runStream()` 启动时 `sessionID := fmt.Sprintf("session_go_%d", time.Now().UnixNano())`），与服务端的 `session_<uuid>` 不统一。
+- **embedded Nexus 走 MemoryStorage**：`src/nexus/server.ts:23-24` `storagePath` 在 `NEXUS_STORAGE_PATH` 未设时回退 `createDefaultNexusRuntime` 内的 `MemoryStorage`，`bbl go` 启动 embedded `__server` 进程退出时 session 数据丢失。
+- **无 session-start 日志**：`~/.babel-o/log/embedded-nexus.log` 不存在，事后回查无据。
+- **当前 Nexus 反证**：`/v1/runtime/status.metrics.execute.count: 0`，uptime 4160ms 表明是 fresh 实例，session 跑在另一已死进程上。
+
+### Phase 0 落地（`bbl inspect-session` CLI）
+- 新规划 `docs/nexus/reference/go-tui-session-observability-governance-plan.md`（基于此 sample 触发）
+- `src/cli/commands/inspectSession.ts` 新增 ~250 行（3 档 hint 模型 + 8 个导出 helper）
+- `src/cli/program.ts` 注册 `registerInspectSessionCommand(program)`
+- `test/inspect-session.test.ts` 新增 16 个 focused tests 全过
+- 真实 CLI smoke 验证：`BABEL_O_CONFIG_DIR=/tmp/x bbl inspect-session session_go_1781146359507755000` 输出 tier (c) "session not found" + 3 条 suggested next steps + "no embedded-nexus start log yet" 提示
+
+### 守门不变量保持
+- 测试隔离用 `withTempConfigDir` + `mkdtempSync` + `BABEL_O_CONFIG_DIR` 注入 + `try/finally` 还原 env，**不**碰真实 `~/.babel-o/config.json`
+- `findSessionInSqlite` 以 `readOnly: true` 模式打开 SQLite，**不**写回
+- `resolveConfigDir` 每次调用重读 env 而非依赖 module-level `DEFAULT_CONFIG_DIR` 缓存（绕过 import-time 捕获导致的测试隔离失效）
+- `provider fallback` / `auto model selection` 未触碰（按 memory 仍延后）
+- 不修改 `permission_request` / `permission_response` 事件 schema
+- `npm test` 16/16 pass；`npx tsc --noEmit` 全过
+
+### 4 份文档同步
+- `docs/nexus/TODO.md` P0 Watch 行追加本规划 + Phase 0 收口状态
+- `docs/nexus/DONE.md` 追加 Phase 0 收口条目（5 段：背景 / 落地点 / 3 档 hint / 16 个测试 / 硬不变量）
+- `docs/nexus/reference/go-tui-session-observability-governance-plan.md` Phase 0 子节更新为"已落地" + 收口标准
+- `docs/nexus/reference/README.md` 索引行已注册本规划
+
+### Phase 1 / 2 / 3 / 4 待办
+- Phase 1: Go TUI 与 Nexus session ID 命名统一（`POST /v1/sessions` 拿 server UUID）
+- Phase 2: embedded Nexus 默认持久化到 `~/.babel-o/db.sqlite`（不再回退 MemoryStorage）
+- Phase 3: session-start 日志与端到端映射
+- Phase 4: 文档同步 + PTY smoke 守门

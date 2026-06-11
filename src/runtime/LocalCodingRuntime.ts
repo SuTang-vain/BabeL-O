@@ -12,6 +12,7 @@ import type {
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { classifyAction } from './classifier.js'
+import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
 import type { HooksConfig } from '../shared/config.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import {
@@ -33,11 +34,28 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
 }
 
 export type ToolPolicy = {
-  isAllowed(tool: AnyTool): boolean
-  describe(): { mode: 'allow_all' | 'allowlist'; allowedTools?: string[] }
+  /**
+   * Per-input policy check. The runtime invokes this at the
+   * hard-deny gate with the parsed tool input so session-rules
+   * policies can substring-match the input. Existing allow-all
+   * / allowlist policies ignore the second arg.
+   */
+  isAllowed(tool: AnyTool, input?: unknown): boolean
+  describe(): { mode: 'allow_all' | 'allowlist' | 'session_rules'; allowedTools?: string[] }
 }
 
 export class LocalCodingRuntime implements NexusRuntime {
+  /**
+   * Per-session accumulated allow rules from user
+   * `scope: 'session'` approvals. Keyed by sessionId; values are
+   * substring patterns matched against the tool input (e.g.
+   * `git:status` matches a Bash call with command `git status`).
+   * Phase A.1 of the enhanced permission panel. Process-local
+   * (lost on server restart — matches the
+   * "no persistent permission decision across restarts" boundary).
+   */
+  private readonly sessionRules = new Map<string, string[]>()
+
   constructor(
     private readonly tools: Map<string, AnyTool>,
     private toolPolicy: ToolPolicy = allowAllTools(),
@@ -107,6 +125,47 @@ export class LocalCodingRuntime implements NexusRuntime {
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    // Phase A.1 enhanced permission panel: when the user has
+    // accumulated `scope: 'session'` rules for this sessionId,
+    // wrap the run with a session-rules policy. The policy
+    // allows the tool when one of the accumulated rules is
+    // present (as a substring) in the tool's input
+    // stringification. Continues to layer with `policyMode`
+    // (Phase B) and `allowedTools` (Phase D) — both are applied
+    // on top of the server-startup policy; this session-rules
+    // policy is applied on top of the Phase D per-turn
+    // allowlist, so a session rule auto-allows the tool even if
+    // the user didn't pass it explicitly in the current body.
+    const sessionRules = this.sessionRules.get(options.sessionId) ?? []
+    if (sessionRules.length > 0) {
+      const sessionPolicy = buildSessionRulesPolicy(sessionRules)
+      yield* this.withToolPolicy(sessionPolicy, () => this.executeStreamWithAllowedTools({
+        ...options,
+        sessionApprovedRules: sessionRules,
+      }))
+      return
+    }
+    yield* this.executeStreamWithAllowedTools(options)
+  }
+
+  private async *executeStreamWithAllowedTools(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    // Phase D of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+    // when the request body carries `allowedTools`, apply a per-turn
+    // allowlist-based policy override. The override is scoped to this
+    // turn only — the next turn re-evaluates from the (possibly
+    // different) body. `policyMode: 'soft-deny'` continues to work
+    // orthogonally: allowedTools controls the *policy* (which tools
+    // are isAllowed), while policyMode controls whether the
+    // hard-deny gate fires for tools outside the allowlist.
+    if (options.allowedTools && options.allowedTools.length > 0) {
+      const overridePolicy = buildPerRequestAllowedToolsPolicy(options.allowedTools)
+      yield* this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
+      return
+    }
+    yield* this.runExecuteStreamInner(options)
+  }
+
+  private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
     if (!options.storage && this.storage) {
       options = { ...options, storage: this.storage }
     }
@@ -209,7 +268,7 @@ export class LocalCodingRuntime implements NexusRuntime {
       // `'strict'` (the default), behaviour is unchanged.
       if (
         effectiveRisk !== 'read' &&
-        !this.toolPolicy.isAllowed(tool) &&
+        !this.toolPolicy.isAllowed(tool, toolInput) &&
         options.policyMode !== 'soft-deny'
       ) {
         const message = `Tool denied by Nexus policy: ${tool.name}`
@@ -305,10 +364,13 @@ export class LocalCodingRuntime implements NexusRuntime {
       // Check if the tool requires authorization.
       if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !options.skipPermissionCheck) {
         const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: options.cwd })
-        let approved = autoApprove
-        let decisionReason = `Auto-approved: ${reason}`
+        const sessionRuleApproved = isApprovedBySessionRule(options.sessionApprovedRules, tool, toolInput)
+        let approved = autoApprove || sessionRuleApproved
+        let decisionReason = sessionRuleApproved
+          ? 'Approved by session rule'
+          : `Auto-approved: ${reason}`
 
-        if (autoApprove) {
+        if (approved) {
           if (this.storage) {
             await this.storage.savePermissionAudit({
               auditId: createId('audit'),
@@ -328,6 +390,17 @@ export class LocalCodingRuntime implements NexusRuntime {
             toolUseId
           )
 
+          // Enhanced permission panel (Phase A.1): surface a
+          // model-suggested allow rule from the tool's
+          // `suggestedAllowRule` (e.g. `Bash` → `bash:*`) plus
+          // a per-input deriver for tools like Bash that produce
+          // command subcategories. The Go TUI permission panel
+          // presents this as the default for the
+          // "Approve for this session" / "Approve with editable
+          // rule" options.
+          const suggestedRule = tool.suggestedAllowRule
+            ?? (tool.name === 'Bash' ? deriveBashSuggestedRule(toolInput) : undefined)
+
           yield {
             type: 'permission_request',
             ...eventBase(options.sessionId),
@@ -336,6 +409,7 @@ export class LocalCodingRuntime implements NexusRuntime {
             input: toolInput,
             risk: effectiveRisk,
             message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+            ...(suggestedRule && { suggestedRule }),
             source: tool.source,
           }
 
@@ -365,6 +439,22 @@ export class LocalCodingRuntime implements NexusRuntime {
 
           approved = decision.approved
           decisionReason = decision.reason ?? 'User review'
+          // Phase A.1 of the enhanced permission panel: persist
+          // `scope: 'session'` rules into the per-session rules
+          // map so the remaining turns of this session auto-allow
+          // matching tool calls. Strict invariants:
+          //  - only user-issued approvals can add rules (no
+          //    auto-approval / classification paths)
+          //  - rules are process-local (lost on server restart)
+          //  - `scope: 'once'` never touches the map
+          if (
+            approved &&
+            decision.scope === 'session' &&
+            typeof decision.rule === 'string' &&
+            decision.rule.length > 0
+          ) {
+            this.addSessionRule(options.sessionId, decision.rule)
+          }
 
           if (this.storage) {
             await this.storage.savePermissionAudit({
@@ -386,6 +476,9 @@ export class LocalCodingRuntime implements NexusRuntime {
             toolUseId,
             approved,
             reason: decisionReason,
+            ...(decision.scope && { scope: decision.scope }),
+            ...(decision.rule && { rule: decision.rule }),
+            ...(decision.feedback && { feedback: decision.feedback }),
           }
         }
 
@@ -646,6 +739,39 @@ export class LocalCodingRuntime implements NexusRuntime {
       message: answer,
     }
   }
+
+  /**
+   * Public API: accumulate a user-issued `scope: 'session'` rule
+   * for the given session. Subsequent turns of the session auto-
+   * allow tool calls whose stringified input contains the rule.
+   * Phase A.1 of the enhanced permission panel.
+   */
+  addSessionRule(sessionId: string, rule: string): void {
+    const trimmed = rule.trim()
+    if (!trimmed) return
+    const existing = this.sessionRules.get(sessionId) ?? []
+    if (existing.includes(trimmed)) return
+    existing.push(trimmed)
+    this.sessionRules.set(sessionId, existing)
+  }
+
+  /**
+   * Test-only accessor for the accumulated session rules. Used by
+   * the test suite to verify the turn-boundary invariant without
+   * reaching into private fields.
+   */
+  getSessionRulesForTest(sessionId: string): readonly string[] {
+    return this.sessionRules.get(sessionId) ?? []
+  }
+}
+
+function isApprovedBySessionRule(
+  rules: readonly string[] | undefined,
+  tool: AnyTool,
+  input: unknown,
+): boolean {
+  if (!rules || rules.length === 0) return false
+  return buildSessionRulesPolicy(rules).isAllowed(tool, input)
 }
 
 import {
@@ -691,8 +817,139 @@ function normalizeToolName(name: string): string {
   return name.trim().toLowerCase()
 }
 
+/**
+ * Derive a per-input suggested allow rule for the Bash tool
+ * (Phase A.1 of the enhanced permission panel). Returns strings
+ * like `git:status`, `npm:install`, or `bash:*` (whole tool
+ * fallback). The classifier here mirrors the read-only subcommand
+ * allowlist in `src/tools/builtin/bashClassifier.ts` so the
+ * suggested rule is always at least as specific as the actual
+ * risk classification.
+ */
+export function deriveBashSuggestedRule(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object' || !('command' in input)) {
+    return undefined
+  }
+  const command = (input as { command: unknown }).command
+  if (typeof command !== 'string' || command.trim() === '') {
+    return undefined
+  }
+  const tokens = command.trim().split(/\s+/).filter(t => t.length > 0)
+  if (tokens.length === 0) {
+    return undefined
+  }
+  const head = tokens[0].toLowerCase()
+  // Per-subcommand granularity for known subcommand-style tools.
+  // Empty Set means "any subcommand of this command".
+  const BASH_SUB_RULES: Record<string, Set<string> | null> = {
+    git: new Set(['status', 'log', 'diff', 'show', 'remote', 'rev-parse', 'ls-files', 'tag', 'branch']),
+    ls: new Set(),
+    cat: new Set(),
+    head: new Set(),
+    tail: new Set(),
+    wc: new Set(),
+    file: new Set(),
+    stat: new Set(),
+    readlink: new Set(),
+    realpath: new Set(),
+    pwd: new Set(),
+    echo: new Set(),
+    whoami: new Set(),
+    hostname: new Set(),
+    date: new Set(),
+    uname: new Set(),
+    env: new Set(),
+    printenv: new Set(),
+    ps: new Set(),
+    top: new Set(),
+    uptime: new Set(),
+  }
+  if (Object.prototype.hasOwnProperty.call(BASH_SUB_RULES, head)) {
+    const subs = BASH_SUB_RULES[head]
+    if (subs !== null) {
+      // Find first non-flag token to use as the subcommand.
+      const sub = tokens.slice(1).find(t => !t.startsWith('-'))
+      if (sub && subs.has(sub)) {
+        return `${head}:${sub}`
+      }
+      if (sub && !subs.has(sub)) {
+        // Subcommand is known-dangerous (e.g. `git push`); still
+        // suggest a default rule so the user can decide.
+        return `${head}:${sub}`
+      }
+    }
+    return `${head}:*`
+  }
+  // Fall back to the whole tool (any arguments) when the command
+  // is something we don't model in the classifier.
+  return `bash:*`
+}
+
 function findTaskBySelector(tasks: NexusTask[], selector: string): NexusTask | undefined {
   return tasks.find(task => task.taskId === selector) ??
     tasks.find(task => task.taskId.endsWith(selector)) ??
     tasks.find(task => task.title === selector)
+}
+
+/**
+ * Build a `ToolPolicy` that auto-allows any tool call whose
+ * stringified input contains one of the accumulated session
+ * `scope: 'session'` rules. Used by `executeStream` to apply
+ * user-issued session approvals to the remaining turns without
+ * requiring per-turn permission requests. Phase A.1 of the
+ * enhanced permission panel.
+ */
+export function buildSessionRulesPolicy(rules: readonly string[]): ToolPolicy {
+  // Normalize rules for substring matching. Empty / whitespace
+  // rules are dropped (they'd match every input, which is too
+  // permissive to be useful as a session rule).
+  const normalised = rules
+    .map(r => r.trim())
+    .filter(r => r.length > 0)
+  if (normalised.length === 0) {
+    return denyByDefaultTools()
+  }
+  return {
+    isAllowed(tool, input) {
+      // `tool.suggestedAllowRule ?? tool.name` keeps the test
+      // name canonical: `Bash` → `bash`, `Write` → `write`.
+      const toolNeedle = (tool.suggestedAllowRule ?? tool.name).toLowerCase()
+      const inputBlob = safeStringify(input).toLowerCase()
+      return normalised.some(rule => {
+        const lower = rule.toLowerCase()
+        // Two match modes:
+        //  1. `tool:command` rules (e.g. `git:status`): both the
+        //     tool part and the command part must be present.
+        //  2. Bare rules (e.g. `bash:*`, or whole tool name):
+        //     just substring match on the input blob.
+        if (lower.includes(':')) {
+          const [toolPart, ...rest] = lower.split(':')
+          const cmdPart = rest.join(':')
+          if (toolPart !== toolNeedle) return false
+          if (cmdPart === '*' || cmdPart === '') return true
+          return inputBlob.includes(cmdPart)
+        }
+        return inputBlob.includes(lower) || toolNeedle.includes(lower)
+      })
+    },
+    describe() {
+      return { mode: 'session_rules', allowedTools: [...normalised] }
+    },
+  }
+}
+
+/**
+ * Stringify a value for rule-substring matching, swallowing
+ * circular-reference errors. We don't need a full JSON serializer
+ * here — `String(v)` covers primitives, arrays, and plain
+ * objects without throwing.
+ */
+function safeStringify(value: unknown): string {
+  try {
+    if (value === null || value === undefined) return ''
+    if (typeof value === 'string') return value
+    return JSON.stringify(value)
+  } catch {
+    try { return String(value) } catch { return '' }
+  }
 }

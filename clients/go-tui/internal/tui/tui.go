@@ -2,6 +2,7 @@ package tui
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,11 +11,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -159,9 +162,11 @@ type runtimeProfilesResponse struct {
 	Tombstones    map[string]runtimeProfileTombstone `json:"tombstones"`
 }
 
-type transcriptLine struct {
+type transcriptItem struct {
 	kind string
 	text string
+	*Versioned
+	cache renderCache
 }
 
 type runtimeConfigMsg struct {
@@ -211,6 +216,20 @@ type runtimeModelsMsg struct {
 
 type profileSelectMsg struct {
 	profile string
+	config  runtimeConfig
+	err     error
+}
+
+// modelSelectMsg is the response from POST
+// /v1/runtime/config/select with body {model: "..."}. The
+// Go TUI uses this to persist a model picked from the
+// /model multi-step flow (Step 4) without going through
+// the `bbl config` CLI. On success the returned runtimeConfig
+// is applied locally (m.modelID / m.providerID / header chrome
+// etc.) so the operator sees the new active settings before
+// the next turn lands.
+type modelSelectMsg struct {
+	modelID string
 	config  runtimeConfig
 	err     error
 }
@@ -810,6 +829,41 @@ const (
 	modePermissionEditFeedback inputMode = "permissionEditFeedback"
 )
 
+// mouseWheelStepLines mirrors crush's MouseScrollThreshold=5:
+// one wheel tick on a trackpad / mouse-wheel fires 5 lines
+// of scroll rather than the more claustrophobic 1. We use the
+// same number across the transcript viewport and every
+// read-only overlay so the muscle memory carries.
+const mouseWheelStepLines = 5
+
+// maxTranscriptWidth mirrors crush's maxTextWidth: on very wide
+// terminals (4K monitor @ 200+ cols) the transcript shouldn't
+// stretch to fill the screen — long lines become hard to scan
+// back to the start. Capping at 120 cols keeps prose readable;
+// the header / footer / input still fill the full terminal width
+// because their content is short anyway.
+const maxTranscriptWidth = 120
+
+// Compact-mode breakpoints (crush's compactModeWidthBreakpoint +
+// compactModeHeightBreakpoint). When the terminal is narrower
+// than the width breakpoint OR shorter than the height
+// breakpoint, the TUI drops secondary chrome (side-channel
+// summary, elapsed time, version suffix) so the primary
+// controls remain visible. The 120×30 numbers are picked to
+// match the common SSH-attach (80×24) and 12" laptop (110×28)
+// scenarios where every row counts.
+const (
+	compactModeWidthBreakpoint  = 120
+	compactModeHeightBreakpoint = 30
+)
+
+// isCompact reports whether the current terminal dimensions
+// trigger the compact layout (drop secondary chrome to free up
+// rows / columns for the primary transcript + input).
+func (m model) isCompact() bool {
+	return m.width < compactModeWidthBreakpoint || m.height < compactModeHeightBreakpoint
+}
+
 func (m inputMode) canEditInput() bool { return m == modeComposing }
 
 type model struct {
@@ -819,7 +873,8 @@ type model struct {
 	pastedTextCounter       int
 	viewport                viewport.Model
 	spinner                 spinner.Model
-	transcript              []transcriptLine
+	gradientSpinner         gradientSpinner
+	transcript              []*transcriptItem
 	inputMode               inputMode
 	helpScroll              int
 	running                 bool
@@ -871,6 +926,36 @@ type model struct {
 	graceMaxDelay           time.Duration
 	connected               bool
 	latestUsage             *usageSnapshot
+	// Phase 11 in-app selection. With --mouse the Go TUI
+	// captures SGR mouse events and the terminal can no
+	// longer do native drag-select. We compensate with an
+	// in-app highlight + OSC 52 copy: the operator presses
+	// and drags the left button over the transcript
+	// viewport, the cells under the drag get a gray
+	// background, and on release the selected text is
+	// pushed to the system clipboard via OSC 52. Coords
+	// are in viewport-content space (line/col), not
+	// screen coords, so a scroll/resize keeps the
+	// selection anchored to the same text.
+	selectionStartLine int
+	selectionStartCol  int
+	selectionEndLine   int
+	selectionEndCol    int
+	selectionActive    bool
+	// mouseDownInViewport tracks a left-button press that
+	// started inside the transcript viewport. We only
+	// update the selection while this is true; a release
+	// outside the viewport (e.g. on the input box) ends
+	// the drag naturally.
+	mouseDownInViewport bool
+	// lastSelectionCopy is the most recent OSC 52 payload
+	// that was emitted. The overlay's footer shows a small
+	// "copied N chars" line for a few seconds so the
+	// operator has feedback that the gesture worked even
+	// when their terminal hides OSC 52 echoing.
+	lastSelectionCopy     string
+	lastSelectionCopyAt   time.Time
+	lastMouseEventTime    time.Time
 	// promptHistory is the per-session list of submitted
 	// prompts; up/down in composing mode walks it so the
 	// operator can recall a prior turn without leaving the
@@ -897,6 +982,13 @@ type model struct {
 	// renders a spinner instead of the list.
 	modelPickerLive    []registeredModel
 	modelPickerLoading bool
+	// modelPickSubmitting is true between the operator
+	// pressing Enter in Step 4 and the response landing
+	// from POST /v1/runtime/config/select. While it's
+	// true the picker locks input (↑/↓/Enter/esc) so a
+	// second press can't fire a duplicate POST, and the
+	// renderer swaps the list for a "saving…" line.
+	modelPickSubmitting bool
 	width              int
 	height             int
 }
@@ -963,6 +1055,507 @@ func (m *model) inPermissionGracePeriod() bool {
 		return false
 	}
 	return true
+}
+
+// scrollOverlay moves the active overlay's internal scroll or
+// selection by `delta` rows. Positive delta walks forward / down,
+// negative walks back / up. The keyboard ↑/↓ handlers for each
+// overlay call into this same helper so the mouse wheel and the
+// keyboard stay in sync. Returns true if the active mode was an
+// overlay that consumed the wheel tick, false if the active mode
+// has no scroll semantics and the caller should treat the wheel
+// as a no-op.
+//
+// The permission panel is special: it has exactly 5 choices in a
+// ring, so a wheel tick of 5 is a full lap and lands back on the
+// same option. We treat it modulo 5.
+func (m *model) scrollOverlay(delta int) bool {
+	if delta == 0 {
+		return true
+	}
+	switch m.inputMode {
+	case modeHelpOverlay:
+		// help has no max — the overlay renderer already
+		// clamps visible rows in `renderHelp` itself.
+		if delta < 0 {
+			for i := 0; i < -delta && m.helpScroll > 0; i++ {
+				m.helpScroll--
+			}
+		} else {
+			m.helpScroll += delta
+		}
+		return true
+	case modeContextOverlay:
+		maxScroll := max(0, len(m.contextOverlayLines)-1)
+		m.contextOverlayScroll = clamp(m.contextOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modeInboxOverlay:
+		maxScroll := max(0, len(m.inboxMessages)-1)
+		m.inboxOverlaySelected = clamp(m.inboxOverlaySelected+delta, 0, maxScroll)
+		return true
+	case modeAgentOverlay:
+		allLines := buildAgentOverlayLines(m.agentJobs)
+		maxScroll := max(0, len(allLines)-1)
+		m.agentOverlayScroll = clamp(m.agentOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modeTaskBoard:
+		allLines := buildTaskBoardLines(m.taskBoard)
+		maxScroll := max(0, len(allLines)-1)
+		m.taskBoardScroll = clamp(m.taskBoardScroll+delta, 0, maxScroll)
+		return true
+	case modeActivityOverlay:
+		allLines := buildActivityOverlayLines(m.activityEvents)
+		maxScroll := max(0, len(allLines)-1)
+		m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modeToolAuditOverlay:
+		allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
+		maxScroll := max(0, len(allLines)-1)
+		m.toolAuditScroll = clamp(m.toolAuditScroll+delta, 0, maxScroll)
+		return true
+	case modeModelOverlay:
+		allLines := buildModelOverlayLines(m.modelCatalog)
+		maxScroll := max(0, len(allLines)-1)
+		m.modelOverlayScroll = clamp(m.modelOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modePermission:
+		// 5-option ring. Treat the wheel tick modulo 5 so
+		// the choice lands predictably.
+		m.permissionChoice = ((m.permissionChoice+delta)%5 + 5) % 5
+		return true
+	}
+	// Composing / slash pick / profile confirm / model pick*
+	// are all no-op for the wheel: composing owns ↑/↓ for
+	// prompt history, the others are tiny pickers that
+	// either respond to type-to-filter or have their own
+	// short key list. The caller is expected to have
+	// already routed the wheel to m.viewport for composing
+	// before consulting scrollOverlay.
+	return false
+}
+
+// selectionInViewport reports whether a screen-relative
+// mouse coordinate lands inside the transcript viewport.
+// The viewport occupies screen lines [1, 1+height) of the
+// rendered output, i.e. just below the single-line header
+// and above any overlay / permission / editor / input /
+// footer rows. The horizontal bounds match the width of
+// the rendered content (which is bounded by `m.width`).
+func (m *model) selectionInViewport(x, y int) bool {
+	if m.cfg.MouseCapture == false {
+		return false
+	}
+	if y < 1 {
+		return false
+	}
+	vpTopY := 1
+	vpBottomY := vpTopY + m.viewport.Height
+	if y >= vpBottomY {
+		return false
+	}
+	if x < 0 || x >= m.width {
+		return false
+	}
+	return true
+}
+
+// startSelection anchors a new selection at the given
+// viewport-content (line, col) position. (line, col) is
+// in the same coord space as the viewport's YOffset —
+// i.e. line 0 is the welcome card's first line, col 0
+// is the leftmost column. Both bounds are clamped.
+func (m *model) startSelection(line, col int) {
+	m.selectionStartLine = clamp(line, 0, m.viewport.Height)
+	m.selectionStartCol = clamp(col, 0, max(0, m.width-1))
+	m.selectionEndLine = m.selectionStartLine
+	m.selectionEndCol = m.selectionStartCol
+	m.selectionActive = true
+}
+
+// extendSelection moves the end-anchor to a new (line, col)
+// while a left-button drag is in progress. The selection
+// stays anchored to its start; only the end moves.
+func (m *model) extendSelection(line, col int) {
+	if !m.selectionActive {
+		return
+	}
+	m.selectionEndLine = clamp(line, 0, m.viewport.Height)
+	m.selectionEndCol = clamp(col, 0, max(0, m.width-1))
+}
+
+// clearSelection resets the selection anchors without
+// touching the "lastSelectionCopy" feedback timestamp.
+func (m *model) clearSelection() {
+	m.selectionActive = false
+	m.selectionStartLine = 0
+	m.selectionStartCol = 0
+	m.selectionEndLine = 0
+	m.selectionEndCol = 0
+	m.mouseDownInViewport = false
+}
+
+// normalizedSelection returns the selection rect in
+// top-left → bottom-right order. If start == end the
+// selection is empty.
+func (m *model) normalizedSelection() (sl, sc, el, ec int, ok bool) {
+	if !m.selectionActive {
+		return 0, 0, 0, 0, false
+	}
+	sl, sc = m.selectionStartLine, m.selectionStartCol
+	el, ec = m.selectionEndLine, m.selectionEndCol
+	if (sl > el) || (sl == el && sc > ec) {
+		sl, sc, el, ec = el, ec, sl, sc
+	}
+	if sl == el && sc == ec {
+		return sl, sc, el, ec, false
+	}
+	return sl, sc, el, ec, true
+}
+
+// handleSelectionMouse routes a left-button MouseMsg to
+// the in-app selection state machine. Returns the model
+// and an optional OSC 52 copy command.
+//
+// Coord mapping: msg.X / msg.Y are screen-relative. The
+// viewport sits at screen Y ∈ [1, 1+height). We translate
+// to viewport-content (line, col) by subtracting the
+// header (1 row) so the same content line keeps the same
+// line index even if the welcome card grows.
+func (m *model) handleSelectionMouse(msg tea.MouseMsg) (model, tea.Cmd) {
+	// Only the transcript viewport accepts selection; an
+	// overlay / permission / editor / input has its own
+	// single-input-owner and we don't want a stray drag to
+	// bleed into the transcript behind it.
+	if m.inputMode != modeComposing {
+		m.mouseDownInViewport = false
+		return *m, nil
+	}
+	if !m.selectionInViewport(msg.X, msg.Y) {
+		// A press / motion / release outside the viewport
+		// ends any in-progress drag without committing a
+		// copy.
+		m.mouseDownInViewport = false
+		return *m, nil
+	}
+	contentLine := m.viewport.YOffset + (msg.Y - 1)
+	contentCol := msg.X
+	switch {
+	case msg.Action == tea.MouseActionPress:
+		m.mouseDownInViewport = true
+		m.startSelection(contentLine, contentCol)
+		return *m, nil
+	case msg.Action == tea.MouseActionMotion && m.mouseDownInViewport:
+		m.extendSelection(contentLine, contentCol)
+		return *m, nil
+	case msg.Action == tea.MouseActionRelease && m.mouseDownInViewport:
+		m.mouseDownInViewport = false
+		m.extendSelection(contentLine, contentCol)
+		sl, sc, el, ec, ok := m.normalizedSelection()
+		if !ok {
+			// Empty / one-cell click: clear, no copy.
+			m.clearSelection()
+			return *m, nil
+		}
+		text := m.extractSelectedText(sl, sc, el, ec)
+		if text == "" {
+			m.clearSelection()
+			return *m, nil
+		}
+		m.lastSelectionCopy = text
+		m.lastSelectionCopyAt = time.Now()
+		return *m, osC52CopyCmd(text)
+	}
+	return *m, nil
+}
+
+// extractSelectedText walks the viewport's plain-text
+// content and pulls the substring inside the given
+// (line, col) rect. ANSI escape sequences are stripped
+// from the source so what gets copied matches what the
+// operator saw (modulo any leading whitespace padding
+// baked in by the welcome card).
+func (m *model) extractSelectedText(sl, sc, el, ec int) string {
+	content := m.viewport.View() // not enough — use full content
+	_ = content
+	full := m.fullViewportContent()
+	plain := stripANSICodes(full)
+	lines := strings.Split(plain, "\n")
+	if sl < 0 || sl >= len(lines) {
+		return ""
+	}
+	if el < 0 || el >= len(lines) {
+		el = len(lines) - 1
+	}
+	if sl == el {
+		line := lines[sl]
+		if sc >= len(line) {
+			return ""
+		}
+		if ec > len(line) {
+			ec = len(line)
+		}
+		return line[sc:ec]
+	}
+	var b strings.Builder
+	for i := sl; i <= el && i < len(lines); i++ {
+		line := lines[i]
+		switch i {
+		case sl:
+			if sc < len(line) {
+				b.WriteString(line[sc:])
+			}
+			b.WriteByte('\n')
+		case el:
+			if ec > len(line) {
+				ec = len(line)
+			}
+			if ec > 0 {
+				b.WriteString(line[:ec])
+			}
+		default:
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// fullViewportContent reconstructs the same content string
+// that refreshViewport() feeds to the viewport. We do not
+// re-call refreshViewport() here because that would also
+// re-position the scroll; the operator's selection must
+// stay anchored to the same text even if they release the
+// mouse on a frame that hasn't been refreshed.
+func (m *model) fullViewportContent() string {
+	welcome := m.renderWelcomeCard(max(40, m.viewport.Width))
+	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width))
+	if transcript != "" {
+		return welcome + "\n\n" + transcript
+	}
+	return welcome
+}
+
+// applySelectionHighlight walks the viewport's visible
+// output and applies a muted gray background to the
+// cells inside the current selection. ANSI escape codes
+// in the source are preserved (we count visible columns
+// while skipping CSI sequences), so foreground colors
+// inside the selected range are not overwritten.
+func (m *model) applySelectionHighlight(viewportView string) string {
+	sl, sc, el, ec, ok := m.normalizedSelection()
+	if !ok {
+		return viewportView
+	}
+	lines := strings.Split(viewportView, "\n")
+	const bg = "\x1b[48;5;240m"
+	const bgReset = "\x1b[49m"
+	// First visible line of the viewport is content line
+	// m.viewport.YOffset. We translate the selection's
+	// (sl, el) content-line range to the visible-line
+	// range by subtracting that offset.
+	first := m.viewport.YOffset
+	for vis := 0; vis < len(lines); vis++ {
+		contentLine := first + vis
+		if contentLine < sl || contentLine > el {
+			continue
+		}
+		var colStart, colEnd int
+		switch contentLine {
+		case sl:
+			colStart = sc
+		default:
+			colStart = 0
+		}
+		switch contentLine {
+		case el:
+			colEnd = ec
+		default:
+			colEnd = visibleWidth(lines[vis])
+		}
+		if colStart >= colEnd {
+			continue
+		}
+		lines[vis] = paintColumnRange(lines[vis], colStart, colEnd, bg, bgReset)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// paintColumnRange injects a background-color span over
+// the visual columns [start, end) of an ANSI-styled
+// string, preserving the existing colors. This is
+// column-aware (we skip CSI sequences while counting)
+// and byte-aware (we splice at exact byte positions).
+func paintColumnRange(s string, start, end int, bgStart, bgEnd string) string {
+	if start >= end {
+		return s
+	}
+	// Walk to the byte position of column `start`.
+	byteStart, _ := columnToByteRange(s, start, -1)
+	if byteStart < 0 {
+		return s
+	}
+	// Walk from there to the byte position of column `end`,
+	// measured from byteStart forward.
+	byteEnd, _ := columnToByteRange(s[byteStart:], end-start, 0)
+	if byteEnd < 0 {
+		return s
+	}
+	byteEnd += byteStart
+	if byteEnd > len(s) {
+		byteEnd = len(s)
+	}
+	if byteStart >= byteEnd {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s) + len(bgStart) + len(bgEnd))
+	b.WriteString(s[:byteStart])
+	b.WriteString(bgStart)
+	b.WriteString(s[byteStart:byteEnd])
+	b.WriteString(bgEnd)
+	b.WriteString(s[byteEnd:])
+	return b.String()
+}
+
+// columnToByteRange walks a (potentially ANSI-styled)
+// string and returns the byte index corresponding to the
+// Nth visible column. If `fromCol` is non-negative the
+// walk starts at that column (which lets the caller
+// chain byte-relative walks cheaply). If the column is
+// out of range, -1 is returned.
+func columnToByteRange(s string, target int, fromCol int) (int, int) {
+	col := 0
+	if fromCol >= 0 {
+		col = fromCol
+	}
+	i := 0
+	for i < len(s) {
+		if col == target {
+			return i, col
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == 0x1b {
+			// Skip CSI: ESC [ ... <final>
+			j := i + 1
+			if j < len(s) && s[j] == '[' {
+				j++
+				for j < len(s) {
+					c := s[j]
+					j++
+					if c >= 0x40 && c <= 0x7e {
+						break
+					}
+				}
+				i = j
+				continue
+			}
+			// Non-CSI escape: skip the introducer and
+			// a single following byte.
+			i += 2
+			continue
+		}
+		// East Asian wide chars count as 2 columns; ASCII
+		// is 1 column. We use runewidth from the bubbles
+		// dependency tree.
+		w := visualWidth(r)
+		col += w
+		i += size
+		if col > target {
+			// We overshot the target column (the rune
+			// was a wide char that straddles the
+			// boundary). Anchor the splice to the
+			// start of this rune so the highlight
+			// doesn't slice a wide glyph in half.
+			return i - size, col - w
+		}
+	}
+	if col == target {
+		return len(s), col
+	}
+	return -1, col
+}
+
+// visibleWidth sums the on-screen column widths of every
+// rune in `s`, skipping CSI sequences. Used to compute
+// the right edge of a full-line selection range.
+func visibleWidth(s string) int {
+	_, col := columnToByteRange(s, 1<<30, 0)
+	return col
+}
+
+// stripANSICodes removes CSI (\x1b[...m) and OSC (\x1b]...BEL
+// or \x1b\\ ) sequences from `s`. Used by the OSC 52
+// copy path so the clipboard receives the operator's text
+// without terminal control bytes attached.
+func stripANSICodes(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	i := 0
+	for i < len(s) {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == 0x1b {
+			j := i + 1
+			if j < len(s) {
+				switch s[j] {
+				case '[':
+					j++
+					for j < len(s) {
+						c := s[j]
+						j++
+						if c >= 0x40 && c <= 0x7e {
+							break
+						}
+					}
+					i = j
+					continue
+				case ']':
+					j++
+					// OSC terminates on BEL (0x07) or
+					// ST (ESC \). Skip until terminator.
+					for j < len(s) {
+						if s[j] == 0x07 {
+							j++
+							break
+						}
+						if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
+							j += 2
+							break
+						}
+						j++
+					}
+					i = j
+					continue
+				}
+			}
+			i += size
+			continue
+		}
+		b.WriteString(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// buildOSC52Sequence returns the raw OSC 52 byte stream
+// for `text`. Most modern terminals (iTerm2, WezTerm,
+// recent gnome-terminal, Windows Terminal, kitty,
+// alacritty) honor OSC 52 even when the app is in
+// alternate-screen mode. The sequence uses BEL as the
+// string terminator, which is the widely-supported
+// default.
+func buildOSC52Sequence(text string) string {
+	encoded := base64.StdEncoding.EncodeToString([]byte(text))
+	return "\x1b]52;c;" + encoded + "\x07"
+}
+
+// osC52CopyCmd builds a tea.Cmd that pushes `text` to the
+// system clipboard via the OSC 52 escape sequence. We
+// use tea.Printf so the byte stream goes through the
+// bubbletea renderer and reaches stdout in a single
+// redraw cycle; printing via os.Stdout would corrupt the
+// current frame.
+func osC52CopyCmd(text string) tea.Cmd {
+	return tea.Printf("%s", buildOSC52Sequence(text))
 }
 
 // slashCommand describes a single Phase 4 slash-palette entry. A command
@@ -1490,6 +2083,8 @@ func newModel(cfg Config) model {
 	spin.Spinner = spinner.Dot
 	spin.Style = statusStyle
 
+	gSpin := newGradientSpinner()
+
 	graceQuiet := 200 * time.Millisecond
 	graceMax := 1500 * time.Millisecond
 	if flag.Lookup("test.v") != nil || os.Getenv("BABEL_O_RUN_GO_TUI_SMOKE") != "" {
@@ -1502,8 +2097,9 @@ func newModel(cfg Config) model {
 		input:                   input,
 		viewport:                vp,
 		spinner:                 spin,
+		gradientSpinner:         gSpin,
 		inputMode:               modeComposing,
-		transcript:              []transcriptLine{},
+		transcript:              []*transcriptItem{},
 		seenInboxCardMessageIDs: map[string]struct{}{},
 		subAgents:               map[string]subAgentEntry{},
 		pastedTextReplacements:  make(map[string]string),
@@ -1553,29 +2149,72 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.MouseMsg:
-		// Phase 10: route the scroll wheel to the transcript
-		// viewport in composing mode only. Overlay modes
-		// (help / slash palette / permission / profile
-		// confirm / context / inbox / agents / tasks /
-		// activity / tools audit / model) are silent on wheel
-		// input — the operator is supposed to dismiss them
-		// before scrolling the transcript, and we don't want
-		// the wheel to also yank the overlay's own scroll
-		// state. We also bail on non-wheel events (press,
-		// release, motion) so we don't accidentally steal
-		// selection drags.
-		if m.inputMode != modeComposing {
+		// Phase 11 wheel routing. Only active when the
+		// operator explicitly opted into mouse capture via
+		// --mouse; otherwise the terminal's own
+		// wheel→arrow conversion is in charge and we never
+		// see a MouseMsg here (SGR mouse tracking is off).
+		//
+		// When the cap is on:
+		//   - the left button routes to the in-app
+		//     selection state machine (drag-select + OSC 52
+		//     copy on release).
+		//   - the wheel only fires on Press (motion /
+		//     release are wheel no-ops, and now they're
+		//     consumed by the selection branch instead).
+		//   - composing mode scrolls the transcript
+		//     viewport by `mouseWheelStepLines`.
+		//   - any read-only overlay (help / context /
+		//     inbox / agents / tasks / activity / tools
+		//     audit / model / permission ring) routes
+		//     through `m.scrollOverlay` so the wheel and
+		//     ↑/↓ stay in lock-step.
+		//   - permission grace period absorbs the wheel
+		//     the same way it absorbs keystrokes, so an
+		//     in-flight wheel tick from the previous
+		//     focus can't yank the permission choice.
+		if !m.cfg.MouseCapture {
 			return m, nil
 		}
+		// Anti-jitter: drop trackpad / mouse scroll and motion events that arrive too quickly.
+		if msg.Action == tea.MouseActionMotion || msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			if flag.Lookup("test.v") == nil {
+				now := time.Now()
+				if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
+					return m, nil
+				}
+				m.lastMouseEventTime = now
+			}
+		}
+		// Left button: in-app drag-select. The handler is
+		// the only place that consumes motion / release
+		// events; the wheel branch below only handles
+		// Press, so there's no double-handling.
+		if msg.Button == tea.MouseButtonLeft {
+			return m.handleSelectionMouse(msg)
+		}
+		// Wheel: Press only.
 		if msg.Action != tea.MouseActionPress {
+			return m, nil
+		}
+		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
+			m.permissionLastInputAt = time.Now()
 			return m, nil
 		}
 		switch msg.Button {
 		case tea.MouseButtonWheelUp:
-			m.viewport.LineUp(1)
+			if m.inputMode == modeComposing {
+				m.viewport.LineUp(mouseWheelStepLines)
+			} else {
+				m.scrollOverlay(-mouseWheelStepLines)
+			}
 			return m, nil
 		case tea.MouseButtonWheelDown:
-			m.viewport.LineDown(1)
+			if m.inputMode == modeComposing {
+				m.viewport.LineDown(mouseWheelStepLines)
+			} else {
+				m.scrollOverlay(mouseWheelStepLines)
+			}
 			return m, nil
 		}
 		return m, nil
@@ -2143,6 +2782,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if provider != nil {
 				total = len(provider.Models)
 			}
+			// While the POST is in flight, lock the picker so
+			// the operator can't fire a second select. Esc is
+			// still allowed to abort the visible request —
+			// the server-side write is fire-and-forget at that
+			// point but it usually lands in <50ms anyway.
+			if m.modelPickSubmitting {
+				if key == "esc" {
+					m.setMode(modeModelPickBaseURL)
+				}
+				return m, nil
+			}
 			switch key {
 			case "esc":
 				m.setMode(modeModelPickBaseURL)
@@ -2158,15 +2808,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "enter":
-				if provider != nil && m.modelPickSelectedIdx >= 0 && m.modelPickSelectedIdx < len(provider.Models) {
-					selectedModel := provider.Models[m.modelPickSelectedIdx]
-					m.appendLine("status", fmt.Sprintf("selected model: %s (provider %s, model writeback is CLI-only in Phase 1; run `bbl config use %s` or `bbl chat /model` to persist)", selectedModel.ID, provider.ID, selectedModel.ID))
-					// Update the local model id so the header
-					// reflects the new selection immediately.
-					m.modelID = selectedModel.ID
-					m.setMode(modeComposing)
+				if provider == nil || m.modelPickSelectedIdx < 0 || m.modelPickSelectedIdx >= len(provider.Models) {
+					return m, nil
 				}
-				return m, nil
+				selectedModel := provider.Models[m.modelPickSelectedIdx]
+				// Phase 2: persist via POST
+				// /v1/runtime/config/select {model: ...}.
+				// selectedModel.ID is already in canonical
+				// `provider/model` form (the Go TUI only
+				// sees model ids in the catalog response,
+				// which are canonical), so we can pass it
+				// through without further munging.
+				m.modelPickSubmitting = true
+				m.appendLine("status", fmt.Sprintf("saving model: %s (provider %s)…", selectedModel.ID, provider.ID))
+				return m, selectRuntimeModel(m.cfg, selectedModel.ID)
 			}
 			return m, nil
 		}
@@ -2226,12 +2881,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pending = nil
 			m.lastEventType = ""
 			m.startedAt = time.Now()
-			return m, startStream(m.cfg, expandedPrompt)
+			return m, tea.Batch(startStream(m.cfg, expandedPrompt), m.gradientSpinner.Tick)
 		}
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+
+	case gradientSpinnerTickMsg:
+		if !m.running {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.gradientSpinner, cmd = m.gradientSpinner.Update(msg)
 		return m, cmd
 
 	case streamStartedMsg:
@@ -2365,6 +3028,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyRuntimeConfig(msg.config)
 		m.appendLine("status", "profile switched: "+firstNonEmpty(msg.config.ActiveProfile, msg.profile))
 		return m, fetchRuntimeProfiles(m.cfg)
+
+	case modelSelectMsg:
+		// Clear the in-flight flag in both success and
+		// failure paths so the picker is operable again.
+		m.modelPickSubmitting = false
+		if msg.err != nil {
+			m.appendLine("error", "model select: "+msg.err.Error())
+			// Keep the operator in the picker so they can
+			// pick a different model or esc back.
+			return m, nil
+		}
+		m.applyRuntimeConfig(msg.config)
+		// Prefer the resolved model's display name when the
+		// Nexus side provides one (e.g. "Claude 3.5 Sonnet");
+		// fall back to the bare model id we sent.
+		display := firstNonEmpty(msg.config.ModelName, msg.modelID)
+		m.appendLine("status", fmt.Sprintf("model saved: %s → %s (provider %s)", display, msg.config.ModelID, firstNonEmpty(msg.config.ProviderID, "?")))
+		// Return the operator to composing and reset the
+		// picker's per-session state so a fresh /model
+		// invocation starts from the provider list, not
+		// from wherever they left the previous pick.
+		m.modelPickSelectedIdx = 0
+		m.modelPickSelectedID = ""
+		m.modelPickProviderIdx = 0
+		m.modelPickProviderDraft = ""
+		m.modelPickerLive = nil
+		m.setMode(modeComposing)
+		return m, nil
 
 	case contextAnalysisMsg:
 		if msg.err != nil {
@@ -2556,17 +3247,38 @@ func (m *model) resize() {
 	// days; on a single-line prompt it produced a triple
 	// `>` box on every resize.
 	inputHeight := 1
+	if m.running {
+		inputHeight = 2
+	}
 	footerHeight := 2
 	m.input.SetWidth(max(20, width-4))
 	m.input.SetHeight(1)
-	m.viewport.Width = width
+	// Reserve a 1-column gutter on the right of the transcript
+	// for the vertical scrollbar. See Scrollbar() in scrollbar.go.
+	// Cap at maxTranscriptWidth so very wide terminals (4K) don't
+	// stretch the prose to unreadable line lengths; header / footer
+	// / input still use the full terminal width because their
+	// content is short.
+	m.viewport.Width = max(20, min(width-1, maxTranscriptWidth))
 	m.viewport.Height = max(6, m.height-headerHeight-permissionHeight-inputHeight-footerHeight)
 }
 
 func (m model) View() string {
 	width := max(40, m.width)
 	header := m.renderHeader(width)
-	transcript := m.viewport.View()
+	transcriptView := m.applySelectionHighlight(m.viewport.View())
+	// Vertical scrollbar column. Always render (track-only when
+	// the content fits in the viewport) so the operator can see
+	// the scroll position at a glance. m.viewport.Width is set
+	// to width-1 in resize() to leave this column blank in the
+	// viewport; the scrollbar then fills it.
+	scrollbar := Scrollbar(
+		m.viewport.TotalLineCount(),
+		m.viewport.VisibleLineCount(),
+		m.viewport.YOffset,
+		m.viewport.Height,
+	)
+	transcript := lipgloss.JoinHorizontal(lipgloss.Top, transcriptView, scrollbar)
 	permission := m.renderPermission(width)
 	permissionEditor := m.renderPermissionEditor(width)
 	input := m.renderInput(width)
@@ -2649,8 +3361,11 @@ var helpOverlayLines = []string{
 	"  ctrl+c / q       quit when input is empty",
 	"  up / down        walk per-session prompt history (single-line input)",
 	"  pgup / pgdown    page-scroll the transcript viewport",
-	"  mouse wheel      scroll the transcript viewport (composing only;",
-	"                   overlay modes stay silent)",
+	"  mouse wheel      scroll 5 lines per tick — transcript viewport in",
+	"                   composing, or the active overlay's internal",
+	"                   scroll/selection (help / context / inbox /",
+	"                   agents / tasks / activity / tools / model /",
+	"                   permission ring). Requires --mouse.",
 	"",
 	"Permission panel:",
 	"  a / y            approve",
@@ -4594,6 +5309,20 @@ func (m model) renderModelPickModel(width int) string {
 		return renderOverlayFrame(width, strings.Join(lines, "\n"))
 	}
 
+	// Submitting state: the operator pressed Enter and the
+	// POST /v1/runtime/config/select request is in flight.
+	// Hide the list (the row they picked is now committed)
+	// and show a "saving…" line. Esc is intentionally still
+	// allowed in the Update handler — the server-side write
+	// usually lands in <50ms and the operator can use esc to
+	// back out of the picker frame if the network is slow.
+	if m.modelPickSubmitting {
+		lines = append(lines, "  "+m.spinner.View()+"  saving model…")
+		lines = append(lines, "")
+		lines = append(lines, mutedStyle.Render("  esc back to base URL (request still in flight)"))
+		return renderOverlayFrame(width, strings.Join(lines, "\n"))
+	}
+
 	// Prefer the live-fetched list when present. Falls
 	// back to the hardcoded catalog entry on the picked
 	// provider when the live fetch never landed.
@@ -4872,6 +5601,12 @@ func (m model) renderHeader(width int) string {
 	state := stateKind.Render(stateLabel)
 	top := joinColumns(width, title, state)
 
+	// Compact mode: drop the divider so the header fits in a
+	// single line. The title + state column is already one
+	// line; we just skip the underline. Phase A.4.
+	if m.isCompact() {
+		return top
+	}
 	return strings.Join([]string{
 		top,
 		divider(width),
@@ -5037,8 +5772,12 @@ func (m model) renderInput(width int) string {
 	if m.running {
 		prompt = focusedLineStyle.Render(prompt)
 	}
+	loader := ""
+	if m.running {
+		loader = "  " + m.gradientSpinner.View() + "\n"
+	}
 	return strings.Join([]string{
-		divider(width),
+		loader + divider(width),
 		prompt,
 	}, "\n")
 }
@@ -5047,7 +5786,15 @@ func (m model) renderFooter(width int) string {
 	// Row 1: the keyboard hint + elapsed time + quit reminder.
 	// Coloured by run state so idle / running / permission-pending
 	// read distinctly without scanning the header.
-	hint := "enter submit"
+	//
+	// Phase A.1: hint + quit reminders are now rendered through
+	// ButtonGroup so the hotkey character (e for "enter submit",
+	// c for "ctrl+c", q for "quit") is underlined. The operator
+	// can spot the binding without scanning every key in the
+	// help card.
+	hint := ButtonGroup([]ButtonOpt{
+		{Text: "enter submit", UnderlineIndex: 0},
+	}, "")
 	if m.running {
 		hint = "waiting for Nexus events"
 	}
@@ -5058,8 +5805,12 @@ func (m model) renderFooter(width int) string {
 	if !m.startedAt.IsZero() && m.running {
 		elapsed = fmt.Sprintf("  elapsed=%s", time.Since(m.startedAt).Round(time.Second))
 	}
+	quitHints := ButtonGroup([]ButtonOpt{
+		{Text: "ctrl+c quit", UnderlineIndex: 5},     // "ctrl+" is 5 chars, then "c"
+		{Text: "q quit when idle", UnderlineIndex: 0}, // "q" is the hotkey
+	}, "  ")
 	topRow := footerStyle.Render(truncatePlain(
-		fmt.Sprintf("%s%s  ctrl+c quit  q quit when idle", hint, elapsed), width))
+		fmt.Sprintf("%s%s  %s", hint, elapsed, quitHints), width))
 
 	// Row 2: side-channel summary — inbox / agents / usage.
 	// Kept as a separate muted line so the keyboard hint on row 1
@@ -5068,15 +5819,20 @@ func (m model) renderFooter(width int) string {
 	// pattern): the line updates in place as new usage events
 	// arrive, and disappears on result / error when the turn
 	// ends.
+	//
+	// Phase A.4: compact mode (terminal < 120×30) drops this
+	// row entirely to free vertical space for the transcript.
 	var sideParts []string
-	if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
-		sideParts = append(sideParts, inbox)
-	}
-	if subRunning := m.subAgentRunningCount(); subRunning > 0 {
-		sideParts = append(sideParts, fmt.Sprintf("sub-agents running: %d", subRunning))
-	}
-	if m.latestUsage != nil {
-		sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
+	if !m.isCompact() {
+		if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
+			sideParts = append(sideParts, inbox)
+		}
+		if subRunning := m.subAgentRunningCount(); subRunning > 0 {
+			sideParts = append(sideParts, fmt.Sprintf("sub-agents running: %d", subRunning))
+		}
+		if m.latestUsage != nil {
+			sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
+		}
 	}
 	bottomRow := ""
 	if len(sideParts) > 0 {
@@ -5583,9 +6339,10 @@ func (m *model) appendStreamingLine(kind string, text string) {
 		return
 	}
 	if len(m.transcript) > 0 {
-		last := &m.transcript[len(m.transcript)-1]
+		last := m.transcript[len(m.transcript)-1]
 		if last.kind == kind {
 			last.text += text
+			last.Bump()
 			m.refreshViewport()
 			return
 		}
@@ -5709,7 +6466,18 @@ func (m *model) subAgentRunningCount() int {
 }
 
 func (m *model) appendLine(kind string, text string) {
-	m.transcript = append(m.transcript, transcriptLine{kind: kind, text: text})
+	// Phase B: each transcript row is a *transcriptItem so its
+	// Versioned counter survives slice reallocations and the
+	// render cache can key on the stable item pointer. A
+	// freshly-appended row starts at version 0; nothing in the
+	// render path mutates it after creation, so the cache entry
+	// computed on first render is reused on every subsequent
+	// frame.
+	m.transcript = append(m.transcript, &transcriptItem{
+		kind:      kind,
+		text:      text,
+		Versioned: NewVersioned(),
+	})
 	m.refreshViewport()
 }
 
@@ -5843,13 +6611,25 @@ func (m model) renderWelcomeCard(width int) string {
 	return strings.Join(outputLines, "\n")
 }
 
-func renderTranscript(lines []transcriptLine, width int) string {
+func renderTranscript(lines []*transcriptItem, width int) string {
 	if len(lines) == 0 {
 		return mutedStyle.Render("No messages yet.")
 	}
 	rendered := make([]string, 0, len(lines)*2)
 	for i, line := range lines {
-		formatted := formatLine(line.kind, line.text, width)
+		// Phase B.2: per-item render cache. The first render
+		// populates line.cache; subsequent calls with the same
+		// (width, version) pair return the cached string
+		// without re-running formatLine. Width changes (terminal
+		// resize) and Bump() calls (content mutation) both
+		// invalidate the entry.
+		version := uint64(0)
+		if line.Versioned != nil {
+			version = line.Version()
+		}
+		formatted := line.cache.GetOrCompute(width, version, func() string {
+			return formatLine(line.kind, line.text, width)
+		})
 		rendered = append(rendered, formatted)
 		// Insert a blank line between rows (but not after the
 		// last one) to give the chat log the breathing room
@@ -6422,6 +7202,23 @@ func selectRuntimeProfile(cfg Config, profile string) tea.Cmd {
 		var payload runtimeConfig
 		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"profile": profile}, &payload)
 		return profileSelectMsg{profile: profile, config: payload, err: err}
+	}
+}
+
+// selectRuntimeModel issues POST /v1/runtime/config/select
+// with body {model: "<provider>/<id>"} and returns the
+// resolved runtimeConfig on success. The Nexus side stores
+// the model as defaultModel; an active profile that pins a
+// model still wins at resolve time (see
+// ConfigManager.resolveSettings), so the operator should
+// clear the active profile or pick a profile that uses
+// this model for the new model to take effect on the next
+// turn.
+func selectRuntimeModel(cfg Config, modelID string) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeConfig
+		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"model": modelID}, &payload)
+		return modelSelectMsg{modelID: modelID, config: payload, err: err}
 	}
 }
 
@@ -7061,6 +7858,31 @@ func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
 func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
 	defer close(eventCh)
 
+	// Phase 1 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
+	// When the operator hasn't pinned a session id via the `--session` flag,
+	// allocate one server-side via `POST /v1/sessions` so the WebSocket
+	// payload, pending permission matching, and event-card rendering all
+	// share a single canonical `session_<uuid>` id (instead of the local
+	// `session_go_<unixnano>` placeholder). The locally-generated id is
+	// preserved as `clientSessionId` metadata so the same id can be
+	// reverse-resolved from the client log later.
+	clientSessionID := ""
+	sessionID := cfg.SessionID
+	if sessionID == "" {
+		allocated, err := allocateServerSession(cfg, prompt)
+		if err != nil {
+			eventCh <- streamEvent{err: fmt.Errorf("allocate server session: %w", err)}
+			return
+		}
+		sessionID = allocated
+		clientSessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
+		// Best-effort: write the client↔server mapping to the client
+		// log so a future `bbl inspect-session session_go_...` can
+		// reverse-resolve the server uuid. Failure is non-fatal — the
+		// session still runs; only the reverse lookup is lost.
+		appendClientSessionLog(cfg, clientSessionID, sessionID)
+	}
+
 	wsURL, err := streamURL(cfg.BaseURL)
 	if err != nil {
 		eventCh <- streamEvent{err: err}
@@ -7120,10 +7942,10 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 		}
 	}()
 
-	sessionID := cfg.SessionID
-	if sessionID == "" {
-		sessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
+	if cfg.SessionID != "" {
+		sessionID = cfg.SessionID
 	}
+	_ = clientSessionID // reserved for future use (e.g. local transcript)
 
 	writeMu.Lock()
 	err = conn.WriteJSON(buildExecuteRequest(cfg, sessionID, prompt))
@@ -7150,6 +7972,93 @@ func runStream(cfg Config, prompt string, eventCh chan<- streamEvent, decisions 
 			return
 		}
 	}
+}
+
+// allocateServerSession is the Phase 1 server-side session-id allocator.
+// It calls `POST /v1/sessions` (with `clientSessionId` metadata when
+// available) and returns the server-allocated `session_<uuid>`. If the
+// call fails, the caller should surface the error to the operator
+// rather than fall back to a local id — the WebSocket payload would
+// then carry a session id that the server doesn't have a row for,
+// which is the exact `session_go_1781146359507755000` failure mode
+// the governance plan is trying to prevent.
+func allocateServerSession(cfg Config, prompt string) (string, error) {
+	type sessionCreatedResponse struct {
+		Type           string `json:"type"`
+		SessionID      string `json:"sessionId"`
+		ClientSessionID string `json:"clientSessionId"`
+		CreatedAt      string `json:"createdAt"`
+	}
+	// We don't have a client-side session id yet at this point; the
+	// call site generates it as `session_go_<unixnano>` and passes it
+	// back via a follow-up log line. We still want the server to know
+	// we have a stable Go TUI client, so we send a minimal marker.
+	body := map[string]any{
+		"cwd":    cfg.Cwd,
+		"metadata": map[string]any{
+			"client": "go-tui",
+			"phase":  "session_allocate",
+		},
+	}
+	var resp sessionCreatedResponse
+	if err := nexusJSON(cfg, http.MethodPost, "/v1/sessions", body, &resp); err != nil {
+		return "", err
+	}
+	if resp.SessionID == "" {
+		return "", fmt.Errorf("server returned empty sessionId for POST /v1/sessions")
+	}
+	return resp.SessionID, nil
+}
+
+// appendClientSessionLog writes the client↔server session id mapping
+// to `~/.babel-o/log/go-tui-session.log`. Best-effort: failure to
+// write is non-fatal. The Phase 0 `bbl inspect-session` CLI uses
+// this log to reverse-resolve `session_go_<unixnano>` ids to the
+// server-allocated uuid.
+//
+// Line format (tab-separated, line-prefixed timestamp):
+//   [YYYY-MM-DDTHH:MM:SS+ZZ:ZZ]\tclientSessionId=session_go_xxx\tserverSessionId=session_<uuid>
+func appendClientSessionLog(cfg Config, clientSessionID, serverSessionID string) {
+	// Honour BABEL_O_CONFIG_DIR override (mirrors `inspectSession.ts`
+	// Phase 0 logic) so tests can redirect the log path.
+	configDir := resolveClientConfigDir()
+	logDir := filepath.Join(configDir, "log")
+	logPath := filepath.Join(logDir, "go-tui-session.log")
+	line := fmt.Sprintf(
+		"%s\tclientSessionId=%s\tserverSessionId=%s\n",
+		time.Now().Format(time.RFC3339),
+		clientSessionID,
+		serverSessionID,
+	)
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		return
+	}
+	// Append (O_APPEND|O_CREATE|O_WRONLY).
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	_, _ = f.WriteString(line)
+}
+
+// resolveClientConfigDir mirrors the Phase 0 `resolveConfigDir` helper
+// in `src/cli/commands/inspectSession.ts`: honour `BABEL_O_CONFIG_DIR`
+// / `BABEL_O_CONFIG_FILE` overrides so tests can redirect. We can't
+// import the TS helper, so we re-implement the resolution here —
+// same three-tier precedence.
+func resolveClientConfigDir() string {
+	if dir := os.Getenv("BABEL_O_CONFIG_DIR"); dir != "" {
+		return dir
+	}
+	if file := os.Getenv("BABEL_O_CONFIG_FILE"); file != "" {
+		return filepath.Dir(file)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return ".babel-o"
+	}
+	return filepath.Join(home, ".babel-o")
 }
 
 func streamURL(base string) (string, error) {
@@ -7502,6 +8411,23 @@ func max(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func clamp(value, lo, hi int) int {
+	if value < lo {
+		return lo
+	}
+	if value > hi {
+		return hi
+	}
+	return value
 }
 
 func (m *model) expandPromptPlaceholders(prompt string) string {

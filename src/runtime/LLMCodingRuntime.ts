@@ -10,7 +10,8 @@ import type {
   RuntimeExecuteOptions,
   RuntimeToolAuditEntry,
 } from './Runtime.js'
-import type { ToolPolicy } from './LocalCodingRuntime.js'
+import { allowAllTools, allowlistedTools, type ToolPolicy } from './LocalCodingRuntime.js'
+import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
 import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
@@ -126,6 +127,23 @@ export class LLMCodingRuntime implements NexusRuntime {
   }
 
   async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    // Phase D of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+    // when the request body carries `allowedTools`, apply a per-turn
+    // allowlist-based policy override. The override is scoped to this
+    // turn only — the next turn re-evaluates from the (possibly
+    // different) body. `policyMode: 'soft-deny'` continues to work
+    // orthogonally: allowedTools controls the *policy* (which tools
+    // are isAllowed), while policyMode controls whether the
+    // *hard-deny* gate fires for tools outside the allowlist.
+    if (options.allowedTools && options.allowedTools.length > 0) {
+      const overridePolicy = buildPerRequestAllowedToolsPolicy(options.allowedTools)
+      yield* this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
+      return
+    }
+    yield* this.runExecuteStreamInner(options)
+  }
+
+  private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
     const resolvedCwd = resolveCwdFromPrompt(options.prompt, options.cwd)
     if (resolvedCwd !== options.cwd) {
       options.cwd = resolvedCwd

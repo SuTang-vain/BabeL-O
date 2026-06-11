@@ -201,6 +201,16 @@ export const PermissionRequestEventSchema = z.object({
   input: z.unknown(),
   risk: z.enum(['read', 'write', 'execute', 'task']),
   message: z.string().optional(),
+  /**
+   * Model-suggested allow rule (e.g. `cd:./repo`, `git:status`,
+   * `npm install`). Surfaced from the tool's `suggestedAllowRule`
+   * plus a per-input deriver. The Go TUI permission panel
+   * presents it to the user as the default rule for the
+   * "Approve for this session" and "Approve with editable rule"
+   * options. Optional; when absent the panel falls back to a
+   * placeholder ("<tool-name>:*").
+   */
+  suggestedRule: z.string().optional(),
   source: z.object({
     type: z.enum(['builtin', 'mcp']),
     serverName: z.string().optional(),
@@ -213,6 +223,27 @@ export const PermissionResponseEventSchema = z.object({
   ...baseEventFields,
   toolUseId: z.string(),
   approved: z.boolean(),
+  /**
+   * Scope of the decision (Phase A.1 of the enhanced permission
+   * panel):
+   *   - 'once' (default): apply to the current call only.
+   *   - 'session': apply the rule to the remainder of the session;
+   *     requires `rule` to be set.
+   *   - 'rule' (future): persist a custom rule (e.g. user-edited);
+   *     requires `rule` to be set.
+   */
+  scope: z.enum(['once', 'session', 'rule']).optional(),
+  /**
+   * The actual allow rule when `scope` is 'session' or 'rule'.
+   * Ignored for scope='once'.
+   */
+  rule: z.string().optional(),
+  /**
+   * User feedback text the model should act on (typically
+   * paired with `approved: false` for the
+   * "Reject, tell the model what to do instead" path).
+   */
+  feedback: z.string().optional(),
   reason: z.string().optional(),
 })
 

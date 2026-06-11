@@ -22,6 +22,8 @@ import type { MemoryProvider } from '../runtime/memoryProvider.js'
 import type { EverCoreClient } from '../runtime/everCoreClient.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
+import * as os from 'node:os'
+import * as path from 'node:path'
 
 export type CreateDefaultNexusRuntimeOptions = {
   storagePath?: string
@@ -56,9 +58,34 @@ export async function createDefaultNexusRuntime(
       tools.set(name, tool)
     }
   }
-  const storage = options.storagePath
-    ? new SqliteStorage(options.storagePath)
-    : new MemoryStorage()
+  // Phase 2 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
+  // When `storagePath` is not explicitly set, fall back to the
+  // shared `~/.babel-o/db.sqlite` (honouring `BABEL_O_CONFIG_DIR` /
+  // `BABEL_O_CONFIG_FILE` overrides) rather than `MemoryStorage`.
+  // The previous `MemoryStorage` default meant any `bbl go`
+  // embedded Nexus instance lost all session data on exit — the
+  // exact failure mode that hid `session_go_1781146359507755000`.
+  //
+  // MemoryStorage is now reserved for the **explicit opt-in** path:
+  // callers pass `storagePath: ':memory:'` (or any other sentinel
+  // that maps to an in-memory backend) to keep the old behaviour
+  // for unit tests / short-lived runners.
+  const resolvedStoragePath = resolveDefaultStoragePath(options.storagePath)
+  const storage = resolvedStoragePath.kind === 'sqlite'
+    ? new SqliteStorage(resolvedStoragePath.path)
+    : resolvedStoragePath.kind === 'memory-opt-in'
+    ? new MemoryStorage()
+    : new MemoryStorage() // legacy fallback (see resolveDefaultStoragePath)
+  if (resolvedStoragePath.kind === 'memory-legacy') {
+    // Non-fatal: log a one-line warning so operators understand
+    // why their session isn't being persisted. Phase 3 will
+    // surface this in `~/.babel-o/log/embedded-nexus.log`.
+    console.warn(
+      '[nexus] storagePath=memory is deprecated; ' +
+        'Phase 2 now defaults to ~/.babel-o/db.sqlite. ' +
+        'Pass `storagePath: \':memory:\'` to opt back in.',
+    )
+  }
   const agentScheduler = new ExploreAgentScheduler({
     storage,
     cwd: options.cwd,
@@ -70,8 +97,8 @@ export async function createDefaultNexusRuntime(
       tools.set(name, tool)
     }
   }
-  if (options.storagePath) {
-    configureStorageBridgeWal(`${options.storagePath}.wal.jsonl`, options.storageWal)
+  if (resolvedStoragePath.kind === 'sqlite') {
+    configureStorageBridgeWal(`${resolvedStoragePath.path}.wal.jsonl`, options.storageWal)
   } else {
     configureStorageBridgeWal(null)
   }
@@ -106,4 +133,86 @@ export async function createDefaultNexusRuntime(
       : new LLMCodingRuntime(tools, policy, storage, configManager, options.memoryProvider)
 
   return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner }
+}
+
+/**
+ * Phase 2 of `docs/nexus/reference/go-tui-session-observability-governance-plan.md`:
+ * Resolve the storage path used by `createDefaultNexusRuntime` when
+ * the caller doesn't pass `storagePath`. Mirrors the Phase 0
+ * `resolveConfigDir` helper in `src/cli/commands/inspectSession.ts`
+ * (same three-tier precedence: explicit arg → `BABEL_O_CONFIG_DIR`
+ * → `BABEL_O_CONFIG_FILE` → `~/.babel-o`).
+ *
+ * Three return kinds:
+ *   - `'sqlite'`     — use the resolved absolute sqlite path.
+ *   - `'memory-opt-in'` — caller explicitly passed `:memory:`
+ *     (or `NODE_ENV === 'test'` is set). Use `MemoryStorage` and
+ *     stay silent. The `NODE_ENV === 'test'` branch preserves
+ *     the test isolation invariant for the 100+ existing tests
+ *     that call `createDefaultNexusRuntime()` without an explicit
+ *     storage path; the plan's hard invariant is "BabeL-O tests
+ *     must never read from or write to the user's real
+ *     `~/.babel-o/config.json`" (memory `babel-o-test-config-isolation`).
+ *   - `'memory-legacy'` — caller passed an unrecognised non-sqlite
+ *     value. Use `MemoryStorage` but emit a deprecation warning.
+ *     The deprecation window gives unit tests and short-lived
+ *     runners time to migrate to explicit opt-in.
+ */
+export type ResolvedStoragePath =
+  | { kind: 'sqlite'; path: string }
+  | { kind: 'memory-opt-in' }
+  | { kind: 'memory-legacy' }
+
+export function resolveDefaultStoragePath(
+  explicitPath: string | undefined,
+): ResolvedStoragePath {
+  // Test isolation guard: when `NODE_ENV === 'test'` (set by
+  // node:test / jest / mocha), default to `MemoryStorage`
+  // unless the caller explicitly opts into sqlite. The 100+
+  // existing tests that call `createDefaultNexusRuntime()`
+  // without arguments will then continue to use the
+  // per-process in-memory backend, never touching the
+  // user's real `~/.babel-o/db.sqlite`.
+  //
+  // This is the smallest possible invasive change that
+  // preserves the test isolation invariant while still
+  // flipping the production default to sqlite (Phase 2's
+  // primary goal).
+  if (explicitPath === undefined && process.env.NODE_ENV === 'test') {
+    return { kind: 'memory-opt-in' }
+  }
+  if (explicitPath !== undefined) {
+    // Recognised opt-in: `:memory:` keeps the old per-process
+    // behaviour for unit tests and short-lived runners.
+    if (explicitPath === ':memory:') {
+      return { kind: 'memory-opt-in' }
+    }
+    // Anything else is treated as a sqlite path (relative or
+    // absolute). We resolve to an absolute path so embedded
+    // Nexus instances don't accidentally write to the wrong
+    // cwd-relative location.
+    const absolute = resolveAbsolutePath(explicitPath)
+    return { kind: 'sqlite', path: absolute }
+  }
+  // No explicit path → default to the shared ~/.babel-o/db.sqlite.
+  // Honours BABEL_O_CONFIG_DIR / BABEL_O_CONFIG_FILE for test
+  // isolation (mirrors `resolveConfigDir` in inspectSession.ts).
+  const configDir = resolveConfigDirForStorage()
+  return { kind: 'sqlite', path: joinPath(configDir, 'db.sqlite') }
+}
+
+function resolveAbsolutePath(p: string): string {
+  return path.isAbsolute(p) ? p : path.resolve(p)
+}
+
+function joinPath(...parts: string[]): string {
+  return path.join(...parts)
+}
+
+function resolveConfigDirForStorage(): string {
+  const fromDir = process.env.BABEL_O_CONFIG_DIR
+  if (fromDir) return fromDir
+  const fromFile = process.env.BABEL_O_CONFIG_FILE
+  if (fromFile) return joinPath(fromFile, '..')
+  return joinPath(os.homedir(), '.babel-o')
 }

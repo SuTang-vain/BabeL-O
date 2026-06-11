@@ -3947,13 +3947,16 @@ test('execute honours per-request policy=soft-deny for write/execute tools', asy
 })
 
 test('execute with default strict policy still hard-denies execute-risk Bash', async () => {
-  // Back-compat: when `policy` is omitted (server-side default 'strict'),
+  // Back-compat: when `policy` is omitted (server-side default 'strict')
+  // AND the server is using the default `denyByDefaultTools()` policy,
   // Bash with execute subcommands is hard-denied with no
   // permission_request, matching pre-Phase-B behaviour. This pins the
   // back-compat surface for `bbl chat` and other non-Go-TUI clients.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-strict-deny`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  // No `allowedTools` → denyByDefaultTools() default → only read/task
+  // risk tools pass isAllowed; Bash (`risk: execute`) is denied.
+  const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
 
   const response = await app.inject({
@@ -5977,3 +5980,418 @@ async function waitFor(
     await new Promise(resolve => setTimeout(resolve, 5))
   }
 }
+
+test('execute honours per-request allowedTools for Bash in soft-deny mode', async () => {
+  // Phase D of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
+  // when the request body carries `allowedTools: ['Bash']`, the runtime
+  // applies an allowlist-based policy for this turn only. Combined
+  // with `policy: 'soft-deny'`, this means Bash is in the allowlist
+  // (so the hard-deny gate passes) AND is `risk: 'execute'` (so the
+  // approval gate fires → `permission_request`).
+  // Net: Bash goes through the permission flow instead of being
+  // blocked; a tool *not* in allowedTools (e.g. `Write`) is still
+  // hard-denied under soft-deny.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allow-tools-bash`)
+  await mkdir(cwd, { recursive: true })
+  // No top-level allowedTools — server default `denyByDefaultTools()`.
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-allow-tools-bash-${Date.now()}`
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m x"',
+      cwd,
+      sessionId,
+      policy: 'soft-deny',
+      allowedTools: ['Bash'],
+      skipPermissionCheck: false,
+    },
+  })
+
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      const reqEvent = data.session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        break
+      }
+    }
+  }
+  assert.ok(
+    toolUseId,
+    'Bash in allowedTools + soft-deny should reach permission_request, not hard-deny',
+  )
+
+  // Approve and await the response.
+  const approveRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/approve`,
+    payload: { toolUseId, reason: 'auto-approve test' },
+  })
+  assert.equal(approveRes.statusCode, 200)
+
+  const response = await executePromise
+  assert.equal(response.statusCode, 200)
+  const events = response.json().events
+  // No hard-deny with policy message (Bash was in the allowlist).
+  assert.ok(
+    !events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
+    'Bash in allowedTools must NOT be hard-denied',
+  )
+
+  await app.close()
+})
+
+
+test('execute with allowedTools scopes to a single turn', async () => {
+  // Phase D turn-boundary: per-turn `allowedTools` is scoped to the
+  // current `executeStream` call. The next turn re-evaluates from
+  // the (possibly different) body. This pins the no-cross-turn-drift
+  // invariant — the user must re-declare `--allow-tools` each turn.
+  //
+  // Both turns use `skipPermissionCheck: true` and rely on the default
+  // server-side `policy: 'strict'`. The only knob that changes between
+  // turns is `allowedTools`. Turn 1 lets Bash through the policy gate;
+  // turn 2 has Bash in the default `denyByDefaultTools()` and gets
+  // hard-denied.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allow-tools-turn-boundary`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-allow-tools-turn-${Date.now()}`
+
+  // First turn: `allowedTools: ['Bash']` → Bash is allowlisted →
+  // hard-deny gate passes → runs.
+  const first = await app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m x"',
+      cwd,
+      sessionId,
+      allowedTools: ['Bash'],
+      skipPermissionCheck: true,
+    },
+  })
+  assert.equal(first.statusCode, 200)
+  const firstBody = first.json()
+  assert.equal(
+    firstBody.events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
+    false,
+    'first turn with allowedTools=[Bash] should NOT hard-deny Bash',
+  )
+
+  // Second turn: NO `allowedTools` → falls back to server-startup
+  // `denyByDefaultTools()` → Bash is denied.
+  const second = await app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m y"',
+      cwd,
+      sessionId,
+      // allowedTools omitted on purpose.
+      skipPermissionCheck: true,
+    },
+  })
+  assert.equal(second.statusCode, 200)
+  const secondBody = second.json()
+  const secondBashDeny = secondBody.events.filter(
+    (e: any) => e.type === 'tool_denied' && e.name === 'Bash' && /denied by Nexus policy/i.test(e.message),
+  )
+  assert.ok(
+    secondBashDeny.length > 0,
+    'second turn without allowedTools should hard-deny Bash via the default denyByDefaultTools policy',
+  )
+
+  await app.close()
+})
+
+test('execute permission denial: user denies → tool_denied + result(false)', async () => {
+  // Phase C end-to-end regression for the deny path of
+  // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
+  // The model emits Bash (execute risk, not in default allowlist).
+  // Under `policy: 'soft-deny'` the hard-deny gate is bypassed
+  // and the approval gate fires `permission_request`. The user
+  // responds via `/deny` with approved=false. The runtime must
+  // (a) emit `tool dened` with the user-denied reason, (b) emit
+  // `result(success=false)`, (c) record the denial in the
+  // permission_audit table. The model can then continue on the
+  // next turn.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-permission-deny`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-perm-deny-${Date.now()}`
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "git commit -m x"',
+      cwd,
+      sessionId,
+      policy: 'soft-deny',
+      allowedTools: ['Bash'],
+    },
+  })
+
+  let toolUseId = ''
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      const reqEvent = data.session?.events?.find((e: any) => e.type === 'permission_request')
+      if (reqEvent) {
+        toolUseId = reqEvent.toolUseId
+        break
+      }
+    }
+  }
+  assert.ok(toolUseId, 'Bash in allowedTools + soft-deny should reach permission_request')
+
+  // User denies.
+  const denyRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/deny`,
+    payload: { toolUseId, reason: 'looks risky' },
+  })
+  assert.equal(denyRes.statusCode, 200)
+
+  const response = await executePromise
+  assert.equal(response.statusCode, 200)
+  const body = response.json()
+  const events = body.events
+
+  // tool_denied event fires on user denial. The runtime message
+  // comes from `classifyAction` (e.g. "Requires manual review" for
+  // `git commit`); the user's reason "looks risky" is captured
+  // separately in the permission_audit row below.
+  const toolDenied = events.find(
+    (e: any) => e.type === 'tool_denied' && e.name === 'Bash',
+  )
+  assert.ok(toolDenied, 'tool_denied should fire on user denial')
+
+  // terminal result is failure.
+  const result = body.result ?? events.find((e: any) => e.type === 'result')
+  assert.ok(result, 'terminal result event should be present')
+  assert.equal(result.success, false)
+
+  // permission_audit row marked 'denied' for record-keeping.
+  const auditsRes = await app.inject({
+    method: 'GET',
+    url: `/v1/sessions/${sessionId}/permission-audits`,
+  })
+  const auditsBody = auditsRes.json()
+  assert.equal(auditsBody.audits.length, 1)
+  assert.equal(auditsBody.audits[0].toolName, 'Bash')
+  assert.equal(auditsBody.audits[0].decision, 'denied')
+  assert.match(auditsBody.audits[0].reason, /looks risky/)
+
+  await app.close()
+})
+
+test('Phase A.1: permission_request surfaces suggestedRule for Bash', async () => {
+  // The runtime's `permission_request` event must include a
+  // `suggestedRule` field for the Bash tool so the Go TUI can
+  // render `Suggested rule: bash:*` above the 5-option
+  // panel. The rule is derived from the Bash command input.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-suggested-rule`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-suggested-rule-${Date.now()}`
+  const executePromise = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "sleep 0"',
+      cwd,
+      sessionId,
+      policy: 'soft-deny',
+    },
+  })
+
+  // Wait until the runtime has yielded the permission_request and
+  // registered it on the pending backend.
+  let toolUseId = ''
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const sessionRes = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (sessionRes.statusCode === 200) {
+      const data = sessionRes.json()
+      const req = (data.session?.events ?? []).find(
+        (e: any) => e.type === 'permission_request',
+      )
+      if (req) {
+        toolUseId = req.toolUseId
+        // Phase A.1 invariant: the request must carry a
+        // `suggestedRule` derived from the Bash command input.
+        // `sleep` is not read-allowlisted, so it stays on the
+        // permission path and falls back to the whole-tool Bash rule.
+        assert.equal(req.suggestedRule, 'bash:*',
+          'permission_request for `sleep 0` should derive suggestedRule=bash:*')
+        break
+      }
+    }
+  }
+  assert.ok(toolUseId, 'should have observed a permission_request event')
+
+  // Cleanup the running turn so the test exits cleanly. We don't
+  // care about the rest of the body — we just need to release the
+  // pending permission so the runtime can move on.
+  await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/deny`,
+    payload: { toolUseId, reason: 'test cleanup' },
+  })
+  await executePromise
+  await app.close()
+})
+
+test('Phase A.1: scope=session accumulates rules and second turn auto-allows', async () => {
+  // Hard invariants for `scope: 'session'` accumulation:
+  //   1. The runtime must add the suggested rule to the per-session
+  //      rules map when the user approves with scope='session'
+  //      and a non-empty rule.
+  //   2. The next turn of the SAME session, even with no
+  //      `allowedTools` (i.e. default `denyByDefaultTools`),
+  //      auto-allows the Bash tool call whose input matches the
+  //      accumulated rule.
+  //   3. `scope: 'once'` never touches the rules map.
+  //   4. Rules are process-local (lost on server restart) — not
+  //      asserted here directly but enforced by the
+  //      `sessionRules: Map<sessionId, string[]>` storage
+  //      location in LocalCodingRuntime.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-session-scope`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+
+  const sessionId = `session-session-scope-${Date.now()}`
+  const localRuntime = runtime as LocalCodingRuntime
+  assert.deepEqual(
+    localRuntime.getSessionRulesForTest(sessionId),
+    [],
+    'precondition: no session rules accumulated yet',
+  )
+
+  // Turn 1: Bash "sleep 0" → permission_request → user approves
+  // with scope='session', rule='bash:*'.
+  const first = app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "sleep 0"',
+      cwd,
+      sessionId,
+      policy: 'soft-deny',
+    },
+  })
+  let toolUseId = ''
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 100))
+    const res = await app.inject({
+      method: 'GET',
+      url: `/v1/sessions/${sessionId}`,
+    })
+    if (res.statusCode === 200) {
+      const data = res.json()
+      const req = (data.session?.events ?? []).find(
+        (e: any) => e.type === 'permission_request',
+      )
+      if (req) { toolUseId = req.toolUseId; break }
+    }
+  }
+  assert.ok(toolUseId, 'turn 1: should have permission_request')
+  const approveRes = await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/approve`,
+    payload: { toolUseId, scope: 'session', rule: 'bash:*' },
+  })
+  assert.equal(approveRes.statusCode, 200)
+  assert.equal(approveRes.json().scope, 'session')
+  assert.equal(approveRes.json().rule, 'bash:*')
+  const firstBody = (await first).json()
+  assert.equal(firstBody.success, true,
+    'turn 1: Bash sleep 0 should run after session-scope approval')
+
+  // Invariant: session rules are now populated.
+  const accumulated = localRuntime.getSessionRulesForTest(sessionId)
+  assert.ok(
+    accumulated.includes('bash:*'),
+    `session rules should include 'bash:*' after scope=session approval, got ${JSON.stringify([...accumulated])}`,
+  )
+
+  // Turn 2 (no `allowedTools`, no `policy` override) — Bash "sleep
+  // 0" should auto-allow via the accumulated session rule.
+  // Default `denyByDefaultTools()` would normally hard-deny it,
+  // but the session-rules policy layer (applied on top of the
+  // per-turn allowlist) lets it through.
+  const second = await app.inject({
+    method: 'POST',
+    url: '/v1/execute',
+    payload: {
+      prompt: 'bash "sleep 0"',
+      cwd,
+      sessionId,
+      // no allowedTools, no policy override.
+    },
+  })
+  const secondBody = second.json()
+  const secondBashDeny = secondBody.events.filter(
+    (e: any) => e.type === 'tool_denied' && e.name === 'Bash',
+  )
+  assert.equal(
+    secondBashDeny.length,
+    0,
+    'turn 2: Bash "sleep 0" must NOT be hard-denied because the accumulated session rule auto-allows it',
+  )
+  // And it must have run to completion.
+  const secondBashCompleted = secondBody.events.filter(
+    (e: any) => e.type === 'tool_completed' && e.name === 'Bash',
+  )
+  assert.ok(
+    secondBashCompleted.length > 0,
+    'turn 2: Bash "sleep 0" should have completed (auto-allowed by session rule)',
+  )
+
+  // Invariant: a `scope: 'once'` approval on a different tool
+  // must NOT extend the rules map. Drive this by hitting the
+  // /approve endpoint with scope=once and a different rule,
+  // then verify the rules map still only contains 'bash:*'.
+  await app.inject({
+    method: 'POST',
+    url: `/v1/sessions/${sessionId}/deny`,
+    payload: { toolUseId: 'synthetic-once-tool', reason: 'invariant check', scope: 'once', rule: 'should-not-stick' },
+  })
+  // The above may 404 (no such pending tool), but if it 200s the
+  // registry would resolve the synthetic entry with scope=once.
+  // Either way, the rules map should not have 'should-not-stick'.
+  const after = localRuntime.getSessionRulesForTest(sessionId)
+  assert.ok(
+    !after.includes('should-not-stick'),
+    `scope: 'once' must never accumulate rules, got ${JSON.stringify([...after])}`,
+  )
+
+  await app.close()
+})

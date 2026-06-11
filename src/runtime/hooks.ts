@@ -1,6 +1,7 @@
 import { setTimeout as delay } from 'node:timers/promises'
 import { errorMessage } from '../shared/errors.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import { type PermissionResolution } from '../shared/session.js'
 import type { HooksConfig } from '../shared/config.js'
 import type { ToolRisk } from '../tools/Tool.js'
 
@@ -282,7 +283,7 @@ export function mergeHookRetryHints(message: string, hookResult: HookExecutionRe
 
 export function firstHookPermissionDecision(
   hookResult: HookExecutionResult,
-): { approved: boolean; reason?: string } | undefined {
+): PermissionResolution | undefined {
   return aggregateHookResults(hookResult).permissionDecision
 }
 

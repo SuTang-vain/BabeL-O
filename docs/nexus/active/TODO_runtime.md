@@ -82,6 +82,25 @@ Provider 偏差校准基础已收口：50K JSON schema、10K 中文、长 tool_r
 
 当前 `/context` 诊断增强和展示一致性回归已收口；若后续真实会话出现展示漂移，再补最小回归。
 
+## 已收口 Go TUI Permission Policy / Bash Hard-Deny 治理
+
+> 详细规划见 [go-tui-permission-policy-governance-plan.md](../reference/go-tui-permission-policy-governance-plan.md)。真实样本：`session_go_1781076550805204000`（Go TUI WebSocket session，sessionId 末段 204000）。
+
+- Phase A — Bash read-only subcommand 自动放行已收口：`src/tools/builtin/bashClassifier.ts` 新建 230 行纯函数 `classifyBashRisk`（read-only 白名单 + git 拒绝子命令黑名单 + find `-type f` 特殊处理 + 30+ 危险 pattern 二次校验）；`src/tools/Tool.ts` `ToolDefinition` 加 `riskForInput?: (input: any) => ToolRisk` 字段；`src/runtime/LocalCodingRuntime.ts` 与 `src/runtime/LLMCodingRuntime.ts` 新增 private `effectiveRisk` helper，hard-deny gate + approval gate 都用 `effectiveRisk` 判定。Go TUI 默认 provider 是 `local`，所以 `LocalCodingRuntime` 必须同样支持 `riskForInput` 才能让 Go TUI 跑得动——这个边界在 plan 阶段未识别，靠 Phase A 第一个 Nexus focused test 间接暴露。
+- Phase B — soft-deny policy per-request override 已收口：`src/nexus/app.ts` `executeSchema` 加 `policy: z.enum(['strict', 'soft-deny']).optional()` + `CreateNexusAppOptions` 加 `executePolicyMode?: 'strict' | 'soft-deny'`（server-side 默认值，默认 `'strict'` 保 back-compat）；`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `policyMode?: 'strict' | 'soft-deny'`；`src/runtime/LocalCodingRuntime.ts` hard-deny gate 改为 `if (effectiveRisk !== 'read' && !this.toolPolicy.isAllowed(tool) && options.policyMode !== 'soft-deny')`——**核心改动仅一行**，soft-deny 仅 bypass hard-deny 让既有 approval gate 自然触发 `permission_request`。
+- Phase C — 端到端 mock provider regression 已收口（含 bug 修复）：`src/runtime/LocalCodingRuntime.ts:4465` `case "result", "error"` 之前不重置 `m.inputMode`，导致 permission denied 流程后 model 卡在 `modePermission` 不出来，textinput 吞掉非 `a/y/n/r/esc` 键；修复为显式 `m.setMode(modeComposing)`。`test/runtime.test.ts` 新增 `execute permission denial: user denies → tool denied + result(false)` 端到端测试。
+- Phase D — Go TUI `--allow-tools` flag 已收口：`src/runtime/perRequestPolicy.ts` 新建独立模块（避免 `LLMCodingRuntime` ↔ `LocalCodingRuntime` 循环 import）——导出 `buildPerRequestAllowedToolsPolicy(allowedTools)` helper，镜像 server-startup policy 解析（`*` / `all` → `allowAllTools`；否则 → `allowlistedTools`）。`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `allowedTools?: readonly string[]` 字段。`src/runtime/LLMCodingRuntime.ts:128-143` 与 `src/runtime/LocalCodingRuntime.ts:109-127` `executeStream` wrapper：`options.allowedTools` 非空时构造 override policy、用 `withToolPolicy` 包裹 inner body（`runExecuteStreamInner` 抽到私有方法）。
+
+**守住的边界**：
+- `denyByDefaultTools()` / `allowAllTools()` / `allowlistedTools()` 三个 policy builder 签名未动
+- approval gate 自身完全未动；`permission_request` / `permission_response` / `tool denied` 事件 schema 未改
+- `bbl chat` 与 HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）
+- child AgentLoop 仍走 server-startup policy，不被 per-request `policy` / `allowedTools` 影响
+- workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截（独立机制）
+- `error.code` 分类口径（`REQUEST_TIMEOUT` / `REQUEST_CANCELLED` / `RUNTIME_AGENT_STEP_ERROR`）未动
+
+后续只在以下情形重新开项：(1) 真实会话继续暴露 runtime tool policy drift；(2) 真实用户反馈 approval gate 需要更细的 read / write / execute 三档区分；(3) Power-user 需要 `allowedTools` 之外的"自动 approve 一组 command" 等新 opt-in 模式。
+
 ## 已归档 Tool Discovery / Targeted Reading 第一阶段
 
 Tool Discovery / Targeted Reading 第一阶段已归档到 [DONE.md](../DONE.md)：`ListDir` 已在后续工具边界切片中作为正交目录 inventory 工具落地；`Glob` 用于 path pattern discovery，`Grep` 用于 content locating，`Read` preview / truncated result / repeat ledger 引导 targeted range 读取，避免重复灌入大文件。

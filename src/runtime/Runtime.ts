@@ -34,6 +34,28 @@ export type RuntimeExecuteOptions = {
    *     tools so the user can approve via the Go TUI permission panel.
    */
   policyMode?: 'strict' | 'soft-deny'
+  /**
+   * Per-request tool allowlist (Phase D of
+   * docs/nexus/reference/go-tui-permission-policy-governance-plan.md).
+   * When set, the runtime temporarily applies an allowlist-based
+   * policy for this turn only; the next turn re-evaluates from the
+   * (possibly different) body. Empty / omitted → no per-turn override;
+   * the server-startup `denyByDefaultTools()` (or whichever policy
+   * the runtime was constructed with) applies. `*` / `all` →
+   * allowAllTools. `policyMode: 'soft-deny'` continues to work
+   * orthogonally: allowedTools controls *which* tools are isAllowed,
+   * while policyMode controls *whether* the hard-deny gate fires
+   * for tools outside the allowlist.
+   */
+  allowedTools?: readonly string[]
+  /**
+   * Internal runtime carry-over for user-approved `scope=session`
+   * permission rules. Unlike `allowedTools`, these rules represent
+   * an explicit user approval from an earlier turn in the same
+   * session, so a matching write/execute tool call may skip the
+   * permission prompt for that session only.
+   */
+  sessionApprovedRules?: readonly string[]
   contextFork?: {
     mode: string
     inheritedItems: number

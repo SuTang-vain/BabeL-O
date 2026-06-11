@@ -61,7 +61,29 @@ export type SessionSnapshot = {
   metadata?: Record<string, unknown>
 }
 
-export type PermissionResolution = { approved: boolean; reason?: string }
+export type PermissionResolution = {
+  approved: boolean
+  reason?: string
+  /**
+   * Scope of the decision (Phase A.1 of the enhanced permission
+   * panel). Defaults to 'once' for back-compat. When set to
+   * 'session', `rule` must be present and the runtime
+   * accumulates it under the session for the remainder of
+   * that session's turns.
+   */
+  scope?: 'once' | 'session' | 'rule'
+  /**
+   * Allow rule for `scope: 'session' | 'rule'`; ignored for
+   * `scope: 'once'`.
+   */
+  rule?: string
+  /**
+   * Free-form user feedback text the model should act on
+   * (typically paired with `approved: false` for the
+   * "Reject, tell the model what to do instead" path).
+   */
+  feedback?: string
+}
 
 export type PendingPermissionEntry = {
   sessionId: string
