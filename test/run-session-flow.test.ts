@@ -2,6 +2,7 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT,
+  resolveCliPolicyMode,
   resolveFinalSessionOutcome,
 } from '../src/cli/runSessionFlow.js'
 import type { NexusEvent } from '../src/shared/events.js'
@@ -117,4 +118,57 @@ test('resolveFinalSessionOutcome does not reuse an older turn result when curren
   assert.equal(outcome.result, undefined)
   assert.match(outcome.error ?? '', /without a result or error event/)
   assert.equal(outcome.terminalReason?.code, REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT)
+})
+
+test('resolveCliPolicyMode defaults to soft-deny to match Go TUI (Phase B 推进)', () => {
+  // Phase B 推进: `bbl chat` (embedded + --url service mode) now
+  // sends `policyMode: 'soft-deny'` by default, mirroring the Go
+  // TUI's hardcoded behavior. Without this, write/execute tools
+  // reach the `LocalCodingRuntime` hard-deny gate first and never
+  // see `permission_request` — operators have no way to approve.
+  const prev = process.env.BABEL_O_CLI_POLICY_MODE
+  delete process.env.BABEL_O_CLI_POLICY_MODE
+  try {
+    assert.equal(resolveCliPolicyMode(), 'soft-deny')
+  } finally {
+    if (prev === undefined) delete process.env.BABEL_O_CLI_POLICY_MODE
+    else process.env.BABEL_O_CLI_POLICY_MODE = prev
+  }
+})
+
+test('resolveCliPolicyMode honours explicit strict opt-in', () => {
+  // Power users can opt back into the old hard-deny behavior by
+  // setting BABEL_O_CLI_POLICY_MODE=strict. This restores the
+  // Phase A default where the server's `denyByDefaultTools()`
+  // policy hard-denies write/execute tools.
+  const prev = process.env.BABEL_O_CLI_POLICY_MODE
+  process.env.BABEL_O_CLI_POLICY_MODE = 'strict'
+  try {
+    assert.equal(resolveCliPolicyMode(), 'strict')
+  } finally {
+    if (prev === undefined) delete process.env.BABEL_O_CLI_POLICY_MODE
+    else process.env.BABEL_O_CLI_POLICY_MODE = prev
+  }
+})
+
+test('resolveCliPolicyMode tolerates soft-deny variants and typos', () => {
+  // Accept common casing/whitespace variants for soft-deny so the
+  // operator can paste from documentation without crashing.
+  // Unknown / typo values fall back to 'soft-deny' (the safe
+  // default) so a typo doesn't silently downgrade safety.
+  const prev = process.env.BABEL_O_CLI_POLICY_MODE
+  try {
+    process.env.BABEL_O_CLI_POLICY_MODE = 'SOFT-DENY'
+    assert.equal(resolveCliPolicyMode(), 'soft-deny')
+    process.env.BABEL_O_CLI_POLICY_MODE = '  softdeny  '
+    assert.equal(resolveCliPolicyMode(), 'soft-deny')
+    process.env.BABEL_O_CLI_POLICY_MODE = 'soft_deny'
+    assert.equal(resolveCliPolicyMode(), 'soft-deny')
+    // Typo: keep safe default.
+    process.env.BABEL_O_CLI_POLICY_MODE = 'soft'
+    assert.equal(resolveCliPolicyMode(), 'soft-deny')
+  } finally {
+    if (prev === undefined) delete process.env.BABEL_O_CLI_POLICY_MODE
+    else process.env.BABEL_O_CLI_POLICY_MODE = prev
+  }
 })

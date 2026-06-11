@@ -13,6 +13,7 @@
 - [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。
 - [go-tui-execute-timeout-governance-plan.md](./go-tui-execute-timeout-governance-plan.md): Go TUI WebSocket 请求未覆盖 `timeoutMs` 撞 Nexus 30s 默认导致 `REQUEST_TIMEOUT` 的治理规划；推荐 Go TUI per-request `timeoutMs` 修复。
 - [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md): Bash 在 `denyByDefaultTools()` 下 hard-deny 跳过 `permission_request` 致 Go TUI 权限面板缺位的治理规划；推荐 read-only subcommand 自动放行 + `policy: 'soft-deny'` per-request override 组合。
+- [go-tui-model-persistence-plan.md](./go-tui-model-persistence-plan.md): Go TUI `/model` Step 4 提交在 Phase 1 仍是 in-memory only（重启 `bbl go` 即丢失），需在 `POST /v1/runtime/config/select` 接受 `model` 字段并扩展 TUI 端 Step 4 state machine。
 
 ## 维护规则
 

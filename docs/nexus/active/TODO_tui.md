@@ -273,6 +273,56 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - 默认安装和默认测试不强制要求 Go toolchain。
 - §5 路径 C 起的所有配置访问：Go TUI 只通过 Nexus 暴露的 HTTP API 拿到 config profile/active/model 视图，并且只通过受限 `POST /v1/runtime/config/select` 切换已有 profile；不允许 Go TUI 读取本地 `ConfigManager` 私有字段，也不复制 `ConfigManager` 的 schema 决策。
 
+## P1 `/model` 模型持久化
+
+> Phase 1 设计上 `/model` Step 4 是 in-memory only——`m.modelID` 立刻切、但 `bbl go` 重启即丢失，操作员必须切回 `bbl config use` 或 `bbl chat /model` 才能落盘。`clients/go-tui/internal/tui/tui.go:2135-2144` Step 4 Enter 分支的 status 行文案 `"model writeback is CLI-only in Phase 1; run bbl config use ... to persist"` 自证这是设计边界而不是 bug。
+>
+> 详细规划见 [Go TUI `/model` 模型持久化规划](../reference/go-tui-model-persistence-plan.md)。本节是该 reference doc 在 active TODO 的同步桩，承载状态变迁与 watch 触发条件。
+
+### 计划切片
+
+- [ ] Phase 1：Nexus 协议层
+  - 改 `src/nexus/app.ts:765` handler 拆三态（`{profile}` 走 `setActiveProfile` / `{model}` 走 `setDefaultModel` / 互斥 400 `mutually_exclusive` / 缺字段 400 `missing_field` / 未知 model 400 `unknown_model`）；role / roleModel 仍 `not_supported`。
+  - 改 `test/config-endpoints.test.ts` 既有 `rejects model / role switching (CLI-only)` 改为只验 role / roleModel，新增 5 条测试（`missing_field` / `mutually_exclusive` / `switches default model and persists` / `model switch preserves an active profile binding` / `rejects unknown model with 400`）。
+  - 验证：`npx tsc --noEmit` 干净 + `node --import tsx --test test/config-endpoints.test.ts` 22/22。
+- [ ] Phase 2：TUI 客户端
+  - `clients/go-tui/internal/tui/tui.go` 加 `modelSelectMsg` typed struct + `selectRuntimeModel(cfg, modelID) tea.Cmd` + `modelPickSubmitting bool` in-flight 锁字段。
+  - 改 Step 4 Enter 分支：进入 in-flight 态（esc 仍允许退 step） + dispatch `selectRuntimeModel` + 打印 `saving model:` status。
+  - 加 `case modelSelectMsg` Update handler：err 路径留 picker + 清 submitting + 报错；ok 路径 `applyRuntimeConfig` + 打印 `model saved:` + 重置 picker 临时态 + `setMode(modeComposing)`。
+  - 改 `renderModelPickModel` 加 saving 态渲染（spinner + "saving model…"）。
+  - 加 3 个 Go 单测：`TestModelPickStep4EnterFiresSelectCommand` / `TestModelSelectMsgAppliesConfigAndClosesPicker` / `TestModelSelectMsgErrorStaysInPicker`。
+  - 验证：`go test ./...` 154+/154+、`go vet ./...` 干净、重编 binary。
+- [ ] Phase 3：PTY smoke（可选）
+  - `test/go_tui_pty_driver.py` 新 `run_model_persistence_sequence`：bash echo 触发 `session_started` → `/model` → 选 provider → 选 model → 等 `model saved:` → 重启 TUI → 验 header modelId 是新选的。
+  - 需 pre-seed `BABEL_O_CONFIG_FILE` 让 default model 与新选不同（避免 no-op 假阳性）。
+- [ ] Phase 4：收口入库
+  - `docs/nexus/DONE.md` 写收口条目（commit hash + 文件列表 + 测试覆盖 + 验证命令）。
+  - 同步本节到"已收口"，把 `P1 /model 模型持久化` 段落从 active TODO 移除 / 折叠到"已收口 P1 列表"。
+  - 同步 `docs/nexus/reference/go-tui-model-persistence-plan.md` Status 行 → "Phase 1+2+3 全部已落地（治理收口）"。
+
+### UX Caveat（已写明在 reference doc §7，本节作为 watch 触发条件）
+
+`ConfigManager.resolveSettings()` 链：`profile.model > env > role > defaultModel > 'local/coding-runtime'`。当操作员存在 active profile 且 `profile.model` 与 Step 4 选的不一致时，`setDefaultModel` 写入**不**生效于下一个 turn 的 provider call —— server 仍用 `profile.model`。TUI 下一次 `fetchRuntimeConfig` poll 会回 `modelId: <profile.model>`，header 文字会从"刚选的新模型"退回"profile 锁住的模型"。
+
+收口底线：本切片**不**做 y/n overlay 询问是否清 active profile、**不**改 `resolveSettings()` 优先级、**不**自动清 active profile。操作员通过 transcript `model saved:` 状态行 + 下次 poll 回的 `modelId` 自我理解现状。若此 UX 阻断被真实会话标为 P0，则**另起**reference doc 讨论 `model saved + active profile cleared` y/n overlay 切片，不在本规划内增量。
+
+### 触发条件
+
+按以下任一条件重新打开实现项：
+
+- 真实会话或 PTY smoke 暴露 `/model` 切完 model 但下一次 turn 仍用旧 model 致 user-facing confusion
+- 多个用户复现"重启 `bbl go` model 不保留"，且 `bbl config use` 不在 workflow 内的吐槽
+- 收到 `bbl config use` ↔ `bbl go /model` 之间的等价性需求（用户希望两边切换路径完全一致）
+
+触发时不重新设计，沿本规划 + reference doc 推进；若 reference doc 边界需要扩（如包含 api-key / base-URL 持久化），按本 reference doc 12 节"另起姊妹 doc"规则处理，不在本 doc 增量。
+
+### 与已有边界的兼容
+
+- 不动 §5 路径 C 阶段 2 已收口的 `setActiveProfile` 路径
+- 不动 `bbl chat` / `bbl config use` 既有行为；新协议路径与 CLI 路径语义完全等价（`setDefaultModel` 已被 `bbl config use` 使用）
+- 不触碰 `babel-o-auto-model-selection-delayed.md` / `feedback-provider-quota-priority.md` 既定 delay 项
+- 持续边界（上方 bullet 列表）字面不动；本切片只新增 `config/select` 接受 `model` 字段，与 `profile` 路径同属受限端点
+
 ## 验证命令
 
 历史验证覆盖：renderer/input/permission/paste/PTY 基线，slash palette、permission panel、compact Read、input placeholder、read/edit/diff/Grep/Glob/TaskCreate、resume session、paste/input，ask coding question about files，task update/status，sub-agent / AgentLoop，唯一输入框键盘路由，tool picker / model wizard overlay routing，agent running terminal states，MCP tool audit / permission display，history search overlay ownership，长路径/CJK/ANSI/resize 宽度，stale wrapped rows，LSP context mention，file attachment references，image reference metadata，opt-in vim mode，以及 sub-agent running + model/context gauge 组合。

@@ -989,7 +989,7 @@ func TestSendPermissionDecisionReturnsToComposing(t *testing.T) {
 	if m.inputMode != modePermission {
 		t.Fatalf("precondition: inputMode = %q, want %q", m.inputMode, modePermission)
 	}
-	m.sendPermissionDecision(true, "Approved from test")
+	m.sendPermissionDecision(true, "Approved from test", "", "", "")
 	if m.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q after send, want %q", m.inputMode, modeComposing)
 	}
@@ -5080,5 +5080,123 @@ func TestUpDownStillWalkPromptHistoryAfterMouseFix(t *testing.T) {
 	}
 	if after4.input.Value() != "" {
 		t.Fatalf("after walking back to live draft, input = %q, want empty", after4.input.Value())
+	}
+}
+
+// Regression: the /model step-2/3 overlays and the permission
+// inline editor (modePermissionEditRule + modePermissionEditFeedback)
+// must render the input box with a SINGLE "> " prompt, not the
+// pre-fix "  > > …" double-prefix.
+//
+// The fix relied on the fact that m.input.Prompt is already "> "
+// — the overlay used to prepend another "> " literal, producing
+// the user-visible "│ > > Ask BabeL-O" line in the model pick
+// overlay. We assert the rendered overlay no longer contains a
+// "> >" pattern AND still surfaces the input's own prompt so the
+// operator sees a usable input line.
+func TestModelPickApiKeyRendersSinglePromptArrow(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	// setMode wires the mode-specific placeholder; do NOT preset
+	// m.inputMode — setMode short-circuits when the mode is unchanged
+	// and would skip the placeholder swap.
+	m.setMode(modeModelPickApiKey)
+	m.height = 30
+	rendered := m.renderModelPickApiKey(120)
+	if rendered == "" {
+		t.Fatalf("renderModelPickApiKey should be non-empty in modeModelPickApiKey")
+	}
+	if strings.Contains(rendered, "> >") {
+		t.Fatalf("renderModelPickApiKey rendered a double-prompt line; the input line is duplicated.\nfull:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "> paste API key (or accept default)") {
+		t.Fatalf("renderModelPickApiKey missing the mode-specific placeholder; the user should see `> paste API key …`.\nfull:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Ask BabeL-O") {
+		t.Fatalf("renderModelPickApiKey still shows the default 'Ask BabeL-O' placeholder; the /model context should override it.\nfull:\n%s", rendered)
+	}
+}
+
+func TestModelPickBaseURLRendersSinglePromptArrow(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickBaseURL)
+	m.height = 30
+	rendered := m.renderModelPickBaseURL(120)
+	if rendered == "" {
+		t.Fatalf("renderModelPickBaseURL should be non-empty in modeModelPickBaseURL")
+	}
+	if strings.Contains(rendered, "> >") {
+		t.Fatalf("renderModelPickBaseURL rendered a double-prompt line.\nfull:\n%s", rendered)
+	}
+	if !strings.Contains(rendered, "> https://api.example.com") {
+		t.Fatalf("renderModelPickBaseURL missing the mode-specific placeholder.\nfull:\n%s", rendered)
+	}
+	if strings.Contains(rendered, "Ask BabeL-O") {
+		t.Fatalf("renderModelPickBaseURL still shows the default 'Ask BabeL-O' placeholder.\nfull:\n%s", rendered)
+	}
+}
+
+func TestPermissionEditorRendersSinglePromptArrow(t *testing.T) {
+	cases := []struct {
+		name string
+		mode inputMode
+	}{
+		{"rule", modePermissionEditRule},
+		{"feedback", modePermissionEditFeedback},
+	}
+	for _, tc := range cases {
+		t.Run(string(tc.mode), func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			// Do NOT preset m.inputMode — setMode short-circuits
+			// when the mode is unchanged and would skip the
+			// placeholder swap.
+			m.setMode(tc.mode)
+			m.height = 30
+			m.pending = &pendingPermission{
+				name:  "Bash",
+				risk:  "low",
+				input: "ls -la",
+			}
+			rendered := m.renderPermissionEditor(120)
+			if rendered == "" {
+				t.Fatalf("renderPermissionEditor should be non-empty in %q", tc.mode)
+			}
+			if strings.Contains(rendered, "> >") {
+				t.Fatalf("renderPermissionEditor(%s) rendered a double-prompt line.\nfull:\n%s", tc.mode, rendered)
+			}
+			if strings.Contains(rendered, "Ask BabeL-O") {
+				t.Fatalf("renderPermissionEditor(%s) still shows the default 'Ask BabeL-O' placeholder.\nfull:\n%s", tc.mode, rendered)
+			}
+		})
+	}
+}
+
+// TestPlaceholderFollowsMode verifies that setMode swaps the
+// input placeholder to a context-appropriate hint for /model and
+// the permission editor, and that returning to a normal mode
+// restores the default "Ask BabeL-O" placeholder.
+func TestPlaceholderFollowsMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+
+	cases := []struct {
+		mode inputMode
+		want string
+	}{
+		{modeModelPickApiKey, "paste API key (or accept default)"},
+		{modeModelPickBaseURL, "https://api.example.com"},
+		{modePermissionEditRule, "git:status, bash:*, npm:install"},
+		{modePermissionEditFeedback, "tell the model what to do instead"},
+	}
+	for _, tc := range cases {
+		m.setMode(tc.mode)
+		if got := m.input.Placeholder; got != tc.want {
+			t.Fatalf("after setMode(%q) placeholder = %q, want %q", tc.mode, got, tc.want)
+		}
+	}
+
+	// Returning to modeComposing restores the default placeholder
+	// so the bottom input box reads `> Ask BabeL-O` again.
+	m.setMode(modeComposing)
+	if got := m.input.Placeholder; got != "Ask BabeL-O" {
+		t.Fatalf("after setMode(modeComposing) placeholder = %q, want %q", got, "Ask BabeL-O")
 	}
 }

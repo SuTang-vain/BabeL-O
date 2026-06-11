@@ -921,6 +921,31 @@ func (m *model) setMode(next inputMode) {
 		m.permissionOpenedAt = time.Now()
 		m.permissionLastInputAt = time.Now()
 	}
+	// Mode-aware placeholder: the /model and permission-editor
+	// overlays render the input box with context-specific hints so
+	// the operator doesn't see "Ask BabeL-O" while configuring a
+	// provider. The default mode goes back to "Ask BabeL-O".
+	m.input.Placeholder = placeholderForMode(next)
+}
+
+// placeholderForMode returns the input placeholder text appropriate
+// for the given mode. Most modes share "Ask BabeL-O" (the default);
+// the model-pick and permission-editor overlays need their own
+// context so the operator sees a hint that matches the active
+// configuration step.
+func placeholderForMode(mode inputMode) string {
+	switch mode {
+	case modeModelPickApiKey:
+		return "paste API key (or accept default)"
+	case modeModelPickBaseURL:
+		return "https://api.example.com"
+	case modePermissionEditRule:
+		return "git:status, bash:*, npm:install"
+	case modePermissionEditFeedback:
+		return "tell the model what to do instead"
+	default:
+		return "Ask BabeL-O"
+	}
 }
 
 func (m *model) inPermissionGracePeriod() bool {
@@ -4505,7 +4530,9 @@ func (m model) renderModelPickApiKey(width int) string {
 		lines = append(lines, "")
 	}
 	// Render the input box via the standard input model.
-	lines = append(lines, "  > "+m.input.View())
+	// m.input.Prompt is already "> " so we don't add a second
+	// prompt prefix here — that would render as "  > > …".
+	lines = append(lines, "  "+m.input.View())
 	lines = append(lines, "")
 	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
 	return renderOverlayFrame(width, strings.Join(lines, "\n"))
@@ -4520,14 +4547,16 @@ func (m model) renderModelPickBaseURL(width int) string {
 		return ""
 	}
 	provider := m.currentModelProvider()
+	providerID := ""
 	defaultURL := ""
 	if provider != nil {
+		providerID = provider.ID
 		defaultURL = provider.DefaultBaseURL
 	}
-	header := titleStyle.Render(fmt.Sprintf("%s base URL", firstNonEmpty(provider.ID, "Provider")))
+	header := titleStyle.Render(fmt.Sprintf("%s base URL", firstNonEmpty(providerID, "Provider")))
 	hint := mutedStyle.Render(fmt.Sprintf("Press Enter to use %s.", firstNonEmpty(defaultURL, "<provider default>")))
 	lines := []string{header, hint, ""}
-	lines = append(lines, "  > "+m.input.View())
+	lines = append(lines, "  "+m.input.View())
 	lines = append(lines, "")
 	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
 	return renderOverlayFrame(width, strings.Join(lines, "\n"))
@@ -4941,7 +4970,8 @@ func (m model) renderPermission(width int) string {
 //   - "Suggested rule: <rule>"  (only when editing option 3 and
 //     the runtime surfaced a rule; this is the reference the
 //     operator can edit)
-//   - Prompt line: "  > <m.input.View()>"
+//   - Prompt line: "  <m.input.View()>" (input's own Prompt
+//     provides the leading "> ")
 //   - Keyboard hint: "↵ confirm  esc back to options"
 func (m model) renderPermissionEditor(width int) string {
 	if m.pending == nil {
@@ -4969,11 +4999,13 @@ func (m model) renderPermissionEditor(width int) string {
 			rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
 		}
 		rows = append(rows, "")
-		rows = append(rows, "  > "+m.input.View())
+		// m.input.Prompt is already "> " so don't add a second
+		// one — would otherwise render as "  > > …".
+		rows = append(rows, "  "+m.input.View())
 		rows = append(rows, permissionStyle.Render("Edit the allow rule. Examples: git:status, bash:*, npm:install. Empty = plain approve (scope=once)."))
 	} else {
 		rows = append(rows, "")
-		rows = append(rows, "  > "+m.input.View())
+		rows = append(rows, "  "+m.input.View())
 		rows = append(rows, permissionStyle.Render("Tell the model what to do instead. Empty = plain reject (no follow-up hint)."))
 	}
 	rows = append(rows, permissionStyle.Render("↵ confirm   esc back to options"))

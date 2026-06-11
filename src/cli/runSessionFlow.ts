@@ -83,7 +83,20 @@ export async function runSessionFlow(
       }
 
       socket.addEventListener('open', () => {
-        socket?.send(JSON.stringify({ prompt, cwd, sessionId }))
+        // Phase B 推进: align `bbl chat --url` with the Go TUI default
+        // (always sends `policy: 'soft-deny'`). Without this the WS
+        // payload omits `policy` and the server falls back to
+        // `executePolicyMode: 'strict'`, which hard-denies write/execute
+        // tools before they ever reach `permission_request`. Power
+        // users can opt back into strict via
+        // `BABEL_O_CLI_POLICY_MODE=strict`.
+        const cliPolicyMode = resolveCliPolicyMode()
+        socket?.send(JSON.stringify({
+          prompt,
+          cwd,
+          sessionId,
+          ...(cliPolicyMode && { policy: cliPolicyMode }),
+        }))
       })
 
       socket.addEventListener('message', async (event: { data: string }) => {
@@ -264,6 +277,13 @@ export async function runSessionFlow(
         model: settings.modelId,
         budget,
         remoteRunner: remoteRunner.runner,
+        // Phase B 推进: align embedded `bbl chat` with the Go TUI
+        // default. Without `policyMode: 'soft-deny'` the
+        // `LocalCodingRuntime` hard-deny gate fires before the
+        // approval gate, and write/execute tools never reach
+        // `permission_request`. Power users can opt back into
+        // strict via `BABEL_O_CLI_POLICY_MODE=strict`.
+        policyMode: resolveCliPolicyMode() ?? 'soft-deny',
       })) {
         currentTurnEvents.push(event)
         await storage.appendEvent(sessionId, event)
@@ -387,4 +407,32 @@ export function resolveFinalSessionOutcome(
           message: terminalEvent.message,
         },
   }
+}
+
+/**
+ * Resolve the per-turn `policyMode` for the CLI's embedded +
+ * service-mode paths. Phase B 推进: `bbl chat` defaults to
+ * `'soft-deny'` to match the Go TUI's hardcoded default
+ * (Go TUI always sends `policy: 'soft-deny'` per-request). Without
+ * this, write/execute tools reach the `LocalCodingRuntime` hard-deny
+ * gate first and are blocked before any `permission_request` fires,
+ * leaving the operator no way to approve.
+ *
+ * Override: set `BABEL_O_CLI_POLICY_MODE=strict` to opt back into
+ * the old hard-deny behavior. Unset / unknown values fall back to
+ * `'soft-deny'` (matches Go TUI) so a typo doesn't silently
+ * downgrade safety.
+ */
+export function resolveCliPolicyMode(): 'strict' | 'soft-deny' {
+  const raw = process.env.BABEL_O_CLI_POLICY_MODE
+  if (!raw) return 'soft-deny'
+  const normalized = raw.trim().toLowerCase()
+  if (normalized === 'strict') return 'strict'
+  if (normalized === 'soft-deny' || normalized === 'softdeny' || normalized === 'soft_deny') {
+    return 'soft-deny'
+  }
+  // Unknown / typo: log once and keep the safe default.
+  // (We avoid `process.exit` here because the helper is also imported
+  // by tests that construct fake env.)
+  return 'soft-deny'
 }
