@@ -37,7 +37,7 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
 export type ToolPolicy = {
   /**
    * Per-input policy check. The runtime invokes this at the
-   * hard-deny gate with the parsed tool input so session-rules
+   * policy-block gate with the parsed tool input so session-rules
    * policies can substring-match the input. Existing allow-all
    * / allowlist policies ignore the second arg.
    */
@@ -157,7 +157,7 @@ export class LocalCodingRuntime implements NexusRuntime {
     // different) body. `policyMode: 'soft-deny'` continues to work
     // orthogonally: allowedTools controls the *policy* (which tools
     // are isAllowed), while policyMode controls whether the
-    // hard-deny gate fires for tools outside the allowlist.
+    // policy-block gate fires for tools outside the allowlist.
     if (options.allowedTools && options.allowedTools.length > 0) {
       const overridePolicy = buildPerRequestAllowedToolsPolicy(options.allowedTools)
       yield* this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
@@ -255,14 +255,14 @@ export class LocalCodingRuntime implements NexusRuntime {
       let toolInput = parsed.data
       let effectiveRisk: ToolRisk = this.effectiveRisk(tool, toolInput)
       // Compute per-input effective risk (e.g. Bash's read-only
-      // subcommand classifier). The policy hard-deny and approval gate
+      // subcommand classifier). The policy block and approval gate
       // both key off this value, not the static `tool.risk`. Read-only
       // subcommands of otherwise-execute tools therefore skip both gates
       // without losing the tool's identity in audit logs.
       //
       // Phase B of
       // docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
-      // when `options.policyMode === 'soft-deny'`, bypass this hard-deny
+      // when `options.policyMode === 'soft-deny'`, bypass this policy block
       // for tools not in the allowlist. The approval gate below then
       // emits `permission_request` for write/execute-risk tools so the
       // user can approve via the Go TUI permission panel. Under
@@ -279,6 +279,8 @@ export class LocalCodingRuntime implements NexusRuntime {
           name: tool.name,
           risk: effectiveRisk,
           message,
+          denialKind: 'policy',
+          recoverable: true,
         }
         yield {
           type: 'result',
@@ -298,6 +300,8 @@ export class LocalCodingRuntime implements NexusRuntime {
           name: tool.name,
           risk: effectiveRisk,
           message,
+          denialKind: 'optimizer_safety',
+          recoverable: true,
         }
         yield {
           type: 'result',
@@ -332,7 +336,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           role: options.role,
           signal: options.signal,
         },
-        { config: options.hooks },
+        { config: options.hooks, hooks: options.runtimeHooks },
       )
       for (const hookEvent of preToolHooks.events) yield hookEvent
       const hookDenyReason = firstHookDenyReason(preToolHooks)
@@ -343,6 +347,8 @@ export class LocalCodingRuntime implements NexusRuntime {
           name: tool.name,
           risk: effectiveRisk,
           message: hookDenyReason,
+          denialKind: 'hook',
+          recoverable: true,
         }
         yield {
           type: 'result',
@@ -428,7 +434,7 @@ export class LocalCodingRuntime implements NexusRuntime {
               role: options.role,
               signal: options.signal,
             },
-            { config: options.hooks },
+            { config: options.hooks, hooks: options.runtimeHooks },
           )
           for (const hookEvent of permissionHooks.events) yield hookEvent
 
@@ -491,6 +497,8 @@ export class LocalCodingRuntime implements NexusRuntime {
             name: tool.name,
             risk: effectiveRisk,
             message: denyMessage,
+            denialKind: 'permission',
+            terminal: true,
           }
           yield {
             type: 'result',
@@ -546,7 +554,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           role: options.role,
           signal: options.signal,
         },
-        { config: options.hooks },
+        { config: options.hooks, hooks: options.runtimeHooks },
       )
       for (const hookEvent of postToolHooks.events) yield hookEvent
 
@@ -679,6 +687,8 @@ export class LocalCodingRuntime implements NexusRuntime {
         name: tool.name,
         risk: tool.risk,
         message,
+        denialKind: 'policy',
+        recoverable: true,
       }
       yield {
         type: 'result',
@@ -797,7 +807,7 @@ export function denyByDefaultTools(): ToolPolicy {
       return tool.risk === 'read' || tool.risk === 'task'
     },
     describe() {
-      return { mode: 'allowlist', allowedTools: ['listdir', 'glob', 'grep', 'read', 'task'] }
+      return { mode: 'allowlist', allowedTools: ['listdir', 'glob', 'grep', 'read', 'websearch', 'task'] }
     },
   }
 }

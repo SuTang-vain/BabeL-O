@@ -226,6 +226,78 @@ test('formatSessionHistory: handles tool denials and errors', () => {
   assert.ok(outputExpanded.includes('UNEXPECTED_ERROR: Something went wrong'))
 })
 
+test('formatSessionHistory: renders recoverable tool denials as blocked', () => {
+  const events: NexusEvent[] = [
+    {
+      type: 'tool_denied',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-recoverable-denial',
+      timestamp: new Date().toISOString(),
+      name: 'Bash',
+      risk: 'execute',
+      message: 'Tool denied by Nexus policy: Bash',
+      denialKind: 'policy',
+      recoverable: true,
+    },
+  ]
+
+  const outputCompact = formatSessionHistory(events, 'compact')
+  assert.ok(outputCompact.includes('blocked recoverable'))
+  assert.ok(!outputCompact.includes('✗ failed'))
+
+  const outputExpanded = formatSessionHistory(events, 'expanded')
+  assert.ok(outputExpanded.includes('! Bash blocked'))
+  assert.ok(outputExpanded.includes('Recoverable: true'))
+})
+
+test('formatSessionHistory: renders grounding guard events', () => {
+  const now = new Date().toISOString()
+  const events: NexusEvent[] = [
+    {
+      type: 'context_grounding_required',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      source: 'post_compact',
+      state: 'summary-derived',
+      requiredFor: ['file_facts', 'test_results', 'git_status', 'task_completion', 'implementation_status'],
+      suggestedActions: ['re_read_referenced_files', 'inspect_changed_files', 'inspect_git_status', 'run_focused_tests', 'inspect_event_log'],
+      message: 'Context was compacted; verify current sources before conclusions.',
+    },
+    {
+      type: 'workspace_dirty_detected',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      source: 'post_compact',
+      changedFileCount: 2,
+      changedFiles: ['src/runtime/LLMCodingRuntime.ts', 'test/runtime.test.ts'],
+      suggestedActions: ['inspect_changed_files', 'inspect_git_status', 'inspect_diff'],
+      message: 'Workspace has 2 changed file(s); inspect git status/diff before relying on compact summaries.',
+    },
+    {
+      type: 'context_grounding_confirmed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      confirmedByToolUseId: 'tool-read-confirm',
+      toolName: 'Read',
+      confirmationKind: 'file_read',
+      confirmedFor: ['file_facts', 'implementation_status'],
+      source: 'tool_result',
+      message: 'Context grounding confirmed by current file read.',
+    },
+  ]
+
+  const output = formatSessionHistory(events, 'compact')
+  assert.ok(output.includes('context grounding required (post_compact)'))
+  assert.ok(output.includes('summary-derived'))
+  assert.ok(output.includes('workspace dirty (post_compact): 2 changed file(s)'))
+  assert.ok(output.includes('src/runtime/LLMCodingRuntime.ts'))
+  assert.ok(output.includes('context grounding confirmed (file_read via Read)'))
+  assert.ok(output.includes('file_facts, implementation_status'))
+})
+
 test('formatSessionHistory: renders provider fallback policy details', () => {
   const events: NexusEvent[] = [
     {

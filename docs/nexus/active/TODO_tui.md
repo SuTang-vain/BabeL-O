@@ -110,7 +110,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - `bbl go` 已接入 CLI，优先运行本地 Go TUI binary（source checkout 下为 `clients/go-tui/bin/go-tui`），缺失时 fallback 到 `go run ./cmd/go-tui`；wrapper 会先探活 `GET /health`，本地 URL 不健康时自动拉起 managed Nexus child，远程 URL 或 `--no-start-nexus` 只连接不启动。
 - MVP 已具备 header、transcript、bottom input、footer、permission panel 与 layered event rendering。
 - 已手动完成 local Nexus + WebSocket + `permission_request` / `permission_response` / Bash tool / result smoke；transcript 可显示 `stdout="go-tui-smoke"`。
-- Go TUI 已开始消费共享模型配置：启动时拉取 `GET /v1/runtime/config`，header 展示 active profile；`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus HTTP API 读取/切换 profile，不作为 agent prompt 发送。
+- Go TUI 已开始消费共享模型配置：启动时拉取 `GET /v1/runtime/config`，header 展示 active profile；`/config`、`/profile`、`/profiles`、`/profile <name>` 作为本地命令通过 Nexus HTTP API 读取/切换 profile，不作为 agent prompt 发送；`/model` Step 4 已通过 `POST /v1/runtime/config/select {model}` 持久化 default model 并应用返回 runtime config。
 
 近期未收口项：
 
@@ -131,10 +131,14 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - Go TUI 与其他远程客户端只能走 Nexus HTTP 拉取 profile/active/model 视图，不依赖 private 字段，不读取本地 config 文件。
 - [x] §5 路径 C 阶段 2：真实 profile 切换 + 增量版本 + tombstone 基线（2026-06-09 收口）。
   - `GET /v1/runtime/config?since=<version>` 支持无变化时返回 `304`，用于 Go TUI 后续增量刷新。
-  - `POST /v1/runtime/config/select` 保留为受限 profile 切换入口：只接受 `profile`，拒绝 `model` / `role` / `roleModel` 动态切换，避免远程 TUI 绕过 CLI 配置治理。
+  - `POST /v1/runtime/config/select` 保留为受限共享配置切换入口：接受互斥的 `profile` 或 `model`；`profile` 切换 active profile，`model` 写 `defaultModel` 供 Go TUI `/model` Step 4 持久化；`role` / `roleModel` 仍拒绝并保持 CLI-only。
   - `ConfigManager` 已具备 `configVersion`、`tombstones`、`deleteProfile()`、`restoreProfile()`、`isProfileTombstoned()`；重新 `setProfile()` 会清理同名 tombstone，避免同名 profile 复建后仍无法选择。
   - `bbl config profile list/use/delete/restore` 已提供 CLI-only profile 生命周期操作；Go TUI `/profile <name>` 调用 Nexus `config/select`，不会直接写 config 文件。
   - `GET /v1/runtime/models` 的 `configured` 判断覆盖 env、provider config、active profile 与其他 profile 内的 provider API key，响应仍不泄露 secret。
+- [x] Go TUI `/model` Step 4 模型持久化（2026-06-12 收口）。
+  - `POST /v1/runtime/config/select` 已支持与 `profile` 互斥的 `model` 字段，未知 model 返回 `unknown_model`，`role` / `roleModel` 仍保持 CLI-only。
+  - Go TUI Step 4 Enter 现在 dispatch `selectRuntimeModel`，in-flight 期间锁 picker；成功后 `applyRuntimeConfig` 并输出 `model saved:`，失败保留在 picker 供重选。
+  - `activeProfile.model > defaultModel` 的 shadow 语义保持既有 server 行为，不自动清 active profile，不恢复 auto model selection / role defaults。
 - [x] §5 路径 C 阶段 3：Go TUI 消费 version polling + tombstone UX 收口（2026-06-09 收口）。
   - Go TUI 加 `--poll-interval-ms` flag（默认 30000，0 禁用）；`fetchRuntimeConfig(cfg, since int)` 在 since > 0 时附加 `?since=N` 查询；`nexusJSON` 在 304 时返回 `errNotModified` 哨兵，handler 静默 reschedule 不刷 transcript。
   - `runtimeConfigMsg` 在 version 实际推进时打 `config updated:` 状态行；304 静默 reschedule。
@@ -293,55 +297,39 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - 默认安装和默认测试不强制要求 Go toolchain。
 - §5 路径 C 起的所有配置访问：Go TUI 只通过 Nexus 暴露的 HTTP API 拿到 config profile/active/model 视图，并且只通过受限 `POST /v1/runtime/config/select` 切换已有 profile；不允许 Go TUI 读取本地 `ConfigManager` 私有字段，也不复制 `ConfigManager` 的 schema 决策。
 
-## P1 `/model` 模型持久化
+## Watch / Closed `/model` 模型持久化
 
-> Phase 1 设计上 `/model` Step 4 是 in-memory only——`m.modelID` 立刻切、但 `bbl go` 重启即丢失，操作员必须切回 `bbl config use` 或 `bbl chat /model` 才能落盘。`clients/go-tui/internal/tui/tui.go:2135-2144` Step 4 Enter 分支的 status 行文案 `"model writeback is CLI-only in Phase 1; run bbl config use ... to persist"` 自证这是设计边界而不是 bug。
->
-> 详细规划见 [Go TUI `/model` 模型持久化规划](../reference/go-tui-model-persistence-plan.md)。本节是该 reference doc 在 active TODO 的同步桩，承载状态变迁与 watch 触发条件。
+> 详细规划见 [Go TUI `/model` 模型持久化规划](../archive/go-tui-model-persistence-plan.md)。实现切片已收口；本节只保留已完成事实与 watch 触发条件。
 
-### 计划切片
+### 已收口切片
 
-- [ ] Phase 1：Nexus 协议层
-  - 改 `src/nexus/app.ts:765` handler 拆三态（`{profile}` 走 `setActiveProfile` / `{model}` 走 `setDefaultModel` / 互斥 400 `mutually_exclusive` / 缺字段 400 `missing_field` / 未知 model 400 `unknown_model`）；role / roleModel 仍 `not_supported`。
-  - 改 `test/config-endpoints.test.ts` 既有 `rejects model / role switching (CLI-only)` 改为只验 role / roleModel，新增 5 条测试（`missing_field` / `mutually_exclusive` / `switches default model and persists` / `model switch preserves an active profile binding` / `rejects unknown model with 400`）。
-  - 验证：`npx tsc --noEmit` 干净 + `node --import tsx --test test/config-endpoints.test.ts` 22/22。
-- [ ] Phase 2：TUI 客户端
-  - `clients/go-tui/internal/tui/tui.go` 加 `modelSelectMsg` typed struct + `selectRuntimeModel(cfg, modelID) tea.Cmd` + `modelPickSubmitting bool` in-flight 锁字段。
-  - 改 Step 4 Enter 分支：进入 in-flight 态（esc 仍允许退 step） + dispatch `selectRuntimeModel` + 打印 `saving model:` status。
-  - 加 `case modelSelectMsg` Update handler：err 路径留 picker + 清 submitting + 报错；ok 路径 `applyRuntimeConfig` + 打印 `model saved:` + 重置 picker 临时态 + `setMode(modeComposing)`。
-  - 改 `renderModelPickModel` 加 saving 态渲染（spinner + "saving model…"）。
-  - 加 3 个 Go 单测：`TestModelPickStep4EnterFiresSelectCommand` / `TestModelSelectMsgAppliesConfigAndClosesPicker` / `TestModelSelectMsgErrorStaysInPicker`。
-  - 验证：`go test ./...` 154+/154+、`go vet ./...` 干净、重编 binary。
-- [ ] Phase 3：PTY smoke（可选）
-  - `test/go_tui_pty_driver.py` 新 `run_model_persistence_sequence`：bash echo 触发 `session_started` → `/model` → 选 provider → 选 model → 等 `model saved:` → 重启 TUI → 验 header modelId 是新选的。
-  - 需 pre-seed `BABEL_O_CONFIG_FILE` 让 default model 与新选不同（避免 no-op 假阳性）。
-- [ ] Phase 4：收口入库
-  - `docs/nexus/DONE.md` 写收口条目（commit hash + 文件列表 + 测试覆盖 + 验证命令）。
-  - 同步本节到"已收口"，把 `P1 /model 模型持久化` 段落从 active TODO 移除 / 折叠到"已收口 P1 列表"。
-  - 同步 `docs/nexus/reference/go-tui-model-persistence-plan.md` Status 行 → "Phase 1+2+3 全部已落地（治理收口）"。
+- Phase 1：Nexus 协议层已落地。
+  - `POST /v1/runtime/config/select` 支持互斥 `{profile}` / `{model}`：`profile` 仍走 `setActiveProfile`，`model` 写 `defaultModel`。
+  - `profile + model` 返回 `mutually_exclusive`；缺字段返回 `missing_field`；未知 model 返回 `unknown_model`；`role` / `roleModel` 仍 `not_supported`。
+  - `test/config-endpoints.test.ts` 已覆盖 profile back-compat、model 持久化、active profile shadow、互斥、空字段、未知 model、role/roleModel 拒绝。
+- Phase 2：TUI 客户端已落地。
+  - `clients/go-tui/internal/tui/tui.go` 已新增 `modelSelectMsg` / `selectRuntimeModel` / `modelPickSubmitting`。
+  - Step 4 Enter dispatch `selectRuntimeModel` 并打印 `saving model:`；in-flight 期间 Enter no-op，Esc 仍可退回上一步。
+  - `case modelSelectMsg` 成功路径 `applyRuntimeConfig` + `model saved:` + 重置 picker + 回 composing；失败路径清 submitting、显示 `model select:`，并留在 picker 供重选。
+  - Go 白盒测试覆盖 Step 4 command dispatch、成功 apply+close、失败 stay-in-picker、submitting render。
+- Phase 3：PTY smoke 暂缓。
+  - 当前已有 TS endpoint 回归 + Go TUI 状态机回归守住主闭环；真实 PTY 序列后续如需补充，需稳定 pre-seed `BABEL_O_CONFIG_FILE` 并处理 active profile shadow 的可观测性。
+- Phase 4：收口入库已完成。
+  - `docs/nexus/archive/go-tui-model-persistence-plan.md`、`docs/nexus/TODO.md`、`docs/nexus/DONE.md`、`docs/nexus/WORK_LOG.md` 与本文件已同步。
 
-### UX Caveat（已写明在 reference doc §7，本节作为 watch 触发条件）
+### UX Caveat（watch-only）
 
-`ConfigManager.resolveSettings()` 链：`profile.model > env > role > defaultModel > 'local/coding-runtime'`。当操作员存在 active profile 且 `profile.model` 与 Step 4 选的不一致时，`setDefaultModel` 写入**不**生效于下一个 turn 的 provider call —— server 仍用 `profile.model`。TUI 下一次 `fetchRuntimeConfig` poll 会回 `modelId: <profile.model>`，header 文字会从"刚选的新模型"退回"profile 锁住的模型"。
+`ConfigManager.resolveSettings()` 链中 active profile 的 `profile.model` 仍优先于 `defaultModel`。当操作员存在 active profile 且 `profile.model` 与 Step 4 选的不一致时，`setDefaultModel` 写入已发生，但下一个 turn 的 resolved model 仍可能由 profile 锁定；TUI 后续 `fetchRuntimeConfig` poll 会显示 server 真实 resolved `modelId`。
 
-收口底线：本切片**不**做 y/n overlay 询问是否清 active profile、**不**改 `resolveSettings()` 优先级、**不**自动清 active profile。操作员通过 transcript `model saved:` 状态行 + 下次 poll 回的 `modelId` 自我理解现状。若此 UX 阻断被真实会话标为 P0，则**另起**reference doc 讨论 `model saved + active profile cleared` y/n overlay 切片，不在本规划内增量。
+收口底线：本切片**不**做 y/n overlay 询问是否清 active profile、**不**改 `resolveSettings()` 优先级、**不**自动清 active profile。若此 UX 阻断被真实会话标为 P0，则另起 reference doc 讨论 `model saved + active profile cleared` y/n overlay，不在本规划内增量。
 
 ### 触发条件
 
 按以下任一条件重新打开实现项：
 
-- 真实会话或 PTY smoke 暴露 `/model` 切完 model 但下一次 turn 仍用旧 model 致 user-facing confusion
-- 多个用户复现"重启 `bbl go` model 不保留"，且 `bbl config use` 不在 workflow 内的吐槽
-- 收到 `bbl config use` ↔ `bbl go /model` 之间的等价性需求（用户希望两边切换路径完全一致）
-
-触发时不重新设计，沿本规划 + reference doc 推进；若 reference doc 边界需要扩（如包含 api-key / base-URL 持久化），按本 reference doc 12 节"另起姊妹 doc"规则处理，不在本 doc 增量。
-
-### 与已有边界的兼容
-
-- 不动 §5 路径 C 阶段 2 已收口的 `setActiveProfile` 路径
-- 不动 `bbl chat` / `bbl config use` 既有行为；新协议路径与 CLI 路径语义完全等价（`setDefaultModel` 已被 `bbl config use` 使用）
-- 不触碰 `babel-o-auto-model-selection-delayed.md` / `feedback-provider-quota-priority.md` 既定 delay 项
-- 持续边界（上方 bullet 列表）字面不动；本切片只新增 `config/select` 接受 `model` 字段，与 `profile` 路径同属受限端点
+- 真实会话或 PTY smoke 暴露 `/model` 切完 model 但下一次 turn 仍用旧 model 致 user-facing confusion。
+- 多个用户复现 active profile shadow 造成的理解成本，且 transcript / header 现有事实表达不足。
+- 收到 Step 2/3 api-key / baseURL 持久化需求；该需求涉及 secret/env/profile 合并，需另起姊妹规划，不在本切片增量。
 
 ## 验证命令
 

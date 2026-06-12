@@ -2,6 +2,44 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-12 — 文档库已完成文档归档整理
+
+- **背景**: 文档库盘点后确认 `docs/nexus/archive/` 内既有 completed plans 已归档，`docs/nexus/reference/` 多数仍是代码注释和长期架构约束，不应移动；真正仍处在活跃路径但已完成的是 Go TUI Phase 9 决策记录与 Go TUI v1 UI 升级计划。
+- **实现**:
+  - 新增归档记录 `docs/nexus/archive/phase-9-promotion-decision.md`，并将 `docs/nexus/PHASE_9_DECISION.md` 缩减为稳定跳转页，避免既有日志、源码注释和 help 文案断链。
+  - 新增归档记录 `docs/nexus/archive/go-tui-v1-ui-upgrade.md`，并将 `clients/go-tui/docs/upgrade-plan.md` 缩减为客户端本地跳转页。
+  - 更新 `docs/nexus/README.md` 与 `docs/nexus/archive/README.md` 的 Archive 索引；将 `clients/go-tui/internal/tui/help_dialog.go` 中唯一直接引用 `upgrade-plan.md` 章节细节的注释指向归档文档。
+- **验证**:
+  - `rg -n "PHASE_9_DECISION|upgrade-plan\\.md|phase-9-promotion-decision|go-tui-v1-ui-upgrade" docs/nexus clients/go-tui src test`（确认旧稳定路径仅作为跳转/历史引用保留，新归档入口可检索）
+  - `cd clients/go-tui && go test ./...`（pass）
+- **边界**: 未移动 `TODO.md` / `DONE.md` / `WORK_LOG.md`；未移动 `docs/nexus/reference/*plan*.md`，因为它们仍承担长期约束或源码注释索引；未二次拆分既有 `docs/nexus/archive/` 文件，避免引入大规模链接 churn。
+
+## 2026-06-12 — Go TUI `tui.go` 文件级拆分收口
+
+- **背景**: `clients/go-tui/internal/tui/tui.go` 长期承载 Go TUI 的 API/stream/render/transcript/text/selection/overlay/event/helper 代码，文件规模 10k+ 行；规划写入 `docs/nexus/archive/go-tui-tui-go-split-plan.md`，要求同 package 机械移动，不改行为，不拆 `model` root 与 `Update` 主状态机。
+- **实现**:
+  - 新增/填充 `api.go`、`stream.go`、`chrome.go`、`welcome.go`、`transcript.go`、`text.go`、`selection.go`、`events.go`、`context.go`、`slash.go`、`permission.go` 与 `overlay_inbox.go` / `overlay_agents.go` / `overlay_tasks.go` / `overlay_activity.go` / `overlay_tools.go` / `overlay_models.go` / `overlay_sessions.go`。
+  - `tui.go` 保留 `Config`/DTO 类型、`model` root、`Run`/`newModel`/`Init`/`Update`/`View` 总装和核心 mode routing；`consumeNexusEvent` 仍留在主文件，仅把低风险 event helper 拆到 `events.go`。
+  - 期间修正机械搬移带来的 import drift，并把误放到 `overlay_models.go` 的 inbox event card 归入 `overlay_inbox.go`。
+- **验证**:
+  - `go -C clients/go-tui test ./...`（pass）
+  - `go -C clients/go-tui vet ./...`（pass）
+- **结果**: `tui.go` 从 10,243 行降至 3,548 行，满足计划“低于 4k 行”目标；未新增功能、未改 Nexus/runtime/context/permission ownership，未执行 Phase 5 `Update` 分段 handler。
+
+## 2026-06-12 — Go TUI `/model` Step 4 模型持久化收口
+
+- **背景**: Go TUI `/model` 多步 picker 的 Step 4 过去只写 `m.modelID` 内存字段，header 会视觉切换但不写 server config；重启 `bbl go` 或下一次从 Nexus 拉配置后会回到 server 真实模型。规划写入 `docs/nexus/archive/go-tui-model-persistence-plan.md`。
+- **实现**:
+  - `src/nexus/app.ts` 的 `POST /v1/runtime/config/select` 已支持互斥 `{profile}` / `{model}`：`profile` 仍切 active profile，`model` 写入 `ConfigManager.setDefaultModel()`，`profile + model` 返回 `mutually_exclusive`，空字段返回 `missing_field`，未知 model 返回 `unknown_model`，`role` / `roleModel` 仍 `not_supported`。
+  - `test/config-endpoints.test.ts` 覆盖 model 持久化、active profile shadow、互斥、空字段、未知 model、role/roleModel 拒绝与 profile back-compat。
+  - `clients/go-tui/internal/tui/tui.go` 已新增 `modelSelectMsg` / `selectRuntimeModel` / `modelPickSubmitting`；Step 4 Enter dispatch `POST /v1/runtime/config/select {model}`，in-flight 期间 Enter no-op；成功路径 `applyRuntimeConfig` + `model saved:` + 回 composing，失败路径清 submitting 并留在 picker。
+  - `clients/go-tui/internal/tui/tui_test.go` 覆盖 Step 4 command dispatch、成功 apply+close、失败 stay-in-picker、submitting render。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/config-endpoints.test.ts`（22/22 pass）
+  - `cd clients/go-tui && go test ./...`（pass）
+  - `cd clients/go-tui && go vet ./...`（pass）
+- **边界**: 不改 `bbl chat` / `bbl config use`；不持久化 Step 2/3 的 api-key/baseURL；不改 `ConfigManager.resolveSettings()` 优先级，active profile 的 `profile.model` 继续优先于 `defaultModel`；不恢复 auto model selection / role defaults。
+
 ## 2026-06-10 — Go TUI permission-policy Phase B 收口（soft-deny policy per-request override）
 
 - **背景**: Phase A 让 read-only Bash subcommand 跳过 policy + approval gate，但 write/execute 工具（`git commit`、`npm install`、`Write`/`Edit`）在 `denyByDefaultTools()` 默认下仍 hard-deny，根本发不出 `permission_request`。规划写入 `docs/nexus/reference/go-tui-permission-policy-governance-plan.md` Phase B。
@@ -51,7 +89,7 @@
 
 ## 2026-06-10 — Go TUI execute-timeout Phase D + E 收口（runtimeAgentStep 分类 + CLI 死信号治理）
 
-- **背景**: Phase A/B/C 已让 Go TUI 主动发 timeoutMs、Nexus emit `execute_summary`、Go TUI 友好渲染；但 `src/nexus/runtimeAgentStep.ts:298` 把任意 `signal.aborted` 都标为 `REQUEST_TIMEOUT`（混淆 user-cancel vs 真超时），且 `src/cli/runSessionFlow.ts:247-254` 的 `timeoutController` 从未被武装但默默传给 runtime（增加未来误读风险）。规划收口在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase D + E。
+- **背景**: Phase A/B/C 已让 Go TUI 主动发 timeoutMs、Nexus emit `execute_summary`、Go TUI 友好渲染；但 `src/nexus/runtimeAgentStep.ts:298` 把任意 `signal.aborted` 都标为 `REQUEST_TIMEOUT`（混淆 user-cancel vs 真超时），且 `src/cli/runSessionFlow.ts:247-254` 的 `timeoutController` 从未被武装但默默传给 runtime（增加未来误读风险）。规划收口在 `docs/nexus/archive/go-tui-execute-timeout-governance-plan.md` Phase D + E。
 - **实现**:
   - `src/nexus/runtimeAgentStep.ts:28-29` `RuntimeAgentStepOptions` 新增 `timeoutSignal?: AbortSignal` 选项。
   - `src/nexus/runtimeAgentStep.ts:229` 修正 `executeStream` 调用的 `timeoutSignal` 字段（之前错误写成 `options.signal`，现在改为 `options.timeoutSignal`）。
@@ -68,11 +106,11 @@
   - `cd clients/go-tui && gofmt -l .`（先报告 tui.go 格式问题，gofmt -w 后干净）
   - `cd clients/go-tui && go test ./...`（全过）
 - **未触动**: Nexus `executeTimeoutMs` 默认值、`bbl chat` 行为、`error.code` 主路径分类（已正确，仅修 `runtimeAgentStep` 这一处 watch 点）、CLI 不引入新超时预算。
-- **整体收口**: Phase A + B + C + D + E 全部落地，详见 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` 末尾"整体收口"表。
+- **整体收口**: Phase A + B + C + D + E 全部落地，详见 `docs/nexus/archive/go-tui-execute-timeout-governance-plan.md` 末尾"整体收口"表。
 
 ## 2026-06-10 — Go TUI execute-timeout Phase C 收口（真实会话 regression fixture）
 
-- **背景**: Phase A 给 Go TUI 加了 per-request `timeoutMs` 覆盖，Phase B 给 Nexus 加了 `execute_summary` 事件 + HTTP envelope 字段，但缺乏端到端 regression fixture 守住"per-request timeoutMs → Nexus 触发 REQUEST_TIMEOUT → Go TUI 渲染友好提示 + execute_summary 预算比例"全链路。规划补在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase C。
+- **背景**: Phase A 给 Go TUI 加了 per-request `timeoutMs` 覆盖，Phase B 给 Nexus 加了 `execute_summary` 事件 + HTTP envelope 字段，但缺乏端到端 regression fixture 守住"per-request timeoutMs → Nexus 触发 REQUEST_TIMEOUT → Go TUI 渲染友好提示 + execute_summary 预算比例"全链路。规划补在 `docs/nexus/archive/go-tui-execute-timeout-governance-plan.md` Phase C。
 - **实现**:
   - `test/runtime.test.ts` 新增 `execute honours per-request timeoutMs from Go TUI WebSocket payload` 测试：服务端 `executeTimeoutMs=30_000`（宽松默认），请求体 `timeoutMs: 200`，跑 `Bash "sleep 1"`（1s > 200ms）。断言 `body.success=false`、`body.events` 含 `REQUEST_TIMEOUT` error、`body.timeoutMs === 200`（per-request 胜出 server 默认 30_000）、`body.outcome === 'timeout'`、`execute_summary` 事件 `timeoutMs === 200` / `outcome === 'timeout'` / `nearTimeout === true`。
   - `clients/go-tui/internal/tui/tui.go` `runStream()` 不再在 `error` 事件 break：Nexus 在 `result`/`error` 之后会 emit `execute_summary` 携带 timeout / outcome metadata，Go TUI 必须继续读到 connection 自然关闭，否则 `execute_summary` 会丢失。原 break 行为会让该事件被吞。
@@ -90,7 +128,7 @@
 
 ## 2026-06-10 — Go TUI execute-timeout Phase B 收口（Nexus 端 execute-timeout 可观察性）
 
-- **背景**: Phase A 解决了 Go TUI 主动发 `timeoutMs`，但服务端没有把 `timeoutMs` / `executeDurationMs` / `nearTimeout` 暴露成可观察 metadata。规划补在 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md` Phase B。
+- **背景**: Phase A 解决了 Go TUI 主动发 `timeoutMs`，但服务端没有把 `timeoutMs` / `executeDurationMs` / `nearTimeout` 暴露成可观察 metadata。规划补在 `docs/nexus/archive/go-tui-execute-timeout-governance-plan.md` Phase B。
 - **实现**:
   - `src/shared/events.ts` 新增 `ExecuteSummaryEventSchema`（type=`execute_summary`，字段 `sessionId` / `requestId` / `timeoutMs` / `executeDurationMs` / `nearTimeout` / `outcome`），加入 `NexusEventSchema` discriminated union。纯加法，不动现有事件 schema。
   - `src/nexus/app.ts` 新增 helper `executeTimeoutNear(durationMs, timeoutMs, ratio=0.8)` / `executeSummaryOutcome(resultEvent, errorEvent, timedOutByAbort)` / `buildExecuteSummaryEvent({...})`。
@@ -109,7 +147,7 @@
 
 ## 2026-06-10 — Go TUI execute-timeout Phase A 收口（per-request `timeoutMs`）
 
-- **背景**: `session_...053000`（Go TUI WebSocket 会话）暴露 `REQUEST_TIMEOUT This operation was aborted`。根因是 Go TUI 在 WebSocket payload 中不覆盖 `timeoutMs`，掉到 Nexus 默认 30s，长会话 turn 容易被切。规划写入 `docs/nexus/reference/go-tui-execute-timeout-governance-plan.md`。
+- **背景**: `session_...053000`（Go TUI WebSocket 会话）暴露 `REQUEST_TIMEOUT This operation was aborted`。根因是 Go TUI 在 WebSocket payload 中不覆盖 `timeoutMs`，掉到 Nexus 默认 30s，长会话 turn 容易被切。规划写入 `docs/nexus/archive/go-tui-execute-timeout-governance-plan.md`。
 - **实现**:
   - `clients/go-tui/internal/tui/tui.go` `Config` 新增 `ExecuteTimeoutMs int` 字段。
   - `clients/go-tui/internal/tui/tui.go` 新增 `buildExecuteRequest(cfg, sessionID, prompt) map[string]any` helper：仅在 `cfg.ExecuteTimeoutMs > 0` 时附加 `timeoutMs`，0 时沿用 Nexus 默认 30s。

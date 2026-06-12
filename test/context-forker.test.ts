@@ -141,6 +141,10 @@ test('minimal context fork keeps explore prompt focused and omits parent history
     '/workspace/project/src/runtime/contextAssembler.ts',
     '/workspace/project/src/runtime/contextManager.ts',
   ])
+  assert.equal(fork.diagnostics.parentSummary.sessionId, 'session-parent')
+  assert.equal(fork.diagnostics.parentSummary.eventCount, parentSession.events.length)
+  assert.equal(fork.diagnostics.provenance.forkMode, 'minimal')
+  assert.deepEqual(fork.diagnostics.provenance.workingSetPaths, fork.diagnostics.workingSetPaths)
 })
 
 test('working-set context fork includes active paths and recent user focus', () => {
@@ -170,6 +174,8 @@ test('task-focused context fork includes task, failure, and permission context',
   assert.match(fork.prompt, /Bash permission requested/)
   assert.ok(fork.diagnostics.included.includes('task_state'))
   assert.ok(fork.diagnostics.included.includes('permission_context'))
+  assert.ok(fork.diagnostics.childWorkingSet.some(item => item.path.endsWith('src/runtime/contextAssembler.ts')))
+  assert.ok(fork.diagnostics.excludedItems.some(item => item.includes('full_parent_history') || item.includes('event:')))
 })
 
 test('full-summary context fork includes compact summaries and child agent results', () => {
@@ -183,6 +189,8 @@ test('full-summary context fork includes compact summaries and child agent resul
   assert.match(fork.prompt, /agent_job_completed/)
   assert.ok(fork.diagnostics.included.includes('compact_summary'))
   assert.ok(fork.diagnostics.included.includes('child_agent_results'))
+  assert.ok(fork.diagnostics.toolTraceReferences.some(reference => reference.name === 'Bash'))
+  assert.ok(fork.diagnostics.provenance.parentSummary?.childAgentResults)
 })
 
 test('debug-replay context fork keeps selected failure events under diagnostics', () => {
@@ -196,6 +204,8 @@ test('debug-replay context fork keeps selected failure events under diagnostics'
   assert.doesNotMatch(fork.prompt, /Large parent history should not be inherited/)
   assert.ok(fork.diagnostics.included.includes('debug_replay_events'))
   assert.ok(fork.diagnostics.eventReferences.some(reference => reference.reason === 'failed tool output'))
+  assert.ok(fork.diagnostics.toolTraceReferences.some(reference => reference.toolUseId === 'tool-test' && reference.success === false))
+  assert.ok(fork.diagnostics.provenance.toolTraceReferences?.some(reference => reference.outputPreview?.includes('test failure')))
   assert.ok(fork.omittedItems > 0)
 })
 
@@ -219,6 +229,12 @@ test('ExploreAgentScheduler stores selected fork diagnostics on child session me
   assert.equal(child?.metadata?.contextForkMode, 'working-set')
   assert.equal((child?.metadata?.contextFork as any)?.inheritedItems > 0, true)
   assert.equal((child?.metadata?.contextFork as any)?.diagnostics?.included.includes('working_set'), true)
+  assert.equal((child?.metadata?.contextFork as any)?.diagnostics?.provenance?.forkMode, 'working-set')
+
+  const completed = await scheduler.waitForAgent(spawned.jobId)
+  assert.equal(completed.result?.contextProvenance?.forkMode, 'working-set')
+  assert.ok(completed.result?.contextProvenance?.workingSetPaths.some(path => path.endsWith('src/runtime/contextAssembler.ts')))
+  assert.ok(completed.result?.contextProvenance?.parentSummary?.eventCount)
 })
 
 function jobWithMode(mode: ContextForkMode): AgentJob {

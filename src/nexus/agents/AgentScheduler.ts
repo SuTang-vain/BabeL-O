@@ -19,6 +19,7 @@ import {
 } from './AgentJobRegistry.js'
 import { forkContextForAgent } from './ContextForker.js'
 import type {
+  AgentContextProvenance,
   AgentJob,
   AgentJobFilter,
   AgentJobGovernance,
@@ -191,6 +192,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
       allowedTools,
       controller,
       maxRuntimeMs,
+      fork.diagnostics.provenance,
     ).finally(() => {
       this.running.delete(job.jobId)
     })
@@ -240,7 +242,8 @@ export class ExploreAgentScheduler implements AgentScheduler {
     childSession: SessionSnapshot,
     allowedTools: string[],
     controller: AbortController,
-    maxRuntimeMs?: number,
+    maxRuntimeMs: number | undefined,
+    contextProvenance: AgentContextProvenance,
   ): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined
     let timedOut = false
@@ -318,7 +321,10 @@ export class ExploreAgentScheduler implements AgentScheduler {
         return
       }
 
-      const result = normalizeAgentResult(events, allowedTools)
+      const result = {
+        ...normalizeAgentResult(events, allowedTools),
+        contextProvenance,
+      }
       job = this.registry.completeJob(jobId, result)
       await this.storage.saveAgentJob(job)
       await this.finalizeChildSession(job, true, result.summary)
@@ -554,6 +560,7 @@ function createAgentChannelMessage(input: {
       childSessionId: input.job.childSessionId,
       parentSessionId: input.job.parentSessionId,
       agentJobStatus: input.job.status,
+      contextProvenance: input.job.result?.contextProvenance,
     },
   }
 }

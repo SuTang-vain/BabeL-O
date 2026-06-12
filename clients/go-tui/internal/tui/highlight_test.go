@@ -59,8 +59,7 @@ func TestSelectionFreezeSuppression(t *testing.T) {
 func TestViewMapsSelectionToTranscriptItems(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	primeSelectionViewport(&m)
-	welcomeLines := lineCount(m.renderWelcomeCard(max(40, m.viewport.Width())))
-	selectionLine := welcomeLines + 2
+	selectionLine := transcriptStartLine(m.renderWelcomeCard(max(40, m.viewport.Width())))
 	m.selectionActive = true
 	m.selectionStartLine = selectionLine
 	m.selectionStartCol = 0
@@ -76,5 +75,61 @@ func TestViewMapsSelectionToTranscriptItems(t *testing.T) {
 	}
 	if m.transcript[1].highlightActive {
 		t.Fatalf("second transcript item should not be highlighted")
+	}
+}
+
+func TestSelectionHighlightStaysOnVisibleContentLine(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	m.width = 80
+	m.height = 14
+	m.resize()
+	m.transcript = []*transcriptItem{
+		{kind: "status", text: "alpha line"},
+		{kind: "status", text: "beta line"},
+		{kind: "status", text: "gamma line"},
+		{kind: "status", text: "delta line"},
+		{kind: "status", text: "epsilon line"},
+		{kind: "status", text: "zeta line"},
+		{kind: "status", text: "eta line"},
+		{kind: "status", text: "theta line"},
+	}
+	m.refreshViewport()
+
+	lines := strings.Split(stripANSICodes(m.viewport.GetContent()), "\n")
+	targetLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "beta line") {
+			targetLine = i
+			break
+		}
+	}
+	if targetLine < 1 {
+		t.Fatalf("test setup expected beta line after at least one visible row, got target=%d:\n%s",
+			targetLine, strings.Join(lines, "\n"))
+	}
+	startCol := strings.Index(lines[targetLine], "beta")
+	if startCol < 0 {
+		t.Fatalf("test setup could not find beta column in %q", lines[targetLine])
+	}
+	m.selectionActive = true
+	m.selectionStartLine = targetLine
+	m.selectionStartCol = startCol
+	m.selectionEndLine = targetLine
+	m.selectionEndCol = startCol + len("beta")
+	m.viewport.SetYOffset(targetLine - 1)
+	if got := m.viewport.YOffset(); got != targetLine-1 {
+		t.Fatalf("test setup expected viewport offset %d, got %d", targetLine-1, got)
+	}
+
+	viewLines := strings.Split(m.highlightedViewportView(), "\n")
+	if len(viewLines) < 2 {
+		t.Fatalf("expected at least two visible viewport rows, got %d: %q", len(viewLines), viewLines)
+	}
+	if strings.Contains(viewLines[0], selectionBackgroundStart) {
+		t.Fatalf("selection display shifted one row up; first visible row was highlighted: %q", viewLines[0])
+	}
+	if !strings.Contains(viewLines[1], selectionBackgroundStart) {
+		t.Fatalf("selected content line should be highlighted on second visible row, got rows:\n%q\n%q",
+			viewLines[0], viewLines[1])
 	}
 }

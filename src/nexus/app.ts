@@ -29,6 +29,8 @@ import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runt
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
+import { assembleContext } from '../runtime/contextAssembler.js'
+import { buildPostCompactGroundingEvents } from '../runtime/runtimePipeline.js'
 import { buildSystemPrompt, extractAbsolutePaths, mapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
 import { buildSessionAssetsSnapshot } from './sessionAssets.js'
@@ -49,6 +51,27 @@ const executeSchema = z.object({
   sessionId: z.string().optional(),
   cwd: z.string().optional(),
   timeoutMs: z.number().int().positive().max(300_000).optional(),
+  timeoutPolicy: z.enum(['fatal', 'soft']).optional(),
+  softTimeoutMs: z.number().int().positive().max(300_000).optional(),
+  watchdogTimeoutMs: z.number().int().positive().max(1_800_000).optional(),
+  /**
+   * Phase 3 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md.
+   * Maximum number of automatic soft-timeout extensions the runtime
+   * may grant when `timeoutPolicy: 'soft'`. Each extension fires
+   * after a `timeout_budget_exceeded` event and is announced with a
+   * `timeout_extension_granted` event. The hard watchdog is never
+   * extended.
+   * Defaults to 1 — enough for the model to react to the budget
+   * warning with a deliberate choice. Set to 0 to disable
+   * extensions entirely (one-shot recoverable signal only).
+   */
+  maxSoftTimeoutExtensions: z.number().int().nonnegative().max(5).optional(),
+  /**
+   * Phase 3: how much extra soft budget is granted per extension.
+   * Defaults to `softTimeoutMs`. Capped at 300_000ms so it can never
+   * outrun the hard watchdog budget.
+   */
+  softTimeoutExtensionMs: z.number().int().positive().max(300_000).optional(),
   maxToolOutputBytes: z.number().int().positive().max(10_000_000).optional(),
   skipPermissionCheck: z.boolean().optional(),
   /**
@@ -458,6 +481,27 @@ type ActiveExecution = {
   abortController: AbortController
   transport: 'http' | 'websocket'
   startedAt: string
+}
+
+type ExecuteTimeoutPolicy = 'fatal' | 'soft'
+
+type ExecuteTimeoutDecision = {
+  policy: ExecuteTimeoutPolicy
+  softTimeoutMs: number
+  watchdogTimeoutMs: number
+  /**
+   * Phase 3 of task-adaptive-recoverable-timeout: how many soft
+   * extensions the runtime will auto-grant after the soft budget is
+   * exhausted. 0 means one-shot recoverable signal with no
+   * extension. Only consulted under `policy: 'soft'`.
+   */
+  maxSoftTimeoutExtensions: number
+  /**
+   * Phase 3: how much soft budget each extension adds. Capped at
+   * the remaining hard watchdog budget at issue time so we never
+   * out-budget the watchdog. Only consulted under `policy: 'soft'`.
+   */
+  softTimeoutExtensionMs: number
 }
 
 export type CreateNexusAppOptions = {
@@ -950,6 +994,23 @@ export async function createNexusApp(
     }
   })
 
+  type WatchdogState = {
+    /**
+     * Phase 5 of the task-adaptive-recoverable-timeout plan: set
+     * to true by the hard watchdog timer when it actually fires.
+     * Lets the execute loop decorate the resulting REQUEST_TIMEOUT
+     * error with `details.kind='watchdog'` so downstream consumers
+     * (Go TUI friendly message, metrics, future SDK clients) can
+     * distinguish a watchdog cutoff from a fresh fatal cutoff.
+     *
+     * Stays false under legacy `fatal` policy because under fatal
+     * the soft and watchdog timeouts collapse, so every cutoff is
+     * effectively the same fatal cutoff; not marking it preserves
+     * back-compat with the existing `REQUEST_TIMEOUT` shape.
+     */
+    fired: boolean
+  }
+
   type PreparedExecution = {
     sessionId: string
     session: SessionSnapshot
@@ -959,12 +1020,32 @@ export async function createNexusApp(
     abortController: AbortController
     timeoutController: AbortController
     timeout: ReturnType<typeof setTimeout>
+    timeoutDecision: ExecuteTimeoutDecision
     policyMode: 'strict' | 'soft-deny'
     allowedTools?: readonly string[]
     allowedPaths?: string[]
+    watchdog: WatchdogState
   }
 
   type PrepareError = { code: string; message: string; status: number }
+
+  function resolveExecuteTimeoutDecision(body: z.infer<typeof executeSchema>): ExecuteTimeoutDecision {
+    const policy = body.timeoutPolicy ?? 'fatal'
+    const legacyTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+    const softTimeoutMs = body.softTimeoutMs ?? legacyTimeoutMs
+    const watchdogTimeoutMs = body.watchdogTimeoutMs ?? (policy === 'soft'
+      ? Math.max(legacyTimeoutMs * 3, legacyTimeoutMs + 300_000)
+      : legacyTimeoutMs)
+    // Phase 3 defaults: a single auto extension equal to the soft
+    // budget gives the model one full window to react to the budget
+    // warning. fatal policy keeps maxSoftTimeoutExtensions=0 so
+    // legacy callers never see the new extension cycle.
+    const maxSoftTimeoutExtensions = policy === 'soft'
+      ? body.maxSoftTimeoutExtensions ?? 1
+      : 0
+    const softTimeoutExtensionMs = body.softTimeoutExtensionMs ?? softTimeoutMs
+    return { policy, softTimeoutMs, watchdogTimeoutMs, maxSoftTimeoutExtensions, softTimeoutExtensionMs }
+  }
 
   async function prepareExecution(body: z.infer<typeof executeSchema>): Promise<PreparedExecution | PrepareError> {
     if (body.executionEnvironment === 'remote' && !options.remoteRunner) {
@@ -1000,7 +1081,18 @@ export async function createNexusApp(
     }
     const abortController = new AbortController()
     const timeoutController = new AbortController()
-    const timeout = setTimeout(() => { timeoutController.abort(); abortController.abort() }, body.timeoutMs ?? executeTimeoutMs)
+    const timeoutDecision = resolveExecuteTimeoutDecision(body)
+    // Phase 5: when the hard watchdog fires, mark a shared
+    // WatchdogState so the execute loop can decorate the
+    // resulting REQUEST_TIMEOUT error with details.kind='watchdog'
+    // and distinguish a system-safety cutoff from a fresh fatal
+    // cutoff in metrics, friendly messages, and persistence.
+    const watchdog: WatchdogState = { fired: false }
+    const timeout = setTimeout(() => {
+      watchdog.fired = true
+      timeoutController.abort()
+      abortController.abort()
+    }, timeoutDecision.watchdogTimeoutMs)
     // Resolve effective policy mode: per-request body field overrides
     // server-side default. Defaults to 'strict' to preserve `bbl chat`
     // / HTTP API back-compat. See Phase B of
@@ -1021,7 +1113,7 @@ export async function createNexusApp(
     await options.storage.saveSession(session)
     await options.storage.appendEvent(sessionId, { type: 'user_message', ...eventBase(sessionId), text: body.prompt })
     const requestId = body.requestId ?? createId('req')
-    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, policyMode, allowedTools, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined }
+    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, timeoutDecision, policyMode, allowedTools, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined, watchdog }
   }
 
   function isPrepareError(r: PreparedExecution | PrepareError): r is PrepareError {
@@ -1086,6 +1178,51 @@ export async function createNexusApp(
     return 200
   }
 
+  /**
+   * Phase 5 of task-adaptive-recoverable-timeout: when the hard
+   * watchdog fired this turn AND the runtime yielded a REQUEST_TIMEOUT
+   * error, decorate the error with `details.kind='watchdog'` (and a
+   * compact softCycle summary) so downstream consumers can credit
+   * the watchdog instead of recommending the operator raise the
+   * fixed-cutoff knob. Only applies under soft policy — fatal
+   * policy callers keep the original `REQUEST_TIMEOUT` shape for
+   * back-compat.
+   *
+   * Pure function: returns a new event when it should be replaced,
+   * undefined when the original should be kept. The caller is
+   * responsible for swapping the in-memory event AND persisting
+   * the decorated version.
+   */
+  function maybeDecorateWatchdogError(options: {
+    event: NexusEvent
+    timeoutDecision: ExecuteTimeoutDecision
+    watchdog: WatchdogState
+    events: readonly NexusEvent[]
+  }): Extract<NexusEvent, { type: 'error' }> | undefined {
+    if (options.event.type !== 'error') return undefined
+    if (options.event.code !== 'REQUEST_TIMEOUT') return undefined
+    if (options.timeoutDecision.policy !== 'soft') return undefined
+    if (!options.watchdog.fired) return undefined
+    const softCycleEvents = options.events.filter(event =>
+      event.type === 'timeout_budget_exceeded' || event.type === 'timeout_extension_granted',
+    )
+    const existingDetails = asRecord(options.event.details) ?? {}
+    const detailRecord: Record<string, unknown> = {
+      ...existingDetails,
+      kind: 'watchdog',
+      policy: 'soft',
+      softTimeoutMs: options.timeoutDecision.softTimeoutMs,
+      watchdogTimeoutMs: options.timeoutDecision.watchdogTimeoutMs,
+      maxSoftTimeoutExtensions: options.timeoutDecision.maxSoftTimeoutExtensions,
+      softCycleEvents: softCycleEvents.length,
+      retryable: false,
+    }
+    return {
+      ...options.event,
+      details: detailRecord,
+    }
+  }
+
   async function maybeAppendNearTimeoutWarning(state: {
     events: NexusEvent[]
     sessionId: string
@@ -1126,6 +1263,147 @@ export async function createNexusApp(
     }, delayMs)
   }
 
+  /**
+   * Phase 2: emit `timeout_budget_exceeded` for one cycle of the
+   * soft timeout watcher. Does NOT touch any AbortController; only
+   * the hard watchdog can abort the runtime under soft policy.
+   *
+   * Phase 3 made this cycle-scoped: each `currentBudgetMs` is the
+   * running soft budget for the current cycle (initial + any
+   * applied extensions). Idempotency is per cycle: a duplicate
+   * fire at the same `currentBudgetMs` is dropped, but a fresh
+   * cycle after an extension grant is allowed to emit again.
+   */
+  async function appendTimeoutBudgetExceededForCycle(state: {
+    events: NexusEvent[]
+    sessionId: string
+    requestId: string
+    currentBudgetMs: number
+    elapsedMs: number
+    send?: (event: NexusEvent) => void
+  }): Promise<void> {
+    const dup = state.events.some(event =>
+      event.type === 'timeout_budget_exceeded' && event.timeoutMs === state.currentBudgetMs,
+    )
+    if (dup) return
+    const event = buildTimeoutBudgetExceededEvent({
+      sessionId: state.sessionId,
+      requestId: state.requestId,
+      timeoutMs: state.currentBudgetMs,
+      elapsedMs: state.elapsedMs,
+      partialSummary: buildPartialTimeoutSummary(state.events),
+    })
+    state.events.push(event)
+    await options.storage.appendEvent(state.sessionId, event)
+    state.send?.(event)
+  }
+
+  /**
+   * Phase 3: emit `timeout_extension_granted` to announce an
+   * auto-extension. Hard watchdog is never extended here.
+   */
+  async function appendTimeoutExtensionGranted(state: {
+    events: NexusEvent[]
+    sessionId: string
+    requestId: string
+    extensionCount: number
+    maxExtensions: number
+    additionalMs: number
+    totalSoftBudgetMs: number
+    elapsedMs: number
+    send?: (event: NexusEvent) => void
+  }): Promise<void> {
+    const event = buildTimeoutExtensionGrantedEvent({
+      sessionId: state.sessionId,
+      requestId: state.requestId,
+      extensionCount: state.extensionCount,
+      maxExtensions: state.maxExtensions,
+      additionalMs: state.additionalMs,
+      totalSoftBudgetMs: state.totalSoftBudgetMs,
+      elapsedMs: state.elapsedMs,
+    })
+    state.events.push(event)
+    await options.storage.appendEvent(state.sessionId, event)
+    state.send?.(event)
+  }
+
+  type SoftTimeoutCycleHandle = {
+    cancel(): void
+  }
+
+  /**
+   * Phase 3: replace the Phase 2 one-shot soft watcher with a
+   * cycle.
+   *
+   * Each cycle waits `currentBudgetMs - alreadyElapsedMs` and then
+   * fires `timeout_budget_exceeded`. If extensions remain, it
+   * immediately fires `timeout_extension_granted`, increments the
+   * cycle's running budget by `extensionMs`, and reschedules.
+   * After `maxExtensions` cycles, no further grant is emitted —
+   * the watchdog stays as the only fatal cutoff.
+   *
+   * Only meaningful when the request opted into
+   * `timeoutPolicy: 'soft'`. Under the legacy `fatal` policy this
+   * helper must not be started.
+   */
+  function scheduleSoftTimeoutCycle(state: {
+    events: NexusEvent[]
+    sessionId: string
+    requestId: string
+    softTimeoutMs: number
+    startedAtMs: number
+    maxExtensions: number
+    extensionMs: number
+    send?: (event: NexusEvent) => void
+  }): SoftTimeoutCycleHandle {
+    let cancelled = false
+    let currentTimer: ReturnType<typeof setTimeout> | undefined
+    let extensionCount = 0
+    let currentBudgetMs = state.softTimeoutMs
+
+    const fire = async (): Promise<void> => {
+      if (cancelled) return
+      const elapsedMs = Math.max(0, Math.round(metrics.now() - state.startedAtMs))
+      await appendTimeoutBudgetExceededForCycle({
+        events: state.events,
+        sessionId: state.sessionId,
+        requestId: state.requestId,
+        currentBudgetMs,
+        elapsedMs,
+        send: state.send,
+      })
+      if (cancelled) return
+      if (extensionCount >= state.maxExtensions) return
+      extensionCount += 1
+      const additionalMs = state.extensionMs
+      currentBudgetMs += additionalMs
+      await appendTimeoutExtensionGranted({
+        events: state.events,
+        sessionId: state.sessionId,
+        requestId: state.requestId,
+        extensionCount,
+        maxExtensions: state.maxExtensions,
+        additionalMs,
+        totalSoftBudgetMs: currentBudgetMs,
+        elapsedMs,
+        send: state.send,
+      })
+      if (cancelled) return
+      const nextDelayMs = Math.max(0, additionalMs)
+      currentTimer = setTimeout(() => { void fire() }, nextDelayMs)
+    }
+
+    const initialDelayMs = Math.max(0, state.softTimeoutMs)
+    currentTimer = setTimeout(() => { void fire() }, initialDelayMs)
+
+    return {
+      cancel(): void {
+        cancelled = true
+        if (currentTimer !== undefined) clearTimeout(currentTimer)
+      },
+    }
+  }
+
   app.post('/v1/execute', async (request, reply) => {
     const releaseExecution = executionGate.tryAcquire()
     if (!releaseExecution) {
@@ -1146,7 +1424,7 @@ export async function createNexusApp(
       if (isPrepareError(prepared)) {
         return reply.status(prepared.status).send({ type: 'error', code: prepared.code, message: prepared.message })
       }
-      const { sessionId, cwd, requestId, abortController, timeoutController, timeout } = prepared
+      const { sessionId, cwd, requestId, abortController, timeoutController, timeout, timeoutDecision } = prepared
       activeSessionId = sessionId
       activeRequestId = requestId
       registerActiveExecution(sessionId, {
@@ -1157,7 +1435,7 @@ export async function createNexusApp(
       })
 
       const events: NexusEvent[] = []
-      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const effectiveTimeoutMs = timeoutDecision.softTimeoutMs
       const nearTimeoutWatcher = startNearTimeoutWatcher({
         events,
         sessionId,
@@ -1165,6 +1443,34 @@ export async function createNexusApp(
         timeoutMs: effectiveTimeoutMs,
         startedAtMs,
       })
+      // Phase 2 of task-adaptive-recoverable-timeout: when the
+      // caller opted into soft policy, fire a one-shot watcher AT
+      // the soft budget that only appends a runtime-visible
+      // `timeout_budget_exceeded` event. The hard watchdog
+      // continues to be the only thing that can abort the runtime.
+      // For legacy fatal policy we skip this watcher: soft and
+      // watchdog timeouts collapse and the existing fatal cutoff
+      // already terminates the loop.
+      //
+      // Phase 3 extends the one-shot watcher into a cycle: after
+      // each budget exhaustion the runtime can auto-grant up to
+      // `maxSoftTimeoutExtensions` extensions (announced via
+      // `timeout_extension_granted`) so the model has time to
+      // react with a deliberate next step. fatal policy keeps
+      // `maxSoftTimeoutExtensions` at 0 in
+      // `resolveExecuteTimeoutDecision`, so the cycle reduces to
+      // zero cycles and back-compat is preserved.
+      const softTimeoutCycle = timeoutDecision.policy === 'soft'
+        ? scheduleSoftTimeoutCycle({
+            events,
+            sessionId,
+            requestId,
+            softTimeoutMs: effectiveTimeoutMs,
+            startedAtMs,
+            maxExtensions: timeoutDecision.maxSoftTimeoutExtensions,
+            extensionMs: timeoutDecision.softTimeoutExtensionMs,
+          })
+        : undefined
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -1184,9 +1490,23 @@ export async function createNexusApp(
           policyMode: prepared.policyMode,
           ...(prepared.allowedTools && { allowedTools: prepared.allowedTools }),
         })) {
-          events.push(event)
-          await options.storage.appendEvent(sessionId, event)
-          recordEventMetrics(event)
+          // Phase 5: when the hard watchdog fired this turn
+          // under soft policy, the resulting REQUEST_TIMEOUT
+          // error must carry `details.kind='watchdog'` so the
+          // Go TUI / metrics layer can distinguish a system
+          // safety cutoff from a fresh fatal cutoff. We
+          // intercept BEFORE pushing/persisting so the
+          // in-memory + storage representations stay
+          // consistent.
+          const decoratedEvent = maybeDecorateWatchdogError({
+            event,
+            timeoutDecision,
+            watchdog: prepared.watchdog,
+            events,
+          }) ?? event
+          events.push(decoratedEvent)
+          await options.storage.appendEvent(sessionId, decoratedEvent)
+          recordEventMetrics(decoratedEvent)
           await maybeAppendNearTimeoutWarning({
             events,
             sessionId,
@@ -1197,6 +1517,7 @@ export async function createNexusApp(
         }
       } finally {
         clearTimeout(nearTimeoutWatcher)
+        softTimeoutCycle?.cancel()
         clearTimeout(timeout)
       }
 
@@ -1214,8 +1535,12 @@ export async function createNexusApp(
         errorEvent,
       })
       resultEvent = partialResultEvent ?? resultEvent
+      const recoveredFromToolDenial = isRecoverableToolDenialOnlyTurn(events, resultEvent, errorEvent, timedOut)
       const succeeded =
-        !timedOut && !errorEvent && resultEvent?.type === 'result' && resultEvent.success
+        !timedOut && !errorEvent && (
+          (resultEvent?.type === 'result' && resultEvent.success) ||
+          recoveredFromToolDenial
+        )
       await finalizeExecutionSession(options.storage, sessionId, {
         succeeded,
         resultEvent,
@@ -1228,7 +1553,7 @@ export async function createNexusApp(
         requestId,
         timeoutMs: effectiveTimeoutMs,
         executeDurationMs,
-        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut),
+        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut, recoveredFromToolDenial),
       })
       events.push(summaryEvent)
       await options.storage.appendEvent(sessionId, summaryEvent)
@@ -1619,18 +1944,42 @@ export async function createNexusApp(
         message: `Session not found: ${params.sessionId}`,
       })
     }
+    const initialPrompt = session.lastUserInput ?? session.prompt
     const result = await compactSession({
       storage: options.storage,
       sessionId: params.sessionId,
       modelId: body.modelId,
       trigger: body.trigger ?? 'manual',
       mapEventsToMessages,
-      initialPrompt: session.lastUserInput ?? session.prompt,
+      initialPrompt,
     })
+    const persistedEvents = await options.storage.listEvents(params.sessionId, { order: 'asc', limit: 10_000 })
+    const assembled = await assembleContext({
+      runtimeOptions: {
+        sessionId: params.sessionId,
+        prompt: initialPrompt,
+        cwd: session.cwd,
+      },
+      events: persistedEvents.events,
+      modelId: body.modelId ?? 'local/coding-runtime',
+      buildSystemPrompt,
+      mapEventsToMessages,
+    })
+    const groundingEvents = buildPostCompactGroundingEvents({
+      sessionId: params.sessionId,
+      source: 'post_compact',
+      boundaryId: result.contextEvent.boundaryId,
+      gitStatus: assembled.gitStatus,
+    })
+    for (const event of groundingEvents) {
+      await options.storage.appendEvent(params.sessionId, event)
+    }
     return {
       type: 'compact_result',
       sessionId: params.sessionId,
       event: result.event,
+      contextEvent: result.contextEvent,
+      groundingEvents,
       beforeEventCount: result.beforeEventCount,
       afterEventCount: result.afterEventCount,
     }
@@ -2267,7 +2616,7 @@ export async function createNexusApp(
       })
       const timeout = prepared.timeout
       const events: NexusEvent[] = []
-      const effectiveTimeoutMs = body.timeoutMs ?? executeTimeoutMs
+      const effectiveTimeoutMs = prepared.timeoutDecision.softTimeoutMs
       const nearTimeoutWatcher = startNearTimeoutWatcher({
         events,
         sessionId,
@@ -2281,6 +2630,36 @@ export async function createNexusApp(
           }
         },
       })
+      // Phase 2: soft watcher fires once at the soft budget and
+      // pushes `timeout_budget_exceeded` over the WS without
+      // aborting. Hard watchdog still owns abort. Only run under
+      // soft policy; legacy fatal callers fall through to the
+      // existing watchdog-driven cutoff.
+      //
+      // Phase 3: same cycle as the HTTP path — after each soft
+      // budget exhaustion the runtime may auto-grant a bounded
+      // number of extensions (announced via
+      // `timeout_extension_granted`). fatal policy keeps
+      // `maxSoftTimeoutExtensions` at 0 in
+      // `resolveExecuteTimeoutDecision`, so legacy WS callers do
+      // not see the new event stream either.
+      const softTimeoutCycle = prepared.timeoutDecision.policy === 'soft'
+        ? scheduleSoftTimeoutCycle({
+            events,
+            sessionId,
+            requestId,
+            softTimeoutMs: effectiveTimeoutMs,
+            startedAtMs,
+            maxExtensions: prepared.timeoutDecision.maxSoftTimeoutExtensions,
+            extensionMs: prepared.timeoutDecision.softTimeoutExtensionMs,
+            send: event => {
+              if (socket.readyState === socket.OPEN) {
+                sendJson(socket, event)
+                metrics.recordStreamEvent(socket.bufferedAmount)
+              }
+            },
+          })
+        : undefined
 
       try {
         for await (const event of options.runtime.executeStream({
@@ -2301,14 +2680,25 @@ export async function createNexusApp(
           policyMode: prepared.policyMode,
           ...(prepared.allowedTools && { allowedTools: prepared.allowedTools }),
         })) {
-          events.push(event)
-          await options.storage.appendEvent(sessionId, event)
-          recordEventMetrics(event)
+          // Phase 5: same watchdog decoration as the HTTP
+          // path. Soft policy + watchdog fired ⇒ rewrite the
+          // REQUEST_TIMEOUT error event with
+          // details.kind='watchdog' before persisting, pushing
+          // to the events array, and sending it over the WS.
+          const decoratedEvent = maybeDecorateWatchdogError({
+            event,
+            timeoutDecision: prepared.timeoutDecision,
+            watchdog: prepared.watchdog,
+            events,
+          }) ?? event
+          events.push(decoratedEvent)
+          await options.storage.appendEvent(sessionId, decoratedEvent)
+          recordEventMetrics(decoratedEvent)
           if (socket.readyState !== socket.OPEN) {
             abortController.abort()
             break
           }
-          sendJson(socket, event)
+          sendJson(socket, decoratedEvent)
           metrics.recordStreamEvent(socket.bufferedAmount)
           await maybeAppendNearTimeoutWarning({
             events,
@@ -2323,13 +2713,14 @@ export async function createNexusApp(
               }
             },
           })
-          if (event.type === 'result') success = event.success
-          if (event.type === 'error' && event.code === 'REQUEST_TIMEOUT') {
+          if (decoratedEvent.type === 'result') success = decoratedEvent.success
+          if (decoratedEvent.type === 'error' && decoratedEvent.code === 'REQUEST_TIMEOUT') {
             timedOut = true
           }
         }
       } finally {
         clearTimeout(nearTimeoutWatcher)
+        softTimeoutCycle?.cancel()
         clearTimeout(timeout)
       }
       timedOut = timedOut || abortController.signal.aborted
@@ -2352,6 +2743,8 @@ export async function createNexusApp(
         resultEvent = partialResultEvent
         success = false
       }
+      const recoveredFromToolDenial = isRecoverableToolDenialOnlyTurn(events, resultEvent, errorEvent, timedOut)
+      if (recoveredFromToolDenial) success = true
       await finalizeExecutionSession(options.storage, sessionId, {
         succeeded: success,
         resultEvent,
@@ -2364,7 +2757,7 @@ export async function createNexusApp(
         requestId,
         timeoutMs: effectiveTimeoutMs,
         executeDurationMs,
-        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut),
+        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut, recoveredFromToolDenial),
       })
       events.push(summaryEvent)
       await options.storage.appendEvent(sessionId, summaryEvent)
@@ -2683,6 +3076,77 @@ function buildNearTimeoutWarningEvent(options: {
   }
 }
 
+/**
+ * Phase 2 of the task-adaptive-recoverable-timeout plan: build a
+ * `timeout_budget_exceeded` event without aborting the runtime.
+ *
+ * The event signals to the model that the soft budget has been
+ * reached. The hard watchdog is still running, so the runtime loop
+ * continues; the model is expected to react to this event in its
+ * next provider call (continue, summarize, narrow scope, or retry
+ * the last tool with a larger budget).
+ */
+function buildTimeoutBudgetExceededEvent(options: {
+  sessionId: string
+  requestId?: string
+  timeoutMs: number
+  elapsedMs: number
+  partialSummary?: string
+}): Extract<NexusEvent, { type: 'timeout_budget_exceeded' }> {
+  const message = options.partialSummary
+    ? 'Soft timeout budget exhausted; the workflow continues — summarize, narrow scope, or continue with a fresh budget.'
+    : 'Soft timeout budget exhausted; the workflow continues — pick a next step (continue / summarize / narrow scope / retry_last_tool).'
+  return {
+    type: 'timeout_budget_exceeded',
+    ...eventBase(options.sessionId),
+    ...(options.requestId !== undefined && { requestId: options.requestId }),
+    timeoutMs: options.timeoutMs,
+    elapsedMs: options.elapsedMs,
+    policy: 'soft',
+    ...(options.partialSummary !== undefined && { partialSummary: options.partialSummary }),
+    suggestedActions: ['continue', 'summarize', 'narrow_scope', 'retry_last_tool'],
+    message,
+  }
+}
+
+/**
+ * Phase 3 of the task-adaptive-recoverable-timeout plan: announce
+ * an auto-extension of the soft budget so the model has time to
+ * react to the budget warning with a deliberate choice. Hard
+ * watchdog is never extended here.
+ */
+function buildTimeoutExtensionGrantedEvent(options: {
+  sessionId: string
+  requestId?: string
+  extensionCount: number
+  maxExtensions: number
+  additionalMs: number
+  totalSoftBudgetMs: number
+  elapsedMs: number
+}): Extract<NexusEvent, { type: 'timeout_extension_granted' }> {
+  const reason: 'auto-first-budget-exhausted' | 'auto-followup-budget-exhausted' =
+    options.extensionCount === 1
+      ? 'auto-first-budget-exhausted'
+      : 'auto-followup-budget-exhausted'
+  const remaining = Math.max(0, options.maxExtensions - options.extensionCount)
+  const message = remaining > 0
+    ? `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; ${remaining} remaining). Pick a deliberate next step.`
+    : `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; this is the last automatic extension). Wrap up or request user confirmation before the watchdog fires.`
+  return {
+    type: 'timeout_extension_granted',
+    ...eventBase(options.sessionId),
+    ...(options.requestId !== undefined && { requestId: options.requestId }),
+    extensionCount: options.extensionCount,
+    maxExtensions: options.maxExtensions,
+    additionalMs: options.additionalMs,
+    totalSoftBudgetMs: options.totalSoftBudgetMs,
+    elapsedMs: options.elapsedMs,
+    policy: 'soft',
+    reason,
+    message,
+  }
+}
+
 function buildTimeoutPartialResultMessage(baseMessage: string, events: readonly NexusEvent[]): string {
   const partialSummary = buildPartialTimeoutSummary(events)
   if (!partialSummary) return baseMessage
@@ -2724,13 +3188,30 @@ function executeSummaryOutcome(
   resultEvent: NexusEvent | undefined,
   errorEvent: NexusEvent | undefined,
   timedOutByAbort: boolean,
+  recoveredFromToolDenial = false,
 ): 'success' | 'error' | 'cancelled' | 'timeout' {
   if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT') return 'timeout'
   if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_CANCELLED') return 'cancelled'
   if (timedOutByAbort) return 'cancelled'
   if (errorEvent?.type === 'error') return 'error'
   if (resultEvent?.type === 'result' && resultEvent.success) return 'success'
+  if (recoveredFromToolDenial) return 'success'
   return 'error'
+}
+
+function isRecoverableToolDenialOnlyTurn(
+  events: readonly NexusEvent[],
+  resultEvent: NexusEvent | undefined,
+  errorEvent: NexusEvent | undefined,
+  timedOutByAbort: boolean,
+): boolean {
+  if (timedOutByAbort || errorEvent?.type === 'error') return false
+  if (resultEvent?.type !== 'result' || resultEvent.success) return false
+  const denials = events.filter((event): event is Extract<NexusEvent, { type: 'tool_denied' }> =>
+    event.type === 'tool_denied',
+  )
+  if (denials.length === 0) return false
+  return denials.every(event => event.recoverable === true && event.terminal !== true)
 }
 
 type ExecuteSummaryOptions = {

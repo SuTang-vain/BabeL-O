@@ -83,7 +83,9 @@ function seedSqliteWithSession(
         CREATE TABLE IF NOT EXISTS events (
           event_key TEXT PRIMARY KEY,
           session_id TEXT NOT NULL,
-          timestamp TEXT NOT NULL
+          timestamp TEXT NOT NULL,
+          event_type TEXT,
+          event_json TEXT
         );
       `)
       const count = options.eventCount ?? 3
@@ -127,6 +129,67 @@ test('inspectSession: tier (a) with no events still returns the row (eventCount=
     assert.equal(result.tier, 'found-in-sqlite')
     if (result.tier !== 'found-in-sqlite') return
     assert.equal(result.row.eventCount, 0)
+  })
+})
+
+test('inspectSession: tier (a) renders compact boundary protocol details', () => {
+  withTempConfigDir((configDir) => {
+    const dbPath = join(configDir, 'db.sqlite')
+    const sessionId = 'session_compact_boundary-uuid'
+    seedSqliteWithSession(dbPath, sessionId, { withEvents: false })
+    const db = new DatabaseSync(dbPath)
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS events (
+          event_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          event_type TEXT,
+          event_json TEXT
+        );
+      `)
+      const event = {
+        type: 'context_compact_boundary',
+        timestamp: '2026-06-12T00:00:00.000Z',
+        trigger: 'manual',
+        boundaryId: 'boundary_123',
+        beforeEventCount: 120,
+        afterEventCount: 14,
+        preTokens: 42_000,
+        postTokens: 7_500,
+        estimatedTokensSaved: 34_500,
+        summaryChars: 780,
+        snippedToolResults: 3,
+        messagesSummarized: 119,
+        droppedItemCount: 119,
+        retainedItemCount: 13,
+        retainedEventCount: 13,
+        preservedTailEventId: 'event_tail',
+        retainedSegmentHash: 'hash_abc',
+        userVisibleSummary: 'Earlier context summary for the operator.',
+      }
+      db.prepare(
+        `INSERT OR REPLACE INTO events (event_key, session_id, timestamp, event_type, event_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run('evt_context_boundary', sessionId, event.timestamp, event.type, JSON.stringify(event))
+    } finally {
+      try { db.close() } catch { /* ignore */ }
+    }
+
+    const result = inspectSession(sessionId)
+    assert.equal(result.tier, 'found-in-sqlite')
+    if (result.tier !== 'found-in-sqlite') return
+    assert.equal(result.row.compactBoundaries.length, 1)
+    const boundary = result.row.compactBoundaries[0]
+    assert.equal(boundary.type, 'context_compact_boundary')
+    assert.equal(boundary.boundaryId, 'boundary_123')
+    assert.equal(boundary.beforeEventCount, 120)
+    assert.equal(boundary.afterEventCount, 14)
+    assert.equal(boundary.preTokens, 42_000)
+    assert.equal(boundary.postTokens, 7_500)
+    assert.equal(boundary.estimatedTokensSaved, 34_500)
+    assert.equal(boundary.retainedEventCount, 13)
+    assert.equal(boundary.preservedTailEventId, 'event_tail')
   })
 })
 

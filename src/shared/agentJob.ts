@@ -73,6 +73,38 @@ export type AgentFinding = {
   evidence?: string
 }
 
+export type AgentContextProvenance = {
+  forkMode: ContextForkMode
+  inheritedItems: number
+  omittedItems: number
+  included: string[]
+  omitted: string[]
+  workingSetPaths: string[]
+  parentSummary?: {
+    sessionId: string
+    eventCount: number
+    latestUserMessages: number
+    compactSummaries: number
+    childAgentResults: number
+    failures: number
+    toolTraces: number
+  }
+  toolTraceReferences?: Array<{
+    toolUseId: string
+    name: string
+    timestamp: string
+    success?: boolean
+    inputPreview?: string
+    outputPreview?: string
+  }>
+  childWorkingSet?: Array<{
+    path: string
+    source: string
+    touches: number
+    isDir?: boolean
+  }>
+}
+
 export type AgentResult = {
   summary: string
   findings?: AgentFinding[]
@@ -81,4 +113,5 @@ export type AgentResult = {
   commandsRun?: string[]
   nextSteps?: string[]
   confidence?: 'low' | 'medium' | 'high'
+  contextProvenance?: AgentContextProvenance
 }

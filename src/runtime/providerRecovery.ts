@@ -91,6 +91,14 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
     'input tokens',
     'token limit',
     'too many tokens',
+    'context size limit',
+    'context_length',
+    'context too long',
+    'exceed context',
+    'exceeds context',
+    'tokens exceed',
+    'token count exceeds',
+    '1301',
   ])) {
     return {
       providerId: error.providerId,

@@ -9,220 +9,161 @@
   <strong>由 KezhongKe（壳中客）提供技术支持。</strong>
 </p>
 
-> **高性能、以 Nexus 服务端为核心（Nexus-first）的通用泛化 AI 智能体（Generalized Agent）。基于 Node.js 与 Fastify 构建，拥有独立的执行运行时、原生 stdio MCP 客户端、动态上下文压缩与状态重建，支持通过轻量级交互式终端 TUI CLI 进行管控。**
+> **以 Nexus 为核心的 AI 编程智能体，提供快速 Go TUI、持久化 session、工具权限治理与跨 session 协作能力。**
 
 [English README](README.md)
 
 ---
 
-## 什么是 BabeL-O？
+## BabeL-O 是什么？
 
-BabeL-O 采用 **以 Nexus 服务端为核心（Nexus-first）的架构设计**，旨在将智能体核心的状态控制与执行逻辑从终端客户端中剥离，移至无界面（Headless）的服务端运行时（**Nexus**）。它贯彻以下设计原则：
+BabeL-O 是面向真实开发工作的终端 AI agent。交互端保持轻量、快速、稳定；Nexus 负责持久化运行状态，包括 session、工具、权限、上下文、记忆与执行轨迹。
 
-> **Nexus 负责执行与状态，CLI 负责交互。**
+当前正式交互入口是 Go TUI：
 
-通过将终端用户界面（TUI）与核心执行引擎彻底解耦，BabeL-O 不仅能作为一个长驻的后台服务运行，还可以作为 CI 门禁中的无界面智能体或隔离的容器化任务求解智能体；同时，为用户提供一个极速、零开销的终端命令行客户端 `bbl` 进行日常交互。
-
----
-
-## 架构设计
-
-BabeL-O 实现了渲染与执行的严格分层。客户端与服务端通过轻量级的 REST 路由和双向 WebSocket 事件流进行通信。
-
-```mermaid
-graph TD
-    subgraph TUI_CLI [TUI CLI - 终端客户端]
-        Program[入口程序 cli/program.ts] --> Renderer[渲染模块 cli/renderEvents.ts]
-        Renderer --> Client[Nexus 客户端 cli/NexusClient.ts]
-    end
-
-    subgraph Nexus_Server [Nexus 服务端 - Fastify 守护进程]
-        Routes[REST API 路由]
-        WS[WebSocket 事件流]
-        Agent[智能体循环 agentLoop.ts]
-
-        Routes --- WS
-        WS --- Agent
-    end
-
-    subgraph Runtime_Layer [执行运行时]
-        Local[LocalCodingRuntime]
-        LLM[LLMCodingRuntime]
-    end
-
-    subgraph Core_Services [核心服务与存储层]
-        Tools[内置工具库与 MCP 注册表]
-        Storage[(SQLite / 内存存储)]
-        Providers[Provider 注册表 / 模型适配器]
-    end
-
-    Client -- HTTP / WebSockets --> Nexus_Server
-    Nexus_Server --> Runtime_Layer
-    Runtime_Layer --> Core_Services
+```bash
+bbl go
 ```
 
----
+它会连接 Nexus，并可在本地 Nexus 不健康时自动拉起服务。你可以在同一个终端界面中完成对话、工具调用、session 切换、context 查看、权限审批和跨 session 协作。
 
-## 主要特性
-
-- **轻量级解耦（零 React/Ink 依赖）**：摆脱 React 组件树的开销。使用原生 Node.js readline 与流式事件监听，实现毫秒级启动与纯净执行。
-- **双运行时设计**：
-  - `LocalCodingRuntime`：基于确定性模式匹配，无需调用模型即可超快速响应，节约 Token 消耗。
-  - `LLMCodingRuntime`：完整的智能体循环，单轮对话支持多达 25 次工具调用与反复修正。
-- **上下文压缩与后压缩状态重建**：在会话逼近 Token 极限时自动触发压缩（`compact_boundary`）。不同于普通的历史截断，它会在压缩前智能抽取模型读取过的关键文件内容 Stub 和当前的任务状态，并将其重新格式化后注入 System Prompt，完美延续长对话的“长期记忆”。
-- **可选 Docker 沙箱与 Shell HMAC 防伪探针**：
-  - 支持将 Shell 命令执行（`bash`）限制在 Docker 隔离容器中，控制网络（默认禁用）、CPU 和内存。
-  - 在本地直接执行 Bash 时，使用基于 HMAC 加密签名的随机 Nonce 对输出进行状态探测，防范 CWD 劫持和 Shell 提示符注入攻击。
-- **严格的工作区路径保护**：通过统一的 `pathSafety.ts` 拦截非工作区文件读写，使用 `realpath` 解析真实物理路径，彻底防范利用符号链接（Symlinks）逃逸安全区。
-- **原生 MCP Stdio 客户端**：通过 `mcp.json` 配置直接接入 Model Context Protocol 服务端，将其动态包装为经过安全分级的原生工具。
-- **Planner ➔ Executor ➔ Critic 编排**：支持在隔离的 Git Worktree 中进行复杂的智能体协作，配合工作区文件系统互斥锁（Mutex Locks）实现安全的并发开发与自动合并/回滚。
-- **SessionChannel 协作（v0.3.2）**：类型化、先预览后确认的 side-channel 消息通道，用于跨 session 共享 finding、review 请求、handoff 与决策。TUI 中体现为 Inbox / Activity / Channels graph 浮层，CLI 中通过 `bbl sessions inbox` / `bbl sessions ack` 暴露给无头消费者。side-channel 内容始终是上下文，绝不会被当作用户直接指令。
-- **更稳的 chat 启动与闲置循环**：`bbl chat` 在 stdin/stdout 任意一侧非 TTY 时直接报错并指向 `bbl run`；SEA 单文件二进制在闲置状态下会保留一个空操作定时器，避免事件循环清空后 prompt 消失。
-- **结构化审计**：所有工具输入输出、模型用量和权限变更日志均自动落盘至 SQLite 数据库（基于原生 `node:sqlite`）。
+<p align="center">
+  <img src="docs/assets/product.png" alt="BabeL-O Go TUI 产品截图" width="920" />
+</p>
 
 ---
 
-## 安装与部署
+## 核心亮点
 
-你可以通过发布版安装脚本、直接下载预编译原生二进制包，或通过源码构建来进行安装。
+- **正式 Go TUI**：`bbl go` 是日常交互客户端，提供 Bubble Tea 界面、多行输入、斜杠命令面板、权限弹窗、context 面板和稳定的 transcript 渲染。
+- **持久化 Nexus Session**：会话历史、工具轨迹、用量统计、压缩后的上下文和 session 元数据都可以跨重启保留与检查。
+- **Session 切换与对话流**：`/session` 面板支持创建、选择、切换 session，并可复制当前 session id。
+- **SessionChannel 协作**：不同 session 可以交换 finding、handoff、review request、decision、memory candidate 等类型化消息，但这些消息永远只是协作上下文，不会被当作直接用户指令执行。
+- **上下文与记忆可视化**：`/context` 展示 token budget、压缩状态、记忆注入、恢复信息和 working set，让长对话状态更透明。
+- **权限优先的工具系统**：Bash、Write、Edit、MCP 等敏感工具通过可见审批流执行，并保留 session 级信任和审计记录。
+- **MCP 与内置工具**：内置 Read、Grep、ListDir、Bash、WebSearch，并支持从 `mcp.json` 接入 MCP server。
+- **模型与 Profile 控制**：可在 TUI 中切换模型、provider 和 profile，配置状态由 Nexus 统一维护。
 
-### 方法一：发布版安装脚本（推荐，最快）
+---
+
+## 安装
+
+### 发布版安装脚本
 
 macOS 和 Linux 下，安装脚本会检测系统与架构，下载最新匹配的 GitHub release 二进制，并安装为 `bbl`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
-bbl chat
+bbl go
 ```
 
-如需安装指定版本，可给安装进程传入 `BBL_VERSION`：
+安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.2 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.3 bash
+bbl go
 ```
 
-安装脚本会先下载到临时文件，失败下载会重试；当 GitHub 返回文件大小时会校验实际下载大小，并拒绝把非二进制的 HTTP 错误响应安装成 `bbl`。
+### 手动下载发布二进制
 
-### 方法二：下载预编译原生二进制包
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制，也可以查看 [v0.3.3 发布说明](docs/releases/v0.3.3.md) 中的版本下载链接。
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 页面下载对应系统的最新单文件可执行二进制包（macOS/Linux 为 `bbl`，Windows 为 `bbl.exe`），也可查看 [版本发布说明](docs/releases/v0.3.2.md) 中的对应下载链接。
+将下载好的 `bbl` 放入系统 `$PATH` 后运行：
 
-将下载好的二进制文件移动到系统环境变量 `$PATH` 包含的目录中（例如 macOS/Linux 下的 `/usr/local/bin`），即可直接全局运行：
 ```bash
-# 启动交互式会话（本地无需安装任何 Node.js 运行环境）
-bbl chat
+bbl go
 ```
 
----
+### 从源码构建
 
-### 方法三：通过源码构建安装（用于开发调试）
+前提条件：
 
-#### 前提条件
+- Node.js >= 22
+- npm
+- 本地开发 Go TUI 时需要 Go toolchain
+- 可选 Docker，用于隔离 Shell 执行
 
-*   **Node.js >= 22**（使用了原生 ESM 与 native SQLite 模块）
-*   **npm** 或 **yarn**
-*   *可选：* Docker（用于运行沙箱环境）
-
-#### 源码构建步骤：
 ```bash
-# 克隆仓库
 git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
-
-# 按 package-lock.json 精确安装依赖
 npm ci
-
-# 运行自动化测试
 npm test
-
-# 选项 A：使用 npm 脚本构建运行
 npm run build
-npm run start # 启动后台守护 Nexus 服务
-
-# 选项 B：编译为单文件原生二进制包
-# 如果当前 Node.js 运行时不支持原生 --build-sea，构建脚本会自动下载并缓存官方 Node.js 26.x builder。
-npm run build:binary
-```
-
-贡献者进行本地开发时，请阅读 [`dev` 分支开发指南](https://github.com/SuTang-vain/BabeL-O/blob/dev/docs/DEVELOPMENT.zh-CN.md)。
-
-如果使用**选项 A**，请在另一个终端中全局软链并启动 CLI 客户端：
-```bash
 npm link
-bbl chat
+bbl go
 ```
 
-如果使用**选项 B**，可直接运行编译好的二进制：
+构建 Node 单文件二进制：
+
 ```bash
-./dist/bbl chat
+npm run build:binary
+./dist/bbl go
 ```
 
-#### 独立原生二进制包编译 (Node.js SEA) 特性：
-* **全自包含 (Self-contained)**：目标运行系统上无需预装 Node.js 环境或 `node_modules` 依赖。
-* **内置资源整合 (Embedded Assets)**：内置的开发者技能（`.md` 技能文件）直接作为 SEA Asset 嵌入二进制包中，运行时原生动态加载。
-* **Homebrew 优化与剥离处理 (Homebrew Workaround)**：若编译环境使用的是被剥离了符号的 Node 运行时（如 macOS Homebrew 版本），脚本会自动从官方源下载、解压并缓存官方的 Node 模板二进制文件，以防注入失败。
-* **ESM require 垫片**：使用动态 Banner 垫片技术，支持打包后 ESM 代码中对 CommonJS 依赖库的无缝调用。
+构建源码树中的 Go TUI 本地二进制：
+
+```bash
+cd clients/go-tui
+make build
+cd ../..
+bbl go --check
+```
 
 ---
 
-## 命令行客户端（bbl）用法说明
+## 快速开始
 
 ```bash
-bbl chat                         # 启动交互式终端对话会话
-bbl chat dev                     # 在源码树中以 dev 模式启动
-bbl run <prompt>                 # 执行单次 Prompt 命令
-bbl optimize                     # 启动智能体自我优化流
-bbl nexus start                  # 启动后台守护 Nexus 服务
-bbl nexus status                 # 检查服务端健康度
-bbl sessions list                # 列出所有持久化的会话历史（带关系标签）
-bbl sessions tree                # 以树形展示 parent-child 会话结构
-bbl sessions inbox <sessionId>   # 列出指定 session 的未读 SessionChannel 消息
-bbl sessions ack <sessionId> <messageId>   # 确认一条 SessionChannel 收件箱消息
-bbl sessions inspect <sessionId> # 深入检查特定会话的事件日志与工具追踪
-bbl tools list                   # 列出可用工具集及其安全状态
-bbl tools audit                  # 审计过往工具执行的风险记录
-bbl config show                  # 展示当前配置项
+bbl go                           # 启动正式 Go TUI
+bbl go --check                   # 检查 Go TUI 二进制、Nexus 健康度和版本兼容
+bbl run "summarize this repo"     # 不打开 TUI，执行一次性 prompt
+bbl nexus status                 # 检查 Nexus 状态
+bbl sessions list                # 列出持久化 session
+bbl sessions inspect <sessionId> # 查看 session 详情与工具轨迹
+bbl tools list                   # 列出可用工具
+bbl tools audit                  # 查看工具审计历史
+bbl config show                  # 查看当前配置
 ```
 
-### 终端交互快捷键
+Go TUI 内常用操作：
 
-| 快捷键 / 指令 | 功能 |
+| 输入 | 功能 |
 | :--- | :--- |
-| `Ctrl+C` | 中断当前模型的循环生成与工具执行（不会退出客户端） |
-| `/help` | 展示斜杠指令面板 |
-| `/clear` | 清屏 |
-| `/exit` | 退出当前会话 |
-| `/model <id>` | 动态切换当前会话所用的 LLM 模型 |
-| `/status` | 展示当前服务端配置、授权状态与健康度 |
-| `/inbox` | 打开 SessionChannel 收件箱浮层 |
-| `/collaborate` | 打开统一的 Inbox / Channels / Agents 协作中心 |
-| `/channels graph` | 渲染只读的 SessionChannel 调试拓扑图 |
-| `/channel send ...` | 预览一条类型化 SessionChannel 消息 |
-| `/channel send confirm` | 真正发送刚才预览的 SessionChannel 消息 |
-| `/activity` | 展示当前 session 最近的 SessionChannel 活动 |
-| 权限选择面板 | 为当前敏感工具权限请求选择批准/拒绝范围 |
-
-### SessionChannel 协作能力
-
-v0.3.2 将 SessionChannel 提升为用户可见能力。聊天循环始终把 side-channel 消息当作**有类型的协作上下文**而非用户直接指令：`question` / `answer` / `finding` / `request_review` / `request_validation` / `hypothesis` / `decision` / `blocked` / `memory_candidate` / `handoff` 等负载统一在 Inbox / Activity / Channels graph 浮层中呈现，并且必须经过显式的 `confirm` 步骤才会真正下发。
-
-协作三步流程：
-
-1. **查看** – 通过 `/inbox`、`/activity` 或 `/collaborate` 了解当前 session 的未读消息、最近活动以及参与的 channel。
-2. **预览** – 通过 `/channel send channel=<id> [to=<sessionId>|broadcast=true] [type=...] [priority=...] -- <message>` 生成发送预览，或者用 `/inbox reply channel=<id> message=<id> -- <message>` 起草回复。
-3. **确认** – 重新执行命令并附加 `confirm`，刚才的草稿会被实际发送；追加 `cancel` 则丢弃草稿。
-
-TUI 之外，`bbl sessions inbox <sessionId>` 把同一份收件箱以 JSON / 文本形式暴露给 CI / 无头调用者；`bbl sessions ack <sessionId> <messageId>` 用于在不发回复的前提下显式确认消息；`bbl sessions tree` 渲染 session 的 parent / child 关系；`bbl sessions list` 在每一行末尾标注关系徽章（parent / child / peer / bridge）。
-
-硬性规则：side-channel 消息永远不能替代真正的用户 prompt。聊天循环不会基于 Inbox 文本自动执行任何动作，所有 `SessionChannel` 内容都被视为需要先核实再决策的协作上下文。
+| `/` | 打开斜杠命令面板 |
+| `/session` | 打开 session 操作面板 |
+| `/context` | 查看当前 context budget 与诊断信息 |
+| `/tools` 或 `Ctrl+O` | 打开工具面板 |
+| `/model` 或 `Ctrl+L` | 打开模型/profile 选择 |
+| `Ctrl+D` | 打开顶部状态面板 |
+| `Shift+Enter` | 在输入框中插入换行 |
+| `Ctrl+C` | 打开退出确认弹窗 |
+| `Esc` | 关闭当前面板或弹窗 |
 
 ---
 
-## 配置文件说明
+## Session 协作
 
-BabeL-O 在本地的 `~/.babel-o/config.json` 下维护其配置。
+BabeL-O 将 session-to-session 消息视为协作上下文，而不是隐藏 prompt。一条消息可以表达 finding、handoff、review request、validation request、hypothesis、decision、blocked 状态或 memory candidate，但接收方仍必须显式核实和行动。
 
-配置范例：
+常用命令：
+
+```bash
+bbl sessions list
+bbl sessions tree
+bbl sessions inbox <sessionId>
+bbl sessions ack <sessionId> <messageId>
+bbl sessions inspect <sessionId>
+```
+
+在 Go TUI 中，可用 `/session` 创建或切换 session，用 `/inbox` 查看跨 session 消息，用 `/activity` 查看近期协作事件。
+
+---
+
+## 配置
+
+BabeL-O 使用 `~/.babel-o/config.json` 保存本地配置。
+
+示例：
 
 ```json
 {
@@ -233,81 +174,39 @@ BabeL-O 在本地的 `~/.babel-o/config.json` 下维护其配置。
 }
 ```
 
-### 兼容的模型供应商
+支持的 provider 包括：
 
-- `anthropic`（支持前缀缓存与原生推理思考块展示）
-- `openai`（标准 OpenAI-compatible chat/completions）
-- `deepseek`（OpenAI-compatible DeepSeek 模型）
-- `moonshot`（OpenAI-compatible Moonshot/Kimi 模型）
-- `ollama`（本地 OpenAI-compatible 端点，默认无需 API key）
-- `zhipu`（Anthropic-compatible GLM 端点）
-- `minimax`（Anthropic-compatible 端点，包含 MiniMax 文本编码 tool-call 归一化）
-- `local`（本地 Mock 适配器，用于单元测试和基准压测）
-
----
-
-## Nexus API 与 WebSocket 说明
-
-Nexus 服务端基于 Fastify 构建，暴露标准的 REST 接口与 WebSocket 供第三方界面或自动化脚本接入：
-
-### REST 接口
-
-- `POST /v1/sessions` - 创建会话
-- `POST /v1/sessions/:id/input` - 输入用户 Prompt
-- `POST /v1/sessions/:id/approve` / `deny` - 提交安全审查响应
-- `GET /v1/sessions/:id/tool-traces` - 获取特定会话的工具执行轨迹
-
-### WebSocket 接口
-
-```
-GET /v1/stream?sessionId=<id>
-```
-
-以 `NexusEvent` 结构返回实时流式事件包：
-*   `session_started` / `session_ended`
-*   `assistant_delta`（助手的流式文本输出）
-*   `thinking_delta`（实时思维链思考块）
-*   `tool_started` / `tool_completed` / `tool_denied`（工具执行生命周期）
-*   `permission_request` / `permission_response`（交互式安全校验）
-*   `inbox_message` / `channel_activity`（SessionChannel side-channel 事件）
-*   `usage` (计费与 Token 统计遥测)
-*   `result` / `error`（最终结果或致命故障归一化）
+- `anthropic`
+- `openai`
+- `deepseek`
+- `moonshot`
+- `ollama`
+- `zhipu`
+- `minimax`
+- `local`，用于测试和基准压测
 
 ---
 
-## 目录结构说明
+## 安全模型
 
-```
-BabeL-O/
-├── bin/
-│   └── bbl.js                    # CLI 入口（基于 tsx 转发）
-├── src/
-│   ├── nexus/                    # Fastify API 接口、任务队列与 AgentLoop 多角色协作
-│   ├── runtime/                  # 运行时引擎、上下文组装与自动压缩
-│   ├── tools/                    # 内置核心工具库（Read、Edit、Bash）与沙箱路径检查
-│   ├── mcp/                      # JSON-RPC MCP 协议桥接客户端
-│   ├── providers/                # LLM 模型适配层（Anthropic/OpenAI 兼容）
-│   ├── cli/                      # Commander 命令注册与 TUI 控制台渲染器
-│   │                             # 包含 inboxOverlay / activityOverlay / channelGraph /
-│   │                             # channelSend / collaborateOverlay 等 SessionChannel 浮层
-│   ├── storage/                  # SQLite 数据库底层（node:sqlite）
-│   ├── skills/                   # 系统提示词技能加载与匹配
-│   └── shared/                   # 全局类型定义、标准事件与配置单例
-└── test/                         # 自动化测试用例集
-```
+BabeL-O 围绕明确边界设计：
+
+- 工作区路径检查会阻止目录穿越和 symlink 逃逸。
+- 高风险工具需要可见的权限决策。
+- 工具输入输出、批准/拒绝记录和用量事件都会持久化，便于回溯。
+- SessionChannel 内容不会作为直接指令执行。
+- Nexus 是运行状态的事实源，TUI 专注于交互体验。
 
 ---
 
-## 未来路线图与未来规划 (Roadmap)
+## 文档
 
-在接下来的阶段中，项目规划（Phase 10）将围绕以下分工进行战略升级：
-* **Go TUI (`bbl go`) 升级为正式面向用户的发布版**：作为零依赖、超低资源消耗的独立单文件二进制进行分发。它将作为主命令 `bbl` 的默认界面，内置后台 Nexus 服务端自启动管理，提供最高级的交互稳定性和抗闪烁视口排版。
-* **TypeScript TUI (`bbl chat`) 转化为开发调试专用版**：保留在源码树中，不再追求复杂界面的升级，专注于作为核心开发人员在测试新 API 和大模型协议变动时的轻量级交互沙箱与调试控制台（Debug Console）。
-
-更多长线架构规划，请阅读 [Go TUI 长期重写计划](docs/nexus/reference/go-tui-rewrite-plan.md)。
+- [发布说明](docs/releases/README.md)
+- [Go TUI 客户端说明](clients/go-tui/README.md)
+- [Nexus 规划与实现记录](docs/nexus/README.md)
 
 ---
 
 ## 开源协议
 
-本项目采用 MIT 开源协议 - 详情请参阅 [LICENSE](LICENSE) 文件。
+本项目采用 MIT 开源协议。详情请参阅 [LICENSE](LICENSE)。

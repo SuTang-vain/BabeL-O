@@ -61,6 +61,8 @@ test('LocalCodingRuntime blocks forbidden actions under optimizer role', async (
   const toolDenied = events.find(e => e.type === 'tool_denied')
   assert.ok(toolDenied)
   assert.match(toolDenied.message, /File modification denied/)
+  assert.equal(toolDenied.recoverable, true)
+  assert.equal(toolDenied.denialKind, 'optimizer_safety')
 
   const result = events.find(e => e.type === 'result')
   assert.ok(result)

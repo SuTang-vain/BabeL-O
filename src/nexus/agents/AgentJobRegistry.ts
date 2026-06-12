@@ -330,6 +330,15 @@ function cloneAgentResult(result: AgentResult | undefined): AgentResult | undefi
     commandsRun: result.commandsRun ? [...result.commandsRun] : undefined,
     nextSteps: result.nextSteps ? [...result.nextSteps] : undefined,
     confidence: result.confidence,
+    contextProvenance: result.contextProvenance ? {
+      ...result.contextProvenance,
+      included: [...result.contextProvenance.included],
+      omitted: [...result.contextProvenance.omitted],
+      workingSetPaths: [...result.contextProvenance.workingSetPaths],
+      parentSummary: result.contextProvenance.parentSummary ? { ...result.contextProvenance.parentSummary } : undefined,
+      toolTraceReferences: result.contextProvenance.toolTraceReferences?.map(reference => ({ ...reference })),
+      childWorkingSet: result.contextProvenance.childWorkingSet?.map(item => ({ ...item })),
+    } : undefined,
   }
 }
 

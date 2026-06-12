@@ -10,7 +10,7 @@ import (
 // It is a stateless view over a (scroll, height) snapshot taken
 // from the main model — see model.renderHelp for the bridge.
 //
-// Per upgrade-plan.md Phase C.4, this migration is structure-only:
+// Per docs/nexus/archive/go-tui-v1-ui-upgrade.md Phase C.4, this migration is structure-only:
 //
 //   - Visual layout is identical to the pre-migration renderHelp:
 //     title + divider + visible window of helpOverlayLines, all

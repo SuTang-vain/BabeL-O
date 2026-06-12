@@ -7,16 +7,16 @@ import {
 } from '../src/runtime/systemPromptBuilder.js'
 
 describe('buildSystemPromptSections', () => {
-  test('produces 7 static (cacheable) sections', () => {
+  test('produces 8 static (cacheable) sections', () => {
     const sections = buildSystemPromptSections({
       cwd: '/tmp/test',
       platform: 'darwin',
     })
     const staticSections = sections.filter(s => s.cacheable)
-    assert.ok(staticSections.length === 7, `Expected 7 static sections, got ${staticSections.length}`)
+    assert.ok(staticSections.length === 8, `Expected 8 static sections, got ${staticSections.length}`)
     const staticIds = staticSections.map(s => s.id)
     assert.deepEqual(staticIds, [
-      'identity', 'system_rules', 'task_guidelines',
+      'identity', 'system_rules', 'context_facts', 'task_guidelines',
       'tool_usage', 'risky_actions', 'tone_style', 'output_efficiency',
     ])
   })
@@ -134,6 +134,25 @@ describe('buildSystemPromptSections', () => {
     assert.ok(rules)
     assert.ok(rules!.content.includes('Latest instruction priority'))
     assert.ok(rules!.content.includes('immediately stop the previous task'))
+  })
+
+  test('context_facts prohibits ungrounded context percentages', () => {
+    const sections = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+    })
+    const facts = sections.find(s => s.id === 'context_facts')
+    assert.ok(facts)
+    assert.equal(facts!.cacheable, true)
+    assert.ok(facts!.content.includes('Context usage numbers are runtime facts'))
+    assert.ok(facts!.content.includes('Do not estimate, invent, or narrate context percentages'))
+    assert.ok(facts!.content.includes('context_usage'))
+    assert.ok(facts!.content.includes('context_warning'))
+    assert.ok(facts!.content.includes('context_blocking'))
+    assert.ok(facts!.content.includes('上下文已 X%'))
+    assert.ok(facts!.content.includes('Compact summaries are indexes/recovery hints'))
+    assert.ok(facts!.content.includes('context_grounding_required'))
+    assert.ok(facts!.content.includes('workspace_dirty_detected'))
   })
 
   test('task_guidelines contains action vs analysis guidance', () => {

@@ -67,6 +67,8 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [archive/TODO_tool_result_budget.md](./archive/TODO_tool_result_budget.md) | 已完成的工具结果持久化与消息级预算历史设计。 |
 | [archive/intake-classifier-upgrade-plan.md](./archive/intake-classifier-upgrade-plan.md) | 已完成的 Intake Classifier Phase 1-4 历史规划。 |
 | [archive/tool-call-text-leakage-governance.md](./archive/tool-call-text-leakage-governance.md) | 已完成 Phase A-C 的 Tool-call Text Leakage 治理设计；后续 corpus watch 由 Runtime TODO 承接。 |
+| [archive/phase-9-promotion-decision.md](./archive/phase-9-promotion-decision.md) | 已收口的 Go TUI Phase 9 stable-alternative 提升决策记录。 |
+| [archive/go-tui-v1-ui-upgrade.md](./archive/go-tui-v1-ui-upgrade.md) | 已完成的 Go TUI v1 UI/UX 升级规划与实施记录。 |
 
 ## 当前实现状态
 

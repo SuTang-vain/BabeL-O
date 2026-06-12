@@ -6,6 +6,7 @@ import { grepTool } from './builtin/grep.js'
 import { listDirTool } from './builtin/listDir.js'
 import { readTool } from './builtin/read.js'
 import { taskTool } from './builtin/task.js'
+import { webSearchTool } from './builtin/webSearch.js'
 import { writeTool } from './builtin/write.js'
 
 export function createDefaultToolRegistry(): Map<string, AnyTool> {
@@ -18,6 +19,7 @@ export function createDefaultToolRegistry(): Map<string, AnyTool> {
     editTool,
     bashTool,
     taskTool,
+    webSearchTool,
   ]
   return new Map(tools.map(tool => [tool.name, tool as AnyTool]))
 }

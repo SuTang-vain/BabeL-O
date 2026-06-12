@@ -268,7 +268,9 @@ test('Deny-by-default blocks high risk tools unless allowed', async () => {
     })
     assert.equal(res.statusCode, 200)
     const body = res.json()
-    assert.equal(body.success, false)
+    assert.equal(body.success, true)
+    assert.equal(body.result.success, false)
+    assert.ok(body.result.message.includes('Tool denied by Nexus policy: Write'))
     assert.ok(body.events.some((e: any) => e.type === 'tool_denied' && e.name === 'Write' && e.message.includes('policy')))
   } finally {
     await app.close()

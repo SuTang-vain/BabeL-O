@@ -8,6 +8,7 @@ export type {
   AgentJobStatus,
   AgentProfileId,
   AgentResult,
+  AgentContextProvenance,
   ContextForkMode,
 } from '../../shared/agentJob.js'
 

@@ -1,12 +1,18 @@
 import type { NexusEvent } from '../../shared/events.js'
 import type { SessionSnapshot } from '../../shared/session.js'
 import { deriveWorkingSet, formatWorkingSet, type WorkingSetEntry } from '../../runtime/workingSet.js'
-import type { AgentJob, ContextForkMode } from './types.js'
+import type { AgentContextProvenance, AgentJob, ContextForkMode } from './types.js'
 
 export type ContextForkDiagnostics = {
   included: string[]
   omitted: string[]
   workingSetPaths: string[]
+  inheritedItems: string[]
+  excludedItems: string[]
+  parentSummary: NonNullable<AgentContextProvenance['parentSummary']>
+  toolTraceReferences: NonNullable<AgentContextProvenance['toolTraceReferences']>
+  childWorkingSet: NonNullable<AgentContextProvenance['childWorkingSet']>
+  provenance: AgentContextProvenance
   eventReferences: Array<{
     type: string
     timestamp: string
@@ -198,12 +204,71 @@ function buildForkResult(
     inheritedItems: options.inheritedItems,
     omittedItems: options.omittedItems,
     allowedPaths: options.allowedPaths.length > 0 ? options.allowedPaths : undefined,
-    diagnostics: {
-      included: options.included,
-      omitted: options.omitted,
-      workingSetPaths: state.workingSetEntries.map(entry => entry.path),
-      eventReferences: buildEventReferences(state),
-    },
+    diagnostics: buildForkDiagnostics(state, options),
+  }
+}
+
+function buildForkDiagnostics(
+  state: ContextForkBuilderState,
+  options: {
+    included: string[]
+    omitted: string[]
+    allowedPaths: string[]
+    inheritedItems: number
+    omittedItems: number
+  },
+): ContextForkDiagnostics {
+  const workingSetPaths = state.workingSetEntries.map(entry => entry.path)
+  const childWorkingSet = state.workingSetEntries.map(entry => ({
+    path: entry.path,
+    source: entry.source,
+    touches: entry.touches,
+    ...(entry.isDir !== undefined && { isDir: entry.isDir }),
+  }))
+  const toolTraceReferences = buildToolTraceReferences(state)
+  const parentSummary = {
+    sessionId: state.parentSession.sessionId,
+    eventCount: state.parentSession.events.length,
+    latestUserMessages: state.summaries.latestUserMessages.length,
+    compactSummaries: state.summaries.compactSummaries.length,
+    childAgentResults: state.summaries.childAgentEvents.length,
+    failures: state.summaries.failureEvents.length,
+    toolTraces: toolTraceReferences.length,
+  }
+  const inheritedItems = [
+    ...options.included,
+    ...workingSetPaths.map(path => `working_set:${path}`),
+    ...toolTraceReferences.map(ref => `tool_trace:${ref.name}:${ref.toolUseId}`),
+  ]
+  const excludedItems = [
+    ...options.omitted,
+    ...state.parentSession.events
+      .filter(event => !isReferencedEvent(state.mode, event))
+      .slice(-8)
+      .map(event => `event:${event.type}:${event.timestamp}`),
+  ]
+  const provenance: AgentContextProvenance = {
+    forkMode: state.mode,
+    inheritedItems: options.inheritedItems,
+    omittedItems: options.omittedItems,
+    included: options.included,
+    omitted: options.omitted,
+    workingSetPaths,
+    parentSummary,
+    toolTraceReferences,
+    childWorkingSet,
+  }
+  return {
+    included: options.included,
+    omitted: options.omitted,
+    workingSetPaths,
+    inheritedItems,
+    excludedItems,
+    parentSummary,
+    toolTraceReferences,
+    childWorkingSet,
+    provenance,
+    eventReferences: buildEventReferences(state),
   }
 }
 
@@ -297,6 +362,29 @@ function buildEventReferences(state: ContextForkBuilderState): ContextForkDiagno
       timestamp: event.timestamp,
       reason: eventReferenceReason(state.mode, event),
     }))
+}
+
+function buildToolTraceReferences(state: ContextForkBuilderState): NonNullable<AgentContextProvenance['toolTraceReferences']> {
+  const toolInputs = new Map<string, Extract<NexusEvent, { type: 'tool_started' }>>()
+  for (const event of state.parentSession.events) {
+    if (event.type === 'tool_started') toolInputs.set(event.toolUseId, event)
+  }
+  const includeSuccess = state.mode === 'debug-replay' || state.mode === 'full-summary'
+  return state.parentSession.events
+    .filter((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed')
+    .filter(event => includeSuccess || !event.success)
+    .slice(-8)
+    .map(event => {
+      const started = toolInputs.get(event.toolUseId)
+      return {
+        toolUseId: event.toolUseId,
+        name: event.name,
+        timestamp: event.timestamp,
+        success: event.success,
+        ...(started && { inputPreview: truncateLine(safeStringify(started.input), 240) }),
+        outputPreview: truncateLine(safeStringify(event.output), 240),
+      }
+    })
 }
 
 function isReferencedEvent(mode: ContextForkMode, event: NexusEvent): boolean {

@@ -2,6 +2,7 @@ import type { NexusEvent } from '../shared/events.js'
 import type { HooksConfig } from '../shared/config.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ToolRisk } from '../tools/Tool.js'
+import type { RuntimeHook } from './hooks.js'
 import type { RemoteToolRunner } from './remoteRunner.js'
 
 export type RuntimeExecuteOptions = {
@@ -24,12 +25,13 @@ export type RuntimeExecuteOptions = {
   storage?: NexusStorage
   allowedPaths?: string[]
   hooks?: HooksConfig
+  runtimeHooks?: RuntimeHook[]
   /**
    * Per-request policy mode (Phase B of
    * docs/nexus/reference/go-tui-permission-policy-governance-plan.md).
-   *   - 'strict' (default): tools not in the allowlist are hard-denied
-   *     and `permission_request` never fires for them (back-compat).
-   *   - 'soft-deny': the hard-deny is bypassed; the existing approval
+   *   - 'strict' (default): tools not in the allowlist are policy-blocked
+   *     before `permission_request` fires.
+   *   - 'soft-deny': the policy block is bypassed; the existing approval
    *     gate then emits `permission_request` for write/execute-risk
    *     tools so the user can approve via the Go TUI permission panel.
    */
@@ -44,7 +46,7 @@ export type RuntimeExecuteOptions = {
    * the runtime was constructed with) applies. `*` / `all` →
    * allowAllTools. `policyMode: 'soft-deny'` continues to work
    * orthogonally: allowedTools controls *which* tools are isAllowed,
-   * while policyMode controls *whether* the hard-deny gate fires
+   * while policyMode controls *whether* the policy block fires
    * for tools outside the allowlist.
    */
   allowedTools?: readonly string[]

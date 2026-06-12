@@ -1,34 +1,19 @@
 package tui
 
 import (
-	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
-	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
-	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/x/term"
-	"github.com/gorilla/websocket"
-	"github.com/mattn/go-runewidth"
-	"github.com/sahilm/fuzzy"
 )
 
 type Config struct {
@@ -66,6 +51,7 @@ type Config struct {
 type streamStartedMsg struct {
 	events    <-chan streamEvent
 	decisions chan<- permissionDecision
+	sessionID string
 }
 
 type streamEventMsg struct {
@@ -101,29 +87,6 @@ type permissionDecision struct {
 	scope    string
 	rule     string
 	feedback string
-}
-
-type pendingPermission struct {
-	sessionID string
-	toolUseID string
-	name      string
-	risk      string
-	input     string
-	message   string
-	// Phase A.1: model-suggested allow rule (e.g. "cd:*",
-	// "git:status"). Surfaced from the runtime's
-	// `permission_request` event's `suggestedRule` field.
-	suggestedRule string
-	// Phase 3 of docs/nexus/reference/go-tui-tool-permission-timeout-optimization-plan.md:
-	// repeatedRuleCount is the number of times this same suggestedRule
-	// has appeared in a short recent window, including the current
-	// request. Values >1 nudge the operator toward session approval.
-	repeatedRuleCount int
-}
-
-type permissionRuleSeen struct {
-	count int
-	last  time.Time
 }
 
 type runtimeCapabilities struct {
@@ -180,8 +143,13 @@ type runtimeProfilesResponse struct {
 }
 
 type transcriptItem struct {
-	kind string
-	text string
+	kind       string
+	text       string
+	toolUseID  string
+	toolName   string
+	toolInput  string
+	toolOutput string
+	toolStatus string
 	*Versioned
 	baseHighlightable
 	cache         renderCache
@@ -818,8 +786,6 @@ type runtimeVersionMsg struct {
 // always round-trip back to modeComposing when an overlay closes.
 type inputMode string
 
-const repeatedPermissionRuleWindow = 2 * time.Minute
-
 const (
 	modeComposing         inputMode = "composing"         // textinput owns keys
 	modePermission        inputMode = "permission"        // a/y/r/n/esc only
@@ -833,6 +799,9 @@ const (
 	modeActivityOverlay   inputMode = "activityOverlay"   // read-only recent activity; up/down/esc/enter/q
 	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
 	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
+	modeSessionOverlay    inputMode = "sessionOverlay"    // /session step 1: pick session operation
+	modeSessionConfirm    inputMode = "sessionConfirm"    // /session step 2: confirm new-session reset
+	modeSessionInput      inputMode = "sessionInput"      // /session step 2: enter/select/switch session id
 	modeModelPickProvider inputMode = "modelPickProvider" // /model step 1: provider select
 	modeModelPickApiKey   inputMode = "modelPickApiKey"   // /model step 2: API key entry
 	modeModelPickBaseURL  inputMode = "modelPickBaseURL"  // /model step 3: base URL entry
@@ -851,12 +820,11 @@ const (
 	modePermissionEditFeedback inputMode = "permissionEditFeedback"
 )
 
-// mouseWheelStepLines mirrors crush's MouseScrollThreshold=5:
-// one wheel tick on a trackpad / mouse-wheel fires 5 lines
-// of scroll rather than the more claustrophobic 1. We use the
-// same number across the transcript viewport and every
-// read-only overlay so the muscle memory carries.
-const mouseWheelStepLines = 5
+// mouseWheelStepLines keeps wheel scrolling close to terminal-native
+// trackpad behavior. Bubble viewport defaults to 3 rows per tick,
+// but that feels jumpy in the Go TUI because the transcript is dense
+// and the app already receives many wheel ticks on modern terminals.
+const mouseWheelStepLines = 1
 
 // maxTranscriptWidth mirrors crush's maxTextWidth: on very wide
 // terminals (4K monitor @ 200+ cols) the transcript shouldn't
@@ -894,21 +862,22 @@ func (m model) isCompact() bool {
 func (m inputMode) canEditInput() bool { return m == modeComposing }
 
 type model struct {
-	cfg                    Config
-	input                  textarea.Model
-	pastedTextReplacements map[string]string
-	pastedTextCounter      int
-	viewport               viewport.Model
-	spinner                spinner.Model
-	gradientSpinner        gradientSpinner
-	transcript             []*transcriptItem
-	inputMode              inputMode
-	helpScroll             int
-	running                bool
-	events                 <-chan streamEvent
-	decisions              chan<- permissionDecision
-	pending                *pendingPermission
-	recentPermissionRules  map[string]permissionRuleSeen
+	cfg                       Config
+	input                     textarea.Model
+	pastedTextReplacements    map[string]string
+	pastedTextCounter         int
+	viewport                  viewport.Model
+	spinner                   spinner.Model
+	gradientSpinner           gradientSpinner
+	transcript                []*transcriptItem
+	inputMode                 inputMode
+	helpScroll                int
+	running                   bool
+	events                    <-chan streamEvent
+	decisions                 chan<- permissionDecision
+	pending                   *pendingPermission
+	recentPermissionRules     map[string]permissionRuleSeen
+	trustedPermissionSessions map[string]struct{}
 	// Phase A.1: 0..4 selector on the 5-option permission panel
 	// ("Approve once" / "Approve for session" / "Approve with
 	// editable rule" / "Reject" / "Reject, tell the model what
@@ -949,6 +918,8 @@ type model struct {
 	toolAuditScroll         int
 	modelCatalog            runtimeModelsResponse
 	modelOverlayScroll      int
+	sessionPanelSelected    int
+	sessionPendingAction    sessionPanelAction
 	quitChoice              int
 	startedAt               time.Time
 	permissionOpenedAt      time.Time
@@ -958,7 +929,16 @@ type model struct {
 	connected               bool
 	latestUsage             *usageSnapshot
 	lastUsage               *usageSnapshot
-	currentTimeout          timeoutDecision
+	contextUsage            *contextUsageSnapshot
+	// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+	// running snapshot of the Nexus-side soft timeout cycle so the
+	// footer can show "soft budget reached / extended" and so a
+	// subsequent REQUEST_TIMEOUT can be classified as a watchdog
+	// cutoff (the soft cycle had already fired) rather than a
+	// fresh fatal cutoff. Cleared on result / error like
+	// `latestUsage` so the next turn starts clean.
+	softTimeoutState *softTimeoutSnapshot
+	currentTimeout   timeoutDecision
 	// Phase 11 in-app selection. With --mouse the Go TUI
 	// captures SGR mouse events and the terminal can no
 	// longer do native drag-select. We compensate with an
@@ -1029,20 +1009,6 @@ type model struct {
 	height              int
 }
 
-type selectionMouseAction int
-
-const (
-	selectionMousePress selectionMouseAction = iota
-	selectionMouseMotion
-	selectionMouseRelease
-)
-
-type selectionMouseEvent struct {
-	action selectionMouseAction
-	x      int
-	y      int
-}
-
 // usageSnapshot captures the most recent token usage event from
 // the Nexus stream so the footer can render a single transient
 // status line (like the `✻ Sautéed for 26s` pattern) instead of
@@ -1052,6 +1018,59 @@ type usageSnapshot struct {
 	InputTokens  int
 	OutputTokens int
 	CacheRead    int
+}
+
+type contextUsageSnapshot struct {
+	PercentUsed      int
+	TokenEstimate    int
+	MaxTokens        int
+	WarningThreshold int
+	CompactThreshold int
+	BlockingLimit    int
+	PolicySource     string
+}
+
+// softTimeoutSnapshot captures the running state of the
+// Nexus-side soft timeout cycle (Phase 4 of
+// docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md).
+// It is updated on every `timeout_budget_exceeded` and
+// `timeout_extension_granted` event so the footer can render a
+// transient "soft budget reached / extended" status, and so
+// `friendlyNexusError` can rewrite the REQUEST_TIMEOUT message
+// to distinguish a watchdog cutoff (the soft cycle had already
+// fired one or more times) from a fresh fatal cutoff.
+//
+// Cleared on `result` / `error` like `usageSnapshot` so the next
+// turn starts clean. Hard watchdog cutoff arrives as an `error`
+// event AFTER the soft cycle events, so the snapshot is still
+// populated when `friendlyNexusError` runs for the error.
+type softTimeoutSnapshot struct {
+	// BudgetExceededAt is the wall-clock time of the most recent
+	// `timeout_budget_exceeded` event. Used by the footer for a
+	// short transient marker and to detect "soft cycle already
+	// fired" when classifying a REQUEST_TIMEOUT.
+	BudgetExceededAt time.Time
+	// OriginalBudgetMs is the soft budget that fired the first
+	// cycle (`timeoutMs` on the first budget_exceeded event).
+	OriginalBudgetMs int
+	// TotalSoftBudgetMs is the running soft budget after the
+	// most recent extension (`totalSoftBudgetMs` on the latest
+	// extension_granted event, or OriginalBudgetMs if none).
+	TotalSoftBudgetMs int
+	// ExtensionCount is the number of extensions granted so far
+	// in the current turn. 0 means the soft cycle has fired but
+	// not granted (e.g. cap reached or maxSoftTimeoutExtensions
+	// set to 0).
+	ExtensionCount int
+	// MaxExtensions is the configured cap as last seen from the
+	// `timeout_extension_granted` event. Lets the footer render
+	// "1/1" so the operator sees how much extension head-room
+	// remains.
+	MaxExtensions int
+	// LastElapsedMs is the elapsed time recorded on the most
+	// recent soft-cycle event (budget or extension). Useful for
+	// human-readable footer / friendly-message output.
+	LastElapsedMs int
 }
 
 type timeoutDecision struct {
@@ -1102,26 +1121,11 @@ func placeholderForMode(mode inputMode) string {
 		return "git:status, bash:*, npm:install"
 	case modePermissionEditFeedback:
 		return "tell the model what to do instead"
+	case modeSessionInput:
+		return "session id"
 	default:
 		return "Ask BabeL-O"
 	}
-}
-
-func (m *model) inPermissionGracePeriod() bool {
-	if m.permissionOpenedAt.IsZero() {
-		return false
-	}
-	if m.graceMaxDelay == 0 {
-		return false
-	}
-	now := time.Now()
-	if now.Sub(m.permissionOpenedAt) >= m.graceMaxDelay {
-		return false
-	}
-	if now.Sub(m.permissionLastInputAt) >= m.graceQuietPeriod {
-		return false
-	}
-	return true
 }
 
 // scrollOverlay moves the active overlay's internal scroll or
@@ -1185,6 +1189,13 @@ func (m *model) scrollOverlay(delta int) bool {
 		maxScroll := max(0, len(allLines)-1)
 		m.modelOverlayScroll = clamp(m.modelOverlayScroll+delta, 0, maxScroll)
 		return true
+	case modeSessionOverlay:
+		actions := sessionPanelActions()
+		if len(actions) == 0 {
+			return true
+		}
+		m.sessionPanelSelected = ((m.sessionPanelSelected+delta)%len(actions) + len(actions)) % len(actions)
+		return true
 	case modePermission:
 		// 5-option ring. Treat the wheel tick modulo 5 so
 		// the choice lands predictably.
@@ -1223,828 +1234,6 @@ func (m *model) setInputValue(value string) {
 	m.resize()
 }
 
-// viewportTopY returns the screen row where the transcript
-// viewport begins. Keep this in one place so header chrome
-// changes (for example adding the input-style divider) do not
-// desync mouse selection coordinates.
-func (m *model) viewportTopY() int {
-	return lipgloss.Height(m.renderHeader(max(40, m.width)))
-}
-
-// selectionInViewport reports whether a screen-relative
-// mouse coordinate lands inside the transcript viewport.
-// The viewport starts immediately below renderHeader(); the
-// horizontal bounds match the rendered content width.
-func (m *model) selectionInViewport(x, y int) bool {
-	if m.cfg.MouseCapture == false {
-		return false
-	}
-	if m.topCardOpen {
-		return false
-	}
-	vpTopY := m.viewportTopY()
-	if y < vpTopY {
-		return false
-	}
-	vpBottomY := vpTopY + m.viewport.Height()
-	if y >= vpBottomY {
-		return false
-	}
-	if x < 0 || x > m.viewport.Width() {
-		return false
-	}
-	return true
-}
-
-func (m *model) maxSelectionLine() int {
-	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
-	return max(0, len(lines)-1)
-}
-
-// startSelection anchors a new selection at the given
-// viewport-content (line, col) position. (line, col) is
-// in the same coord space as the viewport's YOffset —
-// i.e. line 0 is the welcome card's first line, col 0
-// is the leftmost column. Both bounds are clamped.
-func (m *model) startSelection(line, col int) {
-	m.selectionStartLine = clamp(line, 0, m.maxSelectionLine())
-	m.selectionStartCol = m.clampSelectionCol(m.selectionStartLine, col)
-	m.selectionEndLine = m.selectionStartLine
-	m.selectionEndCol = m.selectionStartCol
-	m.selectionActive = true
-}
-
-// extendSelection moves the end-anchor to a new (line, col)
-// while a left-button drag is in progress. The selection
-// stays anchored to its start; only the end moves.
-func (m *model) extendSelection(line, col int) {
-	if !m.selectionActive {
-		return
-	}
-	m.selectionEndLine = clamp(line, 0, m.maxSelectionLine())
-	m.selectionEndCol = m.clampSelectionCol(m.selectionEndLine, col)
-}
-
-// clearSelection resets the selection anchors without
-// touching the "lastSelectionCopy" feedback timestamp.
-func (m *model) clearSelection() {
-	m.selectionActive = false
-	m.selectionStartLine = 0
-	m.selectionStartCol = 0
-	m.selectionEndLine = 0
-	m.selectionEndCol = 0
-	m.mouseDownInViewport = false
-}
-
-// normalizedSelection returns the selection rect in
-// top-left → bottom-right order. If start == end the
-// selection is empty.
-func (m *model) normalizedSelection() (sl, sc, el, ec int, ok bool) {
-	if !m.selectionActive {
-		return 0, 0, 0, 0, false
-	}
-	sl, sc = m.selectionStartLine, m.selectionStartCol
-	el, ec = m.selectionEndLine, m.selectionEndCol
-	if (sl > el) || (sl == el && sc > ec) {
-		sl, sc, el, ec = el, ec, sl, sc
-	}
-	if sl == el && sc == ec {
-		return sl, sc, el, ec, false
-	}
-	return sl, sc, el, ec, true
-}
-
-func (m *model) clampSelectionCol(line, col int) int {
-	lineWidth := m.selectionLineWidth(line)
-	return clamp(col, 0, max(0, lineWidth))
-}
-
-func (m *model) selectionLineWidth(line int) int {
-	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
-	if line < 0 || line >= len(lines) {
-		return m.viewport.Width()
-	}
-	return min(m.viewport.Width(), visibleWidth(lines[line]))
-}
-
-// handleSelectionMouse routes a left-button MouseMsg to
-// the in-app selection state machine. Returns the model
-// and an optional OSC 52 copy command.
-//
-// Coord mapping: msg.X / msg.Y are screen-relative. We translate
-// to viewport-content (line, col) by subtracting the current
-// header height, mirroring Crush's layout-relative mouse routing.
-func (m *model) handleSelectionMouse(msg selectionMouseEvent) (model, tea.Cmd) {
-	// Only the transcript viewport accepts selection; an
-	// overlay / permission / editor / input has its own
-	// single-input-owner and we don't want a stray drag to
-	// bleed into the transcript behind it.
-	if m.inputMode != modeComposing {
-		m.mouseDownInViewport = false
-		return *m, nil
-	}
-	if !m.selectionInViewport(msg.x, msg.y) {
-		// A press / motion / release outside the viewport
-		// ends any in-progress drag without committing a
-		// copy.
-		m.mouseDownInViewport = false
-		return *m, nil
-	}
-	contentLine := m.viewport.YOffset() + (msg.y - m.viewportTopY())
-	contentCol := msg.x
-	switch {
-	case msg.action == selectionMousePress:
-		m.mouseDownInViewport = true
-		m.startSelection(contentLine, contentCol)
-		return *m, nil
-	case msg.action == selectionMouseMotion && m.mouseDownInViewport:
-		m.extendSelection(contentLine, contentCol)
-		return *m, nil
-	case msg.action == selectionMouseRelease && m.mouseDownInViewport:
-		m.mouseDownInViewport = false
-		m.extendSelection(contentLine, contentCol)
-		sl, sc, el, ec, ok := m.normalizedSelection()
-		if !ok {
-			// Empty / one-cell click: clear, no copy.
-			m.clearSelection()
-			return *m, nil
-		}
-		text := m.extractSelectedText(sl, sc, el, ec)
-		if text == "" {
-			m.clearSelection()
-			return *m, nil
-		}
-		m.lastSelectionCopy = text
-		m.lastSelectionCopyAt = time.Now()
-		m.copyToastMessage = "Selected text copied to clipboard"
-		m.copyToastShownAt = m.lastSelectionCopyAt
-		m.clearSelection()
-		return *m, tea.Sequence(osC52CopyCmd(text), expireCopyToastCmd(m.copyToastShownAt))
-	}
-	return *m, nil
-}
-
-func expireCopyToastCmd(copiedAt time.Time) tea.Cmd {
-	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
-		return copyToastExpiredMsg{copiedAt: copiedAt}
-	})
-}
-
-// extractSelectedText walks the viewport's plain-text
-// content and pulls the substring inside the given
-// (line, col) rect. ANSI escape sequences are stripped
-// from the source so what gets copied matches what the
-// operator saw (modulo any leading whitespace padding
-// baked in by the welcome card).
-func (m *model) extractSelectedText(sl, sc, el, ec int) string {
-	full := m.fullViewportContent()
-	plain := stripANSICodes(full)
-	lines := strings.Split(plain, "\n")
-	if sl < 0 || sl >= len(lines) {
-		return ""
-	}
-	if el < 0 || el >= len(lines) {
-		el = len(lines) - 1
-	}
-	if sl == el {
-		return sliceVisibleColumns(lines[sl], sc, ec)
-	}
-	var b strings.Builder
-	for i := sl; i <= el && i < len(lines); i++ {
-		line := lines[i]
-		switch i {
-		case sl:
-			b.WriteString(sliceVisibleColumns(line, sc, visibleWidth(line)))
-			b.WriteByte('\n')
-		case el:
-			b.WriteString(sliceVisibleColumns(line, 0, ec))
-		default:
-			b.WriteString(line)
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
-}
-
-// fullViewportContent reconstructs the same content string
-// that refreshViewport() feeds to the viewport. We do not
-// re-call refreshViewport() here because that would also
-// re-position the scroll; the operator's selection must
-// stay anchored to the same text even if they release the
-// mouse on a frame that hasn't been refreshed.
-func (m *model) fullViewportContent() string {
-	welcome := m.renderWelcomeCard(max(40, m.viewport.Width()))
-	transcript := renderTranscript(m.transcript, max(40, m.viewport.Width()))
-	if transcript != "" {
-		return welcome + "\n\n" + transcript
-	}
-	return welcome
-}
-
-// stripANSICodes removes CSI (\x1b[...m) and OSC (\x1b]...BEL
-// or \x1b\\ ) sequences from `s`. Used by the OSC 52
-// copy path so the clipboard receives the operator's text
-// without terminal control bytes attached.
-func stripANSICodes(s string) string {
-	var b strings.Builder
-	b.Grow(len(s))
-	i := 0
-	for i < len(s) {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if r == 0x1b {
-			j := i + 1
-			if j < len(s) {
-				switch s[j] {
-				case '[':
-					j++
-					for j < len(s) {
-						c := s[j]
-						j++
-						if c >= 0x40 && c <= 0x7e {
-							break
-						}
-					}
-					i = j
-					continue
-				case ']':
-					j++
-					// OSC terminates on BEL (0x07) or
-					// ST (ESC \). Skip until terminator.
-					for j < len(s) {
-						if s[j] == 0x07 {
-							j++
-							break
-						}
-						if s[j] == 0x1b && j+1 < len(s) && s[j+1] == '\\' {
-							j += 2
-							break
-						}
-						j++
-					}
-					i = j
-					continue
-				}
-			}
-			i += size
-			continue
-		}
-		b.WriteString(s[i : i+size])
-		i += size
-	}
-	return b.String()
-}
-
-// buildOSC52Sequence returns the raw OSC 52 byte stream
-// for `text`. Most modern terminals (iTerm2, WezTerm,
-// recent gnome-terminal, Windows Terminal, kitty,
-// alacritty) honor OSC 52 even when the app is in
-// alternate-screen mode. The sequence uses BEL as the
-// string terminator, which is the widely-supported
-// default.
-func buildOSC52Sequence(text string) string {
-	encoded := base64.StdEncoding.EncodeToString([]byte(text))
-	return "\x1b]52;c;" + encoded + "\x07"
-}
-
-// osC52CopyCmd builds a tea.Cmd that pushes `text` to the
-// system clipboard via the OSC 52 escape sequence. We
-// use tea.Printf so the byte stream goes through the
-// bubbletea renderer and reaches stdout in a single
-// redraw cycle; printing via os.Stdout would corrupt the
-// current frame.
-func osC52CopyCmd(text string) tea.Cmd {
-	return tea.Sequence(
-		tea.Printf("%s", buildOSC52Sequence(text)),
-		func() tea.Msg {
-			_ = clipboard.WriteAll(text)
-			return nil
-		},
-	)
-}
-
-// slashCommand describes a single Phase 4 slash-palette entry. A command
-// either has zero args (run immediately when the user presses Enter in
-// the palette) or has args (insert the prefix and return to composing
-// so the user can type the rest of the command). The palette never
-// pre-empts the textinput when a command needs an argument.
-type slashCommand struct {
-	name     string
-	aliases  []string
-	summary  string
-	shortcut string
-	hasArgs  bool
-	argHint  string
-	prefix   string // when non-empty, the palette inserts this string into the textinput and returns to composing
-	run      func(m *model, args []string) tea.Cmd
-}
-
-func (c slashCommand) Shortcut() string { return c.shortcut }
-
-// toolDescriptor is the read-only row the /tools palette renders. The
-// fields map 1:1 to /v1/tools/audit entries. The Phase 4
-// wire path (fetchToolAudit) hydrates toolDescriptor from
-// runtimeToolAuditEntry; staticToolDescriptorCatalog remains
-// as the offline fallback when the Nexus endpoint is
-// unreachable.
-type toolDescriptor struct {
-	name     string
-	risk     string
-	source   string
-	approval bool
-	summary  string
-}
-
-// staticToolDescriptorCatalog returns the Phase 4 hard-coded
-// tool list as a slice of toolDescriptor. Used as the offline
-// fallback when /v1/tools/audit is unreachable and as a
-// reference shape for tests that compare the static catalog to
-// the wire result. Mirrors the static catalog the Go TUI
-// rendered before the Phase 4 wire.
-func staticToolDescriptorCatalog() []toolDescriptor {
-	return []toolDescriptor{
-		{name: "Read", risk: "read", source: "builtin", approval: false, summary: "read a workspace file"},
-		{name: "Write", risk: "write", source: "builtin", approval: true, summary: "create or overwrite a file"},
-		{name: "Edit", risk: "write", source: "builtin", approval: true, summary: "edit an existing file"},
-		{name: "Bash", risk: "execute", source: "builtin", approval: true, summary: "run a shell command"},
-		{name: "Glob", risk: "read", source: "builtin", approval: false, summary: "expand a glob pattern"},
-		{name: "Grep", risk: "read", source: "builtin", approval: false, summary: "search for a regex in workspace"},
-		{name: "TaskCreate", risk: "task", source: "builtin", approval: true, summary: "create a tracked task"},
-	}
-}
-
-// slashCommands is the static Phase 4 registry. Real backend calls
-// (profile select, config refresh) go through Nexus HTTP; placeholder
-// commands surface a status line so the user knows the entry exists
-// but is not yet wired.
-var slashCommands = []slashCommand{
-	{
-		name:    "/help",
-		summary: "show local command reference",
-		run: func(m *model, _ []string) tea.Cmd {
-			// Inline the name list to avoid the static-init cycle
-			// (slashCommands is still being constructed when this
-			// lambda is created; reading the slice from inside the
-			// body would require it to be fully built first).
-			names := []string{
-				"/help", "/config", "/profile", "/clear", "/exit",
-				"/context", "/compact", "/inbox", "/model", "/models", "/tool", "/tools",
-				"/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
-				"/write", "/edit",
-			}
-			m.appendLine("status", "local commands: "+strings.Join(names, ", "))
-			return nil
-		},
-	},
-	{
-		name:    "/config",
-		summary: "refresh shared Nexus config + profile state",
-		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "refreshing shared Nexus config")
-			return tea.Batch(fetchRuntimeConfig(m.cfg, 0), fetchRuntimeProfiles(m.cfg))
-		},
-	},
-	{
-		name:    "/profile",
-		aliases: []string{"/profiles"},
-		summary: "list profiles (no args) or select a profile",
-		hasArgs: true,
-		argHint: "[name]",
-		run: func(m *model, args []string) tea.Cmd {
-			if len(args) == 0 {
-				m.appendLine("status", "loading shared Nexus profiles")
-				return fetchRuntimeProfiles(m.cfg)
-			}
-			profile := args[0]
-			if profile == m.activeProfile && profile != "" {
-				m.appendLine("status", "profile already active: "+profile)
-				return nil
-			}
-			// Profile switch is a session-affecting action: gate it
-			// behind a y/n overlay so an accidental submit can't
-			// change provider/model mid-conversation. The HTTP call
-			// is deferred to the y/enter branch in the mode dispatch.
-			m.pendingProfileName = profile
-			m.setMode(modeProfileConfirm)
-			return nil
-		},
-	},
-	{
-		name:    "/clear",
-		summary: "clear transcript",
-		run: func(m *model, _ []string) tea.Cmd {
-			m.transcript = nil
-			return nil
-		},
-	},
-	{
-		name:     "/exit",
-		aliases:  []string{"/quit"},
-		summary:  "quit the Go TUI",
-		shortcut: "ctrl+q",
-		run: func(_ *model, _ []string) tea.Cmd {
-			return tea.Quit
-		},
-	},
-	{
-		name:    "/context",
-		summary: "analyze current context window usage via Nexus",
-		run: func(m *model, _ []string) tea.Cmd {
-			if m.sessionID == "" {
-				m.appendLine("status", "context: no active session yet — submit a prompt first")
-				return nil
-			}
-			m.appendLine("status", "analyzing shared Nexus context: "+shortID(m.sessionID))
-			return fetchContextAnalysis(m.cfg, m.sessionID)
-		},
-	},
-	{
-		name:    "/compact",
-		summary: "trigger context compaction on the active session",
-		run: func(m *model, _ []string) tea.Cmd {
-			if m.sessionID == "" {
-				m.appendLine("status", "compact: no active session yet — submit a prompt first")
-				return nil
-			}
-			m.appendLine("status", "compacting shared Nexus context: "+shortID(m.sessionID))
-			return triggerCompact(m.cfg, m.sessionID)
-		},
-	},
-	{
-		name:    "/inbox",
-		summary: "open SessionChannel inbox overlay",
-		run: func(m *model, args []string) tea.Cmd {
-			// Sub-commands: "/inbox all" and "/inbox ack <messageId>".
-			// Bare "/inbox" fetches unread-only (matches the TS TUI
-			// default). Without an active session both variants
-			// short-circuit with a friendly status line so the user
-			// isn't confused by a 404 from the Nexus API.
-			if len(args) > 0 {
-				switch args[0] {
-				case "all":
-					return m.fetchInboxWithSession(true)
-				case "ack":
-					if len(args) < 2 {
-						m.appendLine("error", "/inbox ack requires a message id: /inbox ack <messageId>")
-						return nil
-					}
-					return m.ackInboxMessageWithSession(args[1])
-				default:
-					m.appendLine("error", "unknown /inbox sub-command: "+args[0]+" (supported: all, ack <messageId>)")
-					return nil
-				}
-			}
-			return m.fetchInboxWithSession(false)
-		},
-	},
-	{
-		name:     "/model",
-		summary:  "open interactive model registry (provider → api key → base URL → model)",
-		shortcut: "ctrl+l",
-		hasArgs:  true,
-		argHint:  "[id]",
-		run: func(m *model, args []string) tea.Cmd {
-			if len(m.modelCatalog.Providers) == 0 {
-				m.appendLine("status", "loading shared Nexus model configuration")
-				return fetchRuntimeModels(m.cfg, "model")
-			}
-			m.openModelRegistry()
-			// /model <id> is a quick direct-select: seed the
-			// draft input with the requested model id so the
-			// operator can override or accept the default
-			// values in the subsequent apiKey / baseURL
-			// steps. openModelRegistry() reset the draft
-			// above, so set it AFTER.
-			if len(args) > 0 {
-				m.modelPickProviderDraft = args[0]
-			}
-			return nil
-		},
-	},
-	{
-		name:    "/models",
-		summary: "list models from shared Nexus registry",
-		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "loading shared Nexus models capability matrix")
-			return fetchRuntimeModels(m.cfg, "models")
-		},
-	},
-	{
-		name:     "/tools",
-		aliases:  []string{"/tool"},
-		summary:  "open tool audit overlay",
-		shortcut: "ctrl+o",
-		run: func(m *model, _ []string) tea.Cmd {
-			// Phase 4 wire: GET /v1/tools/audit replaces the
-			// static catalog. On wire success the overlay shows
-			// the real runtime tool registry (builtin + MCP
-			// tools, risk + approval + suggested allow rule).
-			// On wire failure the slash handler falls back to
-			// the static catalog so the user can still see a
-			// known-good list when the Nexus is unreachable.
-			m.appendLine("status", "loading shared Nexus tools audit")
-			return fetchToolAudit(m.cfg, "user")
-		},
-	},
-	{
-		name:    "/sessions",
-		summary: "list sessions (TODO: wire to /v1/sessions)",
-		run: func(m *model, _ []string) tea.Cmd {
-			m.appendLine("status", "/sessions not yet implemented in Go TUI")
-			return nil
-		},
-	},
-	{
-		name:     "/tasks",
-		summary:  "open task board overlay",
-		shortcut: "ctrl+t",
-		run: func(m *model, _ []string) tea.Cmd {
-			return m.fetchSessionTasksWithSession()
-		},
-	},
-	{
-		name:    "/activity",
-		summary: "open recent activity overlay",
-		run: func(m *model, _ []string) tea.Cmd {
-			// No HTTP round-trip — the activity buffer is
-			// populated by consumeNexusEvent as the user
-			// types and the model runs. The overlay is
-			// purely a viewport over the in-memory buffer.
-			m.activityOverlayScroll = 0
-			summary := fmt.Sprintf("activity: %d event(s) recorded", len(m.activityEvents))
-			m.appendLine("status", summary)
-			m.setMode(modeActivityOverlay)
-			return nil
-		},
-	},
-	{
-		name:     "/agents",
-		summary:  "open multi-agent status overlay",
-		shortcut: "ctrl+g",
-		run: func(m *model, _ []string) tea.Cmd {
-			return m.fetchSessionAgentsWithSession()
-		},
-	},
-	// Prefix-insertion commands: when picked from the palette, the
-	// command name + space is inserted into the textinput and the user
-	// is dropped back into composing. They never run server-side.
-	{
-		name:    "/bash",
-		summary: "insert Bash prefix",
-		hasArgs: true,
-		argHint: "<command>",
-		prefix:  "/bash ",
-	},
-	{
-		name:    "/read",
-		summary: "insert Read prefix",
-		hasArgs: true,
-		argHint: "<path>",
-		prefix:  "/read ",
-	},
-	{
-		name:    "/grep",
-		summary: "insert Grep prefix",
-		hasArgs: true,
-		argHint: "<pattern>",
-		prefix:  "/grep ",
-	},
-	{
-		name:    "/glob",
-		summary: "insert Glob prefix",
-		hasArgs: true,
-		argHint: "<pattern>",
-		prefix:  "/glob ",
-	},
-	{
-		name:    "/write",
-		summary: "insert Write prefix",
-		hasArgs: true,
-		argHint: "<path> <text>",
-		prefix:  "/write ",
-	},
-	{
-		name:    "/edit",
-		summary: "insert Edit prefix",
-		hasArgs: true,
-		argHint: "<path> <old> <new>",
-		prefix:  "/edit ",
-	},
-}
-
-type slashCommandMatch struct {
-	command slashCommand
-	match   fuzzy.Match
-}
-
-func (m slashCommandMatch) Filter() string {
-	return m.commandFilter()
-}
-
-func (m slashCommandMatch) commandFilter() string {
-	parts := []string{strings.TrimPrefix(m.command.name, "/")}
-	for _, alias := range m.command.aliases {
-		parts = append(parts, strings.TrimPrefix(alias, "/"))
-	}
-	return strings.Join(parts, " ")
-}
-
-func (m *slashCommandMatch) SetMatch(match fuzzy.Match) {
-	m.match = match
-}
-
-// filterSlashCommandMatches narrows the registry with fuzzy matching.
-// Empty query preserves registry order. Non-empty query is ranked by
-// sahilm/fuzzy so non-prefix but useful matches (e.g. "mdl" → /model)
-// still appear.
-func filterSlashCommandMatches(prefix string) []slashCommandMatch {
-	items := make([]slashCommandMatch, len(slashCommands))
-	for i, command := range slashCommands {
-		items[i] = slashCommandMatch{command: command}
-	}
-	query := strings.ToLower(strings.TrimPrefix(prefix, "/"))
-	if query == "" {
-		return items
-	}
-
-	// Preserve the old prefix-filter feel first: when the user types
-	// "prof", /profile should be the only result even though another
-	// command's summary contains similar letters.
-	prefixMatches := make([]slashCommandMatch, 0, len(items))
-	for _, item := range items {
-		if slashCommandHasPrefix(item.command, query) {
-			prefixMatches = append(prefixMatches, withSlashCommandNameMatch(item, query))
-		}
-	}
-	if len(prefixMatches) > 0 {
-		return prefixMatches
-	}
-
-	// Next, fuzzy-match command names and aliases only. This enables
-	// shorthand like "mdl" → /model without summary text outranking the
-	// command the operator likely intended.
-	commandFilters := make([]string, len(items))
-	for i, item := range items {
-		commandFilters[i] = item.commandFilter()
-	}
-	commandMatches := fuzzy.Find(query, commandFilters)
-	if len(commandMatches) > 0 {
-		out := make([]slashCommandMatch, 0, len(commandMatches))
-		for _, match := range commandMatches {
-			item := items[match.Index]
-			item.match = match
-			out = append(out, item)
-		}
-		return out
-	}
-
-	return nil
-}
-
-func slashCommandHasPrefix(command slashCommand, query string) bool {
-	if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(command.name, "/")), query) {
-		return true
-	}
-	for _, alias := range command.aliases {
-		if strings.HasPrefix(strings.ToLower(strings.TrimPrefix(alias, "/")), query) {
-			return true
-		}
-	}
-	return false
-}
-
-func withSlashCommandNameMatch(item slashCommandMatch, query string) slashCommandMatch {
-	name := strings.ToLower(strings.TrimPrefix(item.command.name, "/"))
-	if strings.HasPrefix(name, query) {
-		item.match = fuzzy.Match{Str: item.command.name, MatchedIndexes: sequentialIndexes(len(query))}
-		return item
-	}
-	for _, alias := range item.command.aliases {
-		trimmed := strings.ToLower(strings.TrimPrefix(alias, "/"))
-		if strings.HasPrefix(trimmed, query) {
-			item.match = fuzzy.Match{Str: alias, MatchedIndexes: nil}
-			return item
-		}
-	}
-	return item
-}
-
-func sequentialIndexes(n int) []int {
-	indexes := make([]int, n)
-	for i := range indexes {
-		indexes[i] = i
-	}
-	return indexes
-}
-
-func ptrsToSlashCommandMatches(items []slashCommandMatch) []*slashCommandMatch {
-	out := make([]*slashCommandMatch, len(items))
-	for i := range items {
-		out[i] = &items[i]
-	}
-	return out
-}
-
-func slashCommandMatchValues(items []*slashCommandMatch) []slashCommandMatch {
-	out := make([]slashCommandMatch, len(items))
-	for i, item := range items {
-		out[i] = *item
-	}
-	return out
-}
-
-func highlightSlashCommandName(item slashCommandMatch) string {
-	name := item.command.name
-	if len(item.match.MatchedIndexes) == 0 {
-		return name
-	}
-	matched := make(map[int]bool, len(item.match.MatchedIndexes))
-	for _, idx := range item.match.MatchedIndexes {
-		// Match indexes are relative to Filter(), whose first segment is
-		// the command name without the leading slash. Shift by one so
-		// highlighted columns line up with the rendered slash command.
-		if idx+1 < len(name) {
-			matched[idx+1] = true
-		}
-	}
-	var out strings.Builder
-	out.Grow(len(name) + len(item.match.MatchedIndexes)*(len(buttonHotkeyOpen)+len(buttonHotkeyClose)))
-	for idx, r := range name {
-		if matched[idx] {
-			out.WriteString(buttonHotkeyOpen)
-			out.WriteRune(r)
-			out.WriteString(buttonHotkeyClose)
-			continue
-		}
-		out.WriteRune(r)
-	}
-	return out.String()
-}
-
-// filterSlashCommands preserves the legacy API used by command
-// execution/tests while the renderer consumes filterSlashCommandMatches
-// to access matched indexes for highlighting.
-func filterSlashCommands(prefix string) []slashCommand {
-	matched := filterSlashCommandMatches(prefix)
-	out := make([]slashCommand, len(matched))
-	for i, item := range matched {
-		out[i] = item.command
-	}
-	return out
-}
-
-// findSlashCommand returns the slash command whose name (or alias)
-// matches input exactly (case-insensitive). Returns nil if no match.
-func findSlashCommand(input string) *slashCommand {
-	name := strings.ToLower(strings.TrimSpace(input))
-	if name == "" {
-		return nil
-	}
-	for i, c := range slashCommands {
-		if strings.ToLower(c.name) == name {
-			return &slashCommands[i]
-		}
-		for _, a := range c.aliases {
-			if strings.ToLower(a) == name {
-				return &slashCommands[i]
-			}
-		}
-	}
-	return nil
-}
-
-func findSlashCommandByShortcut(shortcut string) *slashCommand {
-	shortcut = strings.ToLower(strings.TrimSpace(shortcut))
-	if shortcut == "" {
-		return nil
-	}
-	for i, c := range slashCommands {
-		if strings.ToLower(c.Shortcut()) == shortcut {
-			return &slashCommands[i]
-		}
-	}
-	return nil
-}
-
-func shortcutKeyString(msg tea.KeyMsg) string {
-	return msg.String()
-}
-
-func (m *model) dispatchCommandShortcut(msg tea.KeyMsg) (tea.Cmd, bool) {
-	cmd := findSlashCommandByShortcut(shortcutKeyString(msg))
-	if cmd == nil {
-		return nil, false
-	}
-	m.paletteFilter = ""
-	m.paletteSelected = 0
-	m.setMode(modeComposing)
-	if cmd.prefix != "" {
-		m.setInputValue(cmd.prefix)
-		m.appendLine("status", "inserted prefix: "+cmd.prefix)
-		return nil, true
-	}
-	return cmd.run(m, nil), true
-}
-
 func (m *model) handlePaste(content string) {
 	if m.handleMouseEscapeString(content) {
 		return
@@ -2066,159 +1255,6 @@ func (m *model) handlePaste(content string) {
 	m.resize()
 }
 
-func (m *model) handleMouseEscapeString(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	if m.mouseEscapeBuffer != "" {
-		m.mouseEscapeBuffer += raw
-		if m.completeMouseEscapeBuffer() {
-			return true
-		}
-		if len(m.mouseEscapeBuffer) > 32 || !looksLikeMouseEscapePrefix(m.mouseEscapeBuffer) {
-			m.mouseEscapeBuffer = ""
-		}
-		return true
-	}
-	// Some terminals can leak mouse reports as ordinary key
-	// fragments when mouse tracking toggles around focus/scroll.
-	// Bubble Tea normally parses these as MouseMsg; when it does not,
-	// swallowing them here prevents protocol bytes from landing in the
-	// textarea. Wheel reports still scroll the active view.
-	if startsMouseEscape(raw) {
-		m.mouseEscapeBuffer = raw
-		if m.completeMouseEscapeBuffer() {
-			return true
-		}
-		return true
-	}
-	start := strings.Index(raw, "<")
-	x10Start := strings.Index(raw, "[M")
-	if start < 0 && x10Start < 0 {
-		return false
-	}
-	if x10Start >= 0 && (start < 0 || x10Start < start) {
-		m.mouseEscapeBuffer = raw[x10Start:]
-		_ = m.completeMouseEscapeBuffer()
-		return true
-	}
-	report := raw[start:]
-	if !strings.HasSuffix(report, "M") && !strings.HasSuffix(report, "m") {
-		if strings.HasPrefix(report, "<64;") || strings.HasPrefix(report, "<65;") || looksLikeMouseEscapePrefix(report) {
-			m.mouseEscapeBuffer = report
-			return true
-		}
-		return false
-	}
-	if strings.HasPrefix(report, "<64;") {
-		m.scrollByMouseEscape(-mouseWheelStepLines)
-		return true
-	}
-	if strings.HasPrefix(report, "<65;") {
-		m.scrollByMouseEscape(mouseWheelStepLines)
-		return true
-	}
-	return strings.HasPrefix(report, "<")
-}
-
-func (m *model) completeMouseEscapeBuffer() bool {
-	report := m.mouseEscapeBuffer
-	if idx := strings.Index(report, "[M"); idx >= 0 {
-		x10 := report[idx:]
-		if len([]rune(x10)) < 5 {
-			return false
-		}
-		m.mouseEscapeBuffer = ""
-		m.scrollByX10MouseEscape(x10)
-		return true
-	}
-	if idx := strings.Index(report, "<"); idx >= 0 {
-		report = report[idx:]
-	}
-	if !(strings.HasSuffix(report, "M") || strings.HasSuffix(report, "m")) {
-		return false
-	}
-	m.mouseEscapeBuffer = ""
-	if strings.HasPrefix(report, "<64;") {
-		m.scrollByMouseEscape(-mouseWheelStepLines)
-		return true
-	}
-	if strings.HasPrefix(report, "<65;") {
-		m.scrollByMouseEscape(mouseWheelStepLines)
-		return true
-	}
-	return true
-}
-
-func startsMouseEscape(raw string) bool {
-	return raw == "[" ||
-		raw == "\x1b[" ||
-		raw == "\x1b[<" ||
-		raw == "[<" ||
-		raw == "\x1b[M" ||
-		raw == "[M" ||
-		strings.HasPrefix(raw, "\x1b[<") ||
-		strings.HasPrefix(raw, "[<") ||
-		strings.HasPrefix(raw, "\x1b[M") ||
-		strings.HasPrefix(raw, "[M")
-}
-
-func looksLikeMouseEscapePrefix(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	if strings.HasPrefix(raw, "\x1b[") {
-		raw = strings.TrimPrefix(raw, "\x1b[")
-	}
-	if strings.HasPrefix(raw, "[") {
-		raw = strings.TrimPrefix(raw, "[")
-	}
-	if strings.HasPrefix(raw, "M") {
-		return true
-	}
-	if strings.HasPrefix(raw, "<") {
-		raw = strings.TrimPrefix(raw, "<")
-	}
-	if raw == "" {
-		return true
-	}
-	for _, r := range raw {
-		if (r >= '0' && r <= '9') || r == ';' {
-			continue
-		}
-		return r == 'M' || r == 'm'
-	}
-	return true
-}
-
-func (m *model) scrollByX10MouseEscape(report string) {
-	runes := []rune(report)
-	if len(runes) < 5 {
-		return
-	}
-	button := int(runes[2]) - 32
-	if button&0b01_000000 == 0 {
-		return
-	}
-	if button&1 == 0 {
-		m.scrollByMouseEscape(-mouseWheelStepLines)
-	} else {
-		m.scrollByMouseEscape(mouseWheelStepLines)
-	}
-}
-
-func (m *model) scrollByMouseEscape(delta int) {
-	if m.inputMode == modeComposing {
-		if delta < 0 {
-			m.viewport.ScrollUp(-delta)
-		} else {
-			m.viewport.ScrollDown(delta)
-		}
-		return
-	}
-	m.scrollOverlay(delta)
-}
-
 func isInputNewlineKey(key string) bool {
 	if key == "ctrl+j" || key == "shift+enter" || key == "alt+enter" {
 		return true
@@ -2232,55 +1268,10 @@ func isInputNewlineKey(key string) bool {
 	}
 }
 
-func decodeUnknownCSIString(raw string) (string, bool) {
-	if !strings.HasPrefix(raw, "?CSI[") || !strings.HasSuffix(raw, "]?") {
-		return "", false
-	}
-	body := strings.TrimSuffix(strings.TrimPrefix(raw, "?CSI["), "]?")
-	fields := strings.Fields(body)
-	bytes := make([]byte, 0, len(fields)+2)
-	bytes = append(bytes, '\x1b', '[')
-	for _, field := range fields {
-		value, err := strconv.Atoi(field)
-		if err != nil || value < 0 || value > 255 {
-			return "", false
-		}
-		bytes = append(bytes, byte(value))
-	}
-	return string(bytes), true
-}
-
-func isUnknownShiftEnterCSI(raw string) bool {
-	if raw == "" {
-		return false
-	}
-	if strings.Contains(raw, "13;2u") ||
-		strings.Contains(raw, "13;2~") ||
-		strings.Contains(raw, "27;2;13~") {
-		return true
-	}
-	if decoded, ok := decodeUnknownCSIString(raw); ok {
-		return isUnknownShiftEnterCSI(decoded)
-	}
-	return false
-}
-
 func (m *model) insertInputNewline() {
 	m.input.InsertRune('\n')
 	m.syncInputHeight()
 	m.resize()
-}
-
-func (m *model) handleUnknownCSIMessage(raw string) bool {
-	decoded, ok := decodeUnknownCSIString(raw)
-	if !ok {
-		return false
-	}
-	if isUnknownShiftEnterCSI(decoded) {
-		m.insertInputNewline()
-		return true
-	}
-	return m.handleMouseEscapeString(decoded)
 }
 
 // printableRuneFromKey returns the leading printable rune from a
@@ -2299,48 +1290,6 @@ func printableRuneFromKey(msg tea.KeyMsg) rune {
 		return ' '
 	}
 	return 0
-}
-
-// runPaletteSelection executes (or inserts the prefix of) the
-// currently selected command in the slash palette, then resets
-// palette state and returns to composing. For zero-arg commands
-// the runner fires immediately; for has-arg commands the prefix
-// (e.g. "/bash ") is dropped into the textinput so the user can
-// continue typing the rest of the command.
-func (m *model) runPaletteSelection() tea.Cmd {
-	matched := filterSlashCommands(m.paletteFilter)
-	if len(matched) == 0 {
-		m.appendLine("status", "no command matches: /"+m.paletteFilter)
-		return nil
-	}
-	idx := m.paletteSelected
-	if idx < 0 || idx >= len(matched) {
-		idx = 0
-	}
-	cmd := matched[idx]
-	m.paletteFilter = ""
-	m.paletteSelected = 0
-	m.setMode(modeComposing)
-
-	if cmd.prefix != "" {
-		// Insert the prefix into the textinput so the user can keep
-		// typing arguments.
-		m.setInputValue(cmd.prefix)
-		m.appendLine("status", "inserted prefix: "+cmd.prefix)
-		return nil
-	}
-	if cmd.hasArgs {
-		// Has-arg command with no prefix means the command takes a
-		// positional arg parsed by handleLocalCommand; insert the
-		// command name + space and stay in composing.
-		inserted := cmd.name + " "
-		m.setInputValue(inserted)
-		m.appendLine("status", "type the argument, then press enter: "+inserted)
-		return nil
-	}
-	// Zero-arg command: run it immediately.
-	m.appendLine("user", cmd.name)
-	return cmd.run(m, nil)
 }
 
 var (
@@ -2463,6 +1412,7 @@ func newModel(cfg Config) model {
 
 	vp := viewport.New(viewport.WithWidth(80), viewport.WithHeight(20))
 	vp.FillHeight = true
+	vp.MouseWheelDelta = mouseWheelStepLines
 
 	spin := spinner.New()
 	spin.Spinner = spinner.Dot
@@ -2478,21 +1428,22 @@ func newModel(cfg Config) model {
 	}
 
 	m := model{
-		cfg:                     cfg,
-		input:                   input,
-		viewport:                vp,
-		spinner:                 spin,
-		gradientSpinner:         gSpin,
-		inputMode:               modeComposing,
-		transcript:              []*transcriptItem{},
-		recentPermissionRules:   map[string]permissionRuleSeen{},
-		seenInboxCardMessageIDs: map[string]struct{}{},
-		subAgents:               map[string]subAgentEntry{},
-		pastedTextReplacements:  make(map[string]string),
-		pastedTextCounter:       0,
-		historyIndex:            -1,
-		graceQuietPeriod:        graceQuiet,
-		graceMaxDelay:           graceMax,
+		cfg:                       cfg,
+		input:                     input,
+		viewport:                  vp,
+		spinner:                   spin,
+		gradientSpinner:           gSpin,
+		inputMode:                 modeComposing,
+		transcript:                []*transcriptItem{},
+		recentPermissionRules:     map[string]permissionRuleSeen{},
+		trustedPermissionSessions: map[string]struct{}{},
+		seenInboxCardMessageIDs:   map[string]struct{}{},
+		subAgents:                 map[string]subAgentEntry{},
+		pastedTextReplacements:    make(map[string]string),
+		pastedTextCounter:         0,
+		historyIndex:              -1,
+		graceQuietPeriod:          graceQuiet,
+		graceMaxDelay:             graceMax,
 	}
 	if width, height, err := term.GetSize(os.Stdout.Fd()); err == nil && width > 0 && height > 0 {
 		m.width = width
@@ -2630,13 +1581,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		mouse := msg.Mouse()
-		if flag.Lookup("test.v") == nil {
-			now := time.Now()
-			if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
-				return m, nil
-			}
-			m.lastMouseEventTime = now
-		}
 		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
 			m.permissionLastInputAt = time.Now()
 			return m, nil
@@ -2704,6 +1648,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.paletteFilter = ""
 				m.paletteSelected = 0
 				m.setMode(modeSlashPick)
+				m.resize()
 				return m, nil
 			}
 			if isInputNewlineKey(key) {
@@ -2880,8 +1825,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setInputValue("")
 				m.paletteFilter = ""
 				m.paletteSelected = 0
-				m.appendLine("status", "slash cancelled")
 				m.setMode(modeComposing)
+				m.resize()
 				return m, nil
 			case "enter":
 				cmd := m.runPaletteSelection()
@@ -2905,6 +1850,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Filter is empty: bail out of the palette entirely.
 					m.setInputValue("")
 					m.setMode(modeComposing)
+					m.resize()
 				}
 				return m, nil
 			}
@@ -3181,6 +2127,75 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m, nil
+
+		case modeSessionOverlay:
+			actions := sessionPanelActions()
+			switch key {
+			case "esc", "q":
+				m.closeSessionPanel("session panel closed")
+				m.resize()
+				return m, nil
+			case "ctrl+p":
+				return m, m.copyCurrentSessionID()
+			case "up", "k", "shift+tab":
+				if len(actions) > 0 {
+					m.sessionPanelSelected = (m.sessionPanelSelected + len(actions) - 1) % len(actions)
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if len(actions) > 0 {
+					m.sessionPanelSelected = (m.sessionPanelSelected + 1) % len(actions)
+				}
+				return m, nil
+			case "enter":
+				cmd := m.enterSessionPanelSelection()
+				m.resize()
+				return m, cmd
+			}
+			return m, nil
+
+		case modeSessionConfirm:
+			switch key {
+			case "esc", "q":
+				m.closeSessionPanel("session panel closed")
+				m.resize()
+				return m, nil
+			case "ctrl+p":
+				return m, m.copyCurrentSessionID()
+			case "up", "down", "k", "j", "tab", "shift+tab":
+				return m, nil
+			case "enter", "y":
+				m.confirmSessionNew()
+				m.resize()
+				return m, nil
+			case "n":
+				m.closeSessionPanel("session panel closed")
+				m.resize()
+				return m, nil
+			}
+			return m, nil
+
+		case modeSessionInput:
+			switch key {
+			case "esc":
+				m.closeSessionPanel("session panel closed")
+				m.resize()
+				return m, nil
+			case "ctrl+p":
+				return m, m.copyCurrentSessionID()
+			case "enter":
+				m.applySessionInput()
+				m.resize()
+				return m, nil
+			}
+			var inputCmd tea.Cmd
+			oldInputHeight := m.input.Height()
+			m.input, inputCmd = m.input.Update(msg)
+			m.syncInputHeight()
+			if m.input.Height() != oldInputHeight {
+				m.resize()
+			}
+			return m, inputCmd
 		}
 
 		// /model multi-step flow (Phase 1: hardcoded model
@@ -3321,6 +2336,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.paletteFilter = ""
 			m.paletteSelected = 0
 			m.setMode(modeSlashPick)
+			m.resize()
 			return m, nil
 		}
 
@@ -3360,6 +2376,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// stay in composing by default (no setMode call),
 				// which matches the previous behavior.
 				cmd := m.handleLocalCommand(trimmed)
+				m.resize()
 				return m, cmd
 			}
 			m.appendLine("user", trimmed)
@@ -3397,6 +2414,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamStartedMsg:
 		m.events = msg.events
 		m.decisions = msg.decisions
+		if msg.sessionID != "" {
+			m.sessionID = msg.sessionID
+			m.cfg.SessionID = msg.sessionID
+		}
 		// Drop the "stream started" status line: the spinning
 		// `running` indicator in the header already shows that
 		// the WebSocket is up, and an extra transcript row for
@@ -3559,15 +2580,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("error", "context: "+msg.err.Error())
 			return m, nil
 		}
-		// Push the stable top-level envelope to the transcript (so
-		// it survives in the scrollback + PTY harnesses can assert
-		// on it) AND open the full context overlay with the rest of
-		// the diagnostics. The overlay is the primary UX; the
-		// transcript line is the persistent breadcrumb.
-		m.appendLine("status", formatContextAnalysis(msg.raw))
 		m.contextOverlayLines = buildContextOverlayLines(msg.raw)
 		m.contextOverlayScroll = 0
 		m.setMode(modeContextOverlay)
+		m.resize()
 		return m, nil
 
 	case compactResultMsg:
@@ -3750,12 +2766,19 @@ func (m *model) resize() {
 	width := max(40, m.width)
 	m.input.SetWidth(max(20, width-4))
 	m.syncInputHeight()
-	chromeHeight := m.nonTranscriptChromeHeight(width)
 	// Cap at maxTranscriptWidth so very wide terminals (4K) don't
 	// stretch the prose to unreadable line lengths; header / footer
 	// / input still use the full terminal width because their
 	// content is short.
 	m.viewport.SetWidth(max(20, min(width, maxTranscriptWidth)))
+	if m.height <= 0 {
+		return
+	}
+	if m.inputMode == modeContextOverlay {
+		m.viewport.SetHeight(0)
+		return
+	}
+	chromeHeight := m.nonTranscriptChromeHeight(width)
 	if m.topCardOpen {
 		m.viewport.SetHeight(max(0, m.height-chromeHeight))
 		return
@@ -3780,9 +2803,7 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 		m.renderPermission(width),
 		m.renderPermissionEditor(width),
 		m.renderHelp(width),
-		m.renderSlashPalette(width),
 		m.renderProfileConfirm(width),
-		m.renderContextOverlay(width),
 		m.renderInboxOverlay(width),
 		m.renderAgentOverlay(width),
 		m.renderTaskBoard(width),
@@ -3799,7 +2820,7 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 			parts = append(parts, part)
 		}
 	}
-	parts = append(parts, m.renderInput(width), m.renderFooter(width))
+	parts = append(parts, m.renderComposerStack(width), m.renderFooter(width))
 	height := 0
 	for _, part := range parts {
 		height += lipgloss.Height(part)
@@ -3814,15 +2835,20 @@ func (m model) viewString() string {
 	if topCard != "" {
 		return strings.Join([]string{header, topCard, m.renderFooter(width)}, "\n")
 	}
+	if m.inputMode == modeContextOverlay {
+		contextOverlay := m.renderContextOverlay(width)
+		if contextOverlay == "" {
+			return header
+		}
+		return padViewHeight(strings.Join([]string{header, contextOverlay}, "\n"), m.height)
+	}
 	transcript := m.highlightedViewportView()
 	permission := m.renderPermission(width)
 	permissionEditor := m.renderPermissionEditor(width)
-	input := m.renderInput(width)
+	composer := m.renderComposerStack(width)
 	footer := m.renderFooter(width)
 	help := m.renderHelp(width)
-	palette := m.renderSlashPalette(width)
 	profileConfirm := m.renderProfileConfirm(width)
-	contextOverlay := m.renderContextOverlay(width)
 	inboxOverlay := m.renderInboxOverlay(width)
 	agentOverlay := m.renderAgentOverlay(width)
 	taskBoard := m.renderTaskBoard(width)
@@ -3845,14 +2871,8 @@ func (m model) viewString() string {
 	if help != "" {
 		parts = append(parts, help)
 	}
-	if palette != "" {
-		parts = append(parts, palette)
-	}
 	if profileConfirm != "" {
 		parts = append(parts, profileConfirm)
-	}
-	if contextOverlay != "" {
-		parts = append(parts, contextOverlay)
 	}
 	if inboxOverlay != "" {
 		parts = append(parts, inboxOverlay)
@@ -3887,8 +2907,23 @@ func (m model) viewString() string {
 	if quitConfirm != "" {
 		parts = append(parts, quitConfirm)
 	}
-	parts = append(parts, input, footer)
+	parts = append(parts, composer, footer)
 	return strings.Join(parts, "\n")
+}
+
+func padViewHeight(view string, height int) string {
+	if height <= 0 {
+		return view
+	}
+	missing := height - lipgloss.Height(view)
+	if missing <= 0 {
+		return view
+	}
+	lines := make([]string, missing)
+	for i := range lines {
+		lines[i] = " "
+	}
+	return view + "\n" + strings.Join(lines, "\n")
 }
 
 func (m model) View() tea.View {
@@ -3916,7 +2951,7 @@ var helpOverlayLines = []string{
 	"  q                quit when input is empty",
 	"  up / down        walk per-session prompt history (single-line input)",
 	"  pgup / pgdown    page-scroll the transcript viewport",
-	"  mouse wheel      scroll 5 lines per tick — transcript viewport in",
+	"  mouse wheel      smooth-scroll the transcript viewport in",
 	"                   composing, or the active overlay's internal",
 	"                   scroll/selection (help / context / inbox /",
 	"                   agents / tasks / activity / tools / model /",
@@ -3983,28 +3018,15 @@ var helpOverlayLines = []string{
 	"  up / down / tab  scroll through provider/model rows",
 	"  esc / enter / q  close the overlay",
 	"",
+	"Session control overlay:",
+	"  /session         open session operations",
+	"  /session new     create a fresh session on the next prompt",
+	"  /session use <id> switch directly to an existing session",
+	"  up / down / tab  move through session operations",
+	"  enter            open or confirm the selected operation",
+	"  esc              close the overlay",
+	"",
 	"Press esc / enter / q to close.",
-}
-
-// renderToolPalette pushes the static tool catalog into the transcript
-// as a set of status lines, one tool per line. The shape (name,
-// risk, source, approval, summary) matches /v1/tools/audit so the
-// Phase 7 wiring can drop in without changing the user-facing UX.
-func (m *model) renderToolPalette(tools []toolDescriptor) {
-	m.appendLine("status", fmt.Sprintf("tools (%d, read-only):", len(tools)))
-	for _, t := range tools {
-		approval := "no-approval"
-		if t.approval {
-			approval = "approval-required"
-		}
-		// Pad name to 12 chars for column alignment.
-		name := t.name
-		for len(name) < 12 {
-			name += " "
-		}
-		line := fmt.Sprintf("  %s  risk=%-7s  source=%-8s  %s  — %s", name, t.risk, t.source, approval, t.summary)
-		m.appendLine("tool", line)
-	}
 }
 
 func (m model) renderHelp(width int) string {
@@ -4055,2267 +3077,6 @@ func (m model) renderQuitConfirm(width int) string {
 	return newQuitDialog(m.quitChoice).View(width)
 }
 
-// renderContextOverlay paints the multi-line context analysis
-// (Phase 5 续). It is a read-only scrollable overlay, similar in
-// shape to renderHelp: header + divider + clamped line window +
-// bottom hint. Outside modeContextOverlay it returns "" so the
-// View() parts list can splice it unconditionally.
-func (m model) renderContextOverlay(width int) string {
-	if m.inputMode != modeContextOverlay {
-		return ""
-	}
-	if len(m.contextOverlayLines) == 0 {
-		return ""
-	}
-	header := titleStyle.Render("Context")
-	// Reserve one row for header, one for the bottom hint, and one
-	// for a scroll indicator. The remaining rows are the visible
-	// window of contextOverlayLines.
-	reserved := 4
-	visibleRows := max(0, m.height-reserved)
-	if visibleRows == 0 {
-		visibleRows = max(1, len(m.contextOverlayLines))
-	}
-	maxScroll := max(0, len(m.contextOverlayLines)-visibleRows)
-	if m.contextOverlayScroll > maxScroll {
-		m.contextOverlayScroll = maxScroll
-	}
-	start := m.contextOverlayScroll
-	end := start + visibleRows
-	if end > len(m.contextOverlayLines) {
-		end = len(m.contextOverlayLines)
-	}
-	body := strings.Join(m.contextOverlayLines[start:end], "\n")
-	scrollHint := fmt.Sprintf("  scroll %d/%d", start+1, len(m.contextOverlayLines))
-	footerHint := "  up/down/tab scroll  esc/enter/q close"
-	plain := strings.Join([]string{body, scrollHint, footerHint}, "\n")
-	content := strings.Join([]string{header, contextStyle.Render(wrapPlain(plain, max(0, width-2)))}, "\n")
-	return renderOverlayFrame(width, content)
-}
-
-// buildContextOverlayLines turns the raw /v1/sessions/:id/context
-// payload into the line buffer that the contextOverlay renders. It
-// pulls a stable subset of the diagnostics (sections, compact
-// retention, long-term memory, scoped memory, session memory lite,
-// auto compact, recovery, repeated tool inputs, working set paths)
-// plus the top signals and recommendations. Unknown / missing
-// fields are silently skipped so the line count stays bounded.
-func buildContextOverlayLines(raw []byte) []string {
-	var payload struct {
-		Type      string `json:"type"`
-		SessionID string `json:"sessionId"`
-		Cwd       string `json:"cwd"`
-		ModelID   string `json:"modelId"`
-		Budget    struct {
-			MaxTokens    int `json:"maxTokens"`
-			LayerBudgets struct {
-				System         int `json:"system"`
-				Summary        int `json:"summary"`
-				History        int `json:"history"`
-				Memory         int `json:"memory"`
-				ReservedOutput int `json:"reservedOutput"`
-			} `json:"layerBudgets"`
-		} `json:"budget"`
-		Window struct {
-			MaxTokens     int `json:"maxTokens"`
-			TokenEstimate int `json:"tokenEstimate"`
-		} `json:"window"`
-		Sections struct {
-			SystemPromptChars        int  `json:"systemPromptChars"`
-			ProjectMemoryChars       int  `json:"projectMemoryChars"`
-			SessionSummaryChars      int  `json:"sessionSummaryChars"`
-			ActiveSkillsChars        int  `json:"activeSkillsChars"`
-			MessageCount             int  `json:"messageCount"`
-			SelectedEventCount       int  `json:"selectedEventCount"`
-			OmittedEventCount        int  `json:"omittedEventCount"`
-			SnippedEventCount        int  `json:"snippedEventCount"`
-			MicrocompactedEventCount int  `json:"microcompactedEventCount"`
-			MemoryTruncated          bool `json:"memoryTruncated"`
-			ToolDefinitionCount      int  `json:"toolDefinitionCount"`
-		} `json:"sections"`
-		Compact struct {
-			HasBoundary            bool   `json:"hasBoundary"`
-			Trigger                string `json:"trigger"`
-			SummaryChars           int    `json:"summaryChars"`
-			RetainedEventCount     int    `json:"retainedEventCount"`
-			RetainedSegmentValid   bool   `json:"retainedSegmentValid"`
-			RetainedSegmentWarning string `json:"retainedSegmentWarning"`
-			BeforeEventCount       int    `json:"beforeEventCount"`
-			AfterEventCount        int    `json:"afterEventCount"`
-		} `json:"compact"`
-		Diagnostics struct {
-			RemainingTokens  int `json:"remainingTokens"`
-			RemainingPercent int `json:"remainingPercent"`
-			AutoCompact      struct {
-				ShouldCompact    bool `json:"shouldCompact"`
-				ThresholdPercent int  `json:"thresholdPercent"`
-				FuseOpen         bool `json:"fuseOpen"`
-				FailureCount     int  `json:"failureCount"`
-				FailureLimit     int  `json:"failureLimit"`
-			} `json:"autoCompact"`
-			LongTermMemory struct {
-				Provider        string  `json:"provider"`
-				Enabled         bool    `json:"enabled"`
-				HitCount        int     `json:"hitCount"`
-				InjectedChars   int     `json:"injectedChars"`
-				BudgetChars     int     `json:"budgetChars"`
-				Truncated       bool    `json:"truncated"`
-				Scope           string  `json:"scope"`
-				NamespaceID     string  `json:"namespaceId"`
-				SearchLatencyMs float64 `json:"searchLatencyMs"`
-				Error           string  `json:"error"`
-			} `json:"longTermMemory"`
-			ScopedMemory []struct {
-				Scope         string `json:"scope"`
-				Provider      string `json:"provider"`
-				Enabled       bool   `json:"enabled"`
-				HitCount      int    `json:"hitCount"`
-				InjectedChars int    `json:"injectedChars"`
-				BudgetChars   int    `json:"budgetChars"`
-				Truncated     bool   `json:"truncated"`
-				NamespaceID   string `json:"namespaceId"`
-			} `json:"scopedMemory"`
-			SessionMemoryLite struct {
-				Enabled    bool `json:"enabled"`
-				LastUpdate struct {
-					Trigger      string `json:"trigger"`
-					Reason       string `json:"reason"`
-					SummaryChars int    `json:"summaryChars"`
-					EventCount   int    `json:"eventCount"`
-				} `json:"lastUpdate"`
-				NextDecision struct {
-					ShouldUpdate bool   `json:"shouldUpdate"`
-					Reason       string `json:"reason"`
-				} `json:"nextDecision"`
-				CostPolicy struct {
-					SummaryMode     string `json:"summaryMode"`
-					MaxSummaryChars int    `json:"maxSummaryChars"`
-				} `json:"costPolicy"`
-			} `json:"sessionMemoryLite"`
-			CompactRetention struct {
-				HasBoundary            bool   `json:"hasBoundary"`
-				RetainedEventCount     int    `json:"retainedEventCount"`
-				RetainedSegmentValid   bool   `json:"retainedSegmentValid"`
-				RetainedSegmentWarning string `json:"retainedSegmentWarning"`
-				FallbackToFullHistory  bool   `json:"fallbackToFullHistory"`
-			} `json:"compactRetention"`
-			CompactTokenDelta struct {
-				HasBoundary          bool `json:"hasBoundary"`
-				BeforeEventCount     int  `json:"beforeEventCount"`
-				AfterEventCount      int  `json:"afterEventCount"`
-				EstimatedTokensSaved int  `json:"estimatedTokensSaved"`
-			} `json:"compactTokenDelta"`
-			ResumeRecovery struct {
-				Active    bool   `json:"active"`
-				Code      string `json:"code"`
-				Message   string `json:"message"`
-				Timestamp string `json:"timestamp"`
-			} `json:"resumeRecovery"`
-			WorkingSetPaths []struct {
-				Path    string `json:"path"`
-				Touches int    `json:"touches"`
-			} `json:"workingSetPaths"`
-			RepeatedToolInputs []struct {
-				Name         string `json:"name"`
-				Count        int    `json:"count"`
-				InputPreview string `json:"inputPreview"`
-			} `json:"repeatedToolInputs"`
-			LargeToolResults []struct {
-				Name         string `json:"name"`
-				OutputChars  int    `json:"outputChars"`
-				InputPreview string `json:"inputPreview"`
-			} `json:"largeToolResults"`
-		} `json:"diagnostics"`
-		Diagnostic struct {
-			Name            string          `json:"name"`
-			Status          string          `json:"status"`
-			Summary         string          `json:"summary"`
-			Signals         []contextSignal `json:"signals"`
-			Recommendations []string        `json:"recommendations"`
-		} `json:"diagnostic"`
-		Recommendations []string `json:"recommendations"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return []string{fmt.Sprintf("context overlay: decode failed: %v", err)}
-	}
-	lines := []string{}
-	// Header.
-	modelPart := strings.TrimSpace(payload.ModelID)
-	if modelPart == "" {
-		modelPart = "default"
-	}
-	lines = append(lines, fmt.Sprintf("Context · %s · %s", shortID(payload.SessionID), modelPart))
-	// Summary + status.
-	if s := strings.TrimSpace(payload.Diagnostic.Summary); s != "" {
-		lines = append(lines, "  "+s)
-	}
-	if status := strings.TrimSpace(payload.Diagnostic.Status); status != "" {
-		lines = append(lines, fmt.Sprintf("  status: %s", status))
-	}
-	// Sections.
-	if payload.Sections.MessageCount > 0 || payload.Sections.SelectedEventCount > 0 || payload.Sections.ToolDefinitionCount > 0 {
-		lines = append(lines, "  sections:")
-		lines = append(lines, fmt.Sprintf("    messages: %d (selected=%d omitted=%d snipped=%d microcompact=%d)",
-			payload.Sections.MessageCount, payload.Sections.SelectedEventCount,
-			payload.Sections.OmittedEventCount, payload.Sections.SnippedEventCount,
-			payload.Sections.MicrocompactedEventCount))
-		lines = append(lines, fmt.Sprintf("    chars: system=%s project-memory=%s session-summary=%s skills=%s",
-			formatCharCount(payload.Sections.SystemPromptChars),
-			formatCharCount(payload.Sections.ProjectMemoryChars),
-			formatCharCount(payload.Sections.SessionSummaryChars),
-			formatCharCount(payload.Sections.ActiveSkillsChars),
-		))
-		lines = append(lines, fmt.Sprintf("    tools visible: %d%s",
-			payload.Sections.ToolDefinitionCount,
-			ternary(payload.Sections.MemoryTruncated, " (memory truncated)", "")))
-	}
-	// Budget breakdown (only when populated).
-	if lb := payload.Budget.LayerBudgets; lb.System+lb.Summary+lb.History+lb.Memory > 0 {
-		lines = append(lines, "  budget layers (tokens):")
-		lines = append(lines, fmt.Sprintf("    system=%d summary=%d history=%d memory=%d reserved-output=%d",
-			lb.System, lb.Summary, lb.History, lb.Memory, lb.ReservedOutput))
-	}
-	// Compact retention + token delta.
-	if payload.Diagnostics.CompactRetention.HasBoundary {
-		validity := "valid"
-		if !payload.Diagnostics.CompactRetention.RetainedSegmentValid {
-			validity = "fallback"
-		}
-		warning := ""
-		if w := strings.TrimSpace(payload.Diagnostics.CompactRetention.RetainedSegmentWarning); w != "" {
-			warning = " · " + w
-		}
-		lines = append(lines, fmt.Sprintf("  compact retention: %s · events=%d%s",
-			validity, payload.Diagnostics.CompactRetention.RetainedEventCount, warning))
-	}
-	if payload.Diagnostics.CompactTokenDelta.HasBoundary {
-		lines = append(lines, fmt.Sprintf("  compact delta: events %d→%d · saved≈%d tokens",
-			payload.Diagnostics.CompactTokenDelta.BeforeEventCount,
-			payload.Diagnostics.CompactTokenDelta.AfterEventCount,
-			payload.Diagnostics.CompactTokenDelta.EstimatedTokensSaved,
-		))
-	}
-	// Auto compact.
-	if payload.Diagnostics.AutoCompact.ShouldCompact {
-		lines = append(lines, fmt.Sprintf("  auto compact: threshold reached at %d%%",
-			payload.Diagnostics.AutoCompact.ThresholdPercent))
-	}
-	if payload.Diagnostics.AutoCompact.FuseOpen {
-		lines = append(lines, fmt.Sprintf("  auto compact: fuse open after %d/%d failures",
-			payload.Diagnostics.AutoCompact.FailureCount,
-			payload.Diagnostics.AutoCompact.FailureLimit))
-	}
-	// Long-term memory.
-	ltm := payload.Diagnostics.LongTermMemory
-	ltmProvider := ltm.Provider
-	if !ltm.Enabled || ltmProvider == "" {
-		ltmProvider = "disabled"
-	}
-	ltmScopePart := ""
-	if ltm.Scope != "" && ltm.Scope != "unknown" {
-		ltmScopePart = fmt.Sprintf(" scope=%s%s", ltm.Scope,
-			ternary(ltm.NamespaceID != "", " namespace="+ltm.NamespaceID, ""))
-	}
-	lines = append(lines, fmt.Sprintf("  long-term memory: %s%s · hits=%d injected=%s/%s",
-		ltmProvider, ltmScopePart, ltm.HitCount,
-		formatCharCount(ltm.InjectedChars), formatCharCount(ltm.BudgetChars)))
-	if ltm.Truncated {
-		lines = append(lines, "  long-term memory: truncated (budget pressure)")
-	}
-	if ltm.SearchLatencyMs > 0 {
-		lines = append(lines, fmt.Sprintf("  long-term memory: search latency=%dms",
-			int(ltm.SearchLatencyMs)))
-	}
-	if ltm.Error != "" {
-		lines = append(lines, "  long-term memory: error="+ltm.Error)
-	}
-	// Scoped memory.
-	for _, sm := range payload.Diagnostics.ScopedMemory {
-		if sm.Scope == "unknown" {
-			continue
-		}
-		provider := sm.Provider
-		if !sm.Enabled || provider == "" {
-			provider = "disabled"
-		}
-		lines = append(lines, fmt.Sprintf("  scoped memory: %s %s · hits=%d injected=%s/%s%s",
-			sm.Scope, provider, sm.HitCount,
-			formatCharCount(sm.InjectedChars), formatCharCount(sm.BudgetChars),
-			ternary(sm.NamespaceID != "", " namespace="+sm.NamespaceID, "")))
-	}
-	// Session memory lite.
-	sml := payload.Diagnostics.SessionMemoryLite
-	if sml.Enabled || sml.LastUpdate.Trigger != "" {
-		lastLine := "none"
-		if sml.LastUpdate.Trigger != "" {
-			lastLine = fmt.Sprintf("%s/%s events=%d summary=%s",
-				sml.LastUpdate.Trigger,
-				ternary(sml.LastUpdate.Reason == "", "unknown", sml.LastUpdate.Reason),
-				sml.LastUpdate.EventCount,
-				formatCharCount(sml.LastUpdate.SummaryChars))
-		}
-		lines = append(lines, fmt.Sprintf("  session memory lite: enabled=%v last=%s next=%s policy=%s",
-			sml.Enabled, lastLine,
-			ternary(sml.NextDecision.ShouldUpdate, "update", "skip")+"·"+sml.NextDecision.Reason,
-			sml.CostPolicy.SummaryMode))
-	}
-	// Resume recovery.
-	if payload.Diagnostics.ResumeRecovery.Active {
-		lines = append(lines, fmt.Sprintf("  resume recovery: %s · %s",
-			payload.Diagnostics.ResumeRecovery.Code,
-			payload.Diagnostics.ResumeRecovery.Message))
-	}
-	// Working set paths.
-	if len(payload.Diagnostics.WorkingSetPaths) > 0 {
-		parts := []string{}
-		limit := len(payload.Diagnostics.WorkingSetPaths)
-		if limit > 3 {
-			limit = 3
-		}
-		for _, entry := range payload.Diagnostics.WorkingSetPaths[:limit] {
-			parts = append(parts, fmt.Sprintf("%s×%d", entry.Path, entry.Touches))
-		}
-		lines = append(lines, "  working set paths: "+strings.Join(parts, ", "))
-	}
-	// Repeated tool inputs.
-	if len(payload.Diagnostics.RepeatedToolInputs) > 0 {
-		limit := len(payload.Diagnostics.RepeatedToolInputs)
-		if limit > 2 {
-			limit = 2
-		}
-		for _, entry := range payload.Diagnostics.RepeatedToolInputs[:limit] {
-			lines = append(lines, fmt.Sprintf("  repeated tool input: %s ×%d · %s",
-				entry.Name, entry.Count, entry.InputPreview))
-		}
-	}
-	// Large tool results.
-	if len(payload.Diagnostics.LargeToolResults) > 0 {
-		limit := len(payload.Diagnostics.LargeToolResults)
-		if limit > 2 {
-			limit = 2
-		}
-		for _, entry := range payload.Diagnostics.LargeToolResults[:limit] {
-			lines = append(lines, fmt.Sprintf("  large tool result: %s %s · %s",
-				entry.Name, formatCharCount(entry.OutputChars), entry.InputPreview))
-		}
-	}
-	// Signals.
-	if signals := payload.Diagnostic.Signals; len(signals) > 0 {
-		lines = append(lines, "  signals:")
-		limit := len(signals)
-		if limit > 5 {
-			limit = 5
-		}
-		for _, sig := range signals[:limit] {
-			level := strings.TrimSpace(sig.Level)
-			if level == "" {
-				level = "info"
-			}
-			lines = append(lines, fmt.Sprintf("    [%s] %s %s",
-				level, strings.TrimSpace(sig.Code), strings.TrimSpace(sig.Message)))
-		}
-		if len(signals) > 5 {
-			lines = append(lines, fmt.Sprintf("    ... +%d more", len(signals)-5))
-		}
-	}
-	// Recommendations.
-	if recs := payload.Diagnostic.Recommendations; len(recs) > 0 {
-		lines = append(lines, "  recommendations:")
-		limit := len(recs)
-		if limit > 5 {
-			limit = 5
-		}
-		for _, rec := range recs[:limit] {
-			lines = append(lines, "    - "+strings.TrimSpace(rec))
-		}
-		if len(recs) > 5 {
-			lines = append(lines, fmt.Sprintf("    ... +%d more", len(recs)-5))
-		}
-	}
-	return lines
-}
-
-// ternary is a small inline helper to keep the buildContextOverlayLines
-// body readable when picking between two short strings.
-func ternary(cond bool, whenTrue, whenFalse string) string {
-	if cond {
-		return whenTrue
-	}
-	return whenFalse
-}
-
-// isKeyInboxMessage mirrors shouldRenderInboxEventCard in
-// src/cli/inboxOverlay.ts. Handoff / blocked / request_review /
-// request_validation are always key; finding is only key when
-// priority=high; memory_candidate is key when its governance
-// decision is rejected/requires_approval or approval.status is
-// required/rejected. Key messages trigger an event card in the
-// main conversation flow and a "high: <type>" tag in the footer.
-func isKeyInboxMessage(message sessionMessage) bool {
-	switch message.Type {
-	case messageTypeHandoff, messageTypeBlocked,
-		messageTypeRequestReview, messageTypeRequestValidation:
-		return true
-	case messageTypeFinding:
-		return message.Priority == priorityHigh
-	case messageTypeMemoryCandidate:
-		governance := asMap(message.Metadata["memoryCandidateGovernance"])
-		if governance == nil {
-			return false
-		}
-		decision := stringField(governance, "decision")
-		if decision == "rejected" || decision == "requires_approval" {
-			return true
-		}
-		approval := asMap(governance["approval"])
-		approvalStatus := stringField(approval, "status")
-		return approvalStatus == "required" || approvalStatus == "rejected"
-	}
-	return false
-}
-
-// asMap is a tiny defensive helper that returns its input as a
-// generic map. It is used by inbox governance checks that need to
-// reach into optional metadata fields without forcing the typed
-// sessionMessage struct to grow new optional fields.
-func asMap(value any) map[string]any {
-	typed, ok := value.(map[string]any)
-	if !ok {
-		return nil
-	}
-	return typed
-}
-
-// formatInboxEvidence renders the evidence list as
-// "type:ref (label), type:ref" — same shape as
-// formatEvidenceRefs in src/cli/inboxOverlay.ts. Returns "" when
-// no evidence is attached.
-func formatInboxEvidence(evidence []evidenceRef) string {
-	if len(evidence) == 0 {
-		return ""
-	}
-	parts := make([]string, 0, len(evidence))
-	for _, ref := range evidence {
-		entry := strings.TrimSpace(ref.Type) + ":" + strings.TrimSpace(ref.Ref)
-		if label := strings.TrimSpace(ref.Label); label != "" {
-			entry += " (" + label + ")"
-		}
-		parts = append(parts, entry)
-	}
-	return strings.Join(parts, ", ")
-}
-
-// formatInboxGovernanceSummary renders a one-line governance
-// summary for memory_candidate messages. Mirrors
-// formatGovernanceSummary in src/cli/inboxOverlay.ts. Returns ""
-// when the message isn't a memory_candidate or when the optional
-// governance blob is missing.
-func formatInboxGovernanceSummary(message sessionMessage) string {
-	if message.Type != messageTypeMemoryCandidate {
-		return ""
-	}
-	governance := asMap(message.Metadata["memoryCandidateGovernance"])
-	if governance == nil {
-		return ""
-	}
-	approval := asMap(governance["approval"])
-	parts := []string{
-		"decision=" + fallbackUnknown(stringField(governance, "decision")),
-		"scope=" + fallbackUnknown(stringField(governance, "scope")),
-		"approval=" + fallbackUnknown(stringField(approval, "status")) +
-			":" + fallbackUnknown(stringField(approval, "requiredBy")),
-	}
-	if auto, ok := governance["autoWrite"].(bool); ok {
-		parts = append(parts, fmt.Sprintf("auto_write=%v", auto))
-	}
-	return strings.Join(parts, " ")
-}
-
-// fallbackUnknown renders "<x>" for the in-line label when a
-// missing or blank string would otherwise leave a bare "=" in the
-// summary line. Mirrors the inline `?? "unknown"` behavior in
-// formatGovernanceSummary in the TS TUI.
-func fallbackUnknown(value string) string {
-	if strings.TrimSpace(value) == "" {
-		return "unknown"
-	}
-	return value
-}
-
-// formatInboxMessageHeaderRow renders the first row of a message
-// inside the inbox overlay. It uses `›` as the selected marker
-// (mirroring the TS TUI) and a ` ` pad for unselected rows so the
-// column alignment is stable.
-func formatInboxMessageHeaderRow(message sessionMessage, selected bool) string {
-	marker := " "
-	if selected {
-		marker = "›"
-	}
-	status := strings.TrimSpace(string(message.Status))
-	if message.AcknowledgedAt != "" && status == "" {
-		status = "acknowledged"
-	}
-	if status == "" {
-		status = string(messageStatusDelivered)
-	}
-	return fmt.Sprintf("%s %s [%s] %s", marker, message.MessageID, message.CreatedAt, status)
-}
-
-// formatInboxMessageMetaRow renders the second row of a message
-// (type / priority / from / target / channel / kind). The target
-// is `to=<id>` for direct sends and `broadcast=true` for fan-out.
-func formatInboxMessageMetaRow(message sessionMessage, channel sessionChannel) string {
-	target := "broadcast=true"
-	if to := strings.TrimSpace(message.ToSessionID); to != "" {
-		target = "to=" + to
-	}
-	channelKind := string(channel.Kind)
-	if channelKind == "" {
-		channelKind = string(channelKindDirect)
-	}
-	return fmt.Sprintf("  %s · %s · from=%s · %s · kind=%s · channel=%s",
-		message.Type, message.Priority, message.FromSessionID,
-		target, channelKind, message.ChannelID)
-}
-
-// formatInboxMessageContentRow renders the content line, prefixed
-// with two spaces for indent. The text is left untouched — the
-// overlay scrolls vertically, not horizontally, and the chat TUI
-// keeps long content as a single line for grep-ability.
-func formatInboxMessageContentRow(message sessionMessage) string {
-	return "  " + message.Content
-}
-
-// buildInboxMessageRows returns the ordered list of row strings for
-// a single message in the inbox overlay. Returns an empty slice
-// for the zero-value message so callers can iterate safely.
-func buildInboxMessageRows(message sessionMessage, channel sessionChannel, selected bool) []string {
-	rows := []string{
-		formatInboxMessageHeaderRow(message, selected),
-		formatInboxMessageMetaRow(message, channel),
-		formatInboxMessageContentRow(message),
-	}
-	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
-		rows = append(rows, "  evidence: "+evidence)
-	}
-	if gov := formatInboxGovernanceSummary(message); gov != "" {
-		rows = append(rows, "  governance: "+gov)
-	}
-	return rows
-}
-
-// formatInboxFooterStatus mirrors formatInboxFooterStatus in
-// src/cli/inboxOverlay.ts. Renders a compact
-// "linked sessions: N [...]; inbox: N unread; channels: kind1 N/kind2 M; high: <type>"
-// summary used both by the persistent footer status line and the
-// "summary" line at the top of the overlay. Returns "" when there
-// is nothing to surface, so callers can no-op.
-func formatInboxFooterStatus(sessionID string, messages []sessionMessage, channels []sessionChannel) string {
-	unread := 0
-	for _, message := range messages {
-		if message.Status == messageStatusAcknowledged || message.AcknowledgedAt != "" {
-			continue
-		}
-		unread++
-	}
-	linked := map[string]struct{}{}
-	for _, channel := range channels {
-		found := false
-		for _, participant := range channel.ParticipantSessionIDs {
-			if participant == sessionID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			continue
-		}
-		for _, participant := range channel.ParticipantSessionIDs {
-			if participant == sessionID {
-				continue
-			}
-			linked[participant] = struct{}{}
-		}
-	}
-	if len(linked) == 0 {
-		for _, message := range messages {
-			if message.FromSessionID == sessionID {
-				continue
-			}
-			linked[message.FromSessionID] = struct{}{}
-		}
-	}
-	parts := []string{}
-	if linkedSummary := formatLinkedSessionSummary(linked); linkedSummary != "" {
-		parts = append(parts, linkedSummary)
-	}
-	if len(linked) > 0 || unread > 0 {
-		parts = append(parts, fmt.Sprintf("inbox: %d unread", unread))
-	}
-	if kinds := summarizeChannelKinds(channels, sessionID); kinds != "" {
-		parts = append(parts, "channels: "+kinds)
-	}
-	for _, message := range messages {
-		if isKeyInboxMessage(message) {
-			parts = append(parts, "high: "+string(message.Type))
-			break
-		}
-	}
-	return strings.Join(parts, " · ")
-}
-
-// formatLinkedSessionSummary renders the
-// "linked sessions: N [s1, s2, s3 +X more]" segment used by
-// formatInboxFooterStatus. Caps at 3 short IDs and trims with
-// "+N" so the footer status stays on one line in narrow widths.
-func formatLinkedSessionSummary(linked map[string]struct{}) string {
-	if len(linked) == 0 {
-		return ""
-	}
-	ids := make([]string, 0, len(linked))
-	for id := range linked {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	limit := 3
-	if len(ids) < limit {
-		limit = len(ids)
-	}
-	shown := make([]string, 0, limit+1)
-	for _, id := range ids[:limit] {
-		shown = append(shown, shortID(id))
-	}
-	extra := ""
-	if len(ids) > limit {
-		extra = fmt.Sprintf(" +%d", len(ids)-limit)
-	}
-	return fmt.Sprintf("linked sessions: %d [%s%s]", len(ids), strings.Join(shown, ", "), extra)
-}
-
-// summarizeChannelKinds returns a stable
-// "direct 1/group 2/parent_child 1" segment for the channels the
-// current session participates in. The order is sorted by kind so
-// the footer string is stable across runs (mirrors the TS
-// summarizeChannelKinds helper).
-func summarizeChannelKinds(channels []sessionChannel, sessionID string) string {
-	counts := map[sessionChannelKind]int{}
-	for _, channel := range channels {
-		found := false
-		for _, participant := range channel.ParticipantSessionIDs {
-			if participant == sessionID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			continue
-		}
-		counts[channel.Kind]++
-	}
-	if len(counts) == 0 {
-		return ""
-	}
-	keys := make([]string, 0, len(counts))
-	for kind := range counts {
-		keys = append(keys, string(kind))
-	}
-	sort.Strings(keys)
-	parts := make([]string, 0, len(keys))
-	for _, kind := range keys {
-		parts = append(parts, fmt.Sprintf("%s %d", kind, counts[sessionChannelKind(kind)]))
-	}
-	return strings.Join(parts, "/")
-}
-
-// buildInboxOverlayLines turns the inbox response into the ordered
-// list of lines the inbox overlay will render. Each message
-// contributes 3-5 lines (header / meta / content / optional
-// evidence / optional governance); the overlay window is then
-// clamped in renderInboxOverlay. Returns an empty slice for the
-// "no messages" case so the caller can show a friendly placeholder.
-func buildInboxOverlayLines(messages []sessionMessage, channels []sessionChannel, selected int, includeAck bool) []string {
-	if len(messages) == 0 {
-		placeholder := "No unread inbox messages."
-		if includeAck {
-			placeholder = "No inbox messages."
-		}
-		return []string{placeholder}
-	}
-	channelByID := make(map[string]sessionChannel, len(channels))
-	for _, channel := range channels {
-		channelByID[channel.ChannelID] = channel
-	}
-	lines := []string{mutedStyle.Render("  message_id · created_at · status · type · priority · from · target · kind · channel")}
-	for index, message := range messages {
-		channel := channelByID[message.ChannelID]
-		isSelected := index == selected
-		lines = append(lines, buildInboxMessageRows(message, channel, isSelected)...)
-	}
-	return lines
-}
-
-// renderInboxOverlay paints the multi-line SessionChannel inbox
-// view. It is the Phase 6 §1 primary UX for the inbox slash
-// command. The overlay is composed of:
-//   - titleStyle header (Phase 6 banner + session id)
-//   - persistent footer status summary (linked / unread / channels / high)
-//   - clamped window of buildInboxOverlayLines
-//   - bottom hint (selection marker, scroll, close, ack keys)
-//
-// Outside modeInboxOverlay it returns "" so it can be
-// unconditionally spliced into the View() parts list.
-func (m model) renderInboxOverlay(width int) string {
-	if m.inputMode != modeInboxOverlay {
-		return ""
-	}
-	banner := "Inbox"
-	if m.inboxOverlayIncludeAck {
-		banner = "Inbox · all"
-	}
-	header := titleStyle.Render(banner)
-	summary := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels)
-	if summary == "" {
-		summary = "(no inbox summary available)"
-	}
-	lines := []string{header, divider(width), summary}
-	visibleRows := max(1, m.height-10)
-	allLines := buildInboxOverlayLines(m.inboxMessages, m.inboxChannels, m.inboxOverlaySelected, m.inboxOverlayIncludeAck)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.inboxOverlayScroll > maxScroll {
-		// View() is read-only; clamp locally for the rendered slice.
-		// The next key event will reconcile m.inboxOverlayScroll.
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		lines = append(lines, allLines[maxScroll:end]...)
-	} else {
-		end := m.inboxOverlayScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		lines = append(lines, allLines[m.inboxOverlayScroll:end]...)
-	}
-	hint := "↑/↓/Tab move · a ack selected · esc/enter/q close"
-	lines = append(lines, mutedStyle.Render(hint))
-	return renderOverlayFrame(width, inboxStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-// quoteInboxMessageContent renders a multi-line block that can be
-// pre-filled into the textinput when the user chooses to quote a
-// SessionChannel message into the current prompt. Mirrors
-// quoteInboxMessage in src/cli/inboxOverlay.ts. The block always
-// starts with the "verify evidence" guard line so the user is
-// reminded not to act on the inbox context blindly. Missing
-// optional fields (evidence / governance) are dropped; required
-// fields fall back to "unknown" via fallbackUnknown so a
-// server-side addition cannot break the rendering.
-func quoteInboxMessageContent(message sessionMessage) string {
-	header := fmt.Sprintf("message=%s type=%s priority=%s from=%s channel=%s",
-		fallbackUnknown(message.MessageID),
-		fallbackUnknown(string(message.Type)),
-		fallbackUnknown(string(message.Priority)),
-		fallbackUnknown(message.FromSessionID),
-		fallbackUnknown(message.ChannelID),
-	)
-	parts := []string{
-		"Use this SessionChannel inbox context only after verifying evidence:",
-		header,
-		"content: " + fallbackUnknown(message.Content),
-	}
-	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
-		parts = append(parts, "evidence: "+evidence)
-	}
-	if gov := formatInboxGovernanceSummary(message); gov != "" {
-		parts = append(parts, "memory_candidate "+gov)
-	}
-	return strings.Join(parts, "\n")
-}
-
-// renderInboxEventCard is the main-flow event card for a single
-// key SessionChannel message. It is intentionally compact (a
-// short banner + metadata + the "open inbox / ack / quote" hint)
-// so the user's main transcript stays readable. Returns "" for
-// non-key messages so callers can route through it unconditionally.
-// formatAgentStatusIcon returns a short, terminal-friendly
-// status marker (e.g. "[running]", "[done]", "[failed]"). The
-// TS TUI uses Unicode icons in chalk colors, but the Go TUI
-// keeps it plain text so the cooked-mode PTY harness can
-// assert on the literal string without stripping ANSI codes.
-// Unknown statuses fall through to the raw text so a
-// server-side addition cannot crash the client.
-func formatAgentStatusIcon(status agentJobStatus) string {
-	switch status {
-	case agentStatusQueued:
-		return "[queue]"
-	case agentStatusRunning:
-		return "[run]"
-	case agentStatusWaitingPermission:
-		return "[perm]"
-	case agentStatusCompleted:
-		return "[done]"
-	case agentStatusFailed:
-		return "[fail]"
-	case agentStatusCancelled:
-		return "[cancel]"
-	}
-	return "[" + fallbackUnknown(string(status)) + "]"
-}
-
-// formatAgentGovernanceSummary returns a compact
-// "active N/M · depth D/maxD" segment for the agent overlay
-// row. Returns "" when no governance blob is attached so the
-// row stays tight for default-nothing jobs.
-func formatAgentGovernanceSummary(governance *agentJobGovernance) string {
-	if governance == nil {
-		return ""
-	}
-	parts := []string{
-		fmt.Sprintf("active %d/%d", governance.ActiveAgents, governance.MaxConcurrentAgents),
-	}
-	if governance.MaxDepth > 0 || governance.Depth > 0 {
-		parts = append(parts, fmt.Sprintf("depth %d/%d", governance.Depth, governance.MaxDepth))
-	}
-	return strings.Join(parts, " · ")
-}
-
-// formatAgentJobRow renders a single agent job for the agent
-// status overlay. The row is two physical lines:
-//   - main row: status icon + agentType + child=<shortID> +
-//     optional governance summary + optional task#<id>
-//   - indent row: first 80 chars of the prompt (single line,
-//     indent-prefixed) for human-scannability
-//
-// Mirrors the TS TUI formatMultiAgentRow shape (status + source
-// + agentType + depth + title + child + governance + transcript
-// path) but collapses the transcriptPath line since the Go
-// TUI overlay is read-only and the path is mostly useful for
-// `bbl sessions` CLI invocations.
-func formatAgentJobRow(job agentJob) []string {
-	parts := []string{
-		formatAgentStatusIcon(job.Status),
-		"job",
-		string(fallbackUnknown(string(job.AgentType))),
-	}
-	if job.Governance != nil && job.Governance.Depth > 0 {
-		parts = append(parts, fmt.Sprintf("d%d", job.Governance.Depth))
-	}
-	main := strings.Join(parts, " ")
-	if child := strings.TrimSpace(job.ChildSessionID); child != "" {
-		main += "  child=" + shortID(child)
-	}
-	if gov := formatAgentGovernanceSummary(job.Governance); gov != "" {
-		main += "  " + gov
-	}
-	if taskID := strings.TrimSpace(job.ParentTaskID); taskID != "" {
-		main += "  task=#" + taskID
-	}
-	rows := []string{main}
-	if prompt := singleLine(strings.TrimSpace(job.Prompt)); prompt != "" {
-		rows = append(rows, "  prompt: "+truncatePlain(prompt, 100))
-	}
-	return rows
-}
-
-// buildAgentOverlayLines turns the agent jobs snapshot into the
-// ordered list of lines the agent overlay will render. Each
-// job contributes 1-2 lines (main row + optional prompt row);
-// the overlay window is then clamped in renderAgentOverlay.
-// Returns a single placeholder line for the empty case so the
-// caller can show a friendly message.
-func buildAgentOverlayLines(jobs []agentJob) []string {
-	if len(jobs) == 0 {
-		return []string{"No agent jobs for this session."}
-	}
-	lines := []string{mutedStyle.Render("  job_id · type · status · active/max · depth/max · isolation · fork_mode")}
-	for _, job := range jobs {
-		lines = append(lines, formatAgentJobRow(job)...)
-	}
-	return lines
-}
-
-// formatSubAgentRow renders a single subAgentEntry (Phase 6
-// PR6) for the merged /agents overlay. The source tag is
-// "loop" so the user can tell at a glance which rows came
-// from the AgentJob REST endpoint vs the AgentLoop event
-// aggregator. Status uses the same agentJobStatus icon set
-// as formatAgentJobRow so the two sources feel like a single
-// list.
-func formatSubAgentRow(entry subAgentEntry) []string {
-	status := agentJobStatus(entry.Status)
-	icon := formatAgentStatusIcon(status)
-	parts := []string{
-		icon,
-		"loop",
-		"subagent",
-	}
-	if entry.ParentTask != "" {
-		parts = append(parts, "task=#"+entry.ParentTask)
-	}
-	main := strings.Join(parts, " ")
-	main += "  id=" + shortID(entry.ID)
-	if entry.Title != "" {
-		main += "  " + truncatePlain(entry.Title, 80)
-	}
-	rows := []string{main}
-	if entry.UpdatedAt != "" {
-		rows = append(rows, "  updated="+entry.UpdatedAt)
-	}
-	return rows
-}
-
-// buildMergedAgentOverlayLines merges the AgentJob REST rows
-// (Phase 6 PR3) with the in-memory subAgentEntry rows (Phase
-// 6 PR6) for the /agents overlay. Jobs come first (they have
-// stable session-bound identity); sub-agent rows are appended
-// after with a `---` separator so the user can distinguish
-// the two sources. The placeholder falls through to the
-// "No agent jobs for this session." message when both
-// sources are empty.
-func buildMergedAgentOverlayLines(jobs []agentJob, subs map[string]subAgentEntry) []string {
-	jobLines := buildAgentOverlayLines(jobs)
-	if len(subs) == 0 {
-		return jobLines
-	}
-	lines := append([]string{}, jobLines...)
-	if len(jobs) > 0 {
-		lines = append(lines, mutedStyle.Render("  --- AgentLoop sub-agents (event-aggregated) ---"))
-	}
-	// Stable order: alphabetical by id. (The map is
-	// insertion-ordered, but Go intentionally randomizes
-	// iteration; sort for deterministic PTY assertions.)
-	ids := make([]string, 0, len(subs))
-	for id := range subs {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	for _, id := range ids {
-		lines = append(lines, formatSubAgentRow(subs[id])...)
-	}
-	return lines
-}
-
-// renderAgentOverlay paints the multi-line multi-agent status
-// view. It is the Phase 6 PR3 primary UX for the /agents slash
-// command. The overlay is composed of:
-//   - titleStyle header (Phase 6 PR3 banner + session id)
-//   - summary line (running / waiting_permission / queued /
-//     failed / cancelled / completed counts)
-//   - clamped window of buildAgentOverlayLines
-//   - bottom hint (scroll + close keys)
-//
-// Outside modeAgentOverlay it returns "" so it can be
-// unconditionally spliced into the View() parts list.
-func (m model) renderAgentOverlay(width int) string {
-	if m.inputMode != modeAgentOverlay {
-		return ""
-	}
-	header := titleStyle.Render("Agents · " + shortID(m.sessionID))
-	summary := summarizeAgentJobs(m.agentJobs)
-	if subCount := m.subAgentRunningCount(); subCount > 0 {
-		// Phase 6 PR6: include the running sub-agent count in
-		// the summary so the user can correlate the running
-		// badge with the rows in the overlay.
-		summary += " · sub running " + strconv.Itoa(subCount)
-	}
-	visibleRows := max(1, m.height-10)
-	allLines := buildMergedAgentOverlayLines(m.agentJobs, m.subAgents)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.agentOverlayScroll > maxScroll {
-		// View() is read-only; clamp locally for the rendered
-		// slice. The next key event will reconcile
-		// m.agentOverlayScroll.
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[maxScroll:end]
-	} else {
-		end := m.agentOverlayScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[m.agentOverlayScroll:end]
-	}
-	lines := []string{header, divider(width), summary}
-	lines = append(lines, allLines...)
-	hint := "↑/↓/Tab scroll · esc/enter/q close"
-	lines = append(lines, mutedStyle.Render(hint))
-	return renderOverlayFrame(width, agentStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-// summarizeAgentJobs is the per-status count line shown at the
-// top of the agent overlay. Mirrors summarizeMultiAgentRows in
-// src/cli/renderEvents.ts. Returns "no agent jobs" for an
-// empty snapshot so the summary line is never blank.
-func summarizeAgentJobs(jobs []agentJob) string {
-	counts := map[agentJobStatus]int{}
-	for _, job := range jobs {
-		counts[job.Status]++
-	}
-	statusOrder := []agentJobStatus{
-		agentStatusRunning,
-		agentStatusWaitingPermission,
-		agentStatusQueued,
-		agentStatusFailed,
-		agentStatusCancelled,
-		agentStatusCompleted,
-	}
-	parts := []string{}
-	for _, status := range statusOrder {
-		if count := counts[status]; count > 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", status, count))
-		}
-	}
-	if len(parts) == 0 {
-		return "no agent jobs"
-	}
-	return strings.Join(parts, " · ")
-}
-
-// formatTaskStatusIcon returns a short, terminal-friendly
-// status marker (e.g. "[run]", "[done]", "[fail]") for the
-// task board. Mirrors the formatAgentStatusIcon shape so the
-// two overlays feel like siblings.
-func formatTaskStatusIcon(status taskStatus) string {
-	switch status {
-	case taskStatusPending:
-		return "[pend]"
-	case taskStatusInProgress:
-		return "[run]"
-	case taskStatusBlocked:
-		return "[block]"
-	case taskStatusCompleted:
-		return "[done]"
-	case taskStatusFailed:
-		return "[fail]"
-	case taskStatusCancelled:
-		return "[cancel]"
-	}
-	return "[" + fallbackUnknown(string(status)) + "]"
-}
-
-// formatTaskReviewSummary renders a compact
-// "review=approved" / "review=pending" / "review=rejected"
-// segment for the task row. Returns "" when the task has no
-// review row.
-func formatTaskReviewSummary(review *taskReview) string {
-	if review == nil {
-		return ""
-	}
-	return "review=" + string(fallbackUnknown(string(review.Status)))
-}
-
-// formatTaskWorktreeRecoveryAction reads the worktree
-// recovery metadata blob (set by the worktree lifecycle hook
-// on task metadata) and renders a compact
-// "recovery=continue/abandon/keep" segment. Returns "" when
-// the task has no worktree recovery metadata. The TS TUI
-// worktree flow panel uses the same metadata convention.
-func formatTaskWorktreeRecoveryAction(metadata map[string]any) string {
-	if metadata == nil {
-		return ""
-	}
-	recovery, ok := metadata["worktreeRecovery"].(map[string]any)
-	if !ok {
-		return ""
-	}
-	action := stringField(recovery, "action")
-	if action == "" {
-		return ""
-	}
-	preservePath := stringField(recovery, "preservePath")
-	if preservePath != "" {
-		return "recovery=" + action + " path=" + shortID(preservePath)
-	}
-	return "recovery=" + action
-}
-
-// formatTaskRow renders a single nexusTask for the task board
-// overlay. The row is one main line + optional second line
-// for the description / worktree recovery hint:
-//   - main row: status icon + task#<id> + retry=N + review
-//   - second row (optional): source + description or recovery
-//
-// Mirrors the TS TUI task board UX (status / title /
-// retryCount / review / worktree recovery action).
-func formatTaskRow(task nexusTask) []string {
-	parts := []string{
-		formatTaskStatusIcon(task.Status),
-		"#" + fallbackUnknown(task.TaskID),
-	}
-	if task.RetryCount > 0 {
-		parts = append(parts, fmt.Sprintf("retry=%d", task.RetryCount))
-	}
-	if review := formatTaskReviewSummary(task.Review); review != "" {
-		parts = append(parts, review)
-	}
-	main := strings.Join(parts, " ")
-	if title := singleLine(strings.TrimSpace(task.Title)); title != "" {
-		main += "  " + truncatePlain(title, 80)
-	}
-	rows := []string{main}
-	if recovery := formatTaskWorktreeRecoveryAction(task.Metadata); recovery != "" {
-		rows = append(rows, "  "+recovery)
-	}
-	if source := strings.TrimSpace(string(task.Source)); source != "" {
-		rows = append(rows, "  source="+source)
-	}
-	return rows
-}
-
-// buildTaskBoardLines turns the task snapshot into the ordered
-// list of lines the task board will render. Each task
-// contributes 1-3 lines (main row + optional recovery +
-// optional source); the overlay window is then clamped in
-// renderTaskBoard. Returns a single placeholder line for the
-// empty case so the caller can show a friendly message.
-func buildTaskBoardLines(tasks []nexusTask) []string {
-	if len(tasks) == 0 {
-		return []string{"No tasks for this session."}
-	}
-	lines := []string{mutedStyle.Render("  task_id · status · source · owner · title")}
-	for _, task := range tasks {
-		lines = append(lines, formatTaskRow(task)...)
-	}
-	return lines
-}
-
-// summarizeTaskBoard is the per-status count line shown at
-// the top of the task board overlay. Returns "no tasks" for
-// an empty snapshot so the summary line is never blank.
-func summarizeTaskBoard(tasks []nexusTask) string {
-	counts := map[taskStatus]int{}
-	for _, task := range tasks {
-		counts[task.Status]++
-	}
-	statusOrder := []taskStatus{
-		taskStatusInProgress,
-		taskStatusBlocked,
-		taskStatusPending,
-		taskStatusFailed,
-		taskStatusCancelled,
-		taskStatusCompleted,
-	}
-	parts := []string{}
-	for _, status := range statusOrder {
-		if count := counts[status]; count > 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", status, count))
-		}
-	}
-	if len(parts) == 0 {
-		return "no tasks"
-	}
-	return strings.Join(parts, " · ")
-}
-
-// renderTaskBoard paints the multi-line task board view. It
-// is the Phase 6 PR4 primary UX for the /tasks slash command.
-// The overlay is composed of:
-//   - titleStyle header (Phase 6 PR4 banner + session id)
-//   - summary line (in_progress / blocked / pending / failed
-//     / cancelled / completed counts)
-//   - clamped window of buildTaskBoardLines
-//   - bottom hint (scroll + close keys)
-//
-// Outside modeTaskBoard it returns "" so it can be
-// unconditionally spliced into the View() parts list.
-func (m model) renderTaskBoard(width int) string {
-	if m.inputMode != modeTaskBoard {
-		return ""
-	}
-	header := titleStyle.Render("Tasks · " + shortID(m.sessionID))
-	summary := summarizeTaskBoard(m.taskBoard)
-	visibleRows := max(1, m.height-10)
-	allLines := buildTaskBoardLines(m.taskBoard)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.taskBoardScroll > maxScroll {
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[maxScroll:end]
-	} else {
-		end := m.taskBoardScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[m.taskBoardScroll:end]
-	}
-	lines := []string{header, divider(width), summary}
-	lines = append(lines, allLines...)
-	hint := "↑/↓/Tab scroll · esc/enter/q close"
-	lines = append(lines, mutedStyle.Render(hint))
-	return renderOverlayFrame(width, taskBoardStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-// formatActivityKindIcon returns a short, terminal-friendly
-// marker for each activity event kind. The icon list is
-// deliberately smaller than the event type list so the
-// /activity overlay rows stay scannable.
-func formatActivityKindIcon(kind activityEventKind) string {
-	switch kind {
-	case activityKindToolStarted:
-		return "[tool>]"
-	case activityKindToolCompleted:
-		return "[toolok]"
-	case activityKindPermission:
-		return "[perm]"
-	case activityKindAgentJob:
-		return "[agent]"
-	case activityKindContextWarning:
-		return "[ctx-warn]"
-	case activityKindContextBlocking:
-		return "[ctx-stop]"
-	}
-	return "[" + fallbackUnknown(string(kind)) + "]"
-}
-
-// buildActivityOverlayLines turns the in-memory activity
-// buffer into the ordered list of lines the /activity
-// overlay will render. Newest entries are shown first
-// (the buffer is appended chronologically). The overlay
-// window is then clamped in renderActivityOverlay.
-// Returns a single placeholder line for the empty case.
-func buildActivityOverlayLines(entries []activityEventEntry) []string {
-	if len(entries) == 0 {
-		return []string{"No recent activity recorded yet."}
-	}
-	lines := []string{mutedStyle.Render("  kind · summary · timestamp")}
-	// Newest first.
-	for index := len(entries) - 1; index >= 0; index-- {
-		entry := entries[index]
-		row := formatActivityKindIcon(entry.Kind) + "  " + truncatePlain(entry.Summary, 100)
-		if entry.Timestamp != "" {
-			row += "  " + mutedStyle.Render(entry.Timestamp)
-		}
-		lines = append(lines, row)
-	}
-	return lines
-}
-
-// summarizeActivityEvents is the per-kind count line shown
-// at the top of the activity overlay. Returns "no recent
-// activity" for an empty buffer.
-func summarizeActivityEvents(entries []activityEventEntry) string {
-	counts := map[activityEventKind]int{}
-	for _, entry := range entries {
-		counts[entry.Kind]++
-	}
-	order := []activityEventKind{
-		activityKindToolStarted,
-		activityKindToolCompleted,
-		activityKindPermission,
-		activityKindAgentJob,
-		activityKindContextWarning,
-		activityKindContextBlocking,
-	}
-	parts := []string{}
-	for _, kind := range order {
-		if count := counts[kind]; count > 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", kind, count))
-		}
-	}
-	if len(parts) == 0 {
-		return "no recent activity"
-	}
-	return strings.Join(parts, " · ")
-}
-
-// renderActivityOverlay paints the multi-line recent-activity
-// view. It is the Phase 6 PR5 primary UX for the /activity
-// slash command. The overlay is composed of:
-//   - titleStyle header (Phase 6 PR5 banner)
-//   - summary line (per-kind count)
-//   - clamped window of buildActivityOverlayLines (newest
-//     first)
-//   - bottom hint (scroll + close keys)
-//
-// Outside modeActivityOverlay it returns "" so it can be
-// unconditionally spliced into the View() parts list.
-func (m model) renderActivityOverlay(width int) string {
-	if m.inputMode != modeActivityOverlay {
-		return ""
-	}
-	header := titleStyle.Render("Activity")
-	summary := summarizeActivityEvents(m.activityEvents)
-	visibleRows := max(1, m.height-10)
-	allLines := buildActivityOverlayLines(m.activityEvents)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.activityOverlayScroll > maxScroll {
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[maxScroll:end]
-	} else {
-		end := m.activityOverlayScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[m.activityOverlayScroll:end]
-	}
-	lines := []string{header, divider(width), summary}
-	lines = append(lines, allLines...)
-	hint := "↑/↓/Tab scroll · esc/enter/q close"
-	lines = append(lines, mutedStyle.Render(hint))
-	return renderOverlayFrame(width, activityStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-// formatToolRiskIcon returns a short, terminal-friendly risk
-// marker (e.g. "[read]", "[write]") for the /tools audit row.
-// Matches the formatToolAudit column header convention in
-// src/cli/toolAuditFormatter.ts (read / write / execute / task).
-func formatToolRiskIcon(risk toolRisk) string {
-	switch risk {
-	case toolRiskRead:
-		return "[read]"
-	case toolRiskWrite:
-		return "[write]"
-	case toolRiskExecute:
-		return "[execute]"
-	case toolRiskTask:
-		return "[task]"
-	}
-	return "[" + fallbackUnknown(string(risk)) + "]"
-}
-
-// formatToolSourceTag renders the `source` attribution for
-// the audit row. builtin tools get a plain `builtin` tag;
-// MCP tools get a `mcp:<serverName>` tag so the user can see
-// which MCP server backs each tool. Returns "" when the entry
-// has no source attribution.
-func formatToolSourceTag(source *toolAuditSource) string {
-	if source == nil {
-		return ""
-	}
-	switch source.Type {
-	case toolSourceBuiltin:
-		return "builtin"
-	case toolSourceMCP:
-		if server := strings.TrimSpace(source.ServerName); server != "" {
-			return "mcp:" + server
-		}
-		return "mcp"
-	}
-	return fallbackUnknown(string(source.Type))
-}
-
-// formatToolApprovalStatus returns a compact
-// "no-approval" / "approval-required" segment for the audit
-// row. Matches the formatToolAudit column convention in
-// src/cli/toolAuditFormatter.ts.
-func formatToolApprovalStatus(requiresApproval bool) string {
-	if requiresApproval {
-		return "approval-required"
-	}
-	return "no-approval"
-}
-
-// formatToolAuditRow renders a single runtimeToolAuditEntry
-// for the /tools audit overlay. The row is one main line +
-// optional MCP allow / suggested allow rule second line:
-//   - main row: risk + source tag + approval status + name +
-//     truncated description
-//   - second line (optional): MCP server / allow rule hint
-//
-// Mirrors the TS TUI toolAuditFormatter formatMcpToolRow +
-// formatBuiltinToolRow columns (risk / source / approval /
-// name / description / suggested allow rule).
-func formatToolAuditRow(entry runtimeToolAuditEntry) []string {
-	parts := []string{
-		formatToolRiskIcon(entry.Risk),
-	}
-	if source := formatToolSourceTag(entry.Source); source != "" {
-		parts = append(parts, source)
-	} else {
-		parts = append(parts, "unknown")
-	}
-	parts = append(parts, formatToolApprovalStatus(entry.RequiresApproval))
-	main := strings.Join(parts, " ")
-	name := fallbackUnknown(entry.Name)
-	// Pad name to a fixed width so the description lines up
-	// across rows.
-	for len(name) < 14 {
-		name += " "
-	}
-	main += "  " + name
-	if description := singleLine(strings.TrimSpace(entry.Description)); description != "" {
-		main += "  — " + truncatePlain(description, 80)
-	}
-	rows := []string{main}
-	if entry.MCPServerAllowed {
-		rows = append(rows, "  mcp server: allowed")
-	}
-	if rule := strings.TrimSpace(entry.SuggestedAllowRule); rule != "" {
-		rows = append(rows, "  suggested allow rule: "+truncatePlain(rule, 80))
-	}
-	return rows
-}
-
-// buildToolAuditOverlayLines turns the audit snapshot into
-// the ordered list of lines the /tools overlay will render.
-// Each tool contributes 1-3 lines; the overlay window is
-// then clamped in renderToolAuditOverlay. Returns a single
-// placeholder line for the empty case. A column header row
-// is prepended when the catalog is non-empty so the operator
-// can scan the columns at a glance.
-func buildToolAuditOverlayLines(entries []runtimeToolAuditEntry) []string {
-	if len(entries) == 0 {
-		return []string{"No tools registered in the current runtime."}
-	}
-	lines := []string{formatToolAuditColumnHeader()}
-	for _, entry := range entries {
-		lines = append(lines, formatToolAuditRow(entry)...)
-	}
-	return lines
-}
-
-// formatToolAuditColumnHeader mirrors the column structure of
-// formatToolAuditRow so the header aligns with the data rows.
-// The header uses mutedStyle (gray) so it doesn't compete with
-// the tool name column.
-func formatToolAuditColumnHeader() string {
-	return mutedStyle.Render("RISK  SOURCE       APPROVAL          NAME              DESCRIPTION")
-}
-
-// summarizeToolAudit is the per-risk count line shown at the
-// top of the /tools audit overlay. Returns "no tools" for an
-// empty snapshot so the summary line is never blank.
-func summarizeToolAudit(entries []runtimeToolAuditEntry) string {
-	counts := map[toolRisk]int{}
-	for _, entry := range entries {
-		counts[entry.Risk]++
-	}
-	riskOrder := []toolRisk{
-		toolRiskExecute,
-		toolRiskWrite,
-		toolRiskTask,
-		toolRiskRead,
-	}
-	parts := []string{}
-	for _, risk := range riskOrder {
-		if count := counts[risk]; count > 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", risk, count))
-		}
-	}
-	if len(parts) == 0 {
-		return "no tools"
-	}
-	return strings.Join(parts, " · ")
-}
-
-// renderToolAuditOverlay paints the multi-line /v1/tools/audit
-// view. It is the Phase 4 wire primary UX for the /tools
-// slash command. The overlay is composed of:
-//   - titleStyle header (Phase 4 wire banner)
-//   - summary line (read / write / execute / task counts)
-//   - clamped window of buildToolAuditOverlayLines
-//   - bottom hint (scroll + close keys)
-//
-// Outside modeToolAuditOverlay it returns "" so it can be
-// unconditionally spliced into the View() parts list.
-func (m model) renderToolAuditOverlay(width int) string {
-	if m.inputMode != modeToolAuditOverlay {
-		return ""
-	}
-	header := titleStyle.Render("Tools audit")
-	summary := summarizeToolAudit(m.toolAuditEntries)
-	visibleRows := max(1, m.height-10)
-	allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.toolAuditScroll > maxScroll {
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[maxScroll:end]
-	} else {
-		end := m.toolAuditScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[m.toolAuditScroll:end]
-	}
-	lines := []string{header, divider(width), summary}
-	lines = append(lines, allLines...)
-	hint := "↑/↓/Tab scroll · esc/enter/q close"
-	lines = append(lines, mutedStyle.Render(hint))
-	return renderOverlayFrame(width, toolPaletteStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-func formatRuntimeModelConfigSummary(response runtimeModelsResponse) string {
-	activeModel := firstNonEmpty(response.DefaultModel, "unknown")
-	activeProfile := firstNonEmpty(response.ActiveProfile, "none")
-	providerCount := len(response.Providers)
-	modelCount := 0
-	configuredCount := 0
-	for _, provider := range response.Providers {
-		modelCount += len(provider.Models)
-		if provider.Configured {
-			configuredCount++
-		}
-	}
-	prefix := "model config"
-	if response.Version > 0 {
-		prefix = fmt.Sprintf("model config v=%d", response.Version)
-	}
-	return fmt.Sprintf("%s active=%s profile=%s providers=%d configured=%d models=%d",
-		prefix, activeModel, activeProfile, providerCount, configuredCount, modelCount)
-}
-
-func formatModelCapabilityFlags(capabilities runtimeCapabilities) string {
-	flags := []string{}
-	if capabilities.ToolCalling {
-		flags = append(flags, "tool-call")
-	}
-	if capabilities.JSONOutput {
-		flags = append(flags, "json")
-	}
-	if capabilities.StructuredOutput {
-		flags = append(flags, "structured")
-	}
-	if capabilities.Streaming {
-		flags = append(flags, "stream")
-	}
-	if len(flags) == 0 {
-		return "basic"
-	}
-	return strings.Join(flags, ",")
-}
-
-func formatModelProviderStatus(provider registeredProvider) string {
-	parts := []string{}
-	if provider.Active {
-		parts = append(parts, "active")
-	}
-	if provider.Configured {
-		parts = append(parts, "configured")
-	} else {
-		parts = append(parts, "unconfigured")
-	}
-	if provider.AuthMode != "" {
-		parts = append(parts, "auth="+provider.AuthMode)
-	}
-	if len(parts) == 0 {
-		return "unknown"
-	}
-	return strings.Join(parts, " · ")
-}
-
-func buildModelOverlayLines(response runtimeModelsResponse) []string {
-	if len(response.Providers) == 0 {
-		return []string{"No providers reported by the current Nexus runtime."}
-	}
-	lines := []string{
-		"Active model: " + firstNonEmpty(response.DefaultModel, "unknown"),
-		"Active profile: " + firstNonEmpty(response.ActiveProfile, "none"),
-		"",
-		"Configuration writes stay CLI-owned in Go TUI:",
-		"  bbl config use <modelId>",
-		"  bbl chat /model",
-		"",
-		"Providers:",
-	}
-	for _, provider := range response.Providers {
-		displayName := firstNonEmpty(provider.DisplayName, provider.ID)
-		lines = append(lines, fmt.Sprintf("  %s (%s) · %s",
-			provider.ID, displayName, formatModelProviderStatus(provider)))
-		if provider.DefaultModel != "" {
-			lines = append(lines, "    default: "+provider.DefaultModel)
-		}
-		if len(provider.Models) == 0 {
-			lines = append(lines, "    no registered models")
-			continue
-		}
-		for _, model := range provider.Models {
-			marker := " "
-			if model.ID == response.DefaultModel {
-				marker = "*"
-			}
-			name := firstNonEmpty(model.Name, model.ID)
-			lines = append(lines, fmt.Sprintf("    %s %s · ctx=%d · max=%d · %s",
-				marker, model.ID, model.ContextWindow, model.DefaultMaxTokens,
-				formatModelCapabilityFlags(model.Capabilities)))
-			if name != model.ID {
-				lines = append(lines, "      "+name)
-			}
-		}
-	}
-	return lines
-}
-
-func (m model) renderModelOverlay(width int) string {
-	if m.inputMode != modeModelOverlay {
-		return ""
-	}
-	header := titleStyle.Render("Model configuration")
-	summary := formatRuntimeModelConfigSummary(m.modelCatalog)
-	visibleRows := max(1, m.height-10)
-	allLines := buildModelOverlayLines(m.modelCatalog)
-	maxScroll := max(0, len(allLines)-visibleRows)
-	if m.modelOverlayScroll > maxScroll {
-		end := maxScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[maxScroll:end]
-	} else {
-		end := m.modelOverlayScroll + visibleRows
-		if end > len(allLines) {
-			end = len(allLines)
-		}
-		allLines = allLines[m.modelOverlayScroll:end]
-	}
-	lines := []string{header, divider(width), summary}
-	lines = append(lines, allLines...)
-	lines = append(lines, mutedStyle.Render("↑/↓/Tab scroll · esc/enter/q close"))
-	return renderOverlayFrame(width, statusStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
-}
-
-// openModelRegistry kicks off the /model multi-step flow.
-// Reset per-step state (selection index, draft input) so
-// re-entering /model from a previous partially-completed
-// flow doesn't carry stale state.
-func (m *model) openModelRegistry() {
-	m.modelPickProviderIdx = 0
-	m.modelPickSelectedIdx = 0
-	m.modelPickSelectedID = ""
-	m.modelPickProviderDraft = ""
-	m.setMode(modeModelPickProvider)
-}
-
-// currentModelProvider resolves the provider the multi-step
-// flow is currently bound to. Returns nil if the operator
-// somehow advanced past provider selection without a chosen
-// id.
-func (m model) currentModelProvider() *registeredProvider {
-	if m.modelPickSelectedID == "" {
-		return nil
-	}
-	for i := range m.modelCatalog.Providers {
-		if m.modelCatalog.Providers[i].ID == m.modelPickSelectedID {
-			return &m.modelCatalog.Providers[i]
-		}
-	}
-	return nil
-}
-
-// enterModelPicker transitions into the Step 4 model
-// picker. Resets the cursor, clears the prior live list,
-// marks the picker as loading, fires a fresh
-// `/v1/runtime/models` request, and switches the input
-// mode. The runtimeModelsMsg handler routes the response
-// back into `modelPickerLive` and clears the loading flag.
-func (m *model) enterModelPicker() tea.Cmd {
-	m.modelPickSelectedIdx = 0
-	m.modelPickerLive = nil
-	m.modelPickerLoading = true
-	m.setMode(modeModelPickModel)
-	return fetchRuntimeModels(m.cfg, "model-picker")
-}
-
-// renderModelPickProvider is step 1 of the /model flow: a
-// scrollable list of providers, each row tagged with the
-// configured / needs-API-key status. enter advances to the
-// API key step (or to the picker directly when the provider
-// is already configured and the operator chooses to skip
-// the key / base URL steps via the hint chip).
-func (m model) renderModelPickProvider(width int) string {
-	if m.inputMode != modeModelPickProvider {
-		return ""
-	}
-	header := titleStyle.Render("BABEL Model Registry")
-	subtitle := mutedStyle.Render("Select provider, configure API access, then choose a model.")
-	lines := []string{header, subtitle, ""}
-	if len(m.modelCatalog.Providers) == 0 {
-		lines = append(lines, mutedStyle.Render("  No providers reported by the current Nexus runtime."))
-	} else {
-		// Single-column layout: just the provider name. The
-		// configured / needs-api-key state is implied by
-		// the next step's prompt (step 2 asks for an API
-		// key when the provider is unconfigured, skips
-		// straight to step 4 when it's already configured),
-		// so the list itself doesn't need a status column.
-		lines = append(lines, mutedStyle.Render("  provider"))
-		visibleRows := max(1, m.height-12)
-		scrollOffset := 0
-		if m.modelPickProviderIdx >= visibleRows {
-			scrollOffset = m.modelPickProviderIdx - visibleRows + 1
-		}
-		if scrollOffset+visibleRows > len(m.modelCatalog.Providers) {
-			scrollOffset = max(0, len(m.modelCatalog.Providers)-visibleRows)
-		}
-		if scrollOffset > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
-		}
-		for i := 0; i < visibleRows && scrollOffset+i < len(m.modelCatalog.Providers); i++ {
-			actualIdx := scrollOffset + i
-			p := m.modelCatalog.Providers[actualIdx]
-			marker := "  "
-			if actualIdx == m.modelPickProviderIdx {
-				marker = "> "
-			}
-			row := marker + p.DisplayName
-			if actualIdx == m.modelPickProviderIdx {
-				row = focusedLineStyle.Render(row)
-			}
-			lines = append(lines, "  "+row)
-		}
-		remainingBelow := len(m.modelCatalog.Providers) - (scrollOffset + visibleRows)
-		if remainingBelow > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
-		}
-	}
-	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc cancel"))
-	return renderOverlayFrame(width, strings.Join(lines, "\n"))
-}
-
-// renderModelPickApiKey is step 2: paste the API key. The
-// key is echoed in plaintext for parity with the bbl chat
-// TS TUI (operator sees what they type) and cleared from
-// memory after the picker step resolves.
-func (m model) renderModelPickApiKey(width int) string {
-	if m.inputMode != modeModelPickApiKey {
-		return ""
-	}
-	return newModelPickApiKeyDialog(m.currentModelProvider(), m.input.View()).View(width)
-}
-
-// renderModelPickBaseURL is step 3: confirm or override the
-// base URL. The provider's default URL is pre-filled into
-// the input box; pressing Enter without editing accepts the
-// default.
-func (m model) renderModelPickBaseURL(width int) string {
-	if m.inputMode != modeModelPickBaseURL {
-		return ""
-	}
-	return newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View()).View(width)
-}
-
-// renderModelPickModel is step 4: pick a model from the
-// hardcoded list baked into the catalog response. Phase 2
-// will replace this list with a live API call against the
-// freshly-entered base URL.
-func (m model) renderModelPickModel(width int) string {
-	if m.inputMode != modeModelPickModel {
-		return ""
-	}
-	return newModelPickModelDialog(
-		m.currentModelProvider(),
-		m.modelPickerLive,
-		m.modelPickSelectedIdx,
-		m.height,
-		m.modelPickerLoading,
-		m.modelPickSubmitting,
-		m.spinner.View(),
-	).View(width)
-}
-
-// padRightPlain pads a string with spaces to the given
-// visible width. Truncates with a trailing `…` when the
-// input already exceeds the target so the column never
-// overflows.
-func padRightPlain(s string, width int) string {
-	if len(s) >= width {
-		if width <= 1 {
-			return s[:width]
-		}
-		return s[:width-1] + "…"
-	}
-	return s + strings.Repeat(" ", width-len(s))
-}
-
-// visibleLen returns the on-screen column width of a
-// string, stripping ANSI / using lipgloss.Width so a model
-// id with embedded CJK or escape codes doesn't inflate the
-// calculated column width.
-func visibleLen(s string) int {
-	return lipgloss.Width(s)
-}
-
-func renderInboxEventCard(message sessionMessage, channel sessionChannel) string {
-	if !isKeyInboxMessage(message) {
-		return ""
-	}
-	target := "broadcast=true"
-	if to := strings.TrimSpace(message.ToSessionID); to != "" {
-		target = "to=" + to
-	}
-	channelKind := string(channel.Kind)
-	if channelKind == "" {
-		channelKind = string(channelKindDirect)
-	}
-	rows := []string{
-		fmt.Sprintf("SessionChannel %s · %s · from=%s · %s",
-			message.Type, message.Priority, message.FromSessionID, target),
-		fmt.Sprintf("channel=%s kind=%s message=%s", message.ChannelID, channelKind, message.MessageID),
-		"collaboration context only; verify evidence before acting",
-	}
-	if evidence := formatInboxEvidence(message.Evidence); evidence != "" {
-		rows = append(rows, "evidence: "+evidence)
-	}
-	rows = append(rows, fmt.Sprintf("[open inbox: /inbox] [ack: /inbox ack %s] [quote: /inbox then q]", message.MessageID))
-	body := strings.Join(rows, "\n")
-	return strings.Join([]string{divider(80), inboxStyle.Render(wrapPlain(body, 78)), divider(80)}, "\n")
-}
-
-// renderNewInboxEventCards walks the current inbox snapshot and
-// pushes a compact event card into the transcript for every key
-// message that hasn't been rendered yet. Mirrors
-// renderNewInboxEventCards in src/cli/commands/chat.ts. The set
-// of seen message IDs is kept on the model so the next /inbox
-// call (or any future refresh trigger) only surfaces fresh
-// messages, not the historical ones the user already saw.
-func (m *model) renderNewInboxEventCards() {
-	if m.seenInboxCardMessageIDs == nil {
-		m.seenInboxCardMessageIDs = map[string]struct{}{}
-	}
-	channelByID := map[string]sessionChannel{}
-	for _, channel := range m.inboxChannels {
-		channelByID[channel.ChannelID] = channel
-	}
-	for _, message := range m.inboxMessages {
-		if _, seen := m.seenInboxCardMessageIDs[message.MessageID]; seen {
-			continue
-		}
-		if !isKeyInboxMessage(message) {
-			continue
-		}
-		if card := renderInboxEventCard(message, channelByID[message.ChannelID]); card != "" {
-			m.appendLine("inbox", card)
-		}
-		m.seenInboxCardMessageIDs[message.MessageID] = struct{}{}
-	}
-}
-
-// formatCharCount renders a char count in human-friendly form
-// (e.g. 1234 -> "1.2k", 12 -> "12", 0 -> "0"). The chat TUI uses
-// the same idea in contextView.
-func formatCharCount(n int) string {
-	switch {
-	case n <= 0:
-		return "0"
-	case n < 1000:
-		return fmt.Sprintf("%d", n)
-	case n < 10_000:
-		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
-	case n < 1_000_000:
-		return fmt.Sprintf("%dk", n/1000)
-	default:
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000.0)
-	}
-}
-
-func formatTokenCount(n int) string {
-	switch {
-	case n <= 0:
-		return "0"
-	case n < 1000:
-		return fmt.Sprintf("%d", n)
-	case n < 10_000:
-		return fmt.Sprintf("%.1fk", float64(n)/1000.0)
-	case n < 1_000_000:
-		return fmt.Sprintf("%dk", n/1000)
-	default:
-		return fmt.Sprintf("%.1fM", float64(n)/1_000_000.0)
-	}
-}
-
-func shortCwd(cwd string) string {
-	cwd = strings.TrimSpace(cwd)
-	if cwd == "" {
-		return ""
-	}
-	home, err := os.UserHomeDir()
-	if err == nil && home != "" {
-		if cwd == home {
-			return "~"
-		}
-		if strings.HasPrefix(cwd, home+string(os.PathSeparator)) {
-			cwd = "~" + strings.TrimPrefix(cwd, home)
-		}
-	}
-	if lipgloss.Width(cwd) <= 28 {
-		return cwd
-	}
-	parts := strings.Split(filepath.ToSlash(cwd), "/")
-	filtered := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if part != "" {
-			filtered = append(filtered, part)
-		}
-	}
-	if len(filtered) >= 2 {
-		return "…/" + strings.Join(filtered[len(filtered)-2:], "/")
-	}
-	return truncatePlain(cwd, 28)
-}
-
-func joinTopCardColumns(width int, headersAndRows ...any) string {
-	if width < 72 {
-		lines := []string{}
-		for i := 0; i+1 < len(headersAndRows); i += 2 {
-			header, _ := headersAndRows[i].(string)
-			rows, _ := headersAndRows[i+1].([]string)
-			lines = append(lines, mutedStyle.Render(header))
-			for _, row := range rows {
-				lines = append(lines, "  "+truncatePlain(row, max(8, width-2)))
-			}
-		}
-		return strings.Join(lines, "\n")
-	}
-	columnCount := len(headersAndRows) / 2
-	columnWidth := max(12, (width-(columnCount-1)*3)/columnCount)
-	maxRows := 0
-	for i := 1; i < len(headersAndRows); i += 2 {
-		rows, _ := headersAndRows[i].([]string)
-		maxRows = max(maxRows, len(rows))
-	}
-	renderCell := func(text string, cellWidth int) string {
-		return padVisible(truncatePlain(text, cellWidth), cellWidth)
-	}
-	lines := []string{}
-	headerCells := make([]string, 0, columnCount)
-	for i := 0; i+1 < len(headersAndRows); i += 2 {
-		header, _ := headersAndRows[i].(string)
-		headerCells = append(headerCells, mutedStyle.Render(renderCell(header, columnWidth)))
-	}
-	lines = append(lines, strings.Join(headerCells, "   "))
-	for rowIdx := 0; rowIdx < maxRows; rowIdx++ {
-		cells := make([]string, 0, columnCount)
-		for i := 1; i < len(headersAndRows); i += 2 {
-			rows, _ := headersAndRows[i].([]string)
-			value := ""
-			if rowIdx < len(rows) {
-				value = rows[rowIdx]
-			}
-			cells = append(cells, renderCell(value, columnWidth))
-		}
-		lines = append(lines, strings.Join(cells, "   "))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func padVisible(text string, width int) string {
-	pad := width - lipgloss.Width(text)
-	if pad <= 0 {
-		return text
-	}
-	return text + strings.Repeat(" ", pad)
-}
-
-// renderSlashPalette paints the live-filter palette above the input
-// line. It is a compact overlay: header (current filter), up to
-// 6 candidates with the selected one highlighted, and a hint row.
-func (m model) renderSlashPalette(width int) string {
-	if m.inputMode != modeSlashPick {
-		return ""
-	}
-	matched := filterSlashCommandMatches(m.paletteFilter)
-	// visibleHeight mirrors the TS TUI's slash palette (8 rows);
-	// it keeps the palette compact enough to read at a glance
-	// while letting the user scroll through longer filtered lists
-	// (the static catalog has ~20 entries, so we need paging).
-	const visibleHeight = 8
-	total := len(matched)
-	visible := total
-	if visible > visibleHeight {
-		visible = visibleHeight
-	}
-	scrollOffset := 0
-	if m.paletteSelected >= visibleHeight {
-		scrollOffset = m.paletteSelected - visibleHeight + 1
-	}
-	if scrollOffset+visible > total {
-		scrollOffset = max(0, total-visible)
-	}
-	header := titleStyle.Render("Slash · " + "/" + m.paletteFilter)
-	// Two-column layout (command + summary). The earlier
-	// `kind` column was redundant — `→ run` / `→ enter arg:
-	// …` is implied by whether the command has args, and
-	// dropping the middle column frees ~28 columns for the
-	// summary text on narrow terminals so the operator can
-	// read the description without the trailing
-	// truncation eating the first two words.
-	lines := []string{header, divider(width), mutedStyle.Render("  command                summary")}
-	if total == 0 {
-		lines = append(lines, mutedStyle.Render("  (no commands match)"))
-	} else {
-		// Clamp selection to a valid range in case the filter shrank.
-		idx := m.paletteSelected
-		if idx < 0 || idx >= total {
-			idx = 0
-		}
-		// command column: 20 chars wide (covers `/profile`,
-		// `/compact`, `/inbox`, etc. plus the trailing space).
-		// Summary column gets the remainder of the row width
-		// and is truncated with `…` when it overflows.
-		const commandColumnWidth = 20
-		summaryWidth := max(8, width-commandColumnWidth-4)
-		remainingAbove := scrollOffset
-		if remainingAbove > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", remainingAbove)))
-		}
-		for i := 0; i < visible; i++ {
-			actualIdx := scrollOffset + i
-			c := matched[actualIdx]
-			marker := "  "
-			if actualIdx == idx {
-				marker = "> "
-			}
-			name := highlightSlashCommandName(c)
-			plainName := c.command.name
-			if len(plainName) < commandColumnWidth-1 {
-				name = name + strings.Repeat(" ", commandColumnWidth-1-len(plainName))
-			}
-			summary := truncatePlain(c.command.summary, summaryWidth)
-			line := fmt.Sprintf("%s%s  %s", marker, name, mutedStyle.Render(summary))
-			if actualIdx == idx {
-				line = focusedLineStyle.Render(line)
-			}
-			lines = append(lines, line)
-		}
-		remainingBelow := total - (scrollOffset + visible)
-		if remainingBelow > 0 {
-			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
-		}
-	}
-	lines = append(lines, mutedStyle.Render("↑↓/Tab navigate · Enter select · Esc cancel"))
-	return strings.Join(lines, "\n")
-}
-
-func (m model) renderHeader(width int) string {
-	// Header chrome: a quiet guard divider first, then title + run
-	// state. Rendering the title below the first row keeps it visible
-	// in terminals that clip the very top scanline/row.
-	title := titleStyle.Render("BabeL-O · Go TUI")
-	if m.connected {
-		title = title + " " + statusStyle.Render("✓")
-	}
-	stateLabel := "idle"
-	stateKind := stateStyle(false, nil)
-	if m.running {
-		// Surface a separate "thinking" state when the model
-		// is in its reasoning phase (last event was a
-		// thinking_delta) so the operator can tell at a
-		// glance that the spinner is for reasoning, not for
-		// the final reply. Mirrors the `✻ Sautéed for 26s`
-		// pattern in Claude Code: a transient state pill
-		// that shows what's actually happening plus the
-		// elapsed time so the operator can sanity-check
-		// that the reasoning phase is making progress.
-		elapsed := ""
-		if !m.startedAt.IsZero() {
-			elapsed = " " + time.Since(m.startedAt).Round(time.Second).String()
-		}
-		if m.lastEventType == "thinking_delta" {
-			stateLabel = m.spinner.View() + " thinking" + elapsed
-			stateKind = thinkingStyle
-		} else {
-			stateLabel = m.spinner.View() + " running" + elapsed
-			stateKind = statusStyle
-		}
-	}
-	if m.pending != nil {
-		stateLabel = "permission pending"
-		stateKind = permissionStyle
-	}
-	state := stateKind.Render(stateLabel)
-	slashWidth := max(4, min(24, width-lipgloss.Width(title)-lipgloss.Width(state)-36))
-	slashes := topCardAccentStyle.Render(strings.Repeat("/", slashWidth))
-	context := m.formatContextUsageLabel()
-	toggle := "ctrl+d open"
-	if m.topCardOpen {
-		toggle = "ctrl+d close"
-	}
-	metaParts := []string{}
-	metaParts = append(metaParts, context, toggle)
-	metaPlain := strings.Join(metaParts, " · ")
-	stateWidth := lipgloss.Width(state)
-	leftBudget := max(0, width-stateWidth-1)
-	metaBudget := leftBudget - lipgloss.Width(title) - slashWidth - 2
-	if metaBudget < 0 {
-		slashWidth = max(0, leftBudget-lipgloss.Width(title)-1)
-		metaBudget = 0
-	}
-	slashes = topCardAccentStyle.Render(strings.Repeat("/", slashWidth))
-	meta := mutedStyle.Render(truncatePlain(metaPlain, metaBudget))
-	left := strings.TrimSpace(title + " " + slashes + " " + meta)
-	top := joinColumns(width, left, state)
-
-	return strings.Join([]string{
-		divider(width),
-		top,
-		divider(width),
-	}, "\n")
-}
-
-func (m model) renderTopCard(width int) string {
-	if !m.topCardOpen {
-		return ""
-	}
-	innerWidth := max(20, width-4)
-	title := focusedLineStyle.Render(truncatePlain(firstNonEmpty(m.input.Value(), "Ready for the next turn"), innerWidth))
-	modelLine := strings.TrimSpace(strings.Join([]string{
-		firstNonEmpty(m.modelID, "model pending"),
-		firstNonEmpty(m.providerID, "provider pending"),
-		firstNonEmpty(m.activeProfile, "profile pending"),
-	}, " · "))
-	if m.sessionID != "" {
-		modelLine += " · session " + shortID(m.sessionID)
-	}
-	usage := m.formatContextUsageDetail()
-	columns := joinTopCardColumns(innerWidth,
-		"MCPs", m.topCardMCPRows(),
-		"Skills", []string{"reserved: runtime skills"},
-		"Session to session", m.topCardSessionRows(),
-		"Memory", []string{"reserved: memory"},
-	)
-	content := strings.Join([]string{
-		title,
-		mutedStyle.Render(truncatePlain(modelLine, innerWidth)),
-		statusStyle.Render(truncatePlain(usage, innerWidth)),
-		"",
-		columns,
-		mutedStyle.Render(truncatePlain("ctrl+d close · /tools audit · /context inspect", innerWidth)),
-	}, "\n")
-	frameWidth := max(0, width-2)
-	frame := topCardFrameStyle.Width(frameWidth)
-	if m.height > 0 {
-		available := m.height - lipgloss.Height(m.renderHeader(width)) - lipgloss.Height(m.renderFooter(width))
-		if available > lipgloss.Height(content)+2 {
-			frame = frame.Height(available)
-		}
-	}
-	return frame.Render(content)
-}
-
-func (m model) formatContextUsageLabel() string {
-	used := 0
-	if m.latestUsage != nil {
-		used = m.latestUsage.InputTokens
-	} else if m.lastUsage != nil {
-		used = m.lastUsage.InputTokens
-	}
-	if used <= 0 && m.contextWindow <= 0 {
-		return "context --"
-	}
-	if m.contextWindow <= 0 {
-		return fmt.Sprintf("context %s", formatTokenCount(used))
-	}
-	percent := clamp((used*100+m.contextWindow/2)/m.contextWindow, 0, 999)
-	return fmt.Sprintf("context %d%%", percent)
-}
-
-func (m model) formatContextUsageDetail() string {
-	used := 0
-	cache := 0
-	if m.latestUsage != nil {
-		used = m.latestUsage.InputTokens
-		cache = m.latestUsage.CacheRead
-	} else if m.lastUsage != nil {
-		used = m.lastUsage.InputTokens
-		cache = m.lastUsage.CacheRead
-	}
-	if used <= 0 && m.contextWindow <= 0 {
-		return "context: waiting for usage snapshot"
-	}
-	if m.contextWindow <= 0 {
-		if cache > 0 {
-			return fmt.Sprintf("context: %s input · %s cache", formatTokenCount(used), formatTokenCount(cache))
-		}
-		return fmt.Sprintf("context: %s input", formatTokenCount(used))
-	}
-	percent := clamp((used*100+m.contextWindow/2)/m.contextWindow, 0, 999)
-	remaining := max(0, m.contextWindow-used)
-	detail := fmt.Sprintf("context: %s / %s used · %d%% · %s remaining",
-		formatTokenCount(used), formatTokenCount(m.contextWindow), percent, formatTokenCount(remaining))
-	if cache > 0 {
-		detail += " · " + formatTokenCount(cache) + " cache"
-	}
-	return detail
-}
-
-func (m model) topCardMCPRows() []string {
-	servers := map[string]int{}
-	for _, entry := range m.toolAuditEntries {
-		if entry.Source == nil || entry.Source.Type != toolSourceMCP {
-			continue
-		}
-		server := strings.TrimSpace(entry.Source.ServerName)
-		if server == "" {
-			server = "mcp"
-		}
-		servers[server]++
-	}
-	if len(servers) == 0 {
-		return []string{"none detected"}
-	}
-	names := make([]string, 0, len(servers))
-	for server := range servers {
-		names = append(names, server)
-	}
-	sort.Strings(names)
-	rows := make([]string, 0, min(len(names), 3))
-	for _, server := range names {
-		rows = append(rows, fmt.Sprintf("● %s (%d)", server, servers[server]))
-		if len(rows) == 3 {
-			break
-		}
-	}
-	if remaining := len(names) - len(rows); remaining > 0 {
-		rows = append(rows, fmt.Sprintf("+%d more", remaining))
-	}
-	return rows
-}
-
-func (m model) topCardSessionRows() []string {
-	rows := []string{}
-	if m.sessionID != "" {
-		rows = append(rows, "session "+shortID(m.sessionID))
-	}
-	unread := 0
-	for _, message := range m.inboxMessages {
-		if message.Status != messageStatusAcknowledged {
-			unread++
-		}
-	}
-	if len(m.inboxMessages) > 0 {
-		rows = append(rows, fmt.Sprintf("inbox %d unread / %d total", unread, len(m.inboxMessages)))
-	}
-	if len(m.inboxChannels) > 0 {
-		rows = append(rows, fmt.Sprintf("channels %d", len(m.inboxChannels)))
-	}
-	if len(rows) == 0 {
-		rows = append(rows, "reserved for session links")
-	}
-	return rows
-}
-
-func (m *model) handleLocalCommand(input string) tea.Cmd {
-	fields := strings.Fields(input)
-	if len(fields) == 0 {
-		return nil
-	}
-	m.appendLine("user", input)
-	cmd := findSlashCommand(fields[0])
-	if cmd == nil {
-		m.appendLine("error", "unknown local command: "+fields[0])
-		return nil
-	}
-	if cmd.run == nil {
-		// Prefix-insertion commands (e.g. /bash) have no server-side
-		// runner; they only fire from the slash palette. If a user
-		// somehow submits them directly, surface a helpful error
-		// instead of nil-pointer-dereferencing.
-		m.appendLine("error", "command is not executable via direct submit: "+fields[0]+" (open the slash palette to use it)")
-		return nil
-	}
-	return cmd.run(m, fields[1:])
-}
-
 func (m *model) applyRuntimeConfig(config runtimeConfig) {
 	if config.ModelID != "" {
 		m.modelID = config.ModelID
@@ -6329,135 +3090,6 @@ func (m *model) applyRuntimeConfig(config runtimeConfig) {
 		m.configVersion = config.Version
 	}
 	m.tombstoneCount = len(config.Tombstones)
-}
-
-func (m model) renderPermission(width int) string {
-	return newPermissionDialog(m.pending, m.permissionChoice).View(width)
-}
-
-// renderPermissionEditor is the Round 2 inline text editor
-// reached from the 5-option panel for options 3 (editable rule)
-// and 5 (reject-with-feedback). The overlay shows the same
-// context as the 5-option panel (tool name, risk, input, the
-// suggested rule when editing option 3) and a single-line
-// textinput where the operator edits the rule / types feedback.
-//
-// Visual shape:
-//   - Header: "Editing rule for Bash" / "Editing feedback for Bash"
-//   - Tool input + reason echo
-//   - "Suggested rule: <rule>"  (only when editing option 3 and
-//     the runtime surfaced a rule; this is the reference the
-//     operator can edit)
-//   - Prompt line: "  <m.input.View()>" (input's own Prompt
-//     provides the leading "> ")
-//   - Keyboard hint: "↵ confirm  esc back to options"
-func (m model) renderPermissionEditor(width int) string {
-	if m.pending == nil {
-		return ""
-	}
-	if m.inputMode != modePermissionEditRule && m.inputMode != modePermissionEditFeedback {
-		return ""
-	}
-	return newPermissionEditorDialog(m.pending, m.inputMode, m.input.View()).View(width)
-}
-
-func (m model) renderInput(width int) string {
-	// The /model multi-step flow renders its own inline
-	// input box inside the overlay (apiKey + baseURL steps);
-	// hide the bottom prompt row to avoid two visible
-	// input boxes stacked on top of each other. The
-	// provider / picker steps also have no input.
-	//
-	// Round 2: the permission inline editors
-	// (modePermissionEditRule / modePermissionEditFeedback)
-	// also render their own prompt inside the overlay so
-	// the operator sees one coherent editor panel rather
-	// than two stacked input boxes.
-	if m.inputMode == modeModelPickProvider ||
-		m.inputMode == modeModelPickApiKey ||
-		m.inputMode == modeModelPickBaseURL ||
-		m.inputMode == modeModelPickModel ||
-		m.inputMode == modePermissionEditRule ||
-		m.inputMode == modePermissionEditFeedback {
-		return divider(width) + "\n"
-	}
-	inputView := m.input.View()
-	prompt := inputBlockStyle.Width(max(0, width)).Render(inputView)
-	return strings.Join([]string{
-		divider(width),
-		prompt,
-	}, "\n")
-}
-
-func (m model) renderFooter(width int) string {
-	// Row 1 follows Crush's status-bar shape: normal operation
-	// shows compact keyboard help; transient info messages (like
-	// clipboard copy success) temporarily replace that help.
-	if msg := strings.TrimSpace(m.copyToastMessage); msg != "" && !m.copyToastShownAt.IsZero() {
-		topRow := confirmStyle.Render(truncatePlain("✓ "+msg, width))
-		if m.isCompact() {
-			return topRow
-		}
-		if bottomRow := m.renderFooterSummary(width); bottomRow != "" {
-			return topRow + "\n" + bottomRow
-		}
-		return topRow
-	}
-
-	hint := strings.Join([]string{
-		"/ or ctrl+p commands",
-		"ctrl+d panel",
-		"ctrl+l models",
-		"shift+enter newline",
-		"ctrl+c quit",
-		"? help",
-	}, " · ")
-	if m.running {
-		hint = "waiting for Nexus events"
-	}
-	if m.pending != nil {
-		hint = "permission decision required"
-	}
-	elapsed := ""
-	if !m.startedAt.IsZero() && m.running {
-		elapsed = fmt.Sprintf("  elapsed=%s", time.Since(m.startedAt).Round(time.Second))
-	}
-	topRow := footerStyle.Render(truncatePlain(
-		"  "+strings.TrimSpace(strings.Join([]string{hint, strings.TrimSpace(elapsed)}, " ")), width))
-
-	if bottomRow := m.renderFooterSummary(width); bottomRow != "" {
-		return topRow + "\n" + bottomRow
-	}
-	return topRow
-}
-
-func (m model) renderFooterSummary(width int) string {
-	// Row 2: side-channel summary — inbox / agents / usage.
-	// Kept as a separate muted line so the keyboard hint on row 1
-	// stays scannable. The latest usage snapshot is rendered
-	// here as a transient counter (the `✻ Sautéed for 26s`
-	// pattern): the line updates in place as new usage events
-	// arrive, and disappears on result / error when the turn
-	// ends.
-	//
-	// Phase A.4: compact mode (terminal < 120×30) drops this
-	// row entirely to free vertical space for the transcript.
-	var sideParts []string
-	if !m.isCompact() {
-		if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
-			sideParts = append(sideParts, inbox)
-		}
-		if subRunning := m.subAgentRunningCount(); subRunning > 0 {
-			sideParts = append(sideParts, fmt.Sprintf("sub-agents running: %d", subRunning))
-		}
-		if m.latestUsage != nil {
-			sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
-		}
-	}
-	if len(sideParts) > 0 {
-		return mutedStyle.Render(truncatePlain(strings.Join(sideParts, "  · "), width))
-	}
-	return ""
 }
 
 // fetchInboxWithSession is the gated entry point the /inbox slash
@@ -6566,238 +3198,6 @@ func (m *model) fetchSessionTasksWithSession() tea.Cmd {
 	return fetchSessionTasks(m.cfg, m.sessionID, "user")
 }
 
-func (m *model) sendPermissionDecision(approved bool, reason, scope, rule, feedback string) {
-	if m.pending == nil || m.decisions == nil {
-		return
-	}
-	decision := permissionDecision{
-		sessionID: m.pending.sessionID,
-		toolUseID: m.pending.toolUseID,
-		approved:  approved,
-		reason:    reason,
-		scope:     scope,
-		rule:      rule,
-		feedback:  feedback,
-	}
-	select {
-	case m.decisions <- decision:
-		if approved {
-			if scope == "session" {
-				m.appendLine("permission", "approved (session)")
-			} else {
-				m.appendLine("permission", "approved")
-			}
-		} else {
-			if feedback != "" {
-				m.appendLine("permission", "rejected (with feedback)")
-			} else {
-				m.appendLine("permission", "rejected")
-			}
-		}
-	default:
-		m.appendLine("error", "permission decision queue is full")
-	}
-	m.pending = nil
-	m.resize()
-	// Phase 3: clear the permission input mode so the textinput
-	// resumes ownership of subsequent keys.
-	m.setMode(modeComposing)
-}
-
-func (m *model) recordPermissionRuleSeen(rule string, now time.Time) int {
-	rule = strings.TrimSpace(rule)
-	if rule == "" {
-		return 0
-	}
-	if m.recentPermissionRules == nil {
-		m.recentPermissionRules = map[string]permissionRuleSeen{}
-	}
-	for key, seen := range m.recentPermissionRules {
-		if now.Sub(seen.last) > repeatedPermissionRuleWindow {
-			delete(m.recentPermissionRules, key)
-		}
-	}
-	seen := m.recentPermissionRules[rule]
-	if seen.count == 0 || now.Sub(seen.last) > repeatedPermissionRuleWindow {
-		seen.count = 0
-	}
-	seen.count++
-	seen.last = now
-	m.recentPermissionRules[rule] = seen
-	return seen.count
-}
-
-// confirmPermissionChoice is the Phase A.1 entry point invoked
-// when the operator presses enter (or a number key 1-5) on the
-// 5-option permission panel. It maps the cursor to the right
-// scope/rule/feedback combination and calls sendPermissionDecision.
-//
-// Mapping (cursor index 0..4 → choice):
-//
-//	0 — Approve once                       → scope="once",   rule="",    feedback=""
-//	1 — Approve for this session           → scope="session", rule=suggested, feedback=""
-//	2 — Approve with editable rule         → scope="session", rule=<edited> (Round 2 inline editor),
-//	                                             or scope="once" if the operator cleared the rule
-//	3 — Reject                             → scope="once",   rule="",    feedback=""
-//	4 — Reject, tell the model what to do  → scope="once",   rule="",    feedback=<typed>
-//
-// Hard invariants:
-//   - "session" scope is only emitted when there is a non-empty
-//     rule (otherwise the runtime would accumulate an empty rule,
-//     which `addSessionRule` filters out anyway — but keeping the
-//     suggestion visible to the operator is the explicit Phase A.1
-//     UX contract).
-//   - Round 2 routes option 2/4 through the inline editor before
-//     confirmPermissionChoice ever sees them; the editor calls
-//     sendPermissionDecision directly with the edited value.
-func (m *model) confirmPermissionChoice() {
-	if m.pending == nil {
-		return
-	}
-	suggested := strings.TrimSpace(m.pending.suggestedRule)
-	switch m.permissionChoice {
-	case 0:
-		// Approve once
-		m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
-	case 1:
-		// Approve for this session
-		if suggested == "" {
-			// No suggested rule → fall back to "once" so we
-			// never accumulate an empty rule.
-			m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
-			return
-		}
-		m.sendPermissionDecision(true, "Approved (session) from Go TUI", "session", suggested, "")
-	case 2:
-		// Approve with editable rule (Round 1: same as option 1
-		// with the suggested rule; Round 2 will introduce a
-		// dedicated inline editor so the operator can edit the
-		// rule before confirming). The key handler routes the
-		// 3-key / enter-on-cursor-2 path to the editor, which
-		// sends the decision directly with the edited value.
-		// Reaching this branch means the editor confirmed without
-		// editing, so fall back to the suggested rule.
-		if suggested == "" {
-			m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
-			return
-		}
-		m.sendPermissionDecision(true, "Approved (rule) from Go TUI", "rule", suggested, "")
-	case 3:
-		// Reject
-		m.sendPermissionDecision(false, "Rejected from Go TUI", "once", "", "")
-	case 4:
-		// Reject, tell the model what to do instead (Round 1:
-		// empty feedback — the runtime still surfaces a
-		// `permission_response` event with feedback="" so the
-		// wire format is the same as Round 2 will emit; Round 2
-		// routes 5-key / enter-on-cursor-4 through the feedback
-		// editor, which sends the decision directly with the
-		// typed feedback). Reaching this branch means the editor
-		// confirmed with empty feedback, which we treat as a
-		// plain reject.
-		m.sendPermissionDecision(false, "Rejected (with feedback) from Go TUI", "once", "", "")
-	default:
-		// Should not happen — fall back to the safe default.
-		m.sendPermissionDecision(true, "Approved from Go TUI", "once", "", "")
-	}
-}
-
-// enterPermissionRuleEditor opens the inline textinput pre-filled
-// with the runtime-suggested allow rule. The operator edits the
-// rule in-place; Enter confirms option 2 with the edited value
-// (scope="rule" if non-empty, falling back to scope="once" if the
-// operator cleared the input), Esc returns to the 5-option panel.
-// Round 2 of the enhanced permission panel.
-func (m *model) enterPermissionRuleEditor() {
-	if m.pending == nil {
-		return
-	}
-	m.setInputValue(strings.TrimSpace(m.pending.suggestedRule))
-	m.setMode(modePermissionEditRule)
-}
-
-// enterPermissionFeedbackEditor opens the inline textinput empty
-// so the operator can type what the model should do instead.
-// Enter confirms option 4 with the typed feedback (scope="once",
-// feedback=<typed>, or plain reject if the operator submitted
-// empty), Esc returns to the 5-option panel. Round 2.
-func (m *model) enterPermissionFeedbackEditor() {
-	if m.pending == nil {
-		return
-	}
-	m.setInputValue("")
-	m.setMode(modePermissionEditFeedback)
-}
-
-// exitPermissionEditor is the Round 2 close-out for the inline
-// editor. When `confirm` is true (Enter), the typed value is
-// committed: option 2 sends scope="rule" with the edited rule
-// (or scope="once" if cleared), option 4 sends approved=false
-// with the typed feedback. When `confirm` is false (Esc), the
-// textinput is cleared and the 5-option panel is restored with
-// its previous cursor position; no decision is sent.
-//
-// The textinput is always cleared on exit so the next composing
-// prompt starts from an empty value.
-func (m *model) exitPermissionEditor(confirm bool) {
-	if m.pending == nil {
-		// No pending request — just drop the editor mode and
-		// fall through to composing so the next operator
-		// action isn't swallowed.
-		m.setInputValue("")
-		m.setMode(modeComposing)
-		return
-	}
-	edited := strings.TrimSpace(m.input.Value())
-	m.setInputValue("")
-	switch m.inputMode {
-	case modePermissionEditRule:
-		if confirm {
-			if edited == "" {
-				// Operator cleared the suggested rule → fall
-				// back to plain approve (scope="once") so we
-				// never accumulate an empty rule. The
-				// alternative — "Approve once" as a separate
-				// branch — would require another key; this
-				// keeps the wire format consistent.
-				m.appendLine("permission", "rule cleared — falling back to approve once")
-				m.setMode(modeComposing)
-				m.sendPermissionDecision(true, "Approved (rule cleared) from Go TUI", "once", "", "")
-				return
-			}
-			m.setMode(modeComposing)
-			m.sendPermissionDecision(true, "Approved (rule) from Go TUI", "rule", edited, "")
-			return
-		}
-		// Esc → back to the 5-option panel, restore cursor 2
-		// (where the operator was before opening the editor).
-		m.permissionChoice = 2
-		m.setMode(modePermission)
-	case modePermissionEditFeedback:
-		if confirm {
-			if edited == "" {
-				// Operator submitted empty feedback → treat as
-				// a plain reject so the model still sees a
-				// denial, just without a follow-up hint.
-				m.appendLine("permission", "feedback empty — falling back to plain reject")
-				m.setMode(modeComposing)
-				m.sendPermissionDecision(false, "Rejected from Go TUI", "once", "", "")
-				return
-			}
-			m.setMode(modeComposing)
-			m.sendPermissionDecision(false, "Rejected (with feedback) from Go TUI", "once", "", edited)
-			return
-		}
-		// Esc → back to the 5-option panel, restore cursor 4.
-		m.permissionChoice = 4
-		m.setMode(modePermission)
-	default:
-		// Defensive fallback — should not happen, but make sure
-		// the operator isn't stuck in an editor mode.
-		m.setMode(modeComposing)
-	}
-}
-
 // consumeNexusEvent applies a single Nexus event to the model and
 // optionally returns a follow-up tea.Cmd. The Phase 6 PR2
 // auto-refresh hook uses this return value to fire an inbox
@@ -6820,10 +3220,25 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// in the title state, so the standalone row is noise.
 		m.connected = true
 	case "permission_request":
+		sessionID := stringField(event, "sessionId")
+		if m.isPermissionSessionTrusted(sessionID) {
+			m.pending = &pendingPermission{
+				sessionID: sessionID,
+				toolUseID: stringField(event, "toolUseId"),
+				name:      stringField(event, "name"),
+				risk:      stringField(event, "risk"),
+				input:     formatToolInput(stringField(event, "name"), event["input"]),
+				message:   stringField(event, "message"),
+			}
+			if m.sendPermissionDecision(true, "Approved from trusted Go TUI session", "session", strings.TrimSpace(stringField(event, "suggestedRule")), "") {
+				return nil
+			}
+			m.pending = nil
+		}
 		suggestedRule := strings.TrimSpace(stringField(event, "suggestedRule"))
 		repeatedRuleCount := m.recordPermissionRuleSeen(suggestedRule, time.Now())
 		m.pending = &pendingPermission{
-			sessionID:         stringField(event, "sessionId"),
+			sessionID:         sessionID,
 			toolUseID:         stringField(event, "toolUseId"),
 			name:              stringField(event, "name"),
 			risk:              stringField(event, "risk"),
@@ -6852,7 +3267,22 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// failure (`failed: <message>`) and on raw `error`
 		// events so the operator can see why a turn ended in
 		// failure.
-		body := formatNexusEvent(event)
+		//
+		// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+		// when an `error` event carries REQUEST_TIMEOUT but
+		// the soft cycle had already fired during this turn,
+		// the watchdog (not the soft budget) ended the turn.
+		// Use `formatErrorEventWithSoftContext()` for error
+		// events so the operator sees a watchdog-flavoured
+		// message instead of a stale "raise --execute-timeout-ms"
+		// recommendation. Result events still go through
+		// `formatNexusEvent` unchanged.
+		var body string
+		if eventType == "error" {
+			body = m.formatErrorEventWithSoftContext(event)
+		} else {
+			body = formatNexusEvent(event)
+		}
 		if body != "" {
 			m.appendLine(eventType, body)
 		}
@@ -6870,6 +3300,11 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// Clear the transient usage snapshot so the footer
 		// drops the in-flight token counter when the turn ends.
 		m.latestUsage = nil
+		// Phase 4: clear the soft cycle snapshot AFTER the
+		// friendly message has been built (so a watchdog
+		// REQUEST_TIMEOUT still sees the snapshot above). The
+		// next turn starts with a fresh budget anyway.
+		m.softTimeoutState = nil
 		m.resize()
 		// Phase 6 PR2: end-of-turn auto-refresh. The Nexus may
 		// have queued or accepted new SessionChannel messages
@@ -6894,7 +3329,10 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.appendStreamingLine("assistant", stringField(event, "text"))
 	case "thinking_delta":
 		m.appendStreamingLine("thinking", stringField(event, "text"))
-	case "tool_started", "tool_denied", "permission_response", "context_warning", "context_blocking":
+	case "tool_started":
+		m.appendToolStarted(event)
+		m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+	case "tool_denied", "permission_response", "context_warning", "context_blocking":
 		m.appendLine(eventType, formatNexusEvent(event))
 		// Phase 6 PR5: record high-signal events into the
 		// in-memory activity buffer for the /activity overlay.
@@ -6903,14 +3341,20 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// permission decisions, agent job events, and context
 		// warnings.
 		switch eventType {
-		case "tool_started":
-			m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
 		case "permission_response":
 			m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
 		case "context_warning":
 			m.recordActivityEvent(activityKindContextWarning, formatNexusEvent(event), stringField(event, "timestamp"))
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
+		}
+	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected":
+		m.appendLine(eventType, formatNexusEvent(event))
+	case "context_usage":
+		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)
+	case "execution_metrics":
+		if snapshot := contextUsageSnapshotFromExecutionMetrics(event); snapshot != nil {
+			m.contextUsage = snapshot
 		}
 	case "usage":
 		// `usage` events arrive several times per turn (often
@@ -6926,7 +3370,9 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 			OutputTokens: anyInt(event["outputTokens"]),
 			CacheRead:    anyInt(event["cacheReadInputTokens"]),
 		}
-		m.lastUsage = m.latestUsage
+		if m.latestUsage.InputTokens > 0 {
+			m.lastUsage = m.latestUsage
+		}
 	case "user_intake_guidance":
 		// Intake classifier metadata (intent / requiresTools /
 		// reason) is useful for audit but the operator doesn't
@@ -6939,13 +3385,18 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// transcript shows one row per tool call (the started
 		// row stays). The activity overlay still records the
 		// completion so /activity remains useful for triage.
+		m.updateToolCompleted(event)
 		m.recordActivityEvent(activityKindToolCompleted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+		m.lastEventType = eventType
+		return nil
 	case "hook_started", "hook_completed", "hook_failed":
 		// Hook events are intentionally NOT rendered in the
 		// transcript: InvocationDiagnosticsHook fires before /
 		// after every tool call and clutters the chat log
 		// without informing the operator. Activity overlay
 		// and tool audit ignore them too.
+		m.lastEventType = eventType
+		return nil
 	case "agent_job_event":
 		m.appendLine("agent_job", formatNexusEvent(event))
 		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
@@ -6961,6 +3412,48 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		if subAgentStatus, ok := subAgentStatusFromTaskSessionEvent(event); ok {
 			m.recordSubAgentEvent(event, subAgentStatus)
 		}
+	case "timeout_budget_exceeded":
+		// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+		// keep the existing transcript row (default formatter
+		// path) but also track the running soft-cycle state on
+		// the model so the footer can show a transient "soft
+		// budget reached" status and a subsequent
+		// REQUEST_TIMEOUT can be classified as a watchdog
+		// cutoff rather than a fresh fatal cutoff. The
+		// snapshot is cleared on result / error like
+		// `latestUsage`.
+		elapsedMs := anyInt(event["elapsedMs"])
+		budgetMs := anyInt(event["timeoutMs"])
+		if m.softTimeoutState == nil {
+			m.softTimeoutState = &softTimeoutSnapshot{
+				OriginalBudgetMs:  budgetMs,
+				TotalSoftBudgetMs: budgetMs,
+			}
+		}
+		m.softTimeoutState.BudgetExceededAt = time.Now()
+		m.softTimeoutState.LastElapsedMs = elapsedMs
+		// Subsequent budget_exceeded events (after an
+		// extension) carry the running budget for that cycle;
+		// update the total so the footer reflects the budget
+		// that just exhausted.
+		if budgetMs > m.softTimeoutState.TotalSoftBudgetMs {
+			m.softTimeoutState.TotalSoftBudgetMs = budgetMs
+		}
+	case "timeout_extension_granted":
+		// Phase 4: update the soft snapshot with the new running
+		// budget + extension count so the footer can render
+		// "soft budget extended +Xms (1/1)" without adding noise
+		// to the main transcript.
+		if m.softTimeoutState == nil {
+			// The grant event must come AFTER a budget_exceeded
+			// event, but stay defensive: a bare grant still
+			// gets a snapshot so the footer renders.
+			m.softTimeoutState = &softTimeoutSnapshot{}
+		}
+		m.softTimeoutState.ExtensionCount = anyInt(event["extensionCount"])
+		m.softTimeoutState.MaxExtensions = anyInt(event["maxExtensions"])
+		m.softTimeoutState.TotalSoftBudgetMs = anyInt(event["totalSoftBudgetMs"])
+		m.softTimeoutState.LastElapsedMs = anyInt(event["elapsedMs"])
 	default:
 		m.appendLine(eventType, formatNexusEvent(event))
 	}
@@ -6984,121 +3477,6 @@ func (m *model) appendStreamingLine(kind string, text string) {
 	m.appendLine(kind, text)
 }
 
-// recordActivityEvent appends a high-signal event to the
-// in-memory activity buffer, dropping the oldest entry once
-// the cap is hit. Phase 6 PR5 wires this into consumeNexusEvent
-// for tool_started / tool_completed / permission_response /
-// context_warning / context_blocking / agent_job_event so the
-// /activity overlay has a recent snapshot without an extra
-// Nexus round-trip.
-func (m *model) recordActivityEvent(kind activityEventKind, summary string, timestamp string) {
-	entry := activityEventEntry{
-		Kind:      kind,
-		Summary:   singleLine(strings.TrimSpace(summary)),
-		Timestamp: strings.TrimSpace(timestamp),
-	}
-	if entry.Summary == "" {
-		entry.Summary = "[" + string(kind) + "]"
-	}
-	m.activityEvents = append(m.activityEvents, entry)
-	if len(m.activityEvents) > activityBufferCap {
-		// Drop oldest entries. The buffer is small (cap 50)
-		// so a plain re-slice is fine.
-		m.activityEvents = append([]activityEventEntry(nil), m.activityEvents[len(m.activityEvents)-activityBufferCap:]...)
-	}
-}
-
-// subAgentStatusFromTaskSessionEvent maps a task_session_event
-// eventType to the canonical subAgentStatus enum. Returns
-// (status, true) when the eventType is a sub-agent lifecycle
-// event; returns ("", false) for unrelated task_session_event
-// types so the caller can no-op.
-//
-// Mirrors the TS TUI isSubAgentLifecycleEvent +
-// statusFromSubAgentLifecycleEvent helpers in
-// src/cli/renderEvents.ts (Phase 6 PR6).
-func subAgentStatusFromTaskSessionEvent(event map[string]any) (subAgentStatus, bool) {
-	eventType := stringField(event, "eventType")
-	switch eventType {
-	case "subagent_started", "sub_agent_session_started":
-		return subAgentStatusRunning, true
-	case "subagent_completed", "sub_agent_session_completed":
-		return subAgentStatusCompleted, true
-	case "subagent_failed", "sub_agent_session_failed", "sub_agent_session_error", "subagent_failed_v2":
-		return subAgentStatusFailed, true
-	case "subagent_cancelled":
-		return subAgentStatusCancelled, true
-	}
-	return "", false
-}
-
-// recordSubAgentEvent updates the in-memory subAgents tracker
-// from a task_session_event payload. The id is taken from the
-// first non-empty field among agentId / subSessionId /
-// taskId; the parentTaskId is taken from the payload if
-// present; the title is taken from the first non-empty
-// title / taskTitle / summary field. Phase 6 PR6 wires this
-// into consumeNexusEvent for subagent lifecycle events.
-func (m *model) recordSubAgentEvent(event map[string]any, status subAgentStatus) {
-	if m.subAgents == nil {
-		m.subAgents = map[string]subAgentEntry{}
-	}
-	payload := asMap(event["payload"])
-	// eventType / sessionId / eventId / phase / timestamp
-	// live at the top level (TaskSessionEventSchema in
-	// src/shared/events.ts).
-	agentID := stringField(event, "agentId")
-	if agentID == "" {
-		agentID = stringField(payload, "agentId")
-	}
-	if agentID == "" {
-		agentID = stringField(payload, "subSessionId")
-	}
-	if agentID == "" {
-		agentID = stringField(payload, "taskId")
-	}
-	if agentID == "" {
-		// The payload sometimes carries a unique id nested
-		// one level deeper; fall back to that before
-		// giving up.
-		agentID = stringField(payload, "id")
-	}
-	if agentID == "" {
-		// Without an id we can't dedupe; skip the event.
-		return
-	}
-	parentTask := stringField(payload, "parentTaskId")
-	title := firstNonEmpty(
-		stringField(payload, "title"),
-		stringField(payload, "taskTitle"),
-		stringField(payload, "summary"),
-	)
-	entry := subAgentEntry{
-		ID:         agentID,
-		ParentTask: parentTask,
-		Title:      singleLine(title),
-		Status:     status,
-		UpdatedAt:  stringField(event, "timestamp"),
-	}
-	if entry.Title == "" {
-		entry.Title = "sub-agent task"
-	}
-	m.subAgents[agentID] = entry
-}
-
-// subAgentRunningCount returns the number of subAgents
-// currently in the running status. Used by the header badge
-// (Phase 6 PR6).
-func (m *model) subAgentRunningCount() int {
-	count := 0
-	for _, entry := range m.subAgents {
-		if entry.Status == subAgentStatusRunning {
-			count++
-		}
-	}
-	return count
-}
-
 func (m *model) appendLine(kind string, text string) {
 	// Phase B: each transcript row is a *transcriptItem so its
 	// Versioned counter survives slice reallocations and the
@@ -7113,6 +3491,53 @@ func (m *model) appendLine(kind string, text string) {
 		Versioned: NewVersioned(),
 	})
 	m.refreshViewport()
+}
+
+func (m *model) appendToolStarted(event map[string]any) {
+	name := stringField(event, "name")
+	input := formatToolInput(name, event["input"])
+	item := &transcriptItem{
+		kind:       "tool_started",
+		text:       formatToolStartedText(name, input),
+		toolUseID:  stringField(event, "toolUseId"),
+		toolName:   name,
+		toolInput:  input,
+		toolStatus: "running",
+		Versioned:  NewVersioned(),
+	}
+	m.transcript = append(m.transcript, item)
+	m.refreshViewport()
+}
+
+func (m *model) updateToolCompleted(event map[string]any) bool {
+	toolUseID := stringField(event, "toolUseId")
+	name := stringField(event, "name")
+	input := formatToolInput(name, event["input"])
+	for i := len(m.transcript) - 1; i >= 0; i-- {
+		item := m.transcript[i]
+		if item == nil || item.kind != "tool_started" {
+			continue
+		}
+		if toolUseID != "" && item.toolUseID != "" && item.toolUseID != toolUseID {
+			continue
+		}
+		if name != "" && item.toolName != "" && item.toolName != name {
+			continue
+		}
+		if item.toolName == "" {
+			item.toolName = name
+		}
+		if item.toolInput == "" {
+			item.toolInput = input
+		}
+		item.toolStatus = ternary(event["success"] == false, "error", "success")
+		item.toolOutput = extractToolOutputText(event["output"])
+		item.text = formatToolStartedText(item.toolName, item.toolInput)
+		item.Bump()
+		m.refreshViewport()
+		return true
+	}
+	return false
 }
 
 func (m *model) refreshViewport() {
@@ -7132,2034 +3557,4 @@ func (m *model) refreshViewport() {
 	if wasAtBottom {
 		m.viewport.GotoBottom()
 	}
-}
-
-func (m model) renderWelcomeCard(width int) string {
-	formattedCwd := m.cfg.Cwd
-	home := os.Getenv("HOME")
-	if home != "" {
-		if formattedCwd == home {
-			formattedCwd = "~"
-		} else if strings.HasPrefix(formattedCwd, home+"/") {
-			formattedCwd = "~/" + formattedCwd[len(home)+1:]
-		}
-	}
-
-	mode := "Embedded (Local)"
-	if m.cfg.BaseURL != "" && !strings.Contains(m.cfg.BaseURL, "127.0.0.1") && !strings.Contains(m.cfg.BaseURL, "localhost") {
-		mode = "Service (" + m.cfg.BaseURL + ")"
-	}
-
-	defaultModel := m.modelID
-	if defaultModel == "" {
-		defaultModel = "local/coding-runtime"
-	}
-
-	sessionVal := m.sessionID
-	if sessionVal == "" {
-		sessionVal = m.cfg.SessionID
-	}
-	if sessionVal == "" {
-		sessionVal = "new session"
-	}
-
-	pixelRows := []string{
-		"    M    ",
-		"   M M   ",
-		"    R    ",
-		"   R R   ",
-		"  R   R  ",
-		"O O P V V",
-	}
-
-	colors := map[rune]string{
-		'M': "#ff006e",
-		'P': "#ff4f9a",
-		'R': "#c72d68",
-		'O': "#ff7a18",
-		'V': "#8b5cf6",
-	}
-
-	renderLogoRow := func(row string) string {
-		var sb strings.Builder
-		for _, r := range row {
-			if r == ' ' {
-				sb.WriteByte(' ')
-			} else {
-				hex, ok := colors[r]
-				if !ok {
-					hex = "#ff006e"
-				}
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
-				sb.WriteString(style.Render("█"))
-			}
-		}
-		return sb.String()
-	}
-
-	modelSummary := truncatePlain(defaultModel, 42)
-	cwdSummary := truncatePlain(formattedCwd, 42)
-	sessionSummary := truncatePlain(shortID(sessionVal), 42)
-	modeSummary := truncatePlain(mode, 42)
-	titleLine := titleStyle.Render("v"+Version) + mutedStyle.Render("  Welcome back!")
-	metadataLines := []string{
-		titleLine,
-		welcomeMetaLine("model", modelSummary, statusStyle.Render("●")),
-		welcomeMetaLine("work", cwdSummary, contextStyle.Render("○")),
-		welcomeMetaLine("session", sessionSummary, mutedStyle.Render("•")),
-		welcomeMetaLine("mode", modeSummary, mutedStyle.Render("•")),
-	}
-	infoGap := 10
-	infoOffset := 1 + lipgloss.Width(pixelRows[0]) + infoGap
-
-	var cardLines []string
-	for i := 0; i < 6; i++ {
-		logoCol := renderLogoRow(pixelRows[i])
-		metaCol := ""
-		if i < len(metadataLines) {
-			metaCol = metadataLines[i]
-		}
-		combined := " " + logoCol + strings.Repeat(" ", infoGap) + metaCol
-		cardLines = append(cardLines, combined)
-	}
-
-	maxCardWidth := 0
-	for _, line := range cardLines {
-		w := lipgloss.Width(line)
-		if w > maxCardWidth {
-			maxCardWidth = w
-		}
-	}
-
-	navLine := strings.Join([]string{
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#ff7a18")).Render("◆") + " chat",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("51")).Render("◆") + " nexus",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("99")).Render("◆") + " config",
-		lipgloss.NewStyle().Foreground(lipgloss.Color("#ff4f9a")).Render("◆") + " models",
-	}, "   ")
-	cardLines = append(cardLines, strings.Repeat(" ", infoOffset)+focusedLineStyle.Render(navLine))
-	maxCardWidth = max(maxCardWidth, lipgloss.Width(cardLines[len(cardLines)-1]))
-
-	hPad := max(0, (width-maxCardWidth)/2)
-	hSpace := strings.Repeat(" ", hPad)
-
-	var outputLines []string
-	outputLines = append(outputLines, "", "")
-	for _, line := range cardLines {
-		outputLines = append(outputLines, hSpace+line)
-	}
-	outputLines = append(outputLines, "")
-
-	return strings.Join(outputLines, "\n")
-}
-
-func welcomeMetaLine(label string, value string, marker string) string {
-	labelStyle := mutedStyle.Width(8)
-	valueStyle := contextStyle
-	if marker == "" {
-		marker = mutedStyle.Render("•")
-	}
-	return marker + " " + labelStyle.Render(label) + " " + valueStyle.Render(value)
-}
-
-func renderTranscript(lines []*transcriptItem, width int) string {
-	if len(lines) == 0 {
-		return mutedStyle.Render("  No messages yet.")
-	}
-	rendered := make([]string, 0, len(lines)*2)
-	for i, line := range lines {
-		// Phase B.2: per-item render cache. The first render
-		// populates line.cache; subsequent calls with the same
-		// (width, version) pair return the cached string
-		// without re-running formatLine. Width changes (terminal
-		// resize) and Bump() calls (content mutation) both
-		// invalidate the entry.
-		formatted := renderTranscriptItemCached(line, width)
-		rendered = append(rendered, formatted)
-		// Insert a blank line between rows (but not after the
-		// last one) to give the chat log the breathing room
-		// bbl chat's transcript has — multi-line tool args and
-		// wrapped assistant prose no longer run into the next
-		// row. Skip the gap when the previous formatted row
-		// already ends in a blank line (the source text had
-		// its own paragraph break) so we don't produce a
-		// double blank.
-		if i < len(lines)-1 {
-			last := rendered[len(rendered)-1]
-			if last != "" && !strings.HasSuffix(last, "\n\n") {
-				rendered = append(rendered, "")
-			}
-		}
-	}
-	return strings.Join(rendered, "\n")
-}
-
-func renderTranscriptItemCached(line *transcriptItem, width int) string {
-	if line == nil {
-		return ""
-	}
-	version := uint64(0)
-	if line.Versioned != nil {
-		version = line.Version()
-	}
-	return line.cache.GetOrCompute(width, version, func() string {
-		return formatTranscriptItem(line, width)
-	})
-}
-
-func formatTranscriptItem(line *transcriptItem, width int) string {
-	if line == nil {
-		return ""
-	}
-	view := ""
-	if line.kind == "assistant" || line.kind == "thinking" {
-		view = line.markdownCache.Render(line.kind, line.text, width)
-	} else {
-		view = formatLine(line.kind, line.text, width)
-	}
-	return line.renderHighlight(view)
-}
-
-func formatLine(kind string, text string, width int) string {
-	// The bbl chat TS TUI renders user prompts, assistant /
-	// thinking prose, and tool invocations as flat blocks
-	// without a coloured label column:
-	//   > <prompt>
-	//     <2-space-indented assistant / thinking prose>
-	//   ● ToolName(args) (ctrl+o to expand)
-	// Mirroring that here keeps the chat log scannable instead
-	// of forcing the eye to skip a label column for every row.
-	switch kind {
-	case "user", "user_message":
-		bodyWidth := max(10, width-2)
-		body := wrapPlain(text, bodyWidth)
-		bodyLines := strings.Split(body, "\n")
-		if len(bodyLines) == 0 {
-			bodyLines = []string{""}
-		}
-		out := make([]string, 0, len(bodyLines))
-		out = append(out, userStyle.Render("> ")+userStyle.Render(bodyLines[0]))
-		for _, c := range bodyLines[1:] {
-			// Preserve truly empty lines (paragraph breaks
-			// from the source text) so the breathing-room
-			// logic in renderTranscript can de-duplicate
-			// them — without this, the empty line becomes
-			// `  ` (2 spaces) and looks like a blank but
-			// isn't recognised as one.
-			if c == "" {
-				out = append(out, "")
-				continue
-			}
-			out = append(out, "  "+userStyle.Render(c))
-		}
-		return strings.Join(out, "\n")
-	case "assistant", "thinking":
-		return renderAssistantMarkdownText(kind, text, width)
-	case "tool_started", "tool_denied":
-		// Body starts with `● ToolName(...)` from
-		// formatNexusEvent. Split the body into three visual
-		// parts so each gets its own colour:
-		//   `●`        → toolBulletStyle (sky blue, kind marker)
-		//   ToolName   → toolStyle (warm orange #ff7a18, accent)
-		//   `(args) (ctrl+o to expand)` → default foreground
-		//   (no style), so the operator can read the path /
-		//   pattern / command without straining through a
-		//   saturated colour.
-		// Fall back to the all-warm-orange render when the
-		// body doesn't match the expected `● Name(` shape
-		// (older events, custom tool names, etc.).
-		bodyWidth := max(10, width)
-		body := wrapPlain(text, bodyWidth)
-		bodyLines := strings.Split(body, "\n")
-		if len(bodyLines) == 0 {
-			bodyLines = []string{""}
-		}
-		renderToolRow := func(line string) string {
-			stripped := strings.TrimPrefix(line, "● ")
-			if stripped == line || !strings.HasPrefix(line, "● ") {
-				return toolStyle.Render(line)
-			}
-			open := strings.Index(stripped, "(")
-			if open < 0 {
-				return toolBulletStyle.Render("● ") + toolStyle.Render(stripped)
-			}
-			name := stripped[:open]
-			rest := stripped[open:]
-			return toolBulletStyle.Render("● ") + toolStyle.Render(name) + rest
-		}
-		out := make([]string, 0, len(bodyLines))
-		out = append(out, renderToolRow(bodyLines[0]))
-		for _, c := range bodyLines[1:] {
-			if c == "" {
-				out = append(out, "")
-				continue
-			}
-			out = append(out, "  "+renderToolRow(c))
-		}
-		return strings.Join(out, "\n")
-	case "result":
-		// result events emit just `done` (success) or
-		// `failed: <message>` (failure) as body text. Use a
-		// muted 2-space indent so it reads as a quiet
-		// turn-end marker; the header's running indicator
-		// has already flipped back to idle by the time the
-		// transcript catches up.
-		bodyWidth := max(10, width-2)
-		body := wrapPlain(text, bodyWidth)
-		bodyLines := strings.Split(body, "\n")
-		if len(bodyLines) == 0 {
-			bodyLines = []string{""}
-		}
-		style := mutedStyle
-		if strings.HasPrefix(body, "failed") {
-			style = errorStyle
-		}
-		out := make([]string, 0, len(bodyLines))
-		out = append(out, "  "+style.Render(bodyLines[0]))
-		for _, c := range bodyLines[1:] {
-			if c == "" {
-				out = append(out, "")
-				continue
-			}
-			out = append(out, "  "+style.Render(c))
-		}
-		return strings.Join(out, "\n")
-	}
-
-	// Default label-style for status, error, hook, agent, task,
-	// permission, result, etc. — kinds that still benefit from
-	// a short coloured label so the operator can scan the kind
-	// without reading the body.
-	label, style := linePresentation(kind)
-	prefix := style.Render(label)
-	bodyWidth := max(10, width-lipgloss.Width(label)-1)
-	body := wrapPlain(text, bodyWidth)
-	bodyLines := strings.Split(body, "\n")
-	if len(bodyLines) == 0 {
-		bodyLines = []string{""}
-	}
-
-	out := make([]string, 0, len(bodyLines))
-	out = append(out, prefix+" "+style.Render(bodyLines[0]))
-	indent := strings.Repeat(" ", lipgloss.Width(label)+1)
-	for _, continuation := range bodyLines[1:] {
-		out = append(out, indent+style.Render(continuation))
-	}
-	return strings.Join(out, "\n")
-}
-
-func linePresentation(kind string) (string, lipgloss.Style) {
-	switch kind {
-	case "assistant":
-		return "assistant", assistantStyle
-	case "thinking":
-		return "thinking ", thinkingStyle
-	case "tool_started":
-		return "tool >   ", toolStyle
-	case "tool_completed":
-		return "tool ok  ", toolStyle
-	case "tool_denied":
-		return "tool no  ", toolStyle
-	case "hook_started":
-		return "hook >   ", mutedStyle
-	case "hook_completed":
-		return "hook ok  ", mutedStyle
-	case "hook_failed":
-		return "hook no  ", errorStyle
-	case "task_created":
-		return "task +   ", toolStyle
-	case "task_session_event":
-		return "task     ", toolStyle
-	case "agent_job_event":
-		return "agent    ", toolStyle
-	case "user_message":
-		return "you      ", userStyle
-	case "user_intake_guidance":
-		return "intake   ", mutedStyle
-	case "compact_boundary":
-		return "compact+ ", statusStyle
-	case "compact_failure":
-		return "compact! ", errorStyle
-	case "context_warning":
-		return "ctx warn ", statusStyle
-	case "near_timeout_warning":
-		return "timeout ", permissionStyle
-	case "context_blocking":
-		return "ctx stop ", errorStyle
-	case "session_memory_updated":
-		return "memory   ", mutedStyle
-	case "execution_metrics":
-		return "metrics  ", mutedStyle
-	case "permission", "permission_request", "permission_response":
-		return "permit   ", permissionStyle
-	case "error":
-		return "error    ", errorStyle
-	case "user":
-		return "you      ", userStyle
-	case "session":
-		return "session  ", mutedStyle
-	case "status":
-		return "status   ", mutedStyle
-	default:
-		if kind == "" {
-			return "event    ", mutedStyle
-		}
-		return padRight(kind, 8), mutedStyle
-	}
-}
-
-func formatExecuteSummary(event map[string]any) string {
-	duration := anyInt(event["executeDurationMs"])
-	timeoutMs := anyInt(event["timeoutMs"])
-	outcome := firstNonEmpty(stringField(event, "outcome"), "unknown")
-	near := event["nearTimeout"] == true
-	budget := fmt.Sprintf("dur=%dms timeoutMs=%d", duration, timeoutMs)
-	if timeoutMs > 0 {
-		pct := duration * 100 / timeoutMs
-		budget = fmt.Sprintf("dur=%dms/%dms (%d%%)", duration, timeoutMs, pct)
-	}
-	hint := ""
-	if near {
-		hint = " near-timeout"
-	}
-	return fmt.Sprintf("execute_summary outcome=%s%s %s", outcome, hint, budget)
-}
-
-func formatNexusEvent(event map[string]any) string {
-	eventType := stringField(event, "type")
-	switch eventType {
-	case "session_started":
-		return fmt.Sprintf("session %s model %s", shortID(stringField(event, "sessionId")), stringField(event, "model"))
-	case "thinking_delta":
-		return stringField(event, "text")
-	case "tool_started":
-		// Compact single-line form mirroring the bbl chat TS TUI:
-		// "● ToolName(args) (ctrl+o to expand)". The args string
-		// comes from formatToolInput so the most useful field
-		// (path / pattern / command) is highlighted without the
-		// caller scanning raw JSON.
-		name := stringField(event, "name")
-		args := formatToolInput(name, event["input"])
-		return fmt.Sprintf("● %s(%s)  (ctrl+o to expand)", name, args)
-	case "tool_completed":
-		// Kept here so formatNexusEvent remains callable from
-		// tests / future renderers; consumeNexusEvent no longer
-		// appends tool_completed to the transcript (the
-		// compact tool_started row is the only chat line).
-		return strings.TrimSpace(fmt.Sprintf(
-			"%s done success=%v %s",
-			stringField(event, "name"),
-			event["success"],
-			summarizeToolOutput(event["output"]),
-		))
-	case "tool_denied":
-		name := stringField(event, "name")
-		args := formatToolInput(name, event["input"])
-		return fmt.Sprintf("● %s(%s)  denied: %s", name, args, stringField(event, "reason"))
-	case "permission_request":
-		return fmt.Sprintf("%s (%s risk)", stringField(event, "name"), stringField(event, "risk"))
-	case "permission_response":
-		return fmt.Sprintf("approved=%v reason=%s", event["approved"], stringField(event, "reason"))
-	case "context_warning", "context_blocking":
-		return fmt.Sprintf("%s tokens=%v max=%v", eventType, event["tokenEstimate"], event["maxTokens"])
-	case "near_timeout_warning":
-		return fmt.Sprintf("near timeout elapsed=%dms/%dms %s", anyInt(event["elapsedMs"]), anyInt(event["timeoutMs"]), stringField(event, "message"))
-	case "usage":
-		return fmt.Sprintf("input=%v output=%v cacheRead=%v", event["inputTokens"], event["outputTokens"], event["cacheReadInputTokens"])
-	case "hook_started":
-		return fmt.Sprintf("%s %s%s started", stringField(event, "hookName"), stringField(event, "hookEvent"), formatOptionalToolName(event))
-	case "hook_completed":
-		return strings.TrimSpace(fmt.Sprintf(
-			"%s %s%s %s",
-			stringField(event, "hookName"),
-			stringField(event, "hookEvent"),
-			formatOptionalToolName(event),
-			summarizeHookOutput(event["output"]),
-		))
-	case "hook_failed":
-		return fmt.Sprintf("%s %s%s failed: %s", stringField(event, "hookName"), stringField(event, "hookEvent"), formatOptionalToolName(event), stringField(event, "message"))
-	case "user_message":
-		return truncatePlain(singleLine(stringField(event, "text")), 200)
-	case "user_intake_guidance":
-		return fmt.Sprintf("intent=%s requiresTools=%v reason=%s", stringField(event, "intent"), event["requiresTools"], stringField(event, "reason"))
-	case "task_created":
-		return fmt.Sprintf("id=%s title=%s", shortID(stringField(event, "taskId")), stringField(event, "title"))
-	case "task_session_event":
-		return fmt.Sprintf("eventType=%s phase=%s%s", stringField(event, "eventType"), stringField(event, "phase"), summarizeTaskSessionPayload(event["payload"]))
-	case "agent_job_event":
-		return fmt.Sprintf("eventType=%s jobId=%s status=%s agentType=%s", stringField(event, "eventType"), shortID(stringField(event, "jobId")), stringField(event, "status"), stringField(event, "agentType"))
-	case "compact_boundary":
-		return fmt.Sprintf("trigger=%s before=%d after=%d summary=%dchars snipped=%d", stringField(event, "trigger"), anyInt(event["beforeEventCount"]), anyInt(event["afterEventCount"]), anyInt(event["summaryChars"]), anyInt(event["snippedToolResults"]))
-	case "compact_failure":
-		return fmt.Sprintf("trigger=%s failures=%d/%d: %s", stringField(event, "trigger"), anyInt(event["failureCount"]), anyInt(event["maxFailures"]), stringField(event, "message"))
-	case "session_memory_updated":
-		return fmt.Sprintf("trigger=%s reason=%s chars=%d events=%d", stringField(event, "trigger"), firstNonEmpty(stringField(event, "reason"), "n/a"), anyInt(event["summaryChars"]), anyInt(event["eventCount"]))
-	case "execution_metrics":
-		return fmt.Sprintf("dur=%dms input=%d output=%d tools=%d firstToken=%dms", anyInt(event["executeDurationMs"]), anyInt(event["inputTokens"]), anyInt(event["outputTokens"]), anyInt(event["toolCallCount"]), anyInt(event["providerFirstTokenMs"]))
-	case "execute_summary":
-		return formatExecuteSummary(event)
-	case "result":
-		// On success: return empty so the consumeNexusEvent
-		// result branch skips the append entirely (the header
-		// already flipped from running back to idle, the
-		// streaming deltas already produced the reply). On
-		// failure: surface the message so the operator sees
-		// why the turn ended with success=false.
-		if event["success"] == false {
-			return "failed: " + firstNonEmpty(stringField(event, "message"), stringField(event, "text"))
-		}
-		return ""
-	case "error":
-		code := stringField(event, "code")
-		if hint, ok := friendlyNexusError(code, event); ok {
-			return hint
-		}
-		return strings.TrimSpace(fmt.Sprintf("%s %s", code, stringField(event, "message")))
-	default:
-		return compactJSON(event)
-	}
-}
-
-func formatOptionalToolName(event map[string]any) string {
-	toolName := stringField(event, "toolName")
-	if toolName == "" {
-		return ""
-	}
-	return " " + toolName
-}
-
-func summarizeToolOutput(value any) string {
-	if value == nil {
-		return ""
-	}
-	if output, ok := value.(map[string]any); ok {
-		parts := []string{}
-		stdout := strings.TrimSpace(stringAnyField(output, "stdout"))
-		stderr := strings.TrimSpace(stringAnyField(output, "stderr"))
-		exitCode := output["exitCode"]
-		if stdout != "" {
-			parts = append(parts, `stdout="`+truncatePlain(singleLine(stdout), 80)+`"`)
-		}
-		if stderr != "" {
-			parts = append(parts, `stderr="`+truncatePlain(singleLine(stderr), 80)+`"`)
-		}
-		if exitCode != nil {
-			parts = append(parts, fmt.Sprintf("exitCode=%v", exitCode))
-		}
-		if len(parts) > 0 {
-			return strings.Join(parts, " ")
-		}
-	}
-	return compactJSON(value)
-}
-
-func summarizeHookOutput(value any) string {
-	if value == nil {
-		return ""
-	}
-	if output, ok := value.(map[string]any); ok {
-		parts := []string{}
-		if summary := strings.TrimSpace(stringAnyField(output, "summary")); summary != "" {
-			parts = append(parts, truncatePlain(singleLine(summary), 100))
-		}
-		if decision, ok := output["permissionDecision"]; ok {
-			parts = append(parts, fmt.Sprintf("decision=%v", decision))
-		}
-		if updatedInput, ok := output["updatedInput"]; ok {
-			parts = append(parts, "updatedInput="+compactJSON(updatedInput))
-		}
-		if len(parts) > 0 {
-			return strings.Join(parts, " ")
-		}
-	}
-	return compactJSON(value)
-}
-
-func stringAnyField(value map[string]any, key string) string {
-	raw, ok := value[key]
-	if !ok || raw == nil {
-		return ""
-	}
-	if text, ok := raw.(string); ok {
-		return text
-	}
-	return fmt.Sprint(raw)
-}
-
-func singleLine(text string) string {
-	return strings.Join(strings.Fields(text), " ")
-}
-
-func anyInt(value any) int {
-	switch typed := value.(type) {
-	case int:
-		return typed
-	case int32:
-		return int(typed)
-	case int64:
-		return int(typed)
-	case float32:
-		return int(typed)
-	case float64:
-		return int(typed)
-	case json.Number:
-		parsed, _ := typed.Int64()
-		return int(parsed)
-	default:
-		return 0
-	}
-}
-
-func summarizeTaskSessionPayload(payload any) string {
-	if payload == nil {
-		return ""
-	}
-	m, ok := payload.(map[string]any)
-	if !ok {
-		return ""
-	}
-	parts := []string{}
-	if sub := stringAnyField(m, "subagent"); sub != "" {
-		parts = append(parts, "subagent="+sub)
-	}
-	if subId := stringAnyField(m, "subSessionId"); subId != "" {
-		parts = append(parts, "subSessionId="+shortID(subId))
-	}
-	if parent := stringAnyField(m, "parentTaskId"); parent != "" {
-		parts = append(parts, "parentTaskId="+parent)
-	}
-	if depth := m["depth"]; depth != nil {
-		parts = append(parts, fmt.Sprintf("depth=%d", anyInt(depth)))
-	}
-	if status := stringAnyField(m, "status"); status != "" {
-		parts = append(parts, "status="+status)
-	}
-	if len(parts) == 0 {
-		return ""
-	}
-	return " " + strings.Join(parts, " ")
-}
-
-// formatToolInput returns a one-line preview of the most relevant
-// field for a permission_request payload. The TUI needs this so the
-// user can see what they are about to approve.
-func formatToolInput(name string, input any) string {
-	if input == nil {
-		return ""
-	}
-	m, ok := input.(map[string]any)
-	if !ok {
-		return singleLine(truncatePlain(fmt.Sprintf("%v", input), 120))
-	}
-	switch name {
-	case "Bash":
-		if cmd := stringAnyField(m, "command"); cmd != "" {
-			return singleLine(truncatePlain(cmd, 120))
-		}
-	case "Read", "Write", "Edit":
-		if path := stringAnyField(m, "path"); path != "" {
-			return path
-		}
-	case "Grep":
-		if pattern := stringAnyField(m, "pattern"); pattern != "" {
-			return "pattern=" + pattern
-		}
-	case "Glob":
-		if pattern := stringAnyField(m, "pattern"); pattern != "" {
-			return "pattern=" + pattern
-		}
-	case "ListDir":
-		if path := stringAnyField(m, "path"); path != "" {
-			return path
-		}
-	case "TaskCreate":
-		if title := stringAnyField(m, "title"); title != "" {
-			return "title=" + title
-		}
-	}
-	return singleLine(truncatePlain(compactJSON(input), 120))
-}
-
-func startStream(cfg Config, prompt string, timeout timeoutDecision) tea.Cmd {
-	return func() tea.Msg {
-		eventCh := make(chan streamEvent, 128)
-		decisionCh := make(chan permissionDecision, 8)
-		go runStream(cfg, prompt, timeout, eventCh, decisionCh)
-		return streamStartedMsg{events: eventCh, decisions: decisionCh}
-	}
-}
-
-func waitForStreamEvent(ch <-chan streamEvent) tea.Cmd {
-	return func() tea.Msg {
-		if ch == nil {
-			return streamClosedMsg{}
-		}
-		event, ok := <-ch
-		if !ok {
-			return streamClosedMsg{}
-		}
-		return streamEventMsg{event: event}
-	}
-}
-
-func fetchRuntimeConfig(cfg Config, since int) tea.Cmd {
-	return func() tea.Msg {
-		var payload runtimeConfig
-		var query url.Values
-		if since > 0 {
-			query = url.Values{"since": {strconv.Itoa(since)}}
-		}
-		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config", nil, &payload, query)
-		return runtimeConfigMsg{config: payload, err: err}
-	}
-}
-
-func pollTick() tea.Msg {
-	return pollTickMsg{}
-}
-
-func fetchRuntimeProfiles(cfg Config) tea.Cmd {
-	return func() tea.Msg {
-		var payload runtimeProfilesResponse
-		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/config/profiles", nil, &payload)
-		return runtimeProfilesMsg{response: payload, err: err}
-	}
-}
-
-func fetchRuntimeModels(cfg Config, trigger string) tea.Cmd {
-	return func() tea.Msg {
-		var payload runtimeModelsResponse
-		err := nexusJSON(cfg, http.MethodGet, "/v1/runtime/models", nil, &payload)
-		return runtimeModelsMsg{response: payload, trigger: trigger, err: err}
-	}
-}
-
-func selectRuntimeProfile(cfg Config, profile string) tea.Cmd {
-	return func() tea.Msg {
-		var payload runtimeConfig
-		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"profile": profile}, &payload)
-		return profileSelectMsg{profile: profile, config: payload, err: err}
-	}
-}
-
-// selectRuntimeModel issues POST /v1/runtime/config/select
-// with body {model: "<provider>/<id>"} and returns the
-// resolved runtimeConfig on success. The Nexus side stores
-// the model as defaultModel; an active profile that pins a
-// model still wins at resolve time (see
-// ConfigManager.resolveSettings), so the operator should
-// clear the active profile or pick a profile that uses
-// this model for the new model to take effect on the next
-// turn.
-func selectRuntimeModel(cfg Config, modelID string) tea.Cmd {
-	return func() tea.Msg {
-		var payload runtimeConfig
-		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/select", map[string]string{"model": modelID}, &payload)
-		return modelSelectMsg{modelID: modelID, config: payload, err: err}
-	}
-}
-
-func fetchContextAnalysis(cfg Config, sessionID string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/context", nil)
-		return contextAnalysisMsg{sessionID: sessionID, raw: raw, err: err}
-	}
-}
-
-func triggerCompact(cfg Config, sessionID string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodPost,
-			"/v1/sessions/"+url.PathEscape(sessionID)+"/compact",
-			map[string]string{"trigger": "manual"},
-		)
-		return compactResultMsg{sessionID: sessionID, raw: raw, err: err}
-	}
-}
-
-// fetchInbox issues GET /v1/sessions/:sessionId/inbox and decodes
-// the stable top-level envelope (type / sessionId / messages /
-// limit / includeAcknowledged). The raw bytes are retained so any
-// future richer renderer (or a server-side schema addition) does
-// not break the existing format / overlay code. The trigger field
-// ("user" / "auto") tells the Update handler whether to open the
-// overlay (user /inbox command) or just refresh the snapshot in
-// place (Phase 6 PR2 end-of-turn auto-refresh).
-func fetchInbox(cfg Config, sessionID string, includeAck bool, trigger string) tea.Cmd {
-	return func() tea.Msg {
-		query := url.Values{}
-		if includeAck {
-			query.Set("includeAcknowledged", "true")
-		}
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodGet,
-			"/v1/sessions/"+url.PathEscape(sessionID)+"/inbox",
-			nil,
-			query,
-		)
-		out := inboxMsg{sessionID: sessionID, raw: raw, includeAck: includeAck, trigger: trigger, err: err}
-		if err == nil {
-			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
-				out.err = fmt.Errorf("decode inbox: %w", decodeErr)
-			}
-		}
-		return out
-	}
-}
-
-// ackInboxMessage issues POST /v1/sessions/:sessionId/inbox/:messageId/ack.
-// The Go TUI does not need the full message body back — only a
-// success signal — so the message field is preserved as raw bytes
-// for any future audit / governance renderer.
-func ackInboxMessage(cfg Config, sessionID string, messageID string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodPost,
-			"/v1/sessions/"+url.PathEscape(sessionID)+"/inbox/"+url.PathEscape(messageID)+"/ack",
-			map[string]any{},
-		)
-		return inboxAckMsg{sessionID: sessionID, messageID: messageID, raw: raw, err: err}
-	}
-}
-
-// fetchSessionAgents issues GET /v1/sessions/:sessionId/agents
-// and decodes the stable top-level envelope
-// (type / sessionId / jobs). The raw bytes are retained so any
-// future richer renderer (or a server-side schema addition)
-// does not break the existing format / overlay code. The
-// trigger field ("user" / "auto") tells the Update handler
-// whether to open the overlay (user /agents command) or just
-// refresh the snapshot in place (Phase 6 PR3 end-of-turn
-// auto-refresh, paired with fetchInbox auto-refresh).
-func fetchSessionAgents(cfg Config, sessionID string, trigger string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodGet,
-			"/v1/sessions/"+url.PathEscape(sessionID)+"/agents",
-			nil,
-		)
-		out := agentJobsMsg{sessionID: sessionID, raw: raw, trigger: trigger, err: err}
-		if err == nil {
-			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
-				out.err = fmt.Errorf("decode agent jobs: %w", decodeErr)
-			}
-		}
-		return out
-	}
-}
-
-// fetchSessionTasks issues GET /v1/sessions/:sessionId/tasks and
-// decodes the stable top-level envelope
-// (type / sessionId / tasks). The raw bytes are retained so any
-// future richer renderer (or a server-side schema addition)
-// does not break the existing format / overlay code. The
-// trigger field ("user" / "auto") tells the Update handler
-// whether to open the overlay (user /tasks command) or just
-// refresh the snapshot in place (Phase 6 PR4 end-of-turn
-// auto-refresh, paired with fetchInbox + fetchSessionAgents).
-func fetchSessionTasks(cfg Config, sessionID string, trigger string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodGet,
-			"/v1/sessions/"+url.PathEscape(sessionID)+"/tasks",
-			nil,
-		)
-		out := tasksListMsg{sessionID: sessionID, raw: raw, trigger: trigger, err: err}
-		if err == nil {
-			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
-				out.err = fmt.Errorf("decode tasks: %w", decodeErr)
-			}
-		}
-		return out
-	}
-}
-
-// checkRuntimeVersion issues GET /v1/runtime/version and
-// decodes the stable top-level envelope
-// (type / serverVersion / schemaVersion /
-// goTuiCompatibility / nodeCliCompatibility). The raw bytes
-// are retained so any future richer renderer (or a
-// server-side schema addition) does not break the existing
-// format / compat check. Called once at startup from
-// Init() as a non-blocking version-compat sanity check.
-func checkRuntimeVersion(cfg Config) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodGet,
-			"/v1/runtime/version",
-			nil,
-		)
-		out := runtimeVersionMsg{raw: raw, err: err}
-		if err == nil {
-			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
-				out.err = fmt.Errorf("decode runtime version: %w", decodeErr)
-			}
-		}
-		return out
-	}
-}
-
-// fetchToolAudit issues GET /v1/tools/audit and decodes the
-// stable top-level envelope (type / tools). The raw bytes are
-// retained so any future richer renderer (or a server-side
-// schema addition) does not break the existing format /
-// overlay code. The trigger field ("user" / "auto") tells the
-// Update handler whether to open the overlay (user /tools
-// command) or just refresh the snapshot in place (a future
-// end-of-turn auto-refresh).
-//
-// /v1/tools/audit is a GLOBAL endpoint — it does NOT take a
-// session id, so the command is parameter-free on that
-// dimension. The Go TUI does not auto-refresh it on result
-// events (the audit is a snapshot of the runtime tool
-// registry, not a per-session view); a future PR can wire
-// an "auto" trigger if the runtime ever signals a registry
-// change via the stream.
-func fetchToolAudit(cfg Config, trigger string) tea.Cmd {
-	return func() tea.Msg {
-		raw, err := nexusRawJSON(
-			cfg,
-			http.MethodGet,
-			"/v1/tools/audit",
-			nil,
-		)
-		out := toolAuditMsg{raw: raw, trigger: trigger, err: err}
-		if err == nil {
-			if decodeErr := json.Unmarshal(raw, &out.envelope); decodeErr != nil {
-				out.err = fmt.Errorf("decode tool audit: %w", decodeErr)
-			}
-		}
-		return out
-	}
-}
-
-func nexusJSON(cfg Config, method string, path string, body any, out any, query ...url.Values) error {
-	endpoint, err := apiURL(cfg.BaseURL, path)
-	if err != nil {
-		return err
-	}
-	if len(query) > 0 && len(query[0]) > 0 {
-		endpoint = endpoint + "?" + query[0].Encode()
-	}
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequest(method, endpoint, reader)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if cfg.APIKey != "" {
-		req.Header.Set("X-Nexus-API-Key", cfg.APIKey)
-	}
-	client := http.Client{Timeout: 10 * time.Second}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	// 304 Not Modified means the server's configVersion has not moved
-	// past `since`. Surface a sentinel so the caller can no-op without
-	// treating it as an error.
-	if res.StatusCode == http.StatusNotModified {
-		return errNotModified
-	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return fmt.Errorf("%s %s failed: %s %s", method, path, res.Status, summarizeHTTPError(data))
-	}
-	if out == nil {
-		return nil
-	}
-	if err := json.Unmarshal(data, out); err != nil {
-		return fmt.Errorf("decode %s: %w", path, err)
-	}
-	return nil
-}
-
-// nexusRawJSON is the raw-bytes sibling of nexusJSON: same request
-// shape and error semantics, but the response body is returned
-// untouched so the caller can lazily decode only the fields it
-// needs (and ignore schema churn on the rest of the payload).
-func nexusRawJSON(cfg Config, method string, path string, body any, query ...url.Values) ([]byte, error) {
-	endpoint, err := apiURL(cfg.BaseURL, path)
-	if err != nil {
-		return nil, err
-	}
-	if len(query) > 0 && len(query[0]) > 0 {
-		endpoint = endpoint + "?" + query[0].Encode()
-	}
-	var reader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reader = bytes.NewReader(data)
-	}
-	req, err := http.NewRequest(method, endpoint, reader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	if cfg.APIKey != "" {
-		req.Header.Set("X-Nexus-API-Key", cfg.APIKey)
-	}
-	client := http.Client{Timeout: 10 * time.Second}
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return nil, fmt.Errorf("%s %s failed: %s %s", method, path, res.Status, summarizeHTTPError(data))
-	}
-	return data, nil
-}
-
-// errNotModified is returned by nexusJSON when the server replies
-// 304 Not Modified; callers compare with errors.Is.
-var errNotModified = fmt.Errorf("config not modified")
-
-func apiURL(base string, path string) (string, error) {
-	parsed, err := url.Parse(base)
-	if err != nil {
-		return "", err
-	}
-	switch parsed.Scheme {
-	case "http", "https":
-	case "ws":
-		parsed.Scheme = "http"
-	case "wss":
-		parsed.Scheme = "https"
-	default:
-		return "", fmt.Errorf("unsupported Nexus URL scheme %q", parsed.Scheme)
-	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/" + strings.TrimLeft(path, "/")
-	parsed.RawQuery = ""
-	return parsed.String(), nil
-}
-
-func summarizeHTTPError(data []byte) string {
-	if len(data) == 0 {
-		return ""
-	}
-	var payload map[string]any
-	if err := json.Unmarshal(data, &payload); err != nil {
-		return truncatePlain(singleLine(string(data)), 200)
-	}
-	code := stringField(payload, "error")
-	if hint, ok := friendlyNexusError(code, payload); ok {
-		return hint
-	}
-	return truncatePlain(singleLine(firstNonEmpty(stringField(payload, "message"), code, compactJSON(payload))), 200)
-}
-
-// friendlyNexusError maps known §5 path C error codes to human
-// hints. Returns ok=false when the code is not in the friendly set.
-func friendlyNexusError(code string, payload map[string]any) (string, bool) {
-	switch code {
-	case "tombstoned_profile":
-		profile := stringField(payload, "profile")
-		return fmt.Sprintf("profile %q is tombstoned; restore via `bbl config profile restore %s`", profile, profile), true
-	case "unknown_profile":
-		profile := stringField(payload, "profile")
-		return fmt.Sprintf("unknown profile %q", profile), true
-	case "not_supported":
-		return "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI", true
-	case "missing_profile":
-		return "missing profile name in request body", true
-	case "REQUEST_TIMEOUT":
-		timeout := anyInt(payload["timeoutMs"])
-		if timeout > 0 {
-			return fmt.Sprintf("turn exceeded %dms execute timeout (REQUEST_TIMEOUT); consider shorter context, fewer tool calls, or a higher --execute-timeout-ms", timeout), true
-		}
-		return "turn exceeded Nexus execute timeout (REQUEST_TIMEOUT); consider shorter context, fewer tool calls, or a higher --execute-timeout-ms", true
-	case "REQUEST_CANCELLED":
-		return "turn was cancelled (REQUEST_CANCELLED); no retry needed", true
-	}
-	return "", false
-}
-
-func formatRuntimeConfig(config runtimeConfig) string {
-	auth := "auth=missing"
-	if config.HasAPIKey {
-		auth = "auth=configured(" + firstNonEmpty(config.APIKeySource, "unknown") + ")"
-	}
-	profile := firstNonEmpty(config.ActiveProfile, "none")
-	prefix := "config"
-	if config.Version > 0 {
-		prefix = fmt.Sprintf("config v=%d", config.Version)
-	}
-	return fmt.Sprintf(
-		"%s model=%s provider=%s profile=%s %s context=%d",
-		prefix,
-		firstNonEmpty(config.ModelID, "unknown"),
-		firstNonEmpty(config.ProviderID, "unknown"),
-		profile,
-		auth,
-		config.ContextWindow,
-	)
-}
-
-func formatRuntimeProfiles(response runtimeProfilesResponse) string {
-	prefix := "profiles"
-	if response.Version > 0 {
-		prefix = fmt.Sprintf("profiles v=%d", response.Version)
-	}
-	lines := []string{}
-	if len(response.Profiles) == 0 {
-		lines = append(lines, prefix+": none")
-	} else {
-		parts := make([]string, 0, len(response.Profiles))
-		for _, profile := range response.Profiles {
-			name := profile.Name
-			if profile.Active {
-				name = "*" + name
-			}
-			model := firstNonEmpty(profile.Model, "default")
-			parts = append(parts, fmt.Sprintf("%s=%s", name, model))
-		}
-		lines = append(lines, prefix+": "+strings.Join(parts, ", "))
-	}
-	if len(response.Tombstones) > 0 {
-		lines = append(lines, fmt.Sprintf("tombstones (%d):", len(response.Tombstones)))
-		// Stable ordering by name for human-friendly output.
-		names := make([]string, 0, len(response.Tombstones))
-		for name := range response.Tombstones {
-			names = append(names, name)
-		}
-		sort.Strings(names)
-		for _, name := range names {
-			t := response.Tombstones[name]
-			lines = append(lines, fmt.Sprintf("  %s [tombstoned] deletedAt=%s", name, firstNonEmpty(t.DeletedAt, "?")))
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-// contextAnalysisDiagnostic mirrors the stable top-level envelope
-// from analyzeContext. The Go TUI only renders these fields — the
-// rest of the payload is opaque by design.
-type contextAnalysisDiagnostic struct {
-	Name            string          `json:"name"`
-	Status          string          `json:"status"`
-	Summary         string          `json:"summary"`
-	Signals         []contextSignal `json:"signals"`
-	Recommendations []string        `json:"recommendations"`
-}
-
-type contextSignal struct {
-	Level   string `json:"level"`
-	Code    string `json:"code"`
-	Message string `json:"message"`
-}
-
-// formatContextAnalysis turns the raw /v1/sessions/:id/context
-// payload into a compact transcript block. The Go TUI keeps this
-// small by design: full diagnostics are 200+ lines on a busy
-// session, so we surface the summary + status + top 3 signals +
-// top 3 recommendations and leave the rest to a future richer
-// renderer (e.g. a contextOverlay).
-func formatContextAnalysis(raw []byte) string {
-	var top struct {
-		Type          string                    `json:"type"`
-		SessionID     string                    `json:"sessionId"`
-		ModelID       string                    `json:"modelId"`
-		Diagnostic    contextAnalysisDiagnostic `json:"diagnostic"`
-		CompactHasBnd bool                      `json:"-"` // see below
-	}
-	// We decode the compact.hasBoundary separately because it lives
-	// under payload.compact.hasBoundary, not at the top level.
-	var compactBlock struct {
-		Compact struct {
-			HasBoundary bool `json:"hasBoundary"`
-		} `json:"compact"`
-	}
-	if err := json.Unmarshal(raw, &top); err != nil {
-		return fmt.Sprintf("context: decode failed: %v", err)
-	}
-	if err := json.Unmarshal(raw, &compactBlock); err != nil {
-		return fmt.Sprintf("context: decode failed: %v", err)
-	}
-	lines := []string{}
-	headerLabel := "context_analysis"
-	if model := strings.TrimSpace(top.ModelID); model != "" {
-		headerLabel = fmt.Sprintf("context_analysis model=%s", model)
-	}
-	lines = append(lines, headerLabel)
-	if s := strings.TrimSpace(top.Diagnostic.Summary); s != "" {
-		lines = append(lines, "  "+s)
-	}
-	if status := strings.TrimSpace(top.Diagnostic.Status); status != "" {
-		lines = append(lines, fmt.Sprintf("  status: %s", status))
-	}
-	if compactBlock.Compact.HasBoundary {
-		lines = append(lines, "  compact: boundary present (post-compact state retained)")
-	}
-	if signals := top.Diagnostic.Signals; len(signals) > 0 {
-		lines = append(lines, "  signals:")
-		limit := len(signals)
-		if limit > 3 {
-			limit = 3
-		}
-		for _, sig := range signals[:limit] {
-			level := strings.TrimSpace(sig.Level)
-			if level == "" {
-				level = "info"
-			}
-			lines = append(lines, fmt.Sprintf("    [%s] %s %s",
-				level, strings.TrimSpace(sig.Code), strings.TrimSpace(sig.Message)))
-		}
-		if len(signals) > 3 {
-			lines = append(lines, fmt.Sprintf("    ... +%d more", len(signals)-3))
-		}
-	}
-	if recs := top.Diagnostic.Recommendations; len(recs) > 0 {
-		lines = append(lines, "  recommendations:")
-		limit := len(recs)
-		if limit > 3 {
-			limit = 3
-		}
-		for _, rec := range recs[:limit] {
-			lines = append(lines, "    - "+strings.TrimSpace(rec))
-		}
-		if len(recs) > 3 {
-			lines = append(lines, fmt.Sprintf("    ... +%d more", len(recs)-3))
-		}
-	}
-	return strings.Join(lines, "\n")
-}
-
-// formatCompactResult turns the raw /v1/sessions/:id/compact
-// payload into a compact post-compact summary. The Go TUI keeps
-// this short — the full retained segment / snipped tool results
-// breakdown lives in the response payload and the chat TUI's
-// contextView; we surface the most actionable numbers plus the
-// boundary event metadata so the user can verify the compact
-// actually fired.
-func formatCompactResult(raw []byte) string {
-	var payload struct {
-		Type             string `json:"type"`
-		BeforeEventCount int    `json:"beforeEventCount"`
-		AfterEventCount  int    `json:"afterEventCount"`
-		Event            struct {
-			Type               string `json:"type"`
-			Code               string `json:"code"`
-			Trigger            string `json:"trigger"`
-			Summary            string `json:"summary"`
-			SummaryChars       int    `json:"summaryChars"`
-			SnippedToolResults int    `json:"snippedToolResults"`
-			RetainedEvents     []struct {
-				Type string `json:"type"`
-			} `json:"retainedEvents"`
-			RetainedSegment struct {
-				Status             string `json:"status"`
-				RetainedEventCount int    `json:"retainedEventCount"`
-				Warning            string `json:"warning"`
-			} `json:"retainedSegment"`
-			Budget struct {
-				LayerBudgets struct {
-					System  int `json:"system"`
-					Summary int `json:"summary"`
-					History int `json:"history"`
-					Memory  int `json:"memory"`
-				} `json:"layerBudgets"`
-			} `json:"budget"`
-		} `json:"event"`
-	}
-	if err := json.Unmarshal(raw, &payload); err != nil {
-		return fmt.Sprintf("compact: decode failed: %v", err)
-	}
-	lines := []string{
-		fmt.Sprintf("compact_result events: %d → %d", payload.BeforeEventCount, payload.AfterEventCount),
-	}
-	evt := payload.Event
-	if evt.Type != "" {
-		codePart := ""
-		if evt.Code != "" {
-			codePart = " " + evt.Code
-		}
-		triggerPart := ""
-		if evt.Trigger != "" {
-			triggerPart = " trigger=" + evt.Trigger
-		}
-		lines = append(lines, "  boundary: "+evt.Type+codePart+triggerPart)
-	}
-	if summary := strings.TrimSpace(firstLine(evt.Summary, 160)); summary != "" {
-		lines = append(lines, "  summary: "+summary)
-	}
-	if evt.SummaryChars > 0 {
-		lines = append(lines, fmt.Sprintf("  summaryChars: %d", evt.SummaryChars))
-	}
-	if evt.SnippedToolResults > 0 {
-		lines = append(lines, fmt.Sprintf("  snippedToolResults: %d", evt.SnippedToolResults))
-	}
-	if lb := evt.Budget.LayerBudgets; lb.System+lb.Summary+lb.History+lb.Memory > 0 {
-		lines = append(lines, fmt.Sprintf("  budget layers: system=%d summary=%d history=%d memory=%d",
-			lb.System, lb.Summary, lb.History, lb.Memory))
-	}
-	if seg := evt.RetainedSegment; seg.Status != "" || seg.RetainedEventCount > 0 {
-		warning := ""
-		if w := strings.TrimSpace(seg.Warning); w != "" {
-			warning = " · " + w
-		}
-		lines = append(lines, fmt.Sprintf("  retained segment: %s · events=%d%s",
-			ternary(seg.Status == "", "n/a", seg.Status),
-			seg.RetainedEventCount, warning))
-	}
-	return strings.Join(lines, "\n")
-}
-
-// firstLine trims a string to its first \n and bounds the length
-// to maxLen (with a trailing ellipsis when truncated). Used by
-// formatCompactResult to keep the summary preview to a single
-// transcript line.
-func firstLine(s string, maxLen int) string {
-	if idx := strings.IndexAny(s, "\r\n"); idx >= 0 {
-		s = s[:idx]
-	}
-	if maxLen > 0 && len(s) > maxLen {
-		return s[:maxLen] + "…"
-	}
-	return s
-}
-
-const (
-	DefaultGoTuiExecuteTimeoutMs     = 180_000
-	longContextGoTuiExecuteTimeoutMs = 300_000
-	longContextTokenThreshold        = 100_000
-)
-
-func resolveGoTuiTimeout(cfg Config, prompt string, usage *usageSnapshot) timeoutDecision {
-	base := cfg.ExecuteTimeoutMs
-	if base <= 0 {
-		base = DefaultGoTuiExecuteTimeoutMs
-	}
-	decision := timeoutDecision{TimeoutMs: base}
-	if base != DefaultGoTuiExecuteTimeoutMs {
-		return decision
-	}
-	if usage != nil && usage.InputTokens > longContextTokenThreshold {
-		return timeoutDecision{TimeoutMs: longContextGoTuiExecuteTimeoutMs, Reason: "long-context", Adaptive: true}
-	}
-	if looksLikeLongContextPrompt(prompt) {
-		return timeoutDecision{TimeoutMs: longContextGoTuiExecuteTimeoutMs, Reason: "long-context", Adaptive: true}
-	}
-	return decision
-}
-
-func looksLikeLongContextPrompt(prompt string) bool {
-	lower := strings.ToLower(prompt)
-	markers := []string{
-		"long-context",
-		"large context",
-		"100k",
-		"大上下文",
-		"长上下文",
-		"深度分析",
-		"全面分析",
-		"完整分析",
-	}
-	for _, marker := range markers {
-		if strings.Contains(lower, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-// buildExecuteRequest assembles the WebSocket payload sent to /v1/stream.
-// timeoutMs is only emitted when positive so the Nexus default 30s budget
-// remains the fallback for callers that explicitly opt out (cfg.ExecuteTimeoutMs = 0).
-// policy defaults to 'soft-deny' so Go TUI users can run write/execute
-// Bash subcommands (git commit, npm install, etc.) via the existing
-// permission panel; Phase B of
-// docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
-func buildExecuteRequest(cfg Config, sessionID, prompt string) map[string]any {
-	return buildExecuteRequestWithTimeout(cfg, sessionID, prompt, resolveGoTuiTimeout(cfg, prompt, nil))
-}
-
-func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeout timeoutDecision) map[string]any {
-	payload := map[string]any{
-		"prompt":    prompt,
-		"cwd":       cfg.Cwd,
-		"sessionId": sessionID,
-	}
-	if timeout.TimeoutMs > 0 {
-		payload["timeoutMs"] = timeout.TimeoutMs
-	}
-	policy := cfg.PolicyMode
-	if policy == "" {
-		policy = "soft-deny"
-	}
-	payload["policy"] = policy
-	// Phase D: emit per-turn `allowedTools` override when configured.
-	// Empty / unset: per-turn override off; the server-side startup
-	// policy applies. Scoped to this turn only; the next turn
-	// re-evaluates from the body. Each entry is comma-split (so
-	// programmatic Config.AllowTools can carry comma-laden values
-	// the same way the --allow-tools CLI flag does) and trimmed.
-	if len(cfg.AllowTools) > 0 {
-		allow := make([]any, 0, len(cfg.AllowTools))
-		for _, raw := range cfg.AllowTools {
-			for _, part := range strings.Split(raw, ",") {
-				if trimmed := strings.TrimSpace(part); trimmed != "" {
-					allow = append(allow, trimmed)
-				}
-			}
-		}
-		if len(allow) > 0 {
-			payload["allowedTools"] = allow
-		}
-	}
-	return payload
-}
-
-func runStream(cfg Config, prompt string, timeout timeoutDecision, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
-	defer close(eventCh)
-
-	// Phase 1 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
-	// When the operator hasn't pinned a session id via the `--session` flag,
-	// allocate one server-side via `POST /v1/sessions` so the WebSocket
-	// payload, pending permission matching, and event-card rendering all
-	// share a single canonical `session_<uuid>` id (instead of the local
-	// `session_go_<unixnano>` placeholder). The locally-generated id is
-	// preserved as `clientSessionId` metadata so the same id can be
-	// reverse-resolved from the client log later.
-	clientSessionID := ""
-	sessionID := cfg.SessionID
-	if sessionID == "" {
-		allocated, err := allocateServerSession(cfg, prompt)
-		if err != nil {
-			eventCh <- streamEvent{err: fmt.Errorf("allocate server session: %w", err)}
-			return
-		}
-		sessionID = allocated
-		clientSessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
-		// Best-effort: write the client↔server mapping to the client
-		// log so a future `bbl inspect-session session_go_...` can
-		// reverse-resolve the server uuid. Failure is non-fatal — the
-		// session still runs; only the reverse lookup is lost.
-		appendClientSessionLog(cfg, clientSessionID, sessionID)
-	}
-
-	wsURL, err := streamURL(cfg.BaseURL)
-	if err != nil {
-		eventCh <- streamEvent{err: err}
-		return
-	}
-
-	headers := http.Header{}
-	if cfg.APIKey != "" {
-		headers.Set("X-Nexus-API-Key", cfg.APIKey)
-	}
-
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, headers)
-	if err != nil {
-		eventCh <- streamEvent{err: err}
-		return
-	}
-	defer conn.Close()
-
-	var writeMu sync.Mutex
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		for {
-			select {
-			case decision, ok := <-decisions:
-				if !ok {
-					return
-				}
-				// Phase A.1: include scope/rule/feedback in the
-				// permission_response payload so the runtime can
-				// (a) accumulate session-scope rules into the
-				// per-session map, and (b) surface the user's
-				// "tell the model what to do instead" text in
-				// the next turn.
-				payload := map[string]any{
-					"type":      "permission_response",
-					"sessionId": decision.sessionID,
-					"toolUseId": decision.toolUseID,
-					"approved":  decision.approved,
-					"reason":    decision.reason,
-				}
-				if decision.scope != "" {
-					payload["scope"] = decision.scope
-				}
-				if decision.rule != "" {
-					payload["rule"] = decision.rule
-				}
-				if decision.feedback != "" {
-					payload["feedback"] = decision.feedback
-				}
-				writeMu.Lock()
-				_ = conn.WriteJSON(payload)
-				writeMu.Unlock()
-			case <-done:
-				return
-			}
-		}
-	}()
-
-	if cfg.SessionID != "" {
-		sessionID = cfg.SessionID
-	}
-	_ = clientSessionID // reserved for future use (e.g. local transcript)
-
-	writeMu.Lock()
-	err = conn.WriteJSON(buildExecuteRequestWithTimeout(cfg, sessionID, prompt, timeout))
-	writeMu.Unlock()
-	if err != nil {
-		eventCh <- streamEvent{err: err}
-		return
-	}
-
-	for {
-		_, data, err := conn.ReadMessage()
-		if err != nil {
-			eventCh <- streamEvent{err: err}
-			return
-		}
-		var payload map[string]any
-		if err := json.Unmarshal(data, &payload); err != nil {
-			eventCh <- streamEvent{err: fmt.Errorf("decode Nexus event: %w", err)}
-			continue
-		}
-		eventCh <- streamEvent{payload: payload}
-		eventType := stringField(payload, "type")
-		if eventType == "result" || eventType == "error" {
-			return
-		}
-	}
-}
-
-// allocateServerSession is the Phase 1 server-side session-id allocator.
-// It calls `POST /v1/sessions` (with `clientSessionId` metadata when
-// available) and returns the server-allocated `session_<uuid>`. If the
-// call fails, the caller should surface the error to the operator
-// rather than fall back to a local id — the WebSocket payload would
-// then carry a session id that the server doesn't have a row for,
-// which is the exact `session_go_1781146359507755000` failure mode
-// the governance plan is trying to prevent.
-func allocateServerSession(cfg Config, prompt string) (string, error) {
-	type sessionCreatedResponse struct {
-		Type            string `json:"type"`
-		SessionID       string `json:"sessionId"`
-		ClientSessionID string `json:"clientSessionId"`
-		CreatedAt       string `json:"createdAt"`
-	}
-	// We don't have a client-side session id yet at this point; the
-	// call site generates it as `session_go_<unixnano>` and passes it
-	// back via a follow-up log line. We still want the server to know
-	// we have a stable Go TUI client, so we send a minimal marker.
-	body := map[string]any{
-		"cwd": cfg.Cwd,
-		"metadata": map[string]any{
-			"client": "go-tui",
-			"phase":  "session_allocate",
-		},
-	}
-	var resp sessionCreatedResponse
-	if err := nexusJSON(cfg, http.MethodPost, "/v1/sessions", body, &resp); err != nil {
-		return "", err
-	}
-	if resp.SessionID == "" {
-		return "", fmt.Errorf("server returned empty sessionId for POST /v1/sessions")
-	}
-	return resp.SessionID, nil
-}
-
-// appendClientSessionLog writes the client↔server session id mapping
-// to `~/.babel-o/log/go-tui-session.log`. Best-effort: failure to
-// write is non-fatal. The Phase 0 `bbl inspect-session` CLI uses
-// this log to reverse-resolve `session_go_<unixnano>` ids to the
-// server-allocated uuid.
-//
-// Line format (tab-separated, line-prefixed timestamp):
-//
-//	[YYYY-MM-DDTHH:MM:SS+ZZ:ZZ]\tclientSessionId=session_go_xxx\tserverSessionId=session_<uuid>
-func appendClientSessionLog(cfg Config, clientSessionID, serverSessionID string) {
-	// Honour BABEL_O_CONFIG_DIR override (mirrors `inspectSession.ts`
-	// Phase 0 logic) so tests can redirect the log path.
-	configDir := resolveClientConfigDir()
-	logDir := filepath.Join(configDir, "log")
-	logPath := filepath.Join(logDir, "go-tui-session.log")
-	line := fmt.Sprintf(
-		"%s\tclientSessionId=%s\tserverSessionId=%s\n",
-		time.Now().Format(time.RFC3339),
-		clientSessionID,
-		serverSessionID,
-	)
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return
-	}
-	// Append (O_APPEND|O_CREATE|O_WRONLY).
-	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return
-	}
-	defer f.Close()
-	_, _ = f.WriteString(line)
-}
-
-// resolveClientConfigDir mirrors the Phase 0 `resolveConfigDir` helper
-// in `src/cli/commands/inspectSession.ts`: honour `BABEL_O_CONFIG_DIR`
-// / `BABEL_O_CONFIG_FILE` overrides so tests can redirect. We can't
-// import the TS helper, so we re-implement the resolution here —
-// same three-tier precedence.
-func resolveClientConfigDir() string {
-	if dir := os.Getenv("BABEL_O_CONFIG_DIR"); dir != "" {
-		return dir
-	}
-	if file := os.Getenv("BABEL_O_CONFIG_FILE"); file != "" {
-		return filepath.Dir(file)
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		return ".babel-o"
-	}
-	return filepath.Join(home, ".babel-o")
-}
-
-func streamURL(base string) (string, error) {
-	parsed, err := url.Parse(base)
-	if err != nil {
-		return "", err
-	}
-	switch parsed.Scheme {
-	case "http":
-		parsed.Scheme = "ws"
-	case "https":
-		parsed.Scheme = "wss"
-	case "ws", "wss":
-	default:
-		return "", fmt.Errorf("unsupported Nexus URL scheme %q", parsed.Scheme)
-	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + "/v1/stream"
-	parsed.RawQuery = ""
-	return parsed.String(), nil
-}
-
-func stringField(value map[string]any, key string) string {
-	raw, ok := value[key]
-	if !ok || raw == nil {
-		return ""
-	}
-	switch typed := raw.(type) {
-	case string:
-		return typed
-	default:
-		return fmt.Sprint(typed)
-	}
-}
-
-func compactJSON(value any) string {
-	if value == nil {
-		return ""
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return fmt.Sprint(value)
-	}
-	text := string(data)
-	if len(text) > 160 {
-		return text[:157] + "..."
-	}
-	return text
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
-}
-
-func shortID(id string) string {
-	if len(id) <= 16 {
-		return id
-	}
-	return id[:8] + "..." + id[len(id)-6:]
-}
-
-func divider(width int) string {
-	return dividerStyle.Render(strings.Repeat("-", max(0, width)))
-}
-
-// renderOverlayFrame wraps a single block of overlay text in the
-// shared overlayFrameStyle border. The inner content is sized to
-// width-2 so it fits inside the left/right border columns; lines
-// are joined with "\n" so callers can keep returning a string.
-func renderOverlayFrame(width int, content string) string {
-	return overlayFrameStyle.Width(max(0, width-2)).Render(content)
-}
-
-// stateStyle returns the colour for the current run state. Idle
-// uses mutedStyle so the header chrome is quiet when nothing is
-// happening; running switches to statusStyle (cyan) to mirror the
-// spinner colour; a pending permission switches to permissionStyle
-// (yellow) so the operator sees the decision is on them.
-// formatUsageFooter renders a one-line token usage summary used
-// as a transient footer status while a turn is in flight. The
-// snapshot is cleared on result / error, so the line disappears
-// when the turn ends — that's how the operator knows the turn
-// completed without us re-emitting a "done" transcript row.
-func formatUsageFooter(u *usageSnapshot) string {
-	if u == nil {
-		return ""
-	}
-	parts := []string{}
-	if u.InputTokens > 0 {
-		parts = append(parts, fmt.Sprintf("in=%d", u.InputTokens))
-	}
-	if u.OutputTokens > 0 {
-		parts = append(parts, fmt.Sprintf("out=%d", u.OutputTokens))
-	}
-	if u.CacheRead > 0 {
-		parts = append(parts, fmt.Sprintf("cache=%d", u.CacheRead))
-	}
-	if len(parts) == 0 {
-		return "tokens: 0"
-	}
-	return "tokens " + strings.Join(parts, " ")
-}
-
-func stateStyle(running bool, pending *pendingPermission) lipgloss.Style {
-	switch {
-	case pending != nil:
-		return permissionStyle
-	case running:
-		return statusStyle
-	default:
-		return mutedStyle
-	}
-}
-
-func joinColumns(width int, left string, right string) string {
-	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		return truncateVisible(left+" "+right, width)
-	}
-	return left + strings.Repeat(" ", gap) + right
-}
-
-// renderInlineMarkdown applies a small set of inline markdown
-// spans on top of the base style. The walker recognises:
-//
-//	`code`           → inline code (muted chip with bg 238)
-//	**bold** / __bold__ → bold (lipgloss.Bold)
-//	*em* / _em_       → italic (lipgloss.Italic)
-//
-// Headers (`# …`) and code fences (```) are handled at the
-// block level in formatLine, not here. CJK is safe: the walker
-// only treats ASCII punctuation as markers, so Chinese /
-// kana / hangul content never collides with the span
-// delimiters.
-func renderInlineMarkdown(base lipgloss.Style, text string) string {
-	if text == "" {
-		return ""
-	}
-	var out strings.Builder
-	runes := []rune(text)
-	i := 0
-	for i < len(runes) {
-		r := runes[i]
-		// Inline code: `…` (single backtick). Skip empty
-		// matches and unterminated tails. The chip keeps the
-		// muted background highlight so the operator can still
-		// scan a transcript for `…` to count code spans, but
-		// the foreground moves to sky blue (75) — the same
-		// brand-aligned tool accent — so the path / identifier
-		// inside the chip is easier to read at a glance than
-		// the previous near-white (252) on the muted bg.
-		if r == '`' {
-			end := -1
-			for j := i + 1; j < len(runes); j++ {
-				if runes[j] == '`' {
-					end = j
-					break
-				}
-			}
-			if end > i+1 {
-				code := string(runes[i+1 : end])
-				chip := base.Foreground(lipgloss.Color("75")).Render(code)
-				out.WriteString(chip)
-				i = end + 1
-				continue
-			}
-		}
-		// Bold: **…** or __…__
-		if (r == '*' || r == '_') && i+1 < len(runes) && runes[i+1] == r {
-			end := -1
-			for j := i + 2; j+1 < len(runes); j++ {
-				if runes[j] == r && runes[j+1] == r {
-					end = j
-					break
-				}
-			}
-			if end > i+1 {
-				bold := base.Bold(true).Render(string(runes[i+2 : end]))
-				out.WriteString(bold)
-				i = end + 2
-				continue
-			}
-		}
-		// Italic: *…* or _…_ (single, not double).
-		if r == '*' || r == '_' {
-			end := -1
-			for j := i + 1; j < len(runes); j++ {
-				if runes[j] == r {
-					end = j
-					break
-				}
-			}
-			if end > i+1 {
-				italic := base.Italic(true).Render(string(runes[i+1 : end]))
-				out.WriteString(italic)
-				i = end + 1
-				continue
-			}
-		}
-		out.WriteRune(r)
-		i++
-	}
-	return out.String()
-}
-
-func wrapPlain(text string, width int) string {
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
-	// Collapse runs of newlines down to a single space so the
-	// model-written paragraph break (\n\n) renders as a soft
-	// separator instead of a full blank line. Without this
-	// collapse, a sentence like "package.\n\njson 内容" was
-	// displayed as "package. [blank] json 内容" — the operator
-	// read that as the text being truncated mid-word. Joining
-	// the paragraphs with a single space keeps the visible
-	// sentence flow continuous while preserving the model's
-	// intent that the two halves belong to the same reply.
-	text = collapseParagraphBreaks(text)
-	paragraphs := strings.Split(text, "\n")
-	out := make([]string, 0, len(paragraphs))
-	for _, paragraph := range paragraphs {
-		out = append(out, wrapParagraph(paragraph, width)...)
-	}
-	return strings.Join(out, "\n")
-}
-
-// collapseParagraphBreaks replaces any run of two-or-more
-// newlines with a single space. Single newlines are kept
-// intact so the model can still produce hard line breaks.
-func collapseParagraphBreaks(text string) string {
-	for {
-		collapsed := strings.ReplaceAll(text, "\n\n", "\n ")
-		if collapsed == text {
-			return text
-		}
-		text = collapsed
-	}
-}
-
-// visualWidth returns the on-screen column count of a single
-// rune. East Asian wide / fullwidth characters (CJK, kana,
-// hangul) count as 2; everything else counts as 1. Wraps
-// delegated through `wrapParagraph` use this so a Chinese
-// character doesn't get treated as half a column.
-func visualWidth(r rune) int {
-	if w := runewidth.RuneWidth(r); w > 0 {
-		return w
-	}
-	return 1
-}
-
-func canBreakAt(runes []rune, idx int) bool {
-	if idx <= 0 || idx >= len(runes) {
-		return true
-	}
-	rLeft := runes[idx-1]
-	rRight := runes[idx]
-	if isBreakRune(rLeft) || rLeft == '\n' || rLeft == '\r' {
-		return true
-	}
-	if isBreakRune(rRight) || rRight == '\n' || rRight == '\r' {
-		return true
-	}
-	if visualWidth(rLeft) == 2 || visualWidth(rRight) == 2 {
-		return true
-	}
-	return false
-}
-
-func wrapParagraph(text string, width int) []string {
-	if text == "" {
-		return []string{""}
-	}
-	runes := []rune(text)
-	lines := make([]string, 0, len(runes)/max(1, width)+1)
-	for visualLen(runes) > width {
-		cut := len(runes)
-		// Walk back until the prefix's visual width fits.
-		for cut > 0 && visualLen(runes[:cut]) > width {
-			cut--
-		}
-		// Try to break on a nearby whitespace / punctuation
-		// boundary for readability.
-		breakAt := cut
-		for breakAt > 0 && !canBreakAt(runes, breakAt) {
-			breakAt--
-		}
-		if breakAt > 0 {
-			cut = breakAt
-		}
-		if cut <= 0 {
-			cut = len(runes)
-		}
-		lines = append(lines, strings.TrimRight(string(runes[:cut]), " \t"))
-		runes = []rune(strings.TrimLeft(string(runes[cut:]), " \t"))
-	}
-	lines = append(lines, string(runes))
-	return lines
-}
-
-// visualLen returns the sum of the on-screen column widths of
-// every rune in `rs`. Used by wrapParagraph to decide where to
-// cut so a Chinese character doesn't get sliced in half visually.
-func visualLen(rs []rune) int {
-	total := 0
-	for _, r := range rs {
-		total += visualWidth(r)
-	}
-	return total
-}
-
-func truncateVisible(text string, width int) string {
-	if lipgloss.Width(text) <= width {
-		return text
-	}
-	return truncatePlain(text, width)
-}
-
-func truncatePlain(text string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(text)
-	if len(runes) <= width {
-		return text
-	}
-	if width <= 3 {
-		return string(runes[:width])
-	}
-	return string(runes[:width-3]) + "..."
-}
-
-func padRight(text string, width int) string {
-	if len(text) >= width {
-		return text[:width]
-	}
-	return text + strings.Repeat(" ", width-len(text))
-}
-
-func isBreakRune(value rune) bool {
-	return value == ' ' || value == '\t' || value == '/' || value == ',' || value == ';' || value == ':' || value == '-'
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func clamp(value, lo, hi int) int {
-	if value < lo {
-		return lo
-	}
-	if value > hi {
-		return hi
-	}
-	return value
-}
-
-func (m *model) expandPromptPlaceholders(prompt string) string {
-	expanded := prompt
-	if m.pastedTextReplacements == nil {
-		return expanded
-	}
-	for placeholder, rawText := range m.pastedTextReplacements {
-		expanded = strings.ReplaceAll(expanded, placeholder, rawText)
-	}
-	return expanded
-}
-
-func formatRuntimeModels(response runtimeModelsResponse) []string {
-	var lines []string
-	lines = append(lines, "models (capability matrix):")
-	for _, provider := range response.Providers {
-		configuredStr := "unconfigured"
-		if provider.Configured {
-			configuredStr = "configured"
-		}
-		activeStr := ""
-		if provider.Active {
-			activeStr = " (active)"
-		}
-		lines = append(lines, fmt.Sprintf("  provider %s (%s, %s)%s:", provider.ID, provider.DisplayName, configuredStr, activeStr))
-		for _, model := range provider.Models {
-			toolSupport := "✗ tool-call"
-			if model.Capabilities.ToolCalling {
-				toolSupport = "✓ tool-call"
-			}
-			jsonSupport := "✗ json"
-			if model.Capabilities.JSONOutput {
-				jsonSupport = "✓ json"
-			}
-			streamingSupport := "✗ stream"
-			if model.Capabilities.Streaming {
-				streamingSupport = "✓ stream"
-			}
-			paddedID := model.ID
-			if len(paddedID) < 30 {
-				paddedID = paddedID + strings.Repeat(" ", 30-len(paddedID))
-			}
-			line := fmt.Sprintf("    %s · context=%-7d · %s · %s · %s", paddedID, model.ContextWindow, toolSupport, jsonSupport, streamingSupport)
-			lines = append(lines, line)
-		}
-	}
-	return lines
 }

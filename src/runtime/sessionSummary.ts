@@ -98,9 +98,16 @@ export function summarizeSessionEvents(
       case 'usage':
       case 'task_created':
       case 'compact_boundary':
+      case 'context_compact_boundary':
       case 'compact_failure':
       case 'context_warning':
       case 'context_blocking':
+      case 'context_usage':
+      case 'context_microcompact':
+      case 'context_recovery_attempted':
+      case 'context_grounding_required':
+      case 'context_grounding_confirmed':
+      case 'workspace_dirty_detected':
       case 'session_memory_updated':
       case 'hook_started':
       case 'hook_completed':

@@ -424,6 +424,485 @@ func TestFormatNexusEvent(t *testing.T) {
 	}
 }
 
+// Phase 2 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+// the new `timeout_budget_exceeded` event must render in the Go TUI
+// transcript as a budget/status row that surfaces elapsed/budget
+// numbers, the suggested next-step actions, and the message so the
+// operator can see the model just got a recoverable signal — not a
+// fatal cutoff.
+func TestFormatNexusEventTimeoutBudgetExceeded(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":      "timeout_budget_exceeded",
+		"sessionId": "session_456",
+		"timeoutMs": 60_000,
+		"elapsedMs": 60_120,
+		"policy":    "soft",
+		"suggestedActions": []any{
+			"continue",
+			"summarize",
+			"narrow_scope",
+			"retry_last_tool",
+		},
+		"message": "Soft timeout budget exhausted; the workflow continues.",
+	})
+	if !strings.Contains(got, "soft timeout budget reached") {
+		t.Fatalf("formatNexusEvent() missing soft timeout banner: %q", got)
+	}
+	if !strings.Contains(got, "elapsed=60120ms/60000ms") {
+		t.Fatalf("formatNexusEvent() missing elapsed/budget split: %q", got)
+	}
+	if !strings.Contains(got, "policy=soft") {
+		t.Fatalf("formatNexusEvent() missing policy=soft: %q", got)
+	}
+	if !strings.Contains(got, "suggested=continue,summarize,narrow_scope,retry_last_tool") {
+		t.Fatalf("formatNexusEvent() missing suggested actions: %q", got)
+	}
+	if !strings.Contains(got, "Soft timeout budget exhausted") {
+		t.Fatalf("formatNexusEvent() missing event message: %q", got)
+	}
+}
+
+// Phase 3 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+// the new `timeout_extension_granted` event must render in the
+// transcript as a budget-extension row carrying the extension
+// count out of the max, the delta (additionalMs), the new running
+// soft budget, the reason, and the event message. This lets the
+// operator see at a glance that the runtime just bought the model
+// more time — not that a fatal cutoff was avoided silently.
+func TestFormatNexusEventTimeoutExtensionGranted(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":              "timeout_extension_granted",
+		"sessionId":         "session_789",
+		"extensionCount":    1,
+		"maxExtensions":     1,
+		"additionalMs":      60_000,
+		"totalSoftBudgetMs": 120_000,
+		"elapsedMs":         60_500,
+		"policy":            "soft",
+		"reason":            "auto-first-budget-exhausted",
+		"message":           "Soft timeout extended by 60000ms (extension 1/1; this is the last automatic extension).",
+	})
+	if !strings.Contains(got, "soft timeout extension granted +60000ms") {
+		t.Fatalf("formatNexusEvent() missing extension banner / delta: %q", got)
+	}
+	if !strings.Contains(got, "extension 1/1") {
+		t.Fatalf("formatNexusEvent() missing extension count/cap: %q", got)
+	}
+	if !strings.Contains(got, "total=120000ms") {
+		t.Fatalf("formatNexusEvent() missing new running budget: %q", got)
+	}
+	if !strings.Contains(got, "reason=auto-first-budget-exhausted") {
+		t.Fatalf("formatNexusEvent() missing reason: %q", got)
+	}
+	if !strings.Contains(got, "elapsed=60500ms") {
+		t.Fatalf("formatNexusEvent() missing elapsed: %q", got)
+	}
+	if !strings.Contains(got, "Soft timeout extended") {
+		t.Fatalf("formatNexusEvent() missing event message: %q", got)
+	}
+}
+
+// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+// formatSoftTimeoutFooter must render a single one-line indicator
+// driven purely by the soft-cycle snapshot. Empty snapshot →
+// empty string so the footer stays clean. A snapshot with a
+// budget but no extensions shows `budget=Xms`; one with
+// extensions also shows `ext=N/M`. Tests cover three core
+// flavours so the next regression catches a silently dropped
+// field.
+func TestFormatNexusEventContextUsage(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":          "context_usage",
+		"percentUsed":   36,
+		"tokenEstimate": 64000,
+		"maxTokens":     180000,
+	})
+	if !strings.Contains(got, "context usage 36%") {
+		t.Fatalf("formatNexusEvent(context_usage) = %q, want context usage percent", got)
+	}
+	if !strings.Contains(got, "tokens=64000/180000") {
+		t.Fatalf("formatNexusEvent(context_usage) = %q, want token estimate/max", got)
+	}
+}
+
+func TestFormatNexusEventContextMicrocompact(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":                        "context_microcompact",
+		"estimatedTokensSaved":        2000,
+		"compactedEventCount":         2,
+		"deduplicatedToolResultCount": 1,
+	})
+	if !strings.Contains(got, "context microcompact saved≈2000 tokens") {
+		t.Fatalf("formatNexusEvent(context_microcompact) = %q, want saved tokens", got)
+	}
+	if !strings.Contains(got, "events=2") || !strings.Contains(got, "dedup=1") {
+		t.Fatalf("formatNexusEvent(context_microcompact) = %q, want event/dedup counts", got)
+	}
+}
+
+func TestFormatNexusEventContextCompactBoundary(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":                 "context_compact_boundary",
+		"trigger":              "manual",
+		"beforeEventCount":     120,
+		"afterEventCount":      14,
+		"retainedEventCount":   13,
+		"preservedTailEventId": "event_tail",
+	})
+	if !strings.Contains(got, "context compact boundary trigger=manual") {
+		t.Fatalf("formatNexusEvent(context_compact_boundary) = %q, want trigger", got)
+	}
+	for _, want := range []string{"before=120", "after=14", "retained=13", "tail=event_tail"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(context_compact_boundary) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventContextRecoveryAttempted(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":        "context_recovery_attempted",
+		"attempt":     1,
+		"maxAttempts": 1,
+		"strategy":    "semantic_compact_retry",
+		"preTokens":   42000,
+		"postTokens":  7500,
+		"retryable":   true,
+	})
+	for _, want := range []string{"context recovery 1/1", "strategy=semantic_compact_retry", "tokens=42000->7500", "retryable=true"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(context_recovery_attempted) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventContextGroundingRequired(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":             "context_grounding_required",
+		"source":           "post_compact",
+		"state":            "summary-derived",
+		"suggestedActions": []any{"re_read_referenced_files", "inspect_changed_files"},
+	})
+	for _, want := range []string{"context grounding required", "source=post_compact", "state=summary-derived", "re_read_referenced_files,inspect_changed_files"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(context_grounding_required) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventContextGroundingConfirmed(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":             "context_grounding_confirmed",
+		"confirmationKind": "file_read",
+		"toolName":         "Read",
+		"confirmedFor":     []any{"file_facts", "implementation_status"},
+	})
+	for _, want := range []string{"context grounding confirmed", "kind=file_read", "tool=Read", "file_facts,implementation_status"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(context_grounding_confirmed) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventWorkspaceDirtyDetected(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":             "workspace_dirty_detected",
+		"source":           "post_compact",
+		"changedFileCount": 2,
+		"changedFiles":     []any{"src/runtime/LLMCodingRuntime.ts", "test/runtime.test.ts"},
+	})
+	for _, want := range []string{"workspace dirty", "source=post_compact", "changed=2", "src/runtime/LLMCodingRuntime.ts,test/runtime.test.ts"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(workspace_dirty_detected) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatContextUsageFooter(t *testing.T) {
+	if got := formatContextUsageFooter(nil); got != "" {
+		t.Fatalf("formatContextUsageFooter(nil) = %q, want empty", got)
+	}
+	got := formatContextUsageFooter(&contextUsageSnapshot{
+		PercentUsed:      36,
+		TokenEstimate:    64000,
+		MaxTokens:        180000,
+		WarningThreshold: 126000,
+		CompactThreshold: 162000,
+	})
+	if !strings.Contains(got, "ctx 36% 64000/180000") {
+		t.Fatalf("formatContextUsageFooter() = %q, want ctx usage", got)
+	}
+	if !strings.Contains(got, "warn=126000 compact=162000") {
+		t.Fatalf("formatContextUsageFooter() = %q, want thresholds", got)
+	}
+}
+
+func TestFormatSoftTimeoutFooterRendersBudgetAndExtensions(t *testing.T) {
+	if got := formatSoftTimeoutFooter(nil); got != "" {
+		t.Fatalf("formatSoftTimeoutFooter(nil) = %q, want empty", got)
+	}
+	// Snapshot with zero BudgetExceededAt means the cycle has
+	// never fired this turn; still expect empty footer.
+	if got := formatSoftTimeoutFooter(&softTimeoutSnapshot{OriginalBudgetMs: 60_000}); got != "" {
+		t.Fatalf("formatSoftTimeoutFooter() with no fire = %q, want empty", got)
+	}
+	// Budget only.
+	budgetOnly := formatSoftTimeoutFooter(&softTimeoutSnapshot{
+		BudgetExceededAt:  time.Now(),
+		OriginalBudgetMs:  60_000,
+		TotalSoftBudgetMs: 60_000,
+	})
+	if !strings.Contains(budgetOnly, "soft timeout budget=60000ms") {
+		t.Fatalf("budget-only footer = %q, want soft timeout budget=60000ms", budgetOnly)
+	}
+	if strings.Contains(budgetOnly, "ext=") {
+		t.Fatalf("budget-only footer = %q, must not show ext when MaxExtensions=0", budgetOnly)
+	}
+	// Budget + one of one extension.
+	full := formatSoftTimeoutFooter(&softTimeoutSnapshot{
+		BudgetExceededAt:  time.Now(),
+		OriginalBudgetMs:  60_000,
+		TotalSoftBudgetMs: 120_000,
+		ExtensionCount:    1,
+		MaxExtensions:     1,
+	})
+	if !strings.Contains(full, "budget=120000ms") {
+		t.Fatalf("post-extension footer = %q, must surface running budget", full)
+	}
+	if !strings.Contains(full, "ext=1/1") {
+		t.Fatalf("post-extension footer = %q, must surface extensions used / cap", full)
+	}
+}
+
+// Phase 4: friendlyNexusErrorWithContext must reshape
+// REQUEST_TIMEOUT when the soft cycle had already fired this turn
+// (= watchdog cutoff) instead of recommending the operator raise
+// --execute-timeout-ms. With a nil snapshot the legacy message is
+// preserved so HTTP API consumers and old `bbl chat` paths keep
+// the same wording.
+func TestFriendlyNexusErrorWithSoftContextDistinguishesWatchdog(t *testing.T) {
+	legacy, ok := friendlyNexusErrorWithContext("REQUEST_TIMEOUT", map[string]any{"timeoutMs": 180_000}, nil)
+	if !ok || !strings.Contains(legacy, "consider shorter context") {
+		t.Fatalf("legacy REQUEST_TIMEOUT = %q (ok=%v), want fixed-cutoff recommendation", legacy, ok)
+	}
+
+	watchdog, ok := friendlyNexusErrorWithContext("REQUEST_TIMEOUT", map[string]any{"timeoutMs": 180_000}, &softTimeoutSnapshot{
+		BudgetExceededAt:  time.Now(),
+		OriginalBudgetMs:  60_000,
+		TotalSoftBudgetMs: 120_000,
+		ExtensionCount:    1,
+		MaxExtensions:     1,
+	})
+	if !ok {
+		t.Fatalf("watchdog REQUEST_TIMEOUT must still return ok=true")
+	}
+	if !strings.Contains(watchdog, "watchdog") {
+		t.Fatalf("watchdog REQUEST_TIMEOUT = %q, must credit the watchdog", watchdog)
+	}
+	if strings.Contains(watchdog, "raising --execute-timeout-ms") == false &&
+		strings.Contains(watchdog, "raise --execute-timeout-ms") == false &&
+		strings.Contains(watchdog, "raising") == false {
+		// We do mention --execute-timeout-ms in the watchdog
+		// message but ONLY to discourage raising it. Make sure
+		// the discouragement wording is present.
+		t.Fatalf("watchdog REQUEST_TIMEOUT = %q, must discuss --execute-timeout-ms recommendation context", watchdog)
+	}
+	if strings.Contains(watchdog, "consider shorter context") {
+		t.Fatalf("watchdog REQUEST_TIMEOUT must NOT recommend the fixed-cutoff workaround, got %q", watchdog)
+	}
+	if !strings.Contains(watchdog, "ext=") && !strings.Contains(watchdog, "extensions used 1/1") {
+		t.Fatalf("watchdog REQUEST_TIMEOUT = %q, must surface extensions used out of cap", watchdog)
+	}
+}
+
+// Phase 5 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+// when the Nexus error envelope explicitly carries
+// `details.kind="watchdog"` (server-side decoration), the Go TUI
+// friendly message must use the watchdog flavour even if the
+// model never saw the soft cycle snapshot mid-turn. This covers
+// the corner case where the watchdog tripped right after the
+// final soft cycle, or where state was cleared between the
+// soft-cycle event and the error event.
+func TestFriendlyNexusErrorWithDetailsKindWatchdogTriggersWatchdogMessage(t *testing.T) {
+	payload := map[string]any{
+		"timeoutMs": 180_000,
+		"details": map[string]any{
+			"kind":                     "watchdog",
+			"policy":                   "soft",
+			"softTimeoutMs":            60_000,
+			"watchdogTimeoutMs":        180_000,
+			"maxSoftTimeoutExtensions": 1,
+			"softCycleEvents":          2,
+			"retryable":                false,
+		},
+	}
+	got, ok := friendlyNexusErrorWithContext("REQUEST_TIMEOUT", payload, nil)
+	if !ok {
+		t.Fatalf("friendlyNexusErrorWithContext must still return ok=true for watchdog REQUEST_TIMEOUT")
+	}
+	if !strings.Contains(got, "watchdog") {
+		t.Fatalf("watchdog-decorated REQUEST_TIMEOUT = %q, must credit the watchdog", got)
+	}
+	if !strings.Contains(got, "policy=soft") {
+		t.Fatalf("watchdog-decorated REQUEST_TIMEOUT = %q, must surface policy=soft from details", got)
+	}
+	if !strings.Contains(got, "soft budget cycled at 60000ms") {
+		t.Fatalf("watchdog-decorated REQUEST_TIMEOUT = %q, must surface details.softTimeoutMs as the cycled soft budget", got)
+	}
+	if !strings.Contains(got, "watchdog budget 180000ms") {
+		t.Fatalf("watchdog-decorated REQUEST_TIMEOUT = %q, must surface details.watchdogTimeoutMs", got)
+	}
+	if strings.Contains(got, "consider shorter context") {
+		t.Fatalf("watchdog-decorated REQUEST_TIMEOUT must NOT fall back to the fixed-cutoff workaround, got %q", got)
+	}
+}
+
+// Phase 4 lifecycle: consumeNexusEvent must update
+// softTimeoutState on the new events and clear it on
+// result/error. When an error event arrives mid-flight after the
+// soft cycle already fired, the appended transcript line should
+// be the watchdog flavour of friendlyNexusError.
+func TestConsumeNexusEventTracksSoftTimeoutLifecycle(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+
+	m.consumeNexusEvent(map[string]any{
+		"type":      "session_started",
+		"sessionId": "session_abcdef1234567890",
+		"model":     "local/test",
+	})
+	if m.softTimeoutState != nil {
+		t.Fatalf("softTimeoutState should be nil at session start, got %+v", m.softTimeoutState)
+	}
+	m.consumeNexusEvent(map[string]any{
+		"type":      "timeout_budget_exceeded",
+		"sessionId": "session_abcdef1234567890",
+		"timeoutMs": 60_000,
+		"elapsedMs": 60_120,
+		"policy":    "soft",
+	})
+	if m.softTimeoutState == nil {
+		t.Fatalf("timeout_budget_exceeded must populate softTimeoutState")
+	}
+	if m.softTimeoutState.OriginalBudgetMs != 60_000 || m.softTimeoutState.TotalSoftBudgetMs != 60_000 {
+		t.Fatalf("post-budget snapshot = %+v, want original=60000 total=60000", m.softTimeoutState)
+	}
+	if m.softTimeoutState.LastElapsedMs != 60_120 {
+		t.Fatalf("post-budget snapshot LastElapsedMs = %d, want 60120", m.softTimeoutState.LastElapsedMs)
+	}
+
+	m.consumeNexusEvent(map[string]any{
+		"type":              "timeout_extension_granted",
+		"sessionId":         "session_abcdef1234567890",
+		"extensionCount":    1,
+		"maxExtensions":     1,
+		"additionalMs":      60_000,
+		"totalSoftBudgetMs": 120_000,
+		"elapsedMs":         60_500,
+		"policy":            "soft",
+		"reason":            "auto-first-budget-exhausted",
+	})
+	if m.softTimeoutState == nil ||
+		m.softTimeoutState.ExtensionCount != 1 ||
+		m.softTimeoutState.MaxExtensions != 1 ||
+		m.softTimeoutState.TotalSoftBudgetMs != 120_000 {
+		t.Fatalf("post-extension snapshot = %+v, want ext=1/1 total=120000", m.softTimeoutState)
+	}
+
+	// Soft cycle is still live; if the hard watchdog now fires
+	// the friendly message must credit the watchdog.
+	m.consumeNexusEvent(map[string]any{
+		"type":      "error",
+		"sessionId": "session_abcdef1234567890",
+		"code":      "REQUEST_TIMEOUT",
+		"message":   "watchdog timeout",
+		"timeoutMs": 120_000,
+	})
+	if m.softTimeoutState != nil {
+		t.Fatalf("softTimeoutState must be cleared on error event, got %+v", m.softTimeoutState)
+	}
+	// The most recent transcript row should carry the
+	// watchdog-flavoured friendly message; scan from the back
+	// to skip any earlier rows from this turn.
+	var lastErrText string
+	for i := len(m.transcript) - 1; i >= 0; i-- {
+		if m.transcript[i].kind == "error" {
+			lastErrText = m.transcript[i].text
+			break
+		}
+	}
+	if lastErrText == "" {
+		t.Fatalf("expected an error row in the transcript")
+	}
+	if !strings.Contains(lastErrText, "watchdog") {
+		t.Fatalf("error row = %q, want watchdog-credit friendly message", lastErrText)
+	}
+	if strings.Contains(lastErrText, "consider shorter context") {
+		t.Fatalf("error row = %q, must NOT recommend fixed-cutoff workaround after a soft cycle", lastErrText)
+	}
+}
+
+// Phase 4: after a successful turn, softTimeoutState must be
+// cleared so the next turn starts with a fresh budget.
+func TestConsumeNexusEventClearsSoftTimeoutStateOnResult(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	m.consumeNexusEvent(map[string]any{
+		"type":      "timeout_budget_exceeded",
+		"sessionId": "session_clear",
+		"timeoutMs": 30_000,
+		"elapsedMs": 30_010,
+		"policy":    "soft",
+	})
+	if m.softTimeoutState == nil {
+		t.Fatalf("budget_exceeded must populate snapshot")
+	}
+	m.consumeNexusEvent(map[string]any{
+		"type":      "result",
+		"sessionId": "session_clear",
+		"success":   true,
+		"message":   "done",
+	})
+	if m.softTimeoutState != nil {
+		t.Fatalf("softTimeoutState must be cleared on result, got %+v", m.softTimeoutState)
+	}
+}
+
+func TestSoftTimeoutEventsDoNotAppendTranscriptNoise(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	before := len(m.transcript)
+
+	m.consumeNexusEvent(map[string]any{
+		"type":      "timeout_budget_exceeded",
+		"sessionId": "session_noise",
+		"timeoutMs": 180_000,
+		"elapsedMs": 180_003,
+		"policy":    "soft",
+		"message":   "Soft timeout budget exhausted; the workflow continues.",
+	})
+	m.consumeNexusEvent(map[string]any{
+		"type":              "timeout_extension_granted",
+		"sessionId":         "session_noise",
+		"extensionCount":    1,
+		"maxExtensions":     1,
+		"additionalMs":      180_000,
+		"totalSoftBudgetMs": 360_000,
+		"elapsedMs":         180_004,
+		"policy":            "soft",
+	})
+
+	if len(m.transcript) != before {
+		t.Fatalf("soft timeout events should not append transcript rows, got %d new rows", len(m.transcript)-before)
+	}
+	if m.softTimeoutState == nil || m.softTimeoutState.TotalSoftBudgetMs != 360_000 {
+		t.Fatalf("soft timeout state should still update, got %+v", m.softTimeoutState)
+	}
+}
+
 func TestFormatNexusEventSummarizesToolCompletedOutput(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
 		"type":    "tool_completed",
@@ -437,6 +916,21 @@ func TestFormatNexusEventSummarizesToolCompletedOutput(t *testing.T) {
 
 	if !strings.Contains(got, `stdout="go-tui-smoke"`) {
 		t.Fatalf("formatNexusEvent() = %q, want stdout summary", got)
+	}
+}
+
+func TestToolCompletedUpdatesRuntimeAnimationState(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.running = true
+	m.consumeNexusEvent(map[string]any{
+		"type":    "tool_completed",
+		"name":    "Bash",
+		"success": true,
+	})
+	label, kind := m.runtimeAnimationState()
+	if !strings.Contains(label, "tool activity") || kind != runtimeAnimationTool {
+		t.Fatalf("tool_completed runtime animation = (%q, %q), want tool activity/%q",
+			label, kind, runtimeAnimationTool)
 	}
 }
 
@@ -516,6 +1010,234 @@ func TestConsumeNexusEventUpdatesSessionAndPermissionPanel(t *testing.T) {
 	}
 }
 
+func TestStreamStartedPersistsAllocatedSessionForNextTurn(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	events := make(chan streamEvent)
+	decisions := make(chan permissionDecision)
+	updated, _ := m.Update(streamStartedMsg{
+		events:    events,
+		decisions: decisions,
+		sessionID: "session_allocated_once",
+	})
+	m = updated.(model)
+	if m.sessionID != "session_allocated_once" {
+		t.Fatalf("sessionID = %q, want allocated session", m.sessionID)
+	}
+	if m.cfg.SessionID != "session_allocated_once" {
+		t.Fatalf("cfg.SessionID = %q, want allocated session for the next submit", m.cfg.SessionID)
+	}
+}
+
+func TestSessionSlashCommandNewAndUseControlSessionSwitching(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_old"})
+	m.sessionID = "session_old"
+
+	cmd := findSlashCommand("/session")
+	if cmd == nil {
+		t.Fatalf("/session command should be registered")
+	}
+	cmd.run(&m, []string{"new"})
+	if m.sessionID != "" || m.cfg.SessionID != "" {
+		t.Fatalf("/session new should clear active session, got model=%q cfg=%q", m.sessionID, m.cfg.SessionID)
+	}
+
+	cmd.run(&m, []string{"use", "session_next"})
+	if m.sessionID != "session_next" || m.cfg.SessionID != "session_next" {
+		t.Fatalf("/session use should switch active session, got model=%q cfg=%q", m.sessionID, m.cfg.SessionID)
+	}
+
+	alias := findSlashCommand("/sessions")
+	if alias == nil || alias.name != "/session" {
+		t.Fatalf("/sessions should resolve to /session alias, got %+v", alias)
+	}
+}
+
+func TestSessionSlashCommandOpensInteractivePanel(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_old"})
+	m.sessionID = "session_old"
+
+	cmd := findSlashCommand("/session")
+	if cmd == nil {
+		t.Fatalf("/session command should be registered")
+	}
+	cmd.run(&m, nil)
+
+	if m.inputMode != modeSessionOverlay {
+		t.Fatalf("/session should open session overlay, got %q", m.inputMode)
+	}
+	rendered := viewContent(m.View())
+	for _, want := range []string{"Session Control", "session new", "session select", "session switch", "ctrl+p copy id"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("session panel missing %q:\n%s", want, rendered)
+		}
+	}
+
+	updated, _ := m.Update(textKey("down"))
+	m = updated.(model)
+	if m.sessionPanelSelected != 1 {
+		t.Fatalf("down should select session new, got %d", m.sessionPanelSelected)
+	}
+
+	updated, _ = m.Update(textKey("enter"))
+	m = updated.(model)
+	if m.inputMode != modeSessionConfirm {
+		t.Fatalf("enter on session new should open confirm panel, got %q", m.inputMode)
+	}
+
+	updated, _ = m.Update(textKey("esc"))
+	m = updated.(model)
+	if m.inputMode != modeComposing {
+		t.Fatalf("esc should close session panel, got %q", m.inputMode)
+	}
+	if m.sessionID != "session_old" || m.cfg.SessionID != "session_old" {
+		t.Fatalf("esc should not change active session, got model=%q cfg=%q", m.sessionID, m.cfg.SessionID)
+	}
+}
+
+func TestSessionPanelCanConfirmNewSession(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_old"})
+	m.sessionID = "session_old"
+	m.openSessionPanel()
+	m.sessionPanelSelected = 1
+
+	updated, _ := m.Update(textKey("enter"))
+	m = updated.(model)
+	if m.inputMode != modeSessionConfirm {
+		t.Fatalf("new selection inputMode = %q", m.inputMode)
+	}
+	updated, _ = m.Update(textKey("enter"))
+	m = updated.(model)
+
+	if m.inputMode != modeComposing {
+		t.Fatalf("confirm should return to composing, got %q", m.inputMode)
+	}
+	if m.sessionID != "" || m.cfg.SessionID != "" {
+		t.Fatalf("confirm new should clear session, got model=%q cfg=%q", m.sessionID, m.cfg.SessionID)
+	}
+}
+
+func TestSessionPanelCtrlPCopiesCurrentSessionID(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_1234567890abcdef"})
+	m.openSessionPanel()
+
+	updated, cmd := m.Update(ctrlKey('p'))
+	after := updated.(model)
+	if cmd == nil {
+		t.Fatalf("ctrl+p should return clipboard copy command")
+	}
+	if after.copyToastMessage != "Session id copied to clipboard" {
+		t.Fatalf("copy toast = %q", after.copyToastMessage)
+	}
+	if after.copyToastShownAt.IsZero() {
+		t.Fatalf("copy toast timestamp should be set")
+	}
+	if after.inputMode != modeSessionOverlay {
+		t.Fatalf("ctrl+p should keep session panel open, got %q", after.inputMode)
+	}
+}
+
+func TestSessionPanelCtrlPWithoutSessionShowsStatus(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.openSessionPanel()
+
+	updated, cmd := m.Update(ctrlKey('p'))
+	after := updated.(model)
+	if cmd != nil {
+		t.Fatalf("ctrl+p without session should not return clipboard command, got %T", cmd)
+	}
+	if after.copyToastMessage != "" {
+		t.Fatalf("copy toast should remain empty without session, got %q", after.copyToastMessage)
+	}
+	view := stripANSICodes(viewContent(after.View()))
+	compactView := strings.Join(strings.Fields(view), " ")
+	if !strings.Contains(compactView, "session: no active session id to copy") {
+		t.Fatalf("missing no-session status:\n%s", view)
+	}
+}
+
+func TestSessionPanelSwitchesBySessionIDInput(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_old"})
+	m.sessionID = "session_old"
+	m.openSessionPanel()
+	m.sessionPanelSelected = 3
+
+	updated, _ := m.Update(textKey("enter"))
+	m = updated.(model)
+	if m.inputMode != modeSessionInput {
+		t.Fatalf("switch selection inputMode = %q", m.inputMode)
+	}
+
+	for _, r := range "session_next" {
+		updated, _ = m.Update(textKey(string(r)))
+		m = updated.(model)
+	}
+	if got := m.input.Value(); got != "session_next" {
+		t.Fatalf("session input value = %q", got)
+	}
+	updated, _ = m.Update(textKey("enter"))
+	m = updated.(model)
+
+	if m.inputMode != modeComposing {
+		t.Fatalf("confirm should return to composing, got %q", m.inputMode)
+	}
+	if m.sessionID != "session_next" || m.cfg.SessionID != "session_next" {
+		t.Fatalf("session switch got model=%q cfg=%q", m.sessionID, m.cfg.SessionID)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("session input should be cleared after switch, got %q", got)
+	}
+}
+
+func TestEnsureStreamSessionReusesConfiguredSession(t *testing.T) {
+	postCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			postCount++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"type":"session_created","sessionId":"session_new"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	got, err := ensureStreamSession(Config{BaseURL: srv.URL, SessionID: "session_existing"}, "hello")
+	if err != nil {
+		t.Fatalf("ensureStreamSession returned error: %v", err)
+	}
+	if got != "session_existing" {
+		t.Fatalf("session = %q, want existing session", got)
+	}
+	if postCount != 0 {
+		t.Fatalf("configured session should not allocate a new session, POST count=%d", postCount)
+	}
+}
+
+func TestEnsureStreamSessionAllocatesWhenMissing(t *testing.T) {
+	postCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			postCount++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"type":"session_created","sessionId":"session_new"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	got, err := ensureStreamSession(Config{BaseURL: srv.URL, Cwd: "/workspace"}, "hello")
+	if err != nil {
+		t.Fatalf("ensureStreamSession returned error: %v", err)
+	}
+	if got != "session_new" {
+		t.Fatalf("session = %q, want allocated session", got)
+	}
+	if postCount != 1 {
+		t.Fatalf("missing session should allocate exactly once, POST count=%d", postCount)
+	}
+}
+
 func TestRenderTranscriptLabelsLayeredEvents(t *testing.T) {
 	// Mirrors the bbl chat TS TUI transcript layout:
 	//   > please inspect this project
@@ -538,6 +1260,82 @@ func TestRenderTranscriptLabelsLayeredEvents(t *testing.T) {
 	for _, banned := range []string{"you      ", "tool >   ", " assistant "} {
 		if strings.Contains(rendered, banned) {
 			t.Fatalf("rendered transcript should NOT contain %q: %q", banned, rendered)
+		}
+	}
+}
+
+func TestRenderToolStartedStaysOnOneLineWhenPathIsLong(t *testing.T) {
+	rendered := stripANSICodes(renderTranscript([]*transcriptItem{
+		{
+			kind: "tool_started",
+			text: "● Read(/Users/tangyaoyue/DEV/BABEL/BabeL-O/clients/go-tui/internal/tui/tui.go)  (ctrl+o to expand)",
+		},
+	}, 72))
+	lines := strings.Split(rendered, "\n")
+	if len(lines) != 1 {
+		t.Fatalf("tool row should render as one line, got %d lines:\n%s", len(lines), rendered)
+	}
+	if lipgloss.Width(lines[0]) > 72 {
+		t.Fatalf("tool row width = %d, want <= 72: %q", lipgloss.Width(lines[0]), lines[0])
+	}
+	if !strings.Contains(lines[0], "ctrl+o to expand") {
+		t.Fatalf("tool row should keep expand hint when possible: %q", lines[0])
+	}
+}
+
+func TestBashToolCompletedUpdatesStartedRowWithOutputPreview(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.consumeNexusEvent(map[string]any{
+		"type":      "tool_started",
+		"toolUseId": "tool_bash_1",
+		"name":      "Bash",
+		"input":     map[string]any{"command": `ls -la /Users/tangyaoyue/DEV/BABEL/BabeL-O/src && echo "---NEXUS---"`},
+	})
+	if len(m.transcript) != 1 {
+		t.Fatalf("tool_started should append one transcript row, got %d", len(m.transcript))
+	}
+	m.consumeNexusEvent(map[string]any{
+		"type":      "tool_completed",
+		"toolUseId": "tool_bash_1",
+		"name":      "Bash",
+		"success":   true,
+		"output": map[string]any{
+			"stdout": "total 24\ndrwxr-xr-x 13 tangyaoyue staff 416 Jun 10 14:29 .\ndrwxr-xr-x 25 tangyaoyue staff 800 Jun 12 00:54 ..\n",
+			"stderr": "",
+		},
+	})
+	if len(m.transcript) != 1 {
+		t.Fatalf("tool_completed should update the started row, got %d transcript rows", len(m.transcript))
+	}
+	rendered := stripANSICodes(renderTranscript(m.transcript, 96))
+	for _, want := range []string{"● Bash", "ls -la", "ctrl+o to expand", "total 24", "drwxr-xr-x"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered Bash tool block missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, "✓ Bash") {
+		t.Fatalf("Bash tool block should use the shared tool marker instead of completed checkmark:\n%s", rendered)
+	}
+}
+
+func TestBashToolFailureKeepsSharedToolMarker(t *testing.T) {
+	item := &transcriptItem{
+		kind:       "tool_started",
+		text:       "● Bash(exit 1)  (ctrl+o to expand)",
+		toolName:   "Bash",
+		toolInput:  "exit 1",
+		toolStatus: "error",
+		Versioned:  NewVersioned(),
+	}
+	rendered := stripANSICodes(renderTranscript([]*transcriptItem{item}, 80))
+	for _, want := range []string{"● Bash", "failed", "exit 1", "ctrl+o to expand"} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("failed Bash row missing %q:\n%s", want, rendered)
+		}
+	}
+	for _, banned := range []string{"× Bash", "✓ Bash"} {
+		if strings.Contains(rendered, banned) {
+			t.Fatalf("failed Bash row should not use status-specific icon %q:\n%s", banned, rendered)
 		}
 	}
 }
@@ -1310,6 +2108,89 @@ func TestPermissionChoiceNumberKeysJumpAndConfirm(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestApproveForSessionAutoApprovesFuturePermissionRequests(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	decisions := make(chan permissionDecision, 2)
+	m.decisions = decisions
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_1",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "git:status",
+	})
+	updated, _ := m.Update(textKey("2"))
+	m = updated.(model)
+	select {
+	case d := <-decisions:
+		if !d.approved || d.scope != "session" || d.rule != "git:status" {
+			t.Fatalf("first decision = %+v, want approved session git:status", d)
+		}
+	default:
+		t.Fatalf("expected first decision after session approval")
+	}
+	if !m.isPermissionSessionTrusted("session_1") {
+		t.Fatalf("session_1 should be trusted after choosing approve for this session")
+	}
+
+	m.consumeNexusEvent(map[string]any{
+		"type":          "permission_request",
+		"sessionId":     "session_1",
+		"toolUseId":     "tool_2",
+		"name":          "Bash",
+		"risk":          "execute",
+		"suggestedRule": "bash:grep-read",
+	})
+	if m.pending != nil {
+		t.Fatalf("trusted session should not leave a visible pending permission: %+v", m.pending)
+	}
+	if m.inputMode != modeComposing {
+		t.Fatalf("trusted session inputMode = %q, want %q", m.inputMode, modeComposing)
+	}
+	select {
+	case d := <-decisions:
+		if !d.approved || d.scope != "session" || d.rule != "bash:grep-read" {
+			t.Fatalf("auto decision = %+v, want approved session bash:grep-read", d)
+		}
+		if d.sessionID != "session_1" || d.toolUseID != "tool_2" {
+			t.Fatalf("auto decision routed to wrong request: %+v", d)
+		}
+	default:
+		t.Fatalf("expected trusted-session auto decision")
+	}
+}
+
+func TestTrustedPermissionSessionIsScopedBySessionID(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 80
+	m.height = 30
+	decisions := make(chan permissionDecision, 2)
+	m.decisions = decisions
+	m.trustPermissionSession("session_1")
+
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"sessionId": "session_2",
+		"toolUseId": "tool_2",
+		"name":      "Bash",
+		"risk":      "execute",
+	})
+	if m.pending == nil {
+		t.Fatalf("different session should still show a permission prompt")
+	}
+	if m.inputMode != modePermission {
+		t.Fatalf("different session inputMode = %q, want %q", m.inputMode, modePermission)
+	}
+	select {
+	case d := <-decisions:
+		t.Fatalf("different session should not auto-approve, got %+v", d)
+	default:
 	}
 }
 
@@ -2278,6 +3159,24 @@ func TestSlashPaletteEnterOnPrefixCommandInsertsPrefix(t *testing.T) {
 	}
 }
 
+func TestSlashPaletteEnterOnSessionOpensPanel(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeSlashPick)
+	m.paletteFilter = "session"
+
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
+	updatedModel := updated.(model)
+	if updatedModel.inputMode != modeSessionOverlay {
+		t.Fatalf("inputMode = %q, want session overlay", updatedModel.inputMode)
+	}
+	if got := updatedModel.input.Value(); got != "" {
+		t.Fatalf("session palette should not leave command text in input, got %q", got)
+	}
+	if !strings.Contains(stripANSICodes(viewContent(updatedModel.View())), "Session Control") {
+		t.Fatalf("session panel should be visible after palette selection")
+	}
+}
+
 func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 100
@@ -2295,6 +3194,138 @@ func TestSlashPaletteRenderShowsFilterAndCandidates(t *testing.T) {
 	// D.1 may ANSI-highlight the matched rune, so assert on visible text.
 	if !strings.Contains(stripANSICodes(rendered), "/profile") {
 		t.Fatalf("palette should show /profile, got %q", rendered)
+	}
+}
+
+func TestSlashPaletteRendersAboveInputInFinalView(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 32
+	m.resize()
+	m.setMode(modeSlashPick)
+
+	plain := stripANSICodes(viewContent(m.View()))
+	paletteIdx := strings.Index(plain, "Slash · /")
+	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	if paletteIdx < 0 {
+		t.Fatalf("final view should include slash palette, got:\n%s", plain)
+	}
+	if inputIdx < 0 {
+		t.Fatalf("final view should include input prompt, got:\n%s", plain)
+	}
+	if paletteIdx > inputIdx {
+		t.Fatalf("slash palette should render above input prompt; got palette index %d after input index %d:\n%s",
+			paletteIdx, inputIdx, plain)
+	}
+}
+
+func TestSlashCancelDoesNotAppendTranscriptNoise(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	updated, _ := m.Update(textKey("/"))
+	m = updated.(model)
+	before := len(m.transcript)
+
+	updated, _ = m.Update(textKey("esc"))
+	after := updated.(model)
+	if after.inputMode != modeComposing {
+		t.Fatalf("esc should close slash palette, got %q", after.inputMode)
+	}
+	if len(after.transcript) != before {
+		t.Fatalf("slash cancel should not append transcript rows, got %d new rows", len(after.transcript)-before)
+	}
+}
+
+func TestSlashPaletteOpenResizesViewportToKeepComposerVisible(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 32
+	m.resize()
+	beforeHeight := m.viewport.Height()
+
+	updated, _ := m.Update(textKey("/"))
+	after := updated.(model)
+	if after.inputMode != modeSlashPick {
+		t.Fatalf("inputMode = %q, want slash palette", after.inputMode)
+	}
+	if after.viewport.Height() >= beforeHeight {
+		t.Fatalf("opening slash palette should shrink viewport height, before=%d after=%d",
+			beforeHeight, after.viewport.Height())
+	}
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("slash palette view height = %d, want terminal height %d:\n%s", got, after.height, plain)
+	}
+	if !strings.Contains(plain, "Slash · /") || !strings.Contains(plain, "> Ask BabeL-O") {
+		t.Fatalf("slash palette and input should both remain visible, got:\n%s", plain)
+	}
+	if !strings.HasSuffix(plain, stripANSICodes(after.renderFooter(after.width))) {
+		t.Fatalf("footer should remain the final row with slash palette open, got:\n%s", plain)
+	}
+}
+
+func TestSessionPanelAnchorsAboveInputAtSmallHeight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 22
+	m.resize()
+	m.openSessionPanel()
+	m.resize()
+
+	view := viewContent(m.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != m.height {
+		t.Fatalf("session panel view height = %d, want terminal height %d:\n%s", got, m.height, plain)
+	}
+	panelIdx := strings.Index(plain, "Session Control")
+	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	if panelIdx < 0 {
+		t.Fatalf("session panel should be visible:\n%s", plain)
+	}
+	if inputIdx < 0 {
+		t.Fatalf("input prompt should remain visible:\n%s", plain)
+	}
+	if panelIdx > inputIdx {
+		t.Fatalf("session panel should render above input prompt, panel=%d input=%d:\n%s", panelIdx, inputIdx, plain)
+	}
+	if !strings.HasSuffix(plain, stripANSICodes(m.renderFooter(m.width))) {
+		t.Fatalf("footer should remain the final row with session panel open:\n%s", plain)
+	}
+}
+
+func TestDirectSessionCommandResizesForBottomAnchoredPanel(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 22
+	m.resize()
+	beforeHeight := m.viewport.Height()
+	m.setInputValue("/session")
+
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
+	after := updated.(model)
+	if after.inputMode != modeSessionOverlay {
+		t.Fatalf("inputMode = %q, want session overlay", after.inputMode)
+	}
+	if after.viewport.Height() >= beforeHeight {
+		t.Fatalf("opening /session should shrink viewport height, before=%d after=%d",
+			beforeHeight, after.viewport.Height())
+	}
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("direct /session view height = %d, want terminal height %d:\n%s", got, after.height, plain)
+	}
+	panelIdx := strings.Index(plain, "Session Control")
+	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	if panelIdx < 0 || inputIdx < 0 || panelIdx > inputIdx {
+		t.Fatalf("session panel should render above input after direct command, panel=%d input=%d:\n%s",
+			panelIdx, inputIdx, plain)
+	}
+	if !strings.Contains(plain, "enter open") {
+		t.Fatalf("session panel should show its footer hint, got:\n%s", plain)
 	}
 }
 
@@ -2569,8 +3600,8 @@ func TestContextWithActiveSessionFiresHTTP(t *testing.T) {
 		t.Fatalf("/context with active session should fire an HTTP command")
 	}
 	rendered := renderTranscript(m.transcript[before:], 200)
-	if !strings.Contains(rendered, "analyzing shared Nexus context") {
-		t.Fatalf("transcript should mention 'analyzing shared Nexus context', got %q", rendered)
+	if strings.Contains(rendered, "analyzing shared Nexus context") {
+		t.Fatalf("/context loading should not append noisy status rows, got %q", rendered)
 	}
 }
 
@@ -2758,7 +3789,8 @@ func fullContextPayload() []byte {
 			"maxTokens": 8192,
 			"layerBudgets": {"system": 2048, "summary": 1024, "history": 4096, "memory": 512, "reservedOutput": 512}
 		},
-		"window": {"maxTokens": 8192, "tokenEstimate": 1234},
+		"estimate": {"totalTokens": 1234, "systemPromptTokens": 420, "toolDefinitionTokens": 280, "messageTokens": 534},
+		"window": {"maxTokens": 8192, "tokenEstimate": 1234, "compactThresholdTokens": 6553, "blockingLimitTokens": 8000},
 		"sections": {
 			"systemPromptChars": 1500, "projectMemoryChars": 200, "sessionSummaryChars": 80,
 			"activeSkillsChars": 0, "messageCount": 5, "selectedEventCount": 7,
@@ -2772,7 +3804,34 @@ func fullContextPayload() []byte {
 		},
 		"diagnostics": {
 			"remainingTokens": 6958, "remainingPercent": 85,
-			"autoCompact": {"shouldCompact": false, "thresholdPercent": 80, "fuseOpen": false, "failureCount": 0, "failureLimit": 3},
+			"compactRemainingTokens": 5319, "blockingRemainingTokens": 6766,
+			"usageSummary": {"inputTokens": 1234, "outputTokens": 120, "cacheReadInputTokens": 64, "estimatedReasoningTokens": 32},
+			"cacheEconomics": {
+				"policySource": "large_context", "modelContextWindow": 8192, "effectiveContextCeiling": 8192,
+				"legacyContextCeiling": 8192, "reservedOutputTokens": 512, "providerSafetyBufferTokens": 0,
+				"warningThresholdPercent": 70, "compactThresholdPercent": 80,
+				"warningThresholdTokens": 5734, "compactThresholdTokens": 6553, "blockingLimitTokens": 8000,
+				"reason": "test policy"
+			},
+			"visualization": {
+					"buckets": [
+						{"kind": "system", "estimatedTokens": 420, "itemCount": 3, "percentOfEstimate": 34},
+						{"kind": "tool_results", "estimatedTokens": 280, "itemCount": 1, "percentOfEstimate": 23}
+					],
+					"topItems": [
+						{"kind": "tool_results", "label": "Bash:call_big", "estimatedTokens": 280, "source": "tool result output"},
+						{"kind": "compact_summary", "label": "summary:session", "estimatedTokens": 64, "source": "compact summary retained"}
+					],
+					"nextThreshold": {"name": "warning", "thresholdTokens": 5734, "remainingTokens": 4500, "percent": 70},
+					"grounding": {
+						"state": "dirty-workspace", "summaryDerived": true, "dirtyWorkspace": true,
+						"changedFileCount": 2,
+						"changedFiles": ["src/runtime/contextAnalysis.ts", "clients/go-tui/internal/tui/context.go"],
+						"suggestedActions": ["inspect_changed_files", "re_read_referenced_files"]
+					},
+					"suggestions": ["inspect changed files", "re-read referenced files before source/test/git conclusions", "inspect largest items"]
+				},
+				"autoCompact": {"shouldCompact": false, "thresholdPercent": 80, "fuseOpen": false, "failureCount": 0, "failureLimit": 3},
 			"longTermMemory": {
 				"provider": "evercore", "enabled": true, "hitCount": 2, "injectedChars": 240,
 				"budgetChars": 1200, "truncated": false, "scope": "project",
@@ -2820,13 +3879,31 @@ func TestBuildContextOverlayLinesExtractsTopLevelEnvelope(t *testing.T) {
 	lines := buildContextOverlayLines(fullContextPayload())
 	joined := strings.Join(lines, "\n")
 	for _, want := range []string{
-		"Context · session_",
-		"· local/coding-runtime",
-		"context 1234/8192 tokens; 6958 remaining",
+		"BABEL Context · session_",
+		"· coding-runtime",
+		"current context 1.2k/8.2k (15%) · available 7.0k",
+		"[",
+		"Current context by source",
+		"System prompt · 420",
+		"System tools · 280",
+		"Messages · 534",
+		"Capacity",
+		"compact headroom 5.3k · blocking headroom 6.8k",
+		"State",
 		"status: ok",
 		"sections:",
 		"messages: 5 (selected=7",
 		"tools visible: 4",
+		"token buckets:",
+		"system=420 tokens (34%, items=3)",
+		"tool_results=280 tokens (23%, items=1)",
+		"top context items:",
+		"tool_results 280 tokens · Bash:call_big",
+		"next threshold: warning at 5734 tokens (70%), remaining=4500",
+		"grounding: state=dirty-workspace · dirty files=2",
+		"actions=inspect_changed_files,re_read_referenced_files",
+		"context suggestions:",
+		"inspect changed files",
 		"budget layers (tokens):",
 		"system=2048 summary=1024",
 		"compact retention: valid · events=3",
@@ -2926,10 +4003,91 @@ func TestRenderContextOverlayShowsHeaderInMode(t *testing.T) {
 	if rendered == "" {
 		t.Fatalf("renderContextOverlay in modeContextOverlay should be non-empty")
 	}
-	for _, want := range []string{"Context", "· local/coding-runtime", "scroll"} {
+	for _, want := range []string{"Context", "BABEL Context", "· coding-runtime", "Current context by source", "scroll"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("rendered context overlay missing %q\nfull:\n%s", want, rendered)
 		}
+	}
+}
+
+func TestContextAnalysisMsgOpensPanelWithoutTranscriptSummary(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	before := len(m.transcript)
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	after := updated.(model)
+	if after.inputMode != modeContextOverlay {
+		t.Fatalf("context analysis should open overlay, got %q", after.inputMode)
+	}
+	rendered := renderTranscript(after.transcript[before:], 200)
+	if strings.Contains(rendered, "context_analysis") || strings.Contains(rendered, "context 1234/8192") {
+		t.Fatalf("context analysis should not append transcript summary, got %q", rendered)
+	}
+}
+
+func TestContextOverlayFitsAboveComposerAtSmallHeight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 22
+	m.resize()
+
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	after := updated.(model)
+	after.width = 120
+	after.height = 22
+	after.resize()
+
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("context overlay view height = %d, want terminal height %d:\n%s", got, after.height, plain)
+	}
+	contextIdx := strings.Index(plain, "Context")
+	if contextIdx < 0 {
+		t.Fatalf("context overlay should be visible:\n%s", plain)
+	}
+	if strings.Contains(plain, "> Ask BabeL-O") {
+		t.Fatalf("context overlay should not reserve the input box:\n%s", plain)
+	}
+	if !strings.Contains(plain, "up/down/tab scroll  esc/enter/q close") {
+		t.Fatalf("context overlay footer hint should remain visible:\n%s", plain)
+	}
+	if strings.Contains(plain, "/ or ctrl+p commands") {
+		t.Fatalf("context overlay should not reserve the footer:\n%s", plain)
+	}
+}
+
+func TestContextOverlayWithExistingTranscriptDoesNotClipComposer(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 26
+	m.appendLine("status", "analyzing shared Nexus context: session_1234567890abcdef")
+	m.appendLine("status", "context_analysis model=minimax/MiniMax-M3\n  context 42510/179616 tokens; 137106 remaining\n  status: warning")
+	m.resize()
+
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	after := updated.(model)
+	after.width = 120
+	after.height = 26
+	after.resize()
+
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("context overlay with transcript height = %d, want terminal height %d:\n%s", got, after.height, plain)
+	}
+	if after.viewport.Height() < 0 {
+		t.Fatalf("context overlay viewport height should not be negative, got %d", after.viewport.Height())
+	}
+	for _, want := range []string{"Context", "up/down/tab scroll  esc/enter/q close"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("context overlay view missing %q:\n%s", want, plain)
+		}
+	}
+	if strings.Contains(plain, "> Ask BabeL-O") || strings.Contains(plain, "/ or ctrl+p commands") {
+		t.Fatalf("context overlay should cover the input/footer area:\n%s", plain)
+	}
+	if strings.Contains(plain, "context_analysis model=minimax") {
+		t.Fatalf("context overlay should hide the main transcript while open:\n%s", plain)
 	}
 }
 
@@ -4563,6 +5721,22 @@ func TestConsumeNexusEventSkipsActivityForIrrelevantEvents(t *testing.T) {
 	}
 }
 
+func TestFormatNexusEventRendersRecoverableToolDenial(t *testing.T) {
+	out := formatNexusEvent(map[string]any{
+		"type":        "tool_denied",
+		"name":        "Bash",
+		"risk":        "execute",
+		"message":     "Tool denied by Nexus policy: Bash",
+		"recoverable": true,
+	})
+	if !strings.Contains(out, "blocked recoverable") {
+		t.Fatalf("expected recoverable denial wording, got %q", out)
+	}
+	if !strings.Contains(out, "Tool denied by Nexus policy: Bash") {
+		t.Fatalf("expected message field to be rendered, got %q", out)
+	}
+}
+
 func TestActivityOverlayOpensAndCloses(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	// /activity should open the overlay even with an empty buffer.
@@ -4749,11 +5923,97 @@ func TestHeaderShowsStyledTopBarAndContextToggle(t *testing.T) {
 	if !strings.Contains(lines[1], "BabeL-O · Go TUI") {
 		t.Fatalf("header title row missing title, got %q", lines[1])
 	}
-	if strings.Count(lines[1], "/") > 24 {
-		t.Fatalf("header accent slash run should stay compact, got %q", lines[1])
+	if !strings.Contains(lines[1], "─── ◆ ───") {
+		t.Fatalf("header should render quiet diamond accent, got %q", lines[1])
+	}
+	if strings.Contains(lines[1], "////") {
+		t.Fatalf("header should not render legacy slash accent, got %q", lines[1])
 	}
 	if strings.Trim(lines[2], "-") != "" || len(lines[2]) != m.width {
 		t.Fatalf("header divider should span width %d, got %q", m.width, lines[2])
+	}
+}
+
+func TestHeaderContextPrefersRuntimeContextSnapshot(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.contextWindow = 120000
+	m.lastUsage = &usageSnapshot{InputTokens: 60000}
+	m.contextUsage = &contextUsageSnapshot{
+		PercentUsed:   8,
+		TokenEstimate: 13586,
+		MaxTokens:     179616,
+		PolicySource:  "large_context",
+	}
+
+	if got := m.formatContextUsageLabel(); got != "context 8%" {
+		t.Fatalf("formatContextUsageLabel() = %q, want runtime snapshot percent", got)
+	}
+	detail := m.formatContextUsageDetail()
+	for _, want := range []string{"context: 13k / 179k used", "8%", "large_context"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("formatContextUsageDetail() missing %q, got %q", want, detail)
+		}
+	}
+}
+
+func TestExecutionMetricsHydratesContextUsage(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":                          "execution_metrics",
+		"inputTokens":                   13586,
+		"outputTokens":                  1604,
+		"modelContextWindow":            200000,
+		"effectiveContextCeiling":       179616,
+		"contextWarningThresholdTokens": 125731,
+		"contextCompactThresholdTokens": 161654,
+		"contextBlockingLimitTokens":    178616,
+		"contextPolicySource":           "large_context",
+	})
+
+	if m.contextUsage == nil {
+		t.Fatal("execution_metrics should hydrate context usage")
+	}
+	if m.contextUsage.TokenEstimate != 13586 || m.contextUsage.MaxTokens != 179616 {
+		t.Fatalf("context usage = %+v, want token estimate 13586 and max 179616", *m.contextUsage)
+	}
+	if got := m.formatContextUsageLabel(); got != "context 8%" {
+		t.Fatalf("formatContextUsageLabel() = %q, want context 8%%", got)
+	}
+	if got := formatContextUsageFooter(m.contextUsage); !strings.Contains(got, "ctx 8% 13586/179616") || !strings.Contains(got, "warn=125731 compact=161654") {
+		t.Fatalf("formatContextUsageFooter() = %q", got)
+	}
+}
+
+func TestContextUsagePersistsAfterResult(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.contextUsage = &contextUsageSnapshot{PercentUsed: 8, TokenEstimate: 13586, MaxTokens: 179616}
+	m.latestUsage = &usageSnapshot{InputTokens: 13586, OutputTokens: 400}
+	m.running = true
+
+	_ = m.consumeNexusEvent(map[string]any{"type": "result", "success": true})
+
+	if m.contextUsage == nil {
+		t.Fatal("result should keep last runtime context snapshot for the header/top card")
+	}
+	if m.latestUsage != nil {
+		t.Fatalf("result should still clear transient usage snapshot, got %+v", *m.latestUsage)
+	}
+	if got := m.formatContextUsageLabel(); got != "context 8%" {
+		t.Fatalf("formatContextUsageLabel() = %q, want persisted context snapshot", got)
+	}
+}
+
+func TestOutputOnlyUsageDoesNotOverwriteLastInputContext(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.contextWindow = 100000
+	_ = m.consumeNexusEvent(map[string]any{"type": "usage", "inputTokens": 42000, "outputTokens": 0, "cacheReadInputTokens": 1200})
+	_ = m.consumeNexusEvent(map[string]any{"type": "usage", "inputTokens": 0, "outputTokens": 800})
+
+	if m.lastUsage == nil || m.lastUsage.InputTokens != 42000 {
+		t.Fatalf("lastUsage should retain last non-zero input snapshot, got %+v", m.lastUsage)
+	}
+	if got := m.formatContextUsageLabel(); got != "context 42%" {
+		t.Fatalf("formatContextUsageLabel() = %q, want context 42%%", got)
 	}
 }
 
@@ -5330,7 +6590,7 @@ func TestStaticToolDescriptorCatalogIsStableReferenceShape(t *testing.T) {
 	// that re-orders the slice (or drops a tool) trips this
 	// test and forces an explicit decision.
 	tools := staticToolDescriptorCatalog()
-	wantNames := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", "TaskCreate"}
+	wantNames := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "TaskCreate"}
 	if len(tools) != len(wantNames) {
 		t.Fatalf("static catalog should have %d tools, got %d", len(wantNames), len(tools))
 	}
@@ -5533,6 +6793,20 @@ func TestBuildExecuteRequestHonoursExplicitPolicyMode(t *testing.T) {
 	}
 }
 
+func TestBuildExecuteRequestEmitsSoftTimeoutPolicy(t *testing.T) {
+	cfg := Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}
+	payload := buildExecuteRequest(cfg, "session_abc", "hello")
+	if got := payload["timeoutPolicy"]; got != "soft" {
+		t.Fatalf("timeoutPolicy = %v, want soft", got)
+	}
+	if got := anyInt(payload["timeoutMs"]); got != DefaultGoTuiExecuteTimeoutMs {
+		t.Fatalf("timeoutMs = %d, want %d", got, DefaultGoTuiExecuteTimeoutMs)
+	}
+	if got := anyInt(payload["softTimeoutMs"]); got != DefaultGoTuiExecuteTimeoutMs {
+		t.Fatalf("softTimeoutMs = %d, want %d", got, DefaultGoTuiExecuteTimeoutMs)
+	}
+}
+
 func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
 	decision := resolveGoTuiTimeout(Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}, "hello", nil)
 	if decision.TimeoutMs != DefaultGoTuiExecuteTimeoutMs || decision.Adaptive {
@@ -5686,7 +6960,7 @@ func TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest(t *testing.T) {
 
 	doneCh := make(chan struct{})
 	go func() {
-		runStream(cfg, "git commit", resolveGoTuiTimeout(cfg, "git commit", nil), eventCh, decisions)
+		runStream(cfg, "session_test_allocated", "git commit", resolveGoTuiTimeout(cfg, "git commit", nil), eventCh, decisions)
 		close(doneCh)
 	}()
 
@@ -6004,6 +7278,21 @@ func TestMouseWheelScrollsViewportInComposingMode(t *testing.T) {
 	}
 	if got, want := afterDown.viewport.YOffset(), startingYOffset; got != want {
 		t.Fatalf("after wheel up+down round trip, YOffset = %d, want %d (back to %d)", got, want, startingYOffset)
+	}
+}
+
+func TestMouseWheelRepeatedTicksAreNotThrottled(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	fillScrollableViewport(&m)
+	startingYOffset := m.viewport.YOffset()
+
+	updated, _ := m.Update(mouseWheel(tea.MouseWheelUp, 0, 0))
+	m = updated.(model)
+	updated, _ = m.Update(mouseWheel(tea.MouseWheelUp, 0, 0))
+	after := updated.(model)
+
+	if got, want := after.viewport.YOffset(), startingYOffset-(mouseWheelStepLines*2); got != want {
+		t.Fatalf("two immediate wheel ticks should both scroll, got YOffset %d want %d", got, want)
 	}
 }
 
@@ -6728,7 +8017,7 @@ func TestApplySelectionHighlightAddsBackgroundSpan(t *testing.T) {
 	// can assert the renderer paints the highlight. Selecting the
 	// welcome card's blank padding is brittle because the viewport
 	// may trim invisible trailing spaces before they reach View().
-	transcriptStart := lineCount(m.renderWelcomeCard(max(40, m.viewport.Width()))) + 2
+	transcriptStart := transcriptStartLine(m.renderWelcomeCard(max(40, m.viewport.Width())))
 	m.selectionActive = true
 	m.selectionStartLine = transcriptStart
 	m.selectionStartCol = 2
@@ -7321,6 +8610,82 @@ func TestViewHeightBudgetKeepsRunningFooterVisible(t *testing.T) {
 	}
 	if !strings.HasSuffix(plain, stripANSICodes(after.renderFooter(after.width))) {
 		t.Fatalf("running footer should be the final rendered row, got:\n%s", plain)
+	}
+}
+
+func TestRunningViewShowsRuntimeWaveAboveInput(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.running = true
+	m.startedAt = time.Unix(20, 0)
+	m.resize()
+
+	view := viewContent(m.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != m.height {
+		t.Fatalf("running wave view height = %d, want terminal height %d; full view:\n%s", got, m.height, plain)
+	}
+	if !strings.Contains(plain, "agent runtime") {
+		t.Fatalf("running wave row missing from view:\n%s", plain)
+	}
+	if strings.Index(plain, "agent runtime") > strings.Index(plain, "> Ask BabeL-O") {
+		t.Fatalf("running wave should render above the input prompt, got:\n%s", plain)
+	}
+	if !strings.HasSuffix(plain, stripANSICodes(m.renderFooter(m.width))) {
+		t.Fatalf("footer should remain the final rendered row with running wave enabled, got:\n%s", plain)
+	}
+}
+
+func TestRuntimeLightBarUsesStableWidthAndCache(t *testing.T) {
+	spin := newGradientSpinner()
+	first := spin.LightBar(24, runtimeAnimationDefault)
+	if got := lipgloss.Width(first); got != 24 {
+		t.Fatalf("light bar width = %d, want 24; raw=%q", got, first)
+	}
+	key := runtimeAnimationCacheKey{width: 24, kind: runtimeAnimationDefault}
+	if len(spin.lightBarFrames[key]) != prerenderedFrames {
+		t.Fatalf("light bar should prerender %d frames, got %d", prerenderedFrames, len(spin.lightBarFrames[key]))
+	}
+	second := spin.LightBar(24, runtimeAnimationDefault)
+	if second != first {
+		t.Fatalf("same step and width should reuse the same rendered frame")
+	}
+	tool := spin.LightBar(24, runtimeAnimationTool)
+	if tool == first {
+		t.Fatalf("different runtime animation kinds should render distinct frames")
+	}
+}
+
+func TestRuntimeAnimationStateFollowsAgentEvent(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType string
+		pending   bool
+		wantLabel string
+		wantKind  runtimeAnimationKind
+	}{
+		{name: "thinking", eventType: "thinking_delta", wantLabel: "agent thinking", wantKind: runtimeAnimationThinking},
+		{name: "assistant output", eventType: "assistant_delta", wantLabel: "agent writing", wantKind: runtimeAnimationResponding},
+		{name: "tool started", eventType: "tool_started", wantLabel: "tool activity", wantKind: runtimeAnimationTool},
+		{name: "tool completed", eventType: "tool_completed", wantLabel: "tool activity", wantKind: runtimeAnimationTool},
+		{name: "permission event", eventType: "permission_request", wantLabel: "permission needed", wantKind: runtimeAnimationPermission},
+		{name: "pending overrides", eventType: "assistant_delta", pending: true, wantLabel: "permission needed", wantKind: runtimeAnimationPermission},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			m.running = true
+			m.lastEventType = tc.eventType
+			if tc.pending {
+				m.pending = &pendingPermission{name: "Bash"}
+			}
+			label, kind := m.runtimeAnimationState()
+			if !strings.Contains(label, tc.wantLabel) || kind != tc.wantKind {
+				t.Fatalf("runtimeAnimationState = (%q, %q), want label containing %q kind %q",
+					label, kind, tc.wantLabel, tc.wantKind)
+			}
+		})
 	}
 }
 

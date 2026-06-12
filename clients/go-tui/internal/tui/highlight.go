@@ -90,10 +90,7 @@ func (m *model) clearTranscriptHighlights() {
 func (m model) fullViewportContentWithSelection(sl, sc, el, ec int) string {
 	width := max(40, m.viewport.Width())
 	welcome := m.renderWelcomeCard(width)
-	transcriptStart := lineCount(welcome)
-	if len(m.transcript) > 0 {
-		transcriptStart += 2
-	}
+	transcriptStart := transcriptStartLine(welcome)
 	m.applySelectionToTranscriptItems(width, transcriptStart, sl, sc, el, ec)
 	transcript := renderTranscript(m.transcript, width)
 	if transcript == "" {
@@ -103,6 +100,16 @@ func (m model) fullViewportContentWithSelection(sl, sc, el, ec int) string {
 		welcome = renderHighlightRange(welcome, sl, sc, el, ec)
 	}
 	return welcome + "\n\n" + transcript
+}
+
+func transcriptStartLine(welcome string) int {
+	// The first transcript row lives after the exact prefix used
+	// by fullViewportContent: `welcome + "\n\n"`. Count newline
+	// bytes in that prefix instead of adding a fixed number of
+	// logical lines; the welcome card intentionally ends with a
+	// trailing blank row, and lineCount(welcome)+2 would land one
+	// row too low.
+	return strings.Count(welcome+"\n\n", "\n")
 }
 
 func (m model) applySelectionToTranscriptItems(width int, transcriptStart int, sl, sc, el, ec int) {
@@ -120,6 +127,7 @@ func (m model) applySelectionToTranscriptItems(width int, transcriptStart int, s
 			localStartCol := 0
 			if sl > itemStart {
 				localStartLine = sl - itemStart
+				localStartCol = sc
 			} else if sl == itemStart {
 				localStartCol = sc
 			}

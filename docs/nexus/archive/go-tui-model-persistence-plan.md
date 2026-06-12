@@ -1,6 +1,6 @@
 # Go TUI `/model` 模型持久化规划
 
-> Status: 规划中（协议层 + 客户端 state machine + 测试均未落 commit）
+> Status: **Phase 1 + Phase 2 landed / Phase 3 optional smoke deferred / Phase 4 DONE sync landed**
 > Priority: P1 — 与 §5 路径 C 阶段 2 持久化主题同档，但当前没有"真实会话 regression"驱动，按规划先行、regression-first 验证
 > 关联: §5 路径 C 阶段 2（`POST /v1/runtime/config/select` profile 切换落地）— 本规划在同一端点上扩展 `model` 字段
 
@@ -8,7 +8,7 @@
 
 ## 1. 背景
 
-Go TUI 通过 `/model` 多步流程（commit `5012d98`）让操作员在终端内挑选 provider / api-key / base-URL / model 四步组合，**视觉上**立刻把 `m.modelID` 切到新模型并在 header 反映出来。但视觉切换背后是 in-memory only 写入：
+落地前，Go TUI 通过 `/model` 多步流程（commit `5012d98`）让操作员在终端内挑选 provider / api-key / base-URL / model 四步组合，**视觉上**立刻把 `m.modelID` 切到新模型并在 header 反映出来。但视觉切换背后是 in-memory only 写入：
 
 - `clients/go-tui/internal/tui/tui.go:2135-2144`（`case modeModelPickModel` Enter 分支）：
 
@@ -39,13 +39,13 @@ TUI 启动时 `m.modelID` 的来源是 `fetchRuntimeConfig(m.cfg, 0)`（`GET /v1
 - "切完关掉 `bbl go` 重开，又变回原来那个"
 - "我懒得切回 `bbl chat` 跑 `bbl config use`，能不能在 Go TUI 里直接切了落盘"
 
-### 1.2 当前三条切换路径对比
+### 1.2 三条切换路径对比（当前）
 
 | 路径 | 视觉切换 | 持久化 | 跨 `bbl go` 重启保留 |
 |------|---------|--------|---------------------|
 | `bbl config use <model-id>`（CLI） | ❌ TUI 端不感知 | ✅ 写 `~/.babel-o/config.json` 的 `defaultModel` | ✅ |
 | `bbl chat /model <model-id>`（TypeScript chat TUI） | ✅ | ✅ 走同一份 config | ✅ |
-| `bbl go` 内部 `/model` → Step 4 | ✅ header 立刻变 | ❌ 仅 `m.modelID` 内存字段 | ❌ |
+| `bbl go` 内部 `/model` → Step 4 | ✅ 通过返回的 runtime config 更新 header | ✅ 经 Nexus `config/select` 写 `defaultModel` | ✅（无 active profile shadow 时直接生效） |
 
 > 备注：操作员在 Step 2 / Step 3 临时输入的 `apiKey` / `baseURL` **同样**不落盘，只在 `m.modelPickProviderDraft` 内存字段里，commit `5012d98` 阶段就是按"视觉切换 + 持久化走 CLI"做的。本规划**只**解决 `model` 字段持久化，api-key / base-URL 留待后续单独 PR（涉及加密落盘、env 优先级合并，更广的合约面）。
 
@@ -53,9 +53,9 @@ TUI 启动时 `m.modelID` 的来源是 `fetchRuntimeConfig(m.cfg, 0)`（`GET /v1
 
 ## 2. 根因
 
-### 2.1 Nexus 端 `/v1/runtime/config/select` 当前契约
+### 2.1 Nexus 端 `/v1/runtime/config/select` 落地前契约
 
-`src/nexus/app.ts:765-787`（HEAD = `ea61d41`）：
+以下摘录是规划编写时的历史状态（HEAD = `ea61d41`），用于解释为什么需要扩展同一端点；当前落地状态见 §8：
 
 ```ts
 app.post('/v1/runtime/config/select', async (request, reply) => {
@@ -84,9 +84,9 @@ app.post('/v1/runtime/config/select', async (request, reply) => {
 
 所以扩展 `config/select` 接受 `model` 字段是**单值状态切换**，与"profile / role 治理"不是同一类约束。
 
-### 2.2 TUI 端缺 Step 4 提交 state machine
+### 2.2 TUI 端落地前缺 Step 4 提交 state machine
 
-`modeModelPickModel` Enter 分支（`tui.go:2135`）是**同步**路径：本地 `m.modelID = ...` + `setMode(composing)` + return `nil, nil` 退出 picker。要让它发 HTTP 请求，需要：
+落地前，`modeModelPickModel` Enter 分支（`tui.go:2135`）是**同步**路径：本地 `m.modelID = ...` + `setMode(composing)` + return `nil, nil` 退出 picker。要让它发 HTTP 请求，需要：
 - 一个**异步** Cmd 工厂（参考 `selectRuntimeProfile`，`tui.go:6388+`）
 - 一个**响应 msg** 类型（参考 `profileSelectMsg`，`tui.go:213-218`）
 - 一个**in-flight 锁**防止双击 / 双键入重复发请求
@@ -336,38 +336,37 @@ if m.modelPickSubmitting {
 ## 8. 分阶段推进
 
 ### Phase 1：Nexus 协议层
-状态：未启动
+状态：已落地。
 
-- 改 `src/nexus/app.ts:765` handler 拆三态
-- 改 `test/config-endpoints.test.ts` 6 条测试
-- `npx tsc --noEmit` 干净
-- `node --import tsx --test test/config-endpoints.test.ts` 22/22
+- `src/nexus/app.ts` 的 `POST /v1/runtime/config/select` 已拆为互斥三态：`{profile}` 切 active profile、`{model}` 写 `defaultModel`、空字段报 `missing_field`。
+- `profile + model` 返回 `mutually_exclusive`；`role` / `roleModel` 仍返回 `not_supported`，继续保持 CLI-only。
+- `model` 会先校验 `modelRegistry`，未知 model 返回 `unknown_model` 并带回 `model` 字段。
+- `test/config-endpoints.test.ts` 已覆盖 22 条 endpoint/config 回归：profile back-compat、model 持久化、active profile shadow、互斥、未知 model、role/roleModel 拒绝、version endpoint 等。
+- 验证：`NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/config-endpoints.test.ts` 22/22 pass。
 
 ### Phase 2：TUI 客户端
-状态：未启动（依赖 Phase 1）
+状态：已落地。
 
-- `tui.go` 加 `modelSelectMsg` / `selectRuntimeModel` / `modelPickSubmitting`
-- Step 4 Enter 分支 dispatch cmd
-- `case modelSelectMsg` Update handler
-- `renderModelPickModel` 加 saving 态
-- `tui_test.go` 3 个新单测
-- `go test ./...` 干净
-- `go vet ./...` 干净
-- 重编 binary
+- `clients/go-tui/internal/tui/tui.go` 已新增 `modelSelectMsg` / `selectRuntimeModel` / `modelPickSubmitting`。
+- `/model` Step 4 Enter 现在 dispatch `POST /v1/runtime/config/select {model}`，先显示 `saving model:`，不再本地假写 `m.modelID`。
+- `case modelSelectMsg` 成功路径调用 `applyRuntimeConfig`、输出 `model saved:`、重置 picker 状态并回到 composing；失败路径清 in-flight、输出 `model select:`，留在 picker 供重选或 Esc。
+- `renderModelPickModel` 通过 dialog 的 submitting 状态展示 saving / request in-flight 文案。
+- `clients/go-tui/internal/tui/tui_test.go` 已补 Step 4 command dispatch、成功 apply+close、失败 stay-in-picker 与 submitting render 回归。
+- 验证：`cd clients/go-tui && go test ./...` pass；`cd clients/go-tui && go vet ./...` pass。
 
 ### Phase 3：PTY smoke（可选）
-状态：未启动（依赖 Phase 2）
+状态：暂缓。
 
-- `test/go_tui_pty_driver.py` 新 `run_model_persistence_sequence`：bash echo 触发 `session_started` → `/model` → 选 provider → 选 model → 等 `model saved:` → 重启 TUI → 验 header modelId 是新选的
-- 挑战：PTY 序列里需要 pre-seed `BABEL_O_CONFIG_FILE` 让 default model 与新选不同（避免"`local/coding-runtime` → `local/coding-runtime`"这种 no-op）
-- 评估成本后再决定是否入 `all` orchestrator（避免长 orchestrator 不稳定）
+- 当前最小闭环已有 TS endpoint 回归 + Go TUI 白盒状态机回归覆盖，能守住协议、持久化与 in-flight 行为。
+- 真实 PTY model persistence 序列仍可后续补充，但需要稳定 pre-seed `BABEL_O_CONFIG_FILE`、避开 default model no-op，并处理 active profile shadow 的可观测性；不阻塞本切片收口。
 
 ### Phase 4：DONE 收口
-状态：未启动
+状态：已落地。
 
-- 写 `docs/nexus/DONE.md` 收口条目（commit hash + 文件列表 + 测试覆盖 + 验证命令）
-- 同步 `docs/nexus/reference/README.md` 索引（本 doc 仍在 reference，但加一句"implementation slice landed 2026-XX-XX, see DONE.md:NNN"）
-- 同步 `docs/nexus/active/TODO_tui.md` 把 "P2 / model persistence" 从未收口项移到"已收口"
+- `docs/nexus/DONE.md` 增加 Go TUI `/model` 持久化收口条目。
+- `docs/nexus/WORK_LOG.md` 追加事实记录与验证命令。
+- `docs/nexus/TODO.md` / `docs/nexus/active/TODO_tui.md` 从 P1 打开项调整为已收口 / Watch。
+- `docs/nexus/reference/README.md` 增加本参考文档索引，并说明实现切片已落地。
 
 ---
 

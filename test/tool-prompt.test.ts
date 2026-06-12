@@ -46,6 +46,8 @@ describe('Tool prompt()', () => {
     assert.match(bashPrompt, /Read with offset\/limit/)
     assert.match(bashPrompt, /Grep to locate text/)
     assert.match(bashPrompt, /ListDir for directory inventory/)
+    assert.match(bashPrompt, /WebSearch for public web lookups/)
+    assert.match(bashPrompt, /TaskCreate for structured progress tracking/)
 
     assert.match(readPrompt, /Prefer Read over Bash cat, sed -n, head, or tail/)
     assert.match(grepPrompt, /prefer it over Bash grep, rg, or grep \| head/)
@@ -63,5 +65,8 @@ describe('Tool prompt()', () => {
     assert.match(toolUsage!.content, /do NOT use Bash commands such as sed, head, grep, rg, or shell pipelines/)
     assert.match(toolUsage!.content, /use Grep instead of grep, rg, or grep \| head/)
     assert.match(toolUsage!.content, /use Read instead of cat, sed -n, head, or tail/)
+    assert.match(toolUsage!.content, /use WebSearch/)
+    assert.match(toolUsage!.content, /Do not send secrets, private code, credentials, tokens, or confidential user data to WebSearch/)
+    assert.match(toolUsage!.content, /use TaskCreate/)
   })
 })

@@ -163,6 +163,11 @@ export async function runGoTuiCheckReport(
       break
     }
   }
+  lines.push('[INFO]    Go TUI binary search order:')
+  for (const [index, candidate] of candidates.entries()) {
+    const marker = exists(candidate) ? (candidate === resolvedBinary ? 'selected' : 'present') : 'missing'
+    lines.push(`          ${index + 1}. ${marker} ${candidate}`)
+  }
   if (resolvedBinary) {
     lines.push(`[OK]      Go TUI binary found: ${resolvedBinary}`)
   } else if (exists(sourceDir)) {

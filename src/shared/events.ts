@@ -118,6 +118,9 @@ export const ToolDeniedEventSchema = z.object({
   name: z.string(),
   risk: z.enum(['read', 'write', 'execute', 'task']),
   message: z.string(),
+  denialKind: z.enum(['policy', 'hook', 'optimizer_safety', 'permission']).optional(),
+  recoverable: z.boolean().optional(),
+  terminal: z.boolean().optional(),
 })
 
 export const TaskCreatedEventSchema = z.object({
@@ -160,6 +163,64 @@ export const NearTimeoutWarningEventSchema = z.object({
   elapsedMs: z.number().nonnegative(),
   thresholdRatio: z.number(),
   partialSummary: z.string().optional(),
+  message: z.string(),
+})
+
+/**
+ * Soft-budget exhaustion event (Phase 2 of the
+ * task-adaptive-recoverable-timeout plan).
+ *
+ * Emitted once when the soft timeout budget has been reached but the
+ * runtime is intentionally NOT aborted — the hard watchdog is still
+ * running. The model sees this event in its next provider call and is
+ * expected to decide between continuing, summarizing, narrowing
+ * scope, or retrying the last tool with a larger budget.
+ *
+ * Unlike `near_timeout_warning` (fires at thresholdRatio * timeoutMs
+ * to nudge the model toward an early summary), this event fires AT
+ * the budget itself and is only produced when the request opted into
+ * `timeoutPolicy: 'soft'`.
+ */
+export const TimeoutBudgetExceededEventSchema = z.object({
+  type: z.literal('timeout_budget_exceeded'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  timeoutMs: z.number().int().positive(),
+  elapsedMs: z.number().nonnegative(),
+  policy: z.literal('soft'),
+  partialSummary: z.string().optional(),
+  suggestedActions: z.array(z.enum(['continue', 'summarize', 'narrow_scope', 'retry_last_tool'])).optional(),
+  message: z.string(),
+})
+
+/**
+ * Soft-budget extension granted (Phase 3 of the
+ * task-adaptive-recoverable-timeout plan).
+ *
+ * Emitted right after a `timeout_budget_exceeded` event when the
+ * runtime has an extension allowance left. The extension is granted
+ * automatically so the model has time to react to the budget warning
+ * with a deliberate choice (continue / summarize / narrow_scope /
+ * retry_last_tool); without it the model would have to react inside
+ * the same provider step that produced the exhaustion, which the
+ * model usually cannot do.
+ *
+ * `extensionCount` is 1-indexed and counts the extension just
+ * granted. `totalSoftBudgetMs` is the new running soft budget after
+ * the extension is applied. Hard watchdog is never extended here —
+ * it remains the only fatal cutoff.
+ */
+export const TimeoutExtensionGrantedEventSchema = z.object({
+  type: z.literal('timeout_extension_granted'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  extensionCount: z.number().int().positive(),
+  maxExtensions: z.number().int().nonnegative(),
+  additionalMs: z.number().int().positive(),
+  totalSoftBudgetMs: z.number().int().positive(),
+  elapsedMs: z.number().nonnegative(),
+  policy: z.literal('soft'),
+  reason: z.enum(['auto-first-budget-exhausted', 'auto-followup-budget-exhausted']),
   message: z.string(),
 })
 
@@ -296,6 +357,9 @@ export const CompactBoundaryEventSchema = z.object({
   afterEventCount: z.number(),
   summaryChars: z.number(),
   snippedToolResults: z.number(),
+  preTokens: z.number().optional(),
+  postTokens: z.number().optional(),
+  estimatedTokensSaved: z.number().optional(),
   retainedEvents: z.array(z.unknown()).optional(),
   retainedSegment: z.object({
     retainedCount: z.number(),
@@ -306,6 +370,32 @@ export const CompactBoundaryEventSchema = z.object({
   }).optional(),
   modelId: z.string().optional(),
   budget: z.unknown().optional(),
+})
+
+export const ContextCompactBoundaryEventSchema = z.object({
+  type: z.literal('context_compact_boundary'),
+  ...baseEventFields,
+  boundaryId: z.string(),
+  sourceBoundaryTimestamp: z.string(),
+  trigger: z.enum(['manual', 'auto', 'reactive']),
+  beforeEventCount: z.number(),
+  afterEventCount: z.number(),
+  preTokens: z.number().optional(),
+  postTokens: z.number().optional(),
+  estimatedTokensSaved: z.number().optional(),
+  summaryChars: z.number(),
+  snippedToolResults: z.number(),
+  messagesSummarized: z.number(),
+  droppedItemCount: z.number(),
+  retainedEventCount: z.number(),
+  retainedItemCount: z.number(),
+  droppedReasons: z.record(z.string(), z.number()).optional(),
+  preservedFirstEventId: z.string().optional(),
+  preservedTailEventId: z.string().optional(),
+  retainedSegmentHash: z.string().optional(),
+  modelId: z.string().optional(),
+  userVisibleSummary: z.string().optional(),
+  message: z.string(),
 })
 
 export const CompactFailureEventSchema = z.object({
@@ -343,6 +433,91 @@ export const ContextBlockingEventSchema = z.object({
   ...contextPolicyFields,
   httpStatus: z.literal(413),
   recoveryActions: z.array(z.enum(['compact', 'context', 'switch_model', 'reduce_tool_output'])),
+  message: z.string(),
+})
+
+export const ContextUsageEventSchema = z.object({
+  type: z.literal('context_usage'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  modelId: z.string(),
+  providerId: z.string(),
+  tokenEstimate: z.number(),
+  maxTokens: z.number(),
+  percentUsed: z.number(),
+  warningThresholdTokens: z.number(),
+  compactThresholdTokens: z.number(),
+  blockingLimitTokens: z.number(),
+  ...contextPolicyFields,
+  cachePreservationMode: z.boolean().optional(),
+  longContextUtilizationMode: z.boolean().optional(),
+  source: z.enum(['initial_refresh', 'pre_provider_call', 'after_compact', 'after_message_budget']),
+  message: z.string(),
+})
+
+export const ContextMicrocompactEventSchema = z.object({
+  type: z.literal('context_microcompact'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  trigger: z.enum(['initial_refresh', 'pre_provider_call', 'after_compact', 'after_message_budget']),
+  compactedEventCount: z.number(),
+  deduplicatedToolResultCount: z.number(),
+  bytesBefore: z.number(),
+  bytesAfter: z.number(),
+  bytesSaved: z.number(),
+  estimatedTokensSaved: z.number(),
+  message: z.string(),
+})
+
+export const ContextRecoveryAttemptedEventSchema = z.object({
+  type: z.literal('context_recovery_attempted'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  providerId: z.string().optional(),
+  modelId: z.string().optional(),
+  providerErrorCode: z.string(),
+  strategy: z.enum(['microcompact_retry', 'semantic_compact_retry', 'reduce_tool_schema_retry', 'fallback_model_retry']),
+  attempt: z.number().int().positive(),
+  maxAttempts: z.number().int().positive(),
+  preTokens: z.number(),
+  postTokens: z.number().optional(),
+  retryable: z.boolean(),
+  message: z.string(),
+})
+
+export const ContextGroundingRequiredEventSchema = z.object({
+  type: z.literal('context_grounding_required'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  boundaryId: z.string().optional(),
+  source: z.enum(['post_compact', 'resume', 'context_recovery']),
+  state: z.literal('summary-derived'),
+  requiredFor: z.array(z.enum(['file_facts', 'test_results', 'git_status', 'task_completion', 'implementation_status'])),
+  suggestedActions: z.array(z.enum(['re_read_referenced_files', 'inspect_changed_files', 'inspect_git_status', 'run_focused_tests', 'inspect_event_log'])),
+  message: z.string(),
+})
+
+export const ContextGroundingConfirmedEventSchema = z.object({
+  type: z.literal('context_grounding_confirmed'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  confirmedByToolUseId: z.string(),
+  toolName: z.string(),
+  confirmationKind: z.enum(['file_read', 'git_status', 'git_diff', 'test_output', 'event_log', 'search_result']),
+  confirmedFor: z.array(z.enum(['file_facts', 'test_results', 'git_status', 'task_completion', 'implementation_status'])),
+  source: z.enum(['tool_result', 'event_log']),
+  message: z.string(),
+})
+
+export const WorkspaceDirtyDetectedEventSchema = z.object({
+  type: z.literal('workspace_dirty_detected'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  source: z.enum(['post_compact', 'resume', 'pre_summary']),
+  changedFileCount: z.number().int().nonnegative(),
+  changedFiles: z.array(z.string()),
+  truncated: z.boolean().optional(),
+  suggestedActions: z.array(z.enum(['inspect_changed_files', 'inspect_git_status', 'inspect_diff'])),
   message: z.string(),
 })
 
@@ -418,13 +593,22 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   HookCompletedEventSchema,
   HookFailedEventSchema,
   CompactBoundaryEventSchema,
+  ContextCompactBoundaryEventSchema,
   CompactFailureEventSchema,
   ContextWarningEventSchema,
   ContextBlockingEventSchema,
+  ContextUsageEventSchema,
+  ContextMicrocompactEventSchema,
+  ContextRecoveryAttemptedEventSchema,
+  ContextGroundingRequiredEventSchema,
+  ContextGroundingConfirmedEventSchema,
+  WorkspaceDirtyDetectedEventSchema,
   SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
   ExecuteSummaryEventSchema,
   NearTimeoutWarningEventSchema,
+  TimeoutBudgetExceededEventSchema,
+  TimeoutExtensionGrantedEventSchema,
 ])
 
 export type NexusEvent = z.infer<typeof NexusEventSchema>

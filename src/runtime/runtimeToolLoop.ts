@@ -34,6 +34,23 @@ export type ProviderToolCallExecutionOutcome =
   | { kind: 'continue'; toolResult: ToolResultContentBlock }
   | { kind: 'terminal' }
 
+function recoverableDeniedToolResult(options: {
+  toolUseId: string
+  toolName: string
+  message: string
+}): ProviderToolCallExecutionOutcome {
+  return {
+    kind: 'continue',
+    toolResult: {
+      type: 'tool_result',
+      toolUseId: options.toolUseId,
+      content: `${options.message}\nChoose an allowed alternative, ask the user for confirmation, or answer from existing context.`,
+      isError: true,
+      toolName: options.toolName,
+    },
+  }
+}
+
 export async function* executeProviderToolCall(options: {
   toolCall: RuntimeProviderToolCall
   tools: Map<string, AnyTool>
@@ -109,9 +126,14 @@ export async function* executeProviderToolCall(options: {
       name: tool.name,
       risk: tool.risk,
       message,
+      denialKind: 'policy',
+      recoverable: true,
     }
-    yield buildRuntimeResultEvent(runtimeOptions.sessionId, false, message)
-    return { kind: 'terminal' }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message,
+    })
   }
 
   const preToolHooks = await executeRuntimeHooks(
@@ -128,7 +150,7 @@ export async function* executeProviderToolCall(options: {
       role: runtimeOptions.role,
       signal: runtimeOptions.signal,
     },
-    { config: runtimeOptions.hooks },
+    { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
   )
   for (const hookEvent of preToolHooks.events) yield hookEvent
   const hookDenyReason = firstHookDenyReason(preToolHooks)
@@ -139,9 +161,14 @@ export async function* executeProviderToolCall(options: {
       name: tool.name,
       risk: tool.risk,
       message: hookDenyReason,
+      denialKind: 'hook',
+      recoverable: true,
     }
-    yield buildRuntimeResultEvent(runtimeOptions.sessionId, false, hookDenyReason)
-    return { kind: 'terminal' }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message: hookDenyReason,
+    })
   }
   const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
   if (hookUpdatedInput !== undefined) {
@@ -177,6 +204,7 @@ export async function* executeProviderToolCall(options: {
         role: runtimeOptions.role,
         signal: runtimeOptions.signal,
       },
+      { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
     )
     for (const hookEvent of failureHooks.events) yield hookEvent
     message = mergeHookRetryHints(message, failureHooks)
@@ -213,9 +241,14 @@ export async function* executeProviderToolCall(options: {
       name: tool.name,
       risk: tool.risk,
       message,
+      denialKind: 'optimizer_safety',
+      recoverable: true,
     }
-    yield buildRuntimeResultEvent(runtimeOptions.sessionId, false, message)
-    return { kind: 'terminal' }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message,
+    })
   }
 
   if ((tool.risk === 'write' || tool.risk === 'execute') && !runtimeOptions.skipPermissionCheck) {
@@ -266,7 +299,7 @@ export async function* executeProviderToolCall(options: {
           role: runtimeOptions.role,
           signal: runtimeOptions.signal,
         },
-        { config: runtimeOptions.hooks },
+        { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
       )
       for (const hookEvent of permissionHooks.events) yield hookEvent
 
@@ -308,6 +341,8 @@ export async function* executeProviderToolCall(options: {
         name: tool.name,
         risk: tool.risk,
         message: denyMessage,
+        denialKind: 'permission',
+        terminal: true,
       }
       yield buildRuntimeResultEvent(runtimeOptions.sessionId, false, denyMessage)
       return { kind: 'terminal' }
@@ -391,7 +426,7 @@ export async function* executeProviderToolCall(options: {
       role: runtimeOptions.role,
       signal: runtimeOptions.signal,
     },
-    { config: runtimeOptions.hooks },
+    { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
   )
   for (const hookEvent of postToolHooks.events) yield hookEvent
 

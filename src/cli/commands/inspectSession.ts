@@ -46,6 +46,28 @@ export type SessionRow = {
   result: string | null
   error: string | null
   eventCount: number
+  compactBoundaries: CompactBoundaryInspection[]
+}
+
+export type CompactBoundaryInspection = {
+  type: 'compact_boundary' | 'context_compact_boundary'
+  timestamp: string | null
+  trigger: string | null
+  boundaryId: string | null
+  beforeEventCount: number | null
+  afterEventCount: number | null
+  preTokens: number | null
+  postTokens: number | null
+  estimatedTokensSaved: number | null
+  summaryChars: number | null
+  snippedToolResults: number | null
+  messagesSummarized: number | null
+  droppedItemCount: number | null
+  retainedItemCount: number | null
+  retainedEventCount: number | null
+  preservedTailEventId: string | null
+  retainedSegmentHash: string | null
+  userVisibleSummary: string | null
 }
 
 export type ClientLogHit = {
@@ -161,11 +183,13 @@ export function findSessionInSqlite(
     // Count events (separate query so we can return the row even when
     // the events table is empty).
     let eventCount = 0
+    let compactBoundaries: CompactBoundaryInspection[] = []
     try {
       const countRow = db
         .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id = ?`)
         .get(sessionId) as { n: number } | undefined
       eventCount = countRow?.n ?? 0
+      compactBoundaries = listCompactBoundaryInspections(db, sessionId)
     } catch {
       // events table missing → 0
     }
@@ -180,12 +204,90 @@ export function findSessionInSqlite(
       result: row.result,
       error: row.error,
       eventCount,
+      compactBoundaries,
     }
   } catch {
     return null
   } finally {
     try { db.close() } catch { /* ignore */ }
   }
+}
+
+function listCompactBoundaryInspections(
+  db: DatabaseSync,
+  sessionId: string,
+): CompactBoundaryInspection[] {
+  const rows = db
+    .prepare(
+      `SELECT timestamp, event_json FROM events
+       WHERE session_id = ?
+         AND event_type IN ('compact_boundary', 'context_compact_boundary')
+       ORDER BY timestamp ASC, event_key ASC
+       LIMIT 20`,
+    )
+    .all(sessionId) as { timestamp: string | null; event_json: string | null }[]
+  const boundaries: CompactBoundaryInspection[] = []
+  for (const row of rows) {
+    if (!row.event_json) continue
+    let event: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(row.event_json)
+      if (!parsed || typeof parsed !== 'object') continue
+      event = parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+    if (event.type !== 'compact_boundary' && event.type !== 'context_compact_boundary') continue
+    const retainedSegment = event.retainedSegment && typeof event.retainedSegment === 'object'
+      ? event.retainedSegment as Record<string, unknown>
+      : undefined
+    const retainedEvents = Array.isArray(event.retainedEvents) ? event.retainedEvents : undefined
+    const retainedCount = numericField(event, 'retainedEventCount')
+      ?? numericField(event, 'retainedItemCount')
+      ?? numericField(retainedSegment, 'retainedCount')
+      ?? (retainedEvents ? retainedEvents.length : null)
+    boundaries.push({
+      type: event.type,
+      timestamp: stringOrNull(event.timestamp) ?? row.timestamp,
+      trigger: stringOrNull(event.trigger),
+      boundaryId: stringOrNull(event.boundaryId) ?? stringOrNull(retainedSegment?.boundaryId),
+      beforeEventCount: numericField(event, 'beforeEventCount'),
+      afterEventCount: numericField(event, 'afterEventCount'),
+      preTokens: numericField(event, 'preTokens'),
+      postTokens: numericField(event, 'postTokens'),
+      estimatedTokensSaved: numericField(event, 'estimatedTokensSaved'),
+      summaryChars: numericField(event, 'summaryChars'),
+      snippedToolResults: numericField(event, 'snippedToolResults'),
+      messagesSummarized: numericField(event, 'messagesSummarized'),
+      droppedItemCount: numericField(event, 'droppedItemCount'),
+      retainedItemCount: numericField(event, 'retainedItemCount') ?? retainedCount,
+      retainedEventCount: numericField(event, 'retainedEventCount') ?? retainedCount,
+      preservedTailEventId: stringOrNull(event.preservedTailEventId) ?? stringOrNull(retainedSegment?.lastEventId),
+      retainedSegmentHash: stringOrNull(event.retainedSegmentHash) ?? stringOrNull(retainedSegment?.hash),
+      userVisibleSummary: truncatePlain(stringOrNull(event.userVisibleSummary) ?? stringOrNull(event.summary), 200),
+    })
+  }
+  return boundaries
+}
+
+function numericField(record: Record<string, unknown> | undefined, key: string): number | null {
+  if (!record) return null
+  const value = record[key]
+  if (typeof value === 'number' && Number.isFinite(value)) return value
+  if (typeof value === 'string' && value.trim() !== '') {
+    const parsed = Number(value)
+    if (Number.isFinite(parsed)) return parsed
+  }
+  return null
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null
+}
+
+function truncatePlain(value: string | null, maxChars: number): string | null {
+  if (!value) return null
+  return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`
 }
 
 /**
@@ -333,6 +435,18 @@ export function inspectSession(sessionId: string): InspectSessionTier {
  *
  * Pure function: read-only, no I/O outside the given log path.
  */
+function formatCompactBoundaryInspection(boundary: CompactBoundaryInspection): string {
+  const counts = `${boundary.beforeEventCount ?? '?'} -> ${boundary.afterEventCount ?? '?'} events`
+  const tokens = boundary.preTokens !== null || boundary.postTokens !== null
+    ? ` tokens=${boundary.preTokens ?? '?'}/${boundary.postTokens ?? '?'}`
+    : ''
+  const saved = boundary.estimatedTokensSaved !== null ? ` saved=${boundary.estimatedTokensSaved}` : ''
+  const retained = boundary.retainedEventCount !== null ? ` retained=${boundary.retainedEventCount}` : ''
+  const tail = boundary.preservedTailEventId ? ` tail=${boundary.preservedTailEventId}` : ''
+  const summary = boundary.userVisibleSummary ? ` summary="${boundary.userVisibleSummary}"` : ''
+  return `${boundary.type} trigger=${boundary.trigger ?? 'unknown'} ${counts}${tokens}${saved}${retained}${tail}${summary}`
+}
+
 export function reverseResolveClientSessionId(
   clientLogPath: string,
   clientSessionId: string,
@@ -405,6 +519,12 @@ export function registerInspectSessionCommand(program: Command): void {
         console.log(`  created_at : ${row.createdAt ?? '<unknown>'}`)
         console.log(`  updated_at : ${row.updatedAt ?? '<unknown>'}`)
         console.log(`  events     : ${row.eventCount}`)
+        if (row.compactBoundaries.length > 0) {
+          console.log(`  compact boundaries:`)
+          for (const boundary of row.compactBoundaries.slice(-5)) {
+            console.log(`    - ${formatCompactBoundaryInspection(boundary)}`)
+          }
+        }
         if (row.prompt) {
           console.log(`  prompt     : ${row.prompt.slice(0, 100)}${row.prompt.length > 100 ? '…' : ''}`)
         }

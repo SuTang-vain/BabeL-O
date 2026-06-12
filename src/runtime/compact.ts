@@ -11,6 +11,7 @@ import {
 } from './contextAssembler.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
 import { llmSummarizeEvents } from './compactSummary.js'
+import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
@@ -27,6 +28,7 @@ export type CompactSessionOptions = {
 
 export type CompactSessionResult = {
   event: Extract<NexusEvent, { type: 'compact_boundary' }>
+  contextEvent: Extract<NexusEvent, { type: 'context_compact_boundary' }>
   beforeEventCount: number
   afterEventCount: number
   summaryLatencyMs: number
@@ -63,6 +65,7 @@ export async function compactSession(
     selectRecentEvents(compactableEvents, budget),
   )
   const omittedEvents = selectOmittedEvents(compactableEvents, selectedEvents)
+  const beforeTokenEstimate = estimateEventsAsProviderTokens(compactableEvents, options.initialPrompt ?? '')
   const priorSummary = previousBoundary?.event.summary.trim()
   const mapFn = options.mapEventsToMessages
   const summaryStartMs = performance.now()
@@ -84,6 +87,7 @@ export async function compactSession(
     .join('\n')
     .trim()
   const fallbackSummary = summary || 'Manual compact boundary created; no earlier events required summarization.'
+  const afterTokenEstimate = estimateEventsAsProviderTokens(selectedEvents, options.initialPrompt ?? '', fallbackSummary)
 
   const event: Extract<NexusEvent, { type: 'compact_boundary' }> = {
     type: 'compact_boundary',
@@ -94,14 +98,19 @@ export async function compactSession(
     afterEventCount: selectedEvents.length + 1,
     summaryChars: fallbackSummary.length,
     snippedToolResults: countLargeToolResults(omittedEvents, budget.snipToolOutputChars),
+    preTokens: beforeTokenEstimate,
+    postTokens: afterTokenEstimate,
+    estimatedTokensSaved: Math.max(0, beforeTokenEstimate - afterTokenEstimate),
     retainedEvents: selectedEvents,
     modelId,
     budget,
   }
   event.retainedSegment = buildRetainedSegmentMetadata(selectedEvents, event)
+  const contextEvent = buildContextCompactBoundaryEvent(event)
 
   if (options.persist !== false) {
     await options.storage.appendEvent(options.sessionId, event)
+    await options.storage.appendEvent(options.sessionId, contextEvent)
     const memoryDecision = shouldUpdateSessionMemoryLite(events, { force: true })
     const memoryEvent = await updateSessionMemoryLite({
       sessionId: options.sessionId,
@@ -122,10 +131,70 @@ export async function compactSession(
 
   return {
     event,
+    contextEvent,
     beforeEventCount: event.beforeEventCount,
     afterEventCount: event.afterEventCount,
     summaryLatencyMs,
   }
+}
+
+export function buildContextCompactBoundaryEvent(
+  boundary: Extract<NexusEvent, { type: 'compact_boundary' }>,
+): Extract<NexusEvent, { type: 'context_compact_boundary' }> {
+  const retainedSegment = boundary.retainedSegment
+  const retainedEventCount = Array.isArray(boundary.retainedEvents)
+    ? boundary.retainedEvents.length
+    : (retainedSegment?.retainedCount ?? Math.max(0, boundary.afterEventCount - 1))
+  const messagesSummarized = Math.max(0, boundary.beforeEventCount - retainedEventCount)
+  const droppedItemCount = Math.max(0, boundary.beforeEventCount - retainedEventCount)
+  const boundaryId = retainedSegment?.boundaryId ?? `${boundary.sessionId}:${boundary.timestamp}:compact_boundary`
+  const summary = boundary.summary.trim()
+  const userVisibleSummary = summary ? truncate(summary, 500) : undefined
+  const droppedReasons = boundary.snippedToolResults > 0
+    ? { large_tool_result: boundary.snippedToolResults }
+    : undefined
+  return {
+    type: 'context_compact_boundary',
+    ...eventBase(boundary.sessionId),
+    boundaryId,
+    sourceBoundaryTimestamp: boundary.timestamp,
+    trigger: boundary.trigger,
+    beforeEventCount: boundary.beforeEventCount,
+    afterEventCount: boundary.afterEventCount,
+    ...(boundary.preTokens !== undefined && { preTokens: boundary.preTokens }),
+    ...(boundary.postTokens !== undefined && { postTokens: boundary.postTokens }),
+    ...(boundary.estimatedTokensSaved !== undefined && { estimatedTokensSaved: boundary.estimatedTokensSaved }),
+    summaryChars: boundary.summaryChars,
+    snippedToolResults: boundary.snippedToolResults,
+    messagesSummarized,
+    droppedItemCount,
+    retainedEventCount,
+    retainedItemCount: retainedEventCount,
+    ...(droppedReasons && { droppedReasons }),
+    ...(retainedSegment?.firstEventId && { preservedFirstEventId: retainedSegment.firstEventId }),
+    ...(retainedSegment?.lastEventId && { preservedTailEventId: retainedSegment.lastEventId }),
+    ...(retainedSegment?.hash && { retainedSegmentHash: retainedSegment.hash }),
+    ...(boundary.modelId && { modelId: boundary.modelId }),
+    ...(userVisibleSummary && { userVisibleSummary }),
+    message: `Context compact boundary ${boundary.trigger}: ${boundary.beforeEventCount} -> ${boundary.afterEventCount} events; retained ${retainedEventCount}.`,
+  }
+}
+
+function truncate(value: string, maxChars: number): string {
+  return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`
+}
+
+function estimateEventsAsProviderTokens(
+  events: NexusEvent[],
+  initialPrompt: string,
+  summary?: string,
+): number {
+  const content = [
+    summary ? `Compact summary:\n${summary}` : '',
+    JSON.stringify(events),
+    initialPrompt,
+  ].filter(Boolean).join('\n')
+  return estimateContextTokens({ messages: [{ role: 'user', content }] }).totalTokens
 }
 
 function inferSessionCwd(events: NexusEvent[]): string | undefined {

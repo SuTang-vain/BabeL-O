@@ -8,6 +8,8 @@
 - [TODO_tool_result_budget.md](./TODO_tool_result_budget.md): 已完成的工具结果持久化与消息级预算历史设计。
 - [intake-classifier-upgrade-plan.md](./intake-classifier-upgrade-plan.md): 已完成的 Intake Classifier Phase 1-4 历史规划。
 - [tool-call-text-leakage-governance.md](./tool-call-text-leakage-governance.md): 已完成 Phase A-C 的 Tool-call Text Leakage 治理设计。
+- [phase-9-promotion-decision.md](./phase-9-promotion-decision.md): 已收口的 Go TUI Phase 9 stable-alternative 提升决策记录。
+- [go-tui-v1-ui-upgrade.md](./go-tui-v1-ui-upgrade.md): 已完成的 Go TUI v1 UI/UX 升级规划与实施记录。
 
 ## 维护规则
 

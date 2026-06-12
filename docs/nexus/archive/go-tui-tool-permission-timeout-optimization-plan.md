@@ -3,6 +3,8 @@
 > Status: **Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 landed**
 > Priority: P1 Watch；基于真实 session `session_dcf7e34e-bc59-41e4-b802-e4d03d32b48d` 的失败链路，优先减少只读源码分析中的 Bash 权限噪音与 180s 顶层 timeout 风险。
 > 真实样本: `session_dcf7e34e-bc59-41e4-b802-e4d03d32b48d`（Go TUI session，用户请求“查看并分析go tui状态机”；184 events；19 tools 全成功；10 次 Bash permission 全 approved；最终 `REQUEST_TIMEOUT`）。
+>
+> **范围拆分提示**：本规划解决“权限/工具噪音 + near-timeout warning + Bash read-only classifier + adaptive Go TUI timeout”这层局部降噪；它没有改变 180s 顶层 cutoff 的语义。`session_791b10ce-0d41-409d-b2de-1e5d14eb19b3` 真实样本暴露的“仍在推进时被 fatal cutoff 直接 abort”这个更底层产品语义已由 [task-adaptive-recoverable-timeout-plan.md](./task-adaptive-recoverable-timeout-plan.md) 接手并 Phase 0~6 全部落地（soft policy + soft cycle + auto extension + Go TUI 软超时可见化 + hard watchdog `details.kind='watchdog'` 标记与清理 + DONE 同步），两份规划是“降噪” vs “fatal timeout 语义”的互补关系，不应再把本规划用于追加 fatal timeout 行为变更。
 
 ---
 
@@ -340,7 +342,7 @@ session 在 180s 顶层 timeout 时已经产出大量分析内容，但最终 `r
 ## 9. 与既有规划关系
 
 - [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md)：本文件是其后续优化。既有规划解决 Bash hard-deny 截胡 permission panel；本文件解决 permission panel 过度触发与 session-scope 复用不足。
-- [go-tui-execute-timeout-governance-plan.md](./go-tui-execute-timeout-governance-plan.md)：本文件复用其 timeout 可观测性成果，但不把提高 timeout 当根治；重点是减少 tool/approval 耗时和补 partial-result 韧性。
+- [go-tui-execute-timeout-governance-plan.md](../archive/go-tui-execute-timeout-governance-plan.md)：本文件复用其 timeout 可观测性成果，但不把提高 timeout 当根治；重点是减少 tool/approval 耗时和补 partial-result 韧性。
 - [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md)：本文件落实其中的工具边界：源码阅读优先 `Read` / `Grep` / `ListDir`，避免用 Bash 代替专用读工具。
 - [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md)：本文件依赖其 session 可复盘能力；`session_dcf7e34e-bc59-41e4-b802-e4d03d32b48d` 能被 SQLite 复盘，才暴露出该链路。
 

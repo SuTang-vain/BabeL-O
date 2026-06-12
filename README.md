@@ -9,218 +9,161 @@
   <strong>Technical support provided by KezhongKe (壳中客).</strong>
 </p>
 
-> **A high-performance, Nexus-first generalized AI agent. Built with Fastify and Node.js, featuring an isolated runtime, stdio-based MCP client, dynamic context compaction, and multi-agent coordination, all controllable via a lightweight interactive TUI CLI.**
+> **A Nexus-first AI coding agent with a fast Go TUI, persistent sessions, tool-aware execution, and cross-session collaboration.**
 
 [简体中文 README](README.zh-CN.md)
 
 ---
 
-## What is BabeL-O?
+## What Is BabeL-O?
 
-BabeL-O is a **Nexus-first generalized agentic AI system**, shifting the core intelligence and execution out of the client terminal and into a headless server runtime (**Nexus**). It operates under a strict design philosophy:
+BabeL-O is a terminal-first AI agent for real coding work. The interactive client stays light and responsive, while Nexus keeps the durable runtime state: sessions, tools, permissions, context, memory, and execution traces.
 
-> **Nexus owns execution. CLI owns interaction.**
+The production interactive entrypoint is the Go TUI:
 
-By decoupling the terminal user interface (TUI) from the execution engine, BabeL-O can run as a persistent backend service, a headless CI agent, or a containerized task-solving agent, while providing users with a lightning-fast, zero-overhead CLI client (`bbl`) for day-to-day operations.
-
----
-
-## Architecture
-
-BabeL-O segregates CLI rendering from runtime execution. The client and server communicate via lightweight REST endpoints and a WebSocket event stream.
-
-```mermaid
-graph TD
-    subgraph TUI_CLI [TUI CLI - Terminal Client]
-        Program[Program cli/program.ts] --> Renderer[Renderer cli/renderEvents.ts]
-        Renderer --> Client[NexusClient cli/NexusClient.ts]
-    end
-
-    subgraph Nexus_Server [Nexus Server - Fastify Daemon]
-        Routes[REST API Routes]
-        WS[WebSocket Stream]
-        Agent[Agent Loop agentLoop.ts]
-
-        Routes --- WS
-        WS --- Agent
-    end
-
-    subgraph Runtime_Layer [Runtime Layer]
-        Local[LocalCodingRuntime]
-        LLM[LLMCodingRuntime]
-    end
-
-    subgraph Core_Services [Core Services & Storage]
-        Tools[Builtin Tools & MCP Registry]
-        Storage[(SQLite / Memory Storage)]
-        Providers[Provider Registry / LLM Adapters]
-    end
-
-    Client -- HTTP / WebSockets --> Nexus_Server
-    Nexus_Server --> Runtime_Layer
-    Runtime_Layer --> Core_Services
+```bash
+bbl go
 ```
 
----
+It connects to Nexus, can auto-start a local Nexus service for you, and gives you a polished terminal workspace for chatting, running tools, switching sessions, inspecting context, approving permissions, and coordinating work across sessions.
 
-## Key Features
-
-- **Decoupled Engine (Zero React/Ink Dependency)**: Zero React or Ink component overhead. Standard Node.js readline and event streams yield sub-second startup times and clean execution.
-- **Dual Runtime execution**:
-  - `LocalCodingRuntime`: Deterministic pattern-matching for quick, cost-free local adjustments.
-  - `LLMCodingRuntime`: Dynamic agent loop running up to 25 loops per turn, scheduling tool calls and executing actions.
-- **Context Compaction & State Rebuild**: Automatically compacts conversations past token thresholds (`compact_boundary`). Unlike typical message truncation, it extracts file reads and active tasks before compaction to reconstruct the system prompt, maintaining long-context memory.
-- **Opt-in Docker Sandboxing & Shell HMAC Probe**: Runs shell execution (`bash`) inside Docker containers natively with CPU, memory, and network constraints. Local execution uses cryptographically signed HMAC nonces to prevent CWD spoofing and shell injection attacks.
-- **Strict Workspace Path Safety**: Restricts all file accesses to configured workspaces (`pathSafety.ts`). Avoids traversal escapes via symlink checks.
-- **Native MCP Stdio client**: Automatically maps stdio-based MCP servers configured in `mcp.json` into risk-classified tools.
-- **Planner ➔ Executor ➔ Critic Pipeline**: Coordinates multi-agent flows inside task-scoped Git Worktrees with mutex file locks to enable parallel execution without merge conflicts.
-- **SessionChannel Collaboration (v0.3.2)**: A typed, preview-then-confirm side-channel for sharing findings, review requests, handoffs, and decisions between sessions. Renders as Inbox / Activity / Channels graph overlays in the TUI and is exposed via `bbl sessions inbox` / `bbl sessions ack` for headless consumers. Side-channel content is always context, never a direct user instruction.
-- **Hardened Chat Launch**: `bbl chat` now refuses to start when stdin/stdout are not TTYs, and the standalone-binary build keeps a no-op event-loop interval so the prompt does not disappear when idle.
-- **Structured Persistent Audits**: Automatically saves all tool inputs, outputs, tokens, and permission logs into SQLite (`node:sqlite`).
+<p align="center">
+  <img src="docs/assets/product.png" alt="BabeL-O Go TUI product screenshot" width="920" />
+</p>
 
 ---
 
-## Installation
+## Highlights
 
-You can install BabeL-O by using the release installer, downloading a pre-compiled native binary directly, or building it from source.
+- **Production Go TUI**: `bbl go` is the default daily interactive client, with a Bubble Tea interface, multi-line input, slash-command panels, permission dialogs, context inspection, and responsive transcript rendering.
+- **Persistent Nexus Sessions**: Work continues across restarts with session history, tool traces, usage telemetry, compacted context, and inspectable session metadata.
+- **Session Switching and Conversation Flow**: The `/session` panel supports creating, selecting, switching, and copying session IDs without leaving the TUI.
+- **SessionChannel Collaboration**: Typed side-channel messages let sessions exchange findings, handoffs, review requests, decisions, and memory candidates without treating those messages as direct user instructions.
+- **Context and Memory Awareness**: `/context` shows budget, compaction, memory, recovery, and working-set diagnostics so long conversations stay understandable.
+- **Permission-First Tooling**: Sensitive tools such as Bash, Write, Edit, and MCP tools go through visible approval flows with session-level trust options and audit logs.
+- **MCP and Built-in Tools**: Read, Grep, ListDir, Bash, WebSearch, and configured MCP servers are exposed as risk-classified tools.
+- **Model and Profile Control**: Switch model/provider profiles from the TUI while Nexus keeps shared runtime configuration consistent.
 
-### Method 1: Release Installer (Recommended & Fastest)
+---
+
+## Install
+
+### Release Installer
 
 On macOS and Linux, the installer detects your platform, downloads the latest matching GitHub release binary, and installs it as `bbl`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
-bbl chat
+bbl go
 ```
 
-To install a specific release, pass `BBL_VERSION` to the installer process:
+Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.2 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.3 bash
+bbl go
 ```
 
-The installer downloads to a temporary file, retries failed downloads, validates the release asset size when GitHub provides it, and refuses to install non-binary HTTP error bodies.
+### Manual Release Binary
 
-### Method 2: Pre-compiled Native Binary
+Download the latest standalone executable from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.3 release notes](docs/releases/v0.3.3.md) for version-specific links.
 
-Download the latest standalone executable binary (`bbl` for macOS/Linux, `bbl.exe` for Windows) from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/v0.3.2.md) for version-specific download links.
+Move the downloaded `bbl` binary into your `$PATH`, then run:
 
-Move the downloaded binary to a directory in your system `$PATH` (e.g., `/usr/local/bin` on macOS/Linux), and run:
 ```bash
-# Start an interactive chat session directly (no Node.js installation required)
-bbl chat
+bbl go
 ```
 
----
+### Build From Source
 
-### Method 3: Build from Source (For Development)
+Prerequisites:
 
-#### Prerequisites
+- Node.js >= 22
+- npm
+- Go toolchain for local Go TUI development
+- Optional Docker for sandboxed shell execution
 
-*   **Node.js >= 22** (uses native ESM and native SQLite modules)
-*   **npm** or **yarn**
-*   *Optional:* Docker (for isolated sandbox execution)
-
-#### Steps:
 ```bash
-# Clone the repository
 git clone https://github.com/SuTang-vain/BabeL-O.git
 cd BabeL-O
-
-# Install dependencies exactly from package-lock.json
 npm ci
-
-# Run unit and integration tests
 npm test
-
-# Option A: Build and run via npm scripts
 npm run build
-npm run start # Start the Nexus background daemon
-
-# Option B: Compile into a native standalone binary
-# If the current Node.js runtime lacks native --build-sea support, the build script
-# downloads and caches an official Node.js 26.x builder automatically.
-npm run build:binary
-```
-
-For contributor development, see the [`dev` branch development guide](https://github.com/SuTang-vain/BabeL-O/blob/dev/docs/DEVELOPMENT.md).
-
-In a separate terminal, if using Option A, link the CLI globally and start:
-```bash
 npm link
-bbl chat
-```
-If using Option B, you can run the generated binary directly:
-```bash
-./dist/bbl chat
+bbl go
 ```
 
-#### Standalone Native Binary Compilation (Node.js SEA) Features:
-* **Fully self-contained**: Runs on target systems without Node.js or `node_modules` pre-installed.
-* **Embedded Resources**: Built-in developer skills (`.md` files) are baked directly into the binary as native assets, loaded dynamically at runtime.
-* **Homebrew & Stripped Runtime Workaround**: If the compiling environment uses a stripped Node.js binary (common with macOS Homebrew), the build script automatically downloads, caches, and compiles with the official Node.js runtime template.
-* **ESM require shim**: Uses dynamic shimming to support CommonJS dependency requirements inside the bundled ESM codebase.
+Build the standalone Node binary:
+
+```bash
+npm run build:binary
+./dist/bbl go
+```
+
+Build the local Go TUI binary used by `bbl go` from a source checkout:
+
+```bash
+cd clients/go-tui
+make build
+cd ../..
+bbl go --check
+```
 
 ---
 
-## CLI Usage Guide
+## Quick Start
 
 ```bash
-bbl chat                         # Start an interactive CLI chat session
-bbl chat dev                     # Source-tree chat with the `dev` title marker
-bbl run <prompt>                 # Run a one-shot prompt task
-bbl optimize                     # Launch self-optimization workflows
-bbl nexus start                  # Launch the background Nexus daemon
-bbl nexus status                 # Query Nexus health status
-bbl sessions list                # List persistent sessions with relationship badges
-bbl sessions tree                # Show parent-child session tree
-bbl sessions inbox <sessionId>   # List unread SessionChannel inbox messages
-bbl sessions ack <sessionId> <messageId>   # Acknowledge a SessionChannel inbox message
-bbl sessions inspect <sessionId> # Inspect session details and trace files
-bbl tools list                   # List available tools and check permissions
-bbl tools audit                  # Detailed audit logs of past tool activities
-bbl config show                  # Display configuration settings
+bbl go                           # Start the production Go TUI
+bbl go --check                   # Verify Go TUI binary, Nexus health, and compatibility
+bbl run "summarize this repo"     # Run a one-shot prompt without opening the TUI
+bbl nexus status                 # Check Nexus health
+bbl sessions list                # List persisted sessions
+bbl sessions inspect <sessionId> # Inspect session details and traces
+bbl tools list                   # List available tools
+bbl tools audit                  # Review tool audit history
+bbl config show                  # Show active configuration
 ```
 
-### Keyboard Shortcuts in Chat
+Inside the Go TUI:
 
-| Shortcut / Input | Action |
+| Input | Action |
 | :--- | :--- |
-| `Ctrl+C` | Cancels the active LLM generation loop (does not close CLI) |
-| `/help` | Prints the slash palette commands |
-| `/clear` | Clears the terminal screen |
-| `/exit` | Exits the chat session |
-| `/model <id>` | Dynamically switches the active LLM model |
-| `/status` | Details the active session configuration and health |
-| `/inbox` | Opens the SessionChannel inbox overlay |
-| `/collaborate` | Opens the unified Inbox / Channels / Agents hub |
-| `/channels graph` | Renders a debug-only SessionChannel topology view |
-| `/channel send ...` | Previews a typed SessionChannel message send |
-| `/channel send confirm` | Sends the previously previewed SessionChannel message |
-| `/activity` | Shows the recent SessionChannel activity feed |
-| Permission picker | Selects allow/deny scope for a pending permission request |
+| `/` | Open the slash-command palette |
+| `/session` | Open the session operations panel |
+| `/context` | Inspect current context budget and diagnostics |
+| `/tools` or `Ctrl+O` | Open the tools panel |
+| `/model` or `Ctrl+L` | Open model/profile selection |
+| `Ctrl+D` | Open the top status panel |
+| `Shift+Enter` | Insert a newline in the input box |
+| `Ctrl+C` | Open the quit confirmation dialog |
+| `Esc` | Close the active panel/dialog |
 
-### SessionChannel Collaboration
+---
 
-v0.3.2 promotes SessionChannel into a user-visible capability. The chat loop treats side-channel messages as **typed context, not direct user instructions**: every `question`, `answer`, `finding`, `request_review`, `request_validation`, `hypothesis`, `decision`, `blocked`, `memory_candidate`, or `handoff` payload is rendered in a dedicated overlay (Inbox / Activity / Channels graph) and must be confirmed by an explicit `confirm` step before it is dispatched.
+## Session Collaboration
 
-The collaboration flow:
+BabeL-O treats session-to-session messages as collaboration context, not as hidden prompts. A message can carry a finding, handoff, review request, validation request, hypothesis, decision, blocked state, or memory candidate, but the receiving session must still verify and act explicitly.
 
-1. **Inspect** – Use `/inbox`, `/activity`, or `/collaborate` to see unread messages, recent activity, or open channels for the current session.
-2. **Preview** – Use `/channel send channel=<id> [to=<sessionId>|broadcast=true] [type=...] [priority=...] -- <message>` to render a send preview, or `/inbox reply channel=<id> message=<id> -- <message>` to draft a reply.
-3. **Confirm** – Re-issue the same command with `confirm` appended. The previous draft is sent, the new draft replaces it, or `cancel` discards it.
+Useful commands:
 
-Outside the TUI, `bbl sessions inbox <sessionId>` exposes the same inbox for CI / headless consumers, and `bbl sessions ack <sessionId> <messageId>` marks a message as acknowledged without sending a reply. `bbl sessions tree` renders the parent / child relationship of a session, and `bbl sessions list` decorates every row with relationship badges (parent, child, peer, bridge).
+```bash
+bbl sessions list
+bbl sessions tree
+bbl sessions inbox <sessionId>
+bbl sessions ack <sessionId> <messageId>
+bbl sessions inspect <sessionId>
+```
 
-Hard rule: side-channel messages are never a substitute for an actual user prompt. The chat loop never auto-executes actions from inbox text and always treats `SessionChannel` content as collaboration context to verify.
+In the Go TUI, use `/session` to create or switch sessions, `/inbox` to inspect cross-session messages, and `/activity` to review recent collaboration events.
 
 ---
 
 ## Configuration
 
-BabeL-O manages its options via `~/.babel-o/config.json`.
+BabeL-O stores local configuration in `~/.babel-o/config.json`.
 
-Example configuration:
+Example:
 
 ```json
 {
@@ -231,81 +174,39 @@ Example configuration:
 }
 ```
 
-### Supported Providers
+Supported providers include:
 
-- `anthropic` (supports native prompt caching and reasoning thinking streams)
-- `openai` (standard OpenAI-compatible chat/completions)
-- `deepseek` (OpenAI-compatible DeepSeek models)
-- `moonshot` (OpenAI-compatible Moonshot/Kimi models)
-- `ollama` (local OpenAI-compatible endpoint, no API key by default)
-- `zhipu` (Anthropic-compatible GLM endpoint)
-- `minimax` (Anthropic-compatible endpoint with MiniMax text-encoded tool-call normalization)
-- `local` (mock adapter used for tests and benchmarks)
-
----
-
-## Nexus API & Streaming Specifications
-
-The Nexus Server runs Fastify and exposes endpoints for custom UIs and remote platforms:
-
-### REST API
-
-- `POST /v1/sessions` - Initiates a persistent session
-- `POST /v1/sessions/:id/input` - Submits a prompt payload
-- `POST /v1/sessions/:id/approve` / `deny` - Responds to permission requests
-- `GET /v1/sessions/:id/tool-traces` - Queries audit trail databases
-
-### WebSocket Endpoint
-
-```
-GET /v1/stream?sessionId=<id>
-```
-
-Yields a structured event stream (`NexusEvent`):
-*   `session_started` / `session_ended`
-*   `assistant_delta` (streaming assistant text)
-*   `thinking_delta` (streaming raw reasoning blocks)
-*   `tool_started` / `tool_completed` / `tool_denied` (tool boundaries)
-*   `permission_request` / `permission_response` (interactive loops)
-*   `inbox_message` / `channel_activity` (SessionChannel side-channel events)
-*   `usage` (cost tracking telemetry)
-*   `result` / `error` (final execution state)
+- `anthropic`
+- `openai`
+- `deepseek`
+- `moonshot`
+- `ollama`
+- `zhipu`
+- `minimax`
+- `local` for tests and benchmarks
 
 ---
 
-## Directory Structure
+## Safety Model
 
-```
-BabeL-O/
-├── bin/
-│   └── bbl.js                    # CLI entry point (tsx launcher)
-├── src/
-│   ├── nexus/                    # Fastify Server, TaskQueue & AgentLoop
-│   ├── runtime/                  # Dual Runtimes, context assembly & Compaction
-│   ├── tools/                    # Core tools (Read, Edit, Bash) & pathSafety
-│   ├── mcp/                      # JSON-RPC MCP clients & wrapping adapters
-│   ├── providers/                # Model adapters (Anthropic/OpenAI)
-│   ├── cli/                      # Commander commands & text/Chalk UI renderers
-│   │                             # Includes inboxOverlay, activityOverlay, channelGraph,
-│   │                             # channelSend, and collaborateOverlay for SessionChannel
-│   ├── storage/                  # SQLite storage backend
-│   ├── skills/                   # Prompt skill matcher & parser
-│   └── shared/                   # Schemas, events, and configuration types
-└── test/                         # Unit and integration test suites
-```
+BabeL-O is designed around explicit boundaries:
+
+- Workspace path checks protect file access from traversal and symlink escapes.
+- Risky tools require visible permission decisions.
+- Tool inputs, outputs, approvals, denials, and usage events are persisted for inspection.
+- SessionChannel content is never executed as a direct instruction.
+- Nexus remains the source of truth for runtime state, while the TUI focuses on interaction.
 
 ---
 
-## Roadmap & Future Plan
+## Documentation
 
-In the upcoming phases (Phase 10), the project’s strategic direction will focus on:
-* **Go TUI (`bbl go`) as the Production Release Client**: Promoted to the default user interface (via the main `bbl` command). It will be compiled into a zero-dependency, ultra-lightweight standalone binary (~10MB) for distribution, handling silent local Nexus daemon startup and offering high-performance viewport rendering.
-* **TypeScript TUI (`bbl chat`) as the Developer Playground**: Retained inside the source repository for core contributors. It will prioritize quick prototyping, testing new API changes, and serving as a lightweight developer shell/debug console without cross-compilation overhead.
-
-For further long-term details, please refer to the [Go TUI Long-Term Rewrite Plan](docs/nexus/reference/go-tui-rewrite-plan.md).
+- [Release notes](docs/releases/README.md)
+- [Go TUI client guide](clients/go-tui/README.md)
+- [Nexus planning and implementation notes](docs/nexus/README.md)
 
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.

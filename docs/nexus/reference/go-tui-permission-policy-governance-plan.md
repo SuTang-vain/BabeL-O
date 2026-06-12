@@ -519,7 +519,7 @@ Phase A.1 收口必须满足（Round 2 — inline rule / feedback editor）：
 
 ## 9. 与其它 reference 文档的关系
 
-- [go-tui-execute-timeout-governance-plan.md](./go-tui-execute-timeout-governance-plan.md)：本规划的下游。timeout 治理已收口（Phase A-E），本规划是"timeout 之外的另一类 Bash 拦截"——不重叠。
+- [go-tui-execute-timeout-governance-plan.md](../archive/go-tui-execute-timeout-governance-plan.md)：本规划的下游。timeout 治理已收口（Phase A-E），本规划是"timeout 之外的另一类 Bash 拦截"——不重叠。
 - [session-channel-tui-relationship-visibility-plan.md](./session-channel-tui-relationship-visibility-plan.md)：本规划不涉及 SessionChannel 关系可见化。
 - [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md)：本规划不新增工具，不修改现有工具职责。
 - [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md)：本规划不涉及工具失败归因。

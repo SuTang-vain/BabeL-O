@@ -609,6 +609,9 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
+  assert.match(combined, /Go TUI binary search order:/)
+  assert.match(combined, /selected .*go-tui-darwin-arm64/)
+  assert.match(combined, /missing .*clients\/go-tui\/bin\/go-tui/)
   assert.match(combined, /Go TUI binary found: .*go-tui-darwin-arm64/)
   assert.match(combined, /Nexus is healthy at http:\/\/nexus\.local/)
   assert.match(combined, /Server version: 0\.3\.2, supported Go TUI majors: \[0\]/)
@@ -633,6 +636,9 @@ test('bbl go --check: warns (does not fail) when no prebuilt but source is prese
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
+  assert.match(combined, /Go TUI binary search order:/)
+  assert.match(combined, /missing .*go-tui-darwin-arm64/)
+  assert.match(combined, /missing .*clients\/go-tui\/bin\/go-tui/)
   assert.match(combined, /No prebuilt Go TUI binary found in the multi-path search\./)
   assert.match(combined, /Will fall back to source 'go run \.\/cmd\/go-tui'/)
   assert.match(combined, /Result: WARN/)
@@ -735,4 +741,3 @@ test('bbl go --help describes the Go TUI as a stable alternative (Phase 9 promot
   // creep back in unless Phase 9 is explicitly re-opened.
   assert.doesNotMatch(description ?? '', /experimental/)
 })
-

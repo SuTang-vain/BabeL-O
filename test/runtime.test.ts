@@ -31,6 +31,16 @@ import {
   absorbPrefixCacheDiagnosticsMetrics,
   absorbProviderTurnMetrics,
   buildContextBlockingEvents,
+  buildContextMicrocompactEvent,
+  buildContextGroundingConfirmedEvent,
+  buildContextGroundingConfirmedEventForToolResult,
+  buildContextGroundingRequiredEvent,
+  buildPostCompactGroundingEvents,
+  buildWorkspaceDirtyDetectedEvent,
+  classifyContextGroundingConfirmation,
+  extractChangedFilesFromGitStatus,
+  hasPendingContextGroundingConfirmation,
+  buildContextUsageEvent,
   buildContextWarningEvent,
   buildProviderAssistantMessage,
   buildProviderLoopRequestState,
@@ -51,7 +61,7 @@ import {
   resolveProviderToolCallInput,
   streamProviderTurn,
 } from '../src/runtime/runtimePipeline.js'
-import { compactSession } from '../src/runtime/compact.js'
+import { buildContextCompactBoundaryEvent, compactSession } from '../src/runtime/compact.js'
 import { buildCacheAwareCompactPolicy } from '../src/runtime/cacheAwareCompactPolicy.js'
 import type { UserIntentGuidance } from '../src/runtime/intentGuidance.js'
 import { allocateBudget } from '../src/runtime/contextAssembler.js'
@@ -59,6 +69,7 @@ import { setAdapterOverrideForTest } from '../src/providers/registry.js'
 import type { ModelAdapter, ModelQueryParams, StreamDelta } from '../src/providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../src/shared/config.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
+import { ProviderError } from '../src/shared/errors.js'
 import {
   HttpRemoteToolRunner,
   InMemoryRemoteToolRunner,
@@ -201,6 +212,254 @@ test('runtime pipeline builds terminal result and error events', () => {
   assert.deepEqual(error.details, { retryable: true })
 })
 
+test('runtime pipeline builds grounding guard events after compact', () => {
+  const grounding = buildContextGroundingRequiredEvent({
+    sessionId: 'session-grounding',
+    requestId: 'request-grounding',
+    boundaryId: 'boundary-1',
+    source: 'post_compact',
+  })
+  assert.equal(grounding.type, 'context_grounding_required')
+  assert.equal(grounding.state, 'summary-derived')
+  assert.equal(grounding.boundaryId, 'boundary-1')
+  assert.ok(grounding.requiredFor.includes('file_facts'))
+  assert.ok(grounding.requiredFor.includes('test_results'))
+  assert.ok(grounding.suggestedActions.includes('re_read_referenced_files'))
+
+  const gitStatus = [
+    '## Git Status',
+    'Branch: main',
+    'Status (3 files changed):',
+    '  M src/runtime/LLMCodingRuntime.ts',
+    '  A src/runtime/contextGrounding.ts',
+    '  R old.ts -> new.ts',
+  ].join('\n')
+  assert.deepEqual(extractChangedFilesFromGitStatus(gitStatus), [
+    'src/runtime/LLMCodingRuntime.ts',
+    'src/runtime/contextGrounding.ts',
+    'new.ts',
+  ])
+  const dirty = buildWorkspaceDirtyDetectedEvent({
+    sessionId: 'session-grounding',
+    source: 'post_compact',
+    gitStatus,
+  })
+  assert.equal(dirty?.type, 'workspace_dirty_detected')
+  assert.equal(dirty?.changedFileCount, 3)
+  assert.ok(dirty?.suggestedActions.includes('inspect_diff'))
+
+  const events = buildPostCompactGroundingEvents({
+    sessionId: 'session-grounding',
+    source: 'context_recovery',
+    boundaryId: 'boundary-1',
+    gitStatus,
+  })
+  assert.deepEqual(events.map(event => event.type), ['context_grounding_required', 'workspace_dirty_detected'])
+})
+
+test('runtime pipeline builds grounding confirmation events from source evidence tools', () => {
+  const required = buildContextGroundingRequiredEvent({
+    sessionId: 'session-grounding-confirmed',
+    source: 'post_compact',
+  })
+  const dirty = buildWorkspaceDirtyDetectedEvent({
+    sessionId: 'session-grounding-confirmed',
+    source: 'post_compact',
+    gitStatus: ' M src/runtime/runtimePipeline.ts',
+  })!
+  const readCompleted: Extract<NexusEvent, { type: 'tool_completed' }> = {
+    type: 'tool_completed',
+    schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+    sessionId: 'session-grounding-confirmed',
+    timestamp: '2026-05-23T00:00:00.000Z',
+    toolUseId: 'tool-read-confirm',
+    name: 'Read',
+    success: true,
+    output: 'current source',
+  }
+
+  const readConfirmation = buildContextGroundingConfirmedEventForToolResult({
+    sessionId: 'session-grounding-confirmed',
+    requestId: 'request-grounding-confirmed',
+    events: [required, dirty, readCompleted],
+    toolCompleted: readCompleted,
+    toolInput: { path: 'src/runtime/runtimePipeline.ts' },
+  })
+  assert.equal(readConfirmation?.type, 'context_grounding_confirmed')
+  assert.equal(readConfirmation?.confirmationKind, 'file_read')
+  assert.deepEqual(readConfirmation?.confirmedFor, ['file_facts', 'implementation_status'])
+  assert.equal(readConfirmation?.confirmedByToolUseId, 'tool-read-confirm')
+
+  assert.equal(hasPendingContextGroundingConfirmation([required, readConfirmation!], ['file_facts']), false)
+  assert.equal(hasPendingContextGroundingConfirmation([required, dirty, readConfirmation!], ['file_facts']), false)
+  assert.equal(hasPendingContextGroundingConfirmation([required, dirty, readConfirmation!], ['git_status']), true)
+
+  const gitStatusConfirmation = buildContextGroundingConfirmedEvent({
+    sessionId: 'session-grounding-confirmed',
+    confirmedByToolUseId: 'tool-git-status',
+    toolName: 'Bash',
+    confirmationKind: 'git_status',
+    confirmedFor: ['git_status', 'implementation_status'],
+  })
+  assert.equal(hasPendingContextGroundingConfirmation([required, dirty, readConfirmation!, gitStatusConfirmation], ['git_status']), false)
+
+  assert.equal(classifyContextGroundingConfirmation({
+    toolName: 'Bash',
+    success: true,
+    toolInput: { command: 'git -C /repo status --short' },
+  })?.confirmationKind, 'git_status')
+  assert.equal(classifyContextGroundingConfirmation({
+    toolName: 'Bash',
+    success: true,
+    toolInput: { command: 'npm run test -- test/runtime.test.ts' },
+  })?.confirmationKind, 'test_output')
+  assert.equal(classifyContextGroundingConfirmation({
+    toolName: 'Bash',
+    success: false,
+    toolInput: { command: 'git status --short' },
+  }), undefined)
+})
+
+test('runtime pipeline builds context_usage event from context policy facts', () => {
+  const windowState = {
+    tokenEstimate: 64_000,
+    maxTokens: 180_000,
+    percentUsed: 36,
+    warningThresholdTokens: 126_000,
+    compactThresholdTokens: 162_000,
+    blockingLimitTokens: 179_000,
+    isWarning: false,
+    isCompact: false,
+    isBlocking: false,
+  }
+  const policy = buildCacheAwareCompactPolicy({
+    modelId: 'minimax/MiniMax-M3',
+    tokenEstimate: windowState.tokenEstimate,
+    maxOutputTokens: 16_384,
+  })
+
+  const event = buildContextUsageEvent({
+    sessionId: 'session-context-usage',
+    requestId: 'req_context_usage',
+    providerId: 'minimax',
+    modelId: 'minimax/MiniMax-M3',
+    windowState,
+    cacheAwareCompactPolicy: policy,
+    source: 'pre_provider_call',
+  })
+
+  assert.equal(event.type, 'context_usage')
+  assert.equal(event.requestId, 'req_context_usage')
+  assert.equal(event.providerId, 'minimax')
+  assert.equal(event.modelId, 'minimax/MiniMax-M3')
+  assert.equal(event.tokenEstimate, 64_000)
+  assert.equal(event.maxTokens, 180_000)
+  assert.equal(event.percentUsed, 36)
+  assert.equal(event.warningThresholdTokens, 126_000)
+  assert.equal(event.compactThresholdTokens, 162_000)
+  assert.equal(event.blockingLimitTokens, 179_000)
+  assert.equal(event.modelContextWindow, policy.modelContextWindow)
+  assert.equal(event.effectiveContextCeiling, policy.effectiveContextCeiling)
+  assert.equal(event.contextPolicySource, policy.policySource)
+  assert.equal(event.cachePreservationMode, policy.cachePreservationMode)
+  assert.equal(event.longContextUtilizationMode, policy.longContextUtilizationMode)
+})
+
+test('runtime pipeline builds context_microcompact event from metrics', () => {
+  const event = buildContextMicrocompactEvent({
+    sessionId: 'session-context-microcompact',
+    requestId: 'req_microcompact',
+    trigger: 'initial_refresh',
+    metrics: {
+      compactedEventCount: 2,
+      deduplicatedToolResultCount: 1,
+      bytesBefore: 10_000,
+      bytesAfter: 2_000,
+      bytesSaved: 8_000,
+      estimatedTokensSaved: 2_000,
+    },
+  })
+
+  assert.ok(event)
+  assert.equal(event.type, 'context_microcompact')
+  assert.equal(event.requestId, 'req_microcompact')
+  assert.equal(event.trigger, 'initial_refresh')
+  assert.equal(event.compactedEventCount, 2)
+  assert.equal(event.deduplicatedToolResultCount, 1)
+  assert.equal(event.bytesSaved, 8_000)
+  assert.equal(event.estimatedTokensSaved, 2_000)
+  assert.match(event.message, /saved about 2000 tokens/)
+
+  const empty = buildContextMicrocompactEvent({
+    sessionId: 'session-context-microcompact-empty',
+    trigger: 'initial_refresh',
+    metrics: {
+      compactedEventCount: 0,
+      deduplicatedToolResultCount: 0,
+      bytesBefore: 0,
+      bytesAfter: 0,
+      bytesSaved: 0,
+      estimatedTokensSaved: 0,
+    },
+  })
+  assert.equal(empty, undefined)
+})
+
+test('compact builds context_compact_boundary protocol event', () => {
+  const boundary: Extract<NexusEvent, { type: 'compact_boundary' }> = {
+    type: 'compact_boundary',
+    ...eventBase('session-context-compact-boundary'),
+    trigger: 'auto',
+    summary: 'Earlier context summary for the operator.'.repeat(20),
+    beforeEventCount: 120,
+    afterEventCount: 14,
+    summaryChars: 780,
+    snippedToolResults: 3,
+    preTokens: 42_000,
+    postTokens: 7_500,
+    estimatedTokensSaved: 34_500,
+    retainedEvents: [
+      {
+        type: 'user_message',
+        ...eventBase('session-context-compact-boundary'),
+        text: 'latest task',
+      },
+    ],
+    retainedSegment: {
+      retainedCount: 13,
+      boundaryId: 'boundary_123',
+      firstEventId: 'event_first',
+      lastEventId: 'event_tail',
+      hash: 'hash_abc',
+    },
+    modelId: 'minimax/MiniMax-M3',
+  }
+
+  const event = buildContextCompactBoundaryEvent(boundary)
+  assert.equal(event.type, 'context_compact_boundary')
+  assert.equal(event.boundaryId, 'boundary_123')
+  assert.equal(event.sourceBoundaryTimestamp, boundary.timestamp)
+  assert.equal(event.trigger, 'auto')
+  assert.equal(event.beforeEventCount, 120)
+  assert.equal(event.afterEventCount, 14)
+  assert.equal(event.preTokens, 42_000)
+  assert.equal(event.postTokens, 7_500)
+  assert.equal(event.estimatedTokensSaved, 34_500)
+  assert.equal(event.summaryChars, 780)
+  assert.equal(event.snippedToolResults, 3)
+  assert.equal(event.messagesSummarized, 119)
+  assert.equal(event.droppedItemCount, 119)
+  assert.equal(event.retainedEventCount, 1)
+  assert.equal(event.retainedItemCount, 1)
+  assert.deepEqual(event.droppedReasons, { large_tool_result: 3 })
+  assert.equal(event.preservedFirstEventId, 'event_first')
+  assert.equal(event.preservedTailEventId, 'event_tail')
+  assert.equal(event.retainedSegmentHash, 'hash_abc')
+  assert.equal(event.modelId, 'minimax/MiniMax-M3')
+  assert.ok((event.userVisibleSummary?.length ?? 0) <= 500)
+  assert.match(event.message, /120 -> 14 events/)
+})
+
 test('runtime pipeline builds context warning and blocking event sequences', () => {
   const windowState = {
     tokenEstimate: 9_500,
@@ -298,6 +557,7 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
     sessionSummary: '',
     projectMemory: '',
     activeSkills: '',
+    gitStatus: '## Git Status\nStatus: clean',
     compactRetainedEventCount: 0,
     compactRetainedSegmentValid: true,
     compactRetainedSegmentWarning: '',
@@ -613,9 +873,43 @@ test('runtime pipeline reduces max-token provider turns to continuation or termi
   assert.equal(terminalOutcome.eventsBeforeMessages[1]?.type, 'result')
 })
 
-test('runtime pipeline reduces suppressed provider tool turns to retry prompts', () => {
+test('runtime pipeline asks user to confirm option-like suppressed tool turns', () => {
   const outcome = reduceProviderTurnOutcome({
     sessionId: 'session-turn-reducer-suppressed',
+    turn: {
+      assistantText: '',
+      reasoningText: '',
+      toolCalls: [{ id: 'tool_1', name: 'Read', partialInput: '{}' }],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: true,
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: 'B',
+    },
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+
+  assert.equal(outcome.kind, 'terminal')
+  assert.equal(outcome.suppressedToolRetryCount, 0)
+  assert.equal(outcome.eventsBeforeMessages[0]?.type, 'error')
+  assert.equal(outcome.eventsBeforeMessages[0]?.code, 'TOOL_CALL_NEEDS_USER_CONFIRMATION')
+  assert.equal((outcome.eventsBeforeMessages[0]?.details as any).optionSelection, 'B')
+  assert.equal((outcome.eventsBeforeMessages[0]?.details as any).retryAttempted, false)
+  assert.equal(outcome.messages[0]?.role, 'assistant')
+  assert.match(String(outcome.messages[0]?.content), /Reply "B" again to confirm/)
+  assert.equal(outcome.eventsAfterMessages[0]?.type, 'result')
+  assert.equal(outcome.eventsAfterMessages[0]?.success, true)
+
+  const nonOptionOutcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-suppressed-non-option',
     turn: {
       assistantText: '',
       reasoningText: '',
@@ -636,13 +930,11 @@ test('runtime pipeline reduces suppressed provider tool turns to retry prompts',
     suppressedToolRetryCount: 0,
     maxSuppressedToolRetries: 1,
   })
-
-  assert.equal(outcome.kind, 'continue')
-  assert.equal(outcome.suppressedToolRetryCount, 1)
-  assert.equal(outcome.eventsBeforeMessages[0]?.type, 'error')
-  assert.equal(outcome.eventsBeforeMessages[0]?.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
-  assert.equal((outcome.eventsBeforeMessages[0]?.details as any).retryAttempted, true)
-  assert.equal(outcome.messages[0]?.role, 'user')
+  assert.equal(nonOptionOutcome.kind, 'continue')
+  const nonOptionError = nonOptionOutcome.eventsBeforeMessages[0]
+  assert.equal(nonOptionError?.type, 'error')
+  assert.equal(nonOptionError.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
+  assert.equal((nonOptionError.details as any).retryAttempted, true)
 
   const exhaustedOutcome = reduceProviderTurnOutcome({
     sessionId: 'session-turn-reducer-suppressed-exhausted',
@@ -789,7 +1081,7 @@ test('runtime tool loop returns recoverable result for unknown tools', async () 
   assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'MissingTool' && !event.success))
 })
 
-test('runtime tool loop returns terminal result for denied tools', async () => {
+test('runtime tool loop returns recoverable result for policy-denied tools', async () => {
   const stream = executeProviderToolCall({
     toolCall: {
       id: 'tool_loop_denied',
@@ -816,10 +1108,88 @@ test('runtime tool loop returns terminal result for denied tools', async () => {
     next = await stream.next()
   }
 
-  assert.equal(next.value.kind, 'terminal')
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /Tool denied by Nexus policy: Bash/)
+  assert.match(next.value.toolResult.content, /allowed alternative/)
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Bash'))
   assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
-  assert.ok(events.some(event => event.type === 'result' && !event.success))
+  assert.ok(!events.some(event => event.type === 'result' && !event.success))
+})
+
+test('runtime tool loop returns recoverable result for hook-denied tools', async () => {
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_hook_denied',
+      name: 'Read',
+      partialInput: '{"path":"package.json"}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-hook-denied',
+      prompt: 'read package.json',
+      cwd: tmpdir(),
+      skipPermissionCheck: true,
+      runtimeHooks: [{
+        name: 'DenyReadForRegression',
+        events: ['PreToolUse'],
+        run: () => ({ denyReason: 'PreToolUse denied Read for regression.' }),
+      }],
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /Choose an allowed alternative/)
+  assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Read'))
+  assert.ok(!events.some(event => event.type === 'result' && !event.success))
+})
+
+test('runtime tool loop returns recoverable result for optimizer safety denied tools', async () => {
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_optimizer_denied',
+      name: 'Bash',
+      partialInput: '{"command":"git reset --hard HEAD"}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-optimizer-denied',
+      prompt: 'reset hard',
+      cwd: tmpdir(),
+      role: 'optimizer',
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /blocklisted under optimizer role/)
+  assert.match(next.value.toolResult.content, /Choose an allowed alternative/)
+  assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
+  assert.ok(!events.some(event => event.type === 'result' && !event.success))
 })
 
 test('runtime pipeline collects provider turn deltas and usage events', async () => {
@@ -3578,8 +3948,26 @@ test('/v1/sessions/:sessionId/compact creates a manual compact boundary', async 
     assert.equal(body.event.type, 'compact_boundary')
     assert.equal(body.event.trigger, 'manual')
     assert.ok(body.event.summary.length > 0)
+    assert.equal(body.contextEvent.type, 'context_compact_boundary')
+    assert.equal(body.contextEvent.trigger, 'manual')
+    assert.equal(body.contextEvent.beforeEventCount, body.event.beforeEventCount)
+    assert.equal(body.contextEvent.afterEventCount, body.event.afterEventCount)
+    assert.equal(body.contextEvent.retainedEventCount, body.event.retainedEvents.length)
+    assert.equal(typeof body.contextEvent.preTokens, 'number')
+    assert.equal(typeof body.contextEvent.postTokens, 'number')
+    assert.equal(typeof body.contextEvent.estimatedTokensSaved, 'number')
+    assert.equal(body.contextEvent.retainedItemCount, body.contextEvent.retainedEventCount)
+    assert.equal(body.groundingEvents[0].type, 'context_grounding_required')
+    assert.equal(body.groundingEvents[0].boundaryId, body.contextEvent.boundaryId)
+    assert.equal(body.groundingEvents[0].state, 'summary-derived')
 
     const persisted = await storage.listEvents(sessionId, { order: 'asc', limit: 10_000 })
+    const contextBoundaryEvent = persisted.events.find(event => event.type === 'context_compact_boundary') as any
+    assert.ok(contextBoundaryEvent, 'context_compact_boundary should be persisted')
+    assert.equal(contextBoundaryEvent.boundaryId, body.contextEvent.boundaryId)
+    const groundingEvent = persisted.events.find(event => event.type === 'context_grounding_required') as any
+    assert.ok(groundingEvent, 'context_grounding_required should be persisted')
+    assert.equal(groundingEvent.boundaryId, body.contextEvent.boundaryId)
     const memoryEvent = persisted.events.find(event => event.type === 'session_memory_updated') as any
     if (memoryEvent) {
       assert.equal(memoryEvent.reason, 'compact')
@@ -3656,7 +4044,7 @@ test('Grep and Glob fall back when ripgrep is unavailable', async () => {
   }
 })
 
-test('allowlisted runtime executes allowed tools and denies blocked tools', async () => {
+test('allowlisted runtime executes allowed tools and marks blocked tools as recoverable', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allowlist`)
   await mkdir(cwd, { recursive: true })
   await writeFile(join(cwd, 'sample.txt'), 'hello allowlist\n', 'utf8')
@@ -3683,15 +4071,16 @@ test('allowlisted runtime executes allowed tools and denies blocked tools', asyn
     })
     assert.equal(bashResponse.statusCode, 200)
     const body = bashResponse.json()
-    assert.equal(body.success, false)
+    assert.equal(body.success, true)
+    assert.equal(body.outcome, 'success')
     assert.equal(body.result.success, false)
-    assert.ok(body.events.some((event: { type: string }) => event.type === 'tool_denied'))
-    assert.ok(
-      body.events.some(
-        (event: { type: string; name?: string }) =>
-          event.type === 'tool_denied' && event.name === 'Bash',
-      ),
+    const denial = body.events.find(
+      (event: { type: string; name?: string }) =>
+        event.type === 'tool_denied' && event.name === 'Bash',
     )
+    assert.ok(denial)
+    assert.equal(denial.recoverable, true)
+    assert.equal(denial.denialKind, 'policy')
   } finally {
     await app.close()
   }
@@ -3926,6 +4315,540 @@ test('execute timeout preserves partial result and emits near-timeout warning', 
   }
 })
 
+test('execute soft timeout policy treats timeoutMs as soft budget and uses watchdog for abort', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-timeout-policy`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  let softTimerAbortedRuntime = false
+  let watchdogAbortedRuntime = false
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      await new Promise<void>(resolve => setTimeout(resolve, 60))
+      softTimerAbortedRuntime = options.timeoutSignal.aborted || options.signal.aborted
+      await new Promise<void>(resolve => {
+        options.timeoutSignal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      watchdogAbortedRuntime = options.timeoutSignal.aborted || options.signal.aborted
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'REQUEST_TIMEOUT',
+        message: 'watchdog timeout',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 1000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'long analysis',
+        cwd,
+        timeoutMs: 50,
+        timeoutPolicy: 'soft',
+        watchdogTimeoutMs: 120,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.timeoutMs, 50)
+    assert.equal(body.outcome, 'timeout')
+    assert.equal(softTimerAbortedRuntime, false, 'soft timeout budget must not abort the runtime signal')
+    assert.equal(watchdogAbortedRuntime, true, 'hard watchdog still aborts the runtime signal')
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute soft timeout policy emits timeout_budget_exceeded once when the soft budget is reached and keeps the runtime live', async () => {
+  // Phase 2 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+  // when the caller opts into soft policy, hitting the soft budget
+  // MUST emit `timeout_budget_exceeded` exactly once without aborting
+  // the runtime. The runtime keeps yielding events (here a delayed
+  // assistant_delta + a successful result) and the persisted event
+  // log carries both the recoverable signal and the final result.
+  //
+  // Phase 3 added auto-extensions; pin `maxSoftTimeoutExtensions: 0`
+  // here so this test stays a pure one-shot regression for the
+  // Phase 2 invariant — exactly one budget event, no extension.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-timeout-emit`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  let softBudgetSeenAbort = false
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      // Emit a small assistant delta first so the runtime has
+      // partial evidence the helper can summarize.
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: 'analysing project layout, will continue after warning…',
+      }
+      // Wait past the soft budget so the watcher fires before we
+      // resume. Watchdog (300ms below) MUST NOT fire.
+      await new Promise<void>(resolve => setTimeout(resolve, 130))
+      softBudgetSeenAbort = options.timeoutSignal.aborted || options.signal.aborted
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: ' done — emitting result after soft budget exceeded.',
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: 'final answer',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'long soft analysis',
+        cwd,
+        timeoutMs: 50,
+        timeoutPolicy: 'soft',
+        watchdogTimeoutMs: 5_000,
+        maxSoftTimeoutExtensions: 0,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    // Runtime succeeded; soft budget exceeded is informational.
+    assert.equal(body.success, true)
+    assert.equal(body.outcome, 'success')
+    assert.equal(softBudgetSeenAbort, false, 'soft budget must not abort the runtime signal mid-flight')
+
+    // Inspect the persisted event log: exactly one
+    // `timeout_budget_exceeded` event with the expected shape.
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const budgetExceeded = events.filter(event => event.type === 'timeout_budget_exceeded')
+    assert.equal(budgetExceeded.length, 1, 'exactly one timeout_budget_exceeded must be appended')
+    const budgetEvent = budgetExceeded[0]
+    assert.equal(budgetEvent.type, 'timeout_budget_exceeded')
+    if (budgetEvent.type !== 'timeout_budget_exceeded') return
+    assert.equal(budgetEvent.policy, 'soft')
+    assert.equal(budgetEvent.timeoutMs, 50)
+    assert.ok(budgetEvent.elapsedMs >= 0, 'elapsedMs must be non-negative')
+    assert.ok(
+      Array.isArray(budgetEvent.suggestedActions) && budgetEvent.suggestedActions.length > 0,
+      'suggested actions should be present so the model knows the recoverable choices',
+    )
+    // The runtime had emitted an assistant delta before the budget
+    // expired, so a partialSummary should be carried into the event.
+    assert.ok(
+      typeof budgetEvent.partialSummary === 'string' && budgetEvent.partialSummary.length > 0,
+      'partial summary should reflect the assistant_delta seen before the soft budget fired',
+    )
+
+    // And the final result event must still be present and successful.
+    const resultEvents = events.filter(event => event.type === 'result')
+    assert.ok(resultEvents.length >= 1, 'runtime result must still be persisted after the soft budget event')
+    const last = resultEvents[resultEvents.length - 1]
+    assert.equal(last.type, 'result')
+    if (last.type !== 'result') return
+    assert.equal(last.success, true)
+
+    // Phase 3 guard: with maxSoftTimeoutExtensions=0 the cycle
+    // must NOT emit any timeout_extension_granted event.
+    const grants = events.filter(event => event.type === 'timeout_extension_granted')
+    assert.equal(grants.length, 0, 'no extension may be granted when maxSoftTimeoutExtensions=0')
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute soft timeout policy auto-grants one extension by default and emits both budget+grant events in order', async () => {
+  // Phase 3 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+  // when the caller opts into soft policy without specifying
+  // maxSoftTimeoutExtensions, the runtime grants 1 auto-extension
+  // after the first budget exhaustion. The event log must carry
+  // (a) timeout_budget_exceeded then (b) timeout_extension_granted
+  // (extensionCount=1, reason='auto-first-budget-exhausted'). The
+  // runtime is NOT aborted; it can still produce a successful
+  // result before the extended budget is used up.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-timeout-extension-default`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  let softBudgetSeenAbort = false
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: 'starting analysis…',
+      }
+      // Hold for ~130ms so the first soft cycle (50ms) fires,
+      // auto-extension reschedules at +50ms (=100ms total), but
+      // the runtime resumes BEFORE the rescheduled cycle would
+      // fire again. So we expect exactly one budget+grant pair.
+      await new Promise<void>(resolve => setTimeout(resolve, 80))
+      softBudgetSeenAbort = options.timeoutSignal.aborted || options.signal.aborted
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: ' finishing under extended budget.',
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: 'final answer under extension',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'analysis that triggers one extension',
+        cwd,
+        timeoutMs: 50,
+        timeoutPolicy: 'soft',
+        watchdogTimeoutMs: 5_000,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, true)
+    assert.equal(softBudgetSeenAbort, false, 'soft budget + extension must not abort the runtime')
+
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const budgetExceeded = events.filter(event => event.type === 'timeout_budget_exceeded')
+    const grants = events.filter(event => event.type === 'timeout_extension_granted')
+    assert.equal(budgetExceeded.length, 1, 'exactly one budget exhaustion before extension kicks in')
+    assert.equal(grants.length, 1, 'default policy grants exactly one auto-extension')
+
+    const grant = grants[0]
+    assert.equal(grant.type, 'timeout_extension_granted')
+    if (grant.type !== 'timeout_extension_granted') return
+    assert.equal(grant.policy, 'soft')
+    assert.equal(grant.extensionCount, 1)
+    assert.equal(grant.maxExtensions, 1)
+    assert.equal(grant.additionalMs, 50, 'default extension delta equals softTimeoutMs')
+    assert.equal(grant.totalSoftBudgetMs, 100, 'total budget after extension = soft + delta')
+    assert.equal(grant.reason, 'auto-first-budget-exhausted')
+
+    // Order: budget_exceeded must come before its grant.
+    const idxBudget = events.findIndex(event => event.type === 'timeout_budget_exceeded')
+    const idxGrant = events.findIndex(event => event.type === 'timeout_extension_granted')
+    assert.ok(idxBudget >= 0 && idxGrant >= 0 && idxGrant > idxBudget,
+      'grant must follow its budget_exceeded event in the persisted log')
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute soft timeout policy stops granting extensions after maxSoftTimeoutExtensions is reached', async () => {
+  // Phase 3 cap regression: with maxSoftTimeoutExtensions=1 and a
+  // runtime that holds past the extended budget, the runtime must
+  // emit exactly TWO budget_exceeded events (initial + post-grant)
+  // and exactly ONE grant. The second budget exhaustion is the
+  // model's last warning — no further automatic extension is
+  // issued, and the hard watchdog remains the only fatal cutoff.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-timeout-extension-cap`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: 'starting long task…',
+      }
+      // Hold past both the initial soft budget (40ms) and the
+      // extended budget (40+40=80ms total) so the cycle fires
+      // twice. Watchdog stays at 5000ms so the runtime is not
+      // aborted; the runtime decides on its own to wrap up.
+      await new Promise<void>(resolve => setTimeout(resolve, 160))
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: 'wrapping up after second warning',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'analysis past extended budget',
+        cwd,
+        timeoutMs: 40,
+        timeoutPolicy: 'soft',
+        watchdogTimeoutMs: 5_000,
+        maxSoftTimeoutExtensions: 1,
+        softTimeoutExtensionMs: 40,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, true)
+
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const budgetExceeded = events.filter(event => event.type === 'timeout_budget_exceeded')
+    const grants = events.filter(event => event.type === 'timeout_extension_granted')
+    assert.equal(budgetExceeded.length, 2, 'one budget event per cycle: initial + post-extension')
+    assert.equal(grants.length, 1, 'exactly one grant; cap blocks any second extension')
+
+    // The two budget events must carry distinct soft-budget
+    // values: the first at the initial budget (40), the second
+    // at the extended budget (80).
+    const firstBudget = budgetExceeded[0]
+    const secondBudget = budgetExceeded[1]
+    assert.equal(firstBudget.type, 'timeout_budget_exceeded')
+    assert.equal(secondBudget.type, 'timeout_budget_exceeded')
+    if (firstBudget.type !== 'timeout_budget_exceeded' || secondBudget.type !== 'timeout_budget_exceeded') return
+    assert.equal(firstBudget.timeoutMs, 40)
+    assert.equal(secondBudget.timeoutMs, 80)
+
+    const grant = grants[0]
+    assert.equal(grant.type, 'timeout_extension_granted')
+    if (grant.type !== 'timeout_extension_granted') return
+    assert.equal(grant.extensionCount, 1)
+    assert.equal(grant.maxExtensions, 1)
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry', async () => {
+  // Phase 5 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
+  // when the hard watchdog actually fires under soft policy, the
+  // persisted error event MUST carry details.kind='watchdog' so
+  // downstream consumers (Go TUI friendly message, metrics) can
+  // distinguish a system-safety cutoff from a fresh fatal cutoff.
+  // The activeExecutions registry must be cleared after the
+  // request finishes regardless of watchdog vs result outcome.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-watchdog-marker`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      // Hold long enough for the watchdog to fire. Soft cycle
+      // (40ms) + max extensions=1 (+40ms) = 80ms total soft
+      // budget; watchdog at 120ms.
+      await new Promise<void>(resolve => {
+        options.timeoutSignal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'REQUEST_TIMEOUT',
+        message: 'watchdog tripped',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'task that exceeds soft and extended budgets',
+        cwd,
+        timeoutMs: 40,
+        timeoutPolicy: 'soft',
+        watchdogTimeoutMs: 120,
+        maxSoftTimeoutExtensions: 1,
+        softTimeoutExtensionMs: 40,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.outcome, 'timeout')
+
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const errorEvents = events.filter(event => event.type === 'error')
+    assert.ok(errorEvents.length >= 1, 'soft policy watchdog must persist an error event')
+    const watchdogErrors = errorEvents.filter(event =>
+      event.type === 'error' && event.code === 'REQUEST_TIMEOUT'
+      && typeof event.details === 'object' && event.details !== null
+      && (event.details as Record<string, unknown>).kind === 'watchdog',
+    )
+    assert.ok(
+      watchdogErrors.length >= 1,
+      'watchdog cutoff MUST decorate the REQUEST_TIMEOUT error with details.kind=watchdog',
+    )
+    const decorated = watchdogErrors[0]
+    assert.equal(decorated.type, 'error')
+    if (decorated.type !== 'error') return
+    const details = decorated.details as Record<string, unknown>
+    assert.equal(details.policy, 'soft')
+    assert.equal(details.softTimeoutMs, 40)
+    assert.equal(details.watchdogTimeoutMs, 120)
+    assert.equal(details.maxSoftTimeoutExtensions, 1)
+    assert.equal(details.retryable, false, 'watchdog cutoff is fatal — not retryable in the same shape')
+    assert.ok(
+      typeof details.softCycleEvents === 'number' && (details.softCycleEvents as number) >= 1,
+      'softCycleEvents counter must reflect that the soft cycle fired before the watchdog',
+    )
+
+    // Cleanup check: the activeExecutions registry must drop
+    // this session after the request finishes. Inject a quick
+    // follow-up cancel — if the registry still has the request,
+    // `activeExecutionCancelled` would come back true. After a
+    // clean watchdog cutoff it must be false.
+    const cancelResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/sessions/${body.sessionId}/cancel`,
+      payload: {},
+    })
+    assert.equal(
+      cancelResponse.statusCode,
+      200,
+      `stale cancel must still respond 200, got ${cancelResponse.statusCode}`,
+    )
+    const cancelBody = cancelResponse.json()
+    assert.equal(
+      cancelBody.activeExecutionCancelled,
+      false,
+      'activeExecutions registry must be cleaned after the watchdog cutoff',
+    )
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute fatal timeout policy never decorates REQUEST_TIMEOUT with details.kind=watchdog (back-compat)', async () => {
+  // Phase 5 back-compat guard: legacy fatal callers must keep
+  // the original REQUEST_TIMEOUT shape — no watchdog decoration —
+  // so HTTP API consumers and `bbl chat` integration stay
+  // unchanged.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-fatal-no-watchdog-marker`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      await new Promise<void>(resolve => {
+        options.timeoutSignal.addEventListener('abort', () => resolve(), { once: true })
+      })
+      yield {
+        type: 'error',
+        ...eventBase(options.sessionId),
+        code: 'REQUEST_TIMEOUT',
+        message: 'fatal cutoff',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'cheap turn with fatal timeout',
+        cwd,
+        timeoutMs: 40,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const watchdogErrors = events.filter(event =>
+      event.type === 'error' && event.code === 'REQUEST_TIMEOUT'
+      && typeof event.details === 'object' && event.details !== null
+      && (event.details as Record<string, unknown>).kind === 'watchdog',
+    )
+    assert.equal(watchdogErrors.length, 0, 'fatal policy must NOT carry watchdog decoration on REQUEST_TIMEOUT')
+  } finally {
+    await app.close()
+  }
+})
+
+test('execute fatal timeout policy never emits timeout_budget_exceeded (back-compat)', async () => {
+  // Phase 2 back-compat guard: legacy HTTP callers that don't set
+  // `timeoutPolicy` keep the old fatal cutoff behaviour and MUST
+  // NOT see the new soft-budget event. Otherwise existing bbl
+  // chat / HTTP integration tests would break.
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-fatal-no-soft-event`)
+  await mkdir(cwd, { recursive: true })
+  const storage = new MemoryStorage()
+  const runtime = {
+    async *executeStream(options: any): AsyncIterable<NexusEvent> {
+      yield {
+        type: 'session_started',
+        ...eventBase(options.sessionId),
+        cwd: options.cwd,
+        requestId: options.requestId,
+      }
+      yield {
+        type: 'result',
+        ...eventBase(options.sessionId),
+        success: true,
+        message: 'fast answer',
+      }
+    },
+  }
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd, executeTimeoutMs: 5_000 })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: {
+        prompt: 'cheap turn',
+        cwd,
+        // Intentionally omit timeoutPolicy / softTimeoutMs /
+        // watchdogTimeoutMs so the fatal default path is exercised.
+        timeoutMs: 50,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, true)
+    const events = (await storage.listEvents(body.sessionId, { order: 'asc', limit: 1000 })).events
+    const budgetExceeded = events.filter(event => event.type === 'timeout_budget_exceeded')
+    assert.equal(budgetExceeded.length, 0, 'fatal policy callers must not see timeout_budget_exceeded')
+  } finally {
+    await app.close()
+  }
+})
+
 test('execute honours per-request timeoutMs from Go TUI WebSocket payload', async () => {
   // Phase C regression: when the WebSocket / HTTP body sends a per-request
   // timeoutMs that overrides the server default, Nexus must honour it AND
@@ -3978,12 +4901,12 @@ test('execute honours per-request timeoutMs from Go TUI WebSocket payload', asyn
 
 test('execute honours per-request policy=soft-deny for write/execute tools', async () => {
   // Phase B of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
-  // when the request body carries `policy: 'soft-deny'`, the hard-deny
+  // when the request body carries `policy: 'soft-deny'`, the policy block
   // for tools not in the allowlist is bypassed. The existing approval
   // gate then emits `permission_request` for write/execute-risk tools
   // (here: Bash with `git commit -m x`), giving the user (Go TUI
   // permission panel) a chance to approve / deny. Under the default
-  // `'strict'` policy the same call would be hard-denied with no
+  // `'strict'` policy the same call would be policy-blocked with no
   // permission_request.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-soft-deny-bash`)
   await mkdir(cwd, { recursive: true })
@@ -4035,13 +4958,13 @@ test('execute honours per-request policy=soft-deny for write/execute tools', asy
   const body = response.json()
   // The body.success is what the runtime reports; the tool itself may
   // fail (e.g. `git commit` outside a git repo) but the key claim is
-  // that the tool was allowed to run instead of being hard-denied.
+  // that the tool was allowed to run instead of being policy-blocked.
   const events = body.events
   assert.ok(
     events.some((e: any) => e.type === 'permission_request' && e.toolUseId === toolUseId),
     'permission_request event should be present in the events stream',
   )
-  // No tool_denied from the hard-deny path; a downstream tool failure
+  // No tool_denied from the policy-block path; a downstream tool failure
   // would still emit tool_completed with success=false, not tool_denied.
   assert.ok(
     !events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
@@ -4051,12 +4974,12 @@ test('execute honours per-request policy=soft-deny for write/execute tools', asy
   await app.close()
 })
 
-test('execute with default strict policy still hard-denies execute-risk Bash', async () => {
-  // Back-compat: when `policy` is omitted (server-side default 'strict')
-  // AND the server is using the default `denyByDefaultTools()` policy,
-  // Bash with execute subcommands is hard-denied with no
-  // permission_request, matching pre-Phase-B behaviour. This pins the
-  // back-compat surface for `bbl chat` and other non-Go-TUI clients.
+test('execute with default strict policy emits recoverable policy denial for execute-risk Bash', async () => {
+  // When `policy` is omitted (server-side default 'strict') and the
+  // server is using the default `denyByDefaultTools()` policy, Bash with
+  // execute subcommands is blocked by policy with no permission_request.
+  // The governance contract marks this denial recoverable so clients do
+  // not present it as a fatal cancelled turn.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-strict-deny`)
   await mkdir(cwd, { recursive: true })
   // No `allowedTools` → denyByDefaultTools() default → only read/task
@@ -4076,15 +4999,18 @@ test('execute with default strict policy still hard-denies execute-risk Bash', a
   assert.equal(response.statusCode, 200)
   const body = response.json()
   const events = body.events
-  assert.ok(
-    events.some(
-      (e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message),
-    ),
-    'default strict policy should hard-deny execute-risk Bash with policy message',
+  assert.equal(body.success, true)
+  assert.equal(body.outcome, 'success')
+  const denial = events.find(
+    (e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message),
   )
-  assert.ok(
-    !events.some((e: any) => e.type === 'permission_request'),
-    'default strict policy must NOT emit permission_request (back-compat)',
+  assert.ok(denial, 'default strict policy should emit a policy denial for execute-risk Bash')
+  assert.equal(denial.recoverable, true)
+  assert.equal(denial.denialKind, 'policy')
+  assert.equal(
+    events.some((e: any) => e.type === 'permission_request'),
+    false,
+    'default strict policy must NOT emit permission_request',
   )
 
   await app.close()
@@ -5792,6 +6718,83 @@ test('LLMCodingRuntime continues from a successful compact boundary', async () =
   }
 })
 
+test('LLMCodingRuntime emits grounding confirmation after source evidence tool result', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-grounding-confirmed-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-grounding-confirmed-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = join(tmpdir(), `babel-o-grounding-confirmed-${Date.now()}`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'grounding.txt'), 'current grounding facts', 'utf8')
+  const now = new Date().toISOString()
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      if (executionInvocationCount === 1) {
+        yield { type: 'tool_use_start', id: 'tool_read_grounding', name: 'Read' }
+        yield { type: 'tool_use_delta', id: 'tool_read_grounding', inputDelta: '{"path":"grounding.txt"}' }
+        yield { type: 'tool_use_end', id: 'tool_read_grounding', input: { path: 'grounding.txt' } }
+        yield { type: 'finish', reason: 'tool_use' }
+        return
+      }
+      yield { type: 'text', text: 'grounding complete' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'confirm grounding',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+  await storage.appendEvent(sessionId, buildContextGroundingRequiredEvent({
+    sessionId,
+    source: 'post_compact',
+  }))
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'confirm grounding',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      if (event.type === 'result') break
+    }
+
+    const eventTypes = emitted.map(event => event.type).join(',')
+    const confirmation = emitted.find((event): event is Extract<NexusEvent, { type: 'context_grounding_confirmed' }> => event.type === 'context_grounding_confirmed')
+    assert.equal(confirmation?.confirmationKind, 'file_read', `events=${eventTypes}`)
+    assert.deepEqual(confirmation?.confirmedFor, ['file_facts', 'implementation_status'])
+    assert.equal(confirmation?.confirmedByToolUseId, 'tool_read_grounding')
+    assert.equal(emitted.find(event => event.type === 'result')?.success, true)
+    assert.equal(executionInvocationCount, 2)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+  }
+})
+
 test('LLMCodingRuntime attempts reactive compact after tool results exceed provider-loop context limit', async () => {
   const tools = createDefaultToolRegistry()
   const bashTool = tools.get('Bash')!
@@ -5860,6 +6863,10 @@ test('LLMCodingRuntime attempts reactive compact after tool results exceed provi
     }
 
     assert.ok(
+      emitted.some(event => event.type === 'context_usage'),
+      `runtime should emit context_usage facts before provider calls; events=${emitted.map(event => event.type).join(',')}`,
+    )
+    assert.ok(
       emitted.some(event => event.type === 'compact_boundary' && event.trigger === 'reactive'),
       `provider-loop blocking should attempt reactive compact before hard blocking; events=${emitted.map(event => event.type).join(',')}`,
     )
@@ -5869,6 +6876,147 @@ test('LLMCodingRuntime attempts reactive compact after tool results exceed provi
     assert.equal(executionInvocationCount, 2)
   } finally {
     setAdapterOverrideForTest('local', null)
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime recovers provider context-limit errors with reactive compact retry', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-context-recovery-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-context-recovery-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      if (executionInvocationCount === 1) {
+        throw new ProviderError('local', 400, '{"error":{"code":"context_length_exceeded","message":"prompt_too_long"}}')
+      }
+      yield { type: 'text', text: 'continued after provider context recovery' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'recover from provider context error',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: createLongRuntimeContextEvents(sessionId, 10, 200),
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'recover from provider context error',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'result') break
+    }
+
+    assert.ok(
+      emitted.some(event => event.type === 'context_recovery_attempted' && event.strategy === 'semantic_compact_retry'),
+      `provider context error should emit recovery attempt; events=${emitted.map(event => event.type).join(',')}`,
+    )
+    assert.ok(
+      emitted.some(event => event.type === 'compact_boundary' && event.trigger === 'reactive'),
+      `provider context recovery should compact reactively; events=${emitted.map(event => event.type).join(',')}`,
+    )
+    assert.ok(
+      emitted.some(event => event.type === 'context_compact_boundary' && event.trigger === 'reactive'),
+      `provider context recovery should emit compact protocol event; events=${emitted.map(event => event.type).join(',')}`,
+    )
+    assert.ok(!emitted.some(event => event.type === 'context_blocking'))
+    assert.ok(!emitted.some(event => event.type === 'error' && event.code === 'CONTEXT_LIMIT_EXCEEDED'))
+    assert.equal(emitted.find(event => event.type === 'result')?.success, true)
+    assert.equal(executionInvocationCount, 2)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+  }
+})
+
+test('LLMCodingRuntime blocks after provider context-limit recovery is exhausted', async () => {
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-context-blocking-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-context-blocking-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      throw new ProviderError('local', 400, '{"error":{"code":"context_length_exceeded","message":"prompt_too_long"}}')
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'fail provider context recovery',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: createLongRuntimeContextEvents(sessionId, 10, 200),
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'fail provider context recovery',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: new AbortController().signal,
+    })) {
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'result') break
+    }
+
+    assert.equal(emitted.filter(event => event.type === 'context_recovery_attempted').length, 1)
+    assert.ok(emitted.some(event => event.type === 'context_blocking'))
+    const error = emitted.find((event): event is Extract<NexusEvent, { type: 'error' }> => event.type === 'error' && event.code === 'CONTEXT_LIMIT_EXCEEDED')
+    assert.ok(error)
+    assert.match(error.message, /semantic_compact_retry/)
+    assert.equal(emitted.find(event => event.type === 'result')?.success, false)
+    assert.equal(executionInvocationCount, 2)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
     await storage.close()
   }
 })
@@ -6091,11 +7239,11 @@ test('execute honours per-request allowedTools for Bash in soft-deny mode', asyn
   // when the request body carries `allowedTools: ['Bash']`, the runtime
   // applies an allowlist-based policy for this turn only. Combined
   // with `policy: 'soft-deny'`, this means Bash is in the allowlist
-  // (so the hard-deny gate passes) AND is `risk: 'execute'` (so the
+  // (so the policy gate passes) AND is `risk: 'execute'` (so the
   // approval gate fires → `permission_request`).
   // Net: Bash goes through the permission flow instead of being
   // blocked; a tool *not* in allowedTools (e.g. `Write`) is still
-  // hard-denied under soft-deny.
+  // policy-blocked under soft-deny.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allow-tools-bash`)
   await mkdir(cwd, { recursive: true })
   // No top-level allowedTools — server default `denyByDefaultTools()`.
@@ -6134,7 +7282,7 @@ test('execute honours per-request allowedTools for Bash in soft-deny mode', asyn
   }
   assert.ok(
     toolUseId,
-    'Bash in allowedTools + soft-deny should reach permission_request, not hard-deny',
+    'Bash in allowedTools + soft-deny should reach permission_request, not policy-block',
   )
 
   // Approve and await the response.
@@ -6148,10 +7296,10 @@ test('execute honours per-request allowedTools for Bash in soft-deny mode', asyn
   const response = await executePromise
   assert.equal(response.statusCode, 200)
   const events = response.json().events
-  // No hard-deny with policy message (Bash was in the allowlist).
+  // No policy block with policy message (Bash was in the allowlist).
   assert.ok(
     !events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
-    'Bash in allowedTools must NOT be hard-denied',
+    'Bash in allowedTools must NOT be policy-blocked',
   )
 
   await app.close()
@@ -6168,7 +7316,7 @@ test('execute with allowedTools scopes to a single turn', async () => {
   // server-side `policy: 'strict'`. The only knob that changes between
   // turns is `allowedTools`. Turn 1 lets Bash through the policy gate;
   // turn 2 has Bash in the default `denyByDefaultTools()` and gets
-  // hard-denied.
+  // policy-blocked.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-allow-tools-turn-boundary`)
   await mkdir(cwd, { recursive: true })
   const { runtime, storage } = await createDefaultNexusRuntime()
@@ -6177,7 +7325,7 @@ test('execute with allowedTools scopes to a single turn', async () => {
   const sessionId = `session-allow-tools-turn-${Date.now()}`
 
   // First turn: `allowedTools: ['Bash']` → Bash is allowlisted →
-  // hard-deny gate passes → runs.
+  // policy gate passes → runs.
   const first = await app.inject({
     method: 'POST',
     url: '/v1/execute',
@@ -6194,11 +7342,11 @@ test('execute with allowedTools scopes to a single turn', async () => {
   assert.equal(
     firstBody.events.some((e: any) => e.type === 'tool_denied' && /denied by Nexus policy/i.test(e.message)),
     false,
-    'first turn with allowedTools=[Bash] should NOT hard-deny Bash',
+    'first turn with allowedTools=[Bash] should NOT policy-block Bash',
   )
 
   // Second turn: NO `allowedTools` → falls back to server-startup
-  // `denyByDefaultTools()` → Bash is denied.
+  // `denyByDefaultTools()` → Bash is blocked with recoverable policy denial.
   const second = await app.inject({
     method: 'POST',
     url: '/v1/execute',
@@ -6217,8 +7365,10 @@ test('execute with allowedTools scopes to a single turn', async () => {
   )
   assert.ok(
     secondBashDeny.length > 0,
-    'second turn without allowedTools should hard-deny Bash via the default denyByDefaultTools policy',
+    'second turn without allowedTools should block Bash via the default denyByDefaultTools policy',
   )
+  assert.equal(secondBashDeny[0].recoverable, true)
+  assert.equal(secondBody.success, true)
 
   await app.close()
 })
@@ -6227,7 +7377,7 @@ test('execute permission denial: user denies → tool_denied + result(false)', a
   // Phase C end-to-end regression for the deny path of
   // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
   // The model emits Bash (execute risk, not in default allowlist).
-  // Under `policy: 'soft-deny'` the hard-deny gate is bypassed
+  // Under `policy: 'soft-deny'` the policy block is bypassed
   // and the approval gate fires `permission_request`. The user
   // responds via `/deny` with approved=false. The runtime must
   // (a) emit `tool dened` with the user-denied reason, (b) emit
@@ -6291,6 +7441,8 @@ test('execute permission denial: user denies → tool_denied + result(false)', a
     (e: any) => e.type === 'tool_denied' && e.name === 'Bash',
   )
   assert.ok(toolDenied, 'tool_denied should fire on user denial')
+  assert.equal(toolDenied.terminal, true)
+  assert.equal(toolDenied.denialKind, 'permission')
 
   // terminal result is failure.
   const result = body.result ?? events.find((e: any) => e.type === 'result')
@@ -6513,7 +7665,7 @@ test('Phase A.1: scope=session accumulates rules and second turn auto-allows', a
 
   // Turn 2 (no `allowedTools`, no `policy` override) — Bash "sleep
   // 0" should auto-allow via the accumulated session rule.
-  // Default `denyByDefaultTools()` would normally hard-deny it,
+  // Default `denyByDefaultTools()` would normally policy-block it,
   // but the session-rules policy layer (applied on top of the
   // per-turn allowlist) lets it through.
   const second = await app.inject({
@@ -6533,7 +7685,7 @@ test('Phase A.1: scope=session accumulates rules and second turn auto-allows', a
   assert.equal(
     secondBashDeny.length,
     0,
-    'turn 2: Bash "sleep 0" must NOT be hard-denied because the accumulated session rule auto-allows it',
+    'turn 2: Bash "sleep 0" must NOT be policy-blocked because the accumulated session rule auto-allows it',
   )
   // And it must have run to completion.
   const secondBashCompleted = secondBody.events.filter(

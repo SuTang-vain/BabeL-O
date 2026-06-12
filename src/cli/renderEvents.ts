@@ -714,6 +714,7 @@ function renderLiveEvent(event: NexusEvent): void {
         status: 'denied',
         risk: event.risk,
         denialMessage: event.message,
+        recoverableDenied: event.recoverable === true,
       }))
       break
     case 'permission_request':
@@ -728,6 +729,29 @@ function renderLiveEvent(event: NexusEvent): void {
       process.stdout.write(formatErrorRecoveryDetails(event.details))
       break
     case 'compact_boundary':
+      break
+    case 'context_compact_boundary':
+      console.log(chalk.dim(`context compact boundary: ${event.beforeEventCount} -> ${event.afterEventCount} events; retained=${event.retainedEventCount}.`))
+      break
+    case 'context_usage':
+      lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
+      break
+    case 'context_microcompact':
+      if (event.estimatedTokensSaved > 0) {
+        console.log(chalk.dim(`context microcompact: saved ~${event.estimatedTokensSaved} tokens across ${event.compactedEventCount} tool result event(s).`))
+      }
+      break
+    case 'context_recovery_attempted':
+      console.log(chalk.yellow(formatContextRecoveryAttempted(event)))
+      break
+    case 'context_grounding_required':
+      console.log(chalk.yellow(formatContextGroundingRequired(event)))
+      break
+    case 'context_grounding_confirmed':
+      console.log(chalk.green(formatContextGroundingConfirmed(event)))
+      break
+    case 'workspace_dirty_detected':
+      console.log(chalk.yellow(formatWorkspaceDirtyDetected(event)))
       break
     case 'context_warning':
       lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
@@ -793,6 +817,27 @@ function renderLiveEvent(event: NexusEvent): void {
   }
 }
 
+function formatContextRecoveryAttempted(event: Extract<NexusEvent, { type: 'context_recovery_attempted' }>): string {
+  const tokenSuffix = event.postTokens !== undefined
+    ? ` tokens=${event.preTokens}->${event.postTokens}`
+    : ` tokens=${event.preTokens}`
+  return `context recovery ${event.attempt}/${event.maxAttempts}: ${event.strategy}${tokenSuffix}. ${event.message}`
+}
+
+function formatContextGroundingRequired(event: Extract<NexusEvent, { type: 'context_grounding_required' }>): string {
+  return `context grounding required (${event.source}): ${event.state}; verify ${event.requiredFor.join(', ')} before conclusions. ${event.message}`
+}
+
+function formatContextGroundingConfirmed(event: Extract<NexusEvent, { type: 'context_grounding_confirmed' }>): string {
+  return `context grounding confirmed (${event.confirmationKind} via ${event.toolName}): ${event.confirmedFor.join(', ')}. ${event.message}`
+}
+
+function formatWorkspaceDirtyDetected(event: Extract<NexusEvent, { type: 'workspace_dirty_detected' }>): string {
+  const files = event.changedFiles.slice(0, 5).join(', ')
+  const suffix = event.truncated ? ', …' : ''
+  return `workspace dirty (${event.source}): ${event.changedFileCount} changed file(s)${files ? `: ${files}${suffix}` : ''}. ${event.message}`
+}
+
 function formatErrorRecoveryDetails(details: unknown): string {
   if (!details || typeof details !== 'object') return ''
   const record = details as Record<string, unknown>
@@ -821,6 +866,7 @@ interface ToolCallState {
   success?: boolean
   output?: any
   denied?: boolean
+  recoverableDenied?: boolean
   truncated?: boolean
   originalBytes?: number
   risk?: string
@@ -904,6 +950,7 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       if (state) {
         state.completed = true
         state.denied = true
+        state.recoverableDenied = ev.recoverable === true
         state.risk = ev.risk
         state.denialMessage = ev.message
       }
@@ -985,6 +1032,40 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
         }
         break
 
+      case 'context_compact_boundary':
+        if (mode === 'expanded') {
+          outputText += chalk.dim(`context compact boundary: ${ev.beforeEventCount} -> ${ev.afterEventCount} events; retained=${ev.retainedEventCount}.\n`)
+        }
+        break
+
+      case 'context_usage':
+        if (mode === 'expanded') {
+          outputText += chalk.dim(`context usage: ${ev.percentUsed}% (${ev.tokenEstimate}/${ev.maxTokens} tokens).\n`)
+        }
+        break
+
+      case 'context_microcompact':
+        if (mode === 'expanded') {
+          outputText += chalk.dim(`context microcompact: saved ~${ev.estimatedTokensSaved} tokens across ${ev.compactedEventCount} event(s).\n`)
+        }
+        break
+
+      case 'context_recovery_attempted':
+        outputText += chalk.yellow(`${formatContextRecoveryAttempted(ev)}\n`)
+        break
+
+      case 'context_grounding_required':
+        outputText += chalk.yellow(`${formatContextGroundingRequired(ev)}\n`)
+        break
+
+      case 'context_grounding_confirmed':
+        outputText += chalk.green(`${formatContextGroundingConfirmed(ev)}\n`)
+        break
+
+      case 'workspace_dirty_detected':
+        outputText += chalk.yellow(`${formatWorkspaceDirtyDetected(ev)}\n`)
+        break
+
       case 'context_warning':
         outputText += chalk.yellow(
           `context warning: ${ev.percentUsed}% of window used (${ev.tokenEstimate}/${ev.maxTokens} tokens). consider /compact.\n`,
@@ -1010,10 +1091,15 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
       case 'tool_denied': {
         if (isDeniedToolAlreadyRendered(toolsMap, ev.name, ev.message)) break
         if (mode === 'compact') {
-          outputText += `${chalk.red('●')} ${ev.name} denied (${ev.risk} risk) - ${ev.message}\n`
+          const marker = ev.recoverable ? chalk.yellow('●') : chalk.red('●')
+          const status = ev.recoverable ? chalk.yellow('blocked recoverable') : chalk.red('denied')
+          outputText += `${marker} ${ev.name} ${status} (${ev.risk} risk) - ${ev.message}\n`
         } else {
-          outputText += `${chalk.red(`! ${ev.name} denied`)}\n`
+          outputText += ev.recoverable
+            ? `${chalk.yellow(`! ${ev.name} blocked`)}\n`
+            : `${chalk.red(`! ${ev.name} denied`)}\n`
           outputText += `  Risk: ${ev.risk}\n`
+          if (ev.recoverable) outputText += `  Recoverable: true\n`
           outputText += `  Message: ${ev.message}\n`
         }
         break
@@ -1772,7 +1858,9 @@ function formatUserPrompt(text: string): string {
 
 function formatToolHeader(state: ToolCallState): string {
   const label = formatToolCallLabel(state.name, state.input)
-  if (state.denied) return chalk.red(`! ${label} denied`)
+  if (state.denied) return state.recoverableDenied
+    ? chalk.yellow(`! ${label} blocked`)
+    : chalk.red(`! ${label} denied`)
   if (state.success) return chalk.green(`✓ ${label}`)
   return chalk.red(`✗ ${label}`)
 }
@@ -1783,7 +1871,10 @@ function formatToolHistoryLine(state: ToolCallState, formattedInput: string): st
     return `${toolPrefix} ${chalk.bold(label)}`
   }
   if (state.denied) {
-    return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(state.risk ? `${state.risk} risk` : '')}`
+    const marker = state.recoverableDenied ? chalk.yellow('●') : chalk.red('●')
+    const status = state.recoverableDenied ? chalk.yellow('blocked') : chalk.red('denied')
+    const hint = state.recoverableDenied ? chalk.dim(' recoverable') : ''
+    return `${marker} ${chalk.bold(label)} ${status} ${chalk.dim(state.risk ? `${state.risk} risk` : '')}${hint}`
   }
   const status = state.success ? '' : ` ${chalk.red('failed')}`
   const truncated = state.truncated ? ` ${chalk.yellow('truncated')}` : ''
@@ -1804,7 +1895,9 @@ function formatExpandedToolDetails(state: ToolCallState): string {
   if (!state.completed) return lines.join('\n')
 
   if (state.denied) {
-    lines.push(`${chalk.red('  Denied')}: ${state.risk ?? state.permissionRequest?.risk ?? 'unknown'} risk`)
+    const label = state.recoverableDenied ? '  Recoverable denial' : '  Denied'
+    const style = state.recoverableDenied ? chalk.yellow : chalk.red
+    lines.push(`${style(label)}: ${state.risk ?? state.permissionRequest?.risk ?? 'unknown'} risk`)
     if (state.denialMessage) lines.push(`${chalk.dim('  Message')}: ${state.denialMessage}`)
     return lines.join('\n')
   }
@@ -1847,6 +1940,7 @@ function formatToolLiveLine(options: {
   output?: unknown
   risk?: string
   denialMessage?: string
+  recoverableDenied?: boolean
   truncated?: boolean
   originalBytes?: number
 }): string {
@@ -1856,7 +1950,11 @@ function formatToolLiveLine(options: {
     return `${toolPrefix} ${chalk.bold(label)}`
   }
   if (options.status === 'denied') {
-    return `${chalk.red('●')} ${chalk.bold(label)} ${chalk.red('denied')} ${chalk.dim(options.risk ? `${options.risk} risk` : '')} ${options.denialMessage ?? ''}`.trimEnd()
+    const recoverable = options.recoverableDenied === true
+    const marker = recoverable ? chalk.yellow('●') : chalk.red('●')
+    const status = recoverable ? chalk.yellow('blocked') : chalk.red('denied')
+    const hint = recoverable ? chalk.dim(' recoverable') : ''
+    return `${marker} ${chalk.bold(label)} ${status} ${chalk.dim(options.risk ? `${options.risk} risk` : '')}${hint} ${options.denialMessage ?? ''}`.trimEnd()
   }
   const status = options.status === 'completed' ? '' : ` ${chalk.red('failed')}`
   const truncated = options.truncated ? ` ${chalk.yellow(`truncated ${options.originalBytes ?? 'unknown'}b`)}` : ''

@@ -31,8 +31,32 @@ import type { ContextSelectionDiagnostics } from './contextManager.js'
 import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 
 export type ContextDiagnosticSignal = {
-  type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary'
+  type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary' | 'grounding_required' | 'workspace_dirty'
   severity: 'info' | 'warning' | 'critical'
+  message: string
+}
+
+export type ContextVisualizationBucket = {
+  kind: 'system' | 'memory' | 'git' | 'events' | 'tool_results' | 'compact_summary' | 'session_channel' | 'skills'
+  estimatedTokens: number
+  itemCount: number
+  percentOfEstimate: number
+}
+
+export type ContextVisualizationTopItem = {
+  kind: ContextVisualizationBucket['kind']
+  label: string
+  estimatedTokens: number
+  source: string
+}
+
+export type ContextGroundingState = {
+  state: 'source-confirmed' | 'summary-derived' | 'dirty-workspace'
+  summaryDerived: boolean
+  dirtyWorkspace: boolean
+  changedFileCount: number
+  changedFiles: string[]
+  suggestedActions: Array<'inspect_changed_files' | 're_read_referenced_files' | 'inspect_git_status' | 'inspect_diff' | 'run_focused_tests' | 'inspect_event_log'>
   message: string
 }
 
@@ -47,6 +71,18 @@ export type ContextAnalysisDiagnostics = {
     cacheCreationInputTokens: number
     cacheReadInputTokens: number
     estimatedReasoningTokens: number
+  }
+  visualization: {
+    buckets: ContextVisualizationBucket[]
+    topItems: ContextVisualizationTopItem[]
+    nextThreshold: {
+      name: 'warning' | 'compact' | 'blocking' | 'none'
+      thresholdTokens: number
+      remainingTokens: number
+      percent: number
+    }
+    grounding: ContextGroundingState
+    suggestions: string[]
   }
   autoCompact: {
     enabled: boolean
@@ -171,6 +207,9 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   longTermMemorySearchLatencyMs?: number
   longTermMemoryError?: string
   scopedMemory: MemoryProviderDiagnostics[]
+  groundingState: ContextGroundingState['state']
+  contextBucketCount: number
+  topContextItemCount: number
 }>
 
 export type ContextAnalysis = {
@@ -398,6 +437,9 @@ function buildContextDiagnosticEnvelope(options: {
       longTermMemorySearchLatencyMs: options.diagnostics.longTermMemory.searchLatencyMs,
       longTermMemoryError: options.diagnostics.longTermMemory.error,
       scopedMemory: options.diagnostics.scopedMemory,
+      groundingState: options.diagnostics.visualization.grounding.state,
+      contextBucketCount: options.diagnostics.visualization.buckets.length,
+      topContextItemCount: options.diagnostics.visualization.topItems.length,
     },
   })
 }
@@ -452,12 +494,21 @@ function buildContextDiagnostics(options: {
   cacheAwareCompactPolicy: CacheAwareCompactPolicy
 }): ContextAnalysisDiagnostics {
   const remainingTokens = Math.max(0, options.window.maxTokens - options.window.tokenEstimate)
+  const compactRemainingTokens = Math.max(0, options.window.compactThresholdTokens - options.window.tokenEstimate)
+  const blockingRemainingTokens = Math.max(0, options.window.blockingLimitTokens - options.window.tokenEstimate)
   const diagnostics: ContextAnalysisDiagnostics = {
     remainingTokens,
     remainingPercent: Math.round((remainingTokens / Math.max(1, options.window.maxTokens)) * 100),
-    compactRemainingTokens: Math.max(0, options.window.compactThresholdTokens - options.window.tokenEstimate),
-    blockingRemainingTokens: Math.max(0, options.window.blockingLimitTokens - options.window.tokenEstimate),
+    compactRemainingTokens,
+    blockingRemainingTokens,
     usageSummary: summarizeUsage(options.events),
+    visualization: buildContextVisualizationDiagnostics({
+      events: options.events,
+      assembled: options.assembled,
+      window: options.window,
+      compactRemainingTokens,
+      blockingRemainingTokens,
+    }),
     autoCompact: options.autoCompact,
     memory: {
       projectMemoryChars: options.assembled.projectMemory.length,
@@ -506,6 +557,231 @@ function buildContextDiagnostics(options: {
     microcompactMetrics: options.assembled.microcompactMetrics,
   })
   return diagnostics
+}
+
+function buildContextVisualizationDiagnostics(options: {
+  events: NexusEvent[]
+  assembled: AssembledContext
+  window: ContextWindowState
+  compactRemainingTokens: number
+  blockingRemainingTokens: number
+}): ContextAnalysisDiagnostics['visualization'] {
+  const buckets = buildVisualizationBuckets(options)
+  const topItems = buildVisualizationTopItems(options)
+  const grounding = buildGroundingState(options.events)
+  return {
+    buckets,
+    topItems,
+    nextThreshold: buildNextThreshold(options.window, options.compactRemainingTokens, options.blockingRemainingTokens),
+    grounding,
+    suggestions: buildVisualizationSuggestions({
+      window: options.window,
+      grounding,
+      topItems,
+      buckets,
+      compactRemainingTokens: options.compactRemainingTokens,
+    }),
+  }
+}
+
+function buildVisualizationBuckets(options: {
+  events: NexusEvent[]
+  assembled: AssembledContext
+  window: ContextWindowState
+}): ContextVisualizationBucket[] {
+  const totals = new Map<ContextVisualizationBucket['kind'], { estimatedTokens: number; itemCount: number }>()
+  const add = (kind: ContextVisualizationBucket['kind'], estimatedTokens: number, itemCount = 1) => {
+    if (estimatedTokens <= 0 && itemCount <= 0) return
+    const existing = totals.get(kind) ?? { estimatedTokens: 0, itemCount: 0 }
+    existing.estimatedTokens += Math.max(0, estimatedTokens)
+    existing.itemCount += Math.max(0, itemCount)
+    totals.set(kind, existing)
+  }
+
+  add('system', Math.ceil(options.assembled.systemPrompt.length / 4), options.assembled.systemPromptBlocks?.length ?? 1)
+  add('memory', Math.ceil(options.assembled.projectMemory.length / 4), options.assembled.projectMemory ? 1 : 0)
+  add('compact_summary', Math.ceil(options.assembled.sessionSummary.length / 4), options.assembled.sessionSummary ? 1 : 0)
+  add('skills', Math.ceil(options.assembled.activeSkills.length / 4), options.assembled.activeSkills ? 1 : 0)
+  add('git', Math.ceil(options.assembled.gitStatus.length / 4), options.assembled.gitStatus ? 1 : 0)
+  add('events', estimateEventTokens(options.events.filter(event => event.type !== 'tool_completed')), options.events.filter(event => event.type !== 'tool_completed').length)
+  add('tool_results', estimateEventTokens(options.events.filter(event => event.type === 'tool_completed')), options.events.filter(event => event.type === 'tool_completed').length)
+  for (const diagnostic of options.assembled.scopedMemoryDiagnostics) {
+    if (diagnostic.scope === 'channel') {
+      add('session_channel', Math.ceil(diagnostic.injectedChars / 4), diagnostic.hitCount)
+    }
+  }
+
+  return [...totals.entries()]
+    .map(([kind, bucket]) => ({
+      kind,
+      estimatedTokens: bucket.estimatedTokens,
+      itemCount: bucket.itemCount,
+      percentOfEstimate: Math.round((bucket.estimatedTokens / Math.max(1, options.window.tokenEstimate)) * 100),
+    }))
+    .filter(bucket => bucket.estimatedTokens > 0 || bucket.itemCount > 0)
+    .sort((left, right) => right.estimatedTokens - left.estimatedTokens || left.kind.localeCompare(right.kind))
+}
+
+function buildVisualizationTopItems(options: {
+  events: NexusEvent[]
+  assembled: AssembledContext
+}): ContextVisualizationTopItem[] {
+  const items: ContextVisualizationTopItem[] = []
+  const push = (kind: ContextVisualizationTopItem['kind'], label: string, estimatedTokens: number, source: string) => {
+    if (estimatedTokens <= 0) return
+    items.push({ kind, label: truncateLabel(label), estimatedTokens, source })
+  }
+
+  for (const item of options.assembled.selectionDiagnostics.retained) {
+    push(bucketKindForSelectionKind(item.kind), item.id, item.estimatedTokens, item.reason)
+  }
+  for (const item of options.assembled.selectionDiagnostics.dropped) {
+    push(bucketKindForSelectionKind(item.kind), item.id, item.estimatedTokens, item.reason)
+  }
+  for (const event of options.events) {
+    if (event.type !== 'tool_completed') continue
+    push('tool_results', `${event.name}:${event.toolUseId}`, estimateEventTokens([event]), 'tool result output')
+  }
+
+  return items
+    .sort((left, right) => right.estimatedTokens - left.estimatedTokens || left.label.localeCompare(right.label))
+    .slice(0, 8)
+}
+
+function bucketKindForSelectionKind(kind: string): ContextVisualizationBucket['kind'] {
+  switch (kind) {
+    case 'system':
+      return 'system'
+    case 'memory':
+      return 'memory'
+    case 'git':
+    case 'working_set':
+      return 'git'
+    case 'tool_result':
+      return 'tool_results'
+    case 'compact_summary':
+      return 'compact_summary'
+    case 'skill':
+    case 'mcp':
+      return 'skills'
+    case 'task_state':
+    case 'child_agent_state':
+      return 'session_channel'
+    default:
+      return 'events'
+  }
+}
+
+function buildNextThreshold(
+  window: ContextWindowState,
+  compactRemainingTokens: number,
+  blockingRemainingTokens: number,
+): ContextAnalysisDiagnostics['visualization']['nextThreshold'] {
+  if (window.tokenEstimate < window.warningThresholdTokens) {
+    return {
+      name: 'warning',
+      thresholdTokens: window.warningThresholdTokens,
+      remainingTokens: Math.max(0, window.warningThresholdTokens - window.tokenEstimate),
+      percent: Math.round((window.warningThresholdTokens / Math.max(1, window.maxTokens)) * 100),
+    }
+  }
+  if (window.tokenEstimate < window.compactThresholdTokens) {
+    return {
+      name: 'compact',
+      thresholdTokens: window.compactThresholdTokens,
+      remainingTokens: compactRemainingTokens,
+      percent: Math.round((window.compactThresholdTokens / Math.max(1, window.maxTokens)) * 100),
+    }
+  }
+  if (window.tokenEstimate < window.blockingLimitTokens) {
+    return {
+      name: 'blocking',
+      thresholdTokens: window.blockingLimitTokens,
+      remainingTokens: blockingRemainingTokens,
+      percent: Math.round((window.blockingLimitTokens / Math.max(1, window.maxTokens)) * 100),
+    }
+  }
+  return {
+    name: 'none',
+    thresholdTokens: window.blockingLimitTokens,
+    remainingTokens: 0,
+    percent: 100,
+  }
+}
+
+function buildGroundingState(events: NexusEvent[]): ContextGroundingState {
+  const groundingIndex = findLastEventIndex(events, 'context_grounding_required')
+  const dirtyIndex = findLastEventIndex(events, 'workspace_dirty_detected')
+  const confirmedIndex = findLastEventIndex(events, 'context_grounding_confirmed')
+  const gitConfirmedIndex = findLastEventIndex(events, 'context_grounding_confirmed', event => event.confirmedFor.includes('git_status'))
+  const grounding = groundingIndex >= 0 ? events[groundingIndex] as Extract<NexusEvent, { type: 'context_grounding_required' }> : undefined
+  const dirty = dirtyIndex >= 0 ? events[dirtyIndex] as Extract<NexusEvent, { type: 'workspace_dirty_detected' }> : undefined
+  const confirmed = confirmedIndex >= 0 ? events[confirmedIndex] as Extract<NexusEvent, { type: 'context_grounding_confirmed' }> : undefined
+  const summaryDerived = Boolean(grounding && groundingIndex > confirmedIndex)
+  const dirtyWorkspace = Boolean(dirty && dirty.changedFileCount > 0 && dirtyIndex > gitConfirmedIndex)
+  const suggestions = new Set<ContextGroundingState['suggestedActions'][number]>()
+  if (summaryDerived) grounding?.suggestedActions.forEach(action => suggestions.add(action))
+  if (dirtyWorkspace) dirty?.suggestedActions.forEach(action => suggestions.add(action))
+  const state: ContextGroundingState['state'] = dirtyWorkspace ? 'dirty-workspace' : summaryDerived ? 'summary-derived' : 'source-confirmed'
+  return {
+    state,
+    summaryDerived,
+    dirtyWorkspace,
+    changedFileCount: dirtyWorkspace ? dirty?.changedFileCount ?? 0 : 0,
+    changedFiles: dirtyWorkspace ? dirty?.changedFiles ?? [] : [],
+    suggestedActions: [...suggestions],
+    message: dirtyWorkspace
+      ? dirty?.message ?? 'Workspace has changed files; inspect status/diff before implementation claims.'
+      : summaryDerived
+        ? grounding?.message ?? 'Context was compacted; verify sources before conclusions.'
+        : confirmed?.message ?? 'Current context has no pending compact-grounding guard.',
+  }
+}
+
+function findLastEvent<T extends NexusEvent['type']>(events: NexusEvent[], type: T): Extract<NexusEvent, { type: T }> | undefined {
+  const index = findLastEventIndex(events, type)
+  return index >= 0 ? events[index] as Extract<NexusEvent, { type: T }> : undefined
+}
+
+function findLastEventIndex<T extends NexusEvent['type']>(
+  events: NexusEvent[],
+  type: T,
+  predicate?: (event: Extract<NexusEvent, { type: T }>) => boolean,
+): number {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type !== type) continue
+    const typedEvent = event as Extract<NexusEvent, { type: T }>
+    if (!predicate || predicate(typedEvent)) return index
+  }
+  return -1
+}
+
+function buildVisualizationSuggestions(options: {
+  window: ContextWindowState
+  grounding: ContextGroundingState
+  topItems: ContextVisualizationTopItem[]
+  buckets: ContextVisualizationBucket[]
+  compactRemainingTokens: number
+}): string[] {
+  const suggestions: string[] = []
+  if (options.grounding.dirtyWorkspace) suggestions.push('inspect changed files')
+  if (options.grounding.summaryDerived) suggestions.push('re-read referenced files before source/test/git conclusions')
+  if (options.window.isBlocking || options.window.isCompact) suggestions.push('compact')
+  else if (options.window.isWarning) suggestions.push('narrow scope or compact soon')
+  else suggestions.push('continue')
+  if (options.topItems.length > 0) suggestions.push('inspect largest items')
+  if (options.buckets.some(bucket => bucket.kind === 'tool_results' && bucket.percentOfEstimate >= 20)) suggestions.push('reduce tool output')
+  if (options.compactRemainingTokens <= 0) suggestions.push('split task')
+  return [...new Set(suggestions)]
+}
+
+function estimateEventTokens(events: NexusEvent[]): number {
+  return Math.ceil(events.reduce((sum, event) => sum + stableStringify(event).length, 0) / 4)
+}
+
+function truncateLabel(value: string): string {
+  return value.length <= 120 ? value : `${value.slice(0, 117)}...`
 }
 
 function summarizeUsage(events: NexusEvent[]): ContextAnalysisDiagnostics['usageSummary'] {
@@ -835,6 +1111,20 @@ function buildDiagnosticSignals(options: {
       message: `Resume recovery boundary is active after ${options.diagnostics.resumeRecovery.code}.`,
     })
   }
+  if (options.diagnostics.visualization.grounding.summaryDerived) {
+    signals.push({
+      type: 'grounding_required',
+      severity: 'warning',
+      message: 'Compact summary is acting as a recovery index; verify current sources before factual conclusions.',
+    })
+  }
+  if (options.diagnostics.visualization.grounding.dirtyWorkspace) {
+    signals.push({
+      type: 'workspace_dirty',
+      severity: 'warning',
+      message: `Workspace has ${options.diagnostics.visualization.grounding.changedFileCount} changed file(s); inspect status/diff before implementation claims.`,
+    })
+  }
   if (options.diagnostics.largeToolResults.length > 0) {
     const largest = options.diagnostics.largeToolResults[0]!
     signals.push({
@@ -901,6 +1191,14 @@ function buildContextRecommendations(options: {
     recommendations.push('Long-term memory retrieval failed; continue from local session/context evidence.')
   } else if (options.diagnostics.longTermMemory.truncated) {
     recommendations.push('Long-term memory hits were truncated; ask a narrower follow-up or reduce memory retrieval budget pressure.')
+  }
+  if (options.diagnostics.visualization.grounding.dirtyWorkspace) {
+    recommendations.push('Inspect changed files or git diff before reporting current implementation state.')
+  } else if (options.diagnostics.visualization.grounding.summaryDerived) {
+    recommendations.push('Re-read referenced files before making source, test, git, or task-completion claims.')
+  }
+  for (const suggestion of options.diagnostics.visualization.suggestions) {
+    recommendations.push(`Context suggestion: ${suggestion}.`)
   }
   if (!options.hasCompactBoundary) {
     recommendations.push('No compact boundary exists yet; /compact can create a recoverable summary point.')

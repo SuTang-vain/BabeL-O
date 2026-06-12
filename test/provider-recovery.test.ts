@@ -33,6 +33,21 @@ test('classifyProviderRecovery tags context window failures', () => {
   assert.equal(details?.fallbackPolicy.allowSilentModelSwitch, false)
 })
 
+test('classifyProviderRecovery tags provider-specific context window failures', () => {
+  const cases = [
+    ['minimax', '{"base_resp":{"status_code":1004,"status_msg":"tokens exceed context size limit"}}'],
+    ['deepseek', '{"error":{"code":"context_length_exceeded","message":"Input context too long"}}'],
+    ['zhipu', '{"error":{"code":1301,"message":"The token count exceeds context window"}}'],
+  ] as const
+
+  for (const [providerId, rawMessage] of cases) {
+    const details = classifyProviderRecovery(new ProviderError(providerId, 400, rawMessage))
+    assert.equal(details?.kind, 'context_window', providerId)
+    assert.equal(details?.recoveryReason, 'ESCALATED_CONTEXT_WINDOW', providerId)
+    assert.equal(details?.fallbackPolicy.mode, 'compact_then_retry', providerId)
+  }
+})
+
 test('classifyProviderRecovery tags auth and billing failures as non-retryable', () => {
   const details = classifyProviderRecovery(
     new ProviderError('openai', 402, '{"error":{"message":"Insufficient Balance"}}'),

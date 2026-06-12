@@ -20,6 +20,7 @@ import { DatabaseSync } from 'node:sqlite'
  */
 
 const SESSION_ID = 'session_dcf7e34e-bc59-41e4-b802-e4d03d32b48d'
+const RECOVERABLE_TIMEOUT_SESSION_ID = 'session_791b10ce-0d41-409d-b2de-1e5d14eb19b3'
 
 type RegressionSummary = {
   phase: string
@@ -28,17 +29,20 @@ type RegressionSummary = {
   eventCount: number
   toolCount: number
   failedToolCount: number
+  incompleteToolCount: number
   bashToolCount: number
   permissionRequests: number
   permissionResponses: number
   approvedAudits: number
   deniedAudits: number
   timeoutErrors: number
+  assistantDeltaCount: number
   executeOutcome: string | null
   nearTimeout: boolean
   timeoutMs: number | null
   executeDurationMs: number | null
   approvalWaitSeconds: number
+  lastIncompleteToolApproved: boolean
 }
 
 function withTempDb<T>(fn: (dbPath: string) => T): T {
@@ -220,22 +224,204 @@ function appendEvent(
   eventType: string,
   timestamp: string,
   payload: Record<string, unknown>,
+  sessionId = SESSION_ID,
 ): void {
   const event = {
     type: eventType,
     schemaVersion: '2026-05-21.babel-o.v1',
-    sessionId: SESSION_ID,
+    sessionId,
     timestamp,
     ...payload,
   }
   db.prepare(`INSERT INTO events (event_key, session_id, timestamp, event_type, event_json) VALUES (?, ?, ?, ?, ?)`)
-    .run(`${SESSION_ID}:${index.toString().padStart(3, '0')}:${eventType}`, SESSION_ID, timestamp, eventType, JSON.stringify(event))
+    .run(`${sessionId}:${index.toString().padStart(3, '0')}:${eventType}`, sessionId, timestamp, eventType, JSON.stringify(event))
 }
 
-function summarizeRegressionSession(dbPath: string): RegressionSummary {
+function seedRecoverableTimeoutFixture(dbPath: string): void {
+  const db = new DatabaseSync(dbPath)
+  try {
+    db.exec(`
+      CREATE TABLE sessions (
+        session_id TEXT PRIMARY KEY,
+        cwd TEXT NOT NULL,
+        prompt TEXT NOT NULL,
+        phase TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        result TEXT,
+        error TEXT,
+        metadata TEXT
+      );
+      CREATE TABLE events (
+        event_key TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        event_json TEXT NOT NULL
+      );
+      CREATE TABLE tool_traces (
+        tool_use_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        input TEXT NOT NULL,
+        output TEXT,
+        success INTEGER,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        duration_ms INTEGER,
+        remote_runner TEXT
+      );
+      CREATE TABLE permission_audits (
+        audit_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        tool_use_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        tool_risk TEXT NOT NULL,
+        tool_input TEXT NOT NULL,
+        decision TEXT NOT NULL,
+        reason TEXT,
+        timestamp TEXT NOT NULL
+      );
+    `)
+
+    db.prepare(`INSERT INTO sessions
+      (session_id, cwd, prompt, phase, created_at, updated_at, result, error, metadata)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      RECOVERABLE_TIMEOUT_SESSION_ID,
+      '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
+      '',
+      'failed',
+      '2026-06-11T14:25:56.272Z',
+      '2026-06-11T14:28:56.281Z',
+      null,
+      'Execution timed out while running Bash.',
+      JSON.stringify({ client: 'go-tui' }),
+    )
+
+    appendEvent(db, 1, 'user_message', '2026-06-11T14:25:56.277Z', {
+      text: '查看当前项目分析潜在的bug',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    appendEvent(db, 2, 'session_started', '2026-06-11T14:25:56.279Z', {
+      cwd: '/Users/tangyaoyue/DEV/BABEL/BabeL-O',
+      requestId: 'req_a422a2d0-05bd-4b35-bb94-1eaac4b68906',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+
+    for (const [index, text] of [
+      '我将系统地分析项目中的潜在bug。',
+      '有大量未提交的修改，我需要重点关注这些变更。',
+      '我看到几个潜在 bug。',
+      '让我先验证 result schema：',
+    ].entries()) {
+      appendEvent(db, 10 + index, 'assistant_delta', `2026-06-11T14:26:0${4 + index}.000Z`, { text }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    }
+
+    const completedTools = [
+      { id: 'call_function_ry96hqzqxiij_1', name: 'ListDir', input: { path: '/Users/tangyaoyue/DEV/BABEL/BabeL-O' } },
+      { id: 'call_function_ry96hqzqxiij_2', name: 'Bash', input: { command: 'git status --short', timeoutMs: 10000 } },
+      { id: 'call_function_czwf2i5k83li_1', name: 'Bash', input: { command: 'grep -n "ResultEventSchema\\|type: \'result\'\\|ResultEvent = " src/shared/events.ts | head -10', timeoutMs: 5000 } },
+      { id: 'call_function_czwf2i5k83li_2', name: 'Bash', input: { command: 'grep -n "ToolDeniedEventSchema\\|message:\\|tool_denied" src/shared/events.ts | head -20', timeoutMs: 5000 } },
+    ]
+
+    for (const [index, tool] of completedTools.entries()) {
+      const startedAt = `2026-06-11T14:28:5${index}.000Z`
+      const completedAt = `2026-06-11T14:28:5${index}.500Z`
+      db.prepare(`INSERT INTO tool_traces
+        (tool_use_id, session_id, name, input, output, success, started_at, completed_at, duration_ms, remote_runner)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+        tool.id,
+        RECOVERABLE_TIMEOUT_SESSION_ID,
+        tool.name,
+        JSON.stringify(tool.input),
+        'ok',
+        1,
+        startedAt,
+        completedAt,
+        500,
+        null,
+      )
+      appendEvent(db, 30 + index * 2, 'tool_started', startedAt, {
+        toolUseId: tool.id,
+        name: tool.name,
+        input: tool.input,
+      }, RECOVERABLE_TIMEOUT_SESSION_ID)
+      appendEvent(db, 31 + index * 2, 'tool_completed', completedAt, {
+        toolUseId: tool.id,
+        name: tool.name,
+        success: true,
+        output: 'ok',
+      }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    }
+
+    const lastToolUseId = 'call_function_czwf2i5k83li_3'
+    const lastInput = {
+      command: 'awk \'NR>=1 && NR<=200\' src/shared/events.ts | grep -n "z.object\\|z.literal\\|export const" | head -40',
+      timeoutMs: 5000,
+    }
+    db.prepare(`INSERT INTO tool_traces
+      (tool_use_id, session_id, name, input, output, success, started_at, completed_at, duration_ms, remote_runner)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      lastToolUseId,
+      RECOVERABLE_TIMEOUT_SESSION_ID,
+      'Bash',
+      JSON.stringify(lastInput),
+      null,
+      null,
+      '2026-06-11T14:28:55.520Z',
+      null,
+      null,
+      null,
+    )
+    appendEvent(db, 80, 'tool_started', '2026-06-11T14:28:55.520Z', {
+      toolUseId: lastToolUseId,
+      name: 'Bash',
+      input: lastInput,
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    appendEvent(db, 81, 'permission_request', '2026-06-11T14:28:55.520Z', {
+      toolUseId: lastToolUseId,
+      name: 'Bash',
+      risk: 'execute',
+      input: lastInput,
+      message: 'Tool Bash requires user permission to run. Reason: Shell operators require manual review',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    appendEvent(db, 82, 'permission_response', '2026-06-11T14:28:56.253Z', {
+      toolUseId: lastToolUseId,
+      approved: true,
+      reason: 'Approved from Go TUI',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    db.prepare(`INSERT INTO permission_audits
+      (audit_id, session_id, tool_use_id, tool_name, tool_risk, tool_input, decision, reason, timestamp)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(
+      'audit-last-incomplete',
+      RECOVERABLE_TIMEOUT_SESSION_ID,
+      lastToolUseId,
+      'Bash',
+      'execute',
+      JSON.stringify(lastInput),
+      'approved',
+      'Approved from Go TUI',
+      '2026-06-11T14:28:56.252Z',
+    )
+
+    appendEvent(db, 90, 'error', '2026-06-11T14:28:56.280Z', {
+      code: 'REQUEST_TIMEOUT',
+      message: 'Execution timed out while running Bash.',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+    appendEvent(db, 91, 'execute_summary', '2026-06-11T14:28:56.281Z', {
+      requestId: 'req_a422a2d0-05bd-4b35-bb94-1eaac4b68906',
+      timeoutMs: 180000,
+      executeDurationMs: 180002,
+      nearTimeout: true,
+      outcome: 'timeout',
+    }, RECOVERABLE_TIMEOUT_SESSION_ID)
+  } finally {
+    db.close()
+  }
+}
+
+function summarizeRegressionSession(dbPath: string, sessionId = SESSION_ID): RegressionSummary {
   const db = new DatabaseSync(dbPath, { readOnly: true })
   try {
-    const row = db.prepare(`SELECT phase, result, error FROM sessions WHERE session_id = ?`).get(SESSION_ID) as {
+    const row = db.prepare(`SELECT phase, result, error FROM sessions WHERE session_id = ?`).get(sessionId) as {
       phase: string
       result: string | null
       error: string | null
@@ -247,7 +433,7 @@ function summarizeRegressionSession(dbPath: string): RegressionSummary {
         SUM(CASE WHEN event_type = 'permission_response' THEN 1 ELSE 0 END) AS permissionResponses,
         SUM(CASE WHEN event_type = 'error' AND json_extract(event_json, '$.code') = 'REQUEST_TIMEOUT' THEN 1 ELSE 0 END) AS timeoutErrors
       FROM events WHERE session_id = ?
-    `).get(SESSION_ID) as {
+    `).get(sessionId) as {
       eventCount: number
       permissionRequests: number
       permissionResponses: number
@@ -257,15 +443,16 @@ function summarizeRegressionSession(dbPath: string): RegressionSummary {
       SELECT
         COUNT(*) AS toolCount,
         SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS failedToolCount,
+        SUM(CASE WHEN completed_at IS NULL THEN 1 ELSE 0 END) AS incompleteToolCount,
         SUM(CASE WHEN name = 'Bash' THEN 1 ELSE 0 END) AS bashToolCount
       FROM tool_traces WHERE session_id = ?
-    `).get(SESSION_ID) as { toolCount: number; failedToolCount: number; bashToolCount: number }
+    `).get(sessionId) as { toolCount: number; failedToolCount: number; incompleteToolCount: number; bashToolCount: number }
     const auditCounts = db.prepare(`
       SELECT
         SUM(CASE WHEN decision = 'approved' THEN 1 ELSE 0 END) AS approvedAudits,
         SUM(CASE WHEN decision = 'denied' THEN 1 ELSE 0 END) AS deniedAudits
       FROM permission_audits WHERE session_id = ?
-    `).get(SESSION_ID) as { approvedAudits: number; deniedAudits: number }
+    `).get(sessionId) as { approvedAudits: number; deniedAudits: number }
     const summary = db.prepare(`
       SELECT
         json_extract(event_json, '$.outcome') AS executeOutcome,
@@ -276,7 +463,7 @@ function summarizeRegressionSession(dbPath: string): RegressionSummary {
       WHERE session_id = ? AND event_type = 'execute_summary'
       ORDER BY timestamp DESC
       LIMIT 1
-    `).get(SESSION_ID) as {
+    `).get(sessionId) as {
       executeOutcome: string | null
       nearTimeout: number | null
       timeoutMs: number | null
@@ -292,7 +479,18 @@ function summarizeRegressionSession(dbPath: string): RegressionSummary {
       )
       SELECT SUM((julianday(resp.respTs) - julianday(req.reqTs)) * 86400) AS seconds
       FROM req JOIN resp USING(id)
-    `).get(SESSION_ID, SESSION_ID) as { seconds: number | null }
+    `).get(sessionId, sessionId) as { seconds: number | null }
+    const assistantDeltaCount = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM events
+      WHERE session_id = ? AND event_type = 'assistant_delta'
+    `).get(sessionId) as { n: number }
+    const lastIncompleteApproval = db.prepare(`
+      SELECT COUNT(*) AS n
+      FROM tool_traces t
+      JOIN permission_audits p ON p.tool_use_id = t.tool_use_id AND p.session_id = t.session_id
+      WHERE t.session_id = ? AND t.completed_at IS NULL AND p.decision = 'approved'
+    `).get(sessionId) as { n: number }
 
     return {
       ...row,
@@ -302,14 +500,17 @@ function summarizeRegressionSession(dbPath: string): RegressionSummary {
       timeoutErrors: eventCounts.timeoutErrors,
       toolCount: toolCounts.toolCount,
       failedToolCount: toolCounts.failedToolCount,
+      incompleteToolCount: toolCounts.incompleteToolCount,
       bashToolCount: toolCounts.bashToolCount,
       approvedAudits: auditCounts.approvedAudits,
       deniedAudits: auditCounts.deniedAudits,
+      assistantDeltaCount: assistantDeltaCount.n,
       executeOutcome: summary.executeOutcome,
       nearTimeout: summary.nearTimeout === 1,
       timeoutMs: summary.timeoutMs,
       executeDurationMs: summary.executeDurationMs,
       approvalWaitSeconds: Number((wait.seconds ?? 0).toFixed(3)),
+      lastIncompleteToolApproved: lastIncompleteApproval.n > 0,
     }
   } finally {
     db.close()
@@ -332,6 +533,7 @@ test('Go TUI tool/permission/timeout regression: dcf7 failed by request timeout,
 
     assert.equal(summary.toolCount, 6)
     assert.equal(summary.failedToolCount, 0, 'all tool traces should succeed in this regression shape')
+    assert.equal(summary.incompleteToolCount, 0)
     assert.equal(summary.bashToolCount, 3, 'read-only source inspection went through Bash')
 
     assert.equal(summary.permissionRequests, 3)
@@ -339,5 +541,34 @@ test('Go TUI tool/permission/timeout regression: dcf7 failed by request timeout,
     assert.equal(summary.approvedAudits, 3)
     assert.equal(summary.deniedAudits, 0, 'permission mechanism approved every Bash request')
     assert.ok(summary.approvalWaitSeconds > 20, `expected approval waits to be material, got ${summary.approvalWaitSeconds}s`)
+  })
+})
+
+test('recoverable timeout regression: 791b fixed cutoff killed workflow while an approved Bash was still in flight', () => {
+  withTempDb((dbPath) => {
+    seedRecoverableTimeoutFixture(dbPath)
+    const summary = summarizeRegressionSession(dbPath, RECOVERABLE_TIMEOUT_SESSION_ID)
+
+    assert.equal(summary.phase, 'failed')
+    assert.equal(summary.result, null)
+    assert.equal(summary.error, 'Execution timed out while running Bash.')
+    assert.equal(summary.executeOutcome, 'timeout')
+    assert.equal(summary.timeoutErrors, 1)
+    assert.equal(summary.nearTimeout, true)
+    assert.equal(summary.timeoutMs, 180000)
+    assert.equal(summary.executeDurationMs, 180002)
+
+    assert.equal(summary.toolCount, 5)
+    assert.equal(summary.failedToolCount, 0, 'no tool returned a recoverable failure before the request timeout')
+    assert.equal(summary.incompleteToolCount, 1, 'the final Bash was started but never completed')
+    assert.equal(summary.bashToolCount, 4)
+    assert.equal(summary.lastIncompleteToolApproved, true, 'the unfinished Bash had already been approved by Go TUI')
+
+    assert.ok(summary.assistantDeltaCount >= 4, 'partial assistant analysis existed before the fatal cutoff')
+    assert.equal(summary.permissionRequests, 1)
+    assert.equal(summary.permissionResponses, 1)
+    assert.equal(summary.approvedAudits, 1)
+    assert.equal(summary.deniedAudits, 0)
+    assert.ok(summary.approvalWaitSeconds > 0, `expected final approval wait to be observable, got ${summary.approvalWaitSeconds}s`)
   })
 })

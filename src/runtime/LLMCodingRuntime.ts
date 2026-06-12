@@ -41,6 +41,11 @@ import {
   absorbPrefixCacheDiagnosticsMetrics,
   absorbProviderTurnMetrics,
   buildContextBlockingEvents,
+  buildContextMicrocompactEvent,
+  buildContextRecoveryAttemptedEvent,
+  buildContextGroundingConfirmedEventForToolResult,
+  buildPostCompactGroundingEvents,
+  buildContextUsageEvent,
   buildContextWarningEvent,
   buildProviderLoopRequestState,
   buildProviderQueryParams,
@@ -51,8 +56,11 @@ import {
   buildRuntimeExecutionMetricsEvent,
   buildRuntimeResultEvent,
   createRuntimeExecutionMetrics,
+  isOptionSelectionClarificationText,
+  normalizeOptionSelection,
   reduceProviderTurnOutcome,
   refreshRuntimeContextState,
+  resolveProviderToolCallInput,
   streamProviderTurn,
   type RuntimeProviderTurn,
 } from './runtimePipeline.js'
@@ -210,6 +218,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       })
       yield intakeEvent
       previousEvents = [...previousEvents, intakeEvent]
+      const confirmedOptionSelection = isConfirmedOptionSelectionAfterClarification(previousEvents, options.prompt)
 
       const toolsList = () => [...this.tools.values()]
         .filter(tool => this.toolPolicy.isAllowed(tool))
@@ -248,6 +257,15 @@ export class LLMCodingRuntime implements NexusRuntime {
       let autoCompactDecision = contextRefreshState.autoCompactDecision
       let cacheAwareCompactPolicy = contextRefreshState.cacheAwareCompactPolicy
       absorbCacheAwareCompactPolicyMetrics(metrics, cacheAwareCompactPolicy)
+      yield buildContextUsageEvent({
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        modelId: cleanedModelId,
+        providerId: settings.providerId,
+        windowState: contextWindowState,
+        cacheAwareCompactPolicy,
+        source: 'initial_refresh',
+      })
       const estimateVisibleContextTokens = () => estimateContextTokens({
         systemPrompt: assembledContext.systemPrompt,
         messages,
@@ -264,6 +282,39 @@ export class LLMCodingRuntime implements NexusRuntime {
         cacheAwareCompactPolicy = nextState.cacheAwareCompactPolicy
         absorbCacheAwareCompactPolicyMetrics(metrics, cacheAwareCompactPolicy)
       }
+      const contextMicrocompactEvent = (trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget') => buildContextMicrocompactEvent({
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        trigger,
+        metrics: assembledContext.microcompactMetrics,
+      })
+      const refreshAfterProviderContextRecovery = async () => {
+        applyContextRefreshState(await refreshRuntimeContextState({
+          runtimeOptions: options,
+          events: previousEvents,
+          modelId: cleanedModelId,
+          buildSystemPrompt,
+          mapEventsToMessages: mapEventsForProvider,
+          tools: toolsList,
+          warningPercent: contextWarningPercent,
+          compactPercent: contextCompactPercent,
+          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          memoryProvider: this.memoryProvider,
+          sessionInbox: await loadSessionInbox(),
+        }))
+      }
+      const postCompactGroundingEvents = (source: 'post_compact' | 'context_recovery', boundaryId?: string) => {
+        this.readFileCache.clear()
+        return buildPostCompactGroundingEvents({
+          sessionId: options.sessionId,
+          requestId: options.requestId,
+          source,
+          boundaryId,
+          gitStatus: assembledContext.gitStatus,
+        })
+      }
+      const initialMicrocompactEvent = contextMicrocompactEvent('initial_refresh')
+      if (initialMicrocompactEvent) yield initialMicrocompactEvent
       if (contextWindowState.isWarning || autoCompactDecision.fuseOpen) {
         const compactPercent = autoCompactDecision.enabled
           ? autoCompactDecision.thresholdPercent
@@ -295,7 +346,10 @@ export class LLMCodingRuntime implements NexusRuntime {
           })
           absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
           yield compactResult.event
-          previousEvents = [...previousEvents, compactResult.event]
+          yield compactResult.contextEvent
+          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+          for (const groundingEvent of groundingEvents) yield groundingEvent
+          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
           applyContextRefreshState(await refreshRuntimeContextState({
             runtimeOptions: options,
             events: previousEvents,
@@ -310,6 +364,17 @@ export class LLMCodingRuntime implements NexusRuntime {
             sessionInbox: await loadSessionInbox(),
           }))
           autoCompactDecision = contextRefreshState.autoCompactDecision
+          yield buildContextUsageEvent({
+            sessionId: options.sessionId,
+            requestId: options.requestId,
+            modelId: cleanedModelId,
+            providerId: settings.providerId,
+            windowState: contextWindowState,
+            cacheAwareCompactPolicy,
+            source: 'after_compact',
+          })
+          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
+          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
         } catch (error) {
           yield buildCompactFailureEvent({
             sessionId: options.sessionId,
@@ -334,7 +399,10 @@ export class LLMCodingRuntime implements NexusRuntime {
           })
           absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
           yield compactResult.event
-          previousEvents = [...previousEvents, compactResult.event]
+          yield compactResult.contextEvent
+          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+          for (const groundingEvent of groundingEvents) yield groundingEvent
+          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
           applyContextRefreshState(await refreshRuntimeContextState({
             runtimeOptions: options,
             events: previousEvents,
@@ -348,6 +416,17 @@ export class LLMCodingRuntime implements NexusRuntime {
             memoryProvider: this.memoryProvider,
             sessionInbox: await loadSessionInbox(),
           }))
+          yield buildContextUsageEvent({
+            sessionId: options.sessionId,
+            requestId: options.requestId,
+            modelId: cleanedModelId,
+            providerId: settings.providerId,
+            windowState: contextWindowState,
+            cacheAwareCompactPolicy,
+            source: 'after_compact',
+          })
+          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
+          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
         } catch (error) {
           yield buildCompactFailureEvent({
             sessionId: options.sessionId,
@@ -385,7 +464,9 @@ export class LLMCodingRuntime implements NexusRuntime {
       const MAX_OUTPUT_RETRIES = 2
       const MAX_TOKEN_RECOVERIES = 3
       const MAX_SUPPRESSED_TOOL_RETRIES = 1
+      const MAX_PROVIDER_CONTEXT_RECOVERIES = 1
       let maxTokenRecoveryCount = 0
+      let providerContextRecoveryCount = 0
       let suppressedToolRetryCount = 0
       const replacementState = createReplacementState()
       let providerLoopCompactAttempted = false
@@ -403,6 +484,7 @@ export class LLMCodingRuntime implements NexusRuntime {
 
         let suppressToolsForCurrentIntent =
           shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+          !confirmedOptionSelection &&
           suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
         let requestState = buildProviderLoopRequestState({
           loopCount,
@@ -421,6 +503,15 @@ export class LLMCodingRuntime implements NexusRuntime {
         })
         currentToolsList = requestState.currentToolsList
         modelVisibleTools = requestState.modelVisibleTools
+        yield buildContextUsageEvent({
+          sessionId: options.sessionId,
+          requestId: options.requestId,
+          modelId: cleanedModelId,
+          providerId: settings.providerId,
+          windowState: requestState.contextWindowState,
+          cacheAwareCompactPolicy,
+          source: 'pre_provider_call',
+        })
         if (requestState.contextWindowState.isBlocking && !providerLoopCompactAttempted) {
           providerLoopCompactAttempted = true
           try {
@@ -434,7 +525,10 @@ export class LLMCodingRuntime implements NexusRuntime {
             })
             absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
             yield compactResult.event
-            previousEvents = [...previousEvents, compactResult.event]
+            yield compactResult.contextEvent
+            const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+            for (const groundingEvent of groundingEvents) yield groundingEvent
+            previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
             applyContextRefreshState(await refreshRuntimeContextState({
               runtimeOptions: options,
               events: previousEvents,
@@ -453,6 +547,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             })
             suppressToolsForCurrentIntent =
               shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+              !confirmedOptionSelection &&
               suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
             requestState = buildProviderLoopRequestState({
               loopCount,
@@ -471,6 +566,17 @@ export class LLMCodingRuntime implements NexusRuntime {
             })
             currentToolsList = requestState.currentToolsList
             modelVisibleTools = requestState.modelVisibleTools
+            yield buildContextUsageEvent({
+              sessionId: options.sessionId,
+              requestId: options.requestId,
+              modelId: cleanedModelId,
+              providerId: settings.providerId,
+              windowState: requestState.contextWindowState,
+              cacheAwareCompactPolicy,
+              source: 'after_compact',
+            })
+            const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
+            if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
           } catch (error) {
             yield buildCompactFailureEvent({
               sessionId: options.sessionId,
@@ -546,7 +652,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             role: options.role,
             signal: options.signal,
           },
-          { config: options.hooks },
+          { config: options.hooks, hooks: options.runtimeHooks },
         )
         for (const hookEvent of preInvocationHooks.events) yield hookEvent
 
@@ -593,9 +699,86 @@ export class LLMCodingRuntime implements NexusRuntime {
               role: options.role,
               signal: options.signal,
             },
-            { config: options.hooks },
+            { config: options.hooks, hooks: options.runtimeHooks },
           )
           for (const hookEvent of postInvocationHooks.events) yield hookEvent
+          if (providerRecovery?.kind === 'context_window') {
+            const providerErrorCode = providerContextRecoveryErrorCode(error, options)
+            if (providerContextRecoveryCount < MAX_PROVIDER_CONTEXT_RECOVERIES) {
+              providerContextRecoveryCount += 1
+              providerLoopCompactAttempted = true
+              const attempt = providerContextRecoveryCount
+              const preTokens = requestState.contextWindowState.tokenEstimate
+              const recoveryEvent = buildContextRecoveryAttemptedEvent({
+                sessionId: options.sessionId,
+                requestId: options.requestId,
+                providerId: settings.providerId,
+                modelId: cleanedModelId,
+                providerErrorCode,
+                strategy: 'semantic_compact_retry',
+                attempt,
+                maxAttempts: MAX_PROVIDER_CONTEXT_RECOVERIES,
+                preTokens,
+                retryable: true,
+                message: `Provider rejected the prompt as too large; compacting session context and retrying (${attempt}/${MAX_PROVIDER_CONTEXT_RECOVERIES}).`,
+              })
+              yield recoveryEvent
+              previousEvents = [...previousEvents, recoveryEvent]
+              try {
+                const compactResult = await compactSession({
+                  storage: this.storage,
+                  sessionId: options.sessionId,
+                  modelId: cleanedModelId,
+                  trigger: 'reactive',
+                  mapEventsToMessages: mapEventsForProvider,
+                  initialPrompt: options.prompt,
+                })
+                absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
+                yield compactResult.event
+                yield compactResult.contextEvent
+                const groundingEvents = postCompactGroundingEvents('context_recovery', compactResult.contextEvent.boundaryId)
+                for (const groundingEvent of groundingEvents) yield groundingEvent
+                previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
+                await refreshAfterProviderContextRecovery()
+                autoCompactDecision = contextRefreshState.autoCompactDecision
+                messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
+                  contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
+                })
+                yield buildContextUsageEvent({
+                  sessionId: options.sessionId,
+                  requestId: options.requestId,
+                  modelId: cleanedModelId,
+                  providerId: settings.providerId,
+                  windowState: contextWindowState,
+                  cacheAwareCompactPolicy,
+                  source: 'after_compact',
+                })
+                const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
+                if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
+                continue
+              } catch (compactError) {
+                yield buildCompactFailureEvent({
+                  sessionId: options.sessionId,
+                  trigger: 'reactive',
+                  modelId: cleanedModelId,
+                  failureCount: attempt,
+                  maxFailures: MAX_PROVIDER_CONTEXT_RECOVERIES,
+                  message: compactError instanceof Error ? compactError.message : String(compactError),
+                })
+              }
+            }
+            for (const event of buildRuntimeContextBlockingEventsForLoop({
+              sessionId: options.sessionId,
+              modelId: cleanedModelId,
+              windowState: requestState.contextWindowState,
+              autoCompactDecision,
+              fallbackThresholdPercent: contextCompactPercent,
+              message: `Provider rejected the prompt as too large after ${providerContextRecoveryCount} context recovery attempt(s). Tried semantic_compact_retry; remaining actions: run /context, reduce tool output, or switch to a larger-context model.`,
+              cacheAwareCompactPolicy,
+            })) yield event
+            yield buildRuntimeExecutionMetricsEvent(options, metrics)
+            return
+          }
           throw error
         }
 
@@ -614,7 +797,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             role: options.role,
             signal: options.signal,
           },
-          { config: options.hooks },
+          { config: options.hooks, hooks: options.runtimeHooks },
         )
         for (const hookEvent of postInvocationHooks.events) yield hookEvent
 
@@ -664,6 +847,7 @@ export class LLMCodingRuntime implements NexusRuntime {
 
         const toolResultsContent = []
         for (const tc of providerOutcome.toolCalls) {
+          const toolEvents: NexusEvent[] = []
           const toolExecution = executeProviderToolCall({
             toolCall: tc,
             tools: this.tools,
@@ -675,11 +859,27 @@ export class LLMCodingRuntime implements NexusRuntime {
           })
           let next = await toolExecution.next()
           while (!next.done) {
+            toolEvents.push(next.value)
             yield next.value
             next = await toolExecution.next()
           }
+          previousEvents = [...previousEvents, ...toolEvents]
           if (next.value.kind === 'terminal') {
             return
+          }
+          const completedEvent = toolEvents.findLast((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed' && event.toolUseId === tc.id)
+          if (completedEvent) {
+            const groundingConfirmedEvent = buildContextGroundingConfirmedEventForToolResult({
+              sessionId: options.sessionId,
+              requestId: options.requestId,
+              events: previousEvents,
+              toolCompleted: completedEvent,
+              toolInput: resolveProviderToolCallInput(tc),
+            })
+            if (groundingConfirmedEvent) {
+              previousEvents = [...previousEvents, groundingConfirmedEvent]
+              yield groundingConfirmedEvent
+            }
           }
           toolResultsContent.push(next.value.toolResult)
         }
@@ -741,6 +941,36 @@ function providerInvocationErrorCode(error: unknown, options: RuntimeExecuteOpti
   const isTimeout = options.timeoutSignal?.aborted
   const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
   return isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR')
+}
+
+function providerContextRecoveryErrorCode(error: unknown, options: RuntimeExecuteOptions): string {
+  const maybeMetadata = error as { metadata?: { code?: unknown; type?: unknown } }
+  const providerCode = maybeMetadata.metadata?.code ?? maybeMetadata.metadata?.type
+  if (typeof providerCode === 'string' && providerCode.trim()) return providerCode
+  return providerInvocationErrorCode(error, options)
+}
+
+function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], latestPrompt: string): boolean {
+  const optionSelection = normalizeOptionSelection(latestPrompt)
+  if (!optionSelection) return false
+  let skippedCurrentUserMessage = false
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event.type === 'user_message') {
+      if (!skippedCurrentUserMessage && normalizeOptionSelection(event.text) === optionSelection) {
+        skippedCurrentUserMessage = true
+        continue
+      }
+      return false
+    }
+    if (
+      (event.type === 'assistant_delta' && isOptionSelectionClarificationText(event.text) && event.text.includes(`"${optionSelection}"`)) ||
+      (event.type === 'result' && isOptionSelectionClarificationText(event.message) && event.message.includes(`"${optionSelection}"`))
+    ) {
+      return true
+    }
+  }
+  return false
 }
 
 function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
@@ -849,6 +1079,18 @@ export function mapEventsToMessages(
       }
       lastMsg.reasoningContent = `${lastMsg.reasoningContent ?? ''}${event.text}`
       continue
+    } else if (event.type === 'context_grounding_required') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime grounding required: ${event.message} Required for: ${event.requiredFor.join(', ')}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
+    } else if (event.type === 'context_grounding_confirmed') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime grounding confirmed: ${event.message} Confirmation kind: ${event.confirmationKind}. Confirmed for: ${event.confirmedFor.join(', ')}. Source: ${event.source}.` })
+    } else if (event.type === 'workspace_dirty_detected') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
     } else if (event.type === 'tool_started') {
       let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
       if (!lastMsg) {

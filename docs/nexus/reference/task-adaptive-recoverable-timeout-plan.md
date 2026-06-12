@@ -1,7 +1,7 @@
 # Task-adaptive Recoverable Timeout 规划
 
-> Status: 规划中（设计约束已确认；代码未改）
-> Priority: P1 — 真实 Go TUI session 已再次撞 180s 顶层 `REQUEST_TIMEOUT`；本规划把普通 timeout 从 fatal request cutoff 改为可恢复事件与模型可控预算
+> Status: Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6 已落地 — 收口（真实样本回归 + 协议拆分 + runtime 可恢复 `timeout_budget_exceeded` 事件 + 自动 extension cycle + Go TUI 软超时状态可见化 / 看门狗友好消息 + hard watchdog `details.kind='watchdog'` 标记与清理回归 + DONE/跨文档同步）
+> Priority: Watch / Closed — DONE 索引见 [DONE.md](../DONE.md) "Task-adaptive Recoverable Timeout 已落地" 行；旧 [go-tui-tool-permission-timeout-optimization-plan.md](../archive/go-tui-tool-permission-timeout-optimization-plan.md) 已加 "降噪 vs fatal timeout 语义" 范围拆分提示
 > 真实样本: `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3`（2026-06-11；用户请求“查看当前项目分析潜在的bug”；41 tools，最后一个 Bash 未完成；顶层 180s timeout 终止 workflow）
 
 ---
@@ -125,121 +125,191 @@ longContextGoTuiExecuteTimeoutMs = 300_000
 
 ### Phase 0：真实样本与语义回归
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-新增 focused regression：
+落地点：
 
-- `test/recoverable-timeout.test.ts` 或扩展 `test/go-tui-tool-permission-timeout-regression.test.ts`
-- 固化 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3` 的核心形状：
-  - 180s 顶层 cutoff 发生时仍有 1 个 tool 未完成
-  - `permission_response` 已批准最后 tool
-  - `execute_summary.outcome=timeout`
-  - session failed，但 assistant 已有多段 partial analysis
-- 测试输出必须区分：tool timeout / request timeout / watchdog timeout / provider error。
+- 扩展 `test/go-tui-tool-permission-timeout-regression.test.ts`。
+- 新增 synthetic fixture 固化 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3` 的核心形状：
+  - 180s 顶层 cutoff 发生时仍有 1 个 tool 未完成。
+  - `permission_response` 已批准最后 tool。
+  - `execute_summary.outcome=timeout`。
+  - session failed，但 assistant 已有多段 partial analysis。
+  - 最后一个 Bash 没有返回 recoverable `tool_completed(success=false)`，证明失败来自 request-level fatal cutoff 而非 tool-level timeout。
+- 保留原 `session_dcf7e34e-bc59-41e4-b802-e4d03d32b48d` regression，继续守住“工具全成功 + 权限全批准 + request timeout fatal”的旧样本。
 
-收口标准：当前失败链路被最小 fixture 表达，后续实现不能再把普通 soft deadline 误判为 fatal session failure。
+验证命令：
+
+```bash
+NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/go-tui-tool-permission-timeout-regression.test.ts
+```
+
+结果：2/2 pass。
+
+收口标准：当前失败链路已被最小 fixture 表达；后续 Phase 1+ 实现不能再把普通 soft deadline 误判为 fatal session failure。
 
 ### Phase 1：协议语义拆分（soft deadline vs hard watchdog）
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-`/v1/execute` / `/v1/stream` request 增加可选字段（命名待实现时确定）：
+落地点：
 
-```ts
-timeoutPolicy?: 'fatal' | 'soft'
-softTimeoutMs?: number
-watchdogTimeoutMs?: number
+- `src/nexus/app.ts` `executeSchema` 增加 optional `timeoutPolicy: 'fatal' | 'soft'`、`softTimeoutMs`、`watchdogTimeoutMs`。
+- 新增 `ExecuteTimeoutDecision` / `resolveExecuteTimeoutDecision()`：旧客户端默认 `fatal`，Go TUI 可传 `soft`；soft policy 下 `timeoutMs`/`softTimeoutMs` 作为 soft budget，实际 abort 使用 `watchdogTimeoutMs`。
+- HTTP `/v1/execute` 与 WebSocket `/v1/stream` 共享 `prepareExecution()` 的 timeout decision。
+- `clients/go-tui/internal/tui/tui.go` `buildExecuteRequestWithTimeout()` 在发送 `timeoutMs` 时同时发送 `timeoutPolicy='soft'` 与 `softTimeoutMs=<timeoutMs>`，让 Go TUI 先 opt-in soft policy。
+- 旧 HTTP 客户端不传新字段仍保持 fatal back-compat。
+
+验证命令：
+
+```bash
+NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/runtime.test.ts --test-name-pattern "soft timeout policy|per-request timeoutMs|partial result"
+cd clients/go-tui && go test ./internal/tui -run 'TestBuildExecuteRequest.*Timeout|TestResolveGoTuiTimeout|TestBuildExecuteRequestRaisesLongContextTimeout|TestBuildExecuteRequestKeepsPolicyAndTimeoutIndependent'
 ```
 
-兼容策略：
+结果：runtime focused 117/117 pass；Go TUI timeout payload tests pass。
 
-- 未传字段的旧 HTTP 客户端保持现状（`timeoutPolicy='fatal'`），避免破坏 `bbl chat` / API 用户预期。
-- Go TUI 先 opt-in `timeoutPolicy='soft'`。
-- `watchdogTimeoutMs` 默认为 `max(timeoutMs * 3, timeoutMs + 300000)` 或 server config 上限，具体值需实现时评估。
-- `timeoutMs` 可继续作为旧字段，但在 soft policy 下解释为 soft budget。
-
-收口标准：schema 兼容旧客户端；Go TUI 可显式请求 soft timeout；server 内部不再只有一个 abort controller。
+收口标准：schema 已兼容旧客户端；Go TUI 可显式请求 soft timeout；server 内部已拆出 soft budget 与 hard watchdog decision。真正的 runtime-visible soft timeout event 留 Phase 2。
 
 ### Phase 2：Runtime 可恢复事件
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-新增或扩展事件：
+落地点：
 
-```ts
-timeout_budget_exceeded {
-  type: 'timeout_budget_exceeded'
-  requestId?: string
-  timeoutMs: number
-  elapsedMs: number
-  policy: 'soft'
-  partialSummary?: string
-  suggestedActions?: ('continue' | 'summarize' | 'narrow_scope' | 'retry_last_tool')[]
-}
+- `src/shared/events.ts` 新增 `TimeoutBudgetExceededEventSchema` 并加入 `NexusEventSchema` 联合类型。
+- `src/nexus/app.ts` 新增 `buildTimeoutBudgetExceededEvent()` / `maybeAppendTimeoutBudgetExceeded()` / `startSoftTimeoutWatcher()`：到点只 append event，不 abort 任何 `AbortController`，并通过 `buildPartialTimeoutSummary()` 同步当前 partial evidence。
+- HTTP `/v1/execute` 与 WebSocket `/v1/stream` 仅在 `timeoutDecision.policy === 'soft'` 时启动 soft watcher；fatal back-compat 客户端不会收到新事件。
+- `clients/go-tui/internal/tui/tui.go` 在 `eventTypeLabel()` / `formatNexusEvent()` 新增 `timeout_budget_exceeded` 渲染（含 `policy=soft` 与 `suggestedActions` 列表），落到 transcript 默认 `appendLine` 通道。
+- 事件 schema：
+
+  ```ts
+  timeout_budget_exceeded {
+    type: 'timeout_budget_exceeded'
+    requestId?: string
+    timeoutMs: number
+    elapsedMs: number
+    policy: 'soft'
+    partialSummary?: string
+    suggestedActions?: ('continue' | 'summarize' | 'narrow_scope' | 'retry_last_tool')[]
+    message: string
+  }
+  ```
+
+验证命令：
+
+```bash
+NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/runtime.test.ts --test-name-pattern "soft timeout policy|timeout_budget_exceeded|fatal timeout policy"
+cd clients/go-tui && go test ./internal/tui -run 'TestFormatNexusEventTimeoutBudgetExceeded|TestBuildExecuteRequest.*Timeout|TestResolveGoTuiTimeout'
+npx tsc --noEmit
 ```
 
-实现方向：
+结果：runtime focused 119/119 pass；Go TUI focused tests pass；tsc clean。
 
-- soft timer 到点只 append event，不 abort runtime signal。
-- event 注入 runtime-visible history，使下一次 provider call 能看到“预算已超，必须决定收口或继续”。
-- 如果当前正卡在 tool permission 或 tool execution，event 先持久化并推给客户端；等 tool 返回后继续 loop。
-- `execute_summary` 记录 `nearTimeout=true` 或新字段 `softTimeoutExceeded=true`。
-
-收口标准：soft timeout 到达后 session 不自动 failed，事件可持久化、可被 Go TUI 渲染、可进入后续模型上下文。
+收口标准：soft timeout 到达后 session 不自动 failed，事件可持久化、可被 Go TUI 渲染、并随后续 provider call 一起进入模型上下文。模型预算决策与扩展请求留 Phase 3。
 
 ### Phase 3：模型预算决策与扩展请求
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-引入模型可表达的预算动作，最小可先用自然语言 guidance，不急着加工具：
+落地点：
 
-- system prompt 明确：遇到 `timeout_budget_exceeded`，必须选择 summarize / narrow / continue，并解释理由。
-- 若选择 continue，runtime 可允许一次自动 extension（例如 +180s），并记录 `timeout_extension_granted` event。
-- 若已多次 extension，模型必须收口或请求用户确认。
+- `src/shared/events.ts` 新增 `TimeoutExtensionGrantedEventSchema` 并加入 `NexusEventSchema` 联合类型；事件携带 `extensionCount`、`maxExtensions`、`additionalMs`、`totalSoftBudgetMs`、`elapsedMs`、`policy='soft'`、`reason='auto-first-budget-exhausted' | 'auto-followup-budget-exhausted'`、`message`。
+- `src/nexus/app.ts` `executeSchema` 新增 optional `maxSoftTimeoutExtensions`（默认 soft policy 下 1，fatal policy 下 0）与 `softTimeoutExtensionMs`（默认 = `softTimeoutMs`，上限 300_000ms），通过 `ExecuteTimeoutDecision` 一并下传。
+- Phase 2 的 `startSoftTimeoutWatcher()` 已重构为 `scheduleSoftTimeoutCycle()`：每个 cycle 触发后先 append `timeout_budget_exceeded`，若 `extensionCount < maxExtensions` 立即 append `timeout_extension_granted` 并以 `additionalMs` 重新调度下一 cycle；fatal 客户端 `maxSoftTimeoutExtensions` 仍为 0，行为退化为单次 budget event。HTTP `/v1/execute` 与 WS `/v1/stream` 的 finally 改用 `softTimeoutCycle?.cancel()` 拆除。
+- Hard watchdog 仍由独立 timer 持有 abort；extension cycle 永远不调 abortController。
+- Go TUI `eventTypeLabel()` / `formatNexusEvent()` 新增 `timeout_extension_granted` 渲染（`extension N/M`、`+Xms`、`total=Yms`、`reason`、message），默认 transcript `appendLine` 通道接住。
+- 当前 cycle 的 idempotency 改为按 `currentBudgetMs` 去重，避免不同 cycle 的 budget event 被误判为重复。
 
-后续可选新增工具/控制事件：
+事件 schema：
 
-```text
-RequestTimeoutExtension(reason, additionalMs)
+```ts
+timeout_extension_granted {
+  type: 'timeout_extension_granted'
+  requestId?: string
+  extensionCount: number               // 1-indexed, this granted extension
+  maxExtensions: number                // configured cap
+  additionalMs: number                 // delta added by this extension
+  totalSoftBudgetMs: number            // new running soft budget
+  elapsedMs: number
+  policy: 'soft'
+  reason: 'auto-first-budget-exhausted' | 'auto-followup-budget-exhausted'
+  message: string
+}
 ```
 
-但这会引入工具边界，需要单独评估；首阶段用 runtime policy + prompt guidance 足够。
+验证命令：
 
-收口标准：模型不是被动等死，而是在 soft timeout 后主动收口或继续；extension 有次数/总预算上限。
+```bash
+NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/runtime.test.ts --test-name-pattern "soft timeout policy|timeout_budget_exceeded|fatal timeout policy|auto-grants one extension|stops granting extensions"
+cd clients/go-tui && go test ./internal/tui -run 'TestFormatNexusEventTimeoutBudgetExceeded|TestFormatNexusEventTimeoutExtensionGranted|TestBuildExecuteRequest.*Timeout|TestResolveGoTuiTimeout'
+npx tsc --noEmit
+```
+
+结果：runtime focused 5 timeout tests 全 pass（默认 auto-grant 1 次、cap=1 时第二次 cycle 不再 grant、`maxSoftTimeoutExtensions=0` 仍保持 Phase 2 一次性语义、fatal back-compat 仍无新事件）；Go TUI focused tests pass；tsc clean。
+
+收口标准：soft timeout 后模型不再被动等死；runtime 自动 grant 一次 extension，让模型在下一轮 provider call 内能看到 budget_exceeded + extension_granted 一对事件并做出 summarize / narrow / continue / retry 决定；extension 受 `maxSoftTimeoutExtensions` 上限保护，超过后只剩 watchdog；显式 `RequestTimeoutExtension(reason, additionalMs)` 工具留待真实需求出现再做单独评估，避免 [feedback-tool-boundary-granularity](../../.. /memory/feedback-tool-boundary-granularity.md) 提示的“宽边界工具”反模式。
 
 ### Phase 4：Go TUI 展示与交互
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-Go TUI 行为：
+落地点：
 
-- `timeout_budget_exceeded` 渲染为 warning/status：`soft timeout reached 180s; workflow continues`。
-- footer / header 可显示 `timeout +180s` 或 `budget exceeded` 状态。
-- 普通 `REQUEST_TIMEOUT` friendly message 改口径：只有 hard watchdog 才建议“提高 timeout”；soft timeout 只提示“模型正在收口/继续”。
-- 可选按键：当 soft timeout 触发后，operator 可 `c` cancel / `e` extend / `s` ask summarize（后续 UX，不进首切片）。
+- `clients/go-tui/internal/tui/tui.go` 新增 `softTimeoutSnapshot` 类型与 `model.softTimeoutState` 字段：在 `consumeNexusEvent` 中 `timeout_budget_exceeded` / `timeout_extension_granted` 显式处理，分别记录 `OriginalBudgetMs` / `TotalSoftBudgetMs` / `ExtensionCount` / `MaxExtensions` / `LastElapsedMs` / `BudgetExceededAt`；`result` / `error` 在拼装好友好消息之后再清空快照，避免错过 watchdog 上下文。
+- 新增 `formatSoftTimeoutFooter()` 纯函数并接入 `renderFooterSummary()`：未触发时不显示；触发后展示 `soft timeout budget=Xms ext=N/M`，与 `tokens in=… out=…` 同行，操作员在长任务里能一眼看到“软预算已耗尽但工作流仍在跑”。
+- 新增 `friendlyNexusErrorWithContext(code, payload, *softTimeoutSnapshot)`：旧 `friendlyNexusError(code, payload)` 委托给它（snapshot=nil）保 back-compat；`REQUEST_TIMEOUT` 若伴随已触发的软周期则改写为 watchdog 收口口径，并明确不建议 raise `--execute-timeout-ms`。
+- 新增 `model.formatErrorEventWithSoftContext(event)`：`consumeNexusEvent` 在 `case "result", "error"` 仅对 `error` 走带 snapshot 的友好消息；`result` 维持现状。
+- 显式按键扩展（`c` cancel / `e` extend / `s` summarize）继续按文档 "不进首切片" 推迟，留待真实 UX 信号驱动。
 
-收口标准：Go TUI 不把 soft timeout 显示成 fatal failure；session 继续接收事件。
+验证命令：
+
+```bash
+cd clients/go-tui && go test ./internal/tui -run 'TestFormatNexusEventTimeoutBudgetExceeded|TestFormatNexusEventTimeoutExtensionGranted|TestFormatSoftTimeoutFooter|TestFriendlyNexusErrorWithSoftContext|TestConsumeNexusEventTracksSoftTimeoutLifecycle|TestConsumeNexusEventClearsSoftTimeoutStateOnResult'
+go vet ./internal/tui/...
+cd clients/go-tui && go test ./internal/tui
+```
+
+结果：Phase 4 focused 6 tests pass；Go TUI 全量 `go test ./internal/tui` 通过；`go vet` clean。
+
+收口标准：Go TUI 不再把 soft timeout 当 fatal failure 显示；soft 周期触发与扩展状态可见；hard watchdog 触发的 `REQUEST_TIMEOUT` 不再建议直接抬高 `--execute-timeout-ms` 而是引导让模型 summarize / narrow / split。
 
 ### Phase 5：Hard watchdog 与清理
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-Hard watchdog 保留：
+落地点：
 
-- 用户 cancel 立即 abort。
-- WebSocket/HTTP client 断开且无 durable continuation 时，按现有 cleanup 处理。
-- watchdog 到达时 abort runtime，并产出 fatal error：`WATCHDOG_TIMEOUT` 或 `REQUEST_TIMEOUT` with `details.kind='watchdog'`。
-- active execution registry 必须清理，pending permissions 必须 resolve/cancel。
+- `src/nexus/app.ts` `PreparedExecution` 新增 `watchdog: WatchdogState`；`prepareExecution()` 的 `setTimeout` callback 在 abort 前先 `watchdog.fired = true`，HTTP `/v1/execute` 与 WS `/v1/stream` 的 for-await 循环用新 helper `maybeDecorateWatchdogError()` 在 push/persist/send 之前对 `REQUEST_TIMEOUT` 事件加 `details.kind='watchdog'`、`policy='soft'`、`softTimeoutMs`、`watchdogTimeoutMs`、`maxSoftTimeoutExtensions`、`softCycleEvents`、`retryable=false`。
+- 装饰只在 `timeoutDecision.policy === 'soft'` 且 `watchdog.fired === true` 时生效；fatal back-compat 客户端保持原 `REQUEST_TIMEOUT` envelope。
+- HTTP `try/finally` 与 WS `try/finally` 的 `clearActiveExecution` / `activeExecutions` 清扫保持现有路径，新回归 `execute soft policy watchdog decorates REQUEST_TIMEOUT ...` 用 `POST /v1/sessions/:sessionId/cancel` 后断言 `activeExecutionCancelled === false`，证明 watchdog 触发后注册表已 clean。
+- Go TUI `friendlyNexusErrorWithContext` 新增 `details.kind='watchdog'` 解析路径：即使 `softTimeoutSnapshot` 已被清空（如 result/error 流程边界），只要 server 标记到位也走 watchdog 友好消息，并在文案里带出 `policy=soft`、`watchdog budget=Xms`，并显式拒绝建议提高 `--execute-timeout-ms`。
+- 用户 cancel、socket 断开、provider 异常等既有 cleanup 路径未改动；watchdog 装饰严格只针对 `REQUEST_TIMEOUT`，不污染其他错误码或 fatal 路径。
 
-收口标准：soft timeout 可继续，hard watchdog 能防泄漏，二者在事件、metrics、TUI 文案里可区分。
+验证命令：
+
+```bash
+NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/runtime.test.ts --test-name-pattern "soft policy watchdog decorates|fatal timeout policy never decorates|soft timeout policy|timeout_budget_exceeded|fatal timeout policy never emits|auto-grants one extension|stops granting extensions"
+cd clients/go-tui && go test ./internal/tui -run 'TestFriendlyNexusErrorWithSoftContextDistinguishesWatchdog|TestFriendlyNexusErrorWithDetailsKindWatchdog|TestFormatSoftTimeoutFooter|TestFormatNexusEventTimeoutBudgetExceeded|TestFormatNexusEventTimeoutExtensionGranted|TestConsumeNexusEventTracksSoftTimeoutLifecycle|TestConsumeNexusEventClearsSoftTimeoutStateOnResult'
+npx tsc --noEmit
+```
+
+结果：runtime focused 8 timeout tests 全 pass（含新增 soft policy watchdog 装饰 / 清理回归 + fatal back-compat 未装饰回归）；Go TUI focused 7 tests pass；tsc clean。
+
+收口标准：soft timeout 可继续；hard watchdog 触发时 abort 真正发生、`REQUEST_TIMEOUT` 带可识别 `details.kind='watchdog'`、`activeExecutions` registry 清理、Go TUI 友好消息明确区分软周期 vs watchdog；fatal 客户端语义不变。
 
 ### Phase 6：DONE 与文档同步
 
-状态：未启动
+状态：已落地（2026-06-12）
 
-- 更新 `docs/nexus/DONE.md`：记录事件 schema、Nexus timeout policy、Go TUI opt-in、测试命令。
-- 同步 `go-tui-tool-permission-timeout-optimization-plan.md`，说明旧规划解决“降噪”，本规划解决“fatal timeout 语义”。
-- 更新 `active/TODO_runtime.md` 和总控 TODO 状态。
+落地点：
+
+- `docs/nexus/DONE.md` 新增 "Task-adaptive Recoverable Timeout 已落地" 条目：覆盖事件 schema、Nexus timeout policy、Go TUI opt-in、watchdog 装饰、cleanup 回归与验证命令。
+- `docs/nexus/archive/go-tui-tool-permission-timeout-optimization-plan.md` 顶部 "范围拆分提示" 明确：旧规划解决“权限/工具噪音 + near-timeout warning + Bash read-only classifier + adaptive Go TUI timeout”这层局部降噪；本规划解决“fatal timeout 语义”。
+- `docs/nexus/active/TODO_runtime.md` 的 P1 段落改为 "已收口 P1 Task-adaptive Recoverable Timeout"，附收口要点列表。
+- `docs/nexus/TODO.md` 主表格行迁移到 `Watch / Closed`；Runtime / Context 摘要列同步去掉 "P1 打开" 文案；TODO 进度旁注 (#1) 与文档索引 (Plan 行) 都已同步引用 DONE.md 收口。
+
+收口标准：跨文档（plan / runtime TODO / 总控 TODO / DONE / 旧 optimization plan）一致表达 "Task-adaptive Recoverable Timeout Phase 0~6 已落地、转 Watch / Closed"；后续真实样本若再次暴露 fatal-style cutoff drift 才重新开未收口项。
 
 ---
 
@@ -304,7 +374,7 @@ npm test
 - `clients/go-tui/internal/tui/tui.go:7521-7535` — Go TUI `execute_summary` 展示。
 - `clients/go-tui/internal/tui/tui.go:7575-7576` — Go TUI `near_timeout_warning` 展示。
 - `clients/go-tui/internal/tui/tui.go:8206-8211` — Go TUI `REQUEST_TIMEOUT` friendly message。
-- `docs/nexus/reference/go-tui-tool-permission-timeout-optimization-plan.md` — 旧规划，已收口“减少权限/工具噪音与 timeout 风险”的局部优化。
+- `docs/nexus/archive/go-tui-tool-permission-timeout-optimization-plan.md` — 旧规划，已收口“减少权限/工具噪音与 timeout 风险”的局部优化。
 
 ---
 

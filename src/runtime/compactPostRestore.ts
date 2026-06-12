@@ -342,6 +342,7 @@ export function buildCompactCapabilityReminder(state: PostCompactState): string 
   if (state.toolContractLines.length > 0) {
     lines.push(`Tool contract reminders: ${state.toolContractLines.join(' ')}`)
   }
+  lines.push('Important: compact summaries and restored snippets are recovery hints, not authoritative current-file evidence. Re-read current files, git status/diff, tests, or event logs before claiming implementation, test, git, or task-completion facts.')
   lines.push('Important: tool_use and tool_result pairs must remain matched — do not generate one without the other.')
   return lines.join(' ')
 }

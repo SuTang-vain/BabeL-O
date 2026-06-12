@@ -81,6 +81,7 @@ export type AssembledContext = {
   sessionSummary: string
   projectMemory: string
   activeSkills: string
+  gitStatus: string
   compactBoundary?: Extract<NexusEvent, { type: 'compact_boundary' }>
   compactRetainedEventCount: number
   compactRetainedSegmentValid: boolean
@@ -325,6 +326,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     sessionSummary: budgetedSessionSummary,
     projectMemory: budgetedProjectMemory,
     activeSkills: budgetedActiveSkills,
+    gitStatus,
     compactBoundary: compactBoundary?.event,
     compactRetainedEventCount: retainedBoundaryEvents.length,
     compactRetainedSegmentValid: retainedSegmentCheck.valid,

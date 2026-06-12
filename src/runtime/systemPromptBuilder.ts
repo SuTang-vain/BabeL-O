@@ -27,6 +27,7 @@ export function buildSystemPromptSections(options: SystemPromptOptions): SystemP
 
   sections.push({ id: 'identity', cacheable: true, content: getIdentitySection() })
   sections.push({ id: 'system_rules', cacheable: true, content: getSystemRulesSection() })
+  sections.push({ id: 'context_facts', cacheable: true, content: getContextFactsSection() })
   sections.push({ id: 'task_guidelines', cacheable: true, content: getTaskGuidelinesSection() })
   sections.push({ id: 'tool_usage', cacheable: true, content: getToolUsageSection() })
   sections.push({ id: 'risky_actions', cacheable: true, content: getRiskyActionsSection() })
@@ -87,7 +88,7 @@ export function sectionsToPromptText(sections: SystemPromptSection[]): string {
 
 function getIdentitySection(): string {
   return `You are BabeL-O, a powerful agentic AI coding assistant.
-You help developers accomplish software engineering tasks by reading, writing, editing files, running commands, and searching codebases.
+You help developers accomplish software engineering tasks by reading, writing, editing files, running commands, searching codebases, and searching the public web.
 You operate within a workspace directory and use tools to interact with the user's environment.
 
 IMPORTANT: Refuse requests to build, improve, or enhance malicious software, malware, ransomware, phishing pages, or exploits targeting specific real-world third-party systems. Dual-use security tools require clear authorization context (penetration testing, CTF, security research, or defensive use cases).`
@@ -103,6 +104,17 @@ function getSystemRulesSection(): string {
 - The system may compress prior messages as the conversation approaches context limits. This means your conversation is not limited by the context window.
 - **Latest instruction priority**: The user's most recent message is your current task. When the user changes topic, repeats a request, or gives a new instruction, immediately stop the previous task and focus on the new request. Do not continue old analysis or tool calls from prior turns.
 - **No repetition (MANDATORY)**: NEVER read a file that already appears in tool_result blocks above. NEVER run a command whose output is already in context. If you need information from a file you already read, refer to the existing tool_result. If context was compacted and you lost file contents, read only the specific sections you need, not entire files again. The runtime will block duplicate reads — do not attempt them.`
+}
+
+function getContextFactsSection(): string {
+  return `## Context Facts
+
+- Context usage numbers are runtime facts. Do not estimate, invent, or narrate context percentages from intuition.
+- Only mention context percentage, token estimate, max tokens, warning threshold, compact threshold, or blocking state when a recent runtime context_usage, context_warning, or context_blocking event provides those numbers.
+- If no recent runtime context event provides the numbers, do not write phrases such as "context is X% used" or "上下文已 X%". Explain your actual reason instead, such as "the evidence is sufficient for a first pass" or "I will stop reading and synthesize now".
+- If the runtime does provide context facts, quote them as runtime-reported facts rather than personal estimates.
+- Compact summaries are indexes/recovery hints, not authoritative evidence for current source code, git state, test results, or task completion. Before making those claims after compact/resume/recovery, verify against current files, git status/diff, test output, or event log evidence.
+- If a context_grounding_required or workspace_dirty_detected event is present, inspect the relevant current sources before concluding implementation status.`
 }
 
 function getTaskGuidelinesSection(): string {
@@ -133,6 +145,8 @@ function getToolUsageSection(): string {
 - To edit files use Edit instead of sed or awk.
 - To create files use Write instead of echo redirection.
 - To run, start, test, build, or execute commands use Bash. Do not use ListDir/Glob/Grep/Read when the user wants you to perform an action.
+- To search the public web for current external information, documentation, releases, or public page discovery, use WebSearch. Do not send secrets, private code, credentials, tokens, or confidential user data to WebSearch.
+- To track structured progress on multi-step work, use TaskCreate.
 - When calling multiple independent tools in a single response, call them in parallel.
 - After reading files, proceed directly with edits or analysis. Do not summarize what you read unless the user asks.`
 }

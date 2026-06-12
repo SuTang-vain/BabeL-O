@@ -1505,6 +1505,78 @@ test('assembleContext restores compact state across latest task and recovery fix
   }
 })
 
+test('analyzeContext clears grounding guard after source confirmation', async () => {
+  const cwd = join(tmpdir(), `babel-o-context-grounding-confirmed-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'context_grounding_required',
+      schemaVersion,
+      sessionId: 'session-grounding-confirmed-analysis',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      source: 'post_compact',
+      state: 'summary-derived',
+      requiredFor: ['file_facts', 'test_results', 'git_status', 'task_completion', 'implementation_status'],
+      suggestedActions: ['re_read_referenced_files', 'inspect_changed_files', 'inspect_git_status', 'run_focused_tests', 'inspect_event_log'],
+      message: 'Context was compacted; verify sources before conclusions.',
+    },
+    {
+      type: 'workspace_dirty_detected',
+      schemaVersion,
+      sessionId: 'session-grounding-confirmed-analysis',
+      timestamp: '2026-05-23T00:00:01.000Z',
+      source: 'post_compact',
+      changedFileCount: 1,
+      changedFiles: ['src/runtime/contextAnalysis.ts'],
+      suggestedActions: ['inspect_changed_files', 'inspect_git_status', 'inspect_diff'],
+      message: 'Workspace has changed files; inspect diff first.',
+    },
+    {
+      type: 'context_grounding_confirmed',
+      schemaVersion,
+      sessionId: 'session-grounding-confirmed-analysis',
+      timestamp: '2026-05-23T00:00:02.000Z',
+      confirmedByToolUseId: 'tool-read-confirm',
+      toolName: 'Read',
+      confirmationKind: 'file_read',
+      confirmedFor: ['file_facts', 'implementation_status'],
+      source: 'tool_result',
+      message: 'Context grounding confirmed by current file read.',
+    },
+    {
+      type: 'context_grounding_confirmed',
+      schemaVersion,
+      sessionId: 'session-grounding-confirmed-analysis',
+      timestamp: '2026-05-23T00:00:03.000Z',
+      confirmedByToolUseId: 'tool-git-confirm',
+      toolName: 'Bash',
+      confirmationKind: 'git_status',
+      confirmedFor: ['git_status', 'implementation_status'],
+      source: 'tool_result',
+      message: 'Context grounding confirmed by git status.',
+    },
+  ]
+
+  const analysis = await analyzeContext({
+    runtimeOptions: {
+      sessionId: 'session-grounding-confirmed-analysis',
+      prompt: '继续',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+
+  assert.equal(analysis.diagnostics.visualization.grounding.state, 'source-confirmed')
+  assert.equal(analysis.diagnostics.visualization.grounding.summaryDerived, false)
+  assert.equal(analysis.diagnostics.visualization.grounding.dirtyWorkspace, false)
+  assert.equal(analysis.diagnostics.visualization.grounding.changedFileCount, 0)
+  assert.equal(analysis.diagnostic.details.groundingState, 'source-confirmed')
+  assert.ok(!analysis.diagnostics.signals.some(signal => signal.type === 'grounding_required'))
+  assert.ok(!analysis.diagnostics.signals.some(signal => signal.type === 'workspace_dirty'))
+})
+
 test('analyzeContext returns token and compact diagnostics', async () => {
   const cwd = join(tmpdir(), `babel-o-context-analysis-${Date.now()}`)
   const events: NexusEvent[] = [
@@ -1576,6 +1648,28 @@ test('analyzeContext returns token and compact diagnostics', async () => {
       outputTokens: 25,
       cacheCreationInputTokens: 10,
       cacheReadInputTokens: 40,
+    },
+    {
+      type: 'context_grounding_required',
+      schemaVersion,
+      sessionId: 'session-analysis',
+      timestamp: '2026-05-23T00:00:07.100Z',
+      source: 'post_compact',
+      state: 'summary-derived',
+      requiredFor: ['file_facts', 'test_results', 'git_status', 'task_completion', 'implementation_status'],
+      suggestedActions: ['re_read_referenced_files', 'inspect_changed_files', 'inspect_git_status', 'run_focused_tests', 'inspect_event_log'],
+      message: 'Context was compacted; verify sources before conclusions.',
+    },
+    {
+      type: 'workspace_dirty_detected',
+      schemaVersion,
+      sessionId: 'session-analysis',
+      timestamp: '2026-05-23T00:00:07.200Z',
+      source: 'post_compact',
+      changedFileCount: 2,
+      changedFiles: ['src/runtime/contextAnalysis.ts', 'clients/go-tui/internal/tui/context.go'],
+      suggestedActions: ['inspect_changed_files', 'inspect_git_status', 'inspect_diff'],
+      message: 'Workspace has changed files; inspect diff first.',
     },
     {
       type: 'session_memory_updated',
@@ -1659,6 +1753,18 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.equal(typeof analysis.diagnostics.remainingPercent, 'number')
   assert.equal(typeof analysis.diagnostics.compactRemainingTokens, 'number')
   assert.equal(typeof analysis.diagnostics.blockingRemainingTokens, 'number')
+  assert.ok(analysis.diagnostics.visualization.buckets.some(bucket => bucket.kind === 'system'))
+  assert.ok(analysis.diagnostics.visualization.buckets.some(bucket => bucket.kind === 'tool_results'))
+  assert.ok(analysis.diagnostics.visualization.topItems.length > 0)
+  assert.notEqual(analysis.diagnostics.visualization.nextThreshold.name, '')
+  assert.equal(analysis.diagnostics.visualization.grounding.state, 'dirty-workspace')
+  assert.equal(analysis.diagnostics.visualization.grounding.summaryDerived, true)
+  assert.equal(analysis.diagnostics.visualization.grounding.dirtyWorkspace, true)
+  assert.equal(analysis.diagnostics.visualization.grounding.changedFileCount, 2)
+  assert.ok(analysis.diagnostics.visualization.suggestions.includes('inspect changed files'))
+  assert.equal(analysis.diagnostic.details.groundingState, 'dirty-workspace')
+  assert.ok(analysis.diagnostic.details.contextBucketCount > 0)
+  assert.ok(analysis.diagnostic.details.topContextItemCount > 0)
   assert.equal(analysis.diagnostics.workingSetPaths[0]?.path, 'src/runtime/contextAnalysis.ts')
   assert.equal(analysis.diagnostics.workingSetPaths[0]?.touches, 3)
   assert.deepEqual(analysis.diagnostics.selection.phases, CONTEXT_MANAGER_PHASES)

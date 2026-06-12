@@ -2222,6 +2222,125 @@ describe('LLMCodingRuntime', () => {
     assert.match(resultEvent.message, /已完成验证/)
   })
 
+  test('asks user to confirm ambiguous option input before running tools', async () => {
+    const sessionId = 'test-option-input-tool-conflict-clarification'
+    const cwd = join(tmpdir(), `babel-o-test-option-clarify-${Date.now()}`)
+    const storage = new MemoryStorage()
+    fs.mkdirSync(cwd, { recursive: true })
+    fs.writeFileSync(join(cwd, 'package.json'), '{"name":"option-clarify-test"}\n')
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'B',
+      phase: 'executing',
+      createdAt: '2026-06-12T00:00:00.000Z',
+      updatedAt: '2026-06-12T00:00:00.000Z',
+      events: [],
+    })
+
+    const appendAll = async (events: NexusEvent[]) => {
+      for (const event of events) await storage.appendEvent(sessionId, event)
+    }
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"new_focus\\",\\"confidence\\":0.6,\\"continuity\\":0.8,\\"contextScope\\":\\"recent\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Single-letter option-like input.\\",\\"guidance\\":\\"Confirm whether this selects a prior option.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: fetchCalls.length === 1
+          ? createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-read-b","name":"Read","input":{}}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"package.json\\"}"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ])
+          : createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"Confirmed option B and read package.json."}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read']),
+      storage,
+      configManager,
+    )
+
+    try {
+      await storage.appendEvent(sessionId, {
+        type: 'user_message',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-12T00:00:01.000Z',
+        text: 'B',
+      })
+      const firstEvents = await collectEvents(runtime.executeStream({
+        sessionId,
+        prompt: 'B',
+        cwd,
+        skipPermissionCheck: true,
+      }))
+      await appendAll(firstEvents)
+
+      assert.equal(fetchCalls.length, 1)
+      assert.ok(!firstEvents.some(event => event.type === 'tool_started'))
+      const clarificationError = firstEvents.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_NEEDS_USER_CONFIRMATION') as any
+      assert.ok(clarificationError)
+      assert.equal(clarificationError.details.optionSelection, 'B')
+      const clarificationText = firstEvents.find(event => event.type === 'result') as any
+      assert.ok(clarificationText)
+      assert.equal(clarificationText.success, true)
+      assert.match(clarificationText.message, /Reply "B" again to confirm/)
+
+      fetchCalls.length = 0
+      await storage.appendEvent(sessionId, {
+        type: 'user_message',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-12T00:00:02.000Z',
+        text: 'B',
+      })
+      const confirmedEvents = await collectEvents(runtime.executeStream({
+        sessionId,
+        prompt: 'B',
+        cwd,
+        skipPermissionCheck: true,
+      }))
+
+      assert.equal(fetchCalls.length, 2)
+      const confirmedBody = JSON.parse(String(fetchCalls[1].init?.body))
+      assert.deepEqual(confirmedBody.tools.map((tool: any) => tool.name), ['Read'])
+      assert.ok(confirmedEvents.some(event => event.type === 'tool_started' && (event as any).name === 'Read'))
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
   test('suppresses generic tool-shaped text while tools are hidden and retries final answer', async () => {
     globalThis.fetch = async (url, init) => {
       const body = parseRequestBody(init)
@@ -2423,6 +2542,16 @@ describe('LLMCodingRuntime', () => {
         'data: {"index":0}\n\n',
       ])
     )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Bash is not allowed, so I will answer without running it."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
 
     const runtime = new LLMCodingRuntime(
       toolsRegistry,
@@ -2449,8 +2578,8 @@ describe('LLMCodingRuntime', () => {
     assert.equal(toolDenied.name, 'Bash')
 
     const resultEvent = events.find(e => e.type === 'result') as any
-    assert.equal(resultEvent.success, false)
-    assert.match(resultEvent.message, /Tool denied/)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /without running it/)
   })
 })
 

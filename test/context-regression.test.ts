@@ -12,6 +12,7 @@ import {
   mapEventsToMessages,
 } from '../src/runtime/LLMCodingRuntime.js'
 import type { NexusEvent } from '../src/shared/events.js'
+import { findUngroundedAssistantContextPercentages } from '../src/runtime/contextNarrationDiagnostics.js'
 
 const schemaVersion = '2026-05-21.babel-o.v1' as const
 
@@ -354,6 +355,55 @@ test('context regression: provider empty response and invalid tool input remain 
   const serialized = JSON.stringify(messages)
   assert.match(serialized, /继续，先修复刚才空响应/)
   assert.match(serialized, /INVALID_TOOL_INPUT/)
+})
+
+test('context regression: ungrounded assistant context percentage is diagnosed', () => {
+  const sessionId = 'session_661479db-6327-46f2-a793-7b88e0431174'
+  const events: NexusEvent[] = [
+    user(sessionId, '2026-06-12T03:46:04.762Z', 'AgentLoop、Provider Registry、Tool 风险分类需要进行更深入的源码级对比'),
+    assistant(sessionId, '2026-06-12T03:46:45.746Z', '已掌握三个核心模块的完整实现细'),
+    assistant(sessionId, '2026-06-12T03:46:47.133Z', '节及跨模块的衔接逻辑。上下文已 91%，停止深读并直接产出对比分析。'),
+    {
+      type: 'usage',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-12T03:46:44.881Z',
+      inputTokens: 63721,
+      outputTokens: 0,
+      cacheCreationInputTokens: 0,
+      cacheReadInputTokens: 114,
+    },
+  ]
+
+  const diagnostics = findUngroundedAssistantContextPercentages(events)
+  assert.equal(diagnostics.length, 1)
+  assert.equal(diagnostics[0]?.code, 'MODEL_CONTEXT_PERCENT_UNGROUNDED')
+  assert.equal(diagnostics[0]?.percent, 91)
+  assert.match(diagnostics[0]?.textSnippet ?? '', /上下文已 91%/)
+  assert.match(diagnostics[0]?.reason ?? '', /without a recent runtime context event/)
+})
+
+test('context regression: assistant context percentage grounded by runtime event is not diagnosed', () => {
+  const sessionId = 'context-regression-grounded-context-percent'
+  const events: NexusEvent[] = [
+    user(sessionId, '2026-06-12T03:46:04.762Z', '继续分析'),
+    {
+      type: 'context_warning',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-12T03:46:44.000Z',
+      modelId: 'minimax/MiniMax-M2.7',
+      tokenEstimate: 163800,
+      maxTokens: 180000,
+      percentUsed: 91,
+      thresholdPercent: 70,
+      message: 'Context is near capacity.',
+    },
+    assistant(sessionId, '2026-06-12T03:46:47.133Z', 'runtime 已报告上下文 91%，我先收口当前分析。'),
+  ]
+
+  const diagnostics = findUngroundedAssistantContextPercentages(events)
+  assert.equal(diagnostics.length, 0)
 })
 
 function realSession321c48beReplayEvents(): NexusEvent[] {
