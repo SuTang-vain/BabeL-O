@@ -140,8 +140,10 @@ install_shell_launcher() {
 #!/bin/bash
 set -euo pipefail
 
-SEA_PAYLOAD="$SEA_PAYLOAD_PATH"
-GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH"
+SCRIPT_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd -P)"
+SEA_PAYLOAD="\$SCRIPT_DIR/bbl.sea"
+GO_TUI_FALLBACK="$INSTALLED_GO_TUI_PATH"
+GO_TUI_PLATFORM_BINARY="go-tui-$GO_TUI_PLATFORM_SUFFIX"
 
 have() {
   command -v "\$1" >/dev/null 2>&1
@@ -161,6 +163,20 @@ url_port() {
 
 health_url() {
   printf '%s' "\$1" | sed -E 's#^ws:#http:#; s#^wss:#https:#; s#/*\$#/health#'
+}
+
+resolve_go_tui_binary() {
+  if [ -n "\${BABEL_O_GO_TUI_BINARY:-}" ]; then
+    printf '%s\n' "\$BABEL_O_GO_TUI_BINARY"
+    return 0
+  fi
+  local user_local
+  user_local="\${HOME:-}/.local/share/babel-o/bin/\$GO_TUI_PLATFORM_BINARY"
+  if [ -x "\$user_local" ]; then
+    printf '%s\n' "\$user_local"
+    return 0
+  fi
+  printf '%s\n' "\$GO_TUI_FALLBACK"
 }
 
 nexus_healthy() {
@@ -196,11 +212,13 @@ run_go_tui() {
   local start_nexus
   local allowed_tools
   local go_args
+  local go_tui_binary
   url="http://127.0.0.1:3000"
   cwd="\${BABEL_O_LAUNCH_CWD:-\$(pwd)}"
   start_nexus=1
   allowed_tools="\${NEXUS_ALLOWED_TOOLS:-*}"
   go_args=()
+  go_tui_binary="\$(resolve_go_tui_binary)"
 
   while [ "\$#" -gt 0 ]; do
     case "\$1" in
@@ -237,16 +255,21 @@ run_go_tui() {
         shift
         ;;
       --binary)
+        go_tui_binary="\${2:-}"
         shift 2
         ;;
-      --binary=*|--source-dir=*)
+      --binary=*)
+        go_tui_binary="\${1#--binary=}"
+        shift
+        ;;
+      --source-dir=*)
         shift
         ;;
       --source-dir)
         shift 2
         ;;
       --check)
-        BABEL_O_GO_TUI_BINARY="\$GO_TUI_BINARY" NODE_NO_WARNINGS=1 exec "\$SEA_PAYLOAD" go --check --no-start-nexus --url "\$url" --cwd "\$cwd"
+        BABEL_O_GO_TUI_BINARY="\$go_tui_binary" NODE_NO_WARNINGS=1 exec "\$SEA_PAYLOAD" go --check --no-start-nexus --url "\$url" --cwd "\$cwd"
         ;;
       *)
         go_args+=("\$1")
@@ -280,7 +303,12 @@ run_go_tui() {
     fi
   fi
 
-  exec "\$GO_TUI_BINARY" --url "\$url" --cwd "\$cwd" "\${go_args[@]}"
+  if [ ! -x "\$go_tui_binary" ]; then
+    echo "Error: Go TUI binary is not executable: \$go_tui_binary" >&2
+    exit 1
+  fi
+
+  exec "\$go_tui_binary" --url "\$url" --cwd "\$cwd" \${go_args[@]+"\${go_args[@]}"}
 }
 
 if [ "\${1:-}" = "go" ]; then

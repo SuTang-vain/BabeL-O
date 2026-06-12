@@ -25,7 +25,10 @@ test('install.sh validates and atomically installs a downloaded binary', async (
 
   assert.equal(result.code, 0, result.stderr + result.stdout)
   const installed = await readFile(join(fixture.installDir, 'bbl'))
-  assert.match(installed.toString('utf8'), /SEA_PAYLOAD=/)
+  const installedText = installed.toString('utf8')
+  assert.match(installedText, /SCRIPT_DIR=/)
+  assert.match(installedText, /SEA_PAYLOAD="\$SCRIPT_DIR\/bbl\.sea"/)
+  assert.match(installedText, /\$\{go_args\[@\]\+"\$\{go_args\[@\]\}"\}/)
   const goTui = await readFile(join(fixture.homeDir, '.local/share/babel-o/bin/go-tui-darwin-arm64'))
   assert.match(goTui.toString('utf8'), /bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Running install self-check/)
@@ -52,6 +55,25 @@ test('install.sh wrapper launches Go TUI directly for bbl go', async () => {
   assert.equal(launch.code, 0, launch.stderr + launch.stdout)
   assert.match(launch.stdout, /GO_TUI_LAUNCHED --url http:\/\/127\.0\.0\.1:3000 --cwd \/workspace --session session_test/)
   assert.doesNotMatch(launch.stderr, /SEA go path should not run/)
+})
+
+test('install.sh wrapper handles bbl go with no forwarded args under set -u', async () => {
+  const fixture = await createFixture('success')
+  const result = await runInstaller(fixture)
+  assert.equal(result.code, 0, result.stderr + result.stdout)
+
+  const launch = await runInstalledBbl(fixture, [
+    'go',
+    '--no-start-nexus',
+    '--url',
+    'http://127.0.0.1:3000',
+    '--cwd',
+    '/workspace',
+  ])
+
+  assert.equal(launch.code, 0, launch.stderr + launch.stdout)
+  assert.match(launch.stdout, /GO_TUI_LAUNCHED --url http:\/\/127\.0\.0\.1:3000 --cwd \/workspace$/m)
+  assert.doesNotMatch(launch.stderr + launch.stdout, /unbound variable/)
 })
 
 test('install.sh fails self-check when downloaded Go TUI cannot execute', async () => {
