@@ -136,6 +136,8 @@ export async function runGoTuiCheckReport(
     fetch?: FetchFn
     exists?: ExistsFn
     packageRoot?: string
+    platform?: NodeJS.Platform
+    env?: NodeJS.ProcessEnv
   } = {},
 ): Promise<goTuiCheckReport> {
   const lines: string[] = []
@@ -147,14 +149,14 @@ export async function runGoTuiCheckReport(
   // 1. Go TUI launchability.
   const exists = deps.exists ?? existsSync
   const packageRoot = deps.packageRoot ?? defaultPackageRoot()
-  const platform = process.platform
+  const platform = deps.platform ?? process.platform
   const sourceDir = resolve(options.sourceDir ?? defaultGoTuiSourceDir(packageRoot))
   const candidates = collectGoTuiBinaryCandidates({
     options,
     platform,
     packageRoot,
     sourceDir,
-    env: process.env,
+    env: deps.env ?? process.env,
   })
   let resolvedBinary: string | undefined
   for (const candidate of candidates) {

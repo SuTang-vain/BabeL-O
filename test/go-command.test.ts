@@ -605,7 +605,7 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
       cwd: '/workspace',
       alt: true,
     },
-    { exists, fetch: fetchImpl, packageRoot },
+    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', env: {} },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
@@ -632,7 +632,7 @@ test('bbl go --check: warns (does not fail) when no prebuilt but source is prese
       cwd: '/workspace',
       alt: true,
     },
-    { exists, fetch: fetchImpl, packageRoot },
+    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', env: {} },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
