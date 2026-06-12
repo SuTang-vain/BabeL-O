@@ -56,6 +56,7 @@ test('createGoTuiLaunchSpec prefers a prebuilt binary', () => {
     {
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       exists: path => path === binary || path === sourceDir,
     },
   )
@@ -80,6 +81,7 @@ test('createGoTuiLaunchSpec falls back to go run when no binary is built', () =>
     {
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       exists: path => path === sourceDir,
     },
   )
@@ -466,6 +468,7 @@ test('createGoTuiLaunchSpec prefers BABEL_O_GO_TUI_BINARY over the in-tree dev b
       exists,
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       env: { BABEL_O_GO_TUI_BINARY: envPath },
     },
   )
@@ -489,6 +492,7 @@ test('createGoTuiLaunchSpec falls back to the in-tree dev build when no env var 
       exists,
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       env: {},
     },
   )
@@ -512,6 +516,7 @@ test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tre
       exists,
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       env: {},
     },
   )
@@ -538,6 +543,7 @@ test('createGoTuiLaunchSpec falls back to go run ./cmd/go-tui when no binary exi
       exists,
       packageRoot,
       platform: 'darwin',
+      arch: 'arm64',
       env: {},
     },
   )
@@ -569,6 +575,7 @@ test('createGoTuiLaunchSpec errors with an actionable hint when explicit --binar
           exists,
           packageRoot: '/repo',
           platform: 'darwin',
+          arch: 'arm64',
           env: {},
         },
       ),
