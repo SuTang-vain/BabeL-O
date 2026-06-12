@@ -1189,6 +1189,21 @@ func (m *model) scrollOverlay(delta int) bool {
 		maxScroll := max(0, len(allLines)-1)
 		m.modelOverlayScroll = clamp(m.modelOverlayScroll+delta, 0, maxScroll)
 		return true
+	case modeModelPickProvider:
+		maxScroll := max(0, len(m.modelCatalog.Providers)-1)
+		m.modelPickProviderIdx = clamp(m.modelPickProviderIdx+delta, 0, maxScroll)
+		return true
+	case modeModelPickModel:
+		provider := m.currentModelProvider()
+		total := 0
+		if len(m.modelPickerLive) > 0 {
+			total = len(m.modelPickerLive)
+		} else if provider != nil {
+			total = len(provider.Models)
+		}
+		maxScroll := max(0, total-1)
+		m.modelPickSelectedIdx = clamp(m.modelPickSelectedIdx+delta, 0, maxScroll)
+		return true
 	case modeSessionOverlay:
 		actions := sessionPanelActions()
 		if len(actions) == 0 {
@@ -1202,12 +1217,11 @@ func (m *model) scrollOverlay(delta int) bool {
 		m.permissionChoice = ((m.permissionChoice+delta)%5 + 5) % 5
 		return true
 	}
-	// Composing / slash pick / profile confirm / model pick*
-	// are all no-op for the wheel: composing owns ↑/↓ for
-	// prompt history, the others are tiny pickers that
-	// either respond to type-to-filter or have their own
-	// short key list. The caller is expected to have
-	// already routed the wheel to m.viewport for composing
+	// Composing / slash pick / profile confirm / text-entry
+	// pickers are no-op for the wheel: composing owns ↑/↓ for
+	// prompt history, the others either respond to typed input
+	// or have their own short key list. The caller is expected
+	// to have already routed the wheel to m.viewport for composing
 	// before consulting scrollOverlay.
 	return false
 }
@@ -2774,7 +2788,7 @@ func (m *model) resize() {
 	if m.height <= 0 {
 		return
 	}
-	if m.inputMode == modeContextOverlay {
+	if m.usesFullScreenOverlay() {
 		m.viewport.SetHeight(0)
 		return
 	}
@@ -2835,12 +2849,12 @@ func (m model) viewString() string {
 	if topCard != "" {
 		return strings.Join([]string{header, topCard, m.renderFooter(width)}, "\n")
 	}
-	if m.inputMode == modeContextOverlay {
-		contextOverlay := m.renderContextOverlay(width)
-		if contextOverlay == "" {
+	if m.usesFullScreenOverlay() {
+		overlay := m.renderFullScreenOverlay(width)
+		if overlay == "" {
 			return header
 		}
-		return padViewHeight(strings.Join([]string{header, contextOverlay}, "\n"), m.height)
+		return padViewHeight(strings.Join([]string{header, overlay}, "\n"), m.height)
 	}
 	transcript := m.highlightedViewportView()
 	permission := m.renderPermission(width)
@@ -2909,6 +2923,48 @@ func (m model) viewString() string {
 	}
 	parts = append(parts, composer, footer)
 	return strings.Join(parts, "\n")
+}
+
+func (m model) usesFullScreenOverlay() bool {
+	switch m.inputMode {
+	case modeHelpOverlay,
+		modeContextOverlay,
+		modeInboxOverlay,
+		modeAgentOverlay,
+		modeTaskBoard,
+		modeActivityOverlay,
+		modeToolAuditOverlay,
+		modeModelOverlay,
+		modeModelPickProvider,
+		modeModelPickApiKey,
+		modeModelPickBaseURL,
+		modeModelPickModel:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m model) renderFullScreenOverlay(width int) string {
+	for _, part := range []string{
+		m.renderHelp(width),
+		m.renderContextOverlay(width),
+		m.renderInboxOverlay(width),
+		m.renderAgentOverlay(width),
+		m.renderTaskBoard(width),
+		m.renderActivityOverlay(width),
+		m.renderToolAuditOverlay(width),
+		m.renderModelOverlay(width),
+		m.renderModelPickProvider(width),
+		m.renderModelPickApiKey(width),
+		m.renderModelPickBaseURL(width),
+		m.renderModelPickModel(width),
+	} {
+		if part != "" {
+			return part
+		}
+	}
+	return ""
 }
 
 func padViewHeight(view string, height int) string {

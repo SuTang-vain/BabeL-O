@@ -322,6 +322,136 @@ func TestModelRegistryOpensOnModelTriggerAndCloses(t *testing.T) {
 	}
 }
 
+func TestModelRegistryOverlayCoversInputAndTranscriptAtSmallHeight(t *testing.T) {
+	response := runtimeModelsResponse{
+		Type:         "runtime_models",
+		DefaultModel: "minimax/MiniMax-M3",
+		Providers: []registeredProvider{
+			{
+				ID:             "minimax",
+				DisplayName:    "MiniMax",
+				Adapter:        "openai-compatible",
+				AuthMode:       "apiKey",
+				DefaultBaseURL: "https://api.minimax.io/v1",
+				DefaultModel:   "minimax/MiniMax-M3",
+				Configured:     true,
+				Active:         true,
+				Models: []registeredModel{
+					{ID: "minimax/MiniMax-M3", Name: "MiniMax M3", ContextWindow: 245760},
+				},
+			},
+		},
+	}
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 18
+	m.appendLine("status", "loading shared Nexus model configuration")
+	m.resize()
+
+	updated, _ := m.Update(runtimeModelsMsg{response: response, trigger: "model"})
+	after := updated.(model)
+	after.width = 120
+	after.height = 18
+	after.resize()
+
+	view := viewContent(after.View())
+	plain := stripANSICodes(view)
+	if got := lipgloss.Height(view); got != after.height {
+		t.Fatalf("model registry view height = %d, want terminal height %d:\n%s", got, after.height, plain)
+	}
+	for _, want := range []string{"BABEL Model Registry", "Select provider", "MiniMax"} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("model registry overlay missing %q:\n%s", want, plain)
+		}
+	}
+	if strings.Contains(plain, "> Ask BabeL-O") || strings.Contains(plain, "/ or ctrl+p commands") {
+		t.Fatalf("model registry overlay should cover input/footer area:\n%s", plain)
+	}
+	if strings.Contains(plain, "loading shared Nexus model configuration") {
+		t.Fatalf("model registry overlay should hide the main transcript while open:\n%s", plain)
+	}
+}
+
+func TestFullScreenOverlaysCoverInputAndTranscriptAtSmallHeight(t *testing.T) {
+	baseCatalog := runtimeModelsResponse{
+		DefaultModel: "local/coding-runtime",
+		Providers: []registeredProvider{
+			{
+				ID:             "local",
+				DisplayName:    "Local",
+				DefaultBaseURL: "http://127.0.0.1:3000/v1",
+				DefaultModel:   "local/coding-runtime",
+				Configured:     true,
+				Models: []registeredModel{
+					{ID: "local/coding-runtime", Name: "Coding Runtime"},
+				},
+			},
+		},
+	}
+	makeModel := func(mode inputMode) model {
+		m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+		m.width = 120
+		m.height = 18
+		m.sessionID = "sess_overlay_smoke"
+		m.modelCatalog = baseCatalog
+		m.modelPickerLive = baseCatalog.Providers[0].Models
+		m.modelPickSelectedID = "local"
+		m.contextOverlayLines = []string{"BABEL Context", "Current context by source", "runtime 1024/8192"}
+		m.inboxMessages = []sessionMessage{{MessageID: "msg_1", Content: "check pending work", Status: messageStatusDelivered}}
+		m.inboxChannels = []sessionChannel{{ChannelID: "chan_1", Kind: channelKindDirect, Status: channelStatusOpen}}
+		m.agentJobs = []agentJob{{JobID: "job_1", Status: agentStatusRunning, Prompt: "verify overlay"}}
+		m.taskBoard = []nexusTask{{TaskID: "task_1", Status: taskStatusInProgress, Title: "verify overlay"}}
+		m.activityEvents = []activityEventEntry{{Kind: activityKindToolStarted, Summary: "Bash echo hi", Timestamp: "2026-06-10T10:00:00Z"}}
+		m.toolAuditEntries = []runtimeToolAuditEntry{{Name: "bash", Risk: toolRiskExecute}}
+		m.appendLine("status", "TRANSCRIPT_MARKER_should_be_hidden")
+		m.setMode(mode)
+		m.resize()
+		return m
+	}
+
+	cases := []struct {
+		name string
+		mode inputMode
+		want string
+	}{
+		{"help", modeHelpOverlay, "BabeL-O Go TUI"},
+		{"context", modeContextOverlay, "Context"},
+		{"inbox", modeInboxOverlay, "Inbox"},
+		{"agents", modeAgentOverlay, "Agents"},
+		{"tasks", modeTaskBoard, "Tasks"},
+		{"activity", modeActivityOverlay, "Activity"},
+		{"tools", modeToolAuditOverlay, "Tools audit"},
+		{"model", modeModelOverlay, "Model configuration"},
+		{"model provider", modeModelPickProvider, "BABEL Model Registry"},
+		{"model api key", modeModelPickApiKey, "local API key"},
+		{"model base url", modeModelPickBaseURL, "local base URL"},
+		{"model picker", modeModelPickModel, "local models"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := makeModel(tc.mode)
+			view := viewContent(m.View())
+			plain := stripANSICodes(view)
+			if got := lipgloss.Height(view); got != m.height {
+				t.Fatalf("%s view height = %d, want terminal height %d:\n%s", tc.name, got, m.height, plain)
+			}
+			if !strings.Contains(plain, tc.want) {
+				t.Fatalf("%s overlay missing %q:\n%s", tc.name, tc.want, plain)
+			}
+			for _, unwanted := range []string{
+				"> Ask BabeL-O",
+				"/ or ctrl+p commands",
+				"TRANSCRIPT_MARKER_should_be_hidden",
+			} {
+				if strings.Contains(plain, unwanted) {
+					t.Fatalf("%s overlay leaked %q:\n%s", tc.name, unwanted, plain)
+				}
+			}
+		})
+	}
+}
+
 func TestModelSlashCommandWithArgumentEntersRegistry(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	// Pre-load a fake catalog so openModelRegistry has
