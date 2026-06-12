@@ -79,6 +79,21 @@ test('ProviderError preserves provider-specific error metadata', () => {
   assert.match(error.message, /request_id=req_provider_789/)
 })
 
+test('ProviderError normalizes auth failures with a configuration hint', () => {
+  const error = new ProviderError('minimax', 401, JSON.stringify({
+    error: {
+      type: 'authentication_error',
+      message: 'Please carry the API secret key',
+    },
+    request_id: 'req_auth_123',
+  }))
+
+  assert.match(error.message, /Provider 'minimax' returned 401/)
+  assert.match(error.message, /no\/invalid API key/)
+  assert.match(error.message, /bbl config add minimax <KEY>/)
+  assert.match(error.message, /request_id=req_auth_123/)
+})
+
 test('classifyProviderRecovery tags provider protocol replay mismatches', () => {
   const details = classifyProviderRecovery(
     new ProviderError(

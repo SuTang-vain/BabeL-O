@@ -146,6 +146,8 @@ func (m *model) openModelRegistry() {
 	m.modelPickSelectedIdx = 0
 	m.modelPickSelectedID = ""
 	m.modelPickProviderDraft = ""
+	m.modelPickAPIKeyDraft = ""
+	m.modelPickBaseURLDraft = ""
 	m.setMode(modeModelPickProvider)
 }
 
@@ -259,9 +261,7 @@ func (m model) renderModelPickBaseURL(width int) string {
 }
 
 // renderModelPickModel is step 4: pick a model from the
-// hardcoded list baked into the catalog response. Phase 2
-// will replace this list with a live API call against the
-// freshly-entered base URL.
+// refreshed catalog after provider credentials have been saved.
 func (m model) renderModelPickModel(width int) string {
 	if m.inputMode != modeModelPickModel {
 		return ""

@@ -42,13 +42,26 @@ export class ProviderError extends NexusError {
   ) {
     const metadata = parseProviderErrorMetadata(rawMessage)
     super(
-      `Provider '${providerId}' request failed with status ${httpStatus}: ${formatProviderErrorMessage(rawMessage, metadata)}`,
+      formatProviderError(providerId, httpStatus, rawMessage, metadata),
       ErrorCodes.PROVIDER_ERROR,
       502,
     )
     this.name = 'ProviderError'
     this.metadata = metadata
   }
+}
+
+function formatProviderError(
+  providerId: string,
+  httpStatus: number,
+  rawMessage: string,
+  metadata: ProviderErrorMetadata,
+): string {
+  const details = formatProviderErrorMessage(rawMessage, metadata)
+  if (httpStatus === 401 || httpStatus === 403) {
+    return `Provider '${providerId}' returned ${httpStatus} (no/invalid API key). Run: bbl config add ${providerId} <KEY>. ${details}`
+  }
+  return `Provider '${providerId}' request failed with status ${httpStatus}: ${details}`
 }
 
 function parseProviderErrorMetadata(rawMessage: string): ProviderErrorMetadata {

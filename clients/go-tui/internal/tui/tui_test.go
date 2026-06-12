@@ -150,6 +150,39 @@ func TestNexusJSONSendsAPIKeyAndDecodes(t *testing.T) {
 	}
 }
 
+func TestSaveRuntimeProviderConfigPostsProviderCredentials(t *testing.T) {
+	var seenMethod, seenPath string
+	var seenBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seenMethod = r.Method
+		seenPath = r.URL.Path
+		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_config","modelId":"minimax/MiniMax-M3","providerId":"minimax","authMode":"api-key","hasApiKey":true}`))
+	}))
+	defer server.Close()
+
+	msg := saveRuntimeProviderConfig(Config{BaseURL: server.URL}, "minimax", "sk-test", "https://api.minimaxi.com/anthropic")()
+	got, ok := msg.(providerConfigMsg)
+	if !ok {
+		t.Fatalf("expected providerConfigMsg, got %T", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("saveRuntimeProviderConfig returned error: %v", got.err)
+	}
+	if seenMethod != http.MethodPost || seenPath != "/v1/runtime/config/provider" {
+		t.Fatalf("request = %s %s", seenMethod, seenPath)
+	}
+	if seenBody["provider"] != "minimax" || seenBody["apiKey"] != "sk-test" || seenBody["baseUrl"] != "https://api.minimaxi.com/anthropic" {
+		t.Fatalf("unexpected body: %#v", seenBody)
+	}
+	if got.providerID != "minimax" || got.config.ProviderID != "minimax" || !got.config.HasAPIKey {
+		t.Fatalf("unexpected msg: %+v", got)
+	}
+}
+
 func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 	configLine := formatRuntimeConfig(runtimeConfig{
 		ModelID:       "openai/gpt-4o",
@@ -423,7 +456,7 @@ func TestFullScreenOverlaysCoverInputAndTranscriptAtSmallHeight(t *testing.T) {
 		{"tools", modeToolAuditOverlay, "Tools audit"},
 		{"model", modeModelOverlay, "Model configuration"},
 		{"model provider", modeModelPickProvider, "BABEL Model Registry"},
-		{"model api key", modeModelPickApiKey, "local API key"},
+		{"model api key", modeModelPickApiKey, "Enter your local Key"},
 		{"model base url", modeModelPickBaseURL, "local base URL"},
 		{"model picker", modeModelPickModel, "local models"},
 	}
@@ -1732,6 +1765,7 @@ func TestFriendlyNexusErrorProducesHumanHints(t *testing.T) {
 		{"unknown_profile", map[string]any{"profile": "nope"}, `unknown profile "nope"`},
 		{"not_supported", map[string]any{}, "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI"},
 		{"missing_profile", map[string]any{}, "missing profile name in request body"},
+		{"missing_provider_api_key", map[string]any{"provider": "minimax", "model": "minimax/MiniMax-M3", "command": "bbl config add minimax <KEY>"}, "provider \"minimax\" needs an API key before selecting \"minimax/MiniMax-M3\""},
 		{"unknown_code", map[string]any{}, ""},
 	}
 	for _, tc := range cases {
@@ -1748,6 +1782,35 @@ func TestFriendlyNexusErrorProducesHumanHints(t *testing.T) {
 		if !strings.Contains(got, tc.want) {
 			t.Fatalf("friendlyNexusError(%q) = %q, want substring %q", tc.code, got, tc.want)
 		}
+	}
+}
+
+func TestWelcomeCardShowsSetupHintForMissingRemoteKey(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelID = "minimax/MiniMax-M3"
+	m.providerID = "minimax"
+	m.authMode = "api-key"
+	m.hasAPIKey = false
+
+	view := stripANSICodes(m.renderWelcomeCard(100))
+	if !strings.Contains(view, "auth") || !strings.Contains(view, "setup /model") {
+		t.Fatalf("welcome card should show setup hint for missing key:\n%s", view)
+	}
+}
+
+func TestWelcomeCardShowsReadyForNoAuthProvider(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelID = "local/coding-runtime"
+	m.providerID = "local"
+	m.authMode = "none"
+	m.hasAPIKey = false
+
+	view := stripANSICodes(m.renderWelcomeCard(100))
+	if !strings.Contains(view, "auth") || !strings.Contains(view, "ready") {
+		t.Fatalf("welcome card should show ready auth for no-auth provider:\n%s", view)
+	}
+	if strings.Contains(view, "setup /model") {
+		t.Fatalf("welcome card should not request setup for no-auth provider:\n%s", view)
 	}
 }
 
@@ -4218,6 +4281,39 @@ func TestContextOverlayWithExistingTranscriptDoesNotClipComposer(t *testing.T) {
 	}
 	if strings.Contains(plain, "context_analysis model=minimax") {
 		t.Fatalf("context overlay should hide the main transcript while open:\n%s", plain)
+	}
+}
+
+func TestContextOverlayCloseRestoresComposerViewportHeight(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	initialHeight := m.viewport.Height()
+	if initialHeight <= 0 {
+		t.Fatalf("test setup expected positive viewport height, got %d", initialHeight)
+	}
+
+	updated, _ := m.Update(contextAnalysisMsg{raw: fullContextPayload()})
+	overlay := updated.(model)
+	if overlay.inputMode != modeContextOverlay {
+		t.Fatalf("context analysis should open overlay, got %q", overlay.inputMode)
+	}
+	if got := overlay.viewport.Height(); got != 0 {
+		t.Fatalf("context overlay should collapse transcript viewport, got %d", got)
+	}
+
+	closed, _ := overlay.Update(keyPress(tea.KeyEsc))
+	after := closed.(model)
+	if after.inputMode != modeComposing {
+		t.Fatalf("context overlay esc should return to composing, got %q", after.inputMode)
+	}
+	if got := after.viewport.Height(); got <= 0 {
+		t.Fatalf("composer viewport height was not restored after context close, got %d", got)
+	}
+	view := stripANSICodes(viewContent(after.View()))
+	if !strings.Contains(view, "> Ask BabeL-O") {
+		t.Fatalf("composer input should be visible after context close:\n%s", view)
 	}
 }
 
@@ -8296,8 +8392,18 @@ func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 // transcript.
 func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.resize()
+	initialHeight := m.viewport.Height()
+	if initialHeight <= 0 {
+		t.Fatalf("test setup expected positive viewport height, got %d", initialHeight)
+	}
 	m.modelPickSubmitting = true
 	m.setMode(modeModelPickModel)
+	if got := m.viewport.Height(); got != 0 {
+		t.Fatalf("model picker should collapse transcript viewport, got %d", got)
+	}
 	m.modelID = "openai/gpt-4o"
 
 	updated, cmd := m.Update(modelSelectMsg{
@@ -8327,6 +8433,13 @@ func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 	if um.inputMode != modeComposing {
 		t.Fatalf("inputMode after success = %q, want %q", um.inputMode, modeComposing)
 	}
+	if got := um.viewport.Height(); got <= 0 {
+		t.Fatalf("composer viewport height was not restored after model save, got %d", got)
+	}
+	view := stripANSICodes(viewContent(um.View()))
+	if !strings.Contains(view, "> Ask BabeL-O") {
+		t.Fatalf("composer input should be visible after model save:\n%s", view)
+	}
 	if cmd != nil {
 		t.Fatalf("modelSelectMsg success should not return a follow-up cmd, got %T", cmd)
 	}
@@ -8336,6 +8449,80 @@ func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 	}
 	if !strings.Contains(rendered, "provider anthropic") {
 		t.Fatalf("transcript should mention the new provider id, got %q", rendered)
+	}
+}
+
+func TestProviderConfigMsgAppliesConfigAndEntersModelPicker(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:          "minimax",
+			DisplayName: "MiniMax",
+			AuthMode:    "api-key",
+			Configured:  false,
+			Models:      []registeredModel{{ID: "minimax/MiniMax-M3", Name: "MiniMax M3"}},
+		}},
+	}
+	m.modelPickSelectedID = "minimax"
+	m.setMode(modeModelPickBaseURL)
+
+	updated, cmd := m.Update(providerConfigMsg{
+		providerID: "minimax",
+		config: runtimeConfig{
+			Type:       "runtime_config",
+			Version:    11,
+			ModelID:    "local/coding-runtime",
+			ProviderID: "local",
+			AuthMode:   "none",
+			HasAPIKey:  true,
+		},
+	})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.configVersion != 11 {
+		t.Fatalf("configVersion = %d, want 11", um.configVersion)
+	}
+	if !um.modelCatalog.Providers[0].Configured {
+		t.Fatalf("provider should be marked configured after providerConfigMsg")
+	}
+	if um.inputMode != modeModelPickModel {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeModelPickModel)
+	}
+	if !um.modelPickerLoading {
+		t.Fatalf("enterModelPicker should mark live model refresh as loading")
+	}
+	if cmd == nil {
+		t.Fatalf("providerConfigMsg success should fetch runtime models")
+	}
+	rendered := renderTranscript(um.transcript, 200)
+	if !strings.Contains(rendered, "provider configured: minimax") {
+		t.Fatalf("transcript should announce provider configuration, got %q", rendered)
+	}
+}
+
+func TestProviderConfigMsgErrorStaysOnBaseURLStep(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickBaseURL)
+
+	updated, cmd := m.Update(providerConfigMsg{
+		providerID: "minimax",
+		err:        fmt.Errorf("unknown_provider"),
+	})
+	um, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if um.inputMode != modeModelPickBaseURL {
+		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeModelPickBaseURL)
+	}
+	if cmd != nil {
+		t.Fatalf("providerConfigMsg error should not fetch model list, got %T", cmd)
+	}
+	rendered := renderTranscript(um.transcript, 200)
+	if !strings.Contains(rendered, "provider config: unknown_provider") {
+		t.Fatalf("transcript should surface provider config error, got %q", rendered)
 	}
 }
 
@@ -9562,11 +9749,12 @@ func TestModelPickApiKeyDialogViewContainsProviderDefaultAndInput(t *testing.T) 
 	d := newModelPickApiKeyDialog(provider, "> paste API key (or accept default)")
 	out := d.View(100)
 	for _, want := range []string{
-		"anthropic API key",
-		"Paste API key",
-		"default model: claude-sonnet-4-6",
+		"Enter your anthropic Key",
+		"Paste your provider key",
+		"default model  claude-sonnet-4-6",
+		"config target  global provider credentials",
 		"> paste API key (or accept default)",
-		"enter confirm · esc back",
+		"enter continue · esc back",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("View(100) missing %q:\n%s", want, out)

@@ -124,6 +124,37 @@ export type ProviderDiagnostics = {
   roleRecommendation?: ProviderRoleDiagnostics;
 }
 
+export type ModelSelectionAuthIssue = {
+  providerId: string;
+  modelId: string;
+  authMode: ProviderDiagnostics['authMode'];
+  authSource: ProviderDiagnostics['authSource'];
+  command: string;
+  message: string;
+}
+
+export function buildProviderCredentialCommand(providerId: string): string {
+  return `bbl config add ${providerId} <KEY>`;
+}
+
+export function validateModelSelectionAuth(
+  configManager: ConfigManager,
+  modelId: string,
+): ModelSelectionAuthIssue | undefined {
+  const diagnostics = configManager.getProviderDiagnostics({ model: modelId });
+  if (diagnostics.authConfigured) return undefined;
+
+  const command = buildProviderCredentialCommand(diagnostics.providerId);
+  return {
+    providerId: diagnostics.providerId,
+    modelId: diagnostics.modelId,
+    authMode: diagnostics.authMode,
+    authSource: diagnostics.authSource,
+    command,
+    message: `Provider '${diagnostics.providerId}' has no API key configured. Run: ${command}`,
+  };
+}
+
 export const ProviderConfigSchema = z.object({
   apiKey: z.string().min(1, 'API key cannot be empty').optional(),
   baseUrl: z.string().url('Base URL must be a valid URL').optional(),

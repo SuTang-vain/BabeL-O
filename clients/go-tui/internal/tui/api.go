@@ -71,6 +71,21 @@ func selectRuntimeModel(cfg Config, modelID string) tea.Cmd {
 	}
 }
 
+func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, baseURL string) tea.Cmd {
+	return func() tea.Msg {
+		var payload runtimeConfig
+		body := map[string]string{"provider": providerID}
+		if strings.TrimSpace(apiKey) != "" {
+			body["apiKey"] = apiKey
+		}
+		if strings.TrimSpace(baseURL) != "" {
+			body["baseUrl"] = baseURL
+		}
+		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/provider", body, &payload)
+		return providerConfigMsg{providerID: providerID, config: payload, err: err}
+	}
+}
+
 func fetchContextAnalysis(cfg Config, sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/context", nil)
@@ -436,6 +451,14 @@ func friendlyNexusErrorWithContext(code string, payload map[string]any, soft *so
 		return "model / role / roleModel switching is not supported via HTTP; use `bbl config use <modelId>` CLI", true
 	case "missing_profile":
 		return "missing profile name in request body", true
+	case "missing_provider_api_key":
+		provider := stringField(payload, "provider")
+		model := stringField(payload, "model")
+		command := firstNonEmpty(stringField(payload, "command"), "bbl config add "+provider+" <KEY>")
+		return fmt.Sprintf("provider %q needs an API key before selecting %q; run /model to configure it, or run `%s`", provider, model, command), true
+	case "unknown_provider":
+		provider := stringField(payload, "provider")
+		return fmt.Sprintf("unknown provider %q", provider), true
 	case "REQUEST_TIMEOUT":
 		timeout := anyInt(payload["timeoutMs"])
 		// Phase 5: Nexus now decorates watchdog cutoffs with

@@ -61,6 +61,35 @@ test('bbl config profile list reports active and tombstones', () => {
   }
 })
 
+test('bbl config use refuses API-key provider models without credentials', () => {
+  const { file, cleanup } = makeTempConfig()
+  try {
+    const result = runCli(['config', 'use', 'minimax/MiniMax-M3'], { BABEL_O_CONFIG_FILE: file })
+    assert.equal(result.status, 1)
+    assert.match(result.stderr, /Provider 'minimax' has no API key configured/)
+    assert.match(result.stderr, /bbl config add minimax <KEY>/)
+
+    const reloaded = JSON.parse(readFileSync(file, 'utf8'))
+    assert.notEqual(reloaded.defaultModel, 'minimax/MiniMax-M3')
+  } finally {
+    cleanup()
+  }
+})
+
+test('bbl config use allows no-auth local model without credentials', () => {
+  const { file, cleanup } = makeTempConfig()
+  try {
+    const result = runCli(['config', 'use', 'local/coding-runtime'], { BABEL_O_CONFIG_FILE: file })
+    assert.equal(result.status, 0, result.stderr)
+    assert.match(result.stdout, /Default model set to: local\/coding-runtime/)
+
+    const reloaded = JSON.parse(readFileSync(file, 'utf8'))
+    assert.equal(reloaded.defaultModel, 'local/coding-runtime')
+  } finally {
+    cleanup()
+  }
+})
+
 test('bbl config profile use <name> sets active profile and persists', () => {
   const { file, cleanup } = makeTempConfig()
   try {

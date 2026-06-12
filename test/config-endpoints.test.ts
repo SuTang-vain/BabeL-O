@@ -105,6 +105,52 @@ test('GET /v1/runtime/models marks provider configured when a profile carries it
   }
 })
 
+test('POST /v1/runtime/config/provider saves provider credentials without leaking the key', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider',
+      payload: {
+        provider: 'minimax',
+        apiKey: 'sk-minimax-test',
+        baseUrl: 'https://api.minimaxi.com/anthropic',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'runtime_config')
+    assert.ok(!('apiKey' in body), 'provider config response must not leak apiKey')
+
+    const reloaded = new ConfigManager(sharedConfigPath)
+    assert.equal(reloaded.getProviderConfig('minimax').apiKey, 'sk-minimax-test')
+    assert.equal(reloaded.getProviderConfig('minimax').baseUrl, 'https://api.minimaxi.com/anthropic')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/provider rejects unknown providers', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider',
+      payload: { provider: 'not-real', apiKey: 'secret' },
+    })
+    assert.equal(response.statusCode, 400)
+    assert.equal(response.json().error, 'unknown_provider')
+  } finally {
+    await app.close()
+  }
+})
+
 test('POST /v1/runtime/config/select switches active profile and persists', async () => {
   resetProfiles()
   manager.setProfile('alpha', { provider: 'openai', model: 'openai/gpt-test' })
@@ -226,18 +272,64 @@ test('POST /v1/runtime/config/select switches default model and persists', async
     const response = await app.inject({
       method: 'POST',
       url: '/v1/runtime/config/select',
-      payload: { model: 'anthropic/claude-3-5-sonnet' },
+      payload: { model: 'local/coding-runtime' },
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
-    assert.equal(body.modelId, 'anthropic/claude-3-5-sonnet')
-    assert.equal(body.providerId, 'anthropic')
+    assert.equal(body.modelId, 'local/coding-runtime')
+    assert.equal(body.providerId, 'local')
     assert.equal(body.modelSource, 'default')
 
     // Confirm persistence: a fresh manager reading the same file
     // must observe the new default model.
     const reloaded = new ConfigManager(sharedConfigPath)
-    assert.equal(reloaded.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
+    assert.equal(reloaded.getDefaultModel(), 'local/coding-runtime')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select rejects API-key providers without credentials', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { model: 'minimax/MiniMax-M3' },
+    })
+    assert.equal(response.statusCode, 400)
+    const body = response.json()
+    assert.equal(body.error, 'missing_provider_api_key')
+    assert.equal(body.provider, 'minimax')
+    assert.equal(body.model, 'minimax/MiniMax-M3')
+    assert.equal(body.command, 'bbl config add minimax <KEY>')
+    assert.match(body.message, /Provider 'minimax' has no API key configured/)
+
+    const reloaded = new ConfigManager(sharedConfigPath)
+    assert.notEqual(reloaded.getDefaultModel(), 'minimax/MiniMax-M3')
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/select allows no-auth local and ollama models', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    for (const model of ['local/coding-runtime', 'ollama/qwen2.5-coder:7b']) {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/v1/runtime/config/select',
+        payload: { model },
+      })
+      assert.equal(response.statusCode, 200, `${model}: ${response.body}`)
+      assert.equal(new ConfigManager(sharedConfigPath).getDefaultModel(), model)
+    }
   } finally {
     await app.close()
   }
@@ -257,7 +349,7 @@ test('POST /v1/runtime/config/select model switch preserves an active profile bi
     const response = await app.inject({
       method: 'POST',
       url: '/v1/runtime/config/select',
-      payload: { model: 'anthropic/claude-3-5-sonnet' },
+      payload: { model: 'local/coding-runtime' },
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
@@ -265,7 +357,7 @@ test('POST /v1/runtime/config/select model switch preserves an active profile bi
     assert.equal(body.activeProfile, 'alpha')
 
     const reloaded = new ConfigManager(sharedConfigPath)
-    assert.equal(reloaded.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
+    assert.equal(reloaded.getDefaultModel(), 'local/coding-runtime')
     assert.equal(reloaded.getActiveProfile(), 'alpha')
   } finally {
     await app.close()

@@ -75,12 +75,19 @@ func (m model) renderWelcomeCard(width int) string {
 	sessionSummary := truncatePlain(shortID(sessionVal), 42)
 	modeSummary := truncatePlain(mode, 42)
 	titleLine := titleStyle.Render("v"+Version) + mutedStyle.Render("  Welcome back!")
+	authValue := "ready"
+	authMarker := statusStyle.Render("●")
+	if m.authMode != "" && m.authMode != "none" && !m.hasAPIKey {
+		authValue = "setup /model"
+		authMarker = errorStyle.Render("!")
+	}
 	metadataLines := []string{
 		titleLine,
 		welcomeMetaLine("model", modelSummary, statusStyle.Render("●")),
-		welcomeMetaLine("work", cwdSummary, contextStyle.Render("○")),
+		welcomeMetaLine("auth", authValue, authMarker),
 		welcomeMetaLine("session", sessionSummary, mutedStyle.Render("•")),
 		welcomeMetaLine("mode", modeSummary, mutedStyle.Render("•")),
+		welcomeMetaLine("work", cwdSummary, contextStyle.Render("○")),
 	}
 	infoGap := 10
 	infoOffset := 1 + lipgloss.Width(pixelRows[0]) + infoGap

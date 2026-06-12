@@ -22,7 +22,7 @@ import { NexusMetrics, round } from './metrics.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { BABEL_O_VERSION } from '../shared/version.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
-import { ConfigManager, type ProfileConfig } from '../shared/config.js'
+import { ConfigManager, validateModelSelectionAuth, type ProfileConfig } from '../shared/config.js'
 import { getModel, inspectModelCapabilities, modelRegistry, providerRegistry, UnknownModelError } from '../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runtime/providerRecovery.js'
@@ -136,6 +136,12 @@ const runtimeConfigSelectSchema = z.object({
   roleModel: z.string().optional(),
 }).strict()
 
+const runtimeConfigProviderSchema = z.object({
+  provider: z.string().min(1).max(80),
+  apiKey: z.string().min(1).max(20_000).optional(),
+  baseUrl: z.string().url().optional(),
+}).strict()
+
 const runtimeConfigProfileParamsSchema = z.object({
   name: z.string().min(1).max(120),
 })
@@ -191,6 +197,7 @@ function inspectResolvedRuntimeConfig(manager: ConfigManager) {
       modelName: diag.modelName,
       providerId: settings.providerId,
       providerName: diag.providerName,
+      authMode: diag.authMode,
       modelSource: settings.modelSource,
       hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
       apiKeySource: settings.apiKeySource,
@@ -209,6 +216,7 @@ function inspectResolvedRuntimeConfig(manager: ConfigManager) {
       modelName: settings.modelId,
       providerId: settings.providerId,
       providerName: settings.providerId,
+      authMode: 'api-key',
       modelSource: settings.modelSource,
       hasApiKey: settings.apiKeySource !== 'none' && Boolean(settings.apiKey),
       apiKeySource: settings.apiKeySource,
@@ -817,6 +825,25 @@ export async function createNexusApp(
     }
   })
 
+  app.post('/v1/runtime/config/provider', async (request, reply) => {
+    const body = runtimeConfigProviderSchema.parse(request.body ?? {})
+    const manager = ConfigManager.getInstance()
+    if (!providerRegistry.some(provider => provider.id === body.provider)) {
+      return reply.code(400).send({
+        error: 'unknown_provider',
+        provider: body.provider,
+        message: 'provider id is not present in the providerRegistry',
+      })
+    }
+
+    const existing = manager.getProviderConfig(body.provider)
+    manager.setProviderConfig(body.provider, {
+      apiKey: body.apiKey ?? existing.apiKey,
+      baseUrl: body.baseUrl ?? existing.baseUrl,
+    })
+    return inspectResolvedRuntimeConfig(manager)
+  })
+
   // POST /v1/runtime/config/select — 切换 active profile / default model (持久化)
   //
   // 三种互斥形态:
@@ -876,6 +903,19 @@ export async function createNexusApp(
         error: 'unknown_model',
         model: modelId,
         message: 'model id is not present in the modelRegistry',
+      })
+    }
+
+    const authIssue = validateModelSelectionAuth(manager, modelId)
+    if (authIssue) {
+      return reply.code(400).send({
+        error: 'missing_provider_api_key',
+        provider: authIssue.providerId,
+        model: authIssue.modelId,
+        authMode: authIssue.authMode,
+        authSource: authIssue.authSource,
+        command: authIssue.command,
+        message: authIssue.message,
       })
     }
 

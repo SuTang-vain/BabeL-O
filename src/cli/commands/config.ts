@@ -1,6 +1,11 @@
 import chalk from 'chalk'
 import { Command } from 'commander'
-import { ConfigManager, DEFAULT_BABEL_X_CONFIG_FILE, loadBabeLXConfigImportPlan } from '../../shared/config.js'
+import {
+  ConfigManager,
+  DEFAULT_BABEL_X_CONFIG_FILE,
+  loadBabeLXConfigImportPlan,
+  validateModelSelectionAuth,
+} from '../../shared/config.js'
 import { modelRegistry } from '../../providers/registry.js'
 
 export function registerConfigCommand(program: Command): void {
@@ -93,6 +98,12 @@ export function registerConfigCommand(program: Command): void {
       const exists = modelRegistry.some(m => m.id === modelId)
       if (!exists) {
         console.warn(chalk.yellow(`Warning: Model "${modelId}" is not in the registered list, but setting it anyway.`))
+      }
+      const authIssue = validateModelSelectionAuth(configManager, modelId)
+      if (authIssue) {
+        console.error(chalk.red(`Error: ${authIssue.message}`))
+        process.exitCode = 1
+        return
       }
       configManager.setDefaultModel(modelId)
       console.log(chalk.green(`✓ Default model set to: ${modelId}`))

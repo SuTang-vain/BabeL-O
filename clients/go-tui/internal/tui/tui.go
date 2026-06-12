@@ -107,6 +107,7 @@ type runtimeConfig struct {
 	ModelName        string                             `json:"modelName"`
 	ProviderID       string                             `json:"providerId"`
 	ProviderName     string                             `json:"providerName"`
+	AuthMode         string                             `json:"authMode"`
 	ModelSource      string                             `json:"modelSource"`
 	HasAPIKey        bool                               `json:"hasApiKey"`
 	APIKeySource     string                             `json:"apiKeySource"`
@@ -219,6 +220,12 @@ type modelSelectMsg struct {
 	modelID string
 	config  runtimeConfig
 	err     error
+}
+
+type providerConfigMsg struct {
+	providerID string
+	config     runtimeConfig
+	err        error
 }
 
 // contextAnalysisMsg is the response from
@@ -890,6 +897,8 @@ type model struct {
 	sessionID               string
 	modelID                 string
 	providerID              string
+	authMode                string
+	hasAPIKey               bool
 	activeProfile           string
 	contextWindow           int
 	configVersion           int
@@ -987,7 +996,9 @@ type model struct {
 	//   4) modeModelPickModel   — pick a model
 	// Each mode holds its own scroll / selected state.
 	modelPickProviderIdx   int
-	modelPickProviderDraft string // pending apiKey / baseURL typed by the operator
+	modelPickProviderDraft string // pending slash argument / provider seed
+	modelPickAPIKeyDraft   string
+	modelPickBaseURLDraft  string
 	modelPickSelectedID    string
 	modelPickSelectedIdx   int
 	// modelPickerLive is the latest live-fetched model
@@ -1094,6 +1105,7 @@ func (m *model) setMode(next inputMode) {
 	if m.inputMode == next {
 		return
 	}
+	wasFullScreenOverlay := m.usesFullScreenOverlay()
 	m.inputMode = next
 	if next == modePermission {
 		m.permissionOpenedAt = time.Now()
@@ -1104,6 +1116,9 @@ func (m *model) setMode(next inputMode) {
 	// the operator doesn't see "Ask BabeL-O" while configuring a
 	// provider. The default mode goes back to "Ask BabeL-O".
 	m.input.Placeholder = placeholderForMode(next)
+	if m.width > 0 && m.height > 0 && (wasFullScreenOverlay || m.usesFullScreenOverlay()) {
+		m.resize()
+	}
 }
 
 // placeholderForMode returns the input placeholder text appropriate
@@ -2246,6 +2261,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, m.enterModelPicker()
 					}
 					m.modelPickProviderDraft = ""
+					m.modelPickAPIKeyDraft = ""
+					m.modelPickBaseURLDraft = ""
 					m.setInputValue("")
 					m.setMode(modeModelPickApiKey)
 				}
@@ -2259,7 +2276,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setMode(modeModelPickProvider)
 				return m, nil
 			case "enter":
-				m.modelPickProviderDraft = m.input.Value()
+				m.modelPickAPIKeyDraft = m.input.Value()
 				m.setInputValue("")
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
@@ -2279,10 +2296,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if typed == "" && provider != nil {
 					typed = provider.DefaultBaseURL
 				}
-				m.modelPickProviderDraft = typed
+				m.modelPickBaseURLDraft = typed
 				m.setInputValue("")
 				m.modelPickSelectedIdx = 0
-				return m, m.enterModelPicker()
+				if provider == nil {
+					return m, nil
+				}
+				return m, saveRuntimeProviderConfig(m.cfg, provider.ID, m.modelPickAPIKeyDraft, m.modelPickBaseURLDraft)
 			}
 			return m, nil
 
@@ -2585,9 +2605,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelPickSelectedID = ""
 		m.modelPickProviderIdx = 0
 		m.modelPickProviderDraft = ""
+		m.modelPickAPIKeyDraft = ""
+		m.modelPickBaseURLDraft = ""
 		m.modelPickerLive = nil
 		m.setMode(modeComposing)
 		return m, nil
+
+	case providerConfigMsg:
+		if msg.err != nil {
+			m.appendLine("error", "provider config: "+msg.err.Error())
+			m.setMode(modeModelPickBaseURL)
+			return m, nil
+		}
+		m.applyRuntimeConfig(msg.config)
+		for i := range m.modelCatalog.Providers {
+			if m.modelCatalog.Providers[i].ID == msg.providerID {
+				m.modelCatalog.Providers[i].Configured = true
+				break
+			}
+		}
+		m.appendLine("status", "provider configured: "+msg.providerID)
+		return m, m.enterModelPicker()
 
 	case contextAnalysisMsg:
 		if msg.err != nil {
@@ -3141,6 +3179,8 @@ func (m *model) applyRuntimeConfig(config runtimeConfig) {
 		m.contextWindow = config.ContextWindow
 	}
 	m.providerID = config.ProviderID
+	m.authMode = config.AuthMode
+	m.hasAPIKey = config.HasAPIKey
 	m.activeProfile = config.ActiveProfile
 	if config.Version > 0 {
 		m.configVersion = config.Version

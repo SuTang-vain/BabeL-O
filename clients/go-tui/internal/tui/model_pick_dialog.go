@@ -37,17 +37,18 @@ func (d *modelPickApiKeyDialog) View(width int) string {
 	rc := NewRenderContext(width)
 	rc.SetFrameStyle(overlayFrameStyle)
 	lines := []string{
-		titleStyle.Render(fmt.Sprintf("%s API key", firstNonEmpty(providerID, "Provider"))),
-		mutedStyle.Render("Paste API key (Press Enter to confirm, esc to go back.)"),
+		titleStyle.Render(fmt.Sprintf("Enter your %s Key", firstNonEmpty(providerID, "Provider"))),
+		mutedStyle.Render("Paste your provider key. It will be saved in BabeL-O config."),
 		"",
 	}
 	if d.provider != nil {
-		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  default model: %s", d.provider.DefaultModel)))
+		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  default model  %s", d.provider.DefaultModel)))
+		lines = append(lines, mutedStyle.Render("  config target  global provider credentials"))
 		lines = append(lines, "")
 	}
 	lines = append(lines, "  "+d.input)
 	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  enter confirm · esc back"))
+	lines = append(lines, mutedStyle.Render("  enter continue · esc back"))
 	rc.AddPart(strings.Join(lines, "\n"))
 	return rc.Render()
 }
