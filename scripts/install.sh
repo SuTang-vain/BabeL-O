@@ -7,6 +7,8 @@ LATEST_RELEASE_API="https://api.github.com/repos/$REPO/releases/latest"
 INSTALL_DIR="${BBL_INSTALL_DIR:-/usr/local/bin}"
 TMP_PATH=""
 GO_TUI_TMP_PATH=""
+SELF_CHECK_TMP_PATH=""
+INSTALLED_GO_TUI_PATH=""
 
 fail() {
   echo "Error: $*" >&2
@@ -19,6 +21,9 @@ cleanup() {
   fi
   if [ -n "$GO_TUI_TMP_PATH" ] && [ -f "$GO_TUI_TMP_PATH" ]; then
     rm -f "$GO_TUI_TMP_PATH"
+  fi
+  if [ -n "$SELF_CHECK_TMP_PATH" ] && [ -f "$SELF_CHECK_TMP_PATH" ]; then
+    rm -f "$SELF_CHECK_TMP_PATH"
   fi
 }
 trap cleanup EXIT
@@ -104,17 +109,50 @@ validate_binary() {
   if [ "$magic2" = "4d5a" ]; then
     return 0
   fi
+  if [ "$magic2" = "2321" ]; then
+    return 0
+  fi
 
   if have file; then
     file_output="$(file "$path")"
     case "$file_output" in
-      *Mach-O*|*ELF*|*PE32*)
+      *Mach-O*|*ELF*|*PE32*|*script*)
         return 0
         ;;
     esac
   fi
 
   fail "Downloaded file is not a recognized executable binary."
+}
+
+run_self_check() {
+  if [ "${BBL_INSTALL_SMOKE:-1}" = "0" ]; then
+    echo "Skipping install self-check because BBL_INSTALL_SMOKE=0."
+    return 0
+  fi
+
+  echo "Running install self-check..."
+
+  if [ -n "$INSTALLED_GO_TUI_PATH" ]; then
+    SELF_CHECK_TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.self-check.XXXXXX")"
+    if BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$TARGET_PATH" go --check --no-start-nexus >"$SELF_CHECK_TMP_PATH" 2>&1; then
+      cat "$SELF_CHECK_TMP_PATH"
+      rm -f "$SELF_CHECK_TMP_PATH"
+      SELF_CHECK_TMP_PATH=""
+      echo "BabeL-O is ready. Run 'bbl go' to start the Go TUI."
+      return 0
+    fi
+
+    cat "$SELF_CHECK_TMP_PATH" >&2
+    fail "Install self-check failed: bbl go readiness check did not pass. Try BBL_INSTALL_SMOKE=0 to skip the check, or install from npm/source."
+  fi
+
+  if "$TARGET_PATH" --version >/dev/null 2>&1; then
+    echo "BabeL-O CLI is installed. Go TUI self-check was skipped because BBL_INSTALL_GO_TUI=0."
+    return 0
+  fi
+
+  fail "Install self-check failed: installed bbl binary cannot start."
 }
 
 echo "=== BabeL-O Standalone Binary Installer ==="
@@ -231,12 +269,14 @@ if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
     chmod +x "$GO_TUI_TMP_PATH"
     mv "$GO_TUI_TMP_PATH" "$GO_TUI_TARGET_PATH"
     GO_TUI_TMP_PATH=""
+    INSTALLED_GO_TUI_PATH="$GO_TUI_TARGET_PATH"
     echo "Go TUI installed successfully to: $GO_TUI_TARGET_PATH"
   else
-    echo "Warning: Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL" >&2
-    echo "Warning: bbl go will fall back to source if the Go TUI source tree and Go toolchain are available." >&2
+    fail "Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL. The $VERSION release may not have finished publishing Go TUI binaries yet. Set BBL_INSTALL_GO_TUI=0 to install only the bbl CLI."
   fi
 fi
+
+run_self_check
 
 if [ "$PATH_SUGGESTION" = true ]; then
   if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -9,6 +9,7 @@ import { Command } from 'commander'
 type ExistsFn = (path: string) => boolean
 type SpawnFn = typeof spawn
 type FetchFn = typeof fetch
+type ExecFileSyncFn = typeof execFileSync
 
 export interface GoTuiCommandOptions {
   url: string
@@ -92,7 +93,7 @@ export function registerGoCommand(program: Command): void {
           console.error(
             'Error: Go TUI binary was not found and the Go toolchain is unavailable. ' +
               'Install Go (https://go.dev/dl/) or use a prebuilt release: ' +
-              '`npm install -g @bablel/babel-o`, or set BABEL_O_GO_TUI_BINARY to a release asset path.',
+              '`npm install -g babel-o`, or set BABEL_O_GO_TUI_BINARY to a release asset path.',
           )
         } else {
           console.error(`Error: failed to launch Go TUI: ${error.message}`)
@@ -141,6 +142,7 @@ export async function runGoTuiCheckReport(
     arch?: NodeJS.Architecture
     env?: NodeJS.ProcessEnv
     homeDir?: string
+    execFileSync?: ExecFileSyncFn
   } = {},
 ): Promise<goTuiCheckReport> {
   const lines: string[] = []
@@ -177,6 +179,18 @@ export async function runGoTuiCheckReport(
   }
   if (resolvedBinary) {
     lines.push(`[OK]      Go TUI binary found: ${resolvedBinary}`)
+    try {
+      const versionOutput = (deps.execFileSync ?? execFileSync)(resolvedBinary, ['--version'], {
+        encoding: 'utf8',
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }).trim()
+      lines.push(`[OK]      Go TUI executable starts: ${versionOutput || '--version returned no output'}`)
+    } catch (error: any) {
+      const message = error?.message ? String(error.message) : String(error)
+      lines.push(`[FAIL]    Go TUI executable did not start with --version: ${message}`)
+      hasFailure = true
+    }
   } else if (exists(sourceDir)) {
     lines.push(
       `[WARN]    No prebuilt Go TUI binary found in the multi-path search. ` +
@@ -186,7 +200,7 @@ export async function runGoTuiCheckReport(
   } else {
     lines.push(
       `[FAIL]    No prebuilt Go TUI binary AND no source directory at ${sourceDir}. ` +
-        `Install a prebuilt via 'npm install -g @bablel/babel-o' or 'go install' from a source checkout.`,
+        `Install a prebuilt via 'npm install -g babel-o' or 'go install' from a source checkout.`,
     )
     hasFailure = true
   }
@@ -290,14 +304,14 @@ export function createGoTuiLaunchSpec(
     // path and we should error rather than silently swap.
     throw new Error(
       `Go TUI binary not found: ${options.binary}. ` +
-        `Install a prebuilt via 'npm install -g @bablel/babel-o' or set BABEL_O_GO_TUI_BINARY to a release asset.`,
+        `Install a prebuilt via 'npm install -g babel-o' or set BABEL_O_GO_TUI_BINARY to a release asset.`,
     )
   }
 
   if (!exists(sourceDir)) {
     throw new Error(
       `Go TUI source directory not found: ${sourceDir}. ` +
-        `Install a prebuilt via 'npm install -g @bablel/babel-o' or set BABEL_O_GO_TUI_BINARY.`,
+        `Install a prebuilt via 'npm install -g babel-o' or set BABEL_O_GO_TUI_BINARY.`,
     )
   }
 

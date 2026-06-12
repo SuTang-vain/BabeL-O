@@ -618,7 +618,16 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
       cwd: '/workspace',
       alt: true,
     },
-    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', arch: 'arm64', env: {}, homeDir: '' },
+    {
+      exists,
+      fetch: fetchImpl,
+      packageRoot,
+      platform: 'darwin',
+      arch: 'arm64',
+      env: {},
+      homeDir: '',
+      execFileSync: (() => 'bbl-go-tui 0.3.2') as any,
+    },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
@@ -626,6 +635,7 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
   assert.match(combined, /selected .*go-tui-darwin-arm64/)
   assert.match(combined, /missing .*clients\/go-tui\/bin\/go-tui/)
   assert.match(combined, /Go TUI binary found: .*go-tui-darwin-arm64/)
+  assert.match(combined, /Go TUI executable starts: bbl-go-tui 0\.3\.2/)
   assert.match(combined, /Nexus is healthy at http:\/\/nexus\.local/)
   assert.match(combined, /Server version: 0\.3\.2, supported Go TUI majors: \[0\]/)
   assert.match(combined, /Result: OK/)
@@ -674,7 +684,7 @@ test('bbl go --check: fails when no prebuilt AND no source directory', async () 
   assert.equal(report.exitCode, 1)
   const combined = report.lines.join('\n')
   assert.match(combined, /No prebuilt Go TUI binary AND no source directory/)
-  assert.match(combined, /Install a prebuilt via 'npm install -g @bablel\/babel-o'/)
+  assert.match(combined, /Install a prebuilt via 'npm install -g babel-o'/)
   assert.match(combined, /Result: FAIL/)
 })
 
@@ -693,7 +703,7 @@ test('bbl go --check: warns (does not fail) when Nexus is not healthy', async ()
       alt: true,
       binary: '/some/binary',
     },
-    { exists, fetch: fetchImpl },
+    { exists, fetch: fetchImpl, execFileSync: (() => 'bbl-go-tui 0.3.2') as any },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
@@ -720,12 +730,34 @@ test('bbl go --check: skips the compat INFO row when /v1/runtime/version returns
       alt: true,
       binary: '/some/binary',
     },
-    { exists, fetch: fetchImpl as unknown as typeof fetch },
+    { exists, fetch: fetchImpl as unknown as typeof fetch, execFileSync: (() => 'bbl-go-tui 0.3.2') as any },
   )
   const combined = report.lines.join('\n')
   assert.match(combined, /\/v1\/runtime\/version returned 500; compat check skipped\./)
   // The exit code stays 0 because no FAIL row was emitted.
   assert.equal(report.exitCode, 0)
+})
+
+test('bbl go --check: fails when selected Go TUI binary cannot execute', async () => {
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+      binary: '/some/binary',
+    },
+    {
+      exists: (p: string) => p === '/some/binary',
+      fetch: async () => new Response('ok', { status: 200 }),
+      execFileSync: (() => {
+        throw new Error('spawn EACCES')
+      }) as any,
+    },
+  )
+  const combined = report.lines.join('\n')
+  assert.equal(report.exitCode, 1)
+  assert.match(combined, /Go TUI executable did not start with --version: spawn EACCES/)
+  assert.match(combined, /Result: FAIL/)
 })
 
 /**

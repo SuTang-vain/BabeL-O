@@ -25,9 +25,11 @@ test('install.sh validates and atomically installs a downloaded binary', async (
 
   assert.equal(result.code, 0, result.stderr + result.stdout)
   const installed = await readFile(join(fixture.installDir, 'bbl'))
-  assert.equal(installed.subarray(0, 4).toString('hex'), '7f454c46')
+  assert.match(installed.toString('utf8'), /--check/)
   const goTui = await readFile(join(fixture.homeDir, '.local/share/babel-o/bin/go-tui-darwin-arm64'))
-  assert.equal(goTui.subarray(0, 4).toString('hex'), 'cffaedfe')
+  assert.match(goTui.toString('utf8'), /bbl-go-tui 0\.3\.0/)
+  assert.match(result.stdout, /Running install self-check/)
+  assert.match(result.stdout, /Result: OK/)
 })
 
 async function createFixture(mode: '404' | 'success') {
@@ -48,11 +50,34 @@ fi
 `)
 
   const payload = mode === 'success'
-    ? Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46]), Buffer.alloc(64, 0)])
+    ? Buffer.from(`#!/bin/sh
+if [ "$1" = "go" ] && [ "$2" = "--check" ] && [ "$3" = "--no-start-nexus" ]; then
+  if [ -n "$BABEL_O_GO_TUI_BINARY" ] && [ -x "$BABEL_O_GO_TUI_BINARY" ]; then
+    echo "[OK] Go TUI binary found: $BABEL_O_GO_TUI_BINARY"
+    echo "Result: OK"
+    exit 0
+  fi
+  echo "[FAIL] Go TUI binary missing" >&2
+  exit 1
+fi
+if [ "$1" = "--version" ]; then
+  echo "0.3.0"
+  exit 0
+fi
+echo "unexpected bbl args: $*" >&2
+exit 1
+`)
     : Buffer.from('Not Found')
   const payloadPath = join(root, 'payload.bin')
   await writeFile(payloadPath, payload)
-  const goTuiPayload = Buffer.concat([Buffer.from([0xcf, 0xfa, 0xed, 0xfe]), Buffer.alloc(64, 0)])
+  const goTuiPayload = Buffer.from(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bbl-go-tui 0.3.0"
+  exit 0
+fi
+echo "unexpected go-tui args: $*" >&2
+exit 1
+`)
   const goTuiPayloadPath = join(root, 'go-tui-payload.bin')
   await writeFile(goTuiPayloadPath, goTuiPayload)
 

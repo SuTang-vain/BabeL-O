@@ -16,6 +16,7 @@
 - [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md): Go TUI session 可观测性 / Embedded Nexus 持久化治理规划。基于 `session_go_1781146359507755000` 复盘失败的真实样本：session ID 双轨命名（`session_go_<unixnano>` 客户端 vs `session_<uuid>` 服务端）+ embedded Nexus 走 `MemoryStorage` 进程退出即丢 + 无 session-start 日志。当前源码核对状态：Phase 0 `bbl inspect-session` 已收口；Phase 1 server UUID payload 与本地 client→server 映射日志部分落地；Phase 2 生产默认 SQLite 部分落地；Phase 3 Nexus startup log 与 client-log reverse-resolve 部分落地；Phase 4 跨文档同步与 PTY/e2e 守门仍需补齐。
 - [task-adaptive-recoverable-timeout-plan.md](./task-adaptive-recoverable-timeout-plan.md): Task-adaptive recoverable timeout 规划；基于 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3`，将普通 timeout 从 fatal request cutoff 拆成模型可见 soft deadline 与系统兜底 hard watchdog。
 - [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md): Go TUI transcript Markdown 渲染优化规划；对照 Crush 的 Glamour + Chroma + Lip Gloss 链路，建议 assistant-only renderer façade、compile spike、代码块高亮与 benchmark gate 渐进落地。
+- [distribution-strategy-plan.md](./distribution-strategy-plan.md): 分发策略规划；短期以同一 `v*` release 资产 + installer 自检稳住安装链路，中期补 npm 普通 Node wrapper + Go TUI asset 下载，长期将生产 launcher 从 Node.js SEA 迁移到 Go launcher。
 
 ## 维护规则
 
