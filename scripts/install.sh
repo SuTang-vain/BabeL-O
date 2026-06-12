@@ -135,7 +135,14 @@ run_self_check() {
 
   if [ -n "$INSTALLED_GO_TUI_PATH" ]; then
     SELF_CHECK_TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.self-check.XXXXXX")"
-    if BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$TARGET_PATH" go --check --no-start-nexus >"$SELF_CHECK_TMP_PATH" 2>&1; then
+    if "$INSTALLED_GO_TUI_PATH" --version >"$SELF_CHECK_TMP_PATH" 2>&1; then
+      echo "Go TUI executable starts: $(head -n 1 "$SELF_CHECK_TMP_PATH")"
+    else
+      cat "$SELF_CHECK_TMP_PATH" >&2
+      fail "Install self-check failed: installed Go TUI binary cannot start."
+    fi
+
+    if NODE_NO_WARNINGS=1 BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$TARGET_PATH" go --check --no-start-nexus >"$SELF_CHECK_TMP_PATH" 2>&1; then
       cat "$SELF_CHECK_TMP_PATH"
       rm -f "$SELF_CHECK_TMP_PATH"
       SELF_CHECK_TMP_PATH=""

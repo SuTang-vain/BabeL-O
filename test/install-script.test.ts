@@ -29,10 +29,20 @@ test('install.sh validates and atomically installs a downloaded binary', async (
   const goTui = await readFile(join(fixture.homeDir, '.local/share/babel-o/bin/go-tui-darwin-arm64'))
   assert.match(goTui.toString('utf8'), /bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Running install self-check/)
+  assert.match(result.stdout, /Go TUI executable starts: bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Result: OK/)
 })
 
-async function createFixture(mode: '404' | 'success') {
+test('install.sh fails self-check when downloaded Go TUI cannot execute', async () => {
+  const fixture = await createFixture('bad-go-tui')
+
+  const result = await runInstaller(fixture)
+
+  assert.notEqual(result.code, 0)
+  assert.match(result.stderr + result.stdout, /installed Go TUI binary cannot start/)
+})
+
+async function createFixture(mode: '404' | 'success' | 'bad-go-tui') {
   const root = await mkdtemp(join(tmpdir(), 'babel-o-install-'))
   const binDir = join(root, 'bin')
   const installDir = join(root, 'install')
@@ -49,9 +59,13 @@ else
 fi
 `)
 
-  const payload = mode === 'success'
+  const payload = mode !== '404'
     ? Buffer.from(`#!/bin/sh
 if [ "$1" = "go" ] && [ "$2" = "--check" ] && [ "$3" = "--no-start-nexus" ]; then
+  if [ "\${NODE_NO_WARNINGS:-}" != "1" ]; then
+    echo "NODE_NO_WARNINGS was not set for installer self-check" >&2
+    exit 1
+  fi
   if [ -n "$BABEL_O_GO_TUI_BINARY" ] && [ -x "$BABEL_O_GO_TUI_BINARY" ]; then
     echo "[OK] Go TUI binary found: $BABEL_O_GO_TUI_BINARY"
     echo "Result: OK"
@@ -70,7 +84,15 @@ exit 1
     : Buffer.from('Not Found')
   const payloadPath = join(root, 'payload.bin')
   await writeFile(payloadPath, payload)
-  const goTuiPayload = Buffer.from(`#!/bin/sh
+  const goTuiPayload = mode === 'bad-go-tui'
+    ? Buffer.from(`#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "dyld: incompatible architecture" >&2
+  exit 126
+fi
+exit 1
+`)
+    : Buffer.from(`#!/bin/sh
 if [ "$1" = "--version" ]; then
   echo "bbl-go-tui 0.3.0"
   exit 0

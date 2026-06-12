@@ -426,6 +426,41 @@ test('collectGoTuiBinaryCandidates omits XDG entry when homeDir is missing', () 
   ])
 })
 
+test('collectGoTuiBinaryCandidates deduplicates env and XDG paths while preserving order', () => {
+  const xdgPath = '/home/user/.local/share/babel-o/bin/go-tui-darwin-arm64'
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: undefined, sourceDir: '/src' },
+    platform: 'darwin',
+    arch: 'arm64',
+    packageRoot: '/repo',
+    sourceDir: '/src',
+    env: { BABEL_O_GO_TUI_BINARY: xdgPath },
+    homeDir: '/home/user',
+    includePackageCandidates: false,
+  })
+
+  assert.deepEqual(candidates, [xdgPath])
+})
+
+test('collectGoTuiBinaryCandidates can suppress invalid package-root candidates', () => {
+  const candidates = collectGoTuiBinaryCandidates({
+    options: { binary: undefined, sourceDir: '/Users/clients/go-tui' },
+    platform: 'darwin',
+    arch: 'arm64',
+    packageRoot: '/Users',
+    sourceDir: '/Users/clients/go-tui',
+    env: {},
+    homeDir: '/Users/sutang',
+    includePackageCandidates: false,
+  })
+
+  assert.deepEqual(candidates, [
+    '/Users/sutang/.local/share/babel-o/bin/go-tui-darwin-arm64',
+  ])
+  assert.doesNotMatch(candidates.join('\n'), /\/Users\/bin\/go-tui/)
+  assert.doesNotMatch(candidates.join('\n'), /\/Users\/clients\/go-tui/)
+})
+
 test('platformSuffix returns the canonical platform-arch segment', () => {
   assert.equal(platformSuffix('darwin', 'arm64'), 'darwin-arm64')
   assert.equal(platformSuffix('darwin', 'x64'), 'darwin-x64')
@@ -638,6 +673,7 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
   assert.match(combined, /Go TUI executable starts: bbl-go-tui 0\.3\.2/)
   assert.match(combined, /Nexus is healthy at http:\/\/nexus\.local/)
   assert.match(combined, /Server version: 0\.3\.2, supported Go TUI majors: \[0\]/)
+  assert.match(combined, /Go TUI major 0 is compatible with this Nexus server\./)
   assert.match(combined, /Result: OK/)
 })
 
@@ -708,8 +744,37 @@ test('bbl go --check: warns (does not fail) when Nexus is not healthy', async ()
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
   assert.match(combined, /Nexus is not healthy at http:\/\/127\.0\.0\.1:3000/)
-  assert.match(combined, /The launcher will start a local Nexus automatically/)
+  assert.match(combined, /This check does not start Nexus/)
+  assert.match(combined, /A normal 'bbl go' launch may try to start a local Nexus/)
   assert.match(combined, /Result: OK/)
+})
+
+test('bbl go --check: omits invalid SEA package-root candidates from the report', async () => {
+  const xdgPath = '/Users/sutang/.local/share/babel-o/bin/go-tui-darwin-arm64'
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      packageRoot: '/Users',
+      platform: 'darwin',
+      arch: 'arm64',
+      env: { BABEL_O_GO_TUI_BINARY: xdgPath },
+      homeDir: '/Users/sutang',
+      exists: (p: string) => p === xdgPath,
+      fetch: async () => {
+        throw new Error('connection refused')
+      },
+      execFileSync: (() => 'bbl-go-tui 0.3.2') as any,
+    },
+  )
+  const combined = report.lines.join('\n')
+  assert.equal(report.exitCode, 0)
+  assert.match(combined, new RegExp(`selected ${xdgPath}`))
+  assert.doesNotMatch(combined, /\/Users\/bin\/go-tui-darwin-arm64/)
+  assert.doesNotMatch(combined, /\/Users\/clients\/go-tui\/bin\/go-tui/)
 })
 
 test('bbl go --check: skips the compat INFO row when /v1/runtime/version returns 500', async () => {
@@ -758,6 +823,69 @@ test('bbl go --check: fails when selected Go TUI binary cannot execute', async (
   assert.equal(report.exitCode, 1)
   assert.match(combined, /Go TUI executable did not start with --version: spawn EACCES/)
   assert.match(combined, /Result: FAIL/)
+})
+
+test('bbl go --check: fails when Go TUI major is unsupported by healthy Nexus', async () => {
+  const fetchImpl = (url: string | URL | Request) => {
+    if (String(url).endsWith('/health')) {
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }
+    return Promise.resolve(new Response(
+      JSON.stringify({
+        serverVersion: '1.0.0',
+        goTuiCompatibility: { supportedMajors: [1] },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))
+  }
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+      binary: '/some/binary',
+    },
+    {
+      exists: (p: string) => p === '/some/binary',
+      fetch: fetchImpl as unknown as typeof fetch,
+      execFileSync: (() => 'bbl-go-tui 0.3.2') as any,
+    },
+  )
+  const combined = report.lines.join('\n')
+  assert.equal(report.exitCode, 1)
+  assert.match(combined, /Go TUI major 0 is not supported by this Nexus server/)
+  assert.match(combined, /Result: FAIL/)
+})
+
+test('bbl go --check: skips compat comparison when Go TUI version cannot be parsed', async () => {
+  const fetchImpl = (url: string | URL | Request) => {
+    if (String(url).endsWith('/health')) {
+      return Promise.resolve(new Response('ok', { status: 200 }))
+    }
+    return Promise.resolve(new Response(
+      JSON.stringify({
+        serverVersion: '1.0.0',
+        goTuiCompatibility: { supportedMajors: [1] },
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    ))
+  }
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+      binary: '/some/binary',
+    },
+    {
+      exists: (p: string) => p === '/some/binary',
+      fetch: fetchImpl as unknown as typeof fetch,
+      execFileSync: (() => 'development build') as any,
+    },
+  )
+  const combined = report.lines.join('\n')
+  assert.equal(report.exitCode, 0)
+  assert.match(combined, /Could not parse Go TUI major from --version output; compat check skipped\./)
 })
 
 /**

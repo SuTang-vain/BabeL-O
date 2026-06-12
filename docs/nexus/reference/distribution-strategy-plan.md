@@ -30,7 +30,8 @@ These changes are safe for the current release line and should be done before th
 4. Run an installer self-check after install:
 
 ```sh
-BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$INSTALL_DIR/bbl" go --check --no-start-nexus
+"$INSTALLED_GO_TUI_PATH" --version
+NODE_NO_WARNINGS=1 BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$INSTALL_DIR/bbl" go --check --no-start-nexus
 ```
 
 The self-check should be non-destructive: it verifies binary discovery and CLI startup without starting a Nexus server.
@@ -163,7 +164,7 @@ When the Go launcher lands:
 Immediate:
 
 - A release missing `go-tui-*` fails installation clearly.
-- `install.sh` runs `bbl go --check --no-start-nexus` by default.
+- `install.sh` directly probes the installed Go TUI executable with `--version`, then runs `bbl go --check --no-start-nexus` by default.
 - The installer can be smoke-tested with custom install dirs without touching the user's real `bbl`.
 
 npm:
@@ -178,4 +179,3 @@ Go launcher:
 - `bbl --version`, `bbl go --check --no-start-nexus`, and `bbl go` work without Node.
 - macOS arm64 binary is materially smaller than the current SEA plus Go TUI pair.
 - Existing CLI commands either run natively in the launcher or dispatch to an explicitly managed Node runtime with clear messaging. The final target is no hidden SEA dependency in the primary Go TUI path.
-

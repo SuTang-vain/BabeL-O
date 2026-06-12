@@ -147,6 +147,7 @@ export async function runGoTuiCheckReport(
 ): Promise<goTuiCheckReport> {
   const lines: string[] = []
   let hasFailure = false
+  let goTuiMajor: number | undefined
 
   lines.push('BabeL-O Go TUI install check')
   lines.push('=============================')
@@ -156,6 +157,13 @@ export async function runGoTuiCheckReport(
   const packageRoot = deps.packageRoot ?? defaultPackageRoot()
   const platform = deps.platform ?? process.platform
   const sourceDir = resolve(options.sourceDir ?? defaultGoTuiSourceDir(packageRoot))
+  const includePackageCandidates = packageRootLooksValid({
+    packageRoot,
+    sourceDir,
+    platform,
+    arch: deps.arch,
+    exists,
+  })
   const candidates = collectGoTuiBinaryCandidates({
     options,
     platform,
@@ -164,6 +172,7 @@ export async function runGoTuiCheckReport(
     sourceDir,
     env: deps.env ?? process.env,
     homeDir: deps.homeDir ?? homedir(),
+    includePackageCandidates,
   })
   let resolvedBinary: string | undefined
   for (const candidate of candidates) {
@@ -186,6 +195,7 @@ export async function runGoTuiCheckReport(
         stdio: ['ignore', 'pipe', 'pipe'],
       }).trim()
       lines.push(`[OK]      Go TUI executable starts: ${versionOutput || '--version returned no output'}`)
+      goTuiMajor = parseMajorVersion(versionOutput)
     } catch (error: any) {
       const message = error?.message ? String(error.message) : String(error)
       lines.push(`[FAIL]    Go TUI executable did not start with --version: ${message}`)
@@ -213,8 +223,8 @@ export async function runGoTuiCheckReport(
   } else {
     lines.push(
       `[WARN]    Nexus is not healthy at ${options.url}. ` +
-        `The launcher will start a local Nexus automatically (when --url is a localhost URL); ` +
-        `use --no-start-nexus to suppress that.`,
+        `This check does not start Nexus. A normal 'bbl go' launch may try to start a local Nexus ` +
+        `(when --url is a localhost URL); use --no-start-nexus to suppress that.`,
     )
   }
 
@@ -230,14 +240,22 @@ export async function runGoTuiCheckReport(
         }
         const serverVersion = body.serverVersion ?? 'unknown'
         const supported = body.goTuiCompatibility?.supportedMajors ?? []
-        // We don't have a way to read the Go TUI's own
-        // major at the launcher level (the launcher
-        // doesn't execute the binary). Report the
-        // server's declared support so the user can
-        // match it manually.
         lines.push(
           `[INFO]    Server version: ${serverVersion}, supported Go TUI majors: [${supported.join(', ')}]`,
         )
+        if (resolvedBinary) {
+          if (goTuiMajor === undefined) {
+            lines.push(`[INFO]    Could not parse Go TUI major from --version output; compat check skipped.`)
+          } else if (supported.length > 0 && !supported.includes(goTuiMajor)) {
+            lines.push(
+              `[FAIL]    Go TUI major ${goTuiMajor} is not supported by this Nexus server. ` +
+                `Supported majors: [${supported.join(', ')}].`,
+            )
+            hasFailure = true
+          } else if (supported.length > 0) {
+            lines.push(`[OK]      Go TUI major ${goTuiMajor} is compatible with this Nexus server.`)
+          }
+        }
       } else {
         lines.push(
           `[INFO]    Nexus is healthy but /v1/runtime/version returned ${response.status}; compat check skipped.`,
@@ -277,6 +295,13 @@ export function createGoTuiLaunchSpec(
   const packageRoot = deps.packageRoot ?? defaultPackageRoot()
   const sourceDir = resolve(options.sourceDir ?? defaultGoTuiSourceDir(packageRoot))
   const args = buildGoTuiArgs(options)
+  const includePackageCandidates = packageRootLooksValid({
+    packageRoot,
+    sourceDir,
+    platform,
+    arch: deps.arch,
+    exists,
+  })
   const candidates = collectGoTuiBinaryCandidates({
     options,
     platform,
@@ -285,6 +310,7 @@ export function createGoTuiLaunchSpec(
     sourceDir,
     env,
     homeDir: deps.homeDir ?? homedir(),
+    includePackageCandidates,
   })
   for (const candidate of candidates) {
     if (exists(candidate)) {
@@ -350,29 +376,40 @@ export function collectGoTuiBinaryCandidates(input: {
   sourceDir: string
   env: NodeJS.ProcessEnv
   homeDir?: string
+  includePackageCandidates?: boolean
 }): string[] {
   const candidates: string[] = []
+  const seen = new Set<string>()
+  const pushCandidate = (value: string | undefined) => {
+    if (!value) return
+    const resolved = resolve(value)
+    if (seen.has(resolved)) return
+    seen.add(resolved)
+    candidates.push(resolved)
+  }
   if (input.options.binary) {
-    candidates.push(resolve(input.options.binary))
+    pushCandidate(input.options.binary)
   }
   const envBinary = input.env.BABEL_O_GO_TUI_BINARY
   if (envBinary) {
-    candidates.push(resolve(envBinary))
+    pushCandidate(envBinary)
   }
   const packageEnvBinary = input.env.BABEL_O_GO_TUI_PACKAGE_BINARY
   if (packageEnvBinary) {
-    candidates.push(resolve(packageEnvBinary))
+    pushCandidate(packageEnvBinary)
   }
-  const packageBundled = join(
-    input.packageRoot,
-    'bin',
-    `go-tui-${platformSuffix(input.platform, input.arch)}`,
-  )
-  candidates.push(packageBundled)
-  // In-tree dev build (e.g. `make build` then `bbl go` from
-  // a source checkout). The Go TUI Makefile drops the
-  // binary at <sourceDir>/bin/go-tui.
-  candidates.push(defaultGoTuiBinary(input.sourceDir, input.platform))
+  if (input.includePackageCandidates !== false) {
+    const packageBundled = join(
+      input.packageRoot,
+      'bin',
+      `go-tui-${platformSuffix(input.platform, input.arch)}`,
+    )
+    pushCandidate(packageBundled)
+    // In-tree dev build (e.g. `make build` then `bbl go` from
+    // a source checkout). The Go TUI Makefile drops the
+    // binary at <sourceDir>/bin/go-tui.
+    pushCandidate(defaultGoTuiBinary(input.sourceDir, input.platform))
+  }
   if (input.homeDir) {
     const xdgLocal = join(
       input.homeDir,
@@ -382,7 +419,7 @@ export function collectGoTuiBinaryCandidates(input: {
       'bin',
       `go-tui-${platformSuffix(input.platform, input.arch)}`,
     )
-    candidates.push(xdgLocal)
+    pushCandidate(xdgLocal)
   }
   return candidates
 }
@@ -598,4 +635,26 @@ export function defaultGoTuiSourceDir(packageRoot = defaultPackageRoot()): strin
 
 export function defaultGoTuiBinary(sourceDir = defaultGoTuiSourceDir(), platform: NodeJS.Platform = process.platform): string {
   return join(sourceDir, 'bin', defaultGoTuiBinaryName(platform))
+}
+
+function packageRootLooksValid(input: {
+  packageRoot: string
+  sourceDir: string
+  platform: NodeJS.Platform
+  arch?: NodeJS.Architecture
+  exists: ExistsFn
+}): boolean {
+  return (
+    input.exists(join(input.packageRoot, 'package.json')) ||
+    input.exists(input.sourceDir) ||
+    input.exists(join(input.packageRoot, 'bin', `go-tui-${platformSuffix(input.platform, input.arch)}`)) ||
+    input.exists(defaultGoTuiBinary(input.sourceDir, input.platform))
+  )
+}
+
+function parseMajorVersion(versionOutput: string): number | undefined {
+  const match = versionOutput.match(/\b(?:v)?(\d+)\.\d+\.\d+\b/)
+  if (!match) return undefined
+  const parsed = Number(match[1])
+  return Number.isInteger(parsed) ? parsed : undefined
 }
