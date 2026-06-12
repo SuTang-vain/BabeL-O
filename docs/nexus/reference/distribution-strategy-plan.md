@@ -36,6 +36,13 @@ NODE_NO_WARNINGS=1 BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$INSTALL_DIR/
 
 The self-check should be non-destructive: it verifies binary discovery and CLI startup without starting a Nexus server.
 
+5. On macOS standalone installs, wrap the SEA payload with a small shell `bbl` launcher:
+   - Move the downloaded SEA binary to `bbl.sea`.
+   - Keep `bbl run`, `bbl chat`, `bbl sessions`, etc. delegated to `bbl.sea`.
+   - Handle `bbl go` in shell by starting local Nexus when needed, then `exec`ing the installed Go TUI directly.
+
+This is a short-term bridge for the v0.3.3 release line: it avoids the macOS Node SEA `child_process.spawn` path that can report `ENOENT` for a valid Go TUI Mach-O. It is not the final architecture; the Go launcher remains the target.
+
 Users can opt out only for debugging or partial CLI installs:
 
 ```sh
@@ -165,6 +172,7 @@ Immediate:
 
 - A release missing `go-tui-*` fails installation clearly.
 - `install.sh` directly probes the installed Go TUI executable with `--version`, then runs `bbl go --check --no-start-nexus` by default.
+- macOS curl installs launch `bbl go` through the shell wrapper and do not rely on SEA spawning the Go TUI Mach-O.
 - The installer can be smoke-tested with custom install dirs without touching the user's real `bbl`.
 
 npm:

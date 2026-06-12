@@ -40,6 +40,12 @@ export interface ManagedNexusLaunchSpec {
   managed: boolean
 }
 
+export interface GoTuiProcessSpec {
+  command: string
+  args: string[]
+  shellBridge: boolean
+}
+
 export function registerGoCommand(program: Command): void {
   program
     .command('go')
@@ -82,7 +88,8 @@ export function registerGoCommand(program: Command): void {
       }
       process.once('exit', cleanupManagedNexus)
 
-      const child = spawn(launch.command, launch.args, {
+      const processSpec = createGoTuiProcessSpec(launch)
+      const child = spawn(processSpec.command, processSpec.args, {
         cwd: launch.cwd,
         stdio: 'inherit',
         env: process.env,
@@ -189,10 +196,9 @@ export async function runGoTuiCheckReport(
   if (resolvedBinary) {
     lines.push(`[OK]      Go TUI binary found: ${resolvedBinary}`)
     try {
-      const versionOutput = (deps.execFileSync ?? execFileSync)(resolvedBinary, ['--version'], {
-        encoding: 'utf8',
-        timeout: 5_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
+      const versionOutput = execGoTuiVersionProbe(resolvedBinary, {
+        execFileSync: deps.execFileSync,
+        platform,
       }).trim()
       lines.push(`[OK]      Go TUI executable starts: ${versionOutput || '--version returned no output'}`)
       goTuiMajor = parseMajorVersion(versionOutput)
@@ -347,6 +353,47 @@ export function createGoTuiLaunchSpec(
     cwd: sourceDir,
     mode: 'go-run',
   }
+}
+
+export function createGoTuiProcessSpec(
+  launch: Pick<GoTuiLaunchSpec, 'command' | 'args' | 'mode'>,
+  platform: NodeJS.Platform = process.platform,
+): GoTuiProcessSpec {
+  if (platform === 'darwin' && launch.mode === 'binary') {
+    return {
+      command: '/bin/sh',
+      args: ['-c', 'exec "$0" "$@"', launch.command, ...launch.args],
+      shellBridge: true,
+    }
+  }
+
+  return {
+    command: launch.command,
+    args: launch.args,
+    shellBridge: false,
+  }
+}
+
+export function execGoTuiVersionProbe(
+  binary: string,
+  deps: {
+    execFileSync?: ExecFileSyncFn
+    platform?: NodeJS.Platform
+  } = {},
+): string {
+  const exec = deps.execFileSync ?? execFileSync
+  const launch: GoTuiLaunchSpec = {
+    command: binary,
+    args: ['--version'],
+    cwd: dirname(binary),
+    mode: 'binary',
+  }
+  const processSpec = createGoTuiProcessSpec(launch, deps.platform)
+  return exec(processSpec.command, processSpec.args, {
+    encoding: 'utf8',
+    timeout: 5_000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
 }
 
 // collectGoTuiBinaryCandidates returns the ordered list of

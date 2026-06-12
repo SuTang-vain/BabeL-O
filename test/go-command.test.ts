@@ -8,10 +8,12 @@ import {
   buildGoTuiArgs,
   collectGoTuiBinaryCandidates,
   createManagedNexusLaunchSpec,
+  createGoTuiProcessSpec,
   createGoTuiLaunchSpec,
   defaultGoTuiBinary,
   defaultGoTuiBinaryName,
   ensureNexusForGoTui,
+  execGoTuiVersionProbe,
   isLocalNexusUrl,
   isNexusHealthy,
   platformSuffix,
@@ -616,6 +618,65 @@ test('createGoTuiLaunchSpec errors with an actionable hint when explicit --binar
       ),
     /Go TUI binary not found.*Install a prebuilt via 'npm install -g/,
   )
+})
+
+test('createGoTuiProcessSpec bridges macOS binary launch through /bin/sh', () => {
+  const spec = createGoTuiProcessSpec(
+    {
+      command: '/Users/me/.local/share/babel-o/bin/go-tui-darwin-arm64',
+      args: ['--url', 'http://127.0.0.1:3000'],
+      mode: 'binary',
+    },
+    'darwin',
+  )
+
+  assert.deepEqual(spec, {
+    command: '/bin/sh',
+    args: [
+      '-c',
+      'exec "$0" "$@"',
+      '/Users/me/.local/share/babel-o/bin/go-tui-darwin-arm64',
+      '--url',
+      'http://127.0.0.1:3000',
+    ],
+    shellBridge: true,
+  })
+})
+
+test('createGoTuiProcessSpec keeps source fallback as direct go run', () => {
+  const spec = createGoTuiProcessSpec(
+    {
+      command: 'go',
+      args: ['run', './cmd/go-tui'],
+      mode: 'go-run',
+    },
+    'darwin',
+  )
+
+  assert.deepEqual(spec, {
+    command: 'go',
+    args: ['run', './cmd/go-tui'],
+    shellBridge: false,
+  })
+})
+
+test('execGoTuiVersionProbe uses the same macOS shell bridge as launch', () => {
+  const calls: Array<{ command: string; args: string[] }> = []
+  const output = execGoTuiVersionProbe('/go-tui', {
+    platform: 'darwin',
+    execFileSync: ((command: string, args: string[]) => {
+      calls.push({ command, args })
+      return 'bbl-go-tui 0.3.3'
+    }) as any,
+  })
+
+  assert.equal(output, 'bbl-go-tui 0.3.3')
+  assert.deepEqual(calls, [
+    {
+      command: '/bin/sh',
+      args: ['-c', 'exec "$0" "$@"', '/go-tui', '--version'],
+    },
+  ])
 })
 
 /**

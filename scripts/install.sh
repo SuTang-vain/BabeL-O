@@ -9,6 +9,7 @@ TMP_PATH=""
 GO_TUI_TMP_PATH=""
 SELF_CHECK_TMP_PATH=""
 INSTALLED_GO_TUI_PATH=""
+SEA_PAYLOAD_PATH=""
 
 fail() {
   echo "Error: $*" >&2
@@ -123,6 +124,174 @@ validate_binary() {
   fi
 
   fail "Downloaded file is not a recognized executable binary."
+}
+
+install_shell_launcher() {
+  if [ -z "$INSTALLED_GO_TUI_PATH" ]; then
+    return 0
+  fi
+  if [ "$OS" != "darwin" ]; then
+    return 0
+  fi
+
+  SEA_PAYLOAD_PATH="$TARGET_PATH.sea"
+  mv "$TARGET_PATH" "$SEA_PAYLOAD_PATH"
+  cat > "$TARGET_PATH" <<EOF
+#!/bin/bash
+set -euo pipefail
+
+SEA_PAYLOAD="$SEA_PAYLOAD_PATH"
+GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH"
+
+have() {
+  command -v "\$1" >/dev/null 2>&1
+}
+
+is_local_url() {
+  case "\$1" in
+    http://127.0.0.1:*|http://localhost:*|http://[::1]:*) return 0 ;;
+    ws://127.0.0.1:*|ws://localhost:*|ws://[::1]:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+url_port() {
+  printf '%s' "\$1" | sed -E 's#^[a-z]+://(\\[[^]]+\\]|[^:/]+):([0-9]+).*\$#\\2#'
+}
+
+health_url() {
+  printf '%s' "\$1" | sed -E 's#^ws:#http:#; s#^wss:#https:#; s#/*\$#/health#'
+}
+
+nexus_healthy() {
+  local probe_url
+  probe_url="\$(health_url "\$1")"
+  if have curl; then
+    curl -fsS --max-time 1 "\$probe_url" >/dev/null 2>&1
+  elif have wget; then
+    wget -q --timeout=1 --spider "\$probe_url" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+wait_for_nexus() {
+  local wait_url
+  local i
+  wait_url="\$1"
+  i=0
+  while [ "\$i" -lt 80 ]; do
+    if nexus_healthy "\$wait_url"; then
+      return 0
+    fi
+    sleep 0.1
+    i=\$((i + 1))
+  done
+  return 1
+}
+
+run_go_tui() {
+  local url
+  local cwd
+  local start_nexus
+  local allowed_tools
+  local go_args
+  url="http://127.0.0.1:3000"
+  cwd="\${BABEL_O_LAUNCH_CWD:-\$(pwd)}"
+  start_nexus=1
+  allowed_tools="\${NEXUS_ALLOWED_TOOLS:-*}"
+  go_args=()
+
+  while [ "\$#" -gt 0 ]; do
+    case "\$1" in
+      --url)
+        url="\${2:-}"
+        shift 2
+        ;;
+      --url=*)
+        url="\${1#--url=}"
+        shift
+        ;;
+      --cwd)
+        cwd="\${2:-}"
+        shift 2
+        ;;
+      --cwd=*)
+        cwd="\${1#--cwd=}"
+        shift
+        ;;
+      --no-start-nexus)
+        start_nexus=0
+        shift
+        ;;
+      --start-nexus)
+        start_nexus=1
+        shift
+        ;;
+      --allowed-tools)
+        allowed_tools="\${2:-}"
+        shift 2
+        ;;
+      --allowed-tools=*)
+        allowed_tools="\${1#--allowed-tools=}"
+        shift
+        ;;
+      --binary)
+        shift 2
+        ;;
+      --binary=*|--source-dir=*)
+        shift
+        ;;
+      --source-dir)
+        shift 2
+        ;;
+      --check)
+        BABEL_O_GO_TUI_BINARY="\$GO_TUI_BINARY" NODE_NO_WARNINGS=1 exec "\$SEA_PAYLOAD" go --check --no-start-nexus --url "\$url" --cwd "\$cwd"
+        ;;
+      *)
+        go_args+=("\$1")
+        shift
+        ;;
+    esac
+  done
+
+  if ! nexus_healthy "\$url"; then
+    if [ "\$start_nexus" = "1" ] && is_local_url "\$url"; then
+      local port
+      port="\$(url_port "\$url")"
+      if ! printf '%s' "\$port" | grep -Eq '^[0-9]+\$'; then
+        port="3000"
+      fi
+      NEXUS_HOST="127.0.0.1" NEXUS_PORT="\$port" BABEL_O_WORKSPACE="\$cwd" NEXUS_ALLOWED_TOOLS="\$allowed_tools" NODE_NO_WARNINGS=1 "\$SEA_PAYLOAD" __server >/tmp/babel-o-nexus.\$\$.log 2>&1 &
+      local nexus_pid
+      nexus_pid="\$!"
+      cleanup() {
+        kill "\$nexus_pid" >/dev/null 2>&1 || true
+      }
+      trap cleanup EXIT INT TERM
+      if ! wait_for_nexus "\$url"; then
+        cat /tmp/babel-o-nexus.\$\$.log >&2 2>/dev/null || true
+        echo "Error: timed out waiting for Nexus health at \$url" >&2
+        exit 1
+      fi
+    else
+      echo "Error: Nexus is not healthy at \$url. Start Nexus first or use a localhost URL with --start-nexus." >&2
+      exit 1
+    fi
+  fi
+
+  exec "\$GO_TUI_BINARY" --url "\$url" --cwd "\$cwd" "\${go_args[@]}"
+}
+
+if [ "\${1:-}" = "go" ]; then
+  shift
+  run_go_tui "\$@"
+fi
+
+exec "\$SEA_PAYLOAD" "\$@"
+EOF
+  chmod +x "$TARGET_PATH"
+  echo "Installed shell launcher to avoid the macOS Node SEA spawn path for 'bbl go'."
 }
 
 run_self_check() {
@@ -283,6 +452,7 @@ if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
   fi
 fi
 
+install_shell_launcher
 run_self_check
 
 if [ "$PATH_SUGGESTION" = true ]; then

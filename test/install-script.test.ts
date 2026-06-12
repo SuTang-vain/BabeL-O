@@ -25,12 +25,33 @@ test('install.sh validates and atomically installs a downloaded binary', async (
 
   assert.equal(result.code, 0, result.stderr + result.stdout)
   const installed = await readFile(join(fixture.installDir, 'bbl'))
-  assert.match(installed.toString('utf8'), /--check/)
+  assert.match(installed.toString('utf8'), /SEA_PAYLOAD=/)
   const goTui = await readFile(join(fixture.homeDir, '.local/share/babel-o/bin/go-tui-darwin-arm64'))
   assert.match(goTui.toString('utf8'), /bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Running install self-check/)
   assert.match(result.stdout, /Go TUI executable starts: bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Result: OK/)
+})
+
+test('install.sh wrapper launches Go TUI directly for bbl go', async () => {
+  const fixture = await createFixture('success')
+  const result = await runInstaller(fixture)
+  assert.equal(result.code, 0, result.stderr + result.stdout)
+
+  const launch = await runInstalledBbl(fixture, [
+    'go',
+    '--no-start-nexus',
+    '--url',
+    'http://127.0.0.1:3000',
+    '--cwd',
+    '/workspace',
+    '--session',
+    'session_test',
+  ])
+
+  assert.equal(launch.code, 0, launch.stderr + launch.stdout)
+  assert.match(launch.stdout, /GO_TUI_LAUNCHED --url http:\/\/127\.0\.0\.1:3000 --cwd \/workspace --session session_test/)
+  assert.doesNotMatch(launch.stderr, /SEA go path should not run/)
 })
 
 test('install.sh fails self-check when downloaded Go TUI cannot execute', async () => {
@@ -74,6 +95,14 @@ if [ "$1" = "go" ] && [ "$2" = "--check" ] && [ "$3" = "--no-start-nexus" ]; the
   echo "[FAIL] Go TUI binary missing" >&2
   exit 1
 fi
+if [ "$1" = "go" ]; then
+  echo "SEA go path should not run" >&2
+  exit 77
+fi
+if [ "$1" = "__server" ]; then
+  echo "fixture server started" >&2
+  while true; do sleep 1; done
+fi
 if [ "$1" = "--version" ]; then
   echo "0.3.0"
   exit 0
@@ -97,8 +126,8 @@ if [ "$1" = "--version" ]; then
   echo "bbl-go-tui 0.3.0"
   exit 0
 fi
-echo "unexpected go-tui args: $*" >&2
-exit 1
+echo "GO_TUI_LAUNCHED $*"
+exit 0
 `)
   const goTuiPayloadPath = join(root, 'go-tui-payload.bin')
   await writeFile(goTuiPayloadPath, goTuiPayload)
@@ -115,6 +144,10 @@ if printf '%s' "$args" | grep -Eq -- '(^| )-[A-Za-z]*I[A-Za-z]*( |$)'; then
 fi
 if [ "$1" = "-fsSL" ]; then
   printf '{"tag_name":"v0.3.0"}'
+  exit 0
+fi
+if printf '%s' "$args" | grep -q -- '/health'; then
+  printf 'ok'
   exit 0
 fi
 out=""
@@ -148,6 +181,23 @@ async function runInstaller(fixture: { binDir: string; installDir: string; homeD
         PATH: `${fixture.binDir}:${process.env.PATH ?? ''}`,
         BBL_INSTALL_DIR: fixture.installDir,
         BBL_VERSION: 'v0.3.0',
+      },
+    })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', chunk => { stdout += String(chunk) })
+    child.stderr.on('data', chunk => { stderr += String(chunk) })
+    child.on('close', code => resolve({ code, stdout, stderr }))
+  })
+}
+
+async function runInstalledBbl(fixture: { binDir: string; installDir: string; homeDir: string }, args: string[]) {
+  return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+    const child = spawn(join(fixture.installDir, 'bbl'), args, {
+      env: {
+        ...process.env,
+        HOME: fixture.homeDir,
+        PATH: `${fixture.binDir}:${process.env.PATH ?? ''}`,
       },
     })
     let stdout = ''
