@@ -11,9 +11,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
@@ -25,8 +27,39 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          npm test 2>&1 | tee /tmp/babel-o-npm-test.log
+          npm test 2>&1 | tee "$RUNNER_TEMP/babel-o-npm-test.log"
       - name: Print npm test failure tail
         if: failure()
-        run: tail -200 /tmp/babel-o-npm-test.log || true
+        shell: bash
+        run: |
+          test_log="$RUNNER_TEMP/babel-o-npm-test.log"
+          tail_log="$RUNNER_TEMP/babel-o-npm-test-tail.log"
+          if [ ! -f "$test_log" ]; then
+            echo "::error title=npm test failed::npm test failed before writing $test_log"
+            exit 0
+          fi
+
+          {
+            echo "## npm test failure tail"
+            echo
+            echo '```text'
+            tail -200 "$test_log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          tail -80 "$test_log" > "$tail_log"
+          {
+            echo "npm test failed. Last 80 log lines:"
+            cat "$tail_log"
+          } | sed 's/%/%25/g; s/\r/%0D/g; s/$/%0A/' | tr -d '\n' | sed 's/^/::error title=npm test failed::/'
+          echo
+      - name: Upload npm test log
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: npm-test-log
+          path: |
+            ${{ runner.temp }}/babel-o-npm-test.log
+            ${{ runner.temp }}/babel-o-npm-test-tail.log
+          if-no-files-found: ignore
       - run: npm run build:smoke
