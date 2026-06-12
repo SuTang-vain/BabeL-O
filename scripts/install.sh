@@ -11,7 +11,93 @@ SELF_CHECK_TMP_PATH=""
 INSTALLED_GO_TUI_PATH=""
 SEA_PAYLOAD_PATH=""
 
+supports_pretty_output() {
+  [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ "${BBL_INSTALL_PLAIN:-0}" != "1" ]
+}
+
+if supports_pretty_output; then
+  BOLD="$(printf '\033[1m')"
+  DIM="$(printf '\033[2m')"
+  RESET="$(printf '\033[0m')"
+  GREEN="$(printf '\033[32m')"
+  YELLOW="$(printf '\033[33m')"
+  RED="$(printf '\033[31m')"
+  CYAN="$(printf '\033[36m')"
+  CLEAR_LINE="$(printf '\033[2K')"
+else
+  BOLD=""
+  DIM=""
+  RESET=""
+  GREEN=""
+  YELLOW=""
+  RED=""
+  CYAN=""
+  CLEAR_LINE=""
+fi
+
+print_header() {
+  printf '\n'
+  printf '%sBabeL-O%s %sinstaller%s\n' "$BOLD" "$RESET" "$CYAN" "$RESET"
+  printf '%sStandalone CLI + Go TUI%s\n\n' "$DIM" "$RESET"
+}
+
+log_kv() {
+  printf '  %s%s:%s %s\n' "$DIM" "$1" "$RESET" "$2"
+}
+
+log_info() {
+  printf '  %s%s%s\n' "$DIM" "$*" "$RESET"
+}
+
+log_ok() {
+  printf '  %s[ok]%s %s\n' "$GREEN" "$RESET" "$*"
+}
+
+log_warn() {
+  printf '  %s[warn]%s %s\n' "$YELLOW" "$RESET" "$*"
+}
+
+log_error() {
+  printf '  %s[error]%s %s\n' "$RED" "$RESET" "$*" >&2
+}
+
+run_with_spinner() {
+  label="$1"
+  shift
+
+  if ! supports_pretty_output; then
+    log_info "$label"
+    "$@"
+    return $?
+  fi
+
+  log_path="$(mktemp "${TMPDIR:-/tmp}/babel-o-install.XXXXXX")"
+  "$@" >"$log_path" 2>&1 &
+  pid="$!"
+  frames=("-" "\\" "|" "/")
+  i=0
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    frame="${frames[$((i % 4))]}"
+    printf '\r%s  %s%s%s %s' "$CLEAR_LINE" "$CYAN" "$frame" "$RESET" "$label"
+    sleep 0.1
+    i=$((i + 1))
+  done
+
+  if wait "$pid"; then
+    printf '\r%s  %s[ok]%s %s\n' "$CLEAR_LINE" "$GREEN" "$RESET" "$label"
+    rm -f "$log_path"
+    return 0
+  fi
+
+  status="$?"
+  printf '\r%s  %s[fail]%s %s\n' "$CLEAR_LINE" "$RED" "$RESET" "$label"
+  cat "$log_path" >&2
+  rm -f "$log_path"
+  return "$status"
+}
+
 fail() {
+  log_error "$*"
   echo "Error: $*" >&2
   exit 1
 }
@@ -52,9 +138,9 @@ download_to() {
   url="$1"
   output="$2"
   if have curl; then
-    curl -fL --retry 3 --connect-timeout 15 --output "$output" "$url"
+    curl -fL --silent --show-error --retry 3 --connect-timeout 15 --output "$output" "$url"
   elif have wget; then
-    wget --tries=3 --timeout=30 --output-document="$output" "$url"
+    wget -q --tries=3 --timeout=30 --output-document="$output" "$url"
   else
     fail "curl or wget is required to run this installer."
   fi
@@ -319,12 +405,12 @@ fi
 exec "\$SEA_PAYLOAD" "\$@"
 EOF
   chmod +x "$TARGET_PATH"
-  echo "Installed shell launcher to avoid the macOS Node SEA spawn path for 'bbl go'."
+  log_ok "Shell launcher installed for macOS bbl go startup."
 }
 
 run_self_check() {
   if [ "${BBL_INSTALL_SMOKE:-1}" = "0" ]; then
-    echo "Skipping install self-check because BBL_INSTALL_SMOKE=0."
+    log_warn "Skipping install self-check because BBL_INSTALL_SMOKE=0."
     return 0
   fi
 
@@ -333,7 +419,7 @@ run_self_check() {
   if [ -n "$INSTALLED_GO_TUI_PATH" ]; then
     SELF_CHECK_TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.self-check.XXXXXX")"
     if "$INSTALLED_GO_TUI_PATH" --version >"$SELF_CHECK_TMP_PATH" 2>&1; then
-      echo "Go TUI executable starts: $(head -n 1 "$SELF_CHECK_TMP_PATH")"
+      log_ok "Go TUI executable starts: $(head -n 1 "$SELF_CHECK_TMP_PATH")"
     else
       cat "$SELF_CHECK_TMP_PATH" >&2
       fail "Install self-check failed: installed Go TUI binary cannot start."
@@ -343,7 +429,7 @@ run_self_check() {
       cat "$SELF_CHECK_TMP_PATH"
       rm -f "$SELF_CHECK_TMP_PATH"
       SELF_CHECK_TMP_PATH=""
-      echo "BabeL-O is ready. Run 'bbl go' to start the Go TUI."
+      log_ok "BabeL-O is ready. Run 'bbl go' to start the Go TUI."
       return 0
     fi
 
@@ -352,14 +438,14 @@ run_self_check() {
   fi
 
   if "$TARGET_PATH" --version >/dev/null 2>&1; then
-    echo "BabeL-O CLI is installed. Go TUI self-check was skipped because BBL_INSTALL_GO_TUI=0."
+    log_ok "BabeL-O CLI is installed. Go TUI self-check was skipped because BBL_INSTALL_GO_TUI=0."
     return 0
   fi
 
   fail "Install self-check failed: installed bbl binary cannot start."
 }
 
-echo "=== BabeL-O Standalone Binary Installer ==="
+print_header
 
 if [ -n "${BBL_VERSION:-}" ]; then
   VERSION="$BBL_VERSION"
@@ -429,10 +515,10 @@ TARGET_PATH="$INSTALL_DIR/bbl"
 TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.download.XXXXXX")"
 EXPECTED_SIZE="$(content_length "$DOWNLOAD_URL" || true)"
 
-echo "Version: $VERSION"
-echo "Detected System: $OS ($ARCH)"
-echo "Downloading binary from: $DOWNLOAD_URL"
-echo "Target Installation Path: $TARGET_PATH"
+log_kv "Version" "$VERSION"
+log_kv "System" "$OS ($ARCH)"
+log_kv "CLI asset" "$BINARY_NAME"
+log_kv "Install path" "$TARGET_PATH"
 
 if [ -z "$BINARY_NAME" ]; then
   fail "No standalone bbl binary is published for $OS ($ARCH). Install from npm/source, or use a supported release platform."
@@ -442,15 +528,13 @@ if ! asset_exists "$DOWNLOAD_URL"; then
   fail "Release asset not found: $DOWNLOAD_URL. The $VERSION release may not have finished publishing binaries yet."
 fi
 
-download_to "$DOWNLOAD_URL" "$TMP_PATH"
-validate_binary "$TMP_PATH" "$EXPECTED_SIZE"
+run_with_spinner "Downloading BabeL-O CLI" download_to "$DOWNLOAD_URL" "$TMP_PATH" || fail "Failed to download BabeL-O CLI from $DOWNLOAD_URL."
+run_with_spinner "Validating BabeL-O CLI" validate_binary "$TMP_PATH" "$EXPECTED_SIZE" || fail "Downloaded BabeL-O CLI failed validation."
 chmod +x "$TMP_PATH"
 mv "$TMP_PATH" "$TARGET_PATH"
 TMP_PATH=""
 
-echo "----------------------------------------"
-echo "BabeL-O installed successfully to: $TARGET_PATH"
-echo "----------------------------------------"
+log_ok "BabeL-O CLI installed: $TARGET_PATH"
 
 if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
   GO_TUI_INSTALL_DIR="${BBL_GO_TUI_INSTALL_DIR:-$HOME/.local/share/babel-o/bin}"
@@ -466,15 +550,15 @@ if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
   if asset_exists "$GO_TUI_DOWNLOAD_URL"; then
     GO_TUI_TMP_PATH="$(mktemp "$GO_TUI_INSTALL_DIR/go-tui.download.XXXXXX")"
     GO_TUI_EXPECTED_SIZE="$(content_length "$GO_TUI_DOWNLOAD_URL" || true)"
-    echo "Downloading Go TUI binary from: $GO_TUI_DOWNLOAD_URL"
-    echo "Go TUI Installation Path: $GO_TUI_TARGET_PATH"
-    download_to "$GO_TUI_DOWNLOAD_URL" "$GO_TUI_TMP_PATH"
-    validate_binary "$GO_TUI_TMP_PATH" "$GO_TUI_EXPECTED_SIZE"
+    log_kv "Go TUI asset" "$GO_TUI_BINARY_NAME"
+    log_kv "Go TUI path" "$GO_TUI_TARGET_PATH"
+    run_with_spinner "Downloading Go TUI" download_to "$GO_TUI_DOWNLOAD_URL" "$GO_TUI_TMP_PATH" || fail "Failed to download Go TUI from $GO_TUI_DOWNLOAD_URL."
+    run_with_spinner "Validating Go TUI" validate_binary "$GO_TUI_TMP_PATH" "$GO_TUI_EXPECTED_SIZE" || fail "Downloaded Go TUI failed validation."
     chmod +x "$GO_TUI_TMP_PATH"
     mv "$GO_TUI_TMP_PATH" "$GO_TUI_TARGET_PATH"
     GO_TUI_TMP_PATH=""
     INSTALLED_GO_TUI_PATH="$GO_TUI_TARGET_PATH"
-    echo "Go TUI installed successfully to: $GO_TUI_TARGET_PATH"
+    log_ok "Go TUI installed: $GO_TUI_TARGET_PATH"
   else
     fail "Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL. The $VERSION release may not have finished publishing Go TUI binaries yet. Set BBL_INSTALL_GO_TUI=0 to install only the bbl CLI."
   fi
@@ -485,11 +569,13 @@ run_self_check
 
 if [ "$PATH_SUGGESTION" = true ]; then
   if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
-    echo "Warning: $INSTALL_DIR is not in your system PATH."
+    log_warn "$INSTALL_DIR is not in your system PATH."
     echo "Please add it to your shell configuration file, for example ~/.bashrc or ~/.zshrc:"
     echo "  export PATH=\"\$PATH:$INSTALL_DIR\""
     echo "Then restart your terminal or run: source ~/.zshrc"
   fi
 fi
 
+printf '\n'
+log_ok "Install complete."
 echo "To start chatting, run: bbl go"
