@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import process from 'node:process'
@@ -137,7 +138,9 @@ export async function runGoTuiCheckReport(
     exists?: ExistsFn
     packageRoot?: string
     platform?: NodeJS.Platform
+    arch?: NodeJS.Architecture
     env?: NodeJS.ProcessEnv
+    homeDir?: string
   } = {},
 ): Promise<goTuiCheckReport> {
   const lines: string[] = []
@@ -154,9 +157,11 @@ export async function runGoTuiCheckReport(
   const candidates = collectGoTuiBinaryCandidates({
     options,
     platform,
+    arch: deps.arch,
     packageRoot,
     sourceDir,
     env: deps.env ?? process.env,
+    homeDir: deps.homeDir ?? homedir(),
   })
   let resolvedBinary: string | undefined
   for (const candidate of candidates) {
@@ -247,6 +252,7 @@ export function createGoTuiLaunchSpec(
     exists?: ExistsFn
     packageRoot?: string
     platform?: NodeJS.Platform
+    arch?: NodeJS.Architecture
     env?: NodeJS.ProcessEnv
     homeDir?: string
   } = {},
@@ -260,10 +266,11 @@ export function createGoTuiLaunchSpec(
   const candidates = collectGoTuiBinaryCandidates({
     options,
     platform,
+    arch: deps.arch,
     packageRoot,
     sourceDir,
     env,
-    homeDir: deps.homeDir,
+    homeDir: deps.homeDir ?? homedir(),
   })
   for (const candidate of candidates) {
     if (exists(candidate)) {
@@ -324,6 +331,7 @@ export function createGoTuiLaunchSpec(
 export function collectGoTuiBinaryCandidates(input: {
   options: Pick<GoTuiCommandOptions, 'binary' | 'sourceDir'>
   platform: NodeJS.Platform
+  arch?: NodeJS.Architecture
   packageRoot: string
   sourceDir: string
   env: NodeJS.ProcessEnv
@@ -344,7 +352,7 @@ export function collectGoTuiBinaryCandidates(input: {
   const packageBundled = join(
     input.packageRoot,
     'bin',
-    `go-tui-${platformSuffix(input.platform)}`,
+    `go-tui-${platformSuffix(input.platform, input.arch)}`,
   )
   candidates.push(packageBundled)
   // In-tree dev build (e.g. `make build` then `bbl go` from
@@ -358,7 +366,7 @@ export function collectGoTuiBinaryCandidates(input: {
       'share',
       'babel-o',
       'bin',
-      `go-tui-${platformSuffix(input.platform)}`,
+      `go-tui-${platformSuffix(input.platform, input.arch)}`,
     )
     candidates.push(xdgLocal)
   }
@@ -383,12 +391,12 @@ export function defaultGoTuiBinaryName(platform: NodeJS.Platform): string {
 // darwin-arm64 for macOS (the Go 1.23 macOS tier dropped
 // 10.15 support; x64 darwin users must build from source).
 // Linux ships both amd64 + arm64; Windows ships only x64.
-export function platformSuffix(platform: NodeJS.Platform): string {
+export function platformSuffix(platform: NodeJS.Platform, arch: NodeJS.Architecture = process.arch): string {
   switch (platform) {
     case 'darwin':
-      return 'darwin-arm64'
+      return arch === 'x64' ? 'darwin-x64' : 'darwin-arm64'
     case 'linux':
-      return 'linux-x64'
+      return arch === 'arm64' ? 'linux-arm64' : 'linux-x64'
     case 'win32':
       return 'windows-x64.exe'
     case 'freebsd':

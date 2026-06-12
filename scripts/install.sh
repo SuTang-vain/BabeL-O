@@ -6,6 +6,7 @@ REPO="SuTang-vain/BabeL-O"
 LATEST_RELEASE_API="https://api.github.com/repos/$REPO/releases/latest"
 INSTALL_DIR="${BBL_INSTALL_DIR:-/usr/local/bin}"
 TMP_PATH=""
+GO_TUI_TMP_PATH=""
 
 fail() {
   echo "Error: $*" >&2
@@ -15,6 +16,9 @@ fail() {
 cleanup() {
   if [ -n "$TMP_PATH" ] && [ -f "$TMP_PATH" ]; then
     rm -f "$TMP_PATH"
+  fi
+  if [ -n "$GO_TUI_TMP_PATH" ] && [ -f "$GO_TUI_TMP_PATH" ]; then
+    rm -f "$GO_TUI_TMP_PATH"
   fi
 }
 trap cleanup EXIT
@@ -47,6 +51,17 @@ download_to() {
     wget --tries=3 --timeout=30 --output-document="$output" "$url"
   else
     fail "curl or wget is required to run this installer."
+  fi
+}
+
+asset_exists() {
+  url="$1"
+  if have curl; then
+    curl -fsIL "$url" >/dev/null 2>&1
+  elif have wget; then
+    wget --spider --server-response "$url" >/dev/null 2>&1
+  else
+    return 1
   fi
 }
 
@@ -122,9 +137,13 @@ case "$OS" in
     case "$ARCH" in
       arm64|aarch64)
         BINARY_NAME="bbl-darwin-arm64"
+        GO_TUI_BINARY_NAME="go-tui-darwin-arm64"
+        GO_TUI_PLATFORM_SUFFIX="darwin-arm64"
         ;;
       x86_64|amd64)
         BINARY_NAME="bbl-darwin-x64"
+        GO_TUI_BINARY_NAME="go-tui-darwin-x64"
+        GO_TUI_PLATFORM_SUFFIX="darwin-x64"
         ;;
       *)
         fail "Unsupported macOS architecture: $ARCH. Only arm64 and x64 are supported for pre-compiled binaries."
@@ -135,9 +154,11 @@ case "$OS" in
     case "$ARCH" in
       x86_64|amd64)
         BINARY_NAME="bbl-linux-x64"
+        GO_TUI_BINARY_NAME="go-tui-linux-x64"
+        GO_TUI_PLATFORM_SUFFIX="linux-x64"
         ;;
       *)
-        fail "Unsupported Linux architecture: $ARCH. Only x64 is supported for pre-compiled binaries."
+        fail "Unsupported Linux architecture: $ARCH. Only x64 is supported for the standalone installer. Install from npm/source on Linux arm64."
         ;;
     esac
     ;;
@@ -147,6 +168,7 @@ case "$OS" in
 esac
 
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME"
+GO_TUI_DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$GO_TUI_BINARY_NAME"
 PATH_SUGGESTION=false
 
 if [ -n "${BBL_INSTALL_DIR:-}" ]; then
@@ -170,6 +192,14 @@ echo "Detected System: $OS ($ARCH)"
 echo "Downloading binary from: $DOWNLOAD_URL"
 echo "Target Installation Path: $TARGET_PATH"
 
+if [ -z "$BINARY_NAME" ]; then
+  fail "No standalone bbl binary is published for $OS ($ARCH). Install from npm/source, or use a supported release platform."
+fi
+
+if ! asset_exists "$DOWNLOAD_URL"; then
+  fail "Release asset not found: $DOWNLOAD_URL. The $VERSION release may not have finished publishing binaries yet."
+fi
+
 download_to "$DOWNLOAD_URL" "$TMP_PATH"
 validate_binary "$TMP_PATH" "$EXPECTED_SIZE"
 chmod +x "$TMP_PATH"
@@ -179,6 +209,34 @@ TMP_PATH=""
 echo "----------------------------------------"
 echo "BabeL-O installed successfully to: $TARGET_PATH"
 echo "----------------------------------------"
+
+if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
+  GO_TUI_INSTALL_DIR="${BBL_GO_TUI_INSTALL_DIR:-$HOME/.local/share/babel-o/bin}"
+  GO_TUI_TARGET_PATH="$GO_TUI_INSTALL_DIR/go-tui-$GO_TUI_PLATFORM_SUFFIX"
+  case "$GO_TUI_BINARY_NAME" in
+    *windows*) GO_TUI_TARGET_PATH="$GO_TUI_TARGET_PATH.exe" ;;
+  esac
+  mkdir -p "$GO_TUI_INSTALL_DIR"
+  if [ ! -w "$GO_TUI_INSTALL_DIR" ]; then
+    fail "Go TUI install directory is not writable: $GO_TUI_INSTALL_DIR"
+  fi
+
+  if asset_exists "$GO_TUI_DOWNLOAD_URL"; then
+    GO_TUI_TMP_PATH="$(mktemp "$GO_TUI_INSTALL_DIR/go-tui.download.XXXXXX")"
+    GO_TUI_EXPECTED_SIZE="$(content_length "$GO_TUI_DOWNLOAD_URL" || true)"
+    echo "Downloading Go TUI binary from: $GO_TUI_DOWNLOAD_URL"
+    echo "Go TUI Installation Path: $GO_TUI_TARGET_PATH"
+    download_to "$GO_TUI_DOWNLOAD_URL" "$GO_TUI_TMP_PATH"
+    validate_binary "$GO_TUI_TMP_PATH" "$GO_TUI_EXPECTED_SIZE"
+    chmod +x "$GO_TUI_TMP_PATH"
+    mv "$GO_TUI_TMP_PATH" "$GO_TUI_TARGET_PATH"
+    GO_TUI_TMP_PATH=""
+    echo "Go TUI installed successfully to: $GO_TUI_TARGET_PATH"
+  else
+    echo "Warning: Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL" >&2
+    echo "Warning: bbl go will fall back to source if the Go TUI source tree and Go toolchain are available." >&2
+  fi
+fi
 
 if [ "$PATH_SUGGESTION" = true ]; then
   if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then

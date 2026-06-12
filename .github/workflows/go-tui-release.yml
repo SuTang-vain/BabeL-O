@@ -2,8 +2,10 @@ name: Go TUI release
 
 # Phase 8 PR2: prebuilt Go TUI binary release pipeline.
 #
-# Triggers on a `go-tui-v*` tag push (separate from the Node
-# `v*` tag push handled by the parent release.yml). The
+# Triggers on a `go-tui-v*` tag push for standalone Go TUI
+# maintenance releases. Product releases use the parent
+# release.yml and attach Go TUI assets to the same `v*`
+# release as the `bbl-*` standalone binaries. The
 # `bbl go` launcher (src/cli/commands/go.ts) discovers the
 # resulting assets in the standard search order:
 #
@@ -23,10 +25,7 @@ name: Go TUI release
 # naming convention and attaches it to a GitHub Release
 # whose tag matches the push event.
 #
-# Naming convention: bbl-go-tui-<os>-<arch> matches the TS
-# release's bbl-<os>-<arch> scheme so the two artifact
-# families can coexist in the same release without
-# confusion.
+# Naming convention: go-tui-<os>-<arch>.
 
 on:
   push:
@@ -45,41 +44,36 @@ jobs:
           - os: macos-latest
             goos: darwin
             goarch: arm64
-            artifact: bbl-go-tui-darwin-arm64
+            artifact: go-tui-darwin-arm64
             binary_name: go-tui
           - os: macos-13
             goos: darwin
             goarch: amd64
-            artifact: bbl-go-tui-darwin-x64
+            artifact: go-tui-darwin-x64
             binary_name: go-tui
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
-            artifact: bbl-go-tui-linux-x64
-            binary_name: go-tui
-          - os: ubuntu-22.04-arm
-            goos: linux
-            goarch: arm64
-            artifact: bbl-go-tui-linux-arm64
+            artifact: go-tui-linux-x64
             binary_name: go-tui
           - os: windows-latest
             goos: windows
             goarch: amd64
-            artifact: bbl-go-tui-windows-x64.exe
+            artifact: go-tui-windows-x64.exe
             binary_name: go-tui.exe
     runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: clients/go-tui
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.23'
+          go-version: '1.25.x'
           cache-dependency-path: clients/go-tui/go.sum
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Build prebuilt Go TUI binary
         run: make build
       - name: Verify --version prints build metadata
@@ -88,7 +82,7 @@ jobs:
         shell: bash
         run: |
           mv bin/${{ matrix.binary_name }} bin/${{ matrix.artifact }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}
           path: clients/go-tui/bin/${{ matrix.artifact }}
@@ -97,8 +91,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
@@ -107,11 +101,17 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
-            --title "$TAG" \
-            --generate-notes \
-            artifacts/*
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* \
+              --repo "${{ github.repository }}" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TAG" \
+              --generate-notes \
+              artifacts/*
+          fi
 
       - name: Mirror to dist/ for npm package consumers
         run: |
@@ -119,7 +119,7 @@ jobs:
           for asset in artifacts/*; do
             cp "$asset" "dist/go-tui/$(basename "$asset")"
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: bbl-go-tui-dist
           path: dist/go-tui/

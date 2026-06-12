@@ -349,11 +349,12 @@ test('go_tui_pty_driver.py exposes the Phase 1 permission-approve sequence', { s
 test('collectGoTuiBinaryCandidates returns candidates in the spec order', () => {
   const packageRoot = '/repo'
   const sourceDir = join(packageRoot, 'clients', 'go-tui')
-  const candidates = collectGoTuiBinaryCandidates({
-    options: { binary: undefined, sourceDir },
-    platform: 'darwin',
-    packageRoot,
-    sourceDir,
+	  const candidates = collectGoTuiBinaryCandidates({
+	    options: { binary: undefined, sourceDir },
+	    platform: 'darwin',
+	    arch: 'arm64',
+	    packageRoot,
+	    sourceDir,
     env: {
       BABEL_O_GO_TUI_BINARY: '/env/bin/go-tui',
       BABEL_O_GO_TUI_PACKAGE_BINARY: '/env/bin/go-tui-package',
@@ -377,10 +378,11 @@ test('collectGoTuiBinaryCandidates returns candidates in the spec order', () => 
 })
 
 test('collectGoTuiBinaryCandidates pushes explicit --binary ahead of env', () => {
-  const candidates = collectGoTuiBinaryCandidates({
-    options: { binary: '/explicit/go-tui', sourceDir: '/src' },
-    platform: 'linux',
-    packageRoot: '/repo',
+	  const candidates = collectGoTuiBinaryCandidates({
+	    options: { binary: '/explicit/go-tui', sourceDir: '/src' },
+	    platform: 'linux',
+	    arch: 'x64',
+	    packageRoot: '/repo',
     sourceDir: '/src',
     env: { BABEL_O_GO_TUI_BINARY: '/env/go-tui' },
   })
@@ -389,10 +391,11 @@ test('collectGoTuiBinaryCandidates pushes explicit --binary ahead of env', () =>
 })
 
 test('collectGoTuiBinaryCandidates omits missing env vars', () => {
-  const candidates = collectGoTuiBinaryCandidates({
-    options: { binary: undefined, sourceDir: '/src' },
-    platform: 'linux',
-    packageRoot: '/repo',
+	  const candidates = collectGoTuiBinaryCandidates({
+	    options: { binary: undefined, sourceDir: '/src' },
+	    platform: 'linux',
+	    arch: 'x64',
+	    packageRoot: '/repo',
     sourceDir: '/src',
     env: {},
   })
@@ -405,10 +408,11 @@ test('collectGoTuiBinaryCandidates omits missing env vars', () => {
 })
 
 test('collectGoTuiBinaryCandidates omits XDG entry when homeDir is missing', () => {
-  const candidates = collectGoTuiBinaryCandidates({
-    options: { binary: undefined, sourceDir: '/src' },
-    platform: 'darwin',
-    packageRoot: '/repo',
+	  const candidates = collectGoTuiBinaryCandidates({
+	    options: { binary: undefined, sourceDir: '/src' },
+	    platform: 'darwin',
+	    arch: 'arm64',
+	    packageRoot: '/repo',
     sourceDir: '/src',
     env: {},
   })
@@ -421,9 +425,11 @@ test('collectGoTuiBinaryCandidates omits XDG entry when homeDir is missing', () 
 })
 
 test('platformSuffix returns the canonical platform-arch segment', () => {
-  assert.equal(platformSuffix('darwin'), 'darwin-arm64')
-  assert.equal(platformSuffix('linux'), 'linux-x64')
-  assert.equal(platformSuffix('win32'), 'windows-x64.exe')
+  assert.equal(platformSuffix('darwin', 'arm64'), 'darwin-arm64')
+  assert.equal(platformSuffix('darwin', 'x64'), 'darwin-x64')
+  assert.equal(platformSuffix('linux', 'x64'), 'linux-x64')
+  assert.equal(platformSuffix('linux', 'arm64'), 'linux-arm64')
+  assert.equal(platformSuffix('win32', 'x64'), 'windows-x64.exe')
   assert.equal(platformSuffix('freebsd'), 'freebsd-x64')
   // Unknown platform falls through to `${platform}-x64`
   // so a future port still gets a reasonable default
@@ -605,7 +611,7 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
       cwd: '/workspace',
       alt: true,
     },
-    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', env: {} },
+    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', arch: 'arm64', env: {}, homeDir: '' },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')
@@ -632,7 +638,7 @@ test('bbl go --check: warns (does not fail) when no prebuilt but source is prese
       cwd: '/workspace',
       alt: true,
     },
-    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', env: {} },
+    { exists, fetch: fetchImpl, packageRoot, platform: 'darwin', arch: 'arm64', env: {}, homeDir: '' },
   )
   assert.equal(report.exitCode, 0)
   const combined = report.lines.join('\n')

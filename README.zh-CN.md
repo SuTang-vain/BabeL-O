@@ -50,7 +50,7 @@ bbl go
 
 ### 发布版安装脚本
 
-macOS 和 Linux 下，安装脚本会检测系统与架构，下载最新匹配的 GitHub release 二进制，并安装为 `bbl`：
+macOS 和 Linux 下，安装脚本会检测系统与架构，安装匹配的 `bbl` release 二进制，并同时安装正式入口 `bbl go` 使用的 Go TUI 二进制：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
@@ -66,7 +66,7 @@ bbl go
 
 ### 手动下载发布二进制
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制，也可以查看 [v0.3.3 发布说明](docs/releases/v0.3.3.md) 中的版本下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制和匹配的 `go-tui-*` 资产，也可以查看 [v0.3.3 发布说明](docs/releases/v0.3.3.md) 中的版本下载链接。
 
 将下载好的 `bbl` 放入系统 `$PATH` 后运行：
 

@@ -50,7 +50,7 @@ It connects to Nexus, can auto-start a local Nexus service for you, and gives yo
 
 ### Release Installer
 
-On macOS and Linux, the installer detects your platform, downloads the latest matching GitHub release binary, and installs it as `bbl`:
+On macOS and Linux, the installer detects your platform, installs the matching `bbl` release binary, and also installs the matching Go TUI binary used by the production `bbl go` entrypoint:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
@@ -66,7 +66,7 @@ bbl go
 
 ### Manual Release Binary
 
-Download the latest standalone executable from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.3 release notes](docs/releases/v0.3.3.md) for version-specific links.
+Download the latest standalone executable and matching `go-tui-*` asset from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.3 release notes](docs/releases/v0.3.3.md) for version-specific links.
 
 Move the downloaded `bbl` binary into your `$PATH`, then run:
 
