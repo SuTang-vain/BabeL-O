@@ -283,6 +283,10 @@ export const PermissionRequestEventSchema = z.object({
    * placeholder ("<tool-name>:*").
    */
   suggestedRule: z.string().optional(),
+  scopeRisk: z.enum(['none', 'outside_current_project', 'sibling_repo', 'parent_scan', 'historical_path', 'memory_hit_path', 'global_cache_path']).optional(),
+  targetRoot: z.string().optional(),
+  taskPrimaryRoot: z.string().optional(),
+  scopeReason: z.string().optional(),
   source: z.object({
     type: z.enum(['builtin', 'mcp']),
     serverName: z.string().optional(),
@@ -521,6 +525,45 @@ export const WorkspaceDirtyDetectedEventSchema = z.object({
   message: z.string(),
 })
 
+export const TaskScopeDeclaredEventSchema = z.object({
+  type: z.literal('task_scope_declared'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  cwd: z.string(),
+  primaryRoot: z.string(),
+  explicitRoots: z.array(z.string()),
+  confirmedExternalRoots: z.array(z.string()),
+  inferredCandidateRoots: z.array(z.string()),
+  mode: z.enum(['single_root', 'multi_root', 'cross_project']),
+  source: z.enum(['cwd', 'prompt_paths', 'user_confirmation', 'session_metadata']),
+  message: z.string(),
+})
+
+export const ScopeBoundaryDetectedEventSchema = z.object({
+  type: z.literal('scope_boundary_detected'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  toolUseId: z.string(),
+  toolName: z.string(),
+  targetRoot: z.string(),
+  taskPrimaryRoot: z.string(),
+  boundaryKind: z.enum(['parent_scan', 'sibling_repo', 'external_absolute_path', 'historical_session_path', 'memory_hit_path', 'global_cache_path']),
+  action: z.enum(['warn', 'require_confirmation', 'deny']),
+  scopeRisk: z.enum(['outside_current_project', 'sibling_repo', 'parent_scan', 'historical_path', 'memory_hit_path', 'global_cache_path']),
+  reason: z.string(),
+  suggestedPrompt: z.string(),
+})
+
+export const ScopeBoundaryConfirmedEventSchema = z.object({
+  type: z.literal('scope_boundary_confirmed'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  targetRoot: z.string(),
+  confirmationScope: z.enum(['once', 'session', 'task']),
+  confirmedBy: z.enum(['user', 'policy']),
+  message: z.string(),
+})
+
 export const SessionMemoryUpdatedEventSchema = z.object({
   type: z.literal('session_memory_updated'),
   ...baseEventFields,
@@ -603,6 +646,9 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ContextGroundingRequiredEventSchema,
   ContextGroundingConfirmedEventSchema,
   WorkspaceDirtyDetectedEventSchema,
+  TaskScopeDeclaredEventSchema,
+  ScopeBoundaryDetectedEventSchema,
+  ScopeBoundaryConfirmedEventSchema,
   SessionMemoryUpdatedEventSchema,
   ExecutionMetricsEventSchema,
   ExecuteSummaryEventSchema,

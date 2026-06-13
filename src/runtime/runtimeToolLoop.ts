@@ -26,6 +26,13 @@ import {
   type RuntimeExecutionMetrics,
   type RuntimeProviderToolCall,
 } from './runtimePipeline.js'
+import {
+  buildScopeBoundaryConfirmedEvent,
+  buildScopeBoundaryDetectedEvent,
+  classifyToolScopeBoundary,
+  type TaskScopeDeclaredEvent,
+  type ToolScopeBoundary,
+} from './taskScope.js'
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { executeToolSafely, TOOL_EXECUTION_TIMEOUT_MS } from './toolExecutor.js'
 import { replaceLargeToolResult } from './toolResultBudget.js'
@@ -51,6 +58,104 @@ function recoverableDeniedToolResult(options: {
   }
 }
 
+async function* requestScopeBoundaryPermission(options: {
+  runtimeOptions: RuntimeExecuteOptions
+  storage: NexusStorage
+  tool: AnyTool
+  toolUseId: string
+  toolInput: unknown
+  boundary: ToolScopeBoundary
+}): AsyncGenerator<NexusEvent, boolean> {
+  const { runtimeOptions, tool, toolUseId, toolInput, boundary } = options
+  yield buildScopeBoundaryDetectedEvent({
+    sessionId: runtimeOptions.sessionId,
+    requestId: runtimeOptions.requestId,
+    boundary,
+  })
+
+  const pendingPermission = PendingPermissionRegistry.getInstance().register(
+    runtimeOptions.sessionId,
+    toolUseId,
+  )
+
+  yield {
+    type: 'permission_request',
+    ...eventBase(runtimeOptions.sessionId),
+    toolUseId,
+    name: tool.name,
+    input: toolInput,
+    risk: tool.risk,
+    message: `Tool ${tool.name} crosses the current task scope. ${boundary.reason}`,
+    scopeRisk: boundary.scopeRisk,
+    targetRoot: boundary.targetRoot,
+    taskPrimaryRoot: boundary.taskPrimaryRoot,
+    scopeReason: boundary.reason,
+    source: tool.source,
+  }
+
+  const permissionHooks = await executeRuntimeHooks(
+    'PermissionRequest',
+    {
+      toolUseId,
+      toolName: tool.name,
+      toolRisk: tool.risk,
+      toolInput,
+    },
+    {
+      sessionId: runtimeOptions.sessionId,
+      cwd: runtimeOptions.cwd,
+      role: runtimeOptions.role,
+      signal: runtimeOptions.signal,
+    },
+    { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
+  )
+  for (const hookEvent of permissionHooks.events) yield hookEvent
+
+  const hookDecision = firstHookPermissionDecision(permissionHooks)
+  if (hookDecision) {
+    PendingPermissionRegistry.getInstance().resolve(runtimeOptions.sessionId, toolUseId, hookDecision)
+  }
+  const decision = hookDecision ?? await pendingPermission
+  const approved = decision.approved
+  const decisionReason = decision.reason ?? 'User review'
+
+  await options.storage.savePermissionAudit({
+    auditId: createId('audit'),
+    sessionId: runtimeOptions.sessionId,
+    toolUseId,
+    toolName: tool.name,
+    toolRisk: tool.risk,
+    toolInput,
+    decision: approved ? 'approved' : 'denied',
+    reason: decisionReason,
+    timestamp: nowIso(),
+  })
+
+  yield {
+    type: 'permission_response',
+    ...eventBase(runtimeOptions.sessionId),
+    toolUseId,
+    approved,
+    reason: decisionReason,
+    ...(decision.scope && { scope: decision.scope }),
+    ...(decision.rule && { rule: decision.rule }),
+    ...(decision.feedback && { feedback: decision.feedback }),
+  }
+
+  if (approved) {
+    yield buildScopeBoundaryConfirmedEvent({
+      sessionId: runtimeOptions.sessionId,
+      requestId: runtimeOptions.requestId,
+      targetRoot: boundary.targetRoot,
+      confirmationScope: decision.scope === 'session' || decision.scope === 'rule' ? 'session' : 'once',
+      confirmedBy: 'user',
+      message: `User confirmed ${boundary.targetRoot} for the current task scope.`,
+    })
+  }
+
+  return approved
+}
+
 export async function* executeProviderToolCall(options: {
   toolCall: RuntimeProviderToolCall
   tools: Map<string, AnyTool>
@@ -59,6 +164,7 @@ export async function* executeProviderToolCall(options: {
   storage: NexusStorage
   metrics: RuntimeExecutionMetrics
   readFileCache: Map<string, { mtime: number; size: number }>
+  taskScope?: TaskScopeDeclaredEvent
 }): AsyncGenerator<NexusEvent, ProviderToolCallExecutionOutcome> {
   const { toolCall, runtimeOptions, metrics, readFileCache } = options
   let resolvedInput = resolveProviderToolCallInput(toolCall)
@@ -251,7 +357,44 @@ export async function* executeProviderToolCall(options: {
     })
   }
 
-  if ((tool.risk === 'write' || tool.risk === 'execute') && !runtimeOptions.skipPermissionCheck) {
+  const scopeBoundary = options.taskScope
+    ? classifyToolScopeBoundary({
+      taskScope: options.taskScope,
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      toolInput: parsed.data,
+    })
+    : undefined
+
+  if (scopeBoundary && !runtimeOptions.skipPermissionCheck) {
+    const approved = yield* requestScopeBoundaryPermission({
+      runtimeOptions,
+      storage: options.storage,
+      tool,
+      toolUseId: toolCall.id,
+      toolInput: parsed.data,
+      boundary: scopeBoundary,
+    })
+    if (!approved) {
+      const denyMessage = scopeBoundary.reason
+      yield {
+        type: 'tool_denied',
+        ...eventBase(runtimeOptions.sessionId),
+        name: tool.name,
+        risk: tool.risk,
+        message: denyMessage,
+        denialKind: 'permission',
+        recoverable: true,
+      }
+      return recoverableDeniedToolResult({
+        toolUseId: toolCall.id,
+        toolName: tool.name,
+        message: denyMessage,
+      })
+    }
+  }
+
+  if ((tool.risk === 'write' || tool.risk === 'execute') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
     const { autoApprove, reason } = classifyAction(tool.name, parsed.data, { cwd: runtimeOptions.cwd })
     let approved = autoApprove
     let decisionReason = `Auto-approved: ${reason}`

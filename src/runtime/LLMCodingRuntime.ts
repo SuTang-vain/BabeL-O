@@ -24,6 +24,7 @@ import {
   buildCompactFailureEvent,
   compactSession,
 } from './compact.js'
+import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
@@ -219,6 +220,16 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield intakeEvent
       previousEvents = [...previousEvents, intakeEvent]
       const confirmedOptionSelection = isConfirmedOptionSelectionAfterClarification(previousEvents, options.prompt)
+      let taskScopeEvent = buildTaskScopeDeclaredEvent({
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        cwd: options.cwd,
+        prompt: options.prompt,
+        events: previousEvents,
+        allowedPaths: options.allowedPaths,
+      })
+      yield taskScopeEvent
+      previousEvents = [...previousEvents, taskScopeEvent]
 
       const toolsList = () => [...this.tools.values()]
         .filter(tool => this.toolPolicy.isAllowed(tool))
@@ -856,6 +867,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             storage: this.storage,
             metrics,
             readFileCache: this.readFileCache,
+            taskScope: taskScopeEvent,
           })
           let next = await toolExecution.next()
           while (!next.done) {
@@ -879,6 +891,21 @@ export class LLMCodingRuntime implements NexusRuntime {
             if (groundingConfirmedEvent) {
               previousEvents = [...previousEvents, groundingConfirmedEvent]
               yield groundingConfirmedEvent
+            }
+          }
+          const scopeConfirmationEvents = toolEvents.filter((event): event is Extract<NexusEvent, { type: 'scope_boundary_confirmed' }> => event.type === 'scope_boundary_confirmed')
+          if (scopeConfirmationEvents.length > 0) {
+            taskScopeEvent = {
+              ...taskScopeEvent,
+              ...deriveTaskScope({
+                sessionId: options.sessionId,
+                requestId: options.requestId,
+                cwd: options.cwd,
+                prompt: options.prompt,
+                events: previousEvents,
+                allowedPaths: options.allowedPaths,
+              }),
+              message: taskScopeEvent.message,
             }
           }
           toolResultsContent.push(next.value.toolResult)
@@ -1091,6 +1118,18 @@ export function mapEventsToMessages(
       pendingToolResultMsg = null
       pendingToolAssistantMsg = null
       messages.push({ role: 'user', content: `Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
+    } else if (event.type === 'task_scope_declared') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime task scope declared: ${event.message} Primary root: ${event.primaryRoot}. Explicit roots: ${event.explicitRoots.join(', ') || 'none'}. Confirmed external roots: ${event.confirmedExternalRoots.join(', ') || 'none'}. Mode: ${event.mode}.` })
+    } else if (event.type === 'scope_boundary_detected') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.` })
+    } else if (event.type === 'scope_boundary_confirmed') {
+      pendingToolResultMsg = null
+      pendingToolAssistantMsg = null
+      messages.push({ role: 'user', content: `Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.` })
     } else if (event.type === 'tool_started') {
       let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
       if (!lastMsg) {

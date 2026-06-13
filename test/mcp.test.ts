@@ -333,7 +333,9 @@ test('EverCore write MCP tools require permission and call add/flush only after 
   const saveTool = audit.tools.find((tool: { name: string }) => tool.name === 'mcp:evercore:memory_save_note')
   const flushTool = audit.tools.find((tool: { name: string }) => tool.name === 'mcp:evercore:memory_flush_session')
   assert.match(saveTool.description, /permission-gated/)
+  assert.match(saveTool.description, /current runtime session/)
   assert.match(saveTool.description, /workspace evidence/)
+  assert.deepEqual(Object.keys(saveTool.inputSchema.properties).sort(), ['note'])
   assert.match(flushTool.description, /runtime session close/)
   await app.close()
 
@@ -362,7 +364,11 @@ test('EverCore write MCP tools require permission and call add/flush only after 
   }
   assert.equal(addInputs.length, 1)
   assert.equal((addInputs[0] as any).sessionId, saveSessionId)
+  assert.equal((addInputs[0] as any).messages.length, 2)
+  assert.equal((addInputs[0] as any).messages[0].role, 'user')
   assert.equal((addInputs[0] as any).messages[0].content, 'Persist this explicit note.')
+  assert.equal((addInputs[0] as any).messages[1].role, 'assistant')
+  assert.match((addInputs[0] as any).messages[1].content, /Approved long-term memory note saved/)
   assert.ok(saveEvents.some(event => event.type === 'permission_response' && event.approved === true))
 
   const flushSessionId = `session-evercore-mcp-flush-${Date.now()}`

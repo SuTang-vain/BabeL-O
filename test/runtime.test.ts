@@ -1,6 +1,6 @@
 import { mkdir, realpath, writeFile } from 'node:fs/promises'
 import { existsSync, mkdirSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir, homedir } from 'node:os'
@@ -61,6 +61,11 @@ import {
   resolveProviderToolCallInput,
   streamProviderTurn,
 } from '../src/runtime/runtimePipeline.js'
+import {
+  buildTaskScopeDeclaredEvent,
+  classifyToolScopeBoundary,
+  deriveTaskScope,
+} from '../src/runtime/taskScope.js'
 import { buildContextCompactBoundaryEvent, compactSession } from '../src/runtime/compact.js'
 import { buildCacheAwareCompactPolicy } from '../src/runtime/cacheAwareCompactPolicy.js'
 import type { UserIntentGuidance } from '../src/runtime/intentGuidance.js'
@@ -70,6 +75,7 @@ import type { ModelAdapter, ModelQueryParams, StreamDelta } from '../src/provide
 import { ConfigManager } from '../src/shared/config.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 import { ProviderError } from '../src/shared/errors.js'
+import type { RuntimeHook } from '../src/runtime/hooks.js'
 import {
   HttpRemoteToolRunner,
   InMemoryRemoteToolRunner,
@@ -318,6 +324,72 @@ test('runtime pipeline builds grounding confirmation events from source evidence
     success: false,
     toolInput: { command: 'git status --short' },
   }), undefined)
+})
+
+test('runtime pipeline derives task scope and classifies external boundaries', () => {
+  const cwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const sibling = '/Users/test/DEV/BABEL/BabeL-X'
+  const scope = deriveTaskScope({
+    sessionId: 'session-scope',
+    cwd,
+    prompt: '查看当前 babel-o memory 系统进展',
+  })
+  assert.equal(scope.primaryRoot, cwd)
+  assert.deepEqual(scope.explicitRoots, [])
+  assert.deepEqual(scope.confirmedExternalRoots, [])
+  assert.equal(scope.mode, 'single_root')
+
+  const siblingBoundary = classifyToolScopeBoundary({
+    taskScope: {
+      cwd,
+      primaryRoot: cwd,
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+    },
+    toolUseId: 'tool-sibling',
+    toolName: 'Bash',
+    toolInput: { command: `cd ${sibling} && find . -type f` },
+  })
+  assert.equal(siblingBoundary?.boundaryKind, 'sibling_repo')
+  assert.equal(siblingBoundary?.scopeRisk, 'sibling_repo')
+  assert.equal(siblingBoundary?.action, 'require_confirmation')
+  assert.equal(siblingBoundary?.targetRoot, sibling)
+
+  const parentBoundary = classifyToolScopeBoundary({
+    taskScope: {
+      cwd,
+      primaryRoot: cwd,
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+    },
+    toolUseId: 'tool-parent',
+    toolName: 'Bash',
+    toolInput: { command: 'cd .. && find . -type f' },
+  })
+  assert.equal(parentBoundary?.boundaryKind, 'parent_scan')
+  assert.equal(parentBoundary?.scopeRisk, 'parent_scan')
+
+  assert.equal(classifyToolScopeBoundary({
+    taskScope: {
+      cwd,
+      primaryRoot: cwd,
+      explicitRoots: [sibling],
+      confirmedExternalRoots: [],
+    },
+    toolUseId: 'tool-explicit',
+    toolName: 'Read',
+    toolInput: { path: `${sibling}/README.md` },
+  }), undefined)
+
+  const event = buildTaskScopeDeclaredEvent({
+    sessionId: 'session-scope',
+    requestId: 'request-scope',
+    cwd,
+    prompt: `对比 BabeL-O 和 ${sibling}`,
+  })
+  assert.equal(event.type, 'task_scope_declared')
+  assert.equal(event.mode, 'cross_project')
+  assert.deepEqual(event.explicitRoots, [sibling])
 })
 
 test('runtime pipeline builds context_usage event from context policy facts', () => {
@@ -1047,6 +1119,66 @@ test('runtime tool loop executes a provider tool call and returns tool_result co
   assert.ok(metrics.toolRoundtripDurationMs >= 0)
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Read'))
   assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+})
+
+test('runtime tool loop requires confirmation for sibling task scope boundaries', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-scope-primary`)
+  const sibling = join(dirname(cwd), `babel-o-test-${Date.now()}-scope-sibling`)
+  await mkdir(cwd, { recursive: true })
+  await mkdir(sibling, { recursive: true })
+  const hooks: RuntimeHook[] = [{
+    name: 'DenyScopeBoundaryForTest',
+    events: ['PermissionRequest'],
+    run() {
+      return { permissionDecision: { approved: false, reason: 'scope boundary rejected in test' } }
+    },
+  }]
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_scope_sibling',
+      name: 'Bash',
+      partialInput: JSON.stringify({ command: `cd ${sibling} && find . -type f` }),
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-tool-scope-boundary',
+      requestId: 'request-tool-scope-boundary',
+      prompt: '查看当前 babel-o memory 系统进展',
+      cwd,
+      runtimeHooks: hooks,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    taskScope: buildTaskScopeDeclaredEvent({
+      sessionId: 'session-tool-scope-boundary',
+      requestId: 'request-tool-scope-boundary',
+      cwd,
+      prompt: '查看当前 babel-o memory 系统进展',
+    }),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  const boundary = events.find((event): event is Extract<NexusEvent, { type: 'scope_boundary_detected' }> => event.type === 'scope_boundary_detected')
+  assert.equal(boundary?.boundaryKind, 'sibling_repo')
+  assert.equal(boundary?.action, 'require_confirmation')
+  assert.equal(boundary?.targetRoot, sibling)
+  const permission = events.find((event): event is Extract<NexusEvent, { type: 'permission_request' }> => event.type === 'permission_request')
+  assert.equal(permission?.scopeRisk, 'sibling_repo')
+  assert.equal(permission?.targetRoot, sibling)
+  assert.equal(permission?.taskPrimaryRoot, cwd)
+  assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
+  assert.ok(!events.some(event => event.type === 'tool_completed' && event.name === 'Bash'))
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /sibling root outside current task root/)
 })
 
 test('runtime tool loop returns recoverable result for unknown tools', async () => {

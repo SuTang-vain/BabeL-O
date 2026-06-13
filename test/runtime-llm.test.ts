@@ -13,8 +13,12 @@ import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRunti
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { flushSessionMemoryLiteQueue } from '../src/runtime/sessionMemoryLite.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
+import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { CRITIC_ROLE, EXECUTOR_ROLE, PLANNER_ROLE } from '../src/nexus/agentRoles.js'
 import { parseStructuredAgentOutput, zodRoleOutputSchemaToJsonSchema } from '../src/nexus/runtimeAgentStep.js'
+import { createEverCoreMcpToolRegistry } from '../src/tools/everCoreMcpTools.js'
+import type { EverCoreClient } from '../src/runtime/everCoreClient.js'
+import type { EverCoreRuntimeConfig } from '../src/nexus/everCoreConfig.js'
 
 const CONFIG_ENV_KEYS = [
   'BABEL_O_MODEL',
@@ -76,6 +80,36 @@ function createMockStream(chunks: string[]): ReadableStream<Uint8Array> {
       controller.close()
     },
   })
+}
+
+function createAnthropicTextStream(text: string): ReadableStream<Uint8Array> {
+  return createMockStream([
+    'event: content_block_start\n',
+    'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+    'event: content_block_delta\n',
+    `data: ${JSON.stringify({ index: 0, delta: { type: 'text_delta', text } })}\n\n`,
+    'event: content_block_stop\n',
+    'data: {"index":0}\n\n',
+  ])
+}
+
+function createAnthropicToolUseStream(options: {
+  id: string
+  name: string
+  input: unknown
+}): ReadableStream<Uint8Array> {
+  return createMockStream([
+    'event: content_block_start\n',
+    `data: ${JSON.stringify({ index: 0, content_block: { type: 'tool_use', id: options.id, name: options.name, input: {} } })}\n\n`,
+    'event: content_block_delta\n',
+    `data: ${JSON.stringify({ index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(options.input) } })}\n\n`,
+    'event: content_block_stop\n',
+    'data: {"index":0}\n\n',
+    'event: message_delta\n',
+    'data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":16}}\n\n',
+    'event: message_stop\n',
+    'data: {"type":"message_stop"}\n\n',
+  ])
 }
 
 async function collectEvents(iterable: AsyncIterable<NexusEvent>): Promise<NexusEvent[]> {
@@ -1265,6 +1299,159 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
     assert.deepEqual(toolNames, ['Glob', 'Read'])
+  })
+
+  test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
+    const searchInputs: unknown[] = []
+    const client = createMockEverCoreClient({
+      async search(input) {
+        searchInputs.push(input)
+        return {
+          data: {
+            episodes: [{
+              id: 'episode-provider-preference',
+              content: 'User prefers regression-first provider fixes.',
+              score: 0.91,
+            }],
+          },
+        }
+      },
+    })
+    const tools = createEverCoreMcpToolRegistry(client, createEverCoreRuntimeTestConfig({ mcpToolsEnabled: true }))
+    fetchStreamResponses.push(
+      createAnthropicToolUseStream({
+        id: 'memory-search-1',
+        name: 'mcp:evercore:memory_search',
+        input: { query: '用户之前偏好的 provider', topK: 1, maxChars: 256, maxHitChars: 128 },
+      }),
+      createAnthropicTextStream('我记得你偏好 regression-first provider 修复。'),
+    )
+
+    const runtime = new LLMCodingRuntime(
+      tools,
+      allowlistedTools(['mcp:evercore:memory_search']),
+      new MemoryStorage(),
+      configManager,
+      {
+        name: 'test-memory-capability',
+        async retrieve() {
+          return {
+            content: '',
+            diagnostics: {
+              provider: 'test-memory-capability',
+              enabled: true,
+              hitCount: 0,
+              injectedChars: 0,
+              budgetChars: 256,
+              maxHitChars: 128,
+              truncated: false,
+              scope: 'project',
+            },
+          }
+        },
+      },
+    )
+    const events = await collectEvents(runtime.executeStream({
+      sessionId: 'test-memory-search-self-trigger',
+      prompt: '你还记得我之前偏好的 provider 吗？',
+      cwd: tmpdir(),
+    }))
+
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.match(JSON.stringify(firstBody.system), /Long-Term Memory Capability/)
+    assert.deepEqual(firstBody.tools.map((tool: any) => tool.name), ['mcp:evercore:memory_search'])
+    assert.equal(searchInputs.length, 1)
+    assert.deepEqual(searchInputs[0], {
+      query: '用户之前偏好的 provider',
+      appId: 'babel-o',
+      projectId: 'project-1',
+      userId: undefined,
+      agentId: 'agent-1',
+      method: 'hybrid',
+      topK: 1,
+    })
+    const completed = events.find(event => event.type === 'tool_completed' && event.name === 'mcp:evercore:memory_search') as any
+    assert.ok(completed)
+    assert.equal(completed.success, true)
+    assert.match(completed.output.content, /regression-first provider fixes/)
+    const result = events.find(event => event.type === 'result') as any
+    assert.ok(result)
+    assert.equal(result.success, true)
+    assert.match(result.message, /regression-first provider/)
+  })
+
+  test('memory_save_note self-trigger emits permission_request before write', async () => {
+    const addInputs: unknown[] = []
+    const client = createMockEverCoreClient({
+      async addAgentMessages(input) {
+        addInputs.push(input)
+        return { data: { ok: true } }
+      },
+    })
+    const tools = createEverCoreMcpToolRegistry(client, createEverCoreRuntimeTestConfig({ mcpToolsEnabled: true }))
+    const sessionId = 'test-memory-save-self-trigger-permission'
+    fetchStreamResponses.push(
+      createAnthropicToolUseStream({
+        id: 'memory-save-1',
+        name: 'mcp:evercore:memory_save_note',
+        input: { note: 'User prefers regression-first fixes.' },
+      }),
+    )
+
+    const runtime = new LLMCodingRuntime(
+      tools,
+      allowlistedTools(['mcp:evercore:memory_save_note']),
+      new MemoryStorage(),
+      configManager,
+      {
+        name: 'test-memory-capability',
+        async retrieve() {
+          return {
+            content: '',
+            diagnostics: {
+              provider: 'test-memory-capability',
+              enabled: true,
+              hitCount: 0,
+              injectedChars: 0,
+              budgetChars: 256,
+              maxHitChars: 128,
+              truncated: false,
+              scope: 'project',
+            },
+          }
+        },
+      },
+    )
+    const events: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: '记住：我偏好 regression-first 修复。',
+      cwd: tmpdir(),
+    })) {
+      events.push(event)
+      if (event.type === 'permission_request') {
+        PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+          approved: false,
+          reason: 'test denies write after observing permission gate',
+        })
+      }
+    }
+
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.match(JSON.stringify(firstBody.system), /Only save memory when the user explicitly asks you to remember something/)
+    assert.deepEqual(firstBody.tools.map((tool: any) => tool.name), ['mcp:evercore:memory_save_note'])
+    const permission = events.find(event => event.type === 'permission_request') as any
+    assert.ok(permission)
+    assert.equal(permission.name, 'mcp:evercore:memory_save_note')
+    assert.equal(permission.risk, 'write')
+    assert.deepEqual(permission.source, {
+      type: 'mcp',
+      serverName: 'evercore',
+      originalName: 'memory_save_note',
+    })
+    assert.equal(addInputs.length, 0)
+    assert.ok(events.some(event => event.type === 'permission_response' && event.approved === false))
+    assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'mcp:evercore:memory_save_note'))
   })
 
   test('emits classified provider error details and a failed result', async () => {
@@ -2849,6 +3036,36 @@ describe('mapEventsToMessages', () => {
     assert.deepEqual(toolResultContent.map(block => block.toolUseId), ['call-1', 'call-2'])
   })
 })
+
+function createEverCoreRuntimeTestConfig(overrides: Partial<EverCoreRuntimeConfig> = {}): EverCoreRuntimeConfig {
+  return {
+    appId: 'babel-o',
+    projectId: 'project-1',
+    agentId: 'agent-1',
+    retrieveMethod: 'hybrid',
+    topK: 5,
+    uploadOnSessionEnd: false,
+    maxMessages: 8,
+    maxContentChars: 120,
+    mcpToolsEnabled: false,
+    ...overrides,
+  }
+}
+
+function createMockEverCoreClient(overrides: Partial<EverCoreClient> = {}): EverCoreClient {
+  return {
+    async search() {
+      return { data: {} }
+    },
+    async addAgentMessages() {
+      return { data: {} }
+    },
+    async flushAgentSession() {
+      return { data: {} }
+    },
+    ...overrides,
+  }
+}
 
 describe('Agent role structured output', () => {
   test('role output JSON schemas expose required fields', () => {
