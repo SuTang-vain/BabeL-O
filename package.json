@@ -36,7 +36,7 @@
     "format:check": "node scripts/check-format.js",
     "lint": "npm run typecheck && npm run format:check && npm run deps:audit",
     "coverage": "node scripts/coverage-report.js",
-    "build": "tsc -p tsconfig.build.json && mkdir -p dist/skills && cp -r src/skills/built-in dist/skills/",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-built-in-skills.js",
     "build:smoke": "npm run build && node scripts/smoke-production-build.js",
     "deps:audit": "node scripts/audit-dependency-boundary.js && npm ls --depth=0",
     "build:binary": "node scripts/build-binary.js",
