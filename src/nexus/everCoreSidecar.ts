@@ -8,7 +8,10 @@ import { errorMessage } from '../shared/errors.js'
 
 export type EverCoreSidecarMode = 'disabled' | 'external' | 'managed'
 
+export type EverCoreManagedLlmProtocol = 'openai-compatible' | 'anthropic-compatible'
+
 export type EverCoreManagedLlmConfig = {
+  protocol?: EverCoreManagedLlmProtocol
   apiKey?: string
   baseUrl?: string
   model?: string
@@ -262,9 +265,11 @@ function stopEverCoreProcess(child: EverCoreProcess): void {
 
 function buildEverCoreLlmEnv(llm: EverCoreManagedLlmConfig | undefined): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {}
+  const protocol = llm?.protocol?.trim()
   const apiKey = llm?.apiKey?.trim()
   const baseUrl = llm?.baseUrl?.trim()
   const model = llm?.model?.trim()
+  if (protocol) env.EVEROS_LLM__PROTOCOL = protocol
   if (apiKey) env.EVEROS_LLM__API_KEY = apiKey
   if (baseUrl) env.EVEROS_LLM__BASE_URL = baseUrl
   if (model) env.EVEROS_LLM__MODEL = model

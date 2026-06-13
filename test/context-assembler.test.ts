@@ -3533,14 +3533,55 @@ test('assembleContext injects MemoryProvider results as volatile long-term memor
     },
   })
 
+  assert.match(context.systemPrompt, /Long-Term Memory Capability:/)
+  assert.match(context.systemPrompt, /Use memory_search when the user asks about prior preferences/)
   assert.match(context.systemPrompt, /Long-term semantic memory \(volatile, retrieved for the current request\):/)
   assert.match(context.systemPrompt, /Prior decision: keep EverCore memory volatile/)
   assert.match(context.systemPrompt, /not authoritative project state/)
+  assert.equal(context.memoryCapabilityAvailable, true)
   assert.equal(context.memoryProviderDiagnostics?.provider, 'test-memory')
   assert.equal(context.memoryProviderDiagnostics?.hitCount, 1)
+  assert.equal(context.systemPromptBlocks?.at(-2)?.cacheable, false)
+  assert.equal(context.systemPromptBlocks?.at(-2)?.text.includes('Long-Term Memory Capability'), true)
   assert.equal(context.systemPromptBlocks?.at(-1)?.cacheable, false)
   assert.equal(context.systemPromptBlocks?.at(-1)?.text.includes('Long-term semantic memory'), true)
 })
+
+test('assembleContext omits Memory Capability block when provider is disabled', async () => {
+  const context = await assembleContext({
+    runtimeOptions: {
+      sessionId: 'session-memory-provider-disabled',
+      prompt: 'Use prior context if available',
+      cwd: tmpdir(),
+    },
+    events: [],
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+    memoryProvider: {
+      name: 'noop-memory',
+      async retrieve() {
+        return {
+          content: '',
+          diagnostics: {
+            provider: 'noop-memory',
+            enabled: false,
+            hitCount: 0,
+            injectedChars: 0,
+            budgetChars: 0,
+            maxHitChars: 0,
+            truncated: false,
+            scope: 'unknown',
+          },
+        }
+      },
+    },
+  })
+
+  assert.doesNotMatch(context.systemPrompt, /Long-Term Memory Capability:/)
+  assert.equal(context.memoryCapabilityAvailable, false)
+})
+
 
 test('extractEverCoreMemoryHits reads current EverOS typed search response', () => {
   const hits = extractEverCoreMemoryHits({
@@ -3611,8 +3652,10 @@ test('assembleContext keeps MemoryProvider failures out of provider-visible cont
     },
   })
 
-  assert.doesNotMatch(context.systemPrompt, /Long-term semantic memory/)
+  assert.match(context.systemPrompt, /Long-Term Memory Capability:/)
+  assert.doesNotMatch(context.systemPrompt, /Long-term semantic memory \(volatile, retrieved for the current request\):/)
   assert.doesNotMatch(context.systemPrompt, /EverCore unavailable/)
+  assert.equal(context.memoryCapabilityAvailable, true)
   assert.equal(context.memoryProviderDiagnostics?.error, 'EverCore unavailable')
 })
 

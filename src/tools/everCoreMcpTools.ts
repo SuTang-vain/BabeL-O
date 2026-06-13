@@ -55,7 +55,7 @@ function createMemorySearchTool(
 ): ToolDefinition<typeof searchInputSchema> {
   return {
     name: 'mcp:evercore:memory_search',
-    description: 'Search EverCore long-term semantic memory on explicit request.',
+    description: 'Search EverCore long-term semantic memory. Use this read-only tool when the user asks about prior preferences, previous decisions, cross-session context, or says things like "do you remember", "before", "last time", "之前", "上次", or "我的偏好". Results are background hints, not authoritative project state; verify project facts against workspace evidence.',
     risk: 'read',
     inputSchema: searchInputSchema,
     modelInputSchema: z.toJSONSchema(searchInputSchema),
@@ -122,7 +122,7 @@ function createMemorySaveNoteTool(
 ): ToolDefinition<typeof saveNoteInputSchema> {
   return {
     name: 'mcp:evercore:memory_save_note',
-    description: 'Save an explicit user/model note to EverCore long-term memory.',
+    description: 'Save a note to EverCore long-term memory only when the user explicitly asks you to remember something, or when an approved governed memory candidate should be written. This is write-risk and permission-gated. Prefer saving user preferences, durable constraints, or work-style feedback; do not save high-impact project facts without workspace evidence and user approval.',
     risk: 'write',
     inputSchema: saveNoteInputSchema,
     modelInputSchema: z.toJSONSchema(saveNoteInputSchema),
@@ -179,7 +179,7 @@ function createMemoryFlushSessionTool(
 ): ToolDefinition<typeof flushInputSchema> {
   return {
     name: 'mcp:evercore:memory_flush_session',
-    description: 'Flush an explicit session into EverCore memory processing.',
+    description: 'Flush an explicit session into EverCore memory processing. This is a lifecycle/write-risk operation and is normally owned by runtime session close; call it only when the user explicitly asks to sync/flush memory now or during a diagnostic memory workflow.',
     risk: 'write',
     inputSchema: flushInputSchema,
     modelInputSchema: z.toJSONSchema(flushInputSchema),

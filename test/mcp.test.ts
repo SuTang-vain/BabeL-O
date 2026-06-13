@@ -260,6 +260,8 @@ test('EverCore memory_search MCP tool returns bounded explicit search diagnostic
     assert.equal(searchTool.allowed, true)
     assert.equal(searchTool.risk, 'read')
     assert.equal(searchTool.requiresApproval, false)
+    assert.match(searchTool.description, /prior preferences/)
+    assert.match(searchTool.description, /workspace evidence/)
     assert.deepEqual(searchTool.source, {
       type: 'mcp',
       serverName: 'evercore',
@@ -325,6 +327,16 @@ test('EverCore write MCP tools require permission and call add/flush only after 
       config: createEverCoreTestConfig({ mcpToolsEnabled: true }),
     },
   })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  const auditResponse = await app.inject({ method: 'GET', url: '/v1/tools/audit' })
+  const audit = auditResponse.json()
+  const saveTool = audit.tools.find((tool: { name: string }) => tool.name === 'mcp:evercore:memory_save_note')
+  const flushTool = audit.tools.find((tool: { name: string }) => tool.name === 'mcp:evercore:memory_flush_session')
+  assert.match(saveTool.description, /permission-gated/)
+  assert.match(saveTool.description, /workspace evidence/)
+  assert.match(flushTool.description, /runtime session close/)
+  await app.close()
+
   const saveSessionId = `session-evercore-mcp-save-${Date.now()}`
   const saveEvents: NexusEvent[] = []
   for await (const event of runtime.executeStream({

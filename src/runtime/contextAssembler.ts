@@ -93,6 +93,7 @@ export type AssembledContext = {
   microcompactMetrics: MicrocompactMetrics
   selectionDiagnostics: ContextSelectionDiagnostics
   memoryProviderDiagnostics?: MemoryProviderDiagnostics
+  memoryCapabilityAvailable: boolean
   scopedMemoryDiagnostics: MemoryProviderDiagnostics[]
 }
 
@@ -275,6 +276,14 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     workingSet: workingSet || undefined,
     prompt: options.runtimeOptions.prompt,
   })
+  const memoryCapabilityAvailable = memoryProviderResult?.diagnostics.enabled === true
+  if (memoryCapabilityAvailable) {
+    sections.push({
+      id: 'long_term_memory_capability',
+      cacheable: false,
+      content: formatLongTermMemoryCapability(),
+    })
+  }
   if (memoryProviderResult?.content) {
     sections.push({
       id: 'long_term_memory',
@@ -338,8 +347,20 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     microcompactMetrics: microcompactResult.metrics,
     selectionDiagnostics,
     memoryProviderDiagnostics: memoryProviderResult?.diagnostics,
+    memoryCapabilityAvailable,
     scopedMemoryDiagnostics,
   }
+}
+
+function formatLongTermMemoryCapability(): string {
+  return [
+    'Long-Term Memory Capability:',
+    '- Long-term memory is available for this session.',
+    '- Use memory_search when the user asks about prior preferences, previous decisions, cross-session context, or says things like "do you remember", "before", "last time", "之前", "上次", or "我的偏好".',
+    '- Treat memory results as background hints, not authoritative project state.',
+    '- Verify project facts against workspace evidence before acting.',
+    '- Only save memory when the user explicitly asks you to remember something or when a governed memory candidate is approved.',
+  ].join('\n')
 }
 
 function buildScopedMemoryDiagnostics(options: {

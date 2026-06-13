@@ -99,6 +99,7 @@ export type ContextAnalysisDiagnostics = {
     truncated: boolean
   }
   longTermMemory: MemoryProviderDiagnostics
+  longTermMemoryCapabilityAvailable: boolean
   scopedMemory: MemoryProviderDiagnostics[]
   sessionMemoryLite: SessionMemoryLiteStatus
   compactRetention: {
@@ -197,6 +198,7 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   longTermMemoryProvider: string
   longTermMemoryEnabled: boolean
   longTermMemoryHitCount: number
+  longTermMemoryCapabilityAvailable: boolean
   longTermMemoryInjectedChars: number
   longTermMemoryBudgetChars: number
   longTermMemoryTruncated: boolean
@@ -427,6 +429,7 @@ function buildContextDiagnosticEnvelope(options: {
       longTermMemoryProvider: options.diagnostics.longTermMemory.provider,
       longTermMemoryEnabled: options.diagnostics.longTermMemory.enabled,
       longTermMemoryHitCount: options.diagnostics.longTermMemory.hitCount,
+      longTermMemoryCapabilityAvailable: options.diagnostics.longTermMemoryCapabilityAvailable,
       longTermMemoryInjectedChars: options.diagnostics.longTermMemory.injectedChars,
       longTermMemoryBudgetChars: options.diagnostics.longTermMemory.budgetChars,
       longTermMemoryTruncated: options.diagnostics.longTermMemory.truncated,
@@ -526,6 +529,7 @@ function buildContextDiagnostics(options: {
       truncated: false,
       scope: 'unknown',
     },
+    longTermMemoryCapabilityAvailable: options.assembled.memoryCapabilityAvailable,
     scopedMemory: options.assembled.scopedMemoryDiagnostics,
     sessionMemoryLite: buildSessionMemoryLiteStatus(options.events),
     compactRetention: {

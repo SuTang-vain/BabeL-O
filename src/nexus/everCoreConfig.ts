@@ -15,6 +15,7 @@ import {
   startManagedEverCoreSidecar,
   type EverCoreSidecarMode,
   type EverCoreSidecarOptions,
+  type EverCoreManagedLlmProtocol,
   type EverCoreSidecarStatus,
 } from './everCoreSidecar.js'
 
@@ -43,6 +44,7 @@ export type EverCoreConfigInput = {
   managedDataDir?: string
   managedStartupTimeoutMs?: number
   managedHealthIntervalMs?: number
+  managedLlmProtocol?: EverCoreManagedLlmProtocol
   managedLlmApiKey?: string
   managedLlmBaseUrl?: string
   managedLlmModel?: string
@@ -128,6 +130,7 @@ export async function configureEverCoreFromEnv(
     managedPort: parsePositiveInt(env.BABEL_O_EVERCORE_MANAGED_PORT),
     managedDataDir: env.BABEL_O_EVERCORE_DATA_DIR,
     managedStartupTimeoutMs: parsePositiveInt(env.BABEL_O_EVERCORE_MANAGED_STARTUP_TIMEOUT_MS),
+    managedLlmProtocol: parseManagedLlmProtocol(env.BABEL_O_EVERCORE_LLM_PROTOCOL),
     managedLlmApiKey: env.BABEL_O_EVERCORE_LLM_API_KEY,
     managedLlmBaseUrl: env.BABEL_O_EVERCORE_LLM_BASE_URL,
     managedLlmModel: env.BABEL_O_EVERCORE_LLM_MODEL,
@@ -274,25 +277,34 @@ function createEverCoreMemoryProvider(client: EverCoreClient, config: EverCoreRu
 
 function resolveManagedEverCoreLlmConfig(input: EverCoreConfigInput): EverCoreSidecarOptions['llm'] | undefined {
   const explicit = {
+    protocol: input.managedLlmProtocol,
     apiKey: input.managedLlmApiKey?.trim(),
     baseUrl: input.managedLlmBaseUrl?.trim(),
     model: input.managedLlmModel?.trim(),
   }
-  if (explicit.apiKey || explicit.baseUrl || explicit.model) return explicit
+  if (explicit.protocol || explicit.apiKey || explicit.baseUrl || explicit.model) return explicit
 
   const settings = input.providerSettings
   if (!settings) return undefined
   try {
     const provider = getProvider(settings.providerId)
-    if (provider.adapter !== 'openai-compatible' && provider.adapter !== 'openai-responses') return undefined
+    const protocol = resolveEverCoreLlmProtocol(provider.adapter)
+    if (!protocol) return undefined
+    return {
+      protocol,
+      apiKey: settings.apiKey,
+      baseUrl: settings.baseUrl,
+      model: stripProviderPrefix(settings.modelId),
+    }
   } catch {
     return undefined
   }
-  return {
-    apiKey: settings.apiKey,
-    baseUrl: settings.baseUrl,
-    model: stripProviderPrefix(settings.modelId),
-  }
+}
+
+function resolveEverCoreLlmProtocol(adapter: string): EverCoreManagedLlmProtocol | undefined {
+  if (adapter === 'openai-compatible' || adapter === 'openai-responses') return 'openai-compatible'
+  if (adapter === 'anthropic-compatible') return 'anthropic-compatible'
+  return undefined
 }
 
 function stripProviderPrefix(modelId: string): string {
@@ -441,6 +453,11 @@ function parsePositiveInt(value: string | undefined): number | undefined {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed <= 0) return undefined
   return parsed
+}
+
+function parseManagedLlmProtocol(value: string | undefined): EverCoreManagedLlmProtocol | undefined {
+  if (value === 'openai-compatible' || value === 'anthropic-compatible') return value
+  return undefined
 }
 
 function redactEverCoreUrl(raw: string): string {

@@ -588,6 +588,7 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
     },
     selectionDiagnostics: createEmptyContextSelectionDiagnostics(allocateBudget('missing-model-for-default-budget').maxTokens),
     scopedMemoryDiagnostics: [],
+    memoryCapabilityAvailable: false,
   }
   const compactFailureEvent: NexusEvent = {
     type: 'compact_failure',
@@ -2683,6 +2684,7 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(spawnCalls[0]?.env.EVEROS_MEMORY__ROOT, dataDir)
   assert.equal(spawnCalls[0]?.env.EVEROS_API__HOST, '127.0.0.1')
   assert.equal(spawnCalls[0]?.env.EVEROS_API__PORT, '9876')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__PROTOCOL, 'openai-compatible')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'openai-key')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.openai.example/v1')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'gpt-4o')
@@ -2691,7 +2693,7 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(killed, true)
 })
 
-test('EverCore managed mode does not auto-map Anthropic-compatible provider settings', async () => {
+test('EverCore managed mode auto-maps Anthropic-compatible provider settings', async () => {
   const spawnCalls: Array<{ env: NodeJS.ProcessEnv }> = []
   const configured = await configureEverCore({
     mode: 'managed',
@@ -2722,9 +2724,10 @@ test('EverCore managed mode does not auto-map Anthropic-compatible provider sett
   })
 
   assert.ok(configured.client)
-  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, undefined)
-  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, undefined)
-  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__PROTOCOL, 'anthropic-compatible')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'minimax-key')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.minimaxi.com/anthropic')
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'MiniMax-M3')
   await configured.dispose?.()
 })
 
@@ -2735,6 +2738,7 @@ test('EverCore managed mode uses explicit LLM override for sidecar env', async (
     managedPort: 9878,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedLlmProtocol: 'openai-compatible',
     managedLlmApiKey: 'evercore-key',
     managedLlmBaseUrl: 'https://openai-compatible.example/v1',
     managedLlmModel: 'memory-model',
@@ -2762,6 +2766,7 @@ test('EverCore managed mode uses explicit LLM override for sidecar env', async (
   })
 
   assert.ok(configured.client)
+  assert.equal(spawnCalls[0]?.env.EVEROS_LLM__PROTOCOL, 'openai-compatible')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'evercore-key')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://openai-compatible.example/v1')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'memory-model')
