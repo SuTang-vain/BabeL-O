@@ -52,7 +52,9 @@ bbl go
 
 ### 发布版安装脚本
 
-macOS 和 Linux 下，安装脚本会检测系统与架构，安装匹配的 `bbl` release 二进制，并同时安装正式入口 `bbl go` 使用的 Go TUI 二进制：
+macOS 和 Linux 下，安装脚本会检测系统与架构，优先安装轻量 portable release 包。该包内置正式 Go TUI 与已编译的 Nexus CLI/runtime，但复用系统 Node.js，不再下载体积很大的 Node SEA 单文件二进制。
+
+前提条件：Node.js >= 22。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
@@ -62,19 +64,21 @@ bbl go
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.4 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
 bbl go
 ```
 
-### 手动下载发布二进制
+### 手动下载发布包
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制和匹配的 `go-tui-*` 资产，也可以查看 [v0.3.4 发布说明](docs/releases/v0.3.4.md) 中的版本下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新 `bbl-<platform>.tar.gz` 包，也可以查看 [v0.3.5 发布说明](docs/releases/v0.3.5.md) 中的版本下载链接。
 
-将下载好的 `bbl` 放入系统 `$PATH` 后运行：
+解压后将其中的 `bin/` 目录加入系统 `$PATH`，然后运行：
 
 ```bash
 bbl go
 ```
+
+Windows 用户请解压 `bbl-windows-x64.tar.gz`，然后运行 `bin\bbl.cmd go`。
 
 ### 从源码构建
 
@@ -95,7 +99,15 @@ npm link
 bbl go
 ```
 
-构建 Node 单文件二进制：
+构建轻量 portable 包：
+
+```bash
+npm run build
+cd clients/go-tui && make build && cd ../..
+npm run build:portable
+```
+
+构建旧版 Node SEA 单文件二进制：
 
 ```bash
 npm run build:binary

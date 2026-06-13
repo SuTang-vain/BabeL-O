@@ -41,12 +41,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
+          - os: macos-15
             goos: darwin
             goarch: arm64
             artifact: go-tui-darwin-arm64
             binary_name: go-tui
-          - os: macos-13
+          - os: macos-15-intel
             goos: darwin
             goarch: amd64
             artifact: go-tui-darwin-x64

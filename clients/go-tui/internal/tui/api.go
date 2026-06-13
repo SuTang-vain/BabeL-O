@@ -75,6 +75,7 @@ func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, bas
 	return func() tea.Msg {
 		var payload runtimeConfig
 		body := map[string]string{"provider": providerID}
+		apiKey = sanitizeModelAPIKeyInput(apiKey)
 		if strings.TrimSpace(apiKey) != "" {
 			body["apiKey"] = apiKey
 		}

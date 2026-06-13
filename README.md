@@ -52,7 +52,9 @@ It connects to Nexus, can auto-start a local Nexus service for you, and gives yo
 
 ### Release Installer
 
-On macOS and Linux, the installer detects your platform, installs the matching `bbl` release binary, and also installs the matching Go TUI binary used by the production `bbl go` entrypoint:
+On macOS and Linux, the installer detects your platform and installs the lightweight portable release package. The package contains the production Go TUI and the compiled Nexus CLI/runtime, while using your system Node.js instead of a large Node SEA executable.
+
+Prerequisite: Node.js >= 22.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
@@ -62,19 +64,21 @@ bbl go
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.4 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
 bbl go
 ```
 
-### Manual Release Binary
+### Manual Release Package
 
-Download the latest standalone executable and matching `go-tui-*` asset from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.4 release notes](docs/releases/v0.3.4.md) for version-specific links.
+Download the latest `bbl-<platform>.tar.gz` package from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.5 release notes](docs/releases/v0.3.5.md) for version-specific links.
 
-Move the downloaded `bbl` binary into your `$PATH`, then run:
+Extract it, add its `bin/` directory to your `$PATH`, then run:
 
 ```bash
 bbl go
 ```
+
+On Windows, extract `bbl-windows-x64.tar.gz` and run `bin\bbl.cmd go`.
 
 ### Build From Source
 
@@ -95,7 +99,15 @@ npm link
 bbl go
 ```
 
-Build the standalone Node binary:
+Build the lightweight portable package:
+
+```bash
+npm run build
+cd clients/go-tui && make build && cd ../..
+npm run build:portable
+```
+
+Build the legacy standalone Node SEA binary:
 
 ```bash
 npm run build:binary

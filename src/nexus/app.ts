@@ -269,35 +269,55 @@ function sanitizeProfileConfig(name: string, profile: ProfileConfig, activeProfi
   }
 }
 
-function isProviderConfiguredForSharedView(manager: ConfigManager, providerId: string): boolean {
-  const provider = providerRegistry.find(item => item.id === providerId)
-  if (!provider) return false
-  if (provider.authMode === 'none') return true
+type RuntimeProviderAuthSource = 'none' | 'env' | 'profile' | 'provider_config'
 
-  const activeSettings = manager.resolveSettings()
-  if (activeSettings.providerId === providerId && activeSettings.apiKeySource !== 'none' && Boolean(activeSettings.apiKey)) {
-    return true
+function providerCredentialEnv(providerId: string): string | undefined {
+  if (process.env.BABEL_O_API_KEY) return process.env.BABEL_O_API_KEY
+  if (providerId === 'anthropic') return process.env.ANTHROPIC_API_KEY
+  if (providerId === 'openai') return process.env.OPENAI_API_KEY
+  if (providerId === 'deepseek') return process.env.DEEPSEEK_API_KEY
+  if (providerId === 'zhipu') return process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY
+  if (providerId === 'minimax') return process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN
+  if (providerId === 'moonshot') return process.env.MOONSHOT_API_KEY
+  if (providerId === 'ollama') return process.env.OLLAMA_API_KEY
+  return undefined
+}
+
+function profileProviderId(profile: ProfileConfig): string | undefined {
+  if (profile.provider) return profile.provider
+  if (profile.model?.includes('/')) return profile.model.slice(0, profile.model.indexOf('/'))
+  return undefined
+}
+
+function resolveProviderAuthState(
+  manager: ConfigManager,
+  providerId: string,
+): { configured: boolean; authConfigured: boolean; authSource: RuntimeProviderAuthSource } {
+  const provider = providerRegistry.find(item => item.id === providerId)
+  if (!provider) {
+    return { configured: false, authConfigured: false, authSource: 'none' }
+  }
+  if (provider.authMode === 'none') {
+    return { configured: true, authConfigured: true, authSource: 'none' }
   }
 
-  if (process.env.BABEL_O_API_KEY) return true
-  let providerEnvConfigured = false
-  if (providerId === 'anthropic') providerEnvConfigured = Boolean(process.env.ANTHROPIC_API_KEY)
-  if (providerId === 'openai') providerEnvConfigured = Boolean(process.env.OPENAI_API_KEY)
-  if (providerId === 'deepseek') providerEnvConfigured = Boolean(process.env.DEEPSEEK_API_KEY)
-  if (providerId === 'zhipu') providerEnvConfigured = Boolean(process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY)
-  if (providerId === 'minimax') providerEnvConfigured = Boolean(process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN)
-  if (providerId === 'moonshot') providerEnvConfigured = Boolean(process.env.MOONSHOT_API_KEY)
-  if (providerId === 'ollama') providerEnvConfigured = Boolean(process.env.OLLAMA_API_KEY)
-  if (providerEnvConfigured) return true
-  if (manager.getProviderConfig(providerId).apiKey) return true
+  const providerConfigApiKey = manager.getProviderConfig(providerId).apiKey
+  const configured = Boolean(providerConfigApiKey)
 
-  return Object.values(manager.getProfiles()).some(profile => {
-    if (!profile.apiKey) return false
-    const profileProvider =
-      profile.provider ??
-      (profile.model?.includes('/') ? profile.model.slice(0, profile.model.indexOf('/')) : undefined)
-    return profileProvider === providerId
-  })
+  let authSource: RuntimeProviderAuthSource = 'none'
+  if (providerCredentialEnv(providerId)) {
+    authSource = 'env'
+  } else if (Object.values(manager.getProfiles()).some(profile => Boolean(profile.apiKey) && profileProviderId(profile) === providerId)) {
+    authSource = 'profile'
+  } else if (providerConfigApiKey) {
+    authSource = 'provider_config'
+  }
+
+  return {
+    configured,
+    authConfigured: authSource !== 'none',
+    authSource,
+  }
 }
 
 const providerFallbackPlanSchema = z.object({
@@ -1098,6 +1118,7 @@ export async function createNexusApp(
       version: manager.getConfigVersion(),
       tombstones: manager.getTombstones(),
       providers: providerRegistry.map((p) => {
+        const authState = resolveProviderAuthState(manager, p.id)
         return {
           id: p.id,
           displayName: p.displayName,
@@ -1105,7 +1126,9 @@ export async function createNexusApp(
           authMode: p.authMode,
           defaultBaseUrl: p.defaultBaseUrl,
           defaultModel: p.defaultModel,
-          configured: isProviderConfiguredForSharedView(manager, p.id),
+          configured: authState.configured,
+          authConfigured: authState.authConfigured,
+          authSource: authState.authSource,
           active: settings.providerId === p.id,
           models: p.models.map((mid) => {
             const def = modelRegistry.find((m) => m.id === mid)
@@ -1222,7 +1245,7 @@ export async function createNexusApp(
       })
     }
 
-    manager.setDefaultModel(modelId)
+    manager.setDefaultModel(modelId, { clearActiveProfile: true })
     return inspectResolvedRuntimeConfig(manager)
   })
 

@@ -183,6 +183,33 @@ func TestSaveRuntimeProviderConfigPostsProviderCredentials(t *testing.T) {
 	}
 }
 
+func TestSaveRuntimeProviderConfigOmitsEmptyAPIKeyToKeepSavedCredential(t *testing.T) {
+	var seenBody map[string]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_config","modelId":"minimax/MiniMax-M3","providerId":"minimax","authMode":"api-key","hasApiKey":true}`))
+	}))
+	defer server.Close()
+
+	msg := saveRuntimeProviderConfig(Config{BaseURL: server.URL}, "minimax", "", "https://api.minimaxi.com/anthropic")()
+	got, ok := msg.(providerConfigMsg)
+	if !ok {
+		t.Fatalf("expected providerConfigMsg, got %T", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("saveRuntimeProviderConfig returned error: %v", got.err)
+	}
+	if _, ok := seenBody["apiKey"]; ok {
+		t.Fatalf("empty API key should be omitted so the saved credential is preserved: %#v", seenBody)
+	}
+	if seenBody["provider"] != "minimax" || seenBody["baseUrl"] != "https://api.minimaxi.com/anthropic" {
+		t.Fatalf("unexpected body: %#v", seenBody)
+	}
+}
+
 func TestFormatRuntimeConfigAndProfiles(t *testing.T) {
 	configLine := formatRuntimeConfig(runtimeConfig{
 		ModelID:       "openai/gpt-4o",
@@ -8043,17 +8070,14 @@ func TestMouseWheelRoutesToHelpOverlay(t *testing.T) {
 }
 
 // TestMouseWheelDisabledWhenMouseCaptureOff verifies that
-// the wheel is a complete no-op when the operator has not
-// opted in via --mouse. In that mode the terminal owns the
-// wheel-to-arrow conversion (or just scrolls its own
-// scrollback), and the app must ignore any stray MouseMsg
-// it still sees. This is the gate that preserves
-// terminal-native drag-to-select text selection.
+// the wheel is a complete no-op when the operator explicitly
+// opts out with --mouse=false. In that mode the terminal owns
+// the wheel-to-arrow conversion (or just scrolls its own
+// scrollback), and the app must ignore any stray MouseMsg it
+// still sees. This is the gate that preserves terminal-native
+// drag-to-select text selection for the opt-out path.
 func TestMouseWheelDisabledWhenMouseCaptureOff(t *testing.T) {
-	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
-	if m.cfg.MouseCapture {
-		t.Fatalf("test precondition: cfg.MouseCapture must default to false")
-	}
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: false})
 	fillScrollableViewport(&m)
 	startingYOffset := m.viewport.YOffset()
 
@@ -8065,6 +8089,37 @@ func TestMouseWheelDisabledWhenMouseCaptureOff(t *testing.T) {
 	if after.viewport.YOffset() != startingYOffset {
 		t.Fatalf("MouseCapture=off: wheel up should be a no-op, YOffset %d -> %d",
 			startingYOffset, after.viewport.YOffset())
+	}
+}
+
+func TestMouseWheelNeverScrollsTextEntryInput(t *testing.T) {
+	cases := []inputMode{
+		modeModelPickBaseURL,
+		modePermissionEditRule,
+		modePermissionEditFeedback,
+		modeSessionInput,
+	}
+	for _, mode := range cases {
+		t.Run(string(mode), func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+			m.width = 100
+			m.height = 30
+			m.setMode(mode)
+			m.setInputValue(strings.Repeat("line\n", 20))
+			m.input.SetHeight(3)
+			updated, _ := m.input.Update(keyPress(tea.KeyDown))
+			m.input = updated
+			startingInputOffset := m.input.ScrollYOffset()
+
+			updatedModel, cmd := m.Update(mouseWheel(tea.MouseWheelDown, 0, 0))
+			if cmd != nil {
+				t.Fatalf("mouse wheel in %s returned cmd %T", mode, cmd)
+			}
+			after := updatedModel.(model)
+			if got := after.input.ScrollYOffset(); got != startingInputOffset {
+				t.Fatalf("mouse wheel in %s scrolled textarea YOffset %d -> %d", mode, startingInputOffset, got)
+			}
+		})
 	}
 }
 
@@ -8390,11 +8445,14 @@ func TestModelPickApiKeyRendersSinglePromptArrow(t *testing.T) {
 		t.Fatalf("renderModelPickApiKey rendered a double-prompt line; the input line is duplicated.\nfull:\n%s", rendered)
 	}
 	visible := stripANSICodes(rendered)
-	if !strings.Contains(visible, "> paste API key (or accept default)") {
-		t.Fatalf("renderModelPickApiKey missing the mode-specific placeholder; the user should see `> paste API key …`.\nfull:\n%s", rendered)
+	if !strings.Contains(visible, "> paste API key") {
+		t.Fatalf("renderModelPickApiKey missing the mode-specific placeholder; the user should see `> paste API key`.\nfull:\n%s", rendered)
 	}
 	if strings.Contains(visible, "Ask BabeL-O") {
 		t.Fatalf("renderModelPickApiKey still shows the default 'Ask BabeL-O' placeholder; the /model context should override it.\nfull:\n%s", rendered)
+	}
+	if strings.Contains(visible, ":::") {
+		t.Fatalf("renderModelPickApiKey should not use textarea continuation prompts for API keys.\nfull:\n%s", rendered)
 	}
 }
 
@@ -8452,13 +8510,223 @@ func TestInputShiftEnterInsertsNewlineWithoutSubmitting(t *testing.T) {
 	}
 }
 
+func TestModelPickApiKeyPasteSanitizesSingleLineSecret(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickApiKey)
+
+	updated, _ := m.Update(tea.PasteMsg{Content: " sk-cp-abc\r\nDEF\tGHI\n "})
+	m = updated.(model)
+
+	if got := m.modelPickAPIKeyDraft; got != "sk-cp-abcDEFGHI" {
+		t.Fatalf("api key draft = %q, want sanitized single-line key", got)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("api key paste should not touch textarea, got %q", got)
+	}
+	if m.pastedTextCounter != 0 {
+		t.Fatalf("api key paste should not create pasted-text placeholders, got counter=%d", m.pastedTextCounter)
+	}
+}
+
+func TestModelPickApiKeyBackspaceAndClear(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickApiKey)
+	m.modelPickAPIKeyDraft = "sk-test"
+
+	updated, _ := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyBackspace}))
+	m = updated.(model)
+	if got := m.modelPickAPIKeyDraft; got != "sk-tes" {
+		t.Fatalf("backspace draft = %q, want sk-tes", got)
+	}
+
+	updated, _ = m.Update(ctrlKey('u'))
+	m = updated.(model)
+	if got := m.modelPickAPIKeyDraft; got != "" {
+		t.Fatalf("ctrl+u draft = %q, want empty", got)
+	}
+}
+
+func TestModelPickApiKeySpecialKeysDoNotTypeOrBreakWheelCSI(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{
+			{ID: "anthropic"},
+			{ID: "minimax"},
+			{ID: "openai"},
+		},
+	}
+	m.modelPickProviderIdx = 1
+	m.setMode(modeModelPickApiKey)
+	m.modelPickAPIKeyDraft = "sk-test"
+
+	updated, cmd := m.Update(keyPress(tea.KeyUp))
+	m = updated.(model)
+	if cmd != nil {
+		t.Fatalf("up key in api key mode should not return cmd, got %T", cmd)
+	}
+	if got := m.modelPickAPIKeyDraft; got != "sk-test" {
+		t.Fatalf("up key should not type into api key draft, got %q", got)
+	}
+
+	updated, cmd = m.Update(fmt.Stringer(fmtString("?CSI[60 54 53 59 52 53 59 53 77]?")))
+	m = updated.(model)
+	if cmd != nil {
+		t.Fatalf("wheel CSI in api key mode should not return cmd, got %T", cmd)
+	}
+	if got := m.modelPickAPIKeyDraft; got != "sk-test" {
+		t.Fatalf("wheel CSI should not type into api key draft, got %q", got)
+	}
+}
+
+func TestModelPickApiKeyRequiresNonEmptyDraft(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickApiKey)
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+
+	if cmd != nil {
+		t.Fatalf("empty api key should not return cmd, got %T", cmd)
+	}
+	if m.inputMode != modeModelPickApiKey {
+		t.Fatalf("empty api key inputMode = %q, want %q", m.inputMode, modeModelPickApiKey)
+	}
+	rendered := renderTranscript(m.transcript, 120)
+	if !strings.Contains(rendered, "provider API key is required") {
+		t.Fatalf("empty api key should surface an error, got %q", rendered)
+	}
+}
+
+func TestModelPickConfiguredProviderStillShowsApiKeyStep(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:             "minimax",
+			DisplayName:    "MiniMax",
+			AuthMode:       "api-key",
+			DefaultBaseURL: "https://api.minimaxi.com/anthropic",
+			DefaultModel:   "minimax/MiniMax-M3",
+			Configured:     true,
+			AuthConfigured: true,
+			AuthSource:     "provider_config",
+		}},
+	}
+	m.setMode(modeModelPickProvider)
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+
+	if cmd != nil {
+		t.Fatalf("configured API-key provider should not jump directly to model picker, got cmd %T", cmd)
+	}
+	if m.inputMode != modeModelPickApiKey {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickApiKey)
+	}
+	if m.modelPickSelectedID != "minimax" {
+		t.Fatalf("modelPickSelectedID = %q, want minimax", m.modelPickSelectedID)
+	}
+}
+
+func TestModelPickNoAuthProviderSkipsApiKeyStep(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:           "local",
+			DisplayName:  "Local",
+			AuthMode:     "none",
+			DefaultModel: "local/coding-runtime",
+			Configured:   true,
+		}},
+	}
+	m.setMode(modeModelPickProvider)
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+
+	if cmd == nil {
+		t.Fatalf("no-auth provider should enter the live model picker and fetch runtime models")
+	}
+	if m.inputMode != modeModelPickModel {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickModel)
+	}
+	if !m.modelPickerLoading {
+		t.Fatalf("modelPickerLoading = false, want true")
+	}
+}
+
+func TestModelPickApiKeyEmptyEnterKeepsSavedProviderCredential(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:          "minimax",
+			DisplayName: "MiniMax",
+			AuthMode:    "api-key",
+			Configured:  true,
+			AuthSource:  "provider_config",
+		}},
+	}
+	m.modelPickSelectedID = "minimax"
+	m.setMode(modeModelPickApiKey)
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+
+	if cmd != nil {
+		t.Fatalf("empty enter with saved provider credential should only advance to base URL, got cmd %T", cmd)
+	}
+	if m.inputMode != modeModelPickBaseURL {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickBaseURL)
+	}
+	rendered := renderTranscript(m.transcript, 120)
+	if strings.Contains(rendered, "provider API key is required") {
+		t.Fatalf("empty enter with saved provider credential should not emit missing-key error: %q", rendered)
+	}
+}
+
+func TestModelPickApiKeyEnterUsesSanitizedDraft(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeModelPickApiKey)
+	m.modelPickAPIKeyDraft = " sk-cp-abc\nDEF "
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+
+	if cmd != nil {
+		t.Fatalf("api key enter should only advance to base URL step, got cmd %T", cmd)
+	}
+	if got := m.modelPickAPIKeyDraft; got != "sk-cp-abcDEF" {
+		t.Fatalf("api key draft = %q, want sanitized key", got)
+	}
+	if m.inputMode != modeModelPickBaseURL {
+		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickBaseURL)
+	}
+}
+
 func TestModelProviderTextStepsAcceptTypedInput(t *testing.T) {
+	t.Run("api key", func(t *testing.T) {
+		m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+		m.setMode(modeModelPickApiKey)
+		for _, r := range "sk-test" {
+			updated, _ := m.Update(textKey(string(r)))
+			var ok bool
+			m, ok = updated.(model)
+			if !ok {
+				t.Fatalf("expected model, got %T", updated)
+			}
+		}
+		if got := m.modelPickAPIKeyDraft; got != "sk-test" {
+			t.Fatalf("api key draft = %q, want %q", got, "sk-test")
+		}
+		if got := m.input.Value(); got != "" {
+			t.Fatalf("api key step should not write into the textarea, got %q", got)
+		}
+	})
+
 	cases := []struct {
 		name string
 		mode inputMode
 		want string
 	}{
-		{"api key", modeModelPickApiKey, "sk-test"},
 		{"base url", modeModelPickBaseURL, "https://api.example.com"},
 	}
 	for _, tc := range cases {
@@ -10470,15 +10738,15 @@ func TestModelPickApiKeyDialogViewContainsProviderDefaultAndInput(t *testing.T) 
 		ID:           "anthropic",
 		DefaultModel: "claude-sonnet-4-6",
 	}
-	d := newModelPickApiKeyDialog(provider, "> paste API key (or accept default)")
+	d := newModelPickApiKeyDialog(provider, "> paste API key")
 	out := d.View(100)
 	for _, want := range []string{
 		"Enter your anthropic Key",
-		"Paste your provider key",
+		"Paste a single-line provider key",
 		"default model  claude-sonnet-4-6",
 		"config target  global provider credentials",
-		"> paste API key (or accept default)",
-		"enter continue · esc back",
+		"> paste API key",
+		"enter continue · esc back · ctrl+u clear",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("View(100) missing %q:\n%s", want, out)
@@ -10500,11 +10768,27 @@ func TestRenderModelPickApiKeyStillDelegatesToDialog(t *testing.T) {
 	}
 	m.modelPickSelectedID = "anthropic"
 	m.setMode(modeModelPickApiKey)
+	m.modelPickAPIKeyDraft = "sk-ant-1234567890"
 	got := m.renderModelPickApiKey(100)
-	want := newModelPickApiKeyDialog(m.currentModelProvider(), m.input.View()).View(100)
+	want := newModelPickApiKeyDialog(m.currentModelProvider(), modelAPIKeyFieldDisplay(m.modelPickAPIKeyDraft)).View(100)
 	if got != want {
 		t.Fatalf("renderModelPickApiKey(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
 			got, want)
+	}
+}
+
+func TestModelPickApiKeyDialogMasksFullSecret(t *testing.T) {
+	secret := "sk-ant-1234567890SECRET"
+	out := newModelPickApiKeyDialog(nil, modelAPIKeyFieldDisplay(secret)).View(100)
+	visible := stripANSICodes(out)
+	if strings.Contains(visible, secret) {
+		t.Fatalf("api key dialog leaked full secret:\n%s", visible)
+	}
+	if !strings.Contains(visible, "sk-ant…CRET") {
+		t.Fatalf("api key dialog should show a compact masked hint, got:\n%s", visible)
+	}
+	if strings.Contains(visible, ":::") {
+		t.Fatalf("api key dialog should not render textarea continuation prompts:\n%s", visible)
 	}
 }
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -21,6 +22,26 @@ func newModelPickApiKeyDialog(provider *registeredProvider, input string) *model
 	return &modelPickApiKeyDialog{provider: provider, input: input}
 }
 
+func modelAPIKeyFieldDisplay(apiKey string) string {
+	apiKey = sanitizeModelAPIKeyInput(apiKey)
+	if apiKey == "" {
+		return mutedStyle.Render("> paste API key")
+	}
+	chars := utf8.RuneCountInString(apiKey)
+	return fmt.Sprintf("> %s", statusStyle.Render(maskAPIKeyForDisplay(apiKey)+" · "+fmt.Sprintf("%d chars", chars)))
+}
+
+func maskAPIKeyForDisplay(apiKey string) string {
+	apiKey = sanitizeModelAPIKeyInput(apiKey)
+	runes := []rune(apiKey)
+	if len(runes) <= 8 {
+		return strings.Repeat("•", len(runes))
+	}
+	prefixLen := min(6, len(runes))
+	suffixLen := min(4, len(runes)-prefixLen)
+	return string(runes[:prefixLen]) + "…" + string(runes[len(runes)-suffixLen:])
+}
+
 func (d *modelPickApiKeyDialog) ID() string { return "modelPickApiKey" }
 
 // HandleMsg is intentionally a no-op in C.2. The existing
@@ -36,19 +57,28 @@ func (d *modelPickApiKeyDialog) View(width int) string {
 
 	rc := NewRenderContext(width)
 	rc.SetFrameStyle(overlayFrameStyle)
+	instruction := "Paste a single-line provider key. Whitespace is removed before saving."
+	footer := "  enter continue · esc back · ctrl+u clear"
+	if d.provider != nil && d.provider.Configured {
+		instruction = "Paste a new key to replace the saved one, or press Enter to keep it."
+		footer = "  enter keep/continue · paste replace · esc back · ctrl+u clear"
+	}
 	lines := []string{
 		titleStyle.Render(fmt.Sprintf("Enter your %s Key", firstNonEmpty(providerID, "Provider"))),
-		mutedStyle.Render("Paste your provider key. It will be saved in BabeL-O config."),
+		mutedStyle.Render(instruction),
 		"",
 	}
 	if d.provider != nil {
 		lines = append(lines, mutedStyle.Render(fmt.Sprintf("  default model  %s", d.provider.DefaultModel)))
 		lines = append(lines, mutedStyle.Render("  config target  global provider credentials"))
+		if d.provider.AuthSource != "" && d.provider.AuthSource != "none" {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  auth source    %s", d.provider.AuthSource)))
+		}
 		lines = append(lines, "")
 	}
 	lines = append(lines, "  "+d.input)
 	lines = append(lines, "")
-	lines = append(lines, mutedStyle.Render("  enter continue · esc back"))
+	lines = append(lines, mutedStyle.Render(footer))
 	rc.AddPart(strings.Join(lines, "\n"))
 	return rc.Render()
 }

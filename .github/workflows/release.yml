@@ -9,50 +9,83 @@ permissions:
   contents: write
 
 jobs:
-  build-bbl:
+  build-portable:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             artifact: bbl-darwin-arm64
+            goos: darwin
+            goarch: arm64
+            node_platform: darwin
+            node_arch: arm64
+            go_tui_binary: go-tui
           - os: macos-15-intel
             artifact: bbl-darwin-x64
+            goos: darwin
+            goarch: amd64
+            node_platform: darwin
+            node_arch: x64
+            go_tui_binary: go-tui
           - os: ubuntu-latest
             artifact: bbl-linux-x64
+            goos: linux
+            goarch: amd64
+            node_platform: linux
+            node_arch: x64
+            go_tui_binary: go-tui
           - os: windows-latest
-            artifact: bbl-windows-x64.exe
+            artifact: bbl-windows-x64
+            goos: windows
+            goarch: amd64
+            node_platform: win32
+            node_arch: x64
+            go_tui_binary: go-tui.exe
     runs-on: ${{ matrix.os }}
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           cache: npm
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.x'
+          cache-dependency-path: clients/go-tui/go.sum
       - run: npm ci
-      - run: npm run build:binary
-        shell: bash
-      - name: Rename binary
-        shell: bash
+      - run: npm run build
+      - name: Build Go TUI
+        working-directory: clients/go-tui
         run: |
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            mv dist/bbl.exe "${{ matrix.artifact }}"
-          else
-            mv dist/bbl "${{ matrix.artifact }}"
-          fi
+          mkdir -p bin
+          VERSION="$(node -p "require('../../package.json').version")"
+          COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          VERSION_PKG="github.com/sutang-vain/babel-o/clients/go-tui/internal/tui"
+          LDFLAGS="-X ${VERSION_PKG}.Version=${VERSION} -X ${VERSION_PKG}.Commit=${COMMIT} -X ${VERSION_PKG}.BuildDate=${BUILD_DATE}"
+          GOOS="${{ matrix.goos }}" GOARCH="${{ matrix.goarch }}" go build -ldflags "$LDFLAGS" -o "bin/${{ matrix.go_tui_binary }}" ./cmd/go-tui
+      - name: Build portable bundle
+        run: >
+          node scripts/build-portable.js
+          --platform ${{ matrix.node_platform }}
+          --arch ${{ matrix.node_arch }}
+          --go-tui clients/go-tui/bin/${{ matrix.go_tui_binary }}
+          --out ${{ matrix.artifact }}.tar.gz
       - uses: actions/upload-artifact@v6
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact }}.tar.gz
+          path: ${{ matrix.artifact }}.tar.gz
 
   build-go-tui:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             artifact: go-tui-darwin-arm64
             binary_name: go-tui
           - os: macos-15-intel
@@ -98,7 +131,7 @@ jobs:
 
   release:
     needs:
-      - build-bbl
+      - build-portable
       - build-go-tui
     runs-on: ubuntu-latest
     steps:

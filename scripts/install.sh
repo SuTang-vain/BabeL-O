@@ -7,9 +7,13 @@ LATEST_RELEASE_API="https://api.github.com/repos/$REPO/releases/latest"
 INSTALL_DIR="${BBL_INSTALL_DIR:-/usr/local/bin}"
 TMP_PATH=""
 GO_TUI_TMP_PATH=""
+PORTABLE_TMP_PATH=""
+PORTABLE_EXTRACT_DIR=""
 SELF_CHECK_TMP_PATH=""
 INSTALLED_GO_TUI_PATH=""
 SEA_PAYLOAD_PATH=""
+PORTABLE_INSTALL_DIR=""
+PORTABLE_INSTALLED=0
 
 supports_pretty_output() {
   [ -t 1 ] && [ "${TERM:-}" != "dumb" ] && [ "${BBL_INSTALL_PLAIN:-0}" != "1" ]
@@ -108,6 +112,12 @@ cleanup() {
   fi
   if [ -n "$GO_TUI_TMP_PATH" ] && [ -f "$GO_TUI_TMP_PATH" ]; then
     rm -f "$GO_TUI_TMP_PATH"
+  fi
+  if [ -n "$PORTABLE_TMP_PATH" ] && [ -f "$PORTABLE_TMP_PATH" ]; then
+    rm -f "$PORTABLE_TMP_PATH"
+  fi
+  if [ -n "$PORTABLE_EXTRACT_DIR" ] && [ -d "$PORTABLE_EXTRACT_DIR" ]; then
+    rm -rf "$PORTABLE_EXTRACT_DIR"
   fi
   if [ -n "$SELF_CHECK_TMP_PATH" ] && [ -f "$SELF_CHECK_TMP_PATH" ]; then
     rm -f "$SELF_CHECK_TMP_PATH"
@@ -212,7 +222,109 @@ validate_binary() {
   fail "Downloaded file is not a recognized executable binary."
 }
 
+validate_archive() {
+  path="$1"
+  expected_size="$2"
+  actual_size="$(file_size "$path")"
+
+  if [ "$actual_size" -le 0 ]; then
+    fail "Downloaded archive is empty."
+  fi
+
+  if [ -n "$expected_size" ] && printf '%s' "$expected_size" | grep -Eq '^[0-9]+$' && [ "$expected_size" -gt 0 ]; then
+    if [ "$actual_size" -ne "$expected_size" ]; then
+      fail "Downloaded archive is incomplete: expected $expected_size bytes, got $actual_size bytes."
+    fi
+  fi
+
+  if ! have tar; then
+    fail "tar is required to install the lightweight portable package."
+  fi
+  if ! tar -tzf "$path" >/dev/null 2>&1; then
+    fail "Downloaded file is not a valid tar.gz archive."
+  fi
+}
+
+node_major() {
+  node -p "Number(process.versions.node.split('.')[0])" 2>/dev/null || echo 0
+}
+
+ensure_node_for_portable() {
+  if ! have node; then
+    fail "BabeL-O v0.3.5 lightweight packages require Node.js >= 22 on PATH. Install Node.js, then rerun this installer."
+  fi
+  major="$(node_major)"
+  if ! printf '%s' "$major" | grep -Eq '^[0-9]+$' || [ "$major" -lt 22 ]; then
+    fail "BabeL-O v0.3.5 lightweight packages require Node.js >= 22; found Node.js $(node --version 2>/dev/null || echo unknown)."
+  fi
+}
+
+write_portable_launcher() {
+  app_dir="$1"
+  cat > "$TARGET_PATH" <<EOF
+#!/bin/sh
+set -eu
+APP_DIR="$app_dir"
+exec "\$APP_DIR/bin/bbl" "\$@"
+EOF
+  chmod +x "$TARGET_PATH"
+}
+
+install_portable_bundle() {
+  ensure_node_for_portable
+
+  PORTABLE_TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.portable.XXXXXX")"
+  PORTABLE_EXTRACT_DIR="$(mktemp -d "$INSTALL_DIR/bbl.portable.extract.XXXXXX")"
+  PORTABLE_EXPECTED_SIZE="$(content_length "$PORTABLE_DOWNLOAD_URL" || true)"
+
+  log_kv "Package asset" "$PORTABLE_NAME"
+  run_with_spinner "Downloading lightweight BabeL-O package" download_to "$PORTABLE_DOWNLOAD_URL" "$PORTABLE_TMP_PATH" || fail "Failed to download BabeL-O package from $PORTABLE_DOWNLOAD_URL."
+  run_with_spinner "Validating lightweight package" validate_archive "$PORTABLE_TMP_PATH" "$PORTABLE_EXPECTED_SIZE" || fail "Downloaded BabeL-O package failed validation."
+
+  tar -xzf "$PORTABLE_TMP_PATH" -C "$PORTABLE_EXTRACT_DIR"
+  PORTABLE_TOP_PATH=""
+  for candidate in "$PORTABLE_EXTRACT_DIR"/*; do
+    [ -e "$candidate" ] || continue
+    if [ -n "$PORTABLE_TOP_PATH" ]; then
+      fail "Portable package must contain exactly one top-level application directory."
+    fi
+    PORTABLE_TOP_PATH="$candidate"
+  done
+  if [ -z "$PORTABLE_TOP_PATH" ] || [ ! -d "$PORTABLE_TOP_PATH" ]; then
+    fail "Portable package did not contain an application directory."
+  fi
+
+  APP_INSTALL_ROOT="${BBL_APP_INSTALL_ROOT:-$HOME/.local/share/babel-o/app}"
+  PORTABLE_INSTALL_DIR="$APP_INSTALL_ROOT/$VERSION-$GO_TUI_PLATFORM_SUFFIX"
+  mkdir -p "$APP_INSTALL_ROOT"
+  if [ ! -w "$APP_INSTALL_ROOT" ]; then
+    fail "Portable app install directory is not writable: $APP_INSTALL_ROOT"
+  fi
+  rm -rf "$PORTABLE_INSTALL_DIR"
+  mv "$PORTABLE_TOP_PATH" "$PORTABLE_INSTALL_DIR"
+  rm -rf "$PORTABLE_EXTRACT_DIR"
+  PORTABLE_EXTRACT_DIR=""
+  rm -f "$PORTABLE_TMP_PATH"
+  PORTABLE_TMP_PATH=""
+
+  INSTALLED_GO_TUI_PATH="$PORTABLE_INSTALL_DIR/bin/go-tui-$GO_TUI_PLATFORM_SUFFIX"
+  case "$GO_TUI_BINARY_NAME" in
+    *windows*) INSTALLED_GO_TUI_PATH="$INSTALLED_GO_TUI_PATH.exe" ;;
+  esac
+  if [ ! -x "$INSTALLED_GO_TUI_PATH" ]; then
+    fail "Portable package is missing executable Go TUI binary: $INSTALLED_GO_TUI_PATH"
+  fi
+
+  write_portable_launcher "$PORTABLE_INSTALL_DIR"
+  PORTABLE_INSTALLED=1
+  log_ok "BabeL-O lightweight package installed: $PORTABLE_INSTALL_DIR"
+  log_ok "BabeL-O launcher installed: $TARGET_PATH"
+}
+
 install_shell_launcher() {
+  if [ "$PORTABLE_INSTALLED" = "1" ]; then
+    return 0
+  fi
   if [ -z "$INSTALLED_GO_TUI_PATH" ]; then
     return 0
   fi
@@ -434,7 +546,7 @@ run_self_check() {
     fi
 
     cat "$SELF_CHECK_TMP_PATH" >&2
-    fail "Install self-check failed: bbl go readiness check did not pass. Try BBL_INSTALL_SMOKE=0 to skip the check, or install from npm/source."
+    fail "Install self-check failed: bbl go readiness check did not pass. Try BBL_INSTALL_SMOKE=0 to skip the check, or install from source."
   fi
 
   if "$TARGET_PATH" --version >/dev/null 2>&1; then
@@ -454,7 +566,7 @@ else
 fi
 
 if [ -z "$VERSION" ]; then
-  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.4 to install a specific release."
+  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.5 to install a specific release."
 fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -486,7 +598,7 @@ case "$OS" in
         GO_TUI_PLATFORM_SUFFIX="linux-x64"
         ;;
       *)
-        fail "Unsupported Linux architecture: $ARCH. Only x64 is supported for the standalone installer. Install from npm/source on Linux arm64."
+        fail "Unsupported Linux architecture: $ARCH. Only x64 is supported for the release installer. Install from npm/source on Linux arm64."
         ;;
     esac
     ;;
@@ -497,6 +609,8 @@ esac
 
 DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$BINARY_NAME"
 GO_TUI_DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$GO_TUI_BINARY_NAME"
+PORTABLE_NAME="$BINARY_NAME.tar.gz"
+PORTABLE_DOWNLOAD_URL="https://github.com/$REPO/releases/download/$VERSION/$PORTABLE_NAME"
 PATH_SUGGESTION=false
 
 if [ -n "${BBL_INSTALL_DIR:-}" ]; then
@@ -512,55 +626,61 @@ elif [ ! -w "$INSTALL_DIR" ]; then
 fi
 
 TARGET_PATH="$INSTALL_DIR/bbl"
-TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.download.XXXXXX")"
-EXPECTED_SIZE="$(content_length "$DOWNLOAD_URL" || true)"
 
 log_kv "Version" "$VERSION"
 log_kv "System" "$OS ($ARCH)"
-log_kv "CLI asset" "$BINARY_NAME"
 log_kv "Install path" "$TARGET_PATH"
 
 if [ -z "$BINARY_NAME" ]; then
   fail "No standalone bbl binary is published for $OS ($ARCH). Install from npm/source, or use a supported release platform."
 fi
 
-if ! asset_exists "$DOWNLOAD_URL"; then
-  fail "Release asset not found: $DOWNLOAD_URL. The $VERSION release may not have finished publishing binaries yet."
-fi
+if asset_exists "$PORTABLE_DOWNLOAD_URL"; then
+  install_portable_bundle
+else
+  TMP_PATH="$(mktemp "$INSTALL_DIR/bbl.download.XXXXXX")"
+  EXPECTED_SIZE="$(content_length "$DOWNLOAD_URL" || true)"
 
-run_with_spinner "Downloading BabeL-O CLI" download_to "$DOWNLOAD_URL" "$TMP_PATH" || fail "Failed to download BabeL-O CLI from $DOWNLOAD_URL."
-run_with_spinner "Validating BabeL-O CLI" validate_binary "$TMP_PATH" "$EXPECTED_SIZE" || fail "Downloaded BabeL-O CLI failed validation."
-chmod +x "$TMP_PATH"
-mv "$TMP_PATH" "$TARGET_PATH"
-TMP_PATH=""
+  log_kv "CLI asset" "$BINARY_NAME"
 
-log_ok "BabeL-O CLI installed: $TARGET_PATH"
-
-if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
-  GO_TUI_INSTALL_DIR="${BBL_GO_TUI_INSTALL_DIR:-$HOME/.local/share/babel-o/bin}"
-  GO_TUI_TARGET_PATH="$GO_TUI_INSTALL_DIR/go-tui-$GO_TUI_PLATFORM_SUFFIX"
-  case "$GO_TUI_BINARY_NAME" in
-    *windows*) GO_TUI_TARGET_PATH="$GO_TUI_TARGET_PATH.exe" ;;
-  esac
-  mkdir -p "$GO_TUI_INSTALL_DIR"
-  if [ ! -w "$GO_TUI_INSTALL_DIR" ]; then
-    fail "Go TUI install directory is not writable: $GO_TUI_INSTALL_DIR"
+  if ! asset_exists "$DOWNLOAD_URL"; then
+    fail "Release asset not found: $DOWNLOAD_URL. The $VERSION release may not have finished publishing binaries yet."
   fi
 
-  if asset_exists "$GO_TUI_DOWNLOAD_URL"; then
-    GO_TUI_TMP_PATH="$(mktemp "$GO_TUI_INSTALL_DIR/go-tui.download.XXXXXX")"
-    GO_TUI_EXPECTED_SIZE="$(content_length "$GO_TUI_DOWNLOAD_URL" || true)"
-    log_kv "Go TUI asset" "$GO_TUI_BINARY_NAME"
-    log_kv "Go TUI path" "$GO_TUI_TARGET_PATH"
-    run_with_spinner "Downloading Go TUI" download_to "$GO_TUI_DOWNLOAD_URL" "$GO_TUI_TMP_PATH" || fail "Failed to download Go TUI from $GO_TUI_DOWNLOAD_URL."
-    run_with_spinner "Validating Go TUI" validate_binary "$GO_TUI_TMP_PATH" "$GO_TUI_EXPECTED_SIZE" || fail "Downloaded Go TUI failed validation."
-    chmod +x "$GO_TUI_TMP_PATH"
-    mv "$GO_TUI_TMP_PATH" "$GO_TUI_TARGET_PATH"
-    GO_TUI_TMP_PATH=""
-    INSTALLED_GO_TUI_PATH="$GO_TUI_TARGET_PATH"
-    log_ok "Go TUI installed: $GO_TUI_TARGET_PATH"
-  else
-    fail "Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL. The $VERSION release may not have finished publishing Go TUI binaries yet. Set BBL_INSTALL_GO_TUI=0 to install only the bbl CLI."
+  run_with_spinner "Downloading BabeL-O CLI" download_to "$DOWNLOAD_URL" "$TMP_PATH" || fail "Failed to download BabeL-O CLI from $DOWNLOAD_URL."
+  run_with_spinner "Validating BabeL-O CLI" validate_binary "$TMP_PATH" "$EXPECTED_SIZE" || fail "Downloaded BabeL-O CLI failed validation."
+  chmod +x "$TMP_PATH"
+  mv "$TMP_PATH" "$TARGET_PATH"
+  TMP_PATH=""
+
+  log_ok "BabeL-O CLI installed: $TARGET_PATH"
+
+  if [ "${BBL_INSTALL_GO_TUI:-1}" != "0" ]; then
+    GO_TUI_INSTALL_DIR="${BBL_GO_TUI_INSTALL_DIR:-$HOME/.local/share/babel-o/bin}"
+    GO_TUI_TARGET_PATH="$GO_TUI_INSTALL_DIR/go-tui-$GO_TUI_PLATFORM_SUFFIX"
+    case "$GO_TUI_BINARY_NAME" in
+      *windows*) GO_TUI_TARGET_PATH="$GO_TUI_TARGET_PATH.exe" ;;
+    esac
+    mkdir -p "$GO_TUI_INSTALL_DIR"
+    if [ ! -w "$GO_TUI_INSTALL_DIR" ]; then
+      fail "Go TUI install directory is not writable: $GO_TUI_INSTALL_DIR"
+    fi
+
+    if asset_exists "$GO_TUI_DOWNLOAD_URL"; then
+      GO_TUI_TMP_PATH="$(mktemp "$GO_TUI_INSTALL_DIR/go-tui.download.XXXXXX")"
+      GO_TUI_EXPECTED_SIZE="$(content_length "$GO_TUI_DOWNLOAD_URL" || true)"
+      log_kv "Go TUI asset" "$GO_TUI_BINARY_NAME"
+      log_kv "Go TUI path" "$GO_TUI_TARGET_PATH"
+      run_with_spinner "Downloading Go TUI" download_to "$GO_TUI_DOWNLOAD_URL" "$GO_TUI_TMP_PATH" || fail "Failed to download Go TUI from $GO_TUI_DOWNLOAD_URL."
+      run_with_spinner "Validating Go TUI" validate_binary "$GO_TUI_TMP_PATH" "$GO_TUI_EXPECTED_SIZE" || fail "Downloaded Go TUI failed validation."
+      chmod +x "$GO_TUI_TMP_PATH"
+      mv "$GO_TUI_TMP_PATH" "$GO_TUI_TARGET_PATH"
+      GO_TUI_TMP_PATH=""
+      INSTALLED_GO_TUI_PATH="$GO_TUI_TARGET_PATH"
+      log_ok "Go TUI installed: $GO_TUI_TARGET_PATH"
+    else
+      fail "Go TUI release asset not found: $GO_TUI_DOWNLOAD_URL. The $VERSION release may not have finished publishing Go TUI binaries yet. Set BBL_INSTALL_GO_TUI=0 to install only the bbl CLI."
+    fi
   fi
 fi
 

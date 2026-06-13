@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"charm.land/bubbles/v2/spinner"
 	"charm.land/bubbles/v2/textarea"
@@ -24,10 +26,11 @@ type Config struct {
 	AltScreen        bool
 	PollIntervalMs   int
 	ExecuteTimeoutMs int
-	// MouseCapture defaults to false: the Go TUI releases
-	// the terminal's mouse drag-select so the operator can
-	// copy text out of the transcript. Set true to re-enable
-	// mouse-wheel scroll at the cost of breaking selection.
+	// MouseCapture enables Bubble Tea's mouse tracking so
+	// wheel events arrive as MouseWheelMsg instead of being
+	// translated by the terminal into ↑/↓ keys. The default
+	// CLI path keeps it on and uses the in-app selection
+	// renderer + clipboard toast for copying transcript text.
 	MouseCapture bool
 	// PolicyMode controls the per-request `policy` body field sent to
 	// Nexus /v1/stream. Phase B of
@@ -197,6 +200,8 @@ type registeredProvider struct {
 	DefaultBaseURL string            `json:"defaultBaseUrl"`
 	DefaultModel   string            `json:"defaultModel"`
 	Configured     bool              `json:"configured"`
+	AuthConfigured bool              `json:"authConfigured"`
+	AuthSource     string            `json:"authSource"`
 	Active         bool              `json:"active"`
 	Models         []registeredModel `json:"models"`
 }
@@ -853,6 +858,27 @@ const (
 // and the app already receives many wheel ticks on modern terminals.
 const mouseWheelStepLines = 1
 
+const mouseEventThrottle = 15 * time.Millisecond
+
+var lastProgramMouseEvent time.Time
+
+// MouseEventFilter mirrors crush's program-level mouse filter:
+// high-resolution trackpads can emit floods of motion/wheel events
+// faster than the renderer can usefully redraw. Throttling here keeps
+// those events away from child components like textarea before Update
+// routing has a chance to run.
+func MouseEventFilter(_ tea.Model, msg tea.Msg) tea.Msg {
+	switch msg.(type) {
+	case tea.MouseWheelMsg, tea.MouseMotionMsg:
+		now := time.Now()
+		if now.Sub(lastProgramMouseEvent) < mouseEventThrottle {
+			return nil
+		}
+		lastProgramMouseEvent = now
+	}
+	return msg
+}
+
 // maxTranscriptWidth mirrors crush's maxTextWidth: on very wide
 // terminals (4K monitor @ 200+ cols) the transcript shouldn't
 // stretch to fill the screen — long lines become hard to scan
@@ -1295,6 +1321,34 @@ func (m *model) scrollOverlay(delta int) bool {
 	return false
 }
 
+func (m *model) handleMouseWheel(mouse tea.Mouse) {
+	if m.inputMode == modePermission && m.inPermissionGracePeriod() {
+		m.permissionLastInputAt = time.Now()
+		return
+	}
+	switch mouse.Button {
+	case tea.MouseWheelUp:
+		m.scrollByMouseWheelDelta(-mouseWheelStepLines)
+	case tea.MouseWheelDown:
+		m.scrollByMouseWheelDelta(mouseWheelStepLines)
+	}
+}
+
+func (m *model) scrollByMouseWheelDelta(delta int) {
+	if delta == 0 {
+		return
+	}
+	if m.inputMode == modeComposing {
+		if delta < 0 {
+			m.viewport.ScrollUp(-delta)
+		} else {
+			m.viewport.ScrollDown(delta)
+		}
+		return
+	}
+	m.scrollOverlay(delta)
+}
+
 func inputPrompt(info textarea.PromptInfo) string {
 	if info.LineNumber == 0 {
 		return "  > "
@@ -1318,10 +1372,18 @@ func (m *model) setInputValue(value string) {
 }
 
 func (m *model) updateInput(msg tea.Msg) tea.Cmd {
-	if m.inputMode == modeComposing {
-		if raw := fmt.Sprint(msg); m.handleUnknownCSIMessage(raw) {
+	switch msg := msg.(type) {
+	case tea.MouseWheelMsg:
+		if !m.cfg.MouseCapture {
 			return nil
 		}
+		m.handleMouseWheel(msg.Mouse())
+		return nil
+	case tea.MouseClickMsg, tea.MouseMotionMsg, tea.MouseReleaseMsg:
+		return nil
+	}
+	if raw := fmt.Sprint(msg); m.handleUnknownCSIMessage(raw) {
+		return nil
 	}
 	oldInputHeight := m.input.Height()
 	var cmd tea.Cmd
@@ -1335,6 +1397,11 @@ func (m *model) updateInput(msg tea.Msg) tea.Cmd {
 
 func (m *model) handlePaste(content string) {
 	if m.handleMouseEscapeString(content) {
+		return
+	}
+	if m.inputMode == modeModelPickApiKey {
+		m.appendModelAPIKeyDraft(content)
+		m.resize()
 		return
 	}
 	if strings.Contains(content, "\n") || strings.Contains(content, "\r") {
@@ -1352,6 +1419,60 @@ func (m *model) handlePaste(content string) {
 	}
 	m.syncInputHeight()
 	m.resize()
+}
+
+func sanitizeModelAPIKeyInput(value string) string {
+	value = stripANSICodes(value)
+	var b strings.Builder
+	b.Grow(len(value))
+	for _, r := range value {
+		if r == utf8.RuneError {
+			continue
+		}
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func (m *model) appendModelAPIKeyDraft(value string) {
+	m.modelPickAPIKeyDraft = sanitizeModelAPIKeyInput(m.modelPickAPIKeyDraft + value)
+}
+
+func (m *model) deleteModelAPIKeyDraftBackward() {
+	if m.modelPickAPIKeyDraft == "" {
+		return
+	}
+	runes := []rune(m.modelPickAPIKeyDraft)
+	m.modelPickAPIKeyDraft = string(runes[:len(runes)-1])
+}
+
+func (m *model) handleModelAPIKeyInput(msg tea.KeyPressMsg) bool {
+	key := msg.String()
+	switch key {
+	case "backspace", "ctrl+h":
+		m.deleteModelAPIKeyDraftBackward()
+		return true
+	case "ctrl+u":
+		m.modelPickAPIKeyDraft = ""
+		return true
+	}
+	text := msg.Key().Text
+	if text != "" {
+		m.appendModelAPIKeyDraft(text)
+		return true
+	}
+	keyInfo := msg.Key()
+	if keyInfo.Mod&(tea.ModCtrl|tea.ModAlt) == 0 &&
+		keyInfo.Code >= 0x20 &&
+		keyInfo.Code != 0x7f &&
+		keyInfo.Code <= utf8.MaxRune {
+		m.appendModelAPIKeyDraft(string(keyInfo.Code))
+		return true
+	}
+	return false
 }
 
 func isInputNewlineKeyMsg(msg tea.KeyPressMsg) bool {
@@ -1606,24 +1727,13 @@ var (
 
 func Run(cfg Config) error {
 	m := newModel(cfg)
-	// Phase 10: capture the mouse wheel so it scrolls the
-	// transcript viewport in composing mode instead of
-	// leaking into the terminal (some terminals translate
-	// the wheel to ↑/↓ arrow keys when no app is listening,
-	// which used to overlap with our prompt-history
-	// bindings).
-	//
-	// Default OFF in Phase 11: mouse cell motion is what
-	// keeps the operator from copy-pasting text out of the
-	// TUI transcript (the terminal reports drag-select as
-	// a mouse event, not a selection). With the cap off
-	// the terminal's normal selection works on every
-	// rendered line; the operator still has keyboard
-	// scroll (↑/↓, PgUp/PgDn, Home/End) so the loss of
-	// wheel support is a fair trade. The opt-in
-	// `--mouse` flag re-enables the cap for operators who
-	// prefer the wheel to selection.
-	if _, err := tea.NewProgram(m).Run(); err != nil {
+	// Crush-style mouse routing: the program-level filter
+	// throttles high-resolution trackpads, while Update consumes
+	// MouseWheelMsg before textarea.Update can scroll the composer.
+	// The CLI enables MouseCapture by default; --mouse=false keeps
+	// the old terminal-owned mode for operators who prefer native
+	// selection/scrollback over in-app selection and wheel routing.
+	if _, err := tea.NewProgram(m, tea.WithFilter(MouseEventFilter)).Run(); err != nil {
 		return err
 	}
 	return nil
@@ -1761,36 +1871,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
-		if m.inputMode.canReceiveTextInput() {
+		if m.inputMode == modeModelPickApiKey {
+			m.handlePaste(msg.Content)
+		} else if m.inputMode.canReceiveTextInput() {
 			m.handlePaste(msg.Content)
 		}
 		return m, nil
 
 	case tea.MouseClickMsg:
-		// Phase 11 wheel routing. Only active when the
-		// operator explicitly opted into mouse capture via
-		// --mouse; otherwise the terminal's own
-		// wheel→arrow conversion is in charge and we never
-		// see a MouseMsg here (SGR mouse tracking is off).
-		//
-		// When the cap is on:
-		//   - the left button routes to the in-app
-		//     selection state machine (drag-select + OSC 52
-		//     copy on release).
-		//   - the wheel only fires on Press (motion /
-		//     release are wheel no-ops, and now they're
-		//     consumed by the selection branch instead).
-		//   - composing mode scrolls the transcript
-		//     viewport by `mouseWheelStepLines`.
-		//   - any read-only overlay (help / context /
-		//     inbox / agents / tasks / activity / tools
-		//     audit / model / permission ring) routes
-		//     through `m.scrollOverlay` so the wheel and
-		//     ↑/↓ stay in lock-step.
-		//   - permission grace period absorbs the wheel
-		//     the same way it absorbs keystrokes, so an
-		//     in-flight wheel tick from the previous
-		//     focus can't yank the permission choice.
 		if !m.cfg.MouseCapture {
 			return m, nil
 		}
@@ -1811,7 +1899,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		mouse := msg.Mouse()
 		if flag.Lookup("test.v") == nil {
 			now := time.Now()
-			if now.Sub(m.lastMouseEventTime) < 15*time.Millisecond {
+			if now.Sub(m.lastMouseEventTime) < mouseEventThrottle {
 				return m, nil
 			}
 			m.lastMouseEventTime = now
@@ -1843,27 +1931,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.cfg.MouseCapture {
 			return m, nil
 		}
-		mouse := msg.Mouse()
-		if m.inputMode == modePermission && m.inPermissionGracePeriod() {
-			m.permissionLastInputAt = time.Now()
-			return m, nil
-		}
-		switch mouse.Button {
-		case tea.MouseWheelUp:
-			if m.inputMode == modeComposing {
-				m.viewport.ScrollUp(mouseWheelStepLines)
-			} else {
-				m.scrollOverlay(-mouseWheelStepLines)
-			}
-			return m, nil
-		case tea.MouseWheelDown:
-			if m.inputMode == modeComposing {
-				m.viewport.ScrollDown(mouseWheelStepLines)
-			} else {
-				m.scrollOverlay(mouseWheelStepLines)
-			}
-			return m, nil
-		}
+		m.handleMouseWheel(msg.Mouse())
 		return m, nil
 
 	case tea.KeyPressMsg:
@@ -2490,11 +2558,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.modelPickProviderIdx >= 0 && m.modelPickProviderIdx < len(m.modelCatalog.Providers) {
 					p := m.modelCatalog.Providers[m.modelPickProviderIdx]
 					m.modelPickSelectedID = p.ID
-					// Skip the apiKey / baseURL steps for
-					// providers that are already configured
-					// — the operator can re-enter /model to
-					// reconfigure later.
-					if p.Configured {
+					// No-auth providers can enter the model picker
+					// immediately. API-key / bearer providers always
+					// show the credential step so the user can paste
+					// or replace a key; if a global provider key is
+					// already saved, an empty Enter keeps it.
+					if p.AuthMode == "none" {
 						return m, m.enterModelPicker()
 					}
 					m.modelPickProviderDraft = ""
@@ -2513,12 +2582,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setMode(modeModelPickProvider)
 				return m, nil
 			case "enter":
-				m.modelPickAPIKeyDraft = m.input.Value()
+				m.modelPickAPIKeyDraft = sanitizeModelAPIKeyInput(m.modelPickAPIKeyDraft)
+				provider := m.currentModelProvider()
+				if m.modelPickAPIKeyDraft == "" && (provider == nil || !provider.Configured) {
+					m.appendLine("error", "provider API key is required before selecting this model")
+					return m, nil
+				}
 				m.setInputValue("")
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
 			}
-			return m, m.updateInput(msg)
+			if m.handleModelAPIKeyInput(msg) {
+				return m, nil
+			}
+			return m, nil
 
 		case modeModelPickBaseURL:
 			switch key {
@@ -3027,6 +3104,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.inputMode.canReceiveTextInput() {
+		if m.inputMode == modeModelPickApiKey {
+			return m, nil
+		}
 		return m, m.updateInput(msg)
 	}
 	return m, nil
@@ -3274,7 +3354,7 @@ var helpOverlayLines = []string{
 	"                   composing, or the active overlay's internal",
 	"                   scroll/selection (help / context / inbox /",
 	"                   agents / tasks / activity / tools / model /",
-	"                   permission ring). Requires --mouse.",
+	"                   permission ring)",
 	"",
 	"Permission panel:",
 	"  a / y            approve",

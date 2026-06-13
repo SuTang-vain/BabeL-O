@@ -21,8 +21,8 @@
 - [task-adaptive-recoverable-timeout-plan.md](./task-adaptive-recoverable-timeout-plan.md): Task-adaptive recoverable timeout 规划；基于 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3`，将普通 timeout 从 fatal request cutoff 拆成模型可见 soft deadline 与系统兜底 hard watchdog。
 - [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md): Go TUI transcript Markdown 渲染优化规划；对照 Crush 的 Glamour + Chroma + Lip Gloss 链路，建议 assistant-only renderer façade、compile spike、代码块高亮与 benchmark gate 渐进落地。
 - [go-tui-selection-highlight-optimization-plan.md](./go-tui-selection-highlight-optimization-plan.md): Go TUI `--mouse` 文本选区高亮与剪贴板复制优化记录；已用窄范围 ultraviolet cell-buffer highlight 收口“实际选中但视觉未高亮/不覆盖”的问题。
-- [distribution-guide.md](./distribution-guide.md): 分发操作指导；说明当前 `install.sh` / GitHub release / macOS shell wrapper 的安装、自检、发版清单与常见启动问题排查。
-- [distribution-strategy-plan.md](./distribution-strategy-plan.md): 分发策略规划；短期以同一 `v*` release 资产 + installer 自检稳住安装链路，中期补 npm 普通 Node wrapper + Go TUI asset 下载，长期将生产 launcher 从 Node.js SEA 迁移到 Go launcher。
+- [distribution-guide.md](./distribution-guide.md): 分发操作指导；说明 v0.3.5+ lightweight portable package、`install.sh`、GitHub release assets、安装自检、发版清单与常见启动问题排查。
+- [distribution-strategy-plan.md](./distribution-strategy-plan.md): 分发策略规划；当前以 `bbl-<platform>.tar.gz` portable 包降低体积并避开 Node SEA 主路径，中期补 npm 普通 Node wrapper + Go TUI asset 下载，长期将生产 launcher 迁移到 Go launcher。
 
 ## 维护规则
 

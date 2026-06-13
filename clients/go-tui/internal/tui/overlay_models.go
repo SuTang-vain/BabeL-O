@@ -238,15 +238,14 @@ func (m model) renderModelPickProvider(width int) string {
 	return renderOverlayFrame(width, strings.Join(lines, "\n"))
 }
 
-// renderModelPickApiKey is step 2: paste the API key. The
-// key is echoed in plaintext for parity with the bbl chat
-// TS TUI (operator sees what they type) and cleared from
-// memory after the picker step resolves.
+// renderModelPickApiKey is step 2: paste the API key. API keys are
+// long single-line secrets, so this step renders a dedicated masked
+// field instead of the multiline composer textarea.
 func (m model) renderModelPickApiKey(width int) string {
 	if m.inputMode != modeModelPickApiKey {
 		return ""
 	}
-	return newModelPickApiKeyDialog(m.currentModelProvider(), m.input.View()).View(width)
+	return newModelPickApiKeyDialog(m.currentModelProvider(), modelAPIKeyFieldDisplay(m.modelPickAPIKeyDraft)).View(width)
 }
 
 // renderModelPickBaseURL is step 3: confirm or override the

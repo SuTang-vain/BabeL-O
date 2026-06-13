@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
@@ -34,9 +34,36 @@ process.env.BABEL_O_CONFIG_FILE = sharedConfigPath
 const manager = ConfigManager.getInstance()
 manager.save({})
 
+const providerCredentialEnvKeys = [
+  'BABEL_O_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'OPENAI_API_KEY',
+  'DEEPSEEK_API_KEY',
+  'ZHIPU_API_KEY',
+  'ZHIPUAI_API_KEY',
+  'MINIMAX_API_KEY',
+  'MINIMAX_AUTH_TOKEN',
+  'MOONSHOT_API_KEY',
+  'OLLAMA_API_KEY',
+] as const
+
+const originalProviderCredentialEnv = new Map<string, string | undefined>(
+  providerCredentialEnvKeys.map(key => [key, process.env[key]]),
+)
+
 function resetProfiles() {
   manager.save({})
+  for (const key of providerCredentialEnvKeys) {
+    delete process.env[key]
+  }
 }
+
+after(() => {
+  for (const [key, value] of originalProviderCredentialEnv) {
+    if (value === undefined) delete process.env[key]
+    else process.env[key] = value
+  }
+})
 
 test('GET /v1/runtime/config returns sanitized active settings without apiKey', async () => {
   resetProfiles()
@@ -76,6 +103,8 @@ test('GET /v1/runtime/models lists providers and models with configured flag', a
       assert.ok(typeof provider.id === 'string')
       assert.ok(typeof provider.displayName === 'string')
       assert.equal(typeof provider.configured, 'boolean')
+      assert.equal(typeof provider.authConfigured, 'boolean')
+      assert.equal(typeof provider.authSource, 'string')
       assert.ok(Array.isArray(provider.models))
     }
   } finally {
@@ -83,7 +112,7 @@ test('GET /v1/runtime/models lists providers and models with configured flag', a
   }
 })
 
-test('GET /v1/runtime/models marks provider configured when a profile carries its apiKey', async () => {
+test('GET /v1/runtime/models reports profile apiKey as auth-only, not persisted provider configuration', async () => {
   resetProfiles()
   manager.setProfile('work', {
     provider: 'moonshot',
@@ -98,8 +127,53 @@ test('GET /v1/runtime/models marks provider configured when a profile carries it
     assert.equal(response.statusCode, 200)
     const body = response.json()
     const moonshot = body.providers.find((provider: { id: string }) => provider.id === 'moonshot')
-    assert.equal(moonshot.configured, true)
+    assert.equal(moonshot.configured, false)
+    assert.equal(moonshot.authConfigured, true)
+    assert.equal(moonshot.authSource, 'profile')
     assert.doesNotMatch(JSON.stringify(body), /profile-moonshot-key/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('GET /v1/runtime/models marks provider configured only for saved provider credentials', async () => {
+  resetProfiles()
+  manager.setProviderConfig('minimax', {
+    apiKey: 'provider-minimax-key',
+    baseUrl: 'https://api.minimaxi.com/anthropic',
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/models' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const minimax = body.providers.find((provider: { id: string }) => provider.id === 'minimax')
+    assert.equal(minimax.configured, true)
+    assert.equal(minimax.authConfigured, true)
+    assert.equal(minimax.authSource, 'provider_config')
+    assert.doesNotMatch(JSON.stringify(body), /provider-minimax-key/)
+  } finally {
+    await app.close()
+  }
+})
+
+test('GET /v1/runtime/models reports env credentials without treating them as persisted config', async () => {
+  resetProfiles()
+  process.env.MOONSHOT_API_KEY = 'env-moonshot-key'
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/models' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    const moonshot = body.providers.find((provider: { id: string }) => provider.id === 'moonshot')
+    assert.equal(moonshot.configured, false)
+    assert.equal(moonshot.authConfigured, true)
+    assert.equal(moonshot.authSource, 'env')
+    assert.doesNotMatch(JSON.stringify(body), /env-moonshot-key/)
   } finally {
     await app.close()
   }
@@ -116,7 +190,7 @@ test('POST /v1/runtime/config/provider saves provider credentials without leakin
       url: '/v1/runtime/config/provider',
       payload: {
         provider: 'minimax',
-        apiKey: 'sk-minimax-test',
+        apiKey: ' sk-minimax\r\n-test\t',
         baseUrl: 'https://api.minimaxi.com/anthropic',
       },
     })
@@ -335,10 +409,11 @@ test('POST /v1/runtime/config/select allows no-auth local and ollama models', as
   }
 })
 
-test('POST /v1/runtime/config/select model switch preserves an active profile binding', async () => {
-  // When an active profile pins a model, the profile wins in
-  // resolveSettings(); switching defaultModel is still recorded
-  // but does not silently clobber the active profile.
+test('POST /v1/runtime/config/select model switch clears active profile so the TUI selection takes effect', async () => {
+  // /model is an interactive "use this model now" flow. If an active
+  // profile remains selected, resolveSettings() would keep returning the
+  // profile model and the user would see a successful save that does not
+  // actually affect the current runtime model.
   resetProfiles()
   manager.setProfile('alpha', { provider: 'openai', model: 'openai/gpt-4o' })
   manager.setActiveProfile('alpha')
@@ -353,12 +428,12 @@ test('POST /v1/runtime/config/select model switch preserves an active profile bi
     })
     assert.equal(response.statusCode, 200)
     const body = response.json()
-    assert.equal(body.modelId, 'openai/gpt-4o', 'profile model still wins at resolve time')
-    assert.equal(body.activeProfile, 'alpha')
+    assert.equal(body.modelId, 'local/coding-runtime')
+    assert.equal(body.activeProfile, undefined)
 
     const reloaded = new ConfigManager(sharedConfigPath)
     assert.equal(reloaded.getDefaultModel(), 'local/coding-runtime')
-    assert.equal(reloaded.getActiveProfile(), 'alpha')
+    assert.equal(reloaded.getActiveProfile(), undefined)
   } finally {
     await app.close()
   }

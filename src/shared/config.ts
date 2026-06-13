@@ -137,6 +137,16 @@ export function buildProviderCredentialCommand(providerId: string): string {
   return `bbl config add ${providerId} <KEY>`;
 }
 
+export function sanitizeProviderApiKey(value: string | undefined): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const sanitized = Array.from(value).filter(char => {
+    if (/\s/u.test(char)) return false;
+    const code = char.codePointAt(0);
+    return code !== undefined && code >= 0x20 && code !== 0x7f;
+  }).join('');
+  return sanitized.length > 0 ? sanitized : undefined;
+}
+
 export function validateModelSelectionAuth(
   configManager: ConfigManager,
   modelId: string,
@@ -512,9 +522,11 @@ export class ConfigManager {
     if (!conf.providers) {
       conf.providers = {};
     }
+    const sanitizedApiKey = sanitizeProviderApiKey(providerConfig.apiKey);
     conf.providers[providerId] = {
       ...conf.providers[providerId],
       ...providerConfig,
+      ...(providerConfig.apiKey !== undefined ? { apiKey: sanitizedApiKey } : {}),
     };
     this.save(conf);
   }
@@ -600,9 +612,12 @@ export class ConfigManager {
     return conf.defaultModel || 'local/coding-runtime';
   }
 
-  public setDefaultModel(model: string): void {
+  public setDefaultModel(model: string, options?: { clearActiveProfile?: boolean }): void {
     const conf = this.load();
     conf.defaultModel = model;
+    if (options?.clearActiveProfile) {
+      conf.activeProfile = undefined;
+    }
     this.save(conf);
   }
 

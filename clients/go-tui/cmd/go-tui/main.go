@@ -29,7 +29,7 @@ func parseFlags() tui.Config {
 	flag.StringVar(&cfg.Cwd, "cwd", cwd, "workspace directory sent to Nexus")
 	flag.StringVar(&cfg.SessionID, "session", "", "optional existing session id")
 	flag.BoolVar(&cfg.AltScreen, "alt", true, "use terminal alternate screen")
-	flag.BoolVar(&cfg.MouseCapture, "mouse", false, "capture mouse drag / wheel; default false lets the terminal own selection and scrollback")
+	flag.BoolVar(&cfg.MouseCapture, "mouse", true, "capture mouse drag / wheel; set --mouse=false to let the terminal own selection and scrollback")
 	flag.IntVar(&cfg.PollIntervalMs, "poll-interval-ms", 30000, "background /v1/runtime/config poll interval in milliseconds; 0 disables polling")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")
 	flag.BoolVar(&cfg.PrintVersion, "v", false, "print version and exit (shorthand)")

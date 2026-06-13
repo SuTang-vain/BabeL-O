@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
-import { chmod, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readFile, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { spawn } from 'node:child_process'
+import { spawn, execFileSync } from 'node:child_process'
 import { test } from 'node:test'
 
 const repoRoot = new URL('..', import.meta.url).pathname
@@ -34,6 +34,34 @@ test('install.sh validates and atomically installs a downloaded binary', async (
   assert.match(result.stdout, /Running install self-check/)
   assert.match(result.stdout, /Go TUI executable starts: bbl-go-tui 0\.3\.0/)
   assert.match(result.stdout, /Result: OK/)
+})
+
+test('install.sh prefers lightweight portable package when release tarball exists', async () => {
+  const fixture = await createFixture('portable')
+
+  const result = await runInstaller(fixture)
+
+  assert.equal(result.code, 0, result.stderr + result.stdout)
+  const installed = await readFile(join(fixture.installDir, 'bbl'), 'utf8')
+  assert.match(installed, /APP_DIR=/)
+  assert.doesNotMatch(installed, /bbl\.sea/)
+  assert.match(result.stdout, /lightweight package installed/i)
+  assert.match(result.stdout, /Go TUI executable starts: bbl-go-tui 0\.3\.0/)
+  assert.match(result.stdout, /Result: OK/)
+
+  const launch = await runInstalledBbl(fixture, [
+    'go',
+    '--no-start-nexus',
+    '--url',
+    'http://127.0.0.1:3000',
+    '--cwd',
+    '/workspace',
+    '--session',
+    'session_portable',
+  ])
+
+  assert.equal(launch.code, 0, launch.stderr + launch.stdout)
+  assert.match(launch.stdout, /GO_TUI_LAUNCHED --url http:\/\/127\.0\.0\.1:3000 --cwd \/workspace --session session_portable/)
 })
 
 test('install.sh wrapper launches Go TUI directly for bbl go', async () => {
@@ -85,7 +113,7 @@ test('install.sh fails self-check when downloaded Go TUI cannot execute', async 
   assert.match(result.stderr + result.stdout, /installed Go TUI binary cannot start/)
 })
 
-async function createFixture(mode: '404' | 'success' | 'bad-go-tui') {
+async function createFixture(mode: '404' | 'success' | 'bad-go-tui' | 'portable') {
   const root = await mkdtemp(join(tmpdir(), 'babel-o-install-'))
   const binDir = join(root, 'bin')
   const installDir = join(root, 'install')
@@ -153,11 +181,14 @@ exit 0
 `)
   const goTuiPayloadPath = join(root, 'go-tui-payload.bin')
   await writeFile(goTuiPayloadPath, goTuiPayload)
+  const portablePayloadPath = await createPortablePayload(root, mode)
 
   await writeExecutable(join(binDir, 'curl'), `#!/bin/sh
 args="$*"
 if printf '%s' "$args" | grep -Eq -- '(^| )-[A-Za-z]*I[A-Za-z]*( |$)'; then
-  if printf '%s' "$args" | grep -q -- 'go-tui-darwin-arm64'; then
+  if printf '%s' "$args" | grep -q -- 'bbl-darwin-arm64.tar.gz'; then
+    ${mode === 'portable' ? "printf 'HTTP/2 200\\r\\ncontent-length: PLACEHOLDER_PORTABLE_SIZE\\r\\n\\r\\n'" : "printf 'HTTP/2 404\\r\\ncontent-length: 0\\r\\n\\r\\n'; exit 22"}
+  elif printf '%s' "$args" | grep -q -- 'go-tui-darwin-arm64'; then
     printf 'HTTP/2 200\\r\\ncontent-length: ${goTuiPayload.length}\\r\\n\\r\\n'
   else
     printf 'HTTP/2 200\\r\\ncontent-length: ${payload.length}\\r\\n\\r\\n'
@@ -185,13 +216,71 @@ if [ -z "$out" ]; then
 fi
 if printf '%s' "$args" | grep -q -- 'go-tui-darwin-arm64'; then
   cat ${shellQuote(goTuiPayloadPath)} > "$out"
+elif printf '%s' "$args" | grep -q -- 'bbl-darwin-arm64.tar.gz'; then
+  cat ${shellQuote(portablePayloadPath)} > "$out"
 else
   cat ${shellQuote(payloadPath)} > "$out"
 fi
 exit 0
-`)
+`.replace('PLACEHOLDER_PORTABLE_SIZE', String((await stat(portablePayloadPath)).size)))
 
   return { root, binDir, installDir, homeDir }
+}
+
+async function createPortablePayload(root: string, mode: string) {
+  const portableRoot = join(root, 'portable-src', 'babel-o-v0.3.0-darwin-arm64')
+  await mkdir(join(portableRoot, 'bin'), { recursive: true })
+  await writeExecutable(join(portableRoot, 'bin', 'bbl'), `#!/bin/sh
+set -eu
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+exec "$SCRIPT_DIR/bbl.js" "$@"
+`)
+  await writeExecutable(join(portableRoot, 'bin', 'bbl.js'), `#!/usr/bin/env node
+import { spawnSync } from 'node:child_process'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const goTui = resolve(root, 'bin/go-tui-darwin-arm64')
+const args = process.argv.slice(2)
+if (args[0] === '--version') {
+  console.log('0.3.0')
+  process.exit(0)
+}
+if (args[0] === 'go' && args.includes('--check')) {
+  const result = spawnSync(goTui, ['--version'], { encoding: 'utf8' })
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr || 'go-tui failed')
+    process.exit(result.status ?? 1)
+  }
+  console.log('BabeL-O Go TUI install check')
+  console.log('[OK]      Go TUI binary found: ' + goTui)
+  console.log('[OK]      Go TUI executable starts: ' + result.stdout.trim())
+  console.log('Result: OK')
+  process.exit(0)
+}
+if (args[0] === 'go') {
+  const goArgs = args.slice(1).filter(arg => arg !== '--no-start-nexus')
+  const result = spawnSync(goTui, goArgs, { stdio: 'inherit' })
+  process.exit(result.status ?? 1)
+}
+console.error('unexpected portable bbl args: ' + args.join(' '))
+process.exit(1)
+`)
+  await writeExecutable(join(portableRoot, 'bin', 'go-tui-darwin-arm64'), mode === 'bad-go-tui'
+    ? `#!/bin/sh
+exit 126
+`
+    : `#!/bin/sh
+if [ "$1" = "--version" ]; then
+  echo "bbl-go-tui 0.3.0"
+  exit 0
+fi
+echo "GO_TUI_LAUNCHED $*"
+exit 0
+`)
+  const output = join(root, 'portable.tar.gz')
+  execFileSync('tar', ['-czf', output, '-C', join(root, 'portable-src'), 'babel-o-v0.3.0-darwin-arm64'])
+  return output
 }
 
 async function runInstaller(fixture: { binDir: string; installDir: string; homeDir: string }) {

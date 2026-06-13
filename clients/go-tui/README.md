@@ -106,7 +106,7 @@ UI features:
 - RenderContext-backed help, permission, model-pick, and quit dialogs.
 - Fuzzy slash-command filtering with highlighted matched command names.
 - Stable-prefix streaming markdown rendering for assistant/thinking output.
-- Mouse drag selection with item-local highlight rendering and OSC 52 copy feedback when `--mouse` is enabled.
+- Mouse drag selection with item-local highlight rendering and OSC 52 copy feedback in the default mouse-capture mode; pass `--mouse=false` to let the terminal own selection and scrollback.
 
 Local commands:
 

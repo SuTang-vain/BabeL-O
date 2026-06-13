@@ -2,17 +2,18 @@
 
 ## Decision
 
-Move the production installer away from Node.js SEA as the long-term primary channel. The target product shape is:
+Move the production installer away from Node.js SEA as the primary channel. The v0.3.5 release line uses a lightweight portable package now, while the long-term target remains a small Go launcher. The target product shape is:
 
+- v0.3.5 immediate path: `bbl-<platform>.tar.gz` portable packages that bundle `dist/`, production `node_modules`, the normal Node wrapper, and the platform Go TUI.
 - `bbl` as a small Go launcher binary.
 - Go TUI embedded or bundled by the launcher distribution.
 - npm kept as the developer channel with a normal Node wrapper and downloaded Go TUI asset.
 - Homebrew tap as the preferred macOS/Linux user channel.
-- `install.sh` kept as the zero-dependency channel, installing the same release binary as Homebrew.
+- `install.sh` kept as the one-command channel, installing the same product payload as manual GitHub release downloads.
 
 ## Why
 
-The v0.3.4 distribution keeps the stabilized two-asset model by publishing both `bbl-*` and `go-tui-*` assets in the same release, but it still depends on Node.js SEA for the standalone `bbl` executable. That path has three product risks:
+The v0.3.4 distribution kept the stabilized two-asset model by publishing both `bbl-*` and `go-tui-*` assets in the same release, but it still depended on Node.js SEA for the standalone `bbl` executable. That path had three product risks:
 
 - SEA is still a fragile production base for this project because it depends on embedding a Node runtime and application blob into a platform executable.
 - The release asset is large: the macOS arm64 `bbl` is about 140 MB before the separate Go TUI asset.
@@ -22,26 +23,31 @@ The project already maintains Go code for `clients/go-tui`, so a Go launcher has
 
 ## Immediate Path
 
-These changes are safe for the current release line and should be done before the larger launcher migration:
+v0.3.5 is the immediate safer release path before the larger Go launcher migration:
 
 1. Keep one product release tag, `v*`, containing all user-installable assets.
-2. Keep `install.sh` installing both `bbl-*` and `go-tui-*`.
-3. Treat a missing Go TUI release asset as an install failure by default.
-4. Run an installer self-check after install:
+2. Publish lightweight packages as the primary user assets:
+
+```text
+bbl-darwin-arm64.tar.gz
+bbl-darwin-x64.tar.gz
+bbl-linux-x64.tar.gz
+bbl-windows-x64.tar.gz
+```
+
+3. Keep standalone `go-tui-*` assets for manual debugging and compatibility, but do not require a second download in the curl install path.
+4. Require Node.js >= 22 on the target machine for portable packages. This is an explicit tradeoff: it removes the 140MB SEA runtime from the release asset and avoids the macOS SEA spawn path.
+5. `install.sh` should prefer `bbl-<platform>.tar.gz` when present and fall back to legacy SEA + separate Go TUI only for v0.3.4 and older releases.
+6. Run a non-destructive installer self-check after install:
 
 ```sh
 "$INSTALLED_GO_TUI_PATH" --version
 NODE_NO_WARNINGS=1 BABEL_O_GO_TUI_BINARY="$INSTALLED_GO_TUI_PATH" "$INSTALL_DIR/bbl" go --check --no-start-nexus
 ```
 
-The self-check should be non-destructive: it verifies binary discovery and CLI startup without starting a Nexus server.
+The self-check verifies Go TUI discovery and CLI startup without starting a Nexus server.
 
-5. On macOS standalone installs, wrap the SEA payload with a small shell `bbl` launcher:
-   - Move the downloaded SEA binary to `bbl.sea`.
-   - Keep `bbl run`, `bbl chat`, `bbl sessions`, etc. delegated to `bbl.sea`.
-   - Handle `bbl go` in shell by starting local Nexus when needed, then `exec`ing the installed Go TUI directly.
-
-This is a short-term bridge for the v0.3.x release line: it avoids the macOS Node SEA `child_process.spawn` path that can report `ENOENT` for a valid Go TUI Mach-O. It is not the final architecture; the Go launcher remains the target.
+The old macOS SEA shell wrapper remains only as a compatibility branch for legacy releases: it moves the downloaded SEA binary to `bbl.sea`, delegates non-Go commands to that payload, and handles `bbl go` by `exec`ing the installed Go TUI directly. Do not expand that path for new releases.
 
 Users can opt out only for debugging or partial CLI installs:
 
@@ -121,30 +127,36 @@ The launcher ships with `go-tui-*` next to it or under a shared directory and us
 
 ## Homebrew Tap
 
-Before attempting homebrew-core, maintain a first-party tap:
+Before attempting homebrew-core, maintain a first-party tap. For v0.3.5, Homebrew should install the same portable package as `install.sh` and write a small shim into `bin`:
 
 ```ruby
 class BabelO < Formula
   desc "Nexus-first coding agent CLI"
   homepage "https://github.com/SuTang-vain/BabeL-O"
-  version "0.3.4"
+  version "0.3.5"
+  depends_on "node@22"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.4/bbl-darwin-arm64"
+      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.5/bbl-darwin-arm64.tar.gz"
       sha256 "<sha256>"
     else
-      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.4/bbl-darwin-x64"
+      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.5/bbl-darwin-x64.tar.gz"
       sha256 "<sha256>"
     end
   end
 
   def install
-    bin.install Dir["bbl-*"].first => "bbl"
+    libexec.install Dir["*"]
+    (bin/"bbl").write <<~SH
+      #!/bin/sh
+      exec "#{libexec}/bin/bbl" "$@"
+    SH
   end
 
   test do
-    assert_match "0.3.4", shell_output("#{bin}/bbl --version")
+    assert_match "0.3.5", shell_output("#{bin}/bbl --version")
+    assert_match "Result: OK", shell_output("#{bin}/bbl go --check --no-start-nexus")
   end
 end
 ```
@@ -155,7 +167,7 @@ After the Go launcher lands, the formula should install a single `bbl` binary.
 
 The current workflow should remain stable until the Go launcher is ready:
 
-- `release.yml` builds all assets for one `v*` release.
+- `release.yml` builds portable `bbl-<platform>.tar.gz` packages and standalone `go-tui-*` assets for one `v*` release.
 - `install.sh` consumes only that product release.
 - `go-tui-release.yml` remains for standalone maintenance only, not the primary user install path.
 
@@ -170,10 +182,12 @@ When the Go launcher lands:
 
 Immediate:
 
-- A release missing `go-tui-*` fails installation clearly.
-- `install.sh` directly probes the installed Go TUI executable with `--version`, then runs `bbl go --check --no-start-nexus` by default.
-- macOS curl installs launch `bbl go` through the shell wrapper and do not rely on SEA spawning the Go TUI Mach-O.
+- v0.3.5+ releases publish all required `bbl-<platform>.tar.gz` packages.
+- `install.sh` installs the portable package when present and writes a small launcher shim.
+- `install.sh` directly probes the bundled Go TUI executable with `--version`, then runs `bbl go --check --no-start-nexus` by default.
+- macOS curl installs do not rely on SEA spawning the Go TUI Mach-O.
 - The installer can be smoke-tested with custom install dirs without touching the user's real `bbl`.
+- Rebuilding `npm run build:portable` locally does not recursively package older `dist/bbl-*.tar.gz` artifacts.
 
 npm:
 
