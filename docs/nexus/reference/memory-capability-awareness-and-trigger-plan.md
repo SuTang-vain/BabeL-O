@@ -317,6 +317,8 @@ single hit max: 800-1200 chars
 
 ## Phase G5 — Model Self-Trigger Regression
 
+Status: implemented and verified in `test/runtime-llm.test.ts`.
+
 ### 目标
 
 用 mock provider 证明模型可见 memory 能力并能触发。
@@ -427,18 +429,24 @@ docs/nexus/WORK_LOG.md
 
 ## Recommended Next Slice
 
-Implement Phase G1 + G2 first:
+Phase G1-G4 now have a minimal verified implementation:
 
 ```text
-1. Add provider-visible Memory Capability block when EverCore is healthy.
-2. Update EverCore MCP tool descriptions with trigger policy.
-3. Add mock provider regressions for memory_search and memory_save_note.
-4. Keep memory_save_note permission-gated.
-5. Keep memory_flush_session runtime-owned by default.
+1. Provider-visible Memory Capability block is injected when MemoryProvider is enabled.
+2. EverCore MCP tool descriptions carry search/save/flush trigger policy.
+3. SessionChannel memory_candidate messages produce review-only governance metadata.
+4. Runtime EverCore auto-search uses lightweight cue heuristics and skip diagnostics.
+5. memory_save_note remains permission-gated; memory_flush_session remains runtime-owned by default.
 ```
 
-This is the smallest slice that makes BabeL-O “know” it has memory and lets the
-model self-trigger memory retrieval without expanding write risk.
+Next, implement Phase G6:
+
+```text
+1. Run live save/recall validation with managed EverCore after approval.
+2. Verify recall uses memory hints as remembered preference, not workspace fact.
+3. Verify stale/project facts are guarded by workspace evidence and user approval.
+4. Keep memory_save_note permission-gated and memory_flush_session runtime-owned.
+```
 
 ## Open Questions
 

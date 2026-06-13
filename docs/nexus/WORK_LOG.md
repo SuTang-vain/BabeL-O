@@ -2,6 +2,67 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-13 — Go TUI running 态 ESC interrupt 与 queued prompt 收口
+
+- **背景**: 用户反馈 Go TUI 在 agent 运行中无法通过 `Esc` 打断并确保不异常退出，同时输入框无法提前提交下一条用户指令；补充要求 `Esc` 不应直接报错，而应弹出黄色 `What should BabeL-O do instead?` 类提示，让用户给出替代指令。
+- **实现**:
+  - `clients/go-tui/internal/tui/tui.go`: 新增 `queuedPrompt`、`cancelRequested`、`streamCancel` 与 `interruptionPromptActive` 状态；运行中普通 `Enter` 把当前输入 queue 为下一 prompt，不启动第二条并发 stream；当前 `result` / `error` / cancel completion 后自动启动 queued prompt。
+  - `Esc` 在运行中首按只打开 interruption prompt：以 `permission` 风格黄色 transcript 行提示 `What should BabeL-O do instead?`，并在输入框预填 `BabeL-O should `；用户编辑后按 `Enter` 会 queue 替代指令并取消当前 run；提示态再次 `Esc` 则无替代指令地取消当前 run。
+  - `clients/go-tui/internal/tui/stream.go` / `api.go`: `startStream` / `runStream` 增加本地 cancel channel；取消时优先调用 Nexus `POST /v1/sessions/:sessionId/cancel`，失败时兜底关闭本地 WebSocket，避免 UI 卡死或异常退出；取消导致的 read error 被软处理为 `current agent run cancelled`。
+  - `clients/go-tui/internal/tui/chrome.go`: footer 在 interruption prompt、cancel requested 与 queued prompt 三种状态下显示对应提示。
+  - `clients/go-tui/internal/tui/tui_test.go`: 增加 ESC guidance、替代指令 cancel+queue、运行中普通 queue、terminal event 后自动启动 queued prompt 与 stream cancel channel 回归。
+- **验证**:
+  - `go -C clients/go-tui test ./internal/tui`（pass）
+  - `go -C clients/go-tui test ./...`（pass）
+- **边界**: 不改变 Nexus/runtime 执行所有权；Go TUI 只负责交互状态、取消请求与下一 prompt 排队；不会在运行中启动第二条并发 stream；替代指令仍作为下一轮用户 prompt 进入正常 runtime flow。
+
+## 2026-06-13 — Memory Capability Awareness G5 收口
+
+- **背景**: G1-G4 已让 provider loop 可见 long-term memory capability、具备受控 candidate governance 与 heuristic auto-search；继续推进 G5，用 mock provider 证明模型能看到能力/工具并按策略触发。
+- **实现**:
+  - `test/runtime-llm.test.ts` 增加 Anthropic SSE helper，用真实 provider-loop tool_use 解析路径模拟模型调用 EverCore MCP tools。
+  - 新增 recall prompt regression：provider request 包含 `Long-Term Memory Capability` 与 `mcp:evercore:memory_search`，mock provider 调用 `memory_search` 后执行 read-only bounded retrieval，并在下一轮基于 tool result 输出 remembered preference。
+  - 新增 save prompt regression：用户明确“记住”时 mock provider 调用 `memory_save_note`，runtime 在写入 EverCore 前发出 `permission_request`；测试拒绝 permission 后确认没有 `addAgentMessages` 写入，且输出 `permission_response=false` / `tool_denied`。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-runtime-llm.json npx tsx --test --test-concurrency=1 --test-name-pattern="memory capability prompt lets mock provider self-trigger memory_search|memory_save_note self-trigger emits permission_request" test/runtime-llm.test.ts`（2/2 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-provider.json npx tsx --test --test-concurrency=1 test/memory-provider.test.ts`（3/3 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-context.json npx tsx --test --test-concurrency=1 --test-name-pattern="MemoryProvider|Memory Capability|long-term memory" test/context-assembler.test.ts`（4/4 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-mcp.json npx tsx --test --test-concurrency=1 --test-name-pattern="EverCore" test/mcp.test.ts`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-typecheck.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck`（pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g5-format.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run format:check`（0 failures）
+- **边界**: 仍不自动写长期记忆；write path 必须先经过 permission gate；mock provider regression 不替代 Phase G6 live validation。
+
+## 2026-06-13 — Memory Capability Awareness G3/G4 收口
+
+- **背景**: G1/G2 已让 provider loop 可见 long-term memory capability 与 MCP tool trigger policy；继续推进 G3/G4，要求未审批 memory candidate 不自动写入，并让 runtime 在低风险历史/偏好线索下自动检索 memory。
+- **实现**:
+  - 复用已落地的 SessionChannel `memory_candidate` governance：candidate metadata 包含 scope、evidence refs、confidence、staleness/supersession、approval requirement、blocked/review reasons 与 `autoWrite=false`，inbox context 显示 review-only 状态。
+  - `src/runtime/memoryProvider.ts` 增加 `shouldAutoSearchMemory()` 轻量 heuristic：prior/previous/last time/remember/偏好/之前/上次/记得 等 cue 触发 EverCore search；build/test/status、permission response 与纯 workspace/file turn 只返回 enabled diagnostics，不调用 EverCore search。
+  - `MemoryProviderDiagnostics` 增加 `autoSearch` 触发/跳过原因，CLI `/context` 与 context view long-term memory 行展示 `auto-search=triggered|skipped:<reason>`。
+  - 新增 `test/memory-provider.test.ts` 并纳入 `package.json#scripts.test`，覆盖 heuristic trigger/skip 与 EverCoreMemoryProvider 自动检索/跳过行为。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-provider-g4.json npx tsx --test --test-concurrency=1 test/memory-provider.test.ts`（3/3 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-context-g4.json npx tsx --test --test-concurrency=1 --test-name-pattern="MemoryProvider|Memory Capability|long-term memory" test/context-assembler.test.ts`（4/4 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-mcp-g4.json npx tsx --test --test-concurrency=1 --test-name-pattern="EverCore" test/mcp.test.ts`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g4-typecheck.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck`（pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-g4-format.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run format:check`（0 failures）
+- **边界**: 不启用自动长期记忆写入；`memory_save_note` 仍 permission-gated；`memory_flush_session` 仍 runtime-owned；自动检索失败/跳过只进入 diagnostics，不污染 provider-visible memory hits。
+
+## 2026-06-13 — Memory Capability Awareness G1/G2 收口
+
+- **背景**: `docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md` 要求让 provider loop 知道 long-term memory 可用，并能按策略自触发 read-only `memory_search` 与 permission-gated `memory_save_note`。
+- **实现**:
+  - `src/runtime/contextAssembler.ts` 在 `MemoryProvider` enabled 时注入 non-cacheable `Long-Term Memory Capability` block；该 block 说明何时使用 `memory_search`、memory results 只是 background hints、项目事实必须用 workspace evidence 复核、仅在用户明确要求记住或治理候选获批时保存。
+  - `AssembledContext` / `ContextAnalysisDiagnostics` 增加 `memoryCapabilityAvailable` / `longTermMemoryCapabilityAvailable`，便于 `/context` / API diagnostics 表达 capability presence。
+  - `src/tools/everCoreMcpTools.ts` 更新三类 tool descriptions：`memory_search` read-only 自触发场景，`memory_save_note` permission-gated 写入边界，`memory_flush_session` runtime lifecycle 优先。
+  - 同步 `docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/DONE.md`，把 Phase G1/G2 标为已完成首个切片。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-context-2.json npx --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O tsx --test --test-concurrency=1 --test-name-pattern="MemoryProvider|Memory Capability|long-term memory" /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/context-assembler.test.ts`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-mcp-2.json npx --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O tsx --test --test-concurrency=1 --test-name-pattern="EverCore" /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/mcp.test.ts`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-typecheck-2.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck`（pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-format-2.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run format:check`（0 failures）
+- **边界**: 仍不启用无审批自动写长期记忆；`memory_flush_session` 默认 runtime-owned；后续 Phase G3/G4 再推进 memory candidate governance 与 runtime auto-search policy。
+
 ## 2026-06-13 — Go TUI 选区高亮覆盖问题确认解决并同步文档
 
 - **背景**: 用户验证后确认 Go TUI `--mouse` “实际选中但高亮不覆盖”的问题已经解决。
