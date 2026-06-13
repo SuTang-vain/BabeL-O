@@ -1726,7 +1726,10 @@ export function formatContextAnalysis(analysis: Parameters<typeof openContextVie
   const longTermMemoryScope = longTermMemory.scope !== 'unknown'
     ? ` scope=${longTermMemory.scope}${longTermMemory.namespaceId ? ` namespace=${longTermMemory.namespaceId}` : ''}${longTermMemory.namespaceSource ? ` source=${longTermMemory.namespaceSource}` : ''}${longTermMemory.isolationKey ? ` isolation=${longTermMemory.isolationKey}` : ''}`
     : ''
-  diagnosticRows.push(`long-term memory ${longTermMemory.enabled ? longTermMemory.provider : 'disabled'}${longTermMemoryScope} · hits=${longTermMemory.hitCount} injected=${formatCharCount(longTermMemory.injectedChars)}/${formatCharCount(longTermMemory.budgetChars)}${longTermMemory.searchLatencyMs !== undefined ? ` latency=${Math.round(longTermMemory.searchLatencyMs)}ms` : ''}${longTermMemory.truncated ? ' · truncated' : ''}${longTermMemory.error ? ` · error=${longTermMemory.error}` : ''}`)
+  const longTermMemoryAutoSearch = longTermMemory.autoSearch
+    ? ` · auto-search=${longTermMemory.autoSearch.triggered ? 'triggered' : 'skipped'}:${longTermMemory.autoSearch.reason}${longTermMemory.autoSearch.cue ? ` cue=${longTermMemory.autoSearch.cue}` : ''}`
+    : ''
+  diagnosticRows.push(`long-term memory ${longTermMemory.enabled ? longTermMemory.provider : 'disabled'}${longTermMemoryScope} · hits=${longTermMemory.hitCount} injected=${formatCharCount(longTermMemory.injectedChars)}/${formatCharCount(longTermMemory.budgetChars)}${longTermMemory.searchLatencyMs !== undefined ? ` latency=${Math.round(longTermMemory.searchLatencyMs)}ms` : ''}${longTermMemory.truncated ? ' · truncated' : ''}${longTermMemoryAutoSearch}${longTermMemory.error ? ` · error=${longTermMemory.error}` : ''}`)
   for (const scopedMemory of analysis.diagnostics.scopedMemory) {
     if (scopedMemory.scope === 'unknown') continue
     const namespace = scopedMemory.namespaceId ? ` namespace=${scopedMemory.namespaceId}` : ''

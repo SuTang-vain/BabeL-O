@@ -308,6 +308,12 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 		return "ctx ok  ", statusStyle
 	case "workspace_dirty_detected":
 		return "git dirty", statusStyle
+	case "task_scope_declared":
+		return "scope   ", mutedStyle
+	case "scope_boundary_detected":
+		return "scope ! ", statusStyle
+	case "scope_boundary_confirmed":
+		return "scope ok", statusStyle
 	case "compact_failure":
 		return "compact! ", errorStyle
 	case "context_usage":
@@ -421,6 +427,12 @@ func formatNexusEvent(event map[string]any) string {
 		return fmt.Sprintf("context grounding confirmed kind=%s tool=%s for=%s", stringField(event, "confirmationKind"), stringField(event, "toolName"), stringSliceField(event, "confirmedFor"))
 	case "workspace_dirty_detected":
 		return fmt.Sprintf("workspace dirty source=%s changed=%d files=%s", stringField(event, "source"), anyInt(event["changedFileCount"]), stringSliceField(event, "changedFiles"))
+	case "task_scope_declared":
+		return fmt.Sprintf("task scope mode=%s primary=%s external=%s confirmed=%s", stringField(event, "mode"), stringField(event, "primaryRoot"), stringSliceField(event, "explicitRoots"), stringSliceField(event, "confirmedExternalRoots"))
+	case "scope_boundary_detected":
+		return fmt.Sprintf("scope boundary kind=%s action=%s target=%s current=%s reason=%s", stringField(event, "boundaryKind"), stringField(event, "action"), stringField(event, "targetRoot"), stringField(event, "taskPrimaryRoot"), stringField(event, "reason"))
+	case "scope_boundary_confirmed":
+		return fmt.Sprintf("scope boundary confirmed scope=%s target=%s", stringField(event, "confirmationScope"), stringField(event, "targetRoot"))
 	case "context_warning", "context_blocking":
 		return fmt.Sprintf("%s tokens=%v max=%v", eventType, event["tokenEstimate"], event["maxTokens"])
 	case "near_timeout_warning":

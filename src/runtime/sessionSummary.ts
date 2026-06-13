@@ -108,6 +108,9 @@ export function summarizeSessionEvents(
       case 'context_grounding_required':
       case 'context_grounding_confirmed':
       case 'workspace_dirty_detected':
+      case 'task_scope_declared':
+      case 'scope_boundary_detected':
+      case 'scope_boundary_confirmed':
       case 'session_memory_updated':
       case 'hook_started':
       case 'hook_completed':

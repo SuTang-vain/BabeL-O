@@ -385,6 +385,13 @@ func (m model) renderFooter(width int) string {
 	if m.running {
 		hint = "waiting for Nexus events"
 	}
+	if m.interruptionPromptActive {
+		hint = "What should BabeL-O do instead? Enter interrupts · Esc cancels"
+	} else if m.cancelRequested {
+		hint = "interrupt requested — waiting for Nexus to stop"
+	} else if m.queuedPrompt != "" {
+		hint = "next prompt queued after current run"
+	}
 	if m.pending != nil {
 		hint = "permission decision required"
 	}

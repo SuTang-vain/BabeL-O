@@ -753,6 +753,15 @@ function renderLiveEvent(event: NexusEvent): void {
     case 'workspace_dirty_detected':
       console.log(chalk.yellow(formatWorkspaceDirtyDetected(event)))
       break
+    case 'task_scope_declared':
+      console.log(chalk.dim(formatTaskScopeDeclared(event)))
+      break
+    case 'scope_boundary_detected':
+      console.log(chalk.yellow(formatScopeBoundaryDetected(event)))
+      break
+    case 'scope_boundary_confirmed':
+      console.log(chalk.green(formatScopeBoundaryConfirmed(event)))
+      break
     case 'context_warning':
       lastContextWarning = { percentUsed: event.percentUsed, tokenEstimate: event.tokenEstimate, maxTokens: event.maxTokens }
       console.log(
@@ -836,6 +845,19 @@ function formatWorkspaceDirtyDetected(event: Extract<NexusEvent, { type: 'worksp
   const files = event.changedFiles.slice(0, 5).join(', ')
   const suffix = event.truncated ? ', …' : ''
   return `workspace dirty (${event.source}): ${event.changedFileCount} changed file(s)${files ? `: ${files}${suffix}` : ''}. ${event.message}`
+}
+
+function formatTaskScopeDeclared(event: Extract<NexusEvent, { type: 'task_scope_declared' }>): string {
+  const externalRoots = [...event.explicitRoots, ...event.confirmedExternalRoots]
+  return `task scope (${event.mode}): primary=${event.primaryRoot}${externalRoots.length > 0 ? ` external=${externalRoots.join(', ')}` : ''}. ${event.message}`
+}
+
+function formatScopeBoundaryDetected(event: Extract<NexusEvent, { type: 'scope_boundary_detected' }>): string {
+  return `scope boundary (${event.boundaryKind}): ${event.targetRoot} outside ${event.taskPrimaryRoot}; action=${event.action}. ${event.reason}`
+}
+
+function formatScopeBoundaryConfirmed(event: Extract<NexusEvent, { type: 'scope_boundary_confirmed' }>): string {
+  return `scope boundary confirmed (${event.confirmationScope}): ${event.targetRoot}. ${event.message}`
 }
 
 function formatErrorRecoveryDetails(details: unknown): string {
@@ -1064,6 +1086,20 @@ export function formatSessionHistory(events: NexusEvent[], mode: 'compact' | 'ex
 
       case 'workspace_dirty_detected':
         outputText += chalk.yellow(`${formatWorkspaceDirtyDetected(ev)}\n`)
+        break
+
+      case 'task_scope_declared':
+        if (mode === 'expanded') {
+          outputText += chalk.dim(`${formatTaskScopeDeclared(ev)}\n`)
+        }
+        break
+
+      case 'scope_boundary_detected':
+        outputText += chalk.yellow(`${formatScopeBoundaryDetected(ev)}\n`)
+        break
+
+      case 'scope_boundary_confirmed':
+        outputText += chalk.green(`${formatScopeBoundaryConfirmed(ev)}\n`)
         break
 
       case 'context_warning':

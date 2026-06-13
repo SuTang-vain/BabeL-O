@@ -780,6 +780,50 @@ func TestFormatNexusEventWorkspaceDirtyDetected(t *testing.T) {
 	}
 }
 
+func TestFormatNexusEventTaskScopeDeclared(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":                   "task_scope_declared",
+		"mode":                   "single_root",
+		"primaryRoot":            "/repo/BabeL-O",
+		"explicitRoots":          []any{},
+		"confirmedExternalRoots": []any{},
+	})
+	for _, want := range []string{"task scope", "mode=single_root", "primary=/repo/BabeL-O"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(task_scope_declared) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventScopeBoundaryDetected(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":            "scope_boundary_detected",
+		"boundaryKind":    "sibling_repo",
+		"action":          "require_confirmation",
+		"targetRoot":      "/repo/BabeL-X",
+		"taskPrimaryRoot": "/repo/BabeL-O",
+		"reason":          "sibling repo not explicitly requested",
+	})
+	for _, want := range []string{"scope boundary", "kind=sibling_repo", "action=require_confirmation", "target=/repo/BabeL-X", "current=/repo/BabeL-O"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(scope_boundary_detected) = %q, want %q", got, want)
+		}
+	}
+}
+
+func TestFormatNexusEventScopeBoundaryConfirmed(t *testing.T) {
+	got := formatNexusEvent(map[string]any{
+		"type":              "scope_boundary_confirmed",
+		"confirmationScope": "once",
+		"targetRoot":        "/repo/BabeL-X",
+	})
+	for _, want := range []string{"scope boundary confirmed", "scope=once", "target=/repo/BabeL-X"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatNexusEvent(scope_boundary_confirmed) = %q, want %q", got, want)
+		}
+	}
+}
+
 func TestFormatContextUsageFooter(t *testing.T) {
 	if got := formatContextUsageFooter(nil); got != "" {
 		t.Fatalf("formatContextUsageFooter(nil) = %q, want empty", got)
@@ -1186,6 +1230,7 @@ func TestStreamStartedPersistsAllocatedSessionForNextTurn(t *testing.T) {
 	updated, _ := m.Update(streamStartedMsg{
 		events:    events,
 		decisions: decisions,
+		cancel:    make(chan struct{}),
 		sessionID: "session_allocated_once",
 	})
 	m = updated.(model)
@@ -2057,6 +2102,103 @@ func TestKeyDoesNotReachTextinputInPermissionMode(t *testing.T) {
 	}
 }
 
+func TestEscDuringRunningPromptsForAlternativeInstruction(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_1"})
+	m.running = true
+	m.input.SetValue("")
+	updated, cmd := m.Update(keyPress(tea.KeyEsc))
+	if cmd != nil {
+		t.Fatalf("first esc while running should only open the guidance prompt, got cmd %T", cmd)
+	}
+	m = updated.(model)
+	if !m.interruptionPromptActive {
+		t.Fatalf("first esc should activate interruption prompt")
+	}
+	if !strings.Contains(m.input.Value(), "BabeL-O should") {
+		t.Fatalf("interruption prompt should seed input with guidance prefix, got %q", m.input.Value())
+	}
+	if got := m.transcript[len(m.transcript)-1].kind; got != "permission" {
+		t.Fatalf("interruption prompt should render as yellow permission guidance, got kind %q", got)
+	}
+	if !strings.Contains(m.transcript[len(m.transcript)-1].text, "What should BabeL-O do instead?") {
+		t.Fatalf("interruption prompt text missing guidance: %q", m.transcript[len(m.transcript)-1].text)
+	}
+}
+
+func TestEnterAfterInterruptionPromptCancelsAndQueuesNextPrompt(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: "session_1"})
+	m.running = true
+	cancelCh := make(chan struct{}, 1)
+	m.streamCancel = cancelCh
+	m.interruptionPromptActive = true
+	m.input.SetValue("summarize current state instead")
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	if cmd == nil {
+		t.Fatalf("enter after interruption prompt should issue a cancel command")
+	}
+	if !m.cancelRequested {
+		t.Fatalf("enter after interruption prompt should mark cancel requested")
+	}
+	if m.queuedPrompt != "summarize current state instead" {
+		t.Fatalf("queuedPrompt = %q", m.queuedPrompt)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("queued interruption prompt should clear input, got %q", m.input.Value())
+	}
+	_ = cmd()
+	select {
+	case <-cancelCh:
+	default:
+		t.Fatalf("cancel command should notify the local stream cancel channel")
+	}
+}
+
+func TestEnterWhileRunningQueuesNextPrompt(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+	m.input.SetValue("next prompt")
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	if cmd != nil {
+		t.Fatalf("queuing while running should not start a second stream immediately, got %T", cmd)
+	}
+	m = updated.(model)
+	if m.queuedPrompt != "next prompt" {
+		t.Fatalf("queuedPrompt = %q, want next prompt", m.queuedPrompt)
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("input should clear after queueing, got %q", m.input.Value())
+	}
+	if len(m.promptHistory) != 1 || m.promptHistory[0] != "next prompt" {
+		t.Fatalf("queued prompt should enter history, got %#v", m.promptHistory)
+	}
+}
+
+func TestResultStartsQueuedPrompt(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+	m.queuedPrompt = "next prompt"
+	updated, cmd := m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":    "result",
+		"success": true,
+		"message": "done",
+	}}})
+	m = updated.(model)
+	if cmd == nil {
+		t.Fatalf("result with queued prompt should return a start command")
+	}
+	if !m.running {
+		t.Fatalf("queued prompt should start immediately after result")
+	}
+	if m.queuedPrompt != "" {
+		t.Fatalf("queuedPrompt should be consumed, got %q", m.queuedPrompt)
+	}
+	if got := m.transcript[len(m.transcript)-1].text; got != "next prompt" {
+		t.Fatalf("last transcript item = %q, want queued user prompt", got)
+	}
+}
+
 func TestPermissionPanelRendersFiveOptionsWithCursor(t *testing.T) {
 	// Phase A.1 of docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
 	// the permission panel must render 5 numbered choices with a
@@ -2097,6 +2239,31 @@ func TestPermissionPanelRendersFiveOptionsWithCursor(t *testing.T) {
 	}
 	if m.permissionChoice != 0 {
 		t.Fatalf("permissionChoice = %d, want 0 (default cursor on Approve once)", m.permissionChoice)
+	}
+}
+
+func TestPermissionPanelRendersScopeRisk(t *testing.T) {
+	pending := &pendingPermission{
+		name:            "Bash",
+		risk:            "read",
+		input:           "cd /repo/BabeL-X && find . -type f",
+		message:         "Tool Bash crosses the current task scope.",
+		scopeRisk:       "sibling_repo",
+		targetRoot:      "/repo/BabeL-X",
+		taskPrimaryRoot: "/repo/BabeL-O",
+		scopeReason:     "sibling repo not explicitly requested",
+	}
+	d := newPermissionDialog(pending, 0)
+	out := d.View(120)
+	for _, want := range []string{
+		"Scope: sibling_repo outside current task",
+		"Target: /repo/BabeL-X",
+		"Current: /repo/BabeL-O",
+		"Scope reason: sibling repo not explicitly requested",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("scope-risk permission view missing %q:\n%s", want, out)
+		}
 	}
 }
 
@@ -7214,7 +7381,7 @@ func TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest(t *testing.T) {
 
 	doneCh := make(chan struct{})
 	go func() {
-		runStream(cfg, "session_test_allocated", "git commit", resolveGoTuiTimeout(cfg, "git commit", nil), eventCh, decisions)
+		runStream(cfg, "session_test_allocated", "git commit", resolveGoTuiTimeout(cfg, "git commit", nil), eventCh, decisions, make(chan struct{}))
 		close(doneCh)
 	}()
 

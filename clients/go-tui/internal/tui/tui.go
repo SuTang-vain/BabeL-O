@@ -51,6 +51,7 @@ type Config struct {
 type streamStartedMsg struct {
 	events    <-chan streamEvent
 	decisions chan<- permissionDecision
+	cancel    chan<- struct{}
 	sessionID string
 }
 
@@ -59,6 +60,11 @@ type streamEventMsg struct {
 }
 
 type streamClosedMsg struct{}
+
+type streamCancelMsg struct {
+	sessionID string
+	err       error
+}
 
 type copyToastExpiredMsg struct {
 	copiedAt time.Time
@@ -890,6 +896,7 @@ type model struct {
 	running                   bool
 	events                    <-chan streamEvent
 	decisions                 chan<- permissionDecision
+	streamCancel              chan<- struct{}
 	pending                   *pendingPermission
 	recentPermissionRules     map[string]permissionRuleSeen
 	trustedPermissionSessions map[string]struct{}
@@ -997,6 +1004,16 @@ type model struct {
 	promptHistory []string
 	historyIndex  int
 	historySaved  string
+	// queuedPrompt is the next prompt the operator submitted
+	// while a turn was still running. It is dispatched as soon
+	// as the current stream lands a terminal result/error (or an
+	// ESC cancellation finishes). The textarea remains editable
+	// during m.running so the operator can stage follow-up input
+	// without waiting at the terminal.
+	queuedPrompt             string
+	cancelRequested          bool
+	cancelRequestedAt        time.Time
+	interruptionPromptActive bool
 	// /model multi-step state. The flow is:
 	//   1) modeModelPickProvider — pick a provider
 	//   2) modeModelPickApiKey  — paste API key (or accept default)
@@ -1328,6 +1345,158 @@ func (m *model) insertInputNewline() {
 	m.input.InsertRune('\n')
 	m.syncInputHeight()
 	m.resize()
+}
+
+func (m *model) submitPrompt(rawPrompt string, queueIfRunning bool) tea.Cmd {
+	if before, ok := strings.CutSuffix(rawPrompt, "\\"); ok {
+		m.setInputValue(before)
+		m.insertInputNewline()
+		return nil
+	}
+	trimmed := strings.TrimSpace(rawPrompt)
+	if trimmed == "" {
+		return nil
+	}
+	if m.running {
+		if m.interruptionPromptActive {
+			m.queuePrompt(rawPrompt)
+			return m.cancelRunningStream(rawPrompt)
+		}
+		if queueIfRunning {
+			m.queuePrompt(rawPrompt)
+		}
+		return nil
+	}
+	return m.startPrompt(rawPrompt)
+}
+
+func (m *model) queuePrompt(rawPrompt string) {
+	trimmed := strings.TrimSpace(rawPrompt)
+	if trimmed == "" {
+		return
+	}
+	m.queuedPrompt = rawPrompt
+	m.setInputValue("")
+	m.appendPromptHistory(rawPrompt)
+	m.appendLine("status", "queued next prompt: "+truncatePlain(singleLine(trimmed), 120))
+	m.resize()
+}
+
+func (m *model) startPrompt(rawPrompt string) tea.Cmd {
+	trimmed := strings.TrimSpace(rawPrompt)
+	if trimmed == "" || m.running {
+		return nil
+	}
+	m.appendPromptHistory(rawPrompt)
+	m.setInputValue("")
+	expandedPrompt := m.expandPromptPlaceholders(rawPrompt)
+	m.pastedTextReplacements = make(map[string]string)
+	m.pastedTextCounter = 0
+
+	if strings.HasPrefix(trimmed, "/") {
+		// Note: do NOT m.setMode(modeComposing) here — some
+		// slash commands (e.g. /profile <name>) intentionally
+		// transition to modeProfileConfirm, and clobbering
+		// that would skip the y/n overlay. Other commands
+		// stay in composing by default (no setMode call),
+		// which matches the previous behavior.
+		cmd := m.handleLocalCommand(trimmed)
+		m.resize()
+		return cmd
+	}
+	return m.startAgentPrompt(trimmed, expandedPrompt)
+}
+
+func (m *model) appendPromptHistory(rawPrompt string) {
+	if len(m.promptHistory) == 0 || m.promptHistory[len(m.promptHistory)-1] != rawPrompt {
+		m.promptHistory = append(m.promptHistory, rawPrompt)
+	}
+	m.historyIndex = -1
+	m.historySaved = ""
+}
+
+func (m *model) startAgentPrompt(displayPrompt string, expandedPrompt string) tea.Cmd {
+	if strings.TrimSpace(displayPrompt) == "" || m.running {
+		return nil
+	}
+	m.appendLine("user", displayPrompt)
+	timeout := resolveGoTuiTimeout(m.cfg, expandedPrompt, m.latestUsage)
+	m.currentTimeout = timeout
+	if timeout.Adaptive {
+		m.appendLine("status", timeout.Label())
+	}
+	m.running = true
+	m.cancelRequested = false
+	m.cancelRequestedAt = time.Time{}
+	m.pending = nil
+	m.lastEventType = ""
+	m.startedAt = time.Now()
+	m.resize()
+	return tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
+}
+
+func (m *model) startQueuedPrompt() tea.Cmd {
+	rawPrompt := m.queuedPrompt
+	m.queuedPrompt = ""
+	if strings.TrimSpace(rawPrompt) == "" || m.running {
+		return nil
+	}
+	m.appendLine("status", "starting queued prompt")
+	return m.startPrompt(rawPrompt)
+}
+
+func (m *model) openInterruptionPrompt() {
+	if !m.running || m.cancelRequested {
+		return
+	}
+	m.interruptionPromptActive = true
+	m.setMode(modeComposing)
+	if strings.TrimSpace(m.input.Value()) == "" {
+		m.setInputValue("BabeL-O should ")
+	} else {
+		m.resize()
+	}
+	m.appendLine("permission", "What should BabeL-O do instead? Edit the prompt below, then Enter to interrupt; Esc again cancels the current run without extra guidance.")
+	m.resize()
+}
+
+func (m *model) cancelRunningStream(feedback string) tea.Cmd {
+	if !m.running || m.cancelRequested {
+		return nil
+	}
+	m.cancelRequested = true
+	m.cancelRequestedAt = time.Now()
+	m.interruptionPromptActive = false
+	m.pending = nil
+	if m.inputMode == modePermission || m.inputMode == modePermissionEditRule || m.inputMode == modePermissionEditFeedback {
+		m.setMode(modeComposing)
+	}
+	if trimmed := strings.TrimSpace(feedback); trimmed != "" {
+		m.appendLine("permission", "interrupting current run; next instruction: "+truncatePlain(singleLine(trimmed), 120))
+	} else {
+		m.appendLine("status", "cancelling current agent run…")
+	}
+	cancel := m.streamCancel
+	m.resize()
+	return cancelStream(m.cfg, m.sessionID, cancel)
+}
+
+func (m *model) finishRunningStream() tea.Cmd {
+	m.running = false
+	m.cancelRequested = false
+	m.cancelRequestedAt = time.Time{}
+	m.interruptionPromptActive = false
+	m.pending = nil
+	m.events = nil
+	m.decisions = nil
+	m.streamCancel = nil
+	if m.inputMode == modePermission || m.inputMode == modePermissionEditRule || m.inputMode == modePermissionEditFeedback {
+		m.setMode(modeComposing)
+	}
+	m.latestUsage = nil
+	m.softTimeoutState = nil
+	m.resize()
+	return m.startQueuedPrompt()
 }
 
 // printableRuneFromKey returns the leading printable rune from a
@@ -1670,8 +1839,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		if cmd, handled := m.dispatchCommandShortcut(msg); handled {
-			return m, cmd
+		if m.running && m.inputMode == modeComposing && key == "esc" {
+			if m.interruptionPromptActive {
+				return m, m.cancelRunningStream("")
+			}
+			m.openInterruptionPrompt()
+			return m, nil
+		}
+
+		if !m.running {
+			if cmd, handled := m.dispatchCommandShortcut(msg); handled {
+				return m, cmd
+			}
 		}
 
 		// `ctrl+c` is global: open a confirmation overlay, even
@@ -2395,56 +2574,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if key == "enter" {
-			rawPrompt := m.input.Value()
-			if before, ok := strings.CutSuffix(rawPrompt, "\\"); ok {
-				m.setInputValue(before)
-				m.insertInputNewline()
-				return m, nil
-			}
-			trimmed := strings.TrimSpace(rawPrompt)
-			if trimmed == "" || m.running {
-				return m, nil
-			}
-			// Push to the per-session prompt history so the
-			// operator can recall a prior turn with up/down.
-			// Skip the entry if the last submitted prompt was
-			// identical (avoids stacking duplicates when the
-			// user re-submits the same turn). Reset the
-			// history cursor so the next up navigates from
-			// the live draft.
-			if len(m.promptHistory) == 0 || m.promptHistory[len(m.promptHistory)-1] != rawPrompt {
-				m.promptHistory = append(m.promptHistory, rawPrompt)
-			}
-			m.historyIndex = -1
-			m.historySaved = ""
-			m.setInputValue("")
-			expandedPrompt := m.expandPromptPlaceholders(rawPrompt)
-			m.pastedTextReplacements = make(map[string]string)
-			m.pastedTextCounter = 0
-
-			if strings.HasPrefix(trimmed, "/") {
-				// Note: do NOT m.setMode(modeComposing) here — some
-				// slash commands (e.g. /profile <name>) intentionally
-				// transition to modeProfileConfirm, and clobbering
-				// that would skip the y/n overlay. Other commands
-				// stay in composing by default (no setMode call),
-				// which matches the previous behavior.
-				cmd := m.handleLocalCommand(trimmed)
-				m.resize()
-				return m, cmd
-			}
-			m.appendLine("user", trimmed)
-			timeout := resolveGoTuiTimeout(m.cfg, expandedPrompt, m.latestUsage)
-			m.currentTimeout = timeout
-			if timeout.Adaptive {
-				m.appendLine("status", timeout.Label())
-			}
-			m.running = true
-			m.pending = nil
-			m.lastEventType = ""
-			m.startedAt = time.Now()
-			m.resize()
-			return m, tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
+			return m, m.submitPrompt(m.input.Value(), true)
 		}
 
 	default:
@@ -2468,6 +2598,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case streamStartedMsg:
 		m.events = msg.events
 		m.decisions = msg.decisions
+		m.streamCancel = msg.cancel
 		if msg.sessionID != "" {
 			m.sessionID = msg.sessionID
 			m.cfg.SessionID = msg.sessionID
@@ -2480,14 +2611,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case streamEventMsg:
 		if msg.event.err != nil {
+			if m.cancelRequested {
+				m.appendLine("status", "current agent run cancelled")
+				return m, m.finishRunningStream()
+			}
 			m.appendLine("error", msg.event.err.Error())
-			m.running = false
-			m.pending = nil
-			return m, nil
+			m.queuedPrompt = ""
+			return m, m.finishRunningStream()
 		}
+		eventType := stringField(msg.event.payload, "type")
 		eventCmd := m.consumeNexusEvent(msg.event.payload)
 		if m.running {
 			return m, tea.Batch(waitForStreamEvent(m.events), eventCmd)
+		}
+		if eventType == "result" || eventType == "error" {
+			return m, tea.Batch(eventCmd, m.finishRunningStream())
 		}
 		return m, eventCmd
 
@@ -2811,8 +2949,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// "stream started" removal above; the running indicator
 		// in the header is the canonical source of truth for
 		// stream liveness.
-		m.running = false
-		m.pending = nil
+		return m, m.finishRunningStream()
+
+	case streamCancelMsg:
+		if msg.err != nil {
+			m.appendLine("error", "cancel current run: "+msg.err.Error())
+			return m, nil
+		}
 		return m, nil
 
 	case copyToastExpiredMsg:
@@ -3340,7 +3483,11 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		m.connected = true
 	case "permission_request":
 		sessionID := stringField(event, "sessionId")
-		if m.isPermissionSessionTrusted(sessionID) {
+		scopeRisk := strings.TrimSpace(stringField(event, "scopeRisk"))
+		if scopeRisk == "none" {
+			scopeRisk = ""
+		}
+		if scopeRisk == "" && m.isPermissionSessionTrusted(sessionID) {
 			m.pending = &pendingPermission{
 				sessionID: sessionID,
 				toolUseID: stringField(event, "toolUseId"),
@@ -3363,6 +3510,10 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 			risk:              stringField(event, "risk"),
 			input:             formatToolInput(stringField(event, "name"), event["input"]),
 			message:           stringField(event, "message"),
+			scopeRisk:         scopeRisk,
+			targetRoot:        stringField(event, "targetRoot"),
+			taskPrimaryRoot:   stringField(event, "taskPrimaryRoot"),
+			scopeReason:       stringField(event, "scopeReason"),
 			suggestedRule:     suggestedRule,
 			repeatedRuleCount: repeatedRuleCount,
 		}
@@ -3471,7 +3622,7 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
-	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected":
+	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
 		m.appendLine(eventType, formatNexusEvent(event))
 	case "context_usage":
 		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)

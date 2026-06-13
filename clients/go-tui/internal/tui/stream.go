@@ -19,13 +19,14 @@ func startStream(cfg Config, prompt string, timeout timeoutDecision) tea.Cmd {
 	return func() tea.Msg {
 		eventCh := make(chan streamEvent, 128)
 		decisionCh := make(chan permissionDecision, 8)
+		cancelCh := make(chan struct{})
 		sessionID, err := ensureStreamSession(cfg, prompt)
 		if err != nil {
 			close(eventCh)
 			return streamEventMsg{event: streamEvent{err: err}}
 		}
-		go runStream(cfg, sessionID, prompt, timeout, eventCh, decisionCh)
-		return streamStartedMsg{events: eventCh, decisions: decisionCh, sessionID: sessionID}
+		go runStream(cfg, sessionID, prompt, timeout, eventCh, decisionCh, cancelCh)
+		return streamStartedMsg{events: eventCh, decisions: decisionCh, cancel: cancelCh, sessionID: sessionID}
 	}
 }
 
@@ -163,7 +164,7 @@ func ensureStreamSession(cfg Config, prompt string) (string, error) {
 	return sessionID, nil
 }
 
-func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, eventCh chan<- streamEvent, decisions <-chan permissionDecision) {
+func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, eventCh chan<- streamEvent, decisions <-chan permissionDecision, cancel <-chan struct{}) {
 	defer close(eventCh)
 
 	wsURL, err := streamURL(cfg.BaseURL)
@@ -187,6 +188,13 @@ func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, ev
 	var writeMu sync.Mutex
 	done := make(chan struct{})
 	defer close(done)
+	go func() {
+		select {
+		case <-cancel:
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
 	go func() {
 		for {
 			select {

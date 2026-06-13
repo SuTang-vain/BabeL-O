@@ -287,6 +287,45 @@ test('formatSessionHistory: renders grounding guard events', () => {
       source: 'tool_result',
       message: 'Context grounding confirmed by current file read.',
     },
+    {
+      type: 'task_scope_declared',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      cwd: '/repo/BabeL-O',
+      primaryRoot: '/repo/BabeL-O',
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+      inferredCandidateRoots: [],
+      mode: 'single_root',
+      source: 'cwd',
+      message: 'Current task scope is single-root: /repo/BabeL-O.',
+    },
+    {
+      type: 'scope_boundary_detected',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      toolUseId: 'tool-scope-boundary',
+      toolName: 'Bash',
+      targetRoot: '/repo/BabeL-X',
+      taskPrimaryRoot: '/repo/BabeL-O',
+      boundaryKind: 'sibling_repo',
+      action: 'require_confirmation',
+      scopeRisk: 'sibling_repo',
+      reason: 'Tool target /repo/BabeL-X is a sibling root outside current task root /repo/BabeL-O.',
+      suggestedPrompt: 'Ask before inspecting /repo/BabeL-X.',
+    },
+    {
+      type: 'scope_boundary_confirmed',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 'sess-grounding-render',
+      timestamp: now,
+      targetRoot: '/repo/BabeL-X',
+      confirmationScope: 'once',
+      confirmedBy: 'user',
+      message: 'User confirmed /repo/BabeL-X for the current task scope.',
+    },
   ]
 
   const output = formatSessionHistory(events, 'compact')
@@ -296,6 +335,9 @@ test('formatSessionHistory: renders grounding guard events', () => {
   assert.ok(output.includes('src/runtime/LLMCodingRuntime.ts'))
   assert.ok(output.includes('context grounding confirmed (file_read via Read)'))
   assert.ok(output.includes('file_facts, implementation_status'))
+  assert.ok(output.includes('scope boundary (sibling_repo)'))
+  assert.ok(output.includes('/repo/BabeL-X outside /repo/BabeL-O'))
+  assert.ok(output.includes('scope boundary confirmed (once): /repo/BabeL-X'))
 })
 
 test('formatSessionHistory: renders provider fallback policy details', () => {

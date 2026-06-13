@@ -105,6 +105,35 @@ func triggerCompact(cfg Config, sessionID string) tea.Cmd {
 	}
 }
 
+func cancelStream(cfg Config, sessionID string, cancel chan<- struct{}) tea.Cmd {
+	return func() tea.Msg {
+		notifyLocalStream := func() {
+			if cancel == nil {
+				return
+			}
+			select {
+			case cancel <- struct{}{}:
+			default:
+				close(cancel)
+			}
+		}
+		if sessionID == "" {
+			notifyLocalStream()
+			return streamCancelMsg{}
+		}
+		_, err := nexusRawJSON(
+			cfg,
+			http.MethodPost,
+			"/v1/sessions/"+url.PathEscape(sessionID)+"/cancel",
+			map[string]string{"reason": "Cancelled from Go TUI"},
+		)
+		if err != nil {
+			notifyLocalStream()
+		}
+		return streamCancelMsg{sessionID: sessionID, err: err}
+	}
+}
+
 // fetchInbox issues GET /v1/sessions/:sessionId/inbox and decodes
 // the stable top-level envelope (type / sessionId / messages /
 // limit / includeAcknowledged). The raw bytes are retained so any

@@ -39,6 +39,18 @@ func (d *permissionDialog) View(width int) string {
 		rows = append(rows, "input:")
 		rows = append(rows, wrapPlain(input, max(0, width-6)))
 	}
+	if scopeRisk := strings.TrimSpace(d.pending.scopeRisk); scopeRisk != "" {
+		rows = append(rows, permissionStyle.Render("Scope: "+scopeRisk+" outside current task"))
+		if target := strings.TrimSpace(d.pending.targetRoot); target != "" {
+			rows = append(rows, permissionStyle.Render("Target: "+target))
+		}
+		if current := strings.TrimSpace(d.pending.taskPrimaryRoot); current != "" {
+			rows = append(rows, permissionStyle.Render("Current: "+current))
+		}
+		if reason := strings.TrimSpace(d.pending.scopeReason); reason != "" {
+			rows = append(rows, permissionStyle.Render("Scope reason: "+reason))
+		}
+	}
 	repeatedRuleCount := d.pending.repeatedRuleCount
 	if suggested := strings.TrimSpace(d.pending.suggestedRule); suggested != "" {
 		rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
@@ -109,6 +121,18 @@ func (d *permissionEditorDialog) View(width int) string {
 	if input := strings.TrimSpace(d.pending.input); input != "" {
 		rows = append(rows, "input:")
 		rows = append(rows, wrapPlain(input, max(0, width-6)))
+	}
+	if scopeRisk := strings.TrimSpace(d.pending.scopeRisk); scopeRisk != "" {
+		rows = append(rows, permissionStyle.Render("Scope: "+scopeRisk+" outside current task"))
+		if target := strings.TrimSpace(d.pending.targetRoot); target != "" {
+			rows = append(rows, permissionStyle.Render("Target: "+target))
+		}
+		if current := strings.TrimSpace(d.pending.taskPrimaryRoot); current != "" {
+			rows = append(rows, permissionStyle.Render("Current: "+current))
+		}
+		if reason := strings.TrimSpace(d.pending.scopeReason); reason != "" {
+			rows = append(rows, permissionStyle.Render("Scope reason: "+reason))
+		}
 	}
 	if msg := strings.TrimSpace(d.pending.message); msg != "" {
 		rows = append(rows, permissionStyle.Render("reason: "+msg))
