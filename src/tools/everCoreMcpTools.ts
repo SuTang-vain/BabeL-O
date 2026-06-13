@@ -23,7 +23,6 @@ const searchInputSchema = z.object({
 
 const saveNoteInputSchema = z.object({
   note: z.string().min(1).max(MAX_NOTE_CHARS),
-  sessionId: z.string().min(1).optional(),
 })
 
 const flushInputSchema = z.object({
@@ -122,7 +121,7 @@ function createMemorySaveNoteTool(
 ): ToolDefinition<typeof saveNoteInputSchema> {
   return {
     name: 'mcp:evercore:memory_save_note',
-    description: 'Save a note to EverCore long-term memory only when the user explicitly asks you to remember something, or when an approved governed memory candidate should be written. This is write-risk and permission-gated. Prefer saving user preferences, durable constraints, or work-style feedback; do not save high-impact project facts without workspace evidence and user approval.',
+    description: 'Save a note to EverCore long-term memory for the current runtime session only when the user explicitly asks you to remember something, or when an approved governed memory candidate should be written. This is write-risk and permission-gated. Prefer saving user preferences, durable constraints, or work-style feedback; do not save high-impact project facts without workspace evidence and user approval.',
     risk: 'write',
     inputSchema: saveNoteInputSchema,
     modelInputSchema: z.toJSONSchema(saveNoteInputSchema),
@@ -135,28 +134,39 @@ function createMemorySaveNoteTool(
     suggestedAllowRule: 'mcp:evercore:memory_save_note',
     mcpServerAllowed: true,
     async execute(input, context) {
-      const sessionId = input.sessionId ?? context.sessionId
-      const message: EverCoreMessage = {
-        sender_id: config.agentId,
-        sender_name: 'BabeL-O',
-        role: 'assistant',
-        timestamp: Date.now(),
-        content: input.note.trim(),
-      }
+      const sessionId = context.sessionId
+      const note = input.note.trim()
+      const timestamp = Date.now()
+      const messages: EverCoreMessage[] = [
+        {
+          sender_id: config.userId ?? 'local-user',
+          sender_name: 'User',
+          role: 'user',
+          timestamp,
+          content: note,
+        },
+        {
+          sender_id: config.agentId,
+          sender_name: 'BabeL-O',
+          role: 'assistant',
+          timestamp: timestamp + 1,
+          content: `Approved long-term memory note saved: ${note}`,
+        },
+      ]
       try {
         await client.addAgentMessages({
           sessionId,
           appId: config.appId,
           projectId: config.projectId,
-          messages: [message],
+          messages,
         })
         return {
           success: true,
           output: {
             provider: 'evercore',
             sessionId,
-            savedMessages: 1,
-            savedChars: message.content.length,
+            savedMessages: messages.length,
+            savedChars: note.length,
           },
         }
       } catch (error) {
