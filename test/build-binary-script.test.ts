@@ -5,6 +5,7 @@ import { test } from 'node:test'
 
 const repoRoot = new URL('..', import.meta.url).pathname
 const buildBinaryScript = join(repoRoot, 'scripts/build-binary.js')
+const packageJsonPath = join(repoRoot, 'package.json')
 
 test('build-binary esbuild banner aliases createRequire to avoid ESM duplicate declarations', async () => {
   const script = await readFile(buildBinaryScript, 'utf8')
@@ -13,4 +14,16 @@ test('build-binary esbuild banner aliases createRequire to avoid ESM duplicate d
   assert.match(script, /const require = babelOCreateRequire\(import\.meta\.url\)/)
   assert.doesNotMatch(script, /import \{ createRequire \} from ['"]node:module['"]/)
   assert.doesNotMatch(script, /const require = createRequire\(import\.meta\.url\)/)
+})
+
+test('npm package excludes standalone SEA build artifacts', async () => {
+  const pkg = JSON.parse(await readFile(packageJsonPath, 'utf8')) as {
+    files?: string[]
+  }
+
+  assert.ok(pkg.files?.includes('dist'))
+  assert.ok(pkg.files?.includes('!dist/bbl'))
+  assert.ok(pkg.files?.includes('!dist/bbl.exe'))
+  assert.ok(pkg.files?.includes('!dist/bbl-bundled.mjs'))
+  assert.ok(pkg.files?.includes('!dist/sea-config.json'))
 })

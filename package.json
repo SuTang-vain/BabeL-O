@@ -8,6 +8,10 @@
   },
   "files": [
     "dist",
+    "!dist/bbl",
+    "!dist/bbl.exe",
+    "!dist/bbl-bundled.mjs",
+    "!dist/sea-config.json",
     "bin",
     "clients/go-tui/README.md",
     "clients/go-tui/Makefile",
