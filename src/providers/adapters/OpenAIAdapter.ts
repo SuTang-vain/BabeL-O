@@ -120,6 +120,7 @@ export class OpenAIAdapter implements ModelAdapter {
         }
       }
     }
+    validateOpenAIToolMessageSequence(openaiMessages)
 
     const mappedTools = params.tools?.map(tool => ({
       type: 'function',
@@ -280,6 +281,32 @@ const OPENAI_FINISH_MAP: Record<string, string> = {
   length: 'max_tokens',
   content_filter: 'end_turn',
   tool_calls: 'tool_use',
+}
+
+function validateOpenAIToolMessageSequence(messages: any[]): void {
+  const knownToolCalls = new Set<string>()
+  const completedToolCalls = new Set<string>()
+
+  for (const message of messages) {
+    if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      for (const call of message.tool_calls) {
+        const id = String(call?.id ?? '')
+        if (id) knownToolCalls.add(id)
+      }
+      continue
+    }
+
+    if (message?.role !== 'tool') continue
+
+    const toolCallId = String(message.tool_call_id ?? '')
+    if (!toolCallId || !knownToolCalls.has(toolCallId)) {
+      throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${toolCallId || '<missing>'}`)
+    }
+    if (completedToolCalls.has(toolCallId)) {
+      throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${toolCallId}`)
+    }
+    completedToolCalls.add(toolCallId)
+  }
 }
 
 function mapOpenAIFinishReason(reason: string): FinishReason {

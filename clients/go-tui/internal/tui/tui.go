@@ -263,6 +263,11 @@ type compactResultMsg struct {
 	err       error
 }
 
+type memoryStatusMsg struct {
+	raw []byte
+	err error
+}
+
 // sessionChannelKind mirrors the SessionChannelKind union from
 // src/shared/sessionChannel.ts. The Go TUI only renders a small
 // fixed set in the inbox footer / event cards; unknown values
@@ -818,6 +823,7 @@ const (
 	modeAgentOverlay      inputMode = "agentOverlay"      // read-only multi-agent status; up/down/esc/enter/q
 	modeTaskBoard         inputMode = "taskBoard"         // read-only task board; up/down/esc/enter/q
 	modeActivityOverlay   inputMode = "activityOverlay"   // read-only recent activity; up/down/esc/enter/q
+	modeMemoryOverlay     inputMode = "memoryOverlay"     // read-only /v1/runtime/memory/status wire; up/down/esc/enter/q
 	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
 	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
 	modeSessionOverlay    inputMode = "sessionOverlay"    // /session step 1: pick session operation
@@ -882,6 +888,20 @@ func (m model) isCompact() bool {
 
 func (m inputMode) canEditInput() bool { return m == modeComposing }
 
+func (m inputMode) canReceiveTextInput() bool {
+	switch m {
+	case modeComposing,
+		modePermissionEditRule,
+		modePermissionEditFeedback,
+		modeSessionInput,
+		modeModelPickApiKey,
+		modeModelPickBaseURL:
+		return true
+	default:
+		return false
+	}
+}
+
 type model struct {
 	cfg                       Config
 	input                     textarea.Model
@@ -937,6 +957,8 @@ type model struct {
 	taskBoardScroll         int
 	activityEvents          []activityEventEntry
 	activityOverlayScroll   int
+	memoryOverlayLines      []string
+	memoryOverlayScroll     int
 	subAgents               map[string]subAgentEntry
 	toolAuditEntries        []runtimeToolAuditEntry
 	toolAuditScroll         int
@@ -1222,6 +1244,10 @@ func (m *model) scrollOverlay(delta int) bool {
 		maxScroll := max(0, len(allLines)-1)
 		m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
 		return true
+	case modeMemoryOverlay:
+		maxScroll := max(0, len(m.memoryOverlayLines)-1)
+		m.memoryOverlayScroll = clamp(m.memoryOverlayScroll+delta, 0, maxScroll)
+		return true
 	case modeToolAuditOverlay:
 		allLines := buildToolAuditOverlayLines(m.toolAuditEntries)
 		maxScroll := max(0, len(allLines)-1)
@@ -1326,6 +1352,16 @@ func (m *model) handlePaste(content string) {
 	}
 	m.syncInputHeight()
 	m.resize()
+}
+
+func isInputNewlineKeyMsg(msg tea.KeyPressMsg) bool {
+	key := msg.Key()
+	if key.Code == tea.KeyEnter || key.Code == tea.KeyKpEnter {
+		if key.Mod&tea.ModShift != 0 || key.Mod&tea.ModAlt != 0 {
+			return true
+		}
+	}
+	return isInputNewlineKey(msg.String())
 }
 
 func isInputNewlineKey(key string) bool {
@@ -1604,8 +1640,8 @@ func newModel(cfg Config) model {
 	input.DynamicHeight = true
 	input.MinHeight = inputMinHeight
 	input.MaxHeight = inputMaxHeight
-	input.KeyMap.InsertNewline.SetKeys("ctrl+j")
-	input.KeyMap.InsertNewline.SetHelp("ctrl+j", "newline")
+	input.KeyMap.InsertNewline.SetKeys("ctrl+j", "shift+enter", "alt+enter")
+	input.KeyMap.InsertNewline.SetHelp("shift+enter", "newline")
 	// Strip the default background fill from the focused /
 	// blurred base style. The bubbles textarea renders a
 	// dark fill behind the prompt row by default, which
@@ -1725,7 +1761,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.PasteMsg:
-		m.handlePaste(msg.Content)
+		if m.inputMode.canReceiveTextInput() {
+			m.handlePaste(msg.Content)
+		}
 		return m, nil
 
 	case tea.MouseClickMsg:
@@ -1886,7 +1924,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resize()
 				return m, nil
 			}
-			if isInputNewlineKey(key) {
+			if isInputNewlineKeyMsg(msg) {
 				m.insertInputNewline()
 				return m, nil
 			}
@@ -2578,7 +2616,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	default:
-		if m.inputMode == modeComposing && m.handleUnknownCSIMessage(fmt.Sprint(msg)) {
+		if m.inputMode.canReceiveTextInput() && m.handleUnknownCSIMessage(fmt.Sprint(msg)) {
 			return m, nil
 		}
 
@@ -2904,6 +2942,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setMode(modeTaskBoard)
 		return m, nil
 
+	case memoryStatusMsg:
+		if msg.err != nil {
+			m.appendLine("error", "memory: "+msg.err.Error())
+			return m, nil
+		}
+		m.memoryOverlayLines = buildMemoryOverlayLines(msg.raw)
+		m.memoryOverlayScroll = 0
+		m.appendLine("status", "memory status loaded")
+		m.setMode(modeMemoryOverlay)
+		return m, nil
+
 	case toolAuditMsg:
 		if msg.err != nil {
 			if msg.trigger == "auto" {
@@ -2977,7 +3026,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	return m, m.updateInput(msg)
+	if m.inputMode.canReceiveTextInput() {
+		return m, m.updateInput(msg)
+	}
+	return m, nil
 }
 
 func (m *model) resize() {
@@ -3026,6 +3078,7 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 		m.renderAgentOverlay(width),
 		m.renderTaskBoard(width),
 		m.renderActivityOverlay(width),
+		m.renderMemoryOverlay(width),
 		m.renderToolAuditOverlay(width),
 		m.renderModelOverlay(width),
 		m.renderModelPickProvider(width),
@@ -3071,6 +3124,7 @@ func (m model) viewString() string {
 	agentOverlay := m.renderAgentOverlay(width)
 	taskBoard := m.renderTaskBoard(width)
 	activityOverlay := m.renderActivityOverlay(width)
+	memoryOverlay := m.renderMemoryOverlay(width)
 	toolAuditOverlay := m.renderToolAuditOverlay(width)
 	modelOverlay := m.renderModelOverlay(width)
 	modelPickProvider := m.renderModelPickProvider(width)
@@ -3103,6 +3157,9 @@ func (m model) viewString() string {
 	}
 	if activityOverlay != "" {
 		parts = append(parts, activityOverlay)
+	}
+	if memoryOverlay != "" {
+		parts = append(parts, memoryOverlay)
 	}
 	if toolAuditOverlay != "" {
 		parts = append(parts, toolAuditOverlay)
@@ -3137,6 +3194,7 @@ func (m model) usesFullScreenOverlay() bool {
 		modeAgentOverlay,
 		modeTaskBoard,
 		modeActivityOverlay,
+		modeMemoryOverlay,
 		modeToolAuditOverlay,
 		modeModelOverlay,
 		modeModelPickProvider,
@@ -3157,6 +3215,7 @@ func (m model) renderFullScreenOverlay(width int) string {
 		m.renderAgentOverlay(width),
 		m.renderTaskBoard(width),
 		m.renderActivityOverlay(width),
+		m.renderMemoryOverlay(width),
 		m.renderToolAuditOverlay(width),
 		m.renderModelOverlay(width),
 		m.renderModelPickProvider(width),
@@ -3467,6 +3526,16 @@ func (m *model) fetchSessionTasksWithSession() tea.Cmd {
 // that don't need a follow-up).
 func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 	eventType := stringField(event, "type")
+	if shouldSuppressTranscriptEvent(eventType) {
+		m.recordSuppressedNexusEvent(event)
+		m.lastEventType = eventType
+		return nil
+	}
+	if shouldSuppressInternalStatusEvent(event) {
+		m.recordSuppressedNexusEvent(event)
+		m.lastEventType = eventType
+		return nil
+	}
 	switch eventType {
 	case "session_started":
 		m.sessionID = stringField(event, "sessionId")
@@ -3691,12 +3760,74 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// render them in the chat transcript; the footer/soft-timeout
 		// state is the right surface for transient budget pressure.
 	case "timeout_budget_exceeded":
-		// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
-		// track the running soft-cycle state on the model so the
-		// footer can show a transient "soft budget reached" status
-		// and a subsequent REQUEST_TIMEOUT can be classified as a
-		// watchdog cutoff rather than a fresh fatal cutoff. The
-		// snapshot is cleared on result / error like `latestUsage`.
+		m.recordSuppressedNexusEvent(event)
+	case "timeout_extension_granted":
+		m.recordSuppressedNexusEvent(event)
+	default:
+		if body := formatNexusEvent(event); body != "" && !looksLikeInternalStatusLine(eventType, body) {
+			m.appendLine(eventType, body)
+		}
+	}
+	m.lastEventType = eventType
+	return nil
+}
+
+func shouldSuppressTranscriptEvent(eventType string) bool {
+	eventType = strings.TrimSpace(eventType)
+	if eventType == "" {
+		return true
+	}
+	if strings.HasPrefix(eventType, "permission_") && eventType != "permission_request" {
+		return true
+	}
+	switch eventType {
+	case "permit",
+		"near_timeout_warning",
+		"timeout_budget_exceeded",
+		"timeout_extension_granted",
+		"execute_summary",
+		"execution_metrics",
+		"usage",
+		"user_intake_guidance",
+		"hook_started",
+		"hook_completed",
+		"hook_failed":
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldSuppressInternalStatusEvent(event map[string]any) bool {
+	eventType := strings.ToLower(strings.TrimSpace(stringField(event, "type")))
+	if eventType == "" {
+		return true
+	}
+	if eventType != "status" && !strings.Contains(eventType, "runtime_status") {
+		return false
+	}
+	return looksLikeInternalStatusLine(eventType, internalStatusEventText(event))
+}
+
+func internalStatusEventText(event map[string]any) string {
+	parts := make([]string, 0, 6)
+	for _, key := range []string{"status", "message", "text", "reason", "summary", "detail"} {
+		if value := strings.TrimSpace(stringAnyField(event, key)); value != "" {
+			parts = append(parts, value)
+		}
+	}
+	if len(parts) == 0 {
+		parts = append(parts, compactJSON(event))
+	}
+	return strings.Join(parts, " ")
+}
+
+func (m *model) recordSuppressedNexusEvent(event map[string]any) {
+	eventType := stringField(event, "type")
+	switch eventType {
+	case "permission_response", "permit":
+		m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
+	case "timeout_budget_exceeded":
 		elapsedMs := anyInt(event["elapsedMs"])
 		budgetMs := anyInt(event["timeoutMs"])
 		if m.softTimeoutState == nil {
@@ -3707,33 +3838,45 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		}
 		m.softTimeoutState.BudgetExceededAt = time.Now()
 		m.softTimeoutState.LastElapsedMs = elapsedMs
-		// Subsequent budget_exceeded events (after an
-		// extension) carry the running budget for that cycle;
-		// update the total so the footer reflects the budget
-		// that just exhausted.
 		if budgetMs > m.softTimeoutState.TotalSoftBudgetMs {
 			m.softTimeoutState.TotalSoftBudgetMs = budgetMs
 		}
 	case "timeout_extension_granted":
-		// Phase 4: update the soft snapshot with the new running
-		// budget + extension count so the footer can render
-		// "soft budget extended +Xms (1/1)" without adding noise
-		// to the main transcript.
 		if m.softTimeoutState == nil {
-			// The grant event must come AFTER a budget_exceeded
-			// event, but stay defensive: a bare grant still
-			// gets a snapshot so the footer renders.
 			m.softTimeoutState = &softTimeoutSnapshot{}
 		}
 		m.softTimeoutState.ExtensionCount = anyInt(event["extensionCount"])
 		m.softTimeoutState.MaxExtensions = anyInt(event["maxExtensions"])
 		m.softTimeoutState.TotalSoftBudgetMs = anyInt(event["totalSoftBudgetMs"])
 		m.softTimeoutState.LastElapsedMs = anyInt(event["elapsedMs"])
-	default:
-		m.appendLine(eventType, formatNexusEvent(event))
+	case "execution_metrics":
+		if snapshot := contextUsageSnapshotFromExecutionMetrics(event); snapshot != nil {
+			m.contextUsage = snapshot
+		}
+	case "usage":
+		m.latestUsage = &usageSnapshot{
+			InputTokens:  anyInt(event["inputTokens"]),
+			OutputTokens: anyInt(event["outputTokens"]),
+			CacheRead:    anyInt(event["cacheReadInputTokens"]),
+		}
+		if m.latestUsage.InputTokens > 0 {
+			m.lastUsage = m.latestUsage
+		}
 	}
-	m.lastEventType = eventType
-	return nil
+}
+
+func looksLikeInternalStatusLine(eventType string, body string) bool {
+	text := strings.ToLower(strings.TrimSpace(eventType + " " + body))
+	if text == "" {
+		return true
+	}
+	return strings.Contains(text, "near timeout elapsed=") ||
+		strings.Contains(text, "execution is near its timeout budget") ||
+		strings.Contains(text, "preserve a concise partial answer now") ||
+		strings.Contains(text, "approved=true reason=approved from trusted go tui") ||
+		strings.Contains(text, "approved (session)") ||
+		strings.Contains(text, "approved from trusted go tui sessi") ||
+		strings.Contains(text, "slash cancelled")
 }
 
 func (m *model) appendStreamingLine(kind string, text string) {

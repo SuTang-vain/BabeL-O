@@ -360,6 +360,7 @@ function formatLongTermMemoryCapability(): string {
     '- Treat memory results as background hints, not authoritative project state.',
     '- Verify project facts against workspace evidence before acting.',
     '- Only save memory when the user explicitly asks you to remember something or when a governed memory candidate is approved.',
+    '- When the user asks about memory capability, answer at the user-facing capability level: whether memory is available, when confirmation is required, and that memory is only a background hint. Do not expose internal source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets unless the user explicitly asks for implementation details.',
   ].join('\n')
 }
 
@@ -429,13 +430,21 @@ function normalizeRetainedEvents(retainedEvents: unknown[] | undefined): NexusEv
 }
 
 export function eventIdentity(event: NexusEvent): string {
+  return buildEventIdentity(event, false)
+}
+
+function legacyEventIdentity(event: NexusEvent): string {
+  return buildEventIdentity(event, true)
+}
+
+function buildEventIdentity(event: NexusEvent, includeLegacyGuidance: boolean): string {
   return [
     event.type,
     event.sessionId,
     event.timestamp,
     (event as { eventId?: string }).eventId ?? '',
     (event as { toolUseId?: string }).toolUseId ?? '',
-    eventContentFingerprint(event),
+    eventContentFingerprint(event, includeLegacyGuidance),
   ].join(':')
 }
 
@@ -463,7 +472,15 @@ export function verifyRetainedSegment(
   }
   const record = metadata as Partial<RetainedSegmentMetadata>
   const actual = buildRetainedSegmentMetadata(events)
-  if (record.boundaryId && boundary && record.boundaryId !== eventIdentity(boundary)) {
+  const legacyIdentities = events.map(legacyEventIdentity)
+  const legacy = {
+    firstEventId: legacyIdentities[0],
+    lastEventId: legacyIdentities.at(-1),
+    hash: hashEventIdentities(legacyIdentities),
+  }
+  const boundaryIdentity = boundary ? eventIdentity(boundary) : undefined
+  const legacyBoundaryIdentity = boundary ? legacyEventIdentity(boundary) : undefined
+  if (record.boundaryId && boundary && record.boundaryId !== boundaryIdentity && record.boundaryId !== legacyBoundaryIdentity) {
     return { valid: false, warning: 'retained boundary anchor mismatch' }
   }
   if (record.retainedCount !== actual.retainedCount) {
@@ -472,24 +489,27 @@ export function verifyRetainedSegment(
       warning: `retained count mismatch: expected ${record.retainedCount}, got ${actual.retainedCount}`,
     }
   }
-  if (record.firstEventId && record.firstEventId !== actual.firstEventId) {
+  if (record.firstEventId && record.firstEventId !== actual.firstEventId && record.firstEventId !== legacy.firstEventId) {
     return { valid: false, warning: 'retained first event mismatch' }
   }
-  if (record.lastEventId && record.lastEventId !== actual.lastEventId) {
+  if (record.lastEventId && record.lastEventId !== actual.lastEventId && record.lastEventId !== legacy.lastEventId) {
     return { valid: false, warning: 'retained last event mismatch' }
   }
-  if (record.hash && record.hash !== actual.hash) {
+  if (record.hash && record.hash !== actual.hash && record.hash !== legacy.hash) {
     return { valid: false, warning: 'retained hash mismatch' }
   }
   return { valid: true, warning: '' }
 }
 
-function eventContentFingerprint(event: NexusEvent): string {
+function eventContentFingerprint(event: NexusEvent, includeLegacyGuidance = false): string {
   switch (event.type) {
     case 'user_message':
       return hashString(event.text)
     case 'user_intake_guidance':
-      return hashString(`${event.userText}:${event.intent}:${event.actionHint}:${event.requiresTools}:${event.source}:${event.guidance}`)
+      if (includeLegacyGuidance) {
+        return hashString(`${event.userText}:${event.intent}:${event.actionHint}:${event.requiresTools}:${event.problemTarget ?? ''}:${event.source}:${event.guidance ?? ''}`)
+      }
+      return hashString(`${event.userText}:${event.intent}:${event.actionHint}:${event.requiresTools}:${event.problemTarget ?? ''}:${event.source}`)
     case 'assistant_delta':
     case 'thinking_delta':
       return hashString(event.text)

@@ -2,6 +2,171 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-13 — Session replay / evidence governance follow-up parity 收口
+
+- **背景**: Phase A-H 主体实现后，复查确认仍有四个最后保险缺口：原事故 provider MiniMax 走 `anthropic-compatible`，但 adapter-level orphan/duplicate `tool_result` preflight 只在 OpenAI-compatible；`resolveProviderToolCallInput()` 对 malformed `partialInput` 仍 fallback `{}`；SQLite `event_seq` 用 `MAX()+1` 但缺 transaction / unique 约束；Read cache 已记录 `mode` 但 coverage 判定未显式拒绝 preview → non-preview 复用。
+- **实现**:
+  - `src/providers/adapters/AnthropicAdapter.ts`: 增加 `validateAnthropicToolMessageSequence()`，Anthropic-compatible / MiniMax request 在 fetch 前拒绝 orphan / duplicate `tool_result`，错误码沿用 `PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE`。
+  - `src/runtime/runtimePipeline.ts`: malformed `partialInput` 统一返回 `{ _parseError: true, _rawInput }`，不再 fallback `{}`，确保所有 adapter 漏 sentinel 时仍走 runtimeToolLoop 的 pair-safe `TOOL_INPUT_PARSE_ERROR` 路径。
+  - `src/storage/SqliteStorage.ts`: event key 改为 append seq + timestamp/type/payload/content digest；append row 用 `BEGIN IMMEDIATE` 事务分配 session-local `event_seq`；migration 创建 `(session_id,event_seq)` partial unique index，并在建索引前 repair duplicate seq。
+  - `src/runtime/runtimeToolLoop.ts`: `RequestedReadCoverage` 带 `mode`，`findCoveringReadRange()` 拒绝用 `preview` range 满足 non-preview Read。
+  - `test/adapters.test.ts` / `test/storage.test.ts` / `test/runtime.test.ts`: 增加 Anthropic/MiniMax orphan+duplicate preflight、concurrent append event_seq uniqueness、preview→non-preview cache bypass 与 malformed partialInput sentinel regression。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-followup-full.json npx tsx --test test/storage.test.ts test/adapters.test.ts test/read-tool.test.ts test/grep-tool.test.ts test/context-assembler.test.ts test/system-prompt-builder.test.ts test/runtime-llm.test.ts test/runtime.test.ts`（341/341 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-followup-typecheck-3.json npm run typecheck`（pass）
+  - `go -C clients/go-tui test ./...`（pass）
+- **边界**: 不新增 provider fallback；不重写 compact/replay graph；Read cache 仍只是 coverage reuse 优化层，不作为新事实源。
+
+## 2026-06-13 — Session replay / evidence governance Phase E/G 策略化修订
+
+- **背景**: Phase E/G 初版通过 `formatUserIntentGuidance()` 向 provider-visible system prompt 注入动态 `Guidance:` / `Instruction:` 文案，并在 fallback 内维护具体中文/英文 self-diagnosis cue。复盘后确认这会把 intent guidance 变成提示词补丁层，不符合“泛化综合优化 agent 行为路径”的目标。
+- **实现**:
+  - `src/runtime/intentGuidance.ts`: 移除 `AGENT_FAILURE_CUES` / `RUNTIME_REPLAY_CUES` 这类短语 cue 表；目标识别改为抽象 marker score（agent subject / failure / runtime replay / tool evidence / project feature / problem analysis），并保留本地 reconcile 防止 intake model 把已确定的 agent-failure 误漂到 project feature。
+  - `UserIntentGuidance` 不再携带自然语言 `guidance`；新写入的 `user_intake_guidance` 事件只持久化结构化 intent/policy 输入。`src/shared/events.ts` 仅将历史 `guidance` 字段保留为 optional 兼容字段，`contextAssembler` 的事件 fingerprint 也不再依赖该字段。
+  - `formatUserIntentGuidance()` 改为输出 `## Turn Policy` 结构化字段：`responseMode`、`toolMode`、`evidenceMode`、`staleTaskMode`；不再输出动态 `Guidance:` 或 `Instruction:`。
+  - `queryIntakeModel()` 只要求 intake model 返回结构化枚举字段；`parseIntakeModelOutput()` 忽略模型返回的自然语言 `guidance`，避免 intake 模型直接写主模型行为提示。
+  - `src/runtime/systemPromptBuilder.ts`: 增加一条静态、语言无关的 `Turn Policy` 解释，说明主模型如何执行结构化字段；`evidenceMode=verify_before_claim` 要求区分 verified observations、code-confirmed causes 和 hypotheses；不包含中文样例或事故专用短语。
+  - `test/runtime-llm.test.ts` / `test/context-assembler.test.ts`: 断言改为验证 `Turn Policy` 字段与无动态 guidance 注入，仍覆盖 self-diagnosis chain、普通项目分析、纠正转向、respond-only、工具可见性等行为。
+- **验证**:
+  - `npx tsc --noEmit --pretty false`（pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts test/context-assembler.test.ts test/system-prompt-builder.test.ts --test-name-pattern "User intent fallback guidance|persists self-diagnosis problemTarget|persists user_intake_guidance|falls back identity prompts|falls back context-memory prompts|normalizes contradictory pause intake|keeps tools visible for status intake|assembleContext preserves respond-only user intent|assembleContext treats user correction prompts|assembleContext converts pause requests|Turn Policy"`（148/148 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/storage.test.ts test/adapters.test.ts test/read-tool.test.ts test/grep-tool.test.ts test/runtime-llm.test.ts test/runtime.test.ts test/system-prompt-builder.test.ts test/context-assembler.test.ts --test-name-pattern "SQLite event ordering|provider replay|orphan|completed-before-started|Read|Grep|offset|request_paths|extractAbsolutePaths|User intent fallback guidance|persists self-diagnosis problemTarget|persists user_intake_guidance|falls back identity prompts|falls back context-memory prompts|normalizes contradictory pause intake|keeps tools visible for status intake|assembleContext preserves respond-only user intent|assembleContext treats user correction prompts|assembleContext converts pause requests|timeout|near timeout|soft timeout|Turn Policy|context|compact|grounding|workspace dirty|malformed OpenAI tool-call arguments|Bash non-zero|missing Read paths|workspace escape paths|invalid tool input|verifyRetainedSegment"`（337/337 pass）
+- **边界**: `problemTarget` 仍作为持久诊断与策略输入保留；生产路径不再依赖硬编码中文 self-diagnosis 提示词。历史 WORK_LOG 中提到的 fixed guidance 视为被本条 supersede。
+
+## 2026-06-13 — Session replay / evidence governance Phase H 收口
+
+- **背景**: 真实会话里用户输入 wrapped path：`docs/nexus/reference/memory-capability\n  -awareness-and-trigger-plan.md`。旧 `extractAbsolutePaths()` 按空白截断，导致 path diagnostics 只能看到前半段路径。
+- **实现**:
+  - `src/runtime/systemPromptBuilder.ts`: 新增 `normalizeWrappedPathFragments()`，在 `extractAbsolutePaths()` 前受限归一化 terminal-wrapped path fragments，支持 `word\n  -suffix.md` / `word\n_suffix.md` 合并；仅当两侧都像 path fragment 且 suffix 以 `-` 或 `_` 开头时合并，避免普通 prose bullet paragraph 被拼接。
+  - `test/system-prompt-builder.test.ts`: 覆盖 hyphen markdown path、underscore path 与普通 bullet paragraph 不合并。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "extractAbsolutePaths|wrapped|request_paths" test/system-prompt-builder.test.ts test/context-assembler.test.ts`（7/7 pass）
+  - `npm run typecheck`（pass）
+- **边界**: 不做任意换行拼接；不跨 paragraph；不存在路径仍保持 missing path 语义，后续由 path drift diagnostic 处理。
+
+## 2026-06-13 — Session replay / evidence governance Phase G 收口
+
+- **背景**: 记忆能力问答已有用户级能力护栏，但 agent self-diagnosis 回答仍可能变成另一段缺少证据分级的 polished narrative，例如把未见 system prompt 或模型习性当成事实。
+- **实现**:
+  - `src/runtime/intentGuidance.ts`: `problemTarget=agent_failure` 的 guidance 强化为固定自诊断回答合同：使用 `Observed facts / Code-level causes / Model-behavior hypotheses / Fixes` 四段结构；不要把未见 system prompt section 当作事实；不确定原因必须标为 hypothesis。
+  - `test/runtime-llm.test.ts`: 扩展 self-diagnosis focused regression，确认 fallback guidance 与 provider-visible system prompt 均包含四段结构和 unseen system prompt 限制；同时保留 memory capability answer leakage guard 回归。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "self-diagnosis|memory capability answer" test/runtime-llm.test.ts`（3/3 pass）
+  - `npm run typecheck`（pass）
+- **边界**: 不新增通用 final-answer sanitizer；自我诊断的强约束通过 `problemTarget=agent_failure` 的 model-visible guidance 生效。若真实 provider 仍无视结构，再补窄范围 answer-shape retry guard。
+
+## 2026-06-13 — Session replay / evidence governance Phase F 收口
+
+- **背景**: soft timeout / near-timeout 事件已经能持久化和在 Go TUI 展示，但 provider continuation 历史里没有明确的收敛约束，模型仍可能在 timeout warning 后继续 broad `Grep` / `Read` 探索。
+- **实现**:
+  - `src/runtime/LLMCodingRuntime.ts`: `mapEventsToMessages()` 新增 `near_timeout_warning`、`timeout_budget_exceeded`、`timeout_extension_granted` 的 runtime user message 映射。模型下一轮会看到明确约束：不要开启新的探索性工具链；要么用已验证证据回答，要么最多做一次明确有界 final check；未验证 claim 必须标注；需要更多探索则请求 fresh budget。soft extension 会额外提示“用 extension wrap up，不做 broad discovery”。
+  - `test/runtime-llm.test.ts`: 新增 `mapEventsToMessages` focused regression，覆盖 near-timeout warning 与 soft timeout budget/extension 的 provider-visible convergence instruction。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "timeout warnings as convergence|soft timeout extension|mapEventsToMessages" test/runtime-llm.test.ts`（9/9 pass）
+  - `npm run typecheck`（pass）
+- **边界**: 不改变 soft/fatal timeout 调度、watchdog abort 或 Go TUI footer；本阶段只保证 timeout events 在 provider replay 中具备行为收敛语义。
+
+## 2026-06-13 — Session replay / evidence governance Phase E 收口
+
+- **背景**: `session_315814e7-3b82-4a31-8601-a5b383288e9c` 的后续追问里，用户问“为什么你会编 / 这是你系统prompt的问题吗 / 查看源码深度分析问题”，但 intake guidance 没有锁住“问题”的指代对象，导致模型漂回项目 feature 评估。
+- **实现**:
+  - `src/shared/events.ts`: `user_intake_guidance` 增加可选 `problemTarget` 字段，枚举为 `agent_failure` / `runtime_replay` / `tool_evidence` / `project_feature` / `user_artifact` / `unknown`；历史事件无该字段仍可解析。
+  - `src/runtime/intentGuidance.ts`: `UserIntentGuidance` 新增 `problemTarget`；fallback 分类通过集中 cue set 识别中文/英文 self-diagnosis、replay、tool evidence 与 project feature 目标；模型 intake prompt 只保留抽象目标规则，不硬塞具体中文 self-diagnosis 句子。模型 intake 输出即使漂成 `project_feature`，只要本地 fallback 明确识别 self-diagnosis，也会 reconcile 回 `agent_failure`。`formatUserIntentGuidance()` 现在输出 `Problem target` 并在 `agent_failure` 时明确要求分析 agent/runtime failure mode，不要切回项目 feature。
+  - `src/runtime/contextAssembler.ts`: retained segment event identity 纳入 `problemTarget`，保证 intake 目标变化会被上下文身份感知。
+  - `test/runtime-llm.test.ts`: 新增 focused regression 覆盖中文 self-diagnosis history 下的模糊“查看源码深度分析问题”、普通项目问题仍为 `project_feature`、纠正“不是项目本身”立即转 `agent_failure`，以及模型 intake 漂成 project feature 时仍持久化 `problemTarget=agent_failure`。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "problemTarget|self-diagnosis|User intent fallback guidance|persists self-diagnosis" test/runtime-llm.test.ts`（7/7 pass）
+  - 调整后复验：`NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "self-diagnosis|problemTarget|User intent fallback guidance" test/runtime-llm.test.ts`（7/7 pass）
+  - `npm run typecheck`（pass）
+- **边界**: 只做 intent target binding；self-diagnosis answer 的证据分级合同仍留给 Phase G；soft-timeout 行为收敛与 wrapped path normalization 仍打开。
+
+## 2026-06-13 — Session replay / evidence governance Phase C-D 收口
+
+- **背景**: Slice 1-2 收口后，治理看板仍保留 Read line semantics 与 Grep multi-glob / parse-error pair-safety 两个打开项。真实样本里 provider 曾用重复 `pathMatches` JSON key 表达多 glob，随后 malformed tool input 只产出 `tool_completed`，削弱 provider replay pair invariant。
+- **实现**:
+  - `src/tools/builtin/grep.ts`: `pathMatches` 从单字符串扩展为 `string | string[]`；ripgrep 路径重复传 `--glob`，fallback 用 any-match；prompt 明示 multi-glob array 示例并要求不要重复 JSON key；`INVALID_GREP_PATH_MATCHES_GLOB` 校验覆盖数组内 `"true"` / `"false"`。
+  - `src/runtime/runtimeToolLoop.ts`: `_parseError` tool input path 现在先 emit synthetic `tool_started(input={ _parseError, rawPreview })`，再 emit `tool_completed(success=false)`；输出 code 改为 `TOOL_INPUT_PARSE_ERROR`，附带 `repairHint`，返回给模型的 tool_result 同步说明合法 schema 形状。
+  - `docs/nexus/active/TODO_runtime.md`: Phase C 标记为已收口（Read `lineOffset/lineLimit`、`byteOffset/byteLimit`、`shownBytes/shownLines` 已存在并有回归）；Phase D 标记为已收口。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/grep-tool.test.ts`（7/7 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "malformed OpenAI tool-call arguments" test/runtime-llm.test.ts`（1/1 pass）
+- **边界**: 不新增独立 `Search` 工具；不改变 provider adapter 的 `_parseError/_rawInput` 归一来源；不触碰 Go TUI/UI 相关改动；Phase E-H 仍按后续真实 drift 分阶段推进。
+
+## 2026-06-13 — Session replay / evidence governance Slice 1-2 收口
+
+- **背景**: `session_315814e7-3b82-4a31-8601-a5b383288e9c` 暴露两条 P0 链路：同毫秒 `tool_completed` / `tool_started` 排序会让 provider replay 生成 orphan `tool_result`；mtime-only `Read` cache 会把 partial / preview evidence 包装成 full-file authority。
+- **实现**:
+  - `src/storage/SqliteStorage.ts`: events 表新增 `event_seq` append-order column、`events_session_seq_idx`、v12 migration/backfill；`listEvents`、`listSessions(includeEvents)` 与 sync list 全部按 `event_seq` 排序，cursor 改为 opaque seq。
+  - `src/runtime/LLMCodingRuntime.ts`: `mapEventsToMessages()` 缓存 early `tool_completed`，等 matching `tool_started` 出现后再输出 `tool_use -> tool_result`；完全孤儿的 completed 继续跳过，未完成 started 仍 synthetic error。
+  - `src/providers/adapters/OpenAIAdapter.ts`: 请求发送前验证 OpenAI-compatible tool protocol；orphan / duplicate `role=tool` 直接抛 `PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE`，不发 fetch，不 silent fallback。
+  - `src/runtime/runtimeToolLoop.ts` / `runtimePipeline.ts`: `readFileCache` 从 `{mtime,size}` 升级为 coverage-aware ranges；cache hit 必须满足 same mtime/size、requested byte range 被 provider-visible non-truncated range 覆盖，full-file request 必须由 full-file range 覆盖；stub 文案显式说明 requested byte range 与原 Read call，不再说“refer to earlier result”。
+  - `test/storage.test.ts`、`test/runtime-llm.test.ts`、`test/adapters.test.ts`、`test/runtime.test.ts`: 增加同毫秒 append order、completed-before-started replay repair、OpenAI orphan rejection、Read partial→full 与 full→same coverage stub 回归。
+- **验证**:
+  - `npm run typecheck`（pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime.test.ts test/read-tool.test.ts test/storage.test.ts test/runtime-llm.test.ts test/adapters.test.ts`（240/240 pass）
+- **边界**: Phase C-H 仍打开：Read line-based API / explicit byte fields、Grep multi-glob 与 parse-error pair-safety、intent `problemTarget`、near-timeout convergence、self-diagnosis evidence grading、wrapped path normalization 还未收口。
+
+## 2026-06-13 — Session replay / evidence governance 规划建档
+
+- **背景**: `session_315814e7-3b82-4a31-8601-a5b383288e9c` 暴露的不是单点模型幻觉：partial `Read` 被 mtime-only cache 包装成 full evidence、`Read offset/limit` byte 语义被模型按 line 使用、User Intake Guidance 未锁住“你出现的问题”的指代对象，且 SQLite event ordering 在同毫秒下把 `tool_completed` 排到 `tool_started` 前，最终 provider replay 生成 orphan `tool_result` 并触发 MiniMax `tool result's tool id ... not found`。
+- **同步**:
+  - 新增 `docs/nexus/reference/session-replay-and-evidence-governance-plan.md`，综合规划 event append sequence / provider replay repair、Read coverage-aware cache、line-based source reading、Grep multi-glob 与 parse-error replay safety、intent `problemTarget`、soft-timeout convergence、capability/self-diagnosis answer governance 与 wrapped path normalization。
+  - `docs/nexus/reference/README.md` 与 `docs/nexus/active/TODO_runtime.md` 已同步索引，把该真实 session 作为 P0 Session Replay / Evidence Governance 打开项跟踪。
+- **验证**: 文档规划同步；未改 runtime 源码，未跑测试。
+- **边界**: 不通过 silent provider fallback 掩盖 replay bug；不新增 broad Search / mega-tool；Read cache 只能是优化层不是事实源；soft timeout 仍保持 recoverable，不退回 fixed fatal cutoff。
+
+## 2026-06-13 — EverCore process-level cache 收口
+
+- **背景**: `BABEL_O_EVERCORE_MODE=managed` 已能拉起本地 EverOS sidecar，但 embedded / short session 每次 app injection 都会重新 `configureEverCoreFromEnv()`；`storage.close()` 又会 dispose sidecar，导致重复冷启动和潜在端口抖动。
+- **实现**:
+  - `src/nexus/everCoreRuntimeManager.ts`: 新增 process-level lease cache；相同 config fingerprint + healthy/disabled EverCore 复用，同步支持 config drift 时的新 lease，不污染 active entry；`shutdown()` 才真正 dispose cached sidecar。
+  - `src/nexus/everCoreConfig.ts`: 抽出 `resolveEverCoreConfigInputFromEnv()`，让 manager 与 legacy `configureEverCoreFromEnv()` 共享 env parsing。
+  - `src/cli/embedded.ts`: embedded client 改走 `defaultEverCoreRuntimeManager.acquireFromEnv()`；每次 app/storage close 只 release lease，`EmbeddedNexusClient.close()` / `executeEmbedded()` 负责 shutdown。
+  - `src/cli/commands/chat.ts`: 本地 chat 复用单个 embedded client，并在 finally 关闭，避免 slash/status/session 操作反复创建 client 导致重复拉起。
+  - `src/cli/runSessionFlow.ts` / `src/nexus/server.ts`: 复用同一 manager；one-shot local flow 在 finally shutdown，server 在 Fastify `onClose` shutdown。
+  - `test/runtime.test.ts` / `test/architecture-boundary.test.ts`: 覆盖 cache hit、config drift invalidation、shutdown dispose，以及同一 embedded client 两次 app injection 只触发一次 EverCore health/configure。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/architecture-boundary.test.ts --test-name-pattern="embedded Nexus client"`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/architecture-boundary.test.ts test/runtime.test.ts --test-name-pattern="embedded Nexus client|EverCore runtime manager|EverCore managed mode|EverCore config|runtime/status reports managed EverCore"`（141/141 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run typecheck`（pass）
+- **边界**: 只实现 process-level cache；不做 registry 文件、不跨进程复用、不做 idle TTL；`BABEL_O_EVERCORE_MODE=disabled` 仍保持无副作用；长期记忆仍只是 volatile hint。
+
+## 2026-06-13 — Memory capability answer leakage regression 收口
+
+- **背景**: 用户询问“你当前能否写入记忆？”时，provider 可能把内部路径、commit hash、MCP sidecar 或 hidden prompt 内通当成答案暴露；同时 broad `写入.*记忆` 判断会把纯能力问答误判成真实写入请求。
+- **实现**:
+  - `src/runtime/intentGuidance.ts`: 新增 memory capability question classifier；“能否写入记忆？”归为 `status/respond_only/requiresTools=false`，但“请记住/保存具体记忆”仍保持 `continue/requiresTools=true`。
+  - `src/runtime/contextAssembler.ts`: `Long-Term Memory Capability` block 增加用户级能力回答约束，禁止默认暴露 source paths、commit hashes、hidden prompt、provider internals、MCP sidecar implementation details、API keys 或 secrets。
+  - `src/runtime/runtimePipeline.ts` / `src/runtime/LLMCodingRuntime.ts`: 增加窄范围 runtime guard，仅对 memory capability answer 检测内部实现泄露；首次泄露回答会被抑制并重试一次，重复泄露则返回安全 fallback。
+  - `test/runtime-llm.test.ts`: 增加分类、tool hiding、泄露抑制、重试与最终 answer 无内部路径/commit/MCP sidecar 的 focused regression。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test --test-name-pattern="memory capability|memory-save|memory_save_note|User intent fallback guidance" test/runtime-llm.test.ts`（6/6 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/mcp.test.ts test/memory-provider.test.ts test/runtime-llm.test.ts`（74/74 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run typecheck`（pass）
+- **边界**: 只保护 memory capability answer 场景；不改变真实 `memory_save_note` 写入触发和 permission gate；不实现 `/memory` 面板或 EverCore sidecar cache。
+
+## 2026-06-13 — EverCore lifecycle cache 与 /memory 面板规划建档
+
+- **背景**: G6 收口后继续暴露两个后续设计点：managed EverCore sidecar 不应在 embedded / short session 中反复冷启动；用户询问“你当前能否写入记忆？”时不应暴露内部路径、commit hash、MCP sidecar 或 hidden prompt 内通。同时需要规划 `/memory` 用户可见管理入口与 Go TUI 面板。
+- **同步**:
+  - 新增 `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md`，定义 managed warm sidecar、process-level cache、dataDir-local registry health reuse、idle TTL、search short cache、`/memory` CLI/API/Go TUI panel 与 capability answer regression。
+  - `docs/nexus/reference/README.md`、`docs/nexus/TODO.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md` 已同步索引，长期记忆主线从 Watch/Closed 调整为 focused P2/Watch：只推进 lifecycle cache、`/memory` 面板与能力问答不泄露内通守门。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/mcp.test.ts test/memory-provider.test.ts test/runtime-llm.test.ts`（72/72 pass）
+- **边界**: 不做系统级 daemon / launchd / systemd-user；不让 managed sidecar 变成孤儿进程；`/memory` 是 runtime-owned management surface，不替代 `mcp:evercore:*` provider tools；长期记忆仍是 volatile hint，不替代 SQLite/session/event/tool trace。
+
+## 2026-06-13 — Memory Capability Awareness G6 live validation 收口
+
+- **背景**: G1-G5 已完成 capability block、tool trigger policy、candidate governance、runtime auto-search 与 mock provider self-trigger regression；G6 需要用 managed EverCore 验证真实 save/recall/project-fact caution 流程。
+- **实现**:
+  - `src/tools/everCoreMcpTools.ts`: `memory_save_note` 改为始终使用当前 runtime `context.sessionId`，model-visible schema 只暴露 `note`，避免 provider 写入默认或自造 session；写入仍是 user+assistant anchor 且 permission-gated。
+  - `src/runtime/intentGuidance.ts`: intake prompt 与 fallback normalization 增加 explicit memory-save / named MCP tool 规则，避免“保存长期记忆”类请求被降级为 respond-only 并隐藏工具。
+  - `/tmp/babel-o-memory-g6-live-validation.mjs`: live harness 增加 per-turn timeout、save fail-fast diagnostics、search bucket/snippet diagnostics，并用本地 OpenAI-compatible embedding stub 启动 EverOS cascade/LanceDB indexing；该 stub 只服务 managed validation 的 embedding，不替代真实 LLM provider。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/mcp.test.ts test/memory-provider.test.ts test/runtime-llm.test.ts`（72/72 pass）
+  - `node --import tsx /tmp/babel-o-memory-g6-live-validation.mjs`（passed：MiniMax `anthropic-compatible` provider；save permission gate=true；save tool completed=true；EverOS add/flush=true；preference keyword search hit=1 episode；recall mentions `regression-first` and memory hint; project fact caution requires workspace evidence）
+- **边界**: EverCore 仍是 volatile / non-authoritative hint，不替代 SQLite/session/event/tool trace；`memory_save_note` 保持 permission-gated；`memory_flush_session` 仍 runtime-owned by default；managed live validation 需要 embedding/cascade indexing 才能让 keyword search 命中新写入 memory。
+
 ## 2026-06-13 — Go TUI running 态 ESC interrupt 与 queued prompt 收口
 
 - **背景**: 用户反馈 Go TUI 在 agent 运行中无法通过 `Esc` 打断并确保不异常退出，同时输入框无法提前提交下一条用户指令；补充要求 `Esc` 不应直接报错，而应弹出黄色 `What should BabeL-O do instead?` 类提示，让用户给出替代指令。
@@ -5526,4 +5691,109 @@
 - Phase 1 **部分落地**：`clients/go-tui/internal/tui/tui.go:runStream()` 默认先 `POST /v1/sessions` 分配 server UUID，并用该 UUID 发送 WebSocket execute payload；`src/nexus/app.ts` 支持 `clientSessionId` metadata，`test/inspect-session-phase1.test.ts` 覆盖 API allocation/list/metadata。但 Go TUI 目前是在 allocation 之后才生成 `session_go_<unixnano>` 并写 `~/.babel-o/log/go-tui-session.log`，没有把该 client id 传给 server metadata；原规划中提到的 `clients/go-tui/internal/tui/phase1_session_id_test.go` 与 7 个 Go 专名测试并不存在。
 - Phase 2 **部分落地**：`src/nexus/createRuntime.ts:resolveDefaultStoragePath()` 已把生产默认 storage 改为 `~/.babel-o/db.sqlite`，并保留 `NODE_ENV=test` / 显式 `:memory:` 的 MemoryStorage 测试隔离；`test/inspect-session-phase2.test.ts` 覆盖默认路径与 override。但 `src/cli/commands/go.ts:createManagedNexusLaunchSpec()` 未显式传 `NEXUS_STORAGE_PATH` / `BABEL_O_STORAGE_PATH`，`bbl go --check` 也未报告 storage path。
 - Phase 3 **部分落地**：`src/nexus/server.ts` 已 best-effort 写 `nexus[pid=...] listen=... storage=...` 到 `~/.babel-o/log/embedded-nexus.log`；`src/cli/commands/inspectSession.ts` 已能从 `go-tui-session.log` reverse-resolve `clientSessionId → serverSessionId` 并查 SQLite。但 launcher 没有 `bbl-go[pid=...]` 启动行，Go TUI transcript/header 没有 `Session persisted: ...`，`/v1/sessions/:sessionId` 对 `session_go_xxx` 仍返回普通 `SESSION_NOT_FOUND`。
-- Phase 4 **仍需补齐**：`docs/nexus/TODO.md` / `docs/nexus/WORK_LOG.md` / `docs/nexus/DONE.md` / reference 索引已开始同步到“部分收口”事实；仍缺 embedded persistence / startup log / server UUID transcript 的 PTY 或等价 e2e 守门。
+- Phase 4 **仍需补齐**：`docs/nexus/TODO.md` / `docs/nexus/WORK_LOG.md` / `docs/nexus/DONE.md` / reference 索引已开始同步到”部分收口”事实；仍缺 embedded persistence / startup log / server UUID transcript 的 PTY 或等价 e2e 守门。
+
+### 2026-06-12 Phase G 后续 P2 — L4 `/memory` 状态与管理面板 MVP 收口
+
+- 背景：完成 `evercore-lifecycle-cache-and-answer-governance-plan.md` 中 L4 阶段（`/memory` 状态与管理面板 MVP），把 Nexus read-only memory surface、嵌入式客户端 read-only 入口、Go TUI `/memory` overlay 串起来，并补 focused regression。
+- Nexus API：`src/nexus/app.ts` 新增 `GET /v1/runtime/memory/status`，返回 `{ type:'memory_status', capability, everCore, guidance, actions }`；`everCore` 字段来自新增的 `everCoreStatus()` helper，避免 `/v1/runtime/status` 与 `/v1/runtime/memory/status` 两条路径出现 drift。
+- 嵌入式客户端：`src/cli/embedded.ts` 暴露 `memoryStatus()`，复用 `defaultEverCoreRuntimeManager` 同一 lease cache；`close()` 触发 manager `shutdown()`，避免进程残留 warm sidecar。
+- CLI / NexusClient：`src/cli/NexusClient.ts` 新增 `memoryStatus()`，调用 `/v1/runtime/memory/status` 并保持与嵌入式 envelope 一致。
+- Go TUI overlay：
+  - `clients/go-tui/internal/tui/overlay_memory.go`（新）`buildMemoryOverlayLines` / `renderMemoryOverlayLines` / `renderMemoryOverlay` / `anyBool`，统一使用 `asMap` / `stringField` / `anyInt` / `fallbackUnknown` 等共享辅助函数。
+  - `clients/go-tui/internal/tui/tui.go` 新增 `modeMemoryOverlay`、`memoryOverlayLines` / `memoryOverlayScroll` 字段、`memoryStatusMsg` update handler、`scrollOverlay` 滚动分支，并并入 `usesFullScreenOverlay` / `renderFullScreenOverlay` / `nonTranscriptChromeHeight` 三个 full-screen overlay dispatch 点。
+  - `clients/go-tui/internal/tui/api.go` 新增 `fetchMemoryStatus`；`clients/go-tui/internal/tui/slash.go` 新增 `/memory` slash 命令并加入 help list。
+- focused regression：
+  - `test/architecture-boundary.test.ts` 新增 `embedded Nexus client reuses EverCore configuration across app injections`，验证 `client.memoryStatus()` 后两次 `client.status()` + `listSessions` 期间 health endpoint 仅被探测一次（cache 命中）。
+  - `test/runtime.test.ts` 已有 `/v1/runtime/memory/status reports read-only EverCore memory surface` 覆盖 enabled+healthy / enabled+unhealthy / 未配置三种状态。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 7 个 Go focused tests：`TestBuildMemoryOverlayLinesParsesMemoryStatusPayload`、`TestBuildMemoryOverlayLinesEmptyAndErrorPaths`、`TestBuildMemoryOverlayLinesUnhealthyState`、`TestRenderMemoryOverlayLinesClampsScroll`、`TestRenderMemoryOverlayEmptyOutsideMode`、`TestRenderMemoryOverlayShowsHeaderInMode`、`TestUsesFullScreenOverlayIncludesMemoryOverlay`。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/architecture-boundary.test.ts test/runtime.test.ts --test-name-pattern=”runtime/memory/status|embedded Nexus client|EverCore”` 142/142 pass。
+  - `cd clients/go-tui && go test ./internal/tui` 全过。
+  - `npm run typecheck` 与 `npm run format:check` 全绿。
+- 文档同步：
+  - `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md` Phase L4 改为 “Status: implemented and verified”，并补实现要点 + 验证记录；Recommended Next Slice 指向 L5 `/memory` actions。
+  - `docs/nexus/active/TODO_runtime.md` Phase G 后续 P2 段落追加 L4 收口说明，明确 `save` / `flush` / `restart` 仍需走 permission gate。
+  - `docs/nexus/TODO.md` P2/Watch 表与”下一步只推进 focused P2”序号同步指向 L5。
+- 守门不变量：
+  - 测试隔离用 `BABEL_O_CONFIG_FILE=/tmp/...` 注入，**不**碰真实 `~/.babel-o/config.json`。
+  - 嵌入式 `memoryStatus()` 与 `status()` / `listSessions` 走同一 lease cache，不再额外拉起 sidecar。
+  - `provider fallback` / `auto model selection` 仍未触碰（按既定 memory 仍延后）。
+  - Go TUI overlay 仅展示 `defaultEverCoreStatus()` redacted 字段，未引入 endpoint / API key / provider key 直接渲染。
+
+### 2026-06-13 Phase G 后续 P2 — L5 `/memory` actions 收口
+
+- 背景：继续 `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md` L5，把 `/memory` 从 status-only 扩展为 runtime-owned management actions，同时保持“不是 memory mega-tool”、EverCore 非事实源、写/生命周期操作必须显式确认的边界。
+- Nexus API：
+  - `POST /v1/runtime/memory/search`：bounded read-only search，复用 `EverCoreClient.search()` + `extractEverCoreMemoryHits()` + `formatMemoryProviderHits()`，返回 `memory_search_result`、`hitCount`、`totalExtractedHits`、`budgetChars`、`truncated`、`content`、`hits[]` 与 `guidance.memoryIsHint=true` / `projectFactsRequireWorkspaceEvidence=true`。
+  - `GET /v1/runtime/memory/candidates`：读取 SessionChannel `memory_candidate` message，返回 review-only `memoryCandidateGovernance` metadata（scope / decision / approval / evidence / blockedReasons / reviewReasons / `autoWrite=false`）。
+  - `POST /v1/runtime/memory/save-note`：默认返回 HTTP 202 `memory_action_approval_required`；只有 `approved=true` 或 `confirmation="save-note"` 后才调用 `EverCoreClient.addAgentMessages()`。
+  - `POST /v1/runtime/memory/flush`：默认返回 HTTP 202 `memory_action_approval_required`；只有 `approved=true` 或 `confirmation="flush"` 后才调用 `EverCoreClient.flushAgentSession()`。
+  - `POST /v1/runtime/memory/restart`：默认同样需要 approval；确认后返回 `MEMORY_RESTART_NOT_IMPLEMENTED`，当前不静默重启 runtime。
+- Client API：`src/cli/NexusClient.ts` 与 `src/cli/embedded.ts` 新增 `memorySearch()` / `memoryCandidates()` / `memorySaveNote()` / `memoryFlush()` / `memoryRestart()`，嵌入式路径继续复用 `defaultEverCoreRuntimeManager` lease cache。
+- Go TUI：
+  - `clients/go-tui/internal/tui/api.go` 新增 `fetchMemorySearch` / `fetchMemoryCandidates` / `requestMemorySaveNote` / `requestMemoryFlush` / `requestMemoryRestart`。
+  - `clients/go-tui/internal/tui/slash.go` 扩展 `/memory [status|search <query>|candidates|save <note>|flush|restart]`。
+  - `clients/go-tui/internal/tui/overlay_memory.go` 增加 envelope dispatch，可渲染 `memory_search_result`、`memory_candidates`、`memory_action_approval_required`、mutation success 与 error payload。
+- Regression：
+  - `test/runtime.test.ts` 新增 3 条 focused tests：search bounded read-only hints、candidates review-only governance metadata、write/lifecycle approval gate。
+  - `clients/go-tui/internal/tui/tui_test.go` 新增 3 条 overlay tests：search result、candidates result、approval-required result。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/runtime.test.ts test/architecture-boundary.test.ts --test-name-pattern="runtime/memory/(status|search|candidates|write)|embedded Nexus client"`：145/145 pass。
+  - `cd clients/go-tui && go test ./internal/tui`：全过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run typecheck`：全过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run format:check`：failureCount=0。
+- 守门不变量：
+  - `search` / `candidates` 保持 read-only；`save` / `flush` / `restart` 不提供静默执行路径。
+  - `restart` 目前只完成 approval gate 与未实现诊断，不引入进程生命周期副作用。
+  - Layer D search short cache 尚未启用；`save` / `flush` 成功 envelope 只声明 `searchCacheInvalidated=true`，为后续 cache 层保留失效边界。
+  - 测试继续使用 `BABEL_O_CONFIG_FILE=/tmp/...`，不写真实 `~/.babel-o/config.json`。
+  - `provider fallback` / 自动模型选择 / 默认 role model recommendation 仍未触碰。
+
+### 2026-06-13 Phase G 后续 P2 — L2 registry reuse + health check 收口
+
+- 背景：继续 `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md` L2，避免 managed EverCore sidecar 在进程/嵌入式 runtime 重建时重复分配端口和 spawn，只在 registry 健康时复用，stale registry 不阻塞新启动。
+- 落地点：`src/nexus/everCoreSidecar.ts`
+  - managed mode dataDir 下新增 `sidecar-registry.json`，记录 `version`、`baseUrl`、`host`、`port`、`dataDir`、`pid`、`startedAt`、`updatedAt`。
+  - 启动前先 `readSidecarRegistry()` 并对 registry `baseUrl` 调 `/health`；健康则直接返回 reused runtime，`status.sidecar.reused=true`、`registryPath=<dataDir>/sidecar-registry.json`，不调用 port allocator / spawn。
+  - registry stale 时记录 `registryStaleReason`（如 `health_check_failed:...`、`port_mismatch`、`host_mismatch`、`invalid_base_url`），best-effort `unlink` 清理；清理失败只落 `registryCleanupError` diagnostics。
+  - 新 sidecar health check 成功后用 temp file + `rename()` 原子写 registry；写失败只通过 `EVERCORE_MANAGED_REGISTRY_WRITE_FAILED` diagnostics 暴露，不把 healthy sidecar 变 fatal。
+  - `EverCoreSidecarStatus` 增加 `reused`、`registryPath`、`registryStaleReason`、`registryCleanupError` 字段，`/v1/runtime/status` 与 `/v1/runtime/memory/status` 通过已有 `everCoreStatus()` 透传。
+- Regression：
+  - `EverCore managed mode writes registry and reuses healthy sidecar`：首轮 spawn 写 registry，第二轮同 dataDir 健康 registry 命中，不调用 port allocator / spawn。
+  - `EverCore managed mode treats stale registry as diagnostics and starts a fresh sidecar`：旧 registry `/health` 503 不阻塞新 sidecar，记录 stale reason，并把 registry 覆盖为新 `baseUrl` / `pid`。
+  - 既有 `EverCore managed mode starts local sidecar and exposes diagnostics` 与 `/v1/runtime/status reports managed EverCore sidecar diagnostics` 保持通过。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/runtime.test.ts --test-name-pattern="EverCore managed mode (starts local sidecar|writes registry|treats stale registry|auto-maps|uses explicit|rejects non-loopback)|runtime/status reports managed EverCore"`：143/143 pass。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run typecheck`：全过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run format:check`：failureCount=0。
+- 守门不变量：
+  - registry 只放在 EverCore dataDir 下，不写真实 `~/.babel-o/config.json`。
+  - registry 命中必须通过 loopback host 与 `/health`；host/port/dataDir mismatch 或 health failure 都不会复用。
+  - stale registry 清理/新 registry 写入失败不影响 runtime 继续使用健康 sidecar，只进入 diagnostics。
+  - `provider fallback` / 自动模型选择 / 默认 role model recommendation 仍未触碰。
+
+### 2026-06-13 Phase G 后续 P2 — L3 idle TTL warm sidecar 收口
+
+- 背景：继续 `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md` L3，在 L1 process-level cache 与 L2 registry reuse 之上，让 refCount 降为 0 后的 managed EverCore sidecar 在短 TTL 内保持 warm，避免连续嵌入式 app injection / CLI flow 间反复 dispose/spawn。
+- 落地点：`src/nexus/everCoreRuntimeManager.ts`
+  - 新增 `EverCoreRuntimeManagerOptions { idleTtlMs }`，默认 `DEFAULT_IDLE_TTL_MS = 5 * 60 * 1000`。
+  - `release()` 后若 `refCount=0` 且不是 incompatible uncached lease，调用 `scheduleIdleDispose()` 而不是立即 dispose；timer `unref()`，不阻塞进程退出。
+  - TTL 内同 fingerprint `acquire()` 会 `cancelIdleTimer()` 并复用当前 cached EverCore；下一次 release 会重新 schedule idle timer，实现 timer refresh。
+  - `idleTtlMs <= 0` 走立即异步 dispose，方便测试保持 deterministic。
+  - `shutdown()` / incompatible config disposal 仍走 `disposeEntry()`，取消 pending timer 并 best-effort dispose owned sidecar。
+- Regression：
+  - `EverCore runtime manager keeps idle sidecar warm until TTL expires`：release 后 TTL 内不 dispose，TTL 到期 dispose，再 acquire 重新 configure。
+  - `EverCore runtime manager reuses and refreshes idle TTL lease before expiry`：TTL 内 reacquire 复用同一 config，并刷新 release 后的 idle timer。
+  - `EverCore runtime manager supports deterministic idleTtlMs=0 disposal`：测试可设置 TTL=0，让 release 后立即 dispose。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npx tsx --test test/runtime.test.ts --test-name-pattern="EverCore runtime manager (reuses matching|does not reuse incompatible|keeps idle|reuses and refreshes|supports deterministic)"`：146/146 pass。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run typecheck`：全过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json NODE_ENV=test npm run format:check`：failureCount=0。
+- 同步状态：
+  - `docs/nexus/reference/evercore-lifecycle-cache-and-answer-governance-plan.md` L3 标记 implemented and verified；Recommended Next Slice 改为 L1/L2/L3/L4/L5/L6 全部收口，Layer D search short cache 暂不开项。
+  - `docs/nexus/active/TODO_runtime.md` / `docs/nexus/TODO.md` / `docs/nexus/DONE.md` 同步为 lifecycle/cache/UI/answer-governance 后续规划当前关闭。
+- 守门不变量：
+  - TTL 只作用于 process-level manager cache，不改变 EverCore disabled-by-default、不改变 MemoryProvider 非事实源边界。
+  - `shutdown()` 仍然立即 best-effort dispose，不让 one-shot process 残留 child。
+  - `provider fallback` / 自动模型选择 / 默认 role model recommendation 仍未触碰。

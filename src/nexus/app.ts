@@ -5,10 +5,14 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { z } from 'zod'
 import type { NexusRuntime } from '../runtime/Runtime.js'
-import type { EverCoreClient } from '../runtime/everCoreClient.js'
+import type { EverCoreClient, EverCoreMessage } from '../runtime/everCoreClient.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 import type { EverCoreRuntimeConfig, EverCoreStatus } from './everCoreConfig.js'
-import type { MemoryProvider } from '../runtime/memoryProvider.js'
+import {
+  extractEverCoreMemoryHits,
+  formatMemoryProviderHits,
+  type MemoryProvider,
+} from '../runtime/memoryProvider.js'
 import type { RemoteRunnerStatus } from './remoteRunnerConfig.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchema } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
@@ -458,6 +462,38 @@ const sessionInboxQuerySchema = z.object({
   includeAcknowledged: booleanQuery(false),
 })
 
+const memorySearchSchema = z.object({
+  query: z.string().min(1).max(2_000),
+  topK: z.number().int().positive().max(20).optional(),
+  method: z.enum(['keyword', 'vector', 'hybrid', 'agentic']).optional(),
+  maxChars: z.number().int().positive().max(20_000).optional(),
+  maxHitChars: z.number().int().positive().max(4_000).optional(),
+})
+
+const memoryCandidatesQuerySchema = z.object({
+  sessionId: z.string().optional(),
+  limit: z.coerce.number().int().positive().max(100).default(20),
+  includeRejected: booleanQuery(true),
+})
+
+const memoryApprovalSchema = z.object({
+  approved: z.boolean().optional(),
+  confirmation: z.string().optional(),
+  reason: z.string().optional(),
+})
+
+const memorySaveNoteSchema = memoryApprovalSchema.extend({
+  note: z.string().min(1).max(4_000),
+  sessionId: z.string().min(1).optional(),
+  candidateMessageId: z.string().min(1).optional(),
+})
+
+const memoryFlushSchema = memoryApprovalSchema.extend({
+  sessionId: z.string().min(1),
+})
+
+const memoryRestartSchema = memoryApprovalSchema
+
 const agentSpawnSchema = z.object({
   parentSessionId: z.string().min(1),
   prompt: z.string().min(1),
@@ -545,6 +581,70 @@ type WebSocketLike = {
   send(payload: string): void
 }
 
+type MemoryApprovalResult =
+  | { approved: true }
+  | { approved: false; response: Record<string, unknown> }
+
+function isEverCoreAvailable(status: EverCoreStatus): boolean {
+  return status.enabled && status.healthy
+}
+
+function memoryUnavailablePayload(status: EverCoreStatus) {
+  return {
+    type: 'error',
+    code: 'EVERCORE_MEMORY_UNAVAILABLE',
+    message: 'Long-term memory is not available for this runtime.',
+    everCore: status,
+  }
+}
+
+function requireMemoryApproval(action: 'save-note' | 'flush' | 'restart', input: {
+  approved?: boolean
+  confirmation?: string
+  reason?: string
+}): MemoryApprovalResult {
+  const confirmation = input.confirmation?.trim().toLowerCase()
+  const confirmed = input.approved === true || confirmation === action || confirmation === `memory:${action}`
+  if (confirmed) return { approved: true }
+  return {
+    approved: false,
+    response: {
+      type: 'memory_action_approval_required',
+      action,
+      approved: false,
+      risk: action === 'restart' ? 'lifecycle_execute' : 'write_lifecycle',
+      requiredConfirmation: action,
+      guidance: action === 'save-note'
+        ? 'Memory save is write-risk. Re-submit with approved=true or confirmation="save-note" after user approval.'
+        : `Memory ${action} is a lifecycle operation. Re-submit with approved=true or confirmation="${action}" after explicit user confirmation.`,
+      ...(input.reason && { reason: input.reason }),
+    },
+  }
+}
+
+function buildApprovedMemoryNoteMessages(input: {
+  note: string
+  config: EverCoreRuntimeConfig
+}): EverCoreMessage[] {
+  const timestamp = Date.now()
+  return [
+    {
+      sender_id: input.config.userId ?? 'local-user',
+      sender_name: 'User',
+      role: 'user',
+      timestamp,
+      content: input.note,
+    },
+    {
+      sender_id: input.config.agentId,
+      sender_name: 'BabeL-O',
+      role: 'assistant',
+      timestamp: timestamp + 1,
+      content: `Approved long-term memory note saved: ${input.note}`,
+    },
+  ]
+}
+
 export async function createNexusApp(
   options: CreateNexusAppOptions,
 ): Promise<FastifyInstance> {
@@ -564,6 +664,21 @@ export async function createNexusApp(
     remoteRunner: options.remoteRunner,
   })
   await app.register(websocket)
+
+  const everCoreStatus = () => options.everCoreStatus ?? {
+    configured: false,
+    enabled: false,
+    healthy: true,
+    mode: 'disabled' as const,
+    uploadOnSessionEnd: false,
+    mcpToolsEnabled: false,
+    namespace: {
+      layer: 'project_memory' as const,
+      isolationKey: 'projectId' as const,
+      sessionScoped: false,
+      projectIdSource: 'default' as const,
+    },
+  }
 
   app.setErrorHandler((error: any, request, reply) => {
     const isValidationError =
@@ -648,23 +763,211 @@ export async function createNexusApp(
       id: options.remoteRunner?.id,
       capabilities: options.remoteRunner?.capabilities,
     },
-    everCore: options.everCoreStatus ?? {
-      configured: false,
-      enabled: false,
-      healthy: true,
-      mode: 'disabled',
-      uploadOnSessionEnd: false,
-      mcpToolsEnabled: false,
-      namespace: {
-        layer: 'project_memory',
-        isolationKey: 'projectId',
-        sessionScoped: false,
-        projectIdSource: 'default',
-      },
-    },
+    everCore: everCoreStatus(),
     metrics: await buildRuntimeMetricsSnapshot(metrics, options.storage),
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))
+
+  app.get('/v1/runtime/memory/status', async () => {
+    const everCore = everCoreStatus()
+    const capabilityAvailable = isEverCoreAvailable(everCore)
+    return {
+      type: 'memory_status',
+      capability: {
+        available: capabilityAvailable,
+        longTermMemory: capabilityAvailable,
+        autoSearch: 'cue-driven',
+        save: 'permission-gated',
+        authoritative: false,
+      },
+      everCore,
+      guidance: {
+        memoryIsHint: true,
+        projectFactsRequireWorkspaceEvidence: true,
+        candidatesAutoWrite: false,
+        flushRuntimeOwned: true,
+      },
+      actions: {
+        status: 'read',
+        search: 'read',
+        candidates: 'read',
+        saveNote: 'write_permission_gated',
+        flush: 'lifecycle_permission_gated',
+        restart: 'lifecycle_permission_gated',
+      },
+    }
+  })
+
+  app.post('/v1/runtime/memory/search', async (request, reply) => {
+    const body = memorySearchSchema.parse(request.body ?? {})
+    const everCore = everCoreStatus()
+    if (!isEverCoreAvailable(everCore) || !options.everCoreClient || !options.everCoreConfig) {
+      return reply.code(503).send(memoryUnavailablePayload(everCore))
+    }
+    const config = options.everCoreConfig
+    const topK = body.topK ?? config.topK
+    const maxChars = body.maxChars ?? config.maxContentChars ?? 4_000
+    const maxHitChars = body.maxHitChars ?? 800
+    const started = metrics.now()
+    const envelope = await options.everCoreClient.search({
+      query: body.query,
+      appId: config.appId,
+      projectId: config.projectId,
+      userId: config.userId,
+      agentId: config.userId ? undefined : config.agentId,
+      method: body.method ?? config.retrieveMethod,
+      topK,
+    })
+    const hits = extractEverCoreMemoryHits(envelope)
+    const formatted = formatMemoryProviderHits(hits, {
+      maxContextChars: maxChars,
+      maxHitChars,
+      maxHits: topK,
+    })
+    return {
+      type: 'memory_search_result',
+      query: body.query,
+      provider: 'evercore',
+      hitCount: formatted.hitCount,
+      totalExtractedHits: hits.length,
+      injectedChars: formatted.content.length,
+      budgetChars: maxChars,
+      maxHitChars,
+      truncated: formatted.truncated,
+      searchLatencyMs: Math.round(metrics.now() - started),
+      method: body.method ?? config.retrieveMethod,
+      topK,
+      content: formatted.content,
+      hits: hits.slice(0, topK).map(hit => ({
+        content: hit.content.length > maxHitChars ? `${hit.content.slice(0, maxHitChars)}...` : hit.content,
+        ...(hit.source && { source: hit.source }),
+        ...(hit.score !== undefined && { score: hit.score }),
+      })),
+      guidance: {
+        memoryIsHint: true,
+        projectFactsRequireWorkspaceEvidence: true,
+      },
+    }
+  })
+
+  app.get('/v1/runtime/memory/candidates', async request => {
+    const query = memoryCandidatesQuerySchema.parse(request.query)
+    const channels = await options.storage.listSessionChannels({
+      sessionId: query.sessionId,
+      limit: Math.max(query.limit, 100),
+    })
+    const candidates: SessionMessage[] = []
+    for (const channel of channels) {
+      const page = await options.storage.listSessionMessages(channel.channelId, {
+        limit: query.limit,
+        order: 'desc',
+      })
+      for (const message of page.messages) {
+        if (message.type !== 'memory_candidate') continue
+        const governance = message.metadata?.memoryCandidateGovernance as Record<string, unknown> | undefined
+        if (!query.includeRejected && governance?.decision === 'rejected') continue
+        candidates.push(message)
+      }
+    }
+    candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.messageId.localeCompare(a.messageId))
+    const limited = candidates.slice(0, query.limit)
+    return {
+      type: 'memory_candidates',
+      candidates: limited.map(message => ({
+        messageId: message.messageId,
+        channelId: message.channelId,
+        fromSessionId: message.fromSessionId,
+        toSessionId: message.toSessionId,
+        broadcast: message.broadcast,
+        content: message.content,
+        evidence: message.evidence ?? [],
+        priority: message.priority,
+        createdAt: message.createdAt,
+        status: message.status,
+        governance: message.metadata?.memoryCandidateGovernance ?? null,
+      })),
+      limit: query.limit,
+      includeRejected: query.includeRejected,
+      guidance: {
+        autoWrite: false,
+        reviewOnly: true,
+        saveRequiresApproval: true,
+      },
+    }
+  })
+
+  app.post('/v1/runtime/memory/save-note', async (request, reply) => {
+    const body = memorySaveNoteSchema.parse(request.body ?? {})
+    const approval = requireMemoryApproval('save-note', body)
+    if (!approval.approved) return reply.code(202).send(approval.response)
+    const everCore = everCoreStatus()
+    if (!isEverCoreAvailable(everCore) || !options.everCoreClient || !options.everCoreConfig) {
+      return reply.code(503).send(memoryUnavailablePayload(everCore))
+    }
+    const sessionId = body.sessionId ?? createId('memory_note')
+    const note = body.note.trim()
+    const messages = buildApprovedMemoryNoteMessages({ note, config: options.everCoreConfig })
+    const envelope = await options.everCoreClient.addAgentMessages({
+      sessionId,
+      appId: options.everCoreConfig.appId,
+      projectId: options.everCoreConfig.projectId,
+      messages,
+    })
+    return {
+      type: 'memory_note_saved',
+      provider: 'evercore',
+      sessionId,
+      candidateMessageId: body.candidateMessageId,
+      savedMessages: messages.length,
+      savedChars: note.length,
+      envelope,
+      guidance: {
+        searchCacheInvalidated: true,
+        memoryIsHint: true,
+      },
+    }
+  })
+
+  app.post('/v1/runtime/memory/flush', async (request, reply) => {
+    const body = memoryFlushSchema.parse(request.body ?? {})
+    const approval = requireMemoryApproval('flush', body)
+    if (!approval.approved) return reply.code(202).send(approval.response)
+    const everCore = everCoreStatus()
+    if (!isEverCoreAvailable(everCore) || !options.everCoreClient || !options.everCoreConfig) {
+      return reply.code(503).send(memoryUnavailablePayload(everCore))
+    }
+    const envelope = await options.everCoreClient.flushAgentSession({
+      sessionId: body.sessionId,
+      appId: options.everCoreConfig.appId,
+      projectId: options.everCoreConfig.projectId,
+    })
+    return {
+      type: 'memory_session_flushed',
+      provider: 'evercore',
+      sessionId: body.sessionId,
+      flushed: true,
+      envelope,
+      guidance: {
+        searchCacheInvalidated: true,
+        runtimeOwned: true,
+      },
+    }
+  })
+
+  app.post('/v1/runtime/memory/restart', async (request, reply) => {
+    const body = memoryRestartSchema.parse(request.body ?? {})
+    const approval = requireMemoryApproval('restart', body)
+    if (!approval.approved) return reply.code(202).send(approval.response)
+    return reply.code(501).send({
+      type: 'error',
+      code: 'MEMORY_RESTART_NOT_IMPLEMENTED',
+      message: 'Memory restart is permission-gated but not implemented in this runtime yet.',
+      guidance: {
+        restartRequiresRuntimeManagerOwnership: true,
+        useProcessRestartForNow: true,
+      },
+    })
+  })
 
   app.get('/v1/runtime/provider-smoke', async request => {
     const query = providerSmokeQuerySchema.parse(request.query)

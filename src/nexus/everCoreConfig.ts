@@ -106,7 +106,14 @@ export async function configureEverCoreFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   options: { cwd?: string; providerSettings?: ResolvedSettings } = {},
 ): Promise<ConfiguredEverCore> {
-  return configureEverCore({
+  return configureEverCore(resolveEverCoreConfigInputFromEnv(env, options))
+}
+
+export function resolveEverCoreConfigInputFromEnv(
+  env: NodeJS.ProcessEnv = process.env,
+  options: { cwd?: string; providerSettings?: ResolvedSettings } = {},
+): EverCoreConfigInput {
+  return {
     mode: parseEverCoreMode(env.BABEL_O_EVERCORE_MODE),
     enabled: parseBoolean(env.BABEL_O_EVERCORE_ENABLED) ?? false,
     baseUrl: env.BABEL_O_EVERCORE_BASE_URL,
@@ -135,7 +142,7 @@ export async function configureEverCoreFromEnv(
     managedLlmBaseUrl: env.BABEL_O_EVERCORE_LLM_BASE_URL,
     managedLlmModel: env.BABEL_O_EVERCORE_LLM_MODEL,
     providerSettings: options.providerSettings,
-  })
+  }
 }
 
 export async function configureEverCore(

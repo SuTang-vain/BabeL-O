@@ -1577,6 +1577,116 @@ test('analyzeContext clears grounding guard after source confirmation', async ()
   assert.ok(!analysis.diagnostics.signals.some(signal => signal.type === 'workspace_dirty'))
 })
 
+test('analyzeContext exposes task scope and evidence scope diagnostics', async () => {
+  const cwd = join(tmpdir(), `babel-o-context-scope-${Date.now()}`)
+  const sibling = join(tmpdir(), `babel-o-context-scope-sibling-${Date.now()}`)
+  const external = join(tmpdir(), `babel-o-context-scope-external-${Date.now()}`)
+  const events: NexusEvent[] = [
+    {
+      type: 'task_scope_declared',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:00.000Z',
+      cwd,
+      primaryRoot: cwd,
+      explicitRoots: [],
+      confirmedExternalRoots: [external],
+      inferredCandidateRoots: [],
+      mode: 'multi_root',
+      source: 'user_confirmation',
+      message: 'Current task scope includes one confirmed external root.',
+    },
+    {
+      type: 'scope_boundary_detected',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:01.000Z',
+      toolUseId: 'tool-sibling-find',
+      toolName: 'Bash',
+      targetRoot: sibling,
+      taskPrimaryRoot: cwd,
+      boundaryKind: 'sibling_repo',
+      action: 'require_confirmation',
+      scopeRisk: 'sibling_repo',
+      reason: 'Sibling repo was not explicitly requested.',
+      suggestedPrompt: 'Ask before inspecting sibling.',
+    },
+    {
+      type: 'tool_started',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:02.000Z',
+      toolUseId: 'tool-sibling-find',
+      name: 'Bash',
+      input: { command: `cd ${sibling} && find . -type f` },
+    },
+    {
+      type: 'tool_completed',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:03.000Z',
+      toolUseId: 'tool-sibling-find',
+      name: 'Bash',
+      success: true,
+      output: 'README.md',
+    },
+    {
+      type: 'scope_boundary_detected',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:04.000Z',
+      toolUseId: 'tool-external-read',
+      toolName: 'Read',
+      targetRoot: external,
+      taskPrimaryRoot: cwd,
+      boundaryKind: 'external_absolute_path',
+      action: 'require_confirmation',
+      scopeRisk: 'outside_current_project',
+      reason: 'External root needs confirmation.',
+      suggestedPrompt: 'Confirm external root.',
+    },
+    {
+      type: 'scope_boundary_confirmed',
+      schemaVersion,
+      sessionId: 'session-context-scope-analysis',
+      timestamp: '2026-06-13T00:00:05.000Z',
+      targetRoot: external,
+      confirmationScope: 'once',
+      confirmedBy: 'user',
+      message: 'External root confirmed.',
+    },
+  ]
+
+  const analysis = await analyzeContext({
+    runtimeOptions: {
+      sessionId: 'session-context-scope-analysis',
+      prompt: '继续',
+      cwd,
+    },
+    events,
+    modelId: 'local/coding-runtime',
+    buildSystemPrompt,
+    mapEventsToMessages,
+  })
+  const rendered = stripAnsi(formatContextAnalysis(analysis))
+
+  assert.equal(analysis.diagnostics.taskScope.primaryRoot, cwd)
+  assert.deepEqual(analysis.diagnostics.taskScope.confirmedExternalRoots, [external])
+  assert.equal(analysis.diagnostics.taskScope.pendingBoundaries.length, 1)
+  assert.equal(analysis.diagnostics.taskScope.pendingBoundaries[0]?.targetRoot, sibling)
+  assert.equal(analysis.diagnostics.taskScope.outOfScopeEvidence.length, 1)
+  assert.equal(analysis.diagnostics.taskScope.outOfScopeEvidence[0]?.targetRoot, sibling)
+  assert.equal(analysis.diagnostic.details.taskScopeMode, 'multi_root')
+  assert.equal(analysis.diagnostic.details.pendingScopeBoundaryCount, 1)
+  assert.equal(analysis.diagnostic.details.outOfScopeEvidenceCount, 1)
+  assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'scope_boundary'))
+  assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'out_of_scope_evidence'))
+  assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Confirm or reject pending scope boundaries')))
+  assert.match(rendered, /task scope mode=multi_root/)
+  assert.match(rendered, /pending scope boundary sibling_repo/)
+  assert.match(rendered, /out-of-scope evidence Bash:tool-sibling-find/)
+})
+
 test('analyzeContext returns token and compact diagnostics', async () => {
   const cwd = join(tmpdir(), `babel-o-context-analysis-${Date.now()}`)
   const events: NexusEvent[] = [
@@ -2711,7 +2821,7 @@ test('assembleContext treats short greetings as intent guidance without dropping
   assert.match(messagesText, /Baidu old output|Baidu project summary/)
   assert.equal(context.userIntentGuidance.intent, 'greeting')
   assert.equal(context.userIntentGuidance.actionHint, 'respond_only')
-  assert.match(context.systemPrompt, /User Intake Guidance/)
+  assert.match(context.systemPrompt, /Turn Policy/)
 })
 
 test('assembleContext treats user correction prompts as high-priority intent guidance', async () => {
@@ -2765,7 +2875,8 @@ test('assembleContext treats user correction prompts as high-priority intent gui
   assert.match(messagesText, /BabeL-O runtime analysis|BabeL-O analysis done/)
   assert.equal(context.userIntentGuidance.intent, 'correction')
   assert.equal(context.userIntentGuidance.actionHint, 'prioritize_latest')
-  assert.match(context.systemPrompt, /prioritize the latest user message as the active task/i)
+  assert.match(context.systemPrompt, /Action hint: prioritize_latest/)
+  assert.match(context.systemPrompt, /Stale task mode: background_only/)
 })
 
 test('assembleContext keeps prior project context for malformed greeting like session_321c48be', async () => {
@@ -2884,7 +2995,8 @@ test('assembleContext converts pause requests into respond-only intent guidance'
 
   assert.equal(context.userIntentGuidance.intent, 'pause')
   assert.equal(context.userIntentGuidance.actionHint, 'respond_only')
-  assert.match(context.systemPrompt, /Do not start tool calls/)
+  assert.match(context.systemPrompt, /Response mode: direct_answer/)
+  assert.match(context.systemPrompt, /Tool mode: disabled/)
 })
 
 test('buildSystemPrompt anchors explicit absolute paths from the current request', async () => {
@@ -3075,6 +3187,47 @@ test('verifyRetainedSegment reports each retained metadata mismatch independentl
   )
 })
 
+test('verifyRetainedSegment accepts legacy intake guidance hashes without using guidance for new metadata', () => {
+  const retainedEvents: NexusEvent[] = [
+    {
+      type: 'user_intake_guidance',
+      schemaVersion,
+      sessionId: 'session-retained-legacy-intake',
+      timestamp: '2026-05-23T00:00:00.000Z',
+      userText: 'why did you make that unsupported claim?',
+      intent: 'continue',
+      confidence: 0.9,
+      continuity: 0.7,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget: 'agent_failure',
+      reason: 'legacy event with natural-language guidance',
+      guidance: 'legacy natural-language guidance that must not affect new metadata',
+      explicitPaths: [],
+      source: 'fallback',
+    } as NexusEvent,
+  ]
+  const metadata = buildRetainedSegmentMetadata(retainedEvents)
+  const legacyFirstEventId = [
+    'user_intake_guidance',
+    'session-retained-legacy-intake',
+    '2026-05-23T00:00:00.000Z',
+    '',
+    '',
+    legacyHashString('why did you make that unsupported claim?:continue:normal:true:agent_failure:fallback:legacy natural-language guidance that must not affect new metadata'),
+  ].join(':')
+  const legacyMetadata = {
+    ...metadata,
+    firstEventId: legacyFirstEventId,
+    lastEventId: legacyFirstEventId,
+    hash: legacyHashString(legacyFirstEventId),
+  }
+
+  assert.notEqual(metadata.firstEventId, legacyFirstEventId)
+  assert.deepEqual(verifyRetainedSegment(retainedEvents, legacyMetadata), { valid: true, warning: '' })
+})
+
 test('assembleContext uses retained tail after a valid compact boundary', async () => {
   const sessionId = 'session-retained-tail-test'
   const cwd = join(tmpdir(), `babel-o-retained-tail-${Date.now()}`)
@@ -3159,6 +3312,15 @@ test('assembleContext uses retained tail after a valid compact boundary', async 
   assert.match(messagesText, /latest post-compact question/)
   assert.doesNotMatch(messagesText, /stale pre-compact question|stale pre-compact answer/)
 })
+
+function legacyHashString(value: string): string {
+  let hash = 2166136261
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index)
+    hash = Math.imul(hash, 16777619)
+  }
+  return (hash >>> 0).toString(36)
+}
 
 test('assembleContext verifies retained segment metadata and falls back on mismatch', async () => {
   const sessionId = 'session-retained-segment-test'

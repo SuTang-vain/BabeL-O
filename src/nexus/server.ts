@@ -2,7 +2,7 @@ import { createNexusApp, validateSecurityConfig } from './app.js'
 import { createDefaultNexusRuntime, resolveDefaultStoragePath } from './createRuntime.js'
 import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
-import { configureEverCoreFromEnv } from './everCoreConfig.js'
+import { defaultEverCoreRuntimeManager } from './everCoreRuntimeManager.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -67,7 +67,7 @@ try {
   process.exit(1)
 }
 const providerSettings = ConfigManager.getInstance().resolveSettings()
-const everCore = await configureEverCoreFromEnv(process.env, { cwd, providerSettings })
+const everCore = await defaultEverCoreRuntimeManager.acquireFromEnv(process.env, { cwd, providerSettings })
 const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,
@@ -105,6 +105,9 @@ const app = await createNexusApp({
   everCoreStatus: everCore.status,
   memoryProvider: everCore.memoryProvider,
   agentExecutionEnvironment,
+})
+app.addHook('onClose', async () => {
+  await defaultEverCoreRuntimeManager.shutdown()
 })
 
 await app.listen({ host, port })

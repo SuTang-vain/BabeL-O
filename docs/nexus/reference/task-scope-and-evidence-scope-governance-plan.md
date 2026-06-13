@@ -1,6 +1,6 @@
 # Task Scope and Evidence Scope Governance Plan
 
-> Status: Phase 0–3 Foundation Landed (2026-06-13) — 基于真实 session `session_ef76f50a-92cc-4d72-a2bf-13b3ea36917d` 的 scope drift 复盘：用户要求查看 `BabeL-O` / `babel-omemory` 系统进展，agent 自动展开同级独立项目 `BabeL-2` / `BabeL-X` 并把它们作为报告证据。该问题不是危险写入或路径不存在，而是 read-only 工具读取了**任务范围外**的真实证据。
+> Status: Phase 0–4 Landed + Phase 5 Diagnostics Slice Landed (2026-06-13) — 基于真实 session `session_ef76f50a-92cc-4d72-a2bf-13b3ea36917d` 的 scope drift 复盘：用户要求查看 `BabeL-O` / `babel-omemory` 系统进展，agent 自动展开同级独立项目 `BabeL-2` / `BabeL-X` 并把它们作为报告证据。该问题不是危险写入或路径不存在，而是 read-only 工具读取了**任务范围外**的真实证据。
 > Priority: P0 Guardrail — 在不削弱合法跨仓分析能力的前提下，让 Nexus/runtime 能区分“路径安全”与“证据在当前任务范围内”。
 > Related: [context-management-optimization-plan.md](./context-management-optimization-plan.md), [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md), [session-finalization-and-evidence-governance-plan.md](./session-finalization-and-evidence-governance-plan.md), [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md)
 
@@ -8,16 +8,18 @@
 
 ## 0. 已落地基础（2026-06-13）
 
-本轮已完成 Phase 0–3 的最小闭环：
+本轮已完成 Phase 0–4 的最小闭环，并落地 Phase 5 的 diagnostics 切片：
 
 - `src/runtime/taskScope.ts`：新增 runtime-owned TaskScope 推导与工具目标 scope boundary 分类；覆盖 `Read` / `Grep` / `Glob` / `ListDir` / 常见 `Bash` 路径模式（`cd <path>`、`git -C <path>`、`find/ls/cat/head/tail`、`rg/grep <path>`）。
 - `src/shared/events.ts`：新增 `task_scope_declared`、`scope_boundary_detected`、`scope_boundary_confirmed` 事件；`permission_request` 增加 `scopeRisk` / `targetRoot` / `taskPrimaryRoot` / `scopeReason`。
 - `src/runtime/LLMCodingRuntime.ts`：每轮声明 task scope 并回放给 provider；工具执行携带当前 scope；scope boundary 确认后同一轮更新 `confirmedExternalRoots`，后续同 root 只读工具不重复打断。
 - `src/runtime/runtimeToolLoop.ts`：工具执行前做 scope preflight；未确认 sibling repo / parent scan / external absolute path 会先发 `scope_boundary_detected` 和带语义风险的 `permission_request`；拒绝时返回 recoverable tool result。
+- `src/runtime/contextAnalysis.ts`：`analyzeContext()` diagnostics 现在暴露 task scope 摘要、confirmed external roots、pending scope boundaries、confirmed boundary timeline，以及成功工具结果中的 out-of-scope evidence 信号。
+- `src/cli/contextView.ts`、`src/cli/commands/chat.ts` 与 `clients/go-tui/internal/tui/context.go`：TS `/context` overlay、文本 formatter 和 Go TUI `/context` overlay 都展示 task scope、confirmed external roots、pending boundary 与 out-of-scope evidence 摘要。
 - `src/cli/renderEvents.ts` 与 `clients/go-tui/internal/tui/`：TS CLI / Go TUI transcript 展示 scope 事件；Go TUI permission panel 显示 scope risk、target root、current root、scope reason；trusted Go TUI session 不再自动批准带 `scopeRisk` 的外部 root 请求。
-- 验证：新增/相关 TS scope tests 通过；`npm run typecheck` 通过；`npm run format:check` 通过；`go test ./...` 通过；完整 `npm test` 通过（847/847）。
+- 验证：新增/相关 TS scope tests 通过；`npm run typecheck` 通过；`npm run format:check` 通过；`go test ./...` 通过；完整 `npm test` 通过（863/863）。
 
-仍未展开 Phase 4–5 的完整 evidence provenance panel；本轮只完成执行前边界治理、确认事件和 UI 可见性基础。
+仍未展开完整 `evidence_scope_attached` 事件、final-answer evidence panel 或 durable session scope-drift timeline；当前 Phase 5 只承诺 context/session diagnostics 的最小 provenance 可见性。
 
 ---
 
@@ -444,6 +446,8 @@ Reason: user asked about BabeL-O only
 
 ### Phase 4：Confirmed external roots
 
+状态：已落地（2026-06-13）。
+
 目标：允许合法跨仓任务顺畅执行。
 
 落地点：
@@ -459,6 +463,8 @@ Reason: user asked about BabeL-O only
 - 新 session 或新任务默认不继承上次 external root 授权，除非用户/配置明确允许。
 
 ### Phase 5：Evidence scope provenance
+
+状态：diagnostics slice 已落地（2026-06-13）；完整 final-answer evidence panel / durable timeline 仍待后续。
 
 目标：最终结论和 context diagnostics 能区分证据来源范围。
 

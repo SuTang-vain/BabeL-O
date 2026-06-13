@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createServer } from 'node:net'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { DEFAULT_CONFIG_DIR } from '../shared/config.js'
@@ -48,6 +48,10 @@ export type EverCoreSidecarStatus = {
   url?: string
   dataDir?: string
   pid?: number
+  reused?: boolean
+  registryPath?: string
+  registryStaleReason?: string
+  registryCleanupError?: string
   errorCode?: string
   errorMessage?: string
 }
@@ -71,6 +75,19 @@ export type EverCorePortAllocator = (host: string) => Promise<number>
 const DEFAULT_HOST = '127.0.0.1'
 const DEFAULT_STARTUP_TIMEOUT_MS = 5_000
 const DEFAULT_HEALTH_INTERVAL_MS = 100
+const REGISTRY_FILE_NAME = 'sidecar-registry.json'
+const REGISTRY_VERSION = 1
+
+type EverCoreSidecarRegistry = {
+  version: typeof REGISTRY_VERSION
+  baseUrl: string
+  host: string
+  port: number
+  dataDir: string
+  pid?: number
+  startedAt: string
+  updatedAt: string
+}
 
 export async function startManagedEverCoreSidecar(
   options: EverCoreSidecarOptions = {},
@@ -93,30 +110,73 @@ export async function startManagedEverCoreSidecar(
     return failedManagedRuntime('EVERCORE_MANAGED_HOST_NOT_LOCAL', 'Managed EverCore sidecar must bind to 127.0.0.1, localhost, or ::1.')
   }
 
-  let port = options.port
-  if (port === undefined) {
-    try {
-      port = await (options.portAllocator ?? allocateLocalPort)(host)
-    } catch (error) {
-      return failedManagedRuntime('EVERCORE_MANAGED_PORT_ALLOC_FAILED', errorMessage(error))
-    }
-  }
-  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
-    return failedManagedRuntime('EVERCORE_MANAGED_PORT_INVALID', 'Managed EverCore sidecar port must be between 1 and 65535.')
-  }
-
   const dataDir = options.dataDir?.trim() || join(DEFAULT_CONFIG_DIR, 'evercore')
-  const baseUrl = `http://${host}:${port}`
-  const command = options.command?.trim() || 'everos'
-  const args = options.args ?? ['server', 'start', '--host', host, '--port', String(port)]
+  const registryPath = join(dataDir, REGISTRY_FILE_NAME)
   const spawnImpl = options.spawn ?? spawnEverCore
   const fetchImpl = options.fetch ?? fetch
 
   try {
     await mkdir(dataDir, { recursive: true })
   } catch (error) {
-    return failedManagedRuntime('EVERCORE_MANAGED_DATA_DIR_FAILED', errorMessage(error), baseUrl, dataDir)
+    return failedManagedRuntime('EVERCORE_MANAGED_DATA_DIR_FAILED', errorMessage(error), undefined, dataDir, undefined, {
+      registryPath,
+    })
   }
+
+  const registryCheck = await probeReusableRegistry({
+    dataDir,
+    host,
+    requestedPort: options.port,
+    registryPath,
+    fetch: fetchImpl,
+  })
+  if (registryCheck.reused) {
+    return {
+      mode: 'managed',
+      baseUrl: registryCheck.registry.baseUrl,
+      dataDir,
+      status: {
+        mode: 'managed',
+        managed: true,
+        running: true,
+        healthy: true,
+        url: redactEverCoreUrl(registryCheck.registry.baseUrl),
+        dataDir,
+        pid: registryCheck.registry.pid,
+        reused: true,
+        registryPath,
+      },
+    }
+  }
+
+  let registryCleanupError: string | undefined
+  if (registryCheck.staleReason) {
+    registryCleanupError = await removeStaleRegistry(registryPath)
+  }
+
+  let port = options.port
+  if (port === undefined) {
+    try {
+      port = await (options.portAllocator ?? allocateLocalPort)(host)
+    } catch (error) {
+      return failedManagedRuntime('EVERCORE_MANAGED_PORT_ALLOC_FAILED', errorMessage(error), undefined, dataDir, undefined, {
+        registryPath,
+        registryStaleReason: registryCheck.staleReason,
+        registryCleanupError,
+      })
+    }
+  }
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) {
+    return failedManagedRuntime('EVERCORE_MANAGED_PORT_INVALID', 'Managed EverCore sidecar port must be between 1 and 65535.', undefined, dataDir, undefined, {
+      registryPath,
+      registryStaleReason: registryCheck.staleReason,
+      registryCleanupError,
+    })
+  }
+
+  const baseUrl = `http://${host}:${port}`
+  const command = options.command?.trim() || 'everos'
+  const args = options.args ?? ['server', 'start', '--host', host, '--port', String(port)]
 
   let child: EverCoreProcess
   try {
@@ -132,7 +192,11 @@ export async function startManagedEverCoreSidecar(
       detached: false,
     })
   } catch (error) {
-    return failedManagedRuntime('EVERCORE_MANAGED_START_FAILED', errorMessage(error), baseUrl, dataDir)
+    return failedManagedRuntime('EVERCORE_MANAGED_START_FAILED', errorMessage(error), baseUrl, dataDir, undefined, {
+      registryPath,
+      registryStaleReason: registryCheck.staleReason,
+      registryCleanupError,
+    })
   }
 
   const exitPromise = new Promise<Error>(resolve => {
@@ -151,8 +215,23 @@ export async function startManagedEverCoreSidecar(
     })
   } catch (error) {
     stopEverCoreProcess(child)
-    return failedManagedRuntime('EVERCORE_MANAGED_HEALTH_CHECK_FAILED', errorMessage(error), baseUrl, dataDir, child.pid)
+    return failedManagedRuntime('EVERCORE_MANAGED_HEALTH_CHECK_FAILED', errorMessage(error), baseUrl, dataDir, child.pid, {
+      registryPath,
+      registryStaleReason: registryCheck.staleReason,
+      registryCleanupError,
+    })
   }
+
+  const registryWriteError = await writeSidecarRegistry(registryPath, {
+    version: REGISTRY_VERSION,
+    baseUrl,
+    host,
+    port,
+    dataDir,
+    pid: child.pid,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  })
 
   return {
     mode: 'managed',
@@ -166,6 +245,11 @@ export async function startManagedEverCoreSidecar(
       url: redactEverCoreUrl(baseUrl),
       dataDir,
       pid: child.pid,
+      reused: false,
+      registryPath,
+      ...(registryCheck.staleReason && { registryStaleReason: registryCheck.staleReason }),
+      ...(registryCleanupError && { registryCleanupError }),
+      ...(registryWriteError && { errorCode: 'EVERCORE_MANAGED_REGISTRY_WRITE_FAILED', errorMessage: registryWriteError }),
     },
     async dispose() {
       stopEverCoreProcess(child)
@@ -202,12 +286,127 @@ async function fetchHealth(baseUrl: string, fetchImpl: typeof fetch): Promise<vo
   if (!response.ok) throw new Error(`EverCore health returned HTTP ${response.status}.`)
 }
 
+type RegistryProbeResult =
+  | { reused: true; registry: EverCoreSidecarRegistry }
+  | { reused: false; staleReason?: string }
+
+async function probeReusableRegistry(input: {
+  dataDir: string
+  host: string
+  requestedPort?: number
+  registryPath: string
+  fetch: typeof fetch
+}): Promise<RegistryProbeResult> {
+  const registry = await readSidecarRegistry(input.registryPath)
+  if (!registry) return { reused: false }
+  if (registry.version !== REGISTRY_VERSION) return { reused: false, staleReason: 'version_mismatch' }
+  if (registry.dataDir !== input.dataDir) return { reused: false, staleReason: 'data_dir_mismatch' }
+  if (!isLocalHost(registry.host)) return { reused: false, staleReason: 'host_not_local' }
+  if (registry.host !== input.host) return { reused: false, staleReason: 'host_mismatch' }
+  if (input.requestedPort !== undefined && registry.port !== input.requestedPort) {
+    return { reused: false, staleReason: 'port_mismatch' }
+  }
+  if (!isRegistryBaseUrlUsable(registry.baseUrl, registry.host, registry.port)) {
+    return { reused: false, staleReason: 'invalid_base_url' }
+  }
+  try {
+    await fetchHealth(registry.baseUrl, input.fetch)
+    return { reused: true, registry }
+  } catch (error) {
+    return { reused: false, staleReason: `health_check_failed:${errorMessage(error)}` }
+  }
+}
+
+async function readSidecarRegistry(registryPath: string): Promise<EverCoreSidecarRegistry | undefined> {
+  try {
+    const raw = await readFile(registryPath, 'utf8')
+    const parsed = JSON.parse(raw) as Partial<EverCoreSidecarRegistry>
+    if (
+      parsed.version !== REGISTRY_VERSION ||
+      typeof parsed.baseUrl !== 'string' ||
+      typeof parsed.host !== 'string' ||
+      typeof parsed.port !== 'number' ||
+      typeof parsed.dataDir !== 'string' ||
+      typeof parsed.startedAt !== 'string' ||
+      typeof parsed.updatedAt !== 'string'
+    ) {
+      return {
+        version: REGISTRY_VERSION,
+        baseUrl: '',
+        host: '',
+        port: 0,
+        dataDir: '',
+        startedAt: '',
+        updatedAt: '',
+      }
+    }
+    return {
+      version: REGISTRY_VERSION,
+      baseUrl: parsed.baseUrl,
+      host: parsed.host,
+      port: parsed.port,
+      dataDir: parsed.dataDir,
+      ...(typeof parsed.pid === 'number' && { pid: parsed.pid }),
+      startedAt: parsed.startedAt,
+      updatedAt: parsed.updatedAt,
+    }
+  } catch (error) {
+    if (isFileMissingError(error)) return undefined
+    return {
+      version: REGISTRY_VERSION,
+      baseUrl: '',
+      host: '',
+      port: 0,
+      dataDir: '',
+      startedAt: '',
+      updatedAt: '',
+    }
+  }
+}
+
+async function removeStaleRegistry(registryPath: string): Promise<string | undefined> {
+  try {
+    await unlink(registryPath)
+    return undefined
+  } catch (error) {
+    return isFileMissingError(error) ? undefined : errorMessage(error)
+  }
+}
+
+async function writeSidecarRegistry(registryPath: string, registry: EverCoreSidecarRegistry): Promise<string | undefined> {
+  const tempPath = `${registryPath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    await writeFile(tempPath, `${JSON.stringify(registry, null, 2)}\n`, 'utf8')
+    await rename(tempPath, registryPath)
+    return undefined
+  } catch (error) {
+    try {
+      await unlink(tempPath)
+    } catch {}
+    return errorMessage(error)
+  }
+}
+
+function isRegistryBaseUrlUsable(baseUrl: string, host: string, port: number): boolean {
+  try {
+    const url = new URL(baseUrl)
+    return url.protocol === 'http:' && url.hostname === host && Number(url.port) === port && isLocalHost(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+function isFileMissingError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT'
+}
+
 function failedManagedRuntime(
   errorCode: string,
   message: string,
   baseUrl?: string,
   dataDir?: string,
   pid?: number,
+  registry?: Pick<EverCoreSidecarStatus, 'registryPath' | 'registryStaleReason' | 'registryCleanupError'>,
 ): EverCoreSidecarRuntime {
   return {
     mode: 'managed',
@@ -221,6 +420,10 @@ function failedManagedRuntime(
       url: baseUrl ? redactEverCoreUrl(baseUrl) : undefined,
       dataDir,
       pid,
+      reused: false,
+      ...(registry?.registryPath && { registryPath: registry.registryPath }),
+      ...(registry?.registryStaleReason && { registryStaleReason: registry.registryStaleReason }),
+      ...(registry?.registryCleanupError && { registryCleanupError: registry.registryCleanupError }),
       errorCode,
       errorMessage: message,
     },

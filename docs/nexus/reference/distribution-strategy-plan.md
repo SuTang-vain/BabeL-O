@@ -12,7 +12,7 @@ Move the production installer away from Node.js SEA as the long-term primary cha
 
 ## Why
 
-The current v0.3.3 distribution has been stabilized by publishing both `bbl-*` and `go-tui-*` assets in the same release, but it still depends on Node.js SEA for the standalone `bbl` executable. That path has three product risks:
+The v0.3.4 distribution keeps the stabilized two-asset model by publishing both `bbl-*` and `go-tui-*` assets in the same release, but it still depends on Node.js SEA for the standalone `bbl` executable. That path has three product risks:
 
 - SEA is still a fragile production base for this project because it depends on embedding a Node runtime and application blob into a platform executable.
 - The release asset is large: the macOS arm64 `bbl` is about 140 MB before the separate Go TUI asset.
@@ -41,7 +41,7 @@ The self-check should be non-destructive: it verifies binary discovery and CLI s
    - Keep `bbl run`, `bbl chat`, `bbl sessions`, etc. delegated to `bbl.sea`.
    - Handle `bbl go` in shell by starting local Nexus when needed, then `exec`ing the installed Go TUI directly.
 
-This is a short-term bridge for the v0.3.3 release line: it avoids the macOS Node SEA `child_process.spawn` path that can report `ENOENT` for a valid Go TUI Mach-O. It is not the final architecture; the Go launcher remains the target.
+This is a short-term bridge for the v0.3.x release line: it avoids the macOS Node SEA `child_process.spawn` path that can report `ENOENT` for a valid Go TUI Mach-O. It is not the final architecture; the Go launcher remains the target.
 
 Users can opt out only for debugging or partial CLI installs:
 
@@ -127,14 +127,14 @@ Before attempting homebrew-core, maintain a first-party tap:
 class BabelO < Formula
   desc "Nexus-first coding agent CLI"
   homepage "https://github.com/SuTang-vain/BabeL-O"
-  version "0.3.3"
+  version "0.3.4"
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.3/bbl-darwin-arm64"
+      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.4/bbl-darwin-arm64"
       sha256 "<sha256>"
     else
-      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.3/bbl-darwin-x64"
+      url "https://github.com/SuTang-vain/BabeL-O/releases/download/v0.3.4/bbl-darwin-x64"
       sha256 "<sha256>"
     end
   end
@@ -144,7 +144,7 @@ class BabelO < Formula
   end
 
   test do
-    assert_match "0.3.3", shell_output("#{bin}/bbl --version")
+    assert_match "0.3.4", shell_output("#{bin}/bbl --version")
   end
 end
 ```

@@ -40,9 +40,11 @@ It connects to Nexus, can auto-start a local Nexus service for you, and gives yo
 - **Session Switching and Conversation Flow**: The `/session` panel supports creating, selecting, switching, and copying session IDs without leaving the TUI.
 - **SessionChannel Collaboration**: Typed side-channel messages let sessions exchange findings, handoffs, review requests, decisions, and memory candidates without treating those messages as direct user instructions.
 - **Context and Memory Awareness**: `/context` shows budget, compaction, memory, recovery, and working-set diagnostics so long conversations stay understandable.
+- **Memory Management Surface**: `/memory` exposes read-only status, bounded memory search, review-only memory candidates, and approval-gated save/flush actions.
 - **Permission-First Tooling**: Sensitive tools such as Bash, Write, Edit, and MCP tools go through visible approval flows with session-level trust options and audit logs.
 - **MCP and Built-in Tools**: Read, Grep, ListDir, Bash, WebSearch, and configured MCP servers are exposed as risk-classified tools.
 - **Model and Profile Control**: Switch model/provider profiles from the TUI while Nexus keeps shared runtime configuration consistent.
+- **Runtime Stability Fixes**: Session replay, context compaction, evidence routing, timeout recovery, and install self-checks are hardened so long-running Go TUI sessions recover more predictably.
 
 ---
 
@@ -60,13 +62,13 @@ bbl go
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.3 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.4 bash
 bbl go
 ```
 
 ### Manual Release Binary
 
-Download the latest standalone executable and matching `go-tui-*` asset from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.3 release notes](docs/releases/v0.3.3.md) for version-specific links.
+Download the latest standalone executable and matching `go-tui-*` asset from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.4 release notes](docs/releases/v0.3.4.md) for version-specific links.
 
 Move the downloaded `bbl` binary into your `$PATH`, then run:
 
@@ -134,6 +136,7 @@ Inside the Go TUI:
 | `/context` | Inspect current context budget and diagnostics |
 | `/tools` or `Ctrl+O` | Open the tools panel |
 | `/model` or `Ctrl+L` | Open model/profile selection |
+| `/memory` | Inspect memory status, search memory hints, and review candidates |
 | `Ctrl+D` | Open the top status panel |
 | `Shift+Enter` | Insert a newline in the input box |
 | `Ctrl+C` | Open the quit confirmation dialog |

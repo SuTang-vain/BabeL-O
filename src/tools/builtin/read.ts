@@ -30,6 +30,10 @@ type ReadLedgerRange = {
 const inputSchema = z.object({
   path: z.string().min(1),
   maxBytes: z.number().int().positive().max(1_000_000).default(DEFAULT_MAX_BYTES),
+  lineOffset: z.number().int().positive().optional(),
+  lineLimit: z.number().int().positive().max(10_000).optional(),
+  byteOffset: z.number().int().nonnegative().optional(),
+  byteLimit: z.number().int().positive().max(1_000_000).optional(),
   offset: z.number().int().nonnegative().optional(),
   limit: z.number().int().positive().max(1_000_000).optional(),
   mode: z.enum(['auto', 'full', 'preview']).default('auto'),
@@ -38,7 +42,7 @@ const inputSchema = z.object({
 export const readTool: ToolDefinition<typeof inputSchema> = {
   name: 'Read',
   description: 'Read a text file inside the workspace.',
-  prompt: () => 'Read is the source-understanding tool for file contents. Use Read only after you know the file path, with offset/limit for targeted ranges and mode="preview" for large files. Prefer Read over Bash cat, sed -n, head, or tail for ordinary source code reading. Use ListDir for directory inventory, Glob for pattern-based file discovery, and Grep for locating text before reading relevant ranges.',
+  prompt: () => 'Read is the source-understanding tool for file contents. Use Read only after you know the file path. Use lineOffset/lineLimit for source or markdown line ranges. Use byteOffset/byteLimit only for binary-safe byte windows or continuation from a Read tag. mode="preview" is for large files. Deprecated offset/limit are byte aliases and must not be used for line numbers. Prefer Read over Bash cat, sed -n, head, or tail for ordinary source code reading. Use ListDir for directory inventory, Glob for pattern-based file discovery, and Grep for locating text before reading relevant ranges.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
@@ -74,16 +78,19 @@ export const readTool: ToolDefinition<typeof inputSchema> = {
       }
     }
     const file = await readFile(path)
-    const start = input.offset ?? 0
-    const requestedBytes = input.limit ?? input.maxBytes
-    const shouldPreview = input.mode === 'preview' || (input.mode === 'auto' && input.offset === undefined && input.limit === undefined && file.length > input.maxBytes)
+    const request = resolveReadRequest(file, input)
+    if ('error' in request) {
+      return request.error
+    }
+    const { start, requestedBytes, shouldPreview, diagnostics, sourceKind } = request
     const readBytes = shouldPreview
       ? Math.min(LARGE_FILE_PREVIEW_BYTES, input.maxBytes, file.length)
-      : input.mode === 'full' && input.offset === undefined && input.limit === undefined
+      : input.mode === 'full' && sourceKind === 'full-file'
         ? Math.min(file.length, input.maxBytes)
         : Math.min(requestedBytes, input.maxBytes, Math.max(0, file.length - start))
     const end = Math.min(file.length, start + readBytes)
     const lineRange = byteLineRange(file, start, end)
+    const coverage = formatCoverageAttrs(input.path, file.length, start, end, lineRange)
     const repeated = repeatedLargeReadDiagnostic({
       sessionId: context.sessionId,
       path: input.path,
@@ -114,10 +121,11 @@ export const readTool: ToolDefinition<typeof inputSchema> = {
       return {
         success: true,
         output: [
-          `<read-preview path="${input.path}" bytes="${file.length}" shown="${end - start}" remaining="${remainingBytes}">`,
+          ...diagnostics,
+          `<read-preview ${coverage} remaining="${remainingBytes}">`,
           output,
           '</read-preview>',
-          `Use Read with offset=${end} and limit=${Math.min(input.maxBytes, LARGE_FILE_PREVIEW_BYTES)} for the next range, or use Grep/Glob to target symbols before reading more.`,
+          `Use Read with byteOffset=${end} and byteLimit=${Math.min(input.maxBytes, LARGE_FILE_PREVIEW_BYTES)} for the next byte range, or use Grep/Glob to target symbols before reading relevant line ranges.`,
         ].join('\n'),
       }
     }
@@ -126,17 +134,113 @@ export const readTool: ToolDefinition<typeof inputSchema> = {
       return {
         success: true,
         output: [
+          ...diagnostics,
           output,
-          `\n<read-truncated path="${input.path}" bytes="${file.length}" shownRange="${start}-${end}">Use Read with offset=${end} and limit=${Math.min(input.maxBytes, requestedBytes)} to continue.</read-truncated>`,
-        ].join(''),
+          `\n<read-truncated ${coverage}>Use Read with byteOffset=${end} and byteLimit=${Math.min(input.maxBytes, requestedBytes)} to continue by bytes, or lineOffset=${lineRange.end + 1} for the next source line range.</read-truncated>`,
+        ].join('\n'),
       }
     }
 
     return {
       success: true,
-      output,
+      output: [...diagnostics, output].filter(Boolean).join('\n'),
     }
   },
+}
+
+type ReadInput = z.infer<typeof inputSchema>
+
+type ResolvedReadRequest = {
+  start: number
+  requestedBytes: number
+  shouldPreview: boolean
+  diagnostics: string[]
+  sourceKind: 'full-file' | 'line-range' | 'byte-range'
+}
+
+function resolveReadRequest(file: Buffer, input: ReadInput): ResolvedReadRequest | { error: { success: false; output: string } } {
+  const hasLineRange = input.lineOffset !== undefined || input.lineLimit !== undefined
+  const hasByteRange = input.byteOffset !== undefined || input.byteLimit !== undefined
+  const hasDeprecatedRange = input.offset !== undefined || input.limit !== undefined
+  if ([hasLineRange, hasByteRange, hasDeprecatedRange].filter(Boolean).length > 1) {
+    return {
+      error: {
+        success: false,
+        output: [
+          'INVALID_READ_RANGE: choose exactly one range style.',
+          'Use lineOffset/lineLimit for source or markdown line ranges.',
+          'Use byteOffset/byteLimit for byte windows.',
+          'Deprecated offset/limit are byte aliases and cannot be mixed with the explicit fields.',
+        ].join('\n'),
+      },
+    }
+  }
+  const diagnostics = deprecatedOffsetLimitDiagnostics(input)
+  if (hasLineRange) {
+    const lineRange = lineByteRange(file, input.lineOffset ?? 1, input.lineLimit)
+    return {
+      start: lineRange.startByte,
+      requestedBytes: Math.max(0, lineRange.endByte - lineRange.startByte),
+      shouldPreview: false,
+      diagnostics,
+      sourceKind: 'line-range',
+    }
+  }
+  const start = input.byteOffset ?? input.offset ?? 0
+  const requestedBytes = input.byteLimit ?? input.limit ?? input.maxBytes
+  const shouldPreview = input.mode === 'preview' ||
+    (input.mode === 'auto' && !hasByteRange && !hasDeprecatedRange && file.length > input.maxBytes)
+  return {
+    start,
+    requestedBytes,
+    shouldPreview,
+    diagnostics,
+    sourceKind: hasByteRange || hasDeprecatedRange ? 'byte-range' : 'full-file',
+  }
+}
+
+function deprecatedOffsetLimitDiagnostics(input: ReadInput): string[] {
+  if (input.offset === undefined && input.limit === undefined) return []
+  return [
+    '<read-diagnostic code="DEPRECATED_OFFSET_LIMIT">offset/limit are deprecated byte aliases. Use lineOffset/lineLimit for source line ranges, or byteOffset/byteLimit for byte windows.</read-diagnostic>',
+  ]
+}
+
+function lineByteRange(file: Buffer, lineOffset: number, lineLimit?: number): { startByte: number; endByte: number } {
+  const startLine = Math.max(1, lineOffset)
+  const endLineExclusive = lineLimit === undefined ? Number.POSITIVE_INFINITY : startLine + lineLimit
+  let currentLine = 1
+  let startByte = file.length
+  let endByte = file.length
+  for (let index = 0; index < file.length; index += 1) {
+    if (currentLine === startLine && startByte === file.length) {
+      startByte = index
+    }
+    if (currentLine >= endLineExclusive) {
+      endByte = index
+      return { startByte, endByte }
+    }
+    if (file[index] === 10) {
+      currentLine += 1
+      if (currentLine === startLine && startByte === file.length) {
+        startByte = index + 1
+      }
+      if (currentLine >= endLineExclusive) {
+        endByte = index + 1
+        return { startByte, endByte }
+      }
+    }
+  }
+  if (startLine === 1 && startByte === file.length && file.length > 0) startByte = 0
+  return { startByte, endByte }
+}
+
+function formatCoverageAttrs(path: string, fileBytes: number, start: number, end: number, lineRange: { start: number; end: number }): string {
+  return `path="${escapeAttr(path)}" bytes="${fileBytes}" shownBytes="${start}-${end}" shownLines="${lineRange.start}-${lineRange.end}"`
+}
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/"/g, '&quot;')
 }
 
 function repeatedLargeReadDiagnostic(options: {
@@ -161,7 +265,7 @@ function repeatedLargeReadDiagnostic(options: {
   const nextOffset = Math.min(overlapping.end, options.fileBytes)
   const nextLimit = Math.min(options.input.maxBytes, LARGE_FILE_PREVIEW_BYTES, Math.max(0, options.fileBytes - nextOffset))
   const rangeHint = nextLimit > 0
-    ? `Use Read with offset=${nextOffset} and limit=${nextLimit} for the next unread range.`
+    ? `Use Read with byteOffset=${nextOffset} and byteLimit=${nextLimit} for the next unread byte range, or lineOffset=${overlapping.lineEnd + 1} for the next source line range.`
     : 'The previously read range reached the end of this file.'
   const modeHint = options.shouldPreview
     ? 'This large file was already previewed in this session.'
@@ -175,7 +279,7 @@ function repeatedLargeReadDiagnostic(options: {
       `Previously read byte range ${overlapping.start}-${overlapping.end}, lines ${overlapping.lineStart}-${overlapping.lineEnd}, at session read #${overlapping.readIndex}.`,
       rangeHint,
       'Use Grep to search for symbols/errors before reading more, or Glob to confirm related file paths.',
-      'Use mode="full" with an explicit offset/limit only if the user needs this exact range again.',
+      'Use mode="full" with explicit byteOffset/byteLimit only if the user needs this exact byte range again.',
       '</read-repeat>',
     ].join('\n'),
   }
@@ -211,17 +315,21 @@ function rangesOverlap(range: ReadLedgerRange, start: number, end: number): bool
 }
 
 function byteLineRange(file: Buffer, start: number, end: number): { start: number; end: number } {
-  let line = 1
-  let lineStart = 1
-  let lineEnd = 1
   const clampedStart = Math.max(0, Math.min(start, file.length))
   const clampedEnd = Math.max(clampedStart, Math.min(end, file.length))
-  for (let index = 0; index < clampedEnd; index += 1) {
-    if (index === clampedStart) lineStart = line
+  const lineStart = lineNumberAtByte(file, clampedStart)
+  const lastShownByte = clampedEnd > clampedStart ? clampedEnd - 1 : clampedStart
+  const lineEnd = lineNumberAtByte(file, lastShownByte)
+  return { start: lineStart, end: lineEnd }
+}
+
+function lineNumberAtByte(file: Buffer, byteIndex: number): number {
+  const clamped = Math.max(0, Math.min(byteIndex, Math.max(0, file.length - 1)))
+  let line = 1
+  for (let index = 0; index < clamped; index += 1) {
     if (file[index] === 10) line += 1
   }
-  lineEnd = line
-  return { start: lineStart, end: lineEnd }
+  return line
 }
 
 function nextSessionReadIndex(sessionId: string): number {

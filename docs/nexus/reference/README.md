@@ -10,8 +10,10 @@
 - [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md): task scope / evidence scope 治理；防止 read-only 工具把 sibling repo、历史 session path 或 memory hit 自动当作本轮任务证据。
 - [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md): workspace path drift、连续路径失败恢复与证据降级治理。
 - [session-finalization-and-evidence-governance-plan.md](./session-finalization-and-evidence-governance-plan.md): current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。
+- [session-replay-and-evidence-governance-plan.md](./session-replay-and-evidence-governance-plan.md): 基于 `session_315814e7-3b82-4a31-8601-a5b383288e9c` 的 provider replay、Read evidence coverage、line/byte range、intent target 与 self-diagnosis 综合治理规划。
 - [session-to-session-memory-channel-plan.md](./session-to-session-memory-channel-plan.md): Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。
 - [memory-capability-awareness-and-trigger-plan.md](./memory-capability-awareness-and-trigger-plan.md): Memory capability awareness、自触发 memory_search / memory_save_note 与写入治理规划。
+- [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md): EverCore managed sidecar 按需拉起、缓存复用、idle TTL、`/memory` 管理面板与记忆能力问答不泄露内通的治理规划。
 - [go-runner-plan.md](./go-runner-plan.md): 可选 Go `RemoteToolRunner` 执行后端参考。
 - [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。
 - [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md): Bash 在 `denyByDefaultTools()` 下 hard-deny 跳过 `permission_request` 致 Go TUI 权限面板缺位的治理规划。Phase A — Bash read-only subcommand 自动放行（`src/tools/builtin/bashClassifier.ts` 纯函数分类器 + 30+ 危险 pattern 二次校验）；Phase B — `policy: 'soft-deny'` per-request override 组合；Phase C — 端到端 mock provider regression（含 `result`/`error` 不重置 mode 的 bug 修复）；Phase D — Go TUI `--allow-tools` flag（power-user opt-in，per-turn allowlist override）。四 Phase 全部收口，726 TS tests + Go TUI tests 全过。

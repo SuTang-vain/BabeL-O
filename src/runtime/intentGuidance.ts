@@ -13,6 +13,13 @@ export type UserIntentKind =
 
 export type ContextScope = 'full' | 'recent' | 'new_focus'
 export type ActionHint = 'normal' | 'prioritize_latest' | 'respond_only'
+export type ProblemTarget =
+  | 'agent_failure'
+  | 'runtime_replay'
+  | 'tool_evidence'
+  | 'project_feature'
+  | 'user_artifact'
+  | 'unknown'
 
 export type UserIntentGuidance = {
   intent: UserIntentKind
@@ -21,14 +28,56 @@ export type UserIntentGuidance = {
   contextScope: ContextScope
   actionHint: ActionHint
   requiresTools: boolean
+  problemTarget: ProblemTarget
   reason: string
-  guidance: string
   latestUserText: string
   explicitPaths: string[]
   source: 'model' | 'fallback'
 }
 
 export type UserIntakeGuidanceEvent = Extract<NexusEvent, { type: 'user_intake_guidance' }>
+
+type TurnPolicy = {
+  responseMode: 'execute_task' | 'direct_answer'
+  toolMode: 'enabled' | 'disabled' | 'available_for_verification'
+  evidenceMode: 'standard' | 'verify_before_claim' | 'none'
+  staleTaskMode: 'continue' | 'background_only' | 'reset'
+}
+
+type TargetScore = {
+  agentFailure: number
+  runtimeReplay: number
+  toolEvidence: number
+  projectFeature: number
+  problemAnalysis: number
+}
+
+const PROBLEM_MARKERS = {
+  agentSubject: [
+    /\b(?:you|your|assistant|agent|model|runtime|system\s*prompt|prompt)\b/iu,
+    /(?:你|你的|助手|模型|运行时|提示词|系统提示)/u,
+  ],
+  failure: [
+    /\b(?:problem|issue|failure|mistake|wrong|hallucinat\w*|unsupported|unverified|verify|fact|evidence)\b/iu,
+    /(?:问题|错误|失败|错|幻觉|编|事实|核对|证据|验证|未验证|不支撑)/u,
+  ],
+  runtimeReplay: [
+    /\b(?:provider|replay|orphan|tool[_ -]?(?:result|use|call|started|completed)|event\s*ordering|transcript|protocol)\b/iu,
+    /(?:回放|孤儿|工具.*(?:结果|调用|配对)|事件.*排序|转录|协议)/u,
+  ],
+  toolEvidence: [
+    /\b(?:read|grep|listdir|glob|coverage|offset|lineoffset|shownbytes|shownlines|claim|evidence)\b/iu,
+    /(?:工具|读取|覆盖|偏移|行号|结论|判断|证据|事实源)/u,
+  ],
+  projectFeature: [
+    /\b(?:project|product|feature|code|implementation|architecture|source|document)\b/iu,
+    /(?:项目|产品|功能|源码|代码|实现|架构|文档)/u,
+  ],
+  problemAnalysis: [
+    /\b(?:problem|issue|bug|root\s*cause|cause|analy[sz]e|inspect|debug)\b/iu,
+    /(?:问题|原因|缺陷|分析|查看|检查|排查|诊断)/u,
+  ],
+} as const
 
 export async function buildUserIntakeGuidanceEvent(options: {
   adapter: ModelAdapter
@@ -99,8 +148,12 @@ export function guidanceFromIntakeEvent(event: UserIntakeGuidanceEvent): UserInt
     contextScope: event.contextScope,
     actionHint: event.actionHint,
     requiresTools: event.requiresTools,
+    problemTarget: event.problemTarget ?? deriveProblemTarget({
+      latestUserText: event.userText,
+      events: [],
+      explicitPaths: event.explicitPaths,
+    }),
     reason: event.reason,
-    guidance: event.guidance,
     latestUserText: event.userText,
     explicitPaths: event.explicitPaths,
     source: event.source,
@@ -122,16 +175,17 @@ export function toUserIntakeGuidanceEvent(options: {
     contextScope: guidance.contextScope,
     actionHint: guidance.actionHint,
     requiresTools: guidance.requiresTools,
+    problemTarget: guidance.problemTarget,
     reason: guidance.reason,
-    guidance: guidance.guidance,
     explicitPaths: guidance.explicitPaths,
     source: guidance.source,
   }
 }
 
 export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
+  const policy = deriveTurnPolicy(guidance)
   const lines = [
-    '## User Intake Guidance / User Intent Guidance',
+    '## Turn Policy',
     `Source: ${guidance.source}`,
     `Intent: ${guidance.intent}`,
     `Confidence: ${guidance.confidence.toFixed(2)}`,
@@ -139,24 +193,21 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
     `Context scope: ${guidance.contextScope}`,
     `Action hint: ${guidance.actionHint}`,
     `Requires tools: ${guidance.requiresTools ? 'yes' : 'no'}`,
-    `Reason: ${guidance.reason}`,
-    `Guidance: ${guidance.guidance}`,
+    `Problem target: ${guidance.problemTarget}`,
+    `Response mode: ${policy.responseMode}`,
+    `Tool mode: ${policy.toolMode}`,
+    `Evidence mode: ${policy.evidenceMode}`,
+    `Stale task mode: ${policy.staleTaskMode}`,
   ]
   if (guidance.explicitPaths.length > 0) {
     lines.push(`Explicit paths: ${guidance.explicitPaths.join(', ')}`)
-  }
-  if (guidance.intent === 'status' && (!guidance.requiresTools || guidance.actionHint === 'respond_only')) {
-    lines.push('Instruction: the user appears to be asking a status or context question. Answer from existing context unless you genuinely need to run a command to verify. Do not start multi-step tool chains for this message.')
-  } else if (!guidance.requiresTools || guidance.actionHint === 'respond_only') {
-    lines.push('Instruction: respond directly to the latest user message. Do not start tool calls unless the user explicitly asks for new work in this message.')
-  } else if (guidance.actionHint === 'prioritize_latest') {
-    lines.push('Instruction: prioritize the latest user message as the active task. Use prior context only as background and do not continue stale tool chains.')
   }
   return lines.join('\n')
 }
 
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
   const normalized = normalizeGuidancePolicy(guidance)
+  if (isMemoryCapabilityQuestion(normalized.latestUserText)) return true
   if (normalized.intent === 'status') return false
   return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
@@ -169,6 +220,11 @@ export function deriveFallbackUserIntentGuidance(options: {
   const latestUserText = options.latestPrompt || findLatestUserText(options.events)
   const explicitPaths = extractAbsolutePaths(latestUserText)
   const hasPriorUserTurns = countUserMessages(options.events) > 1
+  const problemTarget = deriveProblemTarget({
+    latestUserText,
+    events: options.events,
+    explicitPaths,
+  })
 
   if (isPausePrompt(latestUserText)) {
     return buildGuidance({
@@ -178,8 +234,8 @@ export function deriveFallbackUserIntentGuidance(options: {
       contextScope: 'recent',
       actionHint: 'respond_only',
       requiresTools: false,
+      problemTarget,
       reason: 'The user asked to stop, pause, or wait before continuing.',
-      guidance: 'Acknowledge the pause and wait for the next requirement without starting tool work.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -194,8 +250,24 @@ export function deriveFallbackUserIntentGuidance(options: {
       contextScope: 'recent',
       actionHint: 'prioritize_latest',
       requiresTools: true,
+      problemTarget,
       reason: 'The user is correcting the previous target or interpretation; prioritize the latest wording without discarding prior context.',
-      guidance: 'Use the correction as the active instruction and treat previous work as background, not as an active tool chain.',
+      latestUserText,
+      explicitPaths,
+      source: 'fallback',
+    })
+  }
+
+  if (isMemoryCapabilityQuestion(latestUserText)) {
+    return buildGuidance({
+      intent: 'status',
+      confidence: 0.88,
+      continuity: hasPriorUserTurns ? 0.75 : 0.5,
+      contextScope: 'full',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      problemTarget,
+      reason: 'The user is asking whether memory capability is available, not asking to write memory now.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -211,8 +283,8 @@ export function deriveFallbackUserIntentGuidance(options: {
       contextScope: 'new_focus',
       actionHint: 'prioritize_latest',
       requiresTools: true,
+      problemTarget,
       reason: 'The latest request names path(s) outside the current workspace; treat them as the active focus while retaining prior context as background.',
-      guidance: 'Inspect the explicit path as the active focus if tools are needed; do not continue stale project work.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -227,8 +299,8 @@ export function deriveFallbackUserIntentGuidance(options: {
       contextScope: 'full',
       actionHint: 'respond_only',
       requiresTools: false,
+      problemTarget,
       reason: 'The user is asking about the current state; answer from existing context instead of starting new tool work.',
-      guidance: 'Answer from the visible session state and do not initiate fresh inspection.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -243,8 +315,8 @@ export function deriveFallbackUserIntentGuidance(options: {
       contextScope: 'full',
       actionHint: 'respond_only',
       requiresTools: false,
+      problemTarget,
       reason: 'The latest message is a greeting; acknowledge briefly and keep the prior conversation available.',
-      guidance: 'Reply briefly and do not start tools.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -257,9 +329,9 @@ export function deriveFallbackUserIntentGuidance(options: {
     continuity: hasPriorUserTurns ? 0.8 : 0.5,
     contextScope: 'full',
     actionHint: 'normal',
-    requiresTools: true,
-    reason: 'No strong topic switch, correction, pause, or greeting marker was detected.',
-    guidance: 'Proceed with the latest request, using prior context normally.',
+      requiresTools: true,
+      problemTarget,
+      reason: 'No strong topic switch, correction, pause, or greeting marker was detected.',
     latestUserText,
     explicitPaths,
     source: 'fallback',
@@ -281,21 +353,15 @@ async function queryIntakeModel(options: {
       role: 'user',
       content: [
         'Analyze the latest user message for a coding agent intake step.',
-        'Return only compact JSON with keys: intent, confidence, continuity, contextScope, actionHint, requiresTools, reason, guidance, explicitPaths.',
+        'Return only compact JSON with keys: intent, confidence, continuity, contextScope, actionHint, requiresTools, problemTarget, reason, explicitPaths.',
         'intent must be one of: continue, new_focus, correction, pause, greeting, status.',
         'contextScope must be one of: full, recent, new_focus.',
         'actionHint must be one of: normal, prioritize_latest, respond_only.',
+        'problemTarget must be one of: agent_failure, runtime_replay, tool_evidence, project_feature, user_artifact, unknown.',
         'requiresTools must be false for greeting/pause.',
-        'For status, use requiresTools=false only for pure status questions; if the latest message asks to verify, run, check, test, lint, build, inspect, or modify code, classify as continue with requiresTools=true.',
-        'Examples:',
-        '- "你在干什么" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
-        '- "当前什么状态" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
-        '- "验证当前改动是否健康" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
-        '- "检查一下测试能不能过" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
-        '- "跑一下 lint" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
-        '- "run the tests" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
-        '- "what are you doing" -> {"intent":"status","requiresTools":false,"actionHint":"respond_only"}',
-        '- "check if tests pass" -> {"intent":"continue","requiresTools":true,"actionHint":"normal"}',
+        'Classify the target semantically, not by matching literal phrases. Use agent_failure when the user is asking about the assistant or runtime behavior; runtime_replay when the target is transcript/tool-call replay; tool_evidence when the target is evidence coverage or source support; project_feature when the target is the product or repository feature itself.',
+        'Use status/respond_only only when the user is asking for conversational state or capability information. If the latest message asks to verify, run, check, test, lint, build, inspect, modify, save memory, or call a named tool, keep requiresTools=true.',
+        'Do not include natural-language behavioral instructions in the JSON. The runtime will derive execution policy from the structured fields.',
         `cwd: ${options.cwd}`,
         `recent user history:\n${options.history || '(none)'}`,
         `latest user message:\n${options.latestPrompt}`,
@@ -331,6 +397,7 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
     const requiresTools = typeof raw.requiresTools === 'boolean'
       ? raw.requiresTools
       : actionHint !== 'respond_only'
+    const problemTarget = parseEnum(raw.problemTarget, ['agent_failure', 'runtime_replay', 'tool_evidence', 'project_feature', 'user_artifact', 'unknown'], fallback.problemTarget)
     const explicitPaths = fallback.explicitPaths
     return buildGuidance({
       intent,
@@ -339,8 +406,8 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
       contextScope,
       actionHint,
       requiresTools,
+      problemTarget: reconcileProblemTarget(problemTarget, fallback.problemTarget),
       reason: typeof raw.reason === 'string' && raw.reason.trim() ? raw.reason.trim() : fallback.reason,
-      guidance: typeof raw.guidance === 'string' && raw.guidance.trim() ? raw.guidance.trim() : fallback.guidance,
       latestUserText: fallback.latestUserText,
       explicitPaths,
       source: 'model',
@@ -373,7 +440,107 @@ function buildGuidance(guidance: UserIntentGuidance): UserIntentGuidance {
   return normalizeGuidancePolicy(guidance)
 }
 
+function deriveProblemTarget(options: {
+  latestUserText: string
+  events: NexusEvent[]
+  explicitPaths: string[]
+}): ProblemTarget {
+  const latestScore = scoreProblemTarget(options.latestUserText)
+  const recentUserText = summarizeRecentUserHistory(options.events)
+  const recentTarget = selectProblemTarget(scoreProblemTarget(recentUserText))
+  if (latestScore.problemAnalysis > 0 && recentTarget !== 'unknown' && recentTarget !== 'project_feature') {
+    const directTarget = selectProblemTarget(latestScore)
+    if (directTarget === 'unknown' || directTarget === 'project_feature') return recentTarget
+  }
+
+  const directTarget = selectProblemTarget(latestScore)
+  if (directTarget !== 'unknown') return directTarget
+
+  if (options.explicitPaths.length > 0) return 'user_artifact'
+  return 'unknown'
+}
+
+function reconcileProblemTarget(modelTarget: ProblemTarget, fallbackTarget: ProblemTarget): ProblemTarget {
+  if (fallbackTarget === 'unknown') return modelTarget
+  if (modelTarget === 'unknown') return fallbackTarget
+  if (fallbackTarget === 'agent_failure' && modelTarget === 'project_feature') return fallbackTarget
+  return modelTarget
+}
+
+function deriveTurnPolicy(guidance: UserIntentGuidance): TurnPolicy {
+  const respondOnly = !guidance.requiresTools || guidance.actionHint === 'respond_only'
+  const evidenceTarget = guidance.problemTarget === 'agent_failure' ||
+    guidance.problemTarget === 'runtime_replay' ||
+    guidance.problemTarget === 'tool_evidence'
+
+  let toolMode: TurnPolicy['toolMode'] = 'enabled'
+  if (guidance.intent === 'status' && !guidance.requiresTools && !isMemoryCapabilityQuestion(guidance.latestUserText)) {
+    toolMode = 'available_for_verification'
+  } else if (respondOnly) {
+    toolMode = 'disabled'
+  }
+
+  return {
+    responseMode: respondOnly ? 'direct_answer' : 'execute_task',
+    toolMode,
+    evidenceMode: respondOnly ? 'none' : evidenceTarget ? 'verify_before_claim' : 'standard',
+    staleTaskMode: guidance.contextScope === 'new_focus'
+      ? 'reset'
+      : guidance.actionHint === 'prioritize_latest' || evidenceTarget
+        ? 'background_only'
+        : 'continue',
+  }
+}
+
+function scoreProblemTarget(text: string): TargetScore {
+  const agentSubject = countMarkerMatches(text, PROBLEM_MARKERS.agentSubject)
+  const failure = countMarkerMatches(text, PROBLEM_MARKERS.failure)
+  const runtimeReplay = countMarkerMatches(text, PROBLEM_MARKERS.runtimeReplay)
+  const toolEvidence = countMarkerMatches(text, PROBLEM_MARKERS.toolEvidence)
+  const projectFeature = countMarkerMatches(text, PROBLEM_MARKERS.projectFeature)
+  const problemAnalysis = countMarkerMatches(text, PROBLEM_MARKERS.problemAnalysis)
+
+  return {
+    agentFailure: agentSubject + failure + (agentSubject > 0 && failure > 0 ? 3 : 0),
+    runtimeReplay: runtimeReplay * 2 + (failure > 0 || problemAnalysis > 0 ? 1 : 0),
+    toolEvidence: toolEvidence * 2 + (failure > 0 || problemAnalysis > 0 ? 1 : 0),
+    projectFeature: projectFeature * 2 + (problemAnalysis > 0 ? 1 : 0),
+    problemAnalysis,
+  }
+}
+
+function selectProblemTarget(score: TargetScore): ProblemTarget {
+  const candidates: Array<[ProblemTarget, number]> = [
+    ['runtime_replay', score.runtimeReplay],
+    ['tool_evidence', score.toolEvidence],
+    ['agent_failure', score.agentFailure],
+    ['project_feature', score.projectFeature],
+  ]
+  const [target, value] = candidates.reduce((best, candidate) => candidate[1] > best[1] ? candidate : best)
+  return value >= 3 ? target : 'unknown'
+}
+
+function countMarkerMatches(text: string, markers: readonly RegExp[]): number {
+  return markers.reduce((count, marker) => count + (marker.test(text) ? 1 : 0), 0)
+}
+
 function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
+  if (isMemoryCapabilityQuestion(guidance.latestUserText)) {
+    return {
+      ...guidance,
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
+    }
+  }
+  if (isExplicitMemorySavePrompt(guidance.latestUserText)) {
+    return {
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+    }
+  }
   if (guidance.intent === 'pause') {
     return {
       ...guidance,
@@ -436,6 +603,24 @@ function isStatusPrompt(text: string): boolean {
   if (/你.*(在干什么|正在干什么|还记得|知道我.*问|感知我.*问|听得懂).*[？?!.。！`'"\s]*$/u.test(normalized)) return true
   if (/\b(what are you doing|where are we|what were you doing|do you remember)\b/iu.test(normalized)) return true
   return false
+}
+
+export function isMemoryCapabilityQuestion(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  const asksCapability = /\b(can you|could you|are you able to|do you have|is .*available)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
+    /\b(memory|remember|long[- ]term memory)\b.*\b(available|enabled|write|save)\b/iu.test(normalized) ||
+    /(能否|能不能|可以|可否|是否|有没有|具备).*(写入|保存|记忆|长期记忆)/u.test(text) ||
+    /(记忆|长期记忆).*(能否|能不能|可以|可否|是否|有没有|具备|可用|启用)/u.test(text)
+  if (!asksCapability) return false
+  return !/\b(memory_save_note|remember this|save this to memory|save to memory|remember:|remember that)\b/iu.test(normalized) &&
+    !/(请|帮我|立即|现在|把|将).*(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
+}
+
+function isExplicitMemorySavePrompt(text: string): boolean {
+  if (isMemoryCapabilityQuestion(text)) return false
+  const normalized = text.trim().toLowerCase()
+  return /\b(memory_save_note|remember this|save (?:this )?(?:to )?(?:long[- ]term )?memory|remember:|remember that)\b/iu.test(normalized) ||
+    /(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
 }
 
 function isPausePrompt(text: string): boolean {

@@ -256,9 +256,11 @@ function buildContextUsageSegments(analysis: ContextAnalysis): ContextUsageSegme
 function buildDiagnosticRows(analysis: ContextAnalysis): string[] {
   const usage = analysis.diagnostics.usageSummary
   const cache = analysis.diagnostics.cacheEconomics
+  const scope = analysis.diagnostics.taskScope
   const diagnosticRows = [
     `remaining ${formatTokenCount(analysis.diagnostics.remainingTokens)} (${analysis.diagnostics.remainingPercent}%) · compact headroom ${formatTokenCount(analysis.diagnostics.compactRemainingTokens)} · blocking headroom ${formatTokenCount(analysis.diagnostics.blockingRemainingTokens)}`,
     `assembled events selected=${analysis.sections.selectedEventCount} omitted=${analysis.sections.omittedEventCount} snipped=${analysis.sections.snippedEventCount} microcompacted=${analysis.sections.microcompactedEventCount}`,
+    `task scope mode=${scope.mode} primary=${scope.primaryRoot} explicit=${scope.explicitRoots.length} confirmedExternal=${scope.confirmedExternalRoots.length} pendingBoundaries=${scope.pendingBoundaries.length} outOfScopeEvidence=${scope.outOfScopeEvidence.length}`,
     `usage input=${formatTokenCompact(usage.inputTokens)} cached=${formatTokenCompact(usage.cacheReadInputTokens)} output=${formatTokenCompact(usage.outputTokens)} reasoning≈${formatTokenCompact(usage.estimatedReasoningTokens)}`,
     `cache policy read=${formatPercent(cache.cacheReadRatio, 1)} cacheable=${formatPercent(cache.cacheableSystemPromptRatio, 1)} · preserving=${yesNo(cache.cachePreservationMode)} long-context=${yesNo(cache.longContextUtilizationMode)} · ceiling ${formatTokenCompact(cache.effectiveContextCeiling)}/${formatTokenCompact(cache.legacyContextCeiling)} legacy`,
     `ceiling source=${cache.policySource} model.window=${formatTokenCompact(cache.modelContextWindow)} reserved_output=${formatTokenCompact(cache.reservedOutputTokens)} provider_buffer=${formatTokenCompact(cache.providerSafetyBufferTokens)}${cache.envMaxContextTokens !== undefined ? ` env_cap=${formatTokenCompact(cache.envMaxContextTokens)}` : ''}`,
@@ -295,6 +297,17 @@ function buildDiagnosticRows(analysis: ContextAnalysis): string[] {
   if (analysis.diagnostics.workingSetPaths.length > 0) {
     const paths = analysis.diagnostics.workingSetPaths.slice(0, 3).map(entry => `${entry.path}×${entry.touches}`)
     diagnosticRows.push(`working set paths ${paths.join(', ')}`)
+  }
+  if (scope.confirmedExternalRoots.length > 0) {
+    diagnosticRows.push(`confirmed external roots ${scope.confirmedExternalRoots.slice(0, 3).join(', ')}`)
+  }
+  if (scope.pendingBoundaries.length > 0) {
+    const boundary = scope.pendingBoundaries[0]!
+    diagnosticRows.push(`pending scope boundary ${boundary.boundaryKind} target=${boundary.targetRoot} tool=${boundary.toolName}`)
+  }
+  if (scope.outOfScopeEvidence.length > 0) {
+    const evidence = scope.outOfScopeEvidence[0]!
+    diagnosticRows.push(`out-of-scope evidence ${evidence.toolName}:${evidence.toolUseId} target=${evidence.targetRoot}`)
   }
   if (analysis.diagnostics.resumeRecovery.active) {
     diagnosticRows.push(`resume recovery boundary ${analysis.diagnostics.resumeRecovery.code} · ${analysis.diagnostics.resumeRecovery.message}`)

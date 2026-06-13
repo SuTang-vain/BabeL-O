@@ -346,6 +346,53 @@ describe('Model Adapters & Factory', () => {
       assert.strictEqual(headers['anthropic-beta'], undefined)
     })
 
+    test('rejects orphan Anthropic-compatible tool_result before fetch', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      await assert.rejects(
+        async () => {
+          await collectStream(adapter.queryStream({
+            model: 'minimax/MiniMax-M3',
+            messages: [{
+              role: 'user',
+              content: [{ type: 'tool_result', toolUseId: 'call_missing', content: 'orphan' }],
+            }],
+          }))
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result call_missing/,
+      )
+      assert.equal(lastFetchInit, undefined)
+    })
+
+    test('rejects duplicate Anthropic-compatible tool_result before fetch', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      await assert.rejects(
+        async () => {
+          await collectStream(adapter.queryStream({
+            model: 'minimax/MiniMax-M3',
+            messages: [
+              {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'call_dup', name: 'Read', input: { path: 'README.md' } }],
+              },
+              {
+                role: 'user',
+                content: [
+                  { type: 'tool_result', toolUseId: 'call_dup', content: 'one' },
+                  { type: 'tool_result', toolUseId: 'call_dup', content: 'two' },
+                ],
+              },
+            ],
+          }))
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result call_dup/,
+      )
+      assert.equal(lastFetchInit, undefined)
+    })
+
     test('minimax text-encoded tool calls are normalized instead of streamed as text', async () => {
       const adapter = new AnthropicAdapter()
       mockResponseBody = createMockStream([
@@ -749,6 +796,28 @@ describe('Model Adapters & Factory', () => {
       )
       body = JSON.parse(lastFetchInit?.body as string)
       assert.strictEqual(body.messages[1].reasoning_content, undefined)
+    })
+
+    test('rejects orphan tool_result before OpenAI-compatible fetch', async () => {
+      const adapter = new OpenAIAdapter()
+      await assert.rejects(
+        async () => {
+          for await (const _chunk of adapter.queryStream({
+            model: 'openai/gpt-4o',
+            messages: [
+              { role: 'user', content: 'continue' },
+              {
+                role: 'user',
+                content: [
+                  { type: 'tool_result', toolUseId: 'missing-call', content: 'orphan result' },
+                ],
+              },
+            ],
+          })) {}
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result missing-call/,
+      )
+      assert.equal(lastFetchUrl, undefined)
     })
   })
 })

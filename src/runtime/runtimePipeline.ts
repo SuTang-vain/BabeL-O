@@ -26,6 +26,7 @@ import type { UserIntentGuidance } from './intentGuidance.js'
 import { buildProviderFallbackPolicy } from './providerRecovery.js'
 import { estimateContextTokens, getContextWindowState, type ContextWindowState } from './tokenEstimator.js'
 import type { MicrocompactMetrics } from './compactors/microCompact.js'
+import type { ReadFileCacheEntry } from './runtimeToolLoop.js'
 
 export type LocalRuntimeParsedIntent =
   | { kind: 'tool'; toolName: string; input: unknown }
@@ -88,12 +89,18 @@ export type ToolCallTextLeakSuppression = {
   redactedPreview: string
 }
 
+export type MemoryCapabilityAnswerLeakSuppression = {
+  pattern: string
+  redactedPreview: string
+}
+
 export type RuntimeProviderTurn = {
   assistantText: string
   reasoningText: string
   finishReason?: FinishReason
   toolCalls: RuntimeProviderToolCall[]
   toolCallTextLeakSuppression?: ToolCallTextLeakSuppression
+  memoryCapabilityAnswerLeakSuppression?: MemoryCapabilityAnswerLeakSuppression
   durationMs: number
   turnFirstTokenMs?: number
   providerFirstTokenMs?: number
@@ -108,7 +115,7 @@ export function resolveProviderToolCallInput(toolCall: RuntimeProviderToolCall):
   try {
     return JSON.parse(toolCall.partialInput)
   } catch {
-    return {}
+    return { _parseError: true, _rawInput: toolCall.partialInput.slice(0, 500) }
   }
 }
 
@@ -1249,7 +1256,7 @@ export type RuntimeProviderLoopRequestState = RuntimeProviderLoopState & {
 export function buildProviderLoopRequestState(options: {
   loopCount: number
   maxLoops: number
-  readFileCache: Map<string, { mtime: number; size: number }>
+  readFileCache: Map<string, ReadFileCacheEntry>
   toolCallCount: number
   systemPrompt: string
   messages: ModelMessage[]
@@ -1388,7 +1395,7 @@ function hasRecentProviderContextError(events: NexusEvent[]): boolean {
 export function buildProviderLoopState(options: {
   loopCount: number
   maxLoops: number
-  readFileCache: Map<string, { mtime: number; size: number }>
+  readFileCache: Map<string, ReadFileCacheEntry>
   toolCallCount: number
   contextTokenEstimate: number
   contextMaxTokens: number
@@ -1453,7 +1460,7 @@ export function countRuntimeTurnContextChars(options: {
 export function buildRuntimeExecutionStateBlock(state: {
   loopCount: number
   maxLoops: number
-  readFileCache: Map<string, { mtime: number; size: number }>
+  readFileCache: Map<string, ReadFileCacheEntry>
   toolCallCount: number
   contextTokenEstimate: number
   contextMaxTokens: number
@@ -1575,6 +1582,7 @@ export async function* streamProviderTurn(options: {
   executionStartMs?: number
   queryStartMs?: number
   toolCallTextLeakGuard?: { phase: ToolCallTextLeakPhase }
+  memoryCapabilityAnswerLeakGuard?: boolean
 }): AsyncGenerator<NexusEvent, RuntimeProviderTurn> {
   const queryStartMs = options.queryStartMs ?? performance.now()
   let assistantText = ''
@@ -1592,7 +1600,9 @@ export async function* streamProviderTurn(options: {
   }
   const toolCalls: RuntimeProviderToolCall[] = []
   let textLeakSuppression: ToolCallTextLeakSuppression | undefined
+  let memoryCapabilityAnswerLeakSuppression: MemoryCapabilityAnswerLeakSuppression | undefined
   let guardedTextBuffer = ''
+  let memoryCapabilityAnswerBuffer = ''
 
   const markFirstToken = () => {
     if (turnFirstTokenMs !== undefined) return
@@ -1612,6 +1622,10 @@ export async function* streamProviderTurn(options: {
       markFirstToken()
       streamDeltaCount += 1
       charsOut += delta.text.length
+      if (options.memoryCapabilityAnswerLeakGuard) {
+        memoryCapabilityAnswerBuffer += delta.text
+        continue
+      }
       if (options.toolCallTextLeakGuard) {
         guardedTextBuffer += delta.text
         const leak = detectToolCallTextLeak(guardedTextBuffer, options.toolCallTextLeakGuard.phase)
@@ -1672,7 +1686,17 @@ export async function* streamProviderTurn(options: {
     }
   }
 
-  if (options.toolCallTextLeakGuard && guardedTextBuffer && !textLeakSuppression) {
+  if (options.memoryCapabilityAnswerLeakGuard && memoryCapabilityAnswerBuffer) {
+    memoryCapabilityAnswerLeakSuppression = detectMemoryCapabilityAnswerLeak(memoryCapabilityAnswerBuffer)
+    if (!memoryCapabilityAnswerLeakSuppression) {
+      assistantText += memoryCapabilityAnswerBuffer
+      yield {
+        type: 'assistant_delta',
+        ...eventBase(options.sessionId),
+        text: memoryCapabilityAnswerBuffer,
+      }
+    }
+  } else if (options.toolCallTextLeakGuard && guardedTextBuffer && !textLeakSuppression) {
     assistantText += guardedTextBuffer
     yield {
       type: 'assistant_delta',
@@ -1687,6 +1711,7 @@ export async function* streamProviderTurn(options: {
     finishReason,
     toolCalls,
     toolCallTextLeakSuppression: textLeakSuppression,
+    memoryCapabilityAnswerLeakSuppression,
     durationMs: performance.now() - queryStartMs,
     turnFirstTokenMs,
     providerFirstTokenMs,
@@ -1724,6 +1749,22 @@ function redactToolCallTextPreview(text: string): string {
     .replace(/"arguments"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"arguments":"[REDACTED]"')
     .replace(/"command"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"command":"[REDACTED]"')
     .slice(0, 300)
+}
+
+function detectMemoryCapabilityAnswerLeak(text: string): MemoryCapabilityAnswerLeakSuppression | undefined {
+  const patterns: Array<[string, RegExp]> = [
+    ['source_path', /\b(?:src|test|docs)\/[A-Za-z0-9_./-]+/u],
+    ['commit_hash', /\b[0-9a-f]{7,40}\b/iu],
+    ['hidden_prompt', /\b(hidden prompt|system prompt|provider-visible|provider prompt|内通|隐藏提示)\b/iu],
+    ['mcp_sidecar_internal', /\b(MCP|sidecar|MemoryProvider|EverCoreMemoryProvider|configureEverCoreFromEnv|memory_save_note)\b/u],
+    ['secret_like', /\b(API key|apiKey|secret|token|provider key)\b/iu],
+  ]
+  const hit = patterns.find(([, pattern]) => pattern.test(text))
+  if (!hit) return undefined
+  return {
+    pattern: hit[0],
+    redactedPreview: text.slice(0, 300),
+  }
 }
 
 function isSupportedTaskUpdateStatus(status: string | undefined): status is 'pending' | 'in_progress' | 'completed' | 'failed' {

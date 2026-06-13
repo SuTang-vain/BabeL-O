@@ -77,7 +77,7 @@ func init() {
 				// body would require it to be fully built first).
 				names := []string{
 					"/help", "/config", "/profile", "/clear", "/exit",
-					"/context", "/compact", "/inbox", "/model", "/models", "/tool", "/tools",
+					"/context", "/compact", "/memory", "/inbox", "/model", "/models", "/tool", "/tools",
 					"/session", "/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
 					"/write", "/edit",
 				}
@@ -156,6 +156,52 @@ func init() {
 				}
 				m.appendLine("status", "compacting shared Nexus context: "+shortID(m.sessionID))
 				return triggerCompact(m.cfg, m.sessionID)
+			},
+		},
+		{
+			name:    "/memory",
+			summary: "open long-term memory status/actions overlay",
+			hasArgs: true,
+			argHint: "[status|search <query>|candidates|save <note>|flush|restart]",
+			run: func(m *model, args []string) tea.Cmd {
+				if len(args) == 0 || args[0] == "status" {
+					m.appendLine("status", "loading shared Nexus memory status")
+					return fetchMemoryStatus(m.cfg)
+				}
+				sub := args[0]
+				rest := strings.TrimSpace(strings.Join(args[1:], " "))
+				switch sub {
+				case "search":
+					if rest == "" {
+						m.appendLine("error", "/memory search requires a query")
+						return nil
+					}
+					m.appendLine("status", "searching shared Nexus memory")
+					return fetchMemorySearch(m.cfg, rest)
+				case "candidates":
+					m.appendLine("status", "loading shared Nexus memory candidates")
+					return fetchMemoryCandidates(m.cfg, m.sessionID)
+				case "save":
+					if rest == "" {
+						m.appendLine("error", "/memory save requires a note")
+						return nil
+					}
+					m.appendLine("status", "requesting memory save approval envelope")
+					return requestMemorySaveNote(m.cfg, rest, m.sessionID)
+				case "flush":
+					if m.sessionID == "" {
+						m.appendLine("error", "/memory flush requires an active session")
+						return nil
+					}
+					m.appendLine("status", "requesting memory flush approval envelope")
+					return requestMemoryFlush(m.cfg, m.sessionID)
+				case "restart":
+					m.appendLine("status", "requesting memory restart approval envelope")
+					return requestMemoryRestart(m.cfg)
+				default:
+					m.appendLine("error", "unknown /memory sub-command: "+sub+" (supported: status, search <query>, candidates, save <note>, flush, restart)")
+					return nil
+				}
 			},
 		},
 		{

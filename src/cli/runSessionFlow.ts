@@ -163,7 +163,7 @@ export async function runSessionFlow(
     fs.mkdirSync(DEFAULT_CONFIG_DIR, { recursive: true })
     const storagePath = path.join(DEFAULT_CONFIG_DIR, 'db.sqlite')
     const { createDefaultNexusRuntime } = await import('../nexus/createRuntime.js')
-    const { configureEverCoreFromEnv } = await import('../nexus/everCoreConfig.js')
+    const { defaultEverCoreRuntimeManager } = await import('../nexus/everCoreRuntimeManager.js')
     const {
       assertAgentRemoteExecutionReady,
       assertRemoteRunnerReady,
@@ -176,7 +176,7 @@ export async function runSessionFlow(
     assertAgentRemoteExecutionReady(agentExecutionEnvironment, remoteRunner.status)
     const configManager = ConfigManager.getInstance()
     const providerSettings = configManager.resolveSettings()
-    const everCore = await configureEverCoreFromEnv(process.env, { cwd, providerSettings })
+    const everCore = await defaultEverCoreRuntimeManager.acquireFromEnv(process.env, { cwd, providerSettings })
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath,
       allowedTools: ['*'],
@@ -307,6 +307,7 @@ export async function runSessionFlow(
         await storage.saveSession(finalSession)
       }
       await storage.close?.()
+      await defaultEverCoreRuntimeManager.shutdown()
     }
     PendingPermissionRegistry.getInstance().resolveSession(sessionId, {
       approved: false,

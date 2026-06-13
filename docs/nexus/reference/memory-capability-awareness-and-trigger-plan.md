@@ -94,6 +94,8 @@ memory_flush_session
 
 ## Phase G1 — Memory Capability Block
 
+Status: implemented and verified.
+
 ### 目标
 
 当 EverCore healthy 且 MemoryProvider 可用时，在 provider-visible context 中注入一个短小、非 cacheable 的 capability block。
@@ -146,6 +148,8 @@ Recent messages
 - EverCore disabled/unhealthy 时 block 不出现。
 
 ## Phase G2 — Tool Description and Trigger Policy
+
+Status: implemented and verified.
 
 ### 目标
 
@@ -212,6 +216,8 @@ flow requires it. Normal session-end upload/flush is runtime-owned.
 
 ## Phase G3 — Memory Candidate Governance
 
+Status: implemented and verified.
+
 ### 目标
 
 把“模型觉得值得记住”的内容先转成可审查 candidate，而不是直接写入长期记忆。
@@ -268,6 +274,8 @@ Channel handoff:
 - Context / inbox rendering 能显示 review-only 状态。
 
 ## Phase G4 — Runtime Auto-Search Policy
+
+Status: implemented and verified.
 
 ### 目标
 
@@ -367,6 +375,16 @@ Expected: write is blocked or converted to review-only candidate
 
 ## Phase G6 — Live Validation
 
+Status: implemented and verified with managed EverCore.
+
+Validation notes:
+
+- Live run used current MiniMax `anthropic-compatible` provider for BabeL-O and EverOS text LLM.
+- A local OpenAI-compatible embedding stub was used only to enable EverOS cascade/LanceDB indexing in the managed test environment; without embedding config, EverOS writes markdown but keyword search has no indexed rows.
+- `memory_save_note` is permission-gated and scoped to the current runtime session; the model-visible schema exposes only `note` so providers cannot override the session id.
+- Runtime auto-search recall returned the remembered `regression-first fixes` preference as a long-term memory hint, not workspace fact.
+- Project-fact caution turn preserved the rule that EverCore memory is volatile background context and current workspace evidence remains authoritative.
+
 ### Turn 1: Save
 
 ```text
@@ -429,29 +447,28 @@ docs/nexus/WORK_LOG.md
 
 ## Recommended Next Slice
 
-Phase G1-G4 now have a minimal verified implementation:
+Status: closed.
+
+Phase G1-G6 are implemented and verified:
 
 ```text
-1. Provider-visible Memory Capability block is injected when MemoryProvider is enabled.
-2. EverCore MCP tool descriptions carry search/save/flush trigger policy.
-3. SessionChannel memory_candidate messages produce review-only governance metadata.
-4. Runtime EverCore auto-search uses lightweight cue heuristics and skip diagnostics.
-5. memory_save_note remains permission-gated; memory_flush_session remains runtime-owned by default.
+1. Provider-visible Memory Capability block is injected when MemoryProvider is enabled and omitted when EverCore is disabled/unhealthy.
+2. EverCore MCP tool descriptions carry search/save/flush trigger policy and preserve read/write/lifecycle boundaries.
+3. SessionChannel memory_candidate messages produce review-only governance metadata with autoWrite=false.
+4. Runtime EverCore auto-search uses lightweight cue heuristics, skip diagnostics, and volatile/non-cacheable memory hints.
+5. Mock provider regression covers memory_search self-trigger and memory_save_note permission gate.
+6. Live managed EverCore validation covers save/recall/project-fact caution with memory as hint, not workspace fact.
 ```
 
-Next, implement Phase G6:
+The follow-up lifecycle/cache/UI/answer-governance plan is also closed: [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md) has L1/L2/L3/L4/L5/L6 implemented and verified (process cache, registry reuse, idle TTL, `/memory` status/actions, and memory capability answer leakage guard).
 
-```text
-1. Run live save/recall validation with managed EverCore after approval.
-2. Verify recall uses memory hints as remembered preference, not workspace fact.
-3. Verify stale/project facts are guarded by workspace evidence and user approval.
-4. Keep memory_save_note permission-gated and memory_flush_session runtime-owned.
-```
+Future work remains regression-first and focused: reopen a targeted item only if real usage exposes memory-trigger drift, indexing/cascade drift, permission-gate drift, stale-memory overclaiming, capability-answer leakage, managed sidecar lifecycle churn, or repeated recall-query network overhead. Layer D search short cache remains intentionally disabled until such evidence appears.
 
-## Open Questions
+## Closed Decisions
 
-- Should memory capability be injected by `MemoryProvider` diagnostics or by a separate `RuntimeCapabilityProvider`?
-- Should memory search auto-trigger happen before or after user prompt hooks?
-- Should save candidates be represented as `SessionMessage` `memory_candidate` or a dedicated event type?
-- Should memory_search be visible when EverCore is healthy but `BABEL_O_ENABLE_EVERCORE_MCP_TOOLS` is not enabled?
-- Should Go TUI expose a memory availability indicator in status line / runtime status panel?
+- Memory capability is exposed through context assembly / MemoryProvider diagnostics rather than a separate broad `RuntimeCapabilityProvider`.
+- Runtime auto-search is cue-driven and happens in the MemoryProvider path; skipped turns record diagnostics without polluting provider-visible context.
+- Memory candidates are represented as SessionChannel `SessionMessage` entries with type `memory_candidate` and review-only governance metadata; there is no automatic EverCore write.
+- Provider-visible `mcp:evercore:*` tools remain opt-in via `BABEL_O_ENABLE_EVERCORE_MCP_TOOLS`; runtime-owned `/memory` APIs and Go TUI panel are separate management surfaces.
+- Go TUI exposes `/memory` as a full-screen management overlay with status/search/candidates/action envelopes; status-line availability indicator remains watch-only rather than a required part of this plan.
+- Managed warm sidecar reuse, `/memory` panel/actions, and memory capability answer governance are closed in [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md).

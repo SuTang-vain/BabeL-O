@@ -55,8 +55,9 @@ export const UserIntakeGuidanceEventSchema = z.object({
   contextScope: z.enum(['full', 'recent', 'new_focus']),
   actionHint: z.enum(['normal', 'prioritize_latest', 'respond_only']),
   requiresTools: z.boolean(),
+  problemTarget: z.enum(['agent_failure', 'runtime_replay', 'tool_evidence', 'project_feature', 'user_artifact', 'unknown']).optional(),
   reason: z.string(),
-  guidance: z.string(),
+  guidance: z.string().optional(),
   explicitPaths: z.array(z.string()).default([]),
   source: z.enum(['model', 'fallback']),
 })

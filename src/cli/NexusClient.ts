@@ -30,6 +30,57 @@ export class NexusClient {
     return this.getJson('/v1/runtime/status')
   }
 
+  async memoryStatus(): Promise<unknown> {
+    return this.getJson('/v1/runtime/memory/status')
+  }
+
+  async memorySearch(body: {
+    query: string
+    topK?: number
+    method?: 'keyword' | 'vector' | 'hybrid' | 'agentic'
+    maxChars?: number
+    maxHitChars?: number
+  }): Promise<unknown> {
+    return this.postJson('/v1/runtime/memory/search', body)
+  }
+
+  async memoryCandidates(options: { sessionId?: string; limit?: number; includeRejected?: boolean } = {}): Promise<unknown> {
+    const params = new URLSearchParams()
+    if (options.sessionId) params.set('sessionId', options.sessionId)
+    if (options.limit !== undefined) params.set('limit', String(options.limit))
+    if (options.includeRejected !== undefined) params.set('includeRejected', String(options.includeRejected))
+    const query = params.size > 0 ? `?${params}` : ''
+    return this.getJson(`/v1/runtime/memory/candidates${query}`)
+  }
+
+  async memorySaveNote(body: {
+    note: string
+    sessionId?: string
+    candidateMessageId?: string
+    approved?: boolean
+    confirmation?: string
+    reason?: string
+  }): Promise<unknown> {
+    return this.postJson('/v1/runtime/memory/save-note', body)
+  }
+
+  async memoryFlush(body: {
+    sessionId: string
+    approved?: boolean
+    confirmation?: string
+    reason?: string
+  }): Promise<unknown> {
+    return this.postJson('/v1/runtime/memory/flush', body)
+  }
+
+  async memoryRestart(body: {
+    approved?: boolean
+    confirmation?: string
+    reason?: string
+  } = {}): Promise<unknown> {
+    return this.postJson('/v1/runtime/memory/restart', body)
+  }
+
   async providerSmoke(options: {
     model?: string
     role?: string

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { dirname } from 'node:path'
 import { mkdirSync } from 'node:fs'
@@ -115,7 +116,7 @@ export class SqliteStorage implements NexusStorage {
            ORDER BY updated_at DESC, session_id ASC
            LIMIT ?
          )
-         ORDER BY s.updated_at DESC, s.session_id ASC, e.timestamp ASC, e.event_key ASC`,
+         ORDER BY s.updated_at DESC, s.session_id ASC, e.event_seq ASC, e.event_key ASC`,
       )
       .all(limit) as Row[]
 
@@ -186,20 +187,21 @@ export class SqliteStorage implements NexusStorage {
     const order = options.order ?? 'asc'
     const comparison = order === 'asc' ? '>' : '<'
     const direction = order === 'asc' ? 'ASC' : 'DESC'
+    const cursor = Number(options.cursor ?? 0)
     const rows = options.cursor
       ? (this.db
           .prepare(
-            `SELECT event_key, event_json FROM events
-             WHERE session_id = ? AND event_key ${comparison} ?
-             ORDER BY event_key ${direction}
+            `SELECT event_seq, event_json FROM events
+             WHERE session_id = ? AND event_seq ${comparison} ?
+             ORDER BY event_seq ${direction}, event_key ${direction}
              LIMIT ?`,
           )
-          .all(sessionId, options.cursor, limit + 1) as Row[])
+          .all(sessionId, Number.isFinite(cursor) ? cursor : 0, limit + 1) as Row[])
       : (this.db
           .prepare(
-            `SELECT event_key, event_json FROM events
+            `SELECT event_seq, event_json FROM events
              WHERE session_id = ?
-             ORDER BY event_key ${direction}
+             ORDER BY event_seq ${direction}, event_key ${direction}
              LIMIT ?`,
           )
           .all(sessionId, limit + 1) as Row[])
@@ -208,31 +210,12 @@ export class SqliteStorage implements NexusStorage {
     return {
       events: page.map(row => JSON.parse(String(row.event_json)) as NexusEvent),
       nextCursor:
-        rows.length > limit ? String(page.at(-1)?.event_key ?? '') : undefined,
+        rows.length > limit ? String(page.at(-1)?.event_seq ?? '') : undefined,
     }
   }
 
   async appendEvent(sessionId: string, event: NexusEvent): Promise<void> {
-    const eventKey = `${sessionId}:${event.timestamp}:${event.type}:${eventIndexPayload(event)}`
-    this.db
-      .prepare(
-        `INSERT OR IGNORE INTO events (
-          event_key, session_id, timestamp, event_type, event_json
-        ) VALUES (
-          :eventKey, :sessionId, :timestamp, :eventType, :eventJson
-        )`,
-      )
-      .run({
-        eventKey,
-        sessionId,
-        timestamp: event.timestamp,
-        eventType: event.type,
-        eventJson: JSON.stringify(event),
-      })
-
-    this.db
-      .prepare(`UPDATE sessions SET updated_at = ? WHERE session_id = ?`)
-      .run(event.timestamp, sessionId)
+    this.appendEventRowWithSequence(sessionId, event)
 
     if (event.type === 'session_started') {
       this.db
@@ -269,6 +252,54 @@ export class SqliteStorage implements NexusStorage {
     const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
     if (embeddedMetrics) {
       await this.saveExecutionMetrics(embeddedMetrics)
+    }
+  }
+
+  private appendEventRowWithSequence(sessionId: string, event: NexusEvent): void {
+    this.db.exec('BEGIN IMMEDIATE')
+    let committed = false
+    try {
+      const eventJson = JSON.stringify(event)
+      const duplicateRow = this.db
+        .prepare(`SELECT event_seq FROM events WHERE session_id = ? AND timestamp = ? AND event_type = ? AND event_json = ? LIMIT 1`)
+        .get(sessionId, event.timestamp, event.type, eventJson) as Row | undefined
+      if (!duplicateRow) {
+        const eventSeqRow = this.db
+          .prepare(`SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq FROM events WHERE session_id = ?`)
+          .get(sessionId) as Row | undefined
+        const eventSeq = Number(eventSeqRow?.next_seq ?? 1)
+        const eventKey = sequencedEventKey(sessionId, eventSeq, eventJson, event)
+        this.db
+          .prepare(
+            `INSERT INTO events (
+              event_key, session_id, timestamp, event_type, event_json, event_seq
+            ) VALUES (
+              :eventKey, :sessionId, :timestamp, :eventType, :eventJson, :eventSeq
+            )`,
+          )
+          .run({
+            eventKey,
+            sessionId,
+            timestamp: event.timestamp,
+            eventType: event.type,
+            eventJson,
+            eventSeq,
+          })
+      }
+
+      this.db
+        .prepare(`UPDATE sessions SET updated_at = ? WHERE session_id = ?`)
+        .run(event.timestamp, sessionId)
+
+      this.db.exec('COMMIT')
+      committed = true
+    } catch (error) {
+      if (!committed) {
+        try {
+          this.db.exec('ROLLBACK')
+        } catch {}
+      }
+      throw error
     }
   }
 
@@ -703,7 +734,8 @@ export class SqliteStorage implements NexusStorage {
           session_id TEXT NOT NULL,
           timestamp TEXT NOT NULL,
           event_type TEXT NOT NULL,
-          event_json TEXT NOT NULL
+          event_json TEXT NOT NULL,
+          event_seq INTEGER
         );
 
         CREATE INDEX IF NOT EXISTS events_session_timestamp_idx
@@ -711,6 +743,13 @@ export class SqliteStorage implements NexusStorage {
 
         CREATE INDEX IF NOT EXISTS events_session_key_idx
           ON events(session_id, event_key ASC);
+
+        CREATE INDEX IF NOT EXISTS events_session_seq_idx
+          ON events(session_id, event_seq ASC);
+
+        CREATE UNIQUE INDEX IF NOT EXISTS events_session_event_seq_unique
+          ON events(session_id, event_seq)
+          WHERE event_seq IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS tasks (
           task_id TEXT PRIMARY KEY,
@@ -786,6 +825,8 @@ export class SqliteStorage implements NexusStorage {
           this.db.exec(`ALTER TABLE tasks ADD COLUMN ${col.name} ${col.type}`)
         }
       }
+
+      this.ensureEventSequenceSchema()
 
       this.db.exec('PRAGMA user_version = 1;')
       version = 1
@@ -994,6 +1035,135 @@ export class SqliteStorage implements NexusStorage {
           ON session_messages(created_at ASC, message_id ASC);
       `)
       this.db.exec('PRAGMA user_version = 11;')
+      version = 11
+    }
+
+    if (version < 12) {
+      this.ensureEventSequenceSchema()
+      this.db.exec('PRAGMA user_version = 12;')
+      version = 12
+    }
+
+    if (version < 13) {
+      this.ensureEventSequenceSchema()
+      this.db.exec('PRAGMA user_version = 13;')
+      version = 13
+    }
+  }
+
+  private ensureEventSequenceSchema(): void {
+    const eventColumns = (this.db.prepare(`PRAGMA table_info(events)`).all() as Row[]).map(r => String(r.name))
+    if (!eventColumns.includes('event_seq')) {
+      this.db.exec(`ALTER TABLE events ADD COLUMN event_seq INTEGER`)
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS events_session_seq_idx
+        ON events(session_id, event_seq ASC);
+    `)
+    this.backfillEventSequence()
+    this.repairDuplicateEventSequences()
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS events_session_event_seq_unique
+        ON events(session_id, event_seq)
+        WHERE event_seq IS NOT NULL;
+    `)
+  }
+
+  private backfillEventSequence(): void {
+    const sessions = this.db
+      .prepare(`SELECT DISTINCT session_id FROM events WHERE event_seq IS NULL ORDER BY session_id ASC`)
+      .all() as Row[]
+    if (sessions.length === 0) return
+
+    const selectRows = this.db.prepare(`
+      SELECT event_key FROM events
+      WHERE session_id = ? AND event_seq IS NULL
+      ORDER BY timestamp ASC,
+        CASE event_type
+          WHEN 'session_started' THEN 10
+          WHEN 'user_message' THEN 20
+          WHEN 'user_intake_guidance' THEN 30
+          WHEN 'task_scope_declared' THEN 40
+          WHEN 'assistant_delta' THEN 50
+          WHEN 'thinking_delta' THEN 55
+          WHEN 'tool_started' THEN 60
+          WHEN 'permission_request' THEN 70
+          WHEN 'permission_response' THEN 80
+          WHEN 'tool_completed' THEN 90
+          WHEN 'context_grounding_confirmed' THEN 100
+          WHEN 'result' THEN 200
+          WHEN 'error' THEN 210
+          ELSE 150
+        END ASC,
+        event_key ASC
+    `)
+    const maxSeqStmt = this.db.prepare(`SELECT COALESCE(MAX(event_seq), 0) AS max_seq FROM events WHERE session_id = ?`)
+    const updateStmt = this.db.prepare(`UPDATE events SET event_seq = ? WHERE event_key = ?`)
+    this.db.exec('BEGIN')
+    try {
+      for (const sessionId of sessions.map(row => String(row.session_id))) {
+        const maxRow = maxSeqStmt.get(sessionId) as Row | undefined
+        let seq = Number(maxRow?.max_seq ?? 0)
+        const rows = selectRows.all(sessionId) as Row[]
+        for (const row of rows) {
+          seq += 1
+          updateStmt.run(seq, String(row.event_key))
+        }
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  private repairDuplicateEventSequences(): void {
+    const sessions = this.db
+      .prepare(`SELECT session_id FROM events WHERE event_seq IS NOT NULL GROUP BY session_id, event_seq HAVING COUNT(*) > 1`)
+      .all() as Row[]
+    const sessionIds = Array.from(new Set(sessions.map(row => String(row.session_id))))
+    if (sessionIds.length === 0) return
+
+    const selectRows = this.db.prepare(`
+      SELECT event_key FROM events
+      WHERE session_id = ?
+      ORDER BY event_seq ASC,
+        timestamp ASC,
+        CASE event_type
+          WHEN 'session_started' THEN 10
+          WHEN 'user_message' THEN 20
+          WHEN 'user_intake_guidance' THEN 30
+          WHEN 'task_scope_declared' THEN 40
+          WHEN 'assistant_delta' THEN 50
+          WHEN 'thinking_delta' THEN 55
+          WHEN 'tool_started' THEN 60
+          WHEN 'permission_request' THEN 70
+          WHEN 'permission_response' THEN 80
+          WHEN 'tool_completed' THEN 90
+          WHEN 'context_grounding_confirmed' THEN 100
+          WHEN 'result' THEN 200
+          WHEN 'error' THEN 210
+          ELSE 150
+        END ASC,
+        event_key ASC
+    `)
+    const clearStmt = this.db.prepare(`UPDATE events SET event_seq = NULL WHERE session_id = ?`)
+    const updateStmt = this.db.prepare(`UPDATE events SET event_seq = ? WHERE event_key = ?`)
+    this.db.exec('BEGIN')
+    try {
+      for (const sessionId of sessionIds) {
+        const rows = selectRows.all(sessionId) as Row[]
+        clearStmt.run(sessionId)
+        let seq = 0
+        for (const row of rows) {
+          seq += 1
+          updateStmt.run(seq, String(row.event_key))
+        }
+      }
+      this.db.exec('COMMIT')
+    } catch (error) {
+      this.db.exec('ROLLBACK')
+      throw error
     }
   }
 
@@ -1006,7 +1176,7 @@ export class SqliteStorage implements NexusStorage {
       .prepare(
         `SELECT event_json FROM events
          WHERE session_id = ?
-         ORDER BY timestamp ASC, event_key ASC`,
+         ORDER BY event_seq ASC, event_key ASC`,
       )
       .all(sessionId) as Row[]
     return rows.map(row => JSON.parse(String(row.event_json)) as NexusEvent)
@@ -1315,6 +1485,11 @@ function rowToTask(row: Row): NexusTask {
 
 function nullableString(value: unknown): string | undefined {
   return value === null || value === undefined ? undefined : String(value)
+}
+
+function sequencedEventKey(sessionId: string, eventSeq: number, eventJson: string, event: NexusEvent): string {
+  const digest = createHash('sha256').update(eventJson).digest('hex').slice(0, 12)
+  return `${sessionId}:${String(eventSeq).padStart(12, '0')}:${event.timestamp}:${event.type}:${eventIndexPayload(event)}:${digest}`
 }
 
 function eventIndexPayload(event: NexusEvent): string {

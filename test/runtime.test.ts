@@ -1,4 +1,4 @@
-import { mkdir, realpath, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { existsSync, mkdirSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -83,7 +83,8 @@ import {
   createRemoteToolRunnerServer,
 } from '../src/runtime/remoteRunner.js'
 import { HttpEverCoreClient } from '../src/runtime/everCoreClient.js'
-import { configureEverCore, configureEverCoreFromEnv } from '../src/nexus/everCoreConfig.js'
+import { configureEverCore, configureEverCoreFromEnv, type ConfiguredEverCore } from '../src/nexus/everCoreConfig.js'
+import { EverCoreRuntimeManager } from '../src/nexus/everCoreRuntimeManager.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -98,8 +99,8 @@ const baseRuntimeUserIntentGuidance: UserIntentGuidance = {
   contextScope: 'full',
   actionHint: 'normal',
   requiresTools: true,
+  problemTarget: 'unknown',
   reason: 'test',
-  guidance: 'Continue normally.',
   latestUserText: 'test prompt',
   explicitPaths: [],
   source: 'fallback',
@@ -113,6 +114,41 @@ function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
       controller.close()
     },
   })
+}
+
+function createConfiguredEverCoreForManagerTest(
+  projectId: string,
+  dispose: () => Promise<void>,
+): ConfiguredEverCore {
+  return {
+    config: {
+      appId: 'babel-o',
+      projectId,
+      projectIdSource: 'explicit',
+      userId: undefined,
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      uploadOnSessionEnd: false,
+      maxMessages: 24,
+      maxContentChars: 4_000,
+      mcpToolsEnabled: false,
+    },
+    status: {
+      configured: true,
+      enabled: true,
+      healthy: true,
+      mode: 'managed',
+      uploadOnSessionEnd: false,
+      appId: 'babel-o',
+      projectId,
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: false,
+    },
+    dispose,
+  }
 }
 
 const runtimeTestConfigPath = join(tmpdir(), `babel-o-runtime-test-config-${process.pid}.json`)
@@ -155,7 +191,7 @@ test('runtime pipeline resolves provider tool call inputs', () => {
     id: 'tool_bad',
     name: 'Read',
     partialInput: '{bad json',
-  }), {})
+  }), { _parseError: true, _rawInput: '{bad json' })
   assert.equal(resolveProviderToolCallInput({
     id: 'tool_empty',
     name: 'Read',
@@ -750,8 +786,8 @@ test('runtime pipeline builds provider loop state and execution state blocks', (
   ]
   assert.equal(countRuntimeTurnContextChars({ systemPrompt: 'system', messages }), 23)
 
-  const readFileCache = new Map<string, { mtime: number; size: number }>([
-    ['/tmp/a.txt', { mtime: 1, size: 10 }],
+  const readFileCache = new Map([
+    ['/tmp/a.txt', { mtime: 1, size: 10, ranges: [] }],
   ])
   const loopState = buildProviderLoopState({
     loopCount: 23,
@@ -1119,6 +1155,230 @@ test('runtime tool loop executes a provider tool call and returns tool_result co
   assert.ok(metrics.toolRoundtripDurationMs >= 0)
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Read'))
   assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+})
+
+test('runtime Read cache does not use partial evidence as full-file evidence', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-cache-partial`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'evidence.md'), `${'a'.repeat(6000)}\nFULL-END`, 'utf8')
+  const readFileCache = new Map()
+
+  const first = executeProviderToolCall({
+    toolCall: {
+      id: 'read_partial',
+      name: 'Read',
+      partialInput: '{"path":"evidence.md","maxBytes":5000,"mode":"auto"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-read-cache-partial',
+      prompt: 'read evidence',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache,
+  })
+  let next = await first.next()
+  while (!next.done) next = await first.next()
+  assert.equal(next.value.kind, 'continue')
+  assert.match(next.value.toolResult.content, /<read-(preview|truncated)/)
+
+  const secondEvents: NexusEvent[] = []
+  const second = executeProviderToolCall({
+    toolCall: {
+      id: 'read_full',
+      name: 'Read',
+      partialInput: '{"path":"evidence.md","maxBytes":200000,"mode":"full"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-read-cache-partial',
+      prompt: 'read full evidence',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache,
+  })
+  next = await second.next()
+  while (!next.done) {
+    secondEvents.push(next.value)
+    next = await second.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.match(next.value.toolResult.content, /FULL-END/)
+  assert.doesNotMatch(next.value.toolResult.content, /already returned in full/)
+  assert.ok(secondEvents.some(event => event.type === 'tool_completed' && event.toolUseId === 'read_full' && String(event.output).includes('FULL-END')))
+})
+
+test('runtime Read cache safely stubs an unchanged repeated full-file read', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-cache-full`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'small.md'), 'complete evidence', 'utf8')
+  const readFileCache = new Map()
+
+  for (const id of ['read_full_first', 'read_full_second']) {
+    const stream = executeProviderToolCall({
+      toolCall: {
+        id,
+        name: 'Read',
+        partialInput: '{"path":"small.md","maxBytes":200000,"mode":"full"}',
+      },
+      tools,
+      toolPolicy: allowAllTools(),
+      runtimeOptions: {
+        sessionId: 'session-read-cache-full',
+        prompt: 'read full evidence',
+        cwd,
+        skipPermissionCheck: true,
+      },
+      storage: new MemoryStorage(),
+      metrics: createRuntimeExecutionMetrics(),
+      readFileCache,
+    })
+    let next = await stream.next()
+    while (!next.done) next = await stream.next()
+    assert.equal(next.value.kind, 'continue')
+    if (id === 'read_full_first') {
+      assert.equal(next.value.toolResult.content, 'complete evidence')
+    } else {
+      assert.match(next.value.toolResult.content, /requested byte range 0-17 was already returned in full by Read call read_full_first/)
+      assert.doesNotMatch(next.value.toolResult.content, /File unchanged since last read/)
+    }
+  }
+})
+
+test('runtime Read cache supports explicit byteOffset and byteLimit coverage', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-cache-byte-range`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'range.md'), '0123456789abcdef', 'utf8')
+  const readFileCache = new Map()
+
+  for (const [id, input] of [
+    ['read_byte_first', '{"path":"range.md","byteOffset":2,"byteLimit":4,"maxBytes":200000,"mode":"auto"}'],
+    ['read_byte_second', '{"path":"range.md","byteOffset":2,"byteLimit":4,"maxBytes":200000,"mode":"auto"}'],
+  ] as const) {
+    const stream = executeProviderToolCall({
+      toolCall: { id, name: 'Read', partialInput: input },
+      tools,
+      toolPolicy: allowAllTools(),
+      runtimeOptions: {
+        sessionId: 'session-read-cache-byte-range',
+        prompt: 'read byte range',
+        cwd,
+        skipPermissionCheck: true,
+      },
+      storage: new MemoryStorage(),
+      metrics: createRuntimeExecutionMetrics(),
+      readFileCache,
+    })
+    let next = await stream.next()
+    while (!next.done) next = await stream.next()
+    assert.equal(next.value.kind, 'continue')
+    if (id === 'read_byte_first') {
+      assert.match(next.value.toolResult.content, /^2345/)
+      assert.match(next.value.toolResult.content, /shownBytes="2-6"/)
+    } else {
+      assert.match(next.value.toolResult.content, /requested byte range 2-6 was already returned in full by Read call read_byte_first/)
+    }
+  }
+})
+
+test('runtime Read cache does not stub preview evidence for non-preview reads', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-cache-preview`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'preview.md'), '0123456789abcdef', 'utf8')
+  const readFileCache = new Map()
+
+  const preview = executeProviderToolCall({
+    toolCall: {
+      id: 'read_preview_first',
+      name: 'Read',
+      partialInput: '{"path":"preview.md","byteOffset":0,"byteLimit":8,"maxBytes":200000,"mode":"preview"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-read-cache-preview',
+      prompt: 'preview range',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache,
+  })
+  let next = await preview.next()
+  while (!next.done) next = await preview.next()
+  assert.equal(next.value.kind, 'continue')
+  assert.match(next.value.toolResult.content, /01234567/)
+
+  const regular = executeProviderToolCall({
+    toolCall: {
+      id: 'read_regular_after_preview',
+      name: 'Read',
+      partialInput: '{"path":"preview.md","byteOffset":0,"byteLimit":8,"maxBytes":200000,"mode":"auto"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-read-cache-preview',
+      prompt: 'read range after preview',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache,
+  })
+  next = await regular.next()
+  while (!next.done) next = await regular.next()
+  assert.equal(next.value.kind, 'continue')
+  assert.match(next.value.toolResult.content, /^01234567/)
+  assert.doesNotMatch(next.value.toolResult.content, /already returned in full/)
+})
+
+test('runtime Read cache does not stub lineOffset reads with byte evidence', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-read-cache-line-range`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'lines.md'), 'one\ntwo\nthree\nfour\n', 'utf8')
+  const readFileCache = new Map()
+
+  for (const id of ['read_line_first', 'read_line_second']) {
+    const stream = executeProviderToolCall({
+      toolCall: {
+        id,
+        name: 'Read',
+        partialInput: '{"path":"lines.md","lineOffset":2,"lineLimit":2,"maxBytes":200000,"mode":"auto"}',
+      },
+      tools,
+      toolPolicy: allowAllTools(),
+      runtimeOptions: {
+        sessionId: 'session-read-cache-line-range',
+        prompt: 'read line range',
+        cwd,
+        skipPermissionCheck: true,
+      },
+      storage: new MemoryStorage(),
+      metrics: createRuntimeExecutionMetrics(),
+      readFileCache,
+    })
+    let next = await stream.next()
+    while (!next.done) next = await stream.next()
+    assert.equal(next.value.kind, 'continue')
+    assert.match(next.value.toolResult.content, /^two\nthree\n/)
+    assert.doesNotMatch(next.value.toolResult.content, /already returned in full/)
+  }
 })
 
 test('runtime tool loop requires confirmation for sibling task scope boundaries', async () => {
@@ -2758,6 +3018,128 @@ test('EverCore config defaults to disabled and redacts optional failures', async
   assert.equal(envDerived.status.namespace?.projectIdSource, 'workspace')
 })
 
+test('EverCore runtime manager reuses matching process-level configuration until shutdown', async () => {
+  let configureCount = 0
+  let disposeCount = 0
+  const manager = new EverCoreRuntimeManager(async input => {
+    configureCount += 1
+    return createConfiguredEverCoreForManagerTest(input.projectId ?? 'project-1', async () => {
+      disposeCount += 1
+    })
+  })
+
+  const first = await manager.acquire({ mode: 'managed', projectId: 'project-1', managedPort: 9876 })
+  const second = await manager.acquire({ managedPort: 9876, projectId: 'project-1', mode: 'managed' })
+
+  assert.equal(configureCount, 1)
+  assert.equal(first.status.projectId, 'project-1')
+  assert.equal(second.status.projectId, 'project-1')
+
+  await first.release()
+  await second.dispose?.()
+  assert.equal(disposeCount, 0)
+
+  await manager.shutdown()
+  assert.equal(disposeCount, 1)
+})
+
+test('EverCore runtime manager does not reuse incompatible active configuration', async () => {
+  let configureCount = 0
+  let disposeCount = 0
+  const manager = new EverCoreRuntimeManager(async input => {
+    configureCount += 1
+    return createConfiguredEverCoreForManagerTest(input.projectId ?? `project-${configureCount}`, async () => {
+      disposeCount += 1
+    })
+  })
+
+  const first = await manager.acquire({ mode: 'managed', projectId: 'project-1' })
+  const second = await manager.acquire({ mode: 'managed', projectId: 'project-2' })
+
+  assert.equal(configureCount, 2)
+  await first.release()
+  await second.release()
+  assert.equal(disposeCount, 1)
+
+  await manager.shutdown()
+  assert.equal(disposeCount, 2)
+})
+
+test('EverCore runtime manager keeps idle sidecar warm until TTL expires', async () => {
+  let configureCount = 0
+  let disposeCount = 0
+  const manager = new EverCoreRuntimeManager(async input => {
+    configureCount += 1
+    return createConfiguredEverCoreForManagerTest(input.projectId ?? 'project-1', async () => {
+      disposeCount += 1
+    })
+  }, { idleTtlMs: 25 })
+
+  const first = await manager.acquire({ mode: 'managed', projectId: 'project-ttl' })
+  await first.release()
+  assert.equal(configureCount, 1)
+  assert.equal(disposeCount, 0)
+
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(disposeCount, 0)
+
+  await new Promise(resolve => setTimeout(resolve, 35))
+  assert.equal(disposeCount, 1)
+
+  const second = await manager.acquire({ mode: 'managed', projectId: 'project-ttl' })
+  assert.equal(configureCount, 2)
+  await second.release()
+  await manager.shutdown()
+  assert.equal(disposeCount, 2)
+})
+
+test('EverCore runtime manager reuses and refreshes idle TTL lease before expiry', async () => {
+  let configureCount = 0
+  let disposeCount = 0
+  const manager = new EverCoreRuntimeManager(async input => {
+    configureCount += 1
+    return createConfiguredEverCoreForManagerTest(input.projectId ?? 'project-1', async () => {
+      disposeCount += 1
+    })
+  }, { idleTtlMs: 50 })
+
+  const first = await manager.acquire({ mode: 'managed', projectId: 'project-refresh' })
+  await first.release()
+  await new Promise(resolve => setTimeout(resolve, 15))
+
+  const second = await manager.acquire({ mode: 'managed', projectId: 'project-refresh' })
+  assert.equal(configureCount, 1)
+  assert.equal(disposeCount, 0)
+  await second.release()
+
+  await new Promise(resolve => setTimeout(resolve, 20))
+  assert.equal(disposeCount, 0)
+  await new Promise(resolve => setTimeout(resolve, 45))
+  assert.equal(disposeCount, 1)
+})
+
+test('EverCore runtime manager supports deterministic idleTtlMs=0 disposal', async () => {
+  let configureCount = 0
+  let disposeCount = 0
+  const manager = new EverCoreRuntimeManager(async input => {
+    configureCount += 1
+    return createConfiguredEverCoreForManagerTest(input.projectId ?? 'project-1', async () => {
+      disposeCount += 1
+    })
+  }, { idleTtlMs: 0 })
+
+  const first = await manager.acquire({ mode: 'managed', projectId: 'project-zero' })
+  await first.release()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(disposeCount, 1)
+
+  const second = await manager.acquire({ mode: 'managed', projectId: 'project-zero' })
+  assert.equal(configureCount, 2)
+  await second.release()
+  await new Promise(resolve => setTimeout(resolve, 0))
+  assert.equal(disposeCount, 2)
+})
+
 test('EverCore managed mode starts local sidecar and exposes diagnostics', async () => {
   const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-managed`)
   const spawnCalls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = []
@@ -2823,6 +3205,128 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
 
   await configured.dispose?.()
   assert.equal(killed, true)
+})
+
+test('EverCore managed mode writes registry and reuses healthy sidecar', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-registry-reuse`)
+  const spawnCalls: string[] = []
+  const healthUrls: string[] = []
+  const first = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9911,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedSpawn(command) {
+      spawnCalls.push(command)
+      return {
+        pid: 991100,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async url => {
+      healthUrls.push(String(url))
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 })
+    },
+  })
+
+  assert.equal(first.status.sidecar?.reused, false)
+  assert.equal(first.status.sidecar?.registryPath, join(dataDir, 'sidecar-registry.json'))
+  const registry = JSON.parse(await readFile(join(dataDir, 'sidecar-registry.json'), 'utf8'))
+  assert.equal(registry.baseUrl, 'http://127.0.0.1:9911')
+  assert.equal(registry.dataDir, dataDir)
+  assert.equal(registry.pid, 991100)
+
+  const second = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => {
+      throw new Error('port allocator should not run when registry is healthy')
+    },
+    managedSpawn() {
+      throw new Error('spawn should not run when registry is healthy')
+    },
+    fetch: async url => {
+      healthUrls.push(String(url))
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 })
+    },
+  })
+
+  assert.equal(spawnCalls.length, 1)
+  assert.ok(second.client)
+  assert.equal(second.status.healthy, true)
+  assert.equal(second.status.sidecar?.reused, true)
+  assert.equal(second.status.sidecar?.running, true)
+  assert.equal(second.status.sidecar?.pid, 991100)
+  assert.equal(second.status.sidecar?.registryPath, join(dataDir, 'sidecar-registry.json'))
+  assert.ok(healthUrls.filter(url => url === 'http://127.0.0.1:9911/health').length >= 2)
+
+  await first.dispose?.()
+})
+
+test('EverCore managed mode treats stale registry as diagnostics and starts a fresh sidecar', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-registry-stale`)
+  await mkdir(dataDir, { recursive: true })
+  await writeFile(join(dataDir, 'sidecar-registry.json'), JSON.stringify({
+    version: 1,
+    baseUrl: 'http://127.0.0.1:9912',
+    host: '127.0.0.1',
+    port: 9912,
+    dataDir,
+    pid: 991200,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  }))
+
+  const spawnPorts: string[] = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9913,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedSpawn(_command, _args, options) {
+      spawnPorts.push(String(options.env.EVEROS_API__PORT))
+      return {
+        pid: 991300,
+        killed: false,
+        kill() {
+          return true
+        },
+        once() {},
+      }
+    },
+    fetch: async url => {
+      if (String(url) === 'http://127.0.0.1:9912/health') {
+        return new Response(JSON.stringify({ status: 'down' }), { status: 503 })
+      }
+      assert.equal(String(url), 'http://127.0.0.1:9913/health')
+      return new Response(JSON.stringify({ status: 'ok' }), { status: 200 })
+    },
+  })
+
+  assert.ok(configured.client)
+  assert.equal(configured.status.healthy, true)
+  assert.equal(configured.status.sidecar?.reused, false)
+  assert.match(configured.status.sidecar?.registryStaleReason ?? '', /^health_check_failed:/)
+  assert.equal(configured.status.sidecar?.registryCleanupError, undefined)
+  assert.equal(configured.status.sidecar?.registryPath, join(dataDir, 'sidecar-registry.json'))
+  assert.deepEqual(spawnPorts, ['9913'])
+  const registry = JSON.parse(await readFile(join(dataDir, 'sidecar-registry.json'), 'utf8'))
+  assert.equal(registry.baseUrl, 'http://127.0.0.1:9913')
+  assert.equal(registry.pid, 991300)
+
+  await configured.dispose?.()
 })
 
 test('EverCore managed mode auto-maps Anthropic-compatible provider settings', async () => {
@@ -3106,6 +3610,321 @@ test('/v1/runtime/status reports EverCore diagnostics', async () => {
   }
 })
 
+test('/v1/runtime/memory/status reports read-only EverCore memory surface', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    everCoreStatus: {
+      configured: true,
+      enabled: true,
+      healthy: true,
+      mode: 'managed',
+      url: 'http://127.0.0.1:9876/',
+      uploadOnSessionEnd: false,
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: true,
+      namespace: {
+        layer: 'project_memory',
+        isolationKey: 'projectId',
+        sessionScoped: false,
+        projectIdSource: 'explicit',
+      },
+      sidecar: {
+        mode: 'managed',
+        managed: true,
+        running: true,
+        healthy: true,
+        url: 'http://127.0.0.1:9876/',
+        dataDir: '/tmp/babel-o-evercore',
+        pid: 12345,
+      },
+    },
+  })
+  try {
+    const response = await app.inject({ method: 'GET', url: '/v1/runtime/memory/status' })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'memory_status')
+    assert.equal(body.capability.available, true)
+    assert.equal(body.capability.autoSearch, 'cue-driven')
+    assert.equal(body.capability.save, 'permission-gated')
+    assert.equal(body.capability.authoritative, false)
+    assert.equal(body.everCore.mode, 'managed')
+    assert.equal(body.everCore.namespace.isolationKey, 'projectId')
+    assert.equal(body.guidance.memoryIsHint, true)
+    assert.equal(body.guidance.projectFactsRequireWorkspaceEvidence, true)
+    assert.equal(body.guidance.candidatesAutoWrite, false)
+    assert.equal(body.actions.saveNote, 'write_permission_gated')
+    assert.equal(body.actions.flush, 'lifecycle_permission_gated')
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/memory/search returns bounded read-only memory hints', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  let capturedSearchInput: unknown
+  let addCalls = 0
+  let flushCalls = 0
+  const everCoreClient = {
+    async search(input: unknown) {
+      capturedSearchInput = input
+      return {
+        data: {
+          results: [
+            { content: 'User prefers regression-first fixes.', source: 'preference', score: 0.92 },
+            { content: 'Project facts from memory require workspace evidence.', source: 'boundary', score: 0.73 },
+          ],
+        },
+      }
+    },
+    async addAgentMessages() {
+      addCalls += 1
+      return { data: { ok: true } }
+    },
+    async flushAgentSession() {
+      flushCalls += 1
+      return { data: { ok: true } }
+    },
+  }
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    everCoreClient,
+    everCoreConfig: {
+      appId: 'babel-o',
+      projectId: 'project-1',
+      projectIdSource: 'explicit',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      uploadOnSessionEnd: false,
+      maxMessages: 24,
+      maxContentChars: 4_000,
+      mcpToolsEnabled: false,
+    },
+    everCoreStatus: {
+      configured: true,
+      enabled: true,
+      healthy: true,
+      mode: 'external',
+      uploadOnSessionEnd: false,
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: false,
+    },
+  })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/search',
+      payload: {
+        query: 'what do you remember about my fix preference?',
+        method: 'keyword',
+        topK: 1,
+        maxHitChars: 32,
+        maxChars: 100,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'memory_search_result')
+    assert.equal(body.provider, 'evercore')
+    assert.equal(body.hitCount, 1)
+    assert.equal(body.totalExtractedHits, 2)
+    assert.equal(body.method, 'keyword')
+    assert.equal(body.topK, 1)
+    assert.equal(body.guidance.memoryIsHint, true)
+    assert.equal(body.guidance.projectFactsRequireWorkspaceEvidence, true)
+    assert.match(body.content, /regression-first/)
+    assert.equal(addCalls, 0)
+    assert.equal(flushCalls, 0)
+    assert.deepEqual(capturedSearchInput, {
+      query: 'what do you remember about my fix preference?',
+      appId: 'babel-o',
+      projectId: 'project-1',
+      userId: undefined,
+      agentId: 'babel-o',
+      method: 'keyword',
+      topK: 1,
+    })
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/memory/candidates reports review-only governance metadata', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: process.cwd() })
+  try {
+    const firstSession = (await app.inject({ method: 'POST', url: '/v1/sessions', payload: { cwd: process.cwd() } })).json()
+    const secondSession = (await app.inject({ method: 'POST', url: '/v1/sessions', payload: { cwd: process.cwd() } })).json()
+    const channelResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/session-channels',
+      payload: {
+        participantSessionIds: [firstSession.sessionId, secondSession.sessionId],
+        createdBySessionId: firstSession.sessionId,
+        policy: { allowMemoryWriteRequests: true },
+      },
+    })
+    assert.equal(channelResponse.statusCode, 200)
+    const channel = channelResponse.json().channel
+    const messageResponse = await app.inject({
+      method: 'POST',
+      url: `/v1/session-channels/${channel.channelId}/messages`,
+      payload: {
+        fromSessionId: firstSession.sessionId,
+        toSessionId: secondSession.sessionId,
+        type: 'memory_candidate',
+        content: 'User prefers focused regression tests before broad hygiene.',
+        evidence: [{ type: 'session_event', ref: 'evt_1', label: 'user preference' }],
+        metadata: {
+          memoryCandidate: {
+            scope: 'user',
+            confidence: 0.82,
+            requestedWrite: true,
+          },
+        },
+      },
+    })
+    assert.equal(messageResponse.statusCode, 200)
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/runtime/memory/candidates?sessionId=${encodeURIComponent(secondSession.sessionId)}`,
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'memory_candidates')
+    assert.equal(body.candidates.length, 1)
+    assert.equal(body.guidance.autoWrite, false)
+    assert.equal(body.guidance.reviewOnly, true)
+    const candidate = body.candidates[0]
+    assert.equal(candidate.content, 'User prefers focused regression tests before broad hygiene.')
+    assert.equal(candidate.governance.scope, 'user')
+    assert.equal(candidate.governance.decision, 'requires_approval')
+    assert.equal(candidate.governance.autoWrite, false)
+    assert.equal(candidate.governance.approval.status, 'required')
+    assert.equal(candidate.governance.writePolicy.requestedWrite, true)
+    assert.equal(candidate.governance.writePolicy.allowMemoryWriteRequests, true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('/v1/runtime/memory write and lifecycle actions require explicit approval', async () => {
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  let savedMessages: unknown[] = []
+  let flushedSessionId = ''
+  const everCoreClient = {
+    async search() {
+      return { data: { results: [] } }
+    },
+    async addAgentMessages(input: { messages: unknown[] }) {
+      savedMessages = input.messages
+      return { data: { ok: true } }
+    },
+    async flushAgentSession(input: { sessionId: string }) {
+      flushedSessionId = input.sessionId
+      return { data: { ok: true } }
+    },
+  }
+  const app = await createNexusApp({
+    runtime,
+    storage,
+    defaultCwd: process.cwd(),
+    everCoreClient,
+    everCoreConfig: {
+      appId: 'babel-o',
+      projectId: 'project-1',
+      projectIdSource: 'explicit',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      uploadOnSessionEnd: false,
+      maxMessages: 24,
+      maxContentChars: 4_000,
+      mcpToolsEnabled: false,
+    },
+    everCoreStatus: {
+      configured: true,
+      enabled: true,
+      healthy: true,
+      mode: 'managed',
+      uploadOnSessionEnd: false,
+      appId: 'babel-o',
+      projectId: 'project-1',
+      agentId: 'babel-o',
+      retrieveMethod: 'hybrid',
+      topK: 5,
+      mcpToolsEnabled: false,
+    },
+  })
+  try {
+    const saveGate = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/save-note',
+      payload: { note: 'Remember that I prefer regression-first fixes.', sessionId: 'session_1' },
+    })
+    assert.equal(saveGate.statusCode, 202)
+    assert.equal(saveGate.json().type, 'memory_action_approval_required')
+    assert.equal(savedMessages.length, 0)
+
+    const saveApproved = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/save-note',
+      payload: { note: 'Remember that I prefer regression-first fixes.', sessionId: 'session_1', confirmation: 'save-note' },
+    })
+    assert.equal(saveApproved.statusCode, 200)
+    assert.equal(saveApproved.json().type, 'memory_note_saved')
+    assert.equal(saveApproved.json().savedMessages, 2)
+    assert.equal(savedMessages.length, 2)
+
+    const flushGate = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/flush',
+      payload: { sessionId: 'session_1' },
+    })
+    assert.equal(flushGate.statusCode, 202)
+    assert.equal(flushGate.json().type, 'memory_action_approval_required')
+    assert.equal(flushedSessionId, '')
+
+    const flushApproved = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/flush',
+      payload: { sessionId: 'session_1', approved: true },
+    })
+    assert.equal(flushApproved.statusCode, 200)
+    assert.equal(flushApproved.json().type, 'memory_session_flushed')
+    assert.equal(flushedSessionId, 'session_1')
+
+    const restartGate = await app.inject({ method: 'POST', url: '/v1/runtime/memory/restart', payload: {} })
+    assert.equal(restartGate.statusCode, 202)
+    assert.equal(restartGate.json().type, 'memory_action_approval_required')
+
+    const restartApproved = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/memory/restart',
+      payload: { confirmation: 'restart' },
+    })
+    assert.equal(restartApproved.statusCode, 501)
+    assert.equal(restartApproved.json().code, 'MEMORY_RESTART_NOT_IMPLEMENTED')
+  } finally {
+    await app.close()
+  }
+})
+
 test('/v1/runtime/status reports managed EverCore sidecar diagnostics', async () => {
   const { runtime, storage } = await createDefaultNexusRuntime()
   const app = await createNexusApp({
@@ -3143,6 +3962,7 @@ test('/v1/runtime/status reports managed EverCore sidecar diagnostics', async ()
     assert.equal(body.everCore.mode, 'managed')
     assert.equal(body.everCore.sidecar.running, true)
     assert.equal(body.everCore.sidecar.dataDir, '/tmp/babel-o-evercore')
+    assert.equal(body.everCore.sidecar.reused, undefined)
     assert.equal(body.everCore.mcpToolsEnabled, true)
   } finally {
     await app.close()
@@ -6048,7 +6868,7 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
     const res = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
     assert.equal(res.success, true)
     assert.match(String(res.output), /matches shown; more matches truncated for context budget/)
-    assert.match(String(res.output), /Read with offset\/limit/)
+    assert.match(String(res.output), /Read with lineOffset\/lineLimit/)
     const lines = String(res.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines.length, 2)
 
@@ -6074,7 +6894,7 @@ test('Grep tool enforces maxMatches limits and truncates output', async () => {
     const res2 = await grepTool.execute({ pattern: 'needle', path: 'test.txt', maxMatches: 2 }, ctx)
     assert.equal(res2.success, true)
     assert.match(String(res2.output), /matches shown; more matches truncated for context budget/)
-    assert.match(String(res2.output), /Read with offset\/limit/)
+    assert.match(String(res2.output), /Read with lineOffset\/lineLimit/)
     const lines2 = String(res2.output).split('\n').filter(l => l.includes('needle'))
     assert.equal(lines2.length, 2)
   }

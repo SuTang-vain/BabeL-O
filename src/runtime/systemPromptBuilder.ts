@@ -125,6 +125,7 @@ function getTaskGuidelinesSection(): string {
   - Action requests (start, run, build, test, execute, launch): use Bash to run the command directly.
   - Analysis requests (review, analyze, improve, optimize, check, examine): use ListDir, Glob, Grep, and Read to examine code. Do NOT run the project or start servers unless the user explicitly asks.
   - If the user asks for analysis or review, read the relevant files and provide your assessment. Starting the project is not part of analysis.
+- **Turn Policy**: If a Turn Policy section is present, treat it as structured runtime control data. responseMode=direct_answer means answer without new task execution; toolMode=disabled means do not call tools; toolMode=available_for_verification means use tools only if the latest request truly requires verification; evidenceMode=verify_before_claim means verify claims against current session, source, or tool evidence before presenting them as fact and keep verified observations, code-confirmed causes, and hypotheses distinct; staleTaskMode=background_only means previous work is context, not the active task.
 - **Analysis budget**: For analysis/review/comparison tasks, read at most 10-15 key files before synthesizing your findings. Present your analysis, then ask if the user wants deeper investigation. Do not exhaustively read an entire codebase before responding.
 - Do not create files unless they're absolutely necessary. Prefer editing existing files.
 - If an approach fails, diagnose why before switching tactics — read the error, check your assumptions, try a focused fix.
@@ -212,12 +213,22 @@ function buildFocusBlock(prompt: string, cwd: string): string {
 export function extractAbsolutePaths(text: string): string[] {
   const paths = new Set<string>()
   const pathPattern = /\/[^\s"'`，。！？；：、）\])}<>]+/g
-  for (const match of text.matchAll(pathPattern)) {
+  for (const match of normalizeWrappedPathFragments(text).matchAll(pathPattern)) {
     const cleaned = match[0].replace(/[.,;:!?]+$/u, '')
     const resolved = resolvePromptPath(cleaned)
     if (resolved !== '/') paths.add(resolved)
   }
   return [...paths]
+}
+
+export function normalizeWrappedPathFragments(text: string): string {
+  return text.replace(
+    /((?:\.{0,2}\/|~\/|\/)[^\s"'`，。！？；：、）\])}<>]*[\p{L}\p{N}\]])\r?\n[ \t]*([_-][^\s"'`，。！？；：、）\])}<>]+)/gu,
+    (_match, prefix: string, suffix: string) => {
+      if (!looksLikePathFragment(prefix) || !looksLikePathFragment(suffix)) return _match
+      return `${prefix}${suffix}`
+    },
+  )
 }
 
 export function resolvePromptPath(candidate: string): string {
@@ -233,4 +244,8 @@ export function resolvePromptPath(candidate: string): string {
   }
 
   return candidate
+}
+
+function looksLikePathFragment(fragment: string): boolean {
+  return /[/.]/u.test(fragment) || /[A-Za-z0-9_.-]+\.(?:[A-Za-z0-9]+)$/u.test(fragment)
 }

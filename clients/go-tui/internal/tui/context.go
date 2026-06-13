@@ -93,9 +93,9 @@ func (m model) contextOverlayFrameBudget(width int) int {
 // buildContextOverlayLines turns the raw /v1/sessions/:id/context
 // payload into the line buffer that the contextOverlay renders. It
 // pulls a stable subset of the diagnostics (sections, compact
-// retention, long-term memory, scoped memory, session memory lite,
-// auto compact, recovery, repeated tool inputs, working set paths)
-// plus the top signals and recommendations. Unknown / missing
+// retention, task scope, long-term memory, scoped memory, session
+// memory lite, auto compact, recovery, repeated tool inputs,
+// working set paths) plus the top signals and recommendations. Unknown / missing
 // fields are silently skipped so the line count stays bounded.
 func buildContextOverlayLines(raw []byte) []string {
 	var payload struct {
@@ -256,6 +256,38 @@ func buildContextOverlayLines(raw []byte) []string {
 				Path    string `json:"path"`
 				Touches int    `json:"touches"`
 			} `json:"workingSetPaths"`
+			TaskScope struct {
+				Cwd                    string   `json:"cwd"`
+				PrimaryRoot            string   `json:"primaryRoot"`
+				ExplicitRoots          []string `json:"explicitRoots"`
+				ConfirmedExternalRoots []string `json:"confirmedExternalRoots"`
+				InferredCandidateRoots []string `json:"inferredCandidateRoots"`
+				Mode                   string   `json:"mode"`
+				Source                 string   `json:"source"`
+				LatestDeclaredAt       string   `json:"latestDeclaredAt"`
+				PendingBoundaries      []struct {
+					TargetRoot   string `json:"targetRoot"`
+					BoundaryKind string `json:"boundaryKind"`
+					ToolName     string `json:"toolName"`
+					ToolUseID    string `json:"toolUseId"`
+					Action       string `json:"action"`
+					Reason       string `json:"reason"`
+					Timestamp    string `json:"timestamp"`
+				} `json:"pendingBoundaries"`
+				ConfirmedBoundaries []struct {
+					TargetRoot        string `json:"targetRoot"`
+					ConfirmationScope string `json:"confirmationScope"`
+					ConfirmedBy       string `json:"confirmedBy"`
+					Timestamp         string `json:"timestamp"`
+				} `json:"confirmedBoundaries"`
+				OutOfScopeEvidence []struct {
+					ToolUseID  string `json:"toolUseId"`
+					ToolName   string `json:"toolName"`
+					TargetRoot string `json:"targetRoot"`
+					Reason     string `json:"reason"`
+					Timestamp  string `json:"timestamp"`
+				} `json:"outOfScopeEvidence"`
+			} `json:"taskScope"`
 			RepeatedToolInputs []struct {
 				Name         string `json:"name"`
 				Count        int    `json:"count"`
@@ -361,6 +393,27 @@ func buildContextOverlayLines(raw []byte) []string {
 	if threshold.Name != "" && threshold.Name != "none" {
 		lines = append(lines, fmt.Sprintf("    next threshold %s · %s remaining · %d%%",
 			threshold.Name, formatTokenCount(threshold.RemainingTokens), threshold.Percent))
+	}
+	scope := payload.Diagnostics.TaskScope
+	if strings.TrimSpace(scope.PrimaryRoot) != "" {
+		mode := strings.TrimSpace(scope.Mode)
+		if mode == "" {
+			mode = "unknown"
+		}
+		lines = append(lines, fmt.Sprintf("    task scope %s · primary=%s", mode, scope.PrimaryRoot))
+		lines = append(lines, fmt.Sprintf("    scope roots explicit=%d confirmedExternal=%d pendingBoundaries=%d outOfScopeEvidence=%d",
+			len(scope.ExplicitRoots), len(scope.ConfirmedExternalRoots), len(scope.PendingBoundaries), len(scope.OutOfScopeEvidence)))
+		if len(scope.ConfirmedExternalRoots) > 0 {
+			lines = append(lines, "    confirmed external roots: "+strings.Join(scope.ConfirmedExternalRoots[:min(len(scope.ConfirmedExternalRoots), 3)], ", "))
+		}
+		if len(scope.PendingBoundaries) > 0 {
+			boundary := scope.PendingBoundaries[0]
+			lines = append(lines, fmt.Sprintf("    pending scope boundary: %s target=%s tool=%s", boundary.BoundaryKind, boundary.TargetRoot, boundary.ToolName))
+		}
+		if len(scope.OutOfScopeEvidence) > 0 {
+			evidence := scope.OutOfScopeEvidence[0]
+			lines = append(lines, fmt.Sprintf("    out-of-scope evidence: %s:%s target=%s", evidence.ToolName, evidence.ToolUseID, evidence.TargetRoot))
+		}
 	}
 	// Summary + status.
 	if status := strings.TrimSpace(payload.Diagnostic.Status); status != "" {

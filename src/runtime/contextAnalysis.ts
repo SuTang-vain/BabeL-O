@@ -27,11 +27,12 @@ import {
 import { buildSessionMemoryLiteStatus, type SessionMemoryLiteStatus } from './sessionMemoryLite.js'
 import { buildRuntimeDiagnostics, statusFromSignals, type RuntimeDiagnosticsEnvelope } from './runtimeDiagnostics.js'
 import { extractAbsolutePaths } from './systemPromptBuilder.js'
+import { deriveTaskScope, extractToolTargetPaths } from './taskScope.js'
 import type { ContextSelectionDiagnostics } from './contextManager.js'
 import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 
 export type ContextDiagnosticSignal = {
-  type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary' | 'grounding_required' | 'workspace_dirty'
+  type: 'near_capacity' | 'large_tool_result' | 'repeated_tool_input' | 'memory_bloat' | 'auto_compact_fuse' | 'microcompact_savings' | 'retained_segment_fallback' | 'resume_recovery_boundary' | 'grounding_required' | 'workspace_dirty' | 'scope_boundary' | 'out_of_scope_evidence'
   severity: 'info' | 'warning' | 'critical'
   message: string
 }
@@ -121,6 +122,38 @@ export type ContextAnalysisDiagnostics = {
     touches: number
     latestTimestamp: string
   }>
+  taskScope: {
+    cwd: string
+    primaryRoot: string
+    explicitRoots: string[]
+    confirmedExternalRoots: string[]
+    inferredCandidateRoots: string[]
+    mode: 'single_root' | 'multi_root' | 'cross_project'
+    source: 'cwd' | 'prompt_paths' | 'user_confirmation' | 'session_metadata'
+    latestDeclaredAt: string
+    pendingBoundaries: Array<{
+      targetRoot: string
+      boundaryKind: 'parent_scan' | 'sibling_repo' | 'external_absolute_path' | 'historical_session_path' | 'memory_hit_path' | 'global_cache_path'
+      toolName: string
+      toolUseId: string
+      action: 'warn' | 'require_confirmation' | 'deny'
+      reason: string
+      timestamp: string
+    }>
+    confirmedBoundaries: Array<{
+      targetRoot: string
+      confirmationScope: 'once' | 'session' | 'task'
+      confirmedBy: 'user' | 'policy'
+      timestamp: string
+    }>
+    outOfScopeEvidence: Array<{
+      toolUseId: string
+      toolName: string
+      targetRoot: string
+      reason: string
+      timestamp: string
+    }>
+  }
   autoCompactFloor: {
     thresholdPercent: number
     thresholdTokens: number
@@ -210,6 +243,12 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   longTermMemoryError?: string
   scopedMemory: MemoryProviderDiagnostics[]
   groundingState: ContextGroundingState['state']
+  taskScopeMode: ContextAnalysisDiagnostics['taskScope']['mode']
+  taskPrimaryRoot: string
+  taskExplicitRootCount: number
+  taskConfirmedExternalRootCount: number
+  pendingScopeBoundaryCount: number
+  outOfScopeEvidenceCount: number
   contextBucketCount: number
   topContextItemCount: number
 }>
@@ -336,6 +375,7 @@ export async function analyzeContext(options: {
   const diagnostics = buildContextDiagnostics({
     events: options.events,
     prompt: options.runtimeOptions.prompt,
+    cwd: options.runtimeOptions.cwd,
     assembled,
     window,
     autoCompact,
@@ -441,6 +481,12 @@ function buildContextDiagnosticEnvelope(options: {
       longTermMemoryError: options.diagnostics.longTermMemory.error,
       scopedMemory: options.diagnostics.scopedMemory,
       groundingState: options.diagnostics.visualization.grounding.state,
+      taskScopeMode: options.diagnostics.taskScope.mode,
+      taskPrimaryRoot: options.diagnostics.taskScope.primaryRoot,
+      taskExplicitRootCount: options.diagnostics.taskScope.explicitRoots.length,
+      taskConfirmedExternalRootCount: options.diagnostics.taskScope.confirmedExternalRoots.length,
+      pendingScopeBoundaryCount: options.diagnostics.taskScope.pendingBoundaries.length,
+      outOfScopeEvidenceCount: options.diagnostics.taskScope.outOfScopeEvidence.length,
       contextBucketCount: options.diagnostics.visualization.buckets.length,
       topContextItemCount: options.diagnostics.visualization.topItems.length,
     },
@@ -489,6 +535,7 @@ function hasRecentProviderContextError(events: NexusEvent[]): boolean {
 function buildContextDiagnostics(options: {
   events: NexusEvent[]
   prompt: string
+  cwd: string
   assembled: AssembledContext
   window: ContextWindowState
   autoCompact: ContextAnalysisDiagnostics['autoCompact']
@@ -546,6 +593,7 @@ function buildContextDiagnostics(options: {
       message: options.runtimePolicy.recoveryBoundaryMessage,
     },
     workingSetPaths: findWorkingSetPaths(options.events, options.prompt),
+    taskScope: buildTaskScopeDiagnostics(options.events, options.prompt, options.cwd),
     autoCompactFloor: buildAutoCompactFloor(options.window, options.autoCompact, options.assembled, options.cacheAwareCompactPolicy),
     cacheEconomics: buildCacheEconomicsDiagnostics(options.cacheAwareCompactPolicy),
     compactTokenDelta: buildCompactTokenDelta(options.events, options.compact, options.window),
@@ -806,6 +854,106 @@ function summarizeUsage(events: NexusEvent[]): ContextAnalysisDiagnostics['usage
     cacheReadInputTokens: 0,
     estimatedReasoningTokens: 0,
   })
+}
+
+function buildTaskScopeDiagnostics(events: NexusEvent[], prompt: string, cwd: string): ContextAnalysisDiagnostics['taskScope'] {
+  const latestDeclared = findLastEvent(events, 'task_scope_declared')
+  const derived = deriveTaskScope({
+    sessionId: latestDeclared?.sessionId ?? 'context-analysis',
+    cwd,
+    prompt,
+    events,
+  })
+  const confirmed = events
+    .filter((event): event is Extract<NexusEvent, { type: 'scope_boundary_confirmed' }> => event.type === 'scope_boundary_confirmed')
+    .map(event => ({
+      targetRoot: event.targetRoot,
+      confirmationScope: event.confirmationScope,
+      confirmedBy: event.confirmedBy,
+      timestamp: event.timestamp,
+    }))
+  const confirmedRoots = new Set(confirmed.map(event => event.targetRoot))
+  const latestBoundaryByRoot = new Map<string, Extract<NexusEvent, { type: 'scope_boundary_detected' }>>()
+  for (const event of events) {
+    if (event.type !== 'scope_boundary_detected') continue
+    latestBoundaryByRoot.set(event.targetRoot, event)
+  }
+  const pendingBoundaries = [...latestBoundaryByRoot.values()]
+    .filter(event => !confirmedRoots.has(event.targetRoot))
+    .map(event => ({
+      targetRoot: event.targetRoot,
+      boundaryKind: event.boundaryKind,
+      toolName: event.toolName,
+      toolUseId: event.toolUseId,
+      action: event.action,
+      reason: event.reason,
+      timestamp: event.timestamp,
+    }))
+  const scopeRoots = [derived.primaryRoot, ...derived.explicitRoots, ...derived.confirmedExternalRoots]
+  return {
+    cwd: derived.cwd,
+    primaryRoot: derived.primaryRoot,
+    explicitRoots: derived.explicitRoots,
+    confirmedExternalRoots: derived.confirmedExternalRoots,
+    inferredCandidateRoots: derived.inferredCandidateRoots,
+    mode: latestDeclared?.mode ?? derived.mode,
+    source: latestDeclared?.source ?? derived.source,
+    latestDeclaredAt: latestDeclared?.timestamp ?? '',
+    pendingBoundaries,
+    confirmedBoundaries: confirmed,
+    outOfScopeEvidence: findOutOfScopeToolEvidence(events, cwd, scopeRoots, latestBoundaryByRoot, confirmedRoots),
+  }
+}
+
+function findOutOfScopeToolEvidence(
+  events: NexusEvent[],
+  cwd: string,
+  scopeRoots: string[],
+  boundaryByRoot: Map<string, Extract<NexusEvent, { type: 'scope_boundary_detected' }>>,
+  confirmedRoots: Set<string>,
+): ContextAnalysisDiagnostics['taskScope']['outOfScopeEvidence'] {
+  const completedToolUseIds = new Set(events
+    .filter((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed' && event.success)
+    .map(event => event.toolUseId))
+  const outOfScope: ContextAnalysisDiagnostics['taskScope']['outOfScopeEvidence'] = []
+  for (const event of events) {
+    if (event.type !== 'tool_started') continue
+    if (!completedToolUseIds.has(event.toolUseId)) continue
+    const paths = extractToolTargetPaths(event.name, event.input, cwd)
+    for (const path of paths) {
+      const root = rootForEvidencePath(path, scopeRoots, boundaryByRoot)
+      if (!root || isPathWithinAnyRoot(path, scopeRoots) || confirmedRoots.has(root)) continue
+      outOfScope.push({
+        toolUseId: event.toolUseId,
+        toolName: event.name,
+        targetRoot: root,
+        reason: `Successful ${event.name} evidence targeted ${root} outside current task scope.`,
+        timestamp: event.timestamp,
+      })
+    }
+  }
+  return outOfScope
+}
+
+function rootForEvidencePath(
+  path: string,
+  scopeRoots: string[],
+  boundaryByRoot: Map<string, Extract<NexusEvent, { type: 'scope_boundary_detected' }>>,
+): string | undefined {
+  const boundary = [...boundaryByRoot.values()].find(event => isPathWithinRoot(path, event.targetRoot))
+  if (boundary) return boundary.targetRoot
+  if (isPathWithinAnyRoot(path, scopeRoots)) return undefined
+  return path
+}
+
+function isPathWithinAnyRoot(path: string, roots: string[]): boolean {
+  return roots.some(root => isPathWithinRoot(path, root))
+}
+
+function isPathWithinRoot(path: string, root: string): boolean {
+  const normalized = path.trim()
+  const normalizedRoot = root.trim()
+  return normalized === normalizedRoot || normalized.startsWith(`${normalizedRoot}/`)
 }
 
 function findWorkingSetPaths(events: NexusEvent[], prompt: string): ContextAnalysisDiagnostics['workingSetPaths'] {
@@ -1129,6 +1277,22 @@ function buildDiagnosticSignals(options: {
       message: `Workspace has ${options.diagnostics.visualization.grounding.changedFileCount} changed file(s); inspect status/diff before implementation claims.`,
     })
   }
+  if (options.diagnostics.taskScope.pendingBoundaries.length > 0) {
+    const boundary = options.diagnostics.taskScope.pendingBoundaries[0]!
+    signals.push({
+      type: 'scope_boundary',
+      severity: 'warning',
+      message: `Scope boundary pending for ${boundary.targetRoot}; confirm before using it as task evidence.`,
+    })
+  }
+  if (options.diagnostics.taskScope.outOfScopeEvidence.length > 0) {
+    const evidence = options.diagnostics.taskScope.outOfScopeEvidence[0]!
+    signals.push({
+      type: 'out_of_scope_evidence',
+      severity: 'critical',
+      message: `Out-of-scope ${evidence.toolName} evidence targeted ${evidence.targetRoot}.`,
+    })
+  }
   if (options.diagnostics.largeToolResults.length > 0) {
     const largest = options.diagnostics.largeToolResults[0]!
     signals.push({
@@ -1181,6 +1345,12 @@ function buildContextRecommendations(options: {
   }
   if (options.diagnostics.resumeRecovery.active) {
     recommendations.push('A recovery boundary is active; answer from the latest user turn and re-read files only when needed.')
+  }
+  if (options.diagnostics.taskScope.pendingBoundaries.length > 0) {
+    recommendations.push('Confirm or reject pending scope boundaries before using external roots as evidence.')
+  }
+  if (options.diagnostics.taskScope.outOfScopeEvidence.length > 0) {
+    recommendations.push('Discard or explicitly label out-of-scope tool evidence before making final claims.')
   }
   if (options.diagnostics.largeToolResults.length > 0) {
     recommendations.push('Large tool results are present; re-read only specific file ranges or compact before continuing.')

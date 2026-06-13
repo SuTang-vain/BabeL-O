@@ -13,26 +13,27 @@ const FORCE_RIPGREP_FALLBACK_ENV = 'BABEL_O_GREP_FORCE_FALLBACK'
 const inputSchema = z.object({
   pattern: z.string().min(1),
   path: z.string().default('.'),
-  pathMatches: z.string().optional(),
+  pathMatches: z.union([z.string(), z.array(z.string()).max(20)]).optional(),
   maxMatches: z.number().int().positive().max(200).default(50),
 })
 
 export const grepTool: ToolDefinition<typeof inputSchema> = {
   name: 'Grep',
   description: 'Search file contents using ripgrep.',
-  prompt: () => 'Grep is a content locator built on bundled ripgrep when available, then system rg, then JavaScript RegExp fallback. Supports full regex syntax through ripgrep and basic JavaScript regex fallback; use pathMatches for file glob filters such as "**/*.ts". Use Grep to find candidate lines containing symbols, errors, or text inside files; prefer it over Bash grep, rg, or grep | head for ordinary source code search. Grep results are locator evidence only; use Read with offset/limit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
+  prompt: () => 'Grep is a content locator built on bundled ripgrep when available, then system rg, then JavaScript RegExp fallback. Supports full regex syntax through ripgrep and basic JavaScript regex fallback; use pathMatches for file glob filters such as "**/*.ts", or an array such as ["src/**/*.ts", "test/**/*.ts", "docs/**/*.md"] for multiple include globs. Do not repeat JSON keys. Use Grep to find candidate lines containing symbols, errors, or text inside files; prefer it over Bash grep, rg, or grep | head for ordinary source code search. Grep results are locator evidence only; use Read with lineOffset/lineLimit around relevant matches before making source-level claims. Use ListDir for directory inventory and Glob for path pattern discovery.',
   risk: 'read',
   inputSchema,
   async execute(input, context) {
     const pathMatchesDiagnostic = validatePathMatches(input.pathMatches)
     if (pathMatchesDiagnostic) return { success: false, output: pathMatchesDiagnostic }
+    const pathMatches = normalizePathMatches(input.pathMatches)
 
     const probeLimit = input.maxMatches + 1
     const args = [
       '-n',
       '--max-count',
       String(probeLimit),
-      ...(input.pathMatches ? ['--glob', input.pathMatches] : []),
+      ...pathMatches.flatMap(glob => ['--glob', glob]),
       input.pattern,
       input.path,
     ]
@@ -57,7 +58,7 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
       }
     }
 
-    const output = await grepFallback(context.cwd, input.path, input.pattern, input.maxMatches, input.pathMatches)
+    const output = await grepFallback(context.cwd, input.path, input.pattern, input.maxMatches, pathMatches)
     return { success: true, output }
   },
 }
@@ -101,16 +102,24 @@ function isErrorWithCode(error: unknown, code: string | number): boolean {
 }
 
 function targetedGrepTruncationHint(maxMatches: number): string {
-  return `\n... (${maxMatches} matches shown; more matches truncated for context budget. Narrow the pattern/path, then use Read with offset/limit around the relevant file lines.)`
+  return `\n... (${maxMatches} matches shown; more matches truncated for context budget. Narrow the pattern/path, then use Read with lineOffset/lineLimit around the relevant file lines.)`
 }
 
-function validatePathMatches(pathMatches: string | undefined): string | undefined {
+function normalizePathMatches(pathMatches: string | string[] | undefined): string[] {
+  if (pathMatches === undefined) return []
+  return Array.isArray(pathMatches) ? pathMatches : [pathMatches]
+}
+
+function validatePathMatches(pathMatches: string | string[] | undefined): string | undefined {
   if (pathMatches === undefined) return undefined
-  const normalized = pathMatches.trim().toLowerCase()
-  if (normalized !== 'true' && normalized !== 'false') return undefined
+  const invalid = normalizePathMatches(pathMatches).find(glob => {
+    const normalized = glob.trim().toLowerCase()
+    return normalized === 'true' || normalized === 'false'
+  })
+  if (invalid === undefined) return undefined
   return JSON.stringify({
     code: 'INVALID_GREP_PATH_MATCHES_GLOB',
-    message: 'Grep pathMatches is a file glob filter, not a boolean. Omit pathMatches to search all files, or use a glob such as "**/*.ts" or "**/package.json".',
+    message: 'Grep pathMatches is a file glob filter, not a boolean. Omit pathMatches to search all files, use a glob such as "**/*.ts", or use an array such as ["src/**/*.ts", "test/**/*.ts"].',
     pathMatches,
   })
 }
@@ -120,7 +129,7 @@ async function grepFallback(
   searchPath: string,
   pattern: string,
   maxMatches: number,
-  pathMatches?: string,
+  pathMatches: string[],
 ): Promise<string> {
   const root = isAbsolute(searchPath) ? resolve(searchPath) : resolve(cwd, searchPath)
   const results: string[] = []
@@ -157,7 +166,7 @@ async function grepFallback(
   async function scanFile(filePath: string): Promise<void> {
     if (results.length >= probeLimit) return
     const displayPath = formatGrepPath(cwd, filePath)
-    if (pathMatches && !minimatch(displayPath, pathMatches, { dot: true })) return
+    if (pathMatches.length > 0 && !pathMatches.some(glob => minimatch(displayPath, glob, { dot: true }))) return
     let text = ''
     try {
       text = await readFile(filePath, 'utf8')

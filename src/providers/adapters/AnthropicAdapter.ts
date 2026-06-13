@@ -344,6 +344,7 @@ export class AnthropicAdapter implements ModelAdapter {
         content,
       }
     })
+    validateAnthropicToolMessageSequence(formattedMessages)
 
     // Map tools
     const mappedTools = params.tools?.map((tool, idx) => {
@@ -564,6 +565,35 @@ export class AnthropicAdapter implements ModelAdapter {
         type: 'finish',
         reason: pendingFinishReason,
       }
+    }
+  }
+}
+
+function validateAnthropicToolMessageSequence(messages: Array<{ role: string; content: any[] }>): void {
+  const knownToolUses = new Set<string>()
+  const completedToolUses = new Set<string>()
+
+  for (const message of messages) {
+    if (message?.role === 'assistant' && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type !== 'tool_use') continue
+        const id = String(block.id ?? '')
+        if (id) knownToolUses.add(id)
+      }
+      continue
+    }
+
+    if (!Array.isArray(message?.content)) continue
+    for (const block of message.content) {
+      if (block?.type !== 'tool_result') continue
+      const toolUseId = String(block.tool_use_id ?? '')
+      if (!toolUseId || !knownToolUses.has(toolUseId)) {
+        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${toolUseId || '<missing>'}`)
+      }
+      if (completedToolUses.has(toolUseId)) {
+        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${toolUseId}`)
+      }
+      completedToolUses.add(toolUseId)
     }
   }
 }

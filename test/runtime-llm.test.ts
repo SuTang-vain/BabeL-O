@@ -7,7 +7,7 @@ import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
 import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
-import { deriveFallbackUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
+import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
@@ -676,6 +676,84 @@ describe('User intent fallback guidance', () => {
     assert.equal(memory.requiresTools, false)
     assert.equal(shouldSuppressToolsForIntent(memory), false)
   })
+
+  test('keeps explicit memory-save prompts tool-required', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '请立即使用 mcp:evercore:memory_save_note 保存长期记忆：我偏好 regression-first 修复。',
+      cwd: tmpdir(),
+    })
+    assert.equal(guidance.intent, 'continue')
+    assert.equal(guidance.actionHint, 'normal')
+    assert.equal(guidance.requiresTools, true)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('keeps memory capability questions respond-only without tools', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '你当前能否写入记忆？',
+      cwd: tmpdir(),
+    })
+    assert.equal(guidance.intent, 'status')
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+    assert.equal('guidance' in guidance, false)
+  })
+
+  test('binds ambiguous problem analysis to agent failure after self-diagnosis history', () => {
+    const events: NexusEvent[] = [
+      {
+        type: 'user_message',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: 'session-intent-target',
+        timestamp: '2026-06-13T00:00:00.000Z',
+        text: '为什么你会编？这是你系统prompt的问题吗？',
+      },
+    ]
+
+    const guidance = deriveFallbackUserIntentGuidance({
+      events,
+      latestPrompt: '查看源码深度分析问题',
+      cwd: tmpdir(),
+    })
+
+    assert.equal(guidance.intent, 'continue')
+    assert.equal(guidance.requiresTools, true)
+    assert.equal(guidance.problemTarget, 'agent_failure')
+    const renderedPolicy = formatUserIntentGuidance(guidance)
+    assert.match(renderedPolicy, /Problem target: agent_failure/)
+    assert.match(renderedPolicy, /Evidence mode: verify_before_claim/)
+    assert.match(renderedPolicy, /Stale task mode: background_only/)
+    assert.doesNotMatch(renderedPolicy, /Guidance:|Instruction:|Do not switch back|Observed facts/)
+  })
+
+  test('keeps ordinary project problem analysis on project feature target', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '查看项目源码，深度分析当前功能问题',
+      cwd: tmpdir(),
+    })
+
+    assert.equal(guidance.intent, 'continue')
+    assert.equal(guidance.requiresTools, true)
+    assert.equal(guidance.problemTarget, 'project_feature')
+    assert.match(formatUserIntentGuidance(guidance), /Evidence mode: standard/)
+  })
+
+  test('binds correction away from project to agent failure target', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '不是项目本身，是你刚才为什么错',
+      cwd: tmpdir(),
+    })
+
+    assert.equal(guidance.intent, 'correction')
+    assert.equal(guidance.actionHint, 'prioritize_latest')
+    assert.equal(guidance.problemTarget, 'agent_failure')
+    assert.match(formatUserIntentGuidance(guidance), /Stale task mode: background_only/)
+  })
 })
 
 describe('LLMCodingRuntime', () => {
@@ -965,11 +1043,69 @@ describe('LLMCodingRuntime', () => {
     assert.equal(intake.actionHint, 'respond_only')
     assert.equal(intake.requiresTools, false)
     assert.equal(intake.source, 'model')
+    assert.equal('guidance' in intake, false)
 
     assert.equal(fetchCalls.length, 1)
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
-    assert.match(JSON.stringify(body.system), /User Intake Guidance/)
+    assert.match(JSON.stringify(body.system), /Turn Policy/)
+  })
+
+  test('persists self-diagnosis problemTarget even when intake model drifts to project_feature', async () => {
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.8,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"problemTarget\\":\\"project_feature\\",\\"reason\\":\\"Analyze project source.\\",\\"guidance\\":\\"Analyze the project feature.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createMockStream([
+          'event: content_block_start\n',
+          'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+          'event: content_block_delta\n',
+          'data: {"index":0,"delta":{"type":"text_delta","text":"I will inspect the runtime failure mode."}}\n\n',
+          'event: content_block_stop\n',
+          'data: {"index":0}\n\n',
+        ]),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-intake-problem-target-self-diagnosis',
+        prompt: '为什么你会编？这是你系统prompt的问题吗？',
+        cwd: tmpdir(),
+      })
+    )
+
+    const intake = events.find(event => event.type === 'user_intake_guidance') as any
+    assert.ok(intake)
+    assert.equal(intake.source, 'model')
+    assert.equal(intake.problemTarget, 'agent_failure')
+    assert.equal('guidance' in intake, false)
+
+    assert.equal(fetchCalls.length, 1)
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.match(JSON.stringify(body.system), /Problem target: agent_failure/)
+    assert.match(JSON.stringify(body.system), /Evidence mode: verify_before_claim/)
+    assert.match(JSON.stringify(body.system), /Stale task mode: background_only/)
+    assert.doesNotMatch(JSON.stringify(body.system), /Guidance:|Instruction:|Do not switch back|Observed facts|agent\/runtime failure mode/)
   })
 
   test('falls back identity prompts to respond-only intake when intake model fails', async () => {
@@ -1059,7 +1195,7 @@ describe('LLMCodingRuntime', () => {
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
     assert.deepEqual(toolNames, [...toolsRegistry.keys()].sort())
     assert.match(JSON.stringify(body.system), /Requires tools: no/)
-    assert.match(JSON.stringify(body.system), /Answer from existing context unless you genuinely need to run a command to verify/)
+    assert.match(JSON.stringify(body.system), /Tool mode: available_for_verification/)
   })
 
   test('loads latest session tail before building intake guidance', async () => {
@@ -1259,7 +1395,7 @@ describe('LLMCodingRuntime', () => {
 
     const intake = events.find(event => event.type === 'user_intake_guidance') as any
     assert.ok(intake)
-    assert.equal(intake.intent, 'status')
+    assert.equal(intake.intent, 'continue')
     assert.equal(intake.actionHint, 'normal')
     assert.equal(intake.requiresTools, true)
     assert.ok(!events.some(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT'))
@@ -1378,6 +1514,62 @@ describe('LLMCodingRuntime', () => {
     assert.ok(result)
     assert.equal(result.success, true)
     assert.match(result.message, /regression-first provider/)
+  })
+
+  test('memory capability answer suppresses internal implementation leakage and retries', async () => {
+    fetchStreamResponses.push(
+      createAnthropicTextStream('可以写入，但走的是 src/runtime/memoryProvider.ts 和 mcp:evercore:memory_save_note；commit ad22ed9 接了 MCP sidecar。'),
+      createAnthropicTextStream('可以，但不会自动静默写入。只有你明确要求记住，或批准记忆候选时，我才会发起写入；写入前会经过权限确认。长期记忆只作为背景提示，不替代当前工作区文件、会话记录或工具结果。'),
+    )
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowAllTools(),
+      new MemoryStorage(),
+      configManager,
+      {
+        name: 'test-memory-capability',
+        async retrieve() {
+          return {
+            content: '',
+            diagnostics: {
+              provider: 'test-memory-capability',
+              enabled: true,
+              hitCount: 0,
+              injectedChars: 0,
+              budgetChars: 256,
+              maxHitChars: 128,
+              truncated: false,
+              scope: 'project',
+            },
+          }
+        },
+      },
+    )
+    const events = await collectEvents(runtime.executeStream({
+      sessionId: 'test-memory-capability-answer-leakage',
+      prompt: '你当前能否写入记忆？',
+      cwd: tmpdir(),
+    }))
+
+    assert.equal(fetchCalls.length, 2)
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(firstBody.tools, undefined)
+    assert.match(JSON.stringify(firstBody.system), /Long-Term Memory Capability/)
+    assert.match(JSON.stringify(firstBody.system), /user-facing capability level/)
+
+    const leakError = events.find(event => event.type === 'error' && (event as any).code === 'MEMORY_CAPABILITY_ANSWER_LEAK_SUPPRESSED') as any
+    assert.ok(leakError)
+    assert.equal(leakError.details.pattern, 'source_path')
+    assert.ok(!events.some(event => event.type === 'assistant_delta' && /src\/runtime|ad22ed9|MCP sidecar|memory_save_note/.test((event as any).text)))
+
+    const result = events.find(event => event.type === 'result') as any
+    assert.ok(result)
+    assert.equal(result.success, true)
+    assert.match(result.message, /不会自动静默写入/)
+    assert.match(result.message, /权限确认/)
+    assert.match(result.message, /背景提示/)
+    assert.doesNotMatch(result.message, /src\/runtime|ad22ed9|MCP sidecar|memory_save_note/)
   })
 
   test('memory_save_note self-trigger emits permission_request before write', async () => {
@@ -2681,14 +2873,23 @@ describe('LLMCodingRuntime', () => {
       event.type === 'assistant_delta' && JSON.stringify(event).includes('tool_calls'),
     ))
 
-    assert.ok(!events.some(event => event.type === 'tool_started'))
+    const toolStarted = events.find(event => event.type === 'tool_started') as any
+    assert.ok(toolStarted)
+    assert.equal(toolStarted.name, 'Read')
+    assert.equal(toolStarted.toolUseId, 'call_bad')
+    assert.equal(toolStarted.input._parseError, true)
+    assert.equal(toolStarted.input.rawPreview, '{"path":README.md')
 
     const toolCompleted = events.find(event => event.type === 'tool_completed') as any
     assert.ok(toolCompleted)
     assert.equal(toolCompleted.name, 'Read')
+    assert.equal(toolCompleted.toolUseId, 'call_bad')
     assert.equal(toolCompleted.success, false)
-    assert.equal(toolCompleted.output.code, 'PARSE_ERROR')
+    assert.equal(toolCompleted.output.code, 'TOOL_INPUT_PARSE_ERROR')
+    assert.match(toolCompleted.output.repairHint, /pathMatches/)
     assert.equal(toolCompleted.output.rawPreview, '{"path":README.md')
+
+    assert.ok(events.indexOf(toolStarted) < events.indexOf(toolCompleted))
   })
 
   test('summarizes suppressed tool-shaped text without raw command bodies', () => {
@@ -2970,6 +3171,141 @@ describe('mapEventsToMessages', () => {
     assert.equal(messages[0].role, 'user')
     assert.equal(messages[0].content, 'continue')
     assert.doesNotMatch(JSON.stringify(messages), /call-orphan/)
+  })
+
+  test('repairs completed-before-started tool order during provider replay', () => {
+    const timestamp = '2026-05-22T05:40:00.126Z'
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-05-22T05:40:00.123Z',
+        text: 'inspect',
+      },
+      {
+        type: 'tool_completed',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp,
+        toolUseId: 'call-repair',
+        name: 'Bash',
+        success: true,
+        output: 'ok',
+      },
+      {
+        type: 'tool_started',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp,
+        toolUseId: 'call-repair',
+        name: 'Bash',
+        input: { command: 'echo ok' },
+      },
+    ], 'inspect')
+
+    assert.equal(messages.length, 3)
+    assert.equal(messages[1].role, 'assistant')
+    const assistantContent = messages[1].content as any[]
+    assert.equal(assistantContent[0].type, 'tool_use')
+    assert.equal(assistantContent[0].id, 'call-repair')
+    assert.equal(messages[2].role, 'user')
+    const userContent = messages[2].content as any[]
+    assert.equal(userContent.length, 1)
+    assert.equal(userContent[0].type, 'tool_result')
+    assert.equal(userContent[0].toolUseId, 'call-repair')
+    assert.equal(userContent[0].content, 'ok')
+    assert.doesNotMatch(JSON.stringify(messages), /denied or interrupted/)
+  })
+
+  test('replays timeout warnings as convergence constraints for provider continuation', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:00:00.000Z',
+        text: 'analyze deeply',
+      },
+      {
+        type: 'assistant_delta',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:00:01.000Z',
+        text: 'Partial analysis collected from Read and Grep.',
+      },
+      {
+        type: 'near_timeout_warning',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:02:24.000Z',
+        timeoutMs: 180_000,
+        elapsedMs: 144_000,
+        thresholdRatio: 0.8,
+        partialSummary: 'Read A and Grep B are verified.',
+        message: 'Execution is near its timeout budget.',
+      },
+    ], 'analyze deeply')
+
+    const last = messages.at(-1)
+    assert.equal(last?.role, 'user')
+    assert.match(String(last?.content), /Runtime timeout convergence warning/)
+    assert.match(String(last?.content), /Do not start new exploratory tool calls/)
+    assert.match(String(last?.content), /at most one explicitly bounded final check/)
+    assert.match(String(last?.content), /Mark unverified claims as unverified/)
+    assert.match(String(last?.content), /Read A and Grep B are verified/)
+  })
+
+  test('replays soft timeout extension as wrap-up constraint', () => {
+    const messages = mapEventsToMessages([
+      {
+        type: 'user_message',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:00:00.000Z',
+        text: 'analyze deeply',
+      },
+      {
+        type: 'timeout_budget_exceeded',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:01:00.000Z',
+        requestId: 'req-1',
+        timeoutMs: 60_000,
+        elapsedMs: 60_100,
+        policy: 'soft',
+        partialSummary: 'Some evidence has been collected.',
+        suggestedActions: ['summarize', 'narrow_scope'],
+        message: 'Soft timeout budget reached.',
+      },
+      {
+        type: 'timeout_extension_granted',
+        schemaVersion: '2026-05-21.babel-o.v1',
+        sessionId: 'session-id',
+        timestamp: '2026-06-13T00:01:00.001Z',
+        requestId: 'req-1',
+        extensionCount: 1,
+        maxExtensions: 1,
+        additionalMs: 60_000,
+        totalSoftBudgetMs: 120_000,
+        elapsedMs: 60_100,
+        policy: 'soft',
+        reason: 'auto-first-budget-exhausted',
+        message: 'Automatic soft-timeout extension granted.',
+      },
+    ], 'analyze deeply')
+
+    const budgetMessage = messages.at(-2)
+    assert.equal(budgetMessage?.role, 'user')
+    assert.match(String(budgetMessage?.content), /Runtime soft timeout budget reached/)
+    assert.match(String(budgetMessage?.content), /not permission for broad discovery/)
+    assert.match(String(budgetMessage?.content), /Some evidence has been collected/)
+
+    const extensionMessage = messages.at(-1)
+    assert.equal(extensionMessage?.role, 'user')
+    assert.match(String(extensionMessage?.content), /extension 1\/1/)
+    assert.match(String(extensionMessage?.content), /Use this extension to wrap up/)
+    assert.match(String(extensionMessage?.content), /Run at most one explicitly bounded final check/)
   })
 
   test('groups consecutive tool calls into one assistant turn and one tool result turn', () => {

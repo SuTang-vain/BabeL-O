@@ -34,6 +34,7 @@ import {
 } from './toolResultBudget.js'
 import {
   buildUserIntakeGuidanceEvent,
+  isMemoryCapabilityQuestion,
   shouldSuppressToolsForIntent,
 } from './intentGuidance.js'
 import {
@@ -65,7 +66,7 @@ import {
   streamProviderTurn,
   type RuntimeProviderTurn,
 } from './runtimePipeline.js'
-import { executeProviderToolCall } from './runtimeToolLoop.js'
+import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
 import type { MemoryProvider } from './memoryProvider.js'
 
@@ -80,7 +81,7 @@ export type MapEventsToMessagesOptions = {
 }
 
 export class LLMCodingRuntime implements NexusRuntime {
-  private readFileCache = new Map<string, { mtime: number; size: number }>()
+  private readFileCache = new Map<string, ReadFileCacheEntry>()
 
   constructor(
     private readonly tools: Map<string, AnyTool>,
@@ -479,6 +480,8 @@ export class LLMCodingRuntime implements NexusRuntime {
       let maxTokenRecoveryCount = 0
       let providerContextRecoveryCount = 0
       let suppressedToolRetryCount = 0
+      let memoryCapabilityAnswerRetryCount = 0
+      const memoryCapabilityQuestion = isMemoryCapabilityQuestion(options.prompt)
       const replacementState = createReplacementState()
       let providerLoopCompactAttempted = false
 
@@ -684,6 +687,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             executionStartMs: metrics.executionStartMs,
             queryStartMs: invocationStartMs,
             ...(toolCallTextLeakPhase && { toolCallTextLeakGuard: { phase: toolCallTextLeakPhase } }),
+            ...(memoryCapabilityQuestion && { memoryCapabilityAnswerLeakGuard: true }),
           })
           let providerTurnResult = await providerTurnStream.next()
           while (!providerTurnResult.done) {
@@ -816,6 +820,34 @@ export class LLMCodingRuntime implements NexusRuntime {
         if (providerTurn.toolCallTextLeakSuppression) {
           metrics.toolCallTextLeakSuppressedCount += 1
           metrics.toolShapedTextPattern = providerTurn.toolCallTextLeakSuppression.pattern
+        }
+        if (providerTurn.memoryCapabilityAnswerLeakSuppression) {
+          metrics.toolCallTextLeakSuppressedCount += 1
+          metrics.toolShapedTextPattern = providerTurn.memoryCapabilityAnswerLeakSuppression.pattern
+          const leakError = buildRuntimeErrorEvent({
+            sessionId: options.sessionId,
+            code: 'MEMORY_CAPABILITY_ANSWER_LEAK_SUPPRESSED',
+            message: 'Suppressed a memory capability answer that exposed internal implementation details; retrying with user-facing capability guidance.',
+            details: providerTurn.memoryCapabilityAnswerLeakSuppression,
+          })
+          yield leakError
+          previousEvents = [...previousEvents, leakError]
+          if (memoryCapabilityAnswerRetryCount < 1) {
+            memoryCapabilityAnswerRetryCount += 1
+            metrics.finalAnswerRetryCount += 1
+            messages.push({
+              role: 'user',
+              content: 'Retry the answer at the user-facing capability level only. Say whether memory writes are possible, that they require an explicit remember/save request or approved candidate plus permission confirmation, and that long-term memory is only a background hint. Do not mention source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets.',
+            })
+            continue
+          }
+          yield buildRuntimeResultEvent(
+            options.sessionId,
+            true,
+            '可以，但不会自动静默写入。只有当你明确要求“记住/保存到记忆”，或批准某条记忆候选时，我才会发起写入；写入前会经过权限确认。长期记忆只作为后续会话的背景提示，不会替代当前工作区文件、会话记录或工具结果。',
+          )
+          yield buildRuntimeExecutionMetricsEvent(options, metrics)
+          return
         }
         const providerOutcome = reduceProviderTurnOutcome({
           sessionId: options.sessionId,
@@ -1052,6 +1084,37 @@ export function mapEventsToMessages(
   let pendingToolResultMsg: ModelMessage | null = null
   let pendingToolAssistantMsg: ModelMessage | null = null
   let pendingReasoningContent = ''
+  const seenStartedToolIds = new Set<string>()
+  const earlyCompletedByToolId = new Map<string, Extract<NexusEvent, { type: 'tool_completed' }>>()
+  const emittedToolResultIds = new Set<string>()
+
+  const appendToolResult = (event: Extract<NexusEvent, { type: 'tool_completed' }>) => {
+    let lastMsg: ModelMessage | null = pendingToolResultMsg
+    if (!lastMsg || typeof lastMsg.content === 'string') {
+      lastMsg = { role: 'user', content: [] }
+      messages.push(lastMsg)
+      pendingToolResultMsg = lastMsg
+    }
+    const outputText =
+      typeof event.output === 'string'
+        ? event.output
+        : JSON.stringify(event.output, null, 2)
+    ;(lastMsg.content as ContentBlock[]).push({
+      type: 'tool_result',
+      toolUseId: event.toolUseId,
+      content: outputText,
+      isError: !event.success,
+      toolName: event.name,
+    })
+    emittedToolResultIds.add(event.toolUseId)
+  }
+
+  const appendRuntimeUserMessage = (content: string) => {
+    pendingToolResultMsg = null
+    pendingToolAssistantMsg = null
+    pendingReasoningContent = ''
+    messages.push({ role: 'user', content })
+  }
 
   for (const event of events) {
     if (event.type === 'user_message') {
@@ -1130,7 +1193,14 @@ export function mapEventsToMessages(
       pendingToolResultMsg = null
       pendingToolAssistantMsg = null
       messages.push({ role: 'user', content: `Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.` })
+    } else if (event.type === 'near_timeout_warning') {
+      appendRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
+    } else if (event.type === 'timeout_budget_exceeded') {
+      appendRuntimeUserMessage(formatTimeoutBudgetConvergenceMessage(event))
+    } else if (event.type === 'timeout_extension_granted') {
+      appendRuntimeUserMessage(formatTimeoutExtensionConvergenceMessage(event))
     } else if (event.type === 'tool_started') {
+      seenStartedToolIds.add(event.toolUseId)
       let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
       if (!lastMsg) {
         lastMsg = messages[messages.length - 1]
@@ -1156,9 +1226,12 @@ export function mapEventsToMessages(
         input: event.input,
       })
 
-      // If this tool was started but never completed (e.g. denied or interrupted),
-      // we must synthetically complete it with an error result block so future queries don't break.
-      if (!completedToolIds.has(event.toolUseId)) {
+      const completed = earlyCompletedByToolId.get(event.toolUseId)
+      if (completed && !emittedToolResultIds.has(event.toolUseId)) {
+        appendToolResult(completed)
+      } else if (!completedToolIds.has(event.toolUseId)) {
+        // If this tool was started but never completed (e.g. denied or interrupted),
+        // we must synthetically complete it with an error result block so future queries don't break.
         let lastUserMsg: ModelMessage | null = pendingToolResultMsg
         if (!lastUserMsg || typeof lastUserMsg.content === 'string') {
           lastUserMsg = { role: 'user', content: [] }
@@ -1171,29 +1244,56 @@ export function mapEventsToMessages(
           content: 'Error: Tool execution was denied or interrupted.',
           isError: true,
         })
+        emittedToolResultIds.add(event.toolUseId)
       }
-    } else if (event.type === 'tool_completed' && startedToolIds.has(event.toolUseId)) {
-      let lastMsg: ModelMessage | null = pendingToolResultMsg
-      if (!lastMsg || typeof lastMsg.content === 'string') {
-        lastMsg = { role: 'user', content: [] }
-        messages.push(lastMsg)
-        pendingToolResultMsg = lastMsg
+    } else if (
+      event.type === 'tool_completed' &&
+      startedToolIds.has(event.toolUseId) &&
+      !emittedToolResultIds.has(event.toolUseId)
+    ) {
+      if (seenStartedToolIds.has(event.toolUseId)) {
+        appendToolResult(event)
+      } else {
+        earlyCompletedByToolId.set(event.toolUseId, event)
       }
-      const outputText =
-        typeof event.output === 'string'
-          ? event.output
-          : JSON.stringify(event.output, null, 2)
-      ;(lastMsg.content as ContentBlock[]).push({
-        type: 'tool_result',
-        toolUseId: event.toolUseId,
-        content: outputText,
-        isError: !event.success,
-        toolName: event.name,
-      })
     }
   }
 
   return messages
+}
+
+function formatNearTimeoutConvergenceMessage(event: Extract<NexusEvent, { type: 'near_timeout_warning' }>): string {
+  return [
+    `Runtime timeout convergence warning: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (${Math.round(event.thresholdRatio * 100)}% threshold). ${event.message}`,
+    'Do not start new exploratory tool calls.',
+    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
+    'Mark unverified claims as unverified.',
+    'If the task needs more exploration, ask the user to continue with a fresh budget.',
+    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
+  ].filter(Boolean).join('\n')
+}
+
+function formatTimeoutBudgetConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_budget_exceeded' }>): string {
+  return [
+    `Runtime soft timeout budget reached: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (policy=${event.policy}). ${event.message}`,
+    'This is a recoverable budget signal, not permission for broad discovery.',
+    'Do not start new exploratory tool calls.',
+    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
+    'Mark unverified claims as unverified.',
+    'If more exploration is required, ask the user to continue with a fresh budget.',
+    event.suggestedActions?.length ? `Suggested actions: ${event.suggestedActions.join(', ')}.` : '',
+    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
+  ].filter(Boolean).join('\n')
+}
+
+function formatTimeoutExtensionConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_extension_granted' }>): string {
+  return [
+    `Runtime soft timeout extension granted: extension ${event.extensionCount}/${event.maxExtensions}, +${event.additionalMs}ms, total soft budget ${event.totalSoftBudgetMs}ms.`,
+    'Use this extension to wrap up.',
+    'Do not start broad discovery. Run at most one explicitly bounded final check, then answer.',
+    'Separate verified evidence from unverified claims.',
+    `Reason: ${event.reason}. ${event.message}`,
+  ].join('\n')
 }
 
 function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {

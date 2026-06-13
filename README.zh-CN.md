@@ -40,9 +40,11 @@ bbl go
 - **Session 切换与对话流**：`/session` 面板支持创建、选择、切换 session，并可复制当前 session id。
 - **SessionChannel 协作**：不同 session 可以交换 finding、handoff、review request、decision、memory candidate 等类型化消息，但这些消息永远只是协作上下文，不会被当作直接用户指令执行。
 - **上下文与记忆可视化**：`/context` 展示 token budget、压缩状态、记忆注入、恢复信息和 working set，让长对话状态更透明。
+- **记忆管理面板**：`/memory` 提供只读状态、受限记忆搜索、review-only 记忆候选和需要确认的 save/flush 操作。
 - **权限优先的工具系统**：Bash、Write、Edit、MCP 等敏感工具通过可见审批流执行，并保留 session 级信任和审计记录。
 - **MCP 与内置工具**：内置 Read、Grep、ListDir、Bash、WebSearch，并支持从 `mcp.json` 接入 MCP server。
 - **模型与 Profile 控制**：可在 TUI 中切换模型、provider 和 profile，配置状态由 Nexus 统一维护。
+- **运行稳定性修复**：session replay、context 压缩、证据路由、timeout 恢复和安装自检都经过加固，长时间 Go TUI 会话恢复路径更可预测。
 
 ---
 
@@ -60,13 +62,13 @@ bbl go
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.3 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.4 bash
 bbl go
 ```
 
 ### 手动下载发布二进制
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制和匹配的 `go-tui-*` 资产，也可以查看 [v0.3.3 发布说明](docs/releases/v0.3.3.md) 中的版本下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新单文件可执行二进制和匹配的 `go-tui-*` 资产，也可以查看 [v0.3.4 发布说明](docs/releases/v0.3.4.md) 中的版本下载链接。
 
 将下载好的 `bbl` 放入系统 `$PATH` 后运行：
 
@@ -134,6 +136,7 @@ Go TUI 内常用操作：
 | `/context` | 查看当前 context budget 与诊断信息 |
 | `/tools` 或 `Ctrl+O` | 打开工具面板 |
 | `/model` 或 `Ctrl+L` | 打开模型/profile 选择 |
+| `/memory` | 查看记忆状态、搜索记忆 hint、审阅候选记忆 |
 | `Ctrl+D` | 打开顶部状态面板 |
 | `Shift+Enter` | 在输入框中插入换行 |
 | `Ctrl+C` | 打开退出确认弹窗 |

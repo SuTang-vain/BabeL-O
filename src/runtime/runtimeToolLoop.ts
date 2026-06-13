@@ -41,6 +41,34 @@ export type ProviderToolCallExecutionOutcome =
   | { kind: 'continue'; toolResult: ToolResultContentBlock }
   | { kind: 'terminal' }
 
+export type ReadFileCacheEntry = {
+  mtime: number
+  size: number
+  ranges: ReadFileCacheRange[]
+}
+
+export type ReadFileCacheRange = {
+  startByte: number
+  endByte: number
+  completeFile: boolean
+  truncated: boolean
+  mode: 'auto' | 'full' | 'preview'
+  maxBytes: number
+  offset?: number
+  limit?: number
+  byteOffset?: number
+  byteLimit?: number
+  toolUseId: string
+  providerVisible: boolean
+}
+
+type RequestedReadCoverage = {
+  startByte: number
+  requestedEndByte: number
+  requiresFullFile: boolean
+  mode: 'auto' | 'full' | 'preview'
+}
+
 function recoverableDeniedToolResult(options: {
   toolUseId: string
   toolName: string
@@ -163,7 +191,7 @@ export async function* executeProviderToolCall(options: {
   runtimeOptions: RuntimeExecuteOptions
   storage: NexusStorage
   metrics: RuntimeExecutionMetrics
-  readFileCache: Map<string, { mtime: number; size: number }>
+  readFileCache: Map<string, ReadFileCacheEntry>
   taskScope?: TaskScopeDeclaredEvent
 }): AsyncGenerator<NexusEvent, ProviderToolCallExecutionOutcome> {
   const { toolCall, runtimeOptions, metrics, readFileCache } = options
@@ -171,14 +199,31 @@ export async function* executeProviderToolCall(options: {
 
   if (resolvedInput && typeof resolvedInput === 'object' && '_parseError' in (resolvedInput as Record<string, unknown>)) {
     const rawPreview = (resolvedInput as Record<string, unknown>)._rawInput as string || '(empty)'
-    const errorMsg = `Failed to parse tool input for ${toolCall.name}. The model output was not valid JSON. Raw input preview: ${rawPreview}`
+    const repairHint = 'Use a single pathMatches string or pathMatches array; do not repeat JSON keys.'
+    const errorMsg = [
+      `Failed to parse tool input for ${toolCall.name}. The model output was not valid JSON.`,
+      repairHint,
+      `Raw input preview: ${rawPreview}`,
+    ].join('\n')
+    yield {
+      type: 'tool_started',
+      ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
+      name: toolCall.name,
+      input: { _parseError: true, rawPreview },
+    }
     yield {
       type: 'tool_completed',
       ...eventBase(runtimeOptions.sessionId),
       toolUseId: toolCall.id,
       name: toolCall.name,
       success: false,
-      output: { code: 'PARSE_ERROR', message: 'Invalid JSON from model', rawPreview },
+      output: {
+        code: 'TOOL_INPUT_PARSE_ERROR',
+        message: 'Tool input was not valid JSON.',
+        repairHint,
+        rawPreview,
+      },
     }
     return {
       kind: 'continue',
@@ -501,9 +546,11 @@ export async function* executeProviderToolCall(options: {
     if (cached) {
       try {
         const stat = lstatSync(readPath)
-        if (stat.mtimeMs === cached.mtime) {
+        const requested = requestedReadCoverage(parsed.data as Record<string, unknown>, stat.size)
+        const covered = requested ? findCoveringReadRange(cached, requested) : undefined
+        if (stat.mtimeMs === cached.mtime && stat.size === cached.size && requested && covered) {
           metrics.toolRoundtripDurationMs += performance.now() - toolStartMs
-          const stubMsg = 'File unchanged since last read. The content from the earlier Read tool_result in this conversation is still current — refer to that instead of re-reading.'
+          const stubMsg = `File unchanged. The requested byte range ${requested.startByte}-${requested.requestedEndByte} was already returned in full by Read call ${covered.toolUseId}; use that earlier ${covered.completeFile ? 'full-file' : 'range'} result instead of re-reading.`
           yield { type: 'tool_completed', ...eventBase(runtimeOptions.sessionId), toolUseId: toolCall.id, name: tool.name, success: true, output: stubMsg }
           return {
             kind: 'continue',
@@ -525,7 +572,32 @@ export async function* executeProviderToolCall(options: {
     const readPath = resolve(runtimeOptions.cwd, String((parsed.data as { path: string }).path))
     try {
       const stat = lstatSync(readPath)
-      readFileCache.set(readPath, { mtime: stat.mtimeMs, size: stat.size })
+      const requested = requestedReadCoverage(parsed.data as Record<string, unknown>, stat.size)
+      if (requested) {
+        const previous = readFileCache.get(readPath)
+        const ranges = previous && previous.mtime === stat.mtimeMs && previous.size === stat.size ? previous.ranges : []
+        readFileCache.set(readPath, {
+          mtime: stat.mtimeMs,
+          size: stat.size,
+          ranges: [
+            ...ranges,
+            {
+              startByte: requested.startByte,
+              endByte: Math.min(requested.requestedEndByte, stat.size),
+              completeFile: requested.startByte === 0 && requested.requestedEndByte >= stat.size && !result.truncated,
+              truncated: Boolean(result.truncated),
+              mode: readModeFromInput(parsed.data as Record<string, unknown>),
+              maxBytes: positiveNumber((parsed.data as Record<string, unknown>).maxBytes) ?? 200_000,
+              offset: positiveOrZeroNumber((parsed.data as Record<string, unknown>).offset),
+              limit: positiveNumber((parsed.data as Record<string, unknown>).limit),
+              byteOffset: positiveOrZeroNumber((parsed.data as Record<string, unknown>).byteOffset),
+              byteLimit: positiveNumber((parsed.data as Record<string, unknown>).byteLimit),
+              toolUseId: toolCall.id,
+              providerVisible: true,
+            },
+          ],
+        })
+      }
     } catch {}
   }
   if (result.kind === 'error') {
@@ -597,4 +669,64 @@ export async function* executeProviderToolCall(options: {
       toolName: tool.name,
     },
   }
+}
+
+function requestedReadCoverage(input: Record<string, unknown>, fileSize: number): RequestedReadCoverage | undefined {
+  if (input.lineOffset !== undefined || input.lineLimit !== undefined) {
+    return undefined
+  }
+  const maxBytes = positiveNumber(input.maxBytes) ?? 200_000
+  const offset = positiveOrZeroNumber(input.byteOffset) ?? positiveOrZeroNumber(input.offset)
+  const limit = positiveNumber(input.byteLimit) ?? positiveNumber(input.limit)
+  const mode = readModeFromInput(input)
+  const startByte = offset ?? 0
+  if (startByte > fileSize) {
+    return { startByte, requestedEndByte: startByte, requiresFullFile: false, mode }
+  }
+  if (mode === 'full' && offset === undefined && limit === undefined) {
+    return { startByte: 0, requestedEndByte: fileSize, requiresFullFile: true, mode }
+  }
+  if (limit !== undefined) {
+    return {
+      startByte,
+      requestedEndByte: Math.min(fileSize, startByte + Math.min(limit, maxBytes)),
+      requiresFullFile: false,
+      mode,
+    }
+  }
+  if (mode === 'preview') {
+    return {
+      startByte,
+      requestedEndByte: Math.min(fileSize, startByte + Math.min(50_000, maxBytes)),
+      requiresFullFile: false,
+      mode,
+    }
+  }
+  return {
+    startByte,
+    requestedEndByte: Math.min(fileSize, startByte + maxBytes),
+    requiresFullFile: startByte === 0 && maxBytes >= fileSize,
+    mode,
+  }
+}
+
+function findCoveringReadRange(entry: ReadFileCacheEntry, requested: RequestedReadCoverage): ReadFileCacheRange | undefined {
+  return entry.ranges.find(range => {
+    if (!range.providerVisible || range.truncated) return false
+    if (range.mode === 'preview' && requested.mode !== 'preview') return false
+    if (requested.requiresFullFile && !range.completeFile) return false
+    return range.startByte <= requested.startByte && range.endByte >= requested.requestedEndByte
+  })
+}
+
+function readModeFromInput(input: Record<string, unknown>): 'auto' | 'full' | 'preview' {
+  return input.mode === 'full' || input.mode === 'preview' ? input.mode : 'auto'
+}
+
+function positiveNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined
+}
+
+function positiveOrZeroNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
 }

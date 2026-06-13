@@ -1116,6 +1116,60 @@ func TestSoftTimeoutEventsDoNotAppendTranscriptNoise(t *testing.T) {
 	}
 }
 
+func TestInternalStatusEventsDoNotAppendTranscriptNoise(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	before := len(m.transcript)
+
+	for _, event := range []map[string]any{
+		{
+			"type":     "permit",
+			"approved": true,
+			"reason":   "Approved from trusted Go TUI session",
+		},
+		{
+			"type":      "status",
+			"status":    "slash cancelled",
+			"message":   "slash cancelled",
+			"sessionId": "session_noise",
+		},
+		{
+			"type":      "unknown_runtime_status",
+			"message":   "near timeout elapsed=144003ms/180000ms Execution is near its timeout budget",
+			"sessionId": "session_noise",
+		},
+		{
+			"type":    "status",
+			"status":  "permit    approved (session)",
+			"message": "permit    approved=true reason=Approved from trusted Go TUI sessi",
+		},
+		{
+			"type":    "status",
+			"status":  "timeout  near timeout elapsed=144003ms/180000ms Execution is near its timeout budget;",
+			"message": "preserve a concise partial answer now.",
+		},
+	} {
+		m.consumeNexusEvent(event)
+	}
+
+	if got := len(m.transcript); got != before {
+		t.Fatalf("internal status events should not append transcript rows, got %d new rows", got-before)
+	}
+}
+
+func TestNonTextModesDoNotReceivePasteOrCSIInput(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeContextOverlay)
+
+	updated, _ := m.Update(tea.PasteMsg{Content: "should not paste"})
+	m = updated.(model)
+	updated, _ = m.Update(fmt.Stringer(fmtString("?CSI[49 51 59 50 117]?")))
+	m = updated.(model)
+
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("non-text overlay should not receive paste/CSI input, got %q", got)
+	}
+}
+
 func TestFormatNexusEventSummarizesToolCompletedOutput(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
 		"type":    "tool_completed",
@@ -4219,7 +4273,26 @@ func fullContextPayload() []byte {
 				{"path": "/workspace/src/runtime/compact.ts", "touches": 4},
 				{"path": "/workspace/src/cli/contextView.ts", "touches": 2}
 			],
-			"repeatedToolInputs": [
+			"taskScope": {
+					"cwd": "/workspace",
+					"primaryRoot": "/workspace",
+					"explicitRoots": [],
+					"confirmedExternalRoots": ["/workspace-sibling-confirmed"],
+					"inferredCandidateRoots": [],
+					"mode": "multi_root",
+					"source": "user_confirmation",
+					"latestDeclaredAt": "2026-06-13T00:00:00.000Z",
+					"pendingBoundaries": [
+						{"targetRoot": "/workspace-sibling-pending", "boundaryKind": "sibling_repo", "toolName": "Bash", "toolUseId": "tool-sibling-find", "action": "require_confirmation", "reason": "Sibling repo was not explicitly requested.", "timestamp": "2026-06-13T00:00:01.000Z"}
+					],
+					"confirmedBoundaries": [
+						{"targetRoot": "/workspace-sibling-confirmed", "confirmationScope": "once", "confirmedBy": "user", "timestamp": "2026-06-13T00:00:02.000Z"}
+					],
+					"outOfScopeEvidence": [
+						{"toolUseId": "tool-sibling-find", "toolName": "Bash", "targetRoot": "/workspace-sibling-pending", "reason": "Successful Bash evidence targeted a pending root.", "timestamp": "2026-06-13T00:00:03.000Z"}
+					]
+				},
+				"repeatedToolInputs": [
 				{"name": "Grep", "count": 5, "inputPreview": "context"},
 				{"name": "Read", "count": 2, "inputPreview": "/workspace/src/runtime/compact.ts"}
 			],
@@ -4266,6 +4339,11 @@ func TestBuildContextOverlayLinesExtractsTopLevelEnvelope(t *testing.T) {
 		"top context items:",
 		"tool_results 280 tokens · Bash:call_big",
 		"next threshold: warning at 5734 tokens (70%), remaining=4500",
+		"task scope multi_root · primary=/workspace",
+		"scope roots explicit=0 confirmedExternal=1 pendingBoundaries=1 outOfScopeEvidence=1",
+		"confirmed external roots: /workspace-sibling-confirmed",
+		"pending scope boundary: sibling_repo target=/workspace-sibling-pending tool=Bash",
+		"out-of-scope evidence: Bash:tool-sibling-find target=/workspace-sibling-pending",
 		"grounding: state=dirty-workspace · dirty files=2",
 		"actions=inspect_changed_files,re_read_referenced_files",
 		"context suggestions:",
@@ -6083,6 +6161,218 @@ func TestRenderActivityOverlayShowsHeaderInMode(t *testing.T) {
 			t.Fatalf("rendered activity overlay missing %q\nfull:\n%s", want, rendered)
 		}
 	}
+}
+
+func TestBuildMemoryOverlayLinesParsesMemoryStatusPayload(t *testing.T) {
+	raw := []byte(`{
+		"type": "memory_status",
+		"capability": {"available": true, "longTermMemory": true, "autoSearch": "cue-driven", "save": "permission-gated"},
+		"everCore": {
+			"enabled": true, "healthy": true, "mode": "managed",
+			"url": "http://127.0.0.1:45123", "appId": "app-1", "projectId": "proj-1", "agentId": "agent-1",
+			"retrieveMethod": "hybrid", "topK": 8,
+			"namespace": {"layer": "project", "isolationKey": "dataDir:abc", "projectIdSource": "workspace", "warningCode": ""},
+			"sidecar": {"managed": true, "running": true, "healthy": true, "dataDir": "/tmp/abc", "pid": 4242}
+		},
+		"guidance": {"memoryIsHint": true, "projectFactsRequireWorkspaceEvidence": true, "candidatesAutoWrite": false, "flushRuntimeOwned": true}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	want := []string{
+		"Status: available",
+		"EverCore: enabled=true healthy=true mode=managed",
+		"Endpoint: http://127.0.0.1:45123",
+		"App: app-1",
+		"Project: proj-1",
+		"Agent: agent-1",
+		"Retrieval: method=hybrid topK=8",
+		"layer=project", "isolation=dataDir:abc", "source=workspace",
+		"Sidecar:",
+		"managed=true", "running=true", "healthy=true",
+		"dataDir=/tmp/abc", "pid=4242",
+		"Capability: auto-search=cue-driven save=permission-gated",
+		"Boundaries:",
+		"read-only",
+	}
+	for _, w := range want {
+		if !containsLine(lines, w) {
+			t.Fatalf("expected line containing %q in:\n%s", w, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesEmptyAndErrorPaths(t *testing.T) {
+	if lines := buildMemoryOverlayLines(nil); len(lines) != 1 || !strings.Contains(lines[0], "No memory status payload") {
+		t.Fatalf("empty payload should report placeholder, got %v", lines)
+	}
+	if lines := buildMemoryOverlayLines([]byte("not json {")); len(lines) != 1 || !strings.Contains(lines[0], "Unable to decode memory status") {
+		t.Fatalf("invalid json should report decode error, got %v", lines)
+	}
+	raw := []byte(`{"everCore": {"enabled": false, "healthy": false}, "capability": {"available": false}}`)
+	lines := buildMemoryOverlayLines(raw)
+	if !containsLine(lines, "Status: disabled") {
+		t.Fatalf("disabled capability should yield 'Status: disabled', got:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestBuildMemoryOverlayLinesUnhealthyState(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": false, "mode": "remote", "errorCode": "EVERCORE_UNREACHABLE", "errorMessage": "dial tcp 127.0.0.1:1: connect: connection refused"},
+		"capability": {"available": false}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{
+		"Status: unhealthy",
+		"EverCore: enabled=true healthy=false mode=remote",
+		"Error: EVERCORE_UNREACHABLE",
+		"dial tcp",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected line containing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesParsesSearchResult(t *testing.T) {
+	raw := []byte(`{
+		"type": "memory_search_result",
+		"query": "remember preference",
+		"provider": "evercore",
+		"hitCount": 1,
+		"totalExtractedHits": 2,
+		"injectedChars": 48,
+		"budgetChars": 100,
+		"maxHitChars": 80,
+		"truncated": true,
+		"searchLatencyMs": 12,
+		"method": "keyword",
+		"topK": 1,
+		"content": "- User prefers regression-first fixes."
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{
+		"memory search",
+		"Query: remember preference",
+		"hits=1 extracted=2 truncated=true method=keyword topK=1",
+		"latencyMs=12",
+		"memory hints are not workspace facts",
+		"User prefers regression-first fixes",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected line containing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesParsesCandidatesResult(t *testing.T) {
+	raw := []byte(`{
+		"type": "memory_candidates",
+		"limit": 20,
+		"includeRejected": true,
+		"candidates": [{
+			"messageId": "msg_1",
+			"content": "User prefers focused regression tests before broad hygiene.",
+			"evidence": [{"type": "session_event", "ref": "evt_1"}],
+			"governance": {
+				"scope": "user",
+				"decision": "requires_approval",
+				"autoWrite": false,
+				"approval": {"status": "required", "requiredBy": "user"},
+				"blockedReasons": [],
+				"reviewReasons": ["memory_candidates_are_not_persisted_automatically"]
+			}
+		}]
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{
+		"memory candidates",
+		"count=1 limit=20 includeRejected=true",
+		"autoWrite=false; save requires explicit approval",
+		"msg_1 scope=user decision=requires_approval approval=required:user autoWrite=false evidence=1",
+		"focused regression tests",
+		"review=memory_candidates_are_not_persisted_automatically",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected line containing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesParsesApprovalRequiredResult(t *testing.T) {
+	raw := []byte(`{"type":"memory_action_approval_required","action":"save-note","risk":"write_lifecycle","requiredConfirmation":"save-note","guidance":"Memory save is write-risk."}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{"approval required", "Action: save-note", "Risk: write_lifecycle", "No memory write/lifecycle operation was executed"} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected line containing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestRenderMemoryOverlayLinesClampsScroll(t *testing.T) {
+	lines := []string{"line-0", "line-1", "line-2", "line-3", "line-4", "line-5"}
+	rendered := renderMemoryOverlayLines(lines, 0, 20)
+	if len(rendered) != 6 {
+		t.Fatalf("expected all 6 lines when height is large, got %d", len(rendered))
+	}
+	rendered = renderMemoryOverlayLines(lines, 10, 4)
+	if len(rendered) == 0 {
+		t.Fatalf("renderMemoryOverlayLines should clamp overflow, got empty")
+	}
+	rendered = renderMemoryOverlayLines([]string{}, 0, 0)
+	if len(rendered) != 1 || !strings.Contains(rendered[0], "No memory status loaded") {
+		t.Fatalf("empty lines should yield placeholder, got %v", rendered)
+	}
+}
+
+func TestRenderMemoryOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	if got := m.renderMemoryOverlay(120); got != "" {
+		t.Fatalf("renderMemoryOverlay outside modeMemoryOverlay should be empty, got %q", got)
+	}
+}
+
+func TestRenderMemoryOverlayShowsHeaderInMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.inputMode = modeMemoryOverlay
+	m.height = 30
+	m.memoryOverlayLines = buildMemoryOverlayLines([]byte(`{
+		"capability": {"available": true, "autoSearch": "cue-driven", "save": "permission-gated"},
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "appId": "app-1"},
+		"guidance": {"memoryIsHint": true, "projectFactsRequireWorkspaceEvidence": true, "candidatesAutoWrite": false}
+	}`))
+	rendered := m.renderMemoryOverlay(120)
+	if rendered == "" {
+		t.Fatalf("renderMemoryOverlay in modeMemoryOverlay should be non-empty")
+	}
+	for _, want := range []string{
+		"Memory",
+		"Status: available",
+		"App: app-1",
+		"auto-search=cue-driven",
+		"Boundaries:",
+		"read-only",
+		"scroll", "close",
+	} {
+		if !strings.Contains(rendered, want) {
+			t.Fatalf("rendered memory overlay missing %q\nfull:\n%s", want, rendered)
+		}
+	}
+}
+
+func TestUsesFullScreenOverlayIncludesMemoryOverlay(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.inputMode = modeMemoryOverlay
+	if !m.usesFullScreenOverlay() {
+		t.Fatalf("usesFullScreenOverlay should return true for modeMemoryOverlay")
+	}
+}
+
+func containsLine(lines []string, want string) bool {
+	for _, line := range lines {
+		if strings.Contains(line, want) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestConsumeNexusEventRecordsActivityForToolEvents(t *testing.T) {
@@ -8140,6 +8430,25 @@ func TestInputTextKeysInsertOnceAndInOrder(t *testing.T) {
 	}
 	if got := m.input.Value(); got != "AB你" {
 		t.Fatalf("text keys should insert exactly once and preserve order, got %q", got)
+	}
+}
+
+func TestInputShiftEnterInsertsNewlineWithoutSubmitting(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setInputValue("hello")
+	beforeTranscript := len(m.transcript)
+
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter, Mod: tea.ModShift}))
+	m = updated.(model)
+
+	if cmd != nil {
+		t.Fatalf("shift+enter should not submit a prompt")
+	}
+	if got := m.input.Value(); got != "hello\n" {
+		t.Fatalf("shift+enter input = %q, want newline appended", got)
+	}
+	if got := len(m.transcript); got != beforeTranscript {
+		t.Fatalf("shift+enter should not append transcript rows, got %d new rows", got-beforeTranscript)
 	}
 }
 

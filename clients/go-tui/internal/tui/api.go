@@ -86,6 +86,57 @@ func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, bas
 	}
 }
 
+func fetchMemoryStatus(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/runtime/memory/status", nil)
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
+func fetchMemorySearch(cfg Config, query string) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(cfg, http.MethodPost, "/v1/runtime/memory/search", map[string]any{"query": query})
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
+func fetchMemoryCandidates(cfg Config, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		query := url.Values{}
+		if strings.TrimSpace(sessionID) != "" {
+			query.Set("sessionId", sessionID)
+		}
+		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/runtime/memory/candidates", nil, query)
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
+func requestMemorySaveNote(cfg Config, note string, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		body := map[string]any{"note": note}
+		if strings.TrimSpace(sessionID) != "" {
+			body["sessionId"] = sessionID
+		}
+		raw, err := nexusRawJSON(cfg, http.MethodPost, "/v1/runtime/memory/save-note", body)
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
+func requestMemoryFlush(cfg Config, sessionID string) tea.Cmd {
+	return func() tea.Msg {
+		body := map[string]any{"sessionId": sessionID}
+		raw, err := nexusRawJSON(cfg, http.MethodPost, "/v1/runtime/memory/flush", body)
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
+func requestMemoryRestart(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(cfg, http.MethodPost, "/v1/runtime/memory/restart", map[string]any{})
+		return memoryStatusMsg{raw: raw, err: err}
+	}
+}
+
 func fetchContextAnalysis(cfg Config, sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/sessions/"+url.PathEscape(sessionID)+"/context", nil)

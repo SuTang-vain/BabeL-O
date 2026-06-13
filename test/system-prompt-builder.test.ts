@@ -4,6 +4,7 @@ import {
   buildSystemPromptSections,
   sectionsToPromptText,
   extractAbsolutePaths,
+  normalizeWrappedPathFragments,
 } from '../src/runtime/systemPromptBuilder.js'
 
 describe('buildSystemPromptSections', () => {
@@ -211,6 +212,17 @@ describe('buildSystemPromptSections', () => {
     assert.ok(sections.slice(0, firstVolatileIndex).every(section => section.cacheable))
     assert.ok(sections.slice(firstVolatileIndex).every(section => !section.cacheable))
   })
+
+  test('defines Turn Policy as structured control data with evidence separation', () => {
+    const sections = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+    })
+    const taskGuidelines = sections.find(section => section.id === 'task_guidelines')?.content ?? ''
+    assert.match(taskGuidelines, /Turn Policy/)
+    assert.match(taskGuidelines, /structured runtime control data/)
+    assert.match(taskGuidelines, /verified observations, code-confirmed causes, and hypotheses distinct/)
+  })
 })
 
 describe('sectionsToPromptText', () => {
@@ -236,5 +248,41 @@ describe('extractAbsolutePaths', () => {
   test('returns empty for text without paths', () => {
     const paths = extractAbsolutePaths('Hello world, no paths here')
     assert.equal(paths.length, 0)
+  })
+
+  test('normalizes terminal-wrapped hyphenated paths', () => {
+    const text = [
+      '请查看 /Users/example/repo/docs/nexus/reference/memory-capability',
+      '  -awareness-and-trigger-plan.md 的状态',
+    ].join('\n')
+
+    assert.equal(
+      normalizeWrappedPathFragments(text),
+      '请查看 /Users/example/repo/docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md 的状态',
+    )
+    assert.deepEqual(extractAbsolutePaths(text), [
+      '/Users/example/repo/docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md',
+    ])
+  })
+
+  test('normalizes terminal-wrapped underscore paths without indentation', () => {
+    const text = [
+      'Read /tmp/project/docs/runtime',
+      '_governance.md now',
+    ].join('\n')
+
+    assert.deepEqual(extractAbsolutePaths(text), [
+      '/tmp/project/docs/runtime_governance.md',
+    ])
+  })
+
+  test('does not normalize ordinary prose bullet paragraphs', () => {
+    const text = [
+      'Review /tmp/project/docs/runtime',
+      '- this bullet is a separate sentence, not a path suffix',
+    ].join('\n')
+
+    assert.equal(normalizeWrappedPathFragments(text), text)
+    assert.deepEqual(extractAbsolutePaths(text), ['/tmp/project/docs/runtime'])
   })
 })
