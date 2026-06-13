@@ -2,6 +2,80 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-13 — Go TUI 选区高亮覆盖问题确认解决并同步文档
+
+- **背景**: 用户验证后确认 Go TUI `--mouse` “实际选中但高亮不覆盖”的问题已经解决。
+- **同步**:
+  - `docs/nexus/reference/go-tui-selection-highlight-optimization-plan.md` 从“优化规划”更新为“优化记录”，状态改为 Resolved / Closed，并明确窄范围 `ultraviolet.ScreenBuffer` cell-level reverse highlight 是最终收口方案。
+  - `docs/nexus/README.md`、`docs/nexus/reference/README.md` 与 `docs/nexus/TODO.md` 的索引口径从“修复参考/规划”改为“已收口记录/回归参考”。
+  - `docs/nexus/DONE.md` 新增 Go TUI selection highlight / clipboard copy 完成能力索引，记录 300ms 高亮保留、精确 expiry 清理、no-op cache invalidation、cell-level highlight 与回归覆盖。
+- **边界**: 只同步文档，不改代码；后续若再出现终端主题对比度或 wrap/off-by-one 回归，应在对应 TUI TODO 中重新开未收口项。
+
+## 2026-06-13 — Memory Capability Awareness / Self-Trigger 规划建档
+
+- **背景**: EverCore / EverOS managed sidecar 与 provider protocol convergence 已完成首轮 live validation；下一步需要让 BabeL-O provider loop 知道 long-term memory 可用，并能按策略自触发 read-only search 与受控 save。
+- **实现**:
+  - 新增 `docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md`，规划 Phase G1-G6：Memory Capability block、tool trigger policy、memory candidate governance、runtime auto-search、mock provider self-trigger regression 与 live save/recall validation。
+  - 同步 `docs/nexus/reference/README.md`、`docs/nexus/README.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/TODO.md`，把 Phase G 作为 EverCore Integration 后续推进入口。
+- **验证**:
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-memory-capability-plan-format.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run format:check`（0 failures）
+- **边界**: 本次仅建档，不修改 runtime/tool 代码；规划继续要求 memory result 为 volatile / non-cacheable / non-authoritative hints，`memory_save_note` permission-gated，`memory_flush_session` runtime-owned by default。
+
+## 2026-06-13 — EverCore / EverOS provider protocol convergence live validation
+
+- **背景**: 用户要求根据 EverOS 规划文档推进结合并验证记忆系统跑通；此前阻塞点是 EverOS text LLM 只支持 OpenAI-compatible，而 BabeL-O 当前主 provider 是 MiniMax `anthropic-compatible`。
+- **实现**:
+  - EverOS 新增 protocol-aware text LLM 配置：`EVEROS_LLM__PROTOCOL=openai-compatible|anthropic-compatible`；`OpenAIProvider` 保持默认，新增 `AnthropicProvider` 调 `/v1/messages`，支持 Pydantic schema structured response validation。
+  - EverOS `get_llm_client()` 改走本地 `build_llm_provider()`，保持 service/memory 层只依赖 `LLMClient` 协议；`config.example.toml` 与默认配置注释同步 protocol 字段。
+  - EverOS cascade lifespan 在 embedding 未配置时降级为 disabled，不再阻塞 API startup；keyword-only search 仍可运行，vector/hybrid search 与 fresh vector indexing 继续要求 embedding。
+  - BabeL-O managed EverCore bridge 增加 `BABEL_O_EVERCORE_LLM_PROTOCOL` / `EVEROS_LLM__PROTOCOL`，自动桥接 OpenAI-compatible / OpenAI Responses / Anthropic-compatible adapter，显式 override 仍最高优先级。
+  - 同步 `/Users/tangyaoyue/DEV/EverOS/babel-o-evercore-integration-plan.md`、`docs/nexus/TODO.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/DONE.md`。
+- **验证**:
+  - `uv --directory /Users/tangyaoyue/DEV/EverOS run pytest tests/unit/test_component/test_llm tests/unit/test_config tests/unit/test_entrypoints/test_api/test_lifespans/test_cascade.py -q`（31/31 pass）
+  - `uv --directory /Users/tangyaoyue/DEV/EverOS run ruff check src tests/unit/test_component/test_llm`（pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-protocol-runtime-narrow.json npx --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O tsx --test --test-concurrency=1 --test-name-pattern="EverCore managed mode" /Users/tangyaoyue/DEV/BABEL/BabeL-O/test/runtime.test.ts`（4/4 pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-protocol-typecheck.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run typecheck`（pass）
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-evercore-protocol-format.json npm --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O run format:check`（0 failures）
+  - `npx --prefix /Users/tangyaoyue/DEV/BABEL/BabeL-O tsx /tmp/babel-o-everos-managed-live-validation.mjs`（passed：EverOS `/health` 200、memory add 200/accumulated、flush 200/extracted、keyword search 200；providerId `minimax`，protocol `anthropic-compatible`）
+- **边界**: 首轮 live validation 是 keyword-only search；embedding 未配置时 cascade disabled，后续如需 vector/hybrid search 与 fresh vector indexing 仍需配置真实 embedding provider。没有提交或推送。
+
+## 2026-06-13 — EverCore / EverOS provider protocol convergence 文档同步
+
+- **背景**: 长期记忆 live validation 暴露当前 EverOS text LLM 仍只支持 OpenAI-compatible chat-completions；BabeL-O 当前主 provider 可为 `anthropic-compatible`（如 MiniMax），因此 managed sidecar 不能无条件复用主 provider 配置。
+- **实现**:
+  - 更新 `/Users/tangyaoyue/DEV/EverOS/babel-o-evercore-integration-plan.md`，将旧 Phase A-D 规划改为当前 Phase A-E 已落地状态，并补充 short-term EverCore LLM override、mid-term EverOS `anthropic-compatible` provider、long-term single provider bridge 路线。
+  - 同步 `docs/nexus/TODO.md`、`docs/nexus/active/TODO_runtime.md` 与 `docs/nexus/DONE.md`，明确 managed sidecar 已支持 EverCore LLM override，自动桥接仅限 OpenAI-compatible / OpenAI Responses，后续优先推动 EverOS 原生 Anthropic-compatible LLM provider，不优先新增 BabeL-O OpenAI-compatible proxy。
+- **验证**:
+  - `npm run format:check`（check-only，0 failures）
+- **边界**: 本次只更新规划/状态文档，不修改 runtime/provider 代码；EverCore memory 仍为 volatile / non-cacheable / non-authoritative hints，SQLite/session/event/tool trace 仍是 BabeL-O 事实源。
+
+## 2026-06-13 — Go TUI 选区高亮与复制事件优化收口
+
+- **背景**: 用户反馈 Go TUI `--mouse` 存在“实际选中并复制，但视觉未高亮/高亮过早消失”的体验问题；优化依据为 `docs/nexus/reference/go-tui-selection-highlight-optimization-plan.md` 与 Crush per-item highlight/cache 对照。
+- **实现**:
+  - `selection.go`: release 成功复制后不再立即 `clearSelection()`；新增 `selectionHighlightExpiredMsg` / `expireSelectionHighlightCmd`，保留最后选区约 300ms，并按 `copiedAt + selection anchors` 精确清理，避免旧 tick 清掉新选区。
+  - `tui.go`: 增加 selection highlight expiry 消息处理；切换到非 composing mode 时清理 selection，避免 overlay 背后残留选区。
+  - `highlight.go`: `transcriptItem.SetHighlight` / `ClearHighlight` no-op 化；`highlightedViewportView()` 仅在无选区时全清 transcript highlight；有选区时由 `applySelectionToTranscriptItems` 更新范围内 item 并清理离开范围的 item，降低 cache churn；selection highlight 主绘制路径改为窄范围 `ultraviolet.ScreenBuffer` cell-level reverse highlight，避免字符串插入背景色在复杂 ANSI/wrap/cell 场景下覆盖不完整。
+  - `clients/go-tui/go.mod`: 将 `github.com/charmbracelet/ultraviolet` 提升为 direct dependency，仅用于 selection highlight 绘制。
+  - `tui_test.go` / `highlight_test.go`: 覆盖 release 后仍短暂高亮、复制文本与可见选区一致、selection expiry 只清匹配 copy、重复同范围高亮不失效 cache、CJK/emoji/nested ANSI 高亮不破坏纯文本；后续补强反向拖选 normalize、MouseCapture off no-op、进入 overlay 清理 selection 的边界回归。
+  - `go-tui-selection-highlight-optimization-plan.md`: 状态更新为 Phase 0/1/2/3/4 已落地；Phase 4 记录窄范围 ultraviolet cell-buffer highlight；Phase 5 `tea.SetClipboard` 已评估但暂不迁移，保留现有手写 OSC 52 builder + native clipboard fallback。
+- **验证**:
+  - `gofmt -w clients/go-tui/internal/tui/{selection.go,highlight.go,tui.go,tui_test.go,highlight_test.go}`
+  - `go -C clients/go-tui test ./...`（pass）
+  - `go -C clients/go-tui vet ./...`（pass）
+  - `go -C clients/go-tui build ./...`（pass）
+- **边界**: 仅窄范围引入 ultraviolet cell buffer 用于 selection highlight；未把整体 Go TUI 渲染迁移为 screen renderer；未升级 Bubble Tea；未改变 Nexus/runtime/context ownership；未扩展到 TypeScript TUI 或任意 overlay 文本选择。
+
+## 2026-06-13 — Go TUI 选区高亮优化规划建档
+
+- **背景**: 用户反馈 Go TUI `--mouse` 文本选区存在“实际选中/可复制但视觉未高亮”的体验问题；对照 Crush 后确认其稳定点在 per-item highlight、render callback 与 cache-version bump，而非单纯 OSC 52 复制。
+- **实现**:
+  - 新增 `docs/nexus/reference/go-tui-selection-highlight-optimization-plan.md`，记录当前 BabeL-O selection/highlight/copy 链路、Crush 对照结论、风险点、非目标与 Phase 0~5 修复计划。
+  - 同步 `docs/nexus/reference/README.md`、`docs/nexus/README.md` 与 `docs/nexus/TODO.md` 文档索引；当时标为 P2/watch 修复参考，后续已由上方“确认解决并同步文档”记录更新为已收口/回归参考。
+- **验证**:
+  - `rg -n "go-tui-selection-highlight-optimization-plan" docs/nexus`（确认 reference README、总 README、TODO 索引均可检索）
+- **边界**: 本次仅建档，不修改 Go TUI selection/highlight 代码；建档时先把 ultraviolet 作为非目标，后续已由“Go TUI 选区高亮与复制事件优化收口”记录修订为窄范围 cell-buffer 引入；仍不升级 Bubble Tea 大版本，不改变 Nexus/runtime ownership。
+
 ## 2026-06-12 — 文档库已完成文档归档整理
 
 - **背景**: 文档库盘点后确认 `docs/nexus/archive/` 内既有 completed plans 已归档，`docs/nexus/reference/` 多数仍是代码注释和长期架构约束，不应移动；真正仍处在活跃路径但已完成的是 Go TUI Phase 9 决策记录与 Go TUI v1 UI 升级计划。

@@ -55,9 +55,11 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [reference/workspace-path-drift-governance-plan.md](./reference/workspace-path-drift-governance-plan.md) | Workspace path drift、连续路径失败恢复与最终回答证据降级治理。 |
 | [reference/session-finalization-and-evidence-governance-plan.md](./reference/session-finalization-and-evidence-governance-plan.md) | Current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。 |
 | [reference/session-to-session-memory-channel-plan.md](./reference/session-to-session-memory-channel-plan.md) | Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。 |
+| [reference/memory-capability-awareness-and-trigger-plan.md](./reference/memory-capability-awareness-and-trigger-plan.md) | Memory capability awareness、自触发 memory_search / memory_save_note 与写入治理规划。 |
 | [reference/session-channel-tui-relationship-visibility-plan.md](./reference/session-channel-tui-relationship-visibility-plan.md) | SessionChannel TUI 关系可见化分层规划：状态栏、badge、tree、activity overlay 与 debug graph。 |
 | [reference/go-runner-plan.md](./reference/go-runner-plan.md) | 可选 Go `RemoteToolRunner` 执行后端参考；Go 只负责已批准工具的执行 mechanics，不替代 TypeScript Nexus 主体。 |
 | [reference/go-tui-rewrite-plan.md](./reference/go-tui-rewrite-plan.md) | `bbl go` / Go TUI 长期实验重写规划；Go 只负责终端交互、布局、键盘路由和事件渲染，不替代 Nexus/runtime/context/AgentScheduler。 |
+| [reference/go-tui-selection-highlight-optimization-plan.md](./reference/go-tui-selection-highlight-optimization-plan.md) | Go TUI `--mouse` 文本选区高亮与剪贴板复制优化记录；已用窄范围 ultraviolet cell-buffer highlight 收口“实际选中但视觉未高亮/不覆盖”的问题。 |
 
 ### Archive
 

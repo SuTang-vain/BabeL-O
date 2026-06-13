@@ -222,6 +222,10 @@ Phase D Optional MCP Tools 已收口：`BABEL_O_ENABLE_EVERCORE_MCP_TOOLS=1` 且
 
 Phase E Embedded / Managed EverCore 一体化部署 Spike 已收口：新增 `BABEL_O_EVERCORE_MODE=managed`，BabeL-O/Nexus 可默认关闭地管理本地 `everos server start` sidecar，自动分配 loopback 端口与本地数据目录，向 EverOS 注入 `EVEROS_MEMORY__ROOT` / `EVEROS_API__HOST` / `EVEROS_API__PORT`，并在 `/v1/runtime/status` 暴露 mode、health、redacted endpoint、data dir、pid、upload/MCP tools 状态；managed sidecar 启动/健康检查失败保持 non-fatal diagnostics，external mode 继续保留，SQLite/session/event/tool trace 仍是 authoritative 事实源，EverCore memory 仍只是 volatile / non-cacheable / non-authoritative hints。
 
+Phase F Provider Protocol Convergence 已完成首轮 live 验证：EverOS text LLM 侧新增 protocol-aware provider，BabeL-O managed sidecar 通过 `EVEROS_LLM__PROTOCOL` + `EVEROS_LLM__API_KEY` / `EVEROS_LLM__BASE_URL` / `EVEROS_LLM__MODEL` 桥接当前 provider；显式 `BABEL_O_EVERCORE_LLM_*` override 仍最高优先级。自动桥接按 adapter 映射：OpenAI-compatible / OpenAI Responses → `openai-compatible`，Anthropic-compatible → `anthropic-compatible`；已用当前 MiniMax Anthropic-compatible provider 跑通本地 loopback EverOS `/health`、`/api/v1/memory/add`、`/api/v1/memory/flush` 与 keyword `/api/v1/memory/search`。EverOS cascade 在 embedding 未配置时降级为 disabled，允许 health / add / flush / keyword search 验证继续运行；vector/hybrid search 与 fresh vector indexing 仍需要 embedding 配置。不优先在 BabeL-O 中新增 OpenAI-compatible proxy。
+
+Phase G Memory Capability Awareness / Self-Trigger 规划已建档：详见 [memory-capability-awareness-and-trigger-plan.md](../reference/memory-capability-awareness-and-trigger-plan.md)。下一步让 provider loop 明确知道 long-term memory 可用，并能按策略主动触发 `memory_search` / permission-gated `memory_save_note`；`memory_flush_session` 继续以 runtime lifecycle 为主。首个建议切片是 G1/G2：注入 non-cacheable Memory Capability block，更新 EverCore MCP tool descriptions，补 mock provider 自触发回归。
+
 ## P2/P3 Session Channel + Scoped Memory
 
 > 详细规划见 [session-to-session-memory-channel-plan.md](../reference/session-to-session-memory-channel-plan.md)。本项把 session 视为 workspace runtime state：project/workspace memory 默认按 session/cwd 隔离，user memory / auto-memory 只承载跨项目用户习惯与配置约束，EverCore / EverOS 作为长期语义记忆与 consolidation 层，不替代 SQLite/session/event/tool trace 事实源。
