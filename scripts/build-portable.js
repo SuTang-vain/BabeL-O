@@ -22,6 +22,7 @@ const platform = args.platform ?? process.platform
 const arch = args.arch ?? process.arch
 const suffix = platformSuffix(platform, arch)
 const packageSuffix = suffix.replace(/\.exe$/, '')
+const smokeMode = args.smoke ?? 'full'
 const version = packageJson.version
 const portableName = `babel-o-v${version}-${packageSuffix}`
 const portableRoot = resolve(repoRoot, 'dist', 'portable')
@@ -45,7 +46,7 @@ copyRuntimeTree(stageRoot, suffix, goTuiPath)
 installProductionDependencies(stageRoot)
 writeLaunchers(stageRoot)
 archivePortable(stageRoot, output)
-smokePortable(stageRoot)
+smokePortable(stageRoot, smokeMode)
 
 console.log(JSON.stringify({
   type: 'portable_bundle',
@@ -54,6 +55,7 @@ console.log(JSON.stringify({
   arch,
   suffix,
   packageSuffix,
+  smokeMode,
   output,
   bytes: statSync(output).size,
 }, null, 2))
@@ -70,7 +72,12 @@ function parseArgs(values) {
     else if (value === '--go-tui') parsed.goTui = values[++index]
     else if (value.startsWith('--out=')) parsed.out = value.slice('--out='.length)
     else if (value === '--out') parsed.out = values[++index]
+    else if (value.startsWith('--smoke=')) parsed.smoke = value.slice('--smoke='.length)
+    else if (value === '--smoke') parsed.smoke = values[++index]
     else throw new Error(`Unknown argument: ${value}`)
+  }
+  if (parsed.smoke !== undefined && !['full', 'basic', 'none'].includes(parsed.smoke)) {
+    throw new Error(`Unsupported --smoke mode: ${parsed.smoke}`)
   }
   return parsed
 }
@@ -154,7 +161,8 @@ function archivePortable(targetRoot, outputPath) {
   })
 }
 
-function smokePortable(targetRoot) {
+function smokePortable(targetRoot, mode) {
+  if (mode === 'none') return
   const versionOutput = execFileSync(process.execPath, [join(targetRoot, 'bin', 'bbl.js'), '--version'], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -162,6 +170,7 @@ function smokePortable(targetRoot) {
   if (!versionOutput.includes(version)) {
     throw new Error(`Portable bbl --version returned ${JSON.stringify(versionOutput)}, expected ${version}.`)
   }
+  if (mode === 'basic') return
 
   const checkOutput = execFileSync(
     process.execPath,

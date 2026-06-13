@@ -20,6 +20,7 @@ jobs:
             goarch: arm64
             node_platform: darwin
             node_arch: arm64
+            smoke_mode: full
             go_tui_binary: go-tui
           - os: macos-15-intel
             artifact: bbl-darwin-x64
@@ -27,6 +28,7 @@ jobs:
             goarch: amd64
             node_platform: darwin
             node_arch: x64
+            smoke_mode: full
             go_tui_binary: go-tui
           - os: ubuntu-latest
             artifact: bbl-linux-x64
@@ -34,6 +36,7 @@ jobs:
             goarch: amd64
             node_platform: linux
             node_arch: x64
+            smoke_mode: full
             go_tui_binary: go-tui
           - os: windows-latest
             artifact: bbl-windows-x64
@@ -41,6 +44,7 @@ jobs:
             goarch: amd64
             node_platform: win32
             node_arch: x64
+            smoke_mode: basic
             go_tui_binary: go-tui.exe
     runs-on: ${{ matrix.os }}
     defaults:
@@ -75,6 +79,7 @@ jobs:
           --arch ${{ matrix.node_arch }}
           --go-tui clients/go-tui/bin/${{ matrix.go_tui_binary }}
           --out ${{ matrix.artifact }}.tar.gz
+          --smoke ${{ matrix.smoke_mode }}
       - uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.artifact }}.tar.gz
