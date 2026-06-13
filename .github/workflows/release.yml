@@ -38,14 +38,6 @@ jobs:
             node_arch: x64
             smoke_mode: full
             go_tui_binary: go-tui
-          - os: windows-latest
-            artifact: bbl-windows-x64
-            goos: windows
-            goarch: amd64
-            node_platform: win32
-            node_arch: x64
-            smoke_mode: basic
-            go_tui_binary: go-tui.exe
     runs-on: ${{ matrix.os }}
     defaults:
       run:

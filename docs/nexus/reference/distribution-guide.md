@@ -127,13 +127,12 @@ bbl-darwin-x64.tar.gz
 go-tui-darwin-x64
 bbl-linux-x64.tar.gz
 go-tui-linux-x64
-bbl-windows-x64.tar.gz
 go-tui-windows-x64.exe
 ```
 
-If a v0.3.5+ `bbl-*.tar.gz` asset is missing, `install.sh` may fall back to legacy assets if they exist. For new releases, treat that as a release bug: the portable package is the primary user install artifact.
+If a required macOS/Linux v0.3.5+ `bbl-*.tar.gz` asset is missing, `install.sh` may fall back to legacy assets if they exist. For new releases, treat that as a release bug: the portable package is the primary user install artifact.
 
-The curl installer supports macOS and Linux. Windows users should manually download `bbl-windows-x64.tar.gz`, extract it, and run `bin\bbl.cmd`.
+The curl installer supports macOS and Linux. Windows remains source-build first for v0.3.5 while the portable packaging path is stabilized.
 
 After release publication:
 

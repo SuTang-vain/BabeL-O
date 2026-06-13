@@ -32,7 +32,6 @@ v0.3.5 is the immediate safer release path before the larger Go launcher migrati
 bbl-darwin-arm64.tar.gz
 bbl-darwin-x64.tar.gz
 bbl-linux-x64.tar.gz
-bbl-windows-x64.tar.gz
 ```
 
 3. Keep standalone `go-tui-*` assets for manual debugging and compatibility, but do not require a second download in the curl install path.
@@ -182,7 +181,7 @@ When the Go launcher lands:
 
 Immediate:
 
-- v0.3.5+ releases publish all required `bbl-<platform>.tar.gz` packages.
+- v0.3.5+ releases publish all required macOS/Linux `bbl-<platform>.tar.gz` packages.
 - `install.sh` installs the portable package when present and writes a small launcher shim.
 - `install.sh` directly probes the bundled Go TUI executable with `--version`, then runs `bbl go --check --no-start-nexus` by default.
 - macOS curl installs do not rely on SEA spawning the Go TUI Mach-O.

@@ -78,7 +78,7 @@ bbl go
 bbl go
 ```
 
-Windows 用户请解压 `bbl-windows-x64.tar.gz`，然后运行 `bin\bbl.cmd go`。
+Windows 当前建议从源码构建；轻量发布版安装脚本目前面向 macOS 和 Linux。
 
 ### 从源码构建
 

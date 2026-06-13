@@ -78,7 +78,7 @@ Extract it, add its `bin/` directory to your `$PATH`, then run:
 bbl go
 ```
 
-On Windows, extract `bbl-windows-x64.tar.gz` and run `bin\bbl.cmd go`.
+Windows support is currently source-build first while the lightweight release installer targets macOS and Linux.
 
 ### Build From Source
 
