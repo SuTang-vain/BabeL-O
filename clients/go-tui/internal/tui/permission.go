@@ -92,19 +92,10 @@ func (m *model) sendPermissionDecision(approved bool, reason, scope, rule, feedb
 	}
 	select {
 	case m.decisions <- decision:
-		if approved {
-			if scope == "session" {
-				m.appendLine("permission", "approved (session)")
-			} else {
-				m.appendLine("permission", "approved")
-			}
-		} else {
-			if feedback != "" {
-				m.appendLine("permission", "rejected (with feedback)")
-			} else {
-				m.appendLine("permission", "rejected")
-			}
-		}
+		// Permission decisions are mirrored by Nexus as
+		// permission_response events and surfaced in /activity.
+		// Keep the main transcript focused on user/model/tool
+		// content instead of echoing approval bookkeeping.
 	default:
 		m.appendLine("error", "permission decision queue is full")
 		return false

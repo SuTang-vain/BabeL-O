@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"image"
 	"strings"
 	"unicode/utf8"
+
+	uv "github.com/charmbracelet/ultraviolet"
 )
 
 const (
@@ -54,12 +57,19 @@ func (item *transcriptItem) SetHighlight(startLine, startCol, endLine, endCol in
 	if item == nil {
 		return
 	}
+	if item.highlightActive &&
+		item.highlightStartLine == startLine &&
+		item.highlightStartCol == startCol &&
+		item.highlightEndLine == endLine &&
+		item.highlightEndCol == endCol {
+		return
+	}
 	item.baseHighlightable.SetHighlight(startLine, startCol, endLine, endCol)
 	item.cache.Invalidate()
 }
 
 func (item *transcriptItem) ClearHighlight() {
-	if item == nil {
+	if item == nil || !item.highlightActive {
 		return
 	}
 	item.baseHighlightable.ClearHighlight()
@@ -68,8 +78,8 @@ func (item *transcriptItem) ClearHighlight() {
 
 func (m model) highlightedViewportView() string {
 	sl, sc, el, ec, ok := m.normalizedSelection()
-	m.clearTranscriptHighlights()
 	if !ok {
+		m.clearTranscriptHighlights()
 		return m.viewport.View()
 	}
 	content := m.fullViewportContentWithSelection(sl, sc, el, ec)
@@ -138,6 +148,8 @@ func (m model) applySelectionToTranscriptItems(width int, transcriptStart int, s
 				localEndCol = ec
 			}
 			item.SetHighlight(localStartLine, localStartCol, localEndLine, localEndCol)
+		} else {
+			item.ClearHighlight()
 		}
 		contentLine += itemHeight
 		if i < len(m.transcript)-1 && formatted != "" && !strings.HasSuffix(formatted, "\n\n") {
@@ -161,24 +173,55 @@ func renderHighlightRange(view string, startLine, startCol, endLine, endCol int)
 		return view
 	}
 	lines := strings.Split(view, "\n")
-	for lineIdx := 0; lineIdx < len(lines); lineIdx++ {
-		if lineIdx < startLine || lineIdx > endLine {
-			continue
-		}
+	if len(lines) == 0 || startLine >= len(lines) || endLine < 0 {
+		return view
+	}
+	width := highlightBufferWidth(lines, startCol, endCol)
+	if width <= 0 {
+		return view
+	}
+	area := image.Rect(0, 0, width, len(lines))
+	buf := uv.NewScreenBuffer(width, len(lines))
+	uv.NewStyledString(view).Draw(&buf, area)
+	if endLine < 0 {
+		endLine = len(lines) - 1
+	}
+	if endLine >= len(lines) {
+		endLine = len(lines) - 1
+	}
+	for lineIdx := max(0, startLine); lineIdx <= endLine; lineIdx++ {
+		line := buf.Line(lineIdx)
 		colStart := 0
 		if lineIdx == startLine {
-			colStart = startCol
+			colStart = clamp(startCol, 0, len(line))
 		}
-		colEnd := visibleWidth(lines[lineIdx])
+		colEnd := len(line)
 		if lineIdx == endLine {
-			colEnd = endCol
+			colEnd = clamp(endCol, 0, len(line))
 		}
 		if colStart >= colEnd {
 			continue
 		}
-		lines[lineIdx] = paintColumnRange(lines[lineIdx], colStart, colEnd, selectionBackgroundStart, selectionBackgroundEnd)
+		for col := colStart; col < colEnd; col++ {
+			cell := line.At(col)
+			if cell == nil {
+				continue
+			}
+			cell.Style.Attrs |= uv.AttrReverse
+		}
 	}
-	return strings.Join(lines, "\n")
+	return buf.Render()
+}
+
+func highlightBufferWidth(lines []string, cols ...int) int {
+	width := 0
+	for _, line := range lines {
+		width = max(width, visibleWidth(line))
+	}
+	for _, col := range cols {
+		width = max(width, col)
+	}
+	return max(1, width)
 }
 
 // paintColumnRange injects a background-color span over the visual

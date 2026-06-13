@@ -588,11 +588,10 @@ func TestFormatNexusEvent(t *testing.T) {
 }
 
 // Phase 2 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
-// the new `timeout_budget_exceeded` event must render in the Go TUI
-// transcript as a budget/status row that surfaces elapsed/budget
-// numbers, the suggested next-step actions, and the message so the
-// operator can see the model just got a recoverable signal — not a
-// fatal cutoff.
+// the new `timeout_budget_exceeded` formatter must still surface
+// elapsed/budget numbers, suggested next-step actions, and the
+// message for non-transcript surfaces such as diagnostics. The
+// main transcript suppresses these rows as operational telemetry.
 func TestFormatNexusEventTimeoutBudgetExceeded(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
 		"type":      "timeout_budget_exceeded",
@@ -1039,6 +1038,13 @@ func TestSoftTimeoutEventsDoNotAppendTranscriptNoise(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
 	before := len(m.transcript)
 
+	m.consumeNexusEvent(map[string]any{
+		"type":      "near_timeout_warning",
+		"sessionId": "session_noise",
+		"timeoutMs": 180_000,
+		"elapsedMs": 144_003,
+		"message":   "Execution is near its timeout budget.",
+	})
 	m.consumeNexusEvent(map[string]any{
 		"type":      "timeout_budget_exceeded",
 		"sessionId": "session_noise",
@@ -5935,6 +5941,28 @@ func TestConsumeNexusEventRecordsActivityForToolEvents(t *testing.T) {
 	}
 }
 
+func TestPermissionResponseRecordsActivityWithoutTranscriptNoise(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	beforeTranscript := len(m.transcript)
+
+	_ = m.consumeNexusEvent(map[string]any{
+		"type":      "permission_response",
+		"approved":  true,
+		"reason":    "Approved from trusted Go TUI session",
+		"timestamp": "2026-06-10T10:00:01Z",
+	})
+
+	if got := len(m.transcript); got != beforeTranscript {
+		t.Fatalf("permission_response should not append transcript rows, got %d new rows", got-beforeTranscript)
+	}
+	if got := len(m.activityEvents); got != 1 {
+		t.Fatalf("permission_response should still record one activity event, got %d", got)
+	}
+	if got := m.activityEvents[0].Kind; got != activityKindPermission {
+		t.Fatalf("permission_response activity kind = %s, want %s", got, activityKindPermission)
+	}
+}
+
 func TestConsumeNexusEventSkipsActivityForIrrelevantEvents(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.sessionID = "sess_activity_2"
@@ -7933,6 +7961,78 @@ func TestModelPickBaseURLRendersSinglePromptArrow(t *testing.T) {
 	}
 }
 
+func TestInputTextKeysInsertOnceAndInOrder(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	for _, key := range []tea.KeyPressMsg{textKey("A"), textKey("B"), textKey("你")} {
+		updated, _ := m.Update(key)
+		var ok bool
+		m, ok = updated.(model)
+		if !ok {
+			t.Fatalf("expected model, got %T", updated)
+		}
+	}
+	if got := m.input.Value(); got != "AB你" {
+		t.Fatalf("text keys should insert exactly once and preserve order, got %q", got)
+	}
+}
+
+func TestModelProviderTextStepsAcceptTypedInput(t *testing.T) {
+	cases := []struct {
+		name string
+		mode inputMode
+		want string
+	}{
+		{"api key", modeModelPickApiKey, "sk-test"},
+		{"base url", modeModelPickBaseURL, "https://api.example.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			m.setMode(tc.mode)
+			for _, r := range tc.want {
+				updated, _ := m.Update(textKey(string(r)))
+				var ok bool
+				m, ok = updated.(model)
+				if !ok {
+					t.Fatalf("expected model, got %T", updated)
+				}
+			}
+			if got := m.input.Value(); got != tc.want {
+				t.Fatalf("%s input = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPermissionEditorTextStepsAcceptTypedInput(t *testing.T) {
+	cases := []struct {
+		name string
+		mode inputMode
+		want string
+	}{
+		{"rule", modePermissionEditRule, "bash:*"},
+		{"feedback", modePermissionEditFeedback, "try ls"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+			m.pending = &pendingPermission{name: "Bash"}
+			m.setMode(tc.mode)
+			for _, r := range tc.want {
+				updated, _ := m.Update(textKey(string(r)))
+				var ok bool
+				m, ok = updated.(model)
+				if !ok {
+					t.Fatalf("expected model, got %T", updated)
+				}
+			}
+			if got := m.input.Value(); got != tc.want {
+				t.Fatalf("%s input = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestPermissionEditorRendersSinglePromptArrow(t *testing.T) {
 	cases := []struct {
 		name string
@@ -8031,11 +8131,26 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 	primeSelectionViewport(&m)
 
 	viewportTop := m.viewportTopY()
+	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
+	targetLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "alpha line") {
+			targetLine = i
+			break
+		}
+	}
+	if targetLine < 0 {
+		t.Fatalf("test setup could not find alpha line in viewport content:\n%s", strings.Join(lines, "\n"))
+	}
+	targetCol := strings.Index(lines[targetLine], "alpha")
+	if targetCol < 0 {
+		t.Fatalf("test setup could not find alpha column in %q", lines[targetLine])
+	}
 
-	// press inside the transcript area. The header is currently
-	// two rows (title + divider), so use viewportTopY instead of
-	// baking a row number into the test.
-	updated, _ := m.Update(mouseClick(tea.MouseLeft, 5, viewportTop))
+	// press inside a visible transcript row. The header height
+	// is dynamic, so translate viewport-content line/col back
+	// into screen coordinates instead of baking in a row number.
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, targetCol, viewportTop+targetLine))
 	afterPress, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -8047,8 +8162,9 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 		t.Fatalf("press should activate selection")
 	}
 
-	// drag one viewport row down — should extend end (but not move start).
-	updated, _ = afterPress.Update(mouseMotion(tea.MouseLeft, 12, viewportTop+1))
+	// drag across the same transcript row — should extend end
+	// (but not move start) and make a visible text highlight.
+	updated, _ = afterPress.Update(mouseMotion(tea.MouseLeft, targetCol+5, viewportTop+targetLine))
 	afterDrag, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -8068,9 +8184,10 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 			afterPress.selectionStartLine, sl)
 	}
 
-	// release — should produce a clipboard cmd and clear mouse
-	// state, matching Crush's copy-then-ClearMouse flow.
-	updated, cmd := afterDrag.Update(mouseRelease(tea.MouseLeft, 12, viewportTop+1))
+	// release — should produce a clipboard cmd, clear mouse
+	// button state, and keep the highlight visible briefly so
+	// the operator sees the selected region after copy.
+	updated, cmd := afterDrag.Update(mouseRelease(tea.MouseLeft, targetCol+5, viewportTop+targetLine))
 	afterRelease, ok := updated.(model)
 	if !ok {
 		t.Fatalf("expected model, got %T", updated)
@@ -8081,11 +8198,14 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 	if afterRelease.mouseDownInViewport {
 		t.Fatalf("release should clear mouseDownInViewport")
 	}
-	if afterRelease.selectionActive {
-		t.Fatalf("release after copy should clear selectionActive")
+	if !afterRelease.selectionActive {
+		t.Fatalf("release after copy should keep selectionActive until the delayed highlight expiry")
 	}
-	if afterRelease.lastSelectionCopy == "" {
-		t.Fatalf("release should record lastSelectionCopy for the footer feedback")
+	if view := viewContent(afterRelease.View()); !containsCellSelectionHighlight(view) {
+		t.Fatalf("release should keep the copied selection highlighted briefly, got:\n%s", view)
+	}
+	if afterRelease.lastSelectionCopy != "alpha" {
+		t.Fatalf("release should copy the same visible text that stays highlighted, got %q", afterRelease.lastSelectionCopy)
 	}
 	if afterRelease.lastSelectionCopyAt.IsZero() {
 		t.Fatalf("release should stamp lastSelectionCopyAt")
@@ -8095,6 +8215,78 @@ func TestInAppSelectionDragAndCopy(t *testing.T) {
 	}
 	if !strings.Contains(afterRelease.renderFooter(80), "Selected text copied to clipboard") {
 		t.Fatalf("footer status should include English clipboard message, got:\n%s", afterRelease.renderFooter(80))
+	}
+}
+
+func TestInAppSelectionReverseDragAndCopy(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+
+	viewportTop := m.viewportTopY()
+	lines := strings.Split(stripANSICodes(m.fullViewportContent()), "\n")
+	targetLine := -1
+	for i, line := range lines {
+		if strings.Contains(line, "alpha line") {
+			targetLine = i
+			break
+		}
+	}
+	if targetLine < 0 {
+		t.Fatalf("test setup could not find alpha line in viewport content:\n%s", strings.Join(lines, "\n"))
+	}
+	alphaCol := strings.Index(lines[targetLine], "alpha")
+	if alphaCol < 0 {
+		t.Fatalf("test setup could not find alpha column in %q", lines[targetLine])
+	}
+
+	updated, _ := m.Update(mouseClick(tea.MouseLeft, alphaCol+5, viewportTop+targetLine))
+	afterPress := updated.(model)
+	updated, _ = afterPress.Update(mouseMotion(tea.MouseLeft, alphaCol, viewportTop+targetLine))
+	afterDrag := updated.(model)
+	updated, cmd := afterDrag.Update(mouseRelease(tea.MouseLeft, alphaCol, viewportTop+targetLine))
+	afterRelease := updated.(model)
+
+	if cmd == nil {
+		t.Fatalf("reverse drag release should copy selected text")
+	}
+	if got := afterRelease.lastSelectionCopy; got != "alpha" {
+		t.Fatalf("reverse drag should normalize copied text, got %q", got)
+	}
+	if !afterRelease.selectionActive {
+		t.Fatalf("reverse drag release should keep highlight active until delayed expiry")
+	}
+	if view := viewContent(afterRelease.View()); !containsCellSelectionHighlight(view) {
+		t.Fatalf("reverse drag release should keep visible highlight, got:\n%s", view)
+	}
+}
+
+func TestInAppSelectionMouseCaptureOffNoOp(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: false})
+	primeSelectionViewport(&m)
+
+	updated, cmd := m.Update(mouseClick(tea.MouseLeft, 5, m.viewportTopY()))
+	after := updated.(model)
+	if cmd != nil {
+		t.Fatalf("mouse-capture off selection press should not return a command")
+	}
+	if after.selectionActive || after.mouseDownInViewport {
+		t.Fatalf("mouse-capture off selection press should not start selection")
+	}
+}
+
+func TestSelectionClearsOnModeTransition(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+	m.selectionActive = true
+	m.selectionStartLine = 1
+	m.selectionStartCol = 2
+	m.selectionEndLine = 1
+	m.selectionEndCol = 8
+	m.mouseDownInViewport = true
+
+	m.setMode(modeHelpOverlay)
+	if m.selectionActive || m.mouseDownInViewport {
+		t.Fatalf("entering an overlay should clear transcript selection state")
 	}
 }
 
@@ -8127,6 +8319,62 @@ func TestExtractSelectedTextUsesVisibleColumnsForWideRunes(t *testing.T) {
 	got := m.extractSelectedText(targetLine, startCol, targetLine, startCol+3)
 	if got != "abc" {
 		t.Fatalf("selected text = %q, want %q", got, "abc")
+	}
+}
+
+func TestSelectionHighlightExpiresOnlyMatchingCopy(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
+	primeSelectionViewport(&m)
+	m.selectionActive = true
+	m.selectionStartLine = 1
+	m.selectionStartCol = 2
+	m.selectionEndLine = 1
+	m.selectionEndCol = 8
+	m.lastSelectionCopyAt = time.Unix(20, 0)
+
+	updated, _ := m.Update(selectionHighlightExpiredMsg{
+		copiedAt:  time.Unix(10, 0),
+		startLine: 1,
+		startCol:  2,
+		endLine:   1,
+		endCol:    8,
+	})
+	after, ok := updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if !after.selectionActive {
+		t.Fatalf("stale selection highlight expiry should not clear newer selection")
+	}
+
+	updated, _ = after.Update(selectionHighlightExpiredMsg{
+		copiedAt:  time.Unix(20, 0),
+		startLine: 1,
+		startCol:  2,
+		endLine:   1,
+		endCol:    9,
+	})
+	after, ok = updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if !after.selectionActive {
+		t.Fatalf("selection expiry with mismatched range should not clear current selection")
+	}
+
+	updated, _ = after.Update(selectionHighlightExpiredMsg{
+		copiedAt:  time.Unix(20, 0),
+		startLine: 1,
+		startCol:  2,
+		endLine:   1,
+		endCol:    8,
+	})
+	after, ok = updated.(model)
+	if !ok {
+		t.Fatalf("expected model, got %T", updated)
+	}
+	if after.selectionActive || after.mouseDownInViewport {
+		t.Fatalf("matching selection highlight expiry should clear selection state")
 	}
 }
 
@@ -8229,13 +8477,13 @@ func TestInAppSelectionClearsOnEmptyRelease(t *testing.T) {
 	}
 }
 
-// TestApplySelectionHighlightAddsBackgroundSpan verifies
-// that the highlight path injects a gray-background span
-// inside the selected row of the viewport output, without
+// TestApplySelectionHighlightAddsCellReverse verifies
+// that the highlight path paints selected cells inside
+// the selected row of the viewport output, without
 // disturbing the foreground colors of the surrounding
 // cells. This locks the rendering contract that the
 // operator sees.
-func TestApplySelectionHighlightAddsBackgroundSpan(t *testing.T) {
+func TestApplySelectionHighlightAddsCellReverse(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", MouseCapture: true})
 	primeSelectionViewport(&m)
 
@@ -8252,11 +8500,11 @@ func TestApplySelectionHighlightAddsBackgroundSpan(t *testing.T) {
 	m.viewport.SetYOffset(transcriptStart)
 
 	view := viewContent(m.View())
-	if !strings.Contains(view, "\x1b[48;5;240m") {
-		t.Fatalf("expected gray-background span in View output, got: %q", view)
+	if !containsCellSelectionHighlight(view) {
+		t.Fatalf("expected cell-level selection highlight in View output, got: %q", view)
 	}
-	if !strings.Contains(view, "\x1b[49m") {
-		t.Fatalf("expected background-reset span in View output, got: %q", view)
+	if !strings.Contains(stripANSICodes(view), "alpha line") {
+		t.Fatalf("cell-level selection highlight should preserve visible transcript text, got: %q", view)
 	}
 }
 

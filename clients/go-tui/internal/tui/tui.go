@@ -64,6 +64,14 @@ type copyToastExpiredMsg struct {
 	copiedAt time.Time
 }
 
+type selectionHighlightExpiredMsg struct {
+	copiedAt  time.Time
+	startLine int
+	startCol  int
+	endLine   int
+	endCol    int
+}
+
 type streamEvent struct {
 	payload map[string]any
 	err     error
@@ -1106,6 +1114,9 @@ func (m *model) setMode(next inputMode) {
 		return
 	}
 	wasFullScreenOverlay := m.usesFullScreenOverlay()
+	if next != modeComposing {
+		m.clearSelection()
+	}
 	m.inputMode = next
 	if next == modePermission {
 		m.permissionOpenedAt = time.Now()
@@ -1261,6 +1272,22 @@ func (m *model) setInputValue(value string) {
 	m.input.CursorEnd()
 	m.syncInputHeight()
 	m.resize()
+}
+
+func (m *model) updateInput(msg tea.Msg) tea.Cmd {
+	if m.inputMode == modeComposing {
+		if raw := fmt.Sprint(msg); m.handleUnknownCSIMessage(raw) {
+			return nil
+		}
+	}
+	oldInputHeight := m.input.Height()
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.syncInputHeight()
+	if m.input.Height() != oldInputHeight {
+		m.resize()
+	}
+	return cmd
 }
 
 func (m *model) handlePaste(content string) {
@@ -1828,7 +1855,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// re-render the panel header here — the overlay
 			// renderer in `View` reads `m.inputMode` and draws
 			// the editor prompt itself.
-			return m, nil
+			return m, m.updateInput(msg)
 
 		case modeHelpOverlay:
 			switch key {
@@ -2217,14 +2244,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.resize()
 				return m, nil
 			}
-			var inputCmd tea.Cmd
-			oldInputHeight := m.input.Height()
-			m.input, inputCmd = m.input.Update(msg)
-			m.syncInputHeight()
-			if m.input.Height() != oldInputHeight {
-				m.resize()
-			}
-			return m, inputCmd
+			return m, m.updateInput(msg)
 		}
 
 		// /model multi-step flow (Phase 1: hardcoded model
@@ -2281,7 +2301,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
 			}
-			return m, nil
+			return m, m.updateInput(msg)
 
 		case modeModelPickBaseURL:
 			switch key {
@@ -2304,7 +2324,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, saveRuntimeProviderConfig(m.cfg, provider.ID, m.modelPickAPIKeyDraft, m.modelPickBaseURLDraft)
 			}
-			return m, nil
+			return m, m.updateInput(msg)
 
 		case modeModelPickModel:
 			provider := m.currentModelProvider()
@@ -2801,17 +2821,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.copyToastShownAt = time.Time{}
 		}
 		return m, nil
+
+	case selectionHighlightExpiredMsg:
+		if !m.lastSelectionCopyAt.IsZero() && m.lastSelectionCopyAt.Equal(msg.copiedAt) &&
+			m.selectionActive &&
+			m.selectionStartLine == msg.startLine &&
+			m.selectionStartCol == msg.startCol &&
+			m.selectionEndLine == msg.endLine &&
+			m.selectionEndCol == msg.endCol {
+			m.clearSelection()
+		}
+		return m, nil
 	}
 
-	var inputCmd tea.Cmd
-	oldInputHeight := m.input.Height()
-	m.input, inputCmd = m.input.Update(msg)
-	m.syncInputHeight()
-	if m.input.Height() != oldInputHeight {
-		m.resize()
-	}
-	m.viewport, _ = m.viewport.Update(msg)
-	return m, inputCmd
+	return m, m.updateInput(msg)
 }
 
 func (m *model) resize() {
@@ -3428,7 +3451,13 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 	case "tool_started":
 		m.appendToolStarted(event)
 		m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
-	case "tool_denied", "permission_response", "context_warning", "context_blocking":
+	case "permission_response":
+		// Keep permission acknowledgements out of the main
+		// transcript. They are still useful in the activity panel,
+		// but inline rows like "permit approved=true ..." read like
+		// internal bookkeeping during normal chat.
+		m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
+	case "tool_denied", "context_warning", "context_blocking":
 		m.appendLine(eventType, formatNexusEvent(event))
 		// Phase 6 PR5: record high-signal events into the
 		// in-memory activity buffer for the /activity overlay.
@@ -3437,8 +3466,6 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// permission decisions, agent job events, and context
 		// warnings.
 		switch eventType {
-		case "permission_response":
-			m.recordActivityEvent(activityKindPermission, formatNexusEvent(event), stringField(event, "timestamp"))
 		case "context_warning":
 			m.recordActivityEvent(activityKindContextWarning, formatNexusEvent(event), stringField(event, "timestamp"))
 		case "context_blocking":
@@ -3508,16 +3535,17 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		if subAgentStatus, ok := subAgentStatusFromTaskSessionEvent(event); ok {
 			m.recordSubAgentEvent(event, subAgentStatus)
 		}
+	case "near_timeout_warning":
+		// Runtime timeout hints are operational telemetry. Do not
+		// render them in the chat transcript; the footer/soft-timeout
+		// state is the right surface for transient budget pressure.
 	case "timeout_budget_exceeded":
 		// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
-		// keep the existing transcript row (default formatter
-		// path) but also track the running soft-cycle state on
-		// the model so the footer can show a transient "soft
-		// budget reached" status and a subsequent
-		// REQUEST_TIMEOUT can be classified as a watchdog
-		// cutoff rather than a fresh fatal cutoff. The
-		// snapshot is cleared on result / error like
-		// `latestUsage`.
+		// track the running soft-cycle state on the model so the
+		// footer can show a transient "soft budget reached" status
+		// and a subsequent REQUEST_TIMEOUT can be classified as a
+		// watchdog cutoff rather than a fresh fatal cutoff. The
+		// snapshot is cleared on result / error like `latestUsage`.
 		elapsedMs := anyInt(event["elapsedMs"])
 		budgetMs := anyInt(event["timeoutMs"])
 		if m.softTimeoutState == nil {

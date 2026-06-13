@@ -149,8 +149,10 @@ func (m *model) handleSelectionMouse(msg selectionMouseEvent) (model, tea.Cmd) {
 	if !m.selectionInViewport(msg.x, msg.y) {
 		// A press / motion / release outside the viewport
 		// ends any in-progress drag without committing a
-		// copy.
-		m.mouseDownInViewport = false
+		// copy. If a prior copy left a short-lived highlight
+		// visible, an explicit click outside the transcript is
+		// also a clear signal.
+		m.clearSelection()
 		return *m, nil
 	}
 	contentLine := m.viewport.YOffset() + (msg.y - m.viewportTopY())
@@ -181,8 +183,18 @@ func (m *model) handleSelectionMouse(msg selectionMouseEvent) (model, tea.Cmd) {
 		m.lastSelectionCopyAt = time.Now()
 		m.copyToastMessage = "Selected text copied to clipboard"
 		m.copyToastShownAt = m.lastSelectionCopyAt
-		m.clearSelection()
-		return *m, tea.Sequence(osC52CopyCmd(text), expireCopyToastCmd(m.copyToastShownAt))
+		m.mouseDownInViewport = false
+		return *m, tea.Sequence(
+			osC52CopyCmd(text),
+			expireCopyToastCmd(m.copyToastShownAt),
+			expireSelectionHighlightCmd(
+				m.copyToastShownAt,
+				m.selectionStartLine,
+				m.selectionStartCol,
+				m.selectionEndLine,
+				m.selectionEndCol,
+			),
+		)
 	}
 	return *m, nil
 }
@@ -190,6 +202,18 @@ func (m *model) handleSelectionMouse(msg selectionMouseEvent) (model, tea.Cmd) {
 func expireCopyToastCmd(copiedAt time.Time) tea.Cmd {
 	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
 		return copyToastExpiredMsg{copiedAt: copiedAt}
+	})
+}
+
+func expireSelectionHighlightCmd(copiedAt time.Time, sl, sc, el, ec int) tea.Cmd {
+	return tea.Tick(300*time.Millisecond, func(time.Time) tea.Msg {
+		return selectionHighlightExpiredMsg{
+			copiedAt:  copiedAt,
+			startLine: sl,
+			startCol:  sc,
+			endLine:   el,
+			endCol:    ec,
+		}
 	})
 }
 
