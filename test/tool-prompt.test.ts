@@ -43,7 +43,7 @@ describe('Tool prompt()', () => {
     assert.match(bashPrompt, /Do NOT use Bash for ordinary source code reading/)
     assert.match(bashPrompt, /sed -n/)
     assert.match(bashPrompt, /grep \| head/)
-    assert.match(bashPrompt, /Read with offset\/limit/)
+    assert.match(bashPrompt, /Read with lineOffset\/lineLimit/)
     assert.match(bashPrompt, /Grep to locate text/)
     assert.match(bashPrompt, /ListDir for directory inventory/)
     assert.match(bashPrompt, /WebSearch for public web lookups/)
