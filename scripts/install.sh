@@ -251,11 +251,11 @@ node_major() {
 
 ensure_node_for_portable() {
   if ! have node; then
-    fail "BabeL-O v0.3.5 lightweight packages require Node.js >= 22 on PATH. Install Node.js, then rerun this installer."
+    fail "BabeL-O v0.3.6 lightweight packages require Node.js >= 22 on PATH. Install Node.js, then rerun this installer."
   fi
   major="$(node_major)"
   if ! printf '%s' "$major" | grep -Eq '^[0-9]+$' || [ "$major" -lt 22 ]; then
-    fail "BabeL-O v0.3.5 lightweight packages require Node.js >= 22; found Node.js $(node --version 2>/dev/null || echo unknown)."
+    fail "BabeL-O v0.3.6 lightweight packages require Node.js >= 22; found Node.js $(node --version 2>/dev/null || echo unknown)."
   fi
 }
 
@@ -566,7 +566,7 @@ else
 fi
 
 if [ -z "$VERSION" ]; then
-  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.5 to install a specific release."
+  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.6 to install a specific release."
 fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"

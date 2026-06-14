@@ -6,6 +6,7 @@ Release notes are kept outside `docs/nexus/` because they describe public versio
 
 ## Index
 
+- [v0.3.6](./v0.3.6.md)
 - [v0.3.5](./v0.3.5.md)
 - [v0.3.4](./v0.3.4.md)
 - [v0.3.3](./v0.3.3.md)

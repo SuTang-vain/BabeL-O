@@ -64,13 +64,13 @@ bbl go
 Install a specific release:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.6 bash
 bbl go
 ```
 
 ### Manual Release Package
 
-Download the latest `bbl-<platform>.tar.gz` package from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.5 release notes](docs/releases/v0.3.5.md) for version-specific links.
+Download the latest `bbl-<platform>.tar.gz` package from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [v0.3.6 release notes](docs/releases/v0.3.6.md) for version-specific links.
 
 Extract it, add its `bin/` directory to your `$PATH`, then run:
 

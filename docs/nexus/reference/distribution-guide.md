@@ -57,7 +57,7 @@ curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/in
 Specific release:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.6 bash
 ```
 
 Custom install paths:
@@ -204,7 +204,7 @@ Expected only for legacy macOS SEA installs:
 Reinstall a current lightweight version from main:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.6 bash
 ```
 
 ### `go_args[@]: unbound variable`

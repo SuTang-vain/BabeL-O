@@ -64,13 +64,13 @@ bbl go
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.5 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.6 bash
 bbl go
 ```
 
 ### 手动下载发布包
 
-从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新 `bbl-<platform>.tar.gz` 包，也可以查看 [v0.3.5 发布说明](docs/releases/v0.3.5.md) 中的版本下载链接。
+从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新 `bbl-<platform>.tar.gz` 包，也可以查看 [v0.3.6 发布说明](docs/releases/v0.3.6.md) 中的版本下载链接。
 
 解压后将其中的 `bin/` 目录加入系统 `$PATH`，然后运行：
 
