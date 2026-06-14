@@ -577,8 +577,8 @@ export type CreateNexusAppOptions = {
   /**
    * Server-side default for the per-request `policy` body field. When a
    * request body omits `policy`, this value is used. Defaults to
-   * `'strict'` to preserve the existing behavior of `bbl chat` / HTTP
-   * API consumers. Go TUI overrides per-request to `'soft-deny'`.
+   * `'strict'` to preserve existing HTTP API behavior. Go TUI overrides
+   * per-request to `'soft-deny'`.
    */
   executePolicyMode?: 'strict' | 'soft-deny'
   maxConcurrentExecutions?: number
@@ -1535,8 +1535,8 @@ export async function createNexusApp(
       abortController.abort()
     }, timeoutDecision.watchdogTimeoutMs)
     // Resolve effective policy mode: per-request body field overrides
-    // server-side default. Defaults to 'strict' to preserve `bbl chat`
-    // / HTTP API back-compat. See Phase B of
+    // server-side default. Defaults to 'strict' to preserve HTTP API
+    // back-compat. See Phase B of
     // docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
     const policyMode = body.policy ?? executePolicyMode
     // Per-request allowlist (Phase D): scoped to this turn only. When
@@ -2997,10 +2997,21 @@ export async function createNexusApp(
     socket.on('message', async (raw: Buffer) => {
       const parsedJson = parseJsonObject(raw)
       if (parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && parsedJson.type === 'permission_response') {
-        const res = (parsedJson as unknown) as { sessionId: string; toolUseId: string; approved: boolean; reason?: string }
+        const res = (parsedJson as unknown) as {
+          sessionId: string
+          toolUseId: string
+          approved: boolean
+          reason?: string
+          scope?: 'once' | 'session' | 'rule'
+          rule?: string
+          feedback?: string
+        }
         PendingPermissionRegistry.getInstance().resolve(res.sessionId, res.toolUseId, {
           approved: res.approved,
           reason: res.reason,
+          ...(res.scope && { scope: res.scope }),
+          ...(res.rule && { rule: res.rule }),
+          ...(res.feedback && { feedback: res.feedback }),
         })
         return
       }

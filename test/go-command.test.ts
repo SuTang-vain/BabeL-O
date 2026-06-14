@@ -1049,29 +1049,13 @@ test('bbl go --check: skips compat comparison when Go TUI version cannot be pars
   assert.match(combined, /Could not parse Go TUI major from --version output; compat check skipped\./)
 })
 
-/**
- * Phase 9 promotion gate regression guard. The `bbl go`
- * command's user-facing --help description must keep its
- * "stable alternative to bbl chat" wording (set in 2026-06-10
- * per docs/nexus/PHASE_9_DECISION.md). If a future change
- * accidentally reverts the wording back to "experimental"
- * (or similar) without first closing Phase 9 again, this
- * test trips the smoke step so the decision is surfaced.
- *
- * The test inspects the registered commander Command
- * object directly (rather than spawning the CLI), so it
- * doesn't depend on the tsx loader being available in
- * the test cwd.
- */
-test('bbl go --help describes the Go TUI as a stable alternative (Phase 9 promotion guard)', () => {
+test('bbl go --help describes the Go TUI as the production client', () => {
   const program = new Command()
   registerGoCommand(program)
   const goCommand = program.commands.find((c) => c.name() === 'go')
   assert.ok(goCommand, 'expected a `go` subcommand to be registered')
   const description = goCommand!.description()
-  assert.match(description ?? '', /Launch the Go TUI client/)
-  assert.match(description ?? '', /stable alternative to bbl chat/)
-  // Defensive: the OLD "experimental" wording must not
-  // creep back in unless Phase 9 is explicitly re-opened.
+  assert.match(description ?? '', /Launch the production Go TUI client/)
+  assert.doesNotMatch(description ?? '', /bbl chat/)
   assert.doesNotMatch(description ?? '', /experimental/)
 })

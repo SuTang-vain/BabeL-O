@@ -27,7 +27,7 @@ try {
 
   const checks = [
     ['bbl --help', ['bin/bbl.js', '--help']],
-    ['bbl chat --help', ['bin/bbl.js', 'chat', '--help']],
+    ['bbl go --check', ['bin/bbl.js', 'go', '--check', '--no-start-nexus', '--url', 'http://127.0.0.1:9']],
     ['bbl run hello', ['bin/bbl.js', 'run', 'hello']],
   ]
 

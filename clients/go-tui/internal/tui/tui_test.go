@@ -325,9 +325,9 @@ func TestBuildModelOverlayLinesMirrorsChatModelConfigSemantics(t *testing.T) {
 	for _, want := range []string{
 		"Active model: minimax/MiniMax-M3",
 		"Active profile: alpha",
-		"Configuration writes stay CLI-owned in Go TUI",
-		"bbl config use <modelId>",
-		"bbl chat /model",
+			"Configuration commands",
+			"bbl config use <modelId>",
+			"bbl go, then /model",
 		"minimax (MiniMax) · active · configured · auth=apiKey",
 		"* minimax/MiniMax-M3",
 		"ctx=245760",

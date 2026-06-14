@@ -1,6 +1,6 @@
 import { Command } from 'commander'
 import { NexusClient } from '../NexusClient.js'
-import { formatToolAudit } from '../toolAuditFormatter.js'
+
 
 export function registerToolsCommand(program: Command): void {
   const tools = program.command('tools').description('Inspect Nexus tools')
@@ -11,6 +11,6 @@ export function registerToolsCommand(program: Command): void {
     .option('--url <url>', 'Nexus URL')
     .action(async (options: { url?: string }) => {
       const audit = await new NexusClient({ baseUrl: options.url }).auditTools()
-      console.log(formatToolAudit(audit))
+      console.log(JSON.stringify(audit, null, 2))
     })
 }

@@ -113,17 +113,16 @@ export async function createDefaultNexusRuntime(
 
   // Z3 of the zero-friction memory plan: kick off the
   // background bootstrap at runtime startup so that any path
-  // triggering the runtime (bbl chat, bbl run, bbl serve behind
-  // bbl go) benefits from the same auto-bootstrap behavior. The
+  // triggering the runtime (bbl run, bbl serve behind bbl go)
+  // benefits from the same auto-bootstrap behavior. The
   // worker is fire-and-forget — failure is non-fatal and surfaced
   // via the /v1/runtime/status bootstrap field consumed by both
-  // the TS TUI welcome card and the Go TUI footer.
+  // the CLI welcome card and the Go TUI footer.
   //
   // The auto-bootstrap policy comes from the same env+state
-  // resolution that the TS TUI's chat loop uses, so a user who
+  // resolution used by the interactive launcher, so a user who
   // sets BABEL_O_EVERCORE_AUTO_BOOTSTRAP=1 once will see memory
-  // come online automatically regardless of which TUI they
-  // launched.
+  // come online automatically regardless of entrypoint.
   if (!options.disableAutoMemoryBootstrap) {
     const background = startEverOSBackgroundBootstrap({
       assumeYes: true,

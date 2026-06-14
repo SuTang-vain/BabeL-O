@@ -121,11 +121,11 @@ test('resolveFinalSessionOutcome does not reuse an older turn result when curren
 })
 
 test('resolveCliPolicyMode defaults to soft-deny to match Go TUI (Phase B 推进)', () => {
-  // Phase B 推进: `bbl chat` (embedded + --url service mode) now
-  // sends `policyMode: 'soft-deny'` by default, mirroring the Go
-  // TUI's hardcoded behavior. Without this, write/execute tools
-  // reach the `LocalCodingRuntime` hard-deny gate first and never
-  // see `permission_request` — operators have no way to approve.
+  // Phase B 推进: one-shot CLI execution sends
+  // `policyMode: 'soft-deny'` by default, mirroring the Go TUI's
+  // hardcoded behavior. Without this, write/execute tools reach the
+  // `LocalCodingRuntime` hard-deny gate first and never see
+  // `permission_request` — operators have no way to approve.
   const prev = process.env.BABEL_O_CLI_POLICY_MODE
   delete process.env.BABEL_O_CLI_POLICY_MODE
   try {

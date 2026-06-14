@@ -96,17 +96,6 @@ test('CLI and Nexus API expose the shared package version', async () => {
   }
 })
 
-test('chat command does not import Nexus storage or runtime internals directly', () => {
-  const source = readFileSync(new URL('../src/cli/commands/chat.ts', import.meta.url), 'utf8')
-  const forbidden = [
-    '../../storage/SqliteStorage.js',
-    '../../nexus/sessionLifecycle.js',
-    '../../runtime/compact.js',
-    '../../runtime/contextAnalysis.js',
-    '../../runtime/LLMCodingRuntime.js',
-  ]
-
-  for (const specifier of forbidden) {
-    assert.equal(source.includes(specifier), false, `${specifier} should stay behind Nexus API boundaries`)
-  }
+test('CLI no longer registers the removed TypeScript chat TUI command', () => {
+  assert.equal(program.commands.some(command => command.name() === 'chat'), false)
 })

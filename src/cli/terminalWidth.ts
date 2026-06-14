@@ -6,10 +6,9 @@ export function terminalWidth(text: string): number {
   let width = 0
   for (let i = 0; i < text.length; i++) {
     const codePoint = text.codePointAt(i)!
-    const char = String.fromCodePoint(codePoint)
+    const charWidth = isZeroWidthCodePoint(codePoint) ? 0 : isWideCodePoint(codePoint) ? 2 : 1
+    width += charWidth
     if (codePoint > 0xffff) i++
-    if (isZeroWidthCodePoint(codePoint)) continue
-    width += isWideCodePoint(codePoint) ? 2 : 1
   }
   return width
 }

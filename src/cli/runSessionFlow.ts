@@ -1,29 +1,30 @@
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import type { Interface as CliReadline } from 'node:readline'
 import chalk from 'chalk'
 import { NexusClient } from './NexusClient.js'
-import {
-  renderEvent,
-  startSession,
-  stopSpinner
-} from './renderEvents.js'
 import { ConfigManager, DEFAULT_CONFIG_DIR } from '../shared/config.js'
 import { createId } from '../shared/id.js'
 import { PendingPermissionRegistry } from '../shared/session.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../shared/events.js'
-import type { SessionPhase, TaskSessionTerminalReason } from '../shared/session.js'
+import type { PermissionResolution, SessionPhase, TaskSessionTerminalReason } from '../shared/session.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
 import { extractAbsolutePaths } from '../runtime/LLMCodingRuntime.js'
 import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
-import {
-  CliReadline,
-  sessionPermissionApprovals,
-  isSessionPermissionCached,
-  PermissionDecision,
-  askPermission,
-  handleLocalPermissionRequest,
-  encodeSessionPermissionRule
-} from './ui.js'
+
+type PermissionDialogEvent = {
+  sessionId?: string
+  toolUseId: string
+  name?: string
+  input?: unknown
+  risk?: string
+  message?: string
+  suggestedRule?: string
+}
+
+type CliPermissionDecision = PermissionResolution & {
+  scope: 'once' | 'session' | 'rule'
+}
 
 interface CustomWebSocket {
   send(data: string): void
@@ -83,7 +84,7 @@ export async function runSessionFlow(
       }
 
       socket.addEventListener('open', () => {
-        // Phase B 推进: align `bbl chat --url` with the Go TUI default
+        // Phase B 推进: align service-mode one-shot execution with the Go TUI default
         // (always sends `policy: 'soft-deny'`). Without this the WS
         // payload omits `policy` and the server falls back to
         // `executePolicyMode: 'strict'`, which hard-denies write/execute
@@ -103,21 +104,9 @@ export async function runSessionFlow(
         try {
           const data = JSON.parse(event.data)
           if (data.type === 'permission_request') {
-            renderEvent(data)
+            /* TUI render removed */
             try {
-              const cached = isSessionPermissionCached(data.sessionId, data)
-              const decision: PermissionDecision = cached
-                ? { approved: true, scope: 'session', reason: 'Approved from session permission cache' }
-                : await askPermission(rl, data, abortController.signal)
-              if (decision.approved && decision.scope === 'session' && data.name) {
-                const tools = sessionPermissionApprovals.get(data.sessionId) ?? new Set<string>()
-                if (decision.rule) {
-                  tools.add(encodeSessionPermissionRule(data.name, decision.rule))
-                } else {
-                  tools.add(data.name)
-                }
-                sessionPermissionApprovals.set(data.sessionId, tools)
-              }
+              const decision = await askCliPermission(rl, data, abortController.signal)
               if (socket && socket.readyState === 1 /* OPEN */) {
                 socket.send(JSON.stringify({
                   type: 'permission_response',
@@ -125,6 +114,9 @@ export async function runSessionFlow(
                   toolUseId: data.toolUseId,
                   approved: decision.approved,
                   reason: decision.reason,
+                  scope: decision.scope,
+                  ...(decision.rule && { rule: decision.rule }),
+                  ...(decision.feedback && { feedback: decision.feedback }),
                 }))
               }
             } catch (err: any) {
@@ -135,7 +127,7 @@ export async function runSessionFlow(
               }
             }
           } else {
-            renderEvent(data)
+            /* TUI render removed */
             if (data.type === 'result' || data.type === 'error') {
               abortController.signal.removeEventListener('abort', onAbort)
               socket?.close()
@@ -196,7 +188,7 @@ export async function runSessionFlow(
     storage.appendEvent = async (sid, ev) => {
       await originalAppendEvent(sid, ev)
       if (ev.type === 'permission_request') {
-        renderEvent(ev)
+        /* TUI render removed */
         void handleLocalPermissionRequest(sid, ev, rl, abortController.signal).catch(err => {
           console.error(chalk.red(`Permission prompt error: ${err.message || err}`))
           PendingPermissionRegistry.getInstance().resolve(sid, ev.toolUseId, {
@@ -205,7 +197,7 @@ export async function runSessionFlow(
           })
         })
       } else {
-        renderEvent(ev)
+        /* TUI render removed */
       }
     }
 
@@ -277,7 +269,7 @@ export async function runSessionFlow(
         model: settings.modelId,
         budget,
         remoteRunner: remoteRunner.runner,
-        // Phase B 推进: align embedded `bbl chat` with the Go TUI
+        // Phase B 推进: align embedded one-shot CLI execution with the Go TUI
         // default. Without `policyMode: 'soft-deny'` the
         // `LocalCodingRuntime` hard-deny gate fires before the
         // approval gate, and write/execute tools never reach
@@ -412,17 +404,16 @@ export function resolveFinalSessionOutcome(
 
 /**
  * Resolve the per-turn `policyMode` for the CLI's embedded +
- * service-mode paths. Phase B 推进: `bbl chat` defaults to
- * `'soft-deny'` to match the Go TUI's hardcoded default
- * (Go TUI always sends `policy: 'soft-deny'` per-request). Without
+ * service-mode paths. Phase B 推进: one-shot CLI execution defaults
+ * to `'soft-deny'` to match the Go TUI's hardcoded default. Without
  * this, write/execute tools reach the `LocalCodingRuntime` hard-deny
  * gate first and are blocked before any `permission_request` fires,
  * leaving the operator no way to approve.
  *
  * Override: set `BABEL_O_CLI_POLICY_MODE=strict` to opt back into
- * the old hard-deny behavior. Unset / unknown values fall back to
- * `'soft-deny'` (matches Go TUI) so a typo doesn't silently
- * downgrade safety.
+ * hard-deny behavior for CLI one-shot execution. Unset / unknown
+ * values fall back to `'soft-deny'` (matches Go TUI) so a typo
+ * doesn't silently downgrade safety.
  */
 export function resolveCliPolicyMode(): 'strict' | 'soft-deny' {
   const raw = process.env.BABEL_O_CLI_POLICY_MODE
@@ -436,4 +427,144 @@ export function resolveCliPolicyMode(): 'strict' | 'soft-deny' {
   // (We avoid `process.exit` here because the helper is also imported
   // by tests that construct fake env.)
   return 'soft-deny'
+}
+
+async function handleLocalPermissionRequest(
+  sessionId: string,
+  event: PermissionDialogEvent,
+  rl: CliReadline,
+  signal: AbortSignal,
+): Promise<void> {
+  await new Promise(resolve => setImmediate(resolve))
+  try {
+    const decision = await askCliPermission(rl, event, signal)
+    const resolved = PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+      approved: decision.approved,
+      reason: decision.reason,
+      scope: decision.scope,
+      ...(decision.rule && { rule: decision.rule }),
+      ...(decision.feedback && { feedback: decision.feedback }),
+    })
+    if (!resolved) {
+      console.error(chalk.red(`Permission request not found: ${event.toolUseId}`))
+    }
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+        approved: false,
+        reason: 'Cancelled by user',
+      })
+    } else {
+      throw err
+    }
+  }
+}
+
+async function askCliPermission(
+  rl: CliReadline,
+  event: PermissionDialogEvent,
+  signal: AbortSignal,
+): Promise<CliPermissionDecision> {
+  renderCliPermissionRequest(event)
+  const answer = await questionWithAbort(
+    rl,
+    chalk.yellow('Approve? [y] once / [s] session / [r] edit rule / [n] reject: '),
+    signal,
+  )
+  const normalized = answer.trim().toLowerCase()
+  if (normalized === 's' || normalized === 'session') {
+    const rule = event.suggestedRule ?? defaultPermissionRule(event)
+    return {
+      approved: true,
+      scope: 'session',
+      rule,
+      reason: `Approved for this session: ${rule}`,
+    }
+  }
+  if (normalized === 'r' || normalized === 'rule') {
+    const defaultRule = event.suggestedRule ?? defaultPermissionRule(event)
+    const ruleAnswer = await questionWithAbort(
+      rl,
+      chalk.yellow(`Allow rule (default: ${defaultRule}): `),
+      signal,
+    )
+    const rule = ruleAnswer.trim() || defaultRule
+    return {
+      approved: true,
+      scope: 'rule',
+      rule,
+      reason: `Approved with rule: ${rule}`,
+    }
+  }
+  if (normalized === 'n' || normalized === 'no' || normalized === 'reject') {
+    const reason = await questionWithAbort(
+      rl,
+      chalk.yellow('Reason, or press Enter to reject: '),
+      signal,
+    )
+    return {
+      approved: false,
+      scope: 'once',
+      reason: reason.trim() || 'Denied by user',
+      ...(reason.trim() && { feedback: reason.trim() }),
+    }
+  }
+  return {
+    approved: true,
+    scope: 'once',
+    reason: 'Approved once from CLI',
+  }
+}
+
+function renderCliPermissionRequest(event: PermissionDialogEvent): void {
+  const tool = event.name ?? 'tool'
+  const risk = event.risk ? ` (${event.risk} risk)` : ''
+  const input = formatPermissionInput(event.input)
+  console.error(chalk.yellow(`\nPermission required: ${tool}${risk}`))
+  if (event.message) console.error(chalk.dim(event.message))
+  if (input) console.error(`  ${input}`)
+  const rule = event.suggestedRule ?? defaultPermissionRule(event)
+  console.error(chalk.dim(`  suggested rule: ${rule}`))
+}
+
+function formatPermissionInput(input: unknown): string {
+  if (!input || typeof input !== 'object') return ''
+  const record = input as Record<string, unknown>
+  if (typeof record.command === 'string') return record.command
+  if (typeof record.path === 'string') return record.path
+  try {
+    return JSON.stringify(input)
+  } catch {
+    return String(input)
+  }
+}
+
+function defaultPermissionRule(event: PermissionDialogEvent): string {
+  if (event.name === 'Bash') return 'bash:*'
+  if (event.name && event.name.trim().length > 0) return `${event.name}:*`
+  return '*'
+}
+
+function questionWithAbort(
+  rl: CliReadline,
+  query: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (signal.aborted) return Promise.reject(abortError())
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      reject(abortError())
+    }
+    signal.addEventListener('abort', onAbort, { once: true })
+    rl.question(query, answer => {
+      signal.removeEventListener('abort', onAbort)
+      resolve(answer)
+    })
+  })
+}
+
+function abortError(): Error {
+  const err = new Error('Aborted')
+  err.name = 'AbortError'
+  return err
 }

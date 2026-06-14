@@ -456,7 +456,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           //  - `scope: 'once'` never touches the map
           if (
             approved &&
-            decision.scope === 'session' &&
+            (decision.scope === 'session' || decision.scope === 'rule') &&
             typeof decision.rule === 'string' &&
             decision.rule.length > 0
           ) {

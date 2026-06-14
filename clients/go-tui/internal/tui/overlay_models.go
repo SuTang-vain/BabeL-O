@@ -75,9 +75,9 @@ func buildModelOverlayLines(response runtimeModelsResponse) []string {
 		"Active model: " + firstNonEmpty(response.DefaultModel, "unknown"),
 		"Active profile: " + firstNonEmpty(response.ActiveProfile, "none"),
 		"",
-		"Configuration writes stay CLI-owned in Go TUI:",
+		"Configuration commands:",
 		"  bbl config use <modelId>",
-		"  bbl chat /model",
+		"  bbl go, then /model",
 		"",
 		"Providers:",
 	}

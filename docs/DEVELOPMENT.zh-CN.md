@@ -10,30 +10,25 @@
 
 开发专用行为应先保留在 `dev` 分支，验证稳定后再提升到 `main`。
 
-## 使用 dev 模式启动源码 CLI
+## 启动源码 CLI
 
 在源码检出目录中运行：
 
 ```bash
 npm ci
-npm run cli -- chat dev
+npm run build
+cd clients/go-tui && make build && cd ../..
+npm run cli -- go --check --no-start-nexus
+npm run cli -- go
 ```
 
-`chat dev` 会从当前源码树启动交互式 TUI，并在欢迎标题中显示：
-
-```text
-❖ BABEL-O  dev
-```
-
-本地验证源码改动时请使用该模式，避免与 `$PATH` 中已安装的正式 release 二进制 `bbl chat` 混淆。
+`bbl go` 是正式交互客户端。TypeScript chat TUI 已在 v0.3.7 从发布包中移除，因此源码验证也应走用户安装后实际使用的 Go TUI 路径。
 
 ## 与 release 二进制对比
 
 发布验证应使用已安装或已构建的二进制：
 
 ```bash
-bbl chat
-./dist/bbl chat
+bbl go --check --no-start-nexus
+./dist/cli/program.js go --check --no-start-nexus
 ```
-
-这些命令应显示 release 版本标题，例如 `❖ BABEL-O  v0.3.1`，而不是 `dev`。

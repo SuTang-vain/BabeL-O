@@ -1,7 +1,7 @@
 import chalk from 'chalk'
 import { Command } from 'commander'
 import { NexusClient } from '../NexusClient.js'
-import { shortSessionId, shouldRenderInboxEventCard } from '../inboxOverlay.js'
+
 import type { SessionSnapshot } from '../../shared/session.js'
 import type { SessionChannel, SessionMessage } from '../../shared/sessionChannel.js'
 
@@ -312,7 +312,7 @@ export function formatSessionsList(input: unknown, relationships: SessionRelatio
     const cwd = session.cwd ? ` · ${session.cwd}` : ''
     lines.push(`${chalk.bold(session.sessionId)} ${chalk.dim(session.phase)}${badge ? ` ${badge}` : ''}${cwd}`)
   }
-  lines.push(chalk.dim('Open details with: bbl sessions inbox <sessionId> or /inbox inside bbl chat.'))
+  lines.push(chalk.dim('Open details with: bbl sessions inbox <sessionId> or /inbox inside bbl go.'))
   return lines.join('\n')
 }
 
@@ -358,7 +358,7 @@ export function formatSessionsTree(
     })
   }
   lines.push(chalk.dim('Tree shows parent-child session structure only; non-tree channels stay as row badges.'))
-  lines.push(chalk.dim('Open message details with: /inbox or bbl sessions inbox <sessionId>.'))
+  lines.push(chalk.dim('Open message details with: /inbox in bbl go or bbl sessions inbox <sessionId>.'))
   return lines.join('\n')
 }
 
@@ -489,8 +489,8 @@ function formatSessionRelationshipBadge(session: SessionSnapshot, relationships:
   }
 
   if (unreadMessages.length > 0) {
-    parts.push(unreadMessages.some(message => message.priority === 'high' || shouldRenderInboxEventCard(message)) ? `!!${unreadMessages.length}` : `!${unreadMessages.length}`)
-    const keyMessage = unreadMessages.find(shouldRenderInboxEventCard) ?? unreadMessages.find(message => message.priority === 'high')
+    parts.push(unreadMessages.some(message => message.priority === 'high' || isKeyInboxMessage(message)) ? `!!${unreadMessages.length}` : `!${unreadMessages.length}`)
+    const keyMessage = unreadMessages.find(isKeyInboxMessage) ?? unreadMessages.find(message => message.priority === 'high')
     if (keyMessage) parts.push(keyMessage.type)
   }
 
@@ -502,6 +502,20 @@ function markerForChannelKind(kind: SessionChannel['kind']): string {
   if (kind === 'direct') return '↔'
   if (kind === 'project_bridge') return '↗'
   return '⇄'
+}
+
+function isKeyInboxMessage(message: SessionMessage): boolean {
+  if (message.status === 'acknowledged' || message.acknowledgedAt) return false
+  if (message.type === 'handoff' || message.type === 'blocked' || message.type === 'request_review' || message.type === 'request_validation') return true
+  return message.type === 'finding' && message.priority === 'high'
+}
+
+function shortSessionId(sessionId: string): string {
+  const normalized = sessionId.trim()
+  if (!normalized) return sessionId
+  const stripped = normalized.replace(/^session[-_]/, '')
+  if (stripped.length <= 18) return stripped
+  return `${stripped.slice(0, 8)}…${stripped.slice(-6)}`
 }
 
 function stringFromMetadata(metadata: SessionSnapshot['metadata'], key: string): string | undefined {

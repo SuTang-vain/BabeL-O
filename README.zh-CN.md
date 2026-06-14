@@ -55,9 +55,7 @@ bbl init                          # 交互式 wizard,或:
 bbl init --non-interactive --provider anthropic --model claude-3-5-sonnet-latest
 
 # 4. 聊天
-bbl chat                          # TypeScript TUI,功能最全
-# 或
-bbl go                            # 原生 Go TUI,~10 MB
+bbl go                            # 生产级原生 Go TUI
 
 # 5. 试试看
 > 解释这个 repo 的入口文件
@@ -98,7 +96,7 @@ TUI 内快捷键:
 - **Session 切换与对话流**：`/session` 面板支持创建、选择、切换、复制 session ID,全程不离开 TUI。
 - **SessionChannel 协作**：类型化的侧信道消息让 session 交换 findings、handoff、review 请求、决策、memory 候选,不会被当作直接的用户指令执行。
 - **上下文与记忆感知**：`/context` 展示预算、压缩、记忆、恢复、working set 诊断,长对话也可读。
-- **长期记忆（MemoryOS）**：可选的本地长期记忆,跑 managed sidecar。opt-in 启动,首次 `bbl chat` 会问;失败时一行黄色提示,而不是沉默降级。
+- **长期记忆（MemoryOS）**：可选的本地长期记忆,跑 managed sidecar。opt-in 启动,首次 `bbl go` 会提示/显示状态;失败时一行黄色提示,而不是沉默降级。
 - **权限优先的工具系统**：Bash / Write / Edit / MCP 工具等敏感操作都要经过显式审批,支持 session 级信任和审计日志。
 - **MCP 与内建工具**：Read / Grep / ListDir / Bash / WebSearch / 配置过的 MCP server 全部暴露,带风险分级。
 - **Model 与 Profile 控制**：TUI 内切换 model / provider profile,Nexus 保持 runtime 配置一致。
@@ -152,7 +150,7 @@ curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/in
 bbl go
 ```
 
-指定版本:在管道前加 `BBL_VERSION=v0.3.6 bash`。
+指定版本:在管道前加 `BBL_VERSION=v0.3.7 bash`。
 
 ### 从源码构建
 
@@ -222,8 +220,7 @@ TUI 内,用 `/session` 创建或切换 session,`/inbox` 看跨 session 消息,`/
 ## 常用命令
 
 ```bash
-bbl chat                          # 交互 TUI(TypeScript)
-bbl go                            # 交互 TUI(Go)
+bbl go                            # 交互 TUI(Go,正式入口)
 bbl run "解释这个 repo"           # 一次性 prompt,不开 TUI
 bbl init                          # 首启 provider + model wizard
 bbl doctor                        # 自检(provider、keychain、端口、memory)
@@ -238,6 +235,10 @@ bbl config show                   # 当前配置
 ```
 
 ---
+
+## TypeScript TUI 移除说明
+
+旧的 `bbl chat` TypeScript TUI 已在 v0.3.7 从发布包中移除。正式交互入口是 `bbl go`; `bbl run` 继续用于一次性自动化与脚本场景。这样可以减小分发包体积,减少两套终端 UI 的重复维护,并把后续交互体验集中到原生 Go TUI。
 
 ## 安全模型
 

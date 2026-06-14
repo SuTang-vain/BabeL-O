@@ -5,7 +5,6 @@ import { BABEL_O_VERSION } from '../shared/version.js'
 import { flushStartupTrace, markStartup } from './startupTrace.js'
 
 import { registerRunCommand } from './commands/run.js'
-import { registerChatCommand } from './commands/chat.js'
 import { registerNexusCommand } from './commands/nexus.js'
 import { registerToolsCommand } from './commands/tools.js'
 import { registerSessionsCommand } from './commands/sessions.js'
@@ -27,9 +26,10 @@ program
   .description('BabeL-O: Nexus-first coding agent CLI')
   .version(BABEL_O_VERSION)
 
-// Register modular commands
+// Register modular commands. The TS TUI chat entry point was
+// removed in the zero-friction plan; `bbl go` is the production
+// interactive entry, and `bbl run` is the one-shot fallback.
 registerRunCommand(program)
-registerChatCommand(program)
 registerNexusCommand(program)
 registerToolsCommand(program)
 registerSessionsCommand(program)
@@ -65,20 +65,3 @@ if (isMain()) {
 }
 
 export { program }
-
-export {
-  isSessionPermissionCached,
-  mapDropdownSelection,
-  describeCompletionChoice,
-  formatCompletionChoice,
-  formatPermissionDialog,
-  encodeSessionPermissionRule,
-  sessionPermissionApprovals,
-} from './ui.js'
-
-export {
-  getSlashCompletionChoices,
-  getSlashPaletteChoices,
-  getToolCompletionChoices,
-  formatSlashPalette,
-} from './completer.js'

@@ -5709,7 +5709,7 @@ test('execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=w
 test('execute fatal timeout policy never decorates REQUEST_TIMEOUT with details.kind=watchdog (back-compat)', async () => {
   // Phase 5 back-compat guard: legacy fatal callers must keep
   // the original REQUEST_TIMEOUT shape — no watchdog decoration —
-  // so HTTP API consumers and `bbl chat` integration stay
+  // so HTTP API consumers and older integrations stay
   // unchanged.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-fatal-no-watchdog-marker`)
   await mkdir(cwd, { recursive: true })

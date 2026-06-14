@@ -1,11 +1,15 @@
+import readline from 'node:readline'
 import chalk from 'chalk'
 import { Command } from 'commander'
-import { renderEvent } from '../renderEvents.js'
 import { createId } from '../../shared/id.js'
-import { questionAsync } from '../ui.js'
-import type { CliReadline } from '../ui.js'
 import { ConfigManager } from '../../shared/config.js'
 import type { InPlaceOptimizerApprovalRequest, PlannerAgentResult, PlannerReviewDecision, PlannerTaskPlan } from '../../nexus/agentLoop.js'
+
+type CliReadline = readline.Interface
+const questionAsync = (rl: CliReadline, query: string): Promise<string> =>
+  new Promise(resolve => {
+    rl.question(query, answer => resolve(answer))
+  })
 
 export type OptimizeCommandOptions = {
   target?: string
@@ -98,7 +102,6 @@ export function registerOptimizeCommand(program: Command): void {
       const originalAppendEvent = storage.appendEvent.bind(storage)
       storage.appendEvent = async (sessionId, event) => {
         await originalAppendEvent(sessionId, event)
-        renderEvent(event)
       }
 
       const sessionId = createId('session')

@@ -55,8 +55,7 @@ bbl init                          # interactive wizard, or:
 bbl init --non-interactive --provider anthropic --model claude-3-5-sonnet-latest
 
 # 4. Chat
-bbl go                            # Production Go TUI, ~10 MB binary, default
-# (legacy) bbl chat               # Frozen TypeScript TUI; remove in v0.5.0
+bbl go                            # Production Go TUI
 
 # 5. Try it
 > explain this repo's entry point
@@ -151,7 +150,7 @@ curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/in
 bbl go
 ```
 
-For a specific version: `BBL_VERSION=v0.3.6 bash` before the pipe.
+For a specific version: `BBL_VERSION=v0.3.7 bash` before the pipe.
 
 ### Build from source
 
@@ -222,7 +221,6 @@ In the TUI, use `/session` to create or switch sessions, `/inbox` to inspect cro
 
 ```bash
 bbl go                            # interactive TUI (Go, production)
-bbl chat                          # interactive TUI (TypeScript, **legacy / frozen**)
 bbl run "summarize this repo"     # one-shot prompt, no TUI
 bbl init                          # first-run provider + model wizard
 bbl doctor                        # self-check (provider, keychain, port, memory)
@@ -238,28 +236,9 @@ bbl config show                   # show active configuration
 
 ---
 
-## Legacy: `bbl chat` (TypeScript TUI)
+## TypeScript TUI Removal
 
-> **Frozen as of 2026-06. Removal planned for v0.5.0 once Go TUI feature parity is confirmed.**
-
-`bbl chat` is the original TypeScript TUI that drove the v0.1 → v0.3 line. The native Go TUI (`bbl go`, in `clients/go-tui`) is the production interactive entrypoint and has been the recommended path since v0.3.
-
-The legacy command still works, but:
-
-- Every invocation prints a yellow deprecation banner pointing you to `bbl go`.
-- New features are not added to the TypeScript TUI. The slash palette, vim mode, paste buffer, and other chat-specific code paths are in maintenance-only mode.
-- The `bbl run` one-shot command and the Nexus server (`bbl serve`) keep using the TypeScript runtime and shared `src/cli/` helpers — those are not affected by the freeze.
-
-If you must silence the banner (CI scripts, tests):
-
-```bash
-export BABEL_O_SUPPRESS_CHAT_DEPRECATION=1
-bbl chat
-```
-
-If you have feedback on what is missing from `bbl go` that blocks your migration, file an issue — we will use it to drive the v0.5.0 removal decision.
-
----
+The old `bbl chat` TypeScript TUI was removed from the release package in v0.3.7. The production interactive client is now `bbl go`; `bbl run` remains available for one-shot automation and scripting. This keeps the install smaller, reduces duplicated terminal UI logic, and concentrates future interaction work in the native Go TUI.
 
 ## Safety Model
 

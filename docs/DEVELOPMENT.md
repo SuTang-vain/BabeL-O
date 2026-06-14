@@ -10,30 +10,25 @@ This guide is for contributors working from the `dev` branch or a local source c
 
 Keep development-only behavior on `dev` until it is ready to be promoted to `main`.
 
-## Run the source CLI in dev mode
+## Run the source CLI
 
 From a source checkout:
 
 ```bash
 npm ci
-npm run cli -- chat dev
+npm run build
+cd clients/go-tui && make build && cd ../..
+npm run cli -- go --check --no-start-nexus
+npm run cli -- go
 ```
 
-`chat dev` starts the interactive TUI from the current source tree and renders the welcome header as:
-
-```text
-❖ BABEL-O  dev
-```
-
-Use this mode when validating local source changes so the session is not confused with an installed release binary such as `bbl chat` from your `$PATH`.
+`bbl go` is the production interactive client. The TypeScript chat TUI was removed from release packages in v0.3.7, so source validation should use the same Go TUI path that users run after installation.
 
 ## Release binary comparison
 
 For release validation, use the installed or built binary instead:
 
 ```bash
-bbl chat
-./dist/bbl chat
+bbl go --check --no-start-nexus
+./dist/cli/program.js go --check --no-start-nexus
 ```
-
-Those commands should render the release version title, for example `❖ BABEL-O  v0.3.1`, not `dev`.

@@ -3,7 +3,7 @@
 Nexus-first generalized AI agent runtime. CLI (`bbl`) talks to a headless Fastify
 daemon (`Nexus`) over REST + WebSocket. Runtimes are pluggable (`LocalCodingRuntime`
 for deterministic, `LLMCodingRuntime` for any LLM adapter). Go TUI client is the
-production interface; TypeScript TUI is the developer playground.
+production interactive interface; the legacy TypeScript TUI has been removed.
 
 > **Design rules:**
 > 1. *Nexus owns execution. CLI owns interaction.* Never leak runtime concerns
@@ -23,7 +23,7 @@ production interface; TypeScript TUI is the developer playground.
 | Task | Command |
 | --- | --- |
 | Install deps (locked) | `npm ci` |
-| Run source CLI in dev | `npm run cli -- chat dev` |
+| Run source CLI in dev | `npm run cli -- go` |
 | Start embedded Nexus daemon | `npm run start` |
 | Build TS → `dist/` | `npm run build` |
 | Build standalone SEA binary | `npm run build:binary` |
@@ -59,9 +59,9 @@ rely on the user's real `~/.babel-o/config.json` from any test.
 ┌──────────────────┐   HTTP / WS    ┌────────────────────────┐
 │ CLI  src/cli/    │ ─────────────► │ Nexus  src/nexus/      │
 │  - program.ts    │                │  - server.ts (Fastify) │
-│  - renderEvents  │                │  - app.ts (routes)     │
-│  - NexusClient   │                │  - createRuntime.ts    │
-│  - embedded.ts   │                │  - agentLoop.ts        │
+│  - NexusClient   │                │  - app.ts (routes)     │
+│  - embedded.ts   │                │  - createRuntime.ts    │
+│  - runSessionFlow│                │  - agentLoop.ts        │
 │  - commands/*    │                │  - agents/* (spawn)    │
 └──────────────────┘                │  - storageBridge.ts    │
                                     └───────────┬────────────┘
@@ -105,7 +105,8 @@ rely on the user's real `~/.babel-o/config.json` from any test.
      `scope_boundary_confirmed` on approval.
 5. The runtime streams `NexusEvent`s (`src/shared/events.ts` — Zod schemas
    versioned as `2026-05-21.babel-o.v1`).
-6. CLI renders events via `src/cli/renderEvents.ts` (Chalk, no React/Ink).
+6. Interactive rendering is owned by the Go TUI (`clients/go-tui/`); one-shot
+   CLI execution keeps only lightweight terminal prompts.
 
 **Tool risk model:** `read < write < execute < task`. Tools declare static
 `risk`; `Bash` overrides per-input via `riskForInput` (read-only subcommands
@@ -170,14 +171,10 @@ src/
 │   ├── program.ts          Commander bootstrap (registers all commands)
 │   ├── NexusClient.ts      HTTP + WS client to remote Nexus
 │   ├── embedded.ts         In-process NexusClient (no network)
-│   ├── renderEvents.ts     Streams NexusEvent → terminal output
-│   ├── runSessionFlow.ts   Shared between `bbl run` and `bbl chat`
-│   ├── contextView.ts      `/context` formatter
-│   ├── commands/           chat, run, nexus, sessions, tools, config, agents,
+│   ├── runSessionFlow.ts   One-shot session execution for `bbl run`
+│   ├── commands/           run, nexus, sessions, tools, config, agents,
 │   │                       models, optimize, go, inspectSession, help
-│   ├── inboxOverlay.ts     /inbox SessionChannel UI
-│   ├── channelSend.ts      /channel send preview-then-confirm flow
-│   └── collaborateOverlay.ts /collaborate unified hub
+│   └── terminalWidth.ts    Generic terminal width helpers for CLI output
 ├── tools/
 │   ├── Tool.ts              Tool interface
 │   ├── registry.ts          Tool registry
@@ -376,8 +373,7 @@ long-term memory will be enabled until G6 lands.
 
 ## 6. Go TUI — Production Client Highlights
 
-`clients/go-tui/` (Bubble Tea) is the production release target; TS TUI is
-the developer playground. Layout:
+`clients/go-tui/` (Bubble Tea) is the production release target. Layout:
 - `cmd/go-tui/` — executable entry only
 - `internal/tui/` — TUI package + white-box state-machine tests
 - `bin/` — local build artifacts (not committed)
@@ -529,8 +525,8 @@ Before pushing a change:
 2. `npm test` (full suite; long-running).
 3. `npm run build:smoke` (compile + run prod smoke).
 
-If you touched any of the following, also smoke-test `bbl chat dev` and
-`bbl run "<simple prompt>"` against a scratch directory:
+If you touched any of the following, also smoke-test `bbl go --check --no-start-nexus`
+and `bbl run "<simple prompt>"` against a scratch directory:
 
 - the embedded Nexus default storage path,
 - the permission policy mode,

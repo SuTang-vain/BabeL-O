@@ -40,14 +40,10 @@ import {
 } from '../src/runtime/LLMCodingRuntime.js'
 import { extractAbsolutePaths } from '../src/runtime/systemPromptBuilder.js'
 import { homedir } from 'node:os'
-import chalk from 'chalk'
 import type { NexusEvent } from '../src/shared/events.js'
 import type { ModelMessage } from '../src/providers/adapters/ModelAdapter.js'
-import { analyzeContext, type ContextAnalysis } from '../src/runtime/contextAnalysis.js'
-import { formatContextAnalysis } from '../src/cli/commands/chat.js'
-import { normalizeContextViewKey, renderContextView } from '../src/cli/contextView.js'
+import { analyzeContext } from '../src/runtime/contextAnalysis.js'
 import { CONTEXT_MANAGER_PHASES } from '../src/runtime/contextManager.js'
-import { stripAnsi, visibleTerminalWidth } from '../src/cli/terminalWidth.js'
 import { extractEverCoreMemoryHits } from '../src/runtime/memoryProvider.js'
 
 const schemaVersion = '2026-05-21.babel-o.v1' as const
@@ -1668,8 +1664,6 @@ test('analyzeContext exposes task scope and evidence scope diagnostics', async (
     buildSystemPrompt,
     mapEventsToMessages,
   })
-  const rendered = stripAnsi(formatContextAnalysis(analysis))
-
   assert.equal(analysis.diagnostics.taskScope.primaryRoot, cwd)
   assert.deepEqual(analysis.diagnostics.taskScope.confirmedExternalRoots, [external])
   assert.equal(analysis.diagnostics.taskScope.pendingBoundaries.length, 1)
@@ -1682,9 +1676,6 @@ test('analyzeContext exposes task scope and evidence scope diagnostics', async (
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'scope_boundary'))
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'out_of_scope_evidence'))
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Confirm or reject pending scope boundaries')))
-  assert.match(rendered, /task scope mode=multi_root/)
-  assert.match(rendered, /pending scope boundary sibling_repo/)
-  assert.match(rendered, /out-of-scope evidence Bash:tool-sibling-find/)
 })
 
 test('analyzeContext returns token and compact diagnostics', async () => {
@@ -1982,10 +1973,6 @@ test('analyzeContext exposes long-term memory budget diagnostics', async () => {
   assert.equal(analysis.diagnostic.details.scopedMemory.length, 1)
   assert.equal(analysis.diagnostic.details.scopedMemory[0]?.isolationKey, 'projectId')
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Long-term memory hits were truncated')))
-
-  const rendered = formatContextAnalysis(analysis)
-  assert.match(stripAnsi(rendered), /long-term memory evercore-test scope=project namespace=babel-o-dev source=workspace isolation=projectId · hits=2 injected=39 chars\/64 chars latency=13ms · truncated/)
-  assert.match(stripAnsi(rendered), /scoped memory project evercore-test namespace=babel-o-dev source=workspace isolation=projectId · hits=2 injected=39 chars\/64 chars · truncated/)
 })
 
 
@@ -2046,10 +2033,6 @@ test('analyzeContext exposes user and channel scoped memory diagnostics', async 
   assert.equal(analysis.diagnostics.scopedMemory[1]?.isolationKey, 'channelId')
   assert.equal(analysis.diagnostic.details.scopedMemory[1]?.scope, 'channel')
   assert.equal(analysis.diagnostic.details.scopedMemory[1]?.hitCount, 1)
-
-  const rendered = stripAnsi(formatContextAnalysis(analysis))
-  assert.match(rendered, /scoped memory user user-memory-test namespace=user-tangyaoyue source=explicit isolation=userId · hits=1 injected=42 chars\/96 chars/)
-  assert.match(rendered, /scoped memory channel session-channel namespace=channel-session-pair isolation=channelId · hits=1 injected=/)
 })
 
 
@@ -2249,129 +2232,13 @@ test('/context display includes matching boundary diagnostics for CLI and API pa
     buildSystemPrompt,
     mapEventsToMessages,
   })
-  const colorAnalysis: ContextAnalysis = {
-    ...analysis,
-    estimate: {
-      ...analysis.estimate,
-      totalTokens: 41_200,
-      systemPromptTokens: 19_000,
-      toolDefinitionTokens: 15_200,
-      messageTokens: 7_000,
-    },
-    sections: {
-      ...analysis.sections,
-      activeSkillsChars: 24_000,
-    },
-    window: {
-      ...analysis.window,
-      maxTokens: 200_000,
-      compactThresholdTokens: 167_000,
-    },
-  }
-  const originalChalkLevel = chalk.level
-  chalk.level = 1
-  let rawRendered = ''
-  try {
-    rawRendered = formatContextAnalysis(colorAnalysis)
-  } finally {
-    chalk.level = originalChalkLevel
-  }
-  const rendered = stripAnsi(formatContextAnalysis(analysis))
-  const usageBarLine = rawRendered.split('\n').find(line => stripAnsi(line).includes(' used')) ?? ''
-
-  assert.match(usageBarLine, /\x1b\[34m■+\x1b\[39m/)
-  assert.match(usageBarLine, /\x1b\[35m■+\x1b\[39m/)
-  assert.match(usageBarLine, /\x1b\[36m■+\x1b\[39m/)
-  assert.match(usageBarLine, /\x1b\[32m■+\x1b\[39m/)
-  assert.match(usageBarLine, /\x1b\[33m■+\x1b\[39m/)
-  assert.match(usageBarLine, /\x1b\[2m□+\x1b\[22m/)
   assert.equal(analysis.diagnostics.compactRetention.hasBoundary, true)
   assert.equal(analysis.diagnostics.compactRetention.retainedSegmentValid, true)
   assert.equal(analysis.diagnostics.compactTokenDelta.hasBoundary, true)
   assert.equal(analysis.diagnostics.resumeRecovery.active, true)
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'resume_recovery_boundary'))
-  assert.match(rendered, /BABEL Context/)
-  assert.match(rendered, /retained segment valid · events=1/)
-  assert.match(rendered, /compact delta events 4→2 · saved≈/)
-  assert.match(rendered, /resume recovery boundary REQUEST_CANCELLED · Execution cancelled by user\./)
-  assert.match(rendered, /working set paths src\/display-next\.ts×2/)
-  assert.match(rendered, /cache policy read=/)
-  assert.match(rendered, /cache policy reason /)
-  assert.match(rendered, /selection items retained=\d+ dropped=\d+ · phases=8/)
-  assert.match(rendered, /selection retained /)
-  assert.match(rendered, /session memory lite .*last manual\/compact 256 chars events=4 · next=natural_pause update · policy=extractive max=4k chars/)
-})
-
-test('/context view defaults to visual summary and expands diagnostics', async () => {
-  const cwd = join(tmpdir(), `babel-o-context-view-${Date.now()}`)
-  const events: NexusEvent[] = [
-    {
-      type: 'user_message',
-      schemaVersion,
-      sessionId: 'session-context-view',
-      timestamp: '2026-05-23T00:00:00.000Z',
-      text: 'inspect src/view.ts',
-    },
-    {
-      type: 'tool_started',
-      schemaVersion,
-      sessionId: 'session-context-view',
-      timestamp: '2026-05-23T00:00:01.000Z',
-      toolUseId: 'view-read',
-      name: 'Read',
-      input: { path: 'src/view.ts' },
-    },
-    {
-      type: 'tool_completed',
-      schemaVersion,
-      sessionId: 'session-context-view',
-      timestamp: '2026-05-23T00:00:02.000Z',
-      toolUseId: 'view-read',
-      name: 'Read',
-      success: true,
-      output: 'context view large result '.repeat(2_500),
-    },
-    {
-      type: 'error',
-      schemaVersion,
-      sessionId: 'session-context-view',
-      timestamp: '2026-05-23T00:00:03.000Z',
-      code: 'CONTEXT_LIMIT_EXCEEDED',
-      message: 'Context estimate exceeded window.',
-    },
-  ]
-
-  const analysis = await analyzeContext({
-    runtimeOptions: {
-      sessionId: 'session-context-view',
-      prompt: 'inspect src/view.ts',
-      cwd,
-    },
-    events,
-    modelId: 'local/coding-runtime',
-    buildSystemPrompt,
-    mapEventsToMessages,
-  })
-  const collapsed = stripAnsi(renderContextView(analysis, { expanded: false, scrollOffset: 0 }, { rows: 28, columns: 72 }))
-  const expanded = stripAnsi(renderContextView(analysis, { expanded: true, scrollOffset: 0 }, { rows: 80, columns: 72 }))
-  const narrow = stripAnsi(renderContextView(analysis, { expanded: true, scrollOffset: 0 }, { rows: 18, columns: 42 }))
-
-  assert.match(collapsed, /BABEL Context/)
-  assert.match(collapsed, /Current context by source/)
-  assert.match(collapsed, /Assembled events\s+selected=/)
-  assert.match(collapsed, /ctrl\+o show diagnostics · esc exit/)
-  assert.doesNotMatch(collapsed, /Diagnostics scan full session history/)
-  assert.doesNotMatch(collapsed, /Recommendations/)
-  assert.match(expanded, /Diagnostics/)
-  assert.match(expanded, /Diagnostics scan full session history/)
-  assert.match(expanded, /historical largest tool result Read/)
-  assert.match(expanded, /selection items retained=\d+ dropped=\d+ · phases=8/)
-  assert.match(expanded, /selection retained /)
-  assert.match(expanded, /Recommendations/)
-  assert.equal(normalizeContextViewKey('\x0f'), 'toggle')
-  assert.equal(normalizeContextViewKey('\x1b'), 'exit')
-  assert.equal(normalizeContextViewKey('\x1b[B'), 'down')
-  assert.ok(narrow.split('\n').every(line => visibleTerminalWidth(line) < 42), narrow)
+  assert.ok(analysis.diagnostics.workingSetPaths.some(entry => entry.path.endsWith('src/display-next.ts')))
+  assert.equal(analysis.diagnostics.sessionMemoryLite.lastUpdate?.summaryChars, 256)
 })
 
 test('/context display includes cache-aware long-context diagnostics', async () => {
@@ -2411,8 +2278,6 @@ test('/context display includes cache-aware long-context diagnostics', async () 
       buildSystemPrompt,
       mapEventsToMessages,
     })
-    const rendered = stripAnsi(formatContextAnalysis(analysis))
-
     assert.equal(analysis.window.maxTokens, 920_000)
     assert.equal(analysis.diagnostics.cacheEconomics.modelContextWindow, 1_000_000)
     assert.equal(analysis.diagnostics.cacheEconomics.legacyContextCeiling, 120_000)
@@ -2429,11 +2294,7 @@ test('/context display includes cache-aware long-context diagnostics', async () 
     assert.equal(analysis.diagnostics.autoCompact.thresholdPercent, 93)
     assert.equal(analysis.diagnostic.details.modelContextWindow, 1_000_000)
     assert.equal(analysis.diagnostic.details.policySource, 'large_context')
-    assert.match(rendered, /cache policy read=75% cacheable=.*preserving=yes long-context=yes/)
-    assert.match(rendered, /ceiling 920k\/120k legacy/)
-    assert.match(rendered, /ceiling source=large_context model\.window=1000k reserved_output=16\.4k provider_buffer=20k/)
-    assert.match(rendered, /thresholds warning=736k \(80%\) compact=855\.6k \(93%\) blocking=919k/)
-    assert.match(rendered, /Large-context model and high prompt cache reuse detected/)
+    assert.match(analysis.diagnostics.cacheEconomics.reason, /Large-context model and high prompt cache reuse detected/)
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
     else process.env.BABEL_O_MAX_CONTEXT_TOKENS = previous
@@ -2464,14 +2325,9 @@ test('/context display includes blocking boundary diagnostics for CLI and API pa
     mapEventsToMessages,
     warningPercent: 1,
   })
-  const rendered = stripAnsi(formatContextAnalysis(analysis))
-
   assert.equal(analysis.window.isWarning, true)
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'near_capacity'))
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('warning threshold')))
-  assert.match(rendered, /warning Context is near capacity;/)
-  assert.match(rendered, /Recommendations/)
-  assert.match(rendered, /Context is near the warning threshold; consider \/compact soon\./)
 })
 
 test('manual compact smoke retains latest answerable context around cancellation and failures', async () => {

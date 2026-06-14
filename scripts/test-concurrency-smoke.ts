@@ -20,7 +20,6 @@ const concurrencySafeTests = [
   'test/architecture-boundary.test.ts',
   'test/classifier.test.ts',
   'test/compact-summary.test.ts',
-  'test/completer.test.ts',
   'test/context-assembler.test.ts',
   'test/context-forker.test.ts',
   'test/context-regression.test.ts',
@@ -31,7 +30,6 @@ const concurrencySafeTests = [
   'test/message-normalizer.test.ts',
   'test/optimizer-safety.test.ts',
   'test/optimize-command.test.ts',
-  'test/path-mention.test.ts',
   'test/permission-flow.test.ts',
   'test/prefix-cache.test.ts',
   'test/provider-recovery.test.ts',
@@ -50,10 +48,7 @@ const concurrencySafeTests = [
   'test/working-set.test.ts',
   'test/token-estimator.test.ts',
   'test/tool-prompt.test.ts',
-  'test/tui-renderer.test.ts',
-  'test/tui-input.test.ts',
   'test/worktree.test.ts',
-  'test/editor.test.ts',
 ]
 
 type TestResult = {

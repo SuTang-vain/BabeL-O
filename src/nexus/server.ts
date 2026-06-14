@@ -35,8 +35,8 @@ const storageWalFsync = parseBoolean(process.env.NEXUS_STORAGE_WAL_FSYNC)
 // Phase B 推进: server-side default for the per-request `policy`
 // field. When a request body omits `policy`, this value is used
 // (Go TUI already overrides per-request to `'soft-deny'`). Default
-// is `'strict'` to preserve the existing behavior of `bbl chat` /
-// HTTP API consumers. Set `NEXUS_DEFAULT_POLICY_MODE=soft-deny`
+  // is `'strict'` to preserve existing HTTP API behavior. Set
+  // `NEXUS_DEFAULT_POLICY_MODE=soft-deny`
 // to make ALL clients (CLI / HTTP / WS) reach the
 // `permission_request` flow for write/execute tools instead of
 // being hard-denied by `denyByDefaultTools()`.
@@ -192,7 +192,7 @@ function parseBoolean(value: string | undefined): boolean | undefined {
 function parsePolicyMode(value: string | undefined): 'strict' | 'soft-deny' | undefined {
   // Phase B 推进: validate the server-side default policy mode.
   // Unset → undefined (caller keeps the `strict` default for
-  // back-compat with `bbl chat` / HTTP API consumers).
+  // back-compat with HTTP API consumers).
   // Empty string → undefined (same as unset).
   // Any other value → throw with a clear hint listing accepted
   // values, so a typo in the env var doesn't silently fall back
