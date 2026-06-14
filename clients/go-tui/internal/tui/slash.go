@@ -162,7 +162,7 @@ func init() {
 			name:    "/memory",
 			summary: "open long-term memory status/actions overlay",
 			hasArgs: true,
-			argHint: "[status|search <query>|candidates|save <note>|flush|restart]",
+			argHint: "[status|search <q>|candidates|save <note>|flush|restart|setup|auto|enable-tools|disable-tools|opt-out|external|doctor|reset]",
 			run: func(m *model, args []string) tea.Cmd {
 				if len(args) == 0 || args[0] == "status" {
 					m.appendLine("status", "loading shared Nexus memory status")
@@ -198,10 +198,35 @@ func init() {
 				case "restart":
 					m.appendLine("status", "requesting memory restart approval envelope")
 					return requestMemoryRestart(m.cfg)
+				// MemoryOS lifecycle sub-commands: these mutate the local
+				// bootstrap state via the `bbl memory` CLI. The Go TUI
+				// cannot reach the bootstrap file directly, so each
+				// sub-command opens a dedicated info card panel (the
+				// same `modeMemoryOverlay` surface used by `/memory
+				// status`) and the operator runs the equivalent CLI
+				// command in their shell. The TUI's role is to show
+				// current state + the literal next step.
+				case "setup":
+					m.openMemoryInfoCard(MemoryCardSetup)
+				case "auto":
+					m.openMemoryInfoCard(MemoryCardAuto)
+				case "enable-tools":
+					m.openMemoryInfoCard(MemoryCardEnableTools)
+				case "disable-tools":
+					m.openMemoryInfoCard(MemoryCardDisableTools)
+				case "opt-out":
+					m.openMemoryInfoCard(MemoryCardOptOut)
+				case "external":
+					m.openMemoryInfoCard(MemoryCardExternal)
+				case "reset":
+					m.openMemoryInfoCard(MemoryCardReset)
+				case "doctor":
+					m.openMemoryInfoCard(MemoryCardDoctor)
 				default:
-					m.appendLine("error", "unknown /memory sub-command: "+sub+" (supported: status, search <query>, candidates, save <note>, flush, restart)")
+					m.appendLine("error", "unknown /memory sub-command: "+sub+" (supported: status, search <q>, candidates, save <note>, flush, restart, setup, auto, enable-tools, disable-tools, opt-out, external, doctor, reset)")
 					return nil
 				}
+				return nil
 			},
 		},
 		{

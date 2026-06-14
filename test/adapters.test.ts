@@ -694,7 +694,7 @@ describe('Model Adapters & Factory', () => {
       assert.equal(headers.Authorization, undefined)
       const body = JSON.parse(lastFetchInit.body as string)
       assert.equal(body.model, 'qwen2.5-coder:7b')
-      assert.equal(body.max_tokens, 4096)
+      assert.equal(body.max_tokens, 8192)
       assert.deepEqual(deltas, [{ type: 'text', text: 'ok' }])
     })
 

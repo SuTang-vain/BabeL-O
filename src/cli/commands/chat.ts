@@ -1,3 +1,21 @@
+/**
+ * @file Legacy TypeScript TUI entry point.
+ *
+ * `bbl chat` is the legacy interactive entry point. As of 2026-06
+ * it is **frozen**: no new features, no new fixes beyond stability
+ * patches. The production interactive entrypoint is `bbl go` (the
+ * native Go TUI in `clients/go-tui`).
+ *
+ * This file's logic remains active for the v0.3.x line so existing
+ * scripts and `bbl run` (one-shot, no TUI) keep working without
+ * forcing a hard cutover. It will be removed in v0.5.0 once Go TUI
+ * feature parity is confirmed by release validation.
+ *
+ * The deprecation banner that fires on every `bbl chat` invocation is
+ * the only intentional user-visible change; the rest of the
+ * behaviour is preserved as-is. Suppress the banner with
+ * `BABEL_O_SUPPRESS_CHAT_DEPRECATION=1` (used by legacy tests).
+ */
 import readline from 'node:readline'
 import { stdin as input, stdout as output } from 'node:process'
 import chalk from 'chalk'
@@ -62,6 +80,9 @@ import { formatChannelGraph } from '../channelGraph.js'
 import { channelSendUsage, createChannelSendDraft, formatChannelSendCreated, formatChannelSendPreview, parseChannelSendCommand, resolveInboxReplyDraftTarget, type ChannelSendDraft } from '../channelSend.js'
 import { openCollaborateOverlay } from '../collaborateOverlay.js'
 import type { SessionMessage } from '../../shared/sessionChannel.js'
+import { runFirstRunOnboarding } from './firstRun.js'
+import { decideAutoBootstrap } from '../everosAutoBootstrap.js'
+import { formatEverCoreWelcomeHint } from '../everosWelcomeHint.js'
 
 interface ReadlineInternal extends readline.Interface {
   history: string[]
@@ -82,6 +103,25 @@ export function registerChatCommand(program: Command): void {
         console.error(chalk.red(`Error: unknown chat mode "${mode}". Did you mean \`bbl chat dev\`?`))
         process.exitCode = 1
         return
+      }
+
+      // Deprecation banner. `bbl chat` is the legacy TypeScript TUI
+      // and is frozen as of 2026-06. The production interactive
+      // entrypoint is `bbl go` (native Go TUI, ~10 MB). The legacy
+      // path remains functional for the v0.3.x line — it will be
+      // removed in 0.5.0 once Go TUI feature parity is confirmed.
+      //
+      // Suppress the banner with `BABEL_O_SUPPRESS_CHAT_DEPRECATION=1`
+      // (used by the legacy chat regression tests).
+      if (process.env.BABEL_O_SUPPRESS_CHAT_DEPRECATION !== '1') {
+        process.stderr.write(
+          chalk.yellow(
+            '⚠ `bbl chat` is the legacy TypeScript TUI and is frozen. ' +
+              'Use `bbl go` for the production Go TUI.\n' +
+              'See docs/nexus/FAQ.md and README for the migration path. ' +
+              'Set BABEL_O_SUPPRESS_CHAT_DEPRECATION=1 to silence this warning.\n',
+          ),
+        )
       }
 
       const historyFile = path.join(DEFAULT_CONFIG_DIR, 'history')
@@ -840,6 +880,23 @@ export function registerChatCommand(program: Command): void {
         url: options.url,
         title: isDevMode ? 'dev' : undefined,
       })
+
+      // Zero-friction auto-bootstrap: if the policy is `on` and
+      // the state is unconfigured (or `failed` with pre-reqs now
+      // met), kick off a background worker. The chat readline
+      // loop is created immediately afterward; the worker never
+      // blocks the user.
+      if (!options.url) {
+        const autoDecision = await decideAutoBootstrap({})
+        if (autoDecision.attempt) {
+          process.stderr.write(chalk.dim(`memory: bootstrapping in background (${autoDecision.reason})\n`))
+          void autoDecision.handle.promise.catch(() => undefined)
+        }
+        const everCoreHint = formatEverCoreWelcomeHint()
+        if (everCoreHint) {
+          process.stdout.write(`  ${everCoreHint.text}\n\n`)
+        }
+      }
 
       if (options.session) {
         console.log(formatSessionBanner('resuming', sessionId))

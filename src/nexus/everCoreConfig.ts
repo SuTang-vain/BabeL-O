@@ -18,6 +18,7 @@ import {
   type EverCoreManagedLlmProtocol,
   type EverCoreSidecarStatus,
 } from './everCoreSidecar.js'
+import { applyEverOSBootstrapDefaults } from './everosBootstrapConfig.js'
 
 export type EverCoreConfigInput = {
   mode?: EverCoreSidecarMode
@@ -113,7 +114,7 @@ export function resolveEverCoreConfigInputFromEnv(
   env: NodeJS.ProcessEnv = process.env,
   options: { cwd?: string; providerSettings?: ResolvedSettings } = {},
 ): EverCoreConfigInput {
-  return {
+  return applyEverOSBootstrapDefaults({
     mode: parseEverCoreMode(env.BABEL_O_EVERCORE_MODE),
     enabled: parseBoolean(env.BABEL_O_EVERCORE_ENABLED) ?? false,
     baseUrl: env.BABEL_O_EVERCORE_BASE_URL,
@@ -142,7 +143,7 @@ export function resolveEverCoreConfigInputFromEnv(
     managedLlmBaseUrl: env.BABEL_O_EVERCORE_LLM_BASE_URL,
     managedLlmModel: env.BABEL_O_EVERCORE_LLM_MODEL,
     providerSettings: options.providerSettings,
-  }
+  }, env)
 }
 
 export async function configureEverCore(

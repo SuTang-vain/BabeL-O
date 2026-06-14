@@ -4,6 +4,8 @@ import chalk from 'chalk'
 import { Command } from 'commander'
 import { renderWelcome } from '../welcome.js'
 import { runSessionFlow } from '../runSessionFlow.js'
+import { decideAutoBootstrap } from '../everosAutoBootstrap.js'
+import { formatEverCoreWelcomeHint } from '../everosWelcomeHint.js'
 
 export function registerRunCommand(program: Command): void {
   program
@@ -24,7 +26,16 @@ export function registerRunCommand(program: Command): void {
       })
 
       try {
+        const autoDecision = await decideAutoBootstrap({})
+        if (autoDecision.attempt) {
+          console.error(chalk.dim(`memory: bootstrapping in background (${autoDecision.reason})`))
+          void autoDecision.handle.promise.catch(() => undefined)
+        }
         renderWelcome({ cwd: options.cwd, url: options.url })
+        const everCoreHint = formatEverCoreWelcomeHint()
+        if (everCoreHint) {
+          console.error(chalk.dim(everCoreHint.text))
+        }
         await runSessionFlow(prompt, options.cwd, options.url, rl, abortController)
       } catch (e: any) {
         if (e.message !== 'Aborted' && e.name !== 'AbortError') {

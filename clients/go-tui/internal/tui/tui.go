@@ -278,6 +278,14 @@ type memoryStatusMsg struct {
 	err error
 }
 
+// runtimeStatusMsg fires after each background
+// /v1/runtime/status poll. The handler computes a one-line
+// memory footer indicator from the payload.
+type runtimeStatusMsg struct {
+	raw []byte
+	err error
+}
+
 // sessionChannelKind mirrors the SessionChannelKind union from
 // src/shared/sessionChannel.ts. The Go TUI only renders a small
 // fixed set in the inbox footer / event cards; unknown values
@@ -774,6 +782,15 @@ type subAgentEntry struct {
 // when m.configVersion > 0.
 type pollTickMsg struct{}
 
+// memoryTickMsg fires on a faster cadence (default 3s) than
+// the config poll so the persistent [m: …] footer indicator
+// and the welcome hint banner stay fresh even when the user
+// has not set a config poll interval. The MemoryOS bootstrap
+// state changes more often than config (clone/build progress
+// every few seconds), so a 3s cadence keeps the indicator
+// honest without flooding Nexus with traffic.
+type memoryTickMsg struct{}
+
 // runtimeVersionCompat mirrors the nested
 // `goTuiCompatibility` block of /v1/runtime/version. The Go
 // TUI uses it for the major-version check at startup
@@ -1007,6 +1024,20 @@ type model struct {
 	latestUsage             *usageSnapshot
 	lastUsage               *usageSnapshot
 	contextUsage            *contextUsageSnapshot
+	// Z6 zero-friction plan: cached one-line memory status from
+	// the most recent /v1/runtime/status poll.
+	memoryFooter string
+	// Z14 zero-friction plan: cached one-line MemoryOS welcome
+	// hint rendered as a transient banner above the input box.
+	// Empty when there is nothing actionable to say.
+	memoryHint string
+	// Z520 / memory info cards: raw bytes from the most recent
+	// /v1/runtime/status poll, retained so the /memory
+	// lifecycle info cards (setup/auto/enable-tools/...) can
+	// read the current state without re-fetching. Empty before
+	// the first poll; the info cards degrade to "unknown" labels
+	// in that case.
+	memoryStatusRaw []byte
 	// Phase 4 of docs/nexus/reference/task-adaptive-recoverable-timeout-plan.md:
 	// running snapshot of the Nexus-side soft timeout cycle so the
 	// footer can show "soft budget reached / extended" and so a
@@ -1184,6 +1215,20 @@ func (d timeoutDecision) Label() string {
 		return fmt.Sprintf("timeout=%ds (%s)", seconds, d.Reason)
 	}
 	return fmt.Sprintf("timeout=%ds", seconds)
+}
+
+// openMemoryInfoCard renders a MemoryOS lifecycle info card
+// for the given topic and opens the standard modeMemoryOverlay
+// surface. Used by `/memory setup`, `/memory auto`, etc., so all
+// lifecycle sub-commands share one panel surface with the same
+// up/down/esc/q navigation as `/memory status`. The card is
+// driven by the latest runtime status payload (cached in
+// m.memoryStatusRaw); if no poll has happened yet the card
+// renders "unknown" labels for state-dependent fields.
+func (m *model) openMemoryInfoCard(topic MemoryInfoCardTopic) {
+	m.memoryOverlayLines = buildMemoryInfoCardLines(topic, m.memoryStatusRaw)
+	m.memoryOverlayScroll = 0
+	m.setMode(modeMemoryOverlay)
 }
 
 func (m *model) setMode(next inputMode) {
@@ -1869,6 +1914,19 @@ func (m model) schedulePollTick() tea.Cmd {
 	return tea.Tick(d, func(time.Time) tea.Msg { return pollTickMsg{} })
 }
 
+// scheduleMemoryTick arms the next memory-status poll. The
+// poll interval is independent of the config poll so the
+// [m: …] footer indicator and welcome hint banner stay fresh
+// even when the user has not configured a config poll. The
+// default cadence is 3s (memoryPollIntervalMs). Unlike the
+// config poll, this tick always arms — the memory status must
+// stay current.
+func (m model) scheduleMemoryTick() tea.Cmd {
+	const memoryPollIntervalMs = 3000
+	d := time.Duration(memoryPollIntervalMs) * time.Millisecond
+	return tea.Tick(d, func(time.Time) tea.Msg { return memoryTickMsg{} })
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -2422,6 +2480,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.activityOverlayScroll < maxScroll {
 					m.activityOverlayScroll++
 				}
+				return m, nil
+			}
+			return m, nil
+
+		case modeMemoryOverlay:
+			// MemoryOS status / info-card overlay. Used by
+			// `/memory status` (live runtime snapshot) and
+			// every `/memory <lifecycle>` sub-command
+			// (rendered info card). Both share the same
+			// panel surface so the keyboard contract is
+			// identical: esc/enter/q close, up/k scroll
+			// back, down/j/tab scroll forward, pgup/pgdn
+			// page-scroll. Without these bindings the
+			// user would be trapped inside an info card.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.memoryOverlayScroll = 0
+				m.appendLine("status", "memory panel closed")
+				return m, nil
+			case "up", "k":
+				if m.memoryOverlayScroll > 0 {
+					m.memoryOverlayScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				maxScroll := max(0, len(m.memoryOverlayLines)-1)
+				if m.memoryOverlayScroll < maxScroll {
+					m.memoryOverlayScroll++
+				}
+				return m, nil
+			case "pgup":
+				m.memoryOverlayScroll = max(0, m.memoryOverlayScroll-10)
+				return m, nil
+			case "pgdown", "space":
+				maxScroll := max(0, len(m.memoryOverlayLines)-1)
+				m.memoryOverlayScroll = min(maxScroll, m.memoryOverlayScroll+10)
 				return m, nil
 			}
 			return m, nil
@@ -3068,6 +3163,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setMode(modeMemoryOverlay)
 		return m, nil
 
+	case runtimeStatusMsg:
+		if msg.err == nil && len(msg.raw) > 0 {
+			m.memoryStatusRaw = append([]byte(nil), msg.raw...)
+			m.memoryFooter = formatMemoryFooter(msg.raw)
+			m.memoryHint = formatMemoryHintLine(msg.raw)
+		} else {
+			m.memoryStatusRaw = nil
+			m.memoryFooter = ""
+			m.memoryHint = ""
+		}
+		return m, nil
+
 	case toolAuditMsg:
 		if msg.err != nil {
 			if msg.trigger == "auto" {
@@ -3106,7 +3213,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.configVersion <= 0 {
 			return m, m.schedulePollTick()
 		}
-		return m, fetchRuntimeConfig(m.cfg, m.configVersion)
+		return m, tea.Batch(fetchRuntimeConfig(m.cfg, m.configVersion), fetchRuntimeStatus(m.cfg))
+
+	case memoryTickMsg:
+		// Independent memory-status poll. Fires every 3s so
+		// the [m: …] footer indicator and the welcome hint
+		// banner stay current even when the config poll is
+		// disabled or runs at a slower cadence. The handler
+		// always re-arms itself so the poll continues until
+		// the model is destroyed.
+		return m, tea.Batch(fetchRuntimeStatus(m.cfg), m.scheduleMemoryTick())
 
 	case streamClosedMsg:
 		// Drop the "stream closed" status line to mirror the

@@ -22,6 +22,7 @@ import type { MemoryProvider } from '../runtime/memoryProvider.js'
 import type { EverCoreClient } from '../runtime/everCoreClient.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
+import { startEverOSBackgroundBootstrap } from '../cli/everosBackgroundBootstrap.js'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
@@ -40,6 +41,13 @@ export type CreateDefaultNexusRuntimeOptions = {
     config: EverCoreRuntimeConfig
     dispose?(): Promise<void>
   }
+  /**
+   * Disable the Z3 auto-bootstrap trigger. Used by tests and
+   * by callers that want to manage the bootstrap lifecycle
+   * themselves (e.g. an embedded runner that does its own
+   * pre-flight). Default is `false` (auto-bootstrap enabled).
+   */
+  disableAutoMemoryBootstrap?: boolean
 }
 
 export async function createDefaultNexusRuntime(
@@ -102,6 +110,28 @@ export async function createDefaultNexusRuntime(
   } else {
     configureStorageBridgeWal(null)
   }
+
+  // Z3 of the zero-friction memory plan: kick off the
+  // background bootstrap at runtime startup so that any path
+  // triggering the runtime (bbl chat, bbl run, bbl serve behind
+  // bbl go) benefits from the same auto-bootstrap behavior. The
+  // worker is fire-and-forget — failure is non-fatal and surfaced
+  // via the /v1/runtime/status bootstrap field consumed by both
+  // the TS TUI welcome card and the Go TUI footer.
+  //
+  // The auto-bootstrap policy comes from the same env+state
+  // resolution that the TS TUI's chat loop uses, so a user who
+  // sets BABEL_O_EVERCORE_AUTO_BOOTSTRAP=1 once will see memory
+  // come online automatically regardless of which TUI they
+  // launched.
+  if (!options.disableAutoMemoryBootstrap) {
+    const background = startEverOSBackgroundBootstrap({
+      assumeYes: true,
+      nonInteractive: true,
+    })
+    void background.promise.catch(() => undefined)
+  }
+
   const originalClose = storage.close?.bind(storage)
   storage.close = async () => {
     await flushStorageBridge()

@@ -86,7 +86,7 @@ test('getModel returns valid model definition', () => {
 
   const glmModel = getModel('zhipu/glm-5.1')
   assert.equal(glmModel.id, 'zhipu/glm-5.1')
-  assert.equal(glmModel.contextWindow, 200000)
+  assert.equal(glmModel.contextWindow, 204800)
   assert.equal(glmModel.capabilities.toolCalling, true)
   assert.equal(glmModel.capabilities.jsonOutput, true)
   assert.equal(glmModel.capabilities.streaming, true)
@@ -107,7 +107,7 @@ test('getModel returns valid model definition', () => {
 
   const ollamaModel = getModel('ollama/qwen2.5-coder:7b')
   assert.equal(ollamaModel.id, 'ollama/qwen2.5-coder:7b')
-  assert.equal(ollamaModel.contextWindow, 32768)
+  assert.equal(ollamaModel.contextWindow, 131072)
   assert.equal(ollamaModel.capabilities.toolCalling, true)
   assert.equal(ollamaModel.capabilities.jsonOutput, true)
   assert.equal(ollamaModel.capabilities.streaming, true)
@@ -172,7 +172,7 @@ test('inspectModelCapabilities exposes provider and registry-backed model capabi
   assert.equal(diagnostics.modelDeclared, true)
   assert.equal(diagnostics.capabilitySource, 'registry')
   assert.equal(diagnostics.contextWindow, 128000)
-  assert.equal(diagnostics.defaultMaxTokens, 16384)
+  assert.equal(diagnostics.defaultMaxTokens, 8192)
   assert.deepEqual(diagnostics.capabilities, {
     toolCalling: true,
     jsonOutput: true,
@@ -201,10 +201,10 @@ test('inspectModelCapabilities exposes Moonshot and Ollama seed diagnostics', ()
   assert.equal(ollamaDiagnostics.adapter, 'openai-compatible')
   assert.equal(ollamaDiagnostics.authMode, 'none')
   assert.equal(ollamaDiagnostics.modelDeclared, true)
-  assert.equal(ollamaDiagnostics.contextWindow, 32768)
+  assert.equal(ollamaDiagnostics.contextWindow, 131072)
   assert.equal(ollamaDiagnostics.capabilities.toolCalling, true)
-  assert.equal(ollamaDiagnostics.suitability.agentLoopRoles.planner.suitable, false)
-  assert.deepEqual(ollamaDiagnostics.suitability.agentLoopRoles.planner.missingCapabilities, ['long_context'])
+  assert.equal(ollamaDiagnostics.suitability.agentLoopRoles.planner.suitable, true)
+  assert.deepEqual(ollamaDiagnostics.suitability.agentLoopRoles.planner.missingCapabilities, [])
 })
 
 test('inspectModelCapabilities marks provider-scoped custom models as undeclared without hard blocking', () => {

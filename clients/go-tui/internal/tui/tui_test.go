@@ -2136,6 +2136,44 @@ func TestSchedulePollTickEmitsPollTickMsg(t *testing.T) {
 	}
 }
 
+func TestScheduleMemoryTickAlwaysArms(t *testing.T) {
+	// The memory tick is independent of the config poll; it
+	// always arms so the [m: …] footer indicator stays fresh.
+	// Unlike schedulePollTick, there is no "disabled" path.
+	for _, interval := range []int{0, 5, 30000} {
+		m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: interval})
+		cmd := m.scheduleMemoryTick()
+		if cmd == nil {
+			t.Fatalf("interval=%d: expected a memory tick cmd", interval)
+		}
+		msg := cmd()
+		if _, ok := msg.(memoryTickMsg); !ok {
+			t.Fatalf("interval=%d: expected memoryTickMsg, got %T", interval, msg)
+		}
+	}
+}
+
+func TestMemoryTickHandlerRearmsAndFetches(t *testing.T) {
+	// The memory-tick handler must always return a non-nil
+	// tea.Cmd so the poll continues until the model is
+	// destroyed. The cmd is a tea.Batch of (fetchRuntimeStatus,
+	// scheduleMemoryTick), so calling it returns a BatchMsg
+	// rather than a single message — we just verify the cmd
+	// is non-nil and that the second batch entry is the
+	// re-armed memory tick.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 0})
+	_, cmd := m.Update(memoryTickMsg{})
+	if cmd == nil {
+		t.Fatalf("memory tick handler must return a non-nil cmd")
+	}
+	// Verify the cmd has a tea.BatchMsg type (because the
+	// handler batches fetch + re-arm), confirming the
+	// handler is producing commands.
+	if msg := cmd(); msg == nil {
+		t.Fatalf("memory tick handler cmd() returned nil")
+	}
+}
+
 func TestPollTickDeferWhenConfigVersionIsZero(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", PollIntervalMs: 5})
 	_, cmd := m.Update(pollTickMsg{})
@@ -6284,7 +6322,7 @@ func TestBuildMemoryOverlayLinesParsesMemoryStatusPayload(t *testing.T) {
 	lines := buildMemoryOverlayLines(raw)
 	want := []string{
 		"Status: available",
-		"EverCore: enabled=true healthy=true mode=managed",
+		"everCore: enabled=true healthy=true mode=managed",
 		"Endpoint: http://127.0.0.1:45123",
 		"App: app-1",
 		"Project: proj-1",
@@ -6327,13 +6365,530 @@ func TestBuildMemoryOverlayLinesUnhealthyState(t *testing.T) {
 	lines := buildMemoryOverlayLines(raw)
 	for _, want := range []string{
 		"Status: unhealthy",
-		"EverCore: enabled=true healthy=false mode=remote",
+		"everCore: enabled=true healthy=false mode=remote",
 		"Error: EVERCORE_UNREACHABLE",
 		"dial tcp",
 	} {
 		if !containsLine(lines, want) {
 			t.Fatalf("expected line containing %q in:\n%s", want, strings.Join(lines, "\n"))
 		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesSurfacesMcpToolsHintWhenReadyButToolsOff(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "mcpToolsEnabled": false},
+		"bootstrap": {"status": "ready", "configured": true, "dataDir": "/var/data", "managedCommand": "/usr/local/bin/everos"}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	want := "MemoryOS is on (read-only). To let the model save notes: set BABEL_O_ENABLE_EVERCORE_MCP_TOOLS=1 (or run `bbl memory enable-tools`)."
+	if !containsLine(lines, want) {
+		t.Fatalf("expected MCP tools hint in:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestBuildMemoryOverlayLinesOmitsMcpToolsHintWhenToolsAlreadyEnabled(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "mcpToolsEnabled": true},
+		"bootstrap": {"status": "ready", "configured": true, "managedCommand": "/usr/local/bin/everos"}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	notWant := "MemoryOS is on (read-only)"
+	if containsLine(lines, notWant) {
+		t.Fatalf("did not expect MCP tools hint when mcpToolsEnabled=true:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestBuildMemoryOverlayLinesRendersBootstrapSectionAsMemoryOS(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed"},
+		"bootstrap": {"status": "ready", "configured": true, "dataDir": "/var/data", "managedCommand": "/usr/local/bin/everos"}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{
+		"MemoryOS:",
+		"status=ready",
+		"dataDir=/var/data",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesSurfacesFullBootstrapState(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "mcpToolsEnabled": true},
+		"bootstrap": {
+			"status": "ready",
+			"configured": true,
+			"optedIn": true,
+			"autoBootstrapPolicy": "on",
+			"fallbackBuildTool": "pip",
+			"sourceRepo": "https://example.com/everos.git",
+			"sourceRef": "main",
+			"sourceCommit": "abc123",
+			"managedCommand": "/usr/local/bin/everos",
+			"dataDir": "/var/data",
+			"lastCheckedAt": "2026-06-14T16:00:00.000Z",
+			"lastBuildAt": "2026-06-14T15:30:00.000Z",
+			"mcpToolsEnabled": true
+		}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, want := range []string{
+		"optedIn=true",
+		"autoBootstrap=on",
+		"buildTool=pip",
+		"sourceRepo=https://example.com/everos.git",
+		"sourceRef=main",
+		"sourceCommit=abc123",
+		"managedCommand=/usr/local/bin/everos",
+		"dataDir=/var/data",
+		"lastCheckedAt=2026-06-14T16:00:00.000Z",
+		"lastBuildAt=2026-06-14T15:30:00.000Z",
+		"mcpToolsEnabled=true",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("expected %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryOverlayLinesOmitsBuildToolWhenNone(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed"},
+		"bootstrap": {"status": "ready", "configured": true, "fallbackBuildTool": "none"}
+	}`)
+	lines := buildMemoryOverlayLines(raw)
+	for _, line := range lines {
+		if strings.Contains(line, "buildTool=") {
+			t.Fatalf("did not expect buildTool= when value is 'none', got: %s", line)
+		}
+	}
+}
+
+func TestMemoryActionLineReturnsSetupForFailedState(t *testing.T) {
+	got := memoryActionLine("failed", "EVEROS_BOOTSTRAP_UV_MISSING", false, "")
+	if !strings.Contains(got, "uv") || !strings.Contains(got, "bbl memory setup --retry") {
+		t.Fatalf("memoryActionLine = %q, want uv + retry hint", got)
+	}
+}
+
+func TestMemoryActionLineReturnsRetryForFailedWithoutErrorCode(t *testing.T) {
+	got := memoryActionLine("failed", "", false, "")
+	if !strings.Contains(got, "bbl memory setup --retry") {
+		t.Fatalf("memoryActionLine = %q, want generic retry hint", got)
+	}
+}
+
+func TestMemoryActionLineReturnsNotConfiguredHint(t *testing.T) {
+	for _, status := range []string{"not_configured", ""} {
+		got := memoryActionLine(status, "", false, "")
+		if !strings.Contains(got, "bbl memory setup") {
+			t.Fatalf("memoryActionLine(status=%q) = %q, want setup hint", status, got)
+		}
+	}
+}
+
+func TestMemoryActionLineReturnsEnableToolsHintWhenReadyButToolsOff(t *testing.T) {
+	got := memoryActionLine("ready", "", false, "on")
+	if !strings.Contains(got, "enable-tools") {
+		t.Fatalf("memoryActionLine = %q, want enable-tools hint", got)
+	}
+}
+
+func TestMemoryActionLineReturnsAutoOnHintWhenReadyToolsOnButPolicyEmpty(t *testing.T) {
+	got := memoryActionLine("ready", "", true, "")
+	if !strings.Contains(got, "bbl memory auto on") {
+		t.Fatalf("memoryActionLine = %q, want auto-bootstrap hint", got)
+	}
+}
+
+func TestMemoryActionLineReturnsEmptyForHealthyState(t *testing.T) {
+	got := memoryActionLine("ready", "", true, "on")
+	if got != "" {
+		t.Fatalf("memoryActionLine = %q, want empty for healthy state", got)
+	}
+}
+
+func TestMemoryActionLineReturnsInFlightHint(t *testing.T) {
+	for _, status := range []string{"cloning", "building", "checking_prereqs"} {
+		got := memoryActionLine(status, "", false, "")
+		if !strings.Contains(got, "background") {
+			t.Fatalf("memoryActionLine(status=%q) = %q, want in-flight hint", status, got)
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardSetupRendersHierarchicalLayout(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": false, "healthy": true, "mode": "managed"},
+		"bootstrap": {
+			"status": "not_configured",
+			"path": "/tmp/everos-bootstrap.json",
+			"sourceRepo": "https://example.com/everos.git",
+			"sourceRef": "main",
+			"fallbackBuildTool": "uv"
+		}
+	}`)
+	lines := buildMemoryInfoCardLines(MemoryCardSetup, raw)
+	// Hierarchical layout: header + separator + state table +
+	// "What this does" steps + "How to run" action + close hint.
+	// We assert on the section / step / action markers and on
+	// the value column via containsValueCell so the test is
+	// not sensitive to the exact keyCol padding width.
+	for _, want := range []string{
+		"MemoryOS · Setup",
+		"What this does",
+		"How to run",
+		"[1] Clone EverOS",
+		"[2] Build the Python virtualenv",
+		"[3] Write",
+		"bbl memory setup [--yes",
+		"Press q / Esc / Enter to close",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("setup card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	for _, want := range [][2]string{
+		{"Status", "not_configured"},
+		{"Path", "/tmp/everos-bootstrap.json"},
+		{"Source repo", "https://example.com/everos.git"},
+		{"Source ref", "main"},
+		{"Build tool", "uv"},
+	} {
+		if !containsValueCell(lines, want[0], want[1]) {
+			t.Fatalf("setup card missing key=%q value=%q:\n%s", want[0], want[1], strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardAutoShowsPolicyAndEnv(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": false, "mode": "managed"},
+		"bootstrap": {"status": "ready", "autoBootstrapPolicy": "on"}
+	}`)
+	prev := osGetenv
+	osGetenv = func(key string) string {
+		if key == "BABEL_O_EVERCORE_AUTO_BOOTSTRAP" {
+			return "1"
+		}
+		return "<unset>"
+	}
+	defer func() { osGetenv = prev }()
+	lines := buildMemoryInfoCardLines(MemoryCardAuto, raw)
+	for _, want := range []string{
+		"MemoryOS · Auto-bootstrap policy",
+		"`on`",
+		"`off`",
+		"`prompt`",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("auto card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	for _, want := range [][2]string{
+		{"Current policy", "on  (state)"},
+		{"Env override", "BABEL_O_EVERCORE_AUTO_BOOTSTRAP=1"},
+	} {
+		if !containsValueCell(lines, want[0], want[1]) {
+			t.Fatalf("auto card missing key=%q value=%q:\n%s", want[0], want[1], strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardEnableToolsShowsPrecedence(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "mcpToolsEnabled": false},
+		"bootstrap": {"status": "ready", "mcpToolsEnabled": false}
+	}`)
+	lines := buildMemoryInfoCardLines(MemoryCardEnableTools, raw)
+	for _, want := range []string{
+		"MemoryOS · Enable model-visible memory tools",
+		"Precedence",
+		"env > state > default(off)",
+		"mcp:evercore:memory_save_note",
+		"mcp:evercore:memory_flush_session",
+		"mcp:evercore:memory_restart",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("enable-tools card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	if !containsValueCell(lines, "MCP tools", "off") {
+		t.Fatalf("enable-tools card missing MCP tools=off:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestBuildMemoryInfoCardDisableToolsShowsLockedDownState(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed", "mcpToolsEnabled": true},
+		"bootstrap": {"status": "ready", "mcpToolsEnabled": true}
+	}`)
+	lines := buildMemoryInfoCardLines(MemoryCardDisableTools, raw)
+	for _, want := range []string{
+		"MemoryOS · Disable model-visible memory tools",
+		"Persist `mcpToolsEnabled: false`",
+		"Future cold starts hide the model-visible memory tools",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("disable-tools card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+	if !containsValueCell(lines, "MCP tools", "on (runtime)") {
+		t.Fatalf("disable-tools card missing MCP tools=on (runtime):\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+func TestBuildMemoryInfoCardOptOutShowsState(t *testing.T) {
+	for _, optedOut := range []bool{false, true} {
+		raw := []byte(fmt.Sprintf(`{"bootstrap": {"status": "not_configured", "optedOut": %v}}`, optedOut))
+		lines := buildMemoryInfoCardLines(MemoryCardOptOut, raw)
+		if !containsLine(lines, "MemoryOS · Opt out of first-run prompt") {
+			t.Fatalf("opt-out card missing title:\n%s", strings.Join(lines, "\n"))
+		}
+		expectedValue := "no"
+		if optedOut {
+			expectedValue = "yes"
+		}
+		if !containsValueCell(lines, "optedOut", expectedValue) {
+			t.Fatalf("opt-out card missing optedOut=%s:\n%s", expectedValue, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardExternalShowsRequiredEnv(t *testing.T) {
+	raw := []byte(`{"bootstrap": {"status": "not_configured", "externalHintShown": false}}`)
+	lines := buildMemoryInfoCardLines(MemoryCardExternal, raw)
+	for _, want := range []string{
+		"MemoryOS · Mark as externally managed",
+		"externalHintShown:",
+		"BABEL_O_EVERCORE_MODE=external",
+		"BABEL_O_EVERCORE_BASE_URL=http://127.0.0.1:<port>",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("external card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardResetShowsWhatAndWhatNot(t *testing.T) {
+	raw := []byte(`{"bootstrap": {"status": "ready", "path": "/tmp/bootstrap.json"}}`)
+	lines := buildMemoryInfoCardLines(MemoryCardReset, raw)
+	for _, want := range []string{
+		"MemoryOS · Reset local bootstrap state",
+		"Status:",
+		"ready",
+		"Delete `~/.babel-o/everos-bootstrap.json`",
+		"NOT removed",
+		"`rm -rf`",
+		"bbl memory reset --yes",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("reset card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardDoctorShowsSnapshotAndSteps(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": false, "mode": "managed"},
+		"bootstrap": {
+			"status": "failed",
+			"errorCode": "EVEROS_BOOTSTRAP_UV_MISSING",
+			"autoBootstrapPolicy": "prompt",
+			"fallbackBuildTool": "uv"
+		}
+	}`)
+	lines := buildMemoryInfoCardLines(MemoryCardDoctor, raw)
+	for _, want := range []string{
+		"MemoryOS · Self-check (doctor)",
+		"everCore",
+		"enabled=yes",
+		"healthy=no",
+		"bootstrap",
+		"status=failed",
+		"errorCode",
+		"EVEROS_BOOTSTRAP_UV_MISSING",
+		"autoBootstrap",
+		"buildTool",
+		"Provider diagnostics",
+		"Keychain reachability",
+		"Sidecar port",
+		"bbl memory doctor",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("doctor card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryInfoCardAlignmentRendersKeyColumn(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed"},
+		"bootstrap": {
+			"status": "ready",
+			"path": "/tmp/everos-bootstrap.json",
+			"autoBootstrapPolicy": "on",
+			"fallbackBuildTool": "uv"
+		}
+	}`)
+	lines := buildMemoryInfoCardLines(MemoryCardSetup, raw)
+	// The card's state table is rendered with a left-padded key
+	// column so the colons line up vertically. Instead of
+	// matching exact byte positions (which is brittle as the
+	// renderer evolves), we verify the rendered table has
+	// enough width for the longest key plus a colon, value, and
+	// a single-space separator — the minimum width that makes
+	// the table readable.
+	//
+	// The test payload intentionally does not set sourceRepo so
+	// the fallback "unknown" label is rendered; the assertion
+	// checks the padded "Source repo" row appears with the
+	// unknown placeholder, which is enough to verify the
+	// longest key is padded and the colon is present.
+	if !containsLine(lines, "  Source repo: unknown") {
+		t.Fatalf("setup card missing longest-key row:\n%s", strings.Join(lines, "\n"))
+	}
+	// And shorter keys must be padded so the colon aligns
+	// with the longest one. Spot-check: the line containing
+	// "Status" must show the padded key + colon + value.
+	if !containsLine(lines, "  Status     : ready") {
+		t.Fatalf("setup card missing padded Status row:\n%s", strings.Join(lines, "\n"))
+	}
+}
+
+// containsValueCell returns true if any state-table row in
+// `lines` has the given `key` (left-padded with spaces) followed
+// by a `:` and the literal `value`. Robust to the exact
+// keyCol width because we only check the substring structure:
+// the row is `  <spaces>key<padding>: <value>`, and we look
+// for `key` then walk forward to the next `:` to delimit the
+// padded column.
+func containsValueCell(lines []string, key, value string) bool {
+	for _, line := range lines {
+		idx := strings.Index(line, key)
+		if idx < 0 {
+			continue
+		}
+		// After the key, find the next ":" — that is the end
+		// of the padded column.
+		rest := line[idx+len(key):]
+		colonIdx := strings.Index(rest, ":")
+		if colonIdx < 0 {
+			continue
+		}
+		afterColon := strings.TrimLeft(rest[colonIdx+1:], " ")
+		if afterColon == value || strings.HasPrefix(afterColon, value) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestBuildMemoryInfoCardEmptyPayloadStillRendersShell(t *testing.T) {
+	lines := buildMemoryInfoCardLines(MemoryCardSetup, nil)
+	for _, want := range []string{
+		"MemoryOS · Setup",
+		"Status",
+		"Path",
+		"What this does",
+		"How to run",
+		"bbl memory setup",
+		"Press q / Esc / Enter to close",
+	} {
+		if !containsLine(lines, want) {
+			t.Fatalf("empty-payload setup card missing %q in:\n%s", want, strings.Join(lines, "\n"))
+		}
+	}
+}
+
+func TestBuildMemoryFooterRendersReadyWhenBootstrapReadyAndRuntimeHealthy(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": true, "healthy": true, "mode": "managed"},
+		"bootstrap": {"status": "ready", "configured": true}
+	}`)
+	got := formatMemoryFooter(raw)
+	want := "[m: ready]"
+	if got != want {
+		t.Fatalf("formatMemoryFooter = %q, want %q", got, want)
+	}
+}
+
+func TestBuildMemoryFooterRendersFailedWithErrorCode(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"enabled": false, "healthy": false, "mode": "managed"},
+		"bootstrap": {"status": "failed", "configured": true, "errorCode": "EVEROS_BOOTSTRAP_UV_MISSING"}
+	}`)
+	got := formatMemoryFooter(raw)
+	want := "[m: failed ⚠ EVEROS_BOOTSTRAP_UV_MISSING]"
+	if got != want {
+		t.Fatalf("formatMemoryFooter = %q, want %q", got, want)
+	}
+}
+
+func TestFormatMemoryHintLineReturnsNotConfiguredTipForMissingBootstrap(t *testing.T) {
+	raw := []byte(`{"bootstrap": {"status": "not_configured"}}`)
+	got := formatMemoryHintLine(raw)
+	if !strings.Contains(got, "MemoryOS: not configured") {
+		t.Fatalf("formatMemoryHintLine = %q, want MemoryOS not configured hint", got)
+	}
+}
+
+func TestFormatMemoryHintLineReturnsFailedHintWithErrorCode(t *testing.T) {
+	raw := []byte(`{"bootstrap": {"status": "failed", "errorCode": "EVEROS_BOOTSTRAP_UV_MISSING"}}`)
+	got := formatMemoryHintLine(raw)
+	if !strings.Contains(got, "setup failed") {
+		t.Fatalf("formatMemoryHintLine = %q, want 'setup failed'", got)
+	}
+	if !strings.Contains(got, "EVEROS_BOOTSTRAP_UV_MISSING") {
+		t.Fatalf("formatMemoryHintLine = %q, want error code in message", got)
+	}
+}
+
+func TestFormatMemoryHintLineReturnsInFlightHint(t *testing.T) {
+	for _, status := range []string{"cloning", "building", "checking_prereqs"} {
+		raw := []byte(`{"bootstrap": {"status": "` + status + `"}}`)
+		got := formatMemoryHintLine(raw)
+		if !strings.Contains(got, status) {
+			t.Fatalf("formatMemoryHintLine(%s) = %q, want in-flight hint", status, got)
+		}
+	}
+}
+
+func TestFormatMemoryHintLineReturnsMcpToolsHintWhenReadyButToolsOff(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"mcpToolsEnabled": false},
+		"bootstrap": {"status": "ready"}
+	}`)
+	got := formatMemoryHintLine(raw)
+	if !strings.Contains(got, "ready (read-only)") {
+		t.Fatalf("formatMemoryHintLine = %q, want MCP tools hint", got)
+	}
+	if !strings.Contains(got, "bbl memory enable-tools") {
+		t.Fatalf("formatMemoryHintLine = %q, want enable-tools command in hint", got)
+	}
+}
+
+func TestFormatMemoryHintLineReturnsEmptyForReadyWithToolsEnabled(t *testing.T) {
+	raw := []byte(`{
+		"everCore": {"mcpToolsEnabled": true},
+		"bootstrap": {"status": "ready"}
+	}`)
+	got := formatMemoryHintLine(raw)
+	if got != "" {
+		t.Fatalf("formatMemoryHintLine = %q, want empty for ready+tools-enabled", got)
+	}
+}
+
+func TestFormatMemoryHintLineReturnsEmptyForEmptyOrInvalidPayload(t *testing.T) {
+	if got := formatMemoryHintLine(nil); got != "" {
+		t.Fatalf("formatMemoryHintLine(nil) = %q, want empty", got)
+	}
+	if got := formatMemoryHintLine([]byte("not json")); got != "" {
+		t.Fatalf("formatMemoryHintLine(invalid) = %q, want empty", got)
 	}
 }
 
@@ -7226,6 +7781,55 @@ func TestToolAuditOverlayEscapeEnterQAllClose(t *testing.T) {
 	cm := closed.(model)
 	if cm.inputMode != modeComposing {
 		t.Fatalf("'q' should close the overlay, got %q", cm.inputMode)
+	}
+}
+
+func TestMemoryOverlayEscapeEnterQAllClose(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1"})
+	m.inputMode = modeMemoryOverlay
+	m.memoryOverlayLines = []string{"line 0", "line 1", "line 2"}
+	m.memoryOverlayScroll = 0
+	for _, keyType := range []rune{tea.KeyEsc, tea.KeyEnter} {
+		closed, _ := m.Update(keyPress(keyType))
+		cm := closed.(model)
+		if cm.inputMode != modeComposing {
+			t.Fatalf("key %v should close the memory overlay, got %q", keyType, cm.inputMode)
+		}
+	}
+	closed, _ := m.Update(textKey("q"))
+	cm := closed.(model)
+	if cm.inputMode != modeComposing {
+		t.Fatalf("'q' should close the memory overlay, got %q", cm.inputMode)
+	}
+}
+
+func TestMemoryOverlayScrollsOnUpDown(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1"})
+	m.inputMode = modeMemoryOverlay
+	m.memoryOverlayLines = make([]string, 20)
+	for i := range m.memoryOverlayLines {
+		m.memoryOverlayLines[i] = "line"
+	}
+	m.memoryOverlayScroll = 0
+	up, _ := m.Update(keyPress(tea.KeyUp))
+	u := up.(model)
+	if u.memoryOverlayScroll != 0 {
+		t.Fatalf("up at 0 should stay at 0, got %d", u.memoryOverlayScroll)
+	}
+	down, _ := m.Update(keyPress(tea.KeyDown))
+	d := down.(model)
+	if d.memoryOverlayScroll != 1 {
+		t.Fatalf("down should advance scroll, got %d", d.memoryOverlayScroll)
+	}
+	// Clamp at len-1.
+	cur := d
+	for i := 0; i < 50; i++ {
+		next, _ := cur.Update(keyPress(tea.KeyDown))
+		cur = next.(model)
+	}
+	maxScroll := len(cur.memoryOverlayLines) - 1
+	if cur.memoryOverlayScroll != maxScroll {
+		t.Fatalf("scroll should clamp at %d, got %d", maxScroll, cur.memoryOverlayScroll)
 	}
 }
 

@@ -308,6 +308,12 @@ func (m model) renderComposerStack(width int) string {
 	if contextOverlay := m.renderContextOverlay(width); contextOverlay != "" {
 		parts = append(parts, contextOverlay)
 	}
+	// Z14 zero-friction plan: render the MemoryOS welcome
+	// hint above the input box when the runtime status is in
+	// an actionable state. Empty hint means no banner.
+	if m.memoryHint != "" && m.inputMode == modeComposing {
+		parts = append(parts, m.memoryHint)
+	}
 	if wave := m.renderRuntimeWave(width); wave != "" {
 		parts = append(parts, wave)
 	}
@@ -420,6 +426,9 @@ func (m model) renderFooterSummary(width int) string {
 	// Phase A.4: compact mode (terminal < 120×30) drops this
 	// row entirely to free vertical space for the transcript.
 	var sideParts []string
+	if m.memoryFooter != "" {
+		sideParts = append(sideParts, m.memoryFooter)
+	}
 	if !m.isCompact() {
 		if inbox := formatInboxFooterStatus(m.sessionID, m.inboxMessages, m.inboxChannels); inbox != "" {
 			sideParts = append(sideParts, inbox)

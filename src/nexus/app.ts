@@ -42,6 +42,7 @@ import { removeWorktree } from './worktree.js'
 import { ExploreAgentScheduler } from './agents/AgentScheduler.js'
 import { AgentJobRegistryError } from './agents/AgentJobRegistry.js'
 import type { AgentJob, AgentScheduler } from './agents/types.js'
+import { readEverOSBootstrapStateSync, type EverOSBootstrapErrorCode } from '../shared/everosBootstrapStore.js'
 
 
 declare module 'fastify' {
@@ -700,6 +701,75 @@ export async function createNexusApp(
     },
   }
 
+  /**
+   * MemoryOS bootstrap status snapshot used by `/v1/runtime/status`
+   * (and `/v1/runtime/memory/status`). The Go TUI's persistent
+   * `[m: …]` footer reads this field via the runtime status poll,
+   * so the function must be safe to call synchronously on every
+   * poll — the underlying `readEverOSBootstrapStateSync` is a single
+   * readFileSync, not a network round-trip.
+   */
+  const everOSBootstrapStatus = (): {
+    configured: boolean
+    path: string
+    status: 'not_configured' | 'invalid' | string
+    optedIn?: boolean
+    optedOut?: boolean
+    externalHintShown?: boolean
+    sourceRepo?: string
+    sourceRef?: string
+    sourceCommit?: string
+    sourceDir?: string
+    dataDir?: string
+    managedCommand?: string
+    lastCheckedAt?: string
+    lastBuildAt?: string
+    errorCode?: EverOSBootstrapErrorCode
+    errorMessage?: string
+    autoBootstrapPolicy?: 'off' | 'on' | 'prompt'
+    fallbackBuildTool?: 'uv' | 'pip' | 'none'
+    mcpToolsEnabled?: boolean
+  } => {
+    const read = readEverOSBootstrapStateSync()
+    if (!read.ok) {
+      return {
+        configured: false,
+        path: read.path,
+        status: 'invalid',
+        errorCode: read.errorCode,
+        errorMessage: read.errorMessage,
+      }
+    }
+    if (!read.exists || !read.state) {
+      return {
+        configured: false,
+        path: read.path,
+        status: 'not_configured',
+      }
+    }
+    return {
+      configured: true,
+      path: read.path,
+      status: read.state.buildStatus ?? 'not_started',
+      optedIn: read.state.optedIn === true,
+      optedOut: read.state.optedOut === true,
+      externalHintShown: read.state.externalHintShown === true,
+      sourceRepo: read.state.sourceRepo,
+      sourceRef: read.state.sourceRef,
+      sourceCommit: read.state.sourceCommit,
+      sourceDir: read.state.sourceDir,
+      dataDir: read.state.dataDir,
+      managedCommand: read.state.managedCommand,
+      lastCheckedAt: read.state.lastCheckedAt,
+      lastBuildAt: read.state.lastBuildAt,
+      errorCode: read.state.errorCode ?? undefined,
+      errorMessage: read.state.errorMessage ?? undefined,
+      autoBootstrapPolicy: read.state.autoBootstrapPolicy,
+      fallbackBuildTool: read.state.fallbackBuildTool,
+      mcpToolsEnabled: read.state.mcpToolsEnabled,
+    }
+  }
+
   app.setErrorHandler((error: any, request, reply) => {
     const isValidationError =
       error.validation ||
@@ -784,6 +854,11 @@ export async function createNexusApp(
       capabilities: options.remoteRunner?.capabilities,
     },
     everCore: everCoreStatus(),
+    // MemoryOS bootstrap state must live on the same payload the
+    // Go TUI polls. Without it, the persistent `[m: …]` footer
+    // indicator would always render `[m: off]` because the Go
+    // TUI cannot see the bootstrap file directly.
+    bootstrap: everOSBootstrapStatus(),
     metrics: await buildRuntimeMetricsSnapshot(metrics, options.storage),
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))

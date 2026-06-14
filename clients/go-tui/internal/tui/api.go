@@ -29,6 +29,18 @@ func fetchRuntimeConfig(cfg Config, since int) tea.Cmd {
 	}
 }
 
+// fetchRuntimeStatus issues a lightweight GET /v1/runtime/status
+// poll. The Go TUI uses it to drive the persistent memory
+// footer indicator (Z6 of the zero-friction memory plan). We
+// intentionally do not store the full payload — only the
+// rendered one-line hint survives in the model.
+func fetchRuntimeStatus(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		body, err := nexusRawJSON(cfg, http.MethodGet, "/v1/runtime/status", nil)
+		return runtimeStatusMsg{raw: body, err: err}
+	}
+}
+
 func pollTick() tea.Msg {
 	return pollTickMsg{}
 }

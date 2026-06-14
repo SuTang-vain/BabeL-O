@@ -748,7 +748,7 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
     })
     assert.equal(cacheAwareState.cacheAwareCompactPolicy.longContextUtilizationMode, true)
     assert.equal(cacheAwareState.cacheAwareCompactPolicy.cachePreservationMode, true)
-    assert.equal(cacheAwareState.contextWindowState.maxTokens, 179_616)
+    assert.equal(cacheAwareState.contextWindowState.maxTokens, 920_000)
     assert.equal(cacheAwareState.autoCompactDecision.thresholdPercent, 93)
 
     const providerErrorState = buildRuntimeContextRefreshState({
@@ -869,8 +869,8 @@ test('runtime pipeline builds provider loop request state and query params', () 
     finalResponseOnlyMode: false,
     finalResponseOnlyRemainingLoops: 3,
   })
-  assert.equal(policyRequestState.contextWindowState.maxTokens, 179_616)
-  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(179_616 * 0.93))
+  assert.equal(policyRequestState.contextWindowState.maxTokens, 920_000)
+  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.93))
 
   const suppressedState = buildProviderLoopRequestState({
     loopCount: 24,
