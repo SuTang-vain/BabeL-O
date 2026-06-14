@@ -40,6 +40,11 @@ export interface ManagedNexusLaunchSpec {
   managed: boolean
 }
 
+export interface GoTuiSessionReady {
+  status: 'existing' | 'allocated'
+  sessionId: string
+}
+
 export interface GoTuiProcessSpec {
   command: string
   args: string[]
@@ -71,10 +76,16 @@ export function registerGoCommand(program: Command): void {
       }
       let launch: GoTuiLaunchSpec
       let managedNexus: Awaited<ReturnType<typeof ensureNexusForGoTui>> | undefined
+      let launchOptions = options
       try {
-        launch = createGoTuiLaunchSpec(options)
         managedNexus = await ensureNexusForGoTui(options)
+        const sessionReady = await ensureGoTuiSession(options, { fetch })
+        launchOptions = { ...options, session: sessionReady.sessionId }
+        launch = createGoTuiLaunchSpec(launchOptions)
       } catch (error: any) {
+        if (managedNexus?.status === 'started') {
+          managedNexus.child?.kill?.()
+        }
         console.error(`Error: ${error.message || error}`)
         process.exit(1)
       }
@@ -521,6 +532,70 @@ export function buildGoTuiArgs(options: Pick<GoTuiCommandOptions, 'url' | 'cwd' 
     args.push('--poll-interval-ms', String(options.pollIntervalMs))
   }
   return args
+}
+
+export async function ensureGoTuiSession(
+  options: Pick<GoTuiCommandOptions, 'url' | 'cwd' | 'session'>,
+  deps: {
+    fetch?: FetchFn
+    env?: NodeJS.ProcessEnv
+  } = {},
+): Promise<GoTuiSessionReady> {
+  const existing = options.session?.trim()
+  if (existing) {
+    return { status: 'existing', sessionId: existing }
+  }
+  const sessionId = await allocateGoTuiSession(options, deps)
+  return { status: 'allocated', sessionId }
+}
+
+export async function allocateGoTuiSession(
+  options: Pick<GoTuiCommandOptions, 'url' | 'cwd'>,
+  deps: {
+    fetch?: FetchFn
+    env?: NodeJS.ProcessEnv
+  } = {},
+): Promise<string> {
+  const fetchImpl = deps.fetch ?? fetch
+  const endpoint = new URL('/v1/sessions', healthProbeBaseUrl(options.url))
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+  }
+  const apiKey = deps.env?.NEXUS_API_KEY ?? process.env.NEXUS_API_KEY
+  if (apiKey) {
+    headers['X-Nexus-API-Key'] = apiKey
+  }
+  const response = await fetchImpl(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      cwd: options.cwd,
+      metadata: {
+        client: 'go-tui',
+        phase: 'launcher_session_allocate',
+        entrypoint: 'bbl go',
+      },
+    }),
+  })
+  if (!response.ok) {
+    let detail = ''
+    try {
+      const text = await response.text()
+      detail = text ? `: ${text.slice(0, 240).replace(/\s+/g, ' ')}` : ''
+    } catch {
+      // Keep the primary status message if the body cannot be read.
+    }
+    throw new Error(
+      `Failed to allocate Go TUI session at ${endpoint}: ${response.status} ${response.statusText}${detail}`,
+    )
+  }
+  const body = (await response.json()) as { sessionId?: unknown }
+  const sessionId = typeof body.sessionId === 'string' ? body.sessionId.trim() : ''
+  if (!sessionId) {
+    throw new Error(`Failed to allocate Go TUI session at ${endpoint}: server returned an empty sessionId`)
+  }
+  return sessionId
 }
 
 export async function ensureNexusForGoTui(

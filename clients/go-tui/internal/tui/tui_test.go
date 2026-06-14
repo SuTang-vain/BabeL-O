@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -1480,6 +1481,83 @@ func TestSessionPanelSwitchesBySessionIDInput(t *testing.T) {
 	}
 	if got := m.input.Value(); got != "" {
 		t.Fatalf("session input should be cleared after switch, got %q", got)
+	}
+}
+
+func TestNewModelSyncsConfiguredSessionID(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", SessionID: " session_existing "})
+	if m.sessionID != "session_existing" {
+		t.Fatalf("sessionID = %q, want configured session", m.sessionID)
+	}
+}
+
+func TestEnsureStartupSessionReusesConfiguredSession(t *testing.T) {
+	postCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			postCount++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"type":"session_created","sessionId":"session_new"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	msg := ensureStartupSession(Config{BaseURL: srv.URL, Cwd: "/workspace", SessionID: " session_existing "})()
+	got, ok := msg.(startupSessionMsg)
+	if !ok {
+		t.Fatalf("ensureStartupSession returned %T, want startupSessionMsg", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("ensureStartupSession returned error: %v", got.err)
+	}
+	if got.sessionID != "session_existing" {
+		t.Fatalf("sessionID = %q, want configured session", got.sessionID)
+	}
+	if postCount != 0 {
+		t.Fatalf("configured session should not allocate a new session, POST count=%d", postCount)
+	}
+}
+
+func TestEnsureStartupSessionAllocatesWhenMissing(t *testing.T) {
+	postCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			postCount++
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"type":"session_created","sessionId":"session_startup"}`))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	msg := ensureStartupSession(Config{BaseURL: srv.URL, Cwd: "/workspace"})()
+	got, ok := msg.(startupSessionMsg)
+	if !ok {
+		t.Fatalf("ensureStartupSession returned %T, want startupSessionMsg", msg)
+	}
+	if got.err != nil {
+		t.Fatalf("ensureStartupSession returned error: %v", got.err)
+	}
+	if got.sessionID != "session_startup" {
+		t.Fatalf("sessionID = %q, want allocated session", got.sessionID)
+	}
+	if postCount != 1 {
+		t.Fatalf("missing session should allocate exactly once, POST count=%d", postCount)
+	}
+}
+
+func TestStartupSessionMsgUpdatesActiveSession(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	updated, cmd := m.Update(startupSessionMsg{sessionID: "session_startup"})
+	if cmd != nil {
+		t.Fatalf("startupSessionMsg should not return a command, got %T", cmd)
+	}
+	um := updated.(model)
+	if um.sessionID != "session_startup" || um.cfg.SessionID != "session_startup" {
+		t.Fatalf("startup session got model=%q cfg=%q", um.sessionID, um.cfg.SessionID)
 	}
 }
 
@@ -9497,6 +9575,7 @@ func TestProviderConfigMsgAppliesConfigAndEntersModelPicker(t *testing.T) {
 func TestProviderConfigMsgErrorStaysOnBaseURLStep(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.setMode(modeModelPickBaseURL)
+	m.modelProviderSaving = true
 
 	updated, cmd := m.Update(providerConfigMsg{
 		providerID: "minimax",
@@ -9509,12 +9588,66 @@ func TestProviderConfigMsgErrorStaysOnBaseURLStep(t *testing.T) {
 	if um.inputMode != modeModelPickBaseURL {
 		t.Fatalf("inputMode = %q, want %q", um.inputMode, modeModelPickBaseURL)
 	}
+	if um.modelProviderSaving {
+		t.Fatalf("modelProviderSaving must clear on provider config error")
+	}
 	if cmd != nil {
 		t.Fatalf("providerConfigMsg error should not fetch model list, got %T", cmd)
 	}
 	rendered := renderTranscript(um.transcript, 200)
 	if !strings.Contains(rendered, "provider config: unknown_provider") {
 		t.Fatalf("transcript should surface provider config error, got %q", rendered)
+	}
+	panel := stripANSICodes(um.renderModelPickBaseURL(120))
+	if !strings.Contains(panel, "provider config: unknown_provider") {
+		t.Fatalf("base URL panel should surface provider config error, got:\n%s", panel)
+	}
+}
+
+func TestModelPickBaseURLEnterShowsSavingAndLocksDuplicateSubmit(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.modelCatalog = runtimeModelsResponse{
+		Providers: []registeredProvider{{
+			ID:             "deepseek",
+			DisplayName:    "DeepSeek",
+			AuthMode:       "api-key",
+			DefaultBaseURL: "https://api.deepseek.com",
+		}},
+	}
+	m.modelPickSelectedID = "deepseek"
+	m.modelPickAPIKeyDraft = "sk-test"
+	m.setMode(modeModelPickBaseURL)
+	m.setInputValue("https://api.example.com")
+
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	um := updated.(model)
+	if cmd == nil {
+		t.Fatalf("base URL enter should dispatch provider config save")
+	}
+	if !um.modelProviderSaving {
+		t.Fatalf("modelProviderSaving = false, want true")
+	}
+	panel := stripANSICodes(um.renderModelPickBaseURL(120))
+	if !strings.Contains(panel, "saving provider config") || !strings.Contains(panel, "request in flight") {
+		t.Fatalf("base URL panel should show an in-flight save state:\n%s", panel)
+	}
+	_, cmd2 := um.Update(keyPress(tea.KeyEnter))
+	if cmd2 != nil {
+		t.Fatalf("enter while provider config save is in flight must be a no-op, got %T", cmd2)
+	}
+}
+
+func TestFriendlyNexusRequestErrorExplainsConnectionFailure(t *testing.T) {
+	err := &url.Error{
+		Op:  "Post",
+		URL: "http://127.0.0.1:3000/v1/runtime/config/provider",
+		Err: fmt.Errorf("connect: connection refused"),
+	}
+	got := friendlyNexusRequestError(err)
+	for _, want := range []string{"cannot reach Nexus", "127.0.0.1:3000", "bbl nexus start"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("friendlyNexusRequestError missing %q in %q", want, got)
+		}
 	}
 }
 
@@ -10795,14 +10928,14 @@ func TestModelPickApiKeyDialogMasksFullSecret(t *testing.T) {
 // === Phase C.2: modelPickBaseURLDialog (renderModelPickBaseURL migration) ===
 
 func TestModelPickBaseURLDialogID(t *testing.T) {
-	d := newModelPickBaseURLDialog(nil, "> https://api.example.com")
+	d := newModelPickBaseURLDialog(nil, "> https://api.example.com", false, "")
 	if d.ID() != "modelPickBaseURL" {
 		t.Fatalf("ID() = %q, want %q", d.ID(), "modelPickBaseURL")
 	}
 }
 
 func TestModelPickBaseURLDialogHandleMsgIsNoOp(t *testing.T) {
-	d := newModelPickBaseURLDialog(nil, "> https://api.example.com")
+	d := newModelPickBaseURLDialog(nil, "> https://api.example.com", false, "")
 	if cmd := d.HandleMsg(keyPress(tea.KeyEnter)); cmd != nil {
 		t.Fatalf("HandleMsg(KeyEnter) cmd = %v, want nil", cmd)
 	}
@@ -10813,7 +10946,7 @@ func TestModelPickBaseURLDialogViewContainsProviderDefaultAndInput(t *testing.T)
 		ID:             "anthropic",
 		DefaultBaseURL: "https://api.anthropic.com",
 	}
-	d := newModelPickBaseURLDialog(provider, "> https://api.example.com")
+	d := newModelPickBaseURLDialog(provider, "> https://api.example.com", false, "")
 	out := d.View(100)
 	for _, want := range []string{
 		"anthropic base URL",
@@ -10842,7 +10975,7 @@ func TestRenderModelPickBaseURLStillDelegatesToDialog(t *testing.T) {
 	m.modelPickSelectedID = "anthropic"
 	m.setMode(modeModelPickBaseURL)
 	got := m.renderModelPickBaseURL(100)
-	want := newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View()).View(100)
+	want := newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View(), false, "").View(100)
 	if got != want {
 		t.Fatalf("renderModelPickBaseURL(100) diverges from dialog View:\n--- got ---\n%s\n--- want ---\n%s",
 			got, want)

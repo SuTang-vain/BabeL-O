@@ -90,10 +90,12 @@ func (d *modelPickApiKeyDialog) View(width int) string {
 type modelPickBaseURLDialog struct {
 	provider *registeredProvider
 	input    string
+	saving   bool
+	errorMsg string
 }
 
-func newModelPickBaseURLDialog(provider *registeredProvider, input string) *modelPickBaseURLDialog {
-	return &modelPickBaseURLDialog{provider: provider, input: input}
+func newModelPickBaseURLDialog(provider *registeredProvider, input string, saving bool, errorMsg string) *modelPickBaseURLDialog {
+	return &modelPickBaseURLDialog{provider: provider, input: input, saving: saving, errorMsg: errorMsg}
 }
 
 func (d *modelPickBaseURLDialog) ID() string { return "modelPickBaseURL" }
@@ -115,9 +117,18 @@ func (d *modelPickBaseURLDialog) View(width int) string {
 		mutedStyle.Render(fmt.Sprintf("Press Enter to use %s.", firstNonEmpty(defaultURL, "<provider default>"))),
 		"",
 		"  " + d.input,
-		"",
-		mutedStyle.Render("  enter confirm · esc back"),
 	}
+	if d.errorMsg != "" {
+		lines = append(lines, "", errorStyle.Render("  "+d.errorMsg))
+	}
+	if d.saving {
+		lines = append(lines, "", statusStyle.Render("  saving provider config…"))
+	}
+	footer := "  enter confirm · esc back"
+	if d.saving {
+		footer = "  saving… · request in flight"
+	}
+	lines = append(lines, "", mutedStyle.Render(footer))
 	rc.AddPart(strings.Join(lines, "\n"))
 	return rc.Render()
 }

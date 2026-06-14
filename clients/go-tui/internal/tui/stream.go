@@ -43,6 +43,19 @@ func waitForStreamEvent(ch <-chan streamEvent) tea.Cmd {
 	}
 }
 
+func ensureStartupSession(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		if sessionID := strings.TrimSpace(cfg.SessionID); sessionID != "" {
+			return startupSessionMsg{sessionID: sessionID}
+		}
+		sessionID, err := allocateServerSession(cfg, "")
+		if err != nil {
+			return startupSessionMsg{err: fmt.Errorf("allocate server session: %w", err)}
+		}
+		return startupSessionMsg{sessionID: sessionID}
+	}
+}
+
 const (
 	DefaultGoTuiExecuteTimeoutMs     = 180_000
 	longContextGoTuiExecuteTimeoutMs = 300_000

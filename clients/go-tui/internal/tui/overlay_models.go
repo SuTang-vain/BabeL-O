@@ -256,7 +256,12 @@ func (m model) renderModelPickBaseURL(width int) string {
 	if m.inputMode != modeModelPickBaseURL {
 		return ""
 	}
-	return newModelPickBaseURLDialog(m.currentModelProvider(), m.input.View()).View(width)
+	return newModelPickBaseURLDialog(
+		m.currentModelProvider(),
+		m.input.View(),
+		m.modelProviderSaving,
+		m.modelPickError,
+	).View(width)
 }
 
 // renderModelPickModel is step 4: pick a model from the

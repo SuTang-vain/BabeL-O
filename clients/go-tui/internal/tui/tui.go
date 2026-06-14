@@ -247,6 +247,11 @@ type providerConfigMsg struct {
 	err        error
 }
 
+type startupSessionMsg struct {
+	sessionID string
+	err       error
+}
+
 // contextAnalysisMsg is the response from
 // GET /v1/sessions/:sessionId/context. The Go TUI only reads the
 // stable top-level diagnostic envelope (summary / status / signals /
@@ -1082,6 +1087,13 @@ type model struct {
 	// renders a spinner instead of the list.
 	modelPickerLive    []registeredModel
 	modelPickerLoading bool
+	// modelProviderSaving is true while Step 3 persists the
+	// provider credential/base URL to Nexus. The /model flow is
+	// rendered as a full-screen panel, so provider-save errors
+	// must also live in panel state instead of only the hidden
+	// transcript.
+	modelProviderSaving bool
+	modelPickError      string
 	// modelPickSubmitting is true between the operator
 	// pressing Enter in Step 4 and the response landing
 	// from POST /v1/runtime/config/select. While it's
@@ -1815,6 +1827,7 @@ func newModel(cfg Config) model {
 		historyIndex:              -1,
 		graceQuietPeriod:          graceQuiet,
 		graceMaxDelay:             graceMax,
+		sessionID:                 strings.TrimSpace(cfg.SessionID),
 	}
 	if width, height, err := term.GetSize(os.Stdout.Fd()); err == nil && width > 0 && height > 0 {
 		m.width = width
@@ -1829,6 +1842,7 @@ func (m model) Init() tea.Cmd {
 	return tea.Batch(
 		textarea.Blink,
 		m.spinner.Tick,
+		ensureStartupSession(m.cfg),
 		fetchRuntimeConfig(m.cfg, 0),
 		fetchRuntimeProfiles(m.cfg),
 		m.schedulePollTick(),
@@ -2558,6 +2572,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.modelPickProviderIdx >= 0 && m.modelPickProviderIdx < len(m.modelCatalog.Providers) {
 					p := m.modelCatalog.Providers[m.modelPickProviderIdx]
 					m.modelPickSelectedID = p.ID
+					m.modelPickError = ""
 					// No-auth providers can enter the model picker
 					// immediately. API-key / bearer providers always
 					// show the credential step so the user can paste
@@ -2585,9 +2600,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.modelPickAPIKeyDraft = sanitizeModelAPIKeyInput(m.modelPickAPIKeyDraft)
 				provider := m.currentModelProvider()
 				if m.modelPickAPIKeyDraft == "" && (provider == nil || !provider.Configured) {
-					m.appendLine("error", "provider API key is required before selecting this model")
+					m.modelPickError = "provider API key is required before selecting this model"
+					m.appendLine("error", m.modelPickError)
 					return m, nil
 				}
+				m.modelPickError = ""
 				m.setInputValue("")
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
@@ -2598,8 +2615,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case modeModelPickBaseURL:
+			if m.modelProviderSaving {
+				return m, nil
+			}
 			switch key {
 			case "esc":
+				m.modelPickError = ""
 				m.setMode(modeModelPickApiKey)
 				return m, nil
 			case "enter":
@@ -2616,8 +2637,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if provider == nil {
 					return m, nil
 				}
+				m.modelPickError = ""
+				m.modelProviderSaving = true
 				return m, saveRuntimeProviderConfig(m.cfg, provider.ID, m.modelPickAPIKeyDraft, m.modelPickBaseURLDraft)
 			}
+			m.modelPickError = ""
 			return m, m.updateInput(msg)
 
 		case modeModelPickModel:
@@ -2723,6 +2747,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the WebSocket is up, and an extra transcript row for
 		// every turn adds noise without information.
 		return m, waitForStreamEvent(msg.events)
+
+	case startupSessionMsg:
+		if msg.err != nil {
+			m.appendLine("error", "startup session: "+friendlyNexusRequestError(msg.err))
+			return m, nil
+		}
+		if strings.TrimSpace(msg.sessionID) != "" {
+			m.sessionID = strings.TrimSpace(msg.sessionID)
+			m.cfg.SessionID = m.sessionID
+		}
+		return m, nil
 
 	case streamEventMsg:
 		if msg.event.err != nil {
@@ -2885,11 +2920,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case providerConfigMsg:
+		m.modelProviderSaving = false
 		if msg.err != nil {
-			m.appendLine("error", "provider config: "+msg.err.Error())
+			m.modelPickError = "provider config: " + friendlyNexusRequestError(msg.err)
+			m.appendLine("error", m.modelPickError)
 			m.setMode(modeModelPickBaseURL)
 			return m, nil
 		}
+		m.modelPickError = ""
 		m.applyRuntimeConfig(msg.config)
 		for i := range m.modelCatalog.Providers {
 			if m.modelCatalog.Providers[i].ID == msg.providerID {

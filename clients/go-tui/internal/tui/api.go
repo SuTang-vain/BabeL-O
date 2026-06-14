@@ -3,10 +3,13 @@ package tui
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -485,6 +488,24 @@ func summarizeHTTPError(data []byte) string {
 		return hint
 	}
 	return truncatePlain(singleLine(firstNonEmpty(stringField(payload, "message"), code, compactJSON(payload))), 200)
+}
+
+func friendlyNexusRequestError(err error) string {
+	if err == nil {
+		return ""
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if errors.Is(urlErr.Err, os.ErrDeadlineExceeded) {
+			return "Nexus request timed out; check that `bbl go` started Nexus, or run `bbl nexus start` and retry."
+		}
+		var netErr net.Error
+		if errors.As(urlErr.Err, &netErr) && netErr.Timeout() {
+			return "Nexus request timed out; check that `bbl go` started Nexus, or run `bbl nexus start` and retry."
+		}
+		return fmt.Sprintf("cannot reach Nexus at %s; check that `bbl go` started Nexus, or run `bbl nexus start` and retry.", urlErr.URL)
+	}
+	return err.Error()
 }
 
 // friendlyNexusError maps known §5 path C error codes to human

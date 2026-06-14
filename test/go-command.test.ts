@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { Command } from 'commander'
 import {
+  allocateGoTuiSession,
   buildGoTuiArgs,
   collectGoTuiBinaryCandidates,
   createManagedNexusLaunchSpec,
@@ -12,6 +13,7 @@ import {
   createGoTuiLaunchSpec,
   defaultGoTuiBinary,
   defaultGoTuiBinaryName,
+  ensureGoTuiSession,
   ensureNexusForGoTui,
   execGoTuiVersionProbe,
   isLocalNexusUrl,
@@ -128,6 +130,72 @@ test('isNexusHealthy probes /health and maps ws URLs to HTTP', async () => {
   })
   assert.equal(ok, true)
   assert.deepEqual(seen, ['http://127.0.0.1:3000/health'])
+})
+
+test('allocateGoTuiSession posts to Nexus and returns the allocated session id', async () => {
+  const calls: Array<{ url: string; init?: RequestInit }> = []
+  const sessionId = await allocateGoTuiSession(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+    },
+    {
+      env: { NEXUS_API_KEY: 'secret' },
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls.push({ url: String(input), init })
+        return new Response(
+          JSON.stringify({
+            type: 'session_created',
+            sessionId: 'session_launcher',
+          }),
+          {
+            status: 201,
+            headers: { 'content-type': 'application/json' },
+          },
+        )
+      }) as typeof fetch,
+    },
+  )
+
+  assert.equal(sessionId, 'session_launcher')
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].url, 'http://127.0.0.1:3000/v1/sessions')
+  assert.equal(calls[0].init?.method, 'POST')
+  assert.equal(
+    (calls[0].init?.headers as Record<string, string>)['X-Nexus-API-Key'],
+    'secret',
+  )
+  assert.deepEqual(JSON.parse(String(calls[0].init?.body)), {
+    cwd: '/workspace',
+    metadata: {
+      client: 'go-tui',
+      phase: 'launcher_session_allocate',
+      entrypoint: 'bbl go',
+    },
+  })
+})
+
+test('ensureGoTuiSession reuses an explicit session without POSTing', async () => {
+  let fetchCalled = false
+  const ready = await ensureGoTuiSession(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      session: ' session_existing ',
+    },
+    {
+      fetch: (async () => {
+        fetchCalled = true
+        throw new Error('unexpected fetch')
+      }) as typeof fetch,
+    },
+  )
+
+  assert.deepEqual(ready, {
+    status: 'existing',
+    sessionId: 'session_existing',
+  })
+  assert.equal(fetchCalled, false)
 })
 
 test('createManagedNexusLaunchSpec maps URL, cwd, and tool policy to __server env', () => {
@@ -919,13 +987,15 @@ test('bbl go --check: fails when Go TUI major is unsupported by healthy Nexus', 
     if (String(url).endsWith('/health')) {
       return Promise.resolve(new Response('ok', { status: 200 }))
     }
-    return Promise.resolve(new Response(
-      JSON.stringify({
-        serverVersion: '1.0.0',
-        goTuiCompatibility: { supportedMajors: [1] },
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    ))
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          serverVersion: '1.0.0',
+          goTuiCompatibility: { supportedMajors: [1] },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    )
   }
   const report = await runGoTuiCheckReport(
     {
@@ -951,13 +1021,15 @@ test('bbl go --check: skips compat comparison when Go TUI version cannot be pars
     if (String(url).endsWith('/health')) {
       return Promise.resolve(new Response('ok', { status: 200 }))
     }
-    return Promise.resolve(new Response(
-      JSON.stringify({
-        serverVersion: '1.0.0',
-        goTuiCompatibility: { supportedMajors: [1] },
-      }),
-      { status: 200, headers: { 'content-type': 'application/json' } },
-    ))
+    return Promise.resolve(
+      new Response(
+        JSON.stringify({
+          serverVersion: '1.0.0',
+          goTuiCompatibility: { supportedMajors: [1] },
+        }),
+        { status: 200, headers: { 'content-type': 'application/json' } },
+      ),
+    )
   }
   const report = await runGoTuiCheckReport(
     {
@@ -994,7 +1066,7 @@ test('bbl go --check: skips compat comparison when Go TUI version cannot be pars
 test('bbl go --help describes the Go TUI as a stable alternative (Phase 9 promotion guard)', () => {
   const program = new Command()
   registerGoCommand(program)
-  const goCommand = program.commands.find(c => c.name() === 'go')
+  const goCommand = program.commands.find((c) => c.name() === 'go')
   assert.ok(goCommand, 'expected a `go` subcommand to be registered')
   const description = goCommand!.description()
   assert.match(description ?? '', /Launch the Go TUI client/)
