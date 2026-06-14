@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { Command } from 'commander'
@@ -66,7 +66,7 @@ test('createGoTuiLaunchSpec prefers a prebuilt binary', () => {
   assert.deepEqual(launch, {
     command: binary,
     args: ['--url', 'http://nexus.local', '--cwd', '/workspace'],
-    cwd: sourceDir,
+    cwd: dirname(binary),
     mode: 'binary',
   })
 })
@@ -511,7 +511,32 @@ test('createGoTuiLaunchSpec prefers BABEL_O_GO_TUI_BINARY over the in-tree dev b
   )
   assert.equal(launch.command, envPath)
   assert.equal(launch.mode, 'binary')
-  assert.equal(launch.cwd, sourceDir)
+  assert.equal(launch.cwd, dirname(envPath))
+})
+
+test('createGoTuiLaunchSpec uses package binary dir as cwd for portable installs', () => {
+  const packageRoot = '/Users/sutang/.local/share/babel-o/app/v0.3.5-darwin-arm64'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
+  const launch = createGoTuiLaunchSpec(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists: (p: string) => p === packageBundled || p === join(packageRoot, 'package.json'),
+      packageRoot,
+      platform: 'darwin',
+      arch: 'arm64',
+      env: {},
+    },
+  )
+
+  assert.equal(launch.command, packageBundled)
+  assert.equal(launch.mode, 'binary')
+  assert.equal(launch.cwd, dirname(packageBundled))
+  assert.notEqual(launch.cwd, sourceDir)
 })
 
 test('createGoTuiLaunchSpec falls back to the in-tree dev build when no env var is set', () => {
@@ -535,6 +560,7 @@ test('createGoTuiLaunchSpec falls back to the in-tree dev build when no env var 
   )
   assert.equal(launch.command, inTreeBinary)
   assert.equal(launch.mode, 'binary')
+  assert.equal(launch.cwd, dirname(inTreeBinary))
 })
 
 test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tree dev build', () => {
@@ -562,6 +588,7 @@ test('createGoTuiLaunchSpec picks the package-bundled prebuilt before the in-tre
   // in-tree dev build (priority 5).
   assert.equal(launch.command, packageBundled)
   assert.equal(launch.mode, 'binary')
+  assert.equal(launch.cwd, dirname(packageBundled))
 })
 
 test('createGoTuiLaunchSpec falls back to go run ./cmd/go-tui when no binary exists', () => {
@@ -660,12 +687,12 @@ test('createGoTuiProcessSpec keeps source fallback as direct go run', () => {
   })
 })
 
-test('execGoTuiVersionProbe uses the same macOS shell bridge as launch', () => {
-  const calls: Array<{ command: string; args: string[] }> = []
+test('execGoTuiVersionProbe uses the same macOS shell bridge and cwd as launch', () => {
+  const calls: Array<{ command: string; args: string[]; cwd?: string }> = []
   const output = execGoTuiVersionProbe('/go-tui', {
     platform: 'darwin',
-    execFileSync: ((command: string, args: string[]) => {
-      calls.push({ command, args })
+    execFileSync: ((command: string, args: string[], options: { cwd?: string }) => {
+      calls.push({ command, args, cwd: options.cwd })
       return 'bbl-go-tui 0.3.3'
     }) as any,
   })
@@ -675,6 +702,7 @@ test('execGoTuiVersionProbe uses the same macOS shell bridge as launch', () => {
     {
       command: '/bin/sh',
       args: ['-c', 'exec "$0" "$@"', '/go-tui', '--version'],
+      cwd: '/',
     },
   ])
 })

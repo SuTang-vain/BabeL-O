@@ -102,6 +102,8 @@ export function registerGoCommand(program: Command): void {
               'Install Go (https://go.dev/dl/) or use a prebuilt release: ' +
               '`npm install -g babel-o`, or set BABEL_O_GO_TUI_BINARY to a release asset path.',
           )
+        } else if (error.code === 'ENOENT' && !existsSync(launch.cwd)) {
+          console.error(`Error: failed to launch Go TUI: spawn cwd does not exist: ${launch.cwd}`)
         } else {
           console.error(`Error: failed to launch Go TUI: ${error.message}`)
         }
@@ -323,7 +325,7 @@ export function createGoTuiLaunchSpec(
       return {
         command: candidate,
         args,
-        cwd: sourceDir,
+        cwd: dirname(candidate),
         mode: 'binary',
       }
     }
@@ -393,6 +395,7 @@ export function execGoTuiVersionProbe(
     encoding: 'utf8',
     timeout: 5_000,
     stdio: ['ignore', 'pipe', 'pipe'],
+    cwd: launch.cwd,
   })
 }
 
