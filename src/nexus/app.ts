@@ -1006,6 +1006,129 @@ export async function createNexusApp(
     }
   })
 
+  // bbl loop plan Phase 1b: per-pane workspace/tab/pane ↔
+  // session mapping. Lets multi-pane TUI restore across
+  // server restarts and reconcile against local snapshot.
+  const loopPaneUpsertSchema = z.object({
+    paneId: z.string().min(1).max(128),
+    workspaceId: z.string().min(1).max(128),
+    tabId: z.string().min(1).max(128),
+    sessionId: z.string().min(1).max(256),
+    agent: z.string().min(1).max(64),
+    cwd: z.string().min(1).max(4096),
+    label: z.string().max(256).nullable().optional(),
+    lastRev: z.number().int().min(0).default(0),
+  })
+
+  app.post('/v1/loop/workspaces/:workspaceId/panes', async (request, reply) => {
+    const params = z.object({ workspaceId: z.string() }).parse(request.params)
+    const body = loopPaneUpsertSchema.parse(request.body)
+    if (body.workspaceId !== params.workspaceId) {
+      return reply.code(400).send({
+        type: 'error',
+        code: 'WORKSPACE_MISMATCH',
+        message: `workspaceId in body (${body.workspaceId}) does not match URL (${params.workspaceId}).`,
+      })
+    }
+    const pane = await options.storage.upsertLoopPane({
+      paneId: body.paneId,
+      workspaceId: body.workspaceId,
+      tabId: body.tabId,
+      sessionId: body.sessionId,
+      agent: body.agent,
+      cwd: body.cwd,
+      label: body.label ?? null,
+      lastRev: body.lastRev,
+      updatedAt: new Date().toISOString(),
+    })
+    return { type: 'loop_pane', pane }
+  })
+
+  app.patch(
+    '/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId',
+    async (request, reply) => {
+      const params = z
+        .object({
+          workspaceId: z.string(),
+          tabId: z.string(),
+          paneId: z.string(),
+        })
+        .parse(request.params)
+      const body = z
+        .object({
+          label: z.string().max(256).nullable().optional(),
+          lastRev: z.number().int().min(0).optional(),
+          cwd: z.string().min(1).max(4096).optional(),
+          sessionId: z.string().min(1).max(256).optional(),
+        })
+        .parse(request.body)
+      const existing = await options.storage.listLoopPanes({ paneId: params.paneId })
+      const current = existing[0]
+      if (!current) {
+        return reply.code(404).send({
+          type: 'error',
+          code: 'PANE_NOT_FOUND',
+          message: `Pane not found: ${params.paneId}`,
+        })
+      }
+      const merged: typeof current = {
+        ...current,
+        workspaceId: params.workspaceId,
+        tabId: params.tabId,
+        label: body.label === undefined ? current.label : body.label,
+        cwd: body.cwd ?? current.cwd,
+        sessionId: body.sessionId ?? current.sessionId,
+        lastRev: body.lastRev ?? current.lastRev,
+        updatedAt: new Date().toISOString(),
+      }
+      await options.storage.upsertLoopPane(merged)
+      return { type: 'loop_pane', pane: merged }
+    },
+  )
+
+  app.delete(
+    '/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId',
+    async (request, reply) => {
+      const params = z
+        .object({
+          workspaceId: z.string(),
+          tabId: z.string(),
+          paneId: z.string(),
+        })
+        .parse(request.params)
+      const deleted = await options.storage.deleteLoopPane(params.paneId)
+      if (!deleted) {
+        return reply.code(404).send({
+          type: 'error',
+          code: 'PANE_NOT_FOUND',
+          message: `Pane not found: ${params.paneId}`,
+        })
+      }
+      return { type: 'loop_pane_deleted', paneId: params.paneId }
+    },
+  )
+
+  app.get('/v1/loop/workspaces', async request => {
+    const query = z
+      .object({
+        workspaceId: z.string().max(128).optional(),
+        sessionId: z.string().max(256).optional(),
+      })
+      .parse(request.query)
+    const panes = await options.storage.listLoopPanes({
+      workspaceId: query.workspaceId,
+      sessionId: query.sessionId,
+    })
+    return {
+      type: 'loop_workspaces',
+      panes,
+      filter: {
+        workspaceId: query.workspaceId ?? null,
+        sessionId: query.sessionId ?? null,
+      },
+    }
+  })
+
   app.get('/v1/runtime/memory/status', async () => {
     const everCore = everCoreStatus()
     const capabilityAvailable = isEverCoreAvailable(everCore)

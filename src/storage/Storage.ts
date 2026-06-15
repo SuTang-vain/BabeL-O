@@ -164,5 +164,28 @@ export interface NexusStorage {
   listPermissionAudits(sessionId: string): Promise<PermissionAudit[]>
   saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void>
   getExecutionMetrics(sessionId: string): Promise<ExecutionMetrics | null>
+  upsertLoopPane(pane: LoopPaneState): Promise<LoopPaneState>
+  listLoopPanes(filter?: LoopPaneFilter): Promise<LoopPaneState[]>
+  deleteLoopPane(paneId: string): Promise<boolean>
+  updateLoopPaneRev(paneId: string, lastRev: number, updatedAt: string): Promise<LoopPaneState | null>
   close?(): Promise<void>
+}
+
+export type LoopPaneState = {
+  paneId: string
+  workspaceId: string
+  tabId: string
+  sessionId: string
+  agent: string
+  cwd: string
+  label: string | null
+  lastRev: number
+  updatedAt: string
+}
+
+export type LoopPaneFilter = {
+  workspaceId?: string
+  tabId?: string
+  paneId?: string
+  sessionId?: string
 }

@@ -12,6 +12,8 @@ import type {
   ChildSessionListOptions,
   EventListOptions,
   EventListResult,
+  LoopPaneFilter,
+  LoopPaneState,
   NexusStorage,
   SessionGetOptions,
   StorageListOptions,
@@ -416,6 +418,106 @@ export class SqliteStorage implements NexusStorage {
 
   async close(): Promise<void> {
     this.db.close()
+  }
+
+  async upsertLoopPane(pane: LoopPaneState): Promise<LoopPaneState> {
+    this.db
+      .prepare(
+        `INSERT INTO loop_state (
+          pane_id, workspace_id, tab_id, session_id,
+          agent, cwd, label, last_rev, updated_at
+        ) VALUES (
+          @paneId, @workspaceId, @tabId, @sessionId,
+          @agent, @cwd, @label, @lastRev, @updatedAt
+        )
+        ON CONFLICT(pane_id) DO UPDATE SET
+          workspace_id = excluded.workspace_id,
+          tab_id = excluded.tab_id,
+          session_id = excluded.session_id,
+          agent = excluded.agent,
+          cwd = excluded.cwd,
+          label = excluded.label,
+          last_rev = excluded.last_rev,
+          updated_at = excluded.updated_at`,
+      )
+      .run({
+        paneId: pane.paneId,
+        workspaceId: pane.workspaceId,
+        tabId: pane.tabId,
+        sessionId: pane.sessionId,
+        agent: pane.agent,
+        cwd: pane.cwd,
+        label: pane.label,
+        lastRev: pane.lastRev,
+        updatedAt: pane.updatedAt,
+      })
+    return pane
+  }
+
+  async listLoopPanes(filter: LoopPaneFilter = {}): Promise<LoopPaneState[]> {
+    const conditions: string[] = []
+    const params: Record<string, string> = {}
+    if (filter.workspaceId) {
+      conditions.push('workspace_id = @workspaceId')
+      params.workspaceId = filter.workspaceId
+    }
+    if (filter.tabId) {
+      conditions.push('tab_id = @tabId')
+      params.tabId = filter.tabId
+    }
+    if (filter.paneId) {
+      conditions.push('pane_id = @paneId')
+      params.paneId = filter.paneId
+    }
+    if (filter.sessionId) {
+      conditions.push('session_id = @sessionId')
+      params.sessionId = filter.sessionId
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = this.db
+      .prepare(
+        `SELECT pane_id, workspace_id, tab_id, session_id,
+                agent, cwd, label, last_rev, updated_at
+         FROM loop_state
+         ${where}
+         ORDER BY workspace_id ASC, tab_id ASC, pane_id ASC`,
+      )
+      .all(params) as Row[]
+    return rows.map(row => ({
+      paneId: String(row.pane_id),
+      workspaceId: String(row.workspace_id),
+      tabId: String(row.tab_id),
+      sessionId: String(row.session_id),
+      agent: String(row.agent),
+      cwd: String(row.cwd),
+      label: row.label == null ? null : String(row.label),
+      lastRev: Number(row.last_rev ?? 0),
+      updatedAt: String(row.updated_at),
+    }))
+  }
+
+  async deleteLoopPane(paneId: string): Promise<boolean> {
+    const result = this.db
+      .prepare('DELETE FROM loop_state WHERE pane_id = ?')
+      .run(paneId)
+    return Number(result.changes ?? 0) > 0
+  }
+
+  async updateLoopPaneRev(
+    paneId: string,
+    lastRev: number,
+    updatedAt: string,
+  ): Promise<LoopPaneState | null> {
+    const existing = await this.listLoopPanes({ paneId })
+    const current = existing[0]
+    if (!current) return null
+    const next: LoopPaneState = { ...current, lastRev, updatedAt }
+    this.db
+      .prepare(
+        'UPDATE loop_state SET last_rev = ?, updated_at = ? WHERE pane_id = ?',
+      )
+      .run(lastRev, updatedAt, paneId)
+    return next
   }
 
   async saveToolTrace(trace: ToolTrace): Promise<void> {
@@ -1055,6 +1157,34 @@ export class SqliteStorage implements NexusStorage {
       this.ensureEventSequenceSchema()
       this.db.exec('PRAGMA user_version = 13;')
       version = 13
+    }
+
+    if (version < 14) {
+      // bbl loop Phase 1b: per-pane workspace/tab/pane ↔ session
+      // mapping. One row per pane; lastRev tracks the highest
+      // event_seq the client has consumed so the loop can
+      // resume across server restarts.
+      this.db.exec(`
+        CREATE TABLE IF NOT EXISTS loop_state (
+          pane_id      TEXT NOT NULL,
+          workspace_id TEXT NOT NULL,
+          tab_id       TEXT NOT NULL,
+          session_id   TEXT NOT NULL,
+          agent        TEXT NOT NULL,
+          cwd          TEXT NOT NULL,
+          label        TEXT,
+          last_rev     INTEGER NOT NULL DEFAULT 0,
+          updated_at   TEXT NOT NULL,
+          PRIMARY KEY (pane_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS loop_state_session_idx
+          ON loop_state(session_id);
+        CREATE INDEX IF NOT EXISTS loop_state_workspace_idx
+          ON loop_state(workspace_id, tab_id, pane_id);
+      `)
+      this.db.exec('PRAGMA user_version = 14;')
+      version = 14
     }
   }
 

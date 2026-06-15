@@ -378,3 +378,148 @@ test('GET /v1/runtime/loop/health returns empty panes when no sessions exist', a
     await app.close()
   }
 })
+
+test('loop_state CRUD routes round-trip a pane', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const upsert = await app.inject({
+      method: 'POST',
+      url: '/v1/loop/workspaces/ws-1/panes',
+      payload: {
+        paneId: 'pane-1',
+        workspaceId: 'ws-1',
+        tabId: 'tab-1',
+        sessionId: 'session-loop-1',
+        agent: 'bbl',
+        cwd,
+        label: 'main',
+        lastRev: 0,
+      },
+    })
+    assert.equal(upsert.statusCode, 200)
+    const upserted = upsert.json().pane
+    assert.equal(upserted.paneId, 'pane-1')
+    assert.equal(upserted.workspaceId, 'ws-1')
+
+    const list = await app.inject({
+      method: 'GET',
+      url: '/v1/loop/workspaces?workspaceId=ws-1',
+    })
+    assert.equal(list.statusCode, 200)
+    assert.equal(list.json().panes.length, 1)
+    assert.equal(list.json().panes[0].paneId, 'pane-1')
+
+    const patch = await app.inject({
+      method: 'PATCH',
+      url: '/v1/loop/workspaces/ws-1/tabs/tab-1/panes/pane-1',
+      payload: { label: 'renamed', lastRev: 42 },
+    })
+    assert.equal(patch.statusCode, 200)
+    const patched = patch.json().pane
+    assert.equal(patched.label, 'renamed')
+    assert.equal(patched.lastRev, 42)
+
+    const deleteResponse = await app.inject({
+      method: 'DELETE',
+      url: '/v1/loop/workspaces/ws-1/tabs/tab-1/panes/pane-1',
+    })
+    assert.equal(deleteResponse.statusCode, 200)
+    assert.equal(deleteResponse.json().type, 'loop_pane_deleted')
+
+    const listAfterDelete = await app.inject({
+      method: 'GET',
+      url: '/v1/loop/workspaces?workspaceId=ws-1',
+    })
+    assert.equal(listAfterDelete.json().panes.length, 0)
+  } finally {
+    await app.close()
+  }
+})
+
+test('loop_state POST rejects mismatched workspaceId between URL and body', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state-mismatch`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/loop/workspaces/ws-url/panes',
+      payload: {
+        paneId: 'pane-x',
+        workspaceId: 'ws-body',
+        tabId: 'tab-1',
+        sessionId: 'session-loop-1',
+        agent: 'bbl',
+        cwd,
+      },
+    })
+    assert.equal(response.statusCode, 400)
+    assert.equal(response.json().code, 'WORKSPACE_MISMATCH')
+  } finally {
+    await app.close()
+  }
+})
+
+test('loop_state DELETE returns 404 when pane is missing', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state-404`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'DELETE',
+      url: '/v1/loop/workspaces/ws-1/tabs/tab-1/panes/pane-missing',
+    })
+    assert.equal(response.statusCode, 404)
+    assert.equal(response.json().code, 'PANE_NOT_FOUND')
+  } finally {
+    await app.close()
+  }
+})
+
+test('loop_state ghost pane cleanup removes local rows without a server pane', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state-ghost`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    await options_crud_upsert(app, 'pane-keep', 'ws-1', 'tab-1')
+    await options_crud_upsert(app, 'pane-ghost', 'ws-1', 'tab-1')
+    const serverPanes = await app.inject({
+      method: 'GET',
+      url: '/v1/loop/workspaces',
+    })
+    const serverIds = new Set(serverPanes.json().panes.map((pane: { paneId: string }) => pane.paneId))
+    const localSnapshot = ['pane-keep', 'pane-ghost', 'pane-stale-local-only']
+    const keep = localSnapshot.filter(paneId => serverIds.has(paneId)).sort()
+    const ghost = localSnapshot.filter(paneId => !serverIds.has(paneId)).sort()
+    assert.deepEqual(keep, ['pane-ghost', 'pane-keep'])
+    assert.deepEqual(ghost, ['pane-stale-local-only'])
+  } finally {
+    await app.close()
+  }
+})
+
+async function options_crud_upsert(
+  app: Awaited<ReturnType<typeof createNexusApp>>,
+  paneId: string,
+  workspaceId: string,
+  tabId: string,
+): Promise<void> {
+  await app.inject({
+    method: 'POST',
+    url: `/v1/loop/workspaces/${workspaceId}/panes`,
+    payload: {
+      paneId,
+      workspaceId,
+      tabId,
+      sessionId: `session-${paneId}`,
+      agent: 'bbl',
+      cwd: '/tmp',
+    },
+  })
+}

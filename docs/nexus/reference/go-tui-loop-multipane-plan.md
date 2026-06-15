@@ -370,9 +370,14 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - `src/nexus/app.ts` 已新增 `GET /v1/sessions/:id/wait`（since / match / types / timeout 长轮询 + 250ms tick）；`escapeRegExpForWait` helper 同处定义，匹配为子串语义。
 - `src/storage/Storage.ts` 扩展 `EventListResult.lastSeq`；`SqliteStorage` / `MemoryStorage` 同步填充。客户端可拿到最近事件 revision。
 - `src/runtime/loopDiagnostics.ts` 新增 `derivePaneStatus`（6 态优先级：blocked > drift > waiting > done > working > idle）+ `pendingPermissions` / `pendingScopeBoundaries` / `outOfScopeEvidence` 计数。
-- `test/runtime-loop.test.ts` 新增 9 个测试覆盖：status 状态机 5 个 + wait endpoint 类型/匹配过滤 + 404 + long-poll 命中。全绿。
+- `src/nexus/app.ts` 新增 `GET /v1/runtime/loop/health`，聚合 `derivePaneStatus` + 轻量 `summarizeTaskScope`（直接从 lastN events 提取 taskScope 字段，避免重耦合 runtime pipeline）。
+- `src/storage/Storage.ts` 扩展 `LoopPaneState` / `LoopPaneFilter` 类型与 `upsertLoopPane` / `listLoopPanes` / `deleteLoopPane` / `updateLoopPaneRev` CRUD。
+- `src/storage/SqliteStorage.ts` 新增 v14 迁移建 `loop_state` 表（PRIMARY KEY pane_id + workspace_id / session_id 索引）+ 4 个 CRUD 实现。
+- `src/storage/MemoryStorage.ts` 配套 in-memory stub。
+- `src/nexus/app.ts` 新增 4 个 HTTP 路由：`POST /v1/loop/workspaces/:workspaceId/panes`、`PATCH /v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId`、`DELETE /v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId`、`GET /v1/loop/workspaces`。
+- `test/runtime-loop.test.ts` 累计 15 个测试：status 状态机 5 + wait endpoint 4 + loop/health 2 + loop_state CRUD 4。全绿。
 - `npm test` 全量 855/855 通过；`npm run typecheck` 通过；`npm run format:check` 通过。
-- **未完成**：`/v1/runtime/loop/health` 路由、`loop_state` SQLite 表、taskScope diagnostics 接入 health 响应；Go 侧消费侧未开始（属于 Phase 2）。
+- **未完成**：Go 侧 `internal/loop/` 消费端（属于 Phase 2）；本地 `state.json` + Nexus `loop_state` 双向 reconcile 完整实现（属于 Phase 5）。
 
 ### Phase 2 — `bbl loop` 骨架（单 workspace / 单 tab / 单 pane）
 目标：打通 `bbl loop → Nexus waitForEvent → render`，证明客户端能驱动多 session。
