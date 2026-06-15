@@ -325,9 +325,9 @@ func TestBuildModelOverlayLinesMirrorsChatModelConfigSemantics(t *testing.T) {
 	for _, want := range []string{
 		"Active model: minimax/MiniMax-M3",
 		"Active profile: alpha",
-			"Configuration commands",
-			"bbl config use <modelId>",
-			"bbl go, then /model",
+		"Configuration commands",
+		"bbl config use <modelId>",
+		"bbl go, then /model",
 		"minimax (MiniMax) · active · configured · auth=apiKey",
 		"* minimax/MiniMax-M3",
 		"ctx=245760",
@@ -3353,7 +3353,7 @@ func TestQuitDialogRendersAboveInputAndFitsView(t *testing.T) {
 		t.Fatalf("quit view height = %d, want %d:\n%s", got, m.height, plain)
 	}
 	quitIdx := strings.Index(plain, "Quit BabeL-O?")
-	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	inputIdx := strings.Index(plain, ">")
 	footerIdx := strings.Index(plain, "/ or ctrl+p commands")
 	if quitIdx < 0 || inputIdx < 0 || footerIdx < 0 {
 		t.Fatalf("quit view should contain dialog, input, and footer:\n%s", plain)
@@ -3769,7 +3769,7 @@ func TestSlashPaletteRendersAboveInputInFinalView(t *testing.T) {
 
 	plain := stripANSICodes(viewContent(m.View()))
 	paletteIdx := strings.Index(plain, "Slash · /")
-	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	inputIdx := strings.Index(plain, ">")
 	if paletteIdx < 0 {
 		t.Fatalf("final view should include slash palette, got:\n%s", plain)
 	}
@@ -3822,7 +3822,7 @@ func TestSlashPaletteOpenResizesViewportToKeepComposerVisible(t *testing.T) {
 	if got := lipgloss.Height(view); got != after.height {
 		t.Fatalf("slash palette view height = %d, want terminal height %d:\n%s", got, after.height, plain)
 	}
-	if !strings.Contains(plain, "Slash · /") || !strings.Contains(plain, "> Ask BabeL-O") {
+	if !strings.Contains(plain, "Slash · /") || !strings.Contains(plain, ">") {
 		t.Fatalf("slash palette and input should both remain visible, got:\n%s", plain)
 	}
 	if !strings.HasSuffix(plain, stripANSICodes(after.renderFooter(after.width))) {
@@ -3844,7 +3844,7 @@ func TestSessionPanelAnchorsAboveInputAtSmallHeight(t *testing.T) {
 		t.Fatalf("session panel view height = %d, want terminal height %d:\n%s", got, m.height, plain)
 	}
 	panelIdx := strings.Index(plain, "Session Control")
-	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	inputIdx := strings.Index(plain, ">")
 	if panelIdx < 0 {
 		t.Fatalf("session panel should be visible:\n%s", plain)
 	}
@@ -3882,7 +3882,7 @@ func TestDirectSessionCommandResizesForBottomAnchoredPanel(t *testing.T) {
 		t.Fatalf("direct /session view height = %d, want terminal height %d:\n%s", got, after.height, plain)
 	}
 	panelIdx := strings.Index(plain, "Session Control")
-	inputIdx := strings.Index(plain, "> Ask BabeL-O")
+	inputIdx := strings.Index(plain, ">")
 	if panelIdx < 0 || inputIdx < 0 || panelIdx > inputIdx {
 		t.Fatalf("session panel should render above input after direct command, panel=%d input=%d:\n%s",
 			panelIdx, inputIdx, plain)
@@ -4706,7 +4706,7 @@ func TestContextOverlayCloseRestoresComposerViewportHeight(t *testing.T) {
 		t.Fatalf("composer viewport height was not restored after context close, got %d", got)
 	}
 	view := stripANSICodes(viewContent(after.View()))
-	if !strings.Contains(view, "> Ask BabeL-O") {
+	if !strings.Contains(view, ">") {
 		t.Fatalf("composer input should be visible after context close:\n%s", view)
 	}
 }
@@ -7310,17 +7310,19 @@ func TestHeaderContextPrefersRuntimeContextSnapshot(t *testing.T) {
 	m.contextWindow = 120000
 	m.lastUsage = &usageSnapshot{InputTokens: 60000}
 	m.contextUsage = &contextUsageSnapshot{
-		PercentUsed:   8,
-		TokenEstimate: 13586,
-		MaxTokens:     179616,
-		PolicySource:  "large_context",
+		PercentUsed:             7,
+		TokenEstimate:           13586,
+		MaxTokens:               200000,
+		ModelContextWindow:      200000,
+		EffectiveContextCeiling: 179616,
+		PolicySource:            "large_context",
 	}
 
-	if got := m.formatContextUsageLabel(); got != "context 8%" {
+	if got := m.formatContextUsageLabel(); got != "context 7%" {
 		t.Fatalf("formatContextUsageLabel() = %q, want runtime snapshot percent", got)
 	}
 	detail := m.formatContextUsageDetail()
-	for _, want := range []string{"context: 13k / 179k used", "8%", "large_context"} {
+	for _, want := range []string{"context: 13k / 200k used", "7%", "effective 179k", "large_context"} {
 		if !strings.Contains(detail, want) {
 			t.Fatalf("formatContextUsageDetail() missing %q, got %q", want, detail)
 		}
@@ -7344,14 +7346,36 @@ func TestExecutionMetricsHydratesContextUsage(t *testing.T) {
 	if m.contextUsage == nil {
 		t.Fatal("execution_metrics should hydrate context usage")
 	}
-	if m.contextUsage.TokenEstimate != 13586 || m.contextUsage.MaxTokens != 179616 {
-		t.Fatalf("context usage = %+v, want token estimate 13586 and max 179616", *m.contextUsage)
+	if m.contextUsage.TokenEstimate != 13586 || m.contextUsage.MaxTokens != 200000 || m.contextUsage.EffectiveContextCeiling != 179616 {
+		t.Fatalf("context usage = %+v, want token estimate 13586, model window 200000, effective 179616", *m.contextUsage)
 	}
-	if got := m.formatContextUsageLabel(); got != "context 8%" {
-		t.Fatalf("formatContextUsageLabel() = %q, want context 8%%", got)
+	if got := m.formatContextUsageLabel(); got != "context 7%" {
+		t.Fatalf("formatContextUsageLabel() = %q, want context 7%%", got)
 	}
-	if got := formatContextUsageFooter(m.contextUsage); !strings.Contains(got, "ctx 8% 13586/179616") || !strings.Contains(got, "warn=125731 compact=161654") {
+	if got := formatContextUsageFooter(m.contextUsage); !strings.Contains(got, "ctx 7% 13586/200000") || !strings.Contains(got, "effective=179616") || !strings.Contains(got, "warn=125731 compact=161654") {
 		t.Fatalf("formatContextUsageFooter() = %q", got)
+	}
+}
+
+func TestContextUsagePrefersDeepSeekModelWindowOverEffectiveCeiling(t *testing.T) {
+	usage := contextUsageSnapshotFromContextUsageEvent(map[string]any{
+		"type":                    "context_usage",
+		"tokenEstimate":           11000,
+		"maxTokens":               852000,
+		"modelContextWindow":      1000000,
+		"effectiveContextCeiling": 852000,
+		"contextPolicySource":     "large_context",
+	})
+	if usage.MaxTokens != 1000000 || usage.EffectiveContextCeiling != 852000 {
+		t.Fatalf("context usage = %+v, want model window 1000000 and effective 852000", *usage)
+	}
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.contextUsage = usage
+	detail := m.formatContextUsageDetail()
+	for _, want := range []string{"context: 11k / 1.0M used", "effective 852k", "large_context"} {
+		if !strings.Contains(detail, want) {
+			t.Fatalf("formatContextUsageDetail() missing %q, got %q", want, detail)
+		}
 	}
 }
 
@@ -9497,7 +9521,7 @@ func TestPermissionEditorRendersSinglePromptArrow(t *testing.T) {
 // TestPlaceholderFollowsMode verifies that setMode swaps the
 // input placeholder to a context-appropriate hint for /model and
 // the permission editor, and that returning to a normal mode
-// restores the default "Ask BabeL-O" placeholder.
+// restores a blank default placeholder.
 func TestPlaceholderFollowsMode(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 
@@ -9517,11 +9541,11 @@ func TestPlaceholderFollowsMode(t *testing.T) {
 		}
 	}
 
-	// Returning to modeComposing restores the default placeholder
-	// so the bottom input box reads `> Ask BabeL-O` again.
+	// Returning to modeComposing restores the intentionally blank
+	// default placeholder.
 	m.setMode(modeComposing)
-	if got := m.input.Placeholder; got != "Ask BabeL-O" {
-		t.Fatalf("after setMode(modeComposing) placeholder = %q, want %q", got, "Ask BabeL-O")
+	if got := m.input.Placeholder; got != "" {
+		t.Fatalf("after setMode(modeComposing) placeholder = %q, want blank", got)
 	}
 }
 
@@ -10111,7 +10135,7 @@ func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 		t.Fatalf("composer viewport height was not restored after model save, got %d", got)
 	}
 	view := stripANSICodes(viewContent(um.View()))
-	if !strings.Contains(view, "> Ask BabeL-O") {
+	if !strings.Contains(view, ">") {
 		t.Fatalf("composer input should be visible after model save:\n%s", view)
 	}
 	if cmd != nil {
@@ -10604,7 +10628,7 @@ func TestInputUsesCrushStyleMultilinePrompt(t *testing.T) {
 	m.resize()
 
 	rendered := stripANSICodes(m.renderInput(120))
-	for _, want := range []string{"> Ask BabeL-O"} {
+	for _, want := range []string{">"} {
 		if !strings.Contains(rendered, want) {
 			t.Fatalf("input missing %q, got:\n%s", want, rendered)
 		}
@@ -10675,7 +10699,7 @@ func TestRunningViewShowsRuntimeWaveAboveInput(t *testing.T) {
 	if !strings.Contains(plain, "agent runtime") {
 		t.Fatalf("running wave row missing from view:\n%s", plain)
 	}
-	if strings.Index(plain, "agent runtime") > strings.Index(plain, "> Ask BabeL-O") {
+	if strings.Index(plain, "agent runtime") > strings.Index(plain, ">") {
 		t.Fatalf("running wave should render above the input prompt, got:\n%s", plain)
 	}
 	if !strings.HasSuffix(plain, stripANSICodes(m.renderFooter(m.width))) {

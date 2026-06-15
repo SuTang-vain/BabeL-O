@@ -34,7 +34,7 @@ import {
 } from './toolResultBudget.js'
 import {
   buildUserIntakeGuidanceEvent,
-  isMemoryCapabilityQuestion,
+  isPureMemoryCapabilityQuestion,
   shouldSuppressToolsForIntent,
 } from './intentGuidance.js'
 import {
@@ -481,7 +481,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       let providerContextRecoveryCount = 0
       let suppressedToolRetryCount = 0
       let memoryCapabilityAnswerRetryCount = 0
-      const memoryCapabilityQuestion = isMemoryCapabilityQuestion(options.prompt)
+      const memoryCapabilityQuestion = isPureMemoryCapabilityQuestion(options.prompt)
       const replacementState = createReplacementState()
       let providerLoopCompactAttempted = false
 

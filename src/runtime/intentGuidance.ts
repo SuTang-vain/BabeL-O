@@ -37,6 +37,15 @@ export type UserIntentGuidance = {
 
 export type UserIntakeGuidanceEvent = Extract<NexusEvent, { type: 'user_intake_guidance' }>
 
+type IntentCategory =
+  | 'pure_capability_question'
+  | 'availability_check'
+  | 'memory_save_request'
+  | 'memory_retrieval_request'
+  | 'self_diagnosis_request'
+  | 'action_request'
+  | 'general'
+
 type TurnPolicy = {
   responseMode: 'execute_task' | 'direct_answer'
   toolMode: 'enabled' | 'disabled' | 'available_for_verification'
@@ -184,10 +193,12 @@ export function toUserIntakeGuidanceEvent(options: {
 
 export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
   const policy = deriveTurnPolicy(guidance)
+  const intentCategory = deriveIntentCategory(guidance)
   const lines = [
     '## Turn Policy',
     `Source: ${guidance.source}`,
     `Intent: ${guidance.intent}`,
+    `Intent category: ${intentCategory}`,
     `Confidence: ${guidance.confidence.toFixed(2)}`,
     `Continuity with prior context: ${guidance.continuity.toFixed(2)}`,
     `Context scope: ${guidance.contextScope}`,
@@ -207,7 +218,8 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
 
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
   const normalized = normalizeGuidancePolicy(guidance)
-  if (isMemoryCapabilityQuestion(normalized.latestUserText)) return true
+  if (isMemoryAvailabilityCheckRequest(normalized.latestUserText)) return false
+  if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return true
   if (normalized.intent === 'status') return false
   return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
@@ -258,7 +270,23 @@ export function deriveFallbackUserIntentGuidance(options: {
     })
   }
 
-  if (isMemoryCapabilityQuestion(latestUserText)) {
+  if (isMemoryAvailabilityCheckRequest(latestUserText)) {
+    return buildGuidance({
+      intent: 'status',
+      confidence: 0.86,
+      continuity: hasPriorUserTurns ? 0.75 : 0.5,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget,
+      reason: 'The user is asking to verify current memory availability with runtime or workspace evidence.',
+      latestUserText,
+      explicitPaths,
+      source: 'fallback',
+    })
+  }
+
+  if (isPureMemoryCapabilityQuestion(latestUserText)) {
     return buildGuidance({
       intent: 'status',
       confidence: 0.88,
@@ -267,7 +295,7 @@ export function deriveFallbackUserIntentGuidance(options: {
       actionHint: 'respond_only',
       requiresTools: false,
       problemTarget,
-      reason: 'The user is asking whether memory capability is available, not asking to write memory now.',
+      reason: 'The user is asking whether memory capability is available, not asking to verify or write memory now.',
       latestUserText,
       explicitPaths,
       source: 'fallback',
@@ -360,7 +388,10 @@ async function queryIntakeModel(options: {
         'problemTarget must be one of: agent_failure, runtime_replay, tool_evidence, project_feature, user_artifact, unknown.',
         'requiresTools must be false for greeting/pause.',
         'Classify the target semantically, not by matching literal phrases. Use agent_failure when the user is asking about the assistant or runtime behavior; runtime_replay when the target is transcript/tool-call replay; tool_evidence when the target is evidence coverage or source support; project_feature when the target is the product or repository feature itself.',
-        'Use status/respond_only only when the user is asking for conversational state or capability information. If the latest message asks to verify, run, check, test, lint, build, inspect, modify, save memory, or call a named tool, keep requiresTools=true.',
+        'Use status/respond_only only when the user is asking for conversational state or pure capability information. If the latest message asks to verify, run, check, test, lint, build, inspect, modify, save memory, or call a named tool, keep requiresTools=true.',
+        'Current-state verification requires tools: checking whether the current runtime, tool, memory, config, session, workspace, or service is available, enabled, working, healthy, or up to date is not a pure capability question.',
+        'Chinese action cues such as 执行, 运行, 跑一下, 测试, 检查, 查看当前, 确认当前, 验证 normally indicate tool-backed verification when paired with current state or availability.',
+        'Category examples: pure capability question => status/respond_only/requiresTools=false; current memory status check => status/normal/requiresTools=true; execute a current availability check => continue/normal/requiresTools=true; save an explicit preference to long-term memory => continue/normal/requiresTools=true.',
         'Do not include natural-language behavioral instructions in the JSON. The runtime will derive execution policy from the structured fields.',
         `cwd: ${options.cwd}`,
         `recent user history:\n${options.history || '(none)'}`,
@@ -474,7 +505,7 @@ function deriveTurnPolicy(guidance: UserIntentGuidance): TurnPolicy {
     guidance.problemTarget === 'tool_evidence'
 
   let toolMode: TurnPolicy['toolMode'] = 'enabled'
-  if (guidance.intent === 'status' && !guidance.requiresTools && !isMemoryCapabilityQuestion(guidance.latestUserText)) {
+  if (guidance.intent === 'status' && !guidance.requiresTools && !isPureMemoryCapabilityQuestion(guidance.latestUserText)) {
     toolMode = 'available_for_verification'
   } else if (respondOnly) {
     toolMode = 'disabled'
@@ -490,6 +521,17 @@ function deriveTurnPolicy(guidance: UserIntentGuidance): TurnPolicy {
         ? 'background_only'
         : 'continue',
   }
+}
+
+function deriveIntentCategory(guidance: UserIntentGuidance): IntentCategory {
+  const text = guidance.latestUserText
+  if (isExplicitMemorySavePrompt(text)) return 'memory_save_request'
+  if (isMemoryAvailabilityCheckRequest(text)) return 'availability_check'
+  if (isPureMemoryCapabilityQuestion(text)) return 'pure_capability_question'
+  if (isMemoryRetrievalRequest(text)) return 'memory_retrieval_request'
+  if (guidance.problemTarget === 'agent_failure' || guidance.problemTarget === 'runtime_replay' || guidance.problemTarget === 'tool_evidence') return 'self_diagnosis_request'
+  if (isActionRequest(text)) return 'action_request'
+  return 'general'
 }
 
 function scoreProblemTarget(text: string): TargetScore {
@@ -525,20 +567,28 @@ function countMarkerMatches(text: string, markers: readonly RegExp[]): number {
 }
 
 function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
-  if (isMemoryCapabilityQuestion(guidance.latestUserText)) {
-    return {
-      ...guidance,
-      intent: 'status',
-      actionHint: 'respond_only',
-      requiresTools: false,
-    }
-  }
   if (isExplicitMemorySavePrompt(guidance.latestUserText)) {
     return {
       ...guidance,
       intent: 'continue',
       actionHint: 'normal',
       requiresTools: true,
+    }
+  }
+  if (isMemoryAvailabilityCheckRequest(guidance.latestUserText)) {
+    return {
+      ...guidance,
+      intent: guidance.intent === 'status' ? 'status' : 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+    }
+  }
+  if (isPureMemoryCapabilityQuestion(guidance.latestUserText)) {
+    return {
+      ...guidance,
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
     }
   }
   if (guidance.intent === 'pause') {
@@ -605,22 +655,53 @@ function isStatusPrompt(text: string): boolean {
   return false
 }
 
-export function isMemoryCapabilityQuestion(text: string): boolean {
+export function isPureMemoryCapabilityQuestion(text: string): boolean {
+  if (isMemoryAvailabilityCheckRequest(text) || isExplicitMemorySavePrompt(text)) return false
   const normalized = text.trim().toLowerCase()
-  const asksCapability = /\b(can you|could you|are you able to|do you have|is .*available)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
+  return /\b(can you|could you|are you able to|do you have)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
     /\b(memory|remember|long[- ]term memory)\b.*\b(available|enabled|write|save)\b/iu.test(normalized) ||
+    /\b(is .*memory.*available|is .*long[- ]term memory.*available)\b/iu.test(normalized) ||
     /(能否|能不能|可以|可否|是否|有没有|具备).*(写入|保存|记忆|长期记忆)/u.test(text) ||
     /(记忆|长期记忆).*(能否|能不能|可以|可否|是否|有没有|具备|可用|启用)/u.test(text)
-  if (!asksCapability) return false
-  return !/\b(memory_save_note|remember this|save this to memory|save to memory|remember:|remember that)\b/iu.test(normalized) &&
-    !/(请|帮我|立即|现在|把|将).*(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
+}
+
+export function isMemoryAvailabilityCheckRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  const hasMemory = /\b(memory|long[- ]term memory|memoryos)\b/iu.test(normalized) || /(记忆|长期记忆|memoryos)/u.test(text)
+  if (!hasMemory) return false
+
+  const hasActionCue = /\b(run|execute|test|verify|inspect|check|diagnose|status)\b/iu.test(normalized) ||
+    /(执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看当前|查一下|确认当前|诊断)/u.test(text)
+  const hasCurrentStateCue = /\b(current|now|available|enabled|active|working|healthy|status|read\/?write)\b/iu.test(normalized) ||
+    /(当前|现在|可用|启用|生效|状态|是否正常|能不能读写|读写)/u.test(text)
+
+  return hasActionCue && hasCurrentStateCue
 }
 
 function isExplicitMemorySavePrompt(text: string): boolean {
-  if (isMemoryCapabilityQuestion(text)) return false
   const normalized = text.trim().toLowerCase()
-  return /\b(memory_save_note|remember this|save (?:this )?(?:to )?(?:long[- ]term )?memory|remember:|remember that)\b/iu.test(normalized) ||
-    /(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
+  const explicitEnglish = /\b(memory_save_note|remember this|save (?:this )?(?:to )?(?:long[- ]term )?memory|save to memory|remember:|remember that)\b/iu.test(normalized)
+  if (explicitEnglish) return true
+
+  const asksCapability = /\b(can you|could you|are you able to|do you have)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
+    /(能否|能不能|可以|可否|是否|有没有|具备).*(写入|保存|记忆|长期记忆|记住)/u.test(text) ||
+    /(记忆|长期记忆).*(能否|能不能|可以|可否|是否|有没有|具备|可用|启用)/u.test(text)
+  const explicitChineseCommand = /(请|帮我|立即|现在|把|将).*(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
+  if (asksCapability && !explicitChineseCommand) return false
+
+  return explicitChineseCommand || /(记住|保存.*记忆|写入.*记忆|长期记忆.*写入|记忆保存)/u.test(text)
+}
+
+function isMemoryRetrievalRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(do you remember|remember.*(?:before|last time|previous)|prior preferences|previous decisions|last time)\b/iu.test(normalized) ||
+    /(你.*记得|还记得|之前|上次|我的偏好|历史.*(?:决策|上下文))/u.test(text)
+}
+
+function isActionRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(start|run|build|test|execute|launch|verify|inspect|check|diagnose)\b/iu.test(normalized) ||
+    /(开始|启动|运行|执行|构建|测试|验证|检查|诊断|跑一下|测一下)/u.test(text)
 }
 
 function isPausePrompt(text: string): boolean {

@@ -699,7 +699,32 @@ describe('User intent fallback guidance', () => {
     assert.equal(guidance.actionHint, 'respond_only')
     assert.equal(guidance.requiresTools, false)
     assert.equal(shouldSuppressToolsForIntent(guidance), true)
+    assert.match(formatUserIntentGuidance(guidance), /Intent category: pure_capability_question/)
     assert.equal('guidance' in guidance, false)
+  })
+
+  test('keeps memory availability checks tool-required', () => {
+    const prompts = [
+      '执行一下长期记忆是否可用',
+      '查看当前长期记忆是否可用',
+      '检查长期记忆是否启用',
+      '测试长期记忆读写是否可用',
+      '跑一下 memory status',
+    ]
+
+    for (const latestPrompt of prompts) {
+      const guidance = deriveFallbackUserIntentGuidance({
+        events: [],
+        latestPrompt,
+        cwd: tmpdir(),
+      })
+      assert.equal(guidance.intent, 'status')
+      assert.equal(guidance.actionHint, 'normal')
+      assert.equal(guidance.requiresTools, true)
+      assert.equal(shouldSuppressToolsForIntent(guidance), false)
+      assert.match(formatUserIntentGuidance(guidance), /Intent category: availability_check/)
+      assert.match(formatUserIntentGuidance(guidance), /Tool mode: enabled/)
+    }
   })
 
   test('binds ambiguous problem analysis to agent failure after self-diagnosis history', () => {

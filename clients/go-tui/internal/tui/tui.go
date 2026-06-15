@@ -1148,13 +1148,15 @@ type usageSnapshot struct {
 }
 
 type contextUsageSnapshot struct {
-	PercentUsed      int
-	TokenEstimate    int
-	MaxTokens        int
-	WarningThreshold int
-	CompactThreshold int
-	BlockingLimit    int
-	PolicySource     string
+	PercentUsed             int
+	TokenEstimate           int
+	MaxTokens               int
+	ModelContextWindow      int
+	EffectiveContextCeiling int
+	WarningThreshold        int
+	CompactThreshold        int
+	BlockingLimit           int
+	PolicySource            string
 }
 
 // softTimeoutSnapshot captures the running state of the
@@ -1245,9 +1247,9 @@ func (m *model) setMode(next inputMode) {
 		m.permissionLastInputAt = time.Now()
 	}
 	// Mode-aware placeholder: the /model and permission-editor
-	// overlays render the input box with context-specific hints so
-	// the operator doesn't see "Ask BabeL-O" while configuring a
-	// provider. The default mode goes back to "Ask BabeL-O".
+	// overlays render the input box with context-specific hints.
+	// Normal composing mode intentionally stays blank so the prompt
+	// line is visually quiet until the operator types.
 	m.input.Placeholder = placeholderForMode(next)
 	if m.width > 0 && m.height > 0 && (wasFullScreenOverlay || m.usesFullScreenOverlay()) {
 		m.resize()
@@ -1255,10 +1257,9 @@ func (m *model) setMode(next inputMode) {
 }
 
 // placeholderForMode returns the input placeholder text appropriate
-// for the given mode. Most modes share "Ask BabeL-O" (the default);
-// the model-pick and permission-editor overlays need their own
-// context so the operator sees a hint that matches the active
-// configuration step.
+// for the given mode. Normal composing mode stays blank; the model-pick
+// and permission-editor overlays need their own context so the operator
+// sees a hint that matches the active configuration step.
 func placeholderForMode(mode inputMode) string {
 	switch mode {
 	case modeModelPickApiKey:
@@ -1272,7 +1273,7 @@ func placeholderForMode(mode inputMode) string {
 	case modeSessionInput:
 		return "session id"
 	default:
-		return "Ask BabeL-O"
+		return ""
 	}
 }
 
@@ -1798,7 +1799,7 @@ func Run(cfg Config) error {
 
 func newModel(cfg Config) model {
 	input := textarea.New()
-	input.Placeholder = "Ask BabeL-O"
+	input.Placeholder = ""
 	input.Focus()
 	input.CharLimit = 4000
 	input.Prompt = "  > "

@@ -174,6 +174,9 @@ func (m model) formatContextUsageDetail() string {
 		remaining := max(0, maxTokens-used)
 		detail := fmt.Sprintf("context: %s / %s used · %d%% · %s remaining",
 			formatTokenCount(used), formatTokenCount(maxTokens), clamp(percent, 0, 999), formatTokenCount(remaining))
+		if c.EffectiveContextCeiling > 0 && c.EffectiveContextCeiling != maxTokens {
+			detail += " · effective " + formatTokenCount(c.EffectiveContextCeiling)
+		}
 		if c.PolicySource != "" {
 			detail += " · " + c.PolicySource
 		}

@@ -180,7 +180,12 @@ function computeLongContextCeiling(options: {
 
 function isKnownLargeContextModel(modelId: string, contextWindow: number): boolean {
   if (contextWindow < LARGE_CONTEXT_WINDOW_TOKENS) return false
-  return modelId.startsWith('anthropic/') || modelId.startsWith('minimax/') || modelId.startsWith('zhipu/')
+  try {
+    const declared = getModel(modelId)
+    return declared.contextWindow >= LARGE_CONTEXT_WINDOW_TOKENS
+  } catch {
+    return false
+  }
 }
 
 function computeBlockingLimit(options: {

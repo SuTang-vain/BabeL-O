@@ -166,7 +166,9 @@ describe('buildSystemPromptSections', () => {
     assert.ok(guidelines!.content.includes('Action vs analysis'))
     assert.ok(guidelines!.content.includes('Action requests'))
     assert.ok(guidelines!.content.includes('Analysis requests'))
-    assert.ok(!guidelines!.content.includes('启动'), 'Should not contain Chinese keywords')
+    assert.ok(guidelines!.content.includes('Current-state verification requests'))
+    assert.ok(guidelines!.content.includes('Pure capability questions can be answered directly'))
+    assert.ok(guidelines!.content.includes('查看当前'))
     assert.ok(guidelines!.content.includes('Do NOT run the project'))
   })
 

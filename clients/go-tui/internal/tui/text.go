@@ -164,6 +164,9 @@ func formatContextUsageFooter(c *contextUsageSnapshot) string {
 		return ""
 	}
 	parts := []string{fmt.Sprintf("ctx %d%% %d/%d", c.PercentUsed, c.TokenEstimate, c.MaxTokens)}
+	if c.EffectiveContextCeiling > 0 && c.EffectiveContextCeiling != c.MaxTokens {
+		parts = append(parts, fmt.Sprintf("effective=%d", c.EffectiveContextCeiling))
+	}
 	if c.WarningThreshold > 0 || c.CompactThreshold > 0 {
 		parts = append(parts, fmt.Sprintf("warn=%d compact=%d", c.WarningThreshold, c.CompactThreshold))
 	}

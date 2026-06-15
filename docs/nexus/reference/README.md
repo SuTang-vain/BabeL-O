@@ -13,6 +13,8 @@
 - [session-replay-and-evidence-governance-plan.md](./session-replay-and-evidence-governance-plan.md): 基于 `session_315814e7-3b82-4a31-8601-a5b383288e9c` 的 provider replay、Read evidence coverage、line/byte range、intent target 与 self-diagnosis 综合治理规划。
 - [session-to-session-memory-channel-plan.md](./session-to-session-memory-channel-plan.md): Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。
 - [memory-capability-awareness-and-trigger-plan.md](./memory-capability-awareness-and-trigger-plan.md): Memory capability awareness、自触发 memory_search / memory_save_note 与写入治理规划。
+- [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md): 基于 `session_b2e5660a-2669-4aec-a4a7-73ed65ed1f8e` 的 intent guidance / prompt governance 优化规划；核心原则是禁止事故特定硬编码提示词注入，用语义规则 predicate、结构化 Turn Policy、最小稳定提示词和真实 session regression 区分 pure capability question 与 current-state availability check。
+- [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md): 以 `/Users/tangyaoyue/DEV/BABEL/CLAUDE-FABLE-5.md` 为架构参考的 BabeL-O prompt governance 规划；只吸收 section 化、capability contract、current-state verification、tool boundary、external action 与 skill trigger 等设计方法，不复制 Claude Web / Artifacts / antml / `/mnt/user-data` 等不兼容内容。
 - [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md): EverCore managed sidecar 按需拉起、缓存复用、idle TTL、`/memory` 管理面板与记忆能力问答不泄露内通的治理规划。
 - [go-runner-plan.md](./go-runner-plan.md): 可选 Go `RemoteToolRunner` 执行后端参考。
 - [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。

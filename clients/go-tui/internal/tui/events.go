@@ -3,42 +3,51 @@ package tui
 import "strings"
 
 func contextUsageSnapshotFromContextUsageEvent(event map[string]any) *contextUsageSnapshot {
+	modelWindow := anyInt(event["modelContextWindow"])
+	effectiveCeiling := anyInt(event["effectiveContextCeiling"])
+	maxTokens := firstPositive(modelWindow, anyInt(event["maxTokens"]), effectiveCeiling)
 	return &contextUsageSnapshot{
-		PercentUsed:      anyInt(event["percentUsed"]),
-		TokenEstimate:    anyInt(event["tokenEstimate"]),
-		MaxTokens:        anyInt(event["maxTokens"]),
-		WarningThreshold: anyInt(event["warningThresholdTokens"]),
-		CompactThreshold: anyInt(event["compactThresholdTokens"]),
-		BlockingLimit:    anyInt(event["blockingLimitTokens"]),
-		PolicySource:     stringField(event, "contextPolicySource"),
+		PercentUsed:             percentUsed(anyInt(event["percentUsed"]), anyInt(event["tokenEstimate"]), maxTokens),
+		TokenEstimate:           anyInt(event["tokenEstimate"]),
+		MaxTokens:               maxTokens,
+		ModelContextWindow:      modelWindow,
+		EffectiveContextCeiling: effectiveCeiling,
+		WarningThreshold:        anyInt(event["warningThresholdTokens"]),
+		CompactThreshold:        anyInt(event["compactThresholdTokens"]),
+		BlockingLimit:           anyInt(event["blockingLimitTokens"]),
+		PolicySource:            stringField(event, "contextPolicySource"),
 	}
 }
 
 func contextUsageSnapshotFromExecutionMetrics(event map[string]any) *contextUsageSnapshot {
 	used := anyInt(event["inputTokens"])
-	maxTokens := anyInt(event["effectiveContextCeiling"])
-	if maxTokens <= 0 {
-		maxTokens = anyInt(event["maxTokens"])
-	}
-	if maxTokens <= 0 {
-		maxTokens = anyInt(event["modelContextWindow"])
-	}
+	modelWindow := anyInt(event["modelContextWindow"])
+	effectiveCeiling := anyInt(event["effectiveContextCeiling"])
+	maxTokens := firstPositive(modelWindow, anyInt(event["maxTokens"]), effectiveCeiling)
 	if used <= 0 && maxTokens <= 0 {
 		return nil
 	}
-	percent := anyInt(event["percentUsed"])
-	if percent <= 0 && used > 0 && maxTokens > 0 {
-		percent = clamp((used*100+maxTokens/2)/maxTokens, 0, 999)
-	}
 	return &contextUsageSnapshot{
-		PercentUsed:      percent,
-		TokenEstimate:    used,
-		MaxTokens:        maxTokens,
-		WarningThreshold: anyInt(event["contextWarningThresholdTokens"]),
-		CompactThreshold: anyInt(event["contextCompactThresholdTokens"]),
-		BlockingLimit:    anyInt(event["contextBlockingLimitTokens"]),
-		PolicySource:     stringField(event, "contextPolicySource"),
+		PercentUsed:             percentUsed(anyInt(event["percentUsed"]), used, maxTokens),
+		TokenEstimate:           used,
+		MaxTokens:               maxTokens,
+		ModelContextWindow:      modelWindow,
+		EffectiveContextCeiling: effectiveCeiling,
+		WarningThreshold:        anyInt(event["contextWarningThresholdTokens"]),
+		CompactThreshold:        anyInt(event["contextCompactThresholdTokens"]),
+		BlockingLimit:           anyInt(event["contextBlockingLimitTokens"]),
+		PolicySource:            stringField(event, "contextPolicySource"),
 	}
+}
+
+func percentUsed(percent int, used int, maxTokens int) int {
+	if used > 0 && maxTokens > 0 {
+		return clamp((used*100+maxTokens/2)/maxTokens, 0, 999)
+	}
+	if percent > 0 {
+		return clamp(percent, 0, 999)
+	}
+	return 0
 }
 
 // recordActivityEvent appends a high-signal event to the

@@ -360,7 +360,8 @@ function formatLongTermMemoryCapability(): string {
     '- Treat memory results as background hints, not authoritative project state.',
     '- Verify project facts against workspace evidence before acting.',
     '- Only save memory when the user explicitly asks you to remember something or when a governed memory candidate is approved.',
-    '- When the user asks about memory capability, answer at the user-facing capability level: whether memory is available, when confirmation is required, and that memory is only a background hint. Do not expose internal source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets unless the user explicitly asks for implementation details.',
+    '- For pure memory capability questions, answer at the user-facing capability level: whether memory is available, when confirmation is required, and that memory is only a background hint. Do not expose internal source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets unless the user explicitly asks for implementation details.',
+    '- If the user asks to check, test, execute, inspect, or verify current memory availability, use available tools or diagnostics before answering and keep current-state evidence separate from general capability explanation.',
   ].join('\n')
 }
 

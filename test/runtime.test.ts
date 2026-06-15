@@ -872,6 +872,30 @@ test('runtime pipeline builds provider loop request state and query params', () 
   assert.equal(policyRequestState.contextWindowState.maxTokens, 920_000)
   assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.93))
 
+  const deepSeekPolicyRequestState = buildProviderLoopRequestState({
+    loopCount: 4,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 2,
+    systemPrompt: 'system prompt',
+    messages,
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    cacheAwareCompactPolicy: buildCacheAwareCompactPolicy({
+      modelId: 'deepseek/deepseek-v4-pro',
+      tokenEstimate: 1_000,
+      compactPercent: 90,
+      maxOutputTokens: 128_000,
+    }),
+    finalResponseOnlyMode: false,
+    finalResponseOnlyRemainingLoops: 3,
+  })
+  assert.equal(deepSeekPolicyRequestState.contextWindowState.maxTokens, 852_000)
+  assert.equal(deepSeekPolicyRequestState.contextWindowState.compactThresholdTokens, Math.floor(852_000 * 0.9))
+
   const suppressedState = buildProviderLoopRequestState({
     loopCount: 24,
     maxLoops: 25,
