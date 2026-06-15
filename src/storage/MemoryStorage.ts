@@ -92,6 +92,10 @@ export class MemoryStorage implements NexusStorage {
     return {
       events: structuredClone(events),
       nextCursor: nextIndex < orderedEvents.length ? String(nextIndex) : undefined,
+      lastSeq:
+        events.length > 0
+          ? Number(options.cursor ?? 0) + events.length
+          : undefined,
     }
   }
 

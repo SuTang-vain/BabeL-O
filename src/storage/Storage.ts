@@ -28,6 +28,14 @@ export type EventListOptions = {
 export type EventListResult = {
   events: NexusEvent[]
   nextCursor?: string
+  /**
+   * Highest monotonically-increasing revision observed in this
+   * page. For SQLite this is `MAX(event_seq)` from the rows;
+   * MemoryStorage falls back to the cursor index it consumed.
+   * Used by the bbl-loop `wait` endpoint to advance revision
+   * without re-parsing rows.
+   */
+  lastSeq?: number
 }
 
 export type ToolTraceListOptions = {

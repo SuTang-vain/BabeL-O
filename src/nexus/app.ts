@@ -119,6 +119,15 @@ const booleanQuery = (defaultValue: boolean) => z.preprocess(value => {
   return value
 }, z.boolean())
 
+// escapeRegExpForWait is a minimal regex-metacharacter escape used
+// by the `/v1/sessions/:id/wait` endpoint so the `match` query
+// parameter is treated as a literal substring rather than a
+// user-controlled regex. Substring semantics match the schema
+// (z.string) and the bbl-loop plan's wait-for-event contract.
+function escapeRegExpForWait(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 const providerSmokeQuerySchema = z.object({
   model: z.string().optional(),
   role: z.string().optional(),
@@ -2276,6 +2285,105 @@ export async function createNexusApp(
       events: page.events,
       nextCursor: page.nextCursor,
       order: query.order,
+      limit: query.limit,
+    }
+  })
+
+  // bbl loop plan Phase 1: incremental event subscription with
+  // since / match / types / timeout. Clients (e.g. multi-pane
+  // TUI) poll this endpoint instead of holding a long-lived WS
+  // stream per pane. The endpoint intentionally returns 200 with
+  // an empty event list on timeout so clients treat it as a
+  // normal poll tick, mirroring herdr's `wait_for_output` shape.
+  const waitQuerySchema = z.object({
+    since: z.coerce.number().int().min(0).default(0),
+    match: z.string().min(1).max(2048).optional(),
+    types: z.string().min(1).max(1024).optional(),
+    timeout: z.coerce.number().int().min(0).max(60_000).default(0),
+    limit: z.coerce.number().int().positive().max(500).default(200),
+  })
+
+  app.get('/v1/sessions/:sessionId/wait', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = waitQuerySchema.parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const allowedTypes = query.types
+      ? new Set(query.types.split(',').map(value => value.trim()).filter(Boolean))
+      : null
+    const matcher = query.match
+      ? new RegExp(escapeRegExpForWait(query.match))
+      : null
+
+    const pollOnce = async (): Promise<{ events: NexusEvent[]; lastSeq: number }> => {
+      const page = await options.storage.listEvents(params.sessionId, {
+        order: 'asc',
+        limit: query.limit,
+        cursor: query.since > 0 ? String(query.since) : undefined,
+      })
+      const filtered: NexusEvent[] = []
+      for (const event of page.events) {
+        if (allowedTypes && !allowedTypes.has(event.type)) continue
+        if (matcher && !matcher.test(JSON.stringify(event))) continue
+        filtered.push(event)
+      }
+      return {
+        events: filtered,
+        lastSeq: page.lastSeq ?? query.since,
+      }
+    }
+
+    const initial = await pollOnce()
+    if (initial.events.length > 0 || query.timeout === 0) {
+      return {
+        type: 'session_wait',
+        sessionId: params.sessionId,
+        events: initial.events,
+        nextRevision: String(initial.lastSeq),
+        matched: initial.events.length > 0,
+        order: 'asc',
+        limit: query.limit,
+      }
+    }
+
+    // No matches yet and the client asked us to wait. Poll at a
+    // coarse interval (250ms) until either a matching event shows
+    // up or the deadline elapses. 250ms keeps the round-trip
+    // responsive without thrashing the SQLite reader.
+    const deadline = Date.now() + query.timeout
+    const intervalMs = 250
+    while (Date.now() < deadline) {
+      const remaining = Math.max(0, deadline - Date.now())
+      await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remaining)))
+      const tick = await pollOnce()
+      if (tick.events.length > 0) {
+        return {
+          type: 'session_wait',
+          sessionId: params.sessionId,
+          events: tick.events,
+          nextRevision: String(tick.lastSeq),
+          matched: true,
+          order: 'asc',
+          limit: query.limit,
+        }
+      }
+    }
+
+    return {
+      type: 'session_wait',
+      sessionId: params.sessionId,
+      events: [],
+      nextRevision: String(initial.lastSeq),
+      matched: false,
+      order: 'asc',
       limit: query.limit,
     }
   })

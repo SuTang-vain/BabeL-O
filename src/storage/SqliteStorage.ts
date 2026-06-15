@@ -211,6 +211,13 @@ export class SqliteStorage implements NexusStorage {
       events: page.map(row => JSON.parse(String(row.event_json)) as NexusEvent),
       nextCursor:
         rows.length > limit ? String(page.at(-1)?.event_seq ?? '') : undefined,
+      lastSeq:
+        page.length > 0
+          ? page.reduce<number>((max, row) => {
+              const seq = Number(row.event_seq ?? 0)
+              return Number.isFinite(seq) && seq > max ? seq : max
+            }, 0)
+          : undefined,
     }
   }
 
