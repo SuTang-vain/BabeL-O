@@ -6272,7 +6272,7 @@ test('tool output is truncated before it is stored in events', async () => {
   }
 })
 
-test('bash max buffer is configurable and fails safely on excessive output', async () => {
+test('bash max buffer overflow returns a recoverable failed tool result', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-buffer`)
   await mkdir(cwd, { recursive: true })
   const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
@@ -6291,12 +6291,17 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
     assert.equal(response.statusCode, 200)
     const body = response.json()
     assert.equal(body.success, false)
-    assert.ok(
-      body.events.some(
-        (event: { type: string; code?: string }) =>
-          event.type === 'error' && event.code === 'TOOL_ERROR',
-      ),
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Bash',
     )
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'COMMAND_OUTPUT_LIMIT')
+    assert.equal(toolCompleted.output.outputLimited, true)
+    assert.match(toolCompleted.output.message, /output buffer|narrower range/)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
   } finally {
     await app.close()
   }
@@ -6337,6 +6342,30 @@ test('bash non-zero exit returns a recoverable failed tool result', async () => 
   } finally {
     await app.close()
   }
+})
+
+test('bash output limit preserves partial stdout preview', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-output-limit`)
+  await mkdir(cwd, { recursive: true })
+
+  const { bashTool } = await import('../src/tools/builtin/bash.js')
+  const result = await bashTool.execute({
+    command: 'node -e "process.stdout.write(\'prefix-\' + \'x\'.repeat(20000))"',
+    timeoutMs: 10_000,
+  }, {
+    cwd,
+    sessionId: `bash-output-limit-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 12_000,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal((result.output as any).code, 'COMMAND_OUTPUT_LIMIT')
+  assert.equal((result.output as any).outputLimited, true)
+  assert.match((result.output as any).stdout, /prefix-/)
+  assert.equal((result.output as any).stdoutTruncated, true)
+  assert.ok((result.output as any).stdoutOriginalBytes > (result.output as any).stdout.length)
+  assert.match((result.output as any).message, /output buffer/)
 })
 
 test('bash command timeout returns a recoverable failed tool result', async () => {
