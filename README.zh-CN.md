@@ -1,160 +1,84 @@
 # BabeL-O
 
 <p align="center">
-  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O 产品 logo" width="132" />
-  <img src="docs/assets/kezhongke_logo_3d.png" alt="KezhongKe IP 品牌 logo" width="132" />
+  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O logo" width="132" />
+  <img src="docs/assets/kezhongke_logo_3d.png" alt="KezhongKe logo" width="132" />
 </p>
 
 <p align="center">
-  <strong>技术支援由 KezhongKe（壳中客）提供。</strong>
+  <strong>面向持久化编码会话、原生 TUI 工作流与工具感知 agent 的终端工作台。</strong><br />
+  技术支援由 KezhongKe（壳中客）提供。
 </p>
 
-> **Nexus-first 的 AI 编程 agent：原生 Go TUI、持久化 session、工具感知执行、跨 session 协作。**
+<p align="center">
+  <a href="https://github.com/SuTang-vain/BabeL-O/releases"><img src="https://img.shields.io/github/v/release/SuTang-vain/BabeL-O" alt="Latest release" /></a>
+  <a href="https://www.npmjs.com/package/babel-o"><img src="https://img.shields.io/npm/v/babel-o" alt="npm version" /></a>
+  <a href="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml"><img src="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/product.png" alt="BabeL-O Go TUI 截图" width="860" />
+</p>
 
 [English README](README.md)
 
----
-
-## 为什么是 BabeL-O？
-
-市面上的编程 agent 基本都长一个样：Node 进程、Electron、云端往返、或者一次性 chat。BabeL-O 沿着真正卡脖子的那条线把问题拆开：
-
-- **多 session 跨 worktree 并行执行，状态不丢。** Nexus 守护进程持有持久化 runtime；客户端可以断线、重连、换机器。任务不会因为 TUI 没了就死。_技术对照：process-per-session 模型 + Nexus `bbl serve` / embedded 模式 + `/sessions tree` / `/inbox`。_
-- **10 MB 原生 Go TUI，线上无 Node。** `bbl go` 是用 Bubble Tea 写的客户端，通过 HTTP/WS 跟 Nexus 通信；可以丢到容器、远端、低速 SSH 里，**不**带 Node。_技术对照：`clients/go-tui` Go module，单个静态二进制，连接前先 `--check` 健康检查。_
-- **是能用的 agent loop，不是 demo。** 上下文压缩、证据路由、权限门、sub-agent 协作、超时恢复后还能继续。_技术对照：`src/runtime/cacheAwareCompactPolicy.ts`、`src/runtime/runtimePipeline.ts`、`src/permissions/`、`src/nexus/everCoreRuntimeManager.ts`。_
-
----
-
 ## BabeL-O 是什么？
 
-BabeL-O 是为真正写代码而生的终端 AI agent。交互客户端保持轻量与响应速度，Nexus 持有持久化 runtime 状态：session、工具、权限、上下文、记忆、执行轨迹。
+BabeL-O 是一个运行在终端里的 AI 编程 agent。
 
-默认的交互入口是 Go TUI：
+它把日常交互放进原生 Go TUI，把会话状态交给 Nexus runtime，把文件读取、
+代码编辑、命令执行、WebSearch、MCP 与跨 session 协作都纳入显式权限和审计流程。
+
+正式交互入口是：
 
 ```bash
 bbl go
 ```
 
-它会连接 Nexus（如果本地没有会自动起一个），给你一个打磨过的终端工作区：聊天、跑工具、切 session、看上下文、批权限、跨 session 协作。
+你可以用它阅读仓库、改代码、跑测试、处理长迁移、切换模型、检查上下文、
+审批工具调用，以及在多个 session 之间交接工作。
 
----
+## 为什么选择 BabeL-O？
 
-## 5 分钟快速开始
-
-> **前置条件**：Node.js ≥ 22（`node --version`）。macOS / Linux / Windows-WSL。
-
-```bash
-# 1. 安装
-npm i -g babel-o
-
-# 2. 验证
-bbl --version
-
-# 3. 选 provider + model
-bbl init                          # 交互式 wizard,或:
-bbl init --non-interactive --provider anthropic --model claude-3-5-sonnet-latest
-
-# 4. 聊天
-bbl go                            # 生产级原生 Go TUI
-
-# 5. 试试看
-> 解释这个 repo 的入口文件
-```
-
-TUI 内快捷键:
-
-| 输入 | 动作 |
-| :--- | :--- |
-| `/` | 打开 slash 命令面板 |
-| `/session` | 打开 session 操作面板 |
-| `/context` | 查看当前上下文预算与诊断 |
-| `/tools` 或 `Ctrl+O` | 打开工具面板 |
-| `/model` 或 `Ctrl+L` | 打开 model / profile 切换 |
-| `/memory` | 查看 memory 状态、检索、审查候选 |
-| `Ctrl+D` | 打开顶部状态面板 |
-| `Shift+Enter` | 在输入框里插入换行 |
-| `Ctrl+C` | 打开退出确认 |
-| `Esc` | 关闭当前面板/对话框 |
-
----
-
-## 试试这些 prompt
-
-直接复制下面任意一条,亲身体验 BabeL-O 的差异化:
-
-- `> 在 /tmp/demo 里搭一个 Python 项目,跑通 pytest,提交到新 branch` —— 一次 turn 走完 Bash + Edit + Git。
-- `> 并行起 3 个 worktree,各修 TODO.md 里的一个 P0,然后合并回 main` —— 跑 worktree + sub-agent + session tree。
-- `> 用 bbl run 起一个长迁移任务,中途断网,重连,确认任务续传` —— 跑 Nexus 守护进程的持久化。
-- `> 后台开 MemoryOS,跑 5 个 session,然后问"上周 auth 模型我们怎么定的?"` —— 跑长期记忆 bootstrap + 召回。
-
----
-
-## 核心特性
-
-- **生产级 Go TUI**：`bbl go` 是日常交互客户端,Bubble Tea 界面、多行输入、slash 命令面板、权限对话框、上下文检查、响应式 transcript 渲染。
-- **持久化 Nexus Session**：session 历史、工具 trace、usage telemetry、压缩后的上下文、可检查的 session 元数据都能跨重启保留。
-- **Session 切换与对话流**：`/session` 面板支持创建、选择、切换、复制 session ID,全程不离开 TUI。
-- **SessionChannel 协作**：类型化的侧信道消息让 session 交换 findings、handoff、review 请求、决策、memory 候选,不会被当作直接的用户指令执行。
-- **上下文与记忆感知**：`/context` 展示预算、压缩、记忆、恢复、working set 诊断,长对话也可读。
-- **长期记忆（MemoryOS）**：可选的本地长期记忆,跑 managed sidecar。opt-in 启动,首次 `bbl go` 会提示/显示状态;失败时一行黄色提示,而不是沉默降级。
-- **权限优先的工具系统**：Bash / Write / Edit / MCP 工具等敏感操作都要经过显式审批,支持 session 级信任和审计日志。
-- **MCP 与内建工具**：Read / Grep / ListDir / Bash / WebSearch / 配置过的 MCP server 全部暴露,带风险分级。
-- **Model 与 Profile 控制**：TUI 内切换 model / provider profile,Nexus 保持 runtime 配置一致。
-- **Runtime 稳定性修补**：session 重放、上下文压缩、证据路由、超时恢复、安装自检全部加固,长时间 Go TUI session 恢复更可预测。
-
----
-
-## 长期记忆（MemoryOS）
-
-MemoryOS 是可选的本地长期记忆服务。它在 loopback 起一个 managed sidecar,索引你授权的 session,让模型在之后能回忆起来。**默认关闭、opt-in,永远不替代工作区证据**——它是 hint 层,不是事实源。
-
-快速上手:
-
-```bash
-bbl memory status                 # 看 MemoryOS 是否已就绪
-bbl memory setup --yes            # 一次性 bootstrap(后台 clone + build)
-bbl memory opt-out                # 永久关掉首启询问
-bbl memory enable-tools           # 让模型可写笔记(默认是只读 hint)
-bbl memory doctor                 # 诊断记忆是否就绪
-```
-
-默认情况下模型看不到 MemoryOS 写工具。如果想让模型明确记忆某些事情,先跑 `bbl memory enable-tools`。设置会持久化到 `~/.babel-o/everos-bootstrap.json`(环境变量仍优先)。
-
-详细流程见 [FAQ → Q4](docs/nexus/FAQ.md),设计见 [MemoryOS Zero-Friction Startup Plan](docs/nexus/reference/everos-zero-friction-memory-startup-optimization-plan.md)。
-
----
+- **原生终端界面：** `bbl go` 是正式交互客户端，基于 Bubble Tea，支持多行输入、slash 面板、鼠标选择、权限对话框和长 transcript。
+- **持久化 session：** Nexus 保存 session 状态、工具 trace、上下文、审批与运行元数据。TUI 断开后，也可以重连、检查、继续。
+- **权限优先的工具系统：** Bash、Write、Edit、MCP 工具和 memory 写入都走可见审批。你可以单次批准、session 内批准，也可以拒绝并给出反馈。
+- **可见的上下文状态：** `/context` 展示预算、压缩、记忆、恢复、working set 和长上下文诊断，不把 agent 状态藏起来。
+- **跨 session 协作：** `/session`、`/inbox` 和 SessionChannel 让不同 session 交换 findings、handoff、决策、review 请求和 memory 候选，但不会把这些消息当作隐藏指令执行。
+- **模型与记忆可控：** 在 TUI 内切换 model / provider profile，也可以按需启用本地长期记忆 MemoryOS。
 
 ## 安装
 
-### 推荐：`npm i -g babel-o`
+### 推荐：release 安装脚本
 
-单一推荐路径。macOS / Linux / Windows-WSL 通用。需要 Node.js ≥ 22。
-
-```bash
-npm i -g babel-o
-bbl --version
-```
-
-### 备选：便携 release 包
-
-如果想不带 Node 装(比如丢进没有 Node 的容器),用 portable 包。包含 Go TUI 二进制和 Nexus CLI/runtime,只有 fallback 路径才需要系统 Node。
-
-- 从 [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases) 下载最新的 `bbl-<platform>.tar.gz`,或看 [release notes](docs/releases/README.md)。
-- 解压,把 `bin/` 加到 `$PATH`,然后 `bbl go`。
-- SHA256 校验信息已经在 release 元数据里。
-
-### 备选：install 脚本
+安装脚本会下载当前平台的轻量 release 包，安装一个很小的 `bbl` launcher，
+内置匹配的 Go TUI 二进制，并在结尾运行自检。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
 bbl go
 ```
 
-指定版本:在管道前加 `BBL_VERSION=v0.3.7 bash`。
+安装指定版本：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.7 bash
+```
+
+要求：macOS 或 Linux，`PATH` 中有 Node.js >= 22。
+
+### npm
+
+适合 Node 开发者和源码安装场景：
+
+```bash
+npm install -g babel-o
+bbl go
+```
+
+对大多数用户来说，release 安装脚本更推荐，因为它会带上当前平台的预编译 Go TUI。
 
 ### 从源码构建
-
-前置：Node.js ≥ 22、npm、Go toolchain（TUI 需要）、可选 Docker（沙箱 shell）。
 
 ```bash
 git clone https://github.com/SuTang-vain/BabeL-O.git
@@ -163,107 +87,127 @@ npm ci
 npm test
 npm run build
 npm link
+cd clients/go-tui && make build
 bbl go
 ```
 
-构建 portable 包:
+## 首次使用
 
 ```bash
-npm run build
-cd clients/go-tui && make build && cd ../..
-npm run build:portable
+bbl init
+bbl go
 ```
 
----
-
-## 配置
-
-BabeL-O 把本地配置存在 `~/.babel-o/config.json`。首次运行建议用 `bbl init` 交互式设置,不要手编。
-
-```json
-{
-  "providerId": "anthropic",
-  "modelId": "anthropic/claude-3-5-sonnet",
-  "apiKey": "sk-ant-...",
-  "baseUrl": "https://api.anthropic.com"
-}
-```
-
-支持的 provider：`anthropic`、`openai`、`deepseek`、`moonshot`、`ollama`、`zhipu`、`minimax`、`local`（测试与基准用）。
-
-运行时检查：
+`bbl init` 会引导你配置 provider 和 model。你也可以直接写入配置：
 
 ```bash
-bbl config show
-bbl doctor
-bbl memory doctor
+bbl config add anthropic "$ANTHROPIC_API_KEY"
+bbl config use anthropic/claude-3-5-sonnet
 ```
 
----
+TUI 内常用入口：
 
-## Session 协作
+| 输入 | 动作 |
+| :--- | :--- |
+| `/` | 打开命令面板 |
+| `/model` 或 `Ctrl+L` | 配置 provider、API key、base URL 和 model |
+| `/session` | 创建、选择、切换或复制 session ID |
+| `/context` | 查看上下文预算与诊断 |
+| `/tools` 或 `Ctrl+O` | 打开工具面板 |
+| `/memory` | 查看 MemoryOS 状态和 memory 候选 |
+| `Ctrl+D` | 打开顶部状态面板 |
+| `Shift+Enter` | 在输入框中换行 |
+| `Esc` | 关闭当前面板 |
+| `Ctrl+C` | 打开退出确认 |
 
-BabeL-O 把 session-to-session 消息当作协作上下文,不是隐藏 prompt。消息可以携带 finding、handoff、review 请求、validation 请求、假设、决策、blocked 状态、memory 候选,但接收方仍要自己验证并显式执行。
+## 可以这样试
 
-```bash
-bbl sessions list
-bbl sessions tree
-bbl sessions inbox <sessionId>
-bbl sessions ack <sessionId> <messageId>
-bbl sessions inspect <sessionId>
+```text
+解释这个仓库，并指出主要入口文件
 ```
 
-TUI 内,用 `/session` 创建或切换 session,`/inbox` 看跨 session 消息,`/activity` 看最近的协作事件。
+```text
+阅读失败测试输出，修复问题，然后只跑最小必要测试
+```
 
----
+```text
+为 release note 新建一个 session，然后总结当前变更
+```
+
+```text
+检查当前 context 预算，并判断是否需要 compact
+```
 
 ## 常用命令
 
 ```bash
-bbl go                            # 交互 TUI(Go,正式入口)
-bbl run "解释这个 repo"           # 一次性 prompt,不开 TUI
-bbl init                          # 首启 provider + model wizard
-bbl doctor                        # 自检(provider、keychain、端口、memory)
-bbl memory status                 # MemoryOS bootstrap + runtime 状态
-bbl memory setup --yes            # 引导 MemoryOS
-bbl nexus status                  # 检查 Nexus 健康
-bbl sessions list                 # 列出持久化 session
-bbl sessions inspect <sessionId>  # 查看 session 详情与 trace
-bbl tools list                    # 列出可用工具
-bbl tools audit                   # 工具审计
+bbl go                            # 正式 Go TUI
+bbl run "解释这个 repo"           # 一次性 prompt，不打开 TUI
+bbl init                          # provider 和 model 向导
+bbl doctor                        # 本地环境自检
+bbl go --check --no-start-nexus   # 安装与 TUI 可用性检查
+bbl nexus status                  # Nexus 健康状态
+bbl sessions list                 # 持久化 session 列表
+bbl sessions inspect <sessionId>  # session 事件与 trace
+bbl memory status                 # MemoryOS 状态
+bbl tools audit                   # 工具与权限审计
 bbl config show                   # 当前配置
 ```
 
----
+## MemoryOS
 
-## TypeScript TUI 移除说明
+MemoryOS 是可选的本地长期记忆。它以 loopback sidecar 的形式运行，索引你授权的 session 知识，并在有帮助的时候返回 memory hint。
 
-旧的 `bbl chat` TypeScript TUI 已在 v0.3.7 从发布包中移除。正式交互入口是 `bbl go`; `bbl run` 继续用于一次性自动化与脚本场景。这样可以减小分发包体积,减少两套终端 UI 的重复维护,并把后续交互体验集中到原生 Go TUI。
+它是 opt-in、本地优先的能力，永远不会替代工作区证据。memory hit 是提示，文件内容和工具结果才是事实来源。
+
+```bash
+bbl memory status
+bbl memory setup --yes
+bbl memory enable-tools
+bbl memory doctor
+```
+
+## 配置
+
+BabeL-O 的本地配置保存在 `~/.babel-o/config.json`。
+
+支持的 provider 包括 `anthropic`、`openai`、`deepseek`、`moonshot`、`ollama`、`zhipu`、`minimax` 和 `local`。
+
+常用检查：
+
+```bash
+bbl config show
+bbl doctor
+bbl go --check
+```
 
 ## 安全模型
 
-BabeL-O 设计上守住显式边界：
+BabeL-O 围绕显式边界设计：
 
-- 工作区路径检查防止遍历与 symlink 逃逸。
-- 风险工具必须显式审批。
-- 工具输入、输出、审批、拒绝、usage 事件全部持久化,可审计。
-- SessionChannel 内容**永远不**作为直接指令执行。
-- MemoryOS 结果是 hint,不是工作区事实的权威来源。
-- Nexus 是 runtime 状态的唯一事实源,TUI 只负责交互。
+- 工作区路径检查会拦截路径遍历和 symlink escape。
+- 高风险工具必须经过可见权限决策。
+- 工具输入、输出、审批、拒绝和 usage 事件都会持久化。
+- SessionChannel 消息是协作上下文，不是隐藏命令。
+- MemoryOS 结果是提示，不是工作区事实来源。
+- Nexus 是 runtime 状态源，TUI 是交互层。
 
----
+## Release 说明
+
+从 v0.3.7 开始，旧的 `bbl chat` TypeScript TUI 已从 release 包中移除。
+正式交互入口是 `bbl go`；`bbl run` 继续用于一次性自动化和脚本场景。
+
+这样可以减小安装包体积，移除重复的终端 UI 逻辑，并把后续交互体验集中到原生 Go TUI。
 
 ## 文档
 
-- [FAQ](docs/nexus/FAQ.md) —— 关于长期记忆、安装、配置的常见问题
-- [Go TUI 客户端指南](clients/go-tui/README.md)
-- [Nexus 规划与实现笔记](docs/nexus/README.md)
+- [Changelog](CHANGELOG.md)
 - [Release notes](docs/releases/README.md)
-- [MemoryOS First-Run Onboarding Plan](docs/nexus/reference/everos-first-run-onboarding-optimization-plan.md)
-- [MemoryOS Zero-Friction Startup Plan](docs/nexus/reference/everos-zero-friction-memory-startup-optimization-plan.md)
-
----
+- [FAQ](docs/nexus/FAQ.md)
+- [Go TUI 客户端指南](clients/go-tui/README.md)
+- [分发指南](docs/nexus/reference/distribution-guide.md)
+- [Nexus 规划笔记](docs/nexus/README.md)
 
 ## 许可证
 
-本项目以 MIT 协议开源,详见 [LICENSE](LICENSE)。
+本项目以 MIT 协议开源，详见 [LICENSE](LICENSE)。

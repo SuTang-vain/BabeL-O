@@ -1,160 +1,98 @@
 # BabeL-O
 
 <p align="center">
-  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O product logo" width="132" />
-  <img src="docs/assets/kezhongke_logo_3d.png" alt="KezhongKe IP brand logo" width="132" />
+  <img src="docs/assets/babel-o-logo.png" alt="BabeL-O logo" width="132" />
+  <img src="docs/assets/kezhongke_logo_3d.png" alt="KezhongKe logo" width="132" />
 </p>
 
 <p align="center">
-  <strong>Technical support provided by KezhongKe (壳中客).</strong>
+  <strong>Your terminal workspace for durable coding sessions, native TUI workflows, and tool-aware agents.</strong><br />
+  Technical support provided by KezhongKe (壳中客).
 </p>
 
-> **A Nexus-first AI coding agent with a fast Go TUI, persistent sessions, tool-aware execution, and cross-session collaboration.**
+<p align="center">
+  <a href="https://github.com/SuTang-vain/BabeL-O/releases"><img src="https://img.shields.io/github/v/release/SuTang-vain/BabeL-O" alt="Latest release" /></a>
+  <a href="https://www.npmjs.com/package/babel-o"><img src="https://img.shields.io/npm/v/babel-o" alt="npm version" /></a>
+  <a href="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml"><img src="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
+</p>
+
+<p align="center">
+  <img src="docs/assets/product.png" alt="BabeL-O Go TUI screenshot" width="860" />
+</p>
 
 [简体中文 README](README.zh-CN.md)
 
----
-
-## Why BabeL-O?
-
-Most coding agents are stuck in one shape: a Node process, a heavy Electron, a cloud round-trip, or a one-shot chat. BabeL-O splits the problem along the line that actually hurts:
-
-- **Run many sessions in parallel across worktrees — without losing state.** The Nexus daemon holds the durable runtime; clients can disconnect, reconnect, and switch machines. Tasks do not die when your TUI does. _Technical counterpart: process-per-session model + Nexus `bbl serve` / embedded mode + `/sessions tree` / `/inbox`._
-- **A 10 MB native Go TUI, no Node on the wire.** `bbl go` is a Bubble Tea client that talks to Nexus over HTTP/WS; drop it into a container, a remote box, or a slow SSH without dragging Node with it. _Technical counterpart: `clients/go-tui` Go module, single static binary, `--check` health gate before connect._
-- **A real agent loop, not a demo.** Context compaction, evidence routing, permission gates, sub-agent collaboration, recover from timeouts without losing your place. _Technical counterpart: `src/runtime/cacheAwareCompactPolicy.ts`, `src/runtime/runtimePipeline.ts`, `src/permissions/`, `src/nexus/everCoreRuntimeManager.ts`._
-
----
-
 ## What Is BabeL-O?
 
-BabeL-O is a terminal-first AI agent for real coding work. The interactive client stays light and responsive, while Nexus keeps the durable runtime state: sessions, tools, permissions, context, memory, and execution traces.
+BabeL-O is an AI coding agent that lives in your terminal.
 
-The production interactive entrypoint is the Go TUI:
+It gives you a native Go TUI for day-to-day work, a Nexus runtime that keeps
+sessions alive, and a permission-first tool system for reading, editing,
+running commands, searching the web, and coordinating work across sessions.
+
+Start the production TUI with:
 
 ```bash
 bbl go
 ```
 
-It connects to Nexus, can auto-start a local Nexus service for you, and gives you a polished terminal workspace for chatting, running tools, switching sessions, inspecting context, approving permissions, and coordinating work across sessions.
+Use it for repo exploration, edits, tests, long migrations, model switching,
+context inspection, and session-to-session handoffs without turning your
+terminal into a fragile one-shot chat.
 
----
+## Why BabeL-O?
 
-## Quick Start (5 minutes)
+- **Native terminal interface:** `bbl go` is the official interactive client,
+  built with Bubble Tea and tuned for multi-line input, slash panels, mouse
+  selection, permission dialogs, and long transcripts.
+- **Durable sessions:** Nexus keeps session state, tool traces, context,
+  approvals, and runtime metadata outside the TUI process. You can reconnect,
+  inspect, and continue.
+- **Permission-first tools:** Bash, Write, Edit, MCP tools, and memory writes
+  stay visible. Approve once, approve for a session, or reject with feedback.
+- **Context you can inspect:** `/context` shows budget, compaction, memory,
+  recovery, working set, and long-context diagnostics instead of hiding the
+  agent's state.
+- **Session collaboration:** `/session`, `/inbox`, and SessionChannel let
+  sessions exchange findings, handoffs, decisions, and review requests without
+  treating those messages as secret instructions.
+- **Model and memory control:** Switch model/provider profiles from the TUI,
+  and optionally enable MemoryOS for local long-term recall.
 
-> **Prerequisite:** Node.js ≥ 22 (`node --version`). macOS, Linux, or Windows via WSL.
+## Installation
 
-```bash
-# 1. Install
-npm i -g babel-o
+### Recommended: release installer
 
-# 2. Verify
-bbl --version
-
-# 3. Pick a provider + model
-bbl init                          # interactive wizard, or:
-bbl init --non-interactive --provider anthropic --model claude-3-5-sonnet-latest
-
-# 4. Chat
-bbl go                            # Production Go TUI
-
-# 5. Try it
-> explain this repo's entry point
-```
-
-Inside the TUI:
-
-| Input | Action |
-| :--- | :--- |
-| `/` | Open the slash-command palette |
-| `/session` | Open the session operations panel |
-| `/context` | Inspect current context budget and diagnostics |
-| `/tools` or `Ctrl+O` | Open the tools panel |
-| `/model` or `Ctrl+L` | Open model/profile selection |
-| `/memory` | Inspect memory status, search memory hints, review candidates |
-| `Ctrl+D` | Open the top status panel |
-| `Shift+Enter` | Insert a newline in the input box |
-| `Ctrl+C` | Open the quit confirmation dialog |
-| `Esc` | Close the active panel/dialog |
-
----
-
-## Try these prompts
-
-Copy-paste any of these to see BabeL-O's differentiators in action:
-
-- `> in /tmp/demo, scaffold a Python project, run pytest, commit to a new branch` — exercises Bash + Edit + Git in one turn.
-- `> launch 3 worktrees in parallel, each fixing one P0 item from TODO.md, then merge them back` — exercises the worktree + sub-agent + session tree.
-- `> start a long migration task with bbl run, kill the connection, reconnect, and confirm the task resumed` — exercises the Nexus daemon durability.
-- `> turn on MemoryOS in the background, run 5 sessions, then ask "what did we decide about the auth model last week?"` — exercises the long-term memory bootstrap and recall.
-
----
-
-## Highlights
-
-- **Production Go TUI**: `bbl go` is the default daily interactive client, with a Bubble Tea interface, multi-line input, slash-command panels, permission dialogs, context inspection, and responsive transcript rendering.
-- **Persistent Nexus Sessions**: Work continues across restarts with session history, tool traces, usage telemetry, compacted context, and inspectable session metadata.
-- **Session Switching and Conversation Flow**: The `/session` panel supports creating, selecting, switching, and copying session IDs without leaving the TUI.
-- **SessionChannel Collaboration**: Typed side-channel messages let sessions exchange findings, handoffs, review requests, decisions, and memory candidates without treating those messages as direct user instructions.
-- **Context and Memory Awareness**: `/context` shows budget, compaction, memory, recovery, and working-set diagnostics so long conversations stay understandable.
-- **Long-term Memory (MemoryOS)**: Optional local long-term memory powered by a managed sidecar. Bootstrap is opt-in (first `bbl go` startup may auto-trigger it via `BABEL_O_EVERCORE_AUTO_BOOTSTRAP=1`) and the TUI footer shows a one-line `[m: ready]` / `[m: failed ⚠ …]` indicator instead of silently failing.
-- **Permission-First Tooling**: Sensitive tools such as Bash, Write, Edit, and MCP tools go through visible approval flows with session-level trust options and audit logs.
-- **MCP and Built-in Tools**: Read, Grep, ListDir, Bash, WebSearch, and configured MCP servers are exposed as risk-classified tools.
-- **Model and Profile Control**: Switch model/provider profiles from the TUI while Nexus keeps shared runtime configuration consistent.
-- **Runtime Stability Fixes**: Session replay, context compaction, evidence routing, timeout recovery, and install self-checks are hardened so long-running Go TUI sessions recover more predictably.
-
----
-
-## Long-term Memory (MemoryOS)
-
-MemoryOS is the optional local long-term memory service. It runs a managed sidecar on loopback, indexes the sessions you approve, and lets the model recall them later. It is **opt-in, off by default, and never replaces workspace evidence** — it is a hint layer, not a source of truth.
-
-Quick tour:
-
-```bash
-bbl memory status                 # see whether MemoryOS is set up
-bbl memory setup --yes            # one-shot bootstrap (clone + build, in background)
-bbl memory opt-out                # disable the first-run prompt permanently
-bbl memory enable-tools           # let the model save notes (default is read-only hints)
-bbl memory doctor                 # diagnose memory readiness
-```
-
-The model never sees MemoryOS write tools by default. If you want the model to remember things explicitly, run `bbl memory enable-tools` first. The setting is persisted in `~/.babel-o/everos-bootstrap.json` (env vars still win).
-
-See [FAQ → Q4](docs/nexus/FAQ.md) for the full onboarding flow and [MemoryOS Zero-Friction Startup Plan](docs/nexus/reference/everos-zero-friction-memory-startup-optimization-plan.md) for the design.
-
----
-
-## Install
-
-### Recommended: `npm i -g babel-o`
-
-The single recommended path. Works on macOS, Linux, and Windows (via WSL). Requires Node.js ≥ 22.
-
-```bash
-npm i -g babel-o
-bbl --version
-```
-
-### Alternative: portable release package
-
-If you want a Node-free install (e.g. into a container without Node), use the lightweight portable package. It contains the Go TUI binary and the Nexus CLI/runtime, and uses your system Node only when the optional Node-fallback path is engaged.
-
-- Download the latest `bbl-<platform>.tar.gz` from [GitHub Releases](https://github.com/SuTang-vain/BabeL-O/releases), or see the [release notes](docs/releases/README.md).
-- Extract it, add the `bin/` directory to your `$PATH`, then `bbl go`.
-- SHA256 verification is built into the release artifact metadata.
-
-### Alternative: install script
+The installer downloads the lightweight release package for your platform,
+installs a small `bbl` launcher, bundles the matching Go TUI binary, and runs a
+post-install self-check.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
 bbl go
 ```
 
-For a specific version: `BBL_VERSION=v0.3.7 bash` before the pipe.
+Install a specific version:
 
-### Build from source
+```bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.7 bash
+```
 
-Prerequisites: Node.js ≥ 22, npm, Go toolchain (for the TUI), optionally Docker (for sandboxed shell).
+Requirements: macOS or Linux, Node.js >= 22 on `PATH`.
+
+### npm
+
+Useful for Node developers and source-based installs:
+
+```bash
+npm install -g babel-o
+bbl go
+```
+
+The release installer is preferred for most users because it includes the
+prebuilt Go TUI for your platform.
+
+### From source
 
 ```bash
 git clone https://github.com/SuTang-vain/BabeL-O.git
@@ -163,106 +101,133 @@ npm ci
 npm test
 npm run build
 npm link
+cd clients/go-tui && make build
 bbl go
 ```
 
-To build the portable package:
+## First Run
 
 ```bash
-npm run build
-cd clients/go-tui && make build && cd ../..
-npm run build:portable
+bbl init
+bbl go
 ```
 
----
+`bbl init` walks through provider and model setup. You can also configure
+providers directly:
+
+```bash
+bbl config add anthropic "$ANTHROPIC_API_KEY"
+bbl config use anthropic/claude-3-5-sonnet
+```
+
+Inside the TUI:
+
+| Input | Action |
+| :--- | :--- |
+| `/` | Open the command palette |
+| `/model` or `Ctrl+L` | Configure provider, API key, base URL, and model |
+| `/session` | Create, select, switch, or copy session IDs |
+| `/context` | Inspect context budget and diagnostics |
+| `/tools` or `Ctrl+O` | Open the tool panel |
+| `/memory` | Inspect MemoryOS status and memory candidates |
+| `Ctrl+D` | Open the top status panel |
+| `Shift+Enter` | Insert a newline |
+| `Esc` | Close the active panel |
+| `Ctrl+C` | Open the quit dialog |
+
+## Try It
+
+```text
+explain this repository and point me to the entry points
+```
+
+```text
+read the failing test output, patch the bug, and rerun the smallest useful test
+```
+
+```text
+create a new session for release notes, then summarize the current changes
+```
+
+```text
+inspect the current context budget and tell me whether we should compact
+```
+
+## Common Commands
+
+```bash
+bbl go                            # production Go TUI
+bbl run "summarize this repo"     # one-shot prompt, no TUI
+bbl init                          # provider and model wizard
+bbl doctor                        # local readiness checks
+bbl go --check --no-start-nexus   # install and TUI readiness check
+bbl nexus status                  # Nexus health
+bbl sessions list                 # persisted sessions
+bbl sessions inspect <sessionId>  # session events and traces
+bbl memory status                 # MemoryOS status
+bbl tools audit                   # tool and permission audit
+bbl config show                   # active configuration
+```
+
+## MemoryOS
+
+MemoryOS is optional local long-term memory. It runs as a managed loopback
+sidecar, indexes approved session knowledge, and returns memory hints when they
+are useful.
+
+It is opt-in, local-first, and never replaces workspace evidence. Memory hits
+are hints; files and tool results remain the source of truth.
+
+```bash
+bbl memory status
+bbl memory setup --yes
+bbl memory enable-tools
+bbl memory doctor
+```
 
 ## Configuration
 
-BabeL-O stores local configuration in `~/.babel-o/config.json`. Use `bbl init` to set this up interactively; do not hand-edit it for the first run.
+BabeL-O stores local configuration in `~/.babel-o/config.json`.
 
-```json
-{
-  "providerId": "anthropic",
-  "modelId": "anthropic/claude-3-5-sonnet",
-  "apiKey": "sk-ant-...",
-  "baseUrl": "https://api.anthropic.com"
-}
-```
+Supported providers include `anthropic`, `openai`, `deepseek`, `moonshot`,
+`ollama`, `zhipu`, `minimax`, and `local`.
 
-Supported providers: `anthropic`, `openai`, `deepseek`, `moonshot`, `ollama`, `zhipu`, `minimax`, `local` (for tests and benchmarks).
-
-Inspect at runtime:
+Useful checks:
 
 ```bash
 bbl config show
 bbl doctor
-bbl memory doctor
+bbl go --check
 ```
-
----
-
-## Session Collaboration
-
-BabeL-O treats session-to-session messages as collaboration context, not as hidden prompts. A message can carry a finding, handoff, review request, validation request, hypothesis, decision, blocked state, or memory candidate, but the receiving session must still verify and act explicitly.
-
-```bash
-bbl sessions list
-bbl sessions tree
-bbl sessions inbox <sessionId>
-bbl sessions ack <sessionId> <messageId>
-bbl sessions inspect <sessionId>
-```
-
-In the TUI, use `/session` to create or switch sessions, `/inbox` to inspect cross-session messages, and `/activity` to review recent collaboration events.
-
----
-
-## Common commands
-
-```bash
-bbl go                            # interactive TUI (Go, production)
-bbl run "summarize this repo"     # one-shot prompt, no TUI
-bbl init                          # first-run provider + model wizard
-bbl doctor                        # self-check (provider, keychain, port, memory)
-bbl memory status                 # MemoryOS bootstrap + runtime status
-bbl memory setup --yes            # bootstrap MemoryOS
-bbl nexus status                  # check Nexus health
-bbl sessions list                 # list persisted sessions
-bbl sessions inspect <sessionId>  # inspect session details and traces
-bbl tools list                    # list available tools
-bbl tools audit                   # review tool audit history
-bbl config show                   # show active configuration
-```
-
----
-
-## TypeScript TUI Removal
-
-The old `bbl chat` TypeScript TUI was removed from the release package in v0.3.7. The production interactive client is now `bbl go`; `bbl run` remains available for one-shot automation and scripting. This keeps the install smaller, reduces duplicated terminal UI logic, and concentrates future interaction work in the native Go TUI.
 
 ## Safety Model
 
-BabeL-O is designed around explicit boundaries:
+BabeL-O is built around explicit boundaries:
 
-- Workspace path checks protect file access from traversal and symlink escapes.
+- Workspace path checks protect against traversal and symlink escapes.
 - Risky tools require visible permission decisions.
-- Tool inputs, outputs, approvals, denials, and usage events are persisted for inspection.
-- SessionChannel content is never executed as a direct instruction.
-- MemoryOS results are hints, never authoritative workspace facts.
-- Nexus remains the source of truth for runtime state; the TUI focuses on interaction.
+- Tool inputs, outputs, approvals, denials, and usage events are persisted.
+- SessionChannel messages are collaboration context, not hidden commands.
+- MemoryOS results are hints, not authoritative workspace facts.
+- Nexus is the runtime source of truth; the TUI is the interaction layer.
 
----
+## Release Notes
+
+As of v0.3.7, the old `bbl chat` TypeScript TUI has been removed from the
+release package. The official interactive entrypoint is `bbl go`; `bbl run`
+remains available for one-shot automation.
+
+This keeps the install smaller, removes duplicated terminal UI logic, and puts
+future interaction work into the native Go TUI.
 
 ## Documentation
 
-- [FAQ](docs/nexus/FAQ.md) — common questions about long-term memory, install, configuration
-- [Go TUI client guide](clients/go-tui/README.md)
-- [Nexus planning and implementation notes](docs/nexus/README.md)
+- [Changelog](CHANGELOG.md)
 - [Release notes](docs/releases/README.md)
-- [MemoryOS First-Run Onboarding Plan](docs/nexus/reference/everos-first-run-onboarding-optimization-plan.md)
-- [MemoryOS Zero-Friction Startup Plan](docs/nexus/reference/everos-zero-friction-memory-startup-optimization-plan.md)
-
----
+- [FAQ](docs/nexus/FAQ.md)
+- [Go TUI client guide](clients/go-tui/README.md)
+- [Distribution guide](docs/nexus/reference/distribution-guide.md)
+- [Nexus planning notes](docs/nexus/README.md)
 
 ## License
 

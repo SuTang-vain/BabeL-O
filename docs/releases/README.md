@@ -1,8 +1,14 @@
 # BabeL-O Releases
 
-This directory stores project-level release notes.
+This directory stores project-level release notes and release operations docs.
 
 Release notes are kept outside `docs/nexus/` because they describe public version changes for the whole project, not only Nexus runtime planning or implementation details.
+
+## Release Docs
+
+- [Changelog](../../CHANGELOG.md)
+- [Release guide](./release-guide.md)
+- [Release confidence checklist](./release-confidence.md)
 
 ## Index
 
