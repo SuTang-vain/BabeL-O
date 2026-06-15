@@ -321,7 +321,17 @@ func (m model) renderComposerStack(width int) string {
 		parts = append(parts, wave)
 	}
 	parts = append(parts, m.renderInput(width))
+	if notice := m.renderTransientStatus(width); notice != "" {
+		parts = append(parts, notice)
+	}
 	return strings.Join(parts, "\n")
+}
+
+func (m model) renderTransientStatus(width int) string {
+	if strings.TrimSpace(m.transientStatus) == "" || m.transientStatusAt.IsZero() {
+		return ""
+	}
+	return statusStyle.Render(truncatePlain("  "+m.transientStatus, width))
 }
 
 func (m model) renderRuntimeWave(width int) string {

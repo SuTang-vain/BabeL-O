@@ -8,6 +8,31 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 - No unreleased user-facing changes are documented yet.
 
+## v0.3.8 - 2026-06-15
+
+[Full release notes](docs/releases/v0.3.8.md)
+
+### Changed
+
+- Moved Go TUI `/model` configuration progress messages out of the persistent
+  transcript and into short-lived composer notices.
+- Generalized current-state verification guidance so provider, model, tool,
+  config, session, workspace, test/build, MCP, and runtime checks stay
+  evidence-backed.
+- Clarified WebSearch as an external public-information locator, not a source
+  for private workspace facts or instructions.
+
+### Fixed
+
+- Displayed DeepSeek's declared 1M context window in Go TUI context chrome while
+  still showing the effective runtime ceiling.
+- Kept soft-deny provider tool calls visible to the model while preserving the
+  permission gate for write and execute actions.
+- Fed permission denials back to the provider as recoverable tool results so it
+  can adjust instead of terminating the turn immediately.
+- Reused approved session-scoped provider rules to avoid repeated permission
+  prompts for the same approved action.
+
 ## v0.3.7 - 2026-06-14
 
 [Full release notes](docs/releases/v0.3.7.md)

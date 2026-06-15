@@ -590,15 +590,13 @@ func TestHandleModelSlashCommandOpensModelOverlayFetch(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("/model command should return a non-nil fetch Command")
 	}
-	found := false
 	for _, line := range m.transcript {
-		if line.kind == "status" && strings.Contains(line.text, "loading shared Nexus model configuration") {
-			found = true
-			break
+		if strings.Contains(line.text, "loading shared Nexus model configuration") {
+			t.Fatalf("/model loading notice must not persist in transcript, got: %#v", m.transcript)
 		}
 	}
-	if !found {
-		t.Fatalf("transcript missing model loading status, got: %#v", m.transcript)
+	if got := stripANSICodes(m.renderComposerStack(120)); !strings.Contains(got, "loading shared Nexus model configuration") {
+		t.Fatalf("composer should show transient model loading notice, got:\n%s", got)
 	}
 }
 
@@ -10025,9 +10023,9 @@ func TestOsC52CopyCmdEmitsBase64(t *testing.T) {
 // TestModelPickStep4EnterFiresSelectCommand verifies that pressing
 // Enter in the /model Step 4 picker dispatches the
 // selectRuntimeModel HTTP command, flips modelPickSubmitting on,
-// and seeds the transcript with a "saving model: …" line — but does
-// not commit the model id locally (the model id is only updated
-// after the server response lands).
+// and surfaces a transient "saving model: …" notice — but does
+// not persist it in the transcript or commit the model id locally
+// (the model id is only updated after the server response lands).
 func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.modelCatalog = runtimeModelsResponse{
@@ -10070,9 +10068,11 @@ func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 	if um.modelID == "anthropic/claude-3-5-sonnet" {
 		t.Fatalf("modelID must not flip to the picked model until the POST resolves")
 	}
-	rendered := renderTranscript(um.transcript, 200)
-	if !strings.Contains(rendered, "saving model: anthropic/claude-3-5-sonnet") {
-		t.Fatalf("transcript should announce the in-flight save, got %q", rendered)
+	if rendered := renderTranscript(um.transcript, 200); strings.Contains(rendered, "saving model: anthropic/claude-3-5-sonnet") {
+		t.Fatalf("transcript should not persist in-flight model save, got %q", rendered)
+	}
+	if got := stripANSICodes(um.renderComposerStack(200)); !strings.Contains(got, "saving model: anthropic/claude-3-5-sonnet") {
+		t.Fatalf("composer should show transient in-flight save notice, got:\n%s", got)
 	}
 	// Re-pressing Enter while submitting must NOT dispatch
 	// another cmd (the picker is locked until the response
@@ -10086,8 +10086,8 @@ func TestModelPickStep4EnterFiresSelectCommand(t *testing.T) {
 // TestModelSelectMsgAppliesConfigAndClosesPicker verifies the
 // success path: a modelSelectMsg with a resolved runtimeConfig
 // flips m.modelID, drops the submitting flag, returns the
-// operator to composing mode, and announces the save in the
-// transcript.
+// operator to composing mode, and shows the save as a transient
+// composer notice.
 func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
 	m.width = 120
@@ -10138,15 +10138,16 @@ func TestModelSelectMsgAppliesConfigAndClosesPicker(t *testing.T) {
 	if !strings.Contains(view, ">") {
 		t.Fatalf("composer input should be visible after model save:\n%s", view)
 	}
-	if cmd != nil {
-		t.Fatalf("modelSelectMsg success should not return a follow-up cmd, got %T", cmd)
+	if cmd == nil {
+		t.Fatalf("modelSelectMsg success should arm transient notice expiry")
 	}
 	rendered := renderTranscript(um.transcript, 200)
-	if !strings.Contains(rendered, "model saved: Claude 3.5 Sonnet") {
-		t.Fatalf("transcript should announce the saved model by display name, got %q", rendered)
+	if strings.Contains(rendered, "model saved: Claude 3.5 Sonnet") {
+		t.Fatalf("transcript should not persist saved model notice, got %q", rendered)
 	}
-	if !strings.Contains(rendered, "provider anthropic") {
-		t.Fatalf("transcript should mention the new provider id, got %q", rendered)
+	notice := stripANSICodes(um.renderComposerStack(200))
+	if !strings.Contains(notice, "model saved: Claude 3.5 Sonnet") || !strings.Contains(notice, "provider anthropic") {
+		t.Fatalf("composer should show transient saved model notice, got:\n%s", notice)
 	}
 }
 
@@ -10194,9 +10195,11 @@ func TestProviderConfigMsgAppliesConfigAndEntersModelPicker(t *testing.T) {
 	if cmd == nil {
 		t.Fatalf("providerConfigMsg success should fetch runtime models")
 	}
-	rendered := renderTranscript(um.transcript, 200)
-	if !strings.Contains(rendered, "provider configured: minimax") {
-		t.Fatalf("transcript should announce provider configuration, got %q", rendered)
+	if rendered := renderTranscript(um.transcript, 200); strings.Contains(rendered, "provider configured: minimax") {
+		t.Fatalf("transcript should not persist provider configuration notice, got %q", rendered)
+	}
+	if got := stripANSICodes(um.renderComposerStack(200)); !strings.Contains(got, "provider configured: minimax") {
+		t.Fatalf("composer should show transient provider configuration notice, got:\n%s", got)
 	}
 }
 
@@ -10618,6 +10621,34 @@ func TestFooterCopyStatusOverridesHelp(t *testing.T) {
 	}
 	if strings.Contains(footer, "enter send") {
 		t.Fatalf("copy status should temporarily replace help row, got:\n%s", footer)
+	}
+}
+
+func TestTransientStatusRendersBelowInputAndExpiresByTimestamp(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	_ = m.showTransientStatus("model saved: DeepSeek V4 Pro")
+	first := m.transientStatusAt
+
+	stack := stripANSICodes(m.renderComposerStack(120))
+	inputIdx := strings.Index(stack, ">")
+	noticeIdx := strings.Index(stack, "model saved: DeepSeek V4 Pro")
+	if inputIdx < 0 || noticeIdx < 0 || noticeIdx < inputIdx {
+		t.Fatalf("transient status should render below input, got:\n%s", stack)
+	}
+
+	_ = m.showTransientStatus("provider configured: deepseek")
+	second := m.transientStatusAt
+	updated, _ := m.Update(transientStatusExpiredMsg{shownAt: first})
+	after := updated.(model)
+	if after.transientStatus != "provider configured: deepseek" {
+		t.Fatalf("stale transient expiry should not clear newer notice, got %q", after.transientStatus)
+	}
+	updated, _ = after.Update(transientStatusExpiredMsg{shownAt: second})
+	after = updated.(model)
+	if after.transientStatus != "" || !after.transientStatusAt.IsZero() {
+		t.Fatalf("matching transient expiry should clear notice, got status=%q at=%v", after.transientStatus, after.transientStatusAt)
 	}
 }
 

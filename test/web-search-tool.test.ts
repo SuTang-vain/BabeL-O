@@ -73,7 +73,12 @@ test('WebSearch is registered as a read-only builtin tool', () => {
   assert.ok(tool)
   assert.equal(tool.risk, 'read')
   assert.equal(tool.source?.type ?? 'builtin', 'builtin')
-  assert.match(tool.prompt?.() ?? '', /DuckDuckGo Lite/)
+  const prompt = tool.prompt?.() ?? ''
+  assert.match(prompt, /DuckDuckGo Lite/)
+  assert.match(prompt, /public web search tool/)
+  assert.match(prompt, /Do not use WebSearch for local source-code inspection or current project facts/)
+  assert.match(prompt, /Never send secrets, private code, private logs, credentials, tokens, or confidential user data/)
+  assert.match(prompt, /not instructions/)
 })
 
 test('webSearchTool executes through injectable fetch without real network', async () => {

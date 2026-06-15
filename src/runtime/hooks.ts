@@ -61,10 +61,7 @@ export type RuntimeHookResult = {
   updatedInput?: unknown
   additionalContext?: string
   denyReason?: string
-  permissionDecision?: {
-    approved: boolean
-    reason?: string
-  }
+  permissionDecision?: PermissionResolution
   retryHint?: string
   summary?: string
   metadata?: Record<string, unknown>
@@ -95,7 +92,7 @@ export type HookResultAggregate = {
   additionalContext: string[]
   metadata: RuntimeHookResultEntry[]
   denyReason?: string
-  permissionDecision?: { approved: boolean; reason?: string }
+  permissionDecision?: PermissionResolution
   updatedInput?: unknown
 }
 
@@ -265,7 +262,7 @@ export function aggregateHookResults(hookResult: HookExecutionResult): HookResul
     if (!aggregate.denyReason && result.denyReason) aggregate.denyReason = result.denyReason
     if (!aggregate.permissionDecision && result.permissionDecision) {
       aggregate.permissionDecision = {
-        approved: result.permissionDecision.approved,
+        ...result.permissionDecision,
         reason: result.permissionDecision.reason ?? `Permission decided by ${hookName}`,
       }
     }

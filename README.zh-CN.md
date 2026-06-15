@@ -62,7 +62,7 @@ bbl go
 安装指定版本：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.7 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.8 bash
 ```
 
 要求：macOS 或 Linux，`PATH` 中有 Node.js >= 22。

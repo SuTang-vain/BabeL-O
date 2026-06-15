@@ -566,7 +566,7 @@ else
 fi
 
 if [ -z "$VERSION" ]; then
-  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.7 to install a specific release."
+  fail "Failed to determine latest release version. Set BBL_VERSION=v0.3.8 to install a specific release."
 fi
 
 OS="$(uname -s | tr '[:upper:]' '[:lower:]')"

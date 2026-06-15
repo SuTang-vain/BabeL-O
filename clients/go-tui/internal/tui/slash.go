@@ -264,8 +264,10 @@ func init() {
 			argHint:  "[id]",
 			run: func(m *model, args []string) tea.Cmd {
 				if len(m.modelCatalog.Providers) == 0 {
-					m.appendLine("status", "loading shared Nexus model configuration")
-					return fetchRuntimeModels(m.cfg, "model")
+					return tea.Batch(
+						m.showTransientStatus("loading shared Nexus model configuration"),
+						fetchRuntimeModels(m.cfg, "model"),
+					)
 				}
 				m.openModelRegistry()
 				// /model <id> is a quick direct-select: seed the

@@ -167,6 +167,8 @@ describe('buildSystemPromptSections', () => {
     assert.ok(guidelines!.content.includes('Action requests'))
     assert.ok(guidelines!.content.includes('Analysis requests'))
     assert.ok(guidelines!.content.includes('Current-state verification requests'))
+    assert.ok(guidelines!.content.includes('provider, model, tool, config'))
+    assert.ok(guidelines!.content.includes('git state, tests/build, MCP, remote runner'))
     assert.ok(guidelines!.content.includes('Pure capability questions can be answered directly'))
     assert.ok(guidelines!.content.includes('查看当前'))
     assert.ok(guidelines!.content.includes('Do NOT run the project'))
@@ -224,6 +226,17 @@ describe('buildSystemPromptSections', () => {
     assert.match(taskGuidelines, /Turn Policy/)
     assert.match(taskGuidelines, /structured runtime control data/)
     assert.match(taskGuidelines, /verified observations, code-confirmed causes, and hypotheses distinct/)
+  })
+
+  test('distinguishes durable artifact requests from inline analysis', () => {
+    const sections = buildSystemPromptSections({
+      cwd: '/tmp/test',
+      platform: 'darwin',
+    })
+    const taskGuidelines = sections.find(section => section.id === 'task_guidelines')?.content ?? ''
+    assert.match(taskGuidelines, /write, save, or create a planning document/)
+    assert.match(taskGuidelines, /otherwise answer inline for analysis and recommendations/)
+    assert.match(taskGuidelines, /necessary for the user's requested artifact or implementation/)
   })
 })
 

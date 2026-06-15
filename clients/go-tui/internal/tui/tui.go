@@ -73,6 +73,10 @@ type copyToastExpiredMsg struct {
 	copiedAt time.Time
 }
 
+type transientStatusExpiredMsg struct {
+	shownAt time.Time
+}
+
 type selectionHighlightExpiredMsg struct {
 	copiedAt  time.Time
 	startLine int
@@ -1078,6 +1082,8 @@ type model struct {
 	lastSelectionCopyAt time.Time
 	copyToastMessage    string
 	copyToastShownAt    time.Time
+	transientStatus     string
+	transientStatusAt   time.Time
 	lastMouseEventTime  time.Time
 	mouseEscapeBuffer   string
 	// promptHistory is the per-session list of submitted
@@ -1275,6 +1281,23 @@ func placeholderForMode(mode inputMode) string {
 	default:
 		return ""
 	}
+}
+
+func (m *model) showTransientStatus(message string) tea.Cmd {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil
+	}
+	m.transientStatus = message
+	m.transientStatusAt = time.Now()
+	m.resize()
+	return expireTransientStatusCmd(m.transientStatusAt)
+}
+
+func expireTransientStatusCmd(shownAt time.Time) tea.Cmd {
+	return tea.Tick(3*time.Second, func(time.Time) tea.Msg {
+		return transientStatusExpiredMsg{shownAt: shownAt}
+	})
 }
 
 // scrollOverlay moves the active overlay's internal scroll or
@@ -2784,8 +2807,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// which are canonical), so we can pass it
 				// through without further munging.
 				m.modelPickSubmitting = true
-				m.appendLine("status", fmt.Sprintf("saving model: %s (provider %s)…", selectedModel.ID, provider.ID))
-				return m, selectRuntimeModel(m.cfg, selectedModel.ID)
+				notice := fmt.Sprintf("saving model: %s (provider %s)…", selectedModel.ID, provider.ID)
+				return m, tea.Batch(m.showTransientStatus(notice), selectRuntimeModel(m.cfg, selectedModel.ID))
 			}
 			return m, nil
 		}
@@ -3000,7 +3023,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Nexus side provides one (e.g. "Claude 3.5 Sonnet");
 		// fall back to the bare model id we sent.
 		display := firstNonEmpty(msg.config.ModelName, msg.modelID)
-		m.appendLine("status", fmt.Sprintf("model saved: %s → %s (provider %s)", display, msg.config.ModelID, firstNonEmpty(msg.config.ProviderID, "?")))
+		notice := fmt.Sprintf("model saved: %s → %s (provider %s)", display, msg.config.ModelID, firstNonEmpty(msg.config.ProviderID, "?"))
 		// Return the operator to composing and reset the
 		// picker's per-session state so a fresh /model
 		// invocation starts from the provider list, not
@@ -3013,7 +3036,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.modelPickBaseURLDraft = ""
 		m.modelPickerLive = nil
 		m.setMode(modeComposing)
-		return m, nil
+		return m, m.showTransientStatus(notice)
 
 	case providerConfigMsg:
 		m.modelProviderSaving = false
@@ -3031,8 +3054,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
-		m.appendLine("status", "provider configured: "+msg.providerID)
-		return m, m.enterModelPicker()
+		return m, tea.Batch(m.showTransientStatus("provider configured: "+msg.providerID), m.enterModelPicker())
 
 	case contextAnalysisMsg:
 		if msg.err != nil {
@@ -3243,6 +3265,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if !m.copyToastShownAt.IsZero() && m.copyToastShownAt.Equal(msg.copiedAt) {
 			m.copyToastMessage = ""
 			m.copyToastShownAt = time.Time{}
+		}
+		return m, nil
+
+	case transientStatusExpiredMsg:
+		if !m.transientStatusAt.IsZero() && m.transientStatusAt.Equal(msg.shownAt) {
+			m.transientStatus = ""
+			m.transientStatusAt = time.Time{}
+			m.resize()
 		}
 		return m, nil
 

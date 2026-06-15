@@ -233,7 +233,10 @@ export class LLMCodingRuntime implements NexusRuntime {
       previousEvents = [...previousEvents, taskScopeEvent]
 
       const toolsList = () => [...this.tools.values()]
-        .filter(tool => this.toolPolicy.isAllowed(tool))
+        .filter(tool => this.toolPolicy.isAllowed(tool) || (
+          options.policyMode === 'soft-deny' &&
+          (tool.risk === 'write' || tool.risk === 'execute')
+        ))
         .map(tool => ({
           name: tool.name,
           description: tool.prompt ? tool.prompt() : tool.description,

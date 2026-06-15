@@ -5,11 +5,11 @@ import { z } from 'zod'
 import type { ToolResultContentBlock } from '../providers/adapters/ModelAdapter.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
-import { PendingPermissionRegistry } from '../shared/session.js'
+import { PendingPermissionRegistry, type PermissionResolution } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
-import type { AnyTool } from '../tools/Tool.js'
+import type { AnyTool, ToolRisk } from '../tools/Tool.js'
 import { classifyAction } from './classifier.js'
-import type { ToolPolicy } from './LocalCodingRuntime.js'
+import { buildSessionRulesPolicy, deriveBashSuggestedRule, type ToolPolicy } from './LocalCodingRuntime.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import {
   executeRuntimeHooks,
@@ -21,7 +21,6 @@ import {
 import {
   absorbRemoteToolRunnerMetrics,
   buildRuntimeErrorEvent,
-  buildRuntimeResultEvent,
   resolveProviderToolCallInput,
   type RuntimeExecutionMetrics,
   type RuntimeProviderToolCall,
@@ -62,11 +61,56 @@ export type ReadFileCacheRange = {
   providerVisible: boolean
 }
 
+export function resolveEffectiveToolRisk(tool: AnyTool, input: unknown): ToolRisk {
+  if (typeof tool.riskForInput === 'function') {
+    try {
+      return tool.riskForInput(input)
+    } catch {
+      return tool.risk
+    }
+  }
+  return tool.risk
+}
+
 type RequestedReadCoverage = {
   startByte: number
   requestedEndByte: number
   requiresFullFile: boolean
   mode: 'auto' | 'full' | 'preview'
+}
+
+const providerSessionRules = new Map<string, string[]>()
+
+function addProviderSessionRule(sessionId: string, rule: string): void {
+  const trimmed = rule.trim()
+  if (!trimmed) return
+  const current = providerSessionRules.get(sessionId) ?? []
+  if (current.includes(trimmed)) return
+  providerSessionRules.set(sessionId, [...current, trimmed])
+}
+
+export function resetProviderSessionRulesForTest(): void {
+  providerSessionRules.clear()
+}
+
+function isApprovedByProviderSessionRule(
+  rules: readonly string[] | undefined,
+  tool: AnyTool,
+  input: unknown,
+): boolean {
+  if (!rules || rules.length === 0) return false
+  return buildSessionRulesPolicy(rules).isAllowed(tool, input)
+}
+
+function providerSuggestedRule(tool: AnyTool, input: unknown): string | undefined {
+  return tool.suggestedAllowRule ?? (tool.name === 'Bash' ? deriveBashSuggestedRule(input) : undefined)
+}
+
+function shouldPersistProviderSessionRule(decision: PermissionResolution): decision is PermissionResolution & { rule: string } {
+  return decision.approved &&
+    (decision.scope === 'session' || decision.scope === 'rule') &&
+    typeof decision.rule === 'string' &&
+    decision.rule.length > 0
 }
 
 function recoverableDeniedToolResult(options: {
@@ -92,9 +136,11 @@ async function* requestScopeBoundaryPermission(options: {
   tool: AnyTool
   toolUseId: string
   toolInput: unknown
+  risk: ToolRisk
   boundary: ToolScopeBoundary
+  suggestedRule?: string
 }): AsyncGenerator<NexusEvent, boolean> {
-  const { runtimeOptions, tool, toolUseId, toolInput, boundary } = options
+  const { runtimeOptions, tool, toolUseId, toolInput, risk, boundary, suggestedRule } = options
   yield buildScopeBoundaryDetectedEvent({
     sessionId: runtimeOptions.sessionId,
     requestId: runtimeOptions.requestId,
@@ -112,8 +158,9 @@ async function* requestScopeBoundaryPermission(options: {
     toolUseId,
     name: tool.name,
     input: toolInput,
-    risk: tool.risk,
+    risk,
     message: `Tool ${tool.name} crosses the current task scope. ${boundary.reason}`,
+    ...(suggestedRule && { suggestedRule }),
     scopeRisk: boundary.scopeRisk,
     targetRoot: boundary.targetRoot,
     taskPrimaryRoot: boundary.taskPrimaryRoot,
@@ -126,7 +173,7 @@ async function* requestScopeBoundaryPermission(options: {
     {
       toolUseId,
       toolName: tool.name,
-      toolRisk: tool.risk,
+      toolRisk: risk,
       toolInput,
     },
     {
@@ -146,13 +193,16 @@ async function* requestScopeBoundaryPermission(options: {
   const decision = hookDecision ?? await pendingPermission
   const approved = decision.approved
   const decisionReason = decision.reason ?? 'User review'
+  if (shouldPersistProviderSessionRule(decision)) {
+    addProviderSessionRule(runtimeOptions.sessionId, decision.rule)
+  }
 
   await options.storage.savePermissionAudit({
     auditId: createId('audit'),
     sessionId: runtimeOptions.sessionId,
     toolUseId,
     toolName: tool.name,
-    toolRisk: tool.risk,
+    toolRisk: risk,
     toolInput,
     decision: approved ? 'approved' : 'denied',
     reason: decisionReason,
@@ -261,73 +311,15 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  yield {
-    type: 'tool_started',
-    ...eventBase(runtimeOptions.sessionId),
-    toolUseId: toolCall.id,
-    name: tool.name,
-    input: resolvedInput,
-  }
-
-  if (!options.toolPolicy.isAllowed(tool)) {
-    const message = `Tool denied by Nexus policy: ${tool.name}`
-    yield {
-      type: 'tool_denied',
-      ...eventBase(runtimeOptions.sessionId),
-      name: tool.name,
-      risk: tool.risk,
-      message,
-      denialKind: 'policy',
-      recoverable: true,
-    }
-    return recoverableDeniedToolResult({
-      toolUseId: toolCall.id,
-      toolName: tool.name,
-      message,
-    })
-  }
-
-  const preToolHooks = await executeRuntimeHooks(
-    'PreToolUse',
-    {
-      toolUseId: toolCall.id,
-      toolName: tool.name,
-      toolRisk: tool.risk,
-      toolInput: resolvedInput,
-    },
-    {
-      sessionId: runtimeOptions.sessionId,
-      cwd: runtimeOptions.cwd,
-      role: runtimeOptions.role,
-      signal: runtimeOptions.signal,
-    },
-    { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
-  )
-  for (const hookEvent of preToolHooks.events) yield hookEvent
-  const hookDenyReason = firstHookDenyReason(preToolHooks)
-  if (hookDenyReason) {
-    yield {
-      type: 'tool_denied',
-      ...eventBase(runtimeOptions.sessionId),
-      name: tool.name,
-      risk: tool.risk,
-      message: hookDenyReason,
-      denialKind: 'hook',
-      recoverable: true,
-    }
-    return recoverableDeniedToolResult({
-      toolUseId: toolCall.id,
-      toolName: tool.name,
-      message: hookDenyReason,
-    })
-  }
-  const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
-  if (hookUpdatedInput !== undefined) {
-    resolvedInput = hookUpdatedInput
-  }
-
-  const parsed = tool.inputSchema.safeParse(resolvedInput)
+  let parsed = tool.inputSchema.safeParse(resolvedInput)
   if (!parsed.success) {
+    yield {
+      type: 'tool_started',
+      ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
+      name: tool.name,
+      input: resolvedInput,
+    }
     let message = [
       `Invalid input for tool ${tool.name}.`,
       z.prettifyError(parsed.error),
@@ -383,14 +375,173 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  const safetyCheck = checkOptimizerSafety(tool.name, parsed.data, runtimeOptions.role)
+  let toolInput = parsed.data
+  let effectiveRisk = resolveEffectiveToolRisk(tool, toolInput)
+
+  yield {
+    type: 'tool_started',
+    ...eventBase(runtimeOptions.sessionId),
+    toolUseId: toolCall.id,
+    name: tool.name,
+    input: toolInput,
+    ...(effectiveRisk !== tool.risk && { effectiveRisk }),
+  }
+
+  let sessionRules = providerSessionRules.get(runtimeOptions.sessionId) ?? []
+  let policyAllowed = options.toolPolicy.isAllowed(tool, toolInput) ||
+    isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+
+  if (
+    effectiveRisk !== 'read' &&
+    !policyAllowed &&
+    runtimeOptions.policyMode !== 'soft-deny'
+  ) {
+    const message = `Tool denied by Nexus policy: ${tool.name}`
+    yield {
+      type: 'tool_denied',
+      ...eventBase(runtimeOptions.sessionId),
+      name: tool.name,
+      risk: effectiveRisk,
+      message,
+      denialKind: 'policy',
+      recoverable: true,
+    }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message,
+    })
+  }
+
+  const preToolHooks = await executeRuntimeHooks(
+    'PreToolUse',
+    {
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      toolRisk: effectiveRisk,
+      toolInput,
+    },
+    {
+      sessionId: runtimeOptions.sessionId,
+      cwd: runtimeOptions.cwd,
+      role: runtimeOptions.role,
+      signal: runtimeOptions.signal,
+    },
+    { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
+  )
+  for (const hookEvent of preToolHooks.events) yield hookEvent
+  const hookDenyReason = firstHookDenyReason(preToolHooks)
+  if (hookDenyReason) {
+    yield {
+      type: 'tool_denied',
+      ...eventBase(runtimeOptions.sessionId),
+      name: tool.name,
+      risk: effectiveRisk,
+      message: hookDenyReason,
+      denialKind: 'hook',
+      recoverable: true,
+    }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message: hookDenyReason,
+    })
+  }
+  const hookUpdatedInput = lastHookUpdatedInput(preToolHooks)
+  if (hookUpdatedInput !== undefined) {
+    resolvedInput = hookUpdatedInput
+    parsed = tool.inputSchema.safeParse(resolvedInput)
+    if (!parsed.success) {
+      let message = [
+        `Invalid input for tool ${tool.name}.`,
+        z.prettifyError(parsed.error),
+        `Return a corrected ${tool.name} tool call with all required fields.`,
+      ].join('\n')
+      const failureHooks = await executeRuntimeHooks(
+        'PostToolUseFailure',
+        {
+          toolUseId: toolCall.id,
+          toolName: tool.name,
+          toolRisk: effectiveRisk,
+          toolInput: resolvedInput,
+          success: false,
+          output: {
+            code: 'INVALID_TOOL_INPUT',
+            message,
+            input: resolvedInput,
+          },
+          errorCode: 'INVALID_TOOL_INPUT',
+          errorMessage: message,
+        },
+        {
+          sessionId: runtimeOptions.sessionId,
+          cwd: runtimeOptions.cwd,
+          role: runtimeOptions.role,
+          signal: runtimeOptions.signal,
+        },
+        { config: runtimeOptions.hooks, hooks: runtimeOptions.runtimeHooks },
+      )
+      for (const hookEvent of failureHooks.events) yield hookEvent
+      message = mergeHookRetryHints(message, failureHooks)
+      yield {
+        type: 'tool_completed',
+        ...eventBase(runtimeOptions.sessionId),
+        toolUseId: toolCall.id,
+        name: tool.name,
+        success: false,
+        output: {
+          code: 'INVALID_TOOL_INPUT',
+          message,
+          input: resolvedInput,
+        },
+      }
+      return {
+        kind: 'continue',
+        toolResult: {
+          type: 'tool_result',
+          toolUseId: toolCall.id,
+          content: message,
+          isError: true,
+          toolName: tool.name,
+        },
+      }
+    }
+    toolInput = parsed.data
+    effectiveRisk = resolveEffectiveToolRisk(tool, toolInput)
+    sessionRules = providerSessionRules.get(runtimeOptions.sessionId) ?? []
+    policyAllowed = options.toolPolicy.isAllowed(tool, toolInput) ||
+      isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+    if (
+      effectiveRisk !== 'read' &&
+      !policyAllowed &&
+      runtimeOptions.policyMode !== 'soft-deny'
+    ) {
+      const message = `Tool denied by Nexus policy: ${tool.name}`
+      yield {
+        type: 'tool_denied',
+        ...eventBase(runtimeOptions.sessionId),
+        name: tool.name,
+        risk: effectiveRisk,
+        message,
+        denialKind: 'policy',
+        recoverable: true,
+      }
+      return recoverableDeniedToolResult({
+        toolUseId: toolCall.id,
+        toolName: tool.name,
+        message,
+      })
+    }
+  }
+
+  const safetyCheck = checkOptimizerSafety(tool.name, toolInput, runtimeOptions.role)
   if (!safetyCheck.allowed) {
     const message = safetyCheck.reason!
     yield {
       type: 'tool_denied',
       ...eventBase(runtimeOptions.sessionId),
       name: tool.name,
-      risk: tool.risk,
+      risk: effectiveRisk,
       message,
       denialKind: 'optimizer_safety',
       recoverable: true,
@@ -402,12 +553,13 @@ export async function* executeProviderToolCall(options: {
     })
   }
 
+  const suggestedRule = providerSuggestedRule(tool, toolInput)
   const scopeBoundary = options.taskScope
     ? classifyToolScopeBoundary({
       taskScope: options.taskScope,
       toolUseId: toolCall.id,
       toolName: tool.name,
-      toolInput: parsed.data,
+      toolInput,
     })
     : undefined
 
@@ -417,8 +569,10 @@ export async function* executeProviderToolCall(options: {
       storage: options.storage,
       tool,
       toolUseId: toolCall.id,
-      toolInput: parsed.data,
+      toolInput,
+      risk: effectiveRisk,
       boundary: scopeBoundary,
+      suggestedRule,
     })
     if (!approved) {
       const denyMessage = scopeBoundary.reason
@@ -426,7 +580,7 @@ export async function* executeProviderToolCall(options: {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),
         name: tool.name,
-        risk: tool.risk,
+        risk: effectiveRisk,
         message: denyMessage,
         denialKind: 'permission',
         recoverable: true,
@@ -439,19 +593,24 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  if ((tool.risk === 'write' || tool.risk === 'execute') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
-    const { autoApprove, reason } = classifyAction(tool.name, parsed.data, { cwd: runtimeOptions.cwd })
-    let approved = autoApprove
-    let decisionReason = `Auto-approved: ${reason}`
+  if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
+    const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: runtimeOptions.cwd })
+    const sessionRuleApproved = isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+    let approved = autoApprove || sessionRuleApproved
+    let decisionReason = sessionRuleApproved
+      ? 'Approved by session rule'
+      : `Auto-approved: ${reason}`
 
-    if (autoApprove) {
+    let permissionDecision: PermissionResolution | undefined
+
+    if (approved) {
       await options.storage.savePermissionAudit({
         auditId: createId('audit'),
         sessionId: runtimeOptions.sessionId,
         toolUseId: toolCall.id,
         toolName: tool.name,
-        toolRisk: tool.risk,
-        toolInput: parsed.data,
+        toolRisk: effectiveRisk,
+        toolInput,
         decision: 'approved',
         reason: decisionReason,
         timestamp: nowIso(),
@@ -467,9 +626,10 @@ export async function* executeProviderToolCall(options: {
         ...eventBase(runtimeOptions.sessionId),
         toolUseId: toolCall.id,
         name: tool.name,
-        input: parsed.data,
-        risk: tool.risk,
+        input: toolInput,
+        risk: effectiveRisk,
         message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+        ...(suggestedRule && { suggestedRule }),
         source: tool.source,
       }
 
@@ -478,8 +638,8 @@ export async function* executeProviderToolCall(options: {
         {
           toolUseId: toolCall.id,
           toolName: tool.name,
-          toolRisk: tool.risk,
-          toolInput: parsed.data,
+          toolRisk: effectiveRisk,
+          toolInput,
         },
         {
           sessionId: runtimeOptions.sessionId,
@@ -496,17 +656,21 @@ export async function* executeProviderToolCall(options: {
         PendingPermissionRegistry.getInstance().resolve(runtimeOptions.sessionId, toolCall.id, hookDecision)
       }
       const decision = hookDecision ?? await pendingPermission
+      permissionDecision = decision
 
       approved = decision.approved
       decisionReason = decision.reason ?? 'User review'
+      if (shouldPersistProviderSessionRule(decision)) {
+        addProviderSessionRule(runtimeOptions.sessionId, decision.rule)
+      }
 
       await options.storage.savePermissionAudit({
         auditId: createId('audit'),
         sessionId: runtimeOptions.sessionId,
         toolUseId: toolCall.id,
         toolName: tool.name,
-        toolRisk: tool.risk,
-        toolInput: parsed.data,
+        toolRisk: effectiveRisk,
+        toolInput,
         decision: approved ? 'approved' : 'denied',
         reason: decisionReason,
         timestamp: nowIso(),
@@ -518,35 +682,44 @@ export async function* executeProviderToolCall(options: {
         toolUseId: toolCall.id,
         approved,
         reason: decisionReason,
+        ...(decision.scope && { scope: decision.scope }),
+        ...(decision.rule && { rule: decision.rule }),
+        ...(decision.feedback && { feedback: decision.feedback }),
       }
     }
 
     if (!approved) {
       const denyMessage = decisionReason || `Tool execution denied by user: ${tool.name}`
+      const recoverableMessage = permissionDecision?.feedback
+        ? `${denyMessage}\nUser feedback: ${permissionDecision.feedback}`
+        : denyMessage
       yield {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),
         name: tool.name,
-        risk: tool.risk,
-        message: denyMessage,
+        risk: effectiveRisk,
+        message: recoverableMessage,
         denialKind: 'permission',
-        terminal: true,
+        recoverable: true,
       }
-      yield buildRuntimeResultEvent(runtimeOptions.sessionId, false, denyMessage)
-      return { kind: 'terminal' }
+      return recoverableDeniedToolResult({
+        toolUseId: toolCall.id,
+        toolName: tool.name,
+        message: recoverableMessage,
+      })
     }
   }
 
   metrics.toolCallCount += 1
   const toolStartMs = performance.now()
 
-  if (tool.name === 'Read' && parsed.data && typeof parsed.data === 'object' && 'path' in parsed.data) {
-    const readPath = resolve(runtimeOptions.cwd, String((parsed.data as { path: string }).path))
+  if (tool.name === 'Read' && toolInput && typeof toolInput === 'object' && 'path' in toolInput) {
+    const readPath = resolve(runtimeOptions.cwd, String((toolInput as { path: string }).path))
     const cached = readFileCache.get(readPath)
     if (cached) {
       try {
         const stat = lstatSync(readPath)
-        const requested = requestedReadCoverage(parsed.data as Record<string, unknown>, stat.size)
+        const requested = requestedReadCoverage(toolInput as Record<string, unknown>, stat.size)
         const covered = requested ? findCoveringReadRange(cached, requested) : undefined
         if (stat.mtimeMs === cached.mtime && stat.size === cached.size && requested && covered) {
           metrics.toolRoundtripDurationMs += performance.now() - toolStartMs
@@ -561,18 +734,18 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  const result = await executeToolSafely(tool, parsed.data, runtimeOptions, {
+  const result = await executeToolSafely(tool, toolInput, runtimeOptions, {
     timeout: TOOL_EXECUTION_TIMEOUT_MS,
     toolUseId: toolCall.id,
   })
   metrics.toolRoundtripDurationMs += performance.now() - toolStartMs
   absorbRemoteToolRunnerMetrics(metrics, result.remoteRunner)
 
-  if (tool.name === 'Read' && result.kind === 'result' && result.success && parsed.data && typeof parsed.data === 'object' && 'path' in parsed.data) {
-    const readPath = resolve(runtimeOptions.cwd, String((parsed.data as { path: string }).path))
+  if (tool.name === 'Read' && result.kind === 'result' && result.success && toolInput && typeof toolInput === 'object' && 'path' in toolInput) {
+    const readPath = resolve(runtimeOptions.cwd, String((toolInput as { path: string }).path))
     try {
       const stat = lstatSync(readPath)
-      const requested = requestedReadCoverage(parsed.data as Record<string, unknown>, stat.size)
+      const requested = requestedReadCoverage(toolInput as Record<string, unknown>, stat.size)
       if (requested) {
         const previous = readFileCache.get(readPath)
         const ranges = previous && previous.mtime === stat.mtimeMs && previous.size === stat.size ? previous.ranges : []
@@ -586,12 +759,12 @@ export async function* executeProviderToolCall(options: {
               endByte: Math.min(requested.requestedEndByte, stat.size),
               completeFile: requested.startByte === 0 && requested.requestedEndByte >= stat.size && !result.truncated,
               truncated: Boolean(result.truncated),
-              mode: readModeFromInput(parsed.data as Record<string, unknown>),
-              maxBytes: positiveNumber((parsed.data as Record<string, unknown>).maxBytes) ?? 200_000,
-              offset: positiveOrZeroNumber((parsed.data as Record<string, unknown>).offset),
-              limit: positiveNumber((parsed.data as Record<string, unknown>).limit),
-              byteOffset: positiveOrZeroNumber((parsed.data as Record<string, unknown>).byteOffset),
-              byteLimit: positiveNumber((parsed.data as Record<string, unknown>).byteLimit),
+              mode: readModeFromInput(toolInput as Record<string, unknown>),
+              maxBytes: positiveNumber((toolInput as Record<string, unknown>).maxBytes) ?? 200_000,
+              offset: positiveOrZeroNumber((toolInput as Record<string, unknown>).offset),
+              limit: positiveNumber((toolInput as Record<string, unknown>).limit),
+              byteOffset: positiveOrZeroNumber((toolInput as Record<string, unknown>).byteOffset),
+              byteLimit: positiveNumber((toolInput as Record<string, unknown>).byteLimit),
               toolUseId: toolCall.id,
               providerVisible: true,
             },
@@ -628,8 +801,8 @@ export async function* executeProviderToolCall(options: {
     {
       toolUseId: toolCall.id,
       toolName: tool.name,
-      toolRisk: tool.risk,
-      toolInput: parsed.data,
+      toolRisk: effectiveRisk,
+      toolInput,
       success: result.success,
       output: result.output,
       errorCode: result.success ? undefined : 'TOOL_RESULT_FAILED',

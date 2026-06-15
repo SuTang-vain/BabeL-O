@@ -355,11 +355,18 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
 function formatLongTermMemoryCapability(): string {
   return [
     'Long-Term Memory Capability:',
-    '- Long-term memory is available for this session.',
+    'Capability: long_term_memory',
+    'State: available for this session',
+    'Source: runtime memory provider diagnostics',
+    'Tool surface: memory_search, memory_save_note, memory_flush_session when present and policy-visible',
+    'Allowed triggers:',
     '- Use memory_search when the user asks about prior preferences, previous decisions, cross-session context, or says things like "do you remember", "before", "last time", "之前", "上次", or "我的偏好".',
-    '- Treat memory results as background hints, not authoritative project state.',
-    '- Verify project facts against workspace evidence before acting.',
     '- Only save memory when the user explicitly asks you to remember something or when a governed memory candidate is approved.',
+    'Risk boundary:',
+    '- Memory search is read-only; memory save and lifecycle operations are write/lifecycle actions and follow normal permission policy.',
+    'Authority:',
+    '- Treat memory results as background hints, not authoritative project state. Verify project facts against workspace evidence before acting.',
+    'User-facing policy:',
     '- For pure memory capability questions, answer at the user-facing capability level: whether memory is available, when confirmation is required, and that memory is only a background hint. Do not expose internal source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets unless the user explicitly asks for implementation details.',
     '- If the user asks to check, test, execute, inspect, or verify current memory availability, use available tools or diagnostics before answering and keep current-state evidence separate from general capability explanation.',
   ].join('\n')

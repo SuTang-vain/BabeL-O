@@ -24,7 +24,7 @@ import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSes
 import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
 import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
-import { executeProviderToolCall } from '../src/runtime/runtimeToolLoop.js'
+import { executeProviderToolCall, resetProviderSessionRulesForTest } from '../src/runtime/runtimeToolLoop.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
@@ -1503,13 +1503,13 @@ test('runtime tool loop returns recoverable result for policy-denied tools', asy
     toolCall: {
       id: 'tool_loop_denied',
       name: 'Bash',
-      partialInput: '{"command":"pwd"}',
+      partialInput: '{"command":"git commit -m x"}',
     },
     tools: createDefaultToolRegistry(),
     toolPolicy: allowlistedTools(['Read']),
     runtimeOptions: {
       sessionId: 'session-tool-loop-denied',
-      prompt: 'bash pwd',
+      prompt: 'bash git commit',
       cwd: tmpdir(),
       skipPermissionCheck: true,
     },
@@ -1532,6 +1532,159 @@ test('runtime tool loop returns recoverable result for policy-denied tools', asy
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Bash'))
   assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
   assert.ok(!events.some(event => event.type === 'result' && !event.success))
+})
+
+test('runtime tool loop treats read-only Bash input as read risk before policy', async () => {
+  resetProviderSessionRulesForTest()
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_read_bash',
+      name: 'Bash',
+      partialInput: '{"command":"pwd"}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId: 'session-tool-loop-read-bash',
+      prompt: 'bash pwd',
+      cwd: tmpdir(),
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, false)
+  assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Bash' && event.effectiveRisk === 'read'))
+  assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Bash'))
+  assert.ok(!events.some(event => event.type === 'tool_denied' && event.name === 'Bash'))
+})
+
+test('runtime tool loop soft-deny emits permission_request for provider Write outside policy', async () => {
+  resetProviderSessionRulesForTest()
+  const sessionId = 'session-tool-loop-soft-deny-write'
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_soft_write',
+      name: 'Write',
+      partialInput: '{"path":"generated.txt","content":"hello"}',
+    },
+    tools: createDefaultToolRegistry(),
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write generated.txt',
+      cwd: tmpdir(),
+      policyMode: 'soft-deny',
+      runtimeHooks: [{
+        name: 'DenyProviderWriteForRegression',
+        events: ['PermissionRequest'],
+        run: () => ({ permissionDecision: { approved: false, reason: 'deny after permission request' } }),
+      }],
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  const permission = events.find(event => event.type === 'permission_request') as any
+  assert.ok(permission, 'soft-deny should emit permission_request for provider Write')
+  assert.equal(permission.name, 'Write')
+  assert.equal(permission.risk, 'write')
+  assert.ok(!events.some(event => event.type === 'tool_denied' && event.denialKind === 'policy'))
+  const denied = events.find(event => event.type === 'tool_denied' && event.name === 'Write') as any
+  assert.ok(denied)
+  assert.equal(denied.recoverable, true)
+  assert.equal(denied.terminal, undefined)
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /deny after permission request/)
+})
+
+test('runtime tool loop provider session-scoped approval rule suppresses repeat prompt', async () => {
+  resetProviderSessionRulesForTest()
+  const sessionId = `session-provider-session-rule-${Date.now()}`
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-session-rule`)
+  await mkdir(cwd, { recursive: true })
+  const tools = createDefaultToolRegistry()
+  const storage = new MemoryStorage()
+  const firstEvents: NexusEvent[] = []
+  const first = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_rule_write_1',
+      name: 'Write',
+      partialInput: '{"path":"one.txt","content":"one"}',
+    },
+    tools,
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write one',
+      cwd,
+      policyMode: 'soft-deny',
+      runtimeHooks: [{
+        name: 'ApproveProviderWriteSessionRule',
+        events: ['PermissionRequest'],
+        run: () => ({ permissionDecision: { approved: true, reason: 'approve write session', scope: 'session', rule: 'write:*' } }),
+      }],
+    },
+    storage,
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+  let next = await first.next()
+  while (!next.done) {
+    firstEvents.push(next.value)
+    next = await first.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.ok(firstEvents.some(event => event.type === 'permission_request' && event.name === 'Write'))
+  assert.ok(firstEvents.some(event => event.type === 'tool_completed' && event.name === 'Write' && event.success))
+
+  const secondEvents: NexusEvent[] = []
+  const second = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_rule_write_2',
+      name: 'Write',
+      partialInput: '{"path":"two.txt","content":"two"}',
+    },
+    tools,
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write two',
+      cwd,
+      policyMode: 'strict',
+    },
+    storage,
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+  })
+  next = await second.next()
+  while (!next.done) {
+    secondEvents.push(next.value)
+    next = await second.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.ok(!secondEvents.some(event => event.type === 'permission_request'))
+  assert.ok(!secondEvents.some(event => event.type === 'tool_denied' && event.denialKind === 'policy'))
+  assert.ok(secondEvents.some(event => event.type === 'tool_completed' && event.name === 'Write' && event.success))
 })
 
 test('runtime tool loop returns recoverable result for hook-denied tools', async () => {
@@ -8360,11 +8513,8 @@ test('execute permission denial: user denies → tool_denied + result(false)', a
   // The model emits Bash (execute risk, not in default allowlist).
   // Under `policy: 'soft-deny'` the policy block is bypassed
   // and the approval gate fires `permission_request`. The user
-  // responds via `/deny` with approved=false. The runtime must
-  // (a) emit `tool dened` with the user-denied reason, (b) emit
-  // `result(success=false)`, (c) record the denial in the
-  // permission_audit table. The model can then continue on the
-  // next turn.
+  // responds via `/deny` with approved=false. The local runtime has no
+  // provider loop to repair the tool call, so denial remains terminal.
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-permission-deny`)
   await mkdir(cwd, { recursive: true })
   const { runtime, storage } = await createDefaultNexusRuntime()

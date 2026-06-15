@@ -727,6 +727,52 @@ describe('User intent fallback guidance', () => {
     }
   })
 
+  test('keeps general current-state verification prompts tool-required', () => {
+    const prompts = [
+      '查看当前配置是否生效',
+      '检查当前 provider 是否支持 tool call',
+      '验证这个 session 是否记录了事件',
+    ]
+
+    for (const latestPrompt of prompts) {
+      const guidance = deriveFallbackUserIntentGuidance({
+        events: [],
+        latestPrompt,
+        cwd: tmpdir(),
+      })
+      assert.equal(guidance.intent, 'continue')
+      assert.equal(guidance.actionHint, 'normal')
+      assert.equal(guidance.requiresTools, true)
+      assert.equal(shouldSuppressToolsForIntent(guidance), false)
+      assert.match(formatUserIntentGuidance(guidance), /Intent category: availability_check/)
+      assert.match(formatUserIntentGuidance(guidance), /Tool mode: enabled/)
+    }
+  })
+
+  test('keeps pure memory capability and conversational status direct-answer', () => {
+    const memoryCapability = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '你有长期记忆吗？',
+      cwd: tmpdir(),
+    })
+    assert.equal(memoryCapability.intent, 'status')
+    assert.equal(memoryCapability.actionHint, 'respond_only')
+    assert.equal(memoryCapability.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(memoryCapability), true)
+    assert.match(formatUserIntentGuidance(memoryCapability), /Intent category: pure_capability_question/)
+
+    const conversationalStatus = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '你还在吗？',
+      cwd: tmpdir(),
+    })
+    assert.equal(conversationalStatus.intent, 'status')
+    assert.equal(conversationalStatus.actionHint, 'respond_only')
+    assert.equal(conversationalStatus.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(conversationalStatus), false)
+    assert.match(formatUserIntentGuidance(conversationalStatus), /Tool mode: available_for_verification/)
+  })
+
   test('binds ambiguous problem analysis to agent failure after self-diagnosis history', () => {
     const events: NexusEvent[] = [
       {
@@ -1431,7 +1477,7 @@ describe('LLMCodingRuntime', () => {
     assert.match(JSON.stringify(body.system), /Requires tools: yes/)
   })
 
-  test('only exposes policy-allowed tools to provider requests', async () => {
+  test('only exposes policy-allowed tools to provider requests under strict policy', async () => {
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -1451,7 +1497,7 @@ describe('LLMCodingRuntime', () => {
     )
     await collectEvents(
       runtime.executeStream({
-        sessionId: 'test-tool-policy-visible',
+        sessionId: 'test-tool-policy-visible-strict',
         prompt: 'inspect project',
         cwd: tmpdir(),
       })
@@ -1460,6 +1506,38 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
     assert.deepEqual(toolNames, ['Glob', 'Read'])
+  })
+
+  test('exposes permission-gated write/execute tools to provider requests under soft-deny', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"Done"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read', 'Glob']),
+      null as any,
+      configManager,
+    )
+    await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-tool-policy-visible-soft-deny',
+        prompt: 'inspect and update project',
+        cwd: tmpdir(),
+        policyMode: 'soft-deny',
+      })
+    )
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    const toolNames = body.tools.map((tool: any) => tool.name).sort()
+    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'Write'])
   })
 
   test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
@@ -1668,7 +1746,56 @@ describe('LLMCodingRuntime', () => {
     })
     assert.equal(addInputs.length, 0)
     assert.ok(events.some(event => event.type === 'permission_response' && event.approved === false))
-    assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'mcp:evercore:memory_save_note'))
+    assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'mcp:evercore:memory_save_note' && event.recoverable === true))
+  })
+
+  test('permission denial is fed back to provider so it can adjust', async () => {
+    fetchStreamResponses.push(
+      createAnthropicToolUseStream({
+        id: 'write-denied-1',
+        name: 'Write',
+        input: { path: 'generated.txt', content: 'hello' },
+      }),
+      createAnthropicTextStream('写入已被拒绝，我不会继续调用 Write；可以改为给出需要手动创建的内容。'),
+    )
+
+    const sessionId = 'test-provider-permission-denial-feedback'
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Read']),
+      new MemoryStorage(),
+      configManager,
+    )
+    const events: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'write generated.txt',
+      cwd: tmpdir(),
+      policyMode: 'soft-deny',
+    })) {
+      events.push(event)
+      if (event.type === 'permission_request') {
+        PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
+          approved: false,
+          reason: 'user denied write for regression',
+          feedback: 'Do not retry Write; provide manual file content instead.',
+        })
+      }
+    }
+
+    assert.equal(fetchCalls.length, 2)
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    assert.match(JSON.stringify(secondBody.messages), /user denied write for regression/)
+    assert.match(JSON.stringify(secondBody.messages), /Do not retry Write/)
+    const denied = events.find(event => event.type === 'tool_denied' && event.name === 'Write') as any
+    assert.ok(denied)
+    assert.equal(denied.denialKind, 'permission')
+    assert.equal(denied.recoverable, true)
+    assert.equal(denied.terminal, undefined)
+    const result = events.find(event => event.type === 'result') as any
+    assert.ok(result)
+    assert.equal(result.success, true)
+    assert.match(result.message, /写入已被拒绝/)
   })
 
   test('emits classified provider error details and a failed result', async () => {
@@ -2832,7 +2959,7 @@ describe('LLMCodingRuntime', () => {
         'event: content_block_start\n',
         'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
         'event: content_block_delta\n',
-        'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">pwd</parameter>\\n<parameter name=\\"timeoutMs\\">15000</parameter>\\n</invoke>\\n</minimax:tool_call>"}}\n\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"<minimax:tool_call>\\n<invoke name=\\"Bash\\">\\n<parameter name=\\"command\\">git commit -m x</parameter>\\n</invoke>\\n</minimax:tool_call>"}}\n\n',
       ]),
     )
 
@@ -2857,8 +2984,7 @@ describe('LLMCodingRuntime', () => {
     const toolStarted = events.find(event => event.type === 'tool_started') as any
     assert.ok(toolStarted)
     assert.equal(toolStarted.name, 'Bash')
-    assert.equal(toolStarted.input.command, 'pwd')
-    assert.equal(toolStarted.input.timeoutMs, '15000')
+    assert.equal(toolStarted.input.command, 'git commit -m x')
 
     const toolDenied = events.find(event => event.type === 'tool_denied') as any
     assert.ok(toolDenied)
@@ -2944,13 +3070,13 @@ describe('LLMCodingRuntime', () => {
   })
 
   test('blocks disallowed tools and yields tool_denied event', async () => {
-    // Stream 1: Request tool execution (bash tool which is not in our allowlist)
+    // Stream 1: Request execute-risk Bash, which is not in our allowlist.
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
         'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-bash","name":"Bash","input":{}}}\n\n',
         'event: content_block_delta\n',
-        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"pwd\\"}"}}\n\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"command\\":\\"git commit -m x\\"}"}}\n\n',
         'event: content_block_stop\n',
         'data: {"index":0}\n\n',
       ])
