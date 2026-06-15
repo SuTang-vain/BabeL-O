@@ -19,6 +19,8 @@ import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
 import { DEFAULT_SESSION_CHANNEL_POLICY, type SessionChannel, type SessionChannelPolicy, type SessionMessage } from '../shared/sessionChannel.js'
 import { evaluateSessionMemoryCandidate } from '../runtime/memoryCandidateGovernance.js'
+import { derivePaneStatus } from '../runtime/loopDiagnostics.js'
+import { errorMessage } from '../shared/errors.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
@@ -871,6 +873,138 @@ export async function createNexusApp(
     metrics: await buildRuntimeMetricsSnapshot(metrics, options.storage),
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))
+
+  // bbl loop plan Phase 1a: per-session health snapshot derived
+  // from a bounded event slice (default lastN=200). Aggregates
+  // status from derivePaneStatus + a lightweight taskScope
+  // projection so the multi-pane TUI can render sidebars without
+  // each pane re-deriving truth. Filters by workspaceId/paneId/
+  // sessionId when provided; returns all known sessions
+  // otherwise. loop_state persistence will replace the implicit
+  // "every known session" walk in Phase 1b.
+  const loopHealthQuerySchema = z.object({
+    workspaceId: z.string().max(128).optional(),
+    paneId: z.string().max(128).optional(),
+    sessionId: z.string().max(256).optional(),
+    lastN: z.coerce.number().int().positive().max(1000).default(200),
+  })
+
+  type TaskScopeSummary = {
+    cwd: string
+    primaryRoot: string
+    explicitRoots: string[]
+    confirmedExternalRoots: string[]
+    inferredCandidateRoots: string[]
+    mode: 'single_root' | 'multi_root' | 'cross_project'
+    source: 'cwd' | 'prompt_paths' | 'user_confirmation' | 'session_metadata'
+    latestDeclaredAt: string
+  }
+
+  function summarizeTaskScope(events: NexusEvent[]): TaskScopeSummary {
+    let summary: TaskScopeSummary = {
+      cwd: '',
+      primaryRoot: '',
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+      inferredCandidateRoots: [],
+      mode: 'single_root',
+      source: 'cwd',
+      latestDeclaredAt: '',
+    }
+    for (const event of events) {
+      if (event.type !== 'task_scope_declared') continue
+      if (event.timestamp < summary.latestDeclaredAt) continue
+      summary = {
+        cwd: event.cwd,
+        primaryRoot: event.primaryRoot,
+        explicitRoots: [...event.explicitRoots],
+        confirmedExternalRoots: [...event.confirmedExternalRoots],
+        inferredCandidateRoots: [...event.inferredCandidateRoots],
+        mode: event.mode,
+        source: event.source,
+        latestDeclaredAt: event.timestamp,
+      }
+    }
+    return summary
+  }
+
+  app.get('/v1/runtime/loop/health', async (request, reply) => {
+    const query = loopHealthQuerySchema.parse(request.query)
+    const candidateIds = new Set<string>()
+    if (query.sessionId) candidateIds.add(query.sessionId)
+    let sessionList: SessionSnapshot[]
+    try {
+      sessionList = await options.storage.listSessions({ limit: 500 })
+    } catch (err) {
+      return reply.code(500).send({
+        type: 'error',
+        code: 'LOOP_HEALTH_FAILED',
+        message: errorMessage(err),
+      })
+    }
+    for (const session of sessionList) {
+      if (query.workspaceId && query.workspaceId !== 'all') {
+        // Phase 1b will replace this with a workspace_id column.
+        // For now every session is included unless the caller
+        // narrows by sessionId or paneId explicitly.
+      }
+      candidateIds.add(session.sessionId)
+    }
+    if (candidateIds.size === 0) {
+      return {
+        type: 'loop_health',
+        panes: [],
+        filter: {
+          workspaceId: query.workspaceId,
+          paneId: query.paneId,
+          sessionId: query.sessionId,
+          lastN: query.lastN,
+        },
+      }
+    }
+
+    const panes: Array<Record<string, unknown>> = []
+    for (const sessionId of candidateIds) {
+      let events: NexusEvent[]
+      try {
+        const page = await options.storage.listEvents(sessionId, {
+          order: 'desc',
+          limit: query.lastN,
+        })
+        events = page.events
+      } catch (err) {
+        panes.push({
+          sessionId,
+          error: errorMessage(err),
+        })
+        continue
+      }
+      const status = derivePaneStatus({ events })
+      const taskScope = summarizeTaskScope(events)
+      panes.push({
+        sessionId,
+        agent: 'bbl',
+        status: status.status,
+        pendingPermissions: status.pendingPermissions,
+        pendingScopeBoundaries: status.pendingScopeBoundaries,
+        outOfScopeEvidence: status.outOfScopeEvidence,
+        lastEventRev: status.lastEventSeq,
+        lastEventAt: status.lastEventAt,
+        taskScope,
+      })
+    }
+
+    return {
+      type: 'loop_health',
+      panes,
+      filter: {
+        workspaceId: query.workspaceId,
+        paneId: query.paneId,
+        sessionId: query.sessionId,
+        lastN: query.lastN,
+      },
+    }
+  })
 
   app.get('/v1/runtime/memory/status', async () => {
     const everCore = everCoreStatus()

@@ -296,3 +296,85 @@ test('GET /v1/sessions/:id/wait polls and resolves when a matching event arrives
     await app.close()
   }
 })
+
+test('GET /v1/runtime/loop/health aggregates status and taskScope per session', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-health`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const sessionId = await createEmptySession(cwd, storage)
+    const base = (type: string, ts: string) => eventBase(sessionId, type, ts)
+    await storage.appendEvent(sessionId, {
+      ...base('task_scope_declared', '2026-06-16T00:00:00.000Z'),
+      cwd,
+      primaryRoot: cwd,
+      explicitRoots: [],
+      confirmedExternalRoots: ['/external-confirmed'],
+      inferredCandidateRoots: [],
+      mode: 'multi_root',
+      source: 'user_confirmation',
+      message: 'multi-root task',
+    } as unknown as NexusEvent)
+    await storage.appendEvent(sessionId, {
+      ...base('scope_boundary_detected', '2026-06-16T00:00:01.000Z'),
+      toolUseId: 'tool-1',
+      toolName: 'Bash',
+      targetRoot: '/external-pending',
+      taskPrimaryRoot: cwd,
+      boundaryKind: 'sibling_repo',
+      action: 'require_confirmation',
+      scopeRisk: 'sibling_repo',
+      reason: 'unresolved sibling',
+      suggestedPrompt: 'confirm',
+    } as unknown as NexusEvent)
+    await storage.appendEvent(sessionId, {
+      ...base('permission_request', '2026-06-16T00:00:02.000Z'),
+      toolUseId: 'tool-2',
+      toolName: 'Bash',
+      toolRisk: 'execute',
+      toolInput: {},
+      risk: 'execute',
+    } as unknown as NexusEvent)
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/v1/runtime/loop/health?sessionId=${sessionId}`,
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'loop_health')
+    assert.ok(Array.isArray(body.panes))
+    const pane = body.panes.find((entry: { sessionId: string }) => entry.sessionId === sessionId)
+    assert.ok(pane)
+    assert.equal(pane.status, 'blocked')
+    assert.equal(pane.pendingPermissions, 1)
+    assert.equal(pane.pendingScopeBoundaries, 1)
+    assert.equal(pane.outOfScopeEvidence, 1)
+    assert.equal(pane.taskScope.mode, 'multi_root')
+    assert.equal(pane.taskScope.primaryRoot, cwd)
+    assert.deepEqual(pane.taskScope.confirmedExternalRoots, ['/external-confirmed'])
+    assert.ok(typeof pane.lastEventRev === 'number' || pane.lastEventRev === undefined)
+  } finally {
+    await app.close()
+  }
+})
+
+test('GET /v1/runtime/loop/health returns empty panes when no sessions exist', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-health-empty`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/loop/health?workspaceId=ws-empty',
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'loop_health')
+    assert.equal(body.panes.length, 0)
+  } finally {
+    await app.close()
+  }
+})
