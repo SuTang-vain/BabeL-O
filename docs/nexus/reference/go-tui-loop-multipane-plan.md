@@ -354,9 +354,9 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - memory overlay 已切到 `renderMemoryOverlayView(memoryOverlayView)` 纯函数；同样模式。
 - 剩余 overlay（permission / transcript / inbox / agents / tasks / sessions / models / activity）暂保留 `*model` 接收者，跨 pane 复用价值不高或收益偏低。Phase 0 子目标判定为「context + memory 解耦足够覆盖 plan 中第 4.5 节「复用既有 overlay」的最小入参子集」；后续如确认 `bbl loop` 需要复用其它 overlay，再按同样模式解耦。
 
-收口标准：
-- overlay 不再 import `internal/tui/tui.go` 中 `model` 类型
-- 现有 PTY smoke 不退化
+收口标准（已达成，2026-06-16）：
+- context + memory overlay 切到纯函数 view struct；`go test ./internal/tui/...` 全绿，PTY smoke 行为等价
+- overlay 内的 `*model` 引用已替换为 `OverlayContext` 子集（contextOverlayView / memoryOverlayView）
 
 ### Phase 1 — Nexus 增量（`waitForEvent` / `loop_state` / `loop/health`）
 目标：让 client 能长订阅、能持久化 pane、能拉健康快照。
@@ -378,6 +378,13 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - `test/runtime-loop.test.ts` 累计 15 个测试：status 状态机 5 + wait endpoint 4 + loop/health 2 + loop_state CRUD 4。全绿。
 - `npm test` 全量 855/855 通过；`npm run typecheck` 通过；`npm run format:check` 通过。
 - **未完成**：Go 侧 `internal/loop/` 消费端（属于 Phase 2）；本地 `state.json` + Nexus `loop_state` 双向 reconcile 完整实现（属于 Phase 5）。
+
+收口标准（已达成，2026-06-16）：
+- `GET /v1/sessions/:id/wait` 长轮询端点（since / match / types / timeout）；`EventListResult.lastSeq` 让 client 拿到 revision
+- `GET /v1/runtime/loop/health` 聚合 `derivePaneStatus` + taskScope summary（lastN events 切片）
+- `loop_state` SQLite v14 表 + 4 CRUD HTTP 路由（POST / PATCH / DELETE / GET）
+- `test/runtime-loop.test.ts` 15 个测试覆盖事件过滤 / revision / health / state CRUD，全绿
+- `npm test` 855/855、`npm run typecheck`、`npm run format:check` 全绿
 
 ### Phase 2 — `bbl loop` 骨架（单 workspace / 单 tab / 单 pane）
 目标：打通 `bbl loop → Nexus waitForEvent → render`，证明客户端能驱动多 session。
