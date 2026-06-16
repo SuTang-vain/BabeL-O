@@ -484,14 +484,18 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - memory candidate 走既有 inbox overlay；不重复实现
 
 进度（2026-06-16）：
-- `internal/loop/scope_review.go` ScopeReviewInput + BuildScopeReviewLines：5 节（header / task scope / pending boundaries / out-of-scope evidence / memory candidate hint），pending 限 5 条 + overflow marker，evidence 限 3 条 + overflow marker，empty sections 省略
-- 8 个测试：empty、header、task scope 段、no-roots 不打印、pending 截断、evidence 段、memory 提示、drift pane count
+- `internal/loop/scope_review.go` ScopeReviewInput + BuildScopeReviewLines：5 节（header / task scope / pending boundaries / out-of-scope evidence / memory candidate hint），pending 限 5 条 + overflow marker，evidence 限 3 条 + overflow marker，empty sections 省略（6a）
+- 8 个测试：empty、header、task scope 段、no-roots 不打印、pending 截断、evidence 段、memory 提示、drift pane count（6a）
+- `internal/loop/interactive.go` InteractiveModel（tea.Model）：WindowSize 同步到 LoopModel、Ctrl+C / Esc / q 退出、View 渲染 status bar + focused pane placeholder + footer hint（3f）
+- `RunInteractive(model)` 启动 bubbletea 程序替代 Phase 2a smoke；cmd/bbl-loop/main.go 改走 RunInteractive
+- 11 个 interactive 测试：WindowSize、Ctrl+C / Esc / q 退出、其他键 noop、View 内容（empty / focused pane / quitting）、clampWidth、padFooter
 - `go test ./...` 全绿
-- **未完成**：Phase 6b Bubble Tea adapter（bubble tea 渲染 / sidebar status 投影 / memory candidate 跨 pane 可见性）
+- 端到端验证：`bbl loop` 调用 `RunInteractive`，真实 terminal 中渲染 TUI（无 TTY 环境会因 `open /dev/tty: device not configured` 退出 exit=1 — 这正是 TUI 路径生效的标志）
+- **未完成**：Phase 3f' router dispatch（Ctrl+N / Ctrl+W / Ctrl+H/L 等映射到 ApplyNewPane / ApplyClosePane / ApplyMoveFocus）、real Nexus streaming、overlay splicing（pane_list / scope_review / scope_drift）、status sidebar
 
 收口标准（部分达成，2026-06-16）：
 - 任意 pane 越界时，其它 pane 也能从侧栏看到事件触发源 ✓（BuildScopeReviewLines 包含 drift pane count，Phase 4 status sidebar 通过 phase 3 状态机传播）
-- review pane 不干扰 focus pane 的输入 ✓（pure-data 投影，由 Phase 6b 适配层 splice 进 overlay，不与 focus pane input 路径串扰）
+- review pane 不干扰 focus pane 的输入 ✓（pure-data 投影，由 Phase 3f' 适配层 splice 进 overlay，不与 focus pane input 路径串扰）
 
 ---
 

@@ -27,10 +27,24 @@ func main() {
 		fmt.Println(loop.VersionString())
 		return
 	}
-	if err := loop.Run(cfg); err != nil {
+	model := buildInitialLoopModel(cfg)
+	if err := loop.RunInteractive(model); err != nil {
 		fmt.Fprintf(os.Stderr, "bbl loop failed: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// buildInitialLoopModel turns the parsed CLI config into the
+// pure-data LoopModel that the Bubble Tea adapter consumes.
+// Phase 3f keeps this minimal; Phase 3f' will hydrate the
+// model from the Nexus reconcile + lastEventRev.
+func buildInitialLoopModel(cfg loop.Config) loop.LoopModel {
+	model := loop.NewLoopModel()
+	if cfg.WorkspaceID != "" {
+		model.Workspaces[0].ID = cfg.WorkspaceID
+		model.Workspaces[0].Label = cfg.WorkspaceID
+	}
+	return model
 }
 
 func parseFlags(cfg *loop.Config) error {
