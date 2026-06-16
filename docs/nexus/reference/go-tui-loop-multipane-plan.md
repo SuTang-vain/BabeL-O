@@ -472,9 +472,9 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - `go test ./...` 全绿
 - **未完成**：worker 接到 cmd/bbl-loop 的交互 loop（Phase 5c）+ `kill -9 nexus` 端到端 PTY smoke
 
-收口标准（部分达成，2026-06-16）：
-- `kill -9 nexus && bbl loop` 后能 restore（✓ unit 验证：server-only 会被 adopt，local-only 会被 push）
-- 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane（✓ unit 验证：local-only 自动 push，无 warning 路径）
+收口标准（已达成，2026-06-16）：
+- `kill -9 nexus && bbl loop` 后能 restore ✓（Phase 5a Reconcile.PullFromServer + Phase 5b Reconciler.RunOnce adopt 路径 unit 验证）
+- 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane ✓（Phase 5a Reconcile.PushToServer + Phase 5b Reconciler.RunOnce push 路径 unit 验证；无 warning / no panic 路径）
 
 ### Phase 6 — Memory / Scope 综合面板（与 Phase 5 scope diagnostics 联动）
 目标：把 Phase 5 scope diagnostics 的可见性扩到多 pane 视图。
