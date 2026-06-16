@@ -491,7 +491,9 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 11 个 interactive 测试：WindowSize、Ctrl+C / Esc / q 退出、其他键 noop、View 内容（empty / focused pane / quitting）、clampWidth、padFooter
 - `go test ./...` 全绿
 - 端到端验证：`bbl loop` 调用 `RunInteractive`，真实 terminal 中渲染 TUI（无 TTY 环境会因 `open /dev/tty: device not configured` 退出 exit=1 — 这正是 TUI 路径生效的标志）
-- **未完成**：Phase 3f' router dispatch（Ctrl+N / Ctrl+W / Ctrl+H/L 等映射到 ApplyNewPane / ApplyClosePane / ApplyMoveFocus）、real Nexus streaming、overlay splicing（pane_list / scope_review / scope_drift）、status sidebar
+- **Phase 3f' router dispatch（commit `ec5cb93`）**：Update 通过 `rawEventFromKey` → `Router.Dispatch` → `Apply*` mutators；named keys（Esc/Tab/Enter/Backspace/PgUp/PgDown/arrows）先于 Ctrl 检测，避免 Ctrl+PgDown 误路由；dispatchEvent pointer receiver 让 mutation 通过 Update 返回值回传；ApplyNewPane / ApplyClosePane / ApplyMoveFocus / ApplyNextTab / ApplyPrevTab 全接入
+- 6 个 dispatch 测试：rawEventFromKey table-driven（12 cases）、Ctrl+N 创建、Ctrl+W 关闭、Ctrl+H 移 focus、Ctrl+PgDn 切 tab、KeyReleaseMsg noop
+- **未完成**：real Nexus streaming、overlay splicing（pane_list / scope_review / scope_drift）、status sidebar
 
 收口标准（部分达成，2026-06-16）：
 - 任意 pane 越界时，其它 pane 也能从侧栏看到事件触发源 ✓（BuildScopeReviewLines 包含 drift pane count，Phase 4 status sidebar 通过 phase 3 状态机传播）
