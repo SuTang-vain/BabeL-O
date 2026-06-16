@@ -55,8 +55,10 @@ func (m InteractiveModel) Init() tea.Cmd {
 
 // Update handles Bubble Tea messages. WindowSizeMsg keeps
 // the LoopModel dimensions in sync with the terminal;
-// KeyMsg routes Ctrl+C / Esc / q to a quit command. All
-// other keys are noop until Phase 3a router dispatch lands.
+// KeyMsg routes Ctrl+C / Esc / q to a quit command and
+// dispatches the rest through the Router (Phase 3f') so
+// Ctrl+N / Ctrl+W / Ctrl+H/L / Ctrl+PgUp/PgDn mutate the
+// LoopModel via the Phase 3d helpers.
 func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -64,15 +66,110 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.loop.Height = msg.Height
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
+		// Quit keys win over router dispatch.
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			m.quitting = true
 			return m, tea.Quit
 		}
+		event, ok := rawEventFromKey(msg)
+		if !ok {
+			return m, nil
+		}
+		return m, m.dispatchEvent(event)
+
+	case tea.KeyReleaseMsg:
 		return m, nil
 	}
 	return m, nil
+}
+
+// dispatchEvent runs the Router against the model's loop
+// state, then applies the resulting RouteAction to the
+// LoopModel via the Phase 3d mutators. Returns a tea.Cmd
+// for side effects (sounds + toasts) that a later
+// sub-target will populate.
+func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
+	route, next := NewRouter().Dispatch(event, m.loop)
+	m.loop = next
+	switch route.Action {
+	case RouteClosePane:
+		m.loop = ApplyClosePane(m.loop)
+	case RouteNewPane:
+		m.loop, _ = ApplyNewPane(m.loop, newPaneSeedFor(event))
+	case RouteMoveFocus:
+		m.loop = ApplyMoveFocus(m.loop, route.Direction)
+	case RouteNextTab:
+		m.loop = ApplyNextTab(m.loop)
+	case RoutePrevTab:
+		m.loop = ApplyPrevTab(m.loop)
+	case RouteNewWorkspace, RouteCloseWorkspace, RouteFocusPane, RouteResize, RouteNone:
+		// No mutation in this sub-target. Workspace creation /
+		// destruction will land in Phase 3f''; focus-pane +
+		// resize are already handled in the calling Update.
+	}
+	return nil
+}
+
+// newPaneSeedFor builds a NewPaneSeed for the Ctrl+N path.
+// The sessionId is generated locally for now; Phase 3f''
+// will replace it with a real Nexus session allocation
+// via POST /v1/sessions.
+func newPaneSeedFor(_ RawEvent) NewPaneSeed {
+	return NewPaneSeed{
+		PaneID:    NewID("pane"),
+		Agent:     "bbl",
+		Label:     "main",
+		SessionID: "session-" + NewID("local"),
+	}
+}
+
+// rawEventFromKey maps a bubbletea v2 KeyPressMsg into the
+// canonical RawEvent shape the Router understands. Returns
+// (event, true) when the key is actionable, (zero, false)
+// otherwise. The mapping covers the router's full key set
+// (Ctrl+N/W/T/H/L/K/J/PgUp/PgDn/Tab/Enter/Esc/Backspace +
+// printable runes).
+//
+// Named keys (Esc/Tab/Enter/Backspace/PgUp/PgDown/arrows) are
+// matched before the Ctrl-modifier check so a Ctrl+PgDown
+// becomes "ctrl+pgdn" (the router's expected token) rather
+// than "ctrl+pgdown" + stray 'w'.
+func rawEventFromKey(msg tea.KeyPressMsg) (RawEvent, bool) {
+	switch msg.Code {
+	case tea.KeyEsc:
+		return RawEvent{Kind: "key", Key: "esc"}, true
+	case tea.KeyTab:
+		return RawEvent{Kind: "key", Key: "tab"}, true
+	case tea.KeyEnter:
+		return RawEvent{Kind: "key", Key: "enter"}, true
+	case tea.KeyBackspace:
+		return RawEvent{Kind: "key", Key: "backspace"}, true
+	case tea.KeyPgUp:
+		return RawEvent{Kind: "key", Key: "ctrl+pgup"}, true
+	case tea.KeyPgDown:
+		return RawEvent{Kind: "key", Key: "ctrl+pgdn"}, true
+	case tea.KeyLeft:
+		return RawEvent{Kind: "key", Key: "ctrl+left"}, true
+	case tea.KeyRight:
+		return RawEvent{Kind: "key", Key: "ctrl+right"}, true
+	case tea.KeyUp:
+		return RawEvent{Kind: "key", Key: "ctrl+up"}, true
+	case tea.KeyDown:
+		return RawEvent{Kind: "key", Key: "ctrl+down"}, true
+	}
+	if msg.Mod&tea.ModCtrl != 0 {
+		lower := msg.Code
+		if lower >= 'A' && lower <= 'Z' {
+			lower += 'a' - 'A'
+		}
+		return RawEvent{Kind: "key", Key: "ctrl+" + string(lower)}, true
+	}
+	if msg.Text != "" {
+		return RawEvent{Kind: "key", Key: msg.Text}, true
+	}
+	return RawEvent{}, false
 }
 
 // View renders the status bar + focused pane body + footer.

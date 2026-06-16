@@ -137,3 +137,122 @@ func TestPadFooter(t *testing.T) {
 		t.Fatalf("padFooter overflow should not truncate, got %q", got)
 	}
 }
+
+func TestRawEventFromKeyMapsControlChords(t *testing.T) {
+	cases := []struct {
+		name     string
+		code     rune
+		mod      tea.KeyMod
+		wantKey  string
+		wantOK   bool
+	}{
+		{"ctrl+n", 'n', tea.ModCtrl, "ctrl+n", true},
+		{"ctrl+w", 'w', tea.ModCtrl, "ctrl+w", true},
+		{"ctrl+h (lowercase a)", 'h', tea.ModCtrl, "ctrl+h", true},
+		{"ctrl+shift+n (uppercase N)", 'N', tea.ModCtrl, "ctrl+n", true},
+		{"plain a", 'a', 0, "a", true},
+		{"esc plain", tea.KeyEsc, 0, "esc", true},
+		{"tab plain", tea.KeyTab, 0, "tab", true},
+		{"enter plain", tea.KeyEnter, 0, "enter", true},
+		{"backspace plain", tea.KeyBackspace, 0, "backspace", true},
+		{"pgup plain", tea.KeyPgUp, 0, "ctrl+pgup", true},
+		{"pgdn plain", tea.KeyPgDown, 0, "ctrl+pgdn", true},
+		{"left arrow", tea.KeyLeft, 0, "ctrl+left", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ev, ok := rawEventFromKey(tea.KeyPressMsg(tea.Key{Code: c.code, Mod: c.mod, Text: string(c.code)}))
+			if ok != c.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, c.wantOK)
+			}
+			if ok && ev.Key != c.wantKey {
+				t.Fatalf("Key = %q, want %q", ev.Key, c.wantKey)
+			}
+		})
+	}
+}
+
+func TestInteractiveUpdateCtrlNCreatesPane(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	before := len(model.loop.Workspaces[0].Tabs[0].Panes)
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'n', Mod: tea.ModCtrl}))
+	im := updated.(InteractiveModel)
+	after := len(im.loop.Workspaces[0].Tabs[0].Panes)
+	if after != before+1 {
+		t.Fatalf("Ctrl+N should add a pane, panes %d -> %d", before, after)
+	}
+	if im.loop.Focus.PaneIdx != 0 {
+		t.Fatalf("new pane should be focused, got PaneIdx=%d", im.loop.Focus.PaneIdx)
+	}
+}
+
+func TestInteractiveUpdateCtrlWClosesPane(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	tab := model.loop.Workspaces[0].Tabs[0]
+	updated, err := tab.AddPane(PaneModel{
+		PaneID:      "pane-1",
+		WorkspaceID: model.loop.Workspaces[0].ID,
+		TabID:       tab.ID,
+		SessionID:   "session-1",
+	})
+	if err != nil {
+		t.Fatalf("AddPane: %v", err)
+	}
+	model.loop.Workspaces[0].Tabs[0] = updated
+	before := len(model.loop.Workspaces[0].Tabs[0].Panes)
+	updatedModel, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'w', Mod: tea.ModCtrl}))
+	im := updatedModel.(InteractiveModel)
+	after := len(im.loop.Workspaces[0].Tabs[0].Panes)
+	if after != before-1 {
+		t.Fatalf("Ctrl+W should remove a pane, panes %d -> %d", before, after)
+	}
+}
+
+func TestInteractiveUpdateCtrlHMovesFocusLeft(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	for i := 0; i < 3; i++ {
+		updated, _ := model.loop.Workspaces[0].Tabs[0].AddPane(PaneModel{
+			PaneID:      "pane-" + string(rune('a'+i)),
+			WorkspaceID: model.loop.Workspaces[0].ID,
+			TabID:       model.loop.Workspaces[0].Tabs[0].ID,
+			SessionID:   "session-" + string(rune('a'+i)),
+		})
+		model.loop.Workspaces[0].Tabs[0] = updated
+	}
+	model.loop.Focus.PaneIdx = 2
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: 'h', Mod: tea.ModCtrl}))
+	im := updated.(InteractiveModel)
+	if im.loop.Focus.PaneIdx != 1 {
+		t.Fatalf("Ctrl+H from index 2 should land at 1, got %d", im.loop.Focus.PaneIdx)
+	}
+}
+
+func TestInteractiveUpdateCtrlPgDnCyclesTab(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	ws := model.loop.Workspaces[0]
+	ws = ws.AddTab("logs")
+	model.loop.Workspaces[0] = ws
+	if model.loop.Focus.TabIdx != 0 {
+		t.Fatalf("starting TabIdx should be 0, got %d", model.loop.Focus.TabIdx)
+	}
+	updated, _ := model.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyPgDown, Mod: tea.ModCtrl}))
+	im := updated.(InteractiveModel)
+	if im.loop.Focus.TabIdx != 1 {
+		t.Fatalf("Ctrl+PgDn from 0 should land at 1, got %d", im.loop.Focus.TabIdx)
+	}
+}
+
+func TestInteractiveUpdateReleaseMsgIsNoop(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	updated, cmd := model.Update(tea.KeyReleaseMsg(tea.Key{Code: 'a'}))
+	if cmd != nil {
+		t.Fatal("KeyReleaseMsg should not produce a command")
+	}
+	im := updated.(InteractiveModel)
+	// Check that no pane was created (the most common side effect
+	// of accidental dispatch from KeyRelease).
+	panes := im.loop.Workspaces[0].Tabs[0].Panes
+	if len(panes) != 0 {
+		t.Fatalf("KeyReleaseMsg should not mutate model, got %d panes", len(panes))
+	}
+}
