@@ -433,6 +433,13 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - `notifications/sound.go` macOS/Linux 实现 + Windows 空 stub
 - `notifications/toast.go` tab-aware suppression（仿 herdr `server/notifications.rs`）
 
+进度（2026-06-16）：
+- `internal/loop/status.go` ColorName + SymbolForStatus + ColorForStatus + StatusBadge + FormatStatusBadge + FormatStatusSummary。
+- 颜色表严格按 plan 第 4 节：blocked→red / drift→amber / waiting→blue / done→green / working→blue / idle→gray / unknown→none。
+- FormatStatusSummary 输出 "N panes · blocked/drift/waiting · focused=<id>" 格式。
+- 7 个 status 测试：颜色映射、symbol 唯一、badge 结构、badge line 无 ANSI、empty model、attention 聚合、formatInt。
+- **未完成**：status sidebar overlay（按 pane 列加颜色前缀）、sound + toast 抑制、health poll goroutine。
+
 收口标准：
 - drift / blocked / done 三个状态有不同 sound
 - 同 pane 短时间内多次同状态不重复 toast
