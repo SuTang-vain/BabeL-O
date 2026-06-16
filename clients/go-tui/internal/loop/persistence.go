@@ -69,7 +69,10 @@ type Store struct {
 
 // NewStore returns a Store backed by path. The path is
 // created lazily on first persist; the directory is created
-// eagerly on construction when possible.
+// eagerly on construction when possible. NewStore hydrates
+// the in-memory snapshot from the file on disk (missing file
+// is treated as empty) so a fresh `bbl loop` launch sees the
+// panes the previous session left behind.
 func NewStore(path string) (*Store, error) {
 	if path == "" {
 		path = defaultStatePath()
@@ -79,9 +82,13 @@ func NewStore(path string) (*Store, error) {
 			return nil, fmt.Errorf("loop store: mkdir %q: %w", dir, err)
 		}
 	}
+	snap, err := LoadSnapshot(path)
+	if err != nil {
+		return nil, err
+	}
 	store := &Store{
 		path:       path,
-		current:    Snapshot{Version: snapshotVersion, UpdatedAt: time.Now().UTC().Format(time.RFC3339)},
+		current:    snap,
 		writeDelay: 500 * time.Millisecond,
 		stopCh:     make(chan struct{}),
 		doneCh:     make(chan struct{}),

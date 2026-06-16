@@ -8,6 +8,7 @@
 package loop
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,106 @@ func TestPadFooter(t *testing.T) {
 	}
 	if got := padFooter("very long footer", 5); got != "very long footer" {
 		t.Fatalf("padFooter overflow should not truncate, got %q", got)
+	}
+}
+
+func TestApplySnapshotToLoopHydratesPanes(t *testing.T) {
+	model := NewLoopModel()
+	snap := Snapshot{
+		Version: snapshotVersion,
+		Panes: []PaneStateEntry{
+			{PaneID: "pane-1", WorkspaceID: "ws-default", TabID: "ws-default:1", SessionID: "session-1", Agent: "bbl", Cwd: "/tmp", Label: "main", LastRev: 7},
+			{PaneID: "pane-2", WorkspaceID: "ws-default", TabID: "ws-default:1", SessionID: "session-2", Agent: "bbl", Cwd: "/tmp", Label: "logs", LastRev: 0},
+		},
+	}
+	hydrated := applySnapshotToLoop(model, snap)
+	if len(hydrated.Workspaces[0].Tabs[0].Panes) != 2 {
+		t.Fatalf("expected 2 panes, got %d", len(hydrated.Workspaces[0].Tabs[0].Panes))
+	}
+	if hydrated.Workspaces[0].Tabs[0].Panes[0].PaneID != "pane-1" {
+		t.Fatalf("pane[0] id = %q, want pane-1", hydrated.Workspaces[0].Tabs[0].Panes[0].PaneID)
+	}
+	if hydrated.Workspaces[0].Tabs[0].Panes[1].LastEventRev != 0 {
+		t.Fatalf("pane[1] lastEventRev = %d, want 0", hydrated.Workspaces[0].Tabs[0].Panes[1].LastEventRev)
+	}
+}
+
+func TestApplySnapshotToLoopEmptySnapshotIsNoop(t *testing.T) {
+	model := NewLoopModel()
+	if got := applySnapshotToLoop(model, Snapshot{Version: snapshotVersion}); got.Workspaces[0].Tabs[0].Panes != nil {
+		t.Fatalf("empty snapshot should not produce panes, got %+v", got)
+	}
+}
+
+func TestNewInteractiveModelWithStoreHydrates(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "state.json")
+	store, err := NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	if err := store.Replace(Snapshot{
+		Version: snapshotVersion,
+		Panes: []PaneStateEntry{
+			{PaneID: "pane-persist", WorkspaceID: "ws-default", TabID: "ws-default:1", SessionID: "session-persist", Agent: "bbl", Cwd: "/tmp", LastRev: 3},
+		},
+	}); err != nil {
+		t.Fatalf("Replace: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	store2, err := NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore reload: %v", err)
+	}
+	defer store2.Close()
+	im := NewInteractiveModelWithStore(NewLoopModel(), store2)
+	if im.store == nil {
+		t.Fatal("store should be attached")
+	}
+	if len(im.loop.Workspaces[0].Tabs[0].Panes) != 1 {
+		t.Fatalf("expected 1 hydrated pane, got %d", len(im.loop.Workspaces[0].Tabs[0].Panes))
+	}
+	if im.loop.Workspaces[0].Tabs[0].Panes[0].PaneID != "pane-persist" {
+		t.Fatalf("hydrated pane id = %q, want pane-persist", im.loop.Workspaces[0].Tabs[0].Panes[0].PaneID)
+	}
+}
+
+func TestInteractiveUpdatePersistsSnapshotOnDispatch(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "state.json")
+	store, err := NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	defer store.Close()
+	im := NewInteractiveModelWithStore(NewLoopModel(), store)
+	_, _ = im.Update(tea.KeyPressMsg(tea.Key{Code: 'n', Mod: tea.ModCtrl}))
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	store2, err := NewStore(storePath)
+	if err != nil {
+		t.Fatalf("NewStore reload: %v", err)
+	}
+	defer store2.Close()
+	snap := store2.Snapshot()
+	if len(snap.Panes) != 1 || snap.Panes[0].SessionID == "" {
+		t.Fatalf("snapshot should have the dispatched pane, got %+v", snap.Panes)
+	}
+}
+
+func TestInteractiveModelWithNilStoreIsSafe(t *testing.T) {
+	im := NewInteractiveModelWithStore(NewLoopModel(), nil)
+	if im.store != nil {
+		t.Fatal("nil store should stay nil")
+	}
+	updated, cmd := im.Update(tea.KeyPressMsg(tea.Key{Code: 'n', Mod: tea.ModCtrl}))
+	if cmd != nil {
+		t.Fatal("nil store should still dispatch fine")
+	}
+	if _, ok := updated.(InteractiveModel); !ok {
+		t.Fatalf("unexpected model type %T", updated)
 	}
 }
 

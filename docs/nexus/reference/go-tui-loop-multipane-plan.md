@@ -470,7 +470,26 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - OnPush / OnPull 钩子供 Phase 4 sidebar / toast 复用（5b）
 - 6 个 reconcile worker 测试：unchanged、push、pull、lastRev drift、hooks、nil guard
 - `go test ./...` 全绿
-- **未完成**：worker 接到 cmd/bbl-loop 的交互 loop（Phase 5c）+ `kill -9 nexus` 端到端 PTY smoke
+- **未完成**：reconciler background goroutine（Phase 5c'）+ `kill -9 nexus` 端到端 PTY smoke
+
+收口标准（已达成，2026-06-16）：
+- `kill -9 nexus && bbl loop` 后能 restore ✓（Phase 5a Reconcile.PullFromServer + Phase 5b Reconciler.RunOnce adopt 路径 unit 验证）
+- 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane ✓（Phase 5a Reconcile.PushToServer + Phase 5b Reconciler.RunOnce push 路径 unit 验证；无 warning / no panic 路径）
+
+### Phase 5c — Store 接入 RunInteractive
+目标：让 Phase 5 持久化真正端到端生效；`bbl loop` 启动时从 `~/.bbl/loop/state.json` hydrate 退出时 flush。
+
+进度（2026-06-16）：
+- `NewStore` 现在调 `LoadSnapshot` 在 in-memory state hydration（修 Phase 5a 漏的 bug：之前 in-memory state 总是空）
+- `InteractiveModel` 加 `store *Store` 字段 + `NewInteractiveModelWithStore` 构造器
+- `applySnapshotToLoop` pure function：把 Snapshot 的 panes hydrate 进 focused tab（panes 追加、tab 边界检查）
+- `snapshotFromLoop` pure function：从 focused workspace + tab 提取 PaneStateEntry 列表
+- `dispatchEvent` 每次 Apply* mutator 之后调 `m.persistSnapshot()` → `store.Replace(snapshot)`；debounced 写盘
+- `RunInteractive(model, store)` 退出时 `store.Close()` flush pending writes
+- `cmd/bbl-loop/main.go` 改用 `loop.NewStore(cfg.StatePath)` + `loop.RunInteractive(model, store)`；defer Close 兜底
+- 5 个新测试：applySnapshotToLoop hydrate / empty snapshot noop / NewInteractiveModelWithStore hydrate / dispatch persists snapshot / nil store safe
+- 端到端路径：dispatch → mutator → persistSnapshot → store.Replace → debounced write → Close flush → 下次 `bbl loop` 启动 → NewStore LoadSnapshot → InteractiveModel hydrate
+- `go test ./...` 全绿
 
 收口标准（已达成，2026-06-16）：
 - `kill -9 nexus && bbl loop` 后能 restore ✓（Phase 5a Reconcile.PullFromServer + Phase 5b Reconciler.RunOnce adopt 路径 unit 验证）

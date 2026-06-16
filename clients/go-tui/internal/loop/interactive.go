@@ -7,19 +7,27 @@
 // layer router dispatch, overlay rendering, status sidebar,
 // and scope review on top of the model established here.
 //
-// Scope of this commit:
+// Scope of this commit (Phase 3f):
 //   - WindowSize → LoopModel.Width / Height + layout reset
 //   - KeyMsg: Ctrl+C / Esc / q quit
 //   - View: status bar (FormatStatusSummary) + placeholder
 //     pane body + footer hint
 //
+// Phase 3f' added: router dispatch + Apply* mutators.
+//
+// Phase 5c: hook the local snapshot Store into RunInteractive
+// so a snapshot is loaded on startup and saved on every
+// mutator dispatch + on shutdown. This makes the Phase 5
+// closure criterion "kill -9 nexus && bbl loop" -> restore
+// testable end-to-end; the reconciler goroutine that
+// syncs with the server is a later sub-target (5c').
+//
 // Out of scope (deferred to later sub-targets):
-//   - Router dispatch (Phase 3a) for key events other than
-//     quit
 //   - Layout-based pane geometry rendering (Phase 3b)
 //   - MouseEventFilter (Phase 3c)
 //   - Pane / status / scope overlay splicing
 //   - Real Nexus streaming + transcript accumulation
+//   - Reconciler background goroutine (Phase 5c')
 package loop
 
 import (
@@ -31,11 +39,12 @@ import (
 
 // InteractiveModel is the tea.Model the `bbl loop` TUI runs.
 // It holds the pure-data LoopModel alongside runtime-only
-// state (window dimensions, transcript placeholder) so the
-// data layer stays free of Bubble Tea imports.
+// state (window dimensions, transcript placeholder, optional
+// store) so the data layer stays free of Bubble Tea imports.
 type InteractiveModel struct {
 	loop       LoopModel
 	transcript []string
+	store      *Store
 	quitting    bool
 }
 
@@ -44,6 +53,95 @@ type InteractiveModel struct {
 // sub-target that wires Nexus streaming will populate it.
 func NewInteractiveModel(model LoopModel) InteractiveModel {
 	return InteractiveModel{loop: model}
+}
+
+// NewInteractiveModelWithStore hydrates the model from the
+// snapshot persisted in `store`. The returned model is
+// ready to use; mutations from the Update path are flushed
+// back to the store via the Save-on-dispatch helper that
+// RunInteractive wires in. A nil store is tolerated and
+// behaves like NewInteractiveModel.
+func NewInteractiveModelWithStore(model LoopModel, store *Store) InteractiveModel {
+	im := InteractiveModel{loop: model, store: store}
+	if store == nil {
+		return im
+	}
+	snap := store.Snapshot()
+	im.loop = applySnapshotToLoop(im.loop, snap)
+	return im
+}
+
+// applySnapshotToLoop returns `loop` updated to reflect the
+// panes in `snap`. Pane IDs that don't exist in the
+// current model are appended to the focused tab; existing
+// panes have their metadata refreshed. The function is
+// pure — the caller decides whether to persist.
+func applySnapshotToLoop(loop LoopModel, snap Snapshot) LoopModel {
+	if len(snap.Panes) == 0 {
+		return loop
+	}
+	if loop.Focus.WorkspaceIdx < 0 || loop.Focus.WorkspaceIdx >= len(loop.Workspaces) {
+		return loop
+	}
+	ws := loop.Workspaces[loop.Focus.WorkspaceIdx]
+	if len(ws.Tabs) == 0 {
+		ws.Tabs = []Tab{{ID: ws.ID + ":1", Label: "main"}}
+	}
+	tab := ws.Tabs[loop.Focus.TabIdx]
+	for _, entry := range snap.Panes {
+		tab, _ = tab.AddPane(PaneModel{
+			PaneID:      entry.PaneID,
+			WorkspaceID: entry.WorkspaceID,
+			TabID:       entry.TabID,
+			SessionID:   entry.SessionID,
+			Agent:       entry.Agent,
+			Cwd:         entry.Cwd,
+			Label:       entry.Label,
+			Status:      StatusIdle,
+			LastEventRev: entry.LastRev,
+		})
+	}
+	ws.Tabs[loop.Focus.TabIdx] = tab
+	loop.Workspaces[loop.Focus.WorkspaceIdx] = ws
+	return loop
+}
+
+// snapshotFromLoop extracts the pane list from the current
+// model in the shape Store.Replace expects. Only the
+// focused workspace + tab are persisted; Phase 5c' will
+// extend to multi-workspace snapshots.
+func snapshotFromLoop(model LoopModel) Snapshot {
+	if model.Focus.WorkspaceIdx < 0 || model.Focus.WorkspaceIdx >= len(model.Workspaces) {
+		return Snapshot{Version: snapshotVersion, Panes: nil}
+	}
+	ws := model.Workspaces[model.Focus.WorkspaceIdx]
+	if model.Focus.TabIdx < 0 || model.Focus.TabIdx >= len(ws.Tabs) {
+		return Snapshot{Version: snapshotVersion, Panes: nil}
+	}
+	tab := ws.Tabs[model.Focus.TabIdx]
+	entries := make([]PaneStateEntry, 0, len(tab.Panes))
+	for _, pane := range tab.Panes {
+		entries = append(entries, PaneStateEntry{
+			PaneID:      pane.PaneID,
+			WorkspaceID: pane.WorkspaceID,
+			TabID:       pane.TabID,
+			SessionID:   pane.SessionID,
+			Agent:       pane.Agent,
+			Cwd:         pane.Cwd,
+			Label:       pane.Label,
+			LastRev:     pane.LastEventRev,
+		})
+	}
+	return Snapshot{Version: snapshotVersion, Panes: entries}
+}
+
+// persistSnapshot writes the current loop state into the
+// attached Store. No-op when the store is nil or empty.
+func (m *InteractiveModel) persistSnapshot() {
+	if m.store == nil {
+		return
+	}
+	_ = m.store.Replace(snapshotFromLoop(m.loop))
 }
 
 // Init returns the initial tea.Cmd. Phase 3f only requests
@@ -87,8 +185,10 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // dispatchEvent runs the Router against the model's loop
 // state, then applies the resulting RouteAction to the
-// LoopModel via the Phase 3d mutators. Returns a tea.Cmd
-// for side effects (sounds + toasts) that a later
+// LoopModel via the Phase 3d mutators. After mutating it
+// persists the snapshot to the attached Store (Phase 5c)
+// so the next `bbl loop` launch hydrates from disk. Returns
+// a tea.Cmd for side effects (sounds + toasts) that a later
 // sub-target will populate.
 func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 	route, next := NewRouter().Dispatch(event, m.loop)
@@ -109,6 +209,7 @@ func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 		// destruction will land in Phase 3f''; focus-pane +
 		// resize are already handled in the calling Update.
 	}
+	m.persistSnapshot()
 	return nil
 }
 
@@ -238,14 +339,29 @@ func padFooter(footer string, width int) string {
 // errors. LoopModel state mutations during the TUI are
 // reflected on each Update so a future sub-target can
 // apply router decisions into the same model.
-func RunInteractive(model LoopModel) error {
-	prog := tea.NewProgram(NewInteractiveModel(model))
+//
+// Phase 5c: when store is non-nil, RunInteractive seeds the
+// TUI from the persisted snapshot and flushes the store on
+// shutdown. A nil store is the in-memory default (tests
+// + `bbl loop --check`).
+func RunInteractive(model LoopModel, store *Store) error {
+	prog := tea.NewProgram(NewInteractiveModelWithStore(model, store))
 	finalModel, err := prog.Run()
 	if err != nil {
+		if store != nil {
+			_ = store.Close()
+		}
 		return fmt.Errorf("loop: bubbletea run: %w", err)
 	}
-	if _, ok := finalModel.(InteractiveModel); !ok {
+	im, ok := finalModel.(InteractiveModel)
+	if !ok {
+		if store != nil {
+			_ = store.Close()
+		}
 		return fmt.Errorf("loop: unexpected final model %T", finalModel)
+	}
+	if im.store != nil {
+		_ = im.store.Close()
 	}
 	return nil
 }

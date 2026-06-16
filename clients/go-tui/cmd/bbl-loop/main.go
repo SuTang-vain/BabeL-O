@@ -27,11 +27,35 @@ func main() {
 		fmt.Println(loop.VersionString())
 		return
 	}
+	store, err := openLoopStore(cfg.StatePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bbl loop store open: %v\n", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if store != nil {
+			_ = store.Close()
+		}
+	}()
 	model := buildInitialLoopModel(cfg)
-	if err := loop.RunInteractive(model); err != nil {
+	if err := loop.RunInteractive(model, store); err != nil {
 		fmt.Fprintf(os.Stderr, "bbl loop failed: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// openLoopStore creates the on-disk snapshot store from the
+// CLI's --state flag (or the default ~/.bbl/loop/state.json).
+// Returns (nil, nil) when the caller passes an empty
+// --state path AND no default is desired; cmd/bbl-loop
+// currently always opens the default, so this is a future
+// escape hatch.
+func openLoopStore(statePath string) (*loop.Store, error) {
+	store, err := loop.NewStore(statePath)
+	if err != nil {
+		return nil, err
+	}
+	return store, nil
 }
 
 // buildInitialLoopModel turns the parsed CLI config into the
