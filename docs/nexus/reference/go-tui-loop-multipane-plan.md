@@ -417,10 +417,12 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 7 个 mouse 测试：containment、border fallback、outside fallback、非 mouse 拒绝、空模型、单 pane 缺失几何。
 - `internal/loop/mutate.go` 纯函数 model mutators：ApplyClosePane / ApplyNewPane / ApplyMoveFocus / ApplyNextTab / ApplyPrevTab。ApplyNewPane 在 Focus 完全未设时自动建默认 workspace + tab。
 - 9 个 mutator 测试：close removes pane + 焦点回收、close empty tab 折叠、close noop、new appends + focus、new 拒绝缺字段、new 首次建 ws、move left/right、move 边界 noop、tab 循环 wrap、single tab noop。
-- **未完成**：`pane_list` overlay（Phase 3 最后一个 sub-target）。
+- `internal/loop/pane_list.go` 纯数据 BuildPaneListLines + SummarizePaneList：每行含 focus marker、pane id、label、status；summary 聚合 ByStatus 计数 + HasDrift + PendingBoundary。
+- 6 个 pane_list 测试：empty model、focused marker、all panes、status 指示、multi-workspace、summary counts。
+- **Phase 3 数据层 + overlay 已收口**；Bubble Tea adapter 留作 Phase 4 子目标（与 status sidebar / notification 一起整合）。
 
-收口标准：
-- 创建 / 关闭 / 切换 pane 都不丢事件
+收口标准（已达成，2026-06-16）：
+- 创建 / 关闭 / 切换 pane 都不丢事件（router 分类 + mutate 纯函数应用，pane 状态不依赖 Bubble Tea runtime）
 - focus 切换不破坏任何 pane 的 transcript
 
 ### Phase 4 — Status / Drift / Notification
