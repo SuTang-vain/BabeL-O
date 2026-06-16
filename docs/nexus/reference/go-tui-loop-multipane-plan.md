@@ -411,7 +411,9 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 8 类动作：RouteResize / RouteFocusPane / RouteClosePane / RouteNewPane / RouteMoveFocus / RouteNextTab / RoutePrevTab / RouteNewWorkspace / RouteCloseWorkspace。
 - 全局键位：Ctrl+N 新 pane / Ctrl+W 关闭 / Ctrl+H/L/K/J 移动 focus / Ctrl+T 新 workspace / Ctrl+Shift+T 关 workspace / Ctrl+PgUp/PgDn 切 tab。
 - 8 个 router 测试覆盖 resize / global commands / focus movement / printable keys / unrecognised / mouse / tick / pure-function invariant；`go test ./...` 全绿。
-- **未完成**：`layout.go` split/focus geometry、`MouseEventFilter` adapter、`pane_list` overlay。
+- `internal/loop/layout.go` 纯数据 layout：ComputeLayout(model) 返回 PaneGeometry 列表，focused tab 内 panes 等宽横向分割，余数靠左侧 panes 吸收；NeighborPane(model, direction) 支持 Ctrl+H/L 移动 focus。
+- 8 个 layout 测试：empty tab、zero window、single pane、even split、uneven split remainder、left/right neighbor、edge cases、flat-tab up/down 无邻居。
+- **未完成**：`MouseEventFilter` adapter（路由 mouse 命中具体 pane）、`pane_list` overlay。
 
 收口标准：
 - 创建 / 关闭 / 切换 pane 都不丢事件
