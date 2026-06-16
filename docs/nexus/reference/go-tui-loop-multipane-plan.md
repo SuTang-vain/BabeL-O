@@ -438,11 +438,14 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 颜色表严格按 plan 第 4 节：blocked→red / drift→amber / waiting→blue / done→green / working→blue / idle→gray / unknown→none。
 - FormatStatusSummary 输出 "N panes · blocked/drift/waiting · focused=<id>" 格式。
 - 7 个 status 测试：颜色映射、symbol 唯一、badge 结构、badge line 无 ANSI、empty model、attention 聚合、formatInt。
-- **未完成**：status sidebar overlay（按 pane 列加颜色前缀）、sound + toast 抑制、health poll goroutine。
+- `internal/loop/notifications` 包：SoundName + SoundForStatus（drift→warn / blocked→alert / done→chime，其余→notify / none）+ SoundPlayer 接口 + FakeSoundPlayer + ToastQueue。
+- ToastQueue 行为：默认 5s dedup 窗口、按 (pane, status) key 去重、focused tab 抑制（用户已看见就不打扰）、Play 委托给 SoundPlayer。
+- 7 个 notifications 测试：sound 映射、drift/blocked/done 互不相同、首次接受、窗口内抑制、窗口外接受、状态变化、pane 变化、focused tab 抑制、Play 委托。
+- **未完成**：status sidebar overlay（按 pane 列加颜色前缀）、health poll goroutine、macOS/Linux 平台 sound 实现。
 
-收口标准：
-- drift / blocked / done 三个状态有不同 sound
-- 同 pane 短时间内多次同状态不重复 toast
+收口标准（部分达成，2026-06-16）：
+- drift / blocked / done 三个状态有不同 sound ✓（SoundForStatus 测试已断言）
+- 同 pane 短时间内多次同状态不重复 toast ✓（ToastQueue dedup 窗口 5s）
 
 ### Phase 5 — 持久化与恢复
 目标：本地 snapshot + Nexus `loop_state` 双向 reconcile。
