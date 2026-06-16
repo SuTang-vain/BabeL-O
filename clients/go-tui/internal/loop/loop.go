@@ -12,6 +12,7 @@ package loop
 import (
 	"fmt"
 	"io"
+	"os"
 )
 
 // VersionString returns the human-readable loop driver version.
@@ -47,7 +48,7 @@ func VersionString() string {
 // the LoopModel / API client / persistence layers land in
 // Phase 2b / 2c. Real interaction arrives in Phase 3.
 func Run(cfg Config) error {
-	return runSmoke(cfg, io.Discard)
+	return runSmoke(cfg, os.Stdout)
 }
 
 func runSmoke(cfg Config, sink io.Writer) error {
