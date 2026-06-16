@@ -8031,8 +8031,16 @@ func TestStaticToolDescriptorCatalogIsStableReferenceShape(t *testing.T) {
 	// and risk levels must remain stable so a future refactor
 	// that re-orders the slice (or drops a tool) trips this
 	// test and forces an explicit decision.
+	//
+	// Kept in sync with src/tools/builtin/skillTool.ts (Phase 6
+	// of the Skill execution governance plan). The 5 Skill tools
+	// were added here so the offline fallback does not silently
+	// drop them when /v1/tools/audit is unreachable.
 	tools := staticToolDescriptorCatalog()
-	wantNames := []string{"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "TaskCreate"}
+	wantNames := []string{
+		"Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "TaskCreate",
+		"SkillList", "SkillShow", "SkillValidate", "SkillDraft", "SkillSave",
+	}
 	if len(tools) != len(wantNames) {
 		t.Fatalf("static catalog should have %d tools, got %d", len(wantNames), len(tools))
 	}
@@ -8042,9 +8050,17 @@ func TestStaticToolDescriptorCatalogIsStableReferenceShape(t *testing.T) {
 		}
 	}
 	// Bash is the only execute-risk tool and the only one
-	// that requires approval.
+	// that requires approval among the non-skill tools.
 	if tools[3].risk != "execute" || !tools[3].approval {
 		t.Fatalf("Bash should be execute-risk + approval-required, got risk=%q approval=%v", tools[3].risk, tools[3].approval)
+	}
+	// SkillSave (last entry) is write-risk and approval-required.
+	if tools[len(tools)-1].name != "SkillSave" {
+		t.Fatalf("last static catalog entry should be SkillSave, got %q", tools[len(tools)-1].name)
+	}
+	if tools[len(tools)-1].risk != "write" || !tools[len(tools)-1].approval {
+		t.Fatalf("SkillSave should be write-risk + approval-required, got risk=%q approval=%v",
+			tools[len(tools)-1].risk, tools[len(tools)-1].approval)
 	}
 }
 

@@ -19,7 +19,7 @@ import (
 
 // reconcileDoneMsg is dispatched to the Update path after
 // each reconciler pass. Carries the result so future
-// sub-targets (5c'' / 6b) can surface pushed / pulled pane
+// sub-targets (5c” / 6b) can surface pushed / pulled pane
 // counts in the status bar without re-running RunOnce.
 type reconcileDoneMsg struct {
 	result RunOnceResult
@@ -68,17 +68,17 @@ type tickMsg struct{}
 // (no state change) plus the next tick cmd. The actual
 // reconciler call is in reconcileTickCmd; this function
 // just chains them.
+//
+// We flip reconcileInFlight = true so the chrome can render
+// a "● syncing..." indicator during the gap between kickoff
+// and the reconcileDoneMsg that handleReconcileDone clears
+// it with.
 func (m *InteractiveModel) handleReconcileTick() tea.Cmd {
 	if m.reconciler == nil {
 		return nil
 	}
-	// Run the reconcile (returns immediately) and schedule
-	// the next tick in parallel. tea.Cmd lets us return the
-	// reconcile cmd while also queuing the next tick.
-	return tea.Batch(
-		reconcileTickCmd(m.reconciler),
-		scheduleReconcileTick(m.reconcileInterval),
-	)
+	m.reconcileInFlight = true
+	return reconcileTickCmd(m.reconciler)
 }
 
 // handleReconcileDone updates the reconciler status from
@@ -86,7 +86,13 @@ func (m *InteractiveModel) handleReconcileTick() tea.Cmd {
 // will fold this into the status sidebar). It also
 // reschedules the next tick; the Bubble Tea runtime
 // guarantees the scheduled tick is dropped on program quit.
+//
+// We stamp lastReconcileAt = time.Now() and clear
+// reconcileInFlight so the footer's "synced Ns ago" /
+// "syncing..." indicator stays current.
 func (m *InteractiveModel) handleReconcileDone(msg reconcileDoneMsg) tea.Cmd {
 	m.lastReconcile = msg
+	m.lastReconcileAt = time.Now()
+	m.reconcileInFlight = false
 	return scheduleReconcileTick(m.reconcileInterval)
 }

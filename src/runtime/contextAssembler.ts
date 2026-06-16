@@ -68,6 +68,12 @@ export type ContextAssemblerOptions = {
   mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
   memoryProvider?: MemoryProvider
   sessionInbox?: SessionMessage[]
+  // PR-4a (Track A Phase 1, see docs/nexus/reference/long-running-context-
+  // assembly.md §5.1): when provided, skip the per-call deriveWorkingSet
+  // and use this string verbatim. Lets Nexus-side WorkingSetTracker own
+  // the working set across turns. Backward compatible: when undefined,
+  // the legacy derive path is used.
+  workingSetOverride?: string
 }
 
 export type AssembledContext = {
@@ -186,7 +192,9 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     cwd: options.runtimeOptions.cwd,
   })
   const workingSetEntries = deriveWorkingSet(compactAwareEvents, options.runtimeOptions.cwd)
-  const workingSet = formatWorkingSet(workingSetEntries)
+  const workingSet = options.workingSetOverride !== undefined
+    ? options.workingSetOverride
+    : formatWorkingSet(workingSetEntries)
   const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget)
   const selectedEvents = protectToolPairs(
     compactAwareEvents,

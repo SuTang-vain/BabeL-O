@@ -28,6 +28,7 @@ const CONFIG_ENV_KEYS = [
   'BABEL_O_CONFIG_FILE',
   'BABEL_O_TEST_CONFIG_WRITE_GUARD',
   'BABEL_O_SESSION_MEMORY_LITE',
+  'BABEL_O_NATURAL_PAUSE_SUPPRESS',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -943,6 +944,9 @@ describe('LLMCodingRuntime', () => {
 
   test('queues Session Memory Lite update after no-tool final response', async () => {
     process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
+    // P0 default = suppressed; this test asserts natural_pause still
+    // fires when explicitly opted in via BABEL_O_NATURAL_PAUSE_SUPPRESS=false
+    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
     const cwd = join(tmpdir(), `babel-o-runtime-session-memory-${Date.now()}-${Math.random()}`)
     const sessionId = 'test-session-memory-runtime'
     const storage = new MemoryStorage()

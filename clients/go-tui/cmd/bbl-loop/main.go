@@ -1,11 +1,13 @@
 // cmd/bbl-loop/main.go
 //
-// Phase 2a of docs/nexus/reference/go-tui-loop-multipane-plan.md:
-// standalone entry point for the multi-pane `bbl loop` driver.
-// Reuses the same Nexus HTTP/WS plumbing as cmd/go-tui but
-// drives a workspace/tab/pane container instead of a single
-// session. This file only handles flags + dispatch; the actual
-// LoopModel lives in internal/loop/ (Phase 2b/2c).
+// Phase 4b': standalone entry point for the multi-pane
+// `bbl loop` driver. Wires the Bubble Tea InteractiveModel
+// with the snapshot store, the Reconciler (Phase 5b/5c'),
+// the periodic /v1/runtime/loop/health poll (Phase 4b),
+// the platform-appropriate SoundPlayer (notifications),
+// and the ToastQueue (status-transition dedup + focused-tab
+// suppression). The actual LoopModel lives in internal/loop/;
+// this file is just flags + dispatch.
 
 package main
 
@@ -13,8 +15,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"time"
+
+	tea "charm.land/bubbletea/v2"
 
 	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop"
+	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop/api"
+	"github.com/sutang-vain/babel-o/clients/go-tui/internal/notifications"
 )
 
 func main() {
@@ -38,10 +45,65 @@ func main() {
 		}
 	}()
 	model := buildInitialLoopModel(cfg)
-	if err := loop.RunInteractive(model, store); err != nil {
+	client := api.NewClient(cfg.BaseURL, cfg.APIKey)
+	toastQueue := notifications.NewToastQueue()
+	soundPlayer := notifications.NewSoundPlayerForPlatform()
+	if err := runLoop(model, store, client, toastQueue, soundPlayer, cfg); err != nil {
 		fmt.Fprintf(os.Stderr, "bbl loop failed: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// runLoop wires the periodic reconcile + health poll into
+// the InteractiveModel and hands it to the Bubble Tea
+// program. The reconciler runs the loop_state sync (Phase
+// 5b/5c'); the health poll drives per-pane status
+// projections (Phase 4b). When the operator passes
+// --health-interval-ms=0 or --no-reconcile, the
+// corresponding driver is dropped so the TUI runs in
+// in-memory mode.
+func runLoop(
+	model loop.LoopModel,
+	store *loop.Store,
+	client *api.Client,
+	toastQueue *notifications.ToastQueue,
+	soundPlayer notifications.SoundPlayer,
+	cfg loop.Config,
+) error {
+	reconcileInterval := time.Duration(cfg.PollIntervalMs) * time.Millisecond
+	healthInterval := time.Duration(cfg.HealthIntervalMs) * time.Millisecond
+	var reconciler *loop.Reconciler
+	if store != nil && client != nil {
+		reconciler = &loop.Reconciler{
+			Store:       store,
+			Client:      client,
+			WorkspaceID: cfg.WorkspaceID,
+		}
+	}
+	im := loop.NewInteractiveModelWithLoopClient(
+		model,
+		store,
+		reconciler,
+		reconcileInterval,
+		client,
+		healthInterval,
+		toastQueue,
+		soundPlayer,
+	)
+	im = loop.NewInteractiveModelWithRuntimeOptions(im, cfg.AltScreen, cfg.MouseCapture)
+	prog := tea.NewProgram(im)
+	finalModel, err := prog.Run()
+	if err != nil {
+		return fmt.Errorf("loop: bubbletea run: %w", err)
+	}
+	typed, ok := finalModel.(loop.InteractiveModel)
+	if !ok {
+		return fmt.Errorf("loop: unexpected final model %T", finalModel)
+	}
+	if typed.Store() != nil {
+		_ = typed.Store().Close()
+	}
+	return nil
 }
 
 // openLoopStore creates the on-disk snapshot store from the
@@ -60,8 +122,6 @@ func openLoopStore(statePath string) (*loop.Store, error) {
 
 // buildInitialLoopModel turns the parsed CLI config into the
 // pure-data LoopModel that the Bubble Tea adapter consumes.
-// Phase 3f keeps this minimal; Phase 3f' will hydrate the
-// model from the Nexus reconcile + lastEventRev.
 func buildInitialLoopModel(cfg loop.Config) loop.LoopModel {
 	model := loop.NewLoopModel()
 	if cfg.WorkspaceID != "" {
@@ -78,7 +138,8 @@ func parseFlags(cfg *loop.Config) error {
 	flag.StringVar(&cfg.SessionID, "session", "", "optional existing session id to attach to")
 	flag.StringVar(&cfg.StatePath, "state", "", "optional override path for ~/.bbl/loop/state.json")
 	flag.StringVar(&cfg.WorkspaceID, "workspace", "ws-default", "loop workspace id (auto-created on first run)")
-	flag.IntVar(&cfg.PollIntervalMs, "poll-interval-ms", 5000, "background /v1/runtime/loop/health poll interval in milliseconds; 0 disables polling")
+	flag.IntVar(&cfg.PollIntervalMs, "poll-interval-ms", 5000, "background /v1/loop/workspaces reconcile interval in milliseconds; 0 disables reconcile")
+	flag.IntVar(&cfg.HealthIntervalMs, "health-interval-ms", 3000, "background /v1/runtime/loop/health poll interval in milliseconds; 0 disables the status sidebar live updates")
 	flag.IntVar(&cfg.WaitTimeoutMs, "wait-timeout-ms", 5000, "max wait window per /v1/sessions/:id/wait call in milliseconds")
 	flag.BoolVar(&cfg.AltScreen, "alt", true, "use terminal alternate screen")
 	flag.BoolVar(&cfg.MouseCapture, "mouse", true, "capture mouse drag / wheel; set --mouse=false to let the terminal own selection and scrollback")

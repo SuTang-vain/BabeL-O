@@ -283,3 +283,31 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 - `src/storage/Storage.ts`
 - `src/storage/MemoryStorage.ts`
 - `src/storage/SqliteStorage.ts`
+
+## Skill execution governance (Phase 0–6) — 2026-06-16 收口
+
+- Phase 0（Baseline preservation）— 已收口
+- Phase 1（Schema / validator / normalizer / formatter）— `src/skills/{schema,validator,normalizer,formatter}.ts` + 11 测试
+- Phase 2（SkillRegistry + observability）— `src/skills/registry.ts` + `src/shared/skillEvents.ts`（4 event schema 独立可 import；union 集成延后）+ 7 测试
+- Phase 3（Nexus `/v1/skills/*` endpoints）— `src/nexus/skillRoutes.ts` 4 route + 8 测试
+- Phase 4（Draft generation）— `src/skills/generator.ts`（6 类 redaction）+ `POST /v1/skills/draft` + 21 测试
+- Phase 5（Session capture + save）— `src/skills/storage.ts`（8 errorCode + 原子写 + 重复检测）+ `POST /v1/skills/save` + 16 测试
+- Phase 6（Model-visible bounded skill tools）— `src/tools/builtin/skillTool.ts`（SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave）+ 13 测试
+
+**累计 84/84 测试通过；typecheck 0 错误。** 规划路径见 [reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)；三角关系见 [reference/tool-governance-reference-integration.md](../reference/tool-governance-reference-integration.md)。**不主动开新项**；后续仅在真实 session 暴露 drift 时按 regression-first 重新开项（per §Phase 7）。
+
+### 治理三角闭环 — 2026-06-16 同步
+
+- `tool-granularity-and-evidence-governance-plan.md`（边界）— 顶部 Related plans 行 + 末尾 §10 Related governance plans 段落落地，三角引用从"两条单向 + 一条无"补到 **完整双向闭环**。
+- `tool-surface-expansion-and-native-mcp-coexistence-plan.md`（补齐）+ `skill-execution-and-automated-normalized-skill-generation-governance-plan.md`（Skill）— Related 行 / 段落已存在，本批次未改。
+- 任何后续修改任一联主规划时，必须同步检查另两联 + 整合索引是否需要更新。
+
+### Go TUI fallback 同步 — 2026-06-16
+
+- `clients/go-tui/internal/tui/slash.go` `staticToolDescriptorCatalog` 8 → 13；新增 5 个 Skill 工具（SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave）。
+- `tui_test.go` wantNames 同步；新增 SkillSave risk/approval 断言。
+- `go test ./internal/tui/...` 11.110s 全过；`go vet ./...` 干净。
+
+### 流程收口
+
+- `CronDelete ca8ae7e4` 结束 `/loop 10m` 循环。Skill 治理 6 阶段全部 Closed + 84/84 测试 + 三联闭环 + Go TUI 同步 — 任务目标达成，循环不再需要。

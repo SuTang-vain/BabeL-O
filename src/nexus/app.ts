@@ -32,6 +32,20 @@ import { ConfigManager, validateModelSelectionAuth, type ProfileConfig } from '.
 import { getModel, inspectModelCapabilities, modelRegistry, providerRegistry, UnknownModelError } from '../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runtime/providerRecovery.js'
+import {
+  invokeSkill,
+  listSkills,
+  showSkill,
+  generateDraftHandler,
+  saveSkillHandler,
+  SkillIdParamsSchema,
+  SkillInvokeBodySchema,
+  SkillListQuerySchema,
+  SkillValidateBodySchema,
+  SkillDraftBodySchema,
+  SkillSaveBodySchema,
+  validateSkillRequest,
+} from './skillRoutes.js'
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
@@ -1684,6 +1698,79 @@ export async function createNexusApp(
       order: query.order,
       limit: query.limit,
     }
+  })
+
+  // ---------------------------------------------------------------------
+  // Skill routes (Phase 3 of the Skill execution governance plan)
+  // ---------------------------------------------------------------------
+
+  app.get('/v1/skills', async request => {
+    const query = SkillListQuerySchema.parse(request.query)
+    return listSkills({
+      cwd: query.cwd ?? options.defaultCwd,
+      ...(query.source ? { source: query.source } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.builtInDir ? { builtInDir: query.builtInDir } : {}),
+    })
+  })
+
+  app.get('/v1/skills/:id', async (request, reply) => {
+    const params = SkillIdParamsSchema.parse(request.params)
+    const query = SkillListQuerySchema.parse(request.query)
+    const result = await showSkill({
+      cwd: query.cwd ?? options.defaultCwd,
+      id: params.id,
+      ...(query.builtInDir ? { builtInDir: query.builtInDir } : {}),
+    })
+    if (!result.ok) {
+      const status = result.errorCode === 'SKILL_NOT_FOUND' ? 404 : 500
+      return reply.code(status).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/validate', async (request, reply) => {
+    const body = SkillValidateBodySchema.parse(request.body ?? {})
+    const result = await validateSkillRequest(body)
+    if (!result.ok) {
+      return reply.code(422).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/invoke', async request => {
+    const body = SkillInvokeBodySchema.parse(request.body ?? {})
+    return invokeSkill(body)
+  })
+
+  app.post('/v1/skills/draft', async (request, reply) => {
+    const body = SkillDraftBodySchema.parse(request.body ?? {})
+    const result = await generateDraftHandler(body)
+    if (!result.ok) {
+      return reply.code(422).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/save', async (request, reply) => {
+    const body = SkillSaveBodySchema.parse(request.body ?? {})
+    const result = await saveSkillHandler({
+      cwd: body.cwd ?? options.defaultCwd,
+      draft: body.draft as unknown as Parameters<typeof saveSkillHandler>[0]['draft'],
+      confirm: body.confirm,
+      ...(body.overwrite !== undefined ? { overwrite: body.overwrite } : {}),
+      ...(body.scope ? { scope: body.scope } : {}),
+    })
+    if (!result.ok) {
+      if (result.errorCode === 'SKILL_SAVE_OVERWRITE_REQUIRED') {
+        return reply.code(409).send(result)
+      }
+      if (result.errorCode === 'SKILL_SAVE_PERSIST_FAILED' || result.errorCode === 'SKILL_SAVE_SCOPE_INVALID') {
+        return reply.code(500).send(result)
+      }
+      return reply.code(422).send(result)
+    }
+    return result
   })
 
   app.get('/v1/sessions/:sessionId/agents', async (request, reply) => {

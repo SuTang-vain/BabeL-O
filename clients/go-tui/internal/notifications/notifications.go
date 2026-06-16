@@ -1,26 +1,33 @@
 // Package notifications implements Phase 4b sound + toast
-// suppression for the bbl loop driver. The package is pure:
+// suppression for the bbl loop driver. The package is
+// deliberately decoupled from internal/loop: the public
+// surface takes a status *string* (one of "idle" / "working"
+// / "blocked" / "waiting" / "drift" / "done") so the toast
+// queue and SoundPlayer can be reused by any caller without
+// dragging the loop package in. internal/loop's PaneStatus
+// enum has a String() method that produces these tokens, so
+// loop.PaneStatus.String() is the natural bridge.
+//
 // SoundPlayer is an interface so tests can capture the play
 // log without touching the host audio stack; ToastQueue
 // enforces a dedup window and tab-aware suppression so the
 // same (pane, status) does not spam the user.
 //
-// macOS / Linux / Windows hooks live behind SoundPlayer;
-// Phase 4b' will add platform implementations; tests use
-// FakeSoundPlayer.
+// Platform implementations live behind build tags in
+// sound_darwin.go / sound_linux.go / sound_windows.go /
+// sound_other.go; NewSoundPlayerForPlatform picks the
+// right one for runtime.GOOS.
 package notifications
 
 import (
 	"sync"
 	"time"
-
-	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop"
 )
 
 // SoundName is a string token the SoundPlayer maps to a
 // platform audio file / system beep. Keeping this as a typed
-// string avoids hard-coding audio paths inside the loop
-// package and lets tests assert on intent.
+// string avoids hard-coding audio paths inside the package
+// and lets tests assert on intent.
 type SoundName string
 
 const (
@@ -31,34 +38,26 @@ const (
 	SoundNotify SoundName = "notify"
 )
 
-// SoundForStatus maps a PaneStatus to its canonical sound.
-// The mapping matches the plan's section 4 closure criteria:
-// drift / blocked / done have distinct sounds; idle / working
-// / waiting share a quiet notify (or none).
-func SoundForStatus(status loop.PaneStatus) SoundName {
+// SoundForStatus maps a status string to its canonical
+// sound. The mapping matches the plan's section 4 closure
+// criteria: drift / blocked / done have distinct sounds;
+// idle / working / waiting share a quiet notify (or none).
+// Unknown statuses fall back to SoundNone so a future
+// server-side addition doesn't break the audio path.
+func SoundForStatus(status string) SoundName {
 	switch status {
-	case StatusDone():
+	case "done":
 		return SoundChime
-	case StatusDrift():
+	case "drift":
 		return SoundWarn
-	case StatusBlocked():
+	case "blocked":
 		return SoundAlert
-	case StatusWaiting(), StatusWorking(), StatusIdle():
+	case "waiting", "working", "idle":
 		return SoundNotify
 	default:
 		return SoundNone
 	}
 }
-
-// StatusDone / StatusDrift / StatusBlocked thin wrappers so
-// the package can use the loop.PaneStatus type without
-// importing its constants in every call site.
-func StatusDone() loop.PaneStatus    { return loop.StatusDone }
-func StatusDrift() loop.PaneStatus   { return loop.StatusDrift }
-func StatusBlocked() loop.PaneStatus { return loop.StatusBlocked }
-func StatusWaiting() loop.PaneStatus { return loop.StatusWaiting }
-func StatusWorking() loop.PaneStatus { return loop.StatusWorking }
-func StatusIdle() loop.PaneStatus    { return loop.StatusIdle }
 
 // SoundPlayer is the platform audio abstraction.
 type SoundPlayer interface {
@@ -78,11 +77,21 @@ func (f *FakeSoundPlayer) Play(name SoundName) error {
 	return nil
 }
 
+// PlaysCopy returns a copy of the captured Play log so the
+// caller doesn't have to grab the mutex.
+func (f *FakeSoundPlayer) PlaysCopy() []SoundName {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]SoundName, len(f.Plays))
+	copy(out, f.Plays)
+	return out
+}
+
 // ToastEvent is one recordable toast before suppression.
 type ToastEvent struct {
 	PaneID  string
 	TabID   string
-	Status  loop.PaneStatus
+	Status  string
 	Sound   SoundName
 	Message string
 	Now     time.Time
@@ -131,13 +140,13 @@ func (q *ToastQueue) SetFocusedTab(tabID string) {
 // accepted event with the resolved sound, or zero + false if
 // the event should be suppressed (duplicate within window or
 // focused tab).
-func (q *ToastQueue) Enqueue(paneID, tabID string, status loop.PaneStatus, message string) (ToastEvent, bool) {
+func (q *ToastQueue) Enqueue(paneID, tabID, status, message string) (ToastEvent, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	if tabID != "" && tabID == q.focusedTabID {
 		return ToastEvent{}, false
 	}
-	key := paneID + "|" + status.String()
+	key := paneID + "|" + status
 	now := q.Now()
 	if last, ok := q.lastSeen[key]; ok && now.Sub(last) < q.Window {
 		return ToastEvent{}, false
@@ -158,7 +167,7 @@ func (q *ToastQueue) Enqueue(paneID, tabID string, status loop.PaneStatus, messa
 // in the toast overlay. The caller is expected to call
 // Enqueue first; this helper is the convenience wrapper that
 // combines the two for runtime wiring.
-func (q *ToastQueue) Play(player SoundPlayer, paneID, tabID string, status loop.PaneStatus, message string) (ToastEvent, bool) {
+func (q *ToastQueue) Play(player SoundPlayer, paneID, tabID, status, message string) (ToastEvent, bool) {
 	event, ok := q.Enqueue(paneID, tabID, status, message)
 	if !ok {
 		return ToastEvent{}, false

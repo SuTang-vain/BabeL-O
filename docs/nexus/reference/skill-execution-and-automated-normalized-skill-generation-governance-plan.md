@@ -5,7 +5,8 @@
 - Status: Proposed
 - Scope: Nexus runtime, Go TUI slash commands, skill loader/matcher, context assembly, session events, tests, and documentation
 - Intended audience: BabeL-O runtime maintainers and prompt/agent architecture contributors
-- Last updated: 2026-06-15
+- Last updated: 2026-06-16
+- Related: `tool-governance-reference-integration.md` is the reader's map for the three tool-governance plans (granularity / expansion / skill). Any cross-document conflict should be arbitrated there. `tool-surface-expansion-and-native-mcp-coexistence-plan.md` §3.1.4 defers to this plan for `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave` naming.
 
 ## Executive summary
 
@@ -1239,3 +1240,29 @@ BabeL-O should be considered to have complete skill execution and automated norm
 8. Existing skill files are not overwritten silently.
 9. Skill metadata never bypasses tool policy.
 10. Tests cover loader, registry, validator, runtime injection, TUI commands, API endpoints, and persistence isolation.
+
+---
+
+## Related governance plans
+
+This plan is part of the tool-governance trilogy in `docs/nexus/reference/`:
+
+| 规划 | 路径 | 关系 |
+| --- | --- | --- |
+| **整合索引** | `tool-governance-reference-integration.md` | 读者地图：三角关系、共同术语、工具名映射、共同约束、冲突仲裁。任何跨文档冲突先查这里。 |
+| **边界治理** | `tool-granularity-and-evidence-governance-plan.md` | "既有工具职责分层 / 证据语义"：不新增 `Search` / `define_subagent` / `invoke_subagent`；§4.1 定位/理解/验证分层（ListDir / Glob / Grep / Read / Bash / Agent）。本规划与边界治理共享"不新增重复/模糊命名"约束（§5.1）。 |
+| **补齐治理** | `tool-surface-expansion-and-native-mcp-coexistence-plan.md` | "新工具 + native vs MCP 双轨注册表"：§3.1.4 `SkillList` / `SkillShow` 命名**以本规划为准**；§2.5 失败/拒绝语义（COMMAND_OUTPUT_LIMIT 模式）适用于本规划所有 Skill 工具；§2.4 持久化路径 env 控制同样适用于 Skill save。 |
+
+### 与本规划直接相关的引用点
+
+- **`SkillList` / `SkillShow` 命名**：补齐治理 §3.1.4 显式引用本规划 §Architecture proposal Layer 1 + Phase 6；本规划是命名权威。
+- **失败/拒绝语义**：补齐治理 §2.5（`errorCode` 登记 / 不 throw / soft timeout + AbortSignal）适用于本规划所有 Skill 工具的失败路径，包括 `SkillSave` 的写失败、`SkillDraft` 的 schema validation 失败、`SkillShow` 的 `SKILL_NOT_FOUND` 失败等。
+- **持久化路径 env 控制**：补齐治理 §2.4 规定的 `BABEL_O_CONFIG_FILE` / `BABEL_O_STORAGE_FILE` env 控制同样适用于 Skill save 的 project / user 路径解析（避免测试写真实 `~/.babel-o/skills/`）。
+- **测试隔离**：补齐治理 §8.1 通用守门同样适用于本规划 §Testing strategy 中的 security and persistence tests。
+- **会话事件**：`skill_matched` / `skill_invoked` / `skill_validation` / `skill_saved` 是本规划定义的 event type；补齐治理 §3.4 事件矩阵与本规划共享 `eventBase` 结构（`sessionId` / `eventTs` / `type`）。
+
+### 升级路径
+
+- 任何本规划与其他两份主规划的新冲突，按 `tool-governance-reference-integration.md` §6 的仲裁流程解决。
+- 仲裁无法覆盖时，先升级到整合文档新增仲裁规则；本规划 §Related governance plans 表同步更新。
+- 本规划**不**重开整合文档的三角关系或共同约束摘要；如需修订共同约束，必须先在整合文档 §5 落地，再回灌到本规划与另两份主规划。

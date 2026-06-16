@@ -1,8 +1,15 @@
 import { z } from 'zod'
 
+/**
+ * NOTE — Skill events live in `./skillEvents.ts` (`skill_matched` /
+ * `skill_invoked` / `skill_validation` / `skill_saved`) but are
+ * intentionally not part of this discriminated union. See skillEvents.ts
+ * for the rationale and re-integration plan.
+ */
+
 export const NEXUS_EVENT_SCHEMA_VERSION = '2026-05-21.babel-o.v1'
 
-const baseEventFields = {
+export const baseEventFields = {
   schemaVersion: z.literal(NEXUS_EVENT_SCHEMA_VERSION),
   sessionId: z.string(),
   timestamp: z.string(),

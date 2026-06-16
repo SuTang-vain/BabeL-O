@@ -28,6 +28,7 @@ export interface LoopCommandOptions {
   workspace: string
   state: string
   pollIntervalMs: string
+  healthIntervalMs: string
   waitTimeoutMs: string
   binary?: string
   sourceDir?: string
@@ -52,7 +53,8 @@ export function registerLoopCommand(program: Command): void {
     .option('--cwd <path>', 'Workspace directory', process.env.BABEL_O_LAUNCH_CWD ?? process.cwd())
     .option('--workspace <id>', 'Loop workspace id (auto-created on first run)', 'ws-default')
     .option('--state <path>', 'Override path for ~/.bbl/loop/state.json')
-    .option('--poll-interval-ms <ms>', 'Background /v1/runtime/loop/health poll interval', '5000')
+    .option('--poll-interval-ms <ms>', 'Background /v1/loop/workspaces reconcile interval', '5000')
+    .option('--health-interval-ms <ms>', 'Background /v1/runtime/loop/health poll interval', '3000')
     .option('--wait-timeout-ms <ms>', 'Max wait window per /v1/sessions/:id/wait call', '5000')
     .option('--no-alt', 'Disable terminal alternate screen')
     .option('--no-mouse', 'Do not capture mouse input')
@@ -215,6 +217,9 @@ export function buildLoopArgs(options: LoopCommandOptions): string[] {
   }
   if (options.pollIntervalMs) {
     args.push('--poll-interval-ms', options.pollIntervalMs)
+  }
+  if (options.healthIntervalMs) {
+    args.push('--health-interval-ms', options.healthIntervalMs)
   }
   if (options.waitTimeoutMs) {
     args.push('--wait-timeout-ms', options.waitTimeoutMs)

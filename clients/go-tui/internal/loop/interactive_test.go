@@ -85,6 +85,29 @@ func TestInteractiveViewRendersStatusBarAndPlaceholder(t *testing.T) {
 	}
 }
 
+func TestInteractiveViewAppliesRuntimeOptions(t *testing.T) {
+	model := NewInteractiveModel(NewLoopModel())
+	model.loop.Width = 80
+	model.loop.Height = 24
+
+	defaultView := model.View()
+	if !defaultView.AltScreen {
+		t.Fatal("default bbl loop view should use alt screen")
+	}
+	if defaultView.MouseMode != tea.MouseModeCellMotion {
+		t.Fatalf("default MouseMode = %v, want cell-motion capture", defaultView.MouseMode)
+	}
+
+	model.SetRuntimeOptionsForTest(false, false)
+	plainView := model.View()
+	if plainView.AltScreen {
+		t.Fatal("--alt=false should disable alt screen")
+	}
+	if plainView.MouseMode != tea.MouseModeNone {
+		t.Fatalf("--mouse=false MouseMode = %v, want none", plainView.MouseMode)
+	}
+}
+
 func TestInteractiveViewRendersFocusedPaneMetadata(t *testing.T) {
 	model := NewInteractiveModel(NewLoopModel())
 	model.loop.Width = 80
@@ -241,11 +264,11 @@ func TestInteractiveModelWithNilStoreIsSafe(t *testing.T) {
 
 func TestRawEventFromKeyMapsControlChords(t *testing.T) {
 	cases := []struct {
-		name     string
-		code     rune
-		mod      tea.KeyMod
-		wantKey  string
-		wantOK   bool
+		name    string
+		code    rune
+		mod     tea.KeyMod
+		wantKey string
+		wantOK  bool
 	}{
 		{"ctrl+n", 'n', tea.ModCtrl, "ctrl+n", true},
 		{"ctrl+w", 'w', tea.ModCtrl, "ctrl+w", true},

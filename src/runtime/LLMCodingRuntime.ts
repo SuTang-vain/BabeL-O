@@ -26,6 +26,14 @@ import {
 } from './compact.js'
 import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
+import {
+  buildTraceContext,
+  detectTriggers,
+  deriveRuleSelfAssessment,
+  flushBehaviorTraceQueue,
+  isBehaviorTraceEnabled,
+  queueBehaviorTraceEntry,
+} from './behaviorTrace.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
 import {
@@ -145,12 +153,29 @@ export class LLMCodingRuntime implements NexusRuntime {
     // orthogonally: allowedTools controls the *policy* (which tools
     // are isAllowed), while policyMode controls whether the
     // *hard-deny* gate fires for tools outside the allowlist.
+    let inner: AsyncIterable<NexusEvent>
     if (options.allowedTools && options.allowedTools.length > 0) {
       const overridePolicy = buildPerRequestAllowedToolsPolicy(options.allowedTools)
-      yield* this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
-      return
+      inner = this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
+    } else {
+      inner = this.runExecuteStreamInner(options)
     }
-    yield* this.runExecuteStreamInner(options)
+    // PR-3 (Track B Phase 1 wire, see docs/nexus/reference/behavior-monitor.md
+    // §5/§13): behaviorTrace tap. Best-effort side effect; never blocks or
+    // mutates the event stream. Opt-out via BABEL_O_BEHAVIOR_TRACE_ENABLED.
+    yield* this.withBehaviorTraceTap(options, inner)
+  }
+
+  // PR-3: behaviorTrace tap. Buffers events, runs detectTriggers on each
+  // yield, and queues BehaviorTraceEntry writes. Respects INV-4 (no
+  // silent injection — pure write-side, no model context mutation),
+  // INV-11 (does not touch natural_pause), and test config isolation
+  // (cwd comes from options, never from process.env.HOME).
+  private async *withBehaviorTraceTap(
+    options: RuntimeExecuteOptions,
+    source: AsyncIterable<NexusEvent>,
+  ): AsyncIterable<NexusEvent> {
+    yield* wrapWithBehaviorTraceTap(options, source)
   }
 
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
@@ -1304,4 +1329,74 @@ function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {
     return message.role === 'assistant'
   }
   return message.content.every(block => block.type === 'text' || block.type === 'tool_use')
+}
+
+// ─── PR-3: behaviorTrace tap (top-level exportable function) ──────────────
+//
+// Lives outside the LLMCodingRuntime class so it can be unit-tested without
+// instantiating a full runtime (and a real provider mock). Kept as a
+// top-level export to preserve orthogonality with behaviorTrace.ts
+// (see [[feedback-tool-boundary-granularity]]).
+//
+// Invariants:
+//   - INV-4: pure write-side; never mutates the inner event stream
+//   - INV-11: never touches natural_pause
+//   - test-config-isolation: cwd comes from RuntimeExecuteOptions, never
+//     from process.env.HOME
+export async function* wrapWithBehaviorTraceTap(
+  options: RuntimeExecuteOptions,
+  source: AsyncIterable<NexusEvent>,
+): AsyncIterable<NexusEvent> {
+  if (!isBehaviorTraceEnabled()) {
+    yield* source
+    return
+  }
+  const buffer: NexusEvent[] = []
+  let taskScopeGlob: string | undefined
+  let lastTaskScopeEventAt = -1
+  for await (const event of source) {
+    buffer.push(event)
+    if (event.type === 'task_scope_declared') {
+      const e = event as Extract<NexusEvent, { type: 'task_scope_declared' }>
+      const root = e.primaryRoot
+      if (typeof root === 'string' && root.length > 0) {
+        taskScopeGlob = root.endsWith('/**') ? root : `${root.replace(/\/+$/, '')}/**`
+        lastTaskScopeEventAt = buffer.length - 1
+      }
+    }
+    try {
+      // Only consider events that have been seen (suppress drift detection
+      // on the task_scope_declared event itself, which is the first event
+      // that establishes the scope).
+      const eventsForDetect = lastTaskScopeEventAt >= 0
+        ? buffer.slice(lastTaskScopeEventAt)
+        : buffer
+      const detected = detectTriggers({
+        events: eventsForDetect,
+        cwd: options.cwd,
+        sessionId: options.sessionId,
+        taskScope: taskScopeGlob,
+      })
+      for (const det of detected) {
+        const ctx = buildTraceContext({ events: buffer })
+        const sa = deriveRuleSelfAssessment(det.trigger, det.anomaly, { retryCount: ctx.retryCount })
+        queueBehaviorTraceEntry({
+          cwd: options.cwd,
+          sessionId: options.sessionId,
+          trigger: det.trigger,
+          triggerConfidence: det.confidence,
+          anomaly: det.anomaly,
+          context: ctx,
+          selfAssessment: sa,
+        })
+      }
+    } catch (error) {
+      logger.debug('behaviorTrace tap detection failed', error)
+    }
+    yield event
+  }
+  // Best-effort flush. Do not block event stream teardown.
+  void flushBehaviorTraceQueue().catch((error) => {
+    logger.debug('behaviorTrace flush failed', error)
+  })
 }

@@ -24,6 +24,9 @@ export type PaneStatus =
   | 'waiting'
   | 'drift'
   | 'done'
+  // PR-6: new status for cross-session behavior hints (Track B Phase 2).
+  // Per design §6.5.2 + INV-13: highest priority (6).
+  | 'behaviorHint'
 
 export interface PaneStatusSnapshot {
   status: PaneStatus
@@ -41,7 +44,13 @@ const STATUS_PRIORITY: Record<PaneStatus, number> = {
   done: 2,
   working: 1,
   idle: 0,
+  // PR-6: behaviorHint is highest priority (INV-13). When a session
+  // has a pending behavior hint, it overrides all 6 existing statuses.
+  behaviorHint: 6,
 }
+
+// Re-export for tests + callers that need to inspect priority ordering.
+export { STATUS_PRIORITY }
 
 export interface DerivePaneStatusOptions {
   /** Recent event slice from `storage.listEvents`. */
@@ -152,3 +161,80 @@ export function derivePaneStatus(
     lastEventAt,
   }
 }
+
+// ─── PR-6 (Track B Phase 2 bbl loop P1 integration) ─────────────────────
+//
+// Adds `behaviorHint` to PaneStatus without modifying the existing 6-status
+// projection. Per INV-12: existing statuses (idle/working/blocked/waiting/
+// drift/done) and their priority logic are preserved verbatim. The new
+// status is layered on via `applyBehaviorHint()` which takes the existing
+// snapshot as input.
+//
+// Per design (docs/nexus/reference/behavior-monitor.md §6.5.2):
+//   - StatusBehaviorHint is a NEW status (priority 6, highest)
+//   - When a behavior hint is pending, status overrides to behaviorHint
+//   - Three new fields exposed: pendingHints, lastHintAt, lastHintPattern
+//
+// INV-13: StatusBehaviorHint has highest priority (6)
+// INV-12: existing 6 statuses + priority logic unchanged
+// (Go mirror is a separate PR; this file is the server projection)
+
+import { DEFAULT_HINT_COOLDOWN_MS } from '../nexus/behaviorMonitor.js'
+
+export type BehaviorHintProjection = {
+  /** Number of undispatched behavior hints for this session. */
+  pendingHints: number
+  /** Timestamp of the most recent dispatched hint (ms since epoch). */
+  lastHintAt?: number
+  /** Pattern string of the most recent hint (e.g. "/repo/src/foo.ts"). */
+  lastHintPattern?: string
+  /** Pattern of the *new* hint that triggered this status (if any). */
+  currentHintPattern?: string
+}
+
+export interface PaneStatusSnapshotWithBehaviorHint extends PaneStatusSnapshot {
+  pendingHints: number
+  lastHintAt?: number
+  lastHintPattern?: string
+}
+
+const BEHAVIOR_HINT_PRIORITY = 6
+
+/**
+ * Layer behavior-hint projection on top of an existing PaneStatusSnapshot.
+ * Pure function: never mutates input, never touches storage.
+ *
+ * - When `behaviorHint` is null/undefined or pendingHints === 0, the
+ *   existing snapshot is returned unchanged (INV-12 preserved).
+ * - When pendingHints > 0, the status is overridden to 'behaviorHint'
+ *   (INV-13: highest priority).
+ * - `currentHintPattern` is the new hint pattern; `lastHintPattern` is
+ *   the most recent dispatched one.
+ */
+export function applyBehaviorHint(
+  snapshot: PaneStatusSnapshot,
+  behaviorHint: BehaviorHintProjection | null | undefined,
+): PaneStatusSnapshotWithBehaviorHint {
+  // Fast path: no behavior hint state — pass through unchanged.
+  if (!behaviorHint || behaviorHint.pendingHints <= 0) {
+    return {
+      ...snapshot,
+      pendingHints: 0,
+    }
+  }
+  // Decide whether to override: any pending hint that hasn't been
+  // confirmed by cooldown expiry. The actual "still relevant" gate is
+  // the caller's responsibility (BehaviorMonitor.tryDispatch enforces
+  // cooldown); here we trust the projection.
+  return {
+    ...snapshot,
+    status: 'behaviorHint',
+    pendingHints: behaviorHint.pendingHints,
+    lastHintAt: behaviorHint.lastHintAt,
+    lastHintPattern: behaviorHint.lastHintPattern,
+  }
+}
+
+// Re-export cooldown constant for callers that want to know the
+// freshness window.
+export { DEFAULT_HINT_COOLDOWN_MS, BEHAVIOR_HINT_PRIORITY }

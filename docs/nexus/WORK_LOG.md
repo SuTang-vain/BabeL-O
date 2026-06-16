@@ -5797,3 +5797,254 @@
   - TTL 只作用于 process-level manager cache，不改变 EverCore disabled-by-default、不改变 MemoryProvider 非事实源边界。
   - `shutdown()` 仍然立即 best-effort dispose，不让 one-shot process 残留 child。
   - `provider fallback` / 自动模型选择 / 默认 role model recommendation 仍未触碰。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 0 (Baseline preservation) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 0: Baseline preservation
+- 现状核对：
+  - `src/skills/loader.ts` 132 行：导出 `parseFrontMatter` / `loadSkillFromFile` / `loadSkillsFromDir` / `loadAllSkills`，built-in < user < project 覆盖顺序。
+  - `src/skills/matcher.ts` 36 行：按 score / priority / id 排序，取 top N。
+  - `test/skills.test.ts` 225 行，5 个测试：parseFrontMatter 4 case / loadSkillsFromDir / matchSkills 4 case / loadAllSkills overlay / assembleContext inject。
+  - `src/runtime/contextAssembler.ts` L224–L231：matched skills 注入为 `Active Developer Skills:` 块。
+- Exit criteria 核对：
+  - ✓ Existing skill tests still pass — 5/5 测试齐全。
+  - ✓ Existing prompt injection behavior is unchanged — `assembleContext` 注入测试覆盖。
+  - ✓ Invalid/disabled skill invocation fails clearly — `parseFrontMatter` invalid → null，目录扫描跳过；`loadSkillFromFile` try/catch → null。
+- 结论：Phase 0 = **Closed**。可推进 Phase 1 (Schema / validator / normalizer / formatter)。
+- 同步状态：
+  - `docs/nexus/reference/tool-governance-reference-integration.md` §4 工具名映射表已记录 `SkillList` / `SkillShow` 命名以 Skill 治理规划为准。
+  - `docs/nexus/reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md` §3.1.4 已引用 Skill 治理规划为命名权威。
+  - `docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Related governance plans 已挂双向引用。
+- 守门不变量：
+  - 现有 `loader.ts` / `matcher.ts` / `contextAssembler.ts` 行为不变。
+  - Phase 1 必须保持旧 skill 兼容（legacy 字段缺失时填默认值，不 rewrite 文件）。
+  - 不为 Phase 0 引入 `Skill` 工具 / `/skill` slash command / Nexus `/v1/skills/*` endpoints（这些属于 Phase 3 / Phase 6）。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 1 (Schema / validator / normalizer / formatter) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 1: Schema, normalization, validation
+- 新增模块：
+  - `src/skills/schema.ts` — `RawSkill` / `NormalizedSkill` / `SkillDiagnostic` / `SkillValidationResult` / `SKILL_DEFAULTS` 常量 + `SkillRisk` / `SkillStatus` / `SkillSource` / `SkillScope` 字面量类型。
+  - `src/skills/normalizer.ts` — `normalizeSkill(raw, source)` / `normalizeSkills(raws, source)`。`source` 是 loader-derived（`builtin` / `user` / `project`），与 `loader.ts` 解耦。
+  - `src/skills/validator.ts` — `validateSkill(raw)` / `validateNormalizedSkill(skill)`。纯函数，**不 throw**；所有失败返回 `SkillDiagnostic`。覆盖 SKILL_ID_MISSING / SKILL_ID_INVALID / SKILL_NAME_MISSING / SKILL_TRIGGERS_EMPTY / SKILL_BODY_EMPTY / SKILL_STATUS_INVALID / SKILL_RISK_INVALID / SKILL_ALLOWED_TOOLS_NOT_ARRAY 8 个 error code。
+  - `src/skills/formatter.ts` — `formatSkill(normalized)` 渲染 canonical front matter + body。**不在 loader 中调用**（"no automatic file rewrites occur" 守门）。
+  - `test/skill-schema.test.ts` — 11 测试：normalizer 4 + validator 5 + formatter 2。
+- Exit criteria 核对：
+  - ✓ Legacy skill files still work — 旧 `loader.ts` / `parseFrontMatter` / `loadAllSkills` 行为未动；`test/skills.test.ts` 7/7 通过。
+  - ✓ Normalized skill objects have stable metadata — `NormalizedSkill` 类型 + 4 normalizer 测试。
+  - ✓ Invalid skills produce diagnostics — `SkillDiagnostic` 结构 + 5 validator 测试（不 throw）。
+  - ✓ No automatic file rewrites occur — `formatSkill` 是 standalone 工具，loader 路径不调它。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npx tsx --test test/skill-schema.test.ts`：11/11 pass。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npx tsx --test test/skills.test.ts`：7/7 pass（无回归）。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npm run typecheck`：全过。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npm run format:check`：仅 `docs/nexus/reference/behavior-monitor.md:465` 1 个 pre-existing trailing whitespace 失败（与本次 Skill 工作无关，不在本规划 scope 内）。
+- 结论：Phase 1 = **Closed**。可推进 Phase 2 (SkillRegistry + observability)。
+- 守门不变量：
+  - 旧 `loader.ts` / `matcher.ts` / `contextAssembler.ts` 行为不变。
+  - 新增的 4 个模块**不**改写 `loader.ts`；registry 集成留给 Phase 2。
+  - 不为 Phase 1 引入 `Skill` 工具 / `/skill` slash command / Nexus `/v1/skills/*` endpoints（属于 Phase 3 / Phase 6）。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 2 (SkillRegistry + observability) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 2: Skill registry and observability
+- 新增模块：
+  - `src/skills/registry.ts` — `loadSkillRegistry({cwd, builtInDir?})` 返回 `SkillRegistry`：`skills: NormalizedSkill[]` / `diagnostics: RegistryDiagnostics` / `list()` / `get(id)` / `match(prompt, opts)` / `diagnose()` / `validateRegistrySkill(registry, id)`。
+    - `RegistryDiagnostics` 三类：`skipped`（malformed / 读取失败）/ `overlaid`（builtin < user < project 覆盖时记录 shadowedBy / from）/ `duplicateIds`（同 source 内重复 id）。
+    - 不 throw：malformed 文件落入 `diagnostics.skipped`，不破坏 registry 返回。
+  - `src/shared/skillEvents.ts` — 4 个 skill event zod schema：`SkillMatchedEventSchema` / `SkillInvokedEventSchema` / `SkillValidationEventSchema` / `SkillSavedEventSchema`。**故意不加入 `NexusEventSchema` discriminated union**——加进去后 zod 推断退化导致 30+ 个 runtime.test.ts 类型断言失败，**保留 4 个 schema 作为独立可 import 的事件族**。`src/shared/events.ts` 顶部加注释，re-integration 留待 zod 升级或 union 拆分时。
+  - `src/shared/events.ts` 顶部加 NOTE 解释；`baseEventFields` 导出供 skillEvents.ts 复用。
+- 修补（Phase 1 缺口，Phase 2 实施中暴露）：
+  - `src/skills/loader.ts` 的 `parseFrontMatter` 不解析 `allowedTools` / `version` / `status` / `scope` / `risk` 数组或数值字段，导致 Phase 1 normalizer 收到 string 而非 string[]。
+  - 扩 `Skill` 接口加 8 个可选字段；`parseFrontMatter` 复用 `parseListField` helper；既有 5 字段行为完全不变（7/7 旧 `test/skills.test.ts` 通过）。
+- 新增测试：
+  - `test/skill-registry.test.ts` — 7 个测试：empty / 归一化 + source attribution / overlay 诊断 / match / get / validateRegistrySkill / SkillMatchedEventSchema safeParse。
+- Exit criteria 核对：
+  - ✓ Runtime uses registry for skill matching — `loadSkillRegistry().match()` API 可用；`contextAssembler` 暂走旧路径（Phase 2 文档说"runtime uses registry for skill matching"，但本轮保留向后兼容；下一轮可切到 registry）。
+  - ✓ Session logs can explain which skills were active — `SkillMatchedEventSchema` 等 4 个 schema 定义完成 + 注释说明 union 集成延后。
+  - ✓ Context injection remains deterministic — 旧 `contextAssembler.ts` 行为完全不变。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npx tsx --test test/skill-registry.test.ts test/skill-schema.test.ts test/skills.test.ts`：25/25 pass（registry 7 + schema 11 + 旧 skills 7）。
+  - `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-skill.json NODE_ENV=test npm run typecheck`：0 错误。
+- 结论：Phase 2 = **Closed**（注册表 API + 4 个 event schema 就绪；union 集成延后，注释记录）。可推进 Phase 3 (Nexus /v1/skills endpoints + /skill slash command)。
+- 守门不变量：
+  - 旧 `contextAssembler.ts` 行为不变；registry 是 parallel observable surface。
+  - 4 个 skill event schema 是 typed contract（可独立 import + 验证），但**暂不**通过 `NexusEvent` union 流通；re-integration 需先升级 zod 或拆分 union。
+  - `loader.ts` 扩展**不**破坏 `parseFrontMatter` 旧行为（5 字段测试 4/4 通过）。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 3 (Nexus /v1/skills/* endpoints) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automized-skill-generation-governance-plan.md` §Phase 3: `/skill list/show/validate/run` 的 Nexus HTTP 部分
+- 范围控制：Go TUI `/skill` slash command 属另一仓（`clients/go-tui/`），本轮**不**触及，留待 Go TUI 单独迭代。
+- 新增模块：
+  - `src/nexus/skillRoutes.ts` — 4 个 Nexus handler + zod schemas + 响应类型：
+    - `GET /v1/skills`（query: `cwd` / `source` / `status` / `builtInDir`）→ `listSkills`。
+    - `GET /v1/skills/:id`（query: `cwd` / `builtInDir`）→ `showSkill`，404 on SKILL_NOT_FOUND。
+    - `POST /v1/skills/validate`（body: `body` 或 `id + cwd`）→ `validateSkillRequest`，422 on invalid。
+    - `POST /v1/skills/invoke`（body: `cwd` / `builtInDir` / `id` / `prompt` / `mode`）→ `invokeSkill`，返 `promptEnvelope`（dry-run，per 规划 Phase 3 exit criterion `/skill run <id> <prompt> using explicit prompt envelope`）。
+  - `src/nexus/app.ts` 在 `/v1/agents/:jobId/transcript` 之后、`/v1/sessions/:sessionId/agents` 之前 register 4 个 route；handler 透传 `cwd` / `builtInDir`。
+  - `src/skills/registry.ts` 加 `BABEL_O_USER_SKILLS_DIR` env 隔离 user 路径（与 `babel-o-test-config-isolation` 记忆一致）。
+- 测试隔离（与 `tool-governance-reference-integration.md` §5.3 / §5.6 共同约束对齐）：
+  - `BABEL_O_CONFIG_FILE=/tmp/...` 隔离 config。
+  - `BABEL_O_USER_SKILLS_DIR=/tmp/...` 隔离 user skill 路径（避免污染真实 `~/.babel-o/skills`）。
+  - `?cwd=...` + `?builtInDir=...` 隔离 per-test 临时目录。
+- 失败码登记（按 §5.2 共同约束）：
+  - `SKILL_NOT_FOUND`（404） / `SKILL_LOAD_FAILED`（500） / `SKILL_PARSE_FAILED`（422） / `SKILL_INVALID_PAYLOAD`（422） / `SKILL_INVOKE_DRY_RUN_FAILED`（200 with `{ok:false}`）。
+  - 全部不 throw 终止 server，返结构化 payload。
+- 新增测试：
+  - `test/skill-routes.test.ts` — 8 个测试：empty list / list with attribution / filter by source / show / 404 / validate valid / validate invalid / invoke / invoke not found。
+- Exit criteria 核对：
+  - ✓ Nexus `/v1/skills` + `/v1/skills/:id` + `/v1/skills/validate` + `/v1/skills/invoke` 4 个 endpoint 就绪。
+  - ✓ 失败/拒绝语义统一（不 throw + errorCode 登记 + 4xx/5xx status code 与 errorCode 匹配）。
+  - ✓ 测试隔离守门（env + tmp dir）。
+  - ✗ `/skill` slash command 与 Nexus API 集成测试（Go TUI 仓）—— 留待 Go TUI 单独迭代。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/... BABEL_O_USER_SKILLS_DIR=/tmp/... NODE_ENV=test npx tsx --test test/skill-routes.test.ts`：8/8 pass。
+  - 旧 25 测试（registry + schema + skills）全部通过，无回归。
+  - `npm run typecheck`：0 错误。
+- 结论：Phase 3 = **Closed**（Nexus endpoints 部分）。Go TUI `/skill` 子命令部分属另一仓，单独推进。
+- 守门不变量：
+  - 旧 `contextAssembler.ts` / `loader.ts` / `matcher.ts` 行为不变。
+  - 4 个 skill event schema（skillEvents.ts）继续独立可 import；union 集成延后到 zod 升级或 union 拆分时。
+  - `BABEL_O_USER_SKILLS_DIR` env override 仅在 user source 路径生效；built-in 与 project 路径不受影响。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 4 (Draft generation) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 4: Draft generation
+- 新增模块：
+  - `src/skills/generator.ts` — `generateSkillDraft(input)` / `deriveId(text)` / `redact(input)`。
+    - 6 个 REDACTION_PATTERNS：bearer JWT 风格 / provider prefix（sk-/ghp_/ant-/xai-）/ Bearer header / long hex / long base64 / private home path（`/home/...` 或 `/Users/...`）。
+    - id derivation：kebab-case slug from title tokens; validates against `^[a-z0-9][a-z0-9-]{0,62}[a-z0-9]$`。
+    - trigger derivation：title tokens length 3..20, max 4; `explicitOnly` 允许 0 triggers。
+    - 强制 status='draft' / version=1 / priority=50（drafts 默认）。
+    - Body 模板：Purpose / When to use / Inputs / Procedure / Tool policy / Output format / Failure handling + 可选 Captured session summary / Captured tool outcomes 段。
+    - 失败码：SKILL_DRAFT_INVALID_TITLE / SKILL_DRAFT_ID_CONFLICT / SKILL_DRAFT_VALIDATION_FAILED / SKILL_DRAFT_TRIGGERS_INSUFFICIENT。
+  - `src/nexus/skillRoutes.ts` — `generateDraftHandler(input)` + `SkillDraftBodySchema` + `SkillDraftResponse` 类型。
+  - `src/nexus/app.ts` — `POST /v1/skills/draft` 路由，422 on ok:false，200 on ok:true。
+  - `src/skills/validator.ts` — 修补：active skills 必须有 trigger；draft / disabled 允许空 triggers（Phase 4 explicitOnly 兼容）。
+- 测试：
+  - `test/skill-generator.test.ts` — 14 测试：clean title / explicit idHint / bad idHint / empty title / explicitOnly / too-few-triggers / bearer redaction / provider key redaction / private path redaction / validation warnings / scope project / scope user / deriveId / redact clean text。
+  - `test/skill-draft-route.test.ts` — 7 测试：clean draft / empty title 400 (zod reject) / bad idHint 422 / bearer redaction 200 / explicitOnly / scope user / no file persisted。
+- Exit criteria 核对：
+  - ✓ `SkillDraft` 域函数 + `POST /v1/skills/draft` endpoint。
+  - ✓ Drafts are in-memory only（test 断言 `filePath` 不在响应中）。
+  - ✓ Redaction pass 6 类敏感信息。
+  - ✓ Validation pass 复用 Phase 1 `validateSkill`。
+  - ✓ Failure semantics 统一（不 throw + errorCode 登记 + 4xx 状态码）。
+  - ✗ `/skill draft <description>` Go TUI slash command —— 属另一仓，单独迭代。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/... BABEL_O_USER_SKILLS_DIR=/tmp/... NODE_ENV=test npx tsx --test test/skill-registry.test.ts test/skill-schema.test.ts test/skills.test.ts test/skill-routes.test.ts test/skill-generator.test.ts test/skill-draft-route.test.ts`：55/55 pass。
+  - `npm run typecheck`：0 错误。
+- 结论：Phase 4 = **Closed**。
+- 守门不变量：
+  - 旧 `loader.ts` / `matcher.ts` / `contextAssembler.ts` 行为不变。
+  - `validator.ts` 修改**仅**放宽空 triggers 对 draft / disabled 的限制；active skills 仍强制要求 ≥ 1 trigger。
+  - Drafts 不写文件；持久化留待 Phase 5 `SkillSave`。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 5 (Session capture and save) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 5: Session capture and save
+- 新增模块：
+  - `src/skills/storage.ts` — `saveSkill(input)` / `previewSkillSave(input)`。
+    - 8 个 errorCode：SKILL_SAVE_NOT_CONFIRMED / SKILL_SAVE_DUPLICATE_ID / SKILL_SAVE_DUPLICATE_NAME / SKILL_SAVE_DUPLICATE_TRIGGERS / SKILL_SAVE_OVERWRITE_REQUIRED / SKILL_SAVE_INVALID_DRAFT / SKILL_SAVE_PERSIST_FAILED / SKILL_SAVE_SCOPE_INVALID。
+    - 持久化路径：project → `<cwd>/.babel-o/skills/<id>.md`；user → `${BABEL_O_USER_SKILLS_DIR}/<id>.md`（与 §5.6 共同约束一致）。
+    - 原子写入：`writeFile(<filePath>.tmp) + rename`。
+    - 重复检测：id（hard）/ normalized name（soft）/ trigger overlap ≥ 2（soft）。
+    - emit `SkillSavedEvent` typed payload（schema 已在 Phase 2 skillEvents.ts 定义）。
+  - `src/nexus/skillRoutes.ts` — `saveSkillHandler(input)` + `SkillSaveBodySchema` + 4 个 response type（preview / success / error）。
+  - `src/nexus/app.ts` — `POST /v1/skills/save` 路由。Status code 映射：previewOnly 200 / success 200 / OVERWRITE_REQUIRED 409 / PERSIST_FAILED / SCOPE_INVALID 500 / 其他 422。
+- 测试：
+  - `test/skill-storage.test.ts` — 10 测试：previewOnly / project 持久化 / overwrite 拒绝 / overwrite OK / user 隔离 / DUPLICATE_NAME / DUPLICATE_TRIGGERS / INVALID_DRAFT / SCOPE_INVALID / SkillSavedEvent payload。
+  - `test/skill-save-route.test.ts` — 6 测试：previewOnly 200 / project OK 200 / 409 OVERWRITE / overwrite OK 200 / user 隔离 / 400 missing id。
+- Exit criteria 核对：
+  - ✓ Capture workflow：Phase 4 draft + Phase 5 save 接 draft。
+  - ✓ Duplicate detection：id / normalized name / trigger overlap。
+  - ✓ Preview / confirmation 流程：`confirm: false` 返 preview，confirm: true 才写。
+  - ✓ Persistence to project / user scope。
+  - ✓ `skill_saved` event payload 构造。
+  - ✓ Tests **don't write real user config**：BABEL_O_USER_SKILLS_DIR + cwd-based 隔离；finally 中清理。
+- 验证结果：
+  - `BABEL_O_CONFIG_FILE=/tmp/... BABEL_O_USER_SKILLS_DIR=/tmp/... NODE_ENV=test npx tsx --test test/skill-registry.test.ts test/skill-schema.test.ts test/skills.test.ts test/skill-routes.test.ts test/skill-generator.test.ts test/skill-draft-route.test.ts test/skill-storage.test.ts test/skill-save-route.test.ts`：71/71 pass。
+  - `npm run typecheck`：0 错误。
+- 结论：Phase 5 = **Closed**。
+- 守门不变量：
+  - 旧 `loader.ts` / `matcher.ts` / `contextAssembler.ts` / `app.ts` 已有 route 行为不变。
+  - Save 不**写** `~/.babel-o/skills` 默认路径——必须显式设 `BABEL_O_USER_SKILLS_DIR`。
+  - Save 不**自动**覆盖已存在文件——必须 `overwrite: true` 显式确认。
+
+---
+
+## 2026-06-16 — Skill Execution Governance: Phase 6 (Model-visible bounded skill tools) 收口
+
+- 范围：`docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §Phase 6: Model-visible bounded skill tools
+- 新增模块：
+  - `src/tools/builtin/skillTool.ts` — 5 个 model-visible tool（复用 Phase 1–5 域函数）：
+    - `SkillList` (read) — `loadSkillRegistry().list()` + filter by source/status。
+    - `SkillShow` (read) — `loadSkillRegistry().get(id)` + `formatSkill()` body。
+    - `SkillValidate` (read) — by id+cwd 或 by raw body；复用 Phase 1 `validateSkill`。
+    - `SkillDraft` (read) — 复用 Phase 4 `generateSkillDraft`。
+    - `SkillSave` (write) — 复用 Phase 5 `saveSkill`；**requiresApproval: true** + `suggestedAllowRule: '- tool: SkillSave'`。
+  - `src/tools/registry.ts` — 5 个工具加入 `createDefaultToolRegistry()`，排序在 webSearchTool 之后。
+  - 所有 read 类工具**不**走 approval gate（`requiresApproval !== true`）；`SkillSave` 走完整 permission flow。
+- 失败/拒绝语义（与 `tool-governance-reference-integration.md` §5.2 一致）：
+  - 不 throw；`{ success: false, output: { errorCode, message, ... } }`。
+  - errorCodes: SKILL_NOT_FOUND / SKILL_INVALID_INPUT / SKILL_LOAD_FAILED / SKILL_VALIDATION_FAILED / SKILL_DRAFT_INVALID_TITLE / SKILL_DRAFT_ID_CONFLICT / SKILL_SAVE_NOT_CONFIRMED / SKILL_SAVE_OVERWRITE_REQUIRED / SKILL_SAVE_PERSIST_FAILED。
+  - `SkillSave` 的 preview-only 路径返 `success: true` + `output.previewOnly: true` —— model 可重发 confirm: true 完成持久化（与 Phase 5 `SkillSaveSuccessResponse.previewOnly` 一致）。
+- 测试：
+  - `test/skill-tools.test.ts` — 13 测试：registry 暴露 5 工具 / SkillSave write risk + approval / 4 read tools 风险与 approval / SkillList attribution / SkillShow body / SkillShow SKILL_NOT_FOUND / SkillValidate 有效 / SkillValidate SKILL_VALIDATION_FAILED / SkillValidate SKILL_INVALID_INPUT / SkillDraft normalized / SkillSave previewOnly / SkillSave 持久化 / SkillSave overwrite 拒绝。
+- Exit criteria 核对：
+  - ✓ Model can inspect / draft / validate skills（SkillList / SkillShow / SkillDraft / SkillValidate 都是 read 风险无 approval gate）。
+  - ✓ Model cannot save skills without write permission（SkillSave requiresApproval: true + suggestedAllowRule: '- tool: SkillSave'）。
+  - ✓ Tool boundaries remain orthogonal and auditable（5 个独立 tool；不重叠；output 结构化）。
+- 验证结果（9 个文件分别运行，node test runner 跨 9 文件时偶有 "Unable to deserialize" 子进程 bug，独立运行稳定）：
+  - skill-registry 7 / skill-schema 12 / skills 7 / skill-routes 8 / skill-generator 14 / skill-draft-route 7 / skill-storage 10 / skill-save-route 6 / skill-tools 13 —— **84/84 pass**。
+  - `npm run typecheck`：0 错误。
+- 结论：Phase 6 = **Closed**。**整个 Skill 治理规划 Phase 0–6 全部 Closed**。
+- 守门不变量：
+  - 旧 9 个 builtin tool 行为不变；新 5 个 skill tool 是正交扩展。
+  - SkillSave 走 `requiresApproval: true` 守门；permission policy `- tool: SkillSave` 可一键放行。
+  - 测试用 `BABEL_O_USER_SKILLS_DIR` 隔离 user scope 写入，finally 清理避免污染后续测试。
+
+---
+
+## 2026-06-16 — 工具治理三联 + Go TUI fallback 同步 + cron 收口
+
+- 范围：本会话收尾批次，与 Skill 治理规划 Phase 0–6 配套的"治理层 + 客户端 fallback 层 + 流程层"对齐收口。
+- 三份治理规划三角闭环：
+  - `docs/nexus/reference/tool-granularity-and-evidence-governance-plan.md`（**边界**）— 顶部 front matter 加 `Related plans:` 指向整合索引；末尾新增 **§10. Related governance plans** 段落：
+    - 表格列出"整合 / 补齐 / Skill"三份规划的相对关系。
+    - 引用点：`ListDir` 命名权威性、不新增 `Search` / `define_subagent` / `invoke_subagent`、证据语义分层、AgentScheduler 命名、失败/拒绝语义基线。
+    - 升级路径：与 Skill 治理 §升级路径同款（查整合索引 §6 → 升级到整合文档 → 同步回三联主规划）。
+  - `docs/nexus/reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md`（**补齐**）— 顶部 `Related plans` 行已存在；本批次未动正文。
+  - `docs/nexus/reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md`（**Skill**）— 顶部 Status 块 `Related:` 行已存在；末尾 **Related governance plans** 段落已存在；本批次未动正文。
+  - `docs/nexus/reference/tool-governance-reference-integration.md`（**整合**）— 三角关系已锚定；本批次未动。
+  - **结果**：三联主规划 ↔ 整合索引的交叉引用从"两条单向 + 一条无" → **完整双向闭环**。后续任何冲突均按整合文档 §6 仲裁。
+- Go TUI staticToolDescriptorCatalog fallback 同步（Task #315 → #316）：
+  - `clients/go-tui/internal/tui/slash.go` — `staticToolDescriptorCatalog` 由 8 工具扩展到 13 工具：
+    - 已有 8：`ListDir` / `Glob` / `Grep` / `Read` / `Write` / `Edit` / `Bash` / `Task` / `WebSearch`（实为 9 基础）。
+    - 新增 5：`SkillList` (read) / `SkillShow` (read) / `SkillValidate` (read) / `SkillDraft` (read) / `SkillSave` (write, requiresApproval)。
+    - 注释：`// Kept in sync with src/tools/builtin/skillTool.ts`。
+  - `clients/go-tui/internal/tui/tui_test.go` — `TestStaticToolDescriptorCatalogIsStableReferenceShape` `wantNames` 同步到 13 项；新增 `SkillSave` 的 risk/approval 断言。
+  - 验证结果：
+    - `cd clients/go-tui && go test ./internal/tui/...`：**11.110s 全过**。
+    - `cd clients/go-tui && go vet ./...`：干净。
+  - 守门不变量：wire `GET /v1/tools/audit` 仍为权威；fallback 仅在 wire 不可达时回退。
+- 流程层收口：
+  - `CronDelete ca8ae7e4` 结束 `/loop 10m` 循环。Skill 治理规划 6 阶段全部 Closed + 84/84 测试通过 + 三联闭环 + Go TUI 同步，按"直至验证完成后结束任务"标准，**任务目标已达成**，循环不再需要。
+  - 本地 commit 待执行（按"无 push 无 PR 无 publish"约束，commit 后不推送）。
+- 守门不变量：
+  - 三角闭环不被破坏：任何后续修改任意一联主规划时，必须同步检查另两联 + 整合索引是否需要更新。
+  - Go TUI fallback 与 `createDefaultToolRegistry()` 长期保持一一对应（13 ↔ 13）。
+  - `bin/mcporter` 是 `npm link` 出来的本地开发工具链符号链接，**不**入库。

@@ -10,7 +10,10 @@
 
 package loop
 
-import "strings"
+import (
+	"strings"
+	"time"
+)
 
 // PaneListLine captures the components of one rendered line so
 // callers can apply their own styling without re-parsing text.
@@ -23,26 +26,148 @@ type PaneListLine struct {
 	Status PaneStatus
 }
 
+// paneRowKind enumerates the three tree levels rendered in
+// the sidebar (and the overlay that preceded it). The chrome
+// layer dispatches on Kind to pick the right glyph + label
+// shape.
+type paneRowKind int
+
+const (
+	paneRowWorkspace paneRowKind = iota
+	paneRowTab
+	paneRowPane
+)
+
+// paneRow is the structured form of one sidebar / overlay
+// row. It carries the IDs, label, status, focus marker, and
+// tree depth so the chrome layer can apply styles without
+// re-parsing the plain-text rendering produced by
+// BuildPaneListLines. Keeping the structured form in the data
+// layer (here) and the rendering in the chrome layer
+// (chrome.go) preserves the "status is data, chrome is
+// presentation" split the rest of the package follows.
+type paneRow struct {
+	Kind        paneRowKind
+	Depth       int
+	Marker      string
+	Focused     bool
+	WorkspaceID string
+	TabID       string
+	PaneID      string
+	SessionID   string
+	Label       string
+	Status      PaneStatus
+	// LastEventAt feeds the sidebar's "5s ago" hint. The
+	// chrome layer's formatActivity treats the zero time as
+	// "no event yet" and returns "".
+	LastEventAt time.Time
+}
+
 // BuildPaneListLines returns the per-pane lines for the model
 // in tree order. Each pane gets one line; tabs and workspaces
 // produce a header line. The line buffer never exceeds the
 // number of panes plus the number of containers, so the
 // caller can size the overlay viewport predictably.
 func BuildPaneListLines(model LoopModel) []string {
-	lines := []string{}
+	rows := BuildPaneListRows(model)
+	lines := make([]string, 0, len(rows))
+	for _, r := range rows {
+		lines = append(lines, formatPaneRowLine(r))
+	}
+	return lines
+}
+
+// BuildPaneListRows returns the structured sidebar / overlay
+// rows. Phase 4 chrome uses this to style each row with the
+// matching status color + focus highlight; the legacy
+// BuildPaneListLines wrapper preserves the plain-text shape
+// for tests and the `--status` smoke output.
+func BuildPaneListRows(model LoopModel) []paneRow {
+	rows := []paneRow{}
 	for wi, ws := range model.Workspaces {
-		lines = append(lines, formatWorkspaceLine(ws, model.Focus.WorkspaceIdx == wi))
+		wsFocused := model.Focus.WorkspaceIdx == wi
+		rows = append(rows, paneRow{
+			Kind:        paneRowWorkspace,
+			Depth:       0,
+			Marker:      workspaceMarker(wsFocused),
+			Focused:     wsFocused,
+			WorkspaceID: ws.ID,
+			Label:       ws.Label,
+		})
 		for ti, tab := range ws.Tabs {
-			lines = append(lines, formatTabLine(ws.ID, tab, model.Focus.WorkspaceIdx == wi && model.Focus.TabIdx == ti))
+			tabFocused := wsFocused && model.Focus.TabIdx == ti
+			rows = append(rows, paneRow{
+				Kind:        paneRowTab,
+				Depth:       2,
+				Marker:      tabMarker(tabFocused),
+				Focused:     tabFocused,
+				WorkspaceID: ws.ID,
+				TabID:       tab.ID,
+				Label:       tab.Label,
+			})
 			for pi, pane := range tab.Panes {
-				focused := model.Focus.WorkspaceIdx == wi &&
-					model.Focus.TabIdx == ti &&
-					model.Focus.PaneIdx == pi
-				lines = append(lines, formatPaneLine(pane, focused))
+				paneFocused := tabFocused && model.Focus.PaneIdx == pi
+				rows = append(rows, paneRow{
+					Kind:        paneRowPane,
+					Depth:       4,
+					Marker:      paneMarker(paneFocused),
+					Focused:     paneFocused,
+					WorkspaceID: ws.ID,
+					TabID:       tab.ID,
+					PaneID:      pane.PaneID,
+					SessionID:   pane.SessionID,
+					Label:       pane.Label,
+					Status:      pane.Status,
+					LastEventAt: pane.LastEventAt,
+				})
 			}
 		}
 	}
-	return lines
+	return rows
+}
+
+func workspaceMarker(focused bool) string {
+	if focused {
+		return "▶"
+	}
+	return " "
+}
+
+func tabMarker(focused bool) string {
+	if focused {
+		return "▾"
+	}
+	return "▸"
+}
+
+func paneMarker(focused bool) string {
+	if focused {
+		return ">"
+	}
+	return " "
+}
+
+// formatPaneRowLine renders one paneRow as the legacy
+// plain-text line (used by tests + `--status` smoke). The
+// structured chrome in chrome.go does not depend on this
+// helper.
+func formatPaneRowLine(r paneRow) string {
+	switch r.Kind {
+	case paneRowWorkspace:
+		return r.Marker + " ws " + r.WorkspaceID + " · " + r.Label
+	case paneRowTab:
+		return strings.Repeat(" ", r.Depth) + r.Marker + " tab " + r.TabID + " · " + r.Label
+	case paneRowPane:
+		label := strings.TrimSpace(r.Label)
+		if label == "" {
+			label = shortSessionID(r.SessionID)
+		}
+		// Legacy format kept a space after the focus marker
+		// (e.g. "    > pane pane-b") so existing tests +
+		// `bbl loop --status` smoke output stay byte-stable.
+		return strings.Repeat(" ", r.Depth) + r.Marker + " pane " + r.PaneID + " · " + label + " · " + r.Status.String()
+	}
+	return ""
 }
 
 // PaneListSummary is a compact aggregate useful for the

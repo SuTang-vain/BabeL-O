@@ -24,17 +24,18 @@ const Version = "0.1.0-loop-alpha"
 // the loop driver. Phase 2a only reads the values; the consumer
 // wiring lives in subsequent sub-steps.
 type Config struct {
-	BaseURL       string
-	Cwd           string
-	SessionID     string
-	StatePath     string
-	WorkspaceID   string
-	PollIntervalMs int
-	WaitTimeoutMs  int
-	AltScreen     bool
-	MouseCapture  bool
-	APIKey        string
-	PrintVersion  bool
+	BaseURL          string
+	Cwd              string
+	SessionID        string
+	StatePath        string
+	WorkspaceID      string
+	PollIntervalMs   int
+	HealthIntervalMs int
+	WaitTimeoutMs    int
+	AltScreen        bool
+	MouseCapture     bool
+	APIKey           string
+	PrintVersion     bool
 }
 
 // VersionString renders the loop driver version for `--version`.
@@ -58,7 +59,7 @@ func runSmoke(cfg Config, sink io.Writer) error {
 	fmt.Fprintf(sink, "bbl loop %s\n", Version)
 	fmt.Fprintf(sink, "  url=%s cwd=%s workspace=%s state=%s\n",
 		cfg.BaseURL, cfg.Cwd, cfg.WorkspaceID, cfg.StatePath)
-	fmt.Fprintf(sink, "  pollIntervalMs=%d waitTimeoutMs=%d altScreen=%v mouse=%v\n",
-		cfg.PollIntervalMs, cfg.WaitTimeoutMs, cfg.AltScreen, cfg.MouseCapture)
+	fmt.Fprintf(sink, "  pollIntervalMs=%d healthIntervalMs=%d waitTimeoutMs=%d altScreen=%v mouse=%v\n",
+		cfg.PollIntervalMs, cfg.HealthIntervalMs, cfg.WaitTimeoutMs, cfg.AltScreen, cfg.MouseCapture)
 	return nil
 }

@@ -56,6 +56,15 @@ func staticToolDescriptorCatalog() []toolDescriptor {
 		{name: "Grep", risk: "read", source: "builtin", approval: false, summary: "search for a regex in workspace"},
 		{name: "WebSearch", risk: "read", source: "builtin", approval: false, summary: "search the public web"},
 		{name: "TaskCreate", risk: "task", source: "builtin", approval: true, summary: "create a tracked task"},
+		// Skill tools (Phase 6 of the Skill execution governance plan).
+		// Kept in sync with src/tools/builtin/skillTool.ts so the fallback
+		// catalog (used when /v1/tools/audit is unreachable) does not
+		// silently drop the 5 bounded skill tools.
+		{name: "SkillList", risk: "read", source: "builtin", approval: false, summary: "list visible skills"},
+		{name: "SkillShow", risk: "read", source: "builtin", approval: false, summary: "show a single skill with body"},
+		{name: "SkillValidate", risk: "read", source: "builtin", approval: false, summary: "validate a skill (by id or body)"},
+		{name: "SkillDraft", risk: "read", source: "builtin", approval: false, summary: "generate a normalized skill draft (in-memory)"},
+		{name: "SkillSave", risk: "write", source: "builtin", approval: true, summary: "persist a skill draft to disk"},
 	}
 }
 

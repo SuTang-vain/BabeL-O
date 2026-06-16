@@ -3,6 +3,7 @@
 > Status: P2 partially implemented — `ListDir` landed; TypeScript `Grep` fallback regex/no-result diagnostics landed
 > Priority: P2 unless promoted by a real-session regression
 > Scope: built-in tool granularity, `ListDir` / `Glob` / `Grep` / `Read` evidence semantics, and AgentScheduler tool naming governance
+> Related plans: `tool-governance-reference-integration.md` is the reader's map for the three tool-governance plans (granularity / expansion / skill); this file is the *boundary* counterpart to `tool-surface-expansion-and-native-mcp-coexistence-plan.md` (the *expansion* counterpart) and is the granularity basis that `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` §5 Layer 5 tool boundary inherits. Any cross-document conflict on `ListDir` / `Glob` / `Grep` / `Read` boundaries, `Search` rejection rationale, or AgentScheduler naming should be arbitrated in the integration document.
 
 ---
 
@@ -415,3 +416,29 @@ bounded `ListDir` 已实现并验证：
 ```
 
 `Search`、`define_subagent`、`invoke_subagent` 不进入实现；bounded `ListDir` 已进入实现。后续优先观察 `ListDir` / `Glob` / `Grep` / `Read` 的证据语义是否足以降低 evidence scope drift 和 Bash discovery 权限噪音。
+
+---
+
+## 10. Related governance plans
+
+本规划是 `docs/nexus/reference/` 工具治理三联中的"边界治理"侧：
+
+| 规划 | 路径 | 关系 |
+| --- | --- | --- |
+| **整合索引** | `tool-governance-reference-integration.md` | 读者地图：三角关系、共同术语、工具名映射、共同约束、冲突仲裁。任何跨文档冲突先查这里。 |
+| **补齐治理** | `tool-surface-expansion-and-native-mcp-coexistence-plan.md` | "新工具 + native vs MCP 双轨注册表"：§3.1 任务族拆分 / AskUserQuestion / MCPTool / Skill / Plan 工具族均建立在**本规划 §2 既定边界**之上；§2.5 失败/拒绝语义（COMMAND_OUTPUT_LIMIT 模式）反向引用本规划 §2 不 throw 终止 session 的基线。 |
+| **Skill 治理** | `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` | Skill 域 5 个 model-visible 工具（`SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`）的工具边界（read / write / requiresApproval）**继承本规划 §2 的不新增重复/模糊命名约束**。 |
+
+### 与本规划直接相关的引用点
+
+- **`ListDir` 命名权威性**：本规划 §2.2 是 `ListDir` 作为目录 inventory 工具的命名权威；补齐治理 §6 "与现有文档的关系" 与 Skill 治理 §Layer 5 都引用本规划 §2.2 的 ListDir 边界。
+- **不新增 `Search` / `define_subagent` / `invoke_subagent`**：本规划 §2.1 / §2.3 的拒绝理由是**整套工具治理的基线**；补齐治理在新增工具族前必须先回查本规划以避免重叠。
+- **证据语义分层**（ListDir 定位 / Glob 发现 / Grep 候选 / Read 理解 / Bash 执行 / Agent 调度）：本规划 §4 是补齐治理与 Skill 治理共享的"职责分层"基础。
+- **AgentScheduler 工具命名**（`AgentSpawn` / `AgentWait` / `AgentList` / `AgentCancel`）：本规划 §2.3 是补齐治理中所有 agent-related 工具命名的基线；不引入 `define_subagent` / `invoke_subagent`。
+- **失败/拒绝语义基线**：本规划 §2 隐含"工具不 throw 终止 session"基线；补齐治理 §2.5 与 Skill 治理所有 Skill 工具失败路径都建立在此基线之上。
+
+### 升级路径
+
+- 任何本规划与其他两份主规划的新冲突，按 `tool-governance-reference-integration.md` §6 的仲裁流程解决。
+- 仲裁无法覆盖时，先升级到整合文档新增仲裁规则；本规划 §10 同步更新。
+- 本规划**不**重开整合文档的三角关系或共同约束摘要；如需修订共同约束，必须先在整合文档 §5 落地，再回灌到本规划与另两份主规划。
