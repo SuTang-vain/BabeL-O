@@ -415,7 +415,9 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 8 个 layout 测试：empty tab、zero window、single pane、even split、uneven split remainder、left/right neighbor、edge cases、flat-tab up/down 无邻居。
 - `internal/loop/mouse.go` ResolveMouseTarget：根据 MouseX/MouseY 命中 ComputeLayout 几何区域，命中 pane 返回该 PaneID；border / 外部 fallback 到 focused pane；非 mouse 事件返回 ok=false。
 - 7 个 mouse 测试：containment、border fallback、outside fallback、非 mouse 拒绝、空模型、单 pane 缺失几何。
-- **未完成**：`pane_list` overlay、router 与 LoopModel 的 mutation helpers（RouteClosePane / RouteNewPane 的实际 model 应用）。
+- `internal/loop/mutate.go` 纯函数 model mutators：ApplyClosePane / ApplyNewPane / ApplyMoveFocus / ApplyNextTab / ApplyPrevTab。ApplyNewPane 在 Focus 完全未设时自动建默认 workspace + tab。
+- 9 个 mutator 测试：close removes pane + 焦点回收、close empty tab 折叠、close noop、new appends + focus、new 拒绝缺字段、new 首次建 ws、move left/right、move 边界 noop、tab 循环 wrap、single tab noop。
+- **未完成**：`pane_list` overlay（Phase 3 最后一个 sub-target）。
 
 收口标准：
 - 创建 / 关闭 / 切换 pane 都不丢事件
