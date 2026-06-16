@@ -20,16 +20,25 @@ LDFLAGS        := -X $(VERSION_PKG).Version=$(PACKAGE_VERSION) \
                  -X $(VERSION_PKG).Commit=$(COMMIT) \
                  -X $(VERSION_PKG).BuildDate=$(BUILD_DATE)
 
-.PHONY: dev build test version clean
+.PHONY: dev build dev-loop build-loop test version clean
 
 dev:
 	mkdir -p bin
 	go build -o bin/go-tui ./cmd/go-tui
 
+dev-loop:
+	mkdir -p bin
+	go build -o bin/bbl-loop ./cmd/bbl-loop
+
 build:
 	mkdir -p bin
 	go build -ldflags "$(LDFLAGS)" -o bin/go-tui ./cmd/go-tui
 	@echo "Built bin/go-tui (version=$(PACKAGE_VERSION) commit=$(COMMIT) built=$(BUILD_DATE))"
+
+build-loop:
+	mkdir -p bin
+	go build -ldflags "$(LDFLAGS)" -o bin/bbl-loop ./cmd/bbl-loop
+	@echo "Built bin/bbl-loop (version=$(PACKAGE_VERSION) commit=$(COMMIT) built=$(BUILD_DATE))"
 
 test:
 	go test -count=1 ./...

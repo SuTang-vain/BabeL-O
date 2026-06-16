@@ -394,9 +394,16 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 复用 `internal/tui/overlay/*`（已解耦）
 - 端到端 PTY smoke：开 pane → 提交 prompt → 收到 result
 
-收口标准：
-- `bbl loop` 与现有 `bbl chat` / `bbl go` 并存不冲突
-- 单 pane 与现有 `bbl chat` 行为等价（事件序列一致）
+进度（2026-06-16）：
+- `cmd/bbl-loop/main.go` 入口 + `internal/loop/{loop,state}.go` smoke 入口（2a）
+- `internal/loop/model.go` LoopModel / Workspace / Tab / PaneModel + PaneStatus 6 态（2b）
+- `internal/loop/api/client.go` Nexus HTTP client：UpsertPane / ListPanes / DeletePane / FetchLoopHealth / WaitForEvents（2c）
+- `src/cli/commands/loop.ts` + `registerLoopCommand`（2d）：`bbl loop` CLI 子命令，binary 查找路径 `--binary` / `$BABEL_O_LOOP_BINARY` / `<sourceDir>/bin/bbl-loop` / `go run ./cmd/bbl-loop` fallback；`--check` preflight 已验证。
+- `clients/go-tui/Makefile` 新增 `dev-loop` / `build-loop` targets（2d 配套）
+- `bbl loop --check` 端到端通过：binary 自动定位，preflight OK
+
+收口标准（部分达成，2026-06-16）：
+- `bbl loop` 与现有 `bbl chat` / `bbl go` 并存不冲突 ✓（同 bbl 入口下并列子命令，state 目录 `~/.bbl/loop/` 与 `~/.babel-o/` 隔离）
 
 ### Phase 3 — 多 pane + focus 路由
 目标：支持 tab / split / focus routing。

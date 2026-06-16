@@ -13,6 +13,7 @@ import { registerConfigCommand } from './commands/config.js'
 import { registerModelsCommand } from './commands/models.js'
 import { registerOptimizeCommand } from './commands/optimize.js'
 import { registerGoCommand } from './commands/go.js'
+import { registerLoopCommand } from './commands/loop.js'
 import { registerInspectSessionCommand } from './commands/inspectSession.js'
 import { registerMemoryCommand } from './commands/memory.js'
 import { registerDoctorCommand } from './commands/doctor.js'
@@ -38,6 +39,7 @@ registerConfigCommand(program)
 registerModelsCommand(program)
 registerOptimizeCommand(program)
 registerGoCommand(program)
+registerLoopCommand(program)
 registerInspectSessionCommand(program)
 registerMemoryCommand(program)
 registerDoctorCommand(program)
