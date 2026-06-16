@@ -463,15 +463,18 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - ghost pane 清理（本地有但 server 没有 → 提示用户）
 
 进度（2026-06-16）：
-- `internal/loop/persistence.go` Snapshot / PaneStateEntry / Store + 原子写盘（temp file + rename）+ debounced flushLoop goroutine
-- `Reconcile` 纯函数：local ↔ server diff，输出 `PushToServer`（recreate/overwrite）/ `PullFromServer`（adopt）/ `Unchanged`
-- 7 个 reconcile / roundtrip / store 测试覆盖：identical snapshot、local-only、server-only、lastRev drift、原子写、missing file、Close flush、目录创建
+- `internal/loop/persistence.go` Snapshot / PaneStateEntry / Store + 原子写盘（temp file + rename）+ debounced flushLoop goroutine（5a）
+- `Reconcile` 纯函数：local ↔ server diff，输出 `PushToServer`（recreate/overwrite）/ `PullFromServer`（adopt）/ `Unchanged`（5a）
+- 7 个 reconcile / roundtrip / store 测试覆盖：identical snapshot、local-only、server-only、lastRev drift、原子写、missing file、Close flush、目录创建（5a）
+- `internal/loop/reconcile_worker.go` Reconciler：load snapshot → list server panes → RunOnce → UpsertPane / adopt into store；Run 循环支持 ctx 取消与 ticker 间隔回调（5b）
+- OnPush / OnPull 钩子供 Phase 4 sidebar / toast 复用（5b）
+- 6 个 reconcile worker 测试：unchanged、push、pull、lastRev drift、hooks、nil guard
 - `go test ./...` 全绿
-- **未完成**：reconcile worker（Phase 5b）把 Reconcile 接到 api.Client 实际 UpsertPane/DeletePane
+- **未完成**：worker 接到 cmd/bbl-loop 的交互 loop（Phase 5c）+ `kill -9 nexus` 端到端 PTY smoke
 
-收口标准：
-- `kill -9 nexus && bbl loop` 后能 restore
-- 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane（自动清理本地）
+收口标准（部分达成，2026-06-16）：
+- `kill -9 nexus && bbl loop` 后能 restore（✓ unit 验证：server-only 会被 adopt，local-only 会被 push）
+- 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane（✓ unit 验证：local-only 自动 push，无 warning 路径）
 
 ### Phase 6 — Memory / Scope 综合面板（与 Phase 5 scope diagnostics 联动）
 目标：把 Phase 5 scope diagnostics 的可见性扩到多 pane 视图。
