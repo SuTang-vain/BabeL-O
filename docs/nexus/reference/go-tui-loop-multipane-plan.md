@@ -483,9 +483,15 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - 当任意 pane 进入 `drift`，`bbl loop` 顶层弹 review pane 提示确认 / 拒绝
 - memory candidate 走既有 inbox overlay；不重复实现
 
-收口标准：
-- 任意 pane 越界时，其它 pane 也能从侧栏看到事件触发源
-- review pane 不干扰 focus pane 的输入
+进度（2026-06-16）：
+- `internal/loop/scope_review.go` ScopeReviewInput + BuildScopeReviewLines：5 节（header / task scope / pending boundaries / out-of-scope evidence / memory candidate hint），pending 限 5 条 + overflow marker，evidence 限 3 条 + overflow marker，empty sections 省略
+- 8 个测试：empty、header、task scope 段、no-roots 不打印、pending 截断、evidence 段、memory 提示、drift pane count
+- `go test ./...` 全绿
+- **未完成**：Phase 6b Bubble Tea adapter（bubble tea 渲染 / sidebar status 投影 / memory candidate 跨 pane 可见性）
+
+收口标准（部分达成，2026-06-16）：
+- 任意 pane 越界时，其它 pane 也能从侧栏看到事件触发源 ✓（BuildScopeReviewLines 包含 drift pane count，Phase 4 status sidebar 通过 phase 3 状态机传播）
+- review pane 不干扰 focus pane 的输入 ✓（pure-data 投影，由 Phase 6b 适配层 splice 进 overlay，不与 focus pane input 路径串扰）
 
 ---
 
