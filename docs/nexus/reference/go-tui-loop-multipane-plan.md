@@ -462,6 +462,13 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - Nexus 重启后 `bbl loop` 重启能完整 restore
 - ghost pane 清理（本地有但 server 没有 → 提示用户）
 
+进度（2026-06-16）：
+- `internal/loop/persistence.go` Snapshot / PaneStateEntry / Store + 原子写盘（temp file + rename）+ debounced flushLoop goroutine
+- `Reconcile` 纯函数：local ↔ server diff，输出 `PushToServer`（recreate/overwrite）/ `PullFromServer`（adopt）/ `Unchanged`
+- 7 个 reconcile / roundtrip / store 测试覆盖：identical snapshot、local-only、server-only、lastRev drift、原子写、missing file、Close flush、目录创建
+- `go test ./...` 全绿
+- **未完成**：reconcile worker（Phase 5b）把 Reconcile 接到 api.Client 实际 UpsertPane/DeletePane
+
 收口标准：
 - `kill -9 nexus && bbl loop` 后能 restore
 - 服务端清空 `loop_state` 后 `bbl loop` 不报 ghost pane（自动清理本地）
