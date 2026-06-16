@@ -470,7 +470,30 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - OnPush / OnPull 钩子供 Phase 4 sidebar / toast 复用（5b）
 - 6 个 reconcile worker 测试：unchanged、push、pull、lastRev drift、hooks、nil guard
 - `go test ./...` 全绿
-- **未完成**：reconciler background goroutine（Phase 5c'）+ `kill -9 nexus` 端到端 PTY smoke
+- **未完成**：`kill -9 nexus` 端到端 PTY smoke（脚本化测试）
+
+### Phase 5c' — reconciler background tick
+目标：让 Phase 5b 的 Reconciler 在 interactive loop 中周期性运行，与 server 端 loop_state 同步；不引入裸 goroutine（用 tea.Cmd 驱动）。
+
+进度（2026-06-16）：
+- `internal/loop/reconcile_tick.go`：reconcileDoneMsg / tickMsg / scheduleReconcileTick / reconcileTickCmd / handleReconcileTick / handleReconcileDone
+- `InteractiveModel` 加 `reconciler` / `reconcileInterval` / `lastReconcile` 字段
+- `NewInteractiveModelWithReconciler(model, store, reconciler, interval)` 构造器
+- `RunInteractiveWithReconciler` entry point（`RunInteractive` 是 in-memory 默认）
+- `Init` 当 reconciler 不为空时同时启动 WindowSize + 第一次 reconcile tick
+- `Update` 处理 tickMsg / reconcileDoneMsg / KeyPressMsg（quit 仍优先）
+- 5 个新测试：零 interval 拒绝、Init 条件分支、handleReconcileTick 返回 batch、handleReconcileDone 存 result、httptest 全 round-trip（server-only pane 被 pull 进 local store）
+- `go test ./...` 全绿
+
+完整 reconcile 循环：
+```
+bbl loop 启动
+  → Init: tea.Batch(tea.RequestWindowSize, scheduleReconcileTick(interval))
+  → tickMsg 触发 handleReconcileTick
+  → reconcileTickCmd: Reconciler.RunOnce(ctx)
+  → reconcileDoneMsg: handleReconcileDone 存 result + scheduleReconcileTick(next)
+  → 循环
+```
 
 收口标准（已达成，2026-06-16）：
 - `kill -9 nexus && bbl loop` 后能 restore ✓（Phase 5a Reconcile.PullFromServer + Phase 5b Reconciler.RunOnce adopt 路径 unit 验证）

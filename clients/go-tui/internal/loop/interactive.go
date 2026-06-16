@@ -22,17 +22,23 @@
 // testable end-to-end; the reconciler goroutine that
 // syncs with the server is a later sub-target (5c').
 //
+// Phase 5c' added: tea.Cmd-driven reconcile tick. RunInteractive
+// schedules a tick every `reconcileInterval`; each tick fires
+// Reconciler.RunOnce and the result lands back in Update as
+// reconcileDoneMsg. Phase 6b will surface the last result in
+// the status sidebar.
+//
 // Out of scope (deferred to later sub-targets):
 //   - Layout-based pane geometry rendering (Phase 3b)
 //   - MouseEventFilter (Phase 3c)
-//   - Pane / status / scope overlay splicing
+//   - Pane / status / scope overlay splicing (Phase 6b)
 //   - Real Nexus streaming + transcript accumulation
-//   - Reconciler background goroutine (Phase 5c')
 package loop
 
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 )
@@ -40,12 +46,16 @@ import (
 // InteractiveModel is the tea.Model the `bbl loop` TUI runs.
 // It holds the pure-data LoopModel alongside runtime-only
 // state (window dimensions, transcript placeholder, optional
-// store) so the data layer stays free of Bubble Tea imports.
+// store, optional reconciler) so the data layer stays free
+// of Bubble Tea imports.
 type InteractiveModel struct {
-	loop       LoopModel
-	transcript []string
-	store      *Store
-	quitting    bool
+	loop             LoopModel
+	transcript       []string
+	store            *Store
+	reconciler       *Reconciler
+	reconcileInterval time.Duration
+	lastReconcile    reconcileDoneMsg
+	quitting          bool
 }
 
 // NewInteractiveModel returns a TUI model seeded with the
@@ -68,6 +78,22 @@ func NewInteractiveModelWithStore(model LoopModel, store *Store) InteractiveMode
 	}
 	snap := store.Snapshot()
 	im.loop = applySnapshotToLoop(im.loop, snap)
+	return im
+}
+
+// NewInteractiveModelWithReconciler attaches a Reconciler
+// and a periodic tick interval. The reconciler runs in the
+// background via Update's message loop (no bare goroutine);
+// pass `reconciler == nil` to disable background sync.
+func NewInteractiveModelWithReconciler(
+	model LoopModel,
+	store *Store,
+	reconciler *Reconciler,
+	interval time.Duration,
+) InteractiveModel {
+	im := NewInteractiveModelWithStore(model, store)
+	im.reconciler = reconciler
+	im.reconcileInterval = interval
 	return im
 }
 
@@ -144,10 +170,17 @@ func (m *InteractiveModel) persistSnapshot() {
 	_ = m.store.Replace(snapshotFromLoop(m.loop))
 }
 
-// Init returns the initial tea.Cmd. Phase 3f only requests
-// the initial window size; later sub-targets will add
-// heartbeat / health-poll timers.
+// Init returns the initial tea.Cmd. Phase 3f requests the
+// initial window size; Phase 5c' adds the first reconcile
+// tick so the reconciler starts running on launch. When no
+// reconciler is attached the tick cmd is nil.
 func (m InteractiveModel) Init() tea.Cmd {
+	if m.reconciler != nil {
+		return tea.Batch(
+			tea.RequestWindowSize,
+			scheduleReconcileTick(m.reconcileInterval),
+		)
+	}
 	return tea.RequestWindowSize
 }
 
@@ -156,13 +189,21 @@ func (m InteractiveModel) Init() tea.Cmd {
 // KeyMsg routes Ctrl+C / Esc / q to a quit command and
 // dispatches the rest through the Router (Phase 3f') so
 // Ctrl+N / Ctrl+W / Ctrl+H/L / Ctrl+PgUp/PgDn mutate the
-// LoopModel via the Phase 3d helpers.
+// LoopModel via the Phase 3d helpers. tickMsg fires the
+// reconciler (Phase 5c'); reconcileDoneMsg stores the
+// latest result and reschedules.
 func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.loop.Width = msg.Width
 		m.loop.Height = msg.Height
 		return m, nil
+
+	case tickMsg:
+		return m, m.handleReconcileTick()
+
+	case reconcileDoneMsg:
+		return m, m.handleReconcileDone(msg)
 
 	case tea.KeyPressMsg:
 		// Quit keys win over router dispatch.
@@ -344,8 +385,28 @@ func padFooter(footer string, width int) string {
 // TUI from the persisted snapshot and flushes the store on
 // shutdown. A nil store is the in-memory default (tests
 // + `bbl loop --check`).
+//
+// Phase 5c': when reconciler is non-nil, RunInteractive
+// schedules a tick every `reconcileInterval`; each tick
+// calls Reconciler.RunOnce and posts the result back
+// through reconcileDoneMsg. The reconciler shares the
+// store with the model so server-pulled panes land in the
+// in-memory snapshot the TUI sees.
 func RunInteractive(model LoopModel, store *Store) error {
-	prog := tea.NewProgram(NewInteractiveModelWithStore(model, store))
+	return RunInteractiveWithReconciler(model, store, nil, 0)
+}
+
+// RunInteractiveWithReconciler is the Phase 5c' entry point
+// that schedules periodic reconcile passes. Phase 5c / 5c'
+// are split so the in-memory default and the background-sync
+// default can be wired independently.
+func RunInteractiveWithReconciler(
+	model LoopModel,
+	store *Store,
+	reconciler *Reconciler,
+	reconcileInterval time.Duration,
+) error {
+	prog := tea.NewProgram(NewInteractiveModelWithReconciler(model, store, reconciler, reconcileInterval))
 	finalModel, err := prog.Run()
 	if err != nil {
 		if store != nil {
