@@ -489,6 +489,17 @@ SEA binary (`npm run build:binary`) is the standalone release artifact.
   - `tool-granularity-and-evidence-governance-plan.md` — tool surface
     discipline (no new `Search`, no new path-search tools, no
     `define_subagent` / `invoke_subagent`).
+  - `tool-surface-expansion-and-native-mcp-coexistence-plan.md` — tool
+    surface补齐（Task 族拆分 / AskUserQuestion / MCP 暴露 / Skill /
+    Plan / Worktree / Config / Cron / Sleep / WebSearch provider），
+    当前 Plan only，未实现；实施**前**需真实 regression 引用。
+  - `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` —
+    Skill 域生命周期（schema / registry / Nexus `/v1/skills/*` /
+    draft + 6 类 redaction / save + 重复检测 / 5 个 model-visible
+    tools），Phase 0–6 已 Closed。
+  - `tool-governance-reference-integration.md` — 三联主规划（边界 /
+    补齐 / Skill）的整合索引：共同术语、17-tool 名映射、7 条共同
+    约束、8 项冲突仲裁。任何跨文档冲突先查这里。
   - `context-management-optimization-plan.md` — context ceiling / runtime
     metrics diagnostics.
   - `session-finalization-and-evidence-governance-plan.md` — current-turn

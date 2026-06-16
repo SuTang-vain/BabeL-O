@@ -311,3 +311,95 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 ### 流程收口
 
 - `CronDelete ca8ae7e4` 结束 `/loop 10m` 循环。Skill 治理 6 阶段全部 Closed + 84/84 测试 + 三联闭环 + Go TUI 同步 — 任务目标达成，循环不再需要。
+
+---
+
+## Tool Surface Expansion / Native vs MCP 共存（Phase 0–6）— 2026-06-16 P0 文档口径同步，**实现未开**
+
+规划路径见 [reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md](../reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md)。本规划当前 = **Plan only**，全部 6 个 Phase 均未进入实现；**Phase 0 文档口径守门**已于 2026-06-16 同步完毕。
+
+### Phase 0：文档口径与注册表分层文档化 — 2026-06-16 收口（仅文档层）
+
+- `AGENTS.md` §9 reference 列表补全：补齐 `tool-surface-expansion-and-native-mcp-coexistence-plan.md` / `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` / `tool-governance-reference-integration.md` 三项；删除 stale 隐含。
+- `src/shared/errors.ts` 登记 27 个新 errorCode（按 plan §3.1.1-3.2.4 全部列出的 sentinel）：
+  - §3.1.1 Task 族（3 新增，TASK_NOT_FOUND 既存）：`STORAGE_UNAVAILABLE` / `TASK_TERMINAL` / `TASK_IDENTITY_FIELD_READONLY`。
+  - §3.1.2 AskUserQuestion（2）：`ASK_QUESTION_OPTIONS_OUT_OF_RANGE` / `ASK_QUESTION_NOT_ALLOWED_COLD_START`。
+  - §3.1.3 MCP（4）：`MCP_SERVER_NOT_FOUND` / `MCP_RESOURCES_UNSUPPORTED` / `MCP_RESOURCE_NOT_FOUND` / `MCP_TOOL_CALL_FAILED`。
+  - §3.1.4 Skill（2）：`SKILL_NOT_FOUND` / `SKILL_NAME_REQUIRED`。
+  - §3.1.5 Plan mode（3）：`PLAN_MODE_NOT_TRIGGERED` / `PLAN_MODE_ALREADY_ACTIVE` / `PLAN_MODE_NOT_ACTIVE`。
+  - §3.2.1 Worktree（3）：`NOT_IN_GIT_REPO` / `WORKTREE_BRANCH_EXISTS` / `WORKTREE_PATH_NOT_FOUND`。
+  - §3.2.2 WebSearch provider（1）：`WEB_SEARCH_PROVIDER_UNAVAILABLE`。
+  - §3.2.3 Config（3）：`CONFIG_KEY_NOT_WRITABLE` / `CONFIG_KEY_NOT_FOUND` / `CONFIG_RELOAD_FAILED`。
+  - §3.2.4 Cron / Sleep（5）：`SLEEP_ABORTED` / `SLEEP_DURATION_OUT_OF_RANGE` / `CRON_EXPRESSION_INVALID` / `CRON_JOB_NOT_FOUND` / `CRON_PERSIST_FAILED`。
+  - 注：Skill 治理域另 8 个 SKILL_* errorCode（validator / storage / generator）**仍**保留在 `src/skills/*` 模块 return types，**不**进 `errors.ts`（plan §3.1.4 显式只要求 2 个）。
+- `docs/nexus/TODO.md` 第 29 行 stale 修复：从"未实现 `SkillShow`"改为"未实现 `AskUserQuestion` / `TaskGet/List/Update` / `MCPTool` / `EnterPlanMode` / `Worktree*` / `Config*` / `Sleep` / `ScheduleCron*` / `WebSearchProvider`"。
+- `docs/nexus/active/TODO_runtime.md` 本节即"Phase 0-6 未收口子项"索引（避免污染 WORK_LOG.md 的事实流水）。
+- 守门不变量：
+  - 27 个新 errorCode **未**被任何 P0 工具引用 — 等 Phase 1-6 实施时按"errorCode 必须出现在某 unit test 断言"守门。
+  - 旧 12 个 errorCode 行为不变；typecheck 守门。
+  - Plan still "Plan only" — Phase 0 收口**不**等于"工具已实现"。
+
+### Phase 1：Task 工具族拆分（最小风险，最高价值）— 未开
+
+- 入口：把 `src/tools/builtin/task.ts` 拆为 `src/tools/builtin/task/{create,get,list,update,stop,output}.ts`；6 个 tool 全部走 `shared/task.ts` 的 `NexusTask` 类型 + `context.storage` 持久化。
+- 治理前置：先有 `NexusStorage` 真实支持 `task.get/list/update/stop/output` 5 个接口（当前**只**有 `task.create`）。
+- 实施**前**验证：必须在 `WORK_LOG.md` / session log 找到真实 regression 引用（"模型创建 task 后无法 list / get"），否则按 `babel-o-p0-regression-focus` 降 P1。
+- 装配点：`createDefaultToolRegistry()` 改为引用 `task/create.ts` 等；旧 `Task` 单一入口保留 alias 由 `task/create.ts` 重导出（守 CLI 脚本 `bbl run --task-only` 之类）。
+- 错误码（已登记）：`STORAGE_UNAVAILABLE` / `TASK_TERMINAL` / `TASK_IDENTITY_FIELD_READONLY` / `TASK_NOT_FOUND`。
+- 守门：现有 100+ 测试不回归；`npm run db:migrate` 无报错。
+
+### Phase 2：AskUserQuestion + Skill — Skill 侧已 Closed；AskUserQuestion 0%
+
+- **Skill 侧**（来自 [Skill 治理规划 Phase 6](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)）：5 个 model-visible tool 全 Closed — `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`。
+- **AskUserQuestion** 0%：`src/tools/builtin/askUserQuestion.ts` 不存在；CLI 端 `@inquirer/prompts` 通道接入点、Go TUI `AskUserQuestionDialog` 都未做。
+- 依赖：Go TUI 端 `AskUserQuestionDialog` 必须等 [go-tui-loop-multipane-plan.md](../reference/go-tui-loop-multipane-plan.md) Closed；当前 Phase 0-5c' 推进中，**未**Closed。
+- 实施**前**验证：必须有 session log 中"模型需要澄清问题但被迫写临时文件"的 regression 引用。
+- 错误码（已登记）：`ASK_QUESTION_OPTIONS_OUT_OF_RANGE` / `ASK_QUESTION_NOT_ALLOWED_COLD_START`。
+
+### Phase 3：MCP 工具暴露（`MCPTool` / `ListMcpResources` / `ReadMcpResource`）— 未开
+
+- 入口：把现有 `src/mcp/McpClient.ts` + `src/mcp/McpToolAdapter.ts` 暴露为 3 个独立 `ToolDefinition`；仅在 `enableMcp === true && McpRegistry` 至少注册 1 个 server 时才注册到 `createDefaultToolRegistry()`。
+- 能力探测：`ListMcpResources` / `ReadMcpResource` 前必须 `mcpClient.listCapabilities(server)` 探测 `resources` 能力。
+- 跨前缀覆盖拦截：MCP 注册到 Layer 2 前必须先 check Layer 1 native 是否有同名工具；同名且 MCP `risk` 更高时触发 `tool_overridden_by` 诊断日志。
+- Go TUI 端：`MCPTool` 走 `permission_request.source = 'mcp'`。
+- 错误码（已登记）：`MCP_SERVER_NOT_FOUND` / `MCP_RESOURCES_UNSUPPORTED` / `MCP_RESOURCE_NOT_FOUND` / `MCP_TOOL_CALL_FAILED`。
+- 实施**中**验证：`createDefaultToolRegistry()` 分层行为 unit test 断言（先 native 再 MCP，断言 native 被覆盖并 log）。
+
+### Phase 4：Plan 模式 — 未开
+
+- 入口：`src/tools/builtin/planMode.ts`（`EnterPlanMode` / `ExitPlanMode`）+ `LLMCodingRuntime` 新增 `mode='plan'` 信号 + `src/runtime/planModeCue.ts` 纯函数 cue 检测。
+- plan 模式下 `tools` 白名单由 `LLMCodingRuntime` 重新构建，仅含 `risk: 'read'` + `SkillShow` + `Plan` 三类。
+- `shared/agentJob.ts` 新增可选 `plan` 字段，schema migration 守门。
+- Cue 思路参考 [memory-capability-awareness-and-trigger-plan.md](../reference/memory-capability-awareness-and-trigger-plan.md) `shouldAutoSearchMemory()`（纯函数 + trigger 词表 + 可测试），**不**复用 `memoryProvider.ts` 内部代码。
+- 错误码（已登记）：`PLAN_MODE_NOT_TRIGGERED` / `PLAN_MODE_ALREADY_ACTIVE` / `PLAN_MODE_NOT_ACTIVE`。
+- 实施**后**验证：真实 session 中"模型未走计划直接调 Bash 出错"的 regression log 关闭。
+
+### Phase 5：Worktree / Config / Cron / Sleep — 未开
+
+- 4 个工具族：Worktree（`WorktreeCreate` / `WorktreeRemove`）、Config（`ConfigGet` / `ConfigSet`）、Cron（`ScheduleCronCreate` / `ScheduleCronDelete` / `ScheduleCronList`）、Sleep（`Sleep`）。
+- `NexusStorage.cronJobs` 新表 schema migration（如不存在）；cron 触发时启动**新** session，走 `task-scope-and-evidence-scope-governance-plan.md` 的 `task_scope_declared` 守门。
+- `ConfigSet` 写完必须重新加载 `ConfigManager` + 重新解析 model metadata resolver（与 `babel-o-model-catalog-governance` 一致：显式 set 后必须 reload，**不** auto-switch）。
+- Go TUI `/config` overlay（MVP，与 `/memory` 走同一通道）。
+- 错误码（已登记）：`NOT_IN_GIT_REPO` / `WORKTREE_BRANCH_EXISTS` / `WORKTREE_PATH_NOT_FOUND` / `CONFIG_KEY_NOT_WRITABLE` / `CONFIG_KEY_NOT_FOUND` / `CONFIG_RELOAD_FAILED` / `SLEEP_ABORTED` / `SLEEP_DURATION_OUT_OF_RANGE` / `CRON_EXPRESSION_INVALID` / `CRON_JOB_NOT_FOUND` / `CRON_PERSIST_FAILED`。
+- 实施**前**验证：`ConfigSet` / `Sleep` / `Cron` 必须有真实 regression 引用，否则按 `babel-o-p0-regression-focus` 降 P2。
+
+### Phase 6：WebSearch provider 抽象 — 未开
+
+- 入口：把 `src/tools/builtin/webSearch.ts` 重构为 provider 接口（`WebSearchProvider`） + 内置 `DuckDuckGoLiteProvider` + `McpBackedWebSearchProvider`。
+- provider 选择顺序：MCP `mcp:web_search` > MCP `mcp:brave_search` > builtin `ddgLite`。
+- 缺 provider 时返 `WEB_SEARCH_PROVIDER_UNAVAILABLE` diagnostic，**不**走 Bash `curl` 临时方案。
+- 切换必须在 `~/.babel-o/log/embedded-nexus.log` 留 INFO 行（`web_search_provider=mcp:web_search` 等），不允许运行时静默切换。
+- 错误码（已登记）：`WEB_SEARCH_PROVIDER_UNAVAILABLE`。
+- 实施**后**验证：用户安装 `mcp:web_search` 后无感接管 DuckDuckGo Lite，behavior 一致；back-compat 守门（用户**未**注册 MCP 搜索时，行为与现在完全一致）。
+
+### Phase 7：真实回归驱动 — 长期 Watch
+
+P0 / P1 全部落地后转为 Watch（设计本就是 always-on）。本规划**不主动开新 P0 项**；后续只在真实 session 暴露以下 drift 时按 regression-first 重新开项（与 plan §Phase 7 一致）：
+
+- 工具选择分歧（模型挑错工具造成超时 / 失败）。
+- 同名 MCP 覆盖未被诊断日志记录。
+- Plan 模式被绕过（Bash 强声明但未审批）。
+- Cron 触发后 spawn 的新 session 没有走 `task_scope_declared`。
+- `ConfigSet` 写完后 model metadata resolver 未重跑，模型继续用过时配置。
+- Sleep 固定截断回潮（违反 [task-adaptive-recoverable-timeout-plan.md](../reference/task-adaptive-recoverable-timeout-plan.md)）。
+- test fixture 写入真实 `~/.babel-o/config.json`（CI 守门失败，与 [babel-o-test-config-isolation](../reference/) 记忆一致）。
