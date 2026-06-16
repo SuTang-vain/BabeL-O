@@ -406,6 +406,13 @@ pane 之间的输入隔离 = focus 路由；`textinput.Model` 实例挂在每个
 - mouse 支持：参考 herdr 的 `MouseEventFilter`
 - `pane_list` overlay 列出所有 pane
 
+进度（2026-06-16）：
+- `internal/loop/router.go` 纯数据 Router：RawEvent → Route + RouteAction；不依赖 Bubble Tea，便于纯函数测试。
+- 8 类动作：RouteResize / RouteFocusPane / RouteClosePane / RouteNewPane / RouteMoveFocus / RouteNextTab / RoutePrevTab / RouteNewWorkspace / RouteCloseWorkspace。
+- 全局键位：Ctrl+N 新 pane / Ctrl+W 关闭 / Ctrl+H/L/K/J 移动 focus / Ctrl+T 新 workspace / Ctrl+Shift+T 关 workspace / Ctrl+PgUp/PgDn 切 tab。
+- 8 个 router 测试覆盖 resize / global commands / focus movement / printable keys / unrecognised / mouse / tick / pure-function invariant；`go test ./...` 全绿。
+- **未完成**：`layout.go` split/focus geometry、`MouseEventFilter` adapter、`pane_list` overlay。
+
 收口标准：
 - 创建 / 关闭 / 切换 pane 都不丢事件
 - focus 切换不破坏任何 pane 的 transcript
