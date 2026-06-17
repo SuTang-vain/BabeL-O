@@ -1,6 +1,6 @@
 # Long-Running Context Assembly — 设计文档
 
-> 状态：v1 草案 — Track A Phase 0/1/2/3 server 侧全部落地（2026-06-16），CLI 4 个子命令 + REST 5 个 endpoint 已上线
+> 状态：v1 草案 — Track A Phase 0/1/2/3 server 侧全部落地（2026-06-17），CLI 4 个子命令 + REST 5 个 endpoint + 1 个 WebSocket 已上线
 > 范围：利用 Nexus 常驻能力，重新设计上下文组装架构，支持 session/task 长时间持久运行
 > 替代：旧"压缩 = 上下文管理"模型，升级为"Nexus 组装 = 上下文管理"
 
@@ -21,12 +21,18 @@
 | Phase 3 | CLI `bbl context assemble` | PR-15 | 2026-06-16 |
 | Phase 3 | REST `POST /v1/context/assemble` | PR-18 | 2026-06-16 |
 | Phase 3 | REST `GET /v1/context/working-set/workspace/:wsId` | PR-20 | 2026-06-16 |
+| Phase 3 | WorkingSetTracker event bus（`working_set_updated`） | PR-26 | 2026-06-17 |
+| Phase 3 | WebSocket `/v1/working-set/observe` + shared broadcaster | PR-27 | 2026-06-17 |
+| Phase 3 | CLI `bbl context working-set-edit`（write op, 用户批准 2026-06-17） | PR-19 | 2026-06-17 |
+| Phase 3 | `ContextAssemblerOptions` include* flags + `resumeSession()` helper | PR-28a/28b | 2026-06-17 |
+| Phase 3 | `WorkingSetTracker.applyEvent` + `getWorkspaceWorkingSet` | PR-30 | 2026-06-17 |
+| Phase 3 | `liveHints` section reads `behavior-trace.jsonl` (nexus 5min) | PR-31 | 2026-06-17 |
+| Phase 3 | `projectMemory` section reads `.babel-o/memory.md` | PR-32 | 2026-06-17 |
 
 **剩余项**：
-- ⏸ `bbl context working-set --edit` (write op, 待显式批准 — PR-19)
-- ⏸ `PUT /v1/context/working-set/:sessionId` (write op, 同上)
-- ⏸ WebSocket `/v1/context/observe` (待 runtime 集成)
-- ⏸ `working_set_updated` WS 事件 (待 WorkingSetTracker event bus)
+- ⏸ `PUT /v1/context/working-set/:sessionId` (write op, REST, 仍 gated)
+- ⏸ WebSocket `/v1/context/observe` (`assembled` 事件, 需 runtime 集成)
+- ⏸ `Long-Term Memory` section (Plan C deferred, 需 MemoryProvider)
 
 ---
 
@@ -323,14 +329,14 @@ type AssembledContext = {
 
 ### 4.4 容量预算
 
-| Layer | 默认容量 | 优先级 | pinned |
-|---|---|---|---|
-| Working Set | 1500 tokens | 1（最高） | ✅ |
-| Recent Events | 3000 tokens | 2 | ❌ |
-| Behavior Trace 摘要 | 1000 tokens | 3 | ❌ |
-| Long-Term Memory | 1000 tokens | 4 | ❌ |
-| Project Memory | 500 tokens | 5 | ❌ |
-| Live Hints | 500 tokens | 6（动态） | ❌ |
+| Layer | 默认容量 | 优先级 | pinned | 状态 |
+|---|---|---|---|---|
+| Working Set | 1500 tokens | 1（最高） | ✅ | ✅ PR-15/18 |
+| Recent Events | 3000 tokens | 2 | ❌ | ✅ PR-15/18 |
+| Behavior Trace 摘要 | 1000 tokens | 3 | ❌ | ✅ PR-15/18 |
+| Long-Term Memory | 1000 tokens | 4 | ❌ | ⏸ Plan C deferred, 需 MemoryProvider |
+| Project Memory | 500 tokens | 5 | ❌ | ✅ PR-32 (CLI/REST preview 读 `.babel-o/memory.md`) |
+| Live Hints | 500 tokens | 6（动态） | ❌ | ✅ PR-31 (CLI/REST preview 读 behavior-trace nexus 5min) |
 | **总计** | **7500 tokens**（max 8000） | | |
 
 **溢出处理**：超 budget → `microcompact` 缩减 Layer 2 → 仍超 → 砍 Layer 3 → 仍超 → 报错（不静默丢 pinned）。
@@ -345,7 +351,7 @@ type AssembledContext = {
 - 内存版：`src/nexus/workingSetTracker.ts`（~170 行）
 - 持久化版：`src/nexus/persistedWorkingSetTracker.ts`（~150 行）
 
-**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)
+**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)。✅ event bus (`WorkingSetEventBus`, `working_set_updated` 事件) 已落地 (PR-26, 2026-06-17)，WebSocket `/v1/working-set/observe` 推送已落地 (PR-27, 2026-06-17)
 
 **职责**：
 - 维护每 session working set（内存 + 持久化）
@@ -434,7 +440,7 @@ type AssembleOptions = {
 
 ### 5.3 microcompact（轻量压缩）
 
-**文件**：`src/nexus/microcompact.ts`（~200 行）
+**文件**：`src/runtime/compactors/microCompact.ts`（~140 行）
 
 **职责**：对 recent events 数组做轻量压缩，**不写边界事件**，**不丢事件**。
 
@@ -587,7 +593,7 @@ const result = await context.search({
 | `bbl context show` | 现有：显示当前 context | ✅ 已有（`bbl sessions show`） |
 | `bbl context assemble --scope <s>` | **新**：手动触发组装并显示 | ✅ 已落地（PR-15, 2026-06-16） |
 | `bbl context working-set` | **新**：显示当前 session working set | ✅ 已落地（PR-9, 2026-06-15） |
-| `bbl context working-set --edit` | **新**：手动编辑 working set | ⏸ write op, 待显式批准（PR-19） |
+| `bbl context working-set --edit` | **新**：手动编辑 working set | ✅ 已落地（PR-19, 2026-06-17, 用户显式批准 write op） |
 | `bbl context history --since 24h` | **新**：拉历史事件 + 摘要 | ✅ 已落地（PR-10, 2026-06-15） |
 | `bbl context resume` | **新**：模拟 resume 流程（debug） | ✅ 已落地（PR-13, 2026-06-15） |
 
@@ -607,10 +613,10 @@ const result = await context.search({
 **新增 WebSocket**：
 
 ```
-// 现有 /v1/behavior/observe 扩展
-{ type: 'working_set_updated', sessionId, ws }   // ⏸ 待 WorkingSetTracker event bus 落地
+// /v1/working-set/observe — working set 变更推送（PR-27, 已落地）
+{ type: 'working_set_updated', sessionId, ws }   // ✅ WorkingSetTracker event bus → shared broadcaster → WS fan-out（PR-26 + PR-27）
 
-// 新增 /v1/context/observe
+// /v1/context/observe — assembled context 实时推送（尚未实现）
 { type: 'assembled', sessionId, context }         // ⏸ 待 runtime 集成（PR-X, deferred）
 ```
 
