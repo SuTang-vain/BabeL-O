@@ -124,6 +124,70 @@ export class WorkingSetTracker {
     return this.bySession.has(sessionId)
   }
 
+  // PR-30: derive working-set entries from a single event and apply via
+  // update(). Per doc §5.1 applyEvent API. Currently derives from
+  // tool_started events (extracts file path → file:<path> entry).
+  // Other event types are no-ops (returns null). Pure function on the
+  // event, side effect is the update() call.
+  applyEvent(sessionId: string, event: NexusEvent, cwd: string): WorkingSet | null {
+    if (event.type !== 'tool_started') return null
+    const toolEvent = event as Extract<NexusEvent, { type: 'tool_started' }>
+    const input = toolEvent.input as Record<string, unknown> | undefined
+    if (!input) return null
+    const path = typeof input.path === 'string'
+      ? input.path
+      : typeof input.filePath === 'string'
+        ? input.filePath
+        : ''
+    if (!path || !path.startsWith('/') || !path.startsWith(cwd)) return null
+
+    // Find existing entry; if not present, append
+    const existing = this.bySession.get(sessionId)
+    const entries = existing ? [...existing.entries] : []
+    const key = `file:${path}`
+    if (entries.some((e) => e.key === key)) return existing ?? null
+    entries.push({ key, value: path, updatedAt: new Date().toISOString(), confidence: 0.85 })
+    return this.update(sessionId, {
+      workspaceId: existing?.workspaceId,
+      entries,
+    })
+  }
+
+  // PR-30: getWorkspaceWorkingSet(workspaceId) per doc §5.1. Returns an
+  // aggregated WorkingSet containing all entries from all sessions linked
+  // to this workspace, with each entry's key tagged with the source
+  // sessionId in the value prefix. Returns null if no sessions are linked.
+  getWorkspaceWorkingSet(workspaceId: string): WorkingSet | null {
+    const sessionIds = this.workspaceIndex.get(workspaceId)
+    if (!sessionIds || sessionIds.size === 0) return null
+    const aggregatedEntries: WorkingSetEntry[] = []
+    let maxVersion = 0
+    let latestUpdatedAt = ''
+    for (const sid of sessionIds) {
+      const ws = this.bySession.get(sid)
+      if (!ws) continue
+      if (ws.version > maxVersion) maxVersion = ws.version
+      if (ws.updatedAt > latestUpdatedAt) latestUpdatedAt = ws.updatedAt
+      for (const entry of ws.entries) {
+        // Tag with source sessionId to disambiguate across sessions.
+        // Use a key suffix to avoid collisions.
+        aggregatedEntries.push({
+          key: `${entry.key}@${sid}`,
+          value: entry.value,
+          updatedAt: entry.updatedAt,
+          confidence: entry.confidence,
+        })
+      }
+    }
+    return {
+      sessionId: `workspace:${workspaceId}`,
+      workspaceId,
+      entries: aggregatedEntries,
+      version: maxVersion,
+      updatedAt: latestUpdatedAt,
+    }
+  }
+
   // Apply a patch to an existing working set, or create a new one if absent.
   // Returns the post-patch state. Emits `working_set_updated` on success
   // (PR-26) so the WebSocket layer can fan out to subscribers.
