@@ -55,6 +55,12 @@ type LoopPaneState struct {
 // LoopHealthPane mirrors the per-pane entry in
 // GET /v1/runtime/loop/health. Only the fields the driver reads
 // are typed; unknown fields are tolerated.
+//
+// PR-17a (Track B Phase 2 §6.5.2 bbl loop P1 integration):
+//   - PendingHints / LastHintAt / LastHintPattern support the
+//     StatusBehaviorHint 7th PaneStatus (priority 6, highest per
+//     INV-13). When PendingHints > 0, the runtime projection
+//     overrides status to "behaviorHint".
 type LoopHealthPane struct {
 	SessionID             string         `json:"sessionId"`
 	Agent                 string         `json:"agent"`
@@ -62,6 +68,9 @@ type LoopHealthPane struct {
 	PendingPermissions    int            `json:"pendingPermissions"`
 	PendingScopeBoundaries int            `json:"pendingScopeBoundaries"`
 	OutOfScopeEvidence    int            `json:"outOfScopeEvidence"`
+	PendingHints          int            `json:"pendingHints"`
+	LastHintAt            int64          `json:"lastHintAt"`
+	LastHintPattern       string         `json:"lastHintPattern"`
 	LastEventRev          int64          `json:"lastEventRev"`
 	LastEventAt           string         `json:"lastEventAt"`
 	TaskScope             LoopTaskScope  `json:"taskScope"`

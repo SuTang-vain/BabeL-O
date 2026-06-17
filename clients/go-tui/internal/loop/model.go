@@ -22,6 +22,13 @@ import (
 // `src/runtime/loopDiagnostics.ts` (Phase 1). It is a Go enum
 // so renderers can switch on it; the runtime is still the
 // source of truth — the driver only carries the projection.
+//
+// PR-17a (Track B Phase 2 §6.5.2 bbl loop P1 integration):
+// StatusBehaviorHint is the 7th PaneStatus (priority 6, highest).
+// Per INV-12 the existing 6 states are unchanged; the new state is
+// only set when the runtime's applyBehaviorHint() projects
+// pendingHints > 0. Per INV-15 this enum must mirror the server's
+// STATUS_PRIORITY in src/runtime/loopDiagnostics.ts.
 type PaneStatus int
 
 const (
@@ -31,6 +38,7 @@ const (
 	StatusWaiting
 	StatusDrift
 	StatusDone
+	StatusBehaviorHint
 )
 
 // String renders the status for transcript / sidebar use.
@@ -48,6 +56,8 @@ func (s PaneStatus) String() string {
 		return "drift"
 	case StatusDone:
 		return "done"
+	case StatusBehaviorHint:
+		return "behavior_hint"
 	default:
 		return fmt.Sprintf("unknown(%d)", int(s))
 	}
@@ -67,6 +77,12 @@ type PaneModel struct {
 	Status      PaneStatus
 	LastEventRev int64
 	LastEventAt time.Time
+	// Transcript is the pane's recent event log shaped for the
+	// focused-pane body (Phase 6b). Empty until 6c wires the
+	// per-pane waitForEvent poll; the body renders the
+	// placeholder in that case. BuildTranscriptLines consumes
+	// this slice — keep entries single-line / pre-flattened.
+	Transcript []TranscriptItem
 }
 
 // FocusPath identifies the focused pane in a workspace/tab tree.

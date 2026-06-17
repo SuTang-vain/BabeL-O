@@ -43,6 +43,9 @@ func SymbolForStatus(status PaneStatus) string {
 		return "✗"
 	case StatusDone:
 		return "✓"
+	case StatusBehaviorHint:
+		// PR-17a: hint symbol — distinct from "!" (blocked).
+		return "✦"
 	default:
 		return "?"
 	}
@@ -58,6 +61,7 @@ func SymbolForStatus(status PaneStatus) string {
 //	done      → green  (terminal success)
 //	working   → blue   (mid-execution, in-progress)
 //	idle      → gray   (no recent activity)
+//	hint      → amber  (per doc §6.5.2 chrome: yellow border)
 func ColorForStatus(status PaneStatus) ColorName {
 	switch status {
 	case StatusIdle:
@@ -72,6 +76,8 @@ func ColorForStatus(status PaneStatus) ColorName {
 		return ColorAmber
 	case StatusDone:
 		return ColorGreen
+	case StatusBehaviorHint:
+		return ColorAmber
 	default:
 		return ColorNone
 	}

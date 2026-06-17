@@ -146,3 +146,58 @@ func containsAll(haystack, needle string) bool {
 	}
 	return false
 }
+
+// PR-17a: StatusBehaviorHint (7th PaneStatus) per behavior-monitor §6.5.2.
+// Verified properties:
+//   - Color = Amber (matches doc §6.5.2: yellow border for hint)
+//   - Symbol is non-empty + distinct from other 6 statuses
+//   - String() returns "behavior_hint" (canonical wire form)
+//   - Inherits from default (ColorForStatus with PaneStatus(99) = ColorNone)
+func TestStatusBehaviorHintProjection(t *testing.T) {
+	// Color
+	if got := ColorForStatus(StatusBehaviorHint); got != ColorAmber {
+		t.Errorf("ColorForStatus(StatusBehaviorHint) = %q, want %q", got, ColorAmber)
+	}
+	// Symbol non-empty + distinct
+	sym := SymbolForStatus(StatusBehaviorHint)
+	if sym == "" {
+		t.Error("SymbolForStatus(StatusBehaviorHint) returned empty")
+	}
+	others := map[string]bool{}
+	for _, s := range []PaneStatus{StatusIdle, StatusWorking, StatusBlocked, StatusWaiting, StatusDrift, StatusDone} {
+		others[SymbolForStatus(s)] = true
+	}
+	if others[sym] {
+		t.Errorf("SymbolForStatus(StatusBehaviorHint) = %q collides with existing", sym)
+	}
+	// String
+	if got := StatusBehaviorHint.String(); got != "behavior_hint" {
+		t.Errorf("StatusBehaviorHint.String() = %q, want %q", got, "behavior_hint")
+	}
+	// Badge shape
+	badge := FormatStatusBadge(StatusBehaviorHint)
+	if badge.Text != "behavior_hint" {
+		t.Errorf("FormatStatusBadge Text = %q, want behavior_hint", badge.Text)
+	}
+	if badge.Color != ColorAmber {
+		t.Errorf("FormatStatusBadge Color = %q, want %q", badge.Color, ColorAmber)
+	}
+}
+
+// PR-17a: statusFromString accepts both "behaviorHint" (server wire form)
+// and "behavior_hint" (legacy snake_case) per health_merge.go update.
+func TestStatusFromStringBehaviorHint(t *testing.T) {
+	cases := []struct {
+		in   string
+		want PaneStatus
+	}{
+		{"behaviorHint", StatusBehaviorHint},
+		{"behavior_hint", StatusBehaviorHint},
+		{"unknown_status", StatusIdle}, // default fallback
+	}
+	for _, c := range cases {
+		if got := statusFromString(c.in); got != c.want {
+			t.Errorf("statusFromString(%q) = %v, want %v", c.in, got, c.want)
+		}
+	}
+}

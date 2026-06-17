@@ -129,6 +129,10 @@ func statusFromString(s string) PaneStatus {
 		return StatusDrift
 	case "done":
 		return StatusDone
+	case "behaviorHint", "behavior_hint":
+		// PR-17a: 7th PaneStatus, server uses camelCase "behaviorHint"
+		// but tolerate snake_case too in case of older clients.
+		return StatusBehaviorHint
 	default:
 		return StatusIdle
 	}
