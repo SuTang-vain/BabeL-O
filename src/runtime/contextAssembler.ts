@@ -74,6 +74,13 @@ export type ContextAssemblerOptions = {
   // the working set across turns. Backward compatible: when undefined,
   // the legacy derive path is used.
   workingSetOverride?: string
+  // PR-28a (Track A Phase 3 §5.2 AssembleOptions): explicit include flags
+  // matching the doc's AssembleOptions shape. Backward compatible: when
+  // undefined, all four default to false (current behavior).
+  includeBehaviorTrace?: boolean
+  includeLongTerm?: boolean
+  includeProjectMemory?: boolean
+  includeLiveHints?: boolean
 }
 
 export type AssembledContext = {
