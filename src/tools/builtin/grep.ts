@@ -34,6 +34,7 @@ export const grepTool: ToolDefinition<typeof inputSchema> = {
       '--max-count',
       String(probeLimit),
       ...pathMatches.flatMap(glob => ['--glob', glob]),
+      '--',
       input.pattern,
       input.path,
     ]

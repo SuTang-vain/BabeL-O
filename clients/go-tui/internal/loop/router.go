@@ -150,7 +150,7 @@ func (r *Router) dispatchKey(event RawEvent, model LoopModel) (Route, LoopModel)
 		return Route{Action: RouteMoveFocus, Direction: -2, Payload: event}, model
 	case "ctrl+j", "ctrl+down":
 		return Route{Action: RouteMoveFocus, Direction: +2, Payload: event}, model
-	case "tab":
+	case "tab", "enter", "backspace":
 		return Route{Action: RouteFocusPane, Payload: event}, model
 	default:
 		if isPrintableKey(event.Key) {

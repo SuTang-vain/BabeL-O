@@ -103,6 +103,17 @@ type InteractiveModel struct {
 	// wiring: a CLI flag / env var; tests use
 	// SetUseWsReadForTest.
 	useWsRead bool
+	// useWsWrite is the opt-in flag that switches the
+	// per-pane write path (submit / approve / deny /
+	// cancel) from HTTP to WS command (6d-c'-B). Default
+	// false (HTTP) so existing users see no behavior
+	// change. When true, the 4 dispatchers
+	// (submit/approve/deny/cancel) prefer
+	// `client.SendCommand(action, payload)` and fall
+	// back to the existing HTTP route on any
+	// dial/read/write error (server doesn't yet speak
+	// WS write, dial timeout, response timeout).
+	useWsWrite bool
 	// submitInFlight tracks per-pane HTTP /v1/execute
 	// submissions (Phase 6d-b). It prevents Enter from
 	// launching concurrent turns for the same pane while the
@@ -795,6 +806,18 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// (esc / q / ctrl+c / the toggle key).
 			m.scopeDriftOpen = !m.scopeDriftOpen
 			return m, nil
+		case "v":
+			// PR-B2: behavior trace overlay. Opens the
+			// centered trace panel for the focused pane
+			// when Status == StatusBehaviorHint; dismiss
+			// contract mirrors other overlays (esc/q/
+			// ctrl+c / the toggle key). Falls through
+			// to the router when the precondition is
+			// not met (e.g. focused pane is idle).
+			if handled, cmd := HandleViewTraceKey(msg, &m); handled {
+				return m, cmd
+			}
+			// else fall through to router
 		}
 		event, ok := rawEventFromKey(msg)
 		if !ok {
@@ -1090,8 +1113,17 @@ type chromeViewState struct {
 	// BuildScopeDriftInputFromHealth so the chrome
 	// doesn't need to know about api types.
 	ScopeDriftLines  []string
-	Reconcile        reconcileFooterInfo
-	Layout           layoutChromeState
+	// TraceOverlayOpen is the PR-B2 flag for the
+	// behavior_trace overlay (v key). When true the
+	// chrome splices the trace panel on top of the
+	// existing content. Mirrors ScopeDriftOpen.
+	TraceOverlayOpen  bool
+	// TraceOverlayLines are the pre-computed display
+	// lines returned by B2TraceViewState. Populated by
+	// View() so the chrome renderer stays I/O-free.
+	TraceOverlayLines []string
+	Reconcile         reconcileFooterInfo
+	Layout            layoutChromeState
 }
 
 // activePaneListLines returns the line buffer for the

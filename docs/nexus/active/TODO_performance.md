@@ -50,6 +50,30 @@ context/compact ceiling 诊断已对齐 registry `model.contextWindow` 与 cache
 
 `/v1/runtime/metrics` 与 `/v1/runtime/status` 已基于本地 persisted events 聚合 provider invocation、AgentLoop role step/task failure/retry/sub-agent 与 AgentJob lifecycle 指标；仅用于本地诊断，不引入云端分析平台。
 
+## P1 Agent Trace Schema / Trajectory Eval Harness
+
+> 主规划见 [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md)。本节承接 observability / eval / benchmark 打开项。
+
+### Agent Trace Schema — Open
+
+当前 runtime metrics、tool trace、permission audit、behavior trace 已存在，但还不是统一 trajectory trace。
+
+- [ ] 定义 `AgentTrace` / `AgentSpan` 投影 schema，从现有 `NexusEvent`、`execution_metrics`、`toolTrace`、`permission_audit` 派生，不新增第二事实源。
+- [ ] span 覆盖 provider invocation、tool call、permission decision、scope boundary、memory retrieval、compact/recovery、sub-agent handoff、final result。
+- [ ] trace 可 JSONL 导出，并可从 session replay 重建。
+- [ ] `bbl inspect-session` 或独立 debug command 可输出 machine-readable trace。
+- [ ] 回归覆盖 event ordering、parent-child span、缺失事件降级、permission denied path。
+
+### Trajectory Eval Harness — Open
+
+现有测试/benchmark 能覆盖函数、API、成本和性能；下一步需要面向 agent trajectory 的 eval。
+
+- [ ] 定义最小 eval fixture 格式：prompt、workspace、expected checks、trace assertions。
+- [ ] 新增 `npm run eval:agent` 或等价脚本，默认跑小型 offline fixture，不依赖真实 provider key。
+- [ ] 首批至少 10 个 coding trajectory fixture，覆盖 read-before-edit、permission、scope、context budget、recoverable tool error、memory hint caution。
+- [ ] eval 输出 success、cost、tool count、permission count、scope warnings、trace path。
+- [ ] 后续真实 session regression 可转成 eval fixture，作为 architecture maturity 守门。
+
 ## 验证命令
 
 历史验证覆盖：`npm run benchmark`、`BABEL_O_STARTUP_TRACE=1 npm run cli -- --help`、`npm run test:performance`、`npm run test:concurrency`、1000+ sessions/events `apiScale`、storageBridge fault-injection、mocked AgentLoop cost benchmark、mocked retry policy benchmark、本地 benchmark history 与 TS/Go runner 对比 benchmark。后续新增 metrics history 时，应继续接入 `npm run benchmark` / `npm run test:performance`，并输出机器可读诊断。

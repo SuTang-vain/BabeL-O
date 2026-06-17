@@ -8,6 +8,7 @@ import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { z } from 'zod'
+import { errorMessage } from '../../shared/errors.js'
 import type { ToolDefinition } from '../Tool.js'
 import { summarizeWindow } from '../contextTools.js'
 import { BEHAVIOR_TRACE_RELATIVE_PATH, type BehaviorTraceEntry } from '../../runtime/behaviorTrace.js'
@@ -67,7 +68,11 @@ export const contextSummarizeTool: ToolDefinition<typeof inputSchema> = {
     } catch (error) {
       return {
         success: false,
-        output: error instanceof Error ? error.message : String(error),
+        output: {
+          code: 'CONTEXT_SUMMARIZE_FAILED',
+          message: errorMessage(error),
+          repairHint: 'Retry with a narrower scope/sinceMs window, or inspect the behavior trace file directly if it exists.',
+        },
       }
     }
   },

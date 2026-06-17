@@ -358,6 +358,35 @@ func renderChrome(model LoopModel, state chromeViewState) string {
 	if state.HelpOpen {
 		out = overlayHelp(out, model.Width, model.Height)
 	}
+	if state.PaneListOpen {
+		// 6d-f: the structured-row path is preferred so
+		// the chrome can apply the cursor highlight
+		// without re-parsing plain text. We rebuild the
+		// rows from the model on every render so the
+		// overlay stays in sync with reconcile / health
+		// / new-pane events that may have arrived
+		// between View calls.
+		rows := BuildPaneListRows(model)
+		out = overlayPaneList(out, model.Width, model.Height, state.PaneListCursor, rows)
+	}
+	if state.ScopeReviewOpen {
+		out = overlayScopeReview(out, model.Width, model.Height, state.ScopeReviewLines)
+	}
+	if state.ScopeDriftOpen {
+		// 6d-g: third overlay per plan §4.5 / §6'.
+		// Same splice pattern as overlayScopeReview —
+		// centered, accent-bordered, dismiss on
+		// esc/q/ctrl+c/the toggle key.
+		out = overlayScopeDrift(out, model.Width, model.Height, state.ScopeDriftLines)
+	}
+	if state.TraceOverlayOpen {
+		// PR-B2: behavior trace overlay (v key). Mirrors
+		// scope_drift. Centered panel with the pre-computed
+		// trace lines from B2TraceViewState; dismiss on
+		// esc/q/v/ctrl+c. Same splice pattern as the other
+		// three overlays.
+		out = RenderTraceOverlay(out, model.Width, model.Height, state.TraceOverlayLines, "", false)
+	}
 	return out
 }
 
@@ -728,9 +757,21 @@ func renderSidebarContent(rows []paneRow, model LoopModel, innerWidth, innerHeig
 // level (workspace / tab / pane) and the focus state (▶ / ▾
 // / > vs. · / ▸ /  ) — it carries both signals in one
 // column, matching herdr's `state_icon` / `state_dot` shape.
-// Status is shown on the right with the status color.
-// Pane rows also get a "5s ago" last-activity hint between
-// the label and the status, using the pane's LastEventAt.
+// Status is shown on the right with the status color, AND
+// the leading glyph + pane id are also rendered in the
+// status color (plan §4 status table: blocked→red /
+// drift→amber / waiting→blue). Pane rows also get a "5s
+// ago" last-activity hint between the label and the
+// status, using the pane's LastEventAt.
+//
+// 6d (P1 status sidebar overlay): the focused row gets
+// a `focusedRowStyle` background surface so the operator
+// can see at a glance which row corresponds to the
+// focused pane. The status color is preserved alongside
+// the background (foreground wins on conflicting renders;
+// lipgloss composes the two styles via `Inherit(false)`
+// + a `Render(left, right)` split where the background
+// applies to the whole row width).
 func renderSidebarRow(r paneRow, model LoopModel, width int) string {
 	if width <= 0 {
 		return ""
@@ -747,6 +788,7 @@ func renderSidebarRow(r paneRow, model LoopModel, width int) string {
 
 	left := indent + glyph + "  " + kindLabel
 	middle := activityPart
+	var raw string
 	if statusPart != "" {
 		var gap int
 		if middle != "" {
@@ -754,9 +796,20 @@ func renderSidebarRow(r paneRow, model LoopModel, width int) string {
 		} else {
 			gap = max(1, width-lipgloss.Width(left)-lipgloss.Width(statusPart))
 		}
-		return padOrTruncate(glyphStyle.Render(left)+middle+strings.Repeat(" ", gap)+statusPart, width)
+		raw = glyphStyle.Render(left) + middle + strings.Repeat(" ", gap) + statusPart
+	} else {
+		raw = glyphStyle.Render(left) + middle
 	}
-	return padOrTruncate(glyphStyle.Render(left)+middle, width)
+	padded := padOrTruncate(raw, width)
+	// Apply focused-row background surface to the
+	// focused workspace / tab / pane. Pane rows get
+	// the background + the colored status pill stays
+	// visible because lipgloss preserves the
+	// foreground spans.
+	if r.Focused {
+		return focusedRowStyle.Render(padded)
+	}
+	return padded
 }
 
 // sidebarGlyphForRow returns the leading glyph + style for a
@@ -797,6 +850,48 @@ func sidebarKindLabel(r paneRow) string {
 			label = shortSessionID(r.SessionID)
 		}
 		return r.PaneID + "  " + label
+	}
+	return ""
+}
+
+// formatPaneRowLineColored is the chrome-side variant of
+// formatPaneRowLine (pane_list.go) that emits a row
+// colored to match the always-visible sidebar: the
+// leading marker gets the tree-level style; the
+// pane-status field gets `styleForStatus(r.Status)`
+// (plan §4 color table: blocked→red, drift→amber,
+// waiting→blue). The plain-text formatPaneRowLine stays
+// the source of truth for tests + `bbl loop --status`
+// smoke — this function adds the ANSI layer the chrome
+// needs.
+//
+// 6d (P1 status sidebar overlay): the pane_list overlay
+// is the always-visible sidebar's larger mirror; without
+// status color, the operator opening ctrl+j sees a
+// black-and-white list and has to read the status text
+// to find the drift/blocked pane. The colored variant
+// closes that gap.
+func formatPaneRowLineColored(r paneRow) string {
+	switch r.Kind {
+	case paneRowWorkspace:
+		glyph, glyphStyle := sidebarGlyphForRow(r)
+		return glyphStyle.Render(glyph + " ws " + r.WorkspaceID + " · " + r.Label)
+	case paneRowTab:
+		glyph, glyphStyle := sidebarGlyphForRow(r)
+		return strings.Repeat(" ", r.Depth) + glyphStyle.Render(glyph+" tab "+r.TabID+" · "+r.Label)
+	case paneRowPane:
+		label := strings.TrimSpace(r.Label)
+		if label == "" {
+			label = shortSessionID(r.SessionID)
+		}
+		// Build the line in two parts: the marker +
+		// id/label get the status color; the status
+		// field gets its own status-color styling so
+		// the trailing pill matches the sidebar.
+		glyph, _ := sidebarGlyphForRow(r)
+		prefix := strings.Repeat(" ", r.Depth) + glyph + " pane " + r.PaneID + " · " + label
+		statusField := " · " + SymbolForStatus(r.Status) + " " + r.Status.String()
+		return styleForStatus(r.Status).Render(prefix) + styleForStatus(r.Status).Render(statusField)
 	}
 	return ""
 }
@@ -863,6 +958,14 @@ func renderFocusedPaneHeader(model LoopModel, width int) string {
 // that exist but haven't been attached to a stream yet (e.g.
 // a pane the user just opened with Ctrl+N before any events
 // have arrived).
+//
+// Phase 6d-c: when the focused pane has a non-nil
+// PendingPermission, the body is replaced by the permission
+// dialog (a framed box summarizing the runtime's request +
+// the Y/N/Enter keybind hint). The dialog owns the body —
+// transcript lines are hidden until the operator decides,
+// because the runtime is blocked on the decision anyway
+// and the dialog is the only state the operator can act on.
 func renderFocusedPaneBody(model LoopModel, width, height int) string {
 	focused, ok := model.FocusedPane()
 	if !ok {
@@ -876,6 +979,13 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 			width,
 		)
 	}
+	// 6d-c: when there's a pending permission, render the
+	// dialog instead of the body. The dialog covers the
+	// full body height; the operator can't type into the
+	// pane's input line until they decide.
+	if focused.PendingPermission != nil {
+		return renderPermissionDialog(focused.PendingPermission, width, height)
+	}
 	// The full session id is shown so the legacy test
 	// contract (substring "session-1") keeps passing and
 	// operators can copy/paste a session id from the body.
@@ -887,17 +997,33 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 	}
 	meta := fmt.Sprintf("  session=%s  ·  rev=%d  ·  agent=%s",
 		sessionLabel, focused.LastEventRev, fallback(focused.Agent, "bbl"))
+	reservedInputRows := 1
+	if strings.TrimSpace(focused.QueuedPrompt) != "" {
+		reservedInputRows = 2
+	}
+	contentHeight := max(1, height-reservedInputRows)
 	lines := []string{padOrTruncate(subtextStyle.Render(meta), width)}
 	if len(focused.Transcript) > 0 {
 		// Reserve the first row for the meta line; the rest
 		// of the body is transcript. This is the "user can
 		// finally see the active session" moment of 6b.
-		transcriptBody := renderTranscriptLines(focused, width, height-1)
-		lines = append(lines, splitLines(transcriptBody, width, height-1)...)
+		transcriptBody := renderTranscriptLines(focused, width, contentHeight-1)
+		lines = append(lines, splitLines(transcriptBody, width, contentHeight-1)...)
 	} else {
 		placeholder := mutedStyle.Render("  (waiting for stream — Phase 3f')")
 		lines = append(lines, padOrTruncate(placeholder, width))
 	}
+	for len(lines) < contentHeight {
+		lines = append(lines, strings.Repeat(" ", width))
+	}
+	if len(lines) > contentHeight {
+		lines = lines[:contentHeight]
+	}
+	if strings.TrimSpace(focused.QueuedPrompt) != "" {
+		queued := "  queued: " + singleLine(strings.TrimSpace(focused.QueuedPrompt))
+		lines = append(lines, padOrTruncate(subtextStyle.Render(queued), width))
+	}
+	lines = append(lines, renderPaneInputLine(focused, width))
 	for len(lines) < height {
 		lines = append(lines, strings.Repeat(" ", width))
 	}
@@ -905,6 +1031,113 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 		lines = lines[:height]
 	}
 	return strings.Join(lines, "\n")
+}
+
+func renderPaneInputLine(pane PaneModel, width int) string {
+	prefix := "  > "
+	value := pane.Input
+	if strings.TrimSpace(value) == "" {
+		value = "Ask this pane..."
+		return padOrTruncate(mutedStyle.Render(prefix+value), width)
+	}
+	return padOrTruncate(keyStyle.Render(prefix)+textStyle.Render(value), width)
+}
+
+// renderPermissionDialog renders the modal body shown when a
+// pane has a PendingPermission. The dialog occupies the full
+// body height; it's a replacement for the focused pane body
+// (transcript / input line are hidden until the operator
+// decides). The layout, top-to-bottom:
+//
+//	● permission required                  (title row, amber)
+//	  Tool: Bash · risk: execute           (tool meta)
+//	                                       (blank)
+//	  Tool Bash requires user permission    (message body,
+//	  to run. Reason: touches /tmp.        wrapped to width)
+//	                                       (blank, if rule)
+//	  suggested rule: Bash(git:*)          (rule hint, if any)
+//	                                       (blank)
+//	  [Y/Enter] approve · [N] deny         (keybind hint)
+//
+// The dialog frames itself with the amber border (matches
+// the StatusDrift / StatusBehaviorHint palette) so the
+// operator notices it without it competing with a red
+// blocked state. Pure function: same perm + width/height
+// → same output.
+//
+// The dialog is intentionally narrow-column-tolerant — it
+// clips the message with `…` when the body is too short to
+// show the full reason. Keybinds always stay visible.
+func renderPermissionDialog(perm *PanePermission, width, height int) string {
+	if perm == nil {
+		return strings.Repeat(" ", max(0, width)*max(0, height))
+	}
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		return ""
+	}
+
+	amber := styleForStatus(StatusDrift)
+	dot := amber.Bold(true).Render("●")
+	title := amber.Render("permission required")
+	header := dot + " " + title
+
+	toolLine := ""
+	if name := strings.TrimSpace(perm.Name); name != "" {
+		toolLine = "Tool: " + name
+		if risk := strings.TrimSpace(perm.Risk); risk != "" {
+			toolLine += " · risk: " + risk
+		}
+	}
+
+	// Message body: clip at 200 chars when the panel is
+	// too short to wrap the full reason. Operators can
+	// always press Y/N without reading every byte of the
+	// reason; the runtime already has the full payload.
+	message := strings.TrimSpace(perm.Message)
+	if message == "" {
+		message = "Tool " + perm.Name + " requires user permission to run."
+	}
+	const maxMessageRunes = 200
+	if r := []rune(message); len(r) > maxMessageRunes {
+		message = string(r[:maxMessageRunes-1]) + "…"
+	}
+
+	ruleLine := ""
+	if rule := strings.TrimSpace(perm.SuggestedRule); rule != "" {
+		ruleLine = "suggested rule: " + rule
+	}
+
+	keys := mutedStyle.Render("[") + keyStyle.Render("Y/Enter") + mutedStyle.Render("]") +
+		mutedStyle.Render(" approve · ") +
+		mutedStyle.Render("[") + keyStyle.Render("N") + mutedStyle.Render("]") +
+		mutedStyle.Render(" deny")
+
+	// Compose the inner block.
+	inner := []string{padOrTruncate(header, width), ""}
+	if toolLine != "" {
+		inner = append(inner, padOrTruncate(textStyle.Render(toolLine), width))
+	}
+	inner = append(inner, "")
+	inner = append(inner, padOrTruncate(textStyle.Render(message), width))
+	if ruleLine != "" {
+		inner = append(inner, "")
+		inner = append(inner, padOrTruncate(mutedStyle.Render(ruleLine), width))
+	}
+	// Vertical spacer before the keybinds.
+	inner = append(inner, "")
+	inner = append(inner, padOrTruncate(keys, width))
+
+	// Frame the inner block with the amber border.
+	frame := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color(colAmber)).
+		Padding(0, 1)
+	framed := frame.Width(max(1, width-2)).Render(strings.Join(inner, "\n"))
+
+	return clampBlock(framed, width, height)
 }
 
 // renderTranscriptLines turns a pane's Transcript into styled
@@ -1308,6 +1541,7 @@ func renderHelpPanel(width, height int) string {
 		{"ctrl+b", "toggle sidebar (collapse / expand)"},
 		{"ctrl+z", "zoom focused pane (hide chrome)"},
 		{"?", "toggle this help overlay"},
+		{"v", "view trace (when hint active)"},
 		{"q / esc / ctrl+c", "quit bbl loop"},
 	}
 	innerW := max(10, width-2)
@@ -1330,6 +1564,271 @@ func renderHelpPanel(width, height int) string {
 	// is already padRightPlain'd to 24 cols + desc, which
 	// fits in innerW for any reasonable width.
 	return b.String()
+}
+
+// overlayPaneList splices the pane_list panel (workspace /
+// tab / pane tree) on top of the existing chrome. Mirrors
+// overlayHelp's frame placement: a centered, accent-bordered
+// box that the operator sees while ctrl+j is held. Lines
+// are precomputed by the InteractiveModel's activePaneListLines
+// helper so the chrome's render path stays free of any
+// I/O / model access.
+//
+// The panel is wider than the help overlay (60 → 72) —
+// pane rows carry a 4-segment tuple (glyph + kind + label +
+// status pill) that compresses poorly on a narrow panel.
+// On a too-narrow terminal (< 36 cols) we fall back to an
+// inline hint line so the operator still gets the
+// "press esc to close" feedback.
+func overlayPaneList(content string, width, height int, cursor int, rows []paneRow) string {
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		height = 24
+	}
+	panelW := min(72, width-4)
+	panelH := min(20, height-4)
+	if panelW < 36 || panelH < 8 {
+		return content + "\n" + mutedStyle.Render(
+			truncatePlain("pane list: ctrl+j toggle · press esc to close", width))
+	}
+	panel := renderPaneListPanel(panelW, panelH, cursor, rows)
+	startY := (height - panelH) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	startX := (width - panelW) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	return splicePanel(content, startX, startY, panel, width, height)
+}
+
+// overlayScopeReview splices the scope_review panel on
+// top of the existing chrome. Same frame pattern as
+// overlayPaneList; the data is precomputed by
+// activeScopeReviewLines so this function is pure. The
+// accent border (matching the help / pane_list
+// overlays) tells the operator this is a stackable
+// focusable surface, not an error modal.
+func overlayScopeReview(content string, width, height int, lines []string) string {
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		height = 24
+	}
+	panelW := min(72, width-4)
+	panelH := min(20, height-4)
+	if panelW < 36 || panelH < 8 {
+		return content + "\n" + mutedStyle.Render(
+			truncatePlain("scope review: ctrl+r toggle · press esc to close", width))
+	}
+	panel := renderScopeReviewPanel(panelW, panelH, lines)
+	startY := (height - panelH) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	startX := (width - panelW) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	return splicePanel(content, startX, startY, panel, width, height)
+}
+
+// renderPaneListPanel builds the centered pane_list
+// panel's content: a header line, the precomputed
+// BuildPaneListRows structured rows, and a footer hint.
+// The rows are the same data the sidebar uses — focus
+// marker + kind label + status pill — so an operator
+// opening ctrl+j sees the exact same tree they get in
+// the always-visible sidebar, just at a larger width.
+//
+// 6d-f: when `cursor` is in range, the row at that index
+// is prefixed with `▸ ` and the focus marker is preserved
+// (so the operator can see both "currently focused" and
+// "currently selected" rows when they're different).
+// `cursor < 0` skips the highlight loop — used when the
+// overlay is closed (defense in depth — the caller in
+// renderChrome already gates on state.PaneListOpen).
+func renderPaneListPanel(width, height int, cursor int, rows []paneRow) string {
+	innerW := max(10, width-2)
+	var b strings.Builder
+	b.WriteString(sectionHeaderStyle.Render("bbl loop · panes"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(strings.Repeat("─", innerW)))
+	b.WriteString("\n")
+	if len(rows) == 0 {
+		b.WriteString(mutedStyle.Render("  (no panes)"))
+	} else {
+		maxRows := height - 4
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		for i, row := range rows {
+			if i >= maxRows {
+				b.WriteString(mutedStyle.Render(
+					truncatePlain(fmt.Sprintf("  ... %d more", len(rows)-i), innerW)))
+				break
+			}
+			// 6d (P1 status sidebar overlay): the
+			// chrome-side line is the colored variant
+			// — the status field is rendered with
+			// styleForStatus so the operator sees the
+			// same color coding as the always-visible
+			// sidebar. The plain-text variant
+			// formatPaneRowLine stays for tests +
+			// `bbl loop --status` smoke.
+			line := formatPaneRowLineColored(row)
+			// 6d-f: prefix the cursor row with `▸ ` so
+			// the operator can see the highlight even
+			// when the cursor is on a non-focused
+			// workspace / tab / pane row.
+			if i == cursor {
+				b.WriteString(accentStyle.Render("▸ "))
+			} else {
+				b.WriteString("  ")
+			}
+			b.WriteString(padOrTruncate(line, innerW-2))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(truncatePlain(
+		"↑/↓ move · enter jump · esc / q / ctrl+j to close", innerW)))
+	return b.String()
+}
+
+// renderScopeReviewPanel builds the centered
+// scope_review panel: header, the precomputed
+// BuildScopeReviewLines (5 sections — task scope /
+// pending boundaries / out-of-scope evidence / memory
+// candidates), and a footer hint. Empty sections are
+// already omitted by BuildScopeReviewLines so the
+// panel stays compact when the runtime hasn't reported
+// any boundaries / evidence.
+func renderScopeReviewPanel(width, height int, lines []string) string {
+	innerW := max(10, width-2)
+	var b strings.Builder
+	b.WriteString(sectionHeaderStyle.Render("bbl loop · scope review"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(strings.Repeat("─", innerW)))
+	b.WriteString("\n")
+	if len(lines) == 0 {
+		b.WriteString(mutedStyle.Render("  (no data)"))
+	} else {
+		maxRows := height - 4
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		for i, line := range lines {
+			if i >= maxRows {
+				b.WriteString(mutedStyle.Render(
+					truncatePlain("  ...", innerW)))
+				break
+			}
+			b.WriteString("  " + truncatePlain(line, innerW-2))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(truncatePlain(
+		"press esc / q / ctrl+r to close", innerW)))
+	return b.String()
+}
+
+// overlayScopeDrift splices the scope_drift panel
+// (the 6d-g third overlay per plan §4.5 / §6') on top
+// of the existing chrome. Same frame pattern as
+// overlayPaneList / overlayScopeReview: centered,
+// accent-bordered, with a too-narrow fallback to an
+// inline hint line. The data is precomputed by
+// activeScopeDriftLines so this function is pure.
+func overlayScopeDrift(content string, width, height int, lines []string) string {
+	if width <= 0 {
+		width = 80
+	}
+	if height <= 0 {
+		height = 24
+	}
+	panelW := min(72, width-4)
+	panelH := min(20, height-4)
+	if panelW < 36 || panelH < 8 {
+		return content + "\n" + mutedStyle.Render(
+			truncatePlain("scope drift: ctrl+d toggle · press esc to close", width))
+	}
+	panel := renderScopeDriftPanel(panelW, panelH, lines)
+	startY := (height - panelH) / 2
+	if startY < 0 {
+		startY = 0
+	}
+	startX := (width - panelW) / 2
+	if startX < 0 {
+		startX = 0
+	}
+	return splicePanel(content, startX, startY, panel, width, height)
+}
+
+// renderScopeDriftPanel builds the centered
+// scope_drift panel: header, the precomputed
+// BuildScopeDriftLines (drift-pane list with per-pane
+// counts), and a footer hint. With no drift panes the
+// precomputed lines already include a "no drift
+// reported" placeholder so the panel is always
+// meaningful.
+func renderScopeDriftPanel(width, height int, lines []string) string {
+	innerW := max(10, width-2)
+	var b strings.Builder
+	b.WriteString(sectionHeaderStyle.Render("bbl loop · scope drift"))
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(strings.Repeat("─", innerW)))
+	b.WriteString("\n")
+	if len(lines) == 0 {
+		b.WriteString(mutedStyle.Render("  (no data)"))
+	} else {
+		maxRows := height - 4
+		if maxRows < 1 {
+			maxRows = 1
+		}
+		for i, line := range lines {
+			if i >= maxRows {
+				b.WriteString(mutedStyle.Render(
+					truncatePlain("  ...", innerW)))
+				break
+			}
+			b.WriteString("  " + truncatePlain(line, innerW-2))
+			b.WriteString("\n")
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString(mutedStyle.Render(truncatePlain(
+		"press esc / q / ctrl+d to close", innerW)))
+	return b.String()
+}
+
+// splicePanel replaces a sub-rectangle of `content`
+// (the rendered chrome) with `panel`. The panel rows
+// are written at (startY, startX) and clip cleanly if
+// they extend past the terminal. The pattern mirrors
+// overlayHelp's body — we split the existing chrome
+// into rows, replace the matching slice, and rejoin.
+// Used by both the pane_list and scope_review overlays
+// so the splice logic is in one place.
+func splicePanel(content string, startX, startY int, panel string, width, height int) string {
+	lines := strings.Split(content, "\n")
+	panelLines := strings.Split(panel, "\n")
+	for i, line := range panelLines {
+		row := startY + i
+		if row < 0 || row >= len(lines) {
+			continue
+		}
+		lines[row] = spliceLine(lines[row], startX, line, width)
+	}
+	for len(lines) < height {
+		lines = append(lines, strings.Repeat(" ", max(0, width)))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // spliceLine replaces `width` characters of `line` starting

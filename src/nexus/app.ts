@@ -1731,6 +1731,30 @@ export async function createNexusApp(
     })
   })
 
+  // PR-B2: /v1/context/trace — read raw behavior-trace.jsonl entries
+  // as JSON for the Go TUI's StatusBehaviorHint overlay. Mirrors
+  // /v1/context/history's file-read path but returns the raw typed
+  // entries array (no summarize / search) so the TUI can render
+  // each row directly. See docs/nexus/reference/long-running-
+  // context-assembly.md §18.2.
+  app.get('/v1/context/trace', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = q.sessionId
+    const limit = q.limit ? Math.max(1, Math.min(1000, Number(q.limit))) : 100
+    if (q.limit && (Number.isNaN(limit) || limit <= 0)) {
+      return reply.code(400).send({ error: 'limit must be a positive number' })
+    }
+    const sinceMs = q.sinceMs ? Number(q.sinceMs) : 24 * 60 * 60 * 1000
+    if (q.sinceMs && (Number.isNaN(sinceMs) || sinceMs < 0)) {
+      return reply.code(400).send({ error: 'sinceMs must be a non-negative number' })
+    }
+    return await runBehaviorTraceGet({ cwd, sessionId, limit, sinceMs })
+  })
+
   // PR-12: Track A Phase 2 — context working-set REST endpoints.
   // Read-only. Reuses PR-4b PersistedWorkingSetTracker.
   app.get('/v1/context/working-set', async (request, reply) => {
@@ -5564,6 +5588,81 @@ export async function runContextHistory(params: ContextHistoryParams): Promise<{
     tokenEstimate: summary.tokenEstimate,
     truncated: summary.truncated,
     contentTruncated: summary.truncatedAt,
+  }
+}
+
+// ─── PR-B2: /v1/context/trace endpoint helper ─────────────────────────────
+//
+// Per docs/nexus/reference/long-running-context-assembly.md §18.2 B2.
+// Reads the same <cwd>/.babel-o/behavior-trace.jsonl file that
+// runContextHistory reads, but returns the raw typed entries
+// (BehaviorTraceEntry[]) instead of a summarized markdown blob.
+// The TUI's StatusBehaviorHint overlay renders each entry on its
+// own line. Optional sessionId filter narrows to a single
+// session; sinceMs filters to entries within the window
+// (default 24h, matches runContextHistory); limit caps the
+// returned array (default 100, max 1000).
+export async function runBehaviorTraceGet({
+  cwd,
+  sessionId,
+  limit,
+  sinceMs,
+}: {
+  cwd: string
+  sessionId?: string
+  limit: number
+  sinceMs: number
+}): Promise<{
+  type: 'behavior_trace_result'
+  cwd: string
+  sessionId: string
+  entries: BehaviorTraceEntry[]
+  count: number
+}> {
+  let all: BehaviorTraceEntry[] = []
+  const tracePath = _resolve(cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+  if (_existsSync(tracePath)) {
+    try {
+      const raw = _readFileSync(tracePath, 'utf8')
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        try {
+          all.push(JSON.parse(trimmed) as BehaviorTraceEntry)
+        } catch {
+          // skip malformed lines (mirrors runContextHistory)
+        }
+      }
+    } catch (error) {
+      throw new Error(`Failed to read trace file: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  // Filter: time window (sinceMs back from now), then optional
+  // sessionId. The default sinceMs (24h) is enforced by the
+  // caller; the helper accepts the raw value so test paths
+  // can pass 0 to disable.
+  const cutoff = Date.now() - Math.max(0, sinceMs)
+  let filtered = all.filter((e) => {
+    const ts = Date.parse(e.timestamp ?? '')
+    if (!Number.isFinite(ts)) return false
+    if (ts < cutoff) return false
+    if (sessionId && e.sessionId !== sessionId) return false
+    return true
+  })
+
+  // Take the last N (most recent) entries. The file is appended
+  // to chronologically so the trailing slice is the freshest.
+  if (filtered.length > limit) {
+    filtered = filtered.slice(filtered.length - limit)
+  }
+
+  return {
+    type: 'behavior_trace_result',
+    cwd,
+    sessionId: sessionId ?? '',
+    entries: filtered,
+    count: filtered.length,
   }
 }
 

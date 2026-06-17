@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { errorMessage } from '../../shared/errors.js'
 import { createId, nowIso } from '../../shared/id.js'
 import type { NexusTask } from '../../shared/task.js'
 import type { ToolDefinition } from '../Tool.js'
@@ -29,7 +30,20 @@ export const taskTool: ToolDefinition<typeof inputSchema> = {
       updatedAt: nowIso(),
     }
     if (context.storage) {
-      await context.storage.saveTask(task)
+      try {
+        await context.storage.saveTask(task)
+      } catch (error) {
+        return {
+          success: false,
+          output: {
+            code: 'TASK_SAVE_FAILED',
+            message: errorMessage(error),
+            title: input.title,
+            repairHint: 'Retry task creation after storage is available, or continue without a persisted task marker.',
+            details: taskErrorDetails(error),
+          },
+        }
+      }
     }
     return {
       success: true,
@@ -40,4 +54,13 @@ export const taskTool: ToolDefinition<typeof inputSchema> = {
       },
     }
   },
+}
+
+function taskErrorDetails(error: unknown): Record<string, unknown> | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const record = error as Record<string, unknown>
+  const details: Record<string, unknown> = {}
+  if (record.code !== undefined) details.code = record.code
+  if (record.name !== undefined) details.name = record.name
+  return Object.keys(details).length > 0 ? details : undefined
 }

@@ -2,6 +2,26 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-17 — Recoverable tool error / session continuity 收口
+
+- **背景**: `session_ee116547-6545-4f70-bc7c-b1b287387cda` 暴露两类连续性问题：`Grep` 对 `pattern="- \\[ \\]"` 调用 `rg` 时缺少 `--` separator，导致 `rg: unrecognized flag -`；普通工具抛错被 terminal `TOOL_ERROR` 结束，provider 没有收到 paired `tool_result is_error=true`，后续看起来像“工具失败后失忆”。
+- **实现**:
+  - `src/tools/builtin/grep.ts`: ripgrep 参数在 pattern 前插入 `--`，支持以 `-` 开头的搜索模式。
+  - `src/runtime/toolExecutor.ts`: generic non-timeout / non-cancel / non-workspace-path 工具异常改为 recoverable `kind='result', success=false`，输出 `TOOL_EXECUTION_FAILED`、redacted input、details 与 tool-specific repair hint；workspace escape 仍保持结构化 recoverable path-safety 结果，timeout/cancel 仍是 terminal request 边界。
+  - `src/tools/builtin/write.ts` / `edit.ts` / `glob.ts` / `task.ts`: 将文件系统、底层 `rg`、任务存储等可修正失败转为稳定 `success=false` code（`WRITE_FAILED`、`EDIT_*`、`GLOB_FAILED`、`TASK_SAVE_FAILED`）。
+  - `src/tools/builtin/contextSearch.ts` / `contextRecent.ts` / `contextSummarize.ts` / `webSearch.ts`: 将原先裸字符串失败输出标准化为 `CONTEXT_*` / `WEB_SEARCH_FAILED` 结构化结果。
+  - `docs/nexus/reference/recoverable-tool-error-and-session-continuity-governance-plan.md`: 状态更新为 Phase A/B 已实现，Phase C 对当前内置工具面已完成轻量 repair hints 与结构化失败输出，Phase D 仍作为 recovery boundary / context diagnostics 后续项。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-tool-recoverability.json npx tsx --test test/tool-recoverability.test.ts`（5/5 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-grep-recoverable.json npx tsx --test test/grep-tool.test.ts`（8/8 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-throw-recoverable.json npx tsx --test test/runtime-llm.test.ts`（76/76 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-web-search-recoverability.json npx tsx --test test/web-search-tool.test.ts`（8/8 pass）
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-context-tools-recoverability.json npx tsx --test test/context-tools-registry.test.ts`（8/8 pass）
+  - `npm run typecheck`（pass）
+  - `npm run format:check`（0 failures）
+  - `git diff --check`（pass）
+- **边界**: 不自动重试工具；不把失败伪装成成功；不绕过 permission / task scope / path safety；request timeout、user cancel、provider transport failure 仍保持 terminal 语义；长期记忆不作为工具失败连续性的事实源。
+
 ## 2026-06-13 — Session replay / evidence governance follow-up parity 收口
 
 - **背景**: Phase A-H 主体实现后，复查确认仍有四个最后保险缺口：原事故 provider MiniMax 走 `anthropic-compatible`，但 adapter-level orphan/duplicate `tool_result` preflight 只在 OpenAI-compatible；`resolveProviderToolCallInput()` 对 malformed `partialInput` 仍 fallback `{}`；SQLite `event_seq` 用 `MAX()+1` 但缺 transaction / unique 约束；Read cache 已记录 `mode` 但 coverage 判定未显式拒绝 preview → non-preview 复用。

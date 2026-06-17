@@ -32,6 +32,7 @@ type Config struct {
 	PollIntervalMs   int
 	HealthIntervalMs int
 	WaitTimeoutMs    int
+	ExecuteTimeoutMs int
 	AltScreen        bool
 	MouseCapture     bool
 	APIKey           string

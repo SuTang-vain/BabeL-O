@@ -5,6 +5,7 @@
 // Pure data: reads events from storage, returns capped result.
 
 import { z } from 'zod'
+import { errorMessage } from '../../shared/errors.js'
 import type { ToolDefinition } from '../Tool.js'
 import { searchEvents } from '../contextTools.js'
 import type { NexusEvent } from '../../shared/events.js'
@@ -36,7 +37,14 @@ export const contextSearchTool: ToolDefinition<typeof inputSchema> = {
   requiresApproval: false,
   async execute(input, context) {
     if (!context.storage) {
-      return { success: false, output: 'storage not available in tool context' }
+      return {
+        success: false,
+        output: {
+          code: 'CONTEXT_STORAGE_UNAVAILABLE',
+          message: 'storage not available in tool context',
+          repairHint: 'Continue from visible session context, or retry contextSearch in a runtime with storage attached.',
+        },
+      }
     }
     try {
       const result = await context.storage.listEvents(context.sessionId, {
@@ -54,7 +62,12 @@ export const contextSearchTool: ToolDefinition<typeof inputSchema> = {
     } catch (error) {
       return {
         success: false,
-        output: error instanceof Error ? error.message : String(error),
+        output: {
+          code: 'CONTEXT_SEARCH_FAILED',
+          message: errorMessage(error),
+          query: input.query,
+          repairHint: 'Narrow the query or retry after session storage is available.',
+        },
       }
     }
   },

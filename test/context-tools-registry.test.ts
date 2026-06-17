@@ -102,6 +102,8 @@ describe('PR-8 contextSearchTool.execute', () => {
       cwd, sessionId, maxOutputBytes: 1_000_000, bashMaxBufferBytes: 1_000_000, // no storage
     })
     assert.equal(result.success, false)
+    assert.equal((result.output as any).code, 'CONTEXT_STORAGE_UNAVAILABLE')
+    assert.match((result.output as any).repairHint, /storage/)
   })
 })
 

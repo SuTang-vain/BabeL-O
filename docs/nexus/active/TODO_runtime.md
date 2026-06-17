@@ -9,6 +9,7 @@ Nexus 是 BabeL-O 的执行核心。这里只保留仍未收口的 runtime / API
 - `GET /v1/runtime/status`、`/v1/runtime/provider-smoke`、`/v1/runtime/provider-smoke/live`、`/v1/sessions/:sessionId/context`、`/v1/sessions/:sessionId/assets`、`/compact`、`/context`、Session Memory Lite 第一版、provider recovery、DeepSeek reasoning replay、hooks 最小内核都已落地。
 - Context token estimator conservative mode、blocking limit、auto/manual compact、retained segment、User Intake Guidance、final-response-only、provider protocol regression corpus、统一 diagnostics object、runtime pipeline 最小 seam、tool loop/result aggregator seam、tool loop execution helper、provider turn outcome reducer、context blocking helper、loop state / execution state helper、compact/reassemble state refresh helper 和 provider request assembly / loop guard helper 都已进入可验证状态。
 - 真实会话守门继续采用 regression-first：intake 失败时身份/能力短问、上下文记忆短追问已覆盖为 respond-only fallback；`session_93052ea7-8346-40a9-8175-db941312778c` 暴露的 provider 协议污染 assistant 文本已补 Tool-call Text Leakage 回归守门；测试进程写真实 provider config 的污染事故已补中心化 guard 与回归；`session_9d985c5c-7c89-41b8-9d5e-cc672e412f00` 暴露的 current-turn finalization 污染已补最小 regression 并修复。后续仍按真实漂移先补最小回归再修 runtime/config/adapter/TUI。
+- `session_ee116547-6545-4f70-bc7c-b1b287387cda` 暴露的 recoverable tool error / session continuity drift 已收口：`Grep` dash-leading pattern 加 `--` separator；generic thrown tool errors 改为 provider-visible paired `tool_result is_error=true`；`Write` / `Edit` / `Glob` / `TaskCreate` / `context*` / `WebSearch` 常见可修正失败返回结构化 `success=false` code。后续只在真实样本证明 latest recoverable failure 没有进入 context diagnostics / recovery boundary 时再开 Phase D。
 - `session_1e2299be-b988-49ea-8819-587de8258172` 暴露真实会话在大量 `Read` 后第二轮 provider call 前触发 context blocking；P1 已补 provider-loop reactive compact、adaptive `Read` preview/range 策略、live `Read` aggregate budget、embedded metrics side-table 持久化和 retryable failed session 恢复状态表达。后续只保留重复大文件读取诊断与 P2 targeted reading 地基。
 - 除上述真实会话回归外，后续阶段仍保留架构收口、权限细化和执行入口升级。
 
@@ -188,6 +189,50 @@ Permission pending state 持久 backend 评估已收口：当前不实现 SQLite
 - embedded local 与 Nexus-only 两种运行模式继续保持清晰边界；service mode 经 HTTP/WS `NexusClient`，embedded mode 经 `createEmbeddedNexusClient()` 复用 `createNexusApp().inject()`；`chat.ts` 不直接 import SQLite storage、session lifecycle、compact/context runtime internals。
 - `PendingPermissionRegistry` 保持 process-local backend seam，用于同进程审批、timeout sweep、session close cleanup 与测试替换 backend。
 - 若未来出现真实多进程 service/CLI 权限状态同步需求，先开 resumable execution / durable pending permission 设计项，不单独落地 SQLite backend。
+
+## P1 Agent Runtime Maturity — Durable Resume / MCP Context / Memory Quality
+
+> 主规划见 [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md)。本节只承接 runtime-owned 的打开项；trace/eval harness 见 [TODO_performance.md](./TODO_performance.md)。
+
+### Durable Run Checkpoint / Resume — Open
+
+当前 session/event persistence 已可复盘，但 in-flight continuation 仍偏 process-local。下一步不直接把 pending permission 写 SQLite，而是先定义可恢复执行状态和 checkpoint boundary。
+
+- [ ] 定义 resumable run state：`before_provider_invocation` / `after_provider_invocation` / `before_tool_execution` / `waiting_permission` / `after_tool_result` / `before_final_result`。
+- [ ] session metadata / task state 能表达 `resume possible`、`retry from provider turn`、`waiting permission`、`cannot resume` 与 reason。
+- [ ] pending permission 只有在存在 tool call snapshot + continuation state 时才允许宣称 durable。
+- [ ] `inspect-session` / Nexus status 能说明 session 中断点、是否可恢复、下一步动作。
+- [ ] 回归覆盖：permission wait、tool result 已持久但 provider continuation 未完成、provider context recovery 后中断。
+
+### MCP Context Primitives — Watch / Regression-driven
+
+现有 MCP 主要作为 tool wrapping。若后续落地 `ListMcpResources` / `ReadMcpResource` / MCP roots，必须和 task scope / evidence scope 协议对齐。
+
+- [ ] MCP resource read 触发和文件 `Read` 同级别的 scope diagnostics。
+- [ ] MCP roots 不覆盖 Nexus `primaryRoot`，只能成为 explicitRoots 或 confirmedExternalRoots。
+- [ ] Go TUI 只渲染 `source=mcp` 和 scope event，不 re-derive MCP scope。
+- [ ] 实施前需要真实 MCP resource 使用 regression 或明确集成需求。
+
+### Memory Quality Metrics — Open
+
+MemoryOS/EverCore 当前边界正确：volatile / non-authoritative / cue-driven / permission-gated。下一步需要可观测质量指标。
+
+- [ ] 汇总 auto-search triggered / skipped reason 分布。
+- [ ] 汇总 hit count、injected chars、truncation rate、search latency。
+- [ ] 增加 stale / contradicted memory diagnostic 口径。
+- [ ] 增加 memory save approval / denial 指标。
+- [ ] eval harness 能断言 memory hint 不被当作 workspace fact。
+
+### Loop Taxonomy — Docs Guard
+
+后续文档和代码注释统一使用：
+
+- `runtime loop`：`LLMCodingRuntime` 内 provider/tool 循环。
+- `tool loop`：单次 provider-requested tool lifecycle。
+- `agent loop`：Planner/Executor/Critic/Optimizer task loop。
+- `interaction loop`：Go TUI / `bbl loop` UI event loop。
+
+新增 loop 相关设计必须声明是否拥有 runtime truth；默认只有 Nexus/runtime 拥有 execution truth。
 
 ## P2 Execution Environments
 

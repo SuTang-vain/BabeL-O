@@ -85,7 +85,10 @@ func (m *InteractiveModel) handleHealthTick() tea.Cmd {
 // the LoopModel, then walks the resulting status
 // transitions through the toast queue + sound player so
 // drift / blocked / done changes surface in the chrome.
-// Reschedules the next tick.
+// Also rebuilds m.scopeReviewInput from the fresh health
+// payload so the ctrl+r scope_review overlay reflects
+// the latest taskScope / counts without a manual test
+// injection. Reschedules the next tick.
 func (m *InteractiveModel) handleHealthDone(msg healthDoneMsg) tea.Cmd {
 	m.lastHealthCheckAt = msg.at
 	if msg.err != nil {
@@ -96,11 +99,38 @@ func (m *InteractiveModel) handleHealthDone(msg healthDoneMsg) tea.Cmd {
 		// toast line so a persistent failure is visible.
 		m.toastMessage = "✗ health check failed: " + msg.err.Error()
 		m.toastShownAt = msg.at
+		// Clear the scope review input on persistent
+		// failure so the overlay falls back to the
+		// "no scope data yet" placeholder — the cached
+		// taskScope from a previous successful poll
+		// would otherwise be stale.
+		m.scopeReviewInput = nil
+		// 6d-g: also clear the scope_drift health cache
+		// so the ctrl+d overlay shows model-only
+		// data (no live counts) on the next View
+		// rather than serving stale counts from a
+		// previous successful poll.
+		m.lastHealthForDrift = nil
 		return scheduleHealthTick(m.healthInterval)
 	}
 	newModel, transitions := applyHealthToLoop(m.loop, msg.resp)
 	m.loop = newModel
 	m.applyTransitions(transitions)
+	// Promote the live health payload to the scope_review
+	// overlay's data bundle. The focused pane is the
+	// default — BuildScopeReviewInputFromHealth picks
+	// the row whose SessionID matches the focused pane.
+	// This is what makes ctrl+r show live data instead
+	// of the test-only placeholder.
+	m.scopeReviewInput = BuildScopeReviewInputFromHealth(m.loop, msg.resp)
+	// 6d-g: cache the most recent health response so the
+	// scope_drift overlay (ctrl+d) can read live counts
+	// on every View. We hold a pointer to the response
+	// value; LoopHealthResponse is a plain struct so
+	// the cache is safe (no mutation by the overlay
+	// path).
+	resp := msg.resp
+	m.lastHealthForDrift = &resp
 	return scheduleHealthTick(m.healthInterval)
 }
 

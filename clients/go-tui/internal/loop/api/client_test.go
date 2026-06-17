@@ -205,6 +205,51 @@ func TestClientWaitForEventsBuildsQuery(t *testing.T) {
 	}
 }
 
+func TestClientExecutePromptPostsExecuteBody(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		_, _ = w.Write([]byte(`{
+			"type": "execute_result",
+			"sessionId": "session-1",
+			"success": true,
+			"statusCode": 200,
+			"durationMs": 12,
+			"events": [
+				{"type":"user_prompt","sessionId":"session-1","text":"hello"},
+				{"type":"assistant_text","sessionId":"session-1","text":"hi"}
+			]
+		}`))
+	})
+	c, _ := newTestClient(t, handler)
+	resp, err := c.ExecutePrompt(context.Background(), ExecutePromptRequest{
+		Prompt:       "hello",
+		SessionID:    "session-1",
+		Cwd:          "/workspace",
+		TimeoutMs:    180000,
+		Policy:       "soft-deny",
+		AllowedTools: []string{"Read", "Grep"},
+	})
+	if err != nil {
+		t.Fatalf("ExecutePrompt: %v", err)
+	}
+	if capturedPath != "/v1/execute" {
+		t.Fatalf("ExecutePrompt path = %q", capturedPath)
+	}
+	if capturedBody["prompt"] != "hello" || capturedBody["sessionId"] != "session-1" || capturedBody["cwd"] != "/workspace" {
+		t.Fatalf("ExecutePrompt body = %+v", capturedBody)
+	}
+	if capturedBody["policy"] != "soft-deny" {
+		t.Fatalf("ExecutePrompt policy = %+v", capturedBody["policy"])
+	}
+	if resp.SessionID != "session-1" || !resp.Success || len(resp.Events) != 2 {
+		t.Fatalf("ExecutePrompt response = %+v", resp)
+	}
+}
+
 func TestClientNewClientDefaultsTimeoutAndAuth(t *testing.T) {
 	c := NewClient("http://example.com/", "abc")
 	if c.HTTP.Timeout < 10*time.Second {
@@ -223,5 +268,246 @@ func TestClientNewRequestRequiresBaseURL(t *testing.T) {
 	_, err := c.newRequest(context.Background(), http.MethodGet, "/v1/runtime/loop/health", nil)
 	if err == nil {
 		t.Fatalf("expected error when BaseURL is empty")
+	}
+}
+
+// ── 6d-c: permission decision endpoints ──────────────────────
+
+// TestClientApprovePermissionSendsBodyAndPath covers the
+// happy path: POST /v1/sessions/:id/approve with toolUseId +
+// scope="session" + rule + feedback all flow to the server
+// unchanged, and a 2xx response is treated as success.
+func TestClientApprovePermissionSendsBodyAndPath(t *testing.T) {
+	var capturedPath, capturedMethod, capturedAuth string
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedMethod = r.Method
+		capturedPath = r.URL.Path
+		capturedAuth = r.Header.Get("Authorization")
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"permission_resolved","approved":true,"scope":"session"}`))
+	})
+	c, _ := newTestClient(t, handler)
+
+	err := c.ApprovePermission(context.Background(), "session-1", "toolu_01", ApprovePermissionOptions{
+		Scope:    "session",
+		Rule:     "Bash(git:*)",
+		Feedback: "ok for this session",
+	})
+	if err != nil {
+		t.Fatalf("ApprovePermission: %v", err)
+	}
+	if capturedMethod != http.MethodPost {
+		t.Errorf("method = %q, want POST", capturedMethod)
+	}
+	if capturedPath != "/v1/sessions/session-1/approve" {
+		t.Errorf("path = %q, want /v1/sessions/session-1/approve", capturedPath)
+	}
+	if capturedAuth != "Bearer test-key" {
+		t.Errorf("auth = %q, want Bearer test-key", capturedAuth)
+	}
+	if capturedBody["toolUseId"] != "toolu_01" {
+		t.Errorf("body.toolUseId = %v, want toolu_01", capturedBody["toolUseId"])
+	}
+	if capturedBody["scope"] != "session" {
+		t.Errorf("body.scope = %v, want session", capturedBody["scope"])
+	}
+	if capturedBody["rule"] != "Bash(git:*)" {
+		t.Errorf("body.rule = %v, want Bash(git:*)", capturedBody["rule"])
+	}
+	if capturedBody["feedback"] != "ok for this session" {
+		t.Errorf("body.feedback = %v", capturedBody["feedback"])
+	}
+}
+
+// TestClientApprovePermissionOmitsEmptyOptionals: when
+// the operator picks "approve once" (the default), the
+// body has only toolUseId — scope/rule/feedback are
+// dropped from the JSON so the server uses its own
+// defaults rather than over-specifying.
+func TestClientApprovePermissionOmitsEmptyOptionals(t *testing.T) {
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	c, _ := newTestClient(t, handler)
+
+	if err := c.ApprovePermission(context.Background(), "s1", "toolu_02", ApprovePermissionOptions{}); err != nil {
+		t.Fatalf("ApprovePermission: %v", err)
+	}
+	if _, ok := capturedBody["scope"]; ok {
+		t.Errorf("scope should be omitted when zero, got %v", capturedBody["scope"])
+	}
+	if _, ok := capturedBody["rule"]; ok {
+		t.Errorf("rule should be omitted when zero, got %v", capturedBody["rule"])
+	}
+	if _, ok := capturedBody["feedback"]; ok {
+		t.Errorf("feedback should be omitted when zero, got %v", capturedBody["feedback"])
+	}
+	if capturedBody["toolUseId"] != "toolu_02" {
+		t.Errorf("toolUseId = %v, want toolu_02", capturedBody["toolUseId"])
+	}
+}
+
+// TestClientApprovePermissionRejectsEmptyIDs is the
+// defensive path: missing sessionID or toolUseID is a
+// programmer error (the PanePermission always carries
+// both — see EventToPermission which rejects empty
+// toolUseId). The client surfaces a clear error rather
+// than POSTing /v1/sessions//approve.
+func TestClientApprovePermissionRejectsEmptyIDs(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be called for empty IDs")
+	}))
+	if err := c.ApprovePermission(context.Background(), "", "toolu_x", ApprovePermissionOptions{}); err == nil {
+		t.Fatal("empty sessionID should error")
+	}
+	if err := c.ApprovePermission(context.Background(), "s1", "", ApprovePermissionOptions{}); err == nil {
+		t.Fatal("empty toolUseID should error")
+	}
+}
+
+// TestClientDenyPermissionSendsReasonAndFeedback: the
+// deny body carries reason + feedback separately per
+// the server's schema (src/nexus/app.ts deny handler).
+func TestClientDenyPermissionSendsReasonAndFeedback(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	c, _ := newTestClient(t, handler)
+
+	if err := c.DenyPermission(context.Background(), "session-1", "toolu_03", "writes outside scope", "stick to the repo"); err != nil {
+		t.Fatalf("DenyPermission: %v", err)
+	}
+	if capturedPath != "/v1/sessions/session-1/deny" {
+		t.Errorf("path = %q, want /v1/sessions/session-1/deny", capturedPath)
+	}
+	if capturedBody["toolUseId"] != "toolu_03" {
+		t.Errorf("body.toolUseId = %v, want toolu_03", capturedBody["toolUseId"])
+	}
+	if capturedBody["reason"] != "writes outside scope" {
+		t.Errorf("body.reason = %v", capturedBody["reason"])
+	}
+	if capturedBody["feedback"] != "stick to the repo" {
+		t.Errorf("body.feedback = %v", capturedBody["feedback"])
+	}
+}
+
+// TestClientDenyPermissionOmitsEmptyFields: same as
+// approve — reason / feedback are dropped when zero so
+// the server gets a minimal body for the "deny once,
+// no comment" path.
+func TestClientDenyPermissionOmitsEmptyFields(t *testing.T) {
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.WriteHeader(http.StatusOK)
+	})
+	c, _ := newTestClient(t, handler)
+
+	if err := c.DenyPermission(context.Background(), "s1", "toolu_04", "", ""); err != nil {
+		t.Fatalf("DenyPermission: %v", err)
+	}
+	if _, ok := capturedBody["reason"]; ok {
+		t.Errorf("reason should be omitted when empty")
+	}
+	if _, ok := capturedBody["feedback"]; ok {
+		t.Errorf("feedback should be omitted when empty")
+	}
+}
+
+// TestClientDenyPermissionRejectsEmptyIDs mirrors the
+// approve guard — same reasoning, same expectation.
+func TestClientDenyPermissionRejectsEmptyIDs(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be called for empty IDs")
+	}))
+	if err := c.DenyPermission(context.Background(), "", "toolu_x", "", ""); err == nil {
+		t.Fatal("empty sessionID should error")
+	}
+	if err := c.DenyPermission(context.Background(), "s1", "", "", ""); err == nil {
+		t.Fatal("empty toolUseID should error")
+	}
+}
+
+func TestClientCancelSessionSendsPathAndReason(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	var capturedAuth string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedAuth = r.Header.Get("Authorization")
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"type": "session_cancelled",
+			"sessionId": "s1",
+			"phase": "cancelled",
+			"activeExecutionCancelled": true,
+			"requestId": "req-99",
+			"transport": "stream",
+			"permissionsResolved": 1,
+			"childSessionsCancelled": 0
+		}`))
+	})
+	c, _ := newTestClient(t, handler)
+	resp, err := c.CancelSession(context.Background(), "s1", "operator hit Esc")
+	if err != nil {
+		t.Fatalf("CancelSession: %v", err)
+	}
+	if capturedPath != "/v1/sessions/s1/cancel" {
+		t.Errorf("path = %q, want /v1/sessions/s1/cancel", capturedPath)
+	}
+	if capturedAuth != "Bearer test-key" {
+		t.Errorf("auth = %q, want Bearer test-key", capturedAuth)
+	}
+	if capturedBody["reason"] != "operator hit Esc" {
+		t.Errorf("body reason = %v, want operator hit Esc", capturedBody["reason"])
+	}
+	if !resp.ActiveExecutionCancelled {
+		t.Error("ActiveExecutionCancelled = false, want true")
+	}
+	if resp.Phase != "cancelled" {
+		t.Errorf("Phase = %q, want cancelled", resp.Phase)
+	}
+	if resp.RequestID != "req-99" {
+		t.Errorf("RequestID = %q, want req-99", resp.RequestID)
+	}
+}
+
+func TestClientCancelSessionOmitsEmptyReason(t *testing.T) {
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"session_cancelled","sessionId":"s1","phase":"cancelled","activeExecutionCancelled":false}`))
+	})
+	c, _ := newTestClient(t, handler)
+	if _, err := c.CancelSession(context.Background(), "s1", ""); err != nil {
+		t.Fatalf("CancelSession: %v", err)
+	}
+	if _, ok := capturedBody["reason"]; ok {
+		t.Errorf("empty reason should be omitted from body, got %v", capturedBody["reason"])
+	}
+}
+
+func TestClientCancelSessionRejectsEmptySessionID(t *testing.T) {
+	c, _ := newTestClient(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("server should not be called for empty sessionID")
+	}))
+	if _, err := c.CancelSession(context.Background(), "", "x"); err == nil {
+		t.Fatal("empty sessionID should error")
 	}
 }

@@ -132,6 +132,43 @@ func ApplyMoveFocus(model LoopModel, direction int) LoopModel {
 	return model
 }
 
+// ApplyFocusPath sets FocusPath to point at the given
+// (workspaceIdx, tabIdx, paneIdx) with bounds checking. If
+// any index is out of range the function returns the model
+// unchanged — the caller (6d-f pane_list Enter handler)
+// falls back to "do nothing" rather than panic. This is
+// the cross-tab / cross-workspace focus jump the
+// pane_list overlay's row-highlight Enter key needs;
+// ApplyMoveFocus only handles intra-tab horizontal shifts.
+//
+// 6d-f adds this for the ctrl+j overlay's Enter handler:
+// the operator navigates rows with up/down, presses Enter
+// on a non-focused pane, and focus jumps. When the
+// selected row is a workspace or tab (not a pane), the
+// operator can still tab-cycling in/out of the tab group
+// by pressing Enter — for now we treat workspace/tab rows
+// as "no jump" (the row would have no pane to focus) and
+// let the caller decide whether to close the overlay.
+func ApplyFocusPath(model LoopModel, workspaceIdx, tabIdx, paneIdx int) LoopModel {
+	if workspaceIdx < 0 || workspaceIdx >= len(model.Workspaces) {
+		return model
+	}
+	ws := model.Workspaces[workspaceIdx]
+	if tabIdx < 0 || tabIdx >= len(ws.Tabs) {
+		return model
+	}
+	tab := ws.Tabs[tabIdx]
+	if paneIdx < 0 || paneIdx >= len(tab.Panes) {
+		return model
+	}
+	model.Focus = FocusPath{
+		WorkspaceIdx: workspaceIdx,
+		TabIdx:       tabIdx,
+		PaneIdx:      paneIdx,
+	}
+	return model
+}
+
 // ApplyNextTab / ApplyPrevTab cycle TabIdx within the focused
 // workspace, wrapping around. They noop when the workspace
 // has zero or one tabs.

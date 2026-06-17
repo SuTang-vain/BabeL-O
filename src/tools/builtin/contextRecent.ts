@@ -4,6 +4,7 @@
 // Wraps recentEvents() from src/tools/contextTools.ts (PR-7 data layer).
 
 import { z } from 'zod'
+import { errorMessage } from '../../shared/errors.js'
 import type { ToolDefinition } from '../Tool.js'
 import { recentEvents } from '../contextTools.js'
 import type { NexusEvent } from '../../shared/events.js'
@@ -32,7 +33,14 @@ export const contextRecentTool: ToolDefinition<typeof inputSchema> = {
   requiresApproval: false,
   async execute(input, context) {
     if (!context.storage) {
-      return { success: false, output: 'storage not available in tool context' }
+      return {
+        success: false,
+        output: {
+          code: 'CONTEXT_STORAGE_UNAVAILABLE',
+          message: 'storage not available in tool context',
+          repairHint: 'Continue from visible session context, or retry contextRecent in a runtime with storage attached.',
+        },
+      }
     }
     try {
       const result = await context.storage.listEvents(context.sessionId, {
@@ -48,7 +56,11 @@ export const contextRecentTool: ToolDefinition<typeof inputSchema> = {
     } catch (error) {
       return {
         success: false,
-        output: error instanceof Error ? error.message : String(error),
+        output: {
+          code: 'CONTEXT_RECENT_FAILED',
+          message: errorMessage(error),
+          repairHint: 'Retry with a smaller n or after session storage is available.',
+        },
       }
     }
   },

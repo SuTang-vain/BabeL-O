@@ -168,3 +168,78 @@ func parseHealthTimestamp(s string) (time.Time, bool) {
 	}
 	return time.Time{}, false
 }
+
+// BuildScopeReviewInputFromHealth is the bridge between
+// the per-pane LoopHealthResponse payload and the
+// ScopeReviewInput consumed by the `bbl loop` ctrl+r
+// scope_review overlay.
+//
+// Returns nil when there is no focused pane (empty model
+// / early startup). Otherwise returns a non-nil input
+// that always carries at least the focused model, so
+// `BuildScopeReviewLines` can render a header + drift
+// count even when no health row matches.
+//
+// Strategy:
+//
+//   - find the focused pane's SessionID in `model`
+//   - find the matching health pane by SessionID
+//   - lift its full taskScope (server returns the full
+//     struct, not a count) + PendingScopeBoundaries /
+//     OutOfScopeEvidence / PendingPermissions /
+//     ActiveMemoryCandidates counts
+//   - if no health pane matches, the input is non-nil but
+//     carries no TaskScope / counts — the overlay renders
+//     a header + the drift count from the model, which is
+//     a useful "health is lagging" signal
+//
+// The returned input is the *only* place these two data
+// shapes meet; tests for scope_review rendering can use
+// the array fields, production code reads from the count
+// fields.
+func BuildScopeReviewInputFromHealth(model LoopModel, health api.LoopHealthResponse) *ScopeReviewInput {
+	focused, ok := model.FocusedPane()
+	if !ok {
+		// No focused pane (empty workspace / tab) —
+		// caller renders the existing "no scope data
+		// yet" placeholder.
+		return nil
+	}
+	input := &ScopeReviewInput{Model: model}
+	if focused.SessionID == "" {
+		// Focused pane hasn't been attached to a session
+		// yet (typed in /v1/execute but no response) — no
+		// health row will match. Caller sees header +
+		// drift count.
+		return input
+	}
+	for _, hp := range health.Panes {
+		if hp.SessionID != focused.SessionID {
+			continue
+		}
+		// Lift the full taskScope (server returns the
+		// struct, not just a count). Field-copy across
+		// the api.LoopTaskScope → loop.LoopTaskScope
+		// type alias so the overlay can hold a pointer
+		// to a loop-package-owned struct.
+		scope := LoopTaskScope{
+			Cwd:                    hp.TaskScope.Cwd,
+			PrimaryRoot:            hp.TaskScope.PrimaryRoot,
+			ExplicitRoots:          hp.TaskScope.ExplicitRoots,
+			ConfirmedExternalRoots: hp.TaskScope.ConfirmedExternalRoots,
+			InferredCandidateRoots: hp.TaskScope.InferredCandidateRoots,
+			Mode:                   hp.TaskScope.Mode,
+			Source:                 hp.TaskScope.Source,
+			LatestDeclaredAt:       hp.TaskScope.LatestDeclaredAt,
+		}
+		input.TaskScope = &scope
+		// Lift counts (server only exposes counts for
+		// these — detail arrays are not in /loop/health).
+		input.PendingBoundaryCount = hp.PendingScopeBoundaries
+		input.OutOfScopeEvidenceCount = hp.OutOfScopeEvidence
+		input.PendingPermissionCount = hp.PendingPermissions
+		input.MemoryCandidateCount = hp.ActiveMemoryCandidates
+		break
+	}
+	return input
+}

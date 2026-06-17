@@ -109,15 +109,19 @@ func (m *InteractiveModel) handleReconcileDone(msg reconcileDoneMsg) tea.Cmd {
 	if m.store != nil {
 		m.loop = applySnapshotToLoop(m.loop, m.store.Snapshot())
 	}
-	// Phase 6c: reconcile just discovered / refreshed panes —
-	// start a per-pane waitForEvent poll for any pane that
-	// has a SessionID but no wait in flight. Per §6'.3 6c
-	// point 10, applyClosePane also cleans up waitInFlight,
-	// so a closed pane won't be re-targeted here.
-	waitCmds := m.startWaitsForNewPanes()
-	if len(waitCmds) == 0 {
+	// Phase 6c / 6d-c'-A: reconcile just discovered /
+	// refreshed panes — start a per-pane read cmd for any
+	// pane that has a SessionID but no read in flight.
+	// The dispatcher (startReadsForNewPanes) picks HTTP
+	// wait or WS stream based on m.useWsRead. Per
+	// §6'.3 6c point 10, applyClosePane also cleans up
+	// waitInFlight (and wsReadInFlight, added in
+	// 6d-c'-A), so a closed pane won't be re-targeted
+	// here.
+	readCmds := m.startReadsForNewPanes()
+	if len(readCmds) == 0 {
 		return scheduleReconcileTick(m.reconcileInterval)
 	}
-	all := append([]tea.Cmd{scheduleReconcileTick(m.reconcileInterval)}, waitCmds...)
+	all := append([]tea.Cmd{scheduleReconcileTick(m.reconcileInterval)}, readCmds...)
 	return tea.Batch(all...)
 }

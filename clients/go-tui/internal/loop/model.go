@@ -67,16 +67,16 @@ func (s PaneStatus) String() string {
 // wiring live elsewhere; this struct only carries the stable
 // snapshot the Bubble Tea model reads.
 type PaneModel struct {
-	PaneID      string
-	WorkspaceID string
-	TabID       string
-	SessionID   string
-	Agent       string
-	Cwd         string
-	Label       string
-	Status      PaneStatus
+	PaneID       string
+	WorkspaceID  string
+	TabID        string
+	SessionID    string
+	Agent        string
+	Cwd          string
+	Label        string
+	Status       PaneStatus
 	LastEventRev int64
-	LastEventAt time.Time
+	LastEventAt  time.Time
 	// PR-17b (Track B §6.5.2): when Status == StatusBehaviorHint,
 	// the runtime-provided LastHintPattern is rendered inline by
 	// the chrome ("[hint] pattern: <pattern>"). Empty unless
@@ -88,6 +88,41 @@ type PaneModel struct {
 	// placeholder in that case. BuildTranscriptLines consumes
 	// this slice — keep entries single-line / pre-flattened.
 	Transcript []TranscriptItem
+	// Input is the per-pane draft prompt (Phase 6d-a). It
+	// deliberately stays a plain string instead of a
+	// bubbles textinput.Model so PaneModel remains pure data;
+	// the Bubble Tea adapter owns key translation and writes
+	// the resulting text back through ApplyPaneInputEvent.
+	Input string
+	// PendingPermission will carry the pane-scoped permission
+	// dialog state in a later 6d slice. The first 6d-a slice
+	// keeps it typed as a lightweight pointer so the model
+	// can satisfy the plan's ownership boundary without
+	// importing the single-pane TUI's pendingPermission type.
+	PendingPermission *PanePermission
+	// QueuedPrompt is the next prompt staged for this pane.
+	// 6d-a sets it on Enter and paints a local transcript row;
+	// a later slice will submit it to Nexus.
+	QueuedPrompt string
+	// InterruptionActive mirrors the single-pane TUI's
+	// "What should BabeL-O do instead?" state. 6d-a only
+	// carries the flag; cancel/interrupt wiring lands later.
+	InterruptionActive bool
+}
+
+// PanePermission is the loop driver's pane-local permission
+// projection. Runtime truth still lives in Nexus; the loop
+// model only stores enough data for a future dialog renderer
+// to attach to the pane that emitted the request.
+type PanePermission struct {
+	ToolUseID       string
+	Name            string
+	Risk            string
+	Message         string
+	SuggestedRule   string
+	ScopeRisk       string
+	TargetRoot      string
+	TaskPrimaryRoot string
 }
 
 // FocusPath identifies the focused pane in a workspace/tab tree.

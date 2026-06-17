@@ -62,18 +62,24 @@ type LoopPaneState struct {
 //     INV-13). When PendingHints > 0, the runtime projection
 //     overrides status to "behaviorHint".
 type LoopHealthPane struct {
-	SessionID             string         `json:"sessionId"`
-	Agent                 string         `json:"agent"`
-	Status                string         `json:"status"`
-	PendingPermissions    int            `json:"pendingPermissions"`
-	PendingScopeBoundaries int            `json:"pendingScopeBoundaries"`
-	OutOfScopeEvidence    int            `json:"outOfScopeEvidence"`
-	PendingHints          int            `json:"pendingHints"`
-	LastHintAt            int64          `json:"lastHintAt"`
-	LastHintPattern       string         `json:"lastHintPattern"`
-	LastEventRev          int64          `json:"lastEventRev"`
-	LastEventAt           string         `json:"lastEventAt"`
-	TaskScope             LoopTaskScope  `json:"taskScope"`
+	SessionID              string        `json:"sessionId"`
+	Agent                  string        `json:"agent"`
+	Status                 string        `json:"status"`
+	PendingPermissions     int           `json:"pendingPermissions"`
+	PendingScopeBoundaries int           `json:"pendingScopeBoundaries"`
+	OutOfScopeEvidence     int           `json:"outOfScopeEvidence"`
+	// ActiveMemoryCandidates is the per-pane memory
+	// candidate count surfaced by /v1/runtime/loop/health
+	// (plan §3.2). The Nexus server may not yet emit this
+	// field — 0 is a safe default that the scope_review
+	// overlay renders as "no memory candidates".
+	ActiveMemoryCandidates int           `json:"activeMemoryCandidates"`
+	PendingHints           int           `json:"pendingHints"`
+	LastHintAt             int64         `json:"lastHintAt"`
+	LastHintPattern        string        `json:"lastHintPattern"`
+	LastEventRev           int64         `json:"lastEventRev"`
+	LastEventAt            string        `json:"lastEventAt"`
+	TaskScope              LoopTaskScope `json:"taskScope"`
 }
 
 // LoopTaskScope mirrors the per-pane taskScope summary exposed
@@ -115,9 +121,25 @@ type WaitResponse struct {
 	Limit        int               `json:"limit"`
 }
 
+// ExecuteResponse mirrors POST /v1/execute. The loop driver
+// only needs the final session id, success bit, and raw event
+// array so it can shape transcript rows through the same
+// EventToTranscriptItem path used by wait polling.
+type ExecuteResponse struct {
+	Type              string            `json:"type"`
+	SessionID         string            `json:"sessionId"`
+	Success           bool              `json:"success"`
+	StatusCode        int               `json:"statusCode"`
+	DurationMs        int               `json:"durationMs"`
+	TimeoutMs         int               `json:"timeoutMs"`
+	ExecuteDurationMs int               `json:"executeDurationMs"`
+	Outcome           string            `json:"outcome"`
+	Events            []json.RawMessage `json:"events"`
+}
+
 // LoopWorkspacesResponse mirrors GET /v1/loop/workspaces.
 type LoopWorkspacesResponse struct {
-	Type   string         `json:"type"`
+	Type   string          `json:"type"`
 	Panes  []LoopPaneState `json:"panes"`
 	Filter struct {
 		WorkspaceID string `json:"workspaceId"`
@@ -256,6 +278,156 @@ func (c *Client) WaitForEvents(ctx context.Context, sessionID string, opts WaitO
 		return WaitResponse{}, err
 	}
 	return out, nil
+}
+
+// ExecutePrompt wraps POST /v1/execute for the loop driver.
+// This is the first 6d execution bridge: HTTP gives us a
+// deterministic "prompt in, events out" path before the later
+// WebSocket slice adds bidirectional permission decisions.
+func (c *Client) ExecutePrompt(ctx context.Context, req ExecutePromptRequest) (ExecuteResponse, error) {
+	body := map[string]any{
+		"prompt": req.Prompt,
+	}
+	if req.SessionID != "" {
+		body["sessionId"] = req.SessionID
+	}
+	if req.Cwd != "" {
+		body["cwd"] = req.Cwd
+	}
+	if req.TimeoutMs > 0 {
+		body["timeoutMs"] = req.TimeoutMs
+	}
+	if req.Policy != "" {
+		body["policy"] = req.Policy
+	}
+	if len(req.AllowedTools) > 0 {
+		body["allowedTools"] = req.AllowedTools
+	}
+	var out ExecuteResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/execute", body, &out); err != nil {
+		return ExecuteResponse{}, err
+	}
+	return out, nil
+}
+
+// ExecutePromptRequest carries the subset of /v1/execute fields
+// that bbl loop needs for 6d-b.
+type ExecutePromptRequest struct {
+	Prompt       string
+	SessionID    string
+	Cwd          string
+	TimeoutMs    int
+	Policy       string
+	AllowedTools []string
+}
+
+// ApprovePermission wraps POST /v1/sessions/:sessionId/approve
+// for the loop driver (6d-c). The server's
+// PendingPermissionRegistry resolves the pending request
+// matching (sessionId, toolUseId) and emits a
+// permission_response event back through the wait stream
+// — the client's wait handler clears the pane's
+// PendingPermission on receipt.
+//
+// The `scope` field follows the Nexus Phase A.1 schema:
+// "once" (default) / "session" / "rule". `rule` is only
+// meaningful when scope="rule"; it's the suggested allow
+// pattern (e.g. "Bash(git:*)") the operator may have edited.
+func (c *Client) ApprovePermission(ctx context.Context, sessionID, toolUseID string, opts ApprovePermissionOptions) error {
+	if sessionID == "" || toolUseID == "" {
+		return errors.New("loop api: ApprovePermission requires sessionID and toolUseID")
+	}
+	body := map[string]any{"toolUseId": toolUseID}
+	if opts.Scope != "" {
+		body["scope"] = opts.Scope
+	}
+	if opts.Rule != "" {
+		body["rule"] = opts.Rule
+	}
+	if opts.Feedback != "" {
+		body["feedback"] = opts.Feedback
+	}
+	path := "/v1/sessions/" + url.PathEscape(sessionID) + "/approve"
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+// DenyPermission wraps POST /v1/sessions/:sessionId/deny
+// (6d-c). `reason` is the "why" surfaced in the runtime's
+// trace + the assistant's next prompt; `feedback` is the
+// "what to do instead" free text. Either may be empty;
+// both travel on the same wire as the runtime expects.
+func (c *Client) DenyPermission(ctx context.Context, sessionID, toolUseID, reason, feedback string) error {
+	if sessionID == "" || toolUseID == "" {
+		return errors.New("loop api: DenyPermission requires sessionID and toolUseID")
+	}
+	body := map[string]any{"toolUseId": toolUseID}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	if feedback != "" {
+		body["feedback"] = feedback
+	}
+	path := "/v1/sessions/" + url.PathEscape(sessionID) + "/deny"
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+// CancelSession wraps POST /v1/sessions/:sessionId/cancel
+// (6d-d). The server aborts the in-flight execute via
+// the activeExecution abortController and transitions
+// the session to phase='cancelled' (or whatever
+// `reason` field hints at). Returns the server's
+// session_cancelled envelope so the caller can see
+// whether an active execution was actually cancelled
+// (`ActiveExecutionCancelled` flag) and how many child
+// sessions were rolled up.
+//
+// The empty-sessionID guard is the same pattern
+// Approve/Deny use; the runtime's session-not-found 404
+// surfaces as a normal Go error (doJSON handles the
+// status code).
+func (c *Client) CancelSession(ctx context.Context, sessionID, reason string) (CancelResponse, error) {
+	if sessionID == "" {
+		return CancelResponse{}, errors.New("loop api: CancelSession requires sessionID")
+	}
+	body := map[string]any{}
+	if reason != "" {
+		body["reason"] = reason
+	}
+	var out CancelResponse
+	path := "/v1/sessions/" + url.PathEscape(sessionID) + "/cancel"
+	if err := c.doJSON(ctx, http.MethodPost, path, body, &out); err != nil {
+		return CancelResponse{}, err
+	}
+	return out, nil
+}
+
+// CancelResponse mirrors the wire shape of
+// POST /v1/sessions/:sessionId/cancel. The runtime
+// returns `session_cancelled` plus the bookkeeping
+// fields the loop driver reads to decide whether the
+// pane should re-show a waiting placeholder (no active
+// execution was cancelled — the cancel raced a
+// natural completion) or flip straight to a "cancelled
+// by operator" status.
+type CancelResponse struct {
+	Type                    string `json:"type"`
+	SessionID               string `json:"sessionId"`
+	Phase                   string `json:"phase"`
+	ActiveExecutionCancelled bool   `json:"activeExecutionCancelled"`
+	RequestID               string `json:"requestId,omitempty"`
+	Transport               string `json:"transport,omitempty"`
+	PermissionsResolved     int    `json:"permissionsResolved"`
+	ChildSessionsCancelled  int    `json:"childSessionsCancelled"`
+}
+
+// ApprovePermissionOptions carries the optional scope/rule/
+// feedback fields the server accepts on /approve. Zero
+// values are dropped from the JSON body so the server falls
+// back to its defaults (scope='once', no rule, no feedback).
+type ApprovePermissionOptions struct {
+	Scope    string
+	Rule     string
+	Feedback string
 }
 
 // WaitOptions carries wait query parameters. Zero values are

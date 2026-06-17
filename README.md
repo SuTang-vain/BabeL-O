@@ -211,6 +211,12 @@ BabeL-O is built around explicit boundaries:
 - MemoryOS results are hints, not authoritative workspace facts.
 - Nexus is the runtime source of truth; the TUI is the interaction layer.
 
+## Architecture
+
+For a deeper public overview of how the CLI, Go TUI, Nexus daemon, runtime,
+tools, agents, memory, storage, and observability layers fit together, see
+[BabeL-O Architecture](docs/nexus/ARCHITECTURE.md).
+
 ## Release Notes
 
 As of v0.3.7, the old `bbl chat` TypeScript TUI has been removed from the

@@ -16,12 +16,38 @@ import "fmt"
 // worker) fetches taskScope / boundaries / evidence from the
 // Phase 1b `/v1/runtime/loop/health` endpoint and forwards the
 // focused model alongside.
+//
+// Two source modes are supported:
+//
+//   1. **Live (production)** — set by `handleHealthDone`
+//      from `/v1/runtime/loop/health`. The server only
+//      exposes taskScope (full) + counts of pending
+//      boundaries / out-of-scope evidence / memory
+//      candidates / pending permissions. The detail arrays
+//      (Boundaries, Evidence) stay empty; the count fields
+//      drive the count-only line variants in
+//      `BuildScopeReviewLines`.
+//
+//   2. **Synthetic (tests / future)** — Boundaries /
+//      Evidence arrays are filled in for richer rendering.
+//      When both an array and its corresponding count are
+//      set, the array wins (richer detail). This is the
+//      contract used by scope_review_test.go today and is
+//      also the shape a future `/v1/sessions/:id/events`
+//      expansion can fill in for forensic drift review.
 type ScopeReviewInput struct {
-	Model         LoopModel
-	TaskScope     *LoopTaskScope
-	Boundaries    []LoopPendingBoundary
-	Evidence      []LoopOutOfScopeEvidence
-	MemoryCandidateCount int
+	Model LoopModel
+	TaskScope *LoopTaskScope
+	// Detail arrays (synthetic / future).
+	Boundaries []LoopPendingBoundary
+	Evidence   []LoopOutOfScopeEvidence
+	// Stat counts (live from /v1/runtime/loop/health).
+	// These are used when the corresponding detail array
+	// is empty.
+	PendingBoundaryCount      int
+	OutOfScopeEvidenceCount   int
+	PendingPermissionCount    int
+	MemoryCandidateCount      int
 }
 
 // LoopTaskScope mirrors the per-pane taskScope summary from
@@ -107,7 +133,10 @@ func BuildScopeReviewLines(input ScopeReviewInput) []string {
 		}
 	}
 
-	// 3. pending boundaries
+	// 3. pending boundaries (array takes precedence; count
+	// is the live-from-health fallback). When only the
+	// count is available we still print a header so the
+	// operator sees the drift signal.
 	if len(input.Boundaries) > 0 {
 		lines = append(lines, fmt.Sprintf("pending boundaries (%d)", len(input.Boundaries)))
 		limit := len(input.Boundaries)
@@ -120,9 +149,11 @@ func BuildScopeReviewLines(input ScopeReviewInput) []string {
 		if len(input.Boundaries) > 5 {
 			lines = append(lines, fmt.Sprintf("  ... %d more", len(input.Boundaries)-5))
 		}
+	} else if input.PendingBoundaryCount > 0 {
+		lines = append(lines, fmt.Sprintf("pending boundaries: %d (live from health; use scope_drift overlay for details)", input.PendingBoundaryCount))
 	}
 
-	// 4. out-of-scope evidence
+	// 4. out-of-scope evidence (same precedence rule).
 	if len(input.Evidence) > 0 {
 		lines = append(lines, fmt.Sprintf("out-of-scope evidence (%d)", len(input.Evidence)))
 		limit := len(input.Evidence)
@@ -135,11 +166,24 @@ func BuildScopeReviewLines(input ScopeReviewInput) []string {
 		if len(input.Evidence) > 3 {
 			lines = append(lines, fmt.Sprintf("  ... %d more", len(input.Evidence)-3))
 		}
+	} else if input.OutOfScopeEvidenceCount > 0 {
+		lines = append(lines, fmt.Sprintf("out-of-scope evidence: %d (live from health)", input.OutOfScopeEvidenceCount))
 	}
 
 	// 5. memory candidates
 	if input.MemoryCandidateCount > 0 {
 		lines = append(lines, fmt.Sprintf("memory candidates: %d (use inbox overlay to review)", input.MemoryCandidateCount))
+	}
+
+	// 6. pending permissions (live count; no detail array
+	// exists today — the per-permission dialog surface is
+	// already rendered when the focused pane has a
+	// PendingPermission attached, so this is just a
+	// chrome-level signal that the runtime has more
+	// permission requests in flight for non-focused panes
+	// or future focused-pane updates).
+	if input.PendingPermissionCount > 0 {
+		lines = append(lines, fmt.Sprintf("pending permissions: %d (operator decision required)", input.PendingPermissionCount))
 	}
 
 	return lines

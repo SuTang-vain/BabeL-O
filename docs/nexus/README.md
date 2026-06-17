@@ -31,6 +31,7 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 
 | 文档 | 口径 |
 | --- | --- |
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | 面向外部的 BabeL-O 架构说明：Client、Nexus、Runtime、Framework abstractions、Harness、Observability 与 Loop 的真实代码边界。 |
 | [TODO.md](./TODO.md) | 总控规划、阶段状态、当前优先级和阻塞项。 |
 | [DONE.md](./DONE.md) | 已完成能力索引，把 TODO 中的 `[x]` 历史移出待办清单。 |
 | [WORK_LOG.md](./WORK_LOG.md) | 事实性工作记录、验证命令和重要决策。 |
@@ -90,7 +91,8 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 
 根目录旧文档已按以下规则合并：
 
-- `ARCHITECTURE.md` 的架构原则合并到本 README。
+- 旧根目录 `ARCHITECTURE.md` 的架构原则已合并到本 README；当前对外架构说明见
+  [ARCHITECTURE.md](./ARCHITECTURE.md)。
 - `PLAN.md`、`RECOMMENDATIONS.md`、`BabeL-O_优化建议_v1.0.md` 的可执行结论合并到 `TODO.md` 与各主线 TODO。
 - `BabeL-O_vs_BabeL-X_深度分析_v1.0.md` 和 `BabeL-O_调优规划_v1.0.md` 的上下文、prompt、provider、工具容错结论已经体现在 `reference/context-and-subagent-upgrade-plan.md`、`active/TODO_runtime.md`、`active/TODO_provider_registry.md` 和 `WORK_LOG.md`。
 - `BabeL-O_Session_d61f22d0_问题分析.md` 的真实会话结论已经进入 `TODO.md` 与 `WORK_LOG.md`。

@@ -6,6 +6,8 @@
 
 - [context-and-subagent-upgrade-plan.md](./context-and-subagent-upgrade-plan.md): Context Manager、ContextForker 与模型可见 AgentScheduler 架构参考。
 - [context-management-optimization-plan.md](./context-management-optimization-plan.md): 基于 BabeL-2 上下文管理机制复盘与 BabeL-O 真实 session `session_661479db-6327-46f2-a793-7b88e0431174` 的上下文管理优化规划；聚焦 runtime-owned context facts、microcompact-first、compact boundary protocol、provider context-limit recovery 与 Go TUI 可见性。
+- [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md): Cache 命中率观测与 Nexus 实时检测规划；明确 Prompt Cache 可基于 provider cache tokens 评估，Code Index / Tool / Reasoning Cache 在缺少 hit/miss 事实前必须显示为 unavailable，并规划 `/v1/runtime/metrics`、`/v1/runtime/status`、`/v1/runtime/loop/health` 的接入路径。
+- [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md): 对外架构评估后的成熟度补齐规划；承接 Agent Trace Schema、Trajectory Eval Harness、durable run checkpoint/resume、MCP context primitives、memory quality metrics 与 loop taxonomy。
 - [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md): 工具粒度、证据语义与 Agent tool 命名治理。
 - [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md): task scope / evidence scope 治理；防止 read-only 工具把 sibling repo、历史 session path 或 memory hit 自动当作本轮任务证据。
 - [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md): workspace path drift、连续路径失败恢复与证据降级治理。
@@ -21,6 +23,9 @@
 - [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md): EverCore managed sidecar 按需拉起、缓存复用、idle TTL、`/memory` 管理面板与记忆能力问答不泄露内通的治理规划。
 - [tool-surface-expansion-and-native-mcp-coexistence-plan.md](./tool-surface-expansion-and-native-mcp-coexistence-plan.md): Plan-only 工具面扩展草案；规划 native tools、MCP coexistence、Plan/HITL tool surface 与 governance，不等同于源码已注册这些工具。
 - [tool-governance-reference-integration.md](./tool-governance-reference-integration.md): 工具治理参考整合索引；把 tool granularity、evidence scope、tool surface expansion 三条规划串成一致的边界说明。
+- [tool-call-text-normalization-and-final-response-governance-plan.md](./tool-call-text-normalization-and-final-response-governance-plan.md): 基于 `session_ee116547-6545-4f70-bc7c-b1b287387cda` 的 DSML / pseudo tool-call 文本泄漏治理规划；区分 tools visible 下的可解析文本工具调用与 final-response-only / respond-only 下必须 suppression + retry 的禁用阶段。
+- [tool-loop-budget-and-finalization-governance-plan.md](./tool-loop-budget-and-finalization-governance-plan.md): 工具循环预算与 finalization 治理规划；保留 `maxLoops` 护栏但拆出 adaptive budget、`final_check` 与 fresh continuation budget，避免长任务 premature final-only 或无限工具循环。
+- [recoverable-tool-error-and-session-continuity-governance-plan.md](./recoverable-tool-error-and-session-continuity-governance-plan.md): 可恢复工具错误与 session continuity 治理规划；把普通工具执行失败从 terminal `TOOL_ERROR` 改为 provider-visible `tool_result is_error=true`，并补 `Grep` 以 `-` 开头 pattern 的真实 regression。
 - [go-runner-plan.md](./go-runner-plan.md): 可选 Go `RemoteToolRunner` 执行后端参考。
 - [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。
 - [go-tui-loop-multipane-plan.md](./go-tui-loop-multipane-plan.md): 借鉴 [ogulcancelik/herdr](https://github.com/ogulcancelik/herdr) 的 workspace/tab/pane + wait-event + persist snapshot 形态，新增 `bbl loop` 多 session pane TUI 入口的长期规划；不复制 herdr 的 IPC/multiplexer 责任，只复用 API 形态，不引入新的 runtime truth。

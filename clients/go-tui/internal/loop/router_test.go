@@ -74,7 +74,7 @@ func TestRouterRoutesFocusMovement(t *testing.T) {
 func TestRouterForwardsPrintableKeysToFocus(t *testing.T) {
 	r := NewRouter()
 	model := NewLoopModel()
-	cases := []string{"a", "Z", "1", "/", ".", "?", "tab"}
+	cases := []string{"a", "Z", "1", "/", ".", "?", "tab", "enter", "backspace"}
 	for _, key := range cases {
 		route, _ := r.Dispatch(RawEvent{Kind: "key", Key: key}, model)
 		if route.Action != RouteFocusPane {
