@@ -1,8 +1,18 @@
 # Behavior Monitor — 设计文档
 
-> 状态：v1 草案
+> 状态：v1 草案 — Server 侧 Phase 1/2 已落地（2026-06-16），Go 端 mirror 留作 PR-17（独立 repo）
 > 范围：把 `sessionMemoryLite` 的"natural_pause 频繁写日志"问题，重新定位为"agent 行为轨迹 + 跨 session 自检复盘"系统
 > 替代：`sessionMemoryLite` 的 `natural_pause` 决策分支（保留 `forced` / `growth_threshold`）
+
+**Server 侧落地清单**（按 PR）：
+- PR-1 (2026-06-14): `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag 默认压制 `natural_pause`
+- PR-2 (2026-06-14): `src/runtime/behaviorTrace.ts` 5 类 trigger + 队列 + flush
+- PR-3 (2026-06-14): `wrapWithBehaviorTraceTap()` 包装 runtime error path
+- PR-5 (2026-06-15): `src/nexus/behaviorMonitor.ts` 跨 session 3 类触发器 (hot-path/tool-storm/scope-drift-wave)
+- PR-6 (2026-06-16): `applyBehaviorHint()` 投影 PaneStatus 新 `behaviorHint` 态 (priority 6)
+- PR-14 (2026-06-16): `/v1/runtime/loop/health` 暴露 `pendingHints` / `lastHintAt` / `lastHintPattern`
+
+**Go 端**：`bbl-loop` 独立 repo（PR-17），不阻塞 server 侧。
 
 ---
 
@@ -421,6 +431,11 @@ const STATUS_PRIORITY: Record<PaneStatus, number> = {
 
 ### 6.5.2 P1 集成：新增 `StatusBehaviorHint` 态
 
+> **状态**：
+> - ✅ Server 端 `applyBehaviorHint()` + `STATUS_PRIORITY.behaviorHint: 6` 已落地（PR-6, 2026-06-16）
+> - ✅ HTTP 响应 `pendingHints` / `lastHintAt` / `lastHintPattern` 3 个新字段已落地（PR-14, 2026-06-16）
+> - ⏸ Go 端 `model.go` 改 enum + `chrome.go` 渲染 — 留作 Go mirror（独立 repo）
+
 **服务端**（`src/runtime/loopDiagnostics.ts`）：
 ```ts
 case 'behavior_hint':
@@ -467,13 +482,13 @@ const (
 
 ### 6.5.3 集成点矩阵
 
-| 集成点 | 优先级 | 改动 | 阶段 |
-|---|---|---|---|
-| **A. PaneStatus 加 `StatusBehaviorHint`** | P1 高 | `loopDiagnostics.ts` +15 行 / `model.go` +3 行 / `chrome.go` +20 行 | P1 |
-| **B. 复用 `internal/loop/notifications/`** | P2 中 | notifications 包接入 `behavior_hint` 消息类型 | P2 |
-| **C. reconcile_worker 订阅 WebSocket** | P2 中 | `reconcile_worker.go` 双向：HTTP 轮询 + WS 推送 | P2 |
-| **D. 新增 "Behavior" Tab** | P2 低 | `LoopModel` 增 tab 类型；新增 `BehaviorPaneModel` | P2（独立工作） |
-| **E. cross-session pattern 可视化** | P2 杀手锏 | 多 pane + 模式栏组合渲染 | P2 |
+| 集成点 | 优先级 | 改动 | 阶段 | 状态 |
+|---|---|---|---|---|
+| **A. PaneStatus 加 `StatusBehaviorHint`** | P1 高 | `loopDiagnostics.ts` +15 行 / `model.go` +3 行 / `chrome.go` +20 行 | P1 | ✅ Server 端落地（PR-6 + PR-14, 2026-06-16）；⏸ Go 端 mirror 留作 PR-17（独立 repo） |
+| **B. 复用 `internal/loop/notifications/`** | P2 中 | notifications 包接入 `behavior_hint` 消息类型 | P2 | ⏸ 待 Go 端 |
+| **C. reconcile_worker 订阅 WebSocket** | P2 中 | `reconcile_worker.go` 双向：HTTP 轮询 + WS 推送 | P2 | ⏸ 待 Go 端 |
+| **D. 新增 "Behavior" Tab** | P2 低 | `LoopModel` 增 tab 类型；新增 `BehaviorPaneModel` | P2（独立工作） | ⏸ 待 Go 端 |
+| **E. cross-session pattern 可视化** | P2 杀手锏 | 多 pane + 模式栏组合渲染 | P2 | ⏸ 待 Go 端 |
 
 ### 6.5.4 Phase 2 行为面板（独立工作，不阻塞 P1）
 
@@ -506,15 +521,20 @@ Workspace: ws-default
 
 ### 6.5.5 P1 集成改动预算
 
-| 步骤 | 文件 | 行数 | 风险 |
-|---|---|---|---|
-| 1. `loopDiagnostics.ts` | 改 | +15 | 低 |
-| 2. `nexus/app.ts` (loop/health) | 改 | +15 | 低 |
-| 3. `shared/events.ts` (`behavior_hint` 事件类型) | 改 | +5 | 低 |
-| 4. Go `model.go` PaneStatus | 改 | +3 | 低 |
-| 5. Go `chrome.go` 渲染 hint | 改 | +20 | 低 |
-| 6. 测试（Node + Go） | 新 | ~150 | 0 |
-| **总计** | | **~210 行 / 1-2 天** | **bbl loop 现有 6 态完全不变** |
+> **实际落地（2026-06-16）**:
+> - Server 端步骤 1+2+3 已完成 (PR-6 + PR-14)
+> - Node 测试：35 unit (PR-6 + PR-14) + 5 e2e (PR-14) = 40 测试
+> - Go 端步骤 4+5+6 ⏸ 留作 PR-17 (独立 repo `bbl-loop`)
+
+| 步骤 | 文件 | 估算行数 | 风险 | 状态 |
+|---|---|---|---|---|
+| 1. `loopDiagnostics.ts` | 改 | +15 | 低 | ✅ PR-6 (2026-06-16) |
+| 2. `nexus/app.ts` (loop/health) | 改 | +15 | 低 | ✅ PR-14 (2026-06-16) |
+| 3. `shared/events.ts` (`behavior_hint` 事件类型) | 改 | +5 | 低 | ✅ (PR-6 一并) |
+| 4. Go `model.go` PaneStatus | 改 | +3 | 低 | ⏸ PR-17 (Go mirror) |
+| 5. Go `chrome.go` 渲染 hint | 改 | +20 | 低 | ⏸ PR-17 (Go mirror) |
+| 6. 测试（Node + Go） | 新 | ~150 | 0 | ✅ Node 40 测试; ⏸ Go 测试待 PR-17 |
+| **总计** | | **~210 行 / 1-2 天** | **bbl loop 现有 6 态完全不变 (INV-12 守恒)** | 50% 落地 (server 侧) |
 
 ### 6.5.6 不变量（bbl loop 集成专属）
 

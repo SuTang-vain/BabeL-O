@@ -43,6 +43,7 @@ export const skillListTool: ToolDefinition<typeof skillListInputSchema> = {
   name: 'SkillList',
   description:
     'List visible skills (built-in / user / project). Returns normalized metadata only, not full bodies; use SkillShow to inspect a specific skill.',
+  prompt: () => 'SkillList is the discovery entry point for skills. Use it when you need to find a skill that matches a task ("find me a skill for X", "list available skills", "what skills do I have for refactoring"). Skills are reusable prompt packs — bundled with BabeL-O (builtInDir), per-user, or per-project. SkillList returns normalized metadata (id, name, description, source, tags) but NOT the full skill body. After finding a candidate, call SkillShow with the skill id to read the canonical Markdown body. Set source to filter: "built-in" / "user" / "project". Use cwd to scope to a specific project workspace. Returns do NOT enter active context — call this only when you actually need a skill reference.',
   risk: 'read',
   inputSchema: skillListInputSchema,
   async execute(input, context: ToolContext): Promise<ToolResult> {
@@ -89,6 +90,7 @@ const skillShowInputSchema = z.object({
 export const skillShowTool: ToolDefinition<typeof skillShowInputSchema> = {
   name: 'SkillShow',
   description: 'Show a single skill by id, including its body (canonical Markdown).',
+  prompt: () => 'SkillShow retrieves the full body of a single skill by id. Use it after SkillList returns a candidate, or when the user names a specific skill ("show me the X skill"). The body is canonical Markdown that can be embedded into your response or used to ground a follow-up action. The id comes from SkillList (or from a previous turn where the user mentioned a skill name). SkillShow does not modify state — it is a read-only lookup. If the skill is not found, the tool returns an error; do not retry with the same id, instead use SkillList to re-discover available skills. Result does NOT enter active context — call it only when you actually need the skill body.',
   risk: 'read',
   inputSchema: skillShowInputSchema,
   async execute(input, context: ToolContext): Promise<ToolResult> {
@@ -138,6 +140,7 @@ export const skillValidateTool: ToolDefinition<typeof skillValidateInputSchema> 
   name: 'SkillValidate',
   description:
     'Validate a skill: either by id (loads from cwd registry) or by raw markdown body. Returns structured diagnostics; never throws.',
+  prompt: () => 'SkillValidate is a structural linter for skill Markdown. Use it before SkillDraft to check raw body content, or after editing a skill to confirm the schema is still valid. It accepts either id (loads from cwd registry) OR body (raw Markdown) — exactly one is required. Returns a structured diagnostics object listing errors, warnings, and pass/fail per field. The tool never throws — it always returns a result, even on invalid input, so you can safely call it speculatively. Schema covers: frontmatter fields (name, description, whenToUse), required sections, body length limits, and tag format. Result does NOT enter active context.',
   risk: 'read',
   inputSchema: skillValidateInputSchema,
   async execute(input, context: ToolContext): Promise<ToolResult> {
@@ -212,6 +215,7 @@ export const skillDraftTool: ToolDefinition<typeof skillDraftInputSchema> = {
   name: 'SkillDraft',
   description:
     'Generate a normalized skill draft from a title and optional context. Drafts are in-memory only; use SkillSave (with confirm: true) to persist.',
+  prompt: () => 'SkillDraft generates a normalized skill draft from a title plus optional description and context. The result is in-memory only — to actually save it, you must call SkillSave with confirm: true in a SEPARATE step. Use SkillDraft when the user asks to author a new skill ("write me a skill for X", "create a refactoring skill"). The draft includes frontmatter, default sections, and a body scaffold. The tool does not validate against the full schema — call SkillValidate on the draft body to check. Important workflow: Draft → Validate → (optional edits) → Save. The Draft step alone does NOT persist anything. Returns do NOT enter active context.',
   risk: 'read',
   inputSchema: skillDraftInputSchema,
   async execute(input): Promise<ToolResult> {
@@ -284,6 +288,7 @@ export const skillSaveTool: ToolDefinition<typeof skillSaveInputSchema> = {
   name: 'SkillSave',
   description:
     'Persist a skill draft to disk. Requires explicit `confirm: true` after preview. Write risk; goes through runtime permission flow.',
+  prompt: () => 'SkillSave persists a skill draft to disk. This is a WRITE tool that goes through the runtime permission flow and requires explicit user approval (the `confirm: true` flag is mandatory — without it, the tool returns a preview only). Use it ONLY after the user has approved the skill content. Recommended workflow: SkillDraft → SkillShow (preview) → user review → SkillSave with confirm: true. NEVER call SkillSave with confirm: true speculatively. The tool writes the skill to disk under the appropriate scope (user or project) and returns the saved skill id. If the user declines or wants edits, drop the confirm flag and re-run the draft/edit cycle. SkillSave is the only step in the workflow that produces a durable change; all preceding steps are in-memory.',
   risk: 'write',
   requiresApproval: true,
   suggestedAllowRule: '- tool: SkillSave',

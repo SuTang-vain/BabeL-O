@@ -19,7 +19,7 @@ import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
 import { DEFAULT_SESSION_CHANNEL_POLICY, type SessionChannel, type SessionChannelPolicy, type SessionMessage } from '../shared/sessionChannel.js'
 import { evaluateSessionMemoryCandidate } from '../runtime/memoryCandidateGovernance.js'
-import { derivePaneStatus } from '../runtime/loopDiagnostics.js'
+import { applyBehaviorHint, derivePaneStatus } from '../runtime/loopDiagnostics.js'
 import { errorMessage } from '../shared/errors.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
@@ -942,6 +942,58 @@ export async function createNexusApp(
     return summary
   }
 
+  // PR-14: derive a BehaviorHintProjection for a session by reading
+  // cross-session (source=nexus) trace entries from .babel-o/behavior-trace.jsonl
+  // and applying the 5min cooldown window.
+  function summarizeBehaviorHint(cwd: string, sessionId: string): {
+    pendingHints: number
+    lastHintAt?: number
+    lastHintPattern?: string
+  } {
+    const tracePath = _resolve(cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+    if (!_existsSync(tracePath)) {
+      return { pendingHints: 0 }
+    }
+    let raw: string
+    try {
+      raw = _readFileSync(tracePath, 'utf8')
+    } catch {
+      return { pendingHints: 0 }
+    }
+    const now = Date.now()
+    const cooldownMs = 5 * 60_000
+    let pendingHints = 0
+    let lastHintAt: number | undefined
+    let lastHintPattern: string | undefined
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      let entry: BehaviorTraceEntry
+      try {
+        entry = JSON.parse(trimmed) as BehaviorTraceEntry
+      } catch {
+        continue
+      }
+      if (entry.sessionId !== sessionId) continue
+      const source = (entry.anomaly as { source?: string } | undefined)?.source
+      if (source !== 'nexus') continue
+      const ts = Date.parse(entry.timestamp)
+      if (!Number.isFinite(ts) || ts < now - cooldownMs) continue
+      pendingHints += 1
+      const tsMs = ts
+      if (lastHintAt === undefined || tsMs > lastHintAt) {
+        lastHintAt = tsMs
+        lastHintPattern = entry.anomaly?.errorMessage
+          || entry.anomaly?.errorCode
+          || entry.anomaly?.driftPath
+          || entry.anomaly?.denialReason
+          || entry.anomaly?.userRedirectSignal
+          || undefined
+      }
+    }
+    return { pendingHints, lastHintAt, lastHintPattern }
+  }
+
   app.get('/v1/runtime/loop/health', async (request, reply) => {
     const query = loopHealthQuerySchema.parse(request.query)
     const candidateIds = new Set<string>()
@@ -995,16 +1047,31 @@ export async function createNexusApp(
       }
       const status = derivePaneStatus({ events })
       const taskScope = summarizeTaskScope(events)
+      // PR-14: derive behavior hint projection from cross-session trace file
+      // and apply via applyBehaviorHint (PR-6). This may upgrade status to
+      // 'behaviorHint' if there are recent cross-session detections.
+      const hintProjection = summarizeBehaviorHint(
+        taskScope.cwd || options.storage.toString?.() || '',
+        sessionId,
+      )
+      const finalSnapshot = applyBehaviorHint(status, {
+        pendingHints: hintProjection.pendingHints,
+        lastHintAt: hintProjection.lastHintAt,
+        lastHintPattern: hintProjection.lastHintPattern,
+      })
       panes.push({
         sessionId,
         agent: 'bbl',
-        status: status.status,
-        pendingPermissions: status.pendingPermissions,
-        pendingScopeBoundaries: status.pendingScopeBoundaries,
-        outOfScopeEvidence: status.outOfScopeEvidence,
-        lastEventRev: status.lastEventSeq,
-        lastEventAt: status.lastEventAt,
+        status: finalSnapshot.status,
+        pendingPermissions: finalSnapshot.pendingPermissions,
+        pendingScopeBoundaries: finalSnapshot.pendingScopeBoundaries,
+        outOfScopeEvidence: finalSnapshot.outOfScopeEvidence,
+        lastEventRev: finalSnapshot.lastEventSeq,
+        lastEventAt: finalSnapshot.lastEventAt,
         taskScope,
+        pendingHints: finalSnapshot.pendingHints,
+        lastHintAt: finalSnapshot.lastHintAt,
+        lastHintPattern: finalSnapshot.lastHintPattern,
       })
     }
 
@@ -1608,6 +1675,102 @@ export async function createNexusApp(
 
   app.get('/v1/schema/events', async () => {
     return z.toJSONSchema(NexusEventSchema)
+  })
+
+  // PR-11: Track A Phase 2 — context history REST endpoint.
+  // Reuses PR-7 data layer (searchEvents, summarizeWindow) and PR-10
+  // parseSince helper. Read-only, no Nexus server state required.
+  app.get('/v1/context/history', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const scope = (q.scope === 'search' ? 'search' : 'summarize') as 'search' | 'summarize'
+    const query = q.query
+    const maxTokens = q.maxTokens ? Number(q.maxTokens) : 5000
+    if (Number.isNaN(maxTokens) || maxTokens <= 0) {
+      return reply.code(400).send({ error: 'maxTokens must be a positive number' })
+    }
+    const sinceMs = q.since ? parseSinceFromQuery(q.since) : undefined
+    if (q.since && sinceMs === undefined) {
+      return reply.code(400).send({ error: `Invalid since: ${q.since}. Use e.g. 24h, 30m, 1d, 1w.` })
+    }
+    const summarizeScope = (q.summarizeScope ?? 'all') as
+      'all' | 'error' | 'denial' | 'scope-drift' | 'user-redirect' | 'trajectory-end' | 'cross-session'
+    return await runContextHistory({
+      cwd, scope, query, sinceMs, maxTokens, summarizeScope,
+    })
+  })
+
+  // PR-12: Track A Phase 2 — context working-set REST endpoints.
+  // Read-only. Reuses PR-4b PersistedWorkingSetTracker.
+  app.get('/v1/context/working-set', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    return await runWorkingSetList({ cwd })
+  })
+
+  app.get('/v1/context/working-set/:sessionId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = (request.params as { sessionId: string }).sessionId
+    return await runWorkingSetGet({ cwd, sessionId })
+  })
+
+  // PR-20: Track A Phase 3 — GET /v1/context/working-set/workspace/:wsId.
+  // Per design §7.3 row 3. Returns the working set aggregated across all
+  // sessions that share the same workspaceId. Pure read.
+  app.get('/v1/context/working-set/workspace/:wsId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const workspaceId = (request.params as { wsId: string }).wsId
+    if (!workspaceId) {
+      return reply.code(400).send({ error: 'workspaceId path param is required' })
+    }
+    return await runWorkspaceWorkingSetGet({ cwd, workspaceId })
+  })
+
+  // PR-18: Track A Phase 3 — POST /v1/context/assemble.
+  // Read-only manual context assembly. Reuses PR-15 buildAssemblePreview
+  // (the pure function extracted from runAssemble). Pure read — never
+  // mutates state. Mirrors design §7.3 row 1.
+  app.post('/v1/context/assemble', async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const cwd = typeof body.cwd === 'string' ? body.cwd : undefined
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd is required in body' })
+    }
+    const scopeRaw = typeof body.scope === 'string' ? body.scope : 'standard'
+    const validScopes = ['minimal', 'standard', 'full', 'task', 'workspace']
+    if (!validScopes.includes(scopeRaw)) {
+      return reply.code(400).send({ error: `Invalid scope: ${scopeRaw}. Must be one of: ${validScopes.join(', ')}` })
+    }
+    const maxTokensRaw = body.maxTokens
+    const maxTokens = typeof maxTokensRaw === 'number'
+      ? maxTokensRaw
+      : typeof maxTokensRaw === 'string'
+        ? Number(maxTokensRaw)
+        : 7500
+    if (Number.isNaN(maxTokens) || maxTokens <= 0) {
+      return reply.code(400).send({ error: 'maxTokens must be a positive number' })
+    }
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
+    return await runContextAssemble({
+      cwd,
+      sessionId,
+      scope: scopeRaw as 'minimal' | 'standard' | 'full' | 'task' | 'workspace',
+      maxTokens,
+    })
   })
 
   app.get('/v1/tools/audit', async () => ({
@@ -5037,5 +5200,297 @@ export function validateSecurityConfig(host: string, apiKey: string | undefined)
     throw new Error(
       `Security Error: Running Nexus on non-localhost (${host}) requires setting the NEXUS_API_KEY environment variable.`,
     )
+  }
+}
+
+// ─── PR-11: /v1/context/history endpoint helpers ──────────────────────────
+//
+// These are free functions (not closures) so they can be unit-tested
+// independently of the Fastify request lifecycle. The route handler above
+// just validates params and delegates here.
+
+import { existsSync as _existsSync, readFileSync as _readFileSync } from 'node:fs'
+import { resolve as _resolve } from 'node:path'
+import {
+  BEHAVIOR_TRACE_RELATIVE_PATH,
+  type BehaviorTraceEntry,
+} from '../runtime/behaviorTrace.js'
+import { searchEvents, summarizeWindow } from '../tools/contextTools.js'
+
+export function parseSinceFromQuery(s: string): number | undefined {
+  const match = s.trim().match(/^(\d+)\s*([hmdw])$/i)
+  if (!match) return undefined
+  const n = Number(match[1])
+  const unit = match[2]!.toLowerCase()
+  if (unit === 'm') return n * 60_000
+  if (unit === 'h') return n * 60 * 60_000
+  if (unit === 'd') return n * 24 * 60 * 60_000
+  if (unit === 'w') return n * 7 * 24 * 60 * 60_000
+  return undefined
+}
+
+export type ContextHistoryParams = {
+  cwd: string
+  scope: 'search' | 'summarize'
+  query?: string
+  sinceMs?: number
+  maxTokens: number
+  summarizeScope: 'all' | 'error' | 'denial' | 'scope-drift' | 'user-redirect' | 'trajectory-end' | 'cross-session'
+}
+
+export async function runContextHistory(params: ContextHistoryParams): Promise<{
+  type: 'context_history_result'
+  scope: 'search' | 'summarize'
+  content: string
+  hitCount: number
+  tokenEstimate: number
+  truncated: boolean
+  contentTruncated?: number
+}> {
+  const tracePath = _resolve(params.cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+  if (!_existsSync(tracePath)) {
+    return {
+      type: 'context_history_result',
+      scope: params.scope,
+      content: '(no behavior trace file yet)',
+      hitCount: 0,
+      tokenEstimate: 5,
+      truncated: false,
+    }
+  }
+
+  let entries: BehaviorTraceEntry[] = []
+  try {
+    const raw = _readFileSync(tracePath, 'utf8')
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      try {
+        entries.push(JSON.parse(trimmed) as BehaviorTraceEntry)
+      } catch {
+        // skip malformed lines
+      }
+    }
+  } catch (error) {
+    throw new Error(`Failed to read trace file: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  if (params.scope === 'search') {
+    if (!params.query) {
+      throw new Error('query is required for search scope')
+    }
+    const events: NexusEvent[] = entries.map((e, i) => ({
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId: e.sessionId,
+      timestamp: e.timestamp,
+      toolUseId: `trc_${i}`,
+      name: 'behavior_trace',
+      input: {
+        trigger: e.trigger,
+        errorMessage: e.anomaly?.errorMessage,
+        errorCode: e.anomaly?.errorCode,
+        denialReason: e.anomaly?.denialReason,
+        driftPath: e.anomaly?.driftPath,
+        userRedirectSignal: e.anomaly?.userRedirectSignal,
+        source: (e.anomaly as { source?: string } | undefined)?.source,
+      },
+    }))
+    const result = searchEvents(events, params.query, {
+      sinceMs: params.sinceMs,
+      maxTokens: params.maxTokens,
+    })
+    return {
+      type: 'context_history_result',
+      scope: 'search',
+      content: result.content,
+      hitCount: result.hitCount,
+      tokenEstimate: result.tokenEstimate,
+      truncated: result.truncated,
+      contentTruncated: result.truncatedAt,
+    }
+  }
+
+  const summary = summarizeWindow(entries, {
+    scope: params.summarizeScope,
+    sinceMs: params.sinceMs,
+    maxTokens: params.maxTokens,
+  })
+  return {
+    type: 'context_history_result',
+    scope: 'summarize',
+    content: summary.content,
+    hitCount: summary.hitCount,
+    tokenEstimate: summary.tokenEstimate,
+    truncated: summary.truncated,
+    contentTruncated: summary.truncatedAt,
+  }
+}
+
+// ─── PR-12: /v1/context/working-set endpoint helpers ──────────────────────
+
+export type WorkingSetSession = {
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}
+
+export async function runWorkingSetList({ cwd }: { cwd: string }): Promise<{
+  type: 'working_set_list'
+  cwd: string
+  sessions: WorkingSetSession[]
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const sessions: WorkingSetSession[] = []
+  for (const [sessionId, ws] of tracker.entries()) {
+    sessions.push({
+      sessionId,
+      workspaceId: ws.workspaceId,
+      version: ws.version,
+      updatedAt: ws.updatedAt,
+      entries: ws.entries,
+    })
+  }
+  return { type: 'working_set_list', cwd, sessions }
+}
+
+export async function runWorkingSetGet({ cwd, sessionId }: { cwd: string; sessionId: string }): Promise<{
+  type: 'working_set_session'
+  cwd: string
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const ws = tracker.get(sessionId)
+  if (!ws) {
+    throw new Error(`session not found: ${sessionId}`)
+  }
+  return {
+    type: 'working_set_session',
+    cwd,
+    sessionId,
+    workspaceId: ws.workspaceId,
+    version: ws.version,
+    updatedAt: ws.updatedAt,
+    entries: ws.entries,
+  }
+}
+
+// ─── PR-20: /v1/context/working-set/workspace/:wsId endpoint helper ──────
+//
+// Per design §7.3 row 3. Pure read — returns the working set aggregated
+// across all sessions that share the same workspaceId. Aggregates entries
+// by key, attaching a contributors list so callers can see provenance.
+
+export type WorkspaceEntryContributor = {
+  sessionId: string
+  value: string
+  updatedAt: string
+  confidence: number
+}
+
+export type WorkspaceAggregatedEntry = {
+  key: string
+  contributors: WorkspaceEntryContributor[]
+}
+
+export async function runWorkspaceWorkingSetGet({ cwd, workspaceId }: { cwd: string; workspaceId: string }): Promise<{
+  type: 'workspace_working_set'
+  cwd: string
+  workspaceId: string
+  sessions: WorkingSetSession[]
+  aggregateEntries: WorkspaceAggregatedEntry[]
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const sessions: WorkingSetSession[] = []
+  for (const [sessionId, ws] of tracker.entries()) {
+    if (ws.workspaceId === workspaceId) {
+      sessions.push({
+        sessionId,
+        workspaceId: ws.workspaceId,
+        version: ws.version,
+        updatedAt: ws.updatedAt,
+        entries: ws.entries,
+      })
+    }
+  }
+
+  // Aggregate entries by key, collecting contributors from each session
+  const byKey = new Map<string, WorkspaceEntryContributor[]>()
+  for (const session of sessions) {
+    for (const entry of session.entries) {
+      const list = byKey.get(entry.key) ?? []
+      list.push({
+        sessionId: session.sessionId,
+        value: entry.value,
+        updatedAt: entry.updatedAt,
+        confidence: entry.confidence,
+      })
+      byKey.set(entry.key, list)
+    }
+  }
+  const aggregateEntries: WorkspaceAggregatedEntry[] = []
+  for (const [key, contributors] of byKey.entries()) {
+    aggregateEntries.push({ key, contributors })
+  }
+  // Stable order: sort by key
+  aggregateEntries.sort((a, b) => a.key.localeCompare(b.key))
+
+  return {
+    type: 'workspace_working_set',
+    cwd,
+    workspaceId,
+    sessions,
+    aggregateEntries,
+  }
+}
+
+// Helper to avoid name collision with the ContextCommandOptions / other
+// identifiers in this file. Re-exports the PR-4b class via a local alias.
+import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from './persistedWorkingSetTracker.js'
+
+// ─── PR-18: /v1/context/assemble endpoint helpers ────────────────────────
+//
+// Mirrors PR-15's `buildAssemblePreview` (extracted from runAssemble as a pure
+// function). REST handler just validates body and delegates here.
+// Pure read — never mutates state.
+
+export type ContextAssembleParams = {
+  cwd: string
+  sessionId?: string
+  scope: 'minimal' | 'standard' | 'full' | 'task' | 'workspace'
+  maxTokens: number
+}
+
+import { buildAssemblePreview, type AssembledContextPreview } from '../cli/commands/context.js'
+
+export async function runContextAssemble(params: ContextAssembleParams): Promise<{
+  type: 'context_assemble_result'
+  cwd: string
+  preview: AssembledContextPreview
+}> {
+  const preview = await buildAssemblePreview(params)
+  return {
+    type: 'context_assemble_result',
+    cwd: params.cwd,
+    preview,
   }
 }

@@ -50,6 +50,10 @@ export type WorkingSet = {
 export type WorkingSetPatch = {
   workspaceId?: string
   entries?: WorkingSetEntry[]
+  // Optional explicit version (used by load path to preserve original).
+  // When provided, the resulting WorkingSet uses this version instead of
+  // bumping from the previous one.
+  version?: number
 }
 
 const WORKING_SET_ENTRY_VALUE_MAX_CHARS = 200
@@ -76,7 +80,7 @@ export class WorkingSetTracker {
         sessionId,
         workspaceId: patch.workspaceId ?? '',
         entries: clampEntries(patch.entries ?? []),
-        version: 1,
+        version: patch.version ?? 1,
         updatedAt: now,
       }
       this.bySession.set(sessionId, ws)
@@ -86,7 +90,9 @@ export class WorkingSetTracker {
       sessionId,
       workspaceId: patch.workspaceId ?? existing.workspaceId,
       entries: clampEntries(patch.entries ?? existing.entries),
-      version: existing.version + 1,
+      // If caller provided an explicit version, use it (load path);
+      // otherwise bump from existing.
+      version: patch.version ?? existing.version + 1,
       updatedAt: now,
     }
     this.bySession.set(sessionId, next)

@@ -142,8 +142,13 @@ export class PersistedWorkingSetTracker extends WorkingSetTracker {
     return out
   }
 
-  // Direct map injection (load path). Avoids re-deriving through update.
+  // Direct map injection (load path). Preserves the persisted version
+  // (caller is responsible for monotonicity — we trust the file).
   private hydrate(sessionId: string, ws: WorkingSet): void {
-    super.update(sessionId, { workspaceId: ws.workspaceId, entries: ws.entries })
+    super.update(sessionId, {
+      workspaceId: ws.workspaceId,
+      entries: ws.entries,
+      version: ws.version,
+    })
   }
 }

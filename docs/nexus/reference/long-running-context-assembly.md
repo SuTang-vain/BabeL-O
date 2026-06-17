@@ -1,8 +1,32 @@
 # Long-Running Context Assembly — 设计文档
 
-> 状态：v1 草案
+> 状态：v1 草案 — Track A Phase 0/1/2/3 server 侧全部落地（2026-06-16），CLI 4 个子命令 + REST 5 个 endpoint 已上线
 > 范围：利用 Nexus 常驻能力，重新设计上下文组装架构，支持 session/task 长时间持久运行
 > 替代：旧"压缩 = 上下文管理"模型，升级为"Nexus 组装 = 上下文管理"
+
+**落地清单**（按 PR）：
+
+| Phase | 内容 | PR | 日期 |
+|---|---|---|---|
+| P0 | `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag | PR-1 | 2026-06-14 |
+| Phase 1 | WorkingSetTracker in-memory | PR-4a | 2026-06-14 |
+| Phase 1 | WorkingSetTracker persistence | PR-4b | 2026-06-14 |
+| Phase 2 | contextTools (3 pure fns) | PR-7 | 2026-06-15 |
+| Phase 2 | contextTools ToolRegistry | PR-8 | 2026-06-15 |
+| Phase 2 | CLI `bbl context working-set` | PR-9 | 2026-06-15 |
+| Phase 2 | CLI `bbl context history` | PR-10 | 2026-06-15 |
+| Phase 2 | REST `/v1/context/history` | PR-11 | 2026-06-15 |
+| Phase 2 | REST `/v1/context/working-set` + `:sessionId` | PR-12 | 2026-06-15 |
+| Phase 2 | CLI `bbl context resume` (dry-run) | PR-13 | 2026-06-15 |
+| Phase 3 | CLI `bbl context assemble` | PR-15 | 2026-06-16 |
+| Phase 3 | REST `POST /v1/context/assemble` | PR-18 | 2026-06-16 |
+| Phase 3 | REST `GET /v1/context/working-set/workspace/:wsId` | PR-20 | 2026-06-16 |
+
+**剩余项**：
+- ⏸ `bbl context working-set --edit` (write op, 待显式批准 — PR-19)
+- ⏸ `PUT /v1/context/working-set/:sessionId` (write op, 同上)
+- ⏸ WebSocket `/v1/context/observe` (待 runtime 集成)
+- ⏸ `working_set_updated` WS 事件 (待 WorkingSetTracker event bus)
 
 ---
 
@@ -317,7 +341,11 @@ type AssembledContext = {
 
 ### 5.1 WorkingSetTracker
 
-**文件**：`src/nexus/workingSetTracker.ts`（~300 行）
+**文件**：
+- 内存版：`src/nexus/workingSetTracker.ts`（~170 行）
+- 持久化版：`src/nexus/persistedWorkingSetTracker.ts`（~150 行）
+
+**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)
 
 **职责**：
 - 维护每 session working set（内存 + 持久化）
@@ -355,7 +383,11 @@ class WorkingSetTracker {
 
 ### 5.2 ContextAssembler
 
-**文件**：`src/nexus/contextAssembler.ts`（~400 行）
+**文件**：
+- Runtime 版本：`src/runtime/contextAssembler.ts`（实际 ~700 行，含 assembleContext 入口 + 完整 budget 分配）
+- CLI/REST preview 版本：复用同一个 runtime 模块；CLI/REST 还提供 `buildAssemblePreview()`（`src/cli/commands/context.ts` 纯函数）做离线路径的 read-only 投影
+
+**状态**：✅ runtime `assembleContext` 已落地（Phase 1/2），CLI preview 已落地（PR-15, 2026-06-16），REST endpoint 已落地（PR-18, 2026-06-16）
 
 **职责**：
 - 接收 assemble 请求
@@ -521,6 +553,8 @@ class WorkingSetTracker {
 
 ### 7.1 on-demand 工具（model 主动调用）
 
+> **状态**：✅ 3 个 tool (`context.search` / `context.summarize` / `context.recent`) 已在 `src/tools/contextTools.ts` 落地 (PR-7, 2026-06-15) 并注册到 ToolRegistry (PR-8, 2026-06-15)。CLI `bbl context history` (PR-10) 复用 `searchEvents` / `summarizeWindow`。REST `/v1/context/history` (PR-11) 同样复用。
+
 新增 3 个 tool，在 `src/tools/contextTools.ts`：
 
 | 工具 | 用途 | 拉取源 |
@@ -548,34 +582,36 @@ const result = await context.search({
 
 `bbl context` 命令族扩展：
 
-| 命令 | 功能 |
-|---|---|
-| `bbl context show` | 现有：显示当前 context |
-| `bbl context assemble --scope <s>` | **新**：手动触发组装并显示 |
-| `bbl context working-set` | **新**：显示当前 session working set |
-| `bbl context working-set --edit` | **新**：手动编辑 working set |
-| `bbl context history --since 24h` | **新**：拉历史事件 + 摘要 |
-| `bbl context resume` | **新**：模拟 resume 流程（debug） |
+| 命令 | 功能 | 状态 |
+|---|---|---|
+| `bbl context show` | 现有：显示当前 context | ✅ 已有（`bbl sessions show`） |
+| `bbl context assemble --scope <s>` | **新**：手动触发组装并显示 | ✅ 已落地（PR-15, 2026-06-16） |
+| `bbl context working-set` | **新**：显示当前 session working set | ✅ 已落地（PR-9, 2026-06-15） |
+| `bbl context working-set --edit` | **新**：手动编辑 working set | ⏸ write op, 待显式批准（PR-19） |
+| `bbl context history --since 24h` | **新**：拉历史事件 + 摘要 | ✅ 已落地（PR-10, 2026-06-15） |
+| `bbl context resume` | **新**：模拟 resume 流程（debug） | ✅ 已落地（PR-13, 2026-06-15） |
 
 ### 7.3 REST + WebSocket
 
 **新增 REST**：
 
-| 路径 | 方法 | 功能 |
-|---|---|---|
-| `/v1/context/assemble` | POST | 手动触发组装（带 options） |
-| `/v1/context/working-set/:sessionId` | GET / PUT | 读写 working set |
-| `/v1/context/working-set/workspace/:wsId` | GET | 读 workspace 共享 working set |
-| `/v1/context/history` | GET | 拉历史事件（带过滤） |
+| 路径 | 方法 | 功能 | 状态 |
+|---|---|---|---|
+| `/v1/context/assemble` | POST | 手动触发组装（带 options） | ✅ 已落地（PR-18, 2026-06-16） |
+| `/v1/context/working-set` | GET | 列所有 session 的 working set | ✅ 已落地（PR-12, 2026-06-15） |
+| `/v1/context/working-set/:sessionId` | GET | 读单个 session 的 working set | ✅ 已落地（PR-12, 2026-06-15） |
+| `/v1/context/working-set/:sessionId` | PUT | 写 working set | ⏸ write op, 待显式批准 |
+| `/v1/context/working-set/workspace/:wsId` | GET | 读 workspace 共享 working set（聚合） | ✅ 已落地（PR-20, 2026-06-16） |
+| `/v1/context/history` | GET | 拉历史事件（带过滤） | ✅ 已落地（PR-11, 2026-06-15） |
 
 **新增 WebSocket**：
 
 ```
 // 现有 /v1/behavior/observe 扩展
-{ type: 'working_set_updated', sessionId, ws }
+{ type: 'working_set_updated', sessionId, ws }   // ⏸ 待 WorkingSetTracker event bus 落地
 
 // 新增 /v1/context/observe
-{ type: 'assembled', sessionId, context }   // 每次 assemble 触发
+{ type: 'assembled', sessionId, context }         // ⏸ 待 runtime 集成（PR-X, deferred）
 ```
 
 ---

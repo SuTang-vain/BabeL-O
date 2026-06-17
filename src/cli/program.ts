@@ -17,6 +17,7 @@ import { registerLoopCommand } from './commands/loop.js'
 import { registerInspectSessionCommand } from './commands/inspectSession.js'
 import { registerMemoryCommand } from './commands/memory.js'
 import { registerDoctorCommand } from './commands/doctor.js'
+import { registerContextCommand } from './commands/context.js'
 
 markStartup('cli.imported')
 
@@ -43,6 +44,7 @@ registerLoopCommand(program)
 registerInspectSessionCommand(program)
 registerMemoryCommand(program)
 registerDoctorCommand(program)
+registerContextCommand(program)
 
 program
   .command('__server', { hidden: true })

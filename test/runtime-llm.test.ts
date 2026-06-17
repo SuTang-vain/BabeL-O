@@ -1541,7 +1541,7 @@ describe('LLMCodingRuntime', () => {
 
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
-    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'Write'])
+    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillSave', 'Write'])
   })
 
   test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
