@@ -351,92 +351,151 @@ type AssembledContext = {
 - 内存版：`src/nexus/workingSetTracker.ts`（~170 行）
 - 持久化版：`src/nexus/persistedWorkingSetTracker.ts`（~150 行）
 
-**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)。✅ event bus (`WorkingSetEventBus`, `working_set_updated` 事件) 已落地 (PR-26, 2026-06-17)，WebSocket `/v1/working-set/observe` 推送已落地 (PR-27, 2026-06-17)
+**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)。✅ event bus (`WorkingSetEventBus`, `working_set_updated` 事件) 已落地 (PR-26, 2026-06-17)，WebSocket `/v1/working-set/observe` 推送已落地 (PR-27, 2026-06-17)。✅ `applyEvent` 事件驱动更新已落地 (PR-30, 2026-06-17)，`getWorkspaceWorkingSet` workspace 聚合已落地 (PR-30, 2026-06-17)。
 
 **职责**：
 - 维护每 session working set（内存 + 持久化）
 - 监听 `tool_started` / `task_created` / `scope_boundary_*` 事件自动更新
 - 提供 `get / update / rebuild / share` API
 - 跨 session 通过 `workspaceId` 共享
+- 通过 event bus 推送 `working_set_updated` / `working_set_reset` 事件 (PR-26)
 
-**核心 API**：
+**核心 API**（实际实现, src/nexus/workingSetTracker.ts）：
 
 ```typescript
 class WorkingSetTracker {
-  // 获取
+  // ─── 读 ───
   get(sessionId: string): WorkingSet | null
+  has(sessionId: string): boolean
+  entries(): Array<[string, WorkingSet]>
+  size(): number
 
-  // 增量更新（事件驱动）
-  applyEvent(sessionId: string, event: NexusEvent): void
+  // ─── 写 (in-memory) ───
+  update(sessionId: string, patch: WorkingSetPatch): WorkingSet     // 自动 emit working_set_updated
+  rebuild(sessionId: string, workspaceId: string, entries: WorkingSetEntry[]): WorkingSet
+  reset(sessionId: string): void                                       // 自动 emit working_set_reset
+  applyEvent(sessionId: string, event: NexusEvent, cwd: string): WorkingSet | null  // 事件驱动 (PR-30)
 
-  // 显式更新
-  update(sessionId: string, patch: Partial<WorkingSet>): WorkingSet
-
-  // 从事件流重建
-  rebuild(sessionId: string, fromEventTail: NexusEvent[]): WorkingSet
-
-  // 跨 session 共享（同 workspace）
-  getWorkspaceWorkingSet(workspaceId: string): WorkingSet | null
+  // ─── 跨 session workspace 聚合 (PR-30) ───
   linkToWorkspace(sessionId: string, workspaceId: string): void
+  unlinkFromWorkspace(sessionId: string, workspaceId: string): void
+  sessionsInWorkspace(workspaceId: string): string[]
+  workspaceCount(): number
+  getWorkspaceWorkingSet(workspaceId: string): WorkingSet | null       // 聚合所有 session entries
 
-  // 持久化
-  persist(sessionId: string): Promise<void>
-  load(sessionId: string): Promise<WorkingSet | null>
+  // ─── Event Bus (PR-26) ───
+  subscribe(handler: WorkingSetEventHandler): () => void               // 返回 unsubscribe
+  subscriberCount(): number
+
+  // ─── 派生 (PR-4a 内部) ───
+  deriveEntriesFromEvents(events: NexusEvent[], cwd: string): WorkingSetEntry[]  // 自由函数
 }
 ```
+
+**持久化路径**（src/nexus/persistedWorkingSetTracker.ts，extends WorkingSetTracker）：
+
+```typescript
+class PersistedWorkingSetTracker extends WorkingSetTracker {
+  async load(): Promise<void>                  // 整个文件 → 内存, 无 sessionId 参数
+  async flush(): Promise<void>                 // 整个文件 → 磁盘, 替代 doc 的 per-session persist
+  get fileLocation(): string                   // 调试用
+}
+```
+
+**注意 (与早期 doc 草稿差异)**：
+- `applyEvent` 多 `cwd` 参数（PR-30 落地, 用于过滤文件路径）
+- `rebuild` 接收 `workspaceId` + `entries` 而非 `fromEventTail`（PR-4a; caller 自己 derive）
+- 持久化是 file-level（`load()` / `flush()`）而非 per-session
 
 **持久化路径**：`<cwd>/.babel-o/working-set.json`（per-cwd，因为 workspace 跟 cwd 绑定）
 
 ### 5.2 ContextAssembler
 
 **文件**：
-- Runtime 版本：`src/runtime/contextAssembler.ts`（实际 ~700 行，含 assembleContext 入口 + 完整 budget 分配）
-- CLI/REST preview 版本：复用同一个 runtime 模块；CLI/REST 还提供 `buildAssemblePreview()`（`src/cli/commands/context.ts` 纯函数）做离线路径的 read-only 投影
+- Runtime 版本：`src/runtime/contextAssembler.ts`（实际 ~700 行，含 `assembleContext()` 入口 + 完整 budget 分配）
+- CLI/REST preview 版本：`src/nexus/contextAssemblePreview.ts`（**独立模块**，PR-25 提取后）。提供 `buildAssemblePreview()` + 6 个 `build*Section` builder 函数
 
-**状态**：✅ runtime `assembleContext` 已落地（Phase 1/2），CLI preview 已落地（PR-15, 2026-06-16），REST endpoint 已落地（PR-18, 2026-06-16）
+**状态**：✅ runtime `assembleContext` 已落地（Phase 1/2），CLI preview 已落地（PR-15, 2026-06-16），REST endpoint 已落地（PR-18, 2026-06-16），4 个 `include*` flags 已落地（PR-28a, 2026-06-17）。CLI/REST preview 5/6 层真实读 (Long-Term 仍 stub, Plan C deferred)。
 
 **职责**：
 - 接收 assemble 请求
 - 拉 working set（pinned）
 - 拉 recent events + microcompact
-- 拉可选 layer 3 源
+- 拉可选 layer 3 源（behaviorTrace / longTerm / projectMemory / liveHints）
 - 预算管理
 - 输出 AssembledContext
 
-**核心 API**：
+**核心 API**（**实际实现**，**自由函数**而非 class method）：
 
 ```typescript
-class ContextAssembler {
-  // 主入口
-  assemble(opts: AssembleOptions): Promise<AssembledContext>
+// ─── Runtime 入口 (src/runtime/contextAssembler.ts) ───
+export async function assembleContext(
+  options: ContextAssemblerOptions
+): Promise<AssembledContext>
 
-  // 单独拉 working set
-  getWorkingSetSection(sessionId: string): ContextSection
+// ─── 预算分配 (PR-4a) ───
+export function allocateBudget(modelId: string): ContextBudget
 
-  // 单独拉 recent
-  getRecentEventsSection(sessionId: string, opts: { sinceMs: number, maxTokens: number }): Promise<ContextSection>
+// ─── Memory 截断 (PR-4a) ───
+export function truncateMemoryContent(raw: string): MemoryTruncation
+```
 
-  // 单独拉 trace
-  getBehaviorTraceSection(cwd: string, opts: { sinceMs: number, maxTokens: number }): Promise<ContextSection>
+**`ContextAssemblerOptions` (实际类型, src/runtime/contextAssembler.ts)**：
 
-  // 单独拉 long-term
-  getLongTermSection(query: string, maxTokens: number): Promise<ContextSection>
-
-  // 单独拉 project
-  getProjectMemorySection(cwd: string, maxTokens: number): Promise<ContextSection>
-}
-
-type AssembleOptions = {
-  sessionId: string
-  workspaceId?: string
-  scope: 'minimal' | 'standard' | 'full' | 'task' | 'workspace'
-  maxTokens: number
-  includeBehaviorTrace: boolean
-  includeLongTerm: boolean
-  includeProjectMemory: boolean
-  includeLiveHints: boolean
+```typescript
+type ContextAssemblerOptions = {
+  runtimeOptions: RuntimeExecuteOptions         // 含 sessionId, cwd, prompt, signal 等
+  events: NexusEvent[]                          // 预先查好的事件流 (caller 负责 fetch)
+  modelId: string
+  buildSystemPrompt: (options, projectMemory?, sessionSummary?, activeSkills?) => string
+  mapEventsToMessages: (events, initialPrompt) => ModelMessage[]
+  memoryProvider?: MemoryProvider
+  sessionInbox?: SessionMessage[]
+  workingSetOverride?: string                   // PR-4a: 跳过 derive, 用传入的字符串
+  // PR-28a: 4 个 include flags (默认 undefined = 当前行为)
+  includeBehaviorTrace?: boolean
+  includeLongTerm?: boolean
+  includeProjectMemory?: boolean
+  includeLiveHints?: boolean                     // 当前 assembleContext 内部不使用 (PR-29 stopped)
 }
 ```
+
+**CLI/REST preview builder (src/nexus/contextAssemblePreview.ts)**：
+
+```typescript
+// 一次性产出全部 sections + budget + meta
+export async function buildAssemblePreview(
+  options: AssemblePreviewOptions
+): Promise<AssembledContextPreview>
+
+// 单 section builder (doc 早期提到的 get*Section 在这里是同名函数, 但不是 class method)
+function buildWorkingSetSection(wsVersion, entries): AssembledSection
+function buildRecentEventsSection(sessionId, traces): AssembledSection
+function buildBehaviorTraceSection(traces): AssembledSection
+function buildLongTermStub(): AssembledSection                  // stub, Plan C deferred
+async function buildProjectSection(cwd): AssembledSection       // PR-32
+function buildLiveHintSection(traces, cooldownMs=5min): AssembledSection  // PR-31
+```
+
+**AssemblePreviewOptions (CLI/REST 简化版, PR-15 落地)**：
+
+```typescript
+type AssemblePreviewOptions = {
+  cwd: string
+  sessionId?: string
+  scope: 'minimal' | 'standard' | 'full' | 'task' | 'workspace'
+  maxTokens: number
+  includeBehaviorTrace?: boolean
+  includeLongTerm?: boolean
+  includeProjectMemory?: boolean
+  includeLiveHints?: boolean
+}
+```
+
+**注意 (与早期 doc 草稿差异)**：
+- 实际是**自由函数**, 不是 `class ContextAssembler { assemble() }`
+- 5 个 `get*Section` **不存在作为 class method**; 实际是 `contextAssemblePreview.ts` 里的独立 builder 函数
+- `AssembleOptions` (doc 简版) vs `ContextAssemblerOptions` (实际) 字段完全不同, 实际 API 用 `runtimeOptions + events + modelId`, doc 简版只用 `sessionId + workspaceId + scope`
 
 ### 5.3 microcompact（轻量压缩）
 
@@ -494,8 +553,15 @@ async startTurn(opts) {
 
 ### 6.2 Session Resume 流程
 
+**状态**：🟡 **partial 落地** (2026-06-17)。PR-28b 添加 `resumeSession()` 独立 helper (`src/runtime/sessionResume.ts`) 实现 step 1 (load 或返回 placeholder empty WS). **未落地**:
+- step 2 (call `contextAssembler.assemble`) — helper 未触发实际组装
+- step 3 (subscribe `behaviorMonitor`) — helper 无此功能
+- `LLMCodingRuntime.resume()` class method — **未实现** (需要 constructor 改动, PR-29 stopped per [[memory: babel-o-soft-recoverable-timeouts]])
+
+**注意**: helper 是**独立函数**而非 class method, 避免改 `LLMCodingRuntime` constructor (会破坏所有现有 call site). 完整 `resume()` class method 留作 PR-29 后续.
+
 ```typescript
-// src/runtime/LLMCodingRuntime.ts
+// src/runtime/LLMCodingRuntime.ts  (doc 草稿, 未实现)
 async resume(opts: { sessionId: string; cwd: string }) {
   // 1. 从持久化加载 working set
   const ws = await this.workingSetTracker.load(opts.sessionId)
@@ -941,7 +1007,78 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ---
 
-## 18. 参考
+## 18. 后续需要实现的项目（2026-06-17 审计后）
+
+按 `long-running-context-assembly.md` 全文核对源码后的剩余项。每项标注阻塞原因 + 建议的下一动作。
+
+### 18.1 Server-side (Track A) gated / deferred
+
+| 编号 | 项目 | 阻塞 | 建议 |
+|---|---|---|---|
+| **A1** | `PUT /v1/context/working-set/:sessionId` (write op REST) | 用户仅批了 CLI write op (PR-19, 2026-06-17). REST 写 op 同等风险, 需 [[memory: babel-o-write-capable-child-agent-delayed]] 显式批准 | 显式说"批准 PUT working-set"后启动 |
+| **A2** | WebSocket `/v1/context/observe` (`assembled` 事件) | doc §7.3 显式标 deferred. 需 `assembleContext` 在每次成功组装后 emit `{type: 'assembled', sessionId, context}`, 改 runtime 热路径 (风险较大) | 启动为 PR-29 重启, 但需谨慎 |
+| **A3** | `Long-Term Memory` section (CLI/REST preview 第 4 层) | doc §9 显式标 Plan C deferred. 需 `MemoryProvider` 协议化重构, 涉及 `src/runtime/memory.ts` 重写 | 需新规划 doc; 不在 Track A 范围 |
+| **A4** | §6.2 `LLMCodingRuntime.resume()` class method (含 step 2 + 3) | 需 `LLMCodingRuntime` constructor 改动 (workingSetTracker + contextAssembler + behaviorMonitor). PR-29 stopped per [[memory: babel-o-soft-recoverable-timeouts]] | 启动为新 PR, 但需评估 constructor 风险 |
+| **A5** | §5.2 5 个 `get*Section` class methods (按早期 doc 草稿) | **不实现** (实际是 `contextAssemblePreview.ts` 的 builder 函数). PR-34b 已修正 doc | 已落定 (doc 修正) |
+
+### 18.2 Go TUI (Track B) gated / deferred
+
+| 编号 | 项目 | 阻塞 | 建议 |
+|---|---|---|---|
+| **B1** | PR-17c: Go TUI 订阅 `/v1/working-set/observe` WebSocket | 需在 `internal/loop/reconcile_worker.go` 加 WS 客户端. user 正在改 reconcile_worker (Phase 6'), 建议叠加而非冲突 | 显式说"做 PR-17c"后启动 |
+| **B2** | Go TUI `StatusBehaviorHint` 已在 chrome 渲染 (PR-17b). **未做**: 通知气泡触发 "view_trace" action | 跨 Go repo, 需 `internal/loop/notifications/` | 独立 PR |
+
+### 18.3 用户驱动 WIP（不在本 doc 推进范围）
+
+| 编号 | 项目 | 状态 |
+|---|---|---|
+| **U1** | `clients/go-tui/internal/loop/phase6*_test.go` (3 个新 test 文件) | 用户未提交, WIP |
+| **U2** | `clients/go-tui/internal/loop/transcript.go` + `transcript_events.go` | 用户未提交, WIP |
+| **U3** | `clients/go-tui/internal/loop/wait_tick.go` + `wait_tick_test.go` (6c waitForEvent 长轮询) | 用户未提交, WIP |
+| **U4** | `clients/go-tui/internal/loop/session_reachability_e2e_test.go` | 用户未提交, WIP |
+
+**注**: U1-U4 是 Phase 6' 实时显示活跃 session 的 in-progress work. 跟本 doc 推进**无直接依赖**; 用户完成后再 commit 即可.
+
+### 18.4 优先级建议
+
+按用户价值 + 实现成本:
+
+1. **A1 (PUT working-set)** — 单一 endpoint, ~50 行. **等用户批准** (写 op).
+2. **A4 (LLMCodingRuntime.resume() 全 3 步)** — 需 constructor 改动. 中等风险. 适合在 PR-28b (helper) 基础上叠加.
+3. **A2 (/v1/context/observe)** — 跨多个模块, 大改. 适合作为 PR-27 (server 端 WS 框架) 的 1/2 落地.
+4. **B1 (PR-17c Go TUI WS 订阅)** — 跨 Go repo. 等用户 reconcile_worker 完成.
+5. **A3 (Long-Term Memory / Plan C)** — 需新规划 doc, 不在 Track A 范围. **优先级最低**.
+
+### 18.5 历史记录 (本 doc 推进已完成)
+
+| 阶段 | 内容 | 状态 |
+|---|---|---|
+| Phase 0 | `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag | ✅ PR-1 (2026-06-14) |
+| Phase 1 | WorkingSetTracker in-memory + persistence | ✅ PR-4a/4b (2026-06-14) |
+| Phase 2 | contextTools (3 pure fns) + ToolRegistry | ✅ PR-7/8 (2026-06-15) |
+| Phase 2 | CLI working-set / history / resume | ✅ PR-9/10/13 (2026-06-15) |
+| Phase 2 | REST history / working-set×3 / workspace-aggregate | ✅ PR-11/12/20 (2026-06-15/16) |
+| Phase 3 | CLI bbl context assemble | ✅ PR-15 (2026-06-16) |
+| Phase 3 | REST POST /v1/context/assemble | ✅ PR-18 (2026-06-16) |
+| Phase 3 | WorkingSetTracker event bus (working_set_updated) | ✅ PR-26 (2026-06-17) |
+| Phase 3 | WebSocket /v1/working-set/observe + shared broadcaster | ✅ PR-27 (2026-06-17) |
+| Phase 3 | CLI bbl context working-set-edit (write op, 用户批准) | ✅ PR-19 (2026-06-17) |
+| Phase 3 | WorkingSetTracker.applyEvent + getWorkspaceWorkingSet | ✅ PR-30 (2026-06-17) |
+| Phase 3 | ContextAssemblerOptions include* flags | ✅ PR-28a (2026-06-17) |
+| Phase 3 | resumeSession() helper (doc §6.2 partial) | ✅ PR-28b (2026-06-17) |
+| Phase 3 | liveHints section reads behavior-trace.jsonl (nexus 5min) | ✅ PR-31 (2026-06-17) |
+| Phase 3 | projectMemory section reads .babel-o/memory.md | ✅ PR-32 (2026-06-17) |
+| Phase 3 | Doc 修正 + future work 列表 (本节) | ✅ PR-33/34 (2026-06-17) |
+| Phase 3 | Go TUI StatusBehaviorHint 7th 态 + chrome 渲染 | ✅ PR-17a/17b (2026-06-17) |
+| 修复 | tool-prompt regression (8 个 builtin tools 加 prompt) | ✅ PR-22 (2026-06-17) |
+| 修复 | runtime-loop / runtime-llm pre-existing test | ✅ PR-23 (2026-06-17) |
+| 修复 | buildAssemblePreview 提取 + caller 更新 | ✅ PR-25 (2026-06-17) |
+| 修复 | liveHints section in runtime assembleContext | ⏸ PR-29 stopped (改热路径) |
+| 修复 | runtime-loop test 共享 storage isolation | ⏸ PR-24 stopped (3 approaches failed) |
+
+---
+
+## 19. 参考
 
 - `src/runtime/sessionMemoryLite.ts` — 现有压缩逻辑（P3 决策）
 - `src/runtime/compact.ts` — hard compact 保留
