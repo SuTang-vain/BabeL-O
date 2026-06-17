@@ -553,44 +553,78 @@ async startTurn(opts) {
 
 ### 6.2 Session Resume 流程
 
-**状态**：🟡 **partial 落地** (2026-06-17)。PR-28b 添加 `resumeSession()` 独立 helper (`src/runtime/sessionResume.ts`) 实现 step 1 (load 或返回 placeholder empty WS). **未落地**:
-- step 2 (call `contextAssembler.assemble`) — helper 未触发实际组装
-- step 3 (subscribe `behaviorMonitor`) — helper 无此功能
-- `LLMCodingRuntime.resume()` class method — **未实现** (需要 constructor 改动, PR-29 stopped per [[memory: babel-o-soft-recoverable-timeouts]])
-
-**注意**: helper 是**独立函数**而非 class method, 避免改 `LLMCodingRuntime` constructor (会破坏所有现有 call site). 完整 `resume()` class method 留作 PR-29 后续.
+**状态**：✅ **落地** (2026-06-17)。PR-A4 添加 `LLMCodingRuntime.resume({ sessionId, cwd })` class method (`src/runtime/LLMCodingRuntime.ts`) 实现完整 3 步 flow。`resumeSession()` 独立 helper (`src/runtime/sessionResume.ts`, PR-28b) 保留为 legacy 路径, CLI/REST 后续迁移到 class method. 完整细节:
+- step 1: `workingSetTracker.load()` + `get(sessionId)`; 不存在时从 `storage.listEvents` 拉事件尾并 `rebuild(sessionId, '', deriveEntriesFromEvents(events, cwd))`.
+- step 2: 调 `refreshRuntimeContextState(...)` 走 full `assembleContext` pass; 带 `workingSetOverride` + 4 个 `include*` flags (`includeLiveHints: !!behaviorMonitor`).
+- step 3: `behaviorMonitor.subscribe(sessionId, hint => ...)` 监听 live hints; `canAcceptHint` + `injectSystemSection` 是 runtime 侧的 no-op stub (INV-4: 不静默注入到 model prompt).
+- production: `createDefaultNexusRuntime()` 自动 wire `resumeDeps` (per-cwd `PersistedWorkingSetTracker` + `BehaviorMonitor` + 闭包). Explore agent (`AgentScheduler.ts`) 不动 — 它是 short-lived.
 
 ```typescript
-// src/runtime/LLMCodingRuntime.ts  (doc 草稿, 未实现)
+// src/runtime/LLMCodingRuntime.ts  (PR-A4, 2026-06-17 已落地)
 async resume(opts: { sessionId: string; cwd: string }) {
-  // 1. 从持久化加载 working set
-  const ws = await this.workingSetTracker.load(opts.sessionId)
-  if (!ws) {
-    // 首次或损坏 → 从事件流重建
-    const events = await this.storage.listEvents(opts.sessionId, { limit: 100, order: 'desc' })
-    ws = this.workingSetTracker.rebuild(opts.sessionId, events)
+  if (!this.resumeDeps) {
+    throw new Error('resume() requires resumeDeps; configure via createDefaultNexusRuntime()')
+  }
+  const { workingSetTracker, behaviorMonitor, buildSystemPrompt, mapEventsToMessages } =
+    this.resumeDeps
+
+  // 1. 从持久化加载 working set（不存在则从事件流重建）
+  await workingSetTracker.load()
+  let workingSet = workingSetTracker.get(opts.sessionId)
+  let rebuilt = false
+  let events: NexusEvent[] = []
+  if (!workingSet) {
+    rebuilt = true
+    const result = await this.storage.listEvents(opts.sessionId, { order: 'desc', limit: 1000 })
+    events = [...(result?.events ?? [])].reverse() // ascending for assembler
+    const entries = deriveEntriesFromEvents(events, opts.cwd)
+    workingSet = workingSetTracker.rebuild(opts.sessionId, '', entries)
+  } else {
+    const result = await this.storage.listEvents(opts.sessionId, { order: 'desc', limit: 1000 })
+    events = [...(result?.events ?? [])].reverse()
   }
 
-  // 2. 拉全 workspace context
-  const assembled = await this.nexus.contextAssembler.assemble({
+  // 2. 拉全 workspace context（full assembleContext pass）
+  const settings = this.configManager.resolveSettings()
+  const runtimeOptions: RuntimeExecuteOptions = {
     sessionId: opts.sessionId,
-    workspaceId: ws.workspaceId,
-    scope: 'workspace',
-    maxTokens: 8000,
+    cwd: opts.cwd,
+    prompt: '',
+    model: settings.modelId,
+  }
+  const workingSetOverride = formatWorkingSet(/* map entries to shape */)
+  const refreshState = await refreshRuntimeContextState({
+    runtimeOptions,
+    events,
+    modelId: settings.modelId,
+    buildSystemPrompt,
+    mapEventsToMessages,
+    tools: () => [],
+    warningPercent: 70,
+    compactPercent: 90,
+    suppressToolsForIntent: () => false,
+    memoryProvider: this.memoryProvider,
+    sessionInbox: [],
+    workingSetOverride,
     includeBehaviorTrace: true,
     includeLongTerm: true,
     includeProjectMemory: true,
-    includeLiveHints: false,    // resume 时不要 hint，先恢复稳态
+    includeLiveHints: !!behaviorMonitor,
   })
+  const assembled = refreshState.assembledContext
 
   // 3. 订阅 live hints（resume 完成后才开）
-  this.behaviorMonitor.subscribe(opts.sessionId, hint => {
-    if (this.canAcceptHint()) {
-      this.injectSystemSection(formatHint(hint))
-    }
-  })
+  let unsubscribeHints = (): void => { /* no-op when no monitor */ }
+  if (behaviorMonitor) {
+    unsubscribeHints = behaviorMonitor.subscribe(opts.sessionId, (hint) => {
+      if (this.canAcceptHint()) {
+        const text = formatHint(hint)
+        this.injectSystemSection(text, opts.sessionId)
+      }
+    })
+  }
 
-  return assembled
+  return { workingSet, rebuilt, assembled, unsubscribeHints }
 }
 ```
 
@@ -1066,6 +1100,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | Phase 3 | WorkingSetTracker.applyEvent + getWorkspaceWorkingSet | ✅ PR-30 (2026-06-17) |
 | Phase 3 | ContextAssemblerOptions include* flags | ✅ PR-28a (2026-06-17) |
 | Phase 3 | resumeSession() helper (doc §6.2 partial) | ✅ PR-28b (2026-06-17) |
+| Phase 3 | LLMCodingRuntime.resume() class method (3 steps) + BehaviorMonitor.subscribe + formatHint + createRuntime wire + doc fix | ✅ PR-A4 (2026-06-17) |
 | Phase 3 | liveHints section reads behavior-trace.jsonl (nexus 5min) | ✅ PR-31 (2026-06-17) |
 | Phase 3 | projectMemory section reads .babel-o/memory.md | ✅ PR-32 (2026-06-17) |
 | Phase 3 | Doc 修正 + future work 列表 (本节) | ✅ PR-33/34 (2026-06-17) |

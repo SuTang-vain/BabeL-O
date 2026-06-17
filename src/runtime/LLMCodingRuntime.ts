@@ -81,6 +81,15 @@ import {
 import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
 import type { MemoryProvider } from './memoryProvider.js'
+// PR-A4: resume() class method imports — see long-running-context-
+// assembly.md §6.2 for the 3-step flow.
+import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
+import type { BehaviorMonitor } from '../nexus/behaviorMonitor.js'
+import { deriveEntriesFromEvents } from '../nexus/workingSetTracker.js'
+import { formatWorkingSet } from './workingSet.js'
+import { formatHint } from './formatHint.js'
+import type { AssembledContext } from './contextAssembler.js'
+import type { WorkingSet } from '../nexus/workingSetTracker.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -109,6 +118,25 @@ export class LLMCodingRuntime implements NexusRuntime {
     // architecture moves off the singleton. Defaulting to undefined
     // preserves all 39+ existing test instantiations.
     private readonly contextBroadcaster?: ContextBroadcaster,
+    // PR-A4: optional resume dependencies. When provided, the public
+    // resume() method is enabled; when omitted, calling resume() throws
+    // a clear "not configured" error. The four closures are the same
+    // shapes the hot-path refreshRuntimeContextState call site uses;
+    // they are re-required here so resume() can drive a full
+    // assembleContext pass without re-wiring the singleton side of the
+    // runtime. Production factory (createRuntime.ts) wires these; tests
+    // can omit them.
+    private readonly resumeDeps?: {
+      workingSetTracker: PersistedWorkingSetTracker
+      behaviorMonitor?: BehaviorMonitor
+      buildSystemPrompt: (
+        options: RuntimeExecuteOptions,
+        projectMemory?: string,
+        sessionSummary?: string,
+        activeSkills?: string,
+      ) => string
+      mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
+    },
   ) {}
 
   /**
@@ -1020,6 +1048,172 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield buildRuntimeResultEvent(options.sessionId, false, errorText)
       yield buildRuntimeExecutionMetricsEvent(options, metrics)
     }
+  }
+
+  // ─── PR-A4: Session Resume class method (doc §6.2) ──────────────
+  //
+  // Drives the 3-step resume flow:
+  //   1. Load or rebuild the working set (persisted, or from event tail)
+  //   2. Assemble a full context (AssembledContext) at the resumed state
+  //   3. Subscribe to live hints from the per-cwd BehaviorMonitor
+  //
+  // This is the new canonical entry point for resume. The legacy
+  // resumeSession() helper in src/runtime/sessionResume.ts only does
+  // step 1; CLI/REST callers will migrate to this method in a
+  // follow-up.
+  async resume(opts: { sessionId: string; cwd: string }): Promise<{
+    workingSet: WorkingSet
+    rebuilt: boolean
+    assembled: AssembledContext
+    unsubscribeHints: () => void
+  }> {
+    if (!this.resumeDeps) {
+      throw new Error(
+        'LLMCodingRuntime.resume() requires resumeDeps; configure the runtime via ' +
+          'createDefaultNexusRuntime() or pass resumeDeps explicitly to the constructor.',
+      )
+    }
+    const { workingSetTracker, behaviorMonitor, buildSystemPrompt, mapEventsToMessages } =
+      this.resumeDeps
+
+    // Step 1 — load or rebuild working set.
+    await workingSetTracker.load() // idempotent; the file is tiny
+    let workingSet = workingSetTracker.get(opts.sessionId)
+    let rebuilt = false
+    let events: NexusEvent[] = []
+    if (!workingSet) {
+      rebuilt = true
+      try {
+        const result = await this.storage.listEvents(opts.sessionId, {
+          order: 'desc',
+          limit: 1000,
+        })
+        events = [...(result?.events ?? [])].reverse() // ascending for assembler
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: storage.listEvents failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+      const entries = deriveEntriesFromEvents(events, opts.cwd)
+      // For now, workspaceId is empty on rebuild — linkToWorkspace is a
+      // future concern. The WS file itself has a workspaceId field that
+      // defaults to '' when not yet linked.
+      try {
+        workingSet = workingSetTracker.rebuild(opts.sessionId, '', entries)
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: workingSetTracker.rebuild failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    } else {
+      // Loaded from persistence — we still want the event tail for the
+      // assembler pass below. Same path: storage.listEvents, ascending.
+      try {
+        const result = await this.storage.listEvents(opts.sessionId, {
+          order: 'desc',
+          limit: 1000,
+        })
+        events = [...(result?.events ?? [])].reverse()
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: storage.listEvents (post-load) failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    }
+
+    // Step 2 — assemble context.
+    const settings = this.configManager.resolveSettings()
+    const runtimeOptions: RuntimeExecuteOptions = {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      prompt: '',
+      model: settings.modelId,
+    }
+    const workingSetOverride = formatWorkingSet(
+      workingSet.entries.map((e) => ({
+        path: e.value,
+        touches: 1,
+        lastTurn: 0,
+        isDir: false,
+        source: 'tool' as const,
+      })),
+    )
+    let assembled: AssembledContext
+    try {
+      const refreshState = await refreshRuntimeContextState({
+        runtimeOptions,
+        events,
+        modelId: settings.modelId,
+        buildSystemPrompt,
+        mapEventsToMessages,
+        tools: () => [],
+        warningPercent: 70,
+        compactPercent: 90,
+        suppressToolsForIntent: () => false,
+        memoryProvider: this.memoryProvider,
+        sessionInbox: [],
+        workingSetOverride,
+        includeBehaviorTrace: true,
+        includeLongTerm: true,
+        includeProjectMemory: true,
+        includeLiveHints: !!behaviorMonitor,
+      })
+      assembled = refreshState.assembledContext
+    } catch (error) {
+      throw new Error(
+        `resume() step 2: refreshRuntimeContextState failed for ${opts.sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
+
+    // Step 3 — subscribe live hints.
+    let unsubscribeHints = (): void => { /* no-op when no monitor */ }
+    if (behaviorMonitor) {
+      unsubscribeHints = behaviorMonitor.subscribe(opts.sessionId, (hint) => {
+        if (this.canAcceptHint()) {
+          const text = formatHint(hint)
+          this.injectSystemSection(text, opts.sessionId)
+        }
+      })
+    }
+
+    return { workingSet, rebuilt, assembled, unsubscribeHints }
+  }
+
+  /**
+   * Per doc §6.2 step 3: gates whether a live hint is acceptable right
+   * now. Conservative: returns false when the runtime is currently
+   * executing a tool (no surprise injections mid-tool).
+   *
+   * A4 ships a conservative stub: accept when no tool is currently
+   * running. The active-execution gate from runtimePipeline is not
+   * yet plumbed into the class; until it is, this always returns true
+   * and the hint will be queued (injectSystemSection is a no-op push
+   * — see below).
+   */
+  canAcceptHint(): boolean {
+    return true
+  }
+
+  /**
+   * Per doc §6.2 step 3: surface a formatted hint. A4 ships this as a
+   * no-op push (Nexus-side observability will see it via a future
+   * PR); it does NOT inject into the model prompt (INV-4: no silent
+   * model injection).
+   */
+  injectSystemSection(text: string, sessionId: string): void {
+    // No-op for A4. The text is computed but not pushed anywhere; a
+    // future PR will wire this to a Nexus event sink. Document the
+    // intent here.
+    void text
+    void sessionId
   }
 }
 

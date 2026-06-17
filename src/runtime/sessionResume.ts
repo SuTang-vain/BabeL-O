@@ -9,6 +9,17 @@
 // implementation that callers (PR-29+, future REST POST /sessions/:id/resume)
 // can wire up without disturbing the runtime.
 //
+// ─── DEPRECATION NOTE (PR-A4) ──────────────────────────────────────────────
+// This helper is now superseded by the canonical class method
+// `LLMCodingRuntime.resume({ sessionId, cwd })` (see
+// long-running-context-assembly.md §6.2). The class method completes all
+// 3 steps: load-or-rebuild working set, full assembleContext pass with
+// include* flags, and live-hint subscription. CLI/REST callers should
+// migrate to the class method. This module is kept around for backward
+// compatibility with the PR-28b contract; new code MUST use
+// `LLMCodingRuntime.resume()` instead.
+// ──────────────────────────────────────────────────────────────────────────
+//
 // Behavior (per doc §6.2):
 //   1. Load persisted working set for the session.
 //   2. If absent or invalid, rebuild from recent event tail.

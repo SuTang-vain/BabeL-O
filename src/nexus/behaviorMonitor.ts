@@ -316,6 +316,11 @@ export class BehaviorMonitor {
   private readonly eventsBySession = new Map<string, NexusEvent[]>()
   private readonly lastHintAtBySession = new Map<string, number>()
   private readonly patternCache = new Map<string, RegExp>()
+  // PR-A4: hint subscribers per sessionId. Used by LLMCodingRuntime.resume()
+  // to wire a live-hint fan-out after a successful resume. The map is
+  // intentionally not yet driven by ingest/detectAll — it is a pure
+  // registry. Future code (PR-A5+) will call pushHint() to drive fan-out.
+  private readonly hintSubscribers: Map<string, Set<(hint: BehaviorTraceAnomaly) => void>> = new Map()
 
   constructor(options: BehaviorMonitorOptions) {
     if (!options.cwd || typeof options.cwd !== 'string') {
@@ -433,6 +438,55 @@ export class BehaviorMonitor {
   // Test/admin: read-only access to tracked state.
   trackedSessionCount(): number {
     return this.eventsBySession.size
+  }
+
+  // ─── PR-A4: live-hint subscriber registry (doc §6.2 step 3) ────────
+  //
+  // `subscribe` is additive: it does NOT mutate ingest/detectAll, it
+  // only registers a callback to be invoked when pushHint is called for
+  // the same sessionId. The actual push driver is a future concern
+  // (PR-A5+); this method exists now so that resume() can be plumbed
+  // without modifying the existing monitor flow.
+  //
+  // Returns an unsubscribe function. Calling it removes the handler
+  // from the per-session subscriber set. Calling it twice is a no-op.
+
+  subscribe(sessionId: string, handler: (hint: BehaviorTraceAnomaly) => void): () => void {
+    const set = this.hintSubscribers.get(sessionId) ?? new Set()
+    set.add(handler)
+    this.hintSubscribers.set(sessionId, set)
+    return () => {
+      const current = this.hintSubscribers.get(sessionId)
+      if (!current) return
+      current.delete(handler)
+      if (current.size === 0) {
+        this.hintSubscribers.delete(sessionId)
+      }
+    }
+  }
+
+  // Fire-and-forget fan-out to all subscribers of `sessionId`. Each
+  // handler is invoked synchronously; thrown errors are caught and
+  // logged so a single misbehaving handler cannot block delivery to
+  // the rest. Throws are NEVER re-thrown into the caller.
+  pushHint(sessionId: string, hint: BehaviorTraceAnomaly): void {
+    const set = this.hintSubscribers.get(sessionId)
+    if (!set || set.size === 0) return
+    for (const handler of set) {
+      try {
+        handler(hint)
+      } catch (error) {
+        // INV-4: never silent-inject into model context, and never let
+        // a handler throw kill the fan-out loop.
+        // eslint-disable-next-line no-console
+        console.warn('[BehaviorMonitor] hint subscriber threw', error)
+      }
+    }
+  }
+
+  // Test/observability surface: number of subscribers for a session.
+  subscriberCount(sessionId: string): number {
+    return this.hintSubscribers.get(sessionId)?.size ?? 0
   }
 }
 

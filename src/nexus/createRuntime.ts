@@ -4,7 +4,7 @@ import {
   allowlistedTools,
   LocalCodingRuntime,
 } from '../runtime/LocalCodingRuntime.js'
-import { LLMCodingRuntime } from '../runtime/LLMCodingRuntime.js'
+import { LLMCodingRuntime, buildSystemPrompt as llmBuildSystemPrompt, mapEventsToMessages as llmMapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
 import { MemoryStorage } from '../storage/MemoryStorage.js'
 import { SqliteStorage } from '../storage/SqliteStorage.js'
 import { createDefaultToolRegistry } from '../tools/registry.js'
@@ -23,6 +23,9 @@ import type { EverCoreClient } from '../runtime/everCoreClient.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
 import { startEverOSBackgroundBootstrap } from '../cli/everosBackgroundBootstrap.js'
+// PR-A4: resume() class method dependencies.
+import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import { BehaviorMonitor } from './behaviorMonitor.js'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
@@ -159,7 +162,33 @@ export async function createDefaultNexusRuntime(
   const runtime =
     settings.providerId === 'local'
       ? new LocalCodingRuntime(tools, policy, storage, configManager.load().hooks)
-      : new LLMCodingRuntime(tools, policy, storage, configManager, options.memoryProvider)
+      : await (async () => {
+          // PR-A4: wire resumeDeps for the LLMCodingRuntime class method
+          // (doc §6.2). Construct a per-cwd PersistedWorkingSetTracker +
+          // BehaviorMonitor; pre-load the WS file once at boot (tiny,
+          // idempotent). The buildSystemPrompt + mapEventsToMessages
+          // closures match the shapes the runtime's hot-path
+          // refreshRuntimeContextState call site already uses.
+          const defaultCwd = options.cwd ?? process.cwd()
+          const workingSetTracker = new PersistedWorkingSetTracker(defaultCwd)
+          await workingSetTracker.load()
+          const behaviorMonitor = new BehaviorMonitor({ cwd: defaultCwd })
+          return new LLMCodingRuntime(
+            tools,
+            policy,
+            storage,
+            configManager,
+            options.memoryProvider,
+            undefined, // contextBroadcaster (A2 path) — leave default
+            {
+              workingSetTracker,
+              behaviorMonitor,
+              buildSystemPrompt: llmBuildSystemPrompt,
+              mapEventsToMessages: (events, initialPrompt) =>
+                llmMapEventsToMessages(events, initialPrompt),
+            },
+          )
+        })()
 
   return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner }
 }
