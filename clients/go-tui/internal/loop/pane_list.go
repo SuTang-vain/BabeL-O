@@ -61,6 +61,12 @@ type paneRow struct {
 	// chrome layer's formatActivity treats the zero time as
 	// "no event yet" and returns "".
 	LastEventAt time.Time
+	// PR-17b (Track B §6.5.2): LastHintPattern is rendered
+	// inline when Status == StatusBehaviorHint ("[hint] pattern: …").
+	// Empty string → no inline hint text. Not all chrome
+	// layers show this; the focused pane header is the primary
+	// surface.
+	LastHintPattern string
 }
 
 // BuildPaneListLines returns the per-pane lines for the model
@@ -119,6 +125,10 @@ func BuildPaneListRows(model LoopModel) []paneRow {
 					Label:       pane.Label,
 					Status:      pane.Status,
 					LastEventAt: pane.LastEventAt,
+					// PR-17b: LastHintPattern flows from the
+					// PaneModel down to the sidebar row. Empty
+					// unless the runtime set Status=StatusBehaviorHint.
+					LastHintPattern: pane.LastHintPattern,
 				})
 			}
 		}

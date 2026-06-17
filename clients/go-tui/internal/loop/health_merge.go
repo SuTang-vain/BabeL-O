@@ -98,6 +98,17 @@ func applyHealthToLoop(model LoopModel, health api.LoopHealthResponse) (LoopMode
 						pane.LastEventAt = t
 					}
 				}
+				// PR-17b: only carry the hint pattern forward when
+				// the server still reports StatusBehaviorHint. When
+				// the runtime clears the hint (PendingHints→0),
+				// Status flips back to the prior state and the
+				// pattern resets to "" so chrome doesn't show a
+				// stale pattern on a non-hint pane.
+				if newStatus == StatusBehaviorHint {
+					pane.LastHintPattern = hp.LastHintPattern
+				} else {
+					pane.LastHintPattern = ""
+				}
 				tab.Panes[pi] = pane
 				changed = true
 			}

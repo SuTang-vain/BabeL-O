@@ -123,6 +123,11 @@ func styleForStatus(s PaneStatus) lipgloss.Style {
 		return lipgloss.NewStyle().Foreground(lipgloss.Color(colAmber)).Bold(true)
 	case StatusDone:
 		return lipgloss.NewStyle().Foreground(lipgloss.Color(colGreen))
+	case StatusBehaviorHint:
+		// PR-17b (Track B §6.5.2): yellow border for hint state.
+		// Bold + amber so the pane stands out without being
+		// confused with StatusDrift (which is also amber).
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(colAmber)).Bold(true)
 	default:
 		return mutedStyle
 	}
@@ -497,6 +502,12 @@ func renderStatusSummaryPill(model LoopModel) string {
 	if n := summary.ByStatus[StatusWaiting]; n > 0 {
 		attention = append(attention, styleForColorName(ColorBlue).Render(fmt.Sprintf("%d waiting", n)))
 	}
+	// PR-17b: highlight hint state in the sidebar summary. Per
+	// doc §6.5.2 hint panes warrant operator attention (they
+	// may need follow-up), so we surface the count in amber.
+	if n := summary.ByStatus[StatusBehaviorHint]; n > 0 {
+		attention = append(attention, styleForColorName(ColorAmber).Render(fmt.Sprintf("%d hint", n)))
+	}
 
 	focusLabel := "(none)"
 	focused, ok := model.FocusedPane()
@@ -822,15 +833,36 @@ func renderFocusedPaneHeader(model LoopModel, width int) string {
 	}
 	left := accentStyle.Render(focused.PaneID) + "  " + textStyle.Render(strings.TrimSpace(focused.Label))
 	pill := renderStatusPill(focused.Status)
+	// PR-17b (Track B §6.5.2): when the focused pane is in
+	// StatusBehaviorHint, append the runtime-provided pattern
+	// as "[hint] pattern: <pattern>". We truncate gracefully
+	// when the line is too narrow.
+	if focused.Status == StatusBehaviorHint && focused.LastHintPattern != "" {
+		hintText := "[hint] pattern: " + focused.LastHintPattern
+		hintLine := styleForStatus(StatusBehaviorHint).Render(hintText)
+		// Replace the gap with a newline + hint line. Use a
+		// simple concatenation; the focused body below keeps
+		// the rest of the chrome aligned.
+		header := padOrTruncate(left+strings.Repeat(" ", max(1, width-lipgloss.Width(left)-lipgloss.Width(pill)))+pill, width)
+		// Truncate the hint line to width.
+		hintLine = padOrTruncate(hintLine, width)
+		return header + "\n" + hintLine
+	}
 	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(pill))
 	return padOrTruncate(left+strings.Repeat(" ", gap)+pill, width)
 }
 
-// renderFocusedPaneBody is the placeholder body shown below
-// the focused pane header. Echoes the session id, the last
-// event rev, and a "waiting for stream" note so the operator
-// knows the pane is real even though the stream isn't wired
-// yet.
+// renderFocusedPaneBody is the body shown below the focused
+// pane header. It always renders the session meta line first
+// (so operators can copy/paste a session id from the body);
+// the rest of the body is filled by either the pane's
+// transcript (Phase 6b) or, when Transcript is empty, the
+// historical "waiting for stream" placeholder. The placeholder
+// branch is what the live TUI falls into today — 6c will start
+// filling transcripts; the placeholder still applies to panes
+// that exist but haven't been attached to a stream yet (e.g.
+// a pane the user just opened with Ctrl+N before any events
+// have arrived).
 func renderFocusedPaneBody(model LoopModel, width, height int) string {
 	focused, ok := model.FocusedPane()
 	if !ok {
@@ -855,10 +887,16 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 	}
 	meta := fmt.Sprintf("  session=%s  ·  rev=%d  ·  agent=%s",
 		sessionLabel, focused.LastEventRev, fallback(focused.Agent, "bbl"))
-	placeholder := mutedStyle.Render("  (waiting for stream — Phase 3f')")
-	lines := []string{
-		padOrTruncate(subtextStyle.Render(meta), width),
-		padOrTruncate(placeholder, width),
+	lines := []string{padOrTruncate(subtextStyle.Render(meta), width)}
+	if len(focused.Transcript) > 0 {
+		// Reserve the first row for the meta line; the rest
+		// of the body is transcript. This is the "user can
+		// finally see the active session" moment of 6b.
+		transcriptBody := renderTranscriptLines(focused, width, height-1)
+		lines = append(lines, splitLines(transcriptBody, width, height-1)...)
+	} else {
+		placeholder := mutedStyle.Render("  (waiting for stream — Phase 3f')")
+		lines = append(lines, padOrTruncate(placeholder, width))
 	}
 	for len(lines) < height {
 		lines = append(lines, strings.Repeat(" ", width))
@@ -867,6 +905,90 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 		lines = lines[:height]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// renderTranscriptLines turns a pane's Transcript into styled
+// lines for the focused body. The role prefix is colored to
+// match the rest of the chrome (user / assistant / tool /
+// system). Lines are then padded / truncated to `width` columns
+// so the body joins cleanly.
+func renderTranscriptLines(pane PaneModel, width, height int) string {
+	raw := BuildTranscriptLines(pane, width, height)
+	if len(raw) == 0 {
+		return ""
+	}
+	out := make([]string, 0, len(raw))
+	for _, line := range raw {
+		// The line is "<role label> <padded text>". Re-color
+		// the role prefix; the rest of the line is textStyle
+		// body content. We split on the first space so the
+		// padding between prefix and body stays intact.
+		role, body, found := strings.Cut(line, " ")
+		if !found {
+			out = append(out, padOrTruncate(textStyle.Render(line), width))
+			continue
+		}
+		out = append(out, padOrTruncate(styleForTranscriptRole(parseTranscriptRole(role))+" "+body, width))
+	}
+	return strings.Join(out, "\n")
+}
+
+// splitLines splits a multi-line block into at most `height`
+// rows, each padded to `width`. Used so renderTranscriptLines
+// (which already returns joined text) can be appended into the
+// body's line list without losing the line structure.
+func splitLines(block string, width, height int) []string {
+	if block == "" || height <= 0 {
+		return nil
+	}
+	parts := strings.Split(block, "\n")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(out) >= height {
+			break
+		}
+		out = append(out, padOrTruncate(p, width))
+	}
+	return out
+}
+
+// parseTranscriptRole maps the role label rendered by
+// TranscriptRole.String() back to the enum so the chrome can
+// pick a color. Returns RoleSystem for unknown labels so the
+// fallback never crashes the renderer.
+func parseTranscriptRole(label string) TranscriptRole {
+	switch label {
+	case "you":
+		return RoleUser
+	case "ai":
+		return RoleAssistant
+	case "tool":
+		return RoleTool
+	case "sys":
+		return RoleSystem
+	default:
+		return RoleSystem
+	}
+}
+
+// styleForTranscriptRole picks the chrome color for a
+// transcript line's role. Reuses the palette: user→accent
+// (so the operator sees their own input pop), assistant→text
+// (default body color), tool→blue (matches working status),
+// system→muted (so system messages don't compete with content).
+func styleForTranscriptRole(r TranscriptRole) string {
+	switch r {
+	case RoleUser:
+		return accentStyle.Render("you")
+	case RoleAssistant:
+		return textStyle.Render("ai")
+	case RoleTool:
+		return lipgloss.NewStyle().Foreground(lipgloss.Color(colBlue)).Render("tool")
+	case RoleSystem:
+		return mutedStyle.Render("sys")
+	default:
+		return mutedStyle.Render("?")
+	}
 }
 
 // fallback returns s if non-empty, otherwise dflt. Used to

@@ -77,6 +77,11 @@ type PaneModel struct {
 	Status      PaneStatus
 	LastEventRev int64
 	LastEventAt time.Time
+	// PR-17b (Track B §6.5.2): when Status == StatusBehaviorHint,
+	// the runtime-provided LastHintPattern is rendered inline by
+	// the chrome ("[hint] pattern: <pattern>"). Empty unless
+	// the runtime projection sets it.
+	LastHintPattern string
 	// Transcript is the pane's recent event log shaped for the
 	// focused-pane body (Phase 6b). Empty until 6c wires the
 	// per-pane waitForEvent poll; the body renders the

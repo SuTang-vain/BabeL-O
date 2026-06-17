@@ -306,3 +306,91 @@ func stripANSI(s string) string {
 	}
 	return b.String()
 }
+
+// PR-17b (Track B §6.5.2): when the focused pane is in
+// StatusBehaviorHint with a non-empty LastHintPattern, the chrome
+// renders the pill plus an inline "[hint] pattern: <pattern>"
+// line. This test verifies the wire form: a focused pane
+// transition to StatusBehaviorHint surfaces the pattern in the
+// focused-pane header.
+func TestChromeRendersBehaviorHintInFocusedHeader(t *testing.T) {
+	// Build a model with one workspace + tab + pane.
+	ws := NewWorkspace("ws-hint", "Hint Test").AddTab("Tab")
+	updated, err := ws.Tabs[0].AddPane(PaneModel{
+		PaneID:      "pane-hint",
+		WorkspaceID: ws.ID,
+		TabID:       ws.Tabs[0].ID,
+		SessionID:   "session-hint",
+		Label:       "Hint Pane",
+	})
+	if err != nil {
+		t.Fatalf("AddPane: %v", err)
+	}
+	ws.Tabs[0] = updated
+	model := LoopModel{
+		Workspaces: []Workspace{ws},
+		Focus:      FocusPath{WorkspaceIdx: 0, TabIdx: 0, PaneIdx: 0},
+	}
+
+	// Simulate the health-poll path landing a hint state.
+	ws2 := model.Workspaces[0]
+	tab2 := ws2.Tabs[0]
+	pane := tab2.Panes[0]
+	pane.Status = StatusBehaviorHint
+	pane.LastHintPattern = "tool-storm@session-x"
+	tab2.Panes[0] = pane
+	ws2.Tabs[0] = tab2
+	model.Workspaces[0] = ws2
+
+	header := renderFocusedPaneHeader(model, 80)
+	if !strings.Contains(header, "behavior_hint") {
+		t.Errorf("renderFocusedPaneHeader missing 'behavior_hint' status pill: %q", header)
+	}
+	if !strings.Contains(header, "[hint]") {
+		t.Errorf("renderFocusedPaneHeader missing '[hint]' inline: %q", header)
+	}
+	if !strings.Contains(header, "tool-storm@session-x") {
+		t.Errorf("renderFocusedPaneHeader missing pattern 'tool-storm@session-x': %q", header)
+	}
+}
+
+// PR-17b: when LastHintPattern is set but Status is NOT
+// StatusBehaviorHint, the chrome must NOT show a "[hint]" line —
+// stale patterns from previous health polls would otherwise
+// linger on a non-hint pane.
+func TestChromeSuppressesStaleHintPattern(t *testing.T) {
+	ws := NewWorkspace("ws-stale", "Stale Hint").AddTab("Tab")
+	updated, err := ws.Tabs[0].AddPane(PaneModel{
+		PaneID:      "pane-stale",
+		WorkspaceID: ws.ID,
+		TabID:       ws.Tabs[0].ID,
+		SessionID:   "session-stale",
+		Label:       "Stale Pane",
+	})
+	if err != nil {
+		t.Fatalf("AddPane: %v", err)
+	}
+	ws.Tabs[0] = updated
+	model := LoopModel{
+		Workspaces: []Workspace{ws},
+		Focus:      FocusPath{WorkspaceIdx: 0, TabIdx: 0, PaneIdx: 0},
+	}
+
+	// Status = Done (not StatusBehaviorHint) but pattern set.
+	ws2 := model.Workspaces[0]
+	tab2 := ws2.Tabs[0]
+	pane := tab2.Panes[0]
+	pane.Status = StatusDone
+	pane.LastHintPattern = "old-pattern-should-not-render"
+	tab2.Panes[0] = pane
+	ws2.Tabs[0] = tab2
+	model.Workspaces[0] = ws2
+
+	header := renderFocusedPaneHeader(model, 80)
+	if strings.Contains(header, "[hint]") {
+		t.Errorf("renderFocusedPaneHeader must NOT contain '[hint]' when status != StatusBehaviorHint: %q", header)
+	}
+	if strings.Contains(header, "old-pattern-should-not-render") {
+		t.Errorf("renderFocusedPaneHeader must NOT contain stale pattern: %q", header)
+	}
+}
