@@ -80,6 +80,20 @@ func runLoop(
 			WorkspaceID: cfg.WorkspaceID,
 		}
 	}
+	// PR-17c (B1): wire the per-CWD WS observer. Default-on
+	// (no --ws-observe flag per spec). Empty sessionID = no
+	// filter. The observer is the loop-level glue that
+	// reconnects on read errors + calls Reconciler.RunOnce
+	// once on reconnect to repair drift; the api.Client
+	// method (api/working_set_observer.go) is transport-only
+	// with no auto-reconnect. Reconciler pointer is passed
+	// via the ReconcilerRunner interface seam defined in
+	// loop/ws_observer.go so we don't need to modify the
+	// frozen reconcile_worker.go.
+	var wsObserver *loop.WorkingSetObserver
+	if client != nil {
+		wsObserver = loop.NewWorkingSetObserver(client, reconciler, cfg.Cwd, "")
+	}
 	im := loop.NewInteractiveModelWithLoopClient(
 		model,
 		store,
@@ -90,7 +104,9 @@ func runLoop(
 		toastQueue,
 		soundPlayer,
 	)
+	im = loop.NewInteractiveModelWithWorkingSetObserver(im, wsObserver)
 	im = loop.NewInteractiveModelWithRuntimeOptions(im, cfg.AltScreen, cfg.MouseCapture)
+	im = loop.NewInteractiveModelWithExecuteTimeout(im, time.Duration(cfg.ExecuteTimeoutMs)*time.Millisecond)
 	prog := tea.NewProgram(im)
 	finalModel, err := prog.Run()
 	if err != nil {
@@ -141,6 +157,7 @@ func parseFlags(cfg *loop.Config) error {
 	flag.IntVar(&cfg.PollIntervalMs, "poll-interval-ms", 5000, "background /v1/loop/workspaces reconcile interval in milliseconds; 0 disables reconcile")
 	flag.IntVar(&cfg.HealthIntervalMs, "health-interval-ms", 3000, "background /v1/runtime/loop/health poll interval in milliseconds; 0 disables the status sidebar live updates")
 	flag.IntVar(&cfg.WaitTimeoutMs, "wait-timeout-ms", 5000, "max wait window per /v1/sessions/:id/wait call in milliseconds")
+	flag.IntVar(&cfg.ExecuteTimeoutMs, "execute-timeout-ms", 180000, "max HTTP /v1/execute window for pane prompt submission in milliseconds")
 	flag.BoolVar(&cfg.AltScreen, "alt", true, "use terminal alternate screen")
 	flag.BoolVar(&cfg.MouseCapture, "mouse", true, "capture mouse drag / wheel; set --mouse=false to let the terminal own selection and scrollback")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "print version and exit")

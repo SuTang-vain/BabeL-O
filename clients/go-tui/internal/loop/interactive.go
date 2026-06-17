@@ -36,6 +36,7 @@
 package loop
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -79,7 +80,35 @@ type InteractiveModel struct {
 	// first to avoid stacking concurrent polls on the
 	// same pane. Cleared by handleWaitDone (deferred).
 	waitInFlight map[string]bool
-	quitting     bool
+	// wsReadInFlight tracks per-pane WS stream read state
+	// for 6d-c'-A (the opt-in WS read path). A pane id is
+	// in the map while the /v1/sessions/:id/stream
+	// connection is open; scheduleWsRead callers must
+	// check first to avoid stacking concurrent streams
+	// on the same pane. Cleared by handleWsReadEvent /
+	// handleWsReadStarted on error / clean close. Mutually
+	// exclusive with waitInFlight — a pane is on EITHER
+	// the HTTP wait path OR the WS read path, not both.
+	wsReadInFlight map[string]bool
+	// wsReadCancels stores the per-pane cancel/close
+	// funcs returned by api.StreamSession. close-pane
+	// calls clearWsReadOnClose to stop the read so a
+	// stale event that arrives after the pane is gone is
+	// dropped.
+	wsReadCancels map[string]wsReadHandles
+	// useWsRead is the opt-in flag that switches the
+	// per-pane read path from HTTP `waitForEvent` to WS
+	// stream (6d-c'-A). Default false (HTTP wait) so
+	// existing users see no behavior change. Production
+	// wiring: a CLI flag / env var; tests use
+	// SetUseWsReadForTest.
+	useWsRead bool
+	// submitInFlight tracks per-pane HTTP /v1/execute
+	// submissions (Phase 6d-b). It prevents Enter from
+	// launching concurrent turns for the same pane while the
+	// previous queued prompt is still running.
+	submitInFlight map[string]bool
+	quitting       bool
 	// helpOpen toggles the centered keybind overlay. Wired
 	// to the `?` key from Update; rendered by chrome.go.
 	helpOpen bool
@@ -119,6 +148,10 @@ type InteractiveModel struct {
 	// field so the constructor signature stays readable
 	// even when several periodic loops are wired.
 	healthInterval time.Duration
+	// executeTimeout is the HTTP /v1/execute timeout used
+	// when a pane-local QueuedPrompt is submitted. Zero
+	// falls back to defaultExecuteTimeoutMs.
+	executeTimeout time.Duration
 	// toastQueue deduplicates status-change toasts within
 	// a 5s window and suppresses toasts for the focused
 	// tab. nil means no toast side effects (the chrome
@@ -143,6 +176,61 @@ type InteractiveModel struct {
 	// is driver-owned, while LoopModel stays pure pane state.
 	altScreen    bool
 	mouseCapture bool
+	// paneListOpen / scopeReviewOpen are 6d-overlay
+	// flags: when true, the chrome splices the matching
+	// overlay panel over the focused pane body. Lines
+	// for the overlays are computed once at open time
+	// (and re-computed on every View while the overlay
+	// is open) so the chrome's render path stays free
+	// of I/O. The flags mirror helpOpen's contract —
+	// any key (esc/q/?/ctrl+c) closes the overlay.
+	paneListOpen    bool
+	// paneListCursor is the row index into the structured
+	// BuildPaneListRows output for the ctrl+j pane_list
+	// overlay. 0 when no row is selected (e.g. the overlay
+	// is closed). Reset to 0 every time the overlay is
+	// toggled open so the operator lands on the first row
+	// (the focused pane row is at index 1 in the typical
+	// ws/tab/pane tree, but starting at 0 keeps the
+	// "wherever I last navigated" out of the picture and
+	// makes the up/down math trivial: clamp + wrap).
+	//
+	// 6d-f: row highlight + Enter-to-jump. The cursor
+	// persists across View re-renders so the chrome can
+	// apply the highlight consistently.
+	paneListCursor int
+	scopeReviewOpen bool
+	// scopeDriftOpen is the 6d-g toggle for the
+	// scope_drift overlay (ctrl+d). The third overlay
+	// per plan §4.5 / §6' — surfaces the list of panes
+	// currently in StatusDrift with their live
+	// boundary / evidence / memory counts.
+	scopeDriftOpen bool
+	// lastHealthForDrift captures the most recent
+	// successful health response so the scope_drift
+	// overlay can read live counts on every View. nil
+	// when health hasn't polled yet — the overlay falls
+	// back to a model-only "no drift reported" / rows.
+	// This is the 6d-g counterpart to m.scopeReviewInput
+	// for the 6d-e overlay.
+	lastHealthForDrift *api.LoopHealthResponse
+	// scopeReviewInput is the data bundle for the
+	// scope_review overlay. nil means "no data yet"
+	// (placeholder rendered). A later 6d slice will
+	// populate this from the focused pane's last health
+	// response; for now tests can inject it via
+	// SetScopeReviewInputForTest.
+	scopeReviewInput *ScopeReviewInput
+	// wsObserver is the PR-17c (B1) per-CWD working-set
+	// WS observer. nil means the observer is disabled
+	// (e.g. in-memory / no-Nexus mode). The observer is
+	// auto-started from Init via Start() and the
+	// Update switch handles wsObserverConnectMsg /
+	// wsObserverReconnectMsg / wsObserverEventMsg.
+	// Stored on the model rather than passed around as
+	// a side argument so the Add/Remove plumbing stays
+	// symmetric with loopClient / reconciler.
+	wsObserver *WorkingSetObserver
 }
 
 // toastTTL is how long a transient toast stays visible on
@@ -216,6 +304,7 @@ func NewInteractiveModelWithLoopClient(
 	im := NewInteractiveModelWithReconciler(model, store, reconciler, reconcileInterval)
 	im.loopClient = loopClient
 	im.healthInterval = healthInterval
+	im.executeTimeout = defaultExecuteTimeout
 	im.toastQueue = toastQueue
 	im.soundPlayer = soundPlayer
 	return im
@@ -232,6 +321,32 @@ func NewInteractiveModelWithRuntimeOptions(
 ) InteractiveModel {
 	model.altScreen = altScreen
 	model.mouseCapture = mouseCapture
+	return model
+}
+
+// NewInteractiveModelWithExecuteTimeout applies the pane
+// prompt submission timeout used by the 6d-b HTTP execute
+// bridge. Non-positive values leave the existing default in
+// place.
+func NewInteractiveModelWithExecuteTimeout(model InteractiveModel, timeout time.Duration) InteractiveModel {
+	if timeout > 0 {
+		model.executeTimeout = timeout
+	}
+	return model
+}
+
+// NewInteractiveModelWithWorkingSetObserver attaches the
+// PR-17c (B1) per-CWD working-set WS observer to the
+// InteractiveModel. The observer is auto-started from
+// Init() so the operator gets the live working-set
+// stream as soon as the TUI comes up. Pass `nil` to
+// disable the observer (e.g. in-memory / no-Nexus
+// mode). The reconciler pointer is captured on the
+// observer itself (constructed in cmd/bbl-loop) — the
+// model just stores the field; it does not call
+// RunOnce directly.
+func NewInteractiveModelWithWorkingSetObserver(model InteractiveModel, observer *WorkingSetObserver) InteractiveModel {
+	model.wsObserver = observer
 	return model
 }
 
@@ -378,14 +493,27 @@ func (m InteractiveModel) Init() tea.Cmd {
 	if m.loopClient != nil && m.healthInterval > 0 {
 		cmds = append(cmds, scheduleHealthTick(m.healthInterval))
 	}
-	// Phase 6c: start a per-pane waitForEvent poll for every
-	// pane already in the model at startup. This covers the
-	// case where the user's Store has panes from a previous
-	// bbl loop run (Phase 5a persistence) and we want their
-	// transcripts to start filling in immediately. Newly
-	// discovered panes are picked up by handleReconcileDone
-	// after their first reconcile tick.
-	cmds = append(cmds, m.startAllWaits()...)
+	// Phase 6c / 6d-c'-A: start a per-pane read cmd for
+	// every pane already in the model at startup. The
+	// dispatcher (startAllReads) picks HTTP wait or WS
+	// stream based on m.useWsRead (default HTTP wait for
+	// backwards compatibility). This covers the case
+	// where the user's Store has panes from a previous
+	// bbl loop run (Phase 5a persistence) and we want
+	// their transcripts to start filling in immediately.
+	// Newly discovered panes are picked up by
+	// handleReconcileDone after their first reconcile
+	// tick.
+	cmds = append(cmds, m.startAllReads()...)
+	// PR-17c (B1): auto-start the working-set WS
+	// observer. Default-on (no --ws-observe flag). The
+	// observer manages its own backoff on read errors so
+	// the TUI stays responsive when the server endpoint
+	// isn't reachable; the reconciler REST polling
+	// continues to keep the UI functional in that case.
+	if m.wsObserver != nil {
+		cmds = append(cmds, m.wsObserver.Start(context.Background()))
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -419,6 +547,64 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case waitDoneMsg:
 		return m, m.handleWaitDone(msg)
 
+	case wsReadBatchMsg:
+		// 6d-c'-A: WS read handle arrived. Store the
+		// channels + cancel/close funcs and schedule
+		// the first continue read.
+		return m, m.handleWsReadStarted(msg)
+
+	case wsEventMsg:
+		// 6d-c'-A: a per-event / per-error message from
+		// the open WS stream. Append / heartbeat / error
+		// branch lives in handleWsReadEvent.
+		return m, m.handleWsReadEvent(msg)
+
+	case wsObserverConnectMsg:
+		// PR-17c (B1): the working-set WS dial
+		// finished. On success we kick off a per-event
+		// drain cmd and remember the close fn for
+		// shutdown. On dial failure we schedule a
+		// backoff reconnect.
+		return m, m.handleWsObserverConnect(msg)
+
+	case wsObserverReconnectMsg:
+		// PR-17c (B1): a previously scheduled backoff
+		// reconnect fired. Re-dial.
+		if msg.observer == nil {
+			return m, nil
+		}
+		return m, msg.observer.ConnectCmd()
+
+	case wsObserverEventMsg:
+		// PR-17c (B1): one server-pushed working-set
+		// frame. The handle dispatches by Type (snapshot
+		// / updated / reset / error) and schedules the
+		// next read so the same channel keeps flowing.
+		return m, m.handleWsObserverEvent(msg)
+
+	case wsObserverErrMsg:
+		// PR-17c (B1): a read error / clean close from
+		// the observer's stream. Schedules a backoff
+		// reconnect and (if the observer was previously
+		// connected) a Reconciler.RunOnce drift repair.
+		return m, m.handleWsObserverErr(msg)
+
+	case wsObserverReconcileDoneMsg:
+		// PR-17c (B1): post-reconnect reconciler pass
+		// finished. The store + model are already
+		// updated; the message is currently a no-op,
+		// reserved for future toasts / diagnostics.
+		return m, nil
+
+	case submitDoneMsg:
+		return m, m.handleSubmitDone(msg)
+
+	case permissionDecisionMsg:
+		return m, m.handlePermissionDecision(msg)
+
+	case cancelDoneMsg:
+		return m, m.handleCancelDone(msg)
+
 	case tea.KeyPressMsg:
 		// Help overlay takes priority over quit + router
 		// dispatch so `?` toggles it from any state and
@@ -434,6 +620,120 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// is up so the underlying chrome doesn't
 			// react to a stray keypress.
 			return m, nil
+		}
+		// 6d-overlay: pane_list (ctrl+j) and
+		// scope_review (ctrl+r) overlays. Each opens
+		// until the operator dismisses with esc/q/?/
+		// ctrl+c. We close on the same keys as help so
+		// the dismissal muscle memory is consistent
+		// across overlays. The toggle key is also a
+		// dismiss key (pressing ctrl+j while pane_list
+		// is open closes it). Other keys while the
+		// overlay is up are swallowed (mirrors
+		// helpOpen), BUT the other overlay's toggle
+		// key is allowed through so the operator can
+		// switch between overlays without dismissing
+		// first.
+		if m.paneListOpen {
+			switch chromeKeyName(msg) {
+			case "esc", "q", "ctrl+c", "ctrl+j":
+				m.paneListOpen = false
+				m.paneListCursor = 0
+				return m, nil
+			case "ctrl+r", "ctrl+d", "?":
+				// Allow scope_review / scope_drift /
+				// help to open on top of pane_list —
+				// fall through to the main switch.
+				break
+			case "up":
+				m.paneListCursor = m.movePaneListCursor(-1)
+				return m, nil
+			case "down":
+				m.paneListCursor = m.movePaneListCursor(+1)
+				return m, nil
+			case "enter":
+				// Enter on a pane row jumps focus to
+				// that pane and dismisses the overlay;
+				// Enter on a workspace / tab row is a
+				// noop (the cursor stays put, the
+				// overlay stays open — operator can
+				// keep navigating).
+				if jumped := m.jumpPaneListCursorToFocus(); jumped {
+					m.paneListOpen = false
+					m.paneListCursor = 0
+				}
+				return m, nil
+			}
+			key := chromeKeyName(msg)
+			if key != "ctrl+r" && key != "ctrl+d" && key != "?" {
+				return m, nil
+			}
+		}
+		if m.scopeReviewOpen {
+			switch chromeKeyName(msg) {
+			case "esc", "q", "ctrl+c", "ctrl+r":
+				m.scopeReviewOpen = false
+				return m, nil
+			case "ctrl+j", "ctrl+d", "?":
+				// Allow pane_list / scope_drift / help
+				// to open on top of scope_review — fall
+				// through.
+				break
+			}
+			key := chromeKeyName(msg)
+			if key != "ctrl+j" && key != "ctrl+d" && key != "?" {
+				return m, nil
+			}
+		}
+		if m.scopeDriftOpen {
+			switch chromeKeyName(msg) {
+			case "esc", "q", "ctrl+c", "ctrl+d":
+				m.scopeDriftOpen = false
+				return m, nil
+			case "ctrl+j", "ctrl+r", "?":
+				// Allow pane_list / scope_review / help
+				// to open on top of scope_drift — fall
+				// through.
+				break
+			}
+			key := chromeKeyName(msg)
+			if key != "ctrl+j" && key != "ctrl+r" && key != "?" {
+				return m, nil
+			}
+		}
+		// 6d-c: pending permission dialog intercepts Y/Enter
+		// (approve) and N (deny) BEFORE the quit-key block
+		// and the router dispatch. The dialog is modal — the
+		// operator can't drive other UI until they decide.
+		// We deliberately keep the quit keys alive
+		// (ctrl+c/esc/q still quit) so a misbehaving
+		// permission_request can't trap the operator in
+		// the TUI.
+		if pane, ok := m.loop.FocusedPane(); ok && pane.PendingPermission != nil {
+			switch chromeKeyName(msg) {
+			case "y", "enter":
+				return m, m.dispatchPermissionDecision(pane, pane.PendingPermission, "approve")
+			case "n":
+				return m, m.dispatchPermissionDecision(pane, pane.PendingPermission, "deny")
+			}
+			// Swallow other keys while the dialog is up
+			// so they don't trigger input / router actions
+			// underneath.
+			return m, nil
+		}
+		// 6d-d: Esc on a pane with an in-flight submit
+		// becomes a cancel instead of a quit. The
+		// operator's "Esc to bail out of the current
+		// thing" muscle memory maps cleanly: if there's
+		// something running, Esc cancels it; if there
+		// isn't, Esc still quits the program.
+		if chromeKeyName(msg) == "esc" {
+			if pane, ok := m.loop.FocusedPane(); ok {
+				if pane.SessionID != "" &&
+					(m.isSubmitInFlight(pane.PaneID) || pane.InterruptionActive) {
+					return m, m.requestCancelForPane(pane)
+				}
+			}
 		}
 		// Quit keys win over router dispatch.
 		switch chromeKeyName(msg) {
@@ -456,6 +756,44 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// entry; the chrome just renders it at full
 			// body width.
 			m.zoomFocused = !m.zoomFocused
+			return m, nil
+		case "ctrl+j":
+			// 6d-overlay: pane_list overlay. Lists every
+			// workspace / tab / pane in the LoopModel
+			// using BuildPaneListLines — the data is
+			// already on the model so opening the
+			// overlay doesn't trigger any I/O. Same
+			// dismiss contract as help (`esc` / `q` /
+			// `ctrl+c` / `ctrl+j` again). 6d-f: when
+			// opening, reset the cursor to 0 so the
+			// operator lands on the first row.
+			m.paneListOpen = !m.paneListOpen
+			if m.paneListOpen {
+				m.paneListCursor = 0
+			}
+			return m, nil
+		case "ctrl+r":
+			// 6d-overlay: scope review overlay. Pulls
+			// the task scope / pending boundaries /
+			// out-of-scope evidence from the focused
+			// pane's last health response (or shows a
+			// "no scope data yet" placeholder when the
+			// data hasn't been fetched — health is
+			// best-effort, the overlay degrades
+			// gracefully).
+			m.scopeReviewOpen = !m.scopeReviewOpen
+			return m, nil
+		case "ctrl+d":
+			// 6d-g: scope_drift overlay. The third
+			// overlay per plan §4.5 / §6'. Lists every
+			// pane currently in StatusDrift (and the
+			// live boundary / evidence / memory counts
+			// from the most recent health poll).
+			// Distinct from scope_review which zooms
+			// into the focused pane's full taskScope.
+			// Dismiss contract mirrors help / pane_list
+			// (esc / q / ctrl+c / the toggle key).
+			m.scopeDriftOpen = !m.scopeDriftOpen
 			return m, nil
 		}
 		event, ok := rawEventFromKey(msg)
@@ -489,6 +827,12 @@ func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 		// bookkeeping has to happen at the call site.
 		if closed, ok := m.loop.FocusedPane(); ok {
 			m.clearWaitOnClose(closed.PaneID)
+			// 6d-c'-A: also clear the WS read in-flight
+			// state + cancel the WS connection. The
+			// close-pane site owns both so a stale
+			// event that arrives after the pane is gone
+			// is dropped.
+			m.clearWsReadOnClose(closed.PaneID)
 		}
 		m.loop = ApplyClosePane(m.loop)
 	case RouteNewPane:
@@ -499,7 +843,21 @@ func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 		m.loop = ApplyNextTab(m.loop)
 	case RoutePrevTab:
 		m.loop = ApplyPrevTab(m.loop)
-	case RouteNewWorkspace, RouteCloseWorkspace, RouteFocusPane, RouteResize, RouteNone:
+	case RouteFocusPane:
+		var result PaneInputResult
+		m.loop, result = ApplyPaneInputEvent(m.loop, route.Payload)
+		if !result.Mutated {
+			return nil
+		}
+		if submitted := strings.TrimSpace(result.Submitted); submitted != "" {
+			m.toastMessage = "queued prompt: " + truncatePlain(singleLine(submitted), 80)
+			m.toastShownAt = time.Now()
+			if pane, ok := m.loop.FocusedPane(); ok {
+				return m.startSubmitForPane(pane)
+			}
+		}
+		return nil
+	case RouteNewWorkspace, RouteCloseWorkspace, RouteResize, RouteNone:
 		// No mutation in this sub-target. Workspace creation /
 		// destruction will land in Phase 3f''; focus-pane +
 		// resize are already handled in the calling Update.
@@ -660,8 +1018,22 @@ func (m InteractiveModel) View() tea.View {
 		v.MouseMode = tea.MouseModeNone
 	}
 	v.SetContent(renderChrome(m.loop, chromeViewState{
-		HelpOpen: m.helpOpen,
-		Toast:    m.activeToast(),
+		HelpOpen:        m.helpOpen,
+		Toast:           m.activeToast(),
+		PaneListOpen:    m.paneListOpen,
+		ScopeReviewOpen: m.scopeReviewOpen,
+		// 6d-g: third overlay flag + line buffer for
+		// scope_drift (ctrl+d). The chrome layer reads
+		// these as part of its overlay splice path.
+		ScopeDriftOpen:  m.scopeDriftOpen,
+		PaneListLines:   m.activePaneListLines(),
+		// 6d-f: pass the structured rows + cursor so the
+		// chrome can apply a `▸ ` highlight to the row at
+		// index `paneListCursor`. The legacy `PaneListLines`
+		// path stays for tests + non-overlay renderers.
+		PaneListCursor:   m.cursorForChrome(),
+		ScopeReviewLines: m.activeScopeReviewLines(),
+		ScopeDriftLines:  m.activeScopeDriftLines(),
 		Reconcile: reconcileFooterInfo{
 			InFlight: m.reconcileInFlight,
 			At:       m.lastReconcileAt,
@@ -681,13 +1053,193 @@ func (m InteractiveModel) View() tea.View {
 // carry. Keeping it as a separate struct means the data
 // layer (model.go) stays free of any UI-flavored concept
 // (help overlay, transient toast, reconcile indicator,
-// layout toggles) — those are properties of the interactive
-// driver, not the underlying state.
+// layout toggles, overlay toggles) — those are properties
+// of the interactive driver, not the underlying state.
+//
+// PaneListLines / ScopeReviewLines are the precomputed
+// line buffers the overlay renderers splice into the
+// chrome. The InteractiveModel recomputes them at View
+// time so any state change since the last render is
+// reflected (e.g. a new pane added via reconcile shows
+// up the next time the operator opens ctrl+j). The
+// renderers themselves are pure — no I/O, no model
+// access — so the chrome layer stays data-free.
 type chromeViewState struct {
-	HelpOpen  bool
-	Toast     string
-	Reconcile reconcileFooterInfo
-	Layout    layoutChromeState
+	HelpOpen         bool
+	Toast            string
+	PaneListOpen     bool
+	ScopeReviewOpen  bool
+	// ScopeDriftOpen is the 6d-g flag for the
+	// scope_drift overlay (ctrl+d). When true the
+	// chrome splices the scope_drift panel on top of
+	// the existing content.
+	ScopeDriftOpen   bool
+	PaneListLines    []string
+	// PaneListCursor is the row index for the 6d-f
+	// row-highlight feature. The chrome layer applies a
+	// `▸ ` prefix to the row at this index (in addition
+	// to the existing focus marker on the actually-
+	// focused pane row). -1 means "no row highlighted"
+	// (used when the overlay is closed so the chrome
+	// skips the highlight loop).
+	PaneListCursor   int
+	ScopeReviewLines []string
+	// ScopeDriftLines is the precomputed line buffer for
+	// the 6d-g scope_drift overlay. Computed by
+	// activeScopeDriftLines in View-time from
+	// BuildScopeDriftInputFromHealth so the chrome
+	// doesn't need to know about api types.
+	ScopeDriftLines  []string
+	Reconcile        reconcileFooterInfo
+	Layout           layoutChromeState
+}
+
+// activePaneListLines returns the line buffer for the
+// pane_list overlay. Computed from the current LoopModel
+// via the existing BuildPaneListLines pure function. Nil
+// when the overlay is closed so the chrome's
+// PaneListOpen guard can short-circuit.
+func (m InteractiveModel) activePaneListLines() []string {
+	if !m.paneListOpen {
+		return nil
+	}
+	return BuildPaneListLines(m.loop)
+}
+
+// paneListRowsForChrome returns the structured row slice
+// for the chrome to render with cursor highlight. Mirrors
+// activePaneListLines but exposes the typed `paneRow`
+// values so renderPaneListPanel can apply the `▸ `
+// highlight to the row at index `paneListCursor`. 6d-f
+// addition: the chrome layer needs structured access to
+// apply the highlight without re-parsing the plain-text
+// lines.
+func (m InteractiveModel) paneListRowsForChrome() []paneRow {
+	if !m.paneListOpen {
+		return nil
+	}
+	return BuildPaneListRows(m.loop)
+}
+
+// cursorForChrome is the small adapter that maps
+// `paneListCursor` to a sentinel the chrome layer can
+// branch on. Returns -1 when the overlay is closed so the
+// chrome skips the highlight loop entirely.
+func (m InteractiveModel) cursorForChrome() int {
+	if !m.paneListOpen {
+		return -1
+	}
+	return m.paneListCursor
+}
+
+// movePaneListCursor advances the row cursor by `delta`.
+// Wraps around when the cursor goes past either end. When
+// the row slice is empty the cursor stays at 0 so the
+// next navigation has a stable starting point. 6d-f: the
+// up/down dispatch in Update path delegates here so the
+// math is unit-testable in isolation.
+func (m InteractiveModel) movePaneListCursor(delta int) int {
+	rows := BuildPaneListRows(m.loop)
+	if len(rows) == 0 {
+		return 0
+	}
+	cur := m.paneListCursor + delta
+	if cur < 0 {
+		cur = len(rows) - 1
+	} else if cur >= len(rows) {
+		cur = 0
+	}
+	return cur
+}
+
+// jumpPaneListCursorToFocus looks up the row at the
+// current cursor; if it's a pane row, applies
+// ApplyFocusPath to the underlying model and returns true.
+// Returns false (no jump) for workspace / tab rows so the
+// operator's "Enter on a non-pane row" is a soft noop
+// rather than a confusing "nothing happened, the overlay
+// closed anyway" UX. The mutation is written through the
+// LoopModel field on `m` so the next View() reflects the
+// new focus path.
+func (m *InteractiveModel) jumpPaneListCursorToFocus() bool {
+	rows := BuildPaneListRows(m.loop)
+	if m.paneListCursor < 0 || m.paneListCursor >= len(rows) {
+		return false
+	}
+	row := rows[m.paneListCursor]
+	if row.Kind != paneRowPane {
+		return false
+	}
+	// Find the (workspaceIdx, tabIdx, paneIdx) for the
+	// selected pane. ApplyFocusPath bounds-checks again
+	// so a stale model (pane closed between cursor set
+	// and Enter) doesn't panic.
+	for wi, ws := range m.loop.Workspaces {
+		if ws.ID != row.WorkspaceID {
+			continue
+		}
+		for ti, tab := range ws.Tabs {
+			if tab.ID != row.TabID {
+				continue
+			}
+			for pi, pane := range tab.Panes {
+				if pane.PaneID == row.PaneID {
+					m.loop = ApplyFocusPath(m.loop, wi, ti, pi)
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// activeScopeReviewLines returns the line buffer for the
+// scope_review overlay. The data is sourced from the
+// focused pane's last health response (the
+// /v1/runtime/loop/health endpoint already returns
+// per-pane taskScope with primaryRoot / pendingBoundaries
+// / outOfScopeEvidence). For 6d-overlay step 1 the
+// InteractiveModel only has the LoopModel + a
+// pre-bundled ScopeReviewInput; the caller (a later
+// slice that wires the data) supplies it via
+// SetScopeReviewInputForTest. With no input the overlay
+// shows a "no scope data yet" placeholder so the chrome
+// always renders something.
+func (m InteractiveModel) activeScopeReviewLines() []string {
+	if !m.scopeReviewOpen {
+		return nil
+	}
+	if m.scopeReviewInput == nil {
+		return []string{
+			"Scope review",
+			"  no scope data yet",
+			"  wait for the next health poll",
+			"  (or wire ScopeReviewInput)",
+		}
+	}
+	return BuildScopeReviewLines(*m.scopeReviewInput)
+}
+
+// activeScopeDriftLines returns the line buffer for the
+// 6d-g scope_drift overlay (ctrl+d). Sourced from
+// BuildScopeDriftInputFromHealth which walks the model
+// for drift-status panes and lifts counts from the
+// latest health response. With no drift panes the
+// overlay shows a "no drift reported" placeholder so
+// the chrome always renders something meaningful.
+func (m InteractiveModel) activeScopeDriftLines() []string {
+	if !m.scopeDriftOpen {
+		return nil
+	}
+	// Use the most recent health response if we've
+	// captured one (via SetLastHealthForTest); fall
+	// back to a model-only input so the overlay can
+	// still render the "no drift reported" placeholder
+	// in early startup.
+	if m.lastHealthForDrift == nil {
+		return BuildScopeDriftLines(ScopeDriftInput{Model: m.loop})
+	}
+	return BuildScopeDriftLines(*BuildScopeDriftInputFromHealth(m.loop, *m.lastHealthForDrift))
 }
 
 // activeToast returns the current toast message if it's
@@ -742,6 +1294,28 @@ func (m *InteractiveModel) SetReconcileForTest(info reconcileFooterInfo) {
 func (m *InteractiveModel) SetLayoutForTest(layout layoutChromeState) {
 	m.sidebarCollapsed = layout.SidebarCollapsed
 	m.zoomFocused = layout.ZoomFocused
+}
+
+// SetScopeReviewInputForTest attaches a precomputed
+// ScopeReviewInput to the InteractiveModel so the
+// scope_review overlay can render with real data in
+// tests / chrome smoke commands. A later 6d slice will
+// populate this from the focused pane's last health
+// response automatically; for now the wiring is test-only.
+func (m *InteractiveModel) SetScopeReviewInputForTest(in *ScopeReviewInput) {
+	m.scopeReviewInput = in
+}
+
+// SetHealthForDriftForTest stamps a precomputed health
+// response so the 6d-g scope_drift overlay can render
+// live data without driving a real /v1/runtime/loop/health
+// poll. The production path (handleHealthDone) sets
+// `lastHealthForDrift` from the actual health fetch.
+// Tests use this to seed the cache and assert that the
+// overlay surfaces per-pane counts. Mirrors
+// SetScopeReviewInputForTest in spirit.
+func (m *InteractiveModel) SetHealthForDriftForTest(h *api.LoopHealthResponse) {
+	m.lastHealthForDrift = h
 }
 
 // SetHealthForTest injects a precomputed health response
