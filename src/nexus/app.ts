@@ -598,6 +598,14 @@ export type CreateNexusAppOptions = {
   runtime: NexusRuntime
   storage: NexusStorage
   defaultCwd: string
+  /**
+   * PR-27: Optional shared WorkingSetBroadcaster. When provided, the
+   * /v1/working-set/observe WebSocket and any future REST handlers that
+   * opt in will share a per-cwd PersistedWorkingSetTracker instance, so
+   * mutations flow into the same event bus that subscribers are listening
+   * on. If not provided, a default per-app broadcaster is created.
+   */
+  workingSetBroadcaster?: import('./workingSetBroadcaster.js').WorkingSetBroadcaster
   executeTimeoutMs?: number
   /**
    * Server-side default for the per-request `policy` body field. When a
@@ -699,6 +707,8 @@ export async function createNexusApp(
   const apiKey = options.apiKey ?? process.env.NEXUS_API_KEY
   const executeTimeoutMs = options.executeTimeoutMs ?? 30_000
   const executePolicyMode = options.executePolicyMode ?? 'strict'
+  // PR-27: default per-app broadcaster. Tests can override via options.
+  const appBroadcaster = options.workingSetBroadcaster ?? new WorkingSetBroadcaster()
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
@@ -3851,6 +3861,81 @@ export async function createNexusApp(
     })
   })
 
+  // PR-27: /v1/working-set/observe — WebSocket push for working_set_updated
+  // and working_set_reset events. Per design §7.3 WebSocket + PR-26 event bus.
+  // Pure read: subscribes to a tracker's event bus and fans out to the
+  // client. No state mutation.
+  app.get('/v1/working-set/observe', { websocket: true }, async (socket, request) => {
+    // Use the FastifyRequest for query parsing (the @fastify/websocket
+    // handshake is unreliable across versions).
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = typeof q.cwd === 'string' ? q.cwd : undefined
+    if (!cwd) {
+      sendJson(socket, { type: 'error', code: 'MISSING_CWD', message: 'cwd query param is required' })
+      socket.close(1008, 'missing cwd')
+      return
+    }
+    const sessionId = typeof q.sessionId === 'string' ? q.sessionId : undefined
+
+    // Use the shared broadcaster if provided (lets REST + WS share the
+    // same tracker instance, so REST mutations flow into WS events).
+    // Otherwise create a per-connection broadcaster as a fallback.
+    const broadcaster = options.workingSetBroadcaster ?? appBroadcaster
+    const entry = broadcaster.getOrCreateTracker(cwd)
+    try {
+      await entry.loadPromise
+    } catch (err) {
+      sendJson(socket, {
+        type: 'error',
+        code: 'LOAD_FAILED',
+        message: err instanceof Error ? err.message : String(err),
+      })
+      socket.close(1011, 'load failed')
+      return
+    }
+
+    // Initial snapshot (per design §7.3: 'on connect, send latest state').
+    const initialState: Array<{ sessionId: string; ws: unknown }> = []
+    for (const [sid, ws] of entry.tracker.entries()) {
+      if (sessionId && sid !== sessionId) continue
+      initialState.push({ sessionId: sid, ws })
+    }
+    sendJson(socket, {
+      type: 'working_set_snapshot',
+      cwd,
+      filter: { sessionId: sessionId ?? null },
+      sessions: initialState,
+    })
+
+    // Subscribe to events. Filter by sessionId if requested.
+    const handler = (event: WorkingSetEvent) => {
+      if (sessionId && event.sessionId !== sessionId) return
+      if (event.type === 'working_set_updated') {
+        sendJson(socket, {
+          type: 'working_set_updated',
+          sessionId: event.sessionId,
+          workspaceId: event.workspaceId,
+          ws: event.ws,
+          timestamp: event.timestamp,
+        })
+      } else if (event.type === 'working_set_reset') {
+        sendJson(socket, {
+          type: 'working_set_reset',
+          sessionId: event.sessionId,
+          workspaceId: event.workspaceId,
+          timestamp: event.timestamp,
+        })
+      }
+    }
+    const unsubscribe = entry.tracker.subscribe(handler)
+
+    const cleanup = () => {
+      try { unsubscribe() } catch { /* ignore */ }
+    }
+    socket.once('close', cleanup)
+    socket.once('error', cleanup)
+  })
+
   return app
 }
 
@@ -3866,6 +3951,38 @@ function sendJson(socket: WebSocketLike, value: unknown): void {
   if (socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(value))
   }
+}
+
+// PR-27: parse WebSocket query string. Robust to either @fastify/websocket
+// shape (handshake.query object) or raw URL on `socket.url`.
+function parseSocketQuery(socket: { url?: string; handshake?: { query?: Record<string, unknown> } }): Record<string, string | undefined> {
+  const handshakeQuery = socket.handshake?.query
+  if (handshakeQuery && typeof handshakeQuery === 'object') {
+    const out: Record<string, string | undefined> = {}
+    for (const [k, v] of Object.entries(handshakeQuery)) {
+      if (typeof v === 'string') out[k] = v
+      else if (Array.isArray(v) && typeof v[0] === 'string') out[k] = v[0]
+    }
+    return out
+  }
+  const url = socket.url
+  if (typeof url !== 'string') return {}
+  const qIdx = url.indexOf('?')
+  if (qIdx < 0) return {}
+  const out: Record<string, string | undefined> = {}
+  const search = url.slice(qIdx + 1)
+  for (const pair of search.split('&')) {
+    if (!pair) continue
+    const eq = pair.indexOf('=')
+    if (eq < 0) {
+      out[decodeURIComponent(pair)] = ''
+    } else {
+      const key = decodeURIComponent(pair.slice(0, eq))
+      const val = decodeURIComponent(pair.slice(eq + 1))
+      out[key] = val
+    }
+  }
+  return out
 }
 
 async function findAgentJob(scheduler: AgentScheduler, jobId: string): Promise<AgentJob | undefined> {
@@ -5466,6 +5583,8 @@ export async function runWorkspaceWorkingSetGet({ cwd, workspaceId }: { cwd: str
 // Helper to avoid name collision with the ContextCommandOptions / other
 // identifiers in this file. Re-exports the PR-4b class via a local alias.
 import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from './persistedWorkingSetTracker.js'
+import { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
+import type { WorkingSetEvent } from './workingSetTracker.js'
 
 // ─── PR-18: /v1/context/assemble endpoint helpers ────────────────────────
 //
