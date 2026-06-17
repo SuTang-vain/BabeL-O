@@ -59,6 +59,7 @@ export type AssemblePreviewOptions = {
   includeBehaviorTrace?: boolean
   includeLongTerm?: boolean
   includeProjectMemory?: boolean
+  includeLiveHints?: boolean
 }
 
 function capToTokens(content: string, maxTokens: number): { content: string; tokens: number; truncated: boolean } {
@@ -146,6 +147,30 @@ function buildProjectStub(): AssembledSection {
   return { kind: 'project', content, tokens: Math.ceil(content.length / 4), pinned: false, source: 'stub' }
 }
 
+// PR-31: read live hints from behavior-trace.jsonl. Per doc §4.4 layer 6
+// + §7.3 WS comment. Pulls nexus-source entries (source=nexus) within a
+// 5min cooldown (per doc §4.3 default). Pure read.
+function buildLiveHintSection(traces: ReadonlyArray<BehaviorTraceEntry>, cooldownMs = 5 * 60_000): AssembledSection {
+  const now = Date.now()
+  const fresh = traces.filter((t) => {
+    const source = (t.anomaly as { source?: string } | undefined)?.source
+    if (source !== 'nexus') return false
+    const ts = Date.parse(t.timestamp)
+    return Number.isFinite(ts) && (now - ts) < cooldownMs
+  })
+  if (fresh.length === 0) {
+    const content = '## Live Hints\n\n(no recent nexus-detected patterns within 5min cooldown)\n'
+    return { kind: 'liveHint', content, tokens: Math.ceil(content.length / 4), pinned: false, source: 'behavior-trace.jsonl:nexus:5min' }
+  }
+  const lines: string[] = [`## Live Hints (${fresh.length} within 5min)`, '']
+  for (const t of fresh) {
+    const conf = t.triggerConfidence > 0 ? ` (conf=${t.triggerConfidence})` : ''
+    lines.push(`- [${t.timestamp}] ${t.trigger}${conf}: ${t.anomaly?.errorMessage ?? t.anomaly?.errorCode ?? t.anomaly?.denialReason ?? '(no detail)'}`)
+  }
+  const raw = lines.join('\n')
+  return { kind: 'liveHint', content: raw, tokens: Math.ceil(raw.length / 4), pinned: false, source: 'behavior-trace.jsonl:nexus:5min' }
+}
+
 export async function buildAssemblePreview(options: AssemblePreviewOptions): Promise<AssembledContextPreview> {
   const start = Date.now()
   const cwd = options.cwd
@@ -228,6 +253,12 @@ export async function buildAssemblePreview(options: AssemblePreviewOptions): Pro
   }
   if (options.includeProjectMemory) {
     sections.push(buildProjectStub())
+  }
+  if (options.includeLiveHints && !sections.some(s => s.kind === 'liveHint')) {
+    // PR-31: real live hints from behavior-trace.jsonl (nexus-sourced, 5min cooldown).
+    // Use crossSessionTraces (already filtered to source=nexus) instead of
+    // sessionTraces, so live hints are workspace-wide.
+    sections.push(buildLiveHintSection(crossSessionTraces))
   }
 
   sections.sort((a, b) => (a.pinned === b.pinned ? 0 : a.pinned ? -1 : 1))

@@ -52,6 +52,7 @@ export interface AssembleCommandOptions extends ContextCommandOptions {
   includeBehaviorTrace?: boolean
   includeLongTerm?: boolean
   includeProjectMemory?: boolean
+  includeLiveHints?: boolean
 }
 
 // PR-19: write-op options. NOT silent — defaults to no-op unless explicit
@@ -146,6 +147,7 @@ export function registerContextCommand(program: Command): void {
     .option('--include-behavior-trace', 'Force-include behavior trace summary (default: depends on scope)')
     .option('--include-long-term', 'Force-include long-term memory hint (CLI stub; not yet implemented)')
     .option('--include-project-memory', 'Force-include project memory (CLI stub; not yet implemented)')
+    .option('--include-live-hints', 'Force-include live hints (nexus-detected patterns within 5min; PR-31)')
     .option('--json', 'Print raw JSON output')
     .action(async (options: AssembleCommandOptions & { maxTokens: string }) => {
       await runAssemble({
