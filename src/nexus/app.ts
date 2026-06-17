@@ -606,6 +606,16 @@ export type CreateNexusAppOptions = {
    * on. If not provided, a default per-app broadcaster is created.
    */
   workingSetBroadcaster?: import('./workingSetBroadcaster.js').WorkingSetBroadcaster
+  /**
+   * PR-A2: Optional ContextBroadcaster instance. When provided, it
+   * overrides the module-level `defaultContextBroadcaster` singleton
+   * used by the runtime hot path AND the instance subscribed to by
+   * /v1/context/observe. Both sides share the same instance by
+   * default — production apps that don't pass this option still get
+   * working fan-out (the WS route and the runtime both read from the
+   * singleton). Tests can pass a hermetic instance for isolation.
+   */
+  contextBroadcaster?: import('./contextBroadcaster.js').ContextBroadcaster
   executeTimeoutMs?: number
   /**
    * Server-side default for the per-request `policy` body field. When a
@@ -709,6 +719,14 @@ export async function createNexusApp(
   const executePolicyMode = options.executePolicyMode ?? 'strict'
   // PR-27: default per-app broadcaster. Tests can override via options.
   const appBroadcaster = options.workingSetBroadcaster ?? new WorkingSetBroadcaster()
+  // PR-A2: if the caller provided a custom ContextBroadcaster, install
+  // it as the module-level singleton so the runtime hot path and the
+  // /v1/context/observe WebSocket route share the same instance. When
+  // no option is provided, the singleton stays untouched and both sides
+  // share the default instance.
+  if (options.contextBroadcaster) {
+    setDefaultContextBroadcaster(options.contextBroadcaster)
+  }
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
@@ -3985,6 +4003,62 @@ export async function createNexusApp(
     socket.once('error', cleanup)
   })
 
+  // PR-A2: /v1/context/observe — WebSocket push for assembled context
+  // events emitted by the runtime's hot path. Per design §7.3
+  // WebSocket + PR-A2 event bus. Sends an initial `assembled_snapshot`
+  // frame on connect (from the broadcaster's lastBySessionId cache),
+  // then live `assembled` events. Pure read: subscribes to the
+  // broadcaster and fans out to the client. No state mutation.
+  app.get('/v1/context/observe', { websocket: true }, async (socket, request) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = typeof q.cwd === 'string' ? q.cwd : undefined
+    if (!cwd) {
+      sendJson(socket, { type: 'error', code: 'MISSING_CWD', message: 'cwd query param is required' })
+      socket.close(1008, 'missing cwd')
+      return
+    }
+    const sessionId = typeof q.sessionId === 'string' ? q.sessionId : undefined
+
+    // PR-A2: the WS route always reads from the module-level singleton
+    // (which the createNexusApp call above may have replaced with the
+    // caller's `options.contextBroadcaster`). The runtime hot path also
+    // publishes to this singleton, so by default both sides share the
+    // same instance — no extra wiring required.
+    const broadcaster = defaultContextBroadcaster
+
+    // Initial snapshot (per design §7.3: 'on connect, send latest state').
+    // When sessionId is set, the snapshot is just that session's last
+    // context; otherwise the snapshot's `context` field is null (no
+    // global "all sessions" view — the cache is per-sessionId).
+    const last = sessionId ? broadcaster.getLast(cwd, sessionId) : undefined
+    sendJson(socket, {
+      type: 'assembled_snapshot',
+      cwd,
+      filter: { sessionId: sessionId ?? null },
+      context: last ?? null,
+    })
+
+    // Subscribe to events. Filter by sessionId if requested.
+    const handler = (event: { type: string; sessionId: string; context: unknown; timestamp: string }) => {
+      if (event.type !== 'assembled') return
+      if (sessionId && event.sessionId !== sessionId) return
+      sendJson(socket, {
+        type: 'assembled',
+        cwd,
+        sessionId: event.sessionId,
+        context: event.context,
+        timestamp: event.timestamp,
+      })
+    }
+    const unsubscribe = broadcaster.subscribe(cwd, handler)
+
+    const cleanup = () => {
+      try { unsubscribe() } catch { /* ignore */ }
+    }
+    socket.once('close', cleanup)
+    socket.once('error', cleanup)
+  })
+
   return app
 }
 
@@ -5681,6 +5755,7 @@ export async function runWorkspaceWorkingSetGet({ cwd, workspaceId }: { cwd: str
 // identifiers in this file. Re-exports the PR-4b class via a local alias.
 import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from './persistedWorkingSetTracker.js'
 import { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
+import { setDefaultContextBroadcaster, defaultContextBroadcaster } from '../runtime/contextBroadcasterSingleton.js'
 import type { WorkingSetEvent } from './workingSetTracker.js'
 
 // ─── PR-18: /v1/context/assemble endpoint helpers ────────────────────────

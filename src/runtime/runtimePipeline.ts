@@ -12,6 +12,12 @@ import type {
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import type { AssembledContext, ContextAssemblerOptions } from './contextAssembler.js'
 import { assembleContext } from './contextAssembler.js'
+// PR-A2: module-level singleton for the /v1/context/observe WebSocket
+// observer. Imported from a separate file to avoid a circular import
+// (app.ts → runtimePipeline.ts would re-enter this module if we imported
+// from ../nexus/contextBroadcaster.js here, because app.ts also imports
+// from runtimePipeline.ts).
+import { defaultContextBroadcaster } from './contextBroadcasterSingleton.js'
 import { getAutoCompactDecision, type AutoCompactDecision } from './compact.js'
 import {
   buildCacheAwareCompactPolicy,
@@ -116,6 +122,27 @@ export function resolveProviderToolCallInput(toolCall: RuntimeProviderToolCall):
     return JSON.parse(toolCall.partialInput)
   } catch {
     return { _parseError: true, _rawInput: toolCall.partialInput.slice(0, 500) }
+  }
+}
+
+// PR-A2: fire-and-forget publish of assembled-context events to the
+// default ContextBroadcaster. MUST NOT throw into the hot path, MUST
+// NOT await subscriber callbacks. The broadcaster itself short-circuits
+// when there are no subscribers for the cwd, so the cost in the common
+// case (no observer) is a single Map lookup.
+function safeContextPublish(cwd: string | undefined, sessionId: string | undefined, context: AssembledContext): void {
+  if (!sessionId) return
+  const safeCwd = cwd ?? ''
+  try {
+    defaultContextBroadcaster.publish(safeCwd, {
+      type: 'assembled',
+      sessionId,
+      context,
+      timestamp: new Date().toISOString(),
+    })
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[runtimePipeline] context publish failed:', err)
   }
 }
 
@@ -803,6 +830,9 @@ export async function refreshRuntimeContextState(options: ContextAssemblerOption
     memoryProvider: options.memoryProvider,
     sessionInbox: options.sessionInbox,
   })
+  // PR-A2: publish to contextBroadcaster (fire-and-forget, no-op when
+  // no subscribers; never throws into the hot path).
+  safeContextPublish(options.runtimeOptions.cwd, options.runtimeOptions.sessionId, assembledContext)
 
   return buildRuntimeContextRefreshState({
     assembledContext,

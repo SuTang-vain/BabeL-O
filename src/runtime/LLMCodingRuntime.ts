@@ -36,6 +36,10 @@ import {
 } from './behaviorTrace.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
+// PR-A2: optional broadcaster type for the /v1/context/observe observer.
+// Imported as a type-only reference to keep the runtime-side hot path
+// paying no cost for the field.
+import type { ContextBroadcaster } from './contextBroadcasterSingleton.js'
 import {
   createReplacementState,
   enforceMessageBudget,
@@ -97,7 +101,24 @@ export class LLMCodingRuntime implements NexusRuntime {
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
     private readonly memoryProvider?: MemoryProvider,
+    // PR-A2: optional per-instance ContextBroadcaster. The runtime
+    // hot path (refreshRuntimeContextState in runtimePipeline.ts) uses
+    // the module-level defaultContextBroadcaster singleton, so this
+    // field is intentionally unused in the hot path. It exists so
+    // production factories can attach a custom broadcaster if/when the
+    // architecture moves off the singleton. Defaulting to undefined
+    // preserves all 39+ existing test instantiations.
+    private readonly contextBroadcaster?: ContextBroadcaster,
   ) {}
+
+  /**
+   * PR-A2: expose the optional per-instance broadcaster (or undefined
+   * if not provided). Tests and production wiring can read this to
+   * inject a custom broadcaster.
+   */
+  getContextBroadcaster(): ContextBroadcaster | undefined {
+    return this.contextBroadcaster
+  }
 
   listTools(): RuntimeToolAuditEntry[] {
     return [...this.tools.values()]
