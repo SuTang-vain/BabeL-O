@@ -314,11 +314,11 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 
 ---
 
-## Tool Surface Expansion / Native vs MCP 共存（Phase 0–6）— 2026-06-16 P0 文档口径同步，**实现未开**
+## Tool Surface Expansion / Native vs MCP 共存（Phase 0–6）— 2026-06-17 文档纠偏收口，§2.2 治理待实装
 
-规划路径见 [reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md](../reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md)。本规划当前 = **Plan only**，全部 6 个 Phase 均未进入实现；**Phase 0 文档口径守门**已于 2026-06-16 同步完毕。
+规划路径见 [reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md](../reference/tool-surface-expansion-and-native-mcp-coexistence-plan.md)。本规划新工具（Phase 1–6）= **Plan only**；**Phase 0 文档口径**已 Closed；**§2.2 层级治理实装**为 Phase 0 收尾项仍 Open（现存安全缺口，不受 regression gate 约束）。
 
-### Phase 0：文档口径与注册表分层文档化 — 2026-06-16 收口（仅文档层）
+### Phase 0：文档口径与注册表分层文档化 — Closed（2026-06-17）
 
 - `AGENTS.md` §9 reference 列表补全：补齐 `tool-surface-expansion-and-native-mcp-coexistence-plan.md` / `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` / `tool-governance-reference-integration.md` 三项；删除 stale 隐含。
 - `src/shared/errors.ts` 登记 27 个新 errorCode（按 plan §3.1.1-3.2.4 全部列出的 sentinel）：
@@ -333,11 +333,21 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
   - §3.2.4 Cron / Sleep（5）：`SLEEP_ABORTED` / `SLEEP_DURATION_OUT_OF_RANGE` / `CRON_EXPRESSION_INVALID` / `CRON_JOB_NOT_FOUND` / `CRON_PERSIST_FAILED`。
   - 注：Skill 治理域另 8 个 SKILL_* errorCode（validator / storage / generator）**仍**保留在 `src/skills/*` 模块 return types，**不**进 `errors.ts`（plan §3.1.4 显式只要求 2 个）。
 - `docs/nexus/TODO.md` 第 29 行 stale 修复：从"未实现 `SkillShow`"改为"未实现 `AskUserQuestion` / `TaskGet/List/Update` / `MCPTool` / `EnterPlanMode` / `Worktree*` / `Config*` / `Sleep` / `ScheduleCron*` / `WebSearchProvider`"。
-- `docs/nexus/active/TODO_runtime.md` 本节即"Phase 0-6 未收口子项"索引（避免污染 WORK_LOG.md 的事实流水）。
+- **2026-06-17 文档纠偏**（修正 plan 自身失真）：
+  - §1 现状表 9→17 工具（补 contextTools×3 + Skill×5，注明已通过各自规划落地、非本规划 Phase 1–6 产物）。
+  - §3.1.1 task storage 现状纠正：`NexusStorage` 已有 `saveTask`/`getTask`/`listTasks`（原写"仅 task.create"错误），缺 update/stop/output 三个。
+  - §2.2 层级治理显式标注为"现存安全缺口、非新工具、不受 §7.1 regression gate 约束"。
 - 守门不变量：
-  - 27 个新 errorCode **未**被任何 P0 工具引用 — 等 Phase 1-6 实施时按"errorCode 必须出现在某 unit test 断言"守门。
+  - 27 个新 errorCode **未**被任何 P0 新工具引用 — 等 Phase 1-6 实施时按"errorCode 必须出现在某 unit test 断言"守门。
   - 旧 12 个 errorCode 行为不变；typecheck 守门。
-  - Plan still "Plan only" — Phase 0 收口**不**等于"工具已实现"。
+  - 新工具仍 "Plan only" — Phase 0 收口**不**等于"工具已实现"。
+
+### §2.2 层级治理实装（Phase 0 收尾项）— Open，可立即做
+
+- 现状：`src/nexus/createRuntime.ts:58-66, 104-105` Layer 2/3/4 注册是无条件 `tools.set(name, tool)`，无 `tool_overridden_by` 诊断、无跨前缀拦截、无 `risk_promoted`。
+- 这是 §1.2 记录的现存安全缺口（恶意/同名 MCP server 可无声劫持 builtin），**不属于"新工具"**，不受 §7.1 regression gate 约束。
+- 实装内容：`createDefaultToolRegistry(options)` 加 `diagnosticLogger?`；覆盖 emit `tool_overridden_by` WARN；EverCore 跨前缀 `tool_override_blocked` skip；MCP risk 高于 builtin 时 Go TUI `risk_promoted` 提示。
+- 收口验证：`test/runtime-layering.test.ts` 断言覆盖 + 诊断 + 跨前缀拦截 + risk 提升。
 
 ### Phase 1：Task 工具族拆分（最小风险，最高价值）— 未开
 

@@ -1,17 +1,18 @@
 # Tool Surface Expansion & Native vs MCP Coexistence Plan
 
-> Status: Plan only — no implementation yet
+> Status: Plan only for new tools (Phase 1–6); Phase 0 (doc口径 + errorCode 登记) Closed 2026-06-16; §2.2 layering governance is a pre-existing security gap (unconditional `tools.set` override), not gated on new-tool regression
 > Priority: P2 unless promoted by a real-session regression
 > Scope: native builtin tool surface for `src/tools/builtin/`, coexistence rules with `McpRegistry` / `EverCore MCP`, registry layering, and provider-visible tool naming governance
-> Related plans: `tool-granularity-and-evidence-governance-plan.md` (this file is the *expansion* counterpart; that one is the *boundary* counterpart)
-> Last updated: 2026-06-16
+> Related plans: `tool-granularity-and-evidence-governance-plan.md` (this file is the *expansion* counterpart; that one is the *boundary* counterpart); `tool-governance-reference-integration.md` (reader's map for the three tool-governance plans); `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` (Skill 工具族命名权威，Phase 0–6 已 Closed)
+> Last updated: 2026-06-17
+> Revision notes (2026-06-17): §1 现状表纠正为 17 个 builtin 工具（原写 9，漏列 contextTools×3 与 Skill×5 已落地）；§3.1.1 task storage 现状纠正——`NexusStorage` 已有 `saveTask`/`getTask`/`listTasks`（原写"仅 task.create"错误），缺 update/stop/output；Phase 0 标 Closed；§2.2 显式标注为"现存安全缺口、非新工具、不受 §7.1 regression gate 约束"；§1.2 工具表补 `list_dir` 已删证据。
 > Revision notes (2026-06-16): naming aligned with `skill-execution-and-automated-normalized-skill-generation-governance-plan.md`; `Config`/`Sleep` aligned with `babel-o-test-config-isolation` and `task-adaptive-recoverable-timeout-plan.md`; `Plan` mode wiring pointed at `LLMCodingRuntime`; failure semantics unified on `COMMAND_OUTPUT_LIMIT`-style recoverable diagnostics.
 
 ---
 
 ## 1. 背景
 
-BabeL-O 当前模型可见的内置工具集是 9 个（`createDefaultToolRegistry()` in `src/tools/registry.ts`）：
+BabeL-O 当前模型可见的内置工具集是 **17 个**（`createDefaultToolRegistry()` in `src/tools/registry.ts`，核对于 2026-06-17）：
 
 | 名称 | 风险 | 备注 |
 | --- | --- | --- |
@@ -22,8 +23,18 @@ BabeL-O 当前模型可见的内置工具集是 9 个（`createDefaultToolRegist
 | `Write` | write | 新建 / 覆盖 |
 | `Edit` | write | 精准编辑 |
 | `Bash` | execute | 含 `riskForInput` + `bashClassifier.ts` |
-| `Task` | task | **当前仅暴露 create**，`shared/task.ts` 的 `NexusTask` 全字段未对模型可见 |
+| `TaskCreate` | task | **当前仅暴露 create**，`shared/task.ts` 的 `NexusTask` 全字段未对模型可见；get/list/update/stop/output 入口未实现（见 §3.1.1） |
 | `WebSearch` | read | DuckDuckGo Lite 内置 fallback |
+| `ContextSearch` | read | on-demand context 检索（来自 `long-running-context-assembly.md` Track A Phase 2 / PR-8，已落地） |
+| `ContextSummarize` | read | on-demand context 摘要（同上，已落地） |
+| `ContextRecent` | read | on-demand recent context（同上，已落地） |
+| `SkillList` | read | Skill 域（来自 `skill-execution-and-automated-normalized-skill-generation-governance-plan.md` Phase 6，已 Closed） |
+| `SkillShow` | read | 同上，已落地 |
+| `SkillValidate` | read | 同上，已落地 |
+| `SkillDraft` | read | 同上，已落地 |
+| `SkillSave` | write | 同上，已落地；`requiresApproval: true` + `suggestedAllowRule: '- tool: SkillSave'` |
+
+> 注：早期版本本表写"9 个"——遗漏了 contextTools×3（PR-8）与 Skill×5（Phase 6）。这 8 个已通过各自规划落地，**不属于本规划的 Phase 1–6**；本规划 §3.1.4 显式 defer Skill 完整生命周期到 Skill 治理规划，§3.5 不把 contextTools 列为补齐项（它由 `long-running-context-assembly.md` 管辖）。本规划只负责仍 Plan only 的 Phase 1/2(AskUserQuestion)/3/4/5/6。
 
 叠加 AgentScheduler 与 EverCore MCP：
 
@@ -53,10 +64,12 @@ BabeL-O 设计上把 LLM 可见工具分两类：
 - **native builtin**（`src/tools/builtin/*.ts`）—— 进程内 TypeScript 实现，强类型、权限策略精细、recovery 完整。
 - **MCP / EverCore MCP**（`src/mcp/*` + `src/tools/everCoreMcpTools.ts`）—— 外部进程 stdio JSON-RPC，命名 `mcp:<server>:<tool>`，带 `source.type: 'mcp'` 与 `mcpServerAllowed: true`。
 
-**当前隐含规则（缺文档）**：MCP 后注册会覆盖同名的 builtin（`createDefaultNexusRuntime()` 里 `tools.set(name, ...)` 是无条件覆盖）。这意味着：
+**当前隐含规则（缺文档）**：MCP 后注册会覆盖同名的 builtin（`src/nexus/createRuntime.ts` 里 `tools.set(name, ...)` 是无条件覆盖）。这意味着：
 
 - 用户安装官方 `mcp:web_search` 后会无感接管 `WebSearch`（行为正确，但不易诊断）。
 - 用户安装名字相同的恶意 MCP server 可以无声替换原生工具（`source.type` 仍会记录，但模型看到的只是工具名 + description）。
+
+**这是现存安全缺口，不是"未来可能用到"**：覆盖发生在 `createDefaultNexusRuntime()` 的 Layer 2（MCP）/ Layer 3（EverCore）/ Layer 4（Agent）注册路径，当前无 `tool_overridden_by` 诊断、无跨前缀拦截、无 `risk_promoted` 提示。因此 §2.2 的层级治理实装**不受 §7.1 "新工具需真实 regression 引用"守门约束**——它修的是已存在的风险，本身即等价于 regression 触发。该实装归入 Phase 0 收尾治理项（见 §5 Phase 0 收口标准末条）。
 
 本规划补齐原生工具的同时，也把"原生 vs MCP 的双轨规则"明确写出来。
 
@@ -153,8 +166,8 @@ src/tools/builtin/task/
 - 保留 `requiresApproval=false` 给 read（`get` / `list` / `output`），write（`update` / `stop`）保持 `requiresApproval=true`，让 permission policy 可以 `-` allowlist 通过。
 - `TaskUpdate` 只接受 `status`、`ownerAgentId`、`metadata` 三个字段；**不**接受 `taskId` / `sessionId` / `createdAt` 改写（治理上禁止改写身份字段）。
 - `TaskStop` 必须在执行前检查 `status in ['pending', 'in_progress', 'blocked']`，否则返回 `TASK_TERMINAL` diagnostic（须登记），不重复终止。
-- **存储现状尽调**（Phase 1 启动前置）：`NexusStorage` 当前已支持 `task.create`；`get` / `list` / `update` / `stop` / `output` 5 个接口**未实现**，需在 Phase 1 同步完成。schema migration 守门见 §5 Phase 1 收口标准。
-- **失败码必须登记**：本族新增的 `STORAGE_UNAVAILABLE` / `TASK_TERMINAL` / `TASK_NOT_FOUND` / `TASK_IDENTITY_FIELD_READONLY` 共 4 个错误码，落地前在 `src/shared/errors.ts` 注册。
+- **存储现状尽调**（Phase 1 启动前置，核对于 2026-06-17）：`NexusStorage`（`src/storage/Storage.ts` + `SqliteStorage.ts`）当前已实现 `saveTask(task)` / `getTask(taskId)` / `listTasks(sessionId)` 三个方法（早期版本本节误写"仅支持 task.create"——create 实际走 `saveTask`，且 get/list 已存在）；**缺 `updateTask` / `stopTask` / `outputTask`（或等价 read 接口）3 个**，需在 Phase 1 同步补齐。`TaskCreate` 当前用 `saveTask` 写入，Phase 1 拆分后 `task/create.ts` 仍复用 `saveTask`。schema migration 守门见 §5 Phase 1 收口标准。
+- **失败码必须登记**：本族新增的 `STORAGE_UNAVAILABLE` / `TASK_TERMINAL` / `TASK_NOT_FOUND` / `TASK_IDENTITY_FIELD_READONLY` 共 4 个错误码，落地前在 `src/shared/errors.ts` 注册（**已于 2026-06-16 Phase 0 收口时登记**，commit `207f522`）。
 
 #### 3.1.2 `AskUserQuestion` 工具
 
@@ -168,8 +181,8 @@ src/tools/builtin/task/
 约束：
 
 - 一次只问一个问题；多问题需要模型分多次调用（避免 session state 复杂化）。
-- `options.length` 必须 2–4，少于 2 / 多于 4 返回 `ASK_QUESTION_OPTIONS_OUT_OF_RANGE` diagnostic（须在 `src/shared/errors.ts` 登记）。
-- 冷启动调用（session 尚未收到 user turn）返回 `ASK_QUESTION_NOT_ALLOWED_COLD_START` diagnostic（须登记）。
+- `options.length` 必须 2–4，少于 2 / 多于 4 返回 `ASK_QUESTION_OPTIONS_OUT_OF_RANGE` diagnostic（须在 `src/shared/errors.ts` 登记，**已于 Phase 0 登记**）。
+- 冷启动调用（session 尚未收到 user turn）返回 `ASK_QUESTION_NOT_ALLOWED_COLD_START` diagnostic（须登记，**已于 Phase 0 登记**）。
 - 答案以 `{ question, answer }` 形式注入到 session event，不写 storage。
 - **Go TUI 依赖**：`AskUserQuestionDialog` 依赖 `go-tui-loop-multipane-plan.md` 的多面板通道先落地；Phase 2 收口前必须确认该依赖已 Closed。
 
@@ -189,7 +202,7 @@ src/tools/builtin/task/
 - 命名 **不**使用 `mcp:` 前缀（这是 native builtin，不是 MCP 工具），沿用 `MCPTool` / `ListMcpResources` / `ReadMcpResource`。
 - **能力探测**：调用 `ListMcpResources` / `ReadMcpResource` 前，先通过 `mcpClient.listCapabilities(server)` 探测该 server 是否声明 `resources` 能力；未声明则返回 `MCP_RESOURCES_UNSUPPORTED` diagnostic（须登记），**不**返回误导性的 `RESOURCE_NOT_FOUND`。
 - **跨前缀覆盖拦截**：本族工具注册到 Layer 2（MCP）前，必须先 check 当前 Layer 1（native）是否有同名工具；若同名 native 工具存在且 MCP server 工具 `risk` 更高，触发 `tool_overridden_by` 诊断日志（与 §2.2 一致）。
-- **错误码**：`MCP_SERVER_NOT_FOUND` / `MCP_RESOURCES_UNSUPPORTED` / `MCP_RESOURCE_NOT_FOUND` / `MCP_TOOL_CALL_FAILED` 4 个 errorCode 须在 `src/shared/errors.ts` 登记。
+- **错误码**：`MCP_SERVER_NOT_FOUND` / `MCP_RESOURCES_UNSUPPORTED` / `MCP_RESOURCE_NOT_FOUND` / `MCP_TOOL_CALL_FAILED` 4 个 errorCode 须在 `src/shared/errors.ts` 登记（**已于 Phase 0 登记**）。
 
 #### 3.1.4 `Skill` 工具
 
@@ -202,7 +215,8 @@ src/tools/builtin/task/
 
 - **不**实现"执行 skill body 当作 prompt"这种语义；skill body 仍由 system prompt 注入 + `SkillShow` 显式展开，模型自己决定如何用。
 - 名称沿用 `SkillList` / `SkillShow`，与 Babel-2 `SkillTool` 区分；不新建 `define_skill` / `invoke_skill` / `load_skill` 这种模糊命名。
-- **错误码**：`SKILL_NOT_FOUND` / `SKILL_NAME_REQUIRED` 须在 `src/shared/errors.ts` 登记。
+- **错误码**：`SKILL_NOT_FOUND` / `SKILL_NAME_REQUIRED` 须在 `src/shared/errors.ts` 登记（**已于 Phase 0 登记**）。
+- **实现状态**：`SkillList` / `SkillShow` **已通过 [Skill 治理规划](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) Phase 6 落地**（连同 `SkillValidate` / `SkillDraft` / `SkillSave`）。本节不再重开；§3.1.4 的实现部分 = **Closed**。
 
 #### 3.1.5 `Plan` 工具
 
@@ -217,7 +231,7 @@ src/tools/builtin/task/
 - `EnterPlanMode` 仅在 user prompt 中包含"计划 / 规划 / 拆解 / 方案 / 路线 / plan / roadmap"等强信号时被允许；其他场景返回 `PLAN_MODE_NOT_TRIGGERED` diagnostic（须在 `src/shared/errors.ts` 登记）。
 - **Cue 函数归属**：`shouldEnterPlanMode(prompt)` 作为纯函数放到 `src/runtime/planModeCue.ts`，与 `src/runtime/memoryProvider.ts` 平级；**不**复用 `memoryProvider.ts` 内部代码（职责分离）。Cue 思路参考 `memory-capability-awareness-and-trigger-plan.md` 中 `shouldAutoSearchMemory()` 的写法（纯函数 + trigger 词表 + 可测试）。
 - **Schema 扩展**：`shared/agentJob.ts` 的 `AgentJob` 需要新增可选字段 `plan?: { summary: string; createdAt: string; approved: boolean }`；schema migration 守门见 §5 Phase 4 收口标准。
-- **错误码**：`PLAN_MODE_NOT_TRIGGERED` / `PLAN_MODE_ALREADY_ACTIVE` / `PLAN_MODE_NOT_ACTIVE` 须登记。
+- **错误码**：`PLAN_MODE_NOT_TRIGGERED` / `PLAN_MODE_ALREADY_ACTIVE` / `PLAN_MODE_NOT_ACTIVE` 须登记（**已于 Phase 0 登记**）。
 
 ### 3.2 P1：生态对齐（二期）
 
@@ -232,7 +246,7 @@ src/tools/builtin/task/
 - 必须先 `git rev-parse --is-inside-work-tree` 通过，否则返回 `NOT_IN_GIT_REPO`（须登记）。
 - `WorktreeCreate` 走 `requiresApproval=true`（execute 风险）。
 - 不接管 `shared/agentJob.ts` 的 `AgentIsolationMode = 'worktree'` 内部流程，仅提供 LLM 可见入口；AgentScheduler 仍按既有 profile 配置决定是否走 worktree。
-- **错误码**：`NOT_IN_GIT_REPO` / `WORKTREE_BRANCH_EXISTS` / `WORKTREE_PATH_NOT_FOUND` 须登记。
+- **错误码**：`NOT_IN_GIT_REPO` / `WORKTREE_BRANCH_EXISTS` / `WORKTREE_PATH_NOT_FOUND` 须登记（**已于 Phase 0 登记**）。
 
 #### 3.2.2 `WebSearch` provider 抽象
 
@@ -259,7 +273,7 @@ const mcpProviders = {
 - `createDefaultToolRegistry()` 注册 `WebSearch` 工具时，**只暴露一个 `WebSearch` 名称**；不暴露 provider 列表。
 - provider 选择顺序：MCP `mcp:web_search` > MCP `mcp:brave_search` > builtin `ddgLite`。
 - 用户安装官方 MCP 搜索后，**默认**走 MCP（与 2.2 节的"后注册覆盖"一致），同时在 `~/.babel-o/log/embedded-nexus.log` 输出 `web_search_provider=mcp:web_search` INFO 行。
-- 缺 provider 时返回 `WEB_SEARCH_PROVIDER_UNAVAILABLE` diagnostic（须登记），**不**走 Bash `curl` 临时方案。
+- 缺 provider 时返回 `WEB_SEARCH_PROVIDER_UNAVAILABLE` diagnostic（须登记，**已于 Phase 0 登记**），**不**走 Bash `curl` 临时方案。
 - **Provider 切换守门**：`mcp:web_search` / `mcp:brave_search` 切换走 §2.2 的"后注册覆盖 + 诊断日志"路径；切换必须在 `embedded-nexus.log` 留 INFO 行，**不**允许运行时静默切换。
 
 #### 3.2.3 `Config` 工具
@@ -277,7 +291,7 @@ const mcpProviders = {
 - 写完后必须**重新解析 model metadata resolver**（`model-catalog-and-context-metadata-governance-plan.md`）：写入 `providerId` / `defaultModel` 时，重跑 user_config > builtin > undeclared 解析链，确保模型元数据与运行时一致。这与 `babel-o-model-catalog-governance` 记忆一致（不 auto-switch，但显式 set 后必须 reload）。
 - 不动 `shared/config.ts` 的优先级链（CLI arg > env > file > default）。
 - **测试隔离**：`ConfigSet` 测试必须用 `BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config-<pid>.json` 隔离；CI 守门同 `babel-o-test-config-isolation` 记忆。**严禁**写真实 `~/.babel-o/config.json`。
-- **错误码**：`CONFIG_KEY_NOT_WRITABLE` / `CONFIG_KEY_NOT_FOUND` / `CONFIG_RELOAD_FAILED` 须登记。
+- **错误码**：`CONFIG_KEY_NOT_WRITABLE` / `CONFIG_KEY_NOT_FOUND` / `CONFIG_RELOAD_FAILED` 须登记（**已于 Phase 0 登记**）。
 
 #### 3.2.4 `Cron` / `Sleep` 工具
 
@@ -291,7 +305,7 @@ const mcpProviders = {
 - `ScheduleCron*` 持久化到 `NexusStorage.cronJobs`（如果不存在则需要新表 `cron_jobs`，schema migration 守门见 §5 Phase 5 收口标准）；必须在 session 关闭后仍能触发。
 - cron 触发时启动**新** session，**不**是 current session；新 session 走 `task-scope-and-evidence-scope-governance-plan.md` 的 `task_scope_declared` 守门。
 - 不实现 background dreaming / 长期 polling。
-- **错误码**：`SLEEP_ABORTED` / `SLEEP_DURATION_OUT_OF_RANGE` / `CRON_EXPRESSION_INVALID` / `CRON_JOB_NOT_FOUND` / `CRON_PERSIST_FAILED` 须登记。
+- **错误码**：`SLEEP_ABORTED` / `SLEEP_DURATION_OUT_OF_RANGE` / `CRON_EXPRESSION_INVALID` / `CRON_JOB_NOT_FOUND` / `CRON_PERSIST_FAILED` 须登记（**已于 Phase 0 登记**）。
 
 ### 3.3 权限 / 审批矩阵
 
@@ -459,7 +473,7 @@ export function createDefaultToolRegistry(options?: {
 
 ### Phase 0: 文档口径与注册表分层文档化
 
-状态：本规划承接。
+状态：**Closed（2026-06-17）**。文档口径 + errorCode 登记 + 三角引用收口完成；§2.2 层级治理实装为 Phase 0 收尾项，仍 **Open**（见末条）。
 
 目标：
 
@@ -469,12 +483,20 @@ export function createDefaultToolRegistry(options?: {
 
 收口标准：
 
-- `docs/nexus/TODO.md` 增加本规划入口。
-- `active/TODO_runtime.md` 增加 P2 工具补齐未收口项。
-- `AGENTS.md` 第 9 节 reference 列表增加本文件。
-- `src/tools/builtin/list_dir.ts` 重复文件删除 + 引用 grep 守门。
-- 起草**前**验证：每个 P0 工具入口必须**有真实 session regression 引用**（session id 或 log 路径）才保留 P0 标记；否则降为 P1。守门对齐 `babel-o-p0-regression-focus` 记忆。
-- `src/shared/errors.ts` 已登记本规划用到的所有 `errorCode`（§3.3 权限矩阵 + §3.4 事件矩阵 + 各 P0 段落已枚举）。
+- `docs/nexus/TODO.md` 增加本规划入口。✅
+- `active/TODO_runtime.md` 增加 P2 工具补齐未收口项。✅（2026-06-16 落地 "Tool Surface Expansion / Native vs MCP 共存（Phase 0–6）" section）
+- `AGENTS.md` 第 9 节 reference 列表增加本文件。✅（2026-06-16 commit `207f522`，连带补 Skill 治理规划 + 整合索引）
+- `src/tools/builtin/list_dir.ts` 重复文件删除 + 引用 grep 守门。✅（`list_dir.ts` 已删；`src/runtime/taskScope.ts` 仍保留 `list_dir: ['path']` 容错映射键——`normalizeToolName` 会把大小写/下划线归一，属无害容错，**不**算漏网）
+- 起草**前**验证：每个 P0 工具入口必须**有真实 session regression 引用**（session id 或 log 路径）才保留 P0 标记；否则降为 P1。守门对齐 `babel-o-p0-regression-focus` 记忆。✅（已核：`~/.babel-o/log/embedded-nexus.log` 仅记启动行，无 session 内 tool-call drift；Phase 1–6 全部维持 Plan only / P1 待真需求）
+- `src/shared/errors.ts` 已登记本规划用到的所有 `errorCode`（§3.3 权限矩阵 + §3.4 事件矩阵 + 各 P0 段落已枚举）。✅（2026-06-16 commit `207f522`，共 27 个新 errorCode 登记）
+
+**Phase 0 收尾项（仍 Open，不受 §7.1 regression gate 约束）**：
+
+- §2.2 层级治理实装：`createDefaultToolRegistry(options)` / `createDefaultNexusRuntime()` 的 Layer 2/3/4 注册路径当前是无条件 `tools.set(name, tool)`（`src/nexus/createRuntime.ts:58-66, 104-105`），无 `tool_overridden_by` 诊断、无跨前缀拦截、无 `risk_promoted` 提示。这是 §1.2 记录的**现存安全缺口**（恶意/同名 MCP server 可无声劫持 builtin），**不属于"新工具"**，因此不受 §7.1 "新工具需真实 regression 引用"守门约束——可立即实装。实装内容：
+  - `createDefaultToolRegistry()` 增 `options.diagnosticLogger?`；覆盖时 emit `tool_overridden_by: <layer>:<server>:<tool>` WARN 到 `~/.babel-o/log/embedded-nexus.log`。
+  - EverCore（Layer 3）覆盖 Layer 1/2 非 `mcp:evercore:` 前缀工具时 `tool_override_blocked` 并 skip（跨前缀拦截）。
+  - MCP 工具声明的 `risk` 高于被覆盖 builtin 时，Go TUI `permission_request` 附加 `risk_promoted` 提示（与 `go-tui-permission-policy-governance-plan.md` 协同）。
+  - 收口验证：`test/runtime-layering.test.ts` 断言覆盖 + 诊断 + 跨前缀拦截 + risk 提升。
 
 ### Phase 1: Task 族拆分（最小风险，最高价值）
 
@@ -613,9 +635,10 @@ P0 / P1 全部落地后，转为 Watch / Closed：
 
 | 优先级 | 项目 | 判断 |
 | --- | --- | --- |
-| **P0 文档化** | Phase 0 同步到 `TODO.md` / `active/TODO_runtime.md` / `AGENTS.md` + 删 `list_dir.ts` 重复 + 登记 errorCode | 已开始 |
-| **P0 实现** | Phase 1（Task 族拆分）+ Phase 2（AskUserQuestion / Skill） | 真实回归驱动，**不强行排期** |
-| **P0 实现** | Phase 3（MCP 暴露） | 与现有 `mcp/` 基础设施强绑定，落地成本低 |
+| **P0 文档化** | Phase 0 同步到 `TODO.md` / `active/TODO_runtime.md` / `AGENTS.md` + 删 `list_dir.ts` 重复 + 登记 errorCode | ✅ Closed（2026-06-17）|
+| **P0 治理实装** | §2.2 层级治理（`tool_overridden_by` 诊断 + 跨前缀拦截 + `risk_promoted`） | **可立即做**——现存安全缺口，不受 §7.1 regression gate 约束 |
+| **P0 实现** | Phase 1（Task 族拆分）+ Phase 2（AskUserQuestion） | 真实回归驱动，**不强行排期**；Skill 侧已通过 Skill 治理规划 Closed |
+| **P0 实现** | Phase 3（MCP 暴露） | 与现有 `mcp/` 基础设施强绑定，落地成本低；仍待 regression |
 | **P1 实现** | Phase 4-6 | 视真实回归决定 |
 | **P2 观察** | NotebookEdit / PowerShell / LSP / BriefTool / McpAuthTool / SendMessage | 不主动开项 |
 | **不做** | `Search` / `define_subagent` / `invoke_subagent` / `delegate` | 与 `tool-granularity-and-evidence-governance-plan.md` 一致 |
@@ -717,9 +740,19 @@ P0 / P1 全部落地后，转为 Watch / Closed：
 完成 P0 后，本规划转为 Watch / Closed。后续真实样本暴露以下 drift 时按 regression-first 重新开项：
 
 - 模型选择错工具造成超时 / 失败（候选：工具描述改写 / cue 检测增强）。
-- 同名 MCP 覆盖未被诊断日志记录（候选：`diagnosticLogger` 接口收紧）。
+- 同名 MCP 覆盖未被诊断日志记录（候选：`diagnosticLogger` 接口收紧）——**注**：§2.2 层级治理实装后此条转为守门回归项；实装前是现存缺口（见 Phase 0 收尾项）。
 - Plan 模式被绕过（候选：`shouldEnterPlanMode()` cue 集合扩展，纯函数位于 `src/runtime/planModeCue.ts`）。
 - Cron 触发后 spawn 的新 session 没有走 `task_scope_declared`（候选：cron 触发路径加 `runtimeAgentStep` 接入）。
 - ConfigSet 写完后 model metadata resolver 未重跑（候选：在 `LLMCodingRuntime` 装配点加 reload hook）。
 - Sleep 固定截断回潮（候选：CI 加 `test/sleep-tool.test.ts` 守门，禁止出现固定 `setTimeout(seconds * 1000)` 而无 `AbortSignal`）。
 - test fixture 写入真实 `~/.babel-o/config.json`（候选：CI grep `process.env.BABEL_O_CONFIG_FILE` 守门）。
+
+---
+
+## 10. 评估与修订历史
+
+- **2026-06-17 纠偏评估**：本规划长期以"Plan only、必须真需求"被引用，但重读 + 代码核对发现三处失真已修正：
+  1. §1 现状表原写 9 工具，实际 17（漏列 contextTools×3 + Skill×5，均已通过各自规划落地，非本规划 Phase 1–6 产物）。
+  2. §3.1.1 原写"`NexusStorage` 仅支持 task.create"——事实错误，`saveTask`/`getTask`/`listTasks` 已存在，缺的是 update/stop/output 三个。
+  3. §2.2 层级治理被误归入"需真需求的新工具"——实际是 §1.2 记录的现存安全缺口（无条件 `tools.set` 覆盖），不受 §7.1 regression gate 约束，可立即实装。
+- **结论**：Phase 0 文档口径 = **Closed**；§2.2 层级治理实装 = **可立即做**（Phase 0 收尾项）；Phase 1–6 新工具 = **仍 Plan only**，等真实 session regression 或用户显式 override（per `feedback-babel-o-p0-regression-focus` 记忆"or the user explicitly asks"口子）。
