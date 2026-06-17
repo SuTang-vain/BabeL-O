@@ -385,7 +385,7 @@ func renderChrome(model LoopModel, state chromeViewState) string {
 		// trace lines from B2TraceViewState; dismiss on
 		// esc/q/v/ctrl+c. Same splice pattern as the other
 		// three overlays.
-		out = RenderTraceOverlay(out, model.Width, model.Height, state.TraceOverlayLines, "", false)
+		out = RenderTraceOverlay(out, model.Width, model.Height, state.TraceOverlayLines)
 	}
 	return out
 }

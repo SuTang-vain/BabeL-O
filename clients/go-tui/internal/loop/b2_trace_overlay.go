@@ -213,8 +213,10 @@ func BuildTraceLines(entries []api.BehaviorTraceEntry) []string {
 }
 
 // RenderTraceOverlay splices the trace panel over the existing chrome content.
+// Reads loading/error state from package-level b2Trace so the chrome dispatch
+// doesn't need to carry extra params.
 // Mirrors overlayScopeDrift (chrome.go:1739-1762).
-func RenderTraceOverlay(content string, width, height int, lines []string, err string, loading bool) string {
+func RenderTraceOverlay(content string, width, height int, lines []string) string {
 	if width <= 0 {
 		width = 80
 	}
@@ -226,7 +228,11 @@ func RenderTraceOverlay(content string, width, height int, lines []string, err s
 	if panelW < 40 || panelH < 8 {
 		return content + "\n" + mutedStyle.Render(truncatePlain("behavior trace: v toggle · press esc to close", width))
 	}
-	panel := renderTracePanel(panelW, panelH, lines, err, loading)
+	b2Trace.mu.Lock()
+	traceErr := b2Trace.err
+	traceLoading := b2Trace.loading
+	b2Trace.mu.Unlock()
+	panel := renderTracePanel(panelW, panelH, lines, traceErr, traceLoading)
 	startY := (height - panelH) / 2
 	if startY < 0 {
 		startY = 0

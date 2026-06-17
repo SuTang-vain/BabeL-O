@@ -107,6 +107,7 @@ func runLoop(
 	im = loop.NewInteractiveModelWithWorkingSetObserver(im, wsObserver)
 	im = loop.NewInteractiveModelWithRuntimeOptions(im, cfg.AltScreen, cfg.MouseCapture)
 	im = loop.NewInteractiveModelWithExecuteTimeout(im, time.Duration(cfg.ExecuteTimeoutMs)*time.Millisecond)
+	loop.InitB2Trace(client, cfg.Cwd)
 	prog := tea.NewProgram(im)
 	finalModel, err := prog.Run()
 	if err != nil {

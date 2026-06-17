@@ -607,6 +607,12 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// reserved for future toasts / diagnostics.
 		return m, nil
 
+	case b2TraceLoadedMsg:
+		// PR-B2: fetch trace response arrived. The overlay
+		// state has already been updated by the fetch
+		// goroutine; we just need a re-render tick.
+		return m, HandleB2TraceLoaded(msg)
+
 	case submitDoneMsg:
 		return m, m.handleSubmitDone(msg)
 
@@ -1040,6 +1046,7 @@ func (m InteractiveModel) View() tea.View {
 	} else {
 		v.MouseMode = tea.MouseModeNone
 	}
+	traceOpen, traceLines := B2TraceViewState()
 	v.SetContent(renderChrome(m.loop, chromeViewState{
 		HelpOpen:        m.helpOpen,
 		Toast:           m.activeToast(),
@@ -1057,6 +1064,10 @@ func (m InteractiveModel) View() tea.View {
 		PaneListCursor:   m.cursorForChrome(),
 		ScopeReviewLines: m.activeScopeReviewLines(),
 		ScopeDriftLines:  m.activeScopeDriftLines(),
+		// PR-B2: behavior trace overlay (v key).
+		// State is package-level via B2TraceViewState.
+		TraceOverlayOpen:  traceOpen,
+		TraceOverlayLines: traceLines,
 		Reconcile: reconcileFooterInfo{
 			InFlight: m.reconcileInFlight,
 			At:       m.lastReconcileAt,
