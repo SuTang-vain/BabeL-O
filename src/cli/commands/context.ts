@@ -146,7 +146,7 @@ export function registerContextCommand(program: Command): void {
     .option('--max-tokens <n>', 'Cap total output tokens (default 7500)', '7500')
     .option('--include-behavior-trace', 'Force-include behavior trace summary (default: depends on scope)')
     .option('--include-long-term', 'Force-include long-term memory hint (CLI stub; not yet implemented)')
-    .option('--include-project-memory', 'Force-include project memory (CLI stub; not yet implemented)')
+    .option('--include-project-memory', 'Force-include project memory from .babel-o/memory.md (PR-32)')
     .option('--include-live-hints', 'Force-include live hints (nexus-detected patterns within 5min; PR-31)')
     .option('--json', 'Print raw JSON output')
     .action(async (options: AssembleCommandOptions & { maxTokens: string }) => {

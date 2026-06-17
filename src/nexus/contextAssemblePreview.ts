@@ -12,6 +12,7 @@ import {
   BEHAVIOR_TRACE_RELATIVE_PATH,
   type BehaviorTraceEntry,
 } from '../runtime/behaviorTrace.js'
+import { loadProjectMemory } from '../runtime/memory.js'
 
 export type AssembleScope = 'minimal' | 'standard' | 'full' | 'task' | 'workspace'
 
@@ -143,8 +144,25 @@ function buildLongTermStub(): AssembledSection {
 }
 
 function buildProjectStub(): AssembledSection {
-  const content = '## Project Memory\n\n(not yet implemented in CLI — runtime layer reads .babel-o/memory.md)\n'
+  // PR-32: replaced by async buildProjectSection. Kept as a sync fallback
+  // (calls into a synchronously-cached version, returns empty if not preloaded).
+  const content = '## Project Memory\n\n(use --include-project-memory with --cwd to load .babel-o/memory.md)\n'
   return { kind: 'project', content, tokens: Math.ceil(content.length / 4), pinned: false, source: 'stub' }
+}
+
+// PR-32: read project memory from .babel-o/memory.md (per doc §5.2
+// getProjectMemorySection). Async because loadProjectMemory is async.
+// Reuses the runtime's max-chars cap for consistency.
+async function buildProjectSection(cwd: string): Promise<AssembledSection> {
+  const content = await loadProjectMemory(cwd)
+  if (!content || content.trim().length === 0) {
+    const empty = '## Project Memory\n\n(no .babel-o/memory.md found in this project)\n'
+    return { kind: 'project', content: empty, tokens: Math.ceil(empty.length / 4), pinned: false, source: '.babel-o/memory.md:not-found' }
+  }
+  const header = '## Project Memory (from .babel-o/memory.md)\n\n'
+  const body = content.endsWith('\n') ? content : content + '\n'
+  const full = header + body
+  return { kind: 'project', content: full, tokens: Math.ceil(full.length / 4), pinned: false, source: '.babel-o/memory.md' }
 }
 
 // PR-31: read live hints from behavior-trace.jsonl. Per doc §4.4 layer 6
@@ -252,7 +270,7 @@ export async function buildAssemblePreview(options: AssemblePreviewOptions): Pro
     sections.push(buildLongTermStub())
   }
   if (options.includeProjectMemory) {
-    sections.push(buildProjectStub())
+    sections.push(await buildProjectSection(cwd))
   }
   if (options.includeLiveHints && !sections.some(s => s.kind === 'liveHint')) {
     // PR-31: real live hints from behavior-trace.jsonl (nexus-sourced, 5min cooldown).
