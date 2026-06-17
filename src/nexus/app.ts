@@ -1734,6 +1734,55 @@ export async function createNexusApp(
     return await runWorkingSetGet({ cwd, sessionId })
   })
 
+  // PR-A1: Track A Phase 3 §7.3 — PUT /v1/context/working-set/:sessionId
+  // (write op, user-approved 2026-06-17). Updates a session's working
+  // set entries; auto-persists + emits working_set_updated event
+  // (PR-26). NOT silent: requires explicit body. Body shape:
+  //   { workspaceId?: string, entries: Array<{key, value, updatedAt, confidence}> }
+  // Pure write — caller is expected to read the current state via GET
+  // first and submit the full desired entries set (this endpoint is a
+  // write-through, not a delta).
+  app.put('/v1/context/working-set/:sessionId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = (request.params as { sessionId: string }).sessionId
+    const body = (request.body ?? {}) as {
+      workspaceId?: string
+      entries?: Array<{ key?: unknown; value?: unknown; updatedAt?: unknown; confidence?: unknown }>
+    }
+    if (!Array.isArray(body.entries)) {
+      return reply.code(400).send({ error: 'body.entries must be an array' })
+    }
+    // Per-entry shape validation. Reject early on the first bad row
+    // so callers can pinpoint the issue.
+    const validated: Array<{ key: string; value: string; updatedAt: string; confidence: number }> = []
+    for (let i = 0; i < body.entries.length; i++) {
+      const e = body.entries[i]!
+      if (typeof e.key !== 'string' || e.key.length === 0) {
+        return reply.code(400).send({ error: `entries[${i}].key must be a non-empty string` })
+      }
+      if (typeof e.value !== 'string') {
+        return reply.code(400).send({ error: `entries[${i}].value must be a string` })
+      }
+      if (e.updatedAt !== undefined && typeof e.updatedAt !== 'string') {
+        return reply.code(400).send({ error: `entries[${i}].updatedAt must be a string when present` })
+      }
+      if (e.confidence !== undefined && (typeof e.confidence !== 'number' || e.confidence < 0 || e.confidence > 1)) {
+        return reply.code(400).send({ error: `entries[${i}].confidence must be a number in [0,1]` })
+      }
+      validated.push({
+        key: e.key,
+        value: e.value,
+        updatedAt: typeof e.updatedAt === 'string' ? e.updatedAt : new Date().toISOString(),
+        confidence: typeof e.confidence === 'number' ? e.confidence : 1,
+      })
+    }
+    return await runWorkingSetPut({ cwd, sessionId, workspaceId: body.workspaceId, entries: validated })
+  })
+
   // PR-20: Track A Phase 3 — GET /v1/context/working-set/workspace/:wsId.
   // Per design §7.3 row 3. Returns the working set aggregated across all
   // sessions that share the same workspaceId. Pure read.
@@ -5507,6 +5556,54 @@ export async function runWorkingSetGet({ cwd, sessionId }: { cwd: string; sessio
     version: ws.version,
     updatedAt: ws.updatedAt,
     entries: ws.entries,
+  }
+}
+
+// ─── PR-A1: /v1/context/working-set/:sessionId PUT endpoint helper ───
+//
+// Per design §7.3 row "GET / PUT" + user explicit approval (2026-06-17).
+// Write op: replaces a session's working set entries and auto-persists
+// + emits working_set_updated event (PR-26). Caller submits the FULL
+// desired entries set (write-through, not a delta).
+export async function runWorkingSetPut({
+  cwd,
+  sessionId,
+  workspaceId,
+  entries,
+}: {
+  cwd: string
+  sessionId: string
+  workspaceId?: string
+  entries: Array<{ key: string; value: string; updatedAt: string; confidence: number }>
+}): Promise<{
+  type: 'working_set_session'
+  cwd: string
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{ key: string; value: string; updatedAt: string; confidence: number }>
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  // Preserve the previous workspaceId if the caller omits it; this
+  // matches the doc's intent that the endpoint is a write-through,
+  // not a full replacement that would zero out workspace linkage.
+  const prev = tracker.get(sessionId)
+  const resolvedWorkspaceId = workspaceId ?? prev?.workspaceId ?? ''
+  const updated = tracker.update(sessionId, {
+    workspaceId: resolvedWorkspaceId,
+    entries,
+  })
+  await tracker.flush()
+  return {
+    type: 'working_set_session',
+    cwd,
+    sessionId,
+    workspaceId: updated.workspaceId,
+    version: updated.version,
+    updatedAt: updated.updatedAt,
+    entries: updated.entries,
   }
 }
 
