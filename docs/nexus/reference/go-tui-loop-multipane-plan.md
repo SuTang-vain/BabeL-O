@@ -1,6 +1,7 @@
 # bbl loop — Go Multi-session Pane TUI Plan
 
 > Status: **Draft (2026-06-16)** — 借鉴 [ogulcancelik/herdr](https://github.com/ogulcancelik/herdr) 的 workspace / tab / pane / wait-event / persist snapshot 形态，在 Go TUI 之上引入一个多 session 并发面板，入口 `bbl loop`。`bbl chat` 继续是生产默认入口，本规划不替换它，只新增并列前端。
+> **2026-06-17 增补**：§6'（Phase 6'）记录"实时显示活跃 session"能力分析 + 分层修复路线（切片 6a/6b/6c）。**6a/6b/6c 全部已落地**——server 新 session 实时出现（6a）+ pane body 渲染 Transcript（6b）+ 每 pane `waitForEvent` 长轮询填入 transcript（6c）。活 TUI 终于能实时显示活跃 session 的内容。
 > Priority: 体验增强（不弱化现有 `bbl chat` / `bbl go` 质量门槛），不引入新的 runtime truth。
 > Related: [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md)、[go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md)、[go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md)、[task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md)、[memory-capability-awareness-and-trigger-plan.md](./memory-capability-awareness-and-trigger-plan.md)、[task-adaptive-recoverable-timeout-plan.md](./task-adaptive-recoverable-timeout-plan.md)
 
@@ -540,6 +541,138 @@ bbl loop 启动
 收口标准（部分达成，2026-06-16）：
 - 任意 pane 越界时，其它 pane 也能从侧栏看到事件触发源 ✓（BuildScopeReviewLines 包含 drift pane count，Phase 4 status sidebar 通过 phase 3 状态机传播）
 - review pane 不干扰 focus pane 的输入 ✓（pure-data 投影，由 Phase 3f' 适配层 splice 进 overlay，不与 focus pane input 路径串扰）
+
+### Phase 6' — 实时显示活跃 session（分析 + 分层修复路线，2026-06-17 核定）
+
+> 触发问题："当前 bbl loop 能否实时显示检测到的 session？"
+> 结论：**不能。** 能显示启动时已知 session 的元数据 + 状态，但运行时 server 新检测的 session 不实时出现，且任何 session 都看不到它在干什么。本节记录根因与修复切片。
+
+#### 6'.1 数据流现状（已对代码核实）
+
+```
+server loop_state ──ListPanes──► Reconciler.RunOnce ──Replace──► Store
+                                   (pull: server-only pane 写入 Store)   │
+                                                                        │
+                                   ✗ handleReconcileDone 不回灌           │
+                                                                        ▼
+health poll ──FetchLoopHealth──► applyHealthToLoop ──► m.loop (LoopModel) ──► chrome 渲染
+                                  (只改已有 pane 的 status,            ▲
+                                   不新增 pane)                         │
+                                                                       │
+                              启动时 applySnapshotToLoop (仅此处一次) ──┘
+```
+
+核实到的关键事实：
+
+1. **`applySnapshotToLoop`（`interactive.go:236`）只在构造时调用一次**（`interactive.go:166-167`），把 Store 里的 pane 灌进 `m.loop`。
+2. **`handleReconcileDone`（`reconcile_tick.go:93`）只更新 reconcile 状态 + 重排下次 tick，从不调用 `applySnapshotToLoop` / `store.Snapshot()`**。reconcile 拉来的 server-only pane 写进了 Store，但没刷回 `m.loop`。
+3. **`persistSnapshot`（`interactive.go:306`）是单向的**：`m.loop` → Store。Store → `m.loop` 这条回程路径在运行时不存在。
+4. **`applyHealthToLoop` 按 SessionID 匹配**已有 pane 改 status，**不新增 pane**（未知 session 直接跳过）。
+5. **`renderFocusedPaneBody`（`chrome.go:834`）是占位符**：只渲染 `session=… · rev=… · agent=…` 三行元数据 + `"(waiting for stream — Phase 3f')"`。
+6. **`PaneModel`（`model.go:59`）只有 9 个字段**，缺 plan §4.2 规定的 `Transcript / Input / PendingPermission / QueuedPrompt / InterruptionActive`。
+7. **`applySnapshotToLoop` 是 append-only 不幂等**（`tab.AddPane` 直接 append，无 paneId 去重，`model.go:148`）——直接重复调用会让 pane 翻倍。
+
+#### 6'.2 四个层级的现状
+
+| 层级 | 能否实时显示 | 原因 |
+|---|---|---|
+| **A. 启动时已知的 session** | ✅ 能 | 构造时 `applySnapshotToLoop` 灌入，sidebar/pane list/body 显示 session id/agent/rev |
+| **B. 运行时 server 新检测到的 session** | ❌ 不能 | reconcile 写进 Store，`handleReconcileDone` 不回灌 `m.loop`，要等下次重启才出现 |
+| **C. session 状态变化**（idle→working→drift→done） | ✅ 能（仅限已在 model 的 pane） | health poll → `applyHealthToLoop` → status pill + toast + sound |
+| **D. session 活跃内容**（transcript/事件流） | ❌ 完全不能 | body 是占位符，`PaneModel` 无 Transcript，`waitForEvent` 未接入 |
+
+#### 6'.3 修复切片
+
+> 命名说明：plan 文档原有阶段号为 0–6 + 5c/5c'/3f/3f'；以下 `6a/6b/6c` 是本节为填补 "Phase 6 未完成" 中 "real Nexus streaming" 的子切片编号，**不是已落地的里程碑**。
+
+**切片 6a — Store → LoopModel 回灌（修复层级 B，低成本）— ✅ 已落地（2026-06-17）**
+
+让 server 新检测的 session 实时出现在 pane list / sidebar。前置：先把 `applySnapshotToLoop` 改成 **upsert-by-paneId**（已存在按 paneId 更新 metadata，不存在的才 append），消除 append-only 不幂等问题（事实 7）。然后在 `handleReconcileDone` 末尾加 `m.loop = applySnapshotToLoop(m.loop, m.store.Snapshot())`，把 reconcile 拉来的 pane 回灌进 `m.loop`。
+
+- 改动：`applySnapshotToLoop` 重写为 upsert（existing 按 PaneID 原地刷新 Agent/Cwd/Label/LastEventRev，**Status 保留**归 health poll 所有）+ `handleReconcileDone` 一行回灌
+- 行数：~50 + 测试
+- 风险：health poll 的 `applyHealthToLoop` 仍只改 status 不新增 pane（事实 4），所以 6a 落地后，新 session 在 reconcile 周期内出现（默认 5s），但 status 要等下一次 health poll 才上色——可接受
+- 不变量：不破坏 `persistSnapshot` 的 `m.loop → Store` 单向语义；回灌是 Store → `m.loop` 的单向读取，不产生写冲突；existing pane 的 Status 不被 reconcile 重置为 idle
+- 测试（`internal/loop/phase6a_test.go`，4 个）：upsert 幂等（两次 apply 不翻倍）、existing metadata 刷新 + Status 保留（drift 不被重置）、`handleReconcileDone` 回灌新 server pane（无需重启即出现）、reconcile tick 不重置 blocked status。`go test ./...` 全绿
+
+**切片 6b — `PaneModel.Transcript` + `renderFocusedPaneBody` 读 transcript（修复层级 D 第一步）— ✅ 已落地（2026-06-17）**
+
+按 plan §4.2 给 `PaneModel` 补 `Transcript []TranscriptItem` 字段（先离线/快照态渲染，不接流）。`TranscriptItem` schema 复用 health 已带的字段子集（sessionId/agent/lastEventRev），后续接流时扩展为完整事件体。新增 `BuildTranscriptLines(pane, width, height)` 渲染器，`renderFocusedPaneBody` 从读占位符改为读 transcript。
+
+- 改动：`model.go` 加 `Transcript []TranscriptItem` 字段 + 新建 `transcript.go`（`TranscriptRole` enum + `BuildTranscriptLines` 纯函数，宽度算用 lipgloss.Width，与 chrome.go 一致）+ `chrome.go` `renderFocusedPaneBody` 切换渲染源（meta 行 + 有 transcript 走 transcript / 无 transcript 回退占位符，原行为完全保留）+ 4 个 chrome helper（`renderTranscriptLines` / `splitLines` / `parseTranscriptRole` / `styleForTranscriptRole`）
+- 行数：`transcript.go` ~95 + `chrome.go` 新增 ~70 + 测试 ~190
+- 这是"用户能看到活跃 session 在干什么"的临界点
+- 测试（`internal/loop/phase6b_test.go`，9 个）：空/空 slice 返回 nil、负几何返回 nil、tail window（height=2 取最后 2 条）、短 transcript 全部显示、role label 垂直对齐、超长文本截断带省略号、4 个 role 的 String() 唯一性、空 transcript 走占位符、有 transcript 不走占位符
+- `go test ./...` 全绿；现有 chrome_*_test.go 零回归（grep 确认占位符字符串和 session=… 字符串不在任何测试断言里）
+- 关键不变量：6a 之后"server 新 session 实时出现"已成事实；6b 之后这些 session 一旦 6c 填入 Transcript 就能在 focused body 看到内容。**当前活 TUI 上仍只显示占位符——Transcript 由 6c 接入**
+
+**切片 6c — 每 pane `waitForEvent` 长轮询接入 transcript（修复层级 D 第二步）— ✅ 已落地（2026-06-17）**
+
+`api.WaitForEvents`（`client.go:229`）已就绪。为每个 pane 起一个 `tea.Cmd` 驱动的长轮询（带 `WaitTimeoutMs` 软超时，遵守 [[babel-o-soft-recoverable-timeouts]]），命中事件 append 进该 pane 的 `Transcript`。事件 → 本地 status 映射（assistant_text→working、tool_completed→working、permission_request→blocked、scope_drift→drift、turn_end→done）作为 health 投影的补充源。
+
+- 改动：
+  - `transcript_events.go` 新建：`EventToTranscriptItem` 纯函数（4 种核心事件 + clip 200 字符 + CJK rune 安全 + renderToolOutput 处理 string/object 两种 output）
+  - `wait_tick.go` 新建：`waitDoneMsg` / `scheduleWaitTick` / `fetchWaitCmd`（带 paneID 注入）/ `handleWaitDone`（append + maxTranscriptItems=500 截断 + LastEventRev 推进 + 重排）/ `parseNextRevision`（空/畸形回退 to since，永不回退）/ `startAllWaits` / `startWaitsForNewPanes` / `startWaitForPane`（单飞守卫）/ `clearWaitOnClose` / `findPaneByID` / `withPane`（immutable 写回）
+  - `interactive.go`：加 `waitInFlight map[string]bool` 字段；`Init` 末尾 `startAllWaits` 启动已 hydrate pane；`Update` 路由 `waitDoneMsg → handleWaitDone`；`dispatchEvent` 在 `RouteClosePane` 时调 `clearWaitOnClose` 清理 in-flight
+  - `reconcile_tick.go`：`handleReconcileDone` 末尾追加 `startWaitsForNewPanes`，把"server 新检测的 pane"立即接入 wait 轮询
+- 行数：`transcript_events.go` ~165 + `wait_tick.go` ~290 + 集成改动 ~30 + 测试 ~310
+- 与 health poll 关系：health 是聚合投影（跨 session），wait 是 per-pane 流（内容）；两者互补，不互替
+- 测试（`internal/loop/phase6c_test.go` 12 个 + `internal/loop/wait_tick_test.go` 6 个，共 18 个）：
+  - 4 种核心事件 shape + 未知事件 + 空/畸形/长文本/CJK rune 安全
+  - `TestWaitDoneAppendsToTranscript` 命中 user_prompt → append + LastEventRev 推进
+  - `TestWaitDoneSkipsUnknownEvents` 未知类型不进 transcript 但 cursor 仍推进
+  - `TestStartWaitForPaneSkipsInFlight` 单飞守卫
+  - `TestWaitDoneClearsInFlight` 错误路径也清理 in-flight
+  - `TestWaitDoneTrimsTranscriptAt500` 容量上限截断
+  - `TestParseNextRevision` 6 个 case 覆盖空/畸形/回退到 since
+- `go test ./...` 6a/6b/6c 全部相关测试绿；vet 干净
+- **关键不变量**：waitTick 是 `pane.Transcript` 唯一写入者；waitTick 不动 `pane.Status`（health poll 拥有 status 所有权）；pane close 清理 in-flight；超时返回 nextRev=since 视为正常 poll tick（不报错）
+
+**6c 设计要点（待实施时遵循）**
+
+1. **per-pane 状态**：在 `InteractiveModel` 加 `waitInFlight map[PaneID]bool` + 复用 `pane.LastEventRev` 作为 `since` 参数（不引入并行 per-pane lastSeenRev，避免数据源分裂）。
+2. **轮询触发点**：`handleReconcileDone` 回灌后，对每个 `waitInFlight[PaneID]==false` 的 pane 启动 wait cmd；Init 路径对已 hydrate 的 pane 同样启动（覆盖"启动时 Store 已有 pane"场景）。
+3. **轮询单飞**：用 `waitInFlight` map 防止重复 schedule（每 pane 同时只有一个 in-flight cmd）。
+4. **消息类型**：`waitDoneMsg { PaneID string; Events []json.RawMessage; NextRev int64; Err error }`。
+5. **事件→TranscriptItem 转换**：`eventToTranscriptItem(raw json.RawMessage, lastRev int64) (TranscriptItem, int64, bool)` —— 支持 4 种核心类型（`user_prompt` / `assistant_text` / `tool_completed` / `scope_boundary_*`），其余事件返回 `(zero, false)` 跳过。nextRev 来自 server `nextRevision`，未匹配事件时等于 `since`。
+6. **status 补充映射**：在 wait handler 里把事件 type → PaneStatus 更新（但**不与 health poll 冲突**——health 仍是聚合权威；wait 只是当 health poll 慢一拍时给 pane 一个本地 hint）。具体策略：wait handler 只在 health poll 还没上色到该 status 时设置；若 health poll 下一轮覆盖为更新值,以 health 为准。
+7. **Transcript 容量**：`maxTranscriptItems = 500`(per pane)。append 时超过则 drop 头部,保留 `lastSeenRev = dropped[0].Rev`(防止重复拉)。这个上限保护 pane 内存不爆。
+8. **超时**：`WaitTimeoutMs` 默认 5000ms（与 health interval 错开），遵循软超时语义：超时返回空 events + nextRev=since（不视为错误,正常 poll tick,匹配 plan §3.1 的"超时返回 200 + { events: [] }"约定）。
+9. **错误处理**：网络错误 → toast line + 等下次 reconcile tick 触发重试；不退出。
+10. **不变量**：
+    - wait 轮询**不修改** `pane.Status`(health poll 拥有 status 所有权),只 append `Transcript` + 更新 `LastEventRev`
+    - transcript append 后立即触发一次 chrome 渲染(bubble tea Update 路径自动重画)
+    - pane 被 close 时(`ApplyClosePane`)清理 `waitInFlight[pane.PaneID]`,防止 wait 结果回到已不存在的 pane
+11. **测试点**（`phase6c_test.go`）：
+    - `TestEventToTranscriptItem` 覆盖 4 种事件类型 + 未知事件
+    - `TestScheduleWaitTickSkipsInFlight` 验证单飞
+    - `TestWaitDoneAppendsToTranscript` 通过 httptest 模拟 server 返回 1 个 event
+    - `TestWaitDoneTrimsTranscriptOver500` 容量上限
+    - `TestWaitDoneClosesRemovesInFlight` 与 ApplyClosePane 联动
+    - `TestWaitTimeoutIsSoft` 超时返回 nextRev=since 不视为错
+12. **范围克制**：6c 不实现 input(切片 6d)、不实现 permission dialog(切片 6d)、不实现 multi-workspace wait(单 workspace focused tab 为主)。这与 plan §6'.3 6d 一致。
+
+**为什么 6c 不在 6a/6b 同一个回合推完**(历史说明,2026-06-17 已不适用)
+
+- 6a 是 ~50 行纯函数(upsert) + 一行回灌 + 4 测试;
+- 6b 是 ~165 行(纯函数 + render helper)+ 9 测试;
+- 6c 是 ~200 行 + 5+ 测试,涉及 InteractiveModel 新增字段、per-pane 状态机、事件 schema 集成,工作量约 6a+6b 之和。
+- 6a/6b 的回合已经出现"输出卡在伪工具调用"的故障两次。6c 在一个连续回合内推完会显著增加再次卡死的风险。**6c 已在 6a/6b 完成后单独排期,作为下一回合的首要切片**。
+- **2026-06-17 状态**：6c 已在后续回合以"分小步"方式推完（步骤 1-5）。所有原担忧已解决——以纯函数(步骤 1)开局 + 小步集成(步骤 2-3) + 集中测试(步骤 4) + 文档收口(步骤 5)有效规避了故障风险。
+
+**切片 6d — 后续（暂不排期）**
+
+`PendingPermission`（权限对话框）、`QueuedPrompt` + 每 pane 输入（`textinput.Model` + POST execute）、`InterruptionActive`。这些是 plan §4.2 列出但与本节"显示活跃 session"核心目标（让 session 出现 + 看到内容）无直接依赖的字段，留到交互层阶段。
+
+#### 6'.4 推进顺序与依据
+
+先 6a 再 6b/6c。依据：6a 是 6c 的前置——server 新 session 都进不来 `m.loop`，per-pane `waitForEvent` 无从 attach（没 pane 可挂轮询）。6a 低成本且能立刻消除"重启才看到新 session"的最明显体感断裂。6b/6c 是真正"显示活跃 session 内容"的工作量所在，可独立排期。
+
+#### 6'.5 与既有阶段的对应
+
+- 6a 闭合 Phase 5c' 的 reconcile 回路（reconcile 写 Store 后 TUI 不回灌是 Phase 5c' 收口标准外的遗留 gap）
+- 6b/6c 对应 Phase 6 "未完成" 中的 "real Nexus streaming"
+- 6b/6c 不动 Phase 6 已达成的 scope_review / scope_drift 投影
 
 ---
 

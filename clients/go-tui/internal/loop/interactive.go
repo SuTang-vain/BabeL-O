@@ -72,7 +72,14 @@ type InteractiveModel struct {
 	// the reconciler takes a noticeable fraction of the
 	// 5s interval.
 	reconcileInFlight bool
-	quitting          bool
+	// waitInFlight tracks per-pane wait poll state for
+	// 6c (per-pane waitForEvent). A pane id is in the
+	// map while a /v1/sessions/:id/wait call is
+	// outstanding; scheduleWaitTick callers must check
+	// first to avoid stacking concurrent polls on the
+	// same pane. Cleared by handleWaitDone (deferred).
+	waitInFlight map[string]bool
+	quitting     bool
 	// helpOpen toggles the centered keybind overlay. Wired
 	// to the `?` key from Update; rendered by chrome.go.
 	helpOpen bool
@@ -229,10 +236,20 @@ func NewInteractiveModelWithRuntimeOptions(
 }
 
 // applySnapshotToLoop returns `loop` updated to reflect the
-// panes in `snap`. Pane IDs that don't exist in the
-// current model are appended to the focused tab; existing
-// panes have their metadata refreshed. The function is
-// pure — the caller decides whether to persist.
+// panes in `snap`. It is upsert-by-paneId: panes whose PaneID
+// already exists in the focused tab have their metadata
+// refreshed in place (Agent / Cwd / Label / LastEventRev, plus
+// WorkspaceID/TabID if the snapshot disagrees); panes that
+// don't exist are appended via AddPane. Status is preserved on
+// existing panes (health poll owns status projection) and
+// defaults to StatusIdle on fresh panes. The function is pure
+// — the caller decides whether to persist.
+//
+// Upsert (rather than append-only) is what makes this safe to
+// call repeatedly from handleReconcileDone: a pane the
+// reconciler already pulled into the Store is refreshed, not
+// duplicated, so periodic reconcile no longer causes the pane
+// list to grow on every tick.
 func applySnapshotToLoop(loop LoopModel, snap Snapshot) LoopModel {
 	if len(snap.Panes) == 0 {
 		return loop
@@ -244,8 +261,42 @@ func applySnapshotToLoop(loop LoopModel, snap Snapshot) LoopModel {
 	if len(ws.Tabs) == 0 {
 		ws.Tabs = []Tab{{ID: ws.ID + ":1", Label: "main"}}
 	}
+	if loop.Focus.TabIdx < 0 || loop.Focus.TabIdx >= len(ws.Tabs) {
+		return loop
+	}
 	tab := ws.Tabs[loop.Focus.TabIdx]
 	for _, entry := range snap.Panes {
+		if entry.PaneID == "" {
+			continue
+		}
+		// Refresh metadata on an existing pane (matched by
+		// PaneID) without touching its Status — the health
+		// poll owns status projection, and a reconcile tick
+		// must not clobber a live working/drift state back
+		// to idle.
+		updated := false
+		for i := range tab.Panes {
+			if tab.Panes[i].PaneID != entry.PaneID {
+				continue
+			}
+			tab.Panes[i].WorkspaceID = entry.WorkspaceID
+			tab.Panes[i].TabID = entry.TabID
+			tab.Panes[i].SessionID = entry.SessionID
+			tab.Panes[i].Agent = entry.Agent
+			tab.Panes[i].Cwd = entry.Cwd
+			tab.Panes[i].Label = entry.Label
+			tab.Panes[i].LastEventRev = entry.LastRev
+			updated = true
+			break
+		}
+		if updated {
+			continue
+		}
+		// New pane — append through AddPane so the
+		// invariant checks (non-empty ids, parent match)
+		// still run. A mismatched WorkspaceID/TabID from a
+		// stale snapshot is dropped rather than corrupting
+		// the tab; AddPane returns an error we swallow.
 		tab, _ = tab.AddPane(PaneModel{
 			PaneID:       entry.PaneID,
 			WorkspaceID:  entry.WorkspaceID,
@@ -327,6 +378,14 @@ func (m InteractiveModel) Init() tea.Cmd {
 	if m.loopClient != nil && m.healthInterval > 0 {
 		cmds = append(cmds, scheduleHealthTick(m.healthInterval))
 	}
+	// Phase 6c: start a per-pane waitForEvent poll for every
+	// pane already in the model at startup. This covers the
+	// case where the user's Store has panes from a previous
+	// bbl loop run (Phase 5a persistence) and we want their
+	// transcripts to start filling in immediately. Newly
+	// discovered panes are picked up by handleReconcileDone
+	// after their first reconcile tick.
+	cmds = append(cmds, m.startAllWaits()...)
 	return tea.Batch(cmds...)
 }
 
@@ -356,6 +415,9 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case healthDoneMsg:
 		return m, m.handleHealthDone(msg)
+
+	case waitDoneMsg:
+		return m, m.handleWaitDone(msg)
 
 	case tea.KeyPressMsg:
 		// Help overlay takes priority over quit + router
@@ -420,6 +482,14 @@ func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 	m.loop = next
 	switch route.Action {
 	case RouteClosePane:
+		// Phase 6c: capture the closing pane id BEFORE
+		// mutating m.loop, then clear its wait in-flight
+		// state. ApplyClosePane is pure (it just
+		// manipulates the LoopModel), so the InteractiveModel
+		// bookkeeping has to happen at the call site.
+		if closed, ok := m.loop.FocusedPane(); ok {
+			m.clearWaitOnClose(closed.PaneID)
+		}
 		m.loop = ApplyClosePane(m.loop)
 	case RouteNewPane:
 		m.loop, _ = ApplyNewPane(m.loop, newPaneSeedFor(event))

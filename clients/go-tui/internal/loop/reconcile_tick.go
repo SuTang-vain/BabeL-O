@@ -94,5 +94,30 @@ func (m *InteractiveModel) handleReconcileDone(msg reconcileDoneMsg) tea.Cmd {
 	m.lastReconcile = msg
 	m.lastReconcileAt = time.Now()
 	m.reconcileInFlight = false
-	return scheduleReconcileTick(m.reconcileInterval)
+	// Phase 6a: the reconciler writes server-only / drifted
+	// panes into the Store, but the chrome renders from
+	// m.loop. Without this re-hydrate, a session the server
+	// newly tracks would only appear after a full bbl loop
+	// restart (applySnapshotToLoop ran once at construction).
+	// Re-applying the snapshot here is safe now that
+	// applySnapshotToLoop is upsert-by-paneId, so a pane the
+	// reconciler already pulled in is refreshed rather than
+	// duplicated. Status is preserved on existing panes;
+	// newly discovered panes start idle and get a status on
+	// the next health poll (applyHealthToLoop matches by
+	// SessionID).
+	if m.store != nil {
+		m.loop = applySnapshotToLoop(m.loop, m.store.Snapshot())
+	}
+	// Phase 6c: reconcile just discovered / refreshed panes —
+	// start a per-pane waitForEvent poll for any pane that
+	// has a SessionID but no wait in flight. Per §6'.3 6c
+	// point 10, applyClosePane also cleans up waitInFlight,
+	// so a closed pane won't be re-targeted here.
+	waitCmds := m.startWaitsForNewPanes()
+	if len(waitCmds) == 0 {
+		return scheduleReconcileTick(m.reconcileInterval)
+	}
+	all := append([]tea.Cmd{scheduleReconcileTick(m.reconcileInterval)}, waitCmds...)
+	return tea.Batch(all...)
 }
