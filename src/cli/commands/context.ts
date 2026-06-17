@@ -30,6 +30,7 @@ import {
   summarizeWindow,
 } from '../../tools/contextTools.js'
 import type { NexusEvent } from '../../shared/events.js'
+import type { WorkingSetEntry } from '../../nexus/workingSetTracker.js'
 
 export interface ContextCommandOptions {
   cwd: string
@@ -53,6 +54,21 @@ export interface AssembleCommandOptions extends ContextCommandOptions {
   includeProjectMemory?: boolean
 }
 
+// PR-19: write-op options. NOT silent — defaults to no-op unless explicit
+// flags are provided. Each kv has form key=value where value is JSON-encoded
+// (e.g. 'task:foo="bar"' or 'count=42'). Per [[memory: babel-o-write-capable-
+// child-agent-delayed]] this was approved by user on 2026-06-17.
+export interface WorkingSetEditOptions {
+  cwd: string
+  sessionId?: string
+  workspaceId?: string
+  add: string[]
+  remove: string[]
+  update: string[]
+  dryRun: boolean
+  json: boolean
+}
+
 export function registerContextCommand(program: Command): void {
   const context = program
     .command('context')
@@ -66,6 +82,25 @@ export function registerContextCommand(program: Command): void {
     .option('--json', 'Print raw JSON output')
     .action(async (options: ContextCommandOptions) => {
       await runWorkingSet(options)
+    })
+
+  // PR-19: write op — manual edit of a session's working set.
+  // Per doc §7.2. NOT a silent mutation: requires explicit --add/--remove/--update
+  // flags. Default behavior (no flags) is a no-op that errors out.
+  // --dry-run previews without persisting.
+  context
+    .command('working-set-edit')
+    .description('Edit a session working set (write op). Adds/removes/updates key-value entries.')
+    .option('--cwd <path>', 'Project root (default: current dir)', process.cwd())
+    .option('--session-id <id>', 'Session to edit (required)', undefined)
+    .option('--workspace-id <id>', 'Workspace id (defaults to existing or empty)', undefined)
+    .option('--add <kv>', 'Add entry as key=value (repeatable, JSON value supported)', (val: string, prev: string[]) => prev.concat(val), [])
+    .option('--remove <key>', 'Remove entry by key (repeatable)', (val: string, prev: string[]) => prev.concat(val), [])
+    .option('--update <kv>', 'Update existing entry as key=value (repeatable, JSON value supported)', (val: string, prev: string[]) => prev.concat(val), [])
+    .option('--dry-run', 'Preview changes without persisting', false)
+    .option('--json', 'Print result as JSON', false)
+    .action(async (options: WorkingSetEditOptions) => {
+      await runWorkingSetEdit(options)
     })
 
   context
@@ -419,6 +454,146 @@ export async function runAssemble(options: AssembleCommandOptions): Promise<Asse
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
+
+
+// ─── PR-19: runWorkingSetEdit (write op, user-approved 2026-06-17) ───────
+
+type ParsedKv = { key: string; value: string }
+
+function parseKv(s: string): ParsedKv {
+  const idx = s.indexOf('=')
+  if (idx <= 0) {
+    throw new Error(`Invalid --add/--update value: "${s}". Expected key=value.`)
+  }
+  return { key: s.slice(0, idx), value: s.slice(idx + 1) }
+}
+
+export async function runWorkingSetEdit(options: WorkingSetEditOptions): Promise<void> {
+  if (!options.sessionId) {
+    console.error(chalk.red('Error: --session-id is required for working-set-edit'))
+    process.exitCode = 2
+    return
+  }
+  if (options.add.length === 0 && options.remove.length === 0 && options.update.length === 0) {
+    console.error(chalk.red('Error: must specify at least one of --add, --remove, --update'))
+    process.exitCode = 2
+    return
+  }
+
+  // Load persisted tracker (auto-loads from working-set.json)
+  const tracker = new PersistedWorkingSetTracker(options.cwd)
+  await tracker.load()
+
+  // Capture pre-edit snapshot
+  const before = tracker.get(options.sessionId)
+  const beforeEntries: WorkingSetEntry[] = before?.entries ? [...before.entries] : []
+  const beforeVersion = before?.version ?? 0
+  const beforeWorkspaceId = before?.workspaceId ?? ''
+
+  // Build the new entries list
+  let entries: WorkingSetEntry[] = [...beforeEntries]
+  const now = new Date().toISOString()
+  const operations: Array<{ op: string; key: string; value?: string }> = []
+
+  // --add
+  for (const kv of options.add) {
+    let key: string, value: string
+    try {
+      ({ key, value } = parseKv(kv))
+    } catch (err) {
+      console.error(chalk.red(err instanceof Error ? err.message : String(err)))
+      process.exitCode = 2
+      return
+    }
+    const existingIdx = entries.findIndex((e) => e.key === key)
+    if (existingIdx >= 0) {
+      console.error(chalk.red(`Error: --add key "${key}" already exists; use --update`))
+      process.exitCode = 2
+      return
+    }
+    entries.push({ key, value, updatedAt: now, confidence: 1 })
+    operations.push({ op: 'add', key, value })
+  }
+
+  // --update
+  for (const kv of options.update) {
+    let key: string, value: string
+    try {
+      ({ key, value } = parseKv(kv))
+    } catch (err) {
+      console.error(chalk.red(err instanceof Error ? err.message : String(err)))
+      process.exitCode = 2
+      return
+    }
+    const existingIdx = entries.findIndex((e) => e.key === key)
+    if (existingIdx < 0) {
+      console.error(chalk.red(`Error: --update key "${key}" does not exist; use --add`))
+      process.exitCode = 2
+      return
+    }
+    entries[existingIdx] = { key, value, updatedAt: now, confidence: 1 }
+    operations.push({ op: 'update', key, value })
+  }
+
+  // --remove
+  for (const key of options.remove) {
+    const idx = entries.findIndex((e) => e.key === key)
+    if (idx < 0) {
+      console.error(chalk.red(`Error: --remove key "${key}" not found`))
+      process.exitCode = 2
+      return
+    }
+    entries.splice(idx, 1)
+    operations.push({ op: 'remove', key })
+  }
+
+  const workspaceId = options.workspaceId ?? beforeWorkspaceId
+
+  if (options.dryRun) {
+    if (options.json) {
+      console.log(JSON.stringify({ dryRun: true, operations, beforeCount: beforeEntries.length, afterCount: entries.length }, null, 2))
+    } else {
+      console.log(chalk.yellow('DRY RUN — no changes written'))
+      for (const op of operations) {
+        if (op.op === 'remove') {
+          console.log(`  - remove  ${op.key}`)
+        } else {
+          console.log(`  ${op.op === 'add' ? '+ add' : '~ update'}  ${op.key}=${op.value}`)
+        }
+      }
+      console.log(chalk.gray(`  (${beforeEntries.length} → ${entries.length} entries)`))
+    }
+    return
+  }
+
+  // Persist
+  tracker.update(options.sessionId, { workspaceId, entries })
+  await tracker.flush()
+
+  // PR-26: event bus emits working_set_updated automatically
+  const after = tracker.get(options.sessionId)
+  if (options.json) {
+    console.log(JSON.stringify({
+      sessionId: options.sessionId,
+      workspaceId,
+      version: after?.version,
+      operations,
+      entryCount: entries.length,
+    }, null, 2))
+  } else {
+    console.log(chalk.green('✓ working set updated'))
+    for (const op of operations) {
+      if (op.op === 'remove') {
+        console.log(`  ${chalk.red('- remove')}  ${op.key}`)
+      } else if (op.op === 'add') {
+        console.log(`  ${chalk.green('+ add')}    ${op.key}=${op.value}`)
+      } else {
+        console.log(`  ${chalk.yellow('~ update')} ${op.key}=${op.value}`)
+      }
+    }
+    console.log(chalk.gray(`  version: ${beforeVersion} → ${after?.version} (${entries.length} entries)`))
+  }
+}
 
 export function parseSince(s: string): number | undefined {
   const match = s.trim().match(/^(\d+)\s*([hmdw])$/i)
