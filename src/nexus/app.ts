@@ -5480,7 +5480,7 @@ export type ContextAssembleParams = {
   maxTokens: number
 }
 
-import { buildAssemblePreview, type AssembledContextPreview } from '../cli/commands/context.js'
+import { buildAssemblePreview, type AssembledContextPreview } from './contextAssemblePreview.js'
 
 export async function runContextAssemble(params: ContextAssembleParams): Promise<{
   type: 'context_assemble_result'

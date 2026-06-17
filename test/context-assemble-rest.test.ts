@@ -18,7 +18,7 @@ import {
 import {
   buildAssemblePreview,
   type AssembledContextPreview,
-} from '../src/cli/commands/context.js'
+} from '../src/nexus/contextAssemblePreview.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 

@@ -29,8 +29,8 @@ import { Command } from 'commander'
 import {
   registerContextCommand,
   runAssemble,
-  type AssembledContextPreview,
 } from '../src/cli/commands/context.js'
+import type { AssembledContextPreview } from '../src/nexus/contextAssemblePreview.js'
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {}
 
