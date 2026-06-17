@@ -1352,6 +1352,7 @@ export async function* wrapWithBehaviorTraceTap(
     return
   }
   const buffer: NexusEvent[] = []
+  const emittedTraceKeys = new Set<string>()
   let taskScopeGlob: string | undefined
   let lastTaskScopeEventAt = -1
   for await (const event of source) {
@@ -1378,6 +1379,9 @@ export async function* wrapWithBehaviorTraceTap(
         taskScope: taskScopeGlob,
       })
       for (const det of detected) {
+        const key = behaviorTraceDetectionKey(det)
+        if (emittedTraceKeys.has(key)) continue
+        emittedTraceKeys.add(key)
         const ctx = buildTraceContext({ events: buffer })
         const sa = deriveRuleSelfAssessment(det.trigger, det.anomaly, { retryCount: ctx.retryCount })
         queueBehaviorTraceEntry({
@@ -1399,4 +1403,20 @@ export async function* wrapWithBehaviorTraceTap(
   void flushBehaviorTraceQueue().catch((error) => {
     logger.debug('behaviorTrace flush failed', error)
   })
+}
+
+function behaviorTraceDetectionKey(
+  detected: ReturnType<typeof detectTriggers>[number],
+): string {
+  const anomaly = detected.anomaly
+  return JSON.stringify([
+    detected.trigger,
+    detected.relatedEventIndex,
+    anomaly.errorCode ?? '',
+    anomaly.errorMessage ?? '',
+    anomaly.denialReason ?? '',
+    anomaly.driftPath ?? '',
+    anomaly.expectedScope ?? '',
+    anomaly.userRedirectSignal ?? '',
+  ])
 }

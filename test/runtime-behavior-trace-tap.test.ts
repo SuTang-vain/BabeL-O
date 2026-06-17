@@ -244,6 +244,57 @@ describe('PR-3 behaviorTrace tap (wrapWithBehaviorTraceTap)', () => {
     }
   })
 
+  test('dedupes a detected anomaly across later non-trigger events', async () => {
+    const events: NexusEvent[] = [
+      {
+        type: 'session_started',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-16T10:00:00.000Z',
+        cwd,
+      },
+      {
+        type: 'error',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-16T10:00:01.000Z',
+        code: 'TOOL_ERROR',
+        message: 'boom',
+      },
+      {
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-16T10:00:02.000Z',
+        text: 'continuing',
+      },
+      {
+        type: 'assistant_delta',
+        schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId,
+        timestamp: '2026-06-16T10:00:03.000Z',
+        text: 'still continuing',
+      },
+    ]
+    const source = (async function* () {
+      for (const e of events) yield e
+    })()
+    const options: RuntimeExecuteOptions = { sessionId, prompt: 'test', cwd }
+
+    for await (const _ of wrapWithBehaviorTraceTap(options, source)) {
+      // drain
+    }
+    await flushBehaviorTraceQueue()
+
+    const tracePath = join(cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+    const traces = readFileSync(tracePath, 'utf8')
+      .split('\n')
+      .filter(l => l.trim().length > 0)
+      .map(l => JSON.parse(l))
+      .filter(entry => entry.trigger === 'error')
+    assert.equal(traces.length, 1, 'same error should be traced only once')
+  })
+
   test('disabled: BABEL_O_BEHAVIOR_TRACE_ENABLED=false yields zero writes', async () => {
     process.env.BABEL_O_BEHAVIOR_TRACE_ENABLED = 'false'
     const events = buildTriggerEvents(cwd, sessionId)

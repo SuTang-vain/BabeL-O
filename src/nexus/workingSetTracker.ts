@@ -17,10 +17,14 @@
 //     the per-call derive is skipped and the supplied value is used
 //     verbatim (still capped at MAX_ASSEMBLED_WORKING_SET_CHARS).
 //
+// PR-26 (Track A Phase 3 §6.3 + §7.3 WebSocket):
+//   - event bus: subscribe to {type: 'working_set_updated', ...} events
+//   - per-workspace broadcast: linkToWorkspace + broadcastChange
+//
 // Out of scope (later PRs):
 //   - persistence
-//   - event bus / cross-session broadcast
-//   - cross-workspace aggregation
+//   - /v1/working-set/observe WebSocket (PR-27)
+//   - cross-workspace aggregation API
 //   - everCoreRuntimeManager lease reuse
 //
 // Invariants respected:
@@ -56,10 +60,60 @@ export type WorkingSetPatch = {
   version?: number
 }
 
+// ─── PR-26: event bus for working_set_updated push (design §6.3 + §7.3) ───
+
+export type WorkingSetEventType = 'working_set_updated' | 'working_set_reset'
+
+export type WorkingSetEvent =
+  | { type: 'working_set_updated'; sessionId: string; workspaceId: string; ws: WorkingSet; timestamp: string }
+  | { type: 'working_set_reset'; sessionId: string; workspaceId: string; timestamp: string }
+
+export type WorkingSetEventHandler = (event: WorkingSetEvent) => void | Promise<void>
+
+/**
+ * Simple synchronous-first event bus. Handlers may return a Promise;
+ * the bus does not await it (fire-and-forget) so a slow handler never
+ * blocks a tracker mutation. Handler errors are caught and swallowed
+ * to keep the tracker resilient — observability hooks (Phase 4) may
+ * upgrade this to log to diagnostics.
+ */
+export class WorkingSetEventBus {
+  private handlers: Set<WorkingSetEventHandler> = new Set()
+
+  subscribe(handler: WorkingSetEventHandler): () => void {
+    this.handlers.add(handler)
+    return () => {
+      this.handlers.delete(handler)
+    }
+  }
+
+  size(): number {
+    return this.handlers.size
+  }
+
+  emit(event: WorkingSetEvent): void {
+    for (const handler of this.handlers) {
+      try {
+        const result = handler(event)
+        if (result && typeof (result as Promise<unknown>).catch === 'function') {
+          // Fire-and-forget. We deliberately don't await — see class comment.
+          (result as Promise<unknown>).catch(() => { /* swallow */ })
+        }
+      } catch {
+        // Swallow handler errors to keep tracker mutations safe.
+      }
+    }
+  }
+}
+
 const WORKING_SET_ENTRY_VALUE_MAX_CHARS = 200
 
 export class WorkingSetTracker {
   private bySession = new Map<string, WorkingSet>()
+  // PR-26: workspaceId → set of sessionIds (per design §6.3 linkToWorkspace).
+  private workspaceIndex = new Map<string, Set<string>>()
+  // PR-26: event bus. Owned by tracker; subscribers attach via subscribe().
+  private bus = new WorkingSetEventBus()
 
   // Returns null when session has no tracked working set yet.
   get(sessionId: string): WorkingSet | null {
@@ -71,31 +125,41 @@ export class WorkingSetTracker {
   }
 
   // Apply a patch to an existing working set, or create a new one if absent.
-  // Returns the post-patch state.
+  // Returns the post-patch state. Emits `working_set_updated` on success
+  // (PR-26) so the WebSocket layer can fan out to subscribers.
   update(sessionId: string, patch: WorkingSetPatch): WorkingSet {
     const existing = this.bySession.get(sessionId)
     const now = new Date().toISOString()
+    let next: WorkingSet
     if (!existing) {
-      const ws: WorkingSet = {
+      next = {
         sessionId,
         workspaceId: patch.workspaceId ?? '',
         entries: clampEntries(patch.entries ?? []),
         version: patch.version ?? 1,
         updatedAt: now,
       }
-      this.bySession.set(sessionId, ws)
-      return ws
-    }
-    const next: WorkingSet = {
-      sessionId,
-      workspaceId: patch.workspaceId ?? existing.workspaceId,
-      entries: clampEntries(patch.entries ?? existing.entries),
-      // If caller provided an explicit version, use it (load path);
-      // otherwise bump from existing.
-      version: patch.version ?? existing.version + 1,
-      updatedAt: now,
+    } else {
+      next = {
+        sessionId,
+        workspaceId: patch.workspaceId ?? existing.workspaceId,
+        entries: clampEntries(patch.entries ?? existing.entries),
+        // If caller provided an explicit version, use it (load path);
+        // otherwise bump from existing.
+        version: patch.version ?? existing.version + 1,
+        updatedAt: now,
+      }
     }
     this.bySession.set(sessionId, next)
+    // Keep workspaceIndex in sync with the post-update workspaceId.
+    this.indexWorkspace(sessionId, next.workspaceId)
+    this.bus.emit({
+      type: 'working_set_updated',
+      sessionId,
+      workspaceId: next.workspaceId,
+      ws: next,
+      timestamp: now,
+    })
     return next
   }
 
@@ -105,8 +169,23 @@ export class WorkingSetTracker {
   }
 
   // Remove a session's working set. Used when session ends / is GC'd.
+  // Emits `working_set_reset` so subscribers can drop the session.
   reset(sessionId: string): void {
+    const existing = this.bySession.get(sessionId)
     this.bySession.delete(sessionId)
+    const workspaceId = existing?.workspaceId ?? ''
+    if (workspaceId) {
+      this.workspaceIndex.get(workspaceId)?.delete(sessionId)
+      if (this.workspaceIndex.get(workspaceId)?.size === 0) {
+        this.workspaceIndex.delete(workspaceId)
+      }
+    }
+    this.bus.emit({
+      type: 'working_set_reset',
+      sessionId,
+      workspaceId,
+      timestamp: new Date().toISOString(),
+    })
   }
 
   // Test-only: number of tracked sessions.
@@ -119,6 +198,65 @@ export class WorkingSetTracker {
   // each call (safe to mutate).
   entries(): Array<[string, WorkingSet]> {
     return Array.from(this.bySession.entries())
+  }
+
+  // ─── PR-26: event bus API (per design §7.3 working_set_updated push) ───
+
+  // Subscribe to all working-set mutations. Returns an unsubscribe fn.
+  subscribe(handler: WorkingSetEventHandler): () => void {
+    return this.bus.subscribe(handler)
+  }
+
+  // Number of active subscribers. Test/observability surface.
+  subscriberCount(): number {
+    return this.bus.size()
+  }
+
+  // ─── PR-26: cross-session workspace broadcast (per design §6.3) ───
+
+  // Register a session as belonging to a workspace. Idempotent.
+  linkToWorkspace(sessionId: string, workspaceId: string): void {
+    if (!workspaceId) return
+    if (!this.workspaceIndex.has(workspaceId)) {
+      this.workspaceIndex.set(workspaceId, new Set())
+    }
+    this.workspaceIndex.get(workspaceId)!.add(sessionId)
+  }
+
+  // Unregister a session from a workspace. No-op if not linked.
+  unlinkFromWorkspace(sessionId: string, workspaceId: string): void {
+    this.workspaceIndex.get(workspaceId)?.delete(sessionId)
+    if (this.workspaceIndex.get(workspaceId)?.size === 0) {
+      this.workspaceIndex.delete(workspaceId)
+    }
+  }
+
+  // All sessionIds currently linked to a workspace. Used by future
+  // WebSocket fan-out (PR-27 /v1/working-set/observe).
+  sessionsInWorkspace(workspaceId: string): string[] {
+    return Array.from(this.workspaceIndex.get(workspaceId) ?? [])
+  }
+
+  // Number of registered workspaces. Test/observability surface.
+  workspaceCount(): number {
+    return this.workspaceIndex.size
+  }
+
+  // Internal: keep workspaceIndex consistent with the latest workspaceId
+  // recorded for a session. Called from update(). Removes the sessionId
+  // from any other workspace's set first, so a workspace-change
+  // (ws-a → ws-b) leaves the old workspace correctly empty.
+  private indexWorkspace(sessionId: string, workspaceId: string): void {
+    for (const [wsId, members] of this.workspaceIndex) {
+      if (members.delete(sessionId) && members.size === 0) {
+        this.workspaceIndex.delete(wsId)
+      }
+    }
+    if (!workspaceId) return
+    if (!this.workspaceIndex.has(workspaceId)) {
+      this.workspaceIndex.set(workspaceId, new Set())
+    }
+    this.workspaceIndex.get(workspaceId)!.add(sessionId)
   }
 }
 

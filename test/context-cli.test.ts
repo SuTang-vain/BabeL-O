@@ -175,20 +175,15 @@ describe('PR-9 registerContextCommand integration', () => {
 // ─── Test helper ─────────────────────────────────────────────────────────
 
 function captureStdout(fn: () => void | Promise<void>): Promise<string> {
-  const original = process.stdout.write.bind(process.stdout)
+  const original = console.log
   let buf = ''
-  // Mock with a permissive signature that matches Node's real stdout.write
-  // (which accepts string | Uint8Array, optional encoding, optional callback).
-  // Use a function declaration to avoid strict signature checks.
-  function mockWrite(chunk: any, _encoding?: any, _cb?: any): boolean {
-    buf += typeof chunk === 'string' ? chunk : chunk.toString()
-    return true
+  console.log = (...args: unknown[]) => {
+    buf += args.map(arg => typeof arg === 'string' ? arg : JSON.stringify(arg)).join(' ') + '\n'
   }
-  ;(process.stdout.write as unknown) = mockWrite
   return Promise.resolve()
     .then(() => fn())
     .finally(() => {
-      ;(process.stdout.write as unknown) = original
+      console.log = original
     })
     .then(() => buf)
 }
