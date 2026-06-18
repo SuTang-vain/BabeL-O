@@ -62,6 +62,9 @@ var (
 	subtextStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colGray))
 
+	amber = lipgloss.NewStyle().
+		Foreground(lipgloss.Color(colAmber))
+
 	dividerStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color(colDivider))
 
@@ -788,15 +791,33 @@ func renderSidebarRow(r paneRow, model LoopModel, width int) string {
 
 	left := indent + glyph + "  " + kindLabel
 	middle := activityPart
-	var raw string
-	if statusPart != "" {
-		var gap int
-		if middle != "" {
-			gap = max(1, width-lipgloss.Width(left)-lipgloss.Width(middle)-lipgloss.Width(statusPart))
+	// SessionChannel TUI visibility Phase 1: append the
+	// inbox badge ("!N" / "!!") to the right side of
+	// the row, AFTER the status pill. This keeps the
+	// badge visible even on narrow terminals because
+	// padOrTruncate keeps the left part (label) and
+	// only trims the rightmost space; a badge in the
+	// "middle" position gets eaten by the activity
+	// field first.
+	var inboxBadge string
+	if r.Kind == paneRowPane && r.SessionID != "" {
+		inboxBadge = inboxBadgeForSession(model.SessionInbox, r.SessionID)
+	}
+	right := statusPart
+	if inboxBadge != "" {
+		// Gap between status pill and badge so they
+		// don't visually merge on wide terminals.
+		if right != "" {
+			right = right + " " + accentStyle.Render(inboxBadge)
 		} else {
-			gap = max(1, width-lipgloss.Width(left)-lipgloss.Width(statusPart))
+			right = accentStyle.Render(inboxBadge)
 		}
-		raw = glyphStyle.Render(left) + middle + strings.Repeat(" ", gap) + statusPart
+	}
+	var raw string
+	if right != "" {
+		middleWidth := lipgloss.Width(middle)
+		gap := max(1, width-lipgloss.Width(left)-middleWidth-lipgloss.Width(right))
+		raw = glyphStyle.Render(left) + middle + strings.Repeat(" ", gap) + right
 	} else {
 		raw = glyphStyle.Render(left) + middle
 	}
@@ -898,8 +919,9 @@ func formatPaneRowLineColored(r paneRow) string {
 
 // renderFocusedPane renders the framed box on the right
 // side of the body. The header line shows the focused pane
-// id, label, and a status pill. The body is a placeholder
-// until Phase 3f' wires the real transcript.
+// id, label, and a status pill. The body renders transcript
+// lines when the pane has seen Nexus events, otherwise it shows
+// a neutral wait-state placeholder.
 func renderFocusedPane(model LoopModel, width, height int) string {
 	if width <= 0 || height <= 0 {
 		return ""
@@ -909,7 +931,7 @@ func renderFocusedPane(model LoopModel, width, height int) string {
 
 	headerLine := renderFocusedPaneHeader(model, innerW)
 	divider := dividerStyle.Render(strings.Repeat("─", innerW))
-	body := renderFocusedPaneBody(model, innerW, innerH-2)
+	body := renderFocusedPaneBody(model, innerW, innerH-2, nil)
 
 	frame := frameStyle
 	if model.Focus.WorkspaceIdx >= 0 {
@@ -952,12 +974,10 @@ func renderFocusedPaneHeader(model LoopModel, width int) string {
 // (so operators can copy/paste a session id from the body);
 // the rest of the body is filled by either the pane's
 // transcript (Phase 6b) or, when Transcript is empty, the
-// historical "waiting for stream" placeholder. The placeholder
-// branch is what the live TUI falls into today — 6c will start
-// filling transcripts; the placeholder still applies to panes
-// that exist but haven't been attached to a stream yet (e.g.
-// a pane the user just opened with Ctrl+N before any events
-// have arrived).
+// "waiting for Nexus events" placeholder. The placeholder
+// applies to panes that exist but have not received replayed or
+// live events yet, e.g. a newly opened pane immediately after
+// Ctrl+N or a quiet persisted session after startup.
 //
 // Phase 6d-c: when the focused pane has a non-nil
 // PendingPermission, the body is replaced by the permission
@@ -966,7 +986,11 @@ func renderFocusedPaneHeader(model LoopModel, width int) string {
 // transcript lines are hidden until the operator decides,
 // because the runtime is blocked on the decision anyway
 // and the dialog is the only state the operator can act on.
-func renderFocusedPaneBody(model LoopModel, width, height int) string {
+func renderFocusedPaneBody(model LoopModel, width, height int, dialogStates ...*permDialogState) string {
+	var permDialog *permDialogState
+	if len(dialogStates) > 0 {
+		permDialog = dialogStates[0]
+	}
 	focused, ok := model.FocusedPane()
 	if !ok {
 		return padOrTruncate(mutedStyle.Render("  (no pane focused)"), width)
@@ -984,7 +1008,7 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 	// full body height; the operator can't type into the
 	// pane's input line until they decide.
 	if focused.PendingPermission != nil {
-		return renderPermissionDialog(focused.PendingPermission, width, height)
+		return renderPermissionDialog(focused.PendingPermission, width, height, permDialog)
 	}
 	// The full session id is shown so the legacy test
 	// contract (substring "session-1") keeps passing and
@@ -1010,7 +1034,7 @@ func renderFocusedPaneBody(model LoopModel, width, height int) string {
 		transcriptBody := renderTranscriptLines(focused, width, contentHeight-1)
 		lines = append(lines, splitLines(transcriptBody, width, contentHeight-1)...)
 	} else {
-		placeholder := mutedStyle.Render("  (waiting for stream — Phase 3f')")
+		placeholder := mutedStyle.Render("  (waiting for Nexus events)")
 		lines = append(lines, padOrTruncate(placeholder, width))
 	}
 	for len(lines) < contentHeight {
@@ -1059,16 +1083,21 @@ func renderPaneInputLine(pane PaneModel, width int) string {
 //	                                       (blank)
 //	  [Y/Enter] approve · [N] deny         (keybind hint)
 //
+// 6d-c'-B-stepC: when `state` is non-nil, the dialog renders
+// the sub-mode UI (scope picker / reason input / rule edit)
+// instead of the base Y/N hint. The state carries the
+// operator's in-progress selections and drafts.
+//
 // The dialog frames itself with the amber border (matches
 // the StatusDrift / StatusBehaviorHint palette) so the
 // operator notices it without it competing with a red
 // blocked state. Pure function: same perm + width/height
-// → same output.
+// + state → same output.
 //
 // The dialog is intentionally narrow-column-tolerant — it
 // clips the message with `…` when the body is too short to
 // show the full reason. Keybinds always stay visible.
-func renderPermissionDialog(perm *PanePermission, width, height int) string {
+func renderPermissionDialog(perm *PanePermission, width, height int, state *permDialogState) string {
 	if perm == nil {
 		return strings.Repeat(" ", max(0, width)*max(0, height))
 	}
@@ -1079,7 +1108,6 @@ func renderPermissionDialog(perm *PanePermission, width, height int) string {
 		return ""
 	}
 
-	amber := styleForStatus(StatusDrift)
 	dot := amber.Bold(true).Render("●")
 	title := amber.Render("permission required")
 	header := dot + " " + title
@@ -1110,11 +1138,6 @@ func renderPermissionDialog(perm *PanePermission, width, height int) string {
 		ruleLine = "suggested rule: " + rule
 	}
 
-	keys := mutedStyle.Render("[") + keyStyle.Render("Y/Enter") + mutedStyle.Render("]") +
-		mutedStyle.Render(" approve · ") +
-		mutedStyle.Render("[") + keyStyle.Render("N") + mutedStyle.Render("]") +
-		mutedStyle.Render(" deny")
-
 	// Compose the inner block.
 	inner := []string{padOrTruncate(header, width), ""}
 	if toolLine != "" {
@@ -1126,9 +1149,17 @@ func renderPermissionDialog(perm *PanePermission, width, height int) string {
 		inner = append(inner, "")
 		inner = append(inner, padOrTruncate(mutedStyle.Render(ruleLine), width))
 	}
-	// Vertical spacer before the keybinds.
 	inner = append(inner, "")
-	inner = append(inner, padOrTruncate(keys, width))
+
+	// 6d-c'-B-stepC: sub-mode rendering replaces the
+	// keybind line. The base dialog still shows the
+	// legacy Y/N hint; sub-modes show scope picker /
+	// reason draft / rule draft + their own keybinds.
+	if state != nil {
+		inner = append(inner, renderPermDialogSubMode(state, width)...)
+	} else {
+		inner = append(inner, renderPermDialogBaseKeys(width))
+	}
 
 	// Frame the inner block with the amber border.
 	frame := lipgloss.NewStyle().
@@ -1138,6 +1169,125 @@ func renderPermissionDialog(perm *PanePermission, width, height int) string {
 	framed := frame.Width(max(1, width-2)).Render(strings.Join(inner, "\n"))
 
 	return clampBlock(framed, width, height)
+}
+
+// renderPermDialogBaseKeys returns the legacy Y/N keybind
+// hint line, plus the 6d-c'-B-stepC sub-mode entry hints.
+func renderPermDialogBaseKeys(width int) string {
+	baseKeys := mutedStyle.Render("[") + keyStyle.Render("Y/Enter") + mutedStyle.Render("]") +
+		mutedStyle.Render(" approve · ") +
+		mutedStyle.Render("[") + keyStyle.Render("N") + mutedStyle.Render("]") +
+		mutedStyle.Render(" deny")
+	// Sub-mode entry hints: scope picker, deny reason, rule edit.
+	subHints := mutedStyle.Render("[") + keyStyle.Render("1/2/3") + mutedStyle.Render("]") +
+		mutedStyle.Render(" scope · ") +
+		mutedStyle.Render("[") + keyStyle.Render("D") + mutedStyle.Render("]") +
+		mutedStyle.Render(" reason · ") +
+		mutedStyle.Render("[") + keyStyle.Render("R") + mutedStyle.Render("]") +
+		mutedStyle.Render(" rule")
+	return padOrTruncate(baseKeys+"\n"+subHints, width)
+}
+
+// renderPermDialogSubMode renders the active sub-mode UI
+// lines. The three sub-modes are:
+//   - permDialogScope: scope picker with 1/2/3 selections
+//   - permDialogReason: deny reason text input
+//   - permDialogRule: approve rule edit
+func renderPermDialogSubMode(state *permDialogState, width int) []string {
+	switch state.Mode {
+	case permDialogScope:
+		return renderPermDialogScopePicker(state, width)
+	case permDialogReason:
+		return renderPermDialogReasonInput(state, width)
+	case permDialogRule:
+		return renderPermDialogRuleEdit(state, width)
+	default:
+		return []string{padOrTruncate(renderPermDialogBaseKeys(width), width)}
+	}
+}
+
+// renderPermDialogScopePicker renders the scope selection UI.
+// Shows 3 choices (once / session / rule) with a highlight
+// marker on the currently selected option.
+func renderPermDialogScopePicker(state *permDialogState, width int) []string {
+	scope := state.Scope
+	if scope == "" {
+		scope = "once"
+	}
+	mark := func(opt string) string {
+		if scope == opt {
+			return amber.Render("●") + " " + amber.Render(opt)
+		}
+		return mutedStyle.Render("○") + " " + mutedStyle.Render(opt)
+	}
+	lines := []string{
+		padOrTruncate(amber.Bold(true).Render("approval scope:"), width),
+		"",
+		padOrTruncate(mark("once")+mutedStyle.Render("    — this tool invocation only"), width),
+		padOrTruncate(mark("session")+mutedStyle.Render(" — all tools this session"), width),
+		padOrTruncate(mark("rule")+mutedStyle.Render("   — persistent allow-rule"), width),
+		"",
+		padOrTruncate(
+			mutedStyle.Render("[")+keyStyle.Render("1/2/3")+mutedStyle.Render("]")+
+				mutedStyle.Render(" select · ")+
+				mutedStyle.Render("[")+keyStyle.Render("Esc")+mutedStyle.Render("]")+
+				mutedStyle.Render(" back"),
+			width,
+		),
+	}
+	return lines
+}
+
+// renderPermDialogReasonInput renders the deny reason text
+// input UI. Shows the operator's draft with a cursor, plus
+// Enter/Esc keybind hints.
+func renderPermDialogReasonInput(state *permDialogState, width int) []string {
+	reason := state.Reason
+	cursor := amber.Render("▌")
+	display := reason
+	if display == "" {
+		display = mutedStyle.Render("(type a reason, then press Enter to deny)")
+	}
+	lines := []string{
+		padOrTruncate(amber.Bold(true).Render("deny reason:"), width),
+		"",
+		padOrTruncate("  "+display+cursor, width),
+		"",
+		padOrTruncate(
+			mutedStyle.Render("[")+keyStyle.Render("Enter")+mutedStyle.Render("]")+
+				mutedStyle.Render(" deny with reason · ")+
+				mutedStyle.Render("[")+keyStyle.Render("Esc")+mutedStyle.Render("]")+
+				mutedStyle.Render(" back"),
+			width,
+		),
+	}
+	return lines
+}
+
+// renderPermDialogRuleEdit renders the approve rule edit UI.
+// Shows the operator's draft rule with a cursor, plus
+// Enter/Esc keybind hints.
+func renderPermDialogRuleEdit(state *permDialogState, width int) []string {
+	rule := state.Rule
+	cursor := amber.Render("▌")
+	display := rule
+	if display == "" {
+		display = mutedStyle.Render("(edit the rule, then press Enter to approve)")
+	}
+	lines := []string{
+		padOrTruncate(amber.Bold(true).Render("approve rule:"), width),
+		"",
+		padOrTruncate("  "+display+cursor, width),
+		"",
+		padOrTruncate(
+			mutedStyle.Render("[")+keyStyle.Render("Enter")+mutedStyle.Render("]")+
+				mutedStyle.Render(" approve with rule · ")+
+				mutedStyle.Render("[")+keyStyle.Render("Esc")+mutedStyle.Render("]")+
+				mutedStyle.Render(" back"),
+			width,
+		),
+	}
+	return lines
 }
 
 // renderTranscriptLines turns a pane's Transcript into styled
@@ -1306,6 +1456,83 @@ func renderFooterLine(width int, binds []footerKeybind, info reconcileFooterInfo
 	return padOrTruncate(hint+strings.Repeat(" ", gap)+indicator, width)
 }
 
+// renderInboxIndicator formats the SessionChannel
+// indicator for the focused pane's inbox state (Phase 1
+// of session-channel-tui-relationship-visibility-plan.md).
+// Right-aligned next to the reconcile indicator on the
+// same line. Returns "" when there's no unread — the
+// chrome then leaves the slot empty so the footer
+// doesn't grow a permanent "inbox: 0 unread" cell.
+func renderInboxIndicator(model LoopModel, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	focused, ok := model.FocusedPane()
+	if !ok || focused.SessionID == "" {
+		return ""
+	}
+	resp, exists := model.SessionInbox[focused.SessionID]
+	if !exists || resp == nil {
+		return ""
+	}
+	// Pick the short form when width is tight; the long
+	// "inbox: N unread · high: X" form when there's
+	// room. Threshold mirrors the footer keybinds'
+	// truncation policy.
+	token := formatInboxFooterToken(resp)
+	if token == "" {
+		return ""
+	}
+	if width < 80 {
+		token = formatInboxFooterShort(resp)
+	}
+	return accentStyle.Render(token)
+}
+
+// renderFooterLineWithInbox is a thin wrapper over
+// renderFooterLine that adds the SessionChannel inbox
+// indicator to the right-aligned slot. Layout (right-
+// aligned): inbox indicator · reconcile indicator.
+// When both are present, the operator sees
+// "keybinds ··· in:3! rec: 1s ago"; when one is missing
+// the gap collapses and the remaining indicator slides
+// to the right edge.
+func renderFooterLineWithInbox(width int, binds []footerKeybind, info reconcileFooterInfo, inbox string) string {
+	if width <= 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(binds))
+	for _, b := range binds {
+		parts = append(parts, b.Render())
+	}
+	hint := strings.Join(parts, dividerStyle.Render(" · "))
+	indicator := renderReconcileIndicator(info)
+	// Combine the two right-side indicators. inbox goes
+	// first (closer to the hint) because it tends to be
+	// short and operator-actionable; reconcile is the
+	// fallback background signal.
+	right := inbox
+	if indicator != "" {
+		if right != "" {
+			right = right + dividerStyle.Render(" · ") + indicator
+		} else {
+			right = indicator
+		}
+	}
+	if right == "" {
+		return padOrTruncate(hint, width)
+	}
+	maxHintWidth := max(0, width-lipgloss.Width(right)-1)
+	hint = truncatePlain(hint, maxHintWidth)
+	hintW := lipgloss.Width(hint)
+	rightW := lipgloss.Width(right)
+	gap := max(1, width-hintW-rightW-1)
+	if gap+hintW+rightW > width {
+		return padOrTruncate(right, width)
+	}
+	return padOrTruncate(hint+strings.Repeat(" ", gap)+right, width)
+}
+
 // renderFooter is the bottom keybind hint bar. The base
 // hint is the always-visible key list; the right side
 // carries a transient reconcile indicator ("synced 3s
@@ -1325,8 +1552,13 @@ func renderFooterLine(width int, binds []footerKeybind, info reconcileFooterInfo
 // be misleading to add before the data layer supports them.
 func renderFooter(model LoopModel, width int, info reconcileFooterInfo, layout chromeLayout) string {
 	critical, workflow := footerKeybinds()
+	// SessionChannel TUI visibility Phase 1: focused
+	// pane's inbox indicator. Computed once so the
+	// "fits on one line?" probe sees the same right-
+	// side cost the actual render pays.
+	inbox := renderInboxIndicator(model, width)
 	if layout.Mode == layoutMobile {
-		line1 := renderFooterLine(width, critical, info)
+		line1 := renderFooterLineWithInbox(width, critical, info, inbox)
 		line2 := renderFooterLine(width, workflow, reconcileFooterInfo{})
 		return footerStyle.Render(line1 + "\n" + line2)
 	}
@@ -1339,14 +1571,22 @@ func renderFooter(model LoopModel, width int, info reconcileFooterInfo, layout c
 	// the operator see `?` for the rest.
 	fullHint := renderFooterHint(all)
 	fullIndicator := renderReconcileIndicator(info)
-	fullWidth := lipgloss.Width(fullHint)
+	right := inbox
 	if fullIndicator != "" {
-		fullWidth += lipgloss.Width(fullIndicator) + 1
+		if right != "" {
+			right = right + dividerStyle.Render(" · ") + fullIndicator
+		} else {
+			right = fullIndicator
+		}
 	}
-	if fullWidth <= width || (width >= 96 && fullIndicator == "") {
-		return footerStyle.Render(renderFooterLine(width, all, info))
+	fullWidth := lipgloss.Width(fullHint)
+	if right != "" {
+		fullWidth += lipgloss.Width(right) + 1
 	}
-	short := renderFooterLine(width, critical, info)
+	if fullWidth <= width || (width >= 96 && right == "") {
+		return footerStyle.Render(renderFooterLineWithInbox(width, all, info, inbox))
+	}
+	short := renderFooterLineWithInbox(width, critical, info, inbox)
 	return footerStyle.Render(short)
 }
 

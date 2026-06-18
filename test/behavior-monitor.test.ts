@@ -16,6 +16,7 @@ import {
   detectHotPath,
   detectToolStorm,
   detectScopeDriftWave,
+  detectPromptCacheMissWave,
   runBehaviorMonitor,
   shouldDispatchHint,
   type CrossSessionTrigger,
@@ -360,5 +361,139 @@ describe('PR-5 runBehaviorMonitor end-to-end', () => {
     // Second call (same trigger session) would be blocked — but each trigger
     // here is a different pattern, so 1 dispatch expected
     assert.ok(result.hintsDispatched >= 1)
+  })
+})
+
+describe('Phase D prompt-cache-miss-wave detector (plan §5.4)', () => {
+  const NOW = Date.now()
+  const RATIO_BELOW = 0.4   // < 0.85 target → below
+  const RATIO_OK    = 0.9   // > 0.85 → ok
+
+  function execMetrics(sid: string, ratio: number, tsOffset = -1000) {
+    return {
+      type: 'execution_metrics' as const,
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId: sid,
+      cwd: '/tmp',
+      timestamp: tsAt(NOW, tsOffset),
+      requestId: `r-${sid}`,
+      inputTokens: 100,
+      outputTokens: 50,
+      cacheCreationInputTokens: ratio > 0.85 ? 10 : 0,
+      cacheReadInputTokens: ratio > 0.85 ? 900 : 40,
+      cacheReadRatio: ratio,
+    } as unknown as NexusEvent
+  }
+
+  function sessionSlice(sid: string, ratio: number, tsOffset?: number) {
+    return { sessionId: sid, events: [execMetrics(sid, ratio, tsOffset ?? -1000)] }
+  }
+
+  test('fires when ≥ 3 sessions below target in window', () => {
+    const sessions = ['s1', 's2', 's3'].map(sid => sessionSlice(sid, RATIO_BELOW))
+    const found = detectPromptCacheMissWave(sessions, {
+      minSessions: 3, windowMs: 60_000, targetRatio: 0.85, now: NOW,
+    })
+    assert.equal(found.length, 1)
+    assert.equal(found[0]!.trigger, 'prompt-cache-miss-wave')
+    assert.equal(found[0]!.sessionIds.length, 3)
+    assert.equal(found[0]!.occurrenceCount, 3)
+    for (const sid of ['s1', 's2', 's3']) {
+      assert.ok(found[0]!.observedRatios[sid] !== undefined)
+    }
+  })
+
+  test('does not fire with only 2 sessions below target', () => {
+    const sessions = ['s1', 's2'].map(sid => sessionSlice(sid, RATIO_BELOW))
+    const found = detectPromptCacheMissWave(sessions, {
+      minSessions: 3, windowMs: 60_000, targetRatio: 0.85, now: NOW,
+    })
+    assert.equal(found.length, 0)
+  })
+
+  test('ignores sessions with ratio >= target', () => {
+    const sessions = [
+      sessionSlice('s-ok', RATIO_OK),
+      sessionSlice('s-low', RATIO_BELOW),
+      sessionSlice('s-low2', RATIO_BELOW),
+    ]
+    const found = detectPromptCacheMissWave(sessions, {
+      minSessions: 2, windowMs: 60_000, targetRatio: 0.85, now: NOW,
+    })
+    assert.equal(found.length, 1)
+    assert.equal(found[0]!.sessionIds.length, 2)
+    // s-ok should NOT be in the result
+    assert.ok(!found[0]!.sessionIds.includes('s-ok'))
+  })
+
+  test('fires via BehaviorMonitor.detectAll() when events have low ratios', () => {
+    const monitor = new BehaviorMonitor({
+      cwd: '/tmp',
+      rollingWindowMs: 60_000,
+      promptCacheMissWaveMinSessions: 2,
+      promptCacheMissWaveTargetRatio: 0.85,
+      now: () => NOW,
+    })
+    for (const sid of ['s1', 's2', 's3']) {
+      monitor.ingest(execMetrics(sid, RATIO_BELOW))
+    }
+    const triggers = monitor.detectAll()
+    // One of the triggers should be prompt-cache-miss-wave
+    const hit = triggers.filter(t => t.trigger === 'prompt-cache-miss-wave')
+    assert.equal(hit.length, 1)
+    assert.equal((hit[0] as any).sessionIds.length, 3)
+  })
+
+  test('detectAll() does not fire when ratios are ok', () => {
+    const monitor = new BehaviorMonitor({
+      cwd: '/tmp',
+      rollingWindowMs: 60_000,
+      promptCacheMissWaveMinSessions: 2,
+      promptCacheMissWaveTargetRatio: 0.85,
+      now: () => NOW,
+    })
+    for (const sid of ['s1', 's2', 's3']) {
+      monitor.ingest(execMetrics(sid, RATIO_OK))
+    }
+    const triggers = monitor.detectAll()
+    const hit = triggers.filter(t => t.trigger === 'prompt-cache-miss-wave')
+    assert.equal(hit.length, 0)
+  })
+
+  test('custom target ratio via options', () => {
+    const sessions = ['s1', 's2', 's3'].map(sid =>
+      sessionSlice(sid, 0.7), // 0.7 < 0.75 custom target
+    )
+    const found = detectPromptCacheMissWave(sessions, {
+      minSessions: 3, windowMs: 60_000, targetRatio: 0.75, now: NOW,
+    })
+    assert.equal(found.length, 1)
+    assert.equal(found[0]!.targetRatio, 0.75)
+  })
+
+  test('ignores sessions without execution_metrics', () => {
+    const sessions = ['s1', 's2', 's3'].map(sid => ({
+      sessionId: sid,
+      events: [{
+        type: 'user_message', schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+        sessionId: sid, cwd: '/tmp', timestamp: tsAt(NOW, -1000), text: 'hi',
+      }] as unknown as NexusEvent[],
+    }))
+    const found = detectPromptCacheMissWave(sessions, {
+      minSessions: 3, windowMs: 60_000, targetRatio: 0.85, now: NOW,
+    })
+    assert.equal(found.length, 0)
+  })
+
+  test('prefers latest execution_metrics per session', () => {
+    const s = { sessionId: 's1', events: [
+      execMetrics('s1', 0.9, -2000),   // ok, old
+      execMetrics('s1', 0.3, -1000),   // low, recent → wins
+    ]}
+    const found = detectPromptCacheMissWave([s], {
+      minSessions: 1, windowMs: 60_000, targetRatio: 0.85, now: NOW,
+    })
+    assert.equal(found.length, 1)
+    assert.equal(found[0]!.observedRatios['s1'], 0.3)
   })
 })

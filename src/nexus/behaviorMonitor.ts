@@ -42,6 +42,13 @@ export const DEFAULT_HOT_PATH_MIN_SESSIONS = 3
 export const DEFAULT_TOOL_STORM_CALLS_PER_MINUTE = 20
 export const DEFAULT_SCOPE_DRIFT_WAVE_MIN_SESSIONS = 3
 export const DEFAULT_HINT_COOLDOWN_MS = 5 * 60_000
+// Phase D of `cache-observability-and-nexus-realtime-detection-plan.md`:
+// detector defaults for `prompt-cache-miss-wave`. Triggered when
+// minSessions sessions all have a prompt cache read ratio below
+// targetRatio in the rolling window. Defaults: 3 sessions, 5min
+// window, 0.85 target (matches `DEFAULT_CACHE_HEALTH_TARGETS.prompt`).
+export const DEFAULT_PROMPT_CACHE_MISS_WAVE_MIN_SESSIONS = 3
+export const DEFAULT_PROMPT_CACHE_MISS_WAVE_TARGET_RATIO = 0.85
 
 export type BehaviorMonitorOptions = {
   cwd: string
@@ -50,6 +57,10 @@ export type BehaviorMonitorOptions = {
   toolStormCallsPerMinute?: number
   scopeDriftWaveMinSessions?: number
   hintCooldownMs?: number
+  /** Phase D: prompt-cache-miss-wave detector threshold. */
+  promptCacheMissWaveMinSessions?: number
+  /** Phase D: prompt cache target ratio. Default 0.85 (matches plan §4.2). */
+  promptCacheMissWaveTargetRatio?: number
   now?: () => number
 }
 
@@ -75,10 +86,24 @@ export type CrossSessionScopeDriftWave = {
   windowMs: number
 }
 
+// Phase D: prompt-cache-miss-wave — N sessions in windowMs all have
+// prompt cache read ratio below targetRatio. Carries the per-session
+// observed ratios so the trace entry + hint can show evidence, not
+// just a "below target" verdict.
+export type CrossSessionPromptCacheMissWave = {
+  trigger: 'prompt-cache-miss-wave'
+  sessionIds: string[]
+  occurrenceCount: number
+  windowMs: number
+  targetRatio: number
+  observedRatios: Record<string, number>
+}
+
 export type CrossSessionTrigger =
   | CrossSessionHotPath
   | CrossSessionToolStorm
   | CrossSessionScopeDriftWave
+  | CrossSessionPromptCacheMissWave
 
 export type CrossSessionAnomaly = {
   sessionIds?: string[]
@@ -88,6 +113,8 @@ export type CrossSessionAnomaly = {
   callsPerMinute?: number
   driftTarget?: string
   pattern?: string
+  targetRatio?: number
+  observedRatios?: Record<string, number>
 }
 
 export type HintCandidate = {
@@ -123,6 +150,14 @@ export type ToolStormOptions = {
 export type ScopeDriftWaveOptions = {
   minSessions: number
   windowMs: number
+  now?: number
+}
+
+// Phase D detector options
+export type PromptCacheMissWaveOptions = {
+  minSessions: number
+  windowMs: number
+  targetRatio: number
   now?: number
 }
 
@@ -290,6 +325,51 @@ export function detectScopeDriftWave(
   return out
 }
 
+// prompt-cache-miss-wave: ≥ N sessions in windowMs all have prompt
+// observedRatio < targetRatio. Phase D of
+// `cache-observability-and-nexus-realtime-detection-plan.md` §5.4.
+// Reads `cacheReadRatio` from `execution_metrics` events (carried by
+// LLMCodingRuntime per `src/runtime/runtimePipeline.ts:1187`).
+export function detectPromptCacheMissWave(
+  sessions: SessionEventSlice[],
+  options: PromptCacheMissWaveOptions,
+): CrossSessionPromptCacheMissWave[] {
+  const now = options.now ?? Date.now()
+  const observedRatios: Record<string, number> = {}
+  for (const slice of sessions) {
+    // Use the latest `execution_metrics` event in the window per session.
+    let latestRatio: number | undefined
+    let latestTs = -Infinity
+    for (const event of slice.events) {
+      if (event.type !== 'execution_metrics') continue
+      const e = event as Extract<NexusEvent, { type: 'execution_metrics' }>
+      const ts = Date.parse(e.timestamp)
+      if (!Number.isFinite(ts) || ts < now - options.windowMs) continue
+      if (ts < latestTs) continue
+      const ratio = e.cacheReadRatio
+      if (typeof ratio !== 'number' || !Number.isFinite(ratio)) continue
+      latestRatio = ratio
+      latestTs = ts
+    }
+    if (latestRatio === undefined) continue
+    if (latestRatio < options.targetRatio) {
+      observedRatios[slice.sessionId] = latestRatio
+    }
+  }
+  const sessionIds = Object.keys(observedRatios)
+  if (sessionIds.length < options.minSessions) return []
+  return [
+    {
+      trigger: 'prompt-cache-miss-wave',
+      sessionIds,
+      occurrenceCount: sessionIds.length,
+      windowMs: options.windowMs,
+      targetRatio: options.targetRatio,
+      observedRatios,
+    },
+  ]
+}
+
 // ─── Hint dispatch safety checks ────────────────────────────────────────
 
 // Returns true when ALL safety checks pass — caller may inject the hint.
@@ -333,6 +413,12 @@ export class BehaviorMonitor {
       toolStormCallsPerMinute: options.toolStormCallsPerMinute ?? DEFAULT_TOOL_STORM_CALLS_PER_MINUTE,
       scopeDriftWaveMinSessions: options.scopeDriftWaveMinSessions ?? DEFAULT_SCOPE_DRIFT_WAVE_MIN_SESSIONS,
       hintCooldownMs: options.hintCooldownMs ?? DEFAULT_HINT_COOLDOWN_MS,
+      promptCacheMissWaveMinSessions:
+        options.promptCacheMissWaveMinSessions ??
+        DEFAULT_PROMPT_CACHE_MISS_WAVE_MIN_SESSIONS,
+      promptCacheMissWaveTargetRatio:
+        options.promptCacheMissWaveTargetRatio ??
+        DEFAULT_PROMPT_CACHE_MISS_WAVE_TARGET_RATIO,
       now: options.now ?? (() => Date.now()),
     }
   }
@@ -383,6 +469,16 @@ export class BehaviorMonitor {
       ...detectScopeDriftWave(sessions, {
         minSessions: this.opts.scopeDriftWaveMinSessions,
         windowMs: this.opts.rollingWindowMs,
+        now: this.opts.now(),
+      }),
+      ...detectPromptCacheMissWave(sessions, {
+        minSessions:
+          this.opts.promptCacheMissWaveMinSessions ??
+          DEFAULT_PROMPT_CACHE_MISS_WAVE_MIN_SESSIONS,
+        windowMs: this.opts.rollingWindowMs,
+        targetRatio:
+          this.opts.promptCacheMissWaveTargetRatio ??
+          DEFAULT_PROMPT_CACHE_MISS_WAVE_TARGET_RATIO,
         now: this.opts.now(),
       }),
     ]
@@ -511,6 +607,24 @@ function crossSessionToAnomaly(t: CrossSessionTrigger): BehaviorTraceAnomaly & {
         errorMessage: `scope-drift-wave: ${t.driftTarget} (${t.sessionIds.length} sessions)`,
         source: 'nexus',
       }
+    case 'prompt-cache-miss-wave': {
+      // Build a compact message with the lowest observed ratio so the
+      // operator can see "how bad" the miss wave is. Ratios are kept
+      // as a comma-separated list in the message; structured
+      // observedRatios / targetRatio stay in the trigger payload.
+      const ratios = Object.entries(t.observedRatios)
+        .sort(([, a], [, b]) => a - b)
+        .map(([sid, r]) => `${sid}=${(r * 100).toFixed(1)}%`)
+        .join(', ')
+      return {
+        errorCode: 'PROMPT_CACHE_MISS_WAVE',
+        errorMessage:
+          `prompt-cache-miss-wave: ${t.sessionIds.length} sessions ` +
+          `below target ${(t.targetRatio * 100).toFixed(0)}% ` +
+          `(lowest ${ratios})`,
+        source: 'nexus',
+      }
+    }
   }
 }
 
@@ -537,7 +651,9 @@ export async function runBehaviorMonitor(
     traceEntriesQueued += 1
     const pattern = t.trigger === 'hot-path' ? t.pattern
       : t.trigger === 'tool-storm' ? t.toolName
-      : t.driftTarget
+      : t.trigger === 'scope-drift-wave' ? t.driftTarget
+      : t.trigger === 'prompt-cache-miss-wave' ? `prompt-cache-miss-wave:${t.sessionIds.length}`
+      : 'unknown'
     const candidate: HintCandidate = {
       trigger: t.trigger,
       sessionId,

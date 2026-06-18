@@ -23,9 +23,9 @@ import (
 // fakeNexus captures the request log so tests can assert
 // which endpoints the Reconciler hit.
 type fakeNexus struct {
-	mu        sync.Mutex
-	panes     map[string]api.LoopPaneState
-	upserted  []api.LoopPaneState
+	mu       sync.Mutex
+	panes    map[string]api.LoopPaneState
+	upserted []api.LoopPaneState
 }
 
 func newFakeNexus(seed []api.LoopPaneState) *fakeNexus {
@@ -131,6 +131,30 @@ func TestRunOnceReportsUnchangedWhenSnapshotsMatch(t *testing.T) {
 	}
 	if len(fake.upserted) != 0 {
 		t.Fatalf("unchanged snapshot should not upsert, got %+v", fake.upserted)
+	}
+}
+
+func TestRunOnceDoesNotPushInvalidLocalPane(t *testing.T) {
+	fake := newFakeNexus(nil)
+	r, store := newTestReconciler(t, fake)
+	if err := store.Replace(Snapshot{
+		Version: snapshotVersion,
+		Panes: []PaneStateEntry{
+			{PaneID: "pane-local", WorkspaceID: "ws-1", TabID: "ws-1:1", SessionID: "session-local-deadbeef", Agent: "bbl", Cwd: "/tmp", Label: "main", LastRev: 0},
+			{PaneID: "pane-empty-cwd", WorkspaceID: "ws-1", TabID: "ws-1:1", SessionID: "session-real", Agent: "bbl", Cwd: "", Label: "main", LastRev: 0},
+		},
+	}); err != nil {
+		t.Fatalf("Replace: %v", err)
+	}
+	result, err := r.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if result.Pushed != 0 {
+		t.Fatalf("invalid local panes should not be pushed, got %+v", result)
+	}
+	if len(fake.upserted) != 0 {
+		t.Fatalf("unexpected upserted panes: %+v", fake.upserted)
 	}
 }
 

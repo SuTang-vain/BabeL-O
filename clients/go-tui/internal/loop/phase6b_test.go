@@ -178,9 +178,9 @@ func TestBuildTranscriptRoleString(t *testing.T) {
 
 // TestRenderFocusedPaneBodyPlaceholderWhenTranscriptEmpty
 // asserts the fallback path: a pane with a SessionID but no
-// Transcript still renders the "waiting for stream" line so
+// Transcript still renders the "waiting for Nexus events" line so
 // the operator knows the pane is real. This is the live-TUI
-// behavior until 6c lands.
+// fallback for a real pane before replayed or live events arrive.
 func TestRenderFocusedPaneBodyPlaceholderWhenTranscriptEmpty(t *testing.T) {
 	model := NewLoopModel()
 	seeded, _ := seedPane(model, PaneModel{
@@ -202,7 +202,7 @@ func TestRenderFocusedPaneBodyPlaceholderWhenTranscriptEmpty(t *testing.T) {
 	if !strings.Contains(body, "rev=7") {
 		t.Fatalf("body should show lastRev=7, got %q", body)
 	}
-	if !strings.Contains(body, "waiting for stream") {
+	if !strings.Contains(body, "waiting for Nexus events") {
 		t.Fatalf("body should fall back to placeholder when transcript is empty, got %q", body)
 	}
 }
@@ -214,14 +214,14 @@ func TestRenderFocusedPaneBodyPlaceholderWhenTranscriptEmpty(t *testing.T) {
 func TestRenderFocusedPaneBodyRendersTranscript(t *testing.T) {
 	model := NewLoopModel()
 	seeded, _ := seedPane(model, PaneModel{
-		PaneID:      "pane-active",
-		WorkspaceID: defaultWSID,
-		TabID:       defaultTabID,
-		SessionID:   "session-active",
-		Agent:       "bbl",
-		Cwd:         "/repo",
-		Label:       "main",
-		Status:      StatusWorking,
+		PaneID:       "pane-active",
+		WorkspaceID:  defaultWSID,
+		TabID:        defaultTabID,
+		SessionID:    "session-active",
+		Agent:        "bbl",
+		Cwd:          "/repo",
+		Label:        "main",
+		Status:       StatusWorking,
 		LastEventRev: 12,
 		Transcript: []TranscriptItem{
 			{Role: RoleUser, Text: "explain the diff", Rev: 10},
@@ -242,7 +242,7 @@ func TestRenderFocusedPaneBodyRendersTranscript(t *testing.T) {
 	if !strings.Contains(body, "Bash: pytest -q") {
 		t.Fatalf("body should render the tool turn, got %q", body)
 	}
-	if strings.Contains(body, "waiting for stream") {
+	if strings.Contains(body, "waiting for Nexus events") {
 		t.Fatalf("body should NOT show placeholder when transcript has content, got %q", body)
 	}
 }

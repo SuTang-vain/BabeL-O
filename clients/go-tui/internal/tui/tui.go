@@ -58,6 +58,18 @@ type streamStartedMsg struct {
 	sessionID string
 }
 
+// sessionIDAllocatedMsg fires immediately after
+// ensureStreamSession succeeds, before the WebSocket
+// dials. Update uses it to set m.sessionID and
+// m.cfg.SessionID so slash commands that gate on
+// m.sessionID (`/context`, `/compact`, `/status`) see
+// the freshly-allocated server id without waiting for
+// the WebSocket round-trip + first event. Phase 1.2 of
+// go-tui-session-observability-governance-plan.md.
+type sessionIDAllocatedMsg struct {
+	sessionID string
+}
+
 type streamEventMsg struct {
 	event streamEvent
 }
@@ -2872,6 +2884,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.appendLine("error", "startup session: "+friendlyNexusRequestError(msg.err))
 			return m, nil
 		}
+		if strings.TrimSpace(msg.sessionID) != "" {
+			m.sessionID = strings.TrimSpace(msg.sessionID)
+			m.cfg.SessionID = m.sessionID
+		}
+		return m, nil
+
+	case sessionIDAllocatedMsg:
+		// Phase 1.2: server-allocated id lands in the
+		// model before the WebSocket dial. Update the
+		// same fields streamStartedMsg updates; the
+		// subsequent streamStartedMsg is idempotent so
+		// the same value lands twice.
 		if strings.TrimSpace(msg.sessionID) != "" {
 			m.sessionID = strings.TrimSpace(msg.sessionID)
 			m.cfg.SessionID = m.sessionID

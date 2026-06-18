@@ -300,4 +300,90 @@ describe('extractAbsolutePaths', () => {
     assert.equal(normalizeWrappedPathFragments(text), text)
     assert.deepEqual(extractAbsolutePaths(text), ['/tmp/project/docs/runtime'])
   })
+
+  test('drops CJK-only non-existent candidates like /信息 from 文档/信息', () => {
+    // Real regression: session_981cc5c2-230c-40d1-953c-b956e9dbaaf7 saw
+    // extractAbsolutePaths accept /信息 as a path and resolveCwdFromPrompt
+    // promote / to cwd. CJK-only basename on a non-existent path must be
+    // dropped so runtime does not mistake a natural-language slash fragment
+    // for an explicit path.
+    assert.deepEqual(extractAbsolutePaths('查看有无相关文档/信息'), [])
+  })
+
+  test('drops root-level CJK-only candidates like /信息 standalone', () => {
+    assert.deepEqual(extractAbsolutePaths('看 /信息 是否存在'), [])
+  })
+
+  test('drops CJK-only multi-segment candidates like /信息/归档', () => {
+    assert.deepEqual(extractAbsolutePaths('查 /信息/归档 的内容'), [])
+  })
+
+  test('still keeps real ASCII paths mixed with CJK prose', () => {
+    const paths = extractAbsolutePaths('查看 /etc/hosts 并 阅读 文档/信息 内容')
+    assert.ok(
+      paths.includes('/etc/hosts'),
+      `Expected /etc/hosts in ${JSON.stringify(paths)}`,
+    )
+    assert.ok(
+      !paths.some(p => p.includes('信息')),
+      `Did not expect CJK fragment in ${JSON.stringify(paths)}`,
+    )
+  })
+
+  // Phase A Follow-up (2026-06-18): session_cf361f04 surfaced 5 prose
+  // classes that the original CJK-only guard did not catch. These tests
+  // pin the post-fix behavior; regressions here mean cwd drift will
+  // reappear the next time a real session pastes URL-heavy prose.
+  test('drops bare-English-word prose paths like /while /memory /if', () => {
+    assert.deepEqual(extractAbsolutePaths('call /while in the loop'), [])
+    assert.deepEqual(extractAbsolutePaths('查 /memory 里的内容'), [])
+    assert.deepEqual(extractAbsolutePaths('use /if we want to gate'), [])
+  })
+
+  test('drops trailing-slash bare-Latin prose paths like /memory/', () => {
+    // Without this guard, /memory/ → resolvePromptPath('/memory/') yields
+    // '/memory/' (no existing parent), then resolveCwdFromPrompt falls
+    // back to dirname('/memory/') = '/', drifting cwd to root.
+    assert.deepEqual(extractAbsolutePaths('打开 /memory/ 目录'), [])
+  })
+
+  test('drops CJK-with-em-dash prose paths like /目录——一条编号递进的学习阶梯', () => {
+    // The pre-fix regex `/^[\p{Script=Han}]+$/u` rejected em-dash (U+2014,
+    // script=Common) so the guard never fired for CJK prose with
+    // punctuation. Post-fix the guard accepts Han+Common so the candidate
+    // is correctly dropped when the path does not exist on disk.
+    assert.deepEqual(extractAbsolutePaths('阅读 /目录——一条编号递进的学习阶梯 这条规则'), [])
+  })
+
+  test('drops mixed-language prose paths like /Layer是变换这份数据的可组合单元', () => {
+    // CJK + Latin prose phrase. isCjkMixedBasename matches because the
+    // basename has at least one Han character and is not pure
+    // Latin+punctuation. Path does not exist on disk → dropped.
+    assert.deepEqual(extractAbsolutePaths('看一下 /Layer是变换这份数据的可组合单元'), [])
+  })
+
+  test('drops URL and protocol-relative URL fragments', () => {
+    // session_cf361f04 saw `https://www.openrath.com/` and `//www.openrath.com/`
+    // get treated as local paths; resolvePromptPath then collapsed them to
+    // '/', drifting cwd. The URL guard runs before the path pattern.
+    assert.deepEqual(extractAbsolutePaths('阅读 https://www.openrath.com/agent-architecture'), [])
+    assert.deepEqual(extractAbsolutePaths('参考 //www.openrath.com/archive/2025-12'), [])
+    assert.deepEqual(extractAbsolutePaths('https://docs.openrath.com/spec/loop 上的设计'), [])
+  })
+
+  test('keeps real system paths without file extension like /etc/hosts and /bin/bash', () => {
+    // These paths exist on disk; the existence check in extractAbsolutePaths
+    // short-circuits the prose guard so they survive. Without this branch
+    // the multi-segment-Latin-without-ext heuristic in looksLikeProseFragment
+    // would drop them.
+    const paths = extractAbsolutePaths('查 /etc/hosts 和 /bin/bash 的内容')
+    assert.ok(paths.includes('/etc/hosts'), `Expected /etc/hosts in ${JSON.stringify(paths)}`)
+    assert.ok(paths.includes('/bin/bash'), `Expected /bin/bash in ${JSON.stringify(paths)}`)
+  })
+
+  test('preserves a real absolute path inside prose', () => {
+    const realPath = '/tmp'
+    const paths = extractAbsolutePaths(`请看 ${realPath} 下的文件`)
+    assert.ok(paths.includes(realPath), `Expected ${realPath} in ${JSON.stringify(paths)}`)
+  })
 })

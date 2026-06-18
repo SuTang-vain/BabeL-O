@@ -1,85 +1,89 @@
 # Cache Observability and Nexus Realtime Detection Plan
 
-> 状态：v1 草案（2026-06-17）
-> 范围：把现有 Prompt Cache / prefix cache 观测接入 Nexus realtime health；同时为 Code Index Cache、Tool Cache、Reasoning Cache 建立明确的 unavailable 口径，避免伪造命中率。
-> 相关：[`context-management-optimization-plan.md`](./context-management-optimization-plan.md), [`behavior-monitor.md`](./behavior-monitor.md), [`go-tui-loop-multipane-plan.md`](./go-tui-loop-multipane-plan.md)
+> State: Active Plan
+> Track: Context Cache / Runtime Observability / Realtime Detection
+> Priority: P2 (Phases A–D 收口 2026-06-17; Phase E long-term Watch)
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_performance.md](../active/TODO_performance.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/`, `src/providers/`, `src/storage/`
+> Governance: Indexed by [context-governance-index.md](./context-governance-index.md). This document owns cache observability planning; unavailable cache families must stay explicitly unavailable.
+
+**Status (2026-06-17)**: upgraded from Draft to Active Plan. **Phase A, Phase B, Phase C, and Phase D are all 收口** — see `WORK_LOG.md` 2026-06-17 entries and the per-phase subsections (§5.1, §5.2, §5.3, §5.4) for implementation details. Phase A (`cacheHealth.ts` pure functions + `/v1/runtime/metrics` enrichment). Phase B (per-session aggregation path — reused the existing `events` slice already fetched by `/v1/runtime/loop/health`; no `getExecutionMetrics(sessionId)` call needed). Phase C (eventized `cache_health` event — `CacheHealthEventSchema` + `CacheHealthEventDedup` + `maybeBuildCacheHealthEventFromExecutionMetrics` wired into both HTTP and WebSocket event yield points). Phase D (Behavior Monitor `prompt-cache-miss-wave` detector — `detectPromptCacheMissWave` reads `execution_metrics.cacheReadRatio` per session; `BehaviorTrigger` union extended; wired into `BehaviorMonitor.detectAll()`). **Phase E (future real caches) remains the only open phase** and is long-term Watch.
 
 ---
 
-## 1. 背景
+## 1. Background
 
-BabeL-O 已经有一部分 cache 相关 telemetry：
+BabeL-O already has some cache-related telemetry:
 
-- provider usage delta 暴露 `cacheCreationInputTokens` / `cacheReadInputTokens`；
-- `execution_metrics` 事件保存 `cacheReadRatio`；
-- `NexusMetrics` 在 `/v1/runtime/metrics` 和 `/v1/runtime/status` 汇总 token/cache 数据；
-- prefix cache diagnostics 暴露 immutable prefix ratio、fingerprint、volatile-content-last；
-- cache-aware compact policy 会读取 cache reuse 指标来调整 compact 策略。
+- provider usage deltas expose `cacheCreationInputTokens` / `cacheReadInputTokens`;
+- `execution_metrics` events store `cacheReadRatio`;
+- `NexusMetrics` aggregates token/cache data in `/v1/runtime/metrics` and `/v1/runtime/status`;
+- prefix cache diagnostics expose immutable prefix ratio, fingerprint, and volatile-content-last;
+- cache-aware compact policy reads cache reuse metrics to adjust compact strategy.
 
-这些能力足以观测 **Prompt Cache** 的一部分真实效果，但还没有形成统一的 cache health 协议，也没有和 Nexus realtime detection / `bbl loop` health 结合。
+These capabilities are enough to observe part of real **Prompt Cache** behavior, but there is no unified cache-health protocol yet and no integration with Nexus realtime detection / `bbl loop` health.
 
-用户提出的目标值：
+User-proposed targets:
 
-| 维度 | 目标命中率 |
+| Dimension | Target hit rate |
 | --- | ---: |
 | Prompt Cache | 85% |
 | Code Index Cache | 90% |
 | Tool Cache | 50% |
 | Reasoning Cache | 10% |
 
-当前源码核对结论：
+Current source-audit conclusion:
 
-| 维度 | 当前可评估性 | 说明 |
+| Dimension | Current evaluability | Notes |
 | --- | --- | --- |
-| Prompt Cache | 可部分评估 | provider 返回 cache read/create tokens 时，可计算 `cacheReadRatio`。 |
-| Code Index Cache | 不可评估 | 尚无 code index cache 子系统或 hit/miss 事件。 |
-| Tool Cache | 不可评估 | 有 tool call count / duration，但无 tool result cache hit/miss。 |
-| Reasoning Cache | 不可评估 | 有 reasoning token / replay 相关观测，但无 reasoning cache hit/miss。 |
+| Prompt Cache | Partially evaluable | When provider returns cache read/create tokens, `cacheReadRatio` can be computed. |
+| Code Index Cache | Not evaluable | No code index cache subsystem or hit/miss events yet. |
+| Tool Cache | Not evaluable | Tool call count / duration exists, but no tool result cache hit/miss exists. |
+| Reasoning Cache | Not evaluable | Reasoning token / replay observations exist, but no reasoning cache hit/miss exists. |
 
-本规划目标不是立即补齐所有 cache 类型，而是先建立**诚实的观测协议**：能算的算，不能算的标 `unavailable`，并把低于目标的真实指标接入 Nexus 实时健康视图。
+This plan does not try to implement every cache type immediately. It first establishes an **honest observability protocol**: calculate what can be calculated, mark what cannot as `unavailable`, and feed real below-target metrics into Nexus realtime health.
 
 ---
 
-## 2. 设计原则
+## 2. Design Principles
 
 ### 2.1 Runtime/Nexus owns truth
 
-Cache hit rate 是 runtime/provider/storage 事实，不能由 Go TUI、CLI 或模型叙事自行推导。
+Cache hit rate is a runtime/provider/storage fact. Go TUI, CLI, or model narrative must not infer it locally.
 
-- Runtime 负责产出 per-turn `execution_metrics`。
-- Storage 负责持久化可复盘指标。
-- Nexus 负责滚动窗口聚合、阈值评估和 realtime projection。
-- Client 只渲染 `cacheHealth` / `signals` / `status`。
+- Runtime produces per-turn `execution_metrics`.
+- Storage persists replayable metrics.
+- Nexus owns rolling-window aggregation, threshold evaluation, and realtime projection.
+- Clients only render `cacheHealth` / `signals` / `status`.
 
-### 2.2 不把 unavailable 伪装成 0%
+### 2.2 Do Not Pretend Unavailable Is 0%
 
-0% 表示“有样本，且确实未命中”；`unavailable` 表示“没有对应观测口径”。
+0% means “there are samples and they really missed”; `unavailable` means “there is no corresponding observation contract.”
 
-这点对 Code Index / Tool / Reasoning Cache 尤其重要。否则 UI 上的 0% 会误导用户以为系统实现了这些 cache，只是表现很差。
+This is especially important for Code Index / Tool / Reasoning Cache. Showing 0% would mislead users into thinking those caches exist but perform poorly.
 
-### 2.3 Prompt Cache 分清两类指标
+### 2.3 Separate Prompt Cache Metrics
 
-| 指标 | 含义 | 是否等同 hit rate |
+| Metric | Meaning | Equivalent to hit rate? |
 | --- | --- | --- |
-| `cacheReadRatio` | cached read tokens / total prompt-side tokens | 接近 token-weighted hit rate |
-| `prefixCacheImmutableRatio` | system prompt 中稳定 prefix 的字符比例 | 不是命中率，只是可缓存性/稳定性指标 |
-| `prefixCacheFingerprint` | cacheable prefix 的稳定 fingerprint | 不是命中率，用于 drift/debug |
+| `cacheReadRatio` | cached read tokens / total prompt-side tokens | Close to token-weighted hit rate |
+| `prefixCacheImmutableRatio` | stable prefix character ratio in system prompt | Not hit rate; only cacheability/stability indicator |
+| `prefixCacheFingerprint` | stable fingerprint of cacheable prefix | Not hit rate; used for drift/debug |
 
-实时评估的 Prompt Cache 主指标使用 `cacheReadRatio`。prefix cache diagnostics 作为解释字段，不参与目标值判定。
+Realtime Prompt Cache evaluation uses `cacheReadRatio` as the main metric. Prefix cache diagnostics are explanatory fields and do not participate in target evaluation.
 
-### 2.4 低 cache hit 不应覆盖高优先级运行状态
+### 2.4 Low Cache Hit Must Not Override Higher-priority Runtime State
 
-`blocked`、`drift`、`waiting_permission`、scope boundary、timeout/context grounding 仍是 pane health 的更高优先级事实。
+`blocked`, `drift`, `waiting_permission`, scope boundary, timeout, and context grounding remain higher-priority pane-health facts.
 
-Cache health 应先作为 `signals` / `attention` 字段出现；只有在明确设计新的 status priority 后，才允许影响 pane `status`。
+Cache health should first appear as `signals` / `attention`; it may affect pane `status` only after a new status priority is explicitly designed.
 
 ---
 
-## 3. 现有接入点
+## 3. Existing Integration Points
 
 ### 3.1 Runtime event
 
-`execution_metrics` 已包含：
+`execution_metrics` already contains:
 
 - `inputTokens`
 - `outputTokens`
@@ -91,11 +95,11 @@ Cache health 应先作为 `signals` / `attention` 字段出现；只有在明确
 - `prefixCacheVolatileContentLast`
 - `prefixCacheFingerprint`
 
-当前事件 schema 位于 `src/shared/events.ts`。
+The current event schema lives in `src/shared/events.ts`.
 
-### 3.2 Runtime aggregation
+### 3.2 Runtime Aggregation
 
-`NexusMetrics.recordTokenUsage()` 和 `NexusMetrics.snapshot()` 已汇总：
+`NexusMetrics.recordTokenUsage()` and `NexusMetrics.snapshot()` already aggregate:
 
 ```ts
 tokenUsage: {
@@ -107,7 +111,7 @@ tokenUsage: {
 }
 ```
 
-`contextPolicy.prefixCache` 已汇总：
+`contextPolicy.prefixCache` already aggregates:
 
 ```ts
 prefixCache: {
@@ -118,27 +122,27 @@ prefixCache: {
 }
 ```
 
-### 3.3 Storage replay
+### 3.3 Storage Replay
 
-`execution_metrics` 已进入 SQLite / Memory storage，`getExecutionMetrics(sessionId)` 返回 session 最新指标。
+`execution_metrics` already enters SQLite / Memory storage, and `getExecutionMetrics(sessionId)` returns the latest metrics for a session.
 
-这意味着 realtime detection 可以同时支持：
+This means realtime detection can support:
 
-- in-process cumulative view：快速展示当前 Nexus 进程内累计状态；
-- session replay view：从最近 session events / metrics 重新聚合；
-- pane-local view：`/v1/runtime/loop/health` 针对某个 session 的 recent event slice 派生。
+- in-process cumulative view: quickly show cumulative state inside the current Nexus process;
+- session replay view: re-aggregate from recent session events / metrics;
+- pane-local view: derive from a recent event slice for one session in `/v1/runtime/loop/health`.
 
-### 3.4 Realtime surfaces
+### 3.4 Realtime Surfaces
 
-现有可复用 surface：
+Existing reusable surfaces:
 
-| Surface | 当前职责 | Cache 接入方式 |
+| Surface | Current responsibility | Cache integration |
 | --- | --- | --- |
-| `/v1/runtime/metrics` | 进程级 runtime metrics | 增加 `cacheHealth` 聚合 |
-| `/v1/runtime/status` | Go TUI / client 轮询的 runtime 状态 | 增加 `cacheHealth.summary` |
-| `/v1/runtime/loop/health` | bbl loop pane health | 每个 pane 增加 `cacheHealth` / `signals` |
-| `/v1/sessions/:id/wait` | per-pane event long poll | 可传递未来新增的 `cache_health` event |
-| Behavior trace | 跨 session 异常轨迹 | 低命中率达到窗口阈值时可写 trace |
+| `/v1/runtime/metrics` | Process-level runtime metrics | Add `cacheHealth` aggregation |
+| `/v1/runtime/status` | Runtime status polled by Go TUI / clients | Add `cacheHealth.summary` |
+| `/v1/runtime/loop/health` | bbl loop pane health | Add `cacheHealth` / `signals` per pane |
+| `/v1/sessions/:id/wait` | Per-pane event long poll | Can carry future `cache_health` event |
+| Behavior trace | Cross-session anomaly trajectory | Can write trace when low hit rate crosses a window threshold |
 
 ---
 
@@ -146,7 +150,7 @@ prefixCache: {
 
 ### 4.1 CacheHealth schema
 
-建议新增内部类型：
+Suggested new internal type:
 
 ```ts
 type CacheDimension = 'prompt' | 'code_index' | 'tool' | 'reasoning'
@@ -184,9 +188,9 @@ type CacheHealthSnapshot = {
 }
 ```
 
-### 4.2 Default targets
+### 4.2 Default Targets
 
-默认目标值：
+Default targets:
 
 ```ts
 const DEFAULT_CACHE_HEALTH_TARGETS = {
@@ -197,11 +201,11 @@ const DEFAULT_CACHE_HEALTH_TARGETS = {
 }
 ```
 
-后续可加 env/config override，但 v1 不需要先做配置面。
+Env/config overrides can be added later, but v1 does not need a configuration surface first.
 
-### 4.3 Prompt Cache evaluation
+### 4.3 Prompt Cache Evaluation
 
-Prompt Cache 的可观测判断：
+Prompt Cache observability decision:
 
 ```text
 provider has cache token samples
@@ -215,20 +219,20 @@ has samples and observedRatio < target
   => warning or critical
 ```
 
-建议阈值：
+Suggested thresholds:
 
-| 条件 | 状态 |
+| Condition | Status |
 | --- | --- |
 | sampleCount = 0 | `unavailable` |
 | observedRatio >= target | `ok` |
 | observedRatio >= target * 0.75 | `warning` |
 | observedRatio < target * 0.75 | `critical` |
 
-v1 可以先只输出 `ok/warning/unavailable`，避免 noisy critical。
+v1 may output only `ok/warning/unavailable` first to avoid noisy critical states.
 
-### 4.4 Unavailable dimensions
+### 4.4 Unavailable Dimensions
 
-在没有 hit/miss 事件前：
+Before hit/miss events exist:
 
 ```text
 Code Index Cache => unavailable(reason='code_index_cache_not_implemented')
@@ -236,45 +240,47 @@ Tool Cache       => unavailable(reason='tool_result_cache_not_implemented')
 Reasoning Cache  => unavailable(reason='reasoning_cache_not_reported')
 ```
 
-这三个维度必须显示目标值，但不得显示 0%。
+These three dimensions must show targets but must not show 0%.
 
 ---
 
 ## 5. Nexus Realtime Detection Integration
 
-### 5.1 Phase A — metrics-only cacheHealth
+### 5.1 Phase A — Metrics-only cacheHealth
 
-目标：不新增事件，只在 `/v1/runtime/metrics` 和 `/v1/runtime/status` 中增加 `cacheHealth`。
+Goal: add `cacheHealth` only to `/v1/runtime/metrics` and `/v1/runtime/status` without adding new events.
 
-实现建议：
+Implementation suggestion:
 
-1. 新增 `src/nexus/cacheHealth.ts`：
+1. Add `src/nexus/cacheHealth.ts`:
    - `buildCacheHealthFromRuntimeMetrics(snapshot)`
    - `buildCacheHealthFromEvents(events, options)`
    - `evaluateCacheDimension(...)`
-2. `buildRuntimeMetricsSnapshot()` 调用 cache health builder。
-3. `/v1/runtime/status` 自动携带 `metrics.cacheHealth`。
-4. 添加 regression：
+2. `buildRuntimeMetricsSnapshot()` calls the cache health builder.
+3. `/v1/runtime/status` automatically carries `metrics.cacheHealth`.
+4. Add regressions:
    - provider cache read ratio 0.90 => prompt ok；
    - provider cache read ratio 0.40 => prompt warning；
    - no cache token samples => prompt unavailable；
-   - code/tool/reasoning 三项 unavailable。
+   - code/tool/reasoning remain unavailable.
 
-验收：
+Acceptance:
 
-- `GET /v1/runtime/metrics` 能看到四个维度；
-- 只有 Prompt Cache 有真实 observed ratio；
-- 不改变现有 `tokenUsage` shape。
+- `GET /v1/runtime/metrics` shows all four dimensions;
+- only Prompt Cache has a real observed ratio;
+- existing `tokenUsage` shape is unchanged.
 
-### 5.2 Phase B — loop health pane projection
+### 5.2 Phase B — Loop Health Pane Projection
 
-目标：让 `bbl loop` 能在每个 pane 上看到 cache health，但不改变 pane 主状态优先级。
+**Status (2026-06-17)**: ✅ Phase B 收口.
 
-实现建议：
+Implementation landed:
 
-1. `/v1/runtime/loop/health` 对每个 session 读取最近事件切片；
-2. 从其中的 `execution_metrics` 构造 pane-level `cacheHealth`；
-3. pane payload 增加：
+1. `/v1/runtime/loop/health` already fetches per-session `events: NexusEvent[]` slices with `query.lastN` window — reused for cache health projection (no extra storage call).
+2. `buildCacheHealthFromEvents(events, { sessionId, lastN, kind: 'pane' })` constructed per-pane.
+3. Pane payload now carries sibling `cacheHealth: CacheHealthSnapshot` field; primary `status` is unchanged.
+
+Implementation suggestion (original, kept for reference):
 
 ```ts
 cacheHealth: CacheHealthSnapshot
@@ -287,19 +293,38 @@ signals: [
 ]
 ```
 
-4. Go TUI 只渲染 attention badge，不本地计算命中率。
+4. Go TUI only renders attention badges and does not calculate hit rate locally.
 
-验收：
+Acceptance:
 
-- `blocked/drift/waiting/done` 状态不被 cache warning 覆盖；
-- pane 中可见 prompt cache below target；
-- unavailable 维度不产生 warning。
+- `blocked/drift/waiting/done` states are not overridden by cache warning;
+- prompt cache below target is visible in pane;
+- unavailable dimensions do not produce warnings.
 
-### 5.3 Phase C — eventized cache health
+Validation (`test/cache-health.test.ts` T18 + T19):
+- Wide `NexusEvent[]` slice with mixed event types is accepted; internal filter counts only `execution_metrics` events in `sampleCount`.
+- `kind: 'pane'` propagates to `CacheHealthSnapshot.window.kind`.
+- Status priority: `cacheHealth.status` is independent of pane `status`; route handler keeps them as siblings.
 
-目标：在每轮执行结束时可选生成 `cache_health` 事件，供 `/v1/sessions/:id/wait` 和 transcript 使用。
+Phase C note: the `signals` array shape (above) is deferred to Phase C; Phase B only attaches the structured `cacheHealth` snapshot.
 
-建议新增事件：
+### 5.3 Phase C — Eventized Cache Health
+
+**Status (2026-06-17)**: ✅ Phase C 收口.
+
+Implementation landed:
+
+- `src/shared/events.ts` adds `CacheHealthEventSchema` (discriminated union by `type: 'cache_health'`). Schema includes `sessionId` / `requestId` / `cacheHealth` / `trigger`.
+- `src/nexus/cacheHealth.ts` adds:
+  - `buildCacheHealthEvent({ sessionId, cwd, requestId, cacheHealth, trigger, now })`: returns `undefined` when `summary.status === 'ok'`, else returns the structured event.
+  - `CacheHealthEventDedup` class: per-session FIFO set, 256-entry cap, `shouldEmit(sessionId, requestId)` API.
+  - Module-level singleton `globalCacheHealthDedup` (mirrors `defaultContextBroadcaster` pattern). HTTP and WebSocket paths share the same dedup state.
+  - `maybeBuildCacheHealthEventFromExecutionMetrics(event, cwd)`: aggregates token usage from the `execution_metrics` event, builds the snapshot, applies dedup, returns event or `undefined`.
+- `src/nexus/app.ts` wires `maybeEmitCacheHealthEvent` into both the HTTP `/v1/execute` and WebSocket `/v1/stream` event yield points. The returned event is appended to `events` and persisted via `storage.appendEvent`; the WebSocket path also forwards via `sendJson`.
+
+Goal: optionally generate a `cache_health` event after each turn for `/v1/sessions/:id/wait` and transcript use.
+
+Suggested new event:
 
 ```ts
 {
@@ -310,56 +335,86 @@ signals: [
 }
 ```
 
-约束：
+Constraints:
 
-- 只在 execution_metrics 后生成；
-- v1 可只在 status != ok 时生成；
-- event schema 必须稳定，避免 client 解析碎片化。
+- Generate only after execution_metrics;
+- v1 may generate only when status != ok;
+- event schema must be stable to avoid fragmented client parsing.
 
-验收：
+Acceptance:
 
-- per-pane wait 能收到 cache health warning；
-- session replay 可以复盘 cache health；
-- 不重复发同一 requestId 的相同 warning。
+- per-pane wait can receive cache health warning;
+- session replay can reconstruct cache health;
+- do not emit duplicate identical warnings for the same requestId.
 
-### 5.4 Phase D — Behavior Monitor bridge
+Validation (`test/cache-health.test.ts` T20-T28):
+- `buildCacheHealthEvent` returns `undefined` for `ok` status, structured event for `warning` / `critical`.
+- Dedup: same `(sessionId, requestId)` returns `false`; different `requestId` or `sessionId` returns `true`.
+- Dedup caps at 256 entries per session.
+- `maybeBuildCacheHealthEventFromExecutionMetrics` short-circuits on non-`execution_metrics` events.
+- `ok` status execution_metrics does not emit even on first call.
 
-目标：当多个 session 在短窗口内都出现 Prompt Cache 低命中时，写入 behavior trace，并可触发 live hint。
+### 5.4 Phase D — Behavior Monitor Bridge
 
-新增 detector：
+**Status (2026-06-17)**: ✅ Phase D 收口.
+
+The ingestion wiring blocker documented in the original plan note below was resolved earlier the same day (see `WORK_LOG.md` 2026-06-17 "BehaviorMonitor ingest wiring 收口"). With that prerequisite satisfied, the detector is now implemented and wired into `BehaviorMonitor.detectAll()`.
+
+Implementation landed:
+
+- `src/runtime/behaviorTrace.ts`: `BehaviorTrigger` union extended with `'prompt-cache-miss-wave'`.
+- `src/nexus/behaviorMonitor.ts`:
+  - New `DEFAULT_PROMPT_CACHE_MISS_WAVE_MIN_SESSIONS = 3` + `DEFAULT_PROMPT_CACHE_MISS_WAVE_TARGET_RATIO = 0.85` constants.
+  - New `CrossSessionPromptCacheMissWave` type joined to the `CrossSessionTrigger` union (carries `sessionIds`, `observedRatios: Record<sessionId, ratio>`, `targetRatio`, `windowMs`, `occurrenceCount`).
+  - `BehaviorMonitorOptions` extended with `promptCacheMissWaveMinSessions` + `promptCacheMissWaveTargetRatio`; constructor + `this.opts` default to the constants; `detectAll()` now runs the new detector.
+  - `detectPromptCacheMissWave(sessions, options)`: per session, picks the **latest** `execution_metrics.cacheReadRatio` inside the windowMs; sessions below `targetRatio` land in `observedRatios`; returns a single trigger if `observedRatios.size >= minSessions`.
+  - `crossSessionToAnomaly` handles the new case → `errorCode: 'PROMPT_CACHE_MISS_WAVE'`, message includes the session count, target, and the lowest observed ratios sorted ascending.
+  - `runBehaviorMonitor` pattern selector extended to a 4-way branch so `HintCandidate.pattern` is always defined.
+
+Validation (`test/behavior-monitor.test.ts` Phase D suite, 8 tests):
+- fires when ≥ 3 sessions below target in window;
+- does not fire with only 2 sessions below target;
+- ignores sessions with ratio ≥ target;
+- fires via `BehaviorMonitor.detectAll()` when ingested events have low ratios;
+- `detectAll()` does not fire when all ratios are ok;
+- custom `targetRatio` honored via options;
+- ignores sessions with no `execution_metrics` events;
+- prefers the latest `execution_metrics` per session (re-evaluates when a newer ok follows an old low, and vice versa).
+
+Goal: when multiple sessions show low Prompt Cache hit rate in a short window, write behavior trace and optionally trigger a live hint.
+
+New detector:
 
 ```text
 prompt-cache-miss-wave:
-  N 个 session 在 rollingWindowMs 内 prompt observedRatio < 目标阈值
+  N sessions have prompt observedRatio below the target threshold within rollingWindowMs
 ```
 
-建议默认：
+Defaults (now implemented as module constants):
 
 - minSessions: 3
-- window: 5min
+- window: 5min (reuses `DEFAULT_ROLLING_WINDOW_MS`)
 - target: 0.85
-- hint cooldown: 沿用 BehaviorMonitor 5min
+- hint cooldown: reuse BehaviorMonitor 5min (`DEFAULT_HINT_COOLDOWN_MS`)
 
-输出：
+Output:
 
-- `behavior-trace.jsonl` 中 anomaly source='nexus'
-- `/v1/runtime/loop/health` 的 pendingHints 可继续复用
+- anomaly source='nexus' in `behavior-trace.jsonl` with `errorCode: 'PROMPT_CACHE_MISS_WAVE'`;
+- `pendingHints` in `/v1/runtime/loop/health` continues to be reused (via `applyBehaviorHint`).
 
-注意：
+Note (historical, resolved): the original plan flagged that `BehaviorMonitor` ingest wiring needed to be completed before Phase D could ship. That wiring is now in place (2026-06-17), so the detector receives real `execution_metrics` events via `behaviorMonitor.ingest()` at the HTTP `/v1/execute` and WebSocket `/v1/stream` event yield points.
 
-当前 `BehaviorMonitor` 模块存在，但主 app ingestion 接线仍需核实/补齐。Phase D 必须先完成 event ingest wiring，不能只改 detector。
+### 5.5 Phase E — Future Real Caches
 
-### 5.5 Phase E — future real caches
+Connect hit/miss only when these caches are actually implemented later:
 
-当后续真实实现这些缓存时，再接入 hit/miss：
-
-| 维度 | 需要的最小事实 |
+| Dimension | Minimum required facts |
 | --- | --- |
-| Code Index Cache | index lookup request、hit/miss、index key、invalidated reason |
-| Tool Cache | cacheable tool identity、input hash、hit/miss、ttl、risk-safe invalidation |
-| Reasoning Cache | provider-reported reasoning cache tokens 或明确的 internal reasoning reuse event |
+| Code Index Cache | index lookup request, hit/miss, index key, invalidated reason |
+| Tool Cache | cacheable tool identity, input hash, hit/miss, ttl, risk-safe invalidation |
+| Reasoning Cache | provider-reported reasoning cache tokens or explicit internal reasoning reuse event |
 
-没有这些事实前，继续保持 `unavailable`。
+Keep them `unavailable` until those facts exist.
 
 ---
 
@@ -367,67 +422,141 @@ prompt-cache-miss-wave:
 
 ### 6.1 Runtime status
 
-建议 `/v1/runtime/status` summary：
+Suggested `/v1/runtime/status` summary:
 
 ```text
 cache: prompt 78% / target 85%; code_index unavailable; tool unavailable; reasoning unavailable
 ```
 
-### 6.2 bbl loop sidebar
+### 6.2 bbl loop Sidebar
 
-建议在 pane attention 中显示：
+Suggested pane attention display:
 
 ```text
 cache: prompt below target
 ```
 
-不要在主 pane title 上塞太多比例数字；详细比例放 overlay 或 status details。
+Do not cram too many ratios into the main pane title; put detailed ratios in overlay or status details.
 
-### 6.3 Transcript event
+### 6.3 Transcript Event
 
-如果 Phase C 落地，可渲染成：
+If Phase C lands, render as:
 
 ```text
 cache ! prompt 62% < 85%
 ```
 
-不可观测项不进入 transcript，避免噪音。
+Unobservable dimensions should not enter transcript, to avoid noise.
 
 ---
 
 ## 7. Tests
 
-建议测试分层：
+Suggested test layers:
 
-| 测试 | 覆盖 |
+| Test | Coverage |
 | --- | --- |
-| `test/cache-health.test.ts` | 纯函数：target、ratio、unavailable、summary |
-| `test/runtime.test.ts` | `execution_metrics` 后 runtime metrics/status 包含 cacheHealth |
-| `test/runtime-loop.test.ts` | loop health pane 携带 cacheHealth，不覆盖原 status |
+| `test/cache-health.test.ts` | Pure functions: target, ratio, unavailable, summary |
+| `test/runtime.test.ts` | runtime metrics/status contains cacheHealth after `execution_metrics` |
+| `test/runtime-loop.test.ts` | loop health pane carries cacheHealth without overriding original status |
 | `test/behavior-monitor.test.ts` | Phase D prompt-cache-miss-wave detector |
-| Go TUI loop tests | cache attention 渲染，不本地推导 ratio |
+| Go TUI loop tests | cache attention rendering, no local ratio inference |
 
 ---
 
 ## 8. Non-goals
 
-- 不在 v1 实现 Code Index Cache / Tool Cache / Reasoning Cache。
-- 不把 prefix cache immutable ratio 当成命中率。
-- 不让 Go TUI / CLI 计算 cache hit rate。
-- 不让低 cache hit 覆盖 permission/scope/timeout 等更高优先级 runtime 状态。
-- 不为 unavailable 维度显示 0%。
-- 不引入 LLM 来判断 cache health。
+- Do not implement Code Index Cache / Tool Cache / Reasoning Cache in v1.
+- Do not treat prefix cache immutable ratio as hit rate.
+- Do not let Go TUI / CLI calculate cache hit rate.
+- Do not let low cache hit override higher-priority runtime states such as permission/scope/timeout.
+- Do not show 0% for unavailable dimensions.
+- Do not introduce an LLM to judge cache health.
 
 ---
 
 ## 9. Recommended Next Slice
 
-最小可落地切片：
+Minimal shippable slice:
 
-1. 新增 `src/nexus/cacheHealth.ts` 纯函数。
-2. `/v1/runtime/metrics` 增加 process-level `cacheHealth`。
-3. `/v1/runtime/loop/health` 增加 pane-level `cacheHealth`。
-4. 写 TS regression，确认 Prompt Cache 可评估，其余三项 unavailable。
-5. Go TUI 只做只读渲染，不改变状态机。
+1. Add pure functions in `src/nexus/cacheHealth.ts`.
+2. Add process-level `cacheHealth` to `/v1/runtime/metrics`.
+3. Add pane-level `cacheHealth` to `/v1/runtime/loop/health`.
+4. Write TS regressions confirming Prompt Cache is evaluable and the other three dimensions are unavailable.
+5. Go TUI only renders read-only state and does not change its state machine.
 
-这条路径能最快把 Prompt Cache 的 85% 目标纳入 Nexus 实时检测，同时保持其他三个维度的诚实口径。
+This path brings the 85% Prompt Cache target into Nexus realtime detection fastest while keeping honest semantics for the other three dimensions.
+
+## 10. BabeL-2 Pattern Analysis (Reference Only)
+
+BabeL-2 has implemented several cache observability patterns that are worth understanding before implementation, but **none of them are copied directly** per `context-management-optimization-plan.md` §11 (no imported complexity). The goal is to extract the formula and telemetry shape, then re-home them into BabeL-O's single-module, `unavailable`-aware, REST-first architecture.
+
+### 10.1 Three different `cacheReadRatio` formulas in BabeL-2
+
+| File | Formula | Use case |
+| --- | --- | --- |
+| `utils/forkedAgent.ts:647-654` | `cache_read / (input + cache_creation + cache_read)` | Forked agent telemetry events (token-weighted hit rate) |
+| `utils/telemetry/perfettoTracing.ts:516-522` | `cacheReadTokens / promptTokens * 100` | Perfetto trace export (input-only denominator) |
+| `utils/stats.ts:333-336` (raw accumulation) | Tracks `cacheReadInputTokens` / `cacheCreationInputTokens` separately, no ratio | Daily token stats |
+
+**Lesson**: the two ratio formulas differ in their denominator. BabeL-2 itself uses two different definitions in different code paths, which can confuse operators. BabeL-O must pick one and document it.
+
+**BabeL-O choice** (`src/nexus/metrics.ts:344-351`): the forkedAgent formula — `cacheReadInputTokens / (inputTokens + cacheCreationInputTokens + cacheReadInputTokens)`. This is the **token-weighted hit rate** that is most honest about whether cache is saving real prompt cost. The plan §4.3 already specifies this formula. No change.
+
+### 10.2 Compact-time cache telemetry (BabeL-2 `compact.ts:670-680`)
+
+BabeL-2's compact path records these fields per compact call:
+
+```ts
+compactionInputTokens
+compactionOutputTokens
+compactionCacheReadTokens          // cache read by THIS compact call
+compactionCacheCreationTokens      // cache created by THIS compact call
+compactionTotalTokens              // input + cache_creation + cache_read + output
+promptCacheSharingEnabled
+```
+
+**Lesson**: compact itself is a cache event. A large `compactionCacheCreationTokens` value after a compact indicates the boundary broke the cached prefix (i.e., the new summary invalidated the upstream cache). BabeL-O's `context_compact_boundary` event exists but does not currently surface `cacheCreation` delta. This is a Phase C candidate, not Phase A.
+
+**BabeL-O scope**: defer to Phase C. Phase A only reads existing `cacheReadRatio` / `cacheReadInputTokens` / `cacheCreationInputTokens` from `execution_metrics` and `/v1/runtime/metrics` aggregation. Compact-time delta is out of scope.
+
+### 10.3 Perfetto tracing format (BabeL-2 `perfettoTracing.ts:521`)
+
+BabeL-2 emits `cache_hit_rate_pct` as `Math.round((cacheReadTokens / promptTokens) * 10000) / 100` — a fixed-precision percentage string.
+
+**BabeL-O choice**: keep `observedRatio` as a `0..1` float in the structured `CacheHealthDimension` (plan §4.1), and let the UI layer apply its own precision when rendering. This avoids encoding presentation choices in the data layer.
+
+### 10.4 What to NOT copy from BabeL-2
+
+| BabeL-2 pattern | Why we don't copy |
+| --- | --- |
+| Multiple files (`stats.ts` / `forkedAgent.ts` / `compact.ts` / `perfettoTracing.ts`) implementing the same concept | Single module: `src/nexus/cacheHealth.ts` |
+| `unavailable` not distinguished from `0%` | `CacheHealthStatus = 'ok' \| 'warning' \| 'critical' \| 'unavailable'` (plan §4.1) |
+| Stats.tsx-style 89k-token UI rendering cache | REST API + Go TUI badge only (plan §6) |
+| Compaction logic mixed with cache telemetry | Boundary: cacheHealth reads `execution_metrics`, does not touch compact internals |
+| Daily / monthly aggregation in `stats.ts` | Out of scope; sessions are ephemeral in BabeL-O |
+| Telemetry sent to Statsig as events | BabeL-O does not forward cache telemetry to external analytics |
+
+### 10.5 Summary of design decisions for Phase A
+
+| Decision | Source | Implication |
+| --- | --- | --- |
+| Use forkedAgent formula for `cacheReadRatio` | `src/nexus/metrics.ts:344-351` already uses it | No formula change in Phase A |
+| Keep `observedRatio` as `0..1` float, not pre-rendered percentage | BabeL-2 lesson §10.3 | UI layer formats |
+| Phase A reads only `execution_metrics` + `NexusMetrics.snapshot()` | Avoid compact internals | Simple, testable, no runtime coupling |
+| `code_index` / `tool` / `reasoning` stay `unavailable` | Plan §4.4 + BabeL-2 lesson §10.4 | No fabricated 0% rates |
+| Single `cacheHealth.ts` module, no fragmentation | BabeL-2 lesson §10.4 | Easy to test, no fan-out |
+
+## 中文概述
+
+### 背景
+
+上下文缓存和实时检测容易被文档写成“已经可观测”，但很多 provider 的 cache hit/miss 并没有稳定事实源。
+
+### 边界
+
+本文只规划可审计的 cache health 与 realtime detection，不允许伪造不存在的 cache family 或把估算值当成真实 provider 指标。
+
+### 当前状态
+
+2026-06-17 升级为 Active Plan。Phase A（`cacheHealth.ts` 纯函数 + `/v1/runtime/metrics` 增 `cacheHealth` 字段）独立可落地，0 上游依赖。Phase D（Behavior Monitor bridge）前置条件已就位（`behaviorMonitor.ingest` 在 `app.ts` 2 个 yield 点已接线）。Phase B 需先确认 `getExecutionMetrics(sessionId)` storage 接口；Phase C/E 待 A/B 落地。

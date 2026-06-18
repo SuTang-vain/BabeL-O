@@ -97,7 +97,8 @@ bbl memory doctor                              # 诊断
 Go TUI `/memory` 面板新增 `Bootstrap:` 段,`/memory setup` 子命令指向 CLI 路径;
 底部持久 `[m: ready]` / `[m: failed ⚠ …]` 指示器来自 `/v1/runtime/status` 轮询。
 
-具体实现 + 验证命令见 [`memoryos-zero-friction-memory-startup-optimization-plan.md`](./reference/memoryos-zero-friction-memory-startup-optimization-plan.md),
+具体实现 + 验证命令见 [memory-governance-plan.md](./reference/memory-governance-plan.md) 和归档历史
+[`everos-zero-friction-memory-startup-optimization-plan.md`](./archive/everos-zero-friction-memory-startup-optimization-plan.md),
 相关产品线在
 [`TODO_product_30day.md`](./active/TODO_product_30day.md) W2.5(状态:已实现并验证)。
 
@@ -150,5 +151,5 @@ export BABEL_O_EVERCORE_LLM_MODEL=...
    namespace 串味。
 3. SessionChannel inbox —— 协作上下文，不是用户指令。
 
-这条边界由 `docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md`
+这条边界由 `docs/nexus/reference/memory-governance-plan.md`
 和当前实现的 capability block 共同保障。

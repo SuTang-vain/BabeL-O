@@ -317,6 +317,17 @@ export async function analyzeContext(options: {
   warningPercent?: number
   memoryProvider?: MemoryProvider
   sessionInbox?: SessionMessage[]
+  // §3.5 Memory Quality Metrics: forwarded to `assembleContext`'s
+  // `onMemoryRetrieval` hook so the caller (e.g. Nexus context
+  // route) can persist a `memory_retrieval` NexusEvent for the
+  // dashboard. See `ContextAssemblerOptions.onMemoryRetrieval` for
+  // the full contract.
+  onMemoryRetrieval?: (input: {
+    sessionId: string
+    cwd: string
+    prompt: string
+    diagnostics: MemoryProviderDiagnostics
+  }) => void | Promise<void>
 }): Promise<ContextAnalysis> {
   const assembled = await assembleContext({
     runtimeOptions: options.runtimeOptions,
@@ -326,6 +337,7 @@ export async function analyzeContext(options: {
     mapEventsToMessages: options.mapEventsToMessages,
     memoryProvider: options.memoryProvider,
     sessionInbox: options.sessionInbox,
+    ...(options.onMemoryRetrieval && { onMemoryRetrieval: options.onMemoryRetrieval }),
   })
   const estimate = estimateContextTokens({
     systemPrompt: assembled.systemPrompt,

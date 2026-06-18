@@ -38,6 +38,7 @@ package loop
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -56,6 +57,7 @@ type InteractiveModel struct {
 	loop              LoopModel
 	transcript        []string
 	store             *Store
+	defaultCwd        string
 	reconciler        *Reconciler
 	reconcileInterval time.Duration
 	lastReconcile     reconcileDoneMsg
@@ -159,6 +161,21 @@ type InteractiveModel struct {
 	// field so the constructor signature stays readable
 	// even when several periodic loops are wired.
 	healthInterval time.Duration
+	// inboxInterval is the poll cadence for the
+	// SessionChannel inbox tick (SessionChannel TUI
+	// visibility Phase 1). Zero means polling is
+	// disabled. The loop only fetches the *focused*
+	// pane's session, so the surface stays bounded
+	// regardless of how many panes are open.
+	inboxInterval time.Duration
+	// sessionInbox caches the most recent inbox snapshot
+	// per session id, keyed by session id (not pane id —
+	// a session may have multiple panes during its
+	// lifetime). The chrome footer reads the focused
+	// pane's entry; the sidebar reads every entry to
+	// render unread badges. nil means "no snapshot yet";
+	// the chrome treats nil as "no data, no badge".
+	sessionInbox map[string]*api.SessionInboxResponse
 	// executeTimeout is the HTTP /v1/execute timeout used
 	// when a pane-local QueuedPrompt is submitted. Zero
 	// falls back to defaultExecuteTimeoutMs.
@@ -195,7 +212,7 @@ type InteractiveModel struct {
 	// is open) so the chrome's render path stays free
 	// of I/O. The flags mirror helpOpen's contract —
 	// any key (esc/q/?/ctrl+c) closes the overlay.
-	paneListOpen    bool
+	paneListOpen bool
 	// paneListCursor is the row index into the structured
 	// BuildPaneListRows output for the ctrl+j pane_list
 	// overlay. 0 when no row is selected (e.g. the overlay
@@ -209,7 +226,7 @@ type InteractiveModel struct {
 	// 6d-f: row highlight + Enter-to-jump. The cursor
 	// persists across View re-renders so the chrome can
 	// apply the highlight consistently.
-	paneListCursor int
+	paneListCursor  int
 	scopeReviewOpen bool
 	// scopeDriftOpen is the 6d-g toggle for the
 	// scope_drift overlay (ctrl+d). The third overlay
@@ -232,6 +249,16 @@ type InteractiveModel struct {
 	// response; for now tests can inject it via
 	// SetScopeReviewInputForTest.
 	scopeReviewInput *ScopeReviewInput
+	// permDialog is the 6d-c'-B-stepC multi-mode editor
+	// state for the permission dialog. nil when the dialog
+	// is in its base (Y/N only) mode or when no
+	// PendingPermission is active. When non-nil, the
+	// dialog renders in the sub-mode dictated by
+	// permDialog.Mode, and key dispatch is intercepted
+	// accordingly (1/2/3 for scope, D for deny reason,
+	// R for rule edit). Cleared when PendingPermission
+	// is cleared or when the dialog is dismissed.
+	permDialog *permDialogState
 	// wsObserver is the PR-17c (B1) per-CWD working-set
 	// WS observer. nil means the observer is disabled
 	// (e.g. in-memory / no-Nexus mode). The observer is
@@ -242,6 +269,13 @@ type InteractiveModel struct {
 	// a side argument so the Add/Remove plumbing stays
 	// symmetric with loopClient / reconciler.
 	wsObserver *WorkingSetObserver
+}
+
+type createPaneSessionDoneMsg struct {
+	PaneID    string
+	SessionID string
+	Cwd       string
+	Err       error
 }
 
 // toastTTL is how long a transient toast stays visible on
@@ -315,6 +349,12 @@ func NewInteractiveModelWithLoopClient(
 	im := NewInteractiveModelWithReconciler(model, store, reconciler, reconcileInterval)
 	im.loopClient = loopClient
 	im.healthInterval = healthInterval
+	// SessionChannel TUI visibility Phase 1: default
+	// the inbox poll to 10s — long enough that 20+ open
+	// panes don't make /v1/sessions/:id/inbox a hot path,
+	// short enough that an operator's reaction time isn't
+	// gated on the next reconcile cycle. Set 0 to disable.
+	im.inboxInterval = 10 * time.Second
 	im.executeTimeout = defaultExecuteTimeout
 	im.toastQueue = toastQueue
 	im.soundPlayer = soundPlayer
@@ -343,6 +383,11 @@ func NewInteractiveModelWithExecuteTimeout(model InteractiveModel, timeout time.
 	if timeout > 0 {
 		model.executeTimeout = timeout
 	}
+	return model
+}
+
+func NewInteractiveModelWithDefaultCwd(model InteractiveModel, cwd string) InteractiveModel {
+	model.defaultCwd = cwd
 	return model
 }
 
@@ -391,10 +436,7 @@ func applySnapshotToLoop(loop LoopModel, snap Snapshot) LoopModel {
 		return loop
 	}
 	tab := ws.Tabs[loop.Focus.TabIdx]
-	for _, entry := range snap.Panes {
-		if entry.PaneID == "" {
-			continue
-		}
+	for _, entry := range filterValidPaneEntries(snap.Panes) {
 		// Refresh metadata on an existing pane (matched by
 		// PaneID) without touching its Status — the health
 		// poll owns status projection, and a reconcile tick
@@ -504,6 +546,15 @@ func (m InteractiveModel) Init() tea.Cmd {
 	if m.loopClient != nil && m.healthInterval > 0 {
 		cmds = append(cmds, scheduleHealthTick(m.healthInterval))
 	}
+	// SessionChannel TUI visibility Phase 1: start the
+	// inbox tick so the focused pane's unread / high-
+	// priority summary lands in the footer + sidebar as
+	// soon as the UI is up. Mirrors the health-tick
+	// startup contract — nil client / zero interval
+	// drops the tick.
+	if m.loopClient != nil && m.inboxInterval > 0 {
+		cmds = append(cmds, scheduleInboxTick(m.inboxInterval))
+	}
 	// Phase 6c / 6d-c'-A: start a per-pane read cmd for
 	// every pane already in the model at startup. The
 	// dispatcher (startAllReads) picks HTTP wait or WS
@@ -555,8 +606,17 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case healthDoneMsg:
 		return m, m.handleHealthDone(msg)
 
+	case inboxTickMsg:
+		return m, m.handleInboxTick()
+
+	case inboxDoneMsg:
+		return m, m.handleInboxDone(msg)
+
 	case waitDoneMsg:
 		return m, m.handleWaitDone(msg)
+
+	case createPaneSessionDoneMsg:
+		return m, m.handleCreatePaneSessionDone(msg)
 
 	case wsReadBatchMsg:
 		// 6d-c'-A: WS read handle arrived. Store the
@@ -726,12 +786,107 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// (ctrl+c/esc/q still quit) so a misbehaving
 		// permission_request can't trap the operator in
 		// the TUI.
+		//
+		// 6d-c'-B-stepC: sub-mode keybinds extend the
+		// modal block. 1/2/3 enter scope-picker mode,
+		// D enters deny-reason mode, R enters rule-edit
+		// mode. In sub-modes, printable keys edit the
+		// draft, backspace deletes, Enter commits, Esc
+		// returns to base.
 		if pane, ok := m.loop.FocusedPane(); ok && pane.PendingPermission != nil {
-			switch chromeKeyName(msg) {
+			key := chromeKeyName(msg)
+			// Sub-mode key dispatch.
+			if m.permDialog != nil {
+				switch m.permDialog.Mode {
+				case permDialogScope:
+					switch key {
+					case "1":
+						m.permDialog.Scope = "once"
+						return m, m.dispatchPermissionDecisionWithState(pane, "approve")
+					case "2":
+						m.permDialog.Scope = "session"
+						return m, m.dispatchPermissionDecisionWithState(pane, "approve")
+					case "3":
+						m.permDialog.Scope = "rule"
+						return m, m.dispatchPermissionDecisionWithState(pane, "approve")
+					case "esc":
+						m.permDialog = nil
+						return m, nil
+					}
+					return m, nil
+				case permDialogReason:
+					switch key {
+					case "enter":
+						return m, m.dispatchPermissionDecisionWithState(pane, "deny")
+					case "esc":
+						m.permDialog = nil
+						return m, nil
+					case "backspace":
+						m.permDialog.Reason = dropLastRune(m.permDialog.Reason)
+						return m, nil
+					default:
+						if isPrintableKey(key) {
+							m.permDialog.Reason += key
+						}
+						return m, nil
+					}
+				case permDialogRule:
+					switch key {
+					case "enter":
+						return m, m.dispatchPermissionDecisionWithState(pane, "approve")
+					case "esc":
+						m.permDialog = nil
+						return m, nil
+					case "backspace":
+						m.permDialog.Rule = dropLastRune(m.permDialog.Rule)
+						return m, nil
+					default:
+						if isPrintableKey(key) {
+							m.permDialog.Rule += key
+						}
+						return m, nil
+					}
+				default:
+					m.permDialog = nil
+					return m, nil
+				}
+			}
+			// Base mode key dispatch.
+			switch key {
 			case "y", "enter":
 				return m, m.dispatchPermissionDecision(pane, pane.PendingPermission, "approve")
 			case "n":
 				return m, m.dispatchPermissionDecision(pane, pane.PendingPermission, "deny")
+			// 6d-c'-B-stepC: sub-mode entry keys.
+			case "1", "2", "3":
+				scope := "once"
+				switch key {
+				case "2":
+					scope = "session"
+				case "3":
+					scope = "rule"
+				}
+				m.permDialog = &permDialogState{
+					Mode:  permDialogScope,
+					Perm:  pane.PendingPermission,
+					Scope: scope,
+				}
+				return m, nil
+			case "d":
+				m.permDialog = &permDialogState{
+					Mode: permDialogReason,
+					Perm: pane.PendingPermission,
+				}
+				return m, nil
+			case "r":
+				rule := pane.PendingPermission.SuggestedRule
+				m.permDialog = &permDialogState{
+					Mode:  permDialogRule,
+					Perm:  pane.PendingPermission,
+					Rule:  rule,
+					Scope: "rule",
+				}
+				return m, nil
 			}
 			// Swallow other keys while the dialog is up
 			// so they don't trigger input / router actions
@@ -865,6 +1020,12 @@ func (m *InteractiveModel) dispatchEvent(event RawEvent) tea.Cmd {
 		}
 		m.loop = ApplyClosePane(m.loop)
 	case RouteNewPane:
+		if m.loopClient != nil {
+			paneID := NewID("pane")
+			m.toastMessage = "creating pane session..."
+			m.toastShownAt = time.Now()
+			return createPaneSessionCmd(m.loopClient, paneID, firstNonEmpty(m.defaultCwd, defaultPaneCwd(event)))
+		}
 		m.loop, _ = ApplyNewPane(m.loop, newPaneSeedFor(event))
 	case RouteMoveFocus:
 		m.loop = ApplyMoveFocus(m.loop, route.Direction)
@@ -921,17 +1082,83 @@ func (m *InteractiveModel) refreshFocusedTab() {
 	m.toastQueue.SetFocusedTab(ws.Tabs[m.loop.Focus.TabIdx].ID)
 }
 
-// newPaneSeedFor builds a NewPaneSeed for the Ctrl+N path.
-// The sessionId is generated locally for now; Phase 3f”
-// will replace it with a real Nexus session allocation
-// via POST /v1/sessions.
+// newPaneSeedFor builds a NewPaneSeed for the Ctrl+N fallback
+// path used only when no Nexus client is attached. Real bbl
+// loop panes allocate a canonical server-side session through
+// POST /v1/sessions before calling ApplyNewPane.
 func newPaneSeedFor(_ RawEvent) NewPaneSeed {
 	return NewPaneSeed{
 		PaneID:    NewID("pane"),
 		Agent:     "bbl",
+		Cwd:       defaultPaneCwd(RawEvent{}),
 		Label:     "main",
-		SessionID: "session-" + NewID("local"),
+		SessionID: "offline-" + NewID("pane"),
 	}
+}
+
+func defaultPaneCwd(_ RawEvent) string {
+	if cwd, err := os.Getwd(); err == nil {
+		return cwd
+	}
+	return ""
+}
+
+func createPaneSessionCmd(client *api.Client, paneID string, cwd string) tea.Cmd {
+	if client == nil || paneID == "" {
+		return nil
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		resp, err := client.CreateSession(ctx, api.CreateSessionRequest{
+			Cwd:             cwd,
+			ClientSessionID: paneID,
+			Metadata: map[string]any{
+				"client":     "bbl-loop",
+				"entrypoint": "bbl loop",
+				"paneId":     paneID,
+			},
+		})
+		if err != nil {
+			return createPaneSessionDoneMsg{PaneID: paneID, Cwd: cwd, Err: err}
+		}
+		return createPaneSessionDoneMsg{PaneID: paneID, SessionID: resp.SessionID, Cwd: cwd}
+	}
+}
+
+func (m *InteractiveModel) handleCreatePaneSessionDone(msg createPaneSessionDoneMsg) tea.Cmd {
+	if msg.Err != nil {
+		m.toastMessage = "✗ create pane session failed: " + msg.Err.Error()
+		m.toastShownAt = time.Now()
+		return nil
+	}
+	if msg.SessionID == "" {
+		m.toastMessage = "✗ create pane session failed: empty session id"
+		m.toastShownAt = time.Now()
+		return nil
+	}
+	seed := NewPaneSeed{
+		PaneID:    msg.PaneID,
+		SessionID: msg.SessionID,
+		Agent:     "bbl",
+		Cwd:       msg.Cwd,
+		Label:     "main",
+	}
+	var err error
+	m.loop, err = ApplyNewPane(m.loop, seed)
+	if err != nil {
+		m.toastMessage = "✗ add pane failed: " + err.Error()
+		m.toastShownAt = time.Now()
+		return nil
+	}
+	m.refreshFocusedTab()
+	m.persistSnapshot()
+	m.toastMessage = "created pane session: " + shortSessionID(msg.SessionID)
+	m.toastShownAt = time.Now()
+	if pane, ok := m.loop.FocusedPane(); ok {
+		return m.startReadForPane(pane)
+	}
+	return nil
 }
 
 // rawEventFromKey maps a bubbletea v2 KeyPressMsg into the
@@ -1026,8 +1253,9 @@ func rawEventFromKey(msg tea.KeyPressMsg) (RawEvent, bool) {
 }
 
 // View renders the status bar + focused pane body + footer.
-// The pane body is a placeholder until Phase 3f' wires the
-// real transcript (which lives in Nexus-driven sub-targets).
+// The pane body renders Nexus-backed transcript rows when
+// available and otherwise falls back to a neutral wait-state
+// placeholder.
 //
 // Phase 4 chrome: the visual layer is owned by chrome.go so
 // the data layer (this file) stays focused on input dispatch
@@ -1055,8 +1283,8 @@ func (m InteractiveModel) View() tea.View {
 		// 6d-g: third overlay flag + line buffer for
 		// scope_drift (ctrl+d). The chrome layer reads
 		// these as part of its overlay splice path.
-		ScopeDriftOpen:  m.scopeDriftOpen,
-		PaneListLines:   m.activePaneListLines(),
+		ScopeDriftOpen: m.scopeDriftOpen,
+		PaneListLines:  m.activePaneListLines(),
 		// 6d-f: pass the structured rows + cursor so the
 		// chrome can apply a `▸ ` highlight to the row at
 		// index `paneListCursor`. The legacy `PaneListLines`
@@ -1099,16 +1327,16 @@ func (m InteractiveModel) View() tea.View {
 // renderers themselves are pure — no I/O, no model
 // access — so the chrome layer stays data-free.
 type chromeViewState struct {
-	HelpOpen         bool
-	Toast            string
-	PaneListOpen     bool
-	ScopeReviewOpen  bool
+	HelpOpen        bool
+	Toast           string
+	PaneListOpen    bool
+	ScopeReviewOpen bool
 	// ScopeDriftOpen is the 6d-g flag for the
 	// scope_drift overlay (ctrl+d). When true the
 	// chrome splices the scope_drift panel on top of
 	// the existing content.
-	ScopeDriftOpen   bool
-	PaneListLines    []string
+	ScopeDriftOpen bool
+	PaneListLines  []string
 	// PaneListCursor is the row index for the 6d-f
 	// row-highlight feature. The chrome layer applies a
 	// `▸ ` prefix to the row at this index (in addition
@@ -1123,12 +1351,12 @@ type chromeViewState struct {
 	// activeScopeDriftLines in View-time from
 	// BuildScopeDriftInputFromHealth so the chrome
 	// doesn't need to know about api types.
-	ScopeDriftLines  []string
+	ScopeDriftLines []string
 	// TraceOverlayOpen is the PR-B2 flag for the
 	// behavior_trace overlay (v key). When true the
 	// chrome splices the trace panel on top of the
 	// existing content. Mirrors ScopeDriftOpen.
-	TraceOverlayOpen  bool
+	TraceOverlayOpen bool
 	// TraceOverlayLines are the pre-computed display
 	// lines returned by B2TraceViewState. Populated by
 	// View() so the chrome renderer stays I/O-free.

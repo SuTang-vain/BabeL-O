@@ -107,6 +107,7 @@ func runLoop(
 	im = loop.NewInteractiveModelWithWorkingSetObserver(im, wsObserver)
 	im = loop.NewInteractiveModelWithRuntimeOptions(im, cfg.AltScreen, cfg.MouseCapture)
 	im = loop.NewInteractiveModelWithExecuteTimeout(im, time.Duration(cfg.ExecuteTimeoutMs)*time.Millisecond)
+	im = loop.NewInteractiveModelWithDefaultCwd(im, cfg.Cwd)
 	loop.InitB2Trace(client, cfg.Cwd)
 	prog := tea.NewProgram(im)
 	finalModel, err := prog.Run()
@@ -144,6 +145,28 @@ func buildInitialLoopModel(cfg loop.Config) loop.LoopModel {
 	if cfg.WorkspaceID != "" {
 		model.Workspaces[0].ID = cfg.WorkspaceID
 		model.Workspaces[0].Label = cfg.WorkspaceID
+		if len(model.Workspaces[0].Tabs) > 0 {
+			model.Workspaces[0].Tabs[0].ID = cfg.WorkspaceID + ":1"
+		}
+	}
+	if cfg.SessionID != "" && len(model.Workspaces) > 0 && len(model.Workspaces[0].Tabs) > 0 {
+		ws := model.Workspaces[0]
+		tab := ws.Tabs[0]
+		updated, err := tab.AddPane(loop.PaneModel{
+			PaneID:      loop.NewID("pane"),
+			WorkspaceID: ws.ID,
+			TabID:       tab.ID,
+			SessionID:   cfg.SessionID,
+			Agent:       "bbl",
+			Cwd:         cfg.Cwd,
+			Label:       "main",
+			Status:      loop.StatusIdle,
+		})
+		if err == nil {
+			ws.Tabs[0] = updated
+			model.Workspaces[0] = ws
+			model.Focus.PaneIdx = len(updated.Panes) - 1
+		}
 	}
 	return model
 }

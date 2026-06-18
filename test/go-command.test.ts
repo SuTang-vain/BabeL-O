@@ -831,6 +831,8 @@ test('bbl go --check: passes when a prebuilt binary is present and Nexus is heal
   assert.match(combined, /Nexus is healthy at http:\/\/nexus\.local/)
   assert.match(combined, /Server version: 0\.3\.2, supported Go TUI majors: \[0\]/)
   assert.match(combined, /Go TUI major 0 is compatible with this Nexus server\./)
+  assert.match(combined, /Embedded Nexus storage \(would-be default\): sqlite .*\.babel-o[\\/]db\.sqlite/)
+  assert.match(combined, /bbl go auto-starts a local Nexus without NEXUS_STORAGE_PATH/)
   assert.match(combined, /Result: OK/)
 })
 
@@ -1047,6 +1049,76 @@ test('bbl go --check: skips compat comparison when Go TUI version cannot be pars
   const combined = report.lines.join('\n')
   assert.equal(report.exitCode, 0)
   assert.match(combined, /Could not parse Go TUI major from --version output; compat check skipped\./)
+})
+
+test('bbl go --check: embedded-nexus-storage line honours BABEL_O_CONFIG_DIR (Phase 4)', async () => {
+  // Phase 4 of go-tui-session-observability-governance-plan.md: the
+  // check report must surface the *would-be* embedded Nexus storage
+  // path so the operator can see whether sessions persist across
+  // `bbl go` exits. The path must honour BABEL_O_CONFIG_DIR (the
+  // same override the runtime uses), not the real ~/.babel-o.
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
+  const exists = (p: string) => p === packageBundled || p === sourceDir
+  const fetchImpl = (async () => new Response('ok', { status: 200 })) as unknown as typeof fetch
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      fetch: fetchImpl,
+      packageRoot,
+      platform: 'darwin',
+      arch: 'arm64',
+      env: { BABEL_O_CONFIG_DIR: '/custom/config/dir' },
+      homeDir: '/should/not/be/used',
+      execFileSync: (() => 'bbl-go-tui 0.3.2') as any,
+    },
+  )
+  assert.equal(report.exitCode, 0)
+  const combined = report.lines.join('\n')
+  assert.match(
+    combined,
+    /Embedded Nexus storage \(would-be default\): sqlite \/custom\/config\/dir[\\/]db\.sqlite/,
+  )
+})
+
+test('bbl go --check: embedded-nexus-storage warns memory when NODE_ENV=test (test isolation)', async () => {
+  // When NODE_ENV=test, the runtime's resolveDefaultStoragePath
+  // falls back to MemoryStorage to protect the real ~/.babel-o.
+  // The check report must surface this as a WARN so an operator
+  // running `bbl go --check` from inside a test shell understands
+  // sessions would NOT persist.
+  const packageRoot = '/repo'
+  const sourceDir = join(packageRoot, 'clients', 'go-tui')
+  const packageBundled = join(packageRoot, 'bin', 'go-tui-darwin-arm64')
+  const exists = (p: string) => p === packageBundled || p === sourceDir
+  const fetchImpl = (async () => new Response('ok', { status: 200 })) as unknown as typeof fetch
+  const report = await runGoTuiCheckReport(
+    {
+      url: 'http://nexus.local',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      exists,
+      fetch: fetchImpl,
+      packageRoot,
+      platform: 'darwin',
+      arch: 'arm64',
+      env: { NODE_ENV: 'test' },
+      homeDir: '/home',
+      execFileSync: (() => 'bbl-go-tui 0.3.2') as any,
+    },
+  )
+  assert.equal(report.exitCode, 0)
+  const combined = report.lines.join('\n')
+  assert.match(combined, /Embedded Nexus storage \(would-be default\): memory \(memory-opt-in\)/)
+  assert.match(combined, /would NOT persist sessions to disk in this environment/)
 })
 
 test('bbl go --help describes the Go TUI as the production client', () => {

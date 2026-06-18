@@ -54,25 +54,25 @@ context/compact ceiling 诊断已对齐 registry `model.contextWindow` 与 cache
 
 > 主规划见 [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md)。本节承接 observability / eval / benchmark 打开项。
 
-### Agent Trace Schema — Open
+### Agent Trace Schema — ✅ v1 收口（2026-06-17）
 
-当前 runtime metrics、tool trace、permission audit、behavior trace 已存在，但还不是统一 trajectory trace。
+当前 runtime metrics、tool trace、permission audit、behavior trace 已存在，v1 统一 trajectory trace 已从现有 `NexusEvent` 派生，不新增第二事实源。
 
-- [ ] 定义 `AgentTrace` / `AgentSpan` 投影 schema，从现有 `NexusEvent`、`execution_metrics`、`toolTrace`、`permission_audit` 派生，不新增第二事实源。
-- [ ] span 覆盖 provider invocation、tool call、permission decision、scope boundary、memory retrieval、compact/recovery、sub-agent handoff、final result。
-- [ ] trace 可 JSONL 导出，并可从 session replay 重建。
-- [ ] `bbl inspect-session` 或独立 debug command 可输出 machine-readable trace。
-- [ ] 回归覆盖 event ordering、parent-child span、缺失事件降级、permission denied path。
+- [x] 定义 `AgentTrace` / `AgentSpan` 投影 schema，从现有 `NexusEvent`、`execution_metrics`、`toolTrace`、`permission_audit` 派生，不新增第二事实源。→ `src/runtime/agentTrace.ts` `projectAgentTrace(events)` 纯函数。
+- [x] span 覆盖 provider invocation、tool call、permission decision、scope boundary、memory retrieval（v1 只有 `memory_update`，retrieval 待 §3.5）、compact/recovery、sub-agent handoff、final result。
+- [x] trace 可 JSONL 导出（`traceToJsonl` header + per-span 行），并可从 session replay 重建（spanId 确定性派生）。
+- [x] `bbl inspect-session <id> --trace` 输出 machine-readable trace（`--json` 切换单 blob）。
+- [x] 回归覆盖 event ordering、parent-child span、缺失事件降级、permission denied path。→ `test/agent-trace.test.ts` 19 test + `test/inspect-session.test.ts` 3 个 `exportSessionTrace` 集成 test。
 
-### Trajectory Eval Harness — Open
+### Trajectory Eval Harness — ✅ v1 收口（2026-06-17）
 
-现有测试/benchmark 能覆盖函数、API、成本和性能；下一步需要面向 agent trajectory 的 eval。
+v1 离线 trajectory eval 已落地，消费 Agent Trace Schema 投影，不依赖真实 provider key。
 
-- [ ] 定义最小 eval fixture 格式：prompt、workspace、expected checks、trace assertions。
-- [ ] 新增 `npm run eval:agent` 或等价脚本，默认跑小型 offline fixture，不依赖真实 provider key。
-- [ ] 首批至少 10 个 coding trajectory fixture，覆盖 read-before-edit、permission、scope、context budget、recoverable tool error、memory hint caution。
-- [ ] eval 输出 success、cost、tool count、permission count、scope warnings、trace path。
-- [ ] 后续真实 session regression 可转成 eval fixture，作为 architecture maturity 守门。
+- [x] 定义最小 eval fixture 格式：prompt、workspace、expected checks、trace assertions。→ `evals/coding/<id>.ts` 单模块格式（`ev.*` 事件 builder + `defineFixture`），`expectChecks` 声明 per-check 期望 severity。live-workspace 模式（plan 字面 `prompt.md`/`workspace/`/`expected.json`/`checks.ts`）延后 v1.1（需 §3.3 resume/replay 机制）。
+- [x] 新增 `npm run eval:agent`（`scripts/eval-agent.ts`），默认跑小型 offline fixture，不依赖真实 provider key。`--json` 输出 machine-readable。
+- [x] 首批 10 个 coding trajectory fixture，覆盖 read-before-edit、permission（approved / repeated-deny）、scope（contained / escape）、context budget（repeated-reads / truncated）、recoverable compact-recovery、memory hint caution。
+- [x] eval 输出 success（verdict）、cost（inputTokens/outputTokens/cacheReadTokens）、tool count、permission count、scope warnings、span count、trace warnings。
+- [x] 后续真实 session regression 可转成 eval fixture（`evals/README.md` 文档化导出流程），作为 architecture maturity 守门。自验证：每个 fixture 声明 `expectChecks`，harness 断言 actual===expected，fixture verdict=pass iff 全部断言匹配。
 
 ## 验证命令
 

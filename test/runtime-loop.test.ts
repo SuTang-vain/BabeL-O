@@ -379,6 +379,36 @@ test('GET /v1/runtime/loop/health returns empty panes when no sessions exist', a
   }
 })
 
+test('GET /v1/runtime/loop/health does not synthesize panes for missing sessionId', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-health-missing-session`)
+  await mkdir(cwd, { recursive: true })
+  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
+  try {
+    const realSessionId = await createEmptySession(cwd, storage)
+    const response = await app.inject({
+      method: 'GET',
+      url: '/v1/runtime/loop/health?sessionId=session-local-deadbeef',
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.type, 'loop_health')
+    assert.equal(body.filter.sessionId, 'session-local-deadbeef')
+    assert.deepEqual(body.panes, [])
+
+    const realResponse = await app.inject({
+      method: 'GET',
+      url: `/v1/runtime/loop/health?sessionId=${realSessionId}`,
+    })
+    assert.equal(realResponse.statusCode, 200)
+    const realBody = realResponse.json()
+    assert.equal(realBody.panes.length, 1)
+    assert.equal(realBody.panes[0].sessionId, realSessionId)
+  } finally {
+    await app.close()
+  }
+})
+
 test('loop_state CRUD routes round-trip a pane', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state`)
   await mkdir(cwd, { recursive: true })
@@ -467,7 +497,9 @@ test('loop_state POST rejects mismatched workspaceId between URL and body', asyn
 test('loop_state DELETE returns 404 when pane is missing', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state-404`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+  })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     const response = await app.inject({
@@ -484,7 +516,9 @@ test('loop_state DELETE returns 404 when pane is missing', async () => {
 test('loop_state ghost pane cleanup removes local rows without a server pane', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-loop-state-ghost`)
   await mkdir(cwd, { recursive: true })
-  const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
+  const { runtime, storage } = await createDefaultNexusRuntime({
+    allowedTools: ['*'],
+  })
   const app = await createNexusApp({ runtime, storage, defaultCwd: cwd })
   try {
     await options_crud_upsert(app, 'pane-keep', 'ws-1', 'tab-1')

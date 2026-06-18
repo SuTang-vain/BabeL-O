@@ -248,3 +248,49 @@ export class PendingPermissionRegistry {
 function pendingPermissionKey(sessionId: string, toolUseId: string): string {
   return `${sessionId}:${toolUseId}`
 }
+
+/**
+ * Phase 3 / §3 goal 5 of
+ * `docs/nexus/proposals/go-tui-session-observability-governance-plan.md`:
+ * detect a Go TUI client-side placeholder session id
+ * (`session_go_<unixnano>`, e.g. `session_go_1781146359507755000`).
+ *
+ * The server persists sessions under a canonical `session_<uuid>`;
+ * the Go TUI's local placeholder is only carried as
+ * `metadata.clientSessionId` for cross-reference. When an operator
+ * queries `/v1/sessions/<placeholder>` directly, the 404 response
+ * uses {@link goTuiClientSessionPersistenceHint} to explain *why*
+ * the id is missing and what to do next, instead of the generic
+ * `SESSION_NOT_FOUND`.
+ */
+const GO_TUI_CLIENT_SESSION_ID_PATTERN = /^session_go_\d{15,}$/
+
+export function isGoTuiClientSessionId(sessionId: string): boolean {
+  return GO_TUI_CLIENT_SESSION_ID_PATTERN.test(sessionId)
+}
+
+/**
+ * Redacted persistence hint for a Go TUI client placeholder session
+ * id that the server does not persist under directly. The hint is
+ * deliberately non-revealing (no other sessions, no storage path)
+ * and points the operator at the two real reverse-resolve paths:
+ *   - `bbl inspect-session <placeholder>` (tier (b) client-log scan)
+ *   - `bbl inspect-session <server uuid>` (tier (a) sqlite row,
+ *     which also surfaces `metadata.clientSessionId`)
+ *
+ * It also flags the most common root cause (embedded Nexus ran on
+ * memory storage and the session was never written to disk), which
+ * is the exact failure mode of the real sample
+ * `session_go_1781146359507755000`.
+ */
+export function goTuiClientSessionPersistenceHint(sessionId: string): string {
+  return (
+    `Session ${sessionId} looks like a Go TUI client placeholder ` +
+    `(session_go_<unixnano>); the server persists sessions under a canonical ` +
+    `session_<uuid> and carries this id only as metadata.clientSessionId. ` +
+    `This 404 usually means the session ran on an embedded Nexus that used ` +
+    `memory storage and was never written to disk. Run ` +
+    `'bbl inspect-session ${sessionId}' to reverse-resolve via the client log, ` +
+    `or 'bbl inspect-session <server uuid>' to read the sqlite row directly.`
+  )
+}

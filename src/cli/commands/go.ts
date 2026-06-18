@@ -5,6 +5,7 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import process from 'node:process'
 import { Command } from 'commander'
+import { resolveDefaultStoragePathForEnv } from '../../nexus/createRuntime.js'
 
 type ExistsFn = (path: string) => boolean
 type SpawnFn = typeof spawn
@@ -283,6 +284,46 @@ export async function runGoTuiCheckReport(
     } catch {
       lines.push(`[INFO]    Could not fetch /v1/runtime/version; compat check skipped.`)
     }
+  }
+
+  // 4. Embedded Nexus storage (Phase 4 of
+  //    go-tui-session-observability-governance-plan.md). `bbl go`
+  //    auto-starts a local Nexus child via createManagedNexusLaunchSpec,
+  //    which does NOT set NEXUS_STORAGE_PATH — so the child inherits
+  //    the runtime's production default. Surface the *would-be*
+  //    storage path so the operator can see whether sessions will
+  //    persist across `bbl go` exits (the contract PTY sequence
+  //    `embedded-nexus-persists-session` guards).
+  //
+  // Resolve against the injected env (not process.env) so the
+  // diagnostic reflects what `bbl go` would actually use, and stays
+  // unit-testable. We never start a Nexus here — this is a static
+  // prediction mirroring resolveDefaultStoragePath(undefined).
+  const env = deps.env ?? process.env
+  const homeDirForStorage = deps.homeDir ?? homedir()
+  const resolvedStorage = resolveDefaultStoragePathForEnv(undefined, env, homeDirForStorage)
+  if (resolvedStorage.kind === 'sqlite') {
+    const fileExists = exists(resolvedStorage.path)
+    const marker = fileExists ? 'exists' : 'absent'
+    lines.push(
+      `[INFO]    Embedded Nexus storage (would-be default): sqlite ${resolvedStorage.path} (${marker})`,
+    )
+    lines.push(
+      `          bbl go auto-starts a local Nexus without NEXUS_STORAGE_PATH, so the child ` +
+        `uses the runtime default above. Sessions persist across bbl go exits only when this ` +
+        `path is sqlite (memory = lost on exit).`,
+    )
+  } else {
+    // memory-opt-in (NODE_ENV=test) or memory-legacy.
+    lines.push(
+      `[WARN]    Embedded Nexus storage (would-be default): memory (${resolvedStorage.kind})`,
+    )
+    lines.push(
+      `          bbl go's embedded Nexus would NOT persist sessions to disk in this environment ` +
+        `(NODE_ENV=test or explicit :memory:). This is correct for tests but means a real ` +
+        `'bbl go' launch loses all sessions on exit. Run 'bbl go' outside a test shell to ` +
+        `get the sqlite default at <configDir>/db.sqlite.`,
+    )
   }
 
   lines.push('')

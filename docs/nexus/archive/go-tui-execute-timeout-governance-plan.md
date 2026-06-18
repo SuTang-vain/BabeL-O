@@ -334,9 +334,9 @@ Phase E 收口必须满足：
 
 ## 9. 与其它 reference 文档的关系
 
-- [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md)：本规划是其下"Go TUI 真实会话守门"的子项，不改变 Go TUI 与 Nexus 的所有权边界。
-- [session-finalization-and-evidence-governance-plan.md](./session-finalization-and-evidence-governance-plan.md)：本规划不涉及 session finalization 边界。
-- [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md)：本规划不涉及工具失败归因。
+- [go-tui-history.md](../history/go-tui-history.md)：本规划是其下"Go TUI 真实会话守门"的子项，不改变 Go TUI 与 Nexus 的所有权边界。
+- [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md)：本规划不涉及 session finalization 边界。
+- [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md)：本规划不涉及工具失败归因。
 - [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md)：本规划不新增工具，不修改现有工具职责。
 
 完成事实按 [../README.md 维护规则](../README.md) 写入 [../DONE.md](../DONE.md)。

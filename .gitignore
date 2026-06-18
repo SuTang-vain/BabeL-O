@@ -20,6 +20,7 @@ clients/go-tui/go-tui.exe
 docs/
 !docs/
 docs/*
+!docs/README.md
 !docs/releases/
 !docs/releases/*.md
 !docs/assets/

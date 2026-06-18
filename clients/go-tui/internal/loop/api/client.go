@@ -62,12 +62,12 @@ type LoopPaneState struct {
 //     INV-13). When PendingHints > 0, the runtime projection
 //     overrides status to "behaviorHint".
 type LoopHealthPane struct {
-	SessionID              string        `json:"sessionId"`
-	Agent                  string        `json:"agent"`
-	Status                 string        `json:"status"`
-	PendingPermissions     int           `json:"pendingPermissions"`
-	PendingScopeBoundaries int           `json:"pendingScopeBoundaries"`
-	OutOfScopeEvidence     int           `json:"outOfScopeEvidence"`
+	SessionID              string `json:"sessionId"`
+	Agent                  string `json:"agent"`
+	Status                 string `json:"status"`
+	PendingPermissions     int    `json:"pendingPermissions"`
+	PendingScopeBoundaries int    `json:"pendingScopeBoundaries"`
+	OutOfScopeEvidence     int    `json:"outOfScopeEvidence"`
 	// ActiveMemoryCandidates is the per-pane memory
 	// candidate count surfaced by /v1/runtime/loop/health
 	// (plan §3.2). The Nexus server may not yet emit this
@@ -110,6 +110,69 @@ type LoopHealthFilter struct {
 	LastN       int    `json:"lastN"`
 }
 
+// SessionInboxMessage mirrors a single entry in the
+// GET /v1/sessions/:id/inbox response. Field set is
+// deliberately minimal — the loop driver only consumes
+// the surface fields needed for the footer unread /
+// high-priority summary and the sidebar unread badge.
+// Source of truth: src/shared/sessionChannel.ts.
+type SessionInboxMessage struct {
+	MessageID    string `json:"messageId"`
+	ChannelID    string `json:"channelId"`
+	FromSessionID string `json:"fromSessionId"`
+	Type         string `json:"type"`
+	Priority     string `json:"priority"`
+	Status       string `json:"status"`
+	CreatedAt    string `json:"createdAt"`
+	AcknowledgedAt string `json:"acknowledgedAt,omitempty"`
+}
+
+// SessionInboxResponse mirrors GET /v1/sessions/:id/inbox.
+// We only model the fields the footer + sidebar consume
+// (linked-channel kind + the message list); session_id is
+// duplicated for sanity checks.
+type SessionInboxResponse struct {
+	Type    string               `json:"type"`
+	SessionID string              `json:"sessionId"`
+	Messages []SessionInboxMessage `json:"messages"`
+}
+
+// SessionInboxOptions tunes the inbox fetch. includeAck
+// defaults to false (the footer only cares about unread
+// counts); limit defaults to 20 to match the Nexus default.
+type SessionInboxOptions struct {
+	IncludeAcknowledged bool
+	Limit               int
+}
+
+// FetchSessionInbox wraps GET /v1/sessions/:id/inbox. Returns
+// the response struct on 200 and (zero, err) on any other
+// status. The loop driver calls this from the inbox tick
+// (see internal/loop/inbox_tick.go) for the focused pane's
+// session id; the chrome consumes the response via
+// activeInboxStatus / per-pane badge lookup.
+func (c *Client) FetchSessionInbox(ctx context.Context, sessionID string, opts SessionInboxOptions) (SessionInboxResponse, error) {
+	if sessionID == "" {
+		return SessionInboxResponse{}, errors.New("loop api: empty sessionID for inbox fetch")
+	}
+	q := url.Values{}
+	if opts.IncludeAcknowledged {
+		q.Set("includeAcknowledged", "true")
+	}
+	if opts.Limit > 0 {
+		q.Set("limit", fmt.Sprintf("%d", opts.Limit))
+	}
+	path := "/v1/sessions/" + url.PathEscape(sessionID) + "/inbox"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out SessionInboxResponse
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return SessionInboxResponse{}, err
+	}
+	return out, nil
+}
+
 // WaitResponse mirrors GET /v1/sessions/:id/wait.
 type WaitResponse struct {
 	Type         string            `json:"type"`
@@ -119,6 +182,24 @@ type WaitResponse struct {
 	Matched      bool              `json:"matched"`
 	Order        string            `json:"order"`
 	Limit        int               `json:"limit"`
+}
+
+// CreateSessionResponse mirrors POST /v1/sessions. bbl loop
+// uses this to allocate a canonical Nexus session before a
+// pane is persisted or starts its wait stream.
+type CreateSessionResponse struct {
+	Type            string `json:"type"`
+	SessionID       string `json:"sessionId"`
+	ClientSessionID string `json:"clientSessionId"`
+	CreatedAt       string `json:"createdAt"`
+}
+
+// CreateSessionRequest carries the optional session creation
+// metadata accepted by Nexus.
+type CreateSessionRequest struct {
+	Cwd             string
+	ClientSessionID string
+	Metadata        map[string]any
 }
 
 // ExecuteResponse mirrors POST /v1/execute. The loop driver
@@ -280,6 +361,28 @@ func (c *Client) WaitForEvents(ctx context.Context, sessionID string, opts WaitO
 	return out, nil
 }
 
+// CreateSession allocates a server-side canonical session id.
+func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (CreateSessionResponse, error) {
+	body := map[string]any{}
+	if req.Cwd != "" {
+		body["cwd"] = req.Cwd
+	}
+	if req.ClientSessionID != "" {
+		body["clientSessionId"] = req.ClientSessionID
+	}
+	if len(req.Metadata) > 0 {
+		body["metadata"] = req.Metadata
+	}
+	var out CreateSessionResponse
+	if err := c.doJSON(ctx, http.MethodPost, "/v1/sessions", body, &out); err != nil {
+		return CreateSessionResponse{}, err
+	}
+	if out.SessionID == "" {
+		return CreateSessionResponse{}, errors.New("server returned empty sessionId for POST /v1/sessions")
+	}
+	return out, nil
+}
+
 // ExecutePrompt wraps POST /v1/execute for the loop driver.
 // This is the first 6d execution bridge: HTTP gives us a
 // deterministic "prompt in, events out" path before the later
@@ -410,14 +513,14 @@ func (c *Client) CancelSession(ctx context.Context, sessionID, reason string) (C
 // natural completion) or flip straight to a "cancelled
 // by operator" status.
 type CancelResponse struct {
-	Type                    string `json:"type"`
-	SessionID               string `json:"sessionId"`
-	Phase                   string `json:"phase"`
+	Type                     string `json:"type"`
+	SessionID                string `json:"sessionId"`
+	Phase                    string `json:"phase"`
 	ActiveExecutionCancelled bool   `json:"activeExecutionCancelled"`
-	RequestID               string `json:"requestId,omitempty"`
-	Transport               string `json:"transport,omitempty"`
-	PermissionsResolved     int    `json:"permissionsResolved"`
-	ChildSessionsCancelled  int    `json:"childSessionsCancelled"`
+	RequestID                string `json:"requestId,omitempty"`
+	Transport                string `json:"transport,omitempty"`
+	PermissionsResolved      int    `json:"permissionsResolved"`
+	ChildSessionsCancelled   int    `json:"childSessionsCancelled"`
 }
 
 // ApprovePermissionOptions carries the optional scope/rule/

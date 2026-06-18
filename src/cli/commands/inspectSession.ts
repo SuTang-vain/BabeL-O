@@ -4,6 +4,20 @@ import { homedir } from 'node:os'
 import chalk from 'chalk'
 import { Command } from 'commander'
 import { DatabaseSync } from 'node:sqlite'
+import {
+  projectAgentTrace,
+  traceToJsonl,
+  traceToJson,
+  type AgentTrace,
+} from '../../runtime/agentTrace.js'
+import {
+  deriveResumableState,
+  type DerivedResumableState,
+} from '../../runtime/runCheckpoint.js'
+import type { NexusEvent } from '../../shared/events.js'
+import type { TaskSessionTerminalReason } from '../../shared/session.js'
+
+const TERMINAL_REASON_CATEGORIES = ['error', 'timeout', 'cancelled', 'provider', 'runtime', 'unknown'] as const
 
 /**
  * Phase 0 of `docs/nexus/reference/go-tui-session-observability-governance-plan.md`:
@@ -47,6 +61,12 @@ export type SessionRow = {
   error: string | null
   eventCount: number
   compactBoundaries: CompactBoundaryInspection[]
+  // clientSessionId is the Go TUI Phase 1 back-reference
+  // (typically `session_go_<unixnano>`) stored in the server
+  // session row's metadata column. Empty when the client
+  // didn't set one (bbl chat, curl, older Go TUI) or when
+  // the metadata column is missing.
+  clientSessionId: string | null
 }
 
 export type CompactBoundaryInspection = {
@@ -157,28 +177,55 @@ export function findSessionInSqlite(
     // Probe: the `sessions` table is created by `SqliteStorage` (see
     // `src/storage/SqliteStorage.ts`). If the schema is missing, we
     // treat it as "no row" rather than throwing.
-    const row = db
-      .prepare(
-        `SELECT session_id, phase, cwd, created_at, updated_at,
-                substr(coalesce(prompt, ''), 1, 200) AS prompt,
-                result, error
-           FROM sessions
-          WHERE session_id = ?
-          LIMIT 1`,
-      )
-      .get(sessionId) as
-      | {
-          session_id: string
-          phase: string | null
-          cwd: string | null
-          created_at: string | null
-          updated_at: string | null
-          prompt: string | null
-          result: string | null
-          error: string | null
-        }
-      | undefined
+    //
+    // Phase 1 tier (a) upgrade: also select `metadata` so the Go TUI
+    // back-reference (body.metadata.clientSessionId) can be surfaced.
+    // Pre-Phase-1 databases may lack the `metadata` column entirely;
+    // we fall back to the same query without it rather than crashing.
+    const queryWithMeta =
+      `SELECT session_id, phase, cwd, created_at, updated_at,
+              substr(coalesce(prompt, ''), 1, 200) AS prompt,
+              result, error, metadata
+         FROM sessions
+        WHERE session_id = ?
+        LIMIT 1`
+    const queryWithoutMeta =
+      `SELECT session_id, phase, cwd, created_at, updated_at,
+              substr(coalesce(prompt, ''), 1, 200) AS prompt,
+              result, error
+         FROM sessions
+        WHERE session_id = ?
+        LIMIT 1`
+
+    let row: Record<string, string | null> | undefined
+    try {
+      row = db.prepare(queryWithMeta).get(sessionId) as Record<string, string | null> | undefined
+    } catch {
+      // metadata column missing (pre-Phase-1 schema) — retry without it.
+      row = db.prepare(queryWithoutMeta).get(sessionId) as Record<string, string | null> | undefined
+    }
     if (!row) return null
+
+    // Phase 1 tier (a) upgrade: read body.metadata.clientSessionId
+    // so `bbl inspect-session <server uuid>` can also surface the
+    // Go TUI Phase 1 back-reference (typically session_go_<unixnano>).
+    // Defensive parse: SqliteStorage stores metadata as JSON;
+    // a malformed blob (e.g. written by an older Nexus) must NOT
+    // break the rest of the row's rendering. The fallback query
+    // (without metadata column) leaves this null — correct for
+    // pre-Phase-1 databases.
+    let clientSessionId: string | null = null
+    if (row.metadata) {
+      try {
+        const parsed = JSON.parse(row.metadata) as { clientSessionId?: unknown }
+        if (typeof parsed.clientSessionId === 'string' && parsed.clientSessionId) {
+          clientSessionId = parsed.clientSessionId
+        }
+      } catch {
+        // Malformed metadata: leave clientSessionId null; the rest
+        // of the row still renders normally.
+      }
+    }
 
     // Count events (separate query so we can return the row even when
     // the events table is empty).
@@ -195,7 +242,7 @@ export function findSessionInSqlite(
     }
 
     return {
-      sessionId: row.session_id,
+      sessionId: row.session_id ?? '',
       phase: row.phase,
       cwd: row.cwd,
       createdAt: row.created_at,
@@ -205,6 +252,7 @@ export function findSessionInSqlite(
       error: row.error,
       eventCount,
       compactBoundaries,
+      clientSessionId,
     }
   } catch {
     return null
@@ -447,6 +495,67 @@ function formatCompactBoundaryInspection(boundary: CompactBoundaryInspection): s
   return `${boundary.type} trigger=${boundary.trigger ?? 'unknown'} ${counts}${tokens}${saved}${retained}${tail}${summary}`
 }
 
+/**
+ * Render a `DerivedResumableState` as a human-readable resume diagnostic.
+ * The block is the operator-facing answer to "where did this run stop and what
+ * next" — paired with `--json` for the machine-readable form. Coloring follows
+ * the rest of the inspect-session output: green for resumable, yellow for
+ * recoverable/conditional, red for cannot-resume.
+ */
+export function formatResumeState(
+  sessionId: string,
+  state: import('../../runtime/runCheckpoint.js').DerivedResumableState,
+): string {
+  const lines: string[] = []
+  const s = state.state
+  const stateColor =
+    s.state === 'resume_possible' || s.state === 'retry_from_provider_turn' || s.state === 'terminal_failed_recoverable'
+      ? chalk.green
+      : s.state === 'waiting_permission'
+        ? chalk.yellow
+        : chalk.red
+  lines.push(stateColor(`▶ ${s.state}`))
+  lines.push(`  session_id : ${sessionId}`)
+  lines.push(`  boundary   : ${s.boundary ?? '<none>'}`)
+  lines.push(`  reason     : ${s.reason}`)
+  if (s.state === 'waiting_permission' && (s as { toolUseId?: string }).toolUseId) {
+    lines.push(`  tool_use_id: ${(s as { toolUseId?: string }).toolUseId}`)
+  }
+  lines.push(`  continuation_snapshot: ${state.hasContinuationSnapshot}`)
+  if (state.pendingPermissionToolUseId) {
+    lines.push(`  pending_permission   : ${state.pendingPermissionToolUseId}`)
+  }
+  if (state.warnings.length > 0) {
+    lines.push(`  warnings:`)
+    for (const w of state.warnings) lines.push(`    - ${w}`)
+  }
+  // Honest "next action" hint — kept aligned with the v1 governance rule that
+  // pending permission is only durable if a continuation snapshot exists.
+  const next =
+    s.state === 'resume_possible'
+      ? 'next: resume from this boundary in the live process'
+      : s.state === 'retry_from_provider_turn'
+        ? 'next: retry from the provider turn; the in-flight tool call was not completed'
+        : s.state === 'waiting_permission'
+          ? state.hasContinuationSnapshot
+            ? 'next: approve or deny the pending permission to resume'
+            : 'next: re-issue the approval; the live pending entry was not recovered (process-local only)'
+          : s.state === 'terminal_failed_recoverable'
+            ? 'next: re-run the prompt; the run ended with a failed terminal event'
+            : 'next: cannot resume — re-run the prompt to start a fresh continuation'
+  lines.push(`  ${stateColor(next)}`)
+  // Always add the process-local caveat when the caller didn't supply a
+  // continuation snapshot (the CLI's default). Operators reading this output
+  // should know the durability gap.
+  if (!state.hasContinuationSnapshot) {
+    lines.push(chalk.gray(
+      `  note: derived without a continuation snapshot; v1 does not persist one, so ` +
+        `only waiting_permission + a re-issued approval are actually recoverable across restart.`,
+    ))
+  }
+  return lines.join('\n')
+}
+
 export function reverseResolveClientSessionId(
   clientLogPath: string,
   clientSessionId: string,
@@ -473,6 +582,200 @@ export function reverseResolveClientSessionId(
   return null
 }
 
+/**
+ * Agent Trace Schema export (agent-runtime-architecture-maturity-plan.md §3.1).
+ *
+ * Reads the full ordered event stream for a session from local SQLite (raw SQL,
+ * read-only — same access pattern as `findSessionInSqlite`), then projects it
+ * into an `AgentTrace` via the pure `projectAgentTrace` projector.
+ *
+ * Hard invariants (same as the rest of inspect-session):
+ *  - Read-only; opens the DB with `readOnly: true`.
+ *  - No provider / HTTP / config writes; purely local SQLite + projection.
+ *  - Returns `null` when the DB or `events` table is absent or the session has
+ *    no events — callers emit an honest "no trace" message rather than a partial
+ *    one.
+ *
+ * `session_go_<unixnano>` ids are reverse-resolved to the server uuid via the
+ * client log, mirroring `inspectSession`, so `bbl inspect-session <go id>
+ * --trace` works the same as the non-trace path.
+ */
+export function exportSessionTrace(
+  sessionId: string,
+  options: { sqlitePath?: string } = {},
+): AgentTrace | null {
+  const trace = exportSessionTraceDirect(sessionId, options)
+  if (trace) return trace
+  if (sessionId.startsWith('session_go_')) {
+    const { clientLogPath } = resolveLogPaths()
+    const serverId = reverseResolveClientSessionId(clientLogPath, sessionId)
+    if (serverId) return exportSessionTraceDirect(serverId, options)
+  }
+  return null
+}
+
+export function exportSessionTraceDirect(
+  sessionId: string,
+  options: { sqlitePath?: string },
+): AgentTrace | null {
+  const events = readOrderedEvents(sessionId, options)
+  if (events === null) return null
+  if (events.length === 0) return null
+  return projectAgentTrace(events)
+}
+
+/**
+ * Durable Run Checkpoint / Resume export (agent-runtime-architecture-maturity-plan.md §3.3).
+ *
+ * Derives the resumable execution state of a run from persisted data: the
+ * session row (phase + terminal reason) plus the ordered event stream. Returns
+ * a `DerivedResumableState` that lets `bbl inspect-session <id> --resume` report
+ * where the run stopped, whether it can resume, and what should happen next.
+ *
+ * Same invariants as the rest of inspect-session: read-only, no provider/HTTP,
+ * `session_go_<unixnano>` reverse-resolved via the client log. Returns `null`
+ * when the session is absent (no row + no events).
+ *
+ * Governance (plan §3.3 acceptance #2): the derived state honestly reports
+ * `hasContinuationSnapshot: false` — v1 persists no in-process continuation
+ * snapshot, so a pending permission is NOT described as durable unless a live
+ * caller upgrades the flag. The CLI always passes the default (false), matching
+ * a post-restart inspection.
+ */
+export function exportSessionResumeState(
+  sessionId: string,
+  options: { sqlitePath?: string; pendingPermissionToolUseId?: string | null } = {},
+): DerivedResumableState | null {
+  const direct = exportSessionResumeStateDirect(sessionId, options)
+  if (direct) return direct
+  if (sessionId.startsWith('session_go_')) {
+    const { clientLogPath } = resolveLogPaths()
+    const serverId = reverseResolveClientSessionId(clientLogPath, sessionId)
+    if (serverId) return exportSessionResumeStateDirect(serverId, options)
+  }
+  return null
+}
+
+function exportSessionResumeStateDirect(
+  sessionId: string,
+  options: { sqlitePath?: string; pendingPermissionToolUseId?: string | null },
+): DerivedResumableState | null {
+  const events = readOrderedEvents(sessionId, options)
+  if (events === null) return null
+  // The session row gives us phase + terminal reason. When the row is absent
+  // but events exist (e.g. events without a sessions row), fall back to a
+  // permissive phase so the event-stream derivation still runs.
+  const sessionRow = readSessionPhaseRow(sessionId, options)
+  const phase = (sessionRow?.phase ?? 'executing') as 'created' | 'planning' | 'executing' | 'reviewing' | 'waiting_user' | 'waiting_permission' | 'completed' | 'failed' | 'cancelled'
+  return deriveResumableState({
+    session: {
+      phase,
+      terminalReason: sessionRow?.terminalReason,
+      error: sessionRow?.error ?? undefined,
+    },
+    events,
+    pendingPermissionToolUseId: options.pendingPermissionToolUseId ?? null,
+    hasContinuationSnapshot: false,
+  })
+}
+
+type ResumableSessionRow = {
+  phase: string | null
+  error: string | null
+  terminalReason?: TaskSessionTerminalReason
+}
+
+function readSessionPhaseRow(
+  sessionId: string,
+  options: { sqlitePath?: string },
+): ResumableSessionRow | null {
+  const dbPath = options.sqlitePath ?? resolveSqlitePath()
+  if (!existsSync(dbPath)) return null
+  let db: DatabaseSync
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+  } catch {
+    return null
+  }
+  try {
+    const row = db
+      .prepare(`SELECT phase, error, terminal_reason FROM sessions WHERE session_id = ? LIMIT 1`)
+      .get(sessionId) as { phase: string | null; error: string | null; terminal_reason: string | null } | undefined
+    if (!row) return null
+    let terminalReason: ResumableSessionRow['terminalReason']
+    if (row.terminal_reason) {
+      try {
+        const parsed = JSON.parse(row.terminal_reason) as { category?: string; code?: string; message?: string }
+        if (parsed && typeof parsed === 'object' && typeof parsed.code === 'string') {
+          const category = (TERMINAL_REASON_CATEGORIES as readonly string[]).includes(parsed.category ?? '')
+            ? (parsed.category as TaskSessionTerminalReason['category'])
+            : 'unknown'
+          terminalReason = {
+            category,
+            code: parsed.code,
+            message: typeof parsed.message === 'string' ? parsed.message : '',
+          }
+        }
+      } catch {
+        // malformed terminal_reason blob — leave undefined; derivation still runs on phase + events
+      }
+    }
+    return { phase: row.phase, error: row.error, ...(terminalReason ? { terminalReason } : {}) }
+  } catch {
+    // sessions table missing or unreadable
+    return null
+  } finally {
+    try { db.close() } catch { /* ignore */ }
+  }
+}
+
+/**
+ * Read the full ordered event stream for a session from local SQLite.
+ * Shared by `exportSessionTrace` and `exportSessionResumeState`. Returns `null`
+ * when the DB / events table is absent (honest "no data"); returns `[]` when
+ * the session row region exists but has zero events.
+ */
+function readOrderedEvents(
+  sessionId: string,
+  options: { sqlitePath?: string },
+): NexusEvent[] | null {
+  const dbPath = options.sqlitePath ?? resolveSqlitePath()
+  if (!existsSync(dbPath)) return null
+  let db: DatabaseSync
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+  } catch {
+    return null
+  }
+  try {
+    const rows = db
+      .prepare(
+        `SELECT event_json FROM events
+          WHERE session_id = ?
+          ORDER BY event_seq ASC, event_key ASC`,
+      )
+      .all(sessionId) as { event_json: string | null }[]
+    const events: NexusEvent[] = []
+    for (const row of rows) {
+      if (!row.event_json) continue
+      try {
+        const parsed = JSON.parse(row.event_json)
+        if (parsed && typeof parsed === 'object' && typeof (parsed as { type?: unknown }).type === 'string') {
+          events.push(parsed as NexusEvent)
+        }
+      } catch {
+        // Skip malformed event row; projectors are defensive anyway.
+      }
+    }
+    return events
+  } catch {
+    // events table missing or unreadable.
+    return null
+  } finally {
+    try { db.close() } catch { /* ignore */ }
+  }
+}
+
 export function registerInspectSessionCommand(program: Command): void {
   program
     .command('inspect-session')
@@ -483,11 +786,56 @@ export function registerInspectSessionCommand(program: Command): void {
     )
     .argument('<sessionId>', 'Session id (e.g. `session_go_1781146359507755000`)')
     .option('--json', 'Print raw JSON output')
+    .option('--trace', 'Export the session as a machine-readable agent trace (Agent Trace Schema §3.1)')
+    .option('--resume', 'Report the resumable execution state of the run (Agent Runtime Maturity §3.3)')
     .option('--sqlite-path <path>', 'Override local SQLite path (for tests)')
     .action(async (
       sessionId: string,
-      options: { json?: boolean; sqlitePath?: string },
+      options: { json?: boolean; trace?: boolean; resume?: boolean; sqlitePath?: string },
     ) => {
+      // --trace short-circuits the persistence-tier diagnostic and emits a
+      // machine-readable agent trajectory instead. `--json` selects a single
+      // pretty JSON blob; the default is JSONL (one record per line) which is
+      // append/export friendly.
+      if (options.trace) {
+        const trace = exportSessionTrace(sessionId, { sqlitePath: options.sqlitePath })
+        if (!trace) {
+          console.error(chalk.red(
+            `✗ No events found for session ${sessionId} in local SQLite` +
+              (options.sqlitePath ? ` (${options.sqlitePath})` : ` (${resolveSqlitePath()})`) +
+              `. Cannot build a trace without a persisted event stream.`,
+          ))
+          process.exitCode = 1
+          return
+        }
+        console.log(options.json ? traceToJson(trace) : traceToJsonl(trace))
+        return
+      }
+      // --resume reports the §3.3 Durable Run Checkpoint / Resume state:
+      // where the run stopped, whether it can resume, and what should
+      // happen next. `--json` emits the raw DerivedResumableState; the
+      // default renders a human-readable block. The CLI always passes
+      // `hasContinuationSnapshot: false` (post-restart inspection) and
+      // no live pending-permission id — the derivation is honest about
+      // v1 not persisting a continuation snapshot.
+      if (options.resume) {
+        const resumeState = exportSessionResumeState(sessionId, { sqlitePath: options.sqlitePath })
+        if (!resumeState) {
+          console.error(chalk.red(
+            `✗ No events found for session ${sessionId} in local SQLite` +
+              (options.sqlitePath ? ` (${options.sqlitePath})` : ` (${resolveSqlitePath()})`) +
+              `. Cannot derive a resume state without a persisted event stream.`,
+          ))
+          process.exitCode = 1
+          return
+        }
+        if (options.json) {
+          console.log(JSON.stringify(resumeState, null, 2))
+          return
+        }
+        console.log(formatResumeState(sessionId, resumeState))
+        return
+      }
       const result = options.sqlitePath
         ? (() => {
             const row = findSessionInSqlite(sessionId, { sqlitePath: options.sqlitePath })
@@ -514,6 +862,14 @@ export function registerInspectSessionCommand(program: Command): void {
         const row = result.row
         console.log(chalk.green(`✓ Found session in local SQLite`))
         console.log(`  session_id : ${row.sessionId}`)
+        // Phase 1 tier (a) upgrade: show the Go TUI
+        // back-reference when present, so the operator
+        // can pivot from a server uuid back to a
+        // session_go_<unixnano> (or any other client
+        // marker) without grepping the client log.
+        if (row.clientSessionId) {
+          console.log(`  client_id  : ${row.clientSessionId}`)
+        }
         console.log(`  phase      : ${row.phase ?? '<unknown>'}`)
         console.log(`  cwd        : ${row.cwd ?? '<unknown>'}`)
         console.log(`  created_at : ${row.createdAt ?? '<unknown>'}`)

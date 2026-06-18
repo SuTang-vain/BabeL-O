@@ -424,7 +424,7 @@ export class ExploreAgentScheduler implements AgentScheduler {
 }
 
 export function createExploreRuntime(options: ExploreAgentRuntimeFactoryOptions): NexusRuntime {
-  const tools = createDefaultToolRegistry()
+  const tools = createDefaultToolRegistry({ storage: options.storage ?? null })
   if (options.agentType === 'review' || options.agentType === 'test') {
     tools.set('Bash', createRestrictedAgentBashTool(options.agentType, tools.get('Bash')))
   }

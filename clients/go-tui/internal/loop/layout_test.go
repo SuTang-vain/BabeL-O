@@ -17,6 +17,7 @@ func seedPaneModel(width, height, paneCount int) LoopModel {
 			WorkspaceID: model.Workspaces[0].ID,
 			TabID:       tab.ID,
 			SessionID:   paneID(i) + "-session",
+			Cwd:         "/tmp",
 		})
 		if err != nil {
 			panic(err)

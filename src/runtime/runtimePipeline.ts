@@ -829,6 +829,13 @@ export async function refreshRuntimeContextState(options: ContextAssemblerOption
     mapEventsToMessages: options.mapEventsToMessages,
     memoryProvider: options.memoryProvider,
     sessionInbox: options.sessionInbox,
+    // §3.5 v1.1 follow-up: forward the hot-path memory_retrieval
+    // hook from `refreshRuntimeContextState` callers. Spread
+    // conditionally so a missing hook is a no-op (the `assembleContext`
+    // option is optional, but a literal `undefined` would also be
+    // accepted — the conditional is just to keep the object
+    // minimal when no caller wired a hook).
+    ...(options.onMemoryRetrieval && { onMemoryRetrieval: options.onMemoryRetrieval }),
   })
   // PR-A2: publish to contextBroadcaster (fire-and-forget, no-op when
   // no subscribers; never throws into the hot path).

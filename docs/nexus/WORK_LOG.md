@@ -2,6 +2,289 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-17 — Agent Runtime Maturity: Trajectory Eval Harness v1 收口
+
+- **背景**: `agent-runtime-architecture-maturity-plan.md` §3.2（plan §5 step 3）。Agent Trace Schema v1 刚收口，eval harness 直接消费 `projectAgentTrace` 投影。目标：面向 agent trajectory 的 eval（不是函数输出 / 最终文本），离线、确定性、不依赖真实 provider key。这是把"真实 session regression 转成 eval fixture"守门能力落地的前提。
+- **设计决策**:
+  - v1 = **离线 trace-fixture eval**。每个 fixture 是一段 recorded event stream（被测 trajectory）+ 声明式 check 期望。harness 把 stream 投影成 `AgentTrace`，跑 6 个 builtin discipline check。无 provider key、无 live workspace、无网络。
+  - fixture 格式用单 TS 模块 `evals/coding/<id>.ts`（`ev.*` compact builder + `defineFixture`），而不是 plan 字面的 `prompt.md`/`workspace/`/`expected.json`/`checks.ts` 多文件结构——后者是 live-workspace 模式，依赖 §3.3 的 resume/replay 机制，延后 v1.1。10 个 fixture 用单模块格式更可维护。
+  - **自验证**：fixture 声明 `expectChecks: { checkKey: expectedSeverity }`，harness 断言 actual===expected。fixture `verdict=pass` iff 全部断言匹配。eval exit 1 当任一 fixture misclassify——这样 fixture（已知 good/bad trajectory）证明 check suite 能正确区分。
+- **实现**:
+  - `src/eval/fixtureBuilder.ts`: `ev.*` 事件 builder（填 schemaVersion / sessionId / 自增确定性 timestamp）+ `defineFixture()`。
+  - `src/eval/trajectoryEval.ts`: `CheckSeverity` (pass/warn/fail/skip) / `CheckKey` / `CheckResult` / `FixtureMetrics` / `FixtureResult` / `EvalReport` 类型；`CHECKS` 6 个 builtin check；`runFixture` / `runAll` / `computeMetrics`。
+    - `task_success`: v1 `skip`（需 live-workspace，§3.3）。
+    - `tool_discipline`: 第一个 write/execute tool_call 前是否有 read/search → pass/fail。
+    - `permission_discipline`: 每个 write/execute 要么 approved 要么 completed（auto-approve）；repeated denial ≥2 → fail。
+    - `scope_discipline`: scope_boundary action deny/require_confirmation → fail；warn → warn；无 → pass。
+    - `context_discipline`: 同 path Read >2 次 → warn；large truncated read (originalBytes ≥ 100k) → warn。
+    - `memory_discipline`: 有 memory_update → warn（v1 无法 auto-decide memory-as-fact，需 §3.5 retrieval span）；无 → pass。
+  - `src/runtime/agentTrace.ts` 小幅增强：tool_call span attributes 增 best-effort `path`（从 `tool_started.input.path` 提取，仅 path-bearing tool），让 context_discipline 的 repeated-read 检测能纯从 trace 完成。3 个 tool_call span 路径（completed/denied/orphan）+ 新 `extractToolPathAttr` helper。
+  - `scripts/eval-agent.ts`: glob `evals/coding/*.ts`，dynamic import，`runAll`，per-fixture 报告（verdict / checks / metrics cost+toolCount+permissionCount+scopeWarnings+spanCount / projectorWarnings / mismatches）+ summary；`--json` machine-readable；exit 1 当有 mismatch。
+  - `evals/coding/` 10 个 fixture：read-before-edit-good / edit-without-read-bad / permission-approved-good / permission-repeated-deny-bad / scope-contained-good / scope-escape-bad / context-repeated-reads-bad / context-truncated-bad / memory-hint-caution-warn / compact-recovery-good。
+  - `evals/README.md` authoring guide（格式 / 自验证 / 6 check 表 / 真实 regression 转 fixture 流程 / v1.1 deferred）。
+  - `package.json`: `eval:agent` script；`test` script 补 `test/agent-trace.test.ts` + `test/eval-agent.test.ts`（上次 trace 收口时漏加 agent-trace，一并补齐）。
+- **验证**:
+  - `npx tsc --noEmit`：0 errors。
+  - `npm run eval:agent`：10/10 fixture 自验证通过，0 mismatch。
+  - `test/eval-agent.test.ts`：19/19 pass（6 check 各 pass/warn/fail/skip 路径 + runFixture 自验证 pass/fail + computeMetrics + runAll 聚合）。
+  - `test/agent-trace.test.ts`：19/19 pass（path 增强 不破坏既有投影测试）。
+  - 累计 agent-trace 19 + eval-agent 19 + inspect-session 23 + system-prompt-builder 28 pass，0 回归。
+- **边界**:
+  - 不改 runtime / storage / provider 行为；纯新增 eval 模块 + projector 6 行 path 增强。
+  - 不依赖 OpenTelemetry / LangSmith / 真实 provider。
+  - `task_success` + 完整 `memory_discipline` auto-decide 诚实标 skip/warn，不伪造 pass。
+- **后续可推进**: §3.3 Durable Run Checkpoint / Resume（plan §5 step 4，唯一剩余 P1 打开项）；v1.1 live-workspace eval 模式依赖它。§3.4 MCP / §3.5 Memory Quality / §3.6 Loop Taxonomy 仍 P2。
+
+## 2026-06-17 — Agent Runtime Maturity: Agent Trace Schema v1 收口
+
+- **背景**: `agent-runtime-architecture-maturity-plan.md` §3.1 列为 P1 首项。现有 runtime metrics / toolTrace / permission_audit / behaviorTrace 各自存在但不是统一 trajectory。目标：从现有 `NexusEvent` 派生一个可重建的 agent trace，不引入第二事实源（toolTrace / execution_metrics side table 本身已是 event 的派生投影，读 event stream 即足够）。这是 plan §5 实施顺序的第 1-2 步，也是 §3.2 Trajectory Eval Harness 的前置依赖。
+- **实现**:
+  - `src/runtime/agentTrace.ts`（新文件，纯投影模块）:
+    - `projectAgentTrace(events: ReadonlyArray<NexusEvent>): AgentTrace` — 纯函数，无 storage / 无 clock / 无 I/O。
+    - 9 个 span kind：`run` / `provider_invocation` / `tool_call` / `permission_decision` / `scope_boundary` / `compact_recovery` / `memory_update` / `sub_agent_handoff` / `final_result`。
+    - parent-child：`permission_decision` + `scope_boundary` 通过 `toolUseId` 父接到对应 `tool_call`；其余父接到 `run`。
+    - `provider_invocation`：每个 `execution_metrics` event 一个 span（带 token cost + provider 时序）；若无 execution_metrics 但有 stream deltas，按 delta burst 合成降级 span + warning。
+    - spanId 确定性派生（`run` / `tool:<toolUseId>` / `perm:<toolUseId>` / `provider:<index>` / `compact:<index>` 等），replayed event stream 复现相同 ID。
+    - 降级路径全部 emit 人可读 warning：无 session_started / 无 terminal / deltas 无 execution_metrics / orphan tool_started / orphan permission_request / 空 stream。
+    - 序列化：`traceToJsonl`（header `record:trace` + 每 span 一行 `record:span`，append-friendly）+ `traceToJson`（单 blob）。
+  - `src/cli/commands/inspectSession.ts`:
+    - `exportSessionTrace(sessionId, { sqlitePath })` — read-only 打开 SQLite（`readOnly: true`，复用 `findSessionInSqlite` 的访问模式），`SELECT event_json FROM events ORDER BY event_seq, event_key`，JSON.parse，喂给 projector。`session_go_<unixnano>` 走 client log reverse-resolve，与非 trace 路径一致。无 events / 无 DB → 返回 null（honest "no trace"）。
+    - `bbl inspect-session <id> --trace` flag：短路 persistence-tier 诊断，直接 emit JSONL（`--json` 切单 blob）。无 trace 时 exitCode=1 + 错误文案。
+- **验证**:
+  - `npx tsc --noEmit`：0 errors（含此前 pre-existing `inspectSession.ts:231` 也已不在）。
+  - `test/agent-trace.test.ts`：19/19 pass（覆盖 required span kinds / parent-child / ordering / 5 种降级 / permission denied path / determinism / JSONL+JSON 序列化 / sub-agent 分组）。
+  - `test/inspect-session.test.ts`：23/23 pass（含新增 3 个 `exportSessionTrace` 集成 test：真实 event JSON → trace 投影 / 无 events → null / 无 DB → null）。
+- **边界**:
+  - 不改任何 runtime / storage / provider 行为；纯新增模块 + CLI flag。
+  - 不引入 OpenTelemetry / LangSmith 依赖；字段名 exporter-friendly 但 v1 不要求集成。
+  - `memory_retrieval` span 延后到 §3.5（当前只有 `session_memory_updated`，无 retrieval event）。
+- **后续可推进**: §3.2 Trajectory Eval Harness（plan §5 step 3，消费 exported trace）+ §3.3 Durable Run Checkpoint / Resume。两者仍是 P1 打开项。
+
+## 2026-06-17 — Context CWD Drift Phase A 下游链路 integration 收口
+
+- **背景**: Phase A 的 unit test（`extractAbsolutePaths` 4 case）只守了 prompt → explicit paths 提取这一入口。真实 regression `session_981cc5c2` 的失败链路有两个下游失败点：`resolveCwdFromPrompt` 把 cwd 推到 `/`（event_seq=9447）+ `deriveTaskScope` 把 `primaryRoot` 设为 `/`（event_seq=9449）。plan 的 Test Plan 把这条 integration 列为"Phase B/D 推进时补"，但它是 Phase A 行为的直接下游验证，应在 Phase A 收口时一起守住，不必等 Phase B/D。
+- **实现**:
+  - `src/runtime/LLMCodingRuntime.ts:1278` `resolveCwdFromPrompt` 加 `export`（纯函数，仅 existsSync/lstatSync，无副作用），供测试直接守 event_seq=9447 的 cwd 漂移。
+  - `test/runtime.test.ts` 在既有 `deriveTaskScope` test（line 365）之后新增 3 个 test：
+    - `resolveCwdFromPrompt keeps project cwd when prompt only has a CJK slash fragment` — prompt `查看有无咱们刚刚聊到的上下文管理优化的相关文档/信息` + project cwd → 返回 project cwd（pre-Phase-A 返回 `/`）。
+    - `resolveCwdFromPrompt still follows a real existing absolute path in the prompt` — prompt 含 `tmpdir()` 真实路径 → 仍 resolve 到该路径（防 over-filtering 回归）。
+    - `deriveTaskScope stays single-rooted at the project when prompt has a CJK slash fragment` — `primaryRoot === projectCwd`、`explicitRoots === []`、`mode === 'single_root'`、`source === 'cwd'`（pre-Phase-A `explicitRoots` 含 `/信息`、`mode === 'multi_root'`）。
+- **验证**:
+  - `npx tsx --test --test-name-pattern="CJK slash fragment|real existing absolute path" test/runtime.test.ts`：3/3 pass。
+  - 既有 `resolves cwd from prompt absolute path`（full runtime，line 7798）+ `derives task scope and classifies external boundaries`（line 365）：2/2 pass，0 回归。
+  - `npx tsc --noEmit`：除 pre-existing `inspectSession.ts:231` 外 0 errors。
+- **边界**: 无 production 行为变化（仅 `export` 一个既有纯函数）；不动 `resolveCwdFromPrompt` / `deriveTaskScope` / `extractAbsolutePaths` 逻辑。
+- **后续影响**: Phase B（`SessionRootContinuity` 决策 helper）推进时，`deriveTaskScope` test 就是它的 baseline — 任何 SessionRootContinuity 改动都必须保持这条 single-root 不变量。Phase D / E 仍按真实 regression 触发推进。
+
+## 2026-06-17 — Context CWD Drift 计划升级：Draft → Active Plan
+
+- **背景**：`docs/nexus/proposals/context-cwd-drift-and-recall-governance-plan.md` 之前标记为 `State: Draft`，但内容已具备完整规划要素（真实 regression `session_981cc5c2-230c-40d1-953c-b956e9dbaaf7` 的 root-cause chain / 5 个 phase / 4 设计原则 / 已有 entry points 列表 / 8 条 non-goals / 中文概述），且 v2 文档分层规则要求 `reference/` 只保留 Active Plan / Index / Guide。Phase A（路径分类硬化）与 Phase C（recall 工具 storage contract）已分别在代码中收口。
+- **变更**:
+  - 文件移动：`docs/nexus/proposals/context-cwd-drift-and-recall-governance-plan.md` → `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md`。
+  - 文件内部相对链接：head Related 行 + Document Ownership 段从 `../reference/...` / `./...` 改为 `./...` / `../proposals/...` 以匹配新位置。
+  - 文档头部：`State: Draft` → `State: Active Plan`；`Priority: P1` + Phase A / C 收口标注；新增 **Status (2026-06-17)** 段落。
+  - 新增 §1 Existing Entry Points（10 行代码位置 + 角色 + 状态表）、§2 Design Principles（4 条：runtime owns scope / path is hint not order / storage contract / calibration precedes policy）。
+  - 拆 Phases 表为 §5.1-§5.5 子节，per-phase 状态、覆盖样本、未触动范围全部独立可读。
+  - 移除 `## Verification` 重复段，Test Plan 三层（focused / integration / e2e）取而代之。
+  - 中文概述同步从"草案"措辞改为"2026-06-17 升级为 Active Plan / Phase A 与 Phase C 收口 / Phase B/D/E 仍 Open"措辞。
+  - `context-governance-index.md`：3 处交叉引用（head Related + Ownership Map + Open Items）从 `../proposals/...` 改为 `./...`；Open Items 中 CWD drift 状态从 "Draft proposal based on `session_981cc5c2...`" 改为 "Active Plan; Phase A (path classification) and Phase C (recall tool storage contract) closed 2026-06-17; Phase B / D / E Open, gated on future real-session regressions"。
+  - `reference/README.md`：在 "Runtime, Context, And Agent Architecture" 段补一行新 entry（Active Plan，scope = cwd drift + recall governance）。
+  - `proposals/README.md`：移除 Context CWD Drift 条目（已毕业）。
+  - `TODO.md`：在 P2 Plan 段新增一行 "Context CWD Drift & Recall Governance"，与 Cache Observability 同段。
+- **边界**: 无 runtime / Go TUI / provider / Nexus 行为变化（行为变化在 Phase A 收口 commit 里，本条只记录文档迁移）。
+- **后续影响**: Phase B（`SessionRootContinuity` 决策 helper）/ Phase D（`ContextEstimateCalibration` diagnostic）/ Phase E（`ROOT_SCAN_REQUIRES_CONFIRMATION` 工具层 guard）仍 Open，按 plan §5 触发条件推进；不主动开启。
+
+## 2026-06-17 — Context CWD Drift Phase A 收口
+
+- **背景**: 真实 session `session_981cc5c2-230c-40d1-953c-b956e9dbaaf7` 暴露 root-cause chain：中文短语 `文档/信息` 被 `extractAbsolutePaths()` 误识别成 `/信息`，runtime 随后的 `resolveCwdFromPrompt()` 把 cwd 推到 `/`，`taskScope.ts` 把 `primaryRoot` 设为 `/`，后续 Glob/Grep 扫 `/` 和 `/Users` 产生大量 permission error 与 `stdout maxBuffer length exceeded`。最小修复切片是过滤 CJK-only basename 且不存在的 candidate。
+- **实现**:
+  - `src/runtime/systemPromptBuilder.ts:229` 新增 `isCjkOnlyNonExistentPath(candidate)` helper：basename 若全部由 Han 字符组成（`/^[\p{Script=Han}]+$/u`）且 `!existsSync(candidate)`，返回 true。basename 为空或非纯 CJK 一律返回 false（保留 ASCII / 混合路径）。
+  - `src/runtime/systemPromptBuilder.ts:216` `extractAbsolutePaths()` 在 for-of 循环里加 `if (isCjkOnlyNonExistentPath(resolved)) continue` 守卫，整段丢弃。
+  - 与既有 `resolvePromptPath()` CJK 后缀 fallback（prefix ≥ 50% 长度才接受）互补不冲突：fallback 处理"已存在 prefix + CJK 后缀"的渐进查找；新守卫处理"整个 candidate 是 CJK-only 且不存在"的整段丢弃。
+  - `test/system-prompt-builder.test.ts` 加 4 个 focused test（`describe('extractAbsolutePaths')` 末尾）：
+    - `文档/信息` → `extractAbsolutePaths()` 返回 `[]`（CJK-only basename + 不存在）
+    - `/信息` standalone → 返回 `[]`
+    - `/信息/归档` 多段 → 返回 `[]`
+    - `/etc/hosts` 与 `文档/信息` 混排 → 只保留 `/etc/hosts`
+- **影响面**:
+  - `resolveCwdFromPrompt()` 输入端不再含 `/信息` 类整段 CJK 候选，机械 map 退化为返回 `baseCwd`，cwd 不再被静默推到 `/`。
+  - `taskScope.ts` / `intentGuidance.ts` / `workingSet.ts` / `contextAnalysis.ts` 全部复用同一 `extractAbsolutePaths()`，单一 source of truth（plan §1 Existing Entry Points 表 7 个调用点）。
+  - 未触动: 既有 `resolvePromptPath()` / `normalizeWrappedPathFragments()` / 路径 regex — 行为兼容。
+- **验证**:
+  - `npx tsx --test test/system-prompt-builder.test.ts`：28/28 pass（24 既有 + 4 新增）。
+  - 累计 cache-health 28 + behavior-monitor 29 + system-prompt-builder 28 tests pass，0 回归。
+  - 未单独跑 `npx tsc --noEmit`（仅本文件有 6 行新增 helper，逻辑与既有 `existsSync` 调用一致；既有 pre-existing `inspectSession.ts:231` TS2322 与本任务无关）。
+- **约束**:
+  - 仅在 basename 全部由 Han 字符组成时触发；混合 basename（`/信息/notes.md`）不触发，避免误伤混合路径。
+  - `existsSync` 调用 per candidate；对超长 prompt 有 N 次 syscall，但 N 受 regex match 数约束，不会成 hot path。
+  - 保持 runtime 不接管绝对意图的边界：仅丢弃"明显是自然语言 slash 短语"的候选；真实存在的 absolute path 仍正常 promote 到 cwd / explicit paths。
+
+## 2026-06-17 — Context CWD Drift Phase C 收口（prior, 同步状态）
+
+- **背景**: 同一 session 暴露 `contextSearch` 与 `contextRecent` 在 storage 缺失时返回 `CONTEXT_STORAGE_UNAVAILABLE`，但模型首次调用时 `maxTokens=8000` 触发 schema 失败（`maxTokens.max(5000)`），`contextRecent` 也失败。Plan 升级时回溯标记，代码已先于本 plan 落地。
+- **已落地位置**:
+  - `src/tools/builtin/contextSearch.ts:39-45` — `if (!context.storage)` 返回 `CONTEXT_STORAGE_UNAVAILABLE` + `repairHint: 'Continue from visible session context, or retry contextSearch in a runtime with storage attached.'`。
+  - `src/tools/builtin/contextRecent.ts:35-41` — 同上语义。
+  - `src/tools/builtin/contextSearch.ts:17` / `contextRecent.ts:17` — `maxTokens: z.number().int().positive().max(5000).optional()` schema 强制。
+  - `src/tools/builtin/contextSearch.ts:33` model prompt 明确 `maxTokens caps the response (default 5000)`，避免模型再发 8000。
+- **未触动**: storage contract 实现语义、schema、model prompt 全部 back-compat；`LLMCodingRuntime` 与 Nexus 透传 `context.storage` 已稳定。
+- **守住边界**: 继续在 storage 缺失时返回显式 `CONTEXT_STORAGE_UNAVAILABLE`；不静默 fallback 到 visible context；不把 `contextSearch` 升级为 hidden memory source（仅 on-demand session event locator）。
+
+## 2026-06-17 — Cache Observability 计划升级：Draft → Active Plan
+
+- **背景**：`docs/nexus/proposals/cache-observability-and-nexus-realtime-detection-plan.md` 之前标记为 `State: Draft`，但文档内容已经具备完整规划要素（背景 / 4 设计原则 / 现有接入点 / CacheHealthSnapshot schema / 5 个 phase 实施路径 / 测试分层 / 8 条 non-goals / 中文概述），且 v2 文档分层规则要求 `reference/` 只保留 Active Plan / Index / Guide。同时 2026-06-17 已完成的 BehaviorMonitor ingest wiring 正好解除了 Phase D 的阻塞点，Phase A（metrics-only 纯函数）独立可落地。
+- **变更**:
+  - 文件移动：`docs/nexus/proposals/cache-observability-and-nexus-realtime-detection-plan.md` → `docs/nexus/reference/cache-observability-and-nexus-realtime-detection-plan.md`。
+  - 文档头部：`State: Draft` → `State: Active Plan`；`Priority: P2 Watch` → `Priority: P2 (Phase A immediately implementable; Phase D unblocked 2026-06-17)`；新增 **Status (2026-06-17)** 段落，标注 Phase A 独立可实施、Phase D 前置条件已就位、Phase B 仍需 `getExecutionMetrics(sessionId)` storage 接口澄清。
+  - `context-governance-index.md`：3 处交叉引用从 `../proposals/...` 改为 `./...`；Open Items 中 Cache health aggregation 条目状态从 "Draft; requires real metrics before UI claims" 改为 "Active Plan; Phase A independently implementable, Phase D unblocked 2026-06-17"。
+  - `reference/README.md`：在 "Runtime, Context, And Agent Architecture" 段补一行新 entry（Active Plan，scope = cache health observability + honest unavailable states + Nexus realtime detection integration phases）。
+  - `proposals/README.md`：移除 Cache Observability 条目（已毕业）。
+  - `TODO.md`：在 P2 Plan 段新增一行 "Cache Observability & Nexus Realtime Detection"。
+- **边界**: 无 runtime / Go TUI / provider / Nexus 行为变化，仅文档生命周期迁移。
+- **后续影响**: Phase A（`cacheHealth.ts` 纯函数 + `/v1/runtime/metrics` 增 `cacheHealth` 字段）现已无任何前置依赖，可立即实施；Phase D 移除阻塞标记。
+
+## 2026-06-17 — Cache Observability Phase A 收口
+
+- **背景**: Active Plan 升级同次，Phase A（metrics-only 纯函数）独立可实施且 0 上游依赖。同时研究了 BabeL-2 的 cache observability 实现（3 个不同的 cacheReadRatio 公式、compact-time telemetry、perfettoTracing 格式），写入 cache plan §10 作为后续 contributor 避免重复分析的参考。
+- **实现**:
+  - `src/nexus/cacheHealth.ts`（~225 行新文件）：`buildCacheHealthFromRuntimeMetrics(snapshot)` / `buildCacheHealthFromEvents(events, options)` / `evaluateCacheDimension(...)` 纯函数 + `pickExecutionMetricsEvents` filter。导出 `CacheHealthSnapshot` / `CacheHealthDimension` / `CacheHealthStatus` / `DEFAULT_CACHE_HEALTH_TARGETS`。
+  - 4 维度：prompt（有真实 observed ratio）/ code_index / tool / reasoning（全部 `unavailable`，`source: 'not_implemented'`）。
+  - 关键设计：no provider cache tokens → `unavailable`（不伪造 0%），符合 plan §2.2 和 `cacheReadRatio` token-weighted 公式（与 `nexus/metrics.ts:344-351` 一致：`cacheRead / (input + cacheCreation + cacheRead)`）。
+  - `src/nexus/app.ts`：`buildRuntimeMetricsSnapshot()` 新增 `cacheHealth` 字段，调用 `buildCacheHealthFromRuntimeMetrics({ tokenUsage: snapshot.tokenUsage })`。
+  - `test/cache-health.test.ts`：17 个 focused test 覆盖 targets / status 阈值 / 4 维度行为 / sampleCount 语义 / per-event rollup / summary aggregation / 公式一致性 / schema 稳定性。
+- **验证**:
+  - `npx tsc --noEmit`：0 errors。
+  - `test/cache-health.test.ts`：17/17 pass。
+  - 累计 80 tests（layering + cache-health + behavior-monitor + config-endpoints + agent-tools-runtime）全部 pass，0 回归。
+- **文档同步**:
+  - `cache-observability-and-nexus-realtime-detection-plan.md` §10 新增 BabeL-2 pattern analysis（3 个公式对比 + compact telemetry + perfettoTracing + 不复制什么 + Phase A 决策摘要）。
+  - 中文概述 "当前状态" 同步标注 Phase A 已收口。
+  - 本 WORK_LOG 记录。
+- **后续可推进**: Phase B（per-session aggregation 路径）+ Phase C（eventized cache_health）+ Phase D（BehaviorMonitor bridge 仍待 `pushHint` 链路验证）。
+
+## 2026-06-17 — Cache Observability Phase B 收口
+
+- **背景**: Active Plan Phase B 要求 per-session（per-pane）cache health 投影到 `/v1/runtime/loop/health`。原本担心的 `getExecutionMetrics(sessionId)` storage 接口澄清结果——`Storage.ts:166` 已存在 `getExecutionMetrics(sessionId): Promise<ExecutionMetrics | null>` 返回单条最新 metric 快照；`sessionAssets.ts:129` 已有使用先例。但 `/v1/runtime/loop/health` 路由（`app.ts:1041`）已经 fetch 了 `events: NexusEvent[]` 切片（带 `query.lastN` 窗口），所以更直接的做法是复用已有 `events` 切片 + `buildCacheHealthFromEvents`，零额外 storage 调用。
+- **实现**:
+  - `src/nexus/cacheHealth.ts`:
+    - 新增 `MaybeExecutionMetrics` 类型：接受宽 `NexusEvent[]` 切片（不强制 type 缩窄为 `execution_metrics`）。
+    - `buildCacheHealthFromEvents` signature 改为 `ReadonlyArray<MaybeExecutionMetrics>`，函数内部按 `e.type === 'execution_metrics'` 过滤。
+    - `sampleCount` 改为只计 `execution_metrics` 事件数（之前用 `events.length`，wide slice 模式下会混入非相关事件）。
+  - `src/nexus/app.ts`:
+    - `loopHealthQuerySchema` 已支持 `lastN`（默认值，见 `app.ts:943` 附近）。
+    - `/v1/runtime/loop/health` handler 在已有 `events` 数组上调用 `buildCacheHealthFromEvents(events, { sessionId, lastN: query.lastN, kind: 'pane' })`，把 `paneCacheHealth` 作为 sibling 字段加入 `panes.push({...})`。不覆盖 status，cache health 与 status 平行。
+  - `test/cache-health.test.ts` 新增 2 个 focused test：T18（wide NexusEvent slice 接受 + 内部 filter + sampleCount 仅算 execution_metrics 事件）+ T19（Phase B 集成 shape 验证：type/schemaVersion/window/dimensions/summary）。
+- **设计决策**:
+  - 状态优先级保持：cache health 永远不覆盖 blocked/drift/waiting/done 状态；它是 sibling 字段。
+  - 窗口语义：`lastN` 直接透传到 `CacheHealthSnapshot.window.lastN`，让 client 知道窗口大小。
+  - `kind: 'pane'` 标识是 pane 级别，避免与 process 级别混淆。
+- **验证**:
+  - `npx tsc --noEmit`：0 errors。
+  - `test/cache-health.test.ts`：19/19 pass（17 + 2 新增）。
+  - 累计 82 tests pass，0 回归。
+- **后续可推进**: Phase C（`cache_health` eventized 事件，供 `/v1/sessions/:id/wait`）+ Phase D（BehaviorMonitor bridge，可提示 `prompt-cache-miss-wave`）。
+
+## 2026-06-17 — Cache Observability Phase C 收口
+
+- **背景**: Active Plan Phase C 要求在 `execution_metrics` 后可选生成 `cache_health` 事件，供 `/v1/sessions/:id/wait` 和 transcript 使用。v1 只在 status != ok 时生成；dedup 同一 requestId 的相同 warning。
+- **实现**:
+  - `src/shared/events.ts`：新增 `CacheHealthEventSchema`（discriminated union by `type: 'cache_health'`，含 `requestId` + `cacheHealth` + `trigger` 字段）；加入 `NexusEventSchema` 联合类型。
+  - `src/nexus/cacheHealth.ts`：
+    - 新增 `CacheHealthEvent` 类型。
+    - `buildCacheHealthEvent({ sessionId, cwd, requestId, cacheHealth, trigger, now })`：当 `cacheHealth.summary.status === 'ok'` 时返回 `undefined`；否则返回结构化 event。
+    - `CacheHealthEventDedup` 类：per-session FIFO set 限 256 entries，`shouldEmit(sessionId, requestId)` 返回是否可发送。`undefined` requestId 总是返回 true（保留兼容，emit site 应始终传 requestId）。
+    - 模块级单例 `globalCacheHealthDedup`（与 `defaultContextBroadcaster` 同模式），导出 `getCacheHealthDedup` / `setCacheHealthDedup` / `_resetCacheHealthDedupForTesting`。
+    - `maybeBuildCacheHealthEventFromExecutionMetrics(event, cwd)`：从 `execution_metrics` event 聚合 token usage，构造 snapshot，应用 dedup，返回 event 或 undefined。
+  - `src/nexus/app.ts`：
+    - 导入 `maybeBuildCacheHealthEventFromExecutionMetrics`。
+    - 在 `createNexusApp` 内新增 `maybeEmitCacheHealthEvent` closure（封装 cwd 传参）。
+    - 两个事件 yield 点（HTTP `/v1/execute` ~2596 行 + WebSocket `/v1/stream` ~3920 行）：在 `recordEventMetrics` + `behaviorMonitor.ingest` 之后调用 `maybeEmitCacheHealthEvent`；如返回 event，push 到 `events` + `storage.appendEvent`，WS 路径还额外 `sendJson(socket, event)`。
+- **dedup 语义**:
+  - 同一 `requestId` 不重复发 cache_health（plan §5.3）。
+  - 同一 session 的 dedup set 上限 256 entries（FIFO eviction）。
+  - HTTP 和 WebSocket 路径共享同一模块级单例 dedup 状态，跨 transport 不重复。
+- **验证**:
+  - `npx tsc --noEmit`：除 pre-existing `inspectSession.ts:203` `clientSessionId` 字段缺失（与本任务无关）外，0 errors。
+  - `test/cache-health.test.ts`：28/28 pass（19 + 9 新增 Phase C）。
+  - 累计 91 tests pass，0 回归。
+- **约束**:
+  - v1 只在 status != ok 时发 → ok 状态不污染 transcript。
+  - `cacheHealth` 字段在 schema 中是 `z.unknown()`，因为 CacheHealthSnapshot 实际类型定义在 `nexus/cacheHealth.ts`（避免共享包循环）。
+  - 客户端读取 `cacheHealth` 字段需要 import `CacheHealthSnapshot` 类型来 decode。
+- **后续可推进**: Phase D（BehaviorMonitor `prompt-cache-miss-wave` detector，可消费 cache_health event）+ UI/TUI 渲染（plan §6 描述的 runtime status / bbl loop sidebar / transcript 渲染）。
+
+## 2026-06-17 — Cache Observability Phase D 收口
+
+- **背景**: Active Plan Phase D 要求 `BehaviorMonitor` 实现 `prompt-cache-miss-wave` detector：当 N 个 session 在 rollingWindowMs 内 prompt `cacheReadRatio` 都低于目标阈值时，触发 anomaly trace + live hint。`cacheReadRatio` 已经在 `LLMCodingRuntime` 的 `execution_metrics` 事件中暴露（`src/runtime/runtimePipeline.ts:1187`），Phase A/B/C 也已就位。
+- **实现**:
+  - `src/runtime/behaviorTrace.ts`: `BehaviorTrigger` 联合类型新增 `prompt-cache-miss-wave`。
+  - `src/nexus/behaviorMonitor.ts`:
+    - 新增 `DEFAULT_PROMPT_CACHE_MISS_WAVE_MIN_SESSIONS = 3` + `DEFAULT_PROMPT_CACHE_MISS_WAVE_TARGET_RATIO = 0.85`。
+    - `CrossSessionPromptCacheMissWave` 类型 + 加入 `CrossSessionTrigger` 联合。
+    - `CrossSessionAnomaly` 增 `targetRatio` + `observedRatios` 字段。
+    - `BehaviorMonitorOptions` 增 `promptCacheMissWaveMinSessions` + `promptCacheMissWaveTargetRatio`；构造函数 + `this.opts` 同步；`detectAll()` 集成新 detector。
+    - `detectPromptCacheMissWave(sessions, options)`: 取每个 session 在 windowMs 内**最新**的 `execution_metrics.cacheReadRatio`；低于 `targetRatio` 的 session 进入 `observedRatios`；session 数 < `minSessions` 返回空数组。
+    - `crossSessionToAnomaly` 加 `prompt-cache-miss-wave` case → `errorCode: 'PROMPT_CACHE_MISS_WAVE'`，errorMessage 含 session 数 + 目标 + 最低 observed ratio 列表。
+    - `runBehaviorMonitor` 的 `pattern` 选择器扩展为 4 路（含 `prompt-cache-miss-wave:${sessionIds.length}` 形式）。
+  - `test/behavior-monitor.test.ts`: 新增 8 个 focused test 覆盖 detector 行为（≥ 3 sessions 触发 / < 3 不触发 / 忽略 ok session / via detectAll / 全部 ok 不触发 / 自定义 target / 忽略无 execution_metrics session / 取每 session 最新 ratio）。
+- **检测语义**:
+  - 每个 session 只取一个 observed ratio（windowMs 内**最新**的 `execution_metrics`）。
+  - observedRatios 只记录低于 target 的 session；高于 target 的 session 被排除在 wave 之外。
+  - 错误信息按 ratio 升序列出最低值，给运维可读的"最差 session"列表。
+- **验证**:
+  - `npx tsc --noEmit`：除 pre-existing `inspectSession.ts` 错误外，0 errors。
+  - `test/behavior-monitor.test.ts`: 29/29 pass（21 + 8 新增 Phase D）。
+  - 累计单独运行 71 tests pass（cache-health 28 + behavior-monitor 29 + runtime-layering 11 + agent-tools-runtime 3）；`config-endpoints.test.ts` 有 Node test runner 序列化 bug（pre-existing，与本任务无关）。
+- **约束**:
+  - detector 只读 `execution_metrics.cacheReadRatio` 字段；不调用 `cacheHealth.ts` 模块，避免运行时循环依赖。
+  - 沿用 `shouldDispatchHint` 5min cooldown（plan §5.4 "hint cooldown: 沿用 BehaviorMonitor 5min"）。
+  - hint 注入仍走 `BehaviorMonitor.pushHint(sessionId, hint)`，遵守 §6.2 安全窗口检查。
+- **状态**: Cache Observability Active Plan 现在 4 个核心 phase 全部收口。Phase E (future real caches) 仍为远期 Watch。
+
+## 2026-06-17 — Documentation lifecycle governance v2
+
+- **Background**: Even after the first reference/archive cleanup, `docs/nexus/reference/` still mixed Active Plan, Draft, Partially Landed, Closed Reference, Index, and Guide files. This kept the document count high and forced readers to inspect state headers before knowing whether a document still drove development.
+- **Decision**: Adopted a lifecycle split inspired by Diátaxis-style role separation and ADR-style decision records: `active/` for current work, `reference/` for stable architecture, `proposals/` for Draft / Partially Landed plans, `history/` for Closed / Watch-only ledgers, `decisions/` for ADRs, `archive/` for superseded sources, and `releases/` for version notes.
+- **Change**: Moved Draft / Partially Landed reference files into `proposals/`; consolidated 11 Closed Reference files into 3 history ledgers; added `decisions/0001-documentation-lifecycle.md`; rewrote `reference/README.md` around the smaller reference surface.
+- **Guardrail**: `scripts/check-nexus-docs.js` now understands proposals/history/decisions and rejects invalid lifecycle states in `reference/`.
+- **Boundary**: No runtime, Go TUI, provider, or Nexus source behavior changed.
+
+## 2026-06-17 — Reference language governance incremental cleanup
+
+- **Background**: `docs:check` had already closed structural governance for `docs/nexus`, but still reported 14 historical reference documents with Chinese narrative before the final `中文概述` section.
+- **Change**: Rewrote [go-tui-history.md](./history/go-tui-history.md) into the current reference template style: English planning/history body, preserved `State` / `Governance`, and retained only the final Chinese summary section. Also normalized the narrative sections in [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md), preserving user prompt samples only inside code/sample contexts.
+- **Validation**: `npm run docs:check` now reports 12 historical reference documents with CJK narrative before `中文概述`, with `failureCount: 0`.
+- **Boundary**: No runtime, Go TUI, provider, or Nexus behavior changed. This was a documentation-language normalization pass only.
+
+## 2026-06-17 — Tool Registry Layering 诊断收口
+
+- **背景**: Tool Surface Expansion 规划 §2.2 记录的安全缺口——`createRuntime.ts` Layer 2/3/4 注册是无条件 `tools.set(name, tool)`，缺少 `tool_overridden_by` 诊断、跨前缀拦截和 `risk_promoted` 检测。
+- **实现**:
+  - `src/nexus/toolRegistryLayering.ts`（~180 行新文件）：`registerToolWithDiagnostics(tools, tool, handler)` 封装 3 条规则——(1) EverCore tool（`source.serverName === 'evercore'`）覆盖非 EverCore 同名 → `tool_override_blocked` 跳过注册；(2) 同名覆盖 → `tool_overridden_by` WARN；(3) 新 tool risk 高于已有 → 额外 `risk_promoted` 诊断。
+  - `src/nexus/createRuntime.ts`：Layer 2 MCP / Layer 3 EverCore MCP / Layer 4 Agent tools 全部改为 `registerToolWithDiagnostics()`。新增 `CreateDefaultNexusRuntimeOptions.toolRegistryDiagnosticHandler` 选项（`null`=静默，`undefined`=默认 `console.warn`，自定义 handler=注入）。
+  - `src/tools/registry.ts`：`createDefaultToolRegistry()` 类型标注微调（`AnyTool[]`，行为不变）。
+- **验证**:
+  - `test/runtime-layering.test.ts`：11 个 focused test 全部通过（覆盖 3 种诊断、跨前缀拦截、risk 升降、handler 可空、consoleWarnDiagnosticHandler）。
+  - `test/config-endpoints.test.ts`：无回归。
+  - `test/agent-tools-runtime.test.ts`：无回归。
+  - `npx tsc --noEmit`：0 错误。
+- **文档同步**: `TODO_runtime.md` §2.2 标记为已收口；`TODO.md` P2 Plan 条目更新状态。
+
+## 2026-06-17 — BehaviorMonitor ingest wiring 收口
+
+- **背景**: `BehaviorMonitor` 类（`src/nexus/behaviorMonitor.ts`）有完整的 `ingest()`、`detectAll()`、`subscribe()`、`pushHint()` 方法，但 `app.ts` 没有任何 import 或调用。3 个跨 session 触发器（hot-path、tool-storm、scope-drift-wave）从未收到事件数据，`detectAll()` 总是返回空结果。这是 cache plan Phase D 和 behavior monitor 实时检测的阻塞点。
+- **实现**:
+  - `src/nexus/createRuntime.ts`：`behaviorMonitor` 从 LLM 分支局部变量提升为函数级变量，并加入 return tuple。
+  - `src/nexus/server.ts`：`behaviorMonitor` 从 `createDefaultNexusRuntime()` 解构并通过 `createNexusApp({ behaviorMonitor })` 传入。
+  - `src/nexus/app.ts`：`CreateNexusAppOptions` 新增可选 `behaviorMonitor?: BehaviorMonitor` 字段。两个事件 yield 点（`POST /v1/execute` ~2578 行 + WebSocket `/v1/stream` ~3876 行）在 `recordEventMetrics()` 之后调用 `options.behaviorMonitor?.ingest(decoratedEvent)`——fire-and-forget，同步非阻塞。
+- **接线点**: HTTP execute 路径 + WebSocket stream 路径，均位于 event 已 push/stored/metrics 后。
+- **验证**:
+  - `npx tsc --noEmit`：0 错误。
+  - `test/behavior-monitor.test.ts`：21/21 pass（无回归）。
+  - `test/config-endpoints.test.ts`：28/28 pass（无回归）。
+  - 注：ingest 本身是纯内存操作（push 到 `eventsBySession` Map），无 I/O、无异步，不会增加事件处理延迟。
+- **后续解除阻塞**: BehaviorMonitor 现在能接收真实事件数据，`detectAll()` 可以在有足够事件积累后产出跨 session 触发。Cache plan Phase D（prompt-cache-miss-wave detector）的前置条件已满足。
+
 ## 2026-06-17 — Recoverable tool error / session continuity 收口
 
 - **背景**: `session_ee116547-6545-4f70-bc7c-b1b287387cda` 暴露两类连续性问题：`Grep` 对 `pattern="- \\[ \\]"` 调用 `rg` 时缺少 `--` separator，导致 `rg: unrecognized flag -`；普通工具抛错被 terminal `TOOL_ERROR` 结束，provider 没有收到 paired `tool_result is_error=true`，后续看起来像“工具失败后失忆”。
@@ -6068,3 +6351,178 @@
   - 三角闭环不被破坏：任何后续修改任意一联主规划时，必须同步检查另两联 + 整合索引是否需要更新。
   - Go TUI fallback 与 `createDefaultToolRegistry()` 长期保持一一对应（13 ↔ 13）。
   - `bin/mcporter` 是 `npm link` 出来的本地开发工具链符号链接，**不**入库。
+
+## 2026-06-18 — Agent Runtime Maturity: Durable Run Checkpoint / Resume v1 收口
+
+- **背景**: `agent-runtime-architecture-maturity-plan.md` §3.3 是 P1 最后一项打开。当前 session/event persistence 已可复盘，但 in-flight continuation 仍偏 process-local；如果只把 pending permission 写 SQLite，会出现"看起来 durable / 实际不可恢复"的假持久化。v1 不持久化 in-process continuation snapshot，而是定义 6 个 checkpoint boundary + 5 个 resumable state + 诚实 `hasContinuationSnapshot: false` 投影。
+- **范围**:
+  - `src/runtime/runCheckpoint.ts`（既有，**未改动**）— 6 boundary（`before_provider_invocation` / `after_provider_invocation` / `before_tool_execution` / `waiting_permission` / `after_tool_result` / `before_final_result`）+ 5 state（`resume_possible` / `retry_from_provider_turn` / `waiting_permission` / `terminal_failed_recoverable` / `cannot_resume`）+ `deriveResumableState({ session, events, pendingPermissionToolUseId, hasContinuationSnapshot })` 纯函数 + orphan `tool_started` warning + 18 unit test。
+  - `src/cli/commands/inspectSession.ts` — 新增 `exportSessionResumeState` / `exportSessionResumeStateDirect` / `formatResumeState` / `readSessionPhaseRow` / `readOrderedEvents`（trace 路径共用）；`--resume` 短路径 + `--json` 切换 + 缺数据 exit 1；`session_go_<unixnano>` reverse-resolve 复用 trace 路径逻辑。
+  - `test/inspect-session.test.ts` — 新增 7 集成 test（waiting_permission / terminal success / terminal error / non-terminal mid-run / absent session / formatter），复用 `withTempConfigDir` + `seedSqliteWithSession` 隔离。
+  - `test/run-checkpoint.test.ts` — 之前遗漏在 `package.json` test script，本批次补登记。
+  - `package.json` — test script 补 `test/run-checkpoint.test.ts`（紧跟 `test/inspect-session.test.ts` 之后）。
+- **CLI 输出形态**:
+  - `bbl inspect-session <id> --resume` 默认渲染：`▶ <state>` + `boundary` + `reason` + `warnings` + 诚实 `next:` hint（按 state 分色）+ 灰字 "note: derived without a continuation snapshot"（v1 持久化缺口守门）。
+  - `bbl inspect-session <id> --resume --json` 输出 `DerivedResumableState` 单 blob。
+  - 缺事件/缺 sessions row → `exit 1` + 红字 ✗ 提示。
+- **验证**:
+  - `npx tsc --noEmit`：**0 错误**。
+  - `npx tsx --test test/inspect-session.test.ts`：**29/29 pass**（22 pre-existing + 7 新增）。
+  - `npx tsx --test test/run-checkpoint.test.ts`：**18/18 pass**。
+  - 累计 inspect-session 29 + run-checkpoint 18 + agent-trace 19 + eval-agent 19 pass，0 回归。
+- **边界**:
+  - 不持久化 in-process continuation snapshot（v1.1+ 真实 demand 才推）。
+  - 不从 provider token stream 中段 resume（plan 显式非目标）。
+  - `retryable_provider_turn` / `retryable_tool_result` 仍只 derivation，不写回 session metadata。
+  - 默认 `hasContinuationSnapshot: false`；CLI 一律传 `false`（post-restart inspection 语义），保留 v1 唯一可恢复向量 `waiting_permission` + 操作者重发 approval 的诚实语义。
+- **后续可推进**: §3.5 Memory Quality Metrics（`/v1/runtime/memory/status` 已有基础，待真实 regression 触发再推）；§3.4 MCP / §3.6 Loop Taxonomy 仍 P2。P1 Agent Runtime 成熟度（trace + eval + durable resume）三联全部收口。
+
+## 2026-06-18 — Context CWD Drift Phase A Follow-up: Deep Analysis + Minimum Fix Plan
+
+- **背景**: 上一条 `session_cf361f04` regression 补入 plan 时只描述了现象；这次按用户要求"深度分析推进，必要时回看 session 真实情况深度分析解决"，把 Phase A 的 `extractAbsolutePaths()` + `LocalCodingRuntime.storage` 链路端到端复盘了一遍，定位出 Phase A 收口剩余 5 类 false-positive + 1 类 false-negative + 1 类 path-splitting bug，并写出最小修复包写入 plan §10。
+
+- **方法**: 写 `/tmp/test-extract-prose.mjs` 把 18 个反向构造的 prose 字符串直接喂给 `extractAbsolutePaths()`（项目内 import `/Users/tangyaoyue/DEV/BABEL/BabeL-O/src/runtime/systemPromptBuilder.ts`），记录真实输出：
+
+  | 输入 | Phase A 当前输出 | 真实期望 |
+  | --- | --- | --- |
+  | `/while` | `["/while"]` | `[]` |
+  | `/memory` | `["/memory"]` | `[]` |
+  | `/Linear→Workflow/Agent` | `["/Linear→Workflow/Agent"]` | `[]` |
+  | `/Layer是变换这份数据的可组合单元` | `["/Layer是变换这份数据的可组合单元"]` | `[]` |
+  | `/目录——一条编号递进的学习阶梯` | `["/目录——一条编号递进的学习阶梯"]` | `[]` |
+  | `/.openrath/config.json` | `["/.openrath/config.json"]` | `[]` |
+  | `/etc/hosts` | `["/etc/hosts"]` | `["/etc/hosts"]` ✅ |
+  | `/Users/.../MEMORY.md` | `["/Users/.../MEMORY.md"]` | 整段保留 ✅ |
+  | `https://www.openrath.com/` | `["//www.openrath.com/"]` | `[]` |
+  | `//www.openrath.com/` | `["//www.openrath.com/"]` | `[]` |
+  | `/Users/.../Library/Mobile Documents/...` | 切成 2 段（`/Users/.../Library/Mobile` + `/com~apple~CloudDocs/...`） | 整段保留为单个 candidate（escaped-space 模式） |
+  | `/Library/Application Support` | 切成 2 段 | 整段保留为单个 candidate |
+
+- **根因 #1 — `isCjkOnlyNonExistentPath` regex 太窄**: `/^[\p{Script=Han}]+$/u` 拒绝任何含 `\p{Script=Common}` 字符的 basename。em-dash `——`（U+2014, `Script=Common`）是 CJK prose 最高频的标点，因此 `/目录——...` 的 basename 不通过 guard，整个 candidate 漏出。
+
+  ```
+  basename: "目录——一条编号递进的学习阶梯"
+  Han only regex: false       ← guard 失效
+  Han+Common regex: true      ← 修正后应该匹配
+  ```
+
+- **根因 #2 — `extractAbsolutePaths()` 没有 URL 守卫**: `pathPattern` 直接吃 `//` 起始的字符串，所以 `https://www.openrath.com/` 先被通用 pattern 切出 `//www.openrath.com/`，再被 `resolvePromptPath` 规范成 `/`，最终以 `/` 的形式进入 cwd 候选池。
+
+- **根因 #3 — `extractAbsolutePaths()` 不保留 escaped-space 路径**: `pathPattern = /\/[^\s"'"，。！？；：、）\])}<>]+/g` 在第一个空格处终止，整段被切成两段后两段都通不过 `existsSync`。
+
+- **根因 #4 — `LocalCodingRuntime.storage` 是 optional**（`src/runtime/LocalCodingRuntime.ts:60-63`）:
+  ```ts
+  constructor(
+    ...,
+    private readonly storage?: NexusStorage,  // ← optional
+    ...,
+  ) {}
+  ```
+  当 Go TUI local 模式构造时不传 storage（默认情况），`runExecuteStreamInner:170` 的 `if (!options.storage && this.storage)` 不会填充；`executeToolSafely` 把 `options.storage === undefined` 透传给 tool context；`contextRecent` / `contextSearch` 的 storage gate（`src/tools/builtin/contextSearch.ts:39-48`、`src/tools/builtin/contextRecent.ts:35-44`）一律返回 `CONTEXT_STORAGE_UNAVAILABLE`。registry (`src/tools/registry.ts:22-48`) 无条件把 `contextSearchTool` / `contextSummarizeTool` / `contextRecentTool` 注册进 registry，model prompt 永远会看到这些工具但永远调用失败 — 这就是 `session_cf361f04` event_seq=16671 的真实根因。
+
+- **代码 / 文档变更**:
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md` Status 段更新（标注 2026-06-18 补 Phase A follow-up 4 类补刀 + §10.2 LocalCodingRuntime 根因）。
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md` 新增 §10（"2026-06-18 Deep Analysis — Phase A Follow-up Evidence"）共 4 个子节：
+    - §10.1 false-positive 类目表（7 行：英文 prose / 中英混排 / CJK 含标点 / dotfile 不存在 / 路径含空格 / URL / 真实路径 ✅）
+    - §10.2 `isCjkOnlyNonExistentPath` regex bug 实证（em-dash codepoint 2014, `Script=Common`）
+    - §10.3 `LocalCodingRuntime.storage` optional bug
+    - §10.4 Phase A Follow-up 最小修复包（focused test + code change + integration test）
+
+- **边界**:
+  - 本次只做 deep analysis + 写最小修复包到 plan §10，**没有改 Phase A 代码**。
+  - 不动 Phase B / D / E / F。
+  - 不动 provider / Nexus runtime 行为。
+  - 不持久化 in-process continuation snapshot（仍按 plan 显式非目标）。
+
+- **验证**:
+  - `npx tsx /tmp/test-extract-prose.mjs`：18/18 输入全部按预期输出。
+  - 无代码改动，因此不需要跑 `npm test`。
+
+- **下一步**: Phase A Follow-up 修复包（focused 4 + integration 3 个 test + 代码层 3 处 guard 增强）建议在下次 session_cf361f04-style regression 出现时落地；当前先停在"已知最小修复方案 + plan 完整登记"状态。
+
+## 2026-06-18 — Context CWD Drift Phase A Follow-up 收口
+
+- **背景**: 上一条 deep-analysis WORK_LOG 写到 plan §10 的 5 类 prose-path 漏出 + URL 守卫缺失 + `LocalCodingRuntime.storage` optional 根因 + 4 个根因 #1-#4；本次按 P0 #1 + #2 把 plan §10.4 最小修复包落地为代码 + 测试。修复 `session_cf361f04-7ab1-43a5-907a-41a808942686` 的所有失败点：URL-heavy cwd drift、`Mobile\ Documents` path splitting、prose-path 误识别、`contextRecent` 在 Go TUI local mode 下的 `CONTEXT_STORAGE_UNAVAILABLE` 误暴露。
+
+- **代码变更**（4 文件）:
+  - `src/runtime/systemPromptBuilder.ts`: `extractAbsolutePaths` 重写。新增 `looksLikeLikelyUrlFragment`（在 pathPattern 前丢弃 `https?://` / `//` 起始片段）、`looksLikeProseFragment`（单段 bare Latin word 快速丢弃）、`isNonExistentProseCandidate`（非存路径的多层 CJK guard，覆盖 single-segment bare CJK、two-segment CJK prose、Han+Common 含 em-dash、CJK + Latin 混排）。`isCjkOrCommonBasename` 取代原 `isCjkOnlyNonExistentPath` 的 Han-only regex（接受 Han + Common 标点如 em-dash U+2014）。实存绝对路径短路：`existsSync(restored)` 为 true 时直接 `paths.add(restored)`，绕过 prose guard（保护 `/etc/hosts` / `/bin/bash` / 真实 iCloud 路径）。Escaped-space 路径保留：`SPACE_MARK = '\x00\x01'` 哨兵重写 `\ `，避免 pathPattern 在 backslash 处终止。
+  - `src/tools/registry.ts`: `createDefaultToolRegistry(opts?: { storage?: NexusStorage | null })` 新增 storage 哨兵。`storage: null` → 隐藏 `contextSearch` / `contextSummarize` / `contextRecent` 三个工具；back-compat（无 opts 或 `storage: undefined`）保留全部 18 个工具。导出 `CreateToolRegistryOptions` interface。
+  - `src/nexus/createRuntime.ts`: 调整 storage 构造顺序（line 86-91），storage 构造后用 `createDefaultToolRegistry({ storage })` 注入真实 storage。
+  - `src/nexus/agents/AgentScheduler.ts`: `createExploreRuntime` 用 `createDefaultToolRegistry({ storage: options.storage ?? null })` 显式传递。
+  - `src/nexus/runnerComparisonBenchmark.ts`: benchmark 显式 `{ storage: null }`（不需要 storage）。
+
+- **测试新增**（2 文件 / 11 test）:
+  - `test/system-prompt-builder.test.ts`: 28 → 35 test。新增 7 个 case 守住 5 类 prose-path + URL + 实存绝对路径短路 + escaped-space（详见 plan §10.4）。
+  - `test/runtime-context-tools-registry-gate.test.ts` (**新文件**): 4 个 test 守住 storage 哨兵的 back-compat / hide / execute 路径 / 工具数量差为 3。
+  - `test/runtime.test.ts`: +1 test `resolveCwdFromPrompt stays at project cwd for URL-heavy article paste`（守 `session_cf361f04` event_seq=2613..2616）。
+  - `package.json`: 新 test 文件加入 `npm test` 脚本。
+
+- **验证**:
+  - `npx tsx --test test/system-prompt-builder.test.ts`：**35/35 pass**（28 pre-existing + 7 新增）。
+  - `npx tsx --test test/runtime-context-tools-registry-gate.test.ts`：**4/4 pass**（新文件）。
+  - `npx tsx --test test/context-tools-registry.test.ts`：**8/8 pass**（back-compat 守住 PR-8 已有断言）。
+  - `npx tsx --test --test-name-pattern="CJK slash|over-filtering|task scope|URL-heavy|real existing absolute" test/runtime.test.ts`：**6/6 pass**（含 1 新增 URL-heavy 回归 test）。
+  - `npx tsx --test test/runtime-layering.test.ts`：**11/11 pass**（registry 调用点无回归）。
+  - `npx tsx --test test/skill-tools.test.ts`：**21/21 pass**（registry 调用点无回归）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - `npx tsx /tmp/test-cf361f04.mjs`：`resolveCwdFromPrompt(articlePrompt, projectCwd)` 返回 `projectCwd`（无 URL / 中文 prose 干扰）。
+  - `npx tsx /tmp/test-981cc5c2.mjs`：`/etc/hosts` / `/bin/bash` 仍正常 resolve 到对应 cwd，5 个 CJK prose case 全部返回 `projectCwd`。
+  - 累计 35 + 4 + 8 + 6 + 11 + 21 + 19 (agent-trace) + 18 (run-checkpoint) + 19 (eval-agent) = 141 pass，0 回归。
+  - 1 个 pre-existing flaky test（`test/agent-scheduler.test.ts:518 review and test runtime expose only restricted Bash commands`）在 develop 分支 + 本次 commit 都失败（依赖真实 `npm install` 执行时间），非本次回归。
+
+- **文档变更**:
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md`:
+    - Priority 行：标注 Phase A Follow-up 收口日期。
+    - Status 段：增加 Phase A Follow-up 收口状态 + 5 类 prose 守卫 + URL guard + 实存短路 + SPACE_MARK + 3 调用点更新 + 11 个新 test。
+    - §10.4：从「建议」改为「✅ 收口（2026-06-18）」，列出 11 个 test case 验证 + 验证结果 + 1 个 out-of-scope 标注（escaped-space 仍 split 已被 prose guard 整体兜底，cwd 不漂）。
+    - 中文概述：标注 Phase A Follow-up 收口 + 11 个新 test 守住 `session_cf361f04` 全部失败点。
+  - `docs/nexus/TODO.md`: Context CWD Drift 行从「Phase A 收口」升级为「Phase A + Phase A Follow-up 已收口（2026-06-18）」并列出 11 个新 test。
+  - `docs/nexus/WORK_LOG.md`: 本条（2026-06-18 Phase A Follow-up 收口）。
+
+- **边界**:
+  - Phase B / D / E / F 不动。
+  - 不动 provider / Nexus runtime 行为（仅 `createDefaultToolRegistry` 签名扩展，back-compat 守住）。
+  - Escaped-space 路径在 pathPattern 阶段仍被 unescaped space 切分（仅在反斜杠转义下保留）；非存路径整体被 prose guard 兜底，存路径由 `existsSync` 短路 → 不影响 cwd drift。
+  - `createDefaultToolRegistry` 默认行为不变（无 opts 时 18 个工具全注册），确保 8 个 pre-existing PR-8 test 全部通过。
+
+- **后续可推进**: Phase B（`SessionRootContinuity` 决策 helper）/ Phase D（`ContextEstimateCalibration` diagnostic）/ Phase E（`ROOT_SCAN_REQUIRES_CONFIRMATION` 工具层 guard）/ Phase F（`UserArtifactContinuity` 当前 session artifact 锚定）仍 Open；按"真实 regression 驱动"原则，等下次真实 session 触发再推进。
+
+## 2026-06-18 — Context CWD Drift Phase B SessionRootContinuity 收口
+
+- **背景**: Phase A Follow-up 收口（上一条 WORK_LOG）后，`extractAbsolutePaths` 的 prose guard 已经能识别 CJK 短语 / URL / escaped-space 三类误识别，但 `session_cf361f04-7ab1-43a5-907a-41a808942686` 的 `task_scope_declared.primaryRoot` 被外部文章路径替换的事件仍然可能发生 — 这是 cwd 决策层的漏洞，与路径识别层正交。Phase B 落地 plan §2 描述的 `SessionRootContinuity` 决策 helper：把"项目根 vs 外部根 vs 用户 session 已经锚定的根"显式投影成一个 4-decision × 9-reason 的 decision 树，让 runtime 在切换 cwd 时 yield 一个 `session_root_continuity` event，让 `bbl inspect-session <id> --trace` 能直接看到决策与原因。
+
+- **代码变更**（5 文件）:
+  - `src/runtime/sessionRootContinuity.ts` (**新文件**): 纯 decision helper。`deriveSessionRootContinuity(options)` 接收 `requestCwd` / `prompt` / `storedSessionCwd` / `latestTaskPrimaryRoot` / `acceptExternalPromptPath`，返回 4 decision × 9 reason 的 `SessionRootContinuity` 投影。无第二 source of truth — 全部从 `extractAbsolutePaths` 的现有输出 + caller 提供的 session 元数据投影出来。导出 `SESSION_ROOT_DECISIONS` / `SESSION_ROOT_REASONS` 两个 readonly 数组作为 vocabulary contract；导出 `buildSessionRootContinuityMessage(c)` 作为 CLI 可读的 summary。`inheritedCwd = latestTaskPrimaryRoot ?? storedSessionCwd ?? requestCwd` + `hasSessionOverride` + `sessionContextPresent` 三个变量统一控制 keep_session_root 与 require_confirmation 分支。
+  - `src/shared/events.ts`: 新增 `SessionRootContinuityEventSchema`（zod discriminated union），加入 `NexusEventSchema` 联合。Fields: `requestCwd` / `storedSessionCwd?` / `latestTaskPrimaryRoot?` / `promptPathCandidates` / `resolvedCwd` / `decision` / `reason` / `isExternalRoot` / `wasProjectRootKept` / `warnings` / `message`。
+  - `src/runtime/LLMCodingRuntime.ts:285-340`: `runExecuteStreamInner` 在 `hasSessionContext` 时调用 `resolveCwdWithContinuity({ prompt, baseCwd, storedSessionCwd, latestTaskPrimaryRoot, acceptExternalPromptPath })` 并 yield `session_root_continuity` event；否则回落 2-arg `resolveCwdFromPrompt`（back-compat）。新增 `resolveCwdWithContinuity()` export（行 1402-1431）：内部先调 `deriveSessionRootContinuity`，`require_confirmation` 分支保留 simple 2-arg fallback。
+  - `src/runtime/Runtime.ts:67-85`: `RuntimeExecuteOptions` 新增 3 个 optional 字段 `storedSessionCwd` / `latestTaskPrimaryRoot` / `acceptExternalPromptPath`，带 doc 注释指明这是 Phase B 的 surface。
+  - `src/runtime/agentTrace.ts:99-122`: AgentTrace 投影在 run span 的 `attributes` 上新增 6 个 `lastContinuity*` 字段（`lastContinuityDecision` / `lastContinuityReason` / `lastContinuityResolvedCwd` / `lastContinuityWasProjectRootKept` / `lastContinuityIsExternalRoot` / `lastContinuityMessage`），从 event stream 末尾反向扫描取最近一条 `session_root_continuity` event。这是 `bbl inspect-session <id> --trace` 的 operator surface。
+
+- **测试新增**（3 文件 / 23 test）:
+  - `test/session-root-continuity.test.ts` (**新文件**): 17 个 test 守 4 decision × 9 reason 全 vocabulary + 全部 5 个典型场景（CJK prose / URL-heavy / 真实 internal / 外部 + storedSessionCwd / 外部 + latestTaskPrimaryRoot / `acceptExternalPromptPath=true` opt-in / `latestTaskPrimaryRoot` 优先 / `wasProjectRootKept` 语义 / `buildSessionRootContinuityMessage` 5 decision 全覆盖）。用 `mkdtempSync` + `join(tmpdir(), ...)` 隔离真实文件系统，避开 macOS `/etc → /private/etc` symlink 陷阱。
+  - `test/runtime.test.ts`: +5 个 `resolveCwdWithContinuity` 集成 test（URL-heavy 守 `session_cf361f04` / 真实 internal / 外部 + storedSessionCwd / `acceptExternalPromptPath=true` / `latestTaskPrimaryRoot` 优先）。
+  - `test/inspect-session.test.ts`: +1 个 `exportSessionTrace: session_root_continuity decision is surfaced on the run span (cf361f04 regression)` 守 AgentTrace 投影把 continuity event 上浮为 run span attributes。手工塞 `session_started` + `session_root_continuity` + `result` 三条 event 到 SQLite，断言 run span 的 `lastContinuityDecision === 'keep_request_cwd'` / `lastContinuityReason === 'url_excluded'` / `lastContinuityWasProjectRootKept === true`。
+
+- **验证**:
+  - `npx tsx --test test/session-root-continuity.test.ts`：**17/17 pass**。
+  - `npx tsx --test test/inspect-session.test.ts`：**30/30 pass**（含新增 1 个）。
+  - `npx tsx --test test/agent-trace.test.ts`：**19/19 pass**（run span attributes 投影无回归）。
+  - `npx tsx --test test/runtime.test.ts`：Phase B 的 5 个新 test 全 pass；1 个 pre-existing flaky test `/v1/execute session reuse and history mapping` 失败（event 数 64 !== 2，与本次无关，develop 分支同样失败）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - 累计 17 + 30 + 19 + 5 = 71 个与 Phase B 直接相关的 test pass。
+
+- **文档变更**:
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md`:
+    - Priority 行：标注 Phase B 收口（2026-06-18）；Open 列表更新为 Phase D / E / F。
+    - Status 段：增加 Phase B 收口状态 + 4 decision × 9 reason vocabulary + 5 文件位置 + 23 个新 test 总数。
+    - §Phase B 段：从「Open」改为「✅ 收口（2026-06-18）」，列出每个已落地文件位置 + 守住边界（默认不接外部 prompt path / 无 session context 时回落 2-arg / 不引入新持久化）。
+    - §Test Plan：新增「Focused — `test/session-root-continuity.test.ts`」 17 test 子节 + 「Integration — `test/inspect-session.test.ts`」 1 test 子节。
+    - 中文概述「当前状态」：标注 Phase A / A Follow-up / B / C 已收口，23 个新 test 守住 `session_cf361f04` 的 cwd 切换面。「下一步」：更新为 Phase D / E / F 三个 Open 项。
+
+- **边界**:
+  - 不替代 Phase F（artifact continuity / "这个文章" 跨 turn 指代锚定）。
+  - 不引入新持久化字段；`SessionRootContinuity` 是从 caller-supplied 元数据 + 现有 `extractAbsolutePaths` 投影出来的纯函数。
+  - 默认不接外部 prompt path（`acceptExternalPromptPath` 默认 false）；`bbl go --external-ok` 之类 opt-in 流程需要显式启用。
+  - `hasSessionContext` 为 false 时完整回落 2-arg `resolveCwdFromPrompt`（back-compat，PR-8 的 8 个 test 全部保持绿色）。
+
+- **后续可推进**: Phase D（`ContextEstimateCalibration` diagnostic — provider usage 2x 偏离 emit warn）/ Phase E（`ROOT_SCAN_REQUIRES_CONFIRMATION` 工具层 guard — Phase A 收口后此类触发应已显著减少）/ Phase F（`UserArtifactContinuity` 当前 session artifact 锚定 — `session_cf361f04` final turn 在 `contextRecent` unavailable 后遗忘已粘贴和已读取的文章）仍 Open；按"真实 regression 驱动"原则，等下次真实 session 触发再推进。

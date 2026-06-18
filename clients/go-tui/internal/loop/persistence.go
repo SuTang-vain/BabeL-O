@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,8 +30,8 @@ import (
 // driver state. Version lets future migrations refuse old
 // files; UpdatedAt is the last Replace timestamp.
 type Snapshot struct {
-	Version   int             `json:"version"`
-	UpdatedAt string          `json:"updatedAt"`
+	Version   int              `json:"version"`
+	UpdatedAt string           `json:"updatedAt"`
 	Panes     []PaneStateEntry `json:"panes"`
 }
 
@@ -64,7 +65,7 @@ type Store struct {
 	writeDelay time.Duration
 	stopCh     chan struct{}
 	doneCh     chan struct{}
-	once      sync.Once
+	once       sync.Once
 }
 
 // NewStore returns a Store backed by path. The path is
@@ -254,8 +255,9 @@ type ReconcileOutcome struct {
 // and the server's authoritative panes. Pure function: no
 // I/O, no clock, no allocation beyond the result slice.
 func Reconcile(local Snapshot, serverPanes []api.LoopPaneState) ReconcileOutcome {
-	localByID := make(map[string]PaneStateEntry, len(local.Panes))
-	for _, entry := range local.Panes {
+	localPanes := filterValidPaneEntries(local.Panes)
+	localByID := make(map[string]PaneStateEntry, len(localPanes))
+	for _, entry := range localPanes {
 		localByID[entry.PaneID] = entry
 	}
 	serverByID := make(map[string]api.LoopPaneState, len(serverPanes))
@@ -328,7 +330,48 @@ func normalizePaneEntries(entries []PaneStateEntry) []PaneStateEntry {
 	if len(entries) == 0 {
 		return []PaneStateEntry{}
 	}
-	out := append([]PaneStateEntry(nil), entries...)
+	out := filterValidPaneEntries(entries)
 	sort.Slice(out, func(i, j int) bool { return out[i].PaneID < out[j].PaneID })
 	return out
+}
+
+func filterValidPaneEntries(entries []PaneStateEntry) []PaneStateEntry {
+	if len(entries) == 0 {
+		return []PaneStateEntry{}
+	}
+	out := make([]PaneStateEntry, 0, len(entries))
+	for _, entry := range entries {
+		if !isValidPaneEntry(entry) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func isValidPaneEntry(entry PaneStateEntry) bool {
+	return strings.TrimSpace(entry.PaneID) != "" &&
+		strings.TrimSpace(entry.WorkspaceID) != "" &&
+		strings.TrimSpace(entry.TabID) != "" &&
+		strings.TrimSpace(entry.SessionID) != "" &&
+		!isFakeLocalSessionID(entry.SessionID) &&
+		strings.TrimSpace(entry.Cwd) != ""
+}
+
+func isFakeLocalSessionID(sessionID string) bool {
+	const prefix = "session-local-"
+	if !strings.HasPrefix(sessionID, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(sessionID, prefix)
+	if len(suffix) < 8 {
+		return false
+	}
+	for _, ch := range suffix {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') {
+			continue
+		}
+		return false
+	}
+	return true
 }

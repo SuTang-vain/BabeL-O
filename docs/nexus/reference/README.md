@@ -1,44 +1,99 @@
-# Nexus Reference Docs
+# Nexus Reference Index
 
-本目录保留仍有架构约束价值的长期参考文档。它们不是当前 TODO 的唯一事实源；当前优先级以 [../TODO.md](../TODO.md) 和 [../active/](../active/) 为准。
+This directory stores long-lived architecture references for BabeL-O / Nexus. It is intentionally smaller than before: draft work now lives in [../proposals/](../proposals/), closed implementation context lives in [../history/](../history/), and architecture decisions live in [../decisions/](../decisions/).
 
-## 文档
+Current scheduling lives in [../TODO.md](../TODO.md), active task detail lives in [../active/](../active/), completed implementation evidence lives in [../DONE.md](../DONE.md), and factual work history lives in [../WORK_LOG.md](../WORK_LOG.md).
 
-- [context-and-subagent-upgrade-plan.md](./context-and-subagent-upgrade-plan.md): Context Manager、ContextForker 与模型可见 AgentScheduler 架构参考。
-- [context-management-optimization-plan.md](./context-management-optimization-plan.md): 基于 BabeL-2 上下文管理机制复盘与 BabeL-O 真实 session `session_661479db-6327-46f2-a793-7b88e0431174` 的上下文管理优化规划；聚焦 runtime-owned context facts、microcompact-first、compact boundary protocol、provider context-limit recovery 与 Go TUI 可见性。
-- [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md): Cache 命中率观测与 Nexus 实时检测规划；明确 Prompt Cache 可基于 provider cache tokens 评估，Code Index / Tool / Reasoning Cache 在缺少 hit/miss 事实前必须显示为 unavailable，并规划 `/v1/runtime/metrics`、`/v1/runtime/status`、`/v1/runtime/loop/health` 的接入路径。
-- [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md): 对外架构评估后的成熟度补齐规划；承接 Agent Trace Schema、Trajectory Eval Harness、durable run checkpoint/resume、MCP context primitives、memory quality metrics 与 loop taxonomy。
-- [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md): 工具粒度、证据语义与 Agent tool 命名治理。
-- [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md): task scope / evidence scope 治理；防止 read-only 工具把 sibling repo、历史 session path 或 memory hit 自动当作本轮任务证据。
-- [workspace-path-drift-governance-plan.md](./workspace-path-drift-governance-plan.md): workspace path drift、连续路径失败恢复与证据降级治理。
-- [session-finalization-and-evidence-governance-plan.md](./session-finalization-and-evidence-governance-plan.md): current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。
-- [session-replay-and-evidence-governance-plan.md](./session-replay-and-evidence-governance-plan.md): 基于 `session_315814e7-3b82-4a31-8601-a5b383288e9c` 的 provider replay、Read evidence coverage、line/byte range、intent target 与 self-diagnosis 综合治理规划。
-- [session-to-session-memory-channel-plan.md](./session-to-session-memory-channel-plan.md): Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。
-- [memory-capability-awareness-and-trigger-plan.md](./memory-capability-awareness-and-trigger-plan.md): Memory capability awareness、自触发 memory_search / memory_save_note 与写入治理规划。
-- [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md): Skill 显式执行、可观测性、schema normalization、自动生成草稿与人工确认保存的长期治理规划；明确现有 skill 是 prompt-context module，不是任意脚本执行或权限绕过机制。
-- [behavior-monitor.md](./behavior-monitor.md): 行为监控草案；规划 behavior trace、跨 session drift/loop monitor 与用户意图跟随诊断，不替代 session/event/tool trace、memory 或 compact 事实源。
-- [long-running-context-assembly.md](./long-running-context-assembly.md): 长任务上下文组装草案；规划 Nexus-owned working set、resume pack 与 context assembly API，不代表 `context.search` / `WorkingSetTracker` 已在源码落地。
-- [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md): 基于 `session_b2e5660a-2669-4aec-a4a7-73ed65ed1f8e` 的 intent guidance / prompt governance 优化规划；核心原则是禁止事故特定硬编码提示词注入，用语义规则 predicate、结构化 Turn Policy、最小稳定提示词和真实 session regression 区分 pure capability question 与 current-state availability check。
-- [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md): 以 `/Users/tangyaoyue/DEV/BABEL/CLAUDE-FABLE-5.md` 为架构参考的 BabeL-O prompt governance 规划；只吸收 section 化、capability contract、current-state verification、tool boundary、external action 与 skill trigger 等设计方法，不复制 Claude Web / Artifacts / antml / `/mnt/user-data` 等不兼容内容。
-- [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md): EverCore managed sidecar 按需拉起、缓存复用、idle TTL、`/memory` 管理面板与记忆能力问答不泄露内通的治理规划。
-- [tool-surface-expansion-and-native-mcp-coexistence-plan.md](./tool-surface-expansion-and-native-mcp-coexistence-plan.md): Plan-only 工具面扩展草案；规划 native tools、MCP coexistence、Plan/HITL tool surface 与 governance，不等同于源码已注册这些工具。
-- [tool-governance-reference-integration.md](./tool-governance-reference-integration.md): 工具治理参考整合索引；把 tool granularity、evidence scope、tool surface expansion 三条规划串成一致的边界说明。
-- [tool-call-text-normalization-and-final-response-governance-plan.md](./tool-call-text-normalization-and-final-response-governance-plan.md): 基于 `session_ee116547-6545-4f70-bc7c-b1b287387cda` 的 DSML / pseudo tool-call 文本泄漏治理规划；区分 tools visible 下的可解析文本工具调用与 final-response-only / respond-only 下必须 suppression + retry 的禁用阶段。
-- [tool-loop-budget-and-finalization-governance-plan.md](./tool-loop-budget-and-finalization-governance-plan.md): 工具循环预算与 finalization 治理规划；保留 `maxLoops` 护栏但拆出 adaptive budget、`final_check` 与 fresh continuation budget，避免长任务 premature final-only 或无限工具循环。
-- [recoverable-tool-error-and-session-continuity-governance-plan.md](./recoverable-tool-error-and-session-continuity-governance-plan.md): 可恢复工具错误与 session continuity 治理规划；把普通工具执行失败从 terminal `TOOL_ERROR` 改为 provider-visible `tool_result is_error=true`，并补 `Grep` 以 `-` 开头 pattern 的真实 regression。
-- [go-runner-plan.md](./go-runner-plan.md): 可选 Go `RemoteToolRunner` 执行后端参考。
-- [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md): `bbl go` / Go TUI 长期实验重写规划；Go 只作为交互客户端，不拥有 Nexus/runtime/context/permission。
-- [go-tui-loop-multipane-plan.md](./go-tui-loop-multipane-plan.md): 借鉴 [ogulcancelik/herdr](https://github.com/ogulcancelik/herdr) 的 workspace/tab/pane + wait-event + persist snapshot 形态，新增 `bbl loop` 多 session pane TUI 入口的长期规划；不复制 herdr 的 IPC/multiplexer 责任，只复用 API 形态，不引入新的 runtime truth。
-- [go-tui-permission-policy-governance-plan.md](./go-tui-permission-policy-governance-plan.md): Bash 在 `denyByDefaultTools()` 下 hard-deny 跳过 `permission_request` 致 Go TUI 权限面板缺位的治理规划。Phase A — Bash read-only subcommand 自动放行（`src/tools/builtin/bashClassifier.ts` 纯函数分类器 + 30+ 危险 pattern 二次校验）；Phase B — `policy: 'soft-deny'` per-request override 组合；Phase C — 端到端 mock provider regression（含 `result`/`error` 不重置 mode 的 bug 修复）；Phase D — Go TUI `--allow-tools` flag（power-user opt-in，per-turn allowlist override）。四 Phase 全部收口，726 TS tests + Go TUI tests 全过。
-- [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md): Go TUI session 可观测性 / Embedded Nexus 持久化治理规划。基于 `session_go_1781146359507755000` 复盘失败的真实样本：session ID 双轨命名（`session_go_<unixnano>` 客户端 vs `session_<uuid>` 服务端）+ embedded Nexus 走 `MemoryStorage` 进程退出即丢 + 无 session-start 日志。当前源码核对状态：Phase 0 `bbl inspect-session` 已收口；Phase 1 server UUID payload 与本地 client→server 映射日志部分落地；Phase 2 生产默认 SQLite 部分落地；Phase 3 Nexus startup log 与 client-log reverse-resolve 部分落地；Phase 4 跨文档同步与 PTY/e2e 守门仍需补齐。
-- [task-adaptive-recoverable-timeout-plan.md](./task-adaptive-recoverable-timeout-plan.md): Task-adaptive recoverable timeout 规划；基于 `session_791b10ce-0d41-409d-b2de-1e5d14eb19b3`，将普通 timeout 从 fatal request cutoff 拆成模型可见 soft deadline 与系统兜底 hard watchdog。
-- [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md): Go TUI transcript Markdown 渲染优化规划；对照 Crush 的 Glamour + Chroma + Lip Gloss 链路，建议 assistant-only renderer façade、compile spike、代码块高亮与 benchmark gate 渐进落地。
-- [go-tui-selection-highlight-optimization-plan.md](./go-tui-selection-highlight-optimization-plan.md): Go TUI `--mouse` 文本选区高亮与剪贴板复制优化记录；已用窄范围 ultraviolet cell-buffer highlight 收口“实际选中但视觉未高亮/不覆盖”的问题。
-- [distribution-guide.md](./distribution-guide.md): 分发操作指导；说明 v0.3.5+ lightweight portable package、`install.sh`、GitHub release assets、安装自检、发版清单与常见启动问题排查。
-- [distribution-strategy-plan.md](./distribution-strategy-plan.md): 分发策略规划；当前以 `bbl-<platform>.tar.gz` portable 包降低体积并避开 Node SEA 主路径，中期补 npm 普通 Node wrapper + Go TUI asset 下载，长期将生产 launcher 迁移到 Go launcher。
+## Reference States
 
-## 维护规则
+| State | Meaning |
+| --- | --- |
+| `Active Plan` | Still drives implementation sequencing or open architectural decisions. |
+| `Index` | A reader map that consolidates terminology and cross-document ownership. |
+| `Guide` | Operational guidance rather than architecture planning. |
 
-- 已完成实现事实移入 [../DONE.md](../DONE.md)。
-- 未收口任务写入 [../active/](../active/) 下对应 TODO。
-- 本目录只保留设计边界、非目标、安全口径和未来扩展条件。
+Draft, partially landed, and closed documents should not remain here. Use [../proposals/](../proposals/) for unstable plans, [../history/](../history/) for closed implementation context, and [../decisions/](../decisions/) for compact ADRs.
+
+## Library Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [REFERENCE_TEMPLATE.md](./REFERENCE_TEMPLATE.md) | Guide | Standard template for new reference documents. It keeps the planning body in English and reserves a concise final Chinese summary for local readability. |
+
+## Runtime, Context, And Agent Architecture
+
+| Document | State | Role |
+| --- | --- | --- |
+| [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) | Index | Reader entry point for agent runtime maturity, typed session collaboration, TUI relationship visibility, and the skill product loop. |
+| [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md) | Active Plan | Defines trace, eval, durable resume, MCP context primitive, memory quality, and loop taxonomy gaps for the next runtime maturity slice. |
+| [context-governance-index.md](./context-governance-index.md) | Index | Reader entry point for context governance ownership across compact, working set, behavior trace, cache observability, memory, and tool-loop recovery. |
+| [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift to `/`, context-estimate calibration, and storage-backed session recall tools. Phase A (path classification hardening) and Phase C (recall tool storage contract) closed 2026-06-17. |
+| [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md) | Active Plan | Cache health observability, honest unavailable states for non-prompt cache families, and Nexus realtime detection integration phases. |
+
+## Evidence, Scope, And Session Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [evidence-governance-index.md](./evidence-governance-index.md) | Index | Reader entry point for replay safety, evidence coverage, task scope, path drift, finalization, and timeout evidence boundaries. |
+
+## Tool And Runtime Loop Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [tool-governance-plan.md](./tool-governance-plan.md) | Active Plan | Canonical tool governance entry point for tool classes, evidence semantics, native/MCP coexistence, new-tool admission gates, and recoverable failure semantics. |
+| [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md) | Active Plan | Canonical runtime tool-loop continuity entry point for recoverable tool errors, text-shaped tool-call suppression, loop budget diagnostics, and bounded final checks. |
+
+## Prompt, Intent, And Model Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [prompt-model-governance-index.md](./prompt-model-governance-index.md) | Index | Reader entry point for prompt contracts, Turn Policy, runtime-owned intent policy, model metadata, context-window facts, and no-silent-switching boundaries. |
+| [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md) | Active Plan | Defines provider/model metadata, context-window semantics, cache-aware compact metadata, and future catalog governance. |
+
+## Memory And Session Collaboration
+
+| Document | State | Role |
+| --- | --- | --- |
+| [memory-governance-plan.md](./memory-governance-plan.md) | Active Plan | Canonical memory governance entry point for authority model, capability exposure, EverCore/EverOS lifecycle, startup UX, and opt-in write boundaries. |
+
+## Go Client And Distribution
+
+| Document | State | Role |
+| --- | --- | --- |
+| [go-client-distribution-governance-index.md](./go-client-distribution-governance-index.md) | Index | Reader entry point for Go TUI, `bbl loop`, optional Go Runner, launcher, portable package, and release-channel boundaries. |
+| [distribution-guide.md](./distribution-guide.md) | Guide | Operational guide for lightweight portable packages, install script behavior, release assets, and user-side checks. |
+| [distribution-strategy-plan.md](./distribution-strategy-plan.md) | Active Plan | Defines short-, mid-, and long-term distribution strategy across portable packages, npm wrapper, Go TUI assets, and launcher migration. |
+
+## Lifecycle Directories
+
+| Directory | Role |
+| --- | --- |
+| [../proposals/](../proposals/) | Draft and partially landed plans that are not yet stable references. |
+| [../history/](../history/) | Consolidated ledgers for closed implementation context. |
+| [../decisions/](../decisions/) | Compact architecture decision records. |
+| [../archive/](../archive/) | Superseded, stale, or source planning documents retained for traceability. |
+
+## Authoring Rules
+
+- New reference documents should follow [REFERENCE_TEMPLATE.md](./REFERENCE_TEMPLATE.md).
+- The planning body should be written in English for consistency.
+- Keep Chinese text in a final section named `中文概述`.
+- Every reference document must be `Active Plan`, `Index`, or `Guide`.
+- Draft or partially landed work starts in [../proposals/](../proposals/).
+- Closed implementation context must be summarized into [../history/](../history/) or [../DONE.md](../DONE.md), not kept as a standalone reference file.
+- Architecture-wide decisions should be short ADRs in [../decisions/](../decisions/).
+- A reference document must not silently override [../TODO.md](../TODO.md), [../active/](../active/), [../DONE.md](../DONE.md), or [../WORK_LOG.md](../WORK_LOG.md).
+
+## 中文概述
+
+### 背景
+
+`reference/` 曾经承担过长期架构、草案、半完成计划和已收口记录，数量过多。
+
+### 做法
+
+现在 `reference/` 只保留长期有效的架构入口、索引和指南；草案进入 `proposals/`，已完成历史进入 `history/`，关键治理决策进入 `decisions/`。
+
+### 当前状态
+
+Reference 数量已显著压缩，读者可以先从本索引进入长期架构，再按需要跳转到 proposals、history 或 decisions。

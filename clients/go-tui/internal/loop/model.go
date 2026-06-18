@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop/api"
 )
 
 // PaneStatus mirrors the runtime-owned projection in
@@ -142,6 +144,15 @@ type LoopModel struct {
 	Focus      FocusPath
 	Width      int
 	Height     int
+	// SessionInbox is the per-session SessionChannel
+	// inbox snapshot cache, keyed by session id. The
+	// InteractiveModel (not this struct) owns the
+	// mutation; the chrome layer reads it to render
+	// the footer unread indicator and the per-pane
+	// sidebar badge. nil means "no snapshots yet" —
+	// the chrome treats nil as "no badge". SessionChannel
+	// TUI visibility Phase 1.
+	SessionInbox map[string]*api.SessionInboxResponse
 }
 
 // Workspace groups tabs that share an agent context. Each

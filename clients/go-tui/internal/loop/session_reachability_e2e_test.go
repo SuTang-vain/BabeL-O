@@ -1256,7 +1256,7 @@ func TestE2E_ReconcileDiscoveredPaneStreamsTranscript(t *testing.T) {
 	if !strings.Contains(body, "streamed answer from Nexus") {
 		t.Fatalf("focused body missing assistant transcript:\n%s", body)
 	}
-	if strings.Contains(body, "waiting for stream") {
+	if strings.Contains(body, "waiting for Nexus events") {
 		t.Fatalf("focused body should render transcript, not placeholder:\n%s", body)
 	}
 }

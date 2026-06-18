@@ -213,15 +213,117 @@ function buildFocusBlock(prompt: string, cwd: string): string {
   return `Current focus project:\n${cwd}`
 }
 
+function looksLikeLikelyUrlFragment(span: string): boolean {
+  return /^(?:https?:\/\/|\/\/)/i.test(span)
+}
+
+function looksLikeProseFragment(span: string): boolean {
+  // Identifies candidate spans that are *almost certainly prose* even before
+  // any existence check. These are spans whose literal text can't reasonably
+  // be a real filesystem path:
+  // - bare English word after `/`         (e.g. /while, /memory, /if)
+  // - bare CJK prose with Common punctuation (e.g. /目录——一条)
+  //   (the multi-segment /中文/段落 case is handled by the
+  //   `isNonExistentProseCandidate` post-existence check, which has more
+  //   context than the raw span)
+  // - CJK mixed with Latin / arrows (e.g. /Linear→Workflow/Agent,
+  //   /Layer是变换这份数据的可组合单元) — mixed-language prose.
+  const stripped = span.replace(/^\/+/, '')
+  if (stripped.length === 0) return true
+  if (stripped.includes('/')) {
+    // Multi-segment: defer to post-existence check. Pure structural URL
+    // filter is too narrow here (it would also drop /etc/hosts / /bin/bash
+    // which are real paths without file extensions).
+    return false
+  }
+  // Single segment after `/`:
+  // - bare Latin word (`/while`, `/memory`): prose
+  // - CJK or CJK+Common: handle in isNonExistentProseCandidate (needs the
+  //   `!existsSync` check first because real CJK-named paths exist)
+  return /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(stripped) && !stripped.includes('.')
+}
+
 export function extractAbsolutePaths(text: string): string[] {
   const paths = new Set<string>()
+  const normalized = normalizeWrappedPathFragments(text)
+  // Preserve escaped-space absolute paths as a single candidate: a shell
+  // escape `\ ` inside a path (e.g. /Users/.../Mobile\ Documents/...) must
+  // not be split at the backslash. We rewrite `\ ` to a marker, run the
+  // regex, then restore the space.
+  const SPACE_MARK = '\x00\x01'
+  const preserved = normalized.replace(/\\ /g, SPACE_MARK)
   const pathPattern = /\/[^\s"'`，。！？；：、）\])}<>]+/g
-  for (const match of normalizeWrappedPathFragments(text).matchAll(pathPattern)) {
-    const cleaned = match[0].replace(/[.,;:!?]+$/u, '')
+  for (const match of preserved.matchAll(pathPattern)) {
+    const restored = match[0].replace(new RegExp(SPACE_MARK, 'g'), ' ')
+    if (looksLikeLikelyUrlFragment(restored)) continue
+    if (existsSync(restored)) {
+      // Real on-disk path: keep verbatim. This protects /etc/hosts,
+      // /bin/bash, /Users/.../MEMORY.md, and iCloud paths with spaces.
+      paths.add(restored)
+      continue
+    }
+    if (looksLikeProseFragment(restored)) continue
+    const cleaned = restored.replace(/[.,;:!?]+$/u, '')
     const resolved = resolvePromptPath(cleaned)
-    if (resolved !== '/') paths.add(resolved)
+    if (resolved === '/') continue
+    if (isNonExistentProseCandidate(resolved)) continue
+    paths.add(resolved)
   }
   return [...paths]
+}
+
+function isNonExistentProseCandidate(candidate: string): boolean {
+  // Layered guard for non-existent candidates whose shape is prose-like.
+  // Caller has already verified `!existsSync(candidate)`. We additionally
+  // verify the parent also doesn't resolve, because the real risk is
+  // `resolveCwdFromPrompt` returning dirname(candidate) when dirname
+  // exists. The `resolvePromptPath` collapse-to-parent step is what
+  // caused session_cf361f04 cwd drift.
+  const basename = candidate.slice(candidate.lastIndexOf('/') + 1)
+  if (basename.length === 0) return true
+  if (looksLikeLikelyProseBasename(basename)) return true
+  // Multi-segment candidate whose basename is short and Latin-only is
+  // suspicious: a real path almost always ends in a directory or has
+  // an extension. `/memory/`, `/Linear/Workflow`, `/foo/bar` are prose
+  // when none of the segments exist.
+  const segments = candidate.split('/').filter(s => s.length > 0)
+  if (segments.length === 1) {
+    // single segment after root: a real path would either exist or have
+    // an extension. Bare ASCII word, bare CJK, or trailing-slash all
+    // count as prose when the path doesn't exist.
+    if (/^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(basename)) return true
+    if (/^[\p{Script=Han}]+$/u.test(basename)) return true
+  }
+  if (segments.length === 2) {
+    // two-segment non-existent path: drop if any segment is a bare
+    // CJK prose word, a CJK+Common prose word, or a CJK-mixed word.
+    // Real two-segment paths almost always have a real parent (e.g.
+    // /Users/<name>) and the basename would either match an existing
+    // file or have a recognizable extension.
+    for (const seg of segments) {
+      if (/^[\p{Script=Han}\p{Script=Common}]+$/u.test(seg)
+        && /[\p{Script=Han}]/u.test(seg)) return true
+      if (looksLikeLikelyProseBasename(seg)) return true
+    }
+  }
+  return false
+}
+
+function looksLikeLikelyProseBasename(basename: string): boolean {
+  if (basename.length === 0) return false
+  if (isCjkOrCommonBasename(basename)) return true
+  if (isCjkMixedBasename(basename)) return true
+  return false
+}
+
+function isCjkOrCommonBasename(basename: string): boolean {
+  return /^[\p{Script=Han}\p{Script=Common}]+$/u.test(basename)
+    && /[\p{Script=Han}]/u.test(basename)
+}
+
+function isCjkMixedBasename(basename: string): boolean {
+  return /[\p{Script=Han}]/u.test(basename)
+    && !/^[A-Za-z0-9._-]+$/u.test(basename)
 }
 
 export function normalizeWrappedPathFragments(text: string): string {

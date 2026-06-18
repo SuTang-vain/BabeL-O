@@ -13,6 +13,7 @@ import type {
 import { allowAllTools, allowlistedTools, type ToolPolicy } from './LocalCodingRuntime.js'
 import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
 import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
+import { deriveSessionRootContinuity, buildSessionRootContinuityMessage } from './sessionRootContinuity.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
 import type {
@@ -80,7 +81,7 @@ import {
 } from './runtimePipeline.js'
 import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
-import type { MemoryProvider } from './memoryProvider.js'
+import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 // PR-A4: resume() class method imports — see long-running-context-
 // assembly.md §6.2 for the 3-step flow.
 import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
@@ -227,8 +228,79 @@ export class LLMCodingRuntime implements NexusRuntime {
     yield* wrapWithBehaviorTraceTap(options, source)
   }
 
+  /**
+   * §3.5 Memory Quality Metrics v1.1 follow-up: hot-path emission.
+   * Bound to `ContextAssemblerOptions.onMemoryRetrieval` at every
+   * `refreshRuntimeContextState` call site so every real
+   * provider/tool turn writes a `memory_retrieval` NexusEvent —
+   * not just the GET `/v1/sessions/:id/context` inspection route.
+   *
+   * Fire-and-forget: any throw is swallowed so the hot path stays
+   * unaffected. The dashboard degrades to "fewer events" rather
+   * than 5xx when storage is degraded. This is consistent with
+   * the v1 contract that §3.5 metrics are a recent-window
+   * dashboard signal, not a durability-critical audit.
+   */
+  private readonly emitMemoryRetrieval = async (input: {
+    sessionId: string
+    cwd: string
+    prompt: string
+    diagnostics: MemoryProviderDiagnostics
+  }): Promise<void> => {
+    if (!this.memoryProvider) return
+    const d = input.diagnostics
+    const autoSearch = d.autoSearch
+    const event: NexusEvent = {
+      ...eventBase(input.sessionId),
+      type: 'memory_retrieval',
+      provider: d.provider,
+      enabled: d.enabled,
+      scope: d.scope,
+      ...(d.namespaceId && { namespaceId: d.namespaceId }),
+      ...(d.namespaceSource && { namespaceSource: d.namespaceSource }),
+      ...(d.isolationKey && { isolationKey: d.isolationKey }),
+      autoSearchTriggered: autoSearch?.triggered ?? false,
+      autoSearchReason: autoSearch?.reason ?? 'no_memory_cue',
+      ...(autoSearch?.cue && { autoSearchCue: autoSearch.cue }),
+      hitCount: d.hitCount,
+      injectedChars: d.injectedChars,
+      budgetChars: d.budgetChars,
+      maxHitChars: d.maxHitChars,
+      truncated: d.truncated,
+      ...(d.searchLatencyMs !== undefined && { searchLatencyMs: d.searchLatencyMs }),
+      ...(d.error && { error: d.error }),
+      prompt: input.prompt,
+      cwd: input.cwd,
+    }
+    try {
+      await this.storage.appendEvent(input.sessionId, event)
+    } catch (error) {
+      // never break the hot path on a metrics write failure
+      process.stderr.write(
+        `[LLMCodingRuntime] memory_retrieval event append failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      )
+    }
+  }
+
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
-    const resolvedCwd = resolveCwdFromPrompt(options.prompt, options.cwd)
+    // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+    // Use the continuity-aware resolver when the caller has supplied
+    // session context. Falls through to the simple 2-arg heuristic
+    // when storedSessionCwd / latestTaskPrimaryRoot are absent.
+    const hasSessionContext = options.storedSessionCwd !== undefined
+      || options.latestTaskPrimaryRoot !== undefined
+    const { cwd: resolvedCwd, continuity } = hasSessionContext
+      ? resolveCwdWithContinuity({
+          prompt: options.prompt,
+          baseCwd: options.cwd,
+          storedSessionCwd: options.storedSessionCwd,
+          latestTaskPrimaryRoot: options.latestTaskPrimaryRoot,
+          acceptExternalPromptPath: options.acceptExternalPromptPath,
+        })
+      : {
+          cwd: resolveCwdFromPrompt(options.prompt, options.cwd),
+          continuity: null,
+        }
     if (resolvedCwd !== options.cwd) {
       options.cwd = resolvedCwd
     }
@@ -243,6 +315,25 @@ export class LLMCodingRuntime implements NexusRuntime {
       requestId: options.requestId,
       model: options.model,
       budget: options.budget,
+    }
+
+    if (continuity) {
+      yield {
+        type: 'session_root_continuity',
+        ...eventBase(options.sessionId),
+        requestId: options.requestId,
+        requestCwd: continuity.requestCwd,
+        ...(continuity.storedSessionCwd !== undefined && { storedSessionCwd: continuity.storedSessionCwd }),
+        ...(continuity.latestTaskPrimaryRoot !== undefined && { latestTaskPrimaryRoot: continuity.latestTaskPrimaryRoot }),
+        promptPathCandidates: continuity.promptPathCandidates,
+        resolvedCwd: continuity.resolvedCwd,
+        decision: continuity.decision,
+        reason: continuity.reason,
+        isExternalRoot: continuity.isExternalRoot,
+        wasProjectRootKept: continuity.wasProjectRootKept,
+        warnings: continuity.warnings,
+        message: buildSessionRootContinuityMessage(continuity),
+      }
     }
 
     const metrics = createRuntimeExecutionMetrics()
@@ -337,6 +428,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         compactPercent: contextCompactPercent,
         suppressToolsForIntent: shouldSuppressToolsForIntent,
         memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
       })
       let assembledContext = contextRefreshState.assembledContext
       let messages = contextRefreshState.messages
@@ -389,6 +481,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           compactPercent: contextCompactPercent,
           suppressToolsForIntent: shouldSuppressToolsForIntent,
           memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
           sessionInbox: await loadSessionInbox(),
         }))
       }
@@ -450,6 +543,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
             memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
             sessionInbox: await loadSessionInbox(),
           }))
           autoCompactDecision = contextRefreshState.autoCompactDecision
@@ -503,6 +597,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
             memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
             sessionInbox: await loadSessionInbox(),
           }))
           yield buildContextUsageEvent({
@@ -631,6 +726,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               compactPercent: contextCompactPercent,
               suppressToolsForIntent: shouldSuppressToolsForIntent,
               memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
               sessionInbox: await loadSessionInbox(),
             }))
             messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
@@ -1157,6 +1253,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         compactPercent: 90,
         suppressToolsForIntent: () => false,
         memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
         sessionInbox: [],
         workingSetOverride,
         includeBehaviorTrace: true,
@@ -1275,7 +1372,7 @@ function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], late
   return false
 }
 
-function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
+export function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
   const paths = extractAbsolutePaths(prompt)
   for (const candidate of paths) {
     const resolved = resolvePromptPath(candidate)
@@ -1300,6 +1397,37 @@ function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
     }
   }
   return baseCwd
+}
+
+// Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+// Same heuristic as `resolveCwdFromPrompt`, but threads through
+// `deriveSessionRootContinuity` so the caller can also surface a
+// `session_root_continuity` event. Used by the runtime path; tests
+// continue to use the 2-arg `resolveCwdFromPrompt` to keep the
+// contract narrow.
+export function resolveCwdWithContinuity(options: {
+  prompt: string
+  baseCwd: string
+  storedSessionCwd?: string
+  latestTaskPrimaryRoot?: string
+  acceptExternalPromptPath?: boolean
+}): { cwd: string; continuity: import('./sessionRootContinuity.js').SessionRootContinuity } {
+  const continuity = deriveSessionRootContinuity({
+    requestCwd: options.baseCwd,
+    prompt: options.prompt,
+    storedSessionCwd: options.storedSessionCwd,
+    latestTaskPrimaryRoot: options.latestTaskPrimaryRoot,
+    acceptExternalPromptPath: options.acceptExternalPromptPath,
+  })
+  // If the decision is `require_confirmation`, fall back to the simple
+  // 2-arg heuristic (so we still get any internal-path switch) but keep
+  // the continuity record so the runtime can surface "external path was
+  // detected but not accepted".
+  if (continuity.decision === 'require_confirmation') {
+    const simpleCwd = resolveCwdFromPrompt(options.prompt, continuity.resolvedCwd)
+    return { cwd: simpleCwd, continuity: { ...continuity, resolvedCwd: simpleCwd } }
+  }
+  return { cwd: continuity.resolvedCwd, continuity }
 }
 
 export function mapEventsToMessages(

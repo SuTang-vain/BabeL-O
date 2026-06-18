@@ -1,5 +1,12 @@
 # BabeL-O Distribution Guide
 
+> State: Guide
+> Track: Distribution / Installer / Release Operations
+> Priority: P1 Watch
+> Source of truth: [../TODO.md](../TODO.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `scripts/install.sh`, `scripts/package-portable.mjs`, `docs/releases/`
+
+> Governance: Indexed by [go-client-distribution-governance-index.md](./go-client-distribution-governance-index.md). This guide is operational; strategic channel direction lives in [distribution-strategy-plan.md](./distribution-strategy-plan.md).
+
 ## Purpose
 
 This guide is the operational companion to [distribution-strategy-plan.md](./distribution-strategy-plan.md). The strategy document explains where distribution should go; this guide explains how to ship, install, verify, and debug the current release line.
@@ -267,3 +274,17 @@ curl -fsS http://127.0.0.1:3000/health
 - v0.3.5+ release work should verify `bbl-<platform>.tar.gz`, not just `go-tui-*` and legacy `bbl-*`.
 - The long-term fix is a Go launcher that owns startup and `exec`s the Go TUI without Node SEA.
 - When the Go launcher lands, update this guide, [distribution-strategy-plan.md](./distribution-strategy-plan.md), README install instructions, and release notes together.
+
+## 中文概述
+
+### 背景
+
+本文是发布和安装操作指南，服务于真实用户如何安装、验证、排错 BabeL-O。
+
+### 边界
+
+它不决定长期发布策略；策略方向由 distribution-strategy-plan 维护。指南内容必须和 install.sh、release assets、README 安装命令保持一致。
+
+### 当前状态
+
+作为 Guide 保留，后续每次 release 或安装路径变化都应同步核对。

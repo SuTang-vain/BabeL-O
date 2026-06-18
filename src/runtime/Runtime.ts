@@ -63,6 +63,25 @@ export type RuntimeExecuteOptions = {
     inheritedItems: number
     omittedItems: number
   }
+  /**
+   * Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+   * When the caller has a previously-stored session cwd or a
+   * task_scope_declared.primaryRoot, pass them so
+   * `resolveCwdWithContinuity` can prefer them over a freshly-resolved
+   * cwd from the prompt. Both are optional; if omitted the runtime
+   * falls back to the 2-arg `resolveCwdFromPrompt` heuristic.
+   */
+  storedSessionCwd?: string
+  latestTaskPrimaryRoot?: string
+  /**
+   * When true, an external prompt path (i.e. a real path that lives
+   * outside `cwd`) is allowed to switch cwd. Default false: the
+   * runtime keeps cwd and surfaces a `session_root_continuity` event
+   * with `decision: require_confirmation` so the user / scope flow
+   * can decide. Set true only for opt-in flows (e.g. `bbl go` with
+   * `--external-ok`).
+   */
+  acceptExternalPromptPath?: boolean
 }
 
 export interface NexusRuntime {

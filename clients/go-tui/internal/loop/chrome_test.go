@@ -132,7 +132,7 @@ func TestChromeRendersFocusedPaneMetadata(t *testing.T) {
 	}
 	model.Workspaces[0].Tabs[0] = updated
 	box := stripANSI(renderFocusedPane(model, 80, 20))
-	for _, want := range []string{"pane-1", "session-1", "drift", "Phase 3f'"} {
+	for _, want := range []string{"pane-1", "session-1", "drift", "waiting for Nexus events"} {
 		if !strings.Contains(box, want) {
 			t.Errorf("focused pane box missing %q\nfull:\n%s", want, box)
 		}

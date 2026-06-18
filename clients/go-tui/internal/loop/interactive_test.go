@@ -8,12 +8,17 @@
 package loop
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+
+	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop/api"
 )
 
 func TestInteractiveUpdateAppliesWindowSize(t *testing.T) {
@@ -190,6 +195,21 @@ func TestApplySnapshotToLoopEmptySnapshotIsNoop(t *testing.T) {
 	}
 }
 
+func TestApplySnapshotToLoopSkipsLocalFakeSessionPane(t *testing.T) {
+	model := NewLoopModel()
+	snap := Snapshot{
+		Version: snapshotVersion,
+		Panes: []PaneStateEntry{
+			{PaneID: "pane-fake", WorkspaceID: "ws-default", TabID: "ws-default:1", SessionID: "session-local-deadbeef", Agent: "bbl", Cwd: "/tmp", Label: "main", LastRev: 0},
+			{PaneID: "pane-empty-cwd", WorkspaceID: "ws-default", TabID: "ws-default:1", SessionID: "session-real", Agent: "bbl", Cwd: "", Label: "main", LastRev: 0},
+		},
+	}
+	hydrated := applySnapshotToLoop(model, snap)
+	if len(hydrated.Workspaces[0].Tabs[0].Panes) != 0 {
+		t.Fatalf("invalid snapshot panes should be skipped, got %+v", hydrated.Workspaces[0].Tabs[0].Panes)
+	}
+}
+
 func TestNewInteractiveModelWithStoreHydrates(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	store, err := NewStore(storePath)
@@ -245,6 +265,64 @@ func TestInteractiveUpdatePersistsSnapshotOnDispatch(t *testing.T) {
 	snap := store2.Snapshot()
 	if len(snap.Panes) != 1 || snap.Panes[0].SessionID == "" {
 		t.Fatalf("snapshot should have the dispatched pane, got %+v", snap.Panes)
+	}
+}
+
+func TestInteractiveCtrlNAllocatesServerSessionBeforePane(t *testing.T) {
+	var createCalled bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/sessions":
+			createCalled = true
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body["clientSessionId"] == "" {
+				t.Fatalf("CreateSession missing clientSessionId: %+v", body)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(`{"type":"session_created","sessionId":"session-real","clientSessionId":"pane-1","createdAt":"2026-06-17T00:00:00Z"}`))
+		case "/v1/sessions/session-real/wait":
+			_, _ = w.Write([]byte(`{"type":"session_wait","sessionId":"session-real","events":[],"nextRevision":"0","matched":false}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	defer server.Close()
+
+	client := api.NewClient(server.URL, "test")
+	im := NewInteractiveModelWithLoopClient(
+		NewLoopModel(),
+		nil,
+		nil,
+		0,
+		client,
+		0,
+		nil,
+		nil,
+	)
+	updated, cmd := im.Update(tea.KeyPressMsg(tea.Key{Code: 'n', Mod: tea.ModCtrl}))
+	im = updated.(InteractiveModel)
+	if cmd == nil {
+		t.Fatal("Ctrl+N should allocate a server session")
+	}
+	msg := cmd()
+	updated, readCmd := im.Update(msg)
+	im = updated.(InteractiveModel)
+	if !createCalled {
+		t.Fatal("CreateSession was not called")
+	}
+	pane, ok := im.loop.FocusedPane()
+	if !ok {
+		t.Fatal("expected focused pane after session allocation")
+	}
+	if pane.SessionID != "session-real" {
+		t.Fatalf("pane SessionID = %q, want session-real", pane.SessionID)
+	}
+	if strings.HasPrefix(pane.SessionID, "session-local-") {
+		t.Fatalf("pane should not use fake local session id: %s", pane.SessionID)
+	}
+	if readCmd == nil {
+		t.Fatal("successful pane creation should start a read command")
 	}
 }
 

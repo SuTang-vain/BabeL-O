@@ -1,3 +1,4 @@
+import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool } from './Tool.js'
 import { bashTool } from './builtin/bash.js'
 import { contextRecentTool } from './builtin/contextRecent.js'
@@ -19,8 +20,23 @@ import { taskTool } from './builtin/task.js'
 import { webSearchTool } from './builtin/webSearch.js'
 import { writeTool } from './builtin/write.js'
 
-export function createDefaultToolRegistry(): Map<string, AnyTool> {
-  const tools = [
+export interface CreateToolRegistryOptions {
+  // `storage: null` means "no storage available; hide context* tools so
+  // the model prompt does not advertise tools that always fail with
+  // CONTEXT_STORAGE_UNAVAILABLE." This is the sentinel used by direct
+  // LocalCodingRuntime construction (e.g. Go TUI local mode) where
+  // storage is intentionally absent.
+  // `storage: undefined` (or opts not provided) preserves the historical
+  // default: all tools including context* are registered, and the
+  // tool's own storage gate returns CONTEXT_STORAGE_UNAVAILABLE at
+  // execute time.
+  storage?: NexusStorage | null
+}
+
+const CONTEXT_TOOL_NAMES = new Set(['contextSearch', 'contextSummarize', 'contextRecent'])
+
+export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}): Map<string, AnyTool> {
+  const tools: AnyTool[] = [
     listDirTool,
     globTool,
     grepTool,
@@ -44,5 +60,15 @@ export function createDefaultToolRegistry(): Map<string, AnyTool> {
     skillDraftTool,
     skillSaveTool,
   ]
-  return new Map(tools.map(tool => [tool.name, tool as AnyTool]))
+  const registry = new Map(tools.map(tool => [tool.name, tool as AnyTool]))
+
+  // When the caller explicitly passes `storage: null`, drop the context*
+  // tools. The model prompt for an LLM-runtime without storage should
+  // not advertise tools that will always return CONTEXT_STORAGE_UNAVAILABLE.
+  if (opts.storage === null) {
+    for (const name of CONTEXT_TOOL_NAMES) {
+      registry.delete(name)
+    }
+  }
+  return registry
 }

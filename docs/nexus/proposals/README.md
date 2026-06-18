@@ -1,0 +1,40 @@
+# Nexus Proposals
+
+> State: Index
+> Governance: This directory stores draft and partially landed plans that are not yet stable long-lived references.
+
+This directory holds work that is still being shaped, partially implemented, or waiting for stronger evidence. A proposal may graduate into `reference/`, be summarized into `history/`, or move to `archive/`.
+
+## Current Proposals
+
+| Proposal | State | Scope |
+| --- | --- | --- |
+| [behavior-monitor.md](./behavior-monitor.md) | Partially Landed | Behavior trace, monitor, live hint projection, and Go loop visualization follow-up. |
+| [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md) | Draft | External prompt architecture reference, without importing incompatible product assumptions. |
+| [go-runner-plan.md](./go-runner-plan.md) | Partially Landed | Optional Go RemoteToolRunner phases and runner boundaries. |
+| [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md) | Draft | Gradual Markdown rendering upgrade path for Go TUI transcript readability. |
+| [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md) | Partially Landed | Embedded Nexus persistence and session inspectability gaps for Go TUI. |
+| [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md) | Partially Landed | Intent guidance, deterministic policy normalization, and prompt-governance guardrails. |
+| [long-running-context-assembly.md](./long-running-context-assembly.md) | Partially Landed | Working set, context assembly, resume, REST/CLI/WS interfaces, and follow-up. |
+| [session-graph-runtime-map-governance-plan.md](./session-graph-runtime-map-governance-plan.md) | Draft | Project existing session, event, tool, permission, child-session, and channel facts into a user-readable Session Graph runtime map. |
+| [session-channel-tui-relationship-visibility-plan.md](./session-channel-tui-relationship-visibility-plan.md) | Draft | SessionChannel relationship visibility in TUI without transcript merging or auto-action. |
+| [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Partially Landed | Skill schema governance, explicit skill tools, draft/save boundaries, and generation constraints. |
+| [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md) | Partially Landed | Task scope, evidence scope, boundary confirmation, and out-of-scope diagnostics. |
+
+## Lifecycle
+
+| Outcome | Required action |
+| --- | --- |
+| Becomes canonical architecture | Move to `../reference/` and update `../reference/README.md`. |
+| Implementation closes | Summarize into `../history/` or `../DONE.md`; do not keep it as a standalone proposal. |
+| Superseded or stale | Move to `../archive/` with a short index note. |
+
+## 中文概述
+
+### 作用
+
+`proposals/` 承接 Draft 和 Partially Landed 文档，避免这些尚未稳定的计划污染长期 reference。
+
+### 规则
+
+提案必须最终毕业、合并或归档；不能无限期留在 reference 中。

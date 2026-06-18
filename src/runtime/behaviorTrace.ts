@@ -42,10 +42,14 @@ export type BehaviorTrigger =
   | 'scope-drift'
   | 'trajectory-end'
   | 'user-redirect'
-  // cross-session (3) — declared but not emitted by this module
+  // cross-session (4) — declared but not emitted by this module
   | 'hot-path'
   | 'tool-storm'
   | 'scope-drift-wave'
+  // Phase D: prompt-cache-miss-wave — emitted by BehaviorMonitor when
+  // ≥ N sessions in windowMs all have prompt cache read ratio below
+  // targetRatio. See `cache-observability-and-nexus-realtime-detection-plan.md` §5.4.
+  | 'prompt-cache-miss-wave'
 
 export type SelfAssessmentSource = 'rule' | 'llm' | ''
 

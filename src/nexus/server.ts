@@ -68,7 +68,7 @@ try {
 }
 const providerSettings = ConfigManager.getInstance().resolveSettings()
 const everCore = await defaultEverCoreRuntimeManager.acquireFromEnv(process.env, { cwd, providerSettings })
-const { runtime, storage, agentScheduler } = await createDefaultNexusRuntime({
+const { runtime, storage, agentScheduler, behaviorMonitor } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,
   cwd,
@@ -105,6 +105,7 @@ const app = await createNexusApp({
   everCoreStatus: everCore.status,
   memoryProvider: everCore.memoryProvider,
   agentExecutionEnvironment,
+  behaviorMonitor,
 })
 app.addHook('onClose', async () => {
   await defaultEverCoreRuntimeManager.shutdown()

@@ -48,7 +48,7 @@
 - **改动**:
   - 新增 `## Quick Start (5 minutes)` 段,**只有一种推荐路径**(npm/pnpm global install),不再展示 3 种安装方法并列。
   - 内容:`npm i -g babel-o` → `bbl init my-app` → `bbl chat` → 跑一个内置 demo prompt(如 "explain this repo's entry point")。
-  - 顶部加 ⚠️ 框:"如果你的 Node < 22,先升级;详细安装备选见 [Installation](./docs/INSTALLATION.md)。"
+  - 顶部加 ⚠️ 框:"如果你的 Node < 22,先升级;详细安装备选见 `docs/INSTALLATION.md`。"
 - **产物**:`README.md` 中英双版 + 新文件 `docs/INSTALLATION.md`(把当前 3 种安装方法从 README 搬过去,作为兜底)。
 - **收口**:`bbl init` 命令可被零基础用户复现到第一次成功提示。
 

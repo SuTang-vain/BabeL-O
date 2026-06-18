@@ -205,6 +205,41 @@ func TestClientWaitForEventsBuildsQuery(t *testing.T) {
 	}
 }
 
+func TestClientCreateSessionPostsBodyAndDecodesID(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &capturedBody)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{
+			"type": "session_created",
+			"sessionId": "session-real",
+			"clientSessionId": "loop-local",
+			"createdAt": "2026-06-17T00:00:00.000Z"
+		}`))
+	})
+	c, _ := newTestClient(t, handler)
+	resp, err := c.CreateSession(context.Background(), CreateSessionRequest{
+		Cwd:             "/workspace",
+		ClientSessionID: "loop-local",
+		Metadata:        map[string]any{"entrypoint": "bbl loop"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSession: %v", err)
+	}
+	if capturedPath != "/v1/sessions" {
+		t.Fatalf("CreateSession path = %q", capturedPath)
+	}
+	if capturedBody["cwd"] != "/workspace" || capturedBody["clientSessionId"] != "loop-local" {
+		t.Fatalf("CreateSession body = %+v", capturedBody)
+	}
+	if resp.SessionID != "session-real" || resp.ClientSessionID != "loop-local" {
+		t.Fatalf("CreateSession response = %+v", resp)
+	}
+}
+
 func TestClientExecutePromptPostsExecuteBody(t *testing.T) {
 	var capturedPath string
 	var capturedBody map[string]any

@@ -21,6 +21,17 @@
 // error because the server-side PendingPermissionRegistry
 // may still be waiting for the operator's decision; we'd
 // just have to surface it again on the next /wait poll.
+//
+// 6d-c'-B-stepC (2026-06-17): multi-mode dialog editor.
+// The static Y/N dialog gets three sub-modes reachable via
+// keybinds:
+//   1/2/3 — set approval scope (once / session / rule),
+//           auto-approve when scope is picked from base.
+//   D     — enter deny-reason text input mode.
+//   R     — enter approve-rule edit mode.
+// In reason/rule mode, printable keys edit the draft,
+// backspace deletes one rune, Enter commits the decision,
+// Esc returns to the base dialog.
 
 package loop
 
@@ -32,6 +43,35 @@ import (
 
 	"github.com/sutang-vain/babel-o/clients/go-tui/internal/loop/api"
 )
+
+// permDialogMode enumerates the sub-modes of the permission
+// dialog. The zero value (permDialogBase) is the legacy
+// Y/N-only dialog; the other three are the 6d-c'-B-stepC
+// editor modes.
+type permDialogMode int
+
+const (
+	permDialogBase permDialogMode = iota
+	permDialogScope               // scope picker (1/2/3)
+	permDialogReason              // deny reason text input
+	permDialogRule                // approve rule edit
+)
+
+// permDialogState holds the transient UI state for the
+// multi-mode permission dialog. nil means no sub-mode is
+// active — the base Y/N dialog renders. When non-nil,
+// Mode determines what the dialog shows and which keys
+// are intercepted. The Permission is snapshotted at
+// dialog-open time so a fresher permission_request that
+// replaces PendingPermission mid-edit doesn't corrupt
+// the operator's in-progress input.
+type permDialogState struct {
+	Mode   permDialogMode
+	Perm   *PanePermission
+	Scope  string // "once" | "session" | "rule"
+	Reason string // deny reason draft
+	Rule   string // approve rule draft (initialized from Perm.SuggestedRule)
+}
 
 // permissionDecisionMs is the per-call budget for the
 // approve/deny HTTP request. The runtime usually responds
@@ -124,7 +164,56 @@ func (m *InteractiveModel) dispatchPermissionDecision(pane PaneModel, perm *Pane
 	if m == nil || m.loopClient == nil || perm == nil {
 		return nil
 	}
+	// 6d-c'-B-stepC: clear the dialog sub-mode state
+	// when a decision is dispatched. The dialog stays
+	// in its base (Y/N) mode, and the wait stream's
+	// permission_response will clear PendingPermission
+	// itself.
+	m.permDialog = nil
 	return permissionDecisionCmd(m.loopClient, pane, perm, kind)
+}
+
+// dispatchPermissionDecisionWithState is the 6d-c'-B-stepC
+// variant that reads scope / reason / rule from the
+// permDialogState instead of falling back to defaults.
+// Called when the operator commits from a sub-mode
+// (scope picker, deny reason input, approve rule edit).
+func (m *InteractiveModel) dispatchPermissionDecisionWithState(pane PaneModel, kind string) tea.Cmd {
+	if m == nil || m.loopClient == nil || m.permDialog == nil || m.permDialog.Perm == nil {
+		return nil
+	}
+	perm := m.permDialog.Perm
+	toolUseID := perm.ToolUseID
+	sessionID := pane.SessionID
+	scope := m.permDialog.Scope
+	rule := m.permDialog.Rule
+	reason := m.permDialog.Reason
+	feedback := ""
+
+	// Clear the dialog state before firing the cmd so
+	// the UI returns to base mode immediately.
+	m.permDialog = nil
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), permissionDecisionMs+1*time.Second)
+		defer cancel()
+		var err error
+		switch kind {
+		case "approve":
+			err = m.loopClient.ApprovePermission(ctx, sessionID, toolUseID, api.ApprovePermissionOptions{
+				Scope: scope,
+				Rule:  rule,
+			})
+		case "deny":
+			err = m.loopClient.DenyPermission(ctx, sessionID, toolUseID, reason, feedback)
+		}
+		return permissionDecisionMsg{
+			PaneID:    pane.PaneID,
+			Kind:      kind,
+			ToolUseID: toolUseID,
+			Err:       err,
+		}
+	}
 }
 
 // handlePermissionDecision is the Update-path entry for
