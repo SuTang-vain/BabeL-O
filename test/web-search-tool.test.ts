@@ -123,7 +123,9 @@ test('webSearchTool returns a tool error when provider request fails', async () 
     )
 
     assert.equal(result.success, false)
-    assert.match(String(result.output), /HTTP 429/)
+    assert.equal((result.output as any).code, 'WEB_SEARCH_FAILED')
+    assert.match((result.output as any).message, /HTTP 429/)
+    assert.match((result.output as any).repairHint, /specific public query/)
   } finally {
     restore()
   }

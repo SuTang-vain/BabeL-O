@@ -2,7 +2,7 @@
 
 > Status: **Landed / P2 maintenance**
 > Priority: Watch / Stable Go TUI maintenance — 文件级机械拆分已收口；Phase 5 `Update` 分段仅在后续出现明确维护痛点或 regression 时再评估
-> 关联: [go-tui-rewrite-plan.md](./go-tui-rewrite-plan.md)、[go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md)、[go-tui-model-persistence-plan.md](../archive/go-tui-model-persistence-plan.md)
+> 关联: [go-tui-history.md](../history/go-tui-history.md)、[go-tui-session-observability-governance-plan.md](../proposals/go-tui-session-observability-governance-plan.md)、[go-tui-model-persistence-plan.md](./go-tui-model-persistence-plan.md)
 
 ---
 

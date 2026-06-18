@@ -1,5 +1,12 @@
 # BabeL-O Distribution Strategy Plan
 
+> State: Active Plan
+> Track: Distribution / Portable Package / Launcher
+> Priority: P1 Watch
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_cleanup.md](../active/TODO_cleanup.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `scripts/install.sh`, `scripts/package-portable.mjs`, `src/cli/commands/go.ts`
+
+> Governance: Indexed by [go-client-distribution-governance-index.md](./go-client-distribution-governance-index.md). This document owns release-channel strategy; it must stay aligned with real assets, `install.sh`, and `bbl go --check`.
+
 ## Decision
 
 Move the production installer away from Node.js SEA as the primary channel. The v0.3.5 release line uses a lightweight portable package now, while the long-term target remains a small Go launcher. The target product shape is:
@@ -200,3 +207,17 @@ Go launcher:
 - `bbl --version`, `bbl go --check --no-start-nexus`, and `bbl go` work without Node.
 - macOS arm64 binary is materially smaller than the current SEA plus Go TUI pair.
 - Existing CLI commands either run natively in the launcher or dispatch to an explicitly managed Node runtime with clear messaging. The final target is no hidden SEA dependency in the primary Go TUI path.
+
+## 中文概述
+
+### 背景
+
+本文定义 BabeL-O 从 Node SEA 转向 lightweight portable package、npm wrapper、Homebrew 和未来 Go launcher 的分发路线。
+
+### 边界
+
+分发策略不能超前于真实 release assets 和安装脚本；Go launcher 是长期方向，不等于 Go 接管 Nexus runtime。
+
+### 当前状态
+
+作为 Active Plan 保留。当前主路径是 v0.3.5+ lightweight portable package，Go launcher 仍是后续迁移目标。

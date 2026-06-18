@@ -9,6 +9,26 @@ export interface Skill {
   triggers: string[];
   priority: number;
   content: string;
+  /** Advisory allow-list of tool names (Skill governance plan §Proposed skill schema). */
+  allowedTools?: string[];
+  description?: string;
+  version?: number;
+  status?: string;
+  scope?: string;
+  risk?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  owner?: string;
+}
+
+/** Parse `[a, b, c]` style YAML list. Returns [] on missing/empty. */
+function parseListField(raw: string | undefined): string[] {
+  if (!raw) return []
+  return raw
+    .replace(/[\[\]]/g, '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
 }
 
 export function parseFrontMatter(rawContent: string): Skill | null {
@@ -34,13 +54,13 @@ export function parseFrontMatter(rawContent: string): Skill | null {
 
   const id = metadata['id'] || '';
   const name = metadata['name'] || id;
-  const triggersRaw = metadata['triggers'] || '';
-  const triggers = triggersRaw
-    .replace(/[\[\]]/g, '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+  const triggers = parseListField(metadata['triggers']);
   const priority = parseInt(metadata['priority'] || '0', 10) || 0;
+  const allowedTools = parseListField(metadata['allowedtools']);
+  const version = metadata['version'] ? parseInt(metadata['version'], 10) : undefined;
+  const status = metadata['status'] || undefined;
+  const scope = metadata['scope'] || undefined;
+  const risk = metadata['risk'] || undefined;
 
   if (!id) {
     return null;
@@ -51,8 +71,13 @@ export function parseFrontMatter(rawContent: string): Skill | null {
     name,
     triggers,
     priority,
-    content: bodyContent
-  };
+    content: bodyContent,
+    ...(allowedTools.length > 0 ? { allowedTools } : {}),
+    ...(version !== undefined && !Number.isNaN(version) ? { version } : {}),
+    ...(status ? { status } : {}),
+    ...(scope ? { scope } : {}),
+    ...(risk ? { risk } : {}),
+  }
 }
 
 export async function loadSkillFromFile(filePath: string): Promise<Skill | null> {

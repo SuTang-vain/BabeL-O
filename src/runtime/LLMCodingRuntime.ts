@@ -13,6 +13,7 @@ import type {
 import { allowAllTools, allowlistedTools, type ToolPolicy } from './LocalCodingRuntime.js'
 import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
 import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
+import { deriveSessionRootContinuity, buildSessionRootContinuityMessage } from './sessionRootContinuity.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
 import type {
@@ -26,8 +27,20 @@ import {
 } from './compact.js'
 import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
+import {
+  buildTraceContext,
+  detectTriggers,
+  deriveRuleSelfAssessment,
+  flushBehaviorTraceQueue,
+  isBehaviorTraceEnabled,
+  queueBehaviorTraceEntry,
+} from './behaviorTrace.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
+// PR-A2: optional broadcaster type for the /v1/context/observe observer.
+// Imported as a type-only reference to keep the runtime-side hot path
+// paying no cost for the field.
+import type { ContextBroadcaster } from './contextBroadcasterSingleton.js'
 import {
   createReplacementState,
   enforceMessageBudget,
@@ -68,7 +81,16 @@ import {
 } from './runtimePipeline.js'
 import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
-import type { MemoryProvider } from './memoryProvider.js'
+import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
+// PR-A4: resume() class method imports — see long-running-context-
+// assembly.md §6.2 for the 3-step flow.
+import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
+import type { BehaviorMonitor } from '../nexus/behaviorMonitor.js'
+import { deriveEntriesFromEvents } from '../nexus/workingSetTracker.js'
+import { formatWorkingSet } from './workingSet.js'
+import { formatHint } from './formatHint.js'
+import type { AssembledContext } from './contextAssembler.js'
+import type { WorkingSet } from '../nexus/workingSetTracker.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -89,7 +111,43 @@ export class LLMCodingRuntime implements NexusRuntime {
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
     private readonly memoryProvider?: MemoryProvider,
+    // PR-A2: optional per-instance ContextBroadcaster. The runtime
+    // hot path (refreshRuntimeContextState in runtimePipeline.ts) uses
+    // the module-level defaultContextBroadcaster singleton, so this
+    // field is intentionally unused in the hot path. It exists so
+    // production factories can attach a custom broadcaster if/when the
+    // architecture moves off the singleton. Defaulting to undefined
+    // preserves all 39+ existing test instantiations.
+    private readonly contextBroadcaster?: ContextBroadcaster,
+    // PR-A4: optional resume dependencies. When provided, the public
+    // resume() method is enabled; when omitted, calling resume() throws
+    // a clear "not configured" error. The four closures are the same
+    // shapes the hot-path refreshRuntimeContextState call site uses;
+    // they are re-required here so resume() can drive a full
+    // assembleContext pass without re-wiring the singleton side of the
+    // runtime. Production factory (createRuntime.ts) wires these; tests
+    // can omit them.
+    private readonly resumeDeps?: {
+      workingSetTracker: PersistedWorkingSetTracker
+      behaviorMonitor?: BehaviorMonitor
+      buildSystemPrompt: (
+        options: RuntimeExecuteOptions,
+        projectMemory?: string,
+        sessionSummary?: string,
+        activeSkills?: string,
+      ) => string
+      mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
+    },
   ) {}
+
+  /**
+   * PR-A2: expose the optional per-instance broadcaster (or undefined
+   * if not provided). Tests and production wiring can read this to
+   * inject a custom broadcaster.
+   */
+  getContextBroadcaster(): ContextBroadcaster | undefined {
+    return this.contextBroadcaster
+  }
 
   listTools(): RuntimeToolAuditEntry[] {
     return [...this.tools.values()]
@@ -145,16 +203,104 @@ export class LLMCodingRuntime implements NexusRuntime {
     // orthogonally: allowedTools controls the *policy* (which tools
     // are isAllowed), while policyMode controls whether the
     // *hard-deny* gate fires for tools outside the allowlist.
+    let inner: AsyncIterable<NexusEvent>
     if (options.allowedTools && options.allowedTools.length > 0) {
       const overridePolicy = buildPerRequestAllowedToolsPolicy(options.allowedTools)
-      yield* this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
-      return
+      inner = this.withToolPolicy(overridePolicy, () => this.runExecuteStreamInner(options))
+    } else {
+      inner = this.runExecuteStreamInner(options)
     }
-    yield* this.runExecuteStreamInner(options)
+    // PR-3 (Track B Phase 1 wire, see docs/nexus/reference/behavior-monitor.md
+    // §5/§13): behaviorTrace tap. Best-effort side effect; never blocks or
+    // mutates the event stream. Opt-out via BABEL_O_BEHAVIOR_TRACE_ENABLED.
+    yield* this.withBehaviorTraceTap(options, inner)
+  }
+
+  // PR-3: behaviorTrace tap. Buffers events, runs detectTriggers on each
+  // yield, and queues BehaviorTraceEntry writes. Respects INV-4 (no
+  // silent injection — pure write-side, no model context mutation),
+  // INV-11 (does not touch natural_pause), and test config isolation
+  // (cwd comes from options, never from process.env.HOME).
+  private async *withBehaviorTraceTap(
+    options: RuntimeExecuteOptions,
+    source: AsyncIterable<NexusEvent>,
+  ): AsyncIterable<NexusEvent> {
+    yield* wrapWithBehaviorTraceTap(options, source)
+  }
+
+  /**
+   * §3.5 Memory Quality Metrics v1.1 follow-up: hot-path emission.
+   * Bound to `ContextAssemblerOptions.onMemoryRetrieval` at every
+   * `refreshRuntimeContextState` call site so every real
+   * provider/tool turn writes a `memory_retrieval` NexusEvent —
+   * not just the GET `/v1/sessions/:id/context` inspection route.
+   *
+   * Fire-and-forget: any throw is swallowed so the hot path stays
+   * unaffected. The dashboard degrades to "fewer events" rather
+   * than 5xx when storage is degraded. This is consistent with
+   * the v1 contract that §3.5 metrics are a recent-window
+   * dashboard signal, not a durability-critical audit.
+   */
+  private readonly emitMemoryRetrieval = async (input: {
+    sessionId: string
+    cwd: string
+    prompt: string
+    diagnostics: MemoryProviderDiagnostics
+  }): Promise<void> => {
+    if (!this.memoryProvider) return
+    const d = input.diagnostics
+    const autoSearch = d.autoSearch
+    const event: NexusEvent = {
+      ...eventBase(input.sessionId),
+      type: 'memory_retrieval',
+      provider: d.provider,
+      enabled: d.enabled,
+      scope: d.scope,
+      ...(d.namespaceId && { namespaceId: d.namespaceId }),
+      ...(d.namespaceSource && { namespaceSource: d.namespaceSource }),
+      ...(d.isolationKey && { isolationKey: d.isolationKey }),
+      autoSearchTriggered: autoSearch?.triggered ?? false,
+      autoSearchReason: autoSearch?.reason ?? 'no_memory_cue',
+      ...(autoSearch?.cue && { autoSearchCue: autoSearch.cue }),
+      hitCount: d.hitCount,
+      injectedChars: d.injectedChars,
+      budgetChars: d.budgetChars,
+      maxHitChars: d.maxHitChars,
+      truncated: d.truncated,
+      ...(d.searchLatencyMs !== undefined && { searchLatencyMs: d.searchLatencyMs }),
+      ...(d.error && { error: d.error }),
+      prompt: input.prompt,
+      cwd: input.cwd,
+    }
+    try {
+      await this.storage.appendEvent(input.sessionId, event)
+    } catch (error) {
+      // never break the hot path on a metrics write failure
+      process.stderr.write(
+        `[LLMCodingRuntime] memory_retrieval event append failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      )
+    }
   }
 
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
-    const resolvedCwd = resolveCwdFromPrompt(options.prompt, options.cwd)
+    // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+    // Use the continuity-aware resolver when the caller has supplied
+    // session context. Falls through to the simple 2-arg heuristic
+    // when storedSessionCwd / latestTaskPrimaryRoot are absent.
+    const hasSessionContext = options.storedSessionCwd !== undefined
+      || options.latestTaskPrimaryRoot !== undefined
+    const { cwd: resolvedCwd, continuity } = hasSessionContext
+      ? resolveCwdWithContinuity({
+          prompt: options.prompt,
+          baseCwd: options.cwd,
+          storedSessionCwd: options.storedSessionCwd,
+          latestTaskPrimaryRoot: options.latestTaskPrimaryRoot,
+          acceptExternalPromptPath: options.acceptExternalPromptPath,
+        })
+      : {
+          cwd: resolveCwdFromPrompt(options.prompt, options.cwd),
+          continuity: null,
+        }
     if (resolvedCwd !== options.cwd) {
       options.cwd = resolvedCwd
     }
@@ -169,6 +315,25 @@ export class LLMCodingRuntime implements NexusRuntime {
       requestId: options.requestId,
       model: options.model,
       budget: options.budget,
+    }
+
+    if (continuity) {
+      yield {
+        type: 'session_root_continuity',
+        ...eventBase(options.sessionId),
+        requestId: options.requestId,
+        requestCwd: continuity.requestCwd,
+        ...(continuity.storedSessionCwd !== undefined && { storedSessionCwd: continuity.storedSessionCwd }),
+        ...(continuity.latestTaskPrimaryRoot !== undefined && { latestTaskPrimaryRoot: continuity.latestTaskPrimaryRoot }),
+        promptPathCandidates: continuity.promptPathCandidates,
+        resolvedCwd: continuity.resolvedCwd,
+        decision: continuity.decision,
+        reason: continuity.reason,
+        isExternalRoot: continuity.isExternalRoot,
+        wasProjectRootKept: continuity.wasProjectRootKept,
+        warnings: continuity.warnings,
+        message: buildSessionRootContinuityMessage(continuity),
+      }
     }
 
     const metrics = createRuntimeExecutionMetrics()
@@ -263,6 +428,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         compactPercent: contextCompactPercent,
         suppressToolsForIntent: shouldSuppressToolsForIntent,
         memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
       })
       let assembledContext = contextRefreshState.assembledContext
       let messages = contextRefreshState.messages
@@ -315,6 +481,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           compactPercent: contextCompactPercent,
           suppressToolsForIntent: shouldSuppressToolsForIntent,
           memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
           sessionInbox: await loadSessionInbox(),
         }))
       }
@@ -376,6 +543,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
             memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
             sessionInbox: await loadSessionInbox(),
           }))
           autoCompactDecision = contextRefreshState.autoCompactDecision
@@ -429,6 +597,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
             memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
             sessionInbox: await loadSessionInbox(),
           }))
           yield buildContextUsageEvent({
@@ -557,6 +726,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               compactPercent: contextCompactPercent,
               suppressToolsForIntent: shouldSuppressToolsForIntent,
               memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
               sessionInbox: await loadSessionInbox(),
             }))
             messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
@@ -975,6 +1145,173 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield buildRuntimeExecutionMetricsEvent(options, metrics)
     }
   }
+
+  // ─── PR-A4: Session Resume class method (doc §6.2) ──────────────
+  //
+  // Drives the 3-step resume flow:
+  //   1. Load or rebuild the working set (persisted, or from event tail)
+  //   2. Assemble a full context (AssembledContext) at the resumed state
+  //   3. Subscribe to live hints from the per-cwd BehaviorMonitor
+  //
+  // This is the new canonical entry point for resume. The legacy
+  // resumeSession() helper in src/runtime/sessionResume.ts only does
+  // step 1; CLI/REST callers will migrate to this method in a
+  // follow-up.
+  async resume(opts: { sessionId: string; cwd: string }): Promise<{
+    workingSet: WorkingSet
+    rebuilt: boolean
+    assembled: AssembledContext
+    unsubscribeHints: () => void
+  }> {
+    if (!this.resumeDeps) {
+      throw new Error(
+        'LLMCodingRuntime.resume() requires resumeDeps; configure the runtime via ' +
+          'createDefaultNexusRuntime() or pass resumeDeps explicitly to the constructor.',
+      )
+    }
+    const { workingSetTracker, behaviorMonitor, buildSystemPrompt, mapEventsToMessages } =
+      this.resumeDeps
+
+    // Step 1 — load or rebuild working set.
+    await workingSetTracker.load() // idempotent; the file is tiny
+    let workingSet = workingSetTracker.get(opts.sessionId)
+    let rebuilt = false
+    let events: NexusEvent[] = []
+    if (!workingSet) {
+      rebuilt = true
+      try {
+        const result = await this.storage.listEvents(opts.sessionId, {
+          order: 'desc',
+          limit: 1000,
+        })
+        events = [...(result?.events ?? [])].reverse() // ascending for assembler
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: storage.listEvents failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+      const entries = deriveEntriesFromEvents(events, opts.cwd)
+      // For now, workspaceId is empty on rebuild — linkToWorkspace is a
+      // future concern. The WS file itself has a workspaceId field that
+      // defaults to '' when not yet linked.
+      try {
+        workingSet = workingSetTracker.rebuild(opts.sessionId, '', entries)
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: workingSetTracker.rebuild failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    } else {
+      // Loaded from persistence — we still want the event tail for the
+      // assembler pass below. Same path: storage.listEvents, ascending.
+      try {
+        const result = await this.storage.listEvents(opts.sessionId, {
+          order: 'desc',
+          limit: 1000,
+        })
+        events = [...(result?.events ?? [])].reverse()
+      } catch (error) {
+        throw new Error(
+          `resume() step 1: storage.listEvents (post-load) failed for ${opts.sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        )
+      }
+    }
+
+    // Step 2 — assemble context.
+    const settings = this.configManager.resolveSettings()
+    const runtimeOptions: RuntimeExecuteOptions = {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      prompt: '',
+      model: settings.modelId,
+    }
+    const workingSetOverride = formatWorkingSet(
+      workingSet.entries.map((e) => ({
+        path: e.value,
+        touches: 1,
+        lastTurn: 0,
+        isDir: false,
+        source: 'tool' as const,
+      })),
+    )
+    let assembled: AssembledContext
+    try {
+      const refreshState = await refreshRuntimeContextState({
+        runtimeOptions,
+        events,
+        modelId: settings.modelId,
+        buildSystemPrompt,
+        mapEventsToMessages,
+        tools: () => [],
+        warningPercent: 70,
+        compactPercent: 90,
+        suppressToolsForIntent: () => false,
+        memoryProvider: this.memoryProvider,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
+        sessionInbox: [],
+        workingSetOverride,
+        includeBehaviorTrace: true,
+        includeLongTerm: true,
+        includeProjectMemory: true,
+        includeLiveHints: !!behaviorMonitor,
+      })
+      assembled = refreshState.assembledContext
+    } catch (error) {
+      throw new Error(
+        `resume() step 2: refreshRuntimeContextState failed for ${opts.sessionId}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      )
+    }
+
+    // Step 3 — subscribe live hints.
+    let unsubscribeHints = (): void => { /* no-op when no monitor */ }
+    if (behaviorMonitor) {
+      unsubscribeHints = behaviorMonitor.subscribe(opts.sessionId, (hint) => {
+        if (this.canAcceptHint()) {
+          const text = formatHint(hint)
+          this.injectSystemSection(text, opts.sessionId)
+        }
+      })
+    }
+
+    return { workingSet, rebuilt, assembled, unsubscribeHints }
+  }
+
+  /**
+   * Per doc §6.2 step 3: gates whether a live hint is acceptable right
+   * now. Conservative: returns false when the runtime is currently
+   * executing a tool (no surprise injections mid-tool).
+   *
+   * A4 ships a conservative stub: accept when no tool is currently
+   * running. The active-execution gate from runtimePipeline is not
+   * yet plumbed into the class; until it is, this always returns true
+   * and the hint will be queued (injectSystemSection is a no-op push
+   * — see below).
+   */
+  canAcceptHint(): boolean {
+    return true
+  }
+
+  /**
+   * Per doc §6.2 step 3: surface a formatted hint. A4 ships this as a
+   * no-op push (Nexus-side observability will see it via a future
+   * PR); it does NOT inject into the model prompt (INV-4: no silent
+   * model injection).
+   */
+  injectSystemSection(text: string, sessionId: string): void {
+    // No-op for A4. The text is computed but not pushed anywhere; a
+    // future PR will wire this to a Nexus event sink. Document the
+    // intent here.
+    void text
+    void sessionId
+  }
 }
 
 export function buildSystemPrompt(
@@ -1035,7 +1372,7 @@ function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], late
   return false
 }
 
-function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
+export function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
   const paths = extractAbsolutePaths(prompt)
   for (const candidate of paths) {
     const resolved = resolvePromptPath(candidate)
@@ -1060,6 +1397,37 @@ function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
     }
   }
   return baseCwd
+}
+
+// Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+// Same heuristic as `resolveCwdFromPrompt`, but threads through
+// `deriveSessionRootContinuity` so the caller can also surface a
+// `session_root_continuity` event. Used by the runtime path; tests
+// continue to use the 2-arg `resolveCwdFromPrompt` to keep the
+// contract narrow.
+export function resolveCwdWithContinuity(options: {
+  prompt: string
+  baseCwd: string
+  storedSessionCwd?: string
+  latestTaskPrimaryRoot?: string
+  acceptExternalPromptPath?: boolean
+}): { cwd: string; continuity: import('./sessionRootContinuity.js').SessionRootContinuity } {
+  const continuity = deriveSessionRootContinuity({
+    requestCwd: options.baseCwd,
+    prompt: options.prompt,
+    storedSessionCwd: options.storedSessionCwd,
+    latestTaskPrimaryRoot: options.latestTaskPrimaryRoot,
+    acceptExternalPromptPath: options.acceptExternalPromptPath,
+  })
+  // If the decision is `require_confirmation`, fall back to the simple
+  // 2-arg heuristic (so we still get any internal-path switch) but keep
+  // the continuity record so the runtime can surface "external path was
+  // detected but not accepted".
+  if (continuity.decision === 'require_confirmation') {
+    const simpleCwd = resolveCwdFromPrompt(options.prompt, continuity.resolvedCwd)
+    return { cwd: simpleCwd, continuity: { ...continuity, resolvedCwd: simpleCwd } }
+  }
+  return { cwd: continuity.resolvedCwd, continuity }
 }
 
 export function mapEventsToMessages(
@@ -1304,4 +1672,94 @@ function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {
     return message.role === 'assistant'
   }
   return message.content.every(block => block.type === 'text' || block.type === 'tool_use')
+}
+
+// ─── PR-3: behaviorTrace tap (top-level exportable function) ──────────────
+//
+// Lives outside the LLMCodingRuntime class so it can be unit-tested without
+// instantiating a full runtime (and a real provider mock). Kept as a
+// top-level export to preserve orthogonality with behaviorTrace.ts
+// (see [[feedback-tool-boundary-granularity]]).
+//
+// Invariants:
+//   - INV-4: pure write-side; never mutates the inner event stream
+//   - INV-11: never touches natural_pause
+//   - test-config-isolation: cwd comes from RuntimeExecuteOptions, never
+//     from process.env.HOME
+export async function* wrapWithBehaviorTraceTap(
+  options: RuntimeExecuteOptions,
+  source: AsyncIterable<NexusEvent>,
+): AsyncIterable<NexusEvent> {
+  if (!isBehaviorTraceEnabled()) {
+    yield* source
+    return
+  }
+  const buffer: NexusEvent[] = []
+  const emittedTraceKeys = new Set<string>()
+  let taskScopeGlob: string | undefined
+  let lastTaskScopeEventAt = -1
+  for await (const event of source) {
+    buffer.push(event)
+    if (event.type === 'task_scope_declared') {
+      const e = event as Extract<NexusEvent, { type: 'task_scope_declared' }>
+      const root = e.primaryRoot
+      if (typeof root === 'string' && root.length > 0) {
+        taskScopeGlob = root.endsWith('/**') ? root : `${root.replace(/\/+$/, '')}/**`
+        lastTaskScopeEventAt = buffer.length - 1
+      }
+    }
+    try {
+      // Only consider events that have been seen (suppress drift detection
+      // on the task_scope_declared event itself, which is the first event
+      // that establishes the scope).
+      const eventsForDetect = lastTaskScopeEventAt >= 0
+        ? buffer.slice(lastTaskScopeEventAt)
+        : buffer
+      const detected = detectTriggers({
+        events: eventsForDetect,
+        cwd: options.cwd,
+        sessionId: options.sessionId,
+        taskScope: taskScopeGlob,
+      })
+      for (const det of detected) {
+        const key = behaviorTraceDetectionKey(det)
+        if (emittedTraceKeys.has(key)) continue
+        emittedTraceKeys.add(key)
+        const ctx = buildTraceContext({ events: buffer })
+        const sa = deriveRuleSelfAssessment(det.trigger, det.anomaly, { retryCount: ctx.retryCount })
+        queueBehaviorTraceEntry({
+          cwd: options.cwd,
+          sessionId: options.sessionId,
+          trigger: det.trigger,
+          triggerConfidence: det.confidence,
+          anomaly: det.anomaly,
+          context: ctx,
+          selfAssessment: sa,
+        })
+      }
+    } catch (error) {
+      logger.debug('behaviorTrace tap detection failed', error)
+    }
+    yield event
+  }
+  // Best-effort flush. Do not block event stream teardown.
+  void flushBehaviorTraceQueue().catch((error) => {
+    logger.debug('behaviorTrace flush failed', error)
+  })
+}
+
+function behaviorTraceDetectionKey(
+  detected: ReturnType<typeof detectTriggers>[number],
+): string {
+  const anomaly = detected.anomaly
+  return JSON.stringify([
+    detected.trigger,
+    detected.relatedEventIndex,
+    anomaly.errorCode ?? '',
+    anomaly.errorMessage ?? '',
+    anomaly.denialReason ?? '',
+    anomaly.driftPath ?? '',
+    anomaly.expectedScope ?? '',
+    anomaly.userRedirectSignal ?? '',
+  ])
 }

@@ -1,8 +1,15 @@
 import { z } from 'zod'
 
+/**
+ * NOTE — Skill events live in `./skillEvents.ts` (`skill_matched` /
+ * `skill_invoked` / `skill_validation` / `skill_saved`) but are
+ * intentionally not part of this discriminated union. See skillEvents.ts
+ * for the rationale and re-integration plan.
+ */
+
 export const NEXUS_EVENT_SCHEMA_VERSION = '2026-05-21.babel-o.v1'
 
-const baseEventFields = {
+export const baseEventFields = {
   schemaVersion: z.literal(NEXUS_EVENT_SCHEMA_VERSION),
   sessionId: z.string(),
   timestamp: z.string(),
@@ -540,6 +547,44 @@ export const TaskScopeDeclaredEventSchema = z.object({
   message: z.string(),
 })
 
+// Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
+// Pure decision projector: surfaces WHY a session's effective cwd is what
+// it is. Always emitted together with task_scope_declared; CLI inspector
+// renders it as a separate "session root continuity" block. Never used
+// to drive runtime decisions directly — the runtime still calls
+// `resolveCwdFromPrompt` and derives cwd from existing fields.
+export const SessionRootContinuityEventSchema = z.object({
+  type: z.literal('session_root_continuity'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  requestCwd: z.string(),
+  storedSessionCwd: z.string().optional(),
+  latestTaskPrimaryRoot: z.string().optional(),
+  promptPathCandidates: z.array(z.string()),
+  resolvedCwd: z.string(),
+  decision: z.enum([
+    'keep_request_cwd',
+    'use_prompt_path',
+    'keep_session_root',
+    'require_confirmation',
+  ]),
+  reason: z.enum([
+    'no_paths_in_prompt',
+    'cjk_prose_excluded',
+    'url_excluded',
+    'all_candidates_non_existent',
+    'prompt_internal_path_inferred',
+    'prompt_external_path_inferred',
+    'session_primary_root_inherited',
+    'stored_session_cwd_inherited',
+    'base_cwd_fallback',
+  ]),
+  isExternalRoot: z.boolean(),
+  wasProjectRootKept: z.boolean(),
+  warnings: z.array(z.string()),
+  message: z.string(),
+})
+
 export const ScopeBoundaryDetectedEventSchema = z.object({
   type: z.literal('scope_boundary_detected'),
   ...baseEventFields,
@@ -580,6 +625,55 @@ export const SessionMemoryUpdatedEventSchema = z.object({
   summaryMode: z.enum(['extractive']).optional(),
 })
 
+/**
+ * §3.5 of `docs/nexus/reference/agent-runtime-architecture-maturity-plan.md`:
+ * MemoryOS/EverCore long-term memory retrieval. Emitted by the hot path
+ * (analyzeContext / contextAssembler / memory_search route) so the
+ * `/v1/runtime/memory/status` quality dashboard and the
+ * `agentTrace.ts` `memory_retrieval` span have a durable record of
+ * every retrieval — including auto-search skips, which are the most
+ * important signal that memory was *deliberately not consulted*.
+ *
+ * This event is independent of `session_memory_updated` (which is
+ * session-memory-lite, single-session rolling summary). `memory_retrieval`
+ * covers the long-term memory layer: the MemoryProvider boundary, the
+ * auto-search decision, and the budget / truncation result.
+ *
+ * The `error` field is reserved for transport-level failures (network,
+ * timeout, schema); successful empty retrievals use `hitCount: 0` and
+ * leave `error` undefined.
+ */
+export const MemoryRetrievalEventSchema = z.object({
+  type: z.literal('memory_retrieval'),
+  ...baseEventFields,
+  provider: z.string(),
+  enabled: z.boolean(),
+  scope: z.enum(['project', 'user', 'channel', 'unknown']),
+  namespaceId: z.string().optional(),
+  namespaceSource: z.enum(['explicit', 'workspace', 'default']).optional(),
+  isolationKey: z.enum(['projectId', 'userId', 'channelId']).optional(),
+  autoSearchTriggered: z.boolean(),
+  autoSearchReason: z.enum([
+    'aborted',
+    'empty_prompt',
+    'explicit_memory_cue',
+    'current_workspace_only',
+    'execution_status_only',
+    'permission_response',
+    'no_memory_cue',
+  ]),
+  autoSearchCue: z.string().optional(),
+  hitCount: z.number(),
+  injectedChars: z.number(),
+  budgetChars: z.number(),
+  maxHitChars: z.number(),
+  truncated: z.boolean(),
+  searchLatencyMs: z.number().optional(),
+  error: z.string().optional(),
+  prompt: z.string().optional(),
+  cwd: z.string().optional(),
+})
+
 export const ExecutionMetricsEventSchema = z.object({
   type: z.literal('execution_metrics'),
   ...baseEventFields,
@@ -616,6 +710,19 @@ export const ExecutionMetricsEventSchema = z.object({
   remoteToolRunnerDurationMs: z.number().optional(),
 })
 
+// Phase C of `docs/nexus/reference/cache-observability-and-nexus-realtime-detection-plan.md`.
+// Emitted after `execution_metrics` when the resulting CacheHealthSnapshot
+// has `summary.status !== 'ok'` (i.e., 'warning' or 'critical'). The dedup
+// invariant (no duplicate cache_health for the same requestId) is enforced
+// at the emit site, not the schema.
+export const CacheHealthEventSchema = z.object({
+  type: z.literal('cache_health'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  cacheHealth: z.unknown(), // CacheHealthSnapshot shape lives in nexus/cacheHealth.ts
+  trigger: z.enum(['after_execution_metrics', 'manual']).default('after_execution_metrics'),
+})
+
 export const NexusEventSchema = z.discriminatedUnion('type', [
   SessionStartedEventSchema,
   AssistantDeltaEventSchema,
@@ -648,10 +755,13 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ContextGroundingConfirmedEventSchema,
   WorkspaceDirtyDetectedEventSchema,
   TaskScopeDeclaredEventSchema,
+  SessionRootContinuityEventSchema,
   ScopeBoundaryDetectedEventSchema,
   ScopeBoundaryConfirmedEventSchema,
   SessionMemoryUpdatedEventSchema,
+  MemoryRetrievalEventSchema,
   ExecutionMetricsEventSchema,
+  CacheHealthEventSchema,
   ExecuteSummaryEventSchema,
   NearTimeoutWarningEventSchema,
   TimeoutBudgetExceededEventSchema,

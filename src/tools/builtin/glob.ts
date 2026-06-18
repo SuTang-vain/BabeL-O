@@ -5,6 +5,7 @@ import { isAbsolute, join, relative } from 'node:path'
 import { promisify } from 'node:util'
 import { minimatch } from 'minimatch'
 import { z } from 'zod'
+import { errorMessage } from '../../shared/errors.js'
 import type { ToolDefinition } from '../Tool.js'
 import { buildPathDriftDiagnostic } from './pathDrift.js'
 import { resolveInsideWorkspace } from './pathSafety.js'
@@ -72,7 +73,17 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
       } else if (error?.status === 1 || error?.code === 1) {
         files = []
       } else {
-        throw error
+        return {
+          success: false,
+          output: {
+            code: 'GLOB_FAILED',
+            message: errorMessage(error),
+            pattern: input.pattern,
+            path: input.path,
+            repairHint: 'Verify the glob syntax and search path, or simplify the pattern before retrying Glob.',
+            details: globErrorDetails(error),
+          },
+        }
       }
     }
 
@@ -83,6 +94,19 @@ export const globTool: ToolDefinition<typeof inputSchema> = {
     }
     return { success: true, output: sliced }
   },
+}
+
+function globErrorDetails(error: unknown): Record<string, unknown> | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  const record = error as Record<string, unknown>
+  const details: Record<string, unknown> = {}
+  if (record.code !== undefined) details.code = record.code
+  if (record.status !== undefined) details.status = record.status
+  if (record.signal !== undefined) details.signal = record.signal
+  if (typeof record.stderr === 'string' && record.stderr.length > 0) {
+    details.stderr = record.stderr.slice(0, 4_000)
+  }
+  return Object.keys(details).length > 0 ? details : undefined
 }
 
 async function listFilesFallback(cwd: string, maxFiles: number): Promise<string[]> {

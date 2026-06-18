@@ -37,6 +37,7 @@ import {
 } from './contextManager.js'
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
+import { errorMessage } from '../shared/errors.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -68,6 +69,41 @@ export type ContextAssemblerOptions = {
   mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
   memoryProvider?: MemoryProvider
   sessionInbox?: SessionMessage[]
+  // PR-4a (Track A Phase 1, see docs/nexus/reference/long-running-context-
+  // assembly.md §5.1): when provided, skip the per-call deriveWorkingSet
+  // and use this string verbatim. Lets Nexus-side WorkingSetTracker own
+  // the working set across turns. Backward compatible: when undefined,
+  // the legacy derive path is used.
+  workingSetOverride?: string
+  // PR-28a (Track A Phase 3 §5.2 AssembleOptions): explicit include flags
+  // matching the doc's AssembleOptions shape. Backward compatible: when
+  // undefined, all four default to false (current behavior).
+  includeBehaviorTrace?: boolean
+  includeLongTerm?: boolean
+  includeProjectMemory?: boolean
+  includeLiveHints?: boolean
+  /**
+   * §3.5 Memory Quality Metrics hook. Called once per
+   * `memoryProvider.retrieve()` invocation with the
+   * MemoryProviderDiagnostics + session context, so the caller can
+   * persist a `memory_retrieval` NexusEvent for the
+   * `/v1/runtime/memory/status` dashboard and the
+   * `agentTrace.ts` `memory_retrieval` span.
+   *
+   * Backward compatible: when undefined, no event is emitted
+   * (assembleContext stays a pure read-side operation, matching
+   * its existing contract).
+   *
+   * The hook is fire-and-forget: any throw inside it is caught and
+   * logged; the assembly result is unaffected. This keeps the
+   * critical path safe even when storage is degraded.
+   */
+  onMemoryRetrieval?: (input: {
+    sessionId: string
+    cwd: string
+    prompt: string
+    diagnostics: MemoryProviderDiagnostics
+  }) => void | Promise<void>
 }
 
 export type AssembledContext = {
@@ -186,7 +222,9 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     cwd: options.runtimeOptions.cwd,
   })
   const workingSetEntries = deriveWorkingSet(compactAwareEvents, options.runtimeOptions.cwd)
-  const workingSet = formatWorkingSet(workingSetEntries)
+  const workingSet = options.workingSetOverride !== undefined
+    ? options.workingSetOverride
+    : formatWorkingSet(workingSetEntries)
   const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget)
   const selectedEvents = protectToolPairs(
     compactAwareEvents,
@@ -219,6 +257,31 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     cwd: options.runtimeOptions.cwd,
     signal: options.runtimeOptions.signal,
   })
+  // §3.5 Memory Quality Metrics: fire the onMemoryRetrieval hook
+  // so the caller can persist a `memory_retrieval` NexusEvent for
+  // the dashboard. Fire-and-forget: any throw is swallowed so the
+  // assembly result is unaffected. `NoopMemoryProvider` returns a
+  // `disabled: false` diagnostics with hitCount=0 — we still emit
+  // because auto-search-skip distributions are the most useful
+  // signal in the dashboard (it tells the operator "memory was
+  // deliberately not consulted for this turn").
+  if (options.onMemoryRetrieval && memoryProviderResult) {
+    try {
+      await options.onMemoryRetrieval({
+        sessionId: options.runtimeOptions.sessionId,
+        cwd: options.runtimeOptions.cwd,
+        prompt: options.runtimeOptions.prompt,
+        diagnostics: memoryProviderResult.diagnostics,
+      })
+    } catch (error) {
+      // never let a metrics hook break the hot path; surface in
+      // server logs (visible to operators via the standard
+      // process.stderr) but proceed with assembly.
+      process.stderr.write(
+        `[contextAssembler] onMemoryRetrieval hook failed: ${errorMessage(error)}\n`,
+      )
+    }
+  }
 
   const allSkills = await loadAllSkills(options.runtimeOptions.cwd)
   const matched = matchSkills(allSkills, options.runtimeOptions.prompt)

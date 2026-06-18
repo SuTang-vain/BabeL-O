@@ -28,6 +28,14 @@ export type EventListOptions = {
 export type EventListResult = {
   events: NexusEvent[]
   nextCursor?: string
+  /**
+   * Highest monotonically-increasing revision observed in this
+   * page. For SQLite this is `MAX(event_seq)` from the rows;
+   * MemoryStorage falls back to the cursor index it consumed.
+   * Used by the bbl-loop `wait` endpoint to advance revision
+   * without re-parsing rows.
+   */
+  lastSeq?: number
 }
 
 export type ToolTraceListOptions = {
@@ -156,5 +164,28 @@ export interface NexusStorage {
   listPermissionAudits(sessionId: string): Promise<PermissionAudit[]>
   saveExecutionMetrics(metrics: ExecutionMetrics): Promise<void>
   getExecutionMetrics(sessionId: string): Promise<ExecutionMetrics | null>
+  upsertLoopPane(pane: LoopPaneState): Promise<LoopPaneState>
+  listLoopPanes(filter?: LoopPaneFilter): Promise<LoopPaneState[]>
+  deleteLoopPane(paneId: string): Promise<boolean>
+  updateLoopPaneRev(paneId: string, lastRev: number, updatedAt: string): Promise<LoopPaneState | null>
   close?(): Promise<void>
+}
+
+export type LoopPaneState = {
+  paneId: string
+  workspaceId: string
+  tabId: string
+  sessionId: string
+  agent: string
+  cwd: string
+  label: string | null
+  lastRev: number
+  updatedAt: string
+}
+
+export type LoopPaneFilter = {
+  workspaceId?: string
+  tabId?: string
+  paneId?: string
+  sessionId?: string
 }

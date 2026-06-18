@@ -1,9 +1,11 @@
 # Model Catalog and Context Metadata Governance Plan
 
+> State: Active Plan
 > Status: Proposed — design reference for provider/model metadata evolution
 > Priority: P1 for local user-declared model metadata; P2 for resolver/CLI polish; P3 for optional remote catalog
 > Scope: provider/model registry, custom model metadata, context window semantics, cache-aware compact policy, diagnostics, and future Catwalk-like catalog governance
 > Non-goal: automatic model selection, silent provider/model/profile switching, or default remote catalog auto-update
+> Governance: Indexed by [prompt-model-governance-index.md](./prompt-model-governance-index.md). This document owns provider/model metadata facts; prompt text must not invent model capabilities or context-window limits.
 
 ---
 
@@ -1406,3 +1408,17 @@ user_config model metadata
 - 不让测试读写真实用户 config。
 
 该路线风险小、收益直接，并为未来可选 Catwalk-like remote catalog 预留了正确边界。
+
+## 中文概述
+
+### 背景
+
+模型 catalog 和 context metadata 决定上下文窗口、cache-aware compact、provider 选择和 no-silent-switching 等关键行为。
+
+### 边界
+
+远程 catalog 不能未经审计就覆盖本地事实；模型 metadata 必须可诊断、可覆盖、可回退。
+
+### 当前状态
+
+本文作为 Active Plan 保留。后续落地应以本地可审计 resolver 为先，再评估 cached remote catalog。

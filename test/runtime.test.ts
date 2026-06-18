@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { tmpdir, homedir } from 'node:os'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { z } from 'zod'
 import { createEmptyContextSelectionDiagnostics } from '../src/runtime/contextManager.js'
 import { createId } from '../src/shared/id.js'
@@ -23,7 +24,7 @@ import { createNexusTask, taskQueueStatsForTest } from '../src/nexus/taskQueue.j
 import { createTaskSession, taskSessionStatsForTest } from '../src/nexus/taskSession.js'
 import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
-import { LLMCodingRuntime } from '../src/runtime/LLMCodingRuntime.js'
+import { LLMCodingRuntime, resolveCwdFromPrompt, resolveCwdWithContinuity } from '../src/runtime/LLMCodingRuntime.js'
 import { executeProviderToolCall, resetProviderSessionRulesForTest } from '../src/runtime/runtimeToolLoop.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
@@ -426,6 +427,200 @@ test('runtime pipeline derives task scope and classifies external boundaries', (
   assert.equal(event.type, 'task_scope_declared')
   assert.equal(event.mode, 'cross_project')
   assert.deepEqual(event.explicitRoots, [sibling])
+})
+
+// Regression for session_981cc5c2-230c-40d1-953c-b956e9dbaaf7: the Chinese phrase
+// `文档/信息` was mis-extracted as `/信息`, which then drifted cwd to `/` and set
+// task_scope_declared.primaryRoot to `/`. Phase A (isCjkOnlyNonExistentPath guard
+// in extractAbsolutePaths) closes both failure points. These tests guard the
+// downstream chain documented in the cwd-drift Active Plan (event_seq 9447 + 9449).
+test('resolveCwdFromPrompt keeps project cwd when prompt only has a CJK slash fragment', () => {
+  const projectCwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const prompt = '查看有无咱们刚刚聊到的上下文管理优化的相关文档/信息'
+  // Pre-Phase-A this returned '/' because extractAbsolutePaths yielded '/信息'
+  // and resolvePromptPath fell back to its existing parent '/'. Post-Phase-A the
+  // CJK-only non-existent candidate is dropped entirely, so baseCwd is returned.
+  assert.equal(resolveCwdFromPrompt(prompt, projectCwd), projectCwd)
+})
+
+test('resolveCwdFromPrompt still follows a real existing absolute path in the prompt', () => {
+  const projectCwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const realDir = tmpdir()
+  // Guard against over-filtering: a legitimate existing path must still win.
+  assert.equal(resolveCwdFromPrompt(`查看 ${realDir} 这个目录的内容`, projectCwd), realDir)
+})
+
+// Regression for session_cf361f04-7ab1-43a5-907a-41a808942686: URL-heavy
+// article paste made extractAbsolutePaths yield `//www.openrath.com/`,
+// resolvePromptPath collapsed to `/`, and resolveCwdFromPrompt returned `/`
+// (event_seq=2613..2616). Phase A Follow-up adds a URL guard that drops
+// `https?://` and `//` fragments before the path pattern runs.
+test('resolveCwdFromPrompt stays at project cwd for URL-heavy article paste', () => {
+  const projectCwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const prompt = [
+    '阅读这篇文章 https://www.openrath.com/blog/agent-architecture-overview',
+    '另外参考一下 https://docs.openrath.com/spec/loop',
+    '还有这个 //www.openrath.com/archive/2025-12',
+    '请用 ' + projectCwd + ' 作为项目根目录分析',
+  ].join('\n')
+  // Pre-fix this returned '/' because extractAbsolutePaths yielded
+  // '//www.openrath.com/' which resolvePromptPath collapsed to '/'.
+  // Post-fix the URL guard removes both `https://` and `//` fragments
+  // so only the real project cwd candidate survives.
+  assert.equal(resolveCwdFromPrompt(prompt, projectCwd), projectCwd)
+})
+
+// Phase B regression for session_cf361f04-7ab1-43a5-907a-41a808942686:
+// the URL-heavy article paste should also be handled by the
+// continuity-aware resolver, even when the caller passes session
+// context. The decision should be keep_request_cwd (because the
+// URL guard filters out the URL candidates) and resolvedCwd should
+// equal projectCwd. No warning is needed because the URL guard
+// already absorbed the false candidates upstream.
+test('resolveCwdWithContinuity stays at project cwd for URL-heavy article paste (cf361f04 regression)', () => {
+  const projectCwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const prompt = [
+    '阅读这篇文章 https://www.openrath.com/blog/agent-architecture-overview',
+    '另外参考一下 https://docs.openrath.com/spec/loop',
+    '还有这个 //www.openrath.com/archive/2025-12',
+  ].join('\n')
+  const { cwd, continuity } = resolveCwdWithContinuity({
+    prompt,
+    baseCwd: projectCwd,
+    storedSessionCwd: projectCwd,
+  })
+  assert.equal(cwd, projectCwd)
+  assert.equal(continuity.decision, 'keep_request_cwd')
+  assert.equal(continuity.reason, 'url_excluded')
+  assert.equal(continuity.wasProjectRootKept, true)
+  assert.equal(continuity.isExternalRoot, false)
+  assert.equal(continuity.promptPathCandidates.length, 0)
+})
+
+// Phase B: when the prompt references a real existing directory
+// inside the project, the continuity-aware resolver should switch
+// cwd to it and report use_prompt_path / prompt_internal_path_inferred.
+test('resolveCwdWithContinuity switches to a real internal path with session context', () => {
+  const projectDir = mkdtempSyncCompat()
+  const innerDir = join(projectDir, 'src')
+  mkdirSync(innerDir, { recursive: true })
+  try {
+    const { cwd, continuity } = resolveCwdWithContinuity({
+      prompt: `看 ${innerDir} 下的文件`,
+      baseCwd: projectDir,
+      storedSessionCwd: projectDir,
+    })
+    assert.equal(cwd, innerDir)
+    assert.equal(continuity.decision, 'use_prompt_path')
+    assert.equal(continuity.reason, 'prompt_internal_path_inferred')
+    assert.equal(continuity.isExternalRoot, false)
+  } finally {
+    rmSyncCompat(projectDir)
+  }
+})
+
+// Phase B: when the prompt references an external real path AND the
+// session has a stored cwd, the resolver must keep the session root
+// and record the external path as a candidate. This is the
+// cf361f04-shaped scenario where the runtime should NOT silently
+// switch cwd to the iCloud article directory.
+test('resolveCwdWithContinuity keeps session root for external path with stored session cwd', () => {
+  const projectDir = mkdtempSyncCompat()
+  const externalDir = mkdtempSyncCompat('babel-o-ext-')
+  try {
+    const { cwd, continuity } = resolveCwdWithContinuity({
+      prompt: `分析 ${externalDir} 这个目录`,
+      baseCwd: projectDir,
+      storedSessionCwd: projectDir,
+    })
+    assert.equal(cwd, projectDir)
+    assert.equal(continuity.decision, 'keep_session_root')
+    assert.equal(continuity.reason, 'stored_session_cwd_inherited')
+    assert.equal(continuity.isExternalRoot, true)
+    assert.equal(continuity.wasProjectRootKept, true)
+    assert.ok(continuity.warnings.length > 0)
+  } finally {
+    rmSyncCompat(projectDir)
+    rmSyncCompat(externalDir)
+  }
+})
+
+// Phase B: acceptExternalPromptPath=true should be the only way to
+// actually switch cwd to an external path. This is the
+// `bbl go --external-ok` opt-in flow.
+test('resolveCwdWithContinuity switches to external path when acceptExternalPromptPath=true', () => {
+  const projectDir = mkdtempSyncCompat()
+  const externalDir = mkdtempSyncCompat('babel-o-ext-')
+  try {
+    const { cwd, continuity } = resolveCwdWithContinuity({
+      prompt: `分析 ${externalDir}`,
+      baseCwd: projectDir,
+      storedSessionCwd: projectDir,
+      acceptExternalPromptPath: true,
+    })
+    assert.equal(cwd, externalDir)
+    assert.equal(continuity.decision, 'use_prompt_path')
+    assert.equal(continuity.reason, 'prompt_external_path_inferred')
+    assert.equal(continuity.isExternalRoot, true)
+    assert.equal(continuity.wasProjectRootKept, false)
+  } finally {
+    rmSyncCompat(projectDir)
+    rmSyncCompat(externalDir)
+  }
+})
+
+// Phase B: latestTaskPrimaryRoot should win over storedSessionCwd
+// when both differ from requestCwd. The real-world trigger is when a
+// task_scope_declared event has pinned a project root that differs
+// from the session's stored cwd (e.g. user moved to a new repo mid-
+// session, but the old session was created elsewhere).
+test('resolveCwdWithContinuity prefers latestTaskPrimaryRoot when both differ from requestCwd', () => {
+  const requestDir = mkdtempSyncCompat('babel-o-req-')
+  const primaryDir = mkdtempSyncCompat('babel-o-pri-')
+  const externalDir = mkdtempSyncCompat('babel-o-ext-')
+  const storedDir = mkdtempSyncCompat('babel-o-sto-')
+  try {
+    const { cwd, continuity } = resolveCwdWithContinuity({
+      prompt: `分析 ${externalDir}`,
+      baseCwd: requestDir,
+      storedSessionCwd: storedDir,
+      latestTaskPrimaryRoot: primaryDir,
+    })
+    assert.equal(cwd, primaryDir)
+    assert.equal(continuity.decision, 'keep_session_root')
+    assert.equal(continuity.reason, 'session_primary_root_inherited')
+  } finally {
+    rmSyncCompat(requestDir)
+    rmSyncCompat(primaryDir)
+    rmSyncCompat(externalDir)
+    rmSyncCompat(storedDir)
+  }
+})
+
+// Helper functions for the Phase B integration tests above. They are
+// not part of the production code; they live at the bottom of this
+// test file to keep the new block self-contained.
+function mkdtempSyncCompat(prefix = 'babel-o-int-'): string {
+  return mkdtempSync(join(tmpdir(), prefix))
+}
+function rmSyncCompat(p: string): void {
+  rmSync(p, { recursive: true, force: true })
+}
+
+test('deriveTaskScope stays single-rooted at the project when prompt has a CJK slash fragment', () => {
+  const projectCwd = '/Users/test/DEV/BABEL/BabeL-O'
+  const scope = deriveTaskScope({
+    sessionId: 'session-cjk-drift',
+    cwd: projectCwd,
+    prompt: '查看有无咱们刚刚聊到的上下文管理优化的相关文档/信息',
+  })
+  // Pre-Phase-A explicitRoots contained '/信息' (inferProjectRoot fell back to the
+  // path itself, which is outside the project root), making the scope multi_root.
+  assert.equal(scope.primaryRoot, projectCwd)
+  assert.deepEqual(scope.explicitRoots, [])
+  assert.deepEqual(scope.confirmedExternalRoots, [])
+  assert.equal(scope.mode, 'single_root')
+  assert.equal(scope.source, 'cwd')
 })
 
 test('runtime pipeline builds context_usage event from context policy facts', () => {
@@ -6272,7 +6467,7 @@ test('tool output is truncated before it is stored in events', async () => {
   }
 })
 
-test('bash max buffer is configurable and fails safely on excessive output', async () => {
+test('bash max buffer overflow returns a recoverable failed tool result', async () => {
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-buffer`)
   await mkdir(cwd, { recursive: true })
   const { runtime, storage } = await createDefaultNexusRuntime({ allowedTools: ['*'] })
@@ -6291,12 +6486,17 @@ test('bash max buffer is configurable and fails safely on excessive output', asy
     assert.equal(response.statusCode, 200)
     const body = response.json()
     assert.equal(body.success, false)
-    assert.ok(
-      body.events.some(
-        (event: { type: string; code?: string }) =>
-          event.type === 'error' && event.code === 'TOOL_ERROR',
-      ),
+    const toolCompleted = body.events.find((event: { type: string; name?: string }) =>
+      event.type === 'tool_completed' && event.name === 'Bash',
     )
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'COMMAND_OUTPUT_LIMIT')
+    assert.equal(toolCompleted.output.outputLimited, true)
+    assert.match(toolCompleted.output.message, /output buffer|narrower range/)
+    assert.ok(!body.events.some((event: { type: string; code?: string }) =>
+      event.type === 'error' && event.code === 'TOOL_ERROR',
+    ))
   } finally {
     await app.close()
   }
@@ -6337,6 +6537,30 @@ test('bash non-zero exit returns a recoverable failed tool result', async () => 
   } finally {
     await app.close()
   }
+})
+
+test('bash output limit preserves partial stdout preview', async () => {
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-bash-output-limit`)
+  await mkdir(cwd, { recursive: true })
+
+  const { bashTool } = await import('../src/tools/builtin/bash.js')
+  const result = await bashTool.execute({
+    command: 'node -e "process.stdout.write(\'prefix-\' + \'x\'.repeat(20000))"',
+    timeoutMs: 10_000,
+  }, {
+    cwd,
+    sessionId: `bash-output-limit-${Date.now()}`,
+    maxOutputBytes: 1000,
+    bashMaxBufferBytes: 12_000,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal((result.output as any).code, 'COMMAND_OUTPUT_LIMIT')
+  assert.equal((result.output as any).outputLimited, true)
+  assert.match((result.output as any).stdout, /prefix-/)
+  assert.equal((result.output as any).stdoutTruncated, true)
+  assert.ok((result.output as any).stdoutOriginalBytes > (result.output as any).stdout.length)
+  assert.match((result.output as any).message, /output buffer/)
 })
 
 test('bash command timeout returns a recoverable failed tool result', async () => {
@@ -7208,8 +7432,14 @@ test('executionEnvironment parameter validation', async () => {
     const body = executeRes.json()
     assert.equal(body.type, 'execute_result')
     const hasDockerError = body.events.some((e: any) => e.type === 'error' && (e.message.includes('Docker') || e.message.includes('docker')))
+    const hasDockerToolFailure = body.events.some(
+      (e: any) =>
+        e.type === 'tool_completed' &&
+        e.success === false &&
+        (String(e.output?.message).includes('Docker') || String(e.output?.message).includes('docker')),
+    )
     const hasSuccess = body.events.some((e: any) => e.type === 'tool_completed' && e.success === true && String(e.output?.stdout).includes('hello-sandbox'))
-    assert.ok(hasDockerError || hasSuccess, 'Should either fail with a Docker error or succeed in a Docker sandbox container')
+    assert.ok(hasDockerError || hasDockerToolFailure || hasSuccess, 'Should either fail with a Docker error or succeed in a Docker sandbox container')
 
     const address = await app.listen({ port: 0 })
     const wsUrl = address.replace(/^http/, 'ws') + '/v1/stream'

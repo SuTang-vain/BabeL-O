@@ -708,15 +708,64 @@ func renderMemoryOverlayLines(lines []string, scroll int, height int) []string {
 	return lines[scroll:end]
 }
 
-func (m model) renderMemoryOverlay(width int) string {
-	if m.inputMode != modeMemoryOverlay {
-		return ""
+// memoryOverlayView is the value-only projection of the memory
+// overlay state. Like contextOverlayView it lets the renderer stay
+// decoupled from `*model` so future multi-pane drivers can drive
+// the same renderer with a per-pane slice.
+type memoryOverlayView struct {
+	Active bool
+	Lines  []string
+	Scroll int
+	Width  int
+	Height int
+}
+
+// renderMemoryOverlayView paints the memory status panel. It is
+// the value-only renderer; scroll clamping is returned so callers
+// can persist the clamped index back onto their state.
+func renderMemoryOverlayView(v memoryOverlayView) (string, int) {
+	if !v.Active {
+		return "", v.Scroll
 	}
 	header := titleStyle.Render("Memory")
-	lines := []string{header, divider(width)}
-	lines = append(lines, renderMemoryOverlayLines(m.memoryOverlayLines, m.memoryOverlayScroll, m.height)...)
+	visible := renderMemoryOverlayLines(v.Lines, v.Scroll, v.Height)
+	clampedScroll := v.Scroll
+	if len(v.Lines) > 0 {
+		visibleRows := max(1, v.Height-10)
+		maxScroll := max(0, len(v.Lines)-visibleRows)
+		if clampedScroll > maxScroll {
+			clampedScroll = maxScroll
+		}
+	}
+	lines := []string{header, divider(v.Width)}
+	lines = append(lines, visible...)
 	lines = append(lines, mutedStyle.Render("↑/↓/Tab scroll · esc/enter/q close"))
-	return renderOverlayFrame(width, contextStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, width-2))))
+	return renderOverlayFrame(v.Width, contextStyle.Render(wrapPlain(strings.Join(lines, "\n"), max(0, v.Width-2)))), clampedScroll
+}
+
+// memoryOverlayAdapter wires the legacy `*model` receiver onto the
+// pure renderer. The returned clamped scroll is persisted back so
+// scroll clamping remains consistent with the previous behavior.
+func (m model) memoryOverlayView() memoryOverlayView {
+	return memoryOverlayView{
+		Active: m.inputMode == modeMemoryOverlay,
+		Lines:  m.memoryOverlayLines,
+		Scroll: m.memoryOverlayScroll,
+		Width:  m.width,
+		Height: m.height,
+	}
+}
+
+func (m model) renderMemoryOverlay(width int) string {
+	view := m.memoryOverlayView()
+	if view.Width == 0 {
+		view.Width = width
+	}
+	rendered, clampedScroll := renderMemoryOverlayView(view)
+	if rendered != "" && m.inputMode == modeMemoryOverlay {
+		m.memoryOverlayScroll = clampedScroll
+	}
+	return rendered
 }
 
 func anyBool(value any) bool {

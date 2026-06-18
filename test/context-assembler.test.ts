@@ -32,6 +32,7 @@ import {
 import {
   flushSessionMemoryLiteQueue,
   queueSessionMemoryLiteUpdate,
+  shouldUpdateSessionMemoryLite,
 } from '../src/runtime/sessionMemoryLite.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import {
@@ -1679,6 +1680,10 @@ test('analyzeContext exposes task scope and evidence scope diagnostics', async (
 })
 
 test('analyzeContext returns token and compact diagnostics', async () => {
+  // Preserve pre-P0 natural_pause behavior for this contract test
+  // (P0 default = suppressed; see long-running-context-assembly §13 Phase 0)
+  const previousNaturalPauseSuppress = process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+  process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
   const cwd = join(tmpdir(), `babel-o-context-analysis-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -1909,6 +1914,9 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'large_tool_result'))
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'repeated_tool_input'))
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Large tool results')))
+
+  if (previousNaturalPauseSuppress === undefined) delete process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+  else process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = previousNaturalPauseSuppress
 })
 
 test('analyzeContext exposes long-term memory budget diagnostics', async () => {
@@ -3245,6 +3253,11 @@ test('assembleContext verifies retained segment metadata and falls back on misma
 test('compactSession writes opt-in Session Memory Lite without polluting assembled context', async () => {
   const previous = process.env.BABEL_O_SESSION_MEMORY_LITE
   process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
+  // P0 default = suppressed; this test preserves the pre-P0 path
+  // (decision reaches natural_pause via no-tool pause + growth_threshold
+  // path through compactSession's internal queue)
+  const previousNaturalPauseSuppress = process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+  process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
   const cwd = join(tmpdir(), `babel-o-session-memory-${Date.now()}`)
   const sessionId = 'session-memory-lite-test'
   const storage = new MemoryStorage()
@@ -3295,6 +3308,8 @@ test('compactSession writes opt-in Session Memory Lite without polluting assembl
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_SESSION_MEMORY_LITE
     else process.env.BABEL_O_SESSION_MEMORY_LITE = previous
+    if (previousNaturalPauseSuppress === undefined) delete process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+    else process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = previousNaturalPauseSuppress
     await rm(cwd, { recursive: true, force: true })
   }
 })
@@ -3302,6 +3317,10 @@ test('compactSession writes opt-in Session Memory Lite without polluting assembl
 test('Session Memory Lite queues natural pause updates and skips duplicate turns', async () => {
   const previous = process.env.BABEL_O_SESSION_MEMORY_LITE
   process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
+  // P0 default = suppressed; this test asserts natural_pause still fires
+  // when BABEL_O_NATURAL_PAUSE_SUPPRESS=false is explicitly opted in
+  const previousNaturalPauseSuppress = process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+  process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
   const cwd = join(tmpdir(), `babel-o-session-memory-queue-${Date.now()}`)
   const sessionId = 'session-memory-lite-queue-test'
   const storage = new MemoryStorage()
@@ -3371,7 +3390,92 @@ test('Session Memory Lite queues natural pause updates and skips duplicate turns
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_SESSION_MEMORY_LITE
     else process.env.BABEL_O_SESSION_MEMORY_LITE = previous
+    if (previousNaturalPauseSuppress === undefined) delete process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+    else process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = previousNaturalPauseSuppress
     await rm(cwd, { recursive: true, force: true })
+  }
+})
+
+// P0 [long-running-context-assembly §13 Phase 0]: `natural_pause` is
+// suppressed by default so users stop seeing "压缩太激进". Verifies:
+//   1. unset BABEL_O_NATURAL_PAUSE_SUPPRESS → suppress (default true)
+//   2. BABEL_O_NATURAL_PAUSE_SUPPRESS=true/1/yes/on → suppress
+//   3. BABEL_O_NATURAL_PAUSE_SUPPRESS=false/0/no/off → fire
+//   4. Decision falls through to insufficient_signal when suppressed
+//   5. BABEL_O_NATURAL_PAUSE_SUPPRESS is fully independent of
+//      BABEL_O_SESSION_MEMORY_LITE (the latter must still be set to 1
+//      to enable the write path)
+test('BABEL_O_NATURAL_PAUSE_SUPPRESS defaults to suppressed and opts in via false', () => {
+  const sessionId = 'natural-pause-suppress-test'
+  const buildEvents = (): NexusEvent[] => [
+    {
+      type: 'session_started',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-16T00:00:00.000Z',
+      cwd: '/tmp/test',
+    },
+    {
+      type: 'user_message',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-16T00:00:01.000Z',
+      text: 'hi',
+    },
+    {
+      type: 'assistant_delta',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-16T00:00:02.000Z',
+      text: 'hello',
+    },
+    {
+      type: 'result',
+      schemaVersion,
+      sessionId,
+      timestamp: '2026-06-16T00:00:03.000Z',
+      success: true,
+      message: 'done',
+    },
+  ]
+
+  const original = process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+  try {
+    // 1) unset → suppress (default)
+    delete process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+    const d1 = shouldUpdateSessionMemoryLite(buildEvents())
+    assert.equal(d1.shouldUpdate, false, 'default: should not fire')
+    assert.equal(d1.reason, 'insufficient_signal', 'default: falls through to insufficient_signal')
+
+    // 2) explicit truthy values → suppress
+    for (const truthy of ['true', '1', 'yes', 'on', 'TRUE', 'Yes', 'ON']) {
+      process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = truthy
+      const d = shouldUpdateSessionMemoryLite(buildEvents())
+      assert.equal(d.shouldUpdate, false, `suppress=${truthy}: should not fire`)
+      assert.equal(d.reason, 'insufficient_signal', `suppress=${truthy}: should fall through`)
+    }
+
+    // 3) explicit falsy values → fire
+    for (const falsy of ['false', '0', 'no', 'off', 'FALSE', 'Off']) {
+      process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = falsy
+      const d = shouldUpdateSessionMemoryLite(buildEvents())
+      assert.equal(d.shouldUpdate, true, `suppress=${falsy}: should fire`)
+      assert.equal(d.reason, 'natural_pause', `suppress=${falsy}: should be natural_pause`)
+    }
+
+    // 4) empty string treated as default (suppress)
+    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = ''
+    const dEmpty = shouldUpdateSessionMemoryLite(buildEvents())
+    assert.equal(dEmpty.shouldUpdate, false, 'empty string: defaults to suppress')
+    assert.equal(dEmpty.reason, 'insufficient_signal')
+
+    // 5) whitespace padded truthy → still recognized
+    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = '  true  '
+    const dPadded = shouldUpdateSessionMemoryLite(buildEvents())
+    assert.equal(dPadded.shouldUpdate, false, 'padded truthy: suppress')
+  } finally {
+    if (original === undefined) delete process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS
+    else process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = original
   }
 })
 

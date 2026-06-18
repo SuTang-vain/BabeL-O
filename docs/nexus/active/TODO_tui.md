@@ -71,7 +71,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ### P2 / Watch SessionChannel 关系可见化后续规划
 
-详细设计见 [SessionChannel TUI Relationship Visibility Plan](../reference/session-channel-tui-relationship-visibility-plan.md)。推荐分层组合：状态栏长期显示 connection / unread / high-priority 摘要，session 列表用 badge / marker 提供扫描能力，`/sessions tree` / `/agents tree` 表达 parent-child 派生链，`/activity` overlay 审阅近期跨 session 事件，`/channels graph` 只作为 debug-only 概览。Full message handling 仍以 `/inbox` 为主；inline preview 只允许摘要，不展示完整正文或自动注入 prompt。
+详细设计见 [SessionChannel TUI Relationship Visibility Plan](../proposals/session-channel-tui-relationship-visibility-plan.md)。推荐分层组合：状态栏长期显示 connection / unread / high-priority 摘要，session 列表用 badge / marker 提供扫描能力，`/sessions tree` / `/agents tree` 表达 parent-child 派生链，`/activity` overlay 审阅近期跨 session 事件，`/channels graph` 只作为 debug-only 概览。Full message handling 仍以 `/inbox` 为主；inline preview 只允许摘要，不展示完整正文或自动注入 prompt。
 
 后续若重新打开实现项，按 Phase 1 状态栏增强 + session list badge、Phase 2 tree view、Phase 3 activity overlay、Phase 4 debug graph 的顺序推进。发起侧 UX 另行以 `/inbox` reply 和 `/channel send <sessionId|channelId>` 评估，但必须具备 typed message、evidence、confirmation preview 与手动提交边界。
 
@@ -86,7 +86,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ## 已收口 Go TUI Permission Policy / Bash Hard-Deny 治理
 
-> 详细规划见 [Go TUI Permission Policy / Bash Hard-Deny 治理规划](../reference/go-tui-permission-policy-governance-plan.md)。真实样本：`session_go_1781076550805204000`（Go TUI WebSocket session，sessionId 末段 204000）。
+> 详细规划见 [Go TUI Permission Policy / Bash Hard-Deny 治理规划](../history/go-tui-history.md)。真实样本：`session_go_1781076550805204000`（Go TUI WebSocket session，sessionId 末段 204000）。
 
 - Phase A — Bash read-only subcommand 自动放行已收口：`src/tools/builtin/bashClassifier.ts` 新建 230 行纯函数 `classifyBashRisk`（read-only 白名单 + git 拒绝子命令 + find `-type f` 特殊处理 + 30+ 危险 pattern 二次校验）；`src/tools/builtin/bash.ts` `bashTool` 加 `riskForInput` 钩子（`risk` 仍 `'execute'` 保留 audit 身份）；`src/tools/Tool.ts` `ToolDefinition` 加 `riskForInput?: (input: any) => ToolRisk` 字段；`src/shared/events.ts` `ToolStartedEventSchema` 加 optional `effectiveRisk` 字段；`src/runtime/LocalCodingRuntime.ts` 与 `src/runtime/LLMCodingRuntime.ts` 新增 private `effectiveRisk` helper，hard-deny gate + approval gate 都用 `effectiveRisk` 判定；`test/bash-classifier.test.ts` 新建 12 个 focused test；既有 regression 测试更新为反映新语义。
 - Phase B — soft-deny policy per-request override 已收口：`src/nexus/app.ts` `executeSchema` 加 `policy: z.enum(['strict', 'soft-deny']).optional()`；`CreateNexusAppOptions` 加 `executePolicyMode?: 'strict' | 'soft-deny'`（server-side 默认值，默认 `'strict'` 保 back-compat）；`prepareExecution` 解析 `policyMode = body.policy ?? executePolicyMode`；`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `policyMode?: 'strict' | 'soft-deny'`；`src/runtime/LocalCodingRuntime.ts` hard-deny gate 改为 `if (effectiveRisk !== 'read' && !this.toolPolicy.isAllowed(tool) && options.policyMode !== 'soft-deny')`——**核心改动仅一行**，soft-deny 仅 bypass hard-deny 让既有 approval gate 自然触发 `permission_request`；`clients/go-tui/internal/tui/tui.go` `Config` 加 `PolicyMode string`，`buildExecuteRequest` 总是附加 `policy` 字段（默认 `'soft-deny'`）；`test/runtime.test.ts` 新增 2 个 Nexus focused 测试 + 4 个 Go TUI `buildExecuteRequest` / `runStream` 测试。
@@ -106,7 +106,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ## Watch / Stable Go TUI Maintenance
 
-> 详细规划见 [Go TUI Long-Term Rewrite Plan](../reference/go-tui-rewrite-plan.md)。Go TUI 已通过 Phase 9 promotion gate，作为 `bbl chat` 的 stable opt-in alternative；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
+> 详细规划见 [Go TUI Long-Term Rewrite Plan](../history/go-tui-history.md)。Go TUI 已通过 Phase 9 promotion gate，作为 `bbl chat` 的 stable opt-in alternative；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
 
 当前状态：
 

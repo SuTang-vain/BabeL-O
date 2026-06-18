@@ -4,7 +4,7 @@ import {
   allowlistedTools,
   LocalCodingRuntime,
 } from '../runtime/LocalCodingRuntime.js'
-import { LLMCodingRuntime } from '../runtime/LLMCodingRuntime.js'
+import { LLMCodingRuntime, buildSystemPrompt as llmBuildSystemPrompt, mapEventsToMessages as llmMapEventsToMessages } from '../runtime/LLMCodingRuntime.js'
 import { MemoryStorage } from '../storage/MemoryStorage.js'
 import { SqliteStorage } from '../storage/SqliteStorage.js'
 import { createDefaultToolRegistry } from '../tools/registry.js'
@@ -23,6 +23,15 @@ import type { EverCoreClient } from '../runtime/everCoreClient.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
 import { startEverOSBackgroundBootstrap } from '../cli/everosBackgroundBootstrap.js'
+// PR-A4: resume() class method dependencies.
+import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import { BehaviorMonitor } from './behaviorMonitor.js'
+// Tool registry layering diagnostics (§2.2 of the Tool Surface Expansion plan).
+import {
+  registerToolWithDiagnostics,
+  consoleWarnDiagnosticHandler,
+  type ToolRegistryDiagnosticHandler,
+} from './toolRegistryLayering.js'
 import * as os from 'node:os'
 import * as path from 'node:path'
 
@@ -48,24 +57,20 @@ export type CreateDefaultNexusRuntimeOptions = {
    * pre-flight). Default is `false` (auto-bootstrap enabled).
    */
   disableAutoMemoryBootstrap?: boolean
+  /**
+   * Optional handler for tool registry layering diagnostics.
+   * When provided, each Layer 2-4 tool registration that
+   * overrides an existing name, escalates risk, or attempts a
+   * blocked cross-prefix override will call this handler.
+   * Default: `console.warn` (via `consoleWarnDiagnosticHandler`).
+   * Pass a no-op to silence diagnostics in tests that don't care.
+   */
+  toolRegistryDiagnosticHandler?: ToolRegistryDiagnosticHandler | null
 }
 
 export async function createDefaultNexusRuntime(
   options: CreateDefaultNexusRuntimeOptions = {},
 ) {
-  const tools = createDefaultToolRegistry()
-  if (options.enableMcp) {
-    const mcpTools = await createMcpToolRegistry(options.cwd ?? process.cwd())
-    for (const [name, tool] of mcpTools) {
-      tools.set(name, tool)
-    }
-  }
-  if (options.everCore?.config.mcpToolsEnabled && options.everCore.client) {
-    const everCoreTools = createEverCoreMcpToolRegistry(options.everCore.client, options.everCore.config)
-    for (const [name, tool] of everCoreTools) {
-      tools.set(name, tool)
-    }
-  }
   // Phase 2 of docs/nexus/reference/go-tui-session-observability-governance-plan.md:
   // When `storagePath` is not explicitly set, fall back to the
   // shared `~/.babel-o/db.sqlite` (honouring `BABEL_O_CONFIG_DIR` /
@@ -84,6 +89,31 @@ export async function createDefaultNexusRuntime(
     : resolvedStoragePath.kind === 'memory-opt-in'
     ? new MemoryStorage()
     : new MemoryStorage() // legacy fallback (see resolveDefaultStoragePath)
+  // Pass the real storage so the registry registers context* tools.
+  // (Storage is always available in this code path — see legacy fallback
+  // above. If storage is ever undefined here, the registry's storage=null
+  // gate hides context* tools rather than advertising tools that always
+  // fail with CONTEXT_STORAGE_UNAVAILABLE.)
+  const tools = createDefaultToolRegistry({ storage })
+  // Resolve the diagnostic handler: explicit null means silent,
+  // undefined means default console.warn, handler means custom.
+  const diagnosticHandler: ToolRegistryDiagnosticHandler | undefined =
+    options.toolRegistryDiagnosticHandler === null
+      ? undefined
+      : (options.toolRegistryDiagnosticHandler ?? consoleWarnDiagnosticHandler)
+
+  if (options.enableMcp) {
+    const mcpTools = await createMcpToolRegistry(options.cwd ?? process.cwd())
+    for (const [name, tool] of mcpTools) {
+      registerToolWithDiagnostics(tools, tool, diagnosticHandler)
+    }
+  }
+  if (options.everCore?.config.mcpToolsEnabled && options.everCore.client) {
+    const everCoreTools = createEverCoreMcpToolRegistry(options.everCore.client, options.everCore.config)
+    for (const [name, tool] of everCoreTools) {
+      registerToolWithDiagnostics(tools, tool, diagnosticHandler)
+    }
+  }
   if (resolvedStoragePath.kind === 'memory-legacy') {
     // Non-fatal: log a one-line warning so operators understand
     // why their session isn't being persisted. Phase 3 will
@@ -102,7 +132,7 @@ export async function createDefaultNexusRuntime(
   })
   if (options.enableAgentTools) {
     for (const [name, tool] of createAgentToolRegistry(agentScheduler)) {
-      tools.set(name, tool)
+      registerToolWithDiagnostics(tools, tool, diagnosticHandler)
     }
   }
   if (resolvedStoragePath.kind === 'sqlite') {
@@ -156,12 +186,40 @@ export async function createDefaultNexusRuntime(
     }
   }
 
+  let behaviorMonitor: BehaviorMonitor | undefined
+
   const runtime =
     settings.providerId === 'local'
       ? new LocalCodingRuntime(tools, policy, storage, configManager.load().hooks)
-      : new LLMCodingRuntime(tools, policy, storage, configManager, options.memoryProvider)
+      : await (async () => {
+          // PR-A4: wire resumeDeps for the LLMCodingRuntime class method
+          // (doc §6.2). Construct a per-cwd PersistedWorkingSetTracker +
+          // BehaviorMonitor; pre-load the WS file once at boot (tiny,
+          // idempotent). The buildSystemPrompt + mapEventsToMessages
+          // closures match the shapes the runtime's hot-path
+          // refreshRuntimeContextState call site already uses.
+          const defaultCwd = options.cwd ?? process.cwd()
+          const workingSetTracker = new PersistedWorkingSetTracker(defaultCwd)
+          await workingSetTracker.load()
+          behaviorMonitor = new BehaviorMonitor({ cwd: defaultCwd })
+          return new LLMCodingRuntime(
+            tools,
+            policy,
+            storage,
+            configManager,
+            options.memoryProvider,
+            undefined, // contextBroadcaster (A2 path) — leave default
+            {
+              workingSetTracker,
+              behaviorMonitor,
+              buildSystemPrompt: llmBuildSystemPrompt,
+              mapEventsToMessages: (events, initialPrompt) =>
+                llmMapEventsToMessages(events, initialPrompt),
+            },
+          )
+        })()
 
-  return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner }
+  return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner, behaviorMonitor }
 }
 
 /**
@@ -195,6 +253,29 @@ export type ResolvedStoragePath =
 export function resolveDefaultStoragePath(
   explicitPath: string | undefined,
 ): ResolvedStoragePath {
+  return resolveDefaultStoragePathForEnv(explicitPath, process.env)
+}
+
+/**
+ * Env-parameterised twin of {@link resolveDefaultStoragePath} so
+ * diagnostic surfaces (e.g. `bbl go --check`'s embedded-nexus-storage
+ * line) can resolve the *would-be* storage path against an injected
+ * env without mutating `process.env`. The runtime path still goes
+ * through {@link resolveDefaultStoragePath} (which reads
+ * `process.env`); this function is the shared, testable core.
+ *
+ * Mirrors the production-default resolution that `bbl go`'s embedded
+ * Nexus child inherits: no explicit `NEXUS_STORAGE_PATH` → the
+ * runtime's `resolveDefaultStoragePath(undefined)` lands on
+ * `<configDir>/db.sqlite` (honouring `BABEL_O_CONFIG_DIR` /
+ * `BABEL_O_CONFIG_FILE`), with `NODE_ENV === 'test'` and explicit
+ * `:memory:` keeping the per-process memory backend for isolation.
+ */
+export function resolveDefaultStoragePathForEnv(
+  explicitPath: string | undefined,
+  env: NodeJS.ProcessEnv,
+  homeDir: string = os.homedir(),
+): ResolvedStoragePath {
   // Test isolation guard: when `NODE_ENV === 'test'` (set by
   // node:test / jest / mocha), default to `MemoryStorage`
   // unless the caller explicitly opts into sqlite. The 100+
@@ -207,7 +288,7 @@ export function resolveDefaultStoragePath(
   // preserves the test isolation invariant while still
   // flipping the production default to sqlite (Phase 2's
   // primary goal).
-  if (explicitPath === undefined && process.env.NODE_ENV === 'test') {
+  if (explicitPath === undefined && env.NODE_ENV === 'test') {
     return { kind: 'memory-opt-in' }
   }
   if (explicitPath !== undefined) {
@@ -226,8 +307,20 @@ export function resolveDefaultStoragePath(
   // No explicit path → default to the shared ~/.babel-o/db.sqlite.
   // Honours BABEL_O_CONFIG_DIR / BABEL_O_CONFIG_FILE for test
   // isolation (mirrors `resolveConfigDir` in inspectSession.ts).
-  const configDir = resolveConfigDirForStorage()
+  const configDir = resolveConfigDirForStorageEnv(env, homeDir)
   return { kind: 'sqlite', path: joinPath(configDir, 'db.sqlite') }
+}
+
+function resolveConfigDirForStorage(): string {
+  return resolveConfigDirForStorageEnv(process.env)
+}
+
+function resolveConfigDirForStorageEnv(env: NodeJS.ProcessEnv, homeDir: string = os.homedir()): string {
+  const fromDir = env.BABEL_O_CONFIG_DIR
+  if (fromDir) return fromDir
+  const fromFile = env.BABEL_O_CONFIG_FILE
+  if (fromFile) return joinPath(fromFile, '..')
+  return joinPath(homeDir, '.babel-o')
 }
 
 function resolveAbsolutePath(p: string): string {
@@ -238,10 +331,3 @@ function joinPath(...parts: string[]): string {
   return path.join(...parts)
 }
 
-function resolveConfigDirForStorage(): string {
-  const fromDir = process.env.BABEL_O_CONFIG_DIR
-  if (fromDir) return fromDir
-  const fromFile = process.env.BABEL_O_CONFIG_FILE
-  if (fromFile) return joinPath(fromFile, '..')
-  return joinPath(os.homedir(), '.babel-o')
-}

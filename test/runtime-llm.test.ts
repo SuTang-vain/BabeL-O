@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir, tmpdir } from 'node:os'
+import { z } from 'zod'
 import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan } from '../src/shared/config.js'
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
@@ -28,6 +29,7 @@ const CONFIG_ENV_KEYS = [
   'BABEL_O_CONFIG_FILE',
   'BABEL_O_TEST_CONFIG_WRITE_GUARD',
   'BABEL_O_SESSION_MEMORY_LITE',
+  'BABEL_O_NATURAL_PAUSE_SUPPRESS',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -943,6 +945,9 @@ describe('LLMCodingRuntime', () => {
 
   test('queues Session Memory Lite update after no-tool final response', async () => {
     process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
+    // P0 default = suppressed; this test asserts natural_pause still
+    // fires when explicitly opted in via BABEL_O_NATURAL_PAUSE_SUPPRESS=false
+    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
     const cwd = join(tmpdir(), `babel-o-runtime-session-memory-${Date.now()}-${Math.random()}`)
     const sessionId = 'test-session-memory-runtime'
     const storage = new MemoryStorage()
@@ -1537,7 +1542,7 @@ describe('LLMCodingRuntime', () => {
 
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
-    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'Write'])
+    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillSave', 'Write'])
   })
 
   test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
@@ -2237,6 +2242,79 @@ describe('LLMCodingRuntime', () => {
     assert.equal(fixedCompleted.success, true)
     assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'INVALID_TOOL_INPUT'))
     assert.equal(fetchCalls.length, 3)
+  })
+
+  test('returns thrown tool execution errors to the model instead of aborting the turn', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-thrown-tool-error-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    toolsRegistry.set('Thrower', {
+      name: 'Thrower',
+      description: 'Test tool that throws a recoverable execution error.',
+      risk: 'read',
+      inputSchema: z.object({ target: z.string() }),
+      async execute() {
+        throw new Error('simulated helper failure')
+      },
+    })
+
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-thrower","name":"Thrower","input":{}}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"target\\":\\"notes.md\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"The helper failed, so I will continue from existing evidence."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-thrown-tool-error-recoverable',
+        prompt: 'use the helper',
+        cwd,
+        skipPermissionCheck: true,
+      })
+    )
+
+    try {
+      fs.rmdirSync(cwd)
+    } catch {}
+
+    const toolCompleted = events.find(e => e.type === 'tool_completed' && e.toolUseId === 'tool-call-thrower') as any
+    assert.ok(toolCompleted)
+    assert.equal(toolCompleted.name, 'Thrower')
+    assert.equal(toolCompleted.success, false)
+    assert.equal(toolCompleted.output.code, 'TOOL_EXECUTION_FAILED')
+    assert.equal(toolCompleted.output.toolName, 'Thrower')
+    assert.match(toolCompleted.output.message, /simulated helper failure/)
+    assert.match(toolCompleted.output.repairHint, /corrected tool call|existing verified evidence/)
+    assert.ok(!events.some(e => e.type === 'error' && (e as any).code === 'TOOL_ERROR'))
+
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /helper failed/)
+
+    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
+    const toolResultTurn = secondBody.messages.find((message: any) =>
+      Array.isArray(message.content) &&
+      message.content.some((block: any) => block.type === 'tool_result'),
+    )
+    const toolResult = toolResultTurn.content.find((block: any) => block.type === 'tool_result')
+    assert.equal(toolResult.tool_use_id ?? toolResult.toolUseId, 'tool-call-thrower')
+    assert.equal(toolResult.is_error ?? toolResult.isError, true)
+    assert.match(toolResult.content, /TOOL_EXECUTION_FAILED|simulated helper failure/)
   })
 
   test('returns Bash non-zero exits to the model instead of aborting the turn', async () => {

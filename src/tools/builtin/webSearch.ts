@@ -44,7 +44,12 @@ export const webSearchTool: ToolDefinition<typeof inputSchema> = {
       const message = error instanceof Error ? error.message : String(error)
       return {
         success: false,
-        output: `WebSearch failed for ${formatDiagnosticValue(input.query)}: ${message}`,
+        output: {
+          code: 'WEB_SEARCH_FAILED',
+          message: `WebSearch failed for ${formatDiagnosticValue(input.query)}: ${message}`,
+          query: input.query,
+          repairHint: 'Retry with a more specific public query, or use local workspace tools if the task is about project files.',
+        },
       }
     }
   },

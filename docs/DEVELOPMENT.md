@@ -1,14 +1,14 @@
 # Development Guide
 
-This guide is for contributors working from the `dev` branch or a local source checkout.
+This guide is for contributors working from the `develop` branch or a local source checkout.
 
 ## Branch responsibilities
 
 - `main`: release-oriented branch for installer, release notes, and user-facing validation.
-- `dev`: active development branch for source-code iteration and contributor workflows.
+- `develop`: active development branch for source-code iteration and contributor workflows.
 - `release/vX.Y.Z`: version-specific release validation and hotfix branch.
 
-Keep development-only behavior on `dev` until it is ready to be promoted to `main`.
+Keep development-only behavior on `develop` until it is ready to be promoted to `main`.
 
 ## Run the source CLI
 

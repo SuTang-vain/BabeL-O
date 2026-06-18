@@ -20,13 +20,28 @@ func startStream(cfg Config, prompt string, timeout timeoutDecision) tea.Cmd {
 		eventCh := make(chan streamEvent, 128)
 		decisionCh := make(chan permissionDecision, 8)
 		cancelCh := make(chan struct{})
+		// Phase 1.2: emit sessionIDAllocatedMsg BEFORE the
+		// streamStartedMsg so the model can update
+		// m.sessionID synchronously — slash commands
+		// (`/context`, `/compact`, `/status`) that check
+		// m.sessionID don't see a stale empty id between
+		// allocation and stream start. tea.Bubbletea
+		// processes msgs in order, so this fires first.
 		sessionID, err := ensureStreamSession(cfg, prompt)
 		if err != nil {
 			close(eventCh)
 			return streamEventMsg{event: streamEvent{err: err}}
 		}
+		// Two messages: allocated (m.sessionID update) +
+		// started (channel wiring). We can't ship both
+		// from one tea.Msg because Update only fires one
+		// mutation per message; use tea.Batch so they
+		// fire in order.
 		go runStream(cfg, sessionID, prompt, timeout, eventCh, decisionCh, cancelCh)
-		return streamStartedMsg{events: eventCh, decisions: decisionCh, cancel: cancelCh, sessionID: sessionID}
+		return tea.Batch(
+			func() tea.Msg { return sessionIDAllocatedMsg{sessionID: sessionID} },
+			func() tea.Msg { return streamStartedMsg{events: eventCh, decisions: decisionCh, cancel: cancelCh, sessionID: sessionID} },
+		)()
 	}
 }
 
@@ -48,7 +63,13 @@ func ensureStartupSession(cfg Config) tea.Cmd {
 		if sessionID := strings.TrimSpace(cfg.SessionID); sessionID != "" {
 			return startupSessionMsg{sessionID: sessionID}
 		}
-		sessionID, err := allocateServerSession(cfg, "")
+		// No clientSessionId here — the operator pinned the
+		// session via `--session`, so the client didn't
+		// generate a `session_go_<unixnano>` placeholder. The
+		// server's session row keeps the metadata link
+		// empty in this case; the operator knows the id
+		// because they typed it.
+		sessionID, err := allocateServerSession(cfg, "", "")
 		if err != nil {
 			return startupSessionMsg{err: fmt.Errorf("allocate server session: %w", err)}
 		}
@@ -161,12 +182,19 @@ func ensureStreamSession(cfg Config, prompt string) (string, error) {
 	clientSessionID := ""
 	sessionID := cfg.SessionID
 	if sessionID == "" {
-		allocated, err := allocateServerSession(cfg, prompt)
+		// Phase 1.1: generate the client id BEFORE the allocate
+		// call so we can put it in the server's session metadata
+		// on the same round-trip. The order matters — server
+		// metadata + client log are both keyed by this id, so
+		// the operator's reverse-resolve path works whether they
+		// query SQLite (server metadata) or the client log
+		// (fallback when the SQLite row is gone).
+		clientSessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
+		allocated, err := allocateServerSession(cfg, prompt, clientSessionID)
 		if err != nil {
 			return "", fmt.Errorf("allocate server session: %w", err)
 		}
 		sessionID = allocated
-		clientSessionID = fmt.Sprintf("session_go_%d", time.Now().UnixNano())
 		// Best-effort: write the client↔server mapping to the client
 		// log so a future `bbl inspect-session session_go_...` can
 		// reverse-resolve the server uuid. Failure is non-fatal — the
@@ -274,30 +302,38 @@ func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, ev
 }
 
 // allocateServerSession is the Phase 1 server-side session-id allocator.
-// It calls `POST /v1/sessions` (with `clientSessionId` metadata when
-// available) and returns the server-allocated `session_<uuid>`. If the
-// call fails, the caller should surface the error to the operator
-// rather than fall back to a local id — the WebSocket payload would
-// then carry a session id that the server doesn't have a row for,
-// which is the exact `session_go_1781146359507755000` failure mode
-// the governance plan is trying to prevent.
-func allocateServerSession(cfg Config, prompt string) (string, error) {
+// It calls `POST /v1/sessions` (with `clientSessionId` metadata so
+// the server's session row has a back-reference to the local
+// `session_go_<unixnano>` id) and returns the server-allocated
+// `session_<uuid>`. If the call fails, the caller should surface the
+// error to the operator rather than fall back to a local id — the
+// WebSocket payload would then carry a session id that the server
+// doesn't have a row for, which is the exact
+// `session_go_1781146359507755000` failure mode the governance plan
+// is trying to prevent.
+func allocateServerSession(cfg Config, prompt, clientSessionID string) (string, error) {
 	type sessionCreatedResponse struct {
 		Type            string `json:"type"`
 		SessionID       string `json:"sessionId"`
 		ClientSessionID string `json:"clientSessionId"`
 		CreatedAt       string `json:"createdAt"`
 	}
-	// We don't have a client-side session id yet at this point; the
-	// call site generates it as `session_go_<unixnano>` and passes it
-	// back via a follow-up log line. We still want the server to know
-	// we have a stable Go TUI client, so we send a minimal marker.
+	// Phase 1.1: the locally-generated `session_go_<unixnano>` id
+	// is sent as `clientSessionId` so the server's session row has
+	// the back-reference. `bbl inspect-session session_<uuid>` can
+	// then reverse-resolve to `session_go_xxx` from server
+	// metadata (tier (a) — found in SQLite), no longer requiring
+	// the client log fallback (tier (b)) for normal cases.
+	metadata := map[string]any{
+		"client": "go-tui",
+		"phase":  "session_allocate",
+	}
+	if clientSessionID != "" {
+		metadata["clientSessionId"] = clientSessionID
+	}
 	body := map[string]any{
-		"cwd": cfg.Cwd,
-		"metadata": map[string]any{
-			"client": "go-tui",
-			"phase":  "session_allocate",
-		},
+		"cwd":      cfg.Cwd,
+		"metadata": metadata,
 	}
 	var resp sessionCreatedResponse
 	if err := nexusJSON(cfg, http.MethodPost, "/v1/sessions", body, &resp); err != nil {

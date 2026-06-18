@@ -10,6 +10,8 @@ coverage/
 .babel-o/benchmarks/
 .babel-o/worktrees/
 .babel-o/test-*/
+.babel-o/behavior-trace.jsonl
+bin/mcporter
 clients/go-tui/bin/
 clients/go-tui/go-tui
 clients/go-tui/go-tui.exe
@@ -18,6 +20,7 @@ clients/go-tui/go-tui.exe
 docs/
 !docs/
 docs/*
+!docs/README.md
 !docs/releases/
 !docs/releases/*.md
 !docs/assets/

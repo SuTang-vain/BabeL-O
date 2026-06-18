@@ -8,28 +8,47 @@ import type { NexusRuntime } from '../runtime/Runtime.js'
 import type { EverCoreClient, EverCoreMessage } from '../runtime/everCoreClient.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 import type { EverCoreRuntimeConfig, EverCoreStatus } from './everCoreConfig.js'
-import {
-  extractEverCoreMemoryHits,
-  formatMemoryProviderHits,
-  type MemoryProvider,
-} from '../runtime/memoryProvider.js'
+import { extractEverCoreMemoryHits, formatMemoryProviderHits, type MemoryProvider } from '../runtime/memoryProvider.js'
+import { computeMemoryQualityMetrics, type MemoryQualityMetrics } from '../runtime/memoryMetrics.js'
 import type { RemoteRunnerStatus } from './remoteRunnerConfig.js'
 import { eventBase, NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent, NexusEventSchema } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { SessionSnapshot, TaskSessionTerminalReason } from '../shared/session.js'
 import { DEFAULT_SESSION_CHANNEL_POLICY, type SessionChannel, type SessionChannelPolicy, type SessionMessage } from '../shared/sessionChannel.js'
 import { evaluateSessionMemoryCandidate } from '../runtime/memoryCandidateGovernance.js'
+import { applyBehaviorHint, derivePaneStatus } from '../runtime/loopDiagnostics.js'
+import { errorMessage } from '../shared/errors.js'
 import type { NexusTask, TaskStatus } from '../shared/task.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { ExecutionGate } from './executionGate.js'
 import { NexusMetrics, round } from './metrics.js'
-import { PendingPermissionRegistry } from '../shared/session.js'
+// Phase A of `cache-observability-and-nexus-realtime-detection-plan.md`:
+// attach a process-level CacheHealthSnapshot to the runtime metrics
+// response. Pure function, no I/O. The prompt dimension reads from
+// the NexusMetrics tokenUsage accumulator; code_index / tool /
+// reasoning stay `unavailable` until real hit/miss sources exist.
+import { buildCacheHealthFromRuntimeMetrics, buildCacheHealthFromEvents, maybeBuildCacheHealthEventFromExecutionMetrics } from './cacheHealth.js'
+import { PendingPermissionRegistry, isGoTuiClientSessionId, goTuiClientSessionPersistenceHint } from '../shared/session.js'
 import { BABEL_O_VERSION } from '../shared/version.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
 import { ConfigManager, validateModelSelectionAuth, type ProfileConfig } from '../shared/config.js'
 import { getModel, inspectModelCapabilities, modelRegistry, providerRegistry, UnknownModelError } from '../providers/registry.js'
 import { runProviderLiveSmoke, runProviderSmokeDryRun } from '../runtime/providerSmoke.js'
 import { buildProviderFallbackPolicy, planProviderFallbackAction } from '../runtime/providerRecovery.js'
+import {
+  invokeSkill,
+  listSkills,
+  showSkill,
+  generateDraftHandler,
+  saveSkillHandler,
+  SkillIdParamsSchema,
+  SkillInvokeBodySchema,
+  SkillListQuerySchema,
+  SkillValidateBodySchema,
+  SkillDraftBodySchema,
+  SkillSaveBodySchema,
+  validateSkillRequest,
+} from './skillRoutes.js'
 import { closeNexusSession } from './sessionLifecycle.js'
 import { compactSession } from '../runtime/compact.js'
 import { analyzeContext } from '../runtime/contextAnalysis.js'
@@ -43,7 +62,6 @@ import { ExploreAgentScheduler } from './agents/AgentScheduler.js'
 import { AgentJobRegistryError } from './agents/AgentJobRegistry.js'
 import type { AgentJob, AgentScheduler } from './agents/types.js'
 import { readEverOSBootstrapStateSync, type EverOSBootstrapErrorCode } from '../shared/everosBootstrapStore.js'
-
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -112,12 +130,22 @@ const executeSchema = z.object({
   executionEnvironment: z.enum(['local', 'docker', 'remote']).default('local').optional(),
 })
 
-const booleanQuery = (defaultValue: boolean) => z.preprocess(value => {
-  if (value === undefined) return defaultValue
-  if (value === true || value === 'true' || value === '1') return true
-  if (value === false || value === 'false' || value === '0') return false
-  return value
-}, z.boolean())
+const booleanQuery = (defaultValue: boolean) =>
+  z.preprocess(value => {
+    if (value === undefined) return defaultValue
+    if (value === true || value === 'true' || value === '1') return true
+    if (value === false || value === 'false' || value === '0') return false
+    return value
+  }, z.boolean())
+
+// escapeRegExpForWait is a minimal regex-metacharacter escape used
+// by the `/v1/sessions/:id/wait` endpoint so the `match` query
+// parameter is treated as a literal substring rather than a
+// user-controlled regex. Substring semantics match the schema
+// (z.string) and the bbl-loop plan's wait-for-event contract.
+function escapeRegExpForWait(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
 const providerSmokeQuerySchema = z.object({
   model: z.string().optional(),
@@ -134,18 +162,22 @@ const providerLiveSmokeSchema = z.object({
   timeoutMs: z.number().int().positive().max(60_000).default(30_000).optional(),
 })
 
-const runtimeConfigSelectSchema = z.object({
-  profile: z.string().min(1).max(120).optional(),
-  model: z.string().optional(),
-  role: z.string().optional(),
-  roleModel: z.string().optional(),
-}).strict()
+const runtimeConfigSelectSchema = z
+  .object({
+    profile: z.string().min(1).max(120).optional(),
+    model: z.string().optional(),
+    role: z.string().optional(),
+    roleModel: z.string().optional(),
+  })
+  .strict()
 
-const runtimeConfigProviderSchema = z.object({
-  provider: z.string().min(1).max(80),
-  apiKey: z.string().min(1).max(20_000).optional(),
-  baseUrl: z.string().url().optional(),
-}).strict()
+const runtimeConfigProviderSchema = z
+  .object({
+    provider: z.string().min(1).max(80),
+    apiKey: z.string().min(1).max(20_000).optional(),
+    baseUrl: z.string().url().optional(),
+  })
+  .strict()
 
 const runtimeConfigProfileParamsSchema = z.object({
   name: z.string().min(1).max(120),
@@ -168,10 +200,7 @@ type SharedRuntimeCapabilities = {
 // well-formed response.
 function readOwnPackageVersion(): string {
   try {
-    const candidates = [
-      fileURLToPath(new URL('../../package.json', import.meta.url)),
-      fileURLToPath(new URL('../package.json', import.meta.url)),
-    ]
+    const candidates = [fileURLToPath(new URL('../../package.json', import.meta.url)), fileURLToPath(new URL('../package.json', import.meta.url))]
     for (const candidate of candidates) {
       if (existsSync(candidate)) {
         const raw = readFileSync(candidate, 'utf8')
@@ -293,7 +322,11 @@ function profileProviderId(profile: ProfileConfig): string | undefined {
 function resolveProviderAuthState(
   manager: ConfigManager,
   providerId: string,
-): { configured: boolean; authConfigured: boolean; authSource: RuntimeProviderAuthSource } {
+): {
+  configured: boolean
+  authConfigured: boolean
+  authSource: RuntimeProviderAuthSource
+} {
   const provider = providerRegistry.find(item => item.id === providerId)
   if (!provider) {
     return { configured: false, authConfigured: false, authSource: 'none' }
@@ -324,15 +357,7 @@ function resolveProviderAuthState(
 const providerFallbackPlanSchema = z.object({
   model: z.string().optional(),
   role: z.string().optional(),
-  kind: z.enum([
-    'max_output_tokens',
-    'context_window',
-    'rate_limit',
-    'auth_or_billing',
-    'provider_protocol',
-    'provider_unavailable',
-    'unknown',
-  ]).default('unknown').optional(),
+  kind: z.enum(['max_output_tokens', 'context_window', 'rate_limit', 'auth_or_billing', 'provider_protocol', 'provider_unavailable', 'unknown']).default('unknown').optional(),
 })
 
 const taskMutationMetadataSchema = z.record(z.string(), z.unknown())
@@ -353,9 +378,7 @@ const createTaskSchema = taskMutationAuditSchema.extend({
 
 const sessionInputSchema = z.object({
   message: z.string().min(1),
-  nextPhase: z
-    .enum(['created', 'executing', 'waiting_permission', 'completed', 'failed', 'cancelled'])
-    .optional(),
+  nextPhase: z.enum(['created', 'executing', 'waiting_permission', 'completed', 'failed', 'cancelled']).optional(),
 })
 
 const updateTaskSchema = taskMutationAuditSchema.extend({
@@ -419,18 +442,7 @@ const sessionResumeSchema = z.object({
   includeChildSessions: z.boolean().default(true).optional(),
 })
 
-const sessionMessageTypeSchema = z.enum([
-  'question',
-  'answer',
-  'finding',
-  'request_review',
-  'request_validation',
-  'hypothesis',
-  'decision',
-  'blocked',
-  'memory_candidate',
-  'handoff',
-])
+const sessionMessageTypeSchema = z.enum(['question', 'answer', 'finding', 'request_review', 'request_validation', 'hypothesis', 'decision', 'blocked', 'memory_candidate', 'handoff'])
 
 const sessionChannelPolicySchema = z.object({
   allowedMessageTypes: z.array(sessionMessageTypeSchema).min(1).default(DEFAULT_SESSION_CHANNEL_POLICY.allowedMessageTypes),
@@ -573,6 +585,34 @@ export type CreateNexusAppOptions = {
   runtime: NexusRuntime
   storage: NexusStorage
   defaultCwd: string
+  /**
+   * PR-27: Optional shared WorkingSetBroadcaster. When provided, the
+   * /v1/working-set/observe WebSocket and any future REST handlers that
+   * opt in will share a per-cwd PersistedWorkingSetTracker instance, so
+   * mutations flow into the same event bus that subscribers are listening
+   * on. If not provided, a default per-app broadcaster is created.
+   */
+  workingSetBroadcaster?: import('./workingSetBroadcaster.js').WorkingSetBroadcaster
+  /**
+   * PR-A2: Optional ContextBroadcaster instance. When provided, it
+   * overrides the module-level `defaultContextBroadcaster` singleton
+   * used by the runtime hot path AND the instance subscribed to by
+   * /v1/context/observe. Both sides share the same instance by
+   * default — production apps that don't pass this option still get
+   * working fan-out (the WS route and the runtime both read from the
+   * singleton). Tests can pass a hermetic instance for isolation.
+   */
+  contextBroadcaster?: import('./contextBroadcaster.js').ContextBroadcaster
+  /**
+   * Optional BehaviorMonitor for cross-session event ingestion.
+   * When provided, every Nexus event yielded during execution is
+   * fed to behaviorMonitor.ingest() so that the 3 cross-session
+   * detectors (hot-path, tool-storm, scope-drift-wave) receive
+   * real event data. Without this, detectAll() always returns
+   * empty results. The monitor is created per-cwd inside
+   * createDefaultNexusRuntime(); server.ts passes it through.
+   */
+  behaviorMonitor?: import('./behaviorMonitor.js').BehaviorMonitor
   executeTimeoutMs?: number
   /**
    * Server-side default for the per-request `policy` body field. When a
@@ -602,9 +642,7 @@ type WebSocketLike = {
   send(payload: string): void
 }
 
-type MemoryApprovalResult =
-  | { approved: true }
-  | { approved: false; response: Record<string, unknown> }
+type MemoryApprovalResult = { approved: true } | { approved: false; response: Record<string, unknown> }
 
 function isEverCoreAvailable(status: EverCoreStatus): boolean {
   return status.enabled && status.healthy
@@ -619,11 +657,52 @@ function memoryUnavailablePayload(status: EverCoreStatus) {
   }
 }
 
-function requireMemoryApproval(action: 'save-note' | 'flush' | 'restart', input: {
-  approved?: boolean
-  confirmation?: string
-  reason?: string
-}): MemoryApprovalResult {
+/**
+ * §3.5 Memory Quality Metrics: read the recent-window
+ * `memory_retrieval` event stream from storage. Defensive: returns
+ * `[]` when storage / events table is missing or unreadable so the
+ * `/v1/runtime/memory/status` dashboard degrades to "all zeros"
+ * instead of 5xx-ing.
+ *
+ * Strategy: `listEvents` is per-session, so we walk every session
+ * and pull a small page, then merge + sort. The page size per
+ * session is the `eventsPerSession` cap (default 100); the merged
+ * window is capped at `limit`. This is an N+1 fan-out, but for
+ * v1 with a single Nexus + small session count it is acceptable.
+ * A global event-type index is a v1.1 storage change.
+ */
+async function listRecentMemoryRetrievalEvents(
+  storage: NexusStorage,
+  options: { limit: number; eventsPerSession?: number },
+): Promise<NexusEvent[]> {
+  const eventsPerSession = options.eventsPerSession ?? 100
+  try {
+    const sessions = await storage.listSessions()
+    const perSession: NexusEvent[] = []
+    for (const session of sessions) {
+      const page = await storage.listEvents(session.sessionId, {
+        order: 'desc',
+        limit: eventsPerSession,
+      })
+      for (const event of page.events) {
+        if (event.type === 'memory_retrieval') perSession.push(event)
+      }
+    }
+    perSession.sort((a, b) => b.timestamp.localeCompare(a.timestamp))
+    return perSession.slice(0, options.limit)
+  } catch {
+    return []
+  }
+}
+
+function requireMemoryApproval(
+  action: 'save-note' | 'flush' | 'restart',
+  input: {
+    approved?: boolean
+    confirmation?: string
+    reason?: string
+  },
+): MemoryApprovalResult {
   const confirmation = input.confirmation?.trim().toLowerCase()
   const confirmed = input.approved === true || confirmation === action || confirmation === `memory:${action}`
   if (confirmed) return { approved: true }
@@ -635,18 +714,16 @@ function requireMemoryApproval(action: 'save-note' | 'flush' | 'restart', input:
       approved: false,
       risk: action === 'restart' ? 'lifecycle_execute' : 'write_lifecycle',
       requiredConfirmation: action,
-      guidance: action === 'save-note'
-        ? 'Memory save is write-risk. Re-submit with approved=true or confirmation="save-note" after user approval.'
-        : `Memory ${action} is a lifecycle operation. Re-submit with approved=true or confirmation="${action}" after explicit user confirmation.`,
+      guidance:
+        action === 'save-note'
+          ? 'Memory save is write-risk. Re-submit with approved=true or confirmation="save-note" after user approval.'
+          : `Memory ${action} is a lifecycle operation. Re-submit with approved=true or confirmation="${action}" after explicit user confirmation.`,
       ...(input.reason && { reason: input.reason }),
     },
   }
 }
 
-function buildApprovedMemoryNoteMessages(input: {
-  note: string
-  config: EverCoreRuntimeConfig
-}): EverCoreMessage[] {
+function buildApprovedMemoryNoteMessages(input: { note: string; config: EverCoreRuntimeConfig }): EverCoreMessage[] {
   const timestamp = Date.now()
   return [
     {
@@ -666,40 +743,61 @@ function buildApprovedMemoryNoteMessages(input: {
   ]
 }
 
-export async function createNexusApp(
-  options: CreateNexusAppOptions,
-): Promise<FastifyInstance> {
+export async function createNexusApp(options: CreateNexusAppOptions): Promise<FastifyInstance> {
   const app = Fastify({ logger: false })
   const metrics = new NexusMetrics()
+  /**
+   * §3.5 Memory Quality Metrics: in-process counters for
+   * `memory_save_note` approval / denial / pending-review. The
+   * counts reset on Nexus restart (process-local, not durable),
+   * which is consistent with the v1 contract: §3.5 metrics are
+   * recent-window quality signals, not audit history. The
+   * `memory_candidate` governance metadata on SessionChannel
+   * messages is the durable per-candidate record.
+   */
+  const memoryApprovalCounters = { approved: 0, denied: 0, pendingReview: 0 }
   const apiKey = options.apiKey ?? process.env.NEXUS_API_KEY
   const executeTimeoutMs = options.executeTimeoutMs ?? 30_000
   const executePolicyMode = options.executePolicyMode ?? 'strict'
+  // PR-27: default per-app broadcaster. Tests can override via options.
+  const appBroadcaster = options.workingSetBroadcaster ?? new WorkingSetBroadcaster()
+  // PR-A2: if the caller provided a custom ContextBroadcaster, install
+  // it as the module-level singleton so the runtime hot path and the
+  // /v1/context/observe WebSocket route share the same instance. When
+  // no option is provided, the singleton stays untouched and both sides
+  // share the default instance.
+  if (options.contextBroadcaster) {
+    setDefaultContextBroadcaster(options.contextBroadcaster)
+  }
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
   const activeExecutions = new Map<string, ActiveExecution>()
-  const agentScheduler = options.agentScheduler ?? new ExploreAgentScheduler({
-    storage: options.storage,
-    cwd: options.defaultCwd,
-    executionEnvironment: options.agentExecutionEnvironment,
-    remoteRunner: options.remoteRunner,
-  })
+  const agentScheduler =
+    options.agentScheduler ??
+    new ExploreAgentScheduler({
+      storage: options.storage,
+      cwd: options.defaultCwd,
+      executionEnvironment: options.agentExecutionEnvironment,
+      remoteRunner: options.remoteRunner,
+    })
   await app.register(websocket)
 
-  const everCoreStatus = () => options.everCoreStatus ?? {
-    configured: false,
-    enabled: false,
-    healthy: true,
-    mode: 'disabled' as const,
-    uploadOnSessionEnd: false,
-    mcpToolsEnabled: false,
-    namespace: {
-      layer: 'project_memory' as const,
-      isolationKey: 'projectId' as const,
-      sessionScoped: false,
-      projectIdSource: 'default' as const,
-    },
-  }
+  const everCoreStatus = () =>
+    options.everCoreStatus ?? {
+      configured: false,
+      enabled: false,
+      healthy: true,
+      mode: 'disabled' as const,
+      uploadOnSessionEnd: false,
+      mcpToolsEnabled: false,
+      namespace: {
+        layer: 'project_memory' as const,
+        isolationKey: 'projectId' as const,
+        sessionScoped: false,
+        projectIdSource: 'default' as const,
+      },
+    }
 
   /**
    * MemoryOS bootstrap status snapshot used by `/v1/runtime/status`
@@ -771,10 +869,7 @@ export async function createNexusApp(
   }
 
   app.setErrorHandler((error: any, request, reply) => {
-    const isValidationError =
-      error.validation ||
-      error.name === 'ZodError' ||
-      error.statusCode === 400
+    const isValidationError = error.validation || error.name === 'ZodError' || error.statusCode === 400
 
     if (isValidationError) {
       return reply.status(400).send({
@@ -824,11 +919,7 @@ export async function createNexusApp(
   }
 
   app.addHook('onResponse', async (request, reply) => {
-    metrics.recordRoute(
-      `${request.method} ${request.routeOptions.url ?? request.url}`,
-      reply.statusCode,
-      metrics.now() - request.performanceStartMs,
-    )
+    metrics.recordRoute(`${request.method} ${request.routeOptions.url ?? request.url}`, reply.statusCode, metrics.now() - request.performanceStartMs)
   })
 
   app.get('/health', async () => ({
@@ -863,9 +954,353 @@ export async function createNexusApp(
     sessions: await options.storage.listSessions({ limit: 20 }),
   }))
 
+  // bbl loop plan Phase 1a: per-session health snapshot derived
+  // from a bounded event slice (default lastN=200). Aggregates
+  // status from derivePaneStatus + a lightweight taskScope
+  // projection so the multi-pane TUI can render sidebars without
+  // each pane re-deriving truth. When a sessionId is provided,
+  // only an existing stored session is considered; missing ids
+  // return an empty pane list instead of a synthetic idle pane.
+  // loop_state persistence will replace the implicit "every known
+  // session" walk in Phase 1b.
+  const loopHealthQuerySchema = z.object({
+    workspaceId: z.string().max(128).optional(),
+    paneId: z.string().max(128).optional(),
+    sessionId: z.string().max(256).optional(),
+    lastN: z.coerce.number().int().positive().max(1000).default(200),
+  })
+
+  type TaskScopeSummary = {
+    cwd: string
+    primaryRoot: string
+    explicitRoots: string[]
+    confirmedExternalRoots: string[]
+    inferredCandidateRoots: string[]
+    mode: 'single_root' | 'multi_root' | 'cross_project'
+    source: 'cwd' | 'prompt_paths' | 'user_confirmation' | 'session_metadata'
+    latestDeclaredAt: string
+  }
+
+  function summarizeTaskScope(events: NexusEvent[]): TaskScopeSummary {
+    let summary: TaskScopeSummary = {
+      cwd: '',
+      primaryRoot: '',
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+      inferredCandidateRoots: [],
+      mode: 'single_root',
+      source: 'cwd',
+      latestDeclaredAt: '',
+    }
+    for (const event of events) {
+      if (event.type !== 'task_scope_declared') continue
+      if (event.timestamp < summary.latestDeclaredAt) continue
+      summary = {
+        cwd: event.cwd,
+        primaryRoot: event.primaryRoot,
+        explicitRoots: [...event.explicitRoots],
+        confirmedExternalRoots: [...event.confirmedExternalRoots],
+        inferredCandidateRoots: [...event.inferredCandidateRoots],
+        mode: event.mode,
+        source: event.source,
+        latestDeclaredAt: event.timestamp,
+      }
+    }
+    return summary
+  }
+
+  // PR-14: derive a BehaviorHintProjection for a session by reading
+  // cross-session (source=nexus) trace entries from .babel-o/behavior-trace.jsonl
+  // and applying the 5min cooldown window.
+  function summarizeBehaviorHint(
+    cwd: string,
+    sessionId: string,
+  ): {
+    pendingHints: number
+    lastHintAt?: number
+    lastHintPattern?: string
+  } {
+    const tracePath = _resolve(cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+    if (!_existsSync(tracePath)) {
+      return { pendingHints: 0 }
+    }
+    let raw: string
+    try {
+      raw = _readFileSync(tracePath, 'utf8')
+    } catch {
+      return { pendingHints: 0 }
+    }
+    const now = Date.now()
+    const cooldownMs = 5 * 60_000
+    let pendingHints = 0
+    let lastHintAt: number | undefined
+    let lastHintPattern: string | undefined
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      let entry: BehaviorTraceEntry
+      try {
+        entry = JSON.parse(trimmed) as BehaviorTraceEntry
+      } catch {
+        continue
+      }
+      if (entry.sessionId !== sessionId) continue
+      const source = (entry.anomaly as { source?: string } | undefined)?.source
+      if (source !== 'nexus') continue
+      const ts = Date.parse(entry.timestamp)
+      if (!Number.isFinite(ts) || ts < now - cooldownMs) continue
+      pendingHints += 1
+      const tsMs = ts
+      if (lastHintAt === undefined || tsMs > lastHintAt) {
+        lastHintAt = tsMs
+        lastHintPattern = entry.anomaly?.errorMessage || entry.anomaly?.errorCode || entry.anomaly?.driftPath || entry.anomaly?.denialReason || entry.anomaly?.userRedirectSignal || undefined
+      }
+    }
+    return { pendingHints, lastHintAt, lastHintPattern }
+  }
+
+  app.get('/v1/runtime/loop/health', async (request, reply) => {
+    const query = loopHealthQuerySchema.parse(request.query)
+    const candidateIds = new Set<string>()
+    try {
+      if (query.sessionId) {
+        const session = await options.storage.getSession(query.sessionId, {
+          includeEvents: false,
+        })
+        if (session) candidateIds.add(session.sessionId)
+      } else {
+        const sessionList = await options.storage.listSessions({ limit: 500 })
+        for (const session of sessionList) {
+          if (query.workspaceId && query.workspaceId !== 'all') {
+            // Phase 1b will replace this with a workspace_id column.
+            // For now every session is included unless the caller
+            // narrows by paneId explicitly.
+          }
+          candidateIds.add(session.sessionId)
+        }
+      }
+    } catch (err) {
+      return reply.code(500).send({
+        type: 'error',
+        code: 'LOOP_HEALTH_FAILED',
+        message: errorMessage(err),
+      })
+    }
+    if (candidateIds.size === 0) {
+      return {
+        type: 'loop_health',
+        panes: [],
+        filter: {
+          workspaceId: query.workspaceId,
+          paneId: query.paneId,
+          sessionId: query.sessionId,
+          lastN: query.lastN,
+        },
+      }
+    }
+
+    const panes: Array<Record<string, unknown>> = []
+    for (const sessionId of candidateIds) {
+      let events: NexusEvent[]
+      try {
+        const page = await options.storage.listEvents(sessionId, {
+          order: 'desc',
+          limit: query.lastN,
+        })
+        events = page.events
+      } catch (err) {
+        panes.push({
+          sessionId,
+          error: errorMessage(err),
+        })
+        continue
+      }
+      const status = derivePaneStatus({ events })
+      const taskScope = summarizeTaskScope(events)
+      // PR-14: derive behavior hint projection from cross-session trace file
+      // and apply via applyBehaviorHint (PR-6). This may upgrade status to
+      // 'behaviorHint' if there are recent cross-session detections.
+      const hintProjection = summarizeBehaviorHint(taskScope.cwd || options.storage.toString?.() || '', sessionId)
+      const finalSnapshot = applyBehaviorHint(status, {
+        pendingHints: hintProjection.pendingHints,
+        lastHintAt: hintProjection.lastHintAt,
+        lastHintPattern: hintProjection.lastHintPattern,
+      })
+      // Phase B of `cache-observability-and-nexus-realtime-detection-plan.md`:
+      // build a per-pane cacheHealth from the lastN `execution_metrics`
+      // events already in memory. Pure function, no extra storage call.
+      // Cache health claims stay secondary to the higher-priority status
+      // (blocked/drift/waiting/done) — they appear in a sibling field.
+      const paneCacheHealth = buildCacheHealthFromEvents(events, {
+        sessionId,
+        lastN: query.lastN,
+        kind: 'pane',
+      })
+      panes.push({
+        sessionId,
+        agent: 'bbl',
+        status: finalSnapshot.status,
+        pendingPermissions: finalSnapshot.pendingPermissions,
+        pendingScopeBoundaries: finalSnapshot.pendingScopeBoundaries,
+        outOfScopeEvidence: finalSnapshot.outOfScopeEvidence,
+        lastEventRev: finalSnapshot.lastEventSeq,
+        lastEventAt: finalSnapshot.lastEventAt,
+        taskScope,
+        pendingHints: finalSnapshot.pendingHints,
+        lastHintAt: finalSnapshot.lastHintAt,
+        lastHintPattern: finalSnapshot.lastHintPattern,
+        cacheHealth: paneCacheHealth,
+      })
+    }
+
+    return {
+      type: 'loop_health',
+      panes,
+      filter: {
+        workspaceId: query.workspaceId,
+        paneId: query.paneId,
+        sessionId: query.sessionId,
+        lastN: query.lastN,
+      },
+    }
+  })
+
+  // bbl loop plan Phase 1b: per-pane workspace/tab/pane ↔
+  // session mapping. Lets multi-pane TUI restore across
+  // server restarts and reconcile against local snapshot.
+  const loopPaneUpsertSchema = z.object({
+    paneId: z.string().min(1).max(128),
+    workspaceId: z.string().min(1).max(128),
+    tabId: z.string().min(1).max(128),
+    sessionId: z.string().min(1).max(256),
+    agent: z.string().min(1).max(64),
+    cwd: z.string().min(1).max(4096),
+    label: z.string().max(256).nullable().optional(),
+    lastRev: z.number().int().min(0).default(0),
+  })
+
+  app.post('/v1/loop/workspaces/:workspaceId/panes', async (request, reply) => {
+    const params = z.object({ workspaceId: z.string() }).parse(request.params)
+    const body = loopPaneUpsertSchema.parse(request.body)
+    if (body.workspaceId !== params.workspaceId) {
+      return reply.code(400).send({
+        type: 'error',
+        code: 'WORKSPACE_MISMATCH',
+        message: `workspaceId in body (${body.workspaceId}) does not match URL (${params.workspaceId}).`,
+      })
+    }
+    const pane = await options.storage.upsertLoopPane({
+      paneId: body.paneId,
+      workspaceId: body.workspaceId,
+      tabId: body.tabId,
+      sessionId: body.sessionId,
+      agent: body.agent,
+      cwd: body.cwd,
+      label: body.label ?? null,
+      lastRev: body.lastRev,
+      updatedAt: new Date().toISOString(),
+    })
+    return { type: 'loop_pane', pane }
+  })
+
+  app.patch('/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId', async (request, reply) => {
+    const params = z
+      .object({
+        workspaceId: z.string(),
+        tabId: z.string(),
+        paneId: z.string(),
+      })
+      .parse(request.params)
+    const body = z
+      .object({
+        label: z.string().max(256).nullable().optional(),
+        lastRev: z.number().int().min(0).optional(),
+        cwd: z.string().min(1).max(4096).optional(),
+        sessionId: z.string().min(1).max(256).optional(),
+      })
+      .parse(request.body)
+    const existing = await options.storage.listLoopPanes({
+      paneId: params.paneId,
+    })
+    const current = existing[0]
+    if (!current) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'PANE_NOT_FOUND',
+        message: `Pane not found: ${params.paneId}`,
+      })
+    }
+    const merged: typeof current = {
+      ...current,
+      workspaceId: params.workspaceId,
+      tabId: params.tabId,
+      label: body.label === undefined ? current.label : body.label,
+      cwd: body.cwd ?? current.cwd,
+      sessionId: body.sessionId ?? current.sessionId,
+      lastRev: body.lastRev ?? current.lastRev,
+      updatedAt: new Date().toISOString(),
+    }
+    await options.storage.upsertLoopPane(merged)
+    return { type: 'loop_pane', pane: merged }
+  })
+
+  app.delete('/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId', async (request, reply) => {
+    const params = z
+      .object({
+        workspaceId: z.string(),
+        tabId: z.string(),
+        paneId: z.string(),
+      })
+      .parse(request.params)
+    const deleted = await options.storage.deleteLoopPane(params.paneId)
+    if (!deleted) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'PANE_NOT_FOUND',
+        message: `Pane not found: ${params.paneId}`,
+      })
+    }
+    return { type: 'loop_pane_deleted', paneId: params.paneId }
+  })
+
+  app.get('/v1/loop/workspaces', async request => {
+    const query = z
+      .object({
+        workspaceId: z.string().max(128).optional(),
+        sessionId: z.string().max(256).optional(),
+      })
+      .parse(request.query)
+    const panes = await options.storage.listLoopPanes({
+      workspaceId: query.workspaceId,
+      sessionId: query.sessionId,
+    })
+    return {
+      type: 'loop_workspaces',
+      panes,
+      filter: {
+        workspaceId: query.workspaceId ?? null,
+        sessionId: query.sessionId ?? null,
+      },
+    }
+  })
+
   app.get('/v1/runtime/memory/status', async () => {
     const everCore = everCoreStatus()
     const capabilityAvailable = isEverCoreAvailable(everCore)
+    // §3.5 Memory Quality Metrics: recent-window aggregation from the
+    // `memory_retrieval` event stream + the in-process approval
+    // counters. The recent window is "all retrievals this process
+    // has seen across all sessions" — a single-process lifetime
+    // window, consistent with the v1 honesty rule that memory
+    // quality is a dashboard signal, not a durable audit. The
+    // dashboard degrades gracefully when no retrievals have
+    // happened yet (all counts 0, no errors).
+    const recentRetrievals = await listRecentMemoryRetrievalEvents(options.storage, { limit: 500 })
+    const quality: MemoryQualityMetrics = computeMemoryQualityMetrics(recentRetrievals, {
+      memoryNoteApprovals: memoryApprovalCounters.approved,
+      memoryNoteDenials: memoryApprovalCounters.denied,
+      memoryNotePendingReviews: memoryApprovalCounters.pendingReview,
+    })
     return {
       type: 'memory_status',
       capability: {
@@ -876,6 +1311,27 @@ export async function createNexusApp(
         authoritative: false,
       },
       everCore,
+      quality: {
+        ...quality,
+        // Convenience derived rates so the Go TUI overlay and the
+        // eval harness can render without doing the math.
+        truncationRate: quality.retrievalCount > 0
+          ? quality.truncatedRetrievalCount / quality.retrievalCount
+          : 0,
+        retrievalHitRate: quality.retrievalCount > 0
+          ? quality.retrievalsWithHits / quality.retrievalCount
+          : 0,
+        autoSearchTriggerRate: quality.retrievalCount > 0
+          ? quality.autoSearchTriggeredCount / quality.retrievalCount
+          : 0,
+        averageSearchLatencyMs: quality.retrievalLatencySampleCount > 0
+          ? quality.totalSearchLatencyMs / quality.retrievalLatencySampleCount
+          : 0,
+        saveApprovalRate: (quality.memoryNoteApprovalCount + quality.memoryNoteDenialCount) > 0
+          ? quality.memoryNoteApprovalCount / (quality.memoryNoteApprovalCount + quality.memoryNoteDenialCount)
+          : 0,
+        windowSize: recentRetrievals.length,
+      },
       guidance: {
         memoryIsHint: true,
         projectFactsRequireWorkspaceEvidence: true,
@@ -994,20 +1450,36 @@ export async function createNexusApp(
   app.post('/v1/runtime/memory/save-note', async (request, reply) => {
     const body = memorySaveNoteSchema.parse(request.body ?? {})
     const approval = requireMemoryApproval('save-note', body)
-    if (!approval.approved) return reply.code(202).send(approval.response)
+    if (!approval.approved) {
+      // §3.5: user did not (yet) approve the save. The
+      // SessionChannel `memory_candidate` governance record is the
+      // durable per-candidate audit; this counter is the
+      // recent-window denial signal.
+      memoryApprovalCounters.denied += 1
+      return reply.code(202).send(approval.response)
+    }
     const everCore = everCoreStatus()
     if (!isEverCoreAvailable(everCore) || !options.everCoreClient || !options.everCoreConfig) {
       return reply.code(503).send(memoryUnavailablePayload(everCore))
     }
     const sessionId = body.sessionId ?? createId('memory_note')
     const note = body.note.trim()
-    const messages = buildApprovedMemoryNoteMessages({ note, config: options.everCoreConfig })
+    const messages = buildApprovedMemoryNoteMessages({
+      note,
+      config: options.everCoreConfig,
+    })
     const envelope = await options.everCoreClient.addAgentMessages({
       sessionId,
       appId: options.everCoreConfig.appId,
       projectId: options.everCoreConfig.projectId,
       messages,
     })
+    // §3.5: count this as an approved save. Failures after this
+    // point (transport error on addAgentMessages) would surface
+    // in `everCore.healthy` and increment `errorRetrievalCount`
+    // via the search side; the approval counter stays at +1
+    // because the user *did* approve.
+    memoryApprovalCounters.approved += 1
     return {
       type: 'memory_note_saved',
       provider: 'evercore',
@@ -1144,7 +1616,6 @@ export async function createNexusApp(
     }
   })
 
-
   // GET /v1/runtime/config/profiles — profile 清单 (脱敏: 不返回 apiKey/baseUrl)
   app.get('/v1/runtime/config/profiles', async () => {
     const manager = ConfigManager.getInstance()
@@ -1153,9 +1624,7 @@ export async function createNexusApp(
       type: 'runtime_config_profiles',
       version: manager.getConfigVersion(),
       activeProfile,
-      profiles: Object.entries(manager.getProfiles()).map(([name, profile]) =>
-        sanitizeProfileConfig(name, profile, activeProfile),
-      ),
+      profiles: Object.entries(manager.getProfiles()).map(([name, profile]) => sanitizeProfileConfig(name, profile, activeProfile)),
       tombstones: manager.getTombstones(),
     }
   })
@@ -1192,7 +1661,7 @@ export async function createNexusApp(
       type: 'runtime_models',
       version: manager.getConfigVersion(),
       tombstones: manager.getTombstones(),
-      providers: providerRegistry.map((p) => {
+      providers: providerRegistry.map(p => {
         const authState = resolveProviderAuthState(manager, p.id)
         return {
           id: p.id,
@@ -1205,8 +1674,8 @@ export async function createNexusApp(
           authConfigured: authState.authConfigured,
           authSource: authState.authSource,
           active: settings.providerId === p.id,
-          models: p.models.map((mid) => {
-            const def = modelRegistry.find((m) => m.id === mid)
+          models: p.models.map(mid => {
+            const def = modelRegistry.find(m => m.id === mid)
             return {
               id: mid,
               name: def?.name ?? mid,
@@ -1330,6 +1799,198 @@ export async function createNexusApp(
     return z.toJSONSchema(NexusEventSchema)
   })
 
+  // PR-11: Track A Phase 2 — context history REST endpoint.
+  // Reuses PR-7 data layer (searchEvents, summarizeWindow) and PR-10
+  // parseSince helper. Read-only, no Nexus server state required.
+  app.get('/v1/context/history', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const scope = (q.scope === 'search' ? 'search' : 'summarize') as 'search' | 'summarize'
+    const query = q.query
+    const maxTokens = q.maxTokens ? Number(q.maxTokens) : 5000
+    if (Number.isNaN(maxTokens) || maxTokens <= 0) {
+      return reply.code(400).send({ error: 'maxTokens must be a positive number' })
+    }
+    const sinceMs = q.since ? parseSinceFromQuery(q.since) : undefined
+    if (q.since && sinceMs === undefined) {
+      return reply.code(400).send({
+        error: `Invalid since: ${q.since}. Use e.g. 24h, 30m, 1d, 1w.`,
+      })
+    }
+    const summarizeScope = (q.summarizeScope ?? 'all') as 'all' | 'error' | 'denial' | 'scope-drift' | 'user-redirect' | 'trajectory-end' | 'cross-session'
+    return await runContextHistory({
+      cwd,
+      scope,
+      query,
+      sinceMs,
+      maxTokens,
+      summarizeScope,
+    })
+  })
+
+  // PR-B2: /v1/context/trace — read raw behavior-trace.jsonl entries
+  // as JSON for the Go TUI's StatusBehaviorHint overlay. Mirrors
+  // /v1/context/history's file-read path but returns the raw typed
+  // entries array (no summarize / search) so the TUI can render
+  // each row directly. See docs/nexus/reference/long-running-
+  // context-assembly.md §18.2.
+  app.get('/v1/context/trace', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = q.sessionId
+    const limit = q.limit ? Math.max(1, Math.min(1000, Number(q.limit))) : 100
+    if (q.limit && (Number.isNaN(limit) || limit <= 0)) {
+      return reply.code(400).send({ error: 'limit must be a positive number' })
+    }
+    const sinceMs = q.sinceMs ? Number(q.sinceMs) : 24 * 60 * 60 * 1000
+    if (q.sinceMs && (Number.isNaN(sinceMs) || sinceMs < 0)) {
+      return reply.code(400).send({ error: 'sinceMs must be a non-negative number' })
+    }
+    return await runBehaviorTraceGet({ cwd, sessionId, limit, sinceMs })
+  })
+
+  // PR-12: Track A Phase 2 — context working-set REST endpoints.
+  // Read-only. Reuses PR-4b PersistedWorkingSetTracker.
+  app.get('/v1/context/working-set', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    return await runWorkingSetList({ cwd })
+  })
+
+  app.get('/v1/context/working-set/:sessionId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = (request.params as { sessionId: string }).sessionId
+    return await runWorkingSetGet({ cwd, sessionId })
+  })
+
+  // PR-A1: Track A Phase 3 §7.3 — PUT /v1/context/working-set/:sessionId
+  // (write op, user-approved 2026-06-17). Updates a session's working
+  // set entries; auto-persists + emits working_set_updated event
+  // (PR-26). NOT silent: requires explicit body. Body shape:
+  //   { workspaceId?: string, entries: Array<{key, value, updatedAt, confidence}> }
+  // Pure write — caller is expected to read the current state via GET
+  // first and submit the full desired entries set (this endpoint is a
+  // write-through, not a delta).
+  app.put('/v1/context/working-set/:sessionId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const sessionId = (request.params as { sessionId: string }).sessionId
+    const body = (request.body ?? {}) as {
+      workspaceId?: string
+      entries?: Array<{
+        key?: unknown
+        value?: unknown
+        updatedAt?: unknown
+        confidence?: unknown
+      }>
+    }
+    if (!Array.isArray(body.entries)) {
+      return reply.code(400).send({ error: 'body.entries must be an array' })
+    }
+    // Per-entry shape validation. Reject early on the first bad row
+    // so callers can pinpoint the issue.
+    const validated: Array<{
+      key: string
+      value: string
+      updatedAt: string
+      confidence: number
+    }> = []
+    for (let i = 0; i < body.entries.length; i++) {
+      const e = body.entries[i]!
+      if (typeof e.key !== 'string' || e.key.length === 0) {
+        return reply.code(400).send({ error: `entries[${i}].key must be a non-empty string` })
+      }
+      if (typeof e.value !== 'string') {
+        return reply.code(400).send({ error: `entries[${i}].value must be a string` })
+      }
+      if (e.updatedAt !== undefined && typeof e.updatedAt !== 'string') {
+        return reply.code(400).send({
+          error: `entries[${i}].updatedAt must be a string when present`,
+        })
+      }
+      if (e.confidence !== undefined && (typeof e.confidence !== 'number' || e.confidence < 0 || e.confidence > 1)) {
+        return reply.code(400).send({
+          error: `entries[${i}].confidence must be a number in [0,1]`,
+        })
+      }
+      validated.push({
+        key: e.key,
+        value: e.value,
+        updatedAt: typeof e.updatedAt === 'string' ? e.updatedAt : new Date().toISOString(),
+        confidence: typeof e.confidence === 'number' ? e.confidence : 1,
+      })
+    }
+    return await runWorkingSetPut({
+      cwd,
+      sessionId,
+      workspaceId: body.workspaceId,
+      entries: validated,
+    })
+  })
+
+  // PR-20: Track A Phase 3 — GET /v1/context/working-set/workspace/:wsId.
+  // Per design §7.3 row 3. Returns the working set aggregated across all
+  // sessions that share the same workspaceId. Pure read.
+  app.get('/v1/context/working-set/workspace/:wsId', async (request, reply) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = q.cwd
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd query param is required' })
+    }
+    const workspaceId = (request.params as { wsId: string }).wsId
+    if (!workspaceId) {
+      return reply.code(400).send({ error: 'workspaceId path param is required' })
+    }
+    return await runWorkspaceWorkingSetGet({ cwd, workspaceId })
+  })
+
+  // PR-18: Track A Phase 3 — POST /v1/context/assemble.
+  // Read-only manual context assembly. Reuses PR-15 buildAssemblePreview
+  // (the pure function extracted from runAssemble). Pure read — never
+  // mutates state. Mirrors design §7.3 row 1.
+  app.post('/v1/context/assemble', async (request, reply) => {
+    const body = (request.body ?? {}) as Record<string, unknown>
+    const cwd = typeof body.cwd === 'string' ? body.cwd : undefined
+    if (!cwd) {
+      return reply.code(400).send({ error: 'cwd is required in body' })
+    }
+    const scopeRaw = typeof body.scope === 'string' ? body.scope : 'standard'
+    const validScopes = ['minimal', 'standard', 'full', 'task', 'workspace']
+    if (!validScopes.includes(scopeRaw)) {
+      return reply.code(400).send({
+        error: `Invalid scope: ${scopeRaw}. Must be one of: ${validScopes.join(', ')}`,
+      })
+    }
+    const maxTokensRaw = body.maxTokens
+    const maxTokens = typeof maxTokensRaw === 'number' ? maxTokensRaw : typeof maxTokensRaw === 'string' ? Number(maxTokensRaw) : 7500
+    if (Number.isNaN(maxTokens) || maxTokens <= 0) {
+      return reply.code(400).send({ error: 'maxTokens must be a positive number' })
+    }
+    const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined
+    return await runContextAssemble({
+      cwd,
+      sessionId,
+      scope: scopeRaw as 'minimal' | 'standard' | 'full' | 'task' | 'workspace',
+      maxTokens,
+    })
+  })
+
   app.get('/v1/tools/audit', async () => ({
     type: 'tools_audit',
     tools: options.runtime.listTools?.() ?? [],
@@ -1420,10 +2081,85 @@ export async function createNexusApp(
     }
   })
 
+  // ---------------------------------------------------------------------
+  // Skill routes (Phase 3 of the Skill execution governance plan)
+  // ---------------------------------------------------------------------
+
+  app.get('/v1/skills', async request => {
+    const query = SkillListQuerySchema.parse(request.query)
+    return listSkills({
+      cwd: query.cwd ?? options.defaultCwd,
+      ...(query.source ? { source: query.source } : {}),
+      ...(query.status ? { status: query.status } : {}),
+      ...(query.builtInDir ? { builtInDir: query.builtInDir } : {}),
+    })
+  })
+
+  app.get('/v1/skills/:id', async (request, reply) => {
+    const params = SkillIdParamsSchema.parse(request.params)
+    const query = SkillListQuerySchema.parse(request.query)
+    const result = await showSkill({
+      cwd: query.cwd ?? options.defaultCwd,
+      id: params.id,
+      ...(query.builtInDir ? { builtInDir: query.builtInDir } : {}),
+    })
+    if (!result.ok) {
+      const status = result.errorCode === 'SKILL_NOT_FOUND' ? 404 : 500
+      return reply.code(status).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/validate', async (request, reply) => {
+    const body = SkillValidateBodySchema.parse(request.body ?? {})
+    const result = await validateSkillRequest(body)
+    if (!result.ok) {
+      return reply.code(422).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/invoke', async request => {
+    const body = SkillInvokeBodySchema.parse(request.body ?? {})
+    return invokeSkill(body)
+  })
+
+  app.post('/v1/skills/draft', async (request, reply) => {
+    const body = SkillDraftBodySchema.parse(request.body ?? {})
+    const result = await generateDraftHandler(body)
+    if (!result.ok) {
+      return reply.code(422).send(result)
+    }
+    return result
+  })
+
+  app.post('/v1/skills/save', async (request, reply) => {
+    const body = SkillSaveBodySchema.parse(request.body ?? {})
+    const result = await saveSkillHandler({
+      cwd: body.cwd ?? options.defaultCwd,
+      draft: body.draft as unknown as Parameters<typeof saveSkillHandler>[0]['draft'],
+      confirm: body.confirm,
+      ...(body.overwrite !== undefined ? { overwrite: body.overwrite } : {}),
+      ...(body.scope ? { scope: body.scope } : {}),
+    })
+    if (!result.ok) {
+      if (result.errorCode === 'SKILL_SAVE_OVERWRITE_REQUIRED') {
+        return reply.code(409).send(result)
+      }
+      if (result.errorCode === 'SKILL_SAVE_PERSIST_FAILED' || result.errorCode === 'SKILL_SAVE_SCOPE_INVALID') {
+        return reply.code(500).send(result)
+      }
+      return reply.code(422).send(result)
+    }
+    return result
+  })
+
   app.get('/v1/sessions/:sessionId/agents', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = agentListQuerySchema.omit({ parentSessionId: true }).parse(request.query)
-    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
     if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
     return {
       type: 'agent_jobs',
@@ -1474,26 +2210,34 @@ export async function createNexusApp(
     const policy = body.timeoutPolicy ?? 'fatal'
     const legacyTimeoutMs = body.timeoutMs ?? executeTimeoutMs
     const softTimeoutMs = body.softTimeoutMs ?? legacyTimeoutMs
-    const watchdogTimeoutMs = body.watchdogTimeoutMs ?? (policy === 'soft'
-      ? Math.max(legacyTimeoutMs * 3, legacyTimeoutMs + 300_000)
-      : legacyTimeoutMs)
+    const watchdogTimeoutMs = body.watchdogTimeoutMs ?? (policy === 'soft' ? Math.max(legacyTimeoutMs * 3, legacyTimeoutMs + 300_000) : legacyTimeoutMs)
     // Phase 3 defaults: a single auto extension equal to the soft
     // budget gives the model one full window to react to the budget
     // warning. fatal policy keeps maxSoftTimeoutExtensions=0 so
     // legacy callers never see the new extension cycle.
-    const maxSoftTimeoutExtensions = policy === 'soft'
-      ? body.maxSoftTimeoutExtensions ?? 1
-      : 0
+    const maxSoftTimeoutExtensions = policy === 'soft' ? (body.maxSoftTimeoutExtensions ?? 1) : 0
     const softTimeoutExtensionMs = body.softTimeoutExtensionMs ?? softTimeoutMs
-    return { policy, softTimeoutMs, watchdogTimeoutMs, maxSoftTimeoutExtensions, softTimeoutExtensionMs }
+    return {
+      policy,
+      softTimeoutMs,
+      watchdogTimeoutMs,
+      maxSoftTimeoutExtensions,
+      softTimeoutExtensionMs,
+    }
   }
 
   async function prepareExecution(body: z.infer<typeof executeSchema>): Promise<PreparedExecution | PrepareError> {
     if (body.executionEnvironment === 'remote' && !options.remoteRunner) {
-      return { code: 'NOT_IMPLEMENTED', message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`, status: 501 }
+      return {
+        code: 'NOT_IMPLEMENTED',
+        message: `Execution environment '${body.executionEnvironment}' is not implemented yet.`,
+        status: 501,
+      }
     }
     const sessionId = body.sessionId ?? createId('session')
-    let session = await options.storage.getSession(sessionId, { includeEvents: false })
+    let session = await options.storage.getSession(sessionId, {
+      includeEvents: false,
+    })
     const cwd = resolveRequestCwd({
       prompt: body.prompt,
       requestedCwd: body.cwd,
@@ -1501,7 +2245,11 @@ export async function createNexusApp(
       defaultCwd: options.defaultCwd,
     })
     if (!isWorkspaceAllowed(cwd)) {
-      return { code: 'INVALID_REQUEST', message: `Workspace directory not allowed: ${cwd}`, status: 400 }
+      return {
+        code: 'INVALID_REQUEST',
+        message: `Workspace directory not allowed: ${cwd}`,
+        status: 400,
+      }
     }
 
     let allowedPaths = session?.allowedPaths ? [...session.allowedPaths] : []
@@ -1515,7 +2263,11 @@ export async function createNexusApp(
     try {
       const modelDef = getModel(targetModelId)
       if (modelDef && !modelDef.capabilities.toolCalling) {
-        return { code: 'INVALID_REQUEST', message: `Model "${targetModelId}" does not support tool calling`, status: 400 }
+        return {
+          code: 'INVALID_REQUEST',
+          message: `Model "${targetModelId}" does not support tool calling`,
+          status: 400,
+        }
       }
     } catch (err) {
       if (!(err instanceof UnknownModelError)) throw err
@@ -1552,19 +2304,34 @@ export async function createNexusApp(
       session.allowedPaths = allowedPaths.length > 0 ? allowedPaths : undefined
     }
     await options.storage.saveSession(session)
-    await options.storage.appendEvent(sessionId, { type: 'user_message', ...eventBase(sessionId), text: body.prompt })
+    await options.storage.appendEvent(sessionId, {
+      type: 'user_message',
+      ...eventBase(sessionId),
+      text: body.prompt,
+    })
     const requestId = body.requestId ?? createId('req')
-    return { sessionId, session, cwd, body, requestId, abortController, timeoutController, timeout, timeoutDecision, policyMode, allowedTools, allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined, watchdog }
+    return {
+      sessionId,
+      session,
+      cwd,
+      body,
+      requestId,
+      abortController,
+      timeoutController,
+      timeout,
+      timeoutDecision,
+      policyMode,
+      allowedTools,
+      allowedPaths: allowedPaths.length > 0 ? allowedPaths : undefined,
+      watchdog,
+    }
   }
 
   function isPrepareError(r: PreparedExecution | PrepareError): r is PrepareError {
     return 'status' in r
   }
 
-  function registerActiveExecution(
-    sessionId: string,
-    execution: ActiveExecution,
-  ): void {
+  function registerActiveExecution(sessionId: string, execution: ActiveExecution): void {
     activeExecutions.set(sessionId, execution)
   }
 
@@ -1610,10 +2377,17 @@ export async function createNexusApp(
     if (event.compactSummaryLatencyMs !== undefined) metrics.recordCompactSummaryLatency(event.compactSummaryLatencyMs)
   }
 
-  function runtimeResultStatusCode(
-    events: NexusEvent[],
-    errorEvent: NexusEvent | undefined,
-  ): number {
+  // Phase C: emit a `cache_health` event after an `execution_metrics`
+  // event, when the resulting snapshot is `warning` or `critical` and
+  // the requestId is not yet seen by the dedup registry. The function
+  // returns the new event (already dedup'd) or `undefined` to skip.
+  // The caller is responsible for pushing to `events` and persisting.
+  // WebSocket callers also forward via sendJson.
+  function maybeEmitCacheHealthEvent(event: NexusEvent, cwd: string): NexusEvent | undefined {
+    return maybeBuildCacheHealthEventFromExecutionMetrics(event, cwd)
+  }
+
+  function runtimeResultStatusCode(events: NexusEvent[], errorEvent: NexusEvent | undefined): number {
     if (events.some(event => event.type === 'context_blocking')) return 413
     if (errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT') return 408
     return 200
@@ -1644,9 +2418,7 @@ export async function createNexusApp(
     if (options.event.code !== 'REQUEST_TIMEOUT') return undefined
     if (options.timeoutDecision.policy !== 'soft') return undefined
     if (!options.watchdog.fired) return undefined
-    const softCycleEvents = options.events.filter(event =>
-      event.type === 'timeout_budget_exceeded' || event.type === 'timeout_extension_granted',
-    )
+    const softCycleEvents = options.events.filter(event => event.type === 'timeout_budget_exceeded' || event.type === 'timeout_extension_granted')
     const existingDetails = asRecord(options.event.details) ?? {}
     const detailRecord: Record<string, unknown> = {
       ...existingDetails,
@@ -1723,9 +2495,7 @@ export async function createNexusApp(
     elapsedMs: number
     send?: (event: NexusEvent) => void
   }): Promise<void> {
-    const dup = state.events.some(event =>
-      event.type === 'timeout_budget_exceeded' && event.timeoutMs === state.currentBudgetMs,
-    )
+    const dup = state.events.some(event => event.type === 'timeout_budget_exceeded' && event.timeoutMs === state.currentBudgetMs)
     if (dup) return
     const event = buildTimeoutBudgetExceededEvent({
       sessionId: state.sessionId,
@@ -1831,11 +2601,15 @@ export async function createNexusApp(
       })
       if (cancelled) return
       const nextDelayMs = Math.max(0, additionalMs)
-      currentTimer = setTimeout(() => { void fire() }, nextDelayMs)
+      currentTimer = setTimeout(() => {
+        void fire()
+      }, nextDelayMs)
     }
 
     const initialDelayMs = Math.max(0, state.softTimeoutMs)
-    currentTimer = setTimeout(() => { void fire() }, initialDelayMs)
+    currentTimer = setTimeout(() => {
+      void fire()
+    }, initialDelayMs)
 
     return {
       cancel(): void {
@@ -1863,7 +2637,11 @@ export async function createNexusApp(
       const body = executeSchema.parse(request.body)
       const prepared = await prepareExecution(body)
       if (isPrepareError(prepared)) {
-        return reply.status(prepared.status).send({ type: 'error', code: prepared.code, message: prepared.message })
+        return reply.status(prepared.status).send({
+          type: 'error',
+          code: prepared.code,
+          message: prepared.message,
+        })
       }
       const { sessionId, cwd, requestId, abortController, timeoutController, timeout, timeoutDecision } = prepared
       activeSessionId = sessionId
@@ -1901,17 +2679,18 @@ export async function createNexusApp(
       // `maxSoftTimeoutExtensions` at 0 in
       // `resolveExecuteTimeoutDecision`, so the cycle reduces to
       // zero cycles and back-compat is preserved.
-      const softTimeoutCycle = timeoutDecision.policy === 'soft'
-        ? scheduleSoftTimeoutCycle({
-            events,
-            sessionId,
-            requestId,
-            softTimeoutMs: effectiveTimeoutMs,
-            startedAtMs,
-            maxExtensions: timeoutDecision.maxSoftTimeoutExtensions,
-            extensionMs: timeoutDecision.softTimeoutExtensionMs,
-          })
-        : undefined
+      const softTimeoutCycle =
+        timeoutDecision.policy === 'soft'
+          ? scheduleSoftTimeoutCycle({
+              events,
+              sessionId,
+              requestId,
+              softTimeoutMs: effectiveTimeoutMs,
+              startedAtMs,
+              maxExtensions: timeoutDecision.maxSoftTimeoutExtensions,
+              extensionMs: timeoutDecision.softTimeoutExtensionMs,
+            })
+          : undefined
       try {
         for await (const event of options.runtime.executeStream({
           sessionId,
@@ -1939,15 +2718,26 @@ export async function createNexusApp(
           // intercept BEFORE pushing/persisting so the
           // in-memory + storage representations stay
           // consistent.
-          const decoratedEvent = maybeDecorateWatchdogError({
-            event,
-            timeoutDecision,
-            watchdog: prepared.watchdog,
-            events,
-          }) ?? event
+          const decoratedEvent =
+            maybeDecorateWatchdogError({
+              event,
+              timeoutDecision,
+              watchdog: prepared.watchdog,
+              events,
+            }) ?? event
           events.push(decoratedEvent)
           await options.storage.appendEvent(sessionId, decoratedEvent)
           recordEventMetrics(decoratedEvent)
+          // Feed event to BehaviorMonitor for cross-session detection.
+          options.behaviorMonitor?.ingest(decoratedEvent)
+          // Phase C: emit a `cache_health` event after execution_metrics
+          // when the snapshot is non-ok and the requestId is fresh. The
+          // returned event is persisted + recorded, mirroring the parent.
+          const cacheHealthEvent = maybeEmitCacheHealthEvent(decoratedEvent, cwd)
+          if (cacheHealthEvent) {
+            events.push(cacheHealthEvent)
+            await options.storage.appendEvent(sessionId, cacheHealthEvent)
+          }
           await maybeAppendNearTimeoutWarning({
             events,
             sessionId,
@@ -1966,8 +2756,7 @@ export async function createNexusApp(
       const errorEvent = events.findLast(event => event.type === 'error')
       const statusCode = runtimeResultStatusCode(events, errorEvent)
       const timedOut = abortController.signal.aborted
-      const timeoutEvent =
-        errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT'
+      const timeoutEvent = errorEvent?.type === 'error' && errorEvent.code === 'REQUEST_TIMEOUT'
       const partialResultEvent = await appendTimeoutPartialResult({
         storage: options.storage,
         sessionId,
@@ -1977,11 +2766,7 @@ export async function createNexusApp(
       })
       resultEvent = partialResultEvent ?? resultEvent
       const recoveredFromToolDenial = isRecoverableToolDenialOnlyTurn(events, resultEvent, errorEvent, timedOut)
-      const succeeded =
-        !timedOut && !errorEvent && (
-          (resultEvent?.type === 'result' && resultEvent.success) ||
-          recoveredFromToolDenial
-        )
+      const succeeded = !timedOut && !errorEvent && ((resultEvent?.type === 'result' && resultEvent.success) || recoveredFromToolDenial)
       await finalizeExecutionSession(options.storage, sessionId, {
         succeeded,
         resultEvent,
@@ -2028,7 +2813,9 @@ export async function createNexusApp(
 
   app.get('/v1/sessions', async request => {
     const query = z
-      .object({ limit: z.coerce.number().int().positive().max(200).default(50) })
+      .object({
+        limit: z.coerce.number().int().positive().max(200).default(50),
+      })
       .parse(request.query)
     return {
       type: 'sessions_list',
@@ -2090,7 +2877,9 @@ export async function createNexusApp(
       })
     }
     for (const sessionId of participantSessionIds) {
-      const session = await options.storage.getSession(sessionId, { includeEvents: false })
+      const session = await options.storage.getSession(sessionId, {
+        includeEvents: false,
+      })
       if (!session) return reply.code(404).send(createSessionNotFoundPayload(sessionId))
     }
     const channel: SessionChannel = {
@@ -2178,7 +2967,9 @@ export async function createNexusApp(
   app.get('/v1/sessions/:sessionId/inbox', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = sessionInboxQuerySchema.parse(request.query)
-    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
     if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
     return {
       type: 'session_inbox',
@@ -2191,7 +2982,9 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/inbox/:messageId/ack', async (request, reply) => {
     const params = z.object({ sessionId: z.string(), messageId: z.string() }).parse(request.params)
-    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
     if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
     const message = await options.storage.getSessionMessage(params.messageId)
     if (!message) return reply.code(404).send(createSessionMessageNotFoundPayload(params.messageId))
@@ -2214,6 +3007,24 @@ export async function createNexusApp(
       includeEvents: false,
     })
     if (!session) {
+      // Phase 3 / §3 goal 5 of
+      // go-tui-session-observability-governance-plan.md: when the
+      // operator queries a Go TUI client placeholder
+      // (`session_go_<unixnano>`) directly, return a redacted
+      // persistence hint instead of the generic SESSION_NOT_FOUND.
+      // The hint points at the two real reverse-resolve paths and
+      // flags the embedded-Nexus-memory-storage root cause — the
+      // exact failure mode of session_go_1781146359507755000.
+      if (isGoTuiClientSessionId(params.sessionId)) {
+        return reply.code(404).send({
+          type: 'error',
+          code: 'SESSION_NOT_FOUND',
+          subtype: 'go_tui_client_placeholder',
+          message: goTuiClientSessionPersistenceHint(params.sessionId),
+          hint: goTuiClientSessionPersistenceHint(params.sessionId),
+          sessionId: params.sessionId,
+        })
+      }
       return reply.code(404).send({
         type: 'error',
         code: 'SESSION_NOT_FOUND',
@@ -2280,6 +3091,111 @@ export async function createNexusApp(
     }
   })
 
+  // bbl loop plan Phase 1: incremental event subscription with
+  // since / match / types / timeout. Clients (e.g. multi-pane
+  // TUI) poll this endpoint instead of holding a long-lived WS
+  // stream per pane. The endpoint intentionally returns 200 with
+  // an empty event list on timeout so clients treat it as a
+  // normal poll tick, mirroring herdr's `wait_for_output` shape.
+  const waitQuerySchema = z.object({
+    since: z.coerce.number().int().min(0).default(0),
+    match: z.string().min(1).max(2048).optional(),
+    types: z.string().min(1).max(1024).optional(),
+    timeout: z.coerce.number().int().min(0).max(60_000).default(0),
+    limit: z.coerce.number().int().positive().max(500).default(200),
+  })
+
+  app.get('/v1/sessions/:sessionId/wait', async (request, reply) => {
+    const params = z.object({ sessionId: z.string() }).parse(request.params)
+    const query = waitQuerySchema.parse(request.query)
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
+    if (!session) {
+      return reply.code(404).send({
+        type: 'error',
+        code: 'SESSION_NOT_FOUND',
+        message: `Session not found: ${params.sessionId}`,
+      })
+    }
+    const allowedTypes = query.types
+      ? new Set(
+          query.types
+            .split(',')
+            .map(value => value.trim())
+            .filter(Boolean),
+        )
+      : null
+    const matcher = query.match ? new RegExp(escapeRegExpForWait(query.match)) : null
+
+    const pollOnce = async (): Promise<{
+      events: NexusEvent[]
+      lastSeq: number
+    }> => {
+      const page = await options.storage.listEvents(params.sessionId, {
+        order: 'asc',
+        limit: query.limit,
+        cursor: query.since > 0 ? String(query.since) : undefined,
+      })
+      const filtered: NexusEvent[] = []
+      for (const event of page.events) {
+        if (allowedTypes && !allowedTypes.has(event.type)) continue
+        if (matcher && !matcher.test(JSON.stringify(event))) continue
+        filtered.push(event)
+      }
+      return {
+        events: filtered,
+        lastSeq: page.lastSeq ?? query.since,
+      }
+    }
+
+    const initial = await pollOnce()
+    if (initial.events.length > 0 || query.timeout === 0) {
+      return {
+        type: 'session_wait',
+        sessionId: params.sessionId,
+        events: initial.events,
+        nextRevision: String(initial.lastSeq),
+        matched: initial.events.length > 0,
+        order: 'asc',
+        limit: query.limit,
+      }
+    }
+
+    // No matches yet and the client asked us to wait. Poll at a
+    // coarse interval (250ms) until either a matching event shows
+    // up or the deadline elapses. 250ms keeps the round-trip
+    // responsive without thrashing the SQLite reader.
+    const deadline = Date.now() + query.timeout
+    const intervalMs = 250
+    while (Date.now() < deadline) {
+      const remaining = Math.max(0, deadline - Date.now())
+      await new Promise(resolve => setTimeout(resolve, Math.min(intervalMs, remaining)))
+      const tick = await pollOnce()
+      if (tick.events.length > 0) {
+        return {
+          type: 'session_wait',
+          sessionId: params.sessionId,
+          events: tick.events,
+          nextRevision: String(tick.lastSeq),
+          matched: true,
+          order: 'asc',
+          limit: query.limit,
+        }
+      }
+    }
+
+    return {
+      type: 'session_wait',
+      sessionId: params.sessionId,
+      events: [],
+      nextRevision: String(initial.lastSeq),
+      matched: false,
+      order: 'asc',
+      limit: query.limit,
+    }
+  })
+
   app.get('/v1/sessions/:sessionId/children', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
     const query = childSessionsQuerySchema.parse(request.query)
@@ -2294,33 +3210,36 @@ export async function createNexusApp(
       })
     }
 
-    const childSessions = (await options.storage.listChildSessions(params.sessionId, {
-      limit: query.limit,
-      includeEvents: false,
-    })).filter(child => !query.failedOnly || child.phase === 'failed' || child.phase === 'cancelled' || child.metadata?.status === 'failed' || child.metadata?.status === 'cancelled')
+    const childSessions = (
+      await options.storage.listChildSessions(params.sessionId, {
+        limit: query.limit,
+        includeEvents: false,
+      })
+    ).filter(child => !query.failedOnly || child.phase === 'failed' || child.phase === 'cancelled' || child.metadata?.status === 'failed' || child.metadata?.status === 'cancelled')
 
-    const children = await Promise.all(childSessions.map(async child => {
-      const page = query.includeEvents && query.eventLimit > 0
-        ? await options.storage.listEvents(child.sessionId, {
-            limit: query.eventLimit,
-            order: 'desc',
-          })
-        : undefined
-      return {
-        session: { ...child, events: [] },
-        transcriptPath: typeof child.metadata?.transcriptPath === 'string'
-          ? child.metadata.transcriptPath
-          : `nexus://sessions/${child.sessionId}/events`,
-        events: page
-          ? {
-              items: [...page.events].reverse(),
-              truncated: page.nextCursor !== undefined,
-              limit: query.eventLimit,
-              order: 'asc',
-            }
-          : undefined,
-      }
-    }))
+    const children = await Promise.all(
+      childSessions.map(async child => {
+        const page =
+          query.includeEvents && query.eventLimit > 0
+            ? await options.storage.listEvents(child.sessionId, {
+                limit: query.eventLimit,
+                order: 'desc',
+              })
+            : undefined
+        return {
+          session: { ...child, events: [] },
+          transcriptPath: typeof child.metadata?.transcriptPath === 'string' ? child.metadata.transcriptPath : `nexus://sessions/${child.sessionId}/events`,
+          events: page
+            ? {
+                items: [...page.events].reverse(),
+                truncated: page.nextCursor !== undefined,
+                limit: query.eventLimit,
+                order: 'asc',
+              }
+            : undefined,
+        }
+      }),
+    )
 
     return {
       type: 'child_sessions',
@@ -2359,9 +3278,7 @@ export async function createNexusApp(
       type: 'child_session_events',
       sessionId: params.sessionId,
       childSessionId: params.childSessionId,
-      transcriptPath: typeof child.metadata?.transcriptPath === 'string'
-        ? child.metadata.transcriptPath
-        : `nexus://sessions/${child.sessionId}/events`,
+      transcriptPath: typeof child.metadata?.transcriptPath === 'string' ? child.metadata.transcriptPath : `nexus://sessions/${child.sessionId}/events`,
       events: page.events,
       nextCursor: page.nextCursor,
       order: query.order,
@@ -2371,10 +3288,12 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/compact', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const body = z.object({
-      modelId: z.string().optional(),
-      trigger: z.enum(['manual', 'auto', 'reactive']).default('manual').optional(),
-    }).parse(request.body ?? {})
+    const body = z
+      .object({
+        modelId: z.string().optional(),
+        trigger: z.enum(['manual', 'auto', 'reactive']).default('manual').optional(),
+      })
+      .parse(request.body ?? {})
     const session = await options.storage.getSession(params.sessionId, {
       includeEvents: false,
     })
@@ -2394,7 +3313,10 @@ export async function createNexusApp(
       mapEventsToMessages,
       initialPrompt,
     })
-    const persistedEvents = await options.storage.listEvents(params.sessionId, { order: 'asc', limit: 10_000 })
+    const persistedEvents = await options.storage.listEvents(params.sessionId, {
+      order: 'asc',
+      limit: 10_000,
+    })
     const assembled = await assembleContext({
       runtimeOptions: {
         sessionId: params.sessionId,
@@ -2428,11 +3350,13 @@ export async function createNexusApp(
 
   app.get('/v1/sessions/:sessionId/context', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const query = z.object({
-      modelId: z.string().optional(),
-      prompt: z.string().optional(),
-      cwd: z.string().optional(),
-    }).parse(request.query)
+    const query = z
+      .object({
+        modelId: z.string().optional(),
+        prompt: z.string().optional(),
+        cwd: z.string().optional(),
+      })
+      .parse(request.query)
     const session = await options.storage.getSession(params.sessionId, {
       includeEvents: false,
     })
@@ -2469,7 +3393,56 @@ export async function createNexusApp(
       mapEventsToMessages,
       tools: toolDefinitions,
       memoryProvider: options.memoryProvider,
-      sessionInbox: await options.storage.listSessionInbox(params.sessionId, { limit: 20 }),
+      sessionInbox: await options.storage.listSessionInbox(params.sessionId, {
+        limit: 20,
+      }),
+      onMemoryRetrieval: options.memoryProvider
+        ? async ({ sessionId, cwd, prompt, diagnostics }) => {
+            // §3.5 Memory Quality Metrics: persist a
+            // `memory_retrieval` NexusEvent so the
+            // `/v1/runtime/memory/status` dashboard and the
+            // `agentTrace.ts` `memory_retrieval` span have a
+            // record of this retrieval. The GET context route
+            // is a clean place to surface the diagnostics because
+            // it is the only path that already calls
+            // `memoryProvider.retrieve` and exposes the result;
+            // the hot path (LLMCodingRuntime.execute) is wired
+            // in v1.1 once the same hook lands in the
+            // runtimePipeline path. Failure inside this hook is
+            // fire-and-forget so the context response still
+            // returns to the operator.
+            const autoSearch = diagnostics.autoSearch
+            const event: NexusEvent = {
+              ...eventBase(sessionId),
+              type: 'memory_retrieval',
+              provider: diagnostics.provider,
+              enabled: diagnostics.enabled,
+              scope: diagnostics.scope,
+              ...(diagnostics.namespaceId && { namespaceId: diagnostics.namespaceId }),
+              ...(diagnostics.namespaceSource && { namespaceSource: diagnostics.namespaceSource }),
+              ...(diagnostics.isolationKey && { isolationKey: diagnostics.isolationKey }),
+              autoSearchTriggered: autoSearch?.triggered ?? false,
+              autoSearchReason: autoSearch?.reason ?? 'no_memory_cue',
+              ...(autoSearch?.cue && { autoSearchCue: autoSearch.cue }),
+              hitCount: diagnostics.hitCount,
+              injectedChars: diagnostics.injectedChars,
+              budgetChars: diagnostics.budgetChars,
+              maxHitChars: diagnostics.maxHitChars,
+              truncated: diagnostics.truncated,
+              ...(diagnostics.searchLatencyMs !== undefined && { searchLatencyMs: diagnostics.searchLatencyMs }),
+              ...(diagnostics.error && { error: diagnostics.error }),
+              prompt,
+              cwd,
+            }
+            try {
+              await options.storage.appendEvent(sessionId, event)
+            } catch (error) {
+              process.stderr.write(
+                `[nexus:context] memory_retrieval event append failed: ${errorMessage(error)}\n`,
+              )
+            }
+          }
+        : undefined,
     })
     return analysis
   })
@@ -2536,15 +3509,14 @@ export async function createNexusApp(
       limit: body.recentEventLimit ?? 100,
       order: 'desc',
     })
-    const tasks = body.includeTasks === false
-      ? []
-      : await options.storage.listTasks(params.sessionId)
-    const childSessions = body.includeChildSessions === false
-      ? []
-      : await options.storage.listChildSessions(params.sessionId, {
-          limit: 200,
-          includeEvents: false,
-        })
+    const tasks = body.includeTasks === false ? [] : await options.storage.listTasks(params.sessionId)
+    const childSessions =
+      body.includeChildSessions === false
+        ? []
+        : await options.storage.listChildSessions(params.sessionId, {
+            limit: 200,
+            includeEvents: false,
+          })
     const activeExecution = activeExecutions.get(params.sessionId)
 
     return {
@@ -2615,22 +3587,20 @@ export async function createNexusApp(
     // The runtime's `executeStream` accumulates `scope: 'session'`
     // rules into the per-session map so the remaining turns of the
     // session auto-allow matching tool calls.
-    const body = z.object({
-      toolUseId: z.string(),
-      scope: z.enum(['once', 'session', 'rule']).optional(),
-      rule: z.string().optional(),
-      feedback: z.string().optional(),
-    }).parse(request.body)
-    const resolved = PendingPermissionRegistry.getInstance().resolve(
-      params.sessionId,
-      body.toolUseId,
-      {
-        approved: true,
-        scope: body.scope ?? 'once',
-        ...(body.rule && { rule: body.rule }),
-        ...(body.feedback && { feedback: body.feedback }),
-      }
-    )
+    const body = z
+      .object({
+        toolUseId: z.string(),
+        scope: z.enum(['once', 'session', 'rule']).optional(),
+        rule: z.string().optional(),
+        feedback: z.string().optional(),
+      })
+      .parse(request.body)
+    const resolved = PendingPermissionRegistry.getInstance().resolve(params.sessionId, body.toolUseId, {
+      approved: true,
+      scope: body.scope ?? 'once',
+      ...(body.rule && { rule: body.rule }),
+      ...(body.feedback && { feedback: body.feedback }),
+    })
     if (!resolved) {
       return reply.code(404).send({
         type: 'error',
@@ -2654,24 +3624,22 @@ export async function createNexusApp(
     // Phase A.1: the `feedback` field is the "Reject, tell the model
     // what to do instead" text. It's surfaced in the runtime's
     // `permission_response` event so the next turn can act on it.
-    const body = z.object({
-      toolUseId: z.string(),
-      reason: z.string().optional(),
-      scope: z.enum(['once', 'session', 'rule']).optional(),
-      rule: z.string().optional(),
-      feedback: z.string().optional(),
-    }).parse(request.body)
-    const resolved = PendingPermissionRegistry.getInstance().resolve(
-      params.sessionId,
-      body.toolUseId,
-      {
-        approved: false,
-        reason: body.reason,
-        ...(body.scope && { scope: body.scope }),
-        ...(body.rule && { rule: body.rule }),
-        ...(body.feedback && { feedback: body.feedback }),
-      }
-    )
+    const body = z
+      .object({
+        toolUseId: z.string(),
+        reason: z.string().optional(),
+        scope: z.enum(['once', 'session', 'rule']).optional(),
+        rule: z.string().optional(),
+        feedback: z.string().optional(),
+      })
+      .parse(request.body)
+    const resolved = PendingPermissionRegistry.getInstance().resolve(params.sessionId, body.toolUseId, {
+      approved: false,
+      reason: body.reason,
+      ...(body.scope && { scope: body.scope }),
+      ...(body.rule && { rule: body.rule }),
+      ...(body.feedback && { feedback: body.feedback }),
+    })
     if (!resolved) {
       return reply.code(404).send({
         type: 'error',
@@ -2702,9 +3670,7 @@ export async function createNexusApp(
       phase: 'cancelled',
       reason: body.reason ?? 'Session cancelled',
       hooks: ConfigManager.getInstance().load().hooks,
-      everCore: options.everCoreConfig
-        ? { client: options.everCoreClient, config: options.everCoreConfig }
-        : undefined,
+      everCore: options.everCoreConfig ? { client: options.everCoreClient, config: options.everCoreConfig } : undefined,
     })
     if (!session) {
       return reply.code(404).send({
@@ -2727,19 +3693,19 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/close', async (request, reply) => {
     const params = z.object({ sessionId: z.string() }).parse(request.params)
-    const body = z.object({
-      phase: z.enum(['cancelled', 'completed', 'failed']).optional(),
-      reason: z.string().optional(),
-    }).parse(request.body ?? {})
+    const body = z
+      .object({
+        phase: z.enum(['cancelled', 'completed', 'failed']).optional(),
+        reason: z.string().optional(),
+      })
+      .parse(request.body ?? {})
     const { session, permissionsResolved, childSessionsCancelled } = await closeNexusSession({
       storage: options.storage,
       sessionId: params.sessionId,
       phase: body.phase,
       reason: body.reason,
       hooks: ConfigManager.getInstance().load().hooks,
-      everCore: options.everCoreConfig
-        ? { client: options.everCoreClient, config: options.everCoreConfig }
-        : undefined,
+      everCore: options.everCoreConfig ? { client: options.everCoreClient, config: options.everCoreConfig } : undefined,
     })
     if (!session) {
       return reply.code(404).send({
@@ -2799,9 +3765,7 @@ export async function createNexusApp(
   })
 
   app.patch('/v1/sessions/:sessionId/tasks/:taskId', async (request, reply) => {
-    const params = z
-      .object({ sessionId: z.string(), taskId: z.string() })
-      .parse(request.params)
+    const params = z.object({ sessionId: z.string(), taskId: z.string() }).parse(request.params)
     const body = updateTaskSchema.parse(request.body)
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
@@ -2852,11 +3816,7 @@ export async function createNexusApp(
         status: 'failed',
         result: body.result,
       }
-      const blockedTasksFailed = await propagateFailedDependency(
-        options.storage,
-        task.sessionId,
-        failedTask,
-      )
+      const blockedTasksFailed = await propagateFailedDependency(options.storage, task.sessionId, failedTask)
       return {
         ...failedTask,
         metadata: {
@@ -2869,18 +3829,8 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/tasks/:taskId/cancel', async (request, reply) => {
     return mutateTaskAction(options.storage, request.params, request.body, reply, 'task_cancelled', async (task, body) => {
-      const childSessionsCancelled = await cancelChildSessionsForTask(
-        options.storage,
-        task.sessionId,
-        task.taskId,
-        body.reason ?? 'Task cancelled',
-      )
-      const blockedTasksFailed = await failBlockedTasksForDependency(
-        options.storage,
-        task.sessionId,
-        task.taskId,
-        body.reason ?? 'Task cancelled',
-      )
+      const childSessionsCancelled = await cancelChildSessionsForTask(options.storage, task.sessionId, task.taskId, body.reason ?? 'Task cancelled')
+      const blockedTasksFailed = await failBlockedTasksForDependency(options.storage, task.sessionId, task.taskId, body.reason ?? 'Task cancelled')
       return {
         ...task,
         status: 'cancelled',
@@ -2895,11 +3845,7 @@ export async function createNexusApp(
 
   app.post('/v1/sessions/:sessionId/tasks/:taskId/retry', async (request, reply) => {
     return mutateTaskAction(options.storage, request.params, request.body, reply, 'task_retried', async task => {
-      const blockedTasksRestored = await restoreTasksFailedByDependency(
-        options.storage,
-        task.sessionId,
-        task.taskId,
-      )
+      const blockedTasksRestored = await restoreTasksFailedByDependency(options.storage, task.sessionId, task.taskId)
       return {
         ...task,
         status: 'pending',
@@ -2915,9 +3861,7 @@ export async function createNexusApp(
   })
 
   app.post('/v1/sessions/:sessionId/tasks/:taskId/rerun-subagent', async (request, reply) => {
-    const params = z
-      .object({ sessionId: z.string(), taskId: z.string() })
-      .parse(request.params)
+    const params = z.object({ sessionId: z.string(), taskId: z.string() }).parse(request.params)
     const body = subAgentRerunSchema.parse(request.body ?? {})
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
@@ -2927,7 +3871,9 @@ export async function createNexusApp(
         message: `Task not found: ${params.taskId}`,
       })
     }
-    const session = await options.storage.getSession(params.sessionId, { includeEvents: false })
+    const session = await options.storage.getSession(params.sessionId, {
+      includeEvents: false,
+    })
     if (!session) return reply.code(404).send(createSessionNotFoundPayload(params.sessionId))
     const conflict = checkTaskRevision(task, body.expectedUpdatedAt)
     if (conflict) return reply.code(409).send(conflict)
@@ -2940,9 +3886,7 @@ export async function createNexusApp(
   })
 
   app.post('/v1/sessions/:sessionId/tasks/:taskId/worktree-recovery', async (request, reply) => {
-    const params = z
-      .object({ sessionId: z.string(), taskId: z.string() })
-      .parse(request.params)
+    const params = z.object({ sessionId: z.string(), taskId: z.string() }).parse(request.params)
     const body = worktreeRecoveryActionSchema.parse(request.body ?? {})
     const task = await options.storage.getTask(params.taskId)
     if (!task || task.sessionId !== params.sessionId) {
@@ -2997,7 +3941,7 @@ export async function createNexusApp(
     socket.on('message', async (raw: Buffer) => {
       const parsedJson = parseJsonObject(raw)
       if (parsedJson && typeof parsedJson === 'object' && 'type' in parsedJson && parsedJson.type === 'permission_response') {
-        const res = (parsedJson as unknown) as {
+        const res = parsedJson as unknown as {
           sessionId: string
           toolUseId: string
           approved: boolean
@@ -3052,169 +3996,190 @@ export async function createNexusApp(
           return
         }
 
-      const body = parsed.data
-      const prepared = await prepareExecution(body)
-      if (isPrepareError(prepared)) {
-        sendJson(socket, { type: 'error', code: prepared.code, message: prepared.message })
-        return
-      }
-      const { sessionId, cwd, requestId } = prepared
-      abortController = prepared.abortController
-      registerActiveExecution(sessionId, {
-        requestId,
-        abortController,
-        transport: 'websocket',
-        startedAt: nowIso(),
-      })
-      const timeout = prepared.timeout
-      const events: NexusEvent[] = []
-      const effectiveTimeoutMs = prepared.timeoutDecision.softTimeoutMs
-      const nearTimeoutWatcher = startNearTimeoutWatcher({
-        events,
-        sessionId,
-        requestId,
-        timeoutMs: effectiveTimeoutMs,
-        startedAtMs,
-        send: event => {
-          if (socket.readyState === socket.OPEN) {
-            sendJson(socket, event)
-            metrics.recordStreamEvent(socket.bufferedAmount)
-          }
-        },
-      })
-      // Phase 2: soft watcher fires once at the soft budget and
-      // pushes `timeout_budget_exceeded` over the WS without
-      // aborting. Hard watchdog still owns abort. Only run under
-      // soft policy; legacy fatal callers fall through to the
-      // existing watchdog-driven cutoff.
-      //
-      // Phase 3: same cycle as the HTTP path — after each soft
-      // budget exhaustion the runtime may auto-grant a bounded
-      // number of extensions (announced via
-      // `timeout_extension_granted`). fatal policy keeps
-      // `maxSoftTimeoutExtensions` at 0 in
-      // `resolveExecuteTimeoutDecision`, so legacy WS callers do
-      // not see the new event stream either.
-      const softTimeoutCycle = prepared.timeoutDecision.policy === 'soft'
-        ? scheduleSoftTimeoutCycle({
-            events,
-            sessionId,
-            requestId,
-            softTimeoutMs: effectiveTimeoutMs,
-            startedAtMs,
-            maxExtensions: prepared.timeoutDecision.maxSoftTimeoutExtensions,
-            extensionMs: prepared.timeoutDecision.softTimeoutExtensionMs,
-            send: event => {
-              if (socket.readyState === socket.OPEN) {
-                sendJson(socket, event)
-                metrics.recordStreamEvent(socket.bufferedAmount)
-              }
-            },
+        const body = parsed.data
+        const prepared = await prepareExecution(body)
+        if (isPrepareError(prepared)) {
+          sendJson(socket, {
+            type: 'error',
+            code: prepared.code,
+            message: prepared.message,
           })
-        : undefined
-
-      try {
-        for await (const event of options.runtime.executeStream({
-          sessionId,
-          prompt: body.prompt,
-          cwd,
-          signal: abortController.signal,
-          timeoutSignal: prepared.timeoutController.signal,
-          maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
-          bashMaxBufferBytes,
-          skipPermissionCheck: body.skipPermissionCheck,
-          requestId,
-          model: body.model,
-          budget: body.budget,
-          executionEnvironment: body.executionEnvironment,
-          remoteRunner: options.remoteRunner,
-          allowedPaths: prepared.allowedPaths,
-          policyMode: prepared.policyMode,
-          ...(prepared.allowedTools && { allowedTools: prepared.allowedTools }),
-        })) {
-          // Phase 5: same watchdog decoration as the HTTP
-          // path. Soft policy + watchdog fired ⇒ rewrite the
-          // REQUEST_TIMEOUT error event with
-          // details.kind='watchdog' before persisting, pushing
-          // to the events array, and sending it over the WS.
-          const decoratedEvent = maybeDecorateWatchdogError({
-            event,
-            timeoutDecision: prepared.timeoutDecision,
-            watchdog: prepared.watchdog,
-            events,
-          }) ?? event
-          events.push(decoratedEvent)
-          await options.storage.appendEvent(sessionId, decoratedEvent)
-          recordEventMetrics(decoratedEvent)
-          if (socket.readyState !== socket.OPEN) {
-            abortController.abort()
-            break
-          }
-          sendJson(socket, decoratedEvent)
-          metrics.recordStreamEvent(socket.bufferedAmount)
-          await maybeAppendNearTimeoutWarning({
-            events,
-            sessionId,
-            requestId,
-            timeoutMs: effectiveTimeoutMs,
-            elapsedMs: Math.max(0, Math.round(metrics.now() - startedAtMs)),
-            send: warning => {
-              if (socket.readyState === socket.OPEN) {
-                sendJson(socket, warning)
-                metrics.recordStreamEvent(socket.bufferedAmount)
-              }
-            },
-          })
-          if (decoratedEvent.type === 'result') success = decoratedEvent.success
-          if (decoratedEvent.type === 'error' && decoratedEvent.code === 'REQUEST_TIMEOUT') {
-            timedOut = true
-          }
+          return
         }
-      } finally {
-        clearTimeout(nearTimeoutWatcher)
-        softTimeoutCycle?.cancel()
-        clearTimeout(timeout)
-      }
-      timedOut = timedOut || abortController.signal.aborted
-      let resultEvent = events.findLast(event => event.type === 'result')
-      const errorEvent = events.findLast(event => event.type === 'error')
-      const partialResultEvent = await appendTimeoutPartialResult({
-        storage: options.storage,
-        sessionId,
-        events,
-        resultEvent,
-        errorEvent,
-        send: event => {
-          if (socket.readyState === socket.OPEN) {
-            sendJson(socket, event)
+        const { sessionId, cwd, requestId } = prepared
+        abortController = prepared.abortController
+        registerActiveExecution(sessionId, {
+          requestId,
+          abortController,
+          transport: 'websocket',
+          startedAt: nowIso(),
+        })
+        const timeout = prepared.timeout
+        const events: NexusEvent[] = []
+        const effectiveTimeoutMs = prepared.timeoutDecision.softTimeoutMs
+        const nearTimeoutWatcher = startNearTimeoutWatcher({
+          events,
+          sessionId,
+          requestId,
+          timeoutMs: effectiveTimeoutMs,
+          startedAtMs,
+          send: event => {
+            if (socket.readyState === socket.OPEN) {
+              sendJson(socket, event)
+              metrics.recordStreamEvent(socket.bufferedAmount)
+            }
+          },
+        })
+        // Phase 2: soft watcher fires once at the soft budget and
+        // pushes `timeout_budget_exceeded` over the WS without
+        // aborting. Hard watchdog still owns abort. Only run under
+        // soft policy; legacy fatal callers fall through to the
+        // existing watchdog-driven cutoff.
+        //
+        // Phase 3: same cycle as the HTTP path — after each soft
+        // budget exhaustion the runtime may auto-grant a bounded
+        // number of extensions (announced via
+        // `timeout_extension_granted`). fatal policy keeps
+        // `maxSoftTimeoutExtensions` at 0 in
+        // `resolveExecuteTimeoutDecision`, so legacy WS callers do
+        // not see the new event stream either.
+        const softTimeoutCycle =
+          prepared.timeoutDecision.policy === 'soft'
+            ? scheduleSoftTimeoutCycle({
+                events,
+                sessionId,
+                requestId,
+                softTimeoutMs: effectiveTimeoutMs,
+                startedAtMs,
+                maxExtensions: prepared.timeoutDecision.maxSoftTimeoutExtensions,
+                extensionMs: prepared.timeoutDecision.softTimeoutExtensionMs,
+                send: event => {
+                  if (socket.readyState === socket.OPEN) {
+                    sendJson(socket, event)
+                    metrics.recordStreamEvent(socket.bufferedAmount)
+                  }
+                },
+              })
+            : undefined
+
+        try {
+          for await (const event of options.runtime.executeStream({
+            sessionId,
+            prompt: body.prompt,
+            cwd,
+            signal: abortController.signal,
+            timeoutSignal: prepared.timeoutController.signal,
+            maxToolOutputBytes: body.maxToolOutputBytes ?? maxToolOutputBytes,
+            bashMaxBufferBytes,
+            skipPermissionCheck: body.skipPermissionCheck,
+            requestId,
+            model: body.model,
+            budget: body.budget,
+            executionEnvironment: body.executionEnvironment,
+            remoteRunner: options.remoteRunner,
+            allowedPaths: prepared.allowedPaths,
+            policyMode: prepared.policyMode,
+            ...(prepared.allowedTools && {
+              allowedTools: prepared.allowedTools,
+            }),
+          })) {
+            // Phase 5: same watchdog decoration as the HTTP
+            // path. Soft policy + watchdog fired ⇒ rewrite the
+            // REQUEST_TIMEOUT error event with
+            // details.kind='watchdog' before persisting, pushing
+            // to the events array, and sending it over the WS.
+            const decoratedEvent =
+              maybeDecorateWatchdogError({
+                event,
+                timeoutDecision: prepared.timeoutDecision,
+                watchdog: prepared.watchdog,
+                events,
+              }) ?? event
+            events.push(decoratedEvent)
+            await options.storage.appendEvent(sessionId, decoratedEvent)
+            recordEventMetrics(decoratedEvent)
+            // Feed event to BehaviorMonitor for cross-session detection.
+            options.behaviorMonitor?.ingest(decoratedEvent)
+            // Phase C: emit a `cache_health` event after execution_metrics
+            // when the snapshot is non-ok. Persist + forward over WS so
+            // /v1/sessions/:id/wait consumers can see cache degradation.
+            const cacheHealthEvent = maybeEmitCacheHealthEvent(decoratedEvent, cwd)
+            if (cacheHealthEvent) {
+              events.push(cacheHealthEvent)
+              await options.storage.appendEvent(sessionId, cacheHealthEvent)
+              if (socket.readyState === socket.OPEN) {
+                sendJson(socket, cacheHealthEvent)
+              }
+            }
+            if (socket.readyState !== socket.OPEN) {
+              abortController.abort()
+              break
+            }
+            sendJson(socket, decoratedEvent)
             metrics.recordStreamEvent(socket.bufferedAmount)
+            await maybeAppendNearTimeoutWarning({
+              events,
+              sessionId,
+              requestId,
+              timeoutMs: effectiveTimeoutMs,
+              elapsedMs: Math.max(0, Math.round(metrics.now() - startedAtMs)),
+              send: warning => {
+                if (socket.readyState === socket.OPEN) {
+                  sendJson(socket, warning)
+                  metrics.recordStreamEvent(socket.bufferedAmount)
+                }
+              },
+            })
+            if (decoratedEvent.type === 'result') success = decoratedEvent.success
+            if (decoratedEvent.type === 'error' && decoratedEvent.code === 'REQUEST_TIMEOUT') {
+              timedOut = true
+            }
           }
-        },
-      })
-      if (partialResultEvent) {
-        resultEvent = partialResultEvent
-        success = false
-      }
-      const recoveredFromToolDenial = isRecoverableToolDenialOnlyTurn(events, resultEvent, errorEvent, timedOut)
-      if (recoveredFromToolDenial) success = true
-      await finalizeExecutionSession(options.storage, sessionId, {
-        succeeded: success,
-        resultEvent,
-        errorEvent,
-        contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
-      })
-      const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
-      const summaryEvent = buildExecuteSummaryEvent({
-        sessionId,
-        requestId,
-        timeoutMs: effectiveTimeoutMs,
-        executeDurationMs,
-        outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut, recoveredFromToolDenial),
-      })
-      events.push(summaryEvent)
-      await options.storage.appendEvent(sessionId, summaryEvent)
-      sendJson(socket, summaryEvent)
-      metrics.recordStreamEvent(socket.bufferedAmount)
+        } finally {
+          clearTimeout(nearTimeoutWatcher)
+          softTimeoutCycle?.cancel()
+          clearTimeout(timeout)
+        }
+        timedOut = timedOut || abortController.signal.aborted
+        let resultEvent = events.findLast(event => event.type === 'result')
+        const errorEvent = events.findLast(event => event.type === 'error')
+        const partialResultEvent = await appendTimeoutPartialResult({
+          storage: options.storage,
+          sessionId,
+          events,
+          resultEvent,
+          errorEvent,
+          send: event => {
+            if (socket.readyState === socket.OPEN) {
+              sendJson(socket, event)
+              metrics.recordStreamEvent(socket.bufferedAmount)
+            }
+          },
+        })
+        if (partialResultEvent) {
+          resultEvent = partialResultEvent
+          success = false
+        }
+        const recoveredFromToolDenial = isRecoverableToolDenialOnlyTurn(events, resultEvent, errorEvent, timedOut)
+        if (recoveredFromToolDenial) success = true
+        await finalizeExecutionSession(options.storage, sessionId, {
+          succeeded: success,
+          resultEvent,
+          errorEvent,
+          contextBlockingEvent: events.find(event => event.type === 'context_blocking'),
+        })
+        const executeDurationMs = Math.max(0, Math.round(metrics.now() - startedAtMs))
+        const summaryEvent = buildExecuteSummaryEvent({
+          sessionId,
+          requestId,
+          timeoutMs: effectiveTimeoutMs,
+          executeDurationMs,
+          outcome: executeSummaryOutcome(resultEvent, errorEvent, timedOut, recoveredFromToolDenial),
+        })
+        events.push(summaryEvent)
+        await options.storage.appendEvent(sessionId, summaryEvent)
+        sendJson(socket, summaryEvent)
+        metrics.recordStreamEvent(socket.bufferedAmount)
       } finally {
         socket.off('close', markClosed)
         if (abortController) {
@@ -3236,6 +4201,153 @@ export async function createNexusApp(
     })
   })
 
+  // PR-27: /v1/working-set/observe — WebSocket push for working_set_updated
+  // and working_set_reset events. Per design §7.3 WebSocket + PR-26 event bus.
+  // Pure read: subscribes to a tracker's event bus and fans out to the
+  // client. No state mutation.
+  app.get('/v1/working-set/observe', { websocket: true }, async (socket, request) => {
+    // Use the FastifyRequest for query parsing (the @fastify/websocket
+    // handshake is unreliable across versions).
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = typeof q.cwd === 'string' ? q.cwd : undefined
+    if (!cwd) {
+      sendJson(socket, {
+        type: 'error',
+        code: 'MISSING_CWD',
+        message: 'cwd query param is required',
+      })
+      socket.close(1008, 'missing cwd')
+      return
+    }
+    const sessionId = typeof q.sessionId === 'string' ? q.sessionId : undefined
+
+    // Use the shared broadcaster if provided (lets REST + WS share the
+    // same tracker instance, so REST mutations flow into WS events).
+    // Otherwise create a per-connection broadcaster as a fallback.
+    const broadcaster = options.workingSetBroadcaster ?? appBroadcaster
+    const entry = broadcaster.getOrCreateTracker(cwd)
+    try {
+      await entry.loadPromise
+    } catch (err) {
+      sendJson(socket, {
+        type: 'error',
+        code: 'LOAD_FAILED',
+        message: err instanceof Error ? err.message : String(err),
+      })
+      socket.close(1011, 'load failed')
+      return
+    }
+
+    // Initial snapshot (per design §7.3: 'on connect, send latest state').
+    const initialState: Array<{ sessionId: string; ws: unknown }> = []
+    for (const [sid, ws] of entry.tracker.entries()) {
+      if (sessionId && sid !== sessionId) continue
+      initialState.push({ sessionId: sid, ws })
+    }
+    sendJson(socket, {
+      type: 'working_set_snapshot',
+      cwd,
+      filter: { sessionId: sessionId ?? null },
+      sessions: initialState,
+    })
+
+    // Subscribe to events. Filter by sessionId if requested.
+    const handler = (event: WorkingSetEvent) => {
+      if (sessionId && event.sessionId !== sessionId) return
+      if (event.type === 'working_set_updated') {
+        sendJson(socket, {
+          type: 'working_set_updated',
+          sessionId: event.sessionId,
+          workspaceId: event.workspaceId,
+          ws: event.ws,
+          timestamp: event.timestamp,
+        })
+      } else if (event.type === 'working_set_reset') {
+        sendJson(socket, {
+          type: 'working_set_reset',
+          sessionId: event.sessionId,
+          workspaceId: event.workspaceId,
+          timestamp: event.timestamp,
+        })
+      }
+    }
+    const unsubscribe = entry.tracker.subscribe(handler)
+
+    const cleanup = () => {
+      try {
+        unsubscribe()
+      } catch {
+        /* ignore */
+      }
+    }
+    socket.once('close', cleanup)
+    socket.once('error', cleanup)
+  })
+
+  // PR-A2: /v1/context/observe — WebSocket push for assembled context
+  // events emitted by the runtime's hot path. Per design §7.3
+  // WebSocket + PR-A2 event bus. Sends an initial `assembled_snapshot`
+  // frame on connect (from the broadcaster's lastBySessionId cache),
+  // then live `assembled` events. Pure read: subscribes to the
+  // broadcaster and fans out to the client. No state mutation.
+  app.get('/v1/context/observe', { websocket: true }, async (socket, request) => {
+    const q = (request.query ?? {}) as Record<string, string | undefined>
+    const cwd = typeof q.cwd === 'string' ? q.cwd : undefined
+    if (!cwd) {
+      sendJson(socket, {
+        type: 'error',
+        code: 'MISSING_CWD',
+        message: 'cwd query param is required',
+      })
+      socket.close(1008, 'missing cwd')
+      return
+    }
+    const sessionId = typeof q.sessionId === 'string' ? q.sessionId : undefined
+
+    // PR-A2: the WS route always reads from the module-level singleton
+    // (which the createNexusApp call above may have replaced with the
+    // caller's `options.contextBroadcaster`). The runtime hot path also
+    // publishes to this singleton, so by default both sides share the
+    // same instance — no extra wiring required.
+    const broadcaster = defaultContextBroadcaster
+
+    // Initial snapshot (per design §7.3: 'on connect, send latest state').
+    // When sessionId is set, the snapshot is just that session's last
+    // context; otherwise the snapshot's `context` field is null (no
+    // global "all sessions" view — the cache is per-sessionId).
+    const last = sessionId ? broadcaster.getLast(cwd, sessionId) : undefined
+    sendJson(socket, {
+      type: 'assembled_snapshot',
+      cwd,
+      filter: { sessionId: sessionId ?? null },
+      context: last ?? null,
+    })
+
+    // Subscribe to events. Filter by sessionId if requested.
+    const handler = (event: { type: string; sessionId: string; context: unknown; timestamp: string }) => {
+      if (event.type !== 'assembled') return
+      if (sessionId && event.sessionId !== sessionId) return
+      sendJson(socket, {
+        type: 'assembled',
+        cwd,
+        sessionId: event.sessionId,
+        context: event.context,
+        timestamp: event.timestamp,
+      })
+    }
+    const unsubscribe = broadcaster.subscribe(cwd, handler)
+
+    const cleanup = () => {
+      try {
+        unsubscribe()
+      } catch {
+        /* ignore */
+      }
+    }
+    socket.once('close', cleanup)
+    socket.once('error', cleanup)
+  })
+
   return app
 }
 
@@ -3251,6 +4363,38 @@ function sendJson(socket: WebSocketLike, value: unknown): void {
   if (socket.readyState === socket.OPEN) {
     socket.send(JSON.stringify(value))
   }
+}
+
+// PR-27: parse WebSocket query string. Robust to either @fastify/websocket
+// shape (handshake.query object) or raw URL on `socket.url`.
+function parseSocketQuery(socket: { url?: string; handshake?: { query?: Record<string, unknown> } }): Record<string, string | undefined> {
+  const handshakeQuery = socket.handshake?.query
+  if (handshakeQuery && typeof handshakeQuery === 'object') {
+    const out: Record<string, string | undefined> = {}
+    for (const [k, v] of Object.entries(handshakeQuery)) {
+      if (typeof v === 'string') out[k] = v
+      else if (Array.isArray(v) && typeof v[0] === 'string') out[k] = v[0]
+    }
+    return out
+  }
+  const url = socket.url
+  if (typeof url !== 'string') return {}
+  const qIdx = url.indexOf('?')
+  if (qIdx < 0) return {}
+  const out: Record<string, string | undefined> = {}
+  const search = url.slice(qIdx + 1)
+  for (const pair of search.split('&')) {
+    if (!pair) continue
+    const eq = pair.indexOf('=')
+    if (eq < 0) {
+      out[decodeURIComponent(pair)] = ''
+    } else {
+      const key = decodeURIComponent(pair.slice(0, eq))
+      const val = decodeURIComponent(pair.slice(eq + 1))
+      out[key] = val
+    }
+  }
+  return out
 }
 
 async function findAgentJob(scheduler: AgentScheduler, jobId: string): Promise<AgentJob | undefined> {
@@ -3270,7 +4414,11 @@ function sendAgentError(reply: FastifyReply, error: AgentJobRegistryError): unkn
   })
 }
 
-function createAgentJobNotFoundPayload(jobId: string): { type: 'error'; code: string; message: string } {
+function createAgentJobNotFoundPayload(jobId: string): {
+  type: 'error'
+  code: string
+  message: string
+} {
   return {
     type: 'error',
     code: 'AGENT_JOB_NOT_FOUND',
@@ -3278,7 +4426,11 @@ function createAgentJobNotFoundPayload(jobId: string): { type: 'error'; code: st
   }
 }
 
-function createSessionChannelNotFoundPayload(channelId: string): { type: 'error'; code: string; message: string } {
+function createSessionChannelNotFoundPayload(channelId: string): {
+  type: 'error'
+  code: string
+  message: string
+} {
   return {
     type: 'error',
     code: 'SESSION_CHANNEL_NOT_FOUND',
@@ -3286,7 +4438,11 @@ function createSessionChannelNotFoundPayload(channelId: string): { type: 'error'
   }
 }
 
-function createSessionMessageNotFoundPayload(messageId: string): { type: 'error'; code: string; message: string } {
+function createSessionMessageNotFoundPayload(messageId: string): {
+  type: 'error'
+  code: string
+  message: string
+} {
   return {
     type: 'error',
     code: 'SESSION_MESSAGE_NOT_FOUND',
@@ -3314,10 +4470,7 @@ function withMemoryCandidateGovernance(channel: SessionChannel, message: Session
   }
 }
 
-function validateSessionChannelMessage(
-  channel: SessionChannel,
-  body: z.infer<typeof createSessionMessageSchema>,
-): { type: 'error'; code: string; message: string } | undefined {
+function validateSessionChannelMessage(channel: SessionChannel, body: z.infer<typeof createSessionMessageSchema>): { type: 'error'; code: string; message: string } | undefined {
   if (channel.status !== 'open') {
     return {
       type: 'error',
@@ -3385,11 +4538,7 @@ function validateSessionChannelMessage(
   return undefined
 }
 
-function isSessionMessageRecipient(
-  message: SessionMessage,
-  sessionId: string,
-  channel: SessionChannel | null,
-): boolean {
+function isSessionMessageRecipient(message: SessionMessage, sessionId: string, channel: SessionChannel | null): boolean {
   if (!channel || !channel.participantSessionIds.includes(sessionId)) return false
   if (message.fromSessionId === sessionId) return false
   if (message.toSessionId) return message.toSessionId === sessionId
@@ -3398,11 +4547,7 @@ function isSessionMessageRecipient(
 
 function readContextForkMetadata(metadata: Record<string, unknown> | undefined): { mode: string; inheritedItems: number; omittedItems: number } | undefined {
   const contextFork = asRecord(metadata?.contextFork)
-  const mode = typeof metadata?.contextForkMode === 'string'
-    ? metadata.contextForkMode
-    : typeof contextFork?.mode === 'string'
-      ? contextFork.mode
-      : undefined
+  const mode = typeof metadata?.contextForkMode === 'string' ? metadata.contextForkMode : typeof contextFork?.mode === 'string' ? contextFork.mode : undefined
   if (!mode) return undefined
   const inheritedItems = typeof contextFork?.inheritedItems === 'number' ? contextFork.inheritedItems : 0
   const omittedItems = typeof contextFork?.omittedItems === 'number' ? contextFork.omittedItems : 0
@@ -3416,11 +4561,7 @@ type ExecutionFinalizationOptions = {
   contextBlockingEvent?: NexusEvent
 }
 
-async function finalizeExecutionSession(
-  storage: NexusStorage,
-  sessionId: string,
-  finalization: ExecutionFinalizationOptions,
-): Promise<void> {
+async function finalizeExecutionSession(storage: NexusStorage, sessionId: string, finalization: ExecutionFinalizationOptions): Promise<void> {
   const session = await storage.getSession(sessionId, { includeEvents: false })
   if (!session) return
 
@@ -3442,10 +4583,7 @@ async function finalizeExecutionSession(
     session.error = finalization.errorEvent.message
     session.failureReason = finalization.errorEvent.message
     session.terminalReason = runtimeTerminalReason(finalization.errorEvent)
-    session.metadata = withRuntimeRecoveryMetadata(
-      session.metadata,
-      runtimeRecoveryMetadata(finalization.errorEvent, finalization.contextBlockingEvent),
-    )
+    session.metadata = withRuntimeRecoveryMetadata(session.metadata, runtimeRecoveryMetadata(finalization.errorEvent, finalization.contextBlockingEvent))
   } else {
     session.metadata = withRuntimeRecoveryMetadata(session.metadata)
   }
@@ -3472,11 +4610,8 @@ function runtimeTerminalCategoryForCode(code: string): TaskSessionTerminalReason
 const EXECUTE_TIMEOUT_NEAR_RATIO = 0.8
 
 function hasPartialTimeoutEvidence(events: readonly NexusEvent[]): boolean {
-  return events.some(event =>
-    (event.type === 'assistant_delta' && event.text.trim().length > 0) ||
-    event.type === 'tool_completed' ||
-    event.type === 'tool_denied' ||
-    event.type === 'permission_response',
+  return events.some(
+    event => (event.type === 'assistant_delta' && event.text.trim().length > 0) || event.type === 'tool_completed' || event.type === 'tool_denied' || event.type === 'permission_response',
   )
 }
 
@@ -3513,9 +4648,7 @@ function buildNearTimeoutWarningEvent(options: {
   elapsedMs: number
   partialSummary?: string
 }): Extract<NexusEvent, { type: 'near_timeout_warning' }> {
-  const message = options.partialSummary
-    ? 'Execution is near its timeout budget; preserve a concise partial answer now.'
-    : 'Execution is near its timeout budget; wrap up as soon as possible.'
+  const message = options.partialSummary ? 'Execution is near its timeout budget; preserve a concise partial answer now.' : 'Execution is near its timeout budget; wrap up as soon as possible.'
   return {
     type: 'near_timeout_warning',
     ...eventBase(options.sessionId),
@@ -3523,7 +4656,9 @@ function buildNearTimeoutWarningEvent(options: {
     timeoutMs: options.timeoutMs,
     elapsedMs: options.elapsedMs,
     thresholdRatio: EXECUTE_TIMEOUT_NEAR_RATIO,
-    ...(options.partialSummary !== undefined && { partialSummary: options.partialSummary }),
+    ...(options.partialSummary !== undefined && {
+      partialSummary: options.partialSummary,
+    }),
     message,
   }
 }
@@ -3555,7 +4690,9 @@ function buildTimeoutBudgetExceededEvent(options: {
     timeoutMs: options.timeoutMs,
     elapsedMs: options.elapsedMs,
     policy: 'soft',
-    ...(options.partialSummary !== undefined && { partialSummary: options.partialSummary }),
+    ...(options.partialSummary !== undefined && {
+      partialSummary: options.partialSummary,
+    }),
     suggestedActions: ['continue', 'summarize', 'narrow_scope', 'retry_last_tool'],
     message,
   }
@@ -3576,14 +4713,12 @@ function buildTimeoutExtensionGrantedEvent(options: {
   totalSoftBudgetMs: number
   elapsedMs: number
 }): Extract<NexusEvent, { type: 'timeout_extension_granted' }> {
-  const reason: 'auto-first-budget-exhausted' | 'auto-followup-budget-exhausted' =
-    options.extensionCount === 1
-      ? 'auto-first-budget-exhausted'
-      : 'auto-followup-budget-exhausted'
+  const reason: 'auto-first-budget-exhausted' | 'auto-followup-budget-exhausted' = options.extensionCount === 1 ? 'auto-first-budget-exhausted' : 'auto-followup-budget-exhausted'
   const remaining = Math.max(0, options.maxExtensions - options.extensionCount)
-  const message = remaining > 0
-    ? `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; ${remaining} remaining). Pick a deliberate next step.`
-    : `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; this is the last automatic extension). Wrap up or request user confirmation before the watchdog fires.`
+  const message =
+    remaining > 0
+      ? `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; ${remaining} remaining). Pick a deliberate next step.`
+      : `Soft timeout extended by ${options.additionalMs}ms (extension ${options.extensionCount}/${options.maxExtensions}; this is the last automatic extension). Wrap up or request user confirmation before the watchdog fires.`
   return {
     type: 'timeout_extension_granted',
     ...eventBase(options.sessionId),
@@ -3614,9 +4749,7 @@ async function appendTimeoutPartialResult(options: {
   send?: (event: NexusEvent) => void
 }): Promise<Extract<NexusEvent, { type: 'result' }> | undefined> {
   if (options.errorEvent?.type !== 'error' || options.errorEvent.code !== 'REQUEST_TIMEOUT') return undefined
-  const baseMessage = options.resultEvent?.type === 'result'
-    ? options.resultEvent.message
-    : options.errorEvent.message
+  const baseMessage = options.resultEvent?.type === 'result' ? options.resultEvent.message : options.errorEvent.message
   const message = buildTimeoutPartialResultMessage(baseMessage, options.events)
   if (message === baseMessage) return undefined
   const partialResult: Extract<NexusEvent, { type: 'result' }> = {
@@ -3651,17 +4784,10 @@ function executeSummaryOutcome(
   return 'error'
 }
 
-function isRecoverableToolDenialOnlyTurn(
-  events: readonly NexusEvent[],
-  resultEvent: NexusEvent | undefined,
-  errorEvent: NexusEvent | undefined,
-  timedOutByAbort: boolean,
-): boolean {
+function isRecoverableToolDenialOnlyTurn(events: readonly NexusEvent[], resultEvent: NexusEvent | undefined, errorEvent: NexusEvent | undefined, timedOutByAbort: boolean): boolean {
   if (timedOutByAbort || errorEvent?.type === 'error') return false
   if (resultEvent?.type !== 'result' || resultEvent.success) return false
-  const denials = events.filter((event): event is Extract<NexusEvent, { type: 'tool_denied' }> =>
-    event.type === 'tool_denied',
-  )
+  const denials = events.filter((event): event is Extract<NexusEvent, { type: 'tool_denied' }> => event.type === 'tool_denied')
   if (denials.length === 0) return false
   return denials.every(event => event.recoverable === true && event.terminal !== true)
 }
@@ -3686,10 +4812,7 @@ function buildExecuteSummaryEvent(options: ExecuteSummaryOptions): Extract<Nexus
   }
 }
 
-function runtimeRecoveryMetadata(
-  errorEvent: Extract<NexusEvent, { type: 'error' }>,
-  contextBlockingEvent?: NexusEvent,
-): Record<string, unknown> | undefined {
+function runtimeRecoveryMetadata(errorEvent: Extract<NexusEvent, { type: 'error' }>, contextBlockingEvent?: NexusEvent): Record<string, unknown> | undefined {
   if (errorEvent.code !== 'CONTEXT_LIMIT_EXCEEDED') return undefined
   const details = asRecord(errorEvent.details)
   const blocking = contextBlockingEvent?.type === 'context_blocking' ? contextBlockingEvent : undefined
@@ -3703,16 +4826,11 @@ function runtimeRecoveryMetadata(
     maxTokens: blocking?.maxTokens ?? numberValue(details?.maxTokens),
     blockingLimitTokens: blocking?.blockingLimitTokens ?? numberValue(details?.blockingLimitTokens),
     recoveryActions: recoveryActionsValue(blocking?.recoveryActions ?? details?.recoveryActions),
-    suggestion: typeof details?.suggestion === 'string'
-      ? details.suggestion
-      : 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
+    suggestion: typeof details?.suggestion === 'string' ? details.suggestion : 'Run /compact or /context, switch to a larger context model, or reduce tool output before retrying.',
   }
 }
 
-function withRuntimeRecoveryMetadata(
-  metadata: Record<string, unknown> | undefined,
-  runtimeRecovery?: Record<string, unknown>,
-): Record<string, unknown> | undefined {
+function withRuntimeRecoveryMetadata(metadata: Record<string, unknown> | undefined, runtimeRecovery?: Record<string, unknown>): Record<string, unknown> | undefined {
   const next = { ...(metadata ?? {}) }
   delete next.runtimeRecovery
   if (runtimeRecovery) next.runtimeRecovery = runtimeRecovery
@@ -3720,7 +4838,7 @@ function withRuntimeRecoveryMetadata(
 }
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return typeof value === 'object' && value !== null ? value as Record<string, unknown> : undefined
+  return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : undefined
 }
 
 function numberValue(value: unknown): number | undefined {
@@ -3729,9 +4847,7 @@ function numberValue(value: unknown): number | undefined {
 
 function recoveryActionsValue(value: unknown): string[] {
   const allowed = new Set(['compact', 'context', 'switch_model', 'reduce_tool_output'])
-  const actions = Array.isArray(value)
-    ? value.filter((action): action is string => typeof action === 'string' && allowed.has(action))
-    : []
+  const actions = Array.isArray(value) ? value.filter((action): action is string => typeof action === 'string' && allowed.has(action)) : []
   return actions.length > 0 ? actions : ['compact', 'context', 'switch_model', 'reduce_tool_output']
 }
 
@@ -3769,13 +4885,13 @@ async function mutateTaskAction(
   storage: NexusStorage,
   rawParams: unknown,
   rawBody: unknown,
-  reply: { code: (statusCode: number) => { send: (payload: unknown) => unknown } },
+  reply: {
+    code: (statusCode: number) => { send: (payload: unknown) => unknown }
+  },
   eventType: string,
   apply: (task: NexusTask, body: TaskActionBody) => NexusTask | Promise<NexusTask>,
 ): Promise<unknown> {
-  const params = z
-    .object({ sessionId: z.string(), taskId: z.string() })
-    .parse(rawParams)
+  const params = z.object({ sessionId: z.string(), taskId: z.string() }).parse(rawParams)
   const body = taskActionSchema.parse(rawBody ?? {})
   const task = await storage.getTask(params.taskId)
   if (!task || task.sessionId !== params.sessionId) {
@@ -3808,25 +4924,14 @@ async function mutateTaskAction(
   return { type: eventType, task: updated }
 }
 
-async function applySubAgentRerunAction(
-  storage: NexusStorage,
-  session: SessionSnapshot,
-  task: NexusTask,
-  body: SubAgentRerunBody,
-): Promise<NexusTask> {
+async function applySubAgentRerunAction(storage: NexusStorage, session: SessionSnapshot, task: NexusTask, body: SubAgentRerunBody): Promise<NexusTask> {
   const subAgent = getFailedSubAgentMetadata(task)
   if (!subAgent) {
     throw createTaskMutationHttpError(409, 'SUBAGENT_RERUN_NOT_AVAILABLE', `Task ${task.taskId} does not reference a failed sub-agent.`, task)
   }
 
-  const previousSubAgents = Array.isArray(task.metadata?.previousSubAgents)
-    ? [...task.metadata.previousSubAgents]
-    : []
-  const blockedTasksRestored = await restoreTasksFailedByDependency(
-    storage,
-    task.sessionId,
-    task.taskId,
-  )
+  const previousSubAgents = Array.isArray(task.metadata?.previousSubAgents) ? [...task.metadata.previousSubAgents] : []
+  const blockedTasksRestored = await restoreTasksFailedByDependency(storage, task.sessionId, task.taskId)
   const rerunRequest = {
     requestedAt: nowIso(),
     requestedBy: body.actor ?? 'external',
@@ -3876,12 +4981,7 @@ function getFailedSubAgentMetadata(task: NexusTask): SubAgentReferenceMetadata |
   return typed
 }
 
-async function applyWorktreeRecoveryAction(
-  storage: NexusStorage,
-  session: SessionSnapshot,
-  task: NexusTask,
-  body: WorktreeRecoveryActionBody,
-): Promise<NexusTask> {
+async function applyWorktreeRecoveryAction(storage: NexusStorage, session: SessionSnapshot, task: NexusTask, body: WorktreeRecoveryActionBody): Promise<NexusTask> {
   const recovery = getWorktreeRecoveryMetadata(task)
   if (!recovery) {
     throw createTaskMutationHttpError(409, 'WORKTREE_RECOVERY_NOT_AVAILABLE', `Task ${task.taskId} does not have pending worktree recovery metadata.`, task)
@@ -3889,11 +4989,7 @@ async function applyWorktreeRecoveryAction(
 
   const nextRecovery = {
     ...recovery,
-    status: body.action === 'continue'
-      ? 'retry_requested'
-      : body.action === 'abandon'
-        ? 'abandoned'
-        : 'kept',
+    status: body.action === 'continue' ? 'retry_requested' : body.action === 'abandon' ? 'abandoned' : 'kept',
     selectedAction: body.action,
     selectedAt: nowIso(),
     selectedBy: body.actor ?? 'external',
@@ -3911,9 +5007,7 @@ async function applyWorktreeRecoveryAction(
     ownerAgentId: body.action === 'continue' ? undefined : task.ownerAgentId,
     retryCount: body.action === 'continue' ? task.retryCount + 1 : task.retryCount,
     result: body.action === 'continue' ? undefined : task.result,
-    review: body.action === 'continue'
-      ? task.review?.status === 'pending' ? task.review : undefined
-      : task.review,
+    review: body.action === 'continue' ? (task.review?.status === 'pending' ? task.review : undefined) : task.review,
     metadata: {
       ...(task.metadata ?? {}),
       worktreeRecovery: nextRecovery,
@@ -3942,11 +5036,7 @@ function getWorktreeRecoveryMetadata(task: NexusTask): WorktreeRecoveryMetadata 
   return typed
 }
 
-function assertRecoverableWorktreePath(
-  session: SessionSnapshot,
-  task: NexusTask,
-  recovery: WorktreeRecoveryMetadata,
-): { cwd: string; worktreePath: string } {
+function assertRecoverableWorktreePath(session: SessionSnapshot, task: NexusTask, recovery: WorktreeRecoveryMetadata): { cwd: string; worktreePath: string } {
   const cwd = recovery.cwd
   const worktreePath = recovery.preservedWorktreePath ?? recovery.worktreePath
   if (!cwd || !worktreePath) {
@@ -3990,7 +5080,11 @@ function isTerminalSessionPhase(phase: SessionSnapshot['phase']): boolean {
   return TERMINAL_SESSION_PHASES.has(phase)
 }
 
-function createSessionNotFoundPayload(sessionId: string): { type: 'error'; code: string; message: string } {
+function createSessionNotFoundPayload(sessionId: string): {
+  type: 'error'
+  code: string
+  message: string
+} {
   return {
     type: 'error',
     code: 'SESSION_NOT_FOUND',
@@ -3998,7 +5092,12 @@ function createSessionNotFoundPayload(sessionId: string): { type: 'error'; code:
   }
 }
 
-function createSessionNotMutablePayload(session: SessionSnapshot): { type: 'error'; code: string; message: string; session: SessionSnapshot } {
+function createSessionNotMutablePayload(session: SessionSnapshot): {
+  type: 'error'
+  code: string
+  message: string
+  session: SessionSnapshot
+} {
   return {
     type: 'error',
     code: 'SESSION_NOT_MUTABLE',
@@ -4025,10 +5124,7 @@ function createTaskMutationHttpError(statusCode: number, code: string, message: 
 }
 
 function isTaskMutationHttpError(error: unknown): error is TaskMutationHttpError {
-  return typeof error === 'object'
-    && error !== null
-    && 'statusCode' in error
-    && 'payload' in error
+  return typeof error === 'object' && error !== null && 'statusCode' in error && 'payload' in error
 }
 
 function attachMutationRequestId(metadata: Record<string, unknown> | undefined, requestId: string | undefined): Record<string, unknown> | undefined {
@@ -4055,14 +5151,11 @@ async function findTaskByMutationRequestId(storage: NexusStorage, sessionId: str
 
 const TERMINAL_SESSION_PHASES = new Set(['completed', 'failed', 'cancelled'])
 
-async function cancelChildSessionsForTask(
-  storage: NexusStorage,
-  sessionId: string,
-  taskId: string,
-  reason: string,
-): Promise<string[]> {
+async function cancelChildSessionsForTask(storage: NexusStorage, sessionId: string, taskId: string, reason: string): Promise<string[]> {
   const cancelled: string[] = []
-  for (const child of await storage.listChildSessions(sessionId, { limit: 200 })) {
+  for (const child of await storage.listChildSessions(sessionId, {
+    limit: 200,
+  })) {
     if (TERMINAL_SESSION_PHASES.has(child.phase)) continue
     if (!isChildSessionForTask(child, taskId)) continue
     child.phase = 'cancelled'
@@ -4088,12 +5181,7 @@ function isChildSessionForTask(child: { currentTaskId?: string; metadata?: Recor
   return child.currentTaskId === taskId || child.metadata?.parentTaskId === taskId || child.metadata?.taskId === taskId
 }
 
-async function failBlockedTasksForDependency(
-  storage: NexusStorage,
-  sessionId: string,
-  taskId: string,
-  reason: string,
-): Promise<string[]> {
+async function failBlockedTasksForDependency(storage: NexusStorage, sessionId: string, taskId: string, reason: string): Promise<string[]> {
   const failed: string[] = []
   for (const task of await storage.listTasks(sessionId)) {
     if (task.taskId === taskId) continue
@@ -4116,11 +5204,7 @@ async function failBlockedTasksForDependency(
   return failed
 }
 
-async function propagateFailedDependency(
-  storage: NexusStorage,
-  sessionId: string,
-  failedTask: NexusTask,
-): Promise<string[]> {
+async function propagateFailedDependency(storage: NexusStorage, sessionId: string, failedTask: NexusTask): Promise<string[]> {
   const failed: string[] = []
   let changed = true
   while (changed) {
@@ -4133,9 +5217,7 @@ async function propagateFailedDependency(
       const updated: NexusTask = {
         ...task,
         status: 'failed',
-        result: failedDependencies
-          .map(dep => dep.result || `Dependency ${dep.taskId} failed`)
-          .join('\n') || 'Dependency failed',
+        result: failedDependencies.map(dep => dep.result || `Dependency ${dep.taskId} failed`).join('\n') || 'Dependency failed',
         metadata: {
           ...(task.metadata ?? {}),
           failedDependencies: failedDependencies.map(dep => ({
@@ -4168,11 +5250,7 @@ async function getFailedDependencies(storage: NexusStorage, task: NexusTask, cur
   return failed
 }
 
-async function restoreTasksFailedByDependency(
-  storage: NexusStorage,
-  sessionId: string,
-  dependencyTaskId: string,
-): Promise<string[]> {
+async function restoreTasksFailedByDependency(storage: NexusStorage, sessionId: string, dependencyTaskId: string): Promise<string[]> {
   const restored: string[] = []
   for (const task of await storage.listTasks(sessionId)) {
     if (task.taskId === dependencyTaskId) continue
@@ -4203,19 +5281,10 @@ function isDependencyFailureTarget(task: NexusTask): boolean {
 function hasFailedDependencyMetadata(task: NexusTask, dependencyTaskId: string): boolean {
   if (task.metadata?.failedDependencyTaskId === dependencyTaskId) return true
   const failedDependencies = task.metadata?.failedDependencies
-  return Array.isArray(failedDependencies) && failedDependencies.some(dep =>
-    typeof dep === 'object' && dep !== null && (dep as { taskId?: unknown }).taskId === dependencyTaskId,
-  )
+  return Array.isArray(failedDependencies) && failedDependencies.some(dep => typeof dep === 'object' && dep !== null && (dep as { taskId?: unknown }).taskId === dependencyTaskId)
 }
 
-async function appendTaskMutationAudit(
-  storage: NexusStorage,
-  sessionId: string,
-  eventType: string,
-  previous: NexusTask | undefined,
-  next: NexusTask,
-  audit: TaskMutationAudit,
-): Promise<void> {
+async function appendTaskMutationAudit(storage: NexusStorage, sessionId: string, eventType: string, previous: NexusTask | undefined, next: NexusTask, audit: TaskMutationAudit): Promise<void> {
   await storage.appendEvent(sessionId, {
     type: 'task_session_event',
     schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
@@ -4276,7 +5345,15 @@ type ProviderInvocationMetrics = {
   }
   byFailureKind: Record<string, number>
   byErrorCode: Record<string, number>
-  byRole: Record<string, { count: number; successCount: number; failureCount: number; avgDurationMs: number }>
+  byRole: Record<
+    string,
+    {
+      count: number
+      successCount: number
+      failureCount: number
+      avgDurationMs: number
+    }
+  >
 }
 
 type AgentLoopMetrics = {
@@ -4295,14 +5372,17 @@ type AgentLoopMetrics = {
     count: number
     avgMs: number
   }
-  byRole: Record<string, {
-    count: number
-    successCount: number
-    failureCount: number
-    inputTokens: number
-    outputTokens: number
-    avgDurationMs: number
-  }>
+  byRole: Record<
+    string,
+    {
+      count: number
+      successCount: number
+      failureCount: number
+      inputTokens: number
+      outputTokens: number
+      avgDurationMs: number
+    }
+  >
   byFailureType: Record<string, number>
 }
 
@@ -4311,26 +5391,43 @@ type AgentJobMetrics = {
   completedCount: number
   failedCount: number
   cancelledCount: number
-  byAgentType: Record<string, { count: number; completedCount: number; failedCount: number; cancelledCount: number }>
+  byAgentType: Record<
+    string,
+    {
+      count: number
+      completedCount: number
+      failedCount: number
+      cancelledCount: number
+    }
+  >
   byFailureCode: Record<string, number>
 }
 
 async function buildRuntimeMetricsSnapshot(
   metrics: NexusMetrics,
   storage: NexusStorage,
-): Promise<RuntimeMetricsSnapshot & {
-  providerInvocations: ProviderInvocationMetrics
-  agentLoop: AgentLoopMetrics
-  agentJobs: AgentJobMetrics
-}> {
+): Promise<
+  RuntimeMetricsSnapshot & {
+    providerInvocations: ProviderInvocationMetrics
+    agentLoop: AgentLoopMetrics
+    agentJobs: AgentJobMetrics
+    cacheHealth: ReturnType<typeof buildCacheHealthFromRuntimeMetrics>
+  }
+> {
   const snapshot = metrics.snapshot()
-  const recentSessions = await storage.listSessions({ limit: 100, includeEvents: false })
+  const recentSessions = await storage.listSessions({
+    limit: 100,
+    includeEvents: false,
+  })
   const providerInvocations = createProviderInvocationMetrics()
   const agentLoop = createAgentLoopMetrics()
   const agentJobs = createAgentJobMetrics()
 
   for (const session of recentSessions) {
-    const page = await storage.listEvents(session.sessionId, { limit: 500, order: 'asc' })
+    const page = await storage.listEvents(session.sessionId, {
+      limit: 500,
+      order: 'asc',
+    })
     const sawTaskSessionEvent = page.events.some(event => event.type === 'task_session_event')
     if (sawTaskSessionEvent) agentLoop.sessionsObserved += 1
     for (const event of page.events) {
@@ -4342,11 +5439,20 @@ async function buildRuntimeMetricsSnapshot(
 
   finalizeProviderInvocationMetrics(providerInvocations)
   finalizeAgentLoopMetrics(agentLoop)
+  // Phase A of `cache-observability-and-nexus-realtime-detection-plan.md`:
+  // attach a process-level CacheHealthSnapshot to the runtime metrics
+  // response. Pure function, no I/O. The prompt dimension reads from
+  // the NexusMetrics tokenUsage accumulator; code_index / tool /
+  // reasoning stay `unavailable` until real hit/miss sources exist.
+  const cacheHealth = buildCacheHealthFromRuntimeMetrics({
+    tokenUsage: snapshot.tokenUsage,
+  })
   return {
     ...snapshot,
     providerInvocations,
     agentLoop,
     agentJobs,
+    cacheHealth,
   }
 }
 
@@ -4384,7 +5490,12 @@ function recordProviderInvocationMetrics(metrics: ProviderInvocationMetrics, eve
   if (failureKind) metrics.byFailureKind[failureKind] = (metrics.byFailureKind[failureKind] ?? 0) + 1
   const errorCode = typeof invocation.errorCode === 'string' ? invocation.errorCode : undefined
   if (errorCode) metrics.byErrorCode[errorCode] = (metrics.byErrorCode[errorCode] ?? 0) + 1
-  const roleMetrics = metrics.byRole[role] ?? { count: 0, successCount: 0, failureCount: 0, avgDurationMs: 0 }
+  const roleMetrics = metrics.byRole[role] ?? {
+    count: 0,
+    successCount: 0,
+    failureCount: 0,
+    avgDurationMs: 0,
+  }
   roleMetrics.count += 1
   if (success) roleMetrics.successCount += 1
   else roleMetrics.failureCount += 1
@@ -4396,9 +5507,7 @@ function recordProviderInvocationMetrics(metrics: ProviderInvocationMetrics, eve
 }
 
 function finalizeProviderInvocationMetrics(metrics: ProviderInvocationMetrics): void {
-  metrics.durationMs.avgMs = metrics.durationMs.count > 0
-    ? round(metrics.durationMs.totalMs / metrics.durationMs.count)
-    : 0
+  metrics.durationMs.avgMs = metrics.durationMs.count > 0 ? round(metrics.durationMs.totalMs / metrics.durationMs.count) : 0
 }
 
 function createAgentLoopMetrics(): AgentLoopMetrics {
@@ -4480,9 +5589,7 @@ function recordAgentLoopRoleStepMetrics(metrics: AgentLoopMetrics, payloadValue:
 }
 
 function finalizeAgentLoopMetrics(metrics: AgentLoopMetrics): void {
-  metrics.roleDurationMs.avgMs = metrics.roleDurationMs.count > 0
-    ? round(metrics.roleDurationMs.totalMs / metrics.roleDurationMs.count)
-    : 0
+  metrics.roleDurationMs.avgMs = metrics.roleDurationMs.count > 0 ? round(metrics.roleDurationMs.totalMs / metrics.roleDurationMs.count) : 0
 }
 
 function createAgentJobMetrics(): AgentJobMetrics {
@@ -4501,7 +5608,12 @@ function recordAgentJobMetrics(metrics: AgentJobMetrics, event: NexusEvent): voi
   if (event.eventType !== 'agent_job_completed' && event.eventType !== 'agent_job_failed' && event.eventType !== 'agent_job_cancelled') return
   metrics.count += 1
   const agentType = event.agentType
-  const agentTypeMetrics = metrics.byAgentType[agentType] ?? { count: 0, completedCount: 0, failedCount: 0, cancelledCount: 0 }
+  const agentTypeMetrics = metrics.byAgentType[agentType] ?? {
+    count: 0,
+    completedCount: 0,
+    failedCount: 0,
+    cancelledCount: 0,
+  }
   agentTypeMetrics.count += 1
   if (event.eventType === 'agent_job_completed') {
     metrics.completedCount += 1
@@ -4523,11 +5635,7 @@ function incrementCount(target: Record<string, number>, key: string): void {
   target[key] = (target[key] ?? 0) + 1
 }
 
-function createSessionSnapshot(
-  sessionId: string,
-  cwd: string,
-  prompt: string,
-): SessionSnapshot {
+function createSessionSnapshot(sessionId: string, cwd: string, prompt: string): SessionSnapshot {
   const timestamp = nowIso()
   return {
     sessionId,
@@ -4540,12 +5648,7 @@ function createSessionSnapshot(
   }
 }
 
-function resolveRequestCwd(options: {
-  prompt: string
-  requestedCwd?: string
-  sessionCwd?: string
-  defaultCwd: string
-}): string {
+function resolveRequestCwd(options: { prompt: string; requestedCwd?: string; sessionCwd?: string; defaultCwd: string }): string {
   const explicitCwd = resolveExplicitPromptCwd(options.prompt)
   if (explicitCwd) {
     return explicitCwd
@@ -4572,18 +5675,426 @@ function resolveExplicitPromptCwd(prompt: string): string | undefined {
 
 export function isLocalHost(h: string): boolean {
   const normalized = h.toLowerCase().trim()
-  return (
-    normalized === '127.0.0.1' ||
-    normalized === 'localhost' ||
-    normalized === '::1' ||
-    normalized === '[::1]'
-  )
+  return normalized === '127.0.0.1' || normalized === 'localhost' || normalized === '::1' || normalized === '[::1]'
 }
 
 export function validateSecurityConfig(host: string, apiKey: string | undefined): void {
   if (!isLocalHost(host) && !apiKey) {
-    throw new Error(
-      `Security Error: Running Nexus on non-localhost (${host}) requires setting the NEXUS_API_KEY environment variable.`,
-    )
+    throw new Error(`Security Error: Running Nexus on non-localhost (${host}) requires setting the NEXUS_API_KEY environment variable.`)
+  }
+}
+
+// ─── PR-11: /v1/context/history endpoint helpers ──────────────────────────
+//
+// These are free functions (not closures) so they can be unit-tested
+// independently of the Fastify request lifecycle. The route handler above
+// just validates params and delegates here.
+
+import { existsSync as _existsSync, readFileSync as _readFileSync } from 'node:fs'
+import { resolve as _resolve } from 'node:path'
+import { BEHAVIOR_TRACE_RELATIVE_PATH, type BehaviorTraceEntry } from '../runtime/behaviorTrace.js'
+import { searchEvents, summarizeWindow } from '../tools/contextTools.js'
+
+export function parseSinceFromQuery(s: string): number | undefined {
+  const match = s.trim().match(/^(\d+)\s*([hmdw])$/i)
+  if (!match) return undefined
+  const n = Number(match[1])
+  const unit = match[2]!.toLowerCase()
+  if (unit === 'm') return n * 60_000
+  if (unit === 'h') return n * 60 * 60_000
+  if (unit === 'd') return n * 24 * 60 * 60_000
+  if (unit === 'w') return n * 7 * 24 * 60 * 60_000
+  return undefined
+}
+
+export type ContextHistoryParams = {
+  cwd: string
+  scope: 'search' | 'summarize'
+  query?: string
+  sinceMs?: number
+  maxTokens: number
+  summarizeScope: 'all' | 'error' | 'denial' | 'scope-drift' | 'user-redirect' | 'trajectory-end' | 'cross-session'
+}
+
+export async function runContextHistory(params: ContextHistoryParams): Promise<{
+  type: 'context_history_result'
+  scope: 'search' | 'summarize'
+  content: string
+  hitCount: number
+  tokenEstimate: number
+  truncated: boolean
+  contentTruncated?: number
+}> {
+  const tracePath = _resolve(params.cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+  if (!_existsSync(tracePath)) {
+    return {
+      type: 'context_history_result',
+      scope: params.scope,
+      content: '(no behavior trace file yet)',
+      hitCount: 0,
+      tokenEstimate: 5,
+      truncated: false,
+    }
+  }
+
+  let entries: BehaviorTraceEntry[] = []
+  try {
+    const raw = _readFileSync(tracePath, 'utf8')
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim()
+      if (!trimmed) continue
+      try {
+        entries.push(JSON.parse(trimmed) as BehaviorTraceEntry)
+      } catch {
+        // skip malformed lines
+      }
+    }
+  } catch (error) {
+    throw new Error(`Failed to read trace file: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  if (params.scope === 'search') {
+    if (!params.query) {
+      throw new Error('query is required for search scope')
+    }
+    const events: NexusEvent[] = entries.map((e, i) => ({
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId: e.sessionId,
+      timestamp: e.timestamp,
+      toolUseId: `trc_${i}`,
+      name: 'behavior_trace',
+      input: {
+        trigger: e.trigger,
+        errorMessage: e.anomaly?.errorMessage,
+        errorCode: e.anomaly?.errorCode,
+        denialReason: e.anomaly?.denialReason,
+        driftPath: e.anomaly?.driftPath,
+        userRedirectSignal: e.anomaly?.userRedirectSignal,
+        source: (e.anomaly as { source?: string } | undefined)?.source,
+      },
+    }))
+    const result = searchEvents(events, params.query, {
+      sinceMs: params.sinceMs,
+      maxTokens: params.maxTokens,
+    })
+    return {
+      type: 'context_history_result',
+      scope: 'search',
+      content: result.content,
+      hitCount: result.hitCount,
+      tokenEstimate: result.tokenEstimate,
+      truncated: result.truncated,
+      contentTruncated: result.truncatedAt,
+    }
+  }
+
+  const summary = summarizeWindow(entries, {
+    scope: params.summarizeScope,
+    sinceMs: params.sinceMs,
+    maxTokens: params.maxTokens,
+  })
+  return {
+    type: 'context_history_result',
+    scope: 'summarize',
+    content: summary.content,
+    hitCount: summary.hitCount,
+    tokenEstimate: summary.tokenEstimate,
+    truncated: summary.truncated,
+    contentTruncated: summary.truncatedAt,
+  }
+}
+
+// ─── PR-B2: /v1/context/trace endpoint helper ─────────────────────────────
+//
+// Per docs/nexus/reference/long-running-context-assembly.md §18.2 B2.
+// Reads the same <cwd>/.babel-o/behavior-trace.jsonl file that
+// runContextHistory reads, but returns the raw typed entries
+// (BehaviorTraceEntry[]) instead of a summarized markdown blob.
+// The TUI's StatusBehaviorHint overlay renders each entry on its
+// own line. Optional sessionId filter narrows to a single
+// session; sinceMs filters to entries within the window
+// (default 24h, matches runContextHistory); limit caps the
+// returned array (default 100, max 1000).
+export async function runBehaviorTraceGet({ cwd, sessionId, limit, sinceMs }: { cwd: string; sessionId?: string; limit: number; sinceMs: number }): Promise<{
+  type: 'behavior_trace_result'
+  cwd: string
+  sessionId: string
+  entries: BehaviorTraceEntry[]
+  count: number
+}> {
+  let all: BehaviorTraceEntry[] = []
+  const tracePath = _resolve(cwd, BEHAVIOR_TRACE_RELATIVE_PATH)
+  if (_existsSync(tracePath)) {
+    try {
+      const raw = _readFileSync(tracePath, 'utf8')
+      for (const line of raw.split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        try {
+          all.push(JSON.parse(trimmed) as BehaviorTraceEntry)
+        } catch {
+          // skip malformed lines (mirrors runContextHistory)
+        }
+      }
+    } catch (error) {
+      throw new Error(`Failed to read trace file: ${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  // Filter: time window (sinceMs back from now), then optional
+  // sessionId. The default sinceMs (24h) is enforced by the
+  // caller; the helper accepts the raw value so test paths
+  // can pass 0 to disable.
+  const cutoff = Date.now() - Math.max(0, sinceMs)
+  let filtered = all.filter(e => {
+    const ts = Date.parse(e.timestamp ?? '')
+    if (!Number.isFinite(ts)) return false
+    if (ts < cutoff) return false
+    if (sessionId && e.sessionId !== sessionId) return false
+    return true
+  })
+
+  // Take the last N (most recent) entries. The file is appended
+  // to chronologically so the trailing slice is the freshest.
+  if (filtered.length > limit) {
+    filtered = filtered.slice(filtered.length - limit)
+  }
+
+  return {
+    type: 'behavior_trace_result',
+    cwd,
+    sessionId: sessionId ?? '',
+    entries: filtered,
+    count: filtered.length,
+  }
+}
+
+// ─── PR-12: /v1/context/working-set endpoint helpers ──────────────────────
+
+export type WorkingSetSession = {
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}
+
+export async function runWorkingSetList({ cwd }: { cwd: string }): Promise<{
+  type: 'working_set_list'
+  cwd: string
+  sessions: WorkingSetSession[]
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const sessions: WorkingSetSession[] = []
+  for (const [sessionId, ws] of tracker.entries()) {
+    sessions.push({
+      sessionId,
+      workspaceId: ws.workspaceId,
+      version: ws.version,
+      updatedAt: ws.updatedAt,
+      entries: ws.entries,
+    })
+  }
+  return { type: 'working_set_list', cwd, sessions }
+}
+
+export async function runWorkingSetGet({ cwd, sessionId }: { cwd: string; sessionId: string }): Promise<{
+  type: 'working_set_session'
+  cwd: string
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const ws = tracker.get(sessionId)
+  if (!ws) {
+    throw new Error(`session not found: ${sessionId}`)
+  }
+  return {
+    type: 'working_set_session',
+    cwd,
+    sessionId,
+    workspaceId: ws.workspaceId,
+    version: ws.version,
+    updatedAt: ws.updatedAt,
+    entries: ws.entries,
+  }
+}
+
+// ─── PR-A1: /v1/context/working-set/:sessionId PUT endpoint helper ───
+//
+// Per design §7.3 row "GET / PUT" + user explicit approval (2026-06-17).
+// Write op: replaces a session's working set entries and auto-persists
+// + emits working_set_updated event (PR-26). Caller submits the FULL
+// desired entries set (write-through, not a delta).
+export async function runWorkingSetPut({
+  cwd,
+  sessionId,
+  workspaceId,
+  entries,
+}: {
+  cwd: string
+  sessionId: string
+  workspaceId?: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}): Promise<{
+  type: 'working_set_session'
+  cwd: string
+  sessionId: string
+  workspaceId: string
+  version: number
+  updatedAt: string
+  entries: Array<{
+    key: string
+    value: string
+    updatedAt: string
+    confidence: number
+  }>
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  // Preserve the previous workspaceId if the caller omits it; this
+  // matches the doc's intent that the endpoint is a write-through,
+  // not a full replacement that would zero out workspace linkage.
+  const prev = tracker.get(sessionId)
+  const resolvedWorkspaceId = workspaceId ?? prev?.workspaceId ?? ''
+  const updated = tracker.update(sessionId, {
+    workspaceId: resolvedWorkspaceId,
+    entries,
+  })
+  await tracker.flush()
+  return {
+    type: 'working_set_session',
+    cwd,
+    sessionId,
+    workspaceId: updated.workspaceId,
+    version: updated.version,
+    updatedAt: updated.updatedAt,
+    entries: updated.entries,
+  }
+}
+
+// ─── PR-20: /v1/context/working-set/workspace/:wsId endpoint helper ──────
+//
+// Per design §7.3 row 3. Pure read — returns the working set aggregated
+// across all sessions that share the same workspaceId. Aggregates entries
+// by key, attaching a contributors list so callers can see provenance.
+
+export type WorkspaceEntryContributor = {
+  sessionId: string
+  value: string
+  updatedAt: string
+  confidence: number
+}
+
+export type WorkspaceAggregatedEntry = {
+  key: string
+  contributors: WorkspaceEntryContributor[]
+}
+
+export async function runWorkspaceWorkingSetGet({ cwd, workspaceId }: { cwd: string; workspaceId: string }): Promise<{
+  type: 'workspace_working_set'
+  cwd: string
+  workspaceId: string
+  sessions: WorkingSetSession[]
+  aggregateEntries: WorkspaceAggregatedEntry[]
+}> {
+  const tracker = new PersistedWorkingSetTracker_2(cwd)
+  await tracker.load()
+  const sessions: WorkingSetSession[] = []
+  for (const [sessionId, ws] of tracker.entries()) {
+    if (ws.workspaceId === workspaceId) {
+      sessions.push({
+        sessionId,
+        workspaceId: ws.workspaceId,
+        version: ws.version,
+        updatedAt: ws.updatedAt,
+        entries: ws.entries,
+      })
+    }
+  }
+
+  // Aggregate entries by key, collecting contributors from each session
+  const byKey = new Map<string, WorkspaceEntryContributor[]>()
+  for (const session of sessions) {
+    for (const entry of session.entries) {
+      const list = byKey.get(entry.key) ?? []
+      list.push({
+        sessionId: session.sessionId,
+        value: entry.value,
+        updatedAt: entry.updatedAt,
+        confidence: entry.confidence,
+      })
+      byKey.set(entry.key, list)
+    }
+  }
+  const aggregateEntries: WorkspaceAggregatedEntry[] = []
+  for (const [key, contributors] of byKey.entries()) {
+    aggregateEntries.push({ key, contributors })
+  }
+  // Stable order: sort by key
+  aggregateEntries.sort((a, b) => a.key.localeCompare(b.key))
+
+  return {
+    type: 'workspace_working_set',
+    cwd,
+    workspaceId,
+    sessions,
+    aggregateEntries,
+  }
+}
+
+// Helper to avoid name collision with the ContextCommandOptions / other
+// identifiers in this file. Re-exports the PR-4b class via a local alias.
+import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from './persistedWorkingSetTracker.js'
+import { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
+import { setDefaultContextBroadcaster, defaultContextBroadcaster } from '../runtime/contextBroadcasterSingleton.js'
+import type { WorkingSetEvent } from './workingSetTracker.js'
+
+// ─── PR-18: /v1/context/assemble endpoint helpers ────────────────────────
+//
+// Mirrors PR-15's `buildAssemblePreview` (extracted from runAssemble as a pure
+// function). REST handler just validates body and delegates here.
+// Pure read — never mutates state.
+
+export type ContextAssembleParams = {
+  cwd: string
+  sessionId?: string
+  scope: 'minimal' | 'standard' | 'full' | 'task' | 'workspace'
+  maxTokens: number
+}
+
+import { buildAssemblePreview, type AssembledContextPreview } from './contextAssemblePreview.js'
+
+export async function runContextAssemble(params: ContextAssembleParams): Promise<{
+  type: 'context_assemble_result'
+  cwd: string
+  preview: AssembledContextPreview
+}> {
+  const preview = await buildAssemblePreview(params)
+  return {
+    type: 'context_assemble_result',
+    cwd: params.cwd,
+    preview,
   }
 }

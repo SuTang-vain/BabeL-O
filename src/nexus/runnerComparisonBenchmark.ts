@@ -280,7 +280,7 @@ async function benchmarkRunnerBackend(options: {
 }): Promise<RunnerComparisonBackendResult> {
   const heapUsedBeforeBytes = process.memoryUsage().heapUsed
   const scenarioResults: RunnerComparisonScenarioResult[] = []
-  const tools = createDefaultToolRegistry()
+  const tools = createDefaultToolRegistry({ storage: null })
 
   for (const scenario of options.scenarios) {
     scenarioResults.push(await benchmarkRunnerScenario({

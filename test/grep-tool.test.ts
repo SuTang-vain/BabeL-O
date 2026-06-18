@@ -120,6 +120,21 @@ test('Grep supports regex alternation in fallback-capable execution', async () =
   assert.match(String(result.output), /context\.ts:1:const forkContext = \(\) => true/)
 })
 
+test('Grep supports patterns that start with a dash', async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'babel-o-grep-leading-dash-'))
+  await writeFile(join(cwd, 'todo.md'), '- [ ] unchecked task\n- [x] done task\n')
+
+  const result = await grepTool.execute({
+    pattern: '- \\[ \\]',
+    path: '.',
+    pathMatches: '**/*.md',
+    maxMatches: 10,
+  }, toolContext(cwd))
+
+  assert.equal(result.success, true)
+  assert.match(String(result.output), /todo\.md:1:- \[ \] unchecked task/)
+})
+
 function toolContext(cwd: string) {
   return {
     cwd,

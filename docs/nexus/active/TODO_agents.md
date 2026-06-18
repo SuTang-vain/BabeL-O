@@ -19,7 +19,7 @@
 
 ## P1 Model-visible AgentScheduler / Explore Agent
 
-> 统一规划见 [context-and-subagent-upgrade-plan.md](../reference/context-and-subagent-upgrade-plan.md)。现有 `runAgentLoop` sub-agent 能力继续保留；新增模型可见 agent jobs 必须作为独立 `AgentScheduler` 层落地，不能混入 `RemoteToolRunner`。
+> 统一规划见 [context-and-agent-history.md](../history/context-and-agent-history.md)。现有 `runAgentLoop` sub-agent 能力继续保留；新增模型可见 agent jobs 必须作为独立 `AgentScheduler` 层落地，不能混入 `RemoteToolRunner`。
 
 Agent core types 与基础 profiles 已收口：`src/nexus/agents/types.ts` 定义 `AgentJob`、`AgentResult`、`AgentProfile`、`ContextForkMode` 与 scheduler 接口占位，`AgentProfiles.ts` 已启用 `explore`、`review`、`test` profiles；`explore` 仅允许 `Read/Grep/Glob`，`review` / `test` 允许 `Read/Grep/Glob` 与受限 Bash check-only 命令。
 

@@ -18,6 +18,7 @@ const execFileAsync = promisify(execFile)
 const sessionProbeSecret = randomBytes(32)
 const SESSION_CWD_TTL_MS = 24 * 60 * 60 * 1000
 const SESSION_CWD_SWEEP_INTERVAL_MS = 60 * 60 * 1000
+const OUTPUT_LIMIT_PREVIEW_BYTES = 8_000
 
 // Maintain a map of sessionId -> last active CWD
 const sessionCwdMap = new Map<string, { cwd: string; workspaceCwd: string; lastActiveAt: number }>()
@@ -31,10 +32,15 @@ type StateProbe = {
 type FailedCommandResult = {
   stdout: string
   stderr: string
+  stdoutTruncated?: boolean
+  stdoutOriginalBytes?: number
+  stderrTruncated?: boolean
+  stderrOriginalBytes?: number
   exitCode?: number
   signal?: string
   code?: string
   timedOut?: boolean
+  outputLimited?: boolean
   message: string
 }
 
@@ -90,15 +96,31 @@ function parseStateFromStdout(
 
 function isRecoverableCommandFailure(err: { code?: unknown; signal?: unknown }, signal?: AbortSignal): boolean {
   if (signal?.aborted) return false
-  return typeof err.code === 'number' || isCommandTimeoutFailure(err)
+  return typeof err.code === 'number' || isCommandTimeoutFailure(err) || isCommandOutputLimitFailure(err)
 }
 
 function isCommandTimeoutFailure(err: { code?: unknown; signal?: unknown }): boolean {
   return err.code === null && typeof err.signal === 'string'
 }
 
+function isCommandOutputLimitFailure(err: { code?: unknown }): boolean {
+  return err.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER'
+}
+
 function commandFailureCode(err: { code?: unknown; signal?: unknown }): string | undefined {
-  return isCommandTimeoutFailure(err) ? 'COMMAND_TIMEOUT' : undefined
+  if (isCommandTimeoutFailure(err)) return 'COMMAND_TIMEOUT'
+  if (isCommandOutputLimitFailure(err)) return 'COMMAND_OUTPUT_LIMIT'
+  return undefined
+}
+
+function truncateUtf8Preview(value: string, maxBytes: number): { value: string; truncated?: boolean; originalBytes?: number } {
+  const bytes = Buffer.byteLength(value, 'utf8')
+  if (bytes <= maxBytes) return { value }
+  return {
+    value: Buffer.from(value, 'utf8').subarray(0, maxBytes).toString('utf8'),
+    truncated: true,
+    originalBytes: bytes,
+  }
 }
 
 function toFailedCommandResult(
@@ -117,21 +139,35 @@ function toFailedCommandResult(
   const stderrStr = typeof err.stderr === 'string' ? err.stderr : ''
   const { cleanStdout, detectedCwd } = parseStateFromStdout(stdoutStr, probe)
   const code = commandFailureCode(err)
+  const stdoutPreview = code === 'COMMAND_OUTPUT_LIMIT'
+    ? truncateUtf8Preview(cleanStdout, OUTPUT_LIMIT_PREVIEW_BYTES)
+    : { value: cleanStdout }
+  const stderrPreview = code === 'COMMAND_OUTPUT_LIMIT'
+    ? truncateUtf8Preview(stderrStr, OUTPUT_LIMIT_PREVIEW_BYTES)
+    : { value: stderrStr }
   let cleanedMessage = err.message || 'Command failed'
   cleanedMessage = cleanedMessage.replace(wrappedCommand, originalCommand)
   cleanedMessage = cleanedMessage.replaceAll(probe.marker, '').trim()
   if (code === 'COMMAND_TIMEOUT') {
     cleanedMessage = `Command timed out or was terminated by signal ${String(err.signal)} before completion. Narrow the command scope or increase timeoutMs if this shell execution is necessary.`
+  } else if (code === 'COMMAND_OUTPUT_LIMIT') {
+    const stream = cleanedMessage.includes('stderr maxBuffer') ? 'stderr' : 'stdout'
+    cleanedMessage = `Command ${stream} exceeded the shell output buffer before completion. Re-run with a narrower range or pipe the noisy command through head, tail, cut, awk, or redirect large output to a file before printing a small preview.`
   }
 
   return {
     result: {
-      stdout: cleanStdout,
-      stderr: stderrStr,
+      stdout: stdoutPreview.value,
+      stderr: stderrPreview.value,
+      stdoutTruncated: stdoutPreview.truncated,
+      stdoutOriginalBytes: stdoutPreview.originalBytes,
+      stderrTruncated: stderrPreview.truncated,
+      stderrOriginalBytes: stderrPreview.originalBytes,
       exitCode: typeof err.code === 'number' ? err.code : undefined,
       signal: typeof err.signal === 'string' ? err.signal : undefined,
       code,
       timedOut: code === 'COMMAND_TIMEOUT' ? true : undefined,
+      outputLimited: code === 'COMMAND_OUTPUT_LIMIT' ? true : undefined,
       message: cleanedMessage,
     },
     detectedCwd,

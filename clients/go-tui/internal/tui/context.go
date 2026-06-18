@@ -38,35 +38,51 @@ type contextUsageSegment struct {
 	tokens int
 }
 
-// renderContextOverlay paints the multi-line context analysis
+// contextOverlayView is the minimal, value-only projection of the
+// model state consumed by renderContextOverlayView. It lets the
+// overlay renderer stay decoupled from the top-level `model` type
+// so future drivers (e.g. `bbl loop` multi-pane) can reuse the
+// same renderer without inheriting the full model surface.
+type contextOverlayView struct {
+	Active          bool
+	Lines           []string
+	Scroll          int
+	Width, Height   int
+	HeaderHeight    int
+	SessionID       string
+}
+
+// renderContextOverlayView paints the multi-line context analysis
 // (Phase 5 续). It is a read-only scrollable overlay, similar in
 // shape to renderHelp: header + divider + clamped line window +
-// bottom hint. Outside modeContextOverlay it returns "" so the
-// View() parts list can splice it unconditionally.
-func (m model) renderContextOverlay(width int) string {
-	if m.inputMode != modeContextOverlay {
-		return ""
+// bottom hint. When the overlay is inactive it returns "" so the
+// View() parts list can splice it unconditionally. The returned
+// scroll is the clamped position that callers should persist back
+// onto their state (since clamp may shrink an oversized scroll).
+func renderContextOverlayView(v contextOverlayView) (string, int) {
+	if !v.Active {
+		return "", v.Scroll
 	}
-	if len(m.contextOverlayLines) == 0 {
-		return ""
+	if len(v.Lines) == 0 {
+		return "", v.Scroll
 	}
-	header := titleStyle.Render("Context")
-	frameBudget := m.contextOverlayFrameBudget(width)
+	frameBudget := contextOverlayFrameBudgetFor(v)
 	contentBudget := max(0, frameBudget-2)
 	bodyRows := max(0, contentBudget-3)
 	if bodyRows == 0 && frameBudget == 0 {
-		bodyRows = max(1, min(len(m.contextOverlayLines), 8))
+		bodyRows = max(1, min(len(v.Lines), 8))
 	}
-	maxScroll := max(0, len(m.contextOverlayLines)-max(1, bodyRows))
-	if m.contextOverlayScroll > maxScroll {
-		m.contextOverlayScroll = maxScroll
+	maxScroll := max(0, len(v.Lines)-max(1, bodyRows))
+	scroll := v.Scroll
+	if scroll > maxScroll {
+		scroll = maxScroll
 	}
-	start := m.contextOverlayScroll
-	innerWidth := max(10, width-4)
+	start := scroll
+	innerWidth := max(10, v.Width-4)
 	bodyLines := []string{}
 	if bodyRows > 0 {
-		for i := start; i < len(m.contextOverlayLines) && len(bodyLines) < bodyRows; i++ {
-			wrapped := strings.Split(wrapPlain(m.contextOverlayLines[i], innerWidth), "\n")
+		for i := start; i < len(v.Lines) && len(bodyLines) < bodyRows; i++ {
+			wrapped := strings.Split(wrapPlain(v.Lines[i], innerWidth), "\n")
 			for _, line := range wrapped {
 				if len(bodyLines) >= bodyRows {
 					break
@@ -75,19 +91,61 @@ func (m model) renderContextOverlay(width int) string {
 			}
 		}
 	}
-	scrollHint := fmt.Sprintf("  scroll %d/%d", min(start+1, len(m.contextOverlayLines)), len(m.contextOverlayLines))
+	scrollHint := fmt.Sprintf("  scroll %d/%d", min(start+1, len(v.Lines)), len(v.Lines))
 	footerHint := "  up/down/tab scroll  esc/enter/q close"
 	plainLines := append(bodyLines, scrollHint, footerHint)
-	content := strings.Join([]string{header, contextStyle.Render(strings.Join(plainLines, "\n"))}, "\n")
-	return renderOverlayFrame(width, content)
+	content := strings.Join([]string{titleStyle.Render("Context"), contextStyle.Render(strings.Join(plainLines, "\n"))}, "\n")
+	return renderOverlayFrame(v.Width, content), scroll
+}
+
+// contextOverlayFrameBudgetFor mirrors the old model method but
+// takes the value-only view so callers can avoid touching `model`.
+func contextOverlayFrameBudgetFor(v contextOverlayView) int {
+	if v.Height <= 0 {
+		return 0
+	}
+	used := v.HeaderHeight + 1
+	return max(0, v.Height-used)
+}
+
+// modelAdapter keeps the existing `*model` receivers wired up to
+// the pure view-based renderer. Callers that already hold the
+// model (e.g. the legacy `bbl chat` / `bbl go` paths) can keep
+// using it without changing their call sites.
+func (m model) contextOverlayView() contextOverlayView {
+	headerHeight := 0
+	if m.height > 0 {
+		headerHeight = lipgloss.Height(m.renderHeader(m.width))
+	}
+	return contextOverlayView{
+		Active:       m.inputMode == modeContextOverlay,
+		Lines:        m.contextOverlayLines,
+		Scroll:       m.contextOverlayScroll,
+		Width:        m.width,
+		Height:       m.height,
+		HeaderHeight: headerHeight,
+		SessionID:    m.sessionID,
+	}
+}
+
+func (m model) renderContextOverlay(width int) string {
+	view := m.contextOverlayView()
+	if view.Width == 0 {
+		view.Width = width
+	}
+	rendered, clampedScroll := renderContextOverlayView(view)
+	if rendered != "" && m.inputMode == modeContextOverlay {
+		m.contextOverlayScroll = clampedScroll
+	}
+	return rendered
 }
 
 func (m model) contextOverlayFrameBudget(width int) int {
-	if m.height <= 0 {
-		return 0
+	view := m.contextOverlayView()
+	if view.Width == 0 {
+		view.Width = width
 	}
-	used := lipgloss.Height(m.renderHeader(width)) + 1
-	return max(0, m.height-used)
+	return contextOverlayFrameBudgetFor(view)
 }
 
 // buildContextOverlayLines turns the raw /v1/sessions/:id/context

@@ -8,6 +8,8 @@ import type {
   ChildSessionListOptions,
   EventListOptions,
   EventListResult,
+  LoopPaneFilter,
+  LoopPaneState,
   NexusStorage,
   SessionGetOptions,
   StorageListOptions,
@@ -92,6 +94,10 @@ export class MemoryStorage implements NexusStorage {
     return {
       events: structuredClone(events),
       nextCursor: nextIndex < orderedEvents.length ? String(nextIndex) : undefined,
+      lastSeq:
+        events.length > 0
+          ? Number(options.cursor ?? 0) + events.length
+          : undefined,
     }
   }
 
@@ -294,6 +300,46 @@ export class MemoryStorage implements NexusStorage {
   }
 
   async close(): Promise<void> {}
+
+  private readonly loopPanes = new Map<string, LoopPaneState>()
+
+  async upsertLoopPane(pane: LoopPaneState): Promise<LoopPaneState> {
+    this.loopPanes.set(pane.paneId, { ...pane })
+    return { ...pane }
+  }
+
+  async listLoopPanes(filter: LoopPaneFilter = {}): Promise<LoopPaneState[]> {
+    const rows: LoopPaneState[] = []
+    for (const pane of this.loopPanes.values()) {
+      if (filter.workspaceId && pane.workspaceId !== filter.workspaceId) continue
+      if (filter.tabId && pane.tabId !== filter.tabId) continue
+      if (filter.paneId && pane.paneId !== filter.paneId) continue
+      if (filter.sessionId && pane.sessionId !== filter.sessionId) continue
+      rows.push({ ...pane })
+    }
+    rows.sort((a, b) => {
+      if (a.workspaceId !== b.workspaceId) return a.workspaceId < b.workspaceId ? -1 : 1
+      if (a.tabId !== b.tabId) return a.tabId < b.tabId ? -1 : 1
+      return a.paneId < b.paneId ? -1 : 1
+    })
+    return rows
+  }
+
+  async deleteLoopPane(paneId: string): Promise<boolean> {
+    return this.loopPanes.delete(paneId)
+  }
+
+  async updateLoopPaneRev(
+    paneId: string,
+    lastRev: number,
+    updatedAt: string,
+  ): Promise<LoopPaneState | null> {
+    const current = this.loopPanes.get(paneId)
+    if (!current) return null
+    const next: LoopPaneState = { ...current, lastRev, updatedAt }
+    this.loopPanes.set(paneId, next)
+    return { ...next }
+  }
 }
 
 function cloneSession(

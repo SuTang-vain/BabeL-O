@@ -1407,6 +1407,308 @@ def run_sub_agent_aggregation_sequence(
     return True
 
 
+def run_embedded_nexus_persists_session_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 1.2 of `go-tui-session-observability-governance-plan.md`:
+    embedded Nexus default-persistence guard.
+
+    Sequence:
+      1. Run a Bash round-trip so the WebSocket stream starts, the
+         server allocates a `session_<uuid>`, and the embedded
+         Nexus writes it to the default `~/.babel-o/db.sqlite`
+         (resolved via `BABEL_O_CONFIG_DIR`).
+      2. Use the transcript + a HTTP probe to discover the
+         allocated server uuid (the TUI surfaces the
+         shortID via `/compact`'s status line; the full
+         server uuid is read from the live `GET /v1/sessions`
+         list, which contains at most one row at this point).
+      3. Quit the TUI (and let `bbl go`'s exit handler kill the
+         managed embedded Nexus child). The PTY process is now
+         fully torn down — no `__server` is still running.
+      4. The caller is responsible for the second half of the
+         round-trip (`run_embedded_nexus_persists_session_resume`)
+         that starts a *standalone* Nexus from the same
+         `BABEL_O_CONFIG_DIR` and re-fetches the session via
+         `GET /v1/sessions/<id>` to confirm the row survived
+         the embedded process exit. That function runs in a
+         *separate* Python invocation because the PTY teardown
+         in this function is final.
+    """
+    # 1) bash round-trip.
+    send(master_fd, "bash touch phase1-2-embed-persist")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "Permission: Bash", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] embedded-persist: permission panel did not appear",
+        )
+    time.sleep(0.2)
+    send(master_fd, "a")
+    # Go TUI's chrome status footer writes "Bash completed." to the
+    # alt-screen row 23 when the tool result event arrives; that is
+    # the only tool-completion marker the TUI exposes in the PTY
+    # stream. (The transcript itself is tool_started-only by
+    # design — see formatNexusEvent's tool_completed comment.)
+    if not wait_for(master_fd, "Bash completed.", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] embedded-persist: bash tool did not finish (no 'Bash completed.' footer marker)",
+        )
+    # 2) /compact status line carries the shortID; we don't need
+    # the value here (the resume phase looks it up via /v1/sessions).
+    send(master_fd, "/compact")
+    send(master_fd, "\r")
+    if not wait_for(master_fd, "compacting shared Nexus context:", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] embedded-persist: /compact did not surface the compacting status line",
+        )
+    return True
+
+
+def run_embedded_nexus_persists_session_resume(
+    nexus_url: str,
+    expected_session_id: str,
+    timeout: float = 8.0,
+) -> bool:
+    """
+    Phase 1.2 companion: with the PTY-driven TUI torn down and the
+    embedded Nexus already gone, the caller's standalone Nexus (a
+    second `tsx src/nexus/server.ts` invocation rooted at the same
+    `BABEL_O_CONFIG_DIR`) must report the session that the embedded
+    instance just persisted. The standalone is started by
+    `embedded_nexus_persists_session_main` between the two phases.
+    """
+    deadline = time.time() + timeout
+    last_error: str = ""
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(f"{nexus_url}/v1/sessions", timeout=1.5) as response:
+                if response.status != 200:
+                    last_error = f"status={response.status}"
+                else:
+                    payload = json.loads(response.read().decode("utf-8"))
+                    sessions = payload.get("sessions", payload if isinstance(payload, list) else [])
+                    for row in sessions:
+                        if row.get("sessionId") == expected_session_id:
+                            return True
+                    last_error = f"session {expected_session_id!r} not in /v1/sessions ({len(sessions)} row(s))"
+        except (urllib.error.URLError, ConnectionError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        time.sleep(0.2)
+    print(
+        f"[go-tui-smoke] embedded-persist resume: server at {nexus_url} did not surface {expected_session_id!r}: {last_error}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def discover_session_id_via_nexus(nexus_url: str, timeout: float = 4.0) -> str | None:
+    """
+    Phase 1.2 helper: read the live `GET /v1/sessions` list from the
+    embedded Nexus while the TUI is still up, and return the only
+    session id (assumes the harness ran exactly one bash round-trip
+    before this call). Returns None on error or zero/ambiguous rows.
+    """
+    deadline = time.time() + timeout
+    last_error: str = ""
+    last_payload: str = ""
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        try:
+            with urllib.request.urlopen(f"{nexus_url}/v1/sessions", timeout=1.5) as response:
+                payload_text = response.read().decode("utf-8")
+                last_payload = payload_text
+                payload = json.loads(payload_text)
+                sessions = payload.get("sessions", payload if isinstance(payload, list) else [])
+                # `SessionSnapshot.sessionId` is camelCase — the wire
+                # response mirrors the type, NOT the underlying
+                # sqlite column name (`session_id`).
+                ids = [row.get("sessionId") for row in sessions if row.get("sessionId")]
+                if len(ids) == 1:
+                    return ids[0]
+                if len(ids) == 0:
+                    last_error = f"no sessions yet (rows={len(sessions)}, first keys={list(sessions[0].keys()) if sessions else 'n/a'})"
+                else:
+                    last_error = f"ambiguous: {ids}"
+        except (urllib.error.URLError, ConnectionError, TimeoutError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+        time.sleep(0.2)
+    print(
+        f"[go-tui-smoke] embedded-persist: could not discover session id from {nexus_url} after {attempts} attempts: {last_error}\n  last payload: {last_payload[:500]}",
+        file=sys.stderr,
+    )
+    return None
+
+
+def run_go_tui_session_id_is_server_uuid_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 1.3 of `go-tui-session-observability-governance-plan.md`:
+    when the operator launches `bbl go` *without* `--session`, the
+    TUI's `m.sessionID` must be a server-allocated `session_<uuid>`
+    (the canonical `session_<8-4-4-4-12>` hex form), NOT a locally
+    generated `session_go_<unixnano>` placeholder.
+
+    Sequence:
+      1. Wait for the `BabeL-O · Go TUI` banner. `bbl go` runs
+         `ensureGoTuiSession` → `POST /v1/sessions` → server uuid
+         BEFORE spawning the TUI, then passes the uuid via
+         `--session`. The TUI therefore starts with m.sessionID
+         already set to the server uuid (no client-side allocation,
+         no `session_go_<unixnano>` placeholder on the wire).
+      2. Read the live `GET /v1/sessions` list from the embedded
+         Nexus and assert the only session id matches the canonical
+         `session_<8-4-4-4-12>` form (server uuid), not
+         `session_go_<digits>`.
+      3. Belt-and-suspenders: the transcript must NOT contain a
+         `session_go_<unixnano>` placeholder leak (e.g. the TUI
+         emitting the placeholder into the prompt or status path).
+
+    The HTTP list check is the primary assertion — it directly
+    proves the server-allocated uuid is the one in play, without
+    depending on the TUI's shortID rendering (which truncates the
+    id and can't distinguish uuid from placeholder by tail alone).
+    """
+    if not wait_for(master_fd, "BabeL-O · Go TUI", timeout, transcript):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] go-tui-session-id: banner did not appear within timeout",
+        )
+    # We need the embedded Nexus URL. The PTY main() already waited
+    # for /v1/runtime/status on `nexus_url`; the sequence inherits
+    # it via the module-level BABEL_O_GO_TUI_SMOKE_NEXUS_URL env
+    # stamp the main() sets just before invoking the runner.
+    nexus_url = os.environ.get("BABEL_O_GO_TUI_SMOKE_NEXUS_URL", "")
+    if not nexus_url:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] go-tui-session-id: BABEL_O_GO_TUI_SMOKE_NEXUS_URL not set by harness",
+        )
+    session_id = discover_session_id_via_nexus(nexus_url, timeout=8.0)
+    if session_id is None:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] go-tui-session-id: could not discover server session id from embedded Nexus",
+        )
+    uuid_re = re.compile(r"^session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+    placeholder_re = re.compile(r"^session_go_\d{15,}$")
+    if placeholder_re.fullmatch(session_id):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] go-tui-session-id: server session id is the local placeholder {session_id!r} — the server is persisting the client's `session_go_<unixnano>` instead of allocating a uuid (Phase 1.1 regression)",
+        )
+    if not uuid_re.fullmatch(session_id):
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] go-tui-session-id: server session id {session_id!r} is not a canonical `session_<uuid>` form",
+        )
+    # Transcript must not leak a `session_go_<unixnano>` placeholder.
+    combined = visible_text("".join(transcript))
+    placeholder_leak = placeholder_re.search(combined)
+    if placeholder_leak:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] go-tui-session-id: transcript leaked placeholder {placeholder_leak.group(0)!r} — TUI is surfacing the local `session_go_<unixnano>` on the wire/prompt path",
+        )
+    transcript.append(
+        f"[go-tui-session-id] server session id {session_id!r} is a canonical uuid; no `session_go_<unixnano>` placeholder in transcript",
+    )
+    return True
+
+
+def run_embedded_nexus_startup_log_sequence(
+    master_fd: int,
+    go_tui_proc: "subprocess.Popen[bytes]",
+    transcript: list[str],
+    timeout: float,
+) -> bool:
+    """
+    Phase 1.4 of `go-tui-session-observability-governance-plan.md`:
+    when `bbl go` brings up its embedded Nexus child, the server
+    must append a `nexus[pid=...] listen=... storage=... cwd=...`
+    startup line to `<config_dir>/log/embedded-nexus.log`. This is
+    the tier (c) fallback source `bbl inspect-session` greps when a
+    session can't be found, so a missing line breaks the
+    observability contract.
+
+    Sequence:
+      1. Wait for the `BabeL-O · Go TUI` banner and confirm the
+         embedded Nexus is reachable on `nexus_url` (set by the
+         harness via BABEL_O_GO_TUI_SMOKE_NEXUS_URL).
+      2. Read `<config_dir>/log/embedded-nexus.log`
+         (BABEL_O_GO_TUI_SMOKE_CONFIG_DIR) and assert it contains a
+         `nexus[pid=<digits>] listen=http://127.0.0.1:<port>` line
+         whose port matches the embedded Nexus the TUI is talking
+         to.
+    """
+    config_dir = os.environ.get("BABEL_O_GO_TUI_SMOKE_CONFIG_DIR", "")
+    nexus_url = os.environ.get("BABEL_O_GO_TUI_SMOKE_NEXUS_URL", "")
+    if not config_dir or not nexus_url:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            "[go-tui-smoke] embedded-startup-log: BABEL_O_GO_TUI_SMOKE_CONFIG_DIR / NEXUS_URL not set by harness",
+        )
+    log_path = Path(config_dir) / "log" / "embedded-nexus.log"
+    # The server writes the startup line right after app.listen();
+    # the harness already waited for /v1/runtime/status so the
+    # write should have landed. Give the filesystem a brief grace
+    # window in case the append is still flushing.
+    deadline = time.time() + 5.0
+    content = ""
+    while time.time() < deadline:
+        if log_path.exists():
+            content = log_path.read_text(encoding="utf-8", errors="replace")
+            if "nexus[pid=" in content:
+                break
+        time.sleep(0.2)
+    if not content:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] embedded-startup-log: {log_path} was never created by the embedded Nexus (Phase 3 startup-log regression)",
+        )
+    # Parse the nexus[pid=...] listen=... line. The port in
+    # listen= must match the embedded Nexus the TUI is talking to.
+    port_match = re.search(r":(\d+)$", nexus_url)
+    expected_port = port_match.group(1) if port_match else None
+    line_re = re.compile(
+        r"\[(?P<ts>[^\]]+)\]\s+nexus\[pid=(?P<pid>\d+)\]\s+listen=(?P<listen>\S+)\s+storage=(?P<storage>\S+)\s+executePolicyMode=(?P<policy>\S+)\s+cwd=(?P<cwd>\S+)"
+    )
+    matches = list(line_re.finditer(content))
+    if not matches:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] embedded-startup-log: {log_path} has no `nexus[pid=...] listen=...` line; content: {content!r}",
+        )
+    last = matches[-1]
+    pid = last.group("pid")
+    listen = last.group("listen")
+    if not pid or not pid.isdigit():
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] embedded-startup-log: pid field {pid!r} is not a positive integer",
+        )
+    if expected_port and expected_port not in listen:
+        return _fail(
+            master_fd, go_tui_proc, transcript,
+            f"[go-tui-smoke] embedded-startup-log: listen={listen!r} does not reference the embedded Nexus port {expected_port} (the startup log is for a different instance)",
+        )
+    transcript.append(
+        f"[embedded-startup-log] nexus[pid={pid}] listen={listen} storage={last.group('storage')} cwd={last.group('cwd')}",
+    )
+    return True
+
+
 def run_tools_audit_sequence(
     master_fd: int,
     go_tui_proc: "subprocess.Popen[bytes]",
@@ -1695,6 +1997,30 @@ SEQUENCES: dict[str, dict] = {
             "BabeL-O · Go TUI",
         ],
     },
+    "embedded-nexus-persists-session": {
+        "runner": run_embedded_nexus_persists_session_sequence,
+        "ok_message": "phase 1.2 embedded Nexus default-persistence round-trip verified",
+        "required_invariants": [
+            "BabeL-O · Go TUI",
+        ],
+        "embedded_mode": True,
+    },
+    "go-tui-session-id-is-server-uuid": {
+        "runner": run_go_tui_session_id_is_server_uuid_sequence,
+        "ok_message": "phase 1.3 Go TUI m.sessionID is a server uuid (hex tail), not a local placeholder",
+        "required_invariants": [
+            "BabeL-O · Go TUI",
+        ],
+        "embedded_mode": True,
+    },
+    "embedded-nexus-startup-log": {
+        "runner": run_embedded_nexus_startup_log_sequence,
+        "ok_message": "phase 1.4 embedded Nexus startup log line verified",
+        "required_invariants": [
+            "BabeL-O · Go TUI",
+        ],
+        "embedded_mode": True,
+    },
     "visual-regression-narrow": {
         "runner": run_visual_regression_narrow_sequence,
         "ok_message": "phase 7 narrow-width visual regression verified",
@@ -1773,35 +2099,39 @@ def main() -> int:
     )
     tsx_bin = repo / "node_modules" / ".bin" / "tsx"
     nexus_cmd = [str(tsx_bin), str(repo / "src" / "nexus" / "server.ts")]
-    print(f"[go-tui-smoke] starting nexus: {nexus_url}", flush=True)
-    nexus_proc = subprocess.Popen(
-        nexus_cmd,
-        cwd=str(repo),
-        env=nexus_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    embedded_mode = sequence.get("embedded_mode", False)
+    # In embedded_mode the Go TUI is launched via `bbl go`, which
+    # auto-starts the embedded Nexus child itself. We do not pre-start
+    # a standalone Nexus; the bbl go parent's child IS the server the
+    # TUI will talk to. The default sqlite path resolves through
+    # `BABEL_O_CONFIG_DIR` to `<config_dir>/db.sqlite`.
+    nexus_proc: "subprocess.Popen[bytes] | None" = None
+    if not embedded_mode:
+        print(f"[go-tui-smoke] starting nexus: {nexus_url}", flush=True)
+        nexus_proc = subprocess.Popen(
+            nexus_cmd,
+            cwd=str(repo),
+            env=nexus_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
     cleanup_messages: list[str] = []
     try:
-        try:
-            wait_for_http(f"{nexus_url}/v1/runtime/status", timeout=15.0)
-        except TimeoutError as exc:
+        if nexus_proc is not None:
             try:
-                stderr = nexus_proc.stderr.read(1).decode("utf-8", errors="replace") if nexus_proc.stderr else ""
-            except Exception:
-                stderr = ""
-            print(f"[go-tui-smoke] nexus failed to start: {exc}\n{stderr}", file=sys.stderr)
-            return 1
+                wait_for_http(f"{nexus_url}/v1/runtime/status", timeout=15.0)
+            except TimeoutError as exc:
+                try:
+                    stderr = nexus_proc.stderr.read(1).decode("utf-8", errors="replace") if nexus_proc.stderr else ""
+                except Exception:
+                    stderr = ""
+                print(f"[go-tui-smoke] nexus failed to start: {exc}\n{stderr}", file=sys.stderr)
+                return 1
 
         go_tui_cmd, mode, fallback_warning = find_go_tui(repo)
         if fallback_warning:
             print(fallback_warning, file=sys.stderr)
-        print(
-            f"[go-tui-smoke] launching go-tui ({mode}): "
-            f"{' '.join(go_tui_cmd)} --url {nexus_url} --no-alt",
-            flush=True,
-        )
 
         go_tui_env = os.environ.copy()
         go_tui_env.update(
@@ -1826,15 +2156,53 @@ def main() -> int:
             # We set a tall terminal height to prevent the list from scrolling out of the viewport.
             go_tui_env["COLUMNS"] = "120"
             go_tui_env["LINES"] = "120"
-        go_tui_argv = [
-            *go_tui_cmd,
-            "--url",
-            nexus_url,
-            "--cwd",
-            str(workspace),
-            "--session",
-            f"session_go_tui_smoke_{pid}",
-        ]
+        if embedded_mode:
+            # Launch via `bbl go` so the embedded Nexus is the same
+            # process tree as the TUI parent. The CLI's
+            # `createManagedNexusLaunchSpec` writes NEXUS_HOST/PORT
+            # for the auto-started child based on `--url`; HOME is
+            # already pointed at config_dir so the runtime's
+            # `resolveDefaultStoragePath` lands on
+            # `<config_dir>/db.sqlite`. We do NOT set
+            # NEXUS_STORAGE_PATH (Phase 2 contract: production
+            # default must be sqlite, not env override).
+            #
+            # We also deliberately OMIT `--session`: `ensureStartupSession`
+            # must hit `allocateServerSession` (POST /v1/sessions) so
+            # the TUI's m.sessionID is a real server uuid and the
+            # session row is written to the embedded Nexus's
+            # sqlite — which is the contract P1.2 guards.
+            program_ts = repo / "src" / "cli" / "program.ts"
+            go_tui_argv = [
+                str(tsx_bin),
+                str(program_ts),
+                "go",
+                "--url",
+                nexus_url,
+                "--no-alt",
+                "--cwd",
+                str(workspace),
+            ]
+            print(
+                f"[go-tui-smoke] embedded-mode: launching `bbl go` ({mode}): "
+                f"{' '.join(go_tui_argv)}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[go-tui-smoke] launching go-tui ({mode}): "
+                f"{' '.join(go_tui_cmd)} --url {nexus_url} --no-alt",
+                flush=True,
+            )
+            go_tui_argv = [
+                *go_tui_cmd,
+                "--url",
+                nexus_url,
+                "--cwd",
+                str(workspace),
+                "--session",
+                f"session_go_tui_smoke_{pid}",
+            ]
         master_fd, go_tui_proc = start_chat_process(go_tui_argv, str(workspace), go_tui_env)
         transcript: list[str] = []
         try:
@@ -1845,18 +2213,148 @@ def main() -> int:
                 )
                 return 1
 
+            if embedded_mode:
+                # The TUI is now connected to the embedded Nexus
+                # the bbl go parent auto-started. Wait for that
+                # server to be reachable on the same port; this
+                # doubles as proof the embedded child actually
+                # bound the socket.
+                try:
+                    wait_for_http(f"{nexus_url}/v1/runtime/status", timeout=20.0)
+                except TimeoutError as exc:
+                    return _fail(
+                        master_fd, go_tui_proc, transcript,
+                        f"[go-tui-smoke] embedded-persist: bbl go did not bring up embedded Nexus on {nexus_url}: {exc}",
+                    )
+
+            # Expose the embedded/standalone Nexus URL to sequence
+            # runners that need to probe the server directly (e.g.
+            # P1.3 reads /v1/sessions to assert the TUI's session id
+            # is a server uuid). Sequence runners are pure-Python
+            # and share this process's env.
+            os.environ["BABEL_O_GO_TUI_SMOKE_NEXUS_URL"] = nexus_url
+            os.environ["BABEL_O_GO_TUI_SMOKE_CONFIG_DIR"] = str(config_dir)
             if not sequence["runner"](master_fd, go_tui_proc, transcript, args.timeout):
                 return 1
 
-            send(master_fd, "q")
-            try:
-                go_tui_proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                pass
+            if embedded_mode:
+                # Capture the session id from the still-running
+                # embedded Nexus BEFORE we tear the TUI down, then
+                # quit cleanly. The bbl go parent handles the
+                # child-Nexus SIGTERM via its cleanupManagedNexus
+                # hook, so killing the PTY is enough.
+                #
+                # `bbl go` allocates the server session via
+                # POST /v1/sessions BEFORE spawning the TUI, so
+                # listSessions must already show the row.
+                session_id = discover_session_id_via_nexus(nexus_url)
+                if session_id is None:
+                    return _fail(
+                        master_fd, go_tui_proc, transcript,
+                        "[go-tui-smoke] embedded-persist: could not discover server session id from embedded Nexus",
+                    )
+                send(master_fd, "q")
+                try:
+                    go_tui_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                stop_process(master_fd, go_tui_proc)
+                master_fd = -1  # type: ignore[assignment]
+                go_tui_proc = None  # type: ignore[assignment]
+                # Confirm the embedded Nexus is actually gone.
+                time.sleep(1.0)
+                try:
+                    with urllib.request.urlopen(f"{nexus_url}/v1/runtime/status", timeout=1.0) as response:
+                        # 200 here means the embedded child is
+                        # somehow still alive, which breaks the
+                        # restart-resume invariant.
+                        if response.status == 200:
+                            return _fail(
+                                master_fd, go_tui_proc, transcript,
+                                f"[go-tui-smoke] embedded-persist: embedded Nexus still healthy at {nexus_url} after TUI exit (expected it to be torn down)",
+                            )
+                except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+                    pass
+                # Stand up a second Nexus rooted at the same
+                # BABEL_O_CONFIG_DIR. This one reads the sqlite
+                # the embedded instance just persisted, so
+                # GET /v1/sessions/<id> must still surface the
+                # row. We give it a different port to avoid the
+                # brief TIME_WAIT collision.
+                resume_port = port + 1
+                resume_url = f"http://127.0.0.1:{resume_port}"
+                resume_env = os.environ.copy()
+                resume_env.update(
+                    {
+                        "BABEL_O_CONFIG_FILE": str(config_file),
+                        "BABEL_O_LAUNCH_CWD": str(workspace),
+                        "HOME": str(config_dir),
+                        "NEXUS_HOST": "127.0.0.1",
+                        "NEXUS_PORT": str(resume_port),
+                        "NEXUS_ALLOWED_TOOLS": "*",
+                        "NEXUS_EXECUTE_TIMEOUT_MS": "30000",
+                        "NO_COLOR": "1",
+                    }
+                )
+                resume_cmd = [str(tsx_bin), str(repo / "src" / "nexus" / "server.ts")]
+                resume_proc = subprocess.Popen(
+                    resume_cmd,
+                    cwd=str(repo),
+                    env=resume_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+                try:
+                    wait_for_http(f"{resume_url}/v1/runtime/status", timeout=15.0)
+                except TimeoutError as exc:
+                    try:
+                        stderr = resume_proc.stderr.read(1).decode("utf-8", errors="replace") if resume_proc.stderr else ""
+                    except Exception:
+                        stderr = ""
+                    return _fail(
+                        master_fd, go_tui_proc, transcript,
+                        f"[go-tui-smoke] embedded-persist: resume nexus failed to start: {exc}\n{stderr}",
+                    )
+                try:
+                    if not run_embedded_nexus_persists_session_resume(
+                        resume_url, session_id, timeout=10.0
+                    ):
+                        return _fail(
+                            master_fd, go_tui_proc, transcript,
+                            f"[go-tui-smoke] embedded-persist: resume nexus at {resume_url} did not surface persisted session {session_id!r}",
+                        )
+                finally:
+                    if resume_proc.poll() is None:
+                        try:
+                            os.killpg(resume_proc.pid, signal.SIGTERM)
+                        except OSError:
+                            resume_proc.terminate()
+                        try:
+                            resume_proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            try:
+                                os.killpg(resume_proc.pid, signal.SIGKILL)
+                            except OSError:
+                                resume_proc.kill()
+                print(
+                    f"[go-tui-smoke] embedded-persist: session {session_id!r} survived the embedded Nexus exit and is reachable on a fresh standalone instance",
+                    flush=True,
+                )
+                transcript.append(
+                    f"[embedded-persist] session {session_id} persisted to {config_dir}/db.sqlite and resumed on a fresh standalone Nexus"
+                )
+            else:
+                send(master_fd, "q")
+                try:
+                    go_tui_proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
         finally:
-            stop_process(master_fd, go_tui_proc)
+            if master_fd != -1:
+                stop_process(master_fd, go_tui_proc)
     finally:
-        if nexus_proc.poll() is None:
+        if nexus_proc is not None and nexus_proc.poll() is None:
             try:
                 os.killpg(nexus_proc.pid, signal.SIGTERM)
             except OSError:

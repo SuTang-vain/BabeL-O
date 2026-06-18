@@ -204,15 +204,68 @@ export async function executeToolSafely(
       }
     }
     return {
-      kind: 'error',
-      code: 'TOOL_ERROR',
-      message: errorMessage(error),
-      details: normalizeToolErrorDetails(error, maxOutputBytes),
+      kind: 'result',
+      success: false,
+      output: {
+        code: 'TOOL_EXECUTION_FAILED',
+        toolName: tool.name,
+        message: errorMessage(error),
+        repairHint: repairHintForToolFailure(tool.name, error, input),
+        input: redactRecoverableToolInput(input),
+        details: normalizeToolErrorDetails(error, maxOutputBytes),
+      },
     }
   } finally {
     if (timer) clearTimeout(timer)
     if (onParentAbort) options.signal?.removeEventListener('abort', onParentAbort)
   }
+}
+
+function repairHintForToolFailure(toolName: string, error: unknown, input: unknown): string {
+  if (toolName === 'Grep') {
+    const pattern = input && typeof input === 'object'
+      ? (input as { pattern?: unknown }).pattern
+      : undefined
+    if (typeof pattern === 'string' && pattern.startsWith('-')) {
+      return 'The search pattern starts with "-"; Grep must pass "--" before the pattern when invoking ripgrep. Retry the Grep with the same pattern after the tool fix, or use a safer escaped pattern.'
+    }
+    const message = errorMessage(error)
+    if (/regex|regexp|regular expression|unrecognized flag/i.test(message)) {
+      return 'Check the Grep regex syntax and escape special characters, or simplify the pattern before retrying.'
+    }
+  }
+  if (toolName === 'Read') {
+    return 'Verify the file path with Glob or ListDir, then retry Read with a known in-scope path.'
+  }
+  if (toolName === 'Write') {
+    return 'Verify the parent path is a directory inside the workspace and retry Write with a corrected path.'
+  }
+  if (toolName === 'Edit') {
+    return 'Read the current file contents first, then retry Edit with an exact unique oldString.'
+  }
+  if (toolName === 'Glob') {
+    return 'Verify the search path and glob syntax, or simplify the pattern before retrying Glob.'
+  }
+  if (toolName === 'Bash') {
+    return 'Check whether the command, working directory, and required binaries exist. Prefer dedicated read tools for source inspection.'
+  }
+  if (toolName === 'TaskCreate') {
+    return 'Retry task creation after storage is available, or continue without a persisted task marker.'
+  }
+  return 'Return a corrected tool call if the task still requires this tool, or answer from existing verified evidence.'
+}
+
+function redactRecoverableToolInput(input: unknown): unknown {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input
+  const redacted: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+    if (/api[_-]?key|authorization|auth[_-]?token|password|secret|token/i.test(key)) {
+      redacted[key] = '[REDACTED]'
+    } else {
+      redacted[key] = value
+    }
+  }
+  return redacted
 }
 
 function normalizeRemoteToolRunnerDiagnostics(
