@@ -48,12 +48,12 @@ export class SqliteStorage implements NexusStorage {
           session_id, cwd, prompt, phase, created_at, updated_at, result,
           error, last_user_input,
           queue_id, parent_session_id, assigned_agent_id, current_task_id,
-          failure_reason, terminal_reason, pending_input, metadata
+          failure_reason, terminal_reason, pending_input, metadata, origin_cwd
         ) VALUES (
           :sessionId, :cwd, :prompt, :phase, :createdAt, :updatedAt, :result,
           :error, :lastUserInput,
           :queueId, :parentSessionId, :assignedAgentId, :currentTaskId,
-          :failureReason, :terminalReason, :pendingInput, :metadata
+          :failureReason, :terminalReason, :pendingInput, :metadata, :originCwd
         )
         ON CONFLICT(session_id) DO UPDATE SET
           cwd = excluded.cwd,
@@ -909,7 +909,8 @@ export class SqliteStorage implements NexusStorage {
         { name: 'failure_reason', type: 'TEXT' },
         { name: 'terminal_reason', type: 'TEXT' },
         { name: 'pending_input', type: 'TEXT' },
-        { name: 'metadata', type: 'TEXT' }
+        { name: 'metadata', type: 'TEXT' },
+        { name: 'origin_cwd', type: 'TEXT' },
       ]
       for (const col of expectedSessions) {
         if (!sessionsColumns.includes(col.name)) {
@@ -1185,6 +1186,27 @@ export class SqliteStorage implements NexusStorage {
       `)
       this.db.exec('PRAGMA user_version = 14;')
       version = 14
+    }
+
+    if (version < 15) {
+      // Bug 2 (context-cwd-drift plan §13.4): immutable origin_cwd column.
+      // Written once at session creation (launcher body.cwd / Nexus
+      // defaultCwd), never overwritten by per-turn session.cwd mutations
+      // (saveSession's ON CONFLICT clause does not touch origin_cwd). Phase
+      // B continuity uses it to pull a drifted requestCwd back to the
+      // project root. Backfills existing rows with their current cwd as a
+      // best-effort origin (pre-Bug-2 sessions have no recorded origin).
+      const sessionsColumns = (this.db.prepare(`PRAGMA table_info(sessions)`).all() as Row[]).map(r => String(r.name))
+      if (!sessionsColumns.includes('origin_cwd')) {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN origin_cwd TEXT`)
+      }
+      // Backfill is unconditional + idempotent (WHERE origin_cwd IS NULL):
+      // the column may already exist via the v1 dynamic ALTER above, in
+      // which case the ADD COLUMN is skipped but pre-existing NULL rows
+      // still need backfilling.
+      this.db.exec(`UPDATE sessions SET origin_cwd = cwd WHERE origin_cwd IS NULL`)
+      this.db.exec('PRAGMA user_version = 15;')
+      version = 15
     }
   }
 
@@ -1506,6 +1528,7 @@ function sessionParams(session: SessionSnapshot): Record<string, string | null> 
     terminalReason: session.terminalReason ? JSON.stringify(session.terminalReason) : null,
     pendingInput: session.pendingInput ? JSON.stringify(session.pendingInput) : null,
     metadata: session.metadata ? JSON.stringify(session.metadata) : null,
+    originCwd: session.originCwd ?? null,
   }
 }
 
@@ -1596,6 +1619,7 @@ function rowToSession(row: Row, events: NexusEvent[]): SessionSnapshot {
     terminalReason: row.terminal_reason ? JSON.parse(String(row.terminal_reason)) : undefined,
     pendingInput: row.pending_input ? JSON.parse(String(row.pending_input)) : undefined,
     metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
+    originCwd: nullableString(row.origin_cwd),
   }
 }
 

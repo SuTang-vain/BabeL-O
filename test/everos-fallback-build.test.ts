@@ -6,7 +6,7 @@ import { test } from 'node:test'
 import {
   buildEverOSSourceWithPip,
   detectPipFallbackAvailability,
-} from '../src/cli/everosFallbackBuild.js'
+} from '../src/runtime/everosFallbackBuild.js'
 
 function makeTempDir(): { dir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'babel-o-fallback-build-'))

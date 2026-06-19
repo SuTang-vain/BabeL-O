@@ -2,6 +2,1289 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionWebSocketLifecycle Slice
+
+- **背景**: `ActiveExecutionLease` 收口后，WebSocket `/v1/stream` route 仍直接管理 client close listener、`closedByClient` 状态和 timeout / summary event sender callback。该逻辑属于 WebSocket lifecycle boundary；route 层应只持有 lifecycle tracker 和 event sender，不应内联 listener cleanup 与 open-socket metric 记录细节。
+- **实现**:
+  - 扩展 `src/nexus/executionWebSocketControl.ts`，新增 `trackWebSocketClientClose()`，封装 close listener 注册、`closedByClient` 读取和 cleanup。
+  - 新增 `createWebSocketEventSender()`，统一 open-socket event send 与 `metrics.recordStreamEvent(socket.bufferedAmount)` 记录，用于 timeout / summary event callback。
+  - WebSocket `/v1/stream` 改为持有 `clientCloseTracker` 与 `sendTimeoutEvent`；busy rejection 和 finally 都走 tracker cleanup，finish metrics 继续读取 client-closed 状态。
+  - 扩展 `test/execution-websocket-control.test.ts`，锁定 close tracker cleanup 与 event sender metric 行为。
+  - `app.ts` 当前为 864 lines；`src/nexus/executionWebSocketControl.ts` 为 133 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-lifecycle.json npx tsx --test --test-concurrency=1 test/execution-websocket-control.test.ts`：7/7 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-lifecycle-runtime.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream relays and persists context blocking events|websocket stream timeout aborts long-running tools|WebSocket /v1/stream blocks model without tool calling support|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：4/4 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 864 lines。已知历史 debt 保持不变：`sharedToOutside` 仍为 `src/shared/config.ts -> providers/registry.ts`。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 route lifecycle、request/response contracts、timeout lifecycle、settlement 调用和 remaining socket wiring 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, event append/persist/send ordering, timeout policy semantics, stream metrics semantics, settlement semantics, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ActiveExecutionLease Slice
+
+- **背景**: `ExecutionStreamLoop` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 仍在 route 层用不同方式清理 active execution：HTTP 临时保存 `activeSessionId` / `activeRequestId`，WS 保存 `AbortController` 再通过 `clearByAbortController()` 反查。该逻辑属于 active execution lifecycle boundary；route 层应只持有一个 cleanup handle，不应知道 registry 内部清理键。
+- **实现**:
+  - 扩展 `src/nexus/activeExecutionRegistry.ts`，让 `register()` 返回 `ActiveExecutionLease`，并提供幂等 `release()`。
+  - HTTP `/v1/execute` 与 WebSocket `/v1/stream` 改为保存 `activeExecutionLease` 并在 finally 调 `release()`；route 层不再持有 HTTP `activeSessionId` / `activeRequestId` 清理变量，也不再通过 WS abort controller 反查清理。
+  - 保留 `snapshot()` / `cancel()` / `clearByAbortController()` 旧能力；cancel/resume routers 的 contract 不变。
+  - 新增 `test/active-execution-registry.test.ts`，锁定 lease release 幂等、旧 lease 不会清掉同 session 的新 request，以及 cancel 后 release 能清掉当前 execution。
+  - `app.ts` 当前为 865 lines；`src/nexus/activeExecutionRegistry.ts` 为 75 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-active-execution-registry.json npx tsx --test --test-concurrency=1 test/active-execution-registry.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-active-execution-lease-runtime2.json npx tsx --test --test-concurrency=1 --test-name-pattern "remote cancel aborts active execution and resume returns session snapshot|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|websocket stream timeout aborts long-running tools" test/runtime.test.ts`：3/3 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 route lifecycle、request/response contracts、timeout lifecycle、settlement 调用和 socket cleanup 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, active execution snapshot/cancel response shape, timeout policy semantics, stream metrics semantics, settlement semantics, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionStreamLoop Slice
+
+- **背景**: `ExecutionWebSocketForwarding` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 仍各自内联 runtime event loop 控制流：调用 `runtime.executeStream()`、处理单事件 sink、追加 near-timeout checkpoint，并在 WS path 追踪 result/error terminal state。该逻辑是 execute/stream 共同的 stream-loop boundary，不属于 request preparation、timeout controls、settlement、HTTP envelope 或 socket cleanup。
+- **实现**:
+  - 新增 `src/nexus/executionStreamLoop.ts`，承载 `runExecutionStreamLoop()` 与窄类型 `ExecutionStreamLoopResult` / `ExecutionStreamLoopForwardResult`。
+  - HTTP `/v1/execute` 改为用该 helper 跑 runtime stream；route 层继续负责 execution gate、active registry、timeout controls cleanup、settlement、execute finish metrics 与 HTTP result envelope。
+  - WebSocket `/v1/stream` 通过同一 helper 跑 runtime stream，并注入 `forwardProcessedRuntimeEvent()` 与 `sendTimeoutEvent` callback；route 层继续负责 socket message parsing、permission_response 快路径、execution gate、active registry、timeout controls cleanup、settlement、socket cleanup 与 stream finish metrics。
+  - 新增 `test/execution-stream-loop.test.ts`，锁定 HTTP-style loop 的 persist + near-timeout warning + terminal result tracking，以及 WS-style forwarding closed 时停止 loop 且不追加 near-timeout checkpoint。
+  - `app.ts` 当前为 871 lines；新增 `src/nexus/executionStreamLoop.ts` 为 69 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但共享 event loop 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-stream-loop.json npx tsx --test --test-concurrency=1 test/execution-stream-loop.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-forwarding.json npx tsx --test --test-concurrency=1 test/execution-websocket-control.test.ts`：5/5 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-stream-loop-runtime.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events|execute timeout preserves partial result and emits near-timeout warning|execute permission denial: user denies → tool_denied \+ result\(false\)|/v1/execute returns context blocking status in result envelope|websocket stream relays and persists context blocking events|websocket stream timeout aborts long-running tools|WebSocket /v1/stream blocks model without tool calling support|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：8/8 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 871 lines。已知历史 debt 保持不变：`sharedToOutside` 仍为 `src/shared/config.ts -> providers/registry.ts`。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 route lifecycle、request/response contracts、socket lifecycle 和 settlement 调用仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, event append/persist/send ordering, timeout policy semantics, stream metrics semantics, settlement semantics, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionWebSocketForwarding Slice
+
+- **背景**: `ExecutionSettlement` 收口后，WebSocket `/v1/stream` event loop 仍内联 processed runtime event 的转发细节：`cache_health` 先发、主 decorated event 后发、socket closed 时 abort、只对主 stream event 记录 `metrics.recordStreamEvent()`。该逻辑是 WebSocket forwarding boundary，不属于 runtime event processing sink、settlement、timeout controls 或 route cleanup。
+- **实现**:
+  - 扩展 `src/nexus/executionWebSocketControl.ts`，新增 `forwardProcessedRuntimeEvent()` 与窄类型 `ProcessedRuntimeEventForForwarding` / `StreamMetricsRecorder`。
+  - WebSocket `/v1/stream` event loop 改为调用该 helper；route 层继续负责 near-timeout warning、result/error tracking、timeout/settlement、socket cleanup、active execution cleanup 与 stream finish metrics。
+  - 扩展 `test/execution-websocket-control.test.ts`，锁定 `cache_health` 在 decorated event 前发送、仅主 event 记录一次 stream metric，以及 socket 已关闭时 abort 且不发送主 event。
+  - 顺手把 `test/execution-settlement.test.ts` 的 `tool_denied` fixture 收敛为真实 `NexusEvent` schema（补 `risk`、移除不存在的 `toolUseId`），避免 typecheck 继续依赖宽松假对象。
+  - `app.ts` 当前为 891 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 WebSocket processed event forwarding 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-forwarding.json npx tsx --test --test-concurrency=1 test/execution-websocket-control.test.ts`：5/5 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-settlement.json npx tsx --test --test-concurrency=1 test/execution-settlement.test.ts`：2/2 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 891 lines。已知历史 debt 保持不变：`sharedToOutside` 仍为 `src/shared/config.ts -> providers/registry.ts`。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop control flow 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, event append/persist/send ordering, cache-health schema, stream metrics semantics, timeout policy semantics, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionSettlement Slice
+
+- **背景**: `ExecutionTimeoutControls` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 仍各自内联 loop 后结算逻辑：result/error 提取、timeout partial result 追加、recoverable tool denial 成功归因、session finalization、`execute_summary` append/persist/send。该逻辑是 execution settlement boundary，不属于 runtime event loop、event processing sink、timeout controls 或 HTTP envelope assembly。
+- **实现**:
+  - 扩展 `src/nexus/executionFinalization.ts`，新增 `ExecutionSettlementResult` 与 `settleExecutionSession()`。
+  - HTTP `/v1/execute` loop 后改为调用 `settleExecutionSession()`，route 层继续负责 `metrics.recordExecuteFinish()` 与 `buildExecuteResultEnvelope()`。
+  - WebSocket `/v1/stream` loop 后改为调用同一 helper，并通过既有 `sendTimeoutEvent` closure 发送 timeout partial result 和 `execute_summary`；route 层继续负责 socket cleanup、active execution cleanup 和 `metrics.recordStreamFinish()`。
+  - 新增 `test/execution-settlement.test.ts`，锁定 timeout partial result + summary append/send 顺序，以及 recoverable tool denial only turn 的成功归因。
+  - `app.ts` 当前为 902 lines；`src/nexus/executionFinalization.ts` 为 193 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 shared settlement 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-settlement.json npx tsx --test --test-concurrency=1 test/execution-settlement.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-settlement-runtime.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events|execute timeout preserves partial result and emits near-timeout warning|execute permission denial: user denies → tool_denied \+ result\(false\)|/v1/execute returns context blocking status in result envelope|websocket stream relays and persists context blocking events|websocket stream timeout aborts long-running tools|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：7/7 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 902 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop control flow 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, summary schema, HTTP envelope shape, stream finish metrics, timeout policy semantics, event append/persist/send ordering, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionTimeoutControls Slice
+
+- **背景**: `ExecutionEventSink` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 仍各自内联 timeout controls setup：`effectiveTimeoutMs` 推导、near-timeout watcher 启动、soft-timeout cycle 启动与 cleanup。该逻辑属于 timeout controls 接线，不属于 runtime event loop、主 watchdog abort、finalization 或 response/stream contract。
+- **实现**:
+  - 扩展 `src/nexus/executionTimeoutEvents.ts`，新增 `ExecutionTimeoutControls` 与 `startExecutionTimeoutControls()`。
+  - HTTP `/v1/execute` 与 WebSocket `/v1/stream` 统一通过该 helper 启动 near-timeout watcher 和 soft-timeout cycle；route 层仍保留主 watchdog `timeout` 的 `clearTimeout()`、事件循环、near-timeout 检查点和 socket-close abort handling。
+  - WebSocket path 保留本地 `sendTimeoutEvent` closure，继续由 route 层控制 open-only send 与 `metrics.recordStreamEvent()`。
+  - `app.ts` 当前为 946 lines；`src/nexus/executionTimeoutEvents.ts` 为 382 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 timeout controls setup 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-timeout-controls-focused.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning|execute soft timeout policy emits timeout_budget_exceeded once when the soft budget is reached and keeps the runtime live|execute soft timeout policy auto-grants one extension by default and emits both budget\+grant events in order|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|execute fatal timeout policy never decorates REQUEST_TIMEOUT with details.kind=watchdog|execute honours per-request timeoutMs from Go TUI WebSocket payload|websocket stream timeout aborts long-running tools|WebSocket /v1/stream blocks model without tool calling support|websocket stream relays and persists context blocking events" test/runtime.test.ts`：9/9 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 946 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop control flow 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, timeout event schema, soft timeout extension semantics, main watchdog abort semantics, event append/persist/send ordering, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionEventSink Slice
+
+- **背景**: `ExecutionWebSocketControl` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 的 runtime event loop 仍重复一段单事件处理顺序：soft watchdog error decoration、push 到本轮 events、append storage、record NexusMetrics、BehaviorMonitor ingest、派生并持久化 `cache_health`。该逻辑是 event processing boundary，不属于 loop 控制流、near-timeout watcher 或 socket close handling，本轮抽成单事件 sink helper。
+- **实现**:
+  - 扩展 `src/nexus/executionEventProcessing.ts`，新增 `processRuntimeExecutionEvent()` 与 `BehaviorMonitorLike` / `ProcessRuntimeExecutionEventResult`。
+  - HTTP `/v1/execute` event loop 改为调用 `processRuntimeExecutionEvent()`，随后按原顺序追加 near-timeout warning。
+  - WebSocket `/v1/stream` event loop 改为调用同一 helper，helper 负责 decorate / persist / metrics / ingest / cache-health persistence；WS path 仍在 helper 返回后按原顺序 forward `cache_health` 与主事件，并保留 socket closed abort check、near-timeout warning、success/timedOut tracking。
+  - 新增 `test/execution-event-processing.test.ts`，锁定 watchdog timeout 在 persist/ingest 前被 decorate，以及 `execution_metrics` 后派生的 `cache_health` 按顺序持久化。
+  - `app.ts` 当前为 1022 lines；`src/nexus/executionEventProcessing.ts` 为 119 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但单事件 processing sink 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-event-processing.json npx tsx --test --test-concurrency=1 test/execution-event-processing.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-event-sink-timeout.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|execute fatal timeout policy never decorates REQUEST_TIMEOUT with details.kind=watchdog" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-event-sink-ws.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream relays and persists context blocking events|execute honours per-request timeoutMs from Go TUI WebSocket payload|WebSocket /v1/stream blocks model without tool calling support" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-event-sink-cache.json npx tsx --test --test-concurrency=1 --test-name-pattern "runtime metrics aggregates cache-aware performance diagnostics|runtime metrics exposes provider invocation, agent loop, and cache health summaries|execute reads a workspace file and records session events" test/runtime.test.ts`：2 matching tests pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop control flow 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, event append/persist/send ordering, timeout policy semantics, cache health schema/dedup, BehaviorMonitor ingest, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionWebSocketControl Slice
+
+- **背景**: `ExecutionRuntimeOptions` 收口后，WebSocket `/v1/stream` 仍在 `app.ts` 内联 JSON parse、permission_response 快路径 resolve 与 socket send helper。这些是 WebSocket control helpers，不属于 runtime event loop ordering，本轮作为独立小切片抽出。
+- **实现**:
+  - 新增 `src/nexus/executionWebSocketControl.ts`，承载 `parseJsonObject()`、`sendJson()`、`resolvePermissionResponseMessage()` 与 `WebSocketLike` 结构类型。
+  - `app.ts` 的 `/v1/stream` message handler 只调用 `resolvePermissionResponseMessage(parsedJson)` 处理 permission response 快路径；执行消息解析、execution gate、timeout watcher、event persist/send、summary append、finalization 与 metrics 行为保持不变。
+  - 新增 `test/execution-websocket-control.test.ts`，锁定 invalid JSON fallback、open-only send 与 permission response resolver contract。
+  - `app.ts` 当前为 1050 lines；`src/nexus/executionWebSocketControl.ts` 为 63 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 WebSocket control helpers 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-control.json npx tsx --test --test-concurrency=1 test/execution-websocket-control.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-ws-control-regression.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute honours per-request allowedTools for Bash in soft-deny mode|execute honours per-request timeoutMs from Go TUI WebSocket payload|WebSocket /v1/stream blocks model without tool calling support" test/runtime.test.ts`：3/3 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop wiring 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, permission response semantics, runtime execution order, timeout policy semantics, event persistence/sending order, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionRuntimeOptions Slice
+
+- **背景**: `ExecutionHttpResult` 收口后，HTTP `/v1/execute` 与 WebSocket `/v1/stream` 两条路径仍各自内联同一组 `runtime.executeStream()` options assembly：storage 注入、cwd continuity inputs、policy mode、allowed paths/tools、remote runner、timeout signal 与 output budgets。该逻辑是 execute/stream 共同依赖边界，不属于 event loop ordering，本轮作为独立小切片抽出。
+- **实现**:
+  - 新增 `src/nexus/executionRuntimeOptions.ts`，承载 `buildRuntimeExecuteOptions()`。
+  - `app.ts` 的 HTTP 与 WebSocket 两处 `runtime.executeStream()` 调用统一通过该 helper 组装参数；事件收集、persist/send 顺序、timeout watcher、summary append、finalization、metrics 与 response/stream contract 均保持不变。
+  - 新增 `test/execution-runtime-options.test.ts`，锁定 storage、remote runner、timeout signal、policy/allowedTools、allowedPaths、continuity inputs 与 maxToolOutput fallback 的传递契约。
+  - `app.ts` 当前为 1089 lines；`src/nexus/executionRuntimeOptions.ts` 为 42 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 runtime execute option assembly 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-execution-runtime-options.json npx tsx --test --test-concurrency=1 test/execution-runtime-options.test.ts`：2/2 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 的 event loop wiring 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, runtime execution order, timeout policy semantics, event persistence/sending order, permission policy, storage schema, or runtime behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionHttpResult Slice
+
+- **背景**: `RuntimeMetricsSnapshot` 收口后，`app.ts` 的 HTTP `/v1/execute` 仍内联 result envelope / status-code assembly：`context_blocking` → 413、`REQUEST_TIMEOUT` → 408、`execute_summary` 元数据回填 envelope。该逻辑是 HTTP response assembly，不属于 runtime event loop 或 WebSocket stream，本轮先作为独立小切片抽出。
+- **实现**:
+  - 新增 `src/nexus/executionHttpResult.ts`，承载 `runtimeResultStatusCode()` 与 `buildExecuteResultEnvelope()`。
+  - `app.ts` 在 HTTP `/v1/execute` finalize 后调用 `buildExecuteResultEnvelope()`；事件收集、summary append、session finalization、metrics finish、REST status 200 wrapper 和 WebSocket path 均保持不变。
+  - `app.ts` 当前为 1123 lines；`src/nexus/executionHttpResult.ts` 为 48 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 HTTP execute response assembly 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-http-result-basic.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-http-result-timeout.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-http-result-context.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/execute returns context blocking status in result envelope" test/runtime.test.ts`：1/1 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, HTTP status wrapper, execute result envelope shape, execute summary semantics, event persistence, runtime behavior, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: RuntimeMetricsSnapshot Slice
+
+- **背景**: `ExecutionEventProcessing` 收口后，`app.ts` 仍内联 `/v1/runtime/metrics` 使用的 runtime metrics snapshot 聚合逻辑：provider invocation metrics、agent loop metrics、agent job metrics、cache health summary 与 storage recent-session scan。这块属于 runtime metrics response assembly，不属于 Fastify route wiring 或 execute/stream contract，适合独立抽成可 review helper。
+- **实现**:
+  - 新增 `src/nexus/runtimeMetricsSnapshot.ts`，承载 `buildRuntimeMetricsSnapshot()`、provider invocation / agent loop / agent job metrics 聚合 helper、cache-health snapshot 组合逻辑。
+  - `app.ts` 仅通过 router context closure 调用 `buildRuntimeMetricsSnapshot(metrics, options.storage)`；`runtimeMetricsRouter` route contract、response shape、storage scan 范围、cache health semantics 与 NexusMetrics accumulator 行为保持不变。
+  - `app.ts` 当前为 1133 lines；`src/nexus/runtimeMetricsSnapshot.ts` 为 310 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 runtime metrics aggregation helper 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-metrics-snapshot-router.json npx tsx --test --test-concurrency=1 test/runtime-metrics-router.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-metrics-snapshot-aggregate.json npx tsx --test --test-concurrency=1 --test-name-pattern "runtime metrics aggregates cache-aware performance diagnostics" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-metrics-snapshot-basic.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events" test/runtime.test.ts`：1/1 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, `/v1/runtime/metrics` response shape, NexusMetrics accumulator semantics, cache health snapshot semantics, execution metrics persistence, runtime behavior, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionEventProcessing Slice
+
+- **背景**: `ExecutionFinalization` 收口后，`app.ts` 仍内联 HTTP / WebSocket 共享的 execution event processing 规则：`execution_metrics` 写入 NexusMetrics、`execution_metrics` 后派生 `cache_health`、soft policy watchdog `REQUEST_TIMEOUT` error decoration。这些规则属于执行事件处理边界，不属于 route contract 本体，适合独立抽成可 review helper。
+- **实现**:
+  - 新增 `src/nexus/executionEventProcessing.ts`，承载 `recordExecutionEventMetrics()`、`maybeBuildExecutionCacheHealthEvent()`、`maybeDecorateWatchdogError()`。
+  - `app.ts` 仅在 HTTP `/v1/execute` 与 WebSocket `/v1/stream` event loop 中调用这些 helper；route contract、event append/persist/send 顺序、timeout scheduling、summary append、BehaviorMonitor ingest 与 metrics finish 行为保持不变。
+  - `app.ts` 当前为 1450 lines；`src/nexus/executionEventProcessing.ts` 为 76 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但 execution metrics/cache health/watchdog decoration 规则已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-timeout.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-context.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream relays and persists context blocking events|/v1/execute returns context blocking status in result envelope" test/runtime.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-basic.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events|runtime metrics exposes provider invocation, agent loop, and cache health summaries" test/runtime.test.ts`：1 matching test pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-denial.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute honours per-request policy=soft-deny for write/execute tools|execute with default strict policy emits recoverable policy denial for execute-risk Bash" test/runtime.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-metrics.json npx tsx --test --test-concurrency=1 --test-name-pattern "runtime metrics aggregates cache-aware performance diagnostics" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-events-fatal.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute fatal timeout policy never decorates REQUEST_TIMEOUT with details.kind=watchdog" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-cache-health.json npx tsx --test test/cache-health.test.ts`：28/28 pass。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, event persistence order, timeout policy semantics, cache health event schema, runtime metrics snapshot shape, BehaviorMonitor ingest, runtime behavior, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionFinalization Slice
+
+- **背景**: `ExecutionPreparation` 收口后，`app.ts` 仍内联 HTTP / WebSocket 共享的 execution finalization 状态机：session phase/result/error 写回、terminalReason 分类、context-blocking recovery metadata、recoverable tool-denial success 归因和 execute summary outcome。它不属于 route contract 本体，适合独立抽成可 review helper。
+- **实现**:
+  - 新增 `src/nexus/executionFinalization.ts`，承载 `finalizeExecutionSession()`、`executeSummaryOutcome()`、`isRecoverableToolDenialOnlyTurn()`、runtime terminal reason 分类与 context-blocking recovery metadata helpers。
+  - `app.ts` 仅在 HTTP `/v1/execute` 与 WebSocket `/v1/stream` 结束路径调用这些 helper；route contract、event loop、timeout scheduling、watchdog decoration、summary append 与 metrics recording 保持在 `app.ts`。
+  - `app.ts` 当前为 1545 lines；`src/nexus/executionFinalization.ts` 为 119 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但共享 finalization / outcome 状态机已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-timeout.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning|execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-denial.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute honours per-request policy=soft-deny for write/execute tools" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-denial2.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute with default strict policy emits recoverable policy denial for execute-risk Bash" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-context2.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream relays and persists context blocking events|/v1/execute returns context blocking status in result envelope" test/runtime.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-basic.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute reads a workspace file and records session events" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-final-cancel.json npx tsx --test --test-concurrency=1 --test-name-pattern "remote cancel aborts active execution and resume returns session snapshot" test/runtime.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 1545 lines。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, timeout policy semantics, cancel/resume semantics, context-blocking recovery metadata shape, recoverable denial semantics, event schema, runtime behavior, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionPreparation Slice
+
+- **背景**: `ExecutionTimeoutEvents` 收口后，`app.ts` 仍在 `/v1/execute` 与 `/v1/stream` 之间内联共享 request schema、timeout decision、cwd/session 初始化、model capability gate、policy/allowTools 解析和 continuity input 派生。直接迁移 route 仍过大；本轮先抽 execution preparation state machine，让两条 route 共享窄入口。
+- **实现**:
+  - 新增 `src/nexus/executionPreparation.ts`，承载 `executeSchema`、`prepareExecution()`、`isPrepareError()`、`ExecuteTimeoutDecision` / `WatchdogState` types、timeout decision、session snapshot creation、request cwd resolution、model tool-calling guard、`originCwd` / `latestTaskPrimaryRoot` continuity input 派生。
+  - `app.ts` 改为向 `prepareExecution()` 显式传入 `storage`、`defaultCwd`、`remoteRunnerAvailable`、`executeTimeoutMs` 与 `executePolicyMode`；HTTP `/v1/execute` 和 WebSocket `/v1/stream` route contract、event append、timeout event scheduling、watchdog decoration 和 finalization 仍留在 `app.ts`。
+  - `app.ts` 当前为 1642 lines；`src/nexus/executionPreparation.ts` 为 346 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但共享 preparation / validation / continuity 状态机已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-prep-model.json npx tsx --test --test-concurrency=1 --test-name-pattern "POST /v1/execute blocks model without tool calling support|WebSocket /v1/stream blocks model without tool calling support" test/runtime.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-prep-timeout-policy.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute honours per-request timeoutMs from Go TUI WebSocket payload|execute honours per-request policy=soft-deny for write/execute tools|execute honours per-request allowedTools for Bash in soft-deny mode" test/runtime.test.ts`：3/3 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-prep-cancel.json npx tsx --test --test-concurrency=1 --test-name-pattern "remote cancel aborts active execution and resume returns session snapshot" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-exec-prep-dual-site.json npx tsx --test --test-concurrency=1 test/dual-site-resolver.test.ts test/session-origin-cwd.test.ts test/session-root-continuity.test.ts`：27/27 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 1642 lines。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, timeout policy semantics, model selection behavior, cwd continuity behavior, permission policy semantics, cancel/resume semantics, event schema, runtime behavior, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionTimeoutEvents Slice
+
+- **背景**: `ActiveExecutionRegistry` 收口后，`app.ts` 仍只剩 `/v1/execute` 与 `/v1/stream` 两条 inline routes。直接迁移任一路由会同时触碰 HTTP response、WebSocket fan-out、timeout policy、watchdog decoration 与 execution finalization。本轮选择两条执行入口共享的 timeout event / watcher helper，先把事件构造、near-timeout warning、soft-timeout cycle、partial timeout result 和 execute summary builder 从 `app.ts` 抽出，不移动 route 本体。
+- **实现**:
+  - 新增 `src/nexus/executionTimeoutEvents.ts`，封装 `near_timeout_warning`、`timeout_budget_exceeded`、`timeout_extension_granted`、timeout partial `result` 与 `execute_summary` 的构造 / append / scheduling helper。
+  - `app.ts` 改为显式传入 `storage` 与 `now()` clock；timeout policy 决策、watchdog error decoration、HTTP `/v1/execute` 与 WebSocket `/v1/stream` route contract 仍留在 `app.ts`。
+  - `app.ts` 当前为 1957 lines；`src/nexus/executionTimeoutEvents.ts` 为 330 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但共享 timeout event machinery 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-timeout-events-near.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute timeout preserves partial result and emits near-timeout warning" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-timeout-events-soft.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute soft timeout policy emits timeout_budget_exceeded once when the soft budget is reached and keeps the runtime live|execute soft timeout policy auto-grants one extension by default and emits both budget\\+grant events in order|execute soft timeout policy stops granting extensions after maxSoftTimeoutExtensions is reached|execute fatal timeout policy never emits timeout_budget_exceeded" test/runtime.test.ts`：4/4 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-timeout-events-ws.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream timeout aborts long-running tools|execute honours per-request timeoutMs from Go TUI WebSocket payload" test/runtime.test.ts`：2/2 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 1957 lines。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 REST / WebSocket contract, timeout policy semantics, watchdog decoration rules, event schema, runtime behavior, cancel/resume semantics, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ActiveExecutionRegistry Slice
+
+- **背景**: `contextObserveRouter` 收口后，`app.ts` 只剩 `/v1/execute` 与 `/v1/stream` 两条 inline routes。直接迁移任一路由都会触碰执行循环、timeout、active execution、cancel/resume 与 WebSocket event fan-out。为保持 one PR = one semantic slice，本轮先抽两条执行入口共享的 active execution 状态，而不移动 HTTP / WS route 本身。
+- **实现**:
+  - 新增 `src/nexus/activeExecutionRegistry.ts`，封装 process-local active execution registry。
+  - `app.ts` 不再持有裸 `Map<string, ActiveExecution>` 或本地 `registerActiveExecution()` / `clearActiveExecution()` helper；改为调用 `ActiveExecutionRegistry.register()`、`clear()`、`snapshot()`、`cancel()` 与 `clearByAbortController()`。
+  - `sessionResumeRouter` 继续通过只读 `getActiveExecutionSnapshot()` closure 获取 `{ requestId, transport, startedAt } | null`；`sessionCancelRouter` 继续通过 `cancelActiveExecution()` closure abort 当前 execution，不接触 registry 内部结构。
+  - `app.ts` 当前为 2305 lines；`src/nexus/activeExecutionRegistry.ts` 为 63 lines。剩余 inline routes 仍为 `/v1/execute` 与 `/v1/stream`，但共享 process state 已从 `app.ts` 移出。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-active-execution-registry-cancel.json npx tsx --test --test-concurrency=1 --test-name-pattern "remote cancel aborts active execution and resume returns session snapshot" test/runtime.test.ts`：1/1 pass，覆盖 resume snapshot、remote cancel abort、child session cancel 和 registry cleanup 后 resume。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-active-execution-registry-watchdog.json npx tsx --test --test-concurrency=1 --test-name-pattern "execute soft policy watchdog decorates REQUEST_TIMEOUT with details.kind=watchdog and cleans the active execution registry" test/runtime.test.ts`：1/1 pass，覆盖 watchdog timeout 后 registry cleanup。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-active-execution-registry-ws-busy.json npx tsx --test --test-concurrency=1 --test-name-pattern "websocket stream concurrency gate rejects excess work" test/runtime.test.ts`：1/1 pass，覆盖 WebSocket path active execution / concurrency gate 邻近行为。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 2305 lines。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；`/v1/execute` 与 `/v1/stream` 仍在 `app.ts`。
+  - 不改变 runtime execution contract, timeout behavior, cancel/resume response shape, active execution lifetime semantics, WebSocket stream payloads, or SQLite schema。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: ContextObserveRouter Slice
+
+- **背景**: `workingSetObserveRouter` 收口后，`app.ts` 只剩 `/v1/execute`、`/v1/stream` 和 `/v1/context/observe` 三个 inline routes。本轮选择 `/v1/context/observe`，因为它是独立 observer WebSocket，有专门的 `test/context-observe-websocket.test.ts` 覆盖 snapshot、filter、reconnect 和 cleanup 行为，不触碰 runtime execution loop 或主 `/v1/stream`。
+- **实现**:
+  - 新增 `src/nexus/routers/contextObserveRouter.ts`，接管 GET `/v1/context/observe` WebSocket。
+  - 保留 `cwd` / `sessionId` query 语义、`MISSING_CWD` 1008 close、initial `assembled_snapshot`、per-session last context snapshot、live `assembled` fan-out、sessionId filter 和 close/error cleanup 行为。
+  - 将 `defaultContextBroadcaster` legacy fallback 移到 router 内部；`app.ts` 不再直接持有 context observer 的 broadcaster 变量，也不再 import `defaultContextBroadcaster`。
+  - `app.ts` 当前为 2343 lines；`src/nexus/routers/contextObserveRouter.ts` 为 69 lines；router 文件数为 37。剩余 inline routes 只剩 `/v1/execute` 与 `/v1/stream`。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-context-observe-router.json npx tsx --test --test-concurrency=1 test/context-observe-websocket.test.ts`：7/7 pass，覆盖 initial snapshot、default broadcaster fan-out、sessionId filter、multi-client broadcast、missing cwd、reconnect snapshot 和 subscriber cleanup。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 2343 lines，`defaultContextBroadcaster` references moved from `app.ts` to `contextObserveRouter.ts` compatibility boundary。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；剩余高风险 route 为 `/v1/execute` 与 `/v1/stream`。
+  - 不改变 runtime execution contract, main WebSocket stream, context broadcaster implementation, assembled context payload shape, or context observer WebSocket payload shape。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: WorkingSetObserveRouter Slice
+
+- **背景**: `sessionTaskMutationRouter` 收口后，`app.ts` 剩余 inline routes 为 `/v1/execute`、`/v1/stream`、`/v1/working-set/observe`、`/v1/context/observe`。本轮选择 `/v1/working-set/observe`，因为它是独立的 observer WebSocket，可用既有 `test/working-set-observe-websocket.test.ts` 精准验证，不触碰 runtime execution loop 或主 session stream。
+- **实现**:
+  - 新增 `src/nexus/routers/workingSetObserveRouter.ts`，接管 GET `/v1/working-set/observe` WebSocket。
+  - 保留 `cwd` / `sessionId` query 语义、`MISSING_CWD` 1008 close、load failure 1011 close、initial `working_set_snapshot`、`working_set_updated` / `working_set_reset` 推送和 sessionId filter 行为。
+  - 将 per-app fallback `WorkingSetBroadcaster` 创建移入 router register closure，同时继续优先使用 injected `options.workingSetBroadcaster`，避免改变测试和 app composition 语义。
+  - `app.ts` 当前为 2397 lines；`src/nexus/routers/workingSetObserveRouter.ts` 为 95 lines；router 文件数为 36。剩余 inline routes 只剩 `/v1/execute`、`/v1/stream`、`/v1/context/observe`。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-working-set-observe-router.json npx tsx --test --test-concurrency=1 test/working-set-observe-websocket.test.ts`：10/10 pass，覆盖 snapshot、update、sessionId filter、multi-client shared broadcaster、missing cwd 和 broadcaster unit 行为。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-context-working-set-rest-put.json npx tsx --test --test-concurrency=1 test/context-working-set-rest-put.test.ts`：12/12 pass，覆盖 working-set write path 与 broadcaster update 仍可串联。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 2397 lines，`ConfigManager.getInstance` in `app.ts` 为 1。
+- **边界**:
+  - Phase 4A+ 未关闭；剩余高风险 route 为 `/v1/execute`、`/v1/stream`、`/v1/context/observe`。
+  - 不改变 runtime execution contract, main WebSocket stream, context observe stream, working-set persistence schema, REST working-set write behavior, or WebSocket event payload shape。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: SessionTaskMutationRouter Slice
+
+- **背景**: `sessionCancelRouter` 收口后，`app.ts` 剩余 route 集中在 `/v1/execute`、session task mutation cluster 和 WebSocket streams。task mutation cluster 内部共用 mutation audit、revision conflict、dependency propagation、child-session cleanup、sub-agent rerun 和 worktree recovery helper；若只抽一半会制造双 source of truth。因此本轮按 one PR = one semantic slice，把 session task mutation ownership 整体迁入单独 router，不触碰 `/v1/execute` 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionTaskMutationRouter.ts`，接管 POST `/v1/sessions/:sessionId/tasks`、PATCH `/v1/sessions/:sessionId/tasks/:taskId`、以及 task action routes：`claim`、`complete`、`fail`、`cancel`、`retry`、`rerun-subagent`、`worktree-recovery`、`approve`、`reject`。
+  - 将 task mutation schemas、`mutateTaskAction()`、revision conflict、idempotent create、task mutation audit event、dependency fail/restore、child session cancel、pending review guard、sub-agent rerun 和 worktree recovery helper 迁入 router 私有实现，不新增公共 helper API。
+  - `app.ts` 只注册 `sessionTaskMutationRouter`；移除 task mutation 内联 routes、schemas、helper types、`removeWorktree` import 和 `NexusTask` / `TaskStatus` import。
+  - `app.ts` 当前为 2476 lines；`src/nexus/routers/sessionTaskMutationRouter.ts` 为 739 lines。剩余 inline routes 只剩 `/v1/execute`、`/v1/stream`、`/v1/working-set/observe`、`/v1/context/observe`。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-task-mutation-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "session task API supports idempotent create, mutation audit, dependency cleanup, and review actions" test/runtime.test.ts`：1/1 pass，覆盖 idempotent create、revision conflict、update/claim/complete/fail/cancel/retry、dependency cleanup、sub-agent rerun、worktree recovery、review approve/reject 和 mutation audit。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-task-mutation-lifecycle.json npx tsx --test --test-concurrency=1 --test-name-pattern "session input, cancel, and task lifecycle endpoints update state" test/runtime.test.ts`：1/1 pass，覆盖 task create/claim/complete 与 session input/cancel 串联。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 2476 lines，`ConfigManager.getInstance` in `app.ts` 为 1。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；剩余高风险 route 为 `/v1/execute`、`/v1/stream`、`/v1/working-set/observe`、`/v1/context/observe`。
+  - 不改变 runtime execution contract, WebSocket stream behavior, SQLite schema, task mutation response envelopes, mutation audit payload shape, sub-agent rerun semantics, worktree recovery semantics, or dependency cleanup behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: SessionCancelRouter Slice
+
+- **背景**: `sessionCompactRouter` 收口后，剩余 `app.ts` route 已集中在 `/v1/execute`、大型 task mutation cluster 和 WebSocket streams。为继续保持 one PR = one semantic slice，本轮选择 POST `/v1/sessions/:sessionId/cancel`：它是单一 lifecycle endpoint，负责取消活跃 execution 并调用 `closeNexusSession()` 收口 session，不混入 task mutation 或 stream wiring。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionCancelRouter.ts`，接管 POST `/v1/sessions/:sessionId/cancel`。
+  - `FeatureRouterContext` 新增可选 `cancelActiveExecution(sessionId)` closure；`app.ts` 仍持有 `activeExecutions` Map 和 `AbortController`，router 只接收 `requestId` / `transport` metadata，避免把 active execution registry 暴露到 feature router。
+  - `session_cancelled` envelope、默认 reason、`SESSION_NOT_FOUND` payload、`closeNexusSession()` cleanup cascade、SessionEnd hooks、EverCore non-fatal sync path、permission cleanup 和 child session cancel semantics 保持不变。
+  - `app.ts` 删除 inline cancel route 与 `closeNexusSession` 直接 import，只注册 `sessionCancelRouter`；当前为 3196 lines。`src/nexus/routers/sessionCancelRouter.ts` 为 46 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-cancel-router-lifecycle.json npx tsx --test --test-concurrency=1 --test-name-pattern "session input, cancel, and task lifecycle endpoints update state" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-cancel-router-active.json npx tsx --test --test-concurrency=1 --test-name-pattern "remote cancel aborts active execution and resume returns session snapshot" test/runtime.test.ts`：1/1 pass，覆盖 active execution abort、child session cancel 和 resume snapshot。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-cancel-router-watchdog.json npx tsx --test --test-concurrency=1 --test-name-pattern "soft timeout watchdog cutoff marks REQUEST_TIMEOUT with details.kind=watchdog" test/runtime.test.ts`：1/1 pass，覆盖 watchdog 后 registry cleanup 的 stale cancel path。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3196 lines，`ConfigManager.getInstance` in `app.ts` 为 1。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；剩余 route 为 `/v1/execute`、session task mutation cluster、`/v1/stream`、`/v1/working-set/observe`、`/v1/context/observe`。
+  - 不改变 runtime execution contract, WebSocket stream behavior, task mutation semantics, SQLite schema, permission decision semantics, or session lifecycle cleanup behavior。
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: SessionCompactRouter Slice
+
+- **背景**: `sessionContextRouter` 收口后，下一块选择 POST `/v1/sessions/:sessionId/compact`。该 route 是单一 manual/auto/reactive compact endpoint，负责调用 `compactSession()`、重组 post-compact grounding events，并返回 `compact_result`；不触碰 `/v1/execute`、context analysis GET、cancel/close lifecycle、task mutation 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionCompactRouter.ts`，接管 POST `/v1/sessions/:sessionId/compact`。
+  - `sessionCompactSchema`、`SESSION_NOT_FOUND` payload、`compact_result` envelope、`compact_boundary` / `context_compact_boundary` 字段、post-compact grounding event append 与 model fallback 保持不变。
+  - `app.ts` 删除 inline compact route，以及对 `compactSession()`、`assembleContext()`、`buildPostCompactGroundingEvents()`、`buildSystemPrompt` / `mapEventsToMessages` 的直接 imports，只注册 `sessionCompactRouter`。
+  - `app.ts` 当前为 3214 lines；`src/nexus/routers/sessionCompactRouter.ts` 为 73 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-compact-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/sessions/:sessionId/compact creates a manual compact boundary" test/runtime.test.ts`：1/1 pass，覆盖 compact result envelope、compact boundary、context compact boundary 与 post-compact grounding events。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3214 lines，`ConfigManager.getInstance` in `app.ts` 为 2。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和大型 task mutation cluster。
+  - 不改变 compact summary generation, retained event semantics, post-compact grounding behavior, context analysis behavior, runtime execution, lifecycle close/cancel behavior, task mutation, or WebSocket behavior.
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: SessionContextRouter Slice
+
+- **背景**: `sessionCloseRouter` 收口后，下一块选择 GET `/v1/sessions/:sessionId/context`。该 route 是 operator diagnostics / context preview endpoint，读取 session events、allowed tool definitions、session inbox 与 optional memory provider diagnostics，并返回 `context_analysis`；不触碰 `/v1/execute`、compact mutation、cancel/close lifecycle、task mutation 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionContextRouter.ts`，接管 GET `/v1/sessions/:sessionId/context`。
+  - `sessionContextQuerySchema`、`SESSION_NOT_FOUND` payload、model fallback、allowed tool projection、context fork metadata、SessionChannel inbox 注入、memory retrieval diagnostic event append 与 `[nexus:context]` stderr fallback 保持不变。
+  - `readContextForkMetadata()` 迁入 router；`app.ts` 删除 inline context route 与 `analyzeContext` import，只注册 `sessionContextRouter`。
+  - `app.ts` 当前为 3272 lines；`src/nexus/routers/sessionContextRouter.ts` 为 111 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-context-router-runtime.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/sessions/:sessionId/context returns reusable context analysis|/v1/sessions/:sessionId/context reports long-term memory diagnostics" test/runtime.test.ts`：2/2 pass，覆盖 context analysis envelope、fork metadata、compact/recovery diagnostics 与 long-term memory diagnostics passthrough。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-context-router-channel.json npx tsx --test --test-concurrency=1 --test-name-pattern "Nexus SessionChannel API message is injected into receiving session context until acknowledged" test/session-channel.test.ts`：1/1 pass，覆盖 session inbox context 注入和 ack 后消失。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3272 lines，`ConfigManager.getInstance` in `app.ts` 为 2。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和大型 task mutation cluster。
+  - 不改变 context analysis schema, memory retrieval diagnostics semantics, SessionChannel inbox behavior, compact behavior, runtime execution, lifecycle close/cancel behavior, task mutation, or WebSocket behavior.
+
+## 2026-06-19 — Module Coupling Governance Phase 4A+: SessionCloseRouter Slice
+
+- **背景**: `sessionInputRouter` 收口后，下一块选择 POST `/v1/sessions/:sessionId/close`。该 route 是独立 session lifecycle close endpoint，负责调用 `closeNexusSession()`、解析 close phase/reason、返回 `session_closed` envelope；不触碰 `/v1/execute`、cancel active execution abort、task mutation、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionCloseRouter.ts`，接管 POST `/v1/sessions/:sessionId/close`。
+  - `sessionCloseSchema`、`SESSION_NOT_FOUND` payload、`session_closed` envelope、`closeNexusSession()` 参数、SessionEnd hooks 配置读取、EverCore session-end sync fallback 语义保持不变。
+  - `app.ts` 只注册 `sessionCloseRouter`；POST `/v1/sessions/:sessionId/cancel` 仍留在 `app.ts`，因为它还负责 abort active HTTP/WebSocket execution。
+  - `app.ts` 当前为 3374 lines；`src/nexus/routers/sessionCloseRouter.ts` 为 43 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-close-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "session close cascades runtime session state cleanup|session close records non-fatal EverCore sync failures" test/runtime.test.ts`：2/2 pass，覆盖 close cascade cleanup、pending permission auto-deny、Bash/Task cleanup 与 EverCore sync failure non-fatal。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3374 lines，`ConfigManager.getInstance` in `app.ts` 为 3。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和大型 task mutation cluster。
+  - 不改变 close lifecycle cleanup, SessionEnd hook semantics, EverCore upload/flush failure handling, cancel active execution behavior, session input, task mutation, compact/context behavior, or WebSocket permission handling.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionInputRouter Slice
+
+- **背景**: `sessionPermissionRouter` 收口后，下一块选择 POST `/v1/sessions/:sessionId/input`。该 route 只接受外部 session input，追加 `user_message` event，并在 session 处于 `waiting_permission` 时保留 yes/no shortcut 到 `PendingPermissionRegistry.resolveSession()`；不触碰 `/v1/execute`、cancel/close、task mutation、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionInputRouter.ts`，接管 POST `/v1/sessions/:sessionId/input`。
+  - `sessionInputSchema`、waiting-permission shortcut、`SESSION_NOT_FOUND` payload、`session_input_accepted` envelope、`lastUserInput` / `phase` / `updatedAt` 写入与 `user_message` append 行为保持不变。
+  - `app.ts` 只注册 `sessionInputRouter`；`PendingPermissionRegistry` 在 `app.ts` 仍用于 WebSocket permission response path。
+  - `app.ts` 当前为 3398 lines；`src/nexus/routers/sessionInputRouter.ts` 为 53 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-input-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "session input, cancel, and task lifecycle endpoints update state" test/runtime.test.ts`：1/1 pass，覆盖 input accepted、task lifecycle 和 cancel 仍可串联工作。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3398 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和大型 task mutation cluster。
+  - 不改变 session input schema, waiting-permission shortcut semantics, `user_message` event shape, session phase update, cancel/close behavior, task mutation, compact/context behavior, or WebSocket permission handling.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionPermissionRouter Slice
+
+- **背景**: `sessionResumeRouter` 收口后，下一块选择 POST `/v1/sessions/:sessionId/approve` 与 POST `/v1/sessions/:sessionId/deny`。这两条 route 只负责把 HTTP permission decision 映射到 `PendingPermissionRegistry`，不读取 / 写入 session storage，不关闭或取消 session，不触碰 `/v1/execute`、task mutation、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionPermissionRouter.ts`，接管 approve / deny permission decision routes。
+  - approve / deny body schemas、`PERMISSION_REQUEST_NOT_FOUND` payload、`permission_resolved` response envelope、`scope` / `rule` / `feedback` / `reason` 字段语义保持不变。
+  - `app.ts` 只注册 `sessionPermissionRouter`；`PendingPermissionRegistry` 在 `app.ts` 仍用于 `/input` waiting-permission shortcut 与 WebSocket permission response path。
+  - `app.ts` 当前为 3434 lines；`src/nexus/routers/sessionPermissionRouter.ts` 为 77 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-permission-router-approve.json npx tsx --test --test-concurrency=1 --test-name-pattern "interactive permission approval flow via HTTP POST" test/permission-flow.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-permission-router-deny.json npx tsx --test --test-concurrency=1 --test-name-pattern "interactive permission denial flow via HTTP POST" test/permission-flow.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3434 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 PendingPermissionRegistry semantics, approval / denial payloads, provider-visible permission_response events, session input shortcut behavior, cancel/close behavior, task mutation, compact/context behavior, or WebSocket permission handling.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionResumeRouter Slice
+
+- **背景**: `runtimeMemoryRouter` actions slice 收口后，下一块选择 POST `/v1/sessions/:sessionId/resume`。该 route 只返回 session resume snapshot，读取 session、recent events、tasks、child sessions，并附带 active execution 的只读 metadata；不重启 execution，不修改 session/task/permission 状态，不触碰 `/v1/execute`、compact/context assembly、permission approval/cancel/close mutation 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionResumeRouter.ts`，接管 POST `/v1/sessions/:sessionId/resume`。
+  - `FeatureRouterContext` 新增可选 `getActiveExecutionSnapshot(sessionId)`，只暴露 `{ requestId, transport, startedAt } | null`，避免 router 访问 `AbortController` 或 `activeExecutions` Map。
+  - `app.ts` 只注册 `sessionResumeRouter` 并注入只读 active execution snapshot provider；resume schema、404 payload、event ordering、tasks / child sessions include flags 与 response envelope 保持不变。
+  - `app.ts` 当前为 3504 lines；`src/nexus/routers/sessionResumeRouter.ts` 为 56 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-resume-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "session resume and cancel expose active execution and child session state" test/runtime.test.ts`：1/1 pass，覆盖 active execution metadata、tasks、child sessions、cancel 后 `activeExecution: null` 与 cancelled session snapshot。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3504 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 resume request schema, session_resume_snapshot envelope, event reverse ordering, active execution lifecycle, cancel behavior, task mutation, compact/context behavior, permission approval/deny, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeMemoryActionsRouter Slice
+
+- **背景**: `sessionTaskReadRouter` 收口后，下一块选择 `runtimeMemoryRouter` 内的 POST `/v1/runtime/memory/search`、`save-note`、`flush`、`restart` 四条 memory action routes。它们属于同一 runtime memory governance 域，依赖相同 EverCore client/config 与 process-local approval counters；移动后不触碰 `/v1/execute`、session mutation、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 将 memory action schemas、approval helper、EverCore unavailable payload、approved note message builder 与四条 POST route 从 `app.ts` 迁入 `src/nexus/routers/runtimeMemoryRouter.ts`。
+  - `app.ts` 继续只在 composition root 创建 `memoryApprovalCounters` 并传给 router；不改变 counter reset 语义、approval 文案、EverCore search/add/flush 调用参数或 response envelope。
+  - `app.ts` 当前为 3541 lines；`src/nexus/routers/runtimeMemoryRouter.ts` 为 378 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-memory-actions-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/runtime/memory/search returns bounded read-only memory hints" test/runtime.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-memory-actions-router-write.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/runtime/memory write and lifecycle actions require explicit approval" test/runtime.test.ts`：1/1 pass，覆盖 save-note approval gate / approved save、flush approval gate / approved flush、restart approval gate / confirmed 501。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3541 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 memory search formatting, hit truncation, approval response shape, `memoryApprovalCounters`, EverCore add/flush payloads, restart 501 behavior, runtime execution, session lifecycle, compact/context behavior, or WebSocket behavior。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionTaskReadRouter Slice
+
+- **背景**: `sessionCreateRouter` 收口后，下一块选择 GET `/v1/sessions/:sessionId/tasks`。该 route 只读取 `storage.listTasks(sessionId)` 并返回 `tasks_list` envelope，不校验 / 修改 session，不写 task mutation audit，不触碰 task create/update/action mutation、runtime execution、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionTaskReadRouter.ts`，接管 GET `/v1/sessions/:sessionId/tasks`。
+  - `app.ts` 只注册 `sessionTaskReadRouter`；POST/PATCH task mutation routes、task action routes、session mutation routes、runtime execution 与 WebSocket stream 仍留在后续切片。
+  - `app.ts` 当前为 3779 lines；`src/nexus/routers/sessionTaskReadRouter.ts` 为 15 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-task-read-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "SDK task mutation API writes audit events and guards revisions" test/runtime.test.ts`：1/1 pass，覆盖 task list endpoint 与既有 task mutation readback。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3779 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 `tasks_list` response envelope, storage ordering, task create/update/action mutation, task mutation audit, session lifecycle, runtime execution, compact/context behavior, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionCreateRouter Slice
+
+- **背景**: `sessionInspectionRouter` 收口后，下一块选择 POST `/v1/sessions`。该 route 只分配 canonical server session id 并保存初始 `SessionSnapshot`，用于 Go TUI / inspect-session 的 session allocation；不进入 runtime execution、permission decision、task mutation、compact/context assembly 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionCreateRouter.ts`，接管 POST `/v1/sessions`。
+  - `createSessionSchema`、server `session_<uuid>` allocation、`clientSessionId` / `clientSessionIdSetAt` metadata back-reference、`originCwd` initialization 从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionCreateRouter`；compact/context routes、resume / approval mutation routes、task routes、runtime execution 与 WebSocket stream 仍留在后续切片。
+  - `app.ts` 当前为 3779 lines；`src/nexus/routers/sessionCreateRouter.ts` 为 48 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-create-router.json npx tsx --test --test-concurrency=1 test/inspect-session-phase1.test.ts`：5/5 pass，覆盖 server uuid allocation、defaultCwd fallback、list round-trip、`clientSessionIdSetAt` 与 metadata-only path。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3779 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 session_created response envelope, server id format, defaultCwd fallback, metadata merge, originCwd initialization, runtime execution, permission approval/deny, compact/context behavior, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionInspectionRouter Slice
+
+- **背景**: `sessionChildrenRouter` 收口后，下一块选择 GET `/v1/sessions/:sessionId/tool-traces` 与 GET `/v1/sessions/:sessionId/permission-audits`。这两条 route 是 session inspection / audit read endpoints，只读取 storage 中的 tool traces 与 permission audits，不修改 session/task/permission 状态，不触碰 `/v1/execute`、WebSocket stream、compact/context assembly 或 session mutation heavy paths。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionInspectionRouter.ts`，接管 session tool traces 与 permission audits 两条 GET route。
+  - `toolTraceListQuerySchema`、tool trace pagination envelope、permission audit list envelope 从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionInspectionRouter`；compact/context routes、resume / approval mutation routes、task routes、runtime execution 与 WebSocket stream 仍留在后续切片。
+  - `app.ts` 当前为 3817 lines；`src/nexus/routers/sessionInspectionRouter.ts` 为 57 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-inspection-tool-trace.json npx tsx --test --test-concurrency=1 --test-name-pattern "REST API endpoint GET /v1/sessions/:sessionId/tool-traces" test/tool-trace.test.ts`：1/1 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-inspection-permission-audits.json npx tsx --test --test-concurrency=1 --test-name-pattern "read-only Bash subcommand bypasses permission prompt" test/permission-flow.test.ts`：1/1 pass，覆盖 permission-audits empty list read path。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3817 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 tool trace response envelope, pagination semantics, permission audit response envelope, session lifecycle, task mutation, permission approval/deny, compact/context behavior, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionChildrenRouter Slice
+
+- **背景**: `sessionWaitRouter` 收口后，下一块选择 GET `/v1/sessions/:sessionId/children` 与 GET `/v1/sessions/:sessionId/children/:childSessionId/events`。这两条 route 只读取 parent / child session 与 child transcript events，不修改 session/task/permission 状态，不触碰 `/v1/execute`、WebSocket stream 或 session mutation heavy paths。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionChildrenRouter.ts`，接管 child sessions list 与 child transcript events 两条 GET route。
+  - `childSessionsQuerySchema`、children failed-only filter、transcriptPath fallback、child event pagination 从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionChildrenRouter`；compact/context/tool-trace/permission-audit routes、resume / approval mutation routes、task routes、runtime execution 与 WebSocket stream 仍留在后续切片。
+  - `app.ts` 当前为 3859 lines；`src/nexus/routers/sessionChildrenRouter.ts` 为 118 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-children-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "/v1/sessions/:sessionId/assets returns SDK dashboard data assets" test/runtime.test.ts`：1/1 pass，覆盖 child session list、child transcript events 与 missing child 404。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3859 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 child session response envelope, transcriptPath fallback, failed-only filter semantics, event ordering, pagination, session lifecycle, task mutation, permission approval/deny, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionWaitRouter Slice
+
+- **背景**: Session read router 收口后，下一块选择 GET `/v1/sessions/:sessionId/wait`。该 route 是 polling read endpoint，用于 bbl loop / multi-pane clients 等待匹配事件；它只读取 session events，不修改 session/task/permission 状态，不触碰 `/v1/execute`、WebSocket stream 或 session mutation heavy paths。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionWaitRouter.ts`，接管 GET `/v1/sessions/:sessionId/wait`。
+  - `waitQuerySchema`、literal substring escape helper、event type / match filtering、timeout polling loop 从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionWaitRouter`；children routes、compact/context routes、tool trace / permission audit routes、resume / approval mutation routes 仍留在后续切片。
+  - `app.ts` 当前为 3954 lines；`src/nexus/routers/sessionWaitRouter.ts` 为 107 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-wait-router.json npx tsx --test --test-concurrency=1 --test-name-pattern "GET /v1/sessions/:id/wait" test/runtime-loop.test.ts`：3/3 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 errors。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 3954 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 wait response envelope, literal match semantics, event ordering, timeout polling interval, session lifecycle, task mutation, permission approval/deny, or WebSocket behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionReadRouter Slice
+
+- **背景**: Skill action router 收口后，下一块选择只读 Session API cluster：GET `/v1/sessions`、GET `/v1/sessions/:sessionId`、GET `/v1/sessions/:sessionId/assets` 与 GET `/v1/sessions/:sessionId/events`。该 cluster 只读取 storage / assets snapshot，并保留 Go TUI placeholder 404 hint；不触碰 POST session allocation、wait polling、children routes、compact/context/tool-trace/permission-audit routes、runtime execution 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionReadRouter.ts`，接管 sessions list/detail/assets/events 四条 GET route。
+  - `sessionDetailQuerySchema`、`sessionAssetsQuerySchema`、read-route `eventListQuerySchema`、Go TUI placeholder hint handling 与 `buildSessionAssetsSnapshot()` 调用从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionReadRouter`；POST `/v1/sessions`、GET `/v1/sessions/:sessionId/wait`、children / compact / context / tool-trace / permission-audit / resume / approval mutation routes 仍留在后续切片。
+  - `app.ts` 当前为 4060 lines；`src/nexus/routers/sessionReadRouter.ts` 为 132 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-read-router-phase1.json npx tsx --test test/inspect-session-phase1.test.ts`：5/5 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-read-router-placeholder.json npx tsx --test test/session-placeholder-404-hint.test.ts`：5/5 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-read-router-runtime.json npx tsx --test --test-concurrency=1 --test-name-pattern "session detail uses recent events|/v1/sessions/:sessionId/assets" test/runtime.test.ts`：2/2 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4060 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 session allocation, session lifecycle, event pagination envelope, assets snapshot shape, Go TUI placeholder hint wording, wait polling, child-session listing, compact/context routes, tool trace or permission audit routes.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SkillActionRouter Slice
+
+- **背景**: SessionChannel router 收口后，下一块选择剩余 Skill action routes：POST `/v1/skills/invoke`、POST `/v1/skills/draft` 与 POST `/v1/skills/save`。这些 route 只调用既有 skill registry / generator / storage handler，不触碰 `/v1/execute`、WebSocket stream、session lifecycle、runtime tool loop 或 Skill 文件格式。
+- **实现**:
+  - 新增 `src/nexus/routers/skillActionRouter.ts`，接管 skill invoke / draft / save 三条 POST route。
+  - `SkillInvokeBodySchema`、`SkillDraftBodySchema`、`SkillSaveBodySchema` 解析和 draft/save status-code 映射从 `app.ts` 移入 router。
+  - `skillReadRouter` 继续负责 GET list/show；`skillValidateRouter` 继续负责 POST validate；`skillRoutes.ts` 的 handler/schema 来源不变。
+  - `app.ts` 当前为 4170 lines；`src/nexus/routers/skillActionRouter.ts` 为 49 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-skill-action-router-invoke.json npx tsx --test --test-name-pattern "skills/invoke" test/skill-routes.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-skill-action-router-draft.json npx tsx --test test/skill-draft-route.test.ts`：7/7 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-skill-action-router-save.json BABEL_O_USER_SKILLS_DIR=/tmp/babel-o-skill-action-router-user-skills npx tsx --test test/skill-save-route.test.ts`：6/6 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4170 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 SkillRegistry loading, generated draft normalization, redaction warnings, save preview/confirm/overwrite semantics, user/project skill storage path policy, or model-visible Skill tools.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SessionChannelRouter Slice
+
+- **背景**: Context working-set write router 收口后，下一块选择 SessionChannel + inbox API cluster：`/v1/session-channels*` 与 `/v1/sessions/:sessionId/inbox*`。该 cluster 只维护 typed side-channel collaboration context、message governance metadata 与 ack 状态，不触碰 `/v1/execute`、WebSocket stream、runtime context hot path、SQLite schema 或 Go TUI inbox 渲染。
+- **实现**:
+  - 新增 `src/nexus/routers/sessionChannelRouter.ts`，接管 `POST/GET /v1/session-channels`、`GET /v1/session-channels/:channelId`、`POST/GET /v1/session-channels/:channelId/messages`、`GET /v1/sessions/:sessionId/inbox` 与 `POST /v1/sessions/:sessionId/inbox/:messageId/ack`。
+  - `createSessionChannelSchema`、`createSessionMessageSchema`、inbox query schema、policy merge、message validation、recipient 判定和 memory-candidate governance wrapper 从 `app.ts` 移入 router。
+  - `app.ts` 只注册 `sessionChannelRouter` 并传入现有 `FeatureRouterContext`；SessionChannel storage API、message envelope、inbox unread/ack semantics 与 governance metadata shape 不变。
+  - `app.ts` 当前为 4209 lines；`src/nexus/routers/sessionChannelRouter.ts` 为 341 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-session-channel-router-final.json npx tsx --test test/session-channel.test.ts`：9/9 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4209 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 SessionChannel / SessionMessage schema、SQLite persistence、runtime context inbox injection、Go TUI inbox overlay、agent parent-child channel behavior, or memory candidate governance decisions.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: ContextWorkingSetWriteRouter Slice
+
+- **背景**: loop pane router 收口后，下一块选择 PUT `/v1/context/working-set/:sessionId` write-through route。该 route 只替换 persisted working-set entries 并复用 existing `runWorkingSetPut()` helper behavior，不触碰 `/v1/context/observe` WebSocket、runtime context hot path、session execution 或 SQLite schema。
+- **实现**:
+  - 新增 `src/nexus/routers/contextWorkingSetWriteRouter.ts`，接管 PUT `/v1/context/working-set/:sessionId` 与 `runWorkingSetPut()` helper 实现。
+  - `app.ts` 只注册 `contextWorkingSetWriteRouter`，并从新 router re-export `runWorkingSetPut`，保持现有测试 / 外部 import 兼容。
+  - `contextWorkingSetReadRouter` 继续只负责 GET list/session/workspace aggregate routes；`/v1/context/observe` WebSocket 仍留在后续切片。
+  - `app.ts` 当前为 4509 lines；`src/nexus/routers/contextWorkingSetWriteRouter.ts` 为 117 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-context-working-set-write-router.json npx tsx --test test/context-working-set-rest-put.test.ts`：12/12 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4509 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 working-set JSON schema, write-through replacement semantics, workspaceId preservation behavior, HOME isolation, context observe broadcaster ownership, or runtime context assembly behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: LoopPaneRouter Slice
+
+- **背景**: agent router 收口后，下一块选择 loop pane mutation cluster：POST `/v1/loop/workspaces/:workspaceId/panes`、PATCH `/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId` 与 DELETE `/v1/loop/workspaces/:workspaceId/tabs/:tabId/panes/:paneId`。这些 route 只维护 pane ↔ session mapping，不触碰 `/v1/execute`、WebSocket stream、session task mutation routes 或 runtime hot path。
+- **实现**:
+  - 新增 `src/nexus/routers/loopPaneRouter.ts`，接管 loop pane create/update/delete routes 与相关 schema / error helper。
+  - `loopWorkspaceRouter` 继续只负责 GET `/v1/loop/workspaces` read-only listing；`app.ts` 只负责注册两个 loop routers。
+  - `app.ts` 当前为 4629 lines；`src/nexus/routers/loopPaneRouter.ts` 为 100 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-loop-pane-router-focused.json npx tsx --test test/loop-pane-router.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-loop-pane-router-runtime-loop.json npx tsx --test --test-concurrency=1 --test-name-pattern "loop_state" test/runtime-loop.test.ts`：4/4 pass。
+  - 裸跑 `npx tsx --test --test-name-pattern "loop_state" test/runtime-loop.test.ts` 曾读到默认存储中的旧 pane（`3 !== 1`）；按 AGENTS 测试隔离要求补 `NODE_ENV=test` + 独立 `BABEL_O_CONFIG_FILE` 后通过。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4629 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 loop pane storage schema, loop workspace listing envelope, runtime loop health projection, Go TUI pane ownership, or session execution behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: AgentRouter Slice
+
+- **背景**: skill validate router 收口后，下一块选择 agent job API cluster：POST/GET `/v1/agents`、GET `/v1/agents/:jobId`、POST `/v1/agents/:jobId/wait`、POST `/v1/agents/:jobId/cancel`、GET `/v1/agents/:jobId/transcript` 与 GET `/v1/sessions/:sessionId/agents`。该 cluster 只通过 existing `AgentScheduler` 与 storage transcript/list API 工作，不触碰 `/v1/execute`、WebSocket stream、session task mutation routes 或 runtime hot path。
+- **实现**:
+  - 新增 `src/nexus/routers/agentRouter.ts`，接管 agent job API cluster 与相关 schema / error helper / transcript paging。
+  - `src/nexus/router.ts` 的 `FeatureRouterContext` 增加 optional `agentScheduler`，`app.ts` 仍负责创建 scheduler 并显式传入 router。
+  - `app.ts` 当前为 4719 lines；`src/nexus/routers/agentRouter.ts` 为 194 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/agent-api.test.ts`：2/2 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4719 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 AgentScheduler execution semantics, child-session transcript storage, agent governance fields, session task APIs, or runtime execution behavior.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SkillValidateRouter Slice
+
+- **背景**: skill read router 收口后，下一块选择 POST `/v1/skills/validate`。该 route 是 validation-only diagnostics path，只调用 `validateSkillRequest()` 并保持 invalid payload 422；invoke / draft / save 仍留在 `app.ts`。
+- **实现**:
+  - 新增 `src/nexus/routers/skillValidateRouter.ts`，接管 POST `/v1/skills/validate`。
+  - `SkillValidateBodySchema` 解析与 `validateSkillRequest()` 调用从 `app.ts` 移入 router；POST `/v1/skills/invoke`、`/draft`、`/save` 仍留在 `app.ts`。
+  - `app.ts` 当前为 4868 lines；`src/nexus/routers/skillValidateRouter.ts` 为 19 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/skill-validate-router.test.ts`：1/1 pass。
+  - `npx tsx --test test/skill-routes.test.ts`：8/8 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4868 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 SkillRegistry loading, skill invoke/draft/save behavior, skill storage path policy, model-visible Skill tools, or validation diagnostics.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SkillReadRouter Slice
+
+- **背景**: loop workspace read router 收口后，下一块选择 GET `/v1/skills` 与 GET `/v1/skills/:id`。这两个 route 只读取 SkillRegistry 并展示 list/show envelope；validate / invoke / draft / save routes 仍留在 `app.ts`。
+- **实现**:
+  - 新增 `src/nexus/routers/skillReadRouter.ts`，接管 GET `/v1/skills` 与 GET `/v1/skills/:id`。
+  - `SkillListQuerySchema` / `SkillIdParamsSchema` 的解析和 `listSkills()` / `showSkill()` 调用从 `app.ts` 移入 router；POST `/v1/skills/validate`、`/invoke`、`/draft`、`/save` 仍留在 `app.ts`。
+  - `app.ts` 当前为 4871 lines；`src/nexus/routers/skillReadRouter.ts` 为 37 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/skill-read-router.test.ts`：1/1 pass。
+  - `npx tsx --test test/skill-routes.test.ts`：8/8 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4871 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 SkillRegistry loading, skill validate/invoke/draft/save behavior, skill storage path policy, or model-visible Skill tools.
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: LoopWorkspaceRouter Read Slice
+
+- **背景**: memory candidates router 收口后，下一块选择 GET `/v1/loop/workspaces`。该 route 是 read-only pane listing，只读取 `storage.listLoopPanes()` 并返回原有 filter envelope；pane create/update/delete mutations 仍留在 `app.ts`。
+- **实现**:
+  - 新增 `src/nexus/routers/loopWorkspaceRouter.ts`，接管 GET `/v1/loop/workspaces`。
+  - `loopWorkspaceQuerySchema` 与 panes projection 从 `app.ts` 移入 router；POST `/v1/loop/workspaces/:workspaceId/panes`、PATCH/DELETE pane mutation routes 仍留在 `app.ts`。
+  - `app.ts` 当前为 4892 lines；`src/nexus/routers/loopWorkspaceRouter.ts` 为 28 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/loop-workspace-router.test.ts`：1/1 pass。
+  - `npx tsx --test --test-name-pattern "loop pane" test/runtime-loop.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4892 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 loop pane storage schema、pane create/update/delete behavior、loop health projection 或 Go TUI loop state ownership。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeMemoryRouter Candidates Slice
+
+- **背景**: runtime loop health router 收口后，下一块选择 GET `/v1/runtime/memory/candidates`。该 route 是 read-only review queue，只读取 SessionChannel `memory_candidate` messages，不执行 EverCore search/save/flush/restart，也不改 SessionChannel。
+- **实现**:
+  - 扩展 `src/nexus/routers/runtimeMemoryRouter.ts`，接管 GET `/v1/runtime/memory/candidates`。
+  - `memoryCandidatesQuerySchema` 与 candidates projection 从 `app.ts` 移入 router；`app.ts` 仍保留 memory search/save-note/flush/restart action routes。
+  - `app.ts` 当前为 4905 lines；`src/nexus/routers/runtimeMemoryRouter.ts` 为 156 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-memory-router.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-memory-candidates-router.json npx tsx --test --test-name-pattern "/v1/runtime/memory/candidates reports review-only governance metadata" test/runtime.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4905 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 memory candidate governance metadata、SessionChannel storage schema、EverCore search/save/flush/restart behavior 或 Go TUI memory overlay payload shape。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeLoopHealthRouter Slice
+
+- **背景**: tools audit router 收口后，下一块选择 GET `/v1/runtime/loop/health`。该 route 是 read-only pane health projection，但比此前 route 更重：它读取 storage events、汇总 task scope、叠加 behavior hint，并为 pane 构造 cache health。因而本 slice 只移动 loop health；loop_state CRUD routes 仍留在 `app.ts`。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeLoopHealthRouter.ts`，接管 GET `/v1/runtime/loop/health`。
+  - `loopHealthQuerySchema`、`summarizeTaskScope()`、`summarizeBehaviorHint()` 从 `app.ts` 移入 router；handler 仍复用 runtime-owned `derivePaneStatus()` / `applyBehaviorHint()` 与 Nexus `buildCacheHealthFromEvents()`。
+  - `app.ts` 当前为 4957 lines；`src/nexus/routers/runtimeLoopHealthRouter.ts` 为 205 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-loop-health-router.test.ts`：2/2 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-runtime-loop-health-router.json npx tsx --test test/runtime-loop-health-router.test.ts test/runtime-loop.test.ts`：18/18 pass。
+  - 未隔离环境下直接跑 `npx tsx --test test/runtime-loop-health-router.test.ts test/runtime-loop.test.ts` 时，`test/runtime-loop.test.ts` 读到本机持久状态并出现 empty panes / loop_state count 断言失败；隔离配置下通过，按项目测试隔离规则采用隔离结果作为本 slice 证据。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 4957 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 loop health response shape、pane status priority、task-scope projection、behavior hint cooldown、cache health projection 或 loop_state CRUD 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: ToolsAuditRouter Slice
+
+- **背景**: context assemble router 收口后，下一块选择 GET `/v1/tools/audit`。该 route 是全局 read-only runtime tool audit endpoint，只读取 `runtime.listTools()`，不触碰 session mutation、agent mutation、`/v1/execute` 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/toolsAuditRouter.ts`，接管 GET `/v1/tools/audit`。
+  - 保持 `tools_audit` envelope 与 runtime `listTools()` 来源不变；CLI / Go TUI 仍通过同一全局 endpoint 读取工具审计。
+  - `app.ts` 当前为 5163 lines；`src/nexus/routers/toolsAuditRouter.ts` 为 11 lines。本 slice 因新增 import/register 样板导致 `app.ts` 行数微增；行数不作为单 PR merge gate。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/tools-audit-router.test.ts`：2/2 pass。
+  - `npx tsx --test test/tools-audit-router.test.ts test/mcp.test.ts`：`test/tools-audit-router.test.ts` 通过；`test/mcp.test.ts` 失败于当前真实 provider config 对 `mcp:*` tool name 的 400 响应，未作为本 slice required gate。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5163 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 tool registry、MCP adapter、tool allowlist、Go TUI `/tools` overlay payload shape 或 runtime tool execution behavior。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: ContextAssembleRouter Slice
+
+- **背景**: working-set read router 收口后，下一块选择 POST `/v1/context/assemble` manual preview route。该 route 只调用 `buildAssemblePreview()` 构造上下文预览，不写 persisted working set、不触碰 `/v1/context/observe` WebSocket，也不进入 runtime execute hot path。
+- **实现**:
+  - 新增 `src/nexus/routers/contextAssembleRouter.ts`，接管 POST `/v1/context/assemble`。
+  - `runContextAssemble()` helper 从 `app.ts` 移入 router；`app.ts` re-export 旧 helper/type 入口，保持 `test/context-assemble-rest.test.ts` 和潜在外部 import 兼容。
+  - `app.ts` 当前为 5160 lines；`src/nexus/routers/contextAssembleRouter.ts` 为 61 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/context-assemble-rest.test.ts test/context-assemble-router.test.ts`：16/16 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5160 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 `buildAssemblePreview()` section ordering、budget behavior、response envelope、validation error text 或 runtime context assembly hot path。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: ContextWorkingSetReadRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 context history / trace read routes 后，下一块选择 working-set read routes：GET `/v1/context/working-set`、GET `/v1/context/working-set/:sessionId`、GET `/v1/context/working-set/workspace/:wsId`。它们只读取 persisted working set，不改 working set、不触碰 `/v1/context/observe` WebSocket、不进入 runtime execution path。
+- **实现**:
+  - 新增 `src/nexus/routers/contextWorkingSetReadRouter.ts`，接管 working-set GET list / session / workspace aggregate routes。
+  - `runWorkingSetList()`、`runWorkingSetGet()`、`runWorkspaceWorkingSetGet()` helper 从 `app.ts` 移入 router；`app.ts` re-export 旧 helper/type 入口，保持 `test/context-working-set-rest.test.ts`、`test/context-workspace-working-set-rest.test.ts` 和潜在外部 import 兼容。
+  - PUT `/v1/context/working-set/:sessionId` 已在后续 `contextWorkingSetWriteRouter` slice 接管；`/v1/context/observe` WebSocket 仍留在后续切片。
+  - `app.ts` 当前为 5206 lines；`src/nexus/routers/contextWorkingSetReadRouter.ts` 为 167 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/context-working-set-rest.test.ts test/context-working-set-read-router.test.ts test/context-workspace-working-set-rest.test.ts`：22/22 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5206 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 persisted working-set JSON format、GET response shape、PUT write-through semantics、working-set observe behavior 或 runtime hot path。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: ContextHistoryRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 schema route 后，下一块选择 read-only context routes：GET `/v1/context/history` 与 GET `/v1/context/trace`。它们只读取 `.babel-o/behavior-trace.jsonl`，不改 working set、不触碰 `/v1/context/observe` WebSocket、不进入 runtime execution path。
+- **实现**:
+  - 新增 `src/nexus/routers/contextHistoryRouter.ts`，接管 GET `/v1/context/history` 与 GET `/v1/context/trace`。
+  - `parseSinceFromQuery()`、`runContextHistory()`、`runBehaviorTraceGet()` helper 从 `app.ts` 移入 router；`app.ts` re-export 旧 helper 入口，保持 `test/context-history-rest.test.ts` 和潜在外部 import 兼容。
+  - `app.ts` 当前为 5363 lines；`src/nexus/routers/contextHistoryRouter.ts` 为 216 lines。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/context-history-rest.test.ts test/context-history-router.test.ts`：15/15 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5363 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 behavior trace JSONL format、history summarize/search semantics、trace filtering defaults 或 context observe/working-set/assemble behavior。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: SchemaRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 runtime status/config/memory/models/metrics/provider diagnostics 等低风险 router。本轮选择最小 schema route：GET `/v1/schema/events`，它只导出 `NexusEventSchema` 的 JSON schema，不读写 storage，不触碰 runtime execution、session mutation 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/routers/schemaRouter.ts`，接管 GET `/v1/schema/events`。
+  - `app.ts` 不再直接 import `NexusEventSchema`；事件 JSON schema 导出职责归入 schema router。
+  - `app.ts` 当前为 5588 lines；本 slice 因 router 注册样板略增行数，但减少了 `app.ts` 的 schema ownership。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/schema-router.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5588 lines，`ConfigManager.getInstance` in `app.ts` 仍为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 `NexusEventSchema`、JSON schema shape、event version 或 runtime behavior。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeConfigMutationRouter Slice
+
+- **背景**: `runtimeConfigRouter` 已接管 read-only config/profile routes，provider diagnostics routes 也已拆出。下一块选择 POST `/v1/runtime/config/provider` 与 POST `/v1/runtime/config/select`，因为它们是 bounded config mutation，不涉及 session mutation、`/v1/execute`、WebSocket stream 或 storage schema。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeConfigMutationRouter.ts`，接管 POST `/v1/runtime/config/provider` 与 POST `/v1/runtime/config/select`。
+  - `runtimeConfigProviderSchema` / `runtimeConfigSelectSchema` 从 `app.ts` 移入 router；handler 继续复用 `inspectResolvedRuntimeConfig()`，保持脱敏 response shape 与 read-only config route 对齐。
+  - `app.ts` 当前为 5584 lines；`providerRegistry` / `modelRegistry` config mutation checks 从 `app.ts` 移入 router。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-config-mutation-router.test.ts`：1/1 pass。
+  - `npx tsx --test test/config-endpoints.test.ts`：28/28 pass。
+  - `npx tsx --test test/runtime-config-mutation-router.test.ts test/config-endpoints.test.ts`：29/29 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5584 lines，`ConfigManager.getInstance` in `app.ts` 为 4。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须避开 `/v1/execute`、WebSocket stream 和 session mutation heavy paths。
+  - 不改变 config schema、provider/model registry、auth validation、response redaction 或 Go TUI `/model` persistence behavior。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeProviderDiagnosticsRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 status / config / memory status / models / metrics 五个低风险 router。本轮继续选择 provider diagnostics cluster：provider smoke dry-run/live 与 fallback-plan route。它们不改 session/storage，不触碰 `/v1/execute` 或 WebSocket stream；focused test 只覆盖离线 dry-run 与 fallback-plan 契约，不触发真实 provider 调用。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeProviderDiagnosticsRouter.ts`，接管 GET `/v1/runtime/provider-smoke`、POST `/v1/runtime/provider-smoke/live`、POST `/v1/runtime/provider-fallback/plan`。
+  - provider smoke / fallback plan 专属 Zod schema 从 `app.ts` 移入 router；`app.ts` 仍保留 POST config provider/select mutation routes 及其 schema。
+  - `app.ts` 当前为 5691 lines；route 职责继续向 feature router 收敛。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-provider-diagnostics-router.test.ts`：1/1 pass。
+  - `npx tsx --test test/runtime-metrics-router.test.ts test/runtime-provider-diagnostics-router.test.ts`：2/2 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5691 lines，`ConfigManager.getInstance` in `app.ts` 为 6。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须是 read-only / low-risk cluster。
+  - 不触碰 provider config mutation、`/v1/execute`、WebSocket stream、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeMetricsRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 status / config / memory status / models 四个低风险 router。本轮继续选择 read-only route：GET `/v1/runtime/metrics`，不移动 metrics 聚合 helper，避免把 route extraction 扩大成指标重构。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeMetricsRouter.ts`，接管 GET `/v1/runtime/metrics`。
+  - `app.ts` 通过 `FeatureRouterContext.runtimeMetricsSnapshot()` 注入现有 `buildRuntimeMetricsSnapshot(metrics, storage)` closure；metrics response shape、storage event aggregation、cacheHealth 聚合均不变。
+  - `app.ts` 当前为 5741 lines；本 slice 优先减少路由职责和 merge-conflict surface，行数目标继续作为累计健康指标。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-metrics-router.test.ts`：1/1 pass。
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+  - `npm run deps:audit`：0 boundary failures。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 为 5741 lines。
+  - `npm run test:quarantine`：list mode pass；2 entries remain observing。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须是 read-only / low-risk cluster。
+  - 不触碰 metrics aggregation helper、`/v1/execute`、WebSocket stream、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeModelsRouter Slice
+
+- **背景**: Phase 4A+ 已抽出 status / config / memory status 三个低风险 router。本轮继续选择 read-only route：GET `/v1/runtime/models`，不混入 POST config provider/select mutation。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeModelsRouter.ts`，接管 provider/model list 与 provider auth diagnostics。
+  - `providerCredentialEnv()` / `profileProviderId()` / `resolveProviderAuthState()` 从 `app.ts` 移入 router；`app.ts` 仍保留 POST config mutation 所需的 `providerRegistry` / `modelRegistry` 校验。
+  - `process.env` provider credential reads 从 `app.ts` 集中到 `runtimeModelsRouter.ts`，让 `app.ts` env concentration 从 12 降到 1。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-models-router.test.ts`：2/2 pass。
+  - `npx tsx --test test/config-endpoints.test.ts`：28/28 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 降至 5735 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；下一 router slice 仍必须是 read-only / low-risk cluster。
+  - 不触碰 POST config mutation、`/v1/execute`、WebSocket stream、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeMemoryRouter Slice
+
+- **背景**: `runtimeStatusRouter` 与 `runtimeConfigRouter` 已建立前两块低风险 route extraction。Phase 4A+ 第三块选择 GET `/v1/runtime/memory/status`，因为它是 read-only dashboard route；memory search/save/flush/restart actions 不混入本 slice。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeMemoryRouter.ts`，接管 GET `/v1/runtime/memory/status`。
+  - `listRecentMemoryRetrievalEvents()` 与 memory quality rate assembly 移入 router；`createNexusApp()` 仍拥有 `memoryApprovalCounters`，并把 counters 作为只读 snapshot 注入 router。
+  - `src/nexus/app.ts` 继续保留 memory search/save/flush/restart action routes 与 approval counter mutation。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-memory-router.test.ts`：1/1 pass。
+  - `npx tsx --test --test-name-pattern "/v1/runtime/memory/status reports read-only EverCore memory surface" test/runtime.test.ts`：1/1 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 降至 5823 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；GET `/v1/runtime/models` 已在后续 slice 落地，下一 router slice 仍必须是 read-only / low-risk cluster。
+  - 不触碰 memory search/save/flush/restart、`/v1/execute`、WebSocket stream、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeConfigRouter Slice
+
+- **背景**: `runtimeStatusRouter` 已建立 `FeatureRouter` 注册模式。Phase 4A+ 下一块继续只抽低风险只读 route，选择 runtime config read routes；POST config mutation routes、`/v1/runtime/models`、provider smoke 和 execute/stream 均不混入。
+- **实现**:
+  - 新增 `src/nexus/routers/runtimeConfigRouter.ts`，接管 GET `/v1/runtime/config`、`/v1/runtime/config/profiles`、`/v1/runtime/config/profiles/:name`。
+  - `inspectResolvedRuntimeConfig()` 移入并导出自 `runtimeConfigRouter`，POST `/v1/runtime/config/provider` 与 `/v1/runtime/config/select` 继续复用同一脱敏响应 helper，避免复制 response shape。
+  - `src/nexus/app.ts` 通过 `runtimeConfigRouter.register(...)` 注册只读 config routes；`/v1/runtime/models` 与 POST mutation routes 暂留在 `app.ts`。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-config-router.test.ts`：1/1 pass。
+  - `npx tsx --test test/config-endpoints.test.ts`：28/28 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 降至 5918 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；GET `/v1/runtime/memory/status` 已在后续 slice 落地，下一 router slice 仍必须是 read-only / low-risk cluster。
+  - 不触碰 `/v1/execute`、`/v1/stream`、`/v1/context/observe`、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 4A+: RuntimeStatusRouter Slice
+
+- **背景**: Phase 3B+ 已完成三个可 review 的 runtime strategy slices。下一步按 PR-sized map 转入 Phase 4A+，先抽低风险 Nexus router，不触碰 `/v1/execute` 或 WebSocket stream。
+- **实现**:
+  - 新增 `src/nexus/router.ts`，定义 `FeatureRouter` / `FeatureRouterContext` 与 `EverOSBootstrapStatusSnapshot`。
+  - 新增 `src/nexus/routers/runtimeStatusRouter.ts`，接管 `/health`、`/v1/runtime/status`、`/v1/runtime/version`。
+  - `src/nexus/app.ts` 保留 metrics、bootstrap、EverCore status 等组合根闭包，并通过 `runtimeStatusRouter.register(...)` 注入；route response shape 不变。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/runtime-status-router.test.ts`：1/1 pass。
+  - `npm run coupling:audit`：`runtimeToNexus: []`、`nexusToCli: []`；`app.ts` tracked hotspot 从 6155 lines 降至 6058 lines。
+- **边界**:
+  - Phase 4A+ 未关闭；runtime config read routes 已在后续 slice 落地，下一候选是 memory status。
+  - 不触碰 `/v1/execute`、`/v1/stream`、`/v1/context/observe`、SQLite schema 或 runtime 行为。
+
+## 2026-06-18 — Module Coupling Governance Phase 3B+: ToolDispatchPipeline Slice
+
+- **背景**: `ProviderTurnDriver` 已把 provider stream invocation 从 `LLMCodingRuntime` 抽出。下一块仍适合小 PR 的 runtime loop 责任是 provider tool-call dispatch coordination：执行每个 provider tool call、收集 tool events、触发 working-set update、追加 grounding confirmation，并在 scope confirmation 后重新派生 task scope。
+- **实现**:
+  - 新增 `src/runtime/ToolDispatchPipeline.ts`，封装 provider tool-call dispatch coordination。
+  - `ToolDispatchPipeline.run()` 继续复用 `executeProviderToolCall()`，不改 permission / scope-boundary / audit / tool execution 语义。
+  - `LLMCodingRuntime.executeStream()` 的 provider outcome tool-call 分支改为调用 `toolDispatchPipeline.run(...)`，然后只接收更新后的 `previousEvents`、`taskScopeEvent` 和 tool result content。
+  - working-set 更新通过 callback 注入，避免 `ToolDispatchPipeline` 直接依赖 `LLMCodingRuntime` 私有状态。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/tool-dispatch-pipeline.test.ts`：1/1 pass。
+  - `npx tsx --test --test-name-pattern "runtime tool loop executes a provider tool call and returns tool_result content|provider session rules are isolated between injected services|LLMCodingRuntime emits grounding confirmation after source evidence tool result" test/runtime.test.ts`：2/2 matched tests pass。
+  - `wc -l src/runtime/LLMCodingRuntime.ts src/runtime/ToolDispatchPipeline.ts`：`LLMCodingRuntime.ts` 1841 lines, `ToolDispatchPipeline.ts` 135 lines after this slice.
+- **边界**:
+  - Phase 3B+ 未关闭；下一候选是 hook dispatch / resume 中仍可独立 review 的部分。若无法保持小 PR，先转入 Phase 4A+ low-risk router slice。
+  - 不要求本 slice 达成 `LLMCodingRuntime <= 600 lines`；该目标仍是累计健康指标。
+
+## 2026-06-18 — Module Coupling Governance Phase 3B+: ProviderTurnDriver Slice
+
+- **背景**: `ContextRefreshStrategy` 第一刀落地后，Phase 3B+ 继续按"one PR = one strategy object"抽 `LLMCodingRuntime`。本轮选择 provider adapter stream invocation，保持 hook dispatch、provider recovery、compact retry 和 tool dispatch 仍在 runtime loop，避免混合行为变更。
+- **实现**:
+  - 新增 `src/runtime/ProviderTurnDriver.ts`，封装 provider adapter `queryStream()` 调用、`streamProviderTurn()` 接线，以及 final-response-only / respond-only / tools-hidden 阶段的 tool-call text leak guard setup。
+  - `LLMCodingRuntime.executeStream()` provider invocation 段改为 `providerTurnDriver.run(...)`，保留原有 `PreInvocation` / `PostInvocation` hooks、`classifyProviderRecovery()`、context-window recovery、metrics absorption 和 memory capability leak retry 逻辑。
+  - 本 slice 不改 `ModelAdapter.queryStream()` contract、`streamProviderTurn()` collector、provider query params shape、event yield semantics、permission/tool dispatch 行为。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/provider-turn-driver.test.ts`：2/2 pass。
+  - `npx tsx --test --test-name-pattern "runtime pipeline collects provider turn deltas and usage events|LLMCodingRuntime (recovers provider context-limit errors with reactive compact retry|blocks after provider context-limit recovery is exhausted|attempts reactive compact after tool results exceed provider-loop context limit)" test/runtime.test.ts`：4/4 pass。
+  - `wc -l src/runtime/LLMCodingRuntime.ts src/runtime/ProviderTurnDriver.ts`：`LLMCodingRuntime.ts` 1879 lines, `ProviderTurnDriver.ts` 56 lines after this slice.
+- **边界**:
+  - Phase 3B+ 未关闭；`ToolDispatchPipeline` 已在后续 slice 落地，下一候选是 hook dispatch / resume 中仍可独立 review 的部分。
+  - 不要求本 slice 达成 `LLMCodingRuntime <= 600 lines`；该目标仍是累计健康指标。
+
+## 2026-06-18 — Module Coupling Governance Phase 3B+: ContextRefreshStrategy Slice
+
+- **背景**: Phase 3A 已把 `runtimePipeline.ts` 降为 compatibility façade。Phase 3B+ 开始从 `LLMCodingRuntime` 每次抽一个 strategy object；第一候选是 context refresh，因为 hot path 和 `resume()` 都需要同一组 refresh dependencies、session inbox loading、memory retrieval hook 与 context broadcaster 注入。
+- **实现**:
+  - 新增 `src/runtime/ContextRefreshStrategy.ts`，封装 `refreshRuntimeContextState()` 的 dependency wiring：`storage`、`memoryProvider`、`contextBroadcaster`、session inbox limit。
+  - `ContextRefreshStrategy.refresh()` 支持 `sessionInbox: 'omit' | 'load' | 'empty' | SessionMessage[]`，其中 `'load'` 通过 storage 读取 inbox，失败时保持原有 non-fatal debug + empty fallback。
+  - `LLMCodingRuntime.executeStream()` hot path 改为创建 per-runtime-call `ContextRefreshStrategy`，初始 refresh 使用 omit，compact / provider-context-recovery refresh 使用 `'load'`，不再在 loop 内维护 ad-hoc `loadSessionInbox()` helper。
+  - `LLMCodingRuntime.resume()` context assembly 也改为通过同一 strategy，使用 `sessionInbox: 'empty'` 保持原行为。
+  - 本 slice 不改 compact orchestration、event yield 顺序、provider adapter contract、tool dispatch、permission / hook / storage schema。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test test/context-refresh-strategy.test.ts`：2/2 pass。
+  - `npx tsx --test test/runtime-context-broadcaster-injection.test.ts`：2/2 pass。
+  - `npx tsx --test --test-name-pattern "LLMCodingRuntime (continues from a successful compact boundary|attempts reactive compact after tool results exceed provider-loop context limit|recovers provider context-limit errors with reactive compact retry|blocks after provider context-limit recovery is exhausted|respects auto compact failure fuse before hard blocking|blocks provider calls when compacted context still exceeds limit)" test/runtime.test.ts`：6/6 pass。
+  - `npx tsx --test test/llm-coding-runtime-resume.test.ts`：10/10 pass。
+  - `wc -l src/runtime/LLMCodingRuntime.ts src/runtime/ContextRefreshStrategy.ts`：`LLMCodingRuntime.ts` 1881 lines, `ContextRefreshStrategy.ts` 62 lines after this slice.
+- **边界**:
+  - Phase 3B+ 未关闭；`ProviderTurnDriver` 与 `ToolDispatchPipeline` 已在后续 slices 落地，下一候选是 hook dispatch / resume 中仍可独立 review 的部分。
+  - 不要求本 slice 达成 `LLMCodingRuntime <= 600 lines`；该目标仍是累计健康指标。
+
+## 2026-06-18 — Module Coupling Governance Phase 3A: RuntimePipeline Helper Submodules
+
+- **背景**: Phase 3A 要把 `runtimePipeline.ts` 从单一 helper 聚合文件逐步拆成可 review 的 submodule。本轮选择 provider turn messages、runtime terminal events、context grounding、context refresh/blocking、cache/metrics、provider loop request、provider turn outcome / stream collector、local runtime intent parser 这些 helper cluster，不碰 `LLMCodingRuntime` loop 行为、provider adapter、tool dispatch 或 public Nexus API。
+- **实现**:
+  - 新增 `src/runtime/pipeline/turn.ts`，承载 `RuntimeProviderTurn` / `RuntimeProviderToolCall` 等 turn 类型、`resolveProviderToolCallInput()`、`buildProviderAssistantMessage()`、`buildProviderToolResultsMessage()`。
+  - 新增 `src/runtime/pipeline/events.ts`，承载 `buildRuntimeResultEvent()`、`buildRuntimeErrorEvent()`、`buildToolCallTextLeakSuppressedEvent()`。
+  - 新增 `src/runtime/pipeline/context.ts`，承载 context grounding required/confirmed、workspace dirty detection、git status changed-file parsing 等纯 helper。
+  - 新增 `src/runtime/pipeline/contextRefresh.ts`，承载 context warning/blocking/usage/microcompact/recovery event builders、context refresh state builder、`refreshRuntimeContextState()` 和 injected broadcaster publish path。
+  - 新增 `src/runtime/pipeline/cache.ts`，承载 `RuntimeExecutionMetrics`、`createRuntimeExecutionMetrics()`、`buildRuntimeExecutionMetricsEvent()`、provider/cache/prefix/compact/remote metrics absorption。
+  - 新增 `src/runtime/pipeline/loop.ts`，承载 provider loop request state、query params、prefix-cache diagnostics、execution state block helper。
+  - 新增 `src/runtime/pipeline/providerTurn.ts`，承载 `reduceProviderTurnOutcome()`、option-selection clarification helper、`streamProviderTurn()`、usage aggregation 和 tool-call / memory capability leak guards。
+  - 新增 `src/runtime/pipeline/localIntent.ts`，承载 `parseLocalRuntimeIntent()` 及其 deterministic local parser helpers。
+  - `src/runtime/runtimePipeline.ts` 保留 compatibility façade，继续 re-export 上述类型和 helper，现有 import path 不需要迁移。
+  - 本 slice 不改 `LLMCodingRuntime` loop、tool dispatch、provider streaming semantics、message shape 或 public Nexus API。
+- **验证**:
+  - `npm run typecheck`：0 errors。
+  - `npx tsx --test --test-name-pattern "runtime pipeline (resolves provider tool call inputs|builds provider assistant and tool result messages|builds grounding guard events after compact|builds grounding confirmation events from source evidence tools|builds context warning and blocking event sequences|builds compact refresh state from assembled context|collects provider turn deltas and usage events)" test/runtime.test.ts`：7/7 pass。
+  - `npx tsx --test --test-name-pattern "runtime pipeline (builds provider loop state and execution state blocks|builds provider loop request state and query params|collects provider turn deltas and usage events|builds context_usage event from context policy facts|builds context_microcompact event from metrics)" test/runtime.test.ts`：5/5 pass。
+  - `npx tsx --test --test-name-pattern "runtime pipeline (builds terminal result and error events|builds context_usage event from context policy facts|builds context_microcompact event from metrics|builds context warning and blocking event sequences|builds compact refresh state from assembled context|builds provider loop state and execution state blocks|builds provider loop request state and query params|collects provider turn deltas and usage events)" test/runtime.test.ts`：8/8 pass。
+  - `npx tsx --test --test-name-pattern "runtime pipeline (parses local tool and task intents|reduces max-token provider turns to continuation or terminal outcomes|asks user to confirm option-like suppressed tool turns|reduces final and tool-call provider turns|collects provider turn deltas and usage events)" test/runtime.test.ts`：5/5 pass。
+  - `npx tsx --test test/runtime-context-broadcaster-injection.test.ts`：2/2 pass。
+  - `wc -l src/runtime/runtimePipeline.ts`：137 lines after Phase 3A closes.
+- **边界**:
+  - Phase 3A 已关闭；后续进入 Phase 3B+，每个 PR 只从 `LLMCodingRuntime` 抽一个 strategy object。`ContextRefreshStrategy`、`ProviderTurnDriver`、`ToolDispatchPipeline` 已在后续 slices 落地，下一候选是 hook dispatch / resume 中仍可独立 review 的部分。
+  - 不要求本 PR 达成 `LLMCodingRuntime <= 600 lines` 或完全清空 `runtimePipeline.ts`；这些是累计健康指标。
+
+## 2026-06-18 — Module Coupling Governance Phase 2C ConfigManager Instance Pilot
+
+- **背景**: Stream B 需要逐步降低 `ConfigManager.getInstance()` 的进程级耦合，但不应一次性迁移所有 Nexus / CLI / tool callsites。Phase 2C 先建立 explicit instance path，并迁移 1-2 个低风险 composition callsite。
+- **实现**:
+  - `ConfigManager` constructor 支持 `new ConfigManager({ configFile })`，同时保留旧的 `new ConfigManager(configFile)` string 入口。
+  - `createDefaultNexusRuntime()` 新增 `configManager` option；runtime settings、`LocalCodingRuntime` hooks、`LLMCodingRuntime` 构造均使用该 injected instance。
+  - `ExploreAgentScheduler` / `createExploreRuntime()` 新增 `configManager` option；child agent runtime factory 不再必须回落到全局 singleton。
+  - 保留 `ConfigManager.getInstance()` 作为 legacy caller path；本切片不迁移 `app.ts`、CLI config command、provider smoke、Bash tool 等剩余 callsites。
+- **验证**:
+  - `npx tsx --test test/config-manager-instance.test.ts`：3/3 pass。
+  - `npm run typecheck`：0 errors。
+  - `npm run coupling:audit`：`reverseImports.runtimeToNexus: []`、`reverseImports.nexusToCli: []`；`ConfigManager.getInstance` fingerprint 降至 35 references。
+- **边界**:
+  - 不改变 config schema、env precedence、provider/model selection priority、config write guard、CLI config behavior。
+  - 不引入完整 `RuntimeServices`。
+  - 不把所有 `ConfigManager.getInstance()` callsites 作为单 PR 目标；后续可按 router / CLI / tool slices 继续迁移。
+
+## 2026-06-18 — Module Coupling Governance Phase 2B ContextBroadcaster Injection
+
+- **背景**: Phase 2A 后 `npm run coupling:audit` 仍显示 `runtime/contextBroadcasterSingleton.ts -> nexus/contextBroadcaster.ts`，这是最后一个 `runtime -> nexus` reverse import。`defaultContextBroadcaster` 只应作为 Nexus compatibility default，而不应被 runtime hot path 读取。
+- **实现**:
+  - 新增 `src/runtime/contextBroadcaster.ts`，定义结构化 `RuntimeContextBroadcaster` / `RuntimeContextEvent`，不依赖 Nexus。
+  - `runtimePipeline.refreshRuntimeContextState()` 接收 optional `contextBroadcaster`，`safeContextPublish()` 只发布到 injected broadcaster；未注入时不发布。
+  - `LLMCodingRuntime` 构造函数中的 `contextBroadcaster` 字段改为 runtime-owned interface，并传入所有 hot-path / resume context refresh 调用。
+  - `createDefaultNexusRuntime()` 新增 `contextBroadcaster` option；`server.ts` 和 embedded CLI app composition 显式创建一个 Nexus `ContextBroadcaster`，同时传给 runtime factory 和 `createNexusApp()`。
+  - `createNexusApp()` 不再调用 `setDefaultContextBroadcaster()`；`defaultContextBroadcaster` 保留为 `/v1/context/observe` legacy default。
+  - 删除 `src/runtime/contextBroadcasterSingleton.ts`。
+- **验证**:
+  - `npx tsx --test test/runtime-context-broadcaster-injection.test.ts test/context-broadcaster.test.ts test/context-observe-websocket.test.ts`：18/18 pass。
+  - `npm run typecheck`：0 errors。
+  - `npm run coupling:audit`：`reverseImports.runtimeToNexus: []`，`reverseImports.nexusToCli: []`。
+- **边界**:
+  - 不改 `/v1/context/observe` WebSocket frame shape、snapshot behavior、`ContextBroadcaster` cache/subscriber semantics。
+  - 不引入完整 `RuntimeServices`。
+  - 不处理 `ConfigManager.getInstance()`；该项进入 Phase 2C。
+
+## 2026-06-18 — Module Coupling Governance Phase 2A ProviderSessionRules Service
+
+- **背景**: Phase 0.5 audit baseline 标出 `runtimeToolLoop.ts` 持有 module-level `providerSessionRules` `Map`，session-scoped provider approval rule 无法通过实例隔离。该问题属于 Stream B singleton debt，但不需要一次性引入完整 `RuntimeServices`。
+- **实现**:
+  - 新增 `src/runtime/providerSessionRules.ts`，封装 provider session approval rule 的 add / get / allow-check / clear 行为。
+  - `runtimeToolLoop.ts` 不再持有 module-level rule `Map`；`executeProviderToolCall` 接收 injected `ProviderSessionRules`，并保留 `defaultProviderSessionRules` 作为 legacy direct-call compatibility。
+  - `LLMCodingRuntime` 默认创建 per-runtime `ProviderSessionRules`，并传入每次 tool-loop dispatch。
+  - `resetProviderSessionRulesForTest()` 继续存在，但只清理 legacy default instance。
+  - `scripts/audit-coupling.js` 将 provider session rules 从 generic singleton string match 拆出，单独报告 `singletonState.providerSessionRules.moduleLevelMap`，避免把 injectable service 引用误判为 module-level singleton debt。
+- **验证**:
+  - `npx tsx --test --test-name-pattern "provider session" test/runtime.test.ts`：2/2 pass。
+  - `npm run typecheck`：0 errors。
+  - `npm run coupling:audit`：`singletonState.providerSessionRules.moduleLevelMap.count: 0`；无新增 reverse import；`nexusToCli: []`；剩余 `runtime -> nexus` 仍为 `runtime/contextBroadcasterSingleton.ts -> nexus/contextBroadcaster.ts`，进入 Phase 2B。
+- **边界**:
+  - 不引入完整 `RuntimeServices`。
+  - 不改 permission rule syntax、permission audit persistence、scope-boundary approval flow、tool execution behavior。
+  - 不处理 `defaultContextBroadcaster` hot-path singleton；该项是下一步 Phase 2B。
+
+## 2026-06-18 — Module Coupling Governance Phase 1B Nexus-to-CLI Bootstrap Boundary
+
+- **背景**: Phase 0.5 audit baseline 显示 `src/nexus/createRuntime.ts` 直接 import `src/cli/everosBackgroundBootstrap.ts`，形成 `nexus -> cli` reverse dependency。该 bootstrap worker 是 runtime composition concern，不应由 CLI 层拥有。
+- **实现**:
+  - 将 `everosPrerequisites`、`everosFallbackBuild`、`everosBootstrap`、`everosBackgroundBootstrap` 的共享实现迁入 `src/runtime/`。
+  - `src/nexus/createRuntime.ts` 改为 import `../runtime/everosBackgroundBootstrap.js`。
+  - `src/cli/everosPrerequisites.ts`、`src/cli/everosFallbackBuild.ts`、`src/cli/everosBootstrap.ts`、`src/cli/everosBackgroundBootstrap.ts` 保留 compatibility façade；`src/cli/everosAutoBootstrap.ts` 作为 CLI policy wrapper，直接依赖 runtime prerequisite/background helpers。
+  - 为避免 runtime 引入 CLI-only `chalk` dependency，runtime bootstrap status/setup 输出使用 plain text；CLI command 层仍负责其它命令 UI styling。
+- **验证**:
+  - `npx tsx --test test/everos-bootstrap.test.ts test/everos-background-bootstrap.test.ts test/everos-auto-bootstrap.test.ts test/everos-fallback-build.test.ts test/everos-first-run.test.ts test/everos-bootstrap-config.test.ts test/everos-bootstrap-store.test.ts test/everos-bootstrap-store-v2.test.ts test/everos-welcome-hint.test.ts`：60/60 pass。
+  - `npm run typecheck`：0 errors。
+  - `npm run coupling:audit`：`nexusToCli: []`。
+  - `rg -n "from ['\"]\\.\\./cli|from ['\"]\\.\\.\\/cli" src/nexus`：0 matches。
+- **边界**:
+  - 不改 EverOS bootstrap state schema、lock/update behavior、auto-bootstrap policy decision、managed command resolution。
+  - 不处理 `runtime/contextBroadcasterSingleton.ts -> nexus/contextBroadcaster.ts`；该项进入 Phase 2B。
+
+## 2026-06-18 — Module Coupling Governance Phase 1A Runtime-owned Monitors
+
+- **背景**: Phase 0.5 audit baseline 显示 `runtime -> nexus` reverse imports 中有 10 条来自 monitor / working-set / context broadcaster；其中 `BehaviorMonitor`、`WorkingSetTracker`、`PersistedWorkingSetTracker` 是纯 runtime state machine / persistence concern，不依赖 Fastify / HTTP / WebSocket。
+- **实现**:
+  - 将 `BehaviorMonitor` 从 `src/nexus/behaviorMonitor.ts` 迁到 `src/runtime/behaviorMonitor.ts`。
+  - 将 `WorkingSetTracker` / `deriveEntriesFromEvents` 从 `src/nexus/workingSetTracker.ts` 迁到 `src/runtime/workingSetTracker.ts`。
+  - 将 `PersistedWorkingSetTracker` 从 `src/nexus/persistedWorkingSetTracker.ts` 迁到 `src/runtime/persistedWorkingSetTracker.ts`。
+  - `src/nexus/{behaviorMonitor,workingSetTracker,persistedWorkingSetTracker}.ts` 保留薄 re-export façade，作为 legacy import compatibility。
+  - 更新 runtime / Nexus / CLI source imports 和 focused tests，让新代码直接依赖 runtime-owned modules。
+- **验证**:
+  - `npx tsx --test test/behavior-monitor.test.ts test/behavior-monitor-subscribe.test.ts test/working-set-tracker.test.ts test/working-set-tracker-persist.test.ts test/working-set-tracker-apply-event.test.ts test/working-set-event-bus.test.ts test/session-resume.test.ts test/llm-coding-runtime-resume.test.ts test/context-working-set-rest-put.test.ts test/context-working-set-edit-cli.test.ts`：125/125 pass。
+  - `npm run typecheck`：0 errors。
+  - `npm run coupling:audit`：monitor-related `runtime -> nexus` imports removed; remaining `runtime -> nexus` records are `runtime/contextBroadcasterSingleton.ts -> nexus/contextBroadcaster.ts` and are queued for Phase 2B.
+- **边界**:
+  - 不改 runtime behavior、working-set file schema、BehaviorMonitor detection semantics、REST route response shape。
+  - 不处理 `nexus/createRuntime.ts -> cli/everosBackgroundBootstrap`；该项进入 Phase 1B。
+  - 不处理 `defaultContextBroadcaster` singleton；该项进入 Phase 2B。
+
+## 2026-06-18 — Module Coupling Governance Phase 0.5 Audit Baseline
+
+- **背景**: `module-coupling-decoupling-and-re-aggregation-plan.md` 已补 PR-sized execution map；真实推进需要一个可粘贴到 PR 的 coupling fingerprint，而不是继续依赖人工 `grep` / `wc -l`。
+- **实现**:
+  - 新增 `scripts/audit-coupling.js`，输出机器可读 JSON：`runtime -> nexus`、`nexus -> cli`、`shared -> outside` reverse imports；跨 layer import direction matrix；`ConfigManager.getInstance`、`defaultContextBroadcaster`、`defaultEverCoreRuntimeManager`、`providerSessionRules` known singleton state；hotspot large-file line counts；`process.env` / `process.cwd()` concentration。
+  - 新增 `npm run coupling:audit`，作为后续 coupling PR 的 before / after audit fingerprint 入口。
+  - `active/TODO_cleanup.md` 标记 Phase 0.5 closed；`TODO.md` 和主 coupling plan 同步下一步为 Phase 1A runtime-owned monitor move，再做 Phase 1B `nexus -> cli` bootstrap boundary。
+- **验证**:
+  - `npm run coupling:audit`：输出 JSON baseline。
+- **边界**:
+  - 不改 runtime / Nexus / storage / CLI 行为。
+  - Phase 0.5 audit 是 informational baseline，不把历史耦合债务直接变成 required failure gate。
+
+## 2026-06-18 — Product W4.1 + Development Process Stability Phase 1/2 收口
+
+- **背景**: `active/TODO_product_30day.md` W4.1 要求补 contributor-facing `CONTRIBUTING.md` / `GOVERNANCE.md` / PR 模板 / issue 模板，降低单点维护与外部贡献门槛。前一轮新增的 `development-process-stability-governance-plan.md` Phase 1/2 要求 PR review 风险分级、语义 PR/commit 粒度和 high-risk review checklist。
+- **实现**:
+  - 新增 `CONTRIBUTING.md`：项目结构、Nexus-first 边界、本地开发命令、PR scope 规则、文档生命周期、flaky test 登记原则和 issue triage。
+  - 新增 `GOVERNANCE.md`：当前 maintainer-led 模型、bus factor=1、决策模型、review-light/standard/high-risk/emergency 口径、社区入口和未来 maintainer 培养路径。
+  - 新增 `.github/PULL_REQUEST_TEMPLATE.md`：risk level、scope、behavior changed、regression evidence、verification、docs updated、flaky/quarantine impact、rollback notes 和 checklist。
+  - 新增 `.github/ISSUE_TEMPLATE/` 四类模板：bug report、feature request、documentation issue、question。
+  - `AGENTS.md` 顶部补 `CONTRIBUTING.md` / `GOVERNANCE.md` 引用，避免 AI agent 只读 maintainer-only guide。
+  - README / README.zh-CN 顶部补 contributions welcome 与 GitHub Discussions 徽章。
+  - `active/TODO_cleanup.md` 标记 Development Process Stability Phase 1/2 closed；新增 Flaky Quarantine Index 初始登记（`test/runtime.test.ts` Node test-runner deserialize symptom + `test/permission-flow.test.ts` permission_request timeout pre-existing symptom）。Phase 3 command 仍 open，默认 `npm test` 暂不改。
+  - `active/TODO_product_30day.md` W4.1 标为“部分收口”：文档产物已完成，最终产品收口仍需真实外部 PR 按 checklist merge。
+- **验证**:
+  - `npm run docs:check`：0 failures。
+  - `npm run format:check`：0 failures。
+- **边界**:
+  - 不改 runtime / Nexus / provider / agent loop 行为。
+  - 不把 flaky test 从默认 suite 移出；只登记并保留 Phase 3 后续脚本工作。
+  - GitHub Discussions 需要仓库 Settings 手动启用，本次只补 README/GOVERNANCE 入口和后续 W4.2 口径。
+
+## 2026-06-18 — Development Process Stability Phase 3 + Product W4.2 setup checklist
+
+- **背景**: Phase 1/2 已补 PR review 与 semantic granularity 文档入口；下一步是让 flaky 隔离有实际命令入口，并补 Product W4.2 的 GitHub Discussions owner 操作断点。
+- **实现**:
+  - 新增 `test/quarantine.json` 机器可读 quarantine manifest，登记 `test/runtime.test.ts` Node test-runner deserialize symptom 与 `test/permission-flow.test.ts` permission_request timeout symptom。
+  - 新增 `scripts/test-quarantine.js` 与 `npm run test:quarantine`。默认模式只列出 quarantine state；显式 `npm run test:quarantine -- --run` 才运行登记项并报告结果。`--json` 支持机器可读输出。
+  - `active/TODO_cleanup.md` 标记 Development Process Stability Phase 3 closed，并保留 Phase 4 CI reporting / Phase 5 scheduled lanes open。
+  - `development-process-stability-governance-plan.md` Phase 3 状态更新为 Closed 2026-06-18。v1 口径明确：不从默认 `npm test` 移除 broad coverage，直到每个 root cause 有 deterministic replacement coverage。
+  - 新增 `docs/nexus/reference/github-discussions-setup-guide.md`（Guide），记录 GitHub Settings 手动启用 Discussions、建议 categories、README/GOVERNANCE 链接和验收方式；`active/TODO_product_30day.md` W4.2 同步引用。
+- **验证**:
+  - `npm run test:quarantine`：列出 2 个 quarantine entries，0 command run。
+  - `npm run format:check`：0 failures。
+  - `npm run docs:check`：0 failures。
+- **边界**:
+  - 不改变默认 `npm test`。
+  - 不让 quarantine 成为忽略失败的永久仓库；每条 entry 都有 owner 与 exit condition。
+  - Discussions 启用仍需仓库 owner 在 GitHub UI 手动完成。
+
 ## 2026-06-17 — Agent Runtime Maturity: Trajectory Eval Harness v1 收口
 
 - **背景**: `agent-runtime-architecture-maturity-plan.md` §3.2（plan §5 step 3）。Agent Trace Schema v1 刚收口，eval harness 直接消费 `projectAgentTrace` 投影。目标：面向 agent trajectory 的 eval（不是函数输出 / 最终文本），离线、确定性、不依赖真实 provider key。这是把"真实 session regression 转成 eval fixture"守门能力落地的前提。
@@ -6526,3 +7809,383 @@
   - `hasSessionContext` 为 false 时完整回落 2-arg `resolveCwdFromPrompt`（back-compat，PR-8 的 8 个 test 全部保持绿色）。
 
 - **后续可推进**: Phase D（`ContextEstimateCalibration` diagnostic — provider usage 2x 偏离 emit warn）/ Phase E（`ROOT_SCAN_REQUIRES_CONFIRMATION` 工具层 guard — Phase A 收口后此类触发应已显著减少）/ Phase F（`UserArtifactContinuity` 当前 session artifact 锚定 — `session_cf361f04` final turn 在 `contextRecent` unavailable 后遗忘已粘贴和已读取的文章）仍 Open；按"真实 regression 驱动"原则，等下次真实 session 触发再推进。
+
+## 2026-06-18 — Context CWD Drift session_10320709-2b06-405f-8f51-d954435d4a70 Deep Analysis: 3 Regression Bugs Beyond §10/§11
+
+- **背景**: Phase A / A Follow-up / B / C1 已在 §10 收口，Phase C2 在 §11 登记为 storage propagation 待修。session_10320709-2b06-405f-8f51-d954435d4a70 暴露**3 个接线层 / 兜底层根因**——这反向证明 plan §10.4 "Out of scope" 行的判断有误：以为 Phase A Follow-up 收口后 session 完全可预测；实际未触及**接线层**（Nexus app.ts、LLMCodingRuntime.runExecuteStreamInner 起手）和**dirname 兜底**的根因。详细分析 + 修复方案落入 plan §12。
+
+- **3 个 Bug 复盘**:
+
+  1. **Bug 1 — Cwd 漂到 `/Users/tangyaoyue/Library`**：
+     - **症状**: session_10320709 的 6 个 turn 全部跑在 cwd `/Users/tangyaoyue/Library`（被 iCloud 路径污染）。验证脚本 `/tmp/test-extract-10320709.mjs` 对 prompt `分析这个文章'/Users/tangyaoyue/Library/Mobile Documents/com~apple~CloudDocs/家人共享/上百个Agent...'与babel-o项目理念的相似程度` 输出 `/Users/tangyaoyue/Library/Mobile`（4-segment candidate）。
+     - **根因（3 段链路）**:
+       1. `src/runtime/systemPromptBuilder.ts:255` pathPattern 在 unescaped space 处切断 iCloud 路径 → 产出 4-segment `/Users/tangyaoyue/Library/Mobile`。
+       2. `isNonExistentProseCandidate`（line 275-310）只对 1-2 segment candidate 做 prose guard；4-segment `Mobile`（bare Latin word basename）返回 false。
+       3. `src/runtime/LLMCodingRuntime.ts:1380-1383` `resolveCwdFromPrompt` 在 `!existsSync(resolved)` 时回退到 `dirname = /Users/tangyaoyue/Library`（macOS 系统目录，永远存在）。
+     - **修复方向（按优先级）**: ① `resolveCwdFromPrompt` line 1380-1383 增加 `parent` 拒绝规则（homedir / `/Users` / `/Users/` / `dirname(homedir)` 禁止作为 fallback cwd）；② `extractAbsolutePaths` 加 4-segment 短 bare Latin word 守卫；③ Phase B 的 `deriveSessionRootContinuity` 在 `use_prompt_path` 判定前增加 `isProjectLikeRoot(resolved)` 校验。
+     - **影响范围**: session_10320709 6 turn cwd 全漂 + 同类风险（`/Users/.../Documents/` / `Desktop/` / `Downloads/` 都可能触发）。
+
+  2. **Bug 2 — Phase B Nexus 接线层 missing `storedSessionCwd` / `latestTaskPrimaryRoot`**：
+     - **症状**: session_10320709 的 0 个 `session_root_continuity` event（预期每 turn ≥ 1 个）。意味着 `LLMCodingRuntime.runExecuteStreamInner` line 290 的 `hasSessionContext = false` 永远成立，Phase B 的 `resolveCwdWithContinuity` 路径根本没被触发。
+     - **根因**: `src/nexus/app.ts:2695-2711` `executeStream` 调用**没传** `storedSessionCwd` / `latestTaskPrimaryRoot`。`Runtime.ts:67-85` `RuntimeExecuteOptions` 已定义 3 个 optional 字段（Phase B 收口时加），但 Nexus `app.ts` 的 HTTP / WebSocket 两条 executeStream 路径都没有传。
+     - **修复方向**: Nexus HTTP/WS executeStream 加 2 行（`storedSessionCwd` + `latestTaskPrimaryRoot` 来自 `options.storage.getSession?.(sessionId)`）；session record schema 加 `latestPrimaryRoot` 字段（与 `taskScope.ts:32` 的 `primaryRoot` 对齐）；emit `session_root_continuity_missing` diagnostic。
+     - **影响范围**: session_10320709 0 个 continuity event + 所有已上线 Nexus session 的 Phase B CLI 决策记录、AgentTrace 投影全部失效。
+
+  3. **Bug 3 — LLMCodingRuntime.runExecuteStreamInner missing storage 注入**（**§11 已登记，Phase C2 Open/P0**）：
+     - **症状**: session_10320709 的 3 个 context tool 失败（event_seq 10049/10050 `contextSearch`、15071/15072 `contextRecent`、15102/15103 `contextSearch` 再次失败）。
+     - **根因**: `LLMCodingRuntime.runExecuteStreamInner` 整段**没有** `options = { ...options, storage: this.storage }`（对比 `LocalCodingRuntime.ts:170-172` 有）。`executeToolSafely` → `tool.execute(input, { storage: undefined })` → 触发 Phase C guard。
+     - **修复方向**: §11.4 修 1（`runExecuteStreamInner` 起手段落 2 行）。
+
+- **修复优先级**（按 P0 → P1 排序）:
+
+  | 优先级 | Bug | 修法 | 代码量 | Test |
+  | --- | --- | --- | --- | --- |
+  | **P0** | Bug 3（C2 storage） | §11.4 修 1 | 1 行 | 5 个（§11.5） |
+  | **P0** | Bug 2（Nexus 接线层） | §12.2 修 A | ~5 行 | 2 个（HTTP + WS） |
+  | **P1** | Bug 1（cwd 漂 Library） | §12.1 修 A → C | ~15 行 | 6 个（dirname 收紧 3 + 4-segment guard 2 + continuity 投影 1） |
+
+  按 P0 → P1 顺序，每段独立 PR，便于 regression 验证。
+
+- **验证策略**:
+  1. **Bug 3 fix**: 跑 `test/runtime-context-tools-registry-gate.test.ts` 4 个 + `test/runtime.test.ts` 6 个 + 新增 `test/runtime-storage-propagation.test.ts` 5 个 §11.5 测试；用 `MemoryStorage` 注入 `LLMCodingRuntime` + 故意不传 `RuntimeExecuteOptions.storage` → 验证 `contextSearch` 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`。
+  2. **Bug 2 fix**: 在 `test/nexus-runtime-wiring.test.ts` 新增 2 个测试：HTTP `executeStream` 与 WS `executeStream` 都把 `storedSessionCwd` / `latestTaskPrimaryRoot` 注入；mock Nexus `app.ts:2695` 调用点，验证 options 包含这 2 个字段。
+  3. **Bug 1 fix**: 新增 `test/resolve-cwd-fallback.test.ts` 3 个 test：① iCloud `Mobile Documents` 路径 prompt → cwd 不漂到 `~/Library`；② 已知 project root 锚定检查通过；③ `keep_session_root` 决策在 Project-root 校验失败时触发。
+
+- **Reopen 信号**（operator-facing）:
+  - 任何 `cwd` 漂到 `/Users/<user>/Library` / `/Users/<user>/Documents` 这类「家目录」都是 P1 回归（必须 reopen Phase A/B）。
+  - 任何 `session_root_continuity` event 缺失 + 0 个 `lastContinuity*` attributes 是 P0 回归（必须 reopen Phase B 接线层）。
+  - 任何 `CONTEXT_STORAGE_UNAVAILABLE` + `events` 表非空 是 P0 回归（会阻塞 Phase C2 关闭，或在已关闭后 reopen 注入层）。
+
+- **文档变更**:
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md`:
+    - 新增 §12（"2026-06-18 — Session_10320709-2b06-405f-8f51-d954435d4a70 Deep Analysis: 3 Regression Bugs Beyond §10/§11"）共 6 个子节：12.1 Bug 1 / 12.2 Bug 2 / 12.3 Bug 3（指向 §11）/ 12.4 修复优先级表 / 12.5 验证策略 / 12.6 Reopen 信号。
+  - `docs/nexus/TODO.md`: P2 Plan 的 Context CWD Drift 行更新 Phase B/C 收口状态 + 标注 3 个 Bug 待修。
+  - `docs/nexus/active/TODO_runtime.md`: 新增 session_10320709 跟进项（3 Bug 修复追踪）。
+  - `docs/nexus/WORK_LOG.md`: 本条（2026-06-18 session_10320709 deep analysis）。
+
+- **后续可推进**: Bug 3 → Bug 2 → Bug 1 按 P0 → P1 修复；每段独立 PR + focused regression test + integration test；不扩大 plan 边界（不引入新持久化、不重写 Phase A/B/C 主体逻辑）。
+
+## 2026-06-18 — Long-Running Context Assembly Reality Audit + R0-R7 Follow-up Plan
+
+- **背景**: 用户选中 `long-running-context-assembly.md` 后要求核对源码和 `session_981cc5c2` / `session_cf361f04` / `session_10320709` 的实际运行情况，判断该文档中 "Nexus 组装 = 上下文管理" 是否真实实现。
+
+- **源码审计结论**:
+  - 已落地 primitives：`WorkingSetTracker` / `PersistedWorkingSetTracker`、`assembleContext()`、CLI/REST preview、REST working-set GET/PUT/assemble endpoints、`/v1/working-set/observe`、`/v1/context/observe` route + broadcaster skeleton、`LLMCodingRuntime.resume()`。
+  - 未闭环：正常 `LLMCodingRuntime.executeStream()` hot path 没有 load persisted working set，也没有把 `workingSetOverride` 传进每次 `refreshRuntimeContextState()`；`refreshRuntimeContextState()` 当前会 drop `workingSetOverride` / include flags；`WorkingSetTracker.applyEvent()` 没有接入真实 tool event stream；REST PUT fresh tracker 与 WS broadcaster tracker 不共享 mutation path；`/v1/context/observe` 主要有 simulated publish 测试，缺真实 runtime e2e。
+  - 关键阻塞：`context-cwd-drift-and-recall-governance-plan.md` Phase C2 storage propagation 未收口，导致 storage-backed session 中 `contextSearch` / `contextRecent` 仍可能返回 `CONTEXT_STORAGE_UNAVAILABLE`。
+
+- **真实 session 证据**:
+  - `session_981cc5c2-230c-40d1-953c-b956e9dbaaf7`：19666 events；后半段 task scope 漂到 `/`；`contextSearch` schema 失败后继续触发 `CONTEXT_STORAGE_UNAVAILABLE`；无 `working_set_updated` / persisted `assembled` / `session_root_continuity`。
+  - `session_cf361f04-7ab1-43a5-907a-41a808942686`：23678 events；scope 从项目根漂到 `/` 再漂到 `/Users/tangyaoyue/Library`；多次 `contextSearch` / `contextRecent` 返回 `CONTEXT_STORAGE_UNAVAILABLE`；无 `working_set_updated` / persisted `assembled` / `session_root_continuity`。
+  - `session_10320709-2b06-405f-8f51-d954435d4a70`：15914 events；前 6 个 `task_scope_declared` 都在 `/Users/tangyaoyue/Library`；3 次 context tool 失败均为 `CONTEXT_STORAGE_UNAVAILABLE`；无 `working_set_updated` / persisted `assembled` / `session_root_continuity`。
+
+- **文档修正**:
+  - `docs/nexus/proposals/long-running-context-assembly.md`：
+    - 顶部状态从 "server 侧全部落地" 改为 Reality Audit 2026-06-18：基础设施部分落地，runtime hot path 未闭环。
+    - 新增 "当前真实状态"：明确 primitives、未闭环点、真实 session 证据不支持 zero-loss resume / always-active working set / production cross-session sharing。
+    - 新增 §19 Reality Audit 和 §20 R0-R7 Follow-up Execution Plan。
+  - `docs/nexus/reference/context-governance-index.md`：
+    - long-running context 入口改为 "partially landed；runtime hot path 未 inject persisted working set"。
+    - Open Items 拆成 hot-path working-set injection、REST PUT ↔ observe shared tracker、real-runtime context observe e2e。
+  - `docs/nexus/TODO.md`：
+    - "Behavior Monitor / Long-Running Context Assembly" 行升级为 "P1 Plan — Long-Running Context Assembly Hot Path Closure"，列出 R0-R7 执行顺序。
+  - `docs/nexus/active/TODO_runtime.md`：
+    - 新增 "P1 Long-Running Context Assembly Hot Path Closure — R0-R7" 具体待办。
+
+- **R0-R7 执行顺序**:
+  1. R0：先修 storage propagation + continuity wiring（接 `session_10320709` Bug 2/3）。
+  2. R1：修 cwd drift guard，避免 working set 持久化污染 `/` / `~/Library`。
+  3. R2：把 persisted working set 接进正常 `executeStream` hot path。
+  4. R3：REST PUT 与 `/v1/working-set/observe` 共享 tracker。
+  5. R4：`/v1/context/observe` 做真实 runtime e2e + redacted payload。
+  6. R5：resume preview product path，不宣称 durable continuation。
+  7. R6：Go TUI 只消费 runtime-owned observer facts。
+  8. R7：用三个真实 session 做 regression replay gate。
+
+- **边界**:
+  - 不新增长期记忆权威源；MemoryProvider / EverCore 仍跟 memory governance。
+  - 不把 behavior trace 当事实源。
+  - 不默认持久化 full assembled prompt。
+  - 不允许 CLI / Go TUI 自行推导 context truth。
+  - 不宣称 durable execution resume，直到 continuation snapshot 真正实现。
+
+## 2026-06-18 — Context CWD Drift session_10320709 二次复盘: 4 遗漏细节 + Bug 4 + 修正修复优先级
+
+- **背景**: §12 的 3-bug 分析基于首轮推断，未直接读 SQLite events 表。本轮用 `node:sqlite` 只读直查 `/Users/tangyaoyue/.babel-o/db.sqlite`（15914 events）做二次复盘，发现 §12 遗漏 4 个关键细节 + 1 个新架构层 bug（Bug 4），并修正修复优先级。详细证据落入 plan §13。
+
+- **4 个遗漏细节**:
+
+  1. **真实 prompt 用普通空格（非 `\ ` escape）**: user_message seq=1 原文 `分析这个文章'/Users/tangyaoyue/Library/Mobile Documents/com~apple~CloudDocs/家人共享/上百个Agent...md'与babel-o项目理念的相似程度`。Phase A Follow-up ④ 的 SPACE_MARK 哨兵**只处理 `\ ` shell escape**，而真实用户粘贴的是**普通空格**——SPACE_MARK 修了错误的目标。
+
+  2. **一条 iCloud 路径拆成 2 candidate**: `user_intake_guidance` seq=3 `explicitPaths = ["/Users/tangyaoyue/Library/Mobile","/com~apple~CloudDocs/家人共享/上百个Agent"]`。第 1 个 → cwd 漂移源；第 2 个 → 进了 `task_scope_declared.explicitRoots`（seq=4）成为**垃圾 explicitRoot**，让 file-discovery 去搜不存在的 `/com~apple~CloudDocs/...`。§12 只记了 cwd 漂，漏了 explicitRoot 污染。
+
+  3. **`/Users/tangyaoyue/Library/Mobile` 不存在**（`ls` + `existsSync` 验证）；`~/Library` 存在。因此 `resolveExplicitPromptCwd`（`app.ts:5662`，Site A）**正确拒绝** `/Mobile`（isDirectory 失败 → undefined），但 `resolveCwdFromPrompt`（`LLMCodingRuntime.ts:1380-1383`，Site B）**错误接受**其 dirname `~/Library`（永远存在）。**两 resolution site 行为不一致** → Bug 4。
+
+  4. **drift 跨 turn 2-6 持续**: session_started seq=2/3914/4292/4454/5980/9867 全部 cwd=`~/Library`，但 turn 2-6 的 prompt **完全无路径**（"两个项目的理念哪一个更先进一些"）。说明 drift 一旦发生就被向前传播。turn 7 因用户重述项目内路径 `在/Users/tangyaoyue/DEV/BABEL/BabeL-O/docs/nexus中...` 而**自愈**（seq=14509 cwd=`docs/nexus`）。§12 把它当单 turn 现象，错了。
+
+- **Bug 4 [NEW, P1] — Dual Cwd Resolution Sites Disagree + session.cwd Per-turn Mutation**: `cwd` 在 `app.ts:5651 resolveRequestCwd`（Site A，只接受实存目录）与 `LLMCodingRuntime.ts:1378 resolveCwdFromPrompt`（Site B，有 dirname 兜底）两处用不同逻辑解析；`app.ts:2301 session.cwd = cwd` 每 turn 覆写。两 site 对 `/Mobile` 给出不同结果（A 拒绝、B 接受 `~/Library`），runtime 用 Site B 覆写 `options.cwd` 并 emit `session_started.cwd=~/Library`，drift 跨 turn 持续。
+
+- **下游损害清单**（§12 漏列）:
+  - **8 GLOB_FAILED**（seq 155/271/422/428/4521/4527/6121/10314）: ripgrep 在 `~/Library/Caches/com.apple.ap.adprivacyd` 撞 `Operation not permitted` → 整段失败（非 partial result）。**独立工具鲁棒性问题**：Glob 遇 permission-denied 子目录应跳过继续扫 + diagnostic，而非整段失败。建议在 tool-governance-plan.md 单列 follow-up。
+  - **3 scope_boundary_detected parent_scan**（seq 265/6115/10308）: `taskPrimaryRoot=~/Library` → 模型够项目 `/Users/tangyaoyue/DEV` → 触发 parent_scan 到 `/Users/tangyaoyue` → 3 次确认中断。
+  - **6 WEB_SEARCH_FAILED**（seq 10044/10097/10302/10460/10547/10667）: "fetch failed"。独立网络/配置问题（非本 plan 范围），但加剧 session 质量——模型查 "OpenManus/OpenMenus" 学术项目失败，只能凭训练数据回答。
+  - **5 INVALID_TOOL_INPUT + 1 TOOL_INPUT_PARSE_ERROR**: ListDir `maxDepth>2` 等 provider-side malformed calls（次要）。
+  - **1 幻觉路径拼接**（seq=4786）: Read `/Users/tangyaoyue/Library/Mobile Documents/com~apple~CloudDocs/家人共享/docs/nexus/context-and-subagent-upgrade-pla...`——模型把 drifted iCloud 基路径 + 项目相对路径拼成不存在的路径。
+  - **上下文浪费**: execution_metrics seq=3911 turn 1 `contextCharsIn=992400`（≈250k tokens），大部分是失败 Library 扫描输出。drift 不只污染 cwd，还烧 context budget。
+
+- **修正后的修复优先级**（替换 §12.4）:
+
+  | 优先级 | Bug | 修法 | 代码量 | 阻塞的下游损害 |
+  | --- | --- | --- | --- | --- |
+  | **P0** | Bug 1 Layer A | `extractAbsolutePaths` quote-delimited span（`'...'`/`"..."`/backtick）优先识别，整段实存则绕过空格切断 | ~15 行 | cwd 漂移 + 垃圾 explicitRoot + 8 GLOB_FAILED + 3 parent_scan + 上下文浪费 |
+  | **P0** | Bug 1 Layer B | 共享 `isAcceptablePromptCwd` 在 Site A+B 拒绝 homedir/`~/Library`/`~/Documents`/`~/Desktop`/`~/Downloads`/`/Users` | ~10 行 | dirname 兜底漏网 |
+  | **P0** | Bug 3（C2 storage） | §11.4 修 1 + Nexus 接线 + runtimeToolLoop merge | ~8 行 | 3 CONTEXT_STORAGE_UNAVAILABLE |
+  | **P1** | Bug 2 + origin_cwd | `sessions.origin_cwd` 不可变列 + `app.ts:2695` 传 `storedSessionCwd=origin_cwd` + `latestTaskPrimaryRoot` | ~20 行 | Phase B continuity 失效 + 0 session_root_continuity event |
+  | **P1** | Bug 4（architectural） | 统一 Site A/B：删 `resolveExplicitPromptCwd` 让 runtime+PhaseB 决策，或把 Phase B 上移到 `resolveRequestCwd`；`session.cwd` 不被 external prompt 覆写 | ~30 行 refactor | 跨 turn drift 持续 |
+
+  **关键修正**: Bug 1 从 P1 提升到 **P0**（cwd 漂移 load-bearing fix）；Bug 2 是 defense-in-depth（`session.cwd` 本身已漂，需不可变 `origin_cwd`）；Bug 1 Layer A+B 与 Bug 2 互补不替代。
+
+- **修正后的 Reopen 信号**（替换 §12.6）:
+  - cwd 漂到家目录 → Bug 1 Layer A+B 未收口。
+  - `task_scope_declared.explicitRoots` 含 `/com~apple~...` 破碎 fragment → Bug 1 Layer A 未收口。
+  - turn prompt 无项目路径但 `session_started.cwd !== session.origin_cwd` → Bug 4 未收口（跨 turn drift）。
+  - `session_root_continuity` event 缺失 → Bug 2 未收口。
+  - `CONTEXT_STORAGE_UNAVAILABLE` + events 表非空 → Bug 3 未收口。
+  - `GLOB_FAILED` 因 `Operation not permitted` 整段失败 → 独立工具鲁棒性 follow-up（tool-governance-plan）。
+
+- **文档变更**:
+  - `docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md`:
+    - Status 段追加 §13 二次复盘摘要（普通空格 / 2 candidate / Site A+B 不一致 / 跨 turn 持续 / Bug 1 提 P0 / Bug 2 需 origin_cwd / 下游损害清单）。
+    - 新增 §13（"Session_10320709 Re-examination: Missed Details + Refined Fix Plan"）共 7 个子节：13.1 遗漏证据表 / 13.2 Bug 4 dual resolution sites + session.cwd mutation / 13.3 Bug 1 双层修法（Layer A quote span + Layer B isAcceptablePromptCwd）/ 13.4 Bug 2 origin_cwd 修正 / 13.5 下游损害清单（8 GLOB_FAILED + 3 parent_scan + 6 WEB_SEARCH + 幻觉路径 + 992k context）/ 13.6 修正修复优先级表 + reopen 信号 / 13.7 与 §12 差异总结。
+  - `docs/nexus/WORK_LOG.md`: 本条（2026-06-18 session_10320709 二次复盘）。
+
+- **后续可推进**: Bug 1 Layer A → Bug 1 Layer B → Bug 3 → Bug 2+origin_cwd → Bug 4 按 P0 → P1 修复；Bug 1 Layer A 是 cwd 漂移的根因修复（quote-delimited span），应最优先。Glob permission-denied 降级为 partial result 的工具鲁棒性改进独立列入 tool-governance-plan follow-up，不阻塞本 plan。
+
+## 2026-06-18 — Context CWD Drift Bug 1 Layer A 收口: quote-delimited span 优先识别
+
+- **背景**: §13 二次复盘证明 cwd 漂到 `~/Library` 的 load-bearing 根因是 `extractAbsolutePaths` 的 pathPattern 在**普通空格**处切断 iCloud 路径（Phase A Follow-up ④ 的 SPACE_MARK 哨兵只处理 `\ ` escape，修错目标）。真实 prompt `分析这个文章'/Users/.../Mobile Documents/com~apple~CloudDocs/家人共享/上百个Agent，该怎么管？...md'与babel-o项目理念的相似程度` 里路径被单引号包住、含普通空格 + CJK 标点（`，？：`），pathPattern 的字符类同时排除空格和这些 CJK 标点 → 一条路径拆成 2 个破碎 candidate（`/Users/.../Library/Mobile` → cwd 漂移源 + `/com~apple~CloudDocs/...` → 垃圾 explicitRoot）。
+
+- **代码变更**（1 文件）:
+  - `src/runtime/systemPromptBuilder.ts` `extractAbsolutePaths()`:
+    - 新增 `extractAndBlankQuotedRealPaths(text, paths)` helper，在 pathPattern 循环**之前**运行。匹配 `'...'` / `"..."` / backtick 平衡 span（backreference 保证开闭引号一致），对内容是绝对/家相对路径 + 含 `/` + 含普通空格的 span，校验实存性（`existsSync` true 或 `resolvePromptPath` 命中实存 prefix 且非 prose candidate）→ 把 resolved path 直接加入 `paths`，并把**整个 span（含引号）替换为等长空格**，让 pathPattern 在该位置找不到 `/`、无法再 emit 破碎 fragment。
+    - 关键设计：不只替换空格为 SPACE_MARK（不够，因为 pathPattern 还会在 CJK 标点 `，？：` 处切断文件名 `上百个Agent，该怎么管？...md`）；而是直接 add + blank 整段，绕过 pathPattern 对该 span 的处理。非实存的 quoted span 原样返回，既有 prose guard 继续处理。
+    - `let preserved` 从 `const` 改为 `let`（多一步 blank 处理）。
+
+- **测试新增**（4 test，`test/system-prompt-builder.test.ts` 35 → 39）:
+  1. `Bug 1 Layer A: quoted iCloud-style path with plain space is captured whole` — 用 `mkdtempSync` 造真实 `Mobile Documents/上百个Agent，该怎么管？.md`（普通空格 + CJK 标点文件名），prompt 用单引号包路径 → 断言整段路径在 candidates 里 + 破碎 fragment `/Mobile` **不**在。
+  2. `Bug 1 Layer A: double-quoted path with plain space is captured whole` — 双引号 `"` 包真实路径。
+  3. `Bug 1 Layer A: backtick-quoted path with plain space is captured whole` — backtick 包真实路径。
+  4. `Bug 1 Layer A: quoted prose that is NOT a real path is left untouched` — `'some non existent / path with space'` 不实存 → 不 merge、不产生 candidate（防 false-positive）。
+
+- **验证**:
+  - `npx tsx /tmp/test-extract-10320709.mjs`：prompt 1 从 `/Users/tangyaoyue/Library/Mobile` → **整段 iCloud 文件路径**；prompt 7（项目内路径）行为不变。
+  - `npx tsx --test test/system-prompt-builder.test.ts`：**39/39 pass**（35 pre-existing + 4 新增）。
+  - `npx tsx --test test/session-root-continuity.test.ts test/inspect-session.test.ts`：**47/47 pass**。
+  - `npx tsx --test test/runtime-context-tools-registry-gate.test.ts test/context-tools-registry.test.ts`：**12/12 pass**。
+  - `npx tsx --test --test-name-pattern="CJK slash|over-filtering|task scope|URL-heavy|real existing absolute|resolveCwd|cwd" test/runtime.test.ts`：**13/13 pass**（含 `session_cf361f04` URL-heavy + `/v1/execute persists resolved cwd` 重用回归 + `LLMCodingRuntime resolves cwd from prompt absolute path`）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - `test/runtime.test.ts` 全量运行有 1 个 pre-existing flaky（`Unable to deserialize cloned data` test-runner 序列化错误，非断言失败，develop 分支同样失败，与本次无关）。
+
+- **边界**:
+  - 只处理 quote-delimited 真实路径；非 quoted 的普通空格路径（如裸 `看 /Users/.../Mobile Documents/... 下文件` 无引号）仍由 pathPattern 切断 — 这是 Layer B（`isAcceptablePromptCwd` 拦系统目录）和 Bug 4（统一 resolution sites）的职责，Layer A 不扩大边界。
+  - 不修改 `resolveCwdFromPrompt` 的 dirname 兜底逻辑（那是 Layer B 的修法）。
+  - 不引入新持久化、不改 Phase B continuity 主体。
+
+- **后续可推进**: Bug 1 Layer B（共享 `isAcceptablePromptCwd` 在 Site A+B 拦 homedir/`~/Library`/`~/Documents` 等系统目录，~10 行 + 3 test）→ Bug 3（C2 storage 注入）→ Bug 2+origin_cwd → Bug 4。Layer A 修了 quote-delimited 根因，Layer B 兜底非 quoted + dirname 漏网。
+
+## 2026-06-18 — Context CWD Drift Bug 1 Layer B 收口: isAcceptablePromptCwd 共享守卫
+
+- **背景**: Layer A 修了 quote-delimited 路径的根因，但非 quoted 裸空格路径（如 `分析 /Users/.../Library/Mobile 这个路径`）仍会被 pathPattern 切断成 `/Users/.../Library/Mobile`（不存在），`resolveCwdFromPrompt` Site B 的 dirname 兜底返回 `~/Library`（macOS 系统目录永远存在）。§13 二次复盘证明两 resolution site（Site A `app.ts:resolveExplicitPromptCwd` 只接受实存目录 / Site B `LLMCodingRuntime.ts:resolveCwdFromPrompt` 有 dirname 兜底）行为不一致；Layer B 用一个共享守卫在两 site 都拒绝系统/家目录。
+
+- **代码变更**（3 文件）:
+  - `src/runtime/systemPromptBuilder.ts`: 新增 export `isAcceptablePromptCwd(p): boolean` 纯函数。rejected 列表含 `/` / `/Users` / `/Users/` / `homedir()` / `dirname(homedir())` / `${home}/Library` / `${home}/Documents` / `${home}/Desktop` / `${home}/Downloads` / `${home}/Applications`。用 `resolve(p)` 归一化后比对。放在 systemPromptBuilder 是因为它是 path-resolution helper 的 owner，且两 site 都已 import 该模块。顶部 import 增 `resolve`（从 `node:path`）。
+  - `src/runtime/LLMCodingRuntime.ts` Site B `resolveCwdFromPrompt()`：3 个 return 点都加 `isAcceptablePromptCwd` 守卫 —— ① dirname 兜底（line ~1382，session_10320709 漂移源）`parent` 必须通过守卫才 return；② 实存目录分支 `resolved` 必须通过守卫；③ 文件父目录分支 `parent` 必须通过守卫。守卫失败则 `continue` 到下一 candidate。import 增 `isAcceptablePromptCwd`。
+  - `src/nexus/app.ts` Site A `resolveExplicitPromptCwd()`：`stat.isDirectory()` 后加 `&& isAcceptablePromptCwd(resolved)` 守卫，防止 prompt 直接落在 `~/Library`（实存目录）被提升。import 增 `isAcceptablePromptCwd`。
+
+- **测试新增**（新文件 `test/resolve-cwd-fallback.test.ts`，10 test）:
+  - `isAcceptablePromptCwd — vocabulary`（5 test）：拒绝 homedir / `~/Library` / `~/Documents` / `/` / `/Users`；接受 synthetic project root（用真实 `homedir()` + `mkdtempSync`，honest about on-disk state；`~/Library` 不存在时 skip）。
+  - `resolveCwdFromPrompt — Bug 1 Layer B system-dir fallback rejection (Site B)`（5 test）：① broken `/Mobile` fragment（非 quoted，Layer A 不接）→ dirname `~/Library` 被拒，保持 baseCwd；② 直接 `~/Library` prompt（实存）→ 拒，保持 baseCwd；③ 直接 `~/Documents` → 拒；④ 真实 project-internal dir 仍正常 resolve（防 over-filtering）；⑤ 真实文件 → 父目录（非系统目录）仍正常 resolve。
+  - 已加入 `package.json` test 脚本（同时补登 `test/session-root-continuity.test.ts` 此前漏登）。
+
+- **验证**:
+  - `npx tsx /tmp/test-layerb.mjs`：4 case 全过 —— broken `/Mobile` → baseCwd（不漂 `~/Library`）；real internal dir → 正常 resolve；直接 `~/Library` → baseCwd；直接 `~/Documents` → baseCwd。
+  - `npx tsx --test test/resolve-cwd-fallback.test.ts`：**10/10 pass**。
+  - `npx tsx --test test/system-prompt-builder.test.ts test/session-root-continuity.test.ts test/inspect-session.test.ts test/runtime-context-tools-registry-gate.test.ts test/context-tools-registry.test.ts`：**78/78 pass**。
+  - `npx tsx --test --test-name-pattern="resolveCwd|cwd|CJK slash|URL-heavy|real existing absolute|resolves cwd from prompt" test/runtime.test.ts`：**11/11 pass**（含 `session_cf361f04` URL-heavy + `LLMCodingRuntime resolves cwd from prompt absolute path` + `/v1/execute persists resolved cwd` 重用回归）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - `test/permission-flow.test.ts` 的 `smart permissions: prompts user on non-whitelisted` 测试失败，经 `git stash` 验证为 **pre-existing flaky**（baseline 同样 3/3 失败，3 秒轮询超时未收到 permission_request，与本改动无关——`extractAbsolutePaths('bash "rm -rf temporary_folder"')` 返回 `[]`，cwd 解析不受影响）。
+
+- **边界**:
+  - Layer B 只在两 site 的 return 点守卫；不改 `resolveCwdFromPrompt` 的整体逻辑、不改 Phase B continuity 主体、不引入新持久化。
+  - external-but-project-like 根（如 `/Users/tangyaoyue/DEV/BABEL/BabeL-O` 之外的其它项目目录）仍接受——Phase B continuity 的 `require_confirmation` / `keep_session_root` 单独处理外部确认。Layer B 不接管 external 判定。
+  - 与 Layer A 互补不替代：Layer A 修 quote-delimited 根因（普通空格 + CJK 标点），Layer B 兜底非 quoted 裸空格 + dirname 漏网 + 直接落在系统目录的 prompt。
+
+- **后续可推进**: Bug 3（C2 storage 注入，`LLMCodingRuntime.runExecuteStreamInner` 起手 `options = { ...options, storage: this.storage }` + Nexus HTTP/WS `executeStream` 传 `storage` + `runtimeToolLoop` defensive merge，~8 行 + 5 test）→ Bug 2+origin_cwd → Bug 4。Layer A+B 已彻底锁住 cwd 漂移根因；Bug 3 切换到 context tool storage 注入。
+
+## 2026-06-18 — Context CWD Drift Bug 3 / Phase C2 收口: storage 注入 3 个接线点
+
+- **背景**: session_10320709-2b06-405f-8f51-d954435d4a70 证明 storage-backed Nexus session（SQLite 15914 events + 权限审计可写）中 `contextSearch` / `contextRecent` 仍返回 `CONTEXT_STORAGE_UNAVAILABLE`（event_seq 10050 / 15072 / 15103）。§11 复盘根因：`executeToolSafely` → `tool.execute(input, { storage: options.storage })` 而 `RuntimeExecuteOptions.storage === undefined`——即使 `LLMCodingRuntime.this.storage` 存在、Nexus `options.storage` 存在、`executeProviderToolCall` 收到 side-channel storage。3 个接线点都没把 storage 填进 `RuntimeExecuteOptions.storage`。
+
+- **代码变更**（3 文件 / 3 接线点）:
+  - `src/runtime/LLMCodingRuntime.ts` `runExecuteStreamInner` 起手（line ~286）：段首注入 `if (!options.storage && this.storage) options = { ...options, storage: this.storage }`。镜像 `LocalCodingRuntime.ts:170-172` 既有模式。runtime 自己的 storage 自动填进 per-request options，context tool 在 runtime 内部 tool call 拿到非空 `ToolContext.storage`。
+  - `src/nexus/app.ts` HTTP + WS 两条 `executeStream` 调用点（line ~2695 + ~4071）：各加 `storage: options.storage`。Nexus 把自己的 storage 传给 runtime，覆盖了「LLMCodingRuntime 起手注入」之外的入口（如 runtime 由其它 factory 构造但 Nexus 仍持有 storage 的场景）。
+  - `src/runtime/runtimeToolLoop.ts` `executeProviderToolCall` 在 `executeToolSafely` 之前（line ~737）：defensive merge `const toolRuntimeOptions = runtimeOptions.storage ? runtimeOptions : { ...runtimeOptions, storage: options.storage }`，把 side-channel storage 填进传给 `executeToolSafely` 的 options。defense-in-depth——任何 caller 即使没在 runtimeOptions 里带 storage，只要 `executeProviderToolCall` 收到 side-channel storage，ToolContext.storage 就非空。
+
+- **测试新增**（新文件 `test/runtime-storage-propagation.test.ts`，5 test）:
+  1. `runtimeToolLoop defensive merge: contextRecent succeeds when runtimeOptions.storage is omitted but side-channel storage provided` — session_10320709 精确场景：`runtimeOptions.storage` 故意省略，side-channel `storage` 提供 → `contextRecent` 不返回 `CONTEXT_STORAGE_UNAVAILABLE`。
+  2. `contextSearch succeeds when runtimeOptions.storage is omitted but side-channel storage provided` — 同上，`contextSearch`。
+  3. `existing runtimeOptions.storage is preserved (not overwritten) when already set` — defensive merge 不 clobber 显式 storage。
+  4. `tool_started + tool_completed events are emitted for contextRecent` — `tool_completed.success === true`（不只看 content 文案）。
+  5. `negative: no-storage registry hides context tools (back-compat preserved)` — `createDefaultToolRegistry({ storage: null })` 仍隐藏 3 个 context 工具，Phase C2 注入不破坏 no-storage 路径。
+  - 已加入 `package.json` test 脚本。
+
+- **回归守门验证**（证明 test 真能抓回归）: 临时 revert `runtimeToolLoop` defensive merge → 3 个 test（contextRecent + contextSearch + events）失败；restore → 5/5 pass。证明 test 精确锁住注入点，不是空过。
+
+- **验证**:
+  - `npx tsx --test test/runtime-storage-propagation.test.ts`：**5/5 pass**。
+  - `npx tsx --test test/runtime-storage-propagation.test.ts test/runtime-context-tools-registry-gate.test.ts test/resolve-cwd-fallback.test.ts test/system-prompt-builder.test.ts test/session-root-continuity.test.ts test/inspect-session.test.ts test/context-tools-registry.test.ts`：**113/113 pass**。
+  - `npx tsx --test --test-name-pattern="resolveCwd|cwd|CJK slash|URL-heavy|real existing absolute|resolves cwd from prompt|persists resolved cwd|tool loop executes" test/runtime.test.ts`：**12/12 pass**（含 `/v1/execute persists resolved cwd` 重用回归 + `runtime tool loop executes a provider tool call`）。
+  - `npx tsx --test test/run-session-flow.test.ts`：**6/6 pass**（Nexus HTTP `executeStream` 全路径，含 `app.ts` storage 注入）。
+  - `npx tsx --test test/context-regression.test.ts test/context-assembler.test.ts`：**68/68 pass**。
+  - `npx tsc --noEmit`：**0 错误**。
+
+- **边界**:
+  - 3 个注入点互补：LLMCodingRuntime 起手注入覆盖 runtime 内部 tool call；Nexus app.ts 注入覆盖 per-request options；runtimeToolLoop merge 是 defense-in-depth。三者都做才能覆盖「runtime factory 不同 / caller 没带 storage / side-channel only」三层场景。
+  - 不改 `executeToolSafely` 主体、不改 context tool 的 Phase C guard（`contextSearch.ts:39-45` / `contextRecent.ts:35-41` 仍是最后一道防线）。
+  - 不引入新持久化、不改 Phase B continuity 主体。
+
+- **后续可推进**: Bug 2 + origin_cwd（`sessions.origin_cwd` 不可变列 + `app.ts:2695` 传 `storedSessionCwd=origin_cwd` + `latestTaskPrimaryRoot`，~20 行 + 3 test）→ Bug 4。Bug 3 已让 context tool 在 storage-backed session 可用；Bug 2 让 Phase B continuity 真正触发（session_10320709 的 0 个 `session_root_continuity` event 即此因）。
+
+## 2026-06-18 — Context CWD Drift Bug 2 收口: origin_cwd 不可变列 + Phase B continuity 接线
+
+- **背景**: session_10320709 的 0 个 `session_root_continuity` event 因 `LLMCodingRuntime.runExecuteStreamInner` 的 `hasSessionContext = false` 永真——Nexus `app.ts:2695` `executeStream` 没传 `storedSessionCwd` / `latestTaskPrimaryRoot`。§13.4 进一步发现：即使补传，`session.cwd` 本身已漂（turn 1 → `~/Library`，跨 turn 2-6 持续），单纯传 `session.cwd` 会传漂移值。修法需一个**不可变 origin cwd**——launcher `body.cwd` 写入一次，不随 `session.cwd` 漂移。
+
+- **代码变更**（4 文件）:
+  - `src/shared/session.ts`: `SessionSnapshot` 新增 `originCwd?: string` 字段 + 注释（immutable creation cwd，Phase B continuity 用它拉回 drifted requestCwd）。
+  - `src/storage/SqliteStorage.ts`:
+    - migration v15：`ALTER TABLE sessions ADD COLUMN origin_cwd TEXT` + `UPDATE sessions SET origin_cwd = cwd WHERE origin_cwd IS NULL`（backfill 现有 row，best-effort origin）+ `PRAGMA user_version = 15`。**backfill 无条件运行**（idempotent `WHERE NULL`），不嵌在 `if (!columns.includes)` 里——否则列已存在时（v1 dynamic ALTER 已加）backfill 被跳过。
+    - v1 dynamic ALTER `expectedSessions` 增 `origin_cwd`（新库直接有列）。
+    - `sessionParams` 增 `originCwd: session.originCwd ?? null`。
+    - `saveSession` 的 `INSERT ... ON CONFLICT DO UPDATE` 子句**不**包含 `origin_cwd`——ON CONFLICT 只更新 cwd/prompt/phase/... 等可变字段，origin_cwd 保持 INSERT 时的值（immutable）。
+    - `rowToSession` 增 `originCwd: nullableString(row.origin_cwd)`。
+  - `src/storage/MemoryStorage.ts`: `saveSession` 在 `existing.originCwd` 存在且 `cloned.originCwd` 缺失时回填（保 back-compat：older caller 不带 originCwd 时不 clobber 到 undefined；drift 时 originCwd 不被覆写）。
+  - `src/nexus/app.ts`:
+    - `createSessionSnapshot` + `/v1/sessions` 创建点都设 `originCwd = cwd`（launcher body.cwd / Nexus defaultCwd）。
+    - `PreparedExecution` type 增 `storedSessionCwd?` + `latestTaskPrimaryRoot?`。
+    - `prepareExecution` 末尾派生 `storedSessionCwd = session.originCwd ?? session.cwd` + 调 `resolveLatestTaskPrimaryRoot(storage, sessionId)`。
+    - 新增 `resolveLatestTaskPrimaryRoot(storage, sessionId)` helper：`listEvents(limit:50, order:'desc')` 扫最近 `task_scope_declared.primaryRoot`；失败不阻塞（runtime 回落 2-arg）。
+    - HTTP + WS 两条 `executeStream` 调用点都传 `storedSessionCwd` + `latestTaskPrimaryRoot`（spread，undefined 时不传）。
+
+- **测试新增**（新文件 `test/session-origin-cwd.test.ts`，4 test）:
+  1. MemoryStorage：originCwd 创建后 survives drifted cwd 的 saveSession。
+  2. MemoryStorage：older caller 省略 originCwd 字段时不 clobber。
+  3. SqliteStorage：originCwd 创建后 survives drifted cwd 的 `ON CONFLICT` update（直接验证 SQL 层 immutability）。
+  4. SqliteStorage v15 migration backfill：用 `DatabaseSync` 直接把 origin_cwd 置 NULL + `PRAGMA user_version=14` 模拟 pre-Bug-2 row，reopen storage → backfill 为 cwd。
+  - **测试抓到真实 migration bug**：初版 backfill `UPDATE` 嵌在 `if (!columns.includes('origin_cwd'))` 里，列已存在时被跳过；test 4 失败暴露 → 修正为无条件运行。已加入 `package.json` test 脚本。
+
+- **验证**:
+  - 真实 db 副本 migration：session_10320709 v14 → v15，`originCwd` backfill 为最终 cwd `docs/nexus`（best-effort，历史 session 无真实 origin）。
+  - 真实 db 副本 immutability：create session originCwd=`BabeL-O` → saveSession cwd=`~/Library` → `originCwd` 保持 `BabeL-O`。
+  - MemoryStorage immutability：create originCwd=`/proj/root` → saveSession 省略 originCwd + cwd=`/Users/x/Library` → `originCwd` 保持。
+  - `npx tsx --test test/session-origin-cwd.test.ts`：**4/4 pass**。
+  - `npx tsx --test test/storage.test.ts test/session-origin-cwd.test.ts test/run-session-flow.test.ts test/runtime-storage-propagation.test.ts test/resolve-cwd-fallback.test.ts test/system-prompt-builder.test.ts test/session-root-continuity.test.ts test/inspect-session.test.ts test/runtime-context-tools-registry-gate.test.ts test/context-tools-registry.test.ts`：**125/125 pass**。
+  - `npx tsx --test --test-name-pattern="resolveCwd|cwd|continuity|session_root|persists resolved|resolves cwd from prompt|URL-heavy" test/runtime.test.ts`：**10/10 pass**。
+  - `npx tsx --test test/run-session-flow.test.ts test/context-regression.test.ts`：**18/18 pass**（Nexus HTTP executeStream 全路径 + context assembler）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - 真实 `~/.babel-o/db.sqlite` 未触碰（user_version=14，无 origin_cwd 列）——只在副本上测；下次运行自动 migrate。
+
+- **边界**:
+  - originCwd 只在 session 创建时写一次；ON CONFLICT 不更新；MemoryStorage 保 back-compat。
+  - `latestTaskPrimaryRoot` 用 bounded `listEvents(limit:50, order:'desc')` 查最近 task_scope_declared；失败不阻塞（runtime 回落 2-arg `resolveCwdFromPrompt`，Phase B continuity 仍可仅凭 storedSessionCwd 触发）。
+  - 历史 session backfill 用最终 cwd 作 best-effort origin（无法恢复真实 origin）；新 session 从创建即有正确 origin。
+  - 不改 Phase B continuity 主体、不改 `deriveSessionRootContinuity` 决策逻辑——只补接线层让它真正触发。
+
+- **后续可推进**: Bug 4（统一 dual cwd resolution sites：删 `resolveExplicitPromptCwd` 让 runtime+PhaseB 决策，或把 Phase B continuity 上移到 `resolveRequestCwd`；`session.cwd` 不被 external prompt 覆写，~30 行 refactor + 4 test）。Bug 1 Layer A+B 锁住 cwd 漂移根因，Bug 3 让 context tool 可用，Bug 2 让 Phase B continuity 触发；Bug 4 收口 dual-site 不一致。
+
+## 2026-06-18 — Context CWD Drift Bug 4 收口: 统一 dual cwd resolution sites + session.cwd 不被 prompt 覆写
+
+- **背景**: session_10320709 暴露 §13.2 架构层根因——3 个 divergent 的 prompt→cwd 解析副本：① `app.ts:resolveExplicitPromptCwd` Site A（只接受 existing directory，无 dirname fallback，无 Bug 1 Layer B 守卫），② `LLMCodingRuntime.ts:resolveCwdFromPrompt` Site B（dirname fallback + Layer B 守卫），③ `cli/runSessionFlow.ts:resolveExplicitPromptCwd` 第三份副本（既无 dirname fallback 也无 Layer B 守卫）。Site A 和 Site B 行为不一致 → `session.cwd`（Site A 写）和 `options.cwd`（Site B 写）分离，runtime 内部覆盖进一步漂移。再加上 `app.ts:2301 session.cwd = cwd` 每 turn 覆写，drift 跨 turn 2-6 持续。
+
+- **代码变更**（4 文件）:
+  - `src/runtime/systemPromptBuilder.ts`: 新增 export `resolvePromptCwd(prompt, baseCwd): string` —— 单一共享 resolver，合并 Site B 的 dirname fallback + isAcceptablePromptCwd 守卫于一处。`extractAbsolutePaths` → `resolvePromptPath` → `existsSync` → dirname fallback（带 Layer B 守卫）→ 文件/目录分支。导入增 `lstatSync`。
+  - `src/runtime/LLMCodingRuntime.ts` Site B `resolveCwdFromPrompt` 改为 thin wrapper：`return resolvePromptCwd(prompt, baseCwd)`。注释指向 systemPromptBuilder 的共享实现。清理未用 imports（`existsSync`, `lstatSync`, `dirname`, `isAcceptablePromptCwd`），加 `resolvePromptCwd`。
+  - `src/nexus/app.ts` Site A `resolveExplicitPromptCwd` 改为 thin wrapper：使用 sentinel 模式调 `resolvePromptCwd(prompt, SENTINEL)`，返回 sentinel 时返回 `undefined`（让 `resolveRequestCwd` 回退到 `requestedCwd`/`sessionCwd`/`defaultCwd`）。注释指向 systemPromptBuilder。清理未用 imports（`lstatSync`, `resolvePromptPath`, `isAcceptablePromptCwd`, `extractAbsolutePaths`），加 `resolvePromptCwd`。
+  - `src/nexus/app.ts` `prepareExecution`: `session.cwd` 改用 `trustedSessionCwd = body.cwd ?? session?.originCwd ?? session?.cwd ?? cwd` —— **不再**跟随 prompt-derived `cwd` 覆写。prompt-derived path 仍出现在 runtime 的 `cwd` 字段（runtime 内部 Phase B continuity 决定），但不会污染持久化的 `session.cwd`。这一改动配合 Bug 1 Layer A+B（拦住 system dir prompt path）+ Bug 2 origin_cwd（trusted reference）彻底锁住跨 turn drift。
+  - `src/cli/runSessionFlow.ts` CLI 站点（第三个副本）：`resolveCliRequestCwd` 改为 thin wrapper，使用相同的 sentinel 模式调 `resolvePromptCwd`。删除本地的 `resolveExplicitPromptCwd` 副本。清理未用 imports（`extractAbsolutePaths`, `resolvePromptPath`）。
+
+- **测试新增**（新文件 `test/dual-site-resolver.test.ts`，6 test）:
+  1. Site A 和 Site B 同意引号包裹 iCloud 路径（用 mkdtempSync 构造真实 `Mobile Documents/file.md`，引号包裹）→ 两 site 都 resolve 到父目录。
+  2. Site A 和 Site B 同意 broken `/Mobile` 片段（Layer B 拒绝 `~/Library`）→ 两 site 都返回 baseCwd（Site A 用 sentinel 模式）。
+  3. Site A 和 Site B 同意 project-internal path → 两 site 都 resolve 到该目录。
+  4. CLI runSessionFlow site 也用共享 resolver（regression check：sentinel 模式检测到 `resolvePromptCwd` 走通）。
+  5. `createSessionSnapshot` 在创建时设 `originCwd = launchCwd`（Bug 4 信任根的 pre-condition）。
+  6. `resolveRequestCwd` 在 prompt path 被 Layer B 拒绝时回退到 `defaultCwd`（验证 storage-only 的核心不变量：`session.cwd` 不会漂到 `~/Library`）。
+  - 已加入 `package.json` test 脚本。
+
+- **验证**:
+  - `npx tsx --test test/dual-site-resolver.test.ts`：**6/6 pass**（0.4 秒，全 unit-level，**无 slow nexus app 测试**）。
+  - `npx tsx --test test/storage.test.ts test/session-origin-cwd.test.ts test/dual-site-resolver.test.ts test/resolve-cwd-fallback.test.ts test/system-prompt-builder.test.ts test/session-root-continuity.test.ts test/inspect-session.test.ts test/runtime-storage-propagation.test.ts test/runtime-context-tools-registry-gate.test.ts test/context-tools-registry.test.ts`：**125/125 pass**。
+  - `npx tsx --test test/run-session-flow.test.ts test/context-regression.test.ts`：**18/18 pass**（Nexus HTTP executeStream 全路径）。
+  - `npx tsx --test --test-name-pattern="resolveCwd|cwd|continuity|session_root|persists resolved|resolves cwd from prompt|URL-heavy|tool loop executes" test/runtime.test.ts`：**11/11 pass**（含 `/v1/execute persists resolved cwd` turn 7 自愈回归 + `LLMCodingRuntime resolves cwd from prompt absolute path` + `resolveCwdWithContinuity keeps session root`）。
+  - `npx tsc --noEmit`：**0 错误**。
+  - 真实 `~/.babel-o/db.sqlite` 未触碰。
+
+- **边界**:
+  - 3 个 site 全部委托到 `resolvePromptCwd` —— 单一 source of truth。Sentinel 模式让 Site A / CLI 仍能返回 `undefined`（保持 `resolveRequestCwd` 现有契约）。
+  - `session.cwd` 现在只跟随 `body.cwd` 或 `session.originCwd`（trusted root），不跟随 prompt-derived path —— Bug 1 Layer A+B 仍负责拦截 system dir prompt path（不会让 Layer A 误升级 `~/Library`）。
+  - 不改 Phase B continuity 主体、不改 `deriveSessionRootContinuity` 决策逻辑、不引入新持久化（Bug 2 origin_cwd 列已落地）。
+  - 不重写 `resolveRequestCwd` 的优先级链（prompt path > requestedCwd > sessionCwd > defaultCwd），只是把 prompt path 解析从 Site A 的弱版改为共享强版。
+
+- **P0 + P1 全部收口**: Bug 1 Layer A → Bug 1 Layer B → Bug 3 → Bug 2+origin_cwd → Bug 4 全部关闭。session_10320709 的 4 个 follow-up bug 全修：cwd 漂 `~/Library`（Layer A 修根因 + Layer B 兜底 + Bug 4 统一 sites + session.cwd 不被 prompt 覆写）、Phase B 0 个 continuity event（Bug 2 origin_cwd + resolveLatestTaskPrimaryRoot）、3 个 CONTEXT_STORAGE_UNAVAILABLE（Bug 3 storage 注入）、dual site 不一致（Bug 4）。
+
+- **后续可推进**: cwd drift 治理全部 P0/P1 关闭。R7（真实 session replay gate）可以用 session_10320709 fixture 跑回归验证（详见 long-running-context-assembly.md §20 Phase R7）。Phase D（`ContextEstimateCalibration` diagnostic）/ E（`ROOT_SCAN_REQUIRES_CONFIRMATION` 工具层 guard）/ F（`UserArtifactContinuity`）仍 Open，等真实 regression 触发再推进。Glob permission-denied 降级为 partial result 独立列入 tool-governance-plan follow-up。
+
+## 2026-06-18 — Long-Running Context Assembly R7 收口: Real Regression Replay Gate（条件 1-3 关闭，条件 4-6 OPEN 如实报告）
+
+- **背景**: long-running-context-assembly.md §20 R7 是验收闸门——用 3 个真实 regression session fixture（`session_981cc5c2` / `session_cf361f04` / `session_10320709`）验证 R0-R6 全部关闭。R7 6 个验收条件中：c1-c3（cwd drift 治理 / Phase B continuity / context tool storage）由 R0 + R1 闸门覆盖（已在 Bug 1-4 收口）；c4-c6（working set persistence / observer e2e / resume product path）属于 R2/R4/R5 代码实现，**尚未完成**。R7 必须**如实报告**两状态：c1-c3 关闭，c4-c6 仍 OPEN。
+
+- **代码 + fixture 准备**:
+  - `test/fixtures/r7-fixture.sqlite`（63 MB）：从真实 `~/.babel-o/db.sqlite` 提取 3 个 session 的所有 63320 events + 3 个 sessions row（v15 schema 已含 `origin_cwd` 列；backfill 已运行）。fixture 是 R7 的 source of truth，详见 `test/fixtures/r7-fixture.README.md` 的 refresh 脚本。
+  - `test/fixtures/r7-fixture.README.md`：解释 fixture 来源、schema、refresh 命令。**不能用合成 fixture**：3 session 包含真实 prompt 路径、cwd 漂移、storage 不可用失败；合成要么重演失败（啥都没测）要么编造非证据。
+
+- **测试新增**（新文件 `test/r7-replay-gate.test.ts`，15 test，分 6 suite）:
+  1. **R7 fixture integrity** (3 test): fixture 存在 + 含 3 expected sessions + `origin_cwd` backfill + fixture 真实 capture pre-Bug 2 baseline (0 `session_root_continuity` + 3/8/3 `CONTEXT_STORAGE_UNAVAILABLE` per §12.3 + §13.5)。
+  2. **R7 condition 1: no turn resolves task root to / or ~/Library (Bug 1 Layer A+B + Bug 4)** (4 test):
+     - s103 prompt 1 quoted iCloud path → cwd 不漂 `~/Library`，captures 整段路径
+     - scf3 prompts 5/11 iCloud paths → 全不过 `~/Library` 边界
+     - s981 prompts CJK slash prose (`文档/信息`) + bare-Latin (`上下文管理 | ★★★★☆ | 功能全但模块分散`) → 不 promote `/`
+     - **所有 3 sessions 全部 user_message replay 通过 fix resolver** → 没有任何 prompt 解析到 `/` 或 `~/Library` 或 `~/Documents` 或 `~/Desktop` 或 homedir
+  3. **R7 condition 2: session_root_continuity pre-condition** (1 test): 3 sessions 都有 `originCwd`（Bug 2 的不可变 originCwd 列已 backfill；Phase B continuity 触发的前置满足）。
+  4. **R7 condition 3: contextRecent works in storage-backed runtime (Bug 3)** (3 test):
+     - 每个 session 都有 events for contextRecent to read
+     - storage API 暴露 contextRecent 需要的 `listEvents` / `getExecutionMetrics` / `getSession`
+     - pre-Bug 3 baseline: 3/8/3 `CONTEXT_STORAGE_UNAVAILABLE` counts 与 §12.3 + §13.5 文档一致
+  5. **R7 conditions 4-6: NOT YET CLOSED (honest reporting)** (3 test):
+     - R2 (working-set file): fixture 0 `working_set_updated` events → R2 仍 OPEN
+     - R4 (observer e2e redacted): fixture 0 persisted `assembled` events → R4 仍 OPEN
+     - R5 (resume preview product path): fixture 0 `resume_started`/`resume_preview` events → R5 仍 OPEN
+  6. **R7 gate verdict: per-session close status** (1 test): 输出每 session 的 verdict 字符串（`R7 s981: c1_REPLAY_PASS c2_continuity_pre=true c3_storage_baseline=3 c4c5c6_OPEN; origin=/`）作为 gate-closed assertion + 操作员可读的 summary。
+  - 已加入 `package.json` test 脚本。
+
+- **关键设计决策**:
+  - **R7 是 R0-R6 实现的验收门，不是 R2/R4/R5 的实现前提**。条件 1-3 由 R0/R1 (Bug 1-4) 覆盖；条件 4-6 是 R2/R4/R5 代码层实现，R7 必须诚实报告 OPEN 状态而非跳过。
+  - **Fixture 提取是 honest baseline**：从真实 db 提取 3 session 的 events 和 sessions row（含 v15 backfill 的 origin_cwd）。fixture 的 0 `session_root_continuity` + 0 `working_set_updated` + 3/8/3 `CONTEXT_STORAGE_UNAVAILABLE` counts 是 pre-fix 状态，验证的是 fix 后的 pipeline **不会**重演这些失败。
+  - **使用真实 prompts**：replay tests 取出 fixture 中所有 user_message 文本，跑过 fixed `resolveCwdFromPrompt` / `resolvePromptCwd`，确保每一 prompt 解析出的 cwd 都不在 rejected 集合。这是最强形式的 c1：任何曾经漂移的 prompt 现在都不漂。
+
+- **验证**:
+  - `npx tsx --test test/r7-replay-gate.test.ts`：**15/15 pass**（2.1 秒）。
+  - `npx tsx --test` 完整回归套件 (10 files 含 cwd-drift 所有 fix + R7): **140/140 pass**。
+  - `npx tsc --noEmit`: **0 错误**。
+  - 真实 `~/.babel-o/db.sqlite` 未触碰（fixture 是副本）。
+
+- **边界**:
+  - R7 验证的是**当前 fix 后的 pipeline 行为**，不重复实现 R2/R4/R5。c4-c6 OPEN 是诚实报告，不影响 R0/R1 的 gate-closed 状态。
+  - Fixture 提取时 session_10320709 的 origin_cwd = `docs/nexus`（最终 cwd 的 backfill，非历史 origin）；新 session 的 origin_cwd 由 Bug 2 的 `createSessionSnapshot` 在创建时正确设置。这是 backfill 尽力而为的设计。
+  - 不修改 long-running-context-assembly.md 的 `Partially Landed` 状态——R2/R4/R5 仍 OPEN，plan 升级条件（"R0-R7 全过"）尚未达成。
+
+- **后续可推进**:
+  - R2 (persisted working set 接入 executeStream hot path) 是 c4 的实现前提——基于 Bug 1-4 已收口的 storage + continuity 接线，R2 现在能干净实现，不会被污染根写脏。
+  - R4 (`/v1/context/observe` 真实 runtime e2e + redacted payload) 是 observer 闭环的最后一公里。
+  - R5 (resume 从 class method 升级为可观察产品路径) 是 `bbl inspect-session --resume` 的真实可用性增强。
+  - cwd-drift Phase D (`ContextEstimateCalibration`) / E (`ROOT_SCAN_REQUIRES_CONFIRMATION`) / F (`UserArtifactContinuity`) 仍 Open，等真实 regression 触发再推进。
+  - Glob permission-denied 降级为 partial result 独立列入 tool-governance-plan follow-up。

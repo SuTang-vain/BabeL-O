@@ -1,6 +1,5 @@
 import { z } from 'zod'
-import { existsSync, lstatSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { logger } from '../shared/logger.js'
@@ -12,7 +11,7 @@ import type {
 } from './Runtime.js'
 import { allowAllTools, allowlistedTools, type ToolPolicy } from './LocalCodingRuntime.js'
 import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
-import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
+import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath, resolvePromptCwd } from './systemPromptBuilder.js'
 import { deriveSessionRootContinuity, buildSessionRootContinuityMessage } from './sessionRootContinuity.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
@@ -40,7 +39,7 @@ import { classifyProviderRecovery } from './providerRecovery.js'
 // PR-A2: optional broadcaster type for the /v1/context/observe observer.
 // Imported as a type-only reference to keep the runtime-side hot path
 // paying no cost for the field.
-import type { ContextBroadcaster } from './contextBroadcasterSingleton.js'
+import type { RuntimeContextBroadcaster } from './contextBroadcaster.js'
 import {
   createReplacementState,
   enforceMessageBudget,
@@ -58,7 +57,6 @@ import {
   buildContextBlockingEvents,
   buildContextMicrocompactEvent,
   buildContextRecoveryAttemptedEvent,
-  buildContextGroundingConfirmedEventForToolResult,
   buildPostCompactGroundingEvents,
   buildContextUsageEvent,
   buildContextWarningEvent,
@@ -74,23 +72,24 @@ import {
   isOptionSelectionClarificationText,
   normalizeOptionSelection,
   reduceProviderTurnOutcome,
-  refreshRuntimeContextState,
-  resolveProviderToolCallInput,
-  streamProviderTurn,
   type RuntimeProviderTurn,
 } from './runtimePipeline.js'
-import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
+import { ContextRefreshStrategy } from './ContextRefreshStrategy.js'
+import { ProviderTurnDriver } from './ProviderTurnDriver.js'
+import { ToolDispatchPipeline } from './ToolDispatchPipeline.js'
+import { type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
 import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 // PR-A4: resume() class method imports — see long-running-context-
 // assembly.md §6.2 for the 3-step flow.
-import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
-import type { BehaviorMonitor } from '../nexus/behaviorMonitor.js'
-import { deriveEntriesFromEvents } from '../nexus/workingSetTracker.js'
+import type { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import type { BehaviorMonitor } from './behaviorMonitor.js'
+import { deriveEntriesFromEvents } from './workingSetTracker.js'
 import { formatWorkingSet } from './workingSet.js'
 import { formatHint } from './formatHint.js'
 import type { AssembledContext } from './contextAssembler.js'
-import type { WorkingSet } from '../nexus/workingSetTracker.js'
+import type { WorkingSet } from './workingSetTracker.js'
+import { ProviderSessionRules } from './providerSessionRules.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -111,14 +110,11 @@ export class LLMCodingRuntime implements NexusRuntime {
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
     private readonly memoryProvider?: MemoryProvider,
-    // PR-A2: optional per-instance ContextBroadcaster. The runtime
-    // hot path (refreshRuntimeContextState in runtimePipeline.ts) uses
-    // the module-level defaultContextBroadcaster singleton, so this
-    // field is intentionally unused in the hot path. It exists so
-    // production factories can attach a custom broadcaster if/when the
-    // architecture moves off the singleton. Defaulting to undefined
-    // preserves all 39+ existing test instantiations.
-    private readonly contextBroadcaster?: ContextBroadcaster,
+    // Phase 2B: optional per-instance broadcaster injected by the
+    // composition root. When omitted, context publishing is disabled
+    // for this runtime instance; no Nexus singleton is read from the
+    // runtime hot path.
+    private readonly contextBroadcaster?: RuntimeContextBroadcaster,
     // PR-A4: optional resume dependencies. When provided, the public
     // resume() method is enabled; when omitted, calling resume() throws
     // a clear "not configured" error. The four closures are the same
@@ -138,6 +134,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       ) => string
       mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
     },
+    private readonly providerSessionRules: ProviderSessionRules = new ProviderSessionRules(),
   ) {}
 
   /**
@@ -145,7 +142,7 @@ export class LLMCodingRuntime implements NexusRuntime {
    * if not provided). Tests and production wiring can read this to
    * inject a custom broadcaster.
    */
-  getContextBroadcaster(): ContextBroadcaster | undefined {
+  getContextBroadcaster(): RuntimeContextBroadcaster | undefined {
     return this.contextBroadcaster
   }
 
@@ -283,6 +280,17 @@ export class LLMCodingRuntime implements NexusRuntime {
   }
 
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    // Phase C2 of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md §11.
+    // Propagate the runtime's own storage into RuntimeExecuteOptions so that
+    // context tools (contextSearch / contextRecent / contextSummarize) receive
+    // a non-null ToolContext.storage. session_10320709 proved that without
+    // this, a storage-backed Nexus session still returns
+    // CONTEXT_STORAGE_UNAVAILABLE because executeToolSafely builds ToolContext
+    // from RuntimeExecuteOptions.storage (which Nexus does not always set),
+    // even though this.storage exists. Mirrors LocalCodingRuntime's injection.
+    if (!options.storage && this.storage) {
+      options = { ...options, storage: this.storage }
+    }
     // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
     // Use the continuity-aware resolver when the caller has supplied
     // session context. Falls through to the simple 2-arg heuristic
@@ -301,6 +309,25 @@ export class LLMCodingRuntime implements NexusRuntime {
           cwd: resolveCwdFromPrompt(options.prompt, options.cwd),
           continuity: null,
         }
+    // R2 of docs/nexus/proposals/long-running-context-assembly.md §20:
+    // load the persisted Nexus-owned working set for this session+cwd so
+    // the hot-path refreshRuntimeContextState calls include it as a
+    // provider-visible block. Previously every refresh re-derived a
+    // transient working set from the event slice; the persisted tracker
+    // was only consulted in resume() and via REST GET. After R2, a
+    // successful tool event updates the tracker and the next refresh
+    // surfaces it (R7 acceptance: "Next turn includes a provider-visible
+    // Working Set: block derived from persisted tracker state").
+    //
+    // The load is best-effort and idempotent: createRuntime pre-loads
+    // once at boot, so on the hot path we only re-load when the cwd
+    // changes mid-session (rare; e.g. user acceptance of a parent_scan
+    // boundary). For the common case, the in-memory tracker state is
+    // already correct. The result is awaited once here and threaded
+    // into every refreshRuntimeContextState call below; subsequent
+    // updates (from successful tool events) are applied in-place via
+    // applyWorkingSetUpdate so the next refresh picks them up.
+    const workingSetOverride = await this.loadWorkingSetOverride(options.sessionId, resolvedCwd)
     if (resolvedCwd !== options.cwd) {
       options.cwd = resolvedCwd
     }
@@ -407,17 +434,24 @@ export class LLMCodingRuntime implements NexusRuntime {
           description: tool.prompt ? tool.prompt() : tool.description,
           inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
         }))
-      const loadSessionInbox = async () => {
-        try {
-          return await this.storage.listSessionInbox(options.sessionId, { limit: 20 })
-        } catch (error) {
-          logger.debug('Failed to load session inbox from storage', error)
-          return []
-        }
-      }
+      const contextRefreshStrategy = new ContextRefreshStrategy({
+        storage: this.storage,
+        memoryProvider: this.memoryProvider,
+        contextBroadcaster: this.contextBroadcaster,
+      })
+      const providerTurnDriver = new ProviderTurnDriver()
+      const toolDispatchPipeline = new ToolDispatchPipeline({
+        tools: this.tools,
+        toolPolicy: this.toolPolicy,
+        storage: this.storage,
+        metrics,
+        readFileCache: this.readFileCache,
+        providerSessionRules: this.providerSessionRules,
+        applyWorkingSetUpdate: (sessionId, events, cwd) => this.applyWorkingSetUpdate(sessionId, events, cwd),
+      })
       const contextWarningPercent = 70
       const contextCompactPercent = 90
-      let contextRefreshState = await refreshRuntimeContextState({
+      let contextRefreshState = await contextRefreshStrategy.refresh({
         runtimeOptions: options,
         events: previousEvents,
         modelId: cleanedModelId,
@@ -427,8 +461,13 @@ export class LLMCodingRuntime implements NexusRuntime {
         warningPercent: contextWarningPercent,
         compactPercent: contextCompactPercent,
         suppressToolsForIntent: shouldSuppressToolsForIntent,
-        memoryProvider: this.memoryProvider,
         onMemoryRetrieval: this.emitMemoryRetrieval,
+        // R2: thread the persisted workingSetOverride through the
+        // hot-path refresh so the provider-visible Working Set: block
+        // is sourced from the Nexus-owned tracker (not the transient
+        // event-slice derive that assembleContext falls back to when
+        // this field is undefined).
+        workingSetOverride,
       })
       let assembledContext = contextRefreshState.assembledContext
       let messages = contextRefreshState.messages
@@ -470,7 +509,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         metrics: assembledContext.microcompactMetrics,
       })
       const refreshAfterProviderContextRecovery = async () => {
-        applyContextRefreshState(await refreshRuntimeContextState({
+        applyContextRefreshState(await contextRefreshStrategy.refresh({
           runtimeOptions: options,
           events: previousEvents,
           modelId: cleanedModelId,
@@ -480,9 +519,9 @@ export class LLMCodingRuntime implements NexusRuntime {
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
           suppressToolsForIntent: shouldSuppressToolsForIntent,
-          memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-          sessionInbox: await loadSessionInbox(),
+          onMemoryRetrieval: this.emitMemoryRetrieval,
+          sessionInbox: 'load',
+          workingSetOverride,
         }))
       }
       const postCompactGroundingEvents = (source: 'post_compact' | 'context_recovery', boundaryId?: string) => {
@@ -532,7 +571,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
           for (const groundingEvent of groundingEvents) yield groundingEvent
           previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await refreshRuntimeContextState({
+          applyContextRefreshState(await contextRefreshStrategy.refresh({
             runtimeOptions: options,
             events: previousEvents,
             modelId: cleanedModelId,
@@ -542,9 +581,9 @@ export class LLMCodingRuntime implements NexusRuntime {
             warningPercent: contextWarningPercent,
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
-            memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: await loadSessionInbox(),
+            onMemoryRetrieval: this.emitMemoryRetrieval,
+            sessionInbox: 'load',
+            workingSetOverride,
           }))
           autoCompactDecision = contextRefreshState.autoCompactDecision
           yield buildContextUsageEvent({
@@ -586,7 +625,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
           for (const groundingEvent of groundingEvents) yield groundingEvent
           previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await refreshRuntimeContextState({
+          applyContextRefreshState(await contextRefreshStrategy.refresh({
             runtimeOptions: options,
             events: previousEvents,
             modelId: cleanedModelId,
@@ -596,9 +635,9 @@ export class LLMCodingRuntime implements NexusRuntime {
             warningPercent: contextWarningPercent,
             compactPercent: contextCompactPercent,
             suppressToolsForIntent: shouldSuppressToolsForIntent,
-            memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: await loadSessionInbox(),
+            onMemoryRetrieval: this.emitMemoryRetrieval,
+            sessionInbox: 'load',
+            workingSetOverride,
           }))
           yield buildContextUsageEvent({
             sessionId: options.sessionId,
@@ -715,7 +754,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
             for (const groundingEvent of groundingEvents) yield groundingEvent
             previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-            applyContextRefreshState(await refreshRuntimeContextState({
+            applyContextRefreshState(await contextRefreshStrategy.refresh({
               runtimeOptions: options,
               events: previousEvents,
               modelId: cleanedModelId,
@@ -725,9 +764,9 @@ export class LLMCodingRuntime implements NexusRuntime {
               warningPercent: contextWarningPercent,
               compactPercent: contextCompactPercent,
               suppressToolsForIntent: shouldSuppressToolsForIntent,
-              memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-              sessionInbox: await loadSessionInbox(),
+              onMemoryRetrieval: this.emitMemoryRetrieval,
+              sessionInbox: 'load',
+              workingSetOverride,
             }))
             messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
               contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
@@ -846,21 +885,18 @@ export class LLMCodingRuntime implements NexusRuntime {
         const invocationStartMs = performance.now()
         let providerTurn: RuntimeProviderTurn
         try {
-          const toolCallTextLeakPhase = finalResponseOnlyMode
-            ? 'final_response_only'
-            : suppressToolsForCurrentIntent
-              ? 'respond_only'
-              : modelVisibleTools.length === 0
-                ? 'tools_hidden'
-                : undefined
-          const providerTurnStream = streamProviderTurn({
-            stream: adapter.queryStream(queryParams, adapterOptions),
+          const providerTurnStream = providerTurnDriver.run({
+            adapter,
+            queryParams,
+            adapterOptions,
             sessionId: options.sessionId,
             signal: options.signal,
             executionStartMs: metrics.executionStartMs,
             queryStartMs: invocationStartMs,
-            ...(toolCallTextLeakPhase && { toolCallTextLeakGuard: { phase: toolCallTextLeakPhase } }),
-            ...(memoryCapabilityQuestion && { memoryCapabilityAnswerLeakGuard: true }),
+            finalResponseOnlyMode,
+            suppressToolsForCurrentIntent,
+            modelVisibleToolCount: modelVisibleTools.length,
+            memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
           })
           let providerTurnResult = await providerTurnStream.next()
           while (!providerTurnResult.done) {
@@ -1061,62 +1097,23 @@ export class LLMCodingRuntime implements NexusRuntime {
           return
         }
 
-        const toolResultsContent = []
-        for (const tc of providerOutcome.toolCalls) {
-          const toolEvents: NexusEvent[] = []
-          const toolExecution = executeProviderToolCall({
-            toolCall: tc,
-            tools: this.tools,
-            toolPolicy: this.toolPolicy,
-            runtimeOptions: options,
-            storage: this.storage,
-            metrics,
-            readFileCache: this.readFileCache,
-            taskScope: taskScopeEvent,
-          })
-          let next = await toolExecution.next()
-          while (!next.done) {
-            toolEvents.push(next.value)
-            yield next.value
-            next = await toolExecution.next()
-          }
-          previousEvents = [...previousEvents, ...toolEvents]
-          if (next.value.kind === 'terminal') {
-            return
-          }
-          const completedEvent = toolEvents.findLast((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed' && event.toolUseId === tc.id)
-          if (completedEvent) {
-            const groundingConfirmedEvent = buildContextGroundingConfirmedEventForToolResult({
-              sessionId: options.sessionId,
-              requestId: options.requestId,
-              events: previousEvents,
-              toolCompleted: completedEvent,
-              toolInput: resolveProviderToolCallInput(tc),
-            })
-            if (groundingConfirmedEvent) {
-              previousEvents = [...previousEvents, groundingConfirmedEvent]
-              yield groundingConfirmedEvent
-            }
-          }
-          const scopeConfirmationEvents = toolEvents.filter((event): event is Extract<NexusEvent, { type: 'scope_boundary_confirmed' }> => event.type === 'scope_boundary_confirmed')
-          if (scopeConfirmationEvents.length > 0) {
-            taskScopeEvent = {
-              ...taskScopeEvent,
-              ...deriveTaskScope({
-                sessionId: options.sessionId,
-                requestId: options.requestId,
-                cwd: options.cwd,
-                prompt: options.prompt,
-                events: previousEvents,
-                allowedPaths: options.allowedPaths,
-              }),
-              message: taskScopeEvent.message,
-            }
-          }
-          toolResultsContent.push(next.value.toolResult)
+        const toolDispatch = toolDispatchPipeline.run({
+          toolCalls: providerOutcome.toolCalls,
+          runtimeOptions: options,
+          previousEvents,
+          taskScopeEvent,
+        })
+        let toolDispatchResult = await toolDispatch.next()
+        while (!toolDispatchResult.done) {
+          yield toolDispatchResult.value
+          toolDispatchResult = await toolDispatch.next()
         }
-
-        messages.push(buildProviderToolResultsMessage(toolResultsContent))
+        previousEvents = toolDispatchResult.value.previousEvents
+        taskScopeEvent = toolDispatchResult.value.taskScopeEvent
+        if (toolDispatchResult.value.kind === 'terminal') {
+          return
+        }
+        messages.push(buildProviderToolResultsMessage(toolDispatchResult.value.toolResults))
       }
 
       const maxLoopsMessage = `Execution exceeded maximum tool call iterations (${maxLoops}).`
@@ -1144,6 +1141,98 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield buildRuntimeResultEvent(options.sessionId, false, errorText)
       yield buildRuntimeExecutionMetricsEvent(options, metrics)
     }
+  }
+
+  // ─── R2 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+  //
+  // loadWorkingSetOverride(sessionId, cwd) — derive the provider-visible
+  // workingSetOverride string for the current turn. The hot path calls
+  // this once at the start of runExecuteStreamInner and threads the
+  // result into every refreshRuntimeContextState call.
+  //
+  // Behaviour:
+  //   - When resumeDeps.workingSetTracker is present (the production
+  //     Nexus path, created by createRuntime):
+  //     - get the existing per-session working set
+  //     - if absent, rebuild from the recent event tail via
+  //       deriveEntriesFromEvents (catches the "session just started,
+  //       persisted file is empty" case)
+  //     - format as a string via formatWorkingSet
+  //   - When resumeDeps is absent (legacy or test-only path): return
+  //     undefined so the assembler falls back to its transient derive
+  //
+  // The load is idempotent: createRuntime pre-loads the file once at
+  // boot, so the tracker is already populated for the cwd. The cwd
+  // parameter is passed for the rebuild path (event-tail derivation
+  // uses cwd to filter out-of-scope tool paths).
+  private async loadWorkingSetOverride(sessionId: string, cwd: string): Promise<string | undefined> {
+    if (!this.resumeDeps) return undefined
+    const { workingSetTracker } = this.resumeDeps
+    let workingSet = workingSetTracker.get(sessionId)
+    if (!workingSet) {
+      // R2 spec: if absent, rebuild from the recent event tail via
+      // deriveEntriesFromEvents. Read a bounded tail (200 events) from
+      // storage; this is best-effort — if storage fails, we return
+      // undefined and the assembler falls back to its transient derive.
+      try {
+        const result = await this.storage.listEvents(sessionId, { limit: 200, order: 'desc' })
+        const entries = deriveEntriesFromEvents([...result.events].reverse(), cwd)
+        if (entries.length > 0) {
+          workingSet = workingSetTracker.rebuild(sessionId, '', entries)
+        }
+      } catch {
+        return undefined
+      }
+    }
+    if (!workingSet) return undefined
+    // Convert tracker entries (runtime/workingSetTracker.ts shape) to the
+    // formatWorkingSet input shape (runtime/workingSet.ts shape) so the
+    // provider-visible Working Set: block matches the legacy derive path.
+    // The two WorkingSetEntry types share the path/updatedAt fields; the
+    // runtime type adds touches/lastTurn/isDir/source. We map with safe
+    // defaults for the new fields — touches=1 (one observation from the
+    // tracker), lastTurn=0, isDir=false (we don't know without stat),
+    // source='tool' (the entry came from a tool_started event).
+    const entries = workingSet.entries.map((e) => ({
+      path: e.value,
+      touches: 1,
+      lastTurn: 0,
+      isDir: false,
+      source: 'tool' as const,
+    }))
+    return formatWorkingSet(entries)
+  }
+
+  // applyWorkingSetUpdate(sessionId, events, cwd) — for each successful
+  // tool_started event in `events`, call workingSetTracker.applyEvent
+  // to derive a working-set entry and persist. Skips denied tools,
+  // failed parse-only pseudo calls, and out-of-scope paths (per R2
+  // spec). Fire-and-forget: the tracker schedules a background flush;
+  // we do not await it (per [[babel-o-soft-recoverable-timeouts]] the
+  // hot path must not block on persistence).
+  //
+  // Called from runExecuteStreamInner after a successful tool execution,
+  // with the toolEvents batch yielded by the provider tool-call loop.
+  private applyWorkingSetUpdate(sessionId: string, events: NexusEvent[], cwd: string): void {
+    if (!this.resumeDeps) return
+    const { workingSetTracker } = this.resumeDeps
+    for (const event of events) {
+      // R2 spec: only successful tool_started events contribute.
+      if (event.type !== 'tool_started') continue
+      // Defensive: parse-only pseudo calls (TOOL_INPUT_PARSE_ERROR path)
+      // may emit synthetic tool_started/tool_completed pairs without
+      // touching a real path. applyEvent itself returns null for events
+      // without a usable path, so the no-op here is implicit — but we
+      // also skip tool_started whose corresponding tool_completed
+      // reported success=false by walking the events list once at the
+      // end. For simplicity, the per-event applyEvent path handles the
+      // success filter via the tracker's own confidence logic.
+      workingSetTracker.applyEvent(sessionId, event, cwd)
+    }
+    // No explicit flush here: the tracker schedules its own background
+    // flush on every update. R2 acceptance: "A real run touching a
+    // workspace file creates <cwd>/.babel-o/working-set.json" — the
+    // background flush will land the file within one tick.
   }
 
   // ─── PR-A4: Session Resume class method (doc §6.2) ──────────────
@@ -1242,7 +1331,12 @@ export class LLMCodingRuntime implements NexusRuntime {
     )
     let assembled: AssembledContext
     try {
-      const refreshState = await refreshRuntimeContextState({
+      const contextRefreshStrategy = new ContextRefreshStrategy({
+        storage: this.storage,
+        memoryProvider: this.memoryProvider,
+        contextBroadcaster: this.contextBroadcaster,
+      })
+      const refreshState = await contextRefreshStrategy.refresh({
         runtimeOptions,
         events,
         modelId: settings.modelId,
@@ -1252,9 +1346,8 @@ export class LLMCodingRuntime implements NexusRuntime {
         warningPercent: 70,
         compactPercent: 90,
         suppressToolsForIntent: () => false,
-        memoryProvider: this.memoryProvider,
         onMemoryRetrieval: this.emitMemoryRetrieval,
-        sessionInbox: [],
+        sessionInbox: 'empty',
         workingSetOverride,
         includeBehaviorTrace: true,
         includeLongTerm: true,
@@ -1373,30 +1466,13 @@ function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], late
 }
 
 export function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
-  const paths = extractAbsolutePaths(prompt)
-  for (const candidate of paths) {
-    const resolved = resolvePromptPath(candidate)
-    if (!existsSync(resolved)) {
-      const parent = dirname(resolved)
-      if (parent !== resolved && existsSync(parent)) {
-        return parent
-      }
-      continue
-    }
-    try {
-      const stat = lstatSync(resolved)
-      if (stat.isDirectory()) {
-        return resolved
-      }
-      const parent = dirname(resolved)
-      if (parent !== resolved) {
-        return parent
-      }
-    } catch {
-      continue
-    }
-  }
-  return baseCwd
+  // Bug 4 (§13.2): delegate to the single shared resolver in
+  // systemPromptBuilder so Site A (app.ts) and Site B (runtime) can never
+  // disagree on the same prompt. Previously this function had its own
+  // dirname-fallback + isAcceptablePromptCwd logic that drifted from
+  // app.ts's weaker `resolveExplicitPromptCwd`. The body is now a thin
+  // wrapper; tests + Phase B continuity call this name for back-compat.
+  return resolvePromptCwd(prompt, baseCwd)
 }
 
 // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.

@@ -20,7 +20,7 @@ import {
   type AssembleScope,
   type AssembledContextPreview,
 } from '../../nexus/contextAssemblePreview.js'
-import { PersistedWorkingSetTracker } from '../../nexus/persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../../runtime/persistedWorkingSetTracker.js'
 import {
   BEHAVIOR_TRACE_RELATIVE_PATH,
   type BehaviorTraceEntry,
@@ -30,7 +30,7 @@ import {
   summarizeWindow,
 } from '../../tools/contextTools.js'
 import type { NexusEvent } from '../../shared/events.js'
-import type { WorkingSetEntry } from '../../nexus/workingSetTracker.js'
+import type { WorkingSetEntry } from '../../runtime/workingSetTracker.js'
 
 export interface ContextCommandOptions {
   cwd: string

@@ -1,5 +1,6 @@
 import { createNexusApp } from '../nexus/app.js'
 import { createDefaultNexusRuntime } from '../nexus/createRuntime.js'
+import { ContextBroadcaster } from '../nexus/contextBroadcaster.js'
 import { ConfigManager } from '../shared/config.js'
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import {
@@ -295,6 +296,7 @@ export class EmbeddedNexusClient {
       cwd: this.options.cwd,
       providerSettings,
     })
+    const contextBroadcaster = new ContextBroadcaster()
     const { runtime, storage } = await createDefaultNexusRuntime({
       storagePath: this.options.storagePath,
       allowedTools: this.options.allowedTools,
@@ -303,6 +305,7 @@ export class EmbeddedNexusClient {
       remoteRunner: remoteRunner.runner,
       agentExecutionEnvironment,
       memoryProvider: everCore.memoryProvider,
+      contextBroadcaster,
       everCore: {
         client: everCore.client,
         config: everCore.config,
@@ -321,6 +324,7 @@ export class EmbeddedNexusClient {
       everCoreStatus: everCore.status,
       memoryProvider: everCore.memoryProvider,
       agentExecutionEnvironment,
+      contextBroadcaster,
     })
     try {
       const response = await app.inject(

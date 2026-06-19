@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "policy": "Quarantined checks are tracked separately from required gates. Listing this manifest must be deterministic; running entries is opt-in with npm run test:quarantine -- --run.",
+  "entries": [
+    {
+      "id": "runtime-node-test-runner-deserialize",
+      "file": "test/runtime.test.ts",
+      "testName": "full-file run intermittently reports Unable to deserialize cloned data from the Node test runner",
+      "tier": "quarantine",
+      "status": "observing",
+      "firstObserved": "2026-06-18",
+      "lastObserved": "2026-06-18",
+      "likelyCause": "Node test-runner serialization or large runtime fixture state; observed as runner infrastructure failure rather than assertion failure.",
+      "owner": "Runtime maintainer",
+      "exitCondition": "10 consecutive full-file runs pass or root cause is isolated to a smaller deterministic fixture.",
+      "replacementCoverage": "Focused runtime.test.ts name-pattern runs covering cwd, storage, and tool-loop cases continue to pass.",
+      "command": "NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-quarantine-runtime.json npx tsx --test --test-concurrency=1 test/runtime.test.ts"
+    },
+    {
+      "id": "permission-flow-request-timeout",
+      "file": "test/permission-flow.test.ts",
+      "testName": "smart permissions: prompts user on non-whitelisted",
+      "tier": "quarantine",
+      "status": "observing",
+      "firstObserved": "2026-06-18",
+      "lastObserved": "2026-06-18",
+      "likelyCause": "Async permission timing or polling race; baseline also failed after stash during local audit.",
+      "owner": "Runtime maintainer",
+      "exitCondition": "A deterministic permission fixture replaces the race or the isolated test passes 10 consecutive runs.",
+      "replacementCoverage": "Existing focused permission and runtime tool-loop tests remain required.",
+      "command": "NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-quarantine-permission.json npx tsx --test --test-concurrency=1 --test-name-pattern=\"smart permissions: prompts user on non-whitelisted\" test/permission-flow.test.ts"
+    }
+  ]
+}

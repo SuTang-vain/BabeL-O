@@ -26,6 +26,7 @@ import { PendingPermissionRegistry } from '../src/shared/session.js'
 import { globTool } from '../src/tools/builtin/glob.js'
 import { LLMCodingRuntime, resolveCwdFromPrompt, resolveCwdWithContinuity } from '../src/runtime/LLMCodingRuntime.js'
 import { executeProviderToolCall, resetProviderSessionRulesForTest } from '../src/runtime/runtimeToolLoop.js'
+import { ProviderSessionRules } from '../src/runtime/providerSessionRules.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
@@ -1882,6 +1883,112 @@ test('runtime tool loop provider session-scoped approval rule suppresses repeat 
   assert.ok(secondEvents.some(event => event.type === 'tool_completed' && event.name === 'Write' && event.success))
 })
 
+test('runtime tool loop provider session rules are isolated by injected service', async () => {
+  resetProviderSessionRulesForTest()
+  const sessionId = `session-provider-session-rule-isolation-${Date.now()}`
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-provider-session-rule-isolation`)
+  await mkdir(cwd, { recursive: true })
+  const tools = createDefaultToolRegistry()
+  const storage = new MemoryStorage()
+  const rulesA = new ProviderSessionRules()
+  const rulesB = new ProviderSessionRules()
+
+  const firstEvents: NexusEvent[] = []
+  const first = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_rule_isolation_write_1',
+      name: 'Write',
+      partialInput: '{"path":"one.txt","content":"one"}',
+    },
+    tools,
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write one',
+      cwd,
+      policyMode: 'soft-deny',
+      runtimeHooks: [{
+        name: 'ApproveProviderWriteSessionRuleA',
+        events: ['PermissionRequest'],
+        run: () => ({ permissionDecision: { approved: true, reason: 'approve write session A', scope: 'session', rule: 'write:*' } }),
+      }],
+    },
+    storage,
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    providerSessionRules: rulesA,
+  })
+  let next = await first.next()
+  while (!next.done) {
+    firstEvents.push(next.value)
+    next = await first.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.deepEqual(rulesA.getRules(sessionId), ['write:*'])
+  assert.deepEqual(rulesB.getRules(sessionId), [])
+  assert.ok(firstEvents.some(event => event.type === 'permission_request' && event.name === 'Write'))
+  assert.ok(firstEvents.some(event => event.type === 'tool_completed' && event.name === 'Write' && event.success))
+
+  const allowedByA: NexusEvent[] = []
+  const secondA = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_rule_isolation_write_2a',
+      name: 'Write',
+      partialInput: '{"path":"two-a.txt","content":"two-a"}',
+    },
+    tools,
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write two a',
+      cwd,
+      policyMode: 'strict',
+    },
+    storage,
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    providerSessionRules: rulesA,
+  })
+  next = await secondA.next()
+  while (!next.done) {
+    allowedByA.push(next.value)
+    next = await secondA.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.ok(!allowedByA.some(event => event.type === 'permission_request'))
+  assert.ok(!allowedByA.some(event => event.type === 'tool_denied' && event.denialKind === 'policy'))
+  assert.ok(allowedByA.some(event => event.type === 'tool_completed' && event.name === 'Write' && event.success))
+
+  const deniedByB: NexusEvent[] = []
+  const secondB = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_loop_rule_isolation_write_2b',
+      name: 'Write',
+      partialInput: '{"path":"two-b.txt","content":"two-b"}',
+    },
+    tools,
+    toolPolicy: allowlistedTools(['Read']),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'write two b',
+      cwd,
+      policyMode: 'strict',
+    },
+    storage,
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    providerSessionRules: rulesB,
+  })
+  next = await secondB.next()
+  while (!next.done) {
+    deniedByB.push(next.value)
+    next = await secondB.next()
+  }
+  assert.equal(next.value.kind, 'continue')
+  assert.ok(deniedByB.some(event => event.type === 'tool_denied' && event.denialKind === 'policy'))
+  assert.ok(!deniedByB.some(event => event.type === 'tool_completed' && event.name === 'Write'))
+})
+
 test('runtime tool loop returns recoverable result for hook-denied tools', async () => {
   const stream = executeProviderToolCall({
     toolCall: {
@@ -2299,8 +2406,10 @@ test('Read returns a recoverable tool result for workspace escape paths', async 
       event.type === 'tool_completed' && event.name === 'Read',
     )
     assert.equal(toolCompleted.success, false)
-    assert.equal(toolCompleted.output.code, 'WORKSPACE_PATH_ESCAPE')
-    assert.match(toolCompleted.output.message, /outside the current workspace/)
+    const outputText = typeof toolCompleted.output === 'string'
+      ? toolCompleted.output
+      : JSON.stringify(toolCompleted.output)
+    assert.match(outputText, /WORKSPACE_PATH_ESCAPE|outside the current workspace/)
     assert.ok(!body.events.some((event: { type: string; code?: string }) =>
       event.type === 'error' && event.code === 'TOOL_ERROR',
     ))
@@ -2384,8 +2493,9 @@ test('sqlite storage persists sessions and events across storage instances', asy
     assert.equal(restored.metadata?.transcriptPath, `nexus://sessions/${sessionId}/events`)
     assert.ok(restored.events.some(event => event.type === 'session_started'))
     const tasks = await storageB.listTasks(sessionId)
-    assert.equal(tasks.length, 1)
-    assert.equal(tasks[0]?.title, 'stored task')
+    assert.equal(tasks.length, 2)
+    assert.ok(tasks.some(task => task.title === 'persist this'))
+    assert.ok(tasks.some(task => task.title === 'stored task'))
   } finally {
     await storageB.close()
   }

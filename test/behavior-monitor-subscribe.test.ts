@@ -20,7 +20,7 @@ import { mkdtempSync, rmSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { BehaviorMonitor } from '../src/nexus/behaviorMonitor.js'
+import { BehaviorMonitor } from '../src/runtime/behaviorMonitor.js'
 import type { BehaviorTraceAnomaly } from '../src/runtime/behaviorTrace.js'
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {}

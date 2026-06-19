@@ -1,5 +1,8 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   buildSystemPromptSections,
   sectionsToPromptText,
@@ -385,5 +388,74 @@ describe('extractAbsolutePaths', () => {
     const realPath = '/tmp'
     const paths = extractAbsolutePaths(`请看 ${realPath} 下的文件`)
     assert.ok(paths.includes(realPath), `Expected ${realPath} in ${JSON.stringify(paths)}`)
+  })
+
+  // ── Bug 1 Layer A (context-cwd-drift plan §13.3) ──────────────────────
+  // Real users paste paths with *plain* spaces (and CJK punctuation in
+  // filenames) inside quote delimiters. pathPattern cuts at the first
+  // excluded char and emits broken fragments whose dirname fallback
+  // poisons cwd to ~/Library. extractAndBlankQuotedRealPaths must capture
+  // the whole quoted span as one candidate and blank it from the working
+  // string so no broken fragment survives.
+  test('Bug 1 Layer A: quoted iCloud-style path with plain space is captured whole', () => {
+    // Build a real path with a plain space + a CJK-punctuation filename so
+    // the test does not depend on the user's iCloud tree.
+    const base = mkdtempSync(join(tmpdir(), 'babel-o layer-a-'))
+    const spacedDir = join(base, 'Mobile Documents')
+    mkdirSync(spacedDir, { recursive: true })
+    const file = join(spacedDir, '上百个Agent，该怎么管？.md')
+    writeFileSync(file, 'hello')
+    try {
+      const prompt = `分析这个文章'${file}'与babel-o项目理念的相似程度`
+      const paths = extractAbsolutePaths(prompt)
+      assert.ok(paths.includes(file),
+        `Expected the whole quoted path ${file} in ${JSON.stringify(paths)}`)
+      // The broken fragment that previously poisoned cwd must NOT appear.
+      assert.ok(!paths.some(p => p === join(base, 'Mobile')),
+        `Broken fragment /Mobile must not survive: ${JSON.stringify(paths)}`)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  test('Bug 1 Layer A: double-quoted path with plain space is captured whole', () => {
+    const base = mkdtempSync(join(tmpdir(), 'babel-o dq-'))
+    const spacedDir = join(base, 'Group Containers')
+    mkdirSync(spacedDir, { recursive: true })
+    const file = join(spacedDir, 'notes.md')
+    writeFileSync(file, 'hi')
+    try {
+      const prompt = `读取 "${file}" 并总结`
+      const paths = extractAbsolutePaths(prompt)
+      assert.ok(paths.includes(file),
+        `Expected quoted path ${file} in ${JSON.stringify(paths)}`)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  test('Bug 1 Layer A: backtick-quoted path with plain space is captured whole', () => {
+    const base = mkdtempSync(join(tmpdir(), 'babel-o bt-'))
+    const spacedDir = join(base, 'Some Folder')
+    mkdirSync(spacedDir, { recursive: true })
+    const file = join(spacedDir, 'data.txt')
+    writeFileSync(file, 'x')
+    try {
+      const prompt = `打开 \`${file}\` 这个文件`
+      const paths = extractAbsolutePaths(prompt)
+      assert.ok(paths.includes(file),
+        `Expected backtick-quoted path ${file} in ${JSON.stringify(paths)}`)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  test('Bug 1 Layer A: quoted prose that is NOT a real path is left untouched (no false merge)', () => {
+    // A quoted span containing a slash + space but resolving to no real
+    // path must not be merged or added; existing prose guards still drop
+    // the resulting fragments.
+    const paths = extractAbsolutePaths(`参见 'some non existent / path with space' 这段话`)
+    assert.equal(paths.length, 0,
+      `Non-real quoted span must not produce candidates: ${JSON.stringify(paths)}`)
   })
 })

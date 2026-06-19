@@ -28,7 +28,7 @@ import { randomUUID } from 'node:crypto'
 import { runWorkingSetEdit, type WorkingSetEditOptions } from '../src/cli/commands/context.js'
 import { registerContextCommand } from '../src/cli/commands/context.js'
 import { Command } from 'commander'
-import { PersistedWorkingSetTracker } from '../src/nexus/persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../src/runtime/persistedWorkingSetTracker.js'
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {}
 

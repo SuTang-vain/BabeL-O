@@ -3,8 +3,8 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { runEverOSMemorySetup } from '../src/cli/everosBootstrap.js'
-import type { CommandRunner } from '../src/cli/everosPrerequisites.js'
+import { runEverOSMemorySetup } from '../src/runtime/everosBootstrap.js'
+import type { CommandRunner } from '../src/runtime/everosPrerequisites.js'
 
 function makeTempEnv(): { env: NodeJS.ProcessEnv; dir: string; bootstrapFile: string; sourceDir: string; dataDir: string; cleanup: () => void } {
   const dir = mkdtempSync(join(tmpdir(), 'babel-o-everos-bootstrap-'))

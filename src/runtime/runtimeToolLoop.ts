@@ -9,7 +9,7 @@ import { PendingPermissionRegistry, type PermissionResolution } from '../shared/
 import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool, ToolRisk } from '../tools/Tool.js'
 import { classifyAction } from './classifier.js'
-import { buildSessionRulesPolicy, deriveBashSuggestedRule, type ToolPolicy } from './LocalCodingRuntime.js'
+import { deriveBashSuggestedRule, type ToolPolicy } from './LocalCodingRuntime.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import {
   executeRuntimeHooks,
@@ -35,6 +35,7 @@ import {
 import { checkOptimizerSafety } from './safetyCheck.js'
 import { executeToolSafely, TOOL_EXECUTION_TIMEOUT_MS } from './toolExecutor.js'
 import { replaceLargeToolResult } from './toolResultBudget.js'
+import { defaultProviderSessionRules, type ProviderSessionRules } from './providerSessionRules.js'
 
 export type ProviderToolCallExecutionOutcome =
   | { kind: 'continue'; toolResult: ToolResultContentBlock }
@@ -79,27 +80,8 @@ type RequestedReadCoverage = {
   mode: 'auto' | 'full' | 'preview'
 }
 
-const providerSessionRules = new Map<string, string[]>()
-
-function addProviderSessionRule(sessionId: string, rule: string): void {
-  const trimmed = rule.trim()
-  if (!trimmed) return
-  const current = providerSessionRules.get(sessionId) ?? []
-  if (current.includes(trimmed)) return
-  providerSessionRules.set(sessionId, [...current, trimmed])
-}
-
 export function resetProviderSessionRulesForTest(): void {
-  providerSessionRules.clear()
-}
-
-function isApprovedByProviderSessionRule(
-  rules: readonly string[] | undefined,
-  tool: AnyTool,
-  input: unknown,
-): boolean {
-  if (!rules || rules.length === 0) return false
-  return buildSessionRulesPolicy(rules).isAllowed(tool, input)
+  defaultProviderSessionRules.clear()
 }
 
 function providerSuggestedRule(tool: AnyTool, input: unknown): string | undefined {
@@ -139,6 +121,7 @@ async function* requestScopeBoundaryPermission(options: {
   risk: ToolRisk
   boundary: ToolScopeBoundary
   suggestedRule?: string
+  providerSessionRules: ProviderSessionRules
 }): AsyncGenerator<NexusEvent, boolean> {
   const { runtimeOptions, tool, toolUseId, toolInput, risk, boundary, suggestedRule } = options
   yield buildScopeBoundaryDetectedEvent({
@@ -194,7 +177,7 @@ async function* requestScopeBoundaryPermission(options: {
   const approved = decision.approved
   const decisionReason = decision.reason ?? 'User review'
   if (shouldPersistProviderSessionRule(decision)) {
-    addProviderSessionRule(runtimeOptions.sessionId, decision.rule)
+    options.providerSessionRules.addRule(runtimeOptions.sessionId, decision.rule)
   }
 
   await options.storage.savePermissionAudit({
@@ -243,8 +226,10 @@ export async function* executeProviderToolCall(options: {
   metrics: RuntimeExecutionMetrics
   readFileCache: Map<string, ReadFileCacheEntry>
   taskScope?: TaskScopeDeclaredEvent
+  providerSessionRules?: ProviderSessionRules
 }): AsyncGenerator<NexusEvent, ProviderToolCallExecutionOutcome> {
   const { toolCall, runtimeOptions, metrics, readFileCache } = options
+  const providerSessionRules = options.providerSessionRules ?? defaultProviderSessionRules
   let resolvedInput = resolveProviderToolCallInput(toolCall)
 
   if (resolvedInput && typeof resolvedInput === 'object' && '_parseError' in (resolvedInput as Record<string, unknown>)) {
@@ -387,9 +372,8 @@ export async function* executeProviderToolCall(options: {
     ...(effectiveRisk !== tool.risk && { effectiveRisk }),
   }
 
-  let sessionRules = providerSessionRules.get(runtimeOptions.sessionId) ?? []
   let policyAllowed = options.toolPolicy.isAllowed(tool, toolInput) ||
-    isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+    providerSessionRules.isAllowed(runtimeOptions.sessionId, tool, toolInput)
 
   if (
     effectiveRisk !== 'read' &&
@@ -508,9 +492,8 @@ export async function* executeProviderToolCall(options: {
     }
     toolInput = parsed.data
     effectiveRisk = resolveEffectiveToolRisk(tool, toolInput)
-    sessionRules = providerSessionRules.get(runtimeOptions.sessionId) ?? []
     policyAllowed = options.toolPolicy.isAllowed(tool, toolInput) ||
-      isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+      providerSessionRules.isAllowed(runtimeOptions.sessionId, tool, toolInput)
     if (
       effectiveRisk !== 'read' &&
       !policyAllowed &&
@@ -573,6 +556,7 @@ export async function* executeProviderToolCall(options: {
       risk: effectiveRisk,
       boundary: scopeBoundary,
       suggestedRule,
+      providerSessionRules,
     })
     if (!approved) {
       const denyMessage = scopeBoundary.reason
@@ -595,7 +579,7 @@ export async function* executeProviderToolCall(options: {
 
   if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
     const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: runtimeOptions.cwd })
-    const sessionRuleApproved = isApprovedByProviderSessionRule(sessionRules, tool, toolInput)
+    const sessionRuleApproved = providerSessionRules.isAllowed(runtimeOptions.sessionId, tool, toolInput)
     let approved = autoApprove || sessionRuleApproved
     let decisionReason = sessionRuleApproved
       ? 'Approved by session rule'
@@ -661,7 +645,7 @@ export async function* executeProviderToolCall(options: {
       approved = decision.approved
       decisionReason = decision.reason ?? 'User review'
       if (shouldPersistProviderSessionRule(decision)) {
-        addProviderSessionRule(runtimeOptions.sessionId, decision.rule)
+        providerSessionRules.addRule(runtimeOptions.sessionId, decision.rule)
       }
 
       await options.storage.savePermissionAudit({
@@ -734,7 +718,21 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  const result = await executeToolSafely(tool, toolInput, runtimeOptions, {
+  // Phase C2 (cwd-drift plan §11): defensive merge before executeToolSafely.
+  // executeToolSafely builds ToolContext from RuntimeExecuteOptions.storage,
+  // so context tools (contextSearch / contextRecent) return
+  // CONTEXT_STORAGE_UNAVAILABLE when that field is unset — even though this
+  // function received storage as a side-channel (used above for permission
+  // audit / scope persistence). Merge the side-channel storage into the
+  // options passed to executeToolSafely so ToolContext.storage is non-null.
+  // The LLMCodingRuntime.runExecuteStreamInner injection covers the normal
+  // path; this merge is the defense-in-depth for any caller that reaches
+  // executeProviderToolCall without having normalized runtimeOptions.storage.
+  const toolRuntimeOptions = runtimeOptions.storage
+    ? runtimeOptions
+    : { ...runtimeOptions, storage: options.storage }
+
+  const result = await executeToolSafely(tool, toolInput, toolRuntimeOptions, {
     timeout: TOOL_EXECUTION_TIMEOUT_MS,
     toolUseId: toolCall.id,
   })

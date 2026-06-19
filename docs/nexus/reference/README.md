@@ -20,6 +20,14 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | --- | --- | --- |
 | [REFERENCE_TEMPLATE.md](./REFERENCE_TEMPLATE.md) | Guide | Standard template for new reference documents. It keeps the planning body in English and reserves a concise final Chinese summary for local readability. |
 
+## Development Process Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md) | Active Plan | Defines PR review levels, semantic PR/commit granularity, and flaky test quarantine tiers so high-velocity runtime development keeps trustworthy gates. |
+| [module-coupling-decoupling-and-re-aggregation-plan.md](./module-coupling-decoupling-and-re-aggregation-plan.md) | Active Plan | Canonical coupling governance entry point: layer heat map, reverse `runtime → nexus` cleanup, singleton-to-injection, `LLMCodingRuntime` decomposition, `nexus/app.ts` router split, `runtimePipeline.ts` factory cluster, `shared/events.ts` codegen, and `process.env` consolidation. |
+| [github-discussions-setup-guide.md](./github-discussions-setup-guide.md) | Guide | Owner checklist for enabling GitHub Discussions, creating initial categories, and verifying README/GOVERNANCE community links for Product W4.2. |
+
 ## Runtime, Context, And Agent Architecture
 
 | Document | State | Role |
@@ -27,7 +35,7 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) | Index | Reader entry point for agent runtime maturity, typed session collaboration, TUI relationship visibility, and the skill product loop. |
 | [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md) | Active Plan | Defines trace, eval, durable resume, MCP context primitive, memory quality, and loop taxonomy gaps for the next runtime maturity slice. |
 | [context-governance-index.md](./context-governance-index.md) | Index | Reader entry point for context governance ownership across compact, working set, behavior trace, cache observability, memory, and tool-loop recovery. |
-| [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift to `/`, context-estimate calibration, and storage-backed session recall tools. Phase A (path classification hardening) and Phase C (recall tool storage contract) closed 2026-06-17. |
+| [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift, context-estimate calibration, storage-backed session recall tools, Nexus continuity wiring, and user-artifact continuity. Phase A / A Follow-up / B / C1 are closed; Phase C2 / D / E / F remain open, with `session_10320709` as the current P0 follow-up. |
 | [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md) | Active Plan | Cache health observability, honest unavailable states for non-prompt cache families, and Nexus realtime detection integration phases. |
 
 ## Evidence, Scope, And Session Governance

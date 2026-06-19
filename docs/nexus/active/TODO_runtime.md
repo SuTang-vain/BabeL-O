@@ -78,6 +78,104 @@ Phase 1/2/3/4 已收口：`normalizeGuidancePolicy()` 不再对 `status` + `requ
 
 后续只在真实会话再次出现 context blocking recovery drift 时重新开未收口项；新项必须先补最小 fixture，再调整 runtime/context/TUI。
 
+## P0 session_10320709-2b06-405f-8f51-d954435d4a70 跟进项 — 4 Bug 修复追踪（§12 初判 + §13 二次复盘修正）
+
+> 样本：`session_10320709-2b06-405f-8f51-d954435d4a70`。真实 Nexus session，SQLite event storage 有 15914 行，权限审计可写，但 `contextSearch` / `contextRecent` 在 LLMCodingRuntime/Nexus 热路径仍拿不到 `context.storage`（3 次 `CONTEXT_STORAGE_UNAVAILABLE` 失败：event_seq 10050 / 15072 / 15103）；同时 6 个 turn 全部跑在 cwd `/Users/tangyaoyue/Library`（被 iCloud 路径污染，且跨 turn 2-6 持续）；0 个 `session_root_continuity` event。§12 初判 3 bug，§13 二次复盘（直接读 SQLite events 表）修正为 4 bug + 提升优先级。详细分析见 [context-cwd-drift-and-recall-governance-plan.md §12 + §13](../reference/context-cwd-drift-and-recall-governance-plan.md)。
+
+**§13 二次复盘新增的关键证据**（修正 §12 判断）：
+
+- 真实 prompt 用**普通空格**（`Mobile Documents`，非 `\ ` shell escape）→ Phase A Follow-up ④ 的 SPACE_MARK 哨兵修了错误目标。
+- **一条 iCloud 路径拆成 2 candidate**：`/Users/.../Library/Mobile`（→ cwd 漂移源）+ `/com~apple~CloudDocs/家人共享/上百个Agent`（→ 进 `task_scope_declared.explicitRoots` seq=4 成为垃圾 explicitRoot）。
+- `/Users/tangyaoyue/Library/Mobile` **不存在**（`existsSync` 验证），`~/Library` 存在 → Site A `resolveExplicitPromptCwd`（app.ts）正确拒绝但 Site B `resolveCwdFromPrompt`（runtime）dirname 兜底接受 `~/Library` → **两 resolution site 不一致** = Bug 4。
+- **drift 跨 turn 2-6 持续**：turn 2-6 prompt 完全无路径却仍跑在 `~/Library`；turn 7 用户重述项目内路径 `在/Users/tangyaoyue/DEV/BABEL/BabeL-O/docs/nexus中...` 自愈（seq=14509 cwd=`docs/nexus`）。
+- **下游损害**：8 GLOB_FAILED（ripgrep 撞 `~/Library/Caches` 权限拒绝整段失败，非 partial）+ 3 scope_boundary parent_scan + 6 WEB_SEARCH_FAILED（独立网络问题）+ 1 幻觉路径拼接（seq=4786）+ turn 1 contextCharsIn=992400（≈250k tokens）浪费。
+
+**4 个 bug 修复追踪**（按 P0 → P1 排序，§13 修正后）：
+
+- [x] **Bug 1 Layer A [P0，§13 提升优先级]** — `extractAbsolutePaths` quote-delimited span 优先识别（plan §13.3）。✅ 收口（2026-06-18）：`src/runtime/systemPromptBuilder.ts` 新增 `extractAndBlankQuotedRealPaths()` 在 pathPattern 之前抽取 `'...'`/`"..."`/backtick 平衡 span，实存则整段加入 candidates 并 blank 掉原 span（防止 pathPattern 在普通空格 + CJK 标点处切断 emit 破碎 fragment）。`test/system-prompt-builder.test.ts` 35→39（+4 Layer A test）。真实 prompt 验证：`/Users/.../Library/Mobile` → 整段 iCloud 文件路径。
+  - 症状：cwd 漂 `~/Library` + 垃圾 explicitRoot `/com~apple~CloudDocs/...` + 跨 turn 持续 + 8 GLOB_FAILED + 3 parent_scan + 992k context 浪费。
+  - 根因：pathPattern 在普通空格处切断 iCloud 路径（路径在单引号 `'...'` 内，但 pathPattern 仍在引号内的空格处停）。
+  - 修法：在 pathPattern 之前先抽取 `'...'` / `"..."` / backtick 内容，整段 `existsSync` true 或 `resolvePromptPath` 命中实存 prefix → 作为单一 candidate 加入，绕过空格切断。
+  - 验证：`test/system-prompt-builder.test.ts` +4 个 test（quoted iCloud path 整段提取 / 双引号 / backtick / 混入 prose 不误合并）。
+  - 估算：~15 行 code + 4 test。**最优先**——修根因，阻断整条 drift 链。
+
+- [x] **Bug 1 Layer B [P0]** — 共享 `isAcceptablePromptCwd` 守卫在 Site A+B 拦系统目录（plan §13.3）。✅ 收口（2026-06-18）：`src/runtime/systemPromptBuilder.ts` 新增 export `isAcceptablePromptCwd(p)`（reject `/`/`/Users`/homedir/`dirname(homedir)`/`~/Library`/`~/Documents`/`~/Desktop`/`~/Downloads`/`~/Applications`）；`LLMCodingRuntime.ts:resolveCwdFromPrompt` Site B 的 3 个 return 点 + `app.ts:resolveExplicitPromptCwd` Site A 的 isDirectory 分支都加守卫。新文件 `test/resolve-cwd-fallback.test.ts` 10 test（5 vocabulary + 5 Site B 拒绝场景）。真实验证：broken `/Mobile` fragment / 直接 `~/Library` / 直接 `~/Documents` 都不漂，real internal dir 仍正常 resolve。
+  - 修法：新增纯函数 `isAcceptablePromptCwd(p)` 拒绝 homedir / `~/Library` / `~/Documents` / `~/Desktop` / `~/Downloads` / `/Users` / `/Users/<user>`；`resolveExplicitPromptCwd`（app.ts Site A）与 `resolveCwdFromPrompt`（runtime Site B）返回前都过这个守卫。
+  - 验证：`test/resolve-cwd-fallback.test.ts` +3 个 test（`~/Library` / `~/Documents` / homedir 拒绝；project root 通过）。
+  - 估算：~10 行 code + 3 test。Layer A 漏网时的 defense-in-depth。
+
+- [x] **Bug 3 [P0]** — `LLMCodingRuntime.runExecuteStreamInner` 起手缺 `options = { ...options, storage: this.storage }` 注入（plan §11 / §12.3）。✅ 收口（2026-06-18，Phase C2）：3 个接线点全注入——① `LLMCodingRuntime.runExecuteStreamInner` 起手 `if (!options.storage && this.storage) options = { ...options, storage: this.storage }`（镜像 `LocalCodingRuntime.ts:170-172`）；② `app.ts` HTTP + WS 两条 `executeStream` 调用点各加 `storage: options.storage`；③ `runtimeToolLoop.ts` `executeProviderToolCall` 在 `executeToolSafely` 之前 defensive merge `runtimeOptions.storage ?? options.storage`。新文件 `test/runtime-storage-propagation.test.ts` 5 test（含 session_10320709 精确场景：runtimeOptions.storage 省略 + side-channel storage 提供 → contextRecent/contextSearch 不返回 CONTEXT_STORAGE_UNAVAILABLE）。临时 revert merge → 3 test 失败；restore → 5/5 pass，证明 test 精确锁住注入点。
+  - 症状：session_10320709 的 3 个 `CONTEXT_STORAGE_UNAVAILABLE`（event_seq 10050 / 15072 / 15103）。
+  - 根因：`executeToolSafely` → `tool.execute(input, { storage: options.storage })` 而 `options.storage === undefined`（对比 `LocalCodingRuntime.ts:170-172` 有 storage 注入）。
+  - 修法：`src/runtime/LLMCodingRuntime.ts:runExecuteStreamInner` 起手段落 2 行。
+  - 验证：`test/runtime-storage-propagation.test.ts` 5 个新 focused regression + `test/runtime.test.ts` 6 个 + `test/runtime-context-tools-registry-gate.test.ts` 4 个（共 15 个 regression test 守住 §11.5 全部失败点）。
+  - 同时 `src/nexus/app.ts` HTTP/WS 两条 `executeStream` 调用点同步注入 `storage: options.storage`；`runtimeToolLoop` 在 `executeToolSafely` 之前 defensive merge `storage: runtimeOptions.storage ?? options.storage`。
+  - 估算：~1 行 code + 5 行 wiring + 5 test。锁住 context tool 失败。
+
+- [x] **Bug 2 + origin_cwd [P1，§13 修正]** — `src/nexus/app.ts:2695-2711` `executeStream` 没传 `storedSessionCwd` / `latestTaskPrimaryRoot` + `session.cwd` 本身已漂（plan §13.4）。✅ 收口（2026-06-18）：① `shared/session.ts` `SessionSnapshot` 增 `originCwd?` 字段；② `SqliteStorage` migration v15 加 `origin_cwd` 列 + backfill（无条件 `WHERE NULL`）+ `saveSession` ON CONFLICT **不**更新 origin_cwd（immutable）+ `sessionParams`/`rowToSession` 支持；③ `MemoryStorage` `saveSession` 保 originCwd 不被 clobber；④ `app.ts` 两创建点设 `originCwd=cwd` + `prepareExecution` 派生 `storedSessionCwd=originCwd ?? cwd` + `resolveLatestTaskPrimaryRoot` helper（`listEvents` desc 扫 task_scope_declared.primaryRoot）+ HTTP/WS executeStream 都传两字段。新文件 `test/session-origin-cwd.test.ts` 4 test（Memory + Sqlite immutability + v15 backfill）。**测试抓到真实 migration bug**：backfill 误嵌在 `if(!columns)` 里被跳过 → 修正为无条件。真实 db 副本验证 immutability + session_10320709 backfill。
+  - 症状：session_10320709 的 0 个 `session_root_continuity` event。
+  - 根因：`hasSessionContext` 永远 false；且 §13 发现 `session.cwd` 在 turn 1 就被 `app.ts:2301` 覆写成 drifted 值，单纯传 `session.cwd` 会传漂移值。
+  - 修法：`sessions` 表新增不可变 `origin_cwd` 列（`createSessionSnapshot` 时从 launcher `body.cwd` 写入一次，不随 `session.cwd` 漂移）；`app.ts:2695` 传 `storedSessionCwd = session.origin_cwd` + `latestTaskPrimaryRoot`；emit `session_root_continuity_missing` diagnostic。
+  - 验证：`test/nexus-runtime-wiring.test.ts` +3 个 test（origin_cwd 不随 drift 变 / continuity 用 origin_cwd 拉回 / HTTP+WS 接线）。
+  - 估算：~20 行 code + 3 test。与 Bug 1 互补不替代。
+
+- [x] **Bug 4 [P1，§13 新增]** — dual cwd resolution sites 不一致 + `session.cwd` 每 turn 覆写（plan §13.2）。✅ 收口（2026-06-18）：① `systemPromptBuilder.ts` 新增 `resolvePromptCwd` 单一共享 resolver（合并 Site B 的 dirname fallback + Layer B 守卫）；② `LLMCodingRuntime.ts:resolveCwdFromPrompt` Site B 改为 thin wrapper；③ `app.ts:resolveExplicitPromptCwd` Site A 改为 thin wrapper（sentinel 模式保 `undefined` 契约）；④ `cli/runSessionFlow.ts:resolveExplicitPromptCwd` 第三个副本也合并到 shared resolver；⑤ `app.ts:prepareExecution` `session.cwd` 改用 `trustedSessionCwd = body.cwd ?? session?.originCwd ?? session?.cwd ?? cwd` 不再被 prompt 覆写。新文件 `test/dual-site-resolver.test.ts` 6 test（Site A/B/CLI 三 site 一致性 + Layer B 拒绝 `~/Library` + session.cwd 不漂 invariant）。6/6 pass，125/125 完整回归。
+  - 症状：drift 跨 turn 2-6 持续（turn prompt 无路径但 cwd 不回 project root）。
+  - 根因：Site A（`app.ts:5651 resolveRequestCwd` → `resolveExplicitPromptCwd`，只接受实存目录）与 Site B（`LLMCodingRuntime.ts:1378 resolveCwdFromPrompt`，有 dirname 兜底）行为不一致；`app.ts:2301 session.cwd = cwd` 每 turn 覆写。
+  - 修法：统一 Site A/B——要么删 `resolveExplicitPromptCwd` 让 runtime+PhaseB 决策，要么把 Phase B continuity 上移到 `resolveRequestCwd`；`session.cwd` 不被 external prompt 覆写。
+  - 验证：`test/resolve-cwd-fallback.test.ts` +4 个 test（两 site 一致性 / session.cwd 不被 external prompt 覆写 / 跨 turn 不漂 / turn 7 自愈仍工作）。
+  - 估算：~30 行 refactor + 4 test。
+
+**Reopen 信号**（operator-facing，§13.6 修正）：
+
+- 任何 `cwd` 漂到 `/Users/<user>/Library` / `Documents` / `Desktop` / `Downloads` / `homedir` → **Bug 1 Layer A+B 未收口**。
+- 任何 `task_scope_declared.explicitRoots` 含 `/com~apple~...` / 不以 `/Users/<user>/...` 开头的破碎 fragment → **Bug 1 Layer A 未收口**（quote span 识别漏）。
+- 任何 turn 的 `session_started.cwd` 与 `session.origin_cwd` 不一致 + 该 turn prompt 无项目内路径 → **Bug 4 未收口**（跨 turn drift 持续）。
+- 任何 `session_root_continuity` event 缺失 → **Bug 2 未收口**（接线层未传 origin_cwd）。
+- 任何 `CONTEXT_STORAGE_UNAVAILABLE` + `events` 表非空 → **Bug 3 未收口**（reopen Phase C2 注入层）。
+- 任何 `GLOB_FAILED` 因 `Operation not permitted` 整段失败（非 partial）→ 独立工具鲁棒性 follow-up（tool-governance-plan，不阻塞本 plan）。
+
+## P1 Long-Running Context Assembly Hot Path Closure — R0-R7
+
+> 主文档：[long-running-context-assembly.md §19/§20](../proposals/long-running-context-assembly.md)。2026-06-18 源码 + 真实 session 审计结论：context assembly primitives、working-set storage、CLI/REST preview、observer skeleton 与 `LLMCodingRuntime.resume()` 已部分落地；但正常 `LLMCodingRuntime.executeStream()` 尚未把 persisted Nexus working set 作为 active context 权威来源。`session_981cc5c2` / `session_cf361f04` / `session_10320709` 没有 `working_set_updated` / persisted `assembled` 证据，且 `contextSearch` / `contextRecent` 被 `CONTEXT_STORAGE_UNAVAILABLE` 阻断。
+
+- [ ] **R0 [P0 prerequisite] — Storage propagation + continuity wiring**。
+  - 依赖：上方 `session_10320709` Bug 3 + Bug 2。
+  - 修法：`LLMCodingRuntime.runExecuteStreamInner` 注入 `this.storage`；Nexus HTTP/WS executeStream 传 `storage` / `storedSessionCwd` / `latestTaskPrimaryRoot`；runtimeToolLoop defensive merge。
+  - 验证：`test/runtime-storage-propagation.test.ts` + `test/nexus-runtime-wiring.test.ts`；storage-backed session 中 `contextRecent` 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`，并能 emit `session_root_continuity`。
+
+- [ ] **R1 [P0 prerequisite] — CWD drift guard before persistence**。
+  - 依赖：上方 `session_10320709` Bug 1。
+  - 修法：收紧 `resolveCwdFromPrompt` dirname fallback；拦截 iCloud `Mobile Documents` 4-segment truncation；`SessionRootContinuity` 拒绝非 project-like prompt root。
+  - 验证：`test/resolve-cwd-fallback.test.ts`；`session_cf361f04` / `session_10320709` 风格 prompt 不再把 root 写成 `/` 或 `~/Library`。
+
+- [ ] **R2 [P1 core] — Persisted working set enters normal executeStream hot path**。
+  - 修法：`LLMCodingRuntime` 通过 `resumeDeps.workingSetTracker` load/rebuild working set；每次 `refreshRuntimeContextState()` 传 `workingSetOverride`；成功工具事件后 `applyEvent()` + `flush()`；失败/denied/out-of-scope 不更新。
+  - 同步修：`refreshRuntimeContextState()` 必须 forward `workingSetOverride` / include flags 给 `assembleContext()`，不能 drop。
+  - 验证：`test/runtime-working-set-hot-path.test.ts` 覆盖 persisted entry 出现在 provider system prompt、工具触达后写 `.babel-o/working-set.json`、runtime restart 后下一轮注入。
+
+- [ ] **R3 [P1] — REST PUT and `/v1/working-set/observe` share tracker**。
+  - 问题：当前 PUT helper fresh tracker；WS 监听 broadcaster tracker。写入可以持久化，但不保证通知已连接 WS。
+  - 修法：`WorkingSetBroadcaster.mutate(cwd, fn)` 或等价共享 tracker provider；PUT 走 broadcaster-owned tracker 后 flush。
+  - 验证：REST PUT → persisted file → WS `working_set_updated` → GET same version e2e。
+
+- [ ] **R4 [P1] — `/v1/context/observe` real-runtime e2e + redacted payload**。
+  - 问题：route + broadcaster 存在，但现有测试主要手动 `publish()`。
+  - 修法：真实 runtime turn 触发 `refreshRuntimeContextState()` 后推送 `assembled`；默认 payload redacted，只给 section ids / budgets / counts / diagnostics，full context 仅 local/debug opt-in。
+  - 验证：`test/context-observe-runtime-e2e.test.ts` 证明 execute one turn → observer receives `assembled`；reconnect gets `assembled_snapshot`。
+
+- [ ] **R5 [P2] — Resume preview as product path**。
+  - 修法：增加 read-only resume preview API 或集成到 inspect/context route；返回 loaded/rebuilt working set、assembled section ids/budgets、live hint subscription state、`hasContinuationSnapshot=false`。
+  - 验证：pre-seeded working-set file returns rebuilt=false；event-tail fixture returns rebuilt=true；不自动 resume provider execution。
+
+- [ ] **R6 [P2] — Go TUI consumes runtime-owned context facts only**。
+  - 修法：订阅 `/v1/working-set/observe` 和 redacted `/v1/context/observe`；展示 working-set version/count、last assembled timestamp、context usage source、unavailable state。
+  - 约束：Go TUI 不自行推导 context truth。
+
+- [ ] **R7 [P1 gate] — Real regression replay gate**。
+  - Fixtures：`session_981cc5c2`、`session_cf361f04`、`session_10320709`。
+  - 断言：不漂到 `/` 或 `~/Library`；有 continuity；storage-backed `contextRecent` 可用；working-set file 创建/更新；resume preview 有 bounded context；observer 收到真实 runtime assembled update。
+
 ## 已收口 Runtime Core
 
 Runtime pipeline 与 hooks 最小内核已收口：prompt parser、provider turn collector、execution metrics builder、provider tool input/message builder、terminal result/error event builder、context blocking helper、loop state / execution state helper、compact/reassemble state refresh helper、provider request assembly / loop guard helper、单 tool call execution helper 和 provider turn outcome reducer 已完成。后续只在真实重复分支继续出现时再补小 helper，避免一次性重写 `LLMCodingRuntime` 主循环。

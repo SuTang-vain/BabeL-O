@@ -18,7 +18,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { resumeSession } from '../src/runtime/sessionResume.js'
-import { PersistedWorkingSetTracker } from '../src/nexus/persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../src/runtime/persistedWorkingSetTracker.js'
 import type { ContextAssemblerOptions } from '../src/runtime/contextAssembler.js'
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {}

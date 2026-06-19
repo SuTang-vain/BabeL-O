@@ -9,8 +9,7 @@ import { PendingPermissionRegistry } from '../shared/session.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../shared/events.js'
 import type { PermissionResolution, SessionPhase, TaskSessionTerminalReason } from '../shared/session.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
-import { extractAbsolutePaths } from '../runtime/LLMCodingRuntime.js'
-import { resolvePromptPath } from '../runtime/systemPromptBuilder.js'
+import { resolvePromptCwd } from '../runtime/systemPromptBuilder.js'
 
 type PermissionDialogEvent = {
   sessionId?: string
@@ -310,23 +309,14 @@ export async function runSessionFlow(
 }
 
 function resolveCliRequestCwd(prompt: string, requestedCwd: string, sessionCwd?: string): string {
-  const explicitCwd = resolveExplicitPromptCwd(prompt)
-  if (explicitCwd) return explicitCwd
+  // Bug 4 (§13.2): delegate to the shared `resolvePromptCwd` so the CLI
+  // path agrees with app.ts Site A and the runtime Site B. Previously
+  // this had a third divergent copy (no dirname fallback, no Bug 1 Layer B
+  // system-dir guard). Sentinel detects "no prompt path won" → fall back.
+  const SENTINEL = '\x00\x01no-prompt-cwd\x00\x01'
+  const resolved = resolvePromptCwd(prompt, SENTINEL)
+  if (resolved !== SENTINEL) return resolved
   return sessionCwd ?? requestedCwd
-}
-
-function resolveExplicitPromptCwd(prompt: string): string | undefined {
-  for (const candidate of extractAbsolutePaths(prompt)) {
-    const resolved = resolvePromptPath(candidate)
-    if (!fs.existsSync(resolved)) continue
-    try {
-      const stat = fs.lstatSync(resolved)
-      if (stat.isDirectory()) return resolved
-    } catch {
-      continue
-    }
-  }
-  return undefined
 }
 
 export const REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT = 'REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT'

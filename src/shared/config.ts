@@ -448,8 +448,10 @@ export class ConfigManager {
   private config: BabelOConfig | null = null;
   private readonly configFile: string;
 
-  constructor(configFile = process.env.BABEL_O_CONFIG_FILE ?? DEFAULT_CONFIG_FILE) {
-    this.configFile = configFile;
+  constructor(options: string | { configFile?: string } = {}) {
+    this.configFile = typeof options === 'string'
+      ? options
+      : options.configFile ?? process.env.BABEL_O_CONFIG_FILE ?? DEFAULT_CONFIG_FILE;
   }
 
   public static getInstance(): ConfigManager {

@@ -49,6 +49,17 @@ export type SessionSnapshot = {
   error?: string
   lastUserInput?: string
 
+  // Bug 2 (context-cwd-drift plan §13.4): the cwd the session was created
+  // under (launcher `body.cwd` / Nexus defaultCwd), written ONCE at session
+  // creation and never overwritten by per-turn `session.cwd` mutations.
+  // Phase B continuity uses this as the immutable reference root so that
+  // `deriveSessionRootContinuity` can pull a drifted requestCwd back to the
+  // project root even when `session.cwd` itself has already drifted (the
+  // session_10320709 failure: turns 2-6 stayed on ~/Library because
+  // session.cwd carried the drift forward). Optional for back-compat with
+  // sessions created before this column existed.
+  originCwd?: string
+
   // Agent Loop & Task Session extensions
   queueId?: string
   parentSessionId?: string

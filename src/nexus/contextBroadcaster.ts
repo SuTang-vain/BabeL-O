@@ -20,10 +20,9 @@
 //   - publish() does not await subscriber callbacks (fire-and-forget).
 //   - publish() short-circuits when there are no subscribers for the cwd.
 //
-// Module-level `defaultContextBroadcaster` is the no-op singleton used by
-// the runtime hot path. Production apps can override via
-// `CreateNexusAppOptions.contextBroadcaster` if they need a different
-// instance (e.g. tests).
+// Module-level `defaultContextBroadcaster` is the legacy no-op instance
+// used by /v1/context/observe when a caller does not inject a broadcaster.
+// Runtime hot paths receive a broadcaster explicitly.
 
 import type { AssembledContext } from '../runtime/contextAssembler.js'
 
@@ -139,24 +138,17 @@ export class ContextBroadcaster {
 }
 
 /**
- * Module-level singleton used by the runtime hot path. In production
- * this is a plain ContextBroadcaster — publish() is a fast Map lookup
- * + no-op fan-out when no WS clients are attached, so the hot path
- * stays cheap.
- *
- * Rebindable via `setDefaultContextBroadcaster` (used by
- * `createNexusApp` when the caller passes `options.contextBroadcaster`,
- * so the runtime hot path and the WS route share the same instance).
- * ESM `let` exports are live bindings, so callers that have already
- * imported this name will see the new instance on their next method
- * call.
+ * Legacy default instance used by /v1/context/observe when no explicit
+ * broadcaster is passed. Production composition roots that need runtime
+ * fan-out should construct one ContextBroadcaster and pass it both to
+ * createDefaultNexusRuntime({ contextBroadcaster }) and createNexusApp({
+ * contextBroadcaster }).
  */
 export let defaultContextBroadcaster: ContextBroadcaster = new ContextBroadcaster()
 
 /**
- * Swap the module-level singleton. Used by `createNexusApp` to wire the
- * runtime hot path and the /v1/context/observe WebSocket route to the
- * same instance. Tests can also call this to inject a mock.
+ * Swap the module-level singleton. Kept for legacy tests / manual
+ * compatibility only; new runtime code should use explicit injection.
  */
 export function setDefaultContextBroadcaster(instance: ContextBroadcaster): void {
   defaultContextBroadcaster = instance

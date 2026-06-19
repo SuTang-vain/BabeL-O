@@ -14,9 +14,9 @@ import { randomUUID } from 'node:crypto'
 import {
   PersistedWorkingSetTracker,
   WORKING_SET_RELATIVE_PATH,
-} from '../src/nexus/persistedWorkingSetTracker.js'
-import { WorkingSetTracker } from '../src/nexus/workingSetTracker.js'
-import type { WorkingSetEntry } from '../src/nexus/workingSetTracker.js'
+} from '../src/runtime/persistedWorkingSetTracker.js'
+import { WorkingSetTracker } from '../src/runtime/workingSetTracker.js'
+import type { WorkingSetEntry } from '../src/runtime/workingSetTracker.js'
 
 function mkEntry(key: string, value: string, confidence = 0.9): WorkingSetEntry {
   return { key, value, updatedAt: new Date().toISOString(), confidence }

@@ -8,7 +8,7 @@ import {
   EVEROS_BACKGROUND_BOOTSTRAP_TIMEOUT_ENV,
   isEverOSBackgroundBootstrapInFlight,
   startEverOSBackgroundBootstrap,
-} from '../src/cli/everosBackgroundBootstrap.js'
+} from '../src/runtime/everosBackgroundBootstrap.js'
 import {
   EVEROS_BOOTSTRAP_VERSION,
   readEverOSBootstrapState,

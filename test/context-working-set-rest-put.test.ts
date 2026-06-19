@@ -11,7 +11,7 @@
 //   - Event bus: working_set_updated emitted on PUT
 //
 // The helper is exported from src/nexus/app.js. The persistence class
-// (PersistedWorkingSetTracker / _2 alias) lives in src/nexus/persistedWorkingSetTracker.ts.
+// (PersistedWorkingSetTracker / _2 alias) lives in src/runtime/persistedWorkingSetTracker.ts.
 // subscribe() is inherited from the base WorkingSetTracker and emits
 // { type: 'working_set_updated', sessionId, workspaceId, ws, timestamp }.
 
@@ -26,7 +26,7 @@ import {
   runWorkingSetPut,
   createNexusApp,
 } from '../src/nexus/app.js'
-import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from '../src/nexus/persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker as PersistedWorkingSetTracker_2 } from '../src/runtime/persistedWorkingSetTracker.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 
 const ORIGINAL_ENV: Record<string, string | undefined> = {}

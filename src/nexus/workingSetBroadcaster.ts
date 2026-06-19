@@ -16,12 +16,12 @@
 // This module is purely additive. Existing REST handlers (PR-11/12/18/20)
 // still create per-request trackers and remain unaffected.
 
-import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../runtime/persistedWorkingSetTracker.js'
 import type {
   WorkingSetEvent,
   WorkingSetEventHandler,
   WorkingSetTracker as WorkingSetTrackerType,
-} from './workingSetTracker.js'
+} from '../runtime/workingSetTracker.js'
 
 export type BroadcasterTracker = {
   tracker: PersistedWorkingSetTracker

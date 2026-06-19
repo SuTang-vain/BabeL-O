@@ -31,8 +31,8 @@
 // hints, assemble at scope=workspace) are out of scope here.
 
 import type { NexusEvent } from '../shared/events.js'
-import type { WorkingSet } from '../nexus/workingSetTracker.js'
-import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
+import type { WorkingSet } from './workingSetTracker.js'
+import type { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
 
 export type ResumeSessionOptions = {
   sessionId: string

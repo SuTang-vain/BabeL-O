@@ -19,8 +19,8 @@ import { join } from 'node:path'
 import {
   WorkingSetTracker,
   type WorkingSet,
-} from '../src/nexus/workingSetTracker.js'
-import { PersistedWorkingSetTracker } from '../src/nexus/persistedWorkingSetTracker.js'
+} from '../src/runtime/workingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../src/runtime/persistedWorkingSetTracker.js'
 
 const SCHEMA_VERSION = '2026-05-21.babel-o.v1'
 

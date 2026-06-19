@@ -39,8 +39,8 @@ import {
   buildSystemPrompt,
   mapEventsToMessages,
 } from '../src/runtime/LLMCodingRuntime.js'
-import { PersistedWorkingSetTracker } from '../src/nexus/persistedWorkingSetTracker.js'
-import { BehaviorMonitor } from '../src/nexus/behaviorMonitor.js'
+import { PersistedWorkingSetTracker } from '../src/runtime/persistedWorkingSetTracker.js'
+import { BehaviorMonitor } from '../src/runtime/behaviorMonitor.js'
 import { ConfigManager } from '../src/shared/config.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import type { AnyTool } from '../src/tools/Tool.js'
