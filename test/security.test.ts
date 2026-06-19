@@ -4,6 +4,10 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { createNexusApp, isLocalHost, validateSecurityConfig } from '../src/nexus/app.js'
+import {
+  isLocalHost as isSharedLocalHost,
+  validateSecurityConfig as validateSharedSecurityConfig,
+} from '../src/shared/security.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import {
   isWorkspacePathError,
@@ -30,6 +34,13 @@ test('validateSecurityConfig throws on non-localhost binds without API Key', () 
 
   assert.throws(() => validateSecurityConfig('0.0.0.0', ''), /Security Error/)
   assert.throws(() => validateSecurityConfig('192.168.1.1', undefined), /Security Error/)
+})
+
+test('shared security helpers match the legacy nexus/app exports', () => {
+  assert.equal(isSharedLocalHost('LOCALHOST'), isLocalHost('LOCALHOST'))
+  assert.equal(isSharedLocalHost('0.0.0.0'), isLocalHost('0.0.0.0'))
+  assert.doesNotThrow(() => validateSharedSecurityConfig('127.0.0.1', undefined))
+  assert.throws(() => validateSharedSecurityConfig('0.0.0.0', undefined), /Security Error/)
 })
 
 test('HTTP API endpoints authentication checks', async () => {

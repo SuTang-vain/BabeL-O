@@ -2,6 +2,22 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-20 — Module Coupling Governance Phase 4A+ Tail Cleanup: shared socket/security utilities
+
+- **背景**: Phase 4A+ 已把 `app.ts` 降到 composition root，但尾部仍留有 utility export：`parseSocketQuery` 已适合 TUI / future WebSocket 复用，`isLocalHost` / `validateSecurityConfig` 是 server security helper，不属于 Nexus app composition root。
+- **实现**:
+  - 新增 `src/shared/security.ts`，承载 `isLocalHost()` 与 `validateSecurityConfig()`。
+  - `src/nexus/app.ts` 改为从 shared re-export 这两个 helper，保留 legacy import path；`src/nexus/server.ts` 直接从 shared 导入启动安全校验，避免启动入口经由 app composition root 取 utility。
+  - 当前树中 `src/shared/socketQuery.ts` 已承载 `parseSocketQuery()`；Phase 4 retrospective 同步标记 D1 closed。
+  - `test/security.test.ts` 增加 shared-vs-legacy parity coverage。
+  - `app.ts` 当前 191 lines；`src/shared/security.ts` 为 10 lines。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-security-slice.json npx tsx --test test/security.test.ts test/socket-query.test.ts test/middleware.test.ts`：37/37 pass。
+  - `npm run coupling:audit`：exit 0；`runtimeToNexus: []` / `nexusToCli: []`；tracked `src/nexus/app.ts` hotspot 191 lines。
+- **边界**:
+  - 不改变 REST / WebSocket contract、auth semantics、security error message、Fastify middleware order、SQLite schema 或 runtime behavior。
+  - 不开始 `LLMCodingRuntime.runExecuteStreamInner` / `RuntimeOrchestrator` 拆分；Phase 3B+ 主循环切片仍是下一条高风险主线。
+
 ## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionWebSocketLifecycle Slice
 
 - **背景**: `ActiveExecutionLease` 收口后，WebSocket `/v1/stream` route 仍直接管理 client close listener、`closedByClient` 状态和 timeout / summary event sender callback。该逻辑属于 WebSocket lifecycle boundary；route 层应只持有 lifecycle tracker 和 event sender，不应内联 listener cleanup 与 open-socket metric 记录细节。

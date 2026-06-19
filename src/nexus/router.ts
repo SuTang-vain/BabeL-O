@@ -2,30 +2,13 @@ import type { FastifyInstance } from 'fastify'
 import type { CreateNexusAppOptions } from './app.js'
 import type { EverCoreStatus } from './everCoreConfig.js'
 import type { NexusMetrics } from './metrics.js'
-import type { EverOSBootstrapErrorCode } from '../shared/everosBootstrapStore.js'
 import type { AgentScheduler } from './agents/types.js'
 
-export type EverOSBootstrapStatusSnapshot = {
-  configured: boolean
-  path: string
-  status: 'not_configured' | 'invalid' | string
-  optedIn?: boolean
-  optedOut?: boolean
-  externalHintShown?: boolean
-  sourceRepo?: string
-  sourceRef?: string
-  sourceCommit?: string
-  sourceDir?: string
-  dataDir?: string
-  managedCommand?: string
-  lastCheckedAt?: string
-  lastBuildAt?: string
-  errorCode?: EverOSBootstrapErrorCode
-  errorMessage?: string
-  autoBootstrapPolicy?: 'off' | 'on' | 'prompt'
-  fallbackBuildTool?: 'uv' | 'pip' | 'none'
-  mcpToolsEnabled?: boolean
-}
+// Re-exported from `bootstrapStatus.ts` so existing callers
+// (routerRegistrar, app.ts, runtimeStatusRouter) keep their imports stable.
+// We also import it locally because FeatureRouterContext references it.
+import type { EverOSBootstrapStatusSnapshot } from './bootstrapStatus.js'
+export type { EverOSBootstrapStatusSnapshot }
 
 export type FeatureRouterContext = {
   options: CreateNexusAppOptions

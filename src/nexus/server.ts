@@ -1,7 +1,8 @@
-import { createNexusApp, validateSecurityConfig } from './app.js'
+import { createNexusApp } from './app.js'
 import { createDefaultNexusRuntime, resolveDefaultStoragePath } from './createRuntime.js'
 import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
+import { validateSecurityConfig } from '../shared/security.js'
 import { defaultEverCoreRuntimeManager } from './everCoreRuntimeManager.js'
 import { ContextBroadcaster } from './contextBroadcaster.js'
 import {
