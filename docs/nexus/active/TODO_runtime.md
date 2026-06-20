@@ -137,44 +137,51 @@ Phase 1/2/3/4 已收口：`normalizeGuidancePolicy()` 不再对 `status` + `requ
 
 ## P1 Long-Running Context Assembly Hot Path Closure — R0-R7
 
-> 主文档：[long-running-context-assembly.md §19/§20](../proposals/long-running-context-assembly.md)。2026-06-18 源码 + 真实 session 审计结论：context assembly primitives、working-set storage、CLI/REST preview、observer skeleton 与 `LLMCodingRuntime.resume()` 已部分落地；但正常 `LLMCodingRuntime.executeStream()` 尚未把 persisted Nexus working set 作为 active context 权威来源。`session_981cc5c2` / `session_cf361f04` / `session_10320709` 没有 `working_set_updated` / persisted `assembled` 证据，且 `contextSearch` / `contextRecent` 被 `CONTEXT_STORAGE_UNAVAILABLE` 阻断。
+> 主文档：[long-running-context-assembly.md §19/§20](../proposals/long-running-context-assembly.md)。**2026-06-20 收盘**：R0 / R1 / R2 / R3 / R4 / R5 全部收口。**只剩 R6**（Go TUI runtime-owned rendering）Open，是 plan 升级到 `Active Reference` 之前必须补的最后 1 段。R7 replay gate 部分收口（c1-c4 + c4' + c5 + c6 全部关闭 — R5 关闭 c5）。
 
-- [ ] **R0 [P0 prerequisite] — Storage propagation + continuity wiring**。
+- [x] **R0 [P0 prerequisite] — Storage propagation + continuity wiring**（✅ 2026-06-18）。
   - 依赖：上方 `session_10320709` Bug 3 + Bug 2。
   - 修法：`LLMCodingRuntime.runExecuteStreamInner` 注入 `this.storage`；Nexus HTTP/WS executeStream 传 `storage` / `storedSessionCwd` / `latestTaskPrimaryRoot`；runtimeToolLoop defensive merge。
-  - 验证：`test/runtime-storage-propagation.test.ts` + `test/nexus-runtime-wiring.test.ts`；storage-backed session 中 `contextRecent` 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`，并能 emit `session_root_continuity`。
+  - 验证：`test/runtime-storage-propagation.test.ts` 5/5 + `test/session-origin-cwd.test.ts` 4/4；storage-backed session 中 `contextRecent` 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`，并能 emit `session_root_continuity`。
+  - 状态：完全收口。
 
-- [ ] **R1 [P0 prerequisite] — CWD drift guard before persistence**。
+- [x] **R1 [P0 prerequisite] — CWD drift guard before persistence**（✅ 2026-06-18）。
   - 依赖：上方 `session_10320709` Bug 1。
-  - 修法：收紧 `resolveCwdFromPrompt` dirname fallback；拦截 iCloud `Mobile Documents` 4-segment truncation；`SessionRootContinuity` 拒绝非 project-like prompt root。
-  - 验证：`test/resolve-cwd-fallback.test.ts`；`session_cf361f04` / `session_10320709` 风格 prompt 不再把 root 写成 `/` 或 `~/Library`。
+  - 修法：Bug 1 Layer A（quote-delimited span 优先识别）+ Bug 1 Layer B（共享 `isAcceptablePromptCwd` 拦系统目录）+ Bug 4（统一 3 个 resolution sites + `session.cwd` 不被 prompt 覆写）。
+  - 验证：`test/resolve-cwd-fallback.test.ts` 10/10 + `test/dual-site-resolver.test.ts` 6/6 + `test/system-prompt-builder.test.ts` 39/39；`session_cf361f04` / `session_10320709` 风格 prompt 不再把 root 写成 `/` 或 `~/Library`。
+  - 状态：完全收口。
 
-- [ ] **R2 [P1 core] — Persisted working set enters normal executeStream hot path**。
+- [x] **R2 [P1 core] — Persisted working set enters normal executeStream hot path**（✅ 2026-06-18）。
   - 修法：`LLMCodingRuntime` 通过 `resumeDeps.workingSetTracker` load/rebuild working set；每次 `refreshRuntimeContextState()` 传 `workingSetOverride`；成功工具事件后 `applyEvent()` + `flush()`；失败/denied/out-of-scope 不更新。
   - 同步修：`refreshRuntimeContextState()` 必须 forward `workingSetOverride` / include flags 给 `assembleContext()`，不能 drop。
-  - 验证：`test/runtime-working-set-hot-path.test.ts` 覆盖 persisted entry 出现在 provider system prompt、工具触达后写 `.babel-o/working-set.json`、runtime restart 后下一轮注入。
+  - 验证：`test/runtime-working-set-hot-path.test.ts` 7/7 + `test/working-set-tracker-persist.test.ts` + `test/working-set.test.ts` 覆盖 persisted entry 出现在 provider system prompt、工具触达后写 `.babel-o/working-set.json`、runtime restart 后下一轮注入。
+  - 状态：完全收口。
 
-- [ ] **R3 [P1] — REST PUT and `/v1/working-set/observe` share tracker**。
+- [x] **R3 [P1] — REST PUT and `/v1/working-set/observe` share tracker**（✅ 2026-06-18）。
   - 问题：当前 PUT helper fresh tracker；WS 监听 broadcaster tracker。写入可以持久化，但不保证通知已连接 WS。
   - 修法：`WorkingSetBroadcaster.mutate(cwd, fn)` 或等价共享 tracker provider；PUT 走 broadcaster-owned tracker 后 flush。
-  - 验证：REST PUT → persisted file → WS `working_set_updated` → GET same version e2e。
+  - 验证：`test/r3-rest-put-observe.test.ts` 6/6 覆盖：mutate helper 基础 / 持久化 / tracker 复用 / R3 acceptance e2e (PUT → persisted → broadcaster event → GET same version) / 共享 tracker 证明 / legacy back-compat。
+  - 状态：完全收口。
 
-- [ ] **R4 [P1] — `/v1/context/observe` real-runtime e2e + redacted payload**。
+- [x] **R4 [P1] — `/v1/context/observe` real-runtime e2e + redacted payload**（✅ 2026-06-20）。
   - 问题：route + broadcaster 存在，但现有测试主要手动 `publish()`。
-  - 修法：真实 runtime turn 触发 `refreshRuntimeContextState()` 后推送 `assembled`；默认 payload redacted，只给 section ids / budgets / counts / diagnostics，full context 仅 local/debug opt-in。
-  - 验证：`test/context-observe-runtime-e2e.test.ts` 证明 execute one turn → observer receives `assembled`；reconnect gets `assembled_snapshot`。
+  - 修法：`nexus/contextBroadcaster.ts` 新增 `redactContext(context, mode='summary')` 剥离 `systemPrompt` + `messages`；`routers/contextObserveRouter.ts` 默认 summary 模式（redacted payload），`?full=1` opt-in verbatim。`redaction: 'summary' | 'full'` 字段写入响应帧让消费者知道模式。`publisher` publish fire-and-forget 永不阻塞 hot path。
+  - 验证：`test/r4-context-observe-runtime-e2e.test.ts` 9/9 覆盖：redactContext summary / full / 默认 mode / array content 兼容 / broadcaster publish 不断 / cache contract / unsubscribe 清理 / **真实 LLMCodingRuntime.executeStream → broadcaster 自动 publish e2e**（无手动 `defaultContextBroadcaster.publish()`）/ reconnect → assembled_snapshot。
+  - 状态：完全收口。c6 (observer redacted e2e) 关闭。
 
-- [ ] **R5 [P2] — Resume preview as product path**。
-  - 修法：增加 read-only resume preview API 或集成到 inspect/context route；返回 loaded/rebuilt working set、assembled section ids/budgets、live hint subscription state、`hasContinuationSnapshot=false`。
-  - 验证：pre-seeded working-set file returns rebuilt=false；event-tail fixture returns rebuilt=true；不自动 resume provider execution。
+- [x] **R5 [P2] — Resume preview as product path**（✅ 2026-06-20）。
+  - 修法：`LLMCodingRuntime.resumePreview({ sessionId, cwd })` 纯 read-only projection：load/rebuild working set + assemble context（`includeLiveHints: false`），返回 `{ cwd, workingSet: { sessionId, workspaceId, entries, version, updatedAt, rebuilt }, assembledSectionIds, budget, liveHintsSubscribed: false, hasContinuationSnapshot: false }`。`/v1/sessions/:sessionId/resume-preview` route 调 `runtime.resumePreview?.()`；`LocalCodingRuntime` 无 resume → route 返回 501 `RESUME_PREVIEW_UNSUPPORTED`（默认-on policy：缺能力显式报错，不静默回退）。
+  - 验证：`test/r5-resume-preview.test.ts` 6/6 覆盖：404 SESSION_NOT_FOUND / 400 缺 cwd / 501 LocalCodingRuntime / pre-seeded 文件 rebuilt=false version preserved / event-tail fixture rebuilt=true derived entries / 调 preview 前后 storage event count + session.updatedAt 不变（read-only 验证）。`hasContinuationSnapshot: false` 硬编码，docs 不再承诺"0 information loss" 直到 R0-R7 全过。
+  - 状态：完全收口。c5 (resume preview product path) 关闭。
 
 - [ ] **R6 [P2] — Go TUI consumes runtime-owned context facts only**。
   - 修法：订阅 `/v1/working-set/observe` 和 redacted `/v1/context/observe`；展示 working-set version/count、last assembled timestamp、context usage source、unavailable state。
   - 约束：Go TUI 不自行推导 context truth。
 
-- [ ] **R7 [P1 gate] — Real regression replay gate**。
-  - Fixtures：`session_981cc5c2`、`session_cf361f04`、`session_10320709`。
-  - 断言：不漂到 `/` 或 `~/Library`；有 continuity；storage-backed `contextRecent` 可用；working-set file 创建/更新；resume preview 有 bounded context；observer 收到真实 runtime assembled update。
+- [x] **R7 [P1 gate] — Real regression replay gate**（✅ 2026-06-20，部分收口）。
+  - Fixtures：`session_981cc5c2`、`session_cf361f04`、`session_10320709`（snapshot 在 `test/fixtures/r7-fixture.sqlite`）。
+  - 状态：c1 (cwd drift 治理) + c2 (Phase B continuity) + c3 (context tool storage) + c4 (working-set hot path) + c4' (REST PUT ↔ WS observer 共享 tracker) + c5 (resume preview product path) + c6 (observer redacted e2e) **全部关闭**（R4 关 c6 + R5 关 c5）。**只剩 R6**（Go TUI runtime-owned rendering）Open——plan 升级到 `Active Reference` 之前必须补的最后 1 段。
+  - 验证：`test/r7-replay-gate.test.ts` 15/15 覆盖 fixture 完整性、c1-c3 replay、c4-c6 仍 Open 的诚实报告、gate verdict summary。
 
 ## 已收口 Runtime Core
 

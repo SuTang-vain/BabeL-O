@@ -18,6 +18,53 @@
   - 不改变 REST / WebSocket contract、auth semantics、security error message、Fastify middleware order、SQLite schema 或 runtime behavior。
   - 不开始 `LLMCodingRuntime.runExecuteStreamInner` / `RuntimeOrchestrator` 拆分；Phase 3B+ 主循环切片仍是下一条高风险主线。
 
+## 2026-06-20 — Long-Running Context Assembly R6 Closure: Go TUI runtime-owned context rendering
+
+- **背景**: long-running-context-assembly.md 的 R0-R5/R7 全部收口后，R6 是 plan 升级到 `Active Reference` 之前的最后一段。R6 acceptance 要求 Go TUI 只消费 runtime-owned 观察事实，永远不从 TUI 自身派生 context truth，并在 5 条状态机路径（observer absent / late connect / reconnect / schema mismatch / partial payload）上提供 fallback 文案，而不是让 LLM 模型用它的 narration 反推 context 数据。
+- **实现 (5 子切片)**:
+  - **R6-a `clients/go-tui/internal/loop/api/context_observer.go`** (335 lines): client-side WS subscriber `Client.ObserveContext(ctx, cwd, sessionID, opts) → events / errs / closeFn / err`，typed payload schema：`AssembledSnapshotMsg` / `AssembledMsg` / `ContextObserverError` 加 `AssembledContextEnvelope` 持 `ContextRedactionSummary` + `SystemPromptBlocks` + token estimates；`ContextObserveOpts.RedactionMode` 默认空（server summary 模式）/ `"full"` 注入 `?full=1`。镜像 `working_set_observer.go` 模式：单 reader goroutine、idempotent `closeFn`、forward-compat unknown frame type 处理。
+  - **R6-b `clients/go-tui/internal/loop/context_observer.go`** (372 lines): loop-level `ContextObserver` + tea.Cmd plumbing。复用 PR-17c/B1 的 `BackoffState`（2s→5s→15s）；`Start` / `ConnectCmd` / `ReconnectCmd`；msg types `ctxObserverConnectMsg` / `ctxObserverReconnectMsg` / `ctxObserverEventMsg` / `ctxObserverErrMsg`；observer handle registry 与 ws_observer.go 隔离避免互扰。
+  - **R6-c model wiring**: `interactive.go` 新增 `ctxObserver *ContextObserver` + `ctxObservation map[string]ContextObservation` + `ctxObservationMu sync.Mutex`；`NewInteractiveModelWithContextObserver()` factory；Init() 调 `ctxObserver.Start()`；Update switch 接入 4 种 ctxObserver msg。Helper：`applyCtxObservationFrame()`（observer-driven 唯一写入路径）/ `markCtxObservationDisconnected()` / `GetCtxObservation()` / `FormatCtxObservationLine()`（5 路径文案：not observed / connected · chars · msgs · blocks (cacheable) / reconnecting (err) / full mode (debug) / connected (no frame yet)）。
+  - **R6-d focused tests**: `api/context_observer_test.go` 7 个 transport tests（snapshot+assembled / error frame / close idempotent / null context snapshot / sessionId query param / full mode query param / unknown frame recovery）；`loop/context_observer_test.go` 7 个 state-machine tests with 15 subcases（S1 not-observed / S2 late-connect / S3 reconnect 替换 stale state / S4 schema mismatch 三种子情形 / S5 partial payload 两种 fallback / backoff 序列 2s→5s→15s+cap+Reset / formatThousands helper）。
+  - **R6-e doc sync**: `docs/nexus/proposals/long-running-context-assembly.md` 顶部状态行升级为 R0-R7 全部收口、剩余项块从 6 项 🔴/🟠/🟡 改为 ✅、R6 在 §20 P1 Watch list 标记 "[2026-06-20 已收口]"、修复 line 1124-1126 R6/R7 编号重复。本 plan 现等待 governance 把它从 `proposals/` 迁移到 `reference/` 后即可正式升级为 `Active Reference`（独立 doc lifecycle slice，不阻塞功能闭环）。
+- **runtime-owned 契约**: renderer 永远不从模型自身状态推导 context truth；frame 永远不到时显示 `context: not observed`；server 一旦发 `redaction:"full"`，loop 仍 fallback 到 `context: full mode (debug)` 而不是显示 verbatim prompt；error frame 进来后 status 翻 disconnected、`LastError` 被记录用于诊断、renderer 显示 `reconnecting` 而不是反向推导。
+- **验证**:
+  - `cd clients/go-tui && go build ./...`：clean。
+  - `cd clients/go-tui && go test ./internal/loop/api/ -run TestObserveContext -v`：7/7 pass。
+  - `cd clients/go-tui && go test ./internal/loop/ -run TestR6 -v`：7 top-level tests + 15 subcases 全部 pass。
+  - `cd clients/go-tui && go test ./...`：全套 4 packages（loop / loop/api / notifications / tui）全部 pass。
+  - `npm run docs:check`：green（line 3 仍是 `> State: Partially Landed`，符合 proposal 文档生命周期约束；plan 升级到 `Active Reference` 需独立 doc-governance slice 把文件迁到 `reference/` 目录）。
+- **边界**:
+  - 不改变 `/v1/context/observe` 的 server-side 路由 / redaction policy / payload schema。
+  - 不改变 working-set observer (PR-17c/B1) 的现有 wiring；两个 observer 共享 `BackoffState` 类型但 handle registry 完全隔离。
+  - Bubble Tea 程序的现有 wsObserver 启动 / lifecycle 完全保留；ctxObserver 是叠加而非替换。
+  - 不引入新 CLI flag；observer 默认开启（与 PR-17c/B1 同政策）。
+  - 不改变 SQLite / REST / WebSocket / event schema、不改变 redaction summary 字段集合。
+
+## 2026-06-19 — Module Coupling Governance Phase 3B+ Helper Extraction Pull (3B-1 / 3B-6 / 3B-7 / 3B-8)
+
+- **背景**: Phase 3B+ 已抽出 3 个 strategy class（`ContextRefreshStrategy` / `ProviderTurnDriver` / `ToolDispatchPipeline`），但 `LLMCodingRuntime` 主循环仍持有四块"非 orchestration、可纯函数化"的逻辑：(1) NexusEvent → provider message 翻译，(2) behavior-trace tap 包装 async generator，(3) R2 working-set 读取侧（含 storage rebuild fallback），(4) R2 working-set 写入侧（fire-and-forget per-event apply）。这四块都不参与主循环 25 步的 yield/refresh/compact 顺序，可独立抽出并单测，不破坏 R2 wiring-guard 契约（`test/runtime-working-set-hot-path.test.ts` 要求 `LLMCodingRuntime.prototype.loadWorkingSetOverride` / `applyWorkingSetUpdate` 仍是 function）。
+- **实现 (4 个 slice)**:
+  - **3B-1 `eventsTranslator.ts`** (332 lines): `mapEventsToMessages` 纯函数 + `assistant_delta` / `tool_completed` / `tool_denied` / `usage` / `result` / `error` / `permission_*` 的 if/else 翻译链；`LLMCodingRuntime` re-export 保留 backward-compat。`test/events-translator.test.ts`：14 tests。
+  - **3B-6 `behaviorTraceTap.ts`** (175 lines): `wrapWithBehaviorTraceTap()` async-generator tap + `behaviorTraceDetectionKey()` helper；保留 nexus 5min 检测窗口与 BehaviorMonitor wiring。`test/behavior-trace-tap.test.ts`：6 tests。
+  - **3B-7 `loadWorkingSetOverride.ts`** (118 lines): R2 read-side override loader，处理 tracker undefined / 空 tracker / storage rebuild fallback / out-of-cwd 过滤；`LLMCodingRuntime` 用 thin-delegate method 保留 R2 wiring-guard。`test/load-working-set-override.test.ts`：8 tests。
+  - **3B-8 `applyWorkingSetUpdate.ts`** (83 lines): R2 write-side per-event apply，fire-and-forget；只处理 `tool_started` 事件，跨 cwd / 无 path input 由 `tracker.applyEvent` 内部过滤；`LLMCodingRuntime` 用 thin-delegate method 保留 R2 wiring-guard。`test/apply-working-set-update.test.ts`：7 tests。
+  - 净效果：`src/runtime/LLMCodingRuntime.ts` 1841 → 1620 行（**-221 行 / -12.0%**），新增 4 个独立模块共 708 行，新增 4 个测试文件共 35 个 focused test。
+- **R2 wiring-guard 契约保留**: `test/runtime-working-set-hot-path.test.ts` 中 `proto['loadWorkingSetOverride']` / `proto['applyWorkingSetUpdate']` typeof 'function' 断言通过；`runtimePipeline forwards workingSetOverride to assembleContext` 断言通过；R2 4 scenarios + scenario 5 + 2 wiring 共 7/7 pass。
+- **验证**:
+  - `npx tsc --noEmit -p tsconfig.json`：3B-8 模块本身和 LLMCodingRuntime 引用均无错误（`test/r5-resume-preview.test.ts(347,13)` 一个 R5 自身遗留不影响 3B-8）。
+  - `npm test`：1147/1147 pass（无新失败）。
+  - `npm run docs:check`：green（修回 long-running-context-assembly.md `> State: Partially Landed` bare 形式）。
+  - `npm run coupling:audit`：exit 0；`runtimeToNexus: []` / `nexusToCli: []`。
+  - `npm run format:check` / `npm run deps:audit`：exit 0。
+  - `npm run build:smoke`：exit 0；`bbl run hello` 4615ms。
+- **边界**:
+  - 不改变 R2 hot-path 行为（loadWorkingSetOverride / applyWorkingSetUpdate 调用点 + 频次 + 参数完全一致）。
+  - 不改变 mapEventsToMessages 的事件翻译顺序与字段语义；adapter 端可见 message 数组 byte-identical。
+  - 不改变 behavior-trace tap 的检测窗口语义（仍是 5 min nexus）或 BehaviorMonitor wiring。
+  - 不改变 storage / SQLite schema、REST/WS 契约、tool result envelope。
+  - `LLMCodingRuntime` 主循环 25 步 orchestration（`yield buildXxxEvent` / `refreshRuntimeContextState` / `compactSession` / `previousEvents.push`）仍在原处；下一步切 `runExecuteStreamInner` 主体属于高风险区。
+
 ## 2026-06-19 — Module Coupling Governance Phase 4A+: ExecutionWebSocketLifecycle Slice
 
 - **背景**: `ActiveExecutionLease` 收口后，WebSocket `/v1/stream` route 仍直接管理 client close listener、`closedByClient` 状态和 timeout / summary event sender callback。该逻辑属于 WebSocket lifecycle boundary；route 层应只持有 lifecycle tracker 和 event sender，不应内联 listener cleanup 与 open-socket metric 记录细节。

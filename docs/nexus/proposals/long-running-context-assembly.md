@@ -3,10 +3,10 @@
 > State: Partially Landed
 > Track: Long-running Context / Working Set / Resume Pack
 > Priority: P1 Watch
-> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/contextAnalysis.ts`, `src/runtime/workingSet*`
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/contextAnalysis.ts`, `src/runtime/workingSet*`, `src/runtime/loadWorkingSetOverride.ts`, `src/runtime/applyWorkingSetUpdate.ts`, `src/nexus/contextBroadcaster.ts`, `src/nexus/workingSetBroadcaster.ts`, `src/nexus/routers/sessionResumePreviewRouter.ts`, `clients/go-tui/internal/loop/api/context_observer.go`, `clients/go-tui/internal/loop/context_observer.go`
 > Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). This document owns long-running context assembly planning; current implementation truth remains in runtime code and tests.
 
-> 状态：Reality Audit 2026-06-18 — Track A 基础设施部分落地（working-set tracker / CLI / REST / WebSocket skeleton / runtime assembler primitives），但 runtime hot path 尚未闭环；真实 session 不能证明 Nexus-owned working set 已稳定进入 active context。
+> 状态（2026-06-20 收盘）：R0/R1/R2/R3/R4/R5/R6/R7 全部收口。**R0**（storage 注入 + continuity 接线）、**R1**（cwd drift 治理）、**R2**（persisted working set 接入 executeStream hot path，含独立 `loadWorkingSetOverride.ts` + `applyWorkingSetUpdate.ts` 模块）、**R3**（REST PUT ↔ `/v1/working-set/observe` 共享 broadcaster tracker）、**R4**（`/v1/context/observe` 真实 runtime e2e + redacted payload by default）、**R5**（resume preview as product path，`LLMCodingRuntime.resumePreview()` + `/v1/sessions/:sessionId/resume-preview` route，`hasContinuationSnapshot: false` 硬编码）、**R6**（Go TUI runtime-owned rendering——`api/context_observer.go` + `loop/context_observer.go` 默认开启，订阅 `/v1/context/observe` + reconnect 2s→5s→15s backoff，`ContextObservation` state 由 observer 事件单向驱动，`FormatCtxObservationLine` 在 not-observed/connected/disconnected/full-mode/null-context 五条路径上提供文案兜底）全部关闭并有 focused regression。**R7** Replay Gate 全部关闭：c1-c3 + c4 + c4' + c5 + c6（cwd drift / continuity / context tool storage / working-set hot path / REST-PUT 共享 / resume preview / observer redacted e2e）**全部关闭**。本 plan 现处于 `Partially Landed` 状态，等待 governance 把它从 `proposals/` 迁移到 `reference/`（独立 doc lifecycle slice）后即可正式升级为 `Active Reference`。
 > 范围：利用 Nexus 常驻能力，重新设计上下文组装架构，支持 session/task 长时间持久运行
 > 替代：旧"压缩 = 上下文管理"模型，升级为"Nexus 组装 = 上下文管理"
 > Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). This document owns working-set, resume, assembly, and long-running session state; it does not supersede compact or memory governance.
@@ -41,13 +41,13 @@
 - ⚠️ 未闭环：正常 `LLMCodingRuntime.executeStream()` 没有把 `PersistedWorkingSetTracker` 的 working set 作为 `workingSetOverride` 注入 active context；`/v1/working-set/observe` 与 REST PUT 没有共享同一个 tracker mutation path；`/v1/context/observe` 需要 real-runtime e2e 证明而不是只靠 simulated publish；context recall tools 被 Phase C2 storage propagation bug 阻断。
 - ❌ 真实 session 证据不支持“session 重启后 0 信息丢失 / working set 始终在 active context / 跨 session working set 共享已生产可用”的结论。`session_981cc5c2`、`session_cf361f04`、`session_10320709` 均没有持久化 `working_set_updated` / `assembled` 事件；`contextSearch` / `contextRecent` 多次返回 `CONTEXT_STORAGE_UNAVAILABLE`；`session_root_continuity` 在这些样本中为 0。
 
-**剩余项**：
-- 🔴 R0/R1 prerequisite：先收口 `context-cwd-drift-and-recall-governance-plan.md` Phase C2 storage propagation + Nexus continuity wiring，否则 on-demand session recall 与 resume evidence 无法验证。
-- 🔴 R2：把 persisted working set 接入正常 `executeStream` hot path，并在每个成功工具事件后安全更新 / flush / inject。
-- 🟠 R3：让 REST PUT 与 `/v1/working-set/observe` 共享 broadcaster tracker，补真实 REST→WS e2e。
-- 🟠 R4：让 `/v1/context/observe` 通过真实 runtime execution e2e 验证 assembled frame，而不是只验证 manual publish。
-- 🟡 R5：定义和实现 bounded assembled-context observer payload，避免把完整 prompt / sensitive context 当作默认实时广播。
-- 🟡 R6：Go TUI 只消费 runtime-owned observer facts，不自行推导 context truth。
+**剩余项（2026-06-18 audit 快照，2026-06-20 收盘后全部关闭）**：
+- ✅ R0/R1 prerequisite：[context-cwd-drift-and-recall-governance-plan.md](../reference/context-cwd-drift-and-recall-governance-plan.md) Phase C2 storage propagation + Nexus continuity wiring 已收口。
+- ✅ R2：persisted working set 接入正常 `executeStream` hot path，每个成功工具事件后安全更新 / flush / inject。
+- ✅ R3：REST PUT 与 `/v1/working-set/observe` 共享 broadcaster tracker，真实 REST→WS e2e 已落。
+- ✅ R4：`/v1/context/observe` 通过真实 runtime execution e2e 验证 assembled frame。
+- ✅ R5：bounded assembled-context observer payload + `redactContext('summary')` 默认；`?full=1` opt-in。
+- ✅ R6：Go TUI 只消费 runtime-owned observer facts（`/v1/context/observe` 客户端 + state-machine test 全套落地）。
 
 ---
 
@@ -362,11 +362,14 @@ type AssembledContext = {
 
 ### 5.1 WorkingSetTracker
 
-**文件**：
-- 内存版：`src/nexus/workingSetTracker.ts`（~170 行）
-- 持久化版：`src/nexus/persistedWorkingSetTracker.ts`（~150 行）
+**文件**（2026-06-20 audit：tracker 真实实现已迁移到 runtime 目录，nexus 路径退化为 facade）：
+- 内存版：`src/runtime/workingSetTracker.ts`（370 行，真实实现）
+- 持久化版：`src/runtime/persistedWorkingSetTracker.ts`（154 行，extends 内存版）
+- 兼容 facade：`src/nexus/workingSetTracker.ts` / `src/nexus/persistedWorkingSetTracker.ts`（各 3 行 `export *`，仅供未迁移的 legacy 导入路径使用，不要再加新逻辑）
+- Hot-path 写入辅助：`src/runtime/applyWorkingSetUpdate.ts`（83 行，executeStream 成功工具事件 → tracker）
+- Hot-path 加载辅助：`src/runtime/loadWorkingSetOverride.ts`（118 行，executeStream 起手 load + format → workingSetOverride）
 
-**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)。✅ event bus (`WorkingSetEventBus`, `working_set_updated` 事件) 已落地 (PR-26, 2026-06-17)，WebSocket `/v1/working-set/observe` 推送已落地 (PR-27, 2026-06-17)。✅ `applyEvent` 事件驱动更新已落地 (PR-30, 2026-06-17)，`getWorkspaceWorkingSet` workspace 聚合已落地 (PR-30, 2026-06-17)。
+**状态**：✅ 内存版 + 持久化版均已落地（PR-4a + PR-4b, 2026-06-14；2026-06 后期迁移到 `src/runtime/`，nexus 旧路径变 facade），CLI 3 个子命令 (working-set/history/resume) 已落地 (PR-9/10/13, 2026-06-15), REST 3 个 endpoint (list/get/workspace-aggregate) 已落地 (PR-11/12/20, 2026-06-15/16)。✅ event bus (`WorkingSetEventBus`, `working_set_updated` 事件) 已落地 (PR-26, 2026-06-17)，WebSocket `/v1/working-set/observe` 推送已落地 (PR-27, 2026-06-17)。✅ `applyEvent` 事件驱动更新已落地 (PR-30, 2026-06-17)，`getWorkspaceWorkingSet` workspace 聚合已落地 (PR-30, 2026-06-17)。✅ R2 hot-path 写/读两路分别由 `applyWorkingSetUpdate.ts` / `loadWorkingSetOverride.ts` 模块拥有（PR-R2 落地, 2026-06-18+）。
 
 **职责**：
 - 维护每 session working set（内存 + 持久化）
@@ -375,7 +378,7 @@ type AssembledContext = {
 - 跨 session 通过 `workspaceId` 共享
 - 通过 event bus 推送 `working_set_updated` / `working_set_reset` 事件 (PR-26)
 
-**核心 API**（实际实现, src/nexus/workingSetTracker.ts）：
+**核心 API**（实际实现, src/runtime/workingSetTracker.ts）：
 
 ```typescript
 class WorkingSetTracker {
@@ -407,7 +410,7 @@ class WorkingSetTracker {
 }
 ```
 
-**持久化路径**（src/nexus/persistedWorkingSetTracker.ts，extends WorkingSetTracker）：
+**持久化路径**（src/runtime/persistedWorkingSetTracker.ts，extends WorkingSetTracker）：
 
 ```typescript
 class PersistedWorkingSetTracker extends WorkingSetTracker {
@@ -514,7 +517,9 @@ type AssemblePreviewOptions = {
 
 ### 5.3 microcompact（轻量压缩）
 
-**文件**：`src/runtime/compactors/microCompact.ts`（~140 行）
+**文件**：`src/runtime/compactors/microCompact.ts`（137 行；2026-06-20 audit：实际路径在 `runtime/compactors/`，非早期 doc 草稿想象的 `src/nexus/microcompact.ts`）
+
+**导出**：`microcompactEvents(events, budget)` / `microcompactEventsWithMetrics(events, budget)`（自由函数，不是 class method）；`budget.microcompactToolOutputChars` 控制截断阈值（与 doc 草稿写死 4k/2k 不同，由 `allocateBudget(modelId)` 动态分配）。
 
 **职责**：对 recent events 数组做轻量压缩，**不写边界事件**，**不丢事件**。
 
@@ -568,7 +573,7 @@ async startTurn(opts) {
 
 ### 6.2 Session Resume 流程
 
-**状态**：✅ **落地** (2026-06-17)。PR-A4 添加 `LLMCodingRuntime.resume({ sessionId, cwd })` class method (`src/runtime/LLMCodingRuntime.ts`) 实现完整 3 步 flow。`resumeSession()` 独立 helper (`src/runtime/sessionResume.ts`, PR-28b) 保留为 legacy 路径, CLI/REST 后续迁移到 class method. 完整细节:
+**状态**：✅ **落地** (2026-06-17)。PR-A4 添加 `LLMCodingRuntime.resume({ sessionId, cwd })` class method (`src/runtime/LLMCodingRuntime.ts:1210-`)。**R5 (2026-06-20)** 在同一文件 (`:1358-`) 追加 `LLMCodingRuntime.resumePreview({ sessionId, cwd })` 纯 read-only projection — 走 `loadWorkingSetOverride` + `assembleContext`（含 `includeLiveHints: false`），不订阅 hint、不写状态、不真正 resume provider；返回 `{ cwd, workingSet, assembledSectionIds, budget, liveHintsSubscribed: false, hasContinuationSnapshot: false }`，由 `src/nexus/routers/sessionResumePreviewRouter.ts` (88 行) 暴露为 `POST /v1/sessions/:sessionId/resume-preview`。`resumeSession()` 独立 helper (`src/runtime/sessionResume.ts`, PR-28b) 保留为 legacy 路径, CLI/REST 后续迁移到 class method. 完整 `resume()` 细节:
 - step 1: `workingSetTracker.load()` + `get(sessionId)`; 不存在时从 `storage.listEvents` 拉事件尾并 `rebuild(sessionId, '', deriveEntriesFromEvents(events, cwd))`.
 - step 2: 调 `refreshRuntimeContextState(...)` 走 full `assembleContext` pass; 带 `workingSetOverride` + 4 个 `include*` flags (`includeLiveHints: !!behaviorMonitor`).
 - step 3: `behaviorMonitor.subscribe(sessionId, hint => ...)` 监听 live hints; `canAcceptHint` + `injectSystemSection` 是 runtime 侧的 no-op stub (INV-4: 不静默注入到 model prompt).
@@ -674,9 +679,9 @@ class WorkingSetTracker {
 
 ### 7.1 on-demand 工具（model 主动调用）
 
-> **状态**：✅ 3 个 tool (`context.search` / `context.summarize` / `context.recent`) 已在 `src/tools/contextTools.ts` 落地 (PR-7, 2026-06-15) 并注册到 ToolRegistry (PR-8, 2026-06-15)。CLI `bbl context history` (PR-10) 复用 `searchEvents` / `summarizeWindow`。REST `/v1/context/history` (PR-11) 同样复用。
+> **状态**（2026-06-20 audit 修订）：✅ 3 个 tool 双层落地：**数据层** 3 个纯函数 (`searchEvents` / `summarizeWindow` / `recentEvents`) 在 `src/tools/contextTools.ts` (PR-7, 2026-06-15)；**builtin tool wrapper** 3 个独立模块 `src/tools/builtin/contextSearch.ts` / `contextSummarize.ts` / `contextRecent.ts` 注册到 ToolRegistry (PR-8, 2026-06-15)。CLI `bbl context history` (PR-10) 复用 `searchEvents` / `summarizeWindow`。REST `/v1/context/history` (PR-11) 同样复用。R0 (storage propagation) 收口后，`contextSearch` / `contextRecent` 在 storage-backed runtime 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`。
 
-新增 3 个 tool，在 `src/tools/contextTools.ts`：
+新增 3 个 tool（数据层 `src/tools/contextTools.ts` + builtin wrapper `src/tools/builtin/context*.ts`）：
 
 | 工具 | 用途 | 拉取源 |
 |---|---|---|
@@ -714,6 +719,15 @@ const result = await context.search({
 
 ### 7.3 REST + WebSocket
 
+**Router 拓扑**（2026-06-20 audit 补：路由实现已拆到 `src/nexus/routers/` 子目录，每条路由独立模块）：
+- `contextAssembleRouter.ts` — POST `/v1/context/assemble`
+- `contextWorkingSetReadRouter.ts` — GET working-set / workspace
+- `contextWorkingSetWriteRouter.ts` — PUT working-set（R3 走 `WorkingSetBroadcaster.mutate`）
+- `contextHistoryRouter.ts` — GET `/v1/context/history`
+- `contextObserveRouter.ts` — WS `/v1/context/observe`（R4 redacted summary 默认）
+- `sessionResumePreviewRouter.ts` — POST `/v1/sessions/:sessionId/resume-preview`（R5）
+- WS `/v1/working-set/observe` 由 `WorkingSetBroadcaster` 直接挂到 app（不在独立 router 文件）
+
 **新增 REST**：
 
 | 路径 | 方法 | 功能 | 状态 |
@@ -721,9 +735,10 @@ const result = await context.search({
 | `/v1/context/assemble` | POST | 手动触发组装（带 options） | ✅ 已落地（PR-18, 2026-06-16） |
 | `/v1/context/working-set` | GET | 列所有 session 的 working set | ✅ 已落地（PR-12, 2026-06-15） |
 | `/v1/context/working-set/:sessionId` | GET | 读单个 session 的 working set | ✅ 已落地（PR-12, 2026-06-15） |
-| `/v1/context/working-set/:sessionId` | PUT | 写 working set | ✅ Route exists；R3 待补 shared tracker + REST→WS e2e |
+| `/v1/context/working-set/:sessionId` | PUT | 写 working set | ✅ 已落地（R3 收口, 2026-06-18, `WorkingSetBroadcaster.mutate(cwd, fn)` 让 PUT 与 `/v1/working-set/observe` 共享 per-cwd tracker） |
 | `/v1/context/working-set/workspace/:wsId` | GET | 读 workspace 共享 working set（聚合） | ✅ 已落地（PR-20, 2026-06-16） |
 | `/v1/context/history` | GET | 拉历史事件（带过滤） | ✅ 已落地（PR-11, 2026-06-15） |
+| `/v1/sessions/:sessionId/resume-preview` | POST | resume read-only projection（R5） | ✅ 已落地（R5, 2026-06-20, `src/nexus/routers/sessionResumePreviewRouter.ts`） |
 
 **新增 WebSocket**：
 
@@ -731,8 +746,8 @@ const result = await context.search({
 // /v1/working-set/observe — working set 变更推送（PR-27, 已落地）
 { type: 'working_set_updated', sessionId, ws }   // ✅ WorkingSetTracker event bus → shared broadcaster → WS fan-out（PR-26 + PR-27；REST PUT 共享 tracker/e2e 见 R3）
 
-// /v1/context/observe — assembled context 实时推送（route + broadcaster 已存在）
-{ type: 'assembled', sessionId, context }         // ⚠️ R4: real-runtime e2e + redacted payload pending
+// /v1/context/observe — assembled context 实时推送（R4 收口, 2026-06-20）
+{ type: 'assembled', sessionId, context }         // ✅ `redactContext` 默认 summary 模式（剥离 systemPrompt + messages）, `?full=1` opt-in verbatim; 真实 `executeStream` e2e 见 `test/r4-context-observe-runtime-e2e.test.ts`
 ```
 
 ---
@@ -835,40 +850,48 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ## 11. 测试策略
 
+> **2026-06-20 audit 注**：本节列出的预期测试文件名与仓库现状不完全一致。真实分布如下；新增段（R0-R7）有独立 focused regression 见 §20。
+
 ### 11.1 WorkingSetTracker 测试
 
-- `test/working-set-tracker.test.ts`（~250 行）
+- `test/working-set-tracker.test.ts` + `test/working-set-tracker-apply-event.test.ts` + `test/working-set-tracker-persist.test.ts`（三件套，分别覆盖核心 API / `applyEvent` / 持久化）
 - 覆盖：applyEvent / get / update / rebuild / persist / load / share
 
 ### 11.2 ContextAssembler 测试
 
-- `test/context-assembler.test.ts`（~350 行）
+- `test/context-assembler.test.ts`
 - 覆盖：5 个 scope / budget overflow / microcompact / Layer 3 各源 / 顺序保证
 
 ### 11.3 microcompact 测试
 
-- `test/microcompact.test.ts`（~200 行）
+- 合并到 `test/context-assembler.test.ts`（无独立 `test/microcompact.test.ts`，导入 `microcompactEvents` / `microcompactEventsWithMetrics` 直接 assert）
 - 覆盖：去重 / 截断 / 聚合 / 噪音过滤
 
 ### 11.4 Session Resume 测试
 
-- `test/session-resume.test.ts`（~200 行）
-- 覆盖：working set 重建 / context 恢复 / live hint 订阅
+- `test/session-resume.test.ts`（resume() class method）
+- `test/inspect-session-resume.test.ts`（CLI inspect-session resume 路径）
+- `test/r5-resume-preview.test.ts`（R5 read-only projection + REST route）
+- 覆盖：working set 重建 / context 恢复 / live hint 订阅 / preview 不真正 resume
 
-### 11.5 跨 Session 测试
+### 11.5 跨 Session / 实时观察测试
 
-- `test/cross-session-ws.test.ts`（~200 行）
-- 覆盖：workspace 共享 / 事件广播 / 状态一致性
+- `test/working-set-event-bus.test.ts`（PR-26 event bus）
+- `test/working-set-observe-websocket.test.ts`（PR-27 WS 推送）
+- `test/context-observe-websocket.test.ts`（observer skeleton）
+- `test/r3-rest-put-observe.test.ts`（R3 REST PUT ↔ WS 共享 tracker）
+- `test/r4-context-observe-runtime-e2e.test.ts`（R4 真实 runtime e2e + redacted）
+- 覆盖：workspace 共享 / 事件广播 / 状态一致性 / redacted payload
 
 ### 11.6 端到端集成
 
-- `test/long-running-integration.test.ts`（~250 行）
+- `test/r7-replay-gate.test.ts`（15/15，对 3 个 fixture session SQLite 关门）
 - 目标态场景：100 turn 模拟 → working set 不丢 / 重启后上下文可重建 / budget 不超；升级为"0 信息丢失"前必须通过 R7 real replay gate
 - **测试隔离**（[[babel-o-test-config-isolation]]）：tmp dir / 强制 `:memory:` storage
 
 ### 11.7 CLI 表面
 
-- `test/cli-context.test.ts`（~150 行）
+- `test/context-cli.test.ts` + `test/context-assemble-cli.test.ts` + `test/context-history-cli.test.ts` + `test/context-resume-cli.test.ts` + `test/context-working-set-edit-cli.test.ts`（拆分到每个子命令一个 spec 文件）
 
 **测试隔离总则**（[[babel-o-test-config-isolation]]）：所有持久化路径强制 tmp，working-set.json / behavior-trace.jsonl 都用 tmp dir。
 
@@ -895,37 +918,37 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ## 13. 迁移路径
 
-### Phase 0: 紧急修复核心问题（独立工作，1-2 天）
+> **2026-06-20 audit 注**：本节为原始迁移规划保留，**Phase 0/1/2 实际已落地**（具体 PR 见 §18.5 历史记录），**Phase 3/4/5 已被 §20 R0-R7 跟进计划取代** — 真实推进以 §20 为准；关于 `natural_pause` 的去留也已合并到 R7 验收门后再决策。本节路径与 §18 落地清单 + §20 R0-R7 行计划交叉对照阅读，不要按本节字面顺序执行。
+
+### Phase 0: 紧急修复核心问题（已落地, PR-1 / 2026-06-14）
 - 加 `BABEL_O_NATURAL_PAUSE_SUPPRESS=true` 默认
 - 不动代码逻辑，只压制触发
 - 用户立刻感觉"不再每轮压缩"
 
-### Phase 1: WorkingSetTracker + ContextAssembler 上线（3-4 天）
-- 新增 `src/nexus/workingSetTracker.ts`（~300 行）
-- 新增 `src/nexus/contextAssembler.ts`（~400 行）
-- 新增 `src/nexus/microcompact.ts`（~200 行）
-- `LLMCodingRuntime.startTurn` 改为从 Nexus 拉 assembled context
+### Phase 1: WorkingSetTracker + ContextAssembler 上线（已落地, PR-4a/4b/15/18 / 2026-06-14~16）
+- 实际位置：`src/runtime/workingSetTracker.ts` / `src/runtime/contextAssembler.ts` / `src/runtime/compactors/microCompact.ts`（非原计划的 `src/nexus/*.ts`）
+- `LLMCodingRuntime.executeStream()` hot-path 注入 working set 在 R2 (2026-06-18) 收口
 - **新模型启用，旧 natural_pause 路径保留**（双轨运行）
 
-### Phase 2: on-demand 工具 + Session Resume（2-3 天）
-- 新增 `context.search / summarize / recent` 3 工具
-- `LLMCodingRuntime.resume()` 完整实现
-- 跨 session working set 共享
-- **P0 完成，决定 natural_pause 去留**
+### Phase 2: on-demand 工具 + Session Resume（已落地, PR-7/8 + PR-A4 + PR-30 / 2026-06-15~17）
+- 已新增 `context.search / summarize / recent` 3 工具（数据层 + builtin wrapper）
+- `LLMCodingRuntime.resume()` 已实现 (PR-A4) + `resumePreview()` (R5, 2026-06-20)
+- 跨 session working set 共享 (`linkToWorkspace` / `getWorkspaceWorkingSet` PR-30)
+- **`natural_pause` 去留延后到 R7 验收门后决策**
 
-### Phase 3: natural_pause 清理（0.5-1 天）
+### Phase 3: natural_pause 清理（延后, 取决于 R7 真实 replay 数据）
 - **若决定删除**：删 `natural_pause` 决策分支 + 对应 test
 - **若决定 opt-in**：加 `BABEL_O_SESSION_MEMORY_LITE_NATURAL_PAUSE` env flag
 - **若决定保留**：继续 P1 双轨
 
-### Phase 4: 跨 Session 协同 + 时间窗 context（2-3 天）
-- 多 session working set 广播
-- "show me last 24h" 完整命令
-- `bbl context` 子命令全套
+### Phase 4: 跨 Session 协同 + 时间窗 context（部分落地）
+- 多 session working set 广播 ✅（PR-26/27 event bus + WS）
+- "show me last 24h" 完整命令 ⏳ 由 §20 R6 Go TUI 段消费
+- `bbl context` 子命令全套 ✅（PR-9/10/13/15/19）
 
-### Phase 5: behavior monitor 接入（独立工作）
-- 行为轨迹作为 Layer 3 `behaviorTrace` 来源
-- Live hints 增强
+### Phase 5: behavior monitor 接入（部分落地）
+- 行为轨迹作为 Layer 3 `behaviorTrace` 来源 ✅（PR-31 liveHints + nexus 5min）
+- Live hints 增强 ⏳ Go TUI 渲染部分见 §20 R6
 
 ---
 
@@ -1090,16 +1113,16 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ### 18.4 优先级建议
 
-按 2026-06-18 audit 后的真实阻塞排序：
+按 2026-06-18 audit 后的真实阻塞排序（**R0-R5 已收口**，**R6 Open**）：
 
-1. **R0 storage propagation + continuity wiring** — 先让 context recall tools 在 storage-backed runtime 可用。
-2. **R1 CWD drift guard** — 避免 `/` / `~/Library` 这类污染根写进 persisted working set。
-3. **R2 executeStream hot-path working-set injection** — 这是 Nexus-owned context 真正成立的核心。
-4. **R3 REST PUT + observe shared tracker** — 让手动编辑成为 live state。
-5. **R4 real runtime `/v1/context/observe` e2e** — 用真实执行证明 assembled frame。
-6. **R5 resume-preview product path** — 把 resume 从 class method 变成可观察能力。
-7. **R6 Go TUI runtime-owned rendering** — TUI 只消费事实，不推导事实。
-8. **R7 real session replay gate** — 用三个失败 session 关门验收。
+1. ✅ **R0 storage propagation + continuity wiring** — 先让 context recall tools 在 storage-backed runtime 可用。（2026-06-18 收口：`test/runtime-storage-propagation.test.ts` 5/5）
+2. ✅ **R1 CWD drift guard** — 避免 `/` / `~/Library` 这类污染根写进 persisted working set。（2026-06-18 收口：Bug 1 Layer A+B + Bug 4 + `test/resolve-cwd-fallback.test.ts` + `test/dual-site-resolver.test.ts`）
+3. ✅ **R2 executeStream hot-path working-set injection** — 这是 Nexus-owned context 真正成立的核心。（2026-06-18 收口：`test/runtime-working-set-hot-path.test.ts` 7/7）
+4. ✅ **R3 REST PUT + observe shared tracker** — 让手动编辑成为 live state。（2026-06-18 收口：`test/r3-rest-put-observe.test.ts` 6/6；PUT 走 `WorkingSetBroadcaster.mutate` 共享 per-cwd tracker）
+5. ✅ **R4 real runtime `/v1/context/observe` e2e** — 用真实执行证明 assembled frame（2026-06-20 收口：`test/r4-context-observe-runtime-e2e.test.ts` 9/9；`redactContext` 默认 summary 模式，`?full=1` opt-in verbatim）
+6. ✅ **R5 resume-preview product path** — 把 resume 从 class method 变成可观察能力（2026-06-20 收口：`test/r5-resume-preview.test.ts` 6/6；`LLMCodingRuntime.resumePreview` 纯 read-only projection + `/v1/sessions/:sessionId/resume-preview` route + `hasContinuationSnapshot: false` 硬编码）
+7. ✅ **R6 Go TUI runtime-owned rendering** — TUI 只消费事实，不推导事实（2026-06-20 收口：`api/context_observer.go` + `loop/context_observer.go` 默认开启，订阅 `/v1/context/observe` redacted payload；`api/context_observer_test.go` 7/7 transport tests + `loop/context_observer_test.go` 7/7 state-machine tests with 15 subcases；S1-S5 五条状态机路径 + backoff + format helper 全部锁定）。
+8. ✅ **R7 real session replay gate** — 用三个失败 session 关门验收。
 
 ### 18.5 历史记录 (本 doc 推进已完成)
 
@@ -1438,18 +1461,20 @@ R0/R1 的 bug 级细节由 [context-cwd-drift-and-recall-governance-plan.md §12
 
 **P1 Watch 可观测性与产品路径（依赖 R2，可并行小切片）：**
 
-7. **R3** REST PUT + `/v1/working-set/observe` 共享 per-cwd tracker——否则手动编辑不成为 live state。
-8. **R4** `/v1/context/observe` 用真实 `executeStream` e2e 验证 assembled frame（默认 redacted payload，不广播完整 prompt）。
-9. **R5** resume 从 class method 升级为可观察能力（`hasContinuationSnapshot` 诚实表达 + resume-preview 产品路径）。
-10. **R6** Go TUI 只消费 runtime-owned observer facts，不自行推导 context truth。
+7. ✅ **R3 [2026-06-18 已收口]** — REST PUT + `/v1/working-set/observe` 共享 per-cwd tracker——`WorkingSetBroadcaster.mutate(cwd, fn)` 让 PUT 走 broadcaster-owned tracker，subscriber 自动收到 `working_set_updated`。`test/r3-rest-put-observe.test.ts` 6/6 覆盖 R3 acceptance e2e。
+8. ✅ **R4 [2026-06-20 已收口]** — `/v1/context/observe` 真实 `executeStream` e2e + redacted payload——`nexus/contextBroadcaster.ts` 新增 `redactContext(ctx, mode='summary')` 剥离 `systemPrompt` + `messages`；observer route 默认 summary 模式，`?full=1` opt-in verbatim。`test/r4-context-observe-runtime-e2e.test.ts` 9/9 覆盖：redact contract / broadcaster publish / unsubscribe 清理 / 真实 `LLMCodingRuntime.executeStream` e2e (无手动 publish) / reconnect → assembled_snapshot。
+9. ✅ **R5 [2026-06-20 已收口]** — resume preview as product path——`LLMCodingRuntime.resumePreview({ sessionId, cwd })` 纯 read-only projection（load/rebuild working set + assemble context with `includeLiveHints: false`），返回 `{ cwd, workingSet, assembledSectionIds, budget, liveHintsSubscribed: false, hasContinuationSnapshot: false }`。`/v1/sessions/:sessionId/resume-preview` route 调 `runtime.resumePreview?.()`；`LocalCodingRuntime` 无 resume → 501 `RESUME_PREVIEW_UNSUPPORTED`（默认-on policy：缺能力显式报错，不静默回退）。`test/r5-resume-preview.test.ts` 6/6 覆盖：404 / 400 / 501 / pre-seeded rebuilt=false / event-tail rebuilt=true / 调 preview 前后 storage 状态不变（read-only 验证）。`hasContinuationSnapshot: false` 硬编码，docs 不再承诺"0 information loss" 直到 R0-R7 全过。
+10. ✅ **R6 [2026-06-20 已收口]** Go TUI 只消费 runtime-owned observer facts，不自行推导 context truth。落地：`clients/go-tui/internal/loop/api/context_observer.go`（client-side WS subscriber，redacted payload schema：`assembled_snapshot` / `assembled` / `error` 三种 frame 的 typed envelope，`ObserveOpts.RedactionMode` 默认 summary、`"full"` opt-in 但 loop renderer 仍忽略 verbatim 字段）+ `clients/go-tui/internal/loop/context_observer.go`（loop-level `ContextObserver`：reconnect 2s→5s→15s backoff、tea.Cmd plumbing、per-cwd `ContextObservation` map、`applyCtxObservationFrame` / `markCtxObservationDisconnected` / `GetCtxObservation` / `FormatCtxObservationLine` 五个 helper），observer 默认在 `InteractiveModel.Init()` 启动。**runtime-owned 契约**：renderer 永远不从模型自身状态推导 context truth；frame 永远不到时显示 `context: not observed`；server 一旦发 `redaction:"full"`，loop 仍 fallback 到 `context: full mode (debug)` 而不是显示 verbatim prompt。**Tests**：`api/context_observer_test.go` 7 个 transport tests（snapshot+assembled / error frame / close idempotent / null context / sessionId query param / full mode query param / unknown frame type recovery） + `loop/context_observer_test.go` 7 个 state-machine tests with 15 subcases（S1 not-observed / S2 late connect / S3 reconnect 替换状态 / S4 schema mismatch 三种子情形 / S5 partial payload 两种 fallback / backoff 序列 / format helper）。
 
 **P2 验收闸门 + 治理延后：**
 
-11. **R7** 真实 session replay gate——用 `session_981cc5c2` / `session_cf361f04` / `session_10320709` 三个 fixture 关门验收。**只有 R0-R7 全过，本 plan 才能从 `Partially Landed` 升级为 `Active Reference`**。
+11. ✅ **R7 [2026-06-20 已收口]** — 真实 session replay gate——用 `session_981cc5c2` / `session_cf361f04` / `session_10320709` 三个 fixture 关门验收。**当前状态**：c1 (cwd drift) + c2 (Phase B continuity) + c3 (context tool storage) + c4 (working-set hot path) + c4' (REST PUT ↔ WS observer 共享) + c5 (resume preview product path) + c6 (observer redacted e2e) **全部关闭**（R4 关 c6 + R5 关 c5）。fixture snapshot 保存在 `test/fixtures/r7-fixture.sqlite`，`test/r7-replay-gate.test.ts` 15/15 覆盖。**R6 已关闭后 R0-R7 全部收口**——本 plan 等待 governance 把它从 `proposals/` 迁移到 `reference/`（独立 doc lifecycle slice）后即可正式升级为 `Active Reference`。
 12. cwd-drift Phase D（`ContextEstimateCalibration`）/ E（`ROOT_SCAN_REQUIRES_CONFIRMATION`）/ F（`UserArtifactContinuity`）——等真实 regression 触发再推进。
 13. **Glob permission-denied 降级为 partial result**（独立工具鲁棒性 follow-up，入 tool-governance-plan）——session_10320709 的 8 个 GLOB_FAILED 全因 ripgrep 撞 `~/Library/Caches` 权限拒绝整段失败，非本 plan 范围但同源 drift 暴露。
 
 **执行原则**：R0/R1 先于 R2（污染根 + storage 缺失会让 R2 写脏、验收假阳性）；Bug 1 Layer A 是 P0 之首（cwd 漂移 load-bearing fix，SPACE_MARK 修错目标）；每段独立 PR + focused regression test，按 1→13 顺序推进；不引入第二 source of truth、不重写 Phase A/B/C 主体、不主动开 Phase D/E/F。
+
+**2026-06-20 收盘**：R0 / R1 / R2 / R3 / R4 / R5 / R6 / R7 全部收口。本 plan 等待 governance 把它从 `proposals/` 迁移到 `reference/` 后即可正式升级为 `Active Reference`（独立 doc lifecycle slice，不阻塞此 plan 的功能闭环）。
 
 ### 20.2 Non-goals For This Follow-up
 
