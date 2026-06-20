@@ -49,8 +49,16 @@ export type ToolDefinition<TInput extends z.ZodType = z.ZodType> = {
    * `Map<string, AnyTool>` (function parameter contravariance would
    * otherwise reject narrower input types when widening to `unknown`).
    * The runtime casts back to the concrete input type when invoking.
+   *
+   * Return shape:
+   *   - `ToolRisk` (string) — classify input as that risk; no rule
+   *     attribution (back-compat).
+   *   - `{ kind: ToolRisk, rule?: string }` — classify with optional
+   *     human-readable rule (e.g. `'command:sqlite3-not-allowlisted'`)
+   *     that is included in `tool_denied.message` and the model-visible
+   *     `tool_result` envelope so the model can adjust its next call.
    */
-  riskForInput?: (input: any) => ToolRisk
+  riskForInput?: (input: any) => ToolRisk | { kind: ToolRisk; rule?: string }
   dispose?(): Promise<void> | void
   execute(input: z.infer<TInput>, context: ToolContext): Promise<ToolResult>
 }

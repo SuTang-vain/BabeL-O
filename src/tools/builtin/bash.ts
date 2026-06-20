@@ -257,8 +257,17 @@ export const bashTool: ToolDefinition<typeof inputSchema> = {
   // command chains, redirects, dangerous-pattern hits) stay at 'execute'
   // and follow the existing approval flow. See bashClassifier.ts and
   // docs/nexus/reference/go-tui-permission-policy-governance-plan.md
-  // Phase A.
-  riskForInput: (input) => classifyBashRisk(input.command).kind,
+  // Phase A. The classifier `rule` (e.g. `command:sqlite3-not-allowlisted`,
+  // `output-redirect`, `chained-or`) is surfaced into `tool_denied.message`
+  // and the model-visible `tool_result` so the model knows WHY the call
+  // was rejected (Bug 1.2 fix, 2026-06-20). Without this, deny messages
+  // were the opaque "Tool denied by Nexus policy: Bash" — the model
+  // routinely fabricated a workaround answer instead of adjusting the
+  // command (real session: session_ea4f1793 sqlite3 deny).
+  riskForInput: (input) => {
+    const classification = classifyBashRisk(input.command)
+    return { kind: classification.kind, rule: classification.rule }
+  },
   async execute(input, context) {
     const currentCwd = resolveShellCwd(context.sessionId, context.cwd)
     const workspaceEscape = findWorkspaceEscapeInCommand(input.command, context.cwd, context.allowedPaths)

@@ -63,14 +63,33 @@ export type ReadFileCacheRange = {
 }
 
 export function resolveEffectiveToolRisk(tool: AnyTool, input: unknown): ToolRisk {
+  return resolveEffectiveToolRiskWithRule(tool, input).risk
+}
+
+/**
+ * Like {@link resolveEffectiveToolRisk} but additionally returns the
+ * classifier `rule` (e.g. `command:sqlite3-not-allowlisted`) when the
+ * tool's `riskForInput` returns the rich `{ kind, rule }` shape. Used
+ * by deny code paths so the model-visible message can explain WHY the
+ * tool was rejected (Bug 1.2 fix, 2026-06-20).
+ */
+export function resolveEffectiveToolRiskWithRule(
+  tool: AnyTool,
+  input: unknown,
+): { risk: ToolRisk; rule?: string } {
   if (typeof tool.riskForInput === 'function') {
     try {
-      return tool.riskForInput(input)
+      const result = tool.riskForInput(input)
+      if (typeof result === 'string') return { risk: result }
+      if (result && typeof result === 'object' && 'kind' in result) {
+        return { risk: result.kind, rule: result.rule }
+      }
+      return { risk: tool.risk }
     } catch {
-      return tool.risk
+      return { risk: tool.risk }
     }
   }
-  return tool.risk
+  return { risk: tool.risk }
 }
 
 type RequestedReadCoverage = {
@@ -361,7 +380,7 @@ export async function* executeProviderToolCall(options: {
   }
 
   let toolInput = parsed.data
-  let effectiveRisk = resolveEffectiveToolRisk(tool, toolInput)
+  let { risk: effectiveRisk, rule: classifierRule } = resolveEffectiveToolRiskWithRule(tool, toolInput)
 
   yield {
     type: 'tool_started',
@@ -380,7 +399,8 @@ export async function* executeProviderToolCall(options: {
     !policyAllowed &&
     runtimeOptions.policyMode !== 'soft-deny'
   ) {
-    const message = `Tool denied by Nexus policy: ${tool.name}`
+    const ruleSuffix = classifierRule ? ` (classifier: ${classifierRule})` : ''
+    const message = `Tool denied by Nexus policy: ${tool.name}${ruleSuffix}`
     yield {
       type: 'tool_denied',
       ...eventBase(runtimeOptions.sessionId),
@@ -491,7 +511,11 @@ export async function* executeProviderToolCall(options: {
       }
     }
     toolInput = parsed.data
-    effectiveRisk = resolveEffectiveToolRisk(tool, toolInput)
+    {
+      const recomputed = resolveEffectiveToolRiskWithRule(tool, toolInput)
+      effectiveRisk = recomputed.risk
+      classifierRule = recomputed.rule
+    }
     policyAllowed = options.toolPolicy.isAllowed(tool, toolInput) ||
       providerSessionRules.isAllowed(runtimeOptions.sessionId, tool, toolInput)
     if (
@@ -499,7 +523,8 @@ export async function* executeProviderToolCall(options: {
       !policyAllowed &&
       runtimeOptions.policyMode !== 'soft-deny'
     ) {
-      const message = `Tool denied by Nexus policy: ${tool.name}`
+      const ruleSuffix = classifierRule ? ` (classifier: ${classifierRule})` : ''
+      const message = `Tool denied by Nexus policy: ${tool.name}${ruleSuffix}`
       yield {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),

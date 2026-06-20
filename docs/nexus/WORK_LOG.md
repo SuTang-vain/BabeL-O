@@ -2,6 +2,29 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-20 — Bug 1.2: Bash deny message surfaces classifier rule (model-visible)
+
+- **背景**: 真实 session `session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1` 复盘揭示，同一 session 内 2 次 Bash 调用看起来"deny 不一致"——`git rev-parse HEAD` 通过、`sqlite3 ~/.babel-o/db.sqlite "..."` 被拒。源码核对后发现这不是 inconsistent，而是 `bashClassifier.ts` 正常工作（`git` 在 read-only 白名单 → effectiveRisk=read 自动放行；`sqlite3` 不在白名单 → execute risk → policy deny）。**真正的 bug 是 deny message 的可观测性**：`tool_denied.message` 写死为 `"Tool denied by Nexus policy: Bash"`，丢弃了 classifier 已经算出的 `rule`（`command:sqlite3-not-allowlisted` / `chained-semicolon` / `output-redirect` 等）。模型看不到拒绝原因 → 无法调整下一次调用 → fallback 到 `assistant_delta` 编造手动 workaround（"用 sqlite3 在终端跑"）。
+- **设计选择**:
+  - 不为 Bash 命令开放 sqlite3 白名单（policy 决定，超出本 fix 范围）。
+  - 不改 `bashClassifier.ts` 的 quote-aware tokenization（相关 bug 见下面备忘，待独立 PR）。
+  - **最小、可验证的 fix**：把 classifier 已经计算出的 `rule` 通过 `tool.riskForInput()` 的返回结构暴露给 runtime，再附加到 `tool_denied.message` + 模型可见的 `tool_result` 文本。
+- **实现 (4 段)**:
+  - **Tool 接口扩展** `src/tools/Tool.ts`: `riskForInput?: (input) => ToolRisk | { kind: ToolRisk; rule?: string }` —— 接受字符串（back-compat）或 `{ kind, rule }` 富结构，rule 可选。文档注释解释 rule 的用途与流向。
+  - **Bash 工具切到富结构** `src/tools/builtin/bash.ts:261`: `riskForInput` 现在 `return { kind: classification.kind, rule: classification.rule }`。read-only 命中 `rule=undefined`，execute 命中带 rule 字符串。
+  - **Runtime 解析 + 注入** `src/runtime/LocalCodingRuntime.ts`: `effectiveRisk()` 返回 `{ risk, rule? }` 兼容三种 riskForInput 返回形态（缺失 / string / object）；调用点解构 `let { risk: effectiveRisk, rule: classifierRule } = this.effectiveRisk(tool, toolInput)`；policy deny 路径 `const ruleSuffix = classifierRule ? \` (classifier: \${classifierRule})\` : ''` → `message = \`Tool denied by Nexus policy: \${tool.name}\${ruleSuffix}\``；hook input rewrite 后重算 `recomputed.risk` + `recomputed.rule`。
+  - **runtimeToolLoop 同步** `src/runtime/runtimeToolLoop.ts`: 新增导出 `resolveEffectiveToolRiskWithRule()` 供需要 rule 的调用点用；保留 `resolveEffectiveToolRisk()` 作 back-compat 薄包装；两个 policy deny 路径（`:402`、`:521` 附近）同样追加 `(classifier: <rule>)` suffix；hook 重算 helper 也走 rich-shape 解构。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/bash-deny-classifier-rule.test.ts` (新建 9 case): 3 个 tool-level (riskForInput 富结构 / 非 allowlisted rule / dangerous-pattern rule) + 3 个 helper-level (resolveEffectiveToolRisk back-compat / resolveEffectiveToolRiskWithRule 含 rule / read 路径无 rule) + 3 个 runtime-level e2e (sqlite3 deny message 含 rule / read-only git 无 deny / `rm` dangerous-pattern deny 含 rule)。9/9 pass。
+  - 跨 spec 回归: `test/bash-classifier.test.ts test/runtime.test.ts test/bash-deny-classifier-rule.test.ts test/security.test.ts` 198/198 pass。
+  - **真实 runtime 端到端**: `curl POST /v1/execute` prompt "尝试 bash sqlite3 -line foo.db ... 告诉我你看到的拒绝原因" → session_acbfe055。模型尝试 2 次：第 1 次带 SQL 分号 → deny `(classifier: chained-semicolon)`；第 2 次去掉分号改 `.tables` → deny `(classifier: command:sqlite3-not-allowlisted)`。模型 result 准确解释了**两个不同的 rule** 含义，并给出 `node:sqlite` 替代方案 + 调整 allowlist 建议。修复前模型只能看到 `Tool denied by Nexus policy: Bash`，无法 reason about deny；修复后 deny rule 成为模型可解释的 fact。
+- **边界**:
+  - 不改 `bashClassifier.ts`（包括"`SELECT 1;` 引号内分号被识别为 chained-semicolon"这个独立 bug，留作 follow-up；当前 fix 让模型至少能看到这个 rule 名并 reason about 它）。
+  - 不改 Bash policy / allowlist / approval gate 行为；deny 仍发生在原本会发生的位置，只是携带更多信息。
+  - 不改其他 deny path（hook deny / optimizer-safety deny / permission gate denial）的 message 格式——它们已经有具体的 deny reason，不需要 classifier rule 注入。
+  - `riskForInput` 字符串返回形态保持完整 back-compat，老 tool / 测试不需要任何改动。
+
 ## 2026-06-20 — Long-Running Context Assembly Bug 1.1: contextSessions cross-session metadata search
 
 - **背景**: 真实 session `session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1` 测试 `bbl go` runtime 时，用户 prompt "使用 contextRecent 工具列出最近 5 个 session 的 ID 与 lastUserInput" 触发 4 次工具调用（contextRecent / Bash / Bash / contextSearch），其中 `contextSearch{query: "sessionId lastUserInput", maxTokens: 5000}` 命中 0 结果（`hitCount: 0`, `content: ""`）。根因：`contextSearch` 数据层 `searchEvents()` 只接 `events: NexusEvent[]` 单 session 事件流，跨 session 元数据（id / cwd / prompt / lastUserInput / phase / timestamps）从未进入工具搜索路径。模型 fallback 到 `assistant_delta` 编造"无法获取，需要 sqlite3 查询" 文本回答，而非基于工具事实。

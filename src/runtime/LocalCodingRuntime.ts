@@ -84,16 +84,28 @@ export class LocalCodingRuntime implements NexusRuntime {
    * Compute the effective risk for a tool invocation, honouring any
    * per-input risk override (e.g. Bash's read-only subcommand classifier).
    * Falls back to the tool's static `risk` field when no override exists.
+   *
+   * Returns `{ risk, rule? }` so callers can surface the classification
+   * rule (e.g. `'command:sqlite3-not-allowlisted'`) in deny messages
+   * and tool_result envelopes (Bug 1.2 fix, 2026-06-20). When the tool
+   * has no `riskForInput`, `rule` is undefined.
    */
-  private effectiveRisk(tool: AnyTool, input: unknown): ToolRisk {
+  private effectiveRisk(tool: AnyTool, input: unknown): { risk: ToolRisk; rule?: string } {
     if (typeof tool.riskForInput === 'function') {
       try {
-        return tool.riskForInput(input as Parameters<typeof tool.riskForInput>[0])
+        const result = tool.riskForInput(input as Parameters<typeof tool.riskForInput>[0])
+        if (typeof result === 'string') {
+          return { risk: result }
+        }
+        if (result && typeof result === 'object' && 'kind' in result) {
+          return { risk: result.kind, rule: result.rule }
+        }
+        return { risk: tool.risk }
       } catch {
-        return tool.risk
+        return { risk: tool.risk }
       }
     }
-    return tool.risk
+    return { risk: tool.risk }
   }
 
   withToolPolicy<T>(toolPolicy: ToolPolicy, fn: () => T): T {
@@ -253,12 +265,17 @@ export class LocalCodingRuntime implements NexusRuntime {
         return
       }
       let toolInput = parsed.data
-      let effectiveRisk: ToolRisk = this.effectiveRisk(tool, toolInput)
+      let { risk: effectiveRisk, rule: classifierRule } = this.effectiveRisk(tool, toolInput)
       // Compute per-input effective risk (e.g. Bash's read-only
       // subcommand classifier). The policy block and approval gate
       // both key off this value, not the static `tool.risk`. Read-only
       // subcommands of otherwise-execute tools therefore skip both gates
       // without losing the tool's identity in audit logs.
+      //
+      // `classifierRule` (e.g. `command:sqlite3-not-allowlisted`,
+      // `output-redirect`) is appended to deny messages so the model
+      // can see WHY a Bash command was rejected and adjust the next
+      // call (Bug 1.2 fix, 2026-06-20).
       //
       // Phase B of
       // docs/nexus/reference/go-tui-permission-policy-governance-plan.md:
@@ -272,7 +289,8 @@ export class LocalCodingRuntime implements NexusRuntime {
         !this.toolPolicy.isAllowed(tool, toolInput) &&
         options.policyMode !== 'soft-deny'
       ) {
-        const message = `Tool denied by Nexus policy: ${tool.name}`
+        const ruleSuffix = classifierRule ? ` (classifier: ${classifierRule})` : ''
+        const message = `Tool denied by Nexus policy: ${tool.name}${ruleSuffix}`
         yield {
           type: 'tool_denied',
           ...eventBase(options.sessionId),
@@ -365,7 +383,9 @@ export class LocalCodingRuntime implements NexusRuntime {
         // risk (e.g. a hook that strips dangerous patterns from a Bash
         // command). Recompute so the approval gate matches the
         // post-hook input.
-        effectiveRisk = this.effectiveRisk(tool, toolInput)
+        const recomputed = this.effectiveRisk(tool, toolInput)
+        effectiveRisk = recomputed.risk
+        classifierRule = recomputed.rule
       }
 
       // Check if the tool requires authorization.
