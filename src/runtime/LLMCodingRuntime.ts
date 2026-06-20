@@ -26,6 +26,7 @@ import { loadWorkingSetOverride } from './loadWorkingSetOverride.js'
 import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
 import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetrieval.js'
 import { prepareRuntimeStart } from './prepareRuntimeStart.js'
+import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -487,25 +488,22 @@ export class LLMCodingRuntime implements NexusRuntime {
           gitStatus: assembledContext.gitStatus,
         })
       }
-      const initialMicrocompactEvent = contextMicrocompactEvent('initial_refresh')
-      if (initialMicrocompactEvent) yield initialMicrocompactEvent
-      if (contextWindowState.isWarning || autoCompactDecision.fuseOpen) {
-        const compactPercent = autoCompactDecision.enabled
-          ? autoCompactDecision.thresholdPercent
-          : contextCompactPercent
-        yield buildContextWarningEvent({
-          sessionId: options.sessionId,
-          modelId: cleanedModelId,
-          windowState: contextWindowState,
-          thresholdPercent: compactPercent,
-          message: autoCompactDecision.fuseOpen
-            ? `Auto compact is paused after ${autoCompactDecision.failureCount} consecutive failures. Run /compact manually or inspect compact_failure events.`
-            : contextWindowState.isCompact
-              ? `Context has passed the compact threshold (${compactPercent}%). Auto-compact will trigger on this turn.`
-              : `Context is approaching the compact threshold (${contextWarningPercent}%→${compactPercent}%). Consider /compact soon.`,
-          cacheAwareCompactPolicy,
-        })
-      }
+      // Initial post-refresh yield sequence (microcompact
+      // + warning). The list is built by the
+      // `buildPostRefreshYieldEvents` factory (Phase 3B-11
+      // helper extraction) so the main loop's first refresh
+      // step reads as a single ordered yield.
+      for (const e of buildPostRefreshYieldEvents({
+        assembledContext,
+        contextWindowState,
+        autoCompactDecision,
+        cacheAwareCompactPolicy,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        modelId: cleanedModelId,
+        contextWarningPercent,
+        contextCompactPercent,
+      })) yield e
       let compactAttempted = false
       if (autoCompactDecision.shouldCompact) {
         compactAttempted = true
