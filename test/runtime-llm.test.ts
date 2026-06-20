@@ -29,7 +29,6 @@ const CONFIG_ENV_KEYS = [
   'BABEL_O_CONFIG_FILE',
   'BABEL_O_TEST_CONFIG_WRITE_GUARD',
   'BABEL_O_SESSION_MEMORY_LITE',
-  'BABEL_O_NATURAL_PAUSE_SUPPRESS',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -943,11 +942,11 @@ describe('LLMCodingRuntime', () => {
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
   })
 
-  test('queues Session Memory Lite update after no-tool final response', async () => {
+  test('skips Session Memory Lite write on no-tool final response (post-natural_pause retirement)', async () => {
     process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
-    // P0 default = suppressed; this test asserts natural_pause still
-    // fires when explicitly opted in via BABEL_O_NATURAL_PAUSE_SUPPRESS=false
-    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
+    // Post-R7: the per-turn non-tool summary path (`natural_pause`) was
+    // retired. A single-turn no-tool response now hits `insufficient_signal`
+    // and must NOT produce a memory file or a `session_memory_updated` event.
     const cwd = join(tmpdir(), `babel-o-runtime-session-memory-${Date.now()}-${Math.random()}`)
     const sessionId = 'test-session-memory-runtime'
     const storage = new MemoryStorage()
@@ -992,12 +991,10 @@ describe('LLMCodingRuntime', () => {
       await flushSessionMemoryLiteQueue()
 
       const memoryPath = join(cwd, '.babel-o/session-memory.md')
-      assert.equal(fs.existsSync(memoryPath), true)
-      const memoryText = fs.readFileSync(memoryPath, 'utf8')
-      assert.match(memoryText, /reactive pause/)
+      assert.equal(fs.existsSync(memoryPath), false)
 
       const persisted = await storage.listEvents(sessionId, { order: 'asc', limit: 10_000 })
-      assert.equal(persisted.events.filter(event => event.type === 'session_memory_updated').length, 1)
+      assert.equal(persisted.events.filter(event => event.type === 'session_memory_updated').length, 0)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }

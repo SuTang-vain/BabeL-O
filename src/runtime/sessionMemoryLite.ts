@@ -43,7 +43,7 @@ export type SessionMemoryLiteStatus = {
 
 export type SessionMemoryLiteDecision = {
   shouldUpdate: boolean
-  reason: 'disabled' | 'duplicate_turn' | 'natural_pause' | 'growth_threshold' | 'forced' | 'insufficient_signal'
+  reason: 'disabled' | 'duplicate_turn' | 'growth_threshold' | 'forced' | 'insufficient_signal'
   startIndex: number
   eventCount: number
   toolCallCount: number
@@ -220,26 +220,12 @@ export function shouldUpdateSessionMemoryLite(
 
   const latestTurnEvents = latestUserIndex >= 0 ? events.slice(latestUserIndex + 1) : events
   const latestTurnHasTools = latestTurnEvents.some(event => event.type === 'tool_started')
-  // DEPRECATED (Track B Phase 1, see docs/nexus/reference/behavior-monitor.md §13):
-  // The `natural_pause` reason is preserved for backward compatibility but is
-  // suppressed by default via BABEL_O_NATURAL_PAUSE_SUPPRESS (P0). Phase 2 will
-  // reroute this to behaviorTrace.ts as a `user-redirect` / `trajectory-end`
-  // trigger. Until then, this branch is dormant in production sessions.
-  if (
-    latestUserIndex >= 0
-    && !latestTurnHasTools
-    && eventCount > 0
-    && !isNaturalPauseSuppressed()
-  ) {
-    return {
-      shouldUpdate: true,
-      reason: 'natural_pause',
-      startIndex,
-      eventCount,
-      toolCallCount,
-      estimatedTokensSinceLastUpdate,
-    }
-  }
+  // Note (was natural_pause branch): per-turn non-tool summaries used to live
+  // here as `natural_pause`. Retired after R0-R7 (see
+  // docs/nexus/proposals/long-running-context-assembly.md ADR-5 retirement).
+  // Coverage now lives in `growth_threshold` (token-driven) plus
+  // behaviorTrace's `trajectory-end` / `user-redirect` triggers.
+  void latestTurnHasTools
 
   const minTokens = options.minEstimatedTokensSinceLastUpdate
     ?? DEFAULT_MIN_ESTIMATED_TOKENS_SINCE_LAST_UPDATE
@@ -316,18 +302,6 @@ async function runQueuedSessionMemoryLiteUpdate(options: {
 function isSessionMemoryLiteEnabled(): boolean {
   const raw = (process.env.BABEL_O_SESSION_MEMORY_LITE ?? '').trim().toLowerCase()
   return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
-}
-
-// Tracks [long-running-context-assembly §13 Phase 0]:
-// `natural_pause` fires on every non-tool turn by default, which the
-// user reported as overly aggressive. Default = suppressed so users
-// get immediate pain relief without opt-in. Tests that need to verify
-// the natural_pause path explicitly set BABEL_O_NATURAL_PAUSE_SUPPRESS=false.
-function isNaturalPauseSuppressed(): boolean {
-  const raw = (process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS ?? '').trim().toLowerCase()
-  if (raw === '0' || raw === 'false' || raw === 'no' || raw === 'off') return false
-  if (raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on') return true
-  return true
 }
 
 async function readExistingMemory(path: string): Promise<string> {

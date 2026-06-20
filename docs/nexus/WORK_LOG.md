@@ -2,6 +2,29 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-20 — Long-Running Context Assembly: natural_pause retired (ADR-5 retired)
+
+- **背景**: `long-running-context-assembly.md` 的 R0-R7 全部收口 + plan 升 `Active Plan` (2026-06-21) 之后，ADR-5 承诺的"看 R0-R7 真实数据再决定 natural_pause 去留"已具备决策条件。R7 fixture (`session_981cc5c2` / `session_cf361f04` / `session_10320709`) 跑下来 0 个 natural_pause 事件；working set + behaviorTrace (`trajectory-end` / `user-redirect`) + `/v1/context/observe` redacted summary + resumePreview 已 100% 覆盖原 natural_pause 想捕获的信号。按 §13 Phase 3 + ADR-5 收口路径走候选 (a) 完全删除。
+- **实现**:
+  - `src/runtime/sessionMemoryLite.ts`: enum `SessionMemoryLiteReason` 移除 `'natural_pause'`；删除 decision 分支 + `isNaturalPauseSuppressed()` 函数 + DEPRECATED 注释块 + unused `latestTurnHasTools` 局部变量清理；保留 5-reason contract `disabled / duplicate_turn / growth_threshold / forced / insufficient_signal`。
+  - `src/shared/events.ts:621`: zod schema `decisionReason` 同步移除 `'natural_pause'`。
+  - `src/runtime/sessionMemoryLite.ts` 与其它 4 处源码 (`behaviorTrace.ts:21` / `behaviorMonitor.ts:21` / `behaviorTraceTap.ts:87` / `LLMCodingRuntime.ts:226`) + `test/behavior-trace.test.ts:17` 的 `INV-11: do not revive natural_pause` 注释**保留**为治理护栏 — 禁止任何后续 commit 复活该分支。
+  - `test/context-assembler.test.ts`: 4 处 natural_pause 测试块 — 1 处 fixture+assertion (`analyzeContext returns token and compact diagnostics`) 改用 `growth_threshold`；1 处 env flag 解析测试整段重写为 `Session Memory Lite decision on a no-tool pause falls through to insufficient_signal`；1 处 `compactSession writes opt-in Session Memory Lite` 删 env flag setup/teardown；1 处 `queues natural pause updates` 改写为 `Session Memory Lite duplicates are skipped when no qualifying decision fires`，断言改为"无写入"。
+  - `test/runtime-llm.test.ts`: env var 清空列表删 `'BABEL_O_NATURAL_PAUSE_SUPPRESS'`；`queues Session Memory Lite update after no-tool final response` 改写为 `skips Session Memory Lite write on no-tool final response (post-natural_pause retirement)`，断言改为"无写入"。
+  - `docs/nexus/reference/long-running-context-assembly.md` §3 banner `State: Active Plan`（已就位）；§13 删 Phase 0 + Phase 3，§10 配置表删 `BABEL_O_NATURAL_PAUSE_SUPPRESS` 一行；§14 ADR-5 改写为"Retired 2026-06-20"，列出 Decision / Consequences；§15 budget row 把 P3 行标记 `✅`（已退役）；§16 risk row 改写为已收口；§17 第 5 项改写为"保留现状不主动迁移"；§18.5 Phase 0 行删除。
+  - `docs/nexus/proposals/behavior-monitor.md`: 删除 PR-1 一行（`BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag 默认压制 `natural_pause`）。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`：clean。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/context-assembler.test.ts`：56/56 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/runtime-llm.test.ts`：76/76 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-concurrency=1 test/assemble-context-memory-hook.test.ts test/behavior-trace.test.ts test/context-tools.test.ts test/inspect-session.test.ts test/inspect-session-resume.test.ts test/r7-replay-gate.test.ts test/runtime-working-set-hot-path.test.ts test/r3-rest-put-observe.test.ts test/r4-context-observe-runtime-e2e.test.ts test/r5-resume-preview.test.ts`：136/136 pass（10 spec files）。
+  - `grep -rn "'natural_pause'\|\"natural_pause\"" src test`：0 匹配。
+- **边界**:
+  - 不复活 `natural_pause` decision branch（INV-11 守护，5 处源码 + 1 处 test）。
+  - 不改变 5-reason contract 的另外 4 个 reason (`disabled / duplicate_turn / forced / insufficient_signal`) 行为；`growth_threshold` 已 lock 测试覆盖。
+  - 不迁移旧 `.babel-o/session-memory.md` 文件（保留现状，用户 `bbl context` 命令族可读；自动迁移会污染事件流）。
+  - 不动 `BABEL_O_SESSION_MEMORY_LITE` 总开关（仍由它独立控制 write path enable）。
+
 ## 2026-06-20 — Module Coupling Governance Phase 4A+ Tail Cleanup: shared socket/security utilities
 
 - **背景**: Phase 4A+ 已把 `app.ts` 降到 composition root，但尾部仍留有 utility export：`parseSocketQuery` 已适合 TUI / future WebSocket 复用，`isLocalHost` / `validateSecurityConfig` 是 server security helper，不属于 Nexus app composition root。

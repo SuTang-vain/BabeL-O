@@ -15,7 +15,6 @@
 
 | Phase | 内容 | PR | 日期 |
 |---|---|---|---|
-| P0 | `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag | PR-1 | 2026-06-14 |
 | Phase 1 | WorkingSetTracker in-memory | PR-4a | 2026-06-14 |
 | Phase 1 | WorkingSetTracker persistence | PR-4b | 2026-06-14 |
 | Phase 2 | contextTools (3 pure fns) | PR-7 | 2026-06-15 |
@@ -69,7 +68,7 @@
 - 不动 behavior monitor（独立模块）
 - 不动 `compact.ts`（保留为 hard compact 路径，用户触发）
 - 不动 `.babel-o/memory.md`（项目级手动维护）
-- **唯一改动**：`sessionMemoryLite.ts` 的 `natural_pause` 决策路径**保留但被压制**（P0 完成后决定去留）
+- `sessionMemoryLite.ts` 的 `natural_pause` 决策路径**已退役 (2026-06-20, ADR-5 retired)**；5-reason contract 收敛为 `disabled / duplicate_turn / growth_threshold / forced / insufficient_signal`
 
 ---
 
@@ -772,10 +771,11 @@ const result = await context.search({
 │  ├─ 行为：完整 compact_boundary + 写 behavior-trace   │
 │  └─ 代价：O(n) + 持久化                                │
 ├────────────────────────────────────────────────────────┤
-│  natural_pause（保留但被压制，P0 完成后决定）          │
-│  ├─ 现状：每 user 轮触发                                │
-│  ├─ 被压制：P0 后无意义（数据全在 behavior-trace）     │
-│  └─ 待决策：删除 / opt-in / 保留                        │
+│  ~~natural_pause~~（已退役 2026-06-20, ADR-5 retired） │
+│  ├─ 历史：每 user 轮触发 → 写 session-memory.md      │
+│  ├─ 退役原因：信号源被 working set + behaviorTrace    │
+│  │            (`trajectory-end` / `user-redirect`) 接管 │
+│  └─ 治理护栏：INV-11 跨 5 处源码/test 保留          │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -822,7 +822,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | **Plan C 长期记忆** | Layer 3 `longTerm` 来源——通过 `longTermMemory.search(query=intent)` 接入 |
 | **behavior monitor** | 平行模块——行为轨迹是 Layer 3 `behaviorTrace` 来源 + 跨 session 提示 |
 | **`compact.ts`** | 保留 hard compact 路径——被 ContextAssembler 的 `overflow` 触发 |
-| **`sessionMemoryLite.ts`** | 保留模块——`forced` 给 hard compact 用；`growth_threshold` 改成 microcompact 触发；`natural_pause` **P0 完成后决定** |
+| **`sessionMemoryLite.ts`** | 保留模块——`forced` 给 hard compact 用；`growth_threshold` 改成 microcompact 触发；`natural_pause` 已退役 (2026-06-20, ADR-5)，5-reason contract 收敛为 `disabled / duplicate_turn / growth_threshold / forced / insufficient_signal` |
 | **`.babel-o/memory.md`** | Layer 3 `project` 来源——通过 `loadProjectMemory(cwd)` 接入 |
 | **`everCoreRuntimeManager`** | 复用——WorkingSetTracker 通过其租约机制持久化 |
 
@@ -844,7 +844,6 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | `BABEL_O_CONTEXT_TRACE_WINDOW_MS` | `86400000` | 24 hour |
 | `BABEL_O_CONTEXT_COMPACT_HINT_RATIO` | `0.8` | token usage 比例触发 compact hint |
 | `BABEL_O_CONTEXT_CROSS_SESSION` | `true` | 跨 session working set 共享 |
-| `BABEL_O_NATURAL_PAUSE_SUPPRESS` | `false` | **P0 完成后开启**——压制 natural_pause |
 
 ---
 
@@ -918,28 +917,17 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ## 13. 迁移路径
 
-> **2026-06-20 audit 注**：本节为原始迁移规划保留，**Phase 0/1/2 实际已落地**（具体 PR 见 §18.5 历史记录），**Phase 3/4/5 已被 §20 R0-R7 跟进计划取代** — 真实推进以 §20 为准；关于 `natural_pause` 的去留也已合并到 R7 验收门后再决策。本节路径与 §18 落地清单 + §20 R0-R7 行计划交叉对照阅读，不要按本节字面顺序执行。
-
-### Phase 0: 紧急修复核心问题（已落地, PR-1 / 2026-06-14）
-- 加 `BABEL_O_NATURAL_PAUSE_SUPPRESS=true` 默认
-- 不动代码逻辑，只压制触发
-- 用户立刻感觉"不再每轮压缩"
+> **2026-06-20 audit 注（natural_pause retired）**：本节为原始迁移规划保留，**Phase 1/2 实际已落地**（具体 PR 见 §18.5 历史记录），**Phase 4/5 已被 §20 R0-R7 跟进计划取代** — 真实推进以 §20 为准；2026-06-20 `natural_pause` decision branch 已**退役**（ADR-5 retired，见 §14）：5-reason contract 收敛为 `disabled / duplicate_turn / growth_threshold / forced / insufficient_signal`，对应信号由 working set + behaviorTrace (`trajectory-end` / `user-redirect`) 接管；测试同步删除/改写，INV-11 注释保留为治理护栏。本节路径与 §18 落地清单 + §20 R0-R7 行计划交叉对照阅读，不要按本节字面顺序执行。
 
 ### Phase 1: WorkingSetTracker + ContextAssembler 上线（已落地, PR-4a/4b/15/18 / 2026-06-14~16）
 - 实际位置：`src/runtime/workingSetTracker.ts` / `src/runtime/contextAssembler.ts` / `src/runtime/compactors/microCompact.ts`（非原计划的 `src/nexus/*.ts`）
 - `LLMCodingRuntime.executeStream()` hot-path 注入 working set 在 R2 (2026-06-18) 收口
-- **新模型启用，旧 natural_pause 路径保留**（双轨运行）
+- **新模型启用，原 natural_pause 路径已退役**（ADR-5 retired 2026-06-20）
 
 ### Phase 2: on-demand 工具 + Session Resume（已落地, PR-7/8 + PR-A4 + PR-30 / 2026-06-15~17）
 - 已新增 `context.search / summarize / recent` 3 工具（数据层 + builtin wrapper）
 - `LLMCodingRuntime.resume()` 已实现 (PR-A4) + `resumePreview()` (R5, 2026-06-20)
 - 跨 session working set 共享 (`linkToWorkspace` / `getWorkspaceWorkingSet` PR-30)
-- **`natural_pause` 去留延后到 R7 验收门后决策**
-
-### Phase 3: natural_pause 清理（延后, 取决于 R7 真实 replay 数据）
-- **若决定删除**：删 `natural_pause` 决策分支 + 对应 test
-- **若决定 opt-in**：加 `BABEL_O_SESSION_MEMORY_LITE_NATURAL_PAUSE` env flag
-- **若决定保留**：继续 P1 双轨
 
 ### Phase 4: 跨 Session 协同 + 时间窗 context（全部落地）
 - 多 session working set 广播 ✅（PR-26/27 event bus + WS）
@@ -1003,16 +991,18 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 - (-) Working set 内容必须严格控量
 - (-) 需要严格的更新逻辑避免膨胀
 
-### ADR-5: natural_pause 保留但 P0 完成后决定
+### ADR-5: natural_pause 退役 (Retired 2026-06-20)
 
-**Context**: 用户最初反馈"natural_pause 太激进"。
+**Context (history)**: 用户最初反馈"natural_pause 太激进"——`natural_pause` 在每个非工具 user 轮自动写 `session-memory.md`，体感"几乎每次都在压"。P0 (2026-06-14, PR-1) 加 `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag 默认压制换得短期缓解；ADR-5 承诺"待 P0/P1/P2 完成后看实际数据再决定删除 / opt-in / 保留"。
 
-**Decision**: 保留代码 + `BABEL_O_NATURAL_PAUSE_SUPPRESS` env 压制；待 P0/P1/P2 完成后看实际数据再决定删除 / opt-in / 保留。
+**Decision (retired 2026-06-20)**: 删除 `natural_pause` 决策分支 + `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag + `SessionMemoryLiteReason` enum 对应值 + `shared/events.ts` zod schema 对应值。5-reason contract 收敛为 `disabled / duplicate_turn / growth_threshold / forced / insufficient_signal`。原信号源（每轮非工具轨迹切片）由 working set + behaviorTrace 的 `trajectory-end` / `user-redirect` 触发器接管。`behaviorTrace.ts` / `behaviorMonitor.ts` / `behaviorTraceTap.ts` / `LLMCodingRuntime.ts` / `behavior-trace.test.ts` 5 处 `INV-11: do not revive natural_pause` 注释**保留**为治理护栏——禁止任何后续 commit 复活该分支。
 
 **Consequences**:
-- (+) 零风险过渡
-- (+) 决策基于实际数据
-- (-) 短期增加代码体积
+- (+) 移除 30+ 行 dormant branch + 1 个 env flag + 1 个 enum value
+- (+) 5-reason contract 测试覆盖完整（`growth_threshold` / `forced` / `duplicate_turn` / `disabled` / `insufficient_signal` 各自有独立断言）
+- (+) 治理债收敛：INV-11 注释从"延后决策"变为"主动护栏"
+- (-) 旧 fixture 含 `decisionReason: 'natural_pause'` 的事件需改用 `growth_threshold`（已在 test 中改写）
+- (-) 不再有"每 user 轮自动压缩"的合法路径——working set + behaviorTrace 100% 接管
 
 ### ADR-6: on-demand 工具不进 active context
 
@@ -1050,7 +1040,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | **P2.b** | `LLMCodingRuntime.resume()` | ~200 | 1 天 | 🟡 |
 | **P2.c** | 跨 session 共享 | ~150 | 1 天 | 🟡 |
 | **P2.d** | 测试 | ~500 | 1.5 天 | 🟡 |
-| **P3** | natural_pause 清理 | ~50 | 0.5 天 | 🟢 |
+| **P3** | ~~natural_pause 清理~~（已退役 2026-06-20，见 ADR-5） | — | — | ✅ |
 | **P4** | `bbl context` 扩展 | ~250 | 1.5 天 | 🟢 |
 | **P5** | behavior monitor 接入 | ~200 | 1.5 天 | 🟢 |
 | **总计** | | **~3160 行 / 14.5 工作日** | | |
@@ -1065,7 +1055,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | microcompact 改变事件语义 | 低 | 高 | INV-L8（不写事件）+ 完整 unit test + diff 模式 |
 | resume 慢 (>3s) | 中 | 中 | 工作集已持久化 + cache + INV-L10 硬约束 |
 | 跨 session 同步冲突 | 中 | 中 | workspaceId 锁 + 乐观更新 + 冲突日志 |
-| 与 natural_pause 双轨混乱 | 中 | 低 | P0 压制 + P3 清理（基于数据决策） |
+| ~~与 natural_pause 双轨混乱~~ | — | — | 已退役 (2026-06-20, ADR-5 retired)；5-reason contract + INV-11 护栏收口 |
 | Layer 3 各源失败 | 中 | 中 | 单源失败降级到标准 scope，不阻塞 turn |
 
 ---
@@ -1076,7 +1066,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 2. **跨 session 共享粒度**：所有 session 共享？按 task 共享？→ P2.c 决策
 3. **microcompact 是否计入 trace**：microcompact 改了 events 数组但没写事件，trace 看到的还是原始 events。是否需要写 `microcompact_summary` 到 trace？→ P1.c 决策
 4. **on-demand 工具权限**：模型主动调用 `context.search` 是否需要 approval？→ P2.a 决策
-5. **P0 完成后 natural_pause 数据**：自然废弃后，旧 `.babel-o/session-memory.md` 文件怎么办？自动转 behavior-trace？保留？→ P3 决策
+5. ~~P0 完成后 natural_pause 数据~~（已退役 2026-06-20，ADR-5）：旧 `.babel-o/session-memory.md` 文件保留现状，不主动迁移；用户 `bbl context` 命令族可读；自动迁移会污染事件流。
 
 ---
 
@@ -1129,7 +1119,6 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| Phase 0 | `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag | ✅ PR-1 (2026-06-14) |
 | Phase 1 | WorkingSetTracker in-memory + persistence | ✅ PR-4a/4b (2026-06-14) |
 | Phase 2 | contextTools (3 pure fns) + ToolRegistry | ✅ PR-7/8 (2026-06-15) |
 | Phase 2 | CLI working-set / history / resume | ✅ PR-9/10/13 (2026-06-15) |
