@@ -8479,3 +8479,101 @@
   - R5 (resume 从 class method 升级为可观察产品路径) 是 `bbl inspect-session --resume` 的真实可用性增强。
   - cwd-drift Phase D (`ContextEstimateCalibration`) / E (`ROOT_SCAN_REQUIRES_CONFIRMATION`) / F (`UserArtifactContinuity`) 仍 Open，等真实 regression 触发再推进。
   - Glob permission-denied 降级为 partial result 独立列入 tool-governance-plan follow-up。
+
+## 2026-06-21 — Layer-Direction Audit Enforcement (Phase 3 `--fail-on` advisory gate)
+
+> **完整规范**: [reference/layer-direction-audit-enforcement-plan.md](./reference/layer-direction-audit-enforcement-plan.md) — 长期架构规范（已采纳为 reference，Phase 1+2+3 全部已采纳）。
+
+- **背景**: 2026-06-21 architecture review 发现 `audit-dependency-boundency.js` 只查包级归属、`audit-coupling.js` 只出报表、`architecture-boundary.test.ts` 只测 `app.inject` 干净子路径，第一条设计铁律事实上无强制层方向审计。Phase 1+2 已于当日先收口（layer 方向审计 + checked-in allowlist + 架构边界测试断言方向）。
+- **Phase 3 实施**: `scripts/audit-coupling.js` 增加 `--fail-on` 模式：检查 `reverseImports.runtimeToNexus` 与 `reverseImports.nexusToCli` 任一非空即 `process.exitCode = 1`。`package.json` 新增 `coupling:audit:gate` script。`.github/workflows/ci.yml` 新增独立 `coupling-advisory` job（`continue-on-error: true`，违规发 PR summary 不阻断）—— 这是 advisory → 硬闸的中间形态，待噪声可控后晋升为阻断。
+- **架构测试新增**: `test/architecture-boundary.test.ts` 增加 `coupling audit --fail-on exits 0 on a clean tree` 测试，镜像现有 `layer direction audit passes successfully with zero violations` 模式。
+- **合成反向边验证**: 在 `src/runtime/tokenEstimator.ts` 临时追加 `import { _unused } from "../nexus/server.js"`，`node scripts/audit-coupling.js --fail-on` 退出 1 + stderr `❌ --fail-on: reverse imports detected: runtime -> nexus: 2 edge(s)`；恢复后退出 0 + `✅ --fail-on: no reverse runtime->nexus or nexus->cli imports`。
+- **验证**:
+  - `node scripts/audit-layer-direction.js`: 281 files / 1091 cross-module imports / `SUCCESS: No layer direction violations found!`
+  - `npm run coupling:audit:gate` (current tree): exit 0, `✅ --fail-on: no reverse runtime->nexus or nexus-to-cli imports`
+  - `npx tsx --test --test-concurrency=1 test/architecture-boundary.test.ts`: **7/7 pass**
+  - `npm run docs:check`: `failureCount: 0`
+- **边界**:
+  - `--fail-on` 当前只覆盖 `runtime -> nexus` 与 `nexus -> cli` 两个高层反向边，不覆盖 `cli -> runtime`（已被 layer-direction 审计覆盖）、`shared -> outside` 与其他底层→高层的边。
+  - `coupling-advisory` job 是 advisory 不阻断，晋升为硬闸需先观察 ≥1 个 PR 周期确认零或可解释违规。
+  - 不修改 [module-coupling-decoupling-and-re-aggregation-plan.md](./reference/module-coupling-decoupling-and-re-aggregation-plan.md) —— Phase 3 是同一长期规范的下一实施切片，不改变 coupling plan 的 phase 归属。
+- **后续可推进**:
+  - 把 `coupling-advisory` job 的 `continue-on-error: true` 去掉，advisory 升为硬闸。
+  - 把 `--fail-on` 覆盖范围扩展到 `shared -> outside` 与 `cli -> runtime`（与 layer-direction 审计冗余但耦合 dashboard 读者面更广）。
+  - `audit-coupling.js` 当前 stdout 仍出 json dashboard；advisory 模式下冗余输出可考虑合并到 summary。
+
+## 2026-06-21 — Layer-Direction Audit Enforcement Phase 3 promotion (advisory → blocking)
+
+> **完整规范**: [reference/layer-direction-audit-enforcement-plan.md](./reference/layer-direction-audit-enforcement-plan.md) — 长期架构规范 Phase 3 已从 advisory 升为 blocking 强制闸。
+
+- **背景**: 文档登记的 Phase 3 下一实施切片是 advisory → 硬闸晋升。在保持长期规范方向、不引入新耦合源（不回滚也不新增脚本）的前提下，把 `coupling-advisory` job 的 `continue-on-error: true` 去掉、把 job 重命名为 `coupling-gate`、把 PR summary 的措辞从"advisory"改为"failed (blocking)"。
+- **执行路径选择（不引入新耦合）**: 推进过程中曾试探扩展 `--fail-on` 覆盖 `sharedToOutside` —— 验证显示这会让当前干净树立刻 fail（命中遗留的 `shared/config.ts → providers/registry.ts`）。回滚该扩展（保留 `--fail-on` 只覆盖 `runtime → nexus` + `nexus → cli`），并在脚本与文档里明确记录"为何不扩"。这是按"保持耦合性聚合性"原则选择的路径：不与 layer-direction 审计的 allowlist 机制耦合、不需要新增 allowlist 文件、不分散反向边强制闸的归属。
+- **实施**:
+  - `.github/workflows/ci.yml`：job `coupling-advisory` → `coupling-gate`；去掉 `continue-on-error: true`；PR summary 文案改为 `## ❌ Coupling gate failed` + "This gate is now blocking"；指回参考文档。
+  - `scripts/audit-coupling.js`：`--fail-on` 块增加注释说明刻意不覆盖 `sharedToOutside` 的两条原因（遗留边、避免与 layer-direction 审计 allowlist 机制耦合）。
+  - `docs/nexus/reference/layer-direction-audit-enforcement-plan.md`：Phase 3 行 `Adopted 2026-06-21 (advisory)` → `Adopted 2026-06-21 (blocking)`；中文概述同步；"下一步"段更新为下一实施切片候选。
+- **验证**:
+  - `node scripts/audit-layer-direction.js`：282 files / 1095 imports / `SUCCESS: No layer direction violations found!`
+  - `npm run coupling:audit:gate`：exit 0, `✅ --fail-on: no reverse runtime->nexus or nexus->cli imports`
+  - `npx tsx --test --test-concurrency=1 test/architecture-boundary.test.ts`：**7/7 pass**
+  - `npm run docs:check`：`failureCount: 0`
+  - 合成反向边（临时向 `src/runtime/tokenEstimator.ts` 追加 `import '../nexus/server.js'`）→ exit 1 + stderr 报错；恢复后 exit 0（沿用之前已验证的反向边合成路径）。
+- **边界**:
+  - `--fail-on` 范围刻意只覆盖两个高层反向边，不扩到 `sharedToOutside`、`cli -> runtime` 或底层→高层边——这是已采纳的长期规范设计，不在本次晋升里扩大。
+  - `coupling-gate` job 现在阻断 PR；其阻断是同规范下的强制闸，与 `test/architecture-boundary.test.ts` 的断言（同样要求 `reverseImports.runtimeToNexus` / `nexusToCli` 为 `[]`）形成双向闭合：本地跑测试绿、CI 跑 gate 绿、两者针对同一组合约。
+  - 不修改 coupling plan 的 phase 归属或历史阶段表——本晋升是 layer-direction 规范下的 Phase 3 实施切片，与 coupling plan 是平行而非继承关系。
+- **后续可推进**:
+  - 观察若干 PR 的 `coupling-gate` 噪声确认零误报（无需新代码）。
+  - 把 `shared/config.ts → providers/registry.ts` 遗留边正式登记进 layer-direction 跨层 allowlist，作为同一规范的聚合扩展（见 [layer-direction-audit-enforcement-plan.md §Next steps](./reference/layer-direction-audit-enforcement-plan.md)）。
+  - 审视 `runtime → providers`（30 edges / 27 files）与 `nexus → storage`（20 edges / 19 files）两个高密度方向是否需纳入强制闸——更大架构动作，需单独提案。
+
+## 2026-06-21 — Layer-Direction Audit Enforcement: sharedToOutside gate cohesion (Phase 2 test)
+
+> **完整规范**: [reference/layer-direction-audit-enforcement-plan.md](./reference/layer-direction-audit-enforcement-plan.md) — 长期架构规范。
+> **决策来源**: 上一切片（advisory → blocking promotion）的"下一步"候选 (b) —— 在不引入新耦合源的前提下，确认 `shared → outside` 是否已有 blocking 闸。
+
+- **背景**: 推进候选 (b) 前先做"已存在性调查"。`scripts/audit-layer-direction.js` 的 6 条规则中 **Rule 4**（`shared → outside`）已在脚本 `:154` 实施；`scripts/layer-direction-allowlist.json:76-78` 已有唯一合法边 `src/shared/config.ts → src/providers/registry.ts`；`package.json:42` `npm run deps:audit` 用 `&&` 链 `audit-dependency-boundency.js` → `audit-layer-direction.js` → `npm ls`，违规即短链；`.github/workflows/ci.yml` 的 `deps:audit` step 跑同一脚本。
+- **关键发现**: `shared → outside` 方向**已经是 blocking 闸**。这是 Phase 1 实施时的"自然后果"——但没有专门的回归测试断言它。补 test 比扩展 `--fail-on` 更聚合（零新文件、零新脚本、零新 allowlist 入口）。
+- **路径选择（不引入新耦合）**:
+  - ❌ 扩展 `audit-coupling.js --fail-on` 覆盖 `sharedToOutside`——会立刻 fail（命中遗留边），需要新增 allowlist 机制 → 与 layer-direction 审计散开耦合 → **放弃**。
+  - ✅ 在 `architecture-boundary.test.ts` 新增一条 `execSync` 风格的回归断言（与 `coupling audit --fail-on exits 0 on a clean tree` 同模式），让 Rule 4 闸可测试、可回归。这是"按方向分组、单一 allowlist、跨方向不重复加闸"原则的具体落地。
+- **实施**:
+  - `test/architecture-boundary.test.ts` 新增测试 `layer direction audit exits 0 on a clean tree (shared -> outside already gated by rule 4)`：直接 `execSync('node scripts/audit-layer-direction.js', { stdio: 'pipe' })`，让非零 exit 自然抛错失败。
+  - 注释里说明此闸的来源链（Rule 4 → allowlist → `deps:audit` `&&` 链 → CI step），并明确 `shared → outside` 不在 `audit-coupling.js --fail-on` 范围以避免重复加闸。
+- **验证**:
+  - 干净树：`npx tsx --test --test-concurrency=1 test/architecture-boundary.test.ts` → **8/8 pass**（从 7/7 升）。
+  - 合成 `shared → runtime` 边（向 `src/shared/session.ts` 追加 `import '../runtime/hooks.js'`）：新测试 fail（符合设计）；恢复后 8/8 pass。
+  - 合成 `shared → cli` 边、合成 `shared → tools` 边同理触发。
+  - `node scripts/audit-layer-direction.js`：282 files / 1095 imports / `SUCCESS: No layer direction violations found!`
+  - `npm run deps:audit`：exit 0（layer 方向 + 依赖归属 + `npm ls` 全链路绿）。
+  - `npm run coupling:audit:gate`：exit 0（`runtime → nexus` + `nexus → cli` 仍 blocking，未受本切片影响）。
+  - `npm run docs:check`：`failureCount: 0`。
+- **边界**:
+  - 不新增 allowlist 文件、不修改 `layer-direction-allowlist.json`（已正确登记遗留边）、不修改 `audit-layer-direction.js`（Rule 4 已正确）、不修改 `audit-coupling.js`（`--fail-on` 范围保持 `runtime → nexus` + `nexus → cli` 不变）。
+  - `shared → outside` 与 `runtime → nexus` / `nexus → cli` 是**互补**而非**重复**：前者由 `audit-layer-direction.js` Rule 4 + allowlist 控制，后者由 `audit-coupling.js --fail-on` 控制；两者在 `architecture-boundary.test.ts` 各有独立回归测试。这是"按方向分组、单一 allowlist、跨方向不重复加闸"的设计。
+  - 注释明确"shared → outside"未列入 `--fail-on` 是设计而非遗漏：避免与 layer-direction 审计 allowlist 机制散开耦合。
+- **架构原则沉淀（值得记入项目记忆）**:
+  - 同一长期架构规范下的不同入口（layer-direction 审计 vs coupling dashboard）按方向分组，不重复加闸；新增方向时先在 `audit-layer-direction.js` 评估 Rule 4-6 的可复用性，再决定是否扩 `--fail-on`。
+  - 反向边闸的"已存在"判定不能只看脚本代码——必须沿 `audit → script chain → CI step → 回归测试` 全链验证；本切片通过 `deps:audit` `&&` 链的实证（合成 `shared → runtime` 边触发 exit 1）确认 Rule 4 闸已 blocking。
+  - 跨方向不重复加闸的另一面：每个方向都必须在测试层有独立回归断言。`architecture-boundary.test.ts` 4 条反向边闸断言（layer 审计 + coupling 数组 + layer 退出 + coupling `--fail-on` 退出）形成矩阵。
+- **后续可推进**:
+  - 观察 `deps:audit` 与 `coupling:audit:gate` 的零误报周期（无需新代码）。
+  - 审视 `runtime → providers`（30 edges）与 `nexus → storage`（20 edges）是否需要类似 `shared → outside` 的"已存在调查"——这些方向当前不被任何闸覆盖，是潜在下一批规范化对象。
+  - 评估 `audit-layer-direction.js` Rule 5-6（`bottom-layer → {cli,nexus}` / `bottom-layer → runtime`）是否也需要 `execSync` 风格回归断言。
+
+## 2026-06-21 — Stream G closure: 8 repositories extracted from SqliteStorage (Phase 9 closed)
+
+- **背景**: `module-coupling-decoupling-and-re-aggregation-plan.md` Phase 9 (Stream G Storage Decoupling) opened 2026-06-20, closed today with 8 repository classes extracted from the 1753-line `SqliteStorage.ts` monolith. Each slice preserved byte-identical SQL behavior, gate-clean, and added a focused per-repository test file.
+- **改动 (3B-20 → 3B-27, 8 commits, ahead of origin by 8)**:
+  - 3B-20: `src/storage/EventRepository.ts` (206 lines, events + sequence allocation + duplicate-repair + tool-trace / execution-metrics callbacks)
+  - 3B-21: `src/storage/TaskRepository.ts` (166 lines, tasks + JSON-column serialization for `dependsOn` / `blocks` / `review` / `metadata`)
+  - 3B-22: `src/storage/AuditRepository.ts` (131 lines, permission_audits + `approved` / `denied` decision enum)
+  - 3B-23: `src/storage/ToolTraceRepository.ts` (210 lines, tool_traces + composite `started_at | tool_use_id` cursor pagination)
+  - 3B-24: `src/storage/SessionChannelRepository.ts` (316 lines, session_channels + session_messages + cross-table inbox filter + read-modify-write acknowledge)
+  - 3B-25: `src/storage/AgentJobRepository.ts` (145 lines, agent_jobs + dual storage `job_json` + indexed filter columns)
+  - 3B-26: `src/storage/ExecutionMetricsRepository.ts` (243 lines, execution_metrics + 36 columns + `booleanToDb` / `dbToBoolean` 0/1 encoding)
+  - 3B-27: `src/storage/LoopPaneRepository.ts` (181 lines, loop_state + read-modify-write `updateLoopPaneRev`)
+- **净效果**: `SqliteStorage.ts` 1753 → 968 lines (-785 / -44.8%) acting as a thin-delegation facade that owns only schema setup, transaction locks, public-method dispatch, and cross-cutting helpers (session row map, `listAllEvents` for `SessionGetOptions`).
+- **测试**: 8 new per-repository test files (6 + 7 + 6 + 8 + 9 + 10 + 7 + 12 = 65 cases) + 2 existing `test/storage.test.ts` cases = **67 storage tests pass**, byte-identical with prior behavior. R2/R5/R7 (21/21), `coupling:audit --fail-on`, `deps:audit`, `layer-direction`, `typecheck` all green.
+- **核心耦合 (回应对「核心耦合性问题解决」标准)**: 单文件管理 9 个表 → 9 个聚焦 module（1 thin-delegation facade + 8 repository）。每个 repository 单一职责、独立 reviewable、独立 testable。所有 SQL UPSERT / WHERE / ORDER BY / JSON 序列化模式 byte-identical。
+- **后续**: Stream G 在该表面上不再有可被独立边界问题驱动的进一步抽取。Phase 9 row 改 `Closed 2026-06-21`。Phase 3B+ 主循环边界（LLMCodingRuntime 1841 → 1493）继续 Watch。
