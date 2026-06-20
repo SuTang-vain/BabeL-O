@@ -30,6 +30,7 @@ import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
 import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
 import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
 import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
+import { executeProviderTurn } from './executeProviderTurn.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -806,25 +807,30 @@ export class LLMCodingRuntime implements NexusRuntime {
         const invocationStartMs = performance.now()
         let providerTurn: RuntimeProviderTurn
         try {
-          const providerTurnStream = providerTurnDriver.run({
-            adapter,
-            queryParams,
-            adapterOptions,
-            sessionId: options.sessionId,
-            signal: options.signal,
-            executionStartMs: metrics.executionStartMs,
-            queryStartMs: invocationStartMs,
-            finalResponseOnlyMode,
-            suppressToolsForCurrentIntent,
-            modelVisibleToolCount: modelVisibleTools.length,
-            memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
-          })
-          let providerTurnResult = await providerTurnStream.next()
-          while (!providerTurnResult.done) {
-            yield providerTurnResult.value
-            providerTurnResult = await providerTurnStream.next()
-          }
-          providerTurn = providerTurnResult.value
+          // The implementation lives in
+          // `executeProviderTurn.ts` (Phase 3B-15 helper
+          // extraction). The helper drives the
+          // ProviderTurnDriver.run async generator and
+          // returns { events, providerTurn }. The main
+          // loop drives the user-facing yield loop and
+          // the catch-block below (recovery + post-
+          // invocation hooks).
+          const { events: providerTurnEvents, providerTurn: providerTurnValue } =
+            await executeProviderTurn(providerTurnDriver, {
+              adapter,
+              queryParams,
+              adapterOptions,
+              sessionId: options.sessionId,
+              signal: options.signal,
+              executionStartMs: metrics.executionStartMs,
+              queryStartMs: invocationStartMs,
+              finalResponseOnlyMode,
+              suppressToolsForCurrentIntent,
+              modelVisibleToolCount: modelVisibleTools.length,
+              memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
+            })
+          for (const e of providerTurnEvents) yield e
+          providerTurn = providerTurnValue
         } catch (error) {
           const providerRecovery = classifyProviderRecovery(error)
           const postInvocationHooks = await executeRuntimeHooks(
