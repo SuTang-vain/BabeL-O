@@ -2,6 +2,37 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-21 — bashClassifier quote-aware fix (副发现, follow-up of Bug 1.2)
+
+- **背景**: Bug 1.2 fix 让模型能看到 deny message 中的 classifier rule 名（`chained-semicolon` / `output-redirect` / `command:sqlite3-not-allowlisted` 等）。但 e2e session `session_ea4f1793` 还暴露一个副 bug：`findDangerousPattern` 在 raw command 字符串上跑 regex，没用 `tokenizeBashCommand` 的 quote-aware 输出。导致所有"在引号里的分号/管道/重定向"被误识别为真 shell operator，触发 false-positive `chained-semicolon` / `output-redirect` 等规则。
+- **触发场景**（5 类 false positive）：
+  - `echo "SELECT 1;"` → 被识别为 `chained-semicolon`
+  - `echo "x > y"` → 被识别为 `output-redirect`
+  - `sqlite3 foo.db "SELECT * FROM t WHERE c = 'a;b'"` → 被识别为 `chained-semicolon`
+  - `sqlite3 -line ~/.babel-o/db.sqlite "SELECT 1; SELECT 2;" 2>/dev/null` → 修复前 `chained-semicolon`，修复后正确指向真正的 `2>/dev/null` 重定向 (`output-redirect`)
+  - `echo "a | b"` → 修复前巧合 `read`（`pipe-to-shell` regex 要求特定 shell 名），修复后稳定 `read`
+- **设计选择**:
+  - 不改 DANGEROUS_PATTERNS regex（保持 regex 简洁，避免维护成本）
+  - 不改 `tokenizeBashCommand`（它已经处理引号，但只输出 token 数组；regex 在 raw 上跑 token 会丢位置信息）
+  - **最小、可验证的 fix**：在 `findDangerousPattern` 前加 `maskQuotedSegments(command)` helper，把引号内 char 替换为空格（保持长度对齐），然后 regex 在 masked string 上跑。这样 unquoted operator 仍命中，quoted operator 被 mask 掉。
+- **实现**:
+  - **`src/tools/builtin/bashClassifier.ts`**: 新增 `maskQuotedSegments(command: string): string` (~30 行) — 单/双引号内 char 替换为空格（保留 `\t`/`\n`）；quote chars 本身保留。`findDangerousPattern` 改为先 mask 再 regex，pattern 列表不变。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/bash-classifier.test.ts` (12 → 16 cases):
+    - 翻转既有 'quoted arguments correctly' 测试: `git log "x; y" --oneline` 从 `expectExecute chained-semicolon` 改为 `expectRead`（旧行为即 bug）。
+    - 新增 'dangerous patterns OUTSIDE quotes still fire' (3 case): `echo hi; echo bye` / `echo hi > /tmp/out` / `cat /etc/foo 2>/dev/null || echo fallback` / 真实 session_ea4f1793 sqlite3 + `2>/dev/null` 联合。
+    - 新增 'dangerous patterns INSIDE quotes do NOT fire' (3 case): sqlite3 SQL `;` / `echo "x > y"` / `echo "a | b"`。
+    - 16/16 pass。
+  - 跨 spec 回归: 248/248 pass (含 bash-classifier + bash-deny + runtime + security + context-tools + context-sessions + r4)。
+  - **真实 e2e** session_a0e44a50: bash `sqlite3 -line ~/.babel-o/db.sqlite "SELECT 1; SELECT 2;" 2>/dev/null` → deny message `Tool denied by Nexus policy: Bash (classifier: output-redirect)` → 模型正确识别 `2>/dev/null` 是真危险点 + 解释 + 建议（去掉重定向）。修复前会被 `chained-semicolon` 误导（模型会以为 SQL 分号是问题）。
+- **边界**:
+  - 不改 DANGEROUS_PATTERNS regex；只改输入。
+  - 不改 `tokenizeBashCommand`（它本来就 quote-aware）。
+  - `\\$(command-substitution)` 不受影响（`$(` 和 `)` 都在 unquoted 区域）。
+  - `rm`/`mv`/`cp`/`curl`/`wget` 等命令名 regex 在 token 流上触发（先于 dangerous-pattern 层），不受 mask 影响。
+  - backslash 转义 inside `"\\;"` 仍被 mask（POSIX shell 不识别这些转义；regex 也无需查 escape 序列）。
+
 ## 2026-06-21 — Bug 2: context observer redaction leaks systemPromptBlocks[].text
 
 - **背景**: 真实 e2e 探测（2026-06-20/21）通过 `/v1/context/observe` 在 active turn 期间收到的 `assembled` frame，验证 `redactContext(ctx, 'summary')` 的隐私完整性 — 发现 **R4 的 summary 模式实际并未生效**：frame 里 `context.systemPromptBlocks[].text` 完整呈现（18k+ char system prompt + tool contract lines verbatim），`context.systemPrompt` 也仍然在 payload 里。这是 **真泄漏**：任何订阅 `/v1/context/observe` WS 的 consumer（Go TUI、外部 dashboard、未来 SDK）都会拿到完整 prompt 文本，而 R4 spec 明确要求 summary 模式只暴露长度 / counts / cacheable split。
