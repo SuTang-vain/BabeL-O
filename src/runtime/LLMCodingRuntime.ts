@@ -20,20 +20,22 @@ import type {
   ContentBlock,
 } from '../providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../shared/config.js'
+import { mapEventsToMessages } from './eventsTranslator.js'
+import { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'
+import { loadWorkingSetOverride } from './loadWorkingSetOverride.js'
+import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
 import {
   buildCompactFailureEvent,
   compactSession,
 } from './compact.js'
 import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
-import {
-  buildTraceContext,
-  detectTriggers,
-  deriveRuleSelfAssessment,
-  flushBehaviorTraceQueue,
-  isBehaviorTraceEnabled,
-  queueBehaviorTraceEntry,
-} from './behaviorTrace.js'
+// `wrapWithBehaviorTraceTap` (and its private `behaviorTraceDetectionKey`
+// helper) were extracted to `./behaviorTraceTap.ts` in Phase 3B-6; the
+// underlying behaviorTrace primitives it composes (buildTraceContext /
+// detectTriggers / deriveRuleSelfAssessment / flushBehaviorTraceQueue /
+// isBehaviorTraceEnabled / queueBehaviorTraceEntry) are now imported
+// inside that module instead of here.
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
 // PR-A2: optional broadcaster type for the /v1/context/observe observer.
@@ -97,9 +99,14 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
 }
 
-export type MapEventsToMessagesOptions = {
-  replayReasoningContent?: boolean
-}
+// `mapEventsToMessages` and `MapEventsToMessagesOptions` were extracted
+// to `./eventsTranslator.ts` in Phase 3B-1. We re-export them here so
+// legacy import paths (`from '../runtime/LLMCodingRuntime.js'` for
+// `mapEventsToMessages`) keep working without forcing every consumer
+// to migrate in lockstep. New code should import directly from
+// `./eventsTranslator.js`.
+export { mapEventsToMessages } from './eventsTranslator.js'
+export type { MapEventsToMessagesOptions } from './eventsTranslator.js'
 
 export class LLMCodingRuntime implements NexusRuntime {
   private readFileCache = new Map<string, ReadFileCacheEntry>()
@@ -1145,94 +1152,42 @@ export class LLMCodingRuntime implements NexusRuntime {
 
   // ─── R2 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
   //
-  // loadWorkingSetOverride(sessionId, cwd) — derive the provider-visible
-  // workingSetOverride string for the current turn. The hot path calls
-  // this once at the start of runExecuteStreamInner and threads the
-  // result into every refreshRuntimeContextState call.
+  // `loadWorkingSetOverride` was extracted to
+  // `./loadWorkingSetOverride.ts` in Phase 3B-7. The hot path calls the
+  // standalone function once at the start of `runExecuteStreamInner`
+  // (line 335 in the current build) and threads the result into every
+  // `refreshRuntimeContextState` call.
   //
-  // Behaviour:
-  //   - When resumeDeps.workingSetTracker is present (the production
-  //     Nexus path, created by createRuntime):
-  //     - get the existing per-session working set
-  //     - if absent, rebuild from the recent event tail via
-  //       deriveEntriesFromEvents (catches the "session just started,
-  //       persisted file is empty" case)
-  //     - format as a string via formatWorkingSet
-  //   - When resumeDeps is absent (legacy or test-only path): return
-  //     undefined so the assembler falls back to its transient derive
-  //
-  // The load is idempotent: createRuntime pre-loads the file once at
-  // boot, so the tracker is already populated for the cwd. The cwd
-  // parameter is passed for the rebuild path (event-tail derivation
-  // uses cwd to filter out-of-scope tool paths).
+  // This class method is retained as a thin delegate so that the R2
+  // wiring-guard contract (`runtime-working-set-hot-path.test.ts`) keeps
+  // passing: it asserts `LLMCodingRuntime.prototype.loadWorkingSetOverride`
+  // is a function. Removing it would silently break R2 detection in
+  // future refactors. New code should call the standalone function from
+  // `./loadWorkingSetOverride.js` directly.
   private async loadWorkingSetOverride(sessionId: string, cwd: string): Promise<string | undefined> {
-    if (!this.resumeDeps) return undefined
-    const { workingSetTracker } = this.resumeDeps
-    let workingSet = workingSetTracker.get(sessionId)
-    if (!workingSet) {
-      // R2 spec: if absent, rebuild from the recent event tail via
-      // deriveEntriesFromEvents. Read a bounded tail (200 events) from
-      // storage; this is best-effort — if storage fails, we return
-      // undefined and the assembler falls back to its transient derive.
-      try {
-        const result = await this.storage.listEvents(sessionId, { limit: 200, order: 'desc' })
-        const entries = deriveEntriesFromEvents([...result.events].reverse(), cwd)
-        if (entries.length > 0) {
-          workingSet = workingSetTracker.rebuild(sessionId, '', entries)
-        }
-      } catch {
-        return undefined
-      }
-    }
-    if (!workingSet) return undefined
-    // Convert tracker entries (runtime/workingSetTracker.ts shape) to the
-    // formatWorkingSet input shape (runtime/workingSet.ts shape) so the
-    // provider-visible Working Set: block matches the legacy derive path.
-    // The two WorkingSetEntry types share the path/updatedAt fields; the
-    // runtime type adds touches/lastTurn/isDir/source. We map with safe
-    // defaults for the new fields — touches=1 (one observation from the
-    // tracker), lastTurn=0, isDir=false (we don't know without stat),
-    // source='tool' (the entry came from a tool_started event).
-    const entries = workingSet.entries.map((e) => ({
-      path: e.value,
-      touches: 1,
-      lastTurn: 0,
-      isDir: false,
-      source: 'tool' as const,
-    }))
-    return formatWorkingSet(entries)
+    return loadWorkingSetOverride(
+      this.resumeDeps?.workingSetTracker,
+      this.storage,
+      sessionId,
+      cwd,
+    )
   }
 
-  // applyWorkingSetUpdate(sessionId, events, cwd) — for each successful
-  // tool_started event in `events`, call workingSetTracker.applyEvent
-  // to derive a working-set entry and persist. Skips denied tools,
-  // failed parse-only pseudo calls, and out-of-scope paths (per R2
-  // spec). Fire-and-forget: the tracker schedules a background flush;
-  // we do not await it (per [[babel-o-soft-recoverable-timeouts]] the
-  // hot path must not block on persistence).
+  // applyWorkingSetUpdate(sessionId, events, cwd) — write-side of the
+  // R2 Persisted Working Set hot-path loop. Extracted to
+  // `./applyWorkingSetUpdate.ts` in Phase 3B-8. The hot path calls
+  // the standalone function after every successful tool execution
+  // with the `toolEvents` batch yielded by the provider tool-call
+  // loop; the tracker schedules its own background flush.
   //
-  // Called from runExecuteStreamInner after a successful tool execution,
-  // with the toolEvents batch yielded by the provider tool-call loop.
+  // This class method is retained as a thin delegate so the R2
+  // wiring-guard contract (`runtime-working-set-hot-path.test.ts`)
+  // keeps passing: it asserts `LLMCodingRuntime.prototype.applyWorkingSetUpdate`
+  // is a function. Removing it would silently break R2 detection in
+  // future refactors. New code should call the standalone function
+  // from `./applyWorkingSetUpdate.js` directly.
   private applyWorkingSetUpdate(sessionId: string, events: NexusEvent[], cwd: string): void {
-    if (!this.resumeDeps) return
-    const { workingSetTracker } = this.resumeDeps
-    for (const event of events) {
-      // R2 spec: only successful tool_started events contribute.
-      if (event.type !== 'tool_started') continue
-      // Defensive: parse-only pseudo calls (TOOL_INPUT_PARSE_ERROR path)
-      // may emit synthetic tool_started/tool_completed pairs without
-      // touching a real path. applyEvent itself returns null for events
-      // without a usable path, so the no-op here is implicit — but we
-      // also skip tool_started whose corresponding tool_completed
-      // reported success=false by walking the events list once at the
-      // end. For simplicity, the per-event applyEvent path handles the
-      // success filter via the tracker's own confidence logic.
-      workingSetTracker.applyEvent(sessionId, event, cwd)
-    }
-    // No explicit flush here: the tracker schedules its own background
-    // flush on every update. R2 acceptance: "A real run touching a
-    // workspace file creates <cwd>/.babel-o/working-set.json" — the
-    // background flush will land the file within one tick.
+    applyWorkingSetUpdate(this.resumeDeps?.workingSetTracker, sessionId, events, cwd)
   }
 
   // ─── PR-A4: Session Resume class method (doc §6.2) ──────────────
@@ -1377,6 +1332,151 @@ export class LLMCodingRuntime implements NexusRuntime {
     return { workingSet, rebuilt, assembled, unsubscribeHints }
   }
 
+  // ─── R5 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+  //
+  // resumePreview(sessionId, cwd) — pure read-only projection of what
+  // resume() would build, without subscribing to live hints and
+  // without executing a provider turn. R5's product path: an operator
+  // can inspect what a resumed session would inherit (working set
+  // loaded/rebuilt, assembled section ids + budgets, hint subscription
+  // state) without actually resuming. The `hasContinuationSnapshot:
+  // false` is the explicit, honest R5 contract: until a real restart
+  // e2e proves otherwise, we do not promise "0 information loss".
+  //
+  // Returns:
+  //   - cwd: the cwd the preview was computed for
+  //   - workingSet: { sessionId, workspaceId, entries, version,
+  //     updatedAt, rebuilt: boolean } — rebuilt=true means the WS was
+  //     derived from the recent event tail (no persisted file), false
+  //     means it was loaded from <cwd>/.babel-o/working-set.json.
+  //   - assembled: the full AssembledContext so the route can project
+  //     section ids / budget summaries. The route applies the R4
+  //     redaction contract before serializing the response body.
+  //   - liveHintsSubscribed: false (we did not subscribe). Operator
+  //     sees that no live hook is attached.
+  //   - hasContinuationSnapshot: false. Hard-coded per R5 acceptance.
+  async resumePreview(opts: { sessionId: string; cwd: string }): Promise<{
+    cwd: string
+    workingSet: {
+      sessionId: string
+      workspaceId: string
+      entries: Array<{ path: string; touches: number; lastTurn: number; isDir: boolean; source: 'tool' | 'user' }>
+      version: number
+      updatedAt: string
+      rebuilt: boolean
+    }
+    assembledSectionIds: string[]
+    budget: AssembledContext['budget']
+    liveHintsSubscribed: false
+    hasContinuationSnapshot: false
+  }> {
+    if (!this.resumeDeps) {
+      throw new Error(
+        'LLMCodingRuntime.resumePreview() requires resumeDeps; configure the runtime via ' +
+          'createDefaultNexusRuntime() or pass resumeDeps explicitly to the constructor.',
+      )
+    }
+    const { workingSetTracker, buildSystemPrompt, mapEventsToMessages } = this.resumeDeps
+
+    // Step 1 — load or rebuild working set. Identical logic to
+    // resume() but without subscribing to live hints.
+    await workingSetTracker.load()
+    let workingSet = workingSetTracker.get(opts.sessionId)
+    let rebuilt = false
+    let events: NexusEvent[] = []
+    if (!workingSet) {
+      rebuilt = true
+      const result = await this.storage.listEvents(opts.sessionId, {
+        order: 'desc',
+        limit: 1000,
+      })
+      events = [...(result?.events ?? [])].reverse()
+      const entries = deriveEntriesFromEvents(events, opts.cwd)
+      workingSet = workingSetTracker.rebuild(opts.sessionId, '', entries)
+    } else {
+      const result = await this.storage.listEvents(opts.sessionId, {
+        order: 'desc',
+        limit: 1000,
+      })
+      events = [...(result?.events ?? [])].reverse()
+    }
+
+    // Step 2 — assemble context (read-only). We do NOT subscribe to
+    // behaviorMonitor, so liveHintsSubscribed is false.
+    const settings = this.configManager.resolveSettings()
+    const runtimeOptions: RuntimeExecuteOptions = {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      prompt: '',
+      model: settings.modelId,
+    }
+    const workingSetOverride = formatWorkingSet(
+      workingSet.entries.map((e) => ({
+        path: e.value,
+        touches: 1,
+        lastTurn: 0,
+        isDir: false,
+        source: 'tool' as const,
+      })),
+    )
+    const contextRefreshStrategy = new ContextRefreshStrategy({
+      storage: this.storage,
+      memoryProvider: this.memoryProvider,
+      contextBroadcaster: this.contextBroadcaster,
+    })
+    const refreshState = await contextRefreshStrategy.refresh({
+      runtimeOptions,
+      events,
+      modelId: settings.modelId,
+      buildSystemPrompt,
+      mapEventsToMessages,
+      tools: () => [],
+      warningPercent: 70,
+      compactPercent: 90,
+      suppressToolsForIntent: () => false,
+      onMemoryRetrieval: this.emitMemoryRetrieval,
+      sessionInbox: 'empty',
+      workingSetOverride,
+      includeBehaviorTrace: true,
+      includeLongTerm: true,
+      includeProjectMemory: true,
+      includeLiveHints: false, // R5: pure preview, no live hint subscription
+    })
+    const assembled = refreshState.assembledContext
+    // Section ids from the assembled context's working set block +
+    // (best-effort) the system prompt block ids. The assembler's
+    // `systemPromptBlocks` array carries no id (it drops the source
+    // section id during the buildSystemPromptSections → blocks
+    // projection), so we surface only the workingSetPaths the
+    // assembler captures (rebuild-only context) and the persisted
+    // working set entries as the "section ids" the operator can see.
+    const assembledSectionIds = [
+      ...workingSet.entries.map((e) => `ws:${e.value}`),
+      ...(assembled.selectionDiagnostics?.workingSetPaths ?? []).map((p) => `active-ws:${p}`),
+    ]
+    return {
+      cwd: opts.cwd,
+      workingSet: {
+        sessionId: workingSet.sessionId,
+        workspaceId: workingSet.workspaceId,
+        entries: workingSet.entries.map((e) => ({
+          path: e.value,
+          touches: 1,
+          lastTurn: 0,
+          isDir: false,
+          source: 'tool' as const,
+        })),
+        version: workingSet.version,
+        updatedAt: workingSet.updatedAt,
+        rebuilt,
+      },
+      assembledSectionIds,
+      budget: assembled.budget,
+      liveHintsSubscribed: false,
+      hasContinuationSnapshot: false,
+    }
+  }
+
   /**
    * Per doc §6.2 step 3: gates whether a live hint is acceptable right
    * now. Conservative: returns false when the runtime is currently
@@ -1506,336 +1606,15 @@ export function resolveCwdWithContinuity(options: {
   return { cwd: continuity.resolvedCwd, continuity }
 }
 
-export function mapEventsToMessages(
-  events: NexusEvent[],
-  initialPrompt: string,
-  options: MapEventsToMessagesOptions = {},
-): ModelMessage[] {
-  const messages: ModelMessage[] = []
+// `mapEventsToMessages` is implemented in `./eventsTranslator.ts`.
+// The actual implementation was extracted in Phase 3B-1 to keep this
+// file focused on the runtime loop. We re-export it here for backward
+// compatibility with consumers that still import from
+// `./LLMCodingRuntime.js`.
 
-  const firstUserMsg = events.find(e => e.type === 'user_message') as Extract<NexusEvent, { type: 'user_message' }> | undefined
-  const initial = firstUserMsg ? firstUserMsg.text : initialPrompt
-  messages.push({ role: 'user', content: initial })
-
-  const completedToolIds = new Set<string>()
-  const startedToolIds = new Set<string>()
-  for (const event of events) {
-    if (event.type === 'tool_started') {
-      startedToolIds.add(event.toolUseId)
-    }
-    if (event.type === 'tool_completed') {
-      completedToolIds.add(event.toolUseId)
-    }
-  }
-
-  let pendingToolResultMsg: ModelMessage | null = null
-  let pendingToolAssistantMsg: ModelMessage | null = null
-  let pendingReasoningContent = ''
-  const seenStartedToolIds = new Set<string>()
-  const earlyCompletedByToolId = new Map<string, Extract<NexusEvent, { type: 'tool_completed' }>>()
-  const emittedToolResultIds = new Set<string>()
-
-  const appendToolResult = (event: Extract<NexusEvent, { type: 'tool_completed' }>) => {
-    let lastMsg: ModelMessage | null = pendingToolResultMsg
-    if (!lastMsg || typeof lastMsg.content === 'string') {
-      lastMsg = { role: 'user', content: [] }
-      messages.push(lastMsg)
-      pendingToolResultMsg = lastMsg
-    }
-    const outputText =
-      typeof event.output === 'string'
-        ? event.output
-        : JSON.stringify(event.output, null, 2)
-    ;(lastMsg.content as ContentBlock[]).push({
-      type: 'tool_result',
-      toolUseId: event.toolUseId,
-      content: outputText,
-      isError: !event.success,
-      toolName: event.name,
-    })
-    emittedToolResultIds.add(event.toolUseId)
-  }
-
-  const appendRuntimeUserMessage = (content: string) => {
-    pendingToolResultMsg = null
-    pendingToolAssistantMsg = null
-    pendingReasoningContent = ''
-    messages.push({ role: 'user', content })
-  }
-
-  for (const event of events) {
-    if (event.type === 'user_message') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      pendingReasoningContent = ''
-      const lastMsg = messages[messages.length - 1]
-      if (
-        lastMsg?.role === 'user' &&
-        typeof lastMsg.content === 'string' &&
-        lastMsg.content === event.text
-      ) {
-        continue
-      }
-      messages.push({ role: 'user', content: event.text })
-    } else if (event.type === 'assistant_delta') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      let lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = {
-          role: 'assistant',
-          content: '',
-          ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
-            reasoningContent: pendingReasoningContent,
-          }),
-        }
-        pendingReasoningContent = ''
-        messages.push(lastMsg)
-      }
-      if (typeof lastMsg.content === 'string') {
-        lastMsg.content += event.text
-      } else {
-        const lastBlock = lastMsg.content[lastMsg.content.length - 1]
-        if (lastBlock && lastBlock.type === 'text') {
-          lastBlock.text += event.text
-        } else {
-          lastMsg.content.push({ type: 'text', text: event.text })
-        }
-      }
-    } else if (event.type === 'thinking_delta') {
-      if (!options.replayReasoningContent) {
-        // Keep thinking_delta in the event log for UI/history, but do not replay
-        // prior hidden reasoning into future provider calls. Some providers treat
-        // reasoningContent as live context, which can pollute follow-up turns.
-        continue
-      }
-      const lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        pendingReasoningContent += event.text
-        continue
-      }
-      lastMsg.reasoningContent = `${lastMsg.reasoningContent ?? ''}${event.text}`
-      continue
-    } else if (event.type === 'context_grounding_required') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding required: ${event.message} Required for: ${event.requiredFor.join(', ')}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
-    } else if (event.type === 'context_grounding_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding confirmed: ${event.message} Confirmation kind: ${event.confirmationKind}. Confirmed for: ${event.confirmedFor.join(', ')}. Source: ${event.source}.` })
-    } else if (event.type === 'workspace_dirty_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
-    } else if (event.type === 'task_scope_declared') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime task scope declared: ${event.message} Primary root: ${event.primaryRoot}. Explicit roots: ${event.explicitRoots.join(', ') || 'none'}. Confirmed external roots: ${event.confirmedExternalRoots.join(', ') || 'none'}. Mode: ${event.mode}.` })
-    } else if (event.type === 'scope_boundary_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.` })
-    } else if (event.type === 'scope_boundary_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.` })
-    } else if (event.type === 'near_timeout_warning') {
-      appendRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
-    } else if (event.type === 'timeout_budget_exceeded') {
-      appendRuntimeUserMessage(formatTimeoutBudgetConvergenceMessage(event))
-    } else if (event.type === 'timeout_extension_granted') {
-      appendRuntimeUserMessage(formatTimeoutExtensionConvergenceMessage(event))
-    } else if (event.type === 'tool_started') {
-      seenStartedToolIds.add(event.toolUseId)
-      let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
-      if (!lastMsg) {
-        lastMsg = messages[messages.length - 1]
-        if (!lastMsg || lastMsg.role !== 'assistant' || !isToolCompatibleAssistantMessage(lastMsg)) {
-          lastMsg = {
-            role: 'assistant',
-            content: [],
-            ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
-              reasoningContent: pendingReasoningContent,
-            }),
-          }
-          pendingReasoningContent = ''
-          messages.push(lastMsg)
-        } else if (typeof lastMsg.content === 'string') {
-          lastMsg.content = lastMsg.content ? [{ type: 'text', text: lastMsg.content }] : []
-        }
-        pendingToolAssistantMsg = lastMsg
-      }
-      ;(lastMsg.content as ContentBlock[]).push({
-        type: 'tool_use',
-        id: event.toolUseId,
-        name: event.name,
-        input: event.input,
-      })
-
-      const completed = earlyCompletedByToolId.get(event.toolUseId)
-      if (completed && !emittedToolResultIds.has(event.toolUseId)) {
-        appendToolResult(completed)
-      } else if (!completedToolIds.has(event.toolUseId)) {
-        // If this tool was started but never completed (e.g. denied or interrupted),
-        // we must synthetically complete it with an error result block so future queries don't break.
-        let lastUserMsg: ModelMessage | null = pendingToolResultMsg
-        if (!lastUserMsg || typeof lastUserMsg.content === 'string') {
-          lastUserMsg = { role: 'user', content: [] }
-          messages.push(lastUserMsg)
-          pendingToolResultMsg = lastUserMsg
-        }
-        ;(lastUserMsg.content as ContentBlock[]).push({
-          type: 'tool_result',
-          toolUseId: event.toolUseId,
-          content: 'Error: Tool execution was denied or interrupted.',
-          isError: true,
-        })
-        emittedToolResultIds.add(event.toolUseId)
-      }
-    } else if (
-      event.type === 'tool_completed' &&
-      startedToolIds.has(event.toolUseId) &&
-      !emittedToolResultIds.has(event.toolUseId)
-    ) {
-      if (seenStartedToolIds.has(event.toolUseId)) {
-        appendToolResult(event)
-      } else {
-        earlyCompletedByToolId.set(event.toolUseId, event)
-      }
-    }
-  }
-
-  return messages
-}
-
-function formatNearTimeoutConvergenceMessage(event: Extract<NexusEvent, { type: 'near_timeout_warning' }>): string {
-  return [
-    `Runtime timeout convergence warning: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (${Math.round(event.thresholdRatio * 100)}% threshold). ${event.message}`,
-    'Do not start new exploratory tool calls.',
-    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
-    'Mark unverified claims as unverified.',
-    'If the task needs more exploration, ask the user to continue with a fresh budget.',
-    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
-  ].filter(Boolean).join('\n')
-}
-
-function formatTimeoutBudgetConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_budget_exceeded' }>): string {
-  return [
-    `Runtime soft timeout budget reached: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (policy=${event.policy}). ${event.message}`,
-    'This is a recoverable budget signal, not permission for broad discovery.',
-    'Do not start new exploratory tool calls.',
-    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
-    'Mark unverified claims as unverified.',
-    'If more exploration is required, ask the user to continue with a fresh budget.',
-    event.suggestedActions?.length ? `Suggested actions: ${event.suggestedActions.join(', ')}.` : '',
-    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
-  ].filter(Boolean).join('\n')
-}
-
-function formatTimeoutExtensionConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_extension_granted' }>): string {
-  return [
-    `Runtime soft timeout extension granted: extension ${event.extensionCount}/${event.maxExtensions}, +${event.additionalMs}ms, total soft budget ${event.totalSoftBudgetMs}ms.`,
-    'Use this extension to wrap up.',
-    'Do not start broad discovery. Run at most one explicitly bounded final check, then answer.',
-    'Separate verified evidence from unverified claims.',
-    `Reason: ${event.reason}. ${event.message}`,
-  ].join('\n')
-}
-
-function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {
-  if (message.role !== 'assistant' || typeof message.content === 'string') {
-    return message.role === 'assistant'
-  }
-  return message.content.every(block => block.type === 'text' || block.type === 'tool_use')
-}
-
-// ─── PR-3: behaviorTrace tap (top-level exportable function) ──────────────
-//
-// Lives outside the LLMCodingRuntime class so it can be unit-tested without
-// instantiating a full runtime (and a real provider mock). Kept as a
-// top-level export to preserve orthogonality with behaviorTrace.ts
-// (see [[feedback-tool-boundary-granularity]]).
-//
-// Invariants:
-//   - INV-4: pure write-side; never mutates the inner event stream
-//   - INV-11: never touches natural_pause
-//   - test-config-isolation: cwd comes from RuntimeExecuteOptions, never
-//     from process.env.HOME
-export async function* wrapWithBehaviorTraceTap(
-  options: RuntimeExecuteOptions,
-  source: AsyncIterable<NexusEvent>,
-): AsyncIterable<NexusEvent> {
-  if (!isBehaviorTraceEnabled()) {
-    yield* source
-    return
-  }
-  const buffer: NexusEvent[] = []
-  const emittedTraceKeys = new Set<string>()
-  let taskScopeGlob: string | undefined
-  let lastTaskScopeEventAt = -1
-  for await (const event of source) {
-    buffer.push(event)
-    if (event.type === 'task_scope_declared') {
-      const e = event as Extract<NexusEvent, { type: 'task_scope_declared' }>
-      const root = e.primaryRoot
-      if (typeof root === 'string' && root.length > 0) {
-        taskScopeGlob = root.endsWith('/**') ? root : `${root.replace(/\/+$/, '')}/**`
-        lastTaskScopeEventAt = buffer.length - 1
-      }
-    }
-    try {
-      // Only consider events that have been seen (suppress drift detection
-      // on the task_scope_declared event itself, which is the first event
-      // that establishes the scope).
-      const eventsForDetect = lastTaskScopeEventAt >= 0
-        ? buffer.slice(lastTaskScopeEventAt)
-        : buffer
-      const detected = detectTriggers({
-        events: eventsForDetect,
-        cwd: options.cwd,
-        sessionId: options.sessionId,
-        taskScope: taskScopeGlob,
-      })
-      for (const det of detected) {
-        const key = behaviorTraceDetectionKey(det)
-        if (emittedTraceKeys.has(key)) continue
-        emittedTraceKeys.add(key)
-        const ctx = buildTraceContext({ events: buffer })
-        const sa = deriveRuleSelfAssessment(det.trigger, det.anomaly, { retryCount: ctx.retryCount })
-        queueBehaviorTraceEntry({
-          cwd: options.cwd,
-          sessionId: options.sessionId,
-          trigger: det.trigger,
-          triggerConfidence: det.confidence,
-          anomaly: det.anomaly,
-          context: ctx,
-          selfAssessment: sa,
-        })
-      }
-    } catch (error) {
-      logger.debug('behaviorTrace tap detection failed', error)
-    }
-    yield event
-  }
-  // Best-effort flush. Do not block event stream teardown.
-  void flushBehaviorTraceQueue().catch((error) => {
-    logger.debug('behaviorTrace flush failed', error)
-  })
-}
-
-function behaviorTraceDetectionKey(
-  detected: ReturnType<typeof detectTriggers>[number],
-): string {
-  const anomaly = detected.anomaly
-  return JSON.stringify([
-    detected.trigger,
-    detected.relatedEventIndex,
-    anomaly.errorCode ?? '',
-    anomaly.errorMessage ?? '',
-    anomaly.denialReason ?? '',
-    anomaly.driftPath ?? '',
-    anomaly.expectedScope ?? '',
-    anomaly.userRedirectSignal ?? '',
-  ])
-}
+// `wrapWithBehaviorTraceTap` was extracted to `./behaviorTraceTap.ts`
+// in Phase 3B-6. We re-export it here so legacy import paths
+// (`from '../runtime/LLMCodingRuntime.js'` for `wrapWithBehaviorTraceTap`)
+// keep working without forcing every consumer to migrate in lockstep.
+// New code should import directly from `./behaviorTraceTap.js`.
+export { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'
