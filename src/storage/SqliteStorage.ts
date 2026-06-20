@@ -34,6 +34,7 @@ import { ToolTraceRepository } from './ToolTraceRepository.js'
 import { SessionChannelRepository } from './SessionChannelRepository.js'
 import { AgentJobRepository } from './AgentJobRepository.js'
 import { ExecutionMetricsRepository } from './ExecutionMetricsRepository.js'
+import { LoopPaneRepository } from './LoopPaneRepository.js'
 
 type Row = Record<string, unknown>
 
@@ -46,6 +47,7 @@ export class SqliteStorage implements NexusStorage {
   private readonly sessionChannelRepository: SessionChannelRepository
   private readonly agentJobRepository: AgentJobRepository
   private readonly executionMetricsRepository: ExecutionMetricsRepository
+  private readonly loopPaneRepository: LoopPaneRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -94,6 +96,7 @@ export class SqliteStorage implements NexusStorage {
     this.sessionChannelRepository = new SessionChannelRepository(this.db)
     this.agentJobRepository = new AgentJobRepository(this.db)
     this.executionMetricsRepository = new ExecutionMetricsRepository(this.db)
+    this.loopPaneRepository = new LoopPaneRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -276,86 +279,15 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async upsertLoopPane(pane: LoopPaneState): Promise<LoopPaneState> {
-    this.db
-      .prepare(
-        `INSERT INTO loop_state (
-          pane_id, workspace_id, tab_id, session_id,
-          agent, cwd, label, last_rev, updated_at
-        ) VALUES (
-          @paneId, @workspaceId, @tabId, @sessionId,
-          @agent, @cwd, @label, @lastRev, @updatedAt
-        )
-        ON CONFLICT(pane_id) DO UPDATE SET
-          workspace_id = excluded.workspace_id,
-          tab_id = excluded.tab_id,
-          session_id = excluded.session_id,
-          agent = excluded.agent,
-          cwd = excluded.cwd,
-          label = excluded.label,
-          last_rev = excluded.last_rev,
-          updated_at = excluded.updated_at`,
-      )
-      .run({
-        paneId: pane.paneId,
-        workspaceId: pane.workspaceId,
-        tabId: pane.tabId,
-        sessionId: pane.sessionId,
-        agent: pane.agent,
-        cwd: pane.cwd,
-        label: pane.label,
-        lastRev: pane.lastRev,
-        updatedAt: pane.updatedAt,
-      })
-    return pane
+    return this.loopPaneRepository.upsertLoopPane(pane)
   }
 
   async listLoopPanes(filter: LoopPaneFilter = {}): Promise<LoopPaneState[]> {
-    const conditions: string[] = []
-    const params: Record<string, string> = {}
-    if (filter.workspaceId) {
-      conditions.push('workspace_id = @workspaceId')
-      params.workspaceId = filter.workspaceId
-    }
-    if (filter.tabId) {
-      conditions.push('tab_id = @tabId')
-      params.tabId = filter.tabId
-    }
-    if (filter.paneId) {
-      conditions.push('pane_id = @paneId')
-      params.paneId = filter.paneId
-    }
-    if (filter.sessionId) {
-      conditions.push('session_id = @sessionId')
-      params.sessionId = filter.sessionId
-    }
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const rows = this.db
-      .prepare(
-        `SELECT pane_id, workspace_id, tab_id, session_id,
-                agent, cwd, label, last_rev, updated_at
-         FROM loop_state
-         ${where}
-         ORDER BY workspace_id ASC, tab_id ASC, pane_id ASC`,
-      )
-      .all(params) as Row[]
-    return rows.map(row => ({
-      paneId: String(row.pane_id),
-      workspaceId: String(row.workspace_id),
-      tabId: String(row.tab_id),
-      sessionId: String(row.session_id),
-      agent: String(row.agent),
-      cwd: String(row.cwd),
-      label: row.label == null ? null : String(row.label),
-      lastRev: Number(row.last_rev ?? 0),
-      updatedAt: String(row.updated_at),
-    }))
+    return this.loopPaneRepository.listLoopPanes(filter)
   }
 
   async deleteLoopPane(paneId: string): Promise<boolean> {
-    const result = this.db
-      .prepare('DELETE FROM loop_state WHERE pane_id = ?')
-      .run(paneId)
-    return Number(result.changes ?? 0) > 0
+    return this.loopPaneRepository.deleteLoopPane(paneId)
   }
 
   async updateLoopPaneRev(
@@ -363,16 +295,7 @@ export class SqliteStorage implements NexusStorage {
     lastRev: number,
     updatedAt: string,
   ): Promise<LoopPaneState | null> {
-    const existing = await this.listLoopPanes({ paneId })
-    const current = existing[0]
-    if (!current) return null
-    const next: LoopPaneState = { ...current, lastRev, updatedAt }
-    this.db
-      .prepare(
-        'UPDATE loop_state SET last_rev = ?, updated_at = ? WHERE pane_id = ?',
-      )
-      .run(lastRev, updatedAt, paneId)
-    return next
+    return this.loopPaneRepository.updateLoopPaneRev(paneId, lastRev, updatedAt)
   }
 
   async saveToolTrace(trace: ToolTrace): Promise<void> {
