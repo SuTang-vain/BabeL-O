@@ -374,6 +374,20 @@ func (m model) runtimeAnimationState() (string, runtimeAnimationKind) {
 	case "permission_request":
 		return "  permission needed", runtimeAnimationPermission
 	default:
+		// Path 2 (2026-06-21): when the model has finished thinking
+		// but no assistant_delta has arrived yet, show the
+		// synthesizing indicator instead of falling through to the
+		// default "agent runtime" label. Some providers
+		// (Anthropic-compatible DeepSeek V4 in real e2e) batch the
+		// entire assistant text into a single delta after a long
+		// thinking tail, leaving a visible dead-air gap that
+		// would otherwise flicker between thinking → default →
+		// responding as event types cycle. Tool/permission events
+		// take priority (handled by the switch above) — synthesizing
+		// is the bridge between reasoning and text-only answer.
+		if m.pendingSynthesis {
+			return "  drafting response", runtimeAnimationSynthesizing
+		}
 		return "  agent runtime", runtimeAnimationDefault
 	}
 }
