@@ -27,11 +27,13 @@ import type {
   SessionMessageListResult,
 } from './Storage.js'
 import { executionMetricsFromEvent } from './executionMetricsEvent.js'
+import { EventRepository } from './EventRepository.js'
 
 type Row = Record<string, unknown>
 
 export class SqliteStorage implements NexusStorage {
   private readonly db: DatabaseSync
+  private readonly eventRepository: EventRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -39,6 +41,41 @@ export class SqliteStorage implements NexusStorage {
     }
     this.db = new DatabaseSync(databasePath)
     this.initialize()
+    this.eventRepository = new EventRepository(this.db, {
+      sequencedEventKey,
+      onToolStarted: async (sessionId, event) => {
+        const trace: ToolTrace = {
+          toolUseId: event.toolUseId,
+          sessionId,
+          name: event.name,
+          input: event.input,
+          startedAt: event.timestamp,
+        }
+        await this.saveToolTrace(trace)
+      },
+      onToolCompleted: async (sessionId, event) => {
+        const existing = await this.getToolTrace(event.toolUseId)
+        if (existing) {
+          const completedAt = event.timestamp
+          const durationMs = new Date(completedAt).getTime() - new Date(existing.startedAt).getTime()
+          const updated: ToolTrace = {
+            ...existing,
+            output: event.output,
+            success: event.success,
+            completedAt,
+            durationMs,
+            remoteRunner: event.remoteRunner,
+          }
+          await this.saveToolTrace(updated)
+        }
+      },
+      onExecutionMetrics: async (sessionId, event) => {
+        const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
+        if (embeddedMetrics) {
+          await this.saveExecutionMetrics(embeddedMetrics)
+        }
+      },
+    })
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -185,131 +222,11 @@ export class SqliteStorage implements NexusStorage {
     sessionId: string,
     options: EventListOptions = {},
   ): Promise<EventListResult> {
-    const limit = options.limit ?? 100
-    const order = options.order ?? 'asc'
-    const comparison = order === 'asc' ? '>' : '<'
-    const direction = order === 'asc' ? 'ASC' : 'DESC'
-    const cursor = Number(options.cursor ?? 0)
-    const rows = options.cursor
-      ? (this.db
-          .prepare(
-            `SELECT event_seq, event_json FROM events
-             WHERE session_id = ? AND event_seq ${comparison} ?
-             ORDER BY event_seq ${direction}, event_key ${direction}
-             LIMIT ?`,
-          )
-          .all(sessionId, Number.isFinite(cursor) ? cursor : 0, limit + 1) as Row[])
-      : (this.db
-          .prepare(
-            `SELECT event_seq, event_json FROM events
-             WHERE session_id = ?
-             ORDER BY event_seq ${direction}, event_key ${direction}
-             LIMIT ?`,
-          )
-          .all(sessionId, limit + 1) as Row[])
-
-    const page = rows.slice(0, limit)
-    return {
-      events: page.map(row => JSON.parse(String(row.event_json)) as NexusEvent),
-      nextCursor:
-        rows.length > limit ? String(page.at(-1)?.event_seq ?? '') : undefined,
-      lastSeq:
-        page.length > 0
-          ? page.reduce<number>((max, row) => {
-              const seq = Number(row.event_seq ?? 0)
-              return Number.isFinite(seq) && seq > max ? seq : max
-            }, 0)
-          : undefined,
-    }
+    return this.eventRepository.listEvents(sessionId, options)
   }
 
   async appendEvent(sessionId: string, event: NexusEvent): Promise<void> {
-    this.appendEventRowWithSequence(sessionId, event)
-
-    if (event.type === 'session_started') {
-      this.db
-        .prepare(`UPDATE sessions SET cwd = ?, updated_at = ? WHERE session_id = ?`)
-        .run(event.cwd, event.timestamp, sessionId)
-    }
-
-    if (event.type === 'tool_started') {
-      const trace: ToolTrace = {
-        toolUseId: event.toolUseId,
-        sessionId,
-        name: event.name,
-        input: event.input,
-        startedAt: event.timestamp,
-      }
-      await this.saveToolTrace(trace)
-    } else if (event.type === 'tool_completed') {
-      const existing = await this.getToolTrace(event.toolUseId)
-      if (existing) {
-        const completedAt = event.timestamp
-        const durationMs = new Date(completedAt).getTime() - new Date(existing.startedAt).getTime()
-        const updated: ToolTrace = {
-          ...existing,
-          output: event.output,
-          success: event.success,
-          completedAt,
-          durationMs,
-          remoteRunner: event.remoteRunner,
-        }
-        await this.saveToolTrace(updated)
-      }
-    }
-
-    const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
-    if (embeddedMetrics) {
-      await this.saveExecutionMetrics(embeddedMetrics)
-    }
-  }
-
-  private appendEventRowWithSequence(sessionId: string, event: NexusEvent): void {
-    this.db.exec('BEGIN IMMEDIATE')
-    let committed = false
-    try {
-      const eventJson = JSON.stringify(event)
-      const duplicateRow = this.db
-        .prepare(`SELECT event_seq FROM events WHERE session_id = ? AND timestamp = ? AND event_type = ? AND event_json = ? LIMIT 1`)
-        .get(sessionId, event.timestamp, event.type, eventJson) as Row | undefined
-      if (!duplicateRow) {
-        const eventSeqRow = this.db
-          .prepare(`SELECT COALESCE(MAX(event_seq), 0) + 1 AS next_seq FROM events WHERE session_id = ?`)
-          .get(sessionId) as Row | undefined
-        const eventSeq = Number(eventSeqRow?.next_seq ?? 1)
-        const eventKey = sequencedEventKey(sessionId, eventSeq, eventJson, event)
-        this.db
-          .prepare(
-            `INSERT INTO events (
-              event_key, session_id, timestamp, event_type, event_json, event_seq
-            ) VALUES (
-              :eventKey, :sessionId, :timestamp, :eventType, :eventJson, :eventSeq
-            )`,
-          )
-          .run({
-            eventKey,
-            sessionId,
-            timestamp: event.timestamp,
-            eventType: event.type,
-            eventJson,
-            eventSeq,
-          })
-      }
-
-      this.db
-        .prepare(`UPDATE sessions SET updated_at = ? WHERE session_id = ?`)
-        .run(event.timestamp, sessionId)
-
-      this.db.exec('COMMIT')
-      committed = true
-    } catch (error) {
-      if (!committed) {
-        try {
-          this.db.exec('ROLLBACK')
-        } catch {}
-      }
-      throw error
-    }
+    await this.eventRepository.appendEvent(sessionId, event)
   }
 
   async saveTask(task: NexusTask): Promise<void> {
