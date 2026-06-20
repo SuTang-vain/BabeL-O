@@ -310,16 +310,63 @@ export function summarizeWindow(
 
 // ─── Tool 3: context.recent ───────────────────────────────────────────────
 
+// Event types that recentEvents filters out by default — internal
+// pipeline / noise that pollutes the model-visible recent-flow view.
+// Real session session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1 caught
+// the gap (Bug 1.3, 2026-06-20): a model that excluded only
+// `tool_completed + assistant_delta` still got
+//   hook_started / hook_completed / usage / thinking_delta
+// prepended to its contextRecent output, with the very first line being
+// `[2026-06-20T13:59:51.744Z] hook_started: hook_started InvocationDiagnosticsHook`
+// — useless noise that ate into the 5000-token cap and crowded out the
+// user-visible events the model actually wanted.
+//
+// The caller can still pass `excludeEventTypes` to either (a) override
+// the default entirely (just supply the full set), or (b) extend it
+// (`options.excludeEventTypes` are merged on top of the default).
+// We pick (b) here so the model can opt into MORE filtering without
+// having to repeat the entire default list.
+export const DEFAULT_RECENT_EXCLUDED_EVENT_TYPES: ReadonlySet<NexusEvent['type']> = new Set<NexusEvent['type']>([
+  // Internal hook / pipeline telemetry — never user-visible.
+  'hook_started',
+  'hook_completed',
+  // Per-step token / cache accounting — runtime-owned, not for model reasoning.
+  'usage',
+  // Single-character chunks from extended thinking — high volume, low signal.
+  // Models that DO want thinking_delta can list it explicitly to re-include
+  // (it then sits at the top of the model's choice, not the default).
+  'thinking_delta',
+  // Stream chunks not useful for "what just happened" recap; if the model
+  // wants the exact text of recent model output it can read the result
+  // event directly.
+  'assistant_delta',
+  // tool_completed bodies (raw outputs) are usually large and noisy;
+  // tool_started already gives the model the action signature.
+  'tool_completed',
+])
+
 // Return the most recent N events, optionally excluding certain types
 // (e.g. tool_completed to reduce noise). Each event is rendered as a
 // one-line summary.
+//
+// Default exclusion set (Bug 1.3 fix): see
+// `DEFAULT_RECENT_EXCLUDED_EVENT_TYPES` — model only sees
+// user-visible turns (user_message, tool_started, error, result,
+// scope_boundary_*, etc.) unless it explicitly overrides the list.
 export function recentEvents(
   events: NexusEvent[],
   n: number,
   options: RecentOptions = {},
 ): ToolResult {
   const maxTokens = options.maxTokens ?? MAX_TOKENS_PER_TOOL_RETURN
-  const exclude = options.excludeEventTypes ? new Set(options.excludeEventTypes) : null
+  // Caller-supplied `excludeEventTypes` MERGE on top of the default so
+  // the model can add more filters without having to repeat the whole
+  // baseline. To override entirely, pass a list that includes the
+  // default types and any additional ones you want kept.
+  const exclude = new Set<NexusEvent['type']>(DEFAULT_RECENT_EXCLUDED_EVENT_TYPES)
+  if (options.excludeEventTypes) {
+    for (const t of options.excludeEventTypes) exclude.add(t)
+  }
 
   // Sort newest first
   const sorted = [...events].sort((a, b) => {

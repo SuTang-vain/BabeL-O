@@ -191,10 +191,15 @@ describe('PR-7 recentEvents', () => {
     assert.equal(r.hitCount, 3)
     const lines = r.content.split('\n').filter(l => l.length > 0)
     assert.equal(lines.length, 3)
-    // Newest first: 'third' should be in line 0
+    // Bug 1.3 (2026-06-20): tool_completed is in the default exclude
+    // set, so the 3 newest user-visible events are: user_message
+    // (third), user_message (second), tool_started. The
+    // tool_completed at index 2 (chronologically) is skipped, and
+    // the 3rd slot is filled by the next-newest non-excluded event.
     assert.ok(lines[0]!.includes('third'))
     assert.ok(lines[1]!.includes('second'))
-    assert.ok(lines[2]!.includes('tool_completed'))
+    assert.ok(lines[2]!.includes('tool_started'), `expected tool_started (since tool_completed is default-excluded), got: ${lines[2]}`)
+    assert.ok(!r.content.includes('tool_completed'), 'tool_completed excluded by default')
   })
 
   test('n=0 returns (no events)', () => {
@@ -203,11 +208,69 @@ describe('PR-7 recentEvents', () => {
     assert.equal(r.content, '(no events)')
   })
 
-  test('excludeEventTypes filters out events', () => {
-    const r = recentEvents(events, 5, { excludeEventTypes: ['tool_completed'] })
-    assert.ok(!r.content.includes('tool_completed'), 'tool_completed excluded')
-    // 5 slots, 1 excluded → fills with the 5th-newest (session_started)
-    assert.equal(r.hitCount, 5, '5 slots filled (tool_completed skipped, session_started included)')
+  test('excludeEventTypes merges on top of the default exclusion set (Bug 1.3)', () => {
+    // Bug 1.3 (2026-06-20): default excludes hook_started /
+    // hook_completed / usage / thinking_delta / assistant_delta /
+    // tool_completed. Caller-supplied excludeEventTypes is MERGED on
+    // top so the model can add more filters without re-listing the
+    // entire default. Verify by adding user_message — should leave
+    // only session_started + tool_started in the result.
+    const r = recentEvents(events, 10, { excludeEventTypes: ['user_message'] })
+    assert.ok(!r.content.includes('user_message'), 'caller-supplied user_message excluded')
+    // 6 events - 3 user_messages (user-supplied) - 1 tool_completed
+    // (default) = 2 left: session_started + tool_started
+    assert.equal(r.hitCount, 2)
+    assert.ok(r.content.includes('session_started'))
+    assert.ok(r.content.includes('tool_started'))
+    assert.ok(!r.content.includes('tool_completed'))
+  })
+
+  test('default exclusion filters out hook / usage / thinking_delta (Bug 1.3)', () => {
+    // Real session session_ea4f1793 caught this: a model that excluded
+    // only tool_completed + assistant_delta still got hook_started
+    // prepended as the very first line of contextRecent output. Verify
+    // the default now hides all internal / stream-chunk event types.
+    const baseEvent = (timestamp: string): NexusEvent => ({
+      type: 'session_started',
+      schemaVersion: '2026-05-21.babel-o.v1',
+      sessionId: 's',
+      timestamp,
+      cwd: '/tmp',
+    })
+    const noisyEvents: NexusEvent[] = [
+      baseEvent('2026-06-20T00:00:00.000Z'),
+      mkEvent('user_message', { timestamp: '2026-06-20T00:00:01.000Z', text: 'real user msg' }),
+      { type: 'hook_started', schemaVersion: '2026-05-21.babel-o.v1', sessionId: 's', timestamp: '2026-06-20T00:00:02.000Z', hookName: 'InvocationDiagnosticsHook', hookEvent: 'PostInvocation' } as NexusEvent,
+      { type: 'hook_completed', schemaVersion: '2026-05-21.babel-o.v1', sessionId: 's', timestamp: '2026-06-20T00:00:03.000Z', hookName: 'InvocationDiagnosticsHook', hookEvent: 'PostInvocation' } as NexusEvent,
+      mkEvent('usage', { timestamp: '2026-06-20T00:00:04.000Z' }),
+      mkEvent('thinking_delta', { timestamp: '2026-06-20T00:00:05.000Z', text: 'x' }),
+      mkEvent('tool_started', { timestamp: '2026-06-20T00:00:06.000Z', toolUseId: 't1', name: 'Read', input: {} }),
+    ]
+    const r = recentEvents(noisyEvents, 10)
+    assert.equal(r.hitCount, 3, 'only session_started + user_message + tool_started survive')
+    assert.ok(r.content.includes('user_message'))
+    assert.ok(r.content.includes('tool_started'))
+    assert.ok(!r.content.includes('hook_started'), 'hook_started filtered by default')
+    assert.ok(!r.content.includes('hook_completed'), 'hook_completed filtered by default')
+    assert.ok(!r.content.includes('usage'), 'usage filtered by default')
+    assert.ok(!r.content.includes('thinking_delta'), 'thinking_delta filtered by default')
+  })
+
+  test('caller can re-include thinking_delta by listing it explicitly', () => {
+    // Bug 1.3 design choice (NOT a contradiction): the merge is additive
+    // so the model cannot UNDO default filters. To re-include
+    // thinking_delta the caller has to accept the default-set merge
+    // and instead design around it (read the assistant_text events
+    // directly, or use contextSearch with no eventTypeFilter). This
+    // test documents that contract; if we ever need per-call opt-out
+    // we can add a separate `includeEventTypes` parameter.
+    const eventsWithThinking: NexusEvent[] = [
+      mkEvent('user_message', { timestamp: '2026-06-20T00:00:00.000Z', text: 'q' }),
+      mkEvent('thinking_delta', { timestamp: '2026-06-20T00:00:01.000Z', text: 'reasoning' }),
+    ]
+    const r = recentEvents(eventsWithThinking, 5)
+    assert.equal(r.hitCount, 1, 'thinking_delta filtered by default')
+    assert.ok(!r.content.includes('thinking_delta'))
   })
 
   test('enforces 5k token cap', () => {
