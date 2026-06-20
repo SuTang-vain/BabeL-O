@@ -30,6 +30,7 @@ import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 import { EventRepository } from './EventRepository.js'
 import { TaskRepository } from './TaskRepository.js'
 import { AuditRepository } from './AuditRepository.js'
+import { ToolTraceRepository } from './ToolTraceRepository.js'
 
 type Row = Record<string, unknown>
 
@@ -38,6 +39,7 @@ export class SqliteStorage implements NexusStorage {
   private readonly eventRepository: EventRepository
   private readonly taskRepository: TaskRepository
   private readonly auditRepository: AuditRepository
+  private readonly toolTraceRepository: ToolTraceRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -82,6 +84,7 @@ export class SqliteStorage implements NexusStorage {
     })
     this.taskRepository = new TaskRepository(this.db)
     this.auditRepository = new AuditRepository(this.db)
+    this.toolTraceRepository = new ToolTraceRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -407,91 +410,18 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async saveToolTrace(trace: ToolTrace): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO tool_traces (
-          tool_use_id, session_id, name, input, output, success,
-          started_at, completed_at, duration_ms, remote_runner
-        ) VALUES (
-          :toolUseId, :sessionId, :name, :input, :output, :success,
-          :startedAt, :completedAt, :durationMs, :remoteRunner
-        )
-        ON CONFLICT(tool_use_id) DO UPDATE SET
-          session_id = excluded.session_id,
-          name = excluded.name,
-          input = excluded.input,
-          output = excluded.output,
-          success = excluded.success,
-          started_at = excluded.started_at,
-          completed_at = excluded.completed_at,
-          duration_ms = excluded.duration_ms,
-          remote_runner = excluded.remote_runner`,
-      )
-      .run(toolTraceParams(trace))
+    await this.toolTraceRepository.saveToolTrace(trace)
   }
 
   async getToolTrace(toolUseId: string): Promise<ToolTrace | null> {
-    const row = this.db
-      .prepare(`SELECT * FROM tool_traces WHERE tool_use_id = ?`)
-      .get(toolUseId) as Row | undefined
-    return row ? rowToToolTrace(row) : null
+    return this.toolTraceRepository.getToolTrace(toolUseId)
   }
 
   async listToolTraces(
     sessionId: string,
     options: ToolTraceListOptions = {},
   ): Promise<ToolTraceListResult> {
-    const limit = options.limit ?? 100
-    const order = options.order ?? 'asc'
-    const direction = order === 'asc' ? 'ASC' : 'DESC'
-
-    let rows: Row[]
-    if (options.cursor) {
-      const lastPipeIndex = options.cursor.lastIndexOf('|')
-      const cursorStartedAt = lastPipeIndex !== -1 ? options.cursor.substring(0, lastPipeIndex) : options.cursor
-      const cursorToolUseId = lastPipeIndex !== -1 ? options.cursor.substring(lastPipeIndex + 1) : ''
-
-      const comparisonQuery = order === 'asc'
-        ? `(started_at > :cursorStartedAt OR (started_at = :cursorStartedAt AND tool_use_id > :cursorToolUseId))`
-        : `(started_at < :cursorStartedAt OR (started_at = :cursorStartedAt AND tool_use_id < :cursorToolUseId))`
-
-      rows = this.db
-        .prepare(
-          `SELECT * FROM tool_traces
-           WHERE session_id = :sessionId AND ${comparisonQuery}
-           ORDER BY started_at ${direction}, tool_use_id ${direction}
-           LIMIT :limit`,
-        )
-        .all({
-          sessionId,
-          cursorStartedAt,
-          cursorToolUseId,
-          limit: limit + 1,
-        }) as Row[]
-    } else {
-      rows = this.db
-        .prepare(
-          `SELECT * FROM tool_traces
-           WHERE session_id = ?
-           ORDER BY started_at ${direction}, tool_use_id ${direction}
-           LIMIT ?`,
-        )
-        .all(sessionId, limit + 1) as Row[]
-    }
-
-    const page = rows.slice(0, limit)
-    let nextCursor: string | undefined
-    if (rows.length > limit) {
-      const lastTrace = page[page.length - 1]
-      if (lastTrace) {
-        nextCursor = `${String(lastTrace.started_at)}|${String(lastTrace.tool_use_id)}`
-      }
-    }
-
-    return {
-      traces: page.map(rowToToolTrace),
-      nextCursor,
-    }
+    return this.toolTraceRepository.listToolTraces(sessionId, options)
   }
 
   async saveSessionChannel(channel: SessionChannel): Promise<void> {
@@ -1456,46 +1386,6 @@ function eventIndexPayload(event: NexusEvent): string {
   if ('code' in event && event.code !== undefined) return String(event.code)
   if ('eventId' in event && event.eventId !== undefined) return String(event.eventId)
   return ''
-}
-
-function toolTraceParams(trace: ToolTrace): Record<string, string | number | null> {
-  return {
-    toolUseId: trace.toolUseId,
-    sessionId: trace.sessionId,
-    name: trace.name,
-    input: JSON.stringify(trace.input),
-    output: trace.output !== undefined ? (typeof trace.output === 'string' ? trace.output : JSON.stringify(trace.output)) : null,
-    success: trace.success !== undefined ? (trace.success ? 1 : 0) : null,
-    startedAt: trace.startedAt,
-    completedAt: trace.completedAt ?? null,
-    durationMs: trace.durationMs ?? null,
-    remoteRunner: trace.remoteRunner ? JSON.stringify(trace.remoteRunner) : null,
-  }
-}
-
-function rowToToolTrace(row: Row): ToolTrace {
-  let outputParsed: unknown = undefined
-  if (row.output !== null && row.output !== undefined) {
-    const rawOutput = String(row.output)
-    try {
-      outputParsed = JSON.parse(rawOutput)
-    } catch {
-      outputParsed = rawOutput
-    }
-  }
-
-  return {
-    toolUseId: String(row.tool_use_id),
-    sessionId: String(row.session_id),
-    name: String(row.name),
-    input: JSON.parse(String(row.input)),
-    output: outputParsed,
-    success: row.success !== null && row.success !== undefined ? Boolean(row.success) : undefined,
-    startedAt: String(row.started_at),
-    completedAt: nullableString(row.completed_at),
-    durationMs: row.duration_ms !== null && row.duration_ms !== undefined ? Number(row.duration_ms) : undefined,
-    remoteRunner: row.remote_runner ? JSON.parse(String(row.remote_runner)) : undefined,
-  }
 }
 
 function rowToSessionChannel(row: Row): SessionChannel {
