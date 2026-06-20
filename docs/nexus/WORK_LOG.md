@@ -2,6 +2,55 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-21 — Path 0 (drain-into-array buffer): real streaming root cause
+
+- **背景**: 用户反馈 Path 1 + Path 2 落地后**仍然不丝滑**，"多个事件 chunk 一起显示而不是真实实时"。WS time-trace 抓出真实数据：
+  - **修复前**：first arrival +13064ms, last +13150ms, **span 86ms**, 365 chunks 一齐到达
+  - **修复后**：first arrival +7913ms, last +11459ms, **span 3546ms**, 260 chunks 间隔 ~14ms 真实流式
+- **真实根因**：`src/runtime/executeProviderTurn.ts` 是个 drain-into-array helper，把整段 provider turn 的 async generator drain 进 events[] array：
+  ```typescript
+  while (!result.done) {
+    events.push(result.value)
+    result = await stream.next()
+  }
+  return { events, providerTurn: result.value }
+  ```
+  调用方 `LLMCodingRuntime:822` 拿到 events[] 后再 `for (const e of events) yield e` —— 一个 tight loop 里把整段 dump 出来。Path 1 chunker (commit 19596ae) 正确 yield 多 chunk，但全卡在 events[] 里等 provider turn 结束。
+- **设计选择**：
+  - 不改 `executeProviderTurn.ts` 改成 generator（需要 sync drain protocol for final `providerTurn` return value，复杂）。
+  - **直接 inline streaming loop 替换 helper 调用**：`providerTurnDriver.run({...})` 直接拿到 generator，每个 `await stream.next()` 后立即 `yield result.value`。
+- **实现 (`src/runtime/LLMCodingRuntime.ts`)**: 把 `await executeProviderTurn(...)` + `for (const e of providerTurnEvents) yield e` 替换为：
+  ```typescript
+  const stream = providerTurnDriver.run({...})
+  let result = await stream.next()
+  while (!result.done) {
+    yield result.value          // <-- 每个 event 立即流式
+    result = await stream.next()
+  }
+  providerTurn = result.value
+  ```
+  +删除未使用的 `executeProviderTurn` import；helper 文件 `executeProviderTurn.ts` 保留（无其他 caller，cleanup 后续）。
+- **验证**:
+  - `tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/anthropic-chunker.test.ts` 8/8 + 跨 spec 回归 (`bash-classifier` + `bash-deny` + `runtime` + `security` + `r4`) 219/219 pass。
+  - **真实 WS e2e**：
+    ```
+    server adapter [oa-adapter] delta.content len=1 → +0ms
+    server adapter [oa-adapter] delta.content len=8 → +3486ms
+    server [ws-forward] assistant_delta → +1ms 后立即出来
+    client [client] assistant_delta #1 +7913ms ... #260 +11459ms
+    ```
+    完整 streaming 路径打通：adapter yield → providerTurn yield → runtime yield → ws-forward → client。
+- **边界**:
+  - 不动 catch block + recovery decision tree（错误处理流程不变）。
+  - 不动其他 yield 点（compact, microcompact, refresh, post-recovery）—— 都已 streaming 正确。
+  - `executeProviderTurn.ts` 文件保留（其他 doc 仍引用），后续可随 cleanup PR 删除。
+- **三路径修复完整链路**：
+  1. **Path 0 (本次)**：runtime 不再 buffer event array，每个 yield 真实流式。
+  2. **Path 1 (commit 19596ae)**：adapter chunker 把 batched delta 切成多 chunk。
+  3. **Path 2 (commit f75a268)**：TUI synthesizing 指示器覆盖 dead-air gap。
+  仅 Path 1+2 不够 —— buffer 让 chunk 全卡在最后一刻 dump 出来。Path 0 是真正解封 streaming 的关键。
+
 ## 2026-06-21 — Go TUI real-time rendering: Path 2 + Path 1 组合
 
 - **背景**: 用户报告"Go TUI 无法实时渲染，agent 在流式输出时无法直接捕获"。WS 抓包 (`/tmp/ws-trace.cjs`) 显示：21 个 `thinking_delta` 事件跟 1 个 `assistant_delta`（DeepSeek V4 Anthropic-compatible batched 输出）。Go TUI 的 footer 动画在 thinking → assistant 间出现 dead-air gap，flash "agent thinking" → "agent runtime" → "agent writing"。**根本原因不是 wire 故障** —— server 正确推送 37 个事件，是 provider 行为：DeepSeek V4 把整段 final text 装进一个 `text_delta`/`delta.content`。
