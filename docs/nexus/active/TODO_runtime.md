@@ -137,7 +137,7 @@ Phase 1/2/3/4 已收口：`normalizeGuidancePolicy()` 不再对 `status` + `requ
 
 ## P1 Long-Running Context Assembly Hot Path Closure — R0-R7
 
-> 主文档：[long-running-context-assembly.md §19/§20](../proposals/long-running-context-assembly.md)。**2026-06-20 收盘**：R0 / R1 / R2 / R3 / R4 / R5 全部收口。**只剩 R6**（Go TUI runtime-owned rendering）Open，是 plan 升级到 `Active Reference` 之前必须补的最后 1 段。R7 replay gate 部分收口（c1-c4 + c4' + c5 + c6 全部关闭 — R5 关闭 c5）。
+> 主文档：[long-running-context-assembly.md §19/§20](../reference/long-running-context-assembly.md)。**2026-06-20 收盘**：R0 / R1 / R2 / R3 / R4 / R5 / R6 / R7 全部收口。**2026-06-21 doc lifecycle 迁移完成**：本 plan 已从 `proposals/` 迁到 `reference/`，并升 `Active Plan`（不再标 `Partially Landed`）。R7 replay gate 全过（c1-c6 全部关闭）。
 
 - [x] **R0 [P0 prerequisite] — Storage propagation + continuity wiring**（✅ 2026-06-18）。
   - 依赖：上方 `session_10320709` Bug 3 + Bug 2。

@@ -316,7 +316,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           cwd: resolveCwdFromPrompt(options.prompt, options.cwd),
           continuity: null,
         }
-    // R2 of docs/nexus/proposals/long-running-context-assembly.md §20:
+    // R2 of docs/nexus/reference/long-running-context-assembly.md §20:
     // load the persisted Nexus-owned working set for this session+cwd so
     // the hot-path refreshRuntimeContextState calls include it as a
     // provider-visible block. Previously every refresh re-derived a
@@ -1150,7 +1150,7 @@ export class LLMCodingRuntime implements NexusRuntime {
     }
   }
 
-  // ─── R2 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+  // ─── R2 of docs/nexus/reference/long-running-context-assembly.md §20: ───
   //
   // `loadWorkingSetOverride` was extracted to
   // `./loadWorkingSetOverride.ts` in Phase 3B-7. The hot path calls the
@@ -1332,7 +1332,7 @@ export class LLMCodingRuntime implements NexusRuntime {
     return { workingSet, rebuilt, assembled, unsubscribeHints }
   }
 
-  // ─── R5 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+  // ─── R5 of docs/nexus/reference/long-running-context-assembly.md §20: ───
   //
   // resumePreview(sessionId, cwd) — pure read-only projection of what
   // resume() would build, without subscribing to live hints and

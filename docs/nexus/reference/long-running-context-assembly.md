@@ -1,12 +1,12 @@
 # Long-Running Context Assembly — 设计文档
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Long-running Context / Working Set / Resume Pack
 > Priority: P1 Watch
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/contextAnalysis.ts`, `src/runtime/workingSet*`, `src/runtime/loadWorkingSetOverride.ts`, `src/runtime/applyWorkingSetUpdate.ts`, `src/nexus/contextBroadcaster.ts`, `src/nexus/workingSetBroadcaster.ts`, `src/nexus/routers/sessionResumePreviewRouter.ts`, `clients/go-tui/internal/loop/api/context_observer.go`, `clients/go-tui/internal/loop/context_observer.go`
-> Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). This document owns long-running context assembly planning; current implementation truth remains in runtime code and tests.
+> Governance: Indexed by [context-governance-index.md](./context-governance-index.md). This document owns long-running context assembly planning; current implementation truth remains in runtime code and tests.
 
-> 状态（2026-06-20 收盘）：R0/R1/R2/R3/R4/R5/R6/R7 全部收口。**R0**（storage 注入 + continuity 接线）、**R1**（cwd drift 治理）、**R2**（persisted working set 接入 executeStream hot path，含独立 `loadWorkingSetOverride.ts` + `applyWorkingSetUpdate.ts` 模块）、**R3**（REST PUT ↔ `/v1/working-set/observe` 共享 broadcaster tracker）、**R4**（`/v1/context/observe` 真实 runtime e2e + redacted payload by default）、**R5**（resume preview as product path，`LLMCodingRuntime.resumePreview()` + `/v1/sessions/:sessionId/resume-preview` route，`hasContinuationSnapshot: false` 硬编码）、**R6**（Go TUI runtime-owned rendering——`api/context_observer.go` + `loop/context_observer.go` 默认开启，订阅 `/v1/context/observe` + reconnect 2s→5s→15s backoff，`ContextObservation` state 由 observer 事件单向驱动，`FormatCtxObservationLine` 在 not-observed/connected/disconnected/full-mode/null-context 五条路径上提供文案兜底）全部关闭并有 focused regression。**R7** Replay Gate 全部关闭：c1-c3 + c4 + c4' + c5 + c6（cwd drift / continuity / context tool storage / working-set hot path / REST-PUT 共享 / resume preview / observer redacted e2e）**全部关闭**。本 plan 现处于 `Partially Landed` 状态，等待 governance 把它从 `proposals/` 迁移到 `reference/`（独立 doc lifecycle slice）后即可正式升级为 `Active Reference`。
+> 状态（2026-06-20 收盘 + 2026-06-21 doc lifecycle 迁移）：R0/R1/R2/R3/R4/R5/R6/R7 全部收口，本 plan 已从 `proposals/` 迁移到 `reference/` 并升级到 `Active Plan`。**R0**（storage 注入 + continuity 接线）、**R1**（cwd drift 治理）、**R2**（persisted working set 接入 executeStream hot path，含独立 `loadWorkingSetOverride.ts` + `applyWorkingSetUpdate.ts` 模块）、**R3**（REST PUT ↔ `/v1/working-set/observe` 共享 broadcaster tracker）、**R4**（`/v1/context/observe` 真实 runtime e2e + redacted payload by default）、**R5**（resume preview as product path，`LLMCodingRuntime.resumePreview()` + `/v1/sessions/:sessionId/resume-preview` route，`hasContinuationSnapshot: false` 硬编码）、**R6**（Go TUI runtime-owned rendering——`api/context_observer.go` + `loop/context_observer.go` 默认开启，订阅 `/v1/context/observe` + reconnect 2s→5s→15s backoff，`ContextObservation` state 由 observer 事件单向驱动，`FormatCtxObservationLine` 在 not-observed/connected/disconnected/full-mode/null-context 五条路径上提供文案兜底）全部关闭并有 focused regression。**R7** Replay Gate 全部关闭：c1-c3 + c4 + c4' + c5 + c6（cwd drift / continuity / context tool storage / working-set hot path / REST-PUT 共享 / resume preview / observer redacted e2e）**全部关闭**。
 > 范围：利用 Nexus 常驻能力，重新设计上下文组装架构，支持 session/task 长时间持久运行
 > 替代：旧"压缩 = 上下文管理"模型，升级为"Nexus 组装 = 上下文管理"
 > Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). This document owns working-set, resume, assembly, and long-running session state; it does not supersede compact or memory governance.
@@ -941,14 +941,15 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 - **若决定 opt-in**：加 `BABEL_O_SESSION_MEMORY_LITE_NATURAL_PAUSE` env flag
 - **若决定保留**：继续 P1 双轨
 
-### Phase 4: 跨 Session 协同 + 时间窗 context（部分落地）
+### Phase 4: 跨 Session 协同 + 时间窗 context（全部落地）
 - 多 session working set 广播 ✅（PR-26/27 event bus + WS）
-- "show me last 24h" 完整命令 ⏳ 由 §20 R6 Go TUI 段消费
+- "show me last 24h" 完整命令 ✅（`bbl context history --since` / `/v1/context/history`，PR-10/11）
 - `bbl context` 子命令全套 ✅（PR-9/10/13/15/19）
+- Go TUI 渲染侧 ✅（§20 R6 收口: `context_observer.go` + `FormatCtxObservationLine` 5 状态）
 
-### Phase 5: behavior monitor 接入（部分落地）
+### Phase 5: behavior monitor 接入（全部落地）
 - 行为轨迹作为 Layer 3 `behaviorTrace` 来源 ✅（PR-31 liveHints + nexus 5min）
-- Live hints 增强 ⏳ Go TUI 渲染部分见 §20 R6
+- Live hints 增强 ✅ Go TUI 渲染 ✅（PR-17a/17b StatusBehaviorHint chrome 渲染 + §20 R6 context_observer 完整消费）
 
 ---
 
@@ -1113,7 +1114,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 
 ### 18.4 优先级建议
 
-按 2026-06-18 audit 后的真实阻塞排序（**R0-R5 已收口**，**R6 Open**）：
+按 2026-06-20 audit 后的真实阻塞排序（**R0-R7 全部已收口**，**plan 等待 governance 把本文从 `proposals/` 迁到 `reference/` 后升级为 `Active Reference`**）：
 
 1. ✅ **R0 storage propagation + continuity wiring** — 先让 context recall tools 在 storage-backed runtime 可用。（2026-06-18 收口：`test/runtime-storage-propagation.test.ts` 5/5）
 2. ✅ **R1 CWD drift guard** — 避免 `/` / `~/Library` 这类污染根写进 persisted working set。（2026-06-18 收口：Bug 1 Layer A+B + Bug 4 + `test/resolve-cwd-fallback.test.ts` + `test/dual-site-resolver.test.ts`）
@@ -1122,7 +1123,7 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 5. ✅ **R4 real runtime `/v1/context/observe` e2e** — 用真实执行证明 assembled frame（2026-06-20 收口：`test/r4-context-observe-runtime-e2e.test.ts` 9/9；`redactContext` 默认 summary 模式，`?full=1` opt-in verbatim）
 6. ✅ **R5 resume-preview product path** — 把 resume 从 class method 变成可观察能力（2026-06-20 收口：`test/r5-resume-preview.test.ts` 6/6；`LLMCodingRuntime.resumePreview` 纯 read-only projection + `/v1/sessions/:sessionId/resume-preview` route + `hasContinuationSnapshot: false` 硬编码）
 7. ✅ **R6 Go TUI runtime-owned rendering** — TUI 只消费事实，不推导事实（2026-06-20 收口：`api/context_observer.go` + `loop/context_observer.go` 默认开启，订阅 `/v1/context/observe` redacted payload；`api/context_observer_test.go` 7/7 transport tests + `loop/context_observer_test.go` 7/7 state-machine tests with 15 subcases；S1-S5 五条状态机路径 + backoff + format helper 全部锁定）。
-8. ✅ **R7 real session replay gate** — 用三个失败 session 关门验收。
+8. ✅ **R7 real session replay gate** — 用三个失败 session 关门验收（2026-06-20 收口：`test/r7-replay-gate.test.ts` 15/15）。
 
 ### 18.5 历史记录 (本 doc 推进已完成)
 
@@ -1149,8 +1150,16 @@ if (session.tokenUsageRatio > 0.8 && !session.lastCompactHintAt) {
 | 修复 | tool-prompt regression (8 个 builtin tools 加 prompt) | ✅ PR-22 (2026-06-17) |
 | 修复 | runtime-loop / runtime-llm pre-existing test | ✅ PR-23 (2026-06-17) |
 | 修复 | buildAssemblePreview 提取 + caller 更新 | ✅ PR-25 (2026-06-17) |
-| 修复 | liveHints section in runtime assembleContext | ⚠️ flag exists; real hot-path/live observer closure tracked by R4/R6 |
+| 修复 | liveHints section in runtime assembleContext | ✅ flag 落地；R4 (observer redacted e2e) + R6 (Go TUI consumer) 双侧收口 |
 | 修复 | runtime-loop test 共享 storage isolation | ⏸ PR-24 stopped (3 approaches failed) |
+| R0 收口 | storage 注入 + continuity wiring (Bug 2/3) + `runtime-storage-propagation.test.ts` 5/5 + `dual-site-resolver.test.ts` | ✅ PR-R0 (2026-06-18) |
+| R1 收口 | Bug 1 Layer A (quote-delimited span) + Layer B (`isAcceptablePromptCwd`) + Bug 4 (dual cwd resolver 统一) | ✅ PR-R1 (2026-06-18) |
+| R2 收口 | persisted working set 接入 `executeStream` hot path: `loadWorkingSetOverride.ts` (118 行) + `applyWorkingSetUpdate.ts` (83 行) + `runtime-working-set-hot-path.test.ts` 7/7 | ✅ PR-R2 (2026-06-18) |
+| R3 收口 | REST PUT + `/v1/working-set/observe` 共享 per-cwd tracker via `WorkingSetBroadcaster.mutate(cwd, fn)` | ✅ PR-R3 (2026-06-18) |
+| R4 收口 | `/v1/context/observe` 真实 `executeStream` e2e + `redactContext(ctx, mode='summary')` 默认剥离 systemPrompt+messages + `?full=1` opt-in | ✅ PR-R4 (2026-06-20) |
+| R5 收口 | `LLMCodingRuntime.resumePreview()` + `/v1/sessions/:sessionId/resume-preview` route + `hasContinuationSnapshot: false` 硬编码 + `LocalCodingRuntime` 无能力 → 501 `RESUME_PREVIEW_UNSUPPORTED` | ✅ PR-R5 (2026-06-20) |
+| R6 收口 | Go TUI runtime-owned rendering: `api/context_observer.go` (175 行 transport) + `loop/context_observer.go` (~590 行 state-machine) + `InteractiveModel.Init()` 默认启动 + `FormatCtxObservationLine` 5 状态兜底 + 14 个 Go test (7 transport + 7 state-machine with 15 subcases) | ✅ PR-R6 (2026-06-20) |
+| R7 收口 | 真实 session replay gate: `r7-fixture.sqlite` (3 fixture sessions) + `r7-replay-gate.test.ts` 15/15; c1-c6 全关 | ✅ PR-R7 (2026-06-20) |
 
 ---
 
@@ -1397,6 +1406,8 @@ Acceptance:
 
 ### Phase R6 — Go TUI Integration
 
+**状态**：✅ **2026-06-20 收口**。`clients/go-tui/internal/loop/api/context_observer.go`（transport, 175 行）+ `clients/go-tui/internal/loop/context_observer.go`（state-machine, ~590 行）+ `InteractiveModel.Init()` 默认启动 + `FormatCtxObservationLine` 5 状态兜底。`go test ./internal/loop/...` ok，14 个 Go test（7 transport + 7 state-machine with 15 subcases）全绿。
+
 **Goal**: Go TUI displays runtime-owned context facts without deriving them itself.
 
 Implementation:
@@ -1421,6 +1432,8 @@ Acceptance:
 - Runtime remains the source of truth.
 
 ### Phase R7 — Real Regression Replay Gate
+
+**状态**：✅ **2026-06-20 收口**。`test/r7-replay-gate.test.ts` 15/15 全绿，覆盖 c1 cwd drift / c2 continuity / c3 storage / c4 working-set hot path / c4' REST-PUT↔WS 共享 / c5 resume preview / c6 observer redacted e2e。fixture snapshot 保存在 `test/fixtures/r7-fixture.sqlite`（3 个历史 session 冻结）。
 
 **Goal**: Prove the loop against the three real sessions that exposed current failures.
 

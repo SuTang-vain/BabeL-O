@@ -37,6 +37,7 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | [context-governance-index.md](./context-governance-index.md) | Index | Reader entry point for context governance ownership across compact, working set, behavior trace, cache observability, memory, and tool-loop recovery. |
 | [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift, context-estimate calibration, storage-backed session recall tools, Nexus continuity wiring, and user-artifact continuity. Phase A / A Follow-up / B / C1 are closed; Phase C2 / D / E / F remain open, with `session_10320709` as the current P0 follow-up. |
 | [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md) | Active Plan | Cache health observability, honest unavailable states for non-prompt cache families, and Nexus realtime detection integration phases. |
+| [long-running-context-assembly.md](./long-running-context-assembly.md) | Active Plan | Long-running context assembly: Nexus-owned working set, resume pack, context assembly REST/CLI/WS, persisted working-set hot path injection, redacted `/v1/context/observe`, resume preview product path, Go TUI runtime-owned rendering, and R0-R7 real-session replay gate. R0 / R1 / R2 / R3 / R4 / R5 / R6 / R7 all closed as of 2026-06-20; promoted from `proposals/` to `reference/` on 2026-06-21. |
 
 ## Evidence, Scope, And Session Governance
 

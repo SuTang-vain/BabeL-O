@@ -74,12 +74,13 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [reference/tool-governance-plan.md](./reference/tool-governance-plan.md) | 工具治理 canonical 入口：工具分类、证据语义、native/MCP 共存、新工具准入与可恢复失败边界。 |
 | [reference/runtime-tool-loop-governance-plan.md](./reference/runtime-tool-loop-governance-plan.md) | Runtime tool-loop 连续性治理：可恢复工具错误、伪工具调用文本、loop budget 和 bounded final check。 |
 | [reference/memory-governance-plan.md](./reference/memory-governance-plan.md) | Memory 治理 canonical 入口：长期记忆非权威边界、EverCore/EverOS lifecycle、启动 UX 与 opt-in 写入。 |
+| [reference/long-running-context-assembly.md](./reference/long-running-context-assembly.md) | 长任务上下文组装 Active Plan：Nexus-owned working set、resume pack、context assembly REST/CLI/WS、R0-R7 全部收口。 |
 | [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md) | Workspace path drift、连续路径失败恢复与最终回答证据降级治理。 |
 | [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md) | Current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。 |
 | [context-and-agent-history.md](./history/context-and-agent-history.md) | Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。 |
 | [session-channel-tui-relationship-visibility-plan.md](./proposals/session-channel-tui-relationship-visibility-plan.md) | SessionChannel TUI 关系可见化分层规划：状态栏、badge、tree、activity overlay 与 debug graph。 |
 | [behavior-monitor.md](./proposals/behavior-monitor.md) | 行为监控草案；规划 behavior trace、跨 session drift/loop monitor 与用户意图跟随诊断，不替代现有事实源。 |
-| [long-running-context-assembly.md](./proposals/long-running-context-assembly.md) | 长任务上下文组装草案；规划 Nexus-owned working set、resume pack 与 context assembly API，源码未落地项保持 plan-only 口径。 |
+| *long-running-context-assembly.md (graduated 2026-06-21)* | *迁到 [reference/long-running-context-assembly.md](./reference/long-running-context-assembly.md) (R0-R7 全部收口,升 Active Plan)。* |
 | [go-runner-plan.md](./proposals/go-runner-plan.md) | 可选 Go `RemoteToolRunner` 执行后端参考；Go 只负责已批准工具的执行 mechanics，不替代 TypeScript Nexus 主体。 |
 | [go-tui-history.md](./history/go-tui-history.md) | `bbl go` / Go TUI 长期实验重写规划；Go 只负责终端交互、布局、键盘路由和事件渲染，不替代 Nexus/runtime/context/AgentScheduler。 |
 | [go-tui-history.md](./history/go-tui-history.md) | Go TUI `--mouse` 文本选区高亮与剪贴板复制优化记录；已用窄范围 ultraviolet cell-buffer highlight 收口“实际选中但视觉未高亮/不覆盖”的问题。 |
