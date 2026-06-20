@@ -25,6 +25,7 @@
 import type { FastifyInstance } from 'fastify'
 import type { FeatureRouter, FeatureRouterContext } from './router.js'
 import type { CreateNexusAppOptions } from './app.js'
+import type { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
 import { runtimeStatusRouter } from './routers/runtimeStatusRouter.js'
 import { runtimeConfigRouter } from './routers/runtimeConfigRouter.js'
 import { runtimeConfigMutationRouter } from './routers/runtimeConfigMutationRouter.js'
@@ -55,6 +56,7 @@ import { sessionInspectionRouter } from './routers/sessionInspectionRouter.js'
 import { sessionTaskReadRouter } from './routers/sessionTaskReadRouter.js'
 import { sessionTaskMutationRouter } from './routers/sessionTaskMutationRouter.js'
 import { sessionResumeRouter } from './routers/sessionResumeRouter.js'
+import { sessionResumePreviewRouter } from './routers/sessionResumePreviewRouter.js'
 import { sessionPermissionRouter } from './routers/sessionPermissionRouter.js'
 import { sessionInputRouter } from './routers/sessionInputRouter.js'
 import { sessionCloseRouter } from './routers/sessionCloseRouter.js'
@@ -86,6 +88,15 @@ export type RouterRegistrarExtras = {
   }
   activeExecutionRegistry: ActiveExecutionRegistry
   agentScheduler: AgentScheduler
+  /**
+   * R3 of docs/nexus/proposals/long-running-context-assembly.md §20:
+   * the composition-root-resolved shared WorkingSetBroadcaster. The
+   * composition root (`createNexusApp`) is responsible for providing a
+   * default instance when the caller omits one, so this field is
+   * always non-undefined. Routers that need to mutate or subscribe to
+   * per-cwd working-set state read it from the shared context.
+   */
+  workingSetBroadcaster: WorkingSetBroadcaster
 }
 
 /**
@@ -106,6 +117,11 @@ export async function registerAllRouters(app: FastifyInstance, extras: RouterReg
     getActiveExecutionSnapshot: sessionId => extras.activeExecutionRegistry.snapshot(sessionId),
     cancelActiveExecution: sessionId => extras.activeExecutionRegistry.cancel(sessionId),
     agentScheduler: extras.agentScheduler,
+    // R3: forward the resolved shared broadcaster so REST PUT can route
+    // mutations through the same per-cwd tracker that /v1/working-set/observe
+    // subscribes to. The composition root always provides a default,
+    // so this is non-undefined at this point.
+    workingSetBroadcaster: extras.workingSetBroadcaster,
   }
 
   // Declaration order is significant: it determines the Fastify route
@@ -142,6 +158,7 @@ export async function registerAllRouters(app: FastifyInstance, extras: RouterReg
     sessionTaskReadRouter,
     sessionTaskMutationRouter,
     sessionResumeRouter,
+    sessionResumePreviewRouter,
     sessionPermissionRouter,
     sessionInputRouter,
     sessionCloseRouter,

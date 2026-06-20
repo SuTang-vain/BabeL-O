@@ -8,6 +8,7 @@ import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import type { NexusRuntime } from '../src/runtime/Runtime.js'
 import type { AgentScheduler } from '../src/nexus/agents/types.js'
 import { registerAllRouters, type RouterRegistrarExtras } from '../src/nexus/routerRegistrar.js'
+import { WorkingSetBroadcaster } from '../src/nexus/workingSetBroadcaster.js'
 
 class StubRuntime implements NexusRuntime {
   async *executeStream(): AsyncIterable<never> {
@@ -44,6 +45,7 @@ function buildExtras(overrides: Partial<RouterRegistrarExtras> = {}): RouterRegi
     })),
     activeExecutionRegistry: overrides.activeExecutionRegistry ?? new ActiveExecutionRegistry(),
     agentScheduler: agentScheduler as AgentScheduler,
+    workingSetBroadcaster: overrides.workingSetBroadcaster ?? new WorkingSetBroadcaster(),
   }
 }
 
@@ -121,6 +123,44 @@ test('registerAllRouters builds a runtimeMetricsSnapshot closure that defers rea
     assert.ok(body && typeof body === 'object', 'metrics body must be an object')
     // routes is a map keyed by "<METHOD> <url>"; we just assert that the
     // registration ran without throwing and the route is reachable.
+  } finally {
+    await app.close()
+  }
+})
+
+test('registerAllRouters wires the shared workingSetBroadcaster into contextWorkingSetWriteRouter', async () => {
+  const app = Fastify({ logger: false })
+  const broadcaster = new WorkingSetBroadcaster()
+  await registerAllRouters(app, buildExtras({ workingSetBroadcaster: broadcaster }))
+  try {
+    // Before any request, the broadcaster has no cached tracker.
+    assert.equal(broadcaster.size(), 0)
+    // PUT /v1/context/working-set/:sessionId?cwd=... must route the mutation
+    // through broadcaster.mutate() so the broadcaster ends up with a
+    // cached per-cwd tracker (proves the wire is live, not just typed).
+    const cwd = '/tmp/wsbroadcaster-test'
+    const response = await app.inject({
+      method: 'PUT',
+      url: '/v1/context/working-set/sess-abc?cwd=' + encodeURIComponent(cwd),
+      payload: {
+        workspaceId: 'ws-1',
+        entries: [
+          { key: 'k1', value: 'v1', updatedAt: new Date().toISOString(), confidence: 0.9 },
+        ],
+      },
+    })
+    assert.equal(response.statusCode, 200, `expected 200, got ${response.statusCode}: ${response.body}`)
+    // The broadcaster now owns a tracker for `cwd` — the only way this
+    // could happen is if contextWorkingSetWriteRouter called
+    // broadcaster.mutate(cwd, ...).
+    assert.equal(broadcaster.size(), 1)
+    const tracker = broadcaster.getTracker(cwd)
+    assert.ok(tracker, 'tracker must be cached after PUT')
+    const persisted = tracker!.get('sess-abc')
+    assert.ok(persisted, 'session must be persisted on the shared tracker')
+    assert.equal(persisted!.workspaceId, 'ws-1')
+    assert.equal(persisted!.entries.length, 1)
+    assert.equal(persisted!.entries[0]!.key, 'k1')
   } finally {
     await app.close()
   }

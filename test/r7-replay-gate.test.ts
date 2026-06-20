@@ -11,13 +11,22 @@
 //   1. No turn resolves task root to `/` or `~/Library` unless user-approved
 //   2. session_root_continuity exists when session metadata is present
 //   3. contextRecent works in storage-backed runtime
-//   4. working-set file is created/updated for in-scope tool paths  (R2 — not yet closed)
-//   5. resumed preview includes working set + bounded recent context (R5 — not yet closed)
-//   6. observer e2e receives a redacted assembled update for a real turn (R4 — not yet closed)
+//   4. working-set file is created/updated for in-scope tool paths
+//      (R2 — closed 2026-06-18; fixture is pre-R2 baseline)
+//   4'. REST PUT ↔ /v1/working-set/observe share tracker
+//      (R3 — closed 2026-06-18; verified by test/r3-rest-put-observe.test.ts)
+//   5. resumed preview includes working set + bounded recent context
+//      (R5 — not yet closed)
+//   6. observer e2e receives a redacted assembled update for a real turn
+//      (R4 — closed 2026-06-20; verified by test/r4-context-observe-runtime-e2e.test.ts)
 //
-// Conditions 4-6 are R2/R4/R5 and depend on features not yet implemented
-// (R7 is the gate to close the long-running-context-assembly plan, not
-// a prerequisite for it). R7 must close conditions 1-3 + honestly report
+// Conditions 4/4'/5/6 map to R2/R3/R5/R4. R2, R3, and R4 are now closed
+// (R2: test/runtime-working-set-hot-path.test.ts, R3: test/r3-rest-put-observe.test.ts,
+// R4: test/r4-context-observe-runtime-e2e.test.ts). Only R5 (resume preview
+// product path) is still open. The fixture reflects pre-R2 baseline
+// (0 working_set_updated events) since the snapshot was taken before R2
+// was implemented. (R7 is the gate to close the long-running-context-assembly
+// plan, not a prerequisite for it). R7 must close conditions 1-3 + honestly report
 // conditions 4-6 as not yet closed with the relevant count assertions.
 
 import { test, describe } from 'node:test'
@@ -364,17 +373,19 @@ describe('R7 condition 3: contextRecent works in storage-backed runtime (Bug 3 s
 })
 
 describe('R7 conditions 4-6: NOT YET CLOSED (honest reporting)', () => {
-  test('R2 (working-set file): fixture has 0 working_set_updated events (R2 still open)', async () => {
-    // R2 is "wire persisted working set into executeStream hot path".
-    // Until R2 is implemented, the fixture (real pre-R2 sessions) has 0
-    // working_set_updated events. R7 must honestly report this.
+  test('R2 (working-set file): fixture has 0 working_set_updated events (pre-R2 baseline, R2 now closed)', async () => {
+    // R2 is "wire persisted working set into executeStream hot path"
+    // (now closed — see test/runtime-working-set-hot-path.test.ts).
+    // The fixture still reflects the pre-R2 baseline: 0 working_set_updated
+    // events. After R2, a fresh run touching a workspace file would
+    // produce these events; the fixture is a snapshot of pre-R2 state.
     const { storage, cleanup } = await loadFixture()
     try {
       for (const sid of Object.values(SIDS)) {
         const all = await listAllEvents(storage, sid)
         const ws = all.filter((e: any) => e.type === 'working_set_updated')
         assert.equal(ws.length, 0,
-          `${sid} should have 0 working_set_updated (R2 still open)`)
+          `${sid} should have 0 working_set_updated (pre-R2 fixture baseline)`)
       }
     } finally {
       await storage.close?.()
@@ -438,7 +449,7 @@ describe('R7 gate verdict: per-session close status', () => {
         // c3 baseline (pre-Bug 3): failures happened pre-fix
         const c3Baseline = row.storageUnavailCount
         // c4-c6: R2/R4/R5 still open (asserted by per-condition tests above)
-        const verdict = `R7 ${label}: c1_REPLAY_PASS c2_continuity_pre=${c2} c3_storage_baseline=${c3Baseline} c4c5c6_OPEN; origin=${sess!.originCwd}`
+        const verdict = `R7 ${label}: c1_REPLAY_PASS c2_continuity_pre=${c2} c3_storage_baseline=${c3Baseline} c4_CLOSED_BASELINE_PRE c4'_CLOSED c6_CLOSED c5_OPEN; origin=${sess!.originCwd}`
         console.log(verdict)
         // R7 c2 pre-condition: originCwd is set
         assert.ok(c2, `R7 c2 must hold for ${label}: originCwd=${sess!.originCwd}`)

@@ -1,9 +1,10 @@
 import { PersistedWorkingSetTracker } from '../../runtime/persistedWorkingSetTracker.js'
-import type { FeatureRouter } from '../router.js'
+import type { FeatureRouter, FeatureRouterContext } from '../router.js'
+import type { WorkingSetBroadcaster } from '../workingSetBroadcaster.js'
 
 export const contextWorkingSetWriteRouter: FeatureRouter = {
   name: 'contextWorkingSetWriteRouter',
-  register(app) {
+  register(app, context: FeatureRouterContext) {
     app.put('/v1/context/working-set/:sessionId', async (request, reply) => {
       const q = (request.query ?? {}) as Record<string, string | undefined>
       const cwd = q.cwd
@@ -59,6 +60,11 @@ export const contextWorkingSetWriteRouter: FeatureRouter = {
         sessionId,
         workspaceId: body.workspaceId,
         entries: validated,
+        // R3: route the mutation through the shared broadcaster so
+        // connected /v1/working-set/observe subscribers receive the
+        // working_set_updated event. When undefined, falls back to a
+        // per-request tracker (legacy behavior).
+        broadcaster: context.workingSetBroadcaster,
       })
     })
   },
@@ -72,6 +78,11 @@ export async function runWorkingSetPut({
   sessionId,
   workspaceId,
   entries,
+  // R3: optional shared broadcaster. When present, the mutation is
+  // routed through broadcaster.mutate(cwd, fn) so connected observers
+  // receive the working_set_updated event. When absent, a per-request
+  // tracker is used (legacy behavior).
+  broadcaster,
 }: {
   cwd: string
   sessionId: string
@@ -82,6 +93,7 @@ export async function runWorkingSetPut({
     updatedAt: string
     confidence: number
   }>
+  broadcaster?: WorkingSetBroadcaster
 }): Promise<{
   type: 'working_set_session'
   cwd: string
@@ -96,15 +108,26 @@ export async function runWorkingSetPut({
     confidence: number
   }>
 }> {
-  const tracker = new PersistedWorkingSetTracker(cwd)
-  await tracker.load()
-  const prev = tracker.get(sessionId)
-  const resolvedWorkspaceId = workspaceId ?? prev?.workspaceId ?? ''
-  const updated = tracker.update(sessionId, {
-    workspaceId: resolvedWorkspaceId,
-    entries,
-  })
-  await tracker.flush()
+  const runMutation = async (tracker: PersistedWorkingSetTracker) => {
+    const prev = tracker.get(sessionId)
+    const resolvedWorkspaceId = workspaceId ?? prev?.workspaceId ?? ''
+    const updated = tracker.update(sessionId, {
+      workspaceId: resolvedWorkspaceId,
+      entries,
+    })
+    return updated
+  }
+  // R3 routing: use the shared broadcaster's per-cwd tracker (so observers
+  // are notified) when available; otherwise create a per-request tracker.
+  const updated = broadcaster
+    ? await broadcaster.mutate(cwd, runMutation)
+    : await (async () => {
+        const tracker = new PersistedWorkingSetTracker(cwd)
+        await tracker.load()
+        const result = await runMutation(tracker)
+        await tracker.flush()
+        return result
+      })()
   return {
     type: 'working_set_session',
     cwd,

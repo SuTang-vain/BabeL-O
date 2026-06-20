@@ -19,6 +19,7 @@ import type { AgentScheduler } from './agents/types.js'
 import { buildEverCoreStatus, buildEverOSBootstrapStatus } from './bootstrapStatus.js'
 import { registerCoreMiddleware } from './middleware.js'
 import { buildExecuteRouteSharedDeps } from './executeRouteDeps.js'
+import { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
 
 export {
   parseSinceFromQuery,
@@ -119,6 +120,17 @@ export async function createNexusApp(options: CreateNexusAppOptions): Promise<Fa
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
   const activeExecutionRegistry = new ActiveExecutionRegistry()
+  /**
+   * R3 of docs/nexus/proposals/long-running-context-assembly.md §20:
+   * Composition root always resolves a `WorkingSetBroadcaster`. When
+   * the caller passes one in (`options.workingSetBroadcaster`) we use
+   * theirs so their pre-wired subscribers (e.g. cross-session monitors
+   * registered by the CLI) see our mutations. When omitted, we
+   * instantiate a per-app default so the REST PUT route and the
+   * `/v1/working-set/observe` WebSocket share the same per-cwd tracker
+   * — without this, REST mutations would not reach WebSocket subscribers.
+   */
+  const workingSetBroadcaster = options.workingSetBroadcaster ?? new WorkingSetBroadcaster()
   const agentScheduler =
     options.agentScheduler ??
     new ExploreAgentScheduler({
@@ -147,6 +159,7 @@ export async function createNexusApp(options: CreateNexusAppOptions): Promise<Fa
     everOSBootstrapStatus,
     activeExecutionRegistry,
     agentScheduler,
+    workingSetBroadcaster,
   })
 
   // === Phase 4A+ slice: shared execute route deps built once via factory ===

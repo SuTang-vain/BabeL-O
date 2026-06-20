@@ -153,3 +153,77 @@ export let defaultContextBroadcaster: ContextBroadcaster = new ContextBroadcaste
 export function setDefaultContextBroadcaster(instance: ContextBroadcaster): void {
   defaultContextBroadcaster = instance
 }
+
+// ─── R4 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+//
+// `redactContext(c, opts)` strips the two large text fields
+// (systemPrompt + messages) from an AssembledContext so the observer
+// payload is safe to ship over the wire to non-local-debug consumers.
+// All other fields (counts, budgets, section ids, diagnostics) are
+// structured and non-sensitive; they survive redaction intact.
+//
+// `mode === 'full'` returns the context verbatim — use only for
+// local/debug opt-in (e.g. `?full=1` on the observer route).
+// `mode === 'summary'` (default) returns a redacted copy with
+// `systemPrompt` and `messages` replaced by length-only metadata so
+// the observer can show "the runtime sent a 14k-char system prompt
+// with 23 messages" without leaking the actual prompt text.
+export type RedactionMode = 'summary' | 'full'
+
+export type RedactedContextSummary = {
+  systemPromptChars: number
+  messageCount: number
+  messageChars: number
+  // blockCount: number of SystemPromptBlock sections in the assembled
+  // prompt. AssembledContext's SystemPromptBlock shape does not carry
+  // its source id (the id is dropped when buildSystemPromptSections →
+  // systemPromptBlocks projection runs in contextAssembler.ts), so the
+  // summary exposes a count + cacheable split instead of a list of
+  // ids. cacheableBlockCount tells the observer how much of the prompt
+  // is prefix-cacheable without leaking the actual section names.
+  blockCount: number
+  cacheableBlockCount: number
+}
+
+export type RedactedContext = Omit<AssembledContext, 'systemPrompt' | 'messages'> & {
+  redaction: RedactedContextSummary
+}
+
+export function redactContext(
+  context: AssembledContext,
+  mode: RedactionMode = 'summary',
+): AssembledContext | RedactedContext {
+  if (mode === 'full') return context
+  const systemPromptChars = context.systemPrompt.length
+  const messageCount = context.messages.length
+  const messageChars = context.messages.reduce((sum, m) => {
+    if (typeof m.content === 'string') return sum + m.content.length
+    if (Array.isArray(m.content)) {
+      return sum + m.content.reduce((c, p: unknown) => {
+        if (p && typeof p === 'object' && 'text' in p && typeof (p as { text: unknown }).text === 'string') {
+          return c + (p as { text: string }).text.length
+        }
+        return c + JSON.stringify(p).length
+      }, 0)
+    }
+    return sum
+  }, 0)
+  const blocks = context.systemPromptBlocks ?? []
+  const blockCount = blocks.length
+  const cacheableBlockCount = blocks.filter((b) => b.cacheable).length
+  // Strip the two text-bearing fields. Everything else is structured
+  // metadata that's safe to expose by default.
+  const { systemPrompt: _sp, messages: _msgs, ...rest } = context
+  void _sp
+  void _msgs
+  return {
+    ...rest,
+    redaction: {
+      systemPromptChars,
+      messageCount,
+      messageChars,
+      blockCount,
+      cacheableBlockCount,
+    },
+  }
+}
