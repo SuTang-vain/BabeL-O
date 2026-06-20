@@ -34,6 +34,7 @@ import { executeProviderTurn } from './executeProviderTurn.js'
 import { applyProviderOutcome } from './applyProviderOutcome.js'
 import { executeToolDispatch } from './executeToolDispatch.js'
 import { applyLeakSuppressionEffects } from './applyLeakSuppressionEffects.js'
+import { executeProviderRecoveryDecision } from './executeProviderRecoveryDecision.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -835,105 +836,79 @@ export class LLMCodingRuntime implements NexusRuntime {
           for (const e of providerTurnEvents) yield e
           providerTurn = providerTurnValue
         } catch (error) {
-          const providerRecovery = classifyProviderRecovery(error)
-          const postInvocationHooks = await executeRuntimeHooks(
-            'PostInvocation',
-            {
-              invocation: {
-                ...invocationMetadata,
-                durationMs: performance.now() - invocationStartMs,
-                success: false,
-                errorCode: providerInvocationErrorCode(error, options),
-                failureKind: providerRecovery?.kind,
-              },
+          // Provider recovery decision. The implementation
+          // lives in `executeProviderRecoveryDecision.ts`
+          // (Phase 3B-19 helper extraction). The helper
+          // fires PostInvocation hooks, classifies the
+          // error, and either (a) drives the context_window
+          // recovery compact + refresh + budget sequence,
+          // (b) yields blocking events on cap-reached, or
+          // (c) reports a rethrow.
+          const recoveryResult = await executeProviderRecoveryDecision({
+            error,
+            hooksConfig: { config: options.hooks, hooks: options.runtimeHooks },
+            invocationMetadata: {
+              ...invocationMetadata,
+              durationMs: performance.now() - invocationStartMs,
             },
-            {
+            hookInput: {
               sessionId: options.sessionId,
               cwd: options.cwd,
               role: options.role,
               signal: options.signal,
             },
-            { config: options.hooks, hooks: options.runtimeHooks },
-          )
-          for (const hookEvent of postInvocationHooks.events) yield hookEvent
-          if (providerRecovery?.kind === 'context_window') {
-            const providerErrorCode = providerContextRecoveryErrorCode(error, options)
-            if (providerContextRecoveryCount < MAX_PROVIDER_CONTEXT_RECOVERIES) {
-              providerContextRecoveryCount += 1
-              providerLoopCompactAttempted = true
-              const attempt = providerContextRecoveryCount
-              const preTokens = requestState.contextWindowState.tokenEstimate
-              const recoveryEvent = buildContextRecoveryAttemptedEvent({
-                sessionId: options.sessionId,
-                requestId: options.requestId,
-                providerId: settings.providerId,
-                modelId: cleanedModelId,
-                providerErrorCode,
-                strategy: 'semantic_compact_retry',
-                attempt,
-                maxAttempts: MAX_PROVIDER_CONTEXT_RECOVERIES,
-                preTokens,
-                retryable: true,
-                message: `Provider rejected the prompt as too large; compacting session context and retrying (${attempt}/${MAX_PROVIDER_CONTEXT_RECOVERIES}).`,
-              })
-              yield recoveryEvent
-              previousEvents = [...previousEvents, recoveryEvent]
-              try {
-                const compactResult = await compactSession({
-                  storage: this.storage,
-                  sessionId: options.sessionId,
-                  modelId: cleanedModelId,
-                  trigger: 'reactive',
-                  mapEventsToMessages: mapEventsForProvider,
-                  initialPrompt: options.prompt,
-                })
-                absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-                yield compactResult.event
-                yield compactResult.contextEvent
-                const groundingEvents = postCompactGroundingEvents('context_recovery', compactResult.contextEvent.boundaryId)
-                for (const groundingEvent of groundingEvents) yield groundingEvent
-                previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-                await refreshAfterProviderContextRecovery()
-                autoCompactDecision = contextRefreshState.autoCompactDecision
-                messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
-                  contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
-                })
-                yield buildContextUsageEvent({
-                  sessionId: options.sessionId,
-                  requestId: options.requestId,
-                  modelId: cleanedModelId,
-                  providerId: settings.providerId,
-                  windowState: contextWindowState,
-                  cacheAwareCompactPolicy,
-                  source: 'after_compact',
-                })
-                const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-                if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-                continue
-              } catch (compactError) {
-                yield buildCompactFailureEvent({
-                  sessionId: options.sessionId,
-                  trigger: 'reactive',
-                  modelId: cleanedModelId,
-                  failureCount: attempt,
-                  maxFailures: MAX_PROVIDER_CONTEXT_RECOVERIES,
-                  message: compactError instanceof Error ? compactError.message : String(compactError),
-                })
-              }
-            }
-            for (const event of buildRuntimeContextBlockingEventsForLoop({
-              sessionId: options.sessionId,
-              modelId: cleanedModelId,
-              windowState: requestState.contextWindowState,
-              autoCompactDecision,
-              fallbackThresholdPercent: contextCompactPercent,
-              message: `Provider rejected the prompt as too large after ${providerContextRecoveryCount} context recovery attempt(s). Tried semantic_compact_retry; remaining actions: run /context, reduce tool output, or switch to a larger-context model.`,
-              cacheAwareCompactPolicy,
-            })) yield event
-            yield buildRuntimeExecutionMetricsEvent(options, metrics)
-            return
-          }
-          throw error
+            options,
+            providerId: settings.providerId,
+            modelId: cleanedModelId,
+            cleanedModelId,
+            requestId: options.requestId,
+            sessionId: options.sessionId,
+            state: {
+              getPreviousEvents: () => previousEvents,
+              setPreviousEvents: (next) => { previousEvents = next },
+              getAutoCompactDecision: () => autoCompactDecision,
+              setAutoCompactDecision: (next) => { autoCompactDecision = next },
+              getContextWindowState: () => contextWindowState,
+              getRequestState: () => requestState,
+              getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+              getMessages: () => messages,
+              setMessages: (next) => { messages = next },
+            },
+            closures: {
+              applyContextRefreshState,
+              postCompactGroundingEvents,
+              contextMicrocompactEvent,
+              refreshAfterProviderContextRecovery,
+            },
+            counters: {
+              providerContextRecoveryCount,
+              maxProviderContextRecoveries: MAX_PROVIDER_CONTEXT_RECOVERIES,
+            },
+            flags: {
+              setProviderLoopCompactAttempted: (next) => { providerLoopCompactAttempted = next },
+            },
+            metrics,
+            replacementState,
+            initialPrompt: options.prompt,
+            storage: this.storage,
+            mapEventsForProvider,
+            runHooks: (phase, invocation, ctx, config) =>
+              executeRuntimeHooks(phase, invocation, ctx, config),
+            contextCompactPercent,
+            errorCodeHelpers: {
+              providerInvocationErrorCode,
+              providerContextRecoveryErrorCode,
+            },
+          })
+          for (const e of recoveryResult.events) yield e
+          providerContextRecoveryCount = recoveryResult.providerContextRecoveryCount
+          previousEvents = recoveryResult.previousEvents
+          autoCompactDecision = recoveryResult.autoCompactDecision
+          messages = recoveryResult.messages
+          cacheAwareCompactPolicy = recoveryResult.cacheAwareCompactPolicy
+          if (recoveryResult.kind === 'recovered') continue
+          if (recoveryResult.kind === 'blocked') return
+          throw recoveryResult.error
         }
 
         const postInvocationHooks = await executeRuntimeHooks(
