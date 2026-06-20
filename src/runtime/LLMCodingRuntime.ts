@@ -27,6 +27,7 @@ import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
 import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetrieval.js'
 import { prepareRuntimeStart } from './prepareRuntimeStart.js'
 import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
+import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -440,30 +441,32 @@ export class LLMCodingRuntime implements NexusRuntime {
         cacheAwareCompactPolicy,
         source: 'initial_refresh',
       })
-      const estimateVisibleContextTokens = () => estimateContextTokens({
-        systemPrompt: assembledContext.systemPrompt,
-        messages,
-        tools: modelVisibleTools,
-        conservative: true,
-      }).totalTokens
-      const applyContextRefreshState = (nextState: typeof contextRefreshState) => {
-        contextRefreshState = nextState
-        assembledContext = nextState.assembledContext
-        messages = nextState.messages
-        currentToolsList = nextState.currentToolsList
-        modelVisibleTools = nextState.modelVisibleTools
-        contextWindowState = nextState.contextWindowState
-        cacheAwareCompactPolicy = nextState.cacheAwareCompactPolicy
-        absorbCacheAwareCompactPolicyMetrics(metrics, cacheAwareCompactPolicy)
-      }
-      const contextMicrocompactEvent = (trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget') => buildContextMicrocompactEvent({
-        sessionId: options.sessionId,
-        requestId: options.requestId,
-        trigger,
-        metrics: assembledContext.microcompactMetrics,
-      })
-      const refreshAfterProviderContextRecovery = async () => {
-        applyContextRefreshState(await contextRefreshStrategy.refresh({
+      // Per-request closure bundle for the rest of the
+      // turn. The implementation lives in
+      // `buildContextRefreshClosureSet.ts` (Phase 3B-12
+      // helper extraction). The factory reads / writes
+      // the 7 `let` state variables through the state
+      // bundle so the inline closure definitions can
+      // move out of the main loop body.
+      const refreshClosures = buildContextRefreshClosureSet({
+        state: {
+          getAssembledContext: () => assembledContext,
+          getMessages: () => messages,
+          getModelVisibleTools: () => modelVisibleTools,
+          getContextWindowState: () => contextWindowState,
+          setContextRefreshState: (nextState) => {
+            contextRefreshState = nextState
+            assembledContext = nextState.assembledContext
+            messages = nextState.messages
+            currentToolsList = nextState.currentToolsList
+            modelVisibleTools = nextState.modelVisibleTools
+            contextWindowState = nextState.contextWindowState
+            cacheAwareCompactPolicy = nextState.cacheAwareCompactPolicy
+          },
+        },
+        metrics,
+        refreshStrategy: contextRefreshStrategy,
+        refreshOptions: {
           runtimeOptions: options,
           events: previousEvents,
           modelId: cleanedModelId,
@@ -474,20 +477,19 @@ export class LLMCodingRuntime implements NexusRuntime {
           compactPercent: contextCompactPercent,
           suppressToolsForIntent: shouldSuppressToolsForIntent,
           onMemoryRetrieval: this.emitMemoryRetrieval,
-          sessionInbox: 'load',
           workingSetOverride,
-        }))
-      }
-      const postCompactGroundingEvents = (source: 'post_compact' | 'context_recovery', boundaryId?: string) => {
-        this.readFileCache.clear()
-        return buildPostCompactGroundingEvents({
-          sessionId: options.sessionId,
-          requestId: options.requestId,
-          source,
-          boundaryId,
-          gitStatus: assembledContext.gitStatus,
-        })
-      }
+        },
+        readFileCache: this.readFileCache,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+      })
+      const {
+        estimateVisibleContextTokens,
+        applyContextRefreshState,
+        contextMicrocompactEvent,
+        refreshAfterProviderContextRecovery,
+        postCompactGroundingEvents,
+      } = refreshClosures
       // Initial post-refresh yield sequence (microcompact
       // + warning). The list is built by the
       // `buildPostRefreshYieldEvents` factory (Phase 3B-11
