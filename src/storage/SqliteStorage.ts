@@ -28,12 +28,14 @@ import type {
 } from './Storage.js'
 import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 import { EventRepository } from './EventRepository.js'
+import { TaskRepository } from './TaskRepository.js'
 
 type Row = Record<string, unknown>
 
 export class SqliteStorage implements NexusStorage {
   private readonly db: DatabaseSync
   private readonly eventRepository: EventRepository
+  private readonly taskRepository: TaskRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -76,6 +78,7 @@ export class SqliteStorage implements NexusStorage {
         }
       },
     })
+    this.taskRepository = new TaskRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -230,52 +233,15 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async saveTask(task: NexusTask): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO tasks (
-          task_id, session_id, title, status, created_at, updated_at, result,
-          description, owner_agent_id, created_by_session_id, source,
-          depends_on, blocks, retry_count, review, metadata
-        ) VALUES (
-          :taskId, :sessionId, :title, :status, :createdAt, :updatedAt, :result,
-          :description, :ownerAgentId, :createdBySessionId, :source,
-          :dependsOn, :blocks, :retryCount, :review, :metadata
-        )
-        ON CONFLICT(task_id) DO UPDATE SET
-          session_id = excluded.session_id,
-          title = excluded.title,
-          status = excluded.status,
-          updated_at = excluded.updated_at,
-          result = excluded.result,
-          description = excluded.description,
-          owner_agent_id = excluded.owner_agent_id,
-          created_by_session_id = excluded.created_by_session_id,
-          source = excluded.source,
-          depends_on = excluded.depends_on,
-          blocks = excluded.blocks,
-          retry_count = excluded.retry_count,
-          review = excluded.review,
-          metadata = excluded.metadata`,
-      )
-      .run(taskParams(task))
+    await this.taskRepository.saveTask(task)
   }
 
   async getTask(taskId: string): Promise<NexusTask | null> {
-    const row = this.db
-      .prepare(`SELECT * FROM tasks WHERE task_id = ?`)
-      .get(taskId) as Row | undefined
-    return row ? rowToTask(row) : null
+    return this.taskRepository.getTask(taskId)
   }
 
   async listTasks(sessionId: string): Promise<NexusTask[]> {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM tasks
-         WHERE session_id = ?
-         ORDER BY created_at ASC, task_id ASC`,
-      )
-      .all(sessionId) as Row[]
-    return rows.map(rowToTask)
+    return this.taskRepository.listTasks(sessionId)
   }
 
   async saveAgentJob(job: AgentJob): Promise<void> {
@@ -1449,27 +1415,6 @@ function sessionParams(session: SessionSnapshot): Record<string, string | null> 
   }
 }
 
-function taskParams(task: NexusTask): Record<string, string | number | null> {
-  return {
-    taskId: task.taskId,
-    sessionId: task.sessionId,
-    title: task.title,
-    status: task.status,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-    result: task.result ?? null,
-    description: task.description ?? null,
-    ownerAgentId: task.ownerAgentId ?? null,
-    createdBySessionId: task.createdBySessionId ?? null,
-    source: task.source ?? null,
-    dependsOn: JSON.stringify(task.dependsOn),
-    blocks: JSON.stringify(task.blocks),
-    retryCount: task.retryCount,
-    review: task.review ? JSON.stringify(task.review) : null,
-    metadata: task.metadata ? JSON.stringify(task.metadata) : null,
-  }
-}
-
 function agentJobParams(job: AgentJob): Record<string, string | null> {
   return {
     jobId: job.jobId,
@@ -1537,27 +1482,6 @@ function rowToSession(row: Row, events: NexusEvent[]): SessionSnapshot {
     pendingInput: row.pending_input ? JSON.parse(String(row.pending_input)) : undefined,
     metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
     originCwd: nullableString(row.origin_cwd),
-  }
-}
-
-function rowToTask(row: Row): NexusTask {
-  return {
-    taskId: String(row.task_id),
-    sessionId: String(row.session_id),
-    title: String(row.title),
-    status: String(row.status) as NexusTask['status'],
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-    result: nullableString(row.result),
-    description: nullableString(row.description),
-    ownerAgentId: nullableString(row.owner_agent_id),
-    createdBySessionId: nullableString(row.created_by_session_id),
-    source: (nullableString(row.source) as NexusTask['source']) ?? undefined,
-    dependsOn: row.depends_on ? JSON.parse(String(row.depends_on)) : [],
-    blocks: row.blocks ? JSON.parse(String(row.blocks)) : [],
-    retryCount: row.retry_count !== null && row.retry_count !== undefined ? Number(row.retry_count) : 0,
-    review: row.review ? JSON.parse(String(row.review)) : undefined,
-    metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
   }
 }
 
