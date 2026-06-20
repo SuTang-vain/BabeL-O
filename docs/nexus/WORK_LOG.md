@@ -4,6 +4,8 @@
 
 ## 2026-06-21 — Path 0 (drain-into-array buffer): real streaming root cause
 
+> **完整文档**: [reference/streaming-pipeline-realtime-rendering-fix.md](./reference/streaming-pipeline-realtime-rendering-fix.md) — 包含全部三层 (Path 0 / 1 / 2) 的设计、bisect 目标、WS 抓包数据、为什么三层都必要的解释。本节只记录 Path 0 的事实流水。
+
 - **背景**: 用户反馈 Path 1 + Path 2 落地后**仍然不丝滑**，"多个事件 chunk 一起显示而不是真实实时"。WS time-trace 抓出真实数据：
   - **修复前**：first arrival +13064ms, last +13150ms, **span 86ms**, 365 chunks 一齐到达
   - **修复后**：first arrival +7913ms, last +11459ms, **span 3546ms**, 260 chunks 间隔 ~14ms 真实流式
@@ -52,6 +54,8 @@
   仅 Path 1+2 不够 —— buffer 让 chunk 全卡在最后一刻 dump 出来。Path 0 是真正解封 streaming 的关键。
 
 ## 2026-06-21 — Go TUI real-time rendering: Path 2 + Path 1 组合
+
+> **完整文档**: [reference/streaming-pipeline-realtime-rendering-fix.md](./reference/streaming-pipeline-realtime-rendering-fix.md) — Path 0 / 1 / 2 完整设计 + 为什么三层都必要。本节记录 Path 1 + Path 2 的事实流水。
 
 - **背景**: 用户报告"Go TUI 无法实时渲染，agent 在流式输出时无法直接捕获"。WS 抓包 (`/tmp/ws-trace.cjs`) 显示：21 个 `thinking_delta` 事件跟 1 个 `assistant_delta`（DeepSeek V4 Anthropic-compatible batched 输出）。Go TUI 的 footer 动画在 thinking → assistant 间出现 dead-air gap，flash "agent thinking" → "agent runtime" → "agent writing"。**根本原因不是 wire 故障** —— server 正确推送 37 个事件，是 provider 行为：DeepSeek V4 把整段 final text 装进一个 `text_delta`/`delta.content`。
 - **设计选择 — 双路径组合**：
