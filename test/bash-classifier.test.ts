@@ -173,10 +173,37 @@ test('classifyBashRisk tokenizes quoted arguments correctly', () => {
   // quotes still parses correctly. The allowlist check uses token-level
   // matching, not string-level.
   expectRead('git log "two words" --oneline')
-  // The dangerous-pattern layer still catches ; | > even when they appear
-  // inside double-quoted segments because we tokenize BEFORE matching the
-  // raw string against the patterns.
-  expectExecute('git log "x; y" --oneline', { ruleSubstring: 'chained-semicolon' })
+  // Quote-aware fix (2026-06-21): `;` inside double-quoted segments
+  // is no longer treated as a shell operator. Real e2e session
+  // session_ea4f1793 caught this — sqlite3 with embedded `;` in SQL
+  // was being misclassified as `chained-semicolon`.
+  expectRead('git log "x; y" --oneline')
+})
+
+test('classifyBashRisk: dangerous patterns OUTSIDE quotes still fire', () => {
+  // Same `;` operator but in the unquoted part of the command.
+  expectExecute('echo hi; echo bye', { ruleSubstring: 'chained-semicolon' })
+  // Same `>` redirect but in the unquoted part.
+  expectExecute('echo hi > /tmp/out', { ruleSubstring: 'output-redirect' })
+  // Same `||` chain but in the unquoted part (real session_ea4f1793
+  // had this on the second attempt: the `||` chain to echo fallback).
+  expectExecute('cat /etc/foo 2>/dev/null || echo fallback', { ruleSubstring: 'output-redirect' })
+  // Real session_ea4f1793 sqlite3 command had `;` inside SQL string
+  // + `2>/dev/null` + `||` outside. The dangerous-pattern layer
+  // (DANGEROUS_PATTERNS) lists `rm-anywhere` / `chained-semicolon` /
+  // `output-redirect` / `chained-or` in that source order — the first
+  // match wins, and since `2>/dev/null` redirect appears before
+  // `||` in this command, output-redirect fires first.
+  expectExecute('sqlite3 foo.db "SELECT * FROM t WHERE c = \'a;b\'" 2>/dev/null || echo fallback', { ruleSubstring: 'output-redirect' })
+})
+
+test('classifyBashRisk: dangerous patterns inside quotes do NOT fire', () => {
+  // Single-quoted SQL literal with embedded `;`
+  expectExecute('sqlite3 foo.db "SELECT * FROM t WHERE c = \'a;b\'"', { ruleSubstring: 'command:sqlite3-not-allowlisted' })
+  // Double-quoted echo argument with embedded `>`
+  expectRead('echo "x > y"')
+  // Double-quoted echo with embedded `|` (was a false-negative coincidence)
+  expectRead('echo "a | b"')
 })
 
 test('classifyBashRisk preserves original command string for audit', () => {
