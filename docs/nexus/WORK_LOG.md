@@ -2,6 +2,35 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-21 — Go TUI real-time rendering: Path 2 + Path 1 组合
+
+- **背景**: 用户报告"Go TUI 无法实时渲染，agent 在流式输出时无法直接捕获"。WS 抓包 (`/tmp/ws-trace.cjs`) 显示：21 个 `thinking_delta` 事件跟 1 个 `assistant_delta`（DeepSeek V4 Anthropic-compatible batched 输出）。Go TUI 的 footer 动画在 thinking → assistant 间出现 dead-air gap，flash "agent thinking" → "agent runtime" → "agent writing"。**根本原因不是 wire 故障** —— server 正确推送 37 个事件，是 provider 行为：DeepSeek V4 把整段 final text 装进一个 `text_delta`/`delta.content`。
+- **设计选择 — 双路径组合**：
+  - **Path 1（server 侧 chunker）**：在 `AnthropicAdapter` / `OpenAIAdapter` 的 `text_delta`/`delta.content` 处加 chunker，>50 chars 的单个 delta 按段落/句子/子句/词边界拆成多个 `assistant_delta` 流到 WS。
+  - **Path 2（TUI 侧 synthesizing indicator）**：在 `lastEventType` switch 之前增加 `pendingSynthesis` 状态，thinking → assistant 间隙显示 "drafting response" 指示器。
+  - 两者协同：chunker 把 batched 输出拆成多个 chunk 持续推送；synthesizing 指示器覆盖 chunker 启用之前的 dead-air。
+- **实现（Path 1，server 侧）**：
+  - **`src/providers/adapters/AnthropicAdapter.ts`**: 新增 `function* chunkTextDelta(input)` (~50 行)，边界优先级 paragraph (`\n\n+`) > sentence (`[.!?]+\s*`) > clause (`[,;:]+\s*`) > word (`\s+`)。搜索窗口 `[20, remaining.length - 30]` 保留前缀 + 为下次迭代预留尾巴。找不到自然边界时硬切 60 chars。在 `content_block_delta` 的 `text_delta` 处调 `yield* chunkTextDelta(text)`。
+  - **`src/providers/adapters/OpenAIAdapter.ts`**: 同样算法 inline 复制（避免跨 adapter 依赖，遵守正交边界原则）。在 `delta.content` 处调 `yield* chunkOpenAITextDelta(content)`。**关键**：DeepSeek V4 用的是 OpenAI adapter（不是 Anthropic），所以这个 wiring 才是真正命中的路径。
+  - **threshold 50 chars**：小于等于 50 的 delta verbatim emit，不打散正常 streaming provider。
+- **实现（Path 2，TUI 侧）**：
+  - **`clients/go-tui/internal/tui/anim.go`**: 新增 `runtimeAnimationSynthesizing` enum kind + 桥梁调色板（cyan/purple/cyan 介于 thinking 紫粉 vs responding 青蓝之间）。
+  - **`clients/go-tui/internal/tui/tui.go`**: model 加 `pendingSynthesis bool` + `assistantSeenInTurn bool` 两个 latch。`thinking_delta` case 在 `assistantSeenInTurn=false` 时 arm pendingSynthesis + 清 lastEventType；`assistant_delta` case 关闭两个 latch；`tool_started` case 清 pendingSynthesis（tool 信号优先）；`startPrompt` reset 路径同时清两个 latch + lastEventType。
+  - **`clients/go-tui/internal/tui/chrome.go`**: `runtimeAnimationState()` 优先级：permission_request / tool_* / assistant_delta / thinking_delta 直接 switch；default 分支检查 `pendingSynthesis` → synthesizing 或 fallback default。
+- **验证**:
+  - `tsc -p tsconfig.build.json --noEmit`: clean。
+  - `cd clients/go-tui && go test ./internal/tui/ ./internal/loop/`: 全过。
+  - `test/anthropic-chunker.test.ts` (新建 8 case): short verbatim / sentence boundary / sentence > word priority / hard splits / reassembly invariant / 50-char threshold / paragraph > sentence priority / AnthropicAdapter symbol smoke。8/8 pass。
+  - 跨 spec 回归: 248/248 全绿（之前 Bug 1.2 / quote-aware 测试套件无回归）。
+  - **真实端到端**:
+    - Path 2: `bbl go` 内显示 dead-air 时不再 flash "agent thinking" → "agent runtime"，而是从 "agent thinking" 平滑过渡到 "drafting response" → "agent writing"。
+    - Path 1: WS 抓包确认 OpenAI adapter 命中 chunker 路径（DeepSeek V4 的 `delta.content` > 50 chars 时被切成多 chunk）。短 prompt（直接 streaming provider）chunk 大小仍是 1-14 chars，chunker 不打散已 streaming 输出 —— 零回归。
+- **边界**:
+  - chunker 阈值 50 chars 保守；如需更细可后续调到 30 chars，但风险更高（可能影响 Anthropic 已有 streaming）。
+  - 两个 adapter 各保留独立 chunker 副本，零跨依赖；如未来抽公共 util 需单独 PR。
+  - Path 2 synthesizing 指示器只覆盖 chrome 底部动画，不改 transcript 文本行布局。
+  - Tool / permission 事件优先级高于 synthesizing（实测 scenario：model thinking → 调 tool → tool_completed → 仍可能再有 thinking 时，chrome 切回 tool activity，不被 synthesizing 干扰）。
+
 ## 2026-06-21 — bashClassifier quote-aware fix (副发现, follow-up of Bug 1.2)
 
 - **背景**: Bug 1.2 fix 让模型能看到 deny message 中的 classifier rule 名（`chained-semicolon` / `output-redirect` / `command:sqlite3-not-allowlisted` 等）。但 e2e session `session_ea4f1793` 还暴露一个副 bug：`findDangerousPattern` 在 raw command 字符串上跑 regex，没用 `tokenizeBashCommand` 的 quote-aware 输出。导致所有"在引号里的分号/管道/重定向"被误识别为真 shell operator，触发 false-positive `chained-semicolon` / `output-redirect` 等规则。
