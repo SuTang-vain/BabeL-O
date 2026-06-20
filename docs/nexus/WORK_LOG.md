@@ -2,6 +2,26 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-20 — Long-Running Context Assembly Bug 1.1: contextSessions cross-session metadata search
+
+- **背景**: 真实 session `session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1` 测试 `bbl go` runtime 时，用户 prompt "使用 contextRecent 工具列出最近 5 个 session 的 ID 与 lastUserInput" 触发 4 次工具调用（contextRecent / Bash / Bash / contextSearch），其中 `contextSearch{query: "sessionId lastUserInput", maxTokens: 5000}` 命中 0 结果（`hitCount: 0`, `content: ""`）。根因：`contextSearch` 数据层 `searchEvents()` 只接 `events: NexusEvent[]` 单 session 事件流，跨 session 元数据（id / cwd / prompt / lastUserInput / phase / timestamps）从未进入工具搜索路径。模型 fallback 到 `assistant_delta` 编造"无法获取，需要 sqlite3 查询" 文本回答，而非基于工具事实。
+- **设计选择**: 不扩展 `contextSearch` 加 `crossSession?: boolean` flag — 单 session 事件搜索 vs 跨 session 元数据搜索是两个不同的 question shape + payload schema，flag 化会让 prompt 与 result 含义混乱。改为新增独立的第 4 个 on-demand tool `contextSessions`，与 `contextSearch` / `contextRecent` / `contextSummarize` 保持正交边界（[[feedback-tool-boundary-granularity]]）。
+- **实现 (3 段)**:
+  - **数据层** `src/tools/contextTools.ts` (+128 行): 新增 `SessionMetadata` 类型 (sessionId/cwd/prompt/lastUserInput/phase/createdAt/updatedAt/result/failureReason) + `SessionSearchOptions` 类型 (query/cwd/phase/sinceMs/limit/caseSensitive/maxTokens) + `searchSessionsMetadata(sessions, options)` 纯函数 + `extractSessionText(s)` / `formatSessionSnippet(s)` 内部 helper。复用既有 `capByTokens` / `estimateTokens` token 上限策略。phase 字段支持 string 或 array of string（多 phase 联合）；query 命中 prompt/lastUserInput/result/failureReason/cwd/phase 任一字段；newest-first 排序；`limit` 默认 20，最大 100。
+  - **Builtin wrapper** `src/tools/builtin/contextSessions.ts` (新建 116 行): `contextSessionsTool` 实现 `ToolDefinition`，risk='read'、no-approval；execute() 走 `context.storage.listSessions({})` 取全部 session metadata（`SessionSnapshot` → `SessionMetadata` 投影），调 `searchSessionsMetadata(...)`；storage 缺失时返回 `CONTEXT_STORAGE_UNAVAILABLE`，listSessions 抛错时返回 `CONTEXT_SESSIONS_FAILED`。description + prompt 明确写"跨 session 元数据搜索"，与 contextSearch / contextRecent 单 session 边界对比写清楚。
+  - **Registry 注册** `src/tools/registry.ts` (+3 行): `contextSessionsTool` 加入 tools[] 列表；`CONTEXT_TOOL_NAMES` 集合从 3 扩到 4（`storage: null` 时同步 hide 4 工具）。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/context-sessions-tool.test.ts` (新建 13 test): 8 个 `searchSessionsMetadata` 数据层 (空列表 / query 命中 prompt+lastUserInput+cwd / cwd filter / phase string+array / sinceMs filter / limit + newest-first / caseSensitive / token cap truncated) + 5 个 wrapper (storage 缺失 → CONTEXT_STORAGE_UNAVAILABLE / storage 注入并执行 newest-first / query forwarding / storage 抛错 → CONTEXT_SESSIONS_FAILED / 工具 metadata read+no-approval+prompt 含 cross-session)。13/13 pass。
+  - `test/runtime-context-tools-registry-gate.test.ts` 同步更新（"3 context tools" → "4 context tools"，新增 `contextSessions` 在 storage-gate 4 个测试中的 assertion）。
+  - 跨 spec 回归: `test/context-tools.test.ts test/runtime-context-tools-registry-gate.test.ts test/context-assembler.test.ts test/context-sessions-tool.test.ts` 95/95 pass。
+  - **真实 runtime 端到端**: `curl POST /v1/execute` prompt "使用 contextSessions 工具列出最近 5 个 session 的 ID 与 lastUserInput。只返回工具结果摘要，不要再调用其他工具。" → session_816269a1。模型一次工具调用 `contextSessions{limit: 5}` → success, hitCount=50, contentLen=924；result message 表格列出 5 个 session 的 ID + phase + lastUserInput，全部基于 tool_result 而非 hallucination。
+- **边界**:
+  - 不改 `contextSearch` / `contextRecent` / `contextSummarize` 既有行为；它们继续守住单 session 事件流的语义边界。
+  - 不修改 storage layer（`storage.listSessions()` API 已存在）。
+  - 不持久化新 event 类型；contextSessions 不进 active context（INV-L12）。
+  - 不改 CLI `bbl context history` / REST `/v1/context/history` 路径（它们仍是 `searchEvents` 复用层；如果未来需要 CLI/REST 暴露 cross-session metadata search，再起独立路由）。
+
 ## 2026-06-20 — Long-Running Context Assembly: natural_pause retired (ADR-5 retired)
 
 - **背景**: `long-running-context-assembly.md` 的 R0-R7 全部收口 + plan 升 `Active Plan` (2026-06-21) 之后，ADR-5 承诺的"看 R0-R7 真实数据再决定 natural_pause 去留"已具备决策条件。R7 fixture (`session_981cc5c2` / `session_cf361f04` / `session_10320709`) 跑下来 0 个 natural_pause 事件；working set + behaviorTrace (`trajectory-end` / `user-redirect`) + `/v1/context/observe` redacted summary + resumePreview 已 100% 覆盖原 natural_pause 想捕获的信号。按 §13 Phase 3 + ADR-5 收口路径走候选 (a) 完全删除。

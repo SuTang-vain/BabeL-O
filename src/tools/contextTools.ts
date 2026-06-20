@@ -58,6 +58,123 @@ export type RecentOptions = {
   maxTokens?: number
 }
 
+// ─── Cross-session search ─────────────────────────────────────────────────
+
+// Lightweight session metadata for cross-session search — mirrors the
+// fields models actually need to triage past sessions (id, prompt,
+// cwd, lastUserInput, phase, timestamps) without loading event
+// streams. Wire from `storage.listSessions()` in the tool wrapper.
+export type SessionMetadata = {
+  sessionId: string
+  cwd?: string
+  prompt?: string
+  lastUserInput?: string
+  phase?: string
+  createdAt?: string
+  updatedAt?: string
+  result?: string
+  failureReason?: string
+}
+
+export type SessionSearchOptions = {
+  query?: string                  // optional content match against prompt/lastUserInput/result
+  cwd?: string                    // restrict to a workspace
+  sinceMs?: number                // restrict to sessions updated >= sinceMs
+  phase?: string | string[]       // restrict to phases (e.g. 'completed', ['executing','waiting'])
+  limit?: number                  // max sessions to return (default 20)
+  caseSensitive?: boolean
+  maxTokens?: number
+}
+
+// Search across session metadata (NOT events). Use this when the
+// caller needs to find past sessions by topic, cwd, phase, or
+// timeframe, then optionally drill into a specific session via
+// searchEvents. Returns one line per matching session with id +
+// phase + cwd + lastUserInput + timestamp — capped by maxTokens.
+export function searchSessionsMetadata(
+  sessions: SessionMetadata[],
+  options: SessionSearchOptions = {},
+): ToolResult {
+  const maxTokens = options.maxTokens ?? MAX_TOKENS_PER_TOOL_RETURN
+  const limit = options.limit ?? 20
+  const caseSensitive = options.caseSensitive ?? false
+  const queryRaw = options.query?.trim() ?? ''
+  const needle = queryRaw ? (caseSensitive ? queryRaw : queryRaw.toLowerCase()) : null
+  const phases = options.phase
+    ? (Array.isArray(options.phase) ? new Set(options.phase) : new Set([options.phase]))
+    : null
+  const sinceMs = options.sinceMs
+
+  const filtered: SessionMetadata[] = []
+  for (const session of sessions) {
+    if (options.cwd && session.cwd !== options.cwd) continue
+    if (phases && session.phase && !phases.has(session.phase)) continue
+    if (sinceMs !== undefined) {
+      const ts = Date.parse(session.updatedAt ?? session.createdAt ?? '')
+      if (!Number.isFinite(ts) || ts < sinceMs) continue
+    }
+    if (needle) {
+      const haystack = caseSensitive
+        ? extractSessionText(session)
+        : extractSessionText(session).toLowerCase()
+      if (!haystack.includes(needle)) continue
+    }
+    filtered.push(session)
+  }
+
+  // Sort newest first
+  const sorted = [...filtered].sort((a, b) => {
+    const at = Date.parse(a.updatedAt ?? a.createdAt ?? '') || 0
+    const bt = Date.parse(b.updatedAt ?? b.createdAt ?? '') || 0
+    return bt - at
+  })
+  const sliced = sorted.slice(0, limit)
+  const hitCount = filtered.length
+
+  if (sliced.length === 0) {
+    return {
+      content: '(no matching sessions)',
+      tokenEstimate: estimateTokens('(no matching sessions)'),
+      hitCount: 0,
+      truncated: false,
+    }
+  }
+
+  const lines: string[] = [`## Sessions (${sliced.length}/${hitCount})`, '']
+  for (const s of sliced) {
+    lines.push(formatSessionSnippet(s))
+  }
+  const joined = lines.join('\n')
+  const capped = capByTokens(joined, maxTokens)
+  return {
+    content: capped.content,
+    tokenEstimate: estimateTokens(capped.content),
+    hitCount,
+    truncated: capped.truncated,
+    truncatedAt: capped.truncatedAt,
+  }
+}
+
+function extractSessionText(s: SessionMetadata): string {
+  return [
+    s.sessionId,
+    s.cwd ?? '',
+    s.prompt ?? '',
+    s.lastUserInput ?? '',
+    s.result ?? '',
+    s.failureReason ?? '',
+    s.phase ?? '',
+  ].join(' ')
+}
+
+function formatSessionSnippet(s: SessionMetadata): string {
+  const last = (s.lastUserInput ?? s.prompt ?? '').replace(/\s+/g, ' ').slice(0, 120)
+  const ts = s.updatedAt ?? s.createdAt ?? ''
+  const phase = s.phase ?? '?'
+  const cwd = s.cwd ?? ''
+  return `- [${ts}] ${s.sessionId} phase=${phase} cwd=${cwd}\n  lastInput: "${last}"`
+}
+
 // ─── Token estimation ─────────────────────────────────────────────────────
 
 export function estimateTokens(text: string): number {

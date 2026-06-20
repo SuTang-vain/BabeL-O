@@ -678,15 +678,18 @@ class WorkingSetTracker {
 
 ### 7.1 on-demand 工具（model 主动调用）
 
-> **状态**（2026-06-20 audit 修订）：✅ 3 个 tool 双层落地：**数据层** 3 个纯函数 (`searchEvents` / `summarizeWindow` / `recentEvents`) 在 `src/tools/contextTools.ts` (PR-7, 2026-06-15)；**builtin tool wrapper** 3 个独立模块 `src/tools/builtin/contextSearch.ts` / `contextSummarize.ts` / `contextRecent.ts` 注册到 ToolRegistry (PR-8, 2026-06-15)。CLI `bbl context history` (PR-10) 复用 `searchEvents` / `summarizeWindow`。REST `/v1/context/history` (PR-11) 同样复用。R0 (storage propagation) 收口后，`contextSearch` / `contextRecent` 在 storage-backed runtime 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`。
+> **状态**（2026-06-20 Bug 1.1 修复后修订）：✅ 4 个 tool 双层落地：**数据层** 4 个纯函数 (`searchEvents` / `summarizeWindow` / `recentEvents` / `searchSessionsMetadata`) 在 `src/tools/contextTools.ts` (PR-7, 2026-06-15; cross-session metadata search 补于 2026-06-20)；**builtin tool wrapper** 4 个独立模块 `src/tools/builtin/contextSearch.ts` / `contextSummarize.ts` / `contextRecent.ts` / `contextSessions.ts` 注册到 ToolRegistry (PR-8, 2026-06-15; `contextSessions` 补于 2026-06-20)。CLI `bbl context history` (PR-10) 复用 `searchEvents` / `summarizeWindow`。REST `/v1/context/history` (PR-11) 同样复用。R0 (storage propagation) 收口后，`contextSearch` / `contextRecent` / `contextSessions` 在 storage-backed runtime 不再返回 `CONTEXT_STORAGE_UNAVAILABLE`。
 
-新增 3 个 tool（数据层 `src/tools/contextTools.ts` + builtin wrapper `src/tools/builtin/context*.ts`）：
+**Bug 1.1 修复缘由（2026-06-20，session_ea4f1793 真实回归）**：原始 3 工具的 `contextSearch` / `contextRecent` 只能搜索/读取**当前 session 的事件流**——当用户问"列出最近 5 个 session 的 ID 与 lastUserInput"时，模型用 `contextSearch{query: "sessionId lastUserInput"}` 命中 0 结果（因为只在当前 session 内搜），随后在 `assistant_delta` 里编造"无法获取，需要 sqlite3 查询"的 fallback 回答。新工具 `contextSessions` 直接走 `storage.listSessions()` 跨 session 元数据搜索，弥补这条缺口。session_816269a1 真实验证：模型一次 `contextSessions{limit:5}` 返回正确的 5 session 列表。
 
-| 工具 | 用途 | 拉取源 |
-|---|---|---|
-| `context.search(query, since?)` | 全文搜索过往事件 | EventStore |
-| `context.summarize(scope, since?)` | 抽取某时段的摘要 | behavior-trace.jsonl |
-| `context.recent(n)` | 最近 N 个事件 | EventStore |
+新增 4 个 tool（数据层 `src/tools/contextTools.ts` + builtin wrapper `src/tools/builtin/context*.ts`）：
+
+| 工具 | 用途 | 拉取源 | 范围 |
+|---|---|---|---|
+| `context.search(query, since?)` | 全文搜索过往事件 | EventStore | 单 session |
+| `context.summarize(scope, since?)` | 抽取某时段的摘要 | behavior-trace.jsonl | 单 session |
+| `context.recent(n)` | 最近 N 个事件 | EventStore | 单 session |
+| `context.sessions(query?, cwd?, phase?, sinceMs?, limit?)` | 跨 session 元数据搜索 | `storage.listSessions()` | 全部 sessions |
 
 **示例**：
 ```typescript
