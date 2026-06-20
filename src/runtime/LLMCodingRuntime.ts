@@ -29,6 +29,7 @@ import { prepareRuntimeStart } from './prepareRuntimeStart.js'
 import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
 import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
 import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
+import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -644,81 +645,95 @@ export class LLMCodingRuntime implements NexusRuntime {
           source: 'pre_provider_call',
         })
         if (requestState.contextWindowState.isBlocking && !providerLoopCompactAttempted) {
-          providerLoopCompactAttempted = true
-          try {
-            const compactResult = await compactSession({
+          // Provider-loop reactive compact + refresh. The
+          // implementation lives in
+          // `executeProviderLoopCompactBlock.ts` (Phase
+          // 3B-14 helper extraction). The helper runs the
+          // compact + refresh + yield sequence and
+          // returns whether the compact was attempted so
+          // the main loop can update its flag.
+          const { events: providerLoopEvents, compactAttempted: providerLoopCompactAttemptedNow } =
+            await executeProviderLoopCompactBlock({
               storage: this.storage,
-              sessionId: options.sessionId,
-              modelId: cleanedModelId,
-              trigger: 'reactive',
-              mapEventsToMessages: mapEventsForProvider,
-              initialPrompt: options.prompt,
-            })
-            absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-            yield compactResult.event
-            yield compactResult.contextEvent
-            const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-            for (const groundingEvent of groundingEvents) yield groundingEvent
-            previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-            applyContextRefreshState(await contextRefreshStrategy.refresh({
-              runtimeOptions: options,
-              events: previousEvents,
-              modelId: cleanedModelId,
-              buildSystemPrompt,
-              mapEventsToMessages: mapEventsForProvider,
-              tools: toolsList,
-              warningPercent: contextWarningPercent,
-              compactPercent: contextCompactPercent,
-              suppressToolsForIntent: shouldSuppressToolsForIntent,
-              onMemoryRetrieval: this.emitMemoryRetrieval,
-              sessionInbox: 'load',
-              workingSetOverride,
-            }))
-            messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
-              contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
-            })
-            suppressToolsForCurrentIntent =
-              shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
-              !confirmedOptionSelection &&
-              suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
-            requestState = buildProviderLoopRequestState({
-              loopCount,
-              maxLoops,
-              readFileCache: this.readFileCache,
-              toolCallCount: metrics.toolCallCount,
-              systemPrompt: assembledContext.systemPrompt,
-              messages,
-              currentToolsList: toolsList(),
-              contextMaxTokens: assembledContext.budget.maxTokens,
-              warningPercent: contextWarningPercent,
-              compactPercent: contextCompactPercent,
-              suppressToolsForUserIntent: suppressToolsForCurrentIntent,
-              cacheAwareCompactPolicy,
-              finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
-            })
-            currentToolsList = requestState.currentToolsList
-            modelVisibleTools = requestState.modelVisibleTools
-            yield buildContextUsageEvent({
               sessionId: options.sessionId,
               requestId: options.requestId,
               modelId: cleanedModelId,
               providerId: settings.providerId,
-              windowState: requestState.contextWindowState,
-              cacheAwareCompactPolicy,
-              source: 'after_compact',
+              cleanedModelId,
+              isContextWindowBlocking: requestState.contextWindowState.isBlocking,
+              alreadyAttempted: providerLoopCompactAttempted,
+              refreshStrategy: contextRefreshStrategy,
+              refreshOptions: {
+                runtimeOptions: options,
+                events: previousEvents,
+                modelId: cleanedModelId,
+                buildSystemPrompt,
+                mapEventsToMessages: mapEventsForProvider,
+                tools: toolsList,
+                warningPercent: contextWarningPercent,
+                compactPercent: contextCompactPercent,
+                suppressToolsForIntent: shouldSuppressToolsForIntent,
+                onMemoryRetrieval: this.emitMemoryRetrieval,
+                workingSetOverride,
+              },
+              state: {
+                getPreviousEvents: () => previousEvents,
+                setPreviousEvents: (next) => { previousEvents = next },
+                getAutoCompactDecision: () => autoCompactDecision,
+                setAutoCompactDecision: (next) => { autoCompactDecision = next },
+                getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+                setCacheAwareCompactPolicy: (next) => { cacheAwareCompactPolicy = next },
+                getContextWindowState: () => contextWindowState,
+              },
+              closures: {
+                applyContextRefreshState,
+                postCompactGroundingEvents,
+                contextMicrocompactEvent,
+              },
+              metrics,
+              toolsList,
+              mapEventsForProvider,
+              shouldSuppressToolsForIntent,
+              onMemoryRetrieval: this.emitMemoryRetrieval,
+              workingSetOverride,
+              initialPrompt: options.prompt,
             })
-            const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-            if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-          } catch (error) {
-            yield buildCompactFailureEvent({
-              sessionId: options.sessionId,
-              trigger: 'reactive',
-              modelId: cleanedModelId,
-              failureCount: autoCompactDecision.failureCount + 1,
-              maxFailures: autoCompactDecision.failureLimit,
-              message: error instanceof Error ? error.message : String(error),
-            })
-          }
+          for (const e of providerLoopEvents) yield e
+          providerLoopCompactAttempted = providerLoopCompactAttemptedNow
+        }
+        if (providerLoopCompactAttempted) {
+          // After a reactive compact, rebuild the per-loop
+          // request state with the post-refresh context
+          // window state + message budget. This is the
+          // 3B-14 follow-up that the helper could not
+          // pull into the closure bundle: the main loop
+          // owns the `requestState` rebuild because it
+          // also drives the next `buildContextUsageEvent`
+          // / provider turn.
+          messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
+            contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
+          })
+          suppressToolsForCurrentIntent =
+            shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+            !confirmedOptionSelection &&
+            suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
+          requestState = buildProviderLoopRequestState({
+            loopCount,
+            maxLoops,
+            readFileCache: this.readFileCache,
+            toolCallCount: metrics.toolCallCount,
+            systemPrompt: assembledContext.systemPrompt,
+            messages,
+            currentToolsList: toolsList(),
+            contextMaxTokens: assembledContext.budget.maxTokens,
+            warningPercent: contextWarningPercent,
+            compactPercent: contextCompactPercent,
+            suppressToolsForUserIntent: suppressToolsForCurrentIntent,
+            cacheAwareCompactPolicy,
+            finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+          })
+          currentToolsList = requestState.currentToolsList
+          modelVisibleTools = requestState.modelVisibleTools
         }
         if (requestState.contextWindowState.isBlocking) {
           for (const event of buildRuntimeContextBlockingEventsForLoop({
