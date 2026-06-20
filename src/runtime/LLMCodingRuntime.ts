@@ -31,6 +31,7 @@ import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.j
 import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
 import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
 import { executeProviderTurn } from './executeProviderTurn.js'
+import { applyProviderOutcome } from './applyProviderOutcome.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -985,8 +986,13 @@ export class LLMCodingRuntime implements NexusRuntime {
           yield buildRuntimeExecutionMetricsEvent(options, metrics)
           return
         }
-        const providerOutcome = reduceProviderTurnOutcome({
-          sessionId: options.sessionId,
+        // Provider outcome application. The implementation
+        // lives in `applyProviderOutcome.ts` (Phase 3B-16
+        // helper extraction). The helper runs
+        // `reduceProviderTurnOutcome(...)` and returns
+        // counter updates + events + kind so the main
+        // loop can dispatch on the outcome.
+        const outcomeResult = await applyProviderOutcome({
           turn: providerTurn,
           finalResponseOnlyMode,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
@@ -1000,18 +1006,17 @@ export class LLMCodingRuntime implements NexusRuntime {
           suppressedToolRetryCount,
           maxSuppressedToolRetries: MAX_SUPPRESSED_TOOL_RETRIES,
         })
-        if (providerTurn.toolCallTextLeakSuppression && providerOutcome.kind === 'continue') {
+        if (outcomeResult.finalAnswerRetryIncrement === 1) {
           metrics.finalAnswerRetryCount += 1
         }
-        maxTokenRecoveryCount = providerOutcome.maxTokenRecoveryCount
-        outputRetryCount = providerOutcome.outputRetryCount
-        suppressedToolRetryCount = providerOutcome.suppressedToolRetryCount
-        for (const event of providerOutcome.eventsBeforeMessages) yield event
-        messages.push(...providerOutcome.messages)
-        for (const event of providerOutcome.eventsAfterMessages) yield event
-        if (providerOutcome.kind === 'continue') continue
-        if (providerOutcome.kind === 'terminal') {
-          if (providerOutcome.queueSessionMemoryLiteUpdate) {
+        maxTokenRecoveryCount = outcomeResult.nextCounters.maxTokenRecoveryCount
+        outputRetryCount = outcomeResult.nextCounters.outputRetryCount
+        suppressedToolRetryCount = outcomeResult.nextCounters.suppressedToolRetryCount
+        for (const event of outcomeResult.events) yield event
+        messages.push(...outcomeResult.messages)
+        if (outcomeResult.kind === 'continue') continue
+        if (outcomeResult.kind === 'terminal') {
+          if (outcomeResult.queueSessionMemoryLiteUpdate) {
             queueSessionMemoryLiteUpdate({
               storage: this.storage,
               sessionId: options.sessionId,
@@ -1025,7 +1030,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         }
 
         const toolDispatch = toolDispatchPipeline.run({
-          toolCalls: providerOutcome.toolCalls,
+          toolCalls: outcomeResult.toolCalls!,
           runtimeOptions: options,
           previousEvents,
           taskScopeEvent,
