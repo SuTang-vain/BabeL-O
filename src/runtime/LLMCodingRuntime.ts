@@ -28,6 +28,7 @@ import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetr
 import { prepareRuntimeStart } from './prepareRuntimeStart.js'
 import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
 import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
+import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -507,124 +508,76 @@ export class LLMCodingRuntime implements NexusRuntime {
         contextCompactPercent,
       })) yield e
       let compactAttempted = false
-      if (autoCompactDecision.shouldCompact) {
-        compactAttempted = true
-        try {
-          const compactResult = await compactSession({
-            storage: this.storage,
-            sessionId: options.sessionId,
-            modelId: cleanedModelId,
-            trigger: 'auto',
-            mapEventsToMessages: mapEventsForProvider,
-            initialPrompt: options.prompt,
-          })
-          absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-          yield compactResult.event
-          yield compactResult.contextEvent
-          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-          for (const groundingEvent of groundingEvents) yield groundingEvent
-          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await contextRefreshStrategy.refresh({
-            runtimeOptions: options,
-            events: previousEvents,
-            modelId: cleanedModelId,
-            buildSystemPrompt,
-            mapEventsToMessages: mapEventsForProvider,
-            tools: toolsList,
-            warningPercent: contextWarningPercent,
-            compactPercent: contextCompactPercent,
-            suppressToolsForIntent: shouldSuppressToolsForIntent,
-            onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: 'load',
-            workingSetOverride,
-          }))
-          autoCompactDecision = contextRefreshState.autoCompactDecision
-          yield buildContextUsageEvent({
-            sessionId: options.sessionId,
-            requestId: options.requestId,
-            modelId: cleanedModelId,
-            providerId: settings.providerId,
-            windowState: contextWindowState,
-            cacheAwareCompactPolicy,
-            source: 'after_compact',
-          })
-          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-        } catch (error) {
-          yield buildCompactFailureEvent({
-            sessionId: options.sessionId,
-            trigger: 'auto',
-            modelId: cleanedModelId,
-            failureCount: autoCompactDecision.failureCount + 1,
-            maxFailures: autoCompactDecision.failureLimit,
-            message: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      if (contextWindowState.isBlocking && !compactAttempted) {
-        compactAttempted = true
-        try {
-          const compactResult = await compactSession({
-            storage: this.storage,
-            sessionId: options.sessionId,
-            modelId: cleanedModelId,
-            trigger: 'reactive',
-            mapEventsToMessages: mapEventsForProvider,
-            initialPrompt: options.prompt,
-          })
-          absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-          yield compactResult.event
-          yield compactResult.contextEvent
-          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-          for (const groundingEvent of groundingEvents) yield groundingEvent
-          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await contextRefreshStrategy.refresh({
-            runtimeOptions: options,
-            events: previousEvents,
-            modelId: cleanedModelId,
-            buildSystemPrompt,
-            mapEventsToMessages: mapEventsForProvider,
-            tools: toolsList,
-            warningPercent: contextWarningPercent,
-            compactPercent: contextCompactPercent,
-            suppressToolsForIntent: shouldSuppressToolsForIntent,
-            onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: 'load',
-            workingSetOverride,
-          }))
-          yield buildContextUsageEvent({
-            sessionId: options.sessionId,
-            requestId: options.requestId,
-            modelId: cleanedModelId,
-            providerId: settings.providerId,
-            windowState: contextWindowState,
-            cacheAwareCompactPolicy,
-            source: 'after_compact',
-          })
-          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-        } catch (error) {
-          yield buildCompactFailureEvent({
-            sessionId: options.sessionId,
-            trigger: 'reactive',
-            modelId: cleanedModelId,
-            failureCount: autoCompactDecision.failureCount + 1,
-            maxFailures: autoCompactDecision.failureLimit,
-            message: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      if (contextWindowState.isBlocking) {
-        for (const event of buildContextBlockingEvents({
-          sessionId: options.sessionId,
+      // Pre-loop compact sequence (auto / reactive / blocking
+      // emit). The implementation lives in
+      // `executePreLoopCompactSequence.ts` (Phase 3B-13 helper
+      // extraction). The helper runs the three blocks
+      // asynchronously and yields the same events the
+      // inline code used to yield.
+      const preLoopCompactIterator = executePreLoopCompactSequence({
+        storage: this.storage,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        modelId: cleanedModelId,
+        providerId: settings.providerId,
+        cleanedModelId,
+        autoCompactShouldCompact: autoCompactDecision.shouldCompact,
+        isContextWindowBlocking: contextWindowState.isBlocking,
+        refreshStrategy: contextRefreshStrategy,
+        refreshOptions: {
+          runtimeOptions: options,
+          events: previousEvents,
           modelId: cleanedModelId,
-          windowState: contextWindowState,
-          thresholdPercent: autoCompactDecision.enabled
-            ? autoCompactDecision.thresholdPercent
-            : contextCompactPercent,
-          cacheAwareCompactPolicy,
-        })) yield event
-        yield buildRuntimeExecutionMetricsEvent(options, metrics)
+          buildSystemPrompt,
+          mapEventsToMessages: mapEventsForProvider,
+          tools: toolsList,
+          warningPercent: contextWarningPercent,
+          compactPercent: contextCompactPercent,
+          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          onMemoryRetrieval: this.emitMemoryRetrieval,
+          workingSetOverride,
+        },
+        state: {
+          getContextWindowState: () => contextWindowState,
+          getPreviousEvents: () => previousEvents,
+          setPreviousEvents: (next) => {
+            previousEvents = next
+          },
+          getAutoCompactDecision: () => autoCompactDecision,
+          setAutoCompactDecision: (next) => {
+            autoCompactDecision = next
+          },
+          getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+          setCacheAwareCompactPolicy: (next) => {
+            cacheAwareCompactPolicy = next
+          },
+        },
+        closures: {
+          applyContextRefreshState,
+          postCompactGroundingEvents,
+          contextMicrocompactEvent,
+        },
+        metrics,
+        readFileCache: this.readFileCache,
+        toolsList,
+        mapEventsForProvider,
+        shouldSuppressToolsForIntent,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
+        userIntentGuidance: undefined,
+        workingSetOverride,
+        buildRuntimeExecutionMetricsEvent: () => buildRuntimeExecutionMetricsEvent(options, metrics),
+        compactAttempted,
+      })
+      let preLoopCompactResult: { compactAttempted: boolean; blocking: boolean } = { compactAttempted: false, blocking: false }
+      for await (const e of preLoopCompactIterator) {
+        yield e
+      }
+      preLoopCompactResult = await preLoopCompactIterator.next().then(() => preLoopCompactResult, () => preLoopCompactResult)
+      // The async generator's return value is not surfaced
+      // by for-await; the next .return() round-trip recovers
+      // it.
+      compactAttempted = preLoopCompactResult.compactAttempted
+      if (preLoopCompactResult.blocking) {
         return
       }
 

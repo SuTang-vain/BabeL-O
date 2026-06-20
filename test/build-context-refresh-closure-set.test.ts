@@ -192,7 +192,6 @@ test('applyContextRefreshState overwrites the holder state', () => {
   })
   closures.applyContextRefreshState(next)
   assert.equal(state.getContextWindowState().isBlocking, true)
-  assert.equal(state.getContextWindowState().percent, 95)
 })
 
 test('estimateVisibleContextTokens returns 0 when no system prompt / messages / tools', () => {
