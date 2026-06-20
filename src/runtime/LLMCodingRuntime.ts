@@ -32,6 +32,7 @@ import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.j
 import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
 import { executeProviderTurn } from './executeProviderTurn.js'
 import { applyProviderOutcome } from './applyProviderOutcome.js'
+import { executeToolDispatch } from './executeToolDispatch.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -1029,23 +1030,24 @@ export class LLMCodingRuntime implements NexusRuntime {
           return
         }
 
-        const toolDispatch = toolDispatchPipeline.run({
+        // Tool dispatch. The implementation lives in
+        // `executeToolDispatch.ts` (Phase 3B-17 helper
+        // extraction). The helper drives the dispatch
+        // async generator and returns the per-loop
+        // state updates + events + terminal flag.
+        const dispatchResult = await executeToolDispatch(toolDispatchPipeline, {
           toolCalls: outcomeResult.toolCalls!,
           runtimeOptions: options,
           previousEvents,
           taskScopeEvent,
         })
-        let toolDispatchResult = await toolDispatch.next()
-        while (!toolDispatchResult.done) {
-          yield toolDispatchResult.value
-          toolDispatchResult = await toolDispatch.next()
-        }
-        previousEvents = toolDispatchResult.value.previousEvents
-        taskScopeEvent = toolDispatchResult.value.taskScopeEvent
-        if (toolDispatchResult.value.kind === 'terminal') {
+        for (const event of dispatchResult.events) yield event
+        previousEvents = dispatchResult.previousEvents
+        taskScopeEvent = dispatchResult.taskScopeEvent
+        if (dispatchResult.terminal) {
           return
         }
-        messages.push(buildProviderToolResultsMessage(toolDispatchResult.value.toolResults))
+        messages.push(...dispatchResult.messages)
       }
 
       const maxLoopsMessage = `Execution exceeded maximum tool call iterations (${maxLoops}).`
