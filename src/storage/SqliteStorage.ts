@@ -31,6 +31,7 @@ import { EventRepository } from './EventRepository.js'
 import { TaskRepository } from './TaskRepository.js'
 import { AuditRepository } from './AuditRepository.js'
 import { ToolTraceRepository } from './ToolTraceRepository.js'
+import { SessionChannelRepository } from './SessionChannelRepository.js'
 
 type Row = Record<string, unknown>
 
@@ -40,6 +41,7 @@ export class SqliteStorage implements NexusStorage {
   private readonly taskRepository: TaskRepository
   private readonly auditRepository: AuditRepository
   private readonly toolTraceRepository: ToolTraceRepository
+  private readonly sessionChannelRepository: SessionChannelRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -85,6 +87,7 @@ export class SqliteStorage implements NexusStorage {
     this.taskRepository = new TaskRepository(this.db)
     this.auditRepository = new AuditRepository(this.db)
     this.toolTraceRepository = new ToolTraceRepository(this.db)
+    this.sessionChannelRepository = new SessionChannelRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -425,146 +428,41 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async saveSessionChannel(channel: SessionChannel): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO session_channels (
-          channel_id, kind, participant_session_ids, created_by_session_id,
-          created_at, status, policy_json, metadata_json
-        ) VALUES (
-          :channelId, :kind, :participantSessionIds, :createdBySessionId,
-          :createdAt, :status, :policyJson, :metadataJson
-        )
-        ON CONFLICT(channel_id) DO UPDATE SET
-          kind = excluded.kind,
-          participant_session_ids = excluded.participant_session_ids,
-          created_by_session_id = excluded.created_by_session_id,
-          created_at = excluded.created_at,
-          status = excluded.status,
-          policy_json = excluded.policy_json,
-          metadata_json = excluded.metadata_json`
-      )
-      .run(sessionChannelParams(channel))
+    await this.sessionChannelRepository.saveSessionChannel(channel)
   }
 
   async getSessionChannel(channelId: string): Promise<SessionChannel | null> {
-    const row = this.db
-      .prepare(`SELECT * FROM session_channels WHERE channel_id = ?`)
-      .get(channelId) as Row | undefined
-    return row ? rowToSessionChannel(row) : null
+    return this.sessionChannelRepository.getSessionChannel(channelId)
   }
 
   async listSessionChannels(options: SessionChannelListOptions = {}): Promise<SessionChannel[]> {
-    const limit = options.limit ?? 100
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM session_channels
-         ORDER BY created_at ASC, channel_id ASC`
-      )
-      .all() as Row[]
-    return rows
-      .map(rowToSessionChannel)
-      .filter(channel => !options.sessionId || channel.participantSessionIds.includes(options.sessionId))
-      .slice(0, limit)
+    return this.sessionChannelRepository.listSessionChannels(options)
   }
 
   async saveSessionMessage(message: SessionMessage): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO session_messages (
-          message_id, channel_id, from_session_id, to_session_id, broadcast,
-          type, content, evidence_json, priority, created_at, delivered_at,
-          acknowledged_at, status, metadata_json
-        ) VALUES (
-          :messageId, :channelId, :fromSessionId, :toSessionId, :broadcast,
-          :type, :content, :evidenceJson, :priority, :createdAt, :deliveredAt,
-          :acknowledgedAt, :status, :metadataJson
-        )
-        ON CONFLICT(message_id) DO UPDATE SET
-          channel_id = excluded.channel_id,
-          from_session_id = excluded.from_session_id,
-          to_session_id = excluded.to_session_id,
-          broadcast = excluded.broadcast,
-          type = excluded.type,
-          content = excluded.content,
-          evidence_json = excluded.evidence_json,
-          priority = excluded.priority,
-          created_at = excluded.created_at,
-          delivered_at = excluded.delivered_at,
-          acknowledged_at = excluded.acknowledged_at,
-          status = excluded.status,
-          metadata_json = excluded.metadata_json`
-      )
-      .run(sessionMessageParams(message))
+    await this.sessionChannelRepository.saveSessionMessage(message)
   }
 
   async getSessionMessage(messageId: string): Promise<SessionMessage | null> {
-    const row = this.db
-      .prepare(`SELECT * FROM session_messages WHERE message_id = ?`)
-      .get(messageId) as Row | undefined
-    return row ? rowToSessionMessage(row) : null
+    return this.sessionChannelRepository.getSessionMessage(messageId)
   }
 
   async listSessionMessages(
     channelId: string,
     options: SessionMessageListOptions = {},
   ): Promise<SessionMessageListResult> {
-    const limit = options.limit ?? 100
-    const order = options.order ?? 'asc'
-    const startIndex = options.cursor ? Number(options.cursor) : 0
-    const direction = order === 'asc' ? 'ASC' : 'DESC'
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM session_messages
-         WHERE channel_id = ?
-         ORDER BY created_at ${direction}, message_id ${direction}`
-      )
-      .all(channelId) as Row[]
-    const page = rows.slice(startIndex, startIndex + limit)
-    const nextIndex = startIndex + page.length
-    return {
-      messages: page.map(rowToSessionMessage),
-      nextCursor: nextIndex < rows.length ? String(nextIndex) : undefined,
-    }
+    return this.sessionChannelRepository.listSessionMessages(channelId, options)
   }
 
   async listSessionInbox(
     sessionId: string,
     options: SessionInboxOptions = {},
   ): Promise<SessionMessage[]> {
-    const limit = options.limit ?? 20
-    const channelRows = this.db
-      .prepare(
-        `SELECT * FROM session_channels
-         ORDER BY created_at ASC, channel_id ASC`
-      )
-      .all() as Row[]
-    const channelMap = new Map(channelRows.map(row => {
-      const channel = rowToSessionChannel(row)
-      return [channel.channelId, channel] as const
-    }))
-    const messageRows = this.db
-      .prepare(
-        `SELECT * FROM session_messages
-         ORDER BY created_at ASC, message_id ASC`
-      )
-      .all() as Row[]
-    const messages = messageRows
-      .map(rowToSessionMessage)
-      .filter(message => isInboxMessage(message, sessionId, channelMap.get(message.channelId), options.includeAcknowledged ?? false))
-      .sort(compareMessages)
-    return messages.slice(Math.max(0, messages.length - limit))
+    return this.sessionChannelRepository.listSessionInbox(sessionId, options)
   }
 
   async acknowledgeSessionMessage(messageId: string, acknowledgedAt: string): Promise<SessionMessage | null> {
-    const message = await this.getSessionMessage(messageId)
-    if (!message) return null
-    const acknowledged: SessionMessage = {
-      ...message,
-      acknowledgedAt,
-      status: 'acknowledged',
-    }
-    await this.saveSessionMessage(acknowledged)
-    return acknowledged
+    return this.sessionChannelRepository.acknowledgeSessionMessage(messageId, acknowledgedAt)
   }
 
   async savePermissionAudit(audit: PermissionAudit): Promise<void> {
@@ -1315,38 +1213,6 @@ function agentJobParams(job: AgentJob): Record<string, string | null> {
   }
 }
 
-function sessionChannelParams(channel: SessionChannel): Record<string, string | null> {
-  return {
-    channelId: channel.channelId,
-    kind: channel.kind,
-    participantSessionIds: JSON.stringify(channel.participantSessionIds),
-    createdBySessionId: channel.createdBySessionId,
-    createdAt: channel.createdAt,
-    status: channel.status,
-    policyJson: JSON.stringify(channel.policy),
-    metadataJson: channel.metadata ? JSON.stringify(channel.metadata) : null,
-  }
-}
-
-function sessionMessageParams(message: SessionMessage): Record<string, string | number | null> {
-  return {
-    messageId: message.messageId,
-    channelId: message.channelId,
-    fromSessionId: message.fromSessionId,
-    toSessionId: message.toSessionId ?? null,
-    broadcast: message.broadcast ? 1 : 0,
-    type: message.type,
-    content: message.content,
-    evidenceJson: message.evidence ? JSON.stringify(message.evidence) : null,
-    priority: message.priority,
-    createdAt: message.createdAt,
-    deliveredAt: message.deliveredAt ?? null,
-    acknowledgedAt: message.acknowledgedAt ?? null,
-    status: message.status,
-    metadataJson: message.metadata ? JSON.stringify(message.metadata) : null,
-  }
-}
-
 function rowToSession(row: Row, events: NexusEvent[]): SessionSnapshot {
   return {
     sessionId: String(row.session_id),
@@ -1386,55 +1252,4 @@ function eventIndexPayload(event: NexusEvent): string {
   if ('code' in event && event.code !== undefined) return String(event.code)
   if ('eventId' in event && event.eventId !== undefined) return String(event.eventId)
   return ''
-}
-
-function rowToSessionChannel(row: Row): SessionChannel {
-  return {
-    channelId: String(row.channel_id),
-    kind: String(row.kind) as SessionChannel['kind'],
-    participantSessionIds: JSON.parse(String(row.participant_session_ids)),
-    createdBySessionId: String(row.created_by_session_id),
-    createdAt: String(row.created_at),
-    status: String(row.status) as SessionChannel['status'],
-    policy: JSON.parse(String(row.policy_json)),
-    metadata: row.metadata_json ? JSON.parse(String(row.metadata_json)) : undefined,
-  }
-}
-
-function rowToSessionMessage(row: Row): SessionMessage {
-  return {
-    messageId: String(row.message_id),
-    channelId: String(row.channel_id),
-    fromSessionId: String(row.from_session_id),
-    toSessionId: nullableString(row.to_session_id),
-    broadcast: Number(row.broadcast) === 1,
-    type: String(row.type) as SessionMessage['type'],
-    content: String(row.content),
-    evidence: row.evidence_json ? JSON.parse(String(row.evidence_json)) : undefined,
-    priority: String(row.priority) as SessionMessage['priority'],
-    createdAt: String(row.created_at),
-    deliveredAt: nullableString(row.delivered_at),
-    acknowledgedAt: nullableString(row.acknowledged_at),
-    status: String(row.status) as SessionMessage['status'],
-    metadata: row.metadata_json ? JSON.parse(String(row.metadata_json)) : undefined,
-  }
-}
-
-function compareMessages(left: SessionMessage, right: SessionMessage): number {
-  const cmp = left.createdAt.localeCompare(right.createdAt)
-  if (cmp !== 0) return cmp
-  return left.messageId.localeCompare(right.messageId)
-}
-
-function isInboxMessage(
-  message: SessionMessage,
-  sessionId: string,
-  channel: SessionChannel | undefined,
-  includeAcknowledged: boolean,
-): boolean {
-  if (!channel || !channel.participantSessionIds.includes(sessionId)) return false
-  if (message.fromSessionId === sessionId) return false
-  if (!includeAcknowledged && message.acknowledgedAt) return false
-  if (message.toSessionId) return message.toSessionId === sessionId
-  return message.broadcast === true
 }
