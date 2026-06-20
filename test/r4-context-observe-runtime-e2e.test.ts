@@ -151,6 +151,41 @@ describe('R4: redactContext contract', () => {
     assert.equal(redacted.sessionSummary, original.sessionSummary)
   })
 
+  test('summary mode strips per-block `text` (Bug 2: systemPromptBlocks leak)', () => {
+    // Real e2e via /v1/context/observe during an active execute caught
+    // this: the legacy destructure stripped `systemPrompt` (joined
+    // string) and `messages`, but `systemPromptBlocks: Array<{ text,
+    // cacheable }>` survived redaction — leaking the full ~14k-char
+    // system prompt verbatim to WS observer subscribers under default
+    // summary mode. Fix (2026-06-20): also strip the per-block `text`
+    // field; only `{ cacheable }` markers survive.
+    const original = makeFakeAssembledContext()
+    const redacted = redactContext(original, 'summary') as RedactedContext
+
+    assert.ok(redacted.systemPromptBlocks, 'systemPromptBlocks array present')
+    assert.equal(redacted.systemPromptBlocks!.length, 3)
+    for (const block of redacted.systemPromptBlocks!) {
+      assert.ok(!('text' in block), `block.text must be stripped, got: ${JSON.stringify(block)}`)
+      assert.ok('cacheable' in block, 'block.cacheable survives as length-only marker')
+    }
+    // blockCount still equals the original count
+    assert.equal(redacted.redaction.blockCount, 3)
+    // None of the original per-block text leaks
+    const json = JSON.stringify(redacted)
+    assert.ok(!json.includes('IDENTITY'), 'block 1 text not leaked')
+    assert.ok(!json.includes('SYSTEM_RULES'), 'block 2 text not leaked')
+    assert.ok(!json.includes('ENV_INFO'), 'block 3 text not leaked')
+    assert.ok(!json.includes('You are a test assistant'), 'block body not leaked')
+  })
+
+  test('full mode keeps systemPromptBlocks with text intact', () => {
+    const original = makeFakeAssembledContext()
+    const full = redactContext(original, 'full') as AssembledContext
+    assert.equal(full.systemPromptBlocks!.length, 3)
+    assert.ok(full.systemPromptBlocks![0]!.text.includes('IDENTITY'))
+    assert.ok(full.systemPromptBlocks![1]!.text.includes('SYSTEM_RULES'))
+  })
+
   test('full mode returns the original context verbatim', () => {
     const original = makeFakeAssembledContext()
     const full = redactContext(original, 'full')

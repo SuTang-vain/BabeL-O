@@ -185,7 +185,12 @@ export type RedactedContextSummary = {
   cacheableBlockCount: number
 }
 
-export type RedactedContext = Omit<AssembledContext, 'systemPrompt' | 'messages'> & {
+// Bug 2 fix (2026-06-20): `systemPromptBlocks` is also stripped of
+// its `text` field; the type narrows the surviving fields to
+// `{ cacheable }[]` only.
+export type RedactedContextBlock = Pick<AssembledContext['systemPromptBlocks'] extends Array<infer B> ? B : never, 'cacheable'>
+export type RedactedContext = Omit<AssembledContext, 'systemPrompt' | 'messages' | 'systemPromptBlocks'> & {
+  systemPromptBlocks?: RedactedContextBlock[]
   redaction: RedactedContextSummary
 }
 
@@ -211,13 +216,30 @@ export function redactContext(
   const blocks = context.systemPromptBlocks ?? []
   const blockCount = blocks.length
   const cacheableBlockCount = blocks.filter((b) => b.cacheable).length
-  // Strip the two text-bearing fields. Everything else is structured
+  // Strip the text-bearing fields. Everything else is structured
   // metadata that's safe to expose by default.
-  const { systemPrompt: _sp, messages: _msgs, ...rest } = context
+  //
+  // Bug 2 fix (2026-06-20, real e2e via /v1/context/observe during
+  // active turn): the legacy destructure below stripped only `systemPrompt`
+  // (joined string) and `messages`, but AssembledContext ALSO carries
+  // `systemPromptBlocks: Array<{ text, cacheable }>` — that array survived
+  // redaction, leaking the full ~14k-char system prompt + tool contract
+  // lines verbatim to any WS observer subscriber. The WebSocket default
+  // is `?full` opt-in per R4 spec; the previous behavior made `summary`
+  // mode effectively `full` for any context block under 25k chars. Strip
+  // both `systemPrompt` AND the per-block `text` field; keep the count
+  // + cacheable split for diagnostics.
+  const sanitizedBlocks = blocks.map(({ text: _t, cacheable }) => ({ cacheable }))
+  const { systemPrompt: _sp, messages: _msgs, systemPromptBlocks: _spb, ...rest } = context
   void _sp
   void _msgs
+  void _spb
   return {
     ...rest,
+    // Type assertion: AssembledContext.systemPromptBlocks has the
+    // SystemPromptBlock shape (with `text`); we strip `text` and expose
+    // only `{ cacheable }` markers per RedactedContextBlock.
+    systemPromptBlocks: sanitizedBlocks as RedactedContextBlock[] | undefined,
     redaction: {
       systemPromptChars,
       messageCount,

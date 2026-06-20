@@ -2,6 +2,54 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-21 — Bug 2: context observer redaction leaks systemPromptBlocks[].text
+
+- **背景**: 真实 e2e 探测（2026-06-20/21）通过 `/v1/context/observe` 在 active turn 期间收到的 `assembled` frame，验证 `redactContext(ctx, 'summary')` 的隐私完整性 — 发现 **R4 的 summary 模式实际并未生效**：frame 里 `context.systemPromptBlocks[].text` 完整呈现（18k+ char system prompt + tool contract lines verbatim），`context.systemPrompt` 也仍然在 payload 里。这是 **真泄漏**：任何订阅 `/v1/context/observe` WS 的 consumer（Go TUI、外部 dashboard、未来 SDK）都会拿到完整 prompt 文本，而 R4 spec 明确要求 summary 模式只暴露长度 / counts / cacheable split。
+- **根因**: `redactContext` 在 `src/nexus/contextBroadcaster.ts:216` 用 `const { systemPrompt: _sp, messages: _msgs, ...rest } = context` 拆出 `systemPrompt` 字符串 + `messages` 数组。但 `AssembledContext` **同时**有 `systemPromptBlocks: SystemPromptBlock[]` 字段（`[{text, cacheable}]`），destructure 没有 strip 这个数组，所以每个 block 的 `text` 完整传到 WS payload。
+- **设计选择**:
+  - 不缩小 `systemPromptBlocks` 字段（保留 `cacheable` 字段让 observer 能看 prefix-cacheable 分布）。
+  - 不引入 "len-only marker per block" 类型（避免类型膨胀，as-cast 即可）。
+  - 不改 R4 spec 中的 "summary 模式只暴露 counts/budgets/section ids" 语义；只补齐漏掉的 strip。
+- **实现**:
+  - **数据层** `src/nexus/contextBroadcaster.ts`:
+    - 新增 `RedactedContextBlock = Pick<...SystemPromptBlock, 'cacheable'>` —— 红后的 block 只剩 `cacheable` 字段。
+    - `RedactedContext` type 加 `systemPromptBlocks?: RedactedContextBlock[]` 收紧字段类型。
+    - `redactContext` destructure 加上 `systemPromptBlocks: _spb` 把整个数组 strip，然后用 `sanitizedBlocks = blocks.map(({ text: _t, cacheable }) => ({ cacheable }))` 重建 length-only marker 数组覆盖回去。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/r4-context-observe-runtime-e2e.test.ts` (已有 9 case + 新增 2 case):
+    - 新增 `summary mode strips per-block text (Bug 2: systemPromptBlocks leak)`：13 个原始 block 的 `text` 字段全 strip，`cacheable` 字段保留，JSON 中不出现 `IDENTITY`/`SYSTEM_RULES`/`ENV_INFO` 等任何原文 snippet。
+    - 新增 `full mode keeps systemPromptBlocks with text intact`：opt-in `?full=1` 行为不变。
+    - 11/11 pass。
+  - 跨 spec 回归: r4 + runtime + security + context-tools + context-sessions + bash-deny + context-observe-websocket + runtime-context-tools-registry-gate = **243/243 pass**。
+  - **真实 WS 端到端**（手抓的 ws-frame.bin, 2026-06-20/21）：收到的 `assembled` frame `systemPromptBlocks` 字段全是 `[{cacheable: true}, ...]` — `text` 字段不再出现，`systemPrompt` 字段不再出现，`redaction` 元数据完整保留。
+- **边界**:
+  - 不改 R4 spec 文档语义；只是补齐实现漏洞。
+  - 不改 `full` 模式行为（opt-in 显式 verbatim）。
+  - 不改 observer route 路径 / query param 解析 / redaction mode 选择。
+  - 不改 working-set observer（那个已经是正确的 metadata-only payload）。
+
+## 2026-06-21 — Bug 1.3: contextRecent default-excludes hook / usage / thinking_delta noise
+
+- **背景**: 真实 session `session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1` 暴露 `contextRecent` 输出被内部 telemetry 污染。模型当时显式传了 `excludeEventTypes: ['tool_completed', 'assistant_delta']`，但 output 第一行是 `[2026-06-20T13:59:51.744Z] hook_started: hook_started InvocationDiagnosticsHook PostInvocation` —— 紧跟着 `hook_completed` / `usage` / 几十条单字符 `thinking_delta` chunk。这些 internal pipeline / stream 噪音没有 model 可解释内容，但占用了 5000-token 上限的相当份额，把 `user_message` / `tool_started` / `result` 等 user-visible events 挤出去。
+- **设计选择**:
+  - 不改 `contextSearch` / `contextSummarize`（它们已经只返回用户主动过滤后的内容，pollution 不严重）。
+  - 不引入"硬过滤 + 显式 opt-in include"双层 API（per-call `includeEventTypes`）—— 模型需要 reasoning 证据时，可以直接读 `result` event 或调 `contextSearch`；保持 `contextRecent` 语义单一为 "default-clean + caller-adds-filters"。
+  - **MERGE 而非 OVERRIDE**：caller-supplied `excludeEventTypes` 合并到 default set 之上，不是替代。这样模型可以 **add** 过滤（"再 exclude `user_message`"），但不会无意中 **undo** default 过滤（"我只想看 thinking_delta" 这种 use case 不被鼓励——属于 reasoning-trace inspection，应走 contextSearch）。
+- **实现**:
+  - **数据层** `src/tools/contextTools.ts`: 新增 `DEFAULT_RECENT_EXCLUDED_EVENT_TYPES` 常量 (ReadonlySet)，覆盖 6 类噪音（hook_started / hook_completed / usage / thinking_delta / assistant_delta / tool_completed）。`recentEvents()` 把 caller-supplied excludeEventTypes merge 到 default set 之上而非替代，保留 back-compat 默认行为 (caller 不传 → 用 default；caller 传 → default + caller).
+  - **Builtin wrapper** `src/tools/builtin/contextRecent.ts`: 重新写 `prompt()` —— 显式说明 default 行为 + 提醒 caller-supplied 是 merge 不是 replace，让模型知道思考_delta 想看的话用其他工具。
+- **验证**:
+  - `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+  - `test/context-tools.test.ts` (既有 24 test): 4 个 regression 调整 (1 个 events newest first 期望值换 default filter 后正确位置 / 1 个 excludeEventTypes 改写为 merge 验证 / 2 个新增 default 过滤 hook/usage/thinking_delta + caller-re-include 文档性 test)。
+  - 跨 spec 回归: `test/bash-classifier.test.ts test/runtime.test.ts test/security.test.ts test/context-tools.test.ts test/context-sessions-tool.test.ts test/runtime-context-tools-registry-gate.test.ts test/bash-deny-classifier-rule.test.ts` 239/239 pass。
+  - **真实 runtime 端到端**: `curl POST /v1/execute` prompt "contextRecent n=10 不要传 excludeEventTypes" → session_9bbddf62。模型看到的就是修复后效果，output 完全 user-visible events 链；hitCount=7, contentLen=1268。
+- **边界**:
+  - 不改 contextSearch / contextSummarize 的 filter 行为；它们已经做全量 match by default。
+  - 不改 `excludeEventTypes` parameter schema 形状；只改它的 default 与合并语义。
+  - 不动 `usage` event 排除（保留可观测性，模型要看 token usage 仍可看到）；如需更严格可后续加入 default。
+  - 不动 `contextRecentTool.requiresApproval=false` / `risk='read'` / 5k token cap。
+
 ## 2026-06-20 — Bug 1.2: Bash deny message surfaces classifier rule (model-visible)
 
 - **背景**: 真实 session `session_ea4f1793-ffc1-412a-a3c4-119c386f7ba1` 复盘揭示，同一 session 内 2 次 Bash 调用看起来"deny 不一致"——`git rev-parse HEAD` 通过、`sqlite3 ~/.babel-o/db.sqlite "..."` 被拒。源码核对后发现这不是 inconsistent，而是 `bashClassifier.ts` 正常工作（`git` 在 read-only 白名单 → effectiveRisk=read 自动放行；`sqlite3` 不在白名单 → execute risk → policy deny）。**真正的 bug 是 deny message 的可观测性**：`tool_denied.message` 写死为 `"Tool denied by Nexus policy: Bash"`，丢弃了 classifier 已经算出的 `rule`（`command:sqlite3-not-allowlisted` / `chained-semicolon` / `output-redirect` 等）。模型看不到拒绝原因 → 无法调整下一次调用 → fallback 到 `assistant_delta` 编造手动 workaround（"用 sqlite3 在终端跑"）。
