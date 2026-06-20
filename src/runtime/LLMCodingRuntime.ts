@@ -33,6 +33,7 @@ import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlo
 import { executeProviderTurn } from './executeProviderTurn.js'
 import { applyProviderOutcome } from './applyProviderOutcome.js'
 import { executeToolDispatch } from './executeToolDispatch.js'
+import { applyLeakSuppressionEffects } from './applyLeakSuppressionEffects.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -954,37 +955,30 @@ export class LLMCodingRuntime implements NexusRuntime {
         )
         for (const hookEvent of postInvocationHooks.events) yield hookEvent
 
-        absorbProviderTurnMetrics(metrics, providerTurn)
-        if (providerTurn.toolCallTextLeakSuppression) {
-          metrics.toolCallTextLeakSuppressedCount += 1
-          metrics.toolShapedTextPattern = providerTurn.toolCallTextLeakSuppression.pattern
-        }
-        if (providerTurn.memoryCapabilityAnswerLeakSuppression) {
-          metrics.toolCallTextLeakSuppressedCount += 1
-          metrics.toolShapedTextPattern = providerTurn.memoryCapabilityAnswerLeakSuppression.pattern
-          const leakError = buildRuntimeErrorEvent({
-            sessionId: options.sessionId,
-            code: 'MEMORY_CAPABILITY_ANSWER_LEAK_SUPPRESSED',
-            message: 'Suppressed a memory capability answer that exposed internal implementation details; retrying with user-facing capability guidance.',
-            details: providerTurn.memoryCapabilityAnswerLeakSuppression,
-          })
-          yield leakError
-          previousEvents = [...previousEvents, leakError]
-          if (memoryCapabilityAnswerRetryCount < 1) {
-            memoryCapabilityAnswerRetryCount += 1
-            metrics.finalAnswerRetryCount += 1
-            messages.push({
-              role: 'user',
-              content: 'Retry the answer at the user-facing capability level only. Say whether memory writes are possible, that they require an explicit remember/save request or approved candidate plus permission confirmation, and that long-term memory is only a background hint. Do not mention source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets.',
-            })
-            continue
-          }
-          yield buildRuntimeResultEvent(
-            options.sessionId,
-            true,
-            '可以，但不会自动静默写入。只有当你明确要求“记住/保存到记忆”，或批准某条记忆候选时，我才会发起写入；写入前会经过权限确认。长期记忆只作为后续会话的背景提示，不会替代当前工作区文件、会话记录或工具结果。',
-          )
-          yield buildRuntimeExecutionMetricsEvent(options, metrics)
+        // Leak-suppression effects. The implementation
+        // lives in `applyLeakSuppressionEffects.ts`
+        // (Phase 3B-18 helper extraction). The helper
+        // runs absorbProviderTurnMetrics + the two
+        // leak-suppression side effects and returns the
+        // updated state + events + kind. The helper
+        // mutates `metrics` in place; only the let
+        // bindings need a write-back.
+        const leakResult = await applyLeakSuppressionEffects({
+          providerTurn,
+          metrics,
+          sessionId: options.sessionId,
+          options,
+          previousEvents,
+          messages,
+          memoryCapabilityAnswerRetryCount,
+          maxMemoryCapabilityAnswerRetries: 1,
+        })
+        previousEvents = leakResult.previousEvents
+        messages = leakResult.messages
+        memoryCapabilityAnswerRetryCount = leakResult.memoryCapabilityAnswerRetryCount
+        for (const e of leakResult.events) yield e
+        if (leakResult.kind === 'retry') continue
+        if (leakResult.kind === 'terminal') {
           return
         }
         // Provider outcome application. The implementation
