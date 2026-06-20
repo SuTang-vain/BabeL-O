@@ -25,11 +25,12 @@ import { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'
 import { loadWorkingSetOverride } from './loadWorkingSetOverride.js'
 import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
 import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetrieval.js'
+import { prepareRuntimeStart } from './prepareRuntimeStart.js'
 import {
   buildCompactFailureEvent,
   compactSession,
 } from './compact.js'
-import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
+import { buildTaskScopeDeclaredEvent, deriveTaskScope, type TaskScopeDeclaredEvent } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
 // `wrapWithBehaviorTraceTap` (and its private `behaviorTraceDetectionKey`
 // helper) were extracted to `./behaviorTraceTap.ts` in Phase 3B-6; the
@@ -346,69 +347,46 @@ export class LLMCodingRuntime implements NexusRuntime {
         model: options.model,
       })
 
-      // 2. Load previous session events from storage (if any)
-      let previousEvents: NexusEvent[] = []
-      if (this.storage && options.replaySessionHistory !== false) {
-        try {
-          const result = await this.storage.listEvents(options.sessionId, {
-            order: 'desc',
-            limit: 1000,
-          })
-          previousEvents = [...(result?.events || [])].reverse()
-        } catch (e) {
-          logger.debug('Failed to load previous session events from storage', e)
-        }
-      }
-
       // Strip optional [1m] tag from canonical model name
       const activeModel = options.model || settings.modelId
       const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
       const adapter = getAdapter(settings.providerId)
+
+      // 2. Load previous session events + build intake + task scope
+      //    + per-request closures. The implementation lives in
+      //    `prepareRuntimeStart.ts` (Phase 3B-10 helper extraction);
+      //    this call site owns the shouldReplayReasoningContent
+      //    decision (model-specific) and yields the events.
       const shouldReplayReasoningContent =
         cleanedModelId.includes('deepseek') ||
         settings.modelId.includes('deepseek') ||
         settings.providerId === 'deepseek' ||
         Boolean(settings.baseUrl?.includes('deepseek'))
-      const mapEventsForProvider = (events: NexusEvent[], initialPrompt: string): ModelMessage[] =>
-        mapEventsToMessages(events, initialPrompt, {
-          replayReasoningContent: shouldReplayReasoningContent,
-        })
-
-      const intakeEvent = await buildUserIntakeGuidanceEvent({
+      const start = await prepareRuntimeStart({
+        options,
+        deps: {
+          storage: this.storage,
+          tools: this.tools,
+          toolPolicy: this.toolPolicy,
+          logger,
+        },
+        settings: {
+          providerId: settings.providerId,
+          modelId: settings.modelId,
+          apiKey: settings.apiKey,
+          baseUrl: settings.baseUrl,
+        },
+        cleanedModelId,
         adapter,
-        modelId: cleanedModelId,
-        apiKey: settings.apiKey,
-        baseUrl: settings.baseUrl,
-        sessionId: options.sessionId,
-        events: previousEvents,
-        latestPrompt: options.prompt,
-        cwd: options.cwd,
-        signal: options.signal,
+        shouldReplayReasoningContent,
       })
-      yield intakeEvent
-      previousEvents = [...previousEvents, intakeEvent]
-      const confirmedOptionSelection = isConfirmedOptionSelectionAfterClarification(previousEvents, options.prompt)
-      let taskScopeEvent = buildTaskScopeDeclaredEvent({
-        sessionId: options.sessionId,
-        requestId: options.requestId,
-        cwd: options.cwd,
-        prompt: options.prompt,
-        events: previousEvents,
-        allowedPaths: options.allowedPaths,
-      })
-      yield taskScopeEvent
-      previousEvents = [...previousEvents, taskScopeEvent]
-
-      const toolsList = () => [...this.tools.values()]
-        .filter(tool => this.toolPolicy.isAllowed(tool) || (
-          options.policyMode === 'soft-deny' &&
-          (tool.risk === 'write' || tool.risk === 'execute')
-        ))
-        .map(tool => ({
-          name: tool.name,
-          description: tool.prompt ? tool.prompt() : tool.description,
-          inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
-        }))
+      yield start.intakeEvent
+      yield start.taskScopeEvent
+      let previousEvents = start.previousEvents
+      let taskScopeEvent: TaskScopeDeclaredEvent = start.taskScopeEvent as TaskScopeDeclaredEvent
+      const mapEventsForProvider = start.mapEventsForProvider
+      const toolsList = start.toolsList
+      const confirmedOptionSelection = start.confirmedOptionSelection
       const contextRefreshStrategy = new ContextRefreshStrategy({
         storage: this.storage,
         memoryProvider: this.memoryProvider,
@@ -1508,29 +1486,6 @@ function providerContextRecoveryErrorCode(error: unknown, options: RuntimeExecut
   const providerCode = maybeMetadata.metadata?.code ?? maybeMetadata.metadata?.type
   if (typeof providerCode === 'string' && providerCode.trim()) return providerCode
   return providerInvocationErrorCode(error, options)
-}
-
-function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], latestPrompt: string): boolean {
-  const optionSelection = normalizeOptionSelection(latestPrompt)
-  if (!optionSelection) return false
-  let skippedCurrentUserMessage = false
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
-    if (event.type === 'user_message') {
-      if (!skippedCurrentUserMessage && normalizeOptionSelection(event.text) === optionSelection) {
-        skippedCurrentUserMessage = true
-        continue
-      }
-      return false
-    }
-    if (
-      (event.type === 'assistant_delta' && isOptionSelectionClarificationText(event.text) && event.text.includes(`"${optionSelection}"`)) ||
-      (event.type === 'result' && isOptionSelectionClarificationText(event.message) && event.message.includes(`"${optionSelection}"`))
-    ) {
-      return true
-    }
-  }
-  return false
 }
 
 export function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
