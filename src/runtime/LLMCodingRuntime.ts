@@ -30,7 +30,6 @@ import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
 import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
 import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
 import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
-import { executeProviderTurn } from './executeProviderTurn.js'
 import { applyProviderOutcome } from './applyProviderOutcome.js'
 import { executeToolDispatch } from './executeToolDispatch.js'
 import { applyLeakSuppressionEffects } from './applyLeakSuppressionEffects.js'
@@ -811,30 +810,40 @@ export class LLMCodingRuntime implements NexusRuntime {
         const invocationStartMs = performance.now()
         let providerTurn: RuntimeProviderTurn
         try {
-          // The implementation lives in
-          // `executeProviderTurn.ts` (Phase 3B-15 helper
-          // extraction). The helper drives the
-          // ProviderTurnDriver.run async generator and
-          // returns { events, providerTurn }. The main
-          // loop drives the user-facing yield loop and
-          // the catch-block below (recovery + post-
-          // invocation hooks).
-          const { events: providerTurnEvents, providerTurn: providerTurnValue } =
-            await executeProviderTurn(providerTurnDriver, {
-              adapter,
-              queryParams,
-              adapterOptions,
-              sessionId: options.sessionId,
-              signal: options.signal,
-              executionStartMs: metrics.executionStartMs,
-              queryStartMs: invocationStartMs,
-              finalResponseOnlyMode,
-              suppressToolsForCurrentIntent,
-              modelVisibleToolCount: modelVisibleTools.length,
-              memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
-            })
-          for (const e of providerTurnEvents) yield e
-          providerTurn = providerTurnValue
+          // Stream provider events one-at-a-time so the WS
+          // observer (and Go TUI) sees text deltas as the
+          // provider produces them. Previously this was
+          // `await executeProviderTurn(...)` which buffered
+          // every event into an array then yielded them in a
+          // tight loop after the turn completed — making the
+          // entire assistant text dump out at once at end of
+          // turn even when the provider was streaming
+          // word-by-word. Real e2e (DeepSeek V4 via OpenAI
+          // adapter, prompt: 200-word essay) measured
+          // server-side adapter `delta.content` arriving for
+          // ~5s but ws-forward firing only ONCE at the end —
+          // confirming this buffer was the bottleneck. Path
+          // 1's text chunker is necessary but not sufficient
+          // unless the buffer is also drained progressively.
+          const stream = providerTurnDriver.run({
+            adapter,
+            queryParams,
+            adapterOptions,
+            sessionId: options.sessionId,
+            signal: options.signal,
+            executionStartMs: metrics.executionStartMs,
+            queryStartMs: invocationStartMs,
+            finalResponseOnlyMode,
+            suppressToolsForCurrentIntent,
+            modelVisibleToolCount: modelVisibleTools.length,
+            memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
+          })
+          let result = await stream.next()
+          while (!result.done) {
+            yield result.value
+            result = await stream.next()
+          }
+          providerTurn = result.value
         } catch (error) {
           // Provider recovery decision. The implementation
           // lives in `executeProviderRecoveryDecision.ts`
