@@ -29,6 +29,7 @@ import type {
 import { executionMetricsFromEvent } from './executionMetricsEvent.js'
 import { EventRepository } from './EventRepository.js'
 import { TaskRepository } from './TaskRepository.js'
+import { AuditRepository } from './AuditRepository.js'
 
 type Row = Record<string, unknown>
 
@@ -36,6 +37,7 @@ export class SqliteStorage implements NexusStorage {
   private readonly db: DatabaseSync
   private readonly eventRepository: EventRepository
   private readonly taskRepository: TaskRepository
+  private readonly auditRepository: AuditRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -79,6 +81,7 @@ export class SqliteStorage implements NexusStorage {
       },
     })
     this.taskRepository = new TaskRepository(this.db)
+    this.auditRepository = new AuditRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -635,58 +638,11 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async savePermissionAudit(audit: PermissionAudit): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO permission_audits (
-          audit_id, session_id, tool_use_id, tool_name, tool_risk,
-          tool_input, decision, reason, timestamp
-        ) VALUES (
-          :auditId, :sessionId, :toolUseId, :toolName, :toolRisk,
-          :toolInput, :decision, :reason, :timestamp
-        )
-        ON CONFLICT(audit_id) DO UPDATE SET
-          session_id = excluded.session_id,
-          tool_use_id = excluded.tool_use_id,
-          tool_name = excluded.tool_name,
-          tool_risk = excluded.tool_risk,
-          tool_input = excluded.tool_input,
-          decision = excluded.decision,
-          reason = excluded.reason,
-          timestamp = excluded.timestamp`
-      )
-      .run({
-        auditId: audit.auditId,
-        sessionId: audit.sessionId,
-        toolUseId: audit.toolUseId,
-        toolName: audit.toolName,
-        toolRisk: audit.toolRisk,
-        toolInput: JSON.stringify(audit.toolInput),
-        decision: audit.decision,
-        reason: audit.reason ?? null,
-        timestamp: audit.timestamp,
-      })
+    await this.auditRepository.savePermissionAudit(audit)
   }
 
   async listPermissionAudits(sessionId: string): Promise<PermissionAudit[]> {
-    const rows = this.db
-      .prepare(
-        `SELECT * FROM permission_audits
-         WHERE session_id = ?
-         ORDER BY timestamp ASC`
-      )
-      .all(sessionId) as Row[]
-
-    return rows.map(row => ({
-      auditId: String(row.audit_id),
-      sessionId: String(row.session_id),
-      toolUseId: String(row.tool_use_id),
-      toolName: String(row.tool_name),
-      toolRisk: String(row.tool_risk),
-      toolInput: JSON.parse(String(row.tool_input)),
-      decision: String(row.decision) as 'approved' | 'denied',
-      reason: nullableString(row.reason),
-      timestamp: String(row.timestamp),
-    }))
+    return this.auditRepository.listPermissionAudits(sessionId)
   }
 
   private initialize(): void {
