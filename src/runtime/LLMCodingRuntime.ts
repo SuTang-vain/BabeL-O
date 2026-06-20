@@ -24,6 +24,7 @@ import { mapEventsToMessages } from './eventsTranslator.js'
 import { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'
 import { loadWorkingSetOverride } from './loadWorkingSetOverride.js'
 import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
+import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetrieval.js'
 import {
   buildCompactFailureEvent,
   compactSession,
@@ -239,51 +240,18 @@ export class LLMCodingRuntime implements NexusRuntime {
    * provider/tool turn writes a `memory_retrieval` NexusEvent —
    * not just the GET `/v1/sessions/:id/context` inspection route.
    *
-   * Fire-and-forget: any throw is swallowed so the hot path stays
-   * unaffected. The dashboard degrades to "fewer events" rather
-   * than 5xx when storage is degraded. This is consistent with
-   * the v1 contract that §3.5 metrics are a recent-window
-   * dashboard signal, not a durability-critical audit.
+   * The implementation lives in `emitMemoryRetrieval.ts` (Phase 3B-9
+   * helper extraction). This class field is a thin delegate so
+   * the existing call sites at `onMemoryRetrieval: this.emitMemoryRetrieval`
+   * (6 refresh sites) keep the same method-binding shape.
    */
-  private readonly emitMemoryRetrieval = async (input: {
+  private readonly emitMemoryRetrieval = (input: {
     sessionId: string
     cwd: string
     prompt: string
     diagnostics: MemoryProviderDiagnostics
   }): Promise<void> => {
-    if (!this.memoryProvider) return
-    const d = input.diagnostics
-    const autoSearch = d.autoSearch
-    const event: NexusEvent = {
-      ...eventBase(input.sessionId),
-      type: 'memory_retrieval',
-      provider: d.provider,
-      enabled: d.enabled,
-      scope: d.scope,
-      ...(d.namespaceId && { namespaceId: d.namespaceId }),
-      ...(d.namespaceSource && { namespaceSource: d.namespaceSource }),
-      ...(d.isolationKey && { isolationKey: d.isolationKey }),
-      autoSearchTriggered: autoSearch?.triggered ?? false,
-      autoSearchReason: autoSearch?.reason ?? 'no_memory_cue',
-      ...(autoSearch?.cue && { autoSearchCue: autoSearch.cue }),
-      hitCount: d.hitCount,
-      injectedChars: d.injectedChars,
-      budgetChars: d.budgetChars,
-      maxHitChars: d.maxHitChars,
-      truncated: d.truncated,
-      ...(d.searchLatencyMs !== undefined && { searchLatencyMs: d.searchLatencyMs }),
-      ...(d.error && { error: d.error }),
-      prompt: input.prompt,
-      cwd: input.cwd,
-    }
-    try {
-      await this.storage.appendEvent(input.sessionId, event)
-    } catch (error) {
-      // never break the hot path on a metrics write failure
-      process.stderr.write(
-        `[LLMCodingRuntime] memory_retrieval event append failed: ${error instanceof Error ? error.message : String(error)}\n`,
-      )
-    }
+    return emitMemoryRetrievalImpl(this.memoryProvider, this.storage, input)
   }
 
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
