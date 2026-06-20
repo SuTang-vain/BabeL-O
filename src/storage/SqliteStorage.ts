@@ -32,6 +32,7 @@ import { TaskRepository } from './TaskRepository.js'
 import { AuditRepository } from './AuditRepository.js'
 import { ToolTraceRepository } from './ToolTraceRepository.js'
 import { SessionChannelRepository } from './SessionChannelRepository.js'
+import { AgentJobRepository } from './AgentJobRepository.js'
 
 type Row = Record<string, unknown>
 
@@ -42,6 +43,7 @@ export class SqliteStorage implements NexusStorage {
   private readonly auditRepository: AuditRepository
   private readonly toolTraceRepository: ToolTraceRepository
   private readonly sessionChannelRepository: SessionChannelRepository
+  private readonly agentJobRepository: AgentJobRepository
 
   constructor(private readonly databasePath: string) {
     if (databasePath !== ':memory:') {
@@ -88,6 +90,7 @@ export class SqliteStorage implements NexusStorage {
     this.auditRepository = new AuditRepository(this.db)
     this.toolTraceRepository = new ToolTraceRepository(this.db)
     this.sessionChannelRepository = new SessionChannelRepository(this.db)
+    this.agentJobRepository = new AgentJobRepository(this.db)
   }
 
   async saveSession(session: SessionSnapshot): Promise<void> {
@@ -254,58 +257,15 @@ export class SqliteStorage implements NexusStorage {
   }
 
   async saveAgentJob(job: AgentJob): Promise<void> {
-    this.db
-      .prepare(
-        `INSERT INTO agent_jobs (
-          job_id, parent_session_id, child_session_id, status, agent_type,
-          created_at, updated_at, completed_at, job_json
-        ) VALUES (
-          :jobId, :parentSessionId, :childSessionId, :status, :agentType,
-          :createdAt, :updatedAt, :completedAt, :jobJson
-        )
-        ON CONFLICT(job_id) DO UPDATE SET
-          parent_session_id = excluded.parent_session_id,
-          child_session_id = excluded.child_session_id,
-          status = excluded.status,
-          agent_type = excluded.agent_type,
-          updated_at = excluded.updated_at,
-          completed_at = excluded.completed_at,
-          job_json = excluded.job_json`,
-      )
-      .run(agentJobParams(job))
+    await this.agentJobRepository.saveAgentJob(job)
   }
 
   async getAgentJob(jobId: string): Promise<AgentJob | null> {
-    const row = this.db
-      .prepare(`SELECT job_json FROM agent_jobs WHERE job_id = ?`)
-      .get(jobId) as Row | undefined
-    return row ? JSON.parse(String(row.job_json)) as AgentJob : null
+    return this.agentJobRepository.getAgentJob(jobId)
   }
 
   async listAgentJobs(filter: AgentJobFilter = {}): Promise<AgentJob[]> {
-    const conditions: string[] = []
-    const params: Record<string, string> = {}
-    if (filter.parentSessionId !== undefined) {
-      conditions.push('parent_session_id = :parentSessionId')
-      params.parentSessionId = filter.parentSessionId
-    }
-    if (filter.status !== undefined) {
-      conditions.push('status = :status')
-      params.status = filter.status
-    }
-    if (filter.agentType !== undefined) {
-      conditions.push('agent_type = :agentType')
-      params.agentType = filter.agentType
-    }
-    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
-    const rows = this.db
-      .prepare(
-        `SELECT job_json FROM agent_jobs
-         ${where}
-         ORDER BY created_at ASC, job_id ASC`,
-      )
-      .all(params) as Row[]
-    return rows.map(row => JSON.parse(String(row.job_json)) as AgentJob)
+    return this.agentJobRepository.listAgentJobs(filter)
   }
 
   async close(): Promise<void> {
@@ -1196,20 +1156,6 @@ function sessionParams(session: SessionSnapshot): Record<string, string | null> 
     pendingInput: session.pendingInput ? JSON.stringify(session.pendingInput) : null,
     metadata: session.metadata ? JSON.stringify(session.metadata) : null,
     originCwd: session.originCwd ?? null,
-  }
-}
-
-function agentJobParams(job: AgentJob): Record<string, string | null> {
-  return {
-    jobId: job.jobId,
-    parentSessionId: job.parentSessionId,
-    childSessionId: job.childSessionId,
-    status: job.status,
-    agentType: job.agentType,
-    createdAt: job.createdAt,
-    updatedAt: job.updatedAt,
-    completedAt: job.completedAt ?? null,
-    jobJson: JSON.stringify(job),
   }
 }
 
