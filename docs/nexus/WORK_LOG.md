@@ -8577,3 +8577,194 @@
 - **测试**: 8 new per-repository test files (6 + 7 + 6 + 8 + 9 + 10 + 7 + 12 = 65 cases) + 2 existing `test/storage.test.ts` cases = **67 storage tests pass**, byte-identical with prior behavior. R2/R5/R7 (21/21), `coupling:audit --fail-on`, `deps:audit`, `layer-direction`, `typecheck` all green.
 - **核心耦合 (回应对「核心耦合性问题解决」标准)**: 单文件管理 9 个表 → 9 个聚焦 module（1 thin-delegation facade + 8 repository）。每个 repository 单一职责、独立 reviewable、独立 testable。所有 SQL UPSERT / WHERE / ORDER BY / JSON 序列化模式 byte-identical。
 - **后续**: Stream G 在该表面上不再有可被独立边界问题驱动的进一步抽取。Phase 9 row 改 `Closed 2026-06-21`。Phase 3B+ 主循环边界（LLMCodingRuntime 1841 → 1493）继续 Watch。
+
+## 2026-06-21 — Layer-Direction Audit Enforcement: canonical-shape invariants for runtime→providers and nexus→storage
+
+> **完整规范**: [reference/layer-direction-audit-enforcement-plan.md](./reference/layer-direction-audit-enforcement-plan.md) — 长期架构规范。
+> **决策来源**: 上一切片（advisory → blocking promotion）的"下一步"候选 (b) —— 审视 `runtime → providers`（30 edges / 27 files）与 `nexus → storage`（20 edges / 19 files）两个高密度方向。
+
+- **背景**: 两个高密度方向是 architecture review 标记的"潜在规范化对象"。本切片按之前的方法（`sharedToOutside gate cohesion` 验证）先做"已存在性调查"，再决定规范化路径。
+- **调查结果（已存在性调查）**:
+  - `runtime → providers`：**30 edges / 27 files**。全部是 `import type { ... } from '../providers/adapters/ModelAdapter.js'`（type-level，erasable），或 `import { getAdapter, getModel } from '../providers/registry.js'`（registry value）。**没有任何具体 adapter 的 value import**。反向边 `providers → runtime` 与 `providers → nexus` 各为 0。方向是 canonical 的"runtime 通过抽象使用 providers"。
+  - `nexus → storage`：**20 edges / 19 files**。17/19 是 `import type { NexusStorage } from '../storage/Storage.js'`（抽象），仅 2/19（`createRuntime.ts` composition root + `agentLoopBenchmark.ts` test infrastructure）import 具体 `MemoryStorage`/`SqliteStorage`。方向是 canonical 的"nexus 通过 NexusStorage 接口使用 storage，具体 backend 选型只在 composition root"。
+- **决策（不引入新闸、不新增文件）**:
+  - ❌ **不**加 `audit-layer-direction.js` Rule 7/8：会引入新 allowlist 机制 + 新 allowlist 文件，与"不散开"原则冲突；且两方向当前形态本就合法，没有需要 allowlist 的反向边。
+  - ❌ **不**抽 `scripts/audit-canonical-shape.js`：会引入新脚本，与"`deps:audit` + `coupling:audit:gate` 已聚合 2 个 audit 脚本"的状态冲突。
+  - ✅ **加** `architecture-boundary.test.ts` 内的两条 canonical-shape 回归断言（与现有 4 条反向边闸断言同模式），用 file-walking + per-line 正则 + Set 白名单实现，**in-test 形态不引入新文件**。
+- **实施**:
+  - `test/architecture-boundary.test.ts` 新增 `listTsFiles()` 工具函数（递归 walk 目录，剔 `.d.ts`）。
+  - `canonical-shape invariant: runtime -> providers only via type imports or registry value calls`：扫描 `src/runtime/**` 的 `import { ... }` (排除 `import type` 与 `import { type X, Y }` 内联型) 中指向 `providers/*` 的 specifier；只允许 `providers/registry` 子模块的值 import；任何 `providers/adapters/*` 的值 import 触发测试 fail。
+  - `canonical-shape invariant: nexus -> storage only via NexusStorage type or composition-root concretions`：扫描 `src/nexus/**` 中指向 `storage/MemoryStorage` / `storage/SqliteStorage` 的值 import；白名单仅含 `src/nexus/createRuntime.ts` 与 `src/nexus/agentLoopBenchmark.ts`；其他 nexus 文件的具体 storage import 触发测试 fail。
+- **验证**:
+  - 干净树：`npx tsx --test --test-concurrency=1 test/architecture-boundary.test.ts` → **10/10 pass**（从 8/8 升）。
+  - 合成 `runtime/runtimeToolLoop.ts` 追加 `import { AnthropicAdapter } from "../providers/adapters/AnthropicAdapter.js"` → runtime canonical-shape 测试 fail。
+  - 合成 `nexus/app.ts` 追加 `import { MemoryStorage } from "../storage/MemoryStorage.js"` → nexus canonical-shape 测试 fail。
+  - 恢复后 → 10/10 pass。
+  - 合成 `runtime → nexus` / `shared → outside` 边仍触发对应反向边闸 fail（与 canonical-shape 测试正交）。
+  - `npm run docs:check`：`failureCount: 0`。
+  - `npm run coupling:audit:gate`：exit 0。
+  - `npm run deps:audit`：exit 0。
+- **边界**:
+  - `listTsFiles()` 工具函数**不**依赖 `audit-layer-direction.js` 或 `audit-coupling.js` 现有逻辑，独立实现 file walking + 正则匹配；测试不依赖 `scripts/` 下任何新文件。
+  - canonical-shape 不变式是**正交**的反向边闸：反向边闸防"反向边出现"（如 `runtime → nexus`），canonical-shape 防"具体依赖出现"（如 runtime → 具体 adapter）。两者覆盖不同的失序模式。
+  - 内部 type-only 与值 import 的区分使用**单行正则**匹配以避免跨行误判（之前 `m` flag + `[\s\S]*?` 误匹配已修复）。
+  - 不动 `audit-layer-direction.js` Rule 1-6 与 `audit-coupling.js --fail-on` 范围——这些闸负责"反向边"，canonical-shape 负责"形态"。
+- **架构原则沉淀**:
+  - **canonical shape vs reverse edge** 是两个独立的耦合概念，应分用不同测试断言。`audit-layer-direction` 闸 `cli → X`（layer-direction 闸）与 `audit-coupling --fail-on` 闸 `runtime → nexus`（反向边闸）是反方向的：前者防"cli 越层"，后者防"运行时漏层"。canonical-shape 是"同方向内的合法形态"——runtime 可以到 providers，但只通过抽象。
+  - **不引入新文件 vs 不引入新机制** 是两个独立的设计目标。本切片：能复用现有 audit 脚本的（`sharedToOutside`）就用 regression test 覆盖；不能复用的（"具体依赖出现"语义、`audit-layer-direction.js` 没能力检测 import 是 `import type` 还是值）就放 in-test，独立实现 file walking + 正则，不抽到 `scripts/`。
+  - **同一长期规范下的扩展优先级**：(1) `deps:audit` 闸已覆盖的方向 → 零成本（advisory → blocking + regression test）；(2) `audit-coupling` dashboard 已识别但未闸的方向 → 已有 dashboard 数据可参考（canonical-shape 不变式）；(3) 全新方向 → 需要新规则 + 新 allowlist + 新测试，是最大动作。
+- **后续可推进**:
+  - 观察 `architecture-boundary.test.ts` 10/10 pass 在 CI 上若干 PR 的稳定性。
+  - 审视其他高密度方向是否也有 canonical 形态需要回归断言：`nexus → tools`（11 edges / 8 files）、`tools → runtime`（4 edges / 3 files）等，建议按相同"已存在性调查 → canonical 形态 → 回归断言"流程。
+  - 评估 `scripts/` 下审计脚本输出聚合（`deps:audit` + `coupling:audit:gate` + canonical-shape 各自报告），让 PR summary 包含三方向综合视图，但属于可读性优化不改变 gate 本身。
+
+## 2026-06-21 — Stream watchdog observability: 3 fix 收口 (hard watchdog + activeAge + forward throw)
+
+> 关联真实样本：`session_ffd44ccf-7f3b-4597-9844-a077f41a8967`（2026-06-20）。用户用 DeepSeek V4 + 长 thinking 模型做长任务，session 跑到 6 turns 时 provider stream 突然不再 emit 任何 event（最近一次 `thinking_delta` 之后无任何 token 输出），runtime `for await (const ev of stream)` 永久 block。softTimeoutMs 只发 `near_timeout_warning` / `timeout_extension_granted` 事件但从不 abort，唯一的 abort 源是 socket close —— 真实场景 socket 没断 → **永远不退出**。
+>
+> 本切片用三段独立 PR-sized fix 闭合 "provider stream silent but socket open" 这条死路，并把观测性也补上：
+
+### Fix 1 — executeStreamRoute.ts: hard watchdog timer
+
+- **根因**: WebSocket `/v1/stream` 路由的 abort 源只有两条 —— `socket.once('close', ...)`（line 110）和 `prepared.timeout`（legacy 5000ms fatal）。如果 provider stream 中途完全 silent 而 client 仍 keep-alive，runtime 的 for-await 永久 block，**没有任何机制能 abort**。softTimeoutMs 是 "soft budget" —— 只发 `near_timeout_warning`，不 abort。
+- **修法**: 在 `runExecutionStreamLoop` 启动之后、`finally { clearTimeout(watchdogTimer) }` 之前，注册一个 hard watchdog `setTimeout(() => { ... }, prepared.timeoutDecision.watchdogTimeoutMs)`：
+  ```ts
+  const watchdogMs = prepared.timeoutDecision.watchdogTimeoutMs
+  const watchdogTimer = watchdogMs > 0
+    ? setTimeout(() => {
+        const elapsedMs = deps.metrics.now() - startedAtMs
+        logger.warn(`hard watchdog fired: provider stream unresponsive for ${elapsedMs}ms (session=${sessionId})`)
+        prepared.watchdog.fired = true
+        try {
+          sendJson(socket, {
+            type: 'error',
+            code: 'REQUEST_TIMEOUT',
+            message: `Provider stream did not yield events within ${watchdogMs}ms; aborting.`,
+            details: { kind: 'watchdog', elapsedMs, timeoutMs: watchdogMs },
+          })
+        } catch { /* socket may already be closed; abort will tear down */ }
+        abortController?.abort()
+      }, watchdogMs)
+    : null
+  ```
+- **关键设计选择**:
+  - **`watchdogTimeoutMs` 来自 body**，fatal policy 默认 = `legacyTimeoutMs`（5s），soft policy 默认 = `Math.max(legacyTimeoutMs * 3, legacyTimeoutMs + 300_000)`。Body override 优先；legacy 客户端不传新字段 → 行为完全不变。
+  - **`watchdogMs === 0` 关闭 timer**（`watchdogTimer = null`）—— back-compat 边界。`watchdogTimeoutMs` 正整数才有 timer。
+  - **三步顺序固定**: sendJson 先（带 `details.kind='watchdog'`），abort 后。`sendJson` 包在 try/catch 里，socket 已关闭时静默 —— abort 会把 stream consumer 拆掉。
+  - **`prepared.watchdog.fired = true`** 显式标记，让下游 settlement 用 watchdog 路径分类（而非 cancelled）。
+- **测试**: `test/execute-stream-watchdog.test.ts`（3 test）：(1) abort signal wired to runtime on `/v1/stream` —— 验证 hard watchdog 触发的 prerequisite；(2) watchdog error envelope shape —— lock `{ type:'error', code:'REQUEST_TIMEOUT', details:{ kind:'watchdog', elapsedMs, timeoutMs } }` 结构；(3) `watchdogMs=0` disables timer (back-compat)。
+- **测试设计说明**: `@fastify/websocket` 的 `injectWS` 会在 message handler 返回时自动 close mock socket（触发 `socket.once('close')` abort 路径），所以 watchdog 路径无法用 injectWS 测（socket close 永远先于 setTimeout 300ms 触发）。End-to-end abort 行为已被 `runtime.test.ts:6087` 的 HTTP 路径 watchdog 回归覆盖（WS 和 HTTP 共享 `prepared.abortController`），本切片只测 wiring + envelope 形状。
+
+### Fix 2 — metrics.ts: stream.activeAgeMs 观测性
+
+- **根因**: `/v1/runtime/status` 的 `stream.activeAgeMs` 字段只能通过 `recordStreamEvent()` 间接更新。`recordStreamEvent` 只在 runtime 真的 emit event 时调用。**Provider stream silent 时永远不调用 → activeAgeMs 永远是 0 → operator 看到 `stream.activeCount=1` + `activeAgeMs=0` 没法判断"卡了多久"**。这正是 fix 1 的 hard watchdog 想要救的场景 —— 没有观测性就没人触发 fix。
+- **修法 (2 段)**:
+  - `snapshot()` 在返回前调用 `this.recordStreamActiveAge(this.now())` —— 每次 `/v1/runtime/status` poll 都推进 timer。
+  - `recordStreamActiveAge(nowMs)`:
+    ```ts
+    if (this.stream.activeCount === 0) {
+      this.stream.activeAgeMs = 0
+      return
+    }
+    const delta = nowMs - this.lastStreamActiveSampleMs
+    if (delta > 0 && this.lastStreamActiveSampleMs > 0) {
+      this.stream.activeAgeMs += delta
+    }
+    this.lastStreamActiveSampleMs = nowMs
+    ```
+- **关键设计选择**:
+  - **"首次 sample seed" pattern**: 第一次 `recordStreamActiveAge(0)` 时 `lastStreamActiveSampleMs === 0`，不 add delta（避免把"从 process 启动到现在"算成 stream age）。后续 sample 累加真实 delta。
+  - **`activeCount === 0` early return + reset to 0**: stream 全结束后 activeAgeMs 立即归零 —— operator 看到"hung 之前是 5000ms，现在 0ms"就明确知道 stream 已清。
+  - **snapshot 内部 sample 驱动 timer**: 即使没有任何 `recordStreamEvent` 调用（hung 场景），`/v1/runtime/status` 也能反映真实 elapsed。这是 fix 1 的观测性闭环。
+- **测试**: `test/metrics-active-age.test.ts`（5 test）：(1) no stream → 0；(2) snapshots during active stream grow with real elapsed time；(3) finished stream → next snapshot = 0；(4) explicit `recordStreamActiveAge` 推进 timer 不靠 snapshot；(5) 没有任何 sample 时 finished stream 仍然归 0。
+
+### Fix 3 — executionWebSocketControl.ts: forwardProcessedRuntimeEvent Bug 2
+
+- **根因**: `forwardProcessedRuntimeEvent` 在调用 `sendJson(socket, event)` 时没有 try/catch。`sendJson` 内部 `socket.send(JSON.stringify(value))` 在 socket 已被 close (mid-flight, bufferedAmount cap, transport-level error) 时会 throw。throw 之后 `for await` 还在跑，runtime 继续 produce events，**metrics.stream.activeCount 永远不归 0**。这是 fix 2 想观测的"active count 卡住"的另一条泄漏路径。
+- **修法**:
+  ```ts
+  try {
+    sendJson(socket, event)
+    metrics.recordStreamEvent(socket.bufferedAmount)
+  } catch (err) {
+    logger.warn('forward event failed; aborting stream consumer', err)
+    abortController.abort()
+    return { event, forwarded: false, closed: true }
+  }
+  ```
+- **关键设计选择**:
+  - **`abortController.abort()` 而非依赖 socket.once('close')**：socket 已经坏了，'close' 事件可能已被 emit 但还没处理；显式 abort 是最直接路径。
+  - **`return { ..., closed: true }`**：让 `for await` 退出（route 的 `if (forwarded?.closed) break`），不再 yield 更多 events。
+  - **`metrics.recordStreamEvent` 不在 catch 路径调用**：send 实际失败了，不能记 "successfully sent 1 event"。
+  - **warning level log**：不是 fatal —— 这是 stream 生命周期正常终止之一（socket 死 / client 断），不应让 Sentry 噪音爆表。
+- **测试**: `test/execution-websocket-control.test.ts` 加 2 test：(1) `sendJson throws` mid-flight → `controller.aborted === true`, `forwarded === false`, `closed === true`, 不 record metric；(2) cache-health 成功但 decorated event throws → 仍 abort。
+
+### 验证
+
+- `node_modules/.bin/tsc -p tsconfig.build.json --noEmit`: clean。
+- `npx tsx --test test/execution-websocket-control.test.ts test/metrics-active-age.test.ts test/execute-stream-watchdog.test.ts test/execute-stream-route.test.ts test/execution-event-processing.test.ts`: **21/21 pass**。
+- `npx tsx --test test/runtime.test.ts`: **165/165 pass**（HTTP 路径 watchdog regression 仍然绿）。
+- 跨 spec 回归 `runtime.test.ts` 165 + `architecture-boundary.test.ts` 10 = 175 无 regression。
+- `npm run coupling:audit:gate`: exit 0（无新增跨层依赖）。
+- `npm run docs:check`: `failureCount: 0`。
+- 真实 `~/.babel-o/db.sqlite` 未触碰。
+
+### 边界
+
+- **不**扩展 `softTimeoutMs` 为 abort 源 —— soft 永远不 abort 是设计原则（[task-adaptive-recoverable-timeout-plan §Phase 2](./history/evidence-and-runtime-history.md)）。本切片新加的 hard watchdog 是 soft budget **之外**的安全网。
+- **不**改 `executeHttpRoute.ts` 的 abort 模型 —— HTTP 路径已经有 softTimeoutMs + watchdog 两条闸，行为已经收敛（`runtime.test.ts:6087` 已收口）。本切片只补 WS 路径的 hard watchdog。
+- **不**扩 `audit-coupling --fail-on` 范围 —— Fix 1/2/3 都在已有边界内（WS route + metrics + WS control），不引入新耦合面。
+- **`forwardProcessedRuntimeEvent` Bug 2 fix 的 cache-health throw 路径未做对称修复**：cache-health `sendJson` 仍无 try/catch。已知 minor leak（cache-health 失败时不会 abort，但 runtime 仍会继续 yield decorated event）。如需对称修复需独立 PR —— 当前是 "decorated event 失败时 abort" 语义，与 cache-health 失败语义不同。
+- **`@fastify/websocket injectWS` 限制**：无法用 injectWS 测 hard watchdog 端到端（socket auto-close 抢先）。本切片通过 (a) abort signal wiring + (b) envelope shape + (c) `watchdogMs=0` back-compat 三个角度锁定不变量；end-to-end abort 行为靠 HTTP 路径已收口的 `runtime.test.ts:6087` 复用。
+
+### 后续可推进
+
+- 真实 session `session_ffd44ccf` 在 fix 1/2 上线后，下次重现 "DeepSeek V4 silent 6 turns" 时应该：(a) 300ms 内 client 收到 `details.kind='watchdog'` 的 REQUEST_TIMEOUT；(b) `/v1/runtime/status` 在 silent 期间 `activeAgeMs` 持续增长，让 operator 在几分钟内就发现并选择 abort 或等 watchdog 自然结束。
+- 如果有真实 session 暴露 "hard watchdog 300ms 仍然太短"（provider 在 burst thinking 后 pause 一下），考虑改 body `watchdogTimeoutMs` 上限 (`1_800_000ms` 已是当前 zod max)，但属独立切片。
+- 观察若干 PR 后 `metrics.stream.activeAgeMs` 的 operator 实际使用情况，决定是否把 "activeAgeMs > 60s" 升级为 `BehaviorMonitor` 的 detector 输出 anomaly。
+
+
+## 2026-06-21 — Phase 2D + 7 container landed, plan doc + TODO_cleanup synced to post-Stream-G reality
+
+- **背景**: 紧接 Stream G 收口（3B-20 → 3B-27，8 repository）之后，按 plan doc 自我评估出的 3 个 Next（doc 自洽 + cross-reference + RuntimeServices 容器 + parseRuntimeEnv）连续推进 3 个 commit。
+- **改动 (3 commits, ahead of origin by 11)**:
+  - `06e33f1` (earlier today) — Stream G 收口 doc + 8-repository 清单
+  - `827efc5` — plan doc 自洽 (8 处内部不一致修复) + 2 个新 canonical reference 引用 (layer-direction-audit-enforcement-plan.md, storage-interface-segregation-reference.md) + TODO_cleanup 父 checkbox 翻转
+  - `8173de3` — Phase 2D + 7: `src/runtime/env.ts` (195 lines) `parseRuntimeEnv` boot-time snapshot + `src/nexus/services.ts` (114 lines) `createRuntimeServices` composition root + `test/runtime-env.test.ts` (17 cases) + `test/runtime-services.test.ts` (8 cases)
+- **Phase 2D 关键设计**:
+  - `RuntimeServices` 放在 `src/nexus/` 而非 `src/runtime/`，因为 container 引用 Nexus-owned service 类（`ContextBroadcaster` / `EverCoreRuntimeManager`）。放在 `src/runtime/` 会触发 `runtime → nexus` reverse import（coupling audit 立刻 flag 出 2 个新 edge），违反 Phase 1A + Phase 2B cleanup。`env.ts` 反过来放 `src/runtime/`（无 nexus 依赖）。
+  - `parseRuntimeEnv` mirror `nexus/server.ts:parsePolicyMode` 别名集合（`'strict'` / `'soft-deny'` / `'softdeny'` / `'soft_deny'` / case-insensitive / empty-string-means-undefined）以及 `parseBoolean` yes/no 兼容，确保 2D.1 (server.ts 迁移) 是 byte-identical。
+  - `RuntimeServices` 5 fields: `configManager` / `contextBroadcaster` / `everCoreManager` / `providerSessionRules` / `env`。Defaults fallback 到 legacy module-level 实例 (`ConfigManager.getInstance()` / `defaultEverCoreRuntimeManager` / fresh `ContextBroadcaster` / fresh `ProviderSessionRules` / `parseRuntimeEnv(process.env)`)，legacy caller 不变。
+- **plan doc 内部 8 处不一致修复** (commit `827efc5`):
+  1. Phase 0 row: "Active Plan" → "Closed 2026-06-18" (doc 升级为 canonical 2026-06-21)
+  2. Phase 2 row: "Active Plan" → "In Progress 2026-06-21 (Open: 2D only)"，3 个 sub-slice 标 Closed
+  3. Phase 3 row: "Active Plan" → "In Progress 2026-06-21" + 3 strategy + 5 helper 落地清单
+  4. addendum "Phase 5 Watch" → "Phase 6 Watch"（解决与 north-star "Phase 5" 编号冲突）+ re-evaluate
+  5. Phase 7 verification: "exactly 2 hits" → "0 hits" (server.ts 21 reads 全部迁入后)
+  6. Coupling heat map line 161: `nexus/app.ts 9 reads` → `1 read` (Phase 4A+ completion)
+  7. Source of truth: 加 `audit-coupling.js` + `audit-layer-direction.js`
+  8. Governance / Related: 加 3 个新 canonical reference 引用
+  9. 加 "Stream B stop rule" 段，明确 Phase 2 closure 条件
+  10. Phase 7 row 状态同步: parser + tests landed 2026-06-21, migration 2D.1 → 2D.5 in plan
+  11. Phase 2 row 加 7 follow-up PR map (2D.1 → 2D.7)
+  12. Addendum 加 Phase 2D slice row（commit `8173de3` 描述 + 验证）
+- **TODO_cleanup.md 同步**:
+  - Phase 3B+ 父 checkbox 翻 `[x]` + 加 3B-19 catch-block / 4-slice helper pull
+  - Phase 4A+ 父 checkbox 翻 `[x]` + 加 plan doc section anchor
+  - 新加 Phase 2D 父 checkbox 翻 `[x]` + 7 子 slice (2D.0 done / 2D.1-2D.6 pending / 2D.7 closure)
+- **净效果**:
+  - 计划 doc + TODO_cleanup + WORK_LOG 三库一致指向 "Phase 2 / 7 In Progress, 7 follow-up PRs pending"
+  - `parseRuntimeEnv` 接受 synthetic env 测试, 17/17 cases 覆盖 NEXUS_*/BABEL_O_* env 路径 + error cases
+  - `createRuntimeServices` 接受 caller-provided instances, 8/8 cases 验证 container 5 fields 全部可注入
+  - 92/92 storage tests + 21/21 R-gate tests 不回归
+  - `npm run coupling:audit --fail-on` 仍 `runtimeToNexus: []` / `nexusToCli: []`
+  - `npm run audit-layer-direction` 286 files / 1104 cross-module imports, 0 violations
+- **后续可推进** (按 plan doc "one PR = one slice" 原则):
+  - **2D.1** `src/nexus/server.ts` 21 reads → `services.env.nexus.*` (验证 Phase 7: `grep -rn 'process\.env' src/nexus/` → 0 hits)
+  - **2D.2** `createRuntime.ts` 1 read + 1 `ConfigManager.getInstance()`
+  - **2D.3** `cli/embedded.ts` 2 reads + 2 `getInstance()` + 1 `defaultEverCoreRuntimeManager`
+  - **2D.4** `cli/commands/go.ts` 8 reads + `cli/runSessionFlow.ts` 7 reads
+  - **2D.5** `nexus/routers/runtimeModelsRouter.ts` 8 reads + `runnerComparisonBenchmark.ts` 5 reads
+  - **2D.6** 22+ `ConfigManager.getInstance()` callsites
+  - **2D.7** Phase 2 row → "Closed 2026-06-XX"
+  - **Phase 3B+ 收口审计** (主循环读一遍，决定是否需要最后 1-2 helper)
