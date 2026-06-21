@@ -2,6 +2,27 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-21 — contextSearch 算法与鲁棒性回归收口（Phase 0/1）
+
+> **完整文档**: [reference/context-search-algorithm-robustness-plan.md](./reference/context-search-algorithm-robustness-plan.md) — 含根因、设计、Phase 表与验证清单。本节只记事实流水。
+
+- **背景**: 真实 session `session_06308b17-84b4-402a-909e-b0078f67ca76`（11,997 事件，8 条 user_message）里 `contextSearch` 连续 5 次调用 4 次空返（query 1–4 `hitCount=0`），query 5 靠 `eventTypeFilter:["user_message"]` + query 恰为字面量 `user_message` 才命中 5/8。`contextRecent` / `contextSummarize` / `contextSessions` 同 session 全部正常 → 回归隔离在 `contextSearch`。
+- **两个叠加根因**：
+  1. **算法**：`src/tools/contextTools.ts` `searchEvents` 把整个 query 当一个字面量子串 `haystack.includes(needle)`，无分词。query `架构分析 合理性 先进性` 与实际文本 `分析…架构的合理以及先进性` 无连续相同子串 → 0 命中。
+  2. **鲁棒性**：`src/tools/builtin/contextSearch.ts` 用 `listEvents(order:'asc', limit:10_000)` 加载，11,997 事件只取最早 10,000，seq 10001+ 静默丢弃；`eventTypeFilter` 是**内存里**过滤（`contextTools.ts:227`），SQL 层未用；`truncated` 只反映 token 截断不反映源截断，模型无法区分"没匹配"与"源被截"。工具 prompt 又写成"语义搜索"口吻误导模型反复换措辞重试。
+- **修复**（分支 `fix/context-search-algorithm-robustness`，3 个语义提交按 §7.4 拆分）：
+  - `fix(storage)`: `EventListOptions` 加可选 `eventTypes?: string[]`，`EventRepository.listEvents` 下推 `WHERE event_type IN (...)`（`MemoryStorage` 镜像），非破坏可选字段。
+  - `fix(context)` 算法: `searchEvents` 改分词 AND-substring（`query.split(/\s+/)` 每 token 子串命中）+ 命中倒序 + 同类型连续去重 + `eventsScanned`/`eventsCapped` 诊断 echo。
+  - `fix(context)` 契约: `contextSearch` 带 filter 时传 `eventTypes` 走下推、limit 10k→50k、`prompt`/`description` 改"分词子串匹配 + 正反例 + eventsCapped 指引"。
+- **验证**：
+  - 复现脚本 `scripts/repro-context-search-260621.mjs` 用 `SqliteStorage` 加载真实 session → query 1–4 全部非空（1–3 各命中 3，匹配路径是模型自身 assistant 输出复用同关键词；4 命中 16）、query 5 返回全部 8 条 user_message、`eventsCapped=false`。`PHASE 1 GATE PASS`。
+  - 单测：`test/context-tools.test.ts` 7 个新增（分词 AND、缺失 token 不命中、CJK 单 token 子串无回归、倒序、同类型去重、诊断 echo / 默认 undefined）+ `test/storage-event-repository.test.ts` 2 个新增（SQL 下推绕开低 limit、MemoryStorage 对等）。修复了既有 "5k token cap" 测试（原 fixture 1000 条相同文本被去重成 1 条，改为每条 distinct text）。
+  - 全 gate：`typecheck` / `deps:audit` / `docs:check`(failureCount 0) / `build:smoke` green。`format:check` 仅 `.babel-o/working-set.json` 失败（预存运行时产物，stash 验证非本次引入）。
+- **耦合/架构边界**：存储层（`Storage`/`EventRepository`/`MemoryStorage`）接口扩展、算法层（`contextTools.ts` 纯函数无副作用）、wiring 层（`contextSearch.ts`）三层正交分离；6 个 `refreshRuntimeContextState` hot-path 不用 `eventTypeFilter` 不受影响；`contextRecent`/`contextSummarize`/`contextSessions` 未触碰（健康不碰，P0-regression-focus）。
+- **分支切换副作用处理**：从 `fix/provider-stream-abort-propagation` 切出本分支时，该分支已提交的 SSE abort 改动（`sse.ts`/`OpenAIAdapter.ts`/`AnthropicAdapter.ts` + `test/sse-abort-propagation.test.ts`）作为工作树脏文件被带过来；确认是另一条 P0 回归线的已提交内容（`git cat-file` 验证存在于该分支），已 `git checkout --` 还原 + 删除游离测试，本分支工作树干净，gate 仍绿，未污染另一分支。
+- **文档生命周期**：提案 `proposals/context-search-algorithm-robustness-plan.md` 从 `Draft` → `Partially Landed` → `Active Plan`，毕业到 `reference/`（Phase 3 closed），`reference/README.md` 与 `proposals/README.md` 同步更新（graduation note 指向新位置）。
+- **未触发 / 仍 Open**：Phase 2（CJK bigram 重序容忍，如 `架构分析` vs `分析…架构`）保持 Watch — Phase 1 匹配路径是 assistant 输出复用关键词，重排的 user message 未成为匹配路径，故 gate 未触发，留待未来真实 query。
+
 ## 2026-06-21 — Path 0 (drain-into-array buffer): real streaming root cause
 
 > **完整文档**: [reference/streaming-pipeline-realtime-rendering-fix.md](./reference/streaming-pipeline-realtime-rendering-fix.md) — 包含全部三层 (Path 0 / 1 / 2) 的设计、bisect 目标、WS 抓包数据、为什么三层都必要的解释。本节只记录 Path 0 的事实流水。

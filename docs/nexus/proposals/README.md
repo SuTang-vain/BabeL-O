@@ -10,7 +10,7 @@ This directory holds work that is still being shaped, partially implemented, or 
 | Proposal | State | Scope |
 | --- | --- | --- |
 | [behavior-monitor.md](./behavior-monitor.md) | Partially Landed | Behavior trace, monitor, live hint projection, and Go loop visualization follow-up. |
-| [context-search-algorithm-robustness-plan.md](./context-search-algorithm-robustness-plan.md) | Partially Landed | `contextSearch` algorithm (tokenized AND-substring) and robustness (`eventTypeFilter` SQL pushdown, 10k-cap bypass, `eventsCapped` signal, prompt contract alignment). Phase 0/1 closed against `session_06308b17`; Phase 2 (CJK bigram) gated, Phase 3 (graduate to reference) open. Real session: `session_06308b17` (5 calls, 4 empty). |
+| *context-search-algorithm-robustness-plan.md (graduated 2026-06-21)* | *was Partially Landed* | *moved to [../reference/context-search-algorithm-robustness-plan.md](../reference/context-search-algorithm-robustness-plan.md) as `Active Plan` (Phase 0/1 closed against `session_06308b17`; Phase 2 CJK bigram gated). Per [../decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision, reference holds durable architecture, not "the next stage after proposals".* |
 | [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md) | Draft | External prompt architecture reference, without importing incompatible product assumptions. |
 | [go-runner-plan.md](./go-runner-plan.md) | Partially Landed | Optional Go RemoteToolRunner phases and runner boundaries. |
 | [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md) | Draft | Gradual Markdown rendering upgrade path for Go TUI transcript readability. |
