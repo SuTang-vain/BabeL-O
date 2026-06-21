@@ -63,3 +63,27 @@ jobs:
             ${{ runner.temp }}/babel-o-npm-test-tail.log
           if-no-files-found: ignore
       - run: npm run build:smoke
+
+  coupling-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run --fail-on coupling gate (blocking)
+        run: npm run coupling:audit:gate
+      - name: Emit failure summary on reverse-import violation
+        if: failure()
+        run: |
+          {
+            echo "## ❌ Coupling gate failed"
+            echo
+            echo "The \`--fail-on\` coupling gate detected reverse \`runtime -> nexus\`"
+            echo "or \`nexus -> cli\` imports. This gate is now blocking."
+            echo
+            echo "See [layer-direction-audit-enforcement-plan.md](../../blob/develop/docs/nexus/reference/layer-direction-audit-enforcement-plan.md) Phase 3."
+          } >> "$GITHUB_STEP_SUMMARY"

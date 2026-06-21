@@ -29,6 +29,34 @@ const report = {
 
 console.log(JSON.stringify(report, null, 2))
 
+
+// --fail-on reverses: exit non-zero if any reverse import edge is non-empty.
+// Gates CI on the same boundary the architecture-boundary test asserts.
+// Intentionally scoped to runtime -> nexus and nexus -> cli — these are the
+// two directions the architecture-boundary test asserts as [] and that the
+// coupling plan has driven to zero. sharedToOutside stays dashboard-only:
+//   * `src/shared/config.ts -> src/providers/registry.ts` is a known legacy
+//     edge (coupling plan historical inventory) and gating it requires a
+//     separate allowlist discussion.
+//   * Adding it to --fail-on would couple this gate to a different audit
+//     surface (the cross-layer allowlist in audit-layer-direction.js).
+if (process.argv.includes('--fail-on')) {
+  const reverse = report.reverseImports
+  const violations = []
+  if (reverse.runtimeToNexus.length > 0) {
+    violations.push(`runtime -> nexus: ${reverse.runtimeToNexus.length} edge(s)`)
+  }
+  if (reverse.nexusToCli.length > 0) {
+    violations.push(`nexus -> cli: ${reverse.nexusToCli.length} edge(s)`)
+  }
+  if (violations.length > 0) {
+    console.error(`\n❌ --fail-on: reverse imports detected: ${violations.join('; ')}`)
+    process.exitCode = 1
+  } else {
+    console.error(`\n✅ --fail-on: no reverse runtime->nexus or nexus->cli imports`)
+  }
+}
+
 async function collectSourceImports(files) {
   const imports = []
   for (const filePath of files) {
