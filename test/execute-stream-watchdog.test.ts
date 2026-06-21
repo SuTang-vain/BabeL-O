@@ -8,32 +8,33 @@ import { ExecutionGate } from '../src/nexus/executionGate.js'
 import { ActiveExecutionRegistry } from '../src/nexus/activeExecutionRegistry.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { registerExecuteStreamRoute } from '../src/nexus/executeStreamRoute.js'
+import { isPrepareError, prepareExecution } from '../src/nexus/executionPreparation.js'
 import type { NexusRuntime, RuntimeExecuteOptions } from '../src/runtime/Runtime.js'
 
-// Bug fix 2026-06-21 (hard watchdog timer): the WebSocket
-// `/v1/stream` route now registers a hard watchdog timer after
-// the runtime stream loop is set up. If the provider stream goes
-// silent — emits zero events for `watchdogTimeoutMs` — the timer
-// fires, force-aborts the stream consumer, and pushes a
-// `REQUEST_TIMEOUT` error with `details.kind='watchdog'` to the
-// client. Real sample: session_ffd44ccf-7f3b-4597-9844-a077f41a8967
-// on 2026-06-20, where DeepSeek V4 + long-thinking emitted
-// hundreds of `thinking_delta` chunks and then never resumed.
+// Phase 2 of docs/nexus/proposals/provider-stream-silent-hang-abort-propagation-plan.md.
 //
-// Test design note: `@fastify/websocket`'s `injectWS` helper
-// closes the underlying mock socket once the message handler
-// returns control, which fires the route's
-// `socket.once('close', () => abort())` path BEFORE the
-// watchdog's setTimeout can. This means the watchdog path is
-// only reachable in production when a real client keeps the
-// socket open while the provider stream goes silent. The
-// closest faithful test is therefore to verify (a) the abort
-// signal is wired to the runtime — the prerequisite the
-// watchdog relies on — and (b) the watchdog error envelope
-// has the right shape. The end-to-end behavior of the same
-// abort path is already covered by the HTTP path's watchdog
-// regression at runtime.test.ts:6087 (the WebSocket and HTTP
-// routes share `prepared.abortController`).
+// The hard watchdog is a SINGLE source: `prepareExecution` registers one
+// `setTimeout` (`prepared.timeout`) that fires at `watchdogTimeoutMs`,
+// marks `prepared.watchdog.fired`, and aborts both the timeout and
+// request controllers. The abort propagates through the provider stream
+// reader (Phase 1) so the runtime catch yields a `REQUEST_TIMEOUT`;
+// `processRuntimeExecutionEvent` then decorates it with
+// `details.kind='watchdog'` (soft policy) and the WS forwarder delivers
+// it to the client. The `/v1/stream` route no longer registers a second
+// watchdog timer — that duplicate risked double error events and a
+// direct socket write that bypassed persistence/decoration.
+//
+// Test design note: `@fastify/websocket`'s `injectWS` helper closes the
+// underlying mock socket once the message handler returns control, which
+// fires the route's `socket.once('close', () => abort())` path BEFORE
+// `prepared.timeout` can fire. The watchdog path is therefore only
+// reachable in production when a real client keeps the socket open while
+// the provider stream goes silent. The closest faithful tests are
+// (a) the abort signal is wired to the runtime — the prerequisite the
+// watchdog relies on — and (b) the single-source watchdog contract on
+// `prepareExecution`. The end-to-end decoration is covered by the HTTP
+// path regression at runtime.test.ts:6087 (HTTP and WS share
+// `prepared.timeout` + `processRuntimeExecutionEvent`).
 
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
@@ -59,10 +60,10 @@ function buildAppWithRoute(deps: {
 
 test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/stream', async () => {
   // Contract: when the WS route dispatches a request to the
-  // runtime, the runtime's options must carry a real
-  // AbortSignal so the watchdog's `abortController.abort()` can
-  // reach it. Without this wire, the watchdog's setTimeout
-  // would fire but the runtime would keep blocking forever.
+  // runtime, the runtime's options must carry a real AbortSignal so
+  // `prepared.timeout`'s `abortController.abort()` can reach it.
+  // Without this wire, the watchdog's setTimeout would fire but the
+  // runtime would keep blocking forever.
   const metrics = new NexusMetrics()
   const registry = new ActiveExecutionRegistry()
   let abortSignal: AbortSignal | undefined
@@ -70,9 +71,9 @@ test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/st
     async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
       abortSignal = (options.signal ?? options.timeoutSignal) as AbortSignal
       yield { type: 'session_started', ...eventBase(options.sessionId), cwd: options.cwd, requestId: options.requestId }
-      // Hang the generator so the route's message handler
-      // stays in the for-await loop. This is the pre-watchdog
-      // state we want to verify the abort wire for.
+      // Hang the generator so the route's message handler stays in
+      // the for-await loop. This is the pre-watchdog state we want
+      // to verify the abort wire for.
       const sig = options.signal ?? options.timeoutSignal
       if (sig) {
         await new Promise<void>(resolve => {
@@ -83,9 +84,9 @@ test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/st
     },
   }
 
-  // Order matters: register the websocket plugin BEFORE the
-  // route that uses `websocket: true` (mirroring how
-  // `createNexusApp` does it in production).
+  // Order matters: register the websocket plugin BEFORE the route
+  // that uses `websocket: true` (mirroring how `createNexusApp` does
+  // it in production).
   const { app, registerRoute } = buildAppWithRoute({ runtime, metrics, registry })
   await app.register(websocket)
   registerRoute()
@@ -99,9 +100,8 @@ test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/st
       watchdogTimeoutMs: 300,
     }))
 
-    // Wait for the route to dispatch the request and the
-    // runtime to receive its options. The runtime captures
-    // the abort signal at that point.
+    // Wait for the route to dispatch the request and the runtime to
+    // receive its options.
     const start = Date.now()
     while (Date.now() - start < 1_000) {
       if (abortSignal) break
@@ -109,8 +109,6 @@ test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/st
     }
     assert.ok(abortSignal, 'runtime should have received an AbortSignal option')
     assert.equal(typeof abortSignal!.aborted, 'boolean')
-    // The signal is a real AbortSignal — invoking .abort() on
-    // the underlying controller must be observable here.
     assert.equal(abortSignal!.aborted, false)
 
     ws.terminate()
@@ -120,36 +118,89 @@ test('hard watchdog prerequisite: abort signal is wired to the runtime on /v1/st
   }
 })
 
-test('watchdog error envelope has the right shape and parseable JSON', () => {
-  // The watchdog constructs this envelope (see
-  // executeStreamRoute.ts lines 198-203). If the shape drifts,
-  // downstream consumers (Go TUI friendly message, metrics,
-  // persistence) will misclassify the cutoff. Lock the shape.
-  const watchdogError = {
-    type: 'error',
-    code: 'REQUEST_TIMEOUT',
-    message: 'Provider stream did not yield events within 300ms; aborting.',
-    details: { kind: 'watchdog', elapsedMs: 301, timeoutMs: 300 },
+test('single-source watchdog: prepareExecution fires one timer that marks watchdog.fired and aborts both controllers', async () => {
+  // Phase 2 contract: `prepared.timeout` is the ONLY hard watchdog.
+  // When it fires it must (1) set `watchdog.fired = true` — the marker
+  // `maybeDecorateWatchdogError` reads to attach `details.kind='watchdog'`
+  // — and (2) abort both the timeout controller (so the runtime catch
+  // classifies the error as `REQUEST_TIMEOUT`, not `REQUEST_CANCELLED`)
+  // and the request controller (so Phase 1's reader.cancel() unblocks
+  // the provider stream).
+  const storage = new MemoryStorage()
+  const prepared = await prepareExecution(
+    {
+      prompt: 'turn that outlives the watchdog',
+      cwd: '/tmp',
+      timeoutPolicy: 'soft',
+      softTimeoutMs: 40,
+      watchdogTimeoutMs: 80,
+      maxSoftTimeoutExtensions: 0,
+      softTimeoutExtensionMs: 40,
+    },
+    {
+      storage,
+      defaultCwd: '/tmp',
+      remoteRunnerAvailable: false,
+      executeTimeoutMs: 5_000,
+      executePolicyMode: 'strict',
+    },
+  )
+  assert.ok(!isPrepareError(prepared), 'prepareExecution should succeed for a valid soft-policy body')
+  if (isPrepareError(prepared)) return
+
+  assert.equal(prepared.watchdog.fired, false, 'watchdog must start unfired')
+  assert.ok(prepared.timeout, 'prepareExecution must register a watchdog setTimeout handle')
+  assert.equal(prepared.timeoutController.signal.aborted, false)
+  assert.equal(prepared.abortController.signal.aborted, false)
+
+  try {
+    const start = Date.now()
+    while (Date.now() - start < 1_000) {
+      if (prepared.watchdog.fired) break
+      await wait(10)
+    }
+    assert.ok(prepared.watchdog.fired, 'watchdog must fire within watchdogTimeoutMs')
+    assert.equal(prepared.timeoutController.signal.aborted, true, 'watchdog must abort the timeout controller (drives REQUEST_TIMEOUT classification)')
+    assert.equal(prepared.abortController.signal.aborted, true, 'watchdog must abort the request controller (drives Phase 1 reader.cancel)')
+  } finally {
+    clearTimeout(prepared.timeout)
   }
-  const json = JSON.stringify(watchdogError)
-  const parsed = JSON.parse(json)
-  assert.equal(parsed.type, 'error')
-  assert.equal(parsed.code, 'REQUEST_TIMEOUT')
-  assert.equal(parsed.details.kind, 'watchdog')
-  assert.equal(parsed.details.timeoutMs, 300)
-  assert.equal(parsed.details.elapsedMs, 301)
-  assert.match(parsed.message, /did not yield events within 300ms/)
 })
 
-test('hard watchdog prerequisite: watchdogMs=0 disables the timer (back-compat)', () => {
-  // When `watchdogTimeoutMs` resolves to 0 (e.g. legacy
-  // callers that don't pass it and have a 0 default), the
-  // route must NOT register a timer. This is the back-compat
-  // boundary that keeps fatal-policy callers working
-  // unchanged.
-  const watchdogMs = 0
-  const watchdogTimer = watchdogMs > 0
-    ? setTimeout(() => { /* no-op */ }, watchdogMs)
-    : null
-  assert.equal(watchdogTimer, null, 'watchdogMs=0 must produce a null timer (no setTimeout registered)')
+test('single-source watchdog: fatal policy still fires prepared.timeout and aborts (back-compat)', async () => {
+  // Under fatal policy the watchdog collapses onto the legacy timeout
+  // (`watchdogTimeoutMs === legacyTimeoutMs`). `prepared.timeout` must
+  // still fire and abort so legacy HTTP/WS callers see the same
+  // cutoff. The `details.kind='watchdog'` decoration is intentionally
+  // skipped under fatal (back-compat, guarded by runtime.test.ts:6191);
+  // this test only locks the firing + abort contract.
+  const storage = new MemoryStorage()
+  const prepared = await prepareExecution(
+    {
+      prompt: 'fatal cutoff turn',
+      cwd: '/tmp',
+      timeoutMs: 60,
+    },
+    {
+      storage,
+      defaultCwd: '/tmp',
+      remoteRunnerAvailable: false,
+      executeTimeoutMs: 5_000,
+      executePolicyMode: 'strict',
+    },
+  )
+  assert.ok(!isPrepareError(prepared))
+  if (isPrepareError(prepared)) return
+
+  try {
+    const start = Date.now()
+    while (Date.now() - start < 1_000) {
+      if (prepared.watchdog.fired) break
+      await wait(10)
+    }
+    assert.ok(prepared.watchdog.fired, 'fatal watchdog must fire')
+    assert.equal(prepared.abortController.signal.aborted, true)
+  } finally {
+    clearTimeout(prepared.timeout)
+  }
 })

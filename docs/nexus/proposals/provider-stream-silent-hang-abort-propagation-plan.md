@@ -1,6 +1,6 @@
 # Provider Stream Silent-Hang Abort Propagation Plan
 
-> State: Draft
+> State: Partially Landed
 > Track: Runtime / Providers / Nexus
 > Priority: P0 — a silent provider stream permanently hangs the runtime even though the hard watchdog already exists and fires
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/executionPreparation.ts`, `src/nexus/executeStreamRoute.ts`, `src/nexus/executeHttpRoute.ts`, `src/runtime/pipeline/providerTurn.ts`, `src/runtime/LLMCodingRuntime.ts`, `src/providers/adapters/OpenAIAdapter.ts`, `src/providers/adapters/sse.ts`, `src/runtime/toolExecutor.ts`, `src/nexus/metrics.ts`
@@ -54,19 +54,11 @@ H1 wins by elimination. The root cause is not a missing watchdog; it is **abort-
 
 ### Phase 1 — Active abort propagation on the provider stream path
 
-Mirror the `toolExecutor.ts:67-68` pattern on the provider stream path. Preferred (coupling-cleanest) location: the adapter, so the fix lives where the `Response`/`ReadableStream` is owned.
+Mirror the `toolExecutor.ts:67-68` pattern on the provider stream path. The fix lives in `sse.ts` (`parseSSE` + `readerToAsyncIterable`), where the `ReadableStream` reader is owned, threaded through `OpenAIAdapter.ts` / `AnthropicAdapter.ts` via the existing `options?.signal`.
 
-In `OpenAIAdapter.ts`, immediately after `const response = await withRetry(...)` resolves, register:
+Landed mechanism (differs from the original `response.body.cancel()` sketch — that throws "locked" once a reader is acquired): `parseSSE` accepts an optional `AbortSignal`; when provided it acquires the reader explicitly via `getReader()` so `readerToAsyncIterable` holds the lock and can call `reader.cancel(new Error('Aborted'))` on abort. Only the reader that holds the lock can cancel. `reader.cancel()` errors the pending `reader.read()`, which throws out of `readerToAsyncIterable`'s `for await`, out of `parseSSE`, out of `OpenAIAdapter.queryStream`'s `for await`, and propagates to `providerTurn.ts:346` `for await (const delta of options.stream)` → caught by `LLMCodingRuntime.ts:847` → `classifyProviderRecovery` returns `undefined` for a non-`ProviderError` AbortError → rethrow → classified at `:1040-1041` as `REQUEST_TIMEOUT` (because `timeoutController` was also aborted). Without a signal, `parseSSE` falls back to the stream's native async iterator — back-compat preserved.
 
-```ts
-options?.signal?.addEventListener('abort', () => {
-  void response.body?.cancel(new Error('Aborted')).catch(() => {})
-}, { once: true })
-```
-
-`response.body.cancel()` errors the locked reader, so `reader.read()` in `readerToAsyncIterable` (`sse.ts:66`) rejects, which throws out of `parseSSE`'s `for await`, which throws out of `OpenAIAdapter.queryStream`'s `for await`, which propagates to `providerTurn.ts:346` `for await (const delta of options.stream)` → caught by `LLMCodingRuntime.ts:847` → classified at `:1040-1041`. The existing recovery path handles the rest.
-
-Apply the symmetric fix to `AnthropicAdapter.ts` (same `response.body.cancel()` pattern after its `fetch`).
+Both adapters thread `options?.signal` into `parseSSE(response.body, options?.signal)`. Regression: `test/sse-abort-propagation.test.ts` (4 tests) pins that a silent stream unblocks within ~1s of abort, not hours.
 
 ### Phase 2 — Single-source watchdog + observability
 
@@ -97,8 +89,8 @@ Cohesion note: the watchdog belongs in ONE place (`prepareExecution`, the shared
 
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
-| Phase 1 | Draft | Active abort propagation: `response.body.cancel()` on `signal abort` in `OpenAIAdapter.ts` + `AnthropicAdapter.ts` | A reproduction with a silent provider stream (mock adapter that yields N deltas then never yields again) unblocks within ~50ms of `abortController.abort()`, classifying the run as timed-out. Focused regression test in `test/runtime-llm.test.ts` or a new `test/provider-stream-abort-propagation.test.ts`. |
-| Phase 2 | Draft | Remove redundant WS `watchdogTimer`; add `logger.warn` to `prepared.timeout`; verify WS error-event delivery via settlement | `executeStreamRoute.ts` has one watchdog path (the shared `prepared.timeout`); HTTP and WS both log + deliver `details.kind='watchdog'` REQUEST_TIMEOUT identically; `npm run coupling:audit:gate` green; existing `runtime.test.ts:6087` HTTP watchdog regression still green. |
+| Phase 1 | Landed 2026-06-21 | Active abort propagation: `parseSSE` accepts `signal`, `readerToAsyncIterable` calls `reader.cancel()` on abort; `OpenAIAdapter` + `AnthropicAdapter` thread `options?.signal` | `test/sse-abort-propagation.test.ts` (4 tests): a silent stream unblocks within ~1s of abort, not hours. `architecture-boundary.test.ts` canonical-shape invariant green. |
+| Phase 2 | Landed 2026-06-21 | Removed redundant WS `watchdogTimer` (`executeStreamRoute.ts:189-209`); added `logger.warn` to `prepared.timeout` (`executionPreparation.ts:220`); WS `details.kind='watchdog'` REQUEST_TIMEOUT delivered via settlement/forward path (`processRuntimeExecutionEvent` → `maybeDecorateWatchdogError` → `forwardProcessedRuntimeEvent`) | `executeStreamRoute.ts` has one watchdog path (the shared `prepared.timeout`); `test/execute-stream-watchdog.test.ts` pins the single-source firing contract; `runtime.test.ts:6087` (soft decorates) + `:6191` (fatal doesn't) still green; `coupling:audit:gate` + `deps:audit` exit 0. |
 | Phase 3 | Draft | Deploy `metrics.snapshot()` activeAgeMs (already written); optional BehaviorMonitor `activeAgeMs` anomaly detector via `ingest()` | `/v1/runtime/status` shows growing `stream.activeAgeMs` during a hung stream and 0 after it terminates; detector (if added) emits an anomaly without importing `NexusMetrics` from runtime. |
 
 ## Verification
@@ -136,8 +128,8 @@ hard watchdog 其实早就在 `executionPreparation.ts:220-224` 写好了（HTTP
 
 ### 当前状态
 
-草案。需先进 `proposals/`（本文档），Phase 1 落地 + 复现回归通过后毕业到 `reference/` 或合并进 `history/`。
+部分落地（2026-06-21）。Phase 1（`sse.ts` 的 `reader.cancel()` + 两 adapter 透传 signal）和 Phase 2（删冗余 WS watchdog、`prepared.timeout` 加 `logger.warn`、WS kind=watchdog 走 settlement）已合入分支 `fix/provider-stream-abort-propagation`，回归全绿。Phase 3（activeAgeMs 部署 + 可选 BehaviorMonitor detector）待办。三段全落地后毕业到 `reference/` 或合并进 `history/`。
 
 ### 下一步
 
-最小可验证切片：Phase 1 的 `response.body.cancel()` + 一个 mock silent-stream 复现测试（yield 5 delta 后永不 yield，断言 ~`watchdogTimeoutMs` 内 terminalize 为 timeout 而非 hang 8h）。这是能直接防住 `session_3c3ec27c` 这类事故的回归。
+Phase 3：部署 `metrics.snapshot()` 的 `activeAgeMs`（已写未部署），让 `/v1/runtime/status` 能在零 stream event 的情况下反映持续增长的 `stream.activeAgeMs`；可选 BehaviorMonitor detector 走 `ingest()` push（nexus → runtime 合法），不能从 runtime import `NexusMetrics`。

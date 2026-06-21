@@ -4,6 +4,7 @@ import { resolvePromptCwd } from '../runtime/systemPromptBuilder.js'
 import { ConfigManager } from '../shared/config.js'
 import { eventBase } from '../shared/events.js'
 import { createId, nowIso } from '../shared/id.js'
+import { logger } from '../shared/logger.js'
 import type { SessionSnapshot } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { isWorkspaceAllowed } from '../tools/builtin/pathSafety.js'
@@ -217,11 +218,23 @@ export async function prepareExecution(body: ExecuteBody, options: PrepareExecut
   // and distinguish a system-safety cutoff from a fresh fatal
   // cutoff in metrics, friendly messages, and persistence.
   const watchdog: WatchdogState = { fired: false }
+  const watchdogTimeoutMs = timeoutDecision.watchdogTimeoutMs
   const timeout = setTimeout(() => {
+    // Single-source hard watchdog (Phase 2 of
+    // docs/nexus/proposals/provider-stream-silent-hang-abort-propagation-plan.md).
+    // This is the ONLY watchdog timer for both HTTP and WS execute
+    // paths. Firing marks `watchdog.fired` (so the settlement path
+    // can decorate the resulting REQUEST_TIMEOUT with
+    // `details.kind='watchdog'` under soft policy) and aborts both
+    // controllers so the provider stream reader unblocks (Phase 1)
+    // and the runtime catch yields REQUEST_TIMEOUT.
+    logger.warn(
+      `hard watchdog fired after ${watchdogTimeoutMs}ms (session=${sessionId}); aborting stream consumer`,
+    )
     watchdog.fired = true
     timeoutController.abort()
     abortController.abort()
-  }, timeoutDecision.watchdogTimeoutMs)
+  }, watchdogTimeoutMs)
   // Resolve effective policy mode: per-request body field overrides
   // server-side default. Defaults to 'strict' to preserve HTTP API
   // back-compat. See Phase B of

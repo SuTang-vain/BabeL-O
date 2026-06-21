@@ -34,7 +34,6 @@ import type { NexusRuntime } from '../runtime/Runtime.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 import type { BehaviorMonitor } from '../runtime/behaviorMonitor.js'
 import type { NexusStorage } from '../storage/Storage.js'
-import { logger } from '../shared/logger.js'
 
 import { executeSchema, isPrepareError, prepareExecution } from './executionPreparation.js'
 import { settleExecutionSession } from './executionFinalization.js'
@@ -109,13 +108,21 @@ export function registerExecuteStreamRoute(app: FastifyInstance, deps: ExecuteSt
       let activeExecutionLease: ActiveExecutionLease | undefined
       socket.once('close', () => abortController?.abort())
 
-      // Hard watchdog timer (Bug fix 2026-06-21). Registered later
-      // — after prepareExecution() resolves the timeoutDecision
-      // and abortController — so it can read both values. The
-      // `setTimeout` is registered immediately after the runtime
-      // stream loop is set up; if it fires, the provider stream
-      // is force-aborted and the WS client gets a clear
-      // REQUEST_TIMEOUT event with details.kind='watchdog'.
+      // The hard watchdog lives in `prepareExecution` as a single
+      // `setTimeout` (`prepared.timeout`) that fires at
+      // `watchdogTimeoutMs`, marks `prepared.watchdog.fired`, and
+      // aborts both the timeout and request controllers. The abort
+      // propagates through the provider stream reader (Phase 1 of
+      // docs/nexus/proposals/provider-stream-silent-hang-abort-propagation-plan.md)
+      // so the runtime's for-await throws and its catch yields a
+      // `REQUEST_TIMEOUT`. `processRuntimeExecutionEvent` then
+      // decorates that error with `details.kind='watchdog'` (soft
+      // policy) and `forwardProcessedRuntimeEvent` delivers it to
+      // the WS client. This route deliberately does NOT register a
+      // second watchdog timer — the HTTP route relies on the same
+      // single source, and a duplicate timer only risked double
+      // error events and a direct socket write that bypassed
+      // persistence/decoration.
 
       let success = false
       let timedOut = false
@@ -170,44 +177,6 @@ export function registerExecuteStreamRoute(app: FastifyInstance, deps: ExecuteSt
         })
         const { effectiveTimeoutMs } = timeoutControls
 
-        // Hard watchdog (Bug fix 2026-06-21): before this, the only
-        // path that aborted a hung stream consumer was socket close
-        // (line 109). If the provider stream went silent — DeepSeek
-        // V4 + long-thinking model has been observed to emit
-        // hundreds of thinking_delta chunks and then never resume,
-        // captured against session_ffd44ccf-7f3b-4597-9844-a077f41a8967
-        // on 2026-06-20 — the runtime's `for await (const ev of
-        // stream)` blocked indefinitely. softTimeoutMs only fires
-        // `near_timeout_warning` / `timeout_extension_granted` events
-        // but never aborts. This timer closes the gap: when the
-        // provider fails to yield ANY event for `watchdogTimeoutMs`,
-        // force-abort the stream consumer and push REQUEST_TIMEOUT.
-        // The downstream `for await` throws AbortError, which the
-        // recovery decision tree already classifies as `timedOut=true`.
-        // Normal healthy streams finish well before this fires, so
-        // the cost is one `setTimeout` registration per request.
-        const watchdogMs = prepared.timeoutDecision.watchdogTimeoutMs
-        const watchdogTimer = watchdogMs > 0
-          ? setTimeout(() => {
-              const elapsedMs = deps.metrics.now() - startedAtMs
-              logger.warn(
-                `hard watchdog fired: provider stream unresponsive for ${elapsedMs}ms (session=${sessionId})`,
-              )
-              prepared.watchdog.fired = true
-              try {
-                sendJson(socket, {
-                  type: 'error',
-                  code: 'REQUEST_TIMEOUT',
-                  message: `Provider stream did not yield events within ${watchdogMs}ms; aborting.`,
-                  details: { kind: 'watchdog', elapsedMs, timeoutMs: watchdogMs },
-                })
-              } catch {
-                // socket may already be closed; abort will tear down
-              }
-              abortController?.abort()
-            }, watchdogMs)
-          : null
-
         try {
           const loopResult = await runExecutionStreamLoop({
             runtime: deps.runtime,
@@ -240,7 +209,6 @@ export function registerExecuteStreamRoute(app: FastifyInstance, deps: ExecuteSt
         } finally {
           timeoutControls.cancel()
           clearTimeout(timeout)
-          if (watchdogTimer) clearTimeout(watchdogTimer)
         }
         timedOut = timedOut || abortController.signal.aborted
         const settlement = await settleExecutionSession({
