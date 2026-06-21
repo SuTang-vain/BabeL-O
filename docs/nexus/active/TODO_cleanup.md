@@ -79,13 +79,15 @@ Current focus:
 
 Current focus:
 
-- [ ] **Phase 3B+ — LLMCodingRuntime Strategy Extraction**: extract one strategy object per PR; do not mix router or event-schema work into the same PR.
+- [x] **Phase 3B+ — LLMCodingRuntime Strategy Extraction**（父收口 2026-06-21，per [module-coupling-decoupling-and-re-aggregation-plan.md §3B+](../reference/module-coupling-decoupling-and-re-aggregation-plan.md)）：extract one strategy object per PR; do not mix router or event-schema work into the same PR.
   - [x] `ContextRefreshStrategy` slice（2026-06-18）：新增 `src/runtime/ContextRefreshStrategy.ts`，封装 context refresh dependencies、session inbox loading policy，并接入 `LLMCodingRuntime.executeStream()` hot path 与 `resume()` context assembly；compact orchestration / provider calls / tool dispatch 仍留在 runtime loop。
   - [x] `ProviderTurnDriver` slice（2026-06-18）：新增 `src/runtime/ProviderTurnDriver.ts`，封装 provider adapter `queryStream` 调用、`streamProviderTurn()` 接线和 tool-call text / memory capability leak guard setup；hook dispatch、provider recovery、compact retry 仍留在 runtime loop。
   - [x] `ToolDispatchPipeline` slice（2026-06-18）：新增 `src/runtime/ToolDispatchPipeline.ts`，封装 provider tool-call dispatch coordination、tool events 收集、working-set callback、grounding confirmation 和 scope confirmation 后 task scope re-derive；`executeProviderToolCall()` permission / scope / audit behavior 不变。
-  - [ ] `HookDispatcher` / `RuntimeResumeService` follow-up：下一候选只在能保持小 PR 时推进；当前先让位给 Phase 4A+ low-risk router slice。
+  - [x] `executeProviderRecoveryDecision` slice（2026-06-20, 3B-19）：新增 `src/runtime/executeProviderRecoveryDecision.ts` 382 行 catch-block 提取，owns hook firing / error classification / recovered-blocked-rethrow branching / reactive compact + refresh + enforceMessageBudget sequence。
+  - [x] `eventsTranslator` / `behaviorTraceTap` / `loadWorkingSetOverride` / `applyWorkingSetUpdate` slices（2026-06-19, 3B-1/6/7/8）：4 个 standalone helper 共 708 行从 runtime body 抽出。
+  - **Open**: `HookDispatcher` / `RuntimeResumeService` 后续 follow-up — plan doc 显式说明"仅在能保持小 PR 时推进"。`LLMCodingRuntime.ts` 当前 1502 行（1841 起始），主循环 25+ `yield buildXxxEvent` 仍在原处；按 stop rule (plan doc line 24) 剩余为 orchestration 时即可停。
 
-- [ ] **Phase 4A+ — Nexus Router Slice**: extract low-risk route clusters first; do not start with `/v1/execute` or WebSocket stream.
+- [x] **Phase 4A+ — Nexus Router Slice**（父收口 2026-06-19，per [module-coupling-decoupling-and-re-aggregation-plan.md §4](../reference/module-coupling-decoupling-and-re-aggregation-plan.md) + [Phase 4A+ App.ts Decomposition Retrospective](../reference/module-coupling-decoupling-and-re-aggregation-plan.md#phase-4a-appts-decomposition-retrospective-2026-06-19)）: extract low-risk route clusters first; do not start with `/v1/execute` or WebSocket stream.
   - [x] `runtimeStatusRouter` slice（2026-06-18）：新增 `src/nexus/router.ts` 与 `src/nexus/routers/runtimeStatusRouter.ts`，接管 `/health`、`/v1/runtime/status`、`/v1/runtime/version`；`app.ts` 只传入 metrics/bootstrap/status closures，route response shape 不变，focused router integration test 已补。
   - [x] `runtimeConfigRouter` read-only slice（2026-06-18）：新增 `src/nexus/routers/runtimeConfigRouter.ts`，接管 GET `/v1/runtime/config`、`/v1/runtime/config/profiles`、`/v1/runtime/config/profiles/:name`；POST select/provider 和 `/v1/runtime/models` 仍留在 `app.ts`，focused router integration test 已补。
   - [x] `runtimeConfigMutationRouter` slice（2026-06-18）：新增 `src/nexus/routers/runtimeConfigMutationRouter.ts`，接管 POST `/v1/runtime/config/provider` 与 POST `/v1/runtime/config/select`；复用 `inspectResolvedRuntimeConfig()` 保持脱敏响应 shape，focused router test 与 `test/config-endpoints.test.ts` 已覆盖。
