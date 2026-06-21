@@ -5,6 +5,7 @@ dist/
 .DS_Store
 *.db
 *.sqlite
+!test/fixtures/r7-fixture.sqlite
 coverage/
 .babel-o/tool-results/
 .babel-o/benchmarks/
