@@ -79,7 +79,7 @@ function makeInput(overrides: any = {}) {
     onMemoryRetrieval: (() => undefined) as any,
     userIntentGuidance: undefined,
     workingSetOverride: undefined,
-    buildRuntimeExecutionMetricsEvent: () => ({ type: 'runtime_execution_metrics', sessionId: 's' } as any),
+    buildRuntimeExecutionMetricsEvent: () => ({ type: 'execution_metrics', sessionId: 's' } as any),
     compactAttempted: false,
     ...overrides,
   }
@@ -162,7 +162,7 @@ test('executePreLoopCompactSequence blocking emit only runs when isBlocking=true
   const { events, result } = await collectEvents(input)
   // Reactive block + blocking emit both run.
   assert.ok(events.some((e) => e.type === 'compact_failure'), 'reactive failure yielded')
-  assert.ok(events.some((e) => e.type === 'runtime_execution_metrics'), 'blocking emit yields runtime_execution_metrics')
+  assert.ok(events.some((e) => e.type === 'execution_metrics'), 'blocking emit yields execution_metrics')
   assert.equal(result.blocking, true)
 })
 

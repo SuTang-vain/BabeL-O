@@ -184,7 +184,7 @@ test('prepareRuntimeStart toolsList filters by toolPolicy and applies soft-deny 
   ])
   // policy that only allows read1
   const policy: ToolPolicy = {
-    isAllowed: (tool) => tool.name === 'read1',
+    isAllowed: (tool: AnyTool) => tool.name === 'read1',
   } as unknown as ToolPolicy
   // soft-deny mode
   const result = await prepareRuntimeStart({

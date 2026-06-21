@@ -35,7 +35,7 @@ test('executeProviderTurn returns empty events array and the final value when th
   const driver = makeStubDriver([], { kind: 'continue', toolCalls: [] })
   const result = await executeProviderTurn(driver, stubInput)
   assert.equal(result.events.length, 0)
-  assert.equal(result.providerTurn.kind, 'continue')
+  assert.equal((result.providerTurn as any).kind, 'continue')
 })
 
 test('executeProviderTurn returns all events in order', async () => {
@@ -52,7 +52,7 @@ test('executeProviderTurn returns all events in order', async () => {
     result.events.map((e) => e.type),
     ['thinking_delta', 'tool_use_start', 'tool_use_end', 'finish'],
   )
-  assert.equal(result.providerTurn.kind, 'terminal')
+  assert.equal((result.providerTurn as any).kind, 'terminal')
 })
 
 test('executeProviderTurn returns events from a multi-event provider stream', async () => {
@@ -64,7 +64,7 @@ test('executeProviderTurn returns events from a multi-event provider stream', as
   const driver = makeStubDriver(events, { kind: 'continue', toolCalls: [] })
   const result = await executeProviderTurn(driver, stubInput)
   assert.equal(result.events.length, 10)
-  assert.equal(result.providerTurn.kind, 'continue')
+  assert.equal((result.providerTurn as any).kind, 'continue')
 })
 
 test('executeProviderTurn propagates errors from the driver', async () => {
@@ -83,7 +83,7 @@ test('executeProviderTurn returns no events when the driver returns a terminal v
   const driver = makeStubDriver([], { kind: 'terminal', result: 'final' })
   const result = await executeProviderTurn(driver, stubInput)
   assert.equal(result.events.length, 0)
-  assert.equal(result.providerTurn.kind, 'terminal')
+  assert.equal((result.providerTurn as any).kind, 'terminal')
   assert.equal((result.providerTurn as any).result, 'final')
 })
 

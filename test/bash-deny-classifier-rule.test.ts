@@ -33,7 +33,6 @@ import {
   resolveEffectiveToolRiskWithRule,
 } from '../src/runtime/runtimeToolLoop.js'
 import { LocalCodingRuntime, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
-import { ConfigManager } from '../src/shared/config.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
@@ -110,8 +109,7 @@ test('LocalCodingRuntime: sqlite3 deny message includes classifier rule', async 
   const tools = createDefaultToolRegistry()
   const policy = allowlistedTools(['Read']) // Bash NOT allowed; sqlite3 must hit the deny path.
   const storage = new MemoryStorage()
-  const configManager = new ConfigManager({ configFile: '/tmp/babel-o-test-config.json' })
-  const runtime = new LocalCodingRuntime(tools, policy, storage, configManager)
+  const runtime = new LocalCodingRuntime(tools, policy, storage)
 
   const sessionId = 'bug-1.2-deny-rule-sqlite'
   await storage.saveSession({
@@ -161,8 +159,7 @@ test('LocalCodingRuntime: read-only git command auto-allows without rule annotat
   // Bash NOT in allowlist — read-only classifier must auto-allow regardless.
   const policy = allowlistedTools(['Read'])
   const storage = new MemoryStorage()
-  const configManager = new ConfigManager({ configFile: '/tmp/babel-o-test-config.json' })
-  const runtime = new LocalCodingRuntime(tools, policy, storage, configManager)
+  const runtime = new LocalCodingRuntime(tools, policy, storage)
 
   const sessionId = 'bug-1.2-readonly-no-deny'
   await storage.saveSession({
@@ -200,8 +197,7 @@ test('LocalCodingRuntime: dangerous-pattern command surfaces dangerous-pattern r
   const tools = createDefaultToolRegistry()
   const policy = allowlistedTools(['Read'])
   const storage = new MemoryStorage()
-  const configManager = new ConfigManager({ configFile: '/tmp/babel-o-test-config.json' })
-  const runtime = new LocalCodingRuntime(tools, policy, storage, configManager)
+  const runtime = new LocalCodingRuntime(tools, policy, storage)
 
   const sessionId = 'bug-1.2-deny-rule-dangerous'
   await storage.saveSession({

@@ -36,6 +36,7 @@ import {
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
+import type { AssembledContext } from '../src/runtime/contextAssembler.js'
 
 function makeFakeAssembledContext() {
   // The full AssembledContext type is large (ContextSelectionDiagnostics,
