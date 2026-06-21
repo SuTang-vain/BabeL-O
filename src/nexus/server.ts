@@ -1,8 +1,10 @@
-import { createNexusApp, validateSecurityConfig } from './app.js'
+import { createNexusApp } from './app.js'
 import { createDefaultNexusRuntime, resolveDefaultStoragePath } from './createRuntime.js'
 import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
+import { validateSecurityConfig } from '../shared/security.js'
 import { defaultEverCoreRuntimeManager } from './everCoreRuntimeManager.js'
+import { ContextBroadcaster } from './contextBroadcaster.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -68,6 +70,7 @@ try {
 }
 const providerSettings = ConfigManager.getInstance().resolveSettings()
 const everCore = await defaultEverCoreRuntimeManager.acquireFromEnv(process.env, { cwd, providerSettings })
+const contextBroadcaster = new ContextBroadcaster()
 const { runtime, storage, agentScheduler, behaviorMonitor } = await createDefaultNexusRuntime({
   storagePath,
   allowedTools,
@@ -77,6 +80,7 @@ const { runtime, storage, agentScheduler, behaviorMonitor } = await createDefaul
   remoteRunner: remoteRunner.runner,
   agentExecutionEnvironment,
   memoryProvider: everCore.memoryProvider,
+  contextBroadcaster,
   everCore: {
     client: everCore.client,
     config: everCore.config,
@@ -106,6 +110,7 @@ const app = await createNexusApp({
   memoryProvider: everCore.memoryProvider,
   agentExecutionEnvironment,
   behaviorMonitor,
+  contextBroadcaster,
 })
 app.addHook('onClose', async () => {
   await defaultEverCoreRuntimeManager.shutdown()

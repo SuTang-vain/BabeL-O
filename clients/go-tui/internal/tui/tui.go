@@ -993,6 +993,24 @@ type model struct {
 	// `permission_request` event.
 	permissionChoice        int
 	lastEventType           string
+	// pendingSynthesis tracks the "model finished reasoning, no
+	// assistant text has arrived yet" gap. Some providers (Anthropic-
+	// compatible DeepSeek V4 observed in real e2e) batch the entire
+	// assistant text into a single `assistant_delta` after a long
+	// `thinking_delta` tail. Without this flag the footer animation
+	// flickers between "agent thinking" → "agent runtime" → "agent
+	// writing" during the gap. Setting pendingSynthesis=true on
+	// `thinking_delta` and clearing it on `assistant_delta` gives
+	// the operator a stable "drafting response..." indicator.
+	pendingSynthesis        bool
+	// assistantSeenInTurn is a one-shot latch set when the first
+	// `assistant_delta` arrives in a turn. Late `thinking_delta`
+	// events that arrive AFTER assistant text (e.g. providers
+	// streaming reasoning interleaved with the answer) must NOT
+	// re-arm `pendingSynthesis` — the bridge indicator only makes
+	// sense BEFORE the first assistant chunk. Cleared by
+	// startPrompt.
+	assistantSeenInTurn     bool
 	sessionID               string
 	modelID                 string
 	providerID              string
@@ -1680,6 +1698,8 @@ func (m *model) startAgentPrompt(displayPrompt string, expandedPrompt string) te
 	m.cancelRequestedAt = time.Time{}
 	m.pending = nil
 	m.lastEventType = ""
+	m.pendingSynthesis = false
+	m.assistantSeenInTurn = false
 	m.startedAt = time.Now()
 	m.resize()
 	return tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
@@ -3955,11 +3975,38 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		}
 	case "assistant_delta":
 		m.appendStreamingLine("assistant", stringField(event, "text"))
+		// First assistant text has arrived — clear the synthesis
+		// flag. Late `thinking_delta` events that arrive AFTER
+		// assistant text don't re-arm the flag (we're already
+		// streaming the answer; bridge indicator is no longer
+		// relevant). The `m.assistantSeenInTurn` latch enforces
+		// this monotonic behavior across the rest of the turn.
+		m.pendingSynthesis = false
+		m.assistantSeenInTurn = true
 	case "thinking_delta":
 		m.appendStreamingLine("thinking", stringField(event, "text"))
+		// Path 2 (2026-06-21): between the last thinking chunk
+		// and the first assistant_delta the chrome must show the
+		// "drafting response" indicator instead of falling back
+		// to "agent thinking" or "agent runtime". Track the
+		// transition by clearing lastEventType on each new
+		// thinking chunk — this lets the next render frame fall
+		// into the default branch where `pendingSynthesis`
+		// decides between synthesizing and agent-runtime.
+		// assistantSeenInTurn prevents late reasoning from
+		// re-arming the bridge after the first assistant chunk
+		// already arrived.
+		if !m.assistantSeenInTurn {
+			m.pendingSynthesis = true
+			m.lastEventType = ""
+		}
 	case "tool_started":
 		m.appendToolStarted(event)
 		m.recordActivityEvent(activityKindToolStarted, formatToolInput(stringField(event, "name"), event["input"]), stringField(event, "timestamp"))
+		// Tool started is a higher-priority signal than "drafting
+		// response" — clear the synthesis flag so the chrome shows
+		// "tool activity" instead.
+		m.pendingSynthesis = false
 	case "permission_response":
 		// Keep permission acknowledgements out of the main
 		// transcript. They are still useful in the activity panel,

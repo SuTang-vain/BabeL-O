@@ -618,7 +618,7 @@ export const SessionMemoryUpdatedEventSchema = z.object({
   summaryChars: z.number(),
   eventCount: z.number(),
   reason: z.enum(['compact', 'pause']).optional(),
-  decisionReason: z.enum(['disabled', 'duplicate_turn', 'natural_pause', 'growth_threshold', 'forced', 'insufficient_signal']).optional(),
+  decisionReason: z.enum(['disabled', 'duplicate_turn', 'growth_threshold', 'forced', 'insufficient_signal']).optional(),
   estimatedTokensSinceLastUpdate: z.number().optional(),
   toolCallCount: z.number().optional(),
   summaryMaxChars: z.number().optional(),

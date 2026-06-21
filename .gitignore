@@ -5,12 +5,14 @@ dist/
 .DS_Store
 *.db
 *.sqlite
+!test/fixtures/r7-fixture.sqlite
 coverage/
 .babel-o/tool-results/
 .babel-o/benchmarks/
 .babel-o/worktrees/
 .babel-o/test-*/
 .babel-o/behavior-trace.jsonl
+.babel-o/working-set.json
 bin/mcporter
 clients/go-tui/bin/
 clients/go-tui/go-tui
@@ -36,3 +38,7 @@ docs/*
 !docs/nexus/**/
 !docs/nexus/*.md
 !docs/nexus/**/*.md
+
+# Runtime artifacts inside docs/nexus/ (test side effects, working-set.json)
+docs/nexus/.babel-o/
+docs/nexus/**/.babel-o/

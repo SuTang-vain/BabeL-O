@@ -12,7 +12,6 @@
 > Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). Behavior trace is diagnostics and live guidance; it must not be treated as authoritative memory or task state.
 
 **Server 侧落地清单**（按 PR）：
-- PR-1 (2026-06-14): `BABEL_O_NATURAL_PAUSE_SUPPRESS` env flag 默认压制 `natural_pause`
 - PR-2 (2026-06-14): `src/runtime/behaviorTrace.ts` 5 类 trigger + 队列 + flush
 - PR-3 (2026-06-14): `wrapWithBehaviorTraceTap()` 包装 runtime error path
 - PR-5 (2026-06-15): `src/nexus/behaviorMonitor.ts` 跨 session 3 类触发器 (hot-path/tool-storm/scope-drift-wave)

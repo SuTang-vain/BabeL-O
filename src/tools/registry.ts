@@ -3,6 +3,7 @@ import type { AnyTool } from './Tool.js'
 import { bashTool } from './builtin/bash.js'
 import { contextRecentTool } from './builtin/contextRecent.js'
 import { contextSearchTool } from './builtin/contextSearch.js'
+import { contextSessionsTool } from './builtin/contextSessions.js'
 import { contextSummarizeTool } from './builtin/contextSummarize.js'
 import { editTool } from './builtin/edit.js'
 import { globTool } from './builtin/glob.js'
@@ -33,7 +34,7 @@ export interface CreateToolRegistryOptions {
   storage?: NexusStorage | null
 }
 
-const CONTEXT_TOOL_NAMES = new Set(['contextSearch', 'contextSummarize', 'contextRecent'])
+const CONTEXT_TOOL_NAMES = new Set(['contextSearch', 'contextSummarize', 'contextRecent', 'contextSessions'])
 
 export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}): Map<string, AnyTool> {
   const tools: AnyTool[] = [
@@ -46,11 +47,15 @@ export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}):
     bashTool,
     taskTool,
     webSearchTool,
-    // PR-8: on-demand context tools (Track A Phase 2). Read risk, no approval.
-    // Do NOT enter active context (INV-L12); called by model on demand.
+    // PR-8 + cross-session extension: on-demand context tools (Track A Phase 2).
+    // Read risk, no approval. Do NOT enter active context (INV-L12); called
+    // by model on demand. contextSessions is the 4th tool — single-session
+    // event tools (search/recent/summarize) plus cross-session metadata
+    // search (sessions) — keeping orthogonal scope per tool.
     contextSearchTool,
     contextSummarizeTool,
     contextRecentTool,
+    contextSessionsTool,
     // Skill tools (Phase 6 of the Skill execution governance plan).
     // 5 bounded tools: SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave.
     // SkillSave has write risk + requiresApproval; the other 4 are read risk.

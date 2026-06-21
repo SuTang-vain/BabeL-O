@@ -22,7 +22,7 @@ import {
   type CrossSessionTrigger,
   type HintCandidate,
   type HintDispatchContext,
-} from '../src/nexus/behaviorMonitor.js'
+} from '../src/runtime/behaviorMonitor.js'
 import {
   BEHAVIOR_TRACE_RELATIVE_PATH,
   flushBehaviorTraceQueue,

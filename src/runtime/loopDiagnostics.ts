@@ -179,7 +179,7 @@ export function derivePaneStatus(
 // INV-12: existing 6 statuses + priority logic unchanged
 // (Go mirror is a separate PR; this file is the server projection)
 
-import { DEFAULT_HINT_COOLDOWN_MS } from '../nexus/behaviorMonitor.js'
+import { DEFAULT_HINT_COOLDOWN_MS } from './behaviorMonitor.js'
 
 export type BehaviorHintProjection = {
   /** Number of undispatched behavior hints for this session. */

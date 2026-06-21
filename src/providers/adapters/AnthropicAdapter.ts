@@ -134,6 +134,87 @@ function createMinimaxTextToolParser(): {
   }
 }
 
+/**
+ * Path 1 helper (2026-06-21): split a large assistant text delta
+ * into smaller chunks at sentence / clause / word boundaries. The
+ * Anthropic-compatible provider stream hands us one big `delta.text`
+ * after all `thinking_delta` chunks (real e2e captured this for
+ * DeepSeek V4 — 21 thinking_delta events followed by 1 ~80-char
+ * assistant_delta). The Go TUI then sees one giant frame at the
+ * end of the turn and renders it as a non-progressive dump.
+ *
+ * Splitting at natural boundaries preserves the model's pacing
+ * (operators see commas / sentence breaks, not arbitrary mid-word
+ * splits) and keeps event ordering stable. The threshold (>50
+ * chars) ensures normal providers that already emit small deltas
+ * aren't fragmented. We never add artificial delay — the goal is
+ * better *granularity* on the wire, not slower streaming.
+ *
+ * Boundary priority: paragraph > sentence > clause > word > hard
+ * split. Each chunk returned preserves the original spacing
+ * (trailing whitespace / newlines stay attached to the chunk
+ * that contains them so the joined output equals the input).
+ */
+function* chunkTextDelta(input: string): Generator<{ type: 'text'; text: string }> {
+  if (input.length <= 50) {
+    yield { type: 'text', text: input }
+    return
+  }
+  // Boundary priority: paragraph > sentence > clause > word.
+  // We pick the highest-priority boundary within the search window
+  // [20, remaining.length - 30] so the chunker prefers sentence
+  // breaks over word breaks even when a word break is closer to
+  // position 20. The lower bound leaves the first 20 chars intact
+  // (avoids fragmenting short prefixes). The upper bound leaves at
+  // least 30 chars in the next iteration so the recursive cut can
+  // find another boundary — without this the chunker would cut at
+  // the very last punctuation mark and emit a single chunk
+  // instead of N.
+  //
+  // Boundaries are ordered highest-priority first so the loop picks
+  // the first boundary it finds in priority order. Within a single
+  // priority, ties broken by lowest index (earliest break).
+  const boundaries: Array<{ re: RegExp; priority: number }> = [
+    { re: /\n\n+/g, priority: 0 },
+    { re: /[.!?]+\s*/g, priority: 1 },
+    { re: /[,;:]+\s*/g, priority: 2 },
+    { re: /\s+/g, priority: 3 },
+  ]
+  let remaining = input
+  while (remaining.length > 50) {
+    const windowEnd = Math.max(20, remaining.length - 30)
+    let chosen: { re: RegExp; priority: number; index: number; len: number } | null = null
+    for (const b of boundaries) {
+      // Search for the first match whose start index is in
+      // [20, windowEnd]. Setting `lastIndex = 20` before exec
+      // makes the regex engine skip past any earlier matches.
+      b.re.lastIndex = 20
+      const m = b.re.exec(remaining)
+      if (m && m.index >= 20 && m.index <= windowEnd) {
+        if (chosen === null || b.priority < chosen.priority ||
+            (b.priority === chosen.priority && m.index < chosen.index)) {
+          chosen = { re: b.re, priority: b.priority, index: m.index, len: m[0].length }
+        }
+      }
+    }
+    let cutAt: number
+    let cutLen: number
+    if (chosen !== null) {
+      cutAt = chosen.index
+      cutLen = chosen.len
+    } else {
+      // No natural boundary in [20, windowEnd] — hard split at
+      // 60 chars to keep chunks bounded.
+      cutAt = 60
+      cutLen = 0
+    }
+    const chunk = remaining.slice(0, cutAt + cutLen)
+    if (chunk.length > 0) yield { type: 'text', text: chunk }
+    remaining = remaining.slice(cutAt + cutLen)
+  }
+  if (remaining.length > 0) yield { type: 'text', text: remaining }
+}
+
 function findNextMinimaxTextToolCall(buffer: string): { start: number; closeTag: string } | undefined {
   const standardStart = buffer.indexOf(MINIMAX_TOOL_CALL_OPEN)
   const bracketStart = buffer.indexOf(`${MINIMAX_BRACKET_MARKER}${MINIMAX_BRACKET_TOOL_CALL_OPEN}`)
@@ -488,9 +569,29 @@ export class AnthropicAdapter implements ModelAdapter {
             if (minimaxTextToolParser) {
               yield* minimaxTextToolParser.handleText(delta.text)
             } else {
-              yield {
-                type: 'text',
-                text: delta.text,
+              // Path 1 fix (2026-06-21): some providers (Anthropic-
+              // compatible DeepSeek V4 captured in real e2e
+              // session_ff3a874d-4d25-4e53-b0eb-02744b6bfaa2) emit
+              // the entire assistant answer as a single large
+              // text_delta AFTER all thinking_delta. The Go TUI
+              // then sees one giant assistant_delta frame at the
+              // end of the turn and renders it as a single
+              // non-progressive dump — the operator can't see the
+              // model "writing". Split long text deltas at
+              // sentence/word boundaries so the TUI gets multiple
+              // smaller frames and can show progressive text.
+              //
+              // Threshold: only chunk deltas > 50 chars; small
+              // deltas are emitted verbatim to avoid fragmenting
+              // normal streaming providers.
+              const text = delta.text
+              if (text.length > 50) {
+                yield* chunkTextDelta(text)
+              } else {
+                yield {
+                  type: 'text',
+                  text,
+                }
               }
             }
           } else if (delta.type === 'thinking_delta') {

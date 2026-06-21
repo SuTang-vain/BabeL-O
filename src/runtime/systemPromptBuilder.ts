@@ -1,5 +1,5 @@
-import { existsSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { existsSync, lstatSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
 export type SystemPromptSection = {
@@ -251,7 +251,20 @@ export function extractAbsolutePaths(text: string): string[] {
   // not be split at the backslash. We rewrite `\ ` to a marker, run the
   // regex, then restore the space.
   const SPACE_MARK = '\x00\x01'
-  const preserved = normalized.replace(/\\ /g, SPACE_MARK)
+  let preserved = normalized.replace(/\\ /g, SPACE_MARK)
+  // Bug 1 Layer A (context-cwd-drift plan §13.3): real users paste paths
+  // with *plain* spaces — and CJK punctuation in filenames — inside quote
+  // delimiters, e.g. 分析这个文章'/Users/.../Mobile Documents/.../上百个Agent，该怎么管？...md'.
+  // pathPattern's character class excludes space AND CJK punctuation
+  // (，。！？；：、), so it cuts the span at the first excluded char and
+  // emits broken fragments (/Users/.../Library/Mobile + /com~apple~...).
+  // The first fragment's dirname fallback then poisons cwd to ~/Library
+  // (always exists on macOS). Before running pathPattern, extract
+  // quote-delimited spans that resolve to a real path, add them verbatim,
+  // and blank those spans out of the working string so pathPattern cannot
+  // re-emit broken fragments from them. Non-real quoted spans are left
+  // untouched (existing prose guards handle them).
+  preserved = extractAndBlankQuotedRealPaths(preserved, paths)
   const pathPattern = /\/[^\s"'`，。！？；：、）\])}<>]+/g
   for (const match of preserved.matchAll(pathPattern)) {
     const restored = match[0].replace(new RegExp(SPACE_MARK, 'g'), ' ')
@@ -270,6 +283,39 @@ export function extractAbsolutePaths(text: string): string[] {
     paths.add(resolved)
   }
   return [...paths]
+}
+
+// Bug 1 Layer A helper. Matches `'...'` / `"..."` / `` `...` `` spans
+// (single-line, balanced via backreference) whose content is an absolute or
+// home-relative path containing both `/` and a plain space. For each such
+// span that resolves to a real on-disk path (existsSync true, or
+// resolvePromptPath hits a real prefix that is not itself a prose
+// candidate), the resolved path is added to `paths` and the whole span is
+// replaced with spaces so the caller's pathPattern cannot re-extract broken
+// fragments from it. Spans that don't resolve to a real path are returned
+// unchanged so existing prose guards still handle them.
+function extractAndBlankQuotedRealPaths(text: string, paths: Set<string>): string {
+  const QUOTE_SPAN = /(['"`])([^'"`\n]*)\1/g
+  return text.replace(QUOTE_SPAN, (full, _quote: string, inner: string) => {
+    const candidate = inner.trim()
+    if (!candidate.includes('/') || !candidate.includes(' ')) return full
+    if (!/^(?:\/|~\/)/.test(candidate)) return full
+    let resolved: string | undefined
+    if (existsSync(candidate)) {
+      resolved = candidate
+    } else {
+      const r = resolvePromptPath(candidate)
+      if (r !== candidate && r !== '/' && !isNonExistentProseCandidate(r)) {
+        resolved = r
+      }
+    }
+    if (!resolved) return full
+    paths.add(resolved)
+    // Blank the entire span (quotes + content) with spaces so pathPattern
+    // finds no `/` there and cannot emit broken fragments. Equal-length
+    // replacement keeps regex offsets sane.
+    return ' '.repeat(full.length)
+  })
 }
 
 function isNonExistentProseCandidate(candidate: string): boolean {
@@ -349,6 +395,83 @@ export function resolvePromptPath(candidate: string): string {
   }
 
   return candidate
+}
+
+// Bug 1 Layer B (context-cwd-drift plan §13.3): shared guard used by both
+// cwd resolution sites (`app.ts:resolveExplicitPromptCwd` Site A and
+// `LLMCodingRuntime.ts:resolveCwdFromPrompt` Site B). A prompt-derived cwd
+// must never land on a system/home directory: those always exist on disk
+// (so they pass the `existsSync` + `isDirectory` checks) but they are not a
+// project root and would poison every downstream tool (Glob scanning
+// `~/Library/Caches`, scope boundary parent_scan, working-set persistence).
+// The session_10320709 cwd drift to `~/Library` survived Phase A because the
+// dirname fallback in Site B accepted `~/Library` as the parent of a
+// non-existent `/Users/.../Library/Mobile` candidate. This guard rejects
+// such fallbacks at both sites. Returns false for system/home roots, true
+// for anything else (including external-but-project-like roots — Phase B
+// continuity handles external confirmation separately).
+export function isAcceptablePromptCwd(p: string): boolean {
+  const home = homedir()
+  const rejected = [
+    '/',
+    '/Users',
+    '/Users/',
+    home,
+    dirname(home),
+    `${home}/Library`,
+    `${home}/Documents`,
+    `${home}/Desktop`,
+    `${home}/Downloads`,
+    `${home}/Applications`,
+  ]
+  const normalized = resolve(p)
+  return !rejected.includes(normalized)
+}
+
+// Bug 4 (context-cwd-drift plan §13.2): the single shared prompt → cwd
+// resolver. Before Bug 4 there were THREE divergent copies:
+//   - app.ts `resolveExplicitPromptCwd` (Site A): only accepted an
+//     existing directory; no dirname fallback;
+//   - LLMCodingRuntime.ts `resolveCwdFromPrompt` (Site B): dirname fallback
+//     to an existing parent;
+//   - cli/runSessionFlow.ts `resolveExplicitPromptCwd`: yet another copy
+//     with neither the dirname fallback nor the Bug 1 Layer B guard.
+// They could disagree on the same prompt, so `session.cwd` (Site A) and the
+// runtime's `options.cwd` (Site B) diverged — the root cause of
+// session_10320709's cross-turn drift persistence. This function is now the
+// single source of truth: it mirrors Site B's logic (resolvePromptPath →
+// existsSync → dirname fallback) and applies the Bug 1 Layer B
+// `isAcceptablePromptCwd` guard at every return point. `resolveCwdFromPrompt`
+// in LLMCodingRuntime remains as a thin wrapper for back-compat (tests +
+// Phase B continuity call it), but its body now delegates here.
+export function resolvePromptCwd(prompt: string, baseCwd: string): string {
+  const paths = extractAbsolutePaths(prompt)
+  for (const candidate of paths) {
+    const resolved = resolvePromptPath(candidate)
+    if (!existsSync(resolved)) {
+      const parent = dirname(resolved)
+      if (parent !== resolved && existsSync(parent) && isAcceptablePromptCwd(parent)) {
+        return parent
+      }
+      continue
+    }
+    try {
+      const stat = lstatSync(resolved)
+      if (stat.isDirectory()) {
+        if (isAcceptablePromptCwd(resolved)) {
+          return resolved
+        }
+        continue
+      }
+      const parent = dirname(resolved)
+      if (parent !== resolved && isAcceptablePromptCwd(parent)) {
+        return parent
+      }
+    } catch {
+      continue
+    }
+  }
+  return baseCwd
 }
 
 function looksLikePathFragment(fragment: string): boolean {

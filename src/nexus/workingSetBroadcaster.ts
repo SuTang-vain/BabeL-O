@@ -16,12 +16,12 @@
 // This module is purely additive. Existing REST handlers (PR-11/12/18/20)
 // still create per-request trackers and remain unaffected.
 
-import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../runtime/persistedWorkingSetTracker.js'
 import type {
   WorkingSetEvent,
   WorkingSetEventHandler,
   WorkingSetTracker as WorkingSetTrackerType,
-} from './workingSetTracker.js'
+} from '../runtime/workingSetTracker.js'
 
 export type BroadcasterTracker = {
   tracker: PersistedWorkingSetTracker
@@ -92,5 +92,32 @@ export class WorkingSetBroadcaster {
    */
   clear(): void {
     this.byCwd.clear()
+  }
+
+  /**
+   * R3 of docs/nexus/proposals/long-running-context-assembly.md §20:
+   * Shared mutation helper. Routes a mutation through the same per-cwd
+   * tracker that the /v1/working-set/observe WebSocket subscribes to,
+   * so REST write mutations (PUT /v1/context/working-set/:sessionId)
+   * are observed by every connected subscriber. Awaits the initial
+   * load, runs the user's mutation against the in-memory tracker
+   * (which emits working_set_updated on the bus), then flushes the
+   * tracker to disk so the persistence layer is consistent.
+   *
+   * The mutation callback may return a value that is forwarded to the
+   * caller (useful for the PUT route which returns the post-update
+   * state). On any error during the mutation, the in-memory state
+   * is whatever the callback left it as; the flush is skipped so we
+   * do not persist a partial state. Errors propagate to the caller.
+   */
+  async mutate<T>(
+    cwd: string,
+    fn: (tracker: PersistedWorkingSetTracker) => T | Promise<T>,
+  ): Promise<T> {
+    const { tracker, loadPromise } = this.getOrCreateTracker(cwd)
+    await loadPromise
+    const result = await fn(tracker)
+    await tracker.flush()
+    return result
   }
 }

@@ -20,10 +20,9 @@
 //   - publish() does not await subscriber callbacks (fire-and-forget).
 //   - publish() short-circuits when there are no subscribers for the cwd.
 //
-// Module-level `defaultContextBroadcaster` is the no-op singleton used by
-// the runtime hot path. Production apps can override via
-// `CreateNexusAppOptions.contextBroadcaster` if they need a different
-// instance (e.g. tests).
+// Module-level `defaultContextBroadcaster` is the legacy no-op instance
+// used by /v1/context/observe when a caller does not inject a broadcaster.
+// Runtime hot paths receive a broadcaster explicitly.
 
 import type { AssembledContext } from '../runtime/contextAssembler.js'
 
@@ -139,25 +138,114 @@ export class ContextBroadcaster {
 }
 
 /**
- * Module-level singleton used by the runtime hot path. In production
- * this is a plain ContextBroadcaster — publish() is a fast Map lookup
- * + no-op fan-out when no WS clients are attached, so the hot path
- * stays cheap.
- *
- * Rebindable via `setDefaultContextBroadcaster` (used by
- * `createNexusApp` when the caller passes `options.contextBroadcaster`,
- * so the runtime hot path and the WS route share the same instance).
- * ESM `let` exports are live bindings, so callers that have already
- * imported this name will see the new instance on their next method
- * call.
+ * Legacy default instance used by /v1/context/observe when no explicit
+ * broadcaster is passed. Production composition roots that need runtime
+ * fan-out should construct one ContextBroadcaster and pass it both to
+ * createDefaultNexusRuntime({ contextBroadcaster }) and createNexusApp({
+ * contextBroadcaster }).
  */
 export let defaultContextBroadcaster: ContextBroadcaster = new ContextBroadcaster()
 
 /**
- * Swap the module-level singleton. Used by `createNexusApp` to wire the
- * runtime hot path and the /v1/context/observe WebSocket route to the
- * same instance. Tests can also call this to inject a mock.
+ * Swap the module-level singleton. Kept for legacy tests / manual
+ * compatibility only; new runtime code should use explicit injection.
  */
 export function setDefaultContextBroadcaster(instance: ContextBroadcaster): void {
   defaultContextBroadcaster = instance
+}
+
+// ─── R4 of docs/nexus/proposals/long-running-context-assembly.md §20: ───
+//
+// `redactContext(c, opts)` strips the two large text fields
+// (systemPrompt + messages) from an AssembledContext so the observer
+// payload is safe to ship over the wire to non-local-debug consumers.
+// All other fields (counts, budgets, section ids, diagnostics) are
+// structured and non-sensitive; they survive redaction intact.
+//
+// `mode === 'full'` returns the context verbatim — use only for
+// local/debug opt-in (e.g. `?full=1` on the observer route).
+// `mode === 'summary'` (default) returns a redacted copy with
+// `systemPrompt` and `messages` replaced by length-only metadata so
+// the observer can show "the runtime sent a 14k-char system prompt
+// with 23 messages" without leaking the actual prompt text.
+export type RedactionMode = 'summary' | 'full'
+
+export type RedactedContextSummary = {
+  systemPromptChars: number
+  messageCount: number
+  messageChars: number
+  // blockCount: number of SystemPromptBlock sections in the assembled
+  // prompt. AssembledContext's SystemPromptBlock shape does not carry
+  // its source id (the id is dropped when buildSystemPromptSections →
+  // systemPromptBlocks projection runs in contextAssembler.ts), so the
+  // summary exposes a count + cacheable split instead of a list of
+  // ids. cacheableBlockCount tells the observer how much of the prompt
+  // is prefix-cacheable without leaking the actual section names.
+  blockCount: number
+  cacheableBlockCount: number
+}
+
+// Bug 2 fix (2026-06-20): `systemPromptBlocks` is also stripped of
+// its `text` field; the type narrows the surviving fields to
+// `{ cacheable }[]` only.
+export type RedactedContextBlock = Pick<AssembledContext['systemPromptBlocks'] extends Array<infer B> ? B : never, 'cacheable'>
+export type RedactedContext = Omit<AssembledContext, 'systemPrompt' | 'messages' | 'systemPromptBlocks'> & {
+  systemPromptBlocks?: RedactedContextBlock[]
+  redaction: RedactedContextSummary
+}
+
+export function redactContext(
+  context: AssembledContext,
+  mode: RedactionMode = 'summary',
+): AssembledContext | RedactedContext {
+  if (mode === 'full') return context
+  const systemPromptChars = context.systemPrompt.length
+  const messageCount = context.messages.length
+  const messageChars = context.messages.reduce((sum, m) => {
+    if (typeof m.content === 'string') return sum + m.content.length
+    if (Array.isArray(m.content)) {
+      return sum + m.content.reduce((c, p: unknown) => {
+        if (p && typeof p === 'object' && 'text' in p && typeof (p as { text: unknown }).text === 'string') {
+          return c + (p as { text: string }).text.length
+        }
+        return c + JSON.stringify(p).length
+      }, 0)
+    }
+    return sum
+  }, 0)
+  const blocks = context.systemPromptBlocks ?? []
+  const blockCount = blocks.length
+  const cacheableBlockCount = blocks.filter((b) => b.cacheable).length
+  // Strip the text-bearing fields. Everything else is structured
+  // metadata that's safe to expose by default.
+  //
+  // Bug 2 fix (2026-06-20, real e2e via /v1/context/observe during
+  // active turn): the legacy destructure below stripped only `systemPrompt`
+  // (joined string) and `messages`, but AssembledContext ALSO carries
+  // `systemPromptBlocks: Array<{ text, cacheable }>` — that array survived
+  // redaction, leaking the full ~14k-char system prompt + tool contract
+  // lines verbatim to any WS observer subscriber. The WebSocket default
+  // is `?full` opt-in per R4 spec; the previous behavior made `summary`
+  // mode effectively `full` for any context block under 25k chars. Strip
+  // both `systemPrompt` AND the per-block `text` field; keep the count
+  // + cacheable split for diagnostics.
+  const sanitizedBlocks = blocks.map(({ text: _t, cacheable }) => ({ cacheable }))
+  const { systemPrompt: _sp, messages: _msgs, systemPromptBlocks: _spb, ...rest } = context
+  void _sp
+  void _msgs
+  void _spb
+  return {
+    ...rest,
+    // Type assertion: AssembledContext.systemPromptBlocks has the
+    // SystemPromptBlock shape (with `text`); we strip `text` and expose
+    // only `{ cacheable }` markers per RedactedContextBlock.
+    systemPromptBlocks: sanitizedBlocks as RedactedContextBlock[] | undefined,
+    redaction: {
+      systemPromptChars,
+      messageCount,
+      messageChars,
+      blockCount,
+      cacheableBlockCount,
+    },
+  }
 }

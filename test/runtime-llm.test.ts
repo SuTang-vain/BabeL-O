@@ -29,7 +29,6 @@ const CONFIG_ENV_KEYS = [
   'BABEL_O_CONFIG_FILE',
   'BABEL_O_TEST_CONFIG_WRITE_GUARD',
   'BABEL_O_SESSION_MEMORY_LITE',
-  'BABEL_O_NATURAL_PAUSE_SUPPRESS',
   'ANTHROPIC_API_KEY',
   'ANTHROPIC_BASE_URL',
   'OPENAI_API_KEY',
@@ -943,11 +942,11 @@ describe('LLMCodingRuntime', () => {
     assert.equal(headers?.['x-api-key'], 'anthropic-test-key')
   })
 
-  test('queues Session Memory Lite update after no-tool final response', async () => {
+  test('skips Session Memory Lite write on no-tool final response (post-natural_pause retirement)', async () => {
     process.env.BABEL_O_SESSION_MEMORY_LITE = '1'
-    // P0 default = suppressed; this test asserts natural_pause still
-    // fires when explicitly opted in via BABEL_O_NATURAL_PAUSE_SUPPRESS=false
-    process.env.BABEL_O_NATURAL_PAUSE_SUPPRESS = 'false'
+    // Post-R7: the per-turn non-tool summary path (`natural_pause`) was
+    // retired. A single-turn no-tool response now hits `insufficient_signal`
+    // and must NOT produce a memory file or a `session_memory_updated` event.
     const cwd = join(tmpdir(), `babel-o-runtime-session-memory-${Date.now()}-${Math.random()}`)
     const sessionId = 'test-session-memory-runtime'
     const storage = new MemoryStorage()
@@ -992,12 +991,10 @@ describe('LLMCodingRuntime', () => {
       await flushSessionMemoryLiteQueue()
 
       const memoryPath = join(cwd, '.babel-o/session-memory.md')
-      assert.equal(fs.existsSync(memoryPath), true)
-      const memoryText = fs.readFileSync(memoryPath, 'utf8')
-      assert.match(memoryText, /reactive pause/)
+      assert.equal(fs.existsSync(memoryPath), false)
 
       const persisted = await storage.listEvents(sessionId, { order: 'asc', limit: 10_000 })
-      assert.equal(persisted.events.filter(event => event.type === 'session_memory_updated').length, 1)
+      assert.equal(persisted.events.filter(event => event.type === 'session_memory_updated').length, 0)
     } finally {
       fs.rmSync(cwd, { recursive: true, force: true })
     }
@@ -1696,6 +1693,7 @@ describe('LLMCodingRuntime', () => {
         name: 'mcp:evercore:memory_save_note',
         input: { note: 'User prefers regression-first fixes.' },
       }),
+      createAnthropicTextStream('我不会写入这条长期记忆，因为权限请求已被拒绝。'),
     )
 
     const runtime = new LLMCodingRuntime(
@@ -1727,14 +1725,20 @@ describe('LLMCodingRuntime', () => {
       sessionId,
       prompt: '记住：我偏好 regression-first 修复。',
       cwd: tmpdir(),
+      runtimeHooks: [{
+        name: 'TestDenyMemorySavePermission',
+        events: ['PermissionRequest'],
+        run() {
+          return {
+            permissionDecision: {
+              approved: false,
+              reason: 'test denies write after observing permission gate',
+            },
+          }
+        },
+      }],
     })) {
       events.push(event)
-      if (event.type === 'permission_request') {
-        PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
-          approved: false,
-          reason: 'test denies write after observing permission gate',
-        })
-      }
     }
 
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
@@ -1752,6 +1756,7 @@ describe('LLMCodingRuntime', () => {
     assert.equal(addInputs.length, 0)
     assert.ok(events.some(event => event.type === 'permission_response' && event.approved === false))
     assert.ok(events.some(event => event.type === 'tool_denied' && event.name === 'mcp:evercore:memory_save_note' && event.recoverable === true))
+    assert.ok(events.some(event => event.type === 'result' && event.success === true))
   })
 
   test('permission denial is fed back to provider so it can adjust', async () => {
@@ -1777,15 +1782,21 @@ describe('LLMCodingRuntime', () => {
       prompt: 'write generated.txt',
       cwd: tmpdir(),
       policyMode: 'soft-deny',
+      runtimeHooks: [{
+        name: 'TestDenyWritePermission',
+        events: ['PermissionRequest'],
+        run() {
+          return {
+            permissionDecision: {
+              approved: false,
+              reason: 'user denied write for regression',
+              feedback: 'Do not retry Write; provide manual file content instead.',
+            },
+          }
+        },
+      }],
     })) {
       events.push(event)
-      if (event.type === 'permission_request') {
-        PendingPermissionRegistry.getInstance().resolve(sessionId, event.toolUseId, {
-          approved: false,
-          reason: 'user denied write for regression',
-          feedback: 'Do not retry Write; provide manual file content instead.',
-        })
-      }
     }
 
     assert.equal(fetchCalls.length, 2)
@@ -2551,13 +2562,13 @@ describe('LLMCodingRuntime', () => {
     const leakError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED') as any
     assert.ok(leakError)
     assert.equal(leakError.details.phase, 'final_response_only')
-    assert.equal(leakError.details.pattern, '<tool_call')
+    assert.match(leakError.details.pattern, /<\/?tool_call/)
 
     const metricsEvent = events.find(event => event.type === 'execution_metrics') as any
     assert.ok(metricsEvent)
     assert.equal(metricsEvent.toolCallTextLeakSuppressedCount, 1)
     assert.equal(metricsEvent.finalAnswerRetryCount, 1)
-    assert.equal(metricsEvent.toolShapedTextPattern, '<tool_call')
+    assert.match(metricsEvent.toolShapedTextPattern, /<\/?tool_call/)
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)
@@ -3011,8 +3022,8 @@ describe('LLMCodingRuntime', () => {
     const leakError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED') as any
     assert.ok(leakError)
     assert.equal(leakError.details.phase, 'respond_only')
-    assert.equal(leakError.details.pattern, '<tool_call')
-    assert.match(leakError.details.redactedPreview, /\[REDACTED\]/)
+    assert.match(leakError.details.pattern, /<\/?tool_call/)
+    assert.doesNotMatch(leakError.details.redactedPreview, /<command>pwd<\/command>/)
     assert.equal(leakError.details.retryAttempted, true)
 
     const secondBody = JSON.parse(String(fetchCalls[1].init?.body))

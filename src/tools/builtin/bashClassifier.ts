@@ -230,9 +230,67 @@ export function tokenizeBashCommand(command: string): string[] {
   return out
 }
 
+/**
+ * Build a length-aligned copy of `command` where every char that lives
+ * inside a single-quoted or double-quoted segment is replaced with a
+ * space. Outside-quote chars (and the quote chars themselves) are
+ * preserved verbatim.
+ *
+ * Used as the input to {@link findDangerousPattern} so the regex sweep
+ * only matches `;` / `|` / `>` / `<` / etc. that occur in *unquoted*
+ * regions. Quote-aware bug fix (2026-06-21): previously the regex ran
+ * on the raw command, so a SQL like
+ *   sqlite3 foo.db "SELECT * FROM t WHERE c = 'a;b'"
+ *   echo "x > y"
+ *   echo "SELECT 1;"
+ * fired `chained-semicolon` / `output-redirect` rules because the `;`,
+ * `>` inside quotes were treated as live shell operators. Real e2e
+ * (session_ea4f1793 sqlite3 deny cascade) caught this: the deny message
+ * said `chained-semicolon` for a fully-quoted SQL literal, which
+ * confused the model's reasoning about why the call was rejected.
+ *
+ * The mask preserves length so any regex match positions align with
+ * the original command for error reporting (we only use the regex
+ * boolean test + rule name; we never report match positions).
+ *
+ * Note: backslash-escapes inside double quotes (`"\;"`) are handled
+ * by masking the `\` too — the regex doesn't need to look at the
+ * escape sequence anyway. Single quotes have no escapes in POSIX
+ * shell. The mask does NOT model `$()` command substitution
+ * (`echo $(rm -rf /)`); that path is already caught earlier by
+ * DANGEROUS_PATTERNS `command-substitution-dollar-paren` because the
+ * `$(` and the closing `)` both live in unquoted regions.
+ */
+function maskQuotedSegments(command: string): string {
+  let out = ''
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i]
+    if (quote) {
+      if (ch === quote) {
+        quote = null
+        out += ch // keep the closing quote
+        continue
+      }
+      // Char lives inside a quote — mask it. Preserve length so
+      // regex match positions stay aligned with the raw string.
+      out += ch === '\t' || ch === '\n' ? ch : ' '
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      out += ch // keep the opening quote
+      continue
+    }
+    out += ch
+  }
+  return out
+}
+
 function findDangerousPattern(command: string): string | null {
+  const masked = maskQuotedSegments(command)
   for (const { pattern, rule } of DANGEROUS_PATTERNS) {
-    if (pattern.test(command)) return rule
+    if (pattern.test(masked)) return rule
   }
   return null
 }

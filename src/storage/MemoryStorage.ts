@@ -40,6 +40,15 @@ export class MemoryStorage implements NexusStorage {
     if (existing && cloned.events.length === 0) {
       cloned.events = structuredClone(existing.events)
     }
+    // Bug 2 (context-cwd-drift plan §13.4): originCwd is immutable. Once
+    // set at session creation it must survive subsequent saveSession calls
+    // even if the caller's SessionSnapshot omits it (e.g. an older caller
+    // that doesn't know the field) or carries a different value (drift
+    // must not propagate to origin). Mirrors SqliteStorage's ON CONFLICT
+    // clause which does not update origin_cwd.
+    if (existing?.originCwd && !cloned.originCwd) {
+      cloned.originCwd = existing.originCwd
+    }
     this.sessions.set(session.sessionId, cloned)
   }
 

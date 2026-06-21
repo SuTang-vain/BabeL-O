@@ -208,9 +208,29 @@ export class OpenAIAdapter implements ModelAdapter {
       if (!delta) continue
 
       if (delta.content) {
-        yield {
-          type: 'text',
-          text: delta.content,
+        // Path 1 fix (2026-06-21): some providers (DeepSeek V4
+        // observed in real e2e session_ff3a874d-4d25-4e53-b0eb-02744b6bfaa2)
+        // emit the entire assistant answer as a single large
+        // `delta.content` AFTER all `delta.reasoning_content`
+        // chunks. The Go TUI then sees one giant assistant_delta
+        // frame at the end of the turn and renders it as a
+        // non-progressive dump — the operator can't see the model
+        // "writing". Split long content deltas at sentence / clause
+        // / word boundaries so the TUI gets multiple smaller frames
+        // and can show progressive text.
+        //
+        // Threshold: only chunk deltas > 50 chars; small deltas are
+        // emitted verbatim to avoid fragmenting normal streaming
+        // providers. The same chunker is shared with AnthropicAdapter
+        // — defined inline here to avoid a cross-adapter dependency.
+        const content = delta.content
+        if (content.length > 50) {
+          yield* chunkOpenAITextDelta(content)
+        } else {
+          yield {
+            type: 'text',
+            text: content,
+          }
         }
       }
 
@@ -311,4 +331,51 @@ function validateOpenAIToolMessageSequence(messages: any[]): void {
 
 function mapOpenAIFinishReason(reason: string): FinishReason {
   return (OPENAI_FINISH_MAP[reason] || reason) as FinishReason
+}
+
+/**
+ * Path 1 helper (2026-06-21): identical algorithm to
+ * AnthropicAdapter.chunkTextDelta. See AnthropicAdapter for the
+ * full rationale. Duplicated here to avoid a cross-adapter
+ * import dependency; both adapters stay self-contained.
+ */
+function* chunkOpenAITextDelta(input: string): Generator<{ type: 'text'; text: string }> {
+  if (input.length <= 50) {
+    yield { type: 'text', text: input }
+    return
+  }
+  const boundaries: Array<{ re: RegExp; priority: number }> = [
+    { re: /\n\n+/g, priority: 0 },
+    { re: /[.!?]+\s*/g, priority: 1 },
+    { re: /[,;:]+\s*/g, priority: 2 },
+    { re: /\s+/g, priority: 3 },
+  ]
+  let remaining = input
+  while (remaining.length > 50) {
+    const windowEnd = Math.max(20, remaining.length - 30)
+    let chosen: { priority: number; index: number; len: number } | null = null
+    for (const b of boundaries) {
+      b.re.lastIndex = 20
+      const m = b.re.exec(remaining)
+      if (m && m.index >= 20 && m.index <= windowEnd) {
+        if (chosen === null || b.priority < chosen.priority ||
+            (b.priority === chosen.priority && m.index < chosen.index)) {
+          chosen = { priority: b.priority, index: m.index, len: m[0].length }
+        }
+      }
+    }
+    let cutAt: number
+    let cutLen: number
+    if (chosen !== null) {
+      cutAt = chosen.index
+      cutLen = chosen.len
+    } else {
+      cutAt = 60
+      cutLen = 0
+    }
+    const chunk = remaining.slice(0, cutAt + cutLen)
+    if (chunk.length > 0) yield { type: 'text', text: chunk }
+    remaining = remaining.slice(cutAt + cutLen)
+  }
+  if (remaining.length > 0) yield { type: 'text', text: remaining }
 }

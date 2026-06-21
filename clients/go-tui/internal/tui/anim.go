@@ -23,11 +23,12 @@ var (
 type runtimeAnimationKind string
 
 const (
-	runtimeAnimationDefault    runtimeAnimationKind = "default"
-	runtimeAnimationThinking   runtimeAnimationKind = "thinking"
-	runtimeAnimationResponding runtimeAnimationKind = "responding"
-	runtimeAnimationTool       runtimeAnimationKind = "tool"
-	runtimeAnimationPermission runtimeAnimationKind = "permission"
+	runtimeAnimationDefault      runtimeAnimationKind = "default"
+	runtimeAnimationThinking     runtimeAnimationKind = "thinking"
+	runtimeAnimationSynthesizing runtimeAnimationKind = "synthesizing"
+	runtimeAnimationResponding   runtimeAnimationKind = "responding"
+	runtimeAnimationTool         runtimeAnimationKind = "tool"
+	runtimeAnimationPermission   runtimeAnimationKind = "permission"
 )
 
 type runtimeAnimationCacheKey struct {
@@ -219,6 +220,18 @@ func runtimeAnimationPalette(kind runtimeAnimationKind) (colorful.Color, colorfu
 	case runtimeAnimationThinking:
 		c1, _ := colorful.Hex("#8b5cf6")
 		c2, _ := colorful.Hex("#ff5faf")
+		c3, _ := colorful.Hex("#5fffff")
+		return c1, c2, c3
+	case runtimeAnimationSynthesizing:
+		// Bridge palette between thinking (purple/pink) and responding
+		// (cyan/blue) — visually signals the model finished reasoning
+		// and is composing its final reply, but no `assistant_delta`
+		// has arrived yet. Some providers (Anthropic-compatible DeepSeek
+		// V4 included) batch the entire assistant text into a single
+		// delta after thinking, leaving a visible "dead air" gap that
+		// otherwise flickers to "agent runtime" / "agent writing".
+		c1, _ := colorful.Hex("#7dd3fc")
+		c2, _ := colorful.Hex("#a78bfa")
 		c3, _ := colorful.Hex("#5fffff")
 		return c1, c2, c3
 	case runtimeAnimationResponding:

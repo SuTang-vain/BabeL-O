@@ -37,6 +37,7 @@ export type ExploreAgentSchedulerOptions = {
   now?: () => string
   executionEnvironment?: 'local' | 'remote'
   remoteRunner?: RemoteToolRunner
+  configManager?: ConfigManager
   maxConcurrentAgents?: number
   maxDepth?: number
 }
@@ -47,6 +48,7 @@ export type ExploreAgentRuntimeFactoryOptions = {
   storage: NexusStorage
   executionEnvironment?: 'local' | 'remote'
   remoteRunner?: RemoteToolRunner
+  configManager?: ConfigManager
 }
 
 type RunningAgent = {
@@ -78,7 +80,8 @@ export class ExploreAgentScheduler implements AgentScheduler {
     this.storage = options.storage
     this.cwd = options.cwd
     this.registry = options.registry ?? new AgentJobRegistry({ now: options.now })
-    this.runtimeFactory = options.runtimeFactory ?? createExploreRuntime
+    this.runtimeFactory = options.runtimeFactory ?? (runtimeOptions =>
+      createExploreRuntime({ ...runtimeOptions, configManager: options.configManager }))
     this.now = options.now ?? nowIso
     this.executionEnvironment = options.executionEnvironment
     this.remoteRunner = options.remoteRunner
@@ -429,11 +432,12 @@ export function createExploreRuntime(options: ExploreAgentRuntimeFactoryOptions)
     tools.set('Bash', createRestrictedAgentBashTool(options.agentType, tools.get('Bash')))
   }
   const policy = allowlistedTools(options.allowedTools)
-  const settings = ConfigManager.getInstance().resolveSettings()
+  const configManager = options.configManager ?? ConfigManager.getInstance()
+  const settings = configManager.resolveSettings()
   if (settings.providerId === 'local') {
-    return new LocalCodingRuntime(tools, policy, options.storage, ConfigManager.getInstance().load().hooks)
+    return new LocalCodingRuntime(tools, policy, options.storage, configManager.load().hooks)
   }
-  return new LLMCodingRuntime(tools, policy, options.storage, ConfigManager.getInstance())
+  return new LLMCodingRuntime(tools, policy, options.storage, configManager)
 }
 
 export function normalizeAgentResult(events: NexusEvent[], allowedTools: string[]): AgentResult {

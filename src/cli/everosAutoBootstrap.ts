@@ -6,11 +6,11 @@ import {
 import {
   inspectEverOSPrerequisites,
   type EverOSPrerequisiteReport,
-} from './everosPrerequisites.js'
+} from '../runtime/everosPrerequisites.js'
 import {
   startEverOSBackgroundBootstrap,
   type EverOSBackgroundBootstrapHandle,
-} from './everosBackgroundBootstrap.js'
+} from '../runtime/everosBackgroundBootstrap.js'
 
 /**
  * Reasons the runtime might (or might not) start a background

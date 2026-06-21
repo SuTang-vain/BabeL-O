@@ -1,6 +1,5 @@
 import { z } from 'zod'
-import { existsSync, lstatSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import { logger } from '../shared/logger.js'
@@ -12,7 +11,7 @@ import type {
 } from './Runtime.js'
 import { allowAllTools, allowlistedTools, type ToolPolicy } from './LocalCodingRuntime.js'
 import { buildPerRequestAllowedToolsPolicy } from './perRequestPolicy.js'
-import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath } from './systemPromptBuilder.js'
+import { buildSystemPromptSections, sectionsToPromptText, extractAbsolutePaths, resolvePromptPath, resolvePromptCwd } from './systemPromptBuilder.js'
 import { deriveSessionRootContinuity, buildSessionRootContinuityMessage } from './sessionRootContinuity.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { getAdapter } from '../providers/registry.js'
@@ -21,26 +20,38 @@ import type {
   ContentBlock,
 } from '../providers/adapters/ModelAdapter.js'
 import { ConfigManager } from '../shared/config.js'
+import { mapEventsToMessages } from './eventsTranslator.js'
+import { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'
+import { loadWorkingSetOverride } from './loadWorkingSetOverride.js'
+import { applyWorkingSetUpdate } from './applyWorkingSetUpdate.js'
+import { emitMemoryRetrieval as emitMemoryRetrievalImpl } from './emitMemoryRetrieval.js'
+import { prepareRuntimeStart } from './prepareRuntimeStart.js'
+import { buildPostRefreshYieldEvents } from './buildPostRefreshYieldEvents.js'
+import { buildContextRefreshClosureSet } from './buildContextRefreshClosureSet.js'
+import { executePreLoopCompactSequence } from './executePreLoopCompactSequence.js'
+import { executeProviderLoopCompactBlock } from './executeProviderLoopCompactBlock.js'
+import { applyProviderOutcome } from './applyProviderOutcome.js'
+import { executeToolDispatch } from './executeToolDispatch.js'
+import { applyLeakSuppressionEffects } from './applyLeakSuppressionEffects.js'
+import { executeProviderRecoveryDecision } from './executeProviderRecoveryDecision.js'
 import {
   buildCompactFailureEvent,
   compactSession,
 } from './compact.js'
-import { buildTaskScopeDeclaredEvent, deriveTaskScope } from './taskScope.js'
+import { buildTaskScopeDeclaredEvent, deriveTaskScope, type TaskScopeDeclaredEvent } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
-import {
-  buildTraceContext,
-  detectTriggers,
-  deriveRuleSelfAssessment,
-  flushBehaviorTraceQueue,
-  isBehaviorTraceEnabled,
-  queueBehaviorTraceEntry,
-} from './behaviorTrace.js'
+// `wrapWithBehaviorTraceTap` (and its private `behaviorTraceDetectionKey`
+// helper) were extracted to `./behaviorTraceTap.ts` in Phase 3B-6; the
+// underlying behaviorTrace primitives it composes (buildTraceContext /
+// detectTriggers / deriveRuleSelfAssessment / flushBehaviorTraceQueue /
+// isBehaviorTraceEnabled / queueBehaviorTraceEntry) are now imported
+// inside that module instead of here.
 import { estimateContextTokens } from './tokenEstimator.js'
 import { classifyProviderRecovery } from './providerRecovery.js'
 // PR-A2: optional broadcaster type for the /v1/context/observe observer.
 // Imported as a type-only reference to keep the runtime-side hot path
 // paying no cost for the field.
-import type { ContextBroadcaster } from './contextBroadcasterSingleton.js'
+import type { RuntimeContextBroadcaster } from './contextBroadcaster.js'
 import {
   createReplacementState,
   enforceMessageBudget,
@@ -58,7 +69,6 @@ import {
   buildContextBlockingEvents,
   buildContextMicrocompactEvent,
   buildContextRecoveryAttemptedEvent,
-  buildContextGroundingConfirmedEventForToolResult,
   buildPostCompactGroundingEvents,
   buildContextUsageEvent,
   buildContextWarningEvent,
@@ -74,23 +84,24 @@ import {
   isOptionSelectionClarificationText,
   normalizeOptionSelection,
   reduceProviderTurnOutcome,
-  refreshRuntimeContextState,
-  resolveProviderToolCallInput,
-  streamProviderTurn,
   type RuntimeProviderTurn,
 } from './runtimePipeline.js'
-import { executeProviderToolCall, type ReadFileCacheEntry } from './runtimeToolLoop.js'
+import { ContextRefreshStrategy } from './ContextRefreshStrategy.js'
+import { ProviderTurnDriver } from './ProviderTurnDriver.js'
+import { ToolDispatchPipeline } from './ToolDispatchPipeline.js'
+import { type ReadFileCacheEntry } from './runtimeToolLoop.js'
 import { executeRuntimeHooks, type RuntimeHookInput } from './hooks.js'
 import type { MemoryProvider, MemoryProviderDiagnostics } from './memoryProvider.js'
 // PR-A4: resume() class method imports — see long-running-context-
 // assembly.md §6.2 for the 3-step flow.
-import type { PersistedWorkingSetTracker } from '../nexus/persistedWorkingSetTracker.js'
-import type { BehaviorMonitor } from '../nexus/behaviorMonitor.js'
-import { deriveEntriesFromEvents } from '../nexus/workingSetTracker.js'
+import type { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import type { BehaviorMonitor } from './behaviorMonitor.js'
+import { deriveEntriesFromEvents } from './workingSetTracker.js'
 import { formatWorkingSet } from './workingSet.js'
 import { formatHint } from './formatHint.js'
 import type { AssembledContext } from './contextAssembler.js'
-import type { WorkingSet } from '../nexus/workingSetTracker.js'
+import type { WorkingSet } from './workingSetTracker.js'
+import { ProviderSessionRules } from './providerSessionRules.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -98,9 +109,14 @@ function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
 }
 
-export type MapEventsToMessagesOptions = {
-  replayReasoningContent?: boolean
-}
+// `mapEventsToMessages` and `MapEventsToMessagesOptions` were extracted
+// to `./eventsTranslator.ts` in Phase 3B-1. We re-export them here so
+// legacy import paths (`from '../runtime/LLMCodingRuntime.js'` for
+// `mapEventsToMessages`) keep working without forcing every consumer
+// to migrate in lockstep. New code should import directly from
+// `./eventsTranslator.js`.
+export { mapEventsToMessages } from './eventsTranslator.js'
+export type { MapEventsToMessagesOptions } from './eventsTranslator.js'
 
 export class LLMCodingRuntime implements NexusRuntime {
   private readFileCache = new Map<string, ReadFileCacheEntry>()
@@ -111,14 +127,11 @@ export class LLMCodingRuntime implements NexusRuntime {
     private readonly storage: NexusStorage,
     private readonly configManager: ConfigManager = ConfigManager.getInstance(),
     private readonly memoryProvider?: MemoryProvider,
-    // PR-A2: optional per-instance ContextBroadcaster. The runtime
-    // hot path (refreshRuntimeContextState in runtimePipeline.ts) uses
-    // the module-level defaultContextBroadcaster singleton, so this
-    // field is intentionally unused in the hot path. It exists so
-    // production factories can attach a custom broadcaster if/when the
-    // architecture moves off the singleton. Defaulting to undefined
-    // preserves all 39+ existing test instantiations.
-    private readonly contextBroadcaster?: ContextBroadcaster,
+    // Phase 2B: optional per-instance broadcaster injected by the
+    // composition root. When omitted, context publishing is disabled
+    // for this runtime instance; no Nexus singleton is read from the
+    // runtime hot path.
+    private readonly contextBroadcaster?: RuntimeContextBroadcaster,
     // PR-A4: optional resume dependencies. When provided, the public
     // resume() method is enabled; when omitted, calling resume() throws
     // a clear "not configured" error. The four closures are the same
@@ -138,6 +151,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       ) => string
       mapEventsToMessages: (events: NexusEvent[], initialPrompt: string) => ModelMessage[]
     },
+    private readonly providerSessionRules: ProviderSessionRules = new ProviderSessionRules(),
   ) {}
 
   /**
@@ -145,7 +159,7 @@ export class LLMCodingRuntime implements NexusRuntime {
    * if not provided). Tests and production wiring can read this to
    * inject a custom broadcaster.
    */
-  getContextBroadcaster(): ContextBroadcaster | undefined {
+  getContextBroadcaster(): RuntimeContextBroadcaster | undefined {
     return this.contextBroadcaster
   }
 
@@ -235,54 +249,32 @@ export class LLMCodingRuntime implements NexusRuntime {
    * provider/tool turn writes a `memory_retrieval` NexusEvent —
    * not just the GET `/v1/sessions/:id/context` inspection route.
    *
-   * Fire-and-forget: any throw is swallowed so the hot path stays
-   * unaffected. The dashboard degrades to "fewer events" rather
-   * than 5xx when storage is degraded. This is consistent with
-   * the v1 contract that §3.5 metrics are a recent-window
-   * dashboard signal, not a durability-critical audit.
+   * The implementation lives in `emitMemoryRetrieval.ts` (Phase 3B-9
+   * helper extraction). This class field is a thin delegate so
+   * the existing call sites at `onMemoryRetrieval: this.emitMemoryRetrieval`
+   * (6 refresh sites) keep the same method-binding shape.
    */
-  private readonly emitMemoryRetrieval = async (input: {
+  private readonly emitMemoryRetrieval = (input: {
     sessionId: string
     cwd: string
     prompt: string
     diagnostics: MemoryProviderDiagnostics
   }): Promise<void> => {
-    if (!this.memoryProvider) return
-    const d = input.diagnostics
-    const autoSearch = d.autoSearch
-    const event: NexusEvent = {
-      ...eventBase(input.sessionId),
-      type: 'memory_retrieval',
-      provider: d.provider,
-      enabled: d.enabled,
-      scope: d.scope,
-      ...(d.namespaceId && { namespaceId: d.namespaceId }),
-      ...(d.namespaceSource && { namespaceSource: d.namespaceSource }),
-      ...(d.isolationKey && { isolationKey: d.isolationKey }),
-      autoSearchTriggered: autoSearch?.triggered ?? false,
-      autoSearchReason: autoSearch?.reason ?? 'no_memory_cue',
-      ...(autoSearch?.cue && { autoSearchCue: autoSearch.cue }),
-      hitCount: d.hitCount,
-      injectedChars: d.injectedChars,
-      budgetChars: d.budgetChars,
-      maxHitChars: d.maxHitChars,
-      truncated: d.truncated,
-      ...(d.searchLatencyMs !== undefined && { searchLatencyMs: d.searchLatencyMs }),
-      ...(d.error && { error: d.error }),
-      prompt: input.prompt,
-      cwd: input.cwd,
-    }
-    try {
-      await this.storage.appendEvent(input.sessionId, event)
-    } catch (error) {
-      // never break the hot path on a metrics write failure
-      process.stderr.write(
-        `[LLMCodingRuntime] memory_retrieval event append failed: ${error instanceof Error ? error.message : String(error)}\n`,
-      )
-    }
+    return emitMemoryRetrievalImpl(this.memoryProvider, this.storage, input)
   }
 
   private async *runExecuteStreamInner(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    // Phase C2 of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md §11.
+    // Propagate the runtime's own storage into RuntimeExecuteOptions so that
+    // context tools (contextSearch / contextRecent / contextSummarize) receive
+    // a non-null ToolContext.storage. session_10320709 proved that without
+    // this, a storage-backed Nexus session still returns
+    // CONTEXT_STORAGE_UNAVAILABLE because executeToolSafely builds ToolContext
+    // from RuntimeExecuteOptions.storage (which Nexus does not always set),
+    // even though this.storage exists. Mirrors LocalCodingRuntime's injection.
+    if (!options.storage && this.storage) {
+      options = { ...options, storage: this.storage }
+    }
     // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
     // Use the continuity-aware resolver when the caller has supplied
     // session context. Falls through to the simple 2-arg heuristic
@@ -301,6 +293,25 @@ export class LLMCodingRuntime implements NexusRuntime {
           cwd: resolveCwdFromPrompt(options.prompt, options.cwd),
           continuity: null,
         }
+    // R2 of docs/nexus/reference/long-running-context-assembly.md §20:
+    // load the persisted Nexus-owned working set for this session+cwd so
+    // the hot-path refreshRuntimeContextState calls include it as a
+    // provider-visible block. Previously every refresh re-derived a
+    // transient working set from the event slice; the persisted tracker
+    // was only consulted in resume() and via REST GET. After R2, a
+    // successful tool event updates the tracker and the next refresh
+    // surfaces it (R7 acceptance: "Next turn includes a provider-visible
+    // Working Set: block derived from persisted tracker state").
+    //
+    // The load is best-effort and idempotent: createRuntime pre-loads
+    // once at boot, so on the hot path we only re-load when the cwd
+    // changes mid-session (rare; e.g. user acceptance of a parent_scan
+    // boundary). For the common case, the in-memory tracker state is
+    // already correct. The result is awaited once here and threaded
+    // into every refreshRuntimeContextState call below; subsequent
+    // updates (from successful tool events) are applied in-place via
+    // applyWorkingSetUpdate so the next refresh picks them up.
+    const workingSetOverride = await this.loadWorkingSetOverride(options.sessionId, resolvedCwd)
     if (resolvedCwd !== options.cwd) {
       options.cwd = resolvedCwd
     }
@@ -344,80 +355,64 @@ export class LLMCodingRuntime implements NexusRuntime {
         model: options.model,
       })
 
-      // 2. Load previous session events from storage (if any)
-      let previousEvents: NexusEvent[] = []
-      if (this.storage && options.replaySessionHistory !== false) {
-        try {
-          const result = await this.storage.listEvents(options.sessionId, {
-            order: 'desc',
-            limit: 1000,
-          })
-          previousEvents = [...(result?.events || [])].reverse()
-        } catch (e) {
-          logger.debug('Failed to load previous session events from storage', e)
-        }
-      }
-
       // Strip optional [1m] tag from canonical model name
       const activeModel = options.model || settings.modelId
       const cleanedModelId = activeModel.replace(/\[1m\]$/i, '')
       const adapter = getAdapter(settings.providerId)
+
+      // 2. Load previous session events + build intake + task scope
+      //    + per-request closures. The implementation lives in
+      //    `prepareRuntimeStart.ts` (Phase 3B-10 helper extraction);
+      //    this call site owns the shouldReplayReasoningContent
+      //    decision (model-specific) and yields the events.
       const shouldReplayReasoningContent =
         cleanedModelId.includes('deepseek') ||
         settings.modelId.includes('deepseek') ||
         settings.providerId === 'deepseek' ||
         Boolean(settings.baseUrl?.includes('deepseek'))
-      const mapEventsForProvider = (events: NexusEvent[], initialPrompt: string): ModelMessage[] =>
-        mapEventsToMessages(events, initialPrompt, {
-          replayReasoningContent: shouldReplayReasoningContent,
-        })
-
-      const intakeEvent = await buildUserIntakeGuidanceEvent({
+      const start = await prepareRuntimeStart({
+        options,
+        deps: {
+          storage: this.storage,
+          tools: this.tools,
+          toolPolicy: this.toolPolicy,
+          logger,
+        },
+        settings: {
+          providerId: settings.providerId,
+          modelId: settings.modelId,
+          apiKey: settings.apiKey,
+          baseUrl: settings.baseUrl,
+        },
+        cleanedModelId,
         adapter,
-        modelId: cleanedModelId,
-        apiKey: settings.apiKey,
-        baseUrl: settings.baseUrl,
-        sessionId: options.sessionId,
-        events: previousEvents,
-        latestPrompt: options.prompt,
-        cwd: options.cwd,
-        signal: options.signal,
+        shouldReplayReasoningContent,
       })
-      yield intakeEvent
-      previousEvents = [...previousEvents, intakeEvent]
-      const confirmedOptionSelection = isConfirmedOptionSelectionAfterClarification(previousEvents, options.prompt)
-      let taskScopeEvent = buildTaskScopeDeclaredEvent({
-        sessionId: options.sessionId,
-        requestId: options.requestId,
-        cwd: options.cwd,
-        prompt: options.prompt,
-        events: previousEvents,
-        allowedPaths: options.allowedPaths,
+      yield start.intakeEvent
+      yield start.taskScopeEvent
+      let previousEvents = start.previousEvents
+      let taskScopeEvent: TaskScopeDeclaredEvent = start.taskScopeEvent as TaskScopeDeclaredEvent
+      const mapEventsForProvider = start.mapEventsForProvider
+      const toolsList = start.toolsList
+      const confirmedOptionSelection = start.confirmedOptionSelection
+      const contextRefreshStrategy = new ContextRefreshStrategy({
+        storage: this.storage,
+        memoryProvider: this.memoryProvider,
+        contextBroadcaster: this.contextBroadcaster,
       })
-      yield taskScopeEvent
-      previousEvents = [...previousEvents, taskScopeEvent]
-
-      const toolsList = () => [...this.tools.values()]
-        .filter(tool => this.toolPolicy.isAllowed(tool) || (
-          options.policyMode === 'soft-deny' &&
-          (tool.risk === 'write' || tool.risk === 'execute')
-        ))
-        .map(tool => ({
-          name: tool.name,
-          description: tool.prompt ? tool.prompt() : tool.description,
-          inputSchema: tool.modelInputSchema ?? z.toJSONSchema(tool.inputSchema),
-        }))
-      const loadSessionInbox = async () => {
-        try {
-          return await this.storage.listSessionInbox(options.sessionId, { limit: 20 })
-        } catch (error) {
-          logger.debug('Failed to load session inbox from storage', error)
-          return []
-        }
-      }
+      const providerTurnDriver = new ProviderTurnDriver()
+      const toolDispatchPipeline = new ToolDispatchPipeline({
+        tools: this.tools,
+        toolPolicy: this.toolPolicy,
+        storage: this.storage,
+        metrics,
+        readFileCache: this.readFileCache,
+        providerSessionRules: this.providerSessionRules,
+        applyWorkingSetUpdate: (sessionId, events, cwd) => this.applyWorkingSetUpdate(sessionId, events, cwd),
+      })
       const contextWarningPercent = 70
       const contextCompactPercent = 90
-      let contextRefreshState = await refreshRuntimeContextState({
+      let contextRefreshState = await contextRefreshStrategy.refresh({
         runtimeOptions: options,
         events: previousEvents,
         modelId: cleanedModelId,
@@ -427,8 +422,13 @@ export class LLMCodingRuntime implements NexusRuntime {
         warningPercent: contextWarningPercent,
         compactPercent: contextCompactPercent,
         suppressToolsForIntent: shouldSuppressToolsForIntent,
-        memoryProvider: this.memoryProvider,
         onMemoryRetrieval: this.emitMemoryRetrieval,
+        // R2: thread the persisted workingSetOverride through the
+        // hot-path refresh so the provider-visible Working Set: block
+        // is sourced from the Nexus-owned tracker (not the transient
+        // event-slice derive that assembleContext falls back to when
+        // this field is undefined).
+        workingSetOverride,
       })
       let assembledContext = contextRefreshState.assembledContext
       let messages = contextRefreshState.messages
@@ -447,30 +447,32 @@ export class LLMCodingRuntime implements NexusRuntime {
         cacheAwareCompactPolicy,
         source: 'initial_refresh',
       })
-      const estimateVisibleContextTokens = () => estimateContextTokens({
-        systemPrompt: assembledContext.systemPrompt,
-        messages,
-        tools: modelVisibleTools,
-        conservative: true,
-      }).totalTokens
-      const applyContextRefreshState = (nextState: typeof contextRefreshState) => {
-        contextRefreshState = nextState
-        assembledContext = nextState.assembledContext
-        messages = nextState.messages
-        currentToolsList = nextState.currentToolsList
-        modelVisibleTools = nextState.modelVisibleTools
-        contextWindowState = nextState.contextWindowState
-        cacheAwareCompactPolicy = nextState.cacheAwareCompactPolicy
-        absorbCacheAwareCompactPolicyMetrics(metrics, cacheAwareCompactPolicy)
-      }
-      const contextMicrocompactEvent = (trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget') => buildContextMicrocompactEvent({
-        sessionId: options.sessionId,
-        requestId: options.requestId,
-        trigger,
-        metrics: assembledContext.microcompactMetrics,
-      })
-      const refreshAfterProviderContextRecovery = async () => {
-        applyContextRefreshState(await refreshRuntimeContextState({
+      // Per-request closure bundle for the rest of the
+      // turn. The implementation lives in
+      // `buildContextRefreshClosureSet.ts` (Phase 3B-12
+      // helper extraction). The factory reads / writes
+      // the 7 `let` state variables through the state
+      // bundle so the inline closure definitions can
+      // move out of the main loop body.
+      const refreshClosures = buildContextRefreshClosureSet({
+        state: {
+          getAssembledContext: () => assembledContext,
+          getMessages: () => messages,
+          getModelVisibleTools: () => modelVisibleTools,
+          getContextWindowState: () => contextWindowState,
+          setContextRefreshState: (nextState) => {
+            contextRefreshState = nextState
+            assembledContext = nextState.assembledContext
+            messages = nextState.messages
+            currentToolsList = nextState.currentToolsList
+            modelVisibleTools = nextState.modelVisibleTools
+            contextWindowState = nextState.contextWindowState
+            cacheAwareCompactPolicy = nextState.cacheAwareCompactPolicy
+          },
+        },
+        metrics,
+        refreshStrategy: contextRefreshStrategy,
+        refreshOptions: {
           runtimeOptions: options,
           events: previousEvents,
           modelId: cleanedModelId,
@@ -480,159 +482,107 @@ export class LLMCodingRuntime implements NexusRuntime {
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
           suppressToolsForIntent: shouldSuppressToolsForIntent,
-          memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-          sessionInbox: await loadSessionInbox(),
-        }))
-      }
-      const postCompactGroundingEvents = (source: 'post_compact' | 'context_recovery', boundaryId?: string) => {
-        this.readFileCache.clear()
-        return buildPostCompactGroundingEvents({
-          sessionId: options.sessionId,
-          requestId: options.requestId,
-          source,
-          boundaryId,
-          gitStatus: assembledContext.gitStatus,
-        })
-      }
-      const initialMicrocompactEvent = contextMicrocompactEvent('initial_refresh')
-      if (initialMicrocompactEvent) yield initialMicrocompactEvent
-      if (contextWindowState.isWarning || autoCompactDecision.fuseOpen) {
-        const compactPercent = autoCompactDecision.enabled
-          ? autoCompactDecision.thresholdPercent
-          : contextCompactPercent
-        yield buildContextWarningEvent({
-          sessionId: options.sessionId,
-          modelId: cleanedModelId,
-          windowState: contextWindowState,
-          thresholdPercent: compactPercent,
-          message: autoCompactDecision.fuseOpen
-            ? `Auto compact is paused after ${autoCompactDecision.failureCount} consecutive failures. Run /compact manually or inspect compact_failure events.`
-            : contextWindowState.isCompact
-              ? `Context has passed the compact threshold (${compactPercent}%). Auto-compact will trigger on this turn.`
-              : `Context is approaching the compact threshold (${contextWarningPercent}%→${compactPercent}%). Consider /compact soon.`,
-          cacheAwareCompactPolicy,
-        })
-      }
+          onMemoryRetrieval: this.emitMemoryRetrieval,
+          workingSetOverride,
+        },
+        readFileCache: this.readFileCache,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+      })
+      const {
+        estimateVisibleContextTokens,
+        applyContextRefreshState,
+        contextMicrocompactEvent,
+        refreshAfterProviderContextRecovery,
+        postCompactGroundingEvents,
+      } = refreshClosures
+      // Initial post-refresh yield sequence (microcompact
+      // + warning). The list is built by the
+      // `buildPostRefreshYieldEvents` factory (Phase 3B-11
+      // helper extraction) so the main loop's first refresh
+      // step reads as a single ordered yield.
+      for (const e of buildPostRefreshYieldEvents({
+        assembledContext,
+        contextWindowState,
+        autoCompactDecision,
+        cacheAwareCompactPolicy,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        modelId: cleanedModelId,
+        contextWarningPercent,
+        contextCompactPercent,
+      })) yield e
       let compactAttempted = false
-      if (autoCompactDecision.shouldCompact) {
-        compactAttempted = true
-        try {
-          const compactResult = await compactSession({
-            storage: this.storage,
-            sessionId: options.sessionId,
-            modelId: cleanedModelId,
-            trigger: 'auto',
-            mapEventsToMessages: mapEventsForProvider,
-            initialPrompt: options.prompt,
-          })
-          absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-          yield compactResult.event
-          yield compactResult.contextEvent
-          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-          for (const groundingEvent of groundingEvents) yield groundingEvent
-          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await refreshRuntimeContextState({
-            runtimeOptions: options,
-            events: previousEvents,
-            modelId: cleanedModelId,
-            buildSystemPrompt,
-            mapEventsToMessages: mapEventsForProvider,
-            tools: toolsList,
-            warningPercent: contextWarningPercent,
-            compactPercent: contextCompactPercent,
-            suppressToolsForIntent: shouldSuppressToolsForIntent,
-            memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: await loadSessionInbox(),
-          }))
-          autoCompactDecision = contextRefreshState.autoCompactDecision
-          yield buildContextUsageEvent({
-            sessionId: options.sessionId,
-            requestId: options.requestId,
-            modelId: cleanedModelId,
-            providerId: settings.providerId,
-            windowState: contextWindowState,
-            cacheAwareCompactPolicy,
-            source: 'after_compact',
-          })
-          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-        } catch (error) {
-          yield buildCompactFailureEvent({
-            sessionId: options.sessionId,
-            trigger: 'auto',
-            modelId: cleanedModelId,
-            failureCount: autoCompactDecision.failureCount + 1,
-            maxFailures: autoCompactDecision.failureLimit,
-            message: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      if (contextWindowState.isBlocking && !compactAttempted) {
-        compactAttempted = true
-        try {
-          const compactResult = await compactSession({
-            storage: this.storage,
-            sessionId: options.sessionId,
-            modelId: cleanedModelId,
-            trigger: 'reactive',
-            mapEventsToMessages: mapEventsForProvider,
-            initialPrompt: options.prompt,
-          })
-          absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-          yield compactResult.event
-          yield compactResult.contextEvent
-          const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-          for (const groundingEvent of groundingEvents) yield groundingEvent
-          previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-          applyContextRefreshState(await refreshRuntimeContextState({
-            runtimeOptions: options,
-            events: previousEvents,
-            modelId: cleanedModelId,
-            buildSystemPrompt,
-            mapEventsToMessages: mapEventsForProvider,
-            tools: toolsList,
-            warningPercent: contextWarningPercent,
-            compactPercent: contextCompactPercent,
-            suppressToolsForIntent: shouldSuppressToolsForIntent,
-            memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-            sessionInbox: await loadSessionInbox(),
-          }))
-          yield buildContextUsageEvent({
-            sessionId: options.sessionId,
-            requestId: options.requestId,
-            modelId: cleanedModelId,
-            providerId: settings.providerId,
-            windowState: contextWindowState,
-            cacheAwareCompactPolicy,
-            source: 'after_compact',
-          })
-          const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-          if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-        } catch (error) {
-          yield buildCompactFailureEvent({
-            sessionId: options.sessionId,
-            trigger: 'reactive',
-            modelId: cleanedModelId,
-            failureCount: autoCompactDecision.failureCount + 1,
-            maxFailures: autoCompactDecision.failureLimit,
-            message: error instanceof Error ? error.message : String(error),
-          })
-        }
-      }
-      if (contextWindowState.isBlocking) {
-        for (const event of buildContextBlockingEvents({
-          sessionId: options.sessionId,
+      // Pre-loop compact sequence (auto / reactive / blocking
+      // emit). The implementation lives in
+      // `executePreLoopCompactSequence.ts` (Phase 3B-13 helper
+      // extraction). The helper runs the three blocks
+      // asynchronously and yields the same events the
+      // inline code used to yield.
+      const preLoopCompactIterator = executePreLoopCompactSequence({
+        storage: this.storage,
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        modelId: cleanedModelId,
+        providerId: settings.providerId,
+        cleanedModelId,
+        autoCompactShouldCompact: autoCompactDecision.shouldCompact,
+        isContextWindowBlocking: contextWindowState.isBlocking,
+        refreshStrategy: contextRefreshStrategy,
+        refreshOptions: {
+          runtimeOptions: options,
+          events: previousEvents,
           modelId: cleanedModelId,
-          windowState: contextWindowState,
-          thresholdPercent: autoCompactDecision.enabled
-            ? autoCompactDecision.thresholdPercent
-            : contextCompactPercent,
-          cacheAwareCompactPolicy,
-        })) yield event
-        yield buildRuntimeExecutionMetricsEvent(options, metrics)
+          buildSystemPrompt,
+          mapEventsToMessages: mapEventsForProvider,
+          tools: toolsList,
+          warningPercent: contextWarningPercent,
+          compactPercent: contextCompactPercent,
+          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          onMemoryRetrieval: this.emitMemoryRetrieval,
+          workingSetOverride,
+        },
+        state: {
+          getContextWindowState: () => contextWindowState,
+          getPreviousEvents: () => previousEvents,
+          setPreviousEvents: (next) => {
+            previousEvents = next
+          },
+          getAutoCompactDecision: () => autoCompactDecision,
+          setAutoCompactDecision: (next) => {
+            autoCompactDecision = next
+          },
+          getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+          setCacheAwareCompactPolicy: (next) => {
+            cacheAwareCompactPolicy = next
+          },
+        },
+        closures: {
+          applyContextRefreshState,
+          postCompactGroundingEvents,
+          contextMicrocompactEvent,
+        },
+        metrics,
+        readFileCache: this.readFileCache,
+        toolsList,
+        mapEventsForProvider,
+        shouldSuppressToolsForIntent,
+        onMemoryRetrieval: this.emitMemoryRetrieval,
+        userIntentGuidance: undefined,
+        workingSetOverride,
+        buildRuntimeExecutionMetricsEvent: () => buildRuntimeExecutionMetricsEvent(options, metrics),
+        compactAttempted,
+      })
+      let preLoopCompactResult: { compactAttempted: boolean; blocking: boolean } = { compactAttempted: false, blocking: false }
+      for await (const e of preLoopCompactIterator) {
+        yield e
+      }
+      preLoopCompactResult = await preLoopCompactIterator.next().then(() => preLoopCompactResult, () => preLoopCompactResult)
+      // The async generator's return value is not surfaced
+      // by for-await; the next .return() round-trip recovers
+      // it.
+      compactAttempted = preLoopCompactResult.compactAttempted
+      if (preLoopCompactResult.blocking) {
         return
       }
 
@@ -699,81 +649,95 @@ export class LLMCodingRuntime implements NexusRuntime {
           source: 'pre_provider_call',
         })
         if (requestState.contextWindowState.isBlocking && !providerLoopCompactAttempted) {
-          providerLoopCompactAttempted = true
-          try {
-            const compactResult = await compactSession({
+          // Provider-loop reactive compact + refresh. The
+          // implementation lives in
+          // `executeProviderLoopCompactBlock.ts` (Phase
+          // 3B-14 helper extraction). The helper runs the
+          // compact + refresh + yield sequence and
+          // returns whether the compact was attempted so
+          // the main loop can update its flag.
+          const { events: providerLoopEvents, compactAttempted: providerLoopCompactAttemptedNow } =
+            await executeProviderLoopCompactBlock({
               storage: this.storage,
-              sessionId: options.sessionId,
-              modelId: cleanedModelId,
-              trigger: 'reactive',
-              mapEventsToMessages: mapEventsForProvider,
-              initialPrompt: options.prompt,
-            })
-            absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-            yield compactResult.event
-            yield compactResult.contextEvent
-            const groundingEvents = postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
-            for (const groundingEvent of groundingEvents) yield groundingEvent
-            previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-            applyContextRefreshState(await refreshRuntimeContextState({
-              runtimeOptions: options,
-              events: previousEvents,
-              modelId: cleanedModelId,
-              buildSystemPrompt,
-              mapEventsToMessages: mapEventsForProvider,
-              tools: toolsList,
-              warningPercent: contextWarningPercent,
-              compactPercent: contextCompactPercent,
-              suppressToolsForIntent: shouldSuppressToolsForIntent,
-              memoryProvider: this.memoryProvider,
-        onMemoryRetrieval: this.emitMemoryRetrieval,
-              sessionInbox: await loadSessionInbox(),
-            }))
-            messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
-              contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
-            })
-            suppressToolsForCurrentIntent =
-              shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
-              !confirmedOptionSelection &&
-              suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
-            requestState = buildProviderLoopRequestState({
-              loopCount,
-              maxLoops,
-              readFileCache: this.readFileCache,
-              toolCallCount: metrics.toolCallCount,
-              systemPrompt: assembledContext.systemPrompt,
-              messages,
-              currentToolsList: toolsList(),
-              contextMaxTokens: assembledContext.budget.maxTokens,
-              warningPercent: contextWarningPercent,
-              compactPercent: contextCompactPercent,
-              suppressToolsForUserIntent: suppressToolsForCurrentIntent,
-              cacheAwareCompactPolicy,
-              finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
-            })
-            currentToolsList = requestState.currentToolsList
-            modelVisibleTools = requestState.modelVisibleTools
-            yield buildContextUsageEvent({
               sessionId: options.sessionId,
               requestId: options.requestId,
               modelId: cleanedModelId,
               providerId: settings.providerId,
-              windowState: requestState.contextWindowState,
-              cacheAwareCompactPolicy,
-              source: 'after_compact',
+              cleanedModelId,
+              isContextWindowBlocking: requestState.contextWindowState.isBlocking,
+              alreadyAttempted: providerLoopCompactAttempted,
+              refreshStrategy: contextRefreshStrategy,
+              refreshOptions: {
+                runtimeOptions: options,
+                events: previousEvents,
+                modelId: cleanedModelId,
+                buildSystemPrompt,
+                mapEventsToMessages: mapEventsForProvider,
+                tools: toolsList,
+                warningPercent: contextWarningPercent,
+                compactPercent: contextCompactPercent,
+                suppressToolsForIntent: shouldSuppressToolsForIntent,
+                onMemoryRetrieval: this.emitMemoryRetrieval,
+                workingSetOverride,
+              },
+              state: {
+                getPreviousEvents: () => previousEvents,
+                setPreviousEvents: (next) => { previousEvents = next },
+                getAutoCompactDecision: () => autoCompactDecision,
+                setAutoCompactDecision: (next) => { autoCompactDecision = next },
+                getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+                setCacheAwareCompactPolicy: (next) => { cacheAwareCompactPolicy = next },
+                getContextWindowState: () => contextWindowState,
+              },
+              closures: {
+                applyContextRefreshState,
+                postCompactGroundingEvents,
+                contextMicrocompactEvent,
+              },
+              metrics,
+              toolsList,
+              mapEventsForProvider,
+              shouldSuppressToolsForIntent,
+              onMemoryRetrieval: this.emitMemoryRetrieval,
+              workingSetOverride,
+              initialPrompt: options.prompt,
             })
-            const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-            if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-          } catch (error) {
-            yield buildCompactFailureEvent({
-              sessionId: options.sessionId,
-              trigger: 'reactive',
-              modelId: cleanedModelId,
-              failureCount: autoCompactDecision.failureCount + 1,
-              maxFailures: autoCompactDecision.failureLimit,
-              message: error instanceof Error ? error.message : String(error),
-            })
-          }
+          for (const e of providerLoopEvents) yield e
+          providerLoopCompactAttempted = providerLoopCompactAttemptedNow
+        }
+        if (providerLoopCompactAttempted) {
+          // After a reactive compact, rebuild the per-loop
+          // request state with the post-refresh context
+          // window state + message budget. This is the
+          // 3B-14 follow-up that the helper could not
+          // pull into the closure bundle: the main loop
+          // owns the `requestState` rebuild because it
+          // also drives the next `buildContextUsageEvent`
+          // / provider turn.
+          messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
+            contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
+          })
+          suppressToolsForCurrentIntent =
+            shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+            !confirmedOptionSelection &&
+            suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
+          requestState = buildProviderLoopRequestState({
+            loopCount,
+            maxLoops,
+            readFileCache: this.readFileCache,
+            toolCallCount: metrics.toolCallCount,
+            systemPrompt: assembledContext.systemPrompt,
+            messages,
+            currentToolsList: toolsList(),
+            contextMaxTokens: assembledContext.budget.maxTokens,
+            warningPercent: contextWarningPercent,
+            compactPercent: contextCompactPercent,
+            suppressToolsForUserIntent: suppressToolsForCurrentIntent,
+            cacheAwareCompactPolicy,
+            finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+          })
+          currentToolsList = requestState.currentToolsList
+          modelVisibleTools = requestState.modelVisibleTools
         }
         if (requestState.contextWindowState.isBlocking) {
           for (const event of buildRuntimeContextBlockingEventsForLoop({
@@ -846,128 +810,114 @@ export class LLMCodingRuntime implements NexusRuntime {
         const invocationStartMs = performance.now()
         let providerTurn: RuntimeProviderTurn
         try {
-          const toolCallTextLeakPhase = finalResponseOnlyMode
-            ? 'final_response_only'
-            : suppressToolsForCurrentIntent
-              ? 'respond_only'
-              : modelVisibleTools.length === 0
-                ? 'tools_hidden'
-                : undefined
-          const providerTurnStream = streamProviderTurn({
-            stream: adapter.queryStream(queryParams, adapterOptions),
+          // Stream provider events one-at-a-time so the WS
+          // observer (and Go TUI) sees text deltas as the
+          // provider produces them. Previously this was
+          // `await executeProviderTurn(...)` which buffered
+          // every event into an array then yielded them in a
+          // tight loop after the turn completed — making the
+          // entire assistant text dump out at once at end of
+          // turn even when the provider was streaming
+          // word-by-word. Real e2e (DeepSeek V4 via OpenAI
+          // adapter, prompt: 200-word essay) measured
+          // server-side adapter `delta.content` arriving for
+          // ~5s but ws-forward firing only ONCE at the end —
+          // confirming this buffer was the bottleneck. Path
+          // 1's text chunker is necessary but not sufficient
+          // unless the buffer is also drained progressively.
+          const stream = providerTurnDriver.run({
+            adapter,
+            queryParams,
+            adapterOptions,
             sessionId: options.sessionId,
             signal: options.signal,
             executionStartMs: metrics.executionStartMs,
             queryStartMs: invocationStartMs,
-            ...(toolCallTextLeakPhase && { toolCallTextLeakGuard: { phase: toolCallTextLeakPhase } }),
-            ...(memoryCapabilityQuestion && { memoryCapabilityAnswerLeakGuard: true }),
+            finalResponseOnlyMode,
+            suppressToolsForCurrentIntent,
+            modelVisibleToolCount: modelVisibleTools.length,
+            memoryCapabilityAnswerLeakGuard: memoryCapabilityQuestion,
           })
-          let providerTurnResult = await providerTurnStream.next()
-          while (!providerTurnResult.done) {
-            yield providerTurnResult.value
-            providerTurnResult = await providerTurnStream.next()
+          let result = await stream.next()
+          while (!result.done) {
+            yield result.value
+            result = await stream.next()
           }
-          providerTurn = providerTurnResult.value
+          providerTurn = result.value
         } catch (error) {
-          const providerRecovery = classifyProviderRecovery(error)
-          const postInvocationHooks = await executeRuntimeHooks(
-            'PostInvocation',
-            {
-              invocation: {
-                ...invocationMetadata,
-                durationMs: performance.now() - invocationStartMs,
-                success: false,
-                errorCode: providerInvocationErrorCode(error, options),
-                failureKind: providerRecovery?.kind,
-              },
+          // Provider recovery decision. The implementation
+          // lives in `executeProviderRecoveryDecision.ts`
+          // (Phase 3B-19 helper extraction). The helper
+          // fires PostInvocation hooks, classifies the
+          // error, and either (a) drives the context_window
+          // recovery compact + refresh + budget sequence,
+          // (b) yields blocking events on cap-reached, or
+          // (c) reports a rethrow.
+          const recoveryResult = await executeProviderRecoveryDecision({
+            error,
+            hooksConfig: { config: options.hooks, hooks: options.runtimeHooks },
+            invocationMetadata: {
+              ...invocationMetadata,
+              durationMs: performance.now() - invocationStartMs,
             },
-            {
+            hookInput: {
               sessionId: options.sessionId,
               cwd: options.cwd,
               role: options.role,
               signal: options.signal,
             },
-            { config: options.hooks, hooks: options.runtimeHooks },
-          )
-          for (const hookEvent of postInvocationHooks.events) yield hookEvent
-          if (providerRecovery?.kind === 'context_window') {
-            const providerErrorCode = providerContextRecoveryErrorCode(error, options)
-            if (providerContextRecoveryCount < MAX_PROVIDER_CONTEXT_RECOVERIES) {
-              providerContextRecoveryCount += 1
-              providerLoopCompactAttempted = true
-              const attempt = providerContextRecoveryCount
-              const preTokens = requestState.contextWindowState.tokenEstimate
-              const recoveryEvent = buildContextRecoveryAttemptedEvent({
-                sessionId: options.sessionId,
-                requestId: options.requestId,
-                providerId: settings.providerId,
-                modelId: cleanedModelId,
-                providerErrorCode,
-                strategy: 'semantic_compact_retry',
-                attempt,
-                maxAttempts: MAX_PROVIDER_CONTEXT_RECOVERIES,
-                preTokens,
-                retryable: true,
-                message: `Provider rejected the prompt as too large; compacting session context and retrying (${attempt}/${MAX_PROVIDER_CONTEXT_RECOVERIES}).`,
-              })
-              yield recoveryEvent
-              previousEvents = [...previousEvents, recoveryEvent]
-              try {
-                const compactResult = await compactSession({
-                  storage: this.storage,
-                  sessionId: options.sessionId,
-                  modelId: cleanedModelId,
-                  trigger: 'reactive',
-                  mapEventsToMessages: mapEventsForProvider,
-                  initialPrompt: options.prompt,
-                })
-                absorbCompactSummaryLatencyMetrics(metrics, compactResult.summaryLatencyMs)
-                yield compactResult.event
-                yield compactResult.contextEvent
-                const groundingEvents = postCompactGroundingEvents('context_recovery', compactResult.contextEvent.boundaryId)
-                for (const groundingEvent of groundingEvents) yield groundingEvent
-                previousEvents = [...previousEvents, compactResult.event, compactResult.contextEvent, ...groundingEvents]
-                await refreshAfterProviderContextRecovery()
-                autoCompactDecision = contextRefreshState.autoCompactDecision
-                messages = await enforceMessageBudget(messages, replacementState, options.sessionId, options.cwd, {
-                  contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
-                })
-                yield buildContextUsageEvent({
-                  sessionId: options.sessionId,
-                  requestId: options.requestId,
-                  modelId: cleanedModelId,
-                  providerId: settings.providerId,
-                  windowState: contextWindowState,
-                  cacheAwareCompactPolicy,
-                  source: 'after_compact',
-                })
-                const afterCompactMicrocompactEvent = contextMicrocompactEvent('after_compact')
-                if (afterCompactMicrocompactEvent) yield afterCompactMicrocompactEvent
-                continue
-              } catch (compactError) {
-                yield buildCompactFailureEvent({
-                  sessionId: options.sessionId,
-                  trigger: 'reactive',
-                  modelId: cleanedModelId,
-                  failureCount: attempt,
-                  maxFailures: MAX_PROVIDER_CONTEXT_RECOVERIES,
-                  message: compactError instanceof Error ? compactError.message : String(compactError),
-                })
-              }
-            }
-            for (const event of buildRuntimeContextBlockingEventsForLoop({
-              sessionId: options.sessionId,
-              modelId: cleanedModelId,
-              windowState: requestState.contextWindowState,
-              autoCompactDecision,
-              fallbackThresholdPercent: contextCompactPercent,
-              message: `Provider rejected the prompt as too large after ${providerContextRecoveryCount} context recovery attempt(s). Tried semantic_compact_retry; remaining actions: run /context, reduce tool output, or switch to a larger-context model.`,
-              cacheAwareCompactPolicy,
-            })) yield event
-            yield buildRuntimeExecutionMetricsEvent(options, metrics)
-            return
-          }
-          throw error
+            options,
+            providerId: settings.providerId,
+            modelId: cleanedModelId,
+            cleanedModelId,
+            requestId: options.requestId,
+            sessionId: options.sessionId,
+            state: {
+              getPreviousEvents: () => previousEvents,
+              setPreviousEvents: (next) => { previousEvents = next },
+              getAutoCompactDecision: () => autoCompactDecision,
+              setAutoCompactDecision: (next) => { autoCompactDecision = next },
+              getContextWindowState: () => contextWindowState,
+              getRequestState: () => requestState,
+              getCacheAwareCompactPolicy: () => cacheAwareCompactPolicy,
+              getMessages: () => messages,
+              setMessages: (next) => { messages = next },
+            },
+            closures: {
+              applyContextRefreshState,
+              postCompactGroundingEvents,
+              contextMicrocompactEvent,
+              refreshAfterProviderContextRecovery,
+            },
+            counters: {
+              providerContextRecoveryCount,
+              maxProviderContextRecoveries: MAX_PROVIDER_CONTEXT_RECOVERIES,
+            },
+            flags: {
+              setProviderLoopCompactAttempted: (next) => { providerLoopCompactAttempted = next },
+            },
+            metrics,
+            replacementState,
+            initialPrompt: options.prompt,
+            storage: this.storage,
+            mapEventsForProvider,
+            runHooks: (phase, invocation, ctx, config) =>
+              executeRuntimeHooks(phase, invocation, ctx, config),
+            contextCompactPercent,
+            errorCodeHelpers: {
+              providerInvocationErrorCode,
+              providerContextRecoveryErrorCode,
+            },
+          })
+          for (const e of recoveryResult.events) yield e
+          providerContextRecoveryCount = recoveryResult.providerContextRecoveryCount
+          previousEvents = recoveryResult.previousEvents
+          autoCompactDecision = recoveryResult.autoCompactDecision
+          messages = recoveryResult.messages
+          cacheAwareCompactPolicy = recoveryResult.cacheAwareCompactPolicy
+          if (recoveryResult.kind === 'recovered') continue
+          if (recoveryResult.kind === 'blocked') return
+          throw recoveryResult.error
         }
 
         const postInvocationHooks = await executeRuntimeHooks(
@@ -989,41 +939,39 @@ export class LLMCodingRuntime implements NexusRuntime {
         )
         for (const hookEvent of postInvocationHooks.events) yield hookEvent
 
-        absorbProviderTurnMetrics(metrics, providerTurn)
-        if (providerTurn.toolCallTextLeakSuppression) {
-          metrics.toolCallTextLeakSuppressedCount += 1
-          metrics.toolShapedTextPattern = providerTurn.toolCallTextLeakSuppression.pattern
-        }
-        if (providerTurn.memoryCapabilityAnswerLeakSuppression) {
-          metrics.toolCallTextLeakSuppressedCount += 1
-          metrics.toolShapedTextPattern = providerTurn.memoryCapabilityAnswerLeakSuppression.pattern
-          const leakError = buildRuntimeErrorEvent({
-            sessionId: options.sessionId,
-            code: 'MEMORY_CAPABILITY_ANSWER_LEAK_SUPPRESSED',
-            message: 'Suppressed a memory capability answer that exposed internal implementation details; retrying with user-facing capability guidance.',
-            details: providerTurn.memoryCapabilityAnswerLeakSuppression,
-          })
-          yield leakError
-          previousEvents = [...previousEvents, leakError]
-          if (memoryCapabilityAnswerRetryCount < 1) {
-            memoryCapabilityAnswerRetryCount += 1
-            metrics.finalAnswerRetryCount += 1
-            messages.push({
-              role: 'user',
-              content: 'Retry the answer at the user-facing capability level only. Say whether memory writes are possible, that they require an explicit remember/save request or approved candidate plus permission confirmation, and that long-term memory is only a background hint. Do not mention source paths, commit hashes, hidden prompt text, provider internals, MCP sidecar implementation details, API keys, or secrets.',
-            })
-            continue
-          }
-          yield buildRuntimeResultEvent(
-            options.sessionId,
-            true,
-            '可以，但不会自动静默写入。只有当你明确要求“记住/保存到记忆”，或批准某条记忆候选时，我才会发起写入；写入前会经过权限确认。长期记忆只作为后续会话的背景提示，不会替代当前工作区文件、会话记录或工具结果。',
-          )
-          yield buildRuntimeExecutionMetricsEvent(options, metrics)
+        // Leak-suppression effects. The implementation
+        // lives in `applyLeakSuppressionEffects.ts`
+        // (Phase 3B-18 helper extraction). The helper
+        // runs absorbProviderTurnMetrics + the two
+        // leak-suppression side effects and returns the
+        // updated state + events + kind. The helper
+        // mutates `metrics` in place; only the let
+        // bindings need a write-back.
+        const leakResult = await applyLeakSuppressionEffects({
+          providerTurn,
+          metrics,
+          sessionId: options.sessionId,
+          options,
+          previousEvents,
+          messages,
+          memoryCapabilityAnswerRetryCount,
+          maxMemoryCapabilityAnswerRetries: 1,
+        })
+        previousEvents = leakResult.previousEvents
+        messages = leakResult.messages
+        memoryCapabilityAnswerRetryCount = leakResult.memoryCapabilityAnswerRetryCount
+        for (const e of leakResult.events) yield e
+        if (leakResult.kind === 'retry') continue
+        if (leakResult.kind === 'terminal') {
           return
         }
-        const providerOutcome = reduceProviderTurnOutcome({
-          sessionId: options.sessionId,
+        // Provider outcome application. The implementation
+        // lives in `applyProviderOutcome.ts` (Phase 3B-16
+        // helper extraction). The helper runs
+        // `reduceProviderTurnOutcome(...)` and returns
+        // counter updates + events + kind so the main
+        // loop can dispatch on the outcome.
+        const outcomeResult = await applyProviderOutcome({
           turn: providerTurn,
           finalResponseOnlyMode,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
@@ -1037,18 +985,17 @@ export class LLMCodingRuntime implements NexusRuntime {
           suppressedToolRetryCount,
           maxSuppressedToolRetries: MAX_SUPPRESSED_TOOL_RETRIES,
         })
-        if (providerTurn.toolCallTextLeakSuppression && providerOutcome.kind === 'continue') {
+        if (outcomeResult.finalAnswerRetryIncrement === 1) {
           metrics.finalAnswerRetryCount += 1
         }
-        maxTokenRecoveryCount = providerOutcome.maxTokenRecoveryCount
-        outputRetryCount = providerOutcome.outputRetryCount
-        suppressedToolRetryCount = providerOutcome.suppressedToolRetryCount
-        for (const event of providerOutcome.eventsBeforeMessages) yield event
-        messages.push(...providerOutcome.messages)
-        for (const event of providerOutcome.eventsAfterMessages) yield event
-        if (providerOutcome.kind === 'continue') continue
-        if (providerOutcome.kind === 'terminal') {
-          if (providerOutcome.queueSessionMemoryLiteUpdate) {
+        maxTokenRecoveryCount = outcomeResult.nextCounters.maxTokenRecoveryCount
+        outputRetryCount = outcomeResult.nextCounters.outputRetryCount
+        suppressedToolRetryCount = outcomeResult.nextCounters.suppressedToolRetryCount
+        for (const event of outcomeResult.events) yield event
+        messages.push(...outcomeResult.messages)
+        if (outcomeResult.kind === 'continue') continue
+        if (outcomeResult.kind === 'terminal') {
+          if (outcomeResult.queueSessionMemoryLiteUpdate) {
             queueSessionMemoryLiteUpdate({
               storage: this.storage,
               sessionId: options.sessionId,
@@ -1061,62 +1008,24 @@ export class LLMCodingRuntime implements NexusRuntime {
           return
         }
 
-        const toolResultsContent = []
-        for (const tc of providerOutcome.toolCalls) {
-          const toolEvents: NexusEvent[] = []
-          const toolExecution = executeProviderToolCall({
-            toolCall: tc,
-            tools: this.tools,
-            toolPolicy: this.toolPolicy,
-            runtimeOptions: options,
-            storage: this.storage,
-            metrics,
-            readFileCache: this.readFileCache,
-            taskScope: taskScopeEvent,
-          })
-          let next = await toolExecution.next()
-          while (!next.done) {
-            toolEvents.push(next.value)
-            yield next.value
-            next = await toolExecution.next()
-          }
-          previousEvents = [...previousEvents, ...toolEvents]
-          if (next.value.kind === 'terminal') {
-            return
-          }
-          const completedEvent = toolEvents.findLast((event): event is Extract<NexusEvent, { type: 'tool_completed' }> => event.type === 'tool_completed' && event.toolUseId === tc.id)
-          if (completedEvent) {
-            const groundingConfirmedEvent = buildContextGroundingConfirmedEventForToolResult({
-              sessionId: options.sessionId,
-              requestId: options.requestId,
-              events: previousEvents,
-              toolCompleted: completedEvent,
-              toolInput: resolveProviderToolCallInput(tc),
-            })
-            if (groundingConfirmedEvent) {
-              previousEvents = [...previousEvents, groundingConfirmedEvent]
-              yield groundingConfirmedEvent
-            }
-          }
-          const scopeConfirmationEvents = toolEvents.filter((event): event is Extract<NexusEvent, { type: 'scope_boundary_confirmed' }> => event.type === 'scope_boundary_confirmed')
-          if (scopeConfirmationEvents.length > 0) {
-            taskScopeEvent = {
-              ...taskScopeEvent,
-              ...deriveTaskScope({
-                sessionId: options.sessionId,
-                requestId: options.requestId,
-                cwd: options.cwd,
-                prompt: options.prompt,
-                events: previousEvents,
-                allowedPaths: options.allowedPaths,
-              }),
-              message: taskScopeEvent.message,
-            }
-          }
-          toolResultsContent.push(next.value.toolResult)
+        // Tool dispatch. The implementation lives in
+        // `executeToolDispatch.ts` (Phase 3B-17 helper
+        // extraction). The helper drives the dispatch
+        // async generator and returns the per-loop
+        // state updates + events + terminal flag.
+        const dispatchResult = await executeToolDispatch(toolDispatchPipeline, {
+          toolCalls: outcomeResult.toolCalls!,
+          runtimeOptions: options,
+          previousEvents,
+          taskScopeEvent,
+        })
+        for (const event of dispatchResult.events) yield event
+        previousEvents = dispatchResult.previousEvents
+        taskScopeEvent = dispatchResult.taskScopeEvent
+        if (dispatchResult.terminal) {
+          return
         }
-
-        messages.push(buildProviderToolResultsMessage(toolResultsContent))
+        messages.push(...dispatchResult.messages)
       }
 
       const maxLoopsMessage = `Execution exceeded maximum tool call iterations (${maxLoops}).`
@@ -1144,6 +1053,46 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield buildRuntimeResultEvent(options.sessionId, false, errorText)
       yield buildRuntimeExecutionMetricsEvent(options, metrics)
     }
+  }
+
+  // ─── R2 of docs/nexus/reference/long-running-context-assembly.md §20: ───
+  //
+  // `loadWorkingSetOverride` was extracted to
+  // `./loadWorkingSetOverride.ts` in Phase 3B-7. The hot path calls the
+  // standalone function once at the start of `runExecuteStreamInner`
+  // (line 335 in the current build) and threads the result into every
+  // `refreshRuntimeContextState` call.
+  //
+  // This class method is retained as a thin delegate so that the R2
+  // wiring-guard contract (`runtime-working-set-hot-path.test.ts`) keeps
+  // passing: it asserts `LLMCodingRuntime.prototype.loadWorkingSetOverride`
+  // is a function. Removing it would silently break R2 detection in
+  // future refactors. New code should call the standalone function from
+  // `./loadWorkingSetOverride.js` directly.
+  private async loadWorkingSetOverride(sessionId: string, cwd: string): Promise<string | undefined> {
+    return loadWorkingSetOverride(
+      this.resumeDeps?.workingSetTracker,
+      this.storage,
+      sessionId,
+      cwd,
+    )
+  }
+
+  // applyWorkingSetUpdate(sessionId, events, cwd) — write-side of the
+  // R2 Persisted Working Set hot-path loop. Extracted to
+  // `./applyWorkingSetUpdate.ts` in Phase 3B-8. The hot path calls
+  // the standalone function after every successful tool execution
+  // with the `toolEvents` batch yielded by the provider tool-call
+  // loop; the tracker schedules its own background flush.
+  //
+  // This class method is retained as a thin delegate so the R2
+  // wiring-guard contract (`runtime-working-set-hot-path.test.ts`)
+  // keeps passing: it asserts `LLMCodingRuntime.prototype.applyWorkingSetUpdate`
+  // is a function. Removing it would silently break R2 detection in
+  // future refactors. New code should call the standalone function
+  // from `./applyWorkingSetUpdate.js` directly.
+  private applyWorkingSetUpdate(sessionId: string, events: NexusEvent[], cwd: string): void {
+    applyWorkingSetUpdate(this.resumeDeps?.workingSetTracker, sessionId, events, cwd)
   }
 
   // ─── PR-A4: Session Resume class method (doc §6.2) ──────────────
@@ -1242,7 +1191,12 @@ export class LLMCodingRuntime implements NexusRuntime {
     )
     let assembled: AssembledContext
     try {
-      const refreshState = await refreshRuntimeContextState({
+      const contextRefreshStrategy = new ContextRefreshStrategy({
+        storage: this.storage,
+        memoryProvider: this.memoryProvider,
+        contextBroadcaster: this.contextBroadcaster,
+      })
+      const refreshState = await contextRefreshStrategy.refresh({
         runtimeOptions,
         events,
         modelId: settings.modelId,
@@ -1252,9 +1206,8 @@ export class LLMCodingRuntime implements NexusRuntime {
         warningPercent: 70,
         compactPercent: 90,
         suppressToolsForIntent: () => false,
-        memoryProvider: this.memoryProvider,
         onMemoryRetrieval: this.emitMemoryRetrieval,
-        sessionInbox: [],
+        sessionInbox: 'empty',
         workingSetOverride,
         includeBehaviorTrace: true,
         includeLongTerm: true,
@@ -1282,6 +1235,151 @@ export class LLMCodingRuntime implements NexusRuntime {
     }
 
     return { workingSet, rebuilt, assembled, unsubscribeHints }
+  }
+
+  // ─── R5 of docs/nexus/reference/long-running-context-assembly.md §20: ───
+  //
+  // resumePreview(sessionId, cwd) — pure read-only projection of what
+  // resume() would build, without subscribing to live hints and
+  // without executing a provider turn. R5's product path: an operator
+  // can inspect what a resumed session would inherit (working set
+  // loaded/rebuilt, assembled section ids + budgets, hint subscription
+  // state) without actually resuming. The `hasContinuationSnapshot:
+  // false` is the explicit, honest R5 contract: until a real restart
+  // e2e proves otherwise, we do not promise "0 information loss".
+  //
+  // Returns:
+  //   - cwd: the cwd the preview was computed for
+  //   - workingSet: { sessionId, workspaceId, entries, version,
+  //     updatedAt, rebuilt: boolean } — rebuilt=true means the WS was
+  //     derived from the recent event tail (no persisted file), false
+  //     means it was loaded from <cwd>/.babel-o/working-set.json.
+  //   - assembled: the full AssembledContext so the route can project
+  //     section ids / budget summaries. The route applies the R4
+  //     redaction contract before serializing the response body.
+  //   - liveHintsSubscribed: false (we did not subscribe). Operator
+  //     sees that no live hook is attached.
+  //   - hasContinuationSnapshot: false. Hard-coded per R5 acceptance.
+  async resumePreview(opts: { sessionId: string; cwd: string }): Promise<{
+    cwd: string
+    workingSet: {
+      sessionId: string
+      workspaceId: string
+      entries: Array<{ path: string; touches: number; lastTurn: number; isDir: boolean; source: 'tool' | 'user' }>
+      version: number
+      updatedAt: string
+      rebuilt: boolean
+    }
+    assembledSectionIds: string[]
+    budget: AssembledContext['budget']
+    liveHintsSubscribed: false
+    hasContinuationSnapshot: false
+  }> {
+    if (!this.resumeDeps) {
+      throw new Error(
+        'LLMCodingRuntime.resumePreview() requires resumeDeps; configure the runtime via ' +
+          'createDefaultNexusRuntime() or pass resumeDeps explicitly to the constructor.',
+      )
+    }
+    const { workingSetTracker, buildSystemPrompt, mapEventsToMessages } = this.resumeDeps
+
+    // Step 1 — load or rebuild working set. Identical logic to
+    // resume() but without subscribing to live hints.
+    await workingSetTracker.load()
+    let workingSet = workingSetTracker.get(opts.sessionId)
+    let rebuilt = false
+    let events: NexusEvent[] = []
+    if (!workingSet) {
+      rebuilt = true
+      const result = await this.storage.listEvents(opts.sessionId, {
+        order: 'desc',
+        limit: 1000,
+      })
+      events = [...(result?.events ?? [])].reverse()
+      const entries = deriveEntriesFromEvents(events, opts.cwd)
+      workingSet = workingSetTracker.rebuild(opts.sessionId, '', entries)
+    } else {
+      const result = await this.storage.listEvents(opts.sessionId, {
+        order: 'desc',
+        limit: 1000,
+      })
+      events = [...(result?.events ?? [])].reverse()
+    }
+
+    // Step 2 — assemble context (read-only). We do NOT subscribe to
+    // behaviorMonitor, so liveHintsSubscribed is false.
+    const settings = this.configManager.resolveSettings()
+    const runtimeOptions: RuntimeExecuteOptions = {
+      sessionId: opts.sessionId,
+      cwd: opts.cwd,
+      prompt: '',
+      model: settings.modelId,
+    }
+    const workingSetOverride = formatWorkingSet(
+      workingSet.entries.map((e) => ({
+        path: e.value,
+        touches: 1,
+        lastTurn: 0,
+        isDir: false,
+        source: 'tool' as const,
+      })),
+    )
+    const contextRefreshStrategy = new ContextRefreshStrategy({
+      storage: this.storage,
+      memoryProvider: this.memoryProvider,
+      contextBroadcaster: this.contextBroadcaster,
+    })
+    const refreshState = await contextRefreshStrategy.refresh({
+      runtimeOptions,
+      events,
+      modelId: settings.modelId,
+      buildSystemPrompt,
+      mapEventsToMessages,
+      tools: () => [],
+      warningPercent: 70,
+      compactPercent: 90,
+      suppressToolsForIntent: () => false,
+      onMemoryRetrieval: this.emitMemoryRetrieval,
+      sessionInbox: 'empty',
+      workingSetOverride,
+      includeBehaviorTrace: true,
+      includeLongTerm: true,
+      includeProjectMemory: true,
+      includeLiveHints: false, // R5: pure preview, no live hint subscription
+    })
+    const assembled = refreshState.assembledContext
+    // Section ids from the assembled context's working set block +
+    // (best-effort) the system prompt block ids. The assembler's
+    // `systemPromptBlocks` array carries no id (it drops the source
+    // section id during the buildSystemPromptSections → blocks
+    // projection), so we surface only the workingSetPaths the
+    // assembler captures (rebuild-only context) and the persisted
+    // working set entries as the "section ids" the operator can see.
+    const assembledSectionIds = [
+      ...workingSet.entries.map((e) => `ws:${e.value}`),
+      ...(assembled.selectionDiagnostics?.workingSetPaths ?? []).map((p) => `active-ws:${p}`),
+    ]
+    return {
+      cwd: opts.cwd,
+      workingSet: {
+        sessionId: workingSet.sessionId,
+        workspaceId: workingSet.workspaceId,
+        entries: workingSet.entries.map((e) => ({
+          path: e.value,
+          touches: 1,
+          lastTurn: 0,
+          isDir: false,
+          source: 'tool' as const,
+        })),
+        version: workingSet.version,
+        updatedAt: workingSet.updatedAt,
+        rebuilt,
+      },
+      assembledSectionIds,
+      budget: assembled.budget,
+      liveHintsSubscribed: false,
+      hasContinuationSnapshot: false,
+    }
   }
 
   /**
@@ -1349,54 +1447,14 @@ function providerContextRecoveryErrorCode(error: unknown, options: RuntimeExecut
   return providerInvocationErrorCode(error, options)
 }
 
-function isConfirmedOptionSelectionAfterClarification(events: NexusEvent[], latestPrompt: string): boolean {
-  const optionSelection = normalizeOptionSelection(latestPrompt)
-  if (!optionSelection) return false
-  let skippedCurrentUserMessage = false
-  for (let index = events.length - 1; index >= 0; index -= 1) {
-    const event = events[index]
-    if (event.type === 'user_message') {
-      if (!skippedCurrentUserMessage && normalizeOptionSelection(event.text) === optionSelection) {
-        skippedCurrentUserMessage = true
-        continue
-      }
-      return false
-    }
-    if (
-      (event.type === 'assistant_delta' && isOptionSelectionClarificationText(event.text) && event.text.includes(`"${optionSelection}"`)) ||
-      (event.type === 'result' && isOptionSelectionClarificationText(event.message) && event.message.includes(`"${optionSelection}"`))
-    ) {
-      return true
-    }
-  }
-  return false
-}
-
 export function resolveCwdFromPrompt(prompt: string, baseCwd: string): string {
-  const paths = extractAbsolutePaths(prompt)
-  for (const candidate of paths) {
-    const resolved = resolvePromptPath(candidate)
-    if (!existsSync(resolved)) {
-      const parent = dirname(resolved)
-      if (parent !== resolved && existsSync(parent)) {
-        return parent
-      }
-      continue
-    }
-    try {
-      const stat = lstatSync(resolved)
-      if (stat.isDirectory()) {
-        return resolved
-      }
-      const parent = dirname(resolved)
-      if (parent !== resolved) {
-        return parent
-      }
-    } catch {
-      continue
-    }
-  }
-  return baseCwd
+  // Bug 4 (§13.2): delegate to the single shared resolver in
+  // systemPromptBuilder so Site A (app.ts) and Site B (runtime) can never
+  // disagree on the same prompt. Previously this function had its own
+  // dirname-fallback + isAcceptablePromptCwd logic that drifted from
+  // app.ts's weaker `resolveExplicitPromptCwd`. The body is now a thin
+  // wrapper; tests + Phase B continuity call this name for back-compat.
+  return resolvePromptCwd(prompt, baseCwd)
 }
 
 // Phase B of docs/nexus/reference/context-cwd-drift-and-recall-governance-plan.md.
@@ -1430,336 +1488,15 @@ export function resolveCwdWithContinuity(options: {
   return { cwd: continuity.resolvedCwd, continuity }
 }
 
-export function mapEventsToMessages(
-  events: NexusEvent[],
-  initialPrompt: string,
-  options: MapEventsToMessagesOptions = {},
-): ModelMessage[] {
-  const messages: ModelMessage[] = []
+// `mapEventsToMessages` is implemented in `./eventsTranslator.ts`.
+// The actual implementation was extracted in Phase 3B-1 to keep this
+// file focused on the runtime loop. We re-export it here for backward
+// compatibility with consumers that still import from
+// `./LLMCodingRuntime.js`.
 
-  const firstUserMsg = events.find(e => e.type === 'user_message') as Extract<NexusEvent, { type: 'user_message' }> | undefined
-  const initial = firstUserMsg ? firstUserMsg.text : initialPrompt
-  messages.push({ role: 'user', content: initial })
-
-  const completedToolIds = new Set<string>()
-  const startedToolIds = new Set<string>()
-  for (const event of events) {
-    if (event.type === 'tool_started') {
-      startedToolIds.add(event.toolUseId)
-    }
-    if (event.type === 'tool_completed') {
-      completedToolIds.add(event.toolUseId)
-    }
-  }
-
-  let pendingToolResultMsg: ModelMessage | null = null
-  let pendingToolAssistantMsg: ModelMessage | null = null
-  let pendingReasoningContent = ''
-  const seenStartedToolIds = new Set<string>()
-  const earlyCompletedByToolId = new Map<string, Extract<NexusEvent, { type: 'tool_completed' }>>()
-  const emittedToolResultIds = new Set<string>()
-
-  const appendToolResult = (event: Extract<NexusEvent, { type: 'tool_completed' }>) => {
-    let lastMsg: ModelMessage | null = pendingToolResultMsg
-    if (!lastMsg || typeof lastMsg.content === 'string') {
-      lastMsg = { role: 'user', content: [] }
-      messages.push(lastMsg)
-      pendingToolResultMsg = lastMsg
-    }
-    const outputText =
-      typeof event.output === 'string'
-        ? event.output
-        : JSON.stringify(event.output, null, 2)
-    ;(lastMsg.content as ContentBlock[]).push({
-      type: 'tool_result',
-      toolUseId: event.toolUseId,
-      content: outputText,
-      isError: !event.success,
-      toolName: event.name,
-    })
-    emittedToolResultIds.add(event.toolUseId)
-  }
-
-  const appendRuntimeUserMessage = (content: string) => {
-    pendingToolResultMsg = null
-    pendingToolAssistantMsg = null
-    pendingReasoningContent = ''
-    messages.push({ role: 'user', content })
-  }
-
-  for (const event of events) {
-    if (event.type === 'user_message') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      pendingReasoningContent = ''
-      const lastMsg = messages[messages.length - 1]
-      if (
-        lastMsg?.role === 'user' &&
-        typeof lastMsg.content === 'string' &&
-        lastMsg.content === event.text
-      ) {
-        continue
-      }
-      messages.push({ role: 'user', content: event.text })
-    } else if (event.type === 'assistant_delta') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      let lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        lastMsg = {
-          role: 'assistant',
-          content: '',
-          ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
-            reasoningContent: pendingReasoningContent,
-          }),
-        }
-        pendingReasoningContent = ''
-        messages.push(lastMsg)
-      }
-      if (typeof lastMsg.content === 'string') {
-        lastMsg.content += event.text
-      } else {
-        const lastBlock = lastMsg.content[lastMsg.content.length - 1]
-        if (lastBlock && lastBlock.type === 'text') {
-          lastBlock.text += event.text
-        } else {
-          lastMsg.content.push({ type: 'text', text: event.text })
-        }
-      }
-    } else if (event.type === 'thinking_delta') {
-      if (!options.replayReasoningContent) {
-        // Keep thinking_delta in the event log for UI/history, but do not replay
-        // prior hidden reasoning into future provider calls. Some providers treat
-        // reasoningContent as live context, which can pollute follow-up turns.
-        continue
-      }
-      const lastMsg = messages[messages.length - 1]
-      if (!lastMsg || lastMsg.role !== 'assistant') {
-        pendingReasoningContent += event.text
-        continue
-      }
-      lastMsg.reasoningContent = `${lastMsg.reasoningContent ?? ''}${event.text}`
-      continue
-    } else if (event.type === 'context_grounding_required') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding required: ${event.message} Required for: ${event.requiredFor.join(', ')}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
-    } else if (event.type === 'context_grounding_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding confirmed: ${event.message} Confirmation kind: ${event.confirmationKind}. Confirmed for: ${event.confirmedFor.join(', ')}. Source: ${event.source}.` })
-    } else if (event.type === 'workspace_dirty_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
-    } else if (event.type === 'task_scope_declared') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime task scope declared: ${event.message} Primary root: ${event.primaryRoot}. Explicit roots: ${event.explicitRoots.join(', ') || 'none'}. Confirmed external roots: ${event.confirmedExternalRoots.join(', ') || 'none'}. Mode: ${event.mode}.` })
-    } else if (event.type === 'scope_boundary_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.` })
-    } else if (event.type === 'scope_boundary_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.` })
-    } else if (event.type === 'near_timeout_warning') {
-      appendRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
-    } else if (event.type === 'timeout_budget_exceeded') {
-      appendRuntimeUserMessage(formatTimeoutBudgetConvergenceMessage(event))
-    } else if (event.type === 'timeout_extension_granted') {
-      appendRuntimeUserMessage(formatTimeoutExtensionConvergenceMessage(event))
-    } else if (event.type === 'tool_started') {
-      seenStartedToolIds.add(event.toolUseId)
-      let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
-      if (!lastMsg) {
-        lastMsg = messages[messages.length - 1]
-        if (!lastMsg || lastMsg.role !== 'assistant' || !isToolCompatibleAssistantMessage(lastMsg)) {
-          lastMsg = {
-            role: 'assistant',
-            content: [],
-            ...(options.replayReasoningContent && pendingReasoningContent.trim() && {
-              reasoningContent: pendingReasoningContent,
-            }),
-          }
-          pendingReasoningContent = ''
-          messages.push(lastMsg)
-        } else if (typeof lastMsg.content === 'string') {
-          lastMsg.content = lastMsg.content ? [{ type: 'text', text: lastMsg.content }] : []
-        }
-        pendingToolAssistantMsg = lastMsg
-      }
-      ;(lastMsg.content as ContentBlock[]).push({
-        type: 'tool_use',
-        id: event.toolUseId,
-        name: event.name,
-        input: event.input,
-      })
-
-      const completed = earlyCompletedByToolId.get(event.toolUseId)
-      if (completed && !emittedToolResultIds.has(event.toolUseId)) {
-        appendToolResult(completed)
-      } else if (!completedToolIds.has(event.toolUseId)) {
-        // If this tool was started but never completed (e.g. denied or interrupted),
-        // we must synthetically complete it with an error result block so future queries don't break.
-        let lastUserMsg: ModelMessage | null = pendingToolResultMsg
-        if (!lastUserMsg || typeof lastUserMsg.content === 'string') {
-          lastUserMsg = { role: 'user', content: [] }
-          messages.push(lastUserMsg)
-          pendingToolResultMsg = lastUserMsg
-        }
-        ;(lastUserMsg.content as ContentBlock[]).push({
-          type: 'tool_result',
-          toolUseId: event.toolUseId,
-          content: 'Error: Tool execution was denied or interrupted.',
-          isError: true,
-        })
-        emittedToolResultIds.add(event.toolUseId)
-      }
-    } else if (
-      event.type === 'tool_completed' &&
-      startedToolIds.has(event.toolUseId) &&
-      !emittedToolResultIds.has(event.toolUseId)
-    ) {
-      if (seenStartedToolIds.has(event.toolUseId)) {
-        appendToolResult(event)
-      } else {
-        earlyCompletedByToolId.set(event.toolUseId, event)
-      }
-    }
-  }
-
-  return messages
-}
-
-function formatNearTimeoutConvergenceMessage(event: Extract<NexusEvent, { type: 'near_timeout_warning' }>): string {
-  return [
-    `Runtime timeout convergence warning: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (${Math.round(event.thresholdRatio * 100)}% threshold). ${event.message}`,
-    'Do not start new exploratory tool calls.',
-    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
-    'Mark unverified claims as unverified.',
-    'If the task needs more exploration, ask the user to continue with a fresh budget.',
-    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
-  ].filter(Boolean).join('\n')
-}
-
-function formatTimeoutBudgetConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_budget_exceeded' }>): string {
-  return [
-    `Runtime soft timeout budget reached: elapsed ${event.elapsedMs}ms of ${event.timeoutMs}ms (policy=${event.policy}). ${event.message}`,
-    'This is a recoverable budget signal, not permission for broad discovery.',
-    'Do not start new exploratory tool calls.',
-    'Either answer with verified evidence already collected, or run at most one explicitly bounded final check.',
-    'Mark unverified claims as unverified.',
-    'If more exploration is required, ask the user to continue with a fresh budget.',
-    event.suggestedActions?.length ? `Suggested actions: ${event.suggestedActions.join(', ')}.` : '',
-    event.partialSummary ? `Partial summary already available: ${event.partialSummary}` : '',
-  ].filter(Boolean).join('\n')
-}
-
-function formatTimeoutExtensionConvergenceMessage(event: Extract<NexusEvent, { type: 'timeout_extension_granted' }>): string {
-  return [
-    `Runtime soft timeout extension granted: extension ${event.extensionCount}/${event.maxExtensions}, +${event.additionalMs}ms, total soft budget ${event.totalSoftBudgetMs}ms.`,
-    'Use this extension to wrap up.',
-    'Do not start broad discovery. Run at most one explicitly bounded final check, then answer.',
-    'Separate verified evidence from unverified claims.',
-    `Reason: ${event.reason}. ${event.message}`,
-  ].join('\n')
-}
-
-function isToolCompatibleAssistantMessage(message: ModelMessage): boolean {
-  if (message.role !== 'assistant' || typeof message.content === 'string') {
-    return message.role === 'assistant'
-  }
-  return message.content.every(block => block.type === 'text' || block.type === 'tool_use')
-}
-
-// ─── PR-3: behaviorTrace tap (top-level exportable function) ──────────────
-//
-// Lives outside the LLMCodingRuntime class so it can be unit-tested without
-// instantiating a full runtime (and a real provider mock). Kept as a
-// top-level export to preserve orthogonality with behaviorTrace.ts
-// (see [[feedback-tool-boundary-granularity]]).
-//
-// Invariants:
-//   - INV-4: pure write-side; never mutates the inner event stream
-//   - INV-11: never touches natural_pause
-//   - test-config-isolation: cwd comes from RuntimeExecuteOptions, never
-//     from process.env.HOME
-export async function* wrapWithBehaviorTraceTap(
-  options: RuntimeExecuteOptions,
-  source: AsyncIterable<NexusEvent>,
-): AsyncIterable<NexusEvent> {
-  if (!isBehaviorTraceEnabled()) {
-    yield* source
-    return
-  }
-  const buffer: NexusEvent[] = []
-  const emittedTraceKeys = new Set<string>()
-  let taskScopeGlob: string | undefined
-  let lastTaskScopeEventAt = -1
-  for await (const event of source) {
-    buffer.push(event)
-    if (event.type === 'task_scope_declared') {
-      const e = event as Extract<NexusEvent, { type: 'task_scope_declared' }>
-      const root = e.primaryRoot
-      if (typeof root === 'string' && root.length > 0) {
-        taskScopeGlob = root.endsWith('/**') ? root : `${root.replace(/\/+$/, '')}/**`
-        lastTaskScopeEventAt = buffer.length - 1
-      }
-    }
-    try {
-      // Only consider events that have been seen (suppress drift detection
-      // on the task_scope_declared event itself, which is the first event
-      // that establishes the scope).
-      const eventsForDetect = lastTaskScopeEventAt >= 0
-        ? buffer.slice(lastTaskScopeEventAt)
-        : buffer
-      const detected = detectTriggers({
-        events: eventsForDetect,
-        cwd: options.cwd,
-        sessionId: options.sessionId,
-        taskScope: taskScopeGlob,
-      })
-      for (const det of detected) {
-        const key = behaviorTraceDetectionKey(det)
-        if (emittedTraceKeys.has(key)) continue
-        emittedTraceKeys.add(key)
-        const ctx = buildTraceContext({ events: buffer })
-        const sa = deriveRuleSelfAssessment(det.trigger, det.anomaly, { retryCount: ctx.retryCount })
-        queueBehaviorTraceEntry({
-          cwd: options.cwd,
-          sessionId: options.sessionId,
-          trigger: det.trigger,
-          triggerConfidence: det.confidence,
-          anomaly: det.anomaly,
-          context: ctx,
-          selfAssessment: sa,
-        })
-      }
-    } catch (error) {
-      logger.debug('behaviorTrace tap detection failed', error)
-    }
-    yield event
-  }
-  // Best-effort flush. Do not block event stream teardown.
-  void flushBehaviorTraceQueue().catch((error) => {
-    logger.debug('behaviorTrace flush failed', error)
-  })
-}
-
-function behaviorTraceDetectionKey(
-  detected: ReturnType<typeof detectTriggers>[number],
-): string {
-  const anomaly = detected.anomaly
-  return JSON.stringify([
-    detected.trigger,
-    detected.relatedEventIndex,
-    anomaly.errorCode ?? '',
-    anomaly.errorMessage ?? '',
-    anomaly.denialReason ?? '',
-    anomaly.driftPath ?? '',
-    anomaly.expectedScope ?? '',
-    anomaly.userRedirectSignal ?? '',
-  ])
-}
+// `wrapWithBehaviorTraceTap` was extracted to `./behaviorTraceTap.ts`
+// in Phase 3B-6. We re-export it here so legacy import paths
+// (`from '../runtime/LLMCodingRuntime.js'` for `wrapWithBehaviorTraceTap`)
+// keep working without forcing every consumer to migrate in lockstep.
+// New code should import directly from `./behaviorTraceTap.js`.
+export { wrapWithBehaviorTraceTap } from './behaviorTraceTap.js'

@@ -19,13 +19,14 @@ import {
 } from './storageBridge.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 import type { MemoryProvider } from '../runtime/memoryProvider.js'
+import type { RuntimeContextBroadcaster } from '../runtime/contextBroadcaster.js'
 import type { EverCoreClient } from '../runtime/everCoreClient.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { createEverCoreMcpToolRegistry } from '../tools/everCoreMcpTools.js'
-import { startEverOSBackgroundBootstrap } from '../cli/everosBackgroundBootstrap.js'
+import { startEverOSBackgroundBootstrap } from '../runtime/everosBackgroundBootstrap.js'
 // PR-A4: resume() class method dependencies.
-import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
-import { BehaviorMonitor } from './behaviorMonitor.js'
+import { PersistedWorkingSetTracker } from '../runtime/persistedWorkingSetTracker.js'
+import { BehaviorMonitor } from '../runtime/behaviorMonitor.js'
 // Tool registry layering diagnostics (§2.2 of the Tool Surface Expansion plan).
 import {
   registerToolWithDiagnostics,
@@ -45,6 +46,8 @@ export type CreateDefaultNexusRuntimeOptions = {
   remoteRunner?: RemoteToolRunner
   agentExecutionEnvironment?: 'local' | 'remote'
   memoryProvider?: MemoryProvider
+  contextBroadcaster?: RuntimeContextBroadcaster
+  configManager?: ConfigManager
   everCore?: {
     client?: EverCoreClient
     config: EverCoreRuntimeConfig
@@ -124,11 +127,13 @@ export async function createDefaultNexusRuntime(
         'Pass `storagePath: \':memory:\'` to opt back in.',
     )
   }
+  const configManager = options.configManager ?? ConfigManager.getInstance()
   const agentScheduler = new ExploreAgentScheduler({
     storage,
     cwd: options.cwd,
     executionEnvironment: options.agentExecutionEnvironment,
     remoteRunner: options.remoteRunner,
+    configManager,
   })
   if (options.enableAgentTools) {
     for (const [name, tool] of createAgentToolRegistry(agentScheduler)) {
@@ -170,7 +175,6 @@ export async function createDefaultNexusRuntime(
     await originalClose?.()
   }
 
-  const configManager = ConfigManager.getInstance()
   const settings = configManager.resolveSettings()
 
   let policy = denyByDefaultTools()
@@ -208,7 +212,7 @@ export async function createDefaultNexusRuntime(
             storage,
             configManager,
             options.memoryProvider,
-            undefined, // contextBroadcaster (A2 path) — leave default
+            options.contextBroadcaster,
             {
               workingSetTracker,
               behaviorMonitor,
@@ -330,4 +334,3 @@ function resolveAbsolutePath(p: string): string {
 function joinPath(...parts: string[]): string {
   return path.join(...parts)
 }
-

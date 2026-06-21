@@ -5,6 +5,11 @@ daemon (`Nexus`) over REST + WebSocket. Runtimes are pluggable (`LocalCodingRunt
 for deterministic, `LLMCodingRuntime` for any LLM adapter). Go TUI client is the
 production interactive interface; the legacy TypeScript TUI has been removed.
 
+For user-facing contribution workflow, PR scope, review expectations, issue
+templates, and maintainer governance, read [CONTRIBUTING.md](./CONTRIBUTING.md)
+and [GOVERNANCE.md](./GOVERNANCE.md) before preparing a contribution-facing
+change.
+
 > **Design rules:**
 > 1. *Nexus owns execution. CLI owns interaction.* Never leak runtime concerns
 >    into the CLI module — the dependency-boundary audit (`npm run deps:audit`)

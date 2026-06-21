@@ -20,6 +20,15 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | --- | --- | --- |
 | [REFERENCE_TEMPLATE.md](./REFERENCE_TEMPLATE.md) | Guide | Standard template for new reference documents. It keeps the planning body in English and reserves a concise final Chinese summary for local readability. |
 
+## Development Process Governance
+
+| Document | State | Role |
+| --- | --- | --- |
+| [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md) | Active Plan | Defines PR review levels, semantic PR/commit granularity, and flaky test quarantine tiers so high-velocity runtime development keeps trustworthy gates. |
+| [module-coupling-decoupling-and-re-aggregation-plan.md](./module-coupling-decoupling-and-re-aggregation-plan.md) | Active Plan | Canonical coupling governance entry point: layer heat map, reverse `runtime → nexus` cleanup, singleton-to-injection, `LLMCodingRuntime` decomposition, `nexus/app.ts` router split, `runtimePipeline.ts` factory cluster, `shared/events.ts` codegen, and `process.env` consolidation. |
+| [layer-direction-audit-enforcement-plan.md](./layer-direction-audit-enforcement-plan.md) | Active Plan | Defines direction-aware internal dependency gates, allowlists for reverse imports, and CI-wired architecture tests. |
+| [github-discussions-setup-guide.md](./github-discussions-setup-guide.md) | Guide | Owner checklist for enabling GitHub Discussions, creating initial categories, and verifying README/GOVERNANCE community links for Product W4.2. |
+
 ## Runtime, Context, And Agent Architecture
 
 | Document | State | Role |
@@ -27,8 +36,13 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) | Index | Reader entry point for agent runtime maturity, typed session collaboration, TUI relationship visibility, and the skill product loop. |
 | [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md) | Active Plan | Defines trace, eval, durable resume, MCP context primitive, memory quality, and loop taxonomy gaps for the next runtime maturity slice. |
 | [context-governance-index.md](./context-governance-index.md) | Index | Reader entry point for context governance ownership across compact, working set, behavior trace, cache observability, memory, and tool-loop recovery. |
-| [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift to `/`, context-estimate calibration, and storage-backed session recall tools. Phase A (path classification hardening) and Phase C (recall tool storage contract) closed 2026-06-17. |
+| [context-cwd-drift-and-recall-governance-plan.md](./context-cwd-drift-and-recall-governance-plan.md) | Active Plan | Real-session regression plan for prompt-derived cwd drift, context-estimate calibration, storage-backed session recall tools, Nexus continuity wiring, and user-artifact continuity. Phase A / A Follow-up / B / C1 are closed; Phase C2 / D / E / F remain open, with `session_10320709` as the current P0 follow-up. |
 | [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md) | Active Plan | Cache health observability, honest unavailable states for non-prompt cache families, and Nexus realtime detection integration phases. |
+| [long-running-context-assembly.md](./long-running-context-assembly.md) | Active Plan | Long-running context assembly: Nexus-owned working set, resume pack, context assembly REST/CLI/WS, persisted working-set hot path injection, redacted `/v1/context/observe`, resume preview product path, Go TUI runtime-owned rendering, and R0-R7 real-session replay gate. R0 / R1 / R2 / R3 / R4 / R5 / R6 / R7 all closed as of 2026-06-20; promoted from `proposals/` to `reference/` on 2026-06-21. |
+| [runtime-tool-permission-flow-reference.md](./runtime-tool-permission-flow-reference.md) | Active Plan | Extract one shared tool-permission flow (effective-risk → policy → hooks → scope-boundary → pending registry → audit → events) used by both `LLMCodingRuntime` and `LocalCodingRuntime`, eliminating the duplicated permission/risk/policy code. (Architecture review P1-4.) |
+| [task-scope-root-inference-reference.md](./task-scope-root-inference-reference.md) | Active Plan | Correctness boundaries for `inferProjectRoot` (multi-ecosystem root-marker table) and `extractBashTargetPaths` (redirection-aware, honest about `$()` non-support) so the P0 task-scope guardrail stops false-positiving on non-JS/Go projects. (Architecture review P1-6.) |
+| [storage-interface-segregation-reference.md](./storage-interface-segregation-reference.md) | Active Plan | Segregate the 48-method `NexusStorage` into per-domain sub-interfaces and make repositories polymorphic across SQLite / Memory backends; extends coupling-plan Phase 9 (Stream G). (Architecture review P2-9.) |
+| [streaming-pipeline-realtime-rendering-fix.md](./streaming-pipeline-realtime-rendering-fix.md) | Guide | Three-layer fix (Path 0 / Path 1 / Path 2) postmortem that took the streaming pipeline from "single batched dump at end of turn" to "word-by-word real-time rendering". Closed 2026-06-21 against real session `session_ff3a874d`. WS time trace: before 86 ms span → after 3546 ms span. Bisect targets listed in the doc for any future regression. |
 
 ## Evidence, Scope, And Session Governance
 

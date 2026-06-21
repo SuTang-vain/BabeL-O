@@ -14,7 +14,7 @@ import {
   WorkingSetTracker,
   deriveEntriesFromEvents,
   type WorkingSetEntry,
-} from '../src/nexus/workingSetTracker.js'
+} from '../src/runtime/workingSetTracker.js'
 import { assembleContext } from '../src/runtime/contextAssembler.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 

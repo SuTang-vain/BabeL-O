@@ -184,8 +184,8 @@
 
 > **判定**:**有 1 个非维护者提交了第一个 PR 并被 merge**;**GitHub Discussions 出现 5 个真实用户问题并被回答**。
 
-### W4.1 CONTRIBUTING.md + 治理文档[P0]
-- **现状**:贡献者没有任何引导;`AGENTS.md` 是给 AI agent 看的(且维护者专属)。
+### W4.1 CONTRIBUTING.md + 治理文档[P0] ✅ 部分收口（2026-06-18）
+- **现状**:贡献者没有任何引导;`AGENTS.md` 是给 AI agent 看的(且维护者专属)。2026-06-18 已补 contributor-facing 入口，首个外部 PR merge 仍待真实社区验证。
 - **改动**:
   - 新增 `CONTRIBUTING.md`,覆盖:
     - 仓库布局 + 模块边界(把 `docs/nexus/README.md` 摘要搬过去)。
@@ -195,17 +195,17 @@
     - 决策机制(谁来 merge / 什么是 RFC / 怎么升级 Phase)。
   - 新增 `GOVERNANCE.md`(简短):维护者名单 + 决策权 + bus factor 当前值(诚实标注) + 招募 maintainer 的明确渠道。
   - 同步 `AGENTS.md` 加 "AI agent 提交前先读 CONTRIBUTING.md" 的引用。
-- **产物**:`CONTRIBUTING.md` + `GOVERNANCE.md` + `.github/ISSUE_TEMPLATE/` + `.github/PULL_REQUEST_TEMPLATE.md`。
-- **收口**:首个外部 PR 按 checklist 走完被 merge。
+- **产物**:`CONTRIBUTING.md` + `GOVERNANCE.md` + `.github/ISSUE_TEMPLATE/` + `.github/PULL_REQUEST_TEMPLATE.md` 已落地；`AGENTS.md` 已引用 contributor-facing 文档；README / README.zh-CN 顶部已补贡献与 Discussions 徽章。
+- **收口**:文档产物已完成；最终产品收口仍需首个外部 PR 按 checklist 走完并被 merge。
 
 ### W4.2 GitHub Discussions 启用 + 社区入口[P0]
-- **现状**:社区入口 0;用户问题全部塞进 issue,污染 bug tracker。
+- **现状**:社区入口 0;用户问题全部塞进 issue,污染 bug tracker。2026-06-18 已补 README/GOVERNANCE 入口和 owner 手动启用清单，GitHub Settings 开关仍需仓库 owner 执行。
 - **改动**:
-  - GitHub 仓库 Settings → 启用 Discussions,预置 4 个 category:Q&A / Show and tell / Ideas / General。
+  - GitHub 仓库 Settings → 启用 Discussions,预置 4 个 category:Q&A / Show and tell / Ideas / General（操作清单见 [github-discussions-setup-guide.md](../reference/github-discussions-setup-guide.md)）。
   - README 顶部加 Discussion 徽章和链接,中英双版。
   - 维护者承诺:每个工作日回复一次 Discussions(写在 GOVERNANCE.md)。
   - 短期:**不**做 Discord/Slack(单点维护者维护不过来),只做 GitHub Discussions。
-- **产物**:Discussions 启用 + README 链接 + GOVERNANCE.md 承诺。
+- **产物**:README / README.zh-CN 链接 + GOVERNANCE.md 承诺 + [github-discussions-setup-guide.md](../reference/github-discussions-setup-guide.md) 已落地；Discussions 启用仍需 owner 在 GitHub Settings 执行。
 - **收口**:启用 30 天内,至少 5 个真实用户问题被回答。
 
 ### W4.3 版本故事聚合 + 升级引导[P1]

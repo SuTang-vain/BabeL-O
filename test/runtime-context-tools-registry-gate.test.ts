@@ -3,13 +3,16 @@
 // Phase A Follow-up (2026-06-18) integration: storage-aware gate in
 // createDefaultToolRegistry. When the registry is built with
 // `storage: null` (e.g. Go TUI local mode / Explore agent with no
-// storage), the 3 context* tools MUST NOT be registered — otherwise the
+// storage), the 4 context* tools MUST NOT be registered — otherwise the
 // model prompt advertises tools that always return
 // CONTEXT_STORAGE_UNAVAILABLE, wasting turns and corrupting session
 // recall (session_cf361f04 event_seq=16671).
 //
-// When storage IS provided (default Nexus path), the 3 tools ARE
+// When storage IS provided (default Nexus path), the 4 tools ARE
 // registered, and `contextSearch` should function normally.
+//
+// 2026-06-20: extended to 4 tools (added contextSessions for Bug 1.1
+// cross-session metadata search).
 
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
@@ -20,18 +23,20 @@ import { NEXUS_EVENT_SCHEMA_VERSION } from '../src/shared/events.js'
 import { randomUUID } from 'node:crypto'
 
 describe('createDefaultToolRegistry storage gate', () => {
-  test('default (no opts) keeps all 3 context tools for back-compat', () => {
+  test('default (no opts) keeps all 4 context tools for back-compat', () => {
     const reg = createDefaultToolRegistry()
     assert.ok(reg.has('contextSearch'), 'contextSearch registered by default')
     assert.ok(reg.has('contextSummarize'), 'contextSummarize registered by default')
     assert.ok(reg.has('contextRecent'), 'contextRecent registered by default')
+    assert.ok(reg.has('contextSessions'), 'contextSessions registered by default')
   })
 
-  test('storage: null hides all 3 context tools', () => {
+  test('storage: null hides all 4 context tools', () => {
     const reg = createDefaultToolRegistry({ storage: null })
     assert.ok(!reg.has('contextSearch'), 'contextSearch hidden when no storage')
     assert.ok(!reg.has('contextSummarize'), 'contextSummarize hidden when no storage')
     assert.ok(!reg.has('contextRecent'), 'contextRecent hidden when no storage')
+    assert.ok(!reg.has('contextSessions'), 'contextSessions hidden when no storage')
     // Non-context tools still present
     assert.ok(reg.has('Read'), 'Read still present')
     assert.ok(reg.has('Bash'), 'Bash still present')
@@ -73,6 +78,6 @@ describe('createDefaultToolRegistry storage gate', () => {
       minimal.size < full.size,
       `minimal=${minimal.size} should be < full=${full.size}`,
     )
-    assert.equal(full.size - minimal.size, 3, 'exactly 3 tools (context*) hidden')
+    assert.equal(full.size - minimal.size, 4, 'exactly 4 tools (context*) hidden')
   })
 })

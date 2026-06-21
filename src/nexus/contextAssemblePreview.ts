@@ -7,7 +7,7 @@
 import { existsSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { PersistedWorkingSetTracker } from './persistedWorkingSetTracker.js'
+import { PersistedWorkingSetTracker } from '../runtime/persistedWorkingSetTracker.js'
 import {
   BEHAVIOR_TRACE_RELATIVE_PATH,
   type BehaviorTraceEntry,

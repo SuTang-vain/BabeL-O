@@ -40,6 +40,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
@@ -269,6 +270,24 @@ type InteractiveModel struct {
 	// a side argument so the Add/Remove plumbing stays
 	// symmetric with loopClient / reconciler.
 	wsObserver *WorkingSetObserver
+	// ctxObserver is the R6 per-cwd assembled-context WS
+	// observer (consumes `/v1/context/observe`). nil means
+	// the observer is disabled (in-memory / no-Nexus mode
+	// or the server doesn't support the route). Lifecycle
+	// mirrors wsObserver: auto-started from Init via
+	// Start(); Update switch handles
+	// ctxObserverConnectMsg / ctxObserverReconnectMsg /
+	// ctxObserverEventMsg / ctxObserverErrMsg.
+	ctxObserver *ContextObserver
+	// ctxObservation holds the most recent observer
+	// snapshot per (cwd, sessionID). The renderer reads
+	// from here rather than deriving context truth — R6
+	// acceptance requires the TUI to say "not observed"
+	// when the map is empty rather than invent a summary.
+	// Keyed by cwd|sessionID; sessionID may be empty when
+	// the observer is per-cwd-only.
+	ctxObservation   map[string]ContextObservation
+	ctxObservationMu sync.Mutex
 }
 
 type createPaneSessionDoneMsg struct {
@@ -403,6 +422,18 @@ func NewInteractiveModelWithDefaultCwd(model InteractiveModel, cwd string) Inter
 // RunOnce directly.
 func NewInteractiveModelWithWorkingSetObserver(model InteractiveModel, observer *WorkingSetObserver) InteractiveModel {
 	model.wsObserver = observer
+	return model
+}
+
+// NewInteractiveModelWithContextObserver attaches the R6
+// per-cwd assembled-context WS observer to the
+// InteractiveModel. Auto-started from Init() so the
+// operator's status line gets runtime-owned context truth
+// as soon as the TUI comes up. Pass `nil` to disable
+// (in-memory / no-Nexus / server doesn't expose
+// `/v1/context/observe`).
+func NewInteractiveModelWithContextObserver(model InteractiveModel, observer *ContextObserver) InteractiveModel {
+	model.ctxObserver = observer
 	return model
 }
 
@@ -576,6 +607,12 @@ func (m InteractiveModel) Init() tea.Cmd {
 	if m.wsObserver != nil {
 		cmds = append(cmds, m.wsObserver.Start(context.Background()))
 	}
+	// R6: start the assembled-context observer alongside
+	// the working-set observer. nil-safe — Start returns
+	// nil when the client is missing (in-memory test mode).
+	if m.ctxObserver != nil {
+		cmds = append(cmds, m.ctxObserver.Start(context.Background()))
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -666,6 +703,38 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// updated; the message is currently a no-op,
 		// reserved for future toasts / diagnostics.
 		return m, nil
+
+	case ctxObserverConnectMsg:
+		// R6: the assembled-context WS dial finished.
+		// On success we kick off a per-event drain cmd
+		// and remember the close fn for shutdown. On
+		// dial failure we schedule a backoff reconnect
+		// and mark the observation as disconnected so
+		// the renderer falls back to "context: not
+		// observed" rather than reuse stale state.
+		return m, m.handleCtxObserverConnect(msg)
+
+	case ctxObserverReconnectMsg:
+		// R6: a previously scheduled backoff reconnect
+		// fired. Re-dial.
+		if msg.observer == nil {
+			return m, nil
+		}
+		return m, msg.observer.ConnectCmd()
+
+	case ctxObserverEventMsg:
+		// R6: one server-pushed assembled-context frame.
+		// The handle dispatches by Type (snapshot /
+		// assembled / error) and schedules the next read
+		// so the same channel keeps flowing.
+		return m, m.handleCtxObserverEvent(msg)
+
+	case ctxObserverErrMsg:
+		// R6: a read error / clean close from the
+		// context observer's stream. Schedules a backoff
+		// reconnect and marks the observation as
+		// disconnected.
+		return m, m.handleCtxObserverErr(msg)
 
 	case b2TraceLoadedMsg:
 		// PR-B2: fetch trace response arrived. The overlay
