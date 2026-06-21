@@ -106,11 +106,91 @@ describe('PR-7 searchEvents', () => {
   test('enforces 5k token cap', () => {
     const big: NexusEvent[] = []
     for (let i = 0; i < 1000; i += 1) {
-      big.push(mkEvent('user_message', { text: 'x'.repeat(100) + ' MATCH' }))
+      // Distinct text per event so same-type dedup does not collapse them —
+      // the cap test needs genuinely distinct snippets to exercise truncation.
+      big.push(mkEvent('user_message', { text: `item-${i}-` + 'x'.repeat(80) + ' MATCH' }))
     }
     const r = searchEvents(big, 'MATCH', { maxTokens: 100 })
     assert.equal(r.truncated, true, 'content must be truncated')
     assert.ok(r.tokenEstimate <= 100, `tokenEstimate=${r.tokenEstimate} must be ≤ 100`)
+  })
+})
+
+// Regression coverage for the tokenized AND-substring algorithm + diagnostics
+// landed 2026-06-21 against session_06308b17. See
+// docs/nexus/proposals/context-search-algorithm-robustness-plan.md.
+describe('contextSearch algorithm + robustness (2026-06-21)', () => {
+  test('tokenized AND match: every whitespace-separated token must appear', () => {
+    const events: NexusEvent[] = [
+      mkEvent('user_message', { text: 'analyze the memory leak in the runtime' }),
+      mkEvent('user_message', { text: 'memory optimization notes' }),
+      mkEvent('user_message', { text: 'runtime crash log' }),
+    ]
+    // 'memory' + 'runtime' both appear only in event 0 → AND match hits 1.
+    const r = searchEvents(events, 'memory runtime')
+    assert.equal(r.hitCount, 1, `expected 1 AND match, got ${r.hitCount}`)
+    assert.ok(r.content.includes('memory leak'))
+  })
+
+  test('AND match excludes events missing any token', () => {
+    const events: NexusEvent[] = [
+      mkEvent('user_message', { text: 'memory leak here' }),
+      mkEvent('user_message', { text: 'runtime leak here' }),
+    ]
+    // 'memory' + 'runtime' never co-occur → 0 hits.
+    const r = searchEvents(events, 'memory runtime')
+    assert.equal(r.hitCount, 0)
+  })
+
+  test('single CJK token still matches as substring (no regression)', () => {
+    const events: NexusEvent[] = [
+      mkEvent('user_message', { text: '分析这个项目架构的合理以及先进性' }),
+    ]
+    const r = searchEvents(events, '先进性')
+    assert.equal(r.hitCount, 1)
+  })
+
+  test('newest-first ordering: later events surface first', () => {
+    const events: NexusEvent[] = [
+      mkEvent('user_message', { text: 'first MATCH' }),
+      mkEvent('user_message', { text: 'second MATCH' }),
+      mkEvent('user_message', { text: 'third MATCH' }),
+    ]
+    const r = searchEvents(events, 'MATCH')
+    assert.equal(r.hitCount, 3)
+    const lines = r.content.split('\n---\n')
+    assert.ok(lines[0].includes('third'), 'newest (third) should be first')
+  })
+
+  test('same-type consecutive dedup collapses identical snippets', () => {
+    const events: NexusEvent[] = []
+    for (let i = 0; i < 5; i += 1) {
+      // Identical text + same timestamp → identical snippet → collapsed to 1.
+      events.push(mkEvent('assistant_delta', { text: 'dupe-content' }))
+    }
+    const r = searchEvents(events, 'dupe-content')
+    assert.equal(r.hitCount, 5, 'hitCount counts all matches')
+    const lines = r.content.split('\n---\n')
+    assert.equal(lines.length, 1, `deduped to 1 line, got ${lines.length}`)
+  })
+
+  test('eventsScanned / eventsCapped diagnostics are echoed from options', () => {
+    const events: NexusEvent[] = [
+      mkEvent('user_message', { text: 'MATCH here' }),
+    ]
+    const r = searchEvents(events, 'MATCH', {
+      eventsScanned: 11_997,
+      eventsCapped: true,
+    })
+    assert.equal(r.eventsScanned, 11_997)
+    assert.equal(r.eventsCapped, true)
+  })
+
+  test('diagnostics default to undefined when caller supplies nothing', () => {
+    const events: NexusEvent[] = [mkEvent('user_message', { text: 'MATCH' })]
+    const r = searchEvents(events, 'MATCH')
+    assert.equal(r.eventsScanned, undefined)
+    assert.equal(r.eventsCapped, undefined)
   })
 })
 
