@@ -71,7 +71,11 @@ Net result: one watchdog, one log line, one error-delivery path, for both transp
 
 ### Phase 3 — Stale-session observability
 
-`metrics.ts:295-302` (activeAgeMs sampling in `snapshot()`) is already written. Land it behind the same deployment as Phases 1–2. Optional follow-up: a `BehaviorMonitor` detector that flags `activeAgeMs > threshold` as an anomaly. Coupling constraint: the detector must read via the existing `behaviorMonitor.ingest()` push from nexus (nexus → runtime, permitted), NOT by importing `NexusMetrics` from runtime (which would be a blocked `runtime → nexus` reverse edge).
+`metrics.ts` `activeAgeMs` sampling in `snapshot()` is already written AND already deployed: `/v1/runtime/status` (`runtimeStatusRouter.ts:57`) returns `metrics: await context.runtimeMetricsSnapshot()`, which spreads `snapshot()` (including `stream.activeAgeMs`) into the response. So a hung stream is observable via status without querying SQLite.
+
+Phase 3 fix (2026-06-21): the delta-accumulation in `recordStreamActiveAge` left `lastStreamActiveSampleMs` pinned at its last poll value when `activeCount` dropped to 0. A NEW stream starting much later would, on its first poll, accumulate the entire idle gap as its own `activeAgeMs` — a false "hung" signal that trains operators to ignore the metric (defeating the observability goal). The fix resets `lastStreamActiveSampleMs = 0` alongside `activeAgeMs = 0` in the `activeCount === 0` branch, so each new stream re-seeds cleanly. Regression: `test/metrics-active-age.test.ts` adds the "new stream after a finish gap does not inherit the idle period" case (mutation-verified: fails without the reset).
+
+Optional follow-up (deferred): a `BehaviorMonitor` detector that flags `activeAgeMs > threshold` as an anomaly. Coupling constraint: the detector must read via the existing `behaviorMonitor.ingest()` push from nexus (nexus → runtime, permitted), NOT by importing `NexusMetrics` from runtime (which would be a blocked `runtime → nexus` reverse edge). Not implemented — `activeAgeMs` is already surfaced to the Go TUI / operator via `/v1/runtime/status`; a push detector is a nice-to-have, not a P0 regression guard.
 
 ## Coupling & Cohesion Requirements
 
@@ -91,7 +95,7 @@ Cohesion note: the watchdog belongs in ONE place (`prepareExecution`, the shared
 | --- | --- | --- | --- |
 | Phase 1 | Landed 2026-06-21 | Active abort propagation: `parseSSE` accepts `signal`, `readerToAsyncIterable` calls `reader.cancel()` on abort; `OpenAIAdapter` + `AnthropicAdapter` thread `options?.signal` | `test/sse-abort-propagation.test.ts` (4 tests): a silent stream unblocks within ~1s of abort, not hours. `architecture-boundary.test.ts` canonical-shape invariant green. |
 | Phase 2 | Landed 2026-06-21 | Removed redundant WS `watchdogTimer` (`executeStreamRoute.ts:189-209`); added `logger.warn` to `prepared.timeout` (`executionPreparation.ts:220`); WS `details.kind='watchdog'` REQUEST_TIMEOUT delivered via settlement/forward path (`processRuntimeExecutionEvent` → `maybeDecorateWatchdogError` → `forwardProcessedRuntimeEvent`) | `executeStreamRoute.ts` has one watchdog path (the shared `prepared.timeout`); `test/execute-stream-watchdog.test.ts` pins the single-source firing contract; `runtime.test.ts:6087` (soft decorates) + `:6191` (fatal doesn't) still green; `coupling:audit:gate` + `deps:audit` exit 0. |
-| Phase 3 | Draft | Deploy `metrics.snapshot()` activeAgeMs (already written); optional BehaviorMonitor `activeAgeMs` anomaly detector via `ingest()` | `/v1/runtime/status` shows growing `stream.activeAgeMs` during a hung stream and 0 after it terminates; detector (if added) emits an anomaly without importing `NexusMetrics` from runtime. |
+| Phase 3 | Landed 2026-06-21 | `activeAgeMs` already deployed via `/v1/runtime/status`; fixed the `lastStreamActiveSampleMs` not-reset-on-finish false-positive (new stream after an idle gap no longer inherits the gap as inflated age). Optional BehaviorMonitor `activeAgeMs` detector deferred (would use `ingest()` push) | `/v1/runtime/status` shows growing `stream.activeAgeMs` during a hung stream and 0 after it terminates; `test/metrics-active-age.test.ts` (6 tests) pins the reset, mutation-verified. Detector (if added later) must emit an anomaly without importing `NexusMetrics` from runtime. |
 
 ## Verification
 
@@ -120,7 +124,7 @@ hard watchdog 其实早就在 `executionPreparation.ts:220-224` 写好了（HTTP
 
 - **Phase 1**：在 adapter（`OpenAIAdapter` / `AnthropicAdapter`）拿到 `response` 后注册 `signal.addEventListener('abort', () => response.body.cancel())`，主动 error 掉 locked reader → `reader.read()` reject → 沿 `parseSSE` → `queryStream` → `providerTurn` 的 `for await` 抛出 → `LLMCodingRuntime:847` catch → `:1040` 分类为 timeout。照搬 `toolExecutor.ts:67` 已有的 active-listener 模式。
 - **Phase 2**：删掉 `executeStreamRoute.ts:189-209` 的冗余 `watchdogTimer`（和 `prepared.timeout` 同时刻 fire，是 cohesion 缺陷）；给 `prepared.timeout` 加一行 `logger.warn`；WS 的 `details.kind='watchdog'` 错误事件走 settlement/forward 既有路径，不靠第二个 timer。
-- **Phase 3**：部署 `metrics.snapshot()` 的 `activeAgeMs`（已写）；可选 BehaviorMonitor detector 必须走 `ingest()` push（nexus → runtime 合法），不能从 runtime import `NexusMetrics`（那是被 `coupling:audit:gate` 禁的 `runtime → nexus` 反向边）。
+- **Phase 3**：`activeAgeMs` 早已通过 `/v1/runtime/status` 暴露（`runtimeStatusRouter` 返回 `metrics.snapshot()`）。修了 `recordStreamActiveAge` 的一个 false-positive：流结束后 `lastStreamActiveSampleMs` 没重置，导致新流启动时会继承空闲期作为虚假 inflated age（操作者会被训练成忽略这个指标）。修复在 `activeCount===0` 时一并重置 sample clock。可选 BehaviorMonitor detector 仍 deferred——若做必须走 `ingest()` push（nexus → runtime 合法），不能从 runtime import `NexusMetrics`（那是被 `coupling:audit:gate` 禁的 `runtime → nexus` 反向边）；`activeAgeMs` 已对 Go TUI/操作者可见，push detector 是 nice-to-have 而非 P0 回归保障。
 
 ### 架构耦合约束
 
@@ -128,8 +132,8 @@ hard watchdog 其实早就在 `executionPreparation.ts:220-224` 写好了（HTTP
 
 ### 当前状态
 
-部分落地（2026-06-21）。Phase 1（`sse.ts` 的 `reader.cancel()` + 两 adapter 透传 signal）和 Phase 2（删冗余 WS watchdog、`prepared.timeout` 加 `logger.warn`、WS kind=watchdog 走 settlement）已合入分支 `fix/provider-stream-abort-propagation`，回归全绿。Phase 3（activeAgeMs 部署 + 可选 BehaviorMonitor detector）待办。三段全落地后毕业到 `reference/` 或合并进 `history/`。
+核心三阶段全部落地（2026-06-21，分支 `fix/provider-stream-abort-propagation`）。Phase 1（`sse.ts` 的 `reader.cancel()` + 两 adapter 透传 signal）+ Phase 2（删冗余 WS watchdog、`prepared.timeout` 加 `logger.warn`、WS kind=watchdog 走 settlement）+ Phase 3（`activeAgeMs` 已部署 + 修 false-positive 重置）回归全绿。仅可选的 BehaviorMonitor push detector 仍 deferred。全部落地后毕业到 `reference/` 或合并进 `history/`。
 
 ### 下一步
 
-Phase 3：部署 `metrics.snapshot()` 的 `activeAgeMs`（已写未部署），让 `/v1/runtime/status` 能在零 stream event 的情况下反映持续增长的 `stream.activeAgeMs`；可选 BehaviorMonitor detector 走 `ingest()` push（nexus → runtime 合法），不能从 runtime import `NexusMetrics`。
+可选：BehaviorMonitor `activeAgeMs` anomaly detector（走 `ingest()` push，nexus → runtime 合法；不能从 runtime import `NexusMetrics`）。非 P0——`activeAgeMs` 已通过 `/v1/runtime/status` 对操作者/Go TUI 可见。

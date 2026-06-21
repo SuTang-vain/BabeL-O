@@ -249,6 +249,15 @@ export class NexusMetrics {
   recordStreamActiveAge(nowMs: number): void {
     if (this.stream.activeCount === 0) {
       this.stream.activeAgeMs = 0
+      // Phase 3 fix (2026-06-21): also reset the sample clock. A
+      // stream that finished left lastStreamActiveSampleMs pinned at
+      // its last poll time; a NEW stream starting much later would
+      // then accumulate the whole idle gap as its own age on the
+      // first poll — a false "hung" signal that trains operators to
+      // ignore activeAgeMs. Resetting here makes the next active
+      // stream re-seed cleanly (first poll seeds at 0, subsequent
+      // polls accumulate real elapsed).
+      this.lastStreamActiveSampleMs = 0
       return
     }
     // Approximate: bump activeAgeMs by delta since last sample.

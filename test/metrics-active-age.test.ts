@@ -92,3 +92,45 @@ test('snapshot returns 0 activeAgeMs once stream finishes, even with no prior sn
   metrics.recordStreamFinish({ success: true, timedOut: false, clientClosed: false, durationMs: 0 })
   assert.equal(metrics.snapshot().stream.activeAgeMs, 0)
 })
+
+test('new stream after a finish gap does not inherit the idle period as inflated activeAgeMs', async () => {
+  // Phase 3 regression (2026-06-21): when a stream finishes and the
+  // sample clock is left pinned at its last poll time, the NEXT
+  // stream to start — possibly hours later — would, on its first
+  // poll, accumulate the entire idle gap as its own activeAgeMs.
+  // That false "hung" signal trains operators to ignore the metric,
+  // defeating the whole point of surfacing it. The fix resets the
+  // sample clock when activeCount drops to 0, so each new stream
+  // re-seeds cleanly. This is the case the delta-accumulation
+  // design got wrong before the reset.
+  const metrics = new NexusMetrics()
+  metrics.recordStreamStart()
+  await wait(20)
+  metrics.snapshot() // seed + accumulate a little
+  metrics.recordStreamFinish({ success: true, timedOut: false, clientClosed: false, durationMs: 25 })
+  // Idle gap — no active stream. Snapshots during the gap must
+  // report 0 and, critically, must reset the sample clock.
+  assert.equal(metrics.snapshot().stream.activeAgeMs, 0)
+  await wait(40) // simulate a long idle period before the next stream
+
+  // A fresh stream starts. Its first poll must NOT report the ~40ms
+  // idle gap (let alone a multi-hour one) as its age.
+  metrics.recordStreamStart()
+  await wait(10)
+  const firstAge = metrics.snapshot().stream.activeAgeMs
+  assert.ok(
+    firstAge < 40,
+    `new stream's first-poll activeAgeMs must reflect only its own elapsed time (<40ms), not the idle gap; got ${firstAge}`,
+  )
+  assert.ok(firstAge >= 0)
+  await wait(20)
+  const secondAge = metrics.snapshot().stream.activeAgeMs
+  assert.ok(
+    secondAge >= firstAge,
+    `second poll should grow from first (${firstAge}); got ${secondAge}`,
+  )
+  assert.ok(
+    secondAge < 80,
+    `second-poll activeAgeMs must stay bounded by the new stream's own age, not the prior idle gap; got ${secondAge}`,
+  )
+})
