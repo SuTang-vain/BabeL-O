@@ -25,12 +25,13 @@ const inputSchema = z.object({
 export const contextSearchTool: ToolDefinition<typeof inputSchema> = {
   name: 'contextSearch',
   description: 'Full-text search over the session event stream. ' +
-    'Searches across all text fields of each event (user_message.text, ' +
-    'error.message, tool input strings, etc). Case-insensitive by default. ' +
-    'Returns a capped summary of matching events; check truncated flag to ' +
-    'detect if more results were dropped. Does NOT enter active context — ' +
-    'use this to fetch history on demand.',
-  prompt: () => 'contextSearch is an on-demand history locator. Use it when the user asks about past activity ("what did we do earlier", "did we already see this error", "find the previous decision about X"). It searches across all event text fields — user messages, assistant deltas, tool inputs, error messages — and returns matching events as capped snippets. Prefer it over Grep when searching session history (Grep is for files, contextSearch is for events). The result is locator evidence; use Read on referenced paths to verify claims. Set sinceMs to bound the search window when you know the rough time range. maxTokens caps the response (default 5000); if truncated is true, narrow the query or sinceMs to fetch more targeted results. eventTypeFilter narrows to specific event types when you know what to look for. Returns do NOT enter active context — call this only when you actually need historical evidence.',
+    'The query is split on whitespace into keywords; every keyword must ' +
+    'appear as a substring (case-insensitive by default) in some text field ' +
+    'of an event for it to match. Use distinctive keywords, not full ' +
+    'sentences. Returns matching events as capped snippets, newest first. ' +
+    'Check truncated / eventsCapped to detect dropped results. ' +
+    'Does NOT enter active context — use this to fetch history on demand.',
+  prompt: () => 'contextSearch is an on-demand history locator. Use it when the user asks about past activity ("what did we do earlier", "did we already see this error", "回顾一下之前的任务"). Matching is TOKENIZED SUBSTRING: the query is split on whitespace, and an event matches only when EVERY keyword appears as a substring of its text fields. Use distinctive keywords, not full sentences — `query="memory leak"` works, `query="find the previous decision about the memory leak"` does not. It searches user messages, assistant output, tool inputs, and error messages. Prefer it over Grep when searching session history (Grep is for files, contextSearch is for events). Use Read on referenced paths to verify claims. Set sinceMs to bound the search window when you know the rough time range. eventTypeFilter narrows to specific event types (e.g. ["user_message"]) AND pushes the filter to storage so long sessions do not drop recent matches. maxTokens caps the response (default 5000). If `truncated` is true, narrow the query or sinceMs. If `eventsCapped` is true, the loaded window hit a row cap — narrow with eventTypeFilter or sinceMs rather than rewording the query, since the missing matches may not have been loaded. Returns do NOT enter active context — call this only when you actually need historical evidence.',
   risk: 'read',
   inputSchema,
   source: { type: 'builtin' },
@@ -47,16 +48,29 @@ export const contextSearchTool: ToolDefinition<typeof inputSchema> = {
       }
     }
     try {
-      const result = await context.storage.listEvents(context.sessionId, {
-        order: 'asc',
-        limit: 10_000,
-      })
+      // When eventTypeFilter is set, push it to storage as `eventTypes` so
+      // the SQL WHERE clause filters BEFORE the row LIMIT. Without this
+      // pushdown, a long session (>10k events) silently drops the newest
+      // matching events because listEvents applies LIMIT on an ascending
+      // scan before the in-memory type filter. See
+      // docs/nexus/proposals/context-search-algorithm-robustness-plan.md.
+      const listOptions: {
+        order: 'asc'
+        limit: number
+        eventTypes?: string[]
+      } = { order: 'asc', limit: 50_000 }
+      if (input.eventTypeFilter && input.eventTypeFilter.length > 0) {
+        listOptions.eventTypes = input.eventTypeFilter
+      }
+      const result = await context.storage.listEvents(context.sessionId, listOptions)
       const events = (result?.events ?? []) as NexusEvent[]
       const search = searchEvents(events, input.query, {
         sinceMs: input.sinceMs,
         maxTokens: input.maxTokens,
         caseSensitive: input.caseSensitive,
         eventTypeFilter: input.eventTypeFilter as NexusEvent['type'][] | undefined,
+        eventsScanned: events.length,
+        eventsCapped: result?.nextCursor !== undefined,
       })
       return { success: true, output: search }
     } catch (error) {

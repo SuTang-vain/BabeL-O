@@ -1,6 +1,6 @@
 # Context Search Algorithm And Robustness Plan
 
-> State: Draft
+> State: Partially Landed
 > Track: Tools / Context / Storage
 > Priority: P0 — real-session regression: `contextSearch` returns empty across a long session, forcing the model into a multi-retry loop that still misses the newest user messages
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../WORK_LOG.md](../WORK_LOG.md), `src/tools/builtin/contextSearch.ts`, `src/tools/contextTools.ts`, `src/storage/Storage.ts`, `src/storage/EventRepository.ts`, `src/storage/MemoryStorage.ts`, `test/contextTools.test.ts`
@@ -98,9 +98,9 @@ Rewrite `contextSearch.ts:27-33` `description` and `prompt` to state the actual 
 
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
-| Phase 0 | Draft | This plan, indexed in `proposals/README.md`, with a reproduction script that runs the regression session's 5 queries against the current `searchEvents` and confirms 0 hits for queries 1–4. | Reproduction script committed; `npm run docs:check` passes. |
-| Phase 1 | Open | Tokenized AND-substring match in `searchEvents`; newest-first ordering + same-type dedup; `EventListOptions.eventTypes` pushdown in `EventRepository` + `MemoryStorage`; `contextSearch` passes `eventTypes` and raises `limit` to 50,000; add `eventsScanned` / `eventsCapped` to the result and surface in tool output; rewrite tool `prompt`/`description`; unit tests for tokenization, CJK single-token, pushdown, and the 10k-cap bypass. | Reproduction script returns ≥1 hit for queries 1–4 on first call; query 5 returns all 7 user messages; `npm test` green; `npm run typecheck` / `format:check` / `deps:audit` green. |
-| Phase 2 | Watch | CJK bigram scoring for reordered Chinese queries, gated on a real Phase-1 query that AND-substring cannot satisfy. | A real session query that Phase 1 misses is resolved by bigram scoring without over-retrieving on `assistant_delta`. |
+| Phase 0 | Closed 2026-06-21 | This plan, indexed in `proposals/README.md`, with a reproduction script that runs the regression session's 5 queries against the current `searchEvents` and confirms 0 hits for queries 1–4. | Reproduction script committed; `npm run docs:check` passes. |
+| Phase 1 | Closed 2026-06-21 | Tokenized AND-substring match in `searchEvents`; newest-first ordering + same-type dedup; `EventListOptions.eventTypes` pushdown in `EventRepository` + `MemoryStorage`; `contextSearch` passes `eventTypes` and raises `limit` to 50,000; add `eventsScanned` / `eventsCapped` to the result and surface in tool output; rewrite tool `prompt`/`description`; unit tests for tokenization, CJK single-token, pushdown, and the 10k-cap bypass. | Reproduction script returns ≥1 hit for queries 1–4 on first call (observed: queries 1–3 hit 3 each via assistant_output reuse of the same keywords; query 4 hits 16); query 5 returns all 8 user_message events (was 5 of 8); `npm test` green; `npm run typecheck` / `deps:audit` green. |
+| Phase 2 | Watch | CJK bigram scoring for reordered Chinese queries, gated on a real Phase-1 query that AND-substring cannot satisfy. Phase 1 did NOT trigger this gate — queries 1–3 matched because the model's own prior assistant output reused the same keywords, so reordered user-message text was not the matching path. Gate remains open for a future real query. | A real session query that Phase 1 misses is resolved by bigram scoring without over-retrieving on `assistant_delta`. |
 | Phase 3 | Open | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 is closed against the regression session; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check`; `reference/README.md` updated. |
 
 ## Verification
