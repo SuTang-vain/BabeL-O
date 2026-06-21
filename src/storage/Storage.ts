@@ -23,6 +23,14 @@ export type EventListOptions = {
   limit?: number
   cursor?: string
   order?: 'asc' | 'desc'
+  /**
+   * Optional server-side event-type filter. When set, only events whose
+   * `type` is in this list are returned. For SQLite this is pushed down to
+   * `WHERE event_type IN (...)` so a filtered query is not bounded by the
+   * row `limit` in the way an unfiltered ascending scan is. Used by
+   * `contextSearch` to bypass the 10k-row cap when `eventTypeFilter` is set.
+   */
+  eventTypes?: string[]
 }
 
 export type EventListResult = {
