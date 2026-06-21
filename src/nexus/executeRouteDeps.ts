@@ -31,6 +31,7 @@ import type { NexusStorage } from '../storage/Storage.js'
 import type { ExecutionGate } from './executionGate.js'
 import type { NexusMetrics } from './metrics.js'
 import type { ActiveExecutionRegistry } from './activeExecutionRegistry.js'
+import type { ShutdownSignal } from './daemonLifecycle.js'
 
 /**
  * The 11 shared dependency fields consumed by both
@@ -55,6 +56,14 @@ export type ExecuteRouteSharedDeps = {
   metrics: NexusMetrics
   activeExecutionRegistry: ActiveExecutionRegistry
   behaviorMonitor?: BehaviorMonitor
+  /**
+   * Daemon graceful-shutdown flag (Phase 1 of the daemon shutdown plan).
+   * When `isShuttingDown` is true, the execute routes reject new leases
+   * with `503 SHUTTING_DOWN` before calling `executionGate.tryAcquire`.
+   * Optional for back-compat with embedded runners that do not wire
+   * signal handlers.
+   */
+  shutdownSignal?: ShutdownSignal
 }
 
 /**
@@ -80,6 +89,7 @@ export function buildExecuteRouteSharedDeps(input: {
   metrics: NexusMetrics
   activeExecutionRegistry: ActiveExecutionRegistry
   behaviorMonitor?: BehaviorMonitor
+  shutdownSignal?: ShutdownSignal
 }): ExecuteRouteSharedDeps {
   return {
     runtime: input.runtime,
@@ -94,5 +104,6 @@ export function buildExecuteRouteSharedDeps(input: {
     metrics: input.metrics,
     activeExecutionRegistry: input.activeExecutionRegistry,
     behaviorMonitor: input.behaviorMonitor,
+    shutdownSignal: input.shutdownSignal,
   }
 }
