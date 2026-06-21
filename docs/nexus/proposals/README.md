@@ -24,6 +24,7 @@ This directory holds work that is still being shaped, partially implemented, or 
 | [unify-embedded-cli-path-plan.md](./unify-embedded-cli-path-plan.md) | Draft | Shared `NexusClientInterface`, long-lived embedded Nexus, route embedded execution through the app to eliminate the second orchestration in `runSessionFlow.ts`. (Architecture review P0-3.) |
 | [unify-agent-execution-models-plan.md](./unify-agent-execution-models-plan.md) | Draft | Converge the three overlapping agent subsystems (`runAgentLoop` / `ExploreAgentScheduler` / execute path) on one vocabulary + SQLite state owner; replace `skipPermissionCheck` with profile-scoped policy. (Architecture review P1-7.) |
 | [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md) | Draft | SIGTERM/SIGINT graceful shutdown with `storage.close()` flush, plus startup orphan reaper for stale `executing` sessions / `running` agent jobs. (Architecture review P0-1.) |
+| [provider-stream-silent-hang-abort-propagation-plan.md](./provider-stream-silent-hang-abort-propagation-plan.md) | Draft | The hard watchdog already fires, but the provider stream consumer only passively checks `signal.aborted` per delta, so a silent stream hangs for hours. Active `reader.cancel()` on abort + single-source watchdog + activeAgeMs observability. Real session: `session_3c3ec27c` (8h hang) / `session_ffd44ccf`. |
 
 ## Lifecycle
 

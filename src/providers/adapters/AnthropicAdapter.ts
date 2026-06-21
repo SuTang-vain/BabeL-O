@@ -502,7 +502,7 @@ export class AnthropicAdapter implements ModelAdapter {
     const minimaxTextToolParser = providerId === 'minimax' ? createMinimaxTextToolParser() : undefined
     let pendingFinishReason: FinishReason | undefined
 
-    for await (const sse of parseSSE(response.body)) {
+    for await (const sse of parseSSE(response.body, options?.signal)) {
       if (sse.data === '[DONE]') break
       let stopAfterEvent = false
 
