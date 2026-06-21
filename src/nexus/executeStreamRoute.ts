@@ -108,6 +108,22 @@ export function registerExecuteStreamRoute(app: FastifyInstance, deps: ExecuteSt
       let activeExecutionLease: ActiveExecutionLease | undefined
       socket.once('close', () => abortController?.abort())
 
+      // The hard watchdog lives in `prepareExecution` as a single
+      // `setTimeout` (`prepared.timeout`) that fires at
+      // `watchdogTimeoutMs`, marks `prepared.watchdog.fired`, and
+      // aborts both the timeout and request controllers. The abort
+      // propagates through the provider stream reader (Phase 1 of
+      // docs/nexus/proposals/provider-stream-silent-hang-abort-propagation-plan.md)
+      // so the runtime's for-await throws and its catch yields a
+      // `REQUEST_TIMEOUT`. `processRuntimeExecutionEvent` then
+      // decorates that error with `details.kind='watchdog'` (soft
+      // policy) and `forwardProcessedRuntimeEvent` delivers it to
+      // the WS client. This route deliberately does NOT register a
+      // second watchdog timer — the HTTP route relies on the same
+      // single source, and a duplicate timer only risked double
+      // error events and a direct socket write that bypassed
+      // persistence/decoration.
+
       let success = false
       let timedOut = false
       try {

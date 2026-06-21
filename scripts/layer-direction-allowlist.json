@@ -1,0 +1,83 @@
+{
+  "comment": "Checked-in allowlist of permitted reverse/cross layer imports in BabeL-O.",
+  "allowlist": {
+    "src/cli/NexusClient.ts": [
+      "src/nexus/agents/types.ts"
+    ],
+    "src/cli/commands/agents.ts": [
+      "src/nexus/agents/types.ts"
+    ],
+    "src/cli/commands/config.ts": [
+      "src/providers/registry.ts"
+    ],
+    "src/cli/commands/context.ts": [
+      "src/nexus/contextAssemblePreview.ts",
+      "src/runtime/persistedWorkingSetTracker.ts",
+      "src/runtime/behaviorTrace.ts",
+      "src/runtime/workingSetTracker.ts",
+      "src/tools/contextTools.ts"
+    ],
+    "src/cli/commands/firstRun.ts": [
+      "src/nexus/everosBootstrapConfig.ts"
+    ],
+    "src/cli/commands/go.ts": [
+      "src/nexus/createRuntime.ts"
+    ],
+    "src/cli/commands/inspectSession.ts": [
+      "src/runtime/agentTrace.ts",
+      "src/runtime/runCheckpoint.ts"
+    ],
+    "src/cli/commands/models.ts": [
+      "src/providers/registry.ts"
+    ],
+    "src/cli/commands/optimize.ts": [
+      "src/nexus/agentLoop.ts",
+      "src/nexus/createRuntime.ts",
+      "src/nexus/remoteRunnerConfig.ts",
+      "src/nexus/storageBridge.ts",
+      "src/nexus/runtimeAgentStep.ts",
+      "src/nexus/agentRoles.ts",
+      "src/nexus/taskSession.ts",
+      "src/nexus/agentLoopSmoke.ts"
+    ],
+    "src/cli/embedded.ts": [
+      "src/nexus/app.ts",
+      "src/nexus/createRuntime.ts",
+      "src/nexus/contextBroadcaster.ts",
+      "src/nexus/remoteRunnerConfig.ts",
+      "src/nexus/everCoreRuntimeManager.ts"
+    ],
+    "src/cli/everosAutoBootstrap.ts": [
+      "src/runtime/everosPrerequisites.ts",
+      "src/runtime/everosBackgroundBootstrap.ts"
+    ],
+    "src/cli/everosBackgroundBootstrap.ts": [
+      "src/runtime/everosBackgroundBootstrap.ts"
+    ],
+    "src/cli/everosBootstrap.ts": [
+      "src/runtime/everosBootstrap.ts"
+    ],
+    "src/cli/everosFallbackBuild.ts": [
+      "src/runtime/everosFallbackBuild.ts"
+    ],
+    "src/cli/everosPrerequisites.ts": [
+      "src/runtime/everosPrerequisites.ts"
+    ],
+    "src/cli/program.ts": [
+      "src/nexus/server.ts"
+    ],
+    "src/cli/runSessionFlow.ts": [
+      "src/nexus/createRuntime.ts",
+      "src/nexus/everCoreRuntimeManager.ts",
+      "src/nexus/remoteRunnerConfig.ts",
+      "src/runtime/hooks.ts",
+      "src/runtime/systemPromptBuilder.ts"
+    ],
+    "src/shared/config.ts": [
+      "src/providers/registry.ts"
+    ],
+    "src/tools/everCoreMcpTools.ts": [
+      "src/nexus/everCoreConfig.ts"
+    ]
+  }
+}

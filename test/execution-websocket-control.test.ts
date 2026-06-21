@@ -204,6 +204,100 @@ test('forwardProcessedRuntimeEvent aborts when the socket closes before the deco
   assert.deepEqual(bufferedAmounts, [])
 })
 
+// Bug 2 fix (2026-06-21): if `sendJson` throws (socket closed
+// mid-flight, bufferedAmount cap, transport-level error) while
+// trying to forward the *decorated* event, we must abort the
+// runtime stream consumer — otherwise it keeps producing events
+// for a dead socket and metrics.stream.activeCount leaks.
+test('forwardProcessedRuntimeEvent aborts and skips metric when sendJson throws mid-flight', () => {
+  const sent: string[] = []
+  const socket: WebSocketLike = {
+    OPEN: 1,
+    readyState: 1,
+    bufferedAmount: 0,
+    send(payload: string) {
+      sent.push(payload)
+      throw new Error('socket transport error')
+    },
+  }
+  const controller = new AbortController()
+  const bufferedAmounts: number[] = []
+
+  const result = forwardProcessedRuntimeEvent(
+    socket,
+    {
+      event: {
+        type: 'result',
+        ...eventBase('session-1'),
+        success: true,
+        message: 'done',
+      },
+    },
+    {
+      recordStreamEvent(_bufferedAmount: number) {
+        bufferedAmounts.push(_bufferedAmount)
+      },
+    },
+    controller,
+  )
+
+  assert.equal(result.closed, true)
+  assert.equal(result.forwarded, false)
+  assert.equal(controller.signal.aborted, true)
+  // The throw happens *inside* sendJson, before the metric is
+  // recorded. We must not record a metric for a send that
+  // never actually landed.
+  assert.deepEqual(bufferedAmounts, [])
+})
+
+// Bug 2 fix (2026-06-21): if the cache-health event is forwarded
+// successfully but the *decorated* event throws, the cache-health
+// metric may have been recorded (we don't yet early-return on
+// cache-health failure — that's a known minor leak), but the
+// decorated event must be aborted.
+test('forwardProcessedRuntimeEvent aborts on decorated-event throw even if cache-health already sent', () => {
+  let callCount = 0
+  const socket: WebSocketLike = {
+    OPEN: 1,
+    readyState: 1,
+    bufferedAmount: 0,
+    send(_payload: string) {
+      callCount += 1
+      // First send (cache_health) succeeds; second send (decorated event) throws.
+      if (callCount > 1) throw new Error('socket died mid-event')
+    },
+  }
+  const controller = new AbortController()
+
+  const result = forwardProcessedRuntimeEvent(
+    socket,
+    {
+      cacheHealthEvent: {
+        type: 'cache_health',
+        ...eventBase('session-1'),
+        cacheHealth: { summary: { status: 'warning' } },
+        trigger: 'after_execution_metrics',
+      },
+      event: {
+        type: 'result',
+        ...eventBase('session-1'),
+        success: true,
+        message: 'done',
+      },
+    },
+    {
+      recordStreamEvent(_bufferedAmount: number) {
+        // no-op
+      },
+    },
+    controller,
+  )
+
+  assert.equal(result.closed, true)
+  assert.equal(result.forwarded, false)
+  assert.equal(controller.signal.aborted, true)
+})
+
 test('resolvePermissionResponseMessage resolves valid permission responses only', () => {
   const calls: Array<{
     sessionId: string

@@ -177,7 +177,7 @@ export class OpenAIAdapter implements ModelAdapter {
       { id: string; name: string; argumentsBuffer: string }
     >()
 
-    for await (const sse of parseSSE(response.body)) {
+    for await (const sse of parseSSE(response.body, options?.signal)) {
       if (sse.data === '[DONE]') {
         break
       }

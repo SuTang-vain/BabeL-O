@@ -1,5 +1,6 @@
 import { PendingPermissionRegistry } from '../shared/session.js'
 import type { NexusEvent } from '../shared/events.js'
+import { logger } from '../shared/logger.js'
 
 export type WebSocketLike = {
   OPEN: number
@@ -100,8 +101,20 @@ export function forwardProcessedRuntimeEvent(
     abortController.abort()
     return { event, forwarded: false, closed: true }
   }
-  sendJson(socket, event)
-  metrics.recordStreamEvent(socket.bufferedAmount)
+  try {
+    sendJson(socket, event)
+    metrics.recordStreamEvent(socket.bufferedAmount)
+  } catch (err) {
+    // Bug 2 fix (2026-06-21): if `sendJson` throws (socket
+    // closed mid-flight, bufferedAmount cap, transport-level
+    // error), abort the runtime stream consumer so we don't
+    // keep producing events for a dead socket. Without this the
+    // consumer would keep streaming while the WS was already
+    // closed — leaking work and inflating metrics.stream.activeCount.
+    logger.warn('forward event failed; aborting stream consumer', err)
+    abortController.abort()
+    return { event, forwarded: false, closed: true }
+  }
   return { event, forwarded: true, closed: false }
 }
 
