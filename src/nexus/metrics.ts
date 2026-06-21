@@ -31,6 +31,11 @@ type StreamMetric = {
   totalMs: number
   maxMs: number
   maxBufferedAmount: number
+  /** Bug fix 2026-06-21: cumulative age of the oldest currently-active
+   *  stream. Reset to 0 when activeCount drops to 0. Surfaced via
+   *  /v1/runtime/status so operators can see "is a stream hung"
+   *  without grepping logs. */
+  activeAgeMs: number
 }
 
 export class NexusMetrics {
@@ -59,7 +64,9 @@ export class NexusMetrics {
     totalMs: 0,
     maxMs: 0,
     maxBufferedAmount: 0,
+    activeAgeMs: 0,
   }
+  private lastStreamActiveSampleMs = 0
 
   private providerFirstTokenTotalMs = 0
   private providerFirstTokenCount = 0
@@ -234,6 +241,26 @@ export class NexusMetrics {
     this.stream.activeCount += 1
   }
 
+  // Bug fix 2026-06-21 (watchdog observability): track the oldest
+  // currently-active stream's age. /v1/runtime/status surfaces this
+  // as `stream.activeAgeMs` so operators can see "is any stream
+  // hung right now" without needing to grep logs. Reset to 0 when
+  // activeCount drops to 0 (no streams running).
+  recordStreamActiveAge(nowMs: number): void {
+    if (this.stream.activeCount === 0) {
+      this.stream.activeAgeMs = 0
+      return
+    }
+    // Approximate: bump activeAgeMs by delta since last sample.
+    // We don't track per-stream start times; the cumulative delta
+    // is enough to surface "long-running stream" in status output.
+    const delta = nowMs - this.lastStreamActiveSampleMs
+    if (delta > 0 && this.lastStreamActiveSampleMs > 0) {
+      this.stream.activeAgeMs += delta
+    }
+    this.lastStreamActiveSampleMs = nowMs
+  }
+
   recordStreamRejected(): void {
     this.stream.rejectedCount += 1
   }
@@ -266,6 +293,12 @@ export class NexusMetrics {
   }
 
   snapshot() {
+    // Bug fix 2026-06-21: sample stream active age just before
+    // the snapshot is returned so /v1/runtime/status reflects the
+    // current hang state. Without this, activeAgeMs only updates
+    // on recordStreamEvent, which doesn't fire if the provider
+    // emits zero events (the very bug we're trying to surface).
+    this.recordStreamActiveAge(this.now())
     return {
       type: 'runtime_metrics',
       startedAt: this.startedAt,
