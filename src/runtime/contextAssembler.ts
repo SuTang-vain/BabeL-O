@@ -272,6 +272,27 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget, {
     preSelectionTokenEstimate,
   })
+  // Phase 2 (adaptive-context-window-selection-plan.md): gate the microcompact
+  // / snip char thresholds on the SAME headroom signal. At low usage, raise the
+  // thresholds so tool_results above the legacy 4,000-char / 20,000-char caps
+  // are preserved verbatim instead of summarized — real session session_75d74b74
+  // showed microcompact dropping 39,866 tokens / 159,462 bytes across 18 large
+  // tool_results at 3–22% usage, which is the user-visible "compressed every
+  // prompt" symptom. The dedup path inside microcompact still collapses true
+  // duplicate tool_results regardless of headroom (only size-based trimming
+  // relaxes). At/above the warning threshold, legacy thresholds apply.
+  const hasCompactorHeadroom = budget.maxTokens > 0
+    && preSelectionTokenEstimate
+      < Math.floor(budget.maxTokens * (readSelectionHeadroomWarningPercent() / 100))
+  const compactorBudget: ContextBudget = hasCompactorHeadroom
+    ? {
+        ...budget,
+        microcompactToolOutputChars: Number.POSITIVE_INFINITY,
+        microcompactInternalTextChars: Number.POSITIVE_INFINITY,
+        snipToolOutputChars: Number.POSITIVE_INFINITY,
+        snipPriorTurnToolOutputChars: Number.POSITIVE_INFINITY,
+      }
+    : budget
   const selectedEvents = protectToolPairs(
     compactAwareEvents,
     rawSelectedEvents,
@@ -285,12 +306,12 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     .filter(part => part.trim().length > 0)
     .join('\n')
     .trim()
-  const microcompactResult = microcompactEventsWithMetrics(selectedEvents, budget)
+  const microcompactResult = microcompactEventsWithMetrics(selectedEvents, compactorBudget)
   const microcompactedEvents = microcompactResult.events
   const snippedEvents = snipEventsWithTurnBoundary(
     microcompactedEvents,
-    budget.snipToolOutputChars,
-    budget.snipPriorTurnToolOutputChars,
+    compactorBudget.snipToolOutputChars,
+    compactorBudget.snipPriorTurnToolOutputChars,
   )
   const messages = options.mapEventsToMessages(
     snippedEvents,
