@@ -38,6 +38,8 @@ The current gap is not "missing all tools". The gap is governance:
 - tool registry layering can silently override a tool name if not guarded;
 - new tools can be planned without a real regression or explicit user request.
 
+2026-06-22 real-session follow-up: `bbl go --allowed-tools` must not be treated as a per-turn model-visible tool filter. It is a managed-Nexus startup policy input only. The explicit advanced per-turn filter is `--turn-allowed-tools`, which forwards to Go TUI `--allow-tools`. This distinction prevents a narrow startup allowlist from accidentally hiding `contextSearch`, `contextRecent`, `contextSummarize`, `contextSessions`, `WebSearch`, `Skill*`, `TaskCreate`, `Write`, `Edit`, or `Bash` from the provider. Go TUI permission rendering is a client concern, but the visible tool surface remains Nexus/runtime-owned.
+
 ## Tool Classes
 
 | Class | Tools | Governance rule |
@@ -109,6 +111,16 @@ Tool failures should be recoverable whenever possible:
 - return provider-visible structured failure results with `success=false`, `errorCode`, and concise repair guidance;
 - keep workspace escape, invalid input, missing file, ambiguous edit, no results, and non-zero Bash as model-correctable states;
 - reserve terminal runtime errors for infrastructure, provider, cancellation, or hard safety failures.
+
+## Go TUI Tool Surface And Permission Rendering
+
+The Go TUI must render permissions and local UI state, but it must not redefine model-visible tool truth.
+
+- `permission_request` owns the foreground view once received. This prevents Bash or write-risk approval prompts from being visually buried under transcript, interruption prompt, top cards, overlays, or composer chrome.
+- Internal `hook_started` / `hook_completed` / `hook_failed` events are not user tool activity. The footer should only show tool activity for real `tool_started` / `tool_completed` / `tool_denied` events.
+- `--allowed-tools` on `bbl go` configures auto-started Nexus policy; it does not filter the provider's per-turn tool list.
+- `--turn-allowed-tools` is the explicit per-turn model-visible filter. Use it only when the operator deliberately wants to restrict the provider's tool surface for that turn.
+- If a session shows `drafting response` or `tool activity`, inspect the event tail before classifying the failure: unresolved `permission_request` is a permission UI path; `thinking_delta` with no tool call is a provider/output path; backend transport loss is a client settlement path.
 
 ## Verification
 
