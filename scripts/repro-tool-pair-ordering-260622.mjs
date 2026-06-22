@@ -167,8 +167,83 @@ if (offendingInInventory) {
 console.log()
 if (issues.length === 0) {
   console.log('PHASE 0 GATE PASS: all assistant(tool_use) messages are immediately followed by exactly one matching user(tool_result) message')
-  process.exit(0)
 } else {
   console.log(`PHASE 0 GATE FAIL (${issues.length} issue(s)): at least one assistant(tool_use) message is split across multiple user messages by runtime-injected events`)
+}
+
+console.log()
+console.log('=== Phase 3: real-session replay gate ===')
+let phase3Failures = 0
+const expect3 = (cond, msg) => {
+  if (!cond) { console.error(`  FAIL: ${msg}`); phase3Failures += 1 }
+  else { console.log(`  ok: ${msg}`) }
+}
+
+// (a) The offending Glob must carry a REAL tool_result from the event stream,
+//     not the synthetic "denied or interrupted" placeholder. This proves the
+//     scope-boundary suspension did not corrupt the tool pair.
+const offendingResult = inventory.find(
+  (b) => b.kind === 'tool_result' && b.id === offendingToolUseId,
+)
+expect3(!!offendingResult, `offending Glob ${offendingToolUseId} has a tool_result block`)
+if (offendingResult) {
+  // The synthetic placeholder content is "Error: Tool execution was denied or
+  // interrupted." — the real Glob result is a JSON array of matches.
+  const resultMsg = messages[offendingResult.msgIdx]
+  const block = resultMsg.content.find(
+    (b) => b.type === 'tool_result' && b.toolUseId === offendingToolUseId,
+  )
+  expect3(
+    typeof block.content === 'string' && !block.content.includes('denied or interrupted'),
+    'offending Glob tool_result is real (not the synthetic placeholder)',
+  )
+  expect3(block.isError === false, 'offending Glob tool_result is not an error')
+}
+
+// (b) The assistant text replies from turns 1 and 2 must still be present
+//     (zero semantic loss from deferral).
+const allText = messages
+  .filter((m) => m.role === 'assistant')
+  .flatMap((m) => (typeof m.content === 'string' ? [m.content] : []))
+  .join('\n')
+expect3(allText.includes('对比分析'), 'turn 1 assistant text reply (对比分析) preserved')
+expect3(allText.includes('推荐结论'), 'turn 2 assistant text reply (推荐结论) preserved')
+
+// (c) Per-turn contiguity: for every user_message boundary, re-assemble the
+//     window up to the NEXT context_usage (the pre-invocation snapshot) and
+//     assert no split pair. This simulates what each provider call would see.
+const userMsgSeqs = []
+for (let i = 0; i < events.length; i++) {
+  if (events[i].type === 'user_message') userMsgSeqs.push(i)
+}
+let perTurnSplits = 0
+for (let t = 0; t < userMsgSeqs.length; t++) {
+  const endIdx = t + 1 < userMsgSeqs.length ? userMsgSeqs[t + 1] : events.length
+  const window = events.slice(0, endIdx)
+  const winMsgs = mapEventsToMessages(window, '继续', { replayReasoningContent: true })
+  for (let mi = 0; mi < winMsgs.length; mi++) {
+    const m = winMsgs[mi]
+    if (m.role !== 'assistant' || !Array.isArray(m.content)) continue
+    const useIds = m.content.filter((b) => b.type === 'tool_use').map((b) => b.id)
+    if (useIds.length === 0) continue
+    const next = winMsgs[mi + 1]
+    const resultIds = (next?.role === 'user' && Array.isArray(next.content))
+      ? next.content.filter((b) => b.type === 'tool_result').map((b) => b.toolUseId)
+      : []
+    const missing = useIds.filter((id) => !resultIds.includes(id))
+    if (missing.length > 0 || resultIds.length === 0) {
+      perTurnSplits += 1
+      console.log(`  turn ${t + 1}: split pair at msg ${mi} (missing: ${missing.join(',')})`)
+    }
+  }
+}
+expect3(perTurnSplits === 0, `every per-turn provider call sees a contiguous tool-pair history (${perTurnSplits} split(s))`)
+
+console.log()
+if (issues.length === 0 && phase3Failures === 0) {
+  console.log('PHASE 3 GATE PASS: session_6ce63133 replays with contiguous tool pairs, real results, and preserved text')
+  process.exit(0)
+} else {
+  console.log(`GATE FAIL (${issues.length} contiguity issue(s), ${phase3Failures} phase-3 failure(s))`)
   process.exit(1)
 }
