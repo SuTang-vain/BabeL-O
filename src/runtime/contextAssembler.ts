@@ -3,6 +3,7 @@ import type { SessionMessage } from '../shared/sessionChannel.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import type { ModelMessage, SystemPromptBlock } from '../providers/adapters/ModelAdapter.js'
 import { resolveContextCeilingForModel } from './cacheAwareCompactPolicy.js'
+import { estimateContextTokens } from './tokenEstimator.js'
 import { snipEventsWithTurnBoundary } from './compactors/snipCompactor.js'
 import { microcompactEventsWithMetrics, type MicrocompactMetrics } from './compactors/microCompact.js'
 export { microcompactEvents, microcompactEventsWithMetrics } from './compactors/microCompact.js'
@@ -144,6 +145,37 @@ export type RetainedSegmentMetadata = {
 export const MAX_MEMORY_LINES = 200
 export const MAX_MEMORY_BYTES = 25_000
 
+// Headroom gate for `selectRecentEvents` (adaptive-context-window-selection-
+// plan.md). When the pre-selection context estimate is below this percent of
+// the model ceiling, the turn+event caps relax so prior turns are not
+// discarded at single-digit usage. Matches the cache-aware warning threshold
+// (cacheAwareCompactPolicy DEFAULT_WARNING_PERCENT=70 / cache-preserving 80);
+// kept as a local helper so contextAssembler does not import the policy
+// module (layer direction: contextAssembler must not depend on the policy
+// layer). Env-overridable via BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT for
+// test fixtures that need to force the legacy caps at low token counts (the
+// omitted-events / latest-question tests run on local/coding-runtime with a
+// 6.5k window, where a small fixture would otherwise stay below the gate and
+// never exercise the trim path). Read at call time (not module load) so test
+// overrides take effect. When undefined is passed to selectRecentEvents
+// (callers that do not compute a pre-selection estimate), it falls back to
+// the legacy fixed caps for back-compat.
+export function readSelectionHeadroomWarningPercent(): number {
+  const raw = process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT
+  if (!raw) return 70
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) ? Math.max(1, Math.min(99, parsed)) : 70
+}
+// Low-usage event ceiling: when headroom is available, the raw event-count
+// cap is relaxed to Infinity (see selectRecentEvents). The legacy
+// `recentEventLimit` (300 for ≥120k models) is a raw EVENT-COUNT proxy that
+// decouples from actual token cost once deltas coalesce — session_cd42cb65
+// has 20k raw events but only 84 coalesced messages (42% of ceiling), so a
+// 300-event cap collapsed the window to 1 turn even at low usage. The token
+// estimate is the real budget signal, so it gates alone. The multiplier is
+// kept for documentation of the legacy relationship.
+export const LOW_USAGE_EVENT_LIMIT_MULTIPLIER = 10
+
 export type MemoryTruncation = {
   content: string
   wasLineTruncated: boolean
@@ -225,7 +257,21 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const workingSet = options.workingSetOverride !== undefined
     ? options.workingSetOverride
     : formatWorkingSet(workingSetEntries)
-  const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget)
+  // Adaptive window selection (adaptive-context-window-selection-plan.md):
+  // compute a cheap pre-selection token estimate over the compact-aware
+  // events so selectRecentEvents can decide whether the turn+event caps
+  // should relax. This is the same estimator buildRuntimeContextRefreshState
+  // uses post-assembly; running it pre-selection costs one estimate pass but
+  // only gates a binary "trim or not," so imprecision is tolerable. When the
+  // estimate is below the warning threshold (default 70%), prior turns are
+  // retained instead of dropped at single-digit usage.
+  const preSelectionMessages = options.mapEventsToMessages(compactAwareEvents, options.runtimeOptions.prompt)
+  const preSelectionTokenEstimate = estimateContextTokens({
+    messages: preSelectionMessages,
+  }).totalTokens
+  const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget, {
+    preSelectionTokenEstimate,
+  })
   const selectedEvents = protectToolPairs(
     compactAwareEvents,
     rawSelectedEvents,
@@ -658,9 +704,47 @@ function hashEventIdentities(identities: string[]): string {
   return (hash >>> 0).toString(36)
 }
 
-export function selectRecentEvents(events: NexusEvent[], budget: ContextBudget): NexusEvent[] {
-  const maxTurns = budget.recentTurnLimit
-  const maxEvents = budget.recentEventLimit
+export type SelectionHeadroom = {
+  /**
+   * Pre-selection context estimate in tokens for the event window being
+   * assembled. When this is below the warning threshold (default 70% of
+   * `budget.maxTokens`), the turn+event caps relax so prior turns are not
+   * discarded at single-digit usage. See
+   * adaptive-context-window-selection-plan.md.
+   *
+   * Back-compat: when undefined, the legacy fixed caps apply unchanged.
+   */
+  preSelectionTokenEstimate?: number
+}
+
+export function selectRecentEvents(
+  events: NexusEvent[],
+  budget: ContextBudget,
+  headroom?: SelectionHeadroom,
+): NexusEvent[] {
+  // Adaptive window: when the pre-selection estimate shows plenty of
+  // headroom (below the warning threshold), relax BOTH the turn cap and the
+  // event cap. The Phase 0 repro against session_cd42cb65 showed the legacy
+  // fixed caps retain only 1 of 11 turns at ~3% usage — recentEventLimit=300
+  // trips the second-turn break before recentTurnLimit=4 is reached. With
+  // headroom, all user turns are retained (turn cap removed) and the event
+  // cap is raised by LOW_USAGE_EVENT_LIMIT_MULTIPLIER so a fat turn does not
+  // collapse the window. The raised cap is still bounded to prevent a
+  // pathological 50k-event session from loading everything.
+  const hasHeadroom = headroom?.preSelectionTokenEstimate !== undefined
+    && budget.maxTokens > 0
+    && headroom.preSelectionTokenEstimate
+      < Math.floor(budget.maxTokens * (readSelectionHeadroomWarningPercent() / 100))
+
+  const maxTurns = hasHeadroom ? Number.POSITIVE_INFINITY : budget.recentTurnLimit
+  // At low usage the token estimate (the real budget signal) already proves
+  // the window fits; the raw event-count cap is a legacy small-context proxy
+  // that decouples from token cost once deltas coalesce. So relax maxEvents
+  // to Infinity and let trimSelectedWindow return the full slice. The
+  // pathological 50k-event case is still safe: its token estimate would
+  // exceed the warning threshold, so hasHeadroom would be false and the
+  // legacy 300-event cap would apply.
+  const maxEvents = hasHeadroom ? Number.POSITIVE_INFINITY : budget.recentEventLimit
 
   let recoveryIdx = 0
   for (let idx = events.length - 1; idx >= 0; idx--) {
