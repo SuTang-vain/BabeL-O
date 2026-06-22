@@ -334,6 +334,148 @@ test('selectRecentEvents keeps recent turns for explicit path prompts; intent gu
   assert.match(JSON.stringify(selected), /stale analysis/)
 })
 
+// Adaptive window selection (adaptive-context-window-selection-plan.md, 2026-06-22):
+// when a pre-selection token estimate shows headroom (below the warning
+// threshold), selectRecentEvents relaxes BOTH the turn cap and the event cap
+// so prior turns are not discarded at low usage. Regression: session_cd42cb65
+// retained 1 of 11 turns at ~3% usage because recentEventLimit=300 tripped
+// the second-turn break before recentTurnLimit=4 was reached.
+
+function buildMultiTurnEvents(turnCount: number, fatTurnEventCount: number): NexusEvent[] {
+  const events: NexusEvent[] = []
+  for (let turn = 0; turn < turnCount; turn += 1) {
+    events.push({
+      type: 'user_message',
+      schemaVersion,
+      sessionId: 'session-adaptive',
+      timestamp: `2026-06-22T00:0${turn}:00.000Z`,
+      text: `user turn ${turn + 1}`,
+    })
+    // A "fat" turn: many assistant_delta fragments so candidateLen exceeds
+    // the legacy recentEventLimit (300) for any turn but the last.
+    for (let i = 0; i < fatTurnEventCount; i += 1) {
+      events.push({
+        type: 'assistant_delta',
+        schemaVersion,
+        sessionId: 'session-adaptive',
+        timestamp: `2026-06-22T00:0${turn}:${String(i % 60).padStart(2, '0')}.000Z`,
+        text: `turn-${turn + 1} fragment ${i} `,
+      })
+    }
+  }
+  return events
+}
+
+const adaptiveBudget = {
+  maxTokens: 852_000,
+  maxChars: 852_000 * 4,
+  layerBudgets: { system: 5_000, memory: 2_000, summary: 4_000, recent: 852_000 - 11_000 },
+  snipToolOutputChars: 20_000,
+  snipPriorTurnToolOutputChars: 3_000,
+  microcompactToolOutputChars: 4_000,
+  microcompactInternalTextChars: 1_000,
+  recentEventLimit: 300,
+  recentTurnLimit: 4,
+}
+
+test('selectRecentEvents without headroom (legacy) drops prior turns at low event volume', () => {
+  // 5 turns, 100 events each → 505 events total. Legacy recentEventLimit=300
+  // and recentTurnLimit=4 together retain only the last ~2 turns, dropping
+  // turns 1-3. The exact count is not the point; the point is prior turns
+  // ARE dropped under legacy caps.
+  const events = buildMultiTurnEvents(5, 100)
+  const selected = selectRecentEvents(events, adaptiveBudget)
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.ok(userMsgs.length < 5, `legacy caps drop prior turns (kept ${userMsgs.length} of 5)`)
+  assert.ok(userMsgs.length >= 1, `legacy caps keep at least the last turn (kept ${userMsgs.length})`)
+})
+
+test('selectRecentEvents with headroom retains all user turns at low usage', () => {
+  const events = buildMultiTurnEvents(5, 100)
+  // Pre-selection estimate well below the 70% warning threshold.
+  const selected = selectRecentEvents(events, adaptiveBudget, {
+    preSelectionTokenEstimate: 10_000, // ~1% of 852k
+  })
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.equal(userMsgs.length, 5, `headroom retains all 5 turns, got ${userMsgs.length}`)
+})
+
+test('selectRecentEvents with headroom retains a fat-turn session (session_cd42cb65 shape)', () => {
+  // Mirror the real regression: 11 turns where each turn spans >300 events
+  // so the legacy event cap collapses the window to 1 turn. With headroom,
+  // all 11 turns are retained.
+  const events = buildMultiTurnEvents(11, 500)
+  const selected = selectRecentEvents(events, adaptiveBudget, {
+    preSelectionTokenEstimate: 350_000, // ~41% of 852k, below 70%
+  })
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.equal(userMsgs.length, 11, `headroom retains all 11 turns, got ${userMsgs.length}`)
+})
+
+test('selectRecentEvents falls back to legacy caps when usage is at/above warning threshold', () => {
+  const events = buildMultiTurnEvents(5, 100)
+  // Pre-selection estimate at 80% (above the 70% warning threshold) → no
+  // headroom → legacy caps apply → prior turns are dropped.
+  const selected = selectRecentEvents(events, adaptiveBudget, {
+    preSelectionTokenEstimate: Math.floor(852_000 * 0.8),
+  })
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.ok(userMsgs.length < 5, `no headroom at 80% → legacy caps drop turns (kept ${userMsgs.length} of 5)`)
+})
+
+test('selectRecentEvents without preSelectionTokenEstimate falls back to legacy caps (back-compat)', () => {
+  const events = buildMultiTurnEvents(5, 100)
+  // No headroom signal → legacy behavior unchanged (2-arg call shape).
+  const selected = selectRecentEvents(events, adaptiveBudget)
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.ok(userMsgs.length < 5, `undefined headroom → legacy caps drop turns (kept ${userMsgs.length} of 5)`)
+})
+
+test('selectRecentEvents headroom still respects the recovery-boundary slice', () => {
+  // A recovery-boundary error mid-stream slices off everything before it,
+  // even with headroom. Build turn 1, inject a recovery error, then turns
+  // 2 and 3. Only turns 2-3 are eligible after the recovery boundary.
+  const events: NexusEvent[] = []
+  events.push({
+    type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
+    timestamp: '2026-06-22T00:00:00.000Z', text: 'user turn 1',
+  })
+  for (let i = 0; i < 10; i += 1) {
+    events.push({
+      type: 'assistant_delta', schemaVersion, sessionId: 'session-adaptive',
+      timestamp: `2026-06-22T00:00:${String(i).padStart(2, '0')}.000Z`,
+      text: `turn-1 fragment ${i} `,
+    })
+  }
+  events.push({
+    type: 'error', schemaVersion, sessionId: 'session-adaptive',
+    timestamp: '2026-06-22T00:01:00.000Z', code: 'PROVIDER_ERROR', message: 'provider failed',
+  })
+  // Turns 2 and 3 AFTER the recovery boundary.
+  for (let turn = 2; turn <= 3; turn += 1) {
+    events.push({
+      type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
+      timestamp: `2026-06-22T00:0${turn}:00.000Z`, text: `user turn ${turn}`,
+    })
+    for (let i = 0; i < 10; i += 1) {
+      events.push({
+        type: 'assistant_delta', schemaVersion, sessionId: 'session-adaptive',
+        timestamp: `2026-06-22T00:0${turn}:${String(i).padStart(2, '0')}.000Z`,
+        text: `turn-${turn} fragment ${i} `,
+      })
+    }
+  }
+  const selected = selectRecentEvents(events, adaptiveBudget, {
+    preSelectionTokenEstimate: 1_000,
+  })
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.ok(
+    userMsgs.every((m) => (m as any).text !== 'user turn 1'),
+    'turn 1 (before recovery boundary) is excluded even with headroom',
+  )
+  assert.equal(userMsgs.length, 2, `turns 2-3 retained after recovery boundary, got ${userMsgs.length}`)
+})
+
 test('selectOmittedEvents uses stable event identity after cloning', () => {
   const events: NexusEvent[] = [
     {
@@ -715,6 +857,12 @@ test('assembleContext applies dynamic system prompt layer budgets', async () => 
 })
 
 test('assembleContext summarizes omitted older events without duplicating recent events', async () => {
+  // Force the headroom gate OFF (BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT=1)
+  // so this low-token fixture still exercises the omission/summary path. The
+  // adaptive-window fix (adaptive-context-window-selection-plan.md) would
+  // otherwise retain all turns at this token count and omit nothing.
+  process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT = '1'
+  try {
   const cwd = join(tmpdir(), `babel-o-summary-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -786,6 +934,9 @@ test('assembleContext summarizes omitted older events without duplicating recent
   assert.match(context.systemPrompt, /src\/old\.ts/)
   assert.match(context.systemPrompt, /Read failed/)
   assert.match(JSON.stringify(context.messages), /then inspect the failing file/)
+  } finally {
+    delete process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT
+  }
 })
 
 test('assembleContext omits session summary when all events fit recent context', async () => {
@@ -2454,6 +2605,10 @@ test('assembleContext reduces long-session context by more than 50 percent while
 })
 
 test('assembleContext prioritizes the latest user question in long noisy sessions', async () => {
+  // Force the headroom gate OFF so this fixture exercises the trim path
+  // (adaptive-window fix would otherwise retain the 'hi' turn at low tokens).
+  process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT = '1'
+  try {
   const cwd = join(tmpdir(), `babel-o-latest-question-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -2525,6 +2680,9 @@ test('assembleContext prioritizes the latest user question in long noisy session
   assert.match(context.systemPrompt, /authoritative working history/)
   assert.doesNotMatch(context.systemPrompt, /Current user request:/)
   assert.match(JSON.stringify(context.messages), /你还记得我们之前在讨论什么吗/)
+  } finally {
+    delete process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT
+  }
 })
 
 test('assembleContext starts fresh after a cancelled or timed out long task', async () => {
