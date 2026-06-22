@@ -93,14 +93,27 @@ function selectRecentEvents(events, budget, windowState?):
 - `protectToolPairs`, `selectOmittedEvents`, `summarizeSessionEvents` pipelines stay. They just receive more events when usage is low (good — more detail retained) and fewer when usage is high (unchanged from today).
 - `compact_boundary` / `compact_failure` event shape and triggers unchanged.
 
+### Phase 2: headroom-gated `microcompact` / `snip`
+
+Phase 1 closed the turn-retention gap, but real-session `session_75d74b74` showed the user-visible "compressed every prompt" symptom persists. Root cause traced to `microcompact` (`src/runtime/compactors/microCompact.ts`) and `snip` (`src/runtime/compactors/snipCompactor.ts`), which run unconditionally on every `assembleContext` with fixed char thresholds (`microcompactToolOutputChars` = 4,000, `snipToolOutputChars` = up to 20,000). At 3–22% usage they still shrink every tool_result above 4,000 chars into a summary, discarding the raw Read / ListDir / Bash / Glob output the model needs to ground later turns.
+
+The fix reuses the SAME headroom signal Phase 1 threads into `assembleContext` (the pre-selection token estimate + `readSelectionHeadroomWarningPercent`). When headroom is available:
+
+- `microcompactToolOutputChars` and `microcompactInternalTextChars` are raised (or skipped) so tool_results above 4,000 chars are preserved verbatim. Raising is preferred over skipping so the dedup path (repeated identical tool_results) still collapses true duplicates — only the size-based summarization relaxes.
+- `snipToolOutputChars` and `snipPriorTurnToolOutputChars` are raised similarly so the turn-boundary snipper does not pre-emptively truncate older tool outputs.
+
+At/above the warning threshold, the existing fixed thresholds apply unchanged. Back-compat: the headroom signal is the same optional field Phase 1 added; when absent (callers that do not compute a pre-selection estimate), legacy thresholds apply.
+
+The pre-selection estimate is computed once in `assembleContext` (Phase 1 already does this) and passed to `microcompactEventsWithMetrics` / `snipEventsWithTurnBoundary` via the budget or an explicit headroom arg. No new estimate pass.
+
 ## Phases
 
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
 | Phase 0 | Closed 2026-06-22 | This plan, indexed in `proposals/README.md`, with a reproduction script that loads `session_cd42cb65` and asserts the current `selectRecentEvents` drops 10 of 11 turns at ~3% usage (1 turn retained, not the nominal 4, because `recentEventLimit=300` trips first). | Reproduction script committed (`scripts/repro-adaptive-context-window-260622.mjs`); `npm run docs:check` passes; REPRO PASS confirmed. |
 | Phase 1 | Closed 2026-06-22 | Headroom-aware `selectRecentEvents` (gate on `percentUsed < warningThreshold`); relax BOTH `recentTurnLimit` and `recentEventLimit` at low usage (turn cap → Infinity, event cap → Infinity — the token estimate is the real budget signal); thread a pre-selection token estimate into `assembleContext` via `mapEventsToMessages` + `estimateContextTokens` (Option A); env-overridable `BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT`; 6 unit tests for low-usage-full-retention, fat-turn retention, high-usage-trim, back-compat, and recovery-boundary interaction. | Reproduction script shows all 11 user turns retained at ~3% usage on `session_cd42cb65` (was 1 of 11); `context-assembler` tests green (62/62, two legacy fixtures gated via env to keep exercising the trim path); compact/context/runtime regression cluster 335/335 green; `npm test` / `typecheck` / `deps:audit` / `docs:check` green. |
-| Phase 2 | Watch | Gate `microcompact` / `snip` char thresholds on the same headroom signal, so low-usage assemblies also stop pre-emptively shrinking tool outputs. Only if Phase 1 leaves a measurable secondary loss on a real session. | A real session shows microcompact/snip still dropping detail at <70% usage after Phase 1, and the gate restores it. |
-| Phase 3 | Open | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 is closed against `session_cd42cb65`; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check`; `reference/README.md` updated. |
+| Phase 2 | Closed 2026-06-22 | Gate `microcompact` / `snip` char thresholds on the same headroom signal, so low-usage assemblies stop pre-emptively shrinking tool outputs. **Promoted from Watch after real-session evidence**: `session_75d74b74` (5 turns, 7,974 events, 852k deepseek-v4-pro) — `selectRecentEvents` retains all 5 turns (Phase 1 works), but `microcompact` unconditionally dropped 39,866 tokens / 159,462 bytes across 18 tool_results >4,000 chars at 3–22% usage. Fix: at headroom, `microcompactToolOutputChars` / `snipToolOutputChars` → Infinity (size-based trimming skipped, dedup still fires); legacy thresholds apply at/above warning. | Reproduction script (`scripts/repro-adaptive-context-phase2-260622.mjs`) shows 7 large tool_results preserved at 22% usage (legacy preserved 0); 5 unit tests for headroom-preserves-large, legacy-trims, dedup-still-fires, snip-headroom, snip-legacy; `context-assembler` 67/67; regression cluster 347/347; `typecheck` / `deps:audit` / `docs:check` green. |
+| Phase 3 | Open | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 + Phase 2 are closed against real sessions; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check`; `reference/README.md` updated. |
 
 ## Verification
 

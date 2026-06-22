@@ -14,12 +14,13 @@ import {
   buildRetainedSegmentMetadata,
   verifyRetainedSegment,
   microcompactEvents,
+  microcompactEventsWithMetrics,
   protectToolPairs,
   selectOmittedEvents,
   type ContextBudget,
   selectRecentEvents,
 } from '../src/runtime/contextAssembler.js'
-import { snipEvent } from '../src/runtime/compactors/snipCompactor.js'
+import { snipEvent, snipEventsWithTurnBoundary } from '../src/runtime/compactors/snipCompactor.js'
 import {
   buildCompactCapabilityReminder,
   formatPostCompactState,
@@ -661,6 +662,102 @@ test('microcompact deduplicates repeated tool outputs while keeping latest resul
   assert.deepEqual(compacted.map(event => event.type), ['tool_started', 'tool_completed', 'tool_started', 'tool_completed'])
   assert.equal((compacted[0] as Extract<NexusEvent, { type: 'tool_started' }>).toolUseId, 'read-old')
   assert.equal((compacted[1] as Extract<NexusEvent, { type: 'tool_completed' }>).toolUseId, 'read-old')
+})
+
+// Phase 2 (adaptive-context-window-selection-plan.md): gate microcompact/snip
+// size-based trimming on the same headroom signal as selectRecentEvents. At
+// low usage, large tool_results must be preserved verbatim; only true
+// duplicate tool_results are deduplicated. Regression: session_75d74b74 lost
+// 39,866 tokens across 18 large tool_results at 3–22% usage because microcompact
+// unconditionally trimmed anything >4,000 chars.
+
+function buildLargeToolResultEvents(): NexusEvent[] {
+  return [
+    {
+      type: 'tool_started', schemaVersion, sessionId: 'session-p2',
+      timestamp: '2026-06-22T00:00:00.000Z', toolUseId: 'read-big', name: 'Read',
+      input: { path: 'big.txt' },
+    },
+    {
+      type: 'tool_completed', schemaVersion, sessionId: 'session-p2',
+      timestamp: '2026-06-22T00:00:01.000Z', toolUseId: 'read-big', name: 'Read',
+      success: true, output: 'X'.repeat(10_000), // > microcompactToolOutputChars (4,000)
+    },
+  ]
+}
+
+const phase2Budget: ContextBudget = {
+  maxTokens: 852_000,
+  maxChars: 852_000 * 4,
+  layerBudgets: { system: 5_000, memory: 2_000, summary: 4_000, recent: 852_000 - 11_000 },
+  snipToolOutputChars: 20_000,
+  snipPriorTurnToolOutputChars: 3_000,
+  microcompactToolOutputChars: 4_000,
+  microcompactInternalTextChars: 1_000,
+  recentEventLimit: 300,
+  recentTurnLimit: 4,
+}
+
+// Headroom compactor budget: raise size thresholds to Infinity (Phase 2 shape).
+const phase2HeadroomBudget: ContextBudget = {
+  ...phase2Budget,
+  microcompactToolOutputChars: Number.POSITIVE_INFINITY,
+  microcompactInternalTextChars: Number.POSITIVE_INFINITY,
+  snipToolOutputChars: Number.POSITIVE_INFINITY,
+  snipPriorTurnToolOutputChars: Number.POSITIVE_INFINITY,
+}
+
+test('microcompact (legacy) trims large tool_results above the char threshold', () => {
+  const events = buildLargeToolResultEvents()
+  const result = microcompactEventsWithMetrics(events, phase2Budget)
+  const output = String((result.events[1] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  assert.match(output, /microcompacted Read output/)
+  assert.ok(result.metrics.estimatedTokensSaved > 0, `legacy trims large output (saved ${result.metrics.estimatedTokensSaved} tokens)`)
+})
+
+test('microcompact (headroom) preserves large tool_results verbatim', () => {
+  const events = buildLargeToolResultEvents()
+  const result = microcompactEventsWithMetrics(events, phase2HeadroomBudget)
+  const output = String((result.events[1] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  assert.equal(output, 'X'.repeat(10_000), `headroom preserves the full 10,000-char output`)
+  assert.equal(result.metrics.compactedEventCount, 0, `no size-based compaction under headroom`)
+  assert.equal(result.metrics.estimatedTokensSaved, 0, `no tokens saved via size-trim under headroom`)
+})
+
+test('microcompact (headroom) still deduplicates true duplicate tool_results', () => {
+  // Two identical Read calls to the same path — the older one is a duplicate.
+  // Dedup must still fire under headroom (only size-based trimming relaxes).
+  const events: NexusEvent[] = [
+    { type: 'tool_started', schemaVersion, sessionId: 'session-p2', timestamp: '2026-06-22T00:00:00.000Z', toolUseId: 'r1', name: 'Read', input: { path: 'same.txt' } },
+    { type: 'tool_completed', schemaVersion, sessionId: 'session-p2', timestamp: '2026-06-22T00:00:01.000Z', toolUseId: 'r1', name: 'Read', success: true, output: 'X'.repeat(10_000) },
+    { type: 'tool_started', schemaVersion, sessionId: 'session-p2', timestamp: '2026-06-22T00:00:02.000Z', toolUseId: 'r2', name: 'Read', input: { path: 'same.txt' } },
+    { type: 'tool_completed', schemaVersion, sessionId: 'session-p2', timestamp: '2026-06-22T00:00:03.000Z', toolUseId: 'r2', name: 'Read', success: true, output: 'latest' },
+  ]
+  const result = microcompactEventsWithMetrics(events, phase2HeadroomBudget)
+  const oldOutput = String((result.events[1] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  const latestOutput = String((result.events[3] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  assert.match(oldOutput, /microcompacted duplicate Read result/, `dedup still fires under headroom`)
+  assert.equal(latestOutput, 'latest', `latest duplicate preserved verbatim`)
+  assert.ok(result.metrics.deduplicatedToolResultCount > 0, `dedup count > 0 under headroom`)
+})
+
+test('snip (headroom) preserves large tool_results via Infinity threshold', () => {
+  const events = buildLargeToolResultEvents()
+  const snipped = snipEventsWithTurnBoundary(
+    events,
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  )
+  const output = String((snipped[1] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  assert.equal(output, 'X'.repeat(10_000), `snip with Infinity threshold preserves full output`)
+  assert.equal((snipped[1] as any).truncated, undefined, `no truncation flag under headroom`)
+})
+
+test('snip (legacy) still truncates large tool_results at the char threshold', () => {
+  const events = buildLargeToolResultEvents()
+  const snipped = snipEventsWithTurnBoundary(events, 80, 60)
+  const output = String((snipped[1] as Extract<NexusEvent, { type: 'tool_completed' }>).output)
+  assert.match(output, /chars truncated from tool output/, `legacy snip truncates large output`)
 })
 
 test('assembleContext reports microcompact savings metrics', async () => {
