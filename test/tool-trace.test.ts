@@ -71,6 +71,38 @@ test('MemoryStorage tool trace lifecycle and pagination', async () => {
   assert.equal(trace1Updated.success, true)
   assert.equal(trace1Updated.output, 'hello\n')
 
+  const deniedStart: NexusEvent = {
+    type: 'tool_started',
+    schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+    sessionId,
+    timestamp: '2026-05-22T12:00:02.000Z',
+    toolUseId: 'tool-denied-1',
+    name: 'Bash',
+    input: { command: 'git commit -m x' },
+  }
+  await storage.appendEvent(sessionId, deniedStart)
+  await storage.appendEvent(sessionId, {
+    type: 'tool_denied',
+    schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+    sessionId,
+    timestamp: '2026-05-22T12:00:03.250Z',
+    toolUseId: 'tool-denied-1',
+    name: 'Bash',
+    risk: 'execute',
+    message: 'looks risky',
+    denialKind: 'permission',
+    recoverable: true,
+  })
+  const deniedTrace = await storage.getToolTrace('tool-denied-1')
+  assert.ok(deniedTrace)
+  assert.equal(deniedTrace.success, false)
+  assert.equal(deniedTrace.completedAt, '2026-05-22T12:00:03.250Z')
+  assert.equal(deniedTrace.durationMs, 1250)
+  assert.equal((deniedTrace.output as any).code, 'TOOL_DENIED')
+  assert.equal((deniedTrace.output as any).message, 'looks risky')
+  assert.equal((deniedTrace.output as any).denialKind, 'permission')
+  assert.equal((deniedTrace.output as any).recoverable, true)
+
   // 4. Pagination Setup
   // Clean up and create 5 traces
   const storageForPaging = new MemoryStorage()
@@ -196,6 +228,38 @@ test('SqliteStorage tool trace lifecycle and pagination', async () => {
     assert.equal(trace1Updated.durationMs, 1500)
     assert.equal(trace1Updated.success, true)
     assert.equal(trace1Updated.output, 'hello\n')
+
+    const deniedStart: NexusEvent = {
+      type: 'tool_started',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-22T12:00:02.000Z',
+      toolUseId: 'tool-denied-1',
+      name: 'Bash',
+      input: { command: 'git commit -m x' },
+    }
+    await storage.appendEvent(sessionId, deniedStart)
+    await storage.appendEvent(sessionId, {
+      type: 'tool_denied',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-05-22T12:00:03.250Z',
+      toolUseId: 'tool-denied-1',
+      name: 'Bash',
+      risk: 'execute',
+      message: 'looks risky',
+      denialKind: 'permission',
+      recoverable: true,
+    })
+    const deniedTrace = await storage.getToolTrace('tool-denied-1')
+    assert.ok(deniedTrace)
+    assert.equal(deniedTrace.success, false)
+    assert.equal(deniedTrace.completedAt, '2026-05-22T12:00:03.250Z')
+    assert.equal(deniedTrace.durationMs, 1250)
+    assert.equal((deniedTrace.output as any).code, 'TOOL_DENIED')
+    assert.equal((deniedTrace.output as any).message, 'looks risky')
+    assert.equal((deniedTrace.output as any).denialKind, 'permission')
+    assert.equal((deniedTrace.output as any).recoverable, true)
 
     // 4. Pagination Setup with 5 traces
     const pSessionId = 'session-sqlite-paging'

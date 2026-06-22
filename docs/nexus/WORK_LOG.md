@@ -2,6 +2,155 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-22 — Go TUI drafting-response stall: watchdog fired but stream iterator did not settle
+
+- **背景**: 用户再次同时打开两个新 Go TUI session 后看到 `drafting response` 长时间不结束：
+  - `session_4872604b-a0c8-4eff-bde2-3c17e08d8c09`: prompt=`查看这个项目的git分支情况`，cwd=`clients/go-tui`。
+  - `session_2f196238-40cd-4c5e-aeac-cd242d47d3d9`: 第二轮 prompt=`BabeL-O should 在桌面写一个简单的c语言小程序`，cwd=`/Users/tangyaoyue`。
+- **实际事件结论**:
+  - 两个 session 尾部均为大量 `thinking_delta` → `usage` → `hook_completed(PostInvocation)` → `timeout_budget_exceeded`；没有 pending `permission_request`，也没有后续 `assistant_delta` / `tool_started` / `result` / `error`。
+  - Nexus 日志显示 hard watchdog 已真实触发：`hard watchdog fired after 240000ms`，分别对应 `03:27:00.688Z` 与 `03:27:28.482Z`。
+  - 但 `/v1/runtime/status` 仍显示 `stream.activeCount=2` 且 `activeAgeMs > 480s`，session 仍为 `phase=executing`。这证明问题不是“watchdog 未配置”，而是 watchdog abort 后 `runExecutionStreamLoop` 仍在等待 runtime async iterator 的下一次 `.next()` resolve。
+- **根因**:
+  - `runExecutionStreamLoop` 旧实现用 `for await (const event of runtime.executeStream(...))` 消费 runtime event。该形状假设 runtime/provider 内部在 abort 后一定会 yield/throw/return。
+  - 真实 session 证明这个假设不够强：provider invocation 已完成并发出 `PostInvocation` hook，但后续 runtime 路径没有产出终态；hard watchdog 只能 abort controller，不能抢占一个永远 pending 的 iterator `.next()`。
+  - 另一个相邻风险是 thinking-only provider turn：provider 只返回 reasoning/thinking、没有 assistant 正文也没有工具调用时，旧 reducer 会把“空 assistant + reasoningContent”回灌给下一轮重试。该消息形状对 OpenAI-compatible/DeepSeek 路径可疑，并会放大“只有 thinking 没有正文”的 live stall。
+- **实现**:
+  - `src/nexus/executionStreamLoop.ts`: 把 `for await` 改为显式 async iterator 消费，每次 `iterator.next()` 都与 `signal` / `timeoutSignal` abort race。
+    - `timeoutSignal.aborted` 时由 Nexus 外层合成并持久化 `REQUEST_TIMEOUT` error，继续走 `processRuntimeExecutionEvent()`，因此 soft policy 下仍会被装饰为 `details.kind='watchdog'`。
+    - `signal.aborted` 时合成 `REQUEST_CANCELLED`，保证 Go TUI Esc / `/cancel` 不再依赖 runtime 内部自行收口。
+    - abort 获胜后 best-effort 调 `iterator.return()`，但不 await，避免一个不响应 abort 的 async generator 再次卡住路由。
+  - `src/runtime/pipeline/providerTurn.ts`: reasoning-only + no tool call 不再重试空 assistant，直接 terminal `EMPTY_PROVIDER_RESPONSE`，`details.kind='reasoning_only'`。这把 provider 的异常输出转为可见失败，而不是隐藏在下一轮 provider retry 中。
+- **回归覆盖**:
+  - `test/execution-stream-loop.test.ts`: 新增 `NonResponsiveRuntime`，模拟 runtime 先 yield `session_started` 后永久 pending；触发 timeout controller 后，断言 `runExecutionStreamLoop` 仍返回 `{ timedOut: true }`，并持久化 `REQUEST_TIMEOUT` 且 `details.kind='watchdog'`。
+  - `test/runtime.test.ts`: 新增 reducer 单测，锁定 reasoning-only provider turn 必须立即 terminal，不能增加 `outputRetryCount`。
+  - 既有 `test/runtime-llm.test.ts` thinking-only provider response regression 继续覆盖完整 runtime event 链。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "runtime iterator does not resolve after abort|reasoning-only provider turns|thinking-only provider response|empty provider response" test/execution-stream-loop.test.ts test/runtime.test.ts test/runtime-llm.test.ts`: 4/4 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/execution-stream-loop.test.ts test/execute-stream-watchdog.test.ts test/execution-event-processing.test.ts`: 8/8 pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(BuildExecuteRequestEmitsSoftTimeoutPolicy|RuntimeAnimationStateFollowsAgentEvent|HookCompletedDoesNotShowToolActivity|CancelStreamNotifiesLocalStreamAfterHTTPAck|StreamPermissionRequestOwnsForegroundView|PermissionRequestOwnsForegroundView|ConsumeNexusEventTracksSoftTimeoutLifecycle)$'`: pass。
+- **边界**:
+  - 没有把 `thinking_delta` 暴露为用户答案；reasoning-only 仍是 provider 空响应错误。
+  - 没有改变 soft timeout 的语义：soft budget 仍只发 recoverable signal；真正终止仍来自 hard watchdog 或 user cancel。
+  - 该修复保护 Nexus/WS route，不替代 provider adapter 的 abort propagation；即使内部某个 promise 不响应 abort，外层也能向 Go TUI 发送终态并释放 execution lease。
+
+### Follow-up: `session_f4a0a894` proved the reducer guard was still too late
+
+- **背景**: `session_f4a0a894-1585-4c59-96e2-92f32699bf57` 中，用户要求“你尝试查看一下bash工具是否正常”。事件显示模型只输出 thinking：`I'll run a simple bash command to verify.`，但没有发出 Bash tool call。
+- **证据**:
+  - 该 turn 的事件尾部是 `thinking_delta` → `usage` → `hook_completed(PostInvocation)` → 约 58 秒空窗 → `REQUEST_CANCELLED { source: "nexus_stream_abort_race" }`。
+  - `tool_traces` 中没有该 turn 的 Bash；只有前一轮分析时使用的 `contextSummarize/contextRecent` 等工具。
+  - 因此这仍不是权限面板问题：没有 `permission_request`，也没有 Bash tool call 可显示。
+- **进一步根因**:
+  - 之前在 `reduceProviderTurnOutcome()` 加的 reasoning-only terminal guard 理论上正确，但真实 session 证明 guard 执行得太晚：`PostInvocation` 已经发出后仍出现长空窗。
+  - 对 Go TUI 体验来说，reasoning-only/no-tool/no-text turn 必须在 provider turn 聚合完成后立刻终止，不能先进入 PostInvocation hook / leak helper / outcome helper 链路。
+- **追加实现**:
+  - `src/runtime/LLMCodingRuntime.ts`: 在 provider turn 返回后、`PostInvocation` hooks 之前增加前置 guard。若 `toolCalls.length===0 && assistantText.trim()==='' && reasoningText.trim()!==''`，立即：
+    1. `absorbProviderTurnMetrics(metrics, providerTurn)`，
+    2. emit `EMPTY_PROVIDER_RESPONSE` with `details.kind='reasoning_only'`，
+    3. emit failed `result`，
+    4. emit `execution_metrics`，
+    5. return。
+  - `test/runtime-llm.test.ts`: thinking-only 完整 runtime regression 现在断言 **不会出现 `hook_completed(PostInvocation)`**，锁定“PostInvocation 前终止”这个真实修复点。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "thinking-only provider response|empty provider response|reasoning-only provider turns|runtime iterator does not resolve after abort" test/runtime-llm.test.ts test/runtime.test.ts test/execution-stream-loop.test.ts`: 4/4 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/execution-stream-loop.test.ts test/execute-stream-watchdog.test.ts test/execution-event-processing.test.ts`: 8/8 pass。
+  - `npm run typecheck`: pass。
+
+### Follow-up: `session_f300...4a9fdf` proved stale deployment plus frontend backend-loss blind spot
+
+- **背景**: 用户报告最新 `session_...4a9fdf` 仍停在 `drafting response`，截图中 prompt 为“在桌面写一个简单的 c 语言程序”。Go TUI 显示 `running`，但没有权限面板、没有工具活动详情。
+- **进程事实**:
+  - `lsof -nP -iTCP:3000 -sTCP:LISTEN` 没有发现 Nexus 监听。
+  - 旧 Go TUI 进程仍在：`clients/go-tui/bin/go-tui --url http://127.0.0.1:3000 --cwd /Users/tangyaoyue --session session_f300c03c-1216-46f0-87e2-5b04414a9fdf`。
+  - 因此画面上的 Go TUI 已经与后端脱节；这不是当前 Bash permission panel 的可见性问题。
+- **session 事件证据**:
+  - `bbl inspect-session session_f300c03c-1216-46f0-87e2-5b04414a9fdf` 显示 SQLite 中 session 仍是 `phase=executing`，事件数 77，`terminal_reason=null`。
+  - 事件尾部为 `thinking_delta`（文本拼成 “Let me first check what's on the desktop, then write the file.”）→ `usage` → `hook_completed(PostInvocation)` → 180 秒后 `timeout_budget_exceeded`。
+  - 没有 `assistant_delta`、没有 `tool_started`、没有 `permission_request`、没有 `error/result`。`inspect-session --resume --json` 给出的边界是 `after_provider_invocation` 且 `cannot_resume`。
+- **根因归类**:
+  - 后端层：该 live session 仍命中旧 Nexus/runtime 代码路径。当前源码的前置 guard 会在 provider turn 聚合完成后、PostInvocation hook 之前把 reasoning-only/no-text/no-tool turn 转成 `EMPTY_PROVIDER_RESPONSE`；而真实 session 中已经出现 `hook_completed(PostInvocation)`，说明运行时不是当前修复后的后端。
+  - 前端层：旧 Go TUI 在后端 Nexus 进程死亡/不可达后，后台 `/v1/runtime/status` 轮询只清空 memory footer，没有把正在运行的 turn 收敛成可见错误，因此界面继续显示 `running` / `drafting response`。
+- **追加实现**:
+  - `clients/go-tui/internal/tui/api.go`: 新增 `isNexusTransportError()`，只识别 `url.Error` / `net.Error` / connection refused / reset / broken pipe / EOF 等传输断联，不把 HTTP 500 误判为后端进程丢失。
+  - `clients/go-tui/internal/tui/tui.go`: `runtimeStatusMsg` 在 running 且非 cancelRequested 时，如果健康轮询遇到 transport loss，立即追加 `Nexus became unreachable while this turn was running: ...`，清 `queuedPrompt`，并调用 `finishRunningStream()` 清理 running、pending、stream handles、soft timeout snapshot。
+  - `clients/go-tui/internal/tui/tui_test.go`: 新增两条回归：transport loss 必须 settle stale stream；普通 HTTP status error 不得误杀仍活着的 WebSocket stream。
+  - `src/nexus/sessionLifecycle.ts` + `src/nexus/server.ts`: Nexus 启动时收敛上个进程遗留的 `phase=executing` session，标记为 `failed`，`terminalReason.code=NEXUS_RESTARTED_DURING_EXECUTION`，并写入 `metadata.staleExecutionRecovery`；只处理 `executing`，不碰 `waiting_user` 或 terminal sessions。
+- **验证**:
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(RuntimeStatusFailureSettlesRunningStream|RuntimeStatusHTTPFailureDoesNotSettleRunningStream|StreamPermissionRequestOwnsForegroundView|PermissionRequestOwnsForegroundView|CancelStreamNotifiesLocalStreamAfterHTTPAck|FriendlyNexusRequestError|BuildExecuteRequestEmitsSoftTimeoutPolicy|BuildExecuteRequestRaisesLongContextTimeout|RuntimeAnimationStateFollowsAgentEvent)'`: pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "thinking-only provider response|empty provider response|reasoning-only provider turns|runtime iterator does not resolve after abort" test/runtime-llm.test.ts test/runtime.test.ts test/execution-stream-loop.test.ts`: 4/4 pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/session-lifecycle-stale-startup.test.ts`: pass。
+- **操作结论**:
+  - 对 `session_f300...4a9fdf` 的正确处置是停止旧 Go TUI / stale Nexus，重建并重启当前源码；不能继续用该旧 session 判断 Bash permission 或 context 工具注册。
+  - 后续排查 `drafting response` 必须先看事件尾部：有 unresolved `permission_request` 才是权限面板；只有 `thinking_delta` + `PostInvocation` 是 provider/output path；Nexus 不监听而 TUI 仍 running 是前端 backend-loss 收敛问题。
+
+## 2026-06-22 — Go TUI double-session stall triage: stale Nexus + shorter soft watchdog
+
+- **背景**: 用户同时打开两个新的 Go TUI session 后再次看到“running / drafting response”长时间不结束：
+  - `session_717fe155-b321-4fc7-a675-c744e7958217`: prompt=`查看当前项目的分支信息`，cwd=`/Users/tangyaoyue`。
+  - `session_84031893-9ee4-447f-be3b-666ef9a2a423`: prompt=`能否在桌面编写一个简单的c语言程序？`，cwd=`clients/go-tui`。
+- **实际事件结论**:
+  - 两个 session 都没有 pending `permission_request`；`session_840...` 的唯一 `Bash echo $HOME/Desktop` 已在 93ms 内完成。该轮不是 Bash 权限面板卡住。
+  - `session_717...` 只有 `thinking_delta`，无 `tool_started`、无 `assistant_delta`、无 `result/error`；随后进入软超时事件。
+  - `session_840...` 是第一轮 Bash 完成后，第二轮只输出 `thinking_delta`，无后续正文/工具/result；随后进入软超时事件。
+  - 两个 session 的 `timeout_budget_exceeded` / `timeout_extension_granted` 都来自旧 Go TUI payload：`timeoutPolicy=soft`、未显式传 `watchdogTimeoutMs`、默认 `maxSoftTimeoutExtensions=1`，因此 Nexus 默认 hard watchdog 为 540s，软超时后仍可假运行数分钟。
+- **源码核对**:
+  - 当前源码下新增回归 `test/runtime-llm.test.ts` 证明“thinking-only provider response”会在 ~100ms 内转为 `EMPTY_PROVIDER_RESPONSE`，不会进入数分钟悬挂。
+  - 因此两个 live session 的长时间悬挂不是当前源码可复现的 runtime 行为，而是本机 3000 上仍运行旧 Nexus 进程导致验证命中过期代码路径。
+  - `ps -p 6043` 确认旧 Nexus 是 2026-06-22 01:21:41 启动的 `tsx src/nexus/server.ts`，早于本轮 Go TUI / CLI / timeout 修复。
+- **实现补强**:
+  - `clients/go-tui/internal/tui/stream.go`: Go TUI execute payload 现在显式发送 `watchdogTimeoutMs = timeoutMs + 60s`，并发送 `maxSoftTimeoutExtensions=0`。默认交互 turn 从 “180s soft + 540s watchdog + 1 次扩展” 改为 “180s soft + 240s watchdog + 0 次扩展”；长上下文 turn 为 “300s soft + 360s watchdog”。
+  - `clients/go-tui/internal/tui/chrome.go`: `softTimeoutState` 已触发时，runtime animation 不再继续显示 `drafting response`，而是显示 `waiting for watchdog`，避免把 provider/synthesis stall 伪装成正常即将输出。
+  - `test/runtime-llm.test.ts`: 新增 thinking-only provider response regression，锁定只有 `thinking_delta` + `finish=end_turn` 时必须快速返回 `EMPTY_PROVIDER_RESPONSE`。
+- **验证 / 重启**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test --test-name-pattern "thinking-only provider response|empty provider response" test/runtime-llm.test.ts`: 2/2 pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(BuildExecuteRequestEmitsSoftTimeoutPolicy|BuildExecuteRequestRaisesLongContextTimeout|ResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn|ResolveGoTuiTimeoutRaisesLongContextTo300s|ResolveGoTuiTimeoutHonoursExplicitNonDefaultTimeout|RuntimeAnimationStateFollowsAgentEvent|HookCompletedDoesNotShowToolActivity|CancelStreamNotifiesLocalStreamAfterHTTPAck|StreamPermissionRequestOwnsForegroundView|PermissionRequestOwnsForegroundView|RenderPermissionIncludesInputAndMessage|ConsumeNexusEventTracksSoftTimeoutLifecycle)$'`: pass。
+  - `git diff --check`: clean。
+  - 取消两个 stuck session 后停止旧 Nexus / Go TUI 进程；重新 `npm run start` 启动 Nexus，健康检查通过，runtime status 显示新进程 `stream.activeCount=0`。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache make dev` 重建 `bin/go-tui`；随后启动新 Go TUI 连接 `http://127.0.0.1:3000`。
+  - `/v1/tools/audit` 确认 `contextRecent/contextSearch/contextSessions/contextSummarize` 等 context tools 仍注册并可见；`/v1/tools` 返回 404 是该分支无此公开路由，不代表工具注册丢失。
+- **边界**:
+  - 没有改变 Nexus 全局 soft timeout 默认；仅 Go TUI 交互客户端显式选择更短 hard watchdog 和零自动软扩展。
+  - 未把 `thinking_delta` 当 final answer；thinking-only 仍是 provider 空结果错误，避免把 hidden reasoning 泄漏成用户答案。
+  - 后续若再次看到“工具卡住”，必须先核对 session events + tool traces：有 `permission_request` 才是权限面板问题；只有 `thinking_delta`/soft timeout 是 provider/output path 问题；旧 PID 未重启则优先排除 stale process。
+
+## 2026-06-22 — Go TUI Bash permission panel + full tool-surface regression fix
+
+- **背景**: 用户在真实 Go TUI 验证中发现 Bash 权限申请面板不能直接显示，随后指出更核心的问题：`context*` 以及其他本应可见的工具从模型工具面消失。
+- **根因**:
+  - Go TUI 视觉层问题：`permission_request` 已到达时，`viewString()` 仍先渲染 transcript / interruption prompt / top card 等视图，导致权限面板可能被埋在当前运行态 UI 后面，表现为必须按 `Esc` 才看见。
+  - `session_c3fad031-8d9b-4150-bb10-4e20b91e2b35` 中的 `permission_response: Cancelled from Go TUI` 不是用户正常拒绝 Bash；它是权限面板不可见/卡住后，操作者按 `Esc` 逃生触发的取消。该 session 同时证明 Go TUI 已收到 pending permission（否则不会能取消），问题集中在可见渲染/重绘。
+  - 进一步核对发现：权限前台视图如果只返回短内容，在 Bubble Tea alt-screen / diff 渲染下仍可能留下上一帧满屏 transcript，导致“状态已切到 permission，但画面没有明显接管”。因此权限前台需要像 fullscreen overlay 一样补齐到终端高度。
+  - `session_69d88c7c-73e2-493f-b879-405ec2fa16a0` 复现了相邻但不同的 Go TUI 可见性问题：Nexus tool trace 中没有 Bash、也没有 pending `permission_request`；最后一批真实工具是 `ListDir` / `Read` / `Glob` 且均毫秒级完成。Go TUI footer 显示 `tool activity` 的直接原因是 `hook_started` / `hook_completed` 被 `runtimeAnimationState()` 归类成工具活动，导致内部 hook 事件伪装成用户可见工具卡住。
+  - 同一 session 中用户按 `Esc` 后看到 `interrupt requested — waiting for Nexus to stop` 长时间不恢复。根因是 `cancelStream()` 只有在 HTTP cancel 失败时才通知本地 WebSocket cancel channel；当 Nexus 成功接收 cancel 但 provider/stream 未立刻自然收口时，Go TUI 本地 `running` 状态仍等待远端最终 `result` / `error` / socket close。
+  - 工具面问题：`src/cli/commands/go.ts` 曾把 `bbl go --allowed-tools` 转发为 Go TUI `--allow-tools`。Go TUI 的 `--allow-tools` 会发送 per-turn `allowedTools`，这是模型可见工具集过滤器；用 `Read,Grep,Glob,ListDir` 启动验证时，会把 `contextSearch/contextRecent/contextSummarize/contextSessions`、`WebSearch`、`Skill*`、`TaskCreate`、`Write/Edit/Bash` 等默认工具一起裁掉。
+  - 诊断漂移：`denyByDefaultTools().describe()` 与 Nexus 启动日志仍描述成旧的 `read,grep,glob,task` 口径，实际策略已经是 `read-risk + task`。
+- **实现**:
+  - `clients/go-tui/internal/tui/tui.go`: `viewString()` 在 header 后优先返回 `renderPermissionEditor()` / `renderPermission()`，让 pending permission 拥有前景视图；该前景视图现在用 `padViewHeight(..., m.height)` 补齐到终端高度，避免短视图切换时被旧 transcript 帧干扰。
+  - `clients/go-tui/internal/tui/chrome.go`: `runtimeAnimationState()` 不再把 `hook_started` / `hook_completed` / `hook_failed` 当成 `tool activity`。只有真实 `tool_started` / `tool_completed` / `tool_denied` 会显示工具活动，避免内部 diagnostics hook 让用户误以为工具卡住。
+  - `clients/go-tui/internal/tui/api.go`: `cancelStream()` 在 Nexus cancel HTTP 成功或失败后都会通知本地 stream cancel channel。Esc 中断现在同时请求服务端取消并关闭本地 WebSocket，Go TUI 不再无限等待远端自然收口。
+  - `src/cli/commands/go.ts`: 拆分语义；`--allowed-tools` 只用于 auto-started Nexus 的 `NEXUS_ALLOWED_TOOLS`，新增 `--turn-allowed-tools` 才转发到 Go TUI `--allow-tools`。
+  - `src/runtime/LocalCodingRuntime.ts` + `src/nexus/server.ts`: 默认策略描述改为 `read-risk,task`，启动日志同步为 `allowedTools=default(read-risk,task)`。
+  - `docs/nexus/reference/tool-governance-plan.md`: provider-visible context 工具名修正为真实的 lowercase camelCase，并补上 `contextSessions`。
+- **回归覆盖**:
+  - `clients/go-tui/internal/tui/tui_test.go`: `TestPermissionRequestOwnsForegroundView` 覆盖 running + interruption prompt active 时权限面板仍应前景显示。
+  - `clients/go-tui/internal/tui/tui_test.go`: `TestStreamPermissionRequestOwnsForegroundView` 覆盖真实 `streamEventMsg{permission_request}` 更新路径，断言 `pending != nil`、`inputMode == modePermission`、transcript 不渲染，并且权限前台视图高度等于终端高度。
+  - `clients/go-tui/internal/tui/tui_test.go`: `TestHookCompletedDoesNotShowToolActivity` 覆盖内部 hook 事件不能再显示成工具活动。
+  - `clients/go-tui/internal/tui/tui_test.go`: `TestCancelStreamNotifiesLocalStreamAfterHTTPAck` 覆盖 Nexus cancel HTTP 200 时仍会通知本地 stream cancel channel。
+  - `test/go-command.test.ts`: 覆盖 `--allowed-tools` 不再转发到 Go TUI turn；`--turn-allowed-tools` 才转发。
+  - `test/prepare-runtime-start.test.ts`: 覆盖 default soft-deny 下 `createDefaultToolRegistry()` 的全量工具都保持 model-visible；并锁定 `denyByDefaultTools().describe().allowedTools === ['read-risk', 'task']`。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/go-command.test.ts test/prepare-runtime-start.test.ts`: 56/56 pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(RenderPermissionIncludesInputAndMessage|PermissionRequestOwnsForegroundView|PermissionRequestEntersPermissionMode|KeyDoesNotReachTextinputInPermissionMode|BuildExecuteRequestEmitsAllowedToolsWhenConfigured|BuildExecuteRequestOmitsAllowedToolsWhenUnset)$'`: pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(StreamPermissionRequestOwnsForegroundView|PermissionRequestOwnsForegroundView|RenderPermissionIncludesInputAndMessage)$'`: pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache go test ./internal/tui -run 'Test(HookCompletedDoesNotShowToolActivity|CancelStreamNotifiesLocalStreamAfterHTTPAck|RuntimeAnimationState|ToolCompletedUpdatesRuntimeAnimationState|StreamPermissionRequestOwnsForegroundView|PermissionRequestOwnsForegroundView|RenderPermissionIncludesInputAndMessage)$'`: pass。
+  - `cd clients/go-tui && GOCACHE=/private/tmp/babel-o-go-cache make dev`: rebuilt `bin/go-tui`.
+  - 本地 Nexus 已重启，健康检查通过，启动日志显示 `allowedTools=default(read-risk,task)`；Go TUI 已用 `--no-start-nexus --url http://127.0.0.1:3000` 启动，未携带 `--allowed-tools` / `--turn-allowed-tools`。
+- **边界**:
+  - 没有移除或改名 context 工具；`src/tools/registry.ts` 仍注册 `contextSearch/contextSummarize/contextRecent/contextSessions`。
+  - `allowedTools` per-turn 过滤语义保留，只是从 `bbl go --allowed-tools` 的启动策略中拆出，避免误裁剪默认工具面。
+  - Bash 是否一定触发面板仍取决于 provider 是否真实发出 Bash tool call；若 provider 只输出文本、不发 tool call，则 Nexus 不会有 `permission_request` 可显示。
+
 ## 2026-06-21 — Path 0 (drain-into-array buffer): real streaming root cause
 
 > **完整文档**: [reference/streaming-pipeline-realtime-rendering-fix.md](./reference/streaming-pipeline-realtime-rendering-fix.md) — 包含全部三层 (Path 0 / 1 / 2) 的设计、bisect 目标、WS 抓包数据、为什么三层都必要的解释。本节只记录 Path 0 的事实流水。

@@ -40,7 +40,9 @@ func startStream(cfg Config, prompt string, timeout timeoutDecision) tea.Cmd {
 		go runStream(cfg, sessionID, prompt, timeout, eventCh, decisionCh, cancelCh)
 		return tea.Batch(
 			func() tea.Msg { return sessionIDAllocatedMsg{sessionID: sessionID} },
-			func() tea.Msg { return streamStartedMsg{events: eventCh, decisions: decisionCh, cancel: cancelCh, sessionID: sessionID} },
+			func() tea.Msg {
+				return streamStartedMsg{events: eventCh, decisions: decisionCh, cancel: cancelCh, sessionID: sessionID}
+			},
 		)()
 	}
 }
@@ -80,6 +82,7 @@ func ensureStartupSession(cfg Config) tea.Cmd {
 const (
 	DefaultGoTuiExecuteTimeoutMs     = 180_000
 	longContextGoTuiExecuteTimeoutMs = 300_000
+	goTuiWatchdogGraceMs             = 60_000
 	longContextTokenThreshold        = 100_000
 )
 
@@ -142,6 +145,8 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		payload["timeoutMs"] = timeout.TimeoutMs
 		payload["timeoutPolicy"] = "soft"
 		payload["softTimeoutMs"] = timeout.TimeoutMs
+		payload["watchdogTimeoutMs"] = timeout.WatchdogTimeoutMs()
+		payload["maxSoftTimeoutExtensions"] = 0
 	}
 	policy := cfg.PolicyMode
 	if policy == "" {
@@ -249,25 +254,16 @@ func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, ev
 				// per-session map, and (b) surface the user's
 				// "tell the model what to do instead" text in
 				// the next turn.
-				payload := map[string]any{
-					"type":      "permission_response",
-					"sessionId": decision.sessionID,
-					"toolUseId": decision.toolUseID,
-					"approved":  decision.approved,
-					"reason":    decision.reason,
-				}
-				if decision.scope != "" {
-					payload["scope"] = decision.scope
-				}
-				if decision.rule != "" {
-					payload["rule"] = decision.rule
-				}
-				if decision.feedback != "" {
-					payload["feedback"] = decision.feedback
-				}
 				writeMu.Lock()
-				_ = conn.WriteJSON(payload)
+				err := writePermissionResponse(conn, decision)
 				writeMu.Unlock()
+				if err != nil {
+					select {
+					case eventCh <- streamEvent{err: fmt.Errorf("send permission response: %w", err)}:
+					case <-done:
+					}
+					return
+				}
 			case <-done:
 				return
 			}
@@ -299,6 +295,30 @@ func runStream(cfg Config, sessionID, prompt string, timeout timeoutDecision, ev
 			return
 		}
 	}
+}
+
+type jsonWriter interface {
+	WriteJSON(v any) error
+}
+
+func writePermissionResponse(conn jsonWriter, decision permissionDecision) error {
+	payload := map[string]any{
+		"type":      "permission_response",
+		"sessionId": decision.sessionID,
+		"toolUseId": decision.toolUseID,
+		"approved":  decision.approved,
+		"reason":    decision.reason,
+	}
+	if decision.scope != "" {
+		payload["scope"] = decision.scope
+	}
+	if decision.rule != "" {
+		payload["rule"] = decision.rule
+	}
+	if decision.feedback != "" {
+		payload["feedback"] = decision.feedback
+	}
+	return conn.WriteJSON(payload)
 }
 
 // allocateServerSession is the Phase 1 server-side session-id allocator.

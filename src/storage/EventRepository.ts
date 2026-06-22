@@ -54,7 +54,7 @@
  *   helper as a constructor argument so it does not
  *   depend on the storage internals.
  * - Do not change the tool-trace side effects on
- *   `tool_started` / `tool_completed` events — the
+ *   `tool_started` / `tool_completed` / `tool_denied` events — the
  *   main loop's `appendEvent` flow already calls
  *   `saveToolTrace` / `getToolTrace` on these events.
  *   The repository accepts callbacks to fire those
@@ -78,12 +78,13 @@ export type EventRepositoryOptions = {
    *  depend on the storage internals. */
   sequencedEventKey: (sessionId: string, eventSeq: number, eventJson: string, event: NexusEvent) => string
   /** Tool-trace side effects for `tool_started` /
-   *  `tool_completed` events. The repository fires
+   *  `tool_completed` / `tool_denied` events. The repository fires
    *  these on the appropriate events so the event
    *  pipeline stays the same as the prior inline
    *  implementation. */
   onToolStarted: (sessionId: string, event: Extract<NexusEvent, { type: 'tool_started' }>) => Promise<void>
   onToolCompleted: (sessionId: string, event: Extract<NexusEvent, { type: 'tool_completed' }>) => Promise<void>
+  onToolDenied: (sessionId: string, event: Extract<NexusEvent, { type: 'tool_denied' }>) => Promise<void>
   /** Execution-metrics side effect. The repository
    *  fires this for events that carry embedded
    *  metrics (e.g. `usage` events). */
@@ -151,6 +152,8 @@ export class EventRepository {
       await this.options.onToolStarted(sessionId, event)
     } else if (event.type === 'tool_completed') {
       await this.options.onToolCompleted(sessionId, event)
+    } else if (event.type === 'tool_denied') {
+      await this.options.onToolDenied(sessionId, event)
     }
 
     await this.options.onExecutionMetrics(sessionId, event)

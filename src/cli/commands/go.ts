@@ -22,6 +22,7 @@ export interface GoTuiCommandOptions {
   startNexus?: boolean
   nexusStartupTimeoutMs?: string
   allowedTools?: string
+  turnAllowedTools?: string
   pollIntervalMs?: string
   check?: boolean
 }
@@ -65,7 +66,8 @@ export function registerGoCommand(program: Command): void {
     .option('--start-nexus', 'Start a local Nexus service automatically when --url is not healthy', true)
     .option('--no-start-nexus', 'Do not auto-start Nexus; connect to --url only')
     .option('--nexus-startup-timeout-ms <ms>', 'Milliseconds to wait for auto-started Nexus health', '8000')
-    .option('--allowed-tools <tools>', 'Allowed tools for auto-started Nexus (default: env NEXUS_ALLOWED_TOOLS or *)')
+    .option('--allowed-tools <tools>', 'Allowed tools for auto-started Nexus only (default: env NEXUS_ALLOWED_TOOLS or *)')
+    .option('--turn-allowed-tools <tools>', 'Advanced: per-turn Go TUI allowedTools override; filters the model-visible tool set')
     .option('--poll-interval-ms <ms>', 'Forward Go TUI config polling interval; 0 disables polling')
     .option('--check', 'Verify install readiness (Go TUI binary, Nexus health, version compat) and exit 0/1')
     .action(async (options: GoTuiCommandOptions) => {
@@ -561,7 +563,7 @@ export function platformSuffix(platform: NodeJS.Platform, arch: NodeJS.Architect
   }
 }
 
-export function buildGoTuiArgs(options: Pick<GoTuiCommandOptions, 'url' | 'cwd' | 'session' | 'alt' | 'pollIntervalMs'>): string[] {
+export function buildGoTuiArgs(options: Pick<GoTuiCommandOptions, 'url' | 'cwd' | 'session' | 'alt' | 'pollIntervalMs' | 'turnAllowedTools'>): string[] {
   const args = ['--url', options.url, '--cwd', options.cwd]
   if (options.session) {
     args.push('--session', options.session)
@@ -571,6 +573,9 @@ export function buildGoTuiArgs(options: Pick<GoTuiCommandOptions, 'url' | 'cwd' 
   }
   if (options.pollIntervalMs !== undefined) {
     args.push('--poll-interval-ms', String(options.pollIntervalMs))
+  }
+  if (options.turnAllowedTools !== undefined) {
+    args.push('--allow-tools', options.turnAllowedTools)
   }
   return args
 }

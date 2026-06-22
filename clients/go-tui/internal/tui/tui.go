@@ -991,8 +991,8 @@ type model struct {
 	// enter; esc cancels as before. Always re-initialised to 0
 	// (default cursor on "Approve once") on every fresh
 	// `permission_request` event.
-	permissionChoice        int
-	lastEventType           string
+	permissionChoice int
+	lastEventType    string
 	// pendingSynthesis tracks the "model finished reasoning, no
 	// assistant text has arrived yet" gap. Some providers (Anthropic-
 	// compatible DeepSeek V4 observed in real e2e) batch the entire
@@ -1002,7 +1002,7 @@ type model struct {
 	// writing" during the gap. Setting pendingSynthesis=true on
 	// `thinking_delta` and clearing it on `assistant_delta` gives
 	// the operator a stable "drafting response..." indicator.
-	pendingSynthesis        bool
+	pendingSynthesis bool
 	// assistantSeenInTurn is a one-shot latch set when the first
 	// `assistant_delta` arrives in a turn. Late `thinking_delta`
 	// events that arrive AFTER assistant text (e.g. providers
@@ -1242,6 +1242,13 @@ type timeoutDecision struct {
 	TimeoutMs int
 	Reason    string
 	Adaptive  bool
+}
+
+func (d timeoutDecision) WatchdogTimeoutMs() int {
+	if d.TimeoutMs <= 0 {
+		return 0
+	}
+	return d.TimeoutMs + goTuiWatchdogGraceMs
 }
 
 func (d timeoutDecision) Label() string {
@@ -3239,6 +3246,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.memoryStatusRaw = nil
 			m.memoryFooter = ""
 			m.memoryHint = ""
+			if isNexusTransportError(msg.err) && m.running && !m.cancelRequested {
+				m.appendLine("error", "Nexus became unreachable while this turn was running: "+friendlyNexusRequestError(msg.err))
+				m.queuedPrompt = ""
+				return m, m.finishRunningStream()
+			}
 		}
 		return m, nil
 
@@ -3411,6 +3423,12 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 func (m model) viewString() string {
 	width := max(40, m.width)
 	header := m.renderHeader(width)
+	if permissionEditor := m.renderPermissionEditor(width); permissionEditor != "" {
+		return padViewHeight(strings.Join([]string{header, permissionEditor, m.renderFooter(width)}, "\n"), m.height)
+	}
+	if permission := m.renderPermission(width); permission != "" {
+		return padViewHeight(strings.Join([]string{header, permission, m.renderFooter(width)}, "\n"), m.height)
+	}
 	topCard := m.renderTopCard(width)
 	if topCard != "" {
 		return strings.Join([]string{header, topCard, m.renderFooter(width)}, "\n")
@@ -3423,8 +3441,6 @@ func (m model) viewString() string {
 		return padViewHeight(strings.Join([]string{header, overlay}, "\n"), m.height)
 	}
 	transcript := m.highlightedViewportView()
-	permission := m.renderPermission(width)
-	permissionEditor := m.renderPermissionEditor(width)
 	composer := m.renderComposerStack(width)
 	footer := m.renderFooter(width)
 	help := m.renderHelp(width)
@@ -3443,12 +3459,6 @@ func (m model) viewString() string {
 	quitConfirm := m.renderQuitConfirm(width)
 
 	parts := []string{header, transcript}
-	if permission != "" {
-		parts = append(parts, permission)
-	}
-	if permissionEditor != "" {
-		parts = append(parts, permissionEditor)
-	}
 	if help != "" {
 		parts = append(parts, help)
 	}

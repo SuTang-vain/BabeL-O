@@ -55,6 +55,7 @@ const BASH_READ_ONLY_COMMANDS: Record<string, Set<string> | null> = {
     'rev-parse',
     'ls-files',
     'tag',
+    'branch',
   ]),
   // Pure read-only filesystem inspection
   ls: new Set(),
@@ -136,6 +137,36 @@ const SAFE_GREP_FLAGS = new Set([
   '--binary-files=without-match',
 ])
 const SAFE_SED_FLAGS = new Set(['-n', '--quiet', '--silent'])
+const SAFE_GIT_BRANCH_FLAGS = new Set([
+  '--show-current',
+  '--list',
+  '--all',
+  '--remotes',
+  '--verbose',
+  '--color',
+  '--no-color',
+  '--format',
+  '-a',
+  '-r',
+  '-v',
+  '-vv',
+])
+const DENIED_GIT_BRANCH_FLAGS = new Set([
+  '-d',
+  '-D',
+  '-m',
+  '-M',
+  '-c',
+  '-C',
+  '-f',
+  '--delete',
+  '--move',
+  '--copy',
+  '--force',
+  '--set-upstream-to',
+  '--unset-upstream',
+  '--edit-description',
+])
 
 /**
  * Regex escalations applied to the *entire* command string. A match
@@ -401,6 +432,38 @@ function classifySafeGrep(args: string[]): 'read' | { kind: 'execute'; rule: str
   return 'read'
 }
 
+function classifyGitBranch(args: string[]): 'read' | { kind: 'execute'; rule: string } {
+  if (args.length === 0) return 'read'
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i]
+    if (arg === '--') {
+      return { kind: 'execute', rule: 'git-branch-positional-not-allowlisted' }
+    }
+    if (DENIED_GIT_BRANCH_FLAGS.has(arg)) {
+      return { kind: 'execute', rule: `git-branch-${arg.replace(/^--?/, '')}-denied` }
+    }
+    if (arg === '--format') {
+      const value = args[i + 1]
+      if (!value || value.startsWith('-')) {
+        return { kind: 'execute', rule: 'git-branch-format-requires-value' }
+      }
+      i += 1
+      continue
+    }
+    if (arg.startsWith('--format=')) {
+      continue
+    }
+    if (SAFE_GIT_BRANCH_FLAGS.has(arg)) {
+      continue
+    }
+    if (arg.startsWith('-')) {
+      return { kind: 'execute', rule: `git-branch-${arg.replace(/^--?/, '')}-not-allowlisted` }
+    }
+    return { kind: 'execute', rule: 'git-branch-positional-not-allowlisted' }
+  }
+  return 'read'
+}
+
 /**
  * Classify a Bash command string as `read` (auto-allow under
  * `denyByDefaultTools()`) or `execute` (keep current hard-deny /
@@ -465,6 +528,13 @@ export function classifyBashRisk(command: string): BashRiskClassification {
           return { kind: 'execute', rule: dangerous, command }
         }
         return { kind: 'execute', rule: `command:${first}-${subcommand}-not-allowlisted`, command }
+      }
+    }
+    if (first === 'git' && subcommand === 'branch') {
+      const branchArgs = rest.slice(rest.indexOf(subcommand) + 1)
+      const branchResult = classifyGitBranch(branchArgs)
+      if (branchResult !== 'read') {
+        return { kind: 'execute', rule: branchResult.rule, command }
       }
     }
     // Empty Set (no subcommand restriction) OR matched subcommand: fall

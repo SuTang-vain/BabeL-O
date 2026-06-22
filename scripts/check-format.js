@@ -4,7 +4,7 @@ import { join, relative, resolve } from 'node:path'
 
 const root = resolve(new URL('..', import.meta.url).pathname)
 const checkedExtensions = new Set(['.js', '.json', '.md', '.ts', '.tsx', '.yml', '.yaml'])
-const skippedDirectories = new Set(['.git', '.cache', 'coverage', 'dist', 'node_modules'])
+const skippedDirectories = new Set(['.git', '.cache', '.babel-o', 'coverage', 'dist', 'node_modules'])
 const failures = []
 
 for (const filePath of await listFiles(root)) {

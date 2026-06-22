@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { Command } from 'commander'
+import type { GoTuiCommandOptions } from '../src/cli/commands/go.js'
 import {
   allocateGoTuiSession,
   buildGoTuiArgs,
@@ -43,6 +44,43 @@ test('buildGoTuiArgs forwards Nexus and session options', () => {
       '--alt=false',
       '--poll-interval-ms',
       '0',
+    ],
+  )
+})
+
+test('buildGoTuiArgs does not forward Nexus startup allowed tools to Go TUI turns', () => {
+  const options: GoTuiCommandOptions = {
+    url: 'http://127.0.0.1:3000',
+    cwd: '/workspace',
+    alt: true,
+    allowedTools: 'Read,Bash',
+  }
+  assert.deepEqual(
+    buildGoTuiArgs(options),
+    [
+      '--url',
+      'http://127.0.0.1:3000',
+      '--cwd',
+      '/workspace',
+    ],
+  )
+})
+
+test('buildGoTuiArgs forwards explicit turn allowed tools to Go TUI per-turn requests', () => {
+  assert.deepEqual(
+    buildGoTuiArgs({
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      alt: true,
+      turnAllowedTools: 'Read,contextRecent',
+    }),
+    [
+      '--url',
+      'http://127.0.0.1:3000',
+      '--cwd',
+      '/workspace',
+      '--allow-tools',
+      'Read,contextRecent',
     ],
   )
 })

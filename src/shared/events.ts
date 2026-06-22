@@ -123,6 +123,7 @@ export const ToolCompletedEventSchema = z.object({
 export const ToolDeniedEventSchema = z.object({
   type: z.literal('tool_denied'),
   ...baseEventFields,
+  toolUseId: z.string().optional(),
   name: z.string(),
   risk: z.enum(['read', 'write', 'execute', 'task']),
   message: z.string(),

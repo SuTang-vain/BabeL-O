@@ -230,6 +230,29 @@ export function reduceProviderTurnOutcome(options: {
   const assistantMessage = buildProviderAssistantMessage(turn)
   if (turn.toolCalls.length === 0) {
     if (turn.assistantText.trim().length === 0) {
+      const reasoningOnly = turn.reasoningText.trim().length > 0
+      if (reasoningOnly) {
+        const message = 'Provider returned an empty assistant response with no tool calls.'
+        return {
+          kind: 'terminal',
+          eventsBeforeMessages: [],
+          eventsAfterMessages: [
+            buildRuntimeErrorEvent({
+              sessionId: options.sessionId,
+              code: 'EMPTY_PROVIDER_RESPONSE',
+              message,
+              details: {
+                kind: 'reasoning_only',
+                retryable: true,
+                suggestion: 'Retry the turn or switch to a model/provider that emits assistant text or tool calls after reasoning.',
+              },
+            }),
+            buildRuntimeResultEvent(options.sessionId, false, message),
+          ],
+          messages: [assistantMessage],
+          ...baseCounts,
+        }
+      }
       if (options.outputRetryCount < options.maxOutputRetries) {
         return {
           kind: 'continue',

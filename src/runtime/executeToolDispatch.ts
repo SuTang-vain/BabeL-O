@@ -2,11 +2,11 @@
  * Phase 3B-17 slice — `executeToolDispatch.ts`
  *
  * Extracted from `src/runtime/LLMCodingRuntime.ts`. Contains
- * the standalone async function `executeToolDispatch()`
+ * the standalone async generator `executeToolDispatch()`
  * that runs `ToolDispatchPipeline.run(...)` against the
- * outcome's tool calls, drains the resulting async
- * generator, and returns the per-loop state updates the
- * main loop must apply (previousEvents, taskScopeEvent,
+ * outcome's tool calls, streams the resulting async
+ * generator events, and returns the per-loop state updates
+ * the main loop must apply (previousEvents, taskScopeEvent,
  * toolResults message, terminal flag).
  *
  * Why extracted:
@@ -20,7 +20,7 @@
  *   `executeProviderTurn` (3B-15) and the
  *   `compactSession` block inside the pre-loop helper
  *   (3B-13 / 3B-14). All three follow the
- *   'drain-the-async-generator' pattern; pulling this
+ *   'drive-the-async-generator' pattern; pulling this
  *   third instance out keeps the main loop consistent
  *   with the rest of the per-loop slice.
  * - Future slices that introduce a per-tool-call
@@ -30,9 +30,9 @@
  *
  * Goals:
  *
- * - Preserve exact behavior parity: same generator
- *   driving, same state updates, same kind-based
- *   branch, same toolResults push.
+ * - Preserve the pre-extraction streaming contract:
+ *   permission_request / tool_started / scope events must
+ *   reach Nexus before a tool call finishes.
  * - Eliminate ~15 lines of inline code from
  *   `LLMCodingRuntime.ts`.
  *
@@ -41,11 +41,9 @@
  * - Do not change the call site of
  *   `ToolDispatchPipeline.run(...)`: the helper passes
  *   the same options through.
- * - Do not yield events: the main loop drives the
- *   user-facing yield loop (the tool dispatch's events
- *   are appended to the per-loop `previousEvents`
- *   accumulator by the main loop because the dispatch
- *   events share the loop's yield context).
+ * - Keep state ownership in the main loop: this helper
+ *   yields events progressively, then returns the final
+ *   state bundle for the main loop to write back.
  * - Do not fire the terminal `return`: the helper
  *   surfaces a `terminal` flag instead.
  */
@@ -93,18 +91,19 @@ export type ExecuteToolDispatchResult = {
 /**
  * Run one tool-dispatch pass: drive the
  * `ToolDispatchPipeline.run(...)` async generator,
- * update per-loop state, and return the events the
- * main loop must yield alongside the new state values.
+ * yield dispatch events progressively, and return the new
+ * state values the main loop must write back.
  */
-export async function executeToolDispatch(
+export async function* executeToolDispatch(
   toolDispatchPipeline: ToolDispatchPipeline,
   input: ExecuteToolDispatchInput,
-): Promise<ExecuteToolDispatchResult> {
+): AsyncGenerator<NexusEvent, ExecuteToolDispatchResult> {
   const events: NexusEvent[] = []
   const stream = toolDispatchPipeline.run(input)
   let result = await stream.next()
   while (!result.done) {
     events.push(result.value)
+    yield result.value
     result = await stream.next()
   }
   const final: ToolDispatchPipelineResult = result.value

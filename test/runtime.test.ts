@@ -1336,6 +1336,37 @@ test('runtime pipeline reduces final and tool-call provider turns', () => {
   assert.equal(toolOutcome.messages[0]?.role, 'assistant')
 })
 
+test('runtime pipeline terminates reasoning-only provider turns instead of retrying empty assistant content', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-turn-reducer-reasoning-only',
+    turn: {
+      assistantText: '',
+      reasoningText: 'I should inspect the branch, but I did not emit text or a tool call.',
+      finishReason: 'end_turn',
+      toolCalls: [],
+    },
+    finalResponseOnlyMode: false,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+
+  assert.equal(outcome.kind, 'terminal')
+  assert.equal(outcome.outputRetryCount, 0)
+  assert.equal(outcome.eventsAfterMessages[0]?.type, 'error')
+  assert.equal(outcome.eventsAfterMessages[0]?.code, 'EMPTY_PROVIDER_RESPONSE')
+  assert.equal((outcome.eventsAfterMessages[0]?.details as any).kind, 'reasoning_only')
+  assert.equal(outcome.eventsAfterMessages[1]?.type, 'result')
+  assert.equal(outcome.eventsAfterMessages[1]?.success, false)
+  assert.equal(outcome.messages.length, 1)
+  assert.equal(outcome.messages[0]?.role, 'assistant')
+})
+
 test('runtime tool loop executes a provider tool call and returns tool_result content', async () => {
   const tools = createDefaultToolRegistry()
   const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-tool-loop-success`)
@@ -8912,8 +8943,16 @@ test('execute permission denial: user denies → tool_denied + result(false)', a
     (e: any) => e.type === 'tool_denied' && e.name === 'Bash',
   )
   assert.ok(toolDenied, 'tool_denied should fire on user denial')
+  assert.equal(toolDenied.toolUseId, toolUseId)
   assert.equal(toolDenied.terminal, true)
   assert.equal(toolDenied.denialKind, 'permission')
+
+  const deniedTrace = await storage.getToolTrace(toolUseId)
+  assert.ok(deniedTrace, 'denied Bash should close its tool trace')
+  assert.equal(deniedTrace.success, false)
+  assert.equal(deniedTrace.completedAt !== undefined, true)
+  assert.equal((deniedTrace.output as any).code, 'TOOL_DENIED')
+  assert.equal((deniedTrace.output as any).denialKind, 'permission')
 
   // terminal result is failure.
   const result = body.result ?? events.find((e: any) => e.type === 'result')

@@ -1227,6 +1227,21 @@ func TestToolCompletedUpdatesRuntimeAnimationState(t *testing.T) {
 	}
 }
 
+func TestHookCompletedDoesNotShowToolActivity(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.running = true
+	m.consumeNexusEvent(map[string]any{
+		"type":      "hook_completed",
+		"hookName":  "InvocationDiagnosticsHook",
+		"hookEvent": "PostInvocation",
+	})
+	label, kind := m.runtimeAnimationState()
+	if strings.Contains(label, "tool activity") || kind == runtimeAnimationTool {
+		t.Fatalf("hook_completed runtime animation = (%q, %q), should not masquerade as tool activity",
+			label, kind)
+	}
+}
+
 func TestFormatNexusEventSummarizesHookCompletedOutput(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
 		"type":      "hook_completed",
@@ -1906,6 +1921,85 @@ func TestRenderPermissionIncludesInputAndMessage(t *testing.T) {
 	}
 }
 
+func TestPermissionRequestOwnsForegroundView(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 100
+	m.height = 24
+	m.running = true
+	m.interruptionPromptActive = true
+	m.input.SetValue("BabeL-O should continue")
+	m.resize()
+	m.appendLine("assistant", "TRANSCRIPT_SHOULD_NOT_HIDE_PERMISSION")
+	m.appendLine("permission", "What should BabeL-O do instead? Edit the prompt below.")
+	m.consumeNexusEvent(map[string]any{
+		"type":      "permission_request",
+		"toolUseId": "tool_1",
+		"sessionId": "session_xyz",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input": map[string]any{
+			"command": "git branch --show-current",
+		},
+	})
+
+	view := stripANSICodes(viewContent(m.View()))
+	if !strings.Contains(view, "Permission: Bash") {
+		t.Fatalf("permission panel should be foregrounded, got:\n%s", view)
+	}
+	if !strings.Contains(view, "git branch --show-current") {
+		t.Fatalf("permission panel should show command preview, got:\n%s", view)
+	}
+	if strings.Contains(view, "TRANSCRIPT_SHOULD_NOT_HIDE_PERMISSION") {
+		t.Fatalf("transcript should not be rendered while permission is pending, got:\n%s", view)
+	}
+	if strings.Contains(view, "What should BabeL-O do instead?") {
+		t.Fatalf("interruption prompt should not obscure pending permission, got:\n%s", view)
+	}
+}
+
+func TestStreamPermissionRequestOwnsForegroundView(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 100
+	m.height = 24
+	m.running = true
+	m.events = make(chan streamEvent)
+	m.decisions = make(chan permissionDecision, 1)
+	m.resize()
+	m.appendLine("assistant", "TRANSCRIPT_SHOULD_NOT_HIDE_STREAM_PERMISSION")
+
+	updated, _ := m.Update(streamEventMsg{event: streamEvent{payload: map[string]any{
+		"type":      "permission_request",
+		"toolUseId": "call_bash",
+		"sessionId": "session_xyz",
+		"name":      "Bash",
+		"risk":      "execute",
+		"input": map[string]any{
+			"command": "cd /workspace && git status -sb",
+		},
+	}}})
+	m = updated.(model)
+
+	if m.pending == nil {
+		t.Fatal("stream permission_request should set pending permission")
+	}
+	if m.inputMode != modePermission {
+		t.Fatalf("inputMode = %s, want %s", m.inputMode, modePermission)
+	}
+	view := stripANSICodes(viewContent(m.View()))
+	if !strings.Contains(view, "Permission: Bash") {
+		t.Fatalf("stream permission panel should be foregrounded, got:\n%s", view)
+	}
+	if !strings.Contains(view, "git status -sb") {
+		t.Fatalf("permission panel should show command preview, got:\n%s", view)
+	}
+	if got := lipgloss.Height(viewContent(m.View())); got != m.height {
+		t.Fatalf("permission foreground view height = %d, want terminal height %d", got, m.height)
+	}
+	if strings.Contains(view, "TRANSCRIPT_SHOULD_NOT_HIDE_STREAM_PERMISSION") {
+		t.Fatalf("transcript should not be rendered while stream permission is pending, got:\n%s", view)
+	}
+}
+
 func TestLinePresentationHasStableLabelsForPhase2Events(t *testing.T) {
 	wantLabels := map[string]string{
 		"task_created":           "task +   ",
@@ -2072,6 +2166,73 @@ func TestFetchRuntimeConfigNoSinceWhenZero(t *testing.T) {
 	_ = fetchRuntimeConfig(cfg, 0)()
 	if gotURL != "/v1/runtime/config" {
 		t.Fatalf("fetchRuntimeConfig URL = %q, want no query", gotURL)
+	}
+}
+
+func TestCancelStreamNotifiesLocalStreamAfterHTTPAck(t *testing.T) {
+	var gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"type":"session_cancelled"}`))
+	}))
+	defer srv.Close()
+
+	cancelCh := make(chan struct{}, 1)
+	msg := cancelStream(Config{BaseURL: srv.URL}, "session_cancel_ack", cancelCh)()
+	if gotPath != "/v1/sessions/session_cancel_ack/cancel" {
+		t.Fatalf("cancel request path = %q", gotPath)
+	}
+	if cancelMsg, ok := msg.(streamCancelMsg); !ok || cancelMsg.err != nil {
+		t.Fatalf("cancelStream msg = %#v, want streamCancelMsg without err", msg)
+	}
+	select {
+	case <-cancelCh:
+	default:
+		t.Fatal("successful HTTP cancel should still notify local stream cancel channel")
+	}
+}
+
+func TestRuntimeStatusFailureSettlesRunningStream(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+	m.startedAt = time.Now().Add(-time.Minute)
+	m.events = make(chan streamEvent)
+	m.decisions = make(chan permissionDecision, 1)
+	m.streamCancel = make(chan struct{}, 1)
+	m.queuedPrompt = "do something next"
+
+	updated, cmd := m.Update(runtimeStatusMsg{err: errors.New("dial tcp 127.0.0.1:3000: connect: connection refused")})
+	um := updated.(model)
+	if um.running {
+		t.Fatal("runtime status failure while running should settle the stale stream")
+	}
+	if um.events != nil || um.decisions != nil || um.streamCancel != nil {
+		t.Fatalf("stream handles should be cleared, events=%v decisions=%v cancel=%v", um.events, um.decisions, um.streamCancel)
+	}
+	if um.queuedPrompt != "" {
+		t.Fatalf("queuedPrompt should be cleared after backend loss, got %q", um.queuedPrompt)
+	}
+	if cmd != nil {
+		t.Fatalf("backend loss should not auto-start queued prompt, got %T", cmd)
+	}
+	last := um.transcript[len(um.transcript)-1]
+	if last.kind != "error" || !strings.Contains(last.text, "Nexus became unreachable") {
+		t.Fatalf("expected explicit Nexus unreachable error, got %+v", last)
+	}
+}
+
+func TestRuntimeStatusHTTPFailureDoesNotSettleRunningStream(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.running = true
+
+	updated, _ := m.Update(runtimeStatusMsg{err: errors.New("GET /v1/runtime/status failed: 500 Internal Server Error")})
+	um := updated.(model)
+	if !um.running {
+		t.Fatal("HTTP status errors should not settle an otherwise live WebSocket stream")
+	}
+	if len(um.transcript) > 0 && strings.Contains(um.transcript[len(um.transcript)-1].text, "Nexus became unreachable") {
+		t.Fatalf("HTTP status error should not be rendered as transport loss, got %+v", um.transcript[len(um.transcript)-1])
 	}
 }
 
@@ -8263,6 +8424,12 @@ func TestBuildExecuteRequestEmitsSoftTimeoutPolicy(t *testing.T) {
 	if got := anyInt(payload["softTimeoutMs"]); got != DefaultGoTuiExecuteTimeoutMs {
 		t.Fatalf("softTimeoutMs = %d, want %d", got, DefaultGoTuiExecuteTimeoutMs)
 	}
+	if got := anyInt(payload["watchdogTimeoutMs"]); got != DefaultGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs {
+		t.Fatalf("watchdogTimeoutMs = %d, want %d", got, DefaultGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs)
+	}
+	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 0 {
+		t.Fatalf("maxSoftTimeoutExtensions = %d, want 0", got)
+	}
 }
 
 func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
@@ -8302,6 +8469,12 @@ func TestBuildExecuteRequestRaisesLongContextTimeout(t *testing.T) {
 	payload := buildExecuteRequestWithTimeout(cfg, "session_abc", "long-context analysis", decision)
 	if got := anyInt(payload["timeoutMs"]); got != longContextGoTuiExecuteTimeoutMs {
 		t.Fatalf("timeoutMs = %d, want %d", got, longContextGoTuiExecuteTimeoutMs)
+	}
+	if got := anyInt(payload["watchdogTimeoutMs"]); got != longContextGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs {
+		t.Fatalf("watchdogTimeoutMs = %d, want %d", got, longContextGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs)
+	}
+	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 0 {
+		t.Fatalf("maxSoftTimeoutExtensions = %d, want 0", got)
 	}
 }
 
@@ -8464,6 +8637,55 @@ func TestRunStreamEmitsSoftDenyPolicyAndHandlesPermissionRequest(t *testing.T) {
 		t.Fatalf("permission_request.name = %q, want Bash", got)
 	}
 	<-doneCh
+}
+
+type failingJSONWriter struct {
+	payload map[string]any
+	err     error
+}
+
+func (w *failingJSONWriter) WriteJSON(v any) error {
+	if payload, ok := v.(map[string]any); ok {
+		w.payload = payload
+	}
+	return w.err
+}
+
+func TestWritePermissionResponseReturnsWriteError(t *testing.T) {
+	writer := &failingJSONWriter{err: errors.New("write failed")}
+	err := writePermissionResponse(writer, permissionDecision{
+		sessionID: "session_test_allocated",
+		toolUseID: "tool_1",
+		approved:  true,
+		reason:    "Approved from test",
+		scope:     "rule",
+		rule:      "bash:git",
+		feedback:  "continue",
+	})
+	if err == nil || !strings.Contains(err.Error(), "write failed") {
+		t.Fatalf("writePermissionResponse error = %v, want write failed", err)
+	}
+	if got := writer.payload["type"]; got != "permission_response" {
+		t.Fatalf("payload.type = %v, want permission_response", got)
+	}
+	if got := writer.payload["sessionId"]; got != "session_test_allocated" {
+		t.Fatalf("payload.sessionId = %v, want session_test_allocated", got)
+	}
+	if got := writer.payload["toolUseId"]; got != "tool_1" {
+		t.Fatalf("payload.toolUseId = %v, want tool_1", got)
+	}
+	if got := writer.payload["approved"]; got != true {
+		t.Fatalf("payload.approved = %v, want true", got)
+	}
+	if got := writer.payload["scope"]; got != "rule" {
+		t.Fatalf("payload.scope = %v, want rule", got)
+	}
+	if got := writer.payload["rule"]; got != "bash:git" {
+		t.Fatalf("payload.rule = %v, want bash:git", got)
+	}
+	if got := writer.payload["feedback"]; got != "continue" {
+		t.Fatalf("payload.feedback = %v, want continue", got)
+	}
 }
 
 func TestBuildExecuteRequestEmitsAllowedToolsWhenConfigured(t *testing.T) {
@@ -10780,6 +11002,7 @@ func TestRuntimeAnimationStateFollowsAgentEvent(t *testing.T) {
 		eventType        string
 		pending          bool
 		pendingSynthesis bool
+		softTimedOut     bool
 		wantLabel        string
 		wantKind         runtimeAnimationKind
 	}{
@@ -10796,6 +11019,7 @@ func TestRuntimeAnimationStateFollowsAgentEvent(t *testing.T) {
 		// the next render frame falls into the default branch
 		// where pendingSynthesis picks synthesizing vs default.
 		{name: "synthesizing after thinking", eventType: "", pendingSynthesis: true, wantLabel: "drafting response", wantKind: runtimeAnimationSynthesizing},
+		{name: "soft timeout supersedes synthesizing", eventType: "", pendingSynthesis: true, softTimedOut: true, wantLabel: "waiting for watchdog", wantKind: runtimeAnimationDefault},
 		// Tool events take priority over the synthesis bridge
 		// (the switch above them in runtimeAnimationState). When
 		// lastEventType is tool_*, the chrome shows tool activity
@@ -10813,6 +11037,9 @@ func TestRuntimeAnimationStateFollowsAgentEvent(t *testing.T) {
 			m.pendingSynthesis = tc.pendingSynthesis
 			if tc.pending {
 				m.pending = &pendingPermission{name: "Bash"}
+			}
+			if tc.softTimedOut {
+				m.softTimeoutState = &softTimeoutSnapshot{BudgetExceededAt: time.Now()}
 			}
 			label, kind := m.runtimeAnimationState()
 			if !strings.Contains(label, tc.wantLabel) || kind != tc.wantKind {

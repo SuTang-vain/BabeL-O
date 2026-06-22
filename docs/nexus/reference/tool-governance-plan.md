@@ -25,7 +25,7 @@ BabeL-O already has a broad model-visible tool surface:
 - mutation tools: `Write`, `Edit`
 - execution tool: `Bash`
 - task tool: `TaskCreate`
-- context tools: `ContextSearch`, `ContextSummarize`, `ContextRecent`
+- context tools: `contextSearch`, `contextSummarize`, `contextRecent`, `contextSessions`
 - web tool: `WebSearch`
 - skill tools: `SkillList`, `SkillShow`, `SkillValidate`, `SkillDraft`, `SkillSave`
 - optional AgentScheduler tools when explicitly enabled: `AgentSpawn`, `AgentWait`, `AgentList`, `AgentCancel`
@@ -49,7 +49,7 @@ The current gap is not "missing all tools". The gap is governance:
 | Mutation | `Write`, `Edit`, `SkillSave` | Requires write-risk governance, permission/audit, and repairable failure semantics. |
 | Execution | `Bash` | Requires command classification, execute-risk review, and strong fallback to dedicated tools for source inspection. |
 | Task lifecycle | `TaskCreate` and future task tools | Must stay lifecycle-oriented and not become a hidden planner channel. |
-| Context retrieval | `ContextSearch`, `ContextSummarize`, `ContextRecent` | Must be explicit on-demand context retrieval, not a hidden memory fact source. |
+| Context retrieval | `contextSearch`, `contextSummarize`, `contextRecent`, `contextSessions` | Must be explicit on-demand context retrieval, not a hidden memory fact source. |
 | Skill lifecycle | `SkillList`, `SkillShow`, `SkillValidate`, `SkillDraft`, `SkillSave` | Skill naming and persistence boundaries are owned by the skill governance plan. |
 | Agent lifecycle | `AgentSpawn`, `AgentWait`, `AgentList`, `AgentCancel` | Must remain opt-in and profile-gated; write-capable child agents remain disabled. |
 | MCP wrapped tools | `mcp:*` | Must retain source identity, risk classification, and native/MCP precedence diagnostics. |

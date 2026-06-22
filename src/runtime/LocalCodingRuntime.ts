@@ -362,6 +362,7 @@ export class LocalCodingRuntime implements NexusRuntime {
         yield {
           type: 'tool_denied',
           ...eventBase(options.sessionId),
+          toolUseId,
           name: tool.name,
           risk: effectiveRisk,
           message: hookDenyReason,
@@ -514,6 +515,7 @@ export class LocalCodingRuntime implements NexusRuntime {
           yield {
             type: 'tool_denied',
             ...eventBase(options.sessionId),
+            toolUseId,
             name: tool.name,
             risk: effectiveRisk,
             message: denyMessage,
@@ -827,7 +829,7 @@ export function denyByDefaultTools(): ToolPolicy {
       return tool.risk === 'read' || tool.risk === 'task'
     },
     describe() {
-      return { mode: 'allowlist', allowedTools: ['listdir', 'glob', 'grep', 'read', 'websearch', 'task'] }
+      return { mode: 'allowlist', allowedTools: ['read-risk', 'task'] }
     },
   }
 }

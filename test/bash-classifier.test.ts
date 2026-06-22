@@ -46,6 +46,10 @@ test('classifyBashRisk auto-allows git read-only subcommands', () => {
   expectRead('git rev-parse --short HEAD')
   expectRead('git ls-files')
   expectRead('git tag --list')
+  expectRead('git branch --show-current')
+  expectRead('git branch --list')
+  expectRead('git branch -a')
+  expectRead('git branch --format "%(refname:short)"')
 })
 
 test('classifyBashRisk denies git write/mutating subcommands', () => {
@@ -57,8 +61,10 @@ test('classifyBashRisk denies git write/mutating subcommands', () => {
   expectExecute('git rebase main', { ruleSubstring: 'git-rebase-denied-subcommand' })
   expectExecute('git merge feature', { ruleSubstring: 'git-merge-denied-subcommand' })
   expectExecute('git stash drop', { ruleSubstring: 'git-stash-denied-subcommand' })
-  expectExecute('git branch -D feature', { ruleSubstring: 'git-branch-not-allowlisted' })
-  expectExecute('git branch --list', { ruleSubstring: 'git-branch-not-allowlisted' })
+  expectExecute('git branch -D feature', { ruleSubstring: 'git-branch-D-denied' })
+  expectExecute('git branch -d feature', { ruleSubstring: 'git-branch-d-denied' })
+  expectExecute('git branch -m old new', { ruleSubstring: 'git-branch-m-denied' })
+  expectExecute('git branch feature', { ruleSubstring: 'git-branch-positional-not-allowlisted' })
   expectExecute('git fetch origin', { ruleSubstring: 'git-fetch-denied-subcommand' })
   expectExecute('git pull', { ruleSubstring: 'git-pull-denied-subcommand' })
   expectExecute('git clone https://example.com/repo', { ruleSubstring: 'git-clone-denied-subcommand' })

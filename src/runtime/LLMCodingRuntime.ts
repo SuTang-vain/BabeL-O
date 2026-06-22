@@ -920,6 +920,30 @@ export class LLMCodingRuntime implements NexusRuntime {
           throw recoveryResult.error
         }
 
+        if (
+          providerTurn.toolCalls.length === 0 &&
+          providerTurn.assistantText.trim().length === 0 &&
+          providerTurn.reasoningText.trim().length > 0
+        ) {
+          absorbProviderTurnMetrics(metrics, providerTurn)
+          const message = 'Provider returned an empty assistant response with no tool calls.'
+          yield buildRuntimeErrorEvent({
+            sessionId: options.sessionId,
+            code: 'EMPTY_PROVIDER_RESPONSE',
+            message,
+            details: {
+              kind: 'reasoning_only',
+              providerId: settings.providerId,
+              modelId: cleanedModelId,
+              retryable: true,
+              suggestion: 'Retry the turn or switch to a model/provider that emits assistant text or tool calls after reasoning.',
+            },
+          })
+          yield buildRuntimeResultEvent(options.sessionId, false, message)
+          yield buildRuntimeExecutionMetricsEvent(options, metrics)
+          return
+        }
+
         const postInvocationHooks = await executeRuntimeHooks(
           'PostInvocation',
           {
@@ -1013,13 +1037,18 @@ export class LLMCodingRuntime implements NexusRuntime {
         // extraction). The helper drives the dispatch
         // async generator and returns the per-loop
         // state updates + events + terminal flag.
-        const dispatchResult = await executeToolDispatch(toolDispatchPipeline, {
+        const dispatchStream = executeToolDispatch(toolDispatchPipeline, {
           toolCalls: outcomeResult.toolCalls!,
           runtimeOptions: options,
           previousEvents,
           taskScopeEvent,
         })
-        for (const event of dispatchResult.events) yield event
+        let dispatchNext = await dispatchStream.next()
+        while (!dispatchNext.done) {
+          yield dispatchNext.value
+          dispatchNext = await dispatchStream.next()
+        }
+        const dispatchResult = dispatchNext.value
         previousEvents = dispatchResult.previousEvents
         taskScopeEvent = dispatchResult.taskScopeEvent
         if (dispatchResult.terminal) {

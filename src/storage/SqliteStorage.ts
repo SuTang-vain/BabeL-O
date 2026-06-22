@@ -83,6 +83,28 @@ export class SqliteStorage implements NexusStorage {
           await this.saveToolTrace(updated)
         }
       },
+      onToolDenied: async (sessionId, event) => {
+        if (!event.toolUseId) return
+        const existing = await this.getToolTrace(event.toolUseId)
+        if (existing) {
+          const completedAt = event.timestamp
+          const durationMs = new Date(completedAt).getTime() - new Date(existing.startedAt).getTime()
+          const updated: ToolTrace = {
+            ...existing,
+            output: {
+              code: 'TOOL_DENIED',
+              message: event.message,
+              denialKind: event.denialKind,
+              recoverable: event.recoverable,
+              terminal: event.terminal,
+            },
+            success: false,
+            completedAt,
+            durationMs,
+          }
+          await this.saveToolTrace(updated)
+        }
+      },
       onExecutionMetrics: async (sessionId, event) => {
         const embeddedMetrics = executionMetricsFromEvent(sessionId, event)
         if (embeddedMetrics) {

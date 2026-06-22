@@ -25,6 +25,18 @@ class StaticRuntime implements NexusRuntime {
   }
 }
 
+class NonResponsiveRuntime implements NexusRuntime {
+  async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    yield {
+      type: 'session_started',
+      ...eventBase(options.sessionId),
+      cwd: options.cwd,
+      requestId: options.requestId,
+    }
+    await new Promise<void>(() => {})
+  }
+}
+
 const timeoutDecision: ExecuteTimeoutDecision = {
   policy: 'fatal',
   softTimeoutMs: 1000,
@@ -141,5 +153,61 @@ test('runExecutionStreamLoop lets WebSocket forwarding stop the loop before time
   assert.deepEqual(
     forwarded.map(event => event.type),
     ['assistant_delta'],
+  )
+})
+
+test('runExecutionStreamLoop emits timeout when runtime iterator does not resolve after abort', async () => {
+  const sessionId = 'session-loop-timeout-race'
+  const storage = new LoopStorage()
+  const events: NexusEvent[] = []
+  const timeoutController = new AbortController()
+  const abortController = new AbortController()
+  const softTimeoutDecision: ExecuteTimeoutDecision = {
+    policy: 'soft',
+    softTimeoutMs: 30,
+    watchdogTimeoutMs: 60,
+    softTimeoutExtensionMs: 30,
+    maxSoftTimeoutExtensions: 0,
+  }
+  const timeoutWatchdog: WatchdogState = { fired: true }
+  setTimeout(() => {
+    timeoutController.abort()
+    abortController.abort()
+  }, 20)
+
+  const result = await runExecutionStreamLoop({
+    runtime: new NonResponsiveRuntime(),
+    runtimeOptions: {
+      sessionId,
+      prompt: 'hang forever',
+      cwd: '/workspace',
+      signal: abortController.signal,
+      timeoutSignal: timeoutController.signal,
+    },
+    events,
+    sessionId,
+    cwd: '/workspace',
+    requestId: 'req-loop-timeout-race',
+    storage: storage as unknown as NexusStorage,
+    metrics: new NexusMetrics(),
+    timeoutDecision: softTimeoutDecision,
+    watchdog: timeoutWatchdog,
+    timeoutMs: 30,
+    startedAtMs: 0,
+    now: () => 60,
+  })
+
+  assert.deepEqual(result, { success: false, timedOut: true })
+  assert.deepEqual(
+    events.map(event => event.type),
+    ['session_started', 'error'],
+  )
+  const error = events[1] as Extract<NexusEvent, { type: 'error' }>
+  assert.equal(error.code, 'REQUEST_TIMEOUT')
+  assert.equal((error.details as any).kind, 'watchdog')
+  assert.equal((error.details as any).source, 'nexus_stream_abort_race')
+  assert.deepEqual(
+    storage.appended.map(entry => entry.event.type),
+    ['session_started', 'error'],
   )
 })

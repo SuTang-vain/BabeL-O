@@ -404,6 +404,7 @@ export async function* executeProviderToolCall(options: {
     yield {
       type: 'tool_denied',
       ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
       name: tool.name,
       risk: effectiveRisk,
       message,
@@ -439,6 +440,7 @@ export async function* executeProviderToolCall(options: {
     yield {
       type: 'tool_denied',
       ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
       name: tool.name,
       risk: effectiveRisk,
       message: hookDenyReason,
@@ -528,6 +530,7 @@ export async function* executeProviderToolCall(options: {
       yield {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),
+        toolUseId: toolCall.id,
         name: tool.name,
         risk: effectiveRisk,
         message,
@@ -548,6 +551,7 @@ export async function* executeProviderToolCall(options: {
     yield {
       type: 'tool_denied',
       ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
       name: tool.name,
       risk: effectiveRisk,
       message,
@@ -588,6 +592,7 @@ export async function* executeProviderToolCall(options: {
       yield {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),
+        toolUseId: toolCall.id,
         name: tool.name,
         risk: effectiveRisk,
         message: denyMessage,
@@ -705,6 +710,7 @@ export async function* executeProviderToolCall(options: {
       yield {
         type: 'tool_denied',
         ...eventBase(runtimeOptions.sessionId),
+        toolUseId: toolCall.id,
         name: tool.name,
         risk: effectiveRisk,
         message: recoverableMessage,

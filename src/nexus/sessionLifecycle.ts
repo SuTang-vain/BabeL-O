@@ -1,4 +1,5 @@
 import { executeRuntimeHooks } from '../runtime/hooks.js'
+import { eventBase } from '../shared/events.js'
 import {
   buildEverCoreMessagesFromSession,
   type EverCoreClient,
@@ -9,6 +10,7 @@ import { nowIso } from '../shared/id.js'
 import { PendingPermissionRegistry, type SessionPhase, type SessionSnapshot } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { clearBashSessionState } from '../tools/builtin/bash.js'
+import { finalizeExecutionSession } from './executionFinalization.js'
 import type { EverCoreRuntimeConfig } from './everCoreConfig.js'
 import { clearTaskQueue } from './taskQueue.js'
 import {
@@ -149,6 +151,55 @@ async function syncSessionToEverCore(
 }
 
 const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled'])
+const RESTART_STALE_PHASES = new Set<SessionPhase>(['executing'])
+
+export async function settleStaleExecutingSessionsOnStartup(
+  storage: NexusStorage,
+  options: { limit?: number; now?: () => string } = {},
+): Promise<{ settled: number; sessionIds: string[] }> {
+  const now = options.now ?? nowIso
+  const candidates = await storage.listSessions({
+    limit: options.limit ?? 500,
+    includeEvents: false,
+  })
+  const sessionIds: string[] = []
+  for (const session of candidates) {
+    if (!RESTART_STALE_PHASES.has(session.phase)) continue
+    const settledAt = now()
+    await finalizeExecutionSession(storage, session.sessionId, {
+      succeeded: false,
+      errorEvent: {
+        type: 'error',
+        ...eventBase(session.sessionId),
+        timestamp: settledAt,
+        code: 'NEXUS_RESTARTED_DURING_EXECUTION',
+        message: 'Nexus restarted before this execution emitted a terminal event.',
+        details: {
+          kind: 'stale_executing_session',
+          previousPhase: session.phase,
+          previousUpdatedAt: session.updatedAt,
+          settledAt,
+        },
+      },
+    })
+    const settled = await storage.getSession(session.sessionId, { includeEvents: false })
+    if (settled) {
+      settled.updatedAt = settledAt
+      settled.metadata = {
+        ...(settled.metadata ?? {}),
+        staleExecutionRecovery: {
+          code: 'NEXUS_RESTARTED_DURING_EXECUTION',
+          previousPhase: session.phase,
+          previousUpdatedAt: session.updatedAt,
+          settledAt,
+        },
+      }
+      await storage.saveSession(settled)
+    }
+    sessionIds.push(session.sessionId)
+  }
+  return { settled: sessionIds.length, sessionIds }
+}
 
 async function cascadeCancelChildTaskSessions(
   storage: NexusStorage,

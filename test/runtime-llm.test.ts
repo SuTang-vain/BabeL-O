@@ -1759,6 +1759,50 @@ describe('LLMCodingRuntime', () => {
     assert.ok(events.some(event => event.type === 'result' && event.success === true))
   })
 
+  test('streams Bash permission_request before waiting for user approval', async () => {
+    const sessionId = 'test-bash-permission-streaming'
+    const toolUseId = 'tool-call-bash-permission'
+    fetchStreamResponses.push(
+      createAnthropicToolUseStream({
+        id: toolUseId,
+        name: 'Bash',
+        input: { command: 'npm install left-pad' },
+      }),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), new MemoryStorage(), configManager)
+    const iterator = runtime.executeStream({
+      sessionId,
+      prompt: 'run a command that needs permission',
+      cwd: tmpdir(),
+    })[Symbol.asyncIterator]()
+    const seen: NexusEvent[] = []
+
+    try {
+      for (let i = 0; i < 120; i++) {
+        const next = await Promise.race([
+          iterator.next(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timed out waiting for permission_request')), 500)),
+        ])
+        if (next.done) break
+        seen.push(next.value)
+        if (next.value.type === 'permission_request') {
+          assert.equal(next.value.name, 'Bash')
+          assert.equal(next.value.risk, 'execute')
+          assert.equal(next.value.toolUseId, toolUseId)
+          return
+        }
+      }
+      assert.fail(`permission_request not observed; saw ${seen.map(event => event.type).join(', ')}`)
+    } finally {
+      PendingPermissionRegistry.getInstance().resolve(sessionId, toolUseId, {
+        approved: false,
+        reason: 'test cleanup',
+      })
+      await iterator.return?.()
+    }
+  })
+
   test('permission denial is fed back to provider so it can adjust', async () => {
     fetchStreamResponses.push(
       createAnthropicToolUseStream({
@@ -1930,6 +1974,47 @@ describe('LLMCodingRuntime', () => {
     const errorEvent = events.find(e => e.type === 'error') as any
     assert.ok(errorEvent)
     assert.equal(errorEvent.code, 'EMPTY_PROVIDER_RESPONSE')
+
+    const resultEvent = events.find(e => e.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, false)
+    assert.match(resultEvent.message, /empty assistant response/)
+  })
+
+  test('treats thinking-only provider response as a failed result instead of hanging', async () => {
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"thinking_delta","thinking":"I should call a tool but did not emit one."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+        'event: message_delta\n',
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":12}}\n\n',
+        'event: message_stop\n',
+        'data: {"type":"message_stop"}\n\n',
+      ])
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-thinking-only-response',
+        prompt: '查看当前项目的分支信息',
+        cwd: tmpdir(),
+      })
+    )
+
+    assert.ok(events.some(e => e.type === 'thinking_delta'), 'thinking_delta should still be surfaced')
+    assert.ok(
+      !events.some(e => e.type === 'hook_completed' && e.hookEvent === 'PostInvocation'),
+      'reasoning-only provider turns should terminate before PostInvocation hooks can open a silent gap',
+    )
+    const errorEvent = events.find(e => e.type === 'error') as any
+    assert.ok(errorEvent)
+    assert.equal(errorEvent.code, 'EMPTY_PROVIDER_RESPONSE')
+    assert.equal(errorEvent.details?.kind, 'reasoning_only')
 
     const resultEvent = events.find(e => e.type === 'result') as any
     assert.ok(resultEvent)

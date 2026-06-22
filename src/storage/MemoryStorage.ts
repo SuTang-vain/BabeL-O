@@ -138,6 +138,21 @@ export class MemoryStorage implements NexusStorage {
           new Date(event.timestamp).getTime() - new Date(existing.startedAt).getTime()
         existing.remoteRunner = event.remoteRunner
       }
+    } else if (event.type === 'tool_denied' && event.toolUseId) {
+      const existing = this.toolTraces.get(event.toolUseId)
+      if (existing) {
+        existing.output = {
+          code: 'TOOL_DENIED',
+          message: event.message,
+          denialKind: event.denialKind,
+          recoverable: event.recoverable,
+          terminal: event.terminal,
+        }
+        existing.success = false
+        existing.completedAt = event.timestamp
+        existing.durationMs =
+          new Date(event.timestamp).getTime() - new Date(existing.startedAt).getTime()
+      }
     }
 
     const embeddedMetrics = executionMetricsFromEvent(sessionId, event)

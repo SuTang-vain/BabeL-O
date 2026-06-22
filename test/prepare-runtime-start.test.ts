@@ -2,8 +2,9 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { prepareRuntimeStart } from '../src/runtime/prepareRuntimeStart.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
-import { allowAllTools, type ToolPolicy } from '../src/runtime/LocalCodingRuntime.js'
+import { allowAllTools, denyByDefaultTools, type ToolPolicy } from '../src/runtime/LocalCodingRuntime.js'
 import type { AnyTool } from '../src/tools/Tool.js'
+import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import type { ModelAdapter, ModelMessage } from '../src/providers/adapters/ModelAdapter.js'
 import type { RuntimeExecuteOptions } from '../src/runtime/Runtime.js'
 import type { NexusEvent } from '../src/shared/events.js'
@@ -202,6 +203,47 @@ test('prepareRuntimeStart toolsList filters by toolPolicy and applies soft-deny 
   // passes; write1 / execute1 do not pass isAllowed so they
   // would normally be excluded, but soft-deny promotes them.
   assert.deepEqual(names, ['execute1', 'read1', 'write1'])
+})
+
+test('prepareRuntimeStart default soft-deny keeps every default registry tool visible', async () => {
+  const tools = createDefaultToolRegistry({ storage: new MemoryStorage() })
+  const result = await prepareRuntimeStart({
+    options: makeOptions({ policyMode: 'soft-deny' }),
+    deps: { storage: undefined, tools, toolPolicy: denyByDefaultTools() },
+    settings: baseSettings,
+    cleanedModelId: 'test-model',
+    adapter: failingAdapter,
+    shouldReplayReasoningContent: false,
+  })
+  assert.deepEqual(denyByDefaultTools().describe().allowedTools, ['read-risk', 'task'])
+  const expected = [...tools.keys()].sort()
+  const actual = result.toolsList().map((tool) => tool.name).sort()
+  assert.deepEqual(actual, expected)
+
+  const names = new Set(result.toolsList().map((t) => t.name))
+
+  for (const name of [
+    'ListDir',
+    'Glob',
+    'Grep',
+    'Read',
+    'contextSearch',
+    'contextRecent',
+    'contextSummarize',
+    'contextSessions',
+    'WebSearch',
+    'SkillList',
+    'SkillShow',
+    'SkillValidate',
+    'SkillDraft',
+    'SkillSave',
+    'TaskCreate',
+    'Bash',
+    'Write',
+    'Edit',
+  ]) {
+    assert.ok(names.has(name), `${name} should be model-visible under default Go TUI soft-deny policy`)
+  }
 })
 
 test('prepareRuntimeStart mapEventsForProvider forwards replayReasoningContent flag', async () => {

@@ -369,11 +369,14 @@ func (m model) runtimeAnimationState() (string, runtimeAnimationKind) {
 		return "  agent thinking", runtimeAnimationThinking
 	case "assistant_delta":
 		return "  agent writing", runtimeAnimationResponding
-	case "tool_started", "tool_completed", "tool_denied", "hook_started", "hook_completed", "hook_failed":
+	case "tool_started", "tool_completed", "tool_denied":
 		return "  tool activity", runtimeAnimationTool
 	case "permission_request":
 		return "  permission needed", runtimeAnimationPermission
 	default:
+		if m.softTimeoutState != nil && !m.softTimeoutState.BudgetExceededAt.IsZero() {
+			return "  waiting for watchdog", runtimeAnimationDefault
+		}
 		// Path 2 (2026-06-21): when the model has finished thinking
 		// but no assistant_delta has arrived yet, show the
 		// synthesizing indicator instead of falling through to the

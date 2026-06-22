@@ -194,9 +194,7 @@ func cancelStream(cfg Config, sessionID string, cancel chan<- struct{}) tea.Cmd 
 			"/v1/sessions/"+url.PathEscape(sessionID)+"/cancel",
 			map[string]string{"reason": "Cancelled from Go TUI"},
 		)
-		if err != nil {
-			notifyLocalStream()
-		}
+		notifyLocalStream()
 		return streamCancelMsg{sessionID: sessionID, err: err}
 	}
 }
@@ -518,6 +516,27 @@ func friendlyNexusRequestError(err error) string {
 		return fmt.Sprintf("cannot reach Nexus at %s; check that `bbl go` started Nexus, or run `bbl nexus start` and retry.", urlErr.URL)
 	}
 	return err.Error()
+}
+
+func isNexusTransportError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "connection refused") ||
+		strings.Contains(text, "connection reset") ||
+		strings.Contains(text, "broken pipe") ||
+		strings.Contains(text, "no such host") ||
+		text == "eof" ||
+		strings.Contains(text, "unexpected eof")
 }
 
 // friendlyNexusError maps known §5 path C error codes to human

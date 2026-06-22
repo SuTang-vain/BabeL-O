@@ -5,6 +5,7 @@ import { logger } from '../shared/logger.js'
 import { validateSecurityConfig } from '../shared/security.js'
 import { defaultEverCoreRuntimeManager } from './everCoreRuntimeManager.js'
 import { ContextBroadcaster } from './contextBroadcaster.js'
+import { settleStaleExecutingSessionsOnStartup } from './sessionLifecycle.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -92,6 +93,16 @@ const { runtime, storage, agentScheduler, behaviorMonitor } = await createDefaul
     fsync: storageWalFsync,
   },
 })
+try {
+  const recovered = await settleStaleExecutingSessionsOnStartup(storage)
+  if (recovered.settled > 0) {
+    logger.warn(
+      `Nexus startup settled ${recovered.settled} stale executing session(s): ${recovered.sessionIds.join(', ')}`,
+    )
+  }
+} catch (err: any) {
+  logger.warn('Nexus startup stale-session settlement failed', err)
+}
 const app = await createNexusApp({
   runtime,
   storage,
@@ -151,10 +162,15 @@ try {
 }
 console.log(
   `BabeL-O Nexus listening on http://${host}:${port}` +
-    (storagePath ? ` storage=${storagePath}` : ' storage=memory') +
+    (() => {
+      const resolved = resolveDefaultStoragePath(storagePath)
+      return resolved.kind === 'sqlite'
+        ? ` storage=${resolved.path}`
+        : ` storage=${resolved.kind}`
+    })() +
     (allowedTools
       ? ` allowedTools=${allowedTools.join(',')}`
-      : ' allowedTools=default(read,grep,glob,task)') +
+      : ' allowedTools=default(read-risk,task)') +
     ` mcp=${enableMcp ? 'enabled' : 'disabled'}` +
     ` agentTools=${enableAgentTools ? 'enabled' : 'disabled'}` +
     ` agentExecution=${agentExecutionEnvironment ?? 'local'}` +
