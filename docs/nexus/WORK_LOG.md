@@ -2,6 +2,26 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-22 — Tool-Pair Message Ordering (Phase 5): defer runtime user messages mid tool round + tighten contiguity validators
+
+- **背景**: 真实 session `session_6ce63133-fecb-4c03-adf2-349f38074c98`（6 turn，minimax/MiniMax-M3 + deepseek/deepseek-v4-pro，全程 percentUsed 7-9%）在 turn 3-6 连续 4 次 `PROVIDER_ERROR` 400：
+  - seq 192 / 232 — minimax：`tool call result does not follow tool call (2013)`
+  - seq 248 / 264 — deepseek：`An assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages following tool_calls message)`
+- **根因**: turn 2 assistant 一次 fan-out 4 个工具（ListDir×2 + Glob×2，id 末段 `a0f0a156 / a0f0a16d / a0f0a170 / a0f0a18b`）。第 4 个 Glob (`a0f0a18b`，target `/Users/tangyaoyue/DEV/Baidu`) 命中 scope boundary，在 `tool_started`（seq 119）与 `tool_completed`（seq 126）之间被 runtime 注入 `scope_boundary_detected`（seq 120）+ `permission_request`/`permission_response`（seq 121/124）+ `scope_boundary_confirmed`（seq 125）。
+  - `mapEventsToMessages` 旧实现把 `scope_boundary_*` 作为独立 `user` 消息按事件序 push，并 reset `pendingToolResultMsg`/`pendingToolAssistantMsg`。结果 messages 序列变成：`assistant(tool_use=[156,16d,170,18b])` → `user(tool_result=[156,16d,170])` → `user "scope boundary detected"` → `user "scope boundary confirmed"` → `user(tool_result=[18b])`。
+  - 该结构 set-correct（每个 tool_use 都有 tool_result）但 order-incorrect：`18b` 的 result 没紧邻其 tool_use，被 2 条 runtime user 消息隔开。
+  - Anthropic/OpenAI 协议要求 `tool_use ↔ tool_result` 严格紧邻；minimax 与 deepseek 在 turn 3+ 重放整段历史时拒绝。本地 `validateAnthropicToolMessageSequence` / `validateOpenAIToolMessageSequence` 旧实现只查 orphan/duplicate 不查紧邻，所以拆分本地通过、线上被拒。
+  - turn 2 自身未失败：其最后一次 `assistant_delta` 是纯文本回复（不再产生 tool_use），所以错位对不影响 turn 2 自己的请求；turn 3 loop 1 也通过（minimax 流式校验较宽松）；turn 3 loop 2 起 minimax 严格校验整段历史，连续 4 次拒绝。
+- **实现**:
+  - `src/runtime/eventsTranslator.ts`：新增 `deferredRuntimeUserMessages` 队列 + `hasUnclosedToolUse` / `flushDeferred` / `flushDeferredIfRoundClosed` / `handleRuntimeUserMessage` 四个 helper。runtime 注入事件（scope_boundary_*、context_grounding_*、workspace_dirty_detected、task_scope_declared、near_timeout_*、timeout_*）统一走 `handleRuntimeUserMessage`：若 tool round 打开（pendingToolAssistantMsg 有未配对 tool_use）则推迟入队，不 reset pending；否则 inline push。每次 `appendToolResult` / 合成 tool_result 后调 `flushDeferredIfRoundClosed`，round 闭合（所有 tool_use 配齐 result）时把队列按原序追加在 `user(tool_result)` 之后。`user_message` / `assistant_delta` / 函数末尾调 `flushDeferred` 兜底。无 runtime 事件的常规流队列为空、所有 flush 为 no-op，零行为变化。
+  - `src/providers/adapters/AnthropicAdapter.ts`：`validateAnthropicToolMessageSequence` 改为索引遍历，要求每个 `assistant(tool_use=[…])` 紧跟一个 `user` 且其 tool_result 恰好覆盖这些 id（不多不少），反之亦然。新增 `missing tool_result <id>` / `assistant tool_use not followed by tool_result` 错误码，orphan/duplicate 码保留。
+  - `src/providers/adapters/OpenAIAdapter.ts`：`validateOpenAIToolMessageSequence` 对称收紧（`tool_calls` ↔ `role:'tool'` 紧邻），同样新增 missing 错误码、保留 orphan/duplicate。
+- **验证**:
+  - `scripts/repro-tool-pair-ordering-260622.mjs`：对真 session 全量事件跑 `mapEventsToMessages`，断言全部 5 个 `assistant(tool_use)` 紧邻对应 `user(tool_result)`（0 错位）；Phase 3 gate 额外断言错位 Glob `a0f0a18b` 携带真实 tool_result（非合成 `denied or interrupted`）、isError=false、turn 1（对比分析）/turn 2（推荐结论）assistant 文本回复保留、全 6 turn 边界 per-turn 重放均紧邻（0 split）。GATE PASS。
+  - 离线确认两个 adapter 在 fetch 前即拒绝 legacy split shape：`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result B`。
+  - typecheck / 1222/1222 全量测试通过（含 adapters.test.ts +5 紧邻 case、events-translator.test.ts +2 deferral case；deepseek reasoning test 补 tool_result 使其 flow 合法）。
+- **治理**: 新增 runtime 注入事件类型若要成为 `user` 消息，必须走 `handleRuntimeUserMessage` 以继承 deferral，否则会重新拆开 tool pair。Plan 已 Closed Reference，折入 [history/context-and-agent-history.md](./history/context-and-agent-history.md) Tool-Pair 章节。
+
 ## 2026-06-22 — 自适应上下文窗口选择收口（Phase 0/1/2/3）
 
 > **完整文档**: [reference/adaptive-context-window-selection-plan.md](./reference/adaptive-context-window-selection-plan.md) — 含两条丢上下文路径的根因、设计、Phase 表与验证清单。本节只记事实流水。

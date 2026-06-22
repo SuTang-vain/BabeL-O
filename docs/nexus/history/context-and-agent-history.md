@@ -9,9 +9,41 @@ This history ledger preserves closed implementation context without keeping ever
 
 | Closed item | Original file | Closure status |
 | --- | --- | --- |
+| Tool-Pair Message Ordering Plan (Phase 5) | `tool-pair-message-ordering-plan.md` | Closed 2026-06-22. `mapEventsToMessages` defers runtime-injected user messages that arrive mid tool round; `validateAnthropicToolMessageSequence` and `validateOpenAIToolMessageSequence` tightened to require strict `tool_use ↔ tool_result` contiguity. Closes the `session_6ce63133` 4× PROVIDER_ERROR 400 regression. |
 | BabeL-O Context and Sub-agent Upgrade Plan | `context-and-subagent-upgrade-plan.md` | Context Manager / ContextForker / read-only Explore-Review-Test AgentScheduler phases implemented; write-capable implement agents remain disabled. |
 | BabeL-O 上下文管理优化规划 | `context-management-optimization-plan.md` | Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6A + Phase 6B + Phase 7 已落地 — 基于 BabeL-2 上下文管理机制复盘与 BabeL-O 真实 session `session_661479db-6327-46f2-a793-7b88e0431174` 的“模型自报上下文 91%”样本，推进 runtime-owned context facts、Go TUI footer 可见性、模型不得自估 context 百分比约束、microcompact 事实事件、compact boundary 协议化、provider context-limit recoverable retry、post-compact grounding guard、dirty workspace guard、context bucket/top-items/grounding suggestions 可视化、sub-agent context fork provenance 与后续 context foundation 提升。 |
 | Session-to-Session Memory Channel Plan | `session-to-session-memory-channel-plan.md` | Closed reference retained in this history ledger. |
+
+## Tool-Pair Message Ordering Plan (Phase 5)
+
+**Original file**: `tool-pair-message-ordering-plan.md` (folded into this ledger 2026-06-22; full per-phase detail in [../WORK_LOG.md](../WORK_LOG.md) 2026-06-22 entry)
+
+**Closed status**: Closed 2026-06-22 on branch `fix/tool-pair-message-ordering`. All 4 phases landed; 1222/1222 full test suite pass.
+
+Real session `session_6ce63133-fecb-4c03-adf2-349f38074c98` produced 4 consecutive `PROVIDER_ERROR` 400s in turns 3-6 (seq 192/232 minimax `tool call result does not follow tool call (2013)`, seq 248/264 deepseek `insufficient tool messages following tool_calls message`). Root cause: a single misordered tool pair — Glob `call_019eeec4a8687d83a0f0a18b` on `/Users/tangyaoyue/DEV/Baidu`, suspended by `scope_boundary_detected` / `scope_boundary_confirmed` in turn 2. The runtime injected those two events as standalone `user` messages between `assistant(tool_use=[…])` and the closing `user(tool_result=[…])`, splitting the pair. Anthropic/OpenAI/minimax all reject a split pair at request time; the local validators only checked orphan/duplicate, not contiguity, so the split passed locally and failed on the wire.
+
+Fix (reusable reference for any future runtime-injected event type):
+
+- `src/runtime/eventsTranslator.ts` — `mapEventsToMessages` defers runtime-injected user messages that arrive while a tool round is open (an `assistant` message has a `tool_use` with no matching `tool_result` yet) into a `deferredRuntimeUserMessages` queue, and flushes the queue when the round closes. For streams with no mid-round runtime events the queue is empty and all flushes are no-ops, so existing behavior is unchanged. Zero semantic loss — the deferred messages still reach the model, just after the completed pair.
+- `src/providers/adapters/AnthropicAdapter.ts` and `src/providers/adapters/OpenAIAdapter.ts` — both validators tightened to require strict contiguity. New error codes `missing tool_result <id>` and `assistant tool_use not followed by tool_result`; existing orphan/duplicate codes preserved.
+
+Governance rule for future work: any new runtime-injected event type that becomes a `user` message must route through `handleRuntimeUserMessage` to inherit the deferral behavior; otherwise it risks re-splitting tool pairs.
+
+## 中文概述
+
+### 背景
+
+真实 session `session_6ce63133` 连续 4 次 400,根因是 turn 2 一对被 scope_boundary 暂停的 tool_use/tool_result 被 runtime 注入的 user 消息拆开。本地校验只查 orphan/duplicate 不查紧邻,所以拆分在本地通过、在线上被 minimax/deepseek 拒绝。
+
+### 核心做法
+
+`mapEventsToMessages` 在 tool round 打开期间把 runtime 注入的 user 消息推迟到 round 闭合后再追加;两个 adapter 的校验器收紧为要求 `tool_use ↔ tool_result` 严格紧邻。无 runtime 事件的常规流零行为变化。
+
+### 当前状态
+
+Closed Reference,保留为可复用参考:deferral 模式 + 校验器契约。新增 runtime 注入事件类型必须走 `handleRuntimeUserMessage` 以继承推迟行为。
+
+---
 
 ## BabeL-O Context and Sub-agent Upgrade Plan
 

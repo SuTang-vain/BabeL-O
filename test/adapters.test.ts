@@ -393,6 +393,95 @@ describe('Model Adapters & Factory', () => {
       assert.equal(lastFetchInit, undefined)
     })
 
+    test('rejects split Anthropic tool pair (tool_result not immediately after tool_use)', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      // assistant(tool_use A,B) → user(tool_result A) → user text → user(tool_result B)
+      // The B result is not contiguous with the assistant that declared it.
+      await assert.rejects(
+        async () => {
+          await collectStream(adapter.queryStream({
+            model: 'minimax/MiniMax-M3',
+            messages: [
+              { role: 'user', content: 'q' },
+              {
+                role: 'assistant',
+                content: [
+                  { type: 'tool_use', id: 'call_A', name: 'Read', input: { path: '/a' } },
+                  { type: 'tool_use', id: 'call_B', name: 'Read', input: { path: '/b' } },
+                ],
+              },
+              {
+                role: 'user',
+                content: [{ type: 'tool_result', toolUseId: 'call_A', content: 'a' }],
+              },
+              { role: 'user', content: 'Runtime scope boundary detected before Read' },
+              {
+                role: 'user',
+                content: [{ type: 'tool_result', toolUseId: 'call_B', content: 'b' }],
+              },
+            ],
+          }))
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result call_B/,
+      )
+      assert.equal(lastFetchInit, undefined)
+    })
+
+    test('rejects Anthropic assistant tool_use with no following tool_result', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      await assert.rejects(
+        async () => {
+          await collectStream(adapter.queryStream({
+            model: 'minimax/MiniMax-M3',
+            messages: [
+              { role: 'user', content: 'q' },
+              {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'call_solo', name: 'Read', input: { path: '/a' } }],
+              },
+              { role: 'user', content: 'thanks' },
+            ],
+          }))
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: assistant tool_use not followed by tool_result/,
+      )
+      assert.equal(lastFetchInit, undefined)
+    })
+
+    test('accepts a contiguous Anthropic tool pair with parallel tool_use blocks', async () => {
+      const adapter = new AnthropicAdapter()
+      mockResponseBody = createMockStream([])
+
+      // No rejection: assistant(tool_use A,B) immediately followed by
+      // user(tool_result A,B), then runtime text after the pair.
+      await collectStream(adapter.queryStream({
+        model: 'minimax/MiniMax-M3',
+        messages: [
+          { role: 'user', content: 'q' },
+          {
+            role: 'assistant',
+            content: [
+              { type: 'tool_use', id: 'call_A', name: 'Read', input: { path: '/a' } },
+              { type: 'tool_use', id: 'call_B', name: 'Read', input: { path: '/b' } },
+            ],
+          },
+          {
+            role: 'user',
+            content: [
+              { type: 'tool_result', toolUseId: 'call_A', content: 'a' },
+              { type: 'tool_result', toolUseId: 'call_B', content: 'b' },
+            ],
+          },
+          { role: 'user', content: 'Runtime scope boundary confirmed' },
+        ],
+      }))
+      // Reaching here means the validator accepted the contiguous pair.
+    })
+
     test('minimax text-encoded tool calls are normalized instead of streamed as text', async () => {
       const adapter = new AnthropicAdapter()
       mockResponseBody = createMockStream([
@@ -791,6 +880,12 @@ describe('Model Adapters & Factory', () => {
                 { type: 'tool_use', id: 'call_1', name: 'Read', input: {} },
               ],
             },
+            {
+              role: 'user',
+              content: [
+                { type: 'tool_result', toolUseId: 'call_1', content: 'ok' },
+              ],
+            },
           ],
         })
       )
@@ -816,6 +911,59 @@ describe('Model Adapters & Factory', () => {
           })) {}
         },
         /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result missing-call/,
+      )
+      assert.equal(lastFetchUrl, undefined)
+    })
+
+    test('rejects split OpenAI tool pair (tool message not immediately after tool_calls)', async () => {
+      const adapter = new OpenAIAdapter()
+      await assert.rejects(
+        async () => {
+          for await (const _chunk of adapter.queryStream({
+            model: 'openai/gpt-4o',
+            messages: [
+              { role: 'user', content: 'q' },
+              {
+                role: 'assistant',
+                content: [
+                  { type: 'tool_use', id: 'call_A', name: 'Read', input: { path: '/a' } },
+                  { type: 'tool_use', id: 'call_B', name: 'Read', input: { path: '/b' } },
+                ],
+              },
+              {
+                role: 'user',
+                content: [{ type: 'tool_result', toolUseId: 'call_A', content: 'a' }],
+              },
+              { role: 'user', content: 'Runtime scope boundary detected before Read' },
+              {
+                role: 'user',
+                content: [{ type: 'tool_result', toolUseId: 'call_B', content: 'b' }],
+              },
+            ],
+          })) {}
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result call_B/,
+      )
+      assert.equal(lastFetchUrl, undefined)
+    })
+
+    test('rejects OpenAI assistant tool_calls with no following tool message', async () => {
+      const adapter = new OpenAIAdapter()
+      await assert.rejects(
+        async () => {
+          for await (const _chunk of adapter.queryStream({
+            model: 'openai/gpt-4o',
+            messages: [
+              { role: 'user', content: 'q' },
+              {
+                role: 'assistant',
+                content: [{ type: 'tool_use', id: 'call_solo', name: 'Read', input: { path: '/a' } }],
+              },
+              { role: 'user', content: 'thanks' },
+            ],
+          })) {}
+        },
+        /PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result call_solo/,
       )
       assert.equal(lastFetchUrl, undefined)
     })

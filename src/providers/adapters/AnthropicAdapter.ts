@@ -671,30 +671,71 @@ export class AnthropicAdapter implements ModelAdapter {
 }
 
 function validateAnthropicToolMessageSequence(messages: Array<{ role: string; content: any[] }>): void {
-  const knownToolUses = new Set<string>()
-  const completedToolUses = new Set<string>()
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
+    if (!Array.isArray(message?.content)) continue
 
-  for (const message of messages) {
-    if (message?.role === 'assistant' && Array.isArray(message.content)) {
+    if (message.role === 'assistant') {
+      const useIds: string[] = []
       for (const block of message.content) {
         if (block?.type !== 'tool_use') continue
         const id = String(block.id ?? '')
-        if (id) knownToolUses.add(id)
+        if (id) useIds.push(id)
       }
-      continue
-    }
-
-    if (!Array.isArray(message?.content)) continue
-    for (const block of message.content) {
-      if (block?.type !== 'tool_result') continue
-      const toolUseId = String(block.tool_use_id ?? '')
-      if (!toolUseId || !knownToolUses.has(toolUseId)) {
-        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${toolUseId || '<missing>'}`)
+      if (useIds.length === 0) continue
+      // Contiguity: the immediately following user message must carry exactly
+      // one tool_result per tool_use id, with no other message in between.
+      // Anthropic, minimax, and deepseek-anthropic all reject a split pair at
+      // request time (observed in session_6ce63133 as PROVIDER_ERROR 400s).
+      const next = messages[i + 1]
+      const nextResultIds: string[] = []
+      if (next?.role === 'user' && Array.isArray(next.content)) {
+        for (const block of next.content) {
+          if (block?.type !== 'tool_result') continue
+          nextResultIds.push(String(block.tool_use_id ?? ''))
+        }
       }
-      if (completedToolUses.has(toolUseId)) {
-        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${toolUseId}`)
+      if (nextResultIds.length === 0) {
+        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: assistant tool_use not followed by tool_result (ids=${useIds.join(',') || '<missing>'})`)
       }
-      completedToolUses.add(toolUseId)
+      const useSet = new Set(useIds)
+      const seen = new Set<string>()
+      for (const id of nextResultIds) {
+        if (!useSet.has(id)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${id || '<missing>'}`)
+        }
+        if (seen.has(id)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${id}`)
+        }
+        seen.add(id)
+      }
+      for (const id of useIds) {
+        if (!seen.has(id)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result ${id}`)
+        }
+      }
+    } else if (message.role === 'user') {
+      const resultIds: string[] = []
+      for (const block of message.content) {
+        if (block?.type !== 'tool_result') continue
+        resultIds.push(String(block.tool_use_id ?? ''))
+      }
+      if (resultIds.length === 0) continue
+      // Contiguity: a user message with tool_result blocks must be immediately
+      // preceded by the assistant message whose tool_use blocks they close.
+      const prev = messages[i - 1]
+      const prevUseIds = new Set<string>()
+      if (prev?.role === 'assistant' && Array.isArray(prev.content)) {
+        for (const block of prev.content) {
+          if (block?.type !== 'tool_use') continue
+          prevUseIds.add(String(block.id ?? ''))
+        }
+      }
+      for (const id of resultIds) {
+        if (!prevUseIds.has(id)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${id || '<missing>'}`)
+        }
+      }
     }
   }
 }

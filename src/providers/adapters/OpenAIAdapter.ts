@@ -304,28 +304,58 @@ const OPENAI_FINISH_MAP: Record<string, string> = {
 }
 
 function validateOpenAIToolMessageSequence(messages: any[]): void {
-  const knownToolCalls = new Set<string>()
-  const completedToolCalls = new Set<string>()
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i]
 
-  for (const message of messages) {
     if (message?.role === 'assistant' && Array.isArray(message.tool_calls)) {
+      const callIds: string[] = []
       for (const call of message.tool_calls) {
         const id = String(call?.id ?? '')
-        if (id) knownToolCalls.add(id)
+        if (id) callIds.push(id)
       }
+      if (callIds.length === 0) continue
+      // Contiguity: the immediately following messages must be role:'tool'
+      // covering every tool_call_id, with no other message in between. OpenAI
+      // and deepseek reject a split sequence at request time (observed in
+      // session_6ce63133 as PROVIDER_ERROR 400s).
+      const expected = new Set(callIds)
+      const callIdSet = new Set(callIds)
+      let j = i + 1
+      while (j < messages.length && messages[j]?.role === 'tool') {
+        const toolCallId = String(messages[j].tool_call_id ?? '')
+        if (!toolCallId || !callIdSet.has(toolCallId)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${toolCallId || '<missing>'}`)
+        }
+        if (!expected.has(toolCallId)) {
+          throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${toolCallId}`)
+        }
+        expected.delete(toolCallId)
+        j++
+      }
+      if (expected.size > 0) {
+        throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: missing tool_result ${Array.from(expected).join(',')}`)
+      }
+      i = j - 1
       continue
     }
 
     if (message?.role !== 'tool') continue
 
     const toolCallId = String(message.tool_call_id ?? '')
-    if (!toolCallId || !knownToolCalls.has(toolCallId)) {
+    // Walk back over any consecutive tool messages to find the assistant
+    // whose tool_call this result closes.
+    let k = i - 1
+    while (k >= 0 && messages[k]?.role === 'tool') k--
+    const prevCallIds = new Set<string>()
+    if (messages[k]?.role === 'assistant' && Array.isArray(messages[k].tool_calls)) {
+      for (const call of messages[k].tool_calls) {
+        const id = String(call?.id ?? '')
+        if (id) prevCallIds.add(id)
+      }
+    }
+    if (!toolCallId || !prevCallIds.has(toolCallId)) {
       throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: orphan tool_result ${toolCallId || '<missing>'}`)
     }
-    if (completedToolCalls.has(toolCallId)) {
-      throw new Error(`PROVIDER_REPLAY_INVALID_TOOL_SEQUENCE: duplicate tool_result ${toolCallId}`)
-    }
-    completedToolCalls.add(toolCallId)
   }
 }
 

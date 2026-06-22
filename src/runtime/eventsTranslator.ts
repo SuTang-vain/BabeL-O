@@ -80,9 +80,15 @@ export type MapEventsToMessagesOptions = {
  *   (denied / interrupted) get a synthetic `tool_result` with
  *   `isError: true` so the next provider call does not break.
  * - Grounding / scope / timeout events become `user` messages that
- *   explain the runtime state to the model (these messages reset
- *   any pending tool blocks, since the model cannot reply to them
- *   with a tool call mid-sentence).
+ *   explain the runtime state to the model. When such an event
+ *   arrives while a tool round is still open (an assistant
+ *   `tool_use` block has no matching `tool_result` yet), the
+ *   message is **deferred** until the round closes, so it never
+ *   splits an `assistant(tool_use)` ↔ `user(tool_result)` pair.
+ *   Anthropic, OpenAI, and minimax all reject a split pair at
+ *   request time (observed in `session_6ce63133` as 4 consecutive
+ *   `PROVIDER_ERROR` 400s); deferral keeps the pair contiguous
+ *   while preserving the runtime information for the model.
  *
  * This function is pure: it reads from `events` and writes a new
  * `messages` array. It does not call out to providers, mutate
@@ -117,6 +123,48 @@ export function mapEventsToMessages(
   const earlyCompletedByToolId = new Map<string, Extract<NexusEvent, { type: 'tool_completed' }>>()
   const emittedToolResultIds = new Set<string>()
 
+  // Runtime-injected user messages (scope boundary, grounding, timeout, ...)
+  // that arrived while a tool round was still open. They are deferred until
+  // the round closes so they never split an assistant(tool_use) ↔
+  // user(tool_result) pair. See `session_6ce63133` for the regression this
+  // queue prevents.
+  const deferredRuntimeUserMessages: string[] = []
+
+  const hasUnclosedToolUse = (msg: ModelMessage | null): boolean => {
+    if (!msg || msg.role !== 'assistant' || typeof msg.content === 'string') {
+      return false
+    }
+    return msg.content.some(
+      (block) => block.type === 'tool_use' && !emittedToolResultIds.has(block.id),
+    )
+  }
+
+  // Push every deferred runtime user message onto `messages` and clear the
+  // queue. Also resets the pending tool state, since flushing implies the
+  // surrounding round has closed (or we are starting a new turn / assistant
+  // message). No-op when the queue is empty (so non-runtime streams see no
+  // behavior change).
+  const flushDeferred = () => {
+    if (deferredRuntimeUserMessages.length === 0) return
+    for (const text of deferredRuntimeUserMessages) {
+      messages.push({ role: 'user', content: text })
+    }
+    deferredRuntimeUserMessages.length = 0
+    pendingToolResultMsg = null
+    pendingToolAssistantMsg = null
+    pendingReasoningContent = ''
+  }
+
+  // Called after every tool_result emission. If the open round just closed
+  // (every tool_use in the pending assistant message now has a matching
+  // tool_result) and there are deferred runtime messages, flush them now so
+  // they land immediately after the completed pair.
+  const flushDeferredIfRoundClosed = () => {
+    if (deferredRuntimeUserMessages.length === 0) return
+    if (hasUnclosedToolUse(pendingToolAssistantMsg)) return
+    flushDeferred()
+  }
+
   const appendToolResult = (event: Extract<NexusEvent, { type: 'tool_completed' }>) => {
     let lastMsg: ModelMessage | null = pendingToolResultMsg
     if (!lastMsg || typeof lastMsg.content === 'string') {
@@ -136,9 +184,19 @@ export function mapEventsToMessages(
       toolName: event.name,
     })
     emittedToolResultIds.add(event.toolUseId)
+    flushDeferredIfRoundClosed()
   }
 
-  const appendRuntimeUserMessage = (content: string) => {
+  // Push a runtime-injected user message. If a tool round is open, defer the
+  // message until the round closes (via flushDeferredIfRoundClosed). Otherwise
+  // flush any prior deferred messages (defensive) and push inline, resetting
+  // pending tool state so the next tool round starts fresh.
+  const handleRuntimeUserMessage = (content: string) => {
+    if (hasUnclosedToolUse(pendingToolAssistantMsg)) {
+      deferredRuntimeUserMessages.push(content)
+      return
+    }
+    flushDeferred()
     pendingToolResultMsg = null
     pendingToolAssistantMsg = null
     pendingReasoningContent = ''
@@ -147,6 +205,7 @@ export function mapEventsToMessages(
 
   for (const event of events) {
     if (event.type === 'user_message') {
+      flushDeferred()
       pendingToolResultMsg = null
       pendingToolAssistantMsg = null
       pendingReasoningContent = ''
@@ -160,6 +219,7 @@ export function mapEventsToMessages(
       }
       messages.push({ role: 'user', content: event.text })
     } else if (event.type === 'assistant_delta') {
+      flushDeferred()
       pendingToolResultMsg = null
       pendingToolAssistantMsg = null
       let lastMsg = messages[messages.length - 1]
@@ -199,35 +259,23 @@ export function mapEventsToMessages(
       lastMsg.reasoningContent = `${lastMsg.reasoningContent ?? ''}${event.text}`
       continue
     } else if (event.type === 'context_grounding_required') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding required: ${event.message} Required for: ${event.requiredFor.join(', ')}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
+      handleRuntimeUserMessage(`Runtime grounding required: ${event.message} Required for: ${event.requiredFor.join(', ')}. Suggested actions: ${event.suggestedActions.join(', ')}.`)
     } else if (event.type === 'context_grounding_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime grounding confirmed: ${event.message} Confirmation kind: ${event.confirmationKind}. Confirmed for: ${event.confirmedFor.join(', ')}. Source: ${event.source}.` })
+      handleRuntimeUserMessage(`Runtime grounding confirmed: ${event.message} Confirmation kind: ${event.confirmationKind}. Confirmed for: ${event.confirmedFor.join(', ')}. Source: ${event.source}.`)
     } else if (event.type === 'workspace_dirty_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.` })
+      handleRuntimeUserMessage(`Runtime workspace dirty guard: ${event.message} Changed files (${event.changedFileCount}): ${event.changedFiles.join(', ')}${event.truncated ? ' (truncated)' : ''}. Suggested actions: ${event.suggestedActions.join(', ')}.`)
     } else if (event.type === 'task_scope_declared') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime task scope declared: ${event.message} Primary root: ${event.primaryRoot}. Explicit roots: ${event.explicitRoots.join(', ') || 'none'}. Confirmed external roots: ${event.confirmedExternalRoots.join(', ') || 'none'}. Mode: ${event.mode}.` })
+      handleRuntimeUserMessage(`Runtime task scope declared: ${event.message} Primary root: ${event.primaryRoot}. Explicit roots: ${event.explicitRoots.join(', ') || 'none'}. Confirmed external roots: ${event.confirmedExternalRoots.join(', ') || 'none'}. Mode: ${event.mode}.`)
     } else if (event.type === 'scope_boundary_detected') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.` })
+      handleRuntimeUserMessage(`Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.`)
     } else if (event.type === 'scope_boundary_confirmed') {
-      pendingToolResultMsg = null
-      pendingToolAssistantMsg = null
-      messages.push({ role: 'user', content: `Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.` })
+      handleRuntimeUserMessage(`Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.`)
     } else if (event.type === 'near_timeout_warning') {
-      appendRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
+      handleRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
     } else if (event.type === 'timeout_budget_exceeded') {
-      appendRuntimeUserMessage(formatTimeoutBudgetConvergenceMessage(event))
+      handleRuntimeUserMessage(formatTimeoutBudgetConvergenceMessage(event))
     } else if (event.type === 'timeout_extension_granted') {
-      appendRuntimeUserMessage(formatTimeoutExtensionConvergenceMessage(event))
+      handleRuntimeUserMessage(formatTimeoutExtensionConvergenceMessage(event))
     } else if (event.type === 'tool_started') {
       seenStartedToolIds.add(event.toolUseId)
       let lastMsg: ModelMessage | null | undefined = pendingToolAssistantMsg
@@ -274,6 +322,7 @@ export function mapEventsToMessages(
           isError: true,
         })
         emittedToolResultIds.add(event.toolUseId)
+        flushDeferredIfRoundClosed()
       }
     } else if (
       event.type === 'tool_completed' &&
@@ -287,6 +336,10 @@ export function mapEventsToMessages(
       }
     }
   }
+
+  // Flush any deferred runtime messages that were never flushed by a round
+  // close (defensive — should be empty for a well-formed stream).
+  flushDeferred()
 
   return messages
 }
