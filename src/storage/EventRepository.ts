@@ -106,23 +106,34 @@ export class EventRepository {
     const comparison = order === 'asc' ? '>' : '<'
     const direction = order === 'asc' ? 'ASC' : 'DESC'
     const cursor = Number(options.cursor ?? 0)
+    const eventTypes = options.eventTypes && options.eventTypes.length > 0
+      ? options.eventTypes
+      : null
+    // Push the event-type filter into SQL so filtered queries (e.g.
+    // contextSearch with eventTypeFilter) are NOT bounded by the row limit
+    // the way an unfiltered ascending scan is. Without this, a long session
+    // (11k+ events) silently drops the newest matching events past the cap.
+    const typeClause = eventTypes
+      ? `AND event_type IN (${eventTypes.map(() => '?').join(', ')})`
+      : ''
+    const typeParams = eventTypes ?? []
     const rows = options.cursor
       ? (this.db
           .prepare(
             `SELECT event_seq, event_json FROM events
-             WHERE session_id = ? AND event_seq ${comparison} ?
+             WHERE session_id = ? AND event_seq ${comparison} ? ${typeClause}
              ORDER BY event_seq ${direction}, event_key ${direction}
              LIMIT ?`,
           )
-          .all(sessionId, Number.isFinite(cursor) ? cursor : 0, limit + 1) as any[])
+          .all(sessionId, Number.isFinite(cursor) ? cursor : 0, ...typeParams, limit + 1) as any[])
       : (this.db
           .prepare(
             `SELECT event_seq, event_json FROM events
-             WHERE session_id = ?
+             WHERE session_id = ? ${typeClause}
              ORDER BY event_seq ${direction}, event_key ${direction}
              LIMIT ?`,
           )
-          .all(sessionId, limit + 1) as any[])
+          .all(sessionId, ...typeParams, limit + 1) as any[])
 
     const page = rows.slice(0, limit)
     return {

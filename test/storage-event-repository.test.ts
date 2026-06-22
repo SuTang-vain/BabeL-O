@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
+import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../src/shared/events.js'
 
 function tempDbPath(): { dir: string; dbPath: string } {
@@ -113,6 +114,89 @@ test('EventRepository listEvents descending order returns events in reverse sequ
   } finally {
     storage.close()
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('EventRepository listEvents eventTypes pushdown filters at SQL layer and bypasses row cap', async () => {
+  const { dir, dbPath } = tempDbPath()
+  const storage = new SqliteStorage(dbPath)
+  try {
+    const sessionId = 'session_repo_typefilter'
+    await storage.saveSession(baseSession(sessionId))
+    // Interleave user_message and thinking_delta events. With a low limit
+    // and NO filter, the ascending cap would return only the earliest rows
+    // (all thinking_delta), missing the user_message events entirely. With
+    // eventTypes: ['user_message'], the WHERE clause filters before LIMIT so
+    // the user_message events are reachable regardless of the thinking_delta
+    // volume. This mirrors the session_06308b17 regression where the 10k
+    // ascending cap dropped the newest user messages.
+    for (let i = 0; i < 5; i += 1) {
+      await storage.appendEvent(sessionId, makeThinkingEvent(sessionId, `2026-06-20T00:00:0${i}.000Z`, `think-${i}`))
+    }
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-06-20T00:00:10.000Z',
+      text: 'first user message',
+    } as NexusEvent)
+    for (let i = 0; i < 5; i += 1) {
+      await storage.appendEvent(sessionId, makeThinkingEvent(sessionId, `2026-06-20T00:00:1${i + 1}.000Z`, `think-late-${i}`))
+    }
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-06-20T00:00:20.000Z',
+      text: 'second user message',
+    } as NexusEvent)
+
+    // limit=3, no filter → first 3 rows are all thinking_delta.
+    const unfiltered = await storage.listEvents(sessionId, { limit: 3, order: 'asc' })
+    assert.equal(unfiltered.events.length, 3)
+    assert.ok(unfiltered.events.every((e) => e.type === 'thinking_delta'), 'unfiltered low-limit returns only earliest thinking_delta')
+
+    // limit=3 WITH eventTypes pushdown → returns user_message rows that sit
+    // beyond the unfiltered cap, because the filter runs in SQL before LIMIT.
+    const filtered = await storage.listEvents(sessionId, {
+      limit: 3, order: 'asc', eventTypes: ['user_message'],
+    })
+    assert.equal(filtered.events.length, 2, `expected 2 user_message events, got ${filtered.events.length}`)
+    assert.ok(filtered.events.every((e) => e.type === 'user_message'))
+    assert.equal((filtered.events[0] as any).text, 'first user message')
+    assert.equal((filtered.events[1] as any).text, 'second user message')
+  } finally {
+    storage.close()
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('MemoryStorage listEvents eventTypes filter mirrors SQL pushdown', async () => {
+  const storage = new MemoryStorage()
+  try {
+    const sessionId = 'session_mem_typefilter'
+    await storage.saveSession(baseSession(sessionId))
+    for (let i = 0; i < 3; i += 1) {
+      await storage.appendEvent(sessionId, makeThinkingEvent(sessionId, `2026-06-20T00:00:0${i}.000Z`, `think-${i}`))
+    }
+    await storage.appendEvent(sessionId, {
+      type: 'user_message',
+      schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
+      sessionId,
+      timestamp: '2026-06-20T00:00:10.000Z',
+      text: 'a user message',
+    } as NexusEvent)
+
+    const filtered = await storage.listEvents(sessionId, {
+      limit: 10, order: 'asc', eventTypes: ['user_message'],
+    })
+    assert.equal(filtered.events.length, 1)
+    assert.equal(filtered.events[0].type, 'user_message')
+
+    const unfiltered = await storage.listEvents(sessionId, { limit: 10, order: 'asc' })
+    assert.equal(unfiltered.events.length, 4, 'unfiltered returns all types')
+  } finally {
+    storage.close()
   }
 })
 

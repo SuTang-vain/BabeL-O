@@ -96,8 +96,16 @@ export class MemoryStorage implements NexusStorage {
     const limit = options.limit ?? 100
     const order = options.order ?? 'asc'
     const startIndex = options.cursor ? Number(options.cursor) : 0
+    const eventTypes = options.eventTypes && options.eventTypes.length > 0
+      ? new Set(options.eventTypes)
+      : null
+    // Mirror EventRepository: filter by type BEFORE pagination so a filtered
+    // query is not bounded by the row limit the way an unfiltered scan is.
+    const sourceEvents = eventTypes
+      ? session.events.filter((e) => eventTypes.has(e.type))
+      : session.events
     const orderedEvents =
-      order === 'asc' ? session.events : [...session.events].reverse()
+      order === 'asc' ? sourceEvents : [...sourceEvents].reverse()
     const events = orderedEvents.slice(startIndex, startIndex + limit)
     const nextIndex = startIndex + events.length
     return {

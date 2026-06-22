@@ -37,6 +37,20 @@ export type ToolResult = {
   hitCount: number
   truncated: boolean
   truncatedAt?: number
+  /**
+   * How many events were scanned for this search. Echoed from the caller
+   * (which knows the loaded window size) so the model can tell a sparse
+   * match from a truncated scan.
+   */
+  eventsScanned?: number
+  /**
+   * True when the loaded event window hit a row cap (the caller's
+   * `listEvents` returned a `nextCursor`). Distinct from `truncated`
+   * (which reflects token capping of the result text). When true, the
+   * model should narrow with `eventTypeFilter` or `sinceMs` rather than
+   * reword the query — the missing matches may simply not have been loaded.
+   */
+  eventsCapped?: boolean
 }
 
 export type SearchOptions = {
@@ -44,6 +58,13 @@ export type SearchOptions = {
   maxTokens?: number
   caseSensitive?: boolean
   eventTypeFilter?: NexusEvent['type'][]
+  /**
+   * Caller-supplied diagnostics echoed into the result. `eventsScanned` is
+   * the size of the loaded window; `eventsCapped` is true if that window
+   * was row-capped (listEvents returned a nextCursor).
+   */
+  eventsScanned?: number
+  eventsCapped?: boolean
 }
 
 export type SummarizeOptions = {
@@ -203,6 +224,21 @@ function capByTokens(content: string, maxTokens: number): { content: string; tru
 // Full-text search over an event stream. Case-insensitive by default.
 // Searches across all text fields of each event (user_message.text,
 // error.message, tool input strings, etc.).
+//
+// Matching is TOKENIZED AND-substring: the query is split on whitespace
+// into tokens, and an event matches only when EVERY token appears as a
+// substring of its extracted text. This lets a keyword query like
+// `架构分析 合理性 先进性` match `分析这个项目架构的合理以及先进性` even
+// though no single contiguous run spans the whole phrase. Whole-string
+// substring match (the pre-2026-06-21 behavior) returned empty for any
+// reworded query, which forced the model into a multi-retry loop — see
+// docs/nexus/proposals/context-search-algorithm-robustness-plan.md and
+// real session session_06308b17.
+//
+// CJK reordering (e.g. `架构分析` vs `分析…架构`, same characters in a
+// different order) is NOT handled by AND-substring — that needs bigram
+// scoring and is deferred to Phase 2 of the plan, gated on a real query
+// that Phase 1 cannot satisfy.
 export function searchEvents(
   events: NexusEvent[],
   query: string,
@@ -213,26 +249,49 @@ export function searchEvents(
     return { content: '', tokenEstimate: 0, hitCount: 0, truncated: false }
   }
   const caseSensitive = options.caseSensitive ?? false
-  const needle = caseSensitive ? query : query.toLowerCase()
+  // Tokenize on whitespace. Each token is matched as a substring
+  // (case-insensitively by default). AND: every token must appear.
+  const rawTokens = query.split(/\s+/).filter(Boolean)
+  const tokens = caseSensitive ? rawTokens : rawTokens.map((t) => t.toLowerCase())
   const sinceMs = options.sinceMs
   const typeFilter = options.eventTypeFilter ? new Set(options.eventTypeFilter) : null
 
-  const hits: string[] = []
-  let hitCount = 0
-  for (const event of events) {
+  // Scan in storage order, collect matches with their index so we can
+  // return newest-first without a separate timestamp parse per event.
+  const matched: { event: NexusEvent; index: number; snippet: string }[] = []
+  for (let i = 0; i < events.length; i++) {
+    const event = events[i]
     if (sinceMs !== undefined) {
       const ts = Date.parse((event as { timestamp: string }).timestamp)
       if (!Number.isFinite(ts) || ts < sinceMs) continue
     }
     if (typeFilter && !typeFilter.has(event.type)) continue
     const haystack = caseSensitive ? extractText(event) : extractText(event).toLowerCase()
-    if (haystack.includes(needle)) {
-      hitCount += 1
-      hits.push(formatEventSnippet(event))
+    if (tokens.every((token) => haystack.includes(token))) {
+      matched.push({ event, index: i, snippet: formatEventSnippet(event) })
     }
   }
 
-  const joined = hits.join('\n---\n')
+  const hitCount = matched.length
+
+  // Newest-first: highest storage index first. This matches contextRecent
+  // ordering and surfaces the most recent relevant turn at the top.
+  matched.sort((a, b) => b.index - a.index)
+
+  // Collapse consecutive same-type hits with identical snippet text so a
+  // long assistant_delta run (thousands of chunks) does not crowd out the
+  // result. Keep the first (newest) of a run, drop the rest.
+  const deduped: string[] = []
+  let prevType = ''
+  let prevSnippet = ''
+  for (const m of matched) {
+    if (m.event.type === prevType && m.snippet === prevSnippet) continue
+    deduped.push(m.snippet)
+    prevType = m.event.type
+    prevSnippet = m.snippet
+  }
+
+  const joined = deduped.join('\n---\n')
   const capped = capByTokens(joined, maxTokens)
   return {
     content: capped.content,
@@ -240,6 +299,8 @@ export function searchEvents(
     hitCount,
     truncated: capped.truncated,
     truncatedAt: capped.truncatedAt,
+    eventsScanned: options.eventsScanned,
+    eventsCapped: options.eventsCapped,
   }
 }
 
