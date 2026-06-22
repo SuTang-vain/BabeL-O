@@ -2,6 +2,20 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-22 — 自适应上下文窗口选择收口（Phase 0/1/2/3）
+
+> **完整文档**: [reference/adaptive-context-window-selection-plan.md](./reference/adaptive-context-window-selection-plan.md) — 含两条丢上下文路径的根因、设计、Phase 表与验证清单。本节只记事实流水。
+
+- **背景**: 用户反馈"每次 prompt 自动压缩，没到 80%/90% 就丢细节"。排查发现系统有两条独立的"压缩"路径，阈值门控的全量 `compact_boundary`（90%/93%）**从未误触发**，真凶是每次 `assembleContext` 都跑的固定上限裁剪。
+- **Phase 1 根因**（`session_cd42cb65`，852k deepseek-v4-pro，11 轮）：`selectRecentEvents` 用固定 `recentTurnLimit=4` + `recentEventLimit=300`，不看用量。`recentEventLimit=300` 在第二个 turn 装下之前就触发 break，实际只保留 **1/11 轮**（不是名义上的 4）。每个 `initial_refresh` 从 18%（~150k）跌回 3%（~25k）。
+- **Phase 1 修复**（commit `8d898d0`）：`selectRecentEvents` 新增可选 `SelectionHeadroom.preSelectionTokenEstimate`；`assembleContext` 用 `mapEventsToMessages` + `estimateContextTokens` 算预选择估算；估算 < 70% warning 阈值时 `maxTurns`/`maxEvents` 放宽到 Infinity（token 估算是真正预算信号）。`BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT` env 可覆盖（调用时读取，非模块加载）。2-arg 调用（undefined headroom）走 legacy。复现 gate：1/11 → 11/11。
+- **关键设计发现**: 预选择估算必须用真实 `mapEventsToMessages`（coalesce deltas），不能用 raw `JSON.stringify(events)`——后者 198%（误导），前者 42%（正确）。
+- **Phase 2 根因**（`session_75d74b74`，5 轮，7,974 事件）：Phase 1 修好后 `selectRecentEvents` 保留全部 5 轮，但 `microcompact` 无条件把 >4,000 字符的 tool_result 缩成摘要，砍掉 39,866 tokens / 159,462 字节跨 18 个大 tool_result（Read 27k、ListDir 23k、Glob 14k）。这才是用户看到的"第二轮自动压缩"真凶——轮次保留了，但轮次内 tool_result 细节被缩。
+- **Phase 2 修复**（commit `8967594`）：同一 headroom 信号门控 `microcompact`/`snip`——低用量时 `microcompactToolOutputChars`/`snipToolOutputChars` = Infinity（size-based trimming 跳过），但 **dedup 路径仍生效**（真重复 tool_result 仍合并）。复现 gate：0 个大 tool_result 保留 → 7 个（22% 用量），microcompact tokensSaved 39,866 → 14,127。
+- **验证**: typecheck / deps:audit / docs:check(failureCount 0) green；`context-assembler` 67/67（6 个 selectRecentEvents + 5 个 compactor 新单测，2 个 legacy fixture 用 env gate 保持测 trim 路径）；回归集群 347/347；2 个真实 session 复现脚本（`scripts/repro-adaptive-context-window-260622.mjs` + `scripts/repro-adaptive-context-phase2-260622.mjs`）全绿。
+- **耦合/架构边界**: 预选择估算复用 Phase 1 已算信号，Phase 2 无新开销；`compact_boundary`/`getAutoCompactDecision`/`cacheAwareCompactPolicy` 阈值全程未动；dedup 不受 headroom 影响（只放宽 size-trim）；层方向守约（`contextAssembler` 不 import policy 层，warning 阈值本地实现与 `cacheAwareCompactPolicy` DEFAULT_WARNING_PERCENT=70 数值对齐但无依赖）。
+- **文档生命周期**: 提案 `proposals/adaptive-context-window-selection-plan.md` 从 `Draft` → `Partially Landed` → `Active Plan`，毕业到 `reference/`（Phase 3 closed），`reference/README.md` 与 `proposals/README.md` 同步更新。
+
 ## 2026-06-22 — Go TUI drafting-response stall: watchdog fired but stream iterator did not settle
 
 - **背景**: 用户再次同时打开两个新 Go TUI session 后看到 `drafting response` 长时间不结束：

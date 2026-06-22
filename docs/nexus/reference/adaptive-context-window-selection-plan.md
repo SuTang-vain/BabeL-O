@@ -1,11 +1,11 @@
 # Adaptive Context Window Selection Plan
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Runtime / Context
-> Priority: P0 — real-session regression: every prompt re-trims the event window to a fixed turn+event cap regardless of actual context headroom, silently dropping ~125k tokens of prior thinking / tool results on an 852k-context model at 3% usage. Phase 0/1 closed 2026-06-22.
-> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/cacheAwareCompactPolicy.ts`, `src/runtime/tokenEstimator.ts`, `src/runtime/pipeline/contextRefresh.ts`, `src/runtime/compact.ts`, `test/context-assembler.test.ts`
-> Governance: Indexed by [README.md](./README.md). Canonical owner of "when the per-assembly event-window selection trims history". The threshold-gated full compact (`compact_boundary`) stays owned by [../reference/context-governance-index.md](../reference/context-governance-index.md) + `src/runtime/compact.ts`; cache-aware threshold policy stays in [../reference/cache-observability-and-nexus-realtime-detection-plan.md](../reference/cache-observability-and-nexus-realtime-detection-plan.md); three-tier context model (Working Set / Recent / On-Demand) stays in [../reference/long-running-context-assembly.md](../reference/long-running-context-assembly.md); PR review level for this change is `review-high-risk` per [../reference/development-process-stability-governance-plan.md](../reference/development-process-stability-governance-plan.md) §6.1.
-> Related: [../reference/long-running-context-assembly.md](../reference/long-running-context-assembly.md), [../reference/cache-observability-and-nexus-realtime-detection-plan.md](../reference/cache-observability-and-nexus-realtime-detection-plan.md), [../reference/context-governance-index.md](../reference/context-governance-index.md), [../reference/development-process-stability-governance-plan.md](../reference/development-process-stability-governance-plan.md)
+> Priority: P0 — real-session regression: every prompt re-trimmed the event window and tool results via fixed caps regardless of actual context headroom, silently dropping prior thinking / tool results on an 852k-context model at single-digit usage. Phase 0/1/2 closed 2026-06-22.
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/cacheAwareCompactPolicy.ts`, `src/runtime/tokenEstimator.ts`, `src/runtime/pipeline/contextRefresh.ts`, `src/runtime/compact.ts`, `src/runtime/compactors/microCompact.ts`, `src/runtime/compactors/snipCompactor.ts`, `test/context-assembler.test.ts`, `scripts/repro-adaptive-context-window-260622.mjs`, `scripts/repro-adaptive-context-phase2-260622.mjs`
+> Governance: Indexed by [README.md](./README.md). Canonical owner of "when the per-assembly event-window selection and tool-result compaction trims history". The threshold-gated full compact (`compact_boundary`) stays owned by [context-governance-index.md](./context-governance-index.md) + `src/runtime/compact.ts`; cache-aware threshold policy stays in [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md); three-tier context model (Working Set / Recent / On-Demand) stays in [long-running-context-assembly.md](./long-running-context-assembly.md); PR review level for this change is `review-high-risk` per [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md) §6.1.
+> Related: [long-running-context-assembly.md](./long-running-context-assembly.md), [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md), [context-governance-index.md](./context-governance-index.md), [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md)
 
 ## Purpose
 
@@ -113,7 +113,7 @@ The pre-selection estimate is computed once in `assembleContext` (Phase 1 alread
 | Phase 0 | Closed 2026-06-22 | This plan, indexed in `proposals/README.md`, with a reproduction script that loads `session_cd42cb65` and asserts the current `selectRecentEvents` drops 10 of 11 turns at ~3% usage (1 turn retained, not the nominal 4, because `recentEventLimit=300` trips first). | Reproduction script committed (`scripts/repro-adaptive-context-window-260622.mjs`); `npm run docs:check` passes; REPRO PASS confirmed. |
 | Phase 1 | Closed 2026-06-22 | Headroom-aware `selectRecentEvents` (gate on `percentUsed < warningThreshold`); relax BOTH `recentTurnLimit` and `recentEventLimit` at low usage (turn cap → Infinity, event cap → Infinity — the token estimate is the real budget signal); thread a pre-selection token estimate into `assembleContext` via `mapEventsToMessages` + `estimateContextTokens` (Option A); env-overridable `BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT`; 6 unit tests for low-usage-full-retention, fat-turn retention, high-usage-trim, back-compat, and recovery-boundary interaction. | Reproduction script shows all 11 user turns retained at ~3% usage on `session_cd42cb65` (was 1 of 11); `context-assembler` tests green (62/62, two legacy fixtures gated via env to keep exercising the trim path); compact/context/runtime regression cluster 335/335 green; `npm test` / `typecheck` / `deps:audit` / `docs:check` green. |
 | Phase 2 | Closed 2026-06-22 | Gate `microcompact` / `snip` char thresholds on the same headroom signal, so low-usage assemblies stop pre-emptively shrinking tool outputs. **Promoted from Watch after real-session evidence**: `session_75d74b74` (5 turns, 7,974 events, 852k deepseek-v4-pro) — `selectRecentEvents` retains all 5 turns (Phase 1 works), but `microcompact` unconditionally dropped 39,866 tokens / 159,462 bytes across 18 tool_results >4,000 chars at 3–22% usage. Fix: at headroom, `microcompactToolOutputChars` / `snipToolOutputChars` → Infinity (size-based trimming skipped, dedup still fires); legacy thresholds apply at/above warning. | Reproduction script (`scripts/repro-adaptive-context-phase2-260622.mjs`) shows 7 large tool_results preserved at 22% usage (legacy preserved 0); 5 unit tests for headroom-preserves-large, legacy-trims, dedup-still-fires, snip-headroom, snip-legacy; `context-assembler` 67/67; regression cluster 347/347; `typecheck` / `deps:audit` / `docs:check` green. |
-| Phase 3 | Open | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 + Phase 2 are closed against real sessions; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check`; `reference/README.md` updated. |
+| Phase 3 | Closed 2026-06-22 | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 + Phase 2 are closed against real sessions; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check` (failureCount 0); `reference/README.md` updated; `proposals/README.md` carries the graduation note; implementation recorded in `DONE.md` + `WORK_LOG.md`. |
 
 ## Verification
 
@@ -136,7 +136,7 @@ Before closing Phase 1:
 - Current priority lives in [../TODO.md](../TODO.md) and [../active/TODO_runtime.md](../active/TODO_runtime.md).
 - Completed facts move to [../DONE.md](../DONE.md); detailed history to [../WORK_LOG.md](../WORK_LOG.md).
 - This document keeps only the durable selection-vs-compact boundary, the headroom-gate design, and the regression context. It does not override TODO / DONE / WORK_LOG.
-- On close, this proposal either graduates to `reference/` (if the boundary is durable) or is summarized into `history/` (if the fix is self-contained). Per `proposals/README.md` lifecycle, it must not remain here indefinitely.
+- On close, this document stays in `reference/` as the durable boundary. Implementation facts moved to `DONE.md` / `WORK_LOG.md`; the `proposals/README.md` graduation note points here.
 
 ## 中文概述
 
@@ -150,8 +150,14 @@ Before closing Phase 1:
 
 ### 当前状态
 
-Draft，Phase 0 已 Closed。分支 `fix/adaptive-context-window-selection` 已从 `origin/develop` 切出，工作树干净。复现脚本 `scripts/repro-adaptive-context-window-260622.mjs` 已确认基线（1/11 轮保留，~3% 用量）。Phase 1 是最小闭环：余量感知 selectRecentEvents + 双上限放宽 + 透传估算 + 单测 + 真实 session 重放。Phase 2（microcompact/snip 同步门控）和 Phase 3（毕业到 reference）门控在真实需求。
+Active Plan，Phase 0/1/2/3 全部 Closed（2026-06-22）。分支 `fix/adaptive-context-window-selection` 从 `origin/develop` 切出。
+
+- **Phase 1**（`selectRecentEvents` 余量感知）：`session_cd42cb65` 从 1/11 轮保留 → 11/11。
+- **Phase 2**（`microcompact`/`snip` headroom 门控）：`session_75d74b74` 从 0 个大 tool_result 保留 → 7 个（22% 用量），microcompact tokensSaved 从 39,866（全量 size-trim）→ 14,127（仅 dedup）。
+- **Phase 3**（本毕业）：提案从 `proposals/` 移入 `reference/`，实现证据落入 `DONE.md` + `WORK_LOG.md`。
+
+两条真实丢上下文路径已闭合：整轮丢弃（Phase 1）+ tool_result 细节缩水（Phase 2）。`compact_boundary` / `cacheAwareCompactPolicy` 阈值全程未动。
 
 ### 下一步
 
-最小可验证的下一步是 Phase 1：实现余量感知 `selectRecentEvents` + 双上限放宽 + 透传估算，让 `session_cd42cb65` 在 ~3% 用量下保留全部 11 轮，补单测后跑全 gate。
+无。本计划已收口，长期架构边界由本文档承载，实现事实由 `DONE.md` / `WORK_LOG.md` 承载。未来若发现新的丢上下文路径，另开提案。
