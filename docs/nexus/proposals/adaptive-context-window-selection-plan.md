@@ -15,9 +15,10 @@ There are two independent "compression" paths in the runtime. This plan governs 
 
 Source-verified facts:
 
-- **`selectRecentEvents` enforces a fixed turn cap, not a headroom-aware cap.** `src/runtime/contextAssembler.ts:661-697` walks backwards from the last user message and breaks once `keptTurns + 1 > maxTurns`. `maxTurns` comes from `budget.recentTurnLimit`.
+- **`selectRecentEvents` enforces a fixed turn cap AND a fixed event cap, neither headroom-aware.** `src/runtime/contextAssembler.ts:661-697` walks backwards from the last user message and breaks when `keptTurns + 1 > maxTurns` OR when `candidateLen > maxEvents && keptTurns > 0`. `maxTurns` = `budget.recentTurnLimit`; `maxEvents` = `budget.recentEventLimit`.
 - **`recentTurnLimit` is a coarse model-size proxy, not a usage proxy.** `src/runtime/contextAssembler.ts:198`: `recentTurnLimit: maxTokens >= 100_000 ? 4 : 2`. So a 852k-context model gets `4`, a 8k model gets `2`. The value is computed once in `allocateBudget` from `modelContextWindow` only — it never sees `tokenEstimate` or `percentUsed`.
-- **The selection runs on every `assembleContext` with no percent gate.** `src/runtime/contextAssembler.ts:228` `selectRecentEvents(compactAwareEvents, budget)` is unconditional. At 3% usage it still cuts to 4 turns. At 89% it also cuts to 4 turns. The cut is not a recovery measure; it is the default.
+- **`recentEventLimit` interacts with turn size to make the effective window smaller than `recentTurnLimit`.** `src/runtime/contextAssembler.ts:197`: `recentEventLimit: Math.max(20, Math.min(300, Math.floor(maxTokens / 400)))` → 300 for any model ≥ 120k. On a session where one turn spans >300 events (common: thinking_delta + assistant_delta + tool calls), the `candidateLen > maxEvents && keptTurns > 0` break fires on the second-to-last turn, so only the **last** turn is kept — not 4. Verified by the Phase 0 repro: `session_cd42cb65` retains 1 of 11 turns.
+- **The selection runs on every `assembleContext` with no percent gate.** `src/runtime/contextAssembler.ts:228` `selectRecentEvents(compactAwareEvents, budget)` is unconditional. At 3% usage it still cuts to ≤4 turns. At 89% it also cuts to ≤4 turns. The cut is not a recovery measure; it is the default.
 - **`selectOmittedEvents` + `summarizeSessionEvents` then one-line-summarize everything outside the window.** `src/runtime/contextAssembler.ts:233-241`. The dropped turns are reduced to a short `summarizeSessionEvents` string, losing tool results, thinking deltas, and assistant output detail.
 - **`microcompact` and `snip` also run unconditionally with fixed char thresholds.** `src/runtime/contextAssembler.ts:193-196` sets `snipToolOutputChars` / `microcompactToolOutputChars` from `maxChars * 0.08` etc., and `:242-248` runs them every assembly. These are a secondary loss but smaller than the turn-cap loss.
 - **The threshold-gated full compact is correctly NOT firing.** `getAutoCompactDecision` (`src/runtime/compact.ts:222-252`) gates on `percentUsed >= compactThresholdPercent` (default 90%, cache-preserving 93%). Verified against `session_cd42cb65` below: zero `compact_boundary` events, peak usage 18%.
@@ -29,9 +30,10 @@ Real-session evidence — `session_cd42cb65-bc34-4a49-9923-8d43cb4f5fe4` (2026-0
 - 11 user turns, 20,540 events. Zero `compact_boundary` / `compact_failure` / `context_blocking` events for the entire session (the threshold gate worked).
 - Peak context usage was **18%** (149,905 / 852,000 tokens) at turn 8 end (`07:43:42`).
 - At the start of turn 9 (`07:44:51`, `initial_refresh`) the token estimate dropped back to **3% (25,472 tokens)** — a loss of ~125k tokens of prior thinking, tool results, and assistant output.
-- This 18% → 3% drop repeated at the start of **every** turn. Each `initial_refresh` returned to ~25k / 3%, because `selectRecentEvents` re-trimmed to 4 turns regardless of the 82% headroom available.
+- This 18% → 3% drop repeated at the start of **every** turn. Each `initial_refresh` returned to ~25k / 3%, because `selectRecentEvents` re-trimmed the window regardless of the 82% headroom available.
+- **Phase 0 repro (`scripts/repro-adaptive-context-window-260622.mjs`) against the real event stream:** `selectRecentEvents` retains **1 of 11** user turns (not the nominal 4) because `recentEventLimit=300` trips before a second turn fits. The selected window is ~2% of the 852k ceiling; the runtime reported ~3% throughout. So the fixed caps discard 10 turns of history at single-digit usage.
 
-The user-visible symptom — "context is compressed on every prompt instead of only at 80%/90%" — is this per-assembly fixed turn cap, **not** the threshold-gated compact. The compact gate is healthy; the selection gate does not exist.
+The user-visible symptom — "context is compressed on every prompt instead of only at 80%/90%" — is this per-assembly fixed window, **not** the threshold-gated compact. The compact gate is healthy; the selection gate does not exist.
 
 The compounding design error: `recentTurnLimit` was sized for small-context models (8k–32k) where 4 turns can fill the window. On a 852k model, 4 turns is ~25k tokens = 3% of the ceiling, so 97% of the paid-for context is voluntarily abandoned every turn.
 
@@ -54,32 +56,36 @@ The compounding design error: `recentTurnLimit` was sized for small-context mode
 
 ## Design
 
-### Core change: headroom-aware turn selection in `selectRecentEvents`
+### Core change: headroom-aware window selection in `selectRecentEvents`
 
-Pass the current context window state into `selectRecentEvents` so it can decide whether to enforce the turn cap.
+Pass the current context window state into `selectRecentEvents` so it can decide whether to enforce the turn cap AND the event cap. Both caps must relax at low usage — the Phase 0 repro showed `recentEventLimit=300` is the binding constraint (it trips before a second turn fits, yielding 1-of-11 turns retained), so relaxing only `recentTurnLimit` would not fix the regression.
 
 ```text
 // Pseudo — actual impl stays in contextAssembler.ts
 function selectRecentEvents(events, budget, windowState?):
   if windowState is undefined OR windowState.percentUsed < warningThresholdPercent:
-    # Low usage: preserve all turns (still subject to maxEvents safety cap
-    # and the recovery-boundary slice). No turn-cap trimming.
-    return sliceFromRecoveryBoundary(events) bounded by maxEvents
+    # Low usage: preserve all turns. Both caps relax:
+    #   - maxTurns -> effectively unlimited (all user turns)
+    #   - maxEvents -> raised to a high safety ceiling (e.g. 10x recentEventLimit)
+    #     so a multi-hundred-event turn does not trip the second-turn break.
+    # Recovery-boundary slice still applies.
+    return sliceFromRecoveryBoundary(events) bounded by raisedMaxEvents
   else:
-    # At/above warning: fall back to the existing turn-cap logic so the
-    # window shrinks as usage climbs toward compact.
+    # At/above warning: fall back to the existing turn+event cap logic so
+    # the window shrinks as usage climbs toward compact.
     return existingTurnCapSelection(events, budget)
 ```
 
-- **Gate = warning threshold, not compact threshold.** Use `windowState.isWarning` (70% / 80% cache-preserving) as the trim-on switch. Below warning → full history. Above warning → existing 4-turn cap. This means trimming only starts when the runtime is already signaling "getting full," and the full compact at 90% is still the hard reset.
+- **Gate = warning threshold, not compact threshold.** Use `windowState.isWarning` (70% / 80% cache-preserving) as the trim-on switch. Below warning → full history. Above warning → existing caps. Trimming only starts when the runtime is already signaling "getting full," and the full compact at 90% is still the hard reset.
+- **Both caps relax at low usage.** `recentTurnLimit` becomes "at most N when trimming"; `recentEventLimit` becomes "at most M when trimming," with a raised low-usage ceiling so a fat turn does not collapse the window to 1 turn. The low-usage ceiling is still bounded (pathological 50k-event sessions still get capped) but far above 300.
 - **`windowState` is already computed** in `buildRuntimeContextRefreshState` (`src/runtime/pipeline/contextRefresh.ts:298`) — but it is computed *after* `assembleContext` returns. The fix requires computing a pre-selection estimate (or passing a cheap prior estimate) into `assembleContext`. Options:
   - **Option A (preferred):** compute a cheap token estimate from the event slice before `selectRecentEvents` and pass `percentUsed` via the budget or a new `ContextAssemblerOptions` field. The estimate need not be exact — it only gates a binary "trim or not."
   - **Option B:** thread the *previous* turn's `contextWindowState` (already cached on the runtime) into `assembleContext` as `priorWindowState`. Cheaper (no re-estimate) but one turn stale.
   - Phase 1 picks Option A for correctness; Option B is the fallback if the pre-estimate proves too costly on the hot path.
 
-### Budget: make `recentTurnLimit` a ceiling, not a constant
+### Budget: make `recentTurnLimit` and `recentEventLimit` ceilings, not constants
 
-`allocateBudget` (`src/runtime/contextAssembler.ts:179-200`) keeps `recentTurnLimit` as the **maximum** turns to retain when trimming is active. It is no longer the always-on value. Naming stays for back-compat; semantics shift from "always 4" to "at most 4 when trimming."
+`allocateBudget` (`src/runtime/contextAssembler.ts:179-200`) keeps `recentTurnLimit` and `recentEventLimit` as the **maximum** values when trimming is active. They are no longer the always-on values. Naming stays for back-compat; semantics shift from "always 4 turns / 300 events" to "at most 4 turns / 300 events when trimming; unlimited turns / raised event ceiling when headroom is available."
 
 ### What stays fixed
 
@@ -91,8 +97,8 @@ function selectRecentEvents(events, budget, windowState?):
 
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
-| Phase 0 | Draft | This plan, indexed in `proposals/README.md`, with a reproduction script that loads `session_cd42cb65` and asserts the current `selectRecentEvents` drops turns 1–7 at 3% usage. | Reproduction script committed; `npm run docs:check` passes. |
-| Phase 1 | Open | Headroom-aware `selectRecentEvents` (gate on `percentUsed < warningThreshold`); thread a pre-selection token estimate into `assembleContext` (Option A); `recentTurnLimit` becomes a ceiling not a constant; unit tests for low-usage-full-retention, high-usage-trim, and recovery-boundary interaction. | Reproduction script shows turns 1–7 retained at 3% usage on `session_cd42cb65`; existing `context-assembler` tests green; `npm test` / `typecheck` / `deps:audit` / `docs:check` green. |
+| Phase 0 | Closed 2026-06-22 | This plan, indexed in `proposals/README.md`, with a reproduction script that loads `session_cd42cb65` and asserts the current `selectRecentEvents` drops 10 of 11 turns at ~3% usage (1 turn retained, not the nominal 4, because `recentEventLimit=300` trips first). | Reproduction script committed (`scripts/repro-adaptive-context-window-260622.mjs`); `npm run docs:check` passes; REPRO PASS confirmed. |
+| Phase 1 | Open | Headroom-aware `selectRecentEvents` (gate on `percentUsed < warningThreshold`); relax BOTH `recentTurnLimit` and `recentEventLimit` at low usage; thread a pre-selection token estimate into `assembleContext` (Option A); unit tests for low-usage-full-retention, high-usage-trim, fat-turn retention, and recovery-boundary interaction. | Reproduction script shows all 11 user turns retained at ~3% usage on `session_cd42cb65`; existing `context-assembler` tests green; `npm test` / `typecheck` / `deps:audit` / `docs:check` green. |
 | Phase 2 | Watch | Gate `microcompact` / `snip` char thresholds on the same headroom signal, so low-usage assemblies also stop pre-emptively shrinking tool outputs. Only if Phase 1 leaves a measurable secondary loss on a real session. | A real session shows microcompact/snip still dropping detail at <70% usage after Phase 1, and the gate restores it. |
 | Phase 3 | Open | Graduate this proposal to `reference/` as `Active Plan` once Phase 1 is closed against `session_cd42cb65`; summarize implementation into `DONE.md` / `WORK_LOG.md`. | Document lifecycle move verified by `npm run docs:check`; `reference/README.md` updated. |
 
@@ -100,11 +106,12 @@ function selectRecentEvents(events, budget, windowState?):
 
 Before closing Phase 1:
 
-- **Reproduction script** (`scripts/repro-adaptive-context-window-260622.mjs`): loads the real `session_cd42cb65` events, runs the new `selectRecentEvents` with the pre-selection estimate, and asserts that at 3% usage the selected window includes user turns 1–7 (not just 4–8). Primary regression gate.
+- **Reproduction script** (`scripts/repro-adaptive-context-window-260622.mjs`): loads the real `session_cd42cb65` events, runs the new `selectRecentEvents` with the pre-selection estimate, and asserts that at ~3% usage the selected window includes all 11 user turns (was 1 of 11). Primary regression gate.
 - **Unit tests** in `test/context-assembler.test.ts`:
   - low usage (< warning%) → all user turns retained (no turn-cap trim);
-  - high usage (>= warning%) → existing 4-turn cap behavior preserved;
-  - `recentEventLimit` hard ceiling still enforced at low usage (pathological event count);
+  - low usage (< warning%) with a fat turn (>300 events) → second-to-last turn still retained (the `recentEventLimit` break no longer trips early);
+  - high usage (>= warning%) → existing turn+event cap behavior preserved;
+  - `recentEventLimit` raised ceiling still enforced at low usage (pathological 50k-event session still capped);
   - recovery-boundary slice still applied at low usage;
   - `protectToolPairs` still pairs tool_started/tool_completed across the larger low-usage window.
 - **No regression in compact path**: `compactSession` tests remain green; `getAutoCompactDecision` threshold logic unchanged.
@@ -122,16 +129,16 @@ Before closing Phase 1:
 
 ### 背景
 
-真实 session `session_cd42cb65`（852k 上下文的 deepseek-v4-pro，11 轮）里，每个新 prompt 一开始 token 估计就从 18%（~150k）暴跌回 3%（~25k），前 7 轮的思考/工具结果/assistant 输出全丢。用户感觉"每次 prompt 都在压缩，没到 80%/90% 就丢细节"。但全量 `compact_boundary` 一次都没触发（阈值门控是对的）——真正丢细节的是**每次 `assembleContext` 都跑的固定 4 轮窗口裁剪**（`selectRecentEvents` + `recentTurnLimit=4`），它不看当前 context 用量，3% 也裁、90% 也裁。
+真实 session `session_cd42cb65`（852k 上下文的 deepseek-v4-pro，11 轮）里，每个新 prompt 一开始 token 估计就从 18%（~150k）暴跌回 3%（~25k），前 10 轮的思考/工具结果/assistant 输出全丢。用户感觉"每次 prompt 都在压缩，没到 80%/90% 就丢细节"。但全量 `compact_boundary` 一次都没触发（阈值门控是对的）——真正丢细节的是**每次 `assembleContext` 都跑的固定窗口裁剪**（`selectRecentEvents` + `recentTurnLimit=4` + `recentEventLimit=300`），它不看当前 context 用量，3% 也裁、90% 也裁。Phase 0 复现显示实际只保留 **1/11 轮**（不是名义上的 4 轮），因为 `recentEventLimit=300` 在第二个 turn 装下之前就触发了 break。
 
 ### 核心做法
 
-让 `selectRecentEvents` 变成**余量感知**：当 `percentUsed < warning 阈值`（70%/80%）时保留全部 user-turn 历史（仍受 `recentEventLimit` 硬上限和 recovery-boundary 切片约束），只在到达 warning 阈值后才回退到现有的 4 轮裁剪。`recentTurnLimit` 从"恒定 4"变成"裁剪激活时最多 4"。需要把一个廉价的 pre-selection token 估算或上一轮的 `contextWindowState` 透传进 `assembleContext` 作为门控信号。`compact_boundary` / `cacheAwareCompactPolicy` 阈值一律不动。
+让 `selectRecentEvents` 变成**余量感知**：当 `percentUsed < warning 阈值`（70%/80%）时保留全部 user-turn 历史，**同时放宽** `recentTurnLimit` 和 `recentEventLimit`（低用量时 turn 无上限、event 上限大幅抬高但仍防 50k 事件病态 session），只在到达 warning 阈值后才回退现有的 turn+event 裁剪。`recentTurnLimit` / `recentEventLimit` 从"恒定值"变成"裁剪激活时的上限"。需要把一个廉价的 pre-selection token 估算（或上一轮 `contextWindowState`）透传进 `assembleContext` 作为门控信号。`compact_boundary` / `cacheAwareCompactPolicy` 阈值一律不动。
 
 ### 当前状态
 
-Draft。分支 `fix/adaptive-context-window-selection` 已从 `origin/develop` 切出，工作树干净。Phase 1 是最小闭环：余量感知 selectRecentEvents + 透传估算 + recentTurnLimit 语义收敛 + 单测 + 真实 session 重放。Phase 2（microcompact/snip 同步门控）和 Phase 3（毕业到 reference）门控在真实需求。
+Draft，Phase 0 已 Closed。分支 `fix/adaptive-context-window-selection` 已从 `origin/develop` 切出，工作树干净。复现脚本 `scripts/repro-adaptive-context-window-260622.mjs` 已确认基线（1/11 轮保留，~3% 用量）。Phase 1 是最小闭环：余量感知 selectRecentEvents + 双上限放宽 + 透传估算 + 单测 + 真实 session 重放。Phase 2（microcompact/snip 同步门控）和 Phase 3（毕业到 reference）门控在真实需求。
 
 ### 下一步
 
-最小可验证的下一步是 Phase 0：写复现脚本，用 `session_cd42cb65` 跑当前 `selectRecentEvents`，确认 3% 用量时前 7 轮被丢，作为回归基线；随后在 `fix/adaptive-context-window-selection` 分支上推进 Phase 1。
+最小可验证的下一步是 Phase 1：实现余量感知 `selectRecentEvents` + 双上限放宽 + 透传估算，让 `session_cd42cb65` 在 ~3% 用量下保留全部 11 轮，补单测后跑全 gate。
