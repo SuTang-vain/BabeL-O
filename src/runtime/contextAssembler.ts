@@ -767,14 +767,26 @@ export function selectRecentEvents(
   // legacy 300-event cap would apply.
   const maxEvents = hasHeadroom ? Number.POSITIVE_INFINITY : budget.recentEventLimit
 
+  // Recovery boundary: when a recovery-boundary error (REQUEST_CANCELLED,
+  // REQUEST_TIMEOUT, PROVIDER_ERROR, etc.) appears, legacy behavior slices off
+  // everything before it so the runtime restarts clean after a cancel/timeout.
+  // Phase 4 (adaptive-context-window-selection-plan.md): under headroom this
+  // over-discards history the user expects to recall — real session
+  // session_8d6fc33d lost turns 1–3 (~215k tokens of deep analysis) from turn 4
+  // on after a REQUEST_CANCELLED at 2–5% usage. When hasHeadroom, skip the
+  // slice and keep full history; protectToolPairs (called by the caller) still
+  // pairs tool_started/tool_completed so half-finished tool state from the
+  // cancelled turn is not left dangling. Legacy slice applies at/above warning.
   let recoveryIdx = 0
-  for (let idx = events.length - 1; idx >= 0; idx--) {
-    const event = events[idx]!
-    if (event.type === 'error') {
-      const code = (event as { code?: string }).code
-      if (isRecoveryBoundaryError(code)) {
-        recoveryIdx = idx
-        break
+  if (!hasHeadroom) {
+    for (let idx = events.length - 1; idx >= 0; idx--) {
+      const event = events[idx]!
+      if (event.type === 'error') {
+        const code = (event as { code?: string }).code
+        if (isRecoveryBoundaryError(code)) {
+          recoveryIdx = idx
+          break
+        }
       }
     }
   }
