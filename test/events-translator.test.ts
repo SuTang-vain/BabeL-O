@@ -255,3 +255,100 @@ test('mapEventsToMessages handles complex object tool output by JSON-stringifyin
   assert.match(toolResult.content, /"stdout":"a"/)
   assert.equal(toolResult.isError, false)
 })
+
+test('mapEventsToMessages defers runtime user messages that arrive mid tool round (Phase 5)', () => {
+  // Reproduces the session_6ce63133 shape: an assistant fans out two tools
+  // in one round; the second tool is suspended by a scope_boundary_* pair
+  // before its tool_completed arrives. The runtime messages must be deferred
+  // until the round closes so the assistant(tool_use) ↔ user(tool_result)
+  // pair stays contiguous.
+  const events: NexusEvent[] = [
+    userMessage('q'),
+    assistantDelta('looking'),
+    toolStarted('call-A', 'ListDir', { path: '/a' }),
+    toolCompleted('call-A', 'ListDir', 'entries-A', true),
+    toolStarted('call-B', 'Glob', { pattern: '*.ts', path: '/b' }),
+    {
+      type: 'scope_boundary_detected',
+      ...eventBase(SESSION),
+      toolUseId: 'call-B',
+      toolName: 'Glob',
+      targetRoot: '/b',
+      taskPrimaryRoot: '/a',
+      boundaryKind: 'external_absolute_path',
+      action: 'require_confirmation',
+      scopeRisk: 'outside_current_project',
+      reason: 'Tool target /b is outside current task root /a',
+      suggestedPrompt: 'confirm /b',
+    },
+    {
+      type: 'scope_boundary_confirmed',
+      ...eventBase(SESSION),
+      targetRoot: '/b',
+      confirmationScope: 'session',
+      confirmedBy: 'user',
+      message: 'User confirmed /b for the current task scope.',
+    },
+    toolCompleted('call-B', 'Glob', 'matches-B', true),
+    assistantDelta('done'),
+  ]
+  const messages = mapEventsToMessages(events, 'q')
+
+  // Locate the assistant(tool_use=[A,B]) message and assert the immediately
+  // following user message carries both tool_result blocks.
+  const assistantIdx = messages.findIndex(m =>
+    m.role === 'assistant' &&
+    Array.isArray(m.content) &&
+    (m.content as any[]).some(b => b.type === 'tool_use' && b.id === 'call-B'),
+  )
+  assert.ok(assistantIdx >= 0, 'an assistant message with tool_use call-B must exist')
+  const following = messages[assistantIdx + 1]
+  assert.ok(following && following.role === 'user' && Array.isArray(following.content),
+    'the assistant(tool_use) message must be immediately followed by a user message')
+  const resultIds = (following.content as any[])
+    .filter(b => b.type === 'tool_result')
+    .map(b => b.toolUseId)
+    .sort()
+  assert.deepEqual(resultIds, ['call-A', 'call-B'],
+    'both tool_result blocks must be contiguous with the assistant(tool_use) message')
+
+  // The deferred scope_boundary_* runtime messages must still be present
+  // (zero semantic loss), landing AFTER the completed pair.
+  const afterPair = messages.slice(assistantIdx + 2)
+  const boundaryDetected = afterPair.find(m =>
+    m.role === 'user' && typeof m.content === 'string' && m.content.includes('Runtime scope boundary detected'),
+  )
+  const boundaryConfirmed = afterPair.find(m =>
+    m.role === 'user' && typeof m.content === 'string' && m.content.includes('Runtime scope boundary confirmed'),
+  )
+  assert.ok(boundaryDetected, 'scope_boundary_detected text must be preserved after the pair')
+  assert.ok(boundaryConfirmed, 'scope_boundary_confirmed text must be preserved after the pair')
+})
+
+test('mapEventsToMessages keeps runtime messages inline when no tool round is open', () => {
+  // A runtime event at the start of a turn (before any tool) has no open
+  // round to defer for, so it must be pushed inline in event order — same
+  // behavior as before Phase 5.
+  const events: NexusEvent[] = [
+    userMessage('q'),
+    {
+      type: 'task_scope_declared',
+      ...eventBase(SESSION),
+      message: 'scope declared',
+      primaryRoot: '/a',
+      explicitRoots: [],
+      confirmedExternalRoots: [],
+      mode: 'single_root',
+    },
+    assistantDelta('hi'),
+  ]
+  const messages = mapEventsToMessages(events, 'q')
+  const scopeIdx = messages.findIndex(m =>
+    m.role === 'user' && typeof m.content === 'string' && m.content.includes('Runtime task scope declared'),
+  )
+  const assistantIdx = messages.findIndex(m =>
+    m.role === 'assistant' && typeof m.content === 'string' && m.content === 'hi',
+  )
+  assert.ok(scopeIdx >= 0, 'task_scope_declared must be emitted inline')
+  assert.ok(assistantIdx > scopeIdx, 'task_scope_declared must precede the assistant text')
+})
