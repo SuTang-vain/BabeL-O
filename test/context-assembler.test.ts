@@ -432,10 +432,13 @@ test('selectRecentEvents without preSelectionTokenEstimate falls back to legacy 
   assert.ok(userMsgs.length < 5, `undefined headroom → legacy caps drop turns (kept ${userMsgs.length} of 5)`)
 })
 
-test('selectRecentEvents headroom still respects the recovery-boundary slice', () => {
-  // A recovery-boundary error mid-stream slices off everything before it,
-  // even with headroom. Build turn 1, inject a recovery error, then turns
-  // 2 and 3. Only turns 2-3 are eligible after the recovery boundary.
+test('selectRecentEvents headroom KEEPS history across a recovery-boundary error (Phase 4)', () => {
+  // A recovery-boundary error mid-stream (turn 1, then PROVIDER_ERROR, then
+  // turns 2-3). Phase 4: under headroom, skip the recovery-boundary slice so
+  // history before the error is retained — real session session_8d6fc33d lost
+  // turns 1-3 after a REQUEST_CANCELLED at 2-5% usage. protectToolPairs still
+  // pairs tool_started/tool_completed so half-finished tool state is not left
+  // dangling.
   const events: NexusEvent[] = []
   events.push({
     type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
@@ -452,7 +455,6 @@ test('selectRecentEvents headroom still respects the recovery-boundary slice', (
     type: 'error', schemaVersion, sessionId: 'session-adaptive',
     timestamp: '2026-06-22T00:01:00.000Z', code: 'PROVIDER_ERROR', message: 'provider failed',
   })
-  // Turns 2 and 3 AFTER the recovery boundary.
   for (let turn = 2; turn <= 3; turn += 1) {
     events.push({
       type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
@@ -467,14 +469,41 @@ test('selectRecentEvents headroom still respects the recovery-boundary slice', (
     }
   }
   const selected = selectRecentEvents(events, adaptiveBudget, {
-    preSelectionTokenEstimate: 1_000,
+    preSelectionTokenEstimate: 1_000, // ~0% of 852k → headroom active
+  })
+  const userMsgs = selected.filter((e) => e.type === 'user_message')
+  assert.equal(userMsgs.length, 3, `Phase 4 headroom keeps all 3 turns across recovery boundary, got ${userMsgs.length}`)
+  assert.ok(
+    userMsgs.some((m) => (m as any).text === 'user turn 1'),
+    'turn 1 (before recovery boundary) is retained under headroom',
+  )
+})
+
+test('selectRecentEvents legacy (no headroom) still slices at a recovery-boundary error', () => {
+  // Same fixture, but pre-selection estimate above the warning threshold →
+  // no headroom → legacy recovery-boundary slice applies → turn 1 is dropped.
+  const events: NexusEvent[] = []
+  events.push({
+    type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
+    timestamp: '2026-06-22T00:00:00.000Z', text: 'user turn 1',
+  })
+  events.push({
+    type: 'error', schemaVersion, sessionId: 'session-adaptive',
+    timestamp: '2026-06-22T00:01:00.000Z', code: 'PROVIDER_ERROR', message: 'provider failed',
+  })
+  events.push({
+    type: 'user_message', schemaVersion, sessionId: 'session-adaptive',
+    timestamp: '2026-06-22T00:02:00.000Z', text: 'user turn 2',
+  })
+  const selected = selectRecentEvents(events, adaptiveBudget, {
+    preSelectionTokenEstimate: Math.floor(852_000 * 0.8), // 80% → no headroom
   })
   const userMsgs = selected.filter((e) => e.type === 'user_message')
   assert.ok(
     userMsgs.every((m) => (m as any).text !== 'user turn 1'),
-    'turn 1 (before recovery boundary) is excluded even with headroom',
+    'turn 1 (before recovery boundary) is dropped under legacy caps',
   )
-  assert.equal(userMsgs.length, 2, `turns 2-3 retained after recovery boundary, got ${userMsgs.length}`)
+  assert.equal(userMsgs.length, 1, `legacy keeps only turn 2 after recovery boundary, got ${userMsgs.length}`)
 })
 
 test('selectOmittedEvents uses stable event identity after cloning', () => {
@@ -1931,6 +1960,12 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   // Note: post-R7, the per-turn non-tool summary path (`natural_pause`) was
   // retired. We assert `growth_threshold` here as the surviving reason that
   // still drives `session_memory_updated` events with a known decision.
+  // Phase 4: force the headroom gate OFF so the recovery-boundary slice +
+  // legacy event cap still produce dropped events on the 6.5k
+  // local/coding-runtime window (headroom would otherwise retain all history
+  // across the REQUEST_CANCELLED and drop nothing).
+  process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT = '1'
+  try {
   const cwd = join(tmpdir(), `babel-o-context-analysis-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -2163,6 +2198,9 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'large_tool_result'))
   assert.ok(analysis.diagnostics.signals.some(signal => signal.type === 'repeated_tool_input'))
   assert.ok(analysis.recommendations.some(recommendation => recommendation.includes('Large tool results')))
+  } finally {
+    delete process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT
+  }
 })
 
 test('analyzeContext exposes long-term memory budget diagnostics', async () => {
@@ -2783,6 +2821,12 @@ test('assembleContext prioritizes the latest user question in long noisy session
 })
 
 test('assembleContext starts fresh after a cancelled or timed out long task', async () => {
+  // Phase 4: force the headroom gate OFF so the recovery-boundary slice still
+  // applies (headroom would otherwise retain pre-cancellation history). This
+  // test asserts the "clean restart after cancel" semantics, which is the
+  // legacy behavior we preserve at/above the warning threshold.
+  process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT = '1'
+  try {
   const cwd = join(tmpdir(), `babel-o-recovery-boundary-${Date.now()}`)
   const events: NexusEvent[] = [
     {
@@ -2862,6 +2906,9 @@ test('assembleContext starts fresh after a cancelled or timed out long task', as
   assert.doesNotMatch(messagesText, /old-task/)
   assert.match(context.systemPrompt, /Context Boundary/)
   assert.match(context.systemPrompt, /REQUEST_CANCELLED|cancelled/i)
+  } finally {
+    delete process.env.BABEL_O_SELECTION_HEADROOM_WARNING_PERCENT
+  }
 })
 
 test('assembleContext treats short greetings as intent guidance without dropping prior context', async () => {
