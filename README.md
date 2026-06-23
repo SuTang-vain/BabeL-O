@@ -77,7 +77,7 @@ bbl go
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.8 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.3.9 bash
 ```
 
 Requirements: macOS or Linux, Node.js >= 22 on `PATH`.

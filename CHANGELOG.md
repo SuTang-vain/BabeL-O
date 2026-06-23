@@ -8,6 +8,36 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 - No unreleased user-facing changes are documented yet.
 
+## v0.3.9 - 2026-06-23
+
+[Full release notes](docs/releases/v0.3.9.md)
+
+### Added
+
+- Added context-search pushdown and tokenized matching so long sessions can
+  retrieve relevant historical events without overloading prompt assembly.
+- Added runtime and Nexus watchdog coverage for silent or aborted provider
+  streams, including `activeAgeMs` diagnostics.
+- Added blocking layer-direction and coupling gates to CI.
+
+### Changed
+
+- Improved adaptive context-window selection and headroom preservation around
+  recovery boundaries.
+- Split more Nexus, storage, runtime, and provider-loop responsibilities into
+  smaller modules to reduce coupling.
+- Improved progressive streaming so provider text deltas are surfaced as they
+  arrive instead of being buffered to the end of the turn.
+
+### Fixed
+
+- Preserved provider tool-call/tool-result message ordering across runtime
+  replay and context assembly.
+- Propagated provider aborts through SSE readers so cancelled or timed-out
+  streams settle cleanly.
+- Redacted context-observer payloads more aggressively and excluded internal
+  hook, usage, and thinking events from default context-recent surfaces.
+
 ## v0.3.8 - 2026-06-15
 
 [Full release notes](docs/releases/v0.3.8.md)
