@@ -5,6 +5,8 @@ import { logger } from '../shared/logger.js'
 import { validateSecurityConfig } from '../shared/security.js'
 import { defaultEverCoreRuntimeManager } from './everCoreRuntimeManager.js'
 import { ContextBroadcaster } from './contextBroadcaster.js'
+import { ActiveExecutionRegistry } from './activeExecutionRegistry.js'
+import { createShutdownSignal, registerDaemonShutdownHandlers } from './daemonLifecycle.js'
 import {
   assertAgentRemoteExecutionReady,
   assertRemoteRunnerReady,
@@ -92,6 +94,13 @@ const { runtime, storage, agentScheduler, behaviorMonitor } = await createDefaul
     fsync: storageWalFsync,
   },
 })
+// Phase 1 of daemon-graceful-shutdown-and-orphan-reaper-plan.md: a shared
+// shutdown flag consulted by /v1/execute + /v1/stream, plus the registry
+// the shutdown coordinator calls cancelAll() on. Created here (not inside
+// createNexusApp) so server.ts can hand the same instances to the signal
+// handler.
+const shutdownSignal = createShutdownSignal()
+const activeExecutionRegistry = new ActiveExecutionRegistry()
 const app = await createNexusApp({
   runtime,
   storage,
@@ -111,9 +120,25 @@ const app = await createNexusApp({
   agentExecutionEnvironment,
   behaviorMonitor,
   contextBroadcaster,
+  shutdownSignal,
+  activeExecutionRegistry,
 })
 app.addHook('onClose', async () => {
   await defaultEverCoreRuntimeManager.shutdown()
+})
+
+await app.listen({ host, port })
+
+// Phase 1: signal-driven graceful shutdown. SIGTERM/SIGINT → set flag
+// (new leases get 503 SHUTTING_DOWN) → cancelAll in-flight → bounded
+// grace → app.close() (fires onClose → everCore.shutdown) → storage.close()
+// (flushes storageBridge WAL + disposes tools) → exit(0). A second signal
+// forces exit(1).
+registerDaemonShutdownHandlers({
+  signal: shutdownSignal,
+  app,
+  storage,
+  activeExecutionRegistry,
 })
 
 await app.listen({ host, port })
