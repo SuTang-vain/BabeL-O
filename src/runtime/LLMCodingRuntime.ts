@@ -100,6 +100,7 @@ import { deriveEntriesFromEvents } from './workingSetTracker.js'
 import { formatWorkingSet } from './workingSet.js'
 import { formatHint } from './formatHint.js'
 import type { AssembledContext } from './contextAssembler.js'
+import { HISTORY_EVENT_LOAD_LIMIT_MAX } from './contextAssembler.js'
 import type { WorkingSet } from './workingSetTracker.js'
 import { ProviderSessionRules } from './providerSessionRules.js'
 
@@ -1160,7 +1161,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       try {
         const result = await this.storage.listEvents(opts.sessionId, {
           order: 'desc',
-          limit: 1000,
+          limit: HISTORY_EVENT_LOAD_LIMIT_MAX,
         })
         events = [...(result?.events ?? [])].reverse() // ascending for assembler
       } catch (error) {
@@ -1189,7 +1190,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       try {
         const result = await this.storage.listEvents(opts.sessionId, {
           order: 'desc',
-          limit: 1000,
+          limit: HISTORY_EVENT_LOAD_LIMIT_MAX,
         })
         events = [...(result?.events ?? [])].reverse()
       } catch (error) {
@@ -1322,7 +1323,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       rebuilt = true
       const result = await this.storage.listEvents(opts.sessionId, {
         order: 'desc',
-        limit: 1000,
+        limit: HISTORY_EVENT_LOAD_LIMIT_MAX,
       })
       events = [...(result?.events ?? [])].reverse()
       const entries = deriveEntriesFromEvents(events, opts.cwd)
@@ -1330,7 +1331,7 @@ export class LLMCodingRuntime implements NexusRuntime {
     } else {
       const result = await this.storage.listEvents(opts.sessionId, {
         order: 'desc',
-        limit: 1000,
+        limit: HISTORY_EVENT_LOAD_LIMIT_MAX,
       })
       events = [...(result?.events ?? [])].reverse()
     }

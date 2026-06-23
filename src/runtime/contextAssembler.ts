@@ -166,6 +166,37 @@ export function readSelectionHeadroomWarningPercent(): number {
   const parsed = Number(raw)
   return Number.isFinite(parsed) ? Math.max(1, Math.min(99, parsed)) : 70
 }
+
+// History event load limit. Runtime loads prior session events from storage at
+// the start of every turn (prepareRuntimeStart) and on resume. The legacy hard
+// cap of 1000 events was set before large-context support: a single fat turn
+// (deepseek-v4-pro reasoning) emits 4000+ thinking_delta + 1000+ assistant_delta
+// events, so 1000 events did not even cover one turn, and prior turns were
+// silently dropped before the headroom signal could see them. Real sessions
+// observed: 43 turns / 17938 events (session_9a4170e7), 4 turns / 9279 events
+// (session_cf703023). The cap must be high enough that the pre-selection token
+// estimate reflects real history; otherwise hasHeadroom is always true on a
+// truncated slice and selectRecentEvents still trims to recentEventLimit.
+// Scale with budget so large-context models (852k) load a wide window while
+// legacy (120k) stays bounded. Env-overridable; read at call time.
+export const HISTORY_EVENT_LOAD_LIMIT_MIN = 1000
+export const HISTORY_EVENT_LOAD_LIMIT_MAX = 50000
+
+export function readHistoryEventLoadLimit(): number | undefined {
+  const raw = process.env.BABEL_O_HISTORY_EVENT_LOAD_LIMIT
+  if (!raw) return undefined
+  const parsed = Number(raw)
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : undefined
+}
+
+export function getHistoryEventLoadLimit(maxTokens: number): number {
+  const override = readHistoryEventLoadLimit()
+  if (override !== undefined) return override
+  if (maxTokens <= 0) return HISTORY_EVENT_LOAD_LIMIT_MIN
+  // ~1 event per 20 tokens of budget: 852k → 42600, 120k → 6000. Capped.
+  const scaled = Math.floor(maxTokens / 20)
+  return Math.max(HISTORY_EVENT_LOAD_LIMIT_MIN, Math.min(HISTORY_EVENT_LOAD_LIMIT_MAX, scaled))
+}
 // Low-usage event ceiling: when headroom is available, the raw event-count
 // cap is relaxed to Infinity (see selectRecentEvents). The legacy
 // `recentEventLimit` (300 for ≥120k models) is a raw EVENT-COUNT proxy that

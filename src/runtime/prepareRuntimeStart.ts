@@ -68,6 +68,7 @@ import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool } from '../tools/Tool.js'
 import { type ToolPolicy } from './LocalCodingRuntime.js'
 import { mapEventsToMessages } from './eventsTranslator.js'
+import { allocateBudget, getHistoryEventLoadLimit } from './contextAssembler.js'
 import { buildUserIntakeGuidanceEvent } from './intentGuidance.js'
 import { buildTaskScopeDeclaredEvent } from './taskScope.js'
 import { isOptionSelectionClarificationText, normalizeOptionSelection } from './pipeline/providerTurn.js'
@@ -146,13 +147,20 @@ export async function prepareRuntimeStart(
   const { options, deps, settings, cleanedModelId, adapter, shouldReplayReasoningContent } = input
 
   // Step 2: load previous session events (desc order then
-  // reverse for chronological in-memory list).
+  // reverse for chronological in-memory list). The load limit
+  // scales with the model's context budget so large-context
+  // models (852k) load a wide enough window for the headroom
+  // signal to see real history; the legacy fixed 1000-event cap
+  // dropped prior turns before headroom could protect them
+  // (session_099b26bb / session_cf703023 fat-turn regressions).
   let previousEvents: NexusEvent[] = []
   if (deps.storage && options.replaySessionHistory !== false) {
     try {
+      const budget = allocateBudget(cleanedModelId)
+      const loadLimit = getHistoryEventLoadLimit(budget.maxTokens)
       const result = await deps.storage.listEvents(options.sessionId, {
         order: 'desc',
-        limit: 1000,
+        limit: loadLimit,
       })
       previousEvents = [...(result?.events || [])].reverse()
     } catch (e) {
