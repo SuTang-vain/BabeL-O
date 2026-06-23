@@ -76,7 +76,7 @@ type TaskMutationHttpError = {
   payload: { type: 'error'; code: string; message: string; task?: NexusTask }
 }
 
-const TERMINAL_SESSION_PHASES = new Set(['completed', 'failed', 'cancelled'])
+const TERMINAL_SESSION_PHASES = new Set(['completed', 'failed', 'cancelled', 'interrupted'])
 
 export const sessionTaskMutationRouter: FeatureRouter = {
   name: 'sessionTaskMutationRouter',

@@ -148,7 +148,7 @@ async function syncSessionToEverCore(
   }
 }
 
-const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled'])
+const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled', 'interrupted'])
 
 async function cascadeCancelChildTaskSessions(
   storage: NexusStorage,
