@@ -2,6 +2,20 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-06-23 — History event load limit scaled with budget (Phase 6): fix fat-turn per-turn compression
+
+- **背景**: Phase 1-4 headroom 修复在 slim-turn session 验证通过，但真实 fat-turn session 仍"每轮压缩"。`session_099b26bb`（4 turn，4003 thinking_delta + 58 tool）、`session_cf703023`、`session_1891b642` 三个 session 每轮 `initial_refresh` 都跌回 25k 甚至 3.5k tokens，全程 percentUsed 最高 10%。
+- **诊断**: 在 `assembleContext` 加临时 diag 日志，重跑 fat-turn probe（deepseek-v4-pro，每轮 4000+ thinking + 多 tool）。日志显示 `inputEvents=1002 preSelEstimate=1025` —— assembleContext 只收到 1002 个事件，preSelection 估算仅 1025 tokens。但实际 turn 2 有 5000+ 事件、85k tokens。
+- **根因**: `prepareRuntimeStart.ts:155` 与 `LLMCodingRuntime.ts` 4 处 resume 路径用硬编码 `listEvents(..., { limit: 1000 })` 加载历史。deepseek-v4-pro 单轮就发 4000+ thinking_delta + 1000+ assistant_delta，1000 事件连一整轮都装不全，前几轮事件在 headroom 信号看到之前就被截断。headroom 基于 `options.events`（= 截断后的 1000 事件）估算，永远 < 70%，`hasHeadroom=true`，但 `selectRecentEvents` 仍按 `recentEventLimit=300` 裁剪 → 跌回 22k。**Phase 1-4 headroom 修复对此完全无效，因为截断发生在 headroom 之前。** 离线脚本（直接读 db 全量 events）验证 headroom 有效，是因为离线喂的是全量。
+- **实现**:
+  - `src/runtime/contextAssembler.ts`: 新增 `getHistoryEventLoadLimit(maxTokens)` + `HISTORY_EVENT_LOAD_LIMIT_MIN=1000` / `HISTORY_EVENT_LOAD_LIMIT_MAX=50000` + `readHistoryEventLoadLimit()`。按 ~1 event / 20 tokens 缩放：852k → 42600、120k → 6000，封顶 50000。env `BABEL_O_HISTORY_EVENT_LOAD_LIMIT` 可覆盖，调用时读取（与 headroom percent 同模式）。
+  - `src/runtime/prepareRuntimeStart.ts`（每轮热路径）: `limit: 1000` → `getHistoryEventLoadLimit(allocateBudget(cleanedModelId).maxTokens)`。
+  - `src/runtime/LLMCodingRuntime.ts` resume 路径（4 处）: `limit: 1000` → `HISTORY_EVENT_LOAD_LIMIT_MAX`（resume 一次性，加载全量）。
+- **验证**:
+  - 端到端 fat-turn probe（3 turn，每轮 4000+ thinking + 多 tool，运行中的 server）：修复前 turn 2=22859 / turn 3=23063（-72%/-62% 跌回）；修复后 turn 2=62618 / turn 3=97762（+179%/+56% 单调增长，全程 3%-11%，headroom true）。turn 3 模型准确回忆前两轮每个文件 + 目的（历史保留硬证据）。
+  - typecheck / docs:check(failureCount 0) / 1234/1234 全量测试通过。
+- **架构边界**: 加载上限缩放与 headroom 信号同源（都用 budget.maxTokens）；`selectRecentEvents` / `compact_boundary` / `microcompact` 阈值全程未动。resume 路径用 MAX 而非缩放值，因为 resume 无 modelId 入参且一次性加载全量是合理的。性能：listEvents limit 50000 的 SQLite 查询 + 一次 mapEventsToMessages 全量 pass，对实测最大 session（17938 事件）<1s。
+
 ## 2026-06-22 — Tool-Pair Message Ordering (Phase 5): defer runtime user messages mid tool round + tighten contiguity validators
 
 - **背景**: 真实 session `session_6ce63133-fecb-4c03-adf2-349f38074c98`（6 turn，minimax/MiniMax-M3 + deepseek/deepseek-v4-pro，全程 percentUsed 7-9%）在 turn 3-6 连续 4 次 `PROVIDER_ERROR` 400：

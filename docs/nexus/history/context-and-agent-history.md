@@ -9,10 +9,42 @@ This history ledger preserves closed implementation context without keeping ever
 
 | Closed item | Original file | Closure status |
 | --- | --- | --- |
+| Adaptive Context Window + History Load Limit (Phase 1-4 + 6) | `adaptive-context-window-selection-plan.md` | Closed 2026-06-22/23. `selectRecentEvents` / `microcompact` / `snip` / recovery-boundary gated on a pre-selection token headroom signal (relax caps below 70% usage); `prepareRuntimeStart` + resume paths replaced hard-coded `listEvents(limit:1000)` with `getHistoryEventLoadLimit(maxTokens)` scaled to budget (852k→42600, cap 50000) so headroom sees real history in fat-turn sessions. Closes the `session_cd42cb65` / `session_75d74b74` / `session_099b26bb` / `session_cf703023` / `session_1891b642` per-turn compression regressions. |
 | Tool-Pair Message Ordering Plan (Phase 5) | `tool-pair-message-ordering-plan.md` | Closed 2026-06-22. `mapEventsToMessages` defers runtime-injected user messages that arrive mid tool round; `validateAnthropicToolMessageSequence` and `validateOpenAIToolMessageSequence` tightened to require strict `tool_use ↔ tool_result` contiguity. Closes the `session_6ce63133` 4× PROVIDER_ERROR 400 regression. |
 | BabeL-O Context and Sub-agent Upgrade Plan | `context-and-subagent-upgrade-plan.md` | Context Manager / ContextForker / read-only Explore-Review-Test AgentScheduler phases implemented; write-capable implement agents remain disabled. |
 | BabeL-O 上下文管理优化规划 | `context-management-optimization-plan.md` | Phase 0 + Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5 + Phase 6A + Phase 6B + Phase 7 已落地 — 基于 BabeL-2 上下文管理机制复盘与 BabeL-O 真实 session `session_661479db-6327-46f2-a793-7b88e0431174` 的“模型自报上下文 91%”样本，推进 runtime-owned context facts、Go TUI footer 可见性、模型不得自估 context 百分比约束、microcompact 事实事件、compact boundary 协议化、provider context-limit recoverable retry、post-compact grounding guard、dirty workspace guard、context bucket/top-items/grounding suggestions 可视化、sub-agent context fork provenance 与后续 context foundation 提升。 |
 | Session-to-Session Memory Channel Plan | `session-to-session-memory-channel-plan.md` | Closed reference retained in this history ledger. |
+
+## Adaptive Context Window + History Load Limit (Phase 1-4 + 6)
+
+**Original file**: `adaptive-context-window-selection-plan.md` (folded into this ledger 2026-06-23; full per-phase detail in [../WORK_LOG.md](../WORK_LOG.md) 2026-06-22/23 entries)
+
+**Closed status**: Closed 2026-06-22 (Phase 1-4) + 2026-06-23 (Phase 6) on branch `fix/context-regression-integration`. 1234/1234 full test suite pass.
+
+Four independent "compression" paths were dropping context at low usage. Each was gated on a single headroom signal (`preSelectionTokenEstimate < 70% maxTokens`, env-overridable):
+
+- **Phase 1** (`session_cd42cb65`, 11 turns): `selectRecentEvents` used fixed `recentTurnLimit=4` + `recentEventLimit=300`; the 300-event cap collapsed the window to 1/11 turns. Fix: relax both to Infinity under headroom.
+- **Phase 2** (`session_75d74b74`, 5 turns): `microcompact` unconditionally summarized tool_results > 4000 chars, dropping 39866 tokens across 18 large tool_results. Fix: gate `microcompact`/`snip` char thresholds on the same headroom signal (Infinity under headroom; dedup still runs).
+- **Phase 4** (`session_8d6fc33d`): recovery-boundary slice dropped all history before a `REQUEST_CANCELLED` even at 2-5% usage. Fix: skip the slice under headroom.
+- **Phase 6** (`session_099b26bb` / `session_cf703023` / `session_1891b642`, fat-turn): Phase 1-4 was ineffective because `prepareRuntimeStart` loaded prior events with a hard-coded `listEvents(limit:1000)`. A single deepseek-v4-pro reasoning turn emits 4000+ thinking_delta + 1000+ assistant_delta events, so 1000 events did not cover one turn; prior turns were dropped BEFORE headroom could see them. Diag confirmed `assembleContext` received `inputEvents=1002 preSelEstimate=1025` for a turn whose real history was ~85k tokens. Fix: `getHistoryEventLoadLimit(maxTokens)` scales ~1 event / 20 tokens of budget (852k→42600, cap 50000, env `BABEL_O_HISTORY_EVENT_LOAD_LIMIT`), applied at the per-turn hot path (`prepareRuntimeStart`) and resume paths (`LLMCodingRuntime`, MAX).
+
+Governance rule: the headroom signal is only as good as the event slice it sees. Any new code that truncates the event stream before `assembleContext` must scale with `budget.maxTokens` via `getHistoryEventLoadLimit`, or it will silently re-defeat headroom on fat-turn sessions.
+
+## 中文概述
+
+### 背景
+
+四条独立的"压缩"路径在低用量时丢上下文。Phase 1-4 修了 selectRecentEvents / microcompact / snip / recovery-boundary,但 fat-turn session 仍每轮压缩 —— 根因是 `listEvents(limit:1000)` 在 headroom 之前截断历史。
+
+### 核心做法
+
+同一个 headroom 信号门控四条路径;Phase 6 把 storage 加载上限从硬编码 1000 改为按 budget 缩放(852k→42600,封顶 50000),让 headroom 看到真实历史。
+
+### 当前状态
+
+Closed Reference。新增截断事件流的代码必须用 `getHistoryEventLoadLimit(maxTokens)`,否则会在 fat-turn session 重新击败 headroom。
+
+---
 
 ## Tool-Pair Message Ordering Plan (Phase 5)
 
