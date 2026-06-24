@@ -17,6 +17,7 @@ import {
   flushStorageBridge,
   type StorageBridgeWalOptions,
 } from './storageBridge.js'
+import { runStartupReaper, type ReaperReport } from './startupReaper.js'
 import type { RemoteToolRunner } from '../runtime/remoteRunner.js'
 import type { MemoryProvider } from '../runtime/memoryProvider.js'
 import type { RuntimeContextBroadcaster } from '../runtime/contextBroadcaster.js'
@@ -69,6 +70,14 @@ export type CreateDefaultNexusRuntimeOptions = {
    * Pass a no-op to silence diagnostics in tests that don't care.
    */
   toolRegistryDiagnosticHandler?: ToolRegistryDiagnosticHandler | null
+  /**
+   * Phase 2 of the daemon-graceful-shutdown-and-orphan-reaper plan:
+   * disable the startup orphan reaper. Used by tests that pre-seed
+   * sessions in in-flight phases and by callers that manage boot
+   * themselves. Default is `false` (reaper enabled). The reaper is
+   * non-fatal: a failure is logged and the daemon still starts.
+   */
+  disableStartupReaper?: boolean
 }
 
 export async function createDefaultNexusRuntime(
@@ -223,7 +232,24 @@ export async function createDefaultNexusRuntime(
           )
         })()
 
-  return { runtime, storage, tools, agentScheduler, remoteRunner: options.remoteRunner, behaviorMonitor }
+  // Phase 2 of daemon-graceful-shutdown-and-orphan-reaper-plan.md: run
+  // the startup orphan reaper once after storage is open and before the
+  // server accepts traffic. Non-fatal: a failure is logged and the
+  // returned report captures it; the daemon still starts.
+  let startupReaper: ReaperReport = { reapedSessions: 0, reapedAgentJobs: 0 }
+  if (!options.disableStartupReaper) {
+    startupReaper = await runStartupReaper({ storage, agentScheduler })
+  }
+
+  return {
+    runtime,
+    storage,
+    tools,
+    agentScheduler,
+    remoteRunner: options.remoteRunner,
+    behaviorMonitor,
+    startupReaper,
+  }
 }
 
 /**

@@ -150,7 +150,7 @@ async function syncSessionToEverCore(
   }
 }
 
-const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled'])
+const TERMINAL_PHASES = new Set<SessionPhase>(['completed', 'failed', 'cancelled', 'interrupted'])
 const RESTART_STALE_PHASES = new Set<SessionPhase>(['executing'])
 
 export async function settleStaleExecutingSessionsOnStartup(

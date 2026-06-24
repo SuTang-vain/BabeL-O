@@ -15,9 +15,9 @@ The Nexus daemon ("Nexus owns execution, session is a view") must survive a hard
 
 - `src/nexus/server.ts` registers an `onClose` hook (`server.ts:115-117`) that **only** shuts down `defaultEverCoreRuntimeManager`. There is **no `SIGTERM` / `SIGINT` handler**, no `app.close()` call, and **`storage.close()` is never invoked** on shutdown.
 - `storage.close` is overridden at `createRuntime.ts:169-176` to flush `storageBridge` and dispose tools — but that flush path is **never triggered** because nothing calls `storage.close()` during daemon teardown.
-- `storageBridge` has a genuine WAL: append-on-enqueue (`storageBridge.ts:322-345`), ack-on-flush, replay-on-start (`:407-434`, wired via `configureStorageBridgeWal` at `:152`). On a clean flush this survives; on a hard kill only the already-appended WAL records survive — the in-memory queue is dropped.
+- `storageBridge` has a genuine WAL: append-on-enqueue (`storageBridge.ts:322-345`), ack-on-flush, replay-on-start (`:407-434`). WAL is assembled at `createRuntime.ts:144` (`configureStorageBridgeWal(\`${resolvedStoragePath.path}.wal.jsonl\`, ...)`), and that call internally triggers `replayWal` (`storageBridge.ts:152`) to complete replay-on-start. On a clean flush this survives; on a hard kill only the already-appended WAL records survive — the in-memory queue is dropped.
 - No crash recovery / orphan reaper on startup. `AgentScheduler.loadPersistedJobs` (`AgentScheduler.ts:236`) rehydrates job records but **never transitions stale `running` jobs to `failed`**. Sessions left in `executing` phase by a crashed daemon stay `executing` forever.
-- `/v1/execute` writes events directly to SQLite (`executionStreamLoop.ts:39`); agent-loop path uses in-process `taskSessions` / `taskQueues` Maps as source of truth (`taskSession.ts:21`, `taskQueue.ts:15`) with write-behind — these are lost on death, only mitigated by WAL replay for ops that reached the WAL buffer.
+- `/v1/execute` writes events directly to SQLite via `processRuntimeExecutionEvent` — the actual `storage.appendEvent` call lives at `executionEventProcessing.ts:35` (and `:41` for the cache-health companion event), invoked from the runtime generator loop at `executionStreamLoop.ts:39`; agent-loop path uses in-process `taskSessions` / `taskQueues` Maps as source of truth (`taskSession.ts:21`, `taskQueue.ts:15`, consumed by `agentLoop.ts:28` and peers) with write-behind — these are lost on death, only mitigated by WAL replay for ops that reached the WAL buffer.
 
 This means: after a crash or `kill`, a reconnecting client sees a session stuck in `executing` and agent jobs stuck in `running`, with no automatic recovery.
 
@@ -46,7 +46,7 @@ This also violates the soft-recoverable-timeout principle: a shutdown should be 
 ### Phase 1 — Graceful shutdown wiring
 
 1. In `src/nexus/server.ts`, register `process.on('SIGTERM' | 'SIGINT', shutdown)` where `shutdown`:
-   - Sets a `shuttingDown` flag that causes `/v1/execute` / `/v1/stream` to reject new leases with a `503 SHUTTING_DOWN` (mirrors `EXECUTION_BUSY` envelope shape in `middleware.ts:45-66`).
+   - Sets a `shuttingDown` flag that causes `/v1/execute` / `/v1/stream` to reject new leases with a `503` in the `{ type: 'error', code, message }` envelope shape defined by `registerErrorHandler` in `middleware.ts:45-66`, using a new `SHUTTING_DOWN` code (this code does not exist in the tree today — Phase 1 introduces it; it is not a reuse of an existing literal).
    - Awaits in-flight `ExecutionGate` leases to drain with a bounded grace budget (default 5s, configurable via `RuntimeEnv`), then forces a cancel.
    - Calls `app.close()` (stops accepting new connections, drains WS).
    - Calls `storage.close()` — which already flushes `storageBridge` and disposes tools (`createRuntime.ts:169-176`). Verify the override path actually runs in this flow; if not, re-wire so it does.

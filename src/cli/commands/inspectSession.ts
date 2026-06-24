@@ -666,7 +666,7 @@ function exportSessionResumeStateDirect(
   // but events exist (e.g. events without a sessions row), fall back to a
   // permissive phase so the event-stream derivation still runs.
   const sessionRow = readSessionPhaseRow(sessionId, options)
-  const phase = (sessionRow?.phase ?? 'executing') as 'created' | 'planning' | 'executing' | 'reviewing' | 'waiting_user' | 'waiting_permission' | 'completed' | 'failed' | 'cancelled'
+  const phase = (sessionRow?.phase ?? 'executing') as 'created' | 'planning' | 'executing' | 'reviewing' | 'waiting_user' | 'waiting_permission' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
   return deriveResumableState({
     session: {
       phase,

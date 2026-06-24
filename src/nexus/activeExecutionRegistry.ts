@@ -64,6 +64,26 @@ export class ActiveExecutionRegistry {
     }
   }
 
+  /**
+   * Abort every in-flight execution. Used by the daemon graceful-shutdown
+   * coordinator (Phase 1 of
+   * `docs/nexus/proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md`)
+   * so long-running agent loops stop instead of blocking `app.close()`.
+   *
+   * Returns the count of executions whose abort controller was signalled.
+   * Each aborted execution's route handler finally-block is responsible
+   * for releasing its lease (which removes it from this registry) and
+   * settling the session state.
+   */
+  cancelAll(): number {
+    let cancelled = 0
+    for (const execution of this.activeExecutions.values()) {
+      execution.abortController.abort()
+      cancelled += 1
+    }
+    return cancelled
+  }
+
   clearByAbortController(abortController: AbortController): void {
     for (const [sessionId, execution] of this.activeExecutions.entries()) {
       if (execution.abortController === abortController) {

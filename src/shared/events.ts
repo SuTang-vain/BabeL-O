@@ -263,6 +263,10 @@ export const AgentJobEventSchema = z.object({
     'agent_job_completed',
     'agent_job_failed',
     'agent_job_cancelled',
+    // Phase 2 of docs/nexus/proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md:
+    // reaper emits a dedicated event type so dashboards can distinguish
+    // an orphan-reaped job from a normal failure.
+    'agent_job_orphaned',
   ]),
   jobId: z.string(),
   childSessionId: z.string(),

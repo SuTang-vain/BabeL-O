@@ -61,6 +61,7 @@ type NexusStreamSocket = WebSocketCloseTrackable & {
 import type { NexusMetrics } from './metrics.js'
 import type { ExecutionGate } from './executionGate.js'
 import type { ActiveExecutionRegistry, ActiveExecutionLease } from './activeExecutionRegistry.js'
+import type { ShutdownSignal } from './daemonLifecycle.js'
 
 export type ExecuteStreamRouteDeps = {
   runtime: NexusRuntime
@@ -75,6 +76,8 @@ export type ExecuteStreamRouteDeps = {
   metrics: NexusMetrics
   activeExecutionRegistry: ActiveExecutionRegistry
   behaviorMonitor?: BehaviorMonitor
+  /** Daemon graceful-shutdown flag (Phase 1 of the daemon shutdown plan). */
+  shutdownSignal?: ShutdownSignal
 }
 
 /**
@@ -89,6 +92,18 @@ export function registerExecuteStreamRoute(app: FastifyInstance, deps: ExecuteSt
       if (resolvePermissionResponseMessage(parsedJson)) return
 
       const clientCloseTracker = trackWebSocketClientClose(socket)
+
+      // Daemon graceful shutdown (Phase 1 of daemon shutdown plan): reject
+      // new leases once shutdown has begun, in the canonical error envelope.
+      if (deps.shutdownSignal?.isShuttingDown) {
+        sendJson(socket, {
+          type: 'error',
+          code: 'SHUTTING_DOWN',
+          message: 'Nexus daemon is shutting down. Retry against the next instance.',
+        })
+        clientCloseTracker.cleanup()
+        return
+      }
 
       const releaseExecution = deps.executionGate.tryAcquire()
       if (!releaseExecution) {

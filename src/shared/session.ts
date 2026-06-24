@@ -10,6 +10,18 @@ export type SessionPhase =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  /**
+   * Reaped on startup by the orphan reaper (Phase 2 of
+   * `docs/nexus/proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md`).
+   * A session that was left in an in-flight phase (e.g. `executing`,
+   * `reviewing`, `waiting_user`, `waiting_permission`) by a crashed
+   * daemon is transitioned to `interrupted` so reconnecting clients
+   * see a clean terminal state instead of a frozen in-flight badge.
+   * Treated as terminal by all TERMINAL_SESSION_PHASES / TERMINAL_PHASES
+   * sets — `interrupted` is *not* `failed` because the session was
+   * recoverable, not errored.
+   */
+  | 'interrupted'
 
 export type TaskSessionTerminalReason = {
   category:
