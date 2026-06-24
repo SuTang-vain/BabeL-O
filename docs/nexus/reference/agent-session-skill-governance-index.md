@@ -4,7 +4,7 @@
 > Track: Agent Runtime / Session Collaboration / Skill Product Loop
 > Priority: P1 Watch
 > Source of truth: `docs/nexus/TODO.md`, `docs/nexus/active/TODO_agents.md`, `docs/nexus/active/TODO_runtime.md`, `docs/nexus/active/TODO_tui.md`, `docs/nexus/active/TODO_performance.md`, `docs/nexus/DONE.md`, `docs/nexus/WORK_LOG.md`, `src/nexus/`, `src/runtime/`, `src/skills/`, `src/storage/`, `clients/go-tui/`
-> Related: [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md), [context-and-agent-history.md](../history/context-and-agent-history.md), [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md), [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md), [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [memory-governance-plan.md](./memory-governance-plan.md), [tool-governance-plan.md](./tool-governance-plan.md)
+> Related: [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md), [context-and-agent-history.md](../history/context-and-agent-history.md), [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md), [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md), [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [memory-governance-plan.md](./memory-governance-plan.md), [tool-governance-plan.md](./tool-governance-plan.md)
 
 ## Purpose
 
@@ -27,7 +27,7 @@ The boundary is:
 | [context-and-agent-history.md](../history/context-and-agent-history.md) | Typed SessionChannel and scoped memory architecture. | Use for channel/message/inbox data model, storage/API expectations, and provider-visible inbox boundaries. |
 | [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md) | Session Graph runtime map proposal. | Use for projecting existing session/event/tool/permission/child-session/channel facts into a user-readable graph without creating a second source of truth. |
 | [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md) | TUI relationship visibility over SessionChannel. | Use for footer indicators, session list badges, tree/activity/graph views, and quote/ack UX boundaries. |
-| [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Skill execution and skill generation product loop. | Use for skill schema, registry, validator, explicit skill tools, draft/save confirmation, and diagnostics. |
+| [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Skill execution and skill generation product loop. | Use for skill schema, registry, validator, explicit skill tools, draft/save confirmation, and diagnostics. |
 
 ## Governance Rules
 
@@ -79,7 +79,7 @@ The current implementation already has meaningful slices:
 | Durable run checkpoint/resume | [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md) | P1 Watch. |
 | SessionChannel API/storage/context invariants | [context-and-agent-history.md](../history/context-and-agent-history.md) | Partially landed; keep evidence-first. |
 | TUI relationship visibility polish | [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md) | Draft / UX follow-up. |
-| Explicit skill tools and normalized skill generation | [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Partially landed substrate; product loop open. |
+| Explicit skill tools and normalized skill generation | [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Partially landed substrate; product loop open. |
 
 ## Verification Expectations
 

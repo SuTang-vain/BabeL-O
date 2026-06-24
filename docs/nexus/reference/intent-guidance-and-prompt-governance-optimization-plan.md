@@ -1,16 +1,16 @@
 # Intent Guidance and Prompt Governance Optimization Plan
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Intent Guidance / Prompt Governance / Runtime Policy
-> Priority: P1 Watch
+> Priority: P1 Watch — Graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision. The three governance principles (no accident-specific hardcoded prompts, deterministic Turn Policy ownership, capability/verification split) are enforced through `systemPromptBuilder.ts`, `runtimePipeline.ts`, `intentGuidance.ts`, and the model-context integration; this plan remains the canonical owner of intent guidance regressions.
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_provider_registry.md](../active/TODO_provider_registry.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/intentGuidance.ts`, `src/runtime/systemPromptBuilder.ts`, `src/runtime/runtimePipeline.ts`
-> Governance: Indexed by [prompt-model-governance-index.md](../reference/prompt-model-governance-index.md). This document owns intent guidance regressions; deterministic runtime policy remains authoritative.
+> Governance: Indexed by [prompt-model-governance-index.md](./prompt-model-governance-index.md). This document owns intent guidance regressions; deterministic runtime policy remains authoritative.
 
 Status: proposed.
 
 Primary sample: `session_b2e5660a-2669-4aec-a4a7-73ed65ed1f8e`.
 
-Governance: Indexed by [prompt-model-governance-index.md](../reference/prompt-model-governance-index.md). This document owns intent policy and Turn Policy normalization; model metadata and prompt-architecture references stay in their own documents.
+Governance: Indexed by [prompt-model-governance-index.md](./prompt-model-governance-index.md). This document owns intent policy and Turn Policy normalization; model metadata and prompt-architecture references stay in their own documents.
 
 Related samples / prior governance:
 

@@ -48,7 +48,7 @@ Two divergent orchestration paths mean: a fix to session lifecycle (event append
 
 ### Phase 2 — Long-lived embedded Nexus
 
-1. `EmbeddedNexusClient` builds the app + runtime + storage **once** at construction (or on first use), keeps a reference, and `app.inject`s each request against that single app. `close()` tears it down at CLI exit (fold into the daemon shutdown wiring from [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)).
+1. `EmbeddedNexusClient` builds the app + runtime + storage **once** at construction (or on first use), keeps a reference, and `app.inject`s each request against that single app. `close()` tears it down at CLI exit (fold into the daemon shutdown wiring from [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../reference/daemon-graceful-shutdown-and-orphan-reaper-plan.md)).
 2. Eliminate the per-`injectJson` `createDefaultNexusRuntime` + `createNexusApp` + `app.close()` + `storage.close()` cycle.
 
 ### Phase 3 — Route embedded execution through the app

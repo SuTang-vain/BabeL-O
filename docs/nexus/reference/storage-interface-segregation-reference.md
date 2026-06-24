@@ -5,7 +5,7 @@
 > Priority: P2 — 48-method monolithic interface violates ISP; partial repository extraction left `MemoryStorage` unable to reuse repositories
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/storage/Storage.ts`, `src/storage/SqliteStorage.ts`, `src/storage/MemoryStorage.ts`, `src/storage/EventRepository.ts`, `src/storage/TaskRepository.ts`, `src/storage/AuditRepository.ts`, `src/storage/ToolTraceRepository.ts`, `src/storage/SessionChannelRepository.ts`
 > Governance: Indexed by [README.md](../README.md). Canonical owner of "the storage interface is segregated by domain and repositories are polymorphic across backends." Coupling-debt inventory stays in [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md) (Phase 9 Stream G).
-> Related: [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md)
+> Related: [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)
 
 ## Purpose
 

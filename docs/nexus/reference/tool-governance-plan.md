@@ -5,7 +5,7 @@
 > Priority: P2 unless promoted by a real-session regression or explicit user request
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/tools/`, `src/nexus/agents/`, `src/skills/`
 > Governance: Canonical tool governance entry point, cross-linked from [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) and [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md).
-> Related: [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md), archived source documents in [../archive/](../archive/)
+> Related: [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md), archived source documents in [../archive/](../archive/)
 
 ## Purpose
 

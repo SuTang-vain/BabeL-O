@@ -4,7 +4,7 @@
 > Track: Prompt / Intent / Provider / Model Catalog
 > Priority: P1 Watch
 > Source of truth: `docs/nexus/TODO.md`, `docs/nexus/active/TODO_provider_registry.md`, `docs/nexus/active/TODO_runtime.md`, `docs/nexus/DONE.md`, `docs/nexus/WORK_LOG.md`, `src/runtime/intentGuidance.ts`, `src/runtime/systemPromptBuilder.ts`, `src/runtime/contextAssembler.ts`, `src/providers/registry.ts`, `src/shared/config.ts`, `src/runtime/cacheAwareCompactPolicy.ts`
-> Related: [intent-guidance-and-prompt-governance-optimization-plan.md](../proposals/intent-guidance-and-prompt-governance-optimization-plan.md), [fable-prompt-architecture-reference-governance-plan.md](../proposals/fable-prompt-architecture-reference-governance-plan.md), [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md), [evidence-governance-index.md](./evidence-governance-index.md), [context-governance-index.md](./context-governance-index.md), [memory-governance-plan.md](./memory-governance-plan.md)
+> Related: [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md), [fable-prompt-architecture-reference-governance-plan.md](../proposals/fable-prompt-architecture-reference-governance-plan.md), [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md), [evidence-governance-index.md](./evidence-governance-index.md), [context-governance-index.md](./context-governance-index.md), [memory-governance-plan.md](./memory-governance-plan.md)
 
 ## Purpose
 
@@ -20,7 +20,7 @@ This document is the reader entry point for BabeL-O prompt, intent, and model me
 
 | Document | Role | Reading rule |
 | --- | --- | --- |
-| [intent-guidance-and-prompt-governance-optimization-plan.md](../proposals/intent-guidance-and-prompt-governance-optimization-plan.md) | User intent classification, deterministic policy normalization, structured Turn Policy, and suppression/retry boundaries. | Use when tool visibility, respond-only behavior, capability questions, or current-state verification drift. |
+| [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md) | User intent classification, deterministic policy normalization, structured Turn Policy, and suppression/retry boundaries. | Use when tool visibility, respond-only behavior, capability questions, or current-state verification drift. |
 | [fable-prompt-architecture-reference-governance-plan.md](../proposals/fable-prompt-architecture-reference-governance-plan.md) | Prompt architecture reference extracted from an external Fable/Claude-style prompt, with incompatible product assumptions rejected. | Use as sectioning/design inspiration only; never copy product identity, paths, tool syntax, or accident-specific wording. |
 | [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md) | Provider/model metadata, custom model declarations, context-window semantics, cache-aware compact metadata, and future catalog resolver policy. | Use when model capabilities, context limits, unknown/custom models, or provider diagnostics need a factual source. |
 
@@ -71,7 +71,7 @@ The remaining issue is governance consistency. Prompt work, model metadata work,
 
 | Item | Owner document | Status |
 | --- | --- | --- |
-| Current-state verification vs pure capability question classification | [intent-guidance-and-prompt-governance-optimization-plan.md](../proposals/intent-guidance-and-prompt-governance-optimization-plan.md) | Watch; strengthen only through regressions. |
+| Current-state verification vs pure capability question classification | [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md) | Watch; strengthen only through regressions. |
 | Prompt sectioning and capability contract cleanup | [fable-prompt-architecture-reference-governance-plan.md](../proposals/fable-prompt-architecture-reference-governance-plan.md) | Draft/reference; do not copy source prompt text. |
 | Local custom model metadata | [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md) | Active Plan; prioritize local auditable metadata before remote catalog. |
 | Unknown model context semantics | [model-catalog-and-context-metadata-governance-plan.md](./model-catalog-and-context-metadata-governance-plan.md) | Active Plan; represent unknown as unknown plus conservative fallback. |

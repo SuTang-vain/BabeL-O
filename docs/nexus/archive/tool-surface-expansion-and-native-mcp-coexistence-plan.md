@@ -218,7 +218,7 @@ src/tools/builtin/task/
 - **不**实现"执行 skill body 当作 prompt"这种语义；skill body 仍由 system prompt 注入 + `SkillShow` 显式展开，模型自己决定如何用。
 - 名称沿用 `SkillList` / `SkillShow`，与 Babel-2 `SkillTool` 区分；不新建 `define_skill` / `invoke_skill` / `load_skill` 这种模糊命名。
 - **错误码**：`SKILL_NOT_FOUND` / `SKILL_NAME_REQUIRED` 须在 `src/shared/errors.ts` 登记（**已于 Phase 0 登记**）。
-- **实现状态**：`SkillList` / `SkillShow` **已通过 [Skill 治理规划](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md) Phase 6 落地**（连同 `SkillValidate` / `SkillDraft` / `SkillSave`）。本节不再重开；§3.1.4 的实现部分 = **Closed**。
+- **实现状态**：`SkillList` / `SkillShow` **已通过 [Skill 治理规划](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md) Phase 6 落地**（连同 `SkillValidate` / `SkillDraft` / `SkillSave`）。本节不再重开；§3.1.4 的实现部分 = **Closed**。
 
 #### 3.1.5 `Plan` 工具
 

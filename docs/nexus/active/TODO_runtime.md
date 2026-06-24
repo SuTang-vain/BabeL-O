@@ -446,7 +446,7 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 - Phase 5（Session capture + save）— `src/skills/storage.ts`（8 errorCode + 原子写 + 重复检测）+ `POST /v1/skills/save` + 16 测试
 - Phase 6（Model-visible bounded skill tools）— `src/tools/builtin/skillTool.ts`（SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave）+ 13 测试
 
-**累计 84/84 测试通过；typecheck 0 错误。** 规划路径见 [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)；工具三角关系当前口径见 [reference/tool-governance-plan.md](../reference/tool-governance-plan.md)，历史整合索引见 [archive/tool-governance-reference-integration.md](../archive/tool-governance-reference-integration.md)。**不主动开新项**；后续仅在真实 session 暴露 drift 时按 regression-first 重新开项（per §Phase 7）。
+**累计 84/84 测试通过；typecheck 0 错误。** 规划路径见 [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)；工具三角关系当前口径见 [reference/tool-governance-plan.md](../reference/tool-governance-plan.md)，历史整合索引见 [archive/tool-governance-reference-integration.md](../archive/tool-governance-reference-integration.md)。**不主动开新项**；后续仅在真实 session 暴露 drift 时按 regression-first 重新开项（per §Phase 7）。
 
 ### 治理三角闭环 — 2026-06-16 同步
 
@@ -518,7 +518,7 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 
 ### Phase 2：AskUserQuestion + Skill — Skill 侧已 Closed；AskUserQuestion 0%
 
-- **Skill 侧**（来自 [Skill 治理规划 Phase 6](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)）：5 个 model-visible tool 全 Closed — `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`。
+- **Skill 侧**（来自 [Skill 治理规划 Phase 6](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)）：5 个 model-visible tool 全 Closed — `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`。
 - **AskUserQuestion** 0%：`src/tools/builtin/askUserQuestion.ts` 不存在；CLI 端 `@inquirer/prompts` 通道接入点、Go TUI `AskUserQuestionDialog` 都未做。
 - 依赖：Go TUI 端 `AskUserQuestionDialog` 必须等 [go-tui-history.md](../history/go-tui-history.md) Closed；当前 Phase 0-5c' 推进中，**未**Closed。
 - 实施**前**验证：必须有 session log 中"模型需要澄清问题但被迫写临时文件"的 regression 引用。

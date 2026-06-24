@@ -1,11 +1,11 @@
 # Provider Stream Silent-Hang Abort Propagation Plan
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Runtime / Providers / Nexus
-> Priority: P0 core closed 2026-06-22; P2 Watch only for optional BehaviorMonitor anomaly push
+> Priority: P0 core (Phase 1–6) closed 2026-06-22. Only P2 Watch remains for the optional BehaviorMonitor `activeAgeMs` anomaly detector. Graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision.
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/executionPreparation.ts`, `src/nexus/executeStreamRoute.ts`, `src/nexus/executeHttpRoute.ts`, `src/nexus/executionStreamLoop.ts`, `src/nexus/sessionLifecycle.ts`, `src/runtime/pipeline/providerTurn.ts`, `src/runtime/LLMCodingRuntime.ts`, `src/providers/adapters/OpenAIAdapter.ts`, `src/providers/adapters/sse.ts`, `src/runtime/toolExecutor.ts`, `src/nexus/metrics.ts`, `clients/go-tui/internal/tui/{api.go,stream.go,tui.go}`
-> Governance: Indexed by [README.md](../README.md). Canonical owner of "provider/runtime streams must actively respond to abort and must not leave Go TUI in a false running state". Soft-recoverable-timeout semantics stay in [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md); coupling gates stay in [layer-direction-audit-enforcement-plan.md](../reference/layer-direction-audit-enforcement-plan.md); startup stale-`executing`-session recovery is implemented in `sessionLifecycle.ts` and remains cross-linked with [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md).
-> Related: [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md), [layer-direction-audit-enforcement-plan.md](../reference/layer-direction-audit-enforcement-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)
+> Governance: Indexed by [README.md](./README.md). Canonical owner of "provider/runtime streams must actively respond to abort and must not leave Go TUI in a false running state". Soft-recoverable-timeout semantics stay in [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md); coupling gates stay in [layer-direction-audit-enforcement-plan.md](./layer-direction-audit-enforcement-plan.md); startup stale-`executing`-session recovery is implemented in `sessionLifecycle.ts` and remains cross-linked with [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md).
+> Related: [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md), [layer-direction-audit-enforcement-plan.md](./layer-direction-audit-enforcement-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)
 
 ## Purpose
 
@@ -70,7 +70,7 @@ The 2026-06-22 follow-up sessions refine the root cause into a layered failure m
 
 ## Non-goals
 
-- Do not change soft-policy semantics — soft never aborts; the watchdog is the safety net. Owned by [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md).
+- Do not change soft-policy semantics — soft never aborts; the watchdog is the safety net. Owned by [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md).
 - Do not change Nexus global `watchdogTimeoutMs` defaults. The Go TUI may send a narrower interactive watchdog explicitly; global API back-compat remains owned by timeout governance.
 - Do not build durable continuation snapshots for stale sessions. Startup recovery only terminalizes old `executing` rows honestly; it does not resume a lost in-process continuation.
 - Do not touch `toolExecutor.ts` — its active-listener pattern is already correct and is the model to copy, not the target to change.
@@ -142,7 +142,7 @@ Regressions: Go TUI tests cover transport-loss settlement and HTTP-status non-se
 
 ## Coupling & Cohesion Requirements
 
-Per [layer-direction-audit-enforcement-plan.md](../reference/layer-direction-audit-enforcement-plan.md) and the canonical-shape invariants in [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md):
+Per [layer-direction-audit-enforcement-plan.md](./layer-direction-audit-enforcement-plan.md) and the canonical-shape invariants in [module-coupling-decoupling-and-re-aggregation-plan.md](./module-coupling-decoupling-and-re-aggregation-plan.md):
 
 | Phase | Files touched | New cross-layer edge? | Gate impact |
 | --- | --- | --- | --- |

@@ -4,8 +4,8 @@
 > Track: Runtime / Evidence
 > Priority: P1 — false-positive scope boundaries on non-JS/Go projects erode trust in the P0 task-scope guardrail
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/taskScope.ts`
-> Governance: Indexed by [README.md](../README.md) and [evidence-governance-index.md](./evidence-governance-index.md). Canonical owner of "how a project root and a bash-target path are inferred for scope-boundary classification." The scope-boundary event model and confirmation flow stay in [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md).
-> Related: [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md), [evidence-governance-index.md](./evidence-governance-index.md), [tool-governance-plan.md](./tool-governance-plan.md)
+> Governance: Indexed by [README.md](../README.md) and [evidence-governance-index.md](./evidence-governance-index.md). Canonical owner of "how a project root and a bash-target path are inferred for scope-boundary classification." The scope-boundary event model and confirmation flow stay in [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md).
+> Related: [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md), [evidence-governance-index.md](./evidence-governance-index.md), [tool-governance-plan.md](./tool-governance-plan.md)
 
 ## Purpose
 
@@ -71,7 +71,7 @@ The scope guardrail's value collapses if it false-positives on common project la
 
 - Current priority lives in [../TODO.md](../TODO.md) and [../active/TODO_runtime.md](../active/TODO_runtime.md).
 - Completed facts move to [../DONE.md](../DONE.md); factual history to [../WORK_LOG.md](../WORK_LOG.md).
-- The scope event model and confirmation flow stay in [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md).
+- The scope event model and confirmation flow stay in [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md).
 
 ## 中文概述
 
