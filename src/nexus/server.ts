@@ -127,13 +127,16 @@ app.addHook('onClose', async () => {
   await defaultEverCoreRuntimeManager.shutdown()
 })
 
-await app.listen({ host, port })
-
 // Phase 1: signal-driven graceful shutdown. SIGTERM/SIGINT → set flag
 // (new leases get 503 SHUTTING_DOWN) → cancelAll in-flight → bounded
 // grace → app.close() (fires onClose → everCore.shutdown) → storage.close()
 // (flushes storageBridge WAL + disposes tools) → exit(0). A second signal
 // forces exit(1).
+//
+// Handlers are registered BEFORE `app.listen` so a SIGTERM that arrives
+// during the bind (rare but possible if the port is in use) is still
+// handled by the Phase 1 coordinator instead of escaping to the
+// unhandled-signal path.
 registerDaemonShutdownHandlers({
   signal: shutdownSignal,
   app,
