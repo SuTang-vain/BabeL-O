@@ -87,7 +87,7 @@ func init() {
 				names := []string{
 					"/help", "/config", "/profile", "/clear", "/exit",
 					"/context", "/compact", "/memory", "/inbox", "/model", "/models", "/tool", "/tools",
-					"/session", "/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
+					"/skill", "/skills", "/session", "/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
 					"/write", "/edit",
 				}
 				m.appendLine("status", "local commands: "+strings.Join(names, ", "))
@@ -263,6 +263,48 @@ func init() {
 					}
 				}
 				return m.fetchInboxWithSession(false)
+			},
+		},
+		{
+			name:     "/skill",
+			aliases:  []string{"/skills"},
+			summary:  "list, show, or validate loaded skills (P3 of skill execution plan)",
+			hasArgs:  true,
+			argHint:  "[list|show <id>|validate <id>]",
+			run: func(m *model, args []string) tea.Cmd {
+				// Skill execution governance plan P3 Layer 4.
+				// Sub-commands:
+				//   /skill list         — GET /v1/skills
+				//   /skill show <id>    — GET /v1/skills/:id
+				//   /skill validate <id> — POST /v1/skills/validate (id mode)
+				// /skill run is intentionally NOT exposed in
+				// this first cut: it requires composer
+				// injection semantics that don't exist in
+				// the Go TUI's slash palette today. See the
+				// modeSkillListOverlay note in tui.go.
+				if len(args) == 0 || args[0] == "list" {
+					m.appendLine("status", "loading shared Nexus skills")
+					return fetchSkillList(m.cfg)
+				}
+				switch args[0] {
+				case "show":
+					if len(args) < 2 {
+						m.appendLine("error", "/skill show requires a skill id: /skill show <id>")
+						return nil
+					}
+					m.appendLine("status", "loading skill: "+args[1])
+					return fetchSkillShow(m.cfg, args[1])
+				case "validate":
+					if len(args) < 2 {
+						m.appendLine("error", "/skill validate requires a skill id: /skill validate <id>")
+						return nil
+					}
+					m.appendLine("status", "validating skill: "+args[1])
+					return fetchSkillValidate(m.cfg, args[1])
+				default:
+					m.appendLine("error", "unknown /skill sub-command: "+args[0]+" (supported: list, show <id>, validate <id>)")
+					return nil
+				}
 			},
 		},
 		{
