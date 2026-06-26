@@ -224,6 +224,21 @@ export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): bool
   return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
 
+export function getIntentCategory(guidance: UserIntentGuidance): IntentCategory {
+  return deriveIntentCategory(normalizeGuidancePolicy(guidance))
+}
+
+export function getToolSuppressionReason(guidance: UserIntentGuidance): string | undefined {
+  const normalized = normalizeGuidancePolicy(guidance)
+  if (!shouldSuppressToolsForIntent(normalized)) return undefined
+  if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return 'respond_only_capability_question'
+  if (normalized.intent === 'pause') return 'pause'
+  if (normalized.intent === 'greeting') return 'greeting'
+  if (normalized.actionHint === 'respond_only') return `intent:${normalized.intent}:respond_only`
+  if (!normalized.requiresTools) return `intent:${normalized.intent}:tools_not_required`
+  return 'respond_only'
+}
+
 export function deriveFallbackUserIntentGuidance(options: {
   events: NexusEvent[]
   latestPrompt: string
@@ -694,16 +709,20 @@ export function isCurrentStateVerificationRequest(text: string): boolean {
   if (isMemoryAvailabilityCheckRequest(text)) return true
 
   const normalized = text.trim().toLowerCase()
-  const hasDomainCue = /\b(runtime|provider|model|tool|config|configuration|session|workspace|git|test|tests|build|mcp|remote runner|service)\b/iu.test(normalized) ||
-    /(运行时|provider|模型|工具|配置|会话|session|工作区|workspace|git|未提交|改动|测试|构建|mcp|远程 runner|服务)/u.test(text)
+  const hasExplicitPath = extractAbsolutePaths(text).length > 0
+  const hasDomainCue = hasExplicitPath ||
+    /\b(runtime|provider|model|tool|config|configuration|session|workspace|git|test|tests|build|mcp|remote runner|service|source|code|implementation|architecture|document|docs?)\b/iu.test(normalized) ||
+    /\b[a-z][\w-]*(?:_[\w-]+)+\b/iu.test(normalized) ||
+    /(运行时|provider|模型|工具|配置|会话|session|工作区|workspace|git|未提交|改动|测试|构建|mcp|远程 runner|服务|源码|源文件|代码|实现|架构|文档|内核)/u.test(text)
   if (!hasDomainCue) return false
 
   const hasActionCue = /\b(run|execute|test|verify|inspect|check|diagnose|status)\b/iu.test(normalized) ||
-    /(执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断)/u.test(text)
+    /(执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断|解释|说明|分析|核对)/u.test(text)
   const hasCurrentStateCue = /\b(current|now|this|latest|active|available|enabled|supported|working|healthy|status|recorded|passing|up to date)\b/iu.test(normalized) ||
-    /(当前|现在|这个|本次|本轮|最新|可用|启用|支持|生效|状态|记录|是否正常|通过|健康|最新)/u.test(text)
+    /(当前|目前|现在|这个|这部分|本次|本轮|最新|可用|启用|支持|生效|状态|记录|是否正常|通过|健康|最新)/u.test(text)
+  const hasVerificationQuestionCue = /(?:\?|？|吗|是不是|是否|不就是|就是.*吗|对吗|问题.*在于|核心问题)/u.test(text)
 
-  return hasActionCue && hasCurrentStateCue
+  return (hasActionCue && hasCurrentStateCue) || (hasCurrentStateCue && hasVerificationQuestionCue)
 }
 
 export function isMemoryAvailabilityCheckRequest(text: string): boolean {

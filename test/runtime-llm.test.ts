@@ -733,6 +733,9 @@ describe('User intent fallback guidance', () => {
       '查看当前配置是否生效',
       '检查当前 provider 是否支持 tool call',
       '验证这个 session 是否记录了事件',
+      '`workspace_dirty_detected` push 模型解释一下这部分',
+      '这个不就是源码吗/Users/tangyaoyue/DEV/Baidu/Baidu/钢架雪车/index.html',
+      '所以目前的核心问题在于，文档说明不足、内核耦合性问题？',
     ]
 
     for (const latestPrompt of prompts) {
@@ -1477,6 +1480,75 @@ describe('LLMCodingRuntime', () => {
     const toolNames = body.tools.map((tool: any) => tool.name)
     assert.deepEqual(toolNames, ['Bash'])
     assert.match(JSON.stringify(body.system), /Requires tools: yes/)
+  })
+
+  test('normalizes model respond-only drift for current-state explanation and source verification prompts', async () => {
+    const prompts = [
+      '`workspace_dirty_detected` push 模型解释一下这部分',
+      '这个不就是源码吗/Users/tangyaoyue/DEV/Baidu/Baidu/钢架雪车/index.html',
+    ]
+
+    for (const prompt of prompts) {
+      fetchCalls = []
+      globalThis.fetch = async (url, init) => {
+        const body = parseRequestBody(init)
+        if (isIntakeRequestBody(body)) {
+          return {
+            ok: true,
+            status: 200,
+            body: createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Incorrect respond-only fixture.\\",\\"explicitPaths\\":[]}"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+            text: async () => 'mock drifted intake response',
+          } as Response
+        }
+        fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"我会先用当前证据核对。"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock provider response text',
+        } as Response
+      }
+
+      const runtime = new LLMCodingRuntime(
+        toolsRegistry,
+        allowlistedTools(['Read', 'Grep']),
+        null as any,
+        configManager,
+      )
+      const events = await collectEvents(
+        runtime.executeStream({
+          sessionId: `test-current-state-intake-drift-${prompts.indexOf(prompt)}`,
+          prompt,
+          cwd: tmpdir(),
+        }),
+      )
+
+      const intake = events.find(event => event.type === 'user_intake_guidance') as any
+      assert.ok(intake)
+      assert.equal(intake.actionHint, 'normal')
+      assert.equal(intake.requiresTools, true)
+      assert.ok(!events.some(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT'))
+
+      assert.equal(fetchCalls.length, 1)
+      const body = JSON.parse(String(fetchCalls[0].init?.body))
+      assert.deepEqual(body.tools.map((tool: any) => tool.name).sort(), ['Grep', 'Read'])
+      assert.match(JSON.stringify(body.system), /Intent category: availability_check/)
+      assert.match(JSON.stringify(body.system), /Requires tools: yes/)
+    }
   })
 
   test('only exposes policy-allowed tools to provider requests under strict policy', async () => {
@@ -2733,6 +2805,8 @@ describe('LLMCodingRuntime', () => {
     const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
     assert.ok(suppressionError)
     assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+    assert.equal(suppressionError.details.intentCategory, 'general')
+    assert.equal(suppressionError.details.suppressionReason, 'greeting')
     assert.equal(suppressionError.details.retryAttempted, true)
 
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
