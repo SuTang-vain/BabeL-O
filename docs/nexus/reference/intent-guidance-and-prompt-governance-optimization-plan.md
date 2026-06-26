@@ -3,6 +3,7 @@
 > State: Active Plan
 > Track: Intent Guidance / Prompt Governance / Runtime Policy
 > Priority: P1 Watch — Graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision. The three governance principles (no accident-specific hardcoded prompts, deterministic Turn Policy ownership, capability/verification split) are enforced through `systemPromptBuilder.ts`, `runtimePipeline.ts`, `intentGuidance.ts`, and the model-context integration; this plan remains the canonical owner of intent guidance regressions.
+> 2026-06-26 source verification — `session_b7f64aa1-b173-4759-a0f1-29a5123e0029` and `session_9b1c212c-25a3-4e8b-9714-8e01ee8fba39` independently reproduce the P0-2 / P1-2 / P1-3 bugs on GoTUI-style / WEB project scaffolds (not memory-capability). The intake classifier treats "user asks for tool-backed verification of current state / explanation of how the model works / confirmation that a file is source" as `actionHint=respond_only, requiresTools=false`. See "Primary sample (additional reproduction)" below.
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_provider_registry.md](../active/TODO_provider_registry.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/intentGuidance.ts`, `src/runtime/systemPromptBuilder.ts`, `src/runtime/runtimePipeline.ts`
 > Governance: Indexed by [prompt-model-governance-index.md](./prompt-model-governance-index.md). This document owns intent guidance regressions; deterministic runtime policy remains authoritative.
 
@@ -17,6 +18,21 @@ Related samples / prior governance:
 - `session_315814e7-3b82-4a31-8601-a5b383288e9c`: session replay、Read evidence coverage、intent target 与 self-diagnosis 治理。
 - `docs/nexus/reference/session-replay-and-evidence-governance-plan.md`: 已明确 Phase E/G 方向：provider-visible intent routing 使用结构化 `Turn Policy` 字段，不再注入事故特定中文 guidance / Instruction block。
 - `docs/nexus/reference/memory-capability-awareness-and-trigger-plan.md`: memory capability block、memory_search / memory_save_note / memory_flush_session 边界。
+
+Primary sample (additional reproduction, 2026-06-26):
+
+- `session_b7f64aa1-b173-4759-a0f1-29a5123e0029` (346 events, 6 turns over 21h, **final phase=`failed`** by `PROVIDER_ERROR minimax 504 timeout`):
+  - **Turn 4** (event 293/296): user says *"所以目前的核心问题在于，文档说明不足、内核耦合性问题？"* (加问号 = 当前状态验证追问) → intake `intent=continue, actionHint=respond_only, requiresTools=false`. Model emits `assistant_delta: "让我直接读取相关代码确认细节："` (event 322) and attempts `Read` → blocked at event 325 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` with `attemptedTools=["Read"]`.
+  - **Turn 5** (event 311/314): user says *"`workspace_dirty_detected` push 模型解释一下这部分"* (要求解释 push 模型 = 需要 Read 源码) → intake `actionHint=normal, requiresTools=false`. Same pattern.
+  - **Turn 6** (event 331/334): user says *"继续任务"* → intake `requiresTools=true` ✅ (终于能跑工具), but provider 504 timeout 123.67s → session fails.
+  - Reproduces P0-2 (intake hard normalize), P1-1 (action/analysis 分类), P1-2 (memory capability special-case is one instance; the bug generalizes to "explain this part of the model" → also wrongly respond_only).
+- `session_9b1c212c-25a3-4e8b-9714-8e01ee8fba39` (independent reproduction, 339 events, completed):
+  - **Turn 3** (event 94/106): user says *"这个不就是源码吗/Users/tangyaoyue/DEV/Baidu/Baidu/钢架雪车/index.html"* (质问 + 当前状态验证) → intake `intent=new_focus, actionHint=respond_only, requiresTools=false`. Model emits `assistant_delta: "明白，我刚才判断错了——这就是源文件（Vite 产出的单页应用...）我重新看一下数据结构..."` (event 103) and attempts `Grep` → blocked at event 106 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` with `attemptedTools=["Grep"]`.
+  - Same P0-2 / P1-3 root cause: `requiresTools=false` is hard-normalized for any "ask about how something works / is structured / verify a claim" question.
+
+These two sessions are the first P0-2/P1-2 reproductions **outside the memory-capability vertical** — they prove the bug is **not specific to memory capability special-case** but is in the general `normalizeGuidancePolicy()` path. Plan §3 "区分能力问答和当前状态验证" must generalize from "memory capability" to "any capability / state verification"; P0-3 `shouldSuppressToolsForIntent` and P1-2 memory capability block follow the same shape bug.
+
+Independent observation (cross-cutting, not intake bug): `session_b7f64aa1` event 325 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT.details.latestUserText` reads *"`workspace_dirty_detected` push 模型解释一下这部分"* — but the suppression event itself fires at 02:20:47.096Z during **Turn 4 response** (after Turn 4 user_text at 02:19:17 and before Turn 5 user_text at 02:20:37). `latestUserText` appears to read a **stale or wrong turn's user_text**. This is a separate event-payload bug in `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` emission, not an intake classification bug; flagging it for follow-up but **not** in scope for the P0-2 / P1-2 fix.
 
 ## 背景
 
