@@ -129,9 +129,15 @@ test('timeout env var is respected when present', async () => {
     const handle = startEverOSBackgroundBootstrap({
       env,
       runner: async (command: string) => {
-        // never-resolving runner: forces the worker to hit the
-        // timeout.
-        if (command === 'git') return new Promise(() => {})
+        // Keep the event loop alive long enough for the (unref'd)
+        // timeout to fire. A bare `new Promise(() => {})` leaves no
+        // pending work, so on Node 22 node:test cancels the test
+        // ("event loop already resolved") before the 50ms timeout can
+        // fire. Resolving after a delay > timeout keeps the loop alive;
+        // the 50ms timeout still wins Promise.race and settles
+        // handle.promise with the timeout error. See
+        // src/runtime/everosBackgroundBootstrap.ts (timeoutHandle.unref()).
+        if (command === 'git') return new Promise(resolve => setTimeout(() => resolve({ code: 0, stdout: '', stderr: '' }), 500))
         return { code: 0, stdout: '', stderr: '' }
       },
       assumeYes: true,

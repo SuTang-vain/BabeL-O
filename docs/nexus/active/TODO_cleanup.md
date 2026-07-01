@@ -50,6 +50,8 @@ Check-only format/lint、GitHub Actions workflow 与 coverage report 已接入�
 
 Machine-readable source: `test/quarantine.json`. Listing command: `npm run test:quarantine`. Opt-in run command: `npm run test:quarantine -- --run`.
 
+**Resolved 2026-07-01 (fixed, not quarantined):** `test/everos-background-bootstrap.test.ts` — "timeout env var is respected when present" plus 5 siblings cancelled via `cancelledByParent` on Node 22 (local `npm test` exit 1), passing on Node 24 (CI). Root cause: `startEverOSBackgroundBootstrap` correctly `.unref()`s its timeout timer (production-correct — must not keep the process alive), but the test's mock runner returned a bare `new Promise(() => {})` with no pending I/O, so Node 22's `node:test` saw an empty event loop and cancelled before the 50ms timeout could fire. Fix: mock runner now resolves after 500ms (keeps the loop alive); the 50ms timeout still wins `Promise.race` and settles `handle.promise` with the timeout error. Local `npm test` now exit 0 (1246/1246). No quarantine entry — coverage retained.
+
 ## P1 Module Coupling Governance
 
 > Canonical plan: [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md).
