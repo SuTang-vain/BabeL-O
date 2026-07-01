@@ -3668,6 +3668,7 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
     },
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     providerSettings: {
       providerId: 'openai',
       modelId: 'openai/gpt-4o',
@@ -3707,8 +3708,9 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(configured.status.sidecar?.dataDir, dataDir)
   assert.equal(configured.status.sidecar?.pid, 12345)
   assert.equal(spawnCalls[0]?.command, 'everos-test')
-  assert.deepEqual(spawnCalls[0]?.args, ['server', 'start', '--host', '127.0.0.1', '--port', '9876'])
+  assert.deepEqual(spawnCalls[0]?.args, ['server', 'start', '--root', dataDir, '--host', '127.0.0.1', '--port', '9876'])
   assert.equal(spawnCalls[0]?.env.EVEROS_MEMORY__ROOT, dataDir)
+  assert.equal(spawnCalls[0]?.env.EVEROS_ROOT, dataDir)
   assert.equal(spawnCalls[0]?.env.EVEROS_API__HOST, '127.0.0.1')
   assert.equal(spawnCalls[0]?.env.EVEROS_API__PORT, '9876')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__PROTOCOL, 'openai-compatible')
@@ -3732,6 +3734,7 @@ test('EverCore managed mode writes registry and reuses healthy sidecar', async (
     managedPortAllocator: async () => 9911,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedSpawn(command) {
       spawnCalls.push(command)
       return {
@@ -3808,6 +3811,7 @@ test('EverCore managed mode treats stale registry as diagnostics and starts a fr
     managedPortAllocator: async () => 9913,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedSpawn(_command, _args, options) {
       spawnPorts.push(String(options.env.EVEROS_API__PORT))
       return {
@@ -3849,6 +3853,7 @@ test('EverCore managed mode auto-maps Anthropic-compatible provider settings', a
     managedPort: 9877,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     providerSettings: {
       providerId: 'minimax',
       modelId: 'minimax/MiniMax-M3',
@@ -3887,6 +3892,7 @@ test('EverCore managed mode uses explicit LLM override for sidecar env', async (
     managedPort: 9878,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedLlmProtocol: 'openai-compatible',
     managedLlmApiKey: 'evercore-key',
     managedLlmBaseUrl: 'https://openai-compatible.example/v1',
@@ -3941,6 +3947,77 @@ test('EverCore managed mode rejects non-loopback hosts without starting sidecar'
   assert.equal(configured.status.healthy, false)
   assert.equal(configured.status.errorCode, 'EVERCORE_MANAGED_HOST_NOT_LOCAL')
   assert.equal(configured.status.sidecar?.healthy, false)
+})
+
+test('EverCore managed mode classifies sidecar stderr into typed lastStartupError', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-cascade`)
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9890,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
+    managedSpawn() {
+      const dataListeners: Array<(chunk: Buffer) => void> = []
+      return {
+        pid: 77000,
+        killed: false,
+        kill() {
+          return true
+        },
+        stderr: {
+          on(_event: string, listener: (chunk: Buffer) => void) {
+            dataListeners.push(listener)
+          },
+        },
+        once(event: string, listener: (...args: unknown[]) => void) {
+          if (event === 'close') {
+            // Emit the embedding-cascade stderr, then exit code=1 — mirroring
+            // the real everos lifespan failure captured on 2026-07-01.
+            setTimeout(() => {
+              for (const l of dataListeners) {
+                l(Buffer.from('ValueError: Embedding model is not configured (set EVEROS_EMBEDDING__MODEL or [embedding] model in user toml)'))
+              }
+              listener(1, null)
+            }, 0)
+          }
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any
+    },
+    fetch: async () => new Response('', { status: 503 }),
+  })
+
+  assert.equal(configured.status.healthy, false)
+  assert.equal(configured.status.sidecar?.lastStartupError?.errorCode, 'EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED')
+  assert.match(configured.status.sidecar?.lastStartupError?.errorMessage ?? '', /Embedding model is not configured/)
+  await configured.dispose?.()
+})
+
+test('EverCore managed mode reports EVERCORE_MANAGED_INIT_NOT_RUN when everos init fails', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-init-fail`)
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9891,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 1, stderr: 'Error: everos init failed: permission denied' }),
+    managedSpawn() {
+      throw new Error('server start should not run when init fails')
+    },
+    fetch: async () => new Response('', { status: 503 }),
+  })
+
+  assert.equal(configured.status.healthy, false)
+  assert.equal(configured.status.errorCode, 'EVERCORE_MANAGED_INIT_NOT_RUN')
+  assert.equal(configured.status.sidecar?.lastStartupError?.errorCode, 'EVERCORE_MANAGED_INIT_NOT_RUN')
+  assert.match(configured.status.sidecar?.lastStartupError?.errorMessage ?? '', /everos init failed/)
 })
 
 test('EverCore client calls current memory REST routes', async () => {

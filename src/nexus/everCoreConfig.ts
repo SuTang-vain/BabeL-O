@@ -52,6 +52,7 @@ export type EverCoreConfigInput = {
   providerSettings?: ResolvedSettings
   managedSpawn?: EverCoreSidecarOptions['spawn']
   managedPortAllocator?: EverCoreSidecarOptions['portAllocator']
+  managedInitRun?: EverCoreSidecarOptions['initRun']
   fetch?: typeof fetch
 }
 
@@ -185,6 +186,7 @@ export async function configureEverCore(
       fetch: input.fetch,
       spawn: input.managedSpawn,
       portAllocator: input.managedPortAllocator,
+      initRun: input.managedInitRun,
     })
     baseUrl = sidecar.baseUrl
     sidecarStatus = sidecar.status
