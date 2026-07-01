@@ -10,7 +10,6 @@ This directory holds work that is still being shaped, partially implemented, or 
 | Proposal | State | Scope |
 | --- | --- | --- |
 | [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md) | Draft | External prompt architecture reference, without importing incompatible product assumptions. |
-| [evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md](./evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md) | Draft | Managed EverCore sidecar fails to start in documented `bbl memory setup` + `bbl nexus start` flow (cascade: missing LLM passthrough → missing embedding config → missing `everos init`); 3 reporting surfaces misreport "ready" while `memory_search` returns `EVERCORE_MEMORY_UNAVAILABLE`. Repro + LLM passthrough fix + cascading error surfacing + reproducible live-validation smoke test. Plan graduates to `reference/` when all 4 Phases close. |
 | [go-runner-plan.md](./go-runner-plan.md) | Partially Landed | Optional Go RemoteToolRunner phases and runner boundaries. |
 | [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md) | Draft | Gradual Markdown rendering upgrade path for Go TUI transcript readability. |
 | [go-tui-session-observability-governance-plan.md](./go-tui-session-observability-governance-plan.md) | Partially Landed | Embedded Nexus persistence and session inspectability gaps for Go TUI. |

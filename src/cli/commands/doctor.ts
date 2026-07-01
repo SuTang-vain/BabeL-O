@@ -46,7 +46,7 @@ export async function inspectDoctorMemory(): Promise<DoctorMemorySection> {
   const section = stateToSection(read.state, read.path)
   // Probe the sidecar's actual health (registry + /health), not just the
   // bootstrap buildStatus — otherwise "ready" is reported while the sidecar
-  // is dead. See proposals/evercore-managed-sidecar-live-validation-and-
+  // is dead. See reference/evercore-managed-sidecar-live-validation-and-
   // config-passthrough-plan.md Phase 4.
   if (section.dataDir) {
     section.sidecar = await probeEverCoreSidecarHealth(section.dataDir)

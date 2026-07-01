@@ -266,7 +266,7 @@ export async function startManagedEverCoreSidecar(
   // config root via --root / EVEROS_ROOT (default ~/.everos) and exits code=1
   // before any LLM/embedding lifespan if everos.toml is missing. `bbl memory
   // setup` builds the binary but never runs `everos init`, so the spawner
-  // self-heals here. See proposals/evercore-managed-sidecar-live-validation-
+  // self-heals here. See reference/evercore-managed-sidecar-live-validation-
   // and-config-passthrough-plan.md.
   const everosTomlPath = join(dataDir, 'everos.toml')
   if (!existsSync(everosTomlPath)) {

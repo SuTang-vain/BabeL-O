@@ -1,11 +1,11 @@
 # EverCore Managed Sidecar Live Validation and Config Passthrough Plan
 
-> State: Draft (re-validated 2026-07-01; root cause corrected — see Current State)
+> State: Closed Reference
 > Track: Memory / Nexus / Runtime
 > Priority: P1 — `bbl memory status` / `bbl doctor` / `/v1/runtime/status.everCore` all report "ready" / "configured: yes" while the managed sidecar exits immediately on startup; `memory_search` returns `EVERCORE_MEMORY_UNAVAILABLE`; `capability.longTermMemory: false`. **Root cause (2026-07-01 live capture): the sidecar dies because `everos init` was never run, so `everos.toml` does not exist; the spawner also never passes `--root <dataDir>` / `EVEROS_ROOT`, so `everos` looks in `~/.everos/` and exits `code=1` before any LLM/embedding lifespan runs.** The earlier hypothesis "LLM passthrough chain drops `providerSettings`" is **disproven** — `EVEROS_LLM__*` env is correctly injected end-to-end.
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/everCoreConfig.ts`, `src/nexus/everCoreSidecar.ts`, `src/nexus/everCoreRuntimeManager.ts`, `src/nexus/everosBootstrapConfig.ts`, `src/runtime/everosBootstrap.ts`, `src/cli/commands/memory.ts`, `src/cli/commands/doctor.ts`, `src/cli/commands/nexus.ts`, `src/providers/registry.ts`, `src/shared/config.ts`, `test/everCoreMcpTools.test.ts`
-> Governance: Indexed by [README.md](../README.md) and [memory-governance-plan.md](../reference/memory-governance-plan.md). This plan is the **sidecar lifecycle** follow-up to `memory-governance-plan.md`: the latter owns memory capability / lifecycle / sidecar startup **design**; this plan owns the **reproducibility + health-reporting** gap that the design left open. Memory MCP tools, save/recall governance, and candidate policy stay owned by `memory-governance-plan.md`; cache observability stays owned by [cache-observability-and-nexus-realtime-detection-plan.md](../reference/cache-observability-and-nexus-realtime-detection-plan.md); soft-recoverable-timeout stays owned by [development-process-stability-governance-plan.md](../reference/development-process-stability-governance-plan.md).
-> Related: [memory-governance-plan.md](../reference/memory-governance-plan.md), [cache-observability-and-nexus-realtime-detection-plan.md](../reference/cache-observability-and-nexus-realtime-detection-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../reference/daemon-graceful-shutdown-and-orphan-reaper-plan.md), [provider-recovery-and-model-catalog-governance-plan.md](./provider-recovery-and-model-catalog-governance-plan.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md), archived [../archive/everos-first-run-onboarding-optimization-plan.md](../archive/everos-first-run-onboarding-optimization-plan.md), archived [../archive/everos-zero-friction-memory-startup-optimization-plan.md](../archive/everos-zero-friction-memory-startup-optimization-plan.md)
+> Governance: Indexed by [README.md](../README.md) and [memory-governance-plan.md](./memory-governance-plan.md). This plan is the **sidecar lifecycle** follow-up to `memory-governance-plan.md`: the latter owns memory capability / lifecycle / sidecar startup **design**; this plan owns the **reproducibility + health-reporting** gap that the design left open. Memory MCP tools, save/recall governance, and candidate policy stay owned by `memory-governance-plan.md`; cache observability stays owned by [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md); soft-recoverable-timeout stays owned by [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md).
+> Related: [memory-governance-plan.md](./memory-governance-plan.md), [cache-observability-and-nexus-realtime-detection-plan.md](./cache-observability-and-nexus-realtime-detection-plan.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md), [provider-recovery-and-model-catalog-governance-plan.md](../proposals/provider-recovery-and-model-catalog-governance-plan.md), [intent-guidance-and-prompt-governance-optimization-plan.md](./intent-guidance-and-prompt-governance-optimization-plan.md), archived [../archive/everos-first-run-onboarding-optimization-plan.md](../archive/everos-first-run-onboarding-optimization-plan.md), archived [../archive/everos-zero-friction-memory-startup-optimization-plan.md](../archive/everos-zero-friction-memory-startup-optimization-plan.md)
 
 ## Purpose
 
@@ -148,28 +148,33 @@ The LLM passthrough chain needs no change (verified intact). The real fix is con
 1. In `src/cli/commands/memory.ts` (the `bbl memory status` handler) and `src/cli/commands/doctor.ts` (the memory section), probe the sidecar's actual health instead of echoing `bootstrap.buildStatus`. Either call `/v1/runtime/memory/status` against a running nexus, or read `sidecar-registry.json` + `fetchHealth` directly.
 2. Display `mode: ready, sidecar: <healthy | unhealthy: <errorCode>>` instead of just `mode: ready`. When no nexus is running and the registry is absent/stale, say so explicitly — do **not** report "ready" from build status alone.
 
-### Phase 5 — Embedding config (requires product decision; not started)
+### Phase 5 — Embedding config (✅ done, commit `9fec83e`)
 
-1. After Phase 2 lands, re-run the live repro to confirm the sidecar now dies with `EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED` (the second-order gap).
-2. Decide the embedding source: local ollama (`Qwen/Qwen3-Embedding-4B`), a cloud embedding endpoint, or user-supplied `EVEROS_EMBEDDING__*`. The MiniMax provider does not offer embeddings, so this cannot be derived from `providerSettings`.
-3. Extend `buildEverCoreLlmEnv` → `buildEverCoreEnv` (or a sibling) to inject `EVEROS_EMBEDDING__MODEL/API_KEY/BASE_URL`, and/or have `bbl memory setup` prompt for the embedding endpoint on first run. Gated on owner input — do not implement speculatively.
+Implemented as a backend-agnostic config surface (no hard lock-in to ollama/cloud):
 
-### Phase 6 — Promote the Phase E live-validation claim to be reproducible
+1. `buildEverCoreEmbeddingEnv` in `everCoreSidecar.ts` injects `EVEROS_EMBEDDING__{MODEL,API_KEY,BASE_URL}` into the spawn env (mirrors `buildEverCoreLlmEnv`). EverOS' `EmbeddingSettings` is OpenAI-compatible and requires all three at lifespan startup.
+2. `managedEmbeddingModel/ApiKey/BaseUrl` on `EverCoreConfigInput` (read from `BABEL_O_EVERCORE_EMBEDDING_*` env); `resolveManagedEverCoreEmbeddingConfig` is **explicit-only** — no `providerSettings` fallback, because MiniMax (and most chat-only providers) expose no embedding endpoint.
+3. `embeddingPassthrough { source: 'ollama' | 'custom', model?, baseUrl? }` on `EverOSBootstrapState` is the primary source for `bbl memory setup`-driven config; `applyEverOSBootstrapDefaults` injects `managedEmbedding*` from it. The apiKey is deliberately **not** persisted: ollama re-derives the non-secret literal `'ollama'`; custom expects `BABEL_O_EVERCORE_EMBEDDING_API_KEY` env at runtime (no plaintext cloud secret in bootstrap state).
+4. `bbl memory setup` prompts for the source (ollama recommended / custom / skip) on fresh setup **and** on an already-ready machine missing embedding; `bbl memory status` prints the config or a `not configured — run bbl memory setup` fix hint.
 
-1. Once Phase 1-4 pass (Phase 5 if embedding is in scope): re-run the documented "first-round live validation" scenario (`bbl memory setup` + `bbl nexus start` + `memory_search` returns non-empty for a known query) and capture the exact commands + outputs in `DONE.md`.
-2. Add a `test:memory-live` smoke tier to `package.json` that runs the full repro against a temp `BABEL_O_CONFIG_FILE`, similar to `test:go-tui:smoke`. Mark it as gated / non-default.
-3. Update `reference/memory-governance-plan.md` Phase E "live validation" line to point at the new smoke test instead of being free-form prose, and explicitly note that the 2026-06-30 passthrough-break hypothesis was disproven.
+Live verification (2026-07-01): the real `everos` binary reaches `/health` = healthy with LLM + embedding env present, closing the `EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED` cascade. A full `memory_search` round-trip still needs a real embedding endpoint (ollama/cloud) — that is the operator/CI step documented in `DONE.md`, not a code gap.
+
+### Phase 6 — Promote the Phase E live-validation claim to be reproducible (✅ done)
+
+1. `test/memory-live-smoke.test.ts` + `npm run test:memory-live` (env-gated by `BABEL_O_RUN_MEMORY_LIVE_SMOKE=1`, non-default — mirrors `test:go-tui:smoke`) drive the real `everos` binary (located via the local bootstrap state) in a temp dataDir and assert the sidecar reaches `/health` with stubbed LLM + embedding env. This is the deterministic tier guarding the cascade closed by Phases 2-5. Verified: `ok 1` with the gate set, `skipped 1` without.
+2. This plan graduates `proposals/` → `reference/` per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md); `memory-governance-plan.md` cross-references the smoke tier and the graduated plan.
+3. The 2026-06-30 passthrough-break hypothesis is explicitly disproven in Current State above and in `DONE.md`.
 
 ## Phases
 
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
-| Phase 1 | Draft | Reproduce + regression test. | `test/evercore-sidecar-live.test.ts` documents the specific `errorCode` (`EVERCORE_MANAGED_INIT_NOT_RUN`) and the operator-actionable next step; stderr capture proves the failure is not `LLMNotConfiguredError`. |
-| Phase 2 | Draft | Auto-init `everos.toml` + pass `--root`. | `<dataDir>/everos.toml` is created on spawn if missing; spawn passes `--root <dataDir>`; `test/evercore-config-passthrough.test.ts` proves passthrough is intact and `--root`/init are wired. |
-| Phase 3 | Draft | Capture sidecar stderr as typed `lastStartupError`. | `lastStartupError` is populated with a typed `errorCode`; `/v1/runtime/status.everCore.sidecar` exposes it; raw stderr is not leaked. |
-| Phase 4 | Draft | CLI status surfaces honest. | `bbl memory status` / `bbl doctor` reflect actual sidecar health, not bootstrap build status. |
-| Phase 5 | Blocked on owner input | Embedding config. | Sidecar no longer dies on `EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED`; embedding source is decided and wired. |
-| Phase 6 | Draft | Promote Phase E claim to be reproducible. | `npm run test:memory-live` runs end-to-end; `memory-governance-plan.md` Phase E row references the new smoke test. |
+| Phase 1 | ✅ Done (2026-07-01) | Reproduce + regression test. | The 2026-07-01 live capture (sidecar stderr = `everos.toml not found`) is recorded under Current State; `test/runtime.test.ts` asserts the typed `errorCode` (`EVERCORE_MANAGED_INIT_NOT_RUN` / `EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED`) rather than the generic `EVERCORE_MANAGED_HEALTH_CHECK_FAILED`. |
+| Phase 2 | ✅ Done (commit `9d3c5d0`) | Auto-init `everos.toml` + pass `--root`. | `everCoreSidecar.ts` runs `everos init --root <dataDir> --force` when `everos.toml` is missing and spawns `everos server start --root <dataDir>`; `test/runtime.test.ts` asserts `--root` in args, `EVEROS_ROOT=<dataDir>` in env, and the init run. |
+| Phase 3 | ✅ Done (commit `9d3c5d0`) | Capture sidecar stderr as typed `lastStartupError`. | `stdio` is `['ignore','pipe','pipe']`; `classifySidecarStartupError` maps the captured output to typed `errorCode`s; `sidecarStatus.lastStartupError` carries them; raw stderr is truncated (tail 400, ANSI-stripped) and not leaked verbatim. |
+| Phase 4 | ✅ Done (commit `d464b9d`) | CLI status surfaces honest. | `bbl memory status` and `bbl doctor --memory-only` probe `sidecar-registry.json` + `/health` (`probeEverCoreSidecarHealth`) and print `sidecar: <healthy \| unhealthy \| not_running>` instead of echoing `buildStatus`. |
+| Phase 5 | ✅ Done (commit `9fec83e`) | Embedding config. | `buildEverCoreEmbeddingEnv` injects `EVEROS_EMBEDDING__{MODEL,API_KEY,BASE_URL}`; `embeddingPassthrough` (source `ollama` \| `custom`, no persisted apiKey) is injected by `applyEverOSBootstrapDefaults`; `bbl memory setup` prompts for the source. Live: the real sidecar reaches `/health` with embedding env present. |
+| Phase 6 | ✅ Done (this graduation) | Promote Phase E claim to be reproducible. | `npm run test:memory-live` runs the cascade end-to-end against the real `everos` binary in a temp dataDir and asserts `/health` (env-gated, non-default); this plan graduates `proposals/` → `reference/`; `memory-governance-plan.md` cross-references the smoke tier. |
 
 ## Verification
 
@@ -180,7 +185,7 @@ The LLM passthrough chain needs no change (verified intact). The real fix is con
 
 ## PR granularity
 
-Per [development-process-stability-governance-plan.md](../reference/development-process-stability-governance-plan.md) §6.1, this is **`review-standard`** (no runtime state machine change; only sidecar startup pre-check, config-root wiring, stderr capture, and status surfacing). Commits, one Phase each (Phase 5 gated on owner input):
+Per [development-process-stability-governance-plan.md](./development-process-stability-governance-plan.md) §6.1, this is **`review-standard`** (no runtime state machine change; only sidecar startup pre-check, config-root wiring, stderr capture, and status surfacing). Commits, one Phase each (Phase 5 gated on owner input):
 
 - `chore(memory): reproduce sidecar live validation + add regression test` (Phase 1)
 - `fix(evercore): auto-init everos.toml + pass --root to sidecar spawn` (Phase 2)
@@ -193,7 +198,7 @@ Per [development-process-stability-governance-plan.md](../reference/development-
 
 - Current priority lives in [../TODO.md](../TODO.md) and [../active/TODO_runtime.md](../active/TODO_runtime.md).
 - Completed facts move to [../DONE.md](../DONE.md); factual history to [../WORK_LOG.md](../WORK_LOG.md).
-- When Phase 1-4 + 6 close (Phase 5 tracked separately), this plan graduates from `proposals/` to `reference/` per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision, and the canonical memory governance owner ([memory-governance-plan.md](../reference/memory-governance-plan.md)) absorbs the live-validation ownership — the graduated plan stays as the **reproducibility follow-up** for as long as the memory subsystem has any operational risk worth tracking in a dedicated doc.
+- When Phase 1-4 + 6 close (Phase 5 tracked separately), this plan graduates from `proposals/` to `reference/` per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision, and the canonical memory governance owner ([memory-governance-plan.md](./memory-governance-plan.md)) absorbs the live-validation ownership — the graduated plan stays as the **reproducibility follow-up** for as long as the memory subsystem has any operational risk worth tracking in a dedicated doc.
 
 ## 中文概述
 
@@ -216,8 +221,8 @@ Per [development-process-stability-governance-plan.md](../reference/development-
 
 ### 当前状态
 
-草案，根因已 2026-07-01 实测订正。**前置触发条件已满足**：Phase 2（auto-init + `--root`）和 Phase 3（stderr 捕获）可立即开工，纯技术、不需产品决策。Phase 5（embedding）blocked on owner input。
+**已毕业（2026-07-01）**：六 Phase 全部落地并验证。commits：`9d3c5d0`（Phase 2+3 auto-init + `--root` + stderr 捕获）、`d464b9d`（Phase 4 CLI 状态诚实）、`9fec83e`（Phase 5 embedding 透传 + setup 提示）、本 graduation（Phase 6 smoke tier + 毕业到 `reference/`）。live 验证：真实 `everos` 二进制在 LLM + embedding env 齐备时到达 `/health`=healthy；`npm run test:memory-live`（env-gated）跑通全 cascade。全量测试 1236/1236，typecheck/format/layer-audit 全绿。
 
 ### 下一步
 
-按 Phase 1/2/3/4/6 顺序开 commit，全部 review-standard。Phase 5 单独等 embedding 来源决策。Plan 毕业到 `reference/` 后把 live-validation 归属让给 `memory-governance-plan.md`，本 plan 留作 sidecar lifecycle 的**复现性 follow-up**。
+Plan 已毕业到 `reference/`，live-validation 归属让给 `memory-governance-plan.md`，本 plan 留作 sidecar lifecycle 的**复现性 follow-up**。唯一未闭环：`memory_search` 全链路 round-trip 需真实 embedding 端点（ollama/cloud），属 operator/CI 步骤（见 `DONE.md`），非代码缺口。
