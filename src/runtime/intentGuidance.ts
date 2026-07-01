@@ -597,7 +597,7 @@ function countMarkerMatches(text: string, markers: readonly RegExp[]): number {
   return markers.reduce((count, marker) => count + (marker.test(text) ? 1 : 0), 0)
 }
 
-function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
+export function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
   if (isExplicitMemorySavePrompt(guidance.latestUserText)) {
     return {
       ...guidance,
@@ -651,6 +651,18 @@ function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidan
       actionHint: 'respond_only',
     }
   }
+  // Stopgap Fix B (Mode B): continue + normal is self-contradictory with
+  // requiresTools=false. The fallback default for continue is requiresTools=true
+  // (deriveFallbackUserIntentGuidance), and the intake prompt itself instructs
+  // that verify/run/check/test/inspect/modify keep requiresTools=true — so the
+  // only path to this combo is model under-classification. Force tools visible.
+  // requiresTools=true does NOT force a tool call; it only removes suppression
+  // (see providerTurn.ts:163). Scoped to actionHint=normal so prioritize_latest,
+  // pause, greeting, and status-without-tools paths (which set respond_only
+  // above) are unaffected.
+  if (guidance.intent === 'continue' && guidance.actionHint === 'normal') {
+    return { ...guidance, requiresTools: true }
+  }
   return guidance
 }
 
@@ -694,9 +706,27 @@ function isStatusPrompt(text: string): boolean {
   return false
 }
 
+/**
+ * Action-verb cue shared by isPureMemoryCapabilityQuestion (negation) and
+ * isCurrentStateVerificationRequest (affirmative). Single source of truth for
+ * the action-verb family so the two predicates cannot drift. Keep in sync with
+ * the intake classifier prompt guidance (analyze/test/verify/run/check/inspect
+ * -> requiresTools=true) in queryIntakeModel().
+ */
+function hasActionVerbCue(normalized: string, text: string): boolean {
+  return /\b(run|execute|test|verify|inspect|check|diagnose|status)\b/iu.test(normalized) ||
+    /(执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断|解释|说明|分析|核对)/u.test(text)
+}
+
 export function isPureMemoryCapabilityQuestion(text: string): boolean {
   if (isMemoryAvailabilityCheckRequest(text) || isExplicitMemorySavePrompt(text)) return false
   const normalized = text.trim().toLowerCase()
+  // Stopgap Fix A (Mode A): an action verb indicates tool-backed work, not a
+  // pure yes/no capability question. Without this, "能否分析记忆功能" matches the
+  // capability-question regex and is forced respond-only, suppressing the
+  // model's own tool calls. Pure capability questions carry no action verb and
+  // are unaffected (e.g. "你有长期记忆吗").
+  if (hasActionVerbCue(normalized, text)) return false
   return /\b(can you|could you|are you able to|do you have)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
     /\b(memory|remember|long[- ]term memory)\b.*\b(available|enabled|write|save)\b/iu.test(normalized) ||
     /\b(is .*memory.*available|is .*long[- ]term memory.*available)\b/iu.test(normalized) ||
@@ -716,8 +746,7 @@ export function isCurrentStateVerificationRequest(text: string): boolean {
     /(运行时|provider|模型|工具|配置|会话|session|工作区|workspace|git|未提交|改动|测试|构建|mcp|远程 runner|服务|源码|源文件|代码|实现|架构|文档|内核)/u.test(text)
   if (!hasDomainCue) return false
 
-  const hasActionCue = /\b(run|execute|test|verify|inspect|check|diagnose|status)\b/iu.test(normalized) ||
-    /(执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断|解释|说明|分析|核对)/u.test(text)
+  const hasActionCue = hasActionVerbCue(normalized, text)
   const hasCurrentStateCue = /\b(current|now|this|latest|active|available|enabled|supported|working|healthy|status|recorded|passing|up to date)\b/iu.test(normalized) ||
     /(当前|目前|现在|这个|这部分|本次|本轮|最新|可用|启用|支持|生效|状态|记录|是否正常|通过|健康|最新)/u.test(text)
   const hasVerificationQuestionCue = /(?:\?|？|吗|是不是|是否|不就是|就是.*吗|对吗|问题.*在于|核心问题)/u.test(text)
