@@ -57,6 +57,9 @@
     "src/cli/everosBootstrap.ts": [
       "src/runtime/everosBootstrap.ts"
     ],
+    "src/cli/everCoreSidecarHealth.ts": [
+      "src/runtime/everCoreSidecarHealth.ts"
+    ],
     "src/cli/everosFallbackBuild.ts": [
       "src/runtime/everosFallbackBuild.ts"
     ],

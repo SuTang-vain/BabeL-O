@@ -79,6 +79,7 @@ Draft, partially landed, and closed documents should not remain here. Use [../pr
 | Document | State | Role |
 | --- | --- | --- |
 | [memory-governance-plan.md](./memory-governance-plan.md) | Active Plan | Canonical memory governance entry point for authority model, capability exposure, EverCore/EverOS lifecycle, startup UX, and opt-in write boundaries. |
+| [evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md](./evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md) | Closed Reference | Sidecar lifecycle reproducibility follow-up to `memory-governance-plan.md`: the managed `everos` sidecar died on startup (`everos init` never run + `--root` not passed + embedding unconfigured + `stdio:'ignore'` hiding the stderr) while `bbl memory status` / `bbl doctor` misreported "ready". All six phases closed (2026-07-01): auto-init + `--root`, stderr→typed `lastStartupError`, honest CLI health probes, embedding passthrough (`EVEROS_EMBEDDING__*` + `bbl memory setup` prompt), and the `npm run test:memory-live` smoke tier. Promoted from `proposals/` to `reference/`. |
 
 ## Go Client And Distribution
 

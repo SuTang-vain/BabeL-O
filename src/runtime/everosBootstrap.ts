@@ -8,6 +8,7 @@ import {
   readEverOSBootstrapState,
   resetEverOSBootstrapState,
   updateEverOSBootstrapState,
+  type EverOSBootstrapEmbeddingPassthrough,
   type EverOSBootstrapErrorCode,
   type EverOSBootstrapState,
 } from '../shared/everosBootstrapStore.js'
@@ -21,6 +22,10 @@ import {
   buildEverOSSourceWithPip,
   detectPipFallbackAvailability,
 } from './everosFallbackBuild.js'
+import {
+  probeEverCoreSidecarHealth,
+  formatEverCoreSidecarHealthLine,
+} from './everCoreSidecarHealth.js'
 
 export type EverOSSetupOptions = {
   env?: NodeJS.ProcessEnv
@@ -60,6 +65,19 @@ export async function runEverOSMemorySetup(options: EverOSSetupOptions = {}): Pr
   const existing = await readEverOSBootstrapState({ env })
   if (existing.ok && existing.state?.buildStatus === 'ready' && !options.retry) {
     stdout.write(`MemoryOS bootstrap is already ready at ${existing.path}\n`)
+    // Embedding can be added without a rebuild — offer it here so an
+    // already-bootstrapped machine can still enable memory search.
+    if (!existing.state.embeddingPassthrough) {
+      const embeddingPassthrough = await promptEmbeddingPassthrough(options)
+      if (embeddingPassthrough) {
+        const updated = await updateEverOSBootstrapState(current => createEverOSBootstrapState({
+          ...current,
+          embeddingPassthrough,
+        }), { env })
+        stdout.write(`  embedding: ${embeddingPassthrough.source} (${embeddingPassthrough.model ?? '<unset>'})\n`)
+        return { ok: true, skipped: true, state: updated }
+      }
+    }
     return { ok: true, skipped: true, state: existing.state }
   }
 
@@ -126,6 +144,11 @@ export async function runEverOSMemorySetup(options: EverOSSetupOptions = {}): Pr
     return await failBootstrap(env, 'EVEROS_BOOTSTRAP_COMMAND_NOT_FOUND', 'MemoryOS build completed but no local everos executable was found in the virtual environment.')
   }
 
+  // Embedding is required for memory search. Preserve any existing choice
+  // across --retry; otherwise prompt interactively (no-op when non-TTY).
+  const existingEmbedding = existing.ok ? existing.state?.embeddingPassthrough : undefined
+  const embeddingPassthrough = existingEmbedding ?? await promptEmbeddingPassthrough(options)
+
   const ready = await updateEverOSBootstrapState(current => createEverOSBootstrapState({
     ...current,
     optedIn: true,
@@ -138,6 +161,7 @@ export async function runEverOSMemorySetup(options: EverOSSetupOptions = {}): Pr
     managedCommand,
     buildStatus: 'ready',
     fallbackBuildTool: build.tool,
+    embeddingPassthrough,
     lastCheckedAt: new Date().toISOString(),
     lastBuildAt: new Date().toISOString(),
     errorCode: null,
@@ -146,6 +170,11 @@ export async function runEverOSMemorySetup(options: EverOSSetupOptions = {}): Pr
 
   stdout.write(`MemoryOS local memory bootstrap is ready.\n`)
   stdout.write(`  command: ${managedCommand}\n  dataDir: ${dataDir}\n`)
+  if (embeddingPassthrough) {
+    stdout.write(`  embedding: ${embeddingPassthrough.source} (${embeddingPassthrough.model ?? '<unset>'})\n`)
+  } else {
+    stdout.write(`  embedding: not configured — run 'bbl memory setup' to enable memory search.\n`)
+  }
   return { ok: true, state: ready }
 }
 
@@ -196,6 +225,25 @@ export async function formatEverOSMemorySetupStatus(env: NodeJS.ProcessEnv = pro
     ].join('\n')
   }
   const state = read.state
+  // Probe the sidecar's actual health (not just bootstrap buildStatus) so
+  // `bbl memory status` stops reporting "ready" while the sidecar is dead.
+  // See reference/evercore-managed-sidecar-live-validation-and-config-
+  // passthrough-plan.md Phase 4.
+  let sidecarLine: string | undefined
+  if (state.buildStatus === 'ready' && state.dataDir) {
+    const probe = await probeEverCoreSidecarHealth(state.dataDir)
+    sidecarLine = formatEverCoreSidecarHealthLine(probe)
+  }
+  // When bootstrap is ready but embedding was never configured, the sidecar
+  // cannot reach /health (it dies with EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED
+  // before binding the port). Surface a direct fix hint so the operator does
+  // not have to read the sidecar stderr to know the next step.
+  let embeddingLine: string | undefined
+  if (state.embeddingPassthrough) {
+    embeddingLine = formatEmbeddingPassthroughLine(state.embeddingPassthrough)
+  } else if (state.buildStatus === 'ready') {
+    embeddingLine = 'embeddingPassthrough: not configured (run `bbl memory setup` to enable memory search)'
+  }
   return [
     'MemoryOS Bootstrap',
     `path: ${read.path}`,
@@ -206,6 +254,7 @@ export async function formatEverOSMemorySetupStatus(env: NodeJS.ProcessEnv = pro
     state.fallbackBuildTool ? `fallbackBuildTool: ${state.fallbackBuildTool}` : undefined,
     state.mcpToolsEnabled !== undefined ? `mcpToolsEnabled: ${state.mcpToolsEnabled ? 'yes' : 'no'}` : undefined,
     state.llmPassthrough ? formatLLMPassthroughLine(state.llmPassthrough) : undefined,
+    embeddingLine,
     state.externalHintShown ? 'externalHintShown: yes' : undefined,
     state.sourceRepo ? `sourceRepo: ${state.sourceRepo}` : undefined,
     state.sourceRef ? `sourceRef: ${state.sourceRef}` : undefined,
@@ -217,6 +266,7 @@ export async function formatEverOSMemorySetupStatus(env: NodeJS.ProcessEnv = pro
     state.lastBuildAt ? `lastBuildAt: ${state.lastBuildAt}` : undefined,
     state.errorCode ? `errorCode: ${state.errorCode}` : undefined,
     state.errorMessage ? `errorMessage: ${state.errorMessage}` : undefined,
+    sidecarLine,
   ].filter(Boolean).join('\n')
 }
 
@@ -283,6 +333,68 @@ function formatLLMPassthroughLine(passthrough: NonNullable<EverOSBootstrapState[
   if (passthrough.source) parts.push(`source=${passthrough.source}`)
   if (parts.length === 1) return 'llmPassthrough: (none)'
   return parts.join(' ')
+}
+
+function formatEmbeddingPassthroughLine(passthrough: NonNullable<EverOSBootstrapState['embeddingPassthrough']>): string {
+  const parts: string[] = [`embeddingPassthrough:`]
+  parts.push(`source=${passthrough.source}`)
+  if (passthrough.model) parts.push(`model=${passthrough.model}`)
+  if (passthrough.baseUrl) parts.push(`baseUrl=${passthrough.baseUrl}`)
+  // ollama's apiKey is the non-secret literal 'ollama'; custom expects
+  // BABEL_O_EVERCORE_EMBEDDING_API_KEY env (not persisted). Surface which.
+  parts.push(passthrough.source === 'ollama' ? 'apiKey=ollama(builtin)' : 'apiKey=env(BABEL_O_EVERCORE_EMBEDDING_API_KEY)')
+  return parts.join(' ')
+}
+
+const OLLAMA_DEFAULT_BASE_URL = 'http://localhost:11434/v1'
+const OLLAMA_DEFAULT_MODEL = 'bge-m3'
+
+/**
+ * Interactively choose an embedding source for memory search. Returns
+ * undefined when the operator skips or when there is no TTY (non-interactive
+ * shells, CI). The chosen config is persisted as `embeddingPassthrough`;
+ * the apiKey is never stored (ollama re-derives the non-secret literal,
+ * custom expects BABEL_O_EVERCORE_EMBEDDING_API_KEY env at runtime).
+ */
+async function promptEmbeddingPassthrough(
+  options: EverOSSetupOptions,
+): Promise<EverOSBootstrapEmbeddingPassthrough | undefined> {
+  const stdin = options.stdin ?? process.stdin
+  const stdout = options.stdout ?? process.stdout
+  if (!stdin.isTTY || !stdout.isTTY) return undefined
+  const rl = readline.createInterface({ input: stdin, output: stdout })
+  try {
+    stdout.write('\nMemory search needs an OpenAI-compatible embedding endpoint.\n')
+    const choice = await askWithDefault(rl, '  [1] ollama (local, recommended)  [2] custom OpenAI-compatible  [3] skip: ', '3')
+    if (choice === '1') {
+      const model = await askWithDefault(rl, `  embedding model [${OLLAMA_DEFAULT_MODEL}]: `, OLLAMA_DEFAULT_MODEL)
+      const baseUrl = await askWithDefault(rl, `  ollama base url [${OLLAMA_DEFAULT_BASE_URL}]: `, OLLAMA_DEFAULT_BASE_URL)
+      return { source: 'ollama', model: model || OLLAMA_DEFAULT_MODEL, baseUrl: baseUrl || OLLAMA_DEFAULT_BASE_URL }
+    }
+    if (choice === '2') {
+      const model = (await askWithDefault(rl, '  embedding model: ', '')).trim()
+      const baseUrl = (await askWithDefault(rl, '  embedding base url (e.g. https://api.openai.com/v1): ', '')).trim()
+      if (!model || !baseUrl) {
+        stdout.write('  skipped — model and base url are required for a custom embedding endpoint.\n')
+        return undefined
+      }
+      stdout.write('  note: set BABEL_O_EVERCORE_EMBEDDING_API_KEY in your env; the key is not stored in bootstrap state.\n')
+      return { source: 'custom', model, baseUrl }
+    }
+    stdout.write('  skipped — memory search stays unavailable until embedding is configured.\n')
+    return undefined
+  } finally {
+    rl.close()
+  }
+}
+
+async function askWithDefault(rl: readline.Interface, question: string, fallback: string): Promise<string> {
+  return new Promise(resolve => {
+    rl.question(question, answer => {
+      const trimmed = (answer ?? '').trim()
+      resolve(trimmed.length ? trimmed : fallback)
+    })
+  })
 }
 
 function resolveManagedCommand(sourceDir: string): string | undefined {
