@@ -8,7 +8,7 @@ import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
 import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
-import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
+import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
@@ -828,6 +828,101 @@ describe('User intent fallback guidance', () => {
     assert.equal(guidance.actionHint, 'prioritize_latest')
     assert.equal(guidance.problemTarget, 'agent_failure')
     assert.match(formatUserIntentGuidance(guidance), /Stale task mode: background_only/)
+  })
+})
+
+describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
+  // See docs/nexus/proposals/intent-tool-suppression-stopgap-plan.md.
+  // Reproduces session_eafe6bfc Glob/Read suppression — same class as the
+  // source-verified session_b7f64aa1 / session_9b1c212c in the intent-guidance
+  // Active Plan.
+
+  function modelGuidance(overrides: Partial<UserIntentGuidance>): UserIntentGuidance {
+    return {
+      intent: 'continue',
+      confidence: 0.8,
+      continuity: 0.8,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget: 'unknown',
+      reason: 'test',
+      latestUserText: 'continue with the next step',
+      explicitPaths: [],
+      source: 'model',
+      ...overrides,
+    }
+  }
+
+  test('Mode A: isPureMemoryCapabilityQuestion returns false when an action verb is present', () => {
+    // Each prompt matches the capability-question regex (能否/可以/是否 ... 记忆)
+    // AND carries an action verb. Before Fix A these are forced respond-only;
+    // after Fix A the action verb wins.
+    assert.equal(isPureMemoryCapabilityQuestion('能否分析记忆功能的设计'), false)
+    assert.equal(isPureMemoryCapabilityQuestion('可以解释一下记忆模块吗'), false)
+    assert.equal(isPureMemoryCapabilityQuestion('是否支持核对长期记忆的写入'), false)
+
+    // Pure capability questions without action verbs stay respond-only (unchanged).
+    assert.equal(isPureMemoryCapabilityQuestion('你当前能否写入记忆？'), true)
+    assert.equal(isPureMemoryCapabilityQuestion('你有长期记忆吗？'), true)
+    assert.equal(isPureMemoryCapabilityQuestion('长期记忆是否可用'), true)
+  })
+
+  test('Mode A: deriveFallbackUserIntentGuidance keeps analysis-of-memory tool-required', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '能否分析记忆功能的设计',
+      cwd: tmpdir(),
+    })
+    assert.equal(guidance.requiresTools, true)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Mode B: continue + normal forces requiresTools=true so model tool calls are not suppressed', () => {
+    const underclassified = normalizeGuidancePolicy(modelGuidance({
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '继续分析这个方案的可行性',
+      reason: 'Pure analytical discussion, no tool-backed verification requested.',
+    }))
+    assert.equal(underclassified.requiresTools, true)
+    assert.equal(underclassified.actionHint, 'normal')
+    assert.equal(shouldSuppressToolsForIntent(underclassified), false)
+  })
+
+  test('Mode B negative: guard is scoped to intent=continue + actionHint=normal', () => {
+    // prioritize_latest must NOT fire the guard — still suppressible when the
+    // model said requiresTools=false.
+    const prioritizeLatest = normalizeGuidancePolicy(modelGuidance({
+      intent: 'continue',
+      actionHint: 'prioritize_latest',
+      requiresTools: false,
+      latestUserText: 'look at this other path instead',
+    }))
+    assert.equal(prioritizeLatest.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), true)
+
+    // pause normalizes to respond_only before the guard; still suppressed.
+    const pause = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '等一下',
+    }))
+    assert.equal(pause.actionHint, 'respond_only')
+    assert.equal(pause.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(pause), true)
+
+    // status without tools normalizes to respond_only before the guard; not hard-suppressed.
+    const status = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: 'what is the current state',
+    }))
+    assert.equal(status.actionHint, 'respond_only')
+    assert.equal(status.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(status), false)
   })
 })
 
