@@ -138,8 +138,8 @@ export function registerMemoryCommand(program: Command): void {
   memoryCmd
     .command('doctor')
     .description('Print the bbl doctor memory section (alias for `bbl doctor --memory-only`)')
-    .action(() => {
-      console.log(formatDoctorMemory(inspectDoctorMemory()))
+    .action(async () => {
+      console.log(formatDoctorMemory(await inspectDoctorMemory()))
     })
 
   memoryCmd

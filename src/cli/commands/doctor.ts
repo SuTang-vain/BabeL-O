@@ -6,6 +6,10 @@ import {
   type EverOSBootstrapState,
 } from '../../shared/everosBootstrapStore.js'
 import { suggestEverCoreFixAction } from '../everosWelcomeHint.js'
+import {
+  probeEverCoreSidecarHealth,
+  type EverCoreSidecarHealthProbe,
+} from '../everCoreSidecarHealth.js'
 
 export type DoctorMemorySection = {
   configured: boolean
@@ -17,9 +21,10 @@ export type DoctorMemorySection = {
   errorCode?: EverOSBootstrapErrorCode
   fixAction?: string
   autoBootstrapPolicy?: string
+  sidecar?: EverCoreSidecarHealthProbe
 }
 
-export function inspectDoctorMemory(): DoctorMemorySection {
+export async function inspectDoctorMemory(): Promise<DoctorMemorySection> {
   const read = readEverOSBootstrapStateSync()
   if (!read.ok) {
     return {
@@ -38,7 +43,15 @@ export function inspectDoctorMemory(): DoctorMemorySection {
       fixAction: 'Run `bbl memory setup` to enable local long-term memory.',
     }
   }
-  return stateToSection(read.state, read.path)
+  const section = stateToSection(read.state, read.path)
+  // Probe the sidecar's actual health (registry + /health), not just the
+  // bootstrap buildStatus — otherwise "ready" is reported while the sidecar
+  // is dead. See proposals/evercore-managed-sidecar-live-validation-and-
+  // config-passthrough-plan.md Phase 4.
+  if (section.dataDir) {
+    section.sidecar = await probeEverCoreSidecarHealth(section.dataDir)
+  }
+  return section
 }
 
 function stateToSection(state: EverOSBootstrapState, bootstrapPath: string): DoctorMemorySection {
@@ -94,6 +107,16 @@ export function formatDoctorMemory(section: DoctorMemorySection): string {
   if (section.autoBootstrapPolicy) {
     lines.push(`  auto-bootstrap: ${section.autoBootstrapPolicy}`)
   }
+  if (section.sidecar) {
+    const s = section.sidecar
+    const stateLabel = s.state === 'healthy'
+      ? chalk.green(s.state)
+      : s.state === 'not_running'
+        ? chalk.dim(s.state)
+        : chalk.red(s.state)
+    const detail = s.errorCode ? ` ${chalk.red(s.errorCode)}` : ''
+    lines.push(`  sidecar:        ${stateLabel}${detail}`)
+  }
   if (section.errorCode) {
     lines.push(`  error:          ${chalk.red(section.errorCode)}`)
   }
@@ -109,8 +132,8 @@ export function registerDoctorCommand(program: Command): void {
     .command('doctor')
     .description('Self-check the BabeL-O runtime (provider, keychain, ports, memory, …)')
     .option('--memory-only', 'Only print the memory section')
-    .action((options: { memoryOnly?: boolean }) => {
-      const memory = inspectDoctorMemory()
+    .action(async (options: { memoryOnly?: boolean }) => {
+      const memory = await inspectDoctorMemory()
       if (options.memoryOnly) {
         console.log(formatDoctorMemory(memory))
         return

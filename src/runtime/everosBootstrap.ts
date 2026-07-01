@@ -21,6 +21,10 @@ import {
   buildEverOSSourceWithPip,
   detectPipFallbackAvailability,
 } from './everosFallbackBuild.js'
+import {
+  probeEverCoreSidecarHealth,
+  formatEverCoreSidecarHealthLine,
+} from './everCoreSidecarHealth.js'
 
 export type EverOSSetupOptions = {
   env?: NodeJS.ProcessEnv
@@ -196,6 +200,15 @@ export async function formatEverOSMemorySetupStatus(env: NodeJS.ProcessEnv = pro
     ].join('\n')
   }
   const state = read.state
+  // Probe the sidecar's actual health (not just bootstrap buildStatus) so
+  // `bbl memory status` stops reporting "ready" while the sidecar is dead.
+  // See proposals/evercore-managed-sidecar-live-validation-and-config-
+  // passthrough-plan.md Phase 4.
+  let sidecarLine: string | undefined
+  if (state.buildStatus === 'ready' && state.dataDir) {
+    const probe = await probeEverCoreSidecarHealth(state.dataDir)
+    sidecarLine = formatEverCoreSidecarHealthLine(probe)
+  }
   return [
     'MemoryOS Bootstrap',
     `path: ${read.path}`,
@@ -217,6 +230,7 @@ export async function formatEverOSMemorySetupStatus(env: NodeJS.ProcessEnv = pro
     state.lastBuildAt ? `lastBuildAt: ${state.lastBuildAt}` : undefined,
     state.errorCode ? `errorCode: ${state.errorCode}` : undefined,
     state.errorMessage ? `errorMessage: ${state.errorMessage}` : undefined,
+    sidecarLine,
   ].filter(Boolean).join('\n')
 }
 
