@@ -6,6 +6,7 @@
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md), `src/runtime/intentGuidance.ts`, `src/runtime/pipeline/providerTurn.ts`, `test/`
 > Governance: Scoped PR-sized stopgap for [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md); that Active Plan remains the canonical owner of intent guidance regressions. This proposal must not introduce accident-specific hardcoded prompts or weaken over-tooling protection.
 > Related: [context-cwd-drift-and-recall-governance-plan.md](../reference/context-cwd-drift-and-recall-governance-plan.md)
+> 2026-07-01 implementation — Fix A + Fix B landed in commit `5b8bf53` on branch `fix/intent-tool-suppression-stopgap`. TDD: 4 new tests in `test/runtime-llm.test.ts` (3 red before, all green after); full `runtime-llm.test.ts` 83/83 pass; full deterministic suite 0 fail. Deviation from draft: bare `有` kept (see Fix A notes). Graduation (fold into the intent-guidance Active Plan + move to `archive/`) pending review.
 
 ## Goal
 
@@ -83,9 +84,9 @@ export function isPureMemoryCapabilityQuestion(text: string): boolean {
 
 Notes:
 
-- `hasActionVerbCue` reuses the same `执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断|解释|说明|分析|核对` cue set as `isCurrentStateVerificationRequest`. Extract a shared helper to avoid duplication.
-- Drop the bare `有` from the capability-question alternation (keep `有没有`); a single `有` matches almost any Chinese sentence with a later `记忆`.
-- Pure capability questions without action verbs ("你能够使用长期记忆吗") still return `true` and stay respond-only — unchanged.
+- `hasActionVerbCue` reuses the same `执行|运行|跑一下|跑|测试|测一下|实测|验证|检查|查看|查一下|确认|诊断|解释|说明|分析|核对` cue set as `isCurrentStateVerificationRequest`, extracted as a shared helper so the two predicates cannot drift.
+- Keep the bare `有` in the capability-question alternation. The draft suggested dropping it, but TDD showed "你有长期记忆吗？" (a legitimate pure-capability question) relies on `有` + `记忆`; dropping it regresses that case. The action-verb negation alone fixes Mode A — "能否分析记忆功能" returns `false` because `分析` fires the negation, while `有` + `记忆` without an action verb stays `true`.
+- Pure capability questions without action verbs ("你能够使用长期记忆吗", "你有长期记忆吗") still return `true` and stay respond-only — unchanged.
 
 ## Stopgap Fix B — `continue + normal` forces `requiresTools=true`
 
@@ -184,7 +185,7 @@ The "direction 2" fix — change `providerTurn.ts:163` so the *first* tool call 
 
 只做两个确定性止血，不碰 over-tooling 防护：
 
-1. **Fix A（模式 A，约 25%）**：`isPureMemoryCapabilityQuestion()` 命中动作动词（分析 / 测试 / 执行 / 验证 / 解释 / 核对…）时返回 `false`，落地 Active Plan Phase A 未实现的动作 cue 否定，并去掉过宽的裸 `有`。
+1. **Fix A（模式 A，约 25%）**：`isPureMemoryCapabilityQuestion()` 命中动作动词（分析 / 测试 / 执行 / 验证 / 解释 / 核对…）时返回 `false`，落地 Active Plan Phase A 未实现的动作 cue 否定。保留裸 `有`——"你有长期记忆吗" 是合法纯能力问句，去掉会回归。
 2. **Fix B（模式 B，约 70%）**：`normalizeGuidancePolicy()` 对 `intent=continue && actionHint=normal` 强制 `requiresTools=true`。该组合本就自相矛盾（fallback 默认 continue 即 requiresTools=true）；`requiresTools=true` 只解除压制、不强制调工具，模型不需要工具时照常不调。
 
 ### 不做
