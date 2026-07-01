@@ -4,7 +4,7 @@
 > Track: Go TUI / Go Runner / Distribution
 > Priority: P1 Watch
 > Source of truth: `docs/nexus/TODO.md`, `docs/nexus/active/TODO_tui.md`, `docs/nexus/active/TODO_runtime.md`, `docs/nexus/active/TODO_cleanup.md`, `docs/nexus/DONE.md`, `docs/nexus/WORK_LOG.md`, `clients/go-tui/`, `src/cli/commands/go.ts`, `scripts/install.sh`, `scripts/package-portable.mjs`, `docs/releases/`
-> Related: [go-tui-history.md](../history/go-tui-history.md), [go-tui-history.md](../history/go-tui-history.md), [go-tui-session-observability-governance-plan.md](../proposals/go-tui-session-observability-governance-plan.md), [go-tui-history.md](../history/go-tui-history.md), [go-tui-markdown-rendering-optimization-plan.md](../proposals/go-tui-markdown-rendering-optimization-plan.md), [go-tui-history.md](../history/go-tui-history.md), [go-runner-plan.md](../proposals/go-runner-plan.md), [distribution-strategy-plan.md](./distribution-strategy-plan.md), [distribution-guide.md](./distribution-guide.md)
+> Related: [go-tui-history.md](../history/go-tui-history.md), [go-tui-history.md](../history/go-tui-history.md), [go-tui-session-observability-governance-plan.md](../proposals/go-tui-session-observability-governance-plan.md), [go-tui-history.md](../history/go-tui-history.md), [go-tui-markdown-rendering-optimization-plan.md](../proposals/go-tui-markdown-rendering-optimization-plan.md), [go-tui-history.md](../history/go-tui-history.md), [go-runner-plan.md](../proposals/go-runner-plan.md), [distribution-strategy-plan.md](./distribution-strategy-plan.md), [distribution-guide.md](../../guides/distribution-guide.md)
 
 ## Purpose
 
@@ -20,7 +20,7 @@ None of these lines moves provider loops, context assembly, session truth, permi
 
 | Document | Role | Reading rule |
 | --- | --- | --- |
-| [go-tui-history.md](../history/go-tui-history.md) | Long-term Go TUI client boundary and stable opt-in alternative to `bbl chat`. | Use for `bbl go` ownership, TUI protocol boundaries, keyboard/layout/rendering expectations, and why Go TUI must not own runtime truth. |
+| [go-tui-history.md](../history/go-tui-history.md) | Long-term Go TUI client boundary (sole production TUI since v0.3.7, when the TS TUI `bbl chat` was removed). | Use for `bbl go` ownership, TUI protocol boundaries, keyboard/layout/rendering expectations, and why Go TUI must not own runtime truth. |
 | [go-tui-history.md](../history/go-tui-history.md) | Multi-session pane client experience over Nexus sessions/events/health. | Use for `bbl loop`, pane state, focus routing, status projection, and multi-session visualization. |
 | [go-tui-session-observability-governance-plan.md](../proposals/go-tui-session-observability-governance-plan.md) | Session inspectability, embedded Nexus persistence, client/server session-id mapping, and Go TUI replayability. | Use when Go sessions cannot be inspected or reverse-resolved. |
 | [go-tui-history.md](../history/go-tui-history.md) | Go TUI permission panel, soft-deny routing, approval scopes, and feedback/editor UX. | Use for interactive permission routing. Permission policy remains runtime-owned. |
@@ -28,7 +28,7 @@ None of these lines moves provider loops, context assembly, session truth, permi
 | [go-tui-history.md](../history/go-tui-history.md) | Mouse selection highlight and clipboard regression record. | Closed reference for a UI rendering regression. |
 | [go-runner-plan.md](../proposals/go-runner-plan.md) | Optional Go RemoteToolRunner execution backend. | Use for approved-tool execution mechanics, sandbox/process/cancel/output-budget behavior, and defense-in-depth path enforcement. |
 | [distribution-strategy-plan.md](./distribution-strategy-plan.md) | Product distribution strategy across portable packages, npm, Homebrew, and future Go launcher. | Use for channel direction and release asset shape. |
-| [distribution-guide.md](./distribution-guide.md) | Operational release/install/debug guide. | Use for current install commands, release checks, and support procedures. |
+| [distribution-guide.md](../../guides/distribution-guide.md) | Operational release/install/debug guide. | Use for current install commands, release checks, and support procedures. |
 
 ## Governance Rules
 
@@ -64,7 +64,7 @@ If Go TUI needs richer state, add or stabilize Nexus events/API/diagnostics firs
 
 The current Go/distribution line is mixed but directionally stable:
 
-- `bbl go` is a stable opt-in client while TypeScript `bbl chat` remains available.
+- `bbl go` is the sole production TUI as of v0.3.7 (the TypeScript `bbl chat` was removed).
 - `bbl loop` is an active multi-pane client plan with several landed slices.
 - Go TUI permission, session observability, selection highlight, model persistence, timeout, and split-file histories are documented across reference/archive.
 - Go Runner has partially landed read-only/restricted execution backend phases but remains optional.

@@ -41,7 +41,6 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 
 | 文档 | 口径 |
 | --- | --- |
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | 面向外部的 BabeL-O 架构说明：Client、Nexus、Runtime、Framework abstractions、Harness、Observability 与 Loop 的真实代码边界。 |
 | [TODO.md](./TODO.md) | 总控规划、阶段状态、当前优先级和阻塞项。 |
 | [DONE.md](./DONE.md) | 已完成能力索引，把 TODO 中的 `[x]` 历史移出待办清单。 |
 | [WORK_LOG.md](./WORK_LOG.md) | 事实性工作记录、验证命令和重要决策。 |
@@ -53,7 +52,7 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [active/TODO_runtime.md](./active/TODO_runtime.md) | Nexus Runtime、API、storage、context、安全边界、MCP、skills。 |
 | [active/TODO_agents.md](./active/TODO_agents.md) | TaskSession、TaskQueue、Planner/Executor/Critic、sub-agent、worktree。 |
 | [active/TODO_provider_registry.md](./active/TODO_provider_registry.md) | Provider/model registry、角色路由、模型能力矩阵。 |
-| [active/TODO_tui.md](./active/TODO_tui.md) | `bbl chat`、slash palette、权限交互、输入框、状态渲染。 |
+| [active/TODO_tui.md](./active/TODO_tui.md) | `bbl go`、slash palette、权限交互、输入框、状态渲染。 |
 | [active/TODO_performance.md](./active/TODO_performance.md) | 性能、benchmark、日志、指标、storage 查询优化。 |
 | [active/TODO_cleanup.md](./active/TODO_cleanup.md) | 依赖治理、架构边界、历史复杂度隔离、发布工程化。 |
 
@@ -66,7 +65,7 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [history/README.md](./history/README.md) | Closed / Watch-only 实现历史账本。 |
 | [decisions/README.md](./decisions/README.md) | ADR 风格治理决策索引。 |
 | [reference/agent-session-skill-governance-index.md](./reference/agent-session-skill-governance-index.md) | Agent / Session / Skill 治理入口，统一 agent runtime maturity、typed session collaboration、TUI 关系可见化和 skill product loop 边界。 |
-| [context-and-agent-history.md](./history/context-and-agent-history.md) | 上下文规范化、ContextForker 与模型可见 AgentScheduler 架构参考。 |
+| [context-and-agent-history.md](./history/context-and-agent-history.md) | 上下文规范化、ContextForker、模型可见 AgentScheduler，以及 Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。 |
 | [reference/context-governance-index.md](./reference/context-governance-index.md) | Context 治理入口，统一 Context Manager、compact、working set、behavior trace、cache observability、memory 与 tool-loop recovery 的主从关系。 |
 | [reference/evidence-governance-index.md](./reference/evidence-governance-index.md) | Evidence 治理入口，统一 replay safety、Read coverage、task scope、path drift、finalization 与 timeout evidence boundary。 |
 | [reference/prompt-model-governance-index.md](./reference/prompt-model-governance-index.md) | Prompt / Model 治理入口，统一 prompt contract、Turn Policy、intent policy、model metadata、context-window facts 与 no-silent-switching 边界。 |
@@ -75,15 +74,11 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 | [reference/runtime-tool-loop-governance-plan.md](./reference/runtime-tool-loop-governance-plan.md) | Runtime tool-loop 连续性治理：可恢复工具错误、伪工具调用文本、loop budget 和 bounded final check。 |
 | [reference/memory-governance-plan.md](./reference/memory-governance-plan.md) | Memory 治理 canonical 入口：长期记忆非权威边界、EverCore/EverOS lifecycle、启动 UX 与 opt-in 写入。 |
 | [reference/long-running-context-assembly.md](./reference/long-running-context-assembly.md) | 长任务上下文组装 Active Plan：Nexus-owned working set、resume pack、context assembly REST/CLI/WS、R0-R7 全部收口。 |
-| [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md) | Workspace path drift、连续路径失败恢复与最终回答证据降级治理。 |
-| [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md) | Current-turn session finalization 污染修复与 evidence-scope drift 轻量治理样本。 |
-| [context-and-agent-history.md](./history/context-and-agent-history.md) | Session-to-Session typed channel、Scoped Memory 与 Inbox 架构参考。 |
+| [evidence-and-runtime-history.md](./history/evidence-and-runtime-history.md) | Workspace path drift、连续路径失败恢复、最终回答证据降级，以及 current-turn finalization 污染与 evidence-scope drift 治理样本。 |
 | [session-channel-tui-relationship-visibility-plan.md](./proposals/session-channel-tui-relationship-visibility-plan.md) | SessionChannel TUI 关系可见化分层规划：状态栏、badge、tree、activity overlay 与 debug graph。 |
 | [behavior-monitor.md](./reference/behavior-monitor.md) | 行为监控草案；规划 behavior trace、跨 session drift/loop monitor 与用户意图跟随诊断，不替代现有事实源。 |
-| *long-running-context-assembly.md (graduated 2026-06-21)* | *迁到 [reference/long-running-context-assembly.md](./reference/long-running-context-assembly.md) (R0-R7 全部收口,升 Active Plan)。* |
 | [go-runner-plan.md](./proposals/go-runner-plan.md) | 可选 Go `RemoteToolRunner` 执行后端参考；Go 只负责已批准工具的执行 mechanics，不替代 TypeScript Nexus 主体。 |
-| [go-tui-history.md](./history/go-tui-history.md) | `bbl go` / Go TUI 长期实验重写规划；Go 只负责终端交互、布局、键盘路由和事件渲染，不替代 Nexus/runtime/context/AgentScheduler。 |
-| [go-tui-history.md](./history/go-tui-history.md) | Go TUI `--mouse` 文本选区高亮与剪贴板复制优化记录；已用窄范围 ultraviolet cell-buffer highlight 收口“实际选中但视觉未高亮/不覆盖”的问题。 |
+| [go-tui-history.md](./history/go-tui-history.md) | `bbl go` / Go TUI 长期实验重写规划（Go 只负责终端交互、布局、键盘路由和事件渲染，不替代 Nexus/runtime/context/AgentScheduler），含 `--mouse` 文本选区高亮与剪贴板复制优化记录。 |
 
 ### Archive
 
@@ -112,7 +107,7 @@ src/shared     Events, sessions, tasks, errors, IDs and shared schemas
 根目录旧文档已按以下规则合并：
 
 - 旧根目录 `ARCHITECTURE.md` 的架构原则已合并到本 README；当前对外架构说明见
-  [ARCHITECTURE.md](./ARCHITECTURE.md)。
+  [ARCHITECTURE.md](../guides/ARCHITECTURE.md)。
 - `PLAN.md`、`RECOMMENDATIONS.md`、`BabeL-O_优化建议_v1.0.md` 的可执行结论合并到 `TODO.md` 与各主线 TODO。
 - `BabeL-O_vs_BabeL-X_深度分析_v1.0.md` 和 `BabeL-O_调优规划_v1.0.md` 的上下文、prompt、provider、工具容错结论已经体现在 `reference/context-and-subagent-upgrade-plan.md`、`active/TODO_runtime.md`、`active/TODO_provider_registry.md` 和 `WORK_LOG.md`。
 - `BabeL-O_Session_d61f22d0_问题分析.md` 的真实会话结论已经进入 `TODO.md` 与 `WORK_LOG.md`。

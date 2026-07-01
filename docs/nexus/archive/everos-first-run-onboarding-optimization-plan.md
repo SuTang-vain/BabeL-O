@@ -29,7 +29,7 @@ local long-term memory support powered by EverOS / EverCore sidecar.
 
 Related docs:
 
-- [FAQ](../FAQ.md) — user-facing current behavior and expectation setting.
+- [FAQ](../../guides/FAQ.md) — user-facing current behavior and expectation setting.
 - [TODO Product / UX 30-Day Lift](../active/TODO_product_30day.md) — W2.5 product entry.
 - [Memory Capability Awareness and Self-Trigger Plan](./memory-capability-awareness-and-trigger-plan.md) — already-implemented memory capability behavior.
 - [EverCore Lifecycle, Cache and Answer Governance Plan](./evercore-lifecycle-cache-and-answer-governance-plan.md) — already-implemented runtime lifecycle/cache/status/action governance.

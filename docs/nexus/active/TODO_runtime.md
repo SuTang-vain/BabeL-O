@@ -231,7 +231,7 @@ Provider 偏差校准基础已收口：50K JSON schema、10K 中文、长 tool_r
 **守住的边界**：
 - `denyByDefaultTools()` / `allowAllTools()` / `allowlistedTools()` 三个 policy builder 签名未动
 - approval gate 自身完全未动；`permission_request` / `permission_response` / `tool denied` 事件 schema 未改
-- `bbl chat` 与 HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）
+- HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）；旧 TS TUI `bbl chat` 已于 v0.3.7 移除，不再适用
 - child AgentLoop 仍走 server-startup policy，不被 per-request `policy` / `allowedTools` 影响
 - workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截（独立机制）
 - `error.code` 分类口径（`REQUEST_TIMEOUT` / `REQUEST_CANCELLED` / `RUNTIME_AGENT_STEP_ERROR`）未动
@@ -403,7 +403,7 @@ Phase G 后续只保留 focused P2：当前口径见 [memory-governance-plan.md]
 
 Phase B MVP 已收口：`SessionChannel` / `SessionMessage` shared types、MemoryStorage/SQLite persistence、Nexus API create/list/get channel、send/list message、session inbox 与 ack 已落地；`LLMCodingRuntime` 与 `/v1/sessions/:sessionId/context` 会把 unread inbox 注入 bounded non-cacheable `session_inbox` block，并明确标注跨 session 消息是 collaboration context、不是直接用户指令。MVP 仍不实现完整 dreaming、不做 raw transcript sharing、不替代 `AgentScheduler` parent-child lifecycle。
 
-Phase C.1 CLI/TUI 可见化已收口：`NexusClient` 与 embedded client 支持 list/ack session inbox；`bbl sessions inbox <sessionId>` / `bbl sessions ack <sessionId> <messageId>` 提供外部 CLI 入口；`bbl chat` 新增 `/inbox`、`/inbox all`、`/inbox ack <messageId>` slash 入口并在 help/completion 中可发现。展示继续声明跨 session message 只是 collaboration context，需要验证证据后再行动。
+Phase C.1 CLI/TUI 可见化已收口：`NexusClient` 与 embedded client 支持 list/ack session inbox；`bbl sessions inbox <sessionId>` / `bbl sessions ack <sessionId> <messageId>` 提供外部 CLI 入口；`bbl go` 新增 `/inbox`、`/inbox all`、`/inbox ack <messageId>` slash 入口并在 help/completion 中可发现。展示继续声明跨 session message 只是 collaboration context，需要验证证据后再行动。
 
 Phase C.2 AgentScheduler parent-child channel 已收口：`ExploreAgentScheduler` 会为 parent/child session 创建 `parent_child` channel，parent→child 写入 review/validation request，child terminal 时向 parent inbox 写入 handoff/blocked；`agent_job_event` 与 child transcript 查询仍是 lifecycle/source-of-truth。
 

@@ -136,7 +136,7 @@ embedded Nexus 启动时无 `session_go_xxx → sqlite-mapping` 日志写入 `~/
 - ✅ UI `m.sessionID` 在 allocation 完成后立即通过 `sessionIDAllocatedMsg` 更新（Phase 1.2 修复，2026-06-17）。`startStream` 现在用 `tea.Batch` 同时发 `sessionIDAllocatedMsg`（先 m.sessionID 更新）+ `streamStartedMsg`（后 channel wiring），让 `/context` / `/compact` / `/status` 在 allocation 完成后立刻看到新 session id，不再等待 WebSocket dial + 第一个 event。
 - ✅ 7 个 Go focused tests 已落地：`clients/go-tui/internal/tui/stream_phase1_test.go`（TestPhase1_ClientSessionIdInMetadata / MSessionIDUpdatedSynchronously / StreamPayloadUsesServerUUID / AllocationFailureNoFallback / ClientSessionLogWritten / ClientSessionLogFailureNonFatal / ReverseResolveRoundTrip）。
 - ✅ 端到端 reverse-resolve 链路：server `body.metadata.clientSessionId` ←→ 客户端 `~/.babel-o/log/go-tui-session.log` 的双向映射。`TestPhase1_ReverseResolveRoundTrip` 端到端验证：server metadata tier (a) 命中 + client log tier (b) 命中，server uuid 能 reverse-resolve 回 `session_go_xxx`。
-- 不在 Phase 10 默认化前修改 `bbl chat` 命名约定（CLI 继续用 `session_<uuid>` 命名）。
+- 不在 Phase 10 默认化前修改 `bbl go` 命名约定（CLI 继续用 `session_<uuid>` 命名）。
 
 **残留**（tier (a) 升级，不阻塞 Phase 1 收口）—— **已落地（2026-06-17）**：
 

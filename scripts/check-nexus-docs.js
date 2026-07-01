@@ -12,7 +12,9 @@ const archiveRoot = join(docsRoot, 'archive')
 const proposalsRoot = join(docsRoot, 'proposals')
 const historyRoot = join(docsRoot, 'history')
 const decisionsRoot = join(docsRoot, 'decisions')
+const activeRoot = join(docsRoot, 'active')
 const releasesRoot = join(root, 'docs', 'releases')
+const guidesRoot = join(docsDirectoryRoot, 'guides')
 const referenceReadmePath = join(referenceRoot, 'README.md')
 const referenceReadme = await readFile(referenceReadmePath, 'utf8')
 const archiveReadmePath = join(archiveRoot, 'README.md')
@@ -43,6 +45,12 @@ const historyFiles = (await readdir(historyRoot))
 const decisionFiles = (await readdir(decisionsRoot))
   .filter(name => name.endsWith('.md'))
   .sort()
+const activeFiles = (await readdir(activeRoot))
+  .filter(name => name.endsWith('.md'))
+  .sort()
+const guidesFiles = existsSync(guidesRoot)
+  ? await listMarkdownFiles(guidesRoot)
+  : []
 const allowedStates = new Set([
   'Active Plan',
   'Partially Landed',
@@ -54,7 +62,7 @@ const allowedStates = new Set([
   'History',
   'Accepted',
 ])
-const allowedReferenceStates = new Set(['Active Plan', 'Index', 'Guide'])
+const allowedReferenceStates = new Set(['Active Plan', 'Closed Reference', 'Index', 'Guide'])
 const allowedProposalStates = new Set(['Draft', 'Partially Landed'])
 const allowedHistoryStates = new Set(['History', 'Index'])
 const allowedDecisionStates = new Set(['Accepted', 'Index'])
@@ -88,6 +96,7 @@ await checkReferenceDocuments()
 await checkLifecycleDocuments()
 await checkMarkdownLinks()
 checkArchiveReferencesFromTodo()
+checkStaleSymbolReferences()
 
 console.log(JSON.stringify({
   type: 'nexus_docs_check',
@@ -97,7 +106,9 @@ console.log(JSON.stringify({
   decisionFileCount: decisionFiles.length,
   archiveFileCount: archiveFiles.length,
   releaseFileCount: releaseFiles.length,
-  docsRootPolicy: 'README/DEVELOPMENT only for root markdown; planning belongs under docs/nexus',
+  guidesFileCount: guidesFiles.length,
+  staleSymbolReferences: failures.filter(f => f.reason === 'stale_symbol_reference').length,
+  docsRootPolicy: 'docs root: README/DEVELOPMENT only; external user docs in docs/guides/; planning in docs/nexus',
   referenceBodyCjk: {
     filesWithCjkBeforeChineseSummary: referenceBodyCjkReports.length,
     top: referenceBodyCjkReports
@@ -383,6 +394,69 @@ function checkArchiveReferencesFromTodo() {
       reason: 'todo_links_archive_doc',
       target: match[1],
     })
+  }
+}
+
+function checkStaleSymbolReferences() {
+  // Removed symbols (e.g. the TS TUI `bbl chat`, removed in v0.3.7) must not
+  // appear as current in non-historical docs. A mention is allowed only when
+  // its paragraph carries a removal/legacy marker, so historical context
+  // remains expressible. Scans active/, guides/, reference/, proposals/,
+  // decisions/ plus top-level current docs. Excludes archive/, releases/, history/,
+  // WORK_LOG.md, DONE.md — historical surfaces where removed symbols may
+  // legitimately appear as prior context. To track a new removed symbol,
+  // append to staleSymbols.
+  const removalMarker = /移除|已于|不再|legacy|removed|历史|废弃|retired|superseded|超越|v0\.3\.7|旧 TS TUI|no longer/i
+  const staleSymbols = [
+    {
+      term: 'bbl chat',
+      hint: 'bbl chat (TS TUI) was removed in v0.3.7; bbl go is the sole production TUI. Reframe to bbl go / bbl run, or annotate the paragraph with a removal marker (e.g. v0.3.7 移除 / 旧 TS TUI / legacy).',
+    },
+  ]
+  const scanFiles = [
+    join(docsRoot, 'README.md'),
+    join(docsRoot, 'TODO.md'),
+    join(docsRoot, 'PROJECT_IDENTITY.md'),
+    join(docsRoot, 'PHASE_9_DECISION.md'),
+  ]
+  for (const fileName of activeFiles) scanFiles.push(join(activeRoot, fileName))
+  for (const filePath of guidesFiles) scanFiles.push(filePath)
+  for (const fileName of referenceFiles) scanFiles.push(join(referenceRoot, fileName))
+  for (const fileName of proposalFiles) scanFiles.push(join(proposalsRoot, fileName))
+  for (const fileName of decisionFiles) scanFiles.push(join(decisionsRoot, fileName))
+  for (const filePath of scanFiles) {
+    if (!existsSync(filePath)) continue
+    const text = readFileSync(filePath, 'utf8')
+    const lines = text.split('\n')
+    let para = []
+    let paraStart = 0
+    const flush = () => {
+      if (para.length === 0) return
+      const paraText = para.join('\n')
+      for (const symbol of staleSymbols) {
+        if (paraText.includes(symbol.term) && !removalMarker.test(paraText)) {
+          const hitIdx = para.findIndex(line => line.includes(symbol.term))
+          failures.push({
+            file: relative(root, filePath),
+            reason: 'stale_symbol_reference',
+            symbol: symbol.term,
+            line: paraStart + hitIdx + 1,
+            excerpt: para[hitIdx].slice(0, 140),
+            hint: symbol.hint,
+          })
+        }
+      }
+      para = []
+    }
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trim() === '') {
+        flush()
+      } else {
+        if (para.length === 0) paraStart = i
+        para.push(lines[i])
+      }
+    }
+    flush()
   }
 }
 

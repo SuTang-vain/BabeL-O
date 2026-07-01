@@ -3,7 +3,7 @@
 > State: Active Plan
 > Track: Agent Runtime / Observability / Eval / Durability
 > Priority: P1
-> Source of truth: [../ARCHITECTURE.md](../ARCHITECTURE.md), [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_performance.md](../active/TODO_performance.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/`, `src/runtime/`, `src/storage/`
+> Source of truth: [../../guides/ARCHITECTURE.md](../../guides/ARCHITECTURE.md), [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_performance.md](../active/TODO_performance.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/`, `src/runtime/`, `src/storage/`
 > Governance: Indexed by [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md). This document owns agent runtime maturity gaps; it must not move execution truth out of Nexus/runtime.
 > Related: [context-governance-index.md](./context-governance-index.md), [evidence-governance-index.md](./evidence-governance-index.md), [memory-governance-plan.md](./memory-governance-plan.md)
 
@@ -213,7 +213,7 @@ Standardize loop naming across documentation and code comments:
 
 Acceptance:
 
-- `docs/nexus/ARCHITECTURE.md`, `TODO.md`, and `active/TODO_*` use the same terminology set.
+- `docs/guides/ARCHITECTURE.md`, `TODO.md`, and `active/TODO_*` use the same terminology set.
 - New loop documents must state whether they own runtime truth; the default is no.
 
 ## 4. Priorities

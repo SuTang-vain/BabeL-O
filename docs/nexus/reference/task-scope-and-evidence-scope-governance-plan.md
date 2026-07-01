@@ -1,6 +1,6 @@
 # Task Scope and Evidence Scope Governance Plan
 
-> State: Active Plan
+> State: Closed Reference
 > Status: Phase 0–4 Landed + Phase 5 Diagnostics Slice Landed (2026-06-13) — 基于真实 session `session_ef76f50a-92cc-4d72-a2bf-13b3ea36917d` 的 scope drift 复盘：用户要求查看 `BabeL-O` / `babel-omemory` 系统进展，agent 自动展开同级独立项目 `BabeL-2` / `BabeL-X` 并把它们作为报告证据。该问题不是危险写入或路径不存在，而是 read-only 工具读取了**任务范围外**的真实证据。
 > Priority: P0 Guardrail — 在不削弱合法跨仓分析能力的前提下，让 Nexus/runtime 能区分“路径安全”与“证据在当前任务范围内”。
 > Related: [context-and-agent-history.md](../history/context-and-agent-history.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [tool-governance-plan.md](./tool-governance-plan.md)

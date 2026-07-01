@@ -109,18 +109,16 @@ bbl go
 
 ## First Run
 
-```bash
-bbl init
-bbl go
-```
-
-`bbl init` walks through provider and model setup. You can also configure
-providers directly:
+Configure a provider and a default model, then start the TUI:
 
 ```bash
 bbl config add anthropic "$ANTHROPIC_API_KEY"
-bbl config use anthropic/claude-3-5-sonnet
+bbl config use anthropic/claude-sonnet-4-6
+bbl go
 ```
+
+You can also configure providers and switch models from inside the TUI with
+`/model` (or `Ctrl+L`).
 
 Inside the TUI:
 
@@ -160,15 +158,14 @@ inspect the current context budget and tell me whether we should compact
 ```bash
 bbl go                            # production Go TUI
 bbl run "summarize this repo"     # one-shot prompt, no TUI
-bbl init                          # provider and model wizard
 bbl doctor                        # local readiness checks
 bbl go --check --no-start-nexus   # install and TUI readiness check
 bbl nexus status                  # Nexus health
 bbl sessions list                 # persisted sessions
-bbl sessions inspect <sessionId>  # session events and traces
+bbl inspect-session <sessionId>  # session events and traces
 bbl memory status                 # MemoryOS status
 bbl tools audit                   # tool and permission audit
-bbl config show                   # active configuration
+bbl config list                   # active configuration
 ```
 
 ## MemoryOS
@@ -197,7 +194,7 @@ Supported providers include `anthropic`, `openai`, `deepseek`, `moonshot`,
 Useful checks:
 
 ```bash
-bbl config show
+bbl config list
 bbl doctor
 bbl go --check
 ```
@@ -217,7 +214,7 @@ BabeL-O is built around explicit boundaries:
 
 For a deeper public overview of how the CLI, Go TUI, Nexus daemon, runtime,
 tools, agents, memory, storage, and observability layers fit together, see
-[BabeL-O Architecture](docs/nexus/ARCHITECTURE.md).
+[BabeL-O Architecture](docs/guides/ARCHITECTURE.md).
 
 ## Release Notes
 
@@ -232,9 +229,9 @@ future interaction work into the native Go TUI.
 
 - [Changelog](CHANGELOG.md)
 - [Release notes](docs/releases/README.md)
-- [FAQ](docs/nexus/FAQ.md)
+- [FAQ](docs/guides/FAQ.md)
 - [Go TUI client guide](clients/go-tui/README.md)
-- [Distribution guide](docs/nexus/reference/distribution-guide.md)
+- [Distribution guide](docs/guides/distribution-guide.md)
 - [Nexus planning notes](docs/nexus/README.md)
 
 ## License

@@ -38,10 +38,15 @@ docs/*
 !docs/nexus/**/
 !docs/nexus/*.md
 !docs/nexus/**/*.md
+!docs/guides/
+!docs/guides/**/
+!docs/guides/*.md
+!docs/guides/**/*.md
 
-# Runtime artifacts inside docs/nexus/ (test side effects, working-set.json)
+# Runtime artifacts inside docs/nexus/ and clients/go-tui/ (test side effects, working-set.json)
 docs/nexus/.babel-o/
 docs/nexus/**/.babel-o/
+clients/go-tui/.babel-o/
 
 # pnpm artifacts — this repo uses npm (no packageManager field). These
 # appear if someone accidentally runs pnpm install; do not track them.

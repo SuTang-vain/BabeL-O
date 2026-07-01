@@ -26,7 +26,7 @@ Implemented and verified:
 - Managed EverCore / EverOS sidecar mode supports local loopback startup, registry reuse, process cache, idle TTL, status diagnostics, and explicit actions.
 - Memory capability guidance tells the model when memory search is appropriate and that memory hits are non-authoritative hints.
 - Optional `mcp:evercore:*` tools exist for explicit search, permission-gated note save, and session flush.
-- First-run onboarding is implemented through `bbl chat`, `bbl memory setup`, `bbl memory status`, `bbl memory opt-out`, and external-mode guidance.
+- First-run onboarding is implemented through `bbl go`, `bbl memory setup`, `bbl memory status`, `bbl memory opt-out`, and external-mode guidance.
 - Zero-friction startup improvements are implemented: auto-bootstrap policy, non-blocking background bootstrap, fallback build path, doctor command, welcome hint, Go TUI footer/status integration, and MCP tool enable/disable commands.
 
 The remaining governance question is not whether memory can run. The remaining question is how to keep memory safe, visible, non-authoritative, low-friction, and easy to diagnose as the system grows.

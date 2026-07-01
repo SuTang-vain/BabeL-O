@@ -1,7 +1,7 @@
 # BabeL-O — 项目身份记忆
 
 > 本文件是 BabeL-O 的**核心特性和长期目标**的持久化记忆。
-> 由 Agent 写入于 2026-06-14。后续会话可通过查阅此文件快速对齐项目定位。
+> 由 Agent 写入于 2026-06-14，2026-06-30 更新（v0.3.7 起 `bbl go` 为唯一生产 TUI，旧 TS TUI `bbl chat` 已移除；v0.3.5 起改用 portable 包复用系统 Node）。后续会话可通过查阅此文件快速对齐项目定位。
 
 ---
 
@@ -14,15 +14,15 @@
 - CLI (`bbl`) 是用户交互入口，通过 REST + WebSocket 与 Nexus daemon 通信
 - Nexus (Fastify daemon) 持有运行时状态，管理 agent loop、工具调度、权限治理
 - Runtimes 可插拔：`LocalCodingRuntime`（确定性执行）/ `LLMCodingRuntime`（任意 LLM 适配）
-- Go TUI (`bbl go`) 是生产级交互客户端，~10MB 单文件二进制，零 Node 依赖
+- Go TUI (`bbl go`) 是唯一生产级交互客户端，portable 包复用系统 Node >= 22（v0.3.5 起不再走 Node SEA 单文件二进制）
 
 ---
 
 ## 二、核心特性
 
 ### 2.1 多前端架构
-- **TypeScript CLI**: 开发者 playground，`bbl chat dev`
-- **Go TUI**: 生产界面，10MB 单文件二进制，可丢进容器运行
+- **Go TUI (`bbl go`)**: 唯一生产交互入口，portable 包复用系统 Node >= 22，可丢进容器运行
+- **`bbl run`**: 一次性 prompt 自动化与脚本（无 TUI）；v0.3.7 已移除旧 TS TUI `bbl chat`
 - **REST + WebSocket API**: 远程连接、headless 集成
 
 ### 2.2 Worktree 并行治理
@@ -43,7 +43,7 @@
 
 ### 2.5 可插拔 Provider
 - Anthropic-compatible、OpenAI-compatible、OpenAI-responses 适配器
-- Provider recovery：失败自动切换备用 provider
+- Provider recovery：失败按错误类型分类恢复（context_window / rate_limit / auth / unknown 等），全部要求用户确认，禁止静默切换 provider
 
 ### 2.6 长期记忆（EverCore）
 - 可选的跨 session 语义记忆 sidecar
@@ -68,7 +68,7 @@
 ### W1 — Make It Visible（可见性）
 - README 顶部价值段重写（3 个差异化 bullet）
 - 5 分钟快速开始指南
-- 首页 demo gif / 截图（`bbl chat` + `bbl go`）
+- 首页 demo gif / 截图（`bbl go`）
 - "Try these prompts" 示例库
 
 ### W2 — Make It Trustworthy（可信度）
@@ -97,7 +97,7 @@
 | 维度 | BabeL-O | Claude Code / Aider |
 |------|---------|---------------------|
 | 架构 | Nexus daemon + 多前端 | 单进程 CLI |
-| 客户端 | 10MB Go TUI + TypeScript CLI | Node/Python REPL |
+| 客户端 | Go TUI (`bbl go`) + `bbl run` 一次性 CLI | Node/Python REPL |
 | 多 session | Worktree 并行 + SessionChannel | 单 session |
 | 断线续传 | Daemon 不掉线，TUI 重连续传 | 进程挂则任务丢 |
 | 长任务 | Context compaction + sub-agent | 受限于单次 API 上下文 |
@@ -118,7 +118,7 @@
 
 ## 六、当前状态
 
-- 版本：v0.3.6
+- 版本：v0.3.9
 - 分支：`develop`
 - 活跃改造：30 天产品化计划 W2（部分已实现）
 - 维护者：单点维护，"壳中客(KezhongKe)"

@@ -61,7 +61,7 @@ The reusable part is the architecture shape, not a direct copy of the full code.
 - Do not migrate Go TUI to Bubble Tea / Lip Gloss v2.
 - Do not replace the whole `formatLine`; only replace assistant / thinking body in the first phase.
 - Do not change non-transcript-body rendering such as tool result / permission / status / profile picker.
-- Do not change Markdown behavior in TypeScript `bbl chat`.
+- Do not change Markdown behavior outside `bbl go` (the TypeScript `bbl chat` was removed in v0.3.7).
 - Do not implement full streaming stable-prefix cache in the first phase; use existing per-item cache + benchmark to decide whether it is needed.
 - Do not copy Crush style structs directly into BabeL-O; extract only the renderer façade and necessary theme mapping.
 

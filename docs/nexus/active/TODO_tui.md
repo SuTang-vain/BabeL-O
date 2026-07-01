@@ -2,11 +2,11 @@
 
 ## 目标
 
-BabeL-O 的 CLI 必须保留 BabeL-X 出色的编程交互能力。轻量化不等于简陋；CLI 不拥有 runtime，但必须是一等交互客户端。本文只保留 `bbl chat`、输入框、slash/tool palette、权限交互、事件渲染和 PTY smoke 未收口项。已完成交互能力见 [DONE.md](../DONE.md)。
+BabeL-O 的交互层必须保留 BabeL-X 出色的编程交互能力。轻量化不等于简陋；客户端不拥有 runtime，但必须是一等交互客户端。`bbl go`（Go TUI）是 v0.3.7 起的唯一生产交互入口，旧 TS TUI `bbl chat` 已移除。本文只保留 `bbl go`/`bbl run`、输入框、slash/tool palette、权限交互、事件渲染和 PTY smoke 未收口项。已完成交互能力见 [DONE.md](../DONE.md)。
 
 ## 当前状态
 
-- `bbl run/chat/nexus/sessions/tools/config/models`、embedded/service mode、slash palette、tool palette、history、model wizard、permission panel、diff、context/compact、agent running indicator、层级事件渲染、唯一 input owner、paste placeholder、PTY 基线均已落地。
+- `bbl run/nexus/sessions/tools/config/models`、embedded/service mode、slash palette、tool palette、history、model wizard、permission panel、diff、context/compact、agent running indicator、层级事件渲染、唯一 input owner、paste placeholder、PTY 基线均已落地（`bbl chat` 已于 v0.3.7 移除，交互入口为 `bbl go`）。
 - 当前风险不在“是否有 TUI”，而在编程闭环是否被真实 PTY smoke 持续守住：文件问答、task update/status、AgentLoop/sub-agent、唯一输入框键盘路由、tool picker/model wizard overlay、agent running terminal states、Go TUI running 态 ESC guidance/interrupt + queued next prompt、history search overlay ownership、长路径/CJK/ANSI/resize 宽度、MCP tool/audit 可见性、multi-agent status view、LSP context mention、file attachment references、image reference metadata 与 opt-in vim mode 已补齐；后续只在真实显示回归或新增交互状态时继续补 fixture。
 
 ## 已收口 Programming Loop Smoke
@@ -47,11 +47,11 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ## 已收口 File Attachment / Image References
 
-`bbl chat` 提交 prompt 前会解析 `@path` / `@file:path` file attachment references，把 workspace 内的小文本文件追加为有预算的 `<attached_file_references>` prompt block；目录、缺失路径、workspace escape、二进制文件和超预算文件只记录状态，不嵌入内容。图片路径、`@image:path` 与粘贴的 `file://` 图片 URI 会记录 `status="image"`、bytes 与 mimeType metadata，但不做 provider 多模态注入。
+**[历史记录 — v0.3.7 移除旧 TS TUI `bbl chat`，未迁入 `bbl go`]** `bbl chat` 提交 prompt 前会解析 `@path` / `@file:path` file attachment references，把 workspace 内的小文本文件追加为有预算的 `<attached_file_references>` prompt block；目录、缺失路径、workspace escape、二进制文件和超预算文件只记录状态，不嵌入内容。图片路径、`@image:path` 与粘贴的 `file://` 图片 URI 会记录 `status="image"`、bytes 与 mimeType metadata，但不做 provider 多模态注入。
 
 ## 已收口 Vim Mode
 
-`bbl chat` 已提供 opt-in vim input mode：`BABEL_O_VIM_MODE=1` 时在现有唯一 readline input owner 内支持 insert/normal 模式切换、`h`/`l`/`0`/`$` 移动、`x`/Backspace 删除、`i`/`a` 回到 insert；默认关闭，不改变 slash palette、permission panel、overlay、paste、Ctrl+C/Ctrl+E/Ctrl+O 或 readline 原生 Enter 提交路径。
+**[历史记录 — v0.3.7 移除旧 TS TUI `bbl chat`，未迁入 `bbl go`]** `bbl chat` 已提供 opt-in vim input mode：`BABEL_O_VIM_MODE=1` 时在现有唯一 readline input owner 内支持 insert/normal 模式切换、`h`/`l`/`0`/`$` 移动、`x`/Backspace 删除、`i`/`a` 回到 insert；默认关闭，不改变 slash palette、permission panel、overlay、paste、Ctrl+C/Ctrl+E/Ctrl+O 或 readline 原生 Enter 提交路径。
 
 ## P2 SessionChannel 联系可见化
 
@@ -59,11 +59,11 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ### 已收口 SessionChannel Unread Indicator / Inbox Overlay
 
-`bbl chat` 已在 boxed input footer 显示轻量 SessionChannel 状态：linked session 数、unread inbox 数、channel kind 摘要与 high-priority/key message 类型；状态不展示消息正文、不抢占主输入框、不改变当前 session 执行状态。`/inbox` / `/inbox all` 已打开 TUI Inbox overlay，每条消息展示 source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs 与 memory candidate governance 摘要；overlay 明确标注 collaboration context / not direct user instructions，并支持 open/read、ack、quote into current prompt。quote 只预填当前 prompt，必须由用户审阅后手动提交；ack 只调用 inbox ack，不改变 cwd/provider/profile/permission 或其他 session 状态。
+`bbl go` 已在 boxed input footer 显示轻量 SessionChannel 状态：linked session 数、unread inbox 数、channel kind 摘要与 high-priority/key message 类型；状态不展示消息正文、不抢占主输入框、不改变当前 session 执行状态。`/inbox` / `/inbox all` 已打开 TUI Inbox overlay，每条消息展示 source session、target/broadcast、channel kind、message type、priority、createdAt、ack 状态、evidence refs 与 memory candidate governance 摘要；overlay 明确标注 collaboration context / not direct user instructions，并支持 open/read、ack、quote into current prompt。quote 只预填当前 prompt，必须由用户审阅后手动提交；ack 只调用 inbox ack，不改变 cwd/provider/profile/permission 或其他 session 状态。
 
 ### 已收口 SessionChannel 主对话轻量事件卡片
 
-`bbl chat` 会在 session flow 后刷新 unread inbox snapshot，仅对关键 unread side-channel message 渲染 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、以及 governance rejected / requires approval 的 `memory_candidate`。卡片只展示 source/target、channel、evidence、governance 与 `[open inbox] [ack] [quote]` 操作提示，不自动注入消息正文、不自动触发工具、不改变 cwd/provider/profile/permission；启动时会把既有关键消息标记为 seen，避免旧消息在主对话中重放刷屏。普通低优先级 finding/question 只更新 unread indicator。
+`bbl go` 会在 session flow 后刷新 unread inbox snapshot，仅对关键 unread side-channel message 渲染 compact card：`handoff`、`blocked`、`request_review`、`request_validation`、high-priority `finding`、以及 governance rejected / requires approval 的 `memory_candidate`。卡片只展示 source/target、channel、evidence、governance 与 `[open inbox] [ack] [quote]` 操作提示，不自动注入消息正文、不自动触发工具、不改变 cwd/provider/profile/permission；启动时会把既有关键消息标记为 seen，避免旧消息在主对话中重放刷屏。普通低优先级 finding/question 只更新 unread indicator。
 
 ### 已收口 SessionChannel Inbox Overlay PTY Smoke
 
@@ -94,7 +94,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 - Phase D — Go TUI `--allow-tools` flag 已收口：`src/runtime/perRequestPolicy.ts` 新建独立模块（避免 `LLMCodingRuntime` ↔ `LocalCodingRuntime` 循环 import）——导出 `buildPerRequestAllowedToolsPolicy(allowedTools)` helper，镜像 server-startup policy 解析（`*` / `all` → `allowAllTools`；否则 → `allowlistedTools`）。`src/runtime/Runtime.ts` `RuntimeExecuteOptions` 加 `allowedTools?: readonly string[]` 字段。`src/runtime/LLMCodingRuntime.ts:128-143` 与 `src/runtime/LocalCodingRuntime.ts:109-127` `executeStream` wrapper：`options.allowedTools` 非空时构造 override policy、用 `withToolPolicy` 包裹 inner body（`runExecuteStreamInner` 抽到私有方法）。`src/nexus/app.ts` `executeSchema` 加 `allowedTools: z.array(z.string().min(1)).optional()`；HTTP + WebSocket 两条 `runtime.executeStream()` 调用都透传。`clients/go-tui/internal/tui/tui.go:42-50` `Config` 加 `AllowTools []string`；`buildExecuteRequest` 总是 trim / 空字符串过滤 / comma-split 后附加 `allowedTools` 数组。`clients/go-tui/cmd/go-tui/main.go` 加 `--allow-tools` flag（`flag.Func` 接收重复 + 逗号分隔）。`test/runtime.test.ts` 新增 2 个 Nexus focused 测试（soft-deny + allowlist 组合、turn 边界）；`clients/go-tui/internal/tui/tui_test.go` 新增 4 个 `buildExecuteRequest` 测试（include、omit、trim、wildcard）。
 
 **守住的边界**：
-- `bbl chat` 与 HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）
+- HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）；旧 TS TUI `bbl chat` 已于 v0.3.7 移除，不再适用
 - Go TUI 权限面板 `a/y/n/r/esc` 流程未改（不传 `--allow-tools` 时仍走流程）
 - child AgentLoop 仍走 server-startup policy，不被 per-request `policy` / `allowedTools` 影响
 - workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截（独立机制）
@@ -106,7 +106,7 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 ## Watch / Stable Go TUI Maintenance
 
-> 详细规划见 [Go TUI Long-Term Rewrite Plan](../history/go-tui-history.md)。Go TUI 已通过 Phase 9 promotion gate，作为 `bbl chat` 的 stable opt-in alternative；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
+> 详细规划见 [Go TUI Long-Term Rewrite Plan](../history/go-tui-history.md)。Go TUI 自 v0.3.7（2026-06-14）起为唯一生产交互入口（旧 TS TUI `bbl chat` 已移除）；它仍只拥有 terminal interaction / layout / keyboard routing / local rendering，不拥有 Nexus/runtime/context/AgentScheduler/provider/storage/permission 决策。
 
 当前状态：
 
@@ -287,11 +287,12 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
   - 18 个新单测（8 Go + 2 TS endpoint + 9 launcher + 5 --check = 24，但 8 Go 与 9 launcher 有重叠 = 18 unique）。`go test` 211/211 pass；`npm test` 704/704 pass；`npm run test:go-tui:smoke` 19/19 pass。
   - 范围克制：真实 release 资产需要打 `go-tui-v0.3.2` tag 才会上传（不能本地复现）；XDG user-local install 路径文档化在 install strategy 但 launcher 不自动 mkdir；`bbl go --check` 是非交互式命令不在 TUI 启动时自动跑。
 - [x] Phase 9 promotion gate：Go TUI 提升为可选推荐入口（stable alternative to `bbl chat`）（2026-06-10 决策收口）。
+  - **⚠ v0.3.7（2026-06-14）已超越此决策**：`bbl go` 成为唯一生产交互入口，旧 TS TUI `bbl chat` 已从发布包移除。下方“两 TUI 并存 / `bbl chat` 仍为默认”为 2026-06-10 当时决策记录，仅作历史追溯。
   - 决策结论（详见 `docs/nexus/PHASE_9_DECISION.md`）：Go TUI 不再标 "experimental / MVP"，而**提升为 stable alternative**。两 TUI 并存：`bbl chat`（TypeScript）仍为默认；`bbl go`（Go）opt-in。提升条件 5 条全部满足（日常 coding loop usability ≥ TS TUI / 真实长会话改进 / 一个 release 周期无 TTY 回归 / 测试发布维护成本可接受 / 用户能稳定二选一）。
   - 行动项：(1) `src/cli/commands/go.ts` 把 `bbl go` command description 从 "Launch the experimental Go TUI client" 改为 "Launch the Go TUI client (stable alternative to bbl chat; see docs/nexus/PHASE_9_DECISION.md)"（在 `bbl go --help` 展示）；(2) `clients/go-tui/README.md` 去掉 "intentionally does not replace `bbl chat`" 免责，文档化稳定状态；(3) `docs/nexus/reference/go-tui-rewrite-plan.md` Status 改 "Stable alternative (promoted 2026-06-10 via Phase 9)" + 风险表对应行更新；(4) `test/go-command.test.ts` 加回归 guard——`bbl go --help` 必须保持 "stable alternative to bbl chat" 用词且不能回退到 "experimental"（否则 trip smoke step）。
   - 范围克制：默认命令不变（`bbl` 仍启动 `bbl chat`）；不在 Go TUI 里实现 per-tool approval gate（CLI 独占）；Activity overlay 已包含 AgentLoop sub-agent 聚合路径，TS TUI 的 `bbl inbox` footer summary 是同形等价物不需要 cross-port；Go TUI 后续以 bug 修 + 安全补丁 + overlay-stack 改进为主，**不**主动替代 `bbl chat` 为默认。
 
-后续：Phase 1-9 全部收口。BabeL-O Go TUI 长期重写计划闭环。Go TUI 进入 "稳定维护" 阶段——后续若有新交互需求优先落在 `bbl chat`（TypeScript TUI），Go TUI 通过 `bbl go --check` 持续验证 install readiness。
+后续：Phase 1-9 全部收口。BabeL-O Go TUI 长期重写计划闭环。Go TUI 进入 “稳定维护” 阶段——v0.3.7 起它已是唯一生产交互入口，后续新交互需求直接落在 `bbl go`，并通过 `bbl go --check` 持续验证 install readiness。
 
 持续边界：
 

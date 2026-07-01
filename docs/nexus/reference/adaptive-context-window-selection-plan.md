@@ -1,6 +1,6 @@
 # Adaptive Context Window Selection Plan
 
-> State: Active Plan
+> State: Closed Reference
 > Track: Runtime / Context
 > Priority: P0 — real-session regression: every prompt re-trimmed the event window and tool results via fixed caps regardless of actual context headroom, silently dropping prior thinking / tool results on an 852k-context model at single-digit usage. Phase 0/1/2 closed 2026-06-22.
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/cacheAwareCompactPolicy.ts`, `src/runtime/tokenEstimator.ts`, `src/runtime/pipeline/contextRefresh.ts`, `src/runtime/compact.ts`, `src/runtime/compactors/microCompact.ts`, `src/runtime/compactors/snipCompactor.ts`, `test/context-assembler.test.ts`, `scripts/repro-adaptive-context-window-260622.mjs`, `scripts/repro-adaptive-context-phase2-260622.mjs`
