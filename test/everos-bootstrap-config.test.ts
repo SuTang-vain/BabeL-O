@@ -62,8 +62,62 @@ test('explicit EverCore env wins over ready bootstrap state', async () => {
   }
 })
 
-test('failed and opted-out bootstrap states do not enable EverCore', async () => {
+test('ollama embeddingPassthrough injects managedEmbedding* with builtin apiKey', async () => {
   const { env, cleanup } = makeEnv()
+  try {
+    await updateEverOSBootstrapState(() => createEverOSBootstrapState({
+      optedIn: true,
+      buildStatus: 'ready',
+      managedCommand: '/tmp/everos',
+      dataDir: '/tmp/everos-data',
+      embeddingPassthrough: { source: 'ollama', model: 'bge-m3', baseUrl: 'http://localhost:11434/v1' },
+    }), { env })
+
+    const defaults = loadEverOSBootstrapDefaults(env)
+    assert.equal(defaults?.input.managedEmbeddingModel, 'bge-m3')
+    assert.equal(defaults?.input.managedEmbeddingBaseUrl, 'http://localhost:11434/v1')
+    // ollama's apiKey is the non-secret literal, re-derived at inject time.
+    assert.equal(defaults?.input.managedEmbeddingApiKey, 'ollama')
+
+    const input = resolveEverCoreConfigInputFromEnv(env)
+    assert.equal(input.managedEmbeddingModel, 'bge-m3')
+    assert.equal(input.managedEmbeddingBaseUrl, 'http://localhost:11434/v1')
+    assert.equal(input.managedEmbeddingApiKey, 'ollama')
+  } finally {
+    cleanup()
+  }
+})
+
+test('custom embeddingPassthrough leaves apiKey to env (not persisted)', async () => {
+  const { env, cleanup } = makeEnv()
+  try {
+    await updateEverOSBootstrapState(() => createEverOSBootstrapState({
+      optedIn: true,
+      buildStatus: 'ready',
+      managedCommand: '/tmp/everos',
+      dataDir: '/tmp/everos-data',
+      embeddingPassthrough: { source: 'custom', model: 'text-embedding-3-small', baseUrl: 'https://api.openai.com/v1' },
+    }), { env })
+
+    const defaults = loadEverOSBootstrapDefaults(env)
+    assert.equal(defaults?.input.managedEmbeddingModel, 'text-embedding-3-small')
+    assert.equal(defaults?.input.managedEmbeddingBaseUrl, 'https://api.openai.com/v1')
+    // Custom source must NOT synthesize an apiKey — the operator supplies
+    // BABEL_O_EVERCORE_EMBEDDING_API_KEY at runtime (no plaintext secret).
+    assert.equal(defaults?.input.managedEmbeddingApiKey, undefined)
+
+    // Env override wins over the persisted model/baseUrl.
+    const withEnv = { ...env, BABEL_O_EVERCORE_EMBEDDING_MODEL: 'override-model', BABEL_O_EVERCORE_EMBEDDING_API_KEY: 'sk-from-env' }
+    const input = resolveEverCoreConfigInputFromEnv(withEnv)
+    assert.equal(input.managedEmbeddingModel, 'override-model')
+    assert.equal(input.managedEmbeddingApiKey, 'sk-from-env')
+    assert.equal(input.managedEmbeddingBaseUrl, 'https://api.openai.com/v1')
+  } finally {
+    cleanup()
+  }
+})
+
+test('failed and opted-out bootstrap states do not enable EverCore', async () => {  const { env, cleanup } = makeEnv()
   try {
     await updateEverOSBootstrapState(() => createEverOSBootstrapState({
       optedOut: true,

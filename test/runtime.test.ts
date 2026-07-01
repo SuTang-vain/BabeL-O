@@ -3717,9 +3717,42 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'openai-key')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.openai.example/v1')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'gpt-4o')
+  // Embedding is opt-in: with no managedEmbedding* set, the spawn env must
+  // not carry EVEROS_EMBEDDING__* (EverOS would otherwise try to use it).
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__MODEL, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__API_KEY, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__BASE_URL, undefined)
 
   await configured.dispose?.()
   assert.equal(killed, true)
+})
+
+test('EverCore managed mode passes embedding config through as EVEROS_EMBEDDING__* env', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-embedding`)
+  const spawnCalls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9886,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
+    managedEmbeddingModel: 'bge-m3',
+    managedEmbeddingApiKey: 'ollama',
+    managedEmbeddingBaseUrl: 'http://localhost:11434/v1',
+    managedSpawn(command, args, options) {
+      spawnCalls.push({ command, args, env: options.env })
+      return { pid: 12399, killed: false, kill() { return true }, once() {} }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+  assert.equal(configured.status.healthy, true)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__MODEL, 'bge-m3')
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__API_KEY, 'ollama')
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__BASE_URL, 'http://localhost:11434/v1')
+  await configured.dispose?.()
 })
 
 test('EverCore managed mode writes registry and reuses healthy sidecar', async () => {

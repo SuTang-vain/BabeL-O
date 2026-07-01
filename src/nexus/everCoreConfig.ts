@@ -49,6 +49,9 @@ export type EverCoreConfigInput = {
   managedLlmApiKey?: string
   managedLlmBaseUrl?: string
   managedLlmModel?: string
+  managedEmbeddingModel?: string
+  managedEmbeddingApiKey?: string
+  managedEmbeddingBaseUrl?: string
   providerSettings?: ResolvedSettings
   managedSpawn?: EverCoreSidecarOptions['spawn']
   managedPortAllocator?: EverCoreSidecarOptions['portAllocator']
@@ -143,6 +146,9 @@ export function resolveEverCoreConfigInputFromEnv(
     managedLlmApiKey: env.BABEL_O_EVERCORE_LLM_API_KEY,
     managedLlmBaseUrl: env.BABEL_O_EVERCORE_LLM_BASE_URL,
     managedLlmModel: env.BABEL_O_EVERCORE_LLM_MODEL,
+    managedEmbeddingModel: env.BABEL_O_EVERCORE_EMBEDDING_MODEL,
+    managedEmbeddingApiKey: env.BABEL_O_EVERCORE_EMBEDDING_API_KEY,
+    managedEmbeddingBaseUrl: env.BABEL_O_EVERCORE_EMBEDDING_BASE_URL,
     providerSettings: options.providerSettings,
   }, env)
 }
@@ -183,6 +189,7 @@ export async function configureEverCore(
       startupTimeoutMs: input.managedStartupTimeoutMs,
       healthIntervalMs: input.managedHealthIntervalMs,
       llm: resolveManagedEverCoreLlmConfig(input),
+      embedding: resolveManagedEverCoreEmbeddingConfig(input),
       fetch: input.fetch,
       spawn: input.managedSpawn,
       portAllocator: input.managedPortAllocator,
@@ -309,6 +316,22 @@ function resolveManagedEverCoreLlmConfig(input: EverCoreConfigInput): EverCoreSi
   } catch {
     return undefined
   }
+}
+
+// Embedding has NO providerSettings fallback: minimax (and most chat-only
+// providers) expose no OpenAI-compatible embedding endpoint, so deriving
+// from the chat provider would silently inject a broken base_url. The
+// embedding source must be supplied explicitly — via BABEL_O_EVERCORE_EMBEDDING_*
+// env or the persisted embeddingPassthrough bootstrap field (injected by
+// applyEverOSBootstrapDefaults). Returns undefined when unset; the sidecar
+// then dies with EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED, which the CLI
+// surfaces with a fixAction pointing at `bbl memory setup`.
+function resolveManagedEverCoreEmbeddingConfig(input: EverCoreConfigInput): EverCoreSidecarOptions['embedding'] | undefined {
+  const model = input.managedEmbeddingModel?.trim()
+  const apiKey = input.managedEmbeddingApiKey?.trim()
+  const baseUrl = input.managedEmbeddingBaseUrl?.trim()
+  if (!model && !apiKey && !baseUrl) return undefined
+  return { model, apiKey, baseUrl }
 }
 
 function resolveEverCoreLlmProtocol(adapter: string): EverCoreManagedLlmProtocol | undefined {

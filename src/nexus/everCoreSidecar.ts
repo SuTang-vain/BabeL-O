@@ -18,6 +18,12 @@ export type EverCoreManagedLlmConfig = {
   model?: string
 }
 
+export type EverCoreManagedEmbeddingConfig = {
+  model?: string
+  apiKey?: string
+  baseUrl?: string
+}
+
 export type EverCoreInitRun = (
   command: string,
   args: string[],
@@ -34,6 +40,7 @@ export type EverCoreSidecarOptions = {
   startupTimeoutMs?: number
   healthIntervalMs?: number
   llm?: EverCoreManagedLlmConfig
+  embedding?: EverCoreManagedEmbeddingConfig
   fetch?: typeof fetch
   spawn?: EverCoreSpawn
   portAllocator?: EverCorePortAllocator
@@ -248,6 +255,7 @@ export async function startManagedEverCoreSidecar(
   const spawnEnv: NodeJS.ProcessEnv = {
     ...process.env,
     ...buildEverCoreLlmEnv(options.llm),
+    ...buildEverCoreEmbeddingEnv(options.embedding),
     EVEROS_MEMORY__ROOT: dataDir,
     EVEROS_ROOT: dataDir,
     EVEROS_API__HOST: host,
@@ -599,6 +607,26 @@ function buildEverCoreLlmEnv(llm: EverCoreManagedLlmConfig | undefined): NodeJS.
   if (apiKey) env.EVEROS_LLM__API_KEY = apiKey
   if (baseUrl) env.EVEROS_LLM__BASE_URL = baseUrl
   if (model) env.EVEROS_LLM__MODEL = model
+  return env
+}
+
+// Mirrors buildEverCoreLlmEnv for the OpenAI-compatible embedding endpoint.
+// EverOS' EmbeddingSettings requires model + api_key + base_url at runtime
+// (factory raises ValueError if any is missing → the sidecar dies before
+// /health with "Embedding model is not configured"). minimax has no
+// embedding endpoint, so unlike LLM this cannot be derived from
+// providerSettings — it must be supplied explicitly via env or the
+// persisted embeddingPassthrough bootstrap field. See proposals/
+// evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md
+// Phase 5.
+function buildEverCoreEmbeddingEnv(embedding: EverCoreManagedEmbeddingConfig | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  const apiKey = embedding?.apiKey?.trim()
+  const baseUrl = embedding?.baseUrl?.trim()
+  const model = embedding?.model?.trim()
+  if (model) env.EVEROS_EMBEDDING__MODEL = model
+  if (apiKey) env.EVEROS_EMBEDDING__API_KEY = apiKey
+  if (baseUrl) env.EVEROS_EMBEDDING__BASE_URL = baseUrl
   return env
 }
 
