@@ -44,6 +44,11 @@ export function reduceProviderTurnOutcome(options: {
   turn: Pick<RuntimeProviderTurn, 'assistantText' | 'reasoningText' | 'finishReason' | 'toolCalls' | 'toolCallTextLeakSuppression'>
   finalResponseOnlyMode: boolean
   suppressToolsForUserIntent: boolean
+  // True when the user has re-typed an option-like input to confirm a prior
+  // ambiguous selection (see isConfirmedOptionSelectionAfterClarification).
+  // When true, the option-confirmation gate below is skipped so the confirmed
+  // tool call runs. Direction 2 decoupled this gate from intent suppression.
+  confirmedOptionSelection?: boolean
   userIntentGuidance: UserIntentGuidance
   providerId?: string
   modelId?: string
@@ -160,11 +165,26 @@ export function reduceProviderTurnOutcome(options: {
     }
   }
 
-  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
-    const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
-    const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
-    const optionSelection = normalizeOptionSelection(options.userIntentGuidance.latestUserText)
+  // Option-confirmation gate: disambiguate ambiguous option-like input (a
+  // single letter such as "B") before acting on a tool call. Direction 2
+  // decoupled this gate from intent suppression — it fires whenever the user's
+  // latest input looks like an option selection, the model tried to call a
+  // tool, and the user has not yet confirmed. The gate is terminal: it asks
+  // the user to re-type the option to confirm. A single-letter input is not a
+  // reliable "tools needed" signal, so Tier 2 passthrough does not apply here.
+  // Order matters: this runs after finalResponseOnlyMode (so the over-tooling
+  // guard still short-circuits) and before intent suppression.
+  const confirmedOptionSelection = options.confirmedOptionSelection ?? false
+  const latestUserText = options.userIntentGuidance.latestUserText
+  if (
+    turn.toolCalls.length > 0 &&
+    !confirmedOptionSelection &&
+    latestUserText &&
+    options.suppressedToolRetryCount < options.maxSuppressedToolRetries
+  ) {
+    const optionSelection = normalizeOptionSelection(latestUserText)
     if (optionSelection) {
+      const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
       const clarification = buildOptionSelectionClarificationMessage({
         optionSelection,
         attemptedTools,
@@ -198,6 +218,14 @@ export function reduceProviderTurnOutcome(options: {
         ...baseCounts,
       }
     }
+  }
+
+  // Intent suppression (Tier 1 only after direction 2 — pure-capability
+  // question / pause / greeting; see shouldSuppressToolsForIntent). The
+  // option-confirmation gate above has already been handled independently.
+  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
+    const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
+    const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
     return {
       kind: 'continue',
       eventsBeforeMessages: [

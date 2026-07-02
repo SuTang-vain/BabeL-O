@@ -890,9 +890,13 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(shouldSuppressToolsForIntent(underclassified), false)
   })
 
-  test('Mode B negative: guard is scoped to intent=continue + actionHint=normal', () => {
-    // prioritize_latest must NOT fire the guard — still suppressible when the
-    // model said requiresTools=false.
+  test('Mode B under direction 2: continue + prioritize_latest + requiresTools=false passes through (Tier 2)', () => {
+    // Direction 2 (structural passthrough) supersedes the stopgap scoping:
+    // continue+prioritize_latest+requiresTools=false is Tier 2 and no longer
+    // suppressed — the model's tool call is the ground-truth signal that tools
+    // are needed. Fix B (stopgap) still keeps requiresTools=false here (the
+    // guard is scoped to continue+normal); see the direction-2 block below for
+    // full Tier 2 coverage.
     const prioritizeLatest = normalizeGuidancePolicy(modelGuidance({
       intent: 'continue',
       actionHint: 'prioritize_latest',
@@ -900,9 +904,9 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
       latestUserText: 'look at this other path instead',
     }))
     assert.equal(prioritizeLatest.requiresTools, false)
-    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), true)
+    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), false)
 
-    // pause normalizes to respond_only before the guard; still suppressed.
+    // pause normalizes to respond_only; Tier 1 — still suppressed.
     const pause = normalizeGuidancePolicy(modelGuidance({
       intent: 'pause',
       actionHint: 'normal',
@@ -923,6 +927,119 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(status.actionHint, 'respond_only')
     assert.equal(status.requiresTools, false)
     assert.equal(shouldSuppressToolsForIntent(status), false)
+  })
+})
+
+describe('Intent tool suppression structural passthrough (direction 2)', () => {
+  // See docs/nexus/proposals/intent-tool-suppression-structural-passthrough-plan.md.
+  // Two-tier suppression: Tier 1 (pure-capability + pause + greeting) keeps
+  // hard suppress; Tier 2 (continue / new_focus / correction with
+  // requiresTools=false) gets first-call passthrough — the model's tool call
+  // is the ground-truth signal that tools are needed. Over-tooling stays
+  // handled by finalResponseOnlyMode / TOOL_LOOP_FINAL_RESPONSE_ONLY.
+  //
+  // Inputs are chosen to avoid the normalizeGuidancePolicy overrides
+  // (isCurrentStateVerificationRequest / isMemoryAvailabilityCheckRequest /
+  // isPureMemoryCapabilityQuestion), which would force requiresTools=true and
+  // mask the Tier 2 suppression branch under test.
+
+  function modelGuidance(overrides: Partial<UserIntentGuidance>): UserIntentGuidance {
+    return {
+      intent: 'continue',
+      confidence: 0.8,
+      continuity: 0.8,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget: 'unknown',
+      reason: 'test',
+      latestUserText: 'continue with the next step',
+      explicitPaths: [],
+      source: 'model',
+      ...overrides,
+    }
+  }
+
+  test('Tier 2: continue + requiresTools=false + respond_only passes through (no suppression)', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '继续总结一下',
+      reason: 'Pure analytical continuation, no tool-backed verification requested.',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 2: new_focus + requiresTools=false passes through', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'new_focus',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '换个角度看设计',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 2: correction + requiresTools=false passes through', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'correction',
+      actionHint: 'prioritize_latest',
+      requiresTools: false,
+      latestUserText: '不是这个，换一个',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 1 non-regression: pure capability question still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你有长期记忆吗？',
+    }))
+    assert.equal(guidance.intent, 'status')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: pause still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '等一下',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: greeting still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'greeting',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你是谁？',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: status + respond_only is not hard-suppressed', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: 'what is the current state',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
   })
 })
 
@@ -3094,6 +3211,82 @@ describe('LLMCodingRuntime', () => {
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, true)
     assert.match(resultEvent.message, /已完成验证/)
+  })
+
+  test('direction 2: passes through tool calls for task-continuation intent under-classified as requiresTools=false', async () => {
+    // Regression fixture for session_eafe6bfc (Glob/Read) and the
+    // session_b7f64aa1 / session_9b1c212c class in the intent-guidance Active
+    // Plan: continue + requiresTools=false (Mode B under-classification) and
+    // the model emits a tool. Before direction 2 the runtime suppressed the
+    // tool call and wasted a nudge turn (and could fail the session if the user
+    // cancelled during the nudge); after direction 2 the tool runs on the first
+    // main turn (first-call passthrough).
+    const cwd = join(tmpdir(), `babel-o-test-tier2-passthrough-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.85,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Analytical continuation.\\",\\"guidance\\":\\"Continue the analysis.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      const nextStream = fetchCalls.length === 1
+        ? createAnthropicToolUseStream({ id: 'tool-tier2-1', name: 'Bash', input: { command: 'pwd', timeoutMs: 15000 } })
+        : createAnthropicTextStream('已继续完成分析。')
+      return {
+        ok: true,
+        status: 200,
+        body: nextStream,
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-tier2-passthrough-continue-respond-only',
+        prompt: '继续总结一下',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    // No suppression nudge — the model's tool call runs on the first main turn.
+    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+    assert.equal(suppressionError, undefined)
+
+    const toolStartedEvents = events.filter(event => event.type === 'tool_started') as any[]
+    assert.equal(toolStartedEvents.length, 1)
+    assert.equal(toolStartedEvents[0]?.name, 'Bash')
+
+    // Two main-turn calls: tool_use (runs) + final text response. No nudge turn.
+    assert.equal(fetchCalls.length, 2)
+
+    // Tools were visible on the first main turn (not hidden by suppression).
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.ok(firstBody.tools, 'tools should be visible on the first turn for Tier 2 passthrough')
+    assert.deepEqual(firstBody.tools.map((tool: any) => tool.name), ['Bash'])
   })
 
   test('asks user to confirm ambiguous option input before running tools', async () => {

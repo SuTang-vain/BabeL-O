@@ -1000,6 +1000,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           turn: providerTurn,
           finalResponseOnlyMode,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
+          confirmedOptionSelection,
           userIntentGuidance: assembledContext.userIntentGuidance,
           providerId: settings.providerId,
           modelId: cleanedModelId,

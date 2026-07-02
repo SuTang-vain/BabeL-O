@@ -418,6 +418,8 @@ toolMode=enabled 或 available_for_verification
 
 ## Phase C — Suppression Policy Reform
 
+> **Status: Closed.** Landed via the stopgap (PR #13 — Fix A action-verb negation in `isPureMemoryCapabilityQuestion`; Fix B `continue+normal` Turn Policy guard) plus the direction 2 structural root-cure (PR #15 — two-tier suppression: Tier 1 hard suppress for pure-capability / pause / greeting; Tier 2 first-call passthrough for `continue` / `new_focus` / `correction` with `requiresTools=false`; `TOOL_CALL_NEEDS_USER_CONFIRMATION` option-confirmation gate decoupled from the suppression branch). `finalResponseOnlyMode` over-tooling protection unchanged. Verified by `npm test` (1254/1254), `docs:check`, and a real-session spot check (minimax/MiniMax-M3: Mode B intake `new_focus/requiresTools=false` + 25 tool calls, zero `TOOL_CALL_SUPPRESSED_BY_USER_INTENT`). Design + implementation records folded in from [../archive/intent-tool-suppression-stopgap-plan.md](../archive/intent-tool-suppression-stopgap-plan.md) and [../archive/intent-tool-suppression-structural-passthrough-plan.md](../archive/intent-tool-suppression-structural-passthrough-plan.md). The original Plan snippet below is the historical narrowing proposal; direction 2's two-tier design supersedes it.
+
 Priority: P0.
 
 ### Problem
