@@ -120,8 +120,11 @@ integrity?: { sha256: string }
 | Phase 0 | Closed 2026-07-02 | Admit this proposal and implement minimal Agent Skills package loading (`*/SKILL.md`) into `NormalizedSkill`. | Legacy tests still pass; new tests prove package load, standard metadata mapping, and overlay compatibility. |
 | Phase 1 | Closed 2026-07-02 | Replace ad hoc front matter parsing with a small YAML-compatible parser sufficient for nested `metadata.babel-o`. | Existing legacy fields parse identically; nested metadata maps to IR. |
 | Phase 2 | Closed 2026-07-02 | Resource index hardening for `scripts/`, `references/`, `assets/`; path traversal / symlink guard; no execution. | `SkillShow` exposes resource metadata; resource paths cannot escape package root, including via symlink or realpath drift. |
+| Phase 2.x | Closed 2026-07-02 | Top-level companion `.md` and non-canonical top-level asset dirs in `listPackageResources`. Skips `.git` / `node_modules` / hidden / `.*` dirs by name before any `lstat`. Realpath + symlink guard preserved. | Real Anthropic-published `pdf` exposes `forms.md` + `reference.md` as `kind: 'reference'`; `canvas-design` exposes all 81 `canvas-fonts/*` as `kind: 'asset'`; `.git/HEAD` and `node_modules/` are skipped; symlink escape from non-canonical dir still rejected. |
 | Phase 3 | Closed 2026-07-02 | Discovery semantics: matcher uses explicit invocation > `metadata.babel-o.triggers` > `description` > `name`. | Prompt with description-only package can match without private triggers. |
+| Phase 3.x | Closed 2026-07-02 | Matcher quality gate: description length cap (200 terms), long-description hit-ratio floor (0.05) with 0.25× penalty, length penalty (`max(0.5, 200/termCount)`), absolute description-only hit floor (2). Trigger precedence unchanged. | Real prompt "merge two PDF files together" no longer demotes explicit-trigger skill below a 785-char description-only match; single-substring coincidence description matches dropped; existing trigger-priority tests monotonic. |
 | Phase 4 | Partially Landed 2026-07-02 | Import/export preview APIs and tools for folder/zip/git path. | Local directory import preview/install and export preview/write are landed; zip/git remain open. |
+| Phase 4.x | Closed 2026-07-02 | `SkillShow` progressive disclosure surface: companion references (`kind: 'reference'`) and companion assets (`kind: 'asset'`) sorted by path; `formatSkill()` renders `## Companion Resources` / `## Companion Assets` sections deterministically. | Real Anthropic `pdf` `SkillShow` returns `companionReferences.length === 2`; `canvas-design` `SkillShow` returns `companionAssets.length === 81`; tool prompt updated to surface companion paths. |
 | Phase 5 | Draft | `skills.lock.json` with origin, revision, sha256, format, installedAt. | Install/update are reproducible and auditable. |
 | Phase 6 | Draft | Marketplace metadata model, borrowing MCP Registry-style namespace/integrity concepts. | Local registry JSON can list packages; no central server required. |
 | Phase 7 | Draft | Go TUI / CLI UX: `/skill import`, `/skill export`, `/skill resources`, `/skill update`. | TUI displays package format, resources, trust, and conversion warnings. |
@@ -215,6 +218,96 @@ write path. They:
   paths;
 - require `overwrite: true` if the target package already exists.
 
+### Phase 2.x Resource Walk Hardening (real-public-sample follow-up)
+
+Real Anthropic-published skill samples (`pdf`, `docx`, `pptx`, `canvas-design`)
+surfaced three concrete gaps the canonical Phase 2 walker did not cover:
+
+1. Top-level companion `.md` files (`pdf/forms.md`, `pdf/reference.md`,
+   `pptx/editing.md`, `pptx/pptxgenjs.md`) ship alongside `SKILL.md` as the
+   publisher's progressive-disclosure follow-up docs.
+2. Non-canonical top-level asset directories (`canvas-design/canvas-fonts/`)
+   contain the entire payload of generation-style skills.
+3. Hidden directories (`.git`, `.github`, `.svn`, `.hg`, `node_modules`,
+   `__pycache__`, `.venv`, `venv`, `.idea`, `.vscode`) and any name starting
+   with `.` must be skipped before any `lstat` so a hostile package cannot
+   blow up resource indexing on `.git/HEAD` or `node_modules/` walks.
+
+`src/skills/loader.ts:listPackageResources()` now:
+
+- walks the three canonical spec dirs (`scripts` → `script`,
+  `references` → `reference`, `assets` → `asset`) with the existing
+  realpath + symlink guard preserved verbatim;
+- indexes direct top-level `*.md` children of the package root as
+  `kind: 'reference'`, except `SKILL.md` itself and standard license / readme
+  / changelog files (whitelist: `LICENSE`, `LICENSE.txt`, `LICENSE.md`,
+  `NOTICE`, `NOTICE.txt`, `README`, `README.md`, `CHANGELOG`, `CHANGELOG.md`);
+- walks any direct subdirectory of the package root that is not one of the
+  three spec dirs and not on the skip-list, recursively, as `kind: 'asset'`;
+- rejects symlink entries and any realpath that escapes the package root;
+- is deterministic: sibling order follows `path.localeCompare`.
+
+Existing `test/skills.test.ts:loadSkillsFromDir does not expose symlinked
+package resources` continues to pass unchanged. Four new tests cover the
+companion-Markdown path, the non-canonical-dir path, the skip-list path, and
+symlink escape from a non-canonical top-level dir.
+
+### Phase 3.x Matcher Quality Gate (real-public-sample follow-up)
+
+Real Anthropic `docx` description (785 chars, packed with high-frequency
+keywords Anthropic deliberately uses for their own matcher) was outscoring
+focused short-description skills on tangential prompts ("merge two PDF files
+together" returned `docx` in the top-3). The canonical Phase 3 declared
+description fallback without a quality gate.
+
+`src/skills/matcher.ts:matchSkills()` now applies a deterministic gate before
+a description hit contributes to the score:
+
+- `LONG_DESCRIPTION_THRESHOLD = 200` term-count: descriptions at or above
+  this count are treated as "long-form";
+- `LONG_DESCRIPTION_HIT_RATIO_FLOOR = 0.05`: when the description is long,
+  the hit ratio (`hitCount / termCount`) must clear this floor; otherwise
+  the description score is multiplied by `LONG_DESCRIPTION_HIT_RATIO_PENALTY`
+  = `0.25`;
+- `lengthPenalty = max(0.5, LONG_DESCRIPTION_THRESHOLD / termCount)`:
+  long descriptions that *do* clear the ratio floor are additionally scaled
+  down so a 1000-term description cannot out-score a 100-term description on
+  equivalent hit ratios;
+- `DESCRIPTION_ABSOLUTE_HIT_FLOOR = 2`: descriptions of any length must yield
+  at least 2 absolute term hits to contribute; single-substring coincidence
+  is dropped;
+- name/id tier (no trigger, no description contribution) keeps the existing
+  per-term additive rule with a 1-hit minimum;
+- trigger tier is unchanged: explicit trigger hits always outrank description
+  hits.
+
+Five existing match tests (`matchSkills scores trigger matches and sorts
+correctly`, `matchSkills can discover Agent Skills by description and name`,
+`matchSkills keeps explicit triggers ahead of description-only matches`, ...)
+continue to pass unchanged. Three new tests cover the long-description gate,
+the absolute hit floor, and trigger-priority preservation under the gate.
+
+### Phase 4.x SkillShow Progressive Disclosure (real-public-sample follow-up)
+
+`SkillShow` now exposes the kind-sorted, deterministically-ordered companion
+payload separately from the raw `resources` array:
+
+- `companionReferences: SkillResource[]` — every `kind: 'reference'`
+  resource, sorted by `path.localeCompare`;
+- `companionAssets: SkillResource[]` — every `kind: 'asset'` resource, sorted
+  by `path.localeCompare`;
+- `formatSkill()` renders two new sections after the body, only when the
+  matching companion array is non-empty:
+  - `## Companion Resources` listing `[reference] <path>` entries;
+  - `## Companion Assets` listing `[asset] <path>` entries.
+- The model-visible `SkillShow.prompt()` gained a one-line progressive
+  disclosure hint so the model knows to surface companion paths when the
+  publisher shipped them next to `SKILL.md`.
+
+The Nexus `SkillShowResponse` type was extended to declare the two new
+optional fields so external clients (notably the Go TUI) get a typed
+contract.
+
 ## Security Rules
 
 - External packages are untrusted by default.
@@ -227,13 +320,19 @@ write path. They:
 
 ## Verification
 
-Phase 0-4 local directory slices:
+Phase 0-4.x:
 
 - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-agent-skills-protocol.json BABEL_O_USER_SKILLS_DIR=/tmp/babel-o-agent-skills-user npx tsx --test --test-concurrency=1 test/skills.test.ts test/skill-registry.test.ts test/skill-tools.test.ts test/skill-schema.test.ts test/skill-read-router.test.ts test/skill-routes.test.ts test/skill-draft-route.test.ts test/skill-save-route.test.ts test/skill-validate-router.test.ts test/router-registrar.test.ts`
 - `npm run typecheck`
 - `npm run format:check`
 - `npm run docs:check`
 - `git diff --check`
+
+Phase 2.x / 3.x / 4.x real-public-sample smoke:
+
+- `git clone --depth 1 --filter=blob:none --sparse https://github.com/anthropics/skills.git /tmp/skills-e2e2/sources/skills && git -C /tmp/skills-e2e2/sources/skills sparse-checkout set skills/pdf skills/docx skills/pptx skills/canvas-design`
+- `cp -R /tmp/skills-e2e2/sources/skills/skills/{pdf,docx,pptx,canvas-design} /tmp/skills-e2e2/.babel-o/skills/`
+- `node /tmp/skills-e2e2/real-smoke.mjs` → 11 skills total; `pdf.resources.length === 10` (8 script + 2 reference: `forms.md`, `reference.md`); `pptx.resources.length === 57` (55 script + 2 reference: `editing.md`, `pptxgenjs.md`); `canvas-design.resources.length === 81` (all 81 `canvas-fonts/*` as `asset`); `docx.resources.length === 59` (no top-level companion MD).
 
 Later phases add zip/git import source, lockfile, marketplace metadata, and TUI/CLI UX focused suites.
 

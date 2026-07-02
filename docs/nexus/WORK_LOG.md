@@ -2,6 +2,29 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-07-02 — Agent Skills ecosystem protocol Phase 2.x / 3.x / 4.x real-public-sample follow-up
+
+- **背景**: 上一阶段（2026-07-02 Phase 0-4）让 BabeL-O 能消费本地 Agent Skills 目录包（`*/SKILL.md` + `scripts/` + `references/` + `assets/`），但真实 Anthropic-published skill 样本（`pdf`, `docx`, `pptx`, `canvas-design`）暴露 3 类生态真实世界缺陷：(a) 顶层 companion `.md`（`forms.md`/`reference.md`/`editing.md`/`pptxgenjs.md`）被忽略；(b) 非标资源目录（`canvas-fonts/` 81 个字体）全部丢失；(c) 长 description 的 `docx` 噪声命中比 `pdf-report-analyzer` 等 trigger 命中还强。
+- **规划准入**: 新增 `docs/nexus/proposals/skill-resource-coverage-and-matcher-quality-plan.md`（Draft，2026-07-02），登记到 `docs/nexus/proposals/README.md` 与 `docs/nexus/reference/agent-session-skill-governance-index.md`。
+- **实现**:
+  - `src/skills/loader.ts:listPackageResources()` 拆出常量 `SPEC_RESOURCE_DIRS` / `SKIPPED_TOP_LEVEL_ENTRIES` / `SKIPPED_TOP_LEVEL_DIRS`；抽出 `walkRecursive(kind, prefix, dir, rel)` 共用递归；新增顶层 companion `.md`（kind=reference）+ 顶层非标子目录递归索引（kind=asset）+ `.git`/`node_modules`/`.hidden` skip。原有 realpath + symlink + `isInsidePackage` 防逃逸全部保留。
+  - `src/skills/matcher.ts` 重写：长 description 阈值 200、hit-ratio 下界 0.05、ratio penalty 0.25、length penalty = `max(0.5, 200/termCount)`、绝对命中下界 2。trigger 优先级不变。新增 `countPromptTermHitsDetailed()` 同时返回 `{ hitCount, termCount }`，旧 `countPromptTermHits()` 被替代。
+  - `src/skills/formatter.ts` 导出 `formatCompanionResources(resources, kind, heading)`；`formatSkill()` 在 body 之后按 path localeCompare 排序后追加 `## Companion Resources` / `## Companion Assets` 段（仅非空）。
+  - `src/tools/builtin/skillTool.ts:SkillShow` 输出新增 `companionReferences` / `companionAssets` 字段（按 path 排序）；`prompt()` 增加 progressive disclosure 提示。
+  - `src/nexus/skillRoutes.ts:SkillShowResponse` 类型扩展 `companionReferences?` / `companionAssets?`；`showSkill()` handler 输出对应字段。
+  - 测试：`test/skills.test.ts` +7 个新测试（顶层 companion .md、非标资源目录、隐藏目录跳过、非标目录 symlink 防逃逸、长 description 衰减、绝对命中下界、trigger 优先级在衰减下保持）；`test/skill-tools.test.ts` +1 个新测试覆盖 `SkillShow` companion 输出。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json BABEL_O_USER_SKILLS_DIR=/tmp/babel-o-user-skills npx tsx --test --test-concurrency=1 test/skills.test.ts test/skill-registry.test.ts test/skill-tools.test.ts test/skill-routes.test.ts test/skill-schema.test.ts`: pass 70/70 (上次 62/62 → 新增 8)。
+  - `npm run typecheck`: pass。
+  - `npm run format:check`: pass。
+  - `npm run docs:check`: pass。
+  - 真实样本 smoke（`/tmp/skills-e2e2/real-smoke.mjs`）：`pdf.resources=10`（含 `forms.md` + `reference.md`，kind=reference）；`pptx.resources=57`（含 `editing.md` + `pptxgenjs.md`，kind=reference）；`canvas-design.resources=81`（含全部 `canvas-fonts/*`，kind=asset）；`docx.resources=59`（无顶层 companion .md）。
+- **毕业**:
+  - `docs/nexus/proposals/skill-resource-coverage-and-matcher-quality-plan.md` 已归档到 `docs/nexus/archive/`；`docs/nexus/proposals/README.md` 移除该行；`docs/nexus/archive/README.md` 新增该行。
+  - 主提案 `docs/nexus/proposals/agent-skills-ecosystem-protocol-governance-plan.md` Phase 表新增 Phase 2.x / 3.x / 4.x 行；新增 Phase 2.x / 3.x / 4.x narrative；Verification 段补真实样本 smoke 命令。
+  - `docs/nexus/DONE.md` 入账 Skill Resource Coverage 行。
+- **边界**: 本次只对 loader/matcher/formatter/SkillShow 做增量修补，未改 `NormalizedSkill` IR、未动 Agent Skills wire format、未启用 marketplace / lockfile / zip / git / TUI UX。
+
 ## 2026-07-02 — Agent Skills ecosystem protocol compatibility Phase 0-4 local directory slice
 
 - **背景**: 当前 skill 功能是 BabeL-O 内部可用的单文件自有协议，无法直接消费市场流通的 Agent Skills 目录包，也没有标准 `SKILL.md`、资源目录、导入/导出、来源完整性等生态互通治理。
