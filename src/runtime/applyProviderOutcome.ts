@@ -74,6 +74,7 @@ import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
 export type ApplyProviderOutcomeInput = {
   turn: any
   finalResponseOnlyMode: boolean
+  finalCheckPhase?: boolean
   suppressToolsForUserIntent: boolean
   userIntentGuidance: any
   providerId: string
@@ -134,6 +135,7 @@ export async function applyProviderOutcome(
     sessionId: input.turn.sessionId ?? '',
     turn: input.turn,
     finalResponseOnlyMode: input.finalResponseOnlyMode,
+    finalCheckPhase: input.finalCheckPhase,
     suppressToolsForUserIntent: input.suppressToolsForUserIntent,
     userIntentGuidance: input.userIntentGuidance,
     providerId: input.providerId,
