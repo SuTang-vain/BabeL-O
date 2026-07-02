@@ -1,6 +1,7 @@
 # Intent Tool Suppression Structural Passthrough Plan (Direction 2)
 
-> State: Draft
+> State: History
+> Closed: Landed via PR #15 (two-tier suppression + decoupled option-confirmation gate); folded into [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md) Phase C as the closed suppression-reform phase. See Rollout for the verified status (`npm test` 1254/1254 + real-session spot check).
 > Track: Runtime / Intent Classification / Tool Suppression / Over-tooling
 > Priority: P1
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md), [intent-tool-suppression-stopgap-plan.md](./intent-tool-suppression-stopgap-plan.md), `src/runtime/pipeline/providerTurn.ts`, `src/runtime/LLMCodingRuntime.ts`, `src/runtime/intentGuidance.ts`, `test/`

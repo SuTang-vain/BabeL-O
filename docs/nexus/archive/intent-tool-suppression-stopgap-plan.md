@@ -1,6 +1,7 @@
 # Intent Tool Suppression Stopgap Plan
 
-> State: Draft
+> State: History
+> Closed: Landed via PR #13 (Fix A action-verb negation + Fix B `continue+normal` guard). Fix B's suppression role was superseded by direction 2 (PR #15); Fix A and Fix B both remain in the codebase. Folded into [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md) Phase C together with the direction-2 proposal.
 > Track: Runtime / Intent Classification / Tool Suppression
 > Priority: P1
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md), `src/runtime/intentGuidance.ts`, `src/runtime/pipeline/providerTurn.ts`, `test/`
