@@ -2678,7 +2678,13 @@ describe('LLMCodingRuntime', () => {
     assert.match(resultEvent.message, /maximum tool call iterations/)
   })
 
-  test('hides tools and refuses new tool calls in final-response-only mode', async () => {
+  test('final_check allows one read-only check then must_respond hides tools and refuses further calls', async () => {
+    // Phase D: when the loop enters the finalization reserve (remaining <= 3)
+    // and the one bounded check is unused, the runtime narrows visible tools to
+    // the read-only whitelist (final_check) instead of hiding them. The model
+    // gets ONE read-only check; after it executes, the next turn is must_respond
+    // (tools hidden, further tool calls refused with TOOL_LOOP_FINAL_RESPONSE_ONLY).
+    // See docs/nexus/reference/runtime-tool-loop-governance-plan.md Phase D.
     const cwd = join(tmpdir(), `babel-o-test-tool-loop-guard-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
     const targetFile = join(cwd, 'notes.txt')
@@ -2698,6 +2704,22 @@ describe('LLMCodingRuntime', () => {
         ]),
       )
     }
+    // Iteration 22 (remaining=3, final_check): the one bounded read-only check
+    // is ALLOWED to pass through (Read is on the read-only whitelist).
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-final-check","name":"Read","input":{}}}\n\n`,
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+          targetFile.replace(/\\/g, '\\\\') +
+          '\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+    // Iteration 23 (remaining=2, must_respond): a further tool call is REFUSED
+    // with TOOL_LOOP_FINAL_RESPONSE_ONLY (backstop semantics unchanged).
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -2708,6 +2730,7 @@ describe('LLMCodingRuntime', () => {
         'data: {"index":0}\n\n',
       ]),
     )
+    // Iteration 24 (must_respond): final answer from existing evidence.
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -2734,16 +2757,26 @@ describe('LLMCodingRuntime', () => {
     } catch {}
 
     const toolStartedEvents = events.filter(event => event.type === 'tool_started')
-    assert.equal(toolStartedEvents.length, 21)
+    // 21 normal Reads + 1 final_check Read execute; the must_respond Read is refused.
+    assert.equal(toolStartedEvents.length, 22)
+    assert.ok(toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-final-check'))
     assert.ok(!toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-blocked'))
+
+    // final_check (iteration 22 = fetchCalls[21]): tools narrowed to the read-only
+    // whitelist, not hidden. System prompt advertises the one bounded check.
+    const finalCheckBody = JSON.parse(String(fetchCalls[21].init?.body))
+    const finalCheckToolNames = (finalCheckBody.tools ?? []).map((t: any) => t.name)
+    assert.deepEqual(finalCheckToolNames.sort(), ['Glob', 'Grep', 'ListDir', 'Read'])
+    assert.match(JSON.stringify(finalCheckBody.system), /ONE bounded read-only check/)
+
+    // must_respond (iteration 23 = fetchCalls[22]): tools hidden, further call refused.
+    const mustRespondBody = JSON.parse(String(fetchCalls[22].init?.body))
+    assert.equal(mustRespondBody.tools, undefined)
+    assert.match(JSON.stringify(mustRespondBody.system), /Runtime has hidden all tools/)
 
     const guardError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY') as any
     assert.ok(guardError)
     assert.match(guardError.message, /ignored additional requested tools/)
-
-    const finalOnlyBody = JSON.parse(String(fetchCalls[21].init?.body))
-    assert.equal(finalOnlyBody.tools, undefined)
-    assert.match(JSON.stringify(finalOnlyBody.system), /Runtime has hidden all tools/)
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)

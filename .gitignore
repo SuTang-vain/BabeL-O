@@ -6,6 +6,11 @@ dist/
 *.db
 *.sqlite
 !test/fixtures/r7-fixture.sqlite
+# SQLite WAL/journal sidecar files are regenerated when tests open a fixture in
+# WAL mode — never commit them (the tracked .sqlite fixture is the source of truth).
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
 coverage/
 .babel-o/tool-results/
 .babel-o/benchmarks/

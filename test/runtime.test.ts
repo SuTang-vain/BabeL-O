@@ -1000,7 +1000,10 @@ test('runtime pipeline builds provider loop state and execution state blocks', (
   assert.equal(loopState.turnContextCharsIn, 23)
   assert.match(loopState.executionStateBlock, /iteration 23\/25/)
   assert.match(loopState.executionStateBlock, /Files read: \/tmp\/a\.txt/)
-  assert.match(loopState.executionStateBlock, /Phase: must_respond/)
+  // remaining=2 ≤ reserve(3) AND finalCheckUsed defaults to false → final_check
+  // (one bounded read-only check before must_respond). See runtime-tool-loop-
+  // governance-plan.md Phase D.
+  assert.match(loopState.executionStateBlock, /Phase: final_check/)
 
   const synthesizeBlock = buildRuntimeExecutionStateBlock({
     loopCount: 4,
@@ -1013,6 +1016,128 @@ test('runtime pipeline builds provider loop state and execution state blocks', (
   })
   assert.match(synthesizeBlock, /Phase: synthesize/)
   assert.match(synthesizeBlock, /Present your findings now/)
+})
+
+test('runtime pipeline final_check phase narrows visible tools to read-only when !finalCheckUsed', () => {
+  // See docs/nexus/reference/runtime-tool-loop-governance-plan.md Phase D.
+  const currentToolsList = [
+    { name: 'Read', description: 'read', inputSchema: { type: 'object' } },
+    { name: 'Grep', description: 'grep', inputSchema: { type: 'object' } },
+    { name: 'Glob', description: 'glob', inputSchema: { type: 'object' } },
+    { name: 'ListDir', description: 'listdir', inputSchema: { type: 'object' } },
+    { name: 'Write', description: 'write', inputSchema: { type: 'object' } },
+    { name: 'Edit', description: 'edit', inputSchema: { type: 'object' } },
+    { name: 'Bash', description: 'bash', inputSchema: { type: 'object' } },
+  ]
+  const requestState = buildProviderLoopRequestState({
+    loopCount: 23,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    systemPrompt: 'system',
+    messages: [],
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    finalResponseOnlyRemainingLoops: 3,
+    finalCheckUsed: false,
+  })
+  assert.equal(requestState.finalResponseOnlyMode, true)
+  assert.equal(requestState.finalCheckPhase, true)
+  assert.deepEqual(requestState.modelVisibleTools.map((t: any) => t.name), ['Read', 'Grep', 'Glob', 'ListDir'])
+  assert.match(requestState.executionStateBlock, /Phase: final_check/)
+})
+
+test('runtime pipeline final_check phase: finalCheckUsed=true falls through to must_respond', () => {
+  const currentToolsList = [{ name: 'Read', description: 'r', inputSchema: { type: 'object' } }]
+  const requestState = buildProviderLoopRequestState({
+    loopCount: 23,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    systemPrompt: 'system',
+    messages: [],
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    finalResponseOnlyRemainingLoops: 3,
+    finalCheckUsed: true,
+  })
+  assert.equal(requestState.finalResponseOnlyMode, true)
+  assert.equal(requestState.finalCheckPhase, false)
+  assert.deepEqual(requestState.modelVisibleTools, [])
+  assert.match(requestState.executionStateBlock, /Phase: must_respond/)
+})
+
+test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL_DENIED_FINAL_CHECK', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-final-check-deny',
+    turn: {
+      assistantText: '',
+      reasoningText: '',
+      toolCalls: [{ id: 't1', name: 'Write', partialInput: '{}' }],
+    },
+    finalResponseOnlyMode: true,
+    finalCheckPhase: true,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+  assert.equal(outcome.kind, 'continue')
+  const err = outcome.eventsBeforeMessages[0] as any
+  assert.equal(err?.code, 'TOOL_DENIED_FINAL_CHECK')
+})
+
+test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass through', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-final-check-allow',
+    turn: {
+      assistantText: 'let me re-read',
+      reasoningText: '',
+      toolCalls: [{ id: 't1', name: 'Read', partialInput: '{"path":"a.txt"}' }],
+    },
+    finalResponseOnlyMode: true,
+    finalCheckPhase: true,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+  assert.equal(outcome.kind, 'tool_calls')
+  assert.equal(outcome.toolCalls.length, 1)
+})
+
+test('buildRuntimeExecutionStateBlock surfaces repeated tool input evidence', () => {
+  const block = buildRuntimeExecutionStateBlock({
+    loopCount: 12,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    contextTokenEstimate: 5_000,
+    contextMaxTokens: 10_000,
+    finalResponseOnlyRemainingLoops: 3,
+    repeatedToolInputs: [{
+      name: 'Bash',
+      inputPreview: 'npx tsx --test test/mcp.test.ts',
+      count: 3,
+      latestTimestamp: '2026-07-02T02:15:55.000Z',
+    }],
+  })
+  assert.match(block, /Phase: synthesize/)
+  assert.match(block, /Repeated tool inputs: Bash .+ ×3/)
 })
 
 test('runtime pipeline builds provider loop request state and query params', () => {

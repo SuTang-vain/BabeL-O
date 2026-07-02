@@ -4,7 +4,7 @@
 > Track: Agent Runtime / Session Collaboration / Skill Product Loop
 > Priority: P1 Watch
 > Source of truth: `docs/nexus/TODO.md`, `docs/nexus/active/TODO_agents.md`, `docs/nexus/active/TODO_runtime.md`, `docs/nexus/active/TODO_tui.md`, `docs/nexus/active/TODO_performance.md`, `docs/nexus/DONE.md`, `docs/nexus/WORK_LOG.md`, `src/nexus/`, `src/runtime/`, `src/skills/`, `src/storage/`, `clients/go-tui/`
-> Related: [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md), [context-and-agent-history.md](../history/context-and-agent-history.md), [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md), [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md), [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [memory-governance-plan.md](./memory-governance-plan.md), [tool-governance-plan.md](./tool-governance-plan.md)
+> Related: [agent-runtime-architecture-maturity-plan.md](./agent-runtime-architecture-maturity-plan.md), [context-and-agent-history.md](../history/context-and-agent-history.md), [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md), [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md), [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md), [agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md), [memory-governance-plan.md](./memory-governance-plan.md), [tool-governance-plan.md](./tool-governance-plan.md)
 
 ## Purpose
 
@@ -16,6 +16,7 @@ The boundary is:
 - Session Graph owns the read-only projected runtime map that connects sessions, events, tool calls, permissions, scope boundaries, child sessions, and channel evidence for users.
 - Session collaboration owns typed side-channel messages, inbox, relationship visibility, and parent-child collaboration context.
 - Skill governance owns explicit skill listing, validation, invocation, draft generation, and save boundaries.
+- Agent Skills ecosystem compatibility owns external package/interchange compatibility, import/export, resource indexing, and marketplace/lockfile governance; it must not replace the existing BabeL-O skill product loop.
 - Memory governance owns long-term hint authority and EverCore / EverOS lifecycle.
 - Tool governance owns tool classes, tool failure semantics, MCP/native tool coexistence, and new-tool admission.
 
@@ -28,6 +29,7 @@ The boundary is:
 | [session-graph-runtime-map-governance-plan.md](../proposals/session-graph-runtime-map-governance-plan.md) | Session Graph runtime map proposal. | Use for projecting existing session/event/tool/permission/child-session/channel facts into a user-readable graph without creating a second source of truth. |
 | [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md) | TUI relationship visibility over SessionChannel. | Use for footer indicators, session list badges, tree/activity/graph views, and quote/ack UX boundaries. |
 | [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Skill execution and skill generation product loop. | Use for skill schema, registry, validator, explicit skill tools, draft/save confirmation, and diagnostics. |
+| [agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md) | External skill package/interchange compatibility proposal. | Use for Agent Skills `SKILL.md` package compatibility, import/export, resources, lockfile, marketplace metadata, and compatibility adapters. |
 
 ## Governance Rules
 
@@ -80,6 +82,7 @@ The current implementation already has meaningful slices:
 | SessionChannel API/storage/context invariants | [context-and-agent-history.md](../history/context-and-agent-history.md) | Partially landed; keep evidence-first. |
 | TUI relationship visibility polish | [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md) | Draft / UX follow-up. |
 | Explicit skill tools and normalized skill generation | [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Partially landed substrate; product loop open. |
+| Agent Skills ecosystem compatibility | [agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md) | Partially landed; Phase 0-3 closed and Phase 4 local directory import/export preview/write landed; zip/git and lockfile next. |
 
 ## Verification Expectations
 

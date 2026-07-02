@@ -25,13 +25,14 @@ Implemented pieces:
 - Generic recoverable tool execution failures can be returned to the provider as `tool_result is_error=true` instead of terminal `TOOL_ERROR`.
 - Built-in tools have lightweight structured repair hints for common recoverable failures.
 - Runtime already has final-response-only and respond-only suppression paths for known tool-call-shaped text dialects.
+- Phase D (landed): a first-class `final_check` state allows exactly one bounded read-only check (Read/Grep/Glob/ListDir) before `must_respond`; write/execute/task tools are denied with `TOOL_DENIED_FINAL_CHECK`. `must_respond` remains the backstop (`TOOL_LOOP_FINAL_RESPONSE_ONLY`) once the one check is used or budget is exhausted.
+- Phase C (partially landed): loop-budget state is surfaced in the model-visible execution state block (iteration count, context %, phase, finalization reason), and `findRepeatedToolInputs` surfaces the top repeated tool input as a concrete nudge (e.g. `Bash npx tsx --test test/mcp.test.ts ×3 — reuse the latest result`) at phase ≥ synthesize.
 
 Open pieces:
 
 - DSML / full-width pseudo tool-call text needs a formal dialect entry and regression coverage.
-- Tool-loop budget is still primarily fixed around `maxLoops` and a reserve window.
-- There is no first-class `final_check` state that allows exactly one bounded read-only check before `must_respond`.
-- Loop budget diagnostics are not yet consistently exposed as explicit runtime state.
+- Phase C remainder: the loop budget is still implicit (`maxLoops=25`, reserve `3`) rather than a first-class typed `ToolLoopBudget` struct with a `reason` field; the pragmatic surfacing covers the user-visible failure but not the full typed contract.
+- Phase D remainder: per-tool "bounded" enforcement (Read line ranges, target-path-in-scope checks, "the same input has not already failed") is intentionally deferred — the first version gates on the read-only whitelist + a single `final_check` turn only (see Non-goals).
 
 ## Problem Statement
 
@@ -159,8 +160,8 @@ Never grant `final_check` for `Write`, `Edit`, `Bash`, `TaskCreate`, `SkillSave`
 | --- | --- | --- | --- |
 | Phase A | Partially Landed | Recoverable tool result path and structured repair hints. | Recoverable tool failures are provider-visible and paired to the original tool call. |
 | Phase B | Active Plan | DSML and text-tool dialect registry. | Hidden-tool DSML is suppressed and retried; visible-tools DSML remains suppress-only until strict parser tests exist. |
-| Phase C | Active Plan | Loop budget diagnostics. | Invocation diagnostics and execution metrics expose loop state and finalization reason. |
-| Phase D | Active Plan | One bounded `final_check`. | One read-only in-scope check can run before `must_respond`; write/execute/task tools are denied. |
+| Phase C | Partially Landed | Loop budget diagnostics. | Invocation diagnostics and execution metrics expose loop state and finalization reason. (Iteration/phase/reason surfaced in execution state block; top repeated-tool input nudge wired via `findRepeatedToolInputs`. Typed `ToolLoopBudget` struct + `reason` field remain open.) |
+| Phase D | Landed | One bounded `final_check`. | One read-only in-scope check can run before `must_respond`; write/execute/task tools are denied with `TOOL_DENIED_FINAL_CHECK`. Per-tool bounded enforcement deferred (Non-goal). |
 | Phase E | Watch | Adaptive budget profiles. | Any expanded budget is justified by task intent, context pressure, timeout pressure, and tool novelty telemetry. |
 
 ## Verification
@@ -196,8 +197,8 @@ The following documents are superseded by this plan and now live in `archive/` f
 
 ### 当前状态
 
-Recoverable tool failure 的基础能力已经部分落地；DSML dialect registry、loop budget diagnostics 和 `final_check` 仍是打开项。
+Recoverable tool failure 的基础能力已部分落地；Phase D（`final_check` 一次有界只读检查）已落地，Phase C（loop budget diagnostics）已部分落地（执行状态块暴露迭代/阶段/原因 + 重复工具输入 nudge）。剩余打开项：DSML dialect registry、Phase C 的 typed `ToolLoopBudget` 结构、Phase D 的 per-tool bounded 强制。
 
 ### 下一步
 
-优先补 DSML suppress regression 和 loop budget diagnostics，然后再实现 `final_check`，不要通过简单提高 `maxLoops` 来掩盖长任务问题。
+优先补 DSML suppress regression，再视长任务 telemetry 决定是否补 typed budget 结构与 per-tool bounded 强制。不要通过简单提高 `maxLoops` 来掩盖长任务问题。

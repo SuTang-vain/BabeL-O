@@ -5,6 +5,10 @@ import path from 'path'
 import os from 'os'
 import {
   skillDraftTool,
+  skillExportPreviewTool,
+  skillExportWriteTool,
+  skillImportInstallTool,
+  skillImportPreviewTool,
   skillListTool,
   skillSaveTool,
   skillShowTool,
@@ -38,22 +42,30 @@ coding body`,
   return { cwd, builtInDir, projectSkillsDir }
 }
 
-test('createDefaultToolRegistry exposes the 5 Skill tools', () => {
+test('createDefaultToolRegistry exposes Skill tools', () => {
   const reg = createDefaultToolRegistry()
   assert.ok(reg.has('SkillList'))
   assert.ok(reg.has('SkillShow'))
   assert.ok(reg.has('SkillValidate'))
   assert.ok(reg.has('SkillDraft'))
+  assert.ok(reg.has('SkillExportPreview'))
+  assert.ok(reg.has('SkillExportWrite'))
+  assert.ok(reg.has('SkillImportPreview'))
+  assert.ok(reg.has('SkillImportInstall'))
   assert.ok(reg.has('SkillSave'))
 })
 
 test('SkillSave has write risk and requires approval', () => {
   assert.equal(skillSaveTool.risk, 'write')
   assert.equal(skillSaveTool.requiresApproval, true)
+  assert.equal(skillExportWriteTool.risk, 'write')
+  assert.equal(skillExportWriteTool.requiresApproval, true)
+  assert.equal(skillImportInstallTool.risk, 'write')
+  assert.equal(skillImportInstallTool.requiresApproval, true)
 })
 
-test('SkillList / SkillShow / SkillValidate / SkillDraft have read risk and no approval gate', () => {
-  for (const tool of [skillListTool, skillShowTool, skillValidateTool, skillDraftTool]) {
+test('SkillList / SkillShow / SkillValidate / SkillDraft / SkillExportPreview / SkillImportPreview have read risk and no approval gate', () => {
+  for (const tool of [skillListTool, skillShowTool, skillValidateTool, skillDraftTool, skillExportPreviewTool, skillImportPreviewTool]) {
     assert.equal(tool.risk, 'read')
     assert.notEqual(tool.requiresApproval, true)
   }
@@ -67,6 +79,257 @@ test('SkillList returns built-in + project skills with source attribution', asyn
     const skills = (result.output as { skills: Array<{ id: string; source: string }> }).skills
     const ids = skills.map(s => s.id)
     assert.ok(ids.includes('coding'))
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillList and SkillShow expose Agent Skills package metadata', async () => {
+  const { cwd, builtInDir, projectSkillsDir } = await makeProjectTreeWithBuiltIn('Coding')
+  const packageDir = path.join(projectSkillsDir, 'context-debugging')
+  await fs.mkdir(path.join(packageDir, 'references'), { recursive: true })
+  try {
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata.babel-o.triggers: [context assembly, tool suppression]
+metadata.babel-o.priority: 80
+---
+# Purpose
+Debug context issues.`
+    )
+    await fs.writeFile(path.join(packageDir, 'references', 'flow.md'), '# Flow')
+
+    const listResult = await skillListTool.execute({ cwd, builtInDir }, baseContext(cwd))
+    assert.equal(listResult.success, true)
+    const skills = (listResult.output as { skills: Array<{ id: string; sourceFormat: string; resources: Array<{ path: string }> }> }).skills
+    const listed = skills.find(skill => skill.id === 'context-debugging')
+    assert.ok(listed)
+    assert.equal(listed.sourceFormat, 'agent-skills-v1')
+    assert.equal(listed.resources[0]?.path, 'references/flow.md')
+
+    const showResult = await skillShowTool.execute({ cwd, builtInDir, id: 'context-debugging' }, baseContext(cwd))
+    assert.equal(showResult.success, true)
+    const shown = (showResult.output as { skill: { id: string; sourceFormat: string; manifestPath: string; resources: Array<{ path: string }>; body: string } }).skill
+    assert.equal(shown.id, 'context-debugging')
+    assert.equal(shown.sourceFormat, 'agent-skills-v1')
+    assert.equal(shown.manifestPath, path.join(packageDir, 'SKILL.md'))
+    assert.equal(shown.resources[0]?.path, 'references/flow.md')
+    assert.match(shown.body, /description: Debug context assembly and tool suppression issues\./)
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillImportPreview previews a local Agent Skills package without saving it', async () => {
+  const { cwd, builtInDir, projectSkillsDir } = await makeProjectTreeWithBuiltIn('Coding')
+  const sourcePackageDir = path.join(cwd, 'external-skills', 'context-debugging')
+  await fs.mkdir(path.join(sourcePackageDir, 'references'), { recursive: true })
+  try {
+    await fs.writeFile(
+      path.join(projectSkillsDir, 'context-debugging.md'),
+      `---
+id: context-debugging
+name: Context Debugging
+triggers: [context]
+priority: 1
+---
+existing`,
+    )
+    await fs.writeFile(
+      path.join(sourcePackageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    triggers:
+      - context assembly
+---
+# Purpose
+Debug context issues.`
+    )
+    await fs.writeFile(path.join(sourcePackageDir, 'references', 'flow.md'), '# Flow')
+
+    const result = await skillImportPreviewTool.execute(
+      { cwd, builtInDir, sourcePath: sourcePackageDir },
+      baseContext(cwd),
+    )
+    assert.equal(result.success, true)
+    const output = result.output as {
+      ok: true
+      previewOnly: true
+      skill: { id: string; sourceFormat: string }
+      resources: Array<{ path: string }>
+      warnings: Array<{ code: string }>
+      targetPath: string
+    }
+    assert.equal(output.ok, true)
+    assert.equal(output.previewOnly, true)
+    assert.equal(output.skill.id, 'context-debugging')
+    assert.equal(output.skill.sourceFormat, 'agent-skills-v1')
+    assert.equal(output.resources[0]?.path, 'references/flow.md')
+    assert.ok(output.warnings.some(warning => warning.code === 'SKILL_IMPORT_DUPLICATE_ID'))
+    assert.match(output.targetPath, /\.babel-o\/skills\/context-debugging$/)
+    await assert.rejects(fs.access(output.targetPath))
+    const targetContent = await fs.readFile(path.join(projectSkillsDir, 'context-debugging.md'), 'utf-8')
+    assert.equal(targetContent.includes('existing'), true)
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillImportInstall installs a local Agent Skills package after confirmation', async () => {
+  const { cwd, builtInDir } = await makeProjectTreeWithBuiltIn('Coding')
+  const sourcePackageDir = path.join(cwd, 'external-skills', 'context-debugging')
+  await fs.mkdir(path.join(sourcePackageDir, 'references'), { recursive: true })
+  try {
+    await fs.writeFile(
+      path.join(sourcePackageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    triggers:
+      - context assembly
+---
+# Purpose
+Debug context issues.`
+    )
+    await fs.writeFile(path.join(sourcePackageDir, 'references', 'flow.md'), '# Flow')
+
+    const previewResult = await skillImportInstallTool.execute(
+      { cwd, builtInDir, sourcePath: sourcePackageDir, confirm: false },
+      baseContext(cwd),
+    )
+    assert.equal(previewResult.success, true)
+    const previewOutput = previewResult.output as { ok: boolean; previewOnly: boolean; preview: { targetPath: string } }
+    assert.equal(previewOutput.ok, false)
+    assert.equal(previewOutput.previewOnly, true)
+    await assert.rejects(fs.access(previewOutput.preview.targetPath))
+
+    const installResult = await skillImportInstallTool.execute(
+      { cwd, builtInDir, sourcePath: sourcePackageDir, confirm: true },
+      baseContext(cwd),
+    )
+    assert.equal(installResult.success, true)
+    const output = installResult.output as { ok: true; targetPath: string; skillId: string; format: string }
+    assert.equal(output.skillId, 'context-debugging')
+    assert.equal(output.format, 'new')
+    const manifest = await fs.readFile(path.join(output.targetPath, 'SKILL.md'), 'utf-8')
+    assert.match(manifest, /name: context-debugging/)
+    const reference = await fs.readFile(path.join(output.targetPath, 'references', 'flow.md'), 'utf-8')
+    assert.equal(reference, '# Flow')
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillExportPreview previews an Agent Skills package without writing it', async () => {
+  const { cwd, builtInDir, projectSkillsDir } = await makeProjectTreeWithBuiltIn('Coding')
+  try {
+    await fs.writeFile(
+      path.join(projectSkillsDir, 'context-debugging.md'),
+      `---
+id: context-debugging
+name: Context Debugging
+description: Debug context assembly and tool suppression issues.
+triggers: [context assembly]
+priority: 80
+risk: read
+allowedTools: [Read, Grep]
+---
+# Purpose
+Debug context issues.`,
+    )
+
+    const result = await skillExportPreviewTool.execute(
+      { cwd, builtInDir, id: 'context-debugging', targetDir: 'exports' },
+      baseContext(cwd),
+    )
+    assert.equal(result.success, true)
+    const output = result.output as {
+      ok: true
+      previewOnly: true
+      packageRoot: string
+      manifestPath: string
+      manifest: string
+      conversion: { targetFormat: string }
+    }
+    assert.equal(output.ok, true)
+    assert.equal(output.previewOnly, true)
+    assert.equal(output.conversion.targetFormat, 'agent-skills-v1')
+    assert.equal(output.packageRoot, path.join(cwd, 'exports', 'context-debugging'))
+    assert.equal(output.manifestPath, path.join(cwd, 'exports', 'context-debugging', 'SKILL.md'))
+    assert.match(output.manifest, /name: context-debugging/)
+    assert.match(output.manifest, /metadata:\n  babel-o:/)
+    assert.match(output.manifest, /allowed-tools: Read Grep/)
+    await assert.rejects(fs.access(output.packageRoot))
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillExportWrite writes an Agent Skills package after confirmation', async () => {
+  const { cwd, builtInDir, projectSkillsDir } = await makeProjectTreeWithBuiltIn('Coding')
+  try {
+    const packageDir = path.join(projectSkillsDir, 'context-debugging')
+    await fs.mkdir(path.join(packageDir, 'references'), { recursive: true })
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    displayName: Context Debugging
+    triggers:
+      - context assembly
+    priority: 80
+    risk: read
+---
+# Purpose
+Debug context issues.`,
+    )
+    await fs.writeFile(path.join(packageDir, 'references', 'flow.md'), '# Flow')
+
+    const previewResult = await skillExportWriteTool.execute(
+      { cwd, builtInDir, id: 'context-debugging', targetDir: 'exports', confirm: false },
+      baseContext(cwd),
+    )
+    assert.equal(previewResult.success, true)
+    const previewOutput = previewResult.output as { ok: boolean; previewOnly: boolean; preview: { packageRoot: string } }
+    assert.equal(previewOutput.ok, false)
+    assert.equal(previewOutput.previewOnly, true)
+    await assert.rejects(fs.access(previewOutput.preview.packageRoot))
+
+    const writeResult = await skillExportWriteTool.execute(
+      { cwd, builtInDir, id: 'context-debugging', targetDir: 'exports', confirm: true },
+      baseContext(cwd),
+    )
+    assert.equal(writeResult.success, true)
+    const output = writeResult.output as { ok: true; packageRoot: string; manifestPath: string; format: string }
+    assert.equal(output.format, 'new')
+    const manifest = await fs.readFile(output.manifestPath, 'utf-8')
+    assert.match(manifest, /name: context-debugging/)
+    assert.match(manifest, /metadata:\n  babel-o:/)
+    const exportedReference = await fs.readFile(path.join(output.packageRoot, 'references', 'flow.md'), 'utf-8')
+    assert.equal(exportedReference, '# Flow')
+
+    const conflictResult = await skillExportWriteTool.execute(
+      { cwd, builtInDir, id: 'context-debugging', targetDir: 'exports', confirm: true },
+      baseContext(cwd),
+    )
+    assert.equal(conflictResult.success, false)
+    const conflictOutput = conflictResult.output as { errorCode: string }
+    assert.equal(conflictOutput.errorCode, 'SKILL_EXPORT_OVERWRITE_REQUIRED')
   } finally {
     await fs.rm(cwd, { recursive: true, force: true })
   }

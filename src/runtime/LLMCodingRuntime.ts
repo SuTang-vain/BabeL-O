@@ -101,6 +101,7 @@ import { formatWorkingSet } from './workingSet.js'
 import { formatHint } from './formatHint.js'
 import type { AssembledContext } from './contextAssembler.js'
 import { HISTORY_EVENT_LOAD_LIMIT_MAX } from './contextAssembler.js'
+import { findRepeatedToolInputs } from './contextAnalysis.js'
 import type { WorkingSet } from './workingSetTracker.js'
 import { ProviderSessionRules } from './providerSessionRules.js'
 
@@ -595,6 +596,10 @@ export class LLMCodingRuntime implements NexusRuntime {
       let loopCount = 0
       const maxLoops = 25
       let finalResponseOnlyMode = false
+      // Phase D: tracks whether the one bounded read-only `final_check` has
+      // been used. Set after a read-only tool dispatch in final_check so the
+      // next turn falls through to must_respond.
+      let finalCheckUsed = false
       let outputRetryCount = 0
       const MAX_OUTPUT_RETRIES = 2
       const MAX_TOKEN_RECOVERIES = 3
@@ -637,6 +642,8 @@ export class LLMCodingRuntime implements NexusRuntime {
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
           cacheAwareCompactPolicy,
           finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+          finalCheckUsed,
+          repeatedToolInputs: findRepeatedToolInputs(previousEvents).slice(0, 1),
         })
         currentToolsList = requestState.currentToolsList
         modelVisibleTools = requestState.modelVisibleTools
@@ -736,6 +743,8 @@ export class LLMCodingRuntime implements NexusRuntime {
             suppressToolsForUserIntent: suppressToolsForCurrentIntent,
             cacheAwareCompactPolicy,
             finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+            finalCheckUsed,
+            repeatedToolInputs: findRepeatedToolInputs(previousEvents).slice(0, 1),
           })
           currentToolsList = requestState.currentToolsList
           modelVisibleTools = requestState.modelVisibleTools
@@ -999,6 +1008,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         const outcomeResult = await applyProviderOutcome({
           turn: providerTurn,
           finalResponseOnlyMode,
+          finalCheckPhase: requestState.finalCheckPhase,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
           userIntentGuidance: assembledContext.userIntentGuidance,
           providerId: settings.providerId,
@@ -1056,6 +1066,11 @@ export class LLMCodingRuntime implements NexusRuntime {
           return
         }
         messages.push(...dispatchResult.messages)
+        // Phase D: a read-only tool dispatch in final_check consumes the one
+        // bounded check — the next turn falls through to must_respond.
+        if (requestState.finalCheckPhase) {
+          finalCheckUsed = true
+        }
       }
 
       const maxLoopsMessage = `Execution exceeded maximum tool call iterations (${maxLoops}).`

@@ -1201,7 +1201,7 @@ function findLargeToolResults(
     .slice(0, 5)
 }
 
-function findRepeatedToolInputs(events: NexusEvent[]): ContextAnalysisDiagnostics['repeatedToolInputs'] {
+export function findRepeatedToolInputs(events: NexusEvent[]): ContextAnalysisDiagnostics['repeatedToolInputs'] {
   const counts = new Map<string, { name: string; inputPreview: string; count: number; latestTimestamp: string }>()
   for (let index = 0; index < events.length; index += 1) {
     const event = events[index]

@@ -11,6 +11,7 @@ import { estimateContextTokens, getContextWindowState, type ContextWindowState }
 
 export type RuntimeProviderLoopState = {
   finalResponseOnlyMode: boolean
+  finalCheckPhase: boolean
   turnContextCharsIn: number
   executionStateBlock: string
 }
@@ -36,15 +37,30 @@ export function buildProviderLoopRequestState(options: {
   cacheAwareCompactPolicy?: CacheAwareCompactPolicy
   finalResponseOnlyMode?: boolean
   finalResponseOnlyRemainingLoops?: number
+  // Phase D: when true, the one bounded read-only check has been used and the
+  // runtime must fall through from `final_check` to `must_respond`.
+  finalCheckUsed?: boolean
+  // Phase C: top repeated tool-input entries (from findRepeatedToolInputs) to
+  // surface in the model-visible execution state block when phase >= synthesize.
+  repeatedToolInputs?: Array<{ name: string; inputPreview: string; count: number; latestTimestamp: string }>
 }): RuntimeProviderLoopRequestState {
   const finalResponseOnlyMode = options.finalResponseOnlyMode ?? shouldEnterFinalResponseOnlyMode({
     loopCount: options.loopCount,
     maxLoops: options.maxLoops,
     remainingLoops: options.finalResponseOnlyRemainingLoops,
   })
-  const modelVisibleTools = finalResponseOnlyMode || options.suppressToolsForUserIntent
+  const finalCheckPhase = shouldEnterFinalCheckPhase({
+    finalResponseOnlyMode,
+    finalCheckUsed: options.finalCheckUsed,
+  })
+  const mustRespond = finalResponseOnlyMode && !finalCheckPhase
+  // Tool visibility: intent suppression or must_respond hides all tools;
+  // final_check narrows to the read-only whitelist; otherwise full list.
+  const modelVisibleTools = (options.suppressToolsForUserIntent || mustRespond)
     ? []
-    : options.currentToolsList
+    : finalCheckPhase
+      ? options.currentToolsList.filter(tool => FINAL_CHECK_READ_ONLY.has(tool.name))
+      : options.currentToolsList
   const contextTokenEstimate = estimateContextTokens({
     systemPrompt: options.systemPrompt,
     messages: options.messages,
@@ -67,7 +83,9 @@ export function buildProviderLoopRequestState(options: {
     systemPrompt: options.systemPrompt,
     messages: options.messages,
     finalResponseOnlyMode,
+    finalCheckPhase,
     finalResponseOnlyRemainingLoops: options.finalResponseOnlyRemainingLoops,
+    repeatedToolInputs: options.repeatedToolInputs,
   })
 
   return {
@@ -136,15 +154,22 @@ export function buildProviderLoopState(options: {
   systemPrompt: string
   messages: ModelMessage[]
   finalResponseOnlyMode?: boolean
+  finalCheckPhase?: boolean
   finalResponseOnlyRemainingLoops?: number
+  repeatedToolInputs?: Array<{ name: string; inputPreview: string; count: number; latestTimestamp: string }>
 }): RuntimeProviderLoopState {
   const finalResponseOnlyMode = options.finalResponseOnlyMode ?? shouldEnterFinalResponseOnlyMode({
     loopCount: options.loopCount,
     maxLoops: options.maxLoops,
     remainingLoops: options.finalResponseOnlyRemainingLoops,
   })
+  const finalCheckPhase = options.finalCheckPhase ?? shouldEnterFinalCheckPhase({
+    finalResponseOnlyMode,
+    finalCheckUsed: false,
+  })
   return {
     finalResponseOnlyMode,
+    finalCheckPhase,
     turnContextCharsIn: countRuntimeTurnContextChars({
       systemPrompt: options.systemPrompt,
       messages: options.messages,
@@ -157,7 +182,9 @@ export function buildProviderLoopState(options: {
       contextTokenEstimate: options.contextTokenEstimate,
       contextMaxTokens: options.contextMaxTokens,
       finalResponseOnlyMode,
+      finalCheckPhase,
       finalResponseOnlyRemainingLoops: options.finalResponseOnlyRemainingLoops,
+      repeatedToolInputs: options.repeatedToolInputs,
     }),
   }
 }
@@ -168,6 +195,28 @@ export function shouldEnterFinalResponseOnlyMode(options: {
   remainingLoops?: number
 }): boolean {
   return options.maxLoops - options.loopCount <= (options.remainingLoops ?? 3)
+}
+
+/**
+ * Read-only tool whitelist for the `final_check` phase. Per
+ * runtime-tool-loop-governance-plan.md Phase D, `final_check` allows at most
+ * one bounded read-only check (Read / Grep / Glob / ListDir) before
+ * `must_respond`. Write / execute / task / skill-save / MCP-write / agent
+ * lifecycle tools are never granted `final_check`.
+ */
+export const FINAL_CHECK_READ_ONLY = new Set(['Read', 'Grep', 'Glob', 'ListDir'])
+
+/**
+ * `final_check` is the sub-state of the finalization reserve window where the
+ * one bounded read-only check has not yet been used. It is active when the
+ * runtime is in the reserve window (`finalResponseOnlyMode`) AND the
+ * `finalCheckUsed` flag has not been set by a prior read-only execution.
+ */
+export function shouldEnterFinalCheckPhase(options: {
+  finalResponseOnlyMode: boolean
+  finalCheckUsed?: boolean
+}): boolean {
+  return options.finalResponseOnlyMode && !(options.finalCheckUsed ?? false)
 }
 
 export function countRuntimeTurnContextChars(options: {
@@ -199,14 +248,20 @@ export function buildRuntimeExecutionStateBlock(state: {
   contextTokenEstimate: number
   contextMaxTokens: number
   finalResponseOnlyMode?: boolean
+  finalCheckPhase?: boolean
   finalResponseOnlyRemainingLoops?: number
+  repeatedToolInputs?: Array<{ name: string; inputPreview: string; count: number; latestTimestamp: string }>
 }): string {
   const filesRead = [...state.readFileCache.keys()]
   const remaining = state.maxLoops - state.loopCount
   const pctUsed = state.contextMaxTokens > 0 ? Math.round(state.contextTokenEstimate / state.contextMaxTokens * 100) : 0
+  const finalCheckPhase = state.finalCheckPhase ?? false
   let phase = 'gathering'
-  if (state.finalResponseOnlyMode || remaining <= (state.finalResponseOnlyRemainingLoops ?? 3)) phase = 'must_respond'
-  else if (state.toolCallCount >= 10) phase = 'synthesize'
+  if (state.finalResponseOnlyMode || remaining <= (state.finalResponseOnlyRemainingLoops ?? 3)) {
+    phase = finalCheckPhase ? 'final_check' : 'must_respond'
+  } else if (state.toolCallCount >= 10) {
+    phase = 'synthesize'
+  }
 
   const lines = [
     `## Execution State (iteration ${state.loopCount}/${state.maxLoops})`,
@@ -217,8 +272,17 @@ export function buildRuntimeExecutionStateBlock(state: {
   ]
   if (phase === 'synthesize') {
     lines.push('  → Present your findings now. Only read more if critical information is missing.')
+  } else if (phase === 'final_check') {
+    lines.push('  → You get ONE bounded read-only check (Read/Grep/Glob/ListDir) before the runtime hides all tools. Write/execute tools are denied. Use it to confirm a missing detail, then answer.')
   } else if (phase === 'must_respond') {
     lines.push('  → Runtime has hidden all tools for this request. You MUST produce your final answer immediately.')
+  }
+  // Phase C: surface concrete repeated-tool evidence so the model can break
+  // out of a re-run loop (e.g. re-running the same test) instead of re-running.
+  if ((phase === 'synthesize' || phase === 'final_check' || phase === 'must_respond') && state.repeatedToolInputs && state.repeatedToolInputs.length > 0) {
+    const top = state.repeatedToolInputs[0]!
+    const preview = top.inputPreview.length <= 80 ? top.inputPreview : `${top.inputPreview.slice(0, 77)}...`
+    lines.push(`- Repeated tool inputs: ${top.name} \`${preview}\` ×${top.count} — reuse the latest result instead of re-running.`)
   }
   return lines.join('\n')
 }

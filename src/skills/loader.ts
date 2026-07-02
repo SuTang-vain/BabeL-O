@@ -2,6 +2,8 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import type { Dirent } from 'fs'
+import type { SkillResource } from './schema.js'
 
 export interface Skill {
   id: string;
@@ -19,16 +21,184 @@ export interface Skill {
   createdAt?: string;
   updatedAt?: string;
   owner?: string;
+  license?: string;
+  compatibility?: string;
+  metadata?: Record<string, unknown>;
+  sourceFormat?: 'babel-o-v1' | 'agent-skills-v1';
+  packageRoot?: string;
+  manifestPath?: string;
+  resources?: SkillResource[];
+  filePath?: string;
 }
 
 /** Parse `[a, b, c]` style YAML list. Returns [] on missing/empty. */
-function parseListField(raw: string | undefined): string[] {
+function parseListField(raw: unknown): string[] {
   if (!raw) return []
+  if (Array.isArray(raw)) {
+    return raw
+      .map(value => String(value).trim())
+      .filter(Boolean)
+  }
+  if (typeof raw !== 'string') return []
   return raw
     .replace(/[\[\]]/g, '')
     .split(',')
     .map(s => s.trim())
+    .map(s => s.replace(/^['"]|['"]$/g, ''))
     .filter(Boolean)
+}
+
+function deriveSkillId(text: string): string {
+  const slug = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 8)
+    .join('-')
+    .replace(/-+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return slug || 'skill'
+}
+
+function parseAllowedTools(raw: unknown): string[] {
+  if (!raw) return []
+  if (Array.isArray(raw)) return parseListField(raw)
+  if (typeof raw !== 'string') return []
+  const parsedList = parseListField(raw)
+  return raw.trim().startsWith('[') || parsedList.length > 1
+    ? parsedList
+    : raw.split(/\s+/).map(s => s.trim()).filter(Boolean)
+}
+
+function parseScalarValue(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (!trimmed) return ''
+  if (trimmed.startsWith('[') && trimmed.endsWith(']')) return parseListField(trimmed)
+  if ((trimmed.startsWith('"') && trimmed.endsWith('"')) || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+    return trimmed.slice(1, -1)
+  }
+  if (/^-?\d+$/.test(trimmed)) return parseInt(trimmed, 10)
+  if (trimmed === 'true') return true
+  if (trimmed === 'false') return false
+  return trimmed
+}
+
+function nextIndentedLineIsList(lines: string[], currentIndex: number, currentIndent: number): boolean {
+  for (let i = currentIndex + 1; i < lines.length; i++) {
+    const line = lines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const indent = line.match(/^ */)?.[0].length ?? 0
+    return indent > currentIndent && trimmed.startsWith('- ')
+  }
+  return false
+}
+
+function parseFrontMatterMetadata(metaLines: string[]): Record<string, unknown> {
+  const root: Record<string, unknown> = {}
+  const stack: Array<{ indent: number; value: Record<string, unknown> | unknown[] }> = [{ indent: -1, value: root }]
+
+  for (let i = 0; i < metaLines.length; i++) {
+    const line = metaLines[i]
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const indent = line.match(/^ */)?.[0].length ?? 0
+
+    while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
+      stack.pop()
+    }
+
+    const parent = stack[stack.length - 1].value
+    if (trimmed.startsWith('- ')) {
+      if (Array.isArray(parent)) {
+        parent.push(parseScalarValue(trimmed.slice(2).trim()))
+      }
+      continue
+    }
+
+    const colonIdx = trimmed.indexOf(':')
+    if (colonIdx === -1 || Array.isArray(parent)) continue
+
+    const key = trimmed.slice(0, colonIdx).trim()
+    const value = trimmed.slice(colonIdx + 1).trim()
+    if (!key) continue
+
+    if (!value) {
+      const child: Record<string, unknown> | unknown[] = nextIndentedLineIsList(metaLines, i, indent) ? [] : {}
+      parent[key] = child
+      stack.push({ indent, value: child })
+    } else {
+      parent[key] = parseScalarValue(value)
+    }
+  }
+
+  return root
+}
+
+function getRecordField(record: Record<string, unknown> | undefined, ...keys: string[]): Record<string, unknown> | undefined {
+  const value = getField(record, ...keys)
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
+}
+
+function getField(record: Record<string, unknown> | undefined, ...keys: string[]): unknown {
+  if (!record) return undefined
+  const wanted = new Set(keys.map(key => key.toLowerCase()))
+  for (const [key, value] of Object.entries(record)) {
+    if (wanted.has(key.toLowerCase())) return value
+  }
+  return undefined
+}
+
+function getStringField(record: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
+  const value = getField(record, ...keys)
+  return typeof value === 'string' ? value : undefined
+}
+
+function getNumberField(record: Record<string, unknown> | undefined, ...keys: string[]): number | undefined {
+  const value = getField(record, ...keys)
+  if (typeof value === 'number') return value
+  if (typeof value !== 'string') return undefined
+  const parsed = parseInt(value, 10)
+  return Number.isNaN(parsed) ? undefined : parsed
+}
+
+function parseMetadataFromFlatKeys(metadata: Record<string, unknown>): Record<string, unknown> | undefined {
+  const parsed: Record<string, unknown> = {}
+  const nestedMetadata = getRecordField(metadata, 'metadata')
+  if (nestedMetadata) {
+    Object.assign(parsed, nestedMetadata)
+  }
+
+  const babelO: Record<string, unknown> = {
+    ...(getRecordField(parsed, 'babel-o') || {}),
+  }
+  for (const [key, value] of Object.entries(metadata)) {
+    const normalizedKey = key.toLowerCase()
+    if (!normalizedKey.startsWith('metadata.babel-o.')) continue
+    const field = key.slice('metadata.babel-o.'.length)
+    const normalizedField = field.toLowerCase()
+    if (!field) continue
+    if (normalizedField === 'triggers' || normalizedField === 'allowedtools' || normalizedField === 'allowed-tools') {
+      babelO[normalizedField === 'allowed-tools' ? 'allowedTools' : normalizedField] = parseListField(value)
+    } else if (normalizedField === 'priority' || normalizedField === 'version') {
+      const parsedValue = getNumberField({ value }, 'value')
+      babelO[field] = parsedValue ?? value
+    } else {
+      babelO[field] = value
+    }
+  }
+  if (Object.keys(babelO).length > 0) {
+    parsed['babel-o'] = babelO
+  }
+  return Object.keys(parsed).length > 0 ? parsed : undefined
+}
+
+function getBabelOMetadata(metadata: Record<string, unknown> | undefined): Record<string, unknown> {
+  return getRecordField(metadata, 'babel-o') || {}
 }
 
 export function parseFrontMatter(rawContent: string): Skill | null {
@@ -43,24 +213,37 @@ export function parseFrontMatter(rawContent: string): Skill | null {
   const metaLines = lines.slice(1, endIdx);
   const bodyContent = lines.slice(endIdx + 1).join('\n').trim();
 
-  const metadata: Record<string, string> = {};
-  for (const line of metaLines) {
-    const colonIdx = line.indexOf(':');
-    if (colonIdx === -1) continue;
-    const key = line.slice(0, colonIdx).trim().toLowerCase();
-    const val = line.slice(colonIdx + 1).trim();
-    metadata[key] = val;
-  }
+  const metadata = parseFrontMatterMetadata(metaLines)
 
-  const id = metadata['id'] || '';
-  const name = metadata['name'] || id;
-  const triggers = parseListField(metadata['triggers']);
-  const priority = parseInt(metadata['priority'] || '0', 10) || 0;
-  const allowedTools = parseListField(metadata['allowedtools']);
-  const version = metadata['version'] ? parseInt(metadata['version'], 10) : undefined;
-  const status = metadata['status'] || undefined;
-  const scope = metadata['scope'] || undefined;
-  const risk = metadata['risk'] || undefined;
+  const parsedMetadata = parseMetadataFromFlatKeys(metadata)
+  const babelOMetadata = getBabelOMetadata(parsedMetadata)
+  const standardName = getStringField(metadata, 'name') || ''
+  const description = getStringField(metadata, 'description') || getStringField(babelOMetadata, 'description')
+  const looksLikeAgentSkill = Boolean(
+    description ||
+    getField(metadata, 'allowed-tools', 'allowedTools') ||
+    getStringField(metadata, 'license') ||
+    getStringField(metadata, 'compatibility') ||
+    parsedMetadata,
+  )
+  const metadataId = getStringField(babelOMetadata, 'id') || ''
+  const id = getStringField(metadata, 'id') || metadataId || (looksLikeAgentSkill ? deriveSkillId(standardName) : '')
+  const name = getStringField(babelOMetadata, 'displayName', 'displayname') ||
+    standardName ||
+    id
+  const triggers = parseListField(getField(metadata, 'triggers'))
+    .concat(parseListField(getField(babelOMetadata, 'triggers')))
+  const priority = getNumberField(metadata, 'priority') ?? getNumberField(babelOMetadata, 'priority') ?? 0
+  const allowedTools = parseAllowedTools(
+    getField(metadata, 'allowedtools', 'allowed-tools', 'allowedTools') ??
+    getField(babelOMetadata, 'allowedtools', 'allowed-tools', 'allowedTools'),
+  )
+  const version = getNumberField(metadata, 'version') ?? getNumberField(babelOMetadata, 'version')
+  const status = getStringField(metadata, 'status') || getStringField(babelOMetadata, 'status')
+  const scope = getStringField(metadata, 'scope') || getStringField(babelOMetadata, 'scope')
+  const risk = getStringField(metadata, 'risk') || getStringField(babelOMetadata, 'risk')
+  const license = getStringField(metadata, 'license')
+  const compatibility = getStringField(metadata, 'compatibility')
 
   if (!id) {
     return null;
@@ -72,20 +255,103 @@ export function parseFrontMatter(rawContent: string): Skill | null {
     triggers,
     priority,
     content: bodyContent,
+    ...(description ? { description } : {}),
     ...(allowedTools.length > 0 ? { allowedTools } : {}),
     ...(version !== undefined && !Number.isNaN(version) ? { version } : {}),
     ...(status ? { status } : {}),
     ...(scope ? { scope } : {}),
     ...(risk ? { risk } : {}),
+    ...(license ? { license } : {}),
+    ...(compatibility ? { compatibility } : {}),
+    ...(parsedMetadata ? { metadata: parsedMetadata } : {}),
   }
 }
 
 export async function loadSkillFromFile(filePath: string): Promise<Skill | null> {
   try {
     const rawContent = await fs.readFile(filePath, 'utf-8');
-    return parseFrontMatter(rawContent);
+    const skill = parseFrontMatter(rawContent);
+    return skill ? { ...skill, filePath, sourceFormat: 'babel-o-v1' } : null
   } catch {
     return null;
+  }
+}
+
+async function listPackageResources(packageRoot: string): Promise<SkillResource[]> {
+  const resources: SkillResource[] = []
+  let packageRealPath: string
+  try {
+    packageRealPath = await fs.realpath(packageRoot)
+  } catch {
+    return resources
+  }
+  const isInsidePackage = (targetPath: string): boolean => {
+    const relativePath = path.relative(packageRealPath, targetPath)
+    return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
+  }
+  const collect = async (kind: SkillResource['kind'], dirName: string) => {
+    const dir = path.join(packageRoot, dirName)
+    const walk = async (currentDir: string, relativeDir: string) => {
+      let entries: Dirent[]
+      try {
+        entries = await fs.readdir(currentDir, { withFileTypes: true })
+      } catch {
+        return
+      }
+      for (const entry of entries) {
+        const absolutePath = path.join(currentDir, entry.name)
+        const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name
+        try {
+          const linkStat = await fs.lstat(absolutePath)
+          if (linkStat.isSymbolicLink()) continue
+          const realPath = await fs.realpath(absolutePath)
+          if (!isInsidePackage(realPath)) continue
+          if (linkStat.isDirectory()) {
+            await walk(absolutePath, relativePath)
+            continue
+          }
+          if (!linkStat.isFile()) continue
+        } catch {
+          continue
+        }
+        resources.push({
+          kind,
+          path: `${dirName}/${relativePath}`,
+          absolutePath,
+        })
+      }
+    }
+    try {
+      const realPath = await fs.realpath(dir)
+      if (!isInsidePackage(realPath)) return
+    } catch {
+      return
+    }
+    await walk(dir, '')
+  }
+  await collect('script', 'scripts')
+  await collect('reference', 'references')
+  await collect('asset', 'assets')
+  return resources
+}
+
+export async function loadSkillPackageFromDir(packageRoot: string): Promise<Skill | null> {
+  const manifestPath = path.join(packageRoot, 'SKILL.md')
+  try {
+    const rawContent = await fs.readFile(manifestPath, 'utf-8')
+    const skill = parseFrontMatter(rawContent)
+    if (!skill) return null
+    const resources = await listPackageResources(packageRoot)
+    return {
+      ...skill,
+      sourceFormat: 'agent-skills-v1',
+      packageRoot,
+      manifestPath,
+      filePath: manifestPath,
+      resources,
+    }
+  } catch {
+    return null
   }
 }
 
@@ -95,14 +361,19 @@ export async function loadSkillsFromDir(dirPath: string): Promise<Skill[]> {
     : path.resolve(dirPath);
 
   try {
-    const files = await fs.readdir(resolvedPath);
+    const files = await fs.readdir(resolvedPath, { withFileTypes: true });
     const skills: Skill[] = [];
     for (const file of files) {
-      if (file.endsWith('.md')) {
-        const filePath = path.join(resolvedPath, file);
+      if (file.isFile() && file.name.endsWith('.md')) {
+        const filePath = path.join(resolvedPath, file.name);
         const skill = await loadSkillFromFile(filePath);
         if (skill) {
           skills.push(skill);
+        }
+      } else if (file.isDirectory()) {
+        const skill = await loadSkillPackageFromDir(path.join(resolvedPath, file.name))
+        if (skill) {
+          skills.push(skill)
         }
       }
     }
