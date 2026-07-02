@@ -173,7 +173,7 @@ shouldSuppressToolsForIntent(correction + requiresTools=false) === false
 2. Decouple the option-confirmation gate from the suppression branch (deviation surfaced by TDD — see Implementation Surface). ✅
 3. Narrow `shouldSuppressToolsForIntent` to Tier 1. ✅
 4. Run `npm test` (deterministic suite) + `npm run docs:check`. ✅ (1254/1254 pass, docs:check 0 failures.)
-5. Real-session spot check: replay `session_eafe6bfc` / `session_b7f64aa1` prompts through the runtime; confirm tool calls run on the first turn (no suppression error). ⏳ Pending a real provider key.
+5. Real-session spot check (minimax/MiniMax-M3, real provider): ✅ Confirmed. A Mode B intake (`new_focus/normal/requiresTools=false`) with the model calling 25 tools (Bash / ListDir / Read / Grep) — all passed through on the first turn, zero `TOOL_CALL_SUPPRESSED_BY_USER_INTENT`, clean success. Before direction 2 the first tool call would have been suppressed + nudged. The exact Mode B + model-tools passthrough is also covered deterministically by the runtime integration test in `test/runtime-llm.test.ts`.
 
 ## Graduation
 
