@@ -103,13 +103,20 @@ Because `suppressToolsForUserIntent` (derived from this function) drives **both*
 - makes tools visible for Tier 2 (so the model can call them), and
 - skips the suppression branch for Tier 2 (so emitted calls pass through).
 
-Files likely to change:
+### Implementation deviation: option-confirmation gate decouple (landed)
 
-- `src/runtime/intentGuidance.ts` — `shouldSuppressToolsForIntent` narrowed to Tier 1.
-- `src/runtime/pipeline/providerTurn.ts` — no logic change needed (the `suppressToolsForUserIntent` flag is already the gate); possibly update the suppression-error comment to note it is Tier-1-only.
-- `src/runtime/LLMCodingRuntime.ts` — `suppressToolsForCurrentIntent` computation (`:622-625`) unchanged in structure (still derives from `shouldSuppressToolsForIntent`); the `MAX_SUPPRESSED_TOOL_RETRIES` retry now only applies to Tier 1.
-- `test/runtime-llm.test.ts` — Tier 2 passthrough tests + Tier 1 non-regression.
-- Diagnostics: `getToolSuppressionReason` (`src/runtime/intentGuidance.ts:231-240`) stays valid for Tier 1; Tier 2 no longer emits a suppression reason (it does not suppress).
+> The proposal originally anticipated narrowing `shouldSuppressToolsForIntent` alone. TDD surfaced an unanticipated coupling: the `TOOL_CALL_NEEDS_USER_CONFIRMATION` option-confirmation gate (single-letter input like `"B"`) was nested **inside** the suppression branch at `providerTurn.ts:163`. Narrowing suppression alone would have disabled the gate for Tier 2 option-like inputs — a user typing `"B"` to confirm a prior option (intake: `new_focus + respond_only + requiresTools=false`) would have had the model's tool call run with no confirmation. That broke `test/runtime-llm.test.ts`'s option-clarification test and removed a disambiguation safety net for ambiguous single-letter input (which is not a reliable "tools needed" signal, so Tier 2 passthrough should not apply).
+
+Resolution chosen: **decouple the gate from suppression**. The gate is now an independent branch in `providerTurn.ts` that fires whenever `turn.toolCalls.length > 0 && !confirmedOptionSelection && latestUserText is option-like && retry budget remains`, regardless of `suppressToolsForUserIntent`. It runs after `finalResponseOnlyMode` and before intent suppression. `confirmedOptionSelection` is threaded through `applyProviderOutcome.ts` and passed from `LLMCodingRuntime.ts` (where it was already computed). This preserves the exact current gate behavior for suppressed turns, keeps the gate firing for Tier 2 option-like input, and yields a clean two-tier suppression design (no option carve-out muddying `shouldSuppressToolsForIntent`).
+
+Files changed (as landed):
+
+- `src/runtime/intentGuidance.ts` — `shouldSuppressToolsForIntent` narrowed to Tier 1 (pure-capability + pause + greeting → suppress; status → no; everything else → passthrough).
+- `src/runtime/pipeline/providerTurn.ts` — option-confirmation gate extracted from inside the suppression branch into an independent branch (fires regardless of `suppressToolsForUserIntent`); `confirmedOptionSelection?: boolean` added to `reduceProviderTurnOutcome` options (default `false`); suppression branch narrowed to Tier 1 (gate removed from it).
+- `src/runtime/applyProviderOutcome.ts` — `confirmedOptionSelection?` added to `ApplyProviderOutcomeInput` and threaded to `reduceProviderTurnOutcome`.
+- `src/runtime/LLMCodingRuntime.ts` — passes `confirmedOptionSelection` (already computed at the main-loop scope) to `applyProviderOutcome`. `suppressToolsForCurrentIntent` computation (`:622-625`) unchanged in structure; `MAX_SUPPRESSED_TOOL_RETRIES` retry now only applies to Tier 1.
+- `test/runtime-llm.test.ts` — Tier 2 passthrough tests (unit + one runtime integration fixture for the `session_eafe6bfc` class) + Tier 1 non-regression; stopgap `prioritize_latest` assertion flipped to passthrough.
+- Diagnostics: `getToolSuppressionReason` (`src/runtime/intentGuidance:231-240`) stays valid for Tier 1; Tier 2 no longer emits a suppression reason (it does not suppress).
 
 ## Non-goals
 
@@ -162,10 +169,11 @@ shouldSuppressToolsForIntent(correction + requiresTools=false) === false
 
 ## Rollout
 
-1. Tests first: Tier 2 passthrough tests (red before), Tier 1 non-regression (green throughout).
-2. Narrow `shouldSuppressToolsForIntent` to Tier 1.
-3. Run `npm test` (deterministic suite) + `npm run docs:check`.
-4. Real-session spot check: replay `session_eafe6bfc` / `session_b7f64aa1` prompts through the runtime; confirm tool calls run on the first turn (no suppression error).
+1. Tests first: Tier 2 passthrough tests (red before), Tier 1 non-regression (green throughout). ✅
+2. Decouple the option-confirmation gate from the suppression branch (deviation surfaced by TDD — see Implementation Surface). ✅
+3. Narrow `shouldSuppressToolsForIntent` to Tier 1. ✅
+4. Run `npm test` (deterministic suite) + `npm run docs:check`. ✅ (1254/1254 pass, docs:check 0 failures.)
+5. Real-session spot check: replay `session_eafe6bfc` / `session_b7f64aa1` prompts through the runtime; confirm tool calls run on the first turn (no suppression error). ⏳ Pending a real provider key.
 
 ## Graduation
 
