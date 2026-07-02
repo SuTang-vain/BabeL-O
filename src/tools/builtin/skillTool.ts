@@ -25,6 +25,8 @@ import { validateSkill } from '../../skills/validator.js'
 import { formatSkill } from '../../skills/formatter.js'
 import { generateSkillDraft, type SkillDraftInput } from '../../skills/generator.js'
 import { saveSkill, type SkillSaveInput } from '../../skills/storage.js'
+import { installSkillImport, previewSkillImport } from '../../skills/importer.js'
+import { previewSkillExport, writeSkillExport } from '../../skills/exporter.js'
 
 function failure(errorCode: string, message: string, extras: Record<string, unknown> = {}): ToolResult {
   return { success: false, output: { errorCode, message, ...extras } }
@@ -70,6 +72,8 @@ export const skillListTool: ToolDefinition<typeof skillListInputSchema> = {
             triggers: s.triggers,
             priority: s.priority,
             allowedTools: s.allowedTools,
+            sourceFormat: s.sourceFormat,
+            resources: s.resources,
           })),
         },
       }
@@ -118,6 +122,10 @@ export const skillShowTool: ToolDefinition<typeof skillShowInputSchema> = {
             triggers: skill.triggers,
             priority: skill.priority,
             allowedTools: skill.allowedTools,
+            sourceFormat: skill.sourceFormat,
+            packageRoot: skill.packageRoot,
+            manifestPath: skill.manifestPath,
+            resources: skill.resources,
             body: formatSkill(skill),
           },
         },
@@ -260,6 +268,184 @@ export const skillDraftTool: ToolDefinition<typeof skillDraftInputSchema> = {
 }
 
 // --- SkillSave -------------------------------------------------------------
+
+// --- SkillExportPreview ----------------------------------------------------
+
+const skillExportPreviewInputSchema = z.object({
+  cwd: z.string().optional(),
+  id: z.string().min(1),
+  targetDir: z.string().optional(),
+  builtInDir: z.string().optional(),
+})
+
+export const skillExportPreviewTool: ToolDefinition<typeof skillExportPreviewInputSchema> = {
+  name: 'SkillExportPreview',
+  description:
+    'Preview exporting an existing BabeL-O skill as an Agent Skills package. Read-only: returns SKILL.md and package plan without writing files.',
+  prompt: () => 'SkillExportPreview converts an existing BabeL-O skill into a preview of a standard Agent Skills package. Use it when the user asks to export, share, or check portability of a skill. It returns the target package directory, generated SKILL.md manifest, resources plan, diagnostics, and conversion metadata. This tool is READ ONLY and never writes files.',
+  risk: 'read',
+  inputSchema: skillExportPreviewInputSchema,
+  async execute(input, context: ToolContext): Promise<ToolResult> {
+    const cwd = input.cwd ?? context.cwd
+    const result = await previewSkillExport({
+      cwd,
+      id: input.id,
+      ...(input.targetDir ? { targetDir: input.targetDir } : {}),
+      ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+    })
+    if (!result.ok) {
+      return failure(result.errorCode, result.message, {
+        ...(result.id ? { id: result.id } : {}),
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      })
+    }
+    return {
+      success: true,
+      output: result,
+    }
+  },
+}
+
+// --- SkillExportWrite ------------------------------------------------------
+
+const skillExportWriteInputSchema = skillExportPreviewInputSchema.extend({
+  confirm: z.boolean().default(false),
+  overwrite: z.boolean().optional(),
+})
+
+export const skillExportWriteTool: ToolDefinition<typeof skillExportWriteInputSchema> = {
+  name: 'SkillExportWrite',
+  description:
+    'Write an existing BabeL-O skill as an Agent Skills package after preview. Write risk: requires confirm:true and writes SKILL.md/resources to disk.',
+  prompt: () => 'SkillExportWrite writes an existing BabeL-O skill to disk as a standard Agent Skills package. This is a WRITE tool and requires explicit user approval plus confirm:true. Call SkillExportPreview first, show the generated SKILL.md and target package path to the user, then call this only after confirmation. Without confirm:true it returns a preview-only result and writes nothing. If the target package exists, overwrite:true is required.',
+  risk: 'write',
+  requiresApproval: true,
+  suggestedAllowRule: '- tool: SkillExportWrite',
+  inputSchema: skillExportWriteInputSchema,
+  async execute(input, context: ToolContext): Promise<ToolResult> {
+    const cwd = input.cwd ?? context.cwd
+    const result = await writeSkillExport({
+      cwd,
+      id: input.id,
+      confirm: input.confirm,
+      ...(input.targetDir ? { targetDir: input.targetDir } : {}),
+      ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+      ...(input.overwrite !== undefined ? { overwrite: input.overwrite } : {}),
+    })
+    if (!result.ok) {
+      const preview = 'preview' in result ? result.preview : undefined
+      if (result.errorCode === 'SKILL_EXPORT_NOT_CONFIRMED' && preview) {
+        return {
+          success: true,
+          output: {
+            ok: false,
+            previewOnly: true,
+            errorCode: result.errorCode,
+            message: result.message,
+            preview,
+          },
+        }
+      }
+      return failure(result.errorCode, result.message, {
+        ...(preview ? { preview } : {}),
+        ...(result.id ? { id: result.id } : {}),
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      })
+    }
+    return {
+      success: true,
+      output: result,
+    }
+  },
+}
+
+// --- SkillImportPreview ----------------------------------------------------
+
+const skillImportPreviewInputSchema = z.object({
+  cwd: z.string().optional(),
+  sourcePath: z.string().min(1),
+  scope: z.enum(['user', 'project']).optional(),
+  builtInDir: z.string().optional(),
+})
+
+export const skillImportPreviewTool: ToolDefinition<typeof skillImportPreviewInputSchema> = {
+  name: 'SkillImportPreview',
+  description:
+    'Preview importing a local Agent Skills package directory. Read-only: validates and reports conversion/resource/duplicate warnings without writing files.',
+  prompt: () => 'SkillImportPreview previews an external Agent Skills package before installation. Use it when the user asks to import, inspect compatibility, or convert a skill package. It accepts a local directory containing SKILL.md and returns the normalized skill metadata, package resources, diagnostics, duplicate warnings, and target path. This tool is READ ONLY and never persists the skill. To install later, a separate confirm-gated write path is required. Do not treat preview as installation.',
+  risk: 'read',
+  inputSchema: skillImportPreviewInputSchema,
+  async execute(input, context: ToolContext): Promise<ToolResult> {
+    const cwd = input.cwd ?? context.cwd
+    const result = await previewSkillImport({
+      cwd,
+      sourcePath: input.sourcePath,
+      ...(input.scope ? { scope: input.scope } : {}),
+      ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+    })
+    if (!result.ok) {
+      return failure(result.errorCode, result.message, {
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      })
+    }
+    return {
+      success: true,
+      output: result,
+    }
+  },
+}
+
+// --- SkillImportInstall ----------------------------------------------------
+
+const skillImportInstallInputSchema = skillImportPreviewInputSchema.extend({
+  confirm: z.boolean().default(false),
+  overwrite: z.boolean().optional(),
+})
+
+export const skillImportInstallTool: ToolDefinition<typeof skillImportInstallInputSchema> = {
+  name: 'SkillImportInstall',
+  description:
+    'Install a local Agent Skills package directory after preview. Write risk: requires confirm:true and copies the package into the selected skill scope.',
+  prompt: () => 'SkillImportInstall installs an external Agent Skills package directory into BabeL-O. This is a WRITE tool and requires explicit user approval plus confirm:true. Call SkillImportPreview first, show the preview/target path/warnings to the user, then call this only after confirmation. Without confirm:true it returns a preview-only result and writes nothing. If the target package exists, overwrite:true is required. It copies the package directory and preserves SKILL.md/resources; bundled scripts remain data and are not executed.',
+  risk: 'write',
+  requiresApproval: true,
+  suggestedAllowRule: '- tool: SkillImportInstall',
+  inputSchema: skillImportInstallInputSchema,
+  async execute(input, context: ToolContext): Promise<ToolResult> {
+    const cwd = input.cwd ?? context.cwd
+    const result = await installSkillImport({
+      cwd,
+      sourcePath: input.sourcePath,
+      confirm: input.confirm,
+      ...(input.overwrite !== undefined ? { overwrite: input.overwrite } : {}),
+      ...(input.scope ? { scope: input.scope } : {}),
+      ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+    })
+    if (!result.ok) {
+      const preview = 'preview' in result ? result.preview : undefined
+      if (result.errorCode === 'SKILL_IMPORT_NOT_CONFIRMED' && preview) {
+        return {
+          success: true,
+          output: {
+            ok: false,
+            previewOnly: true,
+            errorCode: result.errorCode,
+            message: result.message,
+            preview,
+          },
+        }
+      }
+      return failure(result.errorCode, result.message, {
+        ...(preview ? { preview } : {}),
+        ...(result.diagnostics ? { diagnostics: result.diagnostics } : {}),
+      })
+    }
+    return {
+      success: true,
+      output: result,
+    }
+  },
+}
 
 const skillSaveInputSchema = z.object({
   cwd: z.string().optional(),

@@ -33,6 +33,7 @@ export function normalizeSkill(
   const risk = (raw.risk ?? SKILL_DEFAULTS.risk) as NormalizedSkill['risk']
   const allowedTools = raw.allowedTools ?? [...SKILL_DEFAULTS.allowedTools]
   const version = raw.version ?? SKILL_DEFAULTS.version
+  const sourceFormat = raw.sourceFormat ?? 'babel-o-v1'
 
   return {
     id: raw.id,
@@ -47,6 +48,14 @@ export function normalizeSkill(
     scope,
     risk,
     allowedTools,
+    sourceFormat,
+    resources: raw.resources ?? [],
+    ...(raw.license ? { license: raw.license } : {}),
+    ...(raw.compatibility ? { compatibility: raw.compatibility } : {}),
+    ...(raw.metadata ? { metadata: raw.metadata } : {}),
+    ...(raw.packageRoot ? { packageRoot: raw.packageRoot } : {}),
+    ...(raw.manifestPath ? { manifestPath: raw.manifestPath } : {}),
+    ...(raw.filePath ? { filePath: raw.filePath } : {}),
   }
 }
 

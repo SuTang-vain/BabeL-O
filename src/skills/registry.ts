@@ -172,7 +172,13 @@ async function loadAllSourcesWithProvenance(
   // NormalizedSkill as optional; populate it from the resolved dir + id.
   const withPath = (skills: Array<ReturnType<typeof parseFrontMatter> & object>, baseDir: string, source: SkillSource) =>
     normalizeSkills(
-      skills.map(s => ({ ...s, filePath: path.join(baseDir, `${s.id}.md`) } as unknown as Parameters<typeof normalizeSkills>[0][number])),
+      skills.map(s => {
+        const skill = s as Record<string, unknown>
+        return {
+          ...s,
+          filePath: typeof skill.filePath === 'string' ? skill.filePath : path.join(baseDir, `${skill.id}.md`),
+        } as unknown as Parameters<typeof normalizeSkills>[0][number]
+      }),
       source,
     )
 

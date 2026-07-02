@@ -12,6 +12,10 @@ import { listDirTool } from './builtin/listDir.js'
 import { readTool } from './builtin/read.js'
 import {
   skillDraftTool,
+  skillExportPreviewTool,
+  skillExportWriteTool,
+  skillImportInstallTool,
+  skillImportPreviewTool,
   skillListTool,
   skillSaveTool,
   skillShowTool,
@@ -57,12 +61,16 @@ export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}):
     contextRecentTool,
     contextSessionsTool,
     // Skill tools (Phase 6 of the Skill execution governance plan).
-    // 5 bounded tools: SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave.
-    // SkillSave has write risk + requiresApproval; the other 4 are read risk.
+    // Bounded tools: read-only list/show/validate/draft/export-preview/import-preview
+    // plus confirm-gated export-write/import-install/save write tools.
     skillListTool,
     skillShowTool,
     skillValidateTool,
     skillDraftTool,
+    skillExportPreviewTool,
+    skillExportWriteTool,
+    skillImportPreviewTool,
+    skillImportInstallTool,
     skillSaveTool,
   ]
   const registry = new Map(tools.map(tool => [tool.name, tool as AnyTool]))
