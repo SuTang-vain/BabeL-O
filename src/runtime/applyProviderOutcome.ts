@@ -75,6 +75,7 @@ export type ApplyProviderOutcomeInput = {
   turn: any
   finalResponseOnlyMode: boolean
   suppressToolsForUserIntent: boolean
+  confirmedOptionSelection?: boolean
   userIntentGuidance: any
   providerId: string
   modelId: string
@@ -135,6 +136,7 @@ export async function applyProviderOutcome(
     turn: input.turn,
     finalResponseOnlyMode: input.finalResponseOnlyMode,
     suppressToolsForUserIntent: input.suppressToolsForUserIntent,
+    confirmedOptionSelection: input.confirmedOptionSelection,
     userIntentGuidance: input.userIntentGuidance,
     providerId: input.providerId,
     modelId: input.modelId,

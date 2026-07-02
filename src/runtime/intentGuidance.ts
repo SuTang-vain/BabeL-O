@@ -219,9 +219,21 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
   const normalized = normalizeGuidancePolicy(guidance)
   if (isCurrentStateVerificationRequest(normalized.latestUserText)) return false
+  // Tier 1 — hard suppress (unchanged): pure capability question, pause,
+  // greeting. These are semantically respond-only; tooling would be
+  // unnecessary. Suppress-then-nudge (MAX_SUPPRESSED_TOOL_RETRIES=1) stays.
   if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return true
+  if (normalized.intent === 'pause' || normalized.intent === 'greeting') return true
   if (normalized.intent === 'status') return false
-  return !normalized.requiresTools || normalized.actionHint === 'respond_only'
+  // Tier 2 — first-call passthrough (direction 2): task-continuation intents
+  // (continue / new_focus / correction) where the model's requiresTools=false
+  // is suspect (Mode B under-classification). Tools stay visible and emitted
+  // tool calls pass through — the model's tool call is the ground-truth signal
+  // that tools are needed. Over-tooling is handled by finalResponseOnlyMode
+  // (TOOL_LOOP_FINAL_RESPONSE_ONLY), not intent suppression. The
+  // option-confirmation gate (single-letter input) is handled independently in
+  // providerTurn.ts and is not affected by this branch.
+  return false
 }
 
 export function getIntentCategory(guidance: UserIntentGuidance): IntentCategory {
