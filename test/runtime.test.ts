@@ -10,6 +10,7 @@ import { createEmptyContextSelectionDiagnostics } from '../src/runtime/contextMa
 import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
+import { buildPartialTimeoutSummary } from '../src/nexus/executionTimeoutEvents.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import {
@@ -9677,4 +9678,21 @@ test('Phase A.1: scope=session accumulates rules and second turn auto-allows', a
   )
 
   await app.close()
+})
+
+test('Soft-error-retry Slice 2-B: partial result prefers the in-flight (truncated) turn output', () => {
+  // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md Slice 2-B.
+  // seq 924: the model's diagnostic report was truncated mid-output by the watchdog.
+  // buildPartialTimeoutSummary must preserve the in-flight turn (output after the last
+  // user_message), not earlier turns' output — that is what the user lost to the cutoff.
+  const events = [
+    { type: 'user_message', text: 'first turn' },
+    { type: 'assistant_delta', text: '早期 turn 的无关输出'.repeat(60) },
+    { type: 'user_message', text: '继续诊断' },
+    { type: 'assistant_delta', text: '当前诊断报告的关键结论:embedding 配置缺失导致 sidecar 必死' },
+  ] as any
+  const summary = buildPartialTimeoutSummary(events)
+  assert.ok(summary, 'a summary must be produced when there is in-flight assistant output')
+  assert.match(summary!, /当前诊断报告的关键结论/, 'must keep the in-flight turn output')
+  assert.ok(!summary!.includes('早期 turn'), 'must not surface earlier-turn output over the in-flight turn')
 })

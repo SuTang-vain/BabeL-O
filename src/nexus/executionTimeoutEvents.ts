@@ -68,6 +68,20 @@ export function hasPartialTimeoutEvidence(events: readonly NexusEvent[]): boolea
 }
 
 export function buildPartialTimeoutSummary(events: readonly NexusEvent[]): string | undefined {
+  // Prefer the in-flight turn's output (after the last user_message) — that is what
+  // the watchdog truncated. Keep the tail (most recent, where the cutoff happened)
+  // when it exceeds the limit. See soft-error-retry-continuity-governance-plan.md.
+  const lastUserMessageIndex = findLastIndex(events, event => event.type === 'user_message')
+  const inFlightText = events
+    .filter((event, index): event is Extract<NexusEvent, { type: 'assistant_delta' }> =>
+      event.type === 'assistant_delta' && index > lastUserMessageIndex)
+    .map(event => event.text)
+    .join('')
+    .trim()
+  if (inFlightText) {
+    return truncateForTimeoutSummaryTail(inFlightText)
+  }
+  // Fall back to full assistant history, then tool evidence.
   const assistantText = events
     .filter((event): event is Extract<NexusEvent, { type: 'assistant_delta' }> => event.type === 'assistant_delta')
     .map(event => event.text)
@@ -296,6 +310,18 @@ async function appendTimeoutExtensionGranted(state: {
 function truncateForTimeoutSummary(value: string): string {
   const normalized = value.replace(/\s+/g, ' ').trim()
   return normalized.length > 800 ? `${normalized.slice(0, 797)}...` : normalized
+}
+
+function truncateForTimeoutSummaryTail(value: string): string {
+  const normalized = value.replace(/\s+/g, ' ').trim()
+  return normalized.length > 800 ? `...${normalized.slice(-797)}` : normalized
+}
+
+function findLastIndex<T>(items: readonly T[], predicate: (item: T, index: number) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (predicate(items[index]!, index)) return index
+  }
+  return -1
 }
 
 function buildNearTimeoutWarningEvent(options: {
