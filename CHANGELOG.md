@@ -8,6 +8,35 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 - No unreleased user-facing changes are documented yet.
 
+## v0.4.0 - 2026-07-03
+
+[Full release notes](docs/releases/v0.4.0.md)
+
+### Added
+
+- Added Agent Skills package import/export interoperability while preserving
+  BabeL-O's `NormalizedSkill` runtime shape.
+- Added Go TUI `/skill` list/show/validate workflow coverage and Skill
+  overlays.
+- Added same-provider automatic retry for transient `provider_unavailable` and
+  `rate_limit` failures, including retry lifecycle events.
+
+### Changed
+
+- Expanded Skill validation, resource coverage, conversion diagnostics, and
+  matcher quality.
+- Added saved config and environment overrides for provider auto retry policy.
+- Moved more user-facing documentation into `docs/guides/`.
+
+### Fixed
+
+- Classified MiniMax transient `unknown error, 999 (1000)` and timeout
+  `2066` failures as retryable provider availability errors.
+- Made provider retry waits stream `provider_retry_scheduled` before sleeping,
+  so TUI/CLI countdowns appear immediately.
+- Cancelled provider retry waits now settle as `REQUEST_CANCELLED` without
+  starting the next provider attempt.
+
 ## v0.3.9 - 2026-06-23
 
 [Full release notes](docs/releases/v0.3.9.md)

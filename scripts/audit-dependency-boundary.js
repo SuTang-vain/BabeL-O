@@ -20,6 +20,10 @@ const dependencyOwnership = {
 const nodeBuiltinModules = new Set([
   ...builtinModules,
   ...builtinModules.map(name => `node:${name}`),
+  // Node 22+ exposes these built-ins behind version/feature availability, but
+  // they may be absent from builtinModules on some audit runtimes.
+  'node:sea',
+  'node:sqlite',
 ])
 const cliOnlyDependencies = new Set(
   Object.entries(dependencyOwnership)
