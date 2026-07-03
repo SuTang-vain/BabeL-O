@@ -268,4 +268,3 @@
 - Go TUI 各 Phase 实现记录（tool palette `/v1/tools/audit` wire / Phase 8 version-reporting+release+`bbl go --check` / Phase 9 promotion / execute-timeout A-E / permission-policy A-D·A.1 / session observability Phase 0）见上方 Watch/Closed 降噪索引表与 [go-tui-history.md](./history/go-tui-history.md)、[archive/go-tui-execute-timeout-governance-plan.md](./archive/go-tui-execute-timeout-governance-plan.md)、[proposals/go-tui-session-observability-governance-plan.md](./proposals/go-tui-session-observability-governance-plan.md)、[PHASE_9_DECISION.md](./PHASE_9_DECISION.md)；事实流水见 [WORK_LOG.md](./WORK_LOG.md)。
 - 子 Agent / optimizer 默认优先隔离执行；in-place Git 操作不能纳入无关未跟踪文件或删除用户文件。
 - TUI 权限面板、slash/tool palette 和 input owner 的键盘路由不能退回多输入框或 `y/N` 单行审批。
-

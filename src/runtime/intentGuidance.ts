@@ -221,6 +221,10 @@ export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): bool
   if (isCurrentStateVerificationRequest(normalized.latestUserText)) return false
   if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return true
   if (normalized.intent === 'status') return false
+  // self-diagnosis turns (model diagnosing the runtime / itself) need read-only
+  // tools to cite rules or state; suppressing them is a false positive. See
+  // soft-error-retry-continuity-governance-plan.md Fix B1 (session_2db242ff seq 1024).
+  if (getIntentCategory(normalized) === 'self_diagnosis_request') return false
   return !normalized.requiresTools || normalized.actionHint === 'respond_only'
 }
 
