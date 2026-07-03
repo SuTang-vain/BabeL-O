@@ -61,6 +61,7 @@ export type SessionRow = {
   error: string | null
   eventCount: number
   compactBoundaries: CompactBoundaryInspection[]
+  providerRetrySummary: ProviderRetryInspection | null
   // clientSessionId is the Go TUI Phase 1 back-reference
   // (typically `session_go_<unixnano>`) stored in the server
   // session row's metadata column. Empty when the client
@@ -88,6 +89,24 @@ export type CompactBoundaryInspection = {
   preservedTailEventId: string | null
   retainedSegmentHash: string | null
   userVisibleSummary: string | null
+}
+
+export type ProviderRetryInspection = {
+  providerId: string | null
+  modelId: string | null
+  recoveryKind: string | null
+  scheduledCount: number
+  startedCount: number
+  succeededCount: number
+  exhaustedCount: number
+  lastAttempt: number | null
+  maxRetries: number | null
+  totalDelayMs: number
+  recoveredAfterMs: number | null
+  finalErrorCode: string | null
+  firstRequestId: string | null
+  lastStatus: string
+  lastTimestamp: string | null
 }
 
 export type ClientLogHit = {
@@ -231,12 +250,14 @@ export function findSessionInSqlite(
     // the events table is empty).
     let eventCount = 0
     let compactBoundaries: CompactBoundaryInspection[] = []
+    let providerRetrySummary: ProviderRetryInspection | null = null
     try {
       const countRow = db
         .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id = ?`)
         .get(sessionId) as { n: number } | undefined
       eventCount = countRow?.n ?? 0
       compactBoundaries = listCompactBoundaryInspections(db, sessionId)
+      providerRetrySummary = summarizeProviderRetryInspections(db, sessionId)
     } catch {
       // events table missing → 0
     }
@@ -252,6 +273,7 @@ export function findSessionInSqlite(
       error: row.error,
       eventCount,
       compactBoundaries,
+      providerRetrySummary,
       clientSessionId,
     }
   } catch {
@@ -316,6 +338,94 @@ function listCompactBoundaryInspections(
     })
   }
   return boundaries
+}
+
+function summarizeProviderRetryInspections(
+  db: DatabaseSync,
+  sessionId: string,
+): ProviderRetryInspection | null {
+  const retryTypes = [
+    'provider_retry_scheduled',
+    'provider_retry_started',
+    'provider_retry_succeeded',
+    'provider_retry_exhausted',
+  ]
+  const rows = db
+    .prepare(
+      `SELECT timestamp, event_type, event_json FROM events
+       WHERE session_id = ?
+         AND event_type IN (${retryTypes.map(() => '?').join(', ')})
+       ORDER BY timestamp ASC, event_key ASC`,
+    )
+    .all(sessionId, ...retryTypes) as {
+      timestamp: string | null
+      event_type: string | null
+      event_json: string | null
+    }[]
+  if (rows.length === 0) return null
+
+  const summary: ProviderRetryInspection = {
+    providerId: null,
+    modelId: null,
+    recoveryKind: null,
+    scheduledCount: 0,
+    startedCount: 0,
+    succeededCount: 0,
+    exhaustedCount: 0,
+    lastAttempt: null,
+    maxRetries: null,
+    totalDelayMs: 0,
+    recoveredAfterMs: null,
+    finalErrorCode: null,
+    firstRequestId: null,
+    lastStatus: 'unknown',
+    lastTimestamp: null,
+  }
+
+  for (const row of rows) {
+    if (!row.event_json) continue
+    let event: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(row.event_json)
+      if (!parsed || typeof parsed !== 'object') continue
+      event = parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const type = stringOrNull(event.type) ?? row.event_type ?? ''
+    if (!retryTypes.includes(type)) continue
+    summary.providerId = summary.providerId ?? stringOrNull(event.providerId)
+    summary.modelId = summary.modelId ?? stringOrNull(event.modelId)
+    summary.recoveryKind = summary.recoveryKind ?? stringOrNull(event.recoveryKind)
+    summary.maxRetries = numericField(event, 'maxRetries') ?? summary.maxRetries
+    summary.lastTimestamp = stringOrNull(event.timestamp) ?? row.timestamp ?? summary.lastTimestamp
+
+    if (type === 'provider_retry_scheduled') {
+      summary.scheduledCount += 1
+      summary.totalDelayMs += numericField(event, 'delayMs') ?? 0
+      summary.lastAttempt = numericField(event, 'attempt') ?? summary.lastAttempt
+      summary.firstRequestId = summary.firstRequestId ?? stringOrNull(event.requestId) ?? stringOrNull(event.originalRequestId)
+      summary.lastStatus = 'scheduled'
+    } else if (type === 'provider_retry_started') {
+      summary.startedCount += 1
+      summary.lastAttempt = numericField(event, 'attempt') ?? summary.lastAttempt
+      summary.lastStatus = 'started'
+    } else if (type === 'provider_retry_succeeded') {
+      summary.succeededCount += 1
+      summary.lastAttempt = numericField(event, 'attempt') ?? summary.lastAttempt
+      summary.recoveredAfterMs = numericField(event, 'recoveredAfterMs') ?? summary.recoveredAfterMs
+      summary.lastStatus = 'succeeded'
+    } else if (type === 'provider_retry_exhausted') {
+      summary.exhaustedCount += 1
+      summary.lastAttempt = numericField(event, 'attempts') ?? summary.lastAttempt
+      summary.finalErrorCode = stringOrNull(event.finalErrorCode) ?? summary.finalErrorCode
+      summary.lastStatus = 'exhausted'
+    }
+  }
+
+  return summary.scheduledCount + summary.startedCount + summary.succeededCount + summary.exhaustedCount > 0
+    ? summary
+    : null
 }
 
 function numericField(record: Record<string, unknown> | undefined, key: string): number | null {
@@ -493,6 +603,19 @@ function formatCompactBoundaryInspection(boundary: CompactBoundaryInspection): s
   const tail = boundary.preservedTailEventId ? ` tail=${boundary.preservedTailEventId}` : ''
   const summary = boundary.userVisibleSummary ? ` summary="${boundary.userVisibleSummary}"` : ''
   return `${boundary.type} trigger=${boundary.trigger ?? 'unknown'} ${counts}${tokens}${saved}${retained}${tail}${summary}`
+}
+
+function formatProviderRetryInspection(summary: ProviderRetryInspection): string {
+  const subject = `${summary.providerId ?? 'unknown'}/${summary.modelId ?? 'unknown'}`
+  const attempt = summary.lastAttempt !== null && summary.maxRetries !== null
+    ? `${summary.lastAttempt}/${summary.maxRetries}`
+    : `${summary.lastAttempt ?? '?'}`
+  const delay = summary.totalDelayMs > 0 ? ` waited=${summary.totalDelayMs}ms` : ''
+  const recovered = summary.recoveredAfterMs !== null ? ` recoveredAfter=${summary.recoveredAfterMs}ms` : ''
+  const code = summary.finalErrorCode ? ` code=${summary.finalErrorCode}` : ''
+  const request = summary.firstRequestId ? ` firstRequest=${summary.firstRequestId}` : ''
+  const timestamp = summary.lastTimestamp ? ` last=${summary.lastTimestamp}` : ''
+  return `${summary.lastStatus} ${subject} kind=${summary.recoveryKind ?? 'unknown'} attempts=${attempt} scheduled=${summary.scheduledCount} started=${summary.startedCount} succeeded=${summary.succeededCount} exhausted=${summary.exhaustedCount}${delay}${recovered}${code}${request}${timestamp}`
 }
 
 /**
@@ -880,6 +1003,10 @@ export function registerInspectSessionCommand(program: Command): void {
           for (const boundary of row.compactBoundaries.slice(-5)) {
             console.log(`    - ${formatCompactBoundaryInspection(boundary)}`)
           }
+        }
+        if (row.providerRetrySummary) {
+          console.log(`  provider retry:`)
+          console.log(`    - ${formatProviderRetryInspection(row.providerRetrySummary)}`)
         }
         if (row.prompt) {
           console.log(`  prompt     : ${row.prompt.slice(0, 100)}${row.prompt.length > 100 ? '…' : ''}`)

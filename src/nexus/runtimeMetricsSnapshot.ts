@@ -74,12 +74,38 @@ type AgentJobMetrics = {
   byFailureCode: Record<string, number>
 }
 
+type ProviderRetryMetrics = {
+  scheduledCount: number
+  startedCount: number
+  succeededCount: number
+  exhaustedCount: number
+  attemptsScheduled: number
+  attemptsStarted: number
+  totalDelayMs: number
+  recoveredAfterMs: {
+    totalMs: number
+    count: number
+    avgMs: number
+  }
+  byProvider: Record<
+    string,
+    {
+      scheduledCount: number
+      startedCount: number
+      succeededCount: number
+      exhaustedCount: number
+    }
+  >
+  byRecoveryKind: Record<string, number>
+}
+
 export async function buildRuntimeMetricsSnapshot(
   metrics: NexusMetrics,
   storage: NexusStorage,
 ): Promise<
   RuntimeMetricsSnapshot & {
     providerInvocations: ProviderInvocationMetrics
+    providerRetries: ProviderRetryMetrics
     agentLoop: AgentLoopMetrics
     agentJobs: AgentJobMetrics
     cacheHealth: ReturnType<typeof buildCacheHealthFromRuntimeMetrics>
@@ -91,6 +117,7 @@ export async function buildRuntimeMetricsSnapshot(
     includeEvents: false,
   })
   const providerInvocations = createProviderInvocationMetrics()
+  const providerRetries = createProviderRetryMetrics()
   const agentLoop = createAgentLoopMetrics()
   const agentJobs = createAgentJobMetrics()
 
@@ -103,12 +130,14 @@ export async function buildRuntimeMetricsSnapshot(
     if (sawTaskSessionEvent) agentLoop.sessionsObserved += 1
     for (const event of page.events) {
       recordProviderInvocationMetrics(providerInvocations, event)
+      recordProviderRetryMetrics(providerRetries, event)
       recordAgentLoopMetrics(agentLoop, event)
       recordAgentJobMetrics(agentJobs, event)
     }
   }
 
   finalizeProviderInvocationMetrics(providerInvocations)
+  finalizeProviderRetryMetrics(providerRetries)
   finalizeAgentLoopMetrics(agentLoop)
   const cacheHealth = buildCacheHealthFromRuntimeMetrics({
     tokenUsage: snapshot.tokenUsage,
@@ -116,10 +145,72 @@ export async function buildRuntimeMetricsSnapshot(
   return {
     ...snapshot,
     providerInvocations,
+    providerRetries,
     agentLoop,
     agentJobs,
     cacheHealth,
   }
+}
+
+function createProviderRetryMetrics(): ProviderRetryMetrics {
+  return {
+    scheduledCount: 0,
+    startedCount: 0,
+    succeededCount: 0,
+    exhaustedCount: 0,
+    attemptsScheduled: 0,
+    attemptsStarted: 0,
+    totalDelayMs: 0,
+    recoveredAfterMs: { totalMs: 0, count: 0, avgMs: 0 },
+    byProvider: {},
+    byRecoveryKind: {},
+  }
+}
+
+function recordProviderRetryMetrics(metrics: ProviderRetryMetrics, event: NexusEvent): void {
+  if (
+    event.type !== 'provider_retry_scheduled' &&
+    event.type !== 'provider_retry_started' &&
+    event.type !== 'provider_retry_succeeded' &&
+    event.type !== 'provider_retry_exhausted'
+  ) {
+    return
+  }
+  const providerKey = `${event.providerId}/${event.modelId}`
+  const providerMetrics = metrics.byProvider[providerKey] ?? {
+    scheduledCount: 0,
+    startedCount: 0,
+    succeededCount: 0,
+    exhaustedCount: 0,
+  }
+  incrementCount(metrics.byRecoveryKind, event.recoveryKind)
+
+  if (event.type === 'provider_retry_scheduled') {
+    metrics.scheduledCount += 1
+    metrics.attemptsScheduled += event.attempt
+    metrics.totalDelayMs = round(metrics.totalDelayMs + event.delayMs)
+    providerMetrics.scheduledCount += 1
+  } else if (event.type === 'provider_retry_started') {
+    metrics.startedCount += 1
+    metrics.attemptsStarted += event.attempt
+    providerMetrics.startedCount += 1
+  } else if (event.type === 'provider_retry_succeeded') {
+    metrics.succeededCount += 1
+    metrics.recoveredAfterMs.totalMs = round(metrics.recoveredAfterMs.totalMs + event.recoveredAfterMs)
+    metrics.recoveredAfterMs.count += 1
+    providerMetrics.succeededCount += 1
+  } else if (event.type === 'provider_retry_exhausted') {
+    metrics.exhaustedCount += 1
+    providerMetrics.exhaustedCount += 1
+  }
+
+  metrics.byProvider[providerKey] = providerMetrics
+}
+
+function finalizeProviderRetryMetrics(metrics: ProviderRetryMetrics): void {
+  metrics.recoveredAfterMs.avgMs = metrics.recoveredAfterMs.count > 0
+    ? round(metrics.recoveredAfterMs.totalMs / metrics.recoveredAfterMs.count)
+    : 0
 }
 
 function createProviderInvocationMetrics(): ProviderInvocationMetrics {

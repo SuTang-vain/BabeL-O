@@ -3,6 +3,7 @@ import { test } from 'node:test'
 import { executeProviderRecoveryDecision } from '../src/runtime/executeProviderRecoveryDecision.js'
 import type { NexusEvent } from '../src/shared/events.js'
 import type { ModelMessage } from '../src/providers/adapters/ModelAdapter.js'
+import { ProviderError } from '../src/shared/errors.js'
 
 // ─── fixtures ──────────────────────────────────────────────
 
@@ -185,4 +186,40 @@ test('executeProviderRecoveryDecision returns all required fields', async () => 
   assert.ok('autoCompactDecision' in result)
   assert.ok('messages' in result)
   assert.ok('cacheAwareCompactPolicy' in result)
+})
+
+test('executeProviderRecoveryDecision schedules retry for provider_unavailable under budget', async () => {
+  const result = await executeProviderRecoveryDecision(makeInput({
+    error: new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"}}'),
+    providerId: 'minimax',
+    cleanedModelId: 'minimax/MiniMax-M3',
+    counters: {
+      providerContextRecoveryCount: 0,
+      maxProviderContextRecoveries: 1,
+      providerAvailabilityRetryState: { count: 0 },
+    },
+    providerAutoRetryPolicy: { enabled: true, maxRetries: 10, delayMs: 1 },
+  }))
+
+  assert.equal(result.kind, 'retry')
+  assert.equal(result.providerAvailabilityRetryState?.count, 1)
+  assert.equal(result.events.some(event => event.type === 'provider_retry_scheduled'), true)
+  assert.equal(result.events.some(event => event.type === 'provider_retry_started'), false)
+})
+
+test('executeProviderRecoveryDecision emits exhausted when provider retry budget is spent', async () => {
+  const result = await executeProviderRecoveryDecision(makeInput({
+    error: new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"}}'),
+    providerId: 'minimax',
+    cleanedModelId: 'minimax/MiniMax-M3',
+    counters: {
+      providerContextRecoveryCount: 0,
+      maxProviderContextRecoveries: 1,
+      providerAvailabilityRetryState: { count: 10 },
+    },
+    providerAutoRetryPolicy: { enabled: true, maxRetries: 10, delayMs: 1 },
+  }))
+
+  assert.equal(result.kind, 'rethrow')
+  assert.equal(result.events.some(event => event.type === 'provider_retry_exhausted'), true)
 })

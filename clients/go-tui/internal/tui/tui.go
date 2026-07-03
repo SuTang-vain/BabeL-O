@@ -1215,6 +1215,7 @@ type model struct {
 	// fresh fatal cutoff. Cleared on result / error like
 	// `latestUsage` so the next turn starts clean.
 	softTimeoutState *softTimeoutSnapshot
+	providerRetryCountdown *providerRetryCountdownSnapshot
 	currentTimeout   timeoutDecision
 	// Phase 11 in-app selection. With --mouse the Go TUI
 	// captures SGR mouse events and the terminal can no
@@ -1371,6 +1372,16 @@ type softTimeoutSnapshot struct {
 	// recent soft-cycle event (budget or extension). Useful for
 	// human-readable footer / friendly-message output.
 	LastElapsedMs int
+}
+
+type providerRetryCountdownSnapshot struct {
+	ProviderID    string
+	ModelID       string
+	RecoveryKind  string
+	Attempt       int
+	MaxRetries    int
+	DelayMs       int
+	NextAttemptAt time.Time
 }
 
 type timeoutDecision struct {
@@ -1842,6 +1853,7 @@ func (m *model) startAgentPrompt(displayPrompt string, expandedPrompt string) te
 	m.lastEventType = ""
 	m.pendingSynthesis = false
 	m.assistantSeenInTurn = false
+	m.providerRetryCountdown = nil
 	m.startedAt = time.Now()
 	m.resize()
 	return tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
@@ -1907,6 +1919,7 @@ func (m *model) finishRunningStream() tea.Cmd {
 	}
 	m.latestUsage = nil
 	m.softTimeoutState = nil
+	m.providerRetryCountdown = nil
 	m.resize()
 	return m.startQueuedPrompt()
 }
@@ -4301,6 +4314,7 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// REQUEST_TIMEOUT still sees the snapshot above). The
 		// next turn starts with a fresh budget anyway.
 		m.softTimeoutState = nil
+		m.providerRetryCountdown = nil
 		m.resize()
 		// Phase 6 PR2: end-of-turn auto-refresh. The Nexus may
 		// have queued or accepted new SessionChannel messages
@@ -4375,7 +4389,8 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
-	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+		m.updateProviderRetryCountdown(event)
 		m.appendLine(eventType, formatNexusEvent(event))
 	case "context_usage":
 		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)
@@ -4546,6 +4561,28 @@ func (m *model) recordSuppressedNexusEvent(event map[string]any) {
 		if m.latestUsage.InputTokens > 0 {
 			m.lastUsage = m.latestUsage
 		}
+	}
+}
+
+func (m *model) updateProviderRetryCountdown(event map[string]any) {
+	switch stringField(event, "type") {
+	case "provider_retry_scheduled":
+		nextAttemptAt, err := time.Parse(time.RFC3339Nano, stringField(event, "nextAttemptAt"))
+		if err != nil {
+			m.providerRetryCountdown = nil
+			return
+		}
+		m.providerRetryCountdown = &providerRetryCountdownSnapshot{
+			ProviderID:    stringField(event, "providerId"),
+			ModelID:       stringField(event, "modelId"),
+			RecoveryKind:  stringField(event, "recoveryKind"),
+			Attempt:       anyInt(event["attempt"]),
+			MaxRetries:    anyInt(event["maxRetries"]),
+			DelayMs:       anyInt(event["delayMs"]),
+			NextAttemptAt: nextAttemptAt,
+		}
+	case "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted":
+		m.providerRetryCountdown = nil
 	}
 }
 

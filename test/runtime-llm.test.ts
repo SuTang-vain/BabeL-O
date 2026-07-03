@@ -199,6 +199,22 @@ describe('ConfigManager', () => {
     assert.equal(configManager.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
   })
 
+  test('saves and loads provider auto retry configuration', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+    configManager.setProviderAutoRetryConfig({
+      enabled: true,
+      maxRetries: 4,
+      delayMs: 2500,
+    })
+
+    const reloaded = new ConfigManager(tempConfigPath)
+    assert.deepEqual(reloaded.getProviderAutoRetryConfig(), {
+      enabled: true,
+      maxRetries: 4,
+      delayMs: 2500,
+    })
+  })
+
   test('resolves settings with correct env var precedence', () => {
     const configManager = new ConfigManager(tempConfigPath)
     configManager.setProviderConfig('openai', {
@@ -1706,7 +1722,7 @@ describe('LLMCodingRuntime', () => {
 
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
-    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillSave', 'Write'])
+    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillExportWrite', 'SkillImportInstall', 'SkillSave', 'Write'])
   })
 
   test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
@@ -2073,6 +2089,64 @@ describe('LLMCodingRuntime', () => {
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, false)
     assert.match(resultEvent.message, /Insufficient Balance/i)
+  })
+
+  test('adapter retries initial provider_unavailable errors before runtime recovery', async () => {
+    process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '1'
+    process.env.BABEL_O_PROVIDER_AUTO_RETRY_MAX_RETRIES = '10'
+    let providerRequestCount = 0
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"test intake\\",\\"guidance\\":\\"Proceed.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      providerRequestCount += 1
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      if (providerRequestCount === 1) {
+        return {
+          ok: false,
+          status: 500,
+          body: null,
+          text: async () => '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"},"request_id":"0695498774bd1185436107ba7f49078b"}',
+        } as Response
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: createAnthropicTextStream('Recovered after provider retry.'),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-provider-unavailable-auto-retry',
+        prompt: 'analyze code',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.equal(providerRequestCount, 2)
+    assert.equal(events.some(event => event.type === 'provider_retry_scheduled'), false)
+    assert.equal(events.some(event => event.type === 'provider_retry_started'), false)
+    assert.equal(events.some(event => event.type === 'provider_retry_succeeded'), false)
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /Recovered after provider retry/)
   })
 
   test('fails instead of accepting repeated max token truncation as a successful answer', async () => {

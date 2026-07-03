@@ -287,6 +287,86 @@ test('inspectSession: tier (a) renders compact boundary protocol details', () =>
   })
 })
 
+test('inspectSession: tier (a) summarizes provider retry lifecycle events', () => {
+  withTempConfigDir((configDir) => {
+    const dbPath = join(configDir, 'db.sqlite')
+    const sessionId = 'session_provider_retry-uuid'
+    seedSqliteWithSession(dbPath, sessionId, { withEvents: false })
+    const db = new DatabaseSync(dbPath)
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS events (
+          event_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          event_type TEXT,
+          event_json TEXT
+        );
+      `)
+      const events = [
+        {
+          type: 'provider_retry_scheduled',
+          timestamp: '2026-07-03T00:00:00.000Z',
+          providerId: 'minimax',
+          modelId: 'MiniMax-M3',
+          recoveryKind: 'provider_unavailable',
+          requestId: 'req_first',
+          attempt: 1,
+          maxRetries: 10,
+          delayMs: 30000,
+          nextAttemptAt: '2026-07-03T00:00:30.000Z',
+        },
+        {
+          type: 'provider_retry_started',
+          timestamp: '2026-07-03T00:00:30.000Z',
+          providerId: 'minimax',
+          modelId: 'MiniMax-M3',
+          recoveryKind: 'provider_unavailable',
+          attempt: 1,
+          maxRetries: 10,
+        },
+        {
+          type: 'provider_retry_succeeded',
+          timestamp: '2026-07-03T00:00:31.000Z',
+          providerId: 'minimax',
+          modelId: 'MiniMax-M3',
+          recoveryKind: 'provider_unavailable',
+          attempt: 1,
+          maxRetries: 10,
+          recoveredAfterMs: 31000,
+        },
+      ]
+      events.forEach((event, index) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO events (event_key, session_id, timestamp, event_type, event_json)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run(`evt_provider_retry_${index}`, sessionId, event.timestamp, event.type, JSON.stringify(event))
+      })
+    } finally {
+      try { db.close() } catch { /* ignore */ }
+    }
+
+    const result = inspectSession(sessionId)
+    assert.equal(result.tier, 'found-in-sqlite')
+    if (result.tier !== 'found-in-sqlite') return
+    const summary = result.row.providerRetrySummary
+    assert.ok(summary)
+    assert.equal(summary.providerId, 'minimax')
+    assert.equal(summary.modelId, 'MiniMax-M3')
+    assert.equal(summary.recoveryKind, 'provider_unavailable')
+    assert.equal(summary.scheduledCount, 1)
+    assert.equal(summary.startedCount, 1)
+    assert.equal(summary.succeededCount, 1)
+    assert.equal(summary.exhaustedCount, 0)
+    assert.equal(summary.lastAttempt, 1)
+    assert.equal(summary.maxRetries, 10)
+    assert.equal(summary.totalDelayMs, 30000)
+    assert.equal(summary.recoveredAfterMs, 31000)
+    assert.equal(summary.firstRequestId, 'req_first')
+    assert.equal(summary.lastStatus, 'succeeded')
+  })
+})
+
 test('inspectSession: tier (b) found in client log only (embedded Nexus memory-storage loss)', () => {
   // The exact `session_go_1781146359507755000` failure mode: client
   // Go TUI wrote the session id to a log line, but the embedded

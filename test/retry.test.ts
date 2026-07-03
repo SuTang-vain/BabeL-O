@@ -1,6 +1,7 @@
 import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 import { withRetry } from '../src/providers/retry.js'
+import { readProviderAutoRetryPolicy } from '../src/runtime/providerRetry.js'
 import { ProviderError } from '../src/shared/errors.js'
 
 describe('withRetry', () => {
@@ -83,5 +84,65 @@ describe('withRetry', () => {
     }, { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 10, retryableStatuses: [429, 500, 502, 503, 529] })
     assert.equal(result, 'ok')
     assert.equal(calls, 3)
+  })
+
+  test('retries 504 timeout errors by default', async () => {
+    let calls = 0
+    const result = await withRetry(async () => {
+      calls += 1
+      if (calls === 1) throw new ProviderError('minimax', 504, '{"type":"error","error":{"type":"timeout_error","message":"请求处理超时，请稍后重试 (2066)"}}')
+      return 'ok'
+    })
+    assert.equal(result, 'ok')
+    assert.equal(calls, 2)
+  })
+})
+
+describe('readProviderAutoRetryPolicy', () => {
+  test('uses default provider auto retry policy without config or env overrides', () => {
+    assert.deepEqual(readProviderAutoRetryPolicy({}), {
+      enabled: true,
+      maxRetries: 10,
+      delayMs: 30_000,
+    })
+  })
+
+  test('uses saved config provider auto retry policy', () => {
+    assert.deepEqual(readProviderAutoRetryPolicy({}, {
+      enabled: false,
+      maxRetries: 4,
+      delayMs: 2500,
+    }), {
+      enabled: false,
+      maxRetries: 4,
+      delayMs: 2500,
+    })
+  })
+
+  test('lets env overrides take precedence over saved provider auto retry config', () => {
+    assert.deepEqual(readProviderAutoRetryPolicy({
+      BABEL_O_PROVIDER_AUTO_RETRY_ENABLED: '1',
+      BABEL_O_PROVIDER_AUTO_RETRY_MAX_RETRIES: '8',
+      BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS: '1200',
+    }, {
+      enabled: false,
+      maxRetries: 4,
+      delayMs: 2500,
+    }), {
+      enabled: true,
+      maxRetries: 8,
+      delayMs: 1200,
+    })
+  })
+
+  test('falls back when saved provider auto retry config values are invalid', () => {
+    assert.deepEqual(readProviderAutoRetryPolicy({}, {
+      maxRetries: -1,
+      delayMs: 1.5,
+    }), {
+      enabled: true,
+      maxRetries: 10,
+      delayMs: 30_000,
+    })
   })
 })

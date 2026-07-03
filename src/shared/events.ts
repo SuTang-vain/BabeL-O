@@ -502,6 +502,55 @@ export const ContextRecoveryAttemptedEventSchema = z.object({
   message: z.string(),
 })
 
+const providerRetryFields = {
+  providerId: z.string(),
+  modelId: z.string(),
+  recoveryKind: z.enum(['provider_unavailable', 'rate_limit']),
+}
+
+export const ProviderRetryScheduledEventSchema = z.object({
+  type: z.literal('provider_retry_scheduled'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  originalRequestId: z.string().optional(),
+  ...providerRetryFields,
+  httpStatus: z.number().optional(),
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+  delayMs: z.number().int().nonnegative(),
+  nextAttemptAt: z.string(),
+  sameProvider: z.literal(true),
+  sameModel: z.literal(true),
+  message: z.string(),
+})
+
+export const ProviderRetryStartedEventSchema = z.object({
+  type: z.literal('provider_retry_started'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+})
+
+export const ProviderRetrySucceededEventSchema = z.object({
+  type: z.literal('provider_retry_succeeded'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+  recoveredAfterMs: z.number().nonnegative(),
+})
+
+export const ProviderRetryExhaustedEventSchema = z.object({
+  type: z.literal('provider_retry_exhausted'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempts: z.number().int().nonnegative(),
+  maxRetries: z.number().int().nonnegative(),
+  finalErrorCode: z.string(),
+  message: z.string(),
+})
+
 export const ContextGroundingRequiredEventSchema = z.object({
   type: z.literal('context_grounding_required'),
   ...baseEventFields,
@@ -756,6 +805,10 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ContextUsageEventSchema,
   ContextMicrocompactEventSchema,
   ContextRecoveryAttemptedEventSchema,
+  ProviderRetryScheduledEventSchema,
+  ProviderRetryStartedEventSchema,
+  ProviderRetrySucceededEventSchema,
+  ProviderRetryExhaustedEventSchema,
   ContextGroundingRequiredEventSchema,
   ContextGroundingConfirmedEventSchema,
   WorkspaceDirtyDetectedEventSchema,
