@@ -2879,6 +2879,8 @@ describe('LLMCodingRuntime', () => {
     const guardError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY') as any
     assert.ok(guardError)
     assert.match(guardError.message, /ignored additional requested tools/)
+    // C1: must_respond backstop is a soft signal (soft-error-retry plan).
+    assert.equal(guardError.details?.severity, 'soft')
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)

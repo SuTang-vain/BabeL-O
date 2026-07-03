@@ -158,6 +158,7 @@ export function reduceProviderTurnOutcome(options: {
             code: 'TOOL_DENIED_FINAL_CHECK',
             message,
             details: {
+              severity: 'soft',
               finalCheckPhase: true,
               attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
               deniedTools: nonReadOnly.map(toolCall => toolCall.name),
@@ -192,6 +193,7 @@ export function reduceProviderTurnOutcome(options: {
           sessionId: options.sessionId,
           code: 'TOOL_LOOP_FINAL_RESPONSE_ONLY',
           message,
+          details: { severity: 'soft' },
         }),
       ],
       eventsAfterMessages: [],

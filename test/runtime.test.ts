@@ -1095,6 +1095,8 @@ test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL
   assert.equal(outcome.kind, 'continue')
   const err = outcome.eventsBeforeMessages[0] as any
   assert.equal(err?.code, 'TOOL_DENIED_FINAL_CHECK')
+  // C1: final_check soft-denial carries severity:'soft' (soft-error-retry plan).
+  assert.equal(err?.details?.severity, 'soft')
 })
 
 test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass through', () => {
