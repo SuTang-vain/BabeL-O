@@ -1,6 +1,6 @@
 # Development Guide
 
-This guide is for contributors working from the `develop` branch or a local source checkout.
+This guide is for contributors working from the `develop` branch or a local source checkout. For the full development guide — essential commands, design rules, layer boundaries, and tooling — see [../AGENTS.md](../AGENTS.md). This page only covers branch responsibilities and source/release CLI invocation.
 
 ## Branch responsibilities
 

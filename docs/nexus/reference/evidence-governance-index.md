@@ -4,7 +4,7 @@
 > Track: Evidence / Session / Runtime / Tools
 > Priority: P1 Watch
 > Source of truth: `docs/nexus/TODO.md`, `docs/nexus/active/`, `docs/nexus/DONE.md`, `docs/nexus/WORK_LOG.md`, `src/runtime/taskScope.ts`, `src/runtime/contextAnalysis.ts`, `src/cli/runSessionFlow.ts`, `src/runtime/readCache.ts`, `src/tools/`, `src/storage/`
-> Related: [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [tool-governance-plan.md](./tool-governance-plan.md), [context-governance-index.md](./context-governance-index.md)
+> Related: [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [tool-governance-plan.md](./tool-governance-plan.md), [context-governance-index.md](./context-governance-index.md)
 
 ## Purpose
 
@@ -18,7 +18,7 @@ Current priority still belongs to `docs/nexus/TODO.md` and `docs/nexus/active/`.
 | --- | --- | --- |
 | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Provider replay safety, event ordering, Read coverage, partial/full evidence semantics, intent-target replay, and provider protocol validity. | Use when a historical session cannot be replayed into a valid provider request or when partial evidence was treated as complete. |
 | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Current-turn terminal outcome correctness and stale result pollution. | Use when a session appears completed but the latest user turn has no current terminal result/error. |
-| [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md) | Whether real read-only evidence is inside the user's current task scope. | Use when the model reads sibling repos, historical roots, or memory-suggested paths without explicit user authorization. |
+| [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md) | Whether real read-only evidence is inside the user's current task scope. | Use when the model reads sibling repos, historical roots, or memory-suggested paths without explicit user authorization. |
 | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Repeated wrong-root tool failures and evidence degradation after path confusion. | Use when `Read` / `ListDir` / `Glob` / `Bash` failures indicate the model is using a wrong but plausible workspace root. |
 | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Timeout as recoverable evidence boundary rather than fatal workflow cutoff. | Use when a long task is interrupted by request timeout before the model can summarize partial evidence or ask for continuation. |
 
@@ -80,8 +80,8 @@ The remaining governance issue is consistency: these capabilities must be read a
 
 | Item | Owner document | Status |
 | --- | --- | --- |
-| Full final-answer evidence panel | [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Watch; avoid heavy ledger until new regressions prove need. |
-| Durable scope/evidence timeline | [task-scope-and-evidence-scope-governance-plan.md](../proposals/task-scope-and-evidence-scope-governance-plan.md) | Watch; current diagnostics are sufficient for the landed slice. |
+| Full final-answer evidence panel | [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Watch; avoid heavy ledger until new regressions prove need. |
+| Durable scope/evidence timeline | [task-scope-and-evidence-scope-governance-plan.md](./task-scope-and-evidence-scope-governance-plan.md) | Watch; current diagnostics are sufficient for the landed slice. |
 | Repeated-root path drift aggregation | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Watch; strengthen only on repeated real samples. |
 | Timeout continuation UX | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Watch; maintain soft deadline vs hard watchdog distinction. |
 | Evidence regression corpus | [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md) | Keep adding real samples when user-visible drift appears. |

@@ -8,7 +8,7 @@ import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
 import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
-import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent } from '../src/runtime/intentGuidance.js'
+import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
@@ -197,6 +197,22 @@ describe('ConfigManager', () => {
     assert.equal(configManager.getDefaultModel(), 'local/coding-runtime')
     configManager.setDefaultModel('anthropic/claude-3-5-sonnet')
     assert.equal(configManager.getDefaultModel(), 'anthropic/claude-3-5-sonnet')
+  })
+
+  test('saves and loads provider auto retry configuration', () => {
+    const configManager = new ConfigManager(tempConfigPath)
+    configManager.setProviderAutoRetryConfig({
+      enabled: true,
+      maxRetries: 4,
+      delayMs: 2500,
+    })
+
+    const reloaded = new ConfigManager(tempConfigPath)
+    assert.deepEqual(reloaded.getProviderAutoRetryConfig(), {
+      enabled: true,
+      maxRetries: 4,
+      delayMs: 2500,
+    })
   })
 
   test('resolves settings with correct env var precedence', () => {
@@ -733,6 +749,9 @@ describe('User intent fallback guidance', () => {
       '查看当前配置是否生效',
       '检查当前 provider 是否支持 tool call',
       '验证这个 session 是否记录了事件',
+      '`workspace_dirty_detected` push 模型解释一下这部分',
+      '这个不就是源码吗/Users/tangyaoyue/DEV/Baidu/Baidu/钢架雪车/index.html',
+      '所以目前的核心问题在于，文档说明不足、内核耦合性问题？',
     ]
 
     for (const latestPrompt of prompts) {
@@ -825,6 +844,101 @@ describe('User intent fallback guidance', () => {
     assert.equal(guidance.actionHint, 'prioritize_latest')
     assert.equal(guidance.problemTarget, 'agent_failure')
     assert.match(formatUserIntentGuidance(guidance), /Stale task mode: background_only/)
+  })
+})
+
+describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
+  // See docs/nexus/proposals/intent-tool-suppression-stopgap-plan.md.
+  // Reproduces session_eafe6bfc Glob/Read suppression — same class as the
+  // source-verified session_b7f64aa1 / session_9b1c212c in the intent-guidance
+  // Active Plan.
+
+  function modelGuidance(overrides: Partial<UserIntentGuidance>): UserIntentGuidance {
+    return {
+      intent: 'continue',
+      confidence: 0.8,
+      continuity: 0.8,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget: 'unknown',
+      reason: 'test',
+      latestUserText: 'continue with the next step',
+      explicitPaths: [],
+      source: 'model',
+      ...overrides,
+    }
+  }
+
+  test('Mode A: isPureMemoryCapabilityQuestion returns false when an action verb is present', () => {
+    // Each prompt matches the capability-question regex (能否/可以/是否 ... 记忆)
+    // AND carries an action verb. Before Fix A these are forced respond-only;
+    // after Fix A the action verb wins.
+    assert.equal(isPureMemoryCapabilityQuestion('能否分析记忆功能的设计'), false)
+    assert.equal(isPureMemoryCapabilityQuestion('可以解释一下记忆模块吗'), false)
+    assert.equal(isPureMemoryCapabilityQuestion('是否支持核对长期记忆的写入'), false)
+
+    // Pure capability questions without action verbs stay respond-only (unchanged).
+    assert.equal(isPureMemoryCapabilityQuestion('你当前能否写入记忆？'), true)
+    assert.equal(isPureMemoryCapabilityQuestion('你有长期记忆吗？'), true)
+    assert.equal(isPureMemoryCapabilityQuestion('长期记忆是否可用'), true)
+  })
+
+  test('Mode A: deriveFallbackUserIntentGuidance keeps analysis-of-memory tool-required', () => {
+    const guidance = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '能否分析记忆功能的设计',
+      cwd: tmpdir(),
+    })
+    assert.equal(guidance.requiresTools, true)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Mode B: continue + normal forces requiresTools=true so model tool calls are not suppressed', () => {
+    const underclassified = normalizeGuidancePolicy(modelGuidance({
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '继续分析这个方案的可行性',
+      reason: 'Pure analytical discussion, no tool-backed verification requested.',
+    }))
+    assert.equal(underclassified.requiresTools, true)
+    assert.equal(underclassified.actionHint, 'normal')
+    assert.equal(shouldSuppressToolsForIntent(underclassified), false)
+  })
+
+  test('Mode B negative: guard is scoped to intent=continue + actionHint=normal', () => {
+    // prioritize_latest must NOT fire the guard — still suppressible when the
+    // model said requiresTools=false.
+    const prioritizeLatest = normalizeGuidancePolicy(modelGuidance({
+      intent: 'continue',
+      actionHint: 'prioritize_latest',
+      requiresTools: false,
+      latestUserText: 'look at this other path instead',
+    }))
+    assert.equal(prioritizeLatest.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), true)
+
+    // pause normalizes to respond_only before the guard; still suppressed.
+    const pause = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '等一下',
+    }))
+    assert.equal(pause.actionHint, 'respond_only')
+    assert.equal(pause.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(pause), true)
+
+    // status without tools normalizes to respond_only before the guard; not hard-suppressed.
+    const status = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: 'what is the current state',
+    }))
+    assert.equal(status.actionHint, 'respond_only')
+    assert.equal(status.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(status), false)
   })
 })
 
@@ -1479,6 +1593,75 @@ describe('LLMCodingRuntime', () => {
     assert.match(JSON.stringify(body.system), /Requires tools: yes/)
   })
 
+  test('normalizes model respond-only drift for current-state explanation and source verification prompts', async () => {
+    const prompts = [
+      '`workspace_dirty_detected` push 模型解释一下这部分',
+      '这个不就是源码吗/Users/tangyaoyue/DEV/Baidu/Baidu/钢架雪车/index.html',
+    ]
+
+    for (const prompt of prompts) {
+      fetchCalls = []
+      globalThis.fetch = async (url, init) => {
+        const body = parseRequestBody(init)
+        if (isIntakeRequestBody(body)) {
+          return {
+            ok: true,
+            status: 200,
+            body: createMockStream([
+              'event: content_block_start\n',
+              'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+              'event: content_block_delta\n',
+              'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"status\\",\\"confidence\\":0.9,\\"continuity\\":0.7,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Incorrect respond-only fixture.\\",\\"explicitPaths\\":[]}"}}\n\n',
+              'event: content_block_stop\n',
+              'data: {"index":0}\n\n',
+            ]),
+            text: async () => 'mock drifted intake response',
+          } as Response
+        }
+        fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"我会先用当前证据核对。"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock provider response text',
+        } as Response
+      }
+
+      const runtime = new LLMCodingRuntime(
+        toolsRegistry,
+        allowlistedTools(['Read', 'Grep']),
+        null as any,
+        configManager,
+      )
+      const events = await collectEvents(
+        runtime.executeStream({
+          sessionId: `test-current-state-intake-drift-${prompts.indexOf(prompt)}`,
+          prompt,
+          cwd: tmpdir(),
+        }),
+      )
+
+      const intake = events.find(event => event.type === 'user_intake_guidance') as any
+      assert.ok(intake)
+      assert.equal(intake.actionHint, 'normal')
+      assert.equal(intake.requiresTools, true)
+      assert.ok(!events.some(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT'))
+
+      assert.equal(fetchCalls.length, 1)
+      const body = JSON.parse(String(fetchCalls[0].init?.body))
+      assert.deepEqual(body.tools.map((tool: any) => tool.name).sort(), ['Grep', 'Read'])
+      assert.match(JSON.stringify(body.system), /Intent category: availability_check/)
+      assert.match(JSON.stringify(body.system), /Requires tools: yes/)
+    }
+  })
+
   test('only exposes policy-allowed tools to provider requests under strict policy', async () => {
     fetchStreamResponses.push(
       createMockStream([
@@ -1539,7 +1722,7 @@ describe('LLMCodingRuntime', () => {
 
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
-    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillSave', 'Write'])
+    assert.deepEqual(toolNames, ['Bash', 'Edit', 'Glob', 'Read', 'SkillExportWrite', 'SkillImportInstall', 'SkillSave', 'Write'])
   })
 
   test('memory capability prompt lets mock provider self-trigger memory_search', async () => {
@@ -1906,6 +2089,64 @@ describe('LLMCodingRuntime', () => {
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, false)
     assert.match(resultEvent.message, /Insufficient Balance/i)
+  })
+
+  test('adapter retries initial provider_unavailable errors before runtime recovery', async () => {
+    process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '1'
+    process.env.BABEL_O_PROVIDER_AUTO_RETRY_MAX_RETRIES = '10'
+    let providerRequestCount = 0
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"reason\\":\\"test intake\\",\\"guidance\\":\\"Proceed.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      providerRequestCount += 1
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      if (providerRequestCount === 1) {
+        return {
+          ok: false,
+          status: 500,
+          body: null,
+          text: async () => '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"},"request_id":"0695498774bd1185436107ba7f49078b"}',
+        } as Response
+      }
+      return {
+        ok: true,
+        status: 200,
+        body: createAnthropicTextStream('Recovered after provider retry.'),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-provider-unavailable-auto-retry',
+        prompt: 'analyze code',
+        cwd: tmpdir(),
+      }),
+    )
+
+    assert.equal(providerRequestCount, 2)
+    assert.equal(events.some(event => event.type === 'provider_retry_scheduled'), false)
+    assert.equal(events.some(event => event.type === 'provider_retry_started'), false)
+    assert.equal(events.some(event => event.type === 'provider_retry_succeeded'), false)
+    const resultEvent = events.find(event => event.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /Recovered after provider retry/)
   })
 
   test('fails instead of accepting repeated max token truncation as a successful answer', async () => {
@@ -2511,7 +2752,13 @@ describe('LLMCodingRuntime', () => {
     assert.match(resultEvent.message, /maximum tool call iterations/)
   })
 
-  test('hides tools and refuses new tool calls in final-response-only mode', async () => {
+  test('final_check allows one read-only check then must_respond hides tools and refuses further calls', async () => {
+    // Phase D: when the loop enters the finalization reserve (remaining <= 3)
+    // and the one bounded check is unused, the runtime narrows visible tools to
+    // the read-only whitelist (final_check) instead of hiding them. The model
+    // gets ONE read-only check; after it executes, the next turn is must_respond
+    // (tools hidden, further tool calls refused with TOOL_LOOP_FINAL_RESPONSE_ONLY).
+    // See docs/nexus/reference/runtime-tool-loop-governance-plan.md Phase D.
     const cwd = join(tmpdir(), `babel-o-test-tool-loop-guard-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
     const targetFile = join(cwd, 'notes.txt')
@@ -2531,6 +2778,22 @@ describe('LLMCodingRuntime', () => {
         ]),
       )
     }
+    // Iteration 22 (remaining=3, final_check): the one bounded read-only check
+    // is ALLOWED to pass through (Read is on the read-only whitelist).
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-final-check","name":"Read","input":{}}}\n\n`,
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"' +
+          targetFile.replace(/\\/g, '\\\\') +
+          '\\"}"}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+    // Iteration 23 (remaining=2, must_respond): a further tool call is REFUSED
+    // with TOOL_LOOP_FINAL_RESPONSE_ONLY (backstop semantics unchanged).
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -2541,6 +2804,7 @@ describe('LLMCodingRuntime', () => {
         'data: {"index":0}\n\n',
       ]),
     )
+    // Iteration 24 (must_respond): final answer from existing evidence.
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -2567,16 +2831,26 @@ describe('LLMCodingRuntime', () => {
     } catch {}
 
     const toolStartedEvents = events.filter(event => event.type === 'tool_started')
-    assert.equal(toolStartedEvents.length, 21)
+    // 21 normal Reads + 1 final_check Read execute; the must_respond Read is refused.
+    assert.equal(toolStartedEvents.length, 22)
+    assert.ok(toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-final-check'))
     assert.ok(!toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-blocked'))
+
+    // final_check (iteration 22 = fetchCalls[21]): tools narrowed to the read-only
+    // whitelist, not hidden. System prompt advertises the one bounded check.
+    const finalCheckBody = JSON.parse(String(fetchCalls[21].init?.body))
+    const finalCheckToolNames = (finalCheckBody.tools ?? []).map((t: any) => t.name)
+    assert.deepEqual(finalCheckToolNames.sort(), ['Glob', 'Grep', 'ListDir', 'Read'])
+    assert.match(JSON.stringify(finalCheckBody.system), /ONE bounded read-only check/)
+
+    // must_respond (iteration 23 = fetchCalls[22]): tools hidden, further call refused.
+    const mustRespondBody = JSON.parse(String(fetchCalls[22].init?.body))
+    assert.equal(mustRespondBody.tools, undefined)
+    assert.match(JSON.stringify(mustRespondBody.system), /Runtime has hidden all tools/)
 
     const guardError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY') as any
     assert.ok(guardError)
     assert.match(guardError.message, /ignored additional requested tools/)
-
-    const finalOnlyBody = JSON.parse(String(fetchCalls[21].init?.body))
-    assert.equal(finalOnlyBody.tools, undefined)
-    assert.match(JSON.stringify(finalOnlyBody.system), /Runtime has hidden all tools/)
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)
@@ -2733,6 +3007,8 @@ describe('LLMCodingRuntime', () => {
     const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
     assert.ok(suppressionError)
     assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
+    assert.equal(suppressionError.details.intentCategory, 'general')
+    assert.equal(suppressionError.details.suppressionReason, 'greeting')
     assert.equal(suppressionError.details.retryAttempted, true)
 
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))

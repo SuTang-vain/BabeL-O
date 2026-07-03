@@ -229,7 +229,7 @@ and where recovery or compaction happened.
 BabeL-O's current architecture is already aligned with modern agent runtime
 practice: Nexus owns orchestration, runtime owns execution and governance, and
 clients only render interaction. The remaining maturity work is tracked in
-[Agent Runtime Architecture Maturity Plan](reference/agent-runtime-architecture-maturity-plan.md).
+[Agent Runtime Architecture Maturity Plan](../nexus/reference/agent-runtime-architecture-maturity-plan.md).
 
 The main gaps are:
 

@@ -64,6 +64,30 @@ export type EverOSBootstrapLLMPassthrough = {
   source?: string
 }
 
+/**
+ * Persisted embedding source chosen during `bbl memory setup`. Unlike
+ * llmPassthrough (display-only — the live LLM config is derived from
+ * providerSettings at runtime), embeddingPassthrough is the PRIMARY
+ * source of embedding config: minimax exposes no embedding endpoint, so
+ * the sidecar spawn reads this back via applyEverOSBootstrapDefaults.
+ *
+ * `source` is `'ollama'` (local, non-secret apiKey literal) or
+ * `'custom'` (OpenAI-compatible endpoint supplied by the operator).
+ * The apiKey is deliberately NOT persisted: ollama's is the fixed
+ * non-secret string `'ollama'` (re-derived from source at inject time),
+ * and custom endpoints must supply their key via
+ * BABEL_O_EVERCORE_EMBEDDING_API_KEY env at runtime to avoid storing a
+ * cloud secret in plaintext bootstrap state.
+ */
+export const everOSBootstrapEmbeddingSources = ['ollama', 'custom'] as const
+export type EverOSBootstrapEmbeddingSource = typeof everOSBootstrapEmbeddingSources[number]
+
+export type EverOSBootstrapEmbeddingPassthrough = {
+  source: EverOSBootstrapEmbeddingSource
+  model?: string
+  baseUrl?: string
+}
+
 const EverOSBootstrapStateSchema = z.object({
   version: z.number().int().positive().default(EVEROS_BOOTSTRAP_VERSION),
   optedIn: z.boolean().optional(),
@@ -93,6 +117,13 @@ const EverOSBootstrapStateSchema = z.object({
       protocol: z.string().optional(),
       model: z.string().optional(),
       source: z.string().optional(),
+    })
+    .optional(),
+  embeddingPassthrough: z
+    .object({
+      source: z.enum(everOSBootstrapEmbeddingSources),
+      model: z.string().min(1).optional(),
+      baseUrl: z.string().min(1).optional(),
     })
     .optional(),
 })

@@ -24,6 +24,8 @@ import { loadSkillRegistry, validateRegistrySkill } from '../skills/registry.js'
 import { validateSkill } from '../skills/validator.js'
 import { formatSkill } from '../skills/formatter.js'
 import { generateSkillDraft, type SkillDraftInput } from '../skills/generator.js'
+import { installSkillImport, previewSkillImport } from '../skills/importer.js'
+import { previewSkillExport, writeSkillExport } from '../skills/exporter.js'
 import { previewSkillSave, saveSkill, type SkillSaveInput } from '../skills/storage.js'
 import type { NormalizedSkill, SkillDiagnostic } from '../skills/schema.js'
 
@@ -93,11 +95,39 @@ export const SkillSaveBodySchema = z.object({
   scope: z.enum(['user', 'project']).optional(),
 })
 
+export const SkillImportPreviewBodySchema = z.object({
+  cwd: z.string().optional(),
+  builtInDir: z.string().optional(),
+  sourcePath: z.string().min(1),
+  scope: z.enum(['user', 'project']).optional(),
+})
+
+export const SkillImportInstallBodySchema = SkillImportPreviewBodySchema.extend({
+  confirm: z.boolean().default(false),
+  overwrite: z.boolean().optional(),
+})
+
+export const SkillExportPreviewBodySchema = z.object({
+  cwd: z.string().optional(),
+  builtInDir: z.string().optional(),
+  id: z.string().min(1),
+  targetDir: z.string().optional(),
+})
+
+export const SkillExportWriteBodySchema = SkillExportPreviewBodySchema.extend({
+  confirm: z.boolean().default(false),
+  overwrite: z.boolean().optional(),
+})
+
 export type SkillListQuery = z.infer<typeof SkillListQuerySchema>
 export type SkillValidateBody = z.infer<typeof SkillValidateBodySchema>
 export type SkillInvokeBody = z.infer<typeof SkillInvokeBodySchema>
 export type SkillDraftBody = z.infer<typeof SkillDraftBodySchema>
 export type SkillSaveBody = z.infer<typeof SkillSaveBodySchema>
+export type SkillImportPreviewBody = z.infer<typeof SkillImportPreviewBodySchema>
+export type SkillImportInstallBody = z.infer<typeof SkillImportInstallBodySchema>
+export type SkillExportPreviewBody = z.infer<typeof SkillExportPreviewBodySchema>
+export type SkillExportWriteBody = z.infer<typeof SkillExportWriteBodySchema>
 
 export type SkillListResponse = {
   ok: boolean
@@ -113,6 +143,10 @@ export type SkillListResponse = {
     priority: number
     allowedTools: string[]
     filePath?: string
+    sourceFormat?: string
+    packageRoot?: string
+    manifestPath?: string
+    resources?: Array<{ kind: string; path: string; absolutePath?: string }>
   }>
   diagnostics: {
     skippedCount: number
@@ -229,6 +263,11 @@ export type SkillSaveErrorResponse = {
 
 export type SkillSaveResponse = SkillSavePreviewResponse | SkillSaveSuccessResponse | SkillSaveErrorResponse
 
+export type SkillImportPreviewResponse = Awaited<ReturnType<typeof previewSkillImport>>
+export type SkillImportInstallResponse = Awaited<ReturnType<typeof installSkillImport>>
+export type SkillExportPreviewResponse = Awaited<ReturnType<typeof previewSkillExport>>
+export type SkillExportWriteResponse = Awaited<ReturnType<typeof writeSkillExport>>
+
 /** List visible skills for a given cwd. */
 export async function listSkills(options: {
   cwd: string
@@ -258,6 +297,10 @@ export async function listSkills(options: {
       priority: s.priority,
       allowedTools: s.allowedTools,
       ...(s.filePath ? { filePath: s.filePath } : {}),
+      sourceFormat: s.sourceFormat,
+      ...(s.packageRoot ? { packageRoot: s.packageRoot } : {}),
+      ...(s.manifestPath ? { manifestPath: s.manifestPath } : {}),
+      resources: s.resources,
     })),
     diagnostics: {
       skippedCount: diag.skipped.length,
@@ -301,6 +344,10 @@ export async function showSkill(options: {
         priority: skill.priority,
         allowedTools: skill.allowedTools,
         ...(skill.filePath ? { filePath: skill.filePath } : {}),
+        sourceFormat: skill.sourceFormat,
+        ...(skill.packageRoot ? { packageRoot: skill.packageRoot } : {}),
+        ...(skill.manifestPath ? { manifestPath: skill.manifestPath } : {}),
+        resources: skill.resources,
         body: formatSkill(skill),
       },
     }
@@ -548,4 +595,44 @@ export async function saveSkillHandler(input: SkillSaveInput): Promise<SkillSave
     format: result.format,
     saved: result.saved,
   }
+}
+
+export async function previewSkillImportHandler(input: SkillImportPreviewBody): Promise<SkillImportPreviewResponse> {
+  return previewSkillImport({
+    cwd: input.cwd ?? process.cwd(),
+    sourcePath: input.sourcePath,
+    ...(input.scope ? { scope: input.scope } : {}),
+    ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+  })
+}
+
+export async function installSkillImportHandler(input: SkillImportInstallBody): Promise<SkillImportInstallResponse> {
+  return installSkillImport({
+    cwd: input.cwd ?? process.cwd(),
+    sourcePath: input.sourcePath,
+    confirm: input.confirm,
+    ...(input.overwrite !== undefined ? { overwrite: input.overwrite } : {}),
+    ...(input.scope ? { scope: input.scope } : {}),
+    ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+  })
+}
+
+export async function previewSkillExportHandler(input: SkillExportPreviewBody): Promise<SkillExportPreviewResponse> {
+  return previewSkillExport({
+    cwd: input.cwd ?? process.cwd(),
+    id: input.id,
+    ...(input.targetDir ? { targetDir: input.targetDir } : {}),
+    ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+  })
+}
+
+export async function writeSkillExportHandler(input: SkillExportWriteBody): Promise<SkillExportWriteResponse> {
+  return writeSkillExport({
+    cwd: input.cwd ?? process.cwd(),
+    id: input.id,
+    confirm: input.confirm,
+    ...(input.targetDir ? { targetDir: input.targetDir } : {}),
+    ...(input.builtInDir ? { builtInDir: input.builtInDir } : {}),
+    ...(input.overwrite !== undefined ? { overwrite: input.overwrite } : {}),
+  })
 }

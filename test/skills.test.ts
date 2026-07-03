@@ -84,6 +84,114 @@ Body 2`
   }
 })
 
+test('loadSkillsFromDir scans Agent Skills package directories', async () => {
+  const tmpDir = path.join(os.tmpdir(), `babel-o-agent-skill-package-${Date.now()}`)
+  const packageDir = path.join(tmpDir, 'context-debugging')
+  await fs.mkdir(path.join(packageDir, 'references'), { recursive: true })
+  await fs.mkdir(path.join(packageDir, 'scripts'), { recursive: true })
+
+  try {
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+license: MIT
+compatibility: Requires BabeL-O 0.4+
+allowed-tools: Read Grep Bash(git:*)
+metadata:
+  babel-o:
+    displayName: Context Debugging
+    triggers:
+      - context assembly
+      - tool suppression
+    priority: 80
+    risk: read
+---
+# Purpose
+Use this package skill to debug context issues.`
+    )
+    await fs.writeFile(path.join(packageDir, 'references', 'checklist.md'), '# Checklist')
+    await fs.writeFile(path.join(packageDir, 'scripts', 'inspect.sh'), 'git status --short')
+
+    const skills = await loadSkillsFromDir(tmpDir)
+    assert.strictEqual(skills.length, 1)
+    const skill = skills[0]
+    assert.strictEqual(skill.id, 'context-debugging')
+    assert.strictEqual(skill.name, 'Context Debugging')
+    assert.strictEqual(skill.description, 'Debug context assembly and tool suppression issues.')
+    assert.strictEqual(skill.sourceFormat, 'agent-skills-v1')
+    assert.strictEqual(skill.packageRoot, packageDir)
+    assert.strictEqual(skill.manifestPath, path.join(packageDir, 'SKILL.md'))
+    assert.deepStrictEqual(skill.triggers, ['context assembly', 'tool suppression'])
+    assert.deepStrictEqual(skill.allowedTools, ['Read', 'Grep', 'Bash(git:*)'])
+    assert.strictEqual(skill.license, 'MIT')
+    assert.strictEqual(skill.compatibility, 'Requires BabeL-O 0.4+')
+    assert.strictEqual(skill.risk, 'read')
+    assert.strictEqual(skill.priority, 80)
+    assert.strictEqual(skill.resources?.length, 2)
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  }
+})
+
+test('parseFrontMatter keeps flat metadata.babel-o compatibility', () => {
+  const content = `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+metadata.babel-o.triggers: [context assembly, tool suppression]
+metadata.babel-o.priority: 80
+metadata.babel-o.risk: read
+---
+# Purpose
+Use this package skill to debug context issues.`
+
+  const skill = parseFrontMatter(content)
+  assert.ok(skill)
+  assert.strictEqual(skill.id, 'context-debugging')
+  assert.strictEqual(skill.description, 'Debug context assembly and tool suppression issues.')
+  assert.deepStrictEqual(skill.triggers, ['context assembly', 'tool suppression'])
+  assert.strictEqual(skill.priority, 80)
+  assert.strictEqual(skill.risk, 'read')
+})
+
+test('loadSkillsFromDir does not expose symlinked package resources', async () => {
+  const tmpDir = path.join(os.tmpdir(), `babel-o-agent-skill-resource-guard-${Date.now()}`)
+  const packageDir = path.join(tmpDir, 'resource-guard')
+  const outsideDir = path.join(tmpDir, 'outside')
+  await fs.mkdir(path.join(packageDir, 'references', 'nested'), { recursive: true })
+  await fs.mkdir(outsideDir, { recursive: true })
+
+  try {
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: resource-guard
+description: Guard package resources.
+metadata:
+  babel-o:
+    triggers:
+      - resource guard
+---
+# Purpose
+Guard resources.`
+    )
+    await fs.writeFile(path.join(packageDir, 'references', 'safe.md'), '# Safe')
+    await fs.writeFile(path.join(packageDir, 'references', 'nested', 'guide.md'), '# Guide')
+    await fs.writeFile(path.join(outsideDir, 'secret.md'), '# Secret')
+    await fs.symlink(path.join(outsideDir, 'secret.md'), path.join(packageDir, 'references', 'secret.md'))
+
+    const skills = await loadSkillsFromDir(tmpDir)
+    assert.strictEqual(skills.length, 1)
+    assert.deepStrictEqual(skills[0].resources?.map(resource => resource.path).sort(), [
+      'references/nested/guide.md',
+      'references/safe.md',
+    ])
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true })
+  }
+})
+
 test('matchSkills scores trigger matches and sorts correctly', () => {
   const skills = [
     {
@@ -131,6 +239,60 @@ test('matchSkills scores trigger matches and sorts correctly', () => {
   assert.strictEqual(match4.length, 2)
   assert.strictEqual(match4[0].id, 'a-skill')
   assert.strictEqual(match4[1].id, 'b-skill')
+})
+
+test('matchSkills can discover Agent Skills by description and name', () => {
+  const skills = [
+    {
+      id: 'context-debugging',
+      name: 'Context Debugging',
+      description: 'Debug context assembly and tool suppression issues.',
+      triggers: [],
+      priority: 0,
+      content: 'context debugging guidelines',
+      sourceFormat: 'agent-skills-v1' as const,
+    },
+    {
+      id: 'deploy-release',
+      name: 'Deploy Release',
+      triggers: [],
+      priority: 0,
+      content: 'deploy guidelines',
+    },
+  ]
+
+  const descriptionMatch = matchSkills(skills, 'please debug context assembly')
+  assert.strictEqual(descriptionMatch.length, 1)
+  assert.strictEqual(descriptionMatch[0].id, 'context-debugging')
+
+  const nameMatch = matchSkills(skills, 'deploy release today')
+  assert.strictEqual(nameMatch.length, 1)
+  assert.strictEqual(nameMatch[0].id, 'deploy-release')
+})
+
+test('matchSkills keeps explicit triggers ahead of description-only matches', () => {
+  const skills = [
+    {
+      id: 'triggered-skill',
+      name: 'Triggered',
+      triggers: ['context assembly'],
+      priority: 0,
+      content: 'triggered guidelines',
+    },
+    {
+      id: 'description-skill',
+      name: 'Description',
+      description: 'Debug context assembly and tool suppression issues.',
+      triggers: [],
+      priority: 100,
+      content: 'description guidelines',
+    },
+  ]
+
+  const matches = matchSkills(skills, 'context assembly')
+  assert.strictEqual(matches.length, 2)
+  assert.strictEqual(matches[0].id, 'triggered-skill')
+  assert.strictEqual(matches[1].id, 'description-skill')
 })
 
 test('loadAllSkills implements directory overlays correctly', async () => {

@@ -1,11 +1,11 @@
 # Skill Execution and Automated Normalized Skill Generation Governance Plan
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Skills / Tool Governance / Context Assembly
-> Priority: P2 Watch
-> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_tui.md](../active/TODO_tui.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/skills/`, `src/runtime/contextAssembler.ts`, `src/runtime/systemPromptBuilder.ts`, `test/skills.test.ts`, `test/system-prompt-builder.test.ts`
-> Governance: Indexed by [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md) and [tool-governance-plan.md](../reference/tool-governance-plan.md). This document owns the skill product loop; tool admission and recoverability rules remain tool-governance-owned.
-> Related: [tool-governance-plan.md](../reference/tool-governance-plan.md), [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md), [context-governance-index.md](../reference/context-governance-index.md)
+> Priority: P0–P3 (skill schema, registry, API, model-visible tools) closed 2026-06-22. P4 (`/skill run` composer injection semantics) remains Open and is the only post-graduation follow-up; graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision.
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_tui.md](../active/TODO_tui.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/skills/`, `src/runtime/contextAssembler.ts`, `src/runtime/systemPromptBuilder.ts`, `src/tools/builtin/skillTool.ts`, `src/nexus/skillRoutes.ts`, `src/nexus/routers/skillReadRouter.ts`, `src/nexus/routers/skillValidateRouter.ts`, `src/nexus/routers/skillActionRouter.ts`, `src/nexus/toolRegistryLayering.ts`, `test/skills.test.ts`, `test/skill-routes.test.ts`, `test/skill-read-router.test.ts`, `test/skill-validate-router.test.ts`, `test/skill-draft-route.test.ts`, `test/skill-save-route.test.ts`, `test/skill-registry.test.ts`, `test/skill-schema.test.ts`, `test/skill-storage.test.ts`, `test/skill-tools.test.ts`, `test/skill-generator.test.ts`, `test/runtime-layering.test.ts`, `clients/go-tui/internal/tui/overlay_skills.go`, `clients/go-tui/internal/tui/overlay_skills_test.go`
+> Governance: Indexed by [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) and [tool-governance-plan.md](./tool-governance-plan.md). This document owns the skill product loop; tool admission and recoverability rules remain tool-governance-owned.
+> Related: [tool-governance-plan.md](./tool-governance-plan.md), [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md), [context-governance-index.md](./context-governance-index.md)
 
 ## Executive summary
 
@@ -1248,9 +1248,9 @@ This plan is now governed by two canonical entry points:
 
 | Reference | Relationship |
 | --- | --- |
-| [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md) | Reader map for how skills interact with agent runtime maturity and session collaboration. |
-| [tool-governance-plan.md](../reference/tool-governance-plan.md) | Canonical owner for tool classes, evidence semantics, new-tool admission gates, and tool failure/recoverability semantics. |
-| [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md) | Canonical owner for runtime tool-loop continuity and text-shaped tool-call suppression. |
+| [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) | Reader map for how skills interact with agent runtime maturity and session collaboration. |
+| [tool-governance-plan.md](./tool-governance-plan.md) | Canonical owner for tool classes, evidence semantics, new-tool admission gates, and tool failure/recoverability semantics. |
+| [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md) | Canonical owner for runtime tool-loop continuity and text-shaped tool-call suppression. |
 
 Direct implications:
 
@@ -1272,4 +1272,4 @@ Skill 不是隐藏 policy，也不能绕过工具权限、workspace 边界或 ev
 
 ### 当前状态
 
-loader / matcher / system prompt 注入已存在；显式 skill 工具和自动规范化生成仍是打开项。后续以 [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md) 和 [tool-governance-plan.md](../reference/tool-governance-plan.md) 为入口维护口径。
+loader / matcher / system prompt 注入已存在；显式 skill 工具和自动规范化生成仍是打开项。后续以 [agent-session-skill-governance-index.md](./agent-session-skill-governance-index.md) 和 [tool-governance-plan.md](./tool-governance-plan.md) 为入口维护口径。

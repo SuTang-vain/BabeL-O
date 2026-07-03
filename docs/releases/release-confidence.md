@@ -138,7 +138,7 @@ Before announcing:
 - [ ] README install commands still point to `bbl go`.
 - [ ] The release note states known limitations honestly.
 - [ ] If the release changes distribution, update
-      `docs/nexus/reference/distribution-guide.md`.
+      `docs/guides/distribution-guide.md`.
 
 ## Go/No-Go Decision
 

@@ -41,7 +41,30 @@ export function loadEverOSBootstrapDefaults(
       // mcpToolsEnabled is set in `resolveEverCoreConfigInputFromEnv`
       // before defaults are applied.
       mcpToolsEnabled: read.state.mcpToolsEnabled,
+      ...resolveEmbeddingDefaultsFromState(read.state),
     },
+  }
+}
+
+/**
+ * Project the persisted `embeddingPassthrough` into the EverCoreConfigInput
+ * fields the sidecar spawn reads. ollama's apiKey is the fixed non-secret
+ * literal `'ollama'` (re-derived here, never stored); custom endpoints
+ * leave apiKey unset so BABEL_O_EVERCORE_EMBEDDING_API_KEY env supplies it
+ * at runtime. Returns an empty object when embedding was never configured
+ * (the sidecar then surfaces EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED).
+ */
+function resolveEmbeddingDefaultsFromState(state: EverOSBootstrapState): Partial<EverCoreConfigInput> {
+  const embedding = state.embeddingPassthrough
+  if (!embedding) return {}
+  const model = embedding.model?.trim()
+  const baseUrl = embedding.baseUrl?.trim()
+  // ollama ignores the key but EverOS' factory requires a non-null api_key.
+  const apiKey = embedding.source === 'ollama' ? 'ollama' : undefined
+  return {
+    managedEmbeddingModel: model,
+    managedEmbeddingBaseUrl: baseUrl,
+    managedEmbeddingApiKey: apiKey,
   }
 }
 
@@ -58,5 +81,11 @@ export function applyEverOSBootstrapDefaults(
     managedCommand: input.managedCommand ?? defaults.input.managedCommand,
     managedDataDir: input.managedDataDir ?? defaults.input.managedDataDir,
     mcpToolsEnabled: input.mcpToolsEnabled ?? defaults.input.mcpToolsEnabled,
+    // resolveEverCoreConfigInputFromEnv sets these to `undefined` when the
+    // env vars are unset; the spread above would clobber the state-derived
+    // defaults, so fall back explicitly (same pattern as mcpToolsEnabled).
+    managedEmbeddingModel: input.managedEmbeddingModel ?? defaults.input.managedEmbeddingModel,
+    managedEmbeddingApiKey: input.managedEmbeddingApiKey ?? defaults.input.managedEmbeddingApiKey,
+    managedEmbeddingBaseUrl: input.managedEmbeddingBaseUrl ?? defaults.input.managedEmbeddingBaseUrl,
   }
 }

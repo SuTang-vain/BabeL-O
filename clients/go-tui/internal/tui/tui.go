@@ -635,6 +635,110 @@ type toolAuditMsg struct {
 	err      error
 }
 
+// Skill execution governance plan P3 Layer 4: typed mirrors
+// of the Nexus /v1/skills/* responses. The Go TUI only reads
+// the stable top-level fields it displays; the rest of the
+// payload stays in skillListMsg.raw / skillShowMsg.raw /
+// skillValidateMsg.raw so schema churn upstream cannot break
+// the client (same defensive pattern as toolAuditMsg /
+// contextAnalysisMsg / inboxMsg / agentJobsMsg).
+//
+// Field names match SkillListResponse / SkillShowResponse /
+// SkillValidateResponse in src/nexus/skillRoutes.ts. Any
+// addition here is a WireSnapshot-owned field; the rest of
+// the JSON stays in .raw and is ignored by the client.
+
+type runtimeSkillListEntry struct {
+	ID           string   `json:"id"`
+	Name         string   `json:"name"`
+	Description  string   `json:"description"`
+	Source       string   `json:"source"`
+	Scope        string   `json:"scope"`
+	Status       string   `json:"status"`
+	Risk         string   `json:"risk"`
+	Triggers     []string `json:"triggers"`
+	Priority     int      `json:"priority"`
+	AllowedTools []string `json:"allowedTools"`
+}
+
+type runtimeSkillListDiagnostics struct {
+	SkippedCount   int `json:"skippedCount"`
+	OverlaidCount  int `json:"overlaidCount"`
+	DuplicateCount int `json:"duplicateCount"`
+}
+
+type skillsListResponse struct {
+	Type        string                       `json:"type"`
+	OK          bool                         `json:"ok"`
+	Skills      []runtimeSkillListEntry       `json:"skills"`
+	Diagnostics runtimeSkillListDiagnostics  `json:"diagnostics"`
+}
+
+// skillListMsg carries the response of GET /v1/skills.
+// err is non-nil on transport / decode failure.
+type skillListMsg struct {
+	raw []byte
+	env skillsListResponse
+	err error
+}
+
+type runtimeSkillShowEntry struct {
+	runtimeSkillListEntry
+	Body     string `json:"body"`
+	FilePath string `json:"filePath,omitempty"`
+}
+
+type skillsShowResponse struct {
+	Type     string                  `json:"type"`
+	OK       bool                    `json:"ok"`
+	Skill    *runtimeSkillShowEntry   `json:"skill,omitempty"`
+	ErrorCode string                 `json:"errorCode,omitempty"`
+	ErrorMessage string              `json:"message,omitempty"`
+	ID       string                  `json:"id,omitempty"`
+}
+
+// skillShowMsg carries the response of GET /v1/skills/:id.
+// err is non-nil on transport / decode failure. ok=false with
+// a populated entry pointer would mean upstream returned a
+// structured SKILL_NOT_FOUND / SKILL_LOAD_FAILED envelope; in
+// that case the overlay renders the error directly.
+type skillShowMsg struct {
+	raw  []byte
+	env  skillsShowResponse
+	id   string
+	err  error
+}
+
+type runtimeSkillDiagnostic struct {
+	Severity string `json:"severity"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Field    string `json:"field,omitempty"`
+}
+
+type runtimeSkillValidateEntry struct {
+	OK            bool                     `json:"ok"`
+	SkillID       string                   `json:"skillId,omitempty"`
+	Diagnostics   []runtimeSkillDiagnostic `json:"diagnostics"`
+	ErrorCount    int                      `json:"errorCount"`
+	WarningCount  int                      `json:"warningCount"`
+}
+
+type skillsValidateResponse struct {
+	Type string                     `json:"type"`
+	OK   bool                       `json:"ok"`
+	runtimeSkillValidateEntry
+}
+
+// skillValidateMsg carries the response of POST /v1/skills/validate.
+// err is non-nil on transport / decode failure.
+type skillValidateMsg struct {
+	raw  []byte
+	env  skillsValidateResponse
+	id   string
+	err  error
+}
+
 // taskStatus mirrors TaskStatus in src/shared/task.ts. The
 // Go TUI renders the status as a single-character icon in
 // the task board overlay (e.g. "▶" for in_progress, "✓" for
@@ -869,6 +973,18 @@ const (
 	modeMemoryOverlay     inputMode = "memoryOverlay"     // read-only /v1/runtime/memory/status wire; up/down/esc/enter/q
 	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
 	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
+	// Skill execution governance plan (P3 Layer 4) — Go TUI
+	// /skill slash command family. The Nexus endpoints are
+	// already shipped (skillReadRouter / skillActionRouter);
+	// these three read-only overlays give the operator direct
+	// visibility into the loaded skill registry, the body of
+	// a single skill, and the validation diagnostics. /skill
+	// run is deferred to a follow-up PR because it requires
+	// composer injection semantics not yet present in the
+	// Go TUI's existing slash-command patterns.
+	modeSkillListOverlay     inputMode = "skillListOverlay"     // /skill list; up/down/esc/enter/q
+	modeSkillShowOverlay     inputMode = "skillShowOverlay"     // /skill show <id>; up/down/esc/enter/q
+	modeSkillValidateOverlay inputMode = "skillValidateOverlay" // /skill validate <id>; up/down/esc/enter/q
 	modeSessionOverlay    inputMode = "sessionOverlay"    // /session step 1: pick session operation
 	modeSessionConfirm    inputMode = "sessionConfirm"    // /session step 2: confirm new-session reset
 	modeSessionInput      inputMode = "sessionInput"      // /session step 2: enter/select/switch session id
@@ -1044,6 +1160,25 @@ type model struct {
 	subAgents               map[string]subAgentEntry
 	toolAuditEntries        []runtimeToolAuditEntry
 	toolAuditScroll         int
+	// Skill execution plan P3 Layer 4: /skill list|show|validate
+	// overlay state. Each overlay stores just enough typed
+	// fields to render without a second HTTP round-trip; raw
+	// bytes are kept alongside (mirrors toolAuditMsg / contextAnalysisMsg)
+	// so upstream schema churn cannot break the client.
+	skillListEntries          []runtimeSkillListEntry
+	skillListScroll           int
+	skillListDiagnostics      runtimeSkillListDiagnostics
+	// skillListSelected tracks the row the operator is
+	// hovering in /skill list so enter / v can act on
+	// that row (mirror the /inbox selectedIdx pattern).
+	// Indexes into skillListEntries; reset to 0 each
+	// time a fresh list arrives via skillListMsg.
+	skillListSelected         int
+	skillShowEntry            *runtimeSkillShowEntry
+	skillShowScroll           int
+	skillValidateResult       *runtimeSkillValidateEntry
+	skillValidateScroll       int
+	skillLastError            string
 	modelCatalog            runtimeModelsResponse
 	modelOverlayScroll      int
 	sessionPanelSelected    int
@@ -1080,6 +1215,7 @@ type model struct {
 	// fresh fatal cutoff. Cleared on result / error like
 	// `latestUsage` so the next turn starts clean.
 	softTimeoutState *softTimeoutSnapshot
+	providerRetryCountdown *providerRetryCountdownSnapshot
 	currentTimeout   timeoutDecision
 	// Phase 11 in-app selection. With --mouse the Go TUI
 	// captures SGR mouse events and the terminal can no
@@ -1236,6 +1372,16 @@ type softTimeoutSnapshot struct {
 	// recent soft-cycle event (budget or extension). Useful for
 	// human-readable footer / friendly-message output.
 	LastElapsedMs int
+}
+
+type providerRetryCountdownSnapshot struct {
+	ProviderID    string
+	ModelID       string
+	RecoveryKind  string
+	Attempt       int
+	MaxRetries    int
+	DelayMs       int
+	NextAttemptAt time.Time
 }
 
 type timeoutDecision struct {
@@ -1707,6 +1853,7 @@ func (m *model) startAgentPrompt(displayPrompt string, expandedPrompt string) te
 	m.lastEventType = ""
 	m.pendingSynthesis = false
 	m.assistantSeenInTurn = false
+	m.providerRetryCountdown = nil
 	m.startedAt = time.Now()
 	m.resize()
 	return tea.Batch(startStream(m.cfg, expandedPrompt, timeout), m.gradientSpinner.Tick)
@@ -1772,6 +1919,7 @@ func (m *model) finishRunningStream() tea.Cmd {
 	}
 	m.latestUsage = nil
 	m.softTimeoutState = nil
+	m.providerRetryCountdown = nil
 	m.resize()
 	return m.startQueuedPrompt()
 }
@@ -2614,6 +2762,107 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case modeSkillListOverlay:
+			// /skill list overlay (Skill execution plan P3
+			// Layer 4). Mirrors the /inbox list pattern: the
+			// operator navigates rows with up/k/down/j/tab
+			// (tracked by skillListSelected), and the
+			// per-row actions are:
+			//   enter  → fetchSkillShow(selected.ID)
+			//   v      → fetchSkillValidate(selected.ID)
+			// Both actions re-use the existing skillShowMsg /
+			// skillValidateMsg Update path; the show / validate
+			// overlay close handlers return to modeComposing
+			// rather than back to the list, matching the
+			// /tools-overlay convention. esc/q always close the
+			// list to modeComposing.
+			switch key {
+			case "esc", "q":
+				m.setMode(modeComposing)
+				m.skillListScroll = 0
+				m.skillListSelected = 0
+				m.appendLine("status", "skill list closed")
+				return m, nil
+			case "up", "k":
+				if m.skillListSelected > 0 {
+					m.skillListSelected--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if len(m.skillListEntries) > 0 &&
+					m.skillListSelected+1 < len(m.skillListEntries) {
+					m.skillListSelected++
+				}
+				return m, nil
+			case "enter":
+				if id, ok := m.selectedSkillID(); ok {
+					m.appendLine("status", "loading skill: "+id)
+					return m, fetchSkillShow(m.cfg, id)
+				}
+				return m, nil
+			case "v":
+				if id, ok := m.selectedSkillID(); ok {
+					m.appendLine("status", "validating skill: "+id)
+					return m, fetchSkillValidate(m.cfg, id)
+				}
+				return m, nil
+			}
+			return m, nil
+
+		case modeSkillShowOverlay:
+			// Read-only /v1/skills/:id overlay. Same key
+			// conventions as the list overlay. Body length is
+			// bounded by buildSkillShowOverlayLines (60 lines
+			// max with a [truncated] tail).
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.skillShowScroll = 0
+				m.skillShowEntry = nil
+				m.appendLine("status", "skill show closed")
+				return m, nil
+			case "up", "k":
+				if m.skillShowScroll > 0 {
+					m.skillShowScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildSkillShowOverlayLines(m.skillShowEntry)
+				maxScroll := max(0, len(allLines)-1)
+				if m.skillShowScroll < maxScroll {
+					m.skillShowScroll++
+				}
+				return m, nil
+			}
+			return m, nil
+
+		case modeSkillValidateOverlay:
+			// Read-only /v1/skills/validate result overlay.
+			// Same key conventions. Diagnostics are rendered
+			// one per line with a severity glyph (✗ / ⚠ / ⓘ)
+			// in buildSkillValidateOverlayLines.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.skillValidateScroll = 0
+				m.skillValidateResult = nil
+				m.appendLine("status", "skill validate closed")
+				return m, nil
+			case "up", "k":
+				if m.skillValidateScroll > 0 {
+					m.skillValidateScroll--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				allLines := buildSkillValidateOverlayLines(m.skillValidateResult)
+				maxScroll := max(0, len(allLines)-1)
+				if m.skillValidateScroll < maxScroll {
+					m.skillValidateScroll++
+				}
+				return m, nil
+			}
+			return m, nil
+
 		case modeModelOverlay:
 			// Read-only model configuration/catalog overlay. The
 			// TypeScript TUI's /model command can write the local
@@ -3286,6 +3535,78 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.setMode(modeToolAuditOverlay)
 		return m, nil
 
+	case skillListMsg:
+		// Skill execution plan P3 Layer 4. No static
+		// fallback: skill registry is cross-source
+		// (builtin/user/project) and the Go TUI cannot
+		// reconstruct a known-good list locally, so a
+		// Nexus error stays in the transcript and the
+		// overlay never opens.
+		if msg.err != nil {
+			m.skillLastError = "skill list: " + msg.err.Error()
+			m.appendLine("error", m.skillLastError)
+			return m, nil
+		}
+		m.skillListEntries = msg.env.Skills
+		m.skillListDiagnostics = msg.env.Diagnostics
+		m.skillListScroll = 0
+		m.skillListSelected = 0
+		summary := fmt.Sprintf("skills: %d loaded (skipped=%d overlaid=%d duplicates=%d)",
+			len(m.skillListEntries),
+			m.skillListDiagnostics.SkippedCount,
+			m.skillListDiagnostics.OverlaidCount,
+			m.skillListDiagnostics.DuplicateCount,
+		)
+		m.appendLine("status", summary)
+		m.setMode(modeSkillListOverlay)
+		return m, nil
+
+	case skillShowMsg:
+		if msg.err != nil {
+			m.skillLastError = "skill show: " + msg.err.Error()
+			m.appendLine("error", m.skillLastError)
+			return m, nil
+		}
+		if !msg.env.OK || msg.env.Skill == nil {
+			// SKILL_NOT_FOUND / SKILL_LOAD_FAILED envelope
+			// with structured errorCode + message. The
+			// overlay never opens; the user sees the
+			// structured error in the transcript.
+			code := firstNonEmpty(msg.env.ErrorCode, "SKILL_SHOW_FAILED")
+			m.skillLastError = fmt.Sprintf("skill show %q: %s — %s", msg.id, code, firstNonEmpty(msg.env.ErrorMessage, "(no message)"))
+			m.appendLine("error", m.skillLastError)
+			return m, nil
+		}
+		entry := *msg.env.Skill
+		m.skillShowEntry = &entry
+		m.skillShowScroll = 0
+		m.appendLine("status", fmt.Sprintf("skill show: %s (source=%s risk=%s)", entry.ID, entry.Source, entry.Risk))
+		m.setMode(modeSkillShowOverlay)
+		return m, nil
+
+	case skillValidateMsg:
+		if msg.err != nil {
+			m.skillLastError = "skill validate: " + msg.err.Error()
+			m.appendLine("error", m.skillLastError)
+			return m, nil
+		}
+		result := runtimeSkillValidateEntry{
+			OK:           msg.env.OK,
+			SkillID:      msg.env.SkillID,
+			Diagnostics:  msg.env.Diagnostics,
+			ErrorCount:   msg.env.ErrorCount,
+			WarningCount: msg.env.WarningCount,
+		}
+		m.skillValidateResult = &result
+		m.skillValidateScroll = 0
+		summary := fmt.Sprintf("skill validate: %s (errors=%d warnings=%d)",
+			firstNonEmpty(result.SkillID, msg.id),
+			result.ErrorCount, result.WarningCount,
+		)
+		m.appendLine("status", summary)
+		m.setMode(modeSkillValidateOverlay)
+		return m, nil
+
 	case pollTickMsg:
 		// Background poll. If we've never fetched a Config, defer to the
 		// next round rather than blocking the chat loop.
@@ -3456,6 +3777,9 @@ func (m model) viewString() string {
 	modelPickApiKey := m.renderModelPickApiKey(width)
 	modelPickBaseURL := m.renderModelPickBaseURL(width)
 	modelPickModel := m.renderModelPickModel(width)
+	skillListOverlay := m.renderSkillListOverlay(width)
+	skillShowOverlay := m.renderSkillShowOverlay(width)
+	skillValidateOverlay := m.renderSkillValidateOverlay(width)
 	quitConfirm := m.renderQuitConfirm(width)
 
 	parts := []string{header, transcript}
@@ -3498,6 +3822,15 @@ func (m model) viewString() string {
 	if modelPickModel != "" {
 		parts = append(parts, modelPickModel)
 	}
+	if skillListOverlay != "" {
+		parts = append(parts, skillListOverlay)
+	}
+	if skillShowOverlay != "" {
+		parts = append(parts, skillShowOverlay)
+	}
+	if skillValidateOverlay != "" {
+		parts = append(parts, skillValidateOverlay)
+	}
 	if quitConfirm != "" {
 		parts = append(parts, quitConfirm)
 	}
@@ -3519,7 +3852,10 @@ func (m model) usesFullScreenOverlay() bool {
 		modeModelPickProvider,
 		modeModelPickApiKey,
 		modeModelPickBaseURL,
-		modeModelPickModel:
+		modeModelPickModel,
+		modeSkillListOverlay,
+		modeSkillShowOverlay,
+		modeSkillValidateOverlay:
 		return true
 	default:
 		return false
@@ -3541,6 +3877,9 @@ func (m model) renderFullScreenOverlay(width int) string {
 		m.renderModelPickApiKey(width),
 		m.renderModelPickBaseURL(width),
 		m.renderModelPickModel(width),
+		m.renderSkillListOverlay(width),
+		m.renderSkillShowOverlay(width),
+		m.renderSkillValidateOverlay(width),
 	} {
 		if part != "" {
 			return part
@@ -3790,6 +4129,18 @@ func (m *model) ackSelectedInboxMessage() tea.Cmd {
 // resumes on the same row (this is just a defensive no-op for
 // now since the overlay is closed and re-opened by an explicit
 // /inbox command, but the field shape mirrors Phase 6 §1).
+// selectedSkillID returns the id of the row currently
+// hovered in /skill list, and a bool indicating whether the
+// index is in range. Centralizes the bounds check so the
+// enter / v key handlers stay readable and so a future
+// "row out of range" case has a single place to handle.
+func (m *model) selectedSkillID() (string, bool) {
+	if m.skillListSelected < 0 || m.skillListSelected >= len(m.skillListEntries) {
+		return "", false
+	}
+	return m.skillListEntries[m.skillListSelected].ID, true
+}
+
 func (m *model) quoteSelectedInboxMessage() tea.Cmd {
 	if m.inputMode != modeInboxOverlay {
 		return nil
@@ -3963,6 +4314,7 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// REQUEST_TIMEOUT still sees the snapshot above). The
 		// next turn starts with a fresh budget anyway.
 		m.softTimeoutState = nil
+		m.providerRetryCountdown = nil
 		m.resize()
 		// Phase 6 PR2: end-of-turn auto-refresh. The Nexus may
 		// have queued or accepted new SessionChannel messages
@@ -4037,7 +4389,8 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
-	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+		m.updateProviderRetryCountdown(event)
 		m.appendLine(eventType, formatNexusEvent(event))
 	case "context_usage":
 		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)
@@ -4208,6 +4561,28 @@ func (m *model) recordSuppressedNexusEvent(event map[string]any) {
 		if m.latestUsage.InputTokens > 0 {
 			m.lastUsage = m.latestUsage
 		}
+	}
+}
+
+func (m *model) updateProviderRetryCountdown(event map[string]any) {
+	switch stringField(event, "type") {
+	case "provider_retry_scheduled":
+		nextAttemptAt, err := time.Parse(time.RFC3339Nano, stringField(event, "nextAttemptAt"))
+		if err != nil {
+			m.providerRetryCountdown = nil
+			return
+		}
+		m.providerRetryCountdown = &providerRetryCountdownSnapshot{
+			ProviderID:    stringField(event, "providerId"),
+			ModelID:       stringField(event, "modelId"),
+			RecoveryKind:  stringField(event, "recoveryKind"),
+			Attempt:       anyInt(event["attempt"]),
+			MaxRetries:    anyInt(event["maxRetries"]),
+			DelayMs:       anyInt(event["delayMs"]),
+			NextAttemptAt: nextAttemptAt,
+		}
+	case "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted":
+		m.providerRetryCountdown = nil
 	}
 }
 

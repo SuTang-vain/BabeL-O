@@ -5,7 +5,7 @@
 > Priority: P1 — three overlapping "agent" subsystems with non-uniform session/task/job vocabulary and no shared state owner undermines "Nexus owns execution, session is a view"
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_agents.md](../active/TODO_agents.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/agentLoop.ts`, `src/nexus/agents/AgentScheduler.ts`, `src/nexus/agents/AgentJobRegistry.ts`, `src/nexus/taskSession.ts`, `src/nexus/taskQueue.ts`, `src/nexus/executionStreamLoop.ts`
 > Governance: Indexed by [README.md](../README.md) and [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md). Canonical owner of "there is one agent execution model with one state owner." Agent maturity stays in [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md); session-channel collaboration stays in [history/context-and-agent-history.md](../history/context-and-agent-history.md).
-> Related: [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md), [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)
+> Related: [agent-runtime-architecture-maturity-plan.md](../reference/agent-runtime-architecture-maturity-plan.md), [agent-session-skill-governance-index.md](../reference/agent-session-skill-governance-index.md), [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../reference/daemon-graceful-shutdown-and-orphan-reaper-plan.md)
 
 ## Purpose
 
@@ -30,7 +30,7 @@ Three subsystems:
 
 ## Problem Statement
 
-Three models mean: durability is inconsistent (only two survive daemon death — see [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md)), the `/v1/agents` surface and the `bbl optimize` surface cannot share progress/handoff semantics, and a fix to agent lifecycle must be applied per-subsystem. The CLI-only `runAgentLoop` is invisible to the daemon and to remote clients, contradicting the Nexus-first identity.
+Three models mean: durability is inconsistent (only two survive daemon death — see [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../reference/daemon-graceful-shutdown-and-orphan-reaper-plan.md)), the `/v1/agents` surface and the `bbl optimize` surface cannot share progress/handoff semantics, and a fix to agent lifecycle must be applied per-subsystem. The CLI-only `runAgentLoop` is invisible to the daemon and to remote clients, contradicting the Nexus-first identity.
 
 ## Goals
 
@@ -57,7 +57,7 @@ Three models mean: durability is inconsistent (only two survive daemon death —
 ### Phase 2 — Make `runAgentLoop` SQLite-owned
 
 1. Move `taskSessions`/`taskQueues` from in-process Maps to SQLite-backed reads/writes (the storage already has `saveTask`/`listTasks` via `TaskRepository`). In-process state becomes a cache.
-2. This unblocks daemon-death recovery for the agent-loop path (pairs with [daemon-graceful-shutdown-and-orphan-reaper-plan.md](./daemon-graceful-shutdown-and-orphan-reaper-plan.md) Phase 2).
+2. This unblocks daemon-death recovery for the agent-loop path (pairs with [daemon-graceful-shutdown-and-orphan-reaper-plan.md](../reference/daemon-graceful-shutdown-and-orphan-reaper-plan.md) Phase 2).
 
 ### Phase 3 — Daemon-expose the planner/executor/critic flow
 

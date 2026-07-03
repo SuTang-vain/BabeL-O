@@ -49,6 +49,7 @@
     "test:concurrency": "NODE_ENV=test tsx scripts/test-concurrency-smoke.ts",
     "test:go-tui:smoke": "NODE_ENV=test BABEL_O_RUN_GO_TUI_SMOKE=1 tsx --test --test-concurrency=1 test/go-tui-smoke.test.ts",
     "test:go-runner:smoke": "NODE_ENV=test BABEL_O_RUN_GO_RUNNER_SMOKE=1 tsx --test --test-concurrency=1 test/remote-runner-go-smoke.test.ts",
+    "test:memory-live": "NODE_ENV=test BABEL_O_RUN_MEMORY_LIVE_SMOKE=1 tsx --test --test-concurrency=1 test/memory-live-smoke.test.ts",
     "test:go-runner": "cd runners/go-runner && go test ./...",
     "test:go-tui": "cd clients/go-tui && go test ./...",
     "test:quarantine": "node scripts/test-quarantine.js",

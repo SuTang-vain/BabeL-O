@@ -19,6 +19,16 @@ export type SkillSource = 'builtin' | 'user' | 'project'
 
 export type SkillScope = SkillSource
 
+export type SkillSourceFormat = 'babel-o-v1' | 'agent-skills-v1'
+
+export type SkillResourceKind = 'script' | 'reference' | 'asset'
+
+export type SkillResource = {
+  kind: SkillResourceKind
+  path: string
+  absolutePath?: string
+}
+
 /**
  * Raw, parsed shape — what `parseFrontMatter` returns today in `loader.ts`.
  * Kept as-is for back-compat; the normalized shape extends it.
@@ -38,6 +48,14 @@ export type RawSkillExtensions = {
   createdAt?: string
   updatedAt?: string
   owner?: string
+  license?: string
+  compatibility?: string
+  metadata?: Record<string, unknown>
+  sourceFormat?: SkillSourceFormat
+  packageRoot?: string
+  manifestPath?: string
+  resources?: SkillResource[]
+  filePath?: string
 }
 
 export type RawSkill = {
@@ -69,6 +87,15 @@ export type NormalizedSkill = RawSkill & {
   createdAt?: string
   updatedAt?: string
   owner?: string
+  license?: string
+  compatibility?: string
+  metadata?: Record<string, unknown>
+  sourceFormat: SkillSourceFormat
+  packageRoot?: string
+  manifestPath?: string
+  resources: SkillResource[]
+  origin?: { type: 'local' | 'git' | 'registry' | 'url'; url?: string; revision?: string }
+  integrity?: { sha256: string }
   /** Resolved filesystem path; populated by the loader, not the file front matter. */
   filePath?: string
 }

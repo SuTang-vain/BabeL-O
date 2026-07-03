@@ -164,7 +164,7 @@ export function classifyProviderRecovery(error: unknown): ProviderRecoveryDetail
     }
   }
 
-  if (status >= 500) {
+  if (status >= 500 || isProviderSpecificTransientUnavailable(error.providerId, normalized)) {
     return {
       providerId: error.providerId,
       httpStatus: status,
@@ -339,6 +339,21 @@ export function buildProviderFallbackPolicy(kind: ProviderRecoveryKind): Provide
         allowSilentModelSwitch: false,
       }
   }
+}
+
+function isProviderSpecificTransientUnavailable(providerId: string, normalizedMessage: string): boolean {
+  if (providerId === 'minimax') {
+    return matchesAny(normalizedMessage, [
+      'api_error',
+      'unknown error, 999',
+      '999 (1000)',
+      'timeout_error',
+      '2066',
+      '请求处理超时',
+      '请稍后重试',
+    ])
+  }
+  return false
 }
 
 function matchesAny(value: string, needles: string[]): boolean {

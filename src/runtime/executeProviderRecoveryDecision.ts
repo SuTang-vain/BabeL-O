@@ -94,6 +94,15 @@ import { enforceMessageBudget } from './toolResultBudget.js'
 import type { RuntimeExecutionMetrics } from './pipeline/cache.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import {
+  buildProviderRetryExhaustedEvent,
+  buildProviderRetryScheduledEvent,
+  canRetryProviderFailure,
+  isProviderAutoRetryKind,
+  readProviderAutoRetryPolicy,
+  type ProviderAutoRetryPolicy,
+  type ProviderAutoRetryState,
+} from './providerRetry.js'
 
 export type ExecuteProviderRecoveryDecisionInput = {
   /** The error thrown by the provider turn. */
@@ -158,6 +167,7 @@ export type ExecuteProviderRecoveryDecisionInput = {
   counters: {
     providerContextRecoveryCount: number
     maxProviderContextRecoveries: number
+    providerAvailabilityRetryState?: ProviderAutoRetryState
   }
   /** Toggle the main loop flips when the recovery
    *  block runs. */
@@ -187,6 +197,7 @@ export type ExecuteProviderRecoveryDecisionInput = {
   /** `contextCompactPercent` for the blocking
    *  threshold message. */
   contextCompactPercent: number
+  providerAutoRetryPolicy?: ProviderAutoRetryPolicy
 }
 
 export type ExecuteProviderRecoveryDecisionResult = {
@@ -196,10 +207,14 @@ export type ExecuteProviderRecoveryDecisionResult = {
    * - 'blocked' = the recovery cap is reached; the main
    *   loop should yield the blocking events (already
    *   in the result.events array) and `return`.
+   * - 'retry' = a provider availability retry was
+   *   scheduled; the main loop should yield the
+   *   schedule event, wait, emit started, and retry
+   *   the same provider/model.
    * - 'rethrow' = the error is not a `context_window`
    *   candidate; the main loop should re-throw.
    */
-  kind: 'recovered' | 'blocked' | 'rethrow'
+  kind: 'recovered' | 'blocked' | 'retry' | 'rethrow'
   /** Every event the recovery block produced, in
    *  order. The main loop yields these (or, on the
    *  `blocked` path, just `return`s). */
@@ -222,6 +237,7 @@ export type ExecuteProviderRecoveryDecisionResult = {
   cacheAwareCompactPolicy: any
   /** When 'rethrow', the error to re-throw. */
   error?: unknown
+  providerAvailabilityRetryState?: ProviderAutoRetryState
 }
 
 export async function executeProviderRecoveryDecision(
@@ -248,10 +264,60 @@ export async function executeProviderRecoveryDecision(
 
   // Step 2: branch on provider recovery.
   if (providerRecovery?.kind !== 'context_window') {
+    const providerAutoRetryPolicy = input.providerAutoRetryPolicy ?? readProviderAutoRetryPolicy()
+    const providerAvailabilityRetryState = input.counters.providerAvailabilityRetryState ?? { count: 0 }
+    if (canRetryProviderFailure({
+      recovery: providerRecovery,
+      policy: providerAutoRetryPolicy,
+      state: providerAvailabilityRetryState,
+    }) && providerRecovery && isProviderAutoRetryKind(providerRecovery.kind)) {
+      const attempt = providerAvailabilityRetryState.count + 1
+      const startedAtMs = providerAvailabilityRetryState.startedAtMs ?? Date.now()
+      const nextAttemptAt = new Date(Date.now() + providerAutoRetryPolicy.delayMs).toISOString()
+      events.push(buildProviderRetryScheduledEvent({
+        sessionId: input.sessionId,
+        providerId: input.providerId,
+        modelId: input.cleanedModelId,
+        requestId: input.requestId,
+        recoveryKind: providerRecovery.kind,
+        httpStatus: providerRecovery.httpStatus,
+        attempt,
+        maxRetries: providerAutoRetryPolicy.maxRetries,
+        delayMs: providerAutoRetryPolicy.delayMs,
+        nextAttemptAt,
+      }))
+      return {
+        kind: 'retry',
+        events,
+        providerContextRecoveryCount: input.counters.providerContextRecoveryCount,
+        providerAvailabilityRetryState: { count: attempt, startedAtMs },
+        previousEvents: input.state.getPreviousEvents(),
+        autoCompactDecision: input.state.getAutoCompactDecision(),
+        messages: input.state.getMessages(),
+        cacheAwareCompactPolicy: input.state.getCacheAwareCompactPolicy(),
+      }
+    }
+    if (
+      providerRecovery?.retryable === true &&
+      providerRecovery.fallbackPolicy.mode === 'retry_same_model' &&
+      isProviderAutoRetryKind(providerRecovery.kind) &&
+      providerAvailabilityRetryState.count >= providerAutoRetryPolicy.maxRetries
+    ) {
+      events.push(buildProviderRetryExhaustedEvent({
+        sessionId: input.sessionId,
+        providerId: input.providerId,
+        modelId: input.cleanedModelId,
+        recoveryKind: providerRecovery.kind,
+        attempts: providerAvailabilityRetryState.count,
+        maxRetries: providerAutoRetryPolicy.maxRetries,
+        finalErrorCode: input.errorCodeHelpers.providerInvocationErrorCode(error, input.options),
+      }))
+    }
     return {
       kind: 'rethrow',
       events,
       providerContextRecoveryCount: input.counters.providerContextRecoveryCount,
+      providerAvailabilityRetryState,
       previousEvents: input.state.getPreviousEvents(),
       autoCompactDecision: input.state.getAutoCompactDecision(),
       messages: input.state.getMessages(),

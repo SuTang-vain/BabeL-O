@@ -95,17 +95,15 @@ bbl go
 
 ## 首次使用
 
-```bash
-bbl init
-bbl go
-```
-
-`bbl init` 会引导你配置 provider 和 model。你也可以直接写入配置：
+配置 provider 和默认 model,然后启动 TUI:
 
 ```bash
 bbl config add anthropic "$ANTHROPIC_API_KEY"
-bbl config use anthropic/claude-3-5-sonnet
+bbl config use anthropic/claude-sonnet-4-6
+bbl go
 ```
+
+你也可以在 TUI 内用 `/model`(或 `Ctrl+L`)配置 provider 和切换 model。
 
 TUI 内常用入口：
 
@@ -145,15 +143,14 @@ TUI 内常用入口：
 ```bash
 bbl go                            # 正式 Go TUI
 bbl run "解释这个 repo"           # 一次性 prompt，不打开 TUI
-bbl init                          # provider 和 model 向导
 bbl doctor                        # 本地环境自检
 bbl go --check --no-start-nexus   # 安装与 TUI 可用性检查
 bbl nexus status                  # Nexus 健康状态
 bbl sessions list                 # 持久化 session 列表
-bbl sessions inspect <sessionId>  # session 事件与 trace
+bbl inspect-session <sessionId>  # session 事件与 trace
 bbl memory status                 # MemoryOS 状态
 bbl tools audit                   # 工具与权限审计
-bbl config show                   # 当前配置
+bbl config list                   # 当前配置
 ```
 
 ## MemoryOS
@@ -178,7 +175,7 @@ BabeL-O 的本地配置保存在 `~/.babel-o/config.json`。
 常用检查：
 
 ```bash
-bbl config show
+bbl config list
 bbl doctor
 bbl go --check
 ```
@@ -205,9 +202,9 @@ BabeL-O 围绕显式边界设计：
 
 - [Changelog](CHANGELOG.md)
 - [Release notes](docs/releases/README.md)
-- [FAQ](docs/nexus/FAQ.md)
+- [FAQ](docs/guides/FAQ.md)
 - [Go TUI 客户端指南](clients/go-tui/README.md)
-- [分发指南](docs/nexus/reference/distribution-guide.md)
+- [分发指南](docs/guides/distribution-guide.md)
 - [Nexus 规划笔记](docs/nexus/README.md)
 
 ## 许可证

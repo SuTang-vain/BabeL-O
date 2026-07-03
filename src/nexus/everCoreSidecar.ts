@@ -1,5 +1,6 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createServer } from 'node:net'
+import { existsSync } from 'node:fs'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
@@ -17,6 +18,18 @@ export type EverCoreManagedLlmConfig = {
   model?: string
 }
 
+export type EverCoreManagedEmbeddingConfig = {
+  model?: string
+  apiKey?: string
+  baseUrl?: string
+}
+
+export type EverCoreInitRun = (
+  command: string,
+  args: string[],
+  options: { env: NodeJS.ProcessEnv },
+) => { code: number | null; stderr: string }
+
 export type EverCoreSidecarOptions = {
   mode?: EverCoreSidecarMode
   command?: string
@@ -27,9 +40,11 @@ export type EverCoreSidecarOptions = {
   startupTimeoutMs?: number
   healthIntervalMs?: number
   llm?: EverCoreManagedLlmConfig
+  embedding?: EverCoreManagedEmbeddingConfig
   fetch?: typeof fetch
   spawn?: EverCoreSpawn
   portAllocator?: EverCorePortAllocator
+  initRun?: EverCoreInitRun
 }
 
 export type EverCoreSidecarRuntime = {
@@ -38,6 +53,11 @@ export type EverCoreSidecarRuntime = {
   dataDir?: string
   status: EverCoreSidecarStatus
   dispose?(): Promise<void>
+}
+
+export type EverCoreSidecarStartupError = {
+  errorCode: string
+  errorMessage: string
 }
 
 export type EverCoreSidecarStatus = {
@@ -54,6 +74,7 @@ export type EverCoreSidecarStatus = {
   registryCleanupError?: string
   errorCode?: string
   errorMessage?: string
+  lastStartupError?: EverCoreSidecarStartupError
 }
 
 export type EverCoreSpawn = (
@@ -61,13 +82,15 @@ export type EverCoreSpawn = (
   args: string[],
   options: {
     env: NodeJS.ProcessEnv
-    stdio: 'ignore'
+    stdio: ['ignore', 'pipe', 'pipe']
     detached: false
   },
 ) => EverCoreProcess
 
 export type EverCoreProcess = Pick<ChildProcessWithoutNullStreams, 'pid' | 'kill' | 'killed'> & {
-  once(event: 'exit' | 'error', listener: (...args: any[]) => void): unknown
+  stdout?: ChildProcessWithoutNullStreams['stdout']
+  stderr?: ChildProcessWithoutNullStreams['stderr']
+  once(event: 'exit' | 'error' | 'close', listener: (...args: any[]) => void): unknown
 }
 
 export type EverCorePortAllocator = (host: string) => Promise<number>
@@ -87,6 +110,59 @@ type EverCoreSidecarRegistry = {
   pid?: number
   startedAt: string
   updatedAt: string
+}
+
+type SidecarExitInfo = { code: number | null; signal: string | null; stderr: string }
+
+class SidecarStartupError extends Error {
+  constructor(
+    public readonly errorCode: string,
+    public readonly errorMessage: string,
+    public readonly exitInfo: SidecarExitInfo,
+  ) {
+    super(errorMessage)
+    this.name = 'SidecarStartupError'
+  }
+}
+
+function truncateStderr(stderr: string): string {
+  // Strip ANSI colour codes; keep the tail (where the fatal traceback lives).
+  const stripped = stderr.replace(/\u001b\[[0-9;]*m/g, '').trim()
+  return stripped.length > 400 ? `…${stripped.slice(-400)}` : stripped
+}
+
+function classifySidecarStartupError(info: SidecarExitInfo): { errorCode: string; errorMessage: string } {
+  const stderr = info.stderr ?? ''
+  if (/everos\.toml not found|Run `everos init`/i.test(stderr)) {
+    return { errorCode: 'EVERCORE_MANAGED_INIT_NOT_RUN', errorMessage: `EverOS config not initialized (run 'everos init'): ${truncateStderr(stderr)}` }
+  }
+  if (/Embedding model is not configured/i.test(stderr)) {
+    return { errorCode: 'EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED', errorMessage: `EverOS embedding model is not configured: ${truncateStderr(stderr)}` }
+  }
+  if (/LLMNotConfiguredError|LLM is required/i.test(stderr)) {
+    return { errorCode: 'EVERCORE_MANAGED_LLM_NOT_CONFIGURED', errorMessage: `EverOS LLM is not configured: ${truncateStderr(stderr)}` }
+  }
+  const fallback = `EverCore sidecar exited before healthy: code=${info.code ?? 'null'} signal=${info.signal ?? 'null'}.`
+  return {
+    errorCode: 'EVERCORE_MANAGED_HEALTH_CHECK_FAILED',
+    errorMessage: info.stderr ? `${fallback} ${truncateStderr(info.stderr)}` : fallback,
+  }
+}
+
+function defaultEverOSInitRun(
+  command: string,
+  args: string[],
+  options: { env: NodeJS.ProcessEnv },
+): { code: number | null; stderr: string } {
+  const result = spawnSync(command, args, {
+    env: options.env,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8',
+  })
+  return {
+    code: result.status,
+    stderr: typeof result.stderr === 'string' ? result.stderr : '',
+  }
 }
 
 export async function startManagedEverCoreSidecar(
@@ -176,21 +252,59 @@ export async function startManagedEverCoreSidecar(
 
   const baseUrl = `http://${host}:${port}`
   const command = options.command?.trim() || 'everos'
-  const args = options.args ?? ['server', 'start', '--host', host, '--port', String(port)]
+  const spawnEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...buildEverCoreLlmEnv(options.llm),
+    ...buildEverCoreEmbeddingEnv(options.embedding),
+    EVEROS_MEMORY__ROOT: dataDir,
+    EVEROS_ROOT: dataDir,
+    EVEROS_API__HOST: host,
+    EVEROS_API__PORT: String(port),
+  }
+
+  // Ensure <dataDir>/everos.toml exists. `everos server start` resolves its
+  // config root via --root / EVEROS_ROOT (default ~/.everos) and exits code=1
+  // before any LLM/embedding lifespan if everos.toml is missing. `bbl memory
+  // setup` builds the binary but never runs `everos init`, so the spawner
+  // self-heals here. See reference/evercore-managed-sidecar-live-validation-
+  // and-config-passthrough-plan.md.
+  const everosTomlPath = join(dataDir, 'everos.toml')
+  if (!existsSync(everosTomlPath)) {
+    const initRun = options.initRun ?? defaultEverOSInitRun
+    const initResult = initRun(command, ['init', '--root', dataDir, '--force'], { env: spawnEnv })
+    if (initResult.code !== 0) {
+      const initErrorMessage = `everos init failed (code=${initResult.code ?? 'null'}): ${truncateStderr(initResult.stderr) || '<no stderr>'}`
+      return failedManagedRuntime(
+        'EVERCORE_MANAGED_INIT_NOT_RUN',
+        initErrorMessage,
+        baseUrl,
+        dataDir,
+        undefined,
+        { registryPath, registryStaleReason: registryCheck.staleReason, registryCleanupError },
+        { errorCode: 'EVERCORE_MANAGED_INIT_NOT_RUN', errorMessage: initErrorMessage },
+      )
+    }
+  }
+
+  const args = options.args ?? ['server', 'start', '--root', dataDir, '--host', host, '--port', String(port)]
 
   let child: EverCoreProcess
+  let capturedOutput = ''
+  const appendOutput = (chunk: Buffer) => {
+    capturedOutput += chunk.toString()
+    if (capturedOutput.length > 16_384) capturedOutput = capturedOutput.slice(-16_384)
+  }
   try {
     child = spawnImpl(command, args, {
-      env: {
-        ...process.env,
-        ...buildEverCoreLlmEnv(options.llm),
-        EVEROS_MEMORY__ROOT: dataDir,
-        EVEROS_API__HOST: host,
-        EVEROS_API__PORT: String(port),
-      },
-      stdio: 'ignore',
+      env: spawnEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
       detached: false,
     })
+    // everos logs Python tracebacks to stdout; capture both streams so
+    // lastStartupError can surface the real cascade (init / embedding / LLM /
+    // schema drift / ...). See classifySidecarStartupError.
+    child.stdout?.on('data', appendOutput)
+    child.stderr?.on('data', appendOutput)
   } catch (error) {
     return failedManagedRuntime('EVERCORE_MANAGED_START_FAILED', errorMessage(error), baseUrl, dataDir, undefined, {
       registryPath,
@@ -199,11 +313,19 @@ export async function startManagedEverCoreSidecar(
     })
   }
 
-  const exitPromise = new Promise<Error>(resolve => {
-    child.once('exit', (code: number | null, signal: string | null) => {
-      resolve(new Error(`EverCore sidecar exited before healthy: code=${code ?? 'null'} signal=${signal ?? 'null'}.`))
+  const exitPromise = new Promise<SidecarStartupError>(resolve => {
+    // Use 'close' (not 'exit'): stdio streams are fully drained by then, so
+    // capturedStderr is complete when we classify the cascade.
+    child.once('close', (code: number | null, signal: string | null) => {
+      const info: SidecarExitInfo = { code: code ?? null, signal: signal ?? null, stderr: capturedOutput }
+      const classified = classifySidecarStartupError(info)
+      resolve(new SidecarStartupError(classified.errorCode, classified.errorMessage, info))
     })
-    child.once('error', (error: Error) => resolve(error))
+    child.once('error', (error: Error) => {
+      const info: SidecarExitInfo = { code: null, signal: null, stderr: errorMessage(error) }
+      const classified = classifySidecarStartupError(info)
+      resolve(new SidecarStartupError(classified.errorCode, classified.errorMessage, info))
+    })
   })
 
   try {
@@ -215,11 +337,18 @@ export async function startManagedEverCoreSidecar(
     })
   } catch (error) {
     stopEverCoreProcess(child)
-    return failedManagedRuntime('EVERCORE_MANAGED_HEALTH_CHECK_FAILED', errorMessage(error), baseUrl, dataDir, child.pid, {
-      registryPath,
-      registryStaleReason: registryCheck.staleReason,
-      registryCleanupError,
-    })
+    const classified = error instanceof SidecarStartupError
+      ? { errorCode: error.errorCode, errorMessage: error.errorMessage }
+      : classifySidecarStartupError({ code: null, signal: null, stderr: errorMessage(error) })
+    return failedManagedRuntime(
+      classified.errorCode,
+      classified.errorMessage,
+      baseUrl,
+      dataDir,
+      child.pid,
+      { registryPath, registryStaleReason: registryCheck.staleReason, registryCleanupError },
+      { errorCode: classified.errorCode, errorMessage: classified.errorMessage },
+    )
   }
 
   const registryWriteError = await writeSidecarRegistry(registryPath, {
@@ -263,7 +392,7 @@ async function waitForEverCoreHealth(
     fetch: typeof fetch
     timeoutMs: number
     intervalMs: number
-    exitPromise: Promise<Error>
+    exitPromise: Promise<SidecarStartupError>
   },
 ): Promise<void> {
   const deadline = Date.now() + options.timeoutMs
@@ -407,6 +536,7 @@ function failedManagedRuntime(
   dataDir?: string,
   pid?: number,
   registry?: Pick<EverCoreSidecarStatus, 'registryPath' | 'registryStaleReason' | 'registryCleanupError'>,
+  lastStartupError?: EverCoreSidecarStartupError,
 ): EverCoreSidecarRuntime {
   return {
     mode: 'managed',
@@ -426,6 +556,7 @@ function failedManagedRuntime(
       ...(registry?.registryCleanupError && { registryCleanupError: registry.registryCleanupError }),
       errorCode,
       errorMessage: message,
+      ...(lastStartupError && { lastStartupError }),
     },
   }
 }
@@ -435,7 +566,7 @@ function spawnEverCore(
   args: string[],
   options: {
     env: NodeJS.ProcessEnv
-    stdio: 'ignore'
+    stdio: ['ignore', 'pipe', 'pipe']
     detached: false
   },
 ): EverCoreProcess {
@@ -476,6 +607,26 @@ function buildEverCoreLlmEnv(llm: EverCoreManagedLlmConfig | undefined): NodeJS.
   if (apiKey) env.EVEROS_LLM__API_KEY = apiKey
   if (baseUrl) env.EVEROS_LLM__BASE_URL = baseUrl
   if (model) env.EVEROS_LLM__MODEL = model
+  return env
+}
+
+// Mirrors buildEverCoreLlmEnv for the OpenAI-compatible embedding endpoint.
+// EverOS' EmbeddingSettings requires model + api_key + base_url at runtime
+// (factory raises ValueError if any is missing → the sidecar dies before
+// /health with "Embedding model is not configured"). minimax has no
+// embedding endpoint, so unlike LLM this cannot be derived from
+// providerSettings — it must be supplied explicitly via env or the
+// persisted embeddingPassthrough bootstrap field. See proposals/
+// evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md
+// Phase 5.
+function buildEverCoreEmbeddingEnv(embedding: EverCoreManagedEmbeddingConfig | undefined): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  const apiKey = embedding?.apiKey?.trim()
+  const baseUrl = embedding?.baseUrl?.trim()
+  const model = embedding?.model?.trim()
+  if (model) env.EVEROS_EMBEDDING__MODEL = model
+  if (apiKey) env.EVEROS_EMBEDDING__API_KEY = apiKey
+  if (baseUrl) env.EVEROS_EMBEDDING__BASE_URL = baseUrl
   return env
 }
 

@@ -76,6 +76,53 @@ Project testing body`,
   }
 })
 
+test('loadSkillRegistry normalizes Agent Skills packages as internal IR', async () => {
+  const cwd = path.join(os.tmpdir(), `babel-o-registry-agent-skills-${Date.now()}`)
+  const builtInDir = path.join(cwd, 'built-in')
+  const packageDir = path.join(cwd, '.babel-o', 'skills', 'context-debugging')
+  await fs.mkdir(builtInDir, { recursive: true })
+  await fs.mkdir(path.join(packageDir, 'assets'), { recursive: true })
+
+  try {
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    scope: project
+    triggers:
+      - context assembly
+      - tool suppression
+    priority: 80
+---
+# Purpose
+Debug context issues.`
+    )
+    await fs.writeFile(path.join(packageDir, 'assets', 'diagram.txt'), 'diagram')
+
+    const reg = await loadSkillRegistry({ cwd, builtInDir })
+    const skill = reg.get('context-debugging')
+    assert.ok(skill)
+    assert.strictEqual(skill.source, 'project')
+    assert.strictEqual(skill.scope, 'project')
+    assert.strictEqual(skill.sourceFormat, 'agent-skills-v1')
+    assert.strictEqual(skill.description, 'Debug context assembly and tool suppression issues.')
+    assert.deepStrictEqual(skill.allowedTools, ['Read', 'Grep'])
+    assert.deepStrictEqual(skill.triggers, ['context assembly', 'tool suppression'])
+    assert.strictEqual(skill.priority, 80)
+    assert.strictEqual(skill.packageRoot, packageDir)
+    assert.strictEqual(skill.manifestPath, path.join(packageDir, 'SKILL.md'))
+    assert.strictEqual(skill.filePath, path.join(packageDir, 'SKILL.md'))
+    assert.strictEqual(skill.resources.length, 1)
+    assert.strictEqual(skill.resources[0]?.path, 'assets/diagram.txt')
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
 test('loadSkillRegistry records overlay when project shadows built-in', async () => {
   const cwd = path.join(os.tmpdir(), `babel-o-registry-overlay-${Date.now()}`)
   const builtInDir = path.join(cwd, 'built-in')

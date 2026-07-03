@@ -1,11 +1,11 @@
 # Daemon Graceful Shutdown and Startup Orphan Reaper Plan
 
-> State: Draft
+> State: Closed Reference
 > Track: Nexus / Runtime / Storage
-> Priority: P0 — directly contradicts the "durable sessions" product claim and the soft-recoverable-timeout principle
-> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/server.ts`, `src/nexus/createRuntime.ts`, `src/nexus/storageBridge.ts`, `src/nexus/agents/AgentScheduler.ts`, `src/storage/SqliteStorage.ts`
-> Governance: Indexed by [README.md](../README.md). Canonical owner of daemon lifecycle / orphan reaping. Coupling boundaries stay in [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md); soft-recoverable-timeout semantics stay in [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md).
-> Related: [module-coupling-decoupling-and-re-aggregation-plan.md](../reference/module-coupling-decoupling-and-re-aggregation-plan.md), [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md)
+> Priority: P0 — directly contradicts the "durable sessions" product claim and the soft-recoverable-timeout principle. Phase 1-3 landed on 2026-06-22/23 (graceful shutdown coordinator + cancelAll + storage close + startup reaper for stale `executing` sessions / running agent jobs); verified by `test/daemon-graceful-shutdown.test.ts` (6/6) + `test/daemon-orphan-reaper.test.ts` (5/5). Graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision.
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/nexus/server.ts`, `src/nexus/createRuntime.ts`, `src/nexus/storageBridge.ts`, `src/nexus/agents/AgentScheduler.ts`, `src/storage/SqliteStorage.ts`, `test/daemon-graceful-shutdown.test.ts`, `test/daemon-orphan-reaper.test.ts`
+> Governance: Indexed by [README.md](./README.md). Canonical owner of daemon lifecycle / orphan reaping. Coupling boundaries stay in [module-coupling-decoupling-and-re-aggregation-plan.md](./module-coupling-decoupling-and-re-aggregation-plan.md); soft-recoverable-timeout semantics stay in [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md).
+> Related: [module-coupling-decoupling-and-re-aggregation-plan.md](./module-coupling-decoupling-and-re-aggregation-plan.md), [runtime-tool-loop-governance-plan.md](./runtime-tool-loop-governance-plan.md)
 
 ## Purpose
 
@@ -15,9 +15,9 @@ The Nexus daemon ("Nexus owns execution, session is a view") must survive a hard
 
 - `src/nexus/server.ts` registers an `onClose` hook (`server.ts:115-117`) that **only** shuts down `defaultEverCoreRuntimeManager`. There is **no `SIGTERM` / `SIGINT` handler**, no `app.close()` call, and **`storage.close()` is never invoked** on shutdown.
 - `storage.close` is overridden at `createRuntime.ts:169-176` to flush `storageBridge` and dispose tools — but that flush path is **never triggered** because nothing calls `storage.close()` during daemon teardown.
-- `storageBridge` has a genuine WAL: append-on-enqueue (`storageBridge.ts:322-345`), ack-on-flush, replay-on-start (`:407-434`, wired via `configureStorageBridgeWal` at `:152`). On a clean flush this survives; on a hard kill only the already-appended WAL records survive — the in-memory queue is dropped.
+- `storageBridge` has a genuine WAL: append-on-enqueue (`storageBridge.ts:322-345`), ack-on-flush, replay-on-start (`:407-434`). WAL is assembled at `createRuntime.ts:144` (`configureStorageBridgeWal(\`${resolvedStoragePath.path}.wal.jsonl\`, ...)`), and that call internally triggers `replayWal` (`storageBridge.ts:152`) to complete replay-on-start. On a clean flush this survives; on a hard kill only the already-appended WAL records survive — the in-memory queue is dropped.
 - No crash recovery / orphan reaper on startup. `AgentScheduler.loadPersistedJobs` (`AgentScheduler.ts:236`) rehydrates job records but **never transitions stale `running` jobs to `failed`**. Sessions left in `executing` phase by a crashed daemon stay `executing` forever.
-- `/v1/execute` writes events directly to SQLite (`executionStreamLoop.ts:39`); agent-loop path uses in-process `taskSessions` / `taskQueues` Maps as source of truth (`taskSession.ts:21`, `taskQueue.ts:15`) with write-behind — these are lost on death, only mitigated by WAL replay for ops that reached the WAL buffer.
+- `/v1/execute` writes events directly to SQLite via `processRuntimeExecutionEvent` — the actual `storage.appendEvent` call lives at `executionEventProcessing.ts:35` (and `:41` for the cache-health companion event), invoked from the runtime generator loop at `executionStreamLoop.ts:39`; agent-loop path uses in-process `taskSessions` / `taskQueues` Maps as source of truth (`taskSession.ts:21`, `taskQueue.ts:15`, consumed by `agentLoop.ts:28` and peers) with write-behind — these are lost on death, only mitigated by WAL replay for ops that reached the WAL buffer.
 
 This means: after a crash or `kill`, a reconnecting client sees a session stuck in `executing` and agent jobs stuck in `running`, with no automatic recovery.
 
@@ -36,7 +36,7 @@ This also violates the soft-recoverable-timeout principle: a shutdown should be 
 
 ## Non-goals
 
-- Do not change the in-process `taskSessions` / `taskQueues` source-of-truth design for the agent-loop path — that is owned by [P1-7 unify-agent-models proposal](./unify-agent-execution-models-plan.md).
+- Do not change the in-process `taskSessions` / `taskQueues` source-of-truth design for the agent-loop path — that is owned by [P1-7 unify-agent-models proposal](../proposals/unify-agent-execution-models-plan.md).
 - Do not replace `node:sqlite` `DatabaseSync` with async I/O here — that is owned by the concurrency-model proposal (to be filed).
 - Do not add cross-process coordination (distributed locks). Single-daemon assumption stays.
 - Do not change the WAL format.
@@ -46,7 +46,7 @@ This also violates the soft-recoverable-timeout principle: a shutdown should be 
 ### Phase 1 — Graceful shutdown wiring
 
 1. In `src/nexus/server.ts`, register `process.on('SIGTERM' | 'SIGINT', shutdown)` where `shutdown`:
-   - Sets a `shuttingDown` flag that causes `/v1/execute` / `/v1/stream` to reject new leases with a `503 SHUTTING_DOWN` (mirrors `EXECUTION_BUSY` envelope shape in `middleware.ts:45-66`).
+   - Sets a `shuttingDown` flag that causes `/v1/execute` / `/v1/stream` to reject new leases with a `503` in the `{ type: 'error', code, message }` envelope shape defined by `registerErrorHandler` in `middleware.ts:45-66`, using a new `SHUTTING_DOWN` code (this code does not exist in the tree today — Phase 1 introduces it; it is not a reuse of an existing literal).
    - Awaits in-flight `ExecutionGate` leases to drain with a bounded grace budget (default 5s, configurable via `RuntimeEnv`), then forces a cancel.
    - Calls `app.close()` (stops accepting new connections, drains WS).
    - Calls `storage.close()` — which already flushes `storageBridge` and disposes tools (`createRuntime.ts:169-176`). Verify the override path actually runs in this flow; if not, re-wire so it does.

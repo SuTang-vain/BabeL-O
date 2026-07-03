@@ -62,6 +62,7 @@ type AgentJobEventType =
   | 'agent_job_completed'
   | 'agent_job_failed'
   | 'agent_job_cancelled'
+  | 'agent_job_orphaned'
 
 export class ExploreAgentScheduler implements AgentScheduler {
   private readonly storage: NexusStorage
@@ -237,6 +238,43 @@ export class ExploreAgentScheduler implements AgentScheduler {
     if (this.loadedPersistedJobs) return
     this.loadedPersistedJobs = true
     this.registry.hydrateJobs(await this.storage.listAgentJobs())
+  }
+
+  /**
+   * Phase 2 of the daemon-graceful-shutdown-and-orphan-reaper plan:
+   * transition any rehydrated agent job whose persisted status is a
+   * non-terminal in-flight state (`running`, `queued`,
+   * `waiting_permission`) to `failed` with `code: 'orphaned_on_restart'`,
+   * finalize the child session to a terminal state, and append a
+   * `agent_job_orphaned` diagnostic event to the parent session.
+   *
+   * Runs once at daemon startup (see `runStartupReaper` in
+   * `startupReaper.ts`). Best-effort; failures propagate to the reaper
+   * which logs + continues.
+   *
+   * @returns the number of jobs reaped.
+   */
+  async reapOrphanedJobsOnStartup(): Promise<number> {
+    await this.loadPersistedJobs()
+    const jobs = this.registry.listJobs()
+    const orphans = jobs.filter(job => !isTerminalAgentJobStatus(job.status))
+    for (const job of orphans) {
+      // `failJob` allows transition from queued / running / waiting_permission
+      // to failed (see AgentJobRegistry.ts assertTransition). Use the
+      // now-string already on the job so the reaper is deterministic with
+      // the persisted completedAt.
+      const failed = this.registry.failJob(job.jobId, {
+        code: 'orphaned_on_restart',
+        message:
+          'Agent job was in an in-flight state when the Nexus daemon was last killed; reaped on startup.',
+      })
+      await this.storage.saveAgentJob(failed)
+      await this.finalizeChildSession(failed, false, failed.error?.message ?? 'Agent job orphaned on restart.')
+      // `agent_job_orphaned` is a dedicated event type so dashboards can
+      // surface the reaper's work distinctly from a normal `agent_job_failed`.
+      await this.appendParentAgentEvent('agent_job_orphaned', failed)
+    }
+    return orphans.length
   }
 
   private async runAgentJob(

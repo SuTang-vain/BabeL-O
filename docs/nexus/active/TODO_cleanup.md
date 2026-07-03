@@ -7,7 +7,7 @@ BabeL-O 采用全新设计的干净架构，不应无选择地搬运 BabeL-X 的
 ## 当前状态
 
 - Runtime 去重、结构化 logger、`docs/nexus` 文档中心、Hooks 最小内核、PromptInput 状态分层、多级 permission panel、Compact UX、MCP stdio client、Skill loader、Agent lifecycle metadata 等第一轮迁入/设计重构已完成。
-- Dependency boundary audit、生产构建与 build smoke 已落地：`npm run deps:audit` 输出 direct dependency ownership、runtime reachable dependency report、CLI imports 和 failure diagnostics；`npm run build:smoke` 会 build `dist/` 并覆盖 `bbl --help`、`bbl chat --help`、`bbl run hello`。
+- Dependency boundary audit、生产构建与 build smoke 已落地：`npm run deps:audit` 输出 direct dependency ownership、runtime reachable dependency report、CLI imports 和 failure diagnostics；`npm run build:smoke` 会 build `dist/` 并覆盖 `bbl --help`、`bbl go --check`、`bbl run hello`（`bbl chat` 已于 v0.3.7 移除，不再纳入 smoke）。
 - Check-only format/lint、GitHub Actions workflow 与 coverage report 已落地：`npm run format:check` 只检查不改写文件，`npm run lint` 串联 typecheck/format/deps audit，`npm run coverage` 产出 `coverage/coverage-summary.json` 且暂不设置硬阈值。
 - 当前 cleanup 剩余项为 P2 后续迁入门禁。
 
@@ -19,7 +19,7 @@ Dependency boundary audit 已接入 `npm run deps:audit`，详见 [DONE.md](../D
 
 ## 已收口 Production Build
 
-Production build 与 build smoke 已接入 `npm run build:smoke`：`npm run build` 产出 `dist/`，`bin/bbl.js` 在 `dist/cli/program.js` 存在时走生产 JS，不再经 `tsx` 启动；smoke 覆盖 `bbl --help`、`bbl run "hello"`、`bbl chat --help`。
+Production build 与 build smoke 已接入 `npm run build:smoke`：`npm run build` 产出 `dist/`，`bin/bbl.js` 在 `dist/cli/program.js` 存在时走生产 JS，不再经 `tsx` 启动；smoke 覆盖 `bbl --help`、`bbl go --check`、`bbl run "hello"`。
 
 ## 已收口 Lint / Format / CI
 
@@ -49,6 +49,8 @@ Check-only format/lint、GitHub Actions workflow 与 coverage report 已接入�
 | `test/permission-flow.test.ts` | `smart permissions: prompts user on non-whitelisted` can time out waiting for `permission_request`; baseline also fails after stash | 2026-06-18 | 2026-06-18 | Async permission timing / polling race, pre-existing | Runtime maintainer | deterministic permission fixture or 10 consecutive isolated passes | Existing focused permission and runtime tool-loop tests remain required |
 
 Machine-readable source: `test/quarantine.json`. Listing command: `npm run test:quarantine`. Opt-in run command: `npm run test:quarantine -- --run`.
+
+**Resolved 2026-07-01 (fixed, not quarantined):** `test/everos-background-bootstrap.test.ts` — "timeout env var is respected when present" plus 5 siblings cancelled via `cancelledByParent` on Node 22 (local `npm test` exit 1), passing on Node 24 (CI). Root cause: `startEverOSBackgroundBootstrap` correctly `.unref()`s its timeout timer (production-correct — must not keep the process alive), but the test's mock runner returned a bare `new Promise(() => {})` with no pending I/O, so Node 22's `node:test` saw an empty event loop and cancelled before the 50ms timeout could fire. Fix: mock runner now resolves after 500ms (keeps the loop alive); the 50ms timeout still wins `Promise.race` and settles `handle.promise` with the timeout error. Local `npm test` now exit 0 (1246/1246). No quarantine entry — coverage retained.
 
 ## P1 Module Coupling Governance
 

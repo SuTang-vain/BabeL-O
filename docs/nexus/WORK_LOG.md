@@ -2,6 +2,26 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+## 2026-07-02 — Agent Skills ecosystem protocol compatibility Phase 0-4 local directory slice
+
+- **背景**: 当前 skill 功能是 BabeL-O 内部可用的单文件自有协议，无法直接消费市场流通的 Agent Skills 目录包，也没有标准 `SKILL.md`、资源目录、导入/导出、来源完整性等生态互通治理。
+- **规划准入**: 新增 `docs/nexus/proposals/agent-skills-ecosystem-protocol-governance-plan.md`，并登记到 `docs/nexus/proposals/README.md` 与 `docs/nexus/reference/agent-session-skill-governance-index.md`。该文档定位为 Partially Landed：Phase 0-3 已 Closed，Phase 4 本地目录 import/export 已部分落地；zip/git、lockfile、marketplace metadata、TUI/CLI UX 仍保持 Draft/Open。
+- **实现**:
+  - `src/skills/loader.ts` 同时支持旧 `.md` 技能与 Agent Skills 目录包 `*/SKILL.md`，把标准 `name` / `description` / `allowed-tools` / `license` / `compatibility` 和 `metadata.babel-o` 映射到 `NormalizedSkill`。
+  - 新增 `sourceFormat`、`packageRoot`、`manifestPath`、`resources`、`metadata`、`origin`、`integrity` 等 IR 兼容字段；旧技能默认 `babel-o-v1`，目录包为 `agent-skills-v1`。
+  - 资源索引覆盖 `scripts/` / `references/` / `assets/`，通过 package realpath、symlink skip、realpath-in-root 检查避免资源逃逸；加载/展示不执行脚本。
+  - matcher 从仅依赖私有 `triggers` 扩展为 trigger 优先、description 次之、name/id 兜底，允许标准 Agent Skills 包不写 BabeL-O 私有触发词也能被发现。
+  - 新增 `src/skills/importer.ts` 与 `src/skills/exporter.ts`，提供本地目录 import preview/install 和 export preview/write；写路径全部 preview-first、`confirm: true` 门控、冲突需 `overwrite: true`，资源复制跳过 symlink。
+  - `SkillImportPreview` / `SkillImportInstall` / `SkillExportPreview` / `SkillExportWrite` 注册为模型可见工具；preview 为 read risk，install/write 为 write risk 且 requiresApproval。
+  - Nexus 新增 `/v1/skills/import/preview`、`/v1/skills/import/install`、`/v1/skills/export/preview`、`/v1/skills/export/write`，并在 list/show 响应中暴露 package/resource 元数据。
+- **验证**:
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-agent-skills-protocol.json BABEL_O_USER_SKILLS_DIR=/tmp/babel-o-agent-skills-user npx tsx --test --test-concurrency=1 test/skills.test.ts test/skill-registry.test.ts test/skill-tools.test.ts test/skill-schema.test.ts test/skill-read-router.test.ts test/skill-routes.test.ts test/skill-draft-route.test.ts test/skill-save-route.test.ts test/skill-validate-router.test.ts test/router-registrar.test.ts`: pass。
+  - `npm run typecheck`: pass。
+  - `npm run format:check`: pass。
+  - `npm run docs:check`: pass。
+  - `git diff --check`: clean。
+- **边界**: 本次只落地 Agent Skills 本地目录互通和资源索引，不支持 zip/git import，不写 `skills.lock.json`，不引入中心 marketplace，不让 `allowed-tools` 越过 runtime permission policy。
+
 ## 2026-06-23 — History event load limit scaled with budget (Phase 6): fix fat-turn per-turn compression
 
 - **背景**: Phase 1-4 headroom 修复在 slim-turn session 验证通过，但真实 fat-turn session 仍"每轮压缩"。`session_099b26bb`（4 turn，4003 thinking_delta + 58 tool）、`session_cf703023`、`session_1891b642` 三个 session 每轮 `initial_refresh` 都跌回 25k 甚至 3.5k tokens，全程 percentUsed 最高 10%。

@@ -2,9 +2,11 @@ package tui
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"charm.land/lipgloss/v2"
 	"github.com/mattn/go-runewidth"
@@ -229,6 +231,21 @@ func formatSoftTimeoutFooter(s *softTimeoutSnapshot) string {
 		return "soft timeout: budget exceeded"
 	}
 	return "soft timeout " + strings.Join(parts, " ")
+}
+
+func formatProviderRetryCountdown(s *providerRetryCountdownSnapshot, now time.Time) string {
+	if s == nil || s.NextAttemptAt.IsZero() {
+		return ""
+	}
+	remaining := int(math.Ceil(s.NextAttemptAt.Sub(now).Seconds()))
+	if remaining < 0 {
+		remaining = 0
+	}
+	subject := strings.TrimSpace(s.ProviderID + "/" + s.ModelID)
+	if subject == "/" {
+		subject = "provider"
+	}
+	return fmt.Sprintf("provider retry %d/%d in %ds %s", s.Attempt, s.MaxRetries, remaining, subject)
 }
 
 func stateStyle(running bool, pending *pendingPermission) lipgloss.Style {

@@ -26,7 +26,7 @@ function formatCliHelp(mode: 'compact' | 'full'): string {
     'Automation:',
     '  bbl run "<prompt>"             Run a one-shot prompt',
     '  bbl sessions list              List persisted Nexus sessions',
-    '  bbl config show                Show active model configuration',
+    '  bbl config list                Show active model configuration',
   ]
   if (mode === 'full') {
     lines.push(

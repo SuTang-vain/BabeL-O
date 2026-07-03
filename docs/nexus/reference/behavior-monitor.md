@@ -1,15 +1,15 @@
 # Behavior Monitor — 设计文档
 
-> State: Partially Landed
+> State: Active Plan
 > Track: Behavior Trace / Cross-session Monitor / Go Loop Visualization
-> Priority: P2 Watch
-> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_tui.md](../active/TODO_tui.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/`, `src/nexus/`, `clients/go-tui/`
-> Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). This document owns behavior-monitor planning; runtime facts remain owned by Nexus events and storage.
+> Priority: P2 Watch — Server-side Phase 1/2 landed (2026-06-16) and ingest wiring closed (2026-06-17). Graduated from `proposals/` to `reference/` on 2026-06-24 per [decisions/0001-documentation-lifecycle.md](../decisions/0001-documentation-lifecycle.md) §Decision. Go loop mirror remains an Open follow-up (independent repo).
+> Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../active/TODO_tui.md](../active/TODO_tui.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/behaviorMonitor.ts` (674 lines), `src/runtime/behaviorTrace.ts`, `src/runtime/behaviorTraceTap.ts`, `src/runtime/sessionMemoryLite.ts` (363 lines, `natural_pause` retired post R0–R7), `src/runtime/LLMCodingRuntime.ts:1133/1151/1245/1259` (live hint subscribe), `src/runtime/contextAnalysis.ts:105/593` (status projection), `test/runtime.test.ts` + focused behavior monitor regressions
+> Governance: Indexed by [context-governance-index.md](./context-governance-index.md). This document owns behavior-monitor planning; runtime facts remain owned by Nexus events and storage.
 
 > 状态：v1 草案 — Server 侧 Phase 1/2 已落地（2026-06-16），**ingest wiring 已收口（2026-06-17）**，Go 端 mirror 留作 PR-17（独立 repo）
 > 范围：把 `sessionMemoryLite` 的"natural_pause 频繁写日志"问题，重新定位为"agent 行为轨迹 + 跨 session 自检复盘"系统
 > 替代：`sessionMemoryLite` 的 `natural_pause` 决策分支（保留 `forced` / `growth_threshold`）
-> Governance: Indexed by [context-governance-index.md](../reference/context-governance-index.md). Behavior trace is diagnostics and live guidance; it must not be treated as authoritative memory or task state.
+> Governance: Indexed by [context-governance-index.md](./context-governance-index.md). Behavior trace is diagnostics and live guidance; it must not be treated as authoritative memory or task state.
 
 **Server 侧落地清单**（按 PR）：
 - PR-2 (2026-06-14): `src/runtime/behaviorTrace.ts` 5 类 trigger + 队列 + flush

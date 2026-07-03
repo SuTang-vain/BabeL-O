@@ -263,6 +263,10 @@ export const AgentJobEventSchema = z.object({
     'agent_job_completed',
     'agent_job_failed',
     'agent_job_cancelled',
+    // Phase 2 of docs/nexus/proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md:
+    // reaper emits a dedicated event type so dashboards can distinguish
+    // an orphan-reaped job from a normal failure.
+    'agent_job_orphaned',
   ]),
   jobId: z.string(),
   childSessionId: z.string(),
@@ -495,6 +499,55 @@ export const ContextRecoveryAttemptedEventSchema = z.object({
   preTokens: z.number(),
   postTokens: z.number().optional(),
   retryable: z.boolean(),
+  message: z.string(),
+})
+
+const providerRetryFields = {
+  providerId: z.string(),
+  modelId: z.string(),
+  recoveryKind: z.enum(['provider_unavailable', 'rate_limit']),
+}
+
+export const ProviderRetryScheduledEventSchema = z.object({
+  type: z.literal('provider_retry_scheduled'),
+  ...baseEventFields,
+  requestId: z.string().optional(),
+  originalRequestId: z.string().optional(),
+  ...providerRetryFields,
+  httpStatus: z.number().optional(),
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+  delayMs: z.number().int().nonnegative(),
+  nextAttemptAt: z.string(),
+  sameProvider: z.literal(true),
+  sameModel: z.literal(true),
+  message: z.string(),
+})
+
+export const ProviderRetryStartedEventSchema = z.object({
+  type: z.literal('provider_retry_started'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+})
+
+export const ProviderRetrySucceededEventSchema = z.object({
+  type: z.literal('provider_retry_succeeded'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempt: z.number().int().positive(),
+  maxRetries: z.number().int().nonnegative(),
+  recoveredAfterMs: z.number().nonnegative(),
+})
+
+export const ProviderRetryExhaustedEventSchema = z.object({
+  type: z.literal('provider_retry_exhausted'),
+  ...baseEventFields,
+  ...providerRetryFields,
+  attempts: z.number().int().nonnegative(),
+  maxRetries: z.number().int().nonnegative(),
+  finalErrorCode: z.string(),
   message: z.string(),
 })
 
@@ -752,6 +805,10 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ContextUsageEventSchema,
   ContextMicrocompactEventSchema,
   ContextRecoveryAttemptedEventSchema,
+  ProviderRetryScheduledEventSchema,
+  ProviderRetryStartedEventSchema,
+  ProviderRetrySucceededEventSchema,
+  ProviderRetryExhaustedEventSchema,
   ContextGroundingRequiredEventSchema,
   ContextGroundingConfirmedEventSchema,
   WorkspaceDirtyDetectedEventSchema,

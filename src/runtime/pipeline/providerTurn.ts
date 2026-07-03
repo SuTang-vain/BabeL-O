@@ -6,7 +6,7 @@ import type {
   StreamDelta,
 } from '../../providers/adapters/ModelAdapter.js'
 import type { CacheAwareCompactUsage } from '../cacheAwareCompactPolicy.js'
-import type { UserIntentGuidance } from '../intentGuidance.js'
+import { getIntentCategory, getToolSuppressionReason, type UserIntentGuidance } from '../intentGuidance.js'
 import { buildProviderFallbackPolicy } from '../providerRecovery.js'
 import {
   buildRuntimeErrorEvent,
@@ -21,6 +21,7 @@ import {
   type ToolCallTextLeakPhase,
   type ToolCallTextLeakSuppression,
 } from './turn.js'
+import { FINAL_CHECK_READ_ONLY } from './loop.js'
 
 type RuntimeProviderTurnOutcomeBase = {
   messages: ModelMessage[]
@@ -43,6 +44,11 @@ export function reduceProviderTurnOutcome(options: {
   sessionId: string
   turn: Pick<RuntimeProviderTurn, 'assistantText' | 'reasoningText' | 'finishReason' | 'toolCalls' | 'toolCallTextLeakSuppression'>
   finalResponseOnlyMode: boolean
+  // Phase D: when true, the runtime is in the `final_check` sub-state — one
+  // bounded read-only check (Read/Grep/Glob/ListDir) is allowed before
+  // must_respond. Non-read-only tool calls are denied with
+  // TOOL_DENIED_FINAL_CHECK; read-only tool calls pass through.
+  finalCheckPhase?: boolean
   suppressToolsForUserIntent: boolean
   userIntentGuidance: UserIntentGuidance
   providerId?: string
@@ -139,7 +145,44 @@ export function reduceProviderTurnOutcome(options: {
     }
   }
 
-  if (options.finalResponseOnlyMode && turn.toolCalls.length > 0) {
+  if (options.finalCheckPhase && turn.toolCalls.length > 0) {
+    const nonReadOnly = turn.toolCalls.filter(toolCall => !FINAL_CHECK_READ_ONLY.has(toolCall.name))
+    if (nonReadOnly.length > 0) {
+      const deniedTools = nonReadOnly.map(toolCall => toolCall.name).join(', ')
+      const message = `final_check: read-only tools only; denied write/execute tool calls (${deniedTools}). The runtime grants one bounded read-only check (Read/Grep/Glob/ListDir) before hiding all tools. Use it to confirm a missing detail, or answer from existing evidence.`
+      return {
+        kind: 'continue',
+        eventsBeforeMessages: [
+          buildRuntimeErrorEvent({
+            sessionId: options.sessionId,
+            code: 'TOOL_DENIED_FINAL_CHECK',
+            message,
+            details: {
+              finalCheckPhase: true,
+              attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
+              deniedTools: nonReadOnly.map(toolCall => toolCall.name),
+              retryAttempted: false,
+              retryExhausted: false,
+            },
+          }),
+        ],
+        eventsAfterMessages: [],
+        messages: [{
+          role: 'user',
+          content: `${message}\nDo not re-issue the denied tool. Either call a read-only tool (Read/Grep/Glob/ListDir) for one final confirmation, or produce your final answer now from the evidence already gathered.`,
+        }],
+        ...baseCounts,
+      }
+    }
+    // All tool calls are read-only: allow them to pass through (the loop will
+    // set finalCheckUsed after execution so the next turn is must_respond).
+    // Fall through to the normal tool_calls handling below.
+  }
+
+  // Intent suppression / must_respond backstop. `finalCheckPhase` is handled
+  // above (read-only pass-through or write denial), so this branch only fires
+  // for the must_respond sub-state (finalResponseOnlyMode && !finalCheckPhase).
+  if (options.finalResponseOnlyMode && !options.finalCheckPhase && turn.toolCalls.length > 0) {
     const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
     const message = `Runtime entered final-response-only mode after repeated tool calls and ignored additional requested tools: ${attemptedTools}.`
     return {
@@ -210,6 +253,8 @@ export function reduceProviderTurnOutcome(options: {
             actionHint: options.userIntentGuidance.actionHint,
             requiresTools: options.userIntentGuidance.requiresTools,
             latestUserText: options.userIntentGuidance.latestUserText,
+            intentCategory: getIntentCategory(options.userIntentGuidance),
+            suppressionReason: getToolSuppressionReason(options.userIntentGuidance),
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
             retryAttempted: true,
             retryExhausted: false,
@@ -219,7 +264,7 @@ export function reduceProviderTurnOutcome(options: {
       eventsAfterMessages: [],
       messages: [{
         role: 'user',
-        content: `${message}\nIf you genuinely need to execute a command or inspect files to answer the user, call the appropriate tool now. Otherwise, answer directly from existing context.`,
+        content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to execute a command or inspect files to answer the user, call the appropriate tool now. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
       }],
       maxTokenRecoveryCount: options.maxTokenRecoveryCount,
       outputRetryCount: options.outputRetryCount,

@@ -20,6 +20,7 @@ import { buildEverCoreStatus, buildEverOSBootstrapStatus } from './bootstrapStat
 import { registerCoreMiddleware } from './middleware.js'
 import { buildExecuteRouteSharedDeps } from './executeRouteDeps.js'
 import { WorkingSetBroadcaster } from './workingSetBroadcaster.js'
+import type { ShutdownSignal } from './daemonLifecycle.js'
 
 export {
   parseSinceFromQuery,
@@ -98,6 +99,22 @@ export type CreateNexusAppOptions = {
   memoryProvider?: MemoryProvider
   agentScheduler?: AgentScheduler
   agentExecutionEnvironment?: 'local' | 'remote'
+  /**
+   * Daemon graceful-shutdown flag (Phase 1 of
+   * `docs/nexus/proposals/daemon-graceful-shutdown-and-orphan-reaper-plan.md`).
+   * When provided, `/v1/execute` and `/v1/stream` reject new leases with
+   * `503 SHUTTING_DOWN` once `isShuttingDown` is true. Created by
+   * `createShutdownSignal()` in `server.ts`; mutated by
+   * `registerDaemonShutdownHandlers`. Optional for embedded runners.
+   */
+  shutdownSignal?: ShutdownSignal
+  /**
+   * Optional injected `ActiveExecutionRegistry`. The daemon composition
+   * root (`server.ts`) passes one it created so the shutdown coordinator
+   * can call `cancelAll()` on the same instance the execute routes
+   * register leases against. When omitted, a per-app default is created.
+   */
+  activeExecutionRegistry?: ActiveExecutionRegistry
 }
 
 export async function createNexusApp(options: CreateNexusAppOptions): Promise<FastifyInstance> {
@@ -119,7 +136,11 @@ export async function createNexusApp(options: CreateNexusAppOptions): Promise<Fa
   const maxToolOutputBytes = options.maxToolOutputBytes ?? 200_000
   const bashMaxBufferBytes = options.bashMaxBufferBytes ?? 1_000_000
   const executionGate = new ExecutionGate(options.maxConcurrentExecutions ?? 8)
-  const activeExecutionRegistry = new ActiveExecutionRegistry()
+  // Accept an injected registry so the daemon composition root (server.ts)
+  // can share the same instance with the shutdown coordinator
+  // (registerDaemonShutdownHandlers needs cancelAll on this exact instance).
+  // Embedded runners omit it and get a per-app default.
+  const activeExecutionRegistry = options.activeExecutionRegistry ?? new ActiveExecutionRegistry()
   /**
    * R3 of docs/nexus/proposals/long-running-context-assembly.md §20:
    * Composition root always resolves a `WorkingSetBroadcaster`. When
@@ -176,6 +197,7 @@ export async function createNexusApp(options: CreateNexusAppOptions): Promise<Fa
     metrics,
     activeExecutionRegistry,
     behaviorMonitor: options.behaviorMonitor,
+    shutdownSignal: options.shutdownSignal,
   })
   registerExecuteHttpRoute(app, executeSharedDeps as ExecuteHttpRouteDeps)
   registerExecuteStreamRoute(app, executeSharedDeps as ExecuteStreamRouteDeps)

@@ -231,7 +231,7 @@ Provider 偏差校准基础已收口：50K JSON schema、10K 中文、长 tool_r
 **守住的边界**：
 - `denyByDefaultTools()` / `allowAllTools()` / `allowlistedTools()` 三个 policy builder 签名未动
 - approval gate 自身完全未动；`permission_request` / `permission_response` / `tool denied` 事件 schema 未改
-- `bbl chat` 与 HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）
+- HTTP API 既有客户端完全 back-compat（不发 `policy` / `allowedTools` 走 server-side 默认 `'strict'` + `denyByDefaultTools()`）；旧 TS TUI `bbl chat` 已于 v0.3.7 移除，不再适用
 - child AgentLoop 仍走 server-startup policy，不被 per-request `policy` / `allowedTools` 影响
 - workspace path safety 仍由 `findWorkspaceEscapeInCommand` 拦截（独立机制）
 - `error.code` 分类口径（`REQUEST_TIMEOUT` / `REQUEST_CANCELLED` / `RUNTIME_AGENT_STEP_ERROR`）未动
@@ -403,7 +403,7 @@ Phase G 后续只保留 focused P2：当前口径见 [memory-governance-plan.md]
 
 Phase B MVP 已收口：`SessionChannel` / `SessionMessage` shared types、MemoryStorage/SQLite persistence、Nexus API create/list/get channel、send/list message、session inbox 与 ack 已落地；`LLMCodingRuntime` 与 `/v1/sessions/:sessionId/context` 会把 unread inbox 注入 bounded non-cacheable `session_inbox` block，并明确标注跨 session 消息是 collaboration context、不是直接用户指令。MVP 仍不实现完整 dreaming、不做 raw transcript sharing、不替代 `AgentScheduler` parent-child lifecycle。
 
-Phase C.1 CLI/TUI 可见化已收口：`NexusClient` 与 embedded client 支持 list/ack session inbox；`bbl sessions inbox <sessionId>` / `bbl sessions ack <sessionId> <messageId>` 提供外部 CLI 入口；`bbl chat` 新增 `/inbox`、`/inbox all`、`/inbox ack <messageId>` slash 入口并在 help/completion 中可发现。展示继续声明跨 session message 只是 collaboration context，需要验证证据后再行动。
+Phase C.1 CLI/TUI 可见化已收口：`NexusClient` 与 embedded client 支持 list/ack session inbox；`bbl sessions inbox <sessionId>` / `bbl sessions ack <sessionId> <messageId>` 提供外部 CLI 入口；`bbl go` 新增 `/inbox`、`/inbox all`、`/inbox ack <messageId>` slash 入口并在 help/completion 中可发现。展示继续声明跨 session message 只是 collaboration context，需要验证证据后再行动。
 
 Phase C.2 AgentScheduler parent-child channel 已收口：`ExploreAgentScheduler` 会为 parent/child session 创建 `parent_child` channel，parent→child 写入 review/validation request，child terminal 时向 parent inbox 写入 handoff/blocked；`agent_job_event` 与 child transcript 查询仍是 lifecycle/source-of-truth。
 
@@ -446,7 +446,7 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 - Phase 5（Session capture + save）— `src/skills/storage.ts`（8 errorCode + 原子写 + 重复检测）+ `POST /v1/skills/save` + 16 测试
 - Phase 6（Model-visible bounded skill tools）— `src/tools/builtin/skillTool.ts`（SkillList / SkillShow / SkillValidate / SkillDraft / SkillSave）+ 13 测试
 
-**累计 84/84 测试通过；typecheck 0 错误。** 规划路径见 [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)；工具三角关系当前口径见 [reference/tool-governance-plan.md](../reference/tool-governance-plan.md)，历史整合索引见 [archive/tool-governance-reference-integration.md](../archive/tool-governance-reference-integration.md)。**不主动开新项**；后续仅在真实 session 暴露 drift 时按 regression-first 重新开项（per §Phase 7）。
+**累计 84/84 测试通过；typecheck 0 错误。** 规划路径见 [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)；工具三角关系当前口径见 [reference/tool-governance-plan.md](../reference/tool-governance-plan.md)，历史整合索引见 [archive/tool-governance-reference-integration.md](../archive/tool-governance-reference-integration.md)。**不主动开新项**；后续仅在真实 session 暴露 drift 时按 regression-first 重新开项（per §Phase 7）。
 
 ### 治理三角闭环 — 2026-06-16 同步
 
@@ -518,7 +518,7 @@ Phase E governed dreaming / auto-memory candidate pipeline 评估已收口为最
 
 ### Phase 2：AskUserQuestion + Skill — Skill 侧已 Closed；AskUserQuestion 0%
 
-- **Skill 侧**（来自 [Skill 治理规划 Phase 6](../proposals/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)）：5 个 model-visible tool 全 Closed — `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`。
+- **Skill 侧**（来自 [Skill 治理规划 Phase 6](../reference/skill-execution-and-automated-normalized-skill-generation-governance-plan.md)）：5 个 model-visible tool 全 Closed — `SkillList` / `SkillShow` / `SkillValidate` / `SkillDraft` / `SkillSave`。
 - **AskUserQuestion** 0%：`src/tools/builtin/askUserQuestion.ts` 不存在；CLI 端 `@inquirer/prompts` 通道接入点、Go TUI `AskUserQuestionDialog` 都未做。
 - 依赖：Go TUI 端 `AskUserQuestionDialog` 必须等 [go-tui-history.md](../history/go-tui-history.md) Closed；当前 Phase 0-5c' 推进中，**未**Closed。
 - 实施**前**验证：必须有 session log 中"模型需要澄清问题但被迫写临时文件"的 regression 引用。

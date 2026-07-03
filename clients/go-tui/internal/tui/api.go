@@ -360,6 +360,150 @@ func fetchToolAudit(cfg Config, trigger string) tea.Cmd {
 	}
 }
 
+// fetchSkillList hits GET /v1/skills. The Go TUI only reads
+// the top-level stable fields it renders (see skillsListResponse
+// in tui.go); the full payload stays in skillListMsg.raw so
+// upstream schema churn cannot break the client.
+func fetchSkillList(cfg Config) tea.Cmd {
+	return func() tea.Msg {
+		raw, err := nexusRawJSON(
+			cfg,
+			http.MethodGet,
+			"/v1/skills",
+			nil,
+		)
+		out := skillListMsg{raw: raw, err: err}
+		if err == nil {
+			if decodeErr := json.Unmarshal(raw, &out.env); decodeErr != nil {
+				out.err = fmt.Errorf("decode skill list: %w", decodeErr)
+			}
+		}
+		return out
+	}
+}
+
+// fetchSkillShow hits GET /v1/skills/:id. The id is also
+// threaded into the returned msg so the Update handler can
+// surface SKILL_NOT_FOUND with the exact id the operator
+// typed (e.g. "skill show foo: SKILL_NOT_FOUND — …").
+//
+// Why this does NOT use nexusRawJSON: Nexus returns HTTP 404
+// with a typed `{ok:false, errorCode:"SKILL_NOT_FOUND", ...}`
+// body for missing skills (skillReadRouter handler). The
+// generic nexusRawJSON treats any 4xx as a transport error
+// and discards the body, which would surface SKILL_NOT_FOUND
+// as an opaque "404 Not Found" with no errorCode. So we
+// short-circuit the read here: always read the body, try to
+// decode the typed envelope, and only fall back to the
+// transport error if the body is not a typed error envelope
+// (e.g. a true network failure or an upstream 5xx without a
+// JSON body).
+func fetchSkillShow(cfg Config, id string) tea.Cmd {
+	return func() tea.Msg {
+		path := "/v1/skills/" + url.PathEscape(id)
+		raw, statusCode, transportErr := nexusRawJSONWithStatus(cfg, http.MethodGet, path, nil)
+		out := skillShowMsg{raw: raw, id: id}
+		if transportErr != nil {
+			out.err = transportErr
+			return out
+		}
+		if decodeErr := json.Unmarshal(raw, &out.env); decodeErr != nil {
+			out.err = fmt.Errorf("decode skill show: %w (status=%d)", decodeErr, statusCode)
+			return out
+		}
+		// Body decoded. If upstream used 4xx/5xx but the
+		// envelope is well-formed, surface the typed error
+		// rather than leaving env.OK at the default zero
+		// value (true) — the model Update handler reads
+		// env.OK + env.ErrorCode to decide whether to open
+		// the overlay.
+		if statusCode >= 400 && !out.env.OK {
+			return out
+		}
+		if statusCode >= 400 && out.env.OK {
+			// Body decoded as ok=true but status is 4xx;
+			// treat as transport error to avoid opening the
+			// overlay on garbage.
+			out.err = fmt.Errorf("skill show returned %d with ok=true body", statusCode)
+		}
+		return out
+	}
+}
+
+// fetchSkillValidate hits POST /v1/skills/validate with an
+// id-only body (the plan-P3 [id] mode). Raw-body validation
+// is intentionally not exposed in the Go TUI slash palette
+// for the first cut — see the deferred-to-follow-up note on
+// modeSkillListOverlay in tui.go.
+//
+// Same reason as fetchSkillShow: we use the status-aware
+// helper so 4xx with a typed `{ok:false, ...}` envelope
+// (which the validate handler may emit for SKILL_NOT_FOUND)
+// surfaces a structured errorCode instead of an opaque
+// "400 Bad Request" string.
+func fetchSkillValidate(cfg Config, id string) tea.Cmd {
+	return func() tea.Msg {
+		body := map[string]any{"id": id}
+		raw, statusCode, transportErr := nexusRawJSONWithStatus(cfg, http.MethodPost, "/v1/skills/validate", body)
+		out := skillValidateMsg{raw: raw, id: id}
+		if transportErr != nil {
+			out.err = transportErr
+			return out
+		}
+		if decodeErr := json.Unmarshal(raw, &out.env); decodeErr != nil {
+			out.err = fmt.Errorf("decode skill validate: %w (status=%d)", decodeErr, statusCode)
+			return out
+		}
+		if statusCode >= 400 && !out.env.OK {
+			return out
+		}
+		return out
+	}
+}
+
+// nexusRawJSONWithStatus is nexusRawJSON's sibling that also
+// returns the HTTP status code. It is used by callers that
+// need to honor upstream 4xx envelopes (skill show /
+// validate). All other call sites keep using nexusRawJSON to
+// preserve the "4xx == transport error" contract that the
+// rest of the Go TUI relies on.
+func nexusRawJSONWithStatus(cfg Config, method string, path string, body any) ([]byte, int, error) {
+	endpoint, err := apiURL(cfg.BaseURL, path)
+	if err != nil {
+		return nil, 0, err
+	}
+	var reader io.Reader
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			return nil, 0, err
+		}
+		reader = bytes.NewReader(data)
+	}
+	req, err := http.NewRequest(method, endpoint, reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if cfg.APIKey != "" {
+		req.Header.Set("X-Nexus-API-Key", cfg.APIKey)
+	}
+	client := http.Client{Timeout: 10 * time.Second}
+	res, err := client.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(res.Body, 1<<20))
+	if err != nil {
+		return nil, res.StatusCode, err
+	}
+	return data, res.StatusCode, nil
+}
+
 func nexusJSON(cfg Config, method string, path string, body any, out any, query ...url.Values) error {
 	endpoint, err := apiURL(cfg.BaseURL, path)
 	if err != nil {

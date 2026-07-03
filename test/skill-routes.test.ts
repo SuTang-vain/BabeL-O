@@ -287,3 +287,234 @@ test('POST /v1/skills/invoke returns SKILL_NOT_FOUND for unknown id', async () =
     await fs.rm(cwd, { recursive: true, force: true })
   }
 })
+
+test('POST /v1/skills/import/preview previews an Agent Skills package without persisting it', async () => {
+  const cwd = path.join(os.tmpdir(), `babel-o-skill-routes-import-${Date.now()}`)
+  const builtInDir = path.join(cwd, 'built-in')
+  const sourcePackageDir = path.join(cwd, 'external-skills', 'context-debugging')
+  await fs.mkdir(builtInDir, { recursive: true })
+  await fs.mkdir(path.join(sourcePackageDir, 'references'), { recursive: true })
+  await fs.writeFile(
+    path.join(sourcePackageDir, 'SKILL.md'),
+    `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    triggers:
+      - context assembly
+---
+# Purpose
+Debug context issues.`,
+  )
+  await fs.writeFile(path.join(sourcePackageDir, 'references', 'flow.md'), '# Flow')
+
+  const app = await buildAppWithCwd(cwd)
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/import/preview',
+      payload: {
+        cwd,
+        builtInDir,
+        sourcePath: sourcePackageDir,
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.previewOnly, true)
+    assert.equal(body.skill.id, 'context-debugging')
+    assert.equal(body.conversion.sourceFormat, 'agent-skills-v1')
+    assert.equal(body.resources[0].path, 'references/flow.md')
+    assert.equal(body.targetPath, path.join(cwd, '.babel-o', 'skills', 'context-debugging'))
+    await assert.rejects(fs.access(path.join(cwd, '.babel-o', 'skills', 'context-debugging')))
+  } finally {
+    await app.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('POST /v1/skills/import/install requires confirm before persisting an Agent Skills package', async () => {
+  const cwd = path.join(os.tmpdir(), `babel-o-skill-routes-import-install-${Date.now()}`)
+  const builtInDir = path.join(cwd, 'built-in')
+  const sourcePackageDir = path.join(cwd, 'external-skills', 'context-debugging')
+  await fs.mkdir(builtInDir, { recursive: true })
+  await fs.mkdir(path.join(sourcePackageDir, 'references'), { recursive: true })
+  await fs.writeFile(
+    path.join(sourcePackageDir, 'SKILL.md'),
+    `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+metadata:
+  babel-o:
+    triggers:
+      - context assembly
+---
+# Purpose
+Debug context issues.`,
+  )
+  await fs.writeFile(path.join(sourcePackageDir, 'references', 'flow.md'), '# Flow')
+
+  const app = await buildAppWithCwd(cwd)
+  try {
+    const previewResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/import/install',
+      payload: {
+        cwd,
+        builtInDir,
+        sourcePath: sourcePackageDir,
+        confirm: false,
+      },
+    })
+    assert.equal(previewResponse.statusCode, 422)
+    const previewBody = previewResponse.json()
+    assert.equal(previewBody.ok, false)
+    assert.equal(previewBody.errorCode, 'SKILL_IMPORT_NOT_CONFIRMED')
+    await assert.rejects(fs.access(path.join(cwd, '.babel-o', 'skills', 'context-debugging')))
+
+    const installResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/import/install',
+      payload: {
+        cwd,
+        builtInDir,
+        sourcePath: sourcePackageDir,
+        confirm: true,
+      },
+    })
+    assert.equal(installResponse.statusCode, 200)
+    const installBody = installResponse.json()
+    assert.equal(installBody.ok, true)
+    assert.equal(installBody.skillId, 'context-debugging')
+    assert.equal(installBody.format, 'new')
+    const manifest = await fs.readFile(path.join(cwd, '.babel-o', 'skills', 'context-debugging', 'SKILL.md'), 'utf-8')
+    assert.match(manifest, /name: context-debugging/)
+    const reference = await fs.readFile(path.join(cwd, '.babel-o', 'skills', 'context-debugging', 'references', 'flow.md'), 'utf-8')
+    assert.equal(reference, '# Flow')
+  } finally {
+    await app.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('POST /v1/skills/export/preview previews an Agent Skills package without persisting it', async () => {
+  const cwd = path.join(os.tmpdir(), `babel-o-skill-routes-export-${Date.now()}`)
+  const builtInDir = path.join(cwd, 'built-in')
+  const projectSkillsDir = path.join(cwd, '.babel-o', 'skills')
+  await fs.mkdir(builtInDir, { recursive: true })
+  await fs.mkdir(projectSkillsDir, { recursive: true })
+  await fs.writeFile(
+    path.join(projectSkillsDir, 'context-debugging.md'),
+    `---
+id: context-debugging
+name: Context Debugging
+description: Debug context assembly and tool suppression issues.
+triggers: [context assembly]
+priority: 80
+risk: read
+allowedTools: [Read, Grep]
+---
+# Purpose
+Debug context issues.`,
+  )
+
+  const app = await buildAppWithCwd(cwd)
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/export/preview',
+      payload: {
+        cwd,
+        builtInDir,
+        id: 'context-debugging',
+        targetDir: 'exports',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.ok, true)
+    assert.equal(body.previewOnly, true)
+    assert.equal(body.packageRoot, path.join(cwd, 'exports', 'context-debugging'))
+    assert.match(body.manifest, /name: context-debugging/)
+    assert.match(body.manifest, /metadata:\n  babel-o:/)
+    await assert.rejects(fs.access(path.join(cwd, 'exports', 'context-debugging')))
+  } finally {
+    await app.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('POST /v1/skills/export/write requires confirm before persisting an Agent Skills package', async () => {
+  const cwd = path.join(os.tmpdir(), `babel-o-skill-routes-export-write-${Date.now()}`)
+  const builtInDir = path.join(cwd, 'built-in')
+  const projectSkillsDir = path.join(cwd, '.babel-o', 'skills')
+  await fs.mkdir(builtInDir, { recursive: true })
+  await fs.mkdir(projectSkillsDir, { recursive: true })
+  const packageDir = path.join(projectSkillsDir, 'context-debugging')
+  await fs.mkdir(path.join(packageDir, 'references'), { recursive: true })
+  await fs.writeFile(
+    path.join(packageDir, 'SKILL.md'),
+    `---
+name: context-debugging
+description: Debug context assembly and tool suppression issues.
+allowed-tools: Read Grep
+metadata:
+  babel-o:
+    displayName: Context Debugging
+    triggers:
+      - context assembly
+    priority: 80
+    risk: read
+---
+# Purpose
+Debug context issues.`,
+  )
+  await fs.writeFile(path.join(packageDir, 'references', 'flow.md'), '# Flow')
+
+  const app = await buildAppWithCwd(cwd)
+  try {
+    const previewResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/export/write',
+      payload: {
+        cwd,
+        builtInDir,
+        id: 'context-debugging',
+        targetDir: 'exports',
+        confirm: false,
+      },
+    })
+    assert.equal(previewResponse.statusCode, 422)
+    const previewBody = previewResponse.json()
+    assert.equal(previewBody.ok, false)
+    assert.equal(previewBody.errorCode, 'SKILL_EXPORT_NOT_CONFIRMED')
+    await assert.rejects(fs.access(path.join(cwd, 'exports', 'context-debugging')))
+
+    const writeResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/skills/export/write',
+      payload: {
+        cwd,
+        builtInDir,
+        id: 'context-debugging',
+        targetDir: 'exports',
+        confirm: true,
+      },
+    })
+    assert.equal(writeResponse.statusCode, 200)
+    const writeBody = writeResponse.json()
+    assert.equal(writeBody.ok, true)
+    assert.equal(writeBody.format, 'new')
+    const manifest = await fs.readFile(path.join(cwd, 'exports', 'context-debugging', 'SKILL.md'), 'utf-8')
+    assert.match(manifest, /name: context-debugging/)
+    assert.match(manifest, /metadata:\n  babel-o:/)
+    const reference = await fs.readFile(path.join(cwd, 'exports', 'context-debugging', 'references', 'flow.md'), 'utf-8')
+    assert.equal(reference, '# Flow')
+  } finally {
+    await app.close()
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})

@@ -70,7 +70,10 @@ export function validateSkill(raw: RawSkill): SkillValidationResult {
   // Phase 4 explicitOnly drafts ship with empty triggers; the validator
   // must not reject them so long as `status` is not 'active'.
   const rawStatus = typeof raw.status === 'string' ? raw.status : 'active'
-  if ((!Array.isArray(raw.triggers) || raw.triggers.length === 0) && rawStatus === 'active') {
+  const canUseDescriptionForDiscovery = raw.sourceFormat === 'agent-skills-v1' &&
+    typeof raw.description === 'string' &&
+    raw.description.trim().length > 0
+  if ((!Array.isArray(raw.triggers) || raw.triggers.length === 0) && rawStatus === 'active' && !canUseDescriptionForDiscovery) {
     diagnostics.push({
       severity: 'error',
       code: 'SKILL_TRIGGERS_EMPTY',

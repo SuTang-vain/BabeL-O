@@ -87,7 +87,7 @@ The postinstall script should:
 - Set `BABEL_O_GO_TUI_PACKAGE_BINARY` or write the binary to the path already searched by `bbl go`.
 - Fail with a clear message when the platform has no prebuilt asset.
 
-This keeps `bbl run`, `bbl chat`, and `bbl go` running through normal Node, avoiding SEA-specific runtime behavior for npm users.
+This keeps `bbl run` and `bbl go` running through normal Node, avoiding SEA-specific runtime behavior for npm users.
 
 ## Long-Term Go Launcher
 

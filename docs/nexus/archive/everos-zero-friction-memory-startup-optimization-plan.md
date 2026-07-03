@@ -585,7 +585,7 @@ This feature is complete when:
 ## Related Docs
 
 - [EverOS First-Run Onboarding Optimization Plan](./everos-first-run-onboarding-optimization-plan.md) — implemented; this plan is the next layer.
-- [FAQ](../FAQ.md) — Q4 will be updated to mention background bootstrap and `AUTO_BOOTSTRAP` once this plan lands.
+- [FAQ](../../guides/FAQ.md) — Q4 will be updated to mention background bootstrap and `AUTO_BOOTSTRAP` once this plan lands.
 - [TODO Product / UX 30-Day Lift](../active/TODO_product_30day.md) — W2.5 already shipped; W2.4 (`bbl init`) is the next wizard step; this plan covers the "no-op" UX between W2.5 and W2.4.
 - [Memory Capability Awareness and Self-Trigger Plan](./memory-capability-awareness-and-trigger-plan.md) — the capability policy stays unchanged; only the bootstrap path becomes less intrusive.
 - [EverCore Lifecycle, Cache and Answer Governance Plan](./evercore-lifecycle-cache-and-answer-governance-plan.md) — the runtime lease + idle TTL are reused by the new background worker.

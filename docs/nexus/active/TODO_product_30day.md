@@ -44,10 +44,10 @@
 - **收口**:路人测试 5 个非维护者用户,4 个能在 30 秒内复述 3 个 bullet 之一。
 
 ### W1.2 README 5 分钟快速开始[P0]
-- **现状**:"CLI Usage Guide" 第一行 `bbl chat` 然后呢?没有"我从这复制粘贴 5 行,就能看到效果"。
+- **现状**:"CLI Usage Guide" 第一行 `bbl go` 然后呢?没有"我从这复制粘贴 5 行,就能看到效果"。
 - **改动**:
   - 新增 `## Quick Start (5 minutes)` 段,**只有一种推荐路径**(npm/pnpm global install),不再展示 3 种安装方法并列。
-  - 内容:`npm i -g babel-o` → `bbl init my-app` → `bbl chat` → 跑一个内置 demo prompt(如 "explain this repo's entry point")。
+  - 内容:`npm i -g babel-o` → `bbl init my-app` → `bbl go` → 跑一个内置 demo prompt(如 "explain this repo's entry point")。
   - 顶部加 ⚠️ 框:"如果你的 Node < 22,先升级;详细安装备选见 `docs/INSTALLATION.md`。"
 - **产物**:`README.md` 中英双版 + 新文件 `docs/INSTALLATION.md`(把当前 3 种安装方法从 README 搬过去,作为兜底)。
 - **收口**:`bbl init` 命令可被零基础用户复现到第一次成功提示。
@@ -55,7 +55,7 @@
 ### W1.3 首页 demo gif / 截图[P0]
 - **现状**:`docs/assets/` 只有两个 logo,0 张产品截图。
 - **改动**:
-  - 录 30-45 秒的 `bbl chat` 跑通"读本地文件 + 改 + 跑测试"全流程屏录,转 gif(目标 < 8MB),放 README 顶部。
+  - 录 30-45 秒的 `bbl go` 跑通"读本地文件 + 改 + 跑测试"全流程屏录,转 gif(目标 < 8MB),放 README 顶部。
   - 录同样流程的 `bbl go` 版,放 README 末"Want a lighter client? Try `bbl go`"段。
   - gif 上加 3 行字幕标注关键步骤,不要裸屏录。
 - **产物**:`docs/assets/quickstart-bbl-chat.gif` + `docs/assets/quickstart-bbl-go.gif`,README 引用。
@@ -121,7 +121,7 @@
     3. 选 default model(根据 provider 动态拉可用列表)。
     4. 选 working dir(默认 cwd,可改)。
     5. 写一条 smoke prompt 自检(如 "echo hello from babel-o")。
-  - 全部走现有 `bbl chat` 的 readline,不需要新 UI。
+  - 全部走现有 CLI 交互,不需要新 UI。
   - `--non-interactive --provider anthropic --model claude-3-5-sonnet-latest` 走 CI/脚本。
 - **产物**:`src/cli/commands/init.ts` + wizard 模块 + `test/init.test.ts` + README Quick Start 段引用。
 - **收口**:`bbl init` 在 4 个平台零配置跑通;非交互模式 0 提问直接完成。
@@ -190,7 +190,7 @@
   - 新增 `CONTRIBUTING.md`,覆盖:
     - 仓库布局 + 模块边界(把 `docs/nexus/README.md` 摘要搬过去)。
     - 本地开发流程(`npm i` / `npm test` / `npm run smoke` / `npm run build`)。
-    - PR 模板(checklist:测试 / changelog / 文档同步 / 行为不破坏 `bbl chat` 默认路径)。
+    - PR 模板(checklist:测试 / changelog / 文档同步 / 行为不破坏 `bbl go` 默认路径)。
     - Issue 模板(bug / feature / docs / question 四种)。
     - 决策机制(谁来 merge / 什么是 RFC / 怎么升级 Phase)。
   - 新增 `GOVERNANCE.md`(简短):维护者名单 + 决策权 + bus factor 当前值(诚实标注) + 招募 maintainer 的明确渠道。
@@ -218,15 +218,14 @@
 - **产物**:`docs/releases/README.md` 重写 + `bbl` 启动 banner + `bbl changelog` 命令 + release 流程文档化。
 - **收口**:连续 2 个 minor 版本升级引导有数据(看 banner 展示 → release notes 点击率)。
 
-### W4.4 `bbl chat` vs `bbl go` 选型指南[P1]
+### W4.4 `bbl go` 客户端指南[P1]
+
+> v0.3.7 已移除旧 TS TUI `bbl chat`，`bbl go` 为唯一生产交互入口；原"`bbl chat` vs `bbl go` 选型"已无意义，本节改为单一客户端指南。
 - **现状**:`PHASE_9_DECISION` 是给开发者读的决策记录,用户不知道该用哪个。
 - **改动**:
-  - 新增 `docs/CLIENTS.md`,给用户讲人话:
-    - "我是大多数用户 → `bbl chat`(TypeScript TUI,功能最全,默认)"
-    - "我想要轻客户端 / 容器部署 / 远程连 Nexus → `bbl go`(Go TUI, ~10MB)"
-    - "我想在终端之外用(未来)→ 关注 roadmap"
-  - 表格对比:启动速度 / 内存占用 / 功能完整度 / 平台 / 安装方式。
-  - `bbl go --help` description 改成 "stable alternative to `bbl chat`;run `bbl docs clients` for guidance",并真的接入 `bbl docs` 子命令(可列出 `docs/*.md` 的精简目录)。
+  - 新增 `docs/CLIENTS.md`,给用户讲人话:`bbl go`(Go TUI,portable 包复用系统 Node >= 22)是唯一生产交互入口,`bbl run` 用于一次性自动化;未来终端外使用关注 roadmap。
+  - 表格说明:启动方式 / 内存占用 / 功能完整度 / 平台 / 安装方式(portable 包 + npm global + 源码)。
+  - `bbl go --help` description 改成 "Launch the Go TUI client (production interactive entrypoint; run `bbl docs clients` for guidance)",并真的接入 `bbl docs` 子命令(可列出 `docs/*.md` 的精简目录)。
 - **产物**:`docs/CLIENTS.md` + `bbl docs` 子命令 + `bbl go --help` 文案更新 + Phase 9 decision 已落地的 action item 收口。
 - **收口**:路人问卷"你刚装好,会选哪个",8/10 答对。
 

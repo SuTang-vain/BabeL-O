@@ -41,6 +41,7 @@ import { buildRuntimeExecuteOptions } from './executionRuntimeOptions.js'
 import type { NexusMetrics } from './metrics.js'
 import type { ExecutionGate } from './executionGate.js'
 import type { ActiveExecutionRegistry, ActiveExecutionLease } from './activeExecutionRegistry.js'
+import type { ShutdownSignal } from './daemonLifecycle.js'
 
 export type ExecuteHttpRouteDeps = {
   runtime: NexusRuntime
@@ -55,6 +56,8 @@ export type ExecuteHttpRouteDeps = {
   metrics: NexusMetrics
   activeExecutionRegistry: ActiveExecutionRegistry
   behaviorMonitor?: BehaviorMonitor
+  /** Daemon graceful-shutdown flag (Phase 1 of the daemon shutdown plan). */
+  shutdownSignal?: ShutdownSignal
 }
 
 /**
@@ -64,6 +67,15 @@ export type ExecuteHttpRouteDeps = {
  */
 export function registerExecuteHttpRoute(app: FastifyInstance, deps: ExecuteHttpRouteDeps): void {
   app.post('/v1/execute', async (request: FastifyRequest, reply: FastifyReply) => {
+    // Daemon graceful shutdown (Phase 1 of daemon shutdown plan): reject
+    // new leases once shutdown has begun, in the canonical error envelope.
+    if (deps.shutdownSignal?.isShuttingDown) {
+      return reply.code(503).send({
+        type: 'error',
+        code: 'SHUTTING_DOWN',
+        message: 'Nexus daemon is shutting down. Retry against the next instance.',
+      })
+    }
     const releaseExecution = deps.executionGate.tryAcquire()
     if (!releaseExecution) {
       deps.metrics.recordExecuteRejected()

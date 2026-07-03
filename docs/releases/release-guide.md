@@ -228,5 +228,5 @@ If `bbl go --check` passes but `bbl go` fails:
 - [Changelog](../../CHANGELOG.md)
 - [Release index](README.md)
 - [Release confidence checklist](release-confidence.md)
-- [Distribution guide](../nexus/reference/distribution-guide.md)
+- [Distribution guide](../guides/distribution-guide.md)
 - [Distribution strategy](../nexus/reference/distribution-strategy-plan.md)

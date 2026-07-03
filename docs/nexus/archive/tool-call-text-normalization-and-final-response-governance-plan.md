@@ -5,7 +5,7 @@
 > Status: Proposed, regression-backed by `session_ee116547-6545-4f70-bc7c-b1b287387cda` on 2026-06-17.
 > Priority: P1 because it can produce user-visible fake tool calls and false completion.
 > Scope: provider text-stream normalization, DSML / pseudo tool-call detection, final-response-only mode, runtime-owned tool execution boundaries.
-> Related plans: [tool-governance-reference-integration.md](./tool-governance-reference-integration.md), [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../proposals/intent-guidance-and-prompt-governance-optimization-plan.md).
+> Related plans: [tool-governance-reference-integration.md](./tool-governance-reference-integration.md), [tool-granularity-and-evidence-governance-plan.md](./tool-granularity-and-evidence-governance-plan.md), [evidence-and-runtime-history.md](../history/evidence-and-runtime-history.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md).
 
 ## 1. Background
 

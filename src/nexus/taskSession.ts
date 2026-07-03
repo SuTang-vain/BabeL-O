@@ -23,6 +23,7 @@ const TERMINAL_SESSION_PHASES = new Set<SessionPhase>([
   'completed',
   'failed',
   'cancelled',
+  'interrupted',
 ])
 const TERMINAL_SESSION_TTL_MS = 24 * 60 * 60 * 1000
 const TERMINAL_SESSION_SWEEP_INTERVAL_MS = 60 * 60 * 1000

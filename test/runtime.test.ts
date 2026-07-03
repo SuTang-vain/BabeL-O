@@ -1000,7 +1000,10 @@ test('runtime pipeline builds provider loop state and execution state blocks', (
   assert.equal(loopState.turnContextCharsIn, 23)
   assert.match(loopState.executionStateBlock, /iteration 23\/25/)
   assert.match(loopState.executionStateBlock, /Files read: \/tmp\/a\.txt/)
-  assert.match(loopState.executionStateBlock, /Phase: must_respond/)
+  // remaining=2 ≤ reserve(3) AND finalCheckUsed defaults to false → final_check
+  // (one bounded read-only check before must_respond). See runtime-tool-loop-
+  // governance-plan.md Phase D.
+  assert.match(loopState.executionStateBlock, /Phase: final_check/)
 
   const synthesizeBlock = buildRuntimeExecutionStateBlock({
     loopCount: 4,
@@ -1013,6 +1016,128 @@ test('runtime pipeline builds provider loop state and execution state blocks', (
   })
   assert.match(synthesizeBlock, /Phase: synthesize/)
   assert.match(synthesizeBlock, /Present your findings now/)
+})
+
+test('runtime pipeline final_check phase narrows visible tools to read-only when !finalCheckUsed', () => {
+  // See docs/nexus/reference/runtime-tool-loop-governance-plan.md Phase D.
+  const currentToolsList = [
+    { name: 'Read', description: 'read', inputSchema: { type: 'object' } },
+    { name: 'Grep', description: 'grep', inputSchema: { type: 'object' } },
+    { name: 'Glob', description: 'glob', inputSchema: { type: 'object' } },
+    { name: 'ListDir', description: 'listdir', inputSchema: { type: 'object' } },
+    { name: 'Write', description: 'write', inputSchema: { type: 'object' } },
+    { name: 'Edit', description: 'edit', inputSchema: { type: 'object' } },
+    { name: 'Bash', description: 'bash', inputSchema: { type: 'object' } },
+  ]
+  const requestState = buildProviderLoopRequestState({
+    loopCount: 23,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    systemPrompt: 'system',
+    messages: [],
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    finalResponseOnlyRemainingLoops: 3,
+    finalCheckUsed: false,
+  })
+  assert.equal(requestState.finalResponseOnlyMode, true)
+  assert.equal(requestState.finalCheckPhase, true)
+  assert.deepEqual(requestState.modelVisibleTools.map((t: any) => t.name), ['Read', 'Grep', 'Glob', 'ListDir'])
+  assert.match(requestState.executionStateBlock, /Phase: final_check/)
+})
+
+test('runtime pipeline final_check phase: finalCheckUsed=true falls through to must_respond', () => {
+  const currentToolsList = [{ name: 'Read', description: 'r', inputSchema: { type: 'object' } }]
+  const requestState = buildProviderLoopRequestState({
+    loopCount: 23,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    systemPrompt: 'system',
+    messages: [],
+    currentToolsList,
+    contextMaxTokens: 10_000,
+    warningPercent: 70,
+    compactPercent: 85,
+    suppressToolsForUserIntent: false,
+    finalResponseOnlyRemainingLoops: 3,
+    finalCheckUsed: true,
+  })
+  assert.equal(requestState.finalResponseOnlyMode, true)
+  assert.equal(requestState.finalCheckPhase, false)
+  assert.deepEqual(requestState.modelVisibleTools, [])
+  assert.match(requestState.executionStateBlock, /Phase: must_respond/)
+})
+
+test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL_DENIED_FINAL_CHECK', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-final-check-deny',
+    turn: {
+      assistantText: '',
+      reasoningText: '',
+      toolCalls: [{ id: 't1', name: 'Write', partialInput: '{}' }],
+    },
+    finalResponseOnlyMode: true,
+    finalCheckPhase: true,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+  assert.equal(outcome.kind, 'continue')
+  const err = outcome.eventsBeforeMessages[0] as any
+  assert.equal(err?.code, 'TOOL_DENIED_FINAL_CHECK')
+})
+
+test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass through', () => {
+  const outcome = reduceProviderTurnOutcome({
+    sessionId: 'session-final-check-allow',
+    turn: {
+      assistantText: 'let me re-read',
+      reasoningText: '',
+      toolCalls: [{ id: 't1', name: 'Read', partialInput: '{"path":"a.txt"}' }],
+    },
+    finalResponseOnlyMode: true,
+    finalCheckPhase: true,
+    suppressToolsForUserIntent: false,
+    userIntentGuidance: baseRuntimeUserIntentGuidance,
+    maxTokenRecoveryCount: 0,
+    maxTokenRecoveries: 3,
+    outputRetryCount: 0,
+    maxOutputRetries: 2,
+    suppressedToolRetryCount: 0,
+    maxSuppressedToolRetries: 1,
+  })
+  assert.equal(outcome.kind, 'tool_calls')
+  assert.equal(outcome.toolCalls.length, 1)
+})
+
+test('buildRuntimeExecutionStateBlock surfaces repeated tool input evidence', () => {
+  const block = buildRuntimeExecutionStateBlock({
+    loopCount: 12,
+    maxLoops: 25,
+    readFileCache: new Map(),
+    toolCallCount: 12,
+    contextTokenEstimate: 5_000,
+    contextMaxTokens: 10_000,
+    finalResponseOnlyRemainingLoops: 3,
+    repeatedToolInputs: [{
+      name: 'Bash',
+      inputPreview: 'npx tsx --test test/mcp.test.ts',
+      count: 3,
+      latestTimestamp: '2026-07-02T02:15:55.000Z',
+    }],
+  })
+  assert.match(block, /Phase: synthesize/)
+  assert.match(block, /Repeated tool inputs: Bash .+ ×3/)
 })
 
 test('runtime pipeline builds provider loop request state and query params', () => {
@@ -3668,6 +3793,7 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
     },
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     providerSettings: {
       providerId: 'openai',
       modelId: 'openai/gpt-4o',
@@ -3707,17 +3833,51 @@ test('EverCore managed mode starts local sidecar and exposes diagnostics', async
   assert.equal(configured.status.sidecar?.dataDir, dataDir)
   assert.equal(configured.status.sidecar?.pid, 12345)
   assert.equal(spawnCalls[0]?.command, 'everos-test')
-  assert.deepEqual(spawnCalls[0]?.args, ['server', 'start', '--host', '127.0.0.1', '--port', '9876'])
+  assert.deepEqual(spawnCalls[0]?.args, ['server', 'start', '--root', dataDir, '--host', '127.0.0.1', '--port', '9876'])
   assert.equal(spawnCalls[0]?.env.EVEROS_MEMORY__ROOT, dataDir)
+  assert.equal(spawnCalls[0]?.env.EVEROS_ROOT, dataDir)
   assert.equal(spawnCalls[0]?.env.EVEROS_API__HOST, '127.0.0.1')
   assert.equal(spawnCalls[0]?.env.EVEROS_API__PORT, '9876')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__PROTOCOL, 'openai-compatible')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__API_KEY, 'openai-key')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__BASE_URL, 'https://api.openai.example/v1')
   assert.equal(spawnCalls[0]?.env.EVEROS_LLM__MODEL, 'gpt-4o')
+  // Embedding is opt-in: with no managedEmbedding* set, the spawn env must
+  // not carry EVEROS_EMBEDDING__* (EverOS would otherwise try to use it).
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__MODEL, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__API_KEY, undefined)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__BASE_URL, undefined)
 
   await configured.dispose?.()
   assert.equal(killed, true)
+})
+
+test('EverCore managed mode passes embedding config through as EVEROS_EMBEDDING__* env', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-embedding`)
+  const spawnCalls: Array<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> = []
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9886,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
+    managedEmbeddingModel: 'bge-m3',
+    managedEmbeddingApiKey: 'ollama',
+    managedEmbeddingBaseUrl: 'http://localhost:11434/v1',
+    managedSpawn(command, args, options) {
+      spawnCalls.push({ command, args, env: options.env })
+      return { pid: 12399, killed: false, kill() { return true }, once() {} }
+    },
+    fetch: async () => new Response(JSON.stringify({ status: 'ok' }), { status: 200 }),
+  })
+  assert.equal(configured.status.healthy, true)
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__MODEL, 'bge-m3')
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__API_KEY, 'ollama')
+  assert.equal(spawnCalls[0]?.env.EVEROS_EMBEDDING__BASE_URL, 'http://localhost:11434/v1')
+  await configured.dispose?.()
 })
 
 test('EverCore managed mode writes registry and reuses healthy sidecar', async () => {
@@ -3732,6 +3892,7 @@ test('EverCore managed mode writes registry and reuses healthy sidecar', async (
     managedPortAllocator: async () => 9911,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedSpawn(command) {
       spawnCalls.push(command)
       return {
@@ -3808,6 +3969,7 @@ test('EverCore managed mode treats stale registry as diagnostics and starts a fr
     managedPortAllocator: async () => 9913,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedSpawn(_command, _args, options) {
       spawnPorts.push(String(options.env.EVEROS_API__PORT))
       return {
@@ -3849,6 +4011,7 @@ test('EverCore managed mode auto-maps Anthropic-compatible provider settings', a
     managedPort: 9877,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     providerSettings: {
       providerId: 'minimax',
       modelId: 'minimax/MiniMax-M3',
@@ -3887,6 +4050,7 @@ test('EverCore managed mode uses explicit LLM override for sidecar env', async (
     managedPort: 9878,
     managedStartupTimeoutMs: 100,
     managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
     managedLlmProtocol: 'openai-compatible',
     managedLlmApiKey: 'evercore-key',
     managedLlmBaseUrl: 'https://openai-compatible.example/v1',
@@ -3941,6 +4105,77 @@ test('EverCore managed mode rejects non-loopback hosts without starting sidecar'
   assert.equal(configured.status.healthy, false)
   assert.equal(configured.status.errorCode, 'EVERCORE_MANAGED_HOST_NOT_LOCAL')
   assert.equal(configured.status.sidecar?.healthy, false)
+})
+
+test('EverCore managed mode classifies sidecar stderr into typed lastStartupError', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-cascade`)
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9890,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 0, stderr: '' }),
+    managedSpawn() {
+      const dataListeners: Array<(chunk: Buffer) => void> = []
+      return {
+        pid: 77000,
+        killed: false,
+        kill() {
+          return true
+        },
+        stderr: {
+          on(_event: string, listener: (chunk: Buffer) => void) {
+            dataListeners.push(listener)
+          },
+        },
+        once(event: string, listener: (...args: unknown[]) => void) {
+          if (event === 'close') {
+            // Emit the embedding-cascade stderr, then exit code=1 — mirroring
+            // the real everos lifespan failure captured on 2026-07-01.
+            setTimeout(() => {
+              for (const l of dataListeners) {
+                l(Buffer.from('ValueError: Embedding model is not configured (set EVEROS_EMBEDDING__MODEL or [embedding] model in user toml)'))
+              }
+              listener(1, null)
+            }, 0)
+          }
+        },
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      } as any
+    },
+    fetch: async () => new Response('', { status: 503 }),
+  })
+
+  assert.equal(configured.status.healthy, false)
+  assert.equal(configured.status.sidecar?.lastStartupError?.errorCode, 'EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED')
+  assert.match(configured.status.sidecar?.lastStartupError?.errorMessage ?? '', /Embedding model is not configured/)
+  await configured.dispose?.()
+})
+
+test('EverCore managed mode reports EVERCORE_MANAGED_INIT_NOT_RUN when everos init fails', async () => {
+  const dataDir = join(tmpdir(), `babel-o-test-${Date.now()}-evercore-init-fail`)
+  const configured = await configureEverCore({
+    mode: 'managed',
+    managedCommand: 'everos-test',
+    managedHost: '127.0.0.1',
+    managedDataDir: dataDir,
+    managedPortAllocator: async () => 9891,
+    managedStartupTimeoutMs: 100,
+    managedHealthIntervalMs: 1,
+    managedInitRun: () => ({ code: 1, stderr: 'Error: everos init failed: permission denied' }),
+    managedSpawn() {
+      throw new Error('server start should not run when init fails')
+    },
+    fetch: async () => new Response('', { status: 503 }),
+  })
+
+  assert.equal(configured.status.healthy, false)
+  assert.equal(configured.status.errorCode, 'EVERCORE_MANAGED_INIT_NOT_RUN')
+  assert.equal(configured.status.sidecar?.lastStartupError?.errorCode, 'EVERCORE_MANAGED_INIT_NOT_RUN')
+  assert.match(configured.status.sidecar?.lastStartupError?.errorMessage ?? '', /everos init failed/)
 })
 
 test('EverCore client calls current memory REST routes', async () => {
@@ -6917,6 +7152,41 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
         },
       }
       yield {
+        type: 'provider_retry_scheduled',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        requestId: 'req-provider-retry',
+        recoveryKind: 'provider_unavailable',
+        httpStatus: 500,
+        attempt: 1,
+        maxRetries: 10,
+        delayMs: 30000,
+        nextAttemptAt: '2026-07-03T00:00:30.000Z',
+        sameProvider: true,
+        sameModel: true,
+        message: 'Provider unavailable; retry 1/10 in 30s.',
+      }
+      yield {
+        type: 'provider_retry_started',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        recoveryKind: 'provider_unavailable',
+        attempt: 1,
+        maxRetries: 10,
+      }
+      yield {
+        type: 'provider_retry_succeeded',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        recoveryKind: 'provider_unavailable',
+        attempt: 1,
+        maxRetries: 10,
+        recoveredAfterMs: 31000,
+      }
+      yield {
         type: 'task_session_event',
         schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
         sessionId: options.sessionId,
@@ -7033,6 +7303,15 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(metrics.providerInvocations.byErrorCode.PROVIDER_ERROR, 1)
     assert.equal(metrics.providerInvocations.byRole.executor.successCount, 1)
     assert.equal(metrics.providerInvocations.byRole.critic.failureCount, 1)
+    assert.equal(metrics.providerRetries.scheduledCount, 1)
+    assert.equal(metrics.providerRetries.startedCount, 1)
+    assert.equal(metrics.providerRetries.succeededCount, 1)
+    assert.equal(metrics.providerRetries.exhaustedCount, 0)
+    assert.equal(metrics.providerRetries.attemptsScheduled, 1)
+    assert.equal(metrics.providerRetries.totalDelayMs, 30000)
+    assert.equal(metrics.providerRetries.recoveredAfterMs.avgMs, 31000)
+    assert.equal(metrics.providerRetries.byProvider['minimax/MiniMax-M3'].succeededCount, 1)
+    assert.equal(metrics.providerRetries.byRecoveryKind.provider_unavailable, 3)
     assert.equal(metrics.agentLoop.sessionsObserved, 1)
     assert.equal(metrics.agentLoop.taskCount, 1)
     assert.equal(metrics.agentLoop.failedTaskCount, 1)
@@ -7057,6 +7336,7 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(status.metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
     assert.equal(status.metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
     assert.equal(status.metrics.providerInvocations.count, 2)
+    assert.equal(status.metrics.providerRetries.succeededCount, 1)
     assert.equal(status.metrics.agentLoop.roleStepCount, 1)
     assert.equal(status.metrics.agentJobs.failedCount, 1)
   } finally {
@@ -8459,6 +8739,162 @@ test('LLMCodingRuntime recovers provider context-limit errors with reactive comp
   } finally {
     setAdapterOverrideForTest('minimax', null)
     await storage.close()
+  }
+})
+
+test('LLMCodingRuntime retries provider_unavailable on the same provider and model', async () => {
+  const previousDelay = process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+  process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '200'
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-unavailable-retry-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-unavailable-retry-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      if (executionInvocationCount === 1) {
+        throw new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"},"request_id":"0695498774bd1185436107ba7f49078b"}')
+      }
+      yield { type: 'text', text: 'continued after provider retry' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'recover from transient provider error',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    let scheduledAfterMs: number | undefined
+    const startedAtMs = Date.now()
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'recover from transient provider error',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: new AbortController().signal,
+    })) {
+      if (event.type === 'provider_retry_scheduled' && scheduledAfterMs === undefined) {
+        scheduledAfterMs = Date.now() - startedAtMs
+      }
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'result') break
+    }
+
+    assert.equal(executionInvocationCount, 2)
+    assert.ok(emitted.some(event => event.type === 'provider_retry_scheduled'))
+    assert.ok(emitted.some(event => event.type === 'provider_retry_started'))
+    assert.ok(emitted.some(event => event.type === 'provider_retry_succeeded'))
+    assert.ok(
+      scheduledAfterMs !== undefined && scheduledAfterMs < 150,
+      `provider retry schedule event should stream before retry delay completes; got ${scheduledAfterMs}ms`,
+    )
+    assert.equal(emitted.find(event => event.type === 'result')?.success, true)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+    if (previousDelay === undefined) {
+      delete process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+    } else {
+      process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = previousDelay
+    }
+  }
+})
+
+test('LLMCodingRuntime cancels provider retry wait before starting the next attempt', async () => {
+  const previousDelay = process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+  process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '500'
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-retry-cancel-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-retry-cancel-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      throw new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"}}')
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+  const abortController = new AbortController()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'cancel while waiting for provider retry',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'cancel while waiting for provider retry',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: abortController.signal,
+    })) {
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'provider_retry_scheduled') {
+        abortController.abort(new Error('cancelled during provider retry wait'))
+      }
+      if (event.type === 'result') break
+    }
+
+    assert.equal(executionInvocationCount, 1)
+    assert.ok(emitted.some(event => event.type === 'provider_retry_scheduled'))
+    assert.equal(emitted.some(event => event.type === 'provider_retry_started'), false)
+    assert.equal(emitted.some(event => event.type === 'provider_retry_succeeded'), false)
+    assert.equal(emitted.find(event => event.type === 'error')?.code, 'REQUEST_CANCELLED')
+    assert.equal(emitted.find(event => event.type === 'result')?.success, false)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+    if (previousDelay === undefined) {
+      delete process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+    } else {
+      process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = previousDelay
+    }
   }
 })
 

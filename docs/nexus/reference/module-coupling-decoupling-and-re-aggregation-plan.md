@@ -446,7 +446,7 @@ The plan is verified by the same gates the project already uses, plus a new dedi
 - `npm run deps:audit` — must report `failures: { missingOwnership: [], runtimeCliLeaks: [], devDependencyLeaks: [], undeclaredImports: [] }`.
 - `npm run coupling:audit` — must be pasted as a before / after fingerprint for coupling PRs. Phase 0.5 is informational and exits green for known debt; later phases may add stricter thresholds once a specific hotspot is closed. `npm run coupling:audit:gate` is the **layer-direction enforcement** mechanism — it fails CI on any reverse `cli → nexus` / `cli → runtime` / `shared → providers` import not in the explicit allowlist. See [layer-direction-audit-enforcement-plan.md](./layer-direction-audit-enforcement-plan.md) for the allowlist ownership and the per-edge list.
 - `npm test` — must pass; the existing 80+ tests must continue to pass without modification unless a test is the direct subject of the PR.
-- `npm run build:smoke` — must pass; `bbl --help`, `bbl chat --help`, `bbl run hello` must continue to work.
+- `npm run build:smoke` — must pass; `bbl --help`, `bbl go --check`, `bbl run hello` must continue to work.
 - `npm run test:quarantine` — state-listing only; this is not a required pass/fail gate for coupling PRs.
 
 Every source-code coupling PR must also include:

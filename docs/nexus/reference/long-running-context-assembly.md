@@ -1,6 +1,6 @@
 # Long-Running Context Assembly — 设计文档
 
-> State: Active Plan
+> State: Closed Reference
 > Track: Long-running Context / Working Set / Resume Pack
 > Priority: P1 Watch
 > Source of truth: [../TODO.md](../TODO.md), [../active/TODO_runtime.md](../active/TODO_runtime.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `src/runtime/contextAssembler.ts`, `src/runtime/contextAnalysis.ts`, `src/runtime/workingSet*`, `src/runtime/loadWorkingSetOverride.ts`, `src/runtime/applyWorkingSetUpdate.ts`, `src/nexus/contextBroadcaster.ts`, `src/nexus/workingSetBroadcaster.ts`, `src/nexus/routers/sessionResumePreviewRouter.ts`, `clients/go-tui/internal/loop/api/context_observer.go`, `clients/go-tui/internal/loop/context_observer.go`

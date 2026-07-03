@@ -9,7 +9,7 @@
 
 ## Goal
 
-SessionChannel already allows different sessions to exchange collaboration context through a typed side-channel. The TUI problem is not to merge multiple session transcripts into one chat stream. The problem is to make the following relationships visible in `bbl chat` and session-management surfaces:
+SessionChannel already allows different sessions to exchange collaboration context through a typed side-channel. The TUI problem is not to merge multiple session transcripts into one chat stream. The problem is to make the following relationships visible in `bbl go` and session-management surfaces:
 
 1. Which sessions are linked to the current session.
 2. What kind of relationship each link represents.
@@ -22,7 +22,7 @@ The recommended approach is a layered composition rather than one large panel: u
 
 Implemented capabilities:
 
-- The `bbl chat` boxed input footer can show SessionChannel linked / unread state.
+- The `bbl go` boxed input footer can show SessionChannel linked / unread state.
 - `/inbox` and `/inbox all` can open the side-channel overlay.
 - The Inbox overlay supports open/read, ack, and quote into the current prompt.
 - Quote only pre-fills the current prompt; the user must review and submit manually.
@@ -228,7 +228,7 @@ This is the highest-priority UX layer because it provides global awareness of li
 
 Exit criteria:
 
-- The `bbl chat` footer can reliably show connection summary, unread count, and high-priority summary.
+- The `bbl go` footer can reliably show connection summary, unread count, and high-priority summary.
 - The session list can show relationship badges / unread markers.
 - Long paths, narrow width, CJK, and resize cases do not break layout.
 - PTY smoke covers key unread/high-priority badge paths.

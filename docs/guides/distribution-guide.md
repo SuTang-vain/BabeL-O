@@ -3,13 +3,13 @@
 > State: Guide
 > Track: Distribution / Installer / Release Operations
 > Priority: P1 Watch
-> Source of truth: [../TODO.md](../TODO.md), [../DONE.md](../DONE.md), [../WORK_LOG.md](../WORK_LOG.md), `scripts/install.sh`, `scripts/package-portable.mjs`, `docs/releases/`
+> Source of truth: [../nexus/TODO.md](../nexus/TODO.md), [../nexus/DONE.md](../nexus/DONE.md), [../nexus/WORK_LOG.md](../nexus/WORK_LOG.md), `scripts/install.sh`, `scripts/package-portable.mjs`, `docs/releases/`
 
-> Governance: Indexed by [go-client-distribution-governance-index.md](./go-client-distribution-governance-index.md). This guide is operational; strategic channel direction lives in [distribution-strategy-plan.md](./distribution-strategy-plan.md).
+> Governance: Indexed by [go-client-distribution-governance-index.md](../nexus/reference/go-client-distribution-governance-index.md). This guide is operational; strategic channel direction lives in [distribution-strategy-plan.md](../nexus/reference/distribution-strategy-plan.md).
 
 ## Purpose
 
-This guide is the operational companion to [distribution-strategy-plan.md](./distribution-strategy-plan.md). The strategy document explains where distribution should go; this guide explains how to ship, install, verify, and debug the current release line.
+This guide is the operational companion to [distribution-strategy-plan.md](../nexus/reference/distribution-strategy-plan.md). The strategy document explains where distribution should go; this guide explains how to ship, install, verify, and debug the current release line.
 
 The current official user entrypoint is the Go TUI:
 
@@ -273,7 +273,7 @@ curl -fsS http://127.0.0.1:3000/health
 - Keep the legacy macOS SEA shell wrapper as a compatibility branch only; do not expand it into a second full launcher.
 - v0.3.5+ release work should verify `bbl-<platform>.tar.gz`, not just `go-tui-*` and legacy `bbl-*`.
 - The long-term fix is a Go launcher that owns startup and `exec`s the Go TUI without Node SEA.
-- When the Go launcher lands, update this guide, [distribution-strategy-plan.md](./distribution-strategy-plan.md), README install instructions, and release notes together.
+- When the Go launcher lands, update this guide, [distribution-strategy-plan.md](../nexus/reference/distribution-strategy-plan.md), README install instructions, and release notes together.
 
 ## 中文概述
 
