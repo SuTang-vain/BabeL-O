@@ -1389,6 +1389,11 @@ test('runtime pipeline asks user to confirm option-like suppressed tool turns', 
   assert.equal(nonOptionError?.type, 'error')
   assert.equal(nonOptionError.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
   assert.equal((nonOptionError.details as any).retryAttempted, true)
+  // Slice 1 B2: suppression is a soft signal — mark severity so consumers can
+  // distinguish it from terminal errors (soft-error-retry-continuity plan Fix B2).
+  assert.equal((nonOptionError.details as any).severity, 'soft')
+  // Slice 1 B3: nudge tells the model the retry will pass through (Fix B3).
+  assert.match(String(nonOptionOutcome.messages[nonOptionOutcome.messages.length - 1]?.content), /retry|will let it through/i)
 
   const exhaustedOutcome = reduceProviderTurnOutcome({
     sessionId: 'session-turn-reducer-suppressed-exhausted',

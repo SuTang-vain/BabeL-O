@@ -255,6 +255,7 @@ export function reduceProviderTurnOutcome(options: {
             latestUserText: options.userIntentGuidance.latestUserText,
             intentCategory: getIntentCategory(options.userIntentGuidance),
             suppressionReason: getToolSuppressionReason(options.userIntentGuidance),
+            severity: 'soft',
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
             retryAttempted: true,
             retryExhausted: false,
@@ -264,7 +265,7 @@ export function reduceProviderTurnOutcome(options: {
       eventsAfterMessages: [],
       messages: [{
         role: 'user',
-        content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to execute a command or inspect files to answer the user, call the appropriate tool now. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
+        content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now — the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
       }],
       maxTokenRecoveryCount: options.maxTokenRecoveryCount,
       outputRetryCount: options.outputRetryCount,

@@ -8,7 +8,7 @@ import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
 import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
-import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
+import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, getIntentCategory, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
@@ -939,6 +939,34 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(status.actionHint, 'respond_only')
     assert.equal(status.requiresTools, false)
     assert.equal(shouldSuppressToolsForIntent(status), false)
+  })
+
+  test('Soft-error-retry Slice 1 B1: self_diagnosis_request is exempt from intent suppression', () => {
+    // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md Fix B1.
+    // Reproduces seq 1024 of session_2db242ff: intent=correction / respond_only /
+    // requiresTools=false, but intentCategory=self_diagnosis_request (the model is
+    // diagnosing the runtime and needs a read-only tool to cite a rule). Suppressing
+    // here is a false positive that ended the session in a user cancel.
+    const selfDiag = normalizeGuidancePolicy(modelGuidance({
+      intent: 'correction',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      problemTarget: 'agent_failure',
+      latestUserText: '但是你软超时的话应该主动发起继续任务才对呀',
+    }))
+    assert.equal(getIntentCategory(selfDiag), 'self_diagnosis_request')
+    assert.equal(shouldSuppressToolsForIntent(selfDiag), false)
+
+    // Negative: a general respond-only turn without a self-diagnosis target is still suppressed.
+    const general = normalizeGuidancePolicy(modelGuidance({
+      intent: 'correction',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      problemTarget: 'unknown',
+      latestUserText: '好的，我明白了',
+    }))
+    assert.notEqual(getIntentCategory(general), 'self_diagnosis_request')
+    assert.equal(shouldSuppressToolsForIntent(general), true)
   })
 })
 
@@ -3015,7 +3043,7 @@ describe('LLMCodingRuntime', () => {
     assert.equal(firstBody.tools, undefined)
     const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
     assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
-    assert.match(JSON.stringify(secondBody.messages), /genuinely need to execute a command or inspect files/)
+    assert.match(JSON.stringify(secondBody.messages), /inspect a file or run a read-only check to answer, retry that tool now/)
   })
 
   test('hard-suppresses MiniMax bracket-wrapped tool calls for respond-only intake', async () => {
