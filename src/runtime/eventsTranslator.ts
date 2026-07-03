@@ -270,6 +270,14 @@ export function mapEventsToMessages(
       handleRuntimeUserMessage(`Runtime scope boundary detected before ${event.toolName}: ${event.reason} Action: ${event.action}. Target root: ${event.targetRoot}. Current task root: ${event.taskPrimaryRoot}. Do not use this external evidence unless the user confirms the scope boundary.`)
     } else if (event.type === 'scope_boundary_confirmed') {
       handleRuntimeUserMessage(`Runtime scope boundary confirmed: ${event.message} Target root: ${event.targetRoot}. Confirmation scope: ${event.confirmationScope}.`)
+    } else if (event.type === 'provider_retry_scheduled') {
+      handleRuntimeUserMessage(`Runtime provider retry scheduled: ${event.message}`)
+    } else if (event.type === 'provider_retry_started') {
+      handleRuntimeUserMessage(`Runtime provider retry started: ${event.providerId}/${event.modelId} attempt ${event.attempt}/${event.maxRetries} for ${event.recoveryKind}.`)
+    } else if (event.type === 'provider_retry_succeeded') {
+      handleRuntimeUserMessage(`Runtime provider retry succeeded: ${event.providerId}/${event.modelId} recovered on attempt ${event.attempt}/${event.maxRetries}.`)
+    } else if (event.type === 'provider_retry_exhausted') {
+      handleRuntimeUserMessage(`Runtime provider retry exhausted: ${event.message}`)
     } else if (event.type === 'near_timeout_warning') {
       handleRuntimeUserMessage(formatNearTimeoutConvergenceMessage(event))
     } else if (event.type === 'timeout_budget_exceeded') {

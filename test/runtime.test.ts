@@ -7152,6 +7152,41 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
         },
       }
       yield {
+        type: 'provider_retry_scheduled',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        requestId: 'req-provider-retry',
+        recoveryKind: 'provider_unavailable',
+        httpStatus: 500,
+        attempt: 1,
+        maxRetries: 10,
+        delayMs: 30000,
+        nextAttemptAt: '2026-07-03T00:00:30.000Z',
+        sameProvider: true,
+        sameModel: true,
+        message: 'Provider unavailable; retry 1/10 in 30s.',
+      }
+      yield {
+        type: 'provider_retry_started',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        recoveryKind: 'provider_unavailable',
+        attempt: 1,
+        maxRetries: 10,
+      }
+      yield {
+        type: 'provider_retry_succeeded',
+        ...eventBase(options.sessionId),
+        providerId: 'minimax',
+        modelId: 'MiniMax-M3',
+        recoveryKind: 'provider_unavailable',
+        attempt: 1,
+        maxRetries: 10,
+        recoveredAfterMs: 31000,
+      }
+      yield {
         type: 'task_session_event',
         schemaVersion: NEXUS_EVENT_SCHEMA_VERSION,
         sessionId: options.sessionId,
@@ -7268,6 +7303,15 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(metrics.providerInvocations.byErrorCode.PROVIDER_ERROR, 1)
     assert.equal(metrics.providerInvocations.byRole.executor.successCount, 1)
     assert.equal(metrics.providerInvocations.byRole.critic.failureCount, 1)
+    assert.equal(metrics.providerRetries.scheduledCount, 1)
+    assert.equal(metrics.providerRetries.startedCount, 1)
+    assert.equal(metrics.providerRetries.succeededCount, 1)
+    assert.equal(metrics.providerRetries.exhaustedCount, 0)
+    assert.equal(metrics.providerRetries.attemptsScheduled, 1)
+    assert.equal(metrics.providerRetries.totalDelayMs, 30000)
+    assert.equal(metrics.providerRetries.recoveredAfterMs.avgMs, 31000)
+    assert.equal(metrics.providerRetries.byProvider['minimax/MiniMax-M3'].succeededCount, 1)
+    assert.equal(metrics.providerRetries.byRecoveryKind.provider_unavailable, 3)
     assert.equal(metrics.agentLoop.sessionsObserved, 1)
     assert.equal(metrics.agentLoop.taskCount, 1)
     assert.equal(metrics.agentLoop.failedTaskCount, 1)
@@ -7292,6 +7336,7 @@ test('runtime metrics aggregates cache-aware performance diagnostics', async () 
     assert.equal(status.metrics.contextPolicy.prefixCache.volatileContentLastRatio, 1)
     assert.equal(status.metrics.contextPolicy.prefixCache.latestFingerprint, 'runtime-prefix-fingerprint')
     assert.equal(status.metrics.providerInvocations.count, 2)
+    assert.equal(status.metrics.providerRetries.succeededCount, 1)
     assert.equal(status.metrics.agentLoop.roleStepCount, 1)
     assert.equal(status.metrics.agentJobs.failedCount, 1)
   } finally {
@@ -8694,6 +8739,162 @@ test('LLMCodingRuntime recovers provider context-limit errors with reactive comp
   } finally {
     setAdapterOverrideForTest('minimax', null)
     await storage.close()
+  }
+})
+
+test('LLMCodingRuntime retries provider_unavailable on the same provider and model', async () => {
+  const previousDelay = process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+  process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '200'
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-unavailable-retry-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-unavailable-retry-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      if (executionInvocationCount === 1) {
+        throw new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"},"request_id":"0695498774bd1185436107ba7f49078b"}')
+      }
+      yield { type: 'text', text: 'continued after provider retry' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'recover from transient provider error',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    let scheduledAfterMs: number | undefined
+    const startedAtMs = Date.now()
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'recover from transient provider error',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: new AbortController().signal,
+    })) {
+      if (event.type === 'provider_retry_scheduled' && scheduledAfterMs === undefined) {
+        scheduledAfterMs = Date.now() - startedAtMs
+      }
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'result') break
+    }
+
+    assert.equal(executionInvocationCount, 2)
+    assert.ok(emitted.some(event => event.type === 'provider_retry_scheduled'))
+    assert.ok(emitted.some(event => event.type === 'provider_retry_started'))
+    assert.ok(emitted.some(event => event.type === 'provider_retry_succeeded'))
+    assert.ok(
+      scheduledAfterMs !== undefined && scheduledAfterMs < 150,
+      `provider retry schedule event should stream before retry delay completes; got ${scheduledAfterMs}ms`,
+    )
+    assert.equal(emitted.find(event => event.type === 'result')?.success, true)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+    if (previousDelay === undefined) {
+      delete process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+    } else {
+      process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = previousDelay
+    }
+  }
+})
+
+test('LLMCodingRuntime cancels provider retry wait before starting the next attempt', async () => {
+  const previousDelay = process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+  process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = '500'
+  const tools = createDefaultToolRegistry()
+  const policy = allowAllTools()
+  const storage = new SqliteStorage(join(tmpdir(), `babel-o-provider-retry-cancel-${Date.now()}.sqlite`))
+  const configManager = new ConfigManager(join(tmpdir(), `babel-o-provider-retry-cancel-config-${Date.now()}.json`))
+  configManager.save({ defaultModel: 'minimax/MiniMax-M3' })
+  let executionInvocationCount = 0
+  const adapter: ModelAdapter = {
+    async *queryStream(params: ModelQueryParams): AsyncIterable<StreamDelta> {
+      if (!params.tools?.length) {
+        yield {
+          type: 'text',
+          text: '{"intent":"continue","confidence":0.9,"continuity":0.8,"contextScope":"full","actionHint":"normal","requiresTools":true,"reason":"test","guidance":"continue"}',
+        }
+        yield { type: 'finish', reason: 'end_turn' }
+        return
+      }
+      executionInvocationCount += 1
+      throw new ProviderError('minimax', 500, '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"}}')
+    },
+  }
+  const runtime = new LLMCodingRuntime(tools, policy, storage, configManager)
+  const sessionId = createId('session')
+  const cwd = tmpdir()
+  const now = new Date().toISOString()
+  const abortController = new AbortController()
+
+  setAdapterOverrideForTest('minimax', adapter)
+  await storage.saveSession({
+    sessionId,
+    cwd,
+    prompt: 'cancel while waiting for provider retry',
+    phase: 'executing',
+    createdAt: now,
+    updatedAt: now,
+    events: [],
+  })
+
+  try {
+    const emitted: NexusEvent[] = []
+    for await (const event of runtime.executeStream({
+      sessionId,
+      prompt: 'cancel while waiting for provider retry',
+      cwd,
+      model: 'minimax/MiniMax-M3',
+      signal: abortController.signal,
+    })) {
+      emitted.push(event)
+      await storage.appendEvent(sessionId, event)
+      if (event.type === 'provider_retry_scheduled') {
+        abortController.abort(new Error('cancelled during provider retry wait'))
+      }
+      if (event.type === 'result') break
+    }
+
+    assert.equal(executionInvocationCount, 1)
+    assert.ok(emitted.some(event => event.type === 'provider_retry_scheduled'))
+    assert.equal(emitted.some(event => event.type === 'provider_retry_started'), false)
+    assert.equal(emitted.some(event => event.type === 'provider_retry_succeeded'), false)
+    assert.equal(emitted.find(event => event.type === 'error')?.code, 'REQUEST_CANCELLED')
+    assert.equal(emitted.find(event => event.type === 'result')?.success, false)
+  } finally {
+    setAdapterOverrideForTest('minimax', null)
+    await storage.close()
+    if (previousDelay === undefined) {
+      delete process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS
+    } else {
+      process.env.BABEL_O_PROVIDER_AUTO_RETRY_DELAY_MS = previousDelay
+    }
   }
 })
 

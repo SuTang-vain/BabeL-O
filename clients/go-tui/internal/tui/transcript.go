@@ -302,6 +302,14 @@ func linePresentation(kind string) (string, lipgloss.Style) {
 		return "ctx cmp ", statusStyle
 	case "context_recovery_attempted":
 		return "ctx rec ", statusStyle
+	case "provider_retry_scheduled":
+		return "retry   ", statusStyle
+	case "provider_retry_started":
+		return "retry > ", statusStyle
+	case "provider_retry_succeeded":
+		return "retry ok", statusStyle
+	case "provider_retry_exhausted":
+		return "retry no", errorStyle
 	case "context_grounding_required":
 		return "ctx grd ", statusStyle
 	case "context_grounding_confirmed":
@@ -421,6 +429,47 @@ func formatNexusEvent(event map[string]any) string {
 			tokens = fmt.Sprintf("tokens=%d->%d", anyInt(event["preTokens"]), postTokens)
 		}
 		return fmt.Sprintf("context recovery %d/%d strategy=%s %s retryable=%v", anyInt(event["attempt"]), anyInt(event["maxAttempts"]), stringField(event, "strategy"), tokens, event["retryable"])
+	case "provider_retry_scheduled":
+		return fmt.Sprintf(
+			"provider retry scheduled %d/%d provider=%s model=%s kind=%s status=%d delay=%dms next=%s request=%s",
+			anyInt(event["attempt"]),
+			anyInt(event["maxRetries"]),
+			stringField(event, "providerId"),
+			stringField(event, "modelId"),
+			stringField(event, "recoveryKind"),
+			anyInt(event["httpStatus"]),
+			anyInt(event["delayMs"]),
+			stringField(event, "nextAttemptAt"),
+			firstNonEmpty(stringField(event, "requestId"), "n/a"),
+		)
+	case "provider_retry_started":
+		return fmt.Sprintf(
+			"provider retry started %d/%d provider=%s model=%s kind=%s",
+			anyInt(event["attempt"]),
+			anyInt(event["maxRetries"]),
+			stringField(event, "providerId"),
+			stringField(event, "modelId"),
+			stringField(event, "recoveryKind"),
+		)
+	case "provider_retry_succeeded":
+		return fmt.Sprintf(
+			"provider retry succeeded after %d attempt(s) provider=%s model=%s kind=%s recoveredAfter=%dms",
+			anyInt(event["attempt"]),
+			stringField(event, "providerId"),
+			stringField(event, "modelId"),
+			stringField(event, "recoveryKind"),
+			anyInt(event["recoveredAfterMs"]),
+		)
+	case "provider_retry_exhausted":
+		return fmt.Sprintf(
+			"provider retry exhausted %d/%d provider=%s model=%s kind=%s code=%s",
+			anyInt(event["attempts"]),
+			anyInt(event["maxRetries"]),
+			stringField(event, "providerId"),
+			stringField(event, "modelId"),
+			stringField(event, "recoveryKind"),
+			stringField(event, "finalErrorCode"),
+		)
 	case "context_grounding_required":
 		return fmt.Sprintf("context grounding required source=%s state=%s actions=%s", stringField(event, "source"), stringField(event, "state"), stringSliceField(event, "suggestedActions"))
 	case "context_grounding_confirmed":

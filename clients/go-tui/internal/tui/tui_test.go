@@ -764,6 +764,65 @@ func TestFormatNexusEventContextRecoveryAttempted(t *testing.T) {
 	}
 }
 
+func TestFormatNexusEventProviderRetry(t *testing.T) {
+	scheduled := formatNexusEvent(map[string]any{
+		"type":          "provider_retry_scheduled",
+		"attempt":       2,
+		"maxRetries":    10,
+		"providerId":    "minimax",
+		"modelId":       "MiniMax-M1-40k",
+		"recoveryKind":  "provider_unavailable",
+		"httpStatus":    500,
+		"delayMs":       30000,
+		"nextAttemptAt": "2026-07-03T12:00:30.000Z",
+		"requestId":     "req_123",
+	})
+	for _, want := range []string{"provider retry scheduled 2/10", "provider=minimax", "model=MiniMax-M1-40k", "kind=provider_unavailable", "status=500", "delay=30000ms", "request=req_123"} {
+		if !strings.Contains(scheduled, want) {
+			t.Fatalf("formatNexusEvent(provider_retry_scheduled) = %q, want %q", scheduled, want)
+		}
+	}
+
+	started := formatNexusEvent(map[string]any{
+		"type":         "provider_retry_started",
+		"attempt":      2,
+		"maxRetries":   10,
+		"providerId":   "minimax",
+		"modelId":      "MiniMax-M1-40k",
+		"recoveryKind": "provider_unavailable",
+	})
+	if !strings.Contains(started, "provider retry started 2/10") || !strings.Contains(started, "provider=minimax") {
+		t.Fatalf("formatNexusEvent(provider_retry_started) = %q", started)
+	}
+
+	succeeded := formatNexusEvent(map[string]any{
+		"type":             "provider_retry_succeeded",
+		"attempt":          2,
+		"providerId":       "minimax",
+		"modelId":          "MiniMax-M1-40k",
+		"recoveryKind":     "provider_unavailable",
+		"recoveredAfterMs": 31000,
+	})
+	if !strings.Contains(succeeded, "provider retry succeeded after 2 attempt(s)") || !strings.Contains(succeeded, "recoveredAfter=31000ms") {
+		t.Fatalf("formatNexusEvent(provider_retry_succeeded) = %q", succeeded)
+	}
+
+	exhausted := formatNexusEvent(map[string]any{
+		"type":           "provider_retry_exhausted",
+		"attempts":       10,
+		"maxRetries":     10,
+		"providerId":     "minimax",
+		"modelId":        "MiniMax-M1-40k",
+		"recoveryKind":   "provider_unavailable",
+		"finalErrorCode": "PROVIDER_ERROR",
+	})
+	for _, want := range []string{"provider retry exhausted 10/10", "provider=minimax", "code=PROVIDER_ERROR"} {
+		if !strings.Contains(exhausted, want) {
+			t.Fatalf("formatNexusEvent(provider_retry_exhausted) = %q, want %q", exhausted, want)
+		}
+	}
+}
+
 func TestFormatNexusEventContextGroundingRequired(t *testing.T) {
 	got := formatNexusEvent(map[string]any{
 		"type":             "context_grounding_required",
@@ -903,6 +962,35 @@ func TestFormatSoftTimeoutFooterRendersBudgetAndExtensions(t *testing.T) {
 	}
 	if !strings.Contains(full, "ext=1/1") {
 		t.Fatalf("post-extension footer = %q, must surface extensions used / cap", full)
+	}
+}
+
+func TestFormatProviderRetryCountdown(t *testing.T) {
+	now := time.Date(2026, 7, 3, 12, 0, 0, 0, time.UTC)
+	got := formatProviderRetryCountdown(&providerRetryCountdownSnapshot{
+		ProviderID:    "minimax",
+		ModelID:       "MiniMax-M3",
+		RecoveryKind:  "provider_unavailable",
+		Attempt:       3,
+		MaxRetries:    10,
+		DelayMs:       30000,
+		NextAttemptAt: now.Add(30 * time.Second),
+	}, now)
+	for _, want := range []string{"provider retry 3/10", "in 30s", "minimax/MiniMax-M3"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("formatProviderRetryCountdown() = %q, want %q", got, want)
+		}
+	}
+
+	expired := formatProviderRetryCountdown(&providerRetryCountdownSnapshot{
+		ProviderID:    "minimax",
+		ModelID:       "MiniMax-M3",
+		Attempt:       3,
+		MaxRetries:    10,
+		NextAttemptAt: now.Add(-time.Second),
+	}, now)
+	if !strings.Contains(expired, "in 0s") {
+		t.Fatalf("expired countdown = %q, want clamped 0s", expired)
 	}
 }
 
@@ -1101,6 +1189,68 @@ func TestConsumeNexusEventClearsSoftTimeoutStateOnResult(t *testing.T) {
 	})
 	if m.softTimeoutState != nil {
 		t.Fatalf("softTimeoutState must be cleared on result, got %+v", m.softTimeoutState)
+	}
+}
+
+func TestConsumeNexusEventTracksProviderRetryCountdown(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.width = 120
+	m.height = 30
+	m.running = true
+	m.resize()
+	nextAttemptAt := time.Now().Add(30 * time.Second).UTC().Format(time.RFC3339Nano)
+	m.consumeNexusEvent(map[string]any{
+		"type":          "provider_retry_scheduled",
+		"sessionId":     "session_retry",
+		"providerId":    "minimax",
+		"modelId":       "MiniMax-M3",
+		"recoveryKind":  "provider_unavailable",
+		"attempt":       2,
+		"maxRetries":    10,
+		"delayMs":       30000,
+		"nextAttemptAt": nextAttemptAt,
+	})
+	if m.providerRetryCountdown == nil {
+		t.Fatalf("provider_retry_scheduled must populate countdown")
+	}
+	footer := stripANSICodes(m.renderFooter(120))
+	for _, want := range []string{"provider retry 2/10", "minimax/MiniMax-M3"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("footer missing %q after retry scheduled:\n%s", want, footer)
+		}
+	}
+
+	m.consumeNexusEvent(map[string]any{
+		"type":         "provider_retry_started",
+		"sessionId":    "session_retry",
+		"providerId":   "minimax",
+		"modelId":      "MiniMax-M3",
+		"recoveryKind": "provider_unavailable",
+		"attempt":      2,
+		"maxRetries":   10,
+	})
+	if m.providerRetryCountdown != nil {
+		t.Fatalf("provider_retry_started must clear countdown, got %+v", m.providerRetryCountdown)
+	}
+}
+
+func TestConsumeNexusEventClearsProviderRetryCountdownOnResult(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:3000", Cwd: "/workspace"})
+	m.providerRetryCountdown = &providerRetryCountdownSnapshot{
+		ProviderID:    "minimax",
+		ModelID:       "MiniMax-M3",
+		Attempt:       1,
+		MaxRetries:    10,
+		NextAttemptAt: time.Now().Add(30 * time.Second),
+	}
+	m.consumeNexusEvent(map[string]any{
+		"type":      "result",
+		"sessionId": "session_retry",
+		"success":   true,
+		"message":   "done",
+	})
+	if m.providerRetryCountdown != nil {
+		t.Fatalf("result must clear providerRetryCountdown, got %+v", m.providerRetryCountdown)
 	}
 }
 
@@ -11011,6 +11161,8 @@ func TestRuntimeAnimationStateFollowsAgentEvent(t *testing.T) {
 		{name: "tool started", eventType: "tool_started", wantLabel: "tool activity", wantKind: runtimeAnimationTool},
 		{name: "tool completed", eventType: "tool_completed", wantLabel: "tool activity", wantKind: runtimeAnimationTool},
 		{name: "permission event", eventType: "permission_request", wantLabel: "permission needed", wantKind: runtimeAnimationPermission},
+		{name: "provider retry scheduled", eventType: "provider_retry_scheduled", wantLabel: "provider retry waiting", wantKind: runtimeAnimationDefault},
+		{name: "provider retry started", eventType: "provider_retry_started", wantLabel: "provider retrying", wantKind: runtimeAnimationDefault},
 		{name: "pending overrides", eventType: "assistant_delta", pending: true, wantLabel: "permission needed", wantKind: runtimeAnimationPermission},
 		// Path 2 fix (2026-06-21): the chrome shows the bridging
 		// "drafting response" indicator between the last thinking

@@ -104,6 +104,14 @@ import { HISTORY_EVENT_LOAD_LIMIT_MAX } from './contextAssembler.js'
 import { findRepeatedToolInputs } from './contextAnalysis.js'
 import type { WorkingSet } from './workingSetTracker.js'
 import { ProviderSessionRules } from './providerSessionRules.js'
+import {
+  buildProviderRetryStartedEvent,
+  buildProviderRetrySucceededEvent,
+  readProviderAutoRetryPolicy,
+  sleepForProviderRetry,
+  type ProviderAutoRetryKind,
+  type ProviderAutoRetryState,
+} from './providerRetry.js'
 
 const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
 
@@ -607,6 +615,12 @@ export class LLMCodingRuntime implements NexusRuntime {
       const MAX_PROVIDER_CONTEXT_RECOVERIES = 1
       let maxTokenRecoveryCount = 0
       let providerContextRecoveryCount = 0
+      let providerAvailabilityRetryState: ProviderAutoRetryState = { count: 0 }
+      let lastProviderAvailabilityRetryKind: ProviderAutoRetryKind | undefined
+      const providerAutoRetryPolicy = readProviderAutoRetryPolicy(
+        process.env,
+        this.configManager.getProviderAutoRetryConfig(),
+      )
       let suppressedToolRetryCount = 0
       let memoryCapabilityAnswerRetryCount = 0
       const memoryCapabilityQuestion = isPureMemoryCapabilityQuestion(options.prompt)
@@ -902,6 +916,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             counters: {
               providerContextRecoveryCount,
               maxProviderContextRecoveries: MAX_PROVIDER_CONTEXT_RECOVERIES,
+              providerAvailabilityRetryState,
             },
             flags: {
               setProviderLoopCompactAttempted: (next) => { providerLoopCompactAttempted = next },
@@ -914,6 +929,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             runHooks: (phase, invocation, ctx, config) =>
               executeRuntimeHooks(phase, invocation, ctx, config),
             contextCompactPercent,
+            providerAutoRetryPolicy,
             errorCodeHelpers: {
               providerInvocationErrorCode,
               providerContextRecoveryErrorCode,
@@ -921,13 +937,48 @@ export class LLMCodingRuntime implements NexusRuntime {
           })
           for (const e of recoveryResult.events) yield e
           providerContextRecoveryCount = recoveryResult.providerContextRecoveryCount
+          providerAvailabilityRetryState = recoveryResult.providerAvailabilityRetryState ?? providerAvailabilityRetryState
           previousEvents = recoveryResult.previousEvents
           autoCompactDecision = recoveryResult.autoCompactDecision
           messages = recoveryResult.messages
           cacheAwareCompactPolicy = recoveryResult.cacheAwareCompactPolicy
+          if (recoveryResult.kind === 'retry') {
+            const scheduledEvent = recoveryResult.events.find((event): event is Extract<NexusEvent, { type: 'provider_retry_scheduled' }> =>
+              event.type === 'provider_retry_scheduled')
+            if (scheduledEvent) {
+              await sleepForProviderRetry(scheduledEvent.delayMs, options.signal)
+              const startedEvent = buildProviderRetryStartedEvent({
+                sessionId: options.sessionId,
+                providerId: settings.providerId,
+                modelId: cleanedModelId,
+                recoveryKind: scheduledEvent.recoveryKind,
+                attempt: scheduledEvent.attempt,
+                maxRetries: scheduledEvent.maxRetries,
+              })
+              yield startedEvent
+              lastProviderAvailabilityRetryKind = startedEvent.recoveryKind
+            }
+            continue
+          }
           if (recoveryResult.kind === 'recovered') continue
           if (recoveryResult.kind === 'blocked') return
           throw recoveryResult.error
+        }
+
+        if (providerAvailabilityRetryState.count > 0 && lastProviderAvailabilityRetryKind) {
+          yield buildProviderRetrySucceededEvent({
+            sessionId: options.sessionId,
+            providerId: settings.providerId,
+            modelId: cleanedModelId,
+            recoveryKind: lastProviderAvailabilityRetryKind,
+            attempt: providerAvailabilityRetryState.count,
+            maxRetries: providerAutoRetryPolicy.maxRetries,
+            recoveredAfterMs: providerAvailabilityRetryState.startedAtMs
+              ? Math.max(0, Date.now() - providerAvailabilityRetryState.startedAtMs)
+              : 0,
+          })
+          providerAvailabilityRetryState = { count: 0 }
+          lastProviderAvailabilityRetryKind = undefined
         }
 
         if (
@@ -1083,12 +1134,17 @@ export class LLMCodingRuntime implements NexusRuntime {
       yield buildRuntimeExecutionMetricsEvent(options, metrics)
     } catch (err: any) {
       const isTimeout = options.timeoutSignal?.aborted
-      const isCancelled = !isTimeout && (options.signal?.aborted || err.message?.includes('Abort') || err.name === 'AbortError')
+      const errorMessage = err instanceof Error ? err.message : String(err)
+      const isCancelled = !isTimeout && (
+        options.signal?.aborted ||
+        errorMessage.toLowerCase().includes('abort') ||
+        err.name === 'AbortError'
+      )
       const providerRecovery = classifyProviderRecovery(err)
       const errorCode = isTimeout ? 'REQUEST_TIMEOUT' : isCancelled ? 'REQUEST_CANCELLED' : (err.code || 'PROVIDER_ERROR')
       const errorText = isCancelled
         ? 'Execution cancelled by user.'
-        : err instanceof Error ? err.message : String(err)
+        : errorMessage
       yield buildRuntimeErrorEvent({
         sessionId: options.sessionId,
         code: errorCode,

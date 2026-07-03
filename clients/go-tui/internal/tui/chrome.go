@@ -373,6 +373,10 @@ func (m model) runtimeAnimationState() (string, runtimeAnimationKind) {
 		return "  tool activity", runtimeAnimationTool
 	case "permission_request":
 		return "  permission needed", runtimeAnimationPermission
+	case "provider_retry_scheduled":
+		return "  provider retry waiting", runtimeAnimationDefault
+	case "provider_retry_started":
+		return "  provider retrying", runtimeAnimationDefault
 	default:
 		if m.softTimeoutState != nil && !m.softTimeoutState.BudgetExceededAt.IsZero() {
 			return "  waiting for watchdog", runtimeAnimationDefault
@@ -420,6 +424,9 @@ func (m model) renderFooter(width int) string {
 	}, " · ")
 	if m.running {
 		hint = "waiting for Nexus events"
+		if retry := formatProviderRetryCountdown(m.providerRetryCountdown, time.Now()); retry != "" {
+			hint = retry
+		}
 	}
 	if m.interruptionPromptActive {
 		hint = "What should BabeL-O do instead? Enter interrupts · Esc cancels"
@@ -471,6 +478,9 @@ func (m model) renderFooterSummary(width int) string {
 		}
 		if m.latestUsage != nil {
 			sideParts = append(sideParts, formatUsageFooter(m.latestUsage))
+		}
+		if retry := formatProviderRetryCountdown(m.providerRetryCountdown, time.Now()); retry != "" {
+			sideParts = append(sideParts, retry)
 		}
 		// Phase 4: surface soft-timeout cycle state next to the
 		// usage counter so the operator sees the workflow is

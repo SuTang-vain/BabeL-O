@@ -33,6 +33,12 @@ export interface HooksConfig {
   builtins?: Record<string, HookBuiltinConfig>;
 }
 
+export interface ProviderAutoRetryConfig {
+  enabled?: boolean;
+  maxRetries?: number;
+  delayMs?: number;
+}
+
 export interface BabelOConfig {
   defaultModel?: string;
   providers?: Record<string, ProviderConfig>;
@@ -47,6 +53,7 @@ export interface BabelOConfig {
     cpus?: string;
   };
   hooks?: HooksConfig;
+  providerAutoRetry?: ProviderAutoRetryConfig;
 }
 
 export type BabeLXConfigImportProfile = {
@@ -197,6 +204,12 @@ export const HooksConfigSchema = z.object({
   builtins: z.record(z.string(), HookBuiltinConfigSchema).optional(),
 });
 
+export const ProviderAutoRetryConfigSchema = z.object({
+  enabled: z.boolean().optional(),
+  maxRetries: z.number().int().nonnegative().max(100).optional(),
+  delayMs: z.number().int().nonnegative().max(3_600_000).optional(),
+});
+
 export const BabelOConfigSchema = z.object({
   defaultModel: z.string().optional(),
   providers: z.record(z.string(), ProviderConfigSchema).optional(),
@@ -211,6 +224,7 @@ export const BabelOConfigSchema = z.object({
     cpus: z.string().optional(),
   }).optional(),
   hooks: HooksConfigSchema.optional(),
+  providerAutoRetry: ProviderAutoRetryConfigSchema.optional(),
 }).superRefine((data, ctx) => {
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;
@@ -529,6 +543,20 @@ export class ConfigManager {
       ...conf.providers[providerId],
       ...providerConfig,
       ...(providerConfig.apiKey !== undefined ? { apiKey: sanitizedApiKey } : {}),
+    };
+    this.save(conf);
+  }
+
+  public getProviderAutoRetryConfig(): ProviderAutoRetryConfig {
+    const conf = this.load();
+    return conf.providerAutoRetry || {};
+  }
+
+  public setProviderAutoRetryConfig(providerAutoRetry: ProviderAutoRetryConfig): void {
+    const conf = this.load();
+    conf.providerAutoRetry = {
+      ...conf.providerAutoRetry,
+      ...providerAutoRetry,
     };
     this.save(conf);
   }

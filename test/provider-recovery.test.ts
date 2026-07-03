@@ -48,6 +48,34 @@ test('classifyProviderRecovery tags provider-specific context window failures', 
   }
 })
 
+test('classifyProviderRecovery tags MiniMax transient api errors as provider_unavailable', () => {
+  const details = classifyProviderRecovery(
+    new ProviderError(
+      'minimax',
+      500,
+      '{"type":"error","error":{"type":"api_error","message":"unknown error, 999 (1000)"},"request_id":"0695498774bd1185436107ba7f49078b"}',
+    ),
+  )
+  assert.equal(details?.kind, 'provider_unavailable')
+  assert.equal(details?.recoveryReason, 'RETRY_PROVIDER_UNAVAILABLE')
+  assert.equal(details?.retryable, true)
+  assert.equal(details?.fallbackPolicy.mode, 'retry_same_model')
+})
+
+test('classifyProviderRecovery tags MiniMax timeout text as provider_unavailable', () => {
+  const details = classifyProviderRecovery(
+    new ProviderError(
+      'minimax',
+      504,
+      '{"type":"error","error":{"type":"timeout_error","message":"请求处理超时，请稍后重试 (2066)"}}',
+    ),
+  )
+  assert.equal(details?.kind, 'provider_unavailable')
+  assert.equal(details?.recoveryReason, 'RETRY_PROVIDER_UNAVAILABLE')
+  assert.equal(details?.retryable, true)
+  assert.equal(details?.fallbackPolicy.mode, 'retry_same_model')
+})
+
 test('classifyProviderRecovery tags auth and billing failures as non-retryable', () => {
   const details = classifyProviderRecovery(
     new ProviderError('openai', 402, '{"error":{"message":"Insufficient Balance"}}'),

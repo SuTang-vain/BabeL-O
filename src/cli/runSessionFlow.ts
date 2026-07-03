@@ -126,7 +126,7 @@ export async function runSessionFlow(
               }
             }
           } else {
-            /* TUI render removed */
+            renderCliProviderRetryEvent(data as NexusEvent)
             if (data.type === 'result' || data.type === 'error') {
               abortController.signal.removeEventListener('abort', onAbort)
               socket?.close()
@@ -196,7 +196,7 @@ export async function runSessionFlow(
           })
         })
       } else {
-        /* TUI render removed */
+        renderCliProviderRetryEvent(ev)
       }
     }
 
@@ -277,6 +277,7 @@ export async function runSessionFlow(
         policyMode: resolveCliPolicyMode() ?? 'soft-deny',
       })) {
         currentTurnEvents.push(event)
+        renderCliProviderRetryEvent(event)
         await storage.appendEvent(sessionId, event)
       }
     } catch (err: any) {
@@ -515,6 +516,27 @@ function renderCliPermissionRequest(event: PermissionDialogEvent): void {
   if (input) console.error(`  ${input}`)
   const rule = event.suggestedRule ?? defaultPermissionRule(event)
   console.error(chalk.dim(`  suggested rule: ${rule}`))
+}
+
+function renderCliProviderRetryEvent(event: NexusEvent): void {
+  if (event.type === 'provider_retry_scheduled') {
+    const seconds = Math.round(event.delayMs / 1000)
+    console.error(chalk.yellow(
+      `provider retry: ${event.providerId}/${event.modelId} ${event.recoveryKind}; retry ${event.attempt}/${event.maxRetries} in ${seconds}s`,
+    ))
+  } else if (event.type === 'provider_retry_started') {
+    console.error(chalk.yellow(
+      `provider retry: starting ${event.attempt}/${event.maxRetries} for ${event.providerId}/${event.modelId}`,
+    ))
+  } else if (event.type === 'provider_retry_succeeded') {
+    console.error(chalk.green(
+      `provider retry: recovered after ${event.attempt}/${event.maxRetries} attempt(s) (${event.recoveredAfterMs}ms)`,
+    ))
+  } else if (event.type === 'provider_retry_exhausted') {
+    console.error(chalk.red(
+      `provider retry: exhausted ${event.attempts}/${event.maxRetries} for ${event.providerId}/${event.modelId} (${event.finalErrorCode})`,
+    ))
+  }
 }
 
 function formatPermissionInput(input: unknown): string {

@@ -37,6 +37,11 @@ test('runtime metrics router preserves runtime metrics snapshot contract', async
     assert.deepEqual(body.routes, [])
 
     assert.equal(body.providerInvocations.count, 0)
+    assert.equal(body.providerRetries.scheduledCount, 0)
+    assert.equal(body.providerRetries.startedCount, 0)
+    assert.equal(body.providerRetries.succeededCount, 0)
+    assert.equal(body.providerRetries.exhaustedCount, 0)
+    assert.equal(body.providerRetries.recoveredAfterMs.avgMs, 0)
     assert.equal(body.agentLoop.sessionsObserved, 0)
     assert.equal(body.agentLoop.taskCount, 0)
     assert.equal(body.agentJobs.count, 0)

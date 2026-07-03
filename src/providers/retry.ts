@@ -11,7 +11,7 @@ const DEFAULT_RETRY_CONFIG: RetryConfig = {
   maxRetries: 2,
   baseDelayMs: 1000,
   maxDelayMs: 15_000,
-  retryableStatuses: [429, 500, 502, 503, 529],
+  retryableStatuses: [429, 500, 502, 503, 504, 529],
 }
 
 export async function withRetry<T>(
