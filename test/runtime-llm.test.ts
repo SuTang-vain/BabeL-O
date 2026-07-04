@@ -961,16 +961,19 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(getIntentCategory(selfDiag), 'self_diagnosis_request')
     assert.equal(shouldSuppressToolsForIntent(selfDiag), false)
 
-    // Negative: a general respond-only turn without a self-diagnosis target is still suppressed.
-    const general = normalizeGuidancePolicy(modelGuidance({
-      intent: 'correction',
+    // Negative (after direction 2 narrowed suppression to Tier 1): a Tier 1 turn
+    // (pause) is still hard-suppressed. Direction 2 turned the general correction
+    // case into Tier 2 passthrough, so the original negative (general correction
+    // suppressed) no longer holds; this Tier 1 case replaces it. The
+    // self_diagnosis positive above is now a special case of Tier 2 passthrough.
+    const tier1 = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
       actionHint: 'respond_only',
       requiresTools: false,
       problemTarget: 'unknown',
-      latestUserText: '好的，我明白了',
+      latestUserText: '先暂停一下',
     }))
-    assert.notEqual(getIntentCategory(general), 'self_diagnosis_request')
-    assert.equal(shouldSuppressToolsForIntent(general), true)
+    assert.equal(shouldSuppressToolsForIntent(tier1), true)
   })
 })
 
