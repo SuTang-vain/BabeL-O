@@ -12,6 +12,8 @@ import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { buildPartialTimeoutSummary } from '../src/nexus/executionTimeoutEvents.js'
 import { buildResumeFromSoftTerminal } from '../src/runtime/contextAssembler.js'
+import { resolveExecuteTimeoutDecision } from '../src/nexus/executionPreparation.js'
+import { logger } from '../src/shared/logger.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import {
@@ -9740,4 +9742,28 @@ test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined when th
     { type: 'assistant_delta', text: 'I already resumed and answered' },
   ] as any
   assert.equal(buildResumeFromSoftTerminal(events, '继续'), undefined, 'must not resume once the model already produced a new answer')
+})
+
+test('soft-timeout recovery option C: warns when watchdog leaves no room for soft extensions', () => {
+  // See docs/nexus/proposals/soft-timeout-recovery-architecture-plan.md option C.
+  // seq 924 shape: watchdog 240s, soft 180s — the hard cut fires during the
+  // extension window and starves the soft-recovery mechanism. The runtime must
+  // warn so the caller can correct the ratio.
+  const originalWarn = logger.warn
+  const warnings: string[] = []
+  logger.warn = (message: string) => { warnings.push(message) }
+  try {
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'soft', softTimeoutMs: 180000, watchdogTimeoutMs: 240000 } as any, 180000)
+    assert.ok(warnings.some(m => m.includes('leaves no room')), 'tight ratio (seq 924 shape) must warn')
+
+    warnings.length = 0
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'soft', softTimeoutMs: 180000, watchdogTimeoutMs: 540000 } as any, 180000)
+    assert.equal(warnings.length, 0, 'healthy ratio (watchdog >= soft + extensions) must not warn')
+
+    warnings.length = 0
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'fatal', timeoutMs: 180000 } as any, 180000)
+    assert.equal(warnings.length, 0, 'fatal policy (no extensions) must not warn')
+  } finally {
+    logger.warn = originalWarn
+  }
 })

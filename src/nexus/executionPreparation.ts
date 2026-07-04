@@ -142,6 +142,15 @@ export function resolveExecuteTimeoutDecision(body: ExecuteBody, defaultExecuteT
   // legacy callers never see the new extension cycle.
   const maxSoftTimeoutExtensions = policy === 'soft' ? (body.maxSoftTimeoutExtensions ?? 1) : 0
   const softTimeoutExtensionMs = body.softTimeoutExtensionMs ?? softTimeoutMs
+  // Soft-timeout recovery (option C): warn when the configured watchdog leaves
+  // no room for soft extensions — the hard cut fires during an extension and
+  // starves the soft-recovery mechanism. seq 924 (session_2db242ff) hit this
+  // with watchdog=240s / soft=180s. See
+  // docs/nexus/proposals/soft-timeout-recovery-architecture-plan.md option C.
+  if (policy === 'soft' && watchdogTimeoutMs < softTimeoutMs + maxSoftTimeoutExtensions * softTimeoutExtensionMs) {
+    const required = softTimeoutMs + maxSoftTimeoutExtensions * softTimeoutExtensionMs
+    logger.warn(`[timeout] watchdogTimeoutMs (${watchdogTimeoutMs}ms) leaves no room for soft extensions (needs >= ${required}ms = soft ${softTimeoutMs}ms + ${maxSoftTimeoutExtensions}x${softTimeoutExtensionMs}ms). The hard watchdog will fire during an extension and starve the soft-recovery mechanism. See docs/nexus/proposals/soft-timeout-recovery-architecture-plan.md option C.`)
+  }
   return {
     policy,
     softTimeoutMs,
