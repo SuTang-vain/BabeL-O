@@ -419,8 +419,17 @@ exit $_EXIT_CODE`
     }
 
     try {
+      // Pick a POSIX-compatible shell to run the wrapped command. The tool
+      // is named "Bash" and `wrappedCommand` below uses POSIX `=` assignment
+      // (`_EXIT_CODE=$?`) which non-POSIX shells (e.g. `fish`) reject at parse
+      // time. Reading `process.env.SHELL` would otherwise inherit the user's
+      // macOS login shell (set via `chsh -s /opt/homebrew/bin/fish`) and break
+      // every Bash call. Default to `/bin/bash` (always present on macOS and
+      // Linux) and allow override via `BABEL_O_SHELL` for advanced users.
+      // See https://github.com/SuTang-vain/BabeL-O/issues/8
+      const bashShell = process.env.BABEL_O_SHELL ?? '/bin/bash'
       const { stdout, stderr } = await execFileAsync(
-        process.env.SHELL ?? '/bin/sh',
+        bashShell,
         ['-lc', wrappedCommand],
         {
           cwd: currentCwd,
