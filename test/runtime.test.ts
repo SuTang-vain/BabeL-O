@@ -11,6 +11,7 @@ import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
 import { buildPartialTimeoutSummary } from '../src/nexus/executionTimeoutEvents.js'
+import { buildResumeFromSoftTerminal } from '../src/runtime/contextAssembler.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import {
@@ -9695,4 +9696,48 @@ test('Soft-error-retry Slice 2-B: partial result prefers the in-flight (truncate
   assert.ok(summary, 'a summary must be produced when there is in-flight assistant output')
   assert.match(summary!, /当前诊断报告的关键结论/, 'must keep the in-flight turn output')
   assert.ok(!summary!.includes('早期 turn'), 'must not surface earlier-turn output over the in-flight turn')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal injects resume nudge for continue + soft timeout', () => {
+  // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md C4.
+  // seq 924 shape: in-flight answer truncated by REQUEST_TIMEOUT, then the user
+  // says "继续" — the runtime must inject a resume nudge with the truncated tail.
+  const events = [
+    { type: 'user_message', text: '诊断 embedding 问题' },
+    { type: 'assistant_delta', text: '诊断报告:embedding 配置缺失,导致 sidecar 必死。' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'Execution timed out.' },
+    { type: 'user_message', text: '继续' },
+  ] as any
+  const nudge = buildResumeFromSoftTerminal(events, '继续')
+  assert.ok(nudge, 'resume nudge must be produced for continue + soft timeout')
+  assert.match(nudge!, /截断/, 'nudge must mention truncation')
+  assert.match(nudge!, /sidecar 必死/, 'nudge must include the truncated tail')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined for hard cancel', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'partial output' },
+    { type: 'error', code: 'REQUEST_CANCELLED', message: 'cancelled' },
+    { type: 'user_message', text: '继续' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '继续'), undefined, 'hard cancel must never resume')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined when not a continue request', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'partial output' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'timed out' },
+    { type: 'user_message', text: '总结一下进度' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '总结一下进度'), undefined, 'non-continue prompt must not trigger resume')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined when the model already answered after the boundary', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'truncated answer' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'timed out' },
+    { type: 'user_message', text: '继续' },
+    { type: 'assistant_delta', text: 'I already resumed and answered' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '继续'), undefined, 'must not resume once the model already produced a new answer')
 })
