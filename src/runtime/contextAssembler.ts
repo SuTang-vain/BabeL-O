@@ -461,6 +461,17 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
       content: sessionInbox,
     })
   }
+  // C4 (soft-error-retry-continuity): when the user says "继续" right after a
+  // soft REQUEST_TIMEOUT that truncated an in-flight answer, inject a resume
+  // nudge so the model continues from the truncated tail instead of restarting.
+  const resumeAfterSoftTerminal = buildResumeFromSoftTerminal(compactAwareEvents, options.runtimeOptions.prompt)
+  if (resumeAfterSoftTerminal) {
+    sections.push({
+      id: 'resume_after_soft_terminal',
+      cacheable: false,
+      content: resumeAfterSoftTerminal,
+    })
+  }
   const scopedMemoryDiagnostics = buildScopedMemoryDiagnostics({
     providerDiagnostics: memoryProviderResult?.diagnostics,
     sessionInboxMessages,
@@ -855,6 +866,70 @@ export function isRecoveryBoundaryError(code: string | undefined): boolean {
     code === 'MAX_OUTPUT_TOKENS_EXCEEDED' ||
     code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY' ||
     code === 'TOOL_CALL_TEXT_LEAK_SUPPRESSED'
+}
+
+/**
+ * C4 (soft-error-retry-continuity): detect a "continue task" intent — the user
+ * is asking the runtime to resume an in-flight answer that was truncated by a
+ * soft terminal, not start a fresh question. Kept narrow so an ordinary "继续"
+ * mention inside a longer prompt does not trigger resume.
+ */
+export function isContinueAfterSoftTerminal(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  if (!normalized) return false
+  if (/^(继续|接着|继续任务|继续吧|go on|continue|resume|keep going)([了啊吧。，,.\s]|$)/i.test(normalized)) return true
+  return /\b(continue|resume|go on|keep going)\b/i.test(normalized)
+}
+
+/**
+ * C4 (soft-error-retry-continuity): build a resume nudge when the user asks to
+ * continue right after a soft REQUEST_TIMEOUT that truncated an in-flight
+ * answer. Returns undefined when there is no soft terminal, no in-flight
+ * partial, the model already produced a new answer after the boundary (user
+ * moved on), or the prompt is not a continue cue. Hard cancels
+ * (REQUEST_CANCELLED) and other boundaries never resume — only soft timeouts.
+ */
+export function buildResumeFromSoftTerminal(events: readonly NexusEvent[], prompt: string): string | undefined {
+  if (!isContinueAfterSoftTerminal(prompt)) return undefined
+  let boundaryIndex = -1
+  let boundaryCode = ''
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!
+    if (event.type === 'error' && isRecoveryBoundaryError(event.code)) {
+      boundaryIndex = index
+      boundaryCode = event.code
+      break
+    }
+  }
+  if (boundaryIndex === -1) return undefined
+  // Only soft-timeout truncation resumes. Hard cancel / other boundaries do not.
+  if (boundaryCode !== 'REQUEST_TIMEOUT') return undefined
+  // The boundary must be the most recent turn: no assistant output after it.
+  // If the model already produced a new answer, the user has moved past it.
+  const hasAssistantAfterBoundary = events.slice(boundaryIndex + 1)
+    .some(event => event.type === 'assistant_delta')
+  if (hasAssistantAfterBoundary) return undefined
+  // Extract the in-flight (truncated) turn's assistant output: between the last
+  // user_message before the boundary and the boundary itself. Keep the tail —
+  // the cutoff happened at the tail (same in-flight logic as Slice 2-B).
+  let turnStart = 0
+  for (let index = boundaryIndex - 1; index >= 0; index -= 1) {
+    if (events[index]!.type === 'user_message') { turnStart = index + 1; break }
+  }
+  const inFlight = events.slice(turnStart, boundaryIndex)
+    .filter((event): event is Extract<NexusEvent, { type: 'assistant_delta' }> => event.type === 'assistant_delta')
+    .map(event => event.text)
+    .join('')
+    .replace(/\s+/g, ' ')
+    .trim()
+  if (!inFlight) return undefined
+  const tail = inFlight.length > 400 ? `...${inFlight.slice(-397)}` : inFlight
+  return [
+    '上一轮执行被软超时截断(soft REQUEST_TIMEOUT),上一回合的回答没有输出完成。',
+    '模型被截断前的最后输出:',
+    tail,
+    '请从截断处继续完成该回答,不要重复已输出内容;若上下文已足够,直接给出剩余结论。',
+  ].join('\n')
 }
 
 function trimSelectedWindow(events: NexusEvent[], maxEvents: number): NexusEvent[] {
