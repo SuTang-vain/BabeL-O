@@ -5,7 +5,7 @@
 > Priority: P1
 > Source of truth: [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md), [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md), `src/nexus/executionStreamLoop.ts`, `src/nexus/executionPreparation.ts`, `src/runtime/intentGuidance.ts`, `src/runtime/pipeline/providerTurn.ts`, `src/runtime/LLMCodingRuntime.ts`, `test/`
 > Governance: Promotes the "soft signal" class (soft timeout, intent suppression, soft tool denial) from hard-error presentation to a recoverable continuity path. Composes with — and does not weaken — the over-tooling protection in [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md) (Phase D `final_check` already landed one soft-denial pattern; this plan generalizes it). Must not raise `maxLoops`, must not remove intent suppression, must not bypass permission/scope/risk gates.
-> Related: [intent-tool-suppression-stopgap-plan.md](./intent-tool-suppression-stopgap-plan.md), [provider-unavailable-auto-retry-governance-plan.md](./provider-unavailable-auto-retry-governance-plan.md)
+> Related: [intent-tool-suppression-stopgap-plan.md](../archive/intent-tool-suppression-stopgap-plan.md), [provider-unavailable-auto-retry-governance-plan.md](./provider-unavailable-auto-retry-governance-plan.md)
 > 2026-07-03 implementation — Slice 1 (B1 + B2-lightweight + B3) + Slice 3 C1-subset landed in PR #17 (merged to develop). Slice 2-B landed on branch `fix/soft-error-retry-slice-2`: in-architecture partial-result strengthening — `buildPartialTimeoutSummary` now prefers the in-flight turn's output (after the last user_message) and keeps the tail (where the watchdog cutoff happened), so a 95%-done answer truncated by the watchdog is preserved as the partial result instead of an early-turn prefix (verified against seq 925, whose partial was already preserved but with the wrong content). **Slice 2 A1/A2 (soft-timeout self-abort + finish-window) deferred** — deep-tracing showed they conflict with the single-source watchdog architecture: soft-timeout never aborts itself, termination is always the single watchdog (executeStreamRoute.ts:126-137, guarded by execute-stream-watchdog.test.ts:121 + runtime.test.ts:6030); overturning it needs a separate proposal. **A3 re-confirmed wrong** (breaks Phase 3 soft+0). **Slice 3 remainder (C2/C3/C4) deferred** — C2 breaking event-type change, C3 new NexusEvent type, C4 session-resume machinery. Full suite 1270/0; typecheck clean; `docs:check` 0; `format:check` 0.
 
 ## Purpose
@@ -205,7 +205,7 @@ Each slice: TDD red → implement → `npm test` + `npm run docs:check` + `npm r
 
 ## Graduation
 
-This plan graduates into [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md) as a new "Soft Error Continuity" phase (alongside Phase D `final_check`), then moves to `archive/` with a one-line index note. It does not remain a standalone reference. Partial graduation: Slice 1 lands the `self_diagnosis_request` exemption into the intent-guidance Active Plan as a completed slice (composing with [intent-tool-suppression-stopgap-plan.md](./intent-tool-suppression-stopgap-plan.md) Fix A/B).
+This plan graduates into [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md) as a new "Soft Error Continuity" phase (alongside Phase D `final_check`), then moves to `archive/` with a one-line index note. It does not remain a standalone reference. Partial graduation: Slice 1 lands the `self_diagnosis_request` exemption into the intent-guidance Active Plan as a completed slice (composing with [intent-tool-suppression-stopgap-plan.md](../archive/intent-tool-suppression-stopgap-plan.md) Fix A/B).
 
 ## Risks & Rollback
 
@@ -219,7 +219,7 @@ This plan graduates into [runtime-tool-loop-governance-plan.md](../reference/run
 
 - [runtime-tool-loop-governance-plan.md](../reference/runtime-tool-loop-governance-plan.md) (Active Plan): owns the continuity model. Phase D `final_check` landed the first soft-denial pattern (`TOOL_DENIED_FINAL_CHECK`); this plan generalizes soft-denial rendering (C2) and adds the soft-timeout finish path (Fix A). Composes, does not conflict.
 - [intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md) (Active Plan): owns intent-guidance regressions. B1 lands a `self_diagnosis_request` exemption as a new slice there.
-- [intent-tool-suppression-stopgap-plan.md](./intent-tool-suppression-stopgap-plan.md) (Draft): landed Mode A/B stopgaps. B1 is a complementary exemption (different category), not a duplicate. That proposal's "direction 2" (first-call passthrough) remains out of scope here.
+- [intent-tool-suppression-stopgap-plan.md](../archive/intent-tool-suppression-stopgap-plan.md) (Draft): landed Mode A/B stopgaps. B1 is a complementary exemption (different category), not a duplicate. That proposal's "direction 2" (first-call passthrough) remains out of scope here.
 - [provider-unavailable-auto-retry-governance-plan.md](./provider-unavailable-auto-retry-governance-plan.md) (Partially Landed): same "soft retry" philosophy for provider failures; this plan extends the philosophy to runtime-side soft signals.
 
 ## 中文概述

@@ -5,6 +5,8 @@
 ## 文档
 
 - [TODO_cli.md](./TODO_cli.md): 已被 [../README.md](../README.md) 和 [../active/TODO_tui.md](../active/TODO_tui.md) 取代的 CLI 导航页。
+- [intent-tool-suppression-stopgap-plan.md](./intent-tool-suppression-stopgap-plan.md): 已收口的 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` stopgap（PR #13，Fix A action-verb negation + Fix B `continue+normal` guard），已折进 [../reference/intent-guidance-and-prompt-governance-optimization-plan.md](../reference/intent-guidance-and-prompt-governance-optimization-plan.md) Phase C。
+- [intent-tool-suppression-structural-passthrough-plan.md](./intent-tool-suppression-structural-passthrough-plan.md): 已收口的方向 2 结构性根治（PR #15，两层压制：Tier 1 硬压制 + Tier 2 首调放行 + option-confirmation gate 解耦），与 stopgap 一起折进 Phase C 作为 suppression-reform 的闭环。
 - [TODO_tool_result_budget.md](./TODO_tool_result_budget.md): 已完成的工具结果持久化与消息级预算历史设计。
 - [intake-classifier-upgrade-plan.md](./intake-classifier-upgrade-plan.md): 已完成的 Intake Classifier Phase 1-4 历史规划。
 - [tool-call-text-leakage-governance.md](./tool-call-text-leakage-governance.md): 已完成 Phase A-C 的 Tool-call Text Leakage 治理设计。
