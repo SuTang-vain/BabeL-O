@@ -552,6 +552,12 @@ export async function* streamProviderTurn(options: {
 
 function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): ToolCallTextLeakSuppression | undefined {
   const normalized = text.toLowerCase()
+  // Half-width (ASCII) dialect patterns: generic XML, MiniMax XML, JSON tool
+  // calls, MCP-style. Plus full-width (DSML) variants — models emit full-width
+  // brackets (U+FF1C ＜, U+FF1E ＞, U+3010 【) to bypass half-width suppression
+  // when tools are hidden. dsml_fullwidth_tool_calls is suppress-only until a
+  // strict parser proves safe normalization while tools are visible. See
+  // runtime-tool-loop-governance-plan.md Phase B.
   const patterns = [
     '<tool_call',
     '</tool_call>',
@@ -562,6 +568,14 @@ function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): Too
     '"tool_calls"',
     '"function_call"',
     'call_tool ',
+    // DSML / full-width variants
+    '＜tool_call',
+    '＜/tool_call',
+    '＜invoke name=',
+    '＜/invoke',
+    '＜minimax:tool_call',
+    '【tool_call',
+    '【invoke name=',
   ]
   const pattern = patterns.find(candidate => normalized.includes(candidate))
   if (!pattern) return undefined
@@ -575,6 +589,7 @@ function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): Too
 function redactToolCallTextPreview(text: string): string {
   return text
     .replace(/<command>[\s\S]*?<\/command>/gi, '<command>[REDACTED]</command>')
+    .replace(/＜command＞[\s\S]*?＜\/command＞/giu, '＜command＞[REDACTED]＜/command＞')
     .replace(/"arguments"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"arguments":"[REDACTED]"')
     .replace(/"command"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"command":"[REDACTED]"')
     .slice(0, 300)

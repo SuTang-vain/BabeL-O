@@ -30,7 +30,7 @@ Implemented pieces:
 
 Open pieces:
 
-- DSML / full-width pseudo tool-call text needs a formal dialect entry and regression coverage.
+- Phase B remainder: a formal dialect registry (named `minimax_xml` / `generic_xml_tool_call` / `json_tool_calls_text` / `dsml_fullwidth_tool_calls` as a typed registry, not inline patterns) and a strict DSML parser for visible-tool normalization remain open. Full-width (DSML) detection landed in `detectToolCallTextLeak` (Phase B suppress-only slice — `＜tool_call＞` / `【tool_call】` variants no longer bypass the leak guard).
 - Phase C remainder: the loop budget is still implicit (`maxLoops=25`, reserve `3`) rather than a first-class typed `ToolLoopBudget` struct with a `reason` field; the pragmatic surfacing covers the user-visible failure but not the full typed contract.
 - Phase D remainder: per-tool "bounded" enforcement (Read line ranges, target-path-in-scope checks, "the same input has not already failed") is intentionally deferred — the first version gates on the read-only whitelist + a single `final_check` turn only (see Non-goals).
 
@@ -159,7 +159,7 @@ Never grant `final_check` for `Write`, `Edit`, `Bash`, `TaskCreate`, `SkillSave`
 | Phase | Status | Scope | Exit criteria |
 | --- | --- | --- | --- |
 | Phase A | Partially Landed | Recoverable tool result path and structured repair hints. | Recoverable tool failures are provider-visible and paired to the original tool call. |
-| Phase B | Active Plan | DSML and text-tool dialect registry. | Hidden-tool DSML is suppressed and retried; visible-tools DSML remains suppress-only until strict parser tests exist. |
+| Phase B | Partially Landed | DSML and text-tool dialect registry. | Hidden-tool DSML is suppressed and retried; visible-tools DSML remains suppress-only until strict parser tests exist. Full-width (DSML) detection landed in `detectToolCallTextLeak` (suppress-only slice); formal typed registry + strict parser remain open. |
 | Phase C | Partially Landed | Loop budget diagnostics. | Invocation diagnostics and execution metrics expose loop state and finalization reason. (Iteration/phase/reason surfaced in execution state block; top repeated-tool input nudge wired via `findRepeatedToolInputs`. Typed `ToolLoopBudget` struct + `reason` field remain open.) |
 | Phase D | Landed | One bounded `final_check`. | One read-only in-scope check can run before `must_respond`; write/execute/task tools are denied with `TOOL_DENIED_FINAL_CHECK`. Per-tool bounded enforcement deferred (Non-goal). |
 | Phase E | Watch | Adaptive budget profiles. | Any expanded budget is justified by task intent, context pressure, timeout pressure, and tool novelty telemetry. |
@@ -202,3 +202,5 @@ Recoverable tool failure 的基础能力已部分落地；Phase D（`final_check
 ### 下一步
 
 优先补 DSML suppress regression，再视长任务 telemetry 决定是否补 typed budget 结构与 per-tool bounded 强制。不要通过简单提高 `maxLoops` 来掩盖长任务问题。
+
+> 2026-07-05 — Phase B suppress-only slice landed: `detectToolCallTextLeak` now matches full-width (DSML) variants (`＜tool_call` / `＜invoke name=` / `【tool_call`), so models can no longer bypass the leak guard with full-width brackets when tools are hidden. `redactToolCallTextPreview` redacts full-width `＜command＞` bodies. Formal typed dialect registry + strict DSML parser for visible-tool normalization remain open. PR fix/runtime-tool-loop-phase-b-dsml.
