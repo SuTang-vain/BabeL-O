@@ -8,6 +8,32 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 - No unreleased user-facing changes are documented yet.
 
+## v0.4.1 - 2026-07-06
+
+[Full release notes](docs/releases/v0.4.1.md)
+
+### Added
+
+- Added runtime authorization and consent gates that separate tool need from
+  user-authorized execution scope.
+- Added Go TUI, CLI one-shot, inspect-session, and trace visibility for
+  authorization mismatches.
+- Added Everforest Light Soft theme coverage.
+
+### Changed
+
+- Improved soft-error and soft-timeout continuity so recoverable runtime states
+  preserve clearer in-flight turn context.
+- Expanded Skill resource coverage and matcher quality for Agent Skills
+  packages.
+
+### Fixed
+
+- Fixed bash tool startup when the user's login shell is incompatible by
+  falling back to `/bin/bash`.
+- Reduced unwanted editing or over-confirmation when the user only gives a
+  preference, status question, or meta-behavior question.
+
 ## v0.4.0 - 2026-07-03
 
 [Full release notes](docs/releases/v0.4.0.md)
