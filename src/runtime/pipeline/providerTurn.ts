@@ -271,8 +271,10 @@ export function reduceProviderTurnOutcome(options: {
   if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
     const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
     const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
+    const suppressionReason = getToolSuppressionReason(options.userIntentGuidance)
+    const blocksExecution = suppressionReason?.startsWith('authorization:none') ?? false
     return {
-      kind: 'continue',
+      kind: blocksExecution ? 'terminal' : 'continue',
       eventsBeforeMessages: [
         buildRuntimeErrorEvent({
           sessionId: options.sessionId,
@@ -284,19 +286,26 @@ export function reduceProviderTurnOutcome(options: {
             requiresTools: options.userIntentGuidance.requiresTools,
             latestUserText: options.userIntentGuidance.latestUserText,
             intentCategory: getIntentCategory(options.userIntentGuidance),
-            suppressionReason: getToolSuppressionReason(options.userIntentGuidance),
+            suppressionReason,
             severity: 'soft',
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
-            retryAttempted: true,
-            retryExhausted: false,
+            retryAttempted: !blocksExecution,
+            retryExhausted: blocksExecution,
           },
         }),
       ],
-      eventsAfterMessages: [],
-      messages: [{
-        role: 'user',
-        content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now — the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
-      }],
+      eventsAfterMessages: blocksExecution
+        ? [buildRuntimeResultEvent(options.sessionId, true, 'The latest user turn did not authorize tool-backed execution, so requested tools were suppressed.')]
+        : [],
+      messages: blocksExecution
+        ? [{
+            role: 'assistant',
+            content: 'I should answer this turn directly from the existing context. The latest message did not authorize tool-backed execution.',
+          }]
+        : [{
+            role: 'user',
+            content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now - the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
+          }],
       maxTokenRecoveryCount: options.maxTokenRecoveryCount,
       outputRetryCount: options.outputRetryCount,
       suppressedToolRetryCount: options.suppressedToolRetryCount + 1,

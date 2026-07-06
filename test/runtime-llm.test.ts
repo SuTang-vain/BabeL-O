@@ -845,6 +845,71 @@ describe('User intent fallback guidance', () => {
     assert.equal(guidance.problemTarget, 'agent_failure')
     assert.match(formatUserIntentGuidance(guidance), /Stale task mode: background_only/)
   })
+
+  test('classifies preference selections and agent-behavior questions as unauthorized execution', () => {
+    for (const latestPrompt of ['everforest', 'light-soft吧']) {
+      const guidance = deriveFallbackUserIntentGuidance({
+        events: [],
+        latestPrompt,
+        cwd: tmpdir(),
+      })
+      assert.equal(guidance.intent, 'status')
+      assert.equal(guidance.actionHint, 'respond_only')
+      assert.equal(guidance.requiresTools, false)
+      assert.equal(guidance.authorization?.level, 'none')
+      assert.equal(guidance.authorization?.selectionKind, 'preference')
+      assert.equal(shouldSuppressToolsForIntent(guidance), true)
+      assert.match(formatUserIntentGuidance(guidance), /Authorization level: none/)
+      assert.match(formatUserIntentGuidance(guidance), /Selection kind: preference/)
+    }
+
+    const meta = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '？为什么你会这么犹豫',
+      cwd: tmpdir(),
+    })
+    assert.equal(meta.intent, 'status')
+    assert.equal(meta.actionHint, 'respond_only')
+    assert.equal(meta.requiresTools, false)
+    assert.equal(meta.problemTarget, 'agent_failure')
+    assert.equal(meta.authorization?.level, 'none')
+    assert.equal(meta.authorization?.selectionKind, 'none')
+    assert.equal(shouldSuppressToolsForIntent(meta), true)
+  })
+
+  test('derives inspect, local, shared, and destructive authorization levels', () => {
+    const inspect = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '查看当前项目分支情况',
+      cwd: tmpdir(),
+    })
+    assert.equal(inspect.authorization?.level, 'inspect')
+    assert.equal(inspect.requiresTools, true)
+
+    const local = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '根据文档规划开始推进',
+      cwd: tmpdir(),
+    })
+    assert.equal(local.authorization?.level, 'local_change')
+    assert.equal(local.authorization?.consentScope, 'stated_plan')
+
+    const shared = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '把 develop 推送到远端',
+      cwd: tmpdir(),
+    })
+    assert.equal(shared.authorization?.level, 'shared_change')
+    assert.equal(shared.authorization?.consentScope, 'current_step')
+
+    const destructive = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '删除旧目录重新 clone',
+      cwd: tmpdir(),
+    })
+    assert.equal(destructive.authorization?.level, 'destructive')
+    assert.equal(destructive.authorization?.consentScope, 'current_step')
+  })
 })
 
 describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
@@ -3166,6 +3231,83 @@ describe('LLMCodingRuntime', () => {
     const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
     assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
     assert.match(JSON.stringify(secondBody.messages), /inspect a file or run a read-only check to answer, retry that tool now/)
+  })
+
+  test('blocks tool execution for bare preference selection even when intake model asks for tools', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-preference-auth-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'theme.txt')
+    fs.writeFileSync(targetFile, 'dark\n', 'utf8')
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"authorizationLevel\\":\\"local_change\\",\\"consentScope\\":\\"current_step\\",\\"consentSource\\":\\"explicit_user\\",\\"selectionKind\\":\\"none\\",\\"reason\\":\\"Incorrectly treat preference as execution.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createAnthropicToolUseStream({
+          id: 'tool-preference-edit',
+          name: 'Edit',
+          input: {
+            path: targetFile,
+            oldString: 'dark',
+            newString: 'light-soft',
+          },
+        }),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowAllTools(),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-preference-selection-no-tool-execution',
+        prompt: 'light-soft吧',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      assert.equal(fs.readFileSync(targetFile, 'utf8'), 'dark\n')
+      const intake = events.find(event => event.type === 'user_intake_guidance') as any
+      assert.ok(intake)
+      assert.equal(intake.authorizationLevel, 'none')
+      assert.equal(intake.selectionKind, 'preference')
+      assert.equal(intake.requiresTools, false)
+
+      const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+      assert.ok(suppressionError)
+      assert.equal(suppressionError.details?.suppressionReason, 'authorization:none:preference_selection')
+      assert.equal(suppressionError.details?.retryAttempted, false)
+
+      assert.equal(events.some(event => event.type === 'tool_started'), false)
+      assert.equal(fetchCalls.length, 1)
+    } finally {
+      try {
+        fs.rmSync(cwd, { recursive: true, force: true })
+      } catch {}
+    }
   })
 
   test('hard-suppresses MiniMax bracket-wrapped tool calls for respond-only intake', async () => {

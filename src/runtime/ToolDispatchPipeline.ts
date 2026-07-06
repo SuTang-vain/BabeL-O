@@ -4,6 +4,7 @@ import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool } from '../tools/Tool.js'
 import type { ToolPolicy } from './LocalCodingRuntime.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
+import type { UserIntentGuidance } from './intentGuidance.js'
 import {
   buildContextGroundingConfirmedEventForToolResult,
   resolveProviderToolCallInput,
@@ -51,6 +52,7 @@ export class ToolDispatchPipeline {
     runtimeOptions: RuntimeExecuteOptions
     previousEvents: NexusEvent[]
     taskScopeEvent: TaskScopeDeclaredEvent
+    userIntentGuidance?: UserIntentGuidance
   }): AsyncGenerator<NexusEvent, ToolDispatchPipelineResult> {
     let previousEvents = options.previousEvents
     let taskScopeEvent = options.taskScopeEvent
@@ -68,6 +70,7 @@ export class ToolDispatchPipeline {
         readFileCache: this.deps.readFileCache,
         taskScope: taskScopeEvent,
         providerSessionRules: this.deps.providerSessionRules,
+        userIntentGuidance: options.userIntentGuidance,
       })
       let next = await toolExecution.next()
       while (!next.done) {

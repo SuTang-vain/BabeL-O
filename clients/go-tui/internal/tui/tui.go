@@ -4243,18 +4243,23 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		suggestedRule := strings.TrimSpace(stringField(event, "suggestedRule"))
 		repeatedRuleCount := m.recordPermissionRuleSeen(suggestedRule, time.Now())
 		m.pending = &pendingPermission{
-			sessionID:         sessionID,
-			toolUseID:         stringField(event, "toolUseId"),
-			name:              stringField(event, "name"),
-			risk:              stringField(event, "risk"),
-			input:             formatToolInput(stringField(event, "name"), event["input"]),
-			message:           stringField(event, "message"),
-			scopeRisk:         scopeRisk,
-			targetRoot:        stringField(event, "targetRoot"),
-			taskPrimaryRoot:   stringField(event, "taskPrimaryRoot"),
-			scopeReason:       stringField(event, "scopeReason"),
-			suggestedRule:     suggestedRule,
-			repeatedRuleCount: repeatedRuleCount,
+			sessionID:                  sessionID,
+			toolUseID:                  stringField(event, "toolUseId"),
+			name:                       stringField(event, "name"),
+			risk:                       stringField(event, "risk"),
+			input:                      formatToolInput(stringField(event, "name"), event["input"]),
+			message:                    stringField(event, "message"),
+			scopeRisk:                  scopeRisk,
+			targetRoot:                 stringField(event, "targetRoot"),
+			taskPrimaryRoot:            stringField(event, "taskPrimaryRoot"),
+			scopeReason:                stringField(event, "scopeReason"),
+			authorizationLevel:         stringField(event, "authorizationLevel"),
+			requiredAuthorizationLevel: stringField(event, "requiredAuthorizationLevel"),
+			consentScope:               stringField(event, "consentScope"),
+			authorizationReason:        stringField(event, "authorizationReason"),
+			suggestedUserWording:       stringField(event, "suggestedUserWording"),
+			suggestedRule:              suggestedRule,
+			repeatedRuleCount:          repeatedRuleCount,
 		}
 		// Reset the cursor to the safe default ("Approve once")
 		// on every fresh permission request so a stale cursor

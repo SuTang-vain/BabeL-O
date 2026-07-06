@@ -23,6 +23,7 @@ This directory holds work that is still being shaped, partially implemented, or 
 | [session-channel-tui-relationship-visibility-plan.md](./session-channel-tui-relationship-visibility-plan.md) | Draft | SessionChannel relationship visibility in TUI without transcript merging or auto-action. |
 | [unify-agent-execution-models-plan.md](./unify-agent-execution-models-plan.md) | Draft | Converge the three overlapping agent subsystems (`runAgentLoop` / `ExploreAgentScheduler` / execute path) on one vocabulary + SQLite state owner; replace `skipPermissionCheck` with profile-scoped policy. (Architecture review P1-7.) |
 | [unify-embedded-cli-path-plan.md](./unify-embedded-cli-path-plan.md) | Draft | Shared `NexusClientInterface`, long-lived embedded Nexus, route embedded execution through the app to eliminate the second orchestration in `runSessionFlow.ts`. (Architecture review P0-3.) |
+| [strategy-authorization-and-consent-governance-plan.md](./strategy-authorization-and-consent-governance-plan.md) | Partially Landed | Separate tool need from execution authorization; Phase 0-3 gate and Phase 4 Go TUI, inspect-session, trace, and CLI one-shot wording slices landed. Replay evaluation remains open. |
 
 已毕业到 `../reference/` 的提案（升为 `Active Plan`）以 [../reference/README.md](../reference/README.md) 为准；本目录不再重复登记毕业条目，避免与 reference 索引双重维护。
 

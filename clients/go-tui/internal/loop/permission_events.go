@@ -30,13 +30,16 @@
 //	  scopeRisk?: "external_repo" | ...,
 //	  targetRoot?: "/tmp/external",
 //	  taskPrimaryRoot?: "/Users/me/repo",
+//	  authorizationLevel?: "inspect" | ...,
+//	  requiredAuthorizationLevel?: "local_change" | ...,
+//	  consentScope?: "current_step" | ...,
+//	  authorizationReason?: "...",
+//	  suggestedUserWording?: "...",
 //	}
 //
 // Fields PanePermission doesn't model (input, scopeReason,
-// source) are intentionally dropped — the dialog renderer
-// just needs to show name + risk + message + a one-line
-// rule suggestion. Tool input can be 100KB+ and would
-// blow out the body column.
+// source) are intentionally dropped. Tool input can be 100KB+
+// and would blow out the body column.
 
 package loop
 
@@ -77,14 +80,19 @@ func EventToPermission(raw json.RawMessage) (*PanePermission, bool) {
 		return nil, false
 	}
 	var p struct {
-		ToolUseID       string `json:"toolUseId"`
-		Name            string `json:"name"`
-		Risk            string `json:"risk"`
-		Message         string `json:"message"`
-		SuggestedRule   string `json:"suggestedRule"`
-		ScopeRisk       string `json:"scopeRisk"`
-		TargetRoot      string `json:"targetRoot"`
-		TaskPrimaryRoot string `json:"taskPrimaryRoot"`
+		ToolUseID                  string `json:"toolUseId"`
+		Name                       string `json:"name"`
+		Risk                       string `json:"risk"`
+		Message                    string `json:"message"`
+		SuggestedRule              string `json:"suggestedRule"`
+		ScopeRisk                  string `json:"scopeRisk"`
+		TargetRoot                 string `json:"targetRoot"`
+		TaskPrimaryRoot            string `json:"taskPrimaryRoot"`
+		AuthorizationLevel         string `json:"authorizationLevel"`
+		RequiredAuthorizationLevel string `json:"requiredAuthorizationLevel"`
+		ConsentScope               string `json:"consentScope"`
+		AuthorizationReason        string `json:"authorizationReason"`
+		SuggestedUserWording       string `json:"suggestedUserWording"`
 	}
 	if err := json.Unmarshal(raw, &p); err != nil {
 		return nil, false
@@ -98,13 +106,18 @@ func EventToPermission(raw json.RawMessage) (*PanePermission, bool) {
 		return nil, false
 	}
 	return &PanePermission{
-		ToolUseID:       p.ToolUseID,
-		Name:            p.Name,
-		Risk:            p.Risk,
-		Message:         p.Message,
-		SuggestedRule:   p.SuggestedRule,
-		ScopeRisk:       p.ScopeRisk,
-		TargetRoot:      p.TargetRoot,
-		TaskPrimaryRoot: p.TaskPrimaryRoot,
+		ToolUseID:                  p.ToolUseID,
+		Name:                       p.Name,
+		Risk:                       p.Risk,
+		Message:                    p.Message,
+		SuggestedRule:              p.SuggestedRule,
+		ScopeRisk:                  p.ScopeRisk,
+		TargetRoot:                 p.TargetRoot,
+		TaskPrimaryRoot:            p.TaskPrimaryRoot,
+		AuthorizationLevel:         p.AuthorizationLevel,
+		RequiredAuthorizationLevel: p.RequiredAuthorizationLevel,
+		ConsentScope:               p.ConsentScope,
+		AuthorizationReason:        p.AuthorizationReason,
+		SuggestedUserWording:       p.SuggestedUserWording,
 	}, true
 }

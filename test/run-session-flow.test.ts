@@ -1,6 +1,8 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
+  AUTHORIZATION_MISMATCH_TERMINAL_EVENT,
+  formatAuthorizationMismatchCliMessage,
   REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT,
   resolveCliPolicyMode,
   resolveFinalSessionOutcome,
@@ -66,6 +68,63 @@ test('resolveFinalSessionOutcome treats latest failed result as failed', () => {
 
   assert.equal(outcome.phase, 'failed')
   assert.match(outcome.result ?? '', /empty assistant response/)
+})
+
+test('resolveFinalSessionOutcome surfaces authorization mismatch instead of generic failed result', () => {
+  const outcome = resolveFinalSessionOutcome([
+    {
+      type: 'result',
+      schemaVersion,
+      sessionId: 'session-auth-mismatch',
+      timestamp: '2026-07-06T04:00:02.000Z',
+      success: false,
+      message: 'Tool call was denied.',
+    },
+    {
+      type: 'tool_denied',
+      schemaVersion,
+      sessionId: 'session-auth-mismatch',
+      timestamp: '2026-07-06T04:00:01.000Z',
+      toolUseId: 'tu-auth',
+      name: 'Bash',
+      risk: 'execute',
+      message: 'The latest user turn did not authorize tool-backed mutation or execution.',
+      denialKind: 'policy',
+      recoverable: true,
+      authorizationLevel: 'none',
+      requiredAuthorizationLevel: 'local_change',
+      consentScope: 'current_step',
+      authorizationReason: 'preference selection without execution consent',
+      suggestedUserWording: 'Please say that you want me to apply this change.',
+    },
+  ])
+
+  assert.equal(outcome.phase, 'failed')
+  assert.equal(outcome.terminalReason?.code, AUTHORIZATION_MISMATCH_TERMINAL_EVENT)
+  assert.match(outcome.result ?? '', /Authorization mismatch for Bash/)
+  assert.match(outcome.result ?? '', /Current authorization: none/)
+  assert.match(outcome.result ?? '', /Required authorization: local_change/)
+  assert.match(outcome.result ?? '', /Please say that you want me to apply this change/)
+})
+
+test('formatAuthorizationMismatchCliMessage renders current and required authorization', () => {
+  const message = formatAuthorizationMismatchCliMessage({
+    name: 'Edit',
+    authorizationLevel: 'inspect',
+    requiredAuthorizationLevel: 'local_change',
+    consentScope: 'current_step',
+    authorizationReason: 'read-only inspection',
+    suggestedUserWording: 'Please ask me to make the local change.',
+    message: 'Turn authorization is inspect; only read-only tools are authorized.',
+  })
+
+  assert.match(message, /Authorization mismatch for Edit/)
+  assert.match(message, /Current authorization: inspect/)
+  assert.match(message, /Required authorization: local_change/)
+  assert.match(message, /Consent scope: current_step/)
+  assert.match(message, /Authorization reason: read-only inspection/)
+  assert.match(message, /Suggested wording: Please ask me to make the local change/)
+  assert.match(message, /only read-only tools are authorized/)
 })
 
 test('resolveFinalSessionOutcome does not reuse an older turn result when current request has no terminal event', () => {

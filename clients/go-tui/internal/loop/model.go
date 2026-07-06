@@ -117,14 +117,19 @@ type PaneModel struct {
 // model only stores enough data for a future dialog renderer
 // to attach to the pane that emitted the request.
 type PanePermission struct {
-	ToolUseID       string
-	Name            string
-	Risk            string
-	Message         string
-	SuggestedRule   string
-	ScopeRisk       string
-	TargetRoot      string
-	TaskPrimaryRoot string
+	ToolUseID                  string
+	Name                       string
+	Risk                       string
+	Message                    string
+	SuggestedRule              string
+	ScopeRisk                  string
+	TargetRoot                 string
+	TaskPrimaryRoot            string
+	AuthorizationLevel         string
+	RequiredAuthorizationLevel string
+	ConsentScope               string
+	AuthorizationReason        string
+	SuggestedUserWording       string
 }
 
 // FocusPath identifies the focused pane in a workspace/tab tree.

@@ -6,16 +6,21 @@ import (
 )
 
 type pendingPermission struct {
-	sessionID       string
-	toolUseID       string
-	name            string
-	risk            string
-	input           string
-	message         string
-	scopeRisk       string
-	targetRoot      string
-	taskPrimaryRoot string
-	scopeReason     string
+	sessionID                   string
+	toolUseID                   string
+	name                        string
+	risk                        string
+	input                       string
+	message                     string
+	scopeRisk                   string
+	targetRoot                  string
+	taskPrimaryRoot             string
+	scopeReason                 string
+	authorizationLevel          string
+	requiredAuthorizationLevel  string
+	consentScope                string
+	authorizationReason         string
+	suggestedUserWording        string
 	// Phase A.1: model-suggested allow rule (e.g. "cd:*",
 	// "git:status"). Surfaced from the runtime's
 	// `permission_request` event's `suggestedRule` field.

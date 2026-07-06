@@ -110,6 +110,15 @@ const baseRuntimeUserIntentGuidance: UserIntentGuidance = {
   latestUserText: 'test prompt',
   explicitPaths: [],
   source: 'fallback',
+  authorization: {
+    level: 'local_change',
+    consentScope: 'current_step',
+    source: 'explicit_user',
+    selectionKind: 'none',
+    reason: 'test authorization',
+    allowedActionSummary: 'test',
+    blockedActionSummary: 'test',
+  },
 }
 
 function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -1542,6 +1551,230 @@ test('runtime tool loop executes a provider tool call and returns tool_result co
   assert.ok(metrics.toolRoundtripDurationMs >= 0)
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Read'))
   assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+})
+
+test('runtime tool loop blocks write tools under inspect-only turn authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-inspect`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'theme.txt'), 'dark\n', 'utf8')
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_inspect_edit',
+      name: 'Edit',
+      partialInput: '{"path":"theme.txt","oldString":"dark","newString":"light"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-inspect-edit',
+      prompt: '查看当前主题',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '查看当前主题',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'inspect',
+        reason: 'read-only inspection',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /only read-only tools are authorized/)
+  assert.equal(await readFile(join(cwd, 'theme.txt'), 'utf8'), 'dark\n')
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'policy')
+  assert.equal(denied.authorizationLevel, 'inspect')
+  assert.equal(denied.requiredAuthorizationLevel, 'local_change')
+  assert.equal(denied.consentScope, 'current_step')
+  assert.equal(denied.authorizationReason, 'read-only inspection')
+  assert.match(denied.suggestedUserWording, /ask me to make the local change/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop blocks shared side effects under local-change authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-local`)
+  await mkdir(cwd, { recursive: true })
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_local_push',
+      name: 'Bash',
+      partialInput: '{"command":"git push origin develop","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-local-push',
+      prompt: '根据规划开始推进',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '根据规划开始推进',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'local_change',
+        consentScope: 'stated_plan',
+        reason: 'local project work only',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /shared or remote side effects are not authorized/)
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'policy')
+  assert.equal(denied.authorizationLevel, 'local_change')
+  assert.equal(denied.requiredAuthorizationLevel, 'shared_change')
+  assert.equal(denied.consentScope, 'stated_plan')
+  assert.match(denied.suggestedUserWording, /push, release, merge/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop blocks Bash mutations under no-execution authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-none-bash`)
+  await mkdir(cwd, { recursive: true })
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_none_bash',
+      name: 'Bash',
+      partialInput: '{"command":"echo light > theme.txt","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-none-bash',
+      prompt: 'light-soft吧',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: 'light-soft吧',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'none',
+        source: 'inferred_none',
+        selectionKind: 'preference',
+        reason: 'preference selection without execution consent',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /did not authorize tool-backed mutation or execution/)
+  const denied = events.find(event => event.type === 'tool_denied' && event.denialKind === 'policy') as any
+  assert.ok(denied)
+  assert.equal(denied.authorizationLevel, 'none')
+  assert.equal(denied.requiredAuthorizationLevel, 'local_change')
+  assert.equal(denied.consentScope, 'current_step')
+  assert.equal(denied.authorizationReason, 'preference selection without execution consent')
+  assert.match(denied.suggestedUserWording, /apply this change/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop requires exact permission for destructive authorized command', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-destructive`)
+  await mkdir(cwd, { recursive: true })
+  const registry = PendingPermissionRegistry.getInstance()
+  setTimeout(() => {
+    registry.resolve('session-auth-destructive-rm', 'tool_auth_destructive_rm', {
+      approved: false,
+      reason: 'test denies destructive confirmation',
+    })
+  }, 0)
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_destructive_rm',
+      name: 'Bash',
+      partialInput: '{"command":"rm -rf dist","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-destructive-rm',
+      prompt: '删除 dist 目录',
+      cwd,
+      skipPermissionCheck: false,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '删除 dist 目录',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'destructive',
+        reason: 'exact destructive request',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  const permissionRequest = events.find(event => event.type === 'permission_request') as any
+  assert.ok(permissionRequest)
+  assert.match(permissionRequest.message, /exact-target confirmation/)
+  assert.equal(permissionRequest.authorizationLevel, 'destructive')
+  assert.equal(permissionRequest.requiredAuthorizationLevel, 'destructive')
+  assert.equal(permissionRequest.consentScope, 'current_step')
+  assert.equal(permissionRequest.authorizationReason, 'exact destructive request')
+  assert.match(permissionRequest.suggestedUserWording, /confirm the exact destructive target/)
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'permission')
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
 })
 
 test('runtime Read cache does not use partial evidence as full-file evidence', async () => {

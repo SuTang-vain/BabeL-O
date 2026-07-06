@@ -1105,6 +1105,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           runtimeOptions: options,
           previousEvents,
           taskScopeEvent,
+          userIntentGuidance: assembledContext.userIntentGuidance,
         })
         let dispatchNext = await dispatchStream.next()
         while (!dispatchNext.done) {

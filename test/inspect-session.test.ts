@@ -367,6 +367,103 @@ test('inspectSession: tier (a) summarizes provider retry lifecycle events', () =
   })
 })
 
+test('inspectSession: tier (a) summarizes authorization mismatch diagnostics', () => {
+  withTempConfigDir((configDir) => {
+    const dbPath = join(configDir, 'db.sqlite')
+    const sessionId = 'session_authorization_summary-uuid'
+    seedSqliteWithSession(dbPath, sessionId, { withEvents: false })
+    const db = new DatabaseSync(dbPath)
+    try {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS events (
+          event_key TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          timestamp TEXT NOT NULL,
+          event_type TEXT,
+          event_json TEXT
+        );
+      `)
+      const events = [
+        {
+          type: 'user_intake_guidance',
+          timestamp: '2026-07-06T00:00:00.000Z',
+          userText: 'light-soft吧',
+          intent: 'continue',
+          confidence: 1,
+          continuity: 1,
+          contextScope: 'full',
+          actionHint: 'respond_only',
+          requiresTools: false,
+          authorizationLevel: 'none',
+          consentScope: 'current_step',
+          selectionKind: 'preference',
+          authorizationReason: 'preference selection without execution consent',
+          reason: 'preference selection',
+          explicitPaths: [],
+          source: 'fallback',
+        },
+        {
+          type: 'tool_denied',
+          timestamp: '2026-07-06T00:00:01.000Z',
+          toolUseId: 'tu-denied',
+          name: 'Bash',
+          risk: 'execute',
+          message: 'The latest user turn did not authorize tool-backed mutation or execution.',
+          denialKind: 'policy',
+          recoverable: true,
+          authorizationLevel: 'none',
+          requiredAuthorizationLevel: 'local_change',
+          consentScope: 'current_step',
+          authorizationReason: 'preference selection without execution consent',
+          suggestedUserWording: 'Please say that you want me to apply this change before I edit or run mutating commands.',
+        },
+        {
+          type: 'permission_request',
+          timestamp: '2026-07-06T00:00:02.000Z',
+          toolUseId: 'tu-rm',
+          name: 'Bash',
+          input: { command: 'rm -rf dist' },
+          risk: 'execute',
+          message: 'Destructive operation requires exact-target confirmation even when requested.',
+          authorizationLevel: 'destructive',
+          requiredAuthorizationLevel: 'destructive',
+          consentScope: 'current_step',
+          authorizationReason: 'exact destructive request',
+          suggestedUserWording: 'Please confirm the exact destructive target before continuing.',
+        },
+      ]
+      events.forEach((event, index) => {
+        db.prepare(
+          `INSERT OR REPLACE INTO events (event_key, session_id, timestamp, event_type, event_json)
+           VALUES (?, ?, ?, ?, ?)`,
+        ).run(`evt_authorization_${index}`, sessionId, event.timestamp, event.type, JSON.stringify(event))
+      })
+    } finally {
+      try { db.close() } catch { /* ignore */ }
+    }
+
+    const result = inspectSession(sessionId)
+    assert.equal(result.tier, 'found-in-sqlite')
+    if (result.tier !== 'found-in-sqlite') return
+    const summary = result.row.authorizationSummary
+    assert.ok(summary)
+    assert.equal(summary.latestLevel, 'none')
+    assert.equal(summary.latestConsentScope, 'current_step')
+    assert.equal(summary.latestSelectionKind, 'preference')
+    assert.equal(summary.latestReason, 'preference selection without execution consent')
+    assert.equal(summary.latestUserText, 'light-soft吧')
+    assert.equal(summary.intakeCount, 1)
+    assert.equal(summary.deniedCount, 1)
+    assert.equal(summary.permissionRequestCount, 1)
+    assert.equal(summary.mismatchCount, 2)
+    assert.equal(summary.lastMismatch?.eventType, 'permission_request')
+    assert.equal(summary.lastMismatch?.toolName, 'Bash')
+    assert.equal(summary.lastMismatch?.authorizationLevel, 'destructive')
+    assert.equal(summary.lastMismatch?.requiredAuthorizationLevel, 'destructive')
+    assert.match(summary.lastMismatch?.suggestedUserWording ?? '', /exact destructive target/)
+  })
+})
+
 test('inspectSession: tier (b) found in client log only (embedded Nexus memory-storage loss)', () => {
   // The exact `session_go_1781146359507755000` failure mode: client
   // Go TUI wrote the session id to a log line, but the embedded
