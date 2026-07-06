@@ -82,7 +82,7 @@ The current implementation already has meaningful slices:
 | SessionChannel API/storage/context invariants | [context-and-agent-history.md](../history/context-and-agent-history.md) | Partially landed; keep evidence-first. |
 | TUI relationship visibility polish | [session-channel-tui-relationship-visibility-plan.md](../proposals/session-channel-tui-relationship-visibility-plan.md) | Draft / UX follow-up. |
 | Explicit skill tools and normalized skill generation | [skill-execution-and-automated-normalized-skill-generation-governance-plan.md](./skill-execution-and-automated-normalized-skill-generation-governance-plan.md) | Partially landed substrate; product loop open. |
-| Agent Skills ecosystem compatibility | [agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md) | Partially landed; Phase 0-3 closed and Phase 4 local directory import/export preview/write landed; zip/git and lockfile next. |
+| Agent Skills ecosystem compatibility | [agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md) | Partially landed; Phase 0-3 closed and Phase 4 local directory import/export preview/write landed; zip/git and lockfile next. **2026-07-02** Phase 2.x / 3.x / 4.x real-public-sample follow-up closed: top-level companion `.md` and non-canonical asset dirs in `listPackageResources`; matcher description-length quality gate; `SkillShow` progressive disclosure surface. See [archive/skill-resource-coverage-and-matcher-quality-plan.md](../archive/skill-resource-coverage-and-matcher-quality-plan.md) and [DONE.md](../DONE.md). |
 
 ## Verification Expectations
 

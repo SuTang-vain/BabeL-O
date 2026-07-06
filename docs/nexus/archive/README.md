@@ -27,6 +27,7 @@
 - [evercore-lifecycle-cache-and-answer-governance-plan.md](./evercore-lifecycle-cache-and-answer-governance-plan.md): 已被 [../reference/memory-governance-plan.md](../reference/memory-governance-plan.md) 收敛的 EverCore lifecycle/cache/answer 历史规划。
 - [everos-first-run-onboarding-optimization-plan.md](./everos-first-run-onboarding-optimization-plan.md): 已被 [../reference/memory-governance-plan.md](../reference/memory-governance-plan.md) 收敛的 EverOS first-run onboarding 历史规划。
 - [everos-zero-friction-memory-startup-optimization-plan.md](./everos-zero-friction-memory-startup-optimization-plan.md): 已被 [../reference/memory-governance-plan.md](../reference/memory-governance-plan.md) 收敛的 EverOS zero-friction startup 历史规划。
+- [skill-resource-coverage-and-matcher-quality-plan.md](./skill-resource-coverage-and-matcher-quality-plan.md): 已落地到 [../reference/agent-skills-ecosystem-protocol-governance-plan.md](../proposals/agent-skills-ecosystem-protocol-governance-plan.md) Phase 2.x + Phase 3.x 的 loader 资源 walk 硬化、matcher description-length 质量门、`SkillShow` progressive disclosure 历史规划。
 
 ## 维护规则
 

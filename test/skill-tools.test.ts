@@ -113,12 +113,58 @@ Debug context issues.`
 
     const showResult = await skillShowTool.execute({ cwd, builtInDir, id: 'context-debugging' }, baseContext(cwd))
     assert.equal(showResult.success, true)
-    const shown = (showResult.output as { skill: { id: string; sourceFormat: string; manifestPath: string; resources: Array<{ path: string }>; body: string } }).skill
+    const shown = (showResult.output as { skill: { id: string; sourceFormat: string; manifestPath: string; resources: Array<{ path: string }>; body: string; companionReferences: Array<{ path: string }>; companionAssets: Array<{ path: string }> } }).skill
     assert.equal(shown.id, 'context-debugging')
     assert.equal(shown.sourceFormat, 'agent-skills-v1')
     assert.equal(shown.manifestPath, path.join(packageDir, 'SKILL.md'))
     assert.equal(shown.resources[0]?.path, 'references/flow.md')
     assert.match(shown.body, /description: Debug context assembly and tool suppression issues\./)
+  } finally {
+    await fs.rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('SkillShow surfaces companion references and assets for real public-ecosystem packages', async () => {
+  const { cwd, builtInDir, projectSkillsDir } = await makeProjectTreeWithBuiltIn('Companion')
+  const packageDir = path.join(projectSkillsDir, 'real-pdf')
+  await fs.mkdir(path.join(packageDir, 'canvas-fonts'), { recursive: true })
+  try {
+    await fs.writeFile(
+      path.join(packageDir, 'SKILL.md'),
+      `---
+name: real-pdf
+description: PDF processing skill.
+---
+# Body`
+    )
+    await fs.writeFile(path.join(packageDir, 'reference.md'), '# Reference')
+    await fs.writeFile(path.join(packageDir, 'forms.md'), '# Forms')
+    await fs.writeFile(path.join(packageDir, 'canvas-fonts', 'BigShoulders-Bold.ttf'), 'binary')
+    await fs.writeFile(path.join(packageDir, 'canvas-fonts', 'OFL.txt'), 'OFL')
+
+    const showResult = await skillShowTool.execute({ cwd, builtInDir, id: 'real-pdf' }, baseContext(cwd))
+    assert.equal(showResult.success, true)
+    const shown = (showResult.output as {
+      skill: {
+        companionReferences: Array<{ kind: string; path: string }>
+        companionAssets: Array<{ kind: string; path: string }>
+        body: string
+      }
+    }).skill
+
+    assert.deepStrictEqual(
+      shown.companionReferences.map(r => r.path),
+      ['forms.md', 'reference.md'],
+    )
+    assert.deepStrictEqual(
+      shown.companionAssets.map(r => r.path).sort(),
+      ['canvas-fonts/BigShoulders-Bold.ttf', 'canvas-fonts/OFL.txt'],
+    )
+    assert.match(shown.body, /## Companion Resources/)
+    assert.match(shown.body, /forms\.md/)
+    assert.match(shown.body, /reference\.md/)
+    assert.match(shown.body, /## Companion Assets/)
+    assert.match(shown.body, /canvas-fonts\/BigShoulders-Bold\.ttf/)
   } finally {
     await fs.rm(cwd, { recursive: true, force: true })
   }

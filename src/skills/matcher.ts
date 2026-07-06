@@ -1,5 +1,24 @@
 import { Skill } from './loader.js';
 
+/**
+ * Implicit discovery quality gates (Phase B of the resource-coverage plan).
+ *
+ * - `LONG_DESCRIPTION_THRESHOLD`: descriptions at or above this term-count are
+ *   considered "long-form" (Anthropic / OpenAI Codex style). Long descriptions
+ *   are penalized so a single tangential term hit cannot outrank a focused
+ *   short-description hit.
+ * - `LONG_DESCRIPTION_HIT_RATIO_FLOOR`: when a description is long, the
+ *   fraction of description terms that hit the prompt must clear this floor
+ *   to count as a real match. Otherwise the description match is demoted.
+ * - `DESCRIPTION_ABSOLUTE_HIT_FLOOR`: descriptions of any length must yield
+ *   at least this many absolute term hits to count. Single-substring
+ *   coincidence is dropped.
+ */
+const LONG_DESCRIPTION_THRESHOLD = 200;
+const LONG_DESCRIPTION_HIT_RATIO_FLOOR = 0.05;
+const LONG_DESCRIPTION_HIT_RATIO_PENALTY = 0.25;
+const DESCRIPTION_ABSOLUTE_HIT_FLOOR = 2;
+
 export function matchSkills(skills: Skill[], prompt: string, maxCount = 3): Skill[] {
   if (!prompt) return [];
   const normalizedPrompt = prompt.toLowerCase()
@@ -18,10 +37,35 @@ export function matchSkills(skills: Skill[], prompt: string, maxCount = 3): Skil
         }
       }
       if (!triggerMatched && skill.description) {
-        score += countPromptTermHits(skill.description, normalizedPrompt) * 10
+        const { hitCount, termCount } = countPromptTermHitsDetailed(
+          skill.description,
+          normalizedPrompt,
+        )
+        if (hitCount >= DESCRIPTION_ABSOLUTE_HIT_FLOOR) {
+          let descriptionScore = hitCount * 10
+          if (termCount >= LONG_DESCRIPTION_THRESHOLD) {
+            const ratio = hitCount / Math.max(1, termCount)
+            if (ratio < LONG_DESCRIPTION_HIT_RATIO_FLOOR) {
+              descriptionScore *= LONG_DESCRIPTION_HIT_RATIO_PENALTY
+            } else {
+              const lengthPenalty = Math.max(
+                0.5,
+                LONG_DESCRIPTION_THRESHOLD / Math.max(1, termCount),
+              )
+              descriptionScore *= lengthPenalty
+            }
+          }
+          score += descriptionScore
+        }
       }
       if (!triggerMatched && score === 0) {
-        score += countPromptTermHits(`${skill.name} ${skill.id}`, normalizedPrompt)
+        const { hitCount } = countPromptTermHitsDetailed(
+          `${skill.name} ${skill.id}`,
+          normalizedPrompt,
+        )
+        if (hitCount >= 1) {
+          score += hitCount
+        }
       }
       return { skill, score };
     })
@@ -44,8 +88,12 @@ function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function countPromptTermHits(source: string, normalizedPrompt: string): number {
-  let score = 0
+function countPromptTermHitsDetailed(
+  source: string,
+  normalizedPrompt: string,
+): { hitCount: number; termCount: number } {
+  let hitCount = 0
+  let termCount = 0
   const terms = source
     .toLowerCase()
     .split(/[^a-z0-9\u4e00-\u9fff]+/u)
@@ -55,9 +103,10 @@ function countPromptTermHits(source: string, normalizedPrompt: string): number {
   for (const term of terms) {
     if (seen.has(term)) continue
     seen.add(term)
+    termCount += 1
     if (normalizedPrompt.includes(term)) {
-      score += 1
+      hitCount += 1
     }
   }
-  return score
+  return { hitCount, termCount }
 }
