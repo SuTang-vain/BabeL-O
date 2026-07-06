@@ -95,3 +95,32 @@ test('ProviderTurnDriver applies tool-call text leak guard for final-response-on
   assert.equal(turn.toolCallTextLeakSuppression?.phase, 'final_response_only')
   assert.match(turn.toolCallTextLeakSuppression?.redactedPreview ?? '', /REDACTED/)
 })
+
+test('ProviderTurnDriver suppresses full-width (DSML) tool-call text leak', async () => {
+  // Phase B (dsml_fullwidth_tool_calls): full-width brackets must not bypass
+  // the leak guard when tools are hidden. See runtime-tool-loop-governance-plan.md.
+  const adapter: ModelAdapter = {
+    async *queryStream(): AsyncIterable<StreamDelta> {
+      yield { type: 'text', text: '＜tool_call＞＜command＞rm -rf /tmp/example＜/command＞＜/tool_call＞' }
+      yield { type: 'finish', reason: 'end_turn' }
+    },
+  }
+  const driver = new ProviderTurnDriver()
+
+  const { events, turn } = await collectProviderTurn(driver.run({
+    adapter,
+    queryParams,
+    sessionId: 'session-provider-driver-leak-fullwidth',
+    executionStartMs: 0,
+    queryStartMs: 0,
+    finalResponseOnlyMode: true,
+    suppressToolsForCurrentIntent: false,
+    modelVisibleToolCount: 1,
+    memoryCapabilityAnswerLeakGuard: false,
+  }))
+
+  assert.deepEqual(events.map(event => event.type), [], 'full-width tool-call text must not leak as events')
+  assert.equal(turn.assistantText, '', 'full-width tool-call text must be suppressed from assistant text')
+  assert.equal(turn.toolCallTextLeakSuppression?.phase, 'final_response_only')
+  assert.match(turn.toolCallTextLeakSuppression?.redactedPreview ?? '', /REDACTED/, 'full-width command body must be redacted')
+})
