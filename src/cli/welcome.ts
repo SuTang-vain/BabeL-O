@@ -14,21 +14,53 @@ const PIXEL_ROWS = [
   'O O P V V',
 ]
 
-const COLORS: Record<string, string> = {
-  M: '#ff006e',
-  P: '#ff4f9a',
-  R: '#c72d68',
-  O: '#ff7a18',
-  V: '#8b5cf6',
+// Pixel-letter → theme-color mapping. The keys come from PIXEL_ROWS above.
+// Each entry points to a hex string produced by reading the active theme's
+// brand / accent / secondary colors. Falling back to the theme's brand color
+// keeps the logo legible on any theme.
+function getLogoPalette(): Record<string, string> {
+  const theme = getTheme()
+  // We can't easily extract hex strings back out of chalk-styled functions,
+  // so we re-declare the per-theme pixel colors here. Keep this in sync with
+  // src/cli/theme.ts.
+  switch (theme.name) {
+    case 'everforest-light-soft':
+      return {
+        M: '#8DA101', // brand (green)
+        P: '#8DA101', // brand
+        R: '#35A77C', // accent (teal)
+        O: '#DFA000', // secondary (yellow)
+        V: '#35A77C', // accent
+      }
+    case 'minimal':
+      // Use plain white for all pixels — minimal theme is greyscale only.
+      return {
+        M: '#FFFFFF',
+        P: '#FFFFFF',
+        R: '#FFFFFF',
+        O: '#FFFFFF',
+        V: '#FFFFFF',
+      }
+    case 'default':
+    default:
+      return {
+        M: '#ff006e',
+        P: '#ff4f9a',
+        R: '#c72d68',
+        O: '#ff7a18',
+        V: '#8b5cf6',
+      }
+  }
 }
 
 function renderLogoRow(row: string): string {
+  const palette = getLogoPalette()
   let result = ''
   for (const char of row) {
     if (char === ' ') {
       result += ' '
     } else {
-      const color = COLORS[char] ?? '#ff006e'
+      const color = palette[char] ?? '#ff006e'
       result += chalk.hex(color)('█')
     }
   }
