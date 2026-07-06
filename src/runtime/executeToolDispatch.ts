@@ -53,6 +53,7 @@ import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import type { TaskScopeDeclaredEvent } from './taskScope.js'
 import type { ToolDispatchPipeline, ToolDispatchPipelineResult } from './ToolDispatchPipeline.js'
 import type { RuntimeProviderToolCall } from './runtimePipeline.js'
+import type { UserIntentGuidance } from './intentGuidance.js'
 
 export type ExecuteToolDispatchInput = {
   toolCalls: RuntimeProviderToolCall[]
@@ -63,6 +64,7 @@ export type ExecuteToolDispatchInput = {
    *  `ToolDispatchPipeline.run(...)` and returns the
    *  updated value the main loop must persist. */
   taskScopeEvent: TaskScopeDeclaredEvent
+  userIntentGuidance?: UserIntentGuidance
 }
 
 export type ExecuteToolDispatchResult = {

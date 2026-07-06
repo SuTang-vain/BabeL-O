@@ -51,6 +51,21 @@ func (d *permissionDialog) View(width int) string {
 			rows = append(rows, permissionStyle.Render("Scope reason: "+reason))
 		}
 	}
+	if auth := strings.TrimSpace(d.pending.authorizationLevel); auth != "" {
+		rows = append(rows, permissionStyle.Render("Authorization: "+auth))
+		if required := strings.TrimSpace(d.pending.requiredAuthorizationLevel); required != "" {
+			rows = append(rows, permissionStyle.Render("Required authorization: "+required))
+		}
+		if consent := strings.TrimSpace(d.pending.consentScope); consent != "" {
+			rows = append(rows, permissionStyle.Render("Consent scope: "+consent))
+		}
+		if reason := strings.TrimSpace(d.pending.authorizationReason); reason != "" {
+			rows = append(rows, permissionStyle.Render("Authorization reason: "+reason))
+		}
+		if wording := strings.TrimSpace(d.pending.suggestedUserWording); wording != "" {
+			rows = append(rows, permissionStyle.Render("Suggested wording: "+wording))
+		}
+	}
 	repeatedRuleCount := d.pending.repeatedRuleCount
 	if suggested := strings.TrimSpace(d.pending.suggestedRule); suggested != "" {
 		rows = append(rows, permissionStyle.Render("Suggested rule: "+suggested))
@@ -132,6 +147,21 @@ func (d *permissionEditorDialog) View(width int) string {
 		}
 		if reason := strings.TrimSpace(d.pending.scopeReason); reason != "" {
 			rows = append(rows, permissionStyle.Render("Scope reason: "+reason))
+		}
+	}
+	if auth := strings.TrimSpace(d.pending.authorizationLevel); auth != "" {
+		rows = append(rows, permissionStyle.Render("Authorization: "+auth))
+		if required := strings.TrimSpace(d.pending.requiredAuthorizationLevel); required != "" {
+			rows = append(rows, permissionStyle.Render("Required authorization: "+required))
+		}
+		if consent := strings.TrimSpace(d.pending.consentScope); consent != "" {
+			rows = append(rows, permissionStyle.Render("Consent scope: "+consent))
+		}
+		if reason := strings.TrimSpace(d.pending.authorizationReason); reason != "" {
+			rows = append(rows, permissionStyle.Render("Authorization reason: "+reason))
+		}
+		if wording := strings.TrimSpace(d.pending.suggestedUserWording); wording != "" {
+			rows = append(rows, permissionStyle.Render("Suggested wording: "+wording))
 		}
 	}
 	if msg := strings.TrimSpace(d.pending.message); msg != "" {

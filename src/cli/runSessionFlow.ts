@@ -19,6 +19,11 @@ type PermissionDialogEvent = {
   risk?: string
   message?: string
   suggestedRule?: string
+  authorizationLevel?: string
+  requiredAuthorizationLevel?: string
+  consentScope?: string
+  authorizationReason?: string
+  suggestedUserWording?: string
 }
 
 type CliPermissionDecision = PermissionResolution & {
@@ -321,6 +326,7 @@ function resolveCliRequestCwd(prompt: string, requestedCwd: string, sessionCwd?:
 }
 
 export const REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT = 'REQUEST_INTERRUPTED_WITHOUT_TERMINAL_EVENT'
+export const AUTHORIZATION_MISMATCH_TERMINAL_EVENT = 'AUTHORIZATION_MISMATCH'
 
 function selectCurrentTurnEvents(eventsNewestFirst: NexusEvent[], requestId?: string): NexusEvent[] {
   if (!requestId) return eventsNewestFirst
@@ -377,6 +383,24 @@ export function resolveFinalSessionOutcome(
         code: terminalEvent.code,
         message: terminalEvent.message,
       },
+    }
+  }
+
+  if (!terminalEvent.success) {
+    const authorizationDenied = currentTurnEvents.find(
+      event => event.type === 'tool_denied' && (event.authorizationLevel || event.requiredAuthorizationLevel),
+    ) as Extract<NexusEvent, { type: 'tool_denied' }> | undefined
+    if (authorizationDenied) {
+      const authorizationMessage = formatAuthorizationMismatchCliMessage(authorizationDenied)
+      return {
+        phase: 'failed',
+        result: authorizationMessage,
+        terminalReason: {
+          category: 'runtime',
+          code: AUTHORIZATION_MISMATCH_TERMINAL_EVENT,
+          message: authorizationMessage,
+        },
+      }
     }
   }
 
@@ -513,9 +537,38 @@ function renderCliPermissionRequest(event: PermissionDialogEvent): void {
   const input = formatPermissionInput(event.input)
   console.error(chalk.yellow(`\nPermission required: ${tool}${risk}`))
   if (event.message) console.error(chalk.dim(event.message))
+  const authorization = formatAuthorizationMismatchCliMessage(event)
+  if (authorization) console.error(chalk.dim(authorization))
   if (input) console.error(`  ${input}`)
   const rule = event.suggestedRule ?? defaultPermissionRule(event)
   console.error(chalk.dim(`  suggested rule: ${rule}`))
+}
+
+export function formatAuthorizationMismatchCliMessage(event: {
+  name?: string
+  authorizationLevel?: string
+  requiredAuthorizationLevel?: string
+  consentScope?: string
+  authorizationReason?: string
+  suggestedUserWording?: string
+  message?: string
+}): string {
+  const hasAuthorization =
+    Boolean(event.authorizationLevel) ||
+    Boolean(event.requiredAuthorizationLevel) ||
+    Boolean(event.authorizationReason) ||
+    Boolean(event.suggestedUserWording)
+  if (!hasAuthorization) return ''
+  const lines = [
+    `Authorization mismatch${event.name ? ` for ${event.name}` : ''}.`,
+    `Current authorization: ${event.authorizationLevel ?? '<unknown>'}.`,
+    `Required authorization: ${event.requiredAuthorizationLevel ?? '<unknown>'}.`,
+  ]
+  if (event.consentScope) lines.push(`Consent scope: ${event.consentScope}.`)
+  if (event.authorizationReason) lines.push(`Authorization reason: ${event.authorizationReason}.`)
+  if (event.suggestedUserWording) lines.push(`Suggested wording: ${event.suggestedUserWording}`)
+  if (event.message) lines.push(`Runtime message: ${event.message}`)
+  return lines.join(' ')
 }
 
 function renderCliProviderRetryEvent(event: NexusEvent): void {

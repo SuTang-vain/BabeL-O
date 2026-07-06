@@ -2773,6 +2773,32 @@ func TestPermissionPanelRendersScopeRisk(t *testing.T) {
 	}
 }
 
+func TestPermissionPanelRendersAuthorizationMismatch(t *testing.T) {
+	pending := &pendingPermission{
+		name:                       "Edit",
+		risk:                       "write",
+		message:                    "Turn authorization is inspect; only read-only tools are authorized.",
+		authorizationLevel:         "inspect",
+		requiredAuthorizationLevel: "local_change",
+		consentScope:               "current_step",
+		authorizationReason:        "read-only inspection",
+		suggestedUserWording:       "Please ask me to make the local change.",
+	}
+	d := newPermissionDialog(pending, 0)
+	out := d.View(120)
+	for _, want := range []string{
+		"Authorization: inspect",
+		"Required authorization: local_change",
+		"Consent scope: current_step",
+		"Authorization reason: read-only inspection",
+		"Suggested wording: Please ask me to make the local change.",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("authorization permission view missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestPermissionPanelHighlightsRepeatedSuggestedRule(t *testing.T) {
 	pending := &pendingPermission{
 		name:              "Bash",

@@ -62,6 +62,7 @@ export type SessionRow = {
   eventCount: number
   compactBoundaries: CompactBoundaryInspection[]
   providerRetrySummary: ProviderRetryInspection | null
+  authorizationSummary: AuthorizationInspection | null
   // clientSessionId is the Go TUI Phase 1 back-reference
   // (typically `session_go_<unixnano>`) stored in the server
   // session row's metadata column. Empty when the client
@@ -107,6 +108,33 @@ export type ProviderRetryInspection = {
   firstRequestId: string | null
   lastStatus: string
   lastTimestamp: string | null
+}
+
+export type AuthorizationInspection = {
+  latestLevel: string | null
+  latestConsentScope: string | null
+  latestSelectionKind: string | null
+  latestReason: string | null
+  latestUserText: string | null
+  intakeCount: number
+  deniedCount: number
+  permissionRequestCount: number
+  mismatchCount: number
+  lastMismatch: AuthorizationMismatchInspection | null
+}
+
+export type AuthorizationMismatchInspection = {
+  eventType: 'tool_denied' | 'permission_request'
+  timestamp: string | null
+  toolName: string | null
+  risk: string | null
+  denialKind: string | null
+  authorizationLevel: string | null
+  requiredAuthorizationLevel: string | null
+  consentScope: string | null
+  authorizationReason: string | null
+  suggestedUserWording: string | null
+  message: string | null
 }
 
 export type ClientLogHit = {
@@ -251,6 +279,7 @@ export function findSessionInSqlite(
     let eventCount = 0
     let compactBoundaries: CompactBoundaryInspection[] = []
     let providerRetrySummary: ProviderRetryInspection | null = null
+    let authorizationSummary: AuthorizationInspection | null = null
     try {
       const countRow = db
         .prepare(`SELECT COUNT(*) AS n FROM events WHERE session_id = ?`)
@@ -258,6 +287,7 @@ export function findSessionInSqlite(
       eventCount = countRow?.n ?? 0
       compactBoundaries = listCompactBoundaryInspections(db, sessionId)
       providerRetrySummary = summarizeProviderRetryInspections(db, sessionId)
+      authorizationSummary = summarizeAuthorizationInspections(db, sessionId)
     } catch {
       // events table missing → 0
     }
@@ -274,6 +304,7 @@ export function findSessionInSqlite(
       eventCount,
       compactBoundaries,
       providerRetrySummary,
+      authorizationSummary,
       clientSessionId,
     }
   } catch {
@@ -424,6 +455,90 @@ function summarizeProviderRetryInspections(
   }
 
   return summary.scheduledCount + summary.startedCount + summary.succeededCount + summary.exhaustedCount > 0
+    ? summary
+    : null
+}
+
+function summarizeAuthorizationInspections(
+  db: DatabaseSync,
+  sessionId: string,
+): AuthorizationInspection | null {
+  const eventTypes = ['user_intake_guidance', 'tool_denied', 'permission_request']
+  const rows = db
+    .prepare(
+      `SELECT timestamp, event_type, event_json FROM events
+       WHERE session_id = ?
+         AND event_type IN (${eventTypes.map(() => '?').join(', ')})
+       ORDER BY timestamp ASC, event_key ASC`,
+    )
+    .all(sessionId, ...eventTypes) as {
+      timestamp: string | null
+      event_type: string | null
+      event_json: string | null
+    }[]
+  if (rows.length === 0) return null
+
+  const summary: AuthorizationInspection = {
+    latestLevel: null,
+    latestConsentScope: null,
+    latestSelectionKind: null,
+    latestReason: null,
+    latestUserText: null,
+    intakeCount: 0,
+    deniedCount: 0,
+    permissionRequestCount: 0,
+    mismatchCount: 0,
+    lastMismatch: null,
+  }
+
+  for (const row of rows) {
+    if (!row.event_json) continue
+    let event: Record<string, unknown>
+    try {
+      const parsed = JSON.parse(row.event_json)
+      if (!parsed || typeof parsed !== 'object') continue
+      event = parsed as Record<string, unknown>
+    } catch {
+      continue
+    }
+    const type = stringOrNull(event.type) ?? row.event_type ?? ''
+    if (type === 'user_intake_guidance') {
+      summary.intakeCount += 1
+      summary.latestLevel = stringOrNull(event.authorizationLevel) ?? summary.latestLevel
+      summary.latestConsentScope = stringOrNull(event.consentScope) ?? summary.latestConsentScope
+      summary.latestSelectionKind = stringOrNull(event.selectionKind) ?? summary.latestSelectionKind
+      summary.latestReason = stringOrNull(event.authorizationReason) ?? stringOrNull(event.reason) ?? summary.latestReason
+      summary.latestUserText = stringOrNull(event.userText) ?? summary.latestUserText
+      continue
+    }
+    if (type !== 'tool_denied' && type !== 'permission_request') continue
+
+    const hasAuthorizationMismatch =
+      stringOrNull(event.requiredAuthorizationLevel) !== null ||
+      stringOrNull(event.authorizationLevel) !== null ||
+      stringOrNull(event.authorizationReason) !== null ||
+      stringOrNull(event.suggestedUserWording) !== null
+    if (type === 'tool_denied') summary.deniedCount += 1
+    if (type === 'permission_request') summary.permissionRequestCount += 1
+    if (!hasAuthorizationMismatch) continue
+
+    summary.mismatchCount += 1
+    summary.lastMismatch = {
+      eventType: type,
+      timestamp: stringOrNull(event.timestamp) ?? row.timestamp,
+      toolName: stringOrNull(event.name),
+      risk: stringOrNull(event.risk),
+      denialKind: stringOrNull(event.denialKind),
+      authorizationLevel: stringOrNull(event.authorizationLevel),
+      requiredAuthorizationLevel: stringOrNull(event.requiredAuthorizationLevel),
+      consentScope: stringOrNull(event.consentScope),
+      authorizationReason: stringOrNull(event.authorizationReason),
+      suggestedUserWording: stringOrNull(event.suggestedUserWording),
+      message: truncatePlain(stringOrNull(event.message), 200),
+    }
+  }
+
+  return summary.intakeCount + summary.deniedCount + summary.permissionRequestCount + summary.mismatchCount > 0
     ? summary
     : null
 }
@@ -616,6 +731,18 @@ function formatProviderRetryInspection(summary: ProviderRetryInspection): string
   const request = summary.firstRequestId ? ` firstRequest=${summary.firstRequestId}` : ''
   const timestamp = summary.lastTimestamp ? ` last=${summary.lastTimestamp}` : ''
   return `${summary.lastStatus} ${subject} kind=${summary.recoveryKind ?? 'unknown'} attempts=${attempt} scheduled=${summary.scheduledCount} started=${summary.startedCount} succeeded=${summary.succeededCount} exhausted=${summary.exhaustedCount}${delay}${recovered}${code}${request}${timestamp}`
+}
+
+function formatAuthorizationInspection(summary: AuthorizationInspection): string {
+  const latest = summary.latestLevel
+    ? `latest=${summary.latestLevel}${summary.latestConsentScope ? ` scope=${summary.latestConsentScope}` : ''}${summary.latestSelectionKind ? ` selection=${summary.latestSelectionKind}` : ''}`
+    : 'latest=<unknown>'
+  const counts = `intake=${summary.intakeCount} denied=${summary.deniedCount} permissionRequests=${summary.permissionRequestCount} mismatches=${summary.mismatchCount}`
+  const reason = summary.latestReason ? ` reason="${truncatePlain(summary.latestReason, 120)}"` : ''
+  const mismatch = summary.lastMismatch
+    ? ` last=${summary.lastMismatch.eventType}:${summary.lastMismatch.toolName ?? 'tool'} ${summary.lastMismatch.authorizationLevel ?? '?'}->${summary.lastMismatch.requiredAuthorizationLevel ?? '?'}${summary.lastMismatch.suggestedUserWording ? ` suggested="${truncatePlain(summary.lastMismatch.suggestedUserWording, 120)}"` : ''}`
+    : ''
+  return `${latest} ${counts}${reason}${mismatch}`
 }
 
 /**
@@ -1007,6 +1134,10 @@ export function registerInspectSessionCommand(program: Command): void {
         if (row.providerRetrySummary) {
           console.log(`  provider retry:`)
           console.log(`    - ${formatProviderRetryInspection(row.providerRetrySummary)}`)
+        }
+        if (row.authorizationSummary) {
+          console.log(`  authorization:`)
+          console.log(`    - ${formatAuthorizationInspection(row.authorizationSummary)}`)
         }
         if (row.prompt) {
           console.log(`  prompt     : ${row.prompt.slice(0, 100)}${row.prompt.length > 100 ? '…' : ''}`)

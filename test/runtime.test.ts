@@ -10,6 +10,10 @@ import { createEmptyContextSelectionDiagnostics } from '../src/runtime/contextMa
 import { createId } from '../src/shared/id.js'
 import { createNexusApp } from '../src/nexus/app.js'
 import { createDefaultNexusRuntime } from '../src/nexus/createRuntime.js'
+import { buildPartialTimeoutSummary } from '../src/nexus/executionTimeoutEvents.js'
+import { buildResumeFromSoftTerminal } from '../src/runtime/contextAssembler.js'
+import { resolveExecuteTimeoutDecision } from '../src/nexus/executionPreparation.js'
+import { logger } from '../src/shared/logger.js'
 import { SqliteStorage } from '../src/storage/SqliteStorage.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
 import {
@@ -106,6 +110,15 @@ const baseRuntimeUserIntentGuidance: UserIntentGuidance = {
   latestUserText: 'test prompt',
   explicitPaths: [],
   source: 'fallback',
+  authorization: {
+    level: 'local_change',
+    consentScope: 'current_step',
+    source: 'explicit_user',
+    selectionKind: 'none',
+    reason: 'test authorization',
+    allowedActionSummary: 'test',
+    blockedActionSummary: 'test',
+  },
 }
 
 function createRuntimeTestStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -1095,6 +1108,8 @@ test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL
   assert.equal(outcome.kind, 'continue')
   const err = outcome.eventsBeforeMessages[0] as any
   assert.equal(err?.code, 'TOOL_DENIED_FINAL_CHECK')
+  // C1: final_check soft-denial carries severity:'soft' (soft-error-retry plan).
+  assert.equal(err?.details?.severity, 'soft')
 })
 
 test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass through', () => {
@@ -1389,6 +1404,11 @@ test('runtime pipeline asks user to confirm option-like suppressed tool turns', 
   assert.equal(nonOptionError?.type, 'error')
   assert.equal(nonOptionError.code, 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT')
   assert.equal((nonOptionError.details as any).retryAttempted, true)
+  // Slice 1 B2: suppression is a soft signal — mark severity so consumers can
+  // distinguish it from terminal errors (soft-error-retry-continuity plan Fix B2).
+  assert.equal((nonOptionError.details as any).severity, 'soft')
+  // Slice 1 B3: nudge tells the model the retry will pass through (Fix B3).
+  assert.match(String(nonOptionOutcome.messages[nonOptionOutcome.messages.length - 1]?.content), /retry|will let it through/i)
 
   const exhaustedOutcome = reduceProviderTurnOutcome({
     sessionId: 'session-turn-reducer-suppressed-exhausted',
@@ -1531,6 +1551,230 @@ test('runtime tool loop executes a provider tool call and returns tool_result co
   assert.ok(metrics.toolRoundtripDurationMs >= 0)
   assert.ok(events.some(event => event.type === 'tool_started' && event.name === 'Read'))
   assert.ok(events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
+})
+
+test('runtime tool loop blocks write tools under inspect-only turn authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-inspect`)
+  await mkdir(cwd, { recursive: true })
+  await writeFile(join(cwd, 'theme.txt'), 'dark\n', 'utf8')
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_inspect_edit',
+      name: 'Edit',
+      partialInput: '{"path":"theme.txt","oldString":"dark","newString":"light"}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-inspect-edit',
+      prompt: '查看当前主题',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '查看当前主题',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'inspect',
+        reason: 'read-only inspection',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /only read-only tools are authorized/)
+  assert.equal(await readFile(join(cwd, 'theme.txt'), 'utf8'), 'dark\n')
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'policy')
+  assert.equal(denied.authorizationLevel, 'inspect')
+  assert.equal(denied.requiredAuthorizationLevel, 'local_change')
+  assert.equal(denied.consentScope, 'current_step')
+  assert.equal(denied.authorizationReason, 'read-only inspection')
+  assert.match(denied.suggestedUserWording, /ask me to make the local change/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop blocks shared side effects under local-change authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-local`)
+  await mkdir(cwd, { recursive: true })
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_local_push',
+      name: 'Bash',
+      partialInput: '{"command":"git push origin develop","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-local-push',
+      prompt: '根据规划开始推进',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '根据规划开始推进',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'local_change',
+        consentScope: 'stated_plan',
+        reason: 'local project work only',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /shared or remote side effects are not authorized/)
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'policy')
+  assert.equal(denied.authorizationLevel, 'local_change')
+  assert.equal(denied.requiredAuthorizationLevel, 'shared_change')
+  assert.equal(denied.consentScope, 'stated_plan')
+  assert.match(denied.suggestedUserWording, /push, release, merge/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop blocks Bash mutations under no-execution authorization', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-none-bash`)
+  await mkdir(cwd, { recursive: true })
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_none_bash',
+      name: 'Bash',
+      partialInput: '{"command":"echo light > theme.txt","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-none-bash',
+      prompt: 'light-soft吧',
+      cwd,
+      skipPermissionCheck: true,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: 'light-soft吧',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'none',
+        source: 'inferred_none',
+        selectionKind: 'preference',
+        reason: 'preference selection without execution consent',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  assert.match(next.value.toolResult.content, /did not authorize tool-backed mutation or execution/)
+  const denied = events.find(event => event.type === 'tool_denied' && event.denialKind === 'policy') as any
+  assert.ok(denied)
+  assert.equal(denied.authorizationLevel, 'none')
+  assert.equal(denied.requiredAuthorizationLevel, 'local_change')
+  assert.equal(denied.consentScope, 'current_step')
+  assert.equal(denied.authorizationReason, 'preference selection without execution consent')
+  assert.match(denied.suggestedUserWording, /apply this change/)
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
+})
+
+test('runtime tool loop requires exact permission for destructive authorized command', async () => {
+  const tools = createDefaultToolRegistry()
+  const cwd = join(tmpdir(), `babel-o-test-${Date.now()}-auth-destructive`)
+  await mkdir(cwd, { recursive: true })
+  const registry = PendingPermissionRegistry.getInstance()
+  setTimeout(() => {
+    registry.resolve('session-auth-destructive-rm', 'tool_auth_destructive_rm', {
+      approved: false,
+      reason: 'test denies destructive confirmation',
+    })
+  }, 0)
+  const stream = executeProviderToolCall({
+    toolCall: {
+      id: 'tool_auth_destructive_rm',
+      name: 'Bash',
+      partialInput: '{"command":"rm -rf dist","timeoutMs":15000}',
+    },
+    tools,
+    toolPolicy: allowAllTools(),
+    runtimeOptions: {
+      sessionId: 'session-auth-destructive-rm',
+      prompt: '删除 dist 目录',
+      cwd,
+      skipPermissionCheck: false,
+    },
+    storage: new MemoryStorage(),
+    metrics: createRuntimeExecutionMetrics(),
+    readFileCache: new Map(),
+    userIntentGuidance: {
+      ...baseRuntimeUserIntentGuidance,
+      latestUserText: '删除 dist 目录',
+      authorization: {
+        ...baseRuntimeUserIntentGuidance.authorization!,
+        level: 'destructive',
+        reason: 'exact destructive request',
+      },
+    },
+  })
+
+  const events: NexusEvent[] = []
+  let next = await stream.next()
+  while (!next.done) {
+    events.push(next.value)
+    next = await stream.next()
+  }
+
+  assert.equal(next.value.kind, 'continue')
+  assert.equal(next.value.toolResult.isError, true)
+  const permissionRequest = events.find(event => event.type === 'permission_request') as any
+  assert.ok(permissionRequest)
+  assert.match(permissionRequest.message, /exact-target confirmation/)
+  assert.equal(permissionRequest.authorizationLevel, 'destructive')
+  assert.equal(permissionRequest.requiredAuthorizationLevel, 'destructive')
+  assert.equal(permissionRequest.consentScope, 'current_step')
+  assert.equal(permissionRequest.authorizationReason, 'exact destructive request')
+  assert.match(permissionRequest.suggestedUserWording, /confirm the exact destructive target/)
+  const denied = events.find(event => event.type === 'tool_denied') as any
+  assert.ok(denied)
+  assert.equal(denied.denialKind, 'permission')
+  assert.equal(events.some(event => event.type === 'tool_completed'), false)
 })
 
 test('runtime Read cache does not use partial evidence as full-file evidence', async () => {
@@ -9670,4 +9914,89 @@ test('Phase A.1: scope=session accumulates rules and second turn auto-allows', a
   )
 
   await app.close()
+})
+
+test('Soft-error-retry Slice 2-B: partial result prefers the in-flight (truncated) turn output', () => {
+  // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md Slice 2-B.
+  // seq 924: the model's diagnostic report was truncated mid-output by the watchdog.
+  // buildPartialTimeoutSummary must preserve the in-flight turn (output after the last
+  // user_message), not earlier turns' output — that is what the user lost to the cutoff.
+  const events = [
+    { type: 'user_message', text: 'first turn' },
+    { type: 'assistant_delta', text: '早期 turn 的无关输出'.repeat(60) },
+    { type: 'user_message', text: '继续诊断' },
+    { type: 'assistant_delta', text: '当前诊断报告的关键结论:embedding 配置缺失导致 sidecar 必死' },
+  ] as any
+  const summary = buildPartialTimeoutSummary(events)
+  assert.ok(summary, 'a summary must be produced when there is in-flight assistant output')
+  assert.match(summary!, /当前诊断报告的关键结论/, 'must keep the in-flight turn output')
+  assert.ok(!summary!.includes('早期 turn'), 'must not surface earlier-turn output over the in-flight turn')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal injects resume nudge for continue + soft timeout', () => {
+  // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md C4.
+  // seq 924 shape: in-flight answer truncated by REQUEST_TIMEOUT, then the user
+  // says "继续" — the runtime must inject a resume nudge with the truncated tail.
+  const events = [
+    { type: 'user_message', text: '诊断 embedding 问题' },
+    { type: 'assistant_delta', text: '诊断报告:embedding 配置缺失,导致 sidecar 必死。' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'Execution timed out.' },
+    { type: 'user_message', text: '继续' },
+  ] as any
+  const nudge = buildResumeFromSoftTerminal(events, '继续')
+  assert.ok(nudge, 'resume nudge must be produced for continue + soft timeout')
+  assert.match(nudge!, /截断/, 'nudge must mention truncation')
+  assert.match(nudge!, /sidecar 必死/, 'nudge must include the truncated tail')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined for hard cancel', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'partial output' },
+    { type: 'error', code: 'REQUEST_CANCELLED', message: 'cancelled' },
+    { type: 'user_message', text: '继续' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '继续'), undefined, 'hard cancel must never resume')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined when not a continue request', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'partial output' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'timed out' },
+    { type: 'user_message', text: '总结一下进度' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '总结一下进度'), undefined, 'non-continue prompt must not trigger resume')
+})
+
+test('Soft-error-retry C4: buildResumeFromSoftTerminal returns undefined when the model already answered after the boundary', () => {
+  const events = [
+    { type: 'assistant_delta', text: 'truncated answer' },
+    { type: 'error', code: 'REQUEST_TIMEOUT', message: 'timed out' },
+    { type: 'user_message', text: '继续' },
+    { type: 'assistant_delta', text: 'I already resumed and answered' },
+  ] as any
+  assert.equal(buildResumeFromSoftTerminal(events, '继续'), undefined, 'must not resume once the model already produced a new answer')
+})
+
+test('soft-timeout recovery option C: warns when watchdog leaves no room for soft extensions', () => {
+  // See docs/nexus/proposals/soft-timeout-recovery-architecture-plan.md option C.
+  // seq 924 shape: watchdog 240s, soft 180s — the hard cut fires during the
+  // extension window and starves the soft-recovery mechanism. The runtime must
+  // warn so the caller can correct the ratio.
+  const originalWarn = logger.warn
+  const warnings: string[] = []
+  logger.warn = (message: string) => { warnings.push(message) }
+  try {
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'soft', softTimeoutMs: 180000, watchdogTimeoutMs: 240000 } as any, 180000)
+    assert.ok(warnings.some(m => m.includes('leaves no room')), 'tight ratio (seq 924 shape) must warn')
+
+    warnings.length = 0
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'soft', softTimeoutMs: 180000, watchdogTimeoutMs: 540000 } as any, 180000)
+    assert.equal(warnings.length, 0, 'healthy ratio (watchdog >= soft + extensions) must not warn')
+
+    warnings.length = 0
+    resolveExecuteTimeoutDecision({ timeoutPolicy: 'fatal', timeoutMs: 180000 } as any, 180000)
+    assert.equal(warnings.length, 0, 'fatal policy (no extensions) must not warn')
+  } finally {
+    logger.warn = originalWarn
+  }
 })

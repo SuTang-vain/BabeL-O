@@ -1061,6 +1061,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           finalResponseOnlyMode,
           finalCheckPhase: requestState.finalCheckPhase,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
+          confirmedOptionSelection,
           userIntentGuidance: assembledContext.userIntentGuidance,
           providerId: settings.providerId,
           modelId: cleanedModelId,
@@ -1104,6 +1105,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           runtimeOptions: options,
           previousEvents,
           taskScopeEvent,
+          userIntentGuidance: assembledContext.userIntentGuidance,
         })
         let dispatchNext = await dispatchStream.next()
         while (!dispatchNext.done) {

@@ -199,19 +199,49 @@ describe('AgentTrace projector — permission denied path', () => {
     const events = [
       ev({ type: 'session_started', timestamp: ts(BASE, 0), cwd: '/repo' }),
       ev({ type: 'tool_started', timestamp: ts(BASE, 10), toolUseId: 'tu-d', name: 'Bash', input: { command: 'rm -rf /' } }),
-      ev({ type: 'tool_denied', timestamp: ts(BASE, 12), name: 'Bash', risk: 'execute', message: 'destructive', denialKind: 'permission', recoverable: true }),
+      ev({
+        type: 'tool_denied',
+        timestamp: ts(BASE, 12),
+        name: 'Bash',
+        risk: 'execute',
+        message: 'destructive',
+        denialKind: 'permission',
+        recoverable: true,
+        authorizationLevel: 'inspect',
+        requiredAuthorizationLevel: 'destructive',
+        consentScope: 'current_step',
+        authorizationReason: 'read-only inspection',
+        suggestedUserWording: 'Please confirm the destructive target.',
+      }),
       ev({ type: 'result', timestamp: ts(BASE, 20), success: false, message: 'denied' }),
     ]
     const trace = projectAgentTrace(events)
     const tool = trace.spans.find(s => s.kind === 'tool_call')!
     assert.equal(tool.status, 'error')
     assert.equal(tool.toolUseId, 'tu-d', 'denied tool attributed to the single open tool_started')
+    assert.equal(tool.attributes.authorizationLevel, 'inspect')
+    assert.equal(tool.attributes.requiredAuthorizationLevel, 'destructive')
+    assert.equal(tool.attributes.consentScope, 'current_step')
+    assert.equal(tool.attributes.authorizationReason, 'read-only inspection')
+    assert.equal(tool.attributes.suggestedUserWording, 'Please confirm the destructive target.')
   })
 
   test('permission_response approved=false produces permission_decision with error status', () => {
     const events = [
       ev({ type: 'session_started', timestamp: ts(BASE, 0), cwd: '/repo' }),
-      ev({ type: 'permission_request', timestamp: ts(BASE, 10), toolUseId: 'tu-p', name: 'Bash', input: {}, risk: 'execute' }),
+      ev({
+        type: 'permission_request',
+        timestamp: ts(BASE, 10),
+        toolUseId: 'tu-p',
+        name: 'Bash',
+        input: {},
+        risk: 'execute',
+        authorizationLevel: 'destructive',
+        requiredAuthorizationLevel: 'destructive',
+        consentScope: 'current_step',
+        authorizationReason: 'exact destructive request',
+        suggestedUserWording: 'Please confirm the exact destructive target.',
+      }),
       ev({ type: 'permission_response', timestamp: ts(BASE, 12), toolUseId: 'tu-p', approved: false, feedback: 'use a safer command' }),
       ev({ type: 'result', timestamp: ts(BASE, 20), success: false, message: 'denied' }),
     ]
@@ -219,6 +249,11 @@ describe('AgentTrace projector — permission denied path', () => {
     const perm = findSpan(trace, 'permission_decision')!
     assert.equal(perm.status, 'error')
     assert.equal((perm.attributes as { approved: boolean }).approved, false)
+    assert.equal(perm.attributes.authorizationLevel, 'destructive')
+    assert.equal(perm.attributes.requiredAuthorizationLevel, 'destructive')
+    assert.equal(perm.attributes.consentScope, 'current_step')
+    assert.equal(perm.attributes.authorizationReason, 'exact destructive request')
+    assert.equal(perm.attributes.suggestedUserWording, 'Please confirm the exact destructive target.')
   })
 
   test('error terminal event marks run + final_result as error', () => {

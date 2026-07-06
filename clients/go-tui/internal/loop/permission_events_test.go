@@ -30,7 +30,12 @@ func TestEventToPermissionFullPayload(t *testing.T) {
 		"suggestedRule":"Bash(git:*)",
 		"scopeRisk":"external_repo",
 		"targetRoot":"/tmp/external",
-		"taskPrimaryRoot":"/Users/me/repo"
+		"taskPrimaryRoot":"/Users/me/repo",
+		"authorizationLevel":"inspect",
+		"requiredAuthorizationLevel":"local_change",
+		"consentScope":"current_step",
+		"authorizationReason":"read-only inspection",
+		"suggestedUserWording":"Please ask me to make the local change."
 	}`)
 	perm, ok := EventToPermission(raw)
 	if !ok {
@@ -59,6 +64,21 @@ func TestEventToPermissionFullPayload(t *testing.T) {
 	}
 	if perm.TaskPrimaryRoot != "/Users/me/repo" {
 		t.Errorf("TaskPrimaryRoot = %q, want /Users/me/repo", perm.TaskPrimaryRoot)
+	}
+	if perm.AuthorizationLevel != "inspect" {
+		t.Errorf("AuthorizationLevel = %q, want inspect", perm.AuthorizationLevel)
+	}
+	if perm.RequiredAuthorizationLevel != "local_change" {
+		t.Errorf("RequiredAuthorizationLevel = %q, want local_change", perm.RequiredAuthorizationLevel)
+	}
+	if perm.ConsentScope != "current_step" {
+		t.Errorf("ConsentScope = %q, want current_step", perm.ConsentScope)
+	}
+	if !strings.Contains(perm.AuthorizationReason, "read-only") {
+		t.Errorf("AuthorizationReason = %q, want read-only reason", perm.AuthorizationReason)
+	}
+	if !strings.Contains(perm.SuggestedUserWording, "local change") {
+		t.Errorf("SuggestedUserWording = %q, want local change wording", perm.SuggestedUserWording)
 	}
 }
 

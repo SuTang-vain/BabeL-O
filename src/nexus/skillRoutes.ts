@@ -158,7 +158,11 @@ export type SkillListResponse = {
 export type SkillShowResponse =
   | {
       ok: true
-      skill: SkillListResponse['skills'][number] & { body: string }
+      skill: SkillListResponse['skills'][number] & {
+        body: string
+        companionReferences?: Array<{ kind: string; path: string; absolutePath?: string }>
+        companionAssets?: Array<{ kind: string; path: string; absolutePath?: string }>
+      }
     }
   | {
       ok: false
@@ -349,6 +353,14 @@ export async function showSkill(options: {
         ...(skill.manifestPath ? { manifestPath: skill.manifestPath } : {}),
         resources: skill.resources,
         body: formatSkill(skill),
+        companionReferences: skill.resources
+          .filter(r => r.kind === 'reference')
+          .slice()
+          .sort((a, b) => a.path.localeCompare(b.path)),
+        companionAssets: skill.resources
+          .filter(r => r.kind === 'asset')
+          .slice()
+          .sort((a, b) => a.path.localeCompare(b.path)),
       },
     }
   } catch (err) {

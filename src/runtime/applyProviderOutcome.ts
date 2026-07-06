@@ -76,6 +76,7 @@ export type ApplyProviderOutcomeInput = {
   finalResponseOnlyMode: boolean
   finalCheckPhase?: boolean
   suppressToolsForUserIntent: boolean
+  confirmedOptionSelection?: boolean
   userIntentGuidance: any
   providerId: string
   modelId: string
@@ -137,6 +138,7 @@ export async function applyProviderOutcome(
     finalResponseOnlyMode: input.finalResponseOnlyMode,
     finalCheckPhase: input.finalCheckPhase,
     suppressToolsForUserIntent: input.suppressToolsForUserIntent,
+    confirmedOptionSelection: input.confirmedOptionSelection,
     userIntentGuidance: input.userIntentGuidance,
     providerId: input.providerId,
     modelId: input.modelId,

@@ -21,6 +21,41 @@ export type ProblemTarget =
   | 'user_artifact'
   | 'unknown'
 
+export type AuthorizationLevel =
+  | 'none'
+  | 'inspect'
+  | 'local_change'
+  | 'shared_change'
+  | 'destructive'
+
+export type ConsentScope =
+  | 'current_step'
+  | 'stated_plan'
+  | 'session_workflow'
+
+export type ConsentSource =
+  | 'explicit_user'
+  | 'stated_plan_confirmation'
+  | 'trusted_session_rule'
+  | 'inferred_none'
+
+export type SelectionKind =
+  | 'none'
+  | 'preference'
+  | 'option'
+  | 'path'
+  | 'workflow_step'
+
+export type TurnAuthorization = {
+  level: AuthorizationLevel
+  consentScope: ConsentScope
+  source: ConsentSource
+  selectionKind: SelectionKind
+  reason: string
+  allowedActionSummary: string
+  blockedActionSummary: string
+}
+
 export type UserIntentGuidance = {
   intent: UserIntentKind
   confidence: number
@@ -33,6 +68,7 @@ export type UserIntentGuidance = {
   latestUserText: string
   explicitPaths: string[]
   source: 'model' | 'fallback'
+  authorization?: TurnAuthorization
 }
 
 export type UserIntakeGuidanceEvent = Extract<NexusEvent, { type: 'user_intake_guidance' }>
@@ -166,6 +202,20 @@ export function guidanceFromIntakeEvent(event: UserIntakeGuidanceEvent): UserInt
     latestUserText: event.userText,
     explicitPaths: event.explicitPaths,
     source: event.source,
+    authorization: {
+      level: event.authorizationLevel ?? deriveDefaultAuthorizationLevel({
+        intent: event.intent,
+        actionHint: event.actionHint,
+        requiresTools: event.requiresTools,
+        latestUserText: event.userText,
+      }),
+      consentScope: event.consentScope ?? 'current_step',
+      source: event.consentSource ?? 'inferred_none',
+      selectionKind: event.selectionKind ?? 'none',
+      reason: event.authorizationReason ?? 'Legacy intake event without explicit authorization metadata.',
+      allowedActionSummary: event.allowedActionSummary ?? 'Follow the existing turn policy.',
+      blockedActionSummary: event.blockedActionSummary ?? 'Do not perform actions beyond the user request.',
+    },
   })
 }
 
@@ -174,6 +224,7 @@ export function toUserIntakeGuidanceEvent(options: {
   guidance: UserIntentGuidance
 }): UserIntakeGuidanceEvent {
   const guidance = normalizeGuidancePolicy(options.guidance)
+  const authorization = getTurnAuthorization(guidance)
   return {
     type: 'user_intake_guidance',
     ...eventBase(options.sessionId),
@@ -185,6 +236,13 @@ export function toUserIntakeGuidanceEvent(options: {
     actionHint: guidance.actionHint,
     requiresTools: guidance.requiresTools,
     problemTarget: guidance.problemTarget,
+    authorizationLevel: authorization.level,
+    consentScope: authorization.consentScope,
+    consentSource: authorization.source,
+    selectionKind: authorization.selectionKind,
+    authorizationReason: authorization.reason,
+    allowedActionSummary: authorization.allowedActionSummary,
+    blockedActionSummary: authorization.blockedActionSummary,
     reason: guidance.reason,
     explicitPaths: guidance.explicitPaths,
     source: guidance.source,
@@ -194,6 +252,7 @@ export function toUserIntakeGuidanceEvent(options: {
 export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
   const policy = deriveTurnPolicy(guidance)
   const intentCategory = deriveIntentCategory(guidance)
+  const authorization = getTurnAuthorization(guidance)
   const lines = [
     '## Turn Policy',
     `Source: ${guidance.source}`,
@@ -204,6 +263,12 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
     `Context scope: ${guidance.contextScope}`,
     `Action hint: ${guidance.actionHint}`,
     `Requires tools: ${guidance.requiresTools ? 'yes' : 'no'}`,
+    `Authorization level: ${authorization.level}`,
+    `Consent scope: ${authorization.consentScope}`,
+    `Consent source: ${authorization.source}`,
+    `Selection kind: ${authorization.selectionKind}`,
+    `Authorized actions: ${authorization.allowedActionSummary}`,
+    `Blocked actions: ${authorization.blockedActionSummary}`,
     `Problem target: ${guidance.problemTarget}`,
     `Response mode: ${policy.responseMode}`,
     `Tool mode: ${policy.toolMode}`,
@@ -219,9 +284,23 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
   const normalized = normalizeGuidancePolicy(guidance)
   if (isCurrentStateVerificationRequest(normalized.latestUserText)) return false
+  // Tier 1 — hard suppress (unchanged): pure capability question, pause,
+  // greeting. These are semantically respond-only; tooling would be
+  // unnecessary. Suppress-then-nudge (MAX_SUPPRESSED_TOOL_RETRIES=1) stays.
   if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return true
+  if (normalized.intent === 'pause' || normalized.intent === 'greeting') return true
+  // Tier 2 — first-call passthrough (direction 2): task-continuation intents
+  // (continue / new_focus / correction) where the model's requiresTools=false
+  // is suspect (Mode B under-classification). Tools stay visible and emitted
+  // tool calls pass through — the model's tool call is the ground-truth signal
+  // that tools are needed. Over-tooling is handled by finalResponseOnlyMode
+  // (TOOL_LOOP_FINAL_RESPONSE_ONLY), not intent suppression. The
+  // option-confirmation gate (single-letter input) is handled independently in
+  // providerTurn.ts and is not affected by this branch.
+  const authorization = getTurnAuthorization(normalized)
+  if (authorization.level === 'none' && (authorization.selectionKind !== 'none' || isMetaBehaviorQuestion(normalized.latestUserText))) return true
   if (normalized.intent === 'status') return false
-  return !normalized.requiresTools || normalized.actionHint === 'respond_only'
+  return false
 }
 
 export function getIntentCategory(guidance: UserIntentGuidance): IntentCategory {
@@ -232,6 +311,11 @@ export function getToolSuppressionReason(guidance: UserIntentGuidance): string |
   const normalized = normalizeGuidancePolicy(guidance)
   if (!shouldSuppressToolsForIntent(normalized)) return undefined
   if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return 'respond_only_capability_question'
+  const authorization = getTurnAuthorization(normalized)
+  if (authorization.level === 'none' && (authorization.selectionKind !== 'none' || isMetaBehaviorQuestion(normalized.latestUserText))) {
+    if (authorization.selectionKind !== 'none') return `authorization:none:${authorization.selectionKind}_selection`
+    return 'authorization:none'
+  }
   if (normalized.intent === 'pause') return 'pause'
   if (normalized.intent === 'greeting') return 'greeting'
   if (normalized.actionHint === 'respond_only') return `intent:${normalized.intent}:respond_only`
@@ -412,12 +496,19 @@ async function queryIntakeModel(options: {
       role: 'user',
       content: [
         'Analyze the latest user message for a coding agent intake step.',
-        'Return only compact JSON with keys: intent, confidence, continuity, contextScope, actionHint, requiresTools, problemTarget, reason, explicitPaths.',
+        'Return only compact JSON with keys: intent, confidence, continuity, contextScope, actionHint, requiresTools, problemTarget, authorizationLevel, consentScope, consentSource, selectionKind, authorizationReason, reason, explicitPaths.',
         'intent must be one of: continue, new_focus, correction, pause, greeting, status.',
         'contextScope must be one of: full, recent, new_focus.',
         'actionHint must be one of: normal, prioritize_latest, respond_only.',
         'problemTarget must be one of: agent_failure, runtime_replay, tool_evidence, project_feature, user_artifact, unknown.',
+        'authorizationLevel must be one of: none, inspect, local_change, shared_change, destructive.',
+        'consentScope must be one of: current_step, stated_plan, session_workflow.',
+        'consentSource must be one of: explicit_user, stated_plan_confirmation, trusted_session_rule, inferred_none.',
+        'selectionKind must be one of: none, preference, option, path, workflow_step.',
         'requiresTools must be false for greeting/pause.',
+        'Separate tool need from execution authorization. A preference or option selection without an execution verb has authorizationLevel=none even if prior context involved tools.',
+        'Meta-behavior questions about why the agent acted, hesitated, modified files, or used tools must be status/respond_only/requiresTools=false/authorizationLevel=none.',
+        'Use authorizationLevel=inspect for read-only verification. Use local_change for local edits/commits. Use shared_change for push/release/merge/PR remote effects. Use destructive for delete/overwrite/force operations.',
         'Classify the target semantically, not by matching literal phrases. Use agent_failure when the user is asking about the assistant or runtime behavior; runtime_replay when the target is transcript/tool-call replay; tool_evidence when the target is evidence coverage or source support; project_feature when the target is the product or repository feature itself.',
         'Use status/respond_only only when the user is asking for conversational state or pure capability information. If the latest message asks to verify, run, check, test, lint, build, inspect, modify, save memory, or call a named tool, keep requiresTools=true.',
         'Current-state verification requires tools: checking whether the current runtime, provider, model, tool, memory, config, session, workspace, git state, tests/build, MCP, remote runner, or service is available, enabled, supported, working, healthy, recorded, passing, or up to date is not a pure capability question.',
@@ -460,6 +551,10 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
       ? raw.requiresTools
       : actionHint !== 'respond_only'
     const problemTarget = parseEnum(raw.problemTarget, ['agent_failure', 'runtime_replay', 'tool_evidence', 'project_feature', 'user_artifact', 'unknown'], fallback.problemTarget)
+    const authorizationLevel = parseEnum(raw.authorizationLevel, ['none', 'inspect', 'local_change', 'shared_change', 'destructive'], fallback.authorization?.level ?? 'inspect')
+    const consentScope = parseEnum(raw.consentScope, ['current_step', 'stated_plan', 'session_workflow'], fallback.authorization?.consentScope ?? 'current_step')
+    const consentSource = parseEnum(raw.consentSource, ['explicit_user', 'stated_plan_confirmation', 'trusted_session_rule', 'inferred_none'], fallback.authorization?.source ?? 'inferred_none')
+    const selectionKind = parseEnum(raw.selectionKind, ['none', 'preference', 'option', 'path', 'workflow_step'], fallback.authorization?.selectionKind ?? 'none')
     const explicitPaths = fallback.explicitPaths
     return buildGuidance({
       intent,
@@ -473,6 +568,15 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
       latestUserText: fallback.latestUserText,
       explicitPaths,
       source: 'model',
+      authorization: buildAuthorization({
+        level: authorizationLevel,
+        consentScope,
+        source: consentSource,
+        selectionKind,
+        reason: typeof raw.authorizationReason === 'string' && raw.authorizationReason.trim()
+          ? raw.authorizationReason.trim()
+          : fallback.authorization?.reason ?? 'Model-derived authorization.',
+      }),
     })
   } catch {
     return fallback
@@ -500,6 +604,10 @@ function summarizeRecentUserHistory(events: NexusEvent[]): string {
 
 function buildGuidance(guidance: UserIntentGuidance): UserIntentGuidance {
   return normalizeGuidancePolicy(guidance)
+}
+
+function getTurnAuthorization(guidance: UserIntentGuidance): TurnAuthorization {
+  return guidance.authorization ?? deriveTurnAuthorization(guidance)
 }
 
 function deriveProblemTarget(options: {
@@ -598,58 +706,155 @@ function countMarkerMatches(text: string, markers: readonly RegExp[]): number {
 }
 
 export function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
-  if (isExplicitMemorySavePrompt(guidance.latestUserText)) {
-    return {
-      ...guidance,
-      intent: 'continue',
-      actionHint: 'normal',
-      requiresTools: true,
-    }
-  }
-  if (isMemoryAvailabilityCheckRequest(guidance.latestUserText)) {
-    return {
-      ...guidance,
-      intent: guidance.intent === 'status' ? 'status' : 'continue',
-      actionHint: 'normal',
-      requiresTools: true,
-    }
-  }
-  if (isCurrentStateVerificationRequest(guidance.latestUserText)) {
-    return {
-      ...guidance,
-      intent: 'continue',
-      actionHint: 'normal',
-      requiresTools: true,
-    }
-  }
-  if (isPureMemoryCapabilityQuestion(guidance.latestUserText)) {
-    return {
+  const withAuthorization = (next: UserIntentGuidance): UserIntentGuidance => ({
+    ...next,
+    authorization: next.authorization ?? deriveTurnAuthorization(next),
+  })
+  if (isMetaBehaviorQuestion(guidance.latestUserText)) {
+    return withAuthorization({
       ...guidance,
       intent: 'status',
       actionHint: 'respond_only',
       requiresTools: false,
-    }
+      problemTarget: guidance.problemTarget === 'unknown' ? 'agent_failure' : guidance.problemTarget,
+      authorization: buildAuthorization({
+        level: 'none',
+        selectionKind: 'none',
+        reason: 'The user is asking about agent behavior or policy, not authorizing execution.',
+      }),
+    })
+  }
+  if (isPureMemoryCapabilityQuestion(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      authorization: buildAuthorization({
+        level: 'none',
+        reason: 'The user asked a pure capability question, not an execution request.',
+      }),
+    })
+  }
+  if (isPreferenceOrOptionSelection(guidance.latestUserText) && !hasExecutionAuthorizationCue(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      authorization: buildAuthorization({
+        level: 'none',
+        selectionKind: inferSelectionKind(guidance.latestUserText),
+        reason: 'The user selected or named a preference without explicitly authorizing execution.',
+      }),
+    })
+  }
+  if (isDestructiveAuthorizationRequest(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'destructive',
+        source: 'explicit_user',
+        reason: 'The user named a destructive operation; exact-target confirmation remains required.',
+      }),
+    })
+  }
+  if (isSharedChangeAuthorizationRequest(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'shared_change',
+        source: 'explicit_user',
+        reason: 'The user explicitly requested a shared or remote side effect.',
+      }),
+    })
+  }
+  if (isLocalChangeAuthorizationRequest(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'local_change',
+        source: 'explicit_user',
+        consentScope: inferConsentScope(guidance.latestUserText, 'local_change'),
+        reason: 'The user explicitly authorized local project work.',
+      }),
+    })
+  }
+  if (isExplicitMemorySavePrompt(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'local_change',
+        source: 'explicit_user',
+        selectionKind: 'none',
+        reason: 'The user explicitly asked to save information to long-term memory.',
+      }),
+    })
+  }
+  if (isMemoryAvailabilityCheckRequest(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: guidance.intent === 'status' ? 'status' : 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'inspect',
+        reason: 'The user asked to verify current memory availability with evidence.',
+      }),
+    })
+  }
+  if (isCurrentStateVerificationRequest(guidance.latestUserText)) {
+    return withAuthorization({
+      ...guidance,
+      intent: 'continue',
+      actionHint: 'normal',
+      requiresTools: true,
+      authorization: buildAuthorization({
+        level: 'inspect',
+        reason: 'The user asked to inspect or verify current state with evidence.',
+      }),
+    })
   }
   if (guidance.intent === 'pause') {
-    return {
+    return withAuthorization({
       ...guidance,
       contextScope: 'recent',
       actionHint: 'respond_only',
       requiresTools: false,
-    }
+      authorization: guidance.authorization ?? buildAuthorization({
+        level: 'none',
+        reason: 'The user asked the agent to pause or wait.',
+      }),
+    })
   }
   if (guidance.intent === 'greeting') {
-    return {
+    return withAuthorization({
       ...guidance,
       actionHint: 'respond_only',
       requiresTools: false,
-    }
+      authorization: guidance.authorization ?? buildAuthorization({
+        level: 'none',
+        reason: 'The user sent a greeting or identity question.',
+      }),
+    })
   }
   if (guidance.intent === 'status' && !guidance.requiresTools) {
-    return {
+    return withAuthorization({
       ...guidance,
       actionHint: 'respond_only',
-    }
+    })
   }
   // Stopgap Fix B (Mode B): continue + normal is self-contradictory with
   // requiresTools=false. The fallback default for continue is requiresTools=true
@@ -661,9 +866,110 @@ export function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserInten
   // pause, greeting, and status-without-tools paths (which set respond_only
   // above) are unaffected.
   if (guidance.intent === 'continue' && guidance.actionHint === 'normal') {
-    return { ...guidance, requiresTools: true }
+    return withAuthorization({ ...guidance, requiresTools: true })
   }
-  return guidance
+  return withAuthorization(guidance)
+}
+
+function deriveTurnAuthorization(guidance: UserIntentGuidance): TurnAuthorization {
+  const level = deriveDefaultAuthorizationLevel(guidance)
+  const selectionKind = inferSelectionKind(guidance.latestUserText)
+  const source: ConsentSource = level === 'none' || level === 'inspect'
+    ? 'inferred_none'
+    : hasExecutionAuthorizationCue(guidance.latestUserText)
+      ? 'explicit_user'
+      : 'stated_plan_confirmation'
+  return buildAuthorization({
+    level,
+    selectionKind,
+    source,
+    consentScope: inferConsentScope(guidance.latestUserText, level),
+    reason: inferAuthorizationReason(guidance, level, selectionKind),
+  })
+}
+
+function buildAuthorization(options: {
+  level: AuthorizationLevel
+  consentScope?: ConsentScope
+  source?: ConsentSource
+  selectionKind?: SelectionKind
+  reason: string
+}): TurnAuthorization {
+  return {
+    level: options.level,
+    consentScope: options.consentScope ?? inferConsentScope('', options.level),
+    source: options.source ?? (options.level === 'none' || options.level === 'inspect' ? 'inferred_none' : 'explicit_user'),
+    selectionKind: options.selectionKind ?? 'none',
+    reason: options.reason,
+    allowedActionSummary: allowedActionSummaryForLevel(options.level),
+    blockedActionSummary: blockedActionSummaryForLevel(options.level),
+  }
+}
+
+function deriveDefaultAuthorizationLevel(options: {
+  intent: UserIntentKind
+  actionHint: ActionHint
+  requiresTools: boolean
+  latestUserText: string
+}): AuthorizationLevel {
+  const text = options.latestUserText
+  if (isDestructiveAuthorizationRequest(text)) return 'destructive'
+  if (isSharedChangeAuthorizationRequest(text)) return 'shared_change'
+  if (isMetaBehaviorQuestion(text)) return 'none'
+  if (isPreferenceOrOptionSelection(text) && !hasExecutionAuthorizationCue(text)) return 'none'
+  if (isLocalChangeAuthorizationRequest(text)) return 'local_change'
+  if (isCurrentStateVerificationRequest(text) || isMemoryAvailabilityCheckRequest(text)) return 'inspect'
+  if (options.intent === 'pause' || options.intent === 'greeting') return 'none'
+  if (options.intent === 'status' && !options.requiresTools) return 'none'
+  return options.requiresTools ? 'inspect' : 'none'
+}
+
+function inferAuthorizationReason(guidance: UserIntentGuidance, level: AuthorizationLevel, selectionKind: SelectionKind): string {
+  if (level === 'none' && selectionKind !== 'none') return 'The latest message is a selection or preference without an execution verb.'
+  if (level === 'none') return 'The latest message does not authorize tool-backed execution.'
+  if (level === 'inspect') return 'The latest message authorizes read-only inspection or verification.'
+  if (level === 'local_change') return 'The latest message authorizes local project changes within the stated task.'
+  if (level === 'shared_change') return 'The latest message explicitly authorizes shared or remote side effects.'
+  return 'The latest message explicitly authorizes a destructive operation, which still requires exact-target confirmation.'
+}
+
+function inferConsentScope(text: string, level: AuthorizationLevel): ConsentScope {
+  if (level === 'destructive' || level === 'shared_change') return 'current_step'
+  if (/(根据|按照|按).*(规划|计划|方案|建议|文档)|继续推进|开始推进|start implementing|proceed with (?:the )?(?:plan|proposal)/iu.test(text)) {
+    return 'stated_plan'
+  }
+  if (/(统一|全部|都要|workflow|流程|全流程|直到完成)/iu.test(text)) return 'session_workflow'
+  return 'current_step'
+}
+
+function allowedActionSummaryForLevel(level: AuthorizationLevel): string {
+  switch (level) {
+    case 'none':
+      return 'Answer directly from existing context; do not start new task execution.'
+    case 'inspect':
+      return 'Use read-only inspection and verification tools when needed.'
+    case 'local_change':
+      return 'Perform local reversible edits, validation, and local git steps within the stated task.'
+    case 'shared_change':
+      return 'Perform the explicitly requested shared or remote operation after verifying current state.'
+    case 'destructive':
+      return 'Proceed only after exact-target confirmation for the destructive operation.'
+  }
+}
+
+function blockedActionSummaryForLevel(level: AuthorizationLevel): string {
+  switch (level) {
+    case 'none':
+      return 'Do not edit files, run mutating commands, commit, push, release, or delete resources.'
+    case 'inspect':
+      return 'Do not edit files, run mutating commands, commit, push, release, or delete resources.'
+    case 'local_change':
+      return 'Do not push, release, merge shared branches, close PRs, or perform destructive operations unless explicitly requested.'
+    case 'shared_change':
+      return 'Do not perform unrelated shared side effects or destructive operations.'
+    case 'destructive':
+      return 'Do not broaden the destructive target beyond the exact user-confirmed scope.'
+  }
 }
 
 function findLatestUserText(events: NexusEvent[]): string {
@@ -791,6 +1097,62 @@ function isActionRequest(text: string): boolean {
   const normalized = text.trim().toLowerCase()
   return /\b(start|run|build|test|execute|launch|verify|inspect|check|diagnose)\b/iu.test(normalized) ||
     /(开始|启动|运行|执行|构建|测试|验证|检查|诊断|跑一下|测一下)/u.test(text)
+}
+
+function isMetaBehaviorQuestion(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  const asksWhy = /\bwhy\b/iu.test(normalized) || /(为什么|为啥|什么情况|怎么回事|咋回事)/u.test(text)
+  const agentBehavior = /\b(hesitat\w*|tool|tools|modify|modified|edit|changed|directly|permission|policy|unauthorized|without asking)\b/iu.test(normalized) ||
+    /(工具|犹豫|直接|修改|改了|编辑|权限|策略|擅自|未授权|没问我)/u.test(text)
+  if (asksWhy && agentBehavior) return true
+  return /(你.*(为什么|为啥).*(犹豫|直接|修改|改了|编辑|执行|调用工具|用工具)|为什么你会这么犹豫|你怎么直接修改|怎么直接改)/u.test(text)
+}
+
+function isPreferenceOrOptionSelection(text: string): boolean {
+  const trimmed = text.trim()
+  if (!trimmed) return false
+  if (trimmed.length > 48) return false
+  if (hasActionVerbCue(trimmed.toLowerCase(), trimmed)) return false
+  if (/[。.!?？]/u.test(trimmed) && trimmed.length > 12) return false
+  const token = trimmed.replace(/(?:吧|就行|即可|可以)$/u, '').trim()
+  if (/^(?:[a-z]|[A-Z]|[0-9]+)$/u.test(token)) return true
+  if (/^(?:选|选择|就|用|要|保留|采用)?\s*(?:第)?[一二三四五六七八九十0-9]+(?:个|项|种|版|号)?$/u.test(token)) return true
+  if (/^(?:选|选择|就|用|要|保留|采用)\s*[\w.-]+$/iu.test(token)) return true
+  if (/^[\w.-]+$/iu.test(token) && /(?:theme|forest|soft|dark|light|everforest|gruvbox|nord|dracula)/iu.test(token)) return true
+  return false
+}
+
+function inferSelectionKind(text: string): SelectionKind {
+  if (!isPreferenceOrOptionSelection(text)) return 'none'
+  const token = text.trim().replace(/(?:吧|就行|即可|可以)$/u, '').trim()
+  if (/^(?:[a-z]|[A-Z]|[0-9]+)$/u.test(token) || /(?:第)?[一二三四五六七八九十0-9]+(?:个|项|种|版|号)?/u.test(token)) return 'option'
+  return 'preference'
+}
+
+function hasExecutionAuthorizationCue(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(do it|apply|implement|change|modify|edit|write|commit|push|merge|release|publish|delete|remove|overwrite|proceed|execute)\b/iu.test(normalized) ||
+    /(直接|开始|推进|执行|实现|修改|改成|应用|写入|提交|推送|合并|发布|删除|移除|覆盖|按.*做|照.*做)/u.test(text)
+}
+
+function isLocalChangeAuthorizationRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  if (isSharedChangeAuthorizationRequest(text) || isDestructiveAuthorizationRequest(text)) return false
+  return /\b(apply|implement|change|modify|edit|write|commit|proceed|start implementing)\b/iu.test(normalized) ||
+    /(根据|按照|按).*(规划|计划|方案|建议|文档).*(推进|开始|实现|修改|处理)?/u.test(text) ||
+    /(开始推进|继续推进|实现|修改|改成|应用|写入|提交当前|创建分支|新建分支)/u.test(text)
+}
+
+function isSharedChangeAuthorizationRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(push|publish|release|merge (?:to|into)?\s*(?:main|master|develop)|close pr|pull request|remote)\b/iu.test(normalized) ||
+    /(推送|远端|发布|release|合并到\s*(?:main|master|develop)|关闭\s*pr|关闭 pull request|创建\s*pr)/iu.test(text)
+}
+
+function isDestructiveAuthorizationRequest(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(rm -rf|delete|remove|overwrite|force delete|drop|wipe|reset --hard)\b/iu.test(normalized) ||
+    /(删除|移除|覆盖|强制删除|清空|重置|reset --hard|rm -rf)/u.test(text)
 }
 
 function isPausePrompt(text: string): boolean {

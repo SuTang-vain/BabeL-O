@@ -258,6 +258,11 @@ export function projectAgentTrace(events: ReadonlyArray<NexusEvent>): AgentTrace
           recoverable: denied.recoverable,
           terminal: denied.terminal,
           message: denied.message,
+          authorizationLevel: denied.authorizationLevel,
+          requiredAuthorizationLevel: denied.requiredAuthorizationLevel,
+          consentScope: denied.consentScope,
+          authorizationReason: denied.authorizationReason,
+          suggestedUserWording: denied.suggestedUserWording,
           ...(extractToolPathAttr(attributedUseId ? openToolStarts.get(attributedUseId)!.event : undefined) ?? {}),
         },
       }
@@ -394,6 +399,11 @@ export function projectAgentTrace(events: ReadonlyArray<NexusEvent>): AgentTrace
           rule: resp.rule,
           feedback: resp.feedback,
           reason: resp.reason,
+          authorizationLevel: open && open.event.type === 'permission_request' ? open.event.authorizationLevel : undefined,
+          requiredAuthorizationLevel: open && open.event.type === 'permission_request' ? open.event.requiredAuthorizationLevel : undefined,
+          consentScope: open && open.event.type === 'permission_request' ? open.event.consentScope : undefined,
+          authorizationReason: open && open.event.type === 'permission_request' ? open.event.authorizationReason : undefined,
+          suggestedUserWording: open && open.event.type === 'permission_request' ? open.event.suggestedUserWording : undefined,
         },
       }
       spans.push(span)
@@ -416,7 +426,16 @@ export function projectAgentTrace(events: ReadonlyArray<NexusEvent>): AgentTrace
       sourceEventIndices: [index],
       sourceEventTypes: ['permission_request'],
       toolUseId,
-      attributes: { risk: req.risk, scopeRisk: req.scopeRisk, suggestedRule: req.suggestedRule },
+      attributes: {
+        risk: req.risk,
+        scopeRisk: req.scopeRisk,
+        suggestedRule: req.suggestedRule,
+        authorizationLevel: req.authorizationLevel,
+        requiredAuthorizationLevel: req.requiredAuthorizationLevel,
+        consentScope: req.consentScope,
+        authorizationReason: req.authorizationReason,
+        suggestedUserWording: req.suggestedUserWording,
+      },
     })
   }
 

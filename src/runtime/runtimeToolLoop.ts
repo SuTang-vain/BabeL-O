@@ -9,6 +9,7 @@ import { PendingPermissionRegistry, type PermissionResolution } from '../shared/
 import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool, ToolRisk } from '../tools/Tool.js'
 import { classifyAction } from './classifier.js'
+import type { AuthorizationLevel, UserIntentGuidance } from './intentGuidance.js'
 import { deriveBashSuggestedRule, type ToolPolicy } from './LocalCodingRuntime.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import {
@@ -131,6 +132,153 @@ function recoverableDeniedToolResult(options: {
   }
 }
 
+type TurnToolAuthorizationDecision =
+  | { action: 'allow' }
+  | {
+    action: 'deny_recoverable'
+    requiredAuthorizationLevel: AuthorizationLevel
+    reason: string
+    suggestedUserWording: string
+  }
+  | {
+    action: 'require_permission'
+    requiredAuthorizationLevel: AuthorizationLevel
+    reason: string
+    suggestedUserWording: string
+  }
+
+function authorizeToolForTurn(options: {
+  guidance?: UserIntentGuidance
+  toolName: string
+  toolInput: unknown
+  effectiveRisk: ToolRisk
+}): TurnToolAuthorizationDecision {
+  const authorization = options.guidance?.authorization
+  if (!authorization) return { action: 'allow' }
+
+  const level = authorization.level
+  const impact = classifyToolAuthorizationImpact(options.toolName, options.toolInput, options.effectiveRisk)
+
+  if (level === 'destructive') {
+    if (impact === 'destructive') {
+      return {
+        action: 'require_permission',
+        requiredAuthorizationLevel: 'destructive',
+        reason: 'Destructive operation requires exact-target confirmation even when requested.',
+        suggestedUserWording: 'Please confirm the exact destructive target before continuing.',
+      }
+    }
+    return { action: 'allow' }
+  }
+
+  if (impact === 'destructive') {
+    return {
+      action: 'deny_recoverable',
+      requiredAuthorizationLevel: 'destructive',
+      reason: `Turn authorization is ${level}; destructive tool use is not authorized.`,
+      suggestedUserWording: 'Please explicitly confirm the destructive target before I run this.',
+    }
+  }
+
+  if (level === 'shared_change') {
+    return { action: 'allow' }
+  }
+
+  if (impact === 'shared_change') {
+    return {
+      action: 'deny_recoverable',
+      requiredAuthorizationLevel: 'shared_change',
+      reason: `Turn authorization is ${level}; shared or remote side effects are not authorized.`,
+      suggestedUserWording: 'Please explicitly ask me to push, release, merge, or create/close the PR.',
+    }
+  }
+
+  if (level === 'none' && options.effectiveRisk !== 'read') {
+    return {
+      action: 'deny_recoverable',
+      requiredAuthorizationLevel: 'local_change',
+      reason: 'The latest user turn did not authorize tool-backed mutation or execution.',
+      suggestedUserWording: 'Please say that you want me to apply this change before I edit or run mutating commands.',
+    }
+  }
+
+  if (level === 'inspect' && options.effectiveRisk !== 'read') {
+    if (options.toolName === 'Bash') return { action: 'allow' }
+    return {
+      action: 'deny_recoverable',
+      requiredAuthorizationLevel: 'local_change',
+      reason: 'Turn authorization is inspect; only read-only tools are authorized.',
+      suggestedUserWording: 'Please ask me to make the local change if you want me to edit or run mutating commands.',
+    }
+  }
+
+  if (level === 'local_change') {
+    return { action: 'allow' }
+  }
+
+  if (impact === 'local_change') {
+    if (options.toolName === 'Bash') return { action: 'allow' }
+    return {
+      action: 'deny_recoverable',
+      requiredAuthorizationLevel: 'local_change',
+      reason: `Turn authorization is ${level}; local file or command mutation is not authorized.`,
+      suggestedUserWording: 'Please explicitly authorize the local change before I edit files or run mutating commands.',
+    }
+  }
+
+  return { action: 'allow' }
+}
+
+function classifyToolAuthorizationImpact(
+  toolName: string,
+  toolInput: unknown,
+  effectiveRisk: ToolRisk,
+): 'read' | 'local_change' | 'shared_change' | 'destructive' {
+  if (effectiveRisk === 'read') return 'read'
+  if (toolName === 'Bash') {
+    const command = getBashCommand(toolInput)
+    if (command && isDestructiveCommand(command)) return 'destructive'
+    if (command && isSharedChangeCommand(command)) return 'shared_change'
+    if (command && isLocalMutationCommand(command)) return 'local_change'
+    return 'read'
+  }
+  if (toolName === 'Task') return 'local_change'
+  if (effectiveRisk === 'write' || effectiveRisk === 'execute' || effectiveRisk === 'task') return 'local_change'
+  return 'read'
+}
+
+function getBashCommand(input: unknown): string | undefined {
+  if (!input || typeof input !== 'object' || !('command' in input)) return undefined
+  const command = (input as { command: unknown }).command
+  return typeof command === 'string' ? command : undefined
+}
+
+function isSharedChangeCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?push(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)npm\s+publish(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)gh\s+release(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)gh\s+pr\s+(?:merge|close|create)(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?(?:merge|checkout)\s+(?:main|master|develop)(?:\s|$)/iu.test(command) ||
+    /\brelease\b/iu.test(command)
+}
+
+function isLocalMutationCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?(?:commit|add|checkout\s+-b|switch\s+-c|branch|stash|tag)(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)npm\s+(?:install|i|ci|update|link|unlink)(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)(?:pnpm|yarn)\s+(?:install|add|remove|update|link|unlink)(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)(?:touch|mkdir|mv|cp|chmod|chown)(?:\s|$)/iu.test(command) ||
+    /(?:>|>>)\s*\S+/u.test(command)
+}
+
+function isDestructiveCommand(command: string): boolean {
+  return /(?:^|[;&|]\s*)rm\s+-[^\s]*(?:r[^\s]*f|f[^\s]*r|r|f)[^\s]*(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?reset\s+--hard(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?branch\s+-D(?:\s|$)/iu.test(command) ||
+    /(?:^|[;&|]\s*)git\s+(?:-C\s+\S+\s+)?push\s+--force(?:\s|$)/iu.test(command) ||
+    /\b(?:delete|overwrite)\b/iu.test(command) ||
+    /(删除|移除|覆盖|强制删除|清空|重置)/u.test(command)
+}
+
 async function* requestScopeBoundaryPermission(options: {
   runtimeOptions: RuntimeExecuteOptions
   storage: NexusStorage
@@ -246,6 +394,7 @@ export async function* executeProviderToolCall(options: {
   readFileCache: Map<string, ReadFileCacheEntry>
   taskScope?: TaskScopeDeclaredEvent
   providerSessionRules?: ProviderSessionRules
+  userIntentGuidance?: UserIntentGuidance
 }): AsyncGenerator<NexusEvent, ProviderToolCallExecutionOutcome> {
   const { toolCall, runtimeOptions, metrics, readFileCache } = options
   const providerSessionRules = options.providerSessionRules ?? defaultProviderSessionRules
@@ -566,6 +715,40 @@ export async function* executeProviderToolCall(options: {
   }
 
   const suggestedRule = providerSuggestedRule(tool, toolInput)
+  const authorizationDecision = authorizeToolForTurn({
+    guidance: options.userIntentGuidance,
+    toolName: tool.name,
+    toolInput,
+    effectiveRisk,
+  })
+  if (authorizationDecision.action === 'deny_recoverable') {
+    const authorization = options.userIntentGuidance?.authorization
+    const message = `${authorizationDecision.reason} Required authorization: ${authorizationDecision.requiredAuthorizationLevel}.`
+    yield {
+      type: 'tool_denied',
+      ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
+      name: tool.name,
+      risk: effectiveRisk,
+      message,
+      denialKind: 'policy',
+      ...(authorization && {
+        authorizationLevel: authorization.level,
+        consentScope: authorization.consentScope,
+        authorizationReason: authorization.reason,
+      }),
+      requiredAuthorizationLevel: authorizationDecision.requiredAuthorizationLevel,
+      suggestedUserWording: authorizationDecision.suggestedUserWording,
+      recoverable: true,
+    }
+    return recoverableDeniedToolResult({
+      toolUseId: toolCall.id,
+      toolName: tool.name,
+      message: authorization
+        ? `${message}\nAuthorization level: ${authorization.level}. Consent scope: ${authorization.consentScope}.`
+        : message,
+    })
+  }
   const scopeBoundary = options.taskScope
     ? classifyToolScopeBoundary({
       taskScope: options.taskScope,
@@ -607,13 +790,16 @@ export async function* executeProviderToolCall(options: {
     }
   }
 
-  if ((effectiveRisk === 'write' || effectiveRisk === 'execute') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
+  if ((effectiveRisk === 'write' || effectiveRisk === 'execute' || authorizationDecision.action === 'require_permission') && !runtimeOptions.skipPermissionCheck && !scopeBoundary) {
     const { autoApprove, reason } = classifyAction(tool.name, toolInput, { cwd: runtimeOptions.cwd })
     const sessionRuleApproved = providerSessionRules.isAllowed(runtimeOptions.sessionId, tool, toolInput)
-    let approved = autoApprove || sessionRuleApproved
+    const requiresTurnAuthorizationPermission = authorizationDecision.action === 'require_permission'
+    let approved = requiresTurnAuthorizationPermission ? false : autoApprove || sessionRuleApproved
     let decisionReason = sessionRuleApproved
       ? 'Approved by session rule'
-      : `Auto-approved: ${reason}`
+      : requiresTurnAuthorizationPermission
+        ? authorizationDecision.reason
+        : `Auto-approved: ${reason}`
 
     let permissionDecision: PermissionResolution | undefined
 
@@ -642,8 +828,15 @@ export async function* executeProviderToolCall(options: {
         name: tool.name,
         input: toolInput,
         risk: effectiveRisk,
-        message: `Tool ${tool.name} requires user permission to run. Reason: ${reason}`,
+        message: `Tool ${tool.name} requires user permission to run. Reason: ${requiresTurnAuthorizationPermission ? authorizationDecision.reason : reason}`,
         ...(suggestedRule && { suggestedRule }),
+        ...(requiresTurnAuthorizationPermission && options.userIntentGuidance?.authorization && {
+          authorizationLevel: options.userIntentGuidance.authorization.level,
+          requiredAuthorizationLevel: authorizationDecision.requiredAuthorizationLevel,
+          consentScope: options.userIntentGuidance.authorization.consentScope,
+          authorizationReason: options.userIntentGuidance.authorization.reason,
+          suggestedUserWording: authorizationDecision.suggestedUserWording,
+        }),
         source: tool.source,
       }
 

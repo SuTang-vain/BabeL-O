@@ -8,7 +8,7 @@ import { ConfigManager, createBabeLXConfigImportPlan, loadBabeLXConfigImportPlan
 import { LLMCodingRuntime, mapEventsToMessages } from '../src/runtime/LLMCodingRuntime.js'
 import { isRecoveryBoundaryError } from '../src/runtime/contextAssembler.js'
 import { summarizeSessionEvents } from '../src/runtime/sessionSummary.js'
-import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
+import { deriveFallbackUserIntentGuidance, formatUserIntentGuidance, shouldSuppressToolsForIntent, isPureMemoryCapabilityQuestion, normalizeGuidancePolicy, getIntentCategory, type UserIntentGuidance } from '../src/runtime/intentGuidance.js'
 import { createDefaultToolRegistry } from '../src/tools/registry.js'
 import { allowAllTools, allowlistedTools } from '../src/runtime/LocalCodingRuntime.js'
 import { MemoryStorage } from '../src/storage/MemoryStorage.js'
@@ -845,6 +845,71 @@ describe('User intent fallback guidance', () => {
     assert.equal(guidance.problemTarget, 'agent_failure')
     assert.match(formatUserIntentGuidance(guidance), /Stale task mode: background_only/)
   })
+
+  test('classifies preference selections and agent-behavior questions as unauthorized execution', () => {
+    for (const latestPrompt of ['everforest', 'light-soft吧']) {
+      const guidance = deriveFallbackUserIntentGuidance({
+        events: [],
+        latestPrompt,
+        cwd: tmpdir(),
+      })
+      assert.equal(guidance.intent, 'status')
+      assert.equal(guidance.actionHint, 'respond_only')
+      assert.equal(guidance.requiresTools, false)
+      assert.equal(guidance.authorization?.level, 'none')
+      assert.equal(guidance.authorization?.selectionKind, 'preference')
+      assert.equal(shouldSuppressToolsForIntent(guidance), true)
+      assert.match(formatUserIntentGuidance(guidance), /Authorization level: none/)
+      assert.match(formatUserIntentGuidance(guidance), /Selection kind: preference/)
+    }
+
+    const meta = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '？为什么你会这么犹豫',
+      cwd: tmpdir(),
+    })
+    assert.equal(meta.intent, 'status')
+    assert.equal(meta.actionHint, 'respond_only')
+    assert.equal(meta.requiresTools, false)
+    assert.equal(meta.problemTarget, 'agent_failure')
+    assert.equal(meta.authorization?.level, 'none')
+    assert.equal(meta.authorization?.selectionKind, 'none')
+    assert.equal(shouldSuppressToolsForIntent(meta), true)
+  })
+
+  test('derives inspect, local, shared, and destructive authorization levels', () => {
+    const inspect = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '查看当前项目分支情况',
+      cwd: tmpdir(),
+    })
+    assert.equal(inspect.authorization?.level, 'inspect')
+    assert.equal(inspect.requiresTools, true)
+
+    const local = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '根据文档规划开始推进',
+      cwd: tmpdir(),
+    })
+    assert.equal(local.authorization?.level, 'local_change')
+    assert.equal(local.authorization?.consentScope, 'stated_plan')
+
+    const shared = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '把 develop 推送到远端',
+      cwd: tmpdir(),
+    })
+    assert.equal(shared.authorization?.level, 'shared_change')
+    assert.equal(shared.authorization?.consentScope, 'current_step')
+
+    const destructive = deriveFallbackUserIntentGuidance({
+      events: [],
+      latestPrompt: '删除旧目录重新 clone',
+      cwd: tmpdir(),
+    })
+    assert.equal(destructive.authorization?.level, 'destructive')
+    assert.equal(destructive.authorization?.consentScope, 'current_step')
+  })
 })
 
 describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
@@ -906,9 +971,13 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(shouldSuppressToolsForIntent(underclassified), false)
   })
 
-  test('Mode B negative: guard is scoped to intent=continue + actionHint=normal', () => {
-    // prioritize_latest must NOT fire the guard — still suppressible when the
-    // model said requiresTools=false.
+  test('Mode B under direction 2: continue + prioritize_latest + requiresTools=false passes through (Tier 2)', () => {
+    // Direction 2 (structural passthrough) supersedes the stopgap scoping:
+    // continue+prioritize_latest+requiresTools=false is Tier 2 and no longer
+    // suppressed — the model's tool call is the ground-truth signal that tools
+    // are needed. Fix B (stopgap) still keeps requiresTools=false here (the
+    // guard is scoped to continue+normal); see the direction-2 block below for
+    // full Tier 2 coverage.
     const prioritizeLatest = normalizeGuidancePolicy(modelGuidance({
       intent: 'continue',
       actionHint: 'prioritize_latest',
@@ -916,9 +985,9 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
       latestUserText: 'look at this other path instead',
     }))
     assert.equal(prioritizeLatest.requiresTools, false)
-    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), true)
+    assert.equal(shouldSuppressToolsForIntent(prioritizeLatest), false)
 
-    // pause normalizes to respond_only before the guard; still suppressed.
+    // pause normalizes to respond_only; Tier 1 — still suppressed.
     const pause = normalizeGuidancePolicy(modelGuidance({
       intent: 'pause',
       actionHint: 'normal',
@@ -939,6 +1008,150 @@ describe('Intent tool suppression stopgap (Mode A + Mode B)', () => {
     assert.equal(status.actionHint, 'respond_only')
     assert.equal(status.requiresTools, false)
     assert.equal(shouldSuppressToolsForIntent(status), false)
+  })
+
+  test('Soft-error-retry Slice 1 B1: self_diagnosis_request is exempt from intent suppression', () => {
+    // See docs/nexus/proposals/soft-error-retry-continuity-governance-plan.md Fix B1.
+    // Reproduces seq 1024 of session_2db242ff: intent=correction / respond_only /
+    // requiresTools=false, but intentCategory=self_diagnosis_request (the model is
+    // diagnosing the runtime and needs a read-only tool to cite a rule). Suppressing
+    // here is a false positive that ended the session in a user cancel.
+    const selfDiag = normalizeGuidancePolicy(modelGuidance({
+      intent: 'correction',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      problemTarget: 'agent_failure',
+      latestUserText: '但是你软超时的话应该主动发起继续任务才对呀',
+    }))
+    assert.equal(getIntentCategory(selfDiag), 'self_diagnosis_request')
+    assert.equal(shouldSuppressToolsForIntent(selfDiag), false)
+
+    // Negative (after direction 2 narrowed suppression to Tier 1): a Tier 1 turn
+    // (pause) is still hard-suppressed. Direction 2 turned the general correction
+    // case into Tier 2 passthrough, so the original negative (general correction
+    // suppressed) no longer holds; this Tier 1 case replaces it. The
+    // self_diagnosis positive above is now a special case of Tier 2 passthrough.
+    const tier1 = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      problemTarget: 'unknown',
+      latestUserText: '先暂停一下',
+    }))
+    assert.equal(shouldSuppressToolsForIntent(tier1), true)
+  })
+})
+
+describe('Intent tool suppression structural passthrough (direction 2)', () => {
+  // See docs/nexus/proposals/intent-tool-suppression-structural-passthrough-plan.md.
+  // Two-tier suppression: Tier 1 (pure-capability + pause + greeting) keeps
+  // hard suppress; Tier 2 (continue / new_focus / correction with
+  // requiresTools=false) gets first-call passthrough — the model's tool call
+  // is the ground-truth signal that tools are needed. Over-tooling stays
+  // handled by finalResponseOnlyMode / TOOL_LOOP_FINAL_RESPONSE_ONLY.
+  //
+  // Inputs are chosen to avoid the normalizeGuidancePolicy overrides
+  // (isCurrentStateVerificationRequest / isMemoryAvailabilityCheckRequest /
+  // isPureMemoryCapabilityQuestion), which would force requiresTools=true and
+  // mask the Tier 2 suppression branch under test.
+
+  function modelGuidance(overrides: Partial<UserIntentGuidance>): UserIntentGuidance {
+    return {
+      intent: 'continue',
+      confidence: 0.8,
+      continuity: 0.8,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget: 'unknown',
+      reason: 'test',
+      latestUserText: 'continue with the next step',
+      explicitPaths: [],
+      source: 'model',
+      ...overrides,
+    }
+  }
+
+  test('Tier 2: continue + requiresTools=false + respond_only passes through (no suppression)', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '继续总结一下',
+      reason: 'Pure analytical continuation, no tool-backed verification requested.',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 2: new_focus + requiresTools=false passes through', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'new_focus',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '换个角度看设计',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 2: correction + requiresTools=false passes through', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'correction',
+      actionHint: 'prioritize_latest',
+      requiresTools: false,
+      latestUserText: '不是这个，换一个',
+    }))
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
+  })
+
+  test('Tier 1 non-regression: pure capability question still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你有长期记忆吗？',
+    }))
+    assert.equal(guidance.intent, 'status')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: pause still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'pause',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: '等一下',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: greeting still suppresses', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'greeting',
+      actionHint: 'respond_only',
+      requiresTools: false,
+      latestUserText: '你是谁？',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), true)
+  })
+
+  test('Tier 1 non-regression: status + respond_only is not hard-suppressed', () => {
+    const guidance = normalizeGuidancePolicy(modelGuidance({
+      intent: 'status',
+      actionHint: 'normal',
+      requiresTools: false,
+      latestUserText: 'what is the current state',
+    }))
+    assert.equal(guidance.actionHint, 'respond_only')
+    assert.equal(guidance.requiresTools, false)
+    assert.equal(shouldSuppressToolsForIntent(guidance), false)
   })
 })
 
@@ -2851,6 +3064,8 @@ describe('LLMCodingRuntime', () => {
     const guardError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_LOOP_FINAL_RESPONSE_ONLY') as any
     assert.ok(guardError)
     assert.match(guardError.message, /ignored additional requested tools/)
+    // C1: must_respond backstop is a soft signal (soft-error-retry plan).
+    assert.equal(guardError.details?.severity, 'soft')
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)
@@ -3015,7 +3230,84 @@ describe('LLMCodingRuntime', () => {
     assert.equal(firstBody.tools, undefined)
     const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
     assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
-    assert.match(JSON.stringify(secondBody.messages), /genuinely need to execute a command or inspect files/)
+    assert.match(JSON.stringify(secondBody.messages), /inspect a file or run a read-only check to answer, retry that tool now/)
+  })
+
+  test('blocks tool execution for bare preference selection even when intake model asks for tools', async () => {
+    const cwd = join(tmpdir(), `babel-o-test-preference-auth-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const targetFile = join(cwd, 'theme.txt')
+    fs.writeFileSync(targetFile, 'dark\n', 'utf8')
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.9,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"normal\\",\\"requiresTools\\":true,\\"authorizationLevel\\":\\"local_change\\",\\"consentScope\\":\\"current_step\\",\\"consentSource\\":\\"explicit_user\\",\\"selectionKind\\":\\"none\\",\\"reason\\":\\"Incorrectly treat preference as execution.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      return {
+        ok: true,
+        status: 200,
+        body: createAnthropicToolUseStream({
+          id: 'tool-preference-edit',
+          name: 'Edit',
+          input: {
+            path: targetFile,
+            oldString: 'dark',
+            newString: 'light-soft',
+          },
+        }),
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowAllTools(),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-preference-selection-no-tool-execution',
+        prompt: 'light-soft吧',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      assert.equal(fs.readFileSync(targetFile, 'utf8'), 'dark\n')
+      const intake = events.find(event => event.type === 'user_intake_guidance') as any
+      assert.ok(intake)
+      assert.equal(intake.authorizationLevel, 'none')
+      assert.equal(intake.selectionKind, 'preference')
+      assert.equal(intake.requiresTools, false)
+
+      const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+      assert.ok(suppressionError)
+      assert.equal(suppressionError.details?.suppressionReason, 'authorization:none:preference_selection')
+      assert.equal(suppressionError.details?.retryAttempted, false)
+
+      assert.equal(events.some(event => event.type === 'tool_started'), false)
+      assert.equal(fetchCalls.length, 1)
+    } finally {
+      try {
+        fs.rmSync(cwd, { recursive: true, force: true })
+      } catch {}
+    }
   })
 
   test('hard-suppresses MiniMax bracket-wrapped tool calls for respond-only intake', async () => {
@@ -3201,6 +3493,82 @@ describe('LLMCodingRuntime', () => {
     assert.ok(resultEvent)
     assert.equal(resultEvent.success, true)
     assert.match(resultEvent.message, /已完成验证/)
+  })
+
+  test('direction 2: passes through tool calls for task-continuation intent under-classified as requiresTools=false', async () => {
+    // Regression fixture for session_eafe6bfc (Glob/Read) and the
+    // session_b7f64aa1 / session_9b1c212c class in the intent-guidance Active
+    // Plan: continue + requiresTools=false (Mode B under-classification) and
+    // the model emits a tool. Before direction 2 the runtime suppressed the
+    // tool call and wasted a nudge turn (and could fail the session if the user
+    // cancelled during the nudge); after direction 2 the tool runs on the first
+    // main turn (first-call passthrough).
+    const cwd = join(tmpdir(), `babel-o-test-tier2-passthrough-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+
+    globalThis.fetch = async (url, init) => {
+      const body = parseRequestBody(init)
+      if (isIntakeRequestBody(body)) {
+        return {
+          ok: true,
+          status: 200,
+          body: createMockStream([
+            'event: content_block_start\n',
+            'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\n',
+            'data: {"index":0,"delta":{"type":"text_delta","text":"{\\"intent\\":\\"continue\\",\\"confidence\\":0.85,\\"continuity\\":0.8,\\"contextScope\\":\\"full\\",\\"actionHint\\":\\"respond_only\\",\\"requiresTools\\":false,\\"reason\\":\\"Analytical continuation.\\",\\"guidance\\":\\"Continue the analysis.\\",\\"explicitPaths\\":[]}"}}\n\n',
+            'event: content_block_stop\n',
+            'data: {"index":0}\n\n',
+          ]),
+          text: async () => 'mock intake response text',
+        } as Response
+      }
+      fetchCalls.push({ url: typeof url === 'string' ? url : (url as Request).url, init })
+      const nextStream = fetchCalls.length === 1
+        ? createAnthropicToolUseStream({ id: 'tool-tier2-1', name: 'Bash', input: { command: 'pwd', timeoutMs: 15000 } })
+        : createAnthropicTextStream('已继续完成分析。')
+      return {
+        ok: true,
+        status: 200,
+        body: nextStream,
+        text: async () => 'mock response text',
+      } as Response
+    }
+
+    const runtime = new LLMCodingRuntime(
+      toolsRegistry,
+      allowlistedTools(['Bash']),
+      null as any,
+      configManager,
+    )
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-tier2-passthrough-continue-respond-only',
+        prompt: '继续总结一下',
+        cwd,
+        skipPermissionCheck: true,
+      }),
+    )
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    // No suppression nudge — the model's tool call runs on the first main turn.
+    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
+    assert.equal(suppressionError, undefined)
+
+    const toolStartedEvents = events.filter(event => event.type === 'tool_started') as any[]
+    assert.equal(toolStartedEvents.length, 1)
+    assert.equal(toolStartedEvents[0]?.name, 'Bash')
+
+    // Two main-turn calls: tool_use (runs) + final text response. No nudge turn.
+    assert.equal(fetchCalls.length, 2)
+
+    // Tools were visible on the first main turn (not hidden by suppression).
+    const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.ok(firstBody.tools, 'tools should be visible on the first turn for Tier 2 passthrough')
+    assert.deepEqual(firstBody.tools.map((tool: any) => tool.name), ['Bash'])
   })
 
   test('asks user to confirm ambiguous option input before running tools', async () => {

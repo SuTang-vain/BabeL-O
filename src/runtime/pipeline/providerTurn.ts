@@ -50,6 +50,11 @@ export function reduceProviderTurnOutcome(options: {
   // TOOL_DENIED_FINAL_CHECK; read-only tool calls pass through.
   finalCheckPhase?: boolean
   suppressToolsForUserIntent: boolean
+  // True when the user has re-typed an option-like input to confirm a prior
+  // ambiguous selection (see isConfirmedOptionSelectionAfterClarification).
+  // When true, the option-confirmation gate below is skipped so the confirmed
+  // tool call runs. Direction 2 decoupled this gate from intent suppression.
+  confirmedOptionSelection?: boolean
   userIntentGuidance: UserIntentGuidance
   providerId?: string
   modelId?: string
@@ -158,6 +163,7 @@ export function reduceProviderTurnOutcome(options: {
             code: 'TOOL_DENIED_FINAL_CHECK',
             message,
             details: {
+              severity: 'soft',
               finalCheckPhase: true,
               attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
               deniedTools: nonReadOnly.map(toolCall => toolCall.name),
@@ -192,6 +198,7 @@ export function reduceProviderTurnOutcome(options: {
           sessionId: options.sessionId,
           code: 'TOOL_LOOP_FINAL_RESPONSE_ONLY',
           message,
+          details: { severity: 'soft' },
         }),
       ],
       eventsAfterMessages: [],
@@ -203,11 +210,26 @@ export function reduceProviderTurnOutcome(options: {
     }
   }
 
-  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
-    const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
-    const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
-    const optionSelection = normalizeOptionSelection(options.userIntentGuidance.latestUserText)
+  // Option-confirmation gate: disambiguate ambiguous option-like input (a
+  // single letter such as "B") before acting on a tool call. Direction 2
+  // decoupled this gate from intent suppression — it fires whenever the user's
+  // latest input looks like an option selection, the model tried to call a
+  // tool, and the user has not yet confirmed. The gate is terminal: it asks
+  // the user to re-type the option to confirm. A single-letter input is not a
+  // reliable "tools needed" signal, so Tier 2 passthrough does not apply here.
+  // Order matters: this runs after finalResponseOnlyMode (so the over-tooling
+  // guard still short-circuits) and before intent suppression.
+  const confirmedOptionSelection = options.confirmedOptionSelection ?? false
+  const latestUserText = options.userIntentGuidance.latestUserText
+  if (
+    turn.toolCalls.length > 0 &&
+    !confirmedOptionSelection &&
+    latestUserText &&
+    options.suppressedToolRetryCount < options.maxSuppressedToolRetries
+  ) {
+    const optionSelection = normalizeOptionSelection(latestUserText)
     if (optionSelection) {
+      const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
       const clarification = buildOptionSelectionClarificationMessage({
         optionSelection,
         attemptedTools,
@@ -241,8 +263,18 @@ export function reduceProviderTurnOutcome(options: {
         ...baseCounts,
       }
     }
+  }
+
+  // Intent suppression (Tier 1 only after direction 2 — pure-capability
+  // question / pause / greeting; see shouldSuppressToolsForIntent). The
+  // option-confirmation gate above has already been handled independently.
+  if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
+    const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
+    const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
+    const suppressionReason = getToolSuppressionReason(options.userIntentGuidance)
+    const blocksExecution = suppressionReason?.startsWith('authorization:none') ?? false
     return {
-      kind: 'continue',
+      kind: blocksExecution ? 'terminal' : 'continue',
       eventsBeforeMessages: [
         buildRuntimeErrorEvent({
           sessionId: options.sessionId,
@@ -254,18 +286,26 @@ export function reduceProviderTurnOutcome(options: {
             requiresTools: options.userIntentGuidance.requiresTools,
             latestUserText: options.userIntentGuidance.latestUserText,
             intentCategory: getIntentCategory(options.userIntentGuidance),
-            suppressionReason: getToolSuppressionReason(options.userIntentGuidance),
+            suppressionReason,
+            severity: 'soft',
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
-            retryAttempted: true,
-            retryExhausted: false,
+            retryAttempted: !blocksExecution,
+            retryExhausted: blocksExecution,
           },
         }),
       ],
-      eventsAfterMessages: [],
-      messages: [{
-        role: 'user',
-        content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to execute a command or inspect files to answer the user, call the appropriate tool now. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
-      }],
+      eventsAfterMessages: blocksExecution
+        ? [buildRuntimeResultEvent(options.sessionId, true, 'The latest user turn did not authorize tool-backed execution, so requested tools were suppressed.')]
+        : [],
+      messages: blocksExecution
+        ? [{
+            role: 'assistant',
+            content: 'I should answer this turn directly from the existing context. The latest message did not authorize tool-backed execution.',
+          }]
+        : [{
+            role: 'user',
+            content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now - the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
+          }],
       maxTokenRecoveryCount: options.maxTokenRecoveryCount,
       outputRetryCount: options.outputRetryCount,
       suppressedToolRetryCount: options.suppressedToolRetryCount + 1,
@@ -521,6 +561,12 @@ export async function* streamProviderTurn(options: {
 
 function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): ToolCallTextLeakSuppression | undefined {
   const normalized = text.toLowerCase()
+  // Half-width (ASCII) dialect patterns: generic XML, MiniMax XML, JSON tool
+  // calls, MCP-style. Plus full-width (DSML) variants — models emit full-width
+  // brackets (U+FF1C ＜, U+FF1E ＞, U+3010 【) to bypass half-width suppression
+  // when tools are hidden. dsml_fullwidth_tool_calls is suppress-only until a
+  // strict parser proves safe normalization while tools are visible. See
+  // runtime-tool-loop-governance-plan.md Phase B.
   const patterns = [
     '<tool_call',
     '</tool_call>',
@@ -531,6 +577,14 @@ function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): Too
     '"tool_calls"',
     '"function_call"',
     'call_tool ',
+    // DSML / full-width variants
+    '＜tool_call',
+    '＜/tool_call',
+    '＜invoke name=',
+    '＜/invoke',
+    '＜minimax:tool_call',
+    '【tool_call',
+    '【invoke name=',
   ]
   const pattern = patterns.find(candidate => normalized.includes(candidate))
   if (!pattern) return undefined
@@ -544,6 +598,7 @@ function detectToolCallTextLeak(text: string, phase: ToolCallTextLeakPhase): Too
 function redactToolCallTextPreview(text: string): string {
   return text
     .replace(/<command>[\s\S]*?<\/command>/gi, '<command>[REDACTED]</command>')
+    .replace(/＜command＞[\s\S]*?＜\/command＞/giu, '＜command＞[REDACTED]＜/command＞')
     .replace(/"arguments"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"arguments":"[REDACTED]"')
     .replace(/"command"\s*:\s*"(?:\\.|[^"\\])*"/gi, '"command":"[REDACTED]"')
     .slice(0, 300)

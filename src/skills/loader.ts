@@ -277,6 +277,50 @@ export async function loadSkillFromFile(filePath: string): Promise<Skill | null>
   }
 }
 
+/** Canonical Agent Skills resource directories. */
+const SPEC_RESOURCE_DIRS: ReadonlyArray<{ kind: SkillResource['kind']; dirName: string }> = [
+  { kind: 'script', dirName: 'scripts' },
+  { kind: 'reference', dirName: 'references' },
+  { kind: 'asset', dirName: 'assets' },
+]
+
+/** Top-level package entries that are never indexed as resources. */
+const SKIPPED_TOP_LEVEL_ENTRIES = new Set<string>([
+  'SKILL.md',
+  'LICENSE',
+  'LICENSE.txt',
+  'LICENSE.md',
+  'NOTICE',
+  'NOTICE.txt',
+  'README',
+  'README.md',
+  'CHANGELOG',
+  'CHANGELOG.md',
+])
+
+/**
+ * Top-level subdirectories that must be skipped before any I/O so a hostile
+ * package cannot blow up resource indexing (e.g. `.git/HEAD` blob walk).
+ * Keep this conservative — every entry must have a concrete reason.
+ */
+const SKIPPED_TOP_LEVEL_DIRS = new Set<string>([
+  '.git',
+  '.github',
+  '.svn',
+  '.hg',
+  'node_modules',
+  '__pycache__',
+  '.venv',
+  'venv',
+  '.idea',
+  '.vscode',
+])
+
+/** True if a top-level dir name is the canonical spec dirs we already walk. */
+function isSpecResourceDir(name: string): boolean {
+  return SPEC_RESOURCE_DIRS.some(d => d.dirName === name)
+}
+
 async function listPackageResources(packageRoot: string): Promise<SkillResource[]> {
   const resources: SkillResource[] = []
   let packageRealPath: string
@@ -289,49 +333,90 @@ async function listPackageResources(packageRoot: string): Promise<SkillResource[
     const relativePath = path.relative(packageRealPath, targetPath)
     return relativePath === '' || (!relativePath.startsWith('..') && !path.isAbsolute(relativePath))
   }
-  const collect = async (kind: SkillResource['kind'], dirName: string) => {
-    const dir = path.join(packageRoot, dirName)
-    const walk = async (currentDir: string, relativeDir: string) => {
-      let entries: Dirent[]
+
+  const walkRecursive = async (
+    kind: SkillResource['kind'],
+    prefix: string,
+    currentDir: string,
+    relativeDir: string,
+  ): Promise<void> => {
+    let entries: Dirent[]
+    try {
+      entries = await fs.readdir(currentDir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const absolutePath = path.join(currentDir, entry.name)
+      const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name
       try {
-        entries = await fs.readdir(currentDir, { withFileTypes: true })
-      } catch {
-        return
-      }
-      for (const entry of entries) {
-        const absolutePath = path.join(currentDir, entry.name)
-        const relativePath = relativeDir ? `${relativeDir}/${entry.name}` : entry.name
-        try {
-          const linkStat = await fs.lstat(absolutePath)
-          if (linkStat.isSymbolicLink()) continue
-          const realPath = await fs.realpath(absolutePath)
-          if (!isInsidePackage(realPath)) continue
-          if (linkStat.isDirectory()) {
-            await walk(absolutePath, relativePath)
-            continue
-          }
-          if (!linkStat.isFile()) continue
-        } catch {
+        const linkStat = await fs.lstat(absolutePath)
+        if (linkStat.isSymbolicLink()) continue
+        const realPath = await fs.realpath(absolutePath)
+        if (!isInsidePackage(realPath)) continue
+        if (linkStat.isDirectory()) {
+          await walkRecursive(kind, prefix, absolutePath, relativePath)
           continue
         }
-        resources.push({
-          kind,
-          path: `${dirName}/${relativePath}`,
-          absolutePath,
-        })
+        if (!linkStat.isFile()) continue
+      } catch {
+        continue
       }
+      resources.push({
+        kind,
+        path: `${prefix}/${relativePath}`,
+        absolutePath,
+      })
     }
+  }
+
+  const collectSpecDir = async (kind: SkillResource['kind'], dirName: string): Promise<void> => {
+    const dir = path.join(packageRoot, dirName)
     try {
       const realPath = await fs.realpath(dir)
       if (!isInsidePackage(realPath)) return
     } catch {
       return
     }
-    await walk(dir, '')
+    await walkRecursive(kind, dirName, dir, '')
   }
-  await collect('script', 'scripts')
-  await collect('reference', 'references')
-  await collect('asset', 'assets')
+
+  for (const spec of SPEC_RESOURCE_DIRS) {
+    await collectSpecDir(spec.kind, spec.dirName)
+  }
+
+  // Top-level companion *.md files (excluding SKILL.md and standard LICENSE/README/...).
+  let topEntries: Dirent[]
+  try {
+    topEntries = await fs.readdir(packageRoot, { withFileTypes: true })
+  } catch {
+    return resources
+  }
+  for (const entry of topEntries) {
+    if (entry.isSymbolicLink()) continue
+    const name = entry.name
+    if (name.startsWith('.')) continue
+    if (SKIPPED_TOP_LEVEL_ENTRIES.has(name)) continue
+    const absolutePath = path.join(packageRoot, name)
+    try {
+      const linkStat = await fs.lstat(absolutePath)
+      if (linkStat.isSymbolicLink()) continue
+      const realPath = await fs.realpath(absolutePath)
+      if (!isInsidePackage(realPath)) continue
+      if (linkStat.isFile() && name.endsWith('.md')) {
+        resources.push({ kind: 'reference', path: name, absolutePath })
+        continue
+      }
+      if (linkStat.isDirectory()) {
+        if (SKIPPED_TOP_LEVEL_DIRS.has(name)) continue
+        if (isSpecResourceDir(name)) continue
+        // Non-canonical top-level asset directory: walk recursively, kind=asset.
+        await walkRecursive('asset', name, absolutePath, '')
+      }
+    } catch {
+      continue
+    }
+  }
   return resources
 }
 

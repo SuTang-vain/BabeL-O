@@ -94,7 +94,7 @@ const skillShowInputSchema = z.object({
 export const skillShowTool: ToolDefinition<typeof skillShowInputSchema> = {
   name: 'SkillShow',
   description: 'Show a single skill by id, including its body (canonical Markdown).',
-  prompt: () => 'SkillShow retrieves the full body of a single skill by id. Use it after SkillList returns a candidate, or when the user names a specific skill ("show me the X skill"). The body is canonical Markdown that can be embedded into your response or used to ground a follow-up action. The id comes from SkillList (or from a previous turn where the user mentioned a skill name). SkillShow does not modify state — it is a read-only lookup. If the skill is not found, the tool returns an error; do not retry with the same id, instead use SkillList to re-discover available skills. Result does NOT enter active context — call it only when you actually need the skill body.',
+  prompt: () => 'SkillShow retrieves the full body of a single skill by id. Use it after SkillList returns a candidate, or when the user names a specific skill ("show me the X skill"). The body is canonical Markdown that can be embedded into your response or used to ground a follow-up action. The id comes from SkillList (or from a previous turn where the user mentioned a skill name). SkillShow does not modify state — it is a read-only lookup. If the skill is not found, the tool returns an error; do not retry with the same id, instead use SkillList to re-discover available skills. If the package ships companion Markdown docs (e.g. `reference.md`, `forms.md`) or non-canonical asset directories, the response also exposes `companionReferences` and `companionAssets` arrays; surface those paths when the body is short and the publisher clearly shipped a progressive-disclosure payload next to `SKILL.md`. Result does NOT enter active context — call it only when you actually need the skill body.',
   risk: 'read',
   inputSchema: skillShowInputSchema,
   async execute(input, context: ToolContext): Promise<ToolResult> {
@@ -127,6 +127,14 @@ export const skillShowTool: ToolDefinition<typeof skillShowInputSchema> = {
             manifestPath: skill.manifestPath,
             resources: skill.resources,
             body: formatSkill(skill),
+            companionReferences: skill.resources
+              .filter(r => r.kind === 'reference')
+              .slice()
+              .sort((a, b) => a.path.localeCompare(b.path)),
+            companionAssets: skill.resources
+              .filter(r => r.kind === 'asset')
+              .slice()
+              .sort((a, b) => a.path.localeCompare(b.path)),
           },
         },
       }
