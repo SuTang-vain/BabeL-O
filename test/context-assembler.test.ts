@@ -20,6 +20,7 @@ import {
   type ContextBudget,
   selectRecentEvents,
 } from '../src/runtime/contextAssembler.js'
+import type { SkillMatchResult, SkillProvider } from '../src/skills/provider.js'
 import { snipEvent, snipEventsWithTurnBoundary } from '../src/runtime/compactors/snipCompactor.js'
 import {
   buildCompactCapabilityReminder,
