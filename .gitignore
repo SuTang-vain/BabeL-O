@@ -47,6 +47,7 @@ docs/*
 !docs/guides/**/
 !docs/guides/*.md
 !docs/guides/**/*.md
+!docs/INSTALLATION.md
 
 # Runtime artifacts inside docs/nexus/ and clients/go-tui/ (test side effects, working-set.json)
 docs/nexus/.babel-o/

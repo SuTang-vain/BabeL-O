@@ -6,7 +6,24 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ## Unreleased
 
-- No unreleased user-facing changes are documented yet.
+### Added
+
+- Added system keychain support for API key storage (macOS Keychain, Windows
+  Credential Manager, Linux Secret Service). `bbl config add` stores keys in
+  the keychain by default; use `--plain` for config file fallback.
+- Added `bbl config init` interactive wizard for first-time provider setup.
+- Added `bbl config migrate` to migrate plaintext API keys to the keychain.
+- Added `bbl config audit` to inspect credential storage locations.
+- Added `ConfigManager.resolveSettingsAsync()` to resolve settings with
+  keychain-backed API keys (priority: env > keychain > config).
+- Added `docs/guides/keychain-guide.md` with credential security best practices.
+- Added `docs/INSTALLATION.md` with detailed installation instructions.
+
+### Changed
+
+- README now features a "Why BabeL-O?" section with 3 core differentiators,
+  a "Quick Start (5 minutes)" guide, and simplified installation instructions.
+- All installation alternatives moved to the dedicated `docs/INSTALLATION.md`.
 
 ## v0.4.1 - 2026-07-06
 

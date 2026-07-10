@@ -42,68 +42,67 @@ bbl go
 
 ## 为什么选择 BabeL-O？
 
-- **原生终端界面：** `bbl go` 是正式交互客户端，基于 Bubble Tea，支持多行输入、slash 面板、鼠标选择、权限对话框和长 transcript。
-- **持久化 session：** Nexus 保存 session 状态、工具 trace、上下文、审批与运行元数据。TUI 断开后，也可以重连、检查、继续。
-- **权限优先的工具系统：** Bash、Write、Edit、MCP 工具和 memory 写入都走可见审批。你可以单次批准、session 内批准，也可以拒绝并给出反馈。
-- **可见的上下文状态：** `/context` 展示预算、压缩、记忆、恢复、working set 和长上下文诊断，不把 agent 状态藏起来。
-- **跨 session 协作：** `/session`、`/inbox` 和 SessionChannel 让不同 session 交换 findings、handoff、决策、review 请求和 memory 候选，但不会把这些消息当作隐藏指令执行。
-- **模型与记忆可控：** 在 TUI 内切换 model / provider profile，也可以按需启用本地长期记忆 MemoryOS。
+- **多 session 并行 worktree** —— 同一项目开多个隔离工作区同时干活。
+  后台 daemon 持有状态，客户端断线重连任务不丢。
+  *(Technical: worktree isolation + session persistence + WebSocket reconnect)*
 
-## 安装
+- **10MB 无依赖客户端** —— `bbl go` 是 Go TUI 二进制（~10MB），无 Node 依赖，
+  丢到容器里就能跑。
+  *(Technical: Go Bubble Tea TUI + Node 22+ daemon with native SQLite)*
 
-### 推荐：release 安装脚本
+- **真正能完成长任务** —— context compaction、tool loop 边界、权限治理、
+  sub-agent 协作，不是 demo 级玩具。
+  *(Technical: LLMCodingRuntime + TaskSession + AgentLoop + scope governance)*
 
-安装脚本会下载当前平台的轻量 release 包，安装一个很小的 `bbl` launcher，
-内置匹配的 Go TUI 二进制，并在结尾运行自检。
+- **权限优先的工具系统** —— Bash、Write、Edit、MCP 工具和 memory 写入都走可见审批。
+  你可以单次批准、session 内批准，也可以拒绝并给出反馈。
+
+- **可见的上下文状态** —— `/context` 展示预算、压缩、记忆、恢复、working set 和长上下文诊断，
+  不把 agent 状态藏起来。
+
+- **跨 session 协作** —— `/session`、`/inbox` 和 SessionChannel 让不同 session 交换 findings、
+  handoff、决策、review 请求，但不会把这些消息当作隐藏指令执行。
+
+---
+
+## 快速开始 (5 分钟)
+
+> ⚠️ **要求 Node.js >= 22。** 如果你的 Node 版本较旧，请先升级。
+> 其他安装方式见 [安装指南](docs/INSTALLATION.md)。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
+# 全局安装
+npm install -g babel-o
+
+# 交互式初始化（即将推出：bbl config init）
+bbl config add anthropic "$ANTHROPIC_API_KEY"
+bbl config use anthropic/claude-sonnet-4-6
+
+# 启动终端 UI
 bbl go
 ```
 
-安装指定版本：
+然后试试：**"解释这个仓库的主要入口文件"**
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.4.1 bash
-```
+更多用法见 [常用命令](#常用命令)。
 
-要求：macOS 或 Linux，`PATH` 中有 Node.js >= 22。
+## 安装
 
-### npm
-
-适合 Node 开发者和源码安装场景：
+### 推荐：npm 全局安装
 
 ```bash
 npm install -g babel-o
 bbl go
 ```
 
-对大多数用户来说，release 安装脚本更推荐，因为它会带上当前平台的预编译 Go TUI。
+要求：macOS 或 Linux，Node.js >= 22。
 
-### 从源码构建
+> 其他安装方式（release 安装脚本、从源码构建）见
+> [安装指南](docs/INSTALLATION.md)。
 
-```bash
-git clone https://github.com/SuTang-vain/BabeL-O.git
-cd BabeL-O
-npm ci
-npm test
-npm run build
-npm link
-cd clients/go-tui && make build
-bbl go
-```
+---
 
-## 首次使用
-
-配置 provider 和默认 model,然后启动 TUI:
-
-```bash
-bbl config add anthropic "$ANTHROPIC_API_KEY"
-bbl config use anthropic/claude-sonnet-4-6
-bbl go
-```
-
-你也可以在 TUI 内用 `/model`(或 `Ctrl+L`)配置 provider 和切换 model。
+## TUI 快捷键
 
 TUI 内常用入口：
 

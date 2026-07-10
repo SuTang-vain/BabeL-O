@@ -9027,3 +9027,37 @@
   - **2D.6** 22+ `ConfigManager.getInstance()` callsites
   - **2D.7** Phase 2 row → "Closed 2026-06-XX"
   - **Phase 3B+ 收口审计** (主循环读一遍，决定是否需要最后 1-2 helper)
+
+## 2026-07-10 — 产品 30 天改造 W1-W2：README 改造 + 系统 Keychain + bbl config init
+
+- **背景**: 产品 30 天改造计划 W1 (Make It Visible) + W2 (Make It Trustworthy) 落地，不动 Nexus runtime / provider / agent loop，只改造产品表层。
+- **W1.1 README 价值段重写**:
+  - `README.md` 在 `What Is BabeL-O?` 之前新增 `Why BabeL-O?` 段，3 个核心差异化亮点：多 session 并行 worktree / 10MB 无依赖客户端 / 真正能完成长任务，每个 bullet 配一句话人话 + 技术对照。
+  - 新增 `Quick Start (5 minutes)` 段，npm global install 为唯一推荐路径。
+  - 安装部分简化，备选方法迁移到新文件 `docs/INSTALLATION.md`。
+  - `README.zh-CN.md` 同步翻译。
+- **W1.2 创建 docs/INSTALLATION.md**:
+  - 新文件覆盖系统要求、npm install / release installer / 源码构建三种方式、Go TUI 构建选项、验证步骤、配置指南和故障排除。
+- **W2.1 系统 Keychain 接入**:
+  - 新增 `src/cli/secrets/` 模块（6 个文件，~560 行）：types（接口 + 错误类型）、macOS Keychain（`security` CLI）、Windows Credential Manager（`cmdkey` CLI）、Linux Secret Service（`secret-tool` CLI）、环境变量降级。
+  - `SecretProvider` 接口：`isAvailable()` / `get()` / `set()` / `delete()` / `list()`。
+  - `isKeychainAvailable()` 自动检测平台和 TTY 环境。
+  - `ConfigManager` 新增 5 个异步方法：`resolveSettingsAsync()`（env > keychain > profile > provider_config 优先级）、`setApiKeyWithKeychain()`、`migrateToKeychain()`、`deleteApiKey()`、`getApiKeyLocation()`。
+  - `bbl config add` 新增 `--plain` 选项，默认写入 Keychain 并自动从配置文件移除明文 key。
+  - `bbl config migrate` 一键迁移明文 key 到 Keychain。
+  - `bbl config audit` 可视化审计 Keychain / 配置文件 / 环境变量三层存储位置。
+- **W2.4 bbl config init 交互式向导**:
+  - `bbl config init` 支持交互模式（选择 provider → 输入 API key → 选择 model）和非交互模式（`--non-interactive --provider anthropic --model claude-sonnet-4-6`）。
+  - API key 输入使用隐藏输入（`process.stdin.setRawMode(true)`），不回显。
+  - 已有配置时提示确认覆盖。
+- **文档**:
+  - 创建 `docs/guides/keychain-guide.md`（API Key 安全指南，含平台说明、审计、迁移、故障排除）。
+  - 更新 `docs/guides/README.md` 文档索引表。
+  - 更新 `docs/INSTALLATION.md` 添加 Keychain 和 init 向导说明。
+  - 更新 `CHANGELOG.md` Unreleased 段。
+- **验证**:
+  - `npm run typecheck`: pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/secrets.test.ts test/config-init.test.ts`: pass 32/32（14 secrets + 18 config-init）。
+  - `npm run format:check`: pass（仅 `.zcode/` 临时文件失败）。
+  - `git diff --stat`: README.md +91/-77, README.zh-CN.md +77/-54, src/cli/commands/config.ts +361/-1, src/shared/config.ts +271/-1, 新增 8 个文件。
+- **边界**: 本次只做产品表层改造，未动 Nexus / runtime / provider / agent loop；Keychain 只做原生 CLI 调用，无外部 npm 依赖；Windows/Linux 实机验证留待 CI 环境。
