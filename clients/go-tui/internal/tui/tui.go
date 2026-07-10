@@ -1252,6 +1252,13 @@ type model struct {
 	transientStatusAt   time.Time
 	lastMouseEventTime  time.Time
 	mouseEscapeBuffer   string
+	// Phase 4.2 of authorization-continuity-execution-plan.md:
+	// persist the current authorization level from user_intake_guidance
+	// events so the status bar can display it, helping operators
+	// understand why "继续任务" inherits local_change vs inspect.
+	authorizationLevel  string
+	consentScope        string
+	consentSource       string
 	// promptHistory is the per-session list of submitted
 	// prompts; up/down in composing mode walks it so the
 	// operator can recall a prior turn without leaving the
@@ -1955,13 +1962,17 @@ var (
 	// runs without the warm orange drowning the glyph; the
 	// tool name that follows is the warm orange accent.
 	toolBulletStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	permissionStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-	confirmStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
-	contextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-	assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-	userStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-	thinkingStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-	dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+		permissionStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+		confirmStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
+		contextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+		assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+		userStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+		thinkingStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+		// Phase 4.2 of authorization-continuity: authorization level indicator
+		// in the status bar. Green for local_change, yellow for shared_change,
+		// red for destructive. Matches the permission dialog color scheme.
+		authStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Bold(true)
+		dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	inputBlockStyle   = lipgloss.NewStyle()
 	topCardFrameStyle = lipgloss.NewStyle().
@@ -4420,14 +4431,20 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		if m.latestUsage.InputTokens > 0 {
 			m.lastUsage = m.latestUsage
 		}
-	case "user_intake_guidance":
-		// Intake classifier metadata (intent / requiresTools /
-		// reason) is useful for audit but the operator doesn't
-		// need to see it inline. Skip the transcript append.
-		// The /activity overlay and the prompt triage flow keep
-		// the same surface; tests still call formatNexusEvent
-		// directly to verify the formatter.
-	case "tool_completed":
+		case "user_intake_guidance":
+			// Intake classifier metadata (intent / requiresTools /
+			// reason) is useful for audit but the operator doesn't
+			// need to see it inline. Skip the transcript append.
+			// The /activity overlay and the prompt triage flow keep
+			// the same surface; tests still call formatNexusEvent
+			// directly to verify the formatter.
+			//
+			// Phase 4.2 of authorization-continuity: capture the
+			// authorization level so the status bar can display it.
+			m.authorizationLevel = stringField(event, "authorizationLevel")
+			m.consentScope = stringField(event, "consentScope")
+			m.consentSource = stringField(event, "consentSource")
+		case "tool_completed":
 		// Compact transcript: skip tool completion lines so the
 		// transcript shows one row per tool call (the started
 		// row stays). The activity overlay still records the

@@ -54,6 +54,15 @@ func (m model) renderHeader(width int) string {
 		toggle = "ctrl+d close"
 	}
 	metaParts := []string{}
+	// Phase 4.2 of authorization-continuity: display current authorization
+	// level in the status bar so operators can see "local_change" vs "inspect".
+	if m.authorizationLevel != "" && m.authorizationLevel != "none" && m.authorizationLevel != "inspect" {
+		authLabel := m.authorizationLevel
+		if m.consentScope != "" && m.consentScope != "current_step" {
+			authLabel = authLabel + ":" + m.consentScope
+		}
+		metaParts = append(metaParts, authStyle.Render("auth:"+authLabel))
+	}
 	metaParts = append(metaParts, context, toggle)
 	metaPlain := strings.Join(metaParts, " · ")
 	stateWidth := lipgloss.Width(state)

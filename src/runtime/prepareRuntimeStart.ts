@@ -62,6 +62,7 @@
 
 import { z } from 'zod'
 import type { NexusEvent } from '../shared/events.js'
+import type { SessionAuthorizationState } from '../shared/session.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import type { NexusStorage } from '../storage/Storage.js'
@@ -168,6 +169,18 @@ export async function prepareRuntimeStart(
     }
   }
 
+  // Phase 2.3 of authorization-continuity: load previous authorization
+  // state from session so that continuation phrases can inherit it.
+  let previousAuthorizationState: SessionAuthorizationState | undefined
+  if (deps.storage) {
+    try {
+      const session = await deps.storage.getSession(options.sessionId, { includeEvents: false })
+      previousAuthorizationState = session?.authorizationState
+    } catch (e) {
+      deps.logger?.debug('Failed to load session authorization state', e)
+    }
+  }
+
   // Step 3: build intake event. The helper builds; the
   // caller yields. (See "Non-goals" above for why the
   // helper does not yield itself.)
@@ -181,6 +194,7 @@ export async function prepareRuntimeStart(
     latestPrompt: options.prompt,
     cwd: options.cwd,
     signal: options.signal,
+    previousAuthorizationState,
   })
   previousEvents = [...previousEvents, intakeEvent]
 

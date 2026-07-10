@@ -15,7 +15,7 @@ import {
   type DerivedResumableState,
 } from '../../runtime/runCheckpoint.js'
 import type { NexusEvent } from '../../shared/events.js'
-import type { TaskSessionTerminalReason } from '../../shared/session.js'
+import type { TaskSessionTerminalReason, SessionAuthorizationState } from '../../shared/session.js'
 
 const TERMINAL_REASON_CATEGORIES = ['error', 'timeout', 'cancelled', 'provider', 'runtime', 'unknown'] as const
 
@@ -63,6 +63,9 @@ export type SessionRow = {
   compactBoundaries: CompactBoundaryInspection[]
   providerRetrySummary: ProviderRetryInspection | null
   authorizationSummary: AuthorizationInspection | null
+  // Phase 4.1 of authorization-continuity: persisted authorization state
+  // for diagnosing "继续任务" inheritance issues.
+  persistedAuthorizationState: SessionAuthorizationState | null
   // clientSessionId is the Go TUI Phase 1 back-reference
   // (typically `session_go_<unixnano>`) stored in the server
   // session row's metadata column. Empty when the client
@@ -229,10 +232,13 @@ export function findSessionInSqlite(
     // back-reference (body.metadata.clientSessionId) can be surfaced.
     // Pre-Phase-1 databases may lack the `metadata` column entirely;
     // we fall back to the same query without it rather than crashing.
+    //
+    // Phase 4.1 of authorization-continuity: also select `authorization_state`
+    // so we can diagnose "继续任务" inheritance issues.
     const queryWithMeta =
       `SELECT session_id, phase, cwd, created_at, updated_at,
               substr(coalesce(prompt, ''), 1, 200) AS prompt,
-              result, error, metadata
+              result, error, metadata, authorization_state
          FROM sessions
         WHERE session_id = ?
         LIMIT 1`
@@ -269,8 +275,18 @@ export function findSessionInSqlite(
           clientSessionId = parsed.clientSessionId
         }
       } catch {
-        // Malformed metadata: leave clientSessionId null; the rest
-        // of the row still renders normally.
+    // Malformed metadata: leave clientSessionId null; the rest
+      // of the row still renders normally.
+      }
+    }
+
+    // Phase 4.1 of authorization-continuity: read persisted authorization_state
+    let persistedAuthorizationState: SessionAuthorizationState | null = null
+    if (row.authorization_state) {
+      try {
+        persistedAuthorizationState = JSON.parse(row.authorization_state) as SessionAuthorizationState
+      } catch {
+        // Malformed authorization_state: leave null
       }
     }
 
@@ -305,6 +321,7 @@ export function findSessionInSqlite(
       compactBoundaries,
       providerRetrySummary,
       authorizationSummary,
+      persistedAuthorizationState,
       clientSessionId,
     }
   } catch {
@@ -1138,6 +1155,18 @@ export function registerInspectSessionCommand(program: Command): void {
         if (row.authorizationSummary) {
           console.log(`  authorization:`)
           console.log(`    - ${formatAuthorizationInspection(row.authorizationSummary)}`)
+        }
+        // Phase 4.1 of authorization-continuity: show persisted authorization state
+        if (row.persistedAuthorizationState) {
+          const auth = row.persistedAuthorizationState
+          console.log(`  persisted_auth:`)
+          console.log(`    level: ${auth.level}`)
+          console.log(`    scope: ${auth.scope}`)
+          console.log(`    source: ${auth.source}`)
+          console.log(`    established: ${auth.establishedAt}`)
+          if (auth.lastConfirmedAt !== auth.establishedAt) {
+            console.log(`    last_confirmed: ${auth.lastConfirmedAt}`)
+          }
         }
         if (row.prompt) {
           console.log(`  prompt     : ${row.prompt.slice(0, 100)}${row.prompt.length > 100 ? '…' : ''}`)
