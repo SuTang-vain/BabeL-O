@@ -41,8 +41,12 @@ docs/*
 *PLAN*.md
 !docs/nexus/
 !docs/nexus/**/
+!docs/troubleshooting/
+!docs/troubleshooting/*.md
 !docs/nexus/*.md
 !docs/nexus/**/*.md
+!docs/troubleshooting/
+!docs/troubleshooting/*.md
 !docs/guides/
 !docs/guides/**/
 !docs/guides/*.md

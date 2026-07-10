@@ -9061,3 +9061,53 @@
   - `npm run format:check`: pass（仅 `.zcode/` 临时文件失败）。
   - `git diff --stat`: README.md +91/-77, README.zh-CN.md +77/-54, src/cli/commands/config.ts +361/-1, src/shared/config.ts +271/-1, 新增 8 个文件。
 - **边界**: 本次只做产品表层改造，未动 Nexus / runtime / provider / agent loop；Keychain 只做原生 CLI 调用，无外部 npm 依赖；Windows/Linux 实机验证留待 CI 环境。
+
+## 2026-07-10 — Error Friendly Message Governance (W2.2) Completed
+
+### Summary
+Implemented humanized error messages across Nexus, runtime, and Go TUI layers. Users now see actionable hints instead of raw JSON error codes.
+
+### Changes
+
+**Phase 1: Schema Extension**
+- Modified `src/shared/events.ts` to add `hint` and `docsUrl` optional fields to `ErrorEventSchema`.
+
+**Phase 2: Error Registry**
+- Created `src/nexus/errorRegistry.ts` with 20+ error code definitions.
+- Implemented `humanizeError()` function for centralized hint/docsUrl mapping.
+- Added context injection for profile/provider error codes.
+- Created `test/error-registry.test.ts` with 13 unit tests.
+
+**Phase 3: Runtime Integration**
+- Modified `src/runtime/pipeline/events.ts` to integrate `humanizeError()` in `buildRuntimeErrorEvent()`.
+- Added helper function in `src/runtime/LocalCodingRuntime.ts` for error event construction.
+- Created `test/error-registry-integration.test.ts` with 5 integration tests.
+
+**Phase 4: Go TUI Refactor**
+- Modified `clients/go-tui/internal/tui/api.go` to prioritize server-provided `hint` field.
+- Retained client-specific soft-timeout watchdog logic for `REQUEST_TIMEOUT`.
+- All Go TUI tests pass.
+
+**Phase 5: Troubleshooting Documentation**
+- Created `docs/troubleshooting/` directory.
+- Added 6 documentation files: README.md, REQUEST_TIMEOUT.md, CONTEXT_BLOCKING.md, PROVIDER_AUTH_FAILED.md, WORKTREE_CONFLICT.md, TOOL_RESULT_BUDGET_EXCEEDED.md.
+
+### Verification
+- TypeScript tests: 18/18 pass
+- Go TUI tests: all pass
+- Type check: pass (pre-existing test errors unrelated)
+
+### Documentation
+- Moved plan from `proposals/` to `history/error-friendly-message-governance-plan.md`.
+- Updated `history/README.md` index.
+- Removed entry from `proposals/README.md`.
+
+### Commands
+```bash
+# Run tests
+NODE_ENV=test npx tsx --test test/error-registry.test.ts test/error-registry-integration.test.ts
+cd clients/go-tui && go test ./internal/tui -run "Friendly|Error" -v
+
+# Type check
+npm run typecheck
+```

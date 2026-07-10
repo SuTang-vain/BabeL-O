@@ -269,3 +269,52 @@
 - Go TUI 各 Phase 实现记录（tool palette `/v1/tools/audit` wire / Phase 8 version-reporting+release+`bbl go --check` / Phase 9 promotion / execute-timeout A-E / permission-policy A-D·A.1 / session observability Phase 0）见上方 Watch/Closed 降噪索引表与 [go-tui-history.md](./history/go-tui-history.md)、[archive/go-tui-execute-timeout-governance-plan.md](./archive/go-tui-execute-timeout-governance-plan.md)、[proposals/go-tui-session-observability-governance-plan.md](./proposals/go-tui-session-observability-governance-plan.md)、[PHASE_9_DECISION.md](./PHASE_9_DECISION.md)；事实流水见 [WORK_LOG.md](./WORK_LOG.md)。
 - 子 Agent / optimizer 默认优先隔离执行；in-place Git 操作不能纳入无关未跟踪文件或删除用户文件。
 - TUI 权限面板、slash/tool palette 和 input owner 的键盘路由不能退回多输入框或 `y/N` 单行审批。
+
+## Error Friendly Message Governance (W2.2)
+
+**Completed**: 2026-07-10
+
+**Objective**: Transform error responses from machine-centric JSON to user-centric hints with documentation links.
+
+### Delivered Capabilities
+
+1. **ErrorEvent Schema Extension**
+   - Added `hint` and `docsUrl` optional fields to error events.
+   - Backward compatible with existing error event consumers.
+
+2. **Centralized Error Registry**
+   - `src/nexus/errorRegistry.ts` manages 20+ error codes.
+   - `humanizeError()` provides consistent hint/docsUrl mapping.
+   - Context injection for profile/provider errors.
+
+3. **Runtime Integration**
+   - All error events automatically include `hint` and `docsUrl` when available.
+   - `buildRuntimeErrorEvent()` centralizes error event construction.
+
+4. **Go TUI Priority Consumption**
+   - Client prefers server-provided hints.
+   - Client-specific soft-timeout logic retained for `REQUEST_TIMEOUT`.
+
+5. **Troubleshooting Documentation**
+   - `docs/troubleshooting/` directory with 5 error-specific guides.
+   - Quick reference index for common error codes.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/shared/events.ts` | ErrorEvent schema with hint/docsUrl |
+| `src/nexus/errorRegistry.ts` | Centralized error code registry |
+| `src/runtime/pipeline/events.ts` | buildRuntimeErrorEvent integration |
+| `clients/go-tui/internal/tui/api.go` | friendlyNexusErrorWithContext refactor |
+| `docs/troubleshooting/*.md` | User-facing troubleshooting guides |
+
+### Tests
+
+- `test/error-registry.test.ts`: 13 unit tests
+- `test/error-registry-integration.test.ts`: 5 integration tests
+- Go TUI tests: all pass
+
+### Documentation
+
+- Plan archived in `docs/nexus/history/error-friendly-message-governance-plan.md`.

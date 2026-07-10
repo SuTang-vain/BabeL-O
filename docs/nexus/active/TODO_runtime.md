@@ -70,6 +70,82 @@ Nexus 是 BabeL-O 的执行核心。这里只保留仍未收口的 runtime / API
 
 Phase 1/2/3/4 已收口：`normalizeGuidancePolicy()` 不再对 `status` + `requiresTools=true` 强制 `respond_only` / `requiresTools=false`，intake prompt 已补中英文执行动词 + 工程对象 few-shot；`"验证当前未提交改动是否健康"` 回归覆盖工具保持可见；纯 `status` 短问仍注入 prompt guidance 但不隐藏工具；pause/greeting 继续首轮硬抑制工具；若 respond-only 场景下 provider 仍尝试工具调用，runtime 会输出 `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` 并注入一次 retry prompt，下一轮工具重新可见，模型仍坚持调用时允许执行。
 
+## P1 Intake 授权连续性与保守性修复
+
+> 样本：`session_1de7cf54-3e73-4a1e-9e36-94e48b0fd661`。Turn 4-5 用户明确授权 `local_change` + `stated_plan`，Turn 6 "继续任务" 被重置为 `inspect` + `inferred_none`，导致后续 Edit 被 TOOL_DENIED。
+>
+> 详细规划见 [authorization-continuity-execution-plan.md](../proposals/authorization-continuity-execution-plan.md) + [intake-conservatism-analysis.md](../proposals/intake-conservatism-analysis.md)。
+
+**核心问题**：Intake 层过度保守，三层防御机制导致授权断裂。
+
+**证据时序**（session_1de7cf54）：
+
+| Turn | 用户输入 | authorizationLevel | consentScope | 问题 |
+|------|---------|---------------------|--------------|------|
+| 4 | "写一篇架构优化文档" | `local_change` | `stated_plan` | ✅ 正确识别 |
+| 5 | "开始推进架构优化" | `local_change` | `stated_plan` | ✅ 正确识别 |
+| **6** | **"继续任务"** | **`inspect`** | `current_step` | ❌ 授权重置 |
+| **7** | **"进入可写模式并开始修复"** | **`inspect`** | `current_step` | ❌ 仍未识别 |
+
+**根因分析**（三层过度防御）：
+
+1. **第一层 — 兜底逻辑偏保守**：`deriveDefaultAuthorizationLevel()` 最后返回 `requiresTools ? 'inspect' : 'none'`，大多数请求被降级
+2. **第二层 — 正则不足**：`isLocalChangeAuthorizationRequest()` 遗漏 "继续"、"修复"、"可写模式" 等常见措辞
+3. **第三层 — 无状态设计**：每轮 intake 独立推导，无历史授权状态继承
+
+**修复规划**：
+
+- [ ] **Phase 0 — 回归基准**（1 天）
+  - 创建 `session_1de7cf54` replay fixture
+  - 定义 baseline test：`"继续任务"` 应继承上一轮 `local_change`
+  - 更新 `strategy-authorization-and-consent-governance-plan.md` 新增 Phase 6
+
+- [ ] **Phase 1 — Intake 层继承逻辑**（2 天）
+  - 新增 `isContinuationPhrase()` 函数识别 "继续"/"continue" 等延续指令
+  - 扩展 `isLocalChangeAuthorizationRequest()` 正则：新增 "修复"、"可写模式"、"执行方案" 等
+  - 在 `normalizeGuidancePolicy()` 开头新增延续指令处理：不强制重写，保留 model intake 授权判断
+  - 在 intake prompt 中明确："If the latest message is a continuation phrase, inherit authorization from context"
+
+- [ ] **Phase 2 — Session 级别授权持久化**（1 天）
+  - `sessions` 表新增 `authorization_state` JSON 列
+  - 在 `user_intake_guidance` 后更新 session authorization_state
+  - 在 intake 调用时传入 previousPolicy 参数
+
+- [ ] **Phase 3 — 测试覆盖**（1 天）
+  - 授权连续性 unit tests：延续指令继承 + 正则扩展覆盖
+  - Replay fixture test：`session_1de7cf54` Turn 4→6 授权继承验证
+  - 测试矩阵：不同授权级别 + 不同延续措辞的组合
+
+- [ ] **Phase 4 — 可见性**（0.5 天）
+  - `bbl inspect-session` 显示授权历史轨迹
+  - Go TUI 状态栏显示当前授权级别
+
+**测试用例**：
+
+| 用户输入 | 上一轮授权 | 预期授权 | 测试场景 |
+|---------|-----------|---------|---------|
+| "继续任务" | `local_change` | `local_change` | 核心修复 |
+| "继续推进" | `local_change` | `local_change` | 核心修复 |
+| "continue" | `local_change` | `local_change` | 英文延续 |
+| "修复这个问题" | `inspect` | `local_change` | 正则扩展 |
+| "进入可写模式" | `inspect` | `local_change` | 正则扩展 |
+| "执行刚才的方案" | `inspect` | `local_change` | 正则扩展 |
+
+**风险评估**：
+
+| 风险 | 缓解措施 |
+|------|---------|
+| 误授权破坏性操作 | `destructive` 级别仍需显式确认 |
+| 远程操作误触发 | `shared_change` 级别保持严格 |
+| 偏好选择误判 | 保留 `isPreferenceOrOptionSelection()` 但缩小范围 |
+
+**设计原则调整**：
+
+```
+从: "默认拒绝，显式授权"
+到: "上下文感知，合理推断，关键操作显式确认"
+```
+
 ## Watch: 真实会话 Context Blocking Recovery
 
 > 样本：`session_1e2299be-b988-49ea-8819-587de8258172`。第一轮项目深度分析成功；第二轮继续深挖 runtime pipeline / AgentLoop 时，多次大文件 `Read` 让上下文估算达到 `194769/179616`，超过 blocking limit `178616`，runtime 在下一次 provider call 前 hard-block。provider fallback 没有 silent switch，blocking 保护正确；待优化点是恢复路径和 live tool output 预算。

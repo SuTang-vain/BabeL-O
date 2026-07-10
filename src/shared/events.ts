@@ -164,6 +164,8 @@ export const ErrorEventSchema = z.object({
   code: z.string(),
   message: z.string(),
   details: z.unknown().optional(),
+  hint: z.string().optional(),
+  docsUrl: z.string().optional(),
 })
 
 export const ExecuteSummaryEventSchema = z.object({

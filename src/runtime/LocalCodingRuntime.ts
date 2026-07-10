@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import { humanizeError } from '../nexus/errorRegistry.js'
 import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool, ToolRisk } from '../tools/Tool.js'
@@ -46,6 +47,19 @@ export type ToolPolicy = {
 }
 
 export class LocalCodingRuntime implements NexusRuntime {
+  private _buildErrorEvent(sessionId: string, code: string, message: string, details?: unknown): Extract<NexusEvent, { type: 'error' }> {
+    const humanized = humanizeError(code, message, details)
+    return {
+      type: 'error',
+      ...eventBase(sessionId),
+      code: humanized.code,
+      message: humanized.message,
+      ...(details !== undefined && { details }),
+      ...(humanized.hint && { hint: humanized.hint }),
+      ...(humanized.docsUrl && { docsUrl: humanized.docsUrl }),
+    }
+  }
+
   /**
    * Per-session accumulated allow rules from user
    * `scope: 'session'` approvals. Keyed by sessionId; values are

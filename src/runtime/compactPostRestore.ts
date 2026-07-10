@@ -1,5 +1,5 @@
 import type { NexusEvent } from '../shared/events.js'
-import type { Skill } from '../skills/loader.js'
+import type { SkillMatchResult } from '../skills/provider.js'
 
 const MAX_RESTORED_FILES = 5
 const MAX_RESTORED_FILE_CHARS = 5_000
@@ -27,7 +27,7 @@ export type PostCompactState = {
   hookLines: string[]
 }
 
-export function derivePostCompactState(events: NexusEvent[], matchedSkills: Skill[]): PostCompactState {
+export function derivePostCompactState(events: NexusEvent[], matchedSkills: SkillMatchResult[]): PostCompactState {
   const recentReadFiles: string[] = []
   const restoredFileContents: RestoredFileContent[] = []
   const seenFiles = new Set<string>()
@@ -216,8 +216,8 @@ function isMcpToolName(name: string | undefined): boolean {
   return typeof name === 'string' && name.startsWith('mcp:')
 }
 
-function formatSkillReminderLine(skill: Skill): string {
-  const triggerSuffix = skill.triggers.length > 0 ? ` triggers=${skill.triggers.join(',')}` : ''
+function formatSkillReminderLine(skill: SkillMatchResult): string {
+  const triggerSuffix = skill.triggers && skill.triggers.length > 0 ? ` triggers=${(skill.triggers ?? []).join(',')}` : ''
   return `- ${skill.id} (${skill.name})${triggerSuffix}`
 }
 

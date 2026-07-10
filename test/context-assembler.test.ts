@@ -1408,7 +1408,6 @@ test('compact post-restore module formats restored state and reminder', () => {
     name: 'Runtime',
     content: 'Skill content',
     triggers: ['runtime'],
-    priority: 1,
   }])
   const block = formatPostCompactState(state)
   const reminder = buildCompactCapabilityReminder(state)
@@ -4133,3 +4132,70 @@ function createLongSessionEventsForAutoCompact(sessionId: string): NexusEvent[] 
 
   return events
 }
+
+// T1 of docs/nexus/reference/architecture-optimization-assessment-plan.md:
+// SkillProvider injection into context assembly.
+test("T1: assembleContext uses injected SkillProvider instead of filesystem", async () => {
+  const stubSkills: SkillMatchResult[] = [
+    { id: "stub-coder", name: "Stub Coder", content: "Stub skill body for coding." },
+    { id: "stub-debug", name: "Stub Debugger", content: "Stub skill body for debugging." },
+  ]
+
+  const stubProvider: SkillProvider = {
+    matchPrompt: async (_prompt: string, _cwd: string) => stubSkills,
+  }
+
+  const cwd = tmpdir()
+  const sessionId = "session-stub-skills"
+  const prompt = "Help me write some code"
+
+  const events: NexusEvent[] = [
+    { type: "session_started", schemaVersion, sessionId, timestamp: "2026-05-23T00:00:00.000Z", cwd, model: "test-model" },
+    { type: "user_message", schemaVersion, sessionId, timestamp: "2026-05-23T00:00:01.000Z", text: prompt },
+  ]
+
+  const fakeMapEvents = (_events: NexusEvent[], initialPrompt: string): ModelMessage[] => [
+    { role: "user", content: [{ type: "text", text: initialPrompt }] },
+  ]
+
+  const result = await assembleContext({
+    runtimeOptions: { sessionId, prompt, cwd },
+    events,
+    modelId: "test-model",
+    buildSystemPrompt: () => "system-prompt",
+    mapEventsToMessages: fakeMapEvents,
+    skillProvider: stubProvider,
+  })
+
+  assert.ok(result.activeSkills.includes("Stub Coder"))
+  assert.ok(result.activeSkills.includes("Stub Debugger"))
+  assert.ok(result.activeSkills.includes("stub-coder"))
+  assert.ok(result.activeSkills.includes("stub-debug"))
+})
+
+test("T1b: assembleContext uses FilesystemSkillProvider when skillProvider is omitted", async () => {
+  const cwd = tmpdir()
+  const sessionId = "session-default-provider"
+  const prompt = "Hello"
+
+  const events: NexusEvent[] = [
+    { type: "session_started", schemaVersion, sessionId, timestamp: "2026-05-23T00:00:00.000Z", cwd, model: "test-model" },
+    { type: "user_message", schemaVersion, sessionId, timestamp: "2026-05-23T00:00:01.000Z", text: prompt },
+  ]
+
+  const fakeMapEvents = (_events: NexusEvent[], initialPrompt: string): ModelMessage[] => [
+    { role: "user", content: [{ type: "text", text: initialPrompt }] },
+  ]
+
+  const result = await assembleContext({
+    runtimeOptions: { sessionId, prompt, cwd },
+    events,
+    modelId: "test-model",
+    buildSystemPrompt: () => "system-prompt",
+    mapEventsToMessages: fakeMapEvents,
+    // skillProvider intentionally omitted — defaults to FilesystemSkillProvider
+  })
+
+  // Default provider loads built-in skills; should not throw.
+  assert.ok(typeof result.activeSkills === "string")
+})

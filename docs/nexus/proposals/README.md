@@ -2,11 +2,8 @@
 
 > State: Index
 > Governance: This directory stores draft and partially landed plans that are not yet stable long-lived references.
-
 This directory holds work that is still being shaped, partially implemented, or waiting for stronger evidence. A proposal may graduate into `reference/`, be summarized into `history/`, or move to `archive/`.
-
 ## Current Proposals
-
 | Proposal | State | Scope |
 | --- | --- | --- |
 | [agent-skills-ecosystem-protocol-governance-plan.md](./agent-skills-ecosystem-protocol-governance-plan.md) | Partially Landed | Adopt Agent Skills as BabeL-O's external skill package/interchange format while preserving `NormalizedSkill` as the internal IR; Phase 0-3 landed plus Phase 4 local directory import/export preview/write. |
@@ -24,23 +21,17 @@ This directory holds work that is still being shaped, partially implemented, or 
 | [unify-agent-execution-models-plan.md](./unify-agent-execution-models-plan.md) | Draft | Converge the three overlapping agent subsystems (`runAgentLoop` / `ExploreAgentScheduler` / execute path) on one vocabulary + SQLite state owner; replace `skipPermissionCheck` with profile-scoped policy. (Architecture review P1-7.) |
 | [unify-embedded-cli-path-plan.md](./unify-embedded-cli-path-plan.md) | Draft | Shared `NexusClientInterface`, long-lived embedded Nexus, route embedded execution through the app to eliminate the second orchestration in `runSessionFlow.ts`. (Architecture review P0-3.) |
 | [strategy-authorization-and-consent-governance-plan.md](./strategy-authorization-and-consent-governance-plan.md) | Partially Landed | Separate tool need from execution authorization; Phase 0-3 gate and Phase 4 Go TUI, inspect-session, trace, and CLI one-shot wording slices landed. Replay evaluation remains open. |
-
+| [authorization-continuity-execution-plan.md](./authorization-continuity-execution-plan.md) | Draft | Fix "继续任务" authorization reset bug: session-level authorization_state persistence + intake inheritance logic + continuation phrase vocabulary. Evidence: `session_1de7cf54` (Turn 6 authorization reset → TOOL_DENIED). |
+| [intake-conservatism-analysis.md](./intake-conservatism-analysis.md) | Draft | Analysis of intake layer over-conservatism: default fallback to 'inspect', missing authorization verbs in regex, no inheritance mechanism. Evidence sessions show repeated TOOL_DENIED after legitimate continuation phrases. |
 已毕业到 `../reference/` 的提案（升为 `Active Plan`）以 [../reference/README.md](../reference/README.md) 为准；本目录不再重复登记毕业条目，避免与 reference 索引双重维护。
-
 ## Lifecycle
-
 | Outcome | Required action |
 | --- | --- |
 | Becomes canonical architecture | Move to `../reference/` and update `../reference/README.md`. |
 | Implementation closes | Summarize into `../history/` or `../DONE.md`; do not keep it as a standalone proposal. |
 | Superseded or stale | Move to `../archive/` with a short index note. |
-
 ## 中文概述
-
 ### 作用
-
 `proposals/` 承接 Draft 和 Partially Landed 文档，避免这些尚未稳定的计划污染长期 reference。
-
 ### 规则
-
 提案必须最终毕业、合并或归档；不能无限期留在 reference 中。已毕业提案的索引以 [../reference/README.md](../reference/README.md) 为准，本目录不再重复登记毕业条目。

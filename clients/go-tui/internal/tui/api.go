@@ -717,6 +717,13 @@ func (m *model) formatErrorEventWithSoftContext(event map[string]any) string {
 // extended the budget as far as it was allowed and the workflow
 // kept running until the hard watchdog fired.
 func friendlyNexusErrorWithContext(code string, payload map[string]any, soft *softTimeoutSnapshot) (string, bool) {
+	// Priority 1: Use server-provided hint if available
+	if hint, ok := payload["hint"].(string); ok && hint != "" {
+		return hint, true
+	}
+
+	// Priority 2: Handle client-specific context (soft-timeout for REQUEST_TIMEOUT)
+	// This logic MUST remain in client because it depends on local softTimeoutSnapshot state
 	switch code {
 	case "tombstoned_profile":
 		profile := stringField(payload, "profile")
