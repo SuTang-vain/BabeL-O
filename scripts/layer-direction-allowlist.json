@@ -81,6 +81,12 @@
     ],
     "src/tools/everCoreMcpTools.ts": [
       "src/nexus/everCoreConfig.ts"
+    ],
+    "src/runtime/LocalCodingRuntime.ts": [
+      "src/nexus/errorRegistry.ts"
+    ],
+    "src/runtime/pipeline/events.ts": [
+      "src/nexus/errorRegistry.ts"
     ]
   }
 }
