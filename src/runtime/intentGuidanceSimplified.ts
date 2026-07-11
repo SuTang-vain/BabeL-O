@@ -1,19 +1,18 @@
 /**
  * Simplified Intent Guidance - Phase 1 of Architecture Optimization
- * 
+ *
  * Design: Complete trust in Model (Plan A)
- * 
+ *
  * Principles:
  * 1. Inheritance first - continuation phrases inherit previous auth
  * 2. Hard boundaries only - destructive/remote operations must be explicit
  * 3. Trust model - Model Intake has full context
  * 4. Permission gate - final safety net (already exists)
- * 
+ *
  * Token savings: 60-70% per turn
  */
 
 import { relative, resolve } from 'node:path'
-import type { ModelAdapter, ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
 import type { SessionAuthorizationState } from '../shared/session.js'
 import { extractAbsolutePaths } from './systemPromptBuilder.js'
@@ -63,6 +62,12 @@ export type SelectionKind =
   | 'path'
   | 'workflow_step'
 
+type IntentCategory =
+  | 'pure_capability_question'
+  | 'self_diagnosis_request'
+  | 'action_request'
+  | 'general'
+
 export type TurnAuthorization = {
   level: AuthorizationLevel
   consentScope: ConsentScope
@@ -94,7 +99,7 @@ export type UserIntakeGuidanceEvent = Extract<NexusEvent, { type: 'user_intake_g
 
 /**
  * Simplified authorization derivation - single layer decision.
- * 
+ *
  * Only hard boundaries are enforced. Everything else trusts the model.
  */
 function deriveAuthorization(
@@ -104,7 +109,7 @@ function deriveAuthorization(
 ): AuthorizationLevel {
   // 1. Inheritance check (highest priority)
   if (isContinuationPhrase(text) && previousAuth) {
-    return previousAuth.level
+    return parseAuthorizationLevel(previousAuth.level, modelAuth ?? 'inspect')
   }
 
   // 2. Destructive boundary (must be explicit)
@@ -178,7 +183,10 @@ function isRemoteOperation(text: string): boolean {
 function isPausePrompt(text: string): boolean {
   const normalized = text.trim().toLowerCase()
   return /^(等一下|等等|暂停|停|停下|停一下|pause|stop|wait|hold on)[？?!.。！`'"\s]*$/iu.test(normalized) ||
-    /^(先别|先不要|不要继续|先停)/u.test(normalized)
+    /\b(?:just|please|pls)?\s*(?:stop|pause|hold)\b/iu.test(normalized) ||
+    /\b(?:wait|waite|hold on|hang on)\b.*\b(?:for me|other require|next|a sec|a second|a minute)\b/iu.test(normalized) ||
+    /^(先别|先不要|不要继续|先停)/u.test(normalized) ||
+    /先不需要.*继续|先不用.*继续|暂时不需要.*继续/u.test(normalized)
 }
 
 /**
@@ -190,6 +198,30 @@ function isGreetingPrompt(text: string): boolean {
   if (/^(hi|hello|hey|你好|您好)$/.test(normalized)) return true
   if (/^(?:hi|hello|hey)?(?:你是谁|你是哪个|你是什么|你能做什么|你会做什么|你可以做什么|你叫什么|你叫啥)$/.test(normalized)) return true
   return false
+}
+
+function hasActionVerbCue(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  return /\b(run|execute|test|verify|inspect|check|diagnose|status|analyze|review|edit|change|fix)\b/iu.test(normalized) ||
+    /(执行|运行|跑一下|测试|验证|检查|查看|确认|诊断|解释|说明|分析|审查|修改|修复|推进|合并|推送)/u.test(text)
+}
+
+function isPureMemoryCapabilityQuestion(text: string): boolean {
+  if (hasActionVerbCue(text)) return false
+  const normalized = text.trim().toLowerCase()
+  return /\b(can you|could you|are you able to|do you have)\b.*\b(memory|remember|long[- ]term memory)\b/iu.test(normalized) ||
+    /\b(memory|remember|long[- ]term memory)\b.*\b(available|enabled|write|save)\b/iu.test(normalized) ||
+    /(能否|能不能|可以|可否|是否|有没有|有|具备|支持).*(写入|保存|记忆|长期记忆)/u.test(text) ||
+    /(记忆|长期记忆).*(能否|能不能|可以|可否|是否|有没有|具备|支持|可用|启用)/u.test(text)
+}
+
+function isMetaBehaviorQuestion(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+  const asksWhy = /\bwhy\b/iu.test(normalized) || /(为什么|为啥|什么情况|怎么回事|咋回事)/u.test(text)
+  const agentBehavior = /\b(hesitat\w*|tool|tools|modify|modified|edit|changed|directly|permission|policy|unauthorized|without asking)\b/iu.test(normalized) ||
+    /(工具|犹豫|直接|修改|改了|编辑|权限|策略|擅自|未授权|没问我)/u.test(text)
+  if (asksWhy && agentBehavior) return true
+  return /(你.*(为什么|为啥).*(犹豫|直接|修改|改了|编辑|执行|调用工具|用工具)|为什么你会这么犹豫|你怎么直接修改|怎么直接改)/u.test(text)
 }
 
 /**
@@ -224,9 +256,9 @@ function buildAuthorization(options: {
   reason: string
 }): TurnAuthorization {
   const level = options.level
-  const consentScope = options.consentScope ?? 
+  const consentScope = options.consentScope ??
     (level === 'none' || level === 'inspect' ? 'current_step' : 'stated_plan')
-  const source = options.source ?? 
+  const source = options.source ??
     (level === 'none' || level === 'inspect' ? 'inferred_none' : 'explicit_user')
 
   const allowedSummary: Record<AuthorizationLevel, string> = {
@@ -256,6 +288,37 @@ function buildAuthorization(options: {
   }
 }
 
+function getGuidanceAuthorization(guidance: UserIntentGuidance): TurnAuthorization {
+  return guidance.authorization ?? buildAuthorization({
+    level: guidance.requiresTools ? 'inspect' : 'none',
+    reason: 'Derived from simplified intent guidance.',
+  })
+}
+
+function parseAuthorizationLevel(value: unknown, fallback: AuthorizationLevel): AuthorizationLevel {
+  return parseEnum(value, ['none', 'inspect', 'local_change', 'shared_change', 'destructive'], fallback)
+}
+
+function parseConsentScope(value: unknown, fallback: ConsentScope): ConsentScope {
+  return parseEnum(value, ['current_step', 'stated_plan', 'session_workflow'], fallback)
+}
+
+function parseConsentSource(value: unknown, fallback: ConsentSource): ConsentSource {
+  return parseEnum(value, ['explicit_user', 'stated_plan_confirmation', 'trusted_session_rule', 'inferred_none'], fallback)
+}
+
+function parseSelectionKind(value: unknown, fallback: SelectionKind): SelectionKind {
+  return parseEnum(value, ['none', 'preference', 'option', 'path', 'workflow_step'], fallback)
+}
+
+function parseProblemTarget(value: unknown, fallback: ProblemTarget): ProblemTarget {
+  return parseEnum(value, ['agent_failure', 'runtime_replay', 'tool_evidence', 'project_feature', 'user_artifact', 'unknown'], fallback)
+}
+
+function parseEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
+  return typeof value === 'string' && allowed.includes(value as T) ? (value as T) : fallback
+}
+
 function buildGuidance(guidance: UserIntentGuidance): UserIntentGuidance {
   return guidance
 }
@@ -264,7 +327,7 @@ function findLatestUserText(events: NexusEvent[]): string {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]
     if (event.type === 'user_message') {
-      return (event as any).content || ''
+      return event.text
     }
   }
   return ''
@@ -278,7 +341,7 @@ function countUserMessages(events: NexusEvent[]): number {
 
 /**
  * Derive fallback user intent guidance (when model is unavailable).
- * 
+ *
  * Simplified: only essential intent classification + hard boundaries.
  */
 export function deriveFallbackUserIntentGuidance(options: {
@@ -408,8 +471,8 @@ export function deriveFallbackUserIntentGuidance(options: {
       explicitPaths,
       source: 'fallback',
       authorization: buildAuthorization({
-        level: prev.level as AuthorizationLevel,
-        consentScope: prev.scope as ConsentScope,
+        level: parseAuthorizationLevel(prev.level, 'inspect'),
+        consentScope: parseConsentScope(prev.scope, 'current_step'),
         source: 'stated_plan_confirmation',
         reason: `Inherited from previous turn.`,
       }),
@@ -452,7 +515,7 @@ export function deriveFallbackUserIntentGuidance(options: {
 
 /**
  * Normalize guidance policy - simplified.
- * 
+ *
  * Only enforces hard boundaries. Trusts model for everything else.
  */
 export function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserIntentGuidance {
@@ -523,9 +586,32 @@ export function normalizeGuidancePolicy(guidance: UserIntentGuidance): UserInten
  * Should suppress tools for intent.
  */
 export function shouldSuppressToolsForIntent(guidance: UserIntentGuidance): boolean {
-  if (guidance.authorization?.level === 'none') return true
-  if (guidance.actionHint === 'respond_only') return true
+  const normalized = normalizeGuidancePolicy(guidance)
+  const authorization = getGuidanceAuthorization(normalized)
+  if (normalized.intent === 'pause' || normalized.intent === 'greeting') return true
+  if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return true
+  if (authorization.level === 'none' && (authorization.selectionKind !== 'none' || isMetaBehaviorQuestion(normalized.latestUserText))) return true
   return false
+}
+
+export function getIntentCategory(guidance: UserIntentGuidance): IntentCategory {
+  const normalized = normalizeGuidancePolicy(guidance)
+  if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return 'pure_capability_question'
+  if (normalized.problemTarget === 'agent_failure' || normalized.problemTarget === 'runtime_replay' || normalized.problemTarget === 'tool_evidence') return 'self_diagnosis_request'
+  if (normalized.requiresTools || normalized.actionHint !== 'respond_only') return 'action_request'
+  return 'general'
+}
+
+export function getToolSuppressionReason(guidance: UserIntentGuidance): string | undefined {
+  const normalized = normalizeGuidancePolicy(guidance)
+  if (!shouldSuppressToolsForIntent(normalized)) return undefined
+  if (isPureMemoryCapabilityQuestion(normalized.latestUserText)) return 'respond_only_capability_question'
+  const authorization = getGuidanceAuthorization(normalized)
+  if (authorization.level === 'none' && authorization.selectionKind !== 'none') return `authorization:none:${authorization.selectionKind}_selection`
+  if (authorization.level === 'none' && isMetaBehaviorQuestion(normalized.latestUserText)) return 'authorization:none'
+  if (normalized.intent === 'pause') return 'pause'
+  if (normalized.intent === 'greeting') return 'greeting'
+  return 'respond_only'
 }
 
 // === Re-exports for compatibility ===
@@ -540,77 +626,92 @@ export function findLatestUserIntakeGuidance(events: NexusEvent[]): UserIntakeGu
 }
 
 export function guidanceFromIntakeEvent(event: UserIntakeGuidanceEvent): UserIntentGuidance {
-  return {
+  const authorizationLevel = parseAuthorizationLevel(event.authorizationLevel, 'inspect')
+  return normalizeGuidancePolicy({
     intent: event.intent,
     confidence: event.confidence,
     continuity: event.continuity,
     contextScope: event.contextScope,
     actionHint: event.actionHint,
     requiresTools: event.requiresTools,
-    problemTarget: event.problemTarget,
+    problemTarget: parseProblemTarget(event.problemTarget, 'unknown'),
     reason: event.reason,
-    latestUserText: event.latestUserText,
+    latestUserText: event.userText,
     explicitPaths: event.explicitPaths,
     source: event.source,
-    authorization: event.authorization ? {
-      level: event.authorization.level,
-      consentScope: event.authorization.consentScope,
-      source: event.authorization.source,
-      selectionKind: event.authorization.selectionKind,
-      reason: event.authorization.reason,
-      allowedActionSummary: event.authorization.allowedActionSummary,
-      blockedActionSummary: event.authorization.blockedActionSummary,
-    } : undefined,
-  }
+    authorization: buildAuthorization({
+      level: authorizationLevel,
+      consentScope: parseConsentScope(event.consentScope, 'current_step'),
+      source: parseConsentSource(event.consentSource, 'inferred_none'),
+      selectionKind: parseSelectionKind(event.selectionKind, 'none'),
+      reason: event.authorizationReason ?? 'Legacy intake event without explicit authorization metadata.',
+    }),
+  })
 }
 
 export function toUserIntakeGuidanceEvent(options: {
   guidance: UserIntentGuidance
   sessionId: string
-  turn: number
+  turn?: number
 }): UserIntakeGuidanceEvent {
-  return eventBase({
+  const guidance = normalizeGuidancePolicy(options.guidance)
+  const authorization = getGuidanceAuthorization(guidance)
+  return {
     type: 'user_intake_guidance',
-    sessionId: options.sessionId,
-    turn: options.turn,
-    ...options.guidance,
-  }) as UserIntakeGuidanceEvent
+    ...eventBase(options.sessionId),
+    userText: guidance.latestUserText,
+    intent: guidance.intent,
+    confidence: guidance.confidence,
+    continuity: guidance.continuity,
+    contextScope: guidance.contextScope,
+    actionHint: guidance.actionHint,
+    requiresTools: guidance.requiresTools,
+    problemTarget: guidance.problemTarget,
+    authorizationLevel: authorization.level,
+    consentScope: authorization.consentScope,
+    consentSource: authorization.source,
+    selectionKind: authorization.selectionKind,
+    authorizationReason: authorization.reason,
+    allowedActionSummary: authorization.allowedActionSummary,
+    blockedActionSummary: authorization.blockedActionSummary,
+    reason: guidance.reason,
+    explicitPaths: guidance.explicitPaths,
+    source: guidance.source,
+  } as UserIntakeGuidanceEvent
 }
 
 export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
+  const normalized = normalizeGuidancePolicy(guidance)
+  const authorization = getGuidanceAuthorization(normalized)
   const lines = [
-    `Intent: ${guidance.intent}`,
-    `Confidence: ${guidance.confidence.toFixed(2)}`,
-    `Continuity: ${guidance.continuity.toFixed(2)}`,
-    `Context scope: ${guidance.contextScope}`,
-    `Action hint: ${guidance.actionHint}`,
-    `Requires tools: ${guidance.requiresTools}`,
-    `Problem target: ${guidance.problemTarget}`,
-    `Authorization level: ${guidance.authorization?.level ?? 'none'}`,
-    `Reason: ${guidance.reason}`,
+    `I: ${normalized.intent}`,
+    `A: ${normalized.actionHint}`,
+    `T: ${normalized.requiresTools ? 'yes' : 'no'}`,
+    `Auth: ${authorization.level}`,
+    `Why: ${normalized.reason}`,
   ]
   return lines.join('\n')
 }
 
-// Placeholder for deriveUserIntentGuidance (will call model)
 export async function deriveUserIntentGuidance(options: {
-  adapter: ModelAdapter
-  modelId: string
-  apiKey?: string
-  baseUrl?: string
   latestPrompt: string
   cwd: string
-  history: string
   events: NexusEvent[]
-  signal?: AbortSignal
   previousAuthorizationState?: SessionAuthorizationState
 }): Promise<UserIntentGuidance> {
-  // For now, return fallback
-  // TODO: Implement simplified model query
   return deriveFallbackUserIntentGuidance({
     events: options.events,
     latestPrompt: options.latestPrompt,
     cwd: options.cwd,
     previousAuthorizationState: options.previousAuthorizationState,
   })
+}
+
+export function deriveUserIntentGuidanceSync(options: {
+  events: NexusEvent[]
+  latestPrompt: string
+  cwd: string
+  previousAuthorizationState?: SessionAuthorizationState
+}): UserIntentGuidance {
+  return deriveFallbackUserIntentGuidance(options)
 }

@@ -57,10 +57,12 @@ import {
   enforceMessageBudget,
 } from './toolResultBudget.js'
 import {
-  buildUserIntakeGuidanceEvent,
   isPureMemoryCapabilityQuestion,
-  shouldSuppressToolsForIntent,
 } from './intentGuidance.js'
+import {
+  buildSelectedUserIntakeGuidanceEvent,
+  shouldSuppressSelectedToolsForIntent,
+} from './intentGuidanceSelector.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
@@ -431,7 +433,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         tools: toolsList,
         warningPercent: contextWarningPercent,
         compactPercent: contextCompactPercent,
-        suppressToolsForIntent: shouldSuppressToolsForIntent,
+        suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
         onMemoryRetrieval: this.emitMemoryRetrieval,
         // R2: thread the persisted workingSetOverride through the
         // hot-path refresh so the provider-visible Working Set: block
@@ -491,7 +493,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           tools: toolsList,
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
-          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
           onMemoryRetrieval: this.emitMemoryRetrieval,
           workingSetOverride,
         },
@@ -548,7 +550,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           tools: toolsList,
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
-          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
           onMemoryRetrieval: this.emitMemoryRetrieval,
           workingSetOverride,
         },
@@ -576,7 +578,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         readFileCache: this.readFileCache,
         toolsList,
         mapEventsForProvider,
-        shouldSuppressToolsForIntent,
+        shouldSuppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
         onMemoryRetrieval: this.emitMemoryRetrieval,
         userIntentGuidance: undefined,
         workingSetOverride,
@@ -639,7 +641,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         })
 
         let suppressToolsForCurrentIntent =
-          shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+          shouldSuppressSelectedToolsForIntent(assembledContext.userIntentGuidance) &&
           !confirmedOptionSelection &&
           suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
         let requestState = buildProviderLoopRequestState({
@@ -698,7 +700,7 @@ export class LLMCodingRuntime implements NexusRuntime {
                 tools: toolsList,
                 warningPercent: contextWarningPercent,
                 compactPercent: contextCompactPercent,
-                suppressToolsForIntent: shouldSuppressToolsForIntent,
+                suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
                 onMemoryRetrieval: this.emitMemoryRetrieval,
                 workingSetOverride,
               },
@@ -719,7 +721,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               metrics,
               toolsList,
               mapEventsForProvider,
-              shouldSuppressToolsForIntent,
+              shouldSuppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
               onMemoryRetrieval: this.emitMemoryRetrieval,
               workingSetOverride,
               initialPrompt: options.prompt,
@@ -740,7 +742,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
           })
           suppressToolsForCurrentIntent =
-            shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+            shouldSuppressSelectedToolsForIntent(assembledContext.userIntentGuidance) &&
             !confirmedOptionSelection &&
             suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
           requestState = buildProviderLoopRequestState({

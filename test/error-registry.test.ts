@@ -64,7 +64,7 @@ describe('errorRegistry', () => {
         'WORKTREE_CONFLICT',
         'TOOL_RESULT_BUDGET_EXCEEDED',
       ]
-      
+
       for (const code of requiredCodes) {
         assert.ok(ERROR_REGISTRY[code], `Missing required error code: ${code}`)
         assert.ok(ERROR_REGISTRY[code].hint, `Missing hint for ${code}`)

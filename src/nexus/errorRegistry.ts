@@ -1,9 +1,9 @@
 /**
  * Error Registry for BabeL-O
- * 
+ *
  * Centralized error code management providing user-friendly hints
  * and documentation URLs for all error events.
- * 
+ *
  * Governance: Nexus owns error definition. Client consumes server hints.
  */
 
@@ -23,7 +23,7 @@ export type ErrorDefinition = {
 
 /**
  * Registry of all known error codes with their user-facing information.
- * 
+ *
  * Principles:
  * 1. Every error code MUST have a hint.
  * 2. Hints should be actionable and avoid technical jargon.
@@ -165,7 +165,7 @@ export const ERROR_REGISTRY: Record<string, ErrorDefinition> = {
 
 /**
  * Humanizes an error by adding user-friendly hint and docsUrl.
- * 
+ *
  * @param code - Machine-readable error code
  * @param message - Original error message
  * @param details - Optional error details for context extraction
@@ -177,18 +177,18 @@ export function humanizeError(
   details?: unknown
 ): { code: string; message: string; hint?: string; docsUrl?: string } {
   const def = ERROR_REGISTRY[code]
-  
+
   if (!def) {
     // Unregistered error code: return original message
     return { code, message }
   }
 
   let hint = def.hint
-  
+
   // Inject context from details if needed
   if (def.requiresContext && details && typeof details === 'object' && details !== null) {
     const detailsRecord = details as Record<string, unknown>
-    
+
     // Handle specific context injections
     if (code === 'tombstoned_profile' && detailsRecord.profile) {
       hint = `Profile "${detailsRecord.profile}" is tombstoned. Restore via \`bbl config profile restore ${detailsRecord.profile}\`.`

@@ -1,16 +1,45 @@
 # Intent Guidance 架构简化执行计划
 
-**Status**: Draft - Phase 1 发现关键问题
+**Status**: Implemented - default simplified path under fallback flag
 **Created**: 2026-07-10
-**Updated**: 2026-07-10
+**Updated**: 2026-07-11
 **Source**: [intent-guidance-architecture-optimization-analysis.md](./intent-guidance-architecture-optimization-analysis.md)
 **Priority**: P2 (Architecture Optimization)
 **Estimated Effort**: 5-7 days (revised from 3-5)
-**Token Savings**: 60-70% per turn
+**Token Savings**: 87-89% provider-visible intent guidance chars in measured prompts
 
 ---
 
 ## 状态更新
+
+### 2026-07-11 实施记录
+
+**已落地**:
+- 新增 `intentGuidanceSelector.ts` 作为统一门面，默认启用 simplified path；`BABEL_O_INTENT_GUIDANCE=default` 保留旧实现回退。
+- `contextAssembler.ts`、`prepareRuntimeStart.ts`、`LLMCodingRuntime.ts`、`providerTurn.ts`、`contextAnalysis.ts` 已切换到 selector，避免提示词、intake event、工具抑制和 diagnostics 各自走不同策略。
+- simplified provider-visible guidance 压缩为 5 行控制字段：`I`、`A`、`T`、`Auth`、`Why`。
+- 工具抑制收敛为硬 respond-only 场景：pause、greeting、纯记忆能力问答、无授权的选择/元行为问题；普通 inspect/status/continue 请求保持工具可见。
+- `/context` diagnostics 新增 `intentGuidance` 块，记录 mode、provider-visible 字符数、旧格式 baseline、估算节省量、工具可见性与抑制原因。
+
+**实测样本**:
+
+| Prompt | Old chars | New chars | Saved |
+| --- | ---: | ---: | ---: |
+| `继续任务` | 599 | 65 | 89% |
+| `just stop it and waite for me other require` | 609 | 71 | 88% |
+| `呃让你分析的就是babel-X项目` | 629 | 81 | 87% |
+| `请查看当前项目分支情况` | 607 | 65 | 89% |
+
+**验证**:
+- `npm run typecheck`
+- `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-intent-further-context.json npx tsx --test test/context-assembler.test.ts`
+- `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-intent-further-prepare.json npx tsx --test test/prepare-runtime-start.test.ts`
+- `npm run build`
+- `bbl go --check --no-start-nexus`
+
+**保留风险**:
+- `default` 旧实现至少保留一个版本周期，便于生产回滚。
+- 需要继续用真实 session replay 观察 simplified path 的 pause/correction/status 边界。
 
 ### Phase 1 进展
 
@@ -31,7 +60,7 @@
    - 简化后需要决定：保留硬守卫还是信任 Model + 权限守门
 
 3. **设计决策点**:
-   
+
    | 场景 | 旧方案 | 新方案 | 风险 |
    |------|--------|--------|------|
    | 偏好选择误判 | 正则强制 none | 信任 Model | 工具可能执行 |
@@ -165,7 +194,7 @@ Output: ~150-200 tokens (JSON)
 ```typescript
 /**
  * 简化后的授权决策函数
- * 
+ *
  * 设计原则：
  * 1. 继承优先 - 延续指令继承上一轮授权
  * 2. 边界明确 - 破坏性/远程操作必须显式
@@ -183,13 +212,13 @@ function deriveAuthorization(
   if (isContinuationPhrase(text) && context.previousAuth) {
     return context.previousAuth.level
   }
-  
+
   // 2. 破坏性边界（必须显式确认）
   if (isDestructiveRequest(text)) return 'destructive'
-  
+
   // 3. 远程操作边界
   if (isRemoteOperation(text)) return 'shared_change'
-  
+
   // 4. 信任模型的判断
   // Model Intake 已经有完整上下文，判断比正则更准确
   return context.modelAuthLevel ?? 'inspect'
@@ -288,9 +317,9 @@ function deriveAuthorization(
 
 **当前 prompt**:
 ```
-Return only compact JSON with keys: intent, confidence, continuity, 
-contextScope, actionHint, requiresTools, problemTarget, 
-authorizationLevel, consentScope, consentSource, selectionKind, 
+Return only compact JSON with keys: intent, confidence, continuity,
+contextScope, actionHint, requiresTools, problemTarget,
+authorizationLevel, consentScope, consentSource, selectionKind,
 authorizationReason, reason, explicitPaths.
 intent must be one of: continue, new_focus, correction, pause, greeting, status.
 contextScope must be one of: full, recent, new_focus.

@@ -253,7 +253,7 @@ func friendlyNexusErrorWithContext(code string, payload map[string]any, soft *so
     if hint, ok := payload["hint"].(string); ok && hint != "" {
         return hint, true
     }
-    
+
     // Priority 2: Handle client-specific context (soft-timeout)
     // This logic MUST remain in client because it depends on local softTimeoutSnapshot
     if code == "REQUEST_TIMEOUT" {
@@ -261,7 +261,7 @@ func friendlyNexusErrorWithContext(code string, payload map[string]any, soft *so
         // (requires client-side softTimeoutSnapshot state)
         // ...
     }
-    
+
     // Priority 3: Fallback to raw message
     return "", false
 }
@@ -320,15 +320,15 @@ The task exceeded the execute timeout limit.
 1. **Ask the model to summarize and narrow scope**
    - Request a summary of current progress.
    - Ask to focus on a specific subtask.
-   
+
 2. **Reduce context size**
    - Run \`/compact\` to trigger manual compaction.
    - Use \`/context\` to inspect current context usage.
-   
+
 3. **Split the task**
    - Break into smaller, independent subtasks.
    - Use worktrees for parallel execution.
-   
+
 4. **Adjust timeout (advanced)**
    - Run with \`--execute-timeout-ms 300000\` for longer tasks.
    - This is a last resort; prefer other solutions first.
