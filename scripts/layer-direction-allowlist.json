@@ -74,10 +74,12 @@
       "src/nexus/everCoreRuntimeManager.ts",
       "src/nexus/remoteRunnerConfig.ts",
       "src/runtime/hooks.ts",
-      "src/runtime/systemPromptBuilder.ts"
+      "src/runtime/systemPromptBuilder.ts",
+      "src/runtime/thinkingLevel.ts"
     ],
     "src/shared/config.ts": [
-      "src/providers/registry.ts"
+      "src/providers/registry.ts",
+      "src/cli/secrets/index.ts"
     ],
     "src/tools/everCoreMcpTools.ts": [
       "src/nexus/everCoreConfig.ts"
