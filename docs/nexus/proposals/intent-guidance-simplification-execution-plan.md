@@ -1,11 +1,71 @@
 # Intent Guidance 架构简化执行计划
 
-**Status**: Draft
+**Status**: Implemented - default simplified path under fallback flag
 **Created**: 2026-07-10
+**Updated**: 2026-07-11
 **Source**: [intent-guidance-architecture-optimization-analysis.md](./intent-guidance-architecture-optimization-analysis.md)
 **Priority**: P2 (Architecture Optimization)
-**Estimated Effort**: 3-5 days
-**Token Savings**: 60-70% per turn
+**Estimated Effort**: 5-7 days (revised from 3-5)
+**Token Savings**: 87-89% provider-visible intent guidance chars in measured prompts
+
+---
+
+## 状态更新
+
+### 2026-07-11 实施记录
+
+**已落地**:
+- 新增 `intentGuidanceSelector.ts` 作为统一门面，默认启用 simplified path；`BABEL_O_INTENT_GUIDANCE=default` 保留旧实现回退。
+- `contextAssembler.ts`、`prepareRuntimeStart.ts`、`LLMCodingRuntime.ts`、`providerTurn.ts`、`contextAnalysis.ts` 已切换到 selector，避免提示词、intake event、工具抑制和 diagnostics 各自走不同策略。
+- simplified provider-visible guidance 压缩为 5 行控制字段：`I`、`A`、`T`、`Auth`、`Why`。
+- 工具抑制收敛为硬 respond-only 场景：pause、greeting、纯记忆能力问答、无授权的选择/元行为问题；普通 inspect/status/continue 请求保持工具可见。
+- `/context` diagnostics 新增 `intentGuidance` 块，记录 mode、provider-visible 字符数、旧格式 baseline、估算节省量、工具可见性与抑制原因。
+
+**实测样本**:
+
+| Prompt | Old chars | New chars | Saved |
+| --- | ---: | ---: | ---: |
+| `继续任务` | 599 | 65 | 89% |
+| `just stop it and waite for me other require` | 609 | 71 | 88% |
+| `呃让你分析的就是babel-X项目` | 629 | 81 | 87% |
+| `请查看当前项目分支情况` | 607 | 65 | 89% |
+
+**验证**:
+- `npm run typecheck`
+- `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-intent-further-context.json npx tsx --test test/context-assembler.test.ts`
+- `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-intent-further-prepare.json npx tsx --test test/prepare-runtime-start.test.ts`
+- `npm run build`
+- `bbl go --check --no-start-nexus`
+
+**保留风险**:
+- `default` 旧实现至少保留一个版本周期，便于生产回滚。
+- 需要继续用真实 session replay 观察 simplified path 的 pause/correction/status 边界。
+
+### Phase 1 进展
+
+**已完成**:
+- 创建 `deriveSimplifiedAuthorization()` 新函数
+- 简化 `normalizeGuidancePolicy()` 只保留破坏性边界
+
+**发现的关键问题**:
+
+1. **双重路径问题**:
+   - `normalizeGuidancePolicy()` (Model 路径)
+   - `deriveFallbackUserIntentGuidance()` (Fallback 路径)
+   - 两者都有大量正则检查，需要同步简化
+
+2. **测试依赖正则硬守卫**:
+   - `test/runtime-llm.test.ts` 有 3 个测试依赖正则纠正 Model 错误判断
+   - 这些测试验证的是"正则硬守卫能纠正 Model 误判"的场景
+   - 简化后需要决定：保留硬守卫还是信任 Model + 权限守门
+
+3. **设计决策点**:
+
+   | 场景 | 旧方案 | 新方案 | 风险 |
+   |------|--------|--------|------|
+   | 偏好选择误判 | 正则强制 none | 信任 Model | 工具可能执行 |
+   | 元行为问题误判 | 正则强制 none | 信任 Model | 工具可能执行 |
+   | 破坏性操作 | 正则强制 destructive | 保留 ✅ | 无 |
 
 ---
 
@@ -134,7 +194,7 @@ Output: ~150-200 tokens (JSON)
 ```typescript
 /**
  * 简化后的授权决策函数
- * 
+ *
  * 设计原则：
  * 1. 继承优先 - 延续指令继承上一轮授权
  * 2. 边界明确 - 破坏性/远程操作必须显式
@@ -152,13 +212,13 @@ function deriveAuthorization(
   if (isContinuationPhrase(text) && context.previousAuth) {
     return context.previousAuth.level
   }
-  
+
   // 2. 破坏性边界（必须显式确认）
   if (isDestructiveRequest(text)) return 'destructive'
-  
+
   // 3. 远程操作边界
   if (isRemoteOperation(text)) return 'shared_change'
-  
+
   // 4. 信任模型的判断
   // Model Intake 已经有完整上下文，判断比正则更准确
   return context.modelAuthLevel ?? 'inspect'
@@ -189,9 +249,55 @@ function deriveAuthorization(
 
 ---
 
-## 五、执行计划
+## 五、执行计划（修订版）
 
-### Phase 1: 简化 normalizeGuidancePolicy（1 天）
+### Phase 1: 设计决策（需要确认）
+
+**关键问题**: 简化程度的选择
+
+**方案 A: 完全信任 Model**
+- 移除所有正则硬守卫
+- 只保留破坏性边界
+- 权限守门作为最终防线
+- Token 节省最大（60-70%）
+- 风险：依赖 Model 准确性
+
+**方案 B: 保留安全硬守卫**
+- 保留：破坏性边界、偏好选择、元行为问题
+- 移除：正向推导（`isLocalChangeAuthorizationRequest` 等）
+- Token 节省中等（40-50%）
+- 风险较低
+
+**方案 C: 仅简化正向推导**
+- 保留所有硬守卫
+- 只移除 `isLocalChangeAuthorizationRequest` 正向推导
+- Token 节省较小（20-30%）
+- 风险最低
+
+**推荐**: 方案 B（折中）
+
+理由：
+1. 论文 "Prompt Injection Attacks" 指出 LLM 判断不可靠
+2. 权限守门虽然能兜底，但用户体验差（频繁弹窗）
+3. 偏好选择误判会导致不必要的工具执行
+
+### Phase 2: 简化 normalizeGuidancePolicy（1 天，修订）
+
+**目标**: 采用方案 B，保留安全硬守卫
+
+**保留的正则**:
+- `isDestructiveAuthorizationRequest()` - 破坏性边界
+- `isSharedChangeAuthorizationRequest()` - 远程操作边界
+- `isMetaBehaviorQuestion()` - 元行为问题
+- `isPreferenceOrOptionSelection()` - 偏好选择
+
+**移除的正则**:
+- `isLocalChangeAuthorizationRequest()` - 正向推导
+- `isCurrentStateVerificationRequest()` - 正向推导
+- `isExplicitMemorySavePrompt()` - 正向推导
+- `isMemoryAvailabilityCheckRequest()` - 正向推导
+
+### Phase 3: 简化 Model Intake Prompt（1 天）
 
 **目标**: 移除正向推导逻辑，只保留继承检查
 
@@ -211,9 +317,9 @@ function deriveAuthorization(
 
 **当前 prompt**:
 ```
-Return only compact JSON with keys: intent, confidence, continuity, 
-contextScope, actionHint, requiresTools, problemTarget, 
-authorizationLevel, consentScope, consentSource, selectionKind, 
+Return only compact JSON with keys: intent, confidence, continuity,
+contextScope, actionHint, requiresTools, problemTarget,
+authorizationLevel, consentScope, consentSource, selectionKind,
 authorizationReason, reason, explicitPaths.
 intent must be one of: continue, new_focus, correction, pause, greeting, status.
 contextScope must be one of: full, recent, new_focus.

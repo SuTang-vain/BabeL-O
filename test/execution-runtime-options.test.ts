@@ -18,6 +18,7 @@ test('buildRuntimeExecuteOptions preserves Nexus execution inputs for runtime.ex
     skipPermissionCheck: true,
     requestId: 'body-request-id',
     model: 'local/coding-runtime',
+    thinkingLevel: 'deep',
     budget: 42,
     executionEnvironment: 'remote',
     allowedTools: ['Read'],
@@ -66,6 +67,7 @@ test('buildRuntimeExecuteOptions preserves Nexus execution inputs for runtime.ex
     assert.equal(out.skipPermissionCheck, true)
     assert.equal(out.requestId, prepared.requestId)
     assert.equal(out.model, body.model)
+    assert.equal(out.thinkingLevel, 'deep')
     assert.equal(out.budget, body.budget)
     assert.equal(out.executionEnvironment, body.executionEnvironment)
     assert.equal(out.remoteRunner, remoteRunner)

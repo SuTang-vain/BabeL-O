@@ -9,6 +9,8 @@ import type { ModelAdapter, ModelMessage } from '../src/providers/adapters/Model
 import type { RuntimeExecuteOptions } from '../src/runtime/Runtime.js'
 import type { NexusEvent } from '../src/shared/events.js'
 import { buildUserIntakeGuidanceEvent } from '../src/runtime/intentGuidance.js'
+import { getIntentGuidanceMode, shouldSuppressSelectedToolsForIntent } from '../src/runtime/intentGuidanceSelector.js'
+import { guidanceFromIntakeEvent } from '../src/runtime/intentGuidanceSimplified.js'
 
 // Always-failing adapter so buildUserIntakeGuidanceEvent
 // falls through to the heuristic fallback. The prepare
@@ -161,6 +163,7 @@ test('prepareRuntimeStart logger receives a single debug line when storage.listE
     listEvents: async () => {
       throw new Error('boom')
     },
+    getSession: async () => undefined,
   } as unknown as Parameters<typeof prepareRuntimeStart>[0]['deps']['storage']
   const result = await prepareRuntimeStart({
     options: makeOptions(),
@@ -290,4 +293,92 @@ test('prepareRuntimeStart skips intake event fallback when buildUserIntakeGuidan
   // Make sure buildUserIntakeGuidanceEvent is reachable
   // here too (smoke check on the import path).
   assert.equal(typeof buildUserIntakeGuidanceEvent, 'function')
+})
+
+test('prepareRuntimeStart uses simplified intent guidance by default', async () => {
+  const previous = process.env.BABEL_O_INTENT_GUIDANCE
+  try {
+    delete process.env.BABEL_O_INTENT_GUIDANCE
+    assert.equal(getIntentGuidanceMode(), 'simplified')
+
+    const result = await prepareRuntimeStart({
+      options: makeOptions({ prompt: '继续任务' }),
+      deps: { storage: undefined, tools: new Map(), toolPolicy: allowAllTools() },
+      settings: baseSettings,
+      cleanedModelId: 'test-model',
+      adapter: failingAdapter,
+      shouldReplayReasoningContent: false,
+    })
+
+    assert.equal(result.intakeEvent.type, 'user_intake_guidance')
+    assert.equal(result.intakeEvent.userText, '继续任务')
+    assert.equal(result.intakeEvent.source, 'fallback')
+    assert.equal(result.intakeEvent.reason, 'Default continue.')
+    assert.equal(result.intakeEvent.authorizationLevel, 'inspect')
+    assert.equal(shouldSuppressSelectedToolsForIntent(guidanceFromIntakeEvent(result.intakeEvent as any)), false)
+  } finally {
+    if (previous === undefined) delete process.env.BABEL_O_INTENT_GUIDANCE
+    else process.env.BABEL_O_INTENT_GUIDANCE = previous
+  }
+})
+
+test('simplified intent guidance suppresses only hard respond-only intents', async () => {
+  const previous = process.env.BABEL_O_INTENT_GUIDANCE
+  try {
+    delete process.env.BABEL_O_INTENT_GUIDANCE
+
+    const status = await prepareRuntimeStart({
+      options: makeOptions({ prompt: '查看当前项目分支情况' }),
+      deps: { storage: undefined, tools: new Map(), toolPolicy: allowAllTools() },
+      settings: baseSettings,
+      cleanedModelId: 'test-model',
+      adapter: failingAdapter,
+      shouldReplayReasoningContent: false,
+    })
+    assert.equal(status.intakeEvent.type, 'user_intake_guidance')
+    const statusIntake = status.intakeEvent
+    assert.equal(statusIntake.requiresTools, true)
+    assert.equal(shouldSuppressSelectedToolsForIntent(guidanceFromIntakeEvent(statusIntake)), false)
+
+    const pause = await prepareRuntimeStart({
+      options: makeOptions({ prompt: '先不需要继续，等我下一步要求' }),
+      deps: { storage: undefined, tools: new Map(), toolPolicy: allowAllTools() },
+      settings: baseSettings,
+      cleanedModelId: 'test-model',
+      adapter: failingAdapter,
+      shouldReplayReasoningContent: false,
+    })
+    assert.equal(pause.intakeEvent.type, 'user_intake_guidance')
+    const pauseIntake = pause.intakeEvent
+    assert.equal(pauseIntake.intent, 'pause')
+    assert.equal(shouldSuppressSelectedToolsForIntent(guidanceFromIntakeEvent(pauseIntake)), true)
+  } finally {
+    if (previous === undefined) delete process.env.BABEL_O_INTENT_GUIDANCE
+    else process.env.BABEL_O_INTENT_GUIDANCE = previous
+  }
+})
+
+test('prepareRuntimeStart can fall back to default intent guidance with feature flag', async () => {
+  const previous = process.env.BABEL_O_INTENT_GUIDANCE
+  try {
+    process.env.BABEL_O_INTENT_GUIDANCE = 'default'
+    assert.equal(getIntentGuidanceMode(), 'default')
+
+    const result = await prepareRuntimeStart({
+      options: makeOptions({ prompt: '继续任务' }),
+      deps: { storage: undefined, tools: new Map(), toolPolicy: allowAllTools() },
+      settings: baseSettings,
+      cleanedModelId: 'test-model',
+      adapter: failingAdapter,
+      shouldReplayReasoningContent: false,
+    })
+
+    assert.equal(result.intakeEvent.type, 'user_intake_guidance')
+    assert.equal(result.intakeEvent.userText, '继续任务')
+    assert.equal(result.intakeEvent.source, 'fallback')
+    assert.equal(result.intakeEvent.authorizationLevel, 'inspect')
+  } finally {
+    if (previous === undefined) delete process.env.BABEL_O_INTENT_GUIDANCE
+    else process.env.BABEL_O_INTENT_GUIDANCE = previous
+  }
 })

@@ -40,6 +40,7 @@ import {
 } from './compact.js'
 import { buildTaskScopeDeclaredEvent, deriveTaskScope, type TaskScopeDeclaredEvent } from './taskScope.js'
 import { queueSessionMemoryLiteUpdate } from './sessionMemoryLite.js'
+import { parseThinkingLevel, resolveThinkingProfile } from './thinkingLevel.js'
 // `wrapWithBehaviorTraceTap` (and its private `behaviorTraceDetectionKey`
 // helper) were extracted to `./behaviorTraceTap.ts` in Phase 3B-6; the
 // underlying behaviorTrace primitives it composes (buildTraceContext /
@@ -57,10 +58,12 @@ import {
   enforceMessageBudget,
 } from './toolResultBudget.js'
 import {
-  buildUserIntakeGuidanceEvent,
   isPureMemoryCapabilityQuestion,
-  shouldSuppressToolsForIntent,
 } from './intentGuidance.js'
+import {
+  buildSelectedUserIntakeGuidanceEvent,
+  shouldSuppressSelectedToolsForIntent,
+} from './intentGuidanceSelector.js'
 import {
   absorbCacheAwareCompactPolicyMetrics,
   absorbCompactSummaryLatencyMetrics,
@@ -328,6 +331,19 @@ export class LLMCodingRuntime implements NexusRuntime {
     if (!options.hooks) {
       options = { ...options, hooks: this.configManager.load().hooks }
     }
+    const configuredThinkingLevel = options.thinkingLevel ??
+      parseThinkingLevel(process.env.BABEL_O_THINKING_LEVEL)
+    const thinkingProfile = resolveThinkingProfile(configuredThinkingLevel)
+    if (configuredThinkingLevel) {
+      options = {
+        ...options,
+        thinkingLevel: thinkingProfile.level,
+        ...(options.maxOutputTokens === undefined &&
+          thinkingProfile.defaultMaxOutputTokens !== undefined && {
+            maxOutputTokens: thinkingProfile.defaultMaxOutputTokens,
+          }),
+      }
+    }
 
     yield {
       type: 'session_started',
@@ -336,6 +352,7 @@ export class LLMCodingRuntime implements NexusRuntime {
       requestId: options.requestId,
       model: options.model,
       budget: options.budget,
+      ...(options.thinkingLevel && { thinkingLevel: options.thinkingLevel }),
     }
 
     if (continuity) {
@@ -431,7 +448,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         tools: toolsList,
         warningPercent: contextWarningPercent,
         compactPercent: contextCompactPercent,
-        suppressToolsForIntent: shouldSuppressToolsForIntent,
+        suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
         onMemoryRetrieval: this.emitMemoryRetrieval,
         // R2: thread the persisted workingSetOverride through the
         // hot-path refresh so the provider-visible Working Set: block
@@ -491,7 +508,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           tools: toolsList,
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
-          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
           onMemoryRetrieval: this.emitMemoryRetrieval,
           workingSetOverride,
         },
@@ -548,7 +565,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           tools: toolsList,
           warningPercent: contextWarningPercent,
           compactPercent: contextCompactPercent,
-          suppressToolsForIntent: shouldSuppressToolsForIntent,
+          suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
           onMemoryRetrieval: this.emitMemoryRetrieval,
           workingSetOverride,
         },
@@ -576,7 +593,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         readFileCache: this.readFileCache,
         toolsList,
         mapEventsForProvider,
-        shouldSuppressToolsForIntent,
+        shouldSuppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
         onMemoryRetrieval: this.emitMemoryRetrieval,
         userIntentGuidance: undefined,
         workingSetOverride,
@@ -596,13 +613,22 @@ export class LLMCodingRuntime implements NexusRuntime {
         return
       }
 
-      // Parse thinking budget config from environments or options.budget
+      // An explicit numeric budget wins. Otherwise an explicit thinking level
+      // supplies the profile default; legacy environment configuration remains
+      // unchanged when no level is selected.
       const thinkingBudgetEnv =
         process.env.BABEL_O_THINKING_BUDGET || process.env.ANTHROPIC_THINKING_BUDGET
-      const thinkingBudget = options.budget !== undefined ? options.budget : (thinkingBudgetEnv ? parseInt(thinkingBudgetEnv, 10) : undefined)
+      const requestedThinkingBudget = options.budget !== undefined
+        ? options.budget
+        : configuredThinkingLevel
+          ? thinkingProfile.defaultThinkingBudget
+          : (thinkingBudgetEnv ? parseInt(thinkingBudgetEnv, 10) : undefined)
+      const thinkingBudget = settings.providerId === 'anthropic'
+        ? requestedThinkingBudget
+        : undefined
 
       let loopCount = 0
-      const maxLoops = 25
+      const maxLoops = thinkingProfile.maxLoops
       let finalResponseOnlyMode = false
       // Phase D: tracks whether the one bounded read-only `final_check` has
       // been used. Set after a read-only tool dispatch in final_check so the
@@ -639,7 +665,7 @@ export class LLMCodingRuntime implements NexusRuntime {
         })
 
         let suppressToolsForCurrentIntent =
-          shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+          shouldSuppressSelectedToolsForIntent(assembledContext.userIntentGuidance) &&
           !confirmedOptionSelection &&
           suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
         let requestState = buildProviderLoopRequestState({
@@ -698,7 +724,7 @@ export class LLMCodingRuntime implements NexusRuntime {
                 tools: toolsList,
                 warningPercent: contextWarningPercent,
                 compactPercent: contextCompactPercent,
-                suppressToolsForIntent: shouldSuppressToolsForIntent,
+                suppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
                 onMemoryRetrieval: this.emitMemoryRetrieval,
                 workingSetOverride,
               },
@@ -719,7 +745,7 @@ export class LLMCodingRuntime implements NexusRuntime {
               metrics,
               toolsList,
               mapEventsForProvider,
-              shouldSuppressToolsForIntent,
+              shouldSuppressToolsForIntent: shouldSuppressSelectedToolsForIntent,
               onMemoryRetrieval: this.emitMemoryRetrieval,
               workingSetOverride,
               initialPrompt: options.prompt,
@@ -740,7 +766,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             contextMaxTokens: cacheAwareCompactPolicy.effectiveContextCeiling ?? assembledContext.budget.maxTokens,
           })
           suppressToolsForCurrentIntent =
-            shouldSuppressToolsForIntent(assembledContext.userIntentGuidance) &&
+            shouldSuppressSelectedToolsForIntent(assembledContext.userIntentGuidance) &&
             !confirmedOptionSelection &&
             suppressedToolRetryCount < MAX_SUPPRESSED_TOOL_RETRIES
           requestState = buildProviderLoopRequestState({
@@ -1527,6 +1553,7 @@ export function buildSystemPrompt(
     projectMemory: projectMemory.trim() || undefined,
     sessionSummary: sessionSummary.trim() || undefined,
     activeSkills: activeSkills.trim() || undefined,
+    thinkingLevel: options.thinkingLevel,
     prompt: options.prompt,
   })
   return sectionsToPromptText(sections)

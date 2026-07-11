@@ -153,6 +153,9 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		policy = "soft-deny"
 	}
 	payload["policy"] = policy
+	if level := normalizeThinkingLevel(cfg.ThinkingLevel); level != "" {
+		payload["thinkingLevel"] = level
+	}
 	// Phase D: emit per-turn `allowedTools` override when configured.
 	// Empty / unset: per-turn override off; the server-side startup
 	// policy applies. Scoped to this turn only; the next turn
@@ -173,6 +176,22 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		}
 	}
 	return payload
+}
+
+func normalizeThinkingLevel(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "quick", "balanced", "deep":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func effectiveThinkingLevel(value string) string {
+	if normalized := normalizeThinkingLevel(value); normalized != "" {
+		return normalized
+	}
+	return "balanced"
 }
 
 func ensureStreamSession(cfg Config, prompt string) (string, error) {

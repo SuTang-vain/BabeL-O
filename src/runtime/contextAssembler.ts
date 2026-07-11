@@ -26,8 +26,10 @@ export {
   type PostCompactState,
 } from './compactPostRestore.js'
 import {
-  deriveUserIntentGuidance,
-  formatUserIntentGuidance,
+  deriveSelectedUserIntentGuidance,
+  formatSelectedUserIntentGuidance,
+} from './intentGuidanceSelector.js'
+import {
   type UserIntentGuidance,
 } from './intentGuidance.js'
 import { deriveWorkingSet, formatWorkingSet } from './workingSet.js'
@@ -286,7 +288,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const compactAwareEvents = compactBoundary && retainedSegmentCheck.valid
     ? [...retainedBoundaryEvents, ...options.events.slice(compactBoundary.index + 1)]
     : options.events
-  const userIntentGuidance = deriveUserIntentGuidance({
+  const userIntentGuidance = deriveSelectedUserIntentGuidance({
     events: compactAwareEvents,
     latestPrompt: options.runtimeOptions.prompt,
     cwd: options.runtimeOptions.cwd,
@@ -440,7 +442,8 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     activeSkills: budgetedActiveSkills.trim() || undefined,
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
-    userIntentGuidance: formatUserIntentGuidance(userIntentGuidance),
+    userIntentGuidance: formatSelectedUserIntentGuidance(userIntentGuidance),
+    thinkingLevel: options.runtimeOptions.thinkingLevel,
     workingSet: workingSet || undefined,
     prompt: options.runtimeOptions.prompt,
   })

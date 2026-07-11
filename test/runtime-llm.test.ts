@@ -1394,6 +1394,50 @@ describe('LLMCodingRuntime', () => {
     assert.equal(body.max_tokens, 256)
   })
 
+  test('applies deep thinking level to Anthropic reasoning, output, and verification guidance', async () => {
+    fetchStreamResponses.push(
+      createAnthropicTextStream('Deep review complete.'),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    const events = await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-deep-thinking-level',
+        prompt: 'review the implementation deeply',
+        cwd: tmpdir(),
+        thinkingLevel: 'deep',
+      })
+    )
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.deepEqual(body.thinking, { type: 'enabled', budget_tokens: 8192 })
+    assert.ok(body.max_tokens >= 9216)
+    assert.match(JSON.stringify(body.system), /Thinking level: deep/)
+    assert.match(JSON.stringify(body.system), /Safety, permissions, task scope, and evidence requirements remain unchanged/)
+    const started = events.find(event => event.type === 'session_started')
+    assert.equal((started as any)?.thinkingLevel, 'deep')
+  })
+
+  test('explicit output budget overrides the thinking level default', async () => {
+    fetchStreamResponses.push(
+      createAnthropicTextStream('Bounded review complete.'),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), null as any, configManager)
+    await collectEvents(
+      runtime.executeStream({
+        sessionId: 'test-deep-thinking-level-explicit-output',
+        prompt: 'review the implementation deeply',
+        cwd: tmpdir(),
+        thinkingLevel: 'deep',
+        maxOutputTokens: 512,
+      })
+    )
+
+    const body = JSON.parse(String(fetchCalls[0].init?.body))
+    assert.equal(body.max_tokens, 9216)
+  })
+
   test('persists user_intake_guidance and hides tools for respond-only intake', async () => {
     globalThis.fetch = async (url, init) => {
       const body = parseRequestBody(init)

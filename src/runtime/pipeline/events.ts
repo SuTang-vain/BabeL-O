@@ -23,7 +23,7 @@ export function buildRuntimeErrorEvent(options: {
 }): Extract<NexusEvent, { type: 'error' }> {
   // Apply humanization to add hint and docsUrl
   const humanized = humanizeError(options.code, options.message, options.details)
-  
+
   return {
     type: 'error',
     ...eventBase(options.sessionId),

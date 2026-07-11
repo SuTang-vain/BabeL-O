@@ -9,7 +9,7 @@ describe('buildRuntimeErrorEvent integration', () => {
       code: 'REQUEST_TIMEOUT',
       message: 'turn exceeded 180000ms',
     })
-    
+
     assert.equal(event.type, 'error')
     assert.equal(event.code, 'REQUEST_TIMEOUT')
     assert.ok(event.hint)
@@ -24,7 +24,7 @@ describe('buildRuntimeErrorEvent integration', () => {
       code: 'CONTEXT_BLOCKING',
       message: 'context limit exceeded',
     })
-    
+
     assert.equal(event.code, 'CONTEXT_BLOCKING')
     assert.ok(event.hint)
     assert.ok(event.hint?.includes('compact'))
@@ -36,7 +36,7 @@ describe('buildRuntimeErrorEvent integration', () => {
       code: 'PROVIDER_AUTH_FAILED',
       message: 'invalid API key',
     })
-    
+
     assert.equal(event.code, 'PROVIDER_AUTH_FAILED')
     assert.ok(event.hint)
     assert.ok(event.hint?.includes('API key'))
@@ -49,7 +49,7 @@ describe('buildRuntimeErrorEvent integration', () => {
       message: 'timeout',
       details: { timeoutMs: 180000 },
     })
-    
+
     assert.ok(event.details)
     assert.deepEqual(event.details, { timeoutMs: 180000 })
   })
@@ -60,7 +60,7 @@ describe('buildRuntimeErrorEvent integration', () => {
       code: 'UNKNOWN_ERROR',
       message: 'something went wrong',
     })
-    
+
     assert.equal(event.code, 'UNKNOWN_ERROR')
     assert.equal(event.message, 'something went wrong')
     assert.equal(event.hint, undefined)

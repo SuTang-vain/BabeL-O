@@ -6,7 +6,8 @@ import type {
   StreamDelta,
 } from '../../providers/adapters/ModelAdapter.js'
 import type { CacheAwareCompactUsage } from '../cacheAwareCompactPolicy.js'
-import { getIntentCategory, getToolSuppressionReason, type UserIntentGuidance } from '../intentGuidance.js'
+import type { UserIntentGuidance } from '../intentGuidance.js'
+import { getSelectedIntentCategory, getSelectedToolSuppressionReason } from '../intentGuidanceSelector.js'
 import { buildProviderFallbackPolicy } from '../providerRecovery.js'
 import {
   buildRuntimeErrorEvent,
@@ -271,7 +272,7 @@ export function reduceProviderTurnOutcome(options: {
   if (options.suppressToolsForUserIntent && turn.toolCalls.length > 0 && options.suppressedToolRetryCount < options.maxSuppressedToolRetries) {
     const attemptedTools = turn.toolCalls.map(toolCall => toolCall.name).join(', ')
     const message = `Runtime suppressed provider tool calls for respond-only user intent: ${attemptedTools}.`
-    const suppressionReason = getToolSuppressionReason(options.userIntentGuidance)
+    const suppressionReason = getSelectedToolSuppressionReason(options.userIntentGuidance)
     const blocksExecution = suppressionReason?.startsWith('authorization:none') ?? false
     return {
       kind: blocksExecution ? 'terminal' : 'continue',
@@ -285,7 +286,7 @@ export function reduceProviderTurnOutcome(options: {
             actionHint: options.userIntentGuidance.actionHint,
             requiresTools: options.userIntentGuidance.requiresTools,
             latestUserText: options.userIntentGuidance.latestUserText,
-            intentCategory: getIntentCategory(options.userIntentGuidance),
+            intentCategory: getSelectedIntentCategory(options.userIntentGuidance),
             suppressionReason,
             severity: 'soft',
             attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
@@ -304,7 +305,7 @@ export function reduceProviderTurnOutcome(options: {
           }]
         : [{
             role: 'user',
-            content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now - the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
+            content: `${message}\nRecovery reason: suppressed_tool_call_for_respond_only_intent\nIntent category after recovery: ${getSelectedIntentCategory(options.userIntentGuidance)}\nIf you genuinely need to inspect a file or run a read-only check to answer, retry that tool now - the runtime will let it through. If the latest request is execution or current-state verification, call the appropriate tool now; otherwise answer directly from existing context.`,
           }],
       maxTokenRecoveryCount: options.maxTokenRecoveryCount,
       outputRetryCount: options.outputRetryCount,

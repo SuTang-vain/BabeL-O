@@ -66,6 +66,7 @@ export const executeSchema = z.object({
   allowedTools: z.array(z.string().min(1)).optional(),
   requestId: z.string().optional(),
   model: z.string().optional(),
+  thinkingLevel: z.enum(['quick', 'balanced', 'deep']).optional(),
   budget: z.number().int().positive().optional(),
   executionEnvironment: z.enum(['local', 'docker', 'remote']).default('local').optional(),
 })

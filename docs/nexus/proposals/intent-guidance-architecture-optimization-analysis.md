@@ -20,7 +20,7 @@
 ### 1.2 安全与授权的关键洞察
 
 > **"Simple Prompt Injection Attacks Can Leak Personal Data" (2025)**
-> 
+>
 > 攻击成功率 20% → LLM 的授权判断不可靠，授权层必须在 LLM 之外执行
 
 **结论**: 权限守门必须保留，但 Intent 推断可以简化。
@@ -150,13 +150,13 @@ function deriveAuthorization(text: string, context: TurnContext): AuthLevel {
   if (isContinuationPhrase(text) && context.previousAuth) {
     return context.previousAuth.level
   }
-  
+
   // 2. 破坏性边界（必须显式）
   if (isDestructiveRequest(text)) return 'destructive'
-  
+
   // 3. 远程操作边界
   if (isRemoteOperation(text)) return 'shared_change'
-  
+
   // 4. 信任模型的判断（传入上下文）
   // 不再做大正则推断
   return context.modelAuthLevel ?? 'inspect'

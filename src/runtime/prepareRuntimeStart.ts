@@ -70,7 +70,7 @@ import type { AnyTool } from '../tools/Tool.js'
 import { type ToolPolicy } from './LocalCodingRuntime.js'
 import { mapEventsToMessages } from './eventsTranslator.js'
 import { allocateBudget, getHistoryEventLoadLimit } from './contextAssembler.js'
-import { buildUserIntakeGuidanceEvent } from './intentGuidance.js'
+import { buildSelectedUserIntakeGuidanceEvent } from './intentGuidanceSelector.js'
 import { buildTaskScopeDeclaredEvent } from './taskScope.js'
 import { isOptionSelectionClarificationText, normalizeOptionSelection } from './pipeline/providerTurn.js'
 
@@ -184,8 +184,8 @@ export async function prepareRuntimeStart(
   // Step 3: build intake event. The helper builds; the
   // caller yields. (See "Non-goals" above for why the
   // helper does not yield itself.)
-  const intakeEvent = await buildUserIntakeGuidanceEvent({
-    adapter: adapter as Parameters<typeof buildUserIntakeGuidanceEvent>[0]['adapter'],
+  const intakeEvent = await buildSelectedUserIntakeGuidanceEvent({
+    adapter: adapter as Parameters<typeof buildSelectedUserIntakeGuidanceEvent>[0]['adapter'],
     modelId: cleanedModelId,
     apiKey: settings.apiKey,
     baseUrl: settings.baseUrl,
