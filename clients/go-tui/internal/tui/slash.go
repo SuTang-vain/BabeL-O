@@ -86,7 +86,7 @@ func init() {
 				// body would require it to be fully built first).
 				names := []string{
 					"/help", "/config", "/profile", "/clear", "/exit",
-					"/context", "/compact", "/memory", "/inbox", "/model", "/models", "/tool", "/tools",
+					"/context", "/compact", "/effort", "/memory", "/inbox", "/model", "/models", "/tool", "/tools",
 					"/skill", "/skills", "/session", "/sessions", "/agents", "/bash", "/read", "/grep", "/glob",
 					"/write", "/edit",
 				}
@@ -165,6 +165,34 @@ func init() {
 				}
 				m.appendLine("status", "compacting shared Nexus context: "+shortID(m.sessionID))
 				return triggerCompact(m.cfg, m.sessionID)
+			},
+		},
+		{
+			name:    "/effort",
+			summary: "show or set thinking effort for the next prompt",
+			hasArgs: true,
+			argHint: "[quick|balanced|deep]",
+			run: func(m *model, args []string) tea.Cmd {
+				if len(args) == 0 {
+					m.openEffortOverlay()
+					return nil
+				}
+				if len(args) != 1 {
+					m.appendLine("error", "usage: /effort [quick|balanced|deep]")
+					return nil
+				}
+				level := normalizeThinkingLevel(args[0])
+				if level == "" {
+					m.appendLine("error", "invalid effort: "+args[0]+" (use quick, balanced, or deep)")
+					return nil
+				}
+				m.cfg.ThinkingLevel = level
+				if m.running {
+					m.appendLine("status", "effort set to "+level+"; applies to the next prompt")
+				} else {
+					m.appendLine("status", "effort set to "+level)
+				}
+				return nil
 			},
 		},
 		{

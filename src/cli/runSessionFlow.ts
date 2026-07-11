@@ -10,6 +10,7 @@ import { NEXUS_EVENT_SCHEMA_VERSION, type NexusEvent } from '../shared/events.js
 import type { PermissionResolution, SessionPhase, TaskSessionTerminalReason } from '../shared/session.js'
 import { executeRuntimeHooks } from '../runtime/hooks.js'
 import { resolvePromptCwd } from '../runtime/systemPromptBuilder.js'
+import { parseThinkingLevel } from '../runtime/thinkingLevel.js'
 
 type PermissionDialogEvent = {
   sessionId?: string
@@ -46,6 +47,7 @@ export async function runSessionFlow(
   sessionIdArg?: string
 ): Promise<string> {
   const sessionId = sessionIdArg ?? createId('session')
+  const thinkingLevel = parseThinkingLevel(process.env.BABEL_O_THINKING_LEVEL)
 
   if (url) {
     const wsUrl = url.replace(/^http/, 'ws') + '/v1/stream'
@@ -101,6 +103,7 @@ export async function runSessionFlow(
           cwd,
           sessionId,
           ...(cliPolicyMode && { policy: cliPolicyMode }),
+          ...(thinkingLevel && { thinkingLevel }),
         }))
       })
 
@@ -271,6 +274,7 @@ export async function runSessionFlow(
         timeoutSignal: timeoutController.signal,
         requestId,
         model: settings.modelId,
+        ...(thinkingLevel && { thinkingLevel }),
         budget,
         remoteRunner: remoteRunner.runner,
         // Phase B 推进: align embedded one-shot CLI execution with the Go TUI

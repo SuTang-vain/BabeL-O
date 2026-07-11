@@ -4,6 +4,7 @@ import type { NexusStorage } from '../storage/Storage.js'
 import type { ToolRisk } from '../tools/Tool.js'
 import type { RuntimeHook } from './hooks.js'
 import type { RemoteToolRunner } from './remoteRunner.js'
+import type { ThinkingLevel } from './thinkingLevel.js'
 
 export type RuntimeExecuteOptions = {
   sessionId: string
@@ -17,6 +18,7 @@ export type RuntimeExecuteOptions = {
   skipPermissionCheck?: boolean
   requestId?: string
   model?: string
+  thinkingLevel?: ThinkingLevel
   budget?: number
   maxOutputTokens?: number
   replaySessionHistory?: boolean

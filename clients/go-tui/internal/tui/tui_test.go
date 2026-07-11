@@ -3767,7 +3767,7 @@ func TestSlashCommandRegistryIsComplete(t *testing.T) {
 		}
 	}
 	// The minimum required by the rewrite plan.
-	for _, want := range []string{"/help", "/config", "/profile", "/clear", "/exit", "/bash", "/read", "/grep"} {
+	for _, want := range []string{"/help", "/config", "/profile", "/clear", "/exit", "/effort", "/bash", "/read", "/grep"} {
 		if !seen[want] {
 			t.Fatalf("required slash command %q missing from registry", want)
 		}
@@ -4275,6 +4275,69 @@ func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
 	rendered := viewContent(m.View())
 	if !strings.Contains(rendered, "unknown local command") {
 		t.Fatalf("view should mention 'unknown local command', got %q", rendered)
+	}
+}
+
+func TestEffortCommandUpdatesVisibleNextTurnThinkingLevel(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+
+	m.handleLocalCommand("/effort")
+	if m.inputMode != modeEffortOverlay {
+		t.Fatalf("/effort should open effort overlay, got %q", m.inputMode)
+	}
+	if !strings.Contains(viewContent(m.View()), "Thinking Effort") {
+		t.Fatalf("effort overlay should render")
+	}
+	updated, _ := m.Update(keyPress(tea.KeyDown))
+	m, _ = updated.(model)
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
+	m, _ = updated.(model)
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("overlay selection ThinkingLevel = %q, want deep", got)
+	}
+
+	m.handleLocalCommand("/effort deep")
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("ThinkingLevel = %q, want deep", got)
+	}
+	payload := buildExecuteRequest(m.cfg, "session_effort", "review implementation")
+	if got := payload["thinkingLevel"]; got != "deep" {
+		t.Fatalf("thinkingLevel = %v, want deep", got)
+	}
+	if !strings.Contains(viewContent(m.View()), "effort:deep") {
+		t.Fatalf("header should show active effort")
+	}
+
+	m.handleLocalCommand("/effort maximum")
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("invalid effort should preserve deep, got %q", got)
+	}
+	if !strings.Contains(viewContent(m.View()), "invalid effort") {
+		t.Fatalf("invalid effort should render an error")
+	}
+}
+
+func TestEffortOverlayStartsAtCurrentLevelAndCancelsWithoutMutation(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", ThinkingLevel: "quick"})
+	m.handleLocalCommand("/effort")
+	if m.inputMode != modeEffortOverlay {
+		t.Fatalf("inputMode = %q, want effort overlay", m.inputMode)
+	}
+	if m.effortSelected != 0 {
+		t.Fatalf("effortSelected = %d, want quick index 0", m.effortSelected)
+	}
+	updated, _ := m.Update(keyPress(tea.KeyDown))
+	m, _ = updated.(model)
+	if m.effortSelected != 1 {
+		t.Fatalf("effortSelected = %d, want balanced index 1", m.effortSelected)
+	}
+	updated, _ = m.Update(keyPress(tea.KeyEscape))
+	m, _ = updated.(model)
+	if got := m.cfg.ThinkingLevel; got != "quick" {
+		t.Fatalf("escape should preserve quick, got %q", got)
+	}
+	if m.inputMode != modeComposing {
+		t.Fatalf("escape should return to composing, got %q", m.inputMode)
 	}
 }
 
@@ -8585,6 +8648,20 @@ func TestBuildExecuteRequestHonoursExplicitPolicyMode(t *testing.T) {
 	payload := buildExecuteRequest(cfg, "session_abc", "hello")
 	if got := payload["policy"]; got != "strict" {
 		t.Fatalf("explicit policy = %v, want 'strict'", got)
+	}
+}
+
+func TestBuildExecuteRequestEmitsValidThinkingLevel(t *testing.T) {
+	payload := buildExecuteRequest(Config{Cwd: "/workspace", ThinkingLevel: "DEEP"}, "session_abc", "review this")
+	if got := payload["thinkingLevel"]; got != "deep" {
+		t.Fatalf("thinkingLevel = %v, want deep", got)
+	}
+}
+
+func TestBuildExecuteRequestOmitsInvalidThinkingLevel(t *testing.T) {
+	payload := buildExecuteRequest(Config{Cwd: "/workspace", ThinkingLevel: "max"}, "session_abc", "review this")
+	if _, ok := payload["thinkingLevel"]; ok {
+		t.Fatalf("invalid thinkingLevel should be omitted, got %v", payload["thinkingLevel"])
 	}
 }
 

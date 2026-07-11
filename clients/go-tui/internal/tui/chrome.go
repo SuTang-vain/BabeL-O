@@ -63,6 +63,7 @@ func (m model) renderHeader(width int) string {
 		}
 		metaParts = append(metaParts, authStyle.Render("auth:"+authLabel))
 	}
+	metaParts = append(metaParts, "effort:"+effectiveThinkingLevel(m.cfg.ThinkingLevel))
 	metaParts = append(metaParts, context, toggle)
 	metaPlain := strings.Join(metaParts, " · ")
 	stateWidth := lipgloss.Width(state)
@@ -109,6 +110,7 @@ func (m model) renderTopCard(width int) string {
 		firstNonEmpty(m.modelID, "model pending"),
 		firstNonEmpty(m.providerID, "provider pending"),
 		firstNonEmpty(m.activeProfile, "profile pending"),
+		"effort " + effectiveThinkingLevel(m.cfg.ThinkingLevel),
 	}, " · "))
 	if m.sessionID != "" {
 		modelLine += " · session " + shortID(m.sessionID)

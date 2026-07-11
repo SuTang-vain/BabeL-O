@@ -31,6 +31,7 @@ export const SessionStartedEventSchema = z.object({
   cwd: z.string(),
   requestId: z.string().optional(),
   model: z.string().optional(),
+  thinkingLevel: z.enum(['quick', 'balanced', 'deep']).optional(),
   budget: z.number().optional(),
 })
 

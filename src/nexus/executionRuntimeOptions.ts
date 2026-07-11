@@ -25,6 +25,7 @@ export function buildRuntimeExecuteOptions(params: BuildRuntimeExecuteOptionsPar
     skipPermissionCheck: body.skipPermissionCheck,
     requestId: prepared.requestId,
     model: body.model,
+    thinkingLevel: body.thinkingLevel,
     budget: body.budget,
     executionEnvironment: body.executionEnvironment,
     remoteRunner: params.remoteRunner,

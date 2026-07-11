@@ -443,6 +443,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
     userIntentGuidance: formatSelectedUserIntentGuidance(userIntentGuidance),
+    thinkingLevel: options.runtimeOptions.thinkingLevel,
     workingSet: workingSet || undefined,
     prompt: options.runtimeOptions.prompt,
   })

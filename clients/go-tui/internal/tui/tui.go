@@ -40,6 +40,10 @@ type Config struct {
 	// etc.) via the existing permission panel. Set to "strict" to
 	// preserve the old hard-deny behaviour for a specific session.
 	PolicyMode string
+	// ThinkingLevel selects the Nexus runtime execution profile for the
+	// current turn: quick, balanced, or deep. It changes reasoning and
+	// verification budgets only; permission and scope policy are unchanged.
+	ThinkingLevel string
 	// AllowTools is the comma-separated list of tool names that the
 	// current turn's `allowedTools` body field should declare. Phase D
 	// of docs/nexus/reference/go-tui-permission-policy-governance-plan.md.
@@ -973,6 +977,7 @@ const (
 	modeMemoryOverlay     inputMode = "memoryOverlay"     // read-only /v1/runtime/memory/status wire; up/down/esc/enter/q
 	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
 	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
+	modeEffortOverlay     inputMode = "effortOverlay"     // thinking effort selector; up/down/enter/esc
 	// Skill execution governance plan (P3 Layer 4) — Go TUI
 	// /skill slash command family. The Nexus endpoints are
 	// already shipped (skillReadRouter / skillActionRouter);
@@ -1181,6 +1186,7 @@ type model struct {
 	skillLastError            string
 	modelCatalog            runtimeModelsResponse
 	modelOverlayScroll      int
+	effortSelected          int
 	sessionPanelSelected    int
 	sessionPendingAction    sessionPanelAction
 	quitChoice              int
@@ -1554,6 +1560,9 @@ func (m *model) scrollOverlay(delta int) bool {
 		allLines := buildModelOverlayLines(m.modelCatalog)
 		maxScroll := max(0, len(allLines)-1)
 		m.modelOverlayScroll = clamp(m.modelOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modeEffortOverlay:
+		m.effortSelected = ((m.effortSelected+delta)%len(effortLevels) + len(effortLevels)) % len(effortLevels)
 		return true
 	case modeModelPickProvider:
 		maxScroll := max(0, len(m.modelCatalog.Providers)-1)
@@ -2901,6 +2910,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
+		case modeEffortOverlay:
+			switch key {
+			case "esc", "q":
+				m.setMode(modeComposing)
+				m.appendLine("status", "effort selection cancelled")
+				return m, nil
+			case "enter":
+				m.applySelectedEffort()
+				return m, nil
+			case "up", "k", "shift+tab":
+				m.effortSelected = (m.effortSelected + len(effortLevels) - 1) % len(effortLevels)
+				return m, nil
+			case "down", "j", "tab":
+				m.effortSelected = (m.effortSelected + 1) % len(effortLevels)
+				return m, nil
+			}
+			return m, nil
+
 		case modeSessionOverlay:
 			actions := sessionPanelActions()
 			switch key {
@@ -3734,6 +3761,7 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 		m.renderMemoryOverlay(width),
 		m.renderToolAuditOverlay(width),
 		m.renderModelOverlay(width),
+		m.renderEffortOverlay(width),
 		m.renderModelPickProvider(width),
 		m.renderModelPickApiKey(width),
 		m.renderModelPickBaseURL(width),
@@ -3784,6 +3812,7 @@ func (m model) viewString() string {
 	memoryOverlay := m.renderMemoryOverlay(width)
 	toolAuditOverlay := m.renderToolAuditOverlay(width)
 	modelOverlay := m.renderModelOverlay(width)
+	effortOverlay := m.renderEffortOverlay(width)
 	modelPickProvider := m.renderModelPickProvider(width)
 	modelPickApiKey := m.renderModelPickApiKey(width)
 	modelPickBaseURL := m.renderModelPickBaseURL(width)
@@ -3820,6 +3849,9 @@ func (m model) viewString() string {
 	}
 	if modelOverlay != "" {
 		parts = append(parts, modelOverlay)
+	}
+	if effortOverlay != "" {
+		parts = append(parts, effortOverlay)
 	}
 	if modelPickProvider != "" {
 		parts = append(parts, modelPickProvider)
@@ -3860,6 +3892,7 @@ func (m model) usesFullScreenOverlay() bool {
 		modeMemoryOverlay,
 		modeToolAuditOverlay,
 		modeModelOverlay,
+		modeEffortOverlay,
 		modeModelPickProvider,
 		modeModelPickApiKey,
 		modeModelPickBaseURL,
@@ -3884,6 +3917,7 @@ func (m model) renderFullScreenOverlay(width int) string {
 		m.renderMemoryOverlay(width),
 		m.renderToolAuditOverlay(width),
 		m.renderModelOverlay(width),
+		m.renderEffortOverlay(width),
 		m.renderModelPickProvider(width),
 		m.renderModelPickApiKey(width),
 		m.renderModelPickBaseURL(width),
@@ -3960,6 +3994,7 @@ var helpOverlayLines = []string{
 	"  /profile [name]  list profiles, or select a profile",
 	"  /model [id]      open model config view, or show CLI set hint",
 	"  /models          print model capability matrix",
+	"  /effort [level]  show or set quick, balanced, or deep for next prompt",
 	"",
 	"Profile confirm overlay:",
 	"  y / enter        confirm the pending profile switch",

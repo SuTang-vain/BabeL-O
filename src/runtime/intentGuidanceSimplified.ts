@@ -690,6 +690,9 @@ export function formatUserIntentGuidance(guidance: UserIntentGuidance): string {
     `Auth: ${authorization.level}`,
     `Why: ${normalized.reason}`,
   ]
+  if (normalized.intent === 'greeting') {
+    lines.push('Reply: brief greeting only; do not list capabilities, internal architecture, tool-call style, or work mode unless the user asks.')
+  }
   return lines.join('\n')
 }
 

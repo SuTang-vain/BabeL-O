@@ -10,9 +10,12 @@ import { registerExecuteHttpRoute } from '../src/nexus/executeHttpRoute.js'
 import type { NexusRuntime, RuntimeExecuteOptions } from '../src/runtime/Runtime.js'
 
 class ScriptedRuntime implements NexusRuntime {
+  receivedOptions: RuntimeExecuteOptions[] = []
+
   constructor(private readonly streamEvents: NexusEvent[]) {}
 
-  async *executeStream(_options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+  async *executeStream(options: RuntimeExecuteOptions): AsyncIterable<NexusEvent> {
+    this.receivedOptions.push(options)
     for (const event of this.streamEvents) {
       yield event
     }
@@ -138,6 +141,35 @@ test('executeHttpRoute streams events and returns execute_result envelope on suc
     const hasResult = body.events.some((event: NexusEvent) => event.type === 'result')
     assert.equal(hasAssistantDelta, true)
     assert.equal(hasResult, true)
+  } finally {
+    await app.close()
+  }
+})
+
+test('executeHttpRoute forwards thinkingLevel to runtime execution options', async () => {
+  const runtime = new ScriptedRuntime([
+    {
+      type: 'result',
+      ...eventBase('seed-thinking-level'),
+      success: true,
+      message: 'done',
+    },
+  ])
+  const app = makeApp({
+    runtime,
+    executionGate: new ExecutionGate(8),
+    metrics: new NexusMetrics(),
+    registry: new ActiveExecutionRegistry(),
+  })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/execute',
+      payload: { prompt: 'review deeply', thinkingLevel: 'deep' },
+    })
+    assert.equal(response.statusCode, 200)
+    assert.equal(runtime.receivedOptions.length, 1)
+    assert.equal(runtime.receivedOptions[0]?.thinkingLevel, 'deep')
   } finally {
     await app.close()
   }
