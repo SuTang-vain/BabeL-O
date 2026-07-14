@@ -94,7 +94,7 @@ Without one of those gates, keep the item as `Draft` or `Watch`.
 
 | Candidate | State | Gate |
 | --- | --- | --- |
-| Task get/list/update/stop/output | Plan-only | Needs real workflow recovery or task lifecycle regression. |
+| Task get/list/update/stop/output | Partially Landed | User explicitly requested complete task lifecycle tool family. Phase 0-5 in [proposals/task-lifecycle-tool-family-expansion-plan.md](../proposals/task-lifecycle-tool-family-expansion-plan.md). |
 | AskUserQuestion | Partially Landed | User explicitly requested Go TUI question dialog. Phase 0-6 in [proposals/go-tui-task-board-and-ask-user-question-plan.md](../proposals/go-tui-task-board-and-ask-user-question-plan.md). |
 | MCP resource/prompt/root exposure | Plan-only | Needs integration demand and runtime-owned scope handling. |
 | EnterPlanMode / ExitPlanMode | Plan-only | Needs planner UX or task-scope regression; must not become a hidden instruction override. |
