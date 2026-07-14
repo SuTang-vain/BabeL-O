@@ -164,8 +164,8 @@ on page 0, which serves as both hint and indicator.
 | Phase | Status | Scope | Exit criteria |
 |-------|--------|-------|---------------|
 | Phase 1 | **Draft** | Planning document + index updates | `docs/nexus/proposals/README.md` updated, `TODO.md` updated, `active/TODO_tui.md` updated |
-| Phase 2 | Draft | State + rendering | `topCardPage int` field; `renderTopCardTaskPage` in `chrome.go`; page-1 task list renders from `m.taskBoard` |
-| Phase 3 | Draft | Key handling | Left/right arrow in global key section, gated by `m.topCardOpen`; `topCardPage` resets to 0 on `ctrl+d` close |
+| Phase 2 | **Done** | State + rendering | `topCardPage int` field; `renderTopCardTaskPage` in `chrome.go`; page-1 task list renders from `m.taskBoard` |
+| Phase 3 | **Done** | Key handling | Left/right arrow in global key section, gated by `m.topCardOpen`; `topCardPage` resets to 0 on `ctrl+d` close |
 | Phase 4 | Draft | Verification | `go build ./...` + `go test ./internal/tui` pass; manual `bbl go` smoke: open card, arrow-right to tasks, arrow-left back, close with ctrl+d |
 
 ## Verification

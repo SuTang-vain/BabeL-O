@@ -86,8 +86,8 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 **根因：** `/tasks` 斜杠命令在 agent 运行期间（`m.running === true`）被 `startPrompt` 阻断；`Ctrl+D` 是全局 key handler，不受 `!m.running` 守卫，是运行态唯一可用的监控出口。当前顶部卡片展示四列（MCP/Skills/Session/Memory），缺失任务信息。
 
 **修复项：**
-- [ ] Phase 2 — 状态 + 渲染：`topCardPage int` 字段 + `renderTopCardTaskPage` 在 `chrome.go`
-- [ ] Phase 3 — 按键处理：左右方向键切换 page 0/1，仅 `topCardOpen` 时激活
+- [x] Phase 2 — 状态 + 渲染：`topCardPage int` 字段 + `renderTopCardTaskPage` 在 `chrome.go`
+- [x] Phase 3 — 按键处理：左右方向键切换 page 0/1，仅 `topCardOpen` 时激活
 - [ ] Phase 4 — 验证：`go build ./...` + `go test ./internal/tui` + 手动 smoke
 
 ### 问题 1：任务面板在 turn 中不更新 ✅ 已修复
