@@ -1,6 +1,6 @@
 import { eventBase, type NexusEvent } from '../../shared/events.js'
 import type { ToolCallTextLeakSuppression } from './turn.js'
-import { humanizeError } from '../../nexus/errorRegistry.js'
+import { humanizeError } from '../../shared/errorRegistry.js'
 
 export function buildRuntimeResultEvent(
   sessionId: string,

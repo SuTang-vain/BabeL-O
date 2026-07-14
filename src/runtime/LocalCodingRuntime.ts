@@ -1,6 +1,6 @@
 import { z } from 'zod'
 import { eventBase, type NexusEvent } from '../shared/events.js'
-import { humanizeError } from '../nexus/errorRegistry.js'
+import { humanizeError } from '../shared/errorRegistry.js'
 import type { RemoteToolRunnerDiagnostics } from '../shared/toolTrace.js'
 import { createId, nowIso } from '../shared/id.js'
 import type { AnyTool, ToolRisk } from '../tools/Tool.js'
