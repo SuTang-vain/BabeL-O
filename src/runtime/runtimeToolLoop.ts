@@ -1081,6 +1081,54 @@ export async function* executeProviderToolCall(options: {
     remoteRunner: result.remoteRunner,
   }
 
+  // TaskCreate real-time notification: the tool persists the task via
+  // storage.saveTask() but no longer calls storage.appendEvent() for
+  // task_created. The runtime yields task_created here so that
+  // processRuntimeExecutionEvent handles both storage persistence and
+  // WebSocket broadcast in a single path. The Go TUI relies on
+  // WebSocket task_created events for real-time task-board updates
+  // (mid-turn, before the end-of-turn REST poll).
+  if (
+    result.success &&
+    tool.name === 'TaskCreate' &&
+    finalOutput !== null &&
+    typeof finalOutput === 'object'
+  ) {
+    const taskOutput = finalOutput as Record<string, unknown>
+    if (typeof taskOutput.taskId === 'string' && typeof taskOutput.title === 'string') {
+      yield {
+        type: 'task_created',
+        ...eventBase(runtimeOptions.sessionId),
+        taskId: taskOutput.taskId,
+        title: taskOutput.title,
+      }
+    }
+  }
+
+  // TaskUpdate real-time notification: emit a task_updated event so
+  // WebSocket consumers (Go TUI, loop driver, etc.) receive the status
+  // change in real time without waiting for an end-of-turn HTTP poll.
+  if (
+    result.success &&
+    tool.name === 'TaskUpdate' &&
+    finalOutput !== null &&
+    typeof finalOutput === 'object'
+  ) {
+    const taskOutput = finalOutput as Record<string, unknown>
+    if (typeof taskOutput.taskId === 'string' && typeof taskOutput.title === 'string') {
+      yield {
+        type: 'task_updated',
+        ...eventBase(runtimeOptions.sessionId),
+        taskId: taskOutput.taskId,
+        title: taskOutput.title,
+        status:
+          typeof taskOutput.status === 'string'
+            ? (taskOutput.status as 'pending' | 'in_progress' | 'blocked' | 'completed' | 'failed' | 'cancelled')
+            : undefined,
+      }
+    }
+  }
+
   const postHookName = result.success ? 'PostToolUse' : 'PostToolUseFailure'
   const postToolHooks = await executeRuntimeHooks(
     postHookName,

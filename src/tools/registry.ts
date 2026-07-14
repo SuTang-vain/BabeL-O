@@ -22,7 +22,7 @@ import {
   skillShowTool,
   skillValidateTool,
 } from './builtin/skillTool.js'
-import { taskTool } from './builtin/task.js'
+import { taskListTool, taskTool, taskUpdateTool } from './builtin/task.js'
 import { webSearchTool } from './builtin/webSearch.js'
 import { writeTool } from './builtin/write.js'
 
@@ -52,6 +52,8 @@ export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}):
     bashTool,
     askUserQuestionTool,
     taskTool,
+    taskListTool,
+    taskUpdateTool,
     webSearchTool,
     // PR-8 + cross-session extension: on-demand context tools (Track A Phase 2).
     // Read risk, no approval. Do NOT enter active context (INV-L12); called

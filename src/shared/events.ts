@@ -153,6 +153,19 @@ export const TaskCreatedEventSchema = z.object({
 })
 
 /**
+ * §3.1.1 Task lifecycle event — emitted by the runtime when the
+ * model calls TaskUpdate to change a task's status, title, or result.
+ * The Go TUI uses this to update the task board in real time.
+ */
+export const TaskUpdatedEventSchema = z.object({
+  type: z.literal('task_updated'),
+  ...baseEventFields,
+  taskId: z.string(),
+  title: z.string(),
+  status: z.enum(['pending', 'in_progress', 'blocked', 'completed', 'failed', 'cancelled']).optional(),
+})
+
+/**
  * §3.1.2 AskUserQuestion event — the runtime emits this when the
  * model invokes the AskUserQuestion tool to ask the user a structured
  * multi-choice question. The Go TUI renders a selection dialog from
@@ -842,6 +855,7 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ToolCompletedEventSchema,
   ToolDeniedEventSchema,
   TaskCreatedEventSchema,
+  TaskUpdatedEventSchema,
   AskUserQuestionEventSchema,
   AskUserQuestionResponseEventSchema,
   ResultEventSchema,
