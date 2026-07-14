@@ -3098,7 +3098,7 @@ describe('LLMCodingRuntime', () => {
     // whitelist, not hidden. System prompt advertises the one bounded check.
     const finalCheckBody = JSON.parse(String(fetchCalls[21].init?.body))
     const finalCheckToolNames = (finalCheckBody.tools ?? []).map((t: any) => t.name)
-    assert.deepEqual(finalCheckToolNames.sort(), ['Glob', 'Grep', 'ListDir', 'Read'])
+    assert.deepEqual(finalCheckToolNames.sort(), ['Glob', 'Grep', 'ListDir', 'Read', 'TaskCreate', 'TaskList', 'TaskUpdate'])
     assert.match(JSON.stringify(finalCheckBody.system), /ONE bounded read-only check/)
 
     // must_respond (iteration 23 = fetchCalls[22]): tools hidden, further call refused.
