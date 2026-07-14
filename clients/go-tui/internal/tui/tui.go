@@ -2003,11 +2003,33 @@ var (
 		dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	inputBlockStyle   = lipgloss.NewStyle()
-	topCardFrameStyle = lipgloss.NewStyle().
-				Border(lipgloss.NormalBorder()).
-				BorderForeground(lipgloss.Color("99")).
-				Padding(0, 1)
-	topCardAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
+topCardFrameStyle = lipgloss.NewStyle().
+					Border(lipgloss.RoundedBorder()).
+					BorderForeground(lipgloss.Color("99")).
+					Padding(0, 1)
+		topCardAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
+		// topCardHeaderStyle is a bold accent heading for the
+		// Ctrl+D overview panel (page 0). Uses the brand accent
+		// color so it stands out from the muted column content.
+		topCardHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
+		// topCardRowStyle renders the key-value rows inside each
+		// top card column. The dot-color prefix is the default
+		// topCardAccentStyle; the content is regular text.
+		topCardRowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("253"))
+		// topCardValueStyle highlights the value/metric in a row
+		// (e.g. the MCP tool count, inbox unread count).
+		topCardValueStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("50"))
+		// topCardNavHintStyle is a prominent navigation hint for the
+		// Ctrl+D panel footer. It uses a bright accent so users can
+		// immediately see the left/right arrow key page toggle.
+		topCardNavHintStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+		// topCardTitleStyle is a bold accent for the top card panels
+		// (task page, overview). It replaces focusedLineStyle with a
+		// more distinct visual hierarchy.
+		topCardTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99")).Padding(0, 0)
+		// topCardSummaryStyle renders the task summary line in a muted
+		// but slightly brighter shade than normal muted text.
+		topCardSummaryStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Italic(true)
 	// overlayFrameStyle wraps every read-only overlay (help,
 	// profile confirm, context, inbox, agents, tasks, activity,
 	// tools audit) in a muted normal border so they read as
@@ -4695,6 +4717,24 @@ case "timeout_budget_exceeded":
 			// transcript.ts formatter already has a "task +" label
 			// for task_created events (lines 289-290).
 			m.appendLine("task_created", formatNexusEvent(event))
+		case "task_updated":
+			// Real-time task board update: when the LLM calls
+			// TaskUpdate, update the matching task in m.taskBoard
+			// in place so the /tasks overlay reflects the new
+			// status / title mid-turn.
+			taskID := stringField(event, "taskId")
+			title := stringField(event, "title")
+			statusStr := stringField(event, "status")
+			for i, t := range m.taskBoard {
+				if t.TaskID == taskID {
+					m.taskBoard[i].Title = title
+					if statusStr != "" {
+						m.taskBoard[i].Status = taskStatus(statusStr)
+					}
+					break
+				}
+			}
+			m.appendLine("task_updated", formatNexusEvent(event))
 	default:
 		if body := formatNexusEvent(event); body != "" && !looksLikeInternalStatusLine(eventType, body) {
 			m.appendLine(eventType, body)
