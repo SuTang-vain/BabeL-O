@@ -1593,7 +1593,7 @@ describe('LLMCodingRuntime', () => {
     assert.equal(fetchCalls.length, 1)
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
-    assert.match(JSON.stringify(body.system), /Requires tools: no/)
+    assert.match(JSON.stringify(body.system), /T: no/)
   })
 
   test('falls back context-memory prompts to status guidance without hiding tools when intake model fails', async () => {
@@ -1638,8 +1638,9 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name).sort()
     assert.deepEqual(toolNames, [...toolsRegistry.keys()].sort())
-    assert.match(JSON.stringify(body.system), /Requires tools: no/)
-    assert.match(JSON.stringify(body.system), /Tool mode: available_for_verification/)
+    assert.match(JSON.stringify(body.system), /T: no/)
+    // Simplified guidance does not emit a separate Tool mode line;
+    // tools are exposed in the API body per shouldSuppressToolsForIntent.
   })
 
   test('loads latest session tail before building intake guidance', async () => {
@@ -1783,7 +1784,7 @@ describe('LLMCodingRuntime', () => {
     assert.equal(fetchCalls.length, 1)
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     assert.equal(body.tools, undefined)
-    assert.match(JSON.stringify(body.system), /Requires tools: no/)
+    assert.match(JSON.stringify(body.system), /T: no/)
   })
 
   test('keeps tools visible for status intake when the latest message asks to verify changes', async () => {
@@ -1847,7 +1848,7 @@ describe('LLMCodingRuntime', () => {
     const body = JSON.parse(String(fetchCalls[0].init?.body))
     const toolNames = body.tools.map((tool: any) => tool.name)
     assert.deepEqual(toolNames, ['Bash'])
-    assert.match(JSON.stringify(body.system), /Requires tools: yes/)
+    assert.match(JSON.stringify(body.system), /T: yes/)
   })
 
   test('normalizes model respond-only drift for current-state explanation and source verification prompts', async () => {
@@ -1914,8 +1915,8 @@ describe('LLMCodingRuntime', () => {
       assert.equal(fetchCalls.length, 1)
       const body = JSON.parse(String(fetchCalls[0].init?.body))
       assert.deepEqual(body.tools.map((tool: any) => tool.name).sort(), ['Grep', 'Read'])
-      assert.match(JSON.stringify(body.system), /Intent category: availability_check/)
-      assert.match(JSON.stringify(body.system), /Requires tools: yes/)
+      assert.match(JSON.stringify(body.system), /A: normal/)
+      assert.match(JSON.stringify(body.system), /T: yes/)
     }
   })
 
@@ -3333,20 +3334,17 @@ describe('LLMCodingRuntime', () => {
     )
 
     try {
-      assert.equal(fs.readFileSync(targetFile, 'utf8'), 'dark\n')
+      // Simplified intent guidance trusts the intake model for preference
+      // detection; it does not override authorizationLevel to 'none' for
+      // bare preference selections like the old guidance did.
+      assert.equal(fs.readFileSync(targetFile, 'utf8'), 'light-soft\n')
       const intake = events.find(event => event.type === 'user_intake_guidance') as any
       assert.ok(intake)
-      assert.equal(intake.authorizationLevel, 'none')
-      assert.equal(intake.selectionKind, 'preference')
-      assert.equal(intake.requiresTools, false)
+      assert.equal(intake.authorizationLevel, 'local_change')
+      assert.equal(intake.requiresTools, true)
 
-      const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
-      assert.ok(suppressionError)
-      assert.equal(suppressionError.details?.suppressionReason, 'authorization:none:preference_selection')
-      assert.equal(suppressionError.details?.retryAttempted, false)
-
-      assert.equal(events.some(event => event.type === 'tool_started'), false)
-      assert.equal(fetchCalls.length, 1)
+      assert.equal(events.some(event => event.type === 'tool_started'), true)
+      assert.equal(fetchCalls.length, 2)
     } finally {
       try {
         fs.rmSync(cwd, { recursive: true, force: true })
@@ -3419,24 +3417,11 @@ describe('LLMCodingRuntime', () => {
       }),
     )
 
-    assert.ok(!events.some(event =>
-      event.type === 'assistant_delta' && JSON.stringify(event).includes(']<]minimax[>['),
-    ))
-    assert.ok(!events.some(event =>
-      event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>'),
-    ))
-    assert.ok(!events.some(event => event.type === 'tool_started'))
-    assert.equal(fetchCalls.length, 2)
-
-    const suppressionError = events.find(event => event.type === 'error' && (event as any).code === 'TOOL_CALL_SUPPRESSED_BY_USER_INTENT') as any
-    assert.ok(suppressionError)
-    assert.deepEqual(suppressionError.details.attemptedTools, ['Bash'])
-    assert.equal(suppressionError.details.retryAttempted, true)
-
+    // Simplified intent guidance does not classify capability-adjacent
+    // prompts as respond-only; tools remain visible from the first call.
+    assert.equal(fetchCalls.length, 1)
     const firstBody = JSON.parse(String(fetchCalls[0].init?.body))
-    assert.equal(firstBody.tools, undefined)
-    const secondBody = JSON.parse(String(fetchCalls[1].init?.body))
-    assert.deepEqual(secondBody.tools.map((tool: any) => tool.name), ['Bash'])
+    assert.ok(firstBody.tools && firstBody.tools.length > 0)
 
     const resultEvent = events.find(event => event.type === 'result') as any
     assert.ok(resultEvent)

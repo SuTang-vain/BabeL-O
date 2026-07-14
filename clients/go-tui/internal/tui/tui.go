@@ -3385,7 +3385,11 @@ case modeActivityOverlay:
 		previousVersion := m.configVersion
 		m.applyRuntimeConfig(msg.config)
 		if msg.config.Version > previousVersion {
-			m.appendLine("status", "config updated: "+formatRuntimeConfig(msg.config))
+			// Suppress the config-updated status line — it's operational
+		// telemetry that clutters the transcript without informing the
+		// operator. The header chrome already shows the active model
+		// and provider; the config version is an internal detail.
+		_ = formatRuntimeConfig(msg.config) // keep function reachable for tests
 		}
 		return m, m.schedulePollTick()
 
@@ -4579,9 +4583,19 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
-	case "context_microcompact", "context_compact_boundary", "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted", "context_grounding_required", "context_grounding_confirmed", "workspace_dirty_detected", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
-		m.updateProviderRetryCountdown(event)
-		m.appendLine(eventType, formatNexusEvent(event))
+case "context_microcompact", "context_compact_boundary", "context_grounding_required", "context_grounding_confirmed", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+			m.updateProviderRetryCountdown(event)
+			// These events are already suppressed by
+			// shouldSuppressTranscriptEvent, so appendLine is a no-op
+			// guard. Keep the call for any side effects that may be
+			// added later.
+		case "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted":
+			m.updateProviderRetryCountdown(event)
+			m.appendLine(eventType, formatNexusEvent(event))
+		case "workspace_dirty_detected":
+			// Keep workspace dirty / failure events visible — they
+			// indicate a real problem the operator needs to know about.
+			m.appendLine(eventType, formatNexusEvent(event))
 	case "context_usage":
 		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)
 	case "execution_metrics":
@@ -4745,26 +4759,34 @@ case "timeout_budget_exceeded":
 }
 
 func shouldSuppressTranscriptEvent(eventType string) bool {
-	eventType = strings.TrimSpace(eventType)
-	if eventType == "" {
-		return true
-	}
-	if strings.HasPrefix(eventType, "permission_") && eventType != "permission_request" {
-		return true
-	}
-	switch eventType {
-	case "permit",
-		"near_timeout_warning",
-		"timeout_budget_exceeded",
-		"timeout_extension_granted",
-		"execute_summary",
-		"execution_metrics",
-		"usage",
-		"user_intake_guidance",
-		"hook_started",
-		"hook_completed",
-		"hook_failed":
-		return true
+		eventType = strings.TrimSpace(eventType)
+		if eventType == "" {
+			return true
+		}
+		if strings.HasPrefix(eventType, "permission_") && eventType != "permission_request" {
+			return true
+		}
+		switch eventType {
+		case "permit",
+			"near_timeout_warning",
+			"timeout_budget_exceeded",
+			"timeout_extension_granted",
+			"execute_summary",
+			"execution_metrics",
+			"usage",
+			"user_intake_guidance",
+			"hook_started",
+			"hook_completed",
+			"hook_failed",
+			"task_scope_declared",
+			"session_root_continuity",
+			"scope_boundary_detected",
+			"scope_boundary_confirmed",
+			"context_microcompact",
+			"context_compact_boundary",
+			"context_grounding_required",
+			"context_grounding_confirmed":
+			return true
 	default:
 		return false
 	}

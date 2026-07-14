@@ -201,10 +201,11 @@ export function shouldEnterFinalResponseOnlyMode(options: {
  * Read-only tool whitelist for the `final_check` phase. Per
  * runtime-tool-loop-governance-plan.md Phase D, `final_check` allows at most
  * one bounded read-only check (Read / Grep / Glob / ListDir) before
- * `must_respond`. Write / execute / task / skill-save / MCP-write / agent
- * lifecycle tools are never granted `final_check`.
+ * `must_respond`. Task lifecycle tools (TaskCreate, TaskList, TaskUpdate)
+ * are also allowed — updating a task's status is a lightweight metadata
+ * operation that should not be blocked by the final_check gate.
  */
-export const FINAL_CHECK_READ_ONLY = new Set(['Read', 'Grep', 'Glob', 'ListDir'])
+export const FINAL_CHECK_READ_ONLY = new Set(['Read', 'Grep', 'Glob', 'ListDir', 'TaskCreate', 'TaskList', 'TaskUpdate'])
 
 /**
  * `final_check` is the sub-state of the finalization reserve window where the

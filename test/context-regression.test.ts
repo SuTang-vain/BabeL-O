@@ -148,7 +148,7 @@ test('context regression: terse correction prioritizes latest target without dro
   assert.equal(assembled.userIntentGuidance.actionHint, 'prioritize_latest')
   assert.match(JSON.stringify(assembled.messages), /BabeL-X/)
   assert.match(JSON.stringify(assembled.messages), /BabeL-O runtime analysis background|BabeL-O package content/)
-  assert.match(assembled.systemPrompt, /Action hint: prioritize_latest/)
+  assert.match(assembled.systemPrompt, /A: prioritize_latest/)
   assert.match(assembled.systemPrompt, /Stale task mode: background_only/)
 })
 
@@ -258,8 +258,8 @@ test('context regression: real session_3ba2d788 replay binds greeting to latest 
   assert.equal(assembled.userIntentGuidance.actionHint, 'respond_only')
   assert.equal(assembled.userIntentGuidance.requiresTools, false)
   assert.deepEqual(assembled.userIntentGuidance.explicitPaths, [])
-  assert.match(assembled.systemPrompt, /Response mode: direct_answer/)
-  assert.match(assembled.systemPrompt, /Tool mode: disabled/)
+  assert.match(assembled.systemPrompt, /A: respond_only/)
+  assert.match(assembled.systemPrompt, /T: no/)
   assert.doesNotMatch(assembled.systemPrompt, /tangyaoyou|tangyaoyao/)
 })
 
