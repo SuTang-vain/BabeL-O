@@ -152,6 +152,40 @@ export const TaskCreatedEventSchema = z.object({
   title: z.string(),
 })
 
+/**
+ * §3.1.2 AskUserQuestion event — the runtime emits this when the
+ * model invokes the AskUserQuestion tool to ask the user a structured
+ * multi-choice question. The Go TUI renders a selection dialog from
+ * this event; the user's choice is sent back via the question response
+ * HTTP endpoint.
+ */
+export const AskUserQuestionEventSchema = z.object({
+  type: z.literal('ask_user_question'),
+  ...baseEventFields,
+  toolUseId: z.string(),
+  question: z.string(),
+  header: z.string().optional(),
+  options: z.array(z.object({
+    label: z.string(),
+    description: z.string().optional(),
+  })),
+  multiSelect: z.boolean().default(false),
+})
+
+/**
+ * §3.1.2 AskUserQuestion response event — emitted by the question
+ * response HTTP endpoint when the user has made their selection(s).
+ * The runtime picks this up as the tool result for the AskUserQuestion
+ * call.
+ */
+export const AskUserQuestionResponseEventSchema = z.object({
+  type: z.literal('ask_user_question_response'),
+  ...baseEventFields,
+  toolUseId: z.string(),
+  selectedIndices: z.array(z.number().int().min(0)),
+  selectedLabels: z.array(z.string()),
+})
+
 export const ResultEventSchema = z.object({
   type: z.literal('result'),
   ...baseEventFields,
@@ -808,6 +842,8 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ToolCompletedEventSchema,
   ToolDeniedEventSchema,
   TaskCreatedEventSchema,
+  AskUserQuestionEventSchema,
+  AskUserQuestionResponseEventSchema,
   ResultEventSchema,
   ErrorEventSchema,
   TaskSessionEventSchema,

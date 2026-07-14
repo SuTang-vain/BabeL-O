@@ -1009,6 +1009,11 @@ const (
 	//     textinput starts empty.
 	modePermissionEditRule     inputMode = "permissionEditRule"
 	modePermissionEditFeedback inputMode = "permissionEditFeedback"
+	// Phase 6: AskUserQuestion overlay. The model has asked a
+	// structured question with predefined options. The operator
+	// navigates with ↑/↓, selects with Enter (single) or space
+	// (multi-select), and confirms with Enter.
+	modeAskUser               inputMode = "askUser"
 )
 
 // mouseWheelStepLines keeps wheel scrolling close to terminal-native
@@ -1103,6 +1108,13 @@ type model struct {
 	decisions                 chan<- permissionDecision
 	streamCancel              chan<- struct{}
 	pending                   *pendingPermission
+	// Phase 6: pending ask_user_question overlay. Non-nil when the
+	// model has asked a structured question and the Go TUI is waiting
+	// for the user to make a selection. Keyed by toolUseID for
+	// correlation with the response endpoint.
+	pendingQuestion           *pendingQuestion
+	questionCursor            int
+	questionSelected          []int
 	recentPermissionRules     map[string]permissionRuleSeen
 	trustedPermissionSessions map[string]struct{}
 	// Phase A.1: 0..4 selector on the 5-option permission panel
@@ -1470,9 +1482,11 @@ func placeholderForMode(mode inputMode) string {
 		return "https://api.example.com"
 	case modePermissionEditRule:
 		return "git:status, bash:*, npm:install"
-	case modePermissionEditFeedback:
-		return "tell the model what to do instead"
-	case modeSessionInput:
+case modePermissionEditFeedback:
+			return "tell the model what to do instead"
+		case modeAskUser:
+			return "select an option and press Enter to answer"
+		case modeSessionInput:
 		return "session id"
 	default:
 		return ""
@@ -1545,8 +1559,12 @@ func (m *model) scrollOverlay(delta int) bool {
 	case modeActivityOverlay:
 		allLines := buildActivityOverlayLines(m.activityEvents)
 		maxScroll := max(0, len(allLines)-1)
-		m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
-		return true
+m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
+			return true
+		case modeAskUser:
+			// AskUserQuestion overlay handles its own cursor movement
+			// in the keyboard dispatch; scroll is not applicable.
+			return true
 	case modeMemoryOverlay:
 		maxScroll := max(0, len(m.memoryOverlayLines)-1)
 		m.memoryOverlayScroll = clamp(m.memoryOverlayScroll+delta, 0, maxScroll)
@@ -2687,33 +2705,114 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-		case modeActivityOverlay:
-			// Read-only recent activity overlay (Phase 6 PR5).
-			// up/k scroll back; down/j/tab scroll forward;
-			// esc/enter/q close. The activity buffer is
-			// append-only from the WebSocket stream, so no
-			// per-row actions. All other keys are swallowed
-			// so they never reach the textinput.
-			switch key {
-			case "esc", "enter", "q":
-				m.setMode(modeComposing)
-				m.activityOverlayScroll = 0
-				m.appendLine("status", "activity closed")
-				return m, nil
-			case "up", "k":
-				if m.activityOverlayScroll > 0 {
-					m.activityOverlayScroll--
+case modeActivityOverlay:
+				// Read-only recent activity overlay (Phase 6 PR5).
+				// up/k scroll back; down/j/tab scroll forward;
+				// esc/enter/q close. The activity buffer is
+				// append-only from the WebSocket stream, so no
+				// per-row actions. All other keys are swallowed
+				// so they never reach the textinput.
+				switch key {
+				case "esc", "enter", "q":
+					m.setMode(modeComposing)
+					m.activityOverlayScroll = 0
+					m.appendLine("status", "activity closed")
+					return m, nil
+				case "up", "k":
+					if m.activityOverlayScroll > 0 {
+						m.activityOverlayScroll--
+					}
+					return m, nil
+				case "down", "j", "tab":
+					allLines := buildActivityOverlayLines(m.activityEvents)
+					maxScroll := max(0, len(allLines)-1)
+					if m.activityOverlayScroll < maxScroll {
+						m.activityOverlayScroll++
+					}
+					return m, nil
 				}
 				return m, nil
-			case "down", "j", "tab":
-				allLines := buildActivityOverlayLines(m.activityEvents)
-				maxScroll := max(0, len(allLines)-1)
-				if m.activityOverlayScroll < maxScroll {
-					m.activityOverlayScroll++
+
+			case modeAskUser:
+				// AskUserQuestion dialog. Single-select: ↑/↓
+				// moves cursor, Enter confirms the current option.
+				// Multi-select: ↑/↓ moves cursor, Space toggles
+				// the current option, Enter confirms all selected.
+				// Esc cancels (sends empty selection).
+				if m.pendingQuestion == nil {
+					m.setMode(modeComposing)
+					return m, nil
+				}
+				switch key {
+				case "esc":
+					m.sendQuestionDecision(nil, nil)
+					m.pendingQuestion = nil
+					m.setMode(modeComposing)
+					m.appendLine("status", "question cancelled")
+					return m, nil
+				case "up", "k":
+					if m.questionCursor > 0 {
+						m.questionCursor--
+					}
+					return m, nil
+				case "down", "j":
+					if m.pendingQuestion != nil && m.questionCursor < len(m.pendingQuestion.options)-1 {
+						m.questionCursor++
+					}
+					return m, nil
+				case "enter":
+					if m.pendingQuestion.multiSelect {
+						// Multi-select: confirm all selected options
+						cmd := m.sendQuestionDecision(m.questionSelected, m.questionSelectedLabels())
+						if cmd != nil {
+							return m, cmd
+						}
+					} else {
+						// Single-select: confirm the current option
+						cmd := m.sendQuestionDecision(
+							[]int{m.questionCursor},
+							[]string{m.pendingQuestion.options[m.questionCursor].Label},
+						)
+						if cmd != nil {
+							return m, cmd
+						}
+					}
+					return m, nil
+				case " ":
+					if m.pendingQuestion != nil && m.pendingQuestion.multiSelect {
+						// Toggle the current option
+						idx := m.questionCursor
+						found := -1
+						for i, sel := range m.questionSelected {
+							if sel == idx {
+								found = i
+								break
+							}
+						}
+						if found >= 0 {
+							m.questionSelected = append(m.questionSelected[:found], m.questionSelected[found+1:]...)
+						} else {
+							m.questionSelected = append(m.questionSelected, idx)
+						}
+					}
+					return m, nil
+				case "1", "2", "3", "4":
+					if !m.pendingQuestion.multiSelect {
+						idx := int(key[0] - '1')
+						if idx >= 0 && idx < len(m.pendingQuestion.options) {
+							m.questionCursor = idx
+							cmd := m.sendQuestionDecision(
+								[]int{idx},
+								[]string{m.pendingQuestion.options[idx].Label},
+							)
+							if cmd != nil {
+								return m, cmd
+							}
+						}
+					}
+					return m, nil
 				}
 				return m, nil
-			}
-			return m, nil
 
 		case modeMemoryOverlay:
 			// MemoryOS status / info-card overlay. Used by
@@ -3819,8 +3918,9 @@ func (m model) viewString() string {
 	modelPickModel := m.renderModelPickModel(width)
 	skillListOverlay := m.renderSkillListOverlay(width)
 	skillShowOverlay := m.renderSkillShowOverlay(width)
-	skillValidateOverlay := m.renderSkillValidateOverlay(width)
-	quitConfirm := m.renderQuitConfirm(width)
+skillValidateOverlay := m.renderSkillValidateOverlay(width)
+		askUserOverlay := m.renderAskUserOverlay(width)
+		quitConfirm := m.renderQuitConfirm(width)
 
 	parts := []string{header, transcript}
 	if help != "" {
@@ -3871,10 +3971,13 @@ func (m model) viewString() string {
 	if skillShowOverlay != "" {
 		parts = append(parts, skillShowOverlay)
 	}
-	if skillValidateOverlay != "" {
-		parts = append(parts, skillValidateOverlay)
-	}
-	if quitConfirm != "" {
+if skillValidateOverlay != "" {
+			parts = append(parts, skillValidateOverlay)
+		}
+		if askUserOverlay != "" {
+			parts = append(parts, askUserOverlay)
+		}
+		if quitConfirm != "" {
 		parts = append(parts, quitConfirm)
 	}
 	parts = append(parts, composer, footer)
@@ -4496,9 +4599,44 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// and tool audit ignore them too.
 		m.lastEventType = eventType
 		return nil
-	case "agent_job_event":
-		m.appendLine("agent_job", formatNexusEvent(event))
-		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
+case "agent_job_event":
+			m.appendLine("agent_job", formatNexusEvent(event))
+			m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
+		case "ask_user_question":
+			// The model has asked a structured question. Parse the
+			// event, create a pendingQuestion, and open the ask-user
+			// overlay so the operator can make a selection.
+			toolUseID := stringField(event, "toolUseId")
+			question := stringField(event, "question")
+			header := stringField(event, "header")
+			multiSelect := anyBool(event["multiSelect"])
+
+			var options []questionOption
+			if rawOptions, ok := event["options"].([]any); ok {
+				for _, raw := range rawOptions {
+					if opt, ok := raw.(map[string]any); ok {
+						opt := questionOption{
+							Label:       stringField(opt, "label"),
+							Description: stringField(opt, "description"),
+						}
+						options = append(options, opt)
+					}
+				}
+			}
+
+			m.pendingQuestion = &pendingQuestion{
+				sessionID:   stringField(event, "sessionId"),
+				toolUseID:   toolUseID,
+				question:    question,
+				header:      header,
+				options:     options,
+				multiSelect: multiSelect,
+			}
+			m.questionCursor = 0
+			m.questionSelected = nil
+			m.resize()
+			m.appendLine("ask_user_question", formatNexusEvent(event))
+			m.setMode(modeAskUser)
 	case "task_session_event":
 		m.appendLine("task_session_event", formatNexusEvent(event))
 		// Phase 6 PR6: aggregate subagent lifecycle events into
@@ -4515,10 +4653,34 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		// Runtime timeout hints are operational telemetry. Do not
 		// render them in the chat transcript; the footer/soft-timeout
 		// state is the right surface for transient budget pressure.
-	case "timeout_budget_exceeded":
-		m.recordSuppressedNexusEvent(event)
-	case "timeout_extension_granted":
-		m.recordSuppressedNexusEvent(event)
+case "timeout_budget_exceeded":
+			m.recordSuppressedNexusEvent(event)
+		case "timeout_extension_granted":
+			m.recordSuppressedNexusEvent(event)
+		case "task_created":
+			// Real-time task board update: when the LLM calls
+			// TaskCreate (or the REST API creates a task), append
+			// the new task to m.taskBoard immediately so the /tasks
+			// overlay reflects it mid-turn instead of waiting for
+			// the end-of-turn HTTP poll. The event carries
+			// taskId + title; other fields default to pending /
+			// empty values that the next poll fills in.
+			taskID := stringField(event, "taskId")
+			title := stringField(event, "title")
+			m.taskBoard = append(m.taskBoard, nexusTask{
+				TaskID:    taskID,
+				SessionID: stringField(event, "sessionId"),
+				Title:     title,
+				Status:    taskStatusPending,
+				DependsOn: []string{},
+				Blocks:    []string{},
+				CreatedAt: stringField(event, "timestamp"),
+				UpdatedAt: stringField(event, "timestamp"),
+			})
+			// Render the event in the transcript as well; the
+			// transcript.ts formatter already has a "task +" label
+			// for task_created events (lines 289-290).
+			m.appendLine("task_created", formatNexusEvent(event))
 	default:
 		if body := formatNexusEvent(event); body != "" && !looksLikeInternalStatusLine(eventType, body) {
 			m.appendLine(eventType, body)

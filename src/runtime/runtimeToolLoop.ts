@@ -1005,13 +1005,77 @@ export async function* executeProviderToolCall(options: {
     return { kind: 'terminal' }
   }
 
+  // §3.1.2 AskUserQuestion pending_question interception.
+  // When the AskUserQuestion tool returns `{ status: 'pending_question' }`,
+  // the runtime emits the ask_user_question event with the real toolUseId,
+  // waits for the user's response via the question-response HTTP endpoint
+  // (which writes ask_user_question_response to storage), then replaces
+  // the tool output with the user's selection before continuing the provider
+  // loop. Without this interception the model receives the raw
+  // pending_question output and never sees the user's answer.
+  let finalOutput: unknown = result.output
+  if (
+    result.success &&
+    tool.name === 'AskUserQuestion' &&
+    finalOutput !== null &&
+    typeof finalOutput === 'object' &&
+    (finalOutput as Record<string, unknown>).status === 'pending_question'
+  ) {
+    const pendingOutput = finalOutput as Record<string, unknown>
+    // Emit the ask_user_question event with the real toolUseId so
+    // the Go TUI (or any WebSocket consumer) receives the question
+    // and opens the selection dialog.
+    const askEvent = {
+      type: 'ask_user_question' as const,
+      ...eventBase(runtimeOptions.sessionId),
+      toolUseId: toolCall.id,
+      question: String(pendingOutput.question ?? ''),
+      ...(pendingOutput.header ? { header: String(pendingOutput.header) } : {}),
+      options: (pendingOutput.options as Array<{ label: string; description?: string }>) ?? [],
+      multiSelect: Boolean(pendingOutput.multiSelect),
+    }
+    yield askEvent
+
+    // Wait for the user's response. Poll storage until we find a
+    // matching ask_user_question_response event, or abort/timeout.
+    const response = await waitForQuestionResponse({
+      storage: options.storage,
+      sessionId: runtimeOptions.sessionId,
+      toolUseId: toolCall.id,
+      timeoutSignal: runtimeOptions.timeoutSignal,
+      signal: runtimeOptions.signal,
+    })
+
+    if (response === null) {
+      // Timed out or cancelled — return a terminal error.
+      const cancelled = runtimeOptions.signal?.aborted || runtimeOptions.timeoutSignal?.aborted
+      yield buildRuntimeErrorEvent({
+        sessionId: runtimeOptions.sessionId,
+        code: cancelled ? 'REQUEST_CANCELLED' : 'QUESTION_TIMEOUT',
+        message: cancelled
+          ? 'Question cancelled while waiting for user response.'
+          : `Timed out waiting for user response to question about "${String(pendingOutput.question ?? '').slice(0, 60)}".`,
+      })
+      return { kind: 'terminal' }
+    }
+
+    // Replace the tool output with the user's selection so it becomes
+    // the provider-visible tool_result.
+    finalOutput = {
+      status: 'answered',
+      selectedIndices: response.selectedIndices,
+      selectedLabels: response.selectedLabels,
+      question: pendingOutput.question,
+    }
+  }
+
   yield {
     type: 'tool_completed',
     ...eventBase(runtimeOptions.sessionId),
     toolUseId: toolCall.id,
     name: tool.name,
     success: result.success,
-    output: result.output,
+    output: finalOutput,
     truncated: result.truncated,
     originalBytes: result.originalBytes,
     remoteRunner: result.remoteRunner,
@@ -1124,4 +1188,77 @@ function positiveNumber(value: unknown): number | undefined {
 
 function positiveOrZeroNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined
+}
+
+// ─── §3.1.2 AskUserQuestion response waiter ──────────────────────
+//
+// Polls storage for a matching ask_user_question_response event.
+// Returns the user's selection or null if the operation was cancelled
+// or timed out. The caller (executeProviderToolCall) uses null to
+// decide between a terminal error or a recoverable tool_denied.
+
+type QuestionResponse = {
+  selectedIndices: number[]
+  selectedLabels: string[]
+}
+
+const QUESTION_RESPONSE_POLL_MS = 250
+const QUESTION_RESPONSE_MAX_WAIT_MS = 180_000
+
+async function waitForQuestionResponse(params: {
+  storage: NexusStorage
+  sessionId: string
+  toolUseId: string
+  timeoutSignal?: AbortSignal
+  signal?: AbortSignal
+}): Promise<QuestionResponse | null> {
+  const { storage, sessionId, toolUseId, timeoutSignal, signal } = params
+  const deadlineMs = Date.now() + QUESTION_RESPONSE_MAX_WAIT_MS
+
+  // Resolve immediately if the request was already cancelled before
+  // we even start polling.
+  if (signal?.aborted || timeoutSignal?.aborted) return null
+
+  while (Date.now() < deadlineMs) {
+    if (signal?.aborted || timeoutSignal?.aborted) return null
+
+    try {
+      const result = await storage.listEvents(sessionId, {
+        limit: 20,
+        order: 'desc',
+        eventTypes: ['ask_user_question_response'],
+      })
+      for (const event of result.events) {
+        if (
+          event.type === 'ask_user_question_response' &&
+          event.toolUseId === toolUseId
+        ) {
+          return {
+            selectedIndices: event.selectedIndices,
+            selectedLabels: event.selectedLabels,
+          }
+        }
+      }
+    } catch {
+      // Storage errors are non-fatal; retry on the next poll.
+    }
+
+    // Wait before the next poll, respecting cancellation signals.
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, QUESTION_RESPONSE_POLL_MS)
+      const onAbort = () => {
+        clearTimeout(timer)
+        resolve()
+      }
+      signal?.addEventListener('abort', onAbort, { once: true })
+      timeoutSignal?.addEventListener('abort', onAbort, { once: true })
+      // Cleanup to avoid leaking listeners when the timeout fires
+      // normally (no abort).
+      timer.unref?.()
+    })
+
+    if (signal?.aborted || timeoutSignal?.aborted) return null
+  }
+
+  return null
 }

@@ -75,7 +75,33 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 后续若重新打开实现项，按 Phase 1 状态栏增强 + session list badge、Phase 2 tree view、Phase 3 activity overlay、Phase 4 debug graph 的顺序推进。发起侧 UX 另行以 `/inbox` reply 和 `/channel send <sessionId|channelId>` 评估，但必须具备 typed message、evidence、confirmation preview 与手动提交边界。
 
-### 持续语义边界
+### P1 Go TUI 任务面板实时更新 + AskUserQuestion 弹窗
+
+> 详细规划见 [proposals/go-tui-task-board-and-ask-user-question-plan.md](../proposals/go-tui-task-board-and-ask-user-question-plan.md)。
+
+### 问题 1：任务面板在 turn 中不更新
+
+**根因：** `src/tools/builtin/task.ts` `TaskCreate` 工具只调用 `saveTask()` 持久化，不发出 `task_created` 事件。Go TUI `consumeNexusEvent()` 没有 `case "task_created"`，任务面板只靠 end-of-turn HTTP 轮询刷新。
+
+**修复项：**
+- [ ] Phase 2 — TaskCreate 事件发射：`task.ts` 在 `saveTask` 成功后调用 `storage.appendEvent(task_created)`
+- [ ] Phase 3 — Go TUI 事件处理：`consumeNexusEvent()` 添加 `case "task_created"` 实时更新 `m.taskBoard`
+
+### 问题 2：AskUserQuestion 弹窗不存在
+
+**根因：** `AskUserQuestion` 工具从未被实现——无事件协议、无工具定义、无 TUI 弹窗。
+
+**修复项：**
+- [ ] Phase 4 — 事件协议：`events.ts` 新增 `AskUserQuestionEventSchema` + `AskUserQuestionResponseEventSchema`
+- [ ] Phase 5 — 工具 + HTTP 路由：`askUserQuestion.ts` 工具 + `questionRouter.ts`
+- [ ] Phase 6 — TUI 弹窗：`overlay_question.go` + `modeAskUser` + `pendingQuestion` + 键盘处理 + 决策发送
+
+### 验证标准
+
+- `npm run typecheck` / `npm test` 通过
+- `cd clients/go-tui && go test ./internal/tui` 通过
+- 手动 `bbl go` 验证：提交创建任务的 prompt → `/tasks` 面板实时显示
+- 手动 `bbl go` 验证：AskUserQuestion 弹窗出现并可选择
 
 - 不实现 raw transcript sharing UI。
 - 不把另一个 session 的消息渲染成当前 session 的用户输入。

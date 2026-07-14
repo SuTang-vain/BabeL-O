@@ -1,4 +1,5 @@
 import { z } from 'zod'
+import { eventBase } from '../../shared/events.js'
 import { errorMessage } from '../../shared/errors.js'
 import { createId, nowIso } from '../../shared/id.js'
 import type { NexusTask } from '../../shared/task.js'
@@ -32,6 +33,17 @@ export const taskTool: ToolDefinition<typeof inputSchema> = {
     if (context.storage) {
       try {
         await context.storage.saveTask(task)
+        // Emit a task_created event so WebSocket consumers (Go TUI,
+        // loop driver, etc.) receive real-time notification without
+        // waiting for an end-of-turn HTTP poll. Mirrors the same
+        // appendEvent call in the REST API handler
+        // (sessionTaskMutationRouter.ts:107-112).
+        await context.storage.appendEvent(context.sessionId, {
+          type: 'task_created',
+          ...eventBase(context.sessionId),
+          taskId: task.taskId,
+          title: task.title,
+        })
       } catch (error) {
         return {
           success: false,

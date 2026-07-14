@@ -1,5 +1,6 @@
 import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool } from './Tool.js'
+import { askUserQuestionTool } from './builtin/askUserQuestion.js'
 import { bashTool } from './builtin/bash.js'
 import { contextRecentTool } from './builtin/contextRecent.js'
 import { contextSearchTool } from './builtin/contextSearch.js'
@@ -49,6 +50,7 @@ export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}):
     writeTool,
     editTool,
     bashTool,
+    askUserQuestionTool,
     taskTool,
     webSearchTool,
     // PR-8 + cross-session extension: on-demand context tools (Track A Phase 2).

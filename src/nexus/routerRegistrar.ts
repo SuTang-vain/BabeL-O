@@ -63,6 +63,7 @@ import { sessionCloseRouter } from './routers/sessionCloseRouter.js'
 import { sessionCancelRouter } from './routers/sessionCancelRouter.js'
 import { sessionContextRouter } from './routers/sessionContextRouter.js'
 import { sessionCompactRouter } from './routers/sessionCompactRouter.js'
+import { sessionQuestionRouter } from './routers/sessionQuestionRouter.js'
 import { workingSetObserveRouter } from './routers/workingSetObserveRouter.js'
 import type { ActiveExecutionRegistry } from './activeExecutionRegistry.js'
 import type { AgentScheduler } from './agents/types.js'
@@ -165,6 +166,7 @@ export async function registerAllRouters(app: FastifyInstance, extras: RouterReg
     sessionCancelRouter,
     sessionContextRouter,
     sessionCompactRouter,
+    sessionQuestionRouter,
     workingSetObserveRouter,
     contextObserveRouter,
   ]
