@@ -180,12 +180,13 @@ function isRemoteOperation(text: string): boolean {
  * Check if text is a pause request.
  * (Essential intent classification)
  */
-function isPausePrompt(text: string): boolean {
+export function isPausePrompt(text: string): boolean {
   const normalized = text.trim().toLowerCase()
   return /^(等一下|等等|暂停|停|停下|停一下|pause|stop|wait|hold on)[？?!.。！`'"\s]*$/iu.test(normalized) ||
     /\b(?:just|please|pls)?\s*(?:stop|pause|hold)\b/iu.test(normalized) ||
     /\b(?:wait|waite|hold on|hang on)\b.*\b(?:for me|other require|next|a sec|a second|a minute)\b/iu.test(normalized) ||
     /^(先别|先不要|不要继续|先停)/u.test(normalized) ||
+    /(等一下|暂停|停|停下|停一下|先停)/u.test(normalized) ||
     /先不需要.*继续|先不用.*继续|暂时不需要.*继续/u.test(normalized)
 }
 

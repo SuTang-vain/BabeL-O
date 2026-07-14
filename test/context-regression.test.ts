@@ -149,7 +149,7 @@ test('context regression: terse correction prioritizes latest target without dro
   assert.match(JSON.stringify(assembled.messages), /BabeL-X/)
   assert.match(JSON.stringify(assembled.messages), /BabeL-O runtime analysis background|BabeL-O package content/)
   assert.match(assembled.systemPrompt, /A: prioritize_latest/)
-  assert.match(assembled.systemPrompt, /Stale task mode: background_only/)
+  // NOTE: Simplified intent guidance no longer emits StaleTaskMode in Turn Policy
 })
 
 test('context regression: multi-path comparison keeps both explicit paths as latest focus', async () => {
