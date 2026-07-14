@@ -1155,6 +1155,7 @@ type model struct {
 	profileCount            int
 	tombstoneCount          int
 	topCardOpen             bool
+	topCardPage             int  // 0=columns, 1=tasks; reset to 0 on close
 	paletteFilter           string
 	paletteSelected         int
 	pendingProfileName      string
@@ -2292,6 +2293,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if key == "ctrl+d" {
 			m.topCardOpen = !m.topCardOpen
+			if !m.topCardOpen {
+				m.topCardPage = 0
+			}
+			m.resize()
+			return m, nil
+		}
+		if m.topCardOpen && key == "left" {
+			m.topCardPage = 0
+			m.resize()
+			return m, nil
+		}
+		if m.topCardOpen && key == "right" {
+			m.topCardPage = 1
 			m.resize()
 			return m, nil
 		}

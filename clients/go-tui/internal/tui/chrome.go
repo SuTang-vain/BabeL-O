@@ -104,6 +104,9 @@ func (m model) renderTopCard(width int) string {
 	if !m.topCardOpen {
 		return ""
 	}
+	if m.topCardPage == 1 {
+		return m.renderTopCardTaskPage(width)
+	}
 	innerWidth := max(20, width-4)
 	title := focusedLineStyle.Render(truncatePlain(firstNonEmpty(m.input.Value(), "Ready for the next turn"), innerWidth))
 	modelLine := strings.TrimSpace(strings.Join([]string{
@@ -128,7 +131,7 @@ func (m model) renderTopCard(width int) string {
 		statusStyle.Render(truncatePlain(usage, innerWidth)),
 		"",
 		columns,
-		mutedStyle.Render(truncatePlain("ctrl+d close · /tools audit · /context inspect", innerWidth)),
+		mutedStyle.Render(truncatePlain("page 1 → · ctrl+d close · /tools audit · /context inspect", innerWidth)),
 	}, "\n")
 	frameWidth := max(0, width-2)
 	frame := topCardFrameStyle.Width(frameWidth)
@@ -139,6 +142,39 @@ func (m model) renderTopCard(width int) string {
 		}
 	}
 	return frame.Render(content)
+}
+
+// renderTopCardTaskPage renders page 1 of the Ctrl+D top card:
+// a compact task list sourced from m.taskBoard. Each task shows
+// title and status. If the list exceeds the available height, a
+// "+N more" hint is appended.
+func (m model) renderTopCardTaskPage(width int) string {
+	innerWidth := max(20, width-4)
+	title := fmt.Sprintf("Tasks · %s", shortID(m.sessionID))
+	summary := summarizeTaskBoard(m.taskBoard)
+	allLines := buildTaskBoardLines(m.taskBoard)
+	// Reserve space for header, summary, bottom hint, and frame
+	// chrome (~6 lines). Clamp visible lines so the card stays
+	// within the terminal height.
+	maxVisible := max(1, m.height-8)
+	visible := allLines
+	overflow := ""
+	if len(visible) > maxVisible {
+		visible = visible[:maxVisible]
+		overflow = mutedStyle.Render(fmt.Sprintf("+%d more · open /tasks for full list", len(allLines)-maxVisible))
+	}
+	lines := []string{
+		focusedLineStyle.Render(truncatePlain(title, innerWidth)),
+		mutedStyle.Render(truncatePlain(summary, innerWidth)),
+		"",
+	}
+	lines = append(lines, visible...)
+	if overflow != "" {
+		lines = append(lines, overflow)
+	}
+	lines = append(lines, "", mutedStyle.Render(truncatePlain("← page 0 · ctrl+d close · /tasks full view", innerWidth)))
+	content := strings.Join(lines, "\n")
+	return topCardFrameStyle.Width(max(0, width-2)).Render(content)
 }
 
 func (m model) formatContextUsageLabel() string {
