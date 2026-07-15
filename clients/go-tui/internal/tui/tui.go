@@ -3158,20 +3158,31 @@ case modeActivityOverlay:
 				}
 				return m, nil
 			case "down", "j", "tab":
-				if m.modelPickProviderIdx < len(m.modelCatalog.Providers)-1 {
+				// +1 for "Add Custom Provider" entry at idx 0
+				if m.modelPickProviderIdx < len(m.modelCatalog.Providers) {
 					m.modelPickProviderIdx++
 				}
 				return m, nil
 			case "enter":
-				if m.modelPickProviderIdx >= 0 && m.modelPickProviderIdx < len(m.modelCatalog.Providers) {
-					p := m.modelCatalog.Providers[m.modelPickProviderIdx]
+				// First entry (idx 0) = "Add Custom Provider"
+				if m.modelPickProviderIdx == 0 {
+					m.addProviderName = ""
+					m.addProviderProtocol = 0
+					m.addProviderURL = ""
+					m.addProviderKey = ""
+					m.addProviderError = ""
+					m.addProviderVerifying = false
+					m.addProviderModels = nil
+					m.setInputValue("")
+					m.setMode(modeAddProviderName)
+					return m, nil
+				}
+				// Regular provider (idx-1 because of "Add" entry at 0)
+				providerIdx := m.modelPickProviderIdx - 1
+				if providerIdx >= 0 && providerIdx < len(m.modelCatalog.Providers) {
+					p := m.modelCatalog.Providers[providerIdx]
 					m.modelPickSelectedID = p.ID
 					m.modelPickError = ""
-					// No-auth providers can enter the model picker
-					// immediately. API-key / bearer providers always
-					// show the credential step so the user can paste
-					// or replace a key; if a global provider key is
-					// already saved, an empty Enter keeps it.
 					if p.AuthMode == "none" {
 						return m, m.enterModelPicker()
 					}
