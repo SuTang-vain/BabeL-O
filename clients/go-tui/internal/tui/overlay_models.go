@@ -141,8 +141,13 @@ func (m model) renderModelOverlay(width int) string {
 // Reset per-step state (selection index, draft input) so
 // re-entering /model from a previous partially-completed
 // flow doesn't carry stale state.
+// Index 0 is "Add Custom Provider...", so default to 1 (first real provider)
+// if providers exist.
 func (m *model) openModelRegistry() {
 	m.modelPickProviderIdx = 0
+	if len(m.modelCatalog.Providers) > 0 {
+		m.modelPickProviderIdx = 1
+	}
 	m.modelPickSelectedIdx = 0
 	m.modelPickSelectedID = ""
 	m.modelPickProviderDraft = ""

@@ -9806,7 +9806,7 @@ func TestModelPickConfiguredProviderStillShowsApiKeyStep(t *testing.T) {
 			AuthSource:     "provider_config",
 		}},
 	}
-	m.setMode(modeModelPickProvider)
+	m.openModelRegistry()
 
 	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
@@ -9818,7 +9818,7 @@ func TestModelPickConfiguredProviderStillShowsApiKeyStep(t *testing.T) {
 		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickApiKey)
 	}
 	if m.modelPickSelectedID != "minimax" {
-		t.Fatalf("modelPickSelectedID = %q, want minimax", m.modelPickSelectedID)
+		t.Fatalf("modelPickSelectedID = %q, want minimix", m.modelPickSelectedID)
 	}
 }
 
@@ -9833,7 +9833,7 @@ func TestModelPickNoAuthProviderSkipsApiKeyStep(t *testing.T) {
 			Configured:   true,
 		}},
 	}
-	m.setMode(modeModelPickProvider)
+	m.openModelRegistry()
 
 	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
