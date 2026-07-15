@@ -2,6 +2,7 @@ import type { ModelAdapter } from './adapters/ModelAdapter.js'
 import { AnthropicAdapter } from './adapters/AnthropicAdapter.js'
 import { OpenAIAdapter } from './adapters/OpenAIAdapter.js'
 import { LocalAdapter } from './adapters/LocalAdapter.js'
+import { readFileSync, existsSync } from 'node:fs'
 
 export type ProviderAdapter =
   | 'anthropic-compatible'
@@ -1026,10 +1027,19 @@ export const modelRegistry: ModelDefinition[] = [
 
 export function getProvider(id: string): ProviderDefinition {
   const provider = providerRegistry.find(p => p.id === id)
-  if (!provider) {
-    throw new UnknownProviderError(id)
+  if (provider) return provider
+  // Custom provider from user config: default to openai-compatible.
+  // The adapter, authMode, and baseUrl are resolved at runtime from
+  // ConfigManager (see getAdapter / inspectModelCapabilities), so the
+  // registry entry is a placeholder that carries the provider ID.
+  return {
+    id,
+    displayName: id,
+    adapter: 'openai-compatible',
+    authMode: 'bearer',
+    defaultModel: `${id}/custom`,
+    models: [`${id}/custom`],
   }
-  return provider
 }
 
 export function getModel(id: string): ModelDefinition {
@@ -1189,7 +1199,13 @@ export function getAdapter(providerId: string): ModelAdapter {
   const override = adapterOverrides.get(providerId)
   if (override) return override
   const provider = getProvider(providerId)
-  switch (provider.adapter) {
+  // Check for a user-configured adapter override in config.json.
+  // This allows custom providers to choose the wire protocol without
+  // modifying the registry. See ProviderConfig.adapter.
+  const configPath = process.env.BABEL_O_CONFIG_FILE
+  const configAdapter = configPath ? readUserConfigAdapter(providerId, configPath) : undefined
+  const effectiveAdapter = configAdapter ?? provider.adapter
+  switch (effectiveAdapter) {
     case 'anthropic-compatible':
       return new AnthropicAdapter()
     case 'openai-compatible':
@@ -1198,6 +1214,18 @@ export function getAdapter(providerId: string): ModelAdapter {
     case 'local':
       return new LocalAdapter()
     default:
-      throw new Error(`No adapter found for provider type: ${provider.adapter}`)
+      throw new Error(`No adapter found for provider type: ${effectiveAdapter}`)
   }
+}
+
+function readUserConfigAdapter(providerId: string, configPath: string): ProviderAdapter | undefined {
+  try {
+    if (!existsSync(configPath)) return undefined
+    const raw = JSON.parse(readFileSync(configPath, 'utf-8'))
+    const adapter = raw.providers?.[providerId]?.adapter
+    if (adapter === 'anthropic-compatible' || adapter === 'openai-compatible') return adapter
+  } catch {
+    // Silently ignore
+  }
+  return undefined
 }

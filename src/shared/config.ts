@@ -9,6 +9,10 @@ import { getSecret, setSecret, deleteSecret, isKeychainAvailable, getSecretStora
 export interface ProviderConfig {
   apiKey?: string;
   baseUrl?: string;
+  /** Custom adapter override. When set, the runtime uses this adapter
+   * instead of the registry default. Only 'anthropic-compatible' and
+   * 'openai-compatible' are supported. */
+  adapter?: 'anthropic-compatible' | 'openai-compatible';
 }
 
 export interface ProfileConfig {
@@ -176,6 +180,7 @@ export function validateModelSelectionAuth(
 export const ProviderConfigSchema = z.object({
   apiKey: z.string().min(1, 'API key cannot be empty').optional(),
   baseUrl: z.string().url('Base URL must be a valid URL').optional(),
+  adapter: z.enum(['anthropic-compatible', 'openai-compatible']).optional(),
 });
 
 export const ProfileConfigSchema = z.object({

@@ -3385,11 +3385,7 @@ case modeActivityOverlay:
 		previousVersion := m.configVersion
 		m.applyRuntimeConfig(msg.config)
 		if msg.config.Version > previousVersion {
-			// Suppress the config-updated status line — it's operational
-		// telemetry that clutters the transcript without informing the
-		// operator. The header chrome already shows the active model
-		// and provider; the config version is an internal detail.
-		_ = formatRuntimeConfig(msg.config) // keep function reachable for tests
+			m.appendLine("status", "config updated: "+formatRuntimeConfig(msg.config))
 		}
 		return m, m.schedulePollTick()
 
