@@ -207,7 +207,7 @@ test('POST /v1/runtime/config/provider saves provider credentials without leakin
   }
 })
 
-test('POST /v1/runtime/config/provider rejects unknown providers', async () => {
+test('POST /v1/runtime/config/provider accepts unknown providers for custom provider support', async () => {
   resetProfiles()
 
   const { runtime, storage } = await createDefaultNexusRuntime()
@@ -216,10 +216,14 @@ test('POST /v1/runtime/config/provider rejects unknown providers', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/runtime/config/provider',
-      payload: { provider: 'not-real', apiKey: 'secret' },
+      payload: { provider: 'custom-provider', apiKey: 'secret', baseUrl: 'https://api.custom.com/v1' },
     })
-    assert.equal(response.statusCode, 400)
-    assert.equal(response.json().error, 'unknown_provider')
+    // Now accepts custom providers — saves config and returns 200
+    assert.equal(response.statusCode, 200)
+    // Verify the config was saved
+    const savedConfig = manager.getProviderConfig('custom-provider')
+    assert.equal(savedConfig.apiKey, 'secret')
+    assert.equal(savedConfig.baseUrl, 'https://api.custom.com/v1')
   } finally {
     await app.close()
   }

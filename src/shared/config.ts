@@ -251,13 +251,7 @@ export const BabelOConfigSchema = z.object({
 
   if (data.providers) {
     for (const providerId of Object.keys(data.providers)) {
-      if (!providerRegistry.some(p => p.id === providerId)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Unknown provider ID: ${providerId}`,
-          path: ['providers', providerId],
-        });
-      }
+      // Allow custom providers — getProvider() returns a fallback for unknown IDs
     }
   }
 
