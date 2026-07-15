@@ -1,5 +1,5 @@
 import { ConfigManager, type ProfileConfig } from '../../shared/config.js'
-import { modelRegistry, providerRegistry } from '../../providers/registry.js'
+import { modelRegistry, providerRegistry, getProvider } from '../../providers/registry.js'
 import type { FeatureRouter } from '../router.js'
 
 type RuntimeProviderAuthSource = 'none' | 'env' | 'profile' | 'provider_config'
@@ -63,16 +63,25 @@ export const runtimeModelsRouter: FeatureRouter = {
     app.get('/v1/runtime/models', async () => {
       const manager = ConfigManager.getInstance()
       const settings = manager.resolveSettings()
+      const config = manager.load()
+
+      // Merge registry providers with user-configured custom providers
+      const userProviderIds = Object.keys(config.providers || {})
+      const registryProviderIds = providerRegistry.map(p => p.id)
+      const allProviderIds = [...new Set([...registryProviderIds, ...userProviderIds])]
+
       return {
         type: 'runtime_models',
         version: manager.getConfigVersion(),
         tombstones: manager.getTombstones(),
-        providers: providerRegistry.map(p => {
-          const authState = resolveProviderAuthState(manager, p.id)
+        providers: allProviderIds.map(providerId => {
+          const p = getProvider(providerId)
+          const authState = resolveProviderAuthState(manager, providerId)
+          const userConfig = manager.getProviderConfig(providerId)
           return {
             id: p.id,
             displayName: p.displayName,
-            adapter: p.adapter,
+            adapter: userConfig.adapter || p.adapter,
             authMode: p.authMode,
             defaultBaseUrl: p.defaultBaseUrl,
             defaultModel: p.defaultModel,
