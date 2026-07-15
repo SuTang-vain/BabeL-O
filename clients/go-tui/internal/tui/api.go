@@ -102,6 +102,55 @@ func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, bas
 	}
 }
 
+type providerVerifyMsg struct {
+	providerID string
+	success    bool
+	models     []registeredModel
+	error      string
+	errorDetail string
+}
+
+func verifyProviderConfig(cfg Config, providerID string, adapter string, baseURL string, apiKey string) tea.Cmd {
+	return func() tea.Msg {
+		body := map[string]interface{}{
+			"provider": providerID,
+			"adapter":  adapter,
+			"baseUrl":  baseURL,
+			"apiKey":   apiKey,
+		}
+		var payload struct {
+			Success     bool   `json:"success"`
+			Provider    string `json:"provider"`
+			Models      []struct {
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"models"`
+			Error       string `json:"error"`
+			ErrorDetail string `json:"errorDetail"`
+		}
+		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/provider/verify", body, &payload)
+		if err != nil {
+			return providerVerifyMsg{
+				providerID:  providerID,
+				success:     false,
+				error:       "network_error",
+				errorDetail: err.Error(),
+			}
+		}
+		models := make([]registeredModel, len(payload.Models))
+		for i, m := range payload.Models {
+			models[i] = registeredModel{ID: m.ID, Name: m.Name}
+		}
+		return providerVerifyMsg{
+			providerID:  providerID,
+			success:     payload.Success,
+			models:      models,
+			error:       payload.Error,
+			errorDetail: payload.ErrorDetail,
+		}
+	}
+}
+
 func fetchMemoryStatus(cfg Config) tea.Cmd {
 	return func() tea.Msg {
 		raw, err := nexusRawJSON(cfg, http.MethodGet, "/v1/runtime/memory/status", nil)

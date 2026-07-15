@@ -997,6 +997,12 @@ const (
 	modeModelPickApiKey   inputMode = "modelPickApiKey"   // /model step 2: API key entry
 	modeModelPickBaseURL  inputMode = "modelPickBaseURL"  // /model step 3: base URL entry
 	modeModelPickModel    inputMode = "modelPickModel"    // /model step 4: model select
+	// Custom provider wizard states
+	modeAddProviderName     inputMode = "addProviderName"     // custom provider: enter name
+	modeAddProviderProtocol inputMode = "addProviderProtocol" // custom provider: select protocol
+	modeAddProviderURL      inputMode = "addProviderURL"      // custom provider: enter base URL
+	modeAddProviderKey      inputMode = "addProviderKey"      // custom provider: enter API key
+	modeAddProviderVerify   inputMode = "addProviderVerify"   // custom provider: verify & fetch models
 	modeQuitConfirm       inputMode = "quitConfirm"       // y/enter confirms quit, esc/n cancels
 	// Phase A.1 Round 2 of the enhanced permission panel:
 	// inline text editors reached from the 5-option panel.
@@ -1330,6 +1336,14 @@ type model struct {
 	// second press can't fire a duplicate POST, and the
 	// renderer swaps the list for a "saving…" line.
 	modelPickSubmitting bool
+	// Custom provider wizard state
+	addProviderName       string // provider ID entered by user
+	addProviderProtocol   int    // 0 = OpenAI-compatible, 1 = Anthropic-compatible
+	addProviderURL        string // base URL
+	addProviderKey        string // API key
+	addProviderVerifying  bool   // true while verify request is in flight
+	addProviderModels     []registeredModel
+	addProviderError      string
 	width               int
 	height              int
 }
