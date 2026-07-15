@@ -3286,6 +3286,121 @@ case modeActivityOverlay:
 				return m, tea.Batch(m.showTransientStatus(notice), selectRuntimeModel(m.cfg, selectedModel.ID))
 			}
 			return m, nil
+			// --- Custom provider wizard states ---
+			case modeAddProviderName:
+				switch key {
+				case "esc":
+					m.setMode(modeModelPickProvider)
+					return m, nil
+				case "enter":
+					name := strings.TrimSpace(m.input.Value())
+					if name == "" {
+						m.addProviderError = "Provider name cannot be empty"
+						return m, nil
+					}
+					if strings.Contains(name, " ") {
+						m.addProviderError = "Provider name must not contain spaces"
+						return m, nil
+					}
+					m.addProviderName = name
+					m.addProviderError = ""
+					m.setInputValue("")
+					m.setMode(modeAddProviderProtocol)
+					return m, nil
+				}
+				m.addProviderError = ""
+				return m, m.updateInput(msg)
+
+			case modeAddProviderProtocol:
+				switch key {
+				case "esc":
+					m.setMode(modeAddProviderName)
+					return m, nil
+				case "up", "k":
+					if m.addProviderProtocol > 0 {
+						m.addProviderProtocol--
+					}
+					return m, nil
+				case "down", "j", "tab":
+					if m.addProviderProtocol < 1 {
+						m.addProviderProtocol++
+					}
+					return m, nil
+				case "enter":
+					m.setInputValue("")
+					m.setMode(modeAddProviderURL)
+					return m, nil
+				}
+				return m, nil
+
+			case modeAddProviderURL:
+				switch key {
+				case "esc":
+					m.setMode(modeAddProviderProtocol)
+					return m, nil
+				case "enter":
+					url := strings.TrimSpace(m.input.Value())
+					if url == "" {
+						m.addProviderError = "Base URL is required"
+						return m, nil
+					}
+					if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+						m.addProviderError = "URL must start with http:// or https://"
+						return m, nil
+					}
+					m.addProviderURL = url
+					m.addProviderError = ""
+					m.setInputValue("")
+					m.setMode(modeAddProviderKey)
+					return m, nil
+				}
+				m.addProviderError = ""
+				return m, m.updateInput(msg)
+
+			case modeAddProviderKey:
+				switch key {
+				case "esc":
+					m.setMode(modeAddProviderURL)
+					return m, nil
+				case "enter":
+					key := m.addProviderKey
+					if key == "" {
+						m.addProviderError = "API key is required"
+						return m, nil
+					}
+					m.addProviderError = ""
+					m.addProviderVerifying = true
+					m.setMode(modeAddProviderVerify)
+					adapter := "openai-compatible"
+					if m.addProviderProtocol == 1 {
+						adapter = "anthropic-compatible"
+					}
+					return m, verifyProviderConfig(m.cfg, m.addProviderName, adapter, m.addProviderURL, key)
+				}
+				if m.handleModelAPIKeyInput(msg) {
+					return m, nil
+				}
+				return m, nil
+
+			case modeAddProviderVerify:
+				if m.addProviderVerifying {
+					return m, nil
+				}
+				switch key {
+				case "esc":
+					if m.addProviderError != "" {
+						m.setMode(modeAddProviderKey)
+					} else {
+						m.setMode(modeModelPickProvider)
+					}
+					return m, nil
+				case "enter":
+					return m, tea.Batch(
+						saveRuntimeProviderConfig(m.cfg, m.addProviderName, m.addProviderKey, m.addProviderURL),
+						fetchRuntimeModels(m.cfg, "add-provider"),
+					)
+				}
+				return m, nil
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -3542,6 +3657,20 @@ case modeActivityOverlay:
 			}
 		}
 		return m, tea.Batch(m.showTransientStatus("provider configured: "+msg.providerID), m.enterModelPicker())
+
+	case providerVerifyMsg:
+		m.addProviderVerifying = false
+		if !msg.success {
+			m.addProviderError = msg.errorDetail
+			if msg.error != "" {
+				m.addProviderError = msg.error + ": " + msg.errorDetail
+			}
+			m.appendLine("error", "provider verify failed: "+m.addProviderError)
+			return m, nil
+		}
+		m.addProviderModels = msg.models
+		m.addProviderError = ""
+		return m, nil
 
 	case contextAnalysisMsg:
 		if msg.err != nil {
@@ -3915,6 +4044,11 @@ func (m model) nonTranscriptChromeHeight(width int) int {
 		m.renderModelPickApiKey(width),
 		m.renderModelPickBaseURL(width),
 		m.renderModelPickModel(width),
+		m.renderAddProviderName(width),
+		m.renderAddProviderProtocol(width),
+		m.renderAddProviderURL(width),
+		m.renderAddProviderKey(width),
+		m.renderAddProviderVerify(width),
 		m.renderQuitConfirm(width),
 	} {
 		if part != "" {
@@ -3966,6 +4100,11 @@ func (m model) viewString() string {
 	modelPickApiKey := m.renderModelPickApiKey(width)
 	modelPickBaseURL := m.renderModelPickBaseURL(width)
 	modelPickModel := m.renderModelPickModel(width)
+	addProviderName := m.renderAddProviderName(width)
+	addProviderProtocol := m.renderAddProviderProtocol(width)
+	addProviderURL := m.renderAddProviderURL(width)
+	addProviderKey := m.renderAddProviderKey(width)
+	addProviderVerify := m.renderAddProviderVerify(width)
 	skillListOverlay := m.renderSkillListOverlay(width)
 	skillShowOverlay := m.renderSkillShowOverlay(width)
 skillValidateOverlay := m.renderSkillValidateOverlay(width)
@@ -4014,6 +4153,21 @@ skillValidateOverlay := m.renderSkillValidateOverlay(width)
 	}
 	if modelPickModel != "" {
 		parts = append(parts, modelPickModel)
+	}
+	if addProviderName != "" {
+		parts = append(parts, addProviderName)
+	}
+	if addProviderProtocol != "" {
+		parts = append(parts, addProviderProtocol)
+	}
+	if addProviderURL != "" {
+		parts = append(parts, addProviderURL)
+	}
+	if addProviderKey != "" {
+		parts = append(parts, addProviderKey)
+	}
+	if addProviderVerify != "" {
+		parts = append(parts, addProviderVerify)
 	}
 	if skillListOverlay != "" {
 		parts = append(parts, skillListOverlay)
@@ -4075,6 +4229,11 @@ func (m model) renderFullScreenOverlay(width int) string {
 		m.renderModelPickApiKey(width),
 		m.renderModelPickBaseURL(width),
 		m.renderModelPickModel(width),
+		m.renderAddProviderName(width),
+		m.renderAddProviderProtocol(width),
+		m.renderAddProviderURL(width),
+		m.renderAddProviderKey(width),
+		m.renderAddProviderVerify(width),
 		m.renderSkillListOverlay(width),
 		m.renderSkillShowOverlay(width),
 		m.renderSkillValidateOverlay(width),
