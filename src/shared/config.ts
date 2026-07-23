@@ -59,6 +59,20 @@ export interface BabelOConfig {
   };
   hooks?: HooksConfig;
   providerAutoRetry?: ProviderAutoRetryConfig;
+  /**
+   * Runtime loop-budget tuning. When omitted, defaults are applied
+   * internally (see LLMCodingRuntime). All fields are optional.
+   */
+  runtime?: {
+    /**
+     * Number of iterations reserved for the finalization window before
+     * maxLoops. When loopCount enters this window, the runtime narrows
+     * visible tools to read-only (final_check) then hides them
+     * (must_respond). Default 5. Increase to give the model more
+     * convergence room; decrease to force earlier finalization.
+     */
+    finalResponseOnlyRemainingLoops?: number;
+  };
 }
 
 export type BabeLXConfigImportProfile = {
@@ -231,6 +245,9 @@ export const BabelOConfigSchema = z.object({
   }).optional(),
   hooks: HooksConfigSchema.optional(),
   providerAutoRetry: ProviderAutoRetryConfigSchema.optional(),
+  runtime: z.object({
+    finalResponseOnlyRemainingLoops: z.number().int().positive().optional(),
+  }).optional(),
 }).superRefine((data, ctx) => {
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;

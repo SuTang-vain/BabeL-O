@@ -3024,18 +3024,20 @@ describe('LLMCodingRuntime', () => {
   })
 
   test('final_check allows one read-only check then must_respond hides tools and refuses further calls', async () => {
-    // Phase D: when the loop enters the finalization reserve (remaining <= 3)
+    // Phase D: when the loop enters the finalization reserve (remaining <= 5)
     // and the one bounded check is unused, the runtime narrows visible tools to
     // the read-only whitelist (final_check) instead of hiding them. The model
     // gets ONE read-only check; after it executes, the next turn is must_respond
     // (tools hidden, further tool calls refused with TOOL_LOOP_FINAL_RESPONSE_ONLY).
     // See docs/nexus/reference/runtime-tool-loop-governance-plan.md Phase D.
+    // Note: default reserve bumped from 3 to 5; with maxLoops=25 (balanced),
+    // final_check starts at iteration 20 (remaining=5).
     const cwd = join(tmpdir(), `babel-o-test-tool-loop-guard-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })
     const targetFile = join(cwd, 'notes.txt')
     fs.writeFileSync(targetFile, 'loop guard fixture', 'utf8')
 
-    for (let i = 1; i <= 21; i++) {
+    for (let i = 1; i <= 19; i++) {
       fetchStreamResponses.push(
         createMockStream([
           'event: content_block_start\n',
@@ -3049,7 +3051,7 @@ describe('LLMCodingRuntime', () => {
         ]),
       )
     }
-    // Iteration 22 (remaining=3, final_check): the one bounded read-only check
+    // Iteration 20 (remaining=5, final_check): the one bounded read-only check
     // is ALLOWED to pass through (Read is on the read-only whitelist).
     fetchStreamResponses.push(
       createMockStream([
@@ -3063,19 +3065,19 @@ describe('LLMCodingRuntime', () => {
         'data: {"index":0}\n\n',
       ]),
     )
-    // Iteration 23 (remaining=2, must_respond): a further tool call is REFUSED
+    // Iteration 21 (remaining=4, must_respond): a further tool call is REFUSED
     // with TOOL_LOOP_FINAL_RESPONSE_ONLY (backstop semantics unchanged).
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
-        'data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-blocked","name":"Read","input":{}}}\n\n',
+        `data: {"index":0,"content_block":{"type":"tool_use","id":"tool-call-blocked","name":"Read","input":{}}}\n\n`,
         'event: content_block_delta\n',
         'data: {"index":0,"delta":{"type":"input_json_delta","partial_json":"{\\"path\\":\\"notes.txt\\"}"}}\n\n',
         'event: content_block_stop\n',
         'data: {"index":0}\n\n',
       ]),
     )
-    // Iteration 24 (must_respond): final answer from existing evidence.
+    // Iteration 22 (must_respond): final answer from existing evidence.
     fetchStreamResponses.push(
       createMockStream([
         'event: content_block_start\n',
@@ -3102,20 +3104,20 @@ describe('LLMCodingRuntime', () => {
     } catch {}
 
     const toolStartedEvents = events.filter(event => event.type === 'tool_started')
-    // 21 normal Reads + 1 final_check Read execute; the must_respond Read is refused.
-    assert.equal(toolStartedEvents.length, 22)
+    // 19 normal Reads + 1 final_check Read execute; the must_respond Read is refused.
+    assert.equal(toolStartedEvents.length, 20)
     assert.ok(toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-final-check'))
     assert.ok(!toolStartedEvents.some(event => (event as any).toolUseId === 'tool-call-blocked'))
 
-    // final_check (iteration 22 = fetchCalls[21]): tools narrowed to the read-only
+    // final_check (iteration 20 = fetchCalls[19]): tools narrowed to the read-only
     // whitelist, not hidden. System prompt advertises the one bounded check.
-    const finalCheckBody = JSON.parse(String(fetchCalls[21].init?.body))
+    const finalCheckBody = JSON.parse(String(fetchCalls[19].init?.body))
     const finalCheckToolNames = (finalCheckBody.tools ?? []).map((t: any) => t.name)
     assert.deepEqual(finalCheckToolNames.sort(), ['Glob', 'Grep', 'ListDir', 'Read', 'TaskCreate', 'TaskList', 'TaskUpdate'])
     assert.match(JSON.stringify(finalCheckBody.system), /ONE bounded read-only check/)
 
-    // must_respond (iteration 23 = fetchCalls[22]): tools hidden, further call refused.
-    const mustRespondBody = JSON.parse(String(fetchCalls[22].init?.body))
+    // must_respond (iteration 21 = fetchCalls[20]): tools hidden, further call refused.
+    const mustRespondBody = JSON.parse(String(fetchCalls[20].init?.body))
     assert.equal(mustRespondBody.tools, undefined)
     assert.match(JSON.stringify(mustRespondBody.system), /Runtime has hidden all tools/)
 
@@ -3137,7 +3139,10 @@ describe('LLMCodingRuntime', () => {
     const targetFile = join(cwd, 'notes.txt')
     fs.writeFileSync(targetFile, 'final-only leakage fixture', 'utf8')
 
-    for (let i = 1; i <= 21; i++) {
+    // Default reserve is 5; with maxLoops=25 (balanced), final_check starts at
+    // iteration 20 (remaining=5). So iterations 1-19 are gathering; iteration
+    // 20 enters final_check where the text-leak stream is emitted.
+    for (let i = 1; i <= 19; i++) {
       fetchStreamResponses.push(
         createMockStream([
           'event: content_block_start\n',
@@ -3187,7 +3192,7 @@ describe('LLMCodingRuntime', () => {
     } catch {}
 
     const toolStartedEvents = events.filter(event => event.type === 'tool_started')
-    assert.equal(toolStartedEvents.length, 21)
+    assert.equal(toolStartedEvents.length, 19)
     assert.ok(!events.some(event => event.type === 'assistant_delta' && JSON.stringify(event).includes('<tool_call>')))
     assert.ok(!events.some(event => event.type === 'assistant_delta' && JSON.stringify(event).includes('pwd')))
 

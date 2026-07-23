@@ -116,7 +116,12 @@ import {
   type ProviderAutoRetryState,
 } from './providerRetry.js'
 
-const FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 3
+// Default finalization reserve window. When `maxLoops - loopCount` falls
+// at or below this value, the runtime enters final_check (read-only tools
+// only) then must_respond (tools hidden). Overridable via
+// `config.runtime.finalResponseOnlyRemainingLoops`. Bumped from 3 to 5 to
+// give the model more convergence room before the finalization gate.
+const DEFAULT_FINAL_RESPONSE_ONLY_REMAINING_LOOPS = 5
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<unknown> {
   return typeof value === 'object' && value !== null && Symbol.asyncIterator in value
@@ -629,6 +634,13 @@ export class LLMCodingRuntime implements NexusRuntime {
 
       let loopCount = 0
       const maxLoops = thinkingProfile.maxLoops
+      // Configurable finalization reserve window (default 5). When
+      // `maxLoops - loopCount` falls at or below this value the runtime
+      // enters final_check then must_respond. Overridable via
+      // `config.runtime.finalResponseOnlyRemainingLoops`.
+      const finalResponseOnlyRemainingLoops =
+        this.configManager.load().runtime?.finalResponseOnlyRemainingLoops
+        ?? DEFAULT_FINAL_RESPONSE_ONLY_REMAINING_LOOPS
       let finalResponseOnlyMode = false
       // Phase D: tracks whether the one bounded read-only `final_check` has
       // been used. Set after a read-only tool dispatch in final_check so the
@@ -681,7 +693,7 @@ export class LLMCodingRuntime implements NexusRuntime {
           compactPercent: contextCompactPercent,
           suppressToolsForUserIntent: suppressToolsForCurrentIntent,
           cacheAwareCompactPolicy,
-          finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+          finalResponseOnlyRemainingLoops,
           finalCheckUsed,
           repeatedToolInputs: findRepeatedToolInputs(previousEvents).slice(0, 1),
         })
@@ -782,7 +794,7 @@ export class LLMCodingRuntime implements NexusRuntime {
             compactPercent: contextCompactPercent,
             suppressToolsForUserIntent: suppressToolsForCurrentIntent,
             cacheAwareCompactPolicy,
-            finalResponseOnlyRemainingLoops: FINAL_RESPONSE_ONLY_REMAINING_LOOPS,
+            finalResponseOnlyRemainingLoops,
             finalCheckUsed,
             repeatedToolInputs: findRepeatedToolInputs(previousEvents).slice(0, 1),
           })

@@ -274,7 +274,7 @@ export function buildRuntimeExecutionStateBlock(state: {
   if (phase === 'synthesize') {
     lines.push('  → Present your findings now. Only read more if critical information is missing.')
   } else if (phase === 'final_check') {
-    lines.push('  → You get ONE bounded read-only check (Read/Grep/Glob/ListDir) before the runtime hides all tools. Write/execute tools are denied. Use it to confirm a missing detail, then answer.')
+    lines.push('  -> You get ONE bounded read-only check (Read/Grep/Glob/ListDir) before the runtime hides all tools. Write/execute tools are routed to the permission flow for explicit user approval rather than auto-denied. Use the read-only check to confirm a missing detail, then answer.')
   } else if (phase === 'must_respond') {
     lines.push('  → Runtime has hidden all tools for this request. You MUST produce your final answer immediately.')
   }

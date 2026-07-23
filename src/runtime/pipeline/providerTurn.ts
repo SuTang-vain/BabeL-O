@@ -47,8 +47,9 @@ export function reduceProviderTurnOutcome(options: {
   finalResponseOnlyMode: boolean
   // Phase D: when true, the runtime is in the `final_check` sub-state — one
   // bounded read-only check (Read/Grep/Glob/ListDir) is allowed before
-  // must_respond. Non-read-only tool calls are denied with
-  // TOOL_DENIED_FINAL_CHECK; read-only tool calls pass through.
+  // must_respond. Non-read-only tool calls are routed through the normal
+  // permission flow (FINAL_CHECK_WRITE_ROUTED) instead of being hard-denied;
+  // read-only tool calls pass through.
   finalCheckPhase?: boolean
   suppressToolsForUserIntent: boolean
   // True when the user has re-typed an option-like input to confirm a prior
@@ -154,30 +155,44 @@ export function reduceProviderTurnOutcome(options: {
   if (options.finalCheckPhase && turn.toolCalls.length > 0) {
     const nonReadOnly = turn.toolCalls.filter(toolCall => !FINAL_CHECK_READ_ONLY.has(toolCall.name))
     if (nonReadOnly.length > 0) {
-      const deniedTools = nonReadOnly.map(toolCall => toolCall.name).join(', ')
-      const message = `final_check: read-only tools only; denied write/execute tool calls (${deniedTools}). The runtime grants one bounded read-only check (Read/Grep/Glob/ListDir) before hiding all tools. Use it to confirm a missing detail, or answer from existing evidence.`
+      const routedTools = nonReadOnly.map(toolCall => toolCall.name).join(', ')
+      // Soft-deny routing (Phase D exception): instead of hard-denying
+      // write/execute tool calls during final_check with
+      // TOOL_DENIED_FINAL_CHECK, route them through the normal permission
+      // flow. Under `policyMode: 'soft-deny'` (Go TUI default) the
+      // permission panel opens so the user can approve or deny; under
+      // `'strict'` the policy gate denies them. Either way the model is
+      // NOT blocked by a final_check-specific hard error - the existing
+      // permission machinery in `executeProviderToolCall` handles it.
+      //
+      // Trade-off: any dispatch in final_check (approved or denied)
+      // consumes the one bounded check (`finalCheckUsed = true` in the
+      // main loop). This prevents runaway retries in the finalization
+      // window. The expanded default reserve (5 iterations, configurable
+      // via `config.runtime.finalResponseOnlyRemainingLoops`) gives the
+      // model more room to complete writes before entering final_check.
+      const message = `final_check: write/execute tool calls (${routedTools}) attempted during finalization window. Routing to the permission flow for user decision.`
+      const assistantMessage = buildProviderAssistantMessage(turn)
       return {
-        kind: 'continue',
+        kind: 'tool_calls',
         eventsBeforeMessages: [
           buildRuntimeErrorEvent({
             sessionId: options.sessionId,
-            code: 'TOOL_DENIED_FINAL_CHECK',
+            code: 'FINAL_CHECK_WRITE_ROUTED',
             message,
             details: {
               severity: 'soft',
               finalCheckPhase: true,
               attemptedTools: turn.toolCalls.map(toolCall => toolCall.name),
-              deniedTools: nonReadOnly.map(toolCall => toolCall.name),
+              routedTools: nonReadOnly.map(toolCall => toolCall.name),
               retryAttempted: false,
               retryExhausted: false,
             },
           }),
         ],
         eventsAfterMessages: [],
-        messages: [{
-          role: 'user',
-          content: `${message}\nDo not re-issue the denied tool. Either call a read-only tool (Read/Grep/Glob/ListDir) for one final confirmation, or produce your final answer now from the evidence already gathered.`,
-        }],
+        messages: [assistantMessage],
+        toolCalls: turn.toolCalls,
         ...baseCounts,
       }
     }

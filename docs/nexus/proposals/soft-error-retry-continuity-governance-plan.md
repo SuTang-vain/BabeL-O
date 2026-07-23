@@ -58,7 +58,7 @@ A runtime signal is **soft** iff the task is still recoverable and the model cou
 | --- | --- |
 | Soft `REQUEST_TIMEOUT` (model still streaming, `softCycleEvents ≥ 1`) | Hard watchdog timeout (`watchdogTimeoutMs` exceeded) |
 | `TOOL_CALL_SUPPRESSED_BY_USER_INTENT` (continue + nudge) | `REQUEST_CANCELLED` (user cancel) |
-| `TOOL_DENIED_FINAL_CHECK` (Phase D soft denial) | Context corrupt / invariant violation |
+| `FINAL_CHECK_WRITE_ROUTED` (Phase D soft routing, renamed from `TOOL_DENIED_FINAL_CHECK` on 2026-07-23) | Context corrupt / invariant violation |
 | `TOOL_LOOP_FINAL_RESPONSE_ONLY` (must_respond backstop) | Provider transport failure |
 | Recoverable tool execution failure (`tool_result is_error=true`) | Storage corruption |
 
@@ -187,7 +187,7 @@ shouldSuppressToolsForIntent({ intent:'pause', actionHint:'respond_only',
 ### Non-regression (must stay green)
 
 - `TOOL_LOOP_FINAL_RESPONSE_ONLY` refusal still fires in `must_respond` ([providerTurn.ts:186](../../src/runtime/pipeline/providerTurn.ts)) — only its *rendering* changes to soft.
-- `TOOL_DENIED_FINAL_CHECK` still denies Writes in `final_check` ([providerTurn.ts:148](../../src/runtime/pipeline/providerTurn.ts)) — only rendering changes.
+- `FINAL_CHECK_WRITE_ROUTED` (renamed from `TOOL_DENIED_FINAL_CHECK` on 2026-07-23) now **routes** Writes in `final_check` through the normal permission flow ([providerTurn.ts:154](../../src/runtime/pipeline/providerTurn.ts)) instead of hard-denying them - under `soft-deny` the user decides via the panel. Rendering stays soft.
 - Hard watchdog (`watchdogTimeoutMs`) still terminates with `retryable: false`.
 - Intent suppression still fires for greeting / pause / pure capability questions (B1 only exempts `self_diagnosis_request`).
 - `MAX_SUPPRESSED_TOOL_RETRIES = 1` unchanged; C3 makes it explicit, does not enlarge it.
