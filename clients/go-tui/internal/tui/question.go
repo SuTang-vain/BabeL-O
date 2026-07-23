@@ -49,12 +49,30 @@ func (m *model) questionSelectedLabels() []string {
 // question response endpoint. Mirrors the sendPermissionDecision
 // pattern but uses the HTTP API instead of the WebSocket channel,
 // since question responses are not tied to the streaming channel.
+//
+// The panel is closed SYNCHRONOUSLY before the HTTP request fires
+// (clearing pendingQuestion + resetting inputMode) so the operator
+// sees immediate feedback on Enter. The HTTP POST runs in the
+// returned goroutine; if it fails the error is surfaced via a
+// pendingQuestionMsg and an error transcript line. Previously the
+// clear happened inside the goroutine after a successful response,
+// which made the panel appear unresponsive (and the cursor state
+// stale) while the network round-trip was in flight; if a concurrent
+// event had already nil'd pendingQuestion, sendQuestionDecision
+// returned a nil cmd and Enter was silently swallowed.
 func (m *model) sendQuestionDecision(selectedIndices []int, selectedLabels []string) tea.Cmd {
 	if m.pendingQuestion == nil {
 		return nil
 	}
 
 	pq := m.pendingQuestion
+	// Close the panel immediately so Enter gives instant feedback.
+	// The HTTP result is delivered asynchronously via
+	// pendingQuestionMsg; a network failure is reported as an
+	// error transcript line rather than re-opening the panel.
+	m.pendingQuestion = nil
+	m.setMode(modeComposing)
+
 	body := map[string]any{
 		"toolUseId":       pq.toolUseID,
 		"selectedIndices": selectedIndices,
@@ -69,8 +87,6 @@ func (m *model) sendQuestionDecision(selectedIndices []int, selectedLabels []str
 		if err != nil {
 			m.appendLine("error", "question response: "+err.Error())
 		} else {
-			m.pendingQuestion = nil
-			m.setMode(modeComposing)
 			m.appendLine("status", fmt.Sprintf("question answered: %d option(s) selected", len(selectedIndices)))
 		}
 		return pendingQuestionMsg{err: err}

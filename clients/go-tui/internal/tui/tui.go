@@ -672,10 +672,10 @@ type runtimeSkillListDiagnostics struct {
 }
 
 type skillsListResponse struct {
-	Type        string                       `json:"type"`
-	OK          bool                         `json:"ok"`
-	Skills      []runtimeSkillListEntry       `json:"skills"`
-	Diagnostics runtimeSkillListDiagnostics  `json:"diagnostics"`
+	Type        string                      `json:"type"`
+	OK          bool                        `json:"ok"`
+	Skills      []runtimeSkillListEntry     `json:"skills"`
+	Diagnostics runtimeSkillListDiagnostics `json:"diagnostics"`
 }
 
 // skillListMsg carries the response of GET /v1/skills.
@@ -693,12 +693,12 @@ type runtimeSkillShowEntry struct {
 }
 
 type skillsShowResponse struct {
-	Type     string                  `json:"type"`
-	OK       bool                    `json:"ok"`
-	Skill    *runtimeSkillShowEntry   `json:"skill,omitempty"`
-	ErrorCode string                 `json:"errorCode,omitempty"`
-	ErrorMessage string              `json:"message,omitempty"`
-	ID       string                  `json:"id,omitempty"`
+	Type         string                 `json:"type"`
+	OK           bool                   `json:"ok"`
+	Skill        *runtimeSkillShowEntry `json:"skill,omitempty"`
+	ErrorCode    string                 `json:"errorCode,omitempty"`
+	ErrorMessage string                 `json:"message,omitempty"`
+	ID           string                 `json:"id,omitempty"`
 }
 
 // skillShowMsg carries the response of GET /v1/skills/:id.
@@ -707,10 +707,10 @@ type skillsShowResponse struct {
 // structured SKILL_NOT_FOUND / SKILL_LOAD_FAILED envelope; in
 // that case the overlay renders the error directly.
 type skillShowMsg struct {
-	raw  []byte
-	env  skillsShowResponse
-	id   string
-	err  error
+	raw []byte
+	env skillsShowResponse
+	id  string
+	err error
 }
 
 type runtimeSkillDiagnostic struct {
@@ -721,26 +721,26 @@ type runtimeSkillDiagnostic struct {
 }
 
 type runtimeSkillValidateEntry struct {
-	OK            bool                     `json:"ok"`
-	SkillID       string                   `json:"skillId,omitempty"`
-	Diagnostics   []runtimeSkillDiagnostic `json:"diagnostics"`
-	ErrorCount    int                      `json:"errorCount"`
-	WarningCount  int                      `json:"warningCount"`
+	OK           bool                     `json:"ok"`
+	SkillID      string                   `json:"skillId,omitempty"`
+	Diagnostics  []runtimeSkillDiagnostic `json:"diagnostics"`
+	ErrorCount   int                      `json:"errorCount"`
+	WarningCount int                      `json:"warningCount"`
 }
 
 type skillsValidateResponse struct {
-	Type string                     `json:"type"`
-	OK   bool                       `json:"ok"`
+	Type string `json:"type"`
+	OK   bool   `json:"ok"`
 	runtimeSkillValidateEntry
 }
 
 // skillValidateMsg carries the response of POST /v1/skills/validate.
 // err is non-nil on transport / decode failure.
 type skillValidateMsg struct {
-	raw  []byte
-	env  skillsValidateResponse
-	id   string
-	err  error
+	raw []byte
+	env skillsValidateResponse
+	id  string
+	err error
 }
 
 // taskStatus mirrors TaskStatus in src/shared/task.ts. The
@@ -964,20 +964,20 @@ type runtimeVersionMsg struct {
 type inputMode string
 
 const (
-	modeComposing         inputMode = "composing"         // textinput owns keys
-	modePermission        inputMode = "permission"        // a/y/r/n/esc only
-	modeSlashPick         inputMode = "slashPick"         // one-shot slash palette (no live filter yet)
-	modeHelpOverlay       inputMode = "helpOverlay"       // read-only help; up/down/esc/enter
-	modeProfileConfirm    inputMode = "profileConfirm"    // y/n/esc only; gates selectRuntimeProfile
-	modeContextOverlay    inputMode = "contextOverlay"    // read-only context analysis; up/down/esc/enter
-	modeInboxOverlay      inputMode = "inboxOverlay"      // read-only SessionChannel inbox; up/down/a/esc/enter/q
-	modeAgentOverlay      inputMode = "agentOverlay"      // read-only multi-agent status; up/down/esc/enter/q
-	modeTaskBoard         inputMode = "taskBoard"         // read-only task board; up/down/esc/enter/q
-	modeActivityOverlay   inputMode = "activityOverlay"   // read-only recent activity; up/down/esc/enter/q
-	modeMemoryOverlay     inputMode = "memoryOverlay"     // read-only /v1/runtime/memory/status wire; up/down/esc/enter/q
-	modeToolAuditOverlay  inputMode = "toolAuditOverlay"  // read-only /v1/tools/audit wire; up/down/esc/enter/q
-	modeModelOverlay      inputMode = "modelOverlay"      // read-only model config/catalog; up/down/esc/enter/q
-	modeEffortOverlay     inputMode = "effortOverlay"     // thinking effort selector; up/down/enter/esc
+	modeComposing        inputMode = "composing"        // textinput owns keys
+	modePermission       inputMode = "permission"       // a/y/r/n/esc only
+	modeSlashPick        inputMode = "slashPick"        // one-shot slash palette (no live filter yet)
+	modeHelpOverlay      inputMode = "helpOverlay"      // read-only help; up/down/esc/enter
+	modeProfileConfirm   inputMode = "profileConfirm"   // y/n/esc only; gates selectRuntimeProfile
+	modeContextOverlay   inputMode = "contextOverlay"   // read-only context analysis; up/down/esc/enter
+	modeInboxOverlay     inputMode = "inboxOverlay"     // read-only SessionChannel inbox; up/down/a/esc/enter/q
+	modeAgentOverlay     inputMode = "agentOverlay"     // read-only multi-agent status; up/down/esc/enter/q
+	modeTaskBoard        inputMode = "taskBoard"        // read-only task board; up/down/esc/enter/q
+	modeActivityOverlay  inputMode = "activityOverlay"  // read-only recent activity; up/down/esc/enter/q
+	modeMemoryOverlay    inputMode = "memoryOverlay"    // read-only /v1/runtime/memory/status wire; up/down/esc/enter/q
+	modeToolAuditOverlay inputMode = "toolAuditOverlay" // read-only /v1/tools/audit wire; up/down/esc/enter/q
+	modeModelOverlay     inputMode = "modelOverlay"     // read-only model config/catalog; up/down/esc/enter/q
+	modeEffortOverlay    inputMode = "effortOverlay"    // thinking effort selector; up/down/enter/esc
 	// Skill execution governance plan (P3 Layer 4) — Go TUI
 	// /skill slash command family. The Nexus endpoints are
 	// already shipped (skillReadRouter / skillActionRouter);
@@ -990,20 +990,21 @@ const (
 	modeSkillListOverlay     inputMode = "skillListOverlay"     // /skill list; up/down/esc/enter/q
 	modeSkillShowOverlay     inputMode = "skillShowOverlay"     // /skill show <id>; up/down/esc/enter/q
 	modeSkillValidateOverlay inputMode = "skillValidateOverlay" // /skill validate <id>; up/down/esc/enter/q
-	modeSessionOverlay    inputMode = "sessionOverlay"    // /session step 1: pick session operation
-	modeSessionConfirm    inputMode = "sessionConfirm"    // /session step 2: confirm new-session reset
-	modeSessionInput      inputMode = "sessionInput"      // /session step 2: enter/select/switch session id
-	modeModelPickProvider inputMode = "modelPickProvider" // /model step 1: provider select
-	modeModelPickApiKey   inputMode = "modelPickApiKey"   // /model step 2: API key entry
-	modeModelPickBaseURL  inputMode = "modelPickBaseURL"  // /model step 3: base URL entry
-	modeModelPickModel    inputMode = "modelPickModel"    // /model step 4: model select
+	modeSessionOverlay       inputMode = "sessionOverlay"       // /session step 1: pick session operation
+	modeSessionConfirm       inputMode = "sessionConfirm"       // /session step 2: confirm new-session reset
+	modeSessionInput         inputMode = "sessionInput"         // /session step 2: enter/select/switch session id
+	modeModelPickProvider    inputMode = "modelPickProvider"    // /model step 1: provider select
+	modeModelPickApiKey      inputMode = "modelPickApiKey"      // /model step 2: API key entry
+	modeModelPickBaseURL     inputMode = "modelPickBaseURL"     // /model step 3: base URL entry
+	modeModelPickModel       inputMode = "modelPickModel"       // /model step 4: model select
 	// Custom provider wizard states
 	modeAddProviderName     inputMode = "addProviderName"     // custom provider: enter name
 	modeAddProviderProtocol inputMode = "addProviderProtocol" // custom provider: select protocol
 	modeAddProviderURL      inputMode = "addProviderURL"      // custom provider: enter base URL
 	modeAddProviderKey      inputMode = "addProviderKey"      // custom provider: enter API key
-	modeAddProviderVerify   inputMode = "addProviderVerify"   // custom provider: verify & fetch models
-	modeQuitConfirm       inputMode = "quitConfirm"       // y/enter confirms quit, esc/n cancels
+	modeAddProviderVerify   inputMode = "addProviderVerify"   // custom provider: verify credentials
+	modeAddProviderModel    inputMode = "addProviderModel"    // custom provider: enter model name
+	modeQuitConfirm         inputMode = "quitConfirm"         // y/enter confirms quit, esc/n cancels
 	// Phase A.1 Round 2 of the enhanced permission panel:
 	// inline text editors reached from the 5-option panel.
 	//   - modePermissionEditRule: textinput owns keys; pre-filled
@@ -1019,7 +1020,7 @@ const (
 	// structured question with predefined options. The operator
 	// navigates with ↑/↓, selects with Enter (single) or space
 	// (multi-select), and confirms with Enter.
-	modeAskUser               inputMode = "askUser"
+	modeAskUser inputMode = "askUser"
 )
 
 // mouseWheelStepLines keeps wheel scrolling close to terminal-native
@@ -1091,7 +1092,11 @@ func (m inputMode) canReceiveTextInput() bool {
 		modePermissionEditFeedback,
 		modeSessionInput,
 		modeModelPickApiKey,
-		modeModelPickBaseURL:
+		modeModelPickBaseURL,
+		modeAddProviderName,
+		modeAddProviderURL,
+		modeAddProviderKey,
+		modeAddProviderModel:
 		return true
 	default:
 		return false
@@ -1099,21 +1104,21 @@ func (m inputMode) canReceiveTextInput() bool {
 }
 
 type model struct {
-	cfg                       Config
-	input                     textarea.Model
-	pastedTextReplacements    map[string]string
-	pastedTextCounter         int
-	viewport                  viewport.Model
-	spinner                   spinner.Model
-	gradientSpinner           gradientSpinner
-	transcript                []*transcriptItem
-	inputMode                 inputMode
-	helpScroll                int
-	running                   bool
-	events                    <-chan streamEvent
-	decisions                 chan<- permissionDecision
-	streamCancel              chan<- struct{}
-	pending                   *pendingPermission
+	cfg                    Config
+	input                  textarea.Model
+	pastedTextReplacements map[string]string
+	pastedTextCounter      int
+	viewport               viewport.Model
+	spinner                spinner.Model
+	gradientSpinner        gradientSpinner
+	transcript             []*transcriptItem
+	inputMode              inputMode
+	helpScroll             int
+	running                bool
+	events                 <-chan streamEvent
+	decisions              chan<- permissionDecision
+	streamCancel           chan<- struct{}
+	pending                *pendingPermission
 	// Phase 6: pending ask_user_question overlay. Non-nil when the
 	// model has asked a structured question and the Go TUI is waiting
 	// for the user to make a selection. Keyed by toolUseID for
@@ -1161,7 +1166,7 @@ type model struct {
 	profileCount            int
 	tombstoneCount          int
 	topCardOpen             bool
-	topCardPage             int  // 0=columns, 1=tasks; reset to 0 on close
+	topCardPage             int // 0=columns, 1=tasks; reset to 0 on close
 	paletteFilter           string
 	paletteSelected         int
 	pendingProfileName      string
@@ -1189,35 +1194,35 @@ type model struct {
 	// fields to render without a second HTTP round-trip; raw
 	// bytes are kept alongside (mirrors toolAuditMsg / contextAnalysisMsg)
 	// so upstream schema churn cannot break the client.
-	skillListEntries          []runtimeSkillListEntry
-	skillListScroll           int
-	skillListDiagnostics      runtimeSkillListDiagnostics
+	skillListEntries     []runtimeSkillListEntry
+	skillListScroll      int
+	skillListDiagnostics runtimeSkillListDiagnostics
 	// skillListSelected tracks the row the operator is
 	// hovering in /skill list so enter / v can act on
 	// that row (mirror the /inbox selectedIdx pattern).
 	// Indexes into skillListEntries; reset to 0 each
 	// time a fresh list arrives via skillListMsg.
-	skillListSelected         int
-	skillShowEntry            *runtimeSkillShowEntry
-	skillShowScroll           int
-	skillValidateResult       *runtimeSkillValidateEntry
-	skillValidateScroll       int
-	skillLastError            string
-	modelCatalog            runtimeModelsResponse
-	modelOverlayScroll      int
-	effortSelected          int
-	sessionPanelSelected    int
-	sessionPendingAction    sessionPanelAction
-	quitChoice              int
-	startedAt               time.Time
-	permissionOpenedAt      time.Time
-	permissionLastInputAt   time.Time
-	graceQuietPeriod        time.Duration
-	graceMaxDelay           time.Duration
-	connected               bool
-	latestUsage             *usageSnapshot
-	lastUsage               *usageSnapshot
-	contextUsage            *contextUsageSnapshot
+	skillListSelected     int
+	skillShowEntry        *runtimeSkillShowEntry
+	skillShowScroll       int
+	skillValidateResult   *runtimeSkillValidateEntry
+	skillValidateScroll   int
+	skillLastError        string
+	modelCatalog          runtimeModelsResponse
+	modelOverlayScroll    int
+	effortSelected        int
+	sessionPanelSelected  int
+	sessionPendingAction  sessionPanelAction
+	quitChoice            int
+	startedAt             time.Time
+	permissionOpenedAt    time.Time
+	permissionLastInputAt time.Time
+	graceQuietPeriod      time.Duration
+	graceMaxDelay         time.Duration
+	connected             bool
+	latestUsage           *usageSnapshot
+	lastUsage             *usageSnapshot
+	contextUsage          *contextUsageSnapshot
 	// Z6 zero-friction plan: cached one-line memory status from
 	// the most recent /v1/runtime/status poll.
 	memoryFooter string
@@ -1239,9 +1244,9 @@ type model struct {
 	// cutoff (the soft cycle had already fired) rather than a
 	// fresh fatal cutoff. Cleared on result / error like
 	// `latestUsage` so the next turn starts clean.
-	softTimeoutState *softTimeoutSnapshot
+	softTimeoutState       *softTimeoutSnapshot
 	providerRetryCountdown *providerRetryCountdownSnapshot
-	currentTimeout   timeoutDecision
+	currentTimeout         timeoutDecision
 	// Phase 11 in-app selection. With --mouse the Go TUI
 	// captures SGR mouse events and the terminal can no
 	// longer do native drag-select. We compensate with an
@@ -1281,9 +1286,9 @@ type model struct {
 	// persist the current authorization level from user_intake_guidance
 	// events so the status bar can display it, helping operators
 	// understand why "继续任务" inherits local_change vs inspect.
-	authorizationLevel  string
-	consentScope        string
-	consentSource       string
+	authorizationLevel string
+	consentScope       string
+	consentSource      string
 	// promptHistory is the per-session list of submitted
 	// prompts; up/down in composing mode walks it so the
 	// operator can recall a prior turn without leaving the
@@ -1337,15 +1342,17 @@ type model struct {
 	// renderer swaps the list for a "saving…" line.
 	modelPickSubmitting bool
 	// Custom provider wizard state
-	addProviderName       string // provider ID entered by user
-	addProviderProtocol   int    // 0 = OpenAI-compatible, 1 = Anthropic-compatible
-	addProviderURL        string // base URL
-	addProviderKey        string // API key
-	addProviderVerifying  bool   // true while verify request is in flight
-	addProviderModels     []registeredModel
-	addProviderError      string
-	width               int
-	height              int
+	addProviderName      string            // provider ID entered by user
+	addProviderProtocol  int               // 0 = OpenAI-compatible, 1 = Anthropic-compatible
+	addProviderURL       string            // base URL
+	addProviderKey       string            // API key
+	addProviderModel     string            // model ID/name entered by user
+	addProviderModels    []registeredModel // models auto-fetched from /models during verify
+	addProviderModelIdx  int               // selected index in addProviderModels picker
+	addProviderVerifying bool              // true while verify request is in flight
+	addProviderError     string
+	width                int
+	height               int
 }
 
 // usageSnapshot captures the most recent token usage event from
@@ -1497,11 +1504,11 @@ func placeholderForMode(mode inputMode) string {
 		return "https://api.example.com"
 	case modePermissionEditRule:
 		return "git:status, bash:*, npm:install"
-case modePermissionEditFeedback:
-			return "tell the model what to do instead"
-		case modeAskUser:
-			return "select an option and press Enter to answer"
-		case modeSessionInput:
+	case modePermissionEditFeedback:
+		return "tell the model what to do instead"
+	case modeAskUser:
+		return "select an option and press Enter to answer"
+	case modeSessionInput:
 		return "session id"
 	default:
 		return ""
@@ -1574,12 +1581,12 @@ func (m *model) scrollOverlay(delta int) bool {
 	case modeActivityOverlay:
 		allLines := buildActivityOverlayLines(m.activityEvents)
 		maxScroll := max(0, len(allLines)-1)
-m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
-			return true
-		case modeAskUser:
-			// AskUserQuestion overlay handles its own cursor movement
-			// in the keyboard dispatch; scroll is not applicable.
-			return true
+		m.activityOverlayScroll = clamp(m.activityOverlayScroll+delta, 0, maxScroll)
+		return true
+	case modeAskUser:
+		// AskUserQuestion overlay handles its own cursor movement
+		// in the keyboard dispatch; scroll is not applicable.
+		return true
 	case modeMemoryOverlay:
 		maxScroll := max(0, len(m.memoryOverlayLines)-1)
 		m.memoryOverlayScroll = clamp(m.memoryOverlayScroll+delta, 0, maxScroll)
@@ -1712,8 +1719,19 @@ func (m *model) handlePaste(content string) {
 	if m.handleMouseEscapeString(content) {
 		return
 	}
+	// Picker mode (models auto-fetched) ignores paste — the operator
+	// navigates with arrows. The manual-entry fallback (no models)
+	// still routes paste into the textarea below.
+	if m.inputMode == modeAddProviderModel && len(m.addProviderModels) > 0 {
+		return
+	}
 	if m.inputMode == modeModelPickApiKey {
 		m.appendModelAPIKeyDraft(content)
+		m.resize()
+		return
+	}
+	if m.inputMode == modeAddProviderKey {
+		m.appendAddProviderKeyDraft(content)
 		m.resize()
 		return
 	}
@@ -1760,6 +1778,48 @@ func (m *model) deleteModelAPIKeyDraftBackward() {
 	}
 	runes := []rune(m.modelPickAPIKeyDraft)
 	m.modelPickAPIKeyDraft = string(runes[:len(runes)-1])
+}
+
+// appendAddProviderKeyDraft appends to the custom provider wizard's
+// dedicated API key field (m.addProviderKey) instead of the /model
+// picker's m.modelPickAPIKeyDraft, preventing state contamination
+// between the two independent flows.
+func (m *model) appendAddProviderKeyDraft(value string) {
+	m.addProviderKey = sanitizeModelAPIKeyInput(m.addProviderKey + value)
+}
+
+func (m *model) deleteAddProviderKeyDraftBackward() {
+	if m.addProviderKey == "" {
+		return
+	}
+	runes := []rune(m.addProviderKey)
+	m.addProviderKey = string(runes[:len(runes)-1])
+}
+
+func (m *model) handleAddProviderKeyInput(msg tea.KeyPressMsg) bool {
+	key := msg.String()
+	switch key {
+	case "backspace", "ctrl+h":
+		m.deleteAddProviderKeyDraftBackward()
+		return true
+	case "ctrl+u":
+		m.addProviderKey = ""
+		return true
+	}
+	text := msg.Key().Text
+	if text != "" {
+		m.appendAddProviderKeyDraft(text)
+		return true
+	}
+	keyInfo := msg.Key()
+	if keyInfo.Mod&(tea.ModCtrl|tea.ModAlt) == 0 &&
+		keyInfo.Code >= 0x20 &&
+		keyInfo.Code != 0x7f &&
+		keyInfo.Code <= utf8.MaxRune {
+		m.appendAddProviderKeyDraft(string(keyInfo.Code))
+		return true
+	}
+	return false
 }
 
 func (m *model) handleModelAPIKeyInput(msg tea.KeyPressMsg) bool {
@@ -2003,47 +2063,47 @@ var (
 	// operator can scan a transcript for `● ` to count tool
 	// runs without the warm orange drowning the glyph; the
 	// tool name that follows is the warm orange accent.
-	toolBulletStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-		permissionStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
-		confirmStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
-		contextStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
-		assistantStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
-		userStyle         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
-		thinkingStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
-		// Phase 4.2 of authorization-continuity: authorization level indicator
-		// in the status bar. Green for local_change, yellow for shared_change,
-		// red for destructive. Matches the permission dialog color scheme.
-		authStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Bold(true)
-		dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+	toolBulletStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	permissionStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Bold(true)
+	confirmStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("215")).Bold(true)
+	contextStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("75"))
+	assistantStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("15"))
+	userStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	thinkingStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("141"))
+	// Phase 4.2 of authorization-continuity: authorization level indicator
+	// in the status bar. Green for local_change, yellow for shared_change,
+	// red for destructive. Matches the permission dialog color scheme.
+	authStyle         = lipgloss.NewStyle().Foreground(lipgloss.Color("78")).Bold(true)
+	dividerStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
 	footerStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	inputBlockStyle   = lipgloss.NewStyle()
-topCardFrameStyle = lipgloss.NewStyle().
-					Border(lipgloss.RoundedBorder()).
-					BorderForeground(lipgloss.Color("99")).
-					Padding(0, 1)
-		topCardAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
-		// topCardHeaderStyle is a bold accent heading for the
-		// Ctrl+D overview panel (page 0). Uses the brand accent
-		// color so it stands out from the muted column content.
-		topCardHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
-		// topCardRowStyle renders the key-value rows inside each
-		// top card column. The dot-color prefix is the default
-		// topCardAccentStyle; the content is regular text.
-		topCardRowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("253"))
-		// topCardValueStyle highlights the value/metric in a row
-		// (e.g. the MCP tool count, inbox unread count).
-		topCardValueStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("50"))
-		// topCardNavHintStyle is a prominent navigation hint for the
-		// Ctrl+D panel footer. It uses a bright accent so users can
-		// immediately see the left/right arrow key page toggle.
-		topCardNavHintStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
-		// topCardTitleStyle is a bold accent for the top card panels
-		// (task page, overview). It replaces focusedLineStyle with a
-		// more distinct visual hierarchy.
-		topCardTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99")).Padding(0, 0)
-		// topCardSummaryStyle renders the task summary line in a muted
-		// but slightly brighter shade than normal muted text.
-		topCardSummaryStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Italic(true)
+	topCardFrameStyle = lipgloss.NewStyle().
+				Border(lipgloss.RoundedBorder()).
+				BorderForeground(lipgloss.Color("99")).
+				Padding(0, 1)
+	topCardAccentStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("99"))
+	// topCardHeaderStyle is a bold accent heading for the
+	// Ctrl+D overview panel (page 0). Uses the brand accent
+	// color so it stands out from the muted column content.
+	topCardHeaderStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("141"))
+	// topCardRowStyle renders the key-value rows inside each
+	// top card column. The dot-color prefix is the default
+	// topCardAccentStyle; the content is regular text.
+	topCardRowStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("253"))
+	// topCardValueStyle highlights the value/metric in a row
+	// (e.g. the MCP tool count, inbox unread count).
+	topCardValueStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("50"))
+	// topCardNavHintStyle is a prominent navigation hint for the
+	// Ctrl+D panel footer. It uses a bright accent so users can
+	// immediately see the left/right arrow key page toggle.
+	topCardNavHintStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("213"))
+	// topCardTitleStyle is a bold accent for the top card panels
+	// (task page, overview). It replaces focusedLineStyle with a
+	// more distinct visual hierarchy.
+	topCardTitleStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("99")).Padding(0, 0)
+	// topCardSummaryStyle renders the task summary line in a muted
+	// but slightly brighter shade than normal muted text.
+	topCardSummaryStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("141")).Italic(true)
 	// overlayFrameStyle wraps every read-only overlay (help,
 	// profile confirm, context, inbox, agents, tasks, activity,
 	// tools audit) in a muted normal border so they read as
@@ -2755,114 +2815,121 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 
-case modeActivityOverlay:
-				// Read-only recent activity overlay (Phase 6 PR5).
-				// up/k scroll back; down/j/tab scroll forward;
-				// esc/enter/q close. The activity buffer is
-				// append-only from the WebSocket stream, so no
-				// per-row actions. All other keys are swallowed
-				// so they never reach the textinput.
-				switch key {
-				case "esc", "enter", "q":
-					m.setMode(modeComposing)
-					m.activityOverlayScroll = 0
-					m.appendLine("status", "activity closed")
-					return m, nil
-				case "up", "k":
-					if m.activityOverlayScroll > 0 {
-						m.activityOverlayScroll--
-					}
-					return m, nil
-				case "down", "j", "tab":
-					allLines := buildActivityOverlayLines(m.activityEvents)
-					maxScroll := max(0, len(allLines)-1)
-					if m.activityOverlayScroll < maxScroll {
-						m.activityOverlayScroll++
-					}
-					return m, nil
+		case modeActivityOverlay:
+			// Read-only recent activity overlay (Phase 6 PR5).
+			// up/k scroll back; down/j/tab scroll forward;
+			// esc/enter/q close. The activity buffer is
+			// append-only from the WebSocket stream, so no
+			// per-row actions. All other keys are swallowed
+			// so they never reach the textinput.
+			switch key {
+			case "esc", "enter", "q":
+				m.setMode(modeComposing)
+				m.activityOverlayScroll = 0
+				m.appendLine("status", "activity closed")
+				return m, nil
+			case "up", "k":
+				if m.activityOverlayScroll > 0 {
+					m.activityOverlayScroll--
 				}
 				return m, nil
+			case "down", "j", "tab":
+				allLines := buildActivityOverlayLines(m.activityEvents)
+				maxScroll := max(0, len(allLines)-1)
+				if m.activityOverlayScroll < maxScroll {
+					m.activityOverlayScroll++
+				}
+				return m, nil
+			}
+			return m, nil
 
-			case modeAskUser:
-				// AskUserQuestion dialog. Single-select: ↑/↓
-				// moves cursor, Enter confirms the current option.
-				// Multi-select: ↑/↓ moves cursor, Space toggles
-				// the current option, Enter confirms all selected.
-				// Esc cancels (sends empty selection).
+		case modeAskUser:
+			// AskUserQuestion dialog. Single-select: ↑/↓
+			// moves cursor, Enter confirms the current option.
+			// Multi-select: ↑/↓ moves cursor, Space toggles
+			// the current option, Enter confirms all selected.
+			// Esc cancels (sends empty selection).
+			if m.pendingQuestion == nil {
+				m.setMode(modeComposing)
+				return m, nil
+			}
+			switch key {
+			case "esc":
+				m.sendQuestionDecision(nil, nil)
+				m.pendingQuestion = nil
+				m.setMode(modeComposing)
+				m.appendLine("status", "question cancelled")
+				return m, nil
+			case "up", "k":
+				if m.questionCursor > 0 {
+					m.questionCursor--
+				}
+				return m, nil
+			case "down", "j":
+				if m.pendingQuestion != nil && m.questionCursor < len(m.pendingQuestion.options)-1 {
+					m.questionCursor++
+				}
+				return m, nil
+			case "enter":
 				if m.pendingQuestion == nil {
+					// Panel already closed (concurrent event cleared it).
+					// Bail to composing instead of dereferencing a nil
+					// pendingQuestion below.
 					m.setMode(modeComposing)
 					return m, nil
 				}
-				switch key {
-				case "esc":
-					m.sendQuestionDecision(nil, nil)
-					m.pendingQuestion = nil
-					m.setMode(modeComposing)
-					m.appendLine("status", "question cancelled")
-					return m, nil
-				case "up", "k":
-					if m.questionCursor > 0 {
-						m.questionCursor--
+				if m.pendingQuestion.multiSelect {
+					// Multi-select: confirm all selected options
+					cmd := m.sendQuestionDecision(m.questionSelected, m.questionSelectedLabels())
+					if cmd != nil {
+						return m, cmd
 					}
-					return m, nil
-				case "down", "j":
-					if m.pendingQuestion != nil && m.questionCursor < len(m.pendingQuestion.options)-1 {
-						m.questionCursor++
+				} else {
+					// Single-select: confirm the current option
+					cmd := m.sendQuestionDecision(
+						[]int{m.questionCursor},
+						[]string{m.pendingQuestion.options[m.questionCursor].Label},
+					)
+					if cmd != nil {
+						return m, cmd
 					}
-					return m, nil
-				case "enter":
-					if m.pendingQuestion.multiSelect {
-						// Multi-select: confirm all selected options
-						cmd := m.sendQuestionDecision(m.questionSelected, m.questionSelectedLabels())
-						if cmd != nil {
-							return m, cmd
+				}
+				return m, nil
+			case " ":
+				if m.pendingQuestion != nil && m.pendingQuestion.multiSelect {
+					// Toggle the current option
+					idx := m.questionCursor
+					found := -1
+					for i, sel := range m.questionSelected {
+						if sel == idx {
+							found = i
+							break
 						}
+					}
+					if found >= 0 {
+						m.questionSelected = append(m.questionSelected[:found], m.questionSelected[found+1:]...)
 					} else {
-						// Single-select: confirm the current option
+						m.questionSelected = append(m.questionSelected, idx)
+					}
+				}
+				return m, nil
+			case "1", "2", "3", "4":
+				if !m.pendingQuestion.multiSelect {
+					idx := int(key[0] - '1')
+					if idx >= 0 && idx < len(m.pendingQuestion.options) {
+						m.questionCursor = idx
 						cmd := m.sendQuestionDecision(
-							[]int{m.questionCursor},
-							[]string{m.pendingQuestion.options[m.questionCursor].Label},
+							[]int{idx},
+							[]string{m.pendingQuestion.options[idx].Label},
 						)
 						if cmd != nil {
 							return m, cmd
 						}
 					}
-					return m, nil
-				case " ":
-					if m.pendingQuestion != nil && m.pendingQuestion.multiSelect {
-						// Toggle the current option
-						idx := m.questionCursor
-						found := -1
-						for i, sel := range m.questionSelected {
-							if sel == idx {
-								found = i
-								break
-							}
-						}
-						if found >= 0 {
-							m.questionSelected = append(m.questionSelected[:found], m.questionSelected[found+1:]...)
-						} else {
-							m.questionSelected = append(m.questionSelected, idx)
-						}
-					}
-					return m, nil
-				case "1", "2", "3", "4":
-					if !m.pendingQuestion.multiSelect {
-						idx := int(key[0] - '1')
-						if idx >= 0 && idx < len(m.pendingQuestion.options) {
-							m.questionCursor = idx
-							cmd := m.sendQuestionDecision(
-								[]int{idx},
-								[]string{m.pendingQuestion.options[idx].Label},
-							)
-							if cmd != nil {
-								return m, cmd
-							}
-						}
-					}
-					return m, nil
 				}
 				return m, nil
+			}
+			return m, nil
 
 		case modeMemoryOverlay:
 			// MemoryOS status / info-card overlay. Used by
@@ -3170,9 +3237,12 @@ case modeActivityOverlay:
 					m.addProviderProtocol = 0
 					m.addProviderURL = ""
 					m.addProviderKey = ""
+					m.modelPickAPIKeyDraft = ""
 					m.addProviderError = ""
 					m.addProviderVerifying = false
+					m.addProviderModel = ""
 					m.addProviderModels = nil
+					m.addProviderModelIdx = 0
 					m.setInputValue("")
 					m.setMode(modeAddProviderName)
 					return m, nil
@@ -3211,6 +3281,10 @@ case modeActivityOverlay:
 				}
 				m.modelPickError = ""
 				m.setInputValue("")
+				if provider != nil && provider.DefaultBaseURL != "" && strings.TrimSpace(m.modelPickBaseURLDraft) == "" {
+					m.modelProviderSaving = true
+					return m, saveRuntimeProviderConfig(m.cfg, provider.ID, m.modelPickAPIKeyDraft, "")
+				}
 				m.setMode(modeModelPickBaseURL)
 				return m, nil
 			}
@@ -3297,121 +3371,201 @@ case modeActivityOverlay:
 				return m, tea.Batch(m.showTransientStatus(notice), selectRuntimeModel(m.cfg, selectedModel.ID))
 			}
 			return m, nil
-			// --- Custom provider wizard states ---
-			case modeAddProviderName:
-				switch key {
-				case "esc":
-					m.setMode(modeModelPickProvider)
+		// --- Custom provider wizard states ---
+		case modeAddProviderName:
+			switch key {
+			case "esc":
+				m.setMode(modeModelPickProvider)
+				return m, nil
+			case "enter":
+				name := strings.TrimSpace(m.input.Value())
+				if name == "" {
+					m.addProviderError = "Provider name cannot be empty"
 					return m, nil
-				case "enter":
-					name := strings.TrimSpace(m.input.Value())
-					if name == "" {
-						m.addProviderError = "Provider name cannot be empty"
-						return m, nil
-					}
-					if strings.Contains(name, " ") {
-						m.addProviderError = "Provider name must not contain spaces"
-						return m, nil
-					}
-					m.addProviderName = name
-					m.addProviderError = ""
-					m.setInputValue("")
-					m.setMode(modeAddProviderProtocol)
+				}
+				if strings.Contains(name, " ") {
+					m.addProviderError = "Provider name must not contain spaces"
+					return m, nil
+				}
+				m.addProviderName = name
+				m.addProviderError = ""
+				m.setInputValue("")
+				m.setMode(modeAddProviderProtocol)
+				return m, nil
+			}
+			m.addProviderError = ""
+			return m, m.updateInput(msg)
+
+		case modeAddProviderProtocol:
+			switch key {
+			case "esc":
+				m.setMode(modeAddProviderName)
+				return m, nil
+			case "up", "k":
+				if m.addProviderProtocol > 0 {
+					m.addProviderProtocol--
+				}
+				return m, nil
+			case "down", "j", "tab":
+				if m.addProviderProtocol < 1 {
+					m.addProviderProtocol++
+				}
+				return m, nil
+			case "enter":
+				m.setInputValue("")
+				m.setMode(modeAddProviderURL)
+				return m, nil
+			}
+			return m, nil
+
+		case modeAddProviderURL:
+			switch key {
+			case "esc":
+				m.setMode(modeAddProviderProtocol)
+				return m, nil
+			case "enter":
+				url := strings.TrimSpace(m.input.Value())
+				if url == "" {
+					m.addProviderError = "Base URL is required"
+					return m, nil
+				}
+				if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+					m.addProviderError = "URL must start with http:// or https://"
+					return m, nil
+				}
+				m.addProviderURL = url
+				m.addProviderError = ""
+				m.setInputValue("")
+				m.setMode(modeAddProviderKey)
+				return m, nil
+			}
+			m.addProviderError = ""
+			return m, m.updateInput(msg)
+
+		case modeAddProviderKey:
+			switch key {
+			case "esc":
+				m.setMode(modeAddProviderURL)
+				return m, nil
+			case "enter":
+				key := m.addProviderKey
+				if key == "" {
+					m.addProviderError = "API key is required"
 					return m, nil
 				}
 				m.addProviderError = ""
-				return m, m.updateInput(msg)
+				m.addProviderVerifying = true
+				m.setMode(modeAddProviderVerify)
+				adapter := "openai-compatible"
+				if m.addProviderProtocol == 1 {
+					adapter = "anthropic-compatible"
+				}
+				return m, verifyProviderConfig(m.cfg, m.addProviderName, adapter, m.addProviderURL, key)
+			}
+			if m.handleAddProviderKeyInput(msg) {
+				return m, nil
+			}
+			return m, nil
 
-			case modeAddProviderProtocol:
+		case modeAddProviderVerify:
+			if m.addProviderVerifying {
+				return m, nil
+			}
+			switch key {
+			case "esc":
+				if m.addProviderError != "" {
+					m.setMode(modeAddProviderKey)
+				} else {
+					m.setMode(modeModelPickProvider)
+				}
+				return m, nil
+			case "enter":
+				return m, nil
+			}
+			return m, nil
+
+		case modeAddProviderModel:
+			// When the verify step auto-fetched a model list from the
+			// upstream `/models` endpoint, render it as a pick-list:
+			// up/down navigate, enter saves the selected model. When
+			// no list came back (e.g. Anthropic-compatible, which has
+			// no `/models` endpoint, or the listing was malformed),
+			// fall back to manual text entry so the operator can type
+			// a model id directly.
+			if len(m.addProviderModels) > 0 {
 				switch key {
 				case "esc":
-					m.setMode(modeAddProviderName)
+					m.setMode(modeAddProviderKey)
 					return m, nil
 				case "up", "k":
-					if m.addProviderProtocol > 0 {
-						m.addProviderProtocol--
+					if m.addProviderModelIdx > 0 {
+						m.addProviderModelIdx--
 					}
 					return m, nil
 				case "down", "j", "tab":
-					if m.addProviderProtocol < 1 {
-						m.addProviderProtocol++
+					if m.addProviderModelIdx < len(m.addProviderModels)-1 {
+						m.addProviderModelIdx++
 					}
 					return m, nil
 				case "enter":
-					m.setInputValue("")
-					m.setMode(modeAddProviderURL)
-					return m, nil
-				}
-				return m, nil
-
-			case modeAddProviderURL:
-				switch key {
-				case "esc":
-					m.setMode(modeAddProviderProtocol)
-					return m, nil
-				case "enter":
-					url := strings.TrimSpace(m.input.Value())
-					if url == "" {
-						m.addProviderError = "Base URL is required"
+					if m.addProviderModelIdx < 0 || m.addProviderModelIdx >= len(m.addProviderModels) {
 						return m, nil
 					}
-					if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
-						m.addProviderError = "URL must start with http:// or https://"
-						return m, nil
+					picked := m.addProviderModels[m.addProviderModelIdx]
+					m.addProviderModel = firstNonEmpty(picked.Name, picked.ID)
+					modelID := picked.ID
+					if !strings.Contains(modelID, "/") {
+						modelID = m.addProviderName + "/" + picked.ID
 					}
-					m.addProviderURL = url
-					m.addProviderError = ""
-					m.setInputValue("")
-					m.setMode(modeAddProviderKey)
-					return m, nil
-				}
-				m.addProviderError = ""
-				return m, m.updateInput(msg)
-
-			case modeAddProviderKey:
-				switch key {
-				case "esc":
-					m.setMode(modeAddProviderURL)
-					return m, nil
-				case "enter":
-					key := m.addProviderKey
-					if key == "" {
-						m.addProviderError = "API key is required"
-						return m, nil
-					}
-					m.addProviderError = ""
-					m.addProviderVerifying = true
-					m.setMode(modeAddProviderVerify)
 					adapter := "openai-compatible"
 					if m.addProviderProtocol == 1 {
 						adapter = "anthropic-compatible"
 					}
-					return m, verifyProviderConfig(m.cfg, m.addProviderName, adapter, m.addProviderURL, key)
-				}
-				if m.handleModelAPIKeyInput(msg) {
-					return m, nil
-				}
-				return m, nil
-
-			case modeAddProviderVerify:
-				if m.addProviderVerifying {
-					return m, nil
-				}
-				switch key {
-				case "esc":
-					if m.addProviderError != "" {
-						m.setMode(modeAddProviderKey)
-					} else {
-						m.setMode(modeModelPickProvider)
-					}
-					return m, nil
-				case "enter":
-					return m, tea.Batch(
-						saveRuntimeProviderConfig(m.cfg, m.addProviderName, m.addProviderKey, m.addProviderURL),
-						fetchRuntimeModels(m.cfg, "add-provider"),
+					m.addProviderError = ""
+					return m, saveRuntimeProviderConfigWithModels(
+						m.cfg,
+						m.addProviderName,
+						m.addProviderKey,
+						m.addProviderURL,
+						adapter,
+						[]registeredModel{{ID: modelID, Name: m.addProviderModel}},
 					)
 				}
+				m.addProviderError = ""
 				return m, nil
+			}
+			// Manual-entry fallback (no models fetched).
+			switch key {
+			case "esc":
+				m.setMode(modeAddProviderKey)
+				return m, nil
+			case "enter":
+				modelName := strings.TrimSpace(m.input.Value())
+				if modelName == "" {
+					m.addProviderError = "Model name is required"
+					return m, nil
+				}
+				m.addProviderModel = modelName
+				modelID := modelName
+				if !strings.Contains(modelID, "/") {
+					modelID = m.addProviderName + "/" + modelName
+				}
+				adapter := "openai-compatible"
+				if m.addProviderProtocol == 1 {
+					adapter = "anthropic-compatible"
+				}
+				m.addProviderError = ""
+				return m, saveRuntimeProviderConfigWithModels(
+					m.cfg,
+					m.addProviderName,
+					m.addProviderKey,
+					m.addProviderURL,
+					adapter,
+					[]registeredModel{{ID: modelID, Name: modelName}},
+				)
+			}
+			m.addProviderError = ""
+			return m, m.updateInput(msg)
 		}
 
 		// `?` toggles the help overlay. Only valid in composing.
@@ -3654,10 +3808,55 @@ case modeActivityOverlay:
 	case providerConfigMsg:
 		m.modelProviderSaving = false
 		if msg.err != nil {
+			// Wizard flow: the operator is in the custom
+			// provider wizard when saveRuntimeProviderConfig
+			// returns. Falling back to modeModelPickBaseURL here
+			// leaks the picker state machine into the wizard —
+			// the wizard has no baseUrl step, so the operator
+			// sees a screen they never navigated to and can't
+			// interpret. Route to the wizard's API key step
+			// instead and surface the same structured error the
+			// wizard already speaks.
+			if m.inputMode == modeAddProviderVerify || m.inputMode == modeAddProviderKey || m.inputMode == modeAddProviderModel {
+				m.addProviderError = "save: " + friendlyNexusRequestError(msg.err)
+				m.appendLine("error", "provider save failed: "+m.addProviderError)
+				m.setMode(modeAddProviderKey)
+				return m, nil
+			}
 			m.modelPickError = "provider config: " + friendlyNexusRequestError(msg.err)
 			m.appendLine("error", m.modelPickError)
 			m.setMode(modeModelPickBaseURL)
 			return m, nil
+		}
+		// Success: same forked routing as above. Both the
+		// verify-then-save path (modeAddProviderVerify) and the
+		// model-name-then-save path (modeAddProviderModel) route
+		// back to the appropriate step in the wizard.
+		if m.inputMode == modeAddProviderVerify || m.inputMode == modeAddProviderKey || m.inputMode == modeAddProviderModel {
+			m.addProviderError = ""
+			m.applyRuntimeConfig(msg.config)
+			for i := range m.modelCatalog.Providers {
+				if m.modelCatalog.Providers[i].ID == msg.providerID {
+					m.modelCatalog.Providers[i].Configured = true
+					break
+				}
+			}
+			// After verify + save succeeded, advance to model name input.
+			// After model name save succeeded, return to the provider picker.
+			if m.inputMode == modeAddProviderVerify || m.inputMode == modeAddProviderKey {
+				m.setInputValue("")
+				m.addProviderModel = ""
+				m.addProviderModelIdx = 0
+				m.setMode(modeAddProviderModel)
+				return m, fetchRuntimeModels(m.cfg, "add-provider")
+			}
+			m.appendLine("status", fmt.Sprintf("provider '%s' saved with model '%s'", msg.providerID, m.addProviderModel))
+			m.setMode(modeModelPickProvider)
+			m.modelPickProviderIdx = 0
+			if len(m.modelCatalog.Providers) > 0 {
+				m.modelPickProviderIdx = 1
+			}
+			return m, fetchRuntimeModels(m.cfg, "add-provider")
 		}
 		m.modelPickError = ""
 		m.applyRuntimeConfig(msg.config)
@@ -3679,9 +3878,24 @@ case modeActivityOverlay:
 			m.appendLine("error", "provider verify failed: "+m.addProviderError)
 			return m, nil
 		}
-		m.addProviderModels = msg.models
 		m.addProviderError = ""
-		return m, nil
+		m.setInputValue("")
+		// Stash the models the verify endpoint auto-fetched from the
+		// upstream `/models` list. The model step renders these as a
+		// pick-list (up/down + enter) instead of forcing the operator
+		// to type a model id blind. Empty (e.g. Anthropic-compatible,
+		// which has no `/models` endpoint) falls back to manual entry.
+		m.addProviderModels = msg.models
+		m.addProviderModelIdx = 0
+		// Verify succeeded: save provider config (key+URL+adapter)
+		// before transitioning to model name input. The save is
+		// routed through the providerConfigMsg handler; if it fails
+		// that handler returns to the key step.
+		adapter := "openai-compatible"
+		if m.addProviderProtocol == 1 {
+			adapter = "anthropic-compatible"
+		}
+		return m, saveRuntimeProviderConfig(m.cfg, m.addProviderName, m.addProviderKey, m.addProviderURL, adapter)
 
 	case contextAnalysisMsg:
 		if msg.err != nil {
@@ -4116,11 +4330,12 @@ func (m model) viewString() string {
 	addProviderURL := m.renderAddProviderURL(width)
 	addProviderKey := m.renderAddProviderKey(width)
 	addProviderVerify := m.renderAddProviderVerify(width)
+	addProviderModel := m.renderAddProviderModel(width)
 	skillListOverlay := m.renderSkillListOverlay(width)
 	skillShowOverlay := m.renderSkillShowOverlay(width)
-skillValidateOverlay := m.renderSkillValidateOverlay(width)
-		askUserOverlay := m.renderAskUserOverlay(width)
-		quitConfirm := m.renderQuitConfirm(width)
+	skillValidateOverlay := m.renderSkillValidateOverlay(width)
+	askUserOverlay := m.renderAskUserOverlay(width)
+	quitConfirm := m.renderQuitConfirm(width)
 
 	parts := []string{header, transcript}
 	if help != "" {
@@ -4180,19 +4395,22 @@ skillValidateOverlay := m.renderSkillValidateOverlay(width)
 	if addProviderVerify != "" {
 		parts = append(parts, addProviderVerify)
 	}
+	if addProviderModel != "" {
+		parts = append(parts, addProviderModel)
+	}
 	if skillListOverlay != "" {
 		parts = append(parts, skillListOverlay)
 	}
 	if skillShowOverlay != "" {
 		parts = append(parts, skillShowOverlay)
 	}
-if skillValidateOverlay != "" {
-			parts = append(parts, skillValidateOverlay)
-		}
-		if askUserOverlay != "" {
-			parts = append(parts, askUserOverlay)
-		}
-		if quitConfirm != "" {
+	if skillValidateOverlay != "" {
+		parts = append(parts, skillValidateOverlay)
+	}
+	if askUserOverlay != "" {
+		parts = append(parts, askUserOverlay)
+	}
+	if quitConfirm != "" {
 		parts = append(parts, quitConfirm)
 	}
 	parts = append(parts, composer, footer)
@@ -4215,9 +4433,15 @@ func (m model) usesFullScreenOverlay() bool {
 		modeModelPickApiKey,
 		modeModelPickBaseURL,
 		modeModelPickModel,
+		modeAddProviderName,
+		modeAddProviderProtocol,
+		modeAddProviderURL,
+		modeAddProviderKey,
+		modeAddProviderVerify,
 		modeSkillListOverlay,
 		modeSkillShowOverlay,
-		modeSkillValidateOverlay:
+		modeSkillValidateOverlay,
+		modeAskUser:
 		return true
 	default:
 		return false
@@ -4248,6 +4472,7 @@ func (m model) renderFullScreenOverlay(width int) string {
 		m.renderSkillListOverlay(width),
 		m.renderSkillShowOverlay(width),
 		m.renderSkillValidateOverlay(width),
+		m.renderAskUserOverlay(width),
 	} {
 		if part != "" {
 			return part
@@ -4763,19 +4988,19 @@ func (m *model) consumeNexusEvent(event map[string]any) tea.Cmd {
 		case "context_blocking":
 			m.recordActivityEvent(activityKindContextBlocking, formatNexusEvent(event), stringField(event, "timestamp"))
 		}
-case "context_microcompact", "context_compact_boundary", "context_grounding_required", "context_grounding_confirmed", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
-			m.updateProviderRetryCountdown(event)
-			// These events are already suppressed by
-			// shouldSuppressTranscriptEvent, so appendLine is a no-op
-			// guard. Keep the call for any side effects that may be
-			// added later.
-		case "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted":
-			m.updateProviderRetryCountdown(event)
-			m.appendLine(eventType, formatNexusEvent(event))
-		case "workspace_dirty_detected":
-			// Keep workspace dirty / failure events visible — they
-			// indicate a real problem the operator needs to know about.
-			m.appendLine(eventType, formatNexusEvent(event))
+	case "context_microcompact", "context_compact_boundary", "context_grounding_required", "context_grounding_confirmed", "task_scope_declared", "scope_boundary_detected", "scope_boundary_confirmed":
+		m.updateProviderRetryCountdown(event)
+		// These events are already suppressed by
+		// shouldSuppressTranscriptEvent, so appendLine is a no-op
+		// guard. Keep the call for any side effects that may be
+		// added later.
+	case "context_recovery_attempted", "provider_retry_scheduled", "provider_retry_started", "provider_retry_succeeded", "provider_retry_exhausted":
+		m.updateProviderRetryCountdown(event)
+		m.appendLine(eventType, formatNexusEvent(event))
+	case "workspace_dirty_detected":
+		// Keep workspace dirty / failure events visible — they
+		// indicate a real problem the operator needs to know about.
+		m.appendLine(eventType, formatNexusEvent(event))
 	case "context_usage":
 		m.contextUsage = contextUsageSnapshotFromContextUsageEvent(event)
 	case "execution_metrics":
@@ -4799,20 +5024,20 @@ case "context_microcompact", "context_compact_boundary", "context_grounding_requ
 		if m.latestUsage.InputTokens > 0 {
 			m.lastUsage = m.latestUsage
 		}
-		case "user_intake_guidance":
-			// Intake classifier metadata (intent / requiresTools /
-			// reason) is useful for audit but the operator doesn't
-			// need to see it inline. Skip the transcript append.
-			// The /activity overlay and the prompt triage flow keep
-			// the same surface; tests still call formatNexusEvent
-			// directly to verify the formatter.
-			//
-			// Phase 4.2 of authorization-continuity: capture the
-			// authorization level so the status bar can display it.
-			m.authorizationLevel = stringField(event, "authorizationLevel")
-			m.consentScope = stringField(event, "consentScope")
-			m.consentSource = stringField(event, "consentSource")
-		case "tool_completed":
+	case "user_intake_guidance":
+		// Intake classifier metadata (intent / requiresTools /
+		// reason) is useful for audit but the operator doesn't
+		// need to see it inline. Skip the transcript append.
+		// The /activity overlay and the prompt triage flow keep
+		// the same surface; tests still call formatNexusEvent
+		// directly to verify the formatter.
+		//
+		// Phase 4.2 of authorization-continuity: capture the
+		// authorization level so the status bar can display it.
+		m.authorizationLevel = stringField(event, "authorizationLevel")
+		m.consentScope = stringField(event, "consentScope")
+		m.consentSource = stringField(event, "consentSource")
+	case "tool_completed":
 		// Compact transcript: skip tool completion lines so the
 		// transcript shows one row per tool call (the started
 		// row stays). The activity overlay still records the
@@ -4829,44 +5054,44 @@ case "context_microcompact", "context_compact_boundary", "context_grounding_requ
 		// and tool audit ignore them too.
 		m.lastEventType = eventType
 		return nil
-case "agent_job_event":
-			m.appendLine("agent_job", formatNexusEvent(event))
-			m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
-		case "ask_user_question":
-			// The model has asked a structured question. Parse the
-			// event, create a pendingQuestion, and open the ask-user
-			// overlay so the operator can make a selection.
-			toolUseID := stringField(event, "toolUseId")
-			question := stringField(event, "question")
-			header := stringField(event, "header")
-			multiSelect := anyBool(event["multiSelect"])
+	case "agent_job_event":
+		m.appendLine("agent_job", formatNexusEvent(event))
+		m.recordActivityEvent(activityKindAgentJob, formatNexusEvent(event), stringField(event, "timestamp"))
+	case "ask_user_question":
+		// The model has asked a structured question. Parse the
+		// event, create a pendingQuestion, and open the ask-user
+		// overlay so the operator can make a selection.
+		toolUseID := stringField(event, "toolUseId")
+		question := stringField(event, "question")
+		header := stringField(event, "header")
+		multiSelect := anyBool(event["multiSelect"])
 
-			var options []questionOption
-			if rawOptions, ok := event["options"].([]any); ok {
-				for _, raw := range rawOptions {
-					if opt, ok := raw.(map[string]any); ok {
-						opt := questionOption{
-							Label:       stringField(opt, "label"),
-							Description: stringField(opt, "description"),
-						}
-						options = append(options, opt)
+		var options []questionOption
+		if rawOptions, ok := event["options"].([]any); ok {
+			for _, raw := range rawOptions {
+				if opt, ok := raw.(map[string]any); ok {
+					opt := questionOption{
+						Label:       stringField(opt, "label"),
+						Description: stringField(opt, "description"),
 					}
+					options = append(options, opt)
 				}
 			}
+		}
 
-			m.pendingQuestion = &pendingQuestion{
-				sessionID:   stringField(event, "sessionId"),
-				toolUseID:   toolUseID,
-				question:    question,
-				header:      header,
-				options:     options,
-				multiSelect: multiSelect,
-			}
-			m.questionCursor = 0
-			m.questionSelected = nil
-			m.resize()
-			m.appendLine("ask_user_question", formatNexusEvent(event))
-			m.setMode(modeAskUser)
+		m.pendingQuestion = &pendingQuestion{
+			sessionID:   stringField(event, "sessionId"),
+			toolUseID:   toolUseID,
+			question:    question,
+			header:      header,
+			options:     options,
+			multiSelect: multiSelect,
+		}
+		m.questionCursor = 0
+		m.questionSelected = nil
+		m.resize()
+		m.appendLine("ask_user_question", formatNexusEvent(event))
+		m.setMode(modeAskUser)
 	case "task_session_event":
 		m.appendLine("task_session_event", formatNexusEvent(event))
 		// Phase 6 PR6: aggregate subagent lifecycle events into
@@ -4883,52 +5108,52 @@ case "agent_job_event":
 		// Runtime timeout hints are operational telemetry. Do not
 		// render them in the chat transcript; the footer/soft-timeout
 		// state is the right surface for transient budget pressure.
-case "timeout_budget_exceeded":
-			m.recordSuppressedNexusEvent(event)
-		case "timeout_extension_granted":
-			m.recordSuppressedNexusEvent(event)
-		case "task_created":
-			// Real-time task board update: when the LLM calls
-			// TaskCreate (or the REST API creates a task), append
-			// the new task to m.taskBoard immediately so the /tasks
-			// overlay reflects it mid-turn instead of waiting for
-			// the end-of-turn HTTP poll. The event carries
-			// taskId + title; other fields default to pending /
-			// empty values that the next poll fills in.
-			taskID := stringField(event, "taskId")
-			title := stringField(event, "title")
-			m.taskBoard = append(m.taskBoard, nexusTask{
-				TaskID:    taskID,
-				SessionID: stringField(event, "sessionId"),
-				Title:     title,
-				Status:    taskStatusPending,
-				DependsOn: []string{},
-				Blocks:    []string{},
-				CreatedAt: stringField(event, "timestamp"),
-				UpdatedAt: stringField(event, "timestamp"),
-			})
-			// Render the event in the transcript as well; the
-			// transcript.ts formatter already has a "task +" label
-			// for task_created events (lines 289-290).
-			m.appendLine("task_created", formatNexusEvent(event))
-		case "task_updated":
-			// Real-time task board update: when the LLM calls
-			// TaskUpdate, update the matching task in m.taskBoard
-			// in place so the /tasks overlay reflects the new
-			// status / title mid-turn.
-			taskID := stringField(event, "taskId")
-			title := stringField(event, "title")
-			statusStr := stringField(event, "status")
-			for i, t := range m.taskBoard {
-				if t.TaskID == taskID {
-					m.taskBoard[i].Title = title
-					if statusStr != "" {
-						m.taskBoard[i].Status = taskStatus(statusStr)
-					}
-					break
+	case "timeout_budget_exceeded":
+		m.recordSuppressedNexusEvent(event)
+	case "timeout_extension_granted":
+		m.recordSuppressedNexusEvent(event)
+	case "task_created":
+		// Real-time task board update: when the LLM calls
+		// TaskCreate (or the REST API creates a task), append
+		// the new task to m.taskBoard immediately so the /tasks
+		// overlay reflects it mid-turn instead of waiting for
+		// the end-of-turn HTTP poll. The event carries
+		// taskId + title; other fields default to pending /
+		// empty values that the next poll fills in.
+		taskID := stringField(event, "taskId")
+		title := stringField(event, "title")
+		m.taskBoard = append(m.taskBoard, nexusTask{
+			TaskID:    taskID,
+			SessionID: stringField(event, "sessionId"),
+			Title:     title,
+			Status:    taskStatusPending,
+			DependsOn: []string{},
+			Blocks:    []string{},
+			CreatedAt: stringField(event, "timestamp"),
+			UpdatedAt: stringField(event, "timestamp"),
+		})
+		// Render the event in the transcript as well; the
+		// transcript.ts formatter already has a "task +" label
+		// for task_created events (lines 289-290).
+		m.appendLine("task_created", formatNexusEvent(event))
+	case "task_updated":
+		// Real-time task board update: when the LLM calls
+		// TaskUpdate, update the matching task in m.taskBoard
+		// in place so the /tasks overlay reflects the new
+		// status / title mid-turn.
+		taskID := stringField(event, "taskId")
+		title := stringField(event, "title")
+		statusStr := stringField(event, "status")
+		for i, t := range m.taskBoard {
+			if t.TaskID == taskID {
+				m.taskBoard[i].Title = title
+				if statusStr != "" {
+					m.taskBoard[i].Status = taskStatus(statusStr)
 				}
+				break
 			}
-			m.appendLine("task_updated", formatNexusEvent(event))
+		}
+		m.appendLine("task_updated", formatNexusEvent(event))
 	default:
 		if body := formatNexusEvent(event); body != "" && !looksLikeInternalStatusLine(eventType, body) {
 			m.appendLine(eventType, body)
@@ -4939,34 +5164,34 @@ case "timeout_budget_exceeded":
 }
 
 func shouldSuppressTranscriptEvent(eventType string) bool {
-		eventType = strings.TrimSpace(eventType)
-		if eventType == "" {
-			return true
-		}
-		if strings.HasPrefix(eventType, "permission_") && eventType != "permission_request" {
-			return true
-		}
-		switch eventType {
-		case "permit",
-			"near_timeout_warning",
-			"timeout_budget_exceeded",
-			"timeout_extension_granted",
-			"execute_summary",
-			"execution_metrics",
-			"usage",
-			"user_intake_guidance",
-			"hook_started",
-			"hook_completed",
-			"hook_failed",
-			"task_scope_declared",
-			"session_root_continuity",
-			"scope_boundary_detected",
-			"scope_boundary_confirmed",
-			"context_microcompact",
-			"context_compact_boundary",
-			"context_grounding_required",
-			"context_grounding_confirmed":
-			return true
+	eventType = strings.TrimSpace(eventType)
+	if eventType == "" {
+		return true
+	}
+	if strings.HasPrefix(eventType, "permission_") && eventType != "permission_request" {
+		return true
+	}
+	switch eventType {
+	case "permit",
+		"near_timeout_warning",
+		"timeout_budget_exceeded",
+		"timeout_extension_granted",
+		"execute_summary",
+		"execution_metrics",
+		"usage",
+		"user_intake_guidance",
+		"hook_started",
+		"hook_completed",
+		"hook_failed",
+		"task_scope_declared",
+		"session_root_continuity",
+		"scope_boundary_detected",
+		"scope_boundary_confirmed",
+		"context_microcompact",
+		"context_compact_boundary",
+		"context_grounding_required",
+		"context_grounding_confirmed":
+		return true
 	default:
 		return false
 	}
