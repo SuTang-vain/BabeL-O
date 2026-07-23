@@ -239,6 +239,26 @@ export const providerRegistry: ProviderDefinition[] = [
       'minimax/MiniMax-M2',
     ],
   },
+  {
+    id: 'ark-codingplan',
+    displayName: '火山 CodingPlan',
+    adapter: 'anthropic-compatible',
+    authMode: 'api-key',
+    defaultBaseUrl: 'https://ark.cn-beijing.volces.com/api/coding',
+    defaultModel: 'ark-codingplan/doubao-seed-2.0-code',
+    models: [
+      'ark-codingplan/doubao-seed-2.0-code',
+      'ark-codingplan/doubao-seed-2.0-pro',
+      'ark-codingplan/doubao-seed-2.0-lite',
+      'ark-codingplan/glm-5.2',
+      'ark-codingplan/kimi-k2.7-code',
+      'ark-codingplan/deepseek-v4-pro',
+      'ark-codingplan/deepseek-v4-flash',
+      'ark-codingplan/minimax-m3',
+      'ark-codingplan/minimax-m2.7',
+      'ark-codingplan/kimi-k2.6',
+    ],
+  },
 ]
 
 export const modelRegistry: ModelDefinition[] = [
@@ -1015,6 +1035,118 @@ export const modelRegistry: ModelDefinition[] = [
   {
     id: 'minimax/MiniMax-M2.1-highspeed',
     name: 'MiniMax M2.1 Highspeed',
+    contextWindow: 200000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  // ark-codingplan: 火山引擎 CodingPlan 聚合端点 (anthropic-compatible).
+  // 参数沿用各模型在原生 registry 中的基准 (deepseek / minimax / glm / kimi).
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-code',
+    name: 'Doubao Seed 2.0 Code (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-pro',
+    name: 'Doubao Seed 2.0 Pro (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-lite',
+    name: 'Doubao Seed 2.0 Lite (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 65536,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/glm-5.2',
+    name: 'GLM 5.2 (Ark CodingPlan)',
+    contextWindow: 204800,
+    defaultMaxTokens: 65536,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/kimi-k2.7-code',
+    name: 'Kimi K2.7 Code (Ark CodingPlan)',
+    contextWindow: 262144,
+    defaultMaxTokens: 32768,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/kimi-k2.6',
+    name: 'Kimi K2.6 (Ark CodingPlan)',
+    contextWindow: 262144,
+    defaultMaxTokens: 32768,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/deepseek-v4-flash',
+    name: 'DeepSeek V4 Flash (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/minimax-m3',
+    name: 'MiniMax M3 (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 16384,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/minimax-m2.7',
+    name: 'MiniMax M2.7 (Ark CodingPlan)',
     contextWindow: 200000,
     defaultMaxTokens: 128000,
     capabilities: {
