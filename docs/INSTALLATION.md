@@ -33,7 +33,7 @@ bbl go
 ### Install a Specific Version
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.4.1 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.4.2 bash
 ```
 
 ## Method 3: From Source

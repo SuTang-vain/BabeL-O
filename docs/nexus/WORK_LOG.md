@@ -2,6 +2,31 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+
+## 2026-07-24 - v0.4.2 release: AskUserQuestion response delivery fix
+
+- **背景**: AskUserQuestion 弹窗中用户选择选项后，runtime 收到了 HTTP POST 响应并写入了 storage，`waitForQuestionResponse` 也成功 poll 到了响应并恢复了执行，但**模型从未看到用户的选择**。根因是 `runtimeToolLoop.ts` 构建 provider-visible `tool_result`（`blockContent`）时使用了 `result.output`（原始 `pending_question` 载荷）而非 `finalOutput`（被替换后的 `answered` 选择载荷）。模型收到的 tool_result 仍然是 `{ status: 'pending_question', question, options, ... }`，完全不含用户的选择信息。
+- **根因链路完整复盘**:
+  1. **核心 bug（runtimeToolLoop）**: `blockContent` 使用 `result.output` 而非 `finalOutput`。`finalOutput` 在 line 1064 被正确赋值为 `{ status: 'answered', selectedIndices, selectedLabels, question }`，但 line 1153 构建 `blockContent` 时仍引用 `result.output`（原始 `{ status: 'pending_question', ... }`）。修复：`result.output` -> `finalOutput`。
+  2. **Esc handler 丢弃 cmd**: Go TUI `tui.go:2858` 的 Esc 处理器调用 `m.sendQuestionDecision(nil, nil)` 但丢弃了返回的 `tea.Cmd`。HTTP POST 永远不会执行，runtime 的 `waitForQuestionResponse` 会轮询到 180s 超时。修复：返回 cmd + 使用空 slice `[]int{}` 替代 Go nil。
+  3. **Zod schema 拒绝 null**: Go nil slice 序列化为 JSON `null`，而 Zod `z.array(...)` 默认拒绝 `null`。取消问题导致 HTTP 400，storage 不会写入任何事件。修复：schema 改为 `.nullish().transform(v => v ?? [])`。
+  4. **watchdog grace 不足**: Go TUI `goTuiWatchdogGraceMs` = 60s，watchdog = 240s。`QUESTION_RESPONSE_MAX_WAIT_MS` = 180s。如果模型在调用 AskUserQuestion 前花费 60s+，question wait deadline（now + 180s）与 watchdog deadline（start + 240s）重叠，watchdog 先触发 abort `timeoutSignal`。修复：grace 60s -> 120s，watchdog = 300s。
+  5. **ProviderConfig 缺 models 字段**: 自定义供应商向导保存 models 时 `ProviderConfig` 类型缺失 `models` 字段导致 TS build 失败。修复：interface + Zod schema 添加 `models?: Array<{ id: string; name?: string }>`。
+  6. **ConfigManager.save 校验不认自定义供应商**: `defaultModel` / profile 的校验只检查 `modelRegistry` / `providerRegistry`，不检查用户配置的自定义供应商。修复：先收集 `knownProviderIds` / `knownModelIds`（含 `data.providers` 中的自定义供应商 + 其 models），再校验。
+  7. **BABEL_O_VERSION 硬编码**: `src/shared/version.ts` 版本常量未随 `npm version` 更新。修复：`0.4.1` -> `0.4.2`。
+- **验证**:
+  - `npm run typecheck`: pass。
+  - `npm run format:check`: 0 failures。
+  - `npm run deps:audit`: pass。
+  - `npm test`: 1300/1300 pass（含 AskUserQuestion e2e test in `test/runtime-llm.test.ts`）。
+  - `npm run build:smoke`: pass。
+  - `cd clients/go-tui && go test ./...`: all pass。
+  - `make build && ./bin/go-tui --version`: `bbl-go-tui 0.4.2`。
+  - Go TUI 新增测试: `TestAskUserSendQuestionDecisionHTTPEndpoint`（mock HTTP server 验证完整 POST 链路）+ `TestWatchdogGivesAskUserQuestionEnoughHeadroom`（断言 watchdog > question wait + 60s headroom）。
+  - 公开安装冒烟: `install.sh BBL_VERSION=v0.4.2` -> `bbl --version` = `0.4.2`，`bbl go --check` = OK。
+  - GitHub Actions release: 7/7 jobs success（3 portable + 4 Go TUI binaries）。
+- **发布**: tag `v0.4.2` pushed，release https://github.com/SuTang-vain/BabeL-O/releases/tag/v0.4.2，7 assets 全部上传。
+
 ## 2026-07-02 — Agent Skills ecosystem protocol Phase 2.x / 3.x / 4.x real-public-sample follow-up
 
 - **背景**: 上一阶段（2026-07-02 Phase 0-4）让 BabeL-O 能消费本地 Agent Skills 目录包（`*/SKILL.md` + `scripts/` + `references/` + `assets/`），但真实 Anthropic-published skill 样本（`pdf`, `docx`, `pptx`, `canvas-design`）暴露 3 类生态真实世界缺陷：(a) 顶层 companion `.md`（`forms.md`/`reference.md`/`editing.md`/`pptxgenjs.md`）被忽略；(b) 非标资源目录（`canvas-fonts/` 81 个字体）全部丢失；(c) 长 description 的 `docx` 噪声命中比 `pdf-report-analyzer` 等 trigger 命中还强。
