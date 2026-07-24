@@ -8681,8 +8681,8 @@ func TestBuildExecuteRequestEmitsSoftTimeoutPolicy(t *testing.T) {
 	if got := anyInt(payload["watchdogTimeoutMs"]); got != DefaultGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs {
 		t.Fatalf("watchdogTimeoutMs = %d, want %d", got, DefaultGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs)
 	}
-	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 0 {
-		t.Fatalf("maxSoftTimeoutExtensions = %d, want 0", got)
+	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 1 {
+		t.Fatalf("maxSoftTimeoutExtensions = %d, want 1", got)
 	}
 }
 
@@ -8697,27 +8697,40 @@ func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
 // waitForQuestionResponse polls storage for up to
 // QUESTION_RESPONSE_MAX_WAIT_MS (180s). The watchdog must fire
 // AFTER that deadline expires, even if the model spends time before
-// calling AskUserQuestion. The watchdog deadline is
-// timeoutMs + goTuiWatchdogGraceMs from execution start; the question
-// wait deadline is now + 180s from when the question event is yielded.
-// If the model takes up to `grace` seconds to reach the question,
-// both deadlines coincide. The grace must therefore be large enough
-// to cover realistic model latency (tool calls, reasoning, context
-// assembly) so the watchdog doesn't abort the question wait.
+// calling AskUserQuestion. With maxSoftTimeoutExtensions=1 the total
+// soft budget is 2 * timeoutMs = 360s; the watchdog
+// (timeoutMs + goTuiWatchdogGraceMs = 390s) fires 30s after the
+// extended soft budget is exhausted, giving the model one full extra
+// window to finish the turn after reacting to the budget-exceeded
+// warning.
 func TestWatchdogGivesAskUserQuestionEnoughHeadroom(t *testing.T) {
 	watchdog := DefaultGoTuiExecuteTimeoutMs + goTuiWatchdogGraceMs
 	// The runtime's QUESTION_RESPONSE_MAX_WAIT_MS is 180_000ms.
 	const questionWaitMs = 180_000
 	// The watchdog must exceed the question wait by at least 60s
 	// so the model has a full minute of headroom before the question
-	// is even asked. This prevents the race where the watchdog fires
-	// while the user is still reading the question.
+	// is even asked.
 	if watchdog <= questionWaitMs {
 		t.Fatalf("watchdog %dms must exceed question wait %dms", watchdog, questionWaitMs)
 	}
 	headroom := watchdog - questionWaitMs
 	if headroom < 60_000 {
 		t.Fatalf("watchdog headroom %dms < 60s; the model needs at least 60s of headroom before AskUserQuestion", headroom)
+	}
+}
+
+// TestWatchdogAccommodatesSoftExtension: with maxSoftTimeoutExtensions=1
+// the total soft budget is 2 * timeoutMs. The watchdog must exceed that
+// so the extension cycle is not starved by the hard cut.
+func TestWatchdogAccommodatesSoftExtension(t *testing.T) {
+	totalSoftBudget := DefaultGoTuiExecuteTimeoutMs * 2 // initial + 1 extension
+	watchdog := DefaultGoTuiExecuteTimeoutMs + goTuiWatchdogGraceMs
+	if watchdog <= totalSoftBudget {
+		t.Fatalf("watchdog %dms must exceed total soft budget %dms (initial + 1 extension)", watchdog, totalSoftBudget)
+	}
+	margin := watchdog - totalSoftBudget
+	if margin < 10_000 {
+		t.Fatalf("watchdog margin %dms < 10s; too little room after the extension is exhausted", margin)
 	}
 }
 
@@ -8755,8 +8768,8 @@ func TestBuildExecuteRequestRaisesLongContextTimeout(t *testing.T) {
 	if got := anyInt(payload["watchdogTimeoutMs"]); got != longContextGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs {
 		t.Fatalf("watchdogTimeoutMs = %d, want %d", got, longContextGoTuiExecuteTimeoutMs+goTuiWatchdogGraceMs)
 	}
-	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 0 {
-		t.Fatalf("maxSoftTimeoutExtensions = %d, want 0", got)
+	if got := anyInt(payload["maxSoftTimeoutExtensions"]); got != 1 {
+		t.Fatalf("maxSoftTimeoutExtensions = %d, want 1", got)
 	}
 }
 

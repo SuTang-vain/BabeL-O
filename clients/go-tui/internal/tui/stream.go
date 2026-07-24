@@ -83,16 +83,25 @@ const (
 	DefaultGoTuiExecuteTimeoutMs     = 180_000
 	longContextGoTuiExecuteTimeoutMs = 300_000
 	// goTuiWatchdogGraceMs is the headroom between the soft timeout
-	// budget (timeoutMs) and the hard watchdog. AskUserQuestion's
-	// waitForQuestionResponse polls storage for up to
-	// QUESTION_RESPONSE_MAX_WAIT_MS (180s). If the model spends
-	// time before calling AskUserQuestion, the question wait deadline
-	// (now + 180s) can overlap with the watchdog deadline (start +
-	// timeoutMs + grace). 120s of grace ensures that even if the
-	// model takes up to 120s to reach the question, the watchdog
-	// (180s + 120s = 300s) still fires after the question wait
-	// deadline expires, giving the user a full 180s to respond.
-	goTuiWatchdogGraceMs             = 120_000
+	// budget (timeoutMs) and the hard watchdog. The Go TUI sends
+	// maxSoftTimeoutExtensions=1 (one auto extension equal to the
+	// soft budget) so the model gets a full extra window to react
+	// to the budget-exceeded warning and finish the turn. The total
+	// soft budget after extension is 2 * timeoutMs = 360s. The
+	// watchdog must exceed that with a small safety margin so the
+	// extension cycle is not starved by the hard cut.
+	//
+	// Timeline (default timeoutMs=180s):
+	//   0s    execution starts, soft budget = 180s
+	//   180s  timeout_budget_exceeded fires, extension granted (+180s)
+	//   360s  total soft budget exhausted, no more extensions
+	//   390s  hard watchdog fires (360s + 30s safety margin)
+	//
+	// AskUserQuestion's waitForQuestionResponse polls for up to
+	// QUESTION_RESPONSE_MAX_WAIT_MS (180s); this timeline gives the
+	// model enough room to ask a question and still receive the
+	// answer before the watchdog trips.
+	goTuiWatchdogGraceMs             = 210_000
 	longContextTokenThreshold        = 100_000
 )
 
@@ -156,7 +165,13 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		payload["timeoutPolicy"] = "soft"
 		payload["softTimeoutMs"] = timeout.TimeoutMs
 		payload["watchdogTimeoutMs"] = timeout.WatchdogTimeoutMs()
-		payload["maxSoftTimeoutExtensions"] = 0
+		// One auto extension: when the soft budget is exhausted the
+		// runtime grants an additional window (equal to softTimeoutMs)
+		// so the model can react to the budget-exceeded warning and
+		// finish the turn instead of being hard-cut by the watchdog.
+		// The watchdog (timeoutMs + goTuiWatchdogGraceMs) is sized to
+		// accommodate this extension with a safety margin.
+		payload["maxSoftTimeoutExtensions"] = 1
 	}
 	policy := cfg.PolicyMode
 	if policy == "" {
