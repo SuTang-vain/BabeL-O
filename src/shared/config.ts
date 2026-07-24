@@ -13,6 +13,12 @@ export interface ProviderConfig {
    * instead of the registry default. Only 'anthropic-compatible' and
    * 'openai-compatible' are supported. */
   adapter?: 'anthropic-compatible' | 'openai-compatible';
+  /** Custom model definitions for a user-configured provider. Each
+   * entry appears in the model registry alongside built-in models. */
+  models?: Array<{
+    id: string;
+    name?: string;
+  }>;
 }
 
 export interface ProfileConfig {
@@ -195,6 +201,10 @@ export const ProviderConfigSchema = z.object({
   apiKey: z.string().min(1, 'API key cannot be empty').optional(),
   baseUrl: z.string().url('Base URL must be a valid URL').optional(),
   adapter: z.enum(['anthropic-compatible', 'openai-compatible']).optional(),
+  models: z.array(z.object({
+    id: z.string().min(1),
+    name: z.string().min(1).optional(),
+  })).optional(),
 });
 
 export const ProfileConfigSchema = z.object({
@@ -249,13 +259,30 @@ export const BabelOConfigSchema = z.object({
     finalResponseOnlyRemainingLoops: z.number().int().positive().optional(),
   }).optional(),
 }).superRefine((data, ctx) => {
+  // Collect provider IDs that are either built-in or user-configured
+  // in this save payload. Custom providers must pass validation for
+  // defaultModel and profiles.
+  const knownProviderIds = new Set<string>(providerRegistry.map(p => p.id))
+  const knownModelIds = new Set<string>(modelRegistry.map(m => m.id))
+  if (data.providers) {
+    for (const [providerId, providerConfig] of Object.entries(data.providers)) {
+      knownProviderIds.add(providerId)
+      // Register custom provider models so profiles / defaultModel can reference them.
+      for (const model of providerConfig.models ?? []) {
+        const fullId = model.id.includes('/') ? model.id : `${providerId}/${model.id}`
+        knownModelIds.add(fullId)
+        knownModelIds.add(model.id)
+      }
+    }
+  }
+
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;
-    const modelValid = modelRegistry.some(m => m.id === defaultModel) || (() => {
+    const modelValid = knownModelIds.has(defaultModel) || (() => {
       const slashIdx = defaultModel.indexOf('/');
       if (slashIdx === -1) return false;
       const providerId = defaultModel.substring(0, slashIdx);
-      return providerRegistry.some(p => p.id === providerId);
+      return knownProviderIds.has(providerId);
     })();
     if (!modelValid) {
       ctx.addIssue({
@@ -266,21 +293,15 @@ export const BabelOConfigSchema = z.object({
     }
   }
 
-  if (data.providers) {
-    for (const providerId of Object.keys(data.providers)) {
-      // Allow custom providers — getProvider() returns a fallback for unknown IDs
-    }
-  }
-
   if (data.profiles) {
     for (const [profileName, profile] of Object.entries(data.profiles)) {
       if (profile.model) {
-        const modelValid = modelRegistry.some(m => m.id === profile.model) || (() => {
-          const slashIdx = profile.model.indexOf('/');
-          if (slashIdx === -1) return false;
-          const providerId = profile.model.substring(0, slashIdx);
-          return providerRegistry.some(p => p.id === providerId);
-        })();
+        const modelValid = knownModelIds.has(profile.model) || (() => {
+          const slashIdx = profile.model.indexOf('/')
+          if (slashIdx === -1) return false
+          const providerId = profile.model.substring(0, slashIdx)
+          return knownProviderIds.has(providerId)
+        })()
         if (!modelValid) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
@@ -289,7 +310,7 @@ export const BabelOConfigSchema = z.object({
           });
         }
       }
-      if (profile.provider && !providerRegistry.some(p => p.id === profile.provider)) {
+      if (profile.provider && !knownProviderIds.has(profile.provider)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Unknown provider ID in profile "${profileName}": ${profile.provider}`,

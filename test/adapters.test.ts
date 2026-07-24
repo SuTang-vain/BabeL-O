@@ -1,5 +1,8 @@
 import { test, describe, beforeEach, afterEach } from 'node:test'
 import assert from 'node:assert'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { AnthropicAdapter } from '../src/providers/adapters/AnthropicAdapter.js'
 import { OpenAIAdapter } from '../src/providers/adapters/OpenAIAdapter.js'
 import { getAdapter } from '../src/providers/registry.js'
@@ -70,15 +73,31 @@ describe('Model Adapters & Factory', () => {
     globalThis.fetch = originalFetch
   })
 
-  test('factory resolves expected adapters', () => {
-    const local = getAdapter('local')
-    assert.ok(local)
+  test('factory uses adapter override from config file', () => {
+    const originalConfigFile = process.env.BABEL_O_CONFIG_FILE
+    const configDir = mkdtempSync(join(tmpdir(), 'babel-o-adapter-config-'))
+    const configPath = join(configDir, 'config.json')
+    try {
+      process.env.BABEL_O_CONFIG_FILE = configPath
+      mkdirSync(configDir, { recursive: true })
+      writeFileSync(configPath, JSON.stringify({
+        providers: {
+          'custom-anthropic': {
+            adapter: 'anthropic-compatible',
+          },
+        },
+      }))
 
-    const anthropic = getAdapter('anthropic')
-    assert.ok(anthropic instanceof AnthropicAdapter)
-
-    const openai = getAdapter('openai')
-    assert.ok(openai instanceof OpenAIAdapter)
+      const adapter = getAdapter('custom-anthropic')
+      assert.ok(adapter instanceof AnthropicAdapter)
+    } finally {
+      if (originalConfigFile === undefined) {
+        delete process.env.BABEL_O_CONFIG_FILE
+      } else {
+        process.env.BABEL_O_CONFIG_FILE = originalConfigFile
+      }
+      rmSync(configDir, { recursive: true, force: true })
+    }
   })
 
   describe('AnthropicAdapter', () => {

@@ -86,10 +86,10 @@ func selectRuntimeModel(cfg Config, modelID string) tea.Cmd {
 	}
 }
 
-func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, baseURL string) tea.Cmd {
+func saveRuntimeProviderConfigWithModels(cfg Config, providerID string, apiKey string, baseURL string, adapter string, models []registeredModel) tea.Cmd {
 	return func() tea.Msg {
 		var payload runtimeConfig
-		body := map[string]string{"provider": providerID}
+		body := map[string]any{"provider": providerID}
 		apiKey = sanitizeModelAPIKeyInput(apiKey)
 		if strings.TrimSpace(apiKey) != "" {
 			body["apiKey"] = apiKey
@@ -97,16 +97,43 @@ func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, bas
 		if strings.TrimSpace(baseURL) != "" {
 			body["baseUrl"] = baseURL
 		}
+		if strings.TrimSpace(adapter) != "" {
+			body["adapter"] = adapter
+		}
+		if len(models) > 0 {
+			modelPayload := make([]map[string]string, 0, len(models))
+			for _, model := range models {
+				if strings.TrimSpace(model.ID) == "" {
+					continue
+				}
+				entry := map[string]string{"id": model.ID}
+				if strings.TrimSpace(model.Name) != "" {
+					entry["name"] = model.Name
+				}
+				modelPayload = append(modelPayload, entry)
+			}
+			if len(modelPayload) > 0 {
+				body["models"] = modelPayload
+			}
+		}
 		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/provider", body, &payload)
 		return providerConfigMsg{providerID: providerID, config: payload, err: err}
 	}
 }
 
+func saveRuntimeProviderConfig(cfg Config, providerID string, apiKey string, baseURL string, adapter ...string) tea.Cmd {
+	selectedAdapter := ""
+	if len(adapter) > 0 {
+		selectedAdapter = adapter[0]
+	}
+	return saveRuntimeProviderConfigWithModels(cfg, providerID, apiKey, baseURL, selectedAdapter, nil)
+}
+
 type providerVerifyMsg struct {
-	providerID string
-	success    bool
-	models     []registeredModel
-	error      string
+	providerID  string
+	success     bool
+	models      []registeredModel
+	error       string
 	errorDetail string
 }
 
@@ -119,22 +146,61 @@ func verifyProviderConfig(cfg Config, providerID string, adapter string, baseURL
 			"apiKey":   apiKey,
 		}
 		var payload struct {
-			Success     bool   `json:"success"`
-			Provider    string `json:"provider"`
-			Models      []struct {
+			Success  bool   `json:"success"`
+			Provider string `json:"provider"`
+			Models   []struct {
 				ID   string `json:"id"`
 				Name string `json:"name"`
 			} `json:"models"`
 			Error       string `json:"error"`
 			ErrorDetail string `json:"errorDetail"`
 		}
-		err := nexusJSON(cfg, http.MethodPost, "/v1/runtime/config/provider/verify", body, &payload)
+		// Distinguish transport-layer failures (timeout, refused
+		// connection, malformed body, etc.) from Nexus business
+		// results. The Go TUI single-input-owner invariant means
+		// the wizard overlay can only show one error string, so we
+		// must not collapse both into the same `network_error`
+		// label: an auth_failed from the upstream provider must
+		// surface as `auth_failed`, not as a transport error.
+		raw, statusCode, err := nexusRawJSONWithStatus(cfg, http.MethodPost, "/v1/runtime/config/provider/verify", body)
 		if err != nil {
 			return providerVerifyMsg{
 				providerID:  providerID,
 				success:     false,
-				error:       "network_error",
+				error:       "transport_error",
 				errorDetail: err.Error(),
+			}
+		}
+		if statusCode < 200 || statusCode >= 300 {
+			if err := json.Unmarshal(raw, &payload); err == nil && (payload.Error != "" || payload.ErrorDetail != "") {
+				return providerVerifyMsg{
+					providerID:  providerID,
+					success:     false,
+					error:       payload.Error,
+					errorDetail: payload.ErrorDetail,
+				}
+			}
+			if summary := summarizeHTTPError(raw); summary != "" {
+				return providerVerifyMsg{
+					providerID:  providerID,
+					success:     false,
+					error:       summary,
+					errorDetail: fmt.Sprintf("%d %s", statusCode, http.StatusText(statusCode)),
+				}
+			}
+			return providerVerifyMsg{
+				providerID:  providerID,
+				success:     false,
+				error:       "transport_error",
+				errorDetail: fmt.Sprintf("POST /v1/runtime/config/provider/verify failed: %d %s", statusCode, http.StatusText(statusCode)),
+			}
+		}
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			return providerVerifyMsg{
+				providerID:  providerID,
+				success:     false,
+				error:       "transport_error",
+				errorDetail: fmt.Sprintf("decode provider verify response: %v", err),
 			}
 		}
 		models := make([]registeredModel, len(payload.Models))

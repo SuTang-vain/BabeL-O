@@ -4,8 +4,12 @@ import type { FeatureRouter } from '../router.js'
 
 const questionResponseSchema = z.object({
   toolUseId: z.string(),
-  selectedIndices: z.array(z.number().int().min(0)),
-  selectedLabels: z.array(z.string()),
+  // Accept null (Go nil slices marshal to JSON null) and coerce to
+  // empty arrays so a cancelled question doesn't 400 the HTTP
+  // endpoint and leave the runtime's waitForQuestionResponse polling
+  // until its 180s deadline.
+  selectedIndices: z.array(z.number().int().min(0)).nullish().transform(v => v ?? []),
+  selectedLabels: z.array(z.string()).nullish().transform(v => v ?? []),
 })
 
 export const sessionQuestionRouter: FeatureRouter = {

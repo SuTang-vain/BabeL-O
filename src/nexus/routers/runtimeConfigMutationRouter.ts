@@ -18,6 +18,11 @@ const runtimeConfigProviderSchema = z
     provider: z.string().min(1).max(80),
     apiKey: z.string().min(1).max(20_000).optional(),
     baseUrl: z.string().url().optional(),
+    adapter: z.enum(['openai-compatible', 'anthropic-compatible']).optional(),
+    models: z.array(z.object({
+      id: z.string().min(1),
+      name: z.string().min(1).optional(),
+    })).optional(),
   })
   .strict()
 
@@ -43,8 +48,14 @@ export const runtimeConfigMutationRouter: FeatureRouter = {
   register(app) {
     app.post('/v1/runtime/config/provider/verify', async (request, reply) => {
       const body = runtimeConfigProviderVerifySchema.parse(request.body ?? {})
+      // Business result is always 200: clients inspect
+      // `result.success` / `result.error` / `result.errorDetail`.
+      // Returning 4xx here makes transport-layer clients (the Go
+      // TUI `nexusJSON` helper) treat a credential failure as a
+      // protocol/network error and lose the structured error code,
+      // which is what surfaces to the operator in the wizard.
       const result = await verifyProviderConfig(body)
-      return reply.code(result.success ? 200 : 400).send(result)
+      return reply.code(200).send(result)
     })
 
     app.post('/v1/runtime/config/provider', async (request, reply) => {
@@ -57,6 +68,8 @@ export const runtimeConfigMutationRouter: FeatureRouter = {
       manager.setProviderConfig(body.provider, {
         apiKey: body.apiKey ?? existing.apiKey,
         baseUrl: body.baseUrl ?? existing.baseUrl,
+        adapter: body.adapter ?? existing.adapter,
+        models: body.models ?? existing.models,
       })
       return inspectResolvedRuntimeConfig(manager)
     })
@@ -105,11 +118,15 @@ export const runtimeConfigMutationRouter: FeatureRouter = {
       }
 
       const modelId = body.model as string
-      if (!modelRegistry.some(entry => entry.id === modelId)) {
+      const config = manager.load()
+      const isConfiguredModel = Object.values(config.providers ?? {}).some(provider =>
+        provider.models?.some(model => model.id === modelId),
+      )
+      if (!modelRegistry.some(entry => entry.id === modelId) && !isConfiguredModel) {
         return reply.code(400).send({
           error: 'unknown_model',
           model: modelId,
-          message: 'model id is not present in the modelRegistry',
+          message: 'model id is not present in the modelRegistry or configured custom providers',
         })
       }
 
@@ -170,25 +187,29 @@ async function verifyProviderConfig(params: {
         }
       }
 
-      const data = await response.json() as any
+      // The credential is valid; surface the upstream model list so
+      // the wizard can offer a pick-list instead of forcing the
+      // operator to type a model id blind. The OpenAI-compatible
+      // `/models` envelope is `{ data: [{ id, ... }, ...] }`. Parse
+      // defensively: a provider that returns a non-standard body
+      // (or an empty list) should still verify successfully and let
+      // the wizard fall back to manual entry — listing failure is
+      // not an auth failure.
       const models: Array<{ id: string; name: string }> = []
-
-      // OpenAI format: { data: [{ id: string, object: string, ... }] }
-      if (Array.isArray(data.data)) {
-        for (const model of data.data) {
-          if (model.id) {
-            models.push({
-              id: `${provider}/${model.id}`,
-              name: model.id,
-            })
-          }
+      try {
+        const body = await response.json() as { data?: Array<{ id?: unknown }> }
+        for (const entry of body.data ?? []) {
+          if (typeof entry?.id !== 'string' || entry.id.length === 0) continue
+          models.push({ id: entry.id, name: entry.id })
         }
+      } catch {
+        // Non-JSON or malformed body: leave models empty.
       }
 
       return {
         success: true,
         provider,
-        models: models.slice(0, 100), // Limit to 100 models
+        models,
       }
     }
 

@@ -82,7 +82,17 @@ func ensureStartupSession(cfg Config) tea.Cmd {
 const (
 	DefaultGoTuiExecuteTimeoutMs     = 180_000
 	longContextGoTuiExecuteTimeoutMs = 300_000
-	goTuiWatchdogGraceMs             = 60_000
+	// goTuiWatchdogGraceMs is the headroom between the soft timeout
+	// budget (timeoutMs) and the hard watchdog. AskUserQuestion's
+	// waitForQuestionResponse polls storage for up to
+	// QUESTION_RESPONSE_MAX_WAIT_MS (180s). If the model spends
+	// time before calling AskUserQuestion, the question wait deadline
+	// (now + 180s) can overlap with the watchdog deadline (start +
+	// timeoutMs + grace). 120s of grace ensures that even if the
+	// model takes up to 120s to reach the question, the watchdog
+	// (180s + 120s = 300s) still fires after the question wait
+	// deadline expires, giving the user a full 180s to respond.
+	goTuiWatchdogGraceMs             = 120_000
 	longContextTokenThreshold        = 100_000
 )
 

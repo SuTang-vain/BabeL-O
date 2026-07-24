@@ -1153,9 +1153,9 @@ export async function* executeProviderToolCall(options: {
   for (const hookEvent of postToolHooks.events) yield hookEvent
 
   const blockContent =
-    typeof result.output === 'string'
-      ? result.output
-      : JSON.stringify(result.output, null, 2)
+    typeof finalOutput === 'string'
+      ? finalOutput
+      : JSON.stringify(finalOutput, null, 2)
   const contentWithHints = result.success
     ? blockContent
     : mergeHookRetryHints(blockContent, postToolHooks)

@@ -2855,9 +2855,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			switch key {
 			case "esc":
-				m.sendQuestionDecision(nil, nil)
-				m.pendingQuestion = nil
-				m.setMode(modeComposing)
+				// Esc cancels the question: send an empty selection
+				// so the runtime can yield a QUESTION_TIMEOUT or
+				// terminal error instead of hanging. The returned
+				// cmd MUST be returned to Bubble Tea so the HTTP POST
+				// actually fires; previously the cmd was discarded and
+				// the runtime's waitForQuestionResponse would poll
+				// until its 180s deadline expired.
+				//
+				// Use empty slices (not nil) so the Zod schema
+				// (z.array(...)) doesn't reject the body with a 400.
+				cmd := m.sendQuestionDecision([]int{}, []string{})
+				if cmd != nil {
+					return m, cmd
+				}
 				m.appendLine("status", "question cancelled")
 				return m, nil
 			case "up", "k":

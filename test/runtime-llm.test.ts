@@ -3133,6 +3133,115 @@ describe('LLMCodingRuntime', () => {
     assert.match(resultEvent.message, /final answer/)
   })
 
+  test('AskUserQuestion: user response via storage resumes the runtime and produces tool_completed', async () => {
+    // End-to-end: mock provider emits an AskUserQuestion tool call.
+    // The runtime intercepts the pending_question output, yields an
+    // ask_user_question event, then polls storage for a matching
+    // ask_user_question_response. We simulate the HTTP endpoint by
+    // writing the response event to storage after the
+    // ask_user_question event arrives. The runtime must then
+    // produce a tool_completed with status:'answered' and continue
+    // to a final result.
+    const cwd = join(tmpdir(), `babel-o-test-askuser-${Date.now()}`)
+    fs.mkdirSync(cwd, { recursive: true })
+    const sessionId = 'test-askuser-e2e'
+    const storage = new MemoryStorage()
+    await storage.saveSession({
+      sessionId,
+      cwd,
+      prompt: 'pick an option',
+      phase: 'executing',
+      createdAt: '2026-07-23T00:00:00.000Z',
+      updatedAt: '2026-07-23T00:00:00.000Z',
+      events: [],
+    })
+
+    // Iteration 1: AskUserQuestion tool call
+    fetchStreamResponses.push(
+      createAnthropicToolUseStream({
+        id: 'ask-tool-1',
+        name: 'AskUserQuestion',
+        input: {
+          question: 'Which approach?',
+          header: 'approach',
+          options: [
+            { label: 'Option A', description: 'first' },
+            { label: 'Option B', description: 'second' },
+          ],
+          multiSelect: false,
+        },
+      }),
+    )
+    // Iteration 2: final answer after receiving the user's selection
+    fetchStreamResponses.push(
+      createMockStream([
+        'event: content_block_start\n',
+        'data: {"index":0,"content_block":{"type":"text","text":""}}\n\n',
+        'event: content_block_delta\n',
+        'data: {"index":0,"delta":{"type":"text_delta","text":"You chose Option A. Done."}}\n\n',
+        'event: content_block_stop\n',
+        'data: {"index":0}\n\n',
+      ]),
+    )
+
+    const runtime = new LLMCodingRuntime(toolsRegistry, allowAllTools(), storage, configManager)
+
+    const collectedEvents: any[] = []
+    const consumePromise = (async () => {
+      for await (const event of runtime.executeStream({
+        sessionId,
+        prompt: 'pick an option',
+        cwd,
+        skipPermissionCheck: true,
+      })) {
+        collectedEvents.push(event)
+        // When we see the ask_user_question event, simulate the
+        // HTTP endpoint writing the user's response to storage.
+        if (event.type === 'ask_user_question') {
+          await storage.appendEvent(sessionId, {
+            type: 'ask_user_question_response',
+            schemaVersion: '2026-05-21.babel-o.v1',
+            sessionId,
+            timestamp: new Date().toISOString(),
+            toolUseId: (event as any).toolUseId,
+            selectedIndices: [0],
+            selectedLabels: ['Option A'],
+          })
+        }
+      }
+    })()
+
+    await consumePromise
+
+    try {
+      fs.rmSync(cwd, { recursive: true, force: true })
+    } catch {}
+
+    // The ask_user_question event must have been emitted.
+    const askEvent = collectedEvents.find(e => e.type === 'ask_user_question')
+    assert.ok(askEvent, 'runtime must yield an ask_user_question event')
+    assert.equal((askEvent as any).toolUseId, 'ask-tool-1')
+
+    // The tool_completed must carry the user's selection (status:'answered').
+    const toolCompleted = collectedEvents.find(
+      e => e.type === 'tool_completed' && (e as any).toolUseId === 'ask-tool-1',
+    ) as any
+    assert.ok(toolCompleted, 'runtime must produce a tool_completed for AskUserQuestion')
+    assert.equal(toolCompleted.success, true)
+    const output = typeof toolCompleted.output === 'string'
+      ? JSON.parse(toolCompleted.output)
+      : toolCompleted.output
+    assert.equal(output.status, 'answered')
+    assert.deepEqual(output.selectedIndices, [0])
+    assert.deepEqual(output.selectedLabels, ['Option A'])
+
+    // The turn must end with a result event.
+    const resultEvent = collectedEvents.find(e => e.type === 'result') as any
+    assert.ok(resultEvent)
+    assert.equal(resultEvent.success, true)
+    assert.match(resultEvent.message, /Option A/)
+  })
+
   test('suppresses tool-shaped text in final-response-only mode without starting a new loop', async () => {
     const cwd = join(tmpdir(), `babel-o-test-final-only-text-leak-${Date.now()}`)
     fs.mkdirSync(cwd, { recursive: true })

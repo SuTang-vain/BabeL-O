@@ -78,18 +78,31 @@ export const runtimeModelsRouter: FeatureRouter = {
           const p = getProvider(providerId)
           const authState = resolveProviderAuthState(manager, providerId)
           const userConfig = manager.getProviderConfig(providerId)
+          const customModels = userConfig.models?.length
+            ? userConfig.models.map(model => ({
+                id: model.id,
+                name: model.name ?? model.id,
+                contextWindow: 8192,
+                defaultMaxTokens: 4096,
+                capabilities: {
+                  toolCalling: false,
+                  jsonOutput: false,
+                  streaming: true,
+                },
+              }))
+            : undefined
           return {
             id: p.id,
             displayName: p.displayName,
             adapter: userConfig.adapter || p.adapter,
             authMode: p.authMode,
             defaultBaseUrl: p.defaultBaseUrl,
-            defaultModel: p.defaultModel,
+            defaultModel: customModels?.[0]?.id ?? p.defaultModel,
             configured: authState.configured,
             authConfigured: authState.authConfigured,
             authSource: authState.authSource,
             active: settings.providerId === p.id,
-            models: p.models.map(mid => {
+            models: customModels ?? p.models.map(mid => {
               const def = modelRegistry.find(m => m.id === mid)
               return {
                 id: mid,

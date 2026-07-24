@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -8692,6 +8693,34 @@ func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
 	}
 }
 
+// TestWatchdogGivesAskUserQuestionEnoughHeadroom: the runtime's
+// waitForQuestionResponse polls storage for up to
+// QUESTION_RESPONSE_MAX_WAIT_MS (180s). The watchdog must fire
+// AFTER that deadline expires, even if the model spends time before
+// calling AskUserQuestion. The watchdog deadline is
+// timeoutMs + goTuiWatchdogGraceMs from execution start; the question
+// wait deadline is now + 180s from when the question event is yielded.
+// If the model takes up to `grace` seconds to reach the question,
+// both deadlines coincide. The grace must therefore be large enough
+// to cover realistic model latency (tool calls, reasoning, context
+// assembly) so the watchdog doesn't abort the question wait.
+func TestWatchdogGivesAskUserQuestionEnoughHeadroom(t *testing.T) {
+	watchdog := DefaultGoTuiExecuteTimeoutMs + goTuiWatchdogGraceMs
+	// The runtime's QUESTION_RESPONSE_MAX_WAIT_MS is 180_000ms.
+	const questionWaitMs = 180_000
+	// The watchdog must exceed the question wait by at least 60s
+	// so the model has a full minute of headroom before the question
+	// is even asked. This prevents the race where the watchdog fires
+	// while the user is still reading the question.
+	if watchdog <= questionWaitMs {
+		t.Fatalf("watchdog %dms must exceed question wait %dms", watchdog, questionWaitMs)
+	}
+	headroom := watchdog - questionWaitMs
+	if headroom < 60_000 {
+		t.Fatalf("watchdog headroom %dms < 60s; the model needs at least 60s of headroom before AskUserQuestion", headroom)
+	}
+}
+
 func TestResolveGoTuiTimeoutRaisesLongContextTo300s(t *testing.T) {
 	for name, tc := range map[string]struct {
 		prompt string
@@ -13037,6 +13066,80 @@ func TestAskUserEnterWithNilPendingBailsSafely(t *testing.T) {
 	m = updated.(model)
 	if m.inputMode != modeComposing {
 		t.Fatalf("inputMode = %q after Enter with nil pending, want %q", m.inputMode, modeComposing)
+	}
+}
+
+// TestAskUserSendQuestionDecisionHTTPEndpoint: verifies the full
+// HTTP chain - sendQuestionDecision must POST to the correct
+// /v1/sessions/:sessionId/questions/:toolUseId/response endpoint
+// with the correct body shape (toolUseId, selectedIndices,
+// selectedLabels). A mock Nexus server captures the request and
+// asserts the path + body, proving the Go TUI's response reaches
+// the same storage the runtime polls.
+func TestAskUserSendQuestionDecisionHTTPEndpoint(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedBody = make(map[string]any)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(bodyBytes, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"question_response_recorded"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.pendingQuestion = &pendingQuestion{
+		sessionID: "session_test123",
+		toolUseID: "toolu_test456",
+		question:  "Which approach?",
+		header:    "approach",
+		options: []questionOption{
+			{Label: "Option A", Description: "first"},
+			{Label: "Option B", Description: "second"},
+		},
+		multiSelect: false,
+	}
+	m.questionCursor = 1
+	m.setMode(modeAskUser)
+
+	// Trigger Enter to fire sendQuestionDecision.
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	if cmd == nil {
+		t.Fatalf("Enter must return a non-nil cmd to send the decision")
+	}
+	// Execute the returned cmd (the HTTP POST goroutine).
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("HTTP POST cmd must produce a message")
+	}
+
+	// Verify the HTTP request hit the correct endpoint with the
+	// correct body. This is the critical assertion: if the path or
+	// body is wrong, the runtime's waitForQuestionResponse poll
+	// will never find the matching ask_user_question_response event.
+	wantPath := "/v1/sessions/session_test123/questions/toolu_test456/response"
+	if capturedPath != wantPath {
+		t.Fatalf("HTTP path = %q, want %q", capturedPath, wantPath)
+	}
+	if toolUseId, _ := capturedBody["toolUseId"].(string); toolUseId != "toolu_test456" {
+		t.Fatalf("body.toolUseId = %q, want %q", toolUseId, "toolu_test456")
+	}
+	indices, _ := capturedBody["selectedIndices"].([]any)
+	if len(indices) != 1 {
+		t.Fatalf("selectedIndices len = %d, want 1", len(indices))
+	}
+	labels, _ := capturedBody["selectedLabels"].([]any)
+	if len(labels) != 1 {
+		t.Fatalf("selectedLabels len = %d, want 1", len(labels))
+	}
+	if label, _ := labels[0].(string); label != "Option B" {
+		t.Fatalf("selectedLabels[0] = %q, want %q", label, "Option B")
 	}
 }
 

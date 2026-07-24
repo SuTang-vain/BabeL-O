@@ -8,6 +8,22 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Added
 
+- (nothing yet)
+
+### Changed
+
+- (nothing yet)
+
+### Fixed
+
+- (nothing yet)
+
+## v0.4.2 - 2026-07-24
+
+[Full release notes](docs/releases/v0.4.2.md)
+
+### Added
+
 - Added system keychain support for API key storage (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). `bbl config add` stores keys in
   the keychain by default; use `--plain` for config file fallback.
@@ -18,12 +34,26 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
   keychain-backed API keys (priority: env > keychain > config).
 - Added `docs/guides/keychain-guide.md` with credential security best practices.
 - Added `docs/INSTALLATION.md` with detailed installation instructions.
+- Added `ProviderConfig.models` field to support custom provider model definitions.
 
 ### Changed
 
 - README now features a "Why BabeL-O?" section with 3 core differentiators,
   a "Quick Start (5 minutes)" guide, and simplified installation instructions.
 - All installation alternatives moved to the dedicated `docs/INSTALLATION.md`.
+- Go TUI watchdog grace increased from 60s to 120s (watchdog 300s) to prevent
+  AskUserQuestion wait starvation during pre-question model latency.
+
+### Fixed
+
+- Fixed AskUserQuestion responses never reaching the model: the runtime now
+  builds `tool_result` from `finalOutput` (user's `answered` selection) instead
+  of `result.output` (raw `pending_question` payload).
+- Fixed Go TUI Esc-cancel in the AskUserQuestion overlay discarding the HTTP
+  `tea.Cmd`, leaving `waitForQuestionResponse` to time out at 180s.
+- Fixed the question-response Zod schema rejecting Go `nil` slices (JSON `null`)
+  for `selectedIndices` / `selectedLabels`, causing a 400 that prevented the
+  response from being persisted to storage.
 
 ## v0.4.1 - 2026-07-06
 

@@ -387,7 +387,7 @@ func (m model) renderAddProviderKey(width int) string {
 	return rc.Render()
 }
 
-// renderAddProviderVerify is step 0e: verify credentials and fetch models
+// renderAddProviderVerify is step 0e: verify credentials
 func (m model) renderAddProviderVerify(width int) string {
 	if m.inputMode != modeAddProviderVerify {
 		return ""
@@ -404,13 +404,81 @@ func (m model) renderAddProviderVerify(width int) string {
 	} else if m.addProviderError != "" {
 		lines = append(lines, errorStyle.Render("  "+m.addProviderError))
 		lines = append(lines, "", mutedStyle.Render("  esc back to retry"))
-	} else if len(m.addProviderModels) > 0 {
-		lines = append(lines, statusStyle.Render(fmt.Sprintf("  ✓ Found %d models", len(m.addProviderModels))))
-		lines = append(lines, "", mutedStyle.Render("  enter save provider · esc cancel"))
 	} else {
-		lines = append(lines, statusStyle.Render("  ✓ Credentials verified (no model list available)"))
-		lines = append(lines, "", mutedStyle.Render("  enter save provider · esc cancel"))
+		lines = append(lines, statusStyle.Render("  ✓ Credentials verified"))
 	}
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+func (m model) renderAddProviderModel(width int) string {
+	if m.inputMode != modeAddProviderModel {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+
+	// Picker: the verify step auto-fetched a model list from the
+	// upstream `/models` endpoint. Render it as a scrollable
+	// pick-list (up/down + enter) instead of a free-text field.
+	if len(m.addProviderModels) > 0 {
+		lines := []string{
+			titleStyle.Render("Select Model"),
+			mutedStyle.Render(fmt.Sprintf("Provider: %s · URL: %s", m.addProviderName, m.addProviderURL)),
+			mutedStyle.Render(fmt.Sprintf("%d models fetched from %s", len(m.addProviderModels), m.addProviderName)),
+			"",
+			mutedStyle.Render("  model"),
+		}
+		visibleRows := max(1, m.height-12)
+		scrollOffset := 0
+		if m.addProviderModelIdx >= visibleRows {
+			scrollOffset = m.addProviderModelIdx - visibleRows + 1
+		}
+		if scrollOffset+visibleRows > len(m.addProviderModels) {
+			scrollOffset = max(0, len(m.addProviderModels)-visibleRows)
+		}
+		if scrollOffset > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
+		}
+		for i := 0; i < visibleRows && scrollOffset+i < len(m.addProviderModels); i++ {
+			actualIdx := scrollOffset + i
+			entry := m.addProviderModels[actualIdx]
+			marker := "  "
+			if actualIdx == m.addProviderModelIdx {
+				marker = "> "
+			}
+			display := firstNonEmpty(entry.Name, entry.ID)
+			row := marker + display
+			if actualIdx == m.addProviderModelIdx {
+				row = focusedLineStyle.Render(row)
+			}
+			lines = append(lines, "  "+row)
+		}
+		remainingBelow := len(m.addProviderModels) - (scrollOffset + visibleRows)
+		if remainingBelow > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
+		}
+		if m.addProviderError != "" {
+			lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+		}
+		lines = append(lines, "", mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc back"))
+		rc.AddPart(strings.Join(lines, "\n"))
+		return rc.Render()
+	}
+
+	// Manual-entry fallback: no model list came back from verify
+	// (e.g. Anthropic-compatible, which has no `/models` endpoint).
+	lines := []string{
+		titleStyle.Render("Enter Model Name"),
+		mutedStyle.Render(fmt.Sprintf("Provider: %s · URL: %s", m.addProviderName, m.addProviderURL)),
+		mutedStyle.Render("No model list available — enter a model id manually."),
+		"",
+		"  " + m.input.View(),
+	}
+	if m.addProviderError != "" {
+		lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+	}
+	lines = append(lines, "", mutedStyle.Render("  enter save provider · esc back"))
 	rc.AddPart(strings.Join(lines, "\n"))
 	return rc.Render()
 }
