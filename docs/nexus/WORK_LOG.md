@@ -2,6 +2,31 @@
 
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
+
+## 2026-07-24 - v0.4.2 release: AskUserQuestion response delivery fix
+
+- **背景**: AskUserQuestion 弹窗中用户选择选项后，runtime 收到了 HTTP POST 响应并写入了 storage，`waitForQuestionResponse` 也成功 poll 到了响应并恢复了执行，但**模型从未看到用户的选择**。根因是 `runtimeToolLoop.ts` 构建 provider-visible `tool_result`（`blockContent`）时使用了 `result.output`（原始 `pending_question` 载荷）而非 `finalOutput`（被替换后的 `answered` 选择载荷）。模型收到的 tool_result 仍然是 `{ status: 'pending_question', question, options, ... }`，完全不含用户的选择信息。
+- **根因链路完整复盘**:
+  1. **核心 bug（runtimeToolLoop）**: `blockContent` 使用 `result.output` 而非 `finalOutput`。`finalOutput` 在 line 1064 被正确赋值为 `{ status: 'answered', selectedIndices, selectedLabels, question }`，但 line 1153 构建 `blockContent` 时仍引用 `result.output`（原始 `{ status: 'pending_question', ... }`）。修复：`result.output` -> `finalOutput`。
+  2. **Esc handler 丢弃 cmd**: Go TUI `tui.go:2858` 的 Esc 处理器调用 `m.sendQuestionDecision(nil, nil)` 但丢弃了返回的 `tea.Cmd`。HTTP POST 永远不会执行，runtime 的 `waitForQuestionResponse` 会轮询到 180s 超时。修复：返回 cmd + 使用空 slice `[]int{}` 替代 Go nil。
+  3. **Zod schema 拒绝 null**: Go nil slice 序列化为 JSON `null`，而 Zod `z.array(...)` 默认拒绝 `null`。取消问题导致 HTTP 400，storage 不会写入任何事件。修复：schema 改为 `.nullish().transform(v => v ?? [])`。
+  4. **watchdog grace 不足**: Go TUI `goTuiWatchdogGraceMs` = 60s，watchdog = 240s。`QUESTION_RESPONSE_MAX_WAIT_MS` = 180s。如果模型在调用 AskUserQuestion 前花费 60s+，question wait deadline（now + 180s）与 watchdog deadline（start + 240s）重叠，watchdog 先触发 abort `timeoutSignal`。修复：grace 60s -> 120s，watchdog = 300s。
+  5. **ProviderConfig 缺 models 字段**: 自定义供应商向导保存 models 时 `ProviderConfig` 类型缺失 `models` 字段导致 TS build 失败。修复：interface + Zod schema 添加 `models?: Array<{ id: string; name?: string }>`。
+  6. **ConfigManager.save 校验不认自定义供应商**: `defaultModel` / profile 的校验只检查 `modelRegistry` / `providerRegistry`，不检查用户配置的自定义供应商。修复：先收集 `knownProviderIds` / `knownModelIds`（含 `data.providers` 中的自定义供应商 + 其 models），再校验。
+  7. **BABEL_O_VERSION 硬编码**: `src/shared/version.ts` 版本常量未随 `npm version` 更新。修复：`0.4.1` -> `0.4.2`。
+- **验证**:
+  - `npm run typecheck`: pass。
+  - `npm run format:check`: 0 failures。
+  - `npm run deps:audit`: pass。
+  - `npm test`: 1300/1300 pass（含 AskUserQuestion e2e test in `test/runtime-llm.test.ts`）。
+  - `npm run build:smoke`: pass。
+  - `cd clients/go-tui && go test ./...`: all pass。
+  - `make build && ./bin/go-tui --version`: `bbl-go-tui 0.4.2`。
+  - Go TUI 新增测试: `TestAskUserSendQuestionDecisionHTTPEndpoint`（mock HTTP server 验证完整 POST 链路）+ `TestWatchdogGivesAskUserQuestionEnoughHeadroom`（断言 watchdog > question wait + 60s headroom）。
+  - 公开安装冒烟: `install.sh BBL_VERSION=v0.4.2` -> `bbl --version` = `0.4.2`，`bbl go --check` = OK。
+  - GitHub Actions release: 7/7 jobs success（3 portable + 4 Go TUI binaries）。
+- **发布**: tag `v0.4.2` pushed，release https://github.com/SuTang-vain/BabeL-O/releases/tag/v0.4.2，7 assets 全部上传。
+
 ## 2026-07-02 — Agent Skills ecosystem protocol Phase 2.x / 3.x / 4.x real-public-sample follow-up
 
 - **背景**: 上一阶段（2026-07-02 Phase 0-4）让 BabeL-O 能消费本地 Agent Skills 目录包（`*/SKILL.md` + `scripts/` + `references/` + `assets/`），但真实 Anthropic-published skill 样本（`pdf`, `docx`, `pptx`, `canvas-design`）暴露 3 类生态真实世界缺陷：(a) 顶层 companion `.md`（`forms.md`/`reference.md`/`editing.md`/`pptxgenjs.md`）被忽略；(b) 非标资源目录（`canvas-fonts/` 81 个字体）全部丢失；(c) 长 description 的 `docx` 噪声命中比 `pdf-report-analyzer` 等 trigger 命中还强。
@@ -9027,3 +9052,87 @@
   - **2D.6** 22+ `ConfigManager.getInstance()` callsites
   - **2D.7** Phase 2 row → "Closed 2026-06-XX"
   - **Phase 3B+ 收口审计** (主循环读一遍，决定是否需要最后 1-2 helper)
+
+## 2026-07-10 — 产品 30 天改造 W1-W2：README 改造 + 系统 Keychain + bbl config init
+
+- **背景**: 产品 30 天改造计划 W1 (Make It Visible) + W2 (Make It Trustworthy) 落地，不动 Nexus runtime / provider / agent loop，只改造产品表层。
+- **W1.1 README 价值段重写**:
+  - `README.md` 在 `What Is BabeL-O?` 之前新增 `Why BabeL-O?` 段，3 个核心差异化亮点：多 session 并行 worktree / 10MB 无依赖客户端 / 真正能完成长任务，每个 bullet 配一句话人话 + 技术对照。
+  - 新增 `Quick Start (5 minutes)` 段，npm global install 为唯一推荐路径。
+  - 安装部分简化，备选方法迁移到新文件 `docs/INSTALLATION.md`。
+  - `README.zh-CN.md` 同步翻译。
+- **W1.2 创建 docs/INSTALLATION.md**:
+  - 新文件覆盖系统要求、npm install / release installer / 源码构建三种方式、Go TUI 构建选项、验证步骤、配置指南和故障排除。
+- **W2.1 系统 Keychain 接入**:
+  - 新增 `src/cli/secrets/` 模块（6 个文件，~560 行）：types（接口 + 错误类型）、macOS Keychain（`security` CLI）、Windows Credential Manager（`cmdkey` CLI）、Linux Secret Service（`secret-tool` CLI）、环境变量降级。
+  - `SecretProvider` 接口：`isAvailable()` / `get()` / `set()` / `delete()` / `list()`。
+  - `isKeychainAvailable()` 自动检测平台和 TTY 环境。
+  - `ConfigManager` 新增 5 个异步方法：`resolveSettingsAsync()`（env > keychain > profile > provider_config 优先级）、`setApiKeyWithKeychain()`、`migrateToKeychain()`、`deleteApiKey()`、`getApiKeyLocation()`。
+  - `bbl config add` 新增 `--plain` 选项，默认写入 Keychain 并自动从配置文件移除明文 key。
+  - `bbl config migrate` 一键迁移明文 key 到 Keychain。
+  - `bbl config audit` 可视化审计 Keychain / 配置文件 / 环境变量三层存储位置。
+- **W2.4 bbl config init 交互式向导**:
+  - `bbl config init` 支持交互模式（选择 provider → 输入 API key → 选择 model）和非交互模式（`--non-interactive --provider anthropic --model claude-sonnet-4-6`）。
+  - API key 输入使用隐藏输入（`process.stdin.setRawMode(true)`），不回显。
+  - 已有配置时提示确认覆盖。
+- **文档**:
+  - 创建 `docs/guides/keychain-guide.md`（API Key 安全指南，含平台说明、审计、迁移、故障排除）。
+  - 更新 `docs/guides/README.md` 文档索引表。
+  - 更新 `docs/INSTALLATION.md` 添加 Keychain 和 init 向导说明。
+  - 更新 `CHANGELOG.md` Unreleased 段。
+- **验证**:
+  - `npm run typecheck`: pass。
+  - `NODE_ENV=test BABEL_O_CONFIG_FILE=/tmp/babel-o-test-config.json npx tsx --test test/secrets.test.ts test/config-init.test.ts`: pass 32/32（14 secrets + 18 config-init）。
+  - `npm run format:check`: pass（仅 `.zcode/` 临时文件失败）。
+  - `git diff --stat`: README.md +91/-77, README.zh-CN.md +77/-54, src/cli/commands/config.ts +361/-1, src/shared/config.ts +271/-1, 新增 8 个文件。
+- **边界**: 本次只做产品表层改造，未动 Nexus / runtime / provider / agent loop；Keychain 只做原生 CLI 调用，无外部 npm 依赖；Windows/Linux 实机验证留待 CI 环境。
+
+## 2026-07-10 — Error Friendly Message Governance (W2.2) Completed
+
+### Summary
+Implemented humanized error messages across Nexus, runtime, and Go TUI layers. Users now see actionable hints instead of raw JSON error codes.
+
+### Changes
+
+**Phase 1: Schema Extension**
+- Modified `src/shared/events.ts` to add `hint` and `docsUrl` optional fields to `ErrorEventSchema`.
+
+**Phase 2: Error Registry**
+- Created `src/nexus/errorRegistry.ts` with 20+ error code definitions.
+- Implemented `humanizeError()` function for centralized hint/docsUrl mapping.
+- Added context injection for profile/provider error codes.
+- Created `test/error-registry.test.ts` with 13 unit tests.
+
+**Phase 3: Runtime Integration**
+- Modified `src/runtime/pipeline/events.ts` to integrate `humanizeError()` in `buildRuntimeErrorEvent()`.
+- Added helper function in `src/runtime/LocalCodingRuntime.ts` for error event construction.
+- Created `test/error-registry-integration.test.ts` with 5 integration tests.
+
+**Phase 4: Go TUI Refactor**
+- Modified `clients/go-tui/internal/tui/api.go` to prioritize server-provided `hint` field.
+- Retained client-specific soft-timeout watchdog logic for `REQUEST_TIMEOUT`.
+- All Go TUI tests pass.
+
+**Phase 5: Troubleshooting Documentation**
+- Created `docs/troubleshooting/` directory.
+- Added 6 documentation files: README.md, REQUEST_TIMEOUT.md, CONTEXT_BLOCKING.md, PROVIDER_AUTH_FAILED.md, WORKTREE_CONFLICT.md, TOOL_RESULT_BUDGET_EXCEEDED.md.
+
+### Verification
+- TypeScript tests: 18/18 pass
+- Go TUI tests: all pass
+- Type check: pass (pre-existing test errors unrelated)
+
+### Documentation
+- Moved plan from `proposals/` to `history/error-friendly-message-governance-plan.md`.
+- Updated `history/README.md` index.
+- Removed entry from `proposals/README.md`.
+
+### Commands
+```bash
+# Run tests
+NODE_ENV=test npx tsx --test test/error-registry.test.ts test/error-registry-integration.test.ts
+cd clients/go-tui && go test ./internal/tui -run "Friendly|Error" -v
+
+# Type check
+npm run typecheck
+```

@@ -1,6 +1,7 @@
 import { relative, resolve } from 'node:path'
 import type { ModelAdapter, ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import { eventBase, type NexusEvent } from '../shared/events.js'
+import type { SessionAuthorizationState } from '../shared/session.js'
 import { extractAbsolutePaths } from './systemPromptBuilder.js'
 
 export type UserIntentKind =
@@ -134,11 +135,14 @@ export async function buildUserIntakeGuidanceEvent(options: {
   latestPrompt: string
   cwd: string
   signal?: AbortSignal
+  /** Phase 2.3 of authorization-continuity: previous authorization state to inherit */
+  previousAuthorizationState?: SessionAuthorizationState
 }): Promise<UserIntakeGuidanceEvent> {
   const fallback = deriveFallbackUserIntentGuidance({
     events: options.events,
     latestPrompt: options.latestPrompt,
     cwd: options.cwd,
+    previousAuthorizationState: options.previousAuthorizationState,
   })
 
   try {
@@ -151,8 +155,9 @@ export async function buildUserIntakeGuidanceEvent(options: {
       cwd: options.cwd,
       history: summarizeRecentUserHistory(options.events),
       signal: options.signal,
+      previousAuthorizationState: options.previousAuthorizationState,
     })
-    const parsed = parseIntakeModelOutput(text, fallback)
+    const parsed = parseIntakeModelOutput(text, fallback, options.previousAuthorizationState)
     return toUserIntakeGuidanceEvent({
       sessionId: options.sessionId,
       guidance: parsed,
@@ -327,6 +332,8 @@ export function deriveFallbackUserIntentGuidance(options: {
   events: NexusEvent[]
   latestPrompt: string
   cwd: string
+  /** Phase 2.3: previous authorization state to inherit for continuation phrases */
+  previousAuthorizationState?: SessionAuthorizationState
 }): UserIntentGuidance {
   const latestUserText = options.latestPrompt || findLatestUserText(options.events)
   const explicitPaths = extractAbsolutePaths(latestUserText)
@@ -466,6 +473,33 @@ export function deriveFallbackUserIntentGuidance(options: {
     })
   }
 
+  // Phase 2.3 of authorization-continuity: if the latest message is a
+  // continuation phrase AND we have a previous authorization state to
+  // inherit, use it instead of defaulting to inspect/inferred_none.
+  if (isContinuationPhrase(latestUserText) && options.previousAuthorizationState) {
+    const prev = options.previousAuthorizationState
+    return buildGuidance({
+      intent: 'continue',
+      confidence: 0.88,
+      continuity: 0.85,
+      contextScope: 'full',
+      actionHint: 'normal',
+      requiresTools: true,
+      problemTarget,
+      reason: `Continuation phrase detected; inheriting previous authorization (${prev.level}/${prev.scope}).`,
+      latestUserText,
+      explicitPaths,
+      source: 'fallback',
+      authorization: buildAuthorization({
+        level: prev.level as AuthorizationLevel,
+        consentScope: prev.scope as ConsentScope,
+        source: 'stated_plan_confirmation', // Inherited from previous turn
+        selectionKind: 'none',
+        reason: `Inherited from previous turn established at ${prev.establishedAt}`,
+      }),
+    })
+  }
+
   return buildGuidance({
     intent: 'continue',
     confidence: 0.66,
@@ -490,7 +524,19 @@ async function queryIntakeModel(options: {
   cwd: string
   history: string
   signal?: AbortSignal
+  /** Phase 2.3: previous authorization state to inherit */
+  previousAuthorizationState?: SessionAuthorizationState
 }): Promise<string> {
+  // Build continuation context if we have previous authorization
+  const continuationContext = options.previousAuthorizationState
+    ? `\n\nPREVIOUS AUTHORIZATION CONTEXT:\n` +
+      `- authorizationLevel: ${options.previousAuthorizationState.level}\n` +
+      `- consentScope: ${options.previousAuthorizationState.scope}\n` +
+      `- source: ${options.previousAuthorizationState.source}\n` +
+      `- establishedAt: ${options.previousAuthorizationState.establishedAt}\n` +
+      `If the latest message is a continuation phrase (继续任务, continue, etc.), inherit this authorization.`
+    : ''
+
   const messages: ModelMessage[] = [
     {
       role: 'user',
@@ -513,10 +559,20 @@ async function queryIntakeModel(options: {
         'Use status/respond_only only when the user is asking for conversational state or pure capability information. If the latest message asks to verify, run, check, test, lint, build, inspect, modify, save memory, or call a named tool, keep requiresTools=true.',
         'Current-state verification requires tools: checking whether the current runtime, provider, model, tool, memory, config, session, workspace, git state, tests/build, MCP, remote runner, or service is available, enabled, supported, working, healthy, recorded, passing, or up to date is not a pure capability question.',
         'Chinese action cues such as 执行, 运行, 跑一下, 测试, 检查, 查看当前, 确认当前, 验证 normally indicate tool-backed verification when paired with current state or availability.',
+        // === Phase 1: Continuation phrase handling ===
+        'CONTINUATION PHRASES: Phrases like "继续任务", "继续", "continue", "keep going", "proceed" indicate the user wants to continue previous authorized work.',
+        'When the latest message is a continuation phrase:',
+        '- If recent user history shows explicit authorization (local_change, shared_change), inherit that authorizationLevel and consentScope.',
+        '- If the user previously authorized a stated_plan, keep consentScope=stated_plan and consentSource=stated_plan_confirmation.',
+        '- Do NOT downgrade authorization to inspect or none without explicit narrowing from the user.',
+        '- requiresTools should remain true if the previous turn had requiresTools=true.',
+        'Examples: "继续任务" after user said "写一篇文档" => authorizationLevel=local_change, consentScope=stated_plan; "continue" after user said "push to develop" => authorizationLevel=shared_change.',
+        '=== End continuation phrase handling ===',
         'Category examples: pure capability question => status/respond_only/requiresTools=false; current memory status check => status/normal/requiresTools=true; execute a current availability check => continue/normal/requiresTools=true; save an explicit preference to long-term memory => continue/normal/requiresTools=true.',
         'Do not include natural-language behavioral instructions in the JSON. The runtime will derive execution policy from the structured fields.',
         `cwd: ${options.cwd}`,
         `recent user history:\n${options.history || '(none)'}`,
+        continuationContext,
         `latest user message:\n${options.latestPrompt}`,
       ].join('\n'),
     },
@@ -539,7 +595,7 @@ async function queryIntakeModel(options: {
   return output
 }
 
-function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): UserIntentGuidance {
+function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance, previousAuthorizationState?: SessionAuthorizationState): UserIntentGuidance {
   const json = extractJsonObject(text)
   if (!json) return fallback
   try {
@@ -551,9 +607,20 @@ function parseIntakeModelOutput(text: string, fallback: UserIntentGuidance): Use
       ? raw.requiresTools
       : actionHint !== 'respond_only'
     const problemTarget = parseEnum(raw.problemTarget, ['agent_failure', 'runtime_replay', 'tool_evidence', 'project_feature', 'user_artifact', 'unknown'], fallback.problemTarget)
-    const authorizationLevel = parseEnum(raw.authorizationLevel, ['none', 'inspect', 'local_change', 'shared_change', 'destructive'], fallback.authorization?.level ?? 'inspect')
-    const consentScope = parseEnum(raw.consentScope, ['current_step', 'stated_plan', 'session_workflow'], fallback.authorization?.consentScope ?? 'current_step')
-    const consentSource = parseEnum(raw.consentSource, ['explicit_user', 'stated_plan_confirmation', 'trusted_session_rule', 'inferred_none'], fallback.authorization?.source ?? 'inferred_none')
+
+    // Phase 2.3: If model output has inferred_none but we have previous authorization
+    // and the intent is continue (continuation), use previous authorization instead.
+    let authorizationLevel = parseEnum(raw.authorizationLevel, ['none', 'inspect', 'local_change', 'shared_change', 'destructive'], fallback.authorization?.level ?? 'inspect')
+    let consentScope = parseEnum(raw.consentScope, ['current_step', 'stated_plan', 'session_workflow'], fallback.authorization?.consentScope ?? 'current_step')
+    let consentSource = parseEnum(raw.consentSource, ['explicit_user', 'stated_plan_confirmation', 'trusted_session_rule', 'inferred_none'], fallback.authorization?.source ?? 'inferred_none')
+
+    // Inherit previous authorization if model produced inferred_none but we have explicit prior auth
+    if (previousAuthorizationState && intent === 'continue' && consentSource === 'inferred_none' && authorizationLevel === 'inspect') {
+      authorizationLevel = previousAuthorizationState.level as AuthorizationLevel
+      consentScope = previousAuthorizationState.scope as ConsentScope
+      consentSource = 'stated_plan_confirmation'
+    }
+
     const selectionKind = parseEnum(raw.selectionKind, ['none', 'preference', 'option', 'path', 'workflow_step'], fallback.authorization?.selectionKind ?? 'none')
     const explicitPaths = fallback.explicitPaths
     return buildGuidance({
@@ -906,7 +973,7 @@ function buildAuthorization(options: {
   }
 }
 
-function deriveDefaultAuthorizationLevel(options: {
+export function deriveDefaultAuthorizationLevel(options: {
   intent: UserIntentKind
   actionHint: ActionHint
   requiresTools: boolean
@@ -1135,12 +1202,97 @@ function hasExecutionAuthorizationCue(text: string): boolean {
     /(直接|开始|推进|执行|实现|修改|改成|应用|写入|提交|推送|合并|发布|删除|移除|覆盖|按.*做|照.*做)/u.test(text)
 }
 
-function isLocalChangeAuthorizationRequest(text: string): boolean {
+/**
+ * Checks if the text is a continuation phrase that indicates
+ * the user wants to continue previous authorized work.
+ *
+ * These phrases should NOT be treated as new authorization requests,
+ * but rather should inherit the authorization level from the previous turn.
+ *
+ * Phase 1 of authorization-continuity-execution-plan.md
+ */
+export function isContinuationPhrase(text: string): boolean {
+  const normalized = text.trim().toLowerCase()
+
+  // Chinese continuation phrases
+  if (/^(继续|继续任务|继续推进|继续工作|继续执行|继续做|继续改|继续写|继续修改|继续完成)$/u.test(normalized)) {
+    return true
+  }
+
+  // "继续..." with additional context
+  if (/^继续.{0,10}$/.test(normalized) && !/(开始新|新任务|查看|分析)/u.test(text)) {
+    return true
+  }
+
+  // English continuation phrases
+  if (/^(continue|keep going|proceed|carry on|go ahead)$/iu.test(normalized)) {
+    return true
+  }
+
+  // "continue with the plan" etc.
+  if (/^continue\s+(with|the|working|on)/iu.test(normalized)) {
+    return true
+  }
+
+  return false
+}
+
+export function isLocalChangeAuthorizationRequest(text: string): boolean {
   const normalized = text.trim().toLowerCase()
   if (isSharedChangeAuthorizationRequest(text) || isDestructiveAuthorizationRequest(text)) return false
-  return /\b(apply|implement|change|modify|edit|write|commit|proceed|start implementing)\b/iu.test(normalized) ||
-    /(根据|按照|按).*(规划|计划|方案|建议|文档).*(推进|开始|实现|修改|处理)?/u.test(text) ||
-    /(开始推进|继续推进|实现|修改|改成|应用|写入|提交当前|创建分支|新建分支)/u.test(text)
+
+  // Existing patterns
+  if (/\b(apply|implement|change|modify|edit|write|commit|proceed|start implementing)\b/iu.test(normalized)) {
+    return true
+  }
+  if (/(根据|按照|按).*(规划|计划|方案|建议|文档).*(推进|开始|实现|修改|处理)?/u.test(text)) {
+    return true
+  }
+  if (/(开始推进|继续推进|实现|修改|改成|应用|写入|提交当前|创建分支|新建分支)/u.test(text)) {
+    return true
+  }
+
+  // === Phase 1: Extended verbs and patterns ===
+
+  // Extended action verbs (修复, 改, 补, etc.)
+  if (/(修复|改|补|重构|优化|更新|调整|更改|改动|fix|patch|update|refactor)/iu.test(text)) {
+    // Must be paired with a target, not just mentioning the verb
+    if (/(这个|那个|当前|问题|文件|代码|bug|issue|版本|配置|内容|功能)/u.test(text) || /\b(this|that|the|current|version|config|content)\b/iu.test(normalized)) {
+      return true
+    }
+  }
+
+  // "改一下..." / "更改..." - simple change requests
+  if (/(改一下|更改|改动)/u.test(text)) {
+    return true
+  }
+
+  // "进入可写模式" / "进入编辑模式" - explicit request for write permission
+  if (/进入.*(可写|编辑|修改).*模式/iu.test(text)) {
+    return true
+  }
+
+  // "执行...方案" / "落实...方案" - executing a previously discussed plan
+  if (/(执行|落实|实施|推进).*(方案|计划|建议|规划)/u.test(text)) {
+    return true
+  }
+
+  // "就这样..." / "按这个..." - approval to proceed
+  if (/(就|直接|按).*(这样|这个|那个).*(改|提交|执行|做|办)/u.test(text)) {
+    return true
+  }
+
+  // "就用...方案" / "采用...方案" - approval to execute a plan
+  if (/(就|直接|采用|选用).*(第.*方案|这个方案|那个方案|方案)/u.test(text)) {
+    return true
+  }
+
+  // "继续...并(修改|执行)" - continuation with explicit action
+  if (/继续.*并.*(修改|执行|推进|实现|改)/u.test(text)) {
+    return true
+  }
+
+  return false
 }
 
 function isSharedChangeAuthorizationRequest(text: string): boolean {

@@ -62,6 +62,7 @@
 
 import { z } from 'zod'
 import type { NexusEvent } from '../shared/events.js'
+import type { SessionAuthorizationState } from '../shared/session.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
 import type { RuntimeExecuteOptions } from './Runtime.js'
 import type { NexusStorage } from '../storage/Storage.js'
@@ -69,7 +70,7 @@ import type { AnyTool } from '../tools/Tool.js'
 import { type ToolPolicy } from './LocalCodingRuntime.js'
 import { mapEventsToMessages } from './eventsTranslator.js'
 import { allocateBudget, getHistoryEventLoadLimit } from './contextAssembler.js'
-import { buildUserIntakeGuidanceEvent } from './intentGuidance.js'
+import { buildSelectedUserIntakeGuidanceEvent } from './intentGuidanceSelector.js'
 import { buildTaskScopeDeclaredEvent } from './taskScope.js'
 import { isOptionSelectionClarificationText, normalizeOptionSelection } from './pipeline/providerTurn.js'
 
@@ -168,11 +169,23 @@ export async function prepareRuntimeStart(
     }
   }
 
+  // Phase 2.3 of authorization-continuity: load previous authorization
+  // state from session so that continuation phrases can inherit it.
+  let previousAuthorizationState: SessionAuthorizationState | undefined
+  if (deps.storage) {
+    try {
+      const session = await deps.storage.getSession(options.sessionId, { includeEvents: false })
+      previousAuthorizationState = session?.authorizationState
+    } catch (e) {
+      deps.logger?.debug('Failed to load session authorization state', e)
+    }
+  }
+
   // Step 3: build intake event. The helper builds; the
   // caller yields. (See "Non-goals" above for why the
   // helper does not yield itself.)
-  const intakeEvent = await buildUserIntakeGuidanceEvent({
-    adapter: adapter as Parameters<typeof buildUserIntakeGuidanceEvent>[0]['adapter'],
+  const intakeEvent = await buildSelectedUserIntakeGuidanceEvent({
+    adapter: adapter as Parameters<typeof buildSelectedUserIntakeGuidanceEvent>[0]['adapter'],
     modelId: cleanedModelId,
     apiKey: settings.apiKey,
     baseUrl: settings.baseUrl,
@@ -181,6 +194,7 @@ export async function prepareRuntimeStart(
     latestPrompt: options.prompt,
     cwd: options.cwd,
     signal: options.signal,
+    previousAuthorizationState,
   })
   previousEvents = [...previousEvents, intakeEvent]
 

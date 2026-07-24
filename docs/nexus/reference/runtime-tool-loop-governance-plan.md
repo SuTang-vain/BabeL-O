@@ -25,7 +25,7 @@ Implemented pieces:
 - Generic recoverable tool execution failures can be returned to the provider as `tool_result is_error=true` instead of terminal `TOOL_ERROR`.
 - Built-in tools have lightweight structured repair hints for common recoverable failures.
 - Runtime already has final-response-only and respond-only suppression paths for known tool-call-shaped text dialects.
-- Phase D (landed): a first-class `final_check` state allows exactly one bounded read-only check (Read/Grep/Glob/ListDir) before `must_respond`; write/execute/task tools are denied with `TOOL_DENIED_FINAL_CHECK`. `must_respond` remains the backstop (`TOOL_LOOP_FINAL_RESPONSE_ONLY`) once the one check is used or budget is exhausted.
+- Phase D (landed + soft-deny routing exception): a first-class `final_check` state allows exactly one bounded read-only check (Read/Grep/Glob/ListDir) before `must_respond`. Write/execute/task tools attempted during `final_check` are **routed through the normal permission flow** (event `FINAL_CHECK_WRITE_ROUTED`) so the user can approve via the panel under `policyMode: 'soft-deny'`, rather than being hard-denied with `TOOL_DENIED_FINAL_CHECK`. `must_respond` remains the backstop (`TOOL_LOOP_FINAL_RESPONSE_ONLY`) once the one check is used or budget is exhausted. Default reserve bumped 3->5, configurable via `config.runtime.finalResponseOnlyRemainingLoops`.
 - Phase C (partially landed): loop-budget state is surfaced in the model-visible execution state block (iteration count, context %, phase, finalization reason), and `findRepeatedToolInputs` surfaces the top repeated tool input as a concrete nudge (e.g. `Bash npx tsx --test test/mcp.test.ts ×3 — reuse the latest result`) at phase ≥ synthesize.
 
 Open pieces:
@@ -154,6 +154,33 @@ Grant `final_check` only when all conditions are true:
 
 Never grant `final_check` for `Write`, `Edit`, `Bash`, `TaskCreate`, `SkillSave`, MCP write tools, or Agent lifecycle tools.
 
+> **Phase D exception (soft-deny routing, landed 2026-07-23):** the original
+> Phase D hard-denied write/execute tool calls during `final_check` with
+> `TOOL_DENIED_FINAL_CHECK`. This blocked legitimate "last edit" completions
+> when the model correctly identified the needed change but ran out of
+> gathering budget. The exception **routes** such tool calls through the
+> normal permission flow instead of hard-denying them:
+>
+> - `reduceProviderTurnOutcome` returns `kind: 'tool_calls'` (not `continue`
+>   with a denial) so `executeProviderToolCall` runs its standard policy +
+>   scope-boundary + risk permission gate.
+> - Under `policyMode: 'soft-deny'` (Go TUI default), the permission panel
+>   opens and the user decides. Under `'strict'`, the policy gate denies.
+> - The new event code is `FINAL_CHECK_WRITE_ROUTED` (replaces
+>   `TOOL_DENIED_FINAL_CHECK`); `severity: 'soft'` is preserved.
+> - Any dispatch in `final_check` (approved or denied) still consumes the one
+>   bounded check (`finalCheckUsed = true`), so runaway retries remain bounded.
+> - The default finalization reserve was bumped from 3 to 5 iterations
+>   (`DEFAULT_FINAL_RESPONSE_ONLY_REMAINING_LOOPS`), configurable via
+>   `config.runtime.finalResponseOnlyRemainingLoops`, to give the model more
+>   convergence room before entering `final_check`.
+>
+> The "Never grant final_check for write tools" rule above still holds in the
+> sense that write tools are **not auto-granted** during `final_check` — they
+> require explicit user approval via the permission flow rather than running
+> silently. Read-only tools (`Read/Grep/Glob/ListDir`) remain auto-granted
+> within the one bounded check.
+
 ## Phases
 
 | Phase | Status | Scope | Exit criteria |
@@ -161,7 +188,7 @@ Never grant `final_check` for `Write`, `Edit`, `Bash`, `TaskCreate`, `SkillSave`
 | Phase A | Partially Landed | Recoverable tool result path and structured repair hints. | Recoverable tool failures are provider-visible and paired to the original tool call. |
 | Phase B | Partially Landed | DSML and text-tool dialect registry. | Hidden-tool DSML is suppressed and retried; visible-tools DSML remains suppress-only until strict parser tests exist. Full-width (DSML) detection landed in `detectToolCallTextLeak` (suppress-only slice); formal typed registry + strict parser remain open. |
 | Phase C | Partially Landed | Loop budget diagnostics. | Invocation diagnostics and execution metrics expose loop state and finalization reason. (Iteration/phase/reason surfaced in execution state block; top repeated-tool input nudge wired via `findRepeatedToolInputs`. Typed `ToolLoopBudget` struct + `reason` field remain open.) |
-| Phase D | Landed | One bounded `final_check`. | One read-only in-scope check can run before `must_respond`; write/execute/task tools are denied with `TOOL_DENIED_FINAL_CHECK`. Per-tool bounded enforcement deferred (Non-goal). |
+| Phase D | Landed (+ soft-deny routing exception) | One bounded `final_check`. | One read-only in-scope check can run before `must_respond`; write/execute/task tools are **routed through the permission flow** (user decides via panel under `soft-deny`) with `FINAL_CHECK_WRITE_ROUTED` instead of hard-denied with `TOOL_DENIED_FINAL_CHECK`. Per-tool bounded enforcement deferred (Non-goal). Default reserve bumped 3->5 and made configurable via `config.runtime.finalResponseOnlyRemainingLoops`. |
 | Phase E | Watch | Adaptive budget profiles. | Any expanded budget is justified by task intent, context pressure, timeout pressure, and tool novelty telemetry. |
 
 ## Verification
@@ -173,8 +200,8 @@ Minimum regression set:
 - missing file, invalid input, ambiguous edit, and invalid glob remain recoverable;
 - final-response-only plus DSML text is suppressed and retried;
 - respond-only plus pseudo tool-call text is suppressed and retried;
-- `final_check` allows only one read-only bounded tool call;
-- `final_check` cannot execute write, edit, bash, task, skill-save, MCP write, or agent lifecycle tools;
+- `final_check` allows only one read-only bounded tool call (auto-granted);
+- `final_check` write/execute tool calls are routed to the permission flow (`FINAL_CHECK_WRITE_ROUTED`) rather than auto-executed; under `soft-deny` the user must approve before they run;
 - "continue task" after loop pressure starts a fresh execution budget while retaining recent failure diagnostics.
 
 ## Archived Source Documents

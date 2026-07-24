@@ -44,83 +44,70 @@ terminal into a fragile one-shot chat.
 
 ## Why BabeL-O?
 
-- **Native terminal interface:** `bbl go` is the official interactive client,
-  built with Bubble Tea and tuned for multi-line input, slash panels, mouse
-  selection, permission dialogs, and long transcripts.
-- **Durable sessions:** Nexus keeps session state, tool traces, context,
-  approvals, and runtime metadata outside the TUI process. You can reconnect,
-  inspect, and continue.
-- **Permission-first tools:** Bash, Write, Edit, MCP tools, and memory writes
+- **Multiple parallel sessions across worktrees** — Work on isolated workspaces
+  simultaneously. The background daemon holds state, so your client can disconnect
+  and reconnect without losing tasks.
+  *(Technical: worktree isolation + session persistence + WebSocket reconnect)*
+
+- **10MB standalone binary client** — `bbl go` is a Go TUI binary (~10MB) with no
+  Node.js dependency. Drop it in a container and run.
+  *(Technical: Go Bubble Tea TUI + Node 22+ daemon with native SQLite)*
+
+- **Completes long tasks for real** — Context compaction, tool loop boundaries,
+  permission governance, and sub-agent coordination — not a demo-level toy.
+  *(Technical: LLMCodingRuntime + TaskSession + AgentLoop + scope governance)*
+
+- **Permission-first tools** — Bash, Write, Edit, MCP tools, and memory writes
   stay visible. Approve once, approve for a session, or reject with feedback.
-- **Context you can inspect:** `/context` shows budget, compaction, memory,
+
+- **Inspectable context** — `/context` shows budget, compaction, memory,
   recovery, working set, and long-context diagnostics instead of hiding the
   agent's state.
-- **Session collaboration:** `/session`, `/inbox`, and SessionChannel let
+
+- **Session collaboration** — `/session`, `/inbox`, and SessionChannel let
   sessions exchange findings, handoffs, decisions, and review requests without
   treating those messages as secret instructions.
-- **Model and memory control:** Switch model/provider profiles from the TUI,
-  and optionally enable MemoryOS for local long-term recall.
 
-## Installation
+---
 
-### Recommended: release installer
+## Quick Start (5 minutes)
 
-The installer downloads the lightweight release package for your platform,
-installs a small `bbl` launcher, bundles the matching Go TUI binary, and runs a
-post-install self-check.
+> ⚠️ **Requires Node.js >= 22.** If your Node is older, upgrade first.
+> For alternative installation methods, see [INSTALLATION.md](docs/INSTALLATION.md).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | bash
+# Install globally
+npm install -g babel-o
+
+# Initialize with interactive setup (coming soon: bbl config init)
+bbl config add anthropic "$ANTHROPIC_API_KEY"
+bbl config use anthropic/claude-sonnet-4-6
+
+# Launch the terminal UI
 bbl go
 ```
 
-Install a specific version:
+Then try: **"Explain this repository's main entry point"**
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.4.1 bash
-```
+See [Common Commands](#common-commands) for more usage examples.
 
-Requirements: macOS or Linux, Node.js >= 22 on `PATH`.
+## Installation
 
-### npm
-
-Useful for Node developers and source-based installs:
+### Recommended: npm global install
 
 ```bash
 npm install -g babel-o
 bbl go
 ```
 
-The release installer is preferred for most users because it includes the
-prebuilt Go TUI for your platform.
+Requirements: macOS or Linux, Node.js >= 22.
 
-### From source
+> For alternative installation methods (release installer, from source), see
+> [INSTALLATION.md](docs/INSTALLATION.md).
 
-```bash
-git clone https://github.com/SuTang-vain/BabeL-O.git
-cd BabeL-O
-npm ci
-npm test
-npm run build
-npm link
-cd clients/go-tui && make build
-bbl go
-```
+---
 
-## First Run
-
-Configure a provider and a default model, then start the TUI:
-
-```bash
-bbl config add anthropic "$ANTHROPIC_API_KEY"
-bbl config use anthropic/claude-sonnet-4-6
-bbl go
-```
-
-You can also configure providers and switch models from inside the TUI with
-`/model` (or `Ctrl+L`).
-
-Inside the TUI:
+## TUI Keybindings
 
 | Input | Action |
 | :--- | :--- |

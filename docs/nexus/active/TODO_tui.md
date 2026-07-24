@@ -75,7 +75,34 @@ CLI 侧已提供轻量 LSP context mention：`@symbol:` / `@sym:` 可补全 work
 
 后续若重新打开实现项，按 Phase 1 状态栏增强 + session list badge、Phase 2 tree view、Phase 3 activity overlay、Phase 4 debug graph 的顺序推进。发起侧 UX 另行以 `/inbox` reply 和 `/channel send <sessionId|channelId>` 评估，但必须具备 typed message、evidence、confirmation preview 与手动提交边界。
 
-### 持续语义边界
+### P1 Go TUI 任务面板实时更新 + AskUserQuestion 弹窗 ✅ Phase 2-6 已落地
+
+> 详细规划见 [proposals/go-tui-task-board-and-ask-user-question-plan.md](../proposals/go-tui-task-board-and-ask-user-question-plan.md)。Phase 2-6（事件发射、TUI 处理、事件协议、工具+路由、弹窗、runtime 闭环）已收口；Phase 7 验证待收口。
+
+### P1 Go TUI Ctrl+D 顶部卡片任务页（翻页）
+
+> 详细规划见 [proposals/go-tui-top-card-task-page-plan.md](../proposals/go-tui-top-card-task-page-plan.md)。
+
+**根因：** `/tasks` 斜杠命令在 agent 运行期间（`m.running === true`）被 `startPrompt` 阻断；`Ctrl+D` 是全局 key handler，不受 `!m.running` 守卫，是运行态唯一可用的监控出口。当前顶部卡片展示四列（MCP/Skills/Session/Memory），缺失任务信息。
+
+**修复项：**
+- [x] Phase 2 — 状态 + 渲染：`topCardPage int` 字段 + `renderTopCardTaskPage` 在 `chrome.go`
+- [x] Phase 3 — 按键处理：左右方向键切换 page 0/1，仅 `topCardOpen` 时激活
+- [ ] Phase 4 — 验证：`go build ./...` + `go test ./internal/tui` + 手动 smoke
+
+### 问题 1：任务面板在 turn 中不更新 ✅ 已修复
+
+**修复：** `task.ts` Phase 2 事件发射 + Go TUI Phase 3 `case "task_created"` 实时更新 `m.taskBoard`。
+
+### 问题 2：AskUserQuestion 弹窗不存在 ✅ 已修复
+
+**修复：** Phase 4 事件协议 + Phase 5 工具/路由 + Phase 6 TUI 弹窗 + runtime pending_question 拦截闭环。
+
+### 验证标准
+
+- `cd clients/go-tui && go build ./...` / `go test ./internal/tui` 通过
+- 手动 `bbl go` 验证：`Ctrl+D` → `→` 看到任务列表 → `←` 回到列布局 → `Ctrl+D` 关闭
+- 手动验证：agent 运行中 `Ctrl+D` → `→` 实时可见任务创建
 
 - 不实现 raw transcript sharing UI。
 - 不把另一个 session 的消息渲染成当前 session 的用户输入。

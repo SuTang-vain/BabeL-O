@@ -64,7 +64,8 @@ function seedSqliteWithSession(
         updated_at TEXT NOT NULL,
         result TEXT,
         error TEXT,
-        metadata TEXT
+        metadata TEXT,
+        authorization_state TEXT
       );
     `)
     db.prepare(

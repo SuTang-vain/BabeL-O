@@ -895,6 +895,9 @@ function parseProviderRequestBody(init?: RequestInit): any {
 }
 
 function isAgentLoopIntakeRequest(body: any): boolean {
+  // In simplified mode (default since 2026-07-10), intake is computed
+  // locally via intentGuidanceSimplified.ts — no intake LLM API calls.
+  if (process.env.BABEL_O_INTENT_GUIDANCE !== 'default') return false
   return JSON.stringify(body).includes('fast intake classifier')
 }
 
@@ -1043,7 +1046,8 @@ test('runAgentLoop non-dry-run provider smoke executes fixed runtime-backed task
     assert.ok(finalSession.events.some(event => event.type === 'tool_started' && event.name === 'Read'))
     assert.ok(finalSession.events.some(event => event.type === 'tool_completed' && event.name === 'Read' && event.success))
     assert.equal(listNexusTasks(finalSession.sessionId).tasks[0].status, 'completed')
-    assert.equal(requestBodies.filter(isAgentLoopIntakeRequest).length, 3)
+    // In simplified intent guidance, intake is local (no LLM API calls).
+    assert.equal(requestBodies.filter(isAgentLoopIntakeRequest).length, 0)
     assert.equal(requestBodies.some(body => JSON.stringify(body).includes('arbitrary user task')), false)
   } finally {
     globalThis.fetch = originalFetch

@@ -1,5 +1,6 @@
 import type { NexusStorage } from '../storage/Storage.js'
 import type { AnyTool } from './Tool.js'
+import { askUserQuestionTool } from './builtin/askUserQuestion.js'
 import { bashTool } from './builtin/bash.js'
 import { contextRecentTool } from './builtin/contextRecent.js'
 import { contextSearchTool } from './builtin/contextSearch.js'
@@ -21,7 +22,7 @@ import {
   skillShowTool,
   skillValidateTool,
 } from './builtin/skillTool.js'
-import { taskTool } from './builtin/task.js'
+import { taskListTool, taskTool, taskUpdateTool } from './builtin/task.js'
 import { webSearchTool } from './builtin/webSearch.js'
 import { writeTool } from './builtin/write.js'
 
@@ -49,7 +50,10 @@ export function createDefaultToolRegistry(opts: CreateToolRegistryOptions = {}):
     writeTool,
     editTool,
     bashTool,
+    askUserQuestionTool,
     taskTool,
+    taskListTool,
+    taskUpdateTool,
     webSearchTool,
     // PR-8 + cross-session extension: on-demand context tools (Track A Phase 2).
     // Read risk, no approval. Do NOT enter active context (INV-L12); called

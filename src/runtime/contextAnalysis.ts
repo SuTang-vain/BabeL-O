@@ -10,7 +10,13 @@ import {
   isRecoveryBoundaryError,
   type AssembledContext,
 } from './contextAssembler.js'
-import { shouldSuppressToolsForIntent } from './intentGuidance.js'
+import {
+  formatSelectedUserIntentGuidance,
+  getIntentGuidanceMode,
+  shouldSuppressSelectedToolsForIntent,
+  getSelectedToolSuppressionReason,
+} from './intentGuidanceSelector.js'
+import { formatUserIntentGuidance as formatDefaultUserIntentGuidance } from './intentGuidance.js'
 import {
   estimateContextTokens,
   getContextWindowState,
@@ -115,6 +121,16 @@ export type ContextAnalysisDiagnostics = {
     code: string
     timestamp: string
     message: string
+  }
+  intentGuidance: {
+    mode: 'default' | 'simplified'
+    providerVisibleChars: number
+    providerVisibleLines: number
+    baselineChars: number
+    estimatedCharsSaved: number
+    estimatedSavingsPercent: number
+    toolsVisible: boolean
+    toolSuppressionReason: string
   }
   workingSetPaths: Array<{
     path: string
@@ -226,6 +242,12 @@ export type ContextAnalysisDiagnosticEnvelope = RuntimeDiagnosticsEnvelope<{
   remainingTokens: number
   compactHasBoundary: boolean
   toolsVisible: boolean
+  intentGuidanceMode: 'default' | 'simplified'
+  intentGuidanceProviderVisibleChars: number
+  intentGuidanceBaselineChars: number
+  intentGuidanceEstimatedCharsSaved: number
+  intentGuidanceEstimatedSavingsPercent: number
+  intentToolSuppressionReason: string
   retainedContextItems: number
   droppedContextItems: number
   longTermMemoryProvider: string
@@ -476,6 +498,12 @@ function buildContextDiagnosticEnvelope(options: {
       remainingTokens: options.diagnostics.remainingTokens,
       compactHasBoundary: options.compact.hasBoundary,
       toolsVisible: options.runtimePolicy.toolsVisible,
+      intentGuidanceMode: options.diagnostics.intentGuidance.mode,
+      intentGuidanceProviderVisibleChars: options.diagnostics.intentGuidance.providerVisibleChars,
+      intentGuidanceBaselineChars: options.diagnostics.intentGuidance.baselineChars,
+      intentGuidanceEstimatedCharsSaved: options.diagnostics.intentGuidance.estimatedCharsSaved,
+      intentGuidanceEstimatedSavingsPercent: options.diagnostics.intentGuidance.estimatedSavingsPercent,
+      intentToolSuppressionReason: options.diagnostics.intentGuidance.toolSuppressionReason,
       retainedContextItems: options.diagnostics.selection.retained.length,
       droppedContextItems: options.diagnostics.selection.dropped.length,
       longTermMemoryProvider: options.diagnostics.longTermMemory.provider,
@@ -509,11 +537,11 @@ function buildRuntimePolicyDiagnostics(
   guidance: AssembledContext['userIntentGuidance'],
   events: NexusEvent[],
 ): ContextAnalysis['runtimePolicy'] {
-  const toolsVisible = !shouldSuppressToolsForIntent(guidance)
+  const toolsVisible = !shouldSuppressSelectedToolsForIntent(guidance)
   const recoveryBoundary = findLatestRecoveryBoundary(events)
   return {
     toolsVisible,
-    toolSuppressionReason: toolsVisible ? '' : `intent:${guidance.intent}:${guidance.actionHint}`,
+    toolSuppressionReason: toolsVisible ? '' : (getSelectedToolSuppressionReason(guidance) ?? `intent:${guidance.intent}:${guidance.actionHint}`),
     recoveryBoundaryActive: recoveryBoundary !== null,
     recoveryBoundaryCode: recoveryBoundary?.code ?? '',
     recoveryBoundaryTimestamp: recoveryBoundary?.timestamp ?? '',
@@ -604,6 +632,7 @@ function buildContextDiagnostics(options: {
       timestamp: options.runtimePolicy.recoveryBoundaryTimestamp,
       message: options.runtimePolicy.recoveryBoundaryMessage,
     },
+    intentGuidance: buildIntentGuidanceDiagnostics(options.assembled.userIntentGuidance, options.runtimePolicy),
     workingSetPaths: findWorkingSetPaths(options.events, options.prompt),
     taskScope: buildTaskScopeDiagnostics(options.events, options.prompt, options.cwd),
     autoCompactFloor: buildAutoCompactFloor(options.window, options.autoCompact, options.assembled, options.cacheAwareCompactPolicy),
@@ -621,6 +650,25 @@ function buildContextDiagnostics(options: {
     microcompactMetrics: options.assembled.microcompactMetrics,
   })
   return diagnostics
+}
+
+function buildIntentGuidanceDiagnostics(
+  guidance: AssembledContext['userIntentGuidance'],
+  runtimePolicy: ContextAnalysis['runtimePolicy'],
+): ContextAnalysisDiagnostics['intentGuidance'] {
+  const rendered = formatSelectedUserIntentGuidance(guidance)
+  const baseline = formatDefaultUserIntentGuidance(guidance)
+  const estimatedCharsSaved = Math.max(0, baseline.length - rendered.length)
+  return {
+    mode: getIntentGuidanceMode(),
+    providerVisibleChars: rendered.length,
+    providerVisibleLines: rendered.length === 0 ? 0 : rendered.split('\n').length,
+    baselineChars: baseline.length,
+    estimatedCharsSaved,
+    estimatedSavingsPercent: Math.round((estimatedCharsSaved / Math.max(1, baseline.length)) * 100),
+    toolsVisible: runtimePolicy.toolsVisible,
+    toolSuppressionReason: runtimePolicy.toolSuppressionReason,
+  }
 }
 
 function buildContextVisualizationDiagnostics(options: {

@@ -141,8 +141,13 @@ func (m model) renderModelOverlay(width int) string {
 // Reset per-step state (selection index, draft input) so
 // re-entering /model from a previous partially-completed
 // flow doesn't carry stale state.
+// Index 0 is "Add Custom Provider...", so default to 1 (first real provider)
+// if providers exist.
 func (m *model) openModelRegistry() {
 	m.modelPickProviderIdx = 0
+	if len(m.modelCatalog.Providers) > 0 {
+		m.modelPickProviderIdx = 1
+	}
 	m.modelPickSelectedIdx = 0
 	m.modelPickSelectedID = ""
 	m.modelPickProviderDraft = ""
@@ -187,6 +192,8 @@ func (m *model) enterModelPicker() tea.Cmd {
 // API key step (or to the picker directly when the provider
 // is already configured and the operator chooses to skip
 // the key / base URL steps via the hint chip).
+// The first entry is always "[Add Custom Provider...]" which
+// launches the custom provider wizard.
 func (m model) renderModelPickProvider(width int) string {
 	if m.inputMode != modeModelPickProvider {
 		return ""
@@ -194,41 +201,50 @@ func (m model) renderModelPickProvider(width int) string {
 	header := titleStyle.Render("BABEL Model Registry")
 	subtitle := mutedStyle.Render("Select provider, configure API access, then choose a model.")
 	lines := []string{header, subtitle, ""}
-	if len(m.modelCatalog.Providers) == 0 {
-		lines = append(lines, mutedStyle.Render("  No providers reported by the current Nexus runtime."))
+
+	// First entry: Add Custom Provider
+	marker := "  "
+	if m.modelPickProviderIdx == 0 {
+		marker = "> "
+	}
+	addRow := marker + "Add Custom Provider..."
+	if m.modelPickProviderIdx == 0 {
+		addRow = focusedLineStyle.Render(addRow)
+	}
+	lines = append(lines, "  "+addRow)
+
+	providerCount := len(m.modelCatalog.Providers)
+	if providerCount == 0 {
+		lines = append(lines, mutedStyle.Render("  No registered providers."))
 	} else {
-		// Single-column layout: just the provider name. The
-		// configured / needs-api-key state is implied by
-		// the next step's prompt (step 2 asks for an API
-		// key when the provider is unconfigured, skips
-		// straight to step 4 when it's already configured),
-		// so the list itself doesn't need a status column.
 		lines = append(lines, mutedStyle.Render("  provider"))
-		visibleRows := max(1, m.height-12)
+		visibleRows := max(1, m.height-14)
 		scrollOffset := 0
-		if m.modelPickProviderIdx >= visibleRows {
-			scrollOffset = m.modelPickProviderIdx - visibleRows + 1
+		// Adjust for "Add Custom Provider" entry
+		adjustedIdx := m.modelPickProviderIdx - 1
+		if adjustedIdx >= visibleRows {
+			scrollOffset = adjustedIdx - visibleRows + 1
 		}
-		if scrollOffset+visibleRows > len(m.modelCatalog.Providers) {
-			scrollOffset = max(0, len(m.modelCatalog.Providers)-visibleRows)
+		if scrollOffset+visibleRows > providerCount {
+			scrollOffset = max(0, providerCount-visibleRows)
 		}
 		if scrollOffset > 0 {
 			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
 		}
-		for i := 0; i < visibleRows && scrollOffset+i < len(m.modelCatalog.Providers); i++ {
+		for i := 0; i < visibleRows && scrollOffset+i < providerCount; i++ {
 			actualIdx := scrollOffset + i
 			p := m.modelCatalog.Providers[actualIdx]
 			marker := "  "
-			if actualIdx == m.modelPickProviderIdx {
+			if actualIdx+1 == m.modelPickProviderIdx {
 				marker = "> "
 			}
 			row := marker + p.DisplayName
-			if actualIdx == m.modelPickProviderIdx {
+			if actualIdx+1 == m.modelPickProviderIdx {
 				row = focusedLineStyle.Render(row)
 			}
 			lines = append(lines, "  "+row)
 		}
-		remainingBelow := len(m.modelCatalog.Providers) - (scrollOffset + visibleRows)
+		remainingBelow := providerCount - (scrollOffset + visibleRows)
 		if remainingBelow > 0 {
 			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
 		}
@@ -279,6 +295,192 @@ func (m model) renderModelPickModel(width int) string {
 		m.modelPickSubmitting,
 		m.spinner.View(),
 	).View(width)
+}
+
+// renderAddProviderName is step 0a: enter provider name/ID
+func (m model) renderAddProviderName(width int) string {
+	if m.inputMode != modeAddProviderName {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+	lines := []string{
+		titleStyle.Render("Add Custom Provider"),
+		mutedStyle.Render("Enter a unique provider ID (e.g., 'my-custom-llm')"),
+		"",
+		"  " + m.input.View(),
+		"",
+		mutedStyle.Render("  enter continue · esc cancel"),
+	}
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+// renderAddProviderProtocol is step 0b: select API protocol
+func (m model) renderAddProviderProtocol(width int) string {
+	if m.inputMode != modeAddProviderProtocol {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+	lines := []string{
+		titleStyle.Render("Select Protocol"),
+		mutedStyle.Render("Choose the API format this provider uses"),
+		"",
+	}
+	protocols := []string{"OpenAI-compatible", "Anthropic-compatible"}
+	for i, p := range protocols {
+		marker := "  "
+		if i == m.addProviderProtocol {
+			marker = "> "
+		}
+		row := marker + p
+		if i == m.addProviderProtocol {
+			row = focusedLineStyle.Render(row)
+		}
+		lines = append(lines, "  "+row)
+	}
+	lines = append(lines, "", mutedStyle.Render("  ↑↓ navigate · enter select · esc back"))
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+// renderAddProviderURL is step 0c: enter base URL
+func (m model) renderAddProviderURL(width int) string {
+	if m.inputMode != modeAddProviderURL {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+	lines := []string{
+		titleStyle.Render("Enter Base URL"),
+		mutedStyle.Render(fmt.Sprintf("Provider: %s", m.addProviderName)),
+		"",
+		"  " + m.input.View(),
+	}
+	if m.addProviderError != "" {
+		lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+	}
+	lines = append(lines, "", mutedStyle.Render("  enter continue · esc back"))
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+// renderAddProviderKey is step 0d: enter API key
+func (m model) renderAddProviderKey(width int) string {
+	if m.inputMode != modeAddProviderKey {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+	lines := []string{
+		titleStyle.Render("Enter API Key"),
+		mutedStyle.Render(fmt.Sprintf("Provider: %s · URL: %s", m.addProviderName, m.addProviderURL)),
+		"",
+		"  " + modelAPIKeyFieldDisplay(m.addProviderKey),
+	}
+	if m.addProviderError != "" {
+		lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+	}
+	lines = append(lines, "", mutedStyle.Render("  enter verify · esc back"))
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+// renderAddProviderVerify is step 0e: verify credentials
+func (m model) renderAddProviderVerify(width int) string {
+	if m.inputMode != modeAddProviderVerify {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+	lines := []string{
+		titleStyle.Render("Verifying Provider"),
+		mutedStyle.Render(fmt.Sprintf("%s @ %s", m.addProviderName, m.addProviderURL)),
+		"",
+	}
+	if m.addProviderVerifying {
+		lines = append(lines, "  "+m.spinner.View()+"  verifying credentials...")
+	} else if m.addProviderError != "" {
+		lines = append(lines, errorStyle.Render("  "+m.addProviderError))
+		lines = append(lines, "", mutedStyle.Render("  esc back to retry"))
+	} else {
+		lines = append(lines, statusStyle.Render("  ✓ Credentials verified"))
+	}
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
+}
+
+func (m model) renderAddProviderModel(width int) string {
+	if m.inputMode != modeAddProviderModel {
+		return ""
+	}
+	rc := NewRenderContext(width)
+	rc.SetFrameStyle(overlayFrameStyle)
+
+	// Picker: the verify step auto-fetched a model list from the
+	// upstream `/models` endpoint. Render it as a scrollable
+	// pick-list (up/down + enter) instead of a free-text field.
+	if len(m.addProviderModels) > 0 {
+		lines := []string{
+			titleStyle.Render("Select Model"),
+			mutedStyle.Render(fmt.Sprintf("Provider: %s · URL: %s", m.addProviderName, m.addProviderURL)),
+			mutedStyle.Render(fmt.Sprintf("%d models fetched from %s", len(m.addProviderModels), m.addProviderName)),
+			"",
+			mutedStyle.Render("  model"),
+		}
+		visibleRows := max(1, m.height-12)
+		scrollOffset := 0
+		if m.addProviderModelIdx >= visibleRows {
+			scrollOffset = m.addProviderModelIdx - visibleRows + 1
+		}
+		if scrollOffset+visibleRows > len(m.addProviderModels) {
+			scrollOffset = max(0, len(m.addProviderModels)-visibleRows)
+		}
+		if scrollOffset > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↑ %d more", scrollOffset)))
+		}
+		for i := 0; i < visibleRows && scrollOffset+i < len(m.addProviderModels); i++ {
+			actualIdx := scrollOffset + i
+			entry := m.addProviderModels[actualIdx]
+			marker := "  "
+			if actualIdx == m.addProviderModelIdx {
+				marker = "> "
+			}
+			display := firstNonEmpty(entry.Name, entry.ID)
+			row := marker + display
+			if actualIdx == m.addProviderModelIdx {
+				row = focusedLineStyle.Render(row)
+			}
+			lines = append(lines, "  "+row)
+		}
+		remainingBelow := len(m.addProviderModels) - (scrollOffset + visibleRows)
+		if remainingBelow > 0 {
+			lines = append(lines, mutedStyle.Render(fmt.Sprintf("  ↓ %d more", remainingBelow)))
+		}
+		if m.addProviderError != "" {
+			lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+		}
+		lines = append(lines, "", mutedStyle.Render("  ↑↓/Tab navigate · enter select · esc back"))
+		rc.AddPart(strings.Join(lines, "\n"))
+		return rc.Render()
+	}
+
+	// Manual-entry fallback: no model list came back from verify
+	// (e.g. Anthropic-compatible, which has no `/models` endpoint).
+	lines := []string{
+		titleStyle.Render("Enter Model Name"),
+		mutedStyle.Render(fmt.Sprintf("Provider: %s · URL: %s", m.addProviderName, m.addProviderURL)),
+		mutedStyle.Render("No model list available — enter a model id manually."),
+		"",
+		"  " + m.input.View(),
+	}
+	if m.addProviderError != "" {
+		lines = append(lines, "", errorStyle.Render("  "+m.addProviderError))
+	}
+	lines = append(lines, "", mutedStyle.Render("  enter save provider · esc back"))
+	rc.AddPart(strings.Join(lines, "\n"))
+	return rc.Render()
 }
 
 // padRightPlain pads a string with spaces to the given

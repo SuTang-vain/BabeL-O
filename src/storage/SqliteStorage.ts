@@ -4,7 +4,7 @@ import { dirname } from 'node:path'
 import { mkdirSync } from 'node:fs'
 import type { AgentJob, AgentJobFilter } from '../shared/agentJob.js'
 import type { NexusEvent } from '../shared/events.js'
-import type { SessionSnapshot } from '../shared/session.js'
+import type { SessionSnapshot, SessionAuthorizationState } from '../shared/session.js'
 import type { SessionChannel, SessionMessage } from '../shared/sessionChannel.js'
 import type { NexusTask } from '../shared/task.js'
 import type { ToolTrace } from '../shared/toolTrace.js'
@@ -128,12 +128,14 @@ export class SqliteStorage implements NexusStorage {
           session_id, cwd, prompt, phase, created_at, updated_at, result,
           error, last_user_input,
           queue_id, parent_session_id, assigned_agent_id, current_task_id,
-          failure_reason, terminal_reason, pending_input, metadata, origin_cwd
+          failure_reason, terminal_reason, pending_input, metadata, origin_cwd,
+          authorization_state
         ) VALUES (
           :sessionId, :cwd, :prompt, :phase, :createdAt, :updatedAt, :result,
           :error, :lastUserInput,
           :queueId, :parentSessionId, :assignedAgentId, :currentTaskId,
-          :failureReason, :terminalReason, :pendingInput, :metadata, :originCwd
+          :failureReason, :terminalReason, :pendingInput, :metadata, :originCwd,
+          :authorizationState
         )
         ON CONFLICT(session_id) DO UPDATE SET
           cwd = excluded.cwd,
@@ -150,7 +152,8 @@ export class SqliteStorage implements NexusStorage {
           failure_reason = excluded.failure_reason,
           terminal_reason = excluded.terminal_reason,
           pending_input = excluded.pending_input,
-          metadata = excluded.metadata`,
+          metadata = excluded.metadata,
+          authorization_state = excluded.authorization_state`,
       )
       .run(sessionParams(session))
 
@@ -486,6 +489,7 @@ export class SqliteStorage implements NexusStorage {
         { name: 'pending_input', type: 'TEXT' },
         { name: 'metadata', type: 'TEXT' },
         { name: 'origin_cwd', type: 'TEXT' },
+        { name: 'authorization_state', type: 'TEXT' },
       ]
       for (const col of expectedSessions) {
         if (!sessionsColumns.includes(col.name)) {
@@ -783,6 +787,23 @@ export class SqliteStorage implements NexusStorage {
       this.db.exec('PRAGMA user_version = 15;')
       version = 15
     }
+
+    if (version < 16) {
+      // Phase 2 of authorization-continuity-execution-plan.md: persisted
+      // turn-level authorization state so that "继续任务" / "continue" can
+      // inherit the previous turn's authorizationLevel + consentScope instead
+      // of being reset to inspect/inferred_none every turn (the
+      // session_1de7cf54 failure: Turn 6 "继续任务" lost the local_change
+      // authorization established in Turn 4-5).
+      const sessionsColumns = (this.db.prepare(`PRAGMA table_info(sessions)`).all() as Row[]).map(r => String(r.name))
+      if (!sessionsColumns.includes('authorization_state')) {
+        this.db.exec(`ALTER TABLE sessions ADD COLUMN authorization_state TEXT`)
+      }
+      // No backfill needed: existing sessions simply have no authorization_state
+      // and will derive from scratch on their next turn.
+      this.db.exec('PRAGMA user_version = 16;')
+      version = 16
+    }
   }
 
   private ensureEventSequenceSchema(): void {
@@ -945,6 +966,7 @@ function sessionParams(session: SessionSnapshot): Record<string, string | null> 
     pendingInput: session.pendingInput ? JSON.stringify(session.pendingInput) : null,
     metadata: session.metadata ? JSON.stringify(session.metadata) : null,
     originCwd: session.originCwd ?? null,
+    authorizationState: session.authorizationState ? JSON.stringify(session.authorizationState) : null,
   }
 }
 
@@ -969,6 +991,7 @@ function rowToSession(row: Row, events: NexusEvent[]): SessionSnapshot {
     pendingInput: row.pending_input ? JSON.parse(String(row.pending_input)) : undefined,
     metadata: row.metadata ? JSON.parse(String(row.metadata)) : undefined,
     originCwd: nullableString(row.origin_cwd),
+    authorizationState: row.authorization_state ? JSON.parse(String(row.authorization_state)) as SessionAuthorizationState : undefined,
   }
 }
 

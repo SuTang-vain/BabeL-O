@@ -12,6 +12,10 @@
 
 ## Runtime / Nexus
 
+- **AskUserQuestion 响应传递修复已收口（v0.4.2，2026-07-24）**：用户在 AskUserQuestion 弹窗选择选项后，runtime 的 `waitForQuestionResponse` 成功 poll 到响应并恢复执行，但模型收到的 `tool_result` 仍是原始 `pending_question` 载荷（`result.output`）而非用户的选择（`finalOutput`）。根因：`runtimeToolLoop.ts:1153` 构建 `blockContent` 时引用 `result.output` 而非 `finalOutput`。附带修复：Go TUI Esc handler 丢弃 HTTP cmd、Zod schema 拒绝 Go nil slice（JSON null）、watchdog grace 不足（60s -> 120s）、ProviderConfig 缺 models 字段、ConfigManager.save 不认自定义供应商。测试：Go TUI `TestAskUserSendQuestionDecisionHTTPEndpoint` + `TestWatchdogGivesAskUserQuestionEnoughHeadroom`；TS `test/runtime-llm.test.ts` AskUserQuestion e2e。全量 1300/1300 pass。详见 2026-07-24 WORK_LOG entry。
+
+- **Intake 授权连续性修复已收口（Phase 0-4，2026-07-10）**：证据 `session_1de7cf54`（Turn 6 "继续任务" 授权重置 → TOOL_DENIED）已修复。实现内容：(1) `isContinuationPhrase()` 识别延续指令；(2) 扩展 `isLocalChangeAuthorizationRequest()` 正则覆盖"修复"、"执行"、"可写模式"等措辞；(3) `sessions.authorization_state` 列持久化授权状态（v16 migration）；(4) intake 调用时传入 `previousAuthorizationState` 并继承；(5) `extractAuthorizationStateFromEvents()` 在 finalize 时更新 session；(6) `bbl inspect-session` 显示 `persistedAuthorizationState`；(7) Go TUI 状态栏显示当前授权级别。设计原则从"默认拒绝，显式授权"调整为"上下文感知，合理推断，关键操作显式确认"。测试覆盖：`test/authorization-continuity.test.ts` (25 tests) + `test/authorization-state-persistence.test.ts` (10 tests) + `test/inspect-session.test.ts` (32 tests) = 67 tests pass。详见 [proposals/authorization-continuity-execution-plan.md](./proposals/authorization-continuity-execution-plan.md)。
+
 - EverCore managed sidecar 启动 cascade + 配置误报已收口（Phase 1-6，2026-07-01）：`bbl memory setup` + `bbl nexus start` 后 managed `everos` sidecar 立即死（`EVERCORE_MANAGED_HEALTH_CHECK_FAILED`）、`memory_search` 返回 `EVERCORE_MEMORY_UNAVAILABLE`、`capability.longTermMemory: false`，而 `bbl memory status` / `bbl doctor` 仍报 "ready"。**2026-07-01 实测订正根因**：sidecar stderr = `everos.toml not found`——`bbl memory setup` 从未跑 `everos init`，spawn 也没传 `--root <dataDir>` / `EVEROS_ROOT`（只设了 `EVEROS_MEMORY__ROOT`，是不同 knob），`stdio:'ignore'` 吞掉 stderr 致 2026-06-30 误判为 "LLM passthrough 断裂"（**该假设已被推翻**：`EVEROS_LLM__*` 全程正确注入）。修法：auto `everos init --root <dataDir>` + spawn 传 `--root` + `stdio` 改 pipe 捕获 stderr → typed `lastStartupError`（`EVERCORE_MANAGED_INIT_NOT_RUN` / `EVERCORE_MANAGED_EMBEDDING_NOT_CONFIGURED` / `EVERCORE_MANAGED_LLM_NOT_CONFIGURED`）+ `probeEverCoreSidecarHealth` 让 `bbl memory status` / `bbl doctor` 反映 sidecar 真实健康 + embedding 透传（`EVEROS_EMBEDDING__{MODEL,API_KEY,BASE_URL}` + `embeddingPassthrough` 持久化 + `bbl memory setup` 交互提示，apiKey 不落盘）+ `npm run test:memory-live` smoke tier（env-gated，真实 everos 二进制跑通 `/health`）。commits：`9d3c5d0`（Phase 2+3）、`d464b9d`（Phase 4）、`9fec83e`（Phase 5）、Phase 6 graduation。live 验证：真实 sidecar 在 LLM + embedding env 齐备时到达 `/health`=healthy。全量测试 1236/1236，typecheck/format/layer-audit 全绿。**唯一未闭环**：`memory_search` 全链路 round-trip 需真实 embedding 端点（ollama/cloud），属 operator/CI 步骤，非代码缺口。详见 [reference/evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md](./reference/evercore-managed-sidecar-live-validation-and-config-passthrough-plan.md)。
 
 - 自适应上下文窗口选择已收口（Phase 0/1/2/3 + Phase 6，2026-06-22/23）：headroom-aware `selectRecentEvents` + `microcompact`/`snip` 门控 + `getHistoryEventLoadLimit` 按 budget 缩放历史加载，fat-turn 不再每轮跌回。真实 session `session_cd42cb65` / `session_75d74b74` / `session_099b26bb`。详见 [history/context-and-agent-history.md](./history/context-and-agent-history.md) + 2026-06-22/23 WORK_LOG entry。
@@ -269,3 +273,52 @@
 - Go TUI 各 Phase 实现记录（tool palette `/v1/tools/audit` wire / Phase 8 version-reporting+release+`bbl go --check` / Phase 9 promotion / execute-timeout A-E / permission-policy A-D·A.1 / session observability Phase 0）见上方 Watch/Closed 降噪索引表与 [go-tui-history.md](./history/go-tui-history.md)、[archive/go-tui-execute-timeout-governance-plan.md](./archive/go-tui-execute-timeout-governance-plan.md)、[proposals/go-tui-session-observability-governance-plan.md](./proposals/go-tui-session-observability-governance-plan.md)、[PHASE_9_DECISION.md](./PHASE_9_DECISION.md)；事实流水见 [WORK_LOG.md](./WORK_LOG.md)。
 - 子 Agent / optimizer 默认优先隔离执行；in-place Git 操作不能纳入无关未跟踪文件或删除用户文件。
 - TUI 权限面板、slash/tool palette 和 input owner 的键盘路由不能退回多输入框或 `y/N` 单行审批。
+
+## Error Friendly Message Governance (W2.2)
+
+**Completed**: 2026-07-10
+
+**Objective**: Transform error responses from machine-centric JSON to user-centric hints with documentation links.
+
+### Delivered Capabilities
+
+1. **ErrorEvent Schema Extension**
+   - Added `hint` and `docsUrl` optional fields to error events.
+   - Backward compatible with existing error event consumers.
+
+2. **Centralized Error Registry**
+   - `src/nexus/errorRegistry.ts` manages 20+ error codes.
+   - `humanizeError()` provides consistent hint/docsUrl mapping.
+   - Context injection for profile/provider errors.
+
+3. **Runtime Integration**
+   - All error events automatically include `hint` and `docsUrl` when available.
+   - `buildRuntimeErrorEvent()` centralizes error event construction.
+
+4. **Go TUI Priority Consumption**
+   - Client prefers server-provided hints.
+   - Client-specific soft-timeout logic retained for `REQUEST_TIMEOUT`.
+
+5. **Troubleshooting Documentation**
+   - `docs/troubleshooting/` directory with 5 error-specific guides.
+   - Quick reference index for common error codes.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `src/shared/events.ts` | ErrorEvent schema with hint/docsUrl |
+| `src/nexus/errorRegistry.ts` | Centralized error code registry |
+| `src/runtime/pipeline/events.ts` | buildRuntimeErrorEvent integration |
+| `clients/go-tui/internal/tui/api.go` | friendlyNexusErrorWithContext refactor |
+| `docs/troubleshooting/*.md` | User-facing troubleshooting guides |
+
+### Tests
+
+- `test/error-registry.test.ts`: 13 unit tests
+- `test/error-registry-integration.test.ts`: 5 integration tests
+- Go TUI tests: all pass
+
+### Documentation
+
+- Plan archived in `docs/nexus/history/error-friendly-message-governance-plan.md`.

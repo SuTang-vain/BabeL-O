@@ -1,5 +1,27 @@
 import type { NexusEvent } from './events.js'
 
+/**
+ * Session-level authorization state persisted across turns so that
+ * continuation phrases ("继续任务", "continue") can inherit the
+ * previous turn's authorization instead of being reset to inspect.
+ *
+ * Phase 2 of authorization-continuity-execution-plan.md.
+ */
+export type SessionAuthorizationState = {
+  /** Current authorization level (none | inspect | local_change | shared_change | destructive) */
+  level: string
+  /** Consent scope (current_step | stated_plan | session_workflow) */
+  scope: string
+  /** Source of the authorization (explicit_user | inferred_none | inherited) */
+  source: string
+  /** ISO timestamp when this authorization was established */
+  establishedAt: string
+  /** Turn index when this authorization was established */
+  establishedByTurn?: number
+  /** ISO timestamp of the last turn that confirmed/used this authorization */
+  lastConfirmedAt: string
+}
+
 export type SessionPhase =
   | 'created'
   | 'planning'
@@ -71,6 +93,15 @@ export type SessionSnapshot = {
   // session.cwd carried the drift forward). Optional for back-compat with
   // sessions created before this column existed.
   originCwd?: string
+
+  // Phase 2 of authorization-continuity-execution-plan.md: persisted
+  // turn-level authorization state so that "继续任务" / "continue" can
+  // inherit the previous turn's authorizationLevel + consentScope instead
+  // of being reset to inspect/inferred_none every turn (the
+  // session_1de7cf54 failure: Turn 6 "继续任务" lost the local_change
+  // authorization established in Turn 4-5). Optional for back-compat with
+  // sessions created before this column existed.
+  authorizationState?: SessionAuthorizationState
 
   // Agent Loop & Task Session extensions
   queueId?: string

@@ -4,10 +4,21 @@ import fs from 'node:fs';
 import { z } from 'zod';
 import { getProvider, inspectModelCapabilities, providerRegistry, modelRegistry, recommendModelForRole, type ModelCapabilityDiagnostics, type ModelRole, type ModelRoleRecommendation } from '../providers/registry.js';
 import { logger } from './logger.js';
+import { getSecret, setSecret, deleteSecret, isKeychainAvailable, getSecretStorageLocation } from '../cli/secrets/index.js';
 
 export interface ProviderConfig {
   apiKey?: string;
   baseUrl?: string;
+  /** Custom adapter override. When set, the runtime uses this adapter
+   * instead of the registry default. Only 'anthropic-compatible' and
+   * 'openai-compatible' are supported. */
+  adapter?: 'anthropic-compatible' | 'openai-compatible';
+  /** Custom model definitions for a user-configured provider. Each
+   * entry appears in the model registry alongside built-in models. */
+  models?: Array<{
+    id: string;
+    name?: string;
+  }>;
 }
 
 export interface ProfileConfig {
@@ -54,6 +65,20 @@ export interface BabelOConfig {
   };
   hooks?: HooksConfig;
   providerAutoRetry?: ProviderAutoRetryConfig;
+  /**
+   * Runtime loop-budget tuning. When omitted, defaults are applied
+   * internally (see LLMCodingRuntime). All fields are optional.
+   */
+  runtime?: {
+    /**
+     * Number of iterations reserved for the finalization window before
+     * maxLoops. When loopCount enters this window, the runtime narrows
+     * visible tools to read-only (final_check) then hides them
+     * (must_respond). Default 5. Increase to give the model more
+     * convergence room; decrease to force earlier finalization.
+     */
+    finalResponseOnlyRemainingLoops?: number;
+  };
 }
 
 export type BabeLXConfigImportProfile = {
@@ -92,7 +117,7 @@ export type ResolvedSettings = {
   baseUrl?: string;
   activeProfile?: string;
   modelSource: 'request' | 'env' | 'role' | 'profile' | 'default';
-  apiKeySource: 'env' | 'profile' | 'provider_config' | 'none';
+  apiKeySource: 'env' | 'keychain' | 'profile' | 'provider_config' | 'none';
   baseUrlSource: 'env' | 'profile' | 'provider_config' | 'provider_default' | 'none';
 }
 
@@ -175,6 +200,11 @@ export function validateModelSelectionAuth(
 export const ProviderConfigSchema = z.object({
   apiKey: z.string().min(1, 'API key cannot be empty').optional(),
   baseUrl: z.string().url('Base URL must be a valid URL').optional(),
+  adapter: z.enum(['anthropic-compatible', 'openai-compatible']).optional(),
+  models: z.array(z.object({
+    id: z.string().min(1),
+    name: z.string().min(1).optional(),
+  })).optional(),
 });
 
 export const ProfileConfigSchema = z.object({
@@ -225,14 +255,34 @@ export const BabelOConfigSchema = z.object({
   }).optional(),
   hooks: HooksConfigSchema.optional(),
   providerAutoRetry: ProviderAutoRetryConfigSchema.optional(),
+  runtime: z.object({
+    finalResponseOnlyRemainingLoops: z.number().int().positive().optional(),
+  }).optional(),
 }).superRefine((data, ctx) => {
+  // Collect provider IDs that are either built-in or user-configured
+  // in this save payload. Custom providers must pass validation for
+  // defaultModel and profiles.
+  const knownProviderIds = new Set<string>(providerRegistry.map(p => p.id))
+  const knownModelIds = new Set<string>(modelRegistry.map(m => m.id))
+  if (data.providers) {
+    for (const [providerId, providerConfig] of Object.entries(data.providers)) {
+      knownProviderIds.add(providerId)
+      // Register custom provider models so profiles / defaultModel can reference them.
+      for (const model of providerConfig.models ?? []) {
+        const fullId = model.id.includes('/') ? model.id : `${providerId}/${model.id}`
+        knownModelIds.add(fullId)
+        knownModelIds.add(model.id)
+      }
+    }
+  }
+
   if (data.defaultModel) {
     const defaultModel = data.defaultModel;
-    const modelValid = modelRegistry.some(m => m.id === defaultModel) || (() => {
+    const modelValid = knownModelIds.has(defaultModel) || (() => {
       const slashIdx = defaultModel.indexOf('/');
       if (slashIdx === -1) return false;
       const providerId = defaultModel.substring(0, slashIdx);
-      return providerRegistry.some(p => p.id === providerId);
+      return knownProviderIds.has(providerId);
     })();
     if (!modelValid) {
       ctx.addIssue({
@@ -243,27 +293,15 @@ export const BabelOConfigSchema = z.object({
     }
   }
 
-  if (data.providers) {
-    for (const providerId of Object.keys(data.providers)) {
-      if (!providerRegistry.some(p => p.id === providerId)) {
-        ctx.addIssue({
-          code: z.ZodIssueCode.custom,
-          message: `Unknown provider ID: ${providerId}`,
-          path: ['providers', providerId],
-        });
-      }
-    }
-  }
-
   if (data.profiles) {
     for (const [profileName, profile] of Object.entries(data.profiles)) {
       if (profile.model) {
-        const modelValid = modelRegistry.some(m => m.id === profile.model) || (() => {
-          const slashIdx = profile.model.indexOf('/');
-          if (slashIdx === -1) return false;
-          const providerId = profile.model.substring(0, slashIdx);
-          return providerRegistry.some(p => p.id === providerId);
-        })();
+        const modelValid = knownModelIds.has(profile.model) || (() => {
+          const slashIdx = profile.model.indexOf('/')
+          if (slashIdx === -1) return false
+          const providerId = profile.model.substring(0, slashIdx)
+          return knownProviderIds.has(providerId)
+        })()
         if (!modelValid) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
@@ -272,7 +310,7 @@ export const BabelOConfigSchema = z.object({
           });
         }
       }
-      if (profile.provider && !providerRegistry.some(p => p.id === profile.provider)) {
+      if (profile.provider && !knownProviderIds.has(profile.provider)) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
           message: `Unknown provider ID in profile "${profileName}": ${profile.provider}`,
@@ -792,6 +830,274 @@ export class ConfigManager {
       apiKeySource,
       baseUrlSource,
     };
+  }
+
+  /**
+   * Async version of resolveSettings that checks keychain first for API keys.
+   * Priority: env > keychain > profile > provider_config
+   */
+  public async resolveSettingsAsync(roleOrOptions?: string | ResolveSettingsOptions): Promise<ResolvedSettings> {
+    const conf = this.load();
+    const options =
+      typeof roleOrOptions === 'string'
+        ? { role: roleOrOptions }
+        : roleOrOptions ?? {};
+    const role = options.role;
+
+    const activeProfileName = conf.activeProfile;
+    const profile = activeProfileName ? conf.profiles?.[activeProfileName] : undefined;
+
+    let modelSource: 'request' | 'env' | 'role' | 'profile' | 'default' = 'default';
+    let modelId = options.model;
+    if (modelId) {
+      modelSource = 'request';
+    }
+    if (!modelId && role && isModelRole(role)) {
+      const recommendation = recommendModelForRole(role);
+      if (recommendation) {
+        modelId = recommendation.modelId;
+        modelSource = 'role';
+      }
+    }
+    if (!modelId && process.env.BABEL_O_MODEL) {
+      modelId = process.env.BABEL_O_MODEL;
+      modelSource = 'env';
+    }
+    if (!modelId && profile?.model) {
+      modelId = profile.model;
+      modelSource = 'profile';
+    }
+    if (!modelId) {
+      modelId = conf.defaultModel || 'local/coding-runtime';
+      modelSource = 'default';
+    }
+
+    let providerId = options.provider || '';
+    const slashIdx = modelId.indexOf('/');
+    if (slashIdx !== -1) {
+      providerId = modelId.substring(0, slashIdx);
+    } else if (!providerId) {
+      providerId = modelId === 'local-runtime' ? 'local' : modelId;
+    }
+
+    if (slashIdx === -1 && (process.env.BABEL_O_PROVIDER || profile?.provider)) {
+      providerId = process.env.BABEL_O_PROVIDER || profile?.provider || providerId;
+    }
+
+    let providerDef;
+    try {
+      providerDef = getProvider(providerId);
+    } catch {
+      providerId = 'local';
+      modelId = 'local/coding-runtime';
+      providerDef = getProvider(providerId);
+    }
+
+    const provConfig = conf.providers?.[providerId] || {};
+
+    let apiKeySource: ResolvedSettings['apiKeySource'] = 'none';
+    let apiKey = process.env.BABEL_O_API_KEY;
+    if (apiKey) {
+      apiKeySource = 'env';
+    }
+    if (!apiKey) {
+      if (providerId === 'anthropic') {
+        apiKey = process.env.ANTHROPIC_API_KEY;
+      } else if (providerId === 'openai') {
+        apiKey = process.env.OPENAI_API_KEY;
+      } else if (providerId === 'deepseek') {
+        apiKey = process.env.DEEPSEEK_API_KEY;
+      } else if (providerId === 'zhipu') {
+        apiKey = process.env.ZHIPU_API_KEY || process.env.ZHIPUAI_API_KEY;
+      } else if (providerId === 'minimax') {
+        apiKey = process.env.MINIMAX_API_KEY || process.env.MINIMAX_AUTH_TOKEN;
+      } else if (providerId === 'moonshot') {
+        apiKey = process.env.MOONSHOT_API_KEY;
+      } else if (providerId === 'ollama') {
+        apiKey = process.env.OLLAMA_API_KEY;
+      }
+      if (apiKey) {
+        apiKeySource = 'env';
+      }
+    }
+    // NEW: Check keychain before falling back to config file
+    if (!apiKey && providerId !== 'local') {
+      try {
+        const keychainKey = await getSecret(providerId);
+        if (keychainKey) {
+          apiKey = keychainKey;
+          apiKeySource = 'keychain';
+        }
+      } catch {
+        // Keychain not available, continue with other sources
+      }
+    }
+    if (!apiKey && profile?.apiKey) {
+      apiKey = profile.apiKey;
+      apiKeySource = 'profile';
+    }
+    if (!apiKey && provConfig.apiKey) {
+      apiKey = provConfig.apiKey;
+      apiKeySource = 'provider_config';
+    }
+
+    let baseUrlSource: ResolvedSettings['baseUrlSource'] = 'none';
+    let baseUrl = process.env.BABEL_O_BASE_URL;
+    if (baseUrl) {
+      baseUrlSource = 'env';
+    }
+    if (!baseUrl) {
+      if (providerId === 'anthropic') {
+        baseUrl = process.env.ANTHROPIC_BASE_URL;
+      } else if (providerId === 'openai') {
+        baseUrl = process.env.OPENAI_BASE_URL;
+      } else if (providerId === 'deepseek') {
+        baseUrl = process.env.DEEPSEEK_BASE_URL;
+      } else if (providerId === 'zhipu') {
+        baseUrl = process.env.ZHIPU_BASE_URL || process.env.ZHIPUAI_BASE_URL;
+      } else if (providerId === 'minimax') {
+        baseUrl = process.env.MINIMAX_BASE_URL;
+      } else if (providerId === 'moonshot') {
+        baseUrl = process.env.MOONSHOT_BASE_URL;
+      } else if (providerId === 'ollama') {
+        baseUrl = process.env.OLLAMA_BASE_URL;
+      }
+      if (baseUrl) {
+        baseUrlSource = 'env';
+      }
+    }
+    if (!baseUrl && profile?.baseUrl) {
+      baseUrl = profile.baseUrl;
+      baseUrlSource = 'profile';
+    }
+    if (!baseUrl && provConfig.baseUrl) {
+      baseUrl = provConfig.baseUrl;
+      baseUrlSource = 'provider_config';
+    }
+    if (!baseUrl && providerDef.defaultBaseUrl) {
+      baseUrl = providerDef.defaultBaseUrl;
+      baseUrlSource = 'provider_default';
+    }
+
+    return {
+      modelId,
+      providerId,
+      apiKey,
+      baseUrl,
+      activeProfile: activeProfileName,
+      modelSource,
+      apiKeySource,
+      baseUrlSource,
+    };
+  }
+
+  /**
+   * Store an API key securely in the system keychain.
+   * If keychain is not available, falls back to config file.
+   */
+  public async setApiKeyWithKeychain(
+    providerId: string,
+    apiKey: string,
+    options?: { plain?: boolean }
+  ): Promise<{ stored: 'keychain' | 'config' }> {
+    // If plain mode requested, skip keychain
+    if (options?.plain) {
+      this.setProviderConfig(providerId, { apiKey });
+      return { stored: 'config' };
+    }
+
+    // Try keychain first
+    try {
+      const available = await isKeychainAvailable();
+      if (available) {
+        await setSecret(providerId, apiKey);
+
+        // Remove from config file if it was there
+        const conf = this.load();
+        if (conf.providers?.[providerId]?.apiKey) {
+          const newConfig = { ...conf };
+          delete newConfig.providers![providerId].apiKey;
+          this.save(newConfig);
+        }
+
+        return { stored: 'keychain' };
+      }
+    } catch (error) {
+      logger.warn('Failed to store API key in keychain, falling back to config file', {
+        providerId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+
+    // Fallback to config file
+    this.setProviderConfig(providerId, { apiKey });
+    return { stored: 'config' };
+  }
+
+  /**
+   * Migrate an API key from config file to keychain.
+   */
+  public async migrateToKeychain(providerId: string): Promise<{ success: boolean; reason?: string }> {
+    const conf = this.load();
+    const apiKey = conf.providers?.[providerId]?.apiKey;
+
+    if (!apiKey) {
+      return { success: false, reason: 'No API key found in config file' };
+    }
+
+    try {
+      const available = await isKeychainAvailable();
+      if (!available) {
+        return { success: false, reason: 'Keychain not available' };
+      }
+
+      await setSecret(providerId, apiKey);
+
+      // Remove from config file
+      const newConfig = { ...conf };
+      delete newConfig.providers![providerId].apiKey;
+      this.save(newConfig);
+
+      return { success: true };
+    } catch (error) {
+      return {
+        success: false,
+        reason: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  /**
+   * Delete an API key from both keychain and config file.
+   */
+  public async deleteApiKey(providerId: string): Promise<{ keychain: boolean; config: boolean }> {
+    const result = { keychain: false, config: false };
+
+    // Delete from keychain
+    try {
+      result.keychain = await deleteSecret(providerId);
+    } catch {
+      // Keychain not available or key not found
+    }
+
+    // Delete from config file
+    const conf = this.load();
+    if (conf.providers?.[providerId]?.apiKey) {
+      const newConfig = { ...conf };
+      delete newConfig.providers![providerId].apiKey;
+      this.save(newConfig);
+      result.config = true;
+    }
+
+    return result;
+  }
+
+  /**
+   * Get the storage location of an API key.
+   */
+  public async getApiKeyLocation(providerId: string): Promise<'keychain' | 'config' | 'env' | 'none'> {
+    const location = await getSecretStorageLocation(providerId);
+    return location;
   }
 
   public getProviderDiagnostics(roleOrOptions?: string | ResolveSettingsOptions): ProviderDiagnostics {

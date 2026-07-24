@@ -12,8 +12,7 @@ import { buildSystemPromptSections } from './systemPromptBuilder.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
 import { loadAgentMdFiles } from './agentMdLoader.js'
 import { collectGitContext } from './gitContext.js'
-import { loadAllSkills } from '../skills/loader.js'
-import { matchSkills } from '../skills/matcher.js'
+import { FilesystemSkillProvider, type SkillProvider, type SkillMatchResult } from '../skills/provider.js'
 import {
   buildCompactCapabilityReminder,
   derivePostCompactState,
@@ -27,8 +26,10 @@ export {
   type PostCompactState,
 } from './compactPostRestore.js'
 import {
-  deriveUserIntentGuidance,
-  formatUserIntentGuidance,
+  deriveSelectedUserIntentGuidance,
+  formatSelectedUserIntentGuidance,
+} from './intentGuidanceSelector.js'
+import {
   type UserIntentGuidance,
 } from './intentGuidance.js'
 import { deriveWorkingSet, formatWorkingSet } from './workingSet.js'
@@ -105,6 +106,14 @@ export type ContextAssemblerOptions = {
     prompt: string
     diagnostics: MemoryProviderDiagnostics
   }) => void | Promise<void>
+  /**
+   * T1 of docs/nexus/reference/architecture-optimization-assessment-plan.md:
+   * Skill discovery provider. When provided, `assembleContext` uses this
+   * provider instead of directly calling `loadAllSkills` + `matchSkills`.
+   * When omitted, a `FilesystemSkillProvider` is used as the default.
+   * Inject a stub to avoid filesystem I/O in tests.
+   */
+  skillProvider?: SkillProvider
 }
 
 export type AssembledContext = {
@@ -279,7 +288,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const compactAwareEvents = compactBoundary && retainedSegmentCheck.valid
     ? [...retainedBoundaryEvents, ...options.events.slice(compactBoundary.index + 1)]
     : options.events
-  const userIntentGuidance = deriveUserIntentGuidance({
+  const userIntentGuidance = deriveSelectedUserIntentGuidance({
     events: compactAwareEvents,
     latestPrompt: options.runtimeOptions.prompt,
     cwd: options.runtimeOptions.cwd,
@@ -381,15 +390,15 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     }
   }
 
-  const allSkills = await loadAllSkills(options.runtimeOptions.cwd)
-  const matched = matchSkills(allSkills, options.runtimeOptions.prompt)
+  const skillProvider = options.skillProvider ?? new FilesystemSkillProvider()
+  const matchedSkills = await skillProvider.matchPrompt(options.runtimeOptions.prompt, options.runtimeOptions.cwd)
   let activeSkills = ''
-  if (matched.length > 0) {
-    activeSkills = `Active Developer Skills:\n` + matched.map(skill => {
+  if (matchedSkills.length > 0) {
+    activeSkills = `Active Developer Skills:\n` + matchedSkills.map(skill => {
       return `## Skill: ${skill.name} (id: ${skill.id})\n${skill.content}`
     }).join('\n\n')
   }
-  const postCompactState = derivePostCompactState(compactAwareEvents, matched)
+  const postCompactState = derivePostCompactState(compactAwareEvents, matchedSkills)
   const stateBlock = formatPostCompactState(postCompactState)
   const compactCapabilityReminder = compactBoundary
     ? buildCompactCapabilityReminder(postCompactState)
@@ -433,7 +442,8 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     activeSkills: budgetedActiveSkills.trim() || undefined,
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
-    userIntentGuidance: formatUserIntentGuidance(userIntentGuidance),
+    userIntentGuidance: formatSelectedUserIntentGuidance(userIntentGuidance),
+    thinkingLevel: options.runtimeOptions.thinkingLevel,
     workingSet: workingSet || undefined,
     prompt: options.runtimeOptions.prompt,
   })

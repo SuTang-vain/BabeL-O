@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import http from 'node:http'
 import { after, test } from 'node:test'
 
 import { createNexusApp } from '../src/nexus/app.js'
@@ -207,7 +208,7 @@ test('POST /v1/runtime/config/provider saves provider credentials without leakin
   }
 })
 
-test('POST /v1/runtime/config/provider rejects unknown providers', async () => {
+test('POST /v1/runtime/config/provider accepts unknown providers for custom provider support', async () => {
   resetProfiles()
 
   const { runtime, storage } = await createDefaultNexusRuntime()
@@ -216,10 +217,119 @@ test('POST /v1/runtime/config/provider rejects unknown providers', async () => {
     const response = await app.inject({
       method: 'POST',
       url: '/v1/runtime/config/provider',
-      payload: { provider: 'not-real', apiKey: 'secret' },
+      payload: {
+        provider: 'custom-provider',
+        apiKey: 'secret',
+        baseUrl: 'https://api.custom.com/v1',
+        adapter: 'openai-compatible',
+        models: [
+          { id: 'custom-provider/model-a', name: 'model-a' },
+          { id: 'custom-provider/model-b', name: 'model-b' },
+        ],
+      },
     })
-    assert.equal(response.statusCode, 400)
-    assert.equal(response.json().error, 'unknown_provider')
+    // Now accepts custom providers — saves config and returns 200
+    assert.equal(response.statusCode, 200)
+    // Verify the config was saved
+    const savedConfig = manager.getProviderConfig('custom-provider')
+    assert.equal(savedConfig.apiKey, 'secret')
+    assert.equal(savedConfig.baseUrl, 'https://api.custom.com/v1')
+    assert.equal(savedConfig.adapter, 'openai-compatible')
+    assert.deepEqual(savedConfig.models, [
+      { id: 'custom-provider/model-a', name: 'model-a' },
+      { id: 'custom-provider/model-b', name: 'model-b' },
+    ])
+  } finally {
+    await app.close()
+  }
+})
+
+test('POST /v1/runtime/config/provider keeps existing custom profile providers valid', async () => {
+  resetProfiles()
+  manager.save({
+    providers: {
+      one: {
+        apiKey: 'existing-secret',
+        baseUrl: 'https://one.example.com/v1',
+        adapter: 'openai-compatible',
+      },
+    },
+    profiles: {
+      custom: {
+        provider: 'one',
+        model: 'one/model-a',
+      },
+    },
+    activeProfile: 'custom',
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider',
+      payload: {
+        provider: 'baidu-one',
+        apiKey: 'secret',
+        baseUrl: 'https://oneapi-comate.baidu-int.com/v1',
+        adapter: 'openai-compatible',
+      },
+    })
+
+    assert.equal(response.statusCode, 200)
+    const savedConfig = manager.getProviderConfig('baidu-one')
+    assert.equal(savedConfig.apiKey, 'secret')
+    assert.equal(savedConfig.baseUrl, 'https://oneapi-comate.baidu-int.com/v1')
+    assert.equal(savedConfig.adapter, 'openai-compatible')
+  } finally {
+    await app.close()
+  }
+})
+
+test('custom provider models are listed and selectable after provider save', async () => {
+  resetProfiles()
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const saveResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider',
+      payload: {
+        provider: 'custom-provider',
+        apiKey: 'secret',
+        baseUrl: 'https://api.custom.com/v1',
+        adapter: 'openai-compatible',
+        models: [
+          { id: 'custom-provider/model-a', name: 'model-a' },
+          { id: 'custom-provider/model-b', name: 'model-b' },
+        ],
+      },
+    })
+    assert.equal(saveResponse.statusCode, 200)
+
+    const modelsResponse = await app.inject({ method: 'GET', url: '/v1/runtime/models' })
+    assert.equal(modelsResponse.statusCode, 200)
+    const modelsBody = modelsResponse.json()
+    const provider = modelsBody.providers.find((entry: any) => entry.id === 'custom-provider')
+    assert.ok(provider)
+    assert.equal(provider.defaultModel, 'custom-provider/model-a')
+    assert.deepEqual(
+      provider.models.map((model: any) => ({ id: model.id, name: model.name })),
+      [
+        { id: 'custom-provider/model-a', name: 'model-a' },
+        { id: 'custom-provider/model-b', name: 'model-b' },
+      ],
+    )
+
+    const selectResponse = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/select',
+      payload: { model: 'custom-provider/model-b' },
+    })
+    assert.equal(selectResponse.statusCode, 200)
+    assert.equal(manager.load().defaultModel, 'custom-provider/model-b')
   } finally {
     await app.close()
   }
@@ -684,5 +794,131 @@ test('GET /v1/runtime/version does not leak secrets', async () => {
     )
   } finally {
     await app.close()
+  }
+})
+
+// startMockUpstream spins up a tiny HTTP server that stands in for
+// an OpenAI-compatible provider: it answers GET /models with the
+// given response. Resolves once listening with the base URL + close.
+async function startMockUpstream(
+  handler: (req: http.IncomingMessage, res: http.ServerResponse) => void,
+): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+  const server = http.createServer(handler)
+  await new Promise<void>((resolve, reject) => {
+    server.on('error', reject)
+    server.listen(0, '127.0.0.1', () => resolve())
+  })
+  const addr = server.address()
+  if (!addr || typeof addr !== 'object') throw new Error('mock upstream not listening')
+  return {
+    baseUrl: `http://127.0.0.1:${addr.port}`,
+    close: () => new Promise<void>(resolve => server.close(() => resolve())),
+  }
+}
+
+// POST /v1/runtime/config/provider/verify probes an OpenAI-compatible
+// upstream and must surface the model list it advertises at /models so
+// the Go TUI wizard can render a pick-list. The endpoint always
+// returns 200 (business result in the body) so transport clients keep
+// the structured error code.
+test('POST /v1/runtime/config/provider/verify returns upstream model list for OpenAI-compatible providers', async () => {
+  const upstream = await startMockUpstream((_req, res) => {
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify({
+      object: 'list',
+      data: [
+        { id: 'gpt-4o', object: 'model' },
+        { id: 'gpt-4o-mini', object: 'model' },
+        // entries without a string id are skipped defensively
+        { object: 'model' },
+      ],
+    }))
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider/verify',
+      payload: {
+        provider: 'my-custom-llm',
+        adapter: 'openai-compatible',
+        baseUrl: upstream.baseUrl,
+        apiKey: 'sk-test',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, true)
+    assert.deepEqual(body.models, [
+      { id: 'gpt-4o', name: 'gpt-4o' },
+      { id: 'gpt-4o-mini', name: 'gpt-4o-mini' },
+    ])
+  } finally {
+    await app.close()
+    await upstream.close()
+  }
+})
+
+// A malformed / non-JSON /models body must NOT fail verification —
+// the credential is valid, the wizard just falls back to manual entry.
+test('POST /v1/runtime/config/provider/verify tolerates a non-JSON /models body', async () => {
+  const upstream = await startMockUpstream((_req, res) => {
+    res.setHeader('content-type', 'text/plain')
+    res.end('not-json')
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider/verify',
+      payload: {
+        provider: 'my-custom-llm',
+        adapter: 'openai-compatible',
+        baseUrl: upstream.baseUrl,
+        apiKey: 'sk-test',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, true)
+    assert.deepEqual(body.models, [])
+  } finally {
+    await app.close()
+    await upstream.close()
+  }
+})
+
+// An upstream auth rejection (401) must surface as success:false with
+// the structured `auth_failed` code, not a transport error.
+test('POST /v1/runtime/config/provider/verify surfaces upstream 401 as auth_failed', async () => {
+  const upstream = await startMockUpstream((_req, res) => {
+    res.statusCode = 401
+    res.end(JSON.stringify({ error: 'invalid api key' }))
+  })
+
+  const { runtime, storage } = await createDefaultNexusRuntime()
+  const app = await createNexusApp({ runtime, storage, defaultCwd: '/tmp' })
+  try {
+    const response = await app.inject({
+      method: 'POST',
+      url: '/v1/runtime/config/provider/verify',
+      payload: {
+        provider: 'my-custom-llm',
+        adapter: 'openai-compatible',
+        baseUrl: upstream.baseUrl,
+        apiKey: 'sk-bad',
+      },
+    })
+    assert.equal(response.statusCode, 200)
+    const body = response.json()
+    assert.equal(body.success, false)
+    assert.equal(body.error, 'auth_failed')
+  } finally {
+    await app.close()
+    await upstream.close()
   }
 })

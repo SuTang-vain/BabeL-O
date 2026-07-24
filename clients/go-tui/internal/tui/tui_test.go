@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -3767,7 +3768,7 @@ func TestSlashCommandRegistryIsComplete(t *testing.T) {
 		}
 	}
 	// The minimum required by the rewrite plan.
-	for _, want := range []string{"/help", "/config", "/profile", "/clear", "/exit", "/bash", "/read", "/grep"} {
+	for _, want := range []string{"/help", "/config", "/profile", "/clear", "/exit", "/effort", "/bash", "/read", "/grep"} {
 		if !seen[want] {
 			t.Fatalf("required slash command %q missing from registry", want)
 		}
@@ -4275,6 +4276,69 @@ func TestHandleLocalCommandRegistersKnownCommands(t *testing.T) {
 	rendered := viewContent(m.View())
 	if !strings.Contains(rendered, "unknown local command") {
 		t.Fatalf("view should mention 'unknown local command', got %q", rendered)
+	}
+}
+
+func TestEffortCommandUpdatesVisibleNextTurnThinkingLevel(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+
+	m.handleLocalCommand("/effort")
+	if m.inputMode != modeEffortOverlay {
+		t.Fatalf("/effort should open effort overlay, got %q", m.inputMode)
+	}
+	if !strings.Contains(viewContent(m.View()), "Thinking Effort") {
+		t.Fatalf("effort overlay should render")
+	}
+	updated, _ := m.Update(keyPress(tea.KeyDown))
+	m, _ = updated.(model)
+	updated, _ = m.Update(keyPress(tea.KeyEnter))
+	m, _ = updated.(model)
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("overlay selection ThinkingLevel = %q, want deep", got)
+	}
+
+	m.handleLocalCommand("/effort deep")
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("ThinkingLevel = %q, want deep", got)
+	}
+	payload := buildExecuteRequest(m.cfg, "session_effort", "review implementation")
+	if got := payload["thinkingLevel"]; got != "deep" {
+		t.Fatalf("thinkingLevel = %v, want deep", got)
+	}
+	if !strings.Contains(viewContent(m.View()), "effort:deep") {
+		t.Fatalf("header should show active effort")
+	}
+
+	m.handleLocalCommand("/effort maximum")
+	if got := m.cfg.ThinkingLevel; got != "deep" {
+		t.Fatalf("invalid effort should preserve deep, got %q", got)
+	}
+	if !strings.Contains(viewContent(m.View()), "invalid effort") {
+		t.Fatalf("invalid effort should render an error")
+	}
+}
+
+func TestEffortOverlayStartsAtCurrentLevelAndCancelsWithoutMutation(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace", ThinkingLevel: "quick"})
+	m.handleLocalCommand("/effort")
+	if m.inputMode != modeEffortOverlay {
+		t.Fatalf("inputMode = %q, want effort overlay", m.inputMode)
+	}
+	if m.effortSelected != 0 {
+		t.Fatalf("effortSelected = %d, want quick index 0", m.effortSelected)
+	}
+	updated, _ := m.Update(keyPress(tea.KeyDown))
+	m, _ = updated.(model)
+	if m.effortSelected != 1 {
+		t.Fatalf("effortSelected = %d, want balanced index 1", m.effortSelected)
+	}
+	updated, _ = m.Update(keyPress(tea.KeyEscape))
+	m, _ = updated.(model)
+	if got := m.cfg.ThinkingLevel; got != "quick" {
+		t.Fatalf("escape should preserve quick, got %q", got)
+	}
+	if m.inputMode != modeComposing {
+		t.Fatalf("escape should return to composing, got %q", m.inputMode)
 	}
 }
 
@@ -8588,6 +8652,20 @@ func TestBuildExecuteRequestHonoursExplicitPolicyMode(t *testing.T) {
 	}
 }
 
+func TestBuildExecuteRequestEmitsValidThinkingLevel(t *testing.T) {
+	payload := buildExecuteRequest(Config{Cwd: "/workspace", ThinkingLevel: "DEEP"}, "session_abc", "review this")
+	if got := payload["thinkingLevel"]; got != "deep" {
+		t.Fatalf("thinkingLevel = %v, want deep", got)
+	}
+}
+
+func TestBuildExecuteRequestOmitsInvalidThinkingLevel(t *testing.T) {
+	payload := buildExecuteRequest(Config{Cwd: "/workspace", ThinkingLevel: "max"}, "session_abc", "review this")
+	if _, ok := payload["thinkingLevel"]; ok {
+		t.Fatalf("invalid thinkingLevel should be omitted, got %v", payload["thinkingLevel"])
+	}
+}
+
 func TestBuildExecuteRequestEmitsSoftTimeoutPolicy(t *testing.T) {
 	cfg := Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}
 	payload := buildExecuteRequest(cfg, "session_abc", "hello")
@@ -8612,6 +8690,34 @@ func TestResolveGoTuiTimeoutKeepsDefaultForOrdinaryTurn(t *testing.T) {
 	decision := resolveGoTuiTimeout(Config{Cwd: "/workspace", ExecuteTimeoutMs: DefaultGoTuiExecuteTimeoutMs}, "hello", nil)
 	if decision.TimeoutMs != DefaultGoTuiExecuteTimeoutMs || decision.Adaptive {
 		t.Fatalf("ordinary timeout decision = %+v, want default non-adaptive", decision)
+	}
+}
+
+// TestWatchdogGivesAskUserQuestionEnoughHeadroom: the runtime's
+// waitForQuestionResponse polls storage for up to
+// QUESTION_RESPONSE_MAX_WAIT_MS (180s). The watchdog must fire
+// AFTER that deadline expires, even if the model spends time before
+// calling AskUserQuestion. The watchdog deadline is
+// timeoutMs + goTuiWatchdogGraceMs from execution start; the question
+// wait deadline is now + 180s from when the question event is yielded.
+// If the model takes up to `grace` seconds to reach the question,
+// both deadlines coincide. The grace must therefore be large enough
+// to cover realistic model latency (tool calls, reasoning, context
+// assembly) so the watchdog doesn't abort the question wait.
+func TestWatchdogGivesAskUserQuestionEnoughHeadroom(t *testing.T) {
+	watchdog := DefaultGoTuiExecuteTimeoutMs + goTuiWatchdogGraceMs
+	// The runtime's QUESTION_RESPONSE_MAX_WAIT_MS is 180_000ms.
+	const questionWaitMs = 180_000
+	// The watchdog must exceed the question wait by at least 60s
+	// so the model has a full minute of headroom before the question
+	// is even asked. This prevents the race where the watchdog fires
+	// while the user is still reading the question.
+	if watchdog <= questionWaitMs {
+		t.Fatalf("watchdog %dms must exceed question wait %dms", watchdog, questionWaitMs)
+	}
+	headroom := watchdog - questionWaitMs
+	if headroom < 60_000 {
+		t.Fatalf("watchdog headroom %dms < 60s; the model needs at least 60s of headroom before AskUserQuestion", headroom)
 	}
 }
 
@@ -9729,7 +9835,7 @@ func TestModelPickConfiguredProviderStillShowsApiKeyStep(t *testing.T) {
 			AuthSource:     "provider_config",
 		}},
 	}
-	m.setMode(modeModelPickProvider)
+	m.openModelRegistry()
 
 	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
@@ -9741,7 +9847,7 @@ func TestModelPickConfiguredProviderStillShowsApiKeyStep(t *testing.T) {
 		t.Fatalf("inputMode = %q, want %q", m.inputMode, modeModelPickApiKey)
 	}
 	if m.modelPickSelectedID != "minimax" {
-		t.Fatalf("modelPickSelectedID = %q, want minimax", m.modelPickSelectedID)
+		t.Fatalf("modelPickSelectedID = %q, want minimix", m.modelPickSelectedID)
 	}
 }
 
@@ -9756,7 +9862,7 @@ func TestModelPickNoAuthProviderSkipsApiKeyStep(t *testing.T) {
 			Configured:   true,
 		}},
 	}
-	m.setMode(modeModelPickProvider)
+	m.openModelRegistry()
 
 	updated, cmd := m.Update(keyPress(tea.KeyEnter))
 	m = updated.(model)
@@ -12378,3 +12484,878 @@ func TestRenderPermissionEditorStillDelegatesToDialog(t *testing.T) {
 			got, want)
 	}
 }
+
+// TestAddProviderKeyPasteSanitizesSingleLineSecret verifies that
+// the wizard's API key step (a) accepts a clipboard paste,
+// (b) routes it into the masked addProviderKey draft instead of
+// the shared composer, and (c) runs sanitizeModelAPIKeyInput on
+// the result so stray whitespace / control characters from
+// clipboard wrappers don't leak into the credential.
+func TestAddProviderKeyPasteSanitizesSingleLineSecret(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeAddProviderKey)
+
+	updated, _ := m.Update(tea.PasteMsg{Content: " sk-cp-abc\r\nDEF\tGHI\n "})
+	m = updated.(model)
+
+	if got := m.addProviderKey; got != "sk-cp-abcDEFGHI" {
+		t.Fatalf("addProviderKey = %q, want sanitized single-line key", got)
+	}
+	if got := m.modelPickAPIKeyDraft; got != "" {
+		t.Fatalf("modelPickAPIKeyDraft should not be touched by add provider flow, got %q", got)
+	}
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("api key paste should not touch textarea, got %q", got)
+	}
+	if m.pastedTextCounter != 0 {
+		t.Fatalf("api key paste should not create pasted-text placeholders, got counter=%d", m.pastedTextCounter)
+	}
+}
+
+func TestAddProviderKeyEnterCommitsDraftBeforeVerify(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.addProviderName = "custom"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.setMode(modeAddProviderKey)
+
+	updated, _ := m.Update(textKey("s"))
+	m = updated.(model)
+	updated, _ = m.Update(textKey("k"))
+	m = updated.(model)
+	updated, _ = m.Update(textKey("-"))
+	m = updated.(model)
+	updated, _ = m.Update(textKey("1"))
+	m = updated.(model)
+
+	if got := m.addProviderKey; got != "sk-1" {
+		t.Fatalf("api key draft = %q, want typed key", got)
+	}
+	if got := m.modelPickAPIKeyDraft; got != "" {
+		t.Fatalf("modelPickAPIKeyDraft should not be touched by add provider flow, got %q", got)
+	}
+
+	updated, cmd := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	m = updated.(model)
+
+	if cmd == nil {
+		t.Fatalf("enter should start provider verification command")
+	}
+	if got := m.addProviderKey; got != "sk-1" {
+		t.Fatalf("addProviderKey = %q, want committed typed key", got)
+	}
+	if got := m.inputMode; got != modeAddProviderVerify {
+		t.Fatalf("inputMode = %q, want %q", got, modeAddProviderVerify)
+	}
+}
+
+func TestAddProviderVerifySuccessPromptsForManualModelName(t *testing.T) {
+	var saved map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runtime/config/provider" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&saved); err != nil {
+			t.Fatalf("decode save body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_config"}`))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "custom"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-1"
+	m.setMode(modeAddProviderVerify)
+	m.addProviderVerifying = true
+
+	// Verify success fires saveRuntimeProviderConfig which returns a cmd.
+	updated, saveCmd := m.Update(providerVerifyMsg{providerID: "custom", success: true})
+	m = updated.(model)
+	if saveCmd == nil {
+		t.Fatalf("verify success should dispatch save command")
+	}
+	if m.addProviderVerifying {
+		t.Fatalf("addProviderVerifying should be false after success")
+	}
+	// Mode stays on verify until the save completes through providerConfigMsg.
+	if m.inputMode != modeAddProviderVerify {
+		t.Fatalf("after verify success but before save, inputMode = %q, want %q", m.inputMode, modeAddProviderVerify)
+	}
+
+	// Execute the save command to get providerConfigMsg, then feed it back.
+	msg := saveCmd()
+	if _, ok := msg.(providerConfigMsg); !ok {
+		t.Fatalf("save command returned %T, want providerConfigMsg", msg)
+	}
+	updated, _ = m.Update(msg)
+	m = updated.(model)
+	if got := m.inputMode; got != modeAddProviderModel {
+		t.Fatalf("after save, inputMode = %q, want %q", got, modeAddProviderModel)
+	}
+
+	// Now enter model name.
+	m.setInputValue("manual-model")
+	updated, modelCmd := m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyEnter}))
+	m = updated.(model)
+	if modelCmd == nil {
+		t.Fatalf("enter should save provider config with models")
+	}
+	msg2 := modelCmd()
+	if got, ok := msg2.(providerConfigMsg); !ok || got.err != nil {
+		t.Fatalf("save command returned %#v", msg2)
+	}
+	if got := saved["provider"]; got != "custom" {
+		t.Fatalf("saved provider = %v, want custom", got)
+	}
+	models, ok := saved["models"].([]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("saved models = %#v, want one model", saved["models"])
+	}
+	model, ok := models[0].(map[string]any)
+	if !ok {
+		t.Fatalf("saved model entry = %#v", models[0])
+	}
+	if got := model["id"]; got != "custom/manual-model" {
+		t.Fatalf("saved model id = %v, want custom/manual-model", got)
+	}
+	if got := model["name"]; got != "manual-model" {
+		t.Fatalf("saved model name = %v, want manual-model", got)
+	}
+}
+
+// TestAddProviderVerifySuccessShowsModelPicker verifies the
+// auto-fetch path: when the verify endpoint returns an upstream
+// model list, the wizard's model step renders a pick-list
+// (up/down navigate, enter selects) instead of forcing manual
+// text entry. The selected model is saved with a provider-prefixed
+// id (the runtime strips the prefix when calling the upstream API).
+func TestAddProviderVerifySuccessShowsModelPicker(t *testing.T) {
+	var saves []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runtime/config/provider" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode save body: %v", err)
+		}
+		saves = append(saves, body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_config"}`))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "custom"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-1"
+	m.setMode(modeAddProviderVerify)
+	m.addProviderVerifying = true
+
+	// Verify returns an auto-fetched model list.
+	updated, saveCmd := m.Update(providerVerifyMsg{
+		providerID: "custom",
+		success:    true,
+		models: []registeredModel{
+			{ID: "gpt-4o", Name: "GPT-4o"},
+			{ID: "gpt-4o-mini", Name: "GPT-4o mini"},
+		},
+	})
+	m = updated.(model)
+	if saveCmd == nil {
+		t.Fatalf("verify success should dispatch save command")
+	}
+	if len(m.addProviderModels) != 2 {
+		t.Fatalf("addProviderModels len = %d, want 2", len(m.addProviderModels))
+	}
+	if m.addProviderVerifying {
+		t.Fatalf("addProviderVerifying should be false after success")
+	}
+
+	// Drive the verify-success save (credentials only) to completion.
+	msg := saveCmd()
+	if _, ok := msg.(providerConfigMsg); !ok {
+		t.Fatalf("save command returned %T, want providerConfigMsg", msg)
+	}
+	updated, _ = m.Update(msg)
+	m = updated.(model)
+	if got := m.inputMode; got != modeAddProviderModel {
+		t.Fatalf("after save, inputMode = %q, want %q", got, modeAddProviderModel)
+	}
+	if m.addProviderModelIdx != 0 {
+		t.Fatalf("picker should start at idx 0, got %d", m.addProviderModelIdx)
+	}
+
+	// A paste in picker mode must NOT touch the textarea (picker
+	// is navigated with arrows, not text).
+	updated, _ = m.Update(tea.PasteMsg{Content: "ignored"})
+	m = updated.(model)
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("picker mode should ignore paste, textarea = %q", got)
+	}
+
+	// Move down to the second model, then enter to select it.
+	updated, _ = m.Update(keyPress(tea.KeyDown))
+	m = updated.(model)
+	if m.addProviderModelIdx != 1 {
+		t.Fatalf("after down, idx = %d, want 1", m.addProviderModelIdx)
+	}
+	updated, pickCmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	if pickCmd == nil {
+		t.Fatalf("enter should save provider config with selected model")
+	}
+	msg2 := pickCmd()
+	if got, ok := msg2.(providerConfigMsg); !ok || got.err != nil {
+		t.Fatalf("save command returned %#v", msg2)
+	}
+
+	// The last save should carry the selected model with the
+	// provider-prefixed id.
+	last := saves[len(saves)-1]
+	if got := last["provider"]; got != "custom" {
+		t.Fatalf("saved provider = %v, want custom", got)
+	}
+	models, ok := last["models"].([]any)
+	if !ok || len(models) != 1 {
+		t.Fatalf("saved models = %#v, want one model", last["models"])
+	}
+	modelEntry, ok := models[0].(map[string]any)
+	if !ok {
+		t.Fatalf("saved model entry = %#v", models[0])
+	}
+	if got := modelEntry["id"]; got != "custom/gpt-4o-mini" {
+		t.Fatalf("saved model id = %v, want custom/gpt-4o-mini", got)
+	}
+	if got := modelEntry["name"]; got != "GPT-4o mini" {
+		t.Fatalf("saved model name = %v, want GPT-4o mini", got)
+	}
+}
+
+// TestAddProviderVerifyBusinessFailureSurfacesAuthFailed verifies
+// the regression fixed in this change set: when the upstream
+// provider rejects the credential (e.g. 401 Unauthorized), the
+// wizard's error display must show the structured business error
+// code (`auth_failed`) instead of being collapsed into a transport
+// `network_error`. The Nexus endpoint always returns 200 with a
+// `success:false` body for business failures, and the Go TUI
+// `providerVerifyMsg` handler must propagate the inner error code.
+func TestAddProviderVerifyBusinessFailureSurfacesAuthFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runtime/config/provider/verify" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Nexus business-failure envelope: HTTP 200, body says
+		// success=false with the structured code the operator
+		// needs to act on (don't blame "network").
+		_, _ = w.Write([]byte(`{
+			"success": false,
+			"provider": "my-custom-llm",
+			"error": "auth_failed",
+			"errorDetail": "Failed to authenticate: 401 Unauthorized"
+		}`))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "my-custom-llm"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-bad-key"
+	m.addProviderProtocol = 0
+	m.setMode(modeAddProviderKey)
+
+	updatedEnter, verifyCmd := m.Update(keyPress(tea.KeyEnter))
+	// Enter should have advanced to the verify state and dispatched
+	// the verifyProviderConfig command.
+	m = updatedEnter.(model)
+	if verifyCmd == nil {
+		t.Fatalf("verify dispatch returned nil cmd")
+	}
+	if m.inputMode != modeAddProviderVerify {
+		t.Fatalf("after Enter, inputMode = %q, want %q", m.inputMode, modeAddProviderVerify)
+	}
+	if !m.addProviderVerifying {
+		t.Fatalf("after Enter, addProviderVerifying should be true")
+	}
+
+	// Drive the verify command to completion: feed its message
+	// back into Update so the providerVerifyMsg handler runs.
+	msg := verifyCmd()
+	if _, ok := msg.(providerVerifyMsg); !ok {
+		t.Fatalf("verify cmd returned unexpected msg type %T", msg)
+	}
+	updated, _ := m.Update(msg)
+	m = updated.(model)
+
+	if m.addProviderVerifying {
+		t.Fatalf("after providerVerifyMsg, addProviderVerifying should be false")
+	}
+	// The handler builds:
+	//   addProviderError = msg.error + ": " + msg.errorDetail
+	// so we expect "auth_failed: Failed to authenticate: 401 ..."
+	if got, want := m.addProviderError, "auth_failed: Failed to authenticate: 401 Unauthorized"; got != want {
+		t.Fatalf("addProviderError = %q, want %q", got, want)
+	}
+	// Make sure the misleading "network_error" label is gone.
+	if strings.Contains(m.addProviderError, "network_error") {
+		t.Fatalf("business failure must not surface as network_error, got %q", m.addProviderError)
+	}
+}
+
+func TestAddProviderVerifyHTTP400BusinessFailureSurfacesAuthFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runtime/config/provider/verify" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{
+			"success": false,
+			"provider": "my-custom-llm",
+			"error": "auth_failed",
+			"errorDetail": "Failed to authenticate: 401 Unauthorized"
+		}`))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "my-custom-llm"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-bad-key"
+	m.addProviderProtocol = 0
+	m.setMode(modeAddProviderKey)
+
+	updatedEnter, verifyCmd := m.Update(keyPress(tea.KeyEnter))
+	m = updatedEnter.(model)
+	if verifyCmd == nil {
+		t.Fatalf("verify dispatch returned nil cmd")
+	}
+
+	updated, _ := m.Update(verifyCmd())
+	m = updated.(model)
+
+	if got, want := m.addProviderError, "auth_failed: Failed to authenticate: 401 Unauthorized"; got != want {
+		t.Fatalf("addProviderError = %q, want %q", got, want)
+	}
+	if strings.Contains(m.addProviderError, "transport_error") {
+		t.Fatalf("HTTP 400 business failure must not surface as transport_error, got %q", m.addProviderError)
+	}
+}
+
+func TestAddProviderVerifyHTTP400PlainTextBusinessFailureSurfacesAuthFailed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/runtime/config/provider/verify" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("auth_failed"))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "my-custom-llm"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-bad-key"
+	m.addProviderProtocol = 0
+	m.setMode(modeAddProviderKey)
+
+	updatedEnter, verifyCmd := m.Update(keyPress(tea.KeyEnter))
+	m = updatedEnter.(model)
+	if verifyCmd == nil {
+		t.Fatalf("verify dispatch returned nil cmd")
+	}
+
+	updated, _ := m.Update(verifyCmd())
+	m = updated.(model)
+
+	if got, want := m.addProviderError, "auth_failed: 400 Bad Request"; got != want {
+		t.Fatalf("addProviderError = %q, want %q", got, want)
+	}
+	if strings.Contains(m.addProviderError, "transport_error") {
+		t.Fatalf("HTTP 400 plain-text business failure must not surface as transport_error, got %q", m.addProviderError)
+	}
+}
+
+// TestAddProviderVerifyTransportFailureSurfacesTransportError
+// verifies the other half of the fix: when Nexus is unreachable
+// (or the response body is malformed), the wizard surfaces the
+// failure as `transport_error`, distinct from upstream auth
+// failures. This lets the operator tell apart "I typed the wrong
+// key" from "my Nexus isn't running".
+func TestAddProviderVerifyTransportFailureSurfacesTransportError(t *testing.T) {
+	// http://127.0.0.1:1 is the project's convention for an
+	// intentionally-unroutable Nexus base URL.
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.addProviderName = "my-custom-llm"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-bad-key"
+	m.addProviderProtocol = 0
+	m.setMode(modeAddProviderKey)
+
+	updatedEnter, verifyCmd := m.Update(keyPress(tea.KeyEnter))
+	m = updatedEnter.(model)
+	if verifyCmd == nil {
+		t.Fatalf("verify dispatch returned nil cmd")
+	}
+	msg := verifyCmd()
+	updated, _ := m.Update(msg)
+	m = updated.(model)
+
+	if !strings.HasPrefix(m.addProviderError, "transport_error:") {
+		t.Fatalf("transport failure should surface as transport_error, got %q", m.addProviderError)
+	}
+}
+
+// TestAddProviderSaveFailureRoutesToKeyStepNotBaseURLStep is the
+// regression net for the "operator gets stuck on the Base URL page
+// they never navigated to" bug. The wizard's verify-success path
+// fires saveRuntimeProviderConfig + fetchRuntimeModels in a batch
+// (tui.go:3424-3427). If save fails (e.g. Zod rejects a body the
+// wizard assembled, or Nexus is unreachable while saving), the
+// providerConfigMsg handler used to setMode(modeModelPickBaseURL)
+// unconditionally — pulling the wizard operator into the picker
+// state machine they never entered. After the fix, the handler
+// must detect the wizard inputMode and route the failure to the
+// API key step instead, with a wizard-native error string.
+func TestAddProviderSaveFailureRoutesToKeyStepNotBaseURLStep(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/runtime/config/provider" {
+			// Simulate Nexus rejecting the save (e.g. body
+			// fails a custom validation we don't model here,
+			// or Nexus can't persist the config).
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"persist_failed","message":"disk write failed"}`))
+			return
+		}
+		// Anything else (e.g. /v1/runtime/models after save):
+		// return a healthy models response so the parallel
+		// fetchRuntimeModels doesn't trip a separate failure
+		// path during this test.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"runtime_models","providers":[],"models":{}}`))
+	}))
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.addProviderName = "my-custom-llm"
+	m.addProviderURL = "https://api.example.com/v1"
+	m.addProviderKey = "sk-good-key"
+	m.addProviderProtocol = 0
+	m.setMode(modeAddProviderVerify)
+
+	// Hand the model a failed providerConfigMsg so we exercise
+	// the post-save handler without going through the network.
+	updated, _ := m.Update(providerConfigMsg{
+		providerID: "my-custom-llm",
+		err:        fmt.Errorf("provider config: POST /v1/runtime/config/provider failed: 500 Internal Server Error persist_failed"),
+	})
+	m = updated.(model)
+
+	if m.inputMode == modeModelPickBaseURL {
+		t.Fatalf("wizard save failure must not leak into modeModelPickBaseURL (operator never entered the picker); got %q", m.inputMode)
+	}
+	if m.inputMode != modeAddProviderKey {
+		t.Fatalf("wizard save failure should route to modeAddProviderKey, got %q", m.inputMode)
+	}
+	if !strings.HasPrefix(m.addProviderError, "save:") {
+		t.Fatalf("wizard save failure should surface under addProviderError with save: prefix, got %q", m.addProviderError)
+	}
+	if m.modelPickError != "" {
+		t.Fatalf("wizard save failure must not touch the picker's modelPickError, got %q", m.modelPickError)
+	}
+}
+
+// === Phase 6 regression: AskUserQuestion overlay layout ===
+
+// newAskUserModel builds a model pre-armed with a
+// pendingQuestion and the matching input mode so the
+// AskUserQuestion overlay renders. It returns by value (not
+// pointer) to match the existing render* conventions used
+// throughout the test suite.
+func newAskUserModel(pq *pendingQuestion, cursor int, selected []int) model {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.pendingQuestion = pq
+	m.questionCursor = cursor
+	m.questionSelected = selected
+	m.setMode(modeAskUser)
+	return m
+}
+
+// samplePendingQuestion returns a 3-option question with a
+// mix of short and long text. The long label / description
+// is the failure mode that produced the truncation bug
+// (operators reported the panel clipping beyond the frame).
+func samplePendingQuestion() *pendingQuestion {
+	return &pendingQuestion{
+		sessionID: "session-test",
+		toolUseID: "tool-use-test",
+		question:  "How should I implement the new long-running context assembly phase?",
+		header:    "approach",
+		options: []questionOption{
+			{Label: "managed sidecar", Description: "run as a separate process with a stable IPC surface"},
+			{Label: "embedded loopback", Description: "spawn inside the Nexus process and reuse the in-memory SQLite"},
+			{Label: "remote HTTP only", Description: "talk to an external service over HTTPS with retry"},
+		},
+		multiSelect: false,
+	}
+}
+
+// TestRenderAskUserOverlayEmptyOutsideMode: when inputMode
+// is not modeAskUser the overlay must produce an empty
+// string so viewString() can append it unconditionally.
+func TestRenderAskUserOverlayEmptyOutsideMode(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.pendingQuestion = samplePendingQuestion()
+	// inputMode stays modeComposing.
+	if got := m.renderAskUserOverlay(100); got != "" {
+		t.Fatalf("renderAskUserOverlay outside modeAskUser = %q, want empty", got)
+	}
+}
+
+// TestRenderAskUserOverlayEmptyWhenNoPendingQuestion: even
+// in modeAskUser, if the pending question is nil the
+// renderer must return "" so the operator sees no stale panel.
+func TestRenderAskUserOverlayEmptyWhenNoPendingQuestion(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeAskUser)
+	m.pendingQuestion = nil
+	if got := m.renderAskUserOverlay(100); got != "" {
+		t.Fatalf("renderAskUserOverlay with nil question = %q, want empty", got)
+	}
+}
+
+// TestAskUserEnterClosesPanelSynchronously: pressing Enter on the
+// AskUserQuestion overlay must close the panel SYNCHRONOUSLY (clear
+// pendingQuestion + reset inputMode to composing) and return a non-nil
+// command. Previously the clear happened inside the async HTTP goroutine
+// after a successful response, so the panel appeared unresponsive while the
+// network round-trip was in flight; if a concurrent event had already nil'd
+// pendingQuestion, sendQuestionDecision returned a nil cmd and Enter was
+// silently swallowed (the "Enter does nothing, then says I didn't select"
+// bug). This test pins the synchronous-clear contract.
+func TestAskUserEnterClosesPanelSynchronously(t *testing.T) {
+	m := newAskUserModel(samplePendingQuestion(), 1, nil)
+	// Enter on index 1 (cursor) in single-select mode.
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	// Panel must be closed synchronously, before the HTTP cmd resolves.
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q after Enter, want %q (synchronous close)", m.inputMode, modeComposing)
+	}
+	if m.pendingQuestion != nil {
+		t.Fatalf("pendingQuestion must be cleared synchronously on Enter, still set")
+	}
+	// A non-nil cmd must be returned so the HTTP POST fires; a nil cmd
+	// here means Enter was swallowed (the regression).
+	if cmd == nil {
+		t.Fatalf("Enter must return a non-nil cmd to send the decision, got nil")
+	}
+}
+
+// TestAskUserEnterWithNilPendingBailsSafely: if a concurrent event
+// already cleared pendingQuestion before Enter was processed, the Enter
+// handler must bail to composing instead of dereferencing a nil
+// pendingQuestion (which would panic on .multiSelect access).
+func TestAskUserEnterWithNilPendingBailsSafely(t *testing.T) {
+	m := newModel(Config{BaseURL: "http://127.0.0.1:1", Cwd: "/workspace"})
+	m.setMode(modeAskUser)
+	m.pendingQuestion = nil // already cleared by a concurrent path
+	updated, _ := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	if m.inputMode != modeComposing {
+		t.Fatalf("inputMode = %q after Enter with nil pending, want %q", m.inputMode, modeComposing)
+	}
+}
+
+// TestAskUserSendQuestionDecisionHTTPEndpoint: verifies the full
+// HTTP chain - sendQuestionDecision must POST to the correct
+// /v1/sessions/:sessionId/questions/:toolUseId/response endpoint
+// with the correct body shape (toolUseId, selectedIndices,
+// selectedLabels). A mock Nexus server captures the request and
+// asserts the path + body, proving the Go TUI's response reaches
+// the same storage the runtime polls.
+func TestAskUserSendQuestionDecisionHTTPEndpoint(t *testing.T) {
+	var capturedPath string
+	var capturedBody map[string]any
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/sessions/", func(w http.ResponseWriter, r *http.Request) {
+		capturedPath = r.URL.Path
+		capturedBody = make(map[string]any)
+		bodyBytes, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(bodyBytes, &capturedBody)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"type":"question_response_recorded"}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	m := newModel(Config{BaseURL: server.URL, Cwd: "/workspace"})
+	m.pendingQuestion = &pendingQuestion{
+		sessionID: "session_test123",
+		toolUseID: "toolu_test456",
+		question:  "Which approach?",
+		header:    "approach",
+		options: []questionOption{
+			{Label: "Option A", Description: "first"},
+			{Label: "Option B", Description: "second"},
+		},
+		multiSelect: false,
+	}
+	m.questionCursor = 1
+	m.setMode(modeAskUser)
+
+	// Trigger Enter to fire sendQuestionDecision.
+	updated, cmd := m.Update(keyPress(tea.KeyEnter))
+	m = updated.(model)
+	if cmd == nil {
+		t.Fatalf("Enter must return a non-nil cmd to send the decision")
+	}
+	// Execute the returned cmd (the HTTP POST goroutine).
+	msg := cmd()
+	if msg == nil {
+		t.Fatalf("HTTP POST cmd must produce a message")
+	}
+
+	// Verify the HTTP request hit the correct endpoint with the
+	// correct body. This is the critical assertion: if the path or
+	// body is wrong, the runtime's waitForQuestionResponse poll
+	// will never find the matching ask_user_question_response event.
+	wantPath := "/v1/sessions/session_test123/questions/toolu_test456/response"
+	if capturedPath != wantPath {
+		t.Fatalf("HTTP path = %q, want %q", capturedPath, wantPath)
+	}
+	if toolUseId, _ := capturedBody["toolUseId"].(string); toolUseId != "toolu_test456" {
+		t.Fatalf("body.toolUseId = %q, want %q", toolUseId, "toolu_test456")
+	}
+	indices, _ := capturedBody["selectedIndices"].([]any)
+	if len(indices) != 1 {
+		t.Fatalf("selectedIndices len = %d, want 1", len(indices))
+	}
+	labels, _ := capturedBody["selectedLabels"].([]any)
+	if len(labels) != 1 {
+		t.Fatalf("selectedLabels len = %d, want 1", len(labels))
+	}
+	if label, _ := labels[0].(string); label != "Option B" {
+		t.Fatalf("selectedLabels[0] = %q, want %q", label, "Option B")
+	}
+}
+
+// TestRenderAskUserOverlaySingleSelectShape: the single-
+// select rendering must show the title, the question text,
+// all options with the `~` cursor on the focused one, and
+// the single-select hint row.
+func TestRenderAskUserOverlaySingleSelectShape(t *testing.T) {
+	m := newAskUserModel(samplePendingQuestion(), 1, nil)
+	out := m.renderAskUserOverlay(100)
+	plain := stripANSICodes(out)
+	for _, want := range []string{
+		"AskUserQuestion",
+		"How should I implement the new long-running context assembly phase?",
+		"managed sidecar",
+		"embedded loopback",
+		"remote HTTP only",
+		"~", // cursor marker
+		"single-select",
+		"▲/↓ select   1/2/3/4 quick-pick   ↵ confirm   esc cancel",
+	} {
+		if !strings.Contains(plain, want) {
+			t.Fatalf("renderAskUserOverlay missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.Contains(plain, "[2]") {
+		t.Fatalf("cursor on index 1 should render as [2], got:\n%s", plain)
+	}
+}
+
+// TestRenderAskUserOverlayMultiSelectShape: the multi-
+// select rendering shows the checkbox markers, sets [x]
+// for selected options, and surfaces the multi-select hint.
+func TestRenderAskUserOverlayMultiSelectShape(t *testing.T) {
+	pq := samplePendingQuestion()
+	pq.multiSelect = true
+	m := newAskUserModel(pq, 0, []int{0, 2}) // 1st and 3rd selected
+
+	out := m.renderAskUserOverlay(100)
+	plain := stripANSICodes(out)
+	if !strings.Contains(plain, "multi-select") {
+		t.Fatalf("multi-select overlay should advertise multi-select, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "space toggle") {
+		t.Fatalf("multi-select hint row missing, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "[x]") {
+		t.Fatalf("multi-select should show [x] for selected options, got:\n%s", plain)
+	}
+	if !strings.Contains(plain, "[ ]") {
+		t.Fatalf("multi-select should show [ ] for unselected options, got:\n%s", plain)
+	}
+	// Selected count: options 0 and 2 should be [x], option
+	// 1 should be [ ]. We assert by substring counts to stay
+	// agnostic about exact column positions.
+	xCount := strings.Count(plain, "[x]")
+	if xCount != 2 {
+		t.Fatalf("multi-select expected 2 [x] markers, got %d:\n%s", xCount, plain)
+	}
+}
+
+// TestRenderAskUserOverlayTitleInfoFromHeader: when the
+// pending question provides a header, it is shown as the
+// titleInfo chip next to the title (right-aligned).
+func TestRenderAskUserOverlayTitleInfoFromHeader(t *testing.T) {
+	pq := samplePendingQuestion()
+	pq.header = "Approach"
+	m := newAskUserModel(pq, 0, nil)
+	plain := stripANSICodes(m.renderAskUserOverlay(100))
+	if !strings.Contains(plain, "Approach") {
+		t.Fatalf("TitleInfo should carry pq.header, got:\n%s", plain)
+	}
+}
+
+// TestRenderAskUserOverlayFallsBackToMultiSelectChip:
+// when header is empty but multiSelect is true, the title
+// info chip advertises the mode.
+func TestRenderAskUserOverlayFallsBackToMultiSelectChip(t *testing.T) {
+	pq := samplePendingQuestion()
+	pq.header = ""
+	pq.multiSelect = true
+	m := newAskUserModel(pq, 0, nil)
+	plain := stripANSICodes(m.renderAskUserOverlay(100))
+	if !strings.Contains(plain, "multi-select") {
+		t.Fatalf("missing multi-select chip, got:\n%s", plain)
+	}
+}
+
+// TestRenderAskUserOverlayWrapsLongDescription: a long
+// description must be wrapped inside the frame so it
+// never extends past the right border. This is the bug
+// operators reported: the panel cropped mid-word for
+// descriptions longer than the terminal width.
+func TestRenderAskUserOverlayWrapsLongDescription(t *testing.T) {
+	pq := &pendingQuestion{
+		sessionID: "session-test",
+		toolUseID: "tool-use-test",
+		question:  "Pick an option.",
+		header:    "pick",
+		options: []questionOption{{
+			Label:       "managed sidecar with provider-protocol bridge (Phase F) and slow warm-up",
+			Description: "this description is intentionally much longer than the terminal width so the wrap path must kick in and split it across multiple lines without ever breaching the frame border",
+		}},
+		multiSelect: false,
+	}
+	m := newAskUserModel(pq, 0, nil)
+
+	const width = 60
+	out := m.renderAskUserOverlay(width)
+	plain := stripANSICodes(out)
+	for _, line := range strings.Split(plain, "\n") {
+		// Border glyphs add 2 visible columns on each side;
+		// allow a 2-cell slack for line-trailing cursor
+		// cells the cursor may leave behind.
+		if got := visibleWidth(line); got > width {
+			t.Fatalf("line exceeds frame width %d (got %d):\n%s\nfull panel:\n%s",
+				width, got, line, out)
+		}
+	}
+	if !strings.Contains(plain, "Phase F") {
+		t.Fatalf("long description should be visible (wrapped), got:\n%s", plain)
+	}
+}
+
+// TestRenderAskUserOverlayUsesPermissionFrameStyle: the
+// overlay must use the loud permissionFrameStyle (yellow
+// border color 220) to mirror the live permission_request
+// decision panel. Both AskUserQuestion and permission_request
+// are operator prompts that block the next turn until a
+// decision is made, so they share the same emphasis frame —
+// the muted overlayFrameStyle (border color 238) is reserved
+// for read-only panels (help, inbox, context, etc.) that do
+// not require an operator decision.
+func TestRenderAskUserOverlayUsesPermissionFrameStyle(t *testing.T) {
+	m := newAskUserModel(samplePendingQuestion(), 0, nil)
+	out := m.renderAskUserOverlay(80)
+	if !strings.Contains(out, "\x1b[38;5;220m") {
+		t.Fatalf("AskUserQuestion must use the yellow permissionFrameStyle border (220) to mirror the permission_request panel, got:\n%s", out)
+	}
+	if strings.Contains(out, "\x1b[38;5;238m") {
+		t.Fatalf("AskUserQuestion must not fall back to the muted overlayFrameStyle border (238), got:\n%s", out)
+	}
+}
+
+// TestRenderAskUserOptionRowCursorAndCheckbox: the pure
+// helper renderAskUserOptionRow covers the cursor-vs-
+// checkbox marker rendering and the digit prefix. We assert
+// both modes side-by-side.
+func TestRenderAskUserOptionRowCursorAndCheckbox(t *testing.T) {
+	opt := questionOption{Label: "alpha", Description: "first option"}
+	innerWidth := 80
+
+	single := stripANSICodes(renderAskUserOptionRow(0, opt, false, 0, nil, innerWidth))
+	if !strings.HasPrefix(single, " ~ [1] ") {
+		t.Fatalf("single-select focused row should start with ' ~ [1] ', got: %q", single)
+	}
+	if !strings.Contains(single, "alpha") || !strings.Contains(single, "first option") {
+		t.Fatalf("single-select row missing label/description: %q", single)
+	}
+
+	multi := stripANSICodes(renderAskUserOptionRow(1, opt, true, 0, []int{1}, innerWidth))
+	if !strings.HasPrefix(multi, " [x] [2] ") {
+		t.Fatalf("multi-select selected row should start with ' [x] [2] ', got: %q", multi)
+	}
+
+	multiUnselected := stripANSICodes(renderAskUserOptionRow(2, opt, true, 0, []int{1}, innerWidth))
+	if !strings.HasPrefix(multiUnselected, " [ ] [3] ") {
+		t.Fatalf("multi-select unselected row should start with ' [ ] [3] ', got: %q", multiUnselected)
+	}
+}
+
+// TestRenderAskUserOptionRowWrapsContinuation: a long
+// label must wrap, and the continuation line must be
+// indented to the same column as the label so wrapped
+// descriptions read as a column.
+//
+// The continuation indent is whitespace-only (a run of spaces
+// matching the prefix width) - NOT a repeat of the marker +
+// digit prefix. Repeating " ~ [1] " on every wrapped line made
+// a single long option read as a stack of independent options,
+// so the indent is spaces only and the first line keeps the
+// unique marker/digit.
+//
+// `innerWidth` is the total space inside the frame border
+// (prefix column included). With innerWidth=20 and a
+// 7-char prefix the wrap width is 13, which is tight
+// enough to force a long label to wrap.
+func TestRenderAskUserOptionRowWrapsContinuation(t *testing.T) {
+	opt := questionOption{
+		Label:       "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau",
+		Description: "",
+	}
+	innerWidth := 20
+	out := stripANSICodes(renderAskUserOptionRow(0, opt, false, 0, nil, innerWidth))
+	lines := strings.Split(out, "\n")
+	if len(lines) < 2 {
+		t.Fatalf("long label must wrap into multiple lines, got:\n%s", out)
+	}
+	// First line keeps the marker + digit prefix.
+	if !strings.HasPrefix(lines[0], " ~ [1] ") {
+		t.Fatalf("first line must start with the marker prefix, got: %q", lines[0])
+	}
+	// Continuation lines are indented with spaces matching the
+	// prefix width (7 for " ~ [1] "), NOT a repeat of the marker.
+	indent := strings.Repeat(" ", len(" ~ [1] "))
+	for i := 1; i < len(lines); i++ {
+		if !strings.HasPrefix(lines[i], indent) {
+			t.Fatalf("continuation line %d must be indented with %d spaces (not repeat the marker prefix), got: %q", i, len(indent), lines[i])
+		}
+		// Must not repeat the marker or digit on continuation lines.
+		if strings.Contains(lines[i], "~") || strings.Contains(lines[i], "[1]") {
+			t.Fatalf("continuation line %d must not repeat the marker/digit, got: %q", i, lines[i])
+		}
+	}
+}
+
+// visibleWidth is provided by highlight.go (already in the
+// package). The wrap tests reuse that helper to assert the
+// rendered panel never exceeds the requested frame width.

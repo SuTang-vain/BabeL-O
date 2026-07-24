@@ -9,6 +9,7 @@ Task-oriented docs for running BabeL-O.
 
 | Document | Audience | Role |
 | --- | --- | --- |
+| [keychain-guide.md](./keychain-guide.md) | Users | System keychain integration, credential audit, and migration. |
 | [quickstart.md](./quickstart.md) | Users | Five-minute path from install to first coding session. |
 | [providers.md](./providers.md) | Users | Configure providers, models, base URLs, and profiles. |
 | [session-and-context.md](./session-and-context.md) | Users | Manage sessions, inspect context, compaction, and resume work. |

@@ -54,18 +54,13 @@ test('getProvider returns valid provider definition', () => {
   assert.ok(ollamaProvider.models.includes('ollama/qwen2.5-coder:7b'))
 })
 
-test('getProvider throws UnknownProviderError for unknown ids', () => {
-  assert.throws(() => {
-    getProvider('non-existent-provider')
-  }, UnknownProviderError)
-
-  try {
-    getProvider('non-existent-provider')
-  } catch (error) {
-    assert.ok(error instanceof Error)
-    assert.equal(error.name, 'UnknownProviderError')
-    assert.equal(error.message, 'Unknown provider: non-existent-provider')
-  }
+test('getProvider returns a custom provider entry for unknown ids instead of throwing', () => {
+  const provider = getProvider('non-existent-provider')
+  assert.equal(provider.id, 'non-existent-provider')
+  assert.equal(provider.adapter, 'openai-compatible')
+  assert.equal(provider.authMode, 'bearer')
+  assert.equal(provider.defaultModel, 'non-existent-provider/custom')
+  assert.deepEqual(provider.models, ['non-existent-provider/custom'])
 })
 
 test('getModel returns valid model definition', () => {

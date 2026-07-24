@@ -1,5 +1,6 @@
 import { eventBase, type NexusEvent } from '../../shared/events.js'
 import type { ToolCallTextLeakSuppression } from './turn.js'
+import { humanizeError } from '../../shared/errorRegistry.js'
 
 export function buildRuntimeResultEvent(
   sessionId: string,
@@ -20,12 +21,17 @@ export function buildRuntimeErrorEvent(options: {
   message: string
   details?: unknown
 }): Extract<NexusEvent, { type: 'error' }> {
+  // Apply humanization to add hint and docsUrl
+  const humanized = humanizeError(options.code, options.message, options.details)
+
   return {
     type: 'error',
     ...eventBase(options.sessionId),
-    code: options.code,
-    message: options.message,
+    code: humanized.code,
+    message: humanized.message,
     ...(options.details !== undefined && { details: options.details }),
+    ...(humanized.hint && { hint: humanized.hint }),
+    ...(humanized.docsUrl && { docsUrl: humanized.docsUrl }),
   }
 }
 

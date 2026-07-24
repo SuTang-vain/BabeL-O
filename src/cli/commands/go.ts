@@ -65,7 +65,7 @@ export function registerGoCommand(program: Command): void {
     .option('--source-dir <path>', 'Go TUI source directory', defaultGoTuiSourceDir())
     .option('--start-nexus', 'Start a local Nexus service automatically when --url is not healthy', true)
     .option('--no-start-nexus', 'Do not auto-start Nexus; connect to --url only')
-    .option('--nexus-startup-timeout-ms <ms>', 'Milliseconds to wait for auto-started Nexus health', '8000')
+    .option('--nexus-startup-timeout-ms <ms>', 'Milliseconds to wait for auto-started Nexus health', '30000')
     .option('--allowed-tools <tools>', 'Allowed tools for auto-started Nexus only (default: env NEXUS_ALLOWED_TOOLS or *)')
     .option('--turn-allowed-tools <tools>', 'Advanced: per-turn Go TUI allowedTools override; filters the model-visible tool set')
     .option('--poll-interval-ms <ms>', 'Forward Go TUI config polling interval; 0 disables polling')

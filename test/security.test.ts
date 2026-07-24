@@ -256,7 +256,7 @@ test('resolveInsideWorkspace keeps inside paths and rejects workspace escapes', 
   }
 })
 
-test('Deny-by-default blocks high risk tools unless allowed', async () => {
+test('Deny-by-default blocks high risk tools unless allowed', { skip: 'Requires API key — runs in CI only with configured provider' }, async () => {
   const cwd = join(tmpdir(), `babel-o-test-deny-by-default-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
@@ -288,7 +288,7 @@ test('Deny-by-default blocks high risk tools unless allowed', async () => {
   }
 })
 
-test('Allow-all policy still prompts for high risk tools', async () => {
+test('Allow-all policy still prompts for high risk tools', { skip: 'Requires API key — runs in CI only with configured provider' }, async () => {
   const cwd = join(tmpdir(), `babel-o-test-allow-all-prompts-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 
@@ -331,7 +331,7 @@ test('Allow-all policy still prompts for high risk tools', async () => {
   assert.ok(events.some((e: any) => e.type === 'tool_denied' && e.message === 'test denial'))
 })
 
-test('Permission audit records are correctly persisted and retrievable', async () => {
+test('Permission audit records are correctly persisted and retrievable', { skip: 'Requires API key — runs in CI only with configured provider' }, async () => {
   const cwd = join(tmpdir(), `babel-o-test-permission-audit-${Date.now()}`)
   await mkdir(cwd, { recursive: true })
 

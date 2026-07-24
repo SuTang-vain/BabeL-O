@@ -54,6 +54,16 @@ func (m model) renderHeader(width int) string {
 		toggle = "ctrl+d close"
 	}
 	metaParts := []string{}
+	// Phase 4.2 of authorization-continuity: display current authorization
+	// level in the status bar so operators can see "local_change" vs "inspect".
+	if m.authorizationLevel != "" && m.authorizationLevel != "none" && m.authorizationLevel != "inspect" {
+		authLabel := m.authorizationLevel
+		if m.consentScope != "" && m.consentScope != "current_step" {
+			authLabel = authLabel + ":" + m.consentScope
+		}
+		metaParts = append(metaParts, authStyle.Render("auth:"+authLabel))
+	}
+	metaParts = append(metaParts, "effort:"+effectiveThinkingLevel(m.cfg.ThinkingLevel))
 	metaParts = append(metaParts, context, toggle)
 	metaPlain := strings.Join(metaParts, " · ")
 	stateWidth := lipgloss.Width(state)
@@ -94,12 +104,16 @@ func (m model) renderTopCard(width int) string {
 	if !m.topCardOpen {
 		return ""
 	}
+	if m.topCardPage == 1 {
+		return m.renderTopCardTaskPage(width)
+	}
 	innerWidth := max(20, width-4)
 	title := focusedLineStyle.Render(truncatePlain(firstNonEmpty(m.input.Value(), "Ready for the next turn"), innerWidth))
 	modelLine := strings.TrimSpace(strings.Join([]string{
 		firstNonEmpty(m.modelID, "model pending"),
 		firstNonEmpty(m.providerID, "provider pending"),
 		firstNonEmpty(m.activeProfile, "profile pending"),
+		"effort " + effectiveThinkingLevel(m.cfg.ThinkingLevel),
 	}, " · "))
 	if m.sessionID != "" {
 		modelLine += " · session " + shortID(m.sessionID)
@@ -111,12 +125,19 @@ func (m model) renderTopCard(width int) string {
 		"Session to session", m.topCardSessionRows(),
 		"Memory", []string{"reserved: memory"},
 	)
+
+	// Navigation hint row — rendered as a prominent section
+	// separator so the left/right page toggle is visually
+	// obvious. The bright accent color draws the eye.
+	navHint := topCardNavHintStyle.Render(" ◀ ▶  ← Overview  ·  Tasks →  ")
 	content := strings.Join([]string{
 		title,
 		mutedStyle.Render(truncatePlain(modelLine, innerWidth)),
 		statusStyle.Render(truncatePlain(usage, innerWidth)),
 		"",
 		columns,
+		"",
+		navHint,
 		mutedStyle.Render(truncatePlain("ctrl+d close · /tools audit · /context inspect", innerWidth)),
 	}, "\n")
 	frameWidth := max(0, width-2)
@@ -128,6 +149,44 @@ func (m model) renderTopCard(width int) string {
 		}
 	}
 	return frame.Render(content)
+}
+
+// renderTopCardTaskPage renders page 1 of the Ctrl+D top card:
+// a visually compact task list sourced from m.taskBoard. Each task
+// shows a status badge, title, and optional source. If the list
+// exceeds the available height, a "+N more" hint is appended.
+func (m model) renderTopCardTaskPage(width int) string {
+	innerWidth := max(20, width-4)
+	title := fmt.Sprintf("Tasks · %s", shortID(m.sessionID))
+	summary := summarizeTaskBoard(m.taskBoard)
+	allLines := buildTaskBoardCompactLines(m.taskBoard)
+
+	// Reserve space for header, summary, bottom hint, and frame
+	// chrome (~6 lines on the task page). Clamp visible lines
+	// so the card stays within the terminal height.
+	maxVisible := max(1, m.height-8)
+	visible := allLines
+	overflow := ""
+	if len(visible) > maxVisible {
+		visible = visible[:maxVisible]
+		overflow = mutedStyle.Render(fmt.Sprintf("+%d more · open /tasks for full list", len(allLines)-maxVisible))
+	}
+
+	// Navigation hint row — same prominent style as the overview
+	// page so the user sees a consistent left/right prompt.
+	navHint := topCardNavHintStyle.Render(" ◀ ▶  ← Overview  ·  Tasks →  ")
+	lines := []string{
+		topCardTitleStyle.Render(truncatePlain(title, innerWidth)),
+		topCardSummaryStyle.Render(truncatePlain(summary, innerWidth)),
+		"",
+	}
+	lines = append(lines, visible...)
+	if overflow != "" {
+		lines = append(lines, overflow)
+	}
+	lines = append(lines, "", navHint, mutedStyle.Render(truncatePlain("ctrl+d close · /tasks full view", innerWidth)))
+	content := strings.Join(lines, "\n")
+	return topCardFrameStyle.Width(max(0, width-2)).Render(content)
 }
 
 func (m model) formatContextUsageLabel() string {

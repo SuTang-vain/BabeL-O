@@ -2,6 +2,7 @@ import type { ModelAdapter } from './adapters/ModelAdapter.js'
 import { AnthropicAdapter } from './adapters/AnthropicAdapter.js'
 import { OpenAIAdapter } from './adapters/OpenAIAdapter.js'
 import { LocalAdapter } from './adapters/LocalAdapter.js'
+import { readFileSync, existsSync } from 'node:fs'
 
 export type ProviderAdapter =
   | 'anthropic-compatible'
@@ -236,6 +237,26 @@ export const providerRegistry: ProviderDefinition[] = [
       'minimax/MiniMax-M2.1',
       'minimax/MiniMax-M2.1-highspeed',
       'minimax/MiniMax-M2',
+    ],
+  },
+  {
+    id: 'ark-codingplan',
+    displayName: '火山 CodingPlan',
+    adapter: 'anthropic-compatible',
+    authMode: 'api-key',
+    defaultBaseUrl: 'https://ark.cn-beijing.volces.com/api/coding',
+    defaultModel: 'ark-codingplan/doubao-seed-2.0-code',
+    models: [
+      'ark-codingplan/doubao-seed-2.0-code',
+      'ark-codingplan/doubao-seed-2.0-pro',
+      'ark-codingplan/doubao-seed-2.0-lite',
+      'ark-codingplan/glm-5.2',
+      'ark-codingplan/kimi-k2.7-code',
+      'ark-codingplan/deepseek-v4-pro',
+      'ark-codingplan/deepseek-v4-flash',
+      'ark-codingplan/minimax-m3',
+      'ark-codingplan/minimax-m2.7',
+      'ark-codingplan/kimi-k2.6',
     ],
   },
 ]
@@ -1022,14 +1043,135 @@ export const modelRegistry: ModelDefinition[] = [
       streaming: true,
     },
   },
+  // ark-codingplan: 火山引擎 CodingPlan 聚合端点 (anthropic-compatible).
+  // 参数沿用各模型在原生 registry 中的基准 (deepseek / minimax / glm / kimi).
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-code',
+    name: 'Doubao Seed 2.0 Code (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-pro',
+    name: 'Doubao Seed 2.0 Pro (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/doubao-seed-2.0-lite',
+    name: 'Doubao Seed 2.0 Lite (Ark CodingPlan)',
+    contextWindow: 256000,
+    defaultMaxTokens: 65536,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/glm-5.2',
+    name: 'GLM 5.2 (Ark CodingPlan)',
+    contextWindow: 204800,
+    defaultMaxTokens: 65536,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/kimi-k2.7-code',
+    name: 'Kimi K2.7 Code (Ark CodingPlan)',
+    contextWindow: 262144,
+    defaultMaxTokens: 32768,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/kimi-k2.6',
+    name: 'Kimi K2.6 (Ark CodingPlan)',
+    contextWindow: 262144,
+    defaultMaxTokens: 32768,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/deepseek-v4-pro',
+    name: 'DeepSeek V4 Pro (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/deepseek-v4-flash',
+    name: 'DeepSeek V4 Flash (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/minimax-m3',
+    name: 'MiniMax M3 (Ark CodingPlan)',
+    contextWindow: 1_000_000,
+    defaultMaxTokens: 16384,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    id: 'ark-codingplan/minimax-m2.7',
+    name: 'MiniMax M2.7 (Ark CodingPlan)',
+    contextWindow: 200000,
+    defaultMaxTokens: 128000,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
 ]
 
 export function getProvider(id: string): ProviderDefinition {
   const provider = providerRegistry.find(p => p.id === id)
-  if (!provider) {
-    throw new UnknownProviderError(id)
+  if (provider) return provider
+  // Custom provider from user config: default to openai-compatible.
+  // The adapter, authMode, and baseUrl are resolved at runtime from
+  // ConfigManager (see getAdapter / inspectModelCapabilities), so the
+  // registry entry is a placeholder that carries the provider ID.
+  return {
+    id,
+    displayName: id,
+    adapter: 'openai-compatible',
+    authMode: 'bearer',
+    defaultModel: `${id}/custom`,
+    models: [`${id}/custom`],
   }
-  return provider
 }
 
 export function getModel(id: string): ModelDefinition {
@@ -1189,7 +1331,13 @@ export function getAdapter(providerId: string): ModelAdapter {
   const override = adapterOverrides.get(providerId)
   if (override) return override
   const provider = getProvider(providerId)
-  switch (provider.adapter) {
+  // Check for a user-configured adapter override in config.json.
+  // This allows custom providers to choose the wire protocol without
+  // modifying the registry. See ProviderConfig.adapter.
+  const configPath = process.env.BABEL_O_CONFIG_FILE
+  const configAdapter = configPath ? readUserConfigAdapter(providerId, configPath) : undefined
+  const effectiveAdapter = configAdapter ?? provider.adapter
+  switch (effectiveAdapter) {
     case 'anthropic-compatible':
       return new AnthropicAdapter()
     case 'openai-compatible':
@@ -1198,6 +1346,18 @@ export function getAdapter(providerId: string): ModelAdapter {
     case 'local':
       return new LocalAdapter()
     default:
-      throw new Error(`No adapter found for provider type: ${provider.adapter}`)
+      throw new Error(`No adapter found for provider type: ${effectiveAdapter}`)
   }
+}
+
+function readUserConfigAdapter(providerId: string, configPath: string): ProviderAdapter | undefined {
+  try {
+    if (!existsSync(configPath)) return undefined
+    const raw = JSON.parse(readFileSync(configPath, 'utf-8'))
+    const adapter = raw.providers?.[providerId]?.adapter
+    if (adapter === 'anthropic-compatible' || adapter === 'openai-compatible') return adapter
+  } catch {
+    // Silently ignore
+  }
+  return undefined
 }

@@ -1086,9 +1086,14 @@ test('runtime pipeline final_check phase: finalCheckUsed=true falls through to m
   assert.match(requestState.executionStateBlock, /Phase: must_respond/)
 })
 
-test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL_DENIED_FINAL_CHECK', () => {
+test('reduceProviderTurnOutcome final_check routes write tools to permission flow with FINAL_CHECK_WRITE_ROUTED', () => {
+  // Phase D exception: instead of hard-denying write/execute tool calls during
+  // final_check with TOOL_DENIED_FINAL_CHECK, the runtime routes them through
+  // the normal permission flow. The outcome is `tool_calls` (not `continue`
+  // with a denial message) so `executeProviderToolCall` can run the standard
+  // permission gate / scope-boundary flow. See governance plan Phase D note.
   const outcome = reduceProviderTurnOutcome({
-    sessionId: 'session-final-check-deny',
+    sessionId: 'session-final-check-route',
     turn: {
       assistantText: '',
       reasoningText: '',
@@ -1105,11 +1110,16 @@ test('reduceProviderTurnOutcome final_check denies non-read-only tools with TOOL
     suppressedToolRetryCount: 0,
     maxSuppressedToolRetries: 1,
   })
-  assert.equal(outcome.kind, 'continue')
+  // Routed, not denied: the tool_calls kind dispatches into the permission flow.
+  assert.equal(outcome.kind, 'tool_calls')
+  assert.equal(outcome.toolCalls!.length, 1)
+  assert.equal(outcome.toolCalls![0]!.name, 'Write')
   const err = outcome.eventsBeforeMessages[0] as any
-  assert.equal(err?.code, 'TOOL_DENIED_FINAL_CHECK')
-  // C1: final_check soft-denial carries severity:'soft' (soft-error-retry plan).
+  assert.equal(err?.code, 'FINAL_CHECK_WRITE_ROUTED')
+  // C1: soft signal preserved (soft-error-retry plan).
   assert.equal(err?.details?.severity, 'soft')
+  assert.equal(err?.details?.finalCheckPhase, true)
+  assert.deepEqual(err?.details?.routedTools, ['Write'])
 })
 
 test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass through', () => {
@@ -1133,6 +1143,11 @@ test('reduceProviderTurnOutcome final_check allows read-only tool calls to pass 
   })
   assert.equal(outcome.kind, 'tool_calls')
   assert.equal(outcome.toolCalls.length, 1)
+  // Read-only tools do not emit FINAL_CHECK_WRITE_ROUTED.
+  const routedEvent = outcome.eventsBeforeMessages.find(
+    (e: any) => e?.code === 'FINAL_CHECK_WRITE_ROUTED',
+  )
+  assert.equal(routedEvent, undefined)
 })
 
 test('buildRuntimeExecutionStateBlock surfaces repeated tool input evidence', () => {
@@ -5703,6 +5718,11 @@ test('/v1/sessions/:sessionId/context returns reusable context analysis', async 
     assert.ok(Array.isArray(body.diagnostics.workingSetPaths))
     assert.equal(typeof body.diagnostics.autoCompactFloor.thresholdTokens, 'number')
     assert.equal(typeof body.diagnostics.compactTokenDelta.hasBoundary, 'boolean')
+    assert.equal(typeof body.diagnostics.intentGuidance.mode, 'string')
+    assert.equal(typeof body.diagnostics.intentGuidance.providerVisibleChars, 'number')
+    assert.equal(typeof body.diagnostics.intentGuidance.estimatedSavingsPercent, 'number')
+    assert.equal(body.diagnostic.details.intentGuidanceMode, body.diagnostics.intentGuidance.mode)
+    assert.equal(body.diagnostic.details.intentGuidanceProviderVisibleChars, body.diagnostics.intentGuidance.providerVisibleChars)
     assert.equal(typeof body.diagnostics.sessionMemoryLite.enabled, 'boolean')
     assert.equal(body.diagnostics.sessionMemoryLite.path, '.babel-o/session-memory.md')
     assert.equal(body.diagnostics.sessionMemoryLite.costPolicy.modelFallback, 'extractive-only')

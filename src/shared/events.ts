@@ -31,6 +31,7 @@ export const SessionStartedEventSchema = z.object({
   cwd: z.string(),
   requestId: z.string().optional(),
   model: z.string().optional(),
+  thinkingLevel: z.enum(['quick', 'balanced', 'deep']).optional(),
   budget: z.number().optional(),
 })
 
@@ -151,6 +152,53 @@ export const TaskCreatedEventSchema = z.object({
   title: z.string(),
 })
 
+/**
+ * §3.1.1 Task lifecycle event — emitted by the runtime when the
+ * model calls TaskUpdate to change a task's status, title, or result.
+ * The Go TUI uses this to update the task board in real time.
+ */
+export const TaskUpdatedEventSchema = z.object({
+  type: z.literal('task_updated'),
+  ...baseEventFields,
+  taskId: z.string(),
+  title: z.string(),
+  status: z.enum(['pending', 'in_progress', 'blocked', 'completed', 'failed', 'cancelled']).optional(),
+})
+
+/**
+ * §3.1.2 AskUserQuestion event — the runtime emits this when the
+ * model invokes the AskUserQuestion tool to ask the user a structured
+ * multi-choice question. The Go TUI renders a selection dialog from
+ * this event; the user's choice is sent back via the question response
+ * HTTP endpoint.
+ */
+export const AskUserQuestionEventSchema = z.object({
+  type: z.literal('ask_user_question'),
+  ...baseEventFields,
+  toolUseId: z.string(),
+  question: z.string(),
+  header: z.string().optional(),
+  options: z.array(z.object({
+    label: z.string(),
+    description: z.string().optional(),
+  })),
+  multiSelect: z.boolean().default(false),
+})
+
+/**
+ * §3.1.2 AskUserQuestion response event — emitted by the question
+ * response HTTP endpoint when the user has made their selection(s).
+ * The runtime picks this up as the tool result for the AskUserQuestion
+ * call.
+ */
+export const AskUserQuestionResponseEventSchema = z.object({
+  type: z.literal('ask_user_question_response'),
+  ...baseEventFields,
+  toolUseId: z.string(),
+  selectedIndices: z.array(z.number().int().min(0)),
+  selectedLabels: z.array(z.string()),
+})
+
 export const ResultEventSchema = z.object({
   type: z.literal('result'),
   ...baseEventFields,
@@ -164,6 +212,8 @@ export const ErrorEventSchema = z.object({
   code: z.string(),
   message: z.string(),
   details: z.unknown().optional(),
+  hint: z.string().optional(),
+  docsUrl: z.string().optional(),
 })
 
 export const ExecuteSummaryEventSchema = z.object({
@@ -805,6 +855,9 @@ export const NexusEventSchema = z.discriminatedUnion('type', [
   ToolCompletedEventSchema,
   ToolDeniedEventSchema,
   TaskCreatedEventSchema,
+  TaskUpdatedEventSchema,
+  AskUserQuestionEventSchema,
+  AskUserQuestionResponseEventSchema,
   ResultEventSchema,
   ErrorEventSchema,
   TaskSessionEventSchema,

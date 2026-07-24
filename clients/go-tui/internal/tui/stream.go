@@ -82,7 +82,17 @@ func ensureStartupSession(cfg Config) tea.Cmd {
 const (
 	DefaultGoTuiExecuteTimeoutMs     = 180_000
 	longContextGoTuiExecuteTimeoutMs = 300_000
-	goTuiWatchdogGraceMs             = 60_000
+	// goTuiWatchdogGraceMs is the headroom between the soft timeout
+	// budget (timeoutMs) and the hard watchdog. AskUserQuestion's
+	// waitForQuestionResponse polls storage for up to
+	// QUESTION_RESPONSE_MAX_WAIT_MS (180s). If the model spends
+	// time before calling AskUserQuestion, the question wait deadline
+	// (now + 180s) can overlap with the watchdog deadline (start +
+	// timeoutMs + grace). 120s of grace ensures that even if the
+	// model takes up to 120s to reach the question, the watchdog
+	// (180s + 120s = 300s) still fires after the question wait
+	// deadline expires, giving the user a full 180s to respond.
+	goTuiWatchdogGraceMs             = 120_000
 	longContextTokenThreshold        = 100_000
 )
 
@@ -153,6 +163,9 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		policy = "soft-deny"
 	}
 	payload["policy"] = policy
+	if level := normalizeThinkingLevel(cfg.ThinkingLevel); level != "" {
+		payload["thinkingLevel"] = level
+	}
 	// Phase D: emit per-turn `allowedTools` override when configured.
 	// Empty / unset: per-turn override off; the server-side startup
 	// policy applies. Scoped to this turn only; the next turn
@@ -173,6 +186,22 @@ func buildExecuteRequestWithTimeout(cfg Config, sessionID, prompt string, timeou
 		}
 	}
 	return payload
+}
+
+func normalizeThinkingLevel(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "quick", "balanced", "deep":
+		return strings.ToLower(strings.TrimSpace(value))
+	default:
+		return ""
+	}
+}
+
+func effectiveThinkingLevel(value string) string {
+	if normalized := normalizeThinkingLevel(value); normalized != "" {
+		return normalized
+	}
+	return "balanced"
 }
 
 func ensureStreamSession(cfg Config, prompt string) (string, error) {

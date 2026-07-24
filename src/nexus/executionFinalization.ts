@@ -1,6 +1,6 @@
 import type { NexusEvent } from '../shared/events.js'
 import { nowIso } from '../shared/id.js'
-import type { TaskSessionTerminalReason } from '../shared/session.js'
+import type { TaskSessionTerminalReason, SessionAuthorizationState } from '../shared/session.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import { appendTimeoutPartialResult, buildExecuteSummaryEvent, type TimeoutEventSender } from './executionTimeoutEvents.js'
 
@@ -9,6 +9,8 @@ export type ExecutionFinalizationOptions = {
   resultEvent?: NexusEvent
   errorEvent?: NexusEvent
   contextBlockingEvent?: NexusEvent
+  /** Phase 2 of authorization-continuity: persist authorization state for next turn */
+  authorizationState?: SessionAuthorizationState
 }
 
 export type ExecutionSettlementResult = {
@@ -59,6 +61,7 @@ export async function settleExecutionSession(options: {
     resultEvent,
     errorEvent,
     contextBlockingEvent: options.events.find(event => event.type === 'context_blocking'),
+    authorizationState: extractAuthorizationStateFromEvents(options.events),
   })
   const executeDurationMs = Math.max(0, Math.round(options.now() - options.startedAtMs))
   const summaryEvent = buildExecuteSummaryEvent({
@@ -111,6 +114,13 @@ export async function finalizeExecutionSession(storage: NexusStorage, sessionId:
     session.metadata = withRuntimeRecoveryMetadata(session.metadata)
   }
 
+  // Phase 2 of authorization-continuity: persist authorization state for
+  // next turn's inheritance. Only update if we have a new authorization
+  // state from this turn's intake guidance.
+  if (finalization.authorizationState) {
+    session.authorizationState = finalization.authorizationState
+  }
+
   await storage.saveSession(session)
 }
 
@@ -151,6 +161,37 @@ function runtimeTerminalCategoryForCode(code: string): TaskSessionTerminalReason
   if (code.startsWith('PROVIDER_')) return 'provider'
   if (code === 'CONTEXT_LIMIT_EXCEEDED' || code.startsWith('RUNTIME_') || code === 'NEXUS_RUNTIME_ERROR') return 'runtime'
   return 'error'
+}
+
+/**
+ * Phase 2 of authorization-continuity: extract authorization state from
+ * the latest user_intake_guidance event so it can be persisted to the
+ * session for next turn's inheritance.
+ */
+export function extractAuthorizationStateFromEvents(events: NexusEvent[]): SessionAuthorizationState | undefined {
+  // Find the latest intake guidance event
+  const intakeEvent = events.findLast((event): event is Extract<NexusEvent, { type: 'user_intake_guidance' }> =>
+    event.type === 'user_intake_guidance'
+  )
+  if (!intakeEvent) return undefined
+
+  // Only persist non-trivial authorization (not 'none' and not just 'inspect' from inferred_none)
+  // to avoid cluttering session state with default/ephemeral authorization.
+  const level = intakeEvent.authorizationLevel ?? 'inspect'
+  const source = intakeEvent.consentSource ?? 'inferred_none'
+
+  // Don't persist trivial authorization that would be derived anyway
+  if (level === 'none') return undefined
+  if (level === 'inspect' && source === 'inferred_none') return undefined
+
+  return {
+    level,
+    scope: intakeEvent.consentScope ?? 'current_step',
+    source,
+    establishedAt: intakeEvent.timestamp,
+    establishedByTurn: undefined, // Could be computed if we track turn numbers
+    lastConfirmedAt: intakeEvent.timestamp,
+  }
 }
 
 function runtimeRecoveryMetadata(errorEvent: Extract<NexusEvent, { type: 'error' }>, contextBlockingEvent?: NexusEvent): Record<string, unknown> | undefined {

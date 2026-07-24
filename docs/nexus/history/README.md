@@ -12,6 +12,7 @@ This directory keeps compact history ledgers for completed or watch-only impleme
 | [go-tui-history.md](./go-tui-history.md) | Go TUI rewrite, `bbl loop`, permission policy, selection highlight, and related closed client UX decisions. |
 | [context-and-agent-history.md](./context-and-agent-history.md) | Context Manager, compact, sub-agent, AgentScheduler, SessionChannel, and session collaboration closure history. |
 | [evidence-and-runtime-history.md](./evidence-and-runtime-history.md) | Provider replay, evidence scope, finalization, timeout, and path-drift closure history. |
+| [error-friendly-message-governance-plan.md](./error-friendly-message-governance-plan.md) | Closed | Humanized error messages across Nexus, runtime, and Go TUI; added hint/docsUrl to ErrorEventSchema; created troubleshooting documentation. Phase 1-5 completed 2026-07-10. |
 
 ## Rules
 
