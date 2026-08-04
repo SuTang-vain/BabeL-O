@@ -1,6 +1,7 @@
 import type {
   ModelAdapter,
   ModelQueryParams,
+  NonStreamCompletion,
   StreamDelta,
   TextContentBlock,
   ToolUseContentBlock,
@@ -293,6 +294,116 @@ export class OpenAIAdapter implements ModelAdapter {
         id: toolCall.id,
         input: parsedInput,
       }
+    }
+  }
+
+  /**
+   * Non-streaming fast path (llm-gateway-service-plan.md Phase 1): one
+   * single round-trip completion without SSE. Avoids the streaming tax for
+   * consumers that only need the final result (AetheL fast-json tasks).
+   * Tool blocks are out of scope here — gateway consumers never send tools.
+   */
+  async queryNonStream(
+    params: ModelQueryParams,
+    options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string },
+  ): Promise<NonStreamCompletion> {
+    const slashIndex = params.model.indexOf('/')
+    const targetModel =
+      slashIndex !== -1 ? params.model.substring(slashIndex + 1) : params.model
+    const providerId =
+      slashIndex !== -1 ? params.model.substring(0, slashIndex) : 'openai'
+
+    let providerDef: Pick<ProviderDefinition, 'authMode' | 'defaultBaseUrl'>
+    let registeredProvider = true
+    try {
+      providerDef = getProvider(providerId)
+    } catch {
+      registeredProvider = false
+      providerDef = { authMode: 'bearer', defaultBaseUrl: 'https://api.openai.com/v1' }
+    }
+
+    const usesOpenAIEnv = providerId === 'openai' || !registeredProvider
+    const apiKey = options?.apiKey || (usesOpenAIEnv ? process.env.OPENAI_API_KEY : undefined) || ''
+    const baseUrl =
+      options?.baseUrl ||
+      (usesOpenAIEnv ? process.env.OPENAI_BASE_URL : undefined) ||
+      providerDef.defaultBaseUrl ||
+      'https://api.openai.com/v1'
+
+    const headers: Record<string, string> = {
+      'content-type': 'application/json',
+    }
+    if (providerDef.authMode === 'bearer') {
+      headers.Authorization = `Bearer ${apiKey}`
+    } else if (providerDef.authMode === 'api-key') {
+      headers['x-api-key'] = apiKey
+    }
+
+    const openaiMessages: any[] = []
+    if (params.systemPrompt) {
+      openaiMessages.push({ role: 'system', content: params.systemPrompt })
+    }
+    for (const msg of params.messages) {
+      if (typeof msg.content === 'string') {
+        openaiMessages.push({ role: msg.role, content: msg.content })
+      } else {
+        const text = msg.content
+          .filter((b) => b.type === 'text')
+          .map((b) => (b as TextContentBlock).text)
+          .join('\n')
+        openaiMessages.push({ role: msg.role, content: text || null })
+      }
+    }
+
+    let maxTokensValue: number | undefined
+    if (params.maxTokens !== undefined) {
+      maxTokensValue = params.maxTokens
+    } else {
+      try {
+        maxTokensValue = getModel(params.model).defaultMaxTokens
+      } catch {
+        maxTokensValue = undefined
+      }
+    }
+
+    const body: any = {
+      model: targetModel,
+      messages: openaiMessages,
+      ...(params.temperature !== undefined && { temperature: params.temperature }),
+      ...(maxTokensValue !== undefined && { max_tokens: maxTokensValue }),
+      ...(params.responseFormat !== undefined && { response_format: params.responseFormat }),
+    }
+
+    const response = await withRetry(async () => {
+      const res = await fetch(`${baseUrl}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(body),
+        signal: options?.signal,
+      })
+      if (!res.ok) {
+        const errorText = await res.text()
+        throw new ProviderError(providerId, res.status, errorText)
+      }
+      return res
+    })
+
+    const data = (await response.json()) as any
+    const message = data?.choices?.[0]?.message
+    const usage = data?.usage
+    return {
+      content: typeof message?.content === 'string' ? message.content : '',
+      reasoningContent:
+        typeof message?.reasoning_content === 'string'
+          ? message.reasoning_content
+          : undefined,
+      usage:
+        usage && typeof usage.prompt_tokens === 'number'
+          ? {
+              inputTokens: usage.prompt_tokens || 0,
+              outputTokens: usage.completion_tokens || 0,
+            }
+          : undefined,
     }
   }
 }
