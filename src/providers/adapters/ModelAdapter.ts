@@ -115,9 +115,28 @@ export type StreamDelta =
   | UsageDelta
   | FinishDelta
 
+export type NonStreamCompletion = {
+  content: string
+  reasoningContent?: string
+  usage?: {
+    inputTokens: number
+    outputTokens: number
+  }
+}
+
 export interface ModelAdapter {
   queryStream(
     params: ModelQueryParams,
     options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string }
   ): AsyncIterable<StreamDelta>
+  /**
+   * Optional non-streaming fast path (llm-gateway-service-plan.md Phase 1):
+   * a single round-trip completion without SSE. Consumers that do not need
+   * streaming (e.g. AetheL fast-json tasks) avoid the streaming tax this way.
+   * Adapters that do not implement it fall back to collecting queryStream.
+   */
+  queryNonStream?(
+    params: ModelQueryParams,
+    options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string }
+  ): Promise<NonStreamCompletion>
 }

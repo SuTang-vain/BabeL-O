@@ -244,7 +244,41 @@ export function registerChatCompletionsRoute(app: FastifyInstance): void {
           return
         }
 
-        // Non-stream: collect deltas, return a single chat.completion.
+        // Non-stream: use the adapter's non-streaming fast path when
+        // available (avoids the streaming tax), else collect from stream.
+        if (adapter.queryNonStream) {
+          const completion = await adapter.queryNonStream(params, adapterOptions)
+          return reply.send({
+            id: `chatcmpl-${Date.now()}`,
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: settings.modelId,
+            choices: [
+              {
+                index: 0,
+                message: {
+                  role: 'assistant',
+                  content: completion.content.length > 0 ? completion.content : null,
+                  ...(completion.reasoningContent
+                    ? { reasoning_content: completion.reasoningContent }
+                    : {}),
+                },
+                finish_reason: 'stop',
+              },
+            ],
+            ...(completion.usage
+              ? {
+                  usage: {
+                    prompt_tokens: completion.usage.inputTokens,
+                    completion_tokens: completion.usage.outputTokens,
+                    total_tokens:
+                      completion.usage.inputTokens + completion.usage.outputTokens,
+                  },
+                }
+              : {}),
+          })
+        }
+
         let content = ''
         let reasoning = ''
         let usage: { prompt_tokens: number; completion_tokens: number } | undefined
