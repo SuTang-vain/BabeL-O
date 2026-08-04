@@ -14,6 +14,7 @@ import { buildRuntimeMetricsSnapshot } from './runtimeMetricsSnapshot.js'
 import { ExploreAgentScheduler } from './agents/AgentScheduler.js'
 import { registerExecuteHttpRoute, type ExecuteHttpRouteDeps } from './executeHttpRoute.js'
 import { registerExecuteStreamRoute, type ExecuteStreamRouteDeps } from './executeStreamRoute.js'
+import { registerChatCompletionsRoute } from './chatCompletionsRoute.js'
 import { registerAllRouters } from './routerRegistrar.js'
 import type { AgentScheduler } from './agents/types.js'
 import { buildEverCoreStatus, buildEverOSBootstrapStatus } from './bootstrapStatus.js'
@@ -201,6 +202,7 @@ export async function createNexusApp(options: CreateNexusAppOptions): Promise<Fa
   })
   registerExecuteHttpRoute(app, executeSharedDeps as ExecuteHttpRouteDeps)
   registerExecuteStreamRoute(app, executeSharedDeps as ExecuteStreamRouteDeps)
+  registerChatCompletionsRoute(app)
 
   return app
 }
