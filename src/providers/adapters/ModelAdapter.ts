@@ -54,6 +54,13 @@ export type ModelQueryParams = {
   thinking?: {
     budgetTokens: number
   }
+  // OpenAI-compatible structured output passthrough (used by the
+  // chat completions gateway). Only honored by adapters that support
+  // it (openai-compatible); others ignore it.
+  responseFormat?: {
+    type: 'json_object' | 'json_schema'
+    json_schema?: unknown
+  }
 }
 
 export type TextDelta = {

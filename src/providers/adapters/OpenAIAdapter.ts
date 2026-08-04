@@ -148,6 +148,7 @@ export class OpenAIAdapter implements ModelAdapter {
       ...(mappedTools && mappedTools.length > 0 && { tools: mappedTools }),
       ...(params.temperature !== undefined && { temperature: params.temperature }),
       ...(maxTokensValue !== undefined && { max_tokens: maxTokensValue }),
+      ...(params.responseFormat !== undefined && { response_format: params.responseFormat }),
       stream: true,
       stream_options: { include_usage: true },
     }
