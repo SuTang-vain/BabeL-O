@@ -16,7 +16,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { z } from 'zod'
 import { ConfigManager } from '../shared/config.js'
-import { getAdapter, getModel, UnknownModelError } from '../providers/registry.js'
+import { getAdapter, providerRegistry } from '../providers/registry.js'
 import { ProviderError } from '../shared/errors.js'
 import type {
   ModelMessage,
@@ -85,17 +85,24 @@ export function registerChatCompletionsRoute(app: FastifyInstance): void {
         model: body.model && body.model.length > 0 ? body.model : undefined,
       })
 
-      // Reject unknown provider/model IDs up front instead of passing them
-      // through to the adapter (which would surface as an upstream 401).
-      try {
-        getModel(settings.modelId)
-      } catch (error) {
-        if (error instanceof UnknownModelError) {
-          return reply.code(400).send(
-            openAiError(`Unknown model "${settings.modelId}"`, 'invalid_request_error', 400, 'MODEL_NOT_FOUND'),
-          )
-        }
-        throw error
+      // Reject unknown provider IDs up front instead of passing them through
+      // to the adapter (which would surface as an upstream 401). "Known"
+      // means: built-in registry OR a user-configured custom provider —
+      // custom providers may use models outside the static model catalog.
+      const configManager = ConfigManager.getInstance()
+      const configuredProviders = configManager.load().providers ?? {}
+      const providerKnown =
+        providerRegistry.some((p) => p.id === settings.providerId) ||
+        Boolean(configuredProviders[settings.providerId])
+      if (!providerKnown) {
+        return reply.code(400).send(
+          openAiError(
+            `Unknown model "${settings.modelId}"`,
+            'invalid_request_error',
+            400,
+            'MODEL_NOT_FOUND',
+          ),
+        )
       }
 
       const adapter = getAdapter(settings.providerId)
