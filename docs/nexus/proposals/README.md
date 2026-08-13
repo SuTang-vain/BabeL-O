@@ -7,6 +7,7 @@ This directory holds work that is still being shaped, partially implemented, or 
 | Proposal | State | Scope |
 | --- | --- | --- |
 | [agent-skills-ecosystem-protocol-governance-plan.md](./agent-skills-ecosystem-protocol-governance-plan.md) | Partially Landed | Adopt Agent Skills as BabeL-O's external skill package/interchange format while preserving `NormalizedSkill` as the internal IR; Phase 0-3 landed plus Phase 4 local directory import/export preview/write. |
+| [context-selection-dead-code-and-threshold-dedup-plan.md](./context-selection-dead-code-and-threshold-dedup-plan.md) | Draft | Remove unused context-selection scoring scaffold in `contextManager.ts`; unify warning/compact/blocking threshold computation to one source. (Architecture review P1-5.) |
 | [fable-prompt-architecture-reference-governance-plan.md](./fable-prompt-architecture-reference-governance-plan.md) | Draft | External prompt architecture reference, without importing incompatible product assumptions. |
 | [go-runner-plan.md](./go-runner-plan.md) | Partially Landed | Optional Go RemoteToolRunner phases and runner boundaries. |
 | [go-tui-markdown-rendering-optimization-plan.md](./go-tui-markdown-rendering-optimization-plan.md) | Draft | Gradual Markdown rendering upgrade path for Go TUI transcript readability. |
