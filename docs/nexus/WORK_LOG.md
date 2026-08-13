@@ -3,6 +3,21 @@
 本文件只记录事实、验证和重要决策。不承载长期规划，长期规划写入各 TODO 文档。
 
 
+## 2026-08-13 — bbl go Nexus 端口自动切换 + 身份识别已收口
+
+- **背景**: `bbl go` 启动报 `Error: Failed to allocate Go TUI session at http://127.0.0.1:3000/v1/sessions: 404 Not Found: {"success":false,"error":"API not found"}`。根因：另一个本地开发服务（AetheL `api/server.ts`）占用默认端口 3000 且恰好暴露 `/health` 返回 200；`ensureNexusForGoTui` 仅凭 `/health` 2xx 就认定 Nexus 已存在 → 跳过自动启动 → `POST /v1/sessions` 命中对方 404 兜底。
+- **修复**：
+  1. 新增 `probeNexusHealth()`：单次 `/health` 请求完成身份识别（JSON 含 `runtime: 'babel-o'` 才是真 Nexus；非 Nexus 服务判 `occupied`，连接失败判 `free`）。
+  2. 重写 `ensureNexusForGoTui()`：端口被非 Nexus 服务占用时，从请求端口向后扫描（默认 12 个，`--nexus-port-scan-attempts <n>` 可调），在第一个空闲端口启动 managed Nexus；扫描途中发现真 Nexus 直接复用；全部被占则抛结构化错误（列出扫描区间）。
+  3. 返回值新增 `url`：会话分配与 Go TUI 启动使用实际生效 URL；端口切换时输出 `[bbl] ... started a local Nexus at ...` 提示。
+  4. `bbl go --check` 的 Nexus 不健康 WARN 文案补充端口扫描说明。
+- **验证**:
+  - `npm run typecheck`: pass。
+  - `npm run format:check`: 0 failures。
+  - `NODE_ENV=test node --import tsx --test test/go-command.test.ts`: 52/52 pass（新增 4 用例：端口切换、复用扫描发现的 Nexus、扫描耗尽报错、probe 分类）。
+  - e2e 实测：3000 端口起 impostor HTTP 服务（200 但无 `runtime: babel-o` 标记）→ `bbl go` 自动在 3001 拉起 Nexus 并成功分配 session；3000 空闲时行为不变（直接在 3000 启动）。
+- **边界**: 仅改 `bbl go` launcher 与 CLI 选项，未动 Nexus 服务端、runtime、事件协议；`isNexusHealthy` 语义未变（`bbl go --check` 与 `waitForNexusHealth` 保持兼容）。
+
 ## 2026-07-24 - v0.4.2 release: AskUserQuestion response delivery fix
 
 - **背景**: AskUserQuestion 弹窗中用户选择选项后，runtime 收到了 HTTP POST 响应并写入了 storage，`waitForQuestionResponse` 也成功 poll 到了响应并恢复了执行，但**模型从未看到用户的选择**。根因是 `runtimeToolLoop.ts` 构建 provider-visible `tool_result`（`blockContent`）时使用了 `result.output`（原始 `pending_question` 载荷）而非 `finalOutput`（被替换后的 `answered` 选择载荷）。模型收到的 tool_result 仍然是 `{ status: 'pending_question', question, options, ... }`，完全不含用户的选择信息。

@@ -8,15 +8,23 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Added
 
-- (nothing yet)
+- Added `bbl go --nexus-port-scan-attempts <n>` to bound the local port scan
+  used when the requested Nexus port is occupied (default: 12).
 
 ### Changed
 
-- (nothing yet)
+- `bbl go` now prints a `[bbl] ...` notice when it switches to a different
+  local port for the Nexus service.
 
 ### Fixed
 
-- (nothing yet)
+- Fixed `bbl go` misdetecting any local service that answers `/health` with
+  2xx as a running Nexus (e.g. another dev server on the default port 3000),
+  which caused `Failed to allocate Go TUI session ... 404 API not found`.
+  The launcher now verifies Nexus identity (`runtime: babel-o` in the
+  `/health` body) and auto-starts the managed Nexus on the first free
+  neighbouring port when the requested one is occupied by a non-Nexus
+  service.
 
 ## v0.4.2 - 2026-07-24
 
