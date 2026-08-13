@@ -21,6 +21,7 @@ export interface GoTuiCommandOptions {
   sourceDir?: string
   startNexus?: boolean
   nexusStartupTimeoutMs?: string
+  nexusPortScanAttempts?: string
   allowedTools?: string
   turnAllowedTools?: string
   pollIntervalMs?: string
@@ -66,6 +67,7 @@ export function registerGoCommand(program: Command): void {
     .option('--start-nexus', 'Start a local Nexus service automatically when --url is not healthy', true)
     .option('--no-start-nexus', 'Do not auto-start Nexus; connect to --url only')
     .option('--nexus-startup-timeout-ms <ms>', 'Milliseconds to wait for auto-started Nexus health', '30000')
+    .option('--nexus-port-scan-attempts <n>', 'Max local ports to scan for a free Nexus port when the requested one is occupied (default: 12)', '12')
     .option('--allowed-tools <tools>', 'Allowed tools for auto-started Nexus only (default: env NEXUS_ALLOWED_TOOLS or *)')
     .option('--turn-allowed-tools <tools>', 'Advanced: per-turn Go TUI allowedTools override; filters the model-visible tool set')
     .option('--poll-interval-ms <ms>', 'Forward Go TUI config polling interval; 0 disables polling')
@@ -82,8 +84,17 @@ export function registerGoCommand(program: Command): void {
       let launchOptions = options
       try {
         managedNexus = await ensureNexusForGoTui(options)
-        const sessionReady = await ensureGoTuiSession(options, { fetch })
-        launchOptions = { ...options, session: sessionReady.sessionId }
+        const effectiveOptions = { ...options, url: managedNexus.url }
+        if (managedNexus.url !== options.url) {
+          console.error(
+            `[bbl] ${options.url} is not a BabeL-O Nexus; ` +
+              (managedNexus.status === 'started'
+                ? `started a local Nexus at ${managedNexus.url}`
+                : `using Nexus at ${managedNexus.url}`),
+          )
+        }
+        const sessionReady = await ensureGoTuiSession(effectiveOptions, { fetch })
+        launchOptions = { ...effectiveOptions, session: sessionReady.sessionId }
         launch = createGoTuiLaunchSpec(launchOptions)
       } catch (error: any) {
         if (managedNexus?.status === 'started') {
@@ -246,7 +257,9 @@ export async function runGoTuiCheckReport(
     lines.push(
       `[WARN]    Nexus is not healthy at ${options.url}. ` +
         `This check does not start Nexus. A normal 'bbl go' launch may try to start a local Nexus ` +
-        `(when --url is a localhost URL); use --no-start-nexus to suppress that.`,
+        `(when --url is a localhost URL); if that port is occupied by a non-Nexus service, ` +
+        `'bbl go' scans the next ports and starts Nexus on the first free one. ` +
+        `Use --no-start-nexus to suppress auto-start.`,
     )
   }
 
@@ -644,6 +657,46 @@ export async function allocateGoTuiSession(
   return sessionId
 }
 
+export type NexusHealthProbe =
+  | { kind: 'nexus' }
+  | { kind: 'occupied'; status: number }
+  | { kind: 'free' }
+
+export interface EnsureNexusForGoTuiResult {
+  status: 'existing' | 'started' | 'skipped'
+  child?: ChildProcess
+  url: string
+}
+
+// probeNexusHealth performs one /health request and classifies
+// whatever answers: a real BabeL-O Nexus (`runtime: 'babel-o'`
+// in the JSON body), a port occupied by some other service,
+// or a free port (connection failure). This identity check
+// prevents `bbl go` from mistaking an unrelated local dev
+// server that happens to expose /health (e.g. another project
+// bound to the default port 3000) for a running Nexus.
+export async function probeNexusHealth(
+  url: string,
+  fetchImpl: FetchFn = fetch,
+): Promise<NexusHealthProbe> {
+  let response: Response
+  try {
+    response = await fetchImpl(new URL('/health', healthProbeBaseUrl(url)), { method: 'GET' })
+  } catch {
+    return { kind: 'free' }
+  }
+  let body: any
+  try {
+    body = await response.json()
+  } catch {
+    // Non-JSON /health body (plain text, HTML, ...) — not a Nexus.
+  }
+  if (response.ok && body?.runtime === 'babel-o') {
+    return { kind: 'nexus' }
+  }
+  return { kind: 'occupied', status: response.status }
+}
+
 export async function ensureNexusForGoTui(
   options: GoTuiCommandOptions,
   deps: {
@@ -655,44 +708,71 @@ export async function ensureNexusForGoTui(
     execArgv?: string[]
     env?: NodeJS.ProcessEnv
   } = {},
-): Promise<{ status: 'existing' | 'started' | 'skipped'; child?: ChildProcess }> {
+): Promise<EnsureNexusForGoTuiResult> {
   const fetchImpl = deps.fetch ?? fetch
-  if (await isNexusHealthy(options.url, fetchImpl)) {
-    return { status: 'existing' }
+  const firstProbe = await probeNexusHealth(options.url, fetchImpl)
+  if (firstProbe.kind === 'nexus') {
+    return { status: 'existing', url: options.url }
   }
 
   if (options.startNexus === false) {
-    return { status: 'skipped' }
+    return { status: 'skipped', url: options.url }
   }
 
   if (!isLocalNexusUrl(options.url)) {
     throw new Error(`Nexus is not healthy at ${options.url}; automatic startup is only supported for localhost URLs.`)
   }
 
-  const spec = createManagedNexusLaunchSpec(options, {
-    argv: deps.argv,
-    execArgv: deps.execArgv,
-    env: deps.env,
-  })
-  const child = (deps.spawn ?? spawn)(spec.command, spec.args, {
-    stdio: 'ignore',
-    env: spec.env,
-  })
-  child.unref?.()
+  // The requested port is either free (connection refused) or
+  // occupied by a non-Nexus service. Scan the neighbouring
+  // ports and start the managed Nexus on the first free one,
+  // so a port collision on the default (3000) never blocks
+  // `bbl go`. A real Nexus discovered mid-scan is reused.
+  const attempts = parsePositiveIntOption(options.nexusPortScanAttempts, 12)
+  const basePort = parseLocalNexusUrl(options.url)!.port
+  for (let offset = 0; offset < attempts; offset++) {
+    const candidateUrl = offset === 0 ? options.url : portOffsetUrl(options.url, offset)
+    const probe = offset === 0 ? firstProbe : await probeNexusHealth(candidateUrl, fetchImpl)
+    if (probe.kind === 'nexus') {
+      return { status: 'existing', url: candidateUrl }
+    }
+    if (probe.kind !== 'free') {
+      // Occupied by a non-Nexus service (or an unhealthy one):
+      // spawning here would fail with EADDRINUSE. Try the next port.
+      continue
+    }
 
-  try {
-    await waitForNexusHealth(options.url, {
-      fetch: fetchImpl,
-      timeoutMs: parsePositiveIntOption(options.nexusStartupTimeoutMs, 8000),
-      sleep: deps.sleep,
-      now: deps.now,
+    const spec = createManagedNexusLaunchSpec({ ...options, url: candidateUrl }, {
+      argv: deps.argv,
+      execArgv: deps.execArgv,
+      env: deps.env,
     })
-  } catch (error) {
-    child.kill?.()
-    throw error
+    const child = (deps.spawn ?? spawn)(spec.command, spec.args, {
+      stdio: 'ignore',
+      env: spec.env,
+    })
+    child.unref?.()
+
+    try {
+      await waitForNexusHealth(candidateUrl, {
+        fetch: fetchImpl,
+        timeoutMs: parsePositiveIntOption(options.nexusStartupTimeoutMs, 8000),
+        sleep: deps.sleep,
+        now: deps.now,
+      })
+    } catch (error) {
+      child.kill?.()
+      throw error
+    }
+
+    return { status: 'started', child, url: candidateUrl }
   }
 
-  return { status: 'started', child }
+  throw new Error(
+    `Could not auto-start Nexus near ${options.url}: scanned ${attempts} port(s) ` +
+      `(${basePort}–${basePort + attempts - 1}) and every port is occupied by a non-Nexus service. ` +
+      `Stop the conflicting service, or pass --url with a free port.`,
+  )
 }
 
 export function createManagedNexusLaunchSpec(
@@ -761,6 +841,18 @@ export async function waitForNexusHealth(
 
 export function isLocalNexusUrl(value: string): boolean {
   return parseLocalNexusUrl(value) !== undefined
+}
+
+// portOffsetUrl returns the same URL as `url` but with the
+// port shifted by `offset` (e.g. http://127.0.0.1:3000 + 1 →
+// http://127.0.0.1:3001/). Used by ensureNexusForGoTui's port
+// scan when the requested port is occupied by a non-Nexus
+// service.
+function portOffsetUrl(url: string, offset: number): string {
+  const parsed = new URL(url)
+  const base = parsed.port ? Number(parsed.port) : 80
+  parsed.port = String(base + offset)
+  return parsed.toString()
 }
 
 function parseLocalNexusUrl(value: string): { hostname: string; port: number } | undefined {

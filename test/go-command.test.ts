@@ -20,6 +20,7 @@ import {
   isLocalNexusUrl,
   isNexusHealthy,
   platformSuffix,
+  probeNexusHealth,
   registerGoCommand,
   runGoTuiCheckReport,
   waitForNexusHealth,
@@ -286,7 +287,11 @@ test('ensureNexusForGoTui reuses healthy Nexus without spawning', async () => {
       alt: true,
     },
     {
-      fetch: async () => ({ ok: true }) as Response,
+      fetch: async () =>
+        new Response(JSON.stringify({ status: 'ok', runtime: 'babel-o' }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }) as Response,
       spawn: (() => {
         spawnCalled = true
         throw new Error('unexpected spawn')
@@ -295,11 +300,13 @@ test('ensureNexusForGoTui reuses healthy Nexus without spawning', async () => {
   )
 
   assert.equal(result.status, 'existing')
+  assert.equal(result.url, 'http://127.0.0.1:3000')
   assert.equal(spawnCalled, false)
 })
 
 test('ensureNexusForGoTui starts local Nexus and waits for health', async () => {
   const fetchStatuses = [false, false, true]
+  let fetchCalls = 0
   const spawnCalls: Array<{ command: string; args: string[]; env?: NodeJS.ProcessEnv }> = []
   const child = {
     unrefCalled: false,
@@ -324,7 +331,14 @@ test('ensureNexusForGoTui starts local Nexus and waits for health', async () => 
       argv: ['node', '/repo/src/cli/program.ts', 'go'],
       execArgv: ['--import', 'tsx'],
       env: {},
-      fetch: async () => ({ ok: fetchStatuses.shift() ?? true }) as Response,
+      fetch: (async () => {
+        fetchCalls += 1
+        if (fetchCalls === 1) {
+          // Port probe: nothing is listening on 3333.
+          throw new Error('ECONNREFUSED')
+        }
+        return { ok: fetchStatuses.shift() ?? true } as Response
+      }) as any,
       spawn: ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
         spawnCalls.push({ command, args, env: options.env })
         return child
@@ -338,6 +352,7 @@ test('ensureNexusForGoTui starts local Nexus and waits for health', async () => 
   )
 
   assert.equal(result.status, 'started')
+  assert.equal(result.url, 'http://127.0.0.1:3333')
   assert.equal(result.child, child as any)
   assert.equal(child.unrefCalled, true)
   assert.equal(child.killed, false)
@@ -393,6 +408,7 @@ test('ensureNexusForGoTui kills auto-started Nexus when health never becomes rea
     },
   }
   let nowValue = 0
+  let fetchCalls = 0
 
   await assert.rejects(
     () =>
@@ -404,7 +420,14 @@ test('ensureNexusForGoTui kills auto-started Nexus when health never becomes rea
           nexusStartupTimeoutMs: '1',
         },
         {
-          fetch: async () => ({ ok: false }) as Response,
+          fetch: (async () => {
+            fetchCalls += 1
+            if (fetchCalls === 1) {
+              // Port probe: nothing is listening on 3999.
+              throw new Error('ECONNREFUSED')
+            }
+            return { ok: false } as Response
+          }) as any,
           spawn: (() => child) as any,
           sleep: async () => {
             nowValue += 200
@@ -415,6 +438,141 @@ test('ensureNexusForGoTui kills auto-started Nexus when health never becomes rea
     /Timed out waiting for Nexus health/,
   )
   assert.equal(child.killed, true)
+})
+
+test('ensureNexusForGoTui switches to the next free port when the requested port hosts a non-Nexus service', async () => {
+  const spawnCalls: Array<{ env?: NodeJS.ProcessEnv }> = []
+  const child = {
+    unref() {},
+    kill() {
+      return true
+    },
+  }
+  let nextPortProbes = 0
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('127.0.0.1:3001')) {
+      nextPortProbes += 1
+      if (nextPortProbes === 1) {
+        // Port scan probe: 3001 is free.
+        throw new Error('ECONNREFUSED')
+      }
+      // waitForNexusHealth after the managed Nexus spawned.
+      return new Response(JSON.stringify({ status: 'ok', runtime: 'babel-o' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    // Port 3000: an unrelated service that happens to answer /health.
+    return new Response(JSON.stringify({ status: 'ok', service: 'something-else' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+
+  const result = await ensureNexusForGoTui(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      fetch: fetchImpl as any,
+      spawn: ((command: string, args: string[], options: { env?: NodeJS.ProcessEnv }) => {
+        spawnCalls.push({ env: options.env })
+        return child
+      }) as any,
+      sleep: async () => undefined,
+      now: (() => {
+        let t = 0
+        return () => (t += 100)
+      })(),
+    },
+  )
+
+  assert.equal(result.status, 'started')
+  assert.equal(result.url, 'http://127.0.0.1:3001/')
+  assert.equal(spawnCalls.length, 1)
+  assert.equal(spawnCalls[0].env?.NEXUS_PORT, '3001')
+})
+
+test('ensureNexusForGoTui reuses an existing Nexus discovered on a scanned port', async () => {
+  let spawnCalled = false
+  const fetchImpl = async (input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('127.0.0.1:3002')) {
+      return new Response(JSON.stringify({ status: 'ok', runtime: 'babel-o' }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    // Ports 3000 and 3001: unrelated services answering /health.
+    return new Response('impostor', { status: 200 })
+  }
+
+  const result = await ensureNexusForGoTui(
+    {
+      url: 'http://127.0.0.1:3000',
+      cwd: '/workspace',
+      alt: true,
+    },
+    {
+      fetch: fetchImpl as any,
+      spawn: (() => {
+        spawnCalled = true
+        throw new Error('unexpected spawn')
+      }) as any,
+    },
+  )
+
+  assert.equal(result.status, 'existing')
+  assert.equal(result.url, 'http://127.0.0.1:3002/')
+  assert.equal(spawnCalled, false)
+})
+
+test('ensureNexusForGoTui fails after scanning when every port is occupied by non-Nexus services', async () => {
+  const fetchImpl = async () => new Response('impostor', { status: 200 })
+  await assert.rejects(
+    () =>
+      ensureNexusForGoTui(
+        {
+          url: 'http://127.0.0.1:3000',
+          cwd: '/workspace',
+          alt: true,
+          nexusPortScanAttempts: '3',
+        },
+        {
+          fetch: fetchImpl as any,
+          spawn: (() => {
+            throw new Error('unexpected spawn')
+          }) as any,
+        },
+      ),
+    /scanned 3 port\(s\) \(3000–3002\)/,
+  )
+})
+
+test('probeNexusHealth classifies Nexus, impostor, and free ports', async () => {
+  const nexus = await probeNexusHealth('http://127.0.0.1:3000', async () => {
+    return new Response(JSON.stringify({ status: 'ok', runtime: 'babel-o' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  })
+  assert.equal(nexus.kind, 'nexus')
+
+  const impostor = await probeNexusHealth('http://127.0.0.1:3000', async () => {
+    return new Response(JSON.stringify({ status: 'ok', service: 'other' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  })
+  assert.equal(impostor.kind, 'occupied')
+
+  const free = await probeNexusHealth('http://127.0.0.1:3000', async () => {
+    throw new Error('ECONNREFUSED')
+  })
+  assert.equal(free.kind, 'free')
 })
 
 test('waitForNexusHealth resolves after a later healthy probe', async () => {
