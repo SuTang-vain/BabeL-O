@@ -444,6 +444,8 @@ export const CompactBoundaryEventSchema = z.object({
   preTokens: z.number().optional(),
   postTokens: z.number().optional(),
   estimatedTokensSaved: z.number().optional(),
+  summaryInputTokens: z.number().optional(),
+  summaryOutputTokens: z.number().optional(),
   retainedEvents: z.array(z.unknown()).optional(),
   retainedSegment: z.object({
     retainedCount: z.number(),
@@ -467,6 +469,8 @@ export const ContextCompactBoundaryEventSchema = z.object({
   preTokens: z.number().optional(),
   postTokens: z.number().optional(),
   estimatedTokensSaved: z.number().optional(),
+  summaryInputTokens: z.number().optional(),
+  summaryOutputTokens: z.number().optional(),
   summaryChars: z.number(),
   snippedToolResults: z.number(),
   messagesSummarized: z.number(),

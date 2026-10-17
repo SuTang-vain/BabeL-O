@@ -18,6 +18,13 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Fixed
 
+- Fixed context compaction reading the **oldest** 10k events instead of the
+  newest window, which could drop the current user instruction on sessions
+  with more than 10k events. Compaction now keeps the newest turns under a
+  token budget, always retains the current `user_message` (failing closed if
+  it cannot), budgets the post-compact state block separately so summary
+  truncation cannot delete it, and reports pre/post token counts in the same
+  unit as the trigger while recording summary usage.
 - Fixed `bbl go` misdetecting any local service that answers `/health` with
   2xx as a running Nexus (e.g. another dev server on the default port 3000),
   which caused `Failed to allocate Go TUI session ... 404 API not found`.
