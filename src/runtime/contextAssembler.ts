@@ -403,27 +403,30 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const compactCapabilityReminder = compactBoundary
     ? buildCompactCapabilityReminder(postCompactState)
     : ''
-  if (compactBoundary && stateBlock) {
-    sessionSummary = [sessionSummary, stateBlock]
-      .filter(part => part.trim().length > 0)
-      .join('\n')
-      .trim()
-  }
-  if (compactCapabilityReminder) {
-    sessionSummary = [sessionSummary, compactCapabilityReminder]
-      .filter(part => part.trim().length > 0)
-      .join('\n')
-      .trim()
-  }
-  if (compactBoundary && !retainedSegmentCheck.valid) {
-    sessionSummary = [
-      sessionSummary,
-      `Preserved Segment Warning: ${retainedSegmentCheck.warning}. Falling back to full session history for this context build.`,
-    ]
-      .filter(part => part.trim().length > 0)
-      .join('\n')
-      .trim()
-  }
+  const stateSuffix = [
+    compactBoundary ? stateBlock : '',
+    compactCapabilityReminder,
+    compactBoundary && !retainedSegmentCheck.valid
+      ? `Preserved Segment Warning: ${retainedSegmentCheck.warning}. Falling back to full session history for this context build.`
+      : '',
+  ]
+    .filter(part => part.trim().length > 0)
+    .join('\n')
+    .trim()
+
+  // Budget the prose summary separately from the post-compact state. The old
+  // path appended the state block to the end of the summary string and then
+  // head-truncated the concatenation, so the newest state was the first thing
+  // deleted once the summary exceeded the layer budget.
+  const summaryBudgetChars = budget.layerBudgets.summary * 4
+  const proseBudget = Math.max(0, summaryBudgetChars - (stateSuffix ? stateSuffix.length + 1 : 0))
+  sessionSummary = [
+    truncateToBudget(sessionSummary, proseBudget),
+    stateSuffix,
+  ]
+    .filter(part => part.trim().length > 0)
+    .join('\n')
+    .trim()
 
   const { projectMemory: budgetedProjectMemory, sessionSummary: budgetedSessionSummary, activeSkills: budgetedActiveSkills } =
     enforceDynamicLayerBudgets({
@@ -988,7 +991,10 @@ function enforceDynamicLayerBudgets(options: {
   const { budget } = options
   return {
     projectMemory: truncateToBudget(options.projectMemory, budget.layerBudgets.memory * 4),
-    sessionSummary: truncateToBudget(options.sessionSummary, budget.layerBudgets.summary * 4),
+    // assembleContext budgets the prose summary and the post-compact state
+    // separately, then hands over the already-budgeted result. Re-truncating
+    // here would cut the state suffix that must survive.
+    sessionSummary: options.sessionSummary,
     activeSkills: truncateToBudget(options.activeSkills, budget.layerBudgets.system * 4),
   }
 }
