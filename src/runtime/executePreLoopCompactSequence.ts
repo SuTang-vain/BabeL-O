@@ -207,6 +207,13 @@ export async function* executePreLoopCompactSequence(
     failureCount: initialDecision.failureCount,
     fuseOpen: initialDecision.fuseOpen,
     reason: initialDecision.reason ?? (initialDecision.shouldCompact ? 'should-compact' : 'headroom'),
+    ...(initialDecision.tier && { tier: initialDecision.tier }),
+    ...(initialDecision.payback !== undefined && { payback: initialDecision.payback }),
+    ...(initialDecision.nStar !== undefined && { nStar: initialDecision.nStar }),
+    ...(initialDecision.dHat !== undefined && { dHat: initialDecision.dHat }),
+    ...(initialDecision.sHat !== undefined && { sHat: initialDecision.sHat }),
+    ...(initialDecision.kHat !== undefined && { kHat: initialDecision.kHat }),
+    ...(initialDecision.nHat !== undefined && { nHat: initialDecision.nHat }),
   })
 
   // Block 1: auto compact.
@@ -290,6 +297,9 @@ export async function* executePreLoopCompactSequence(
       failureCount: reactiveDecision.failureCount,
       fuseOpen: reactiveDecision.fuseOpen,
       reason: 'reactive-blocking',
+      ...(reactiveDecision.tier && { tier: reactiveDecision.tier }),
+      ...(reactiveDecision.payback !== undefined && { payback: reactiveDecision.payback }),
+      ...(reactiveDecision.nStar !== undefined && { nStar: reactiveDecision.nStar }),
     })
     try {
       const compactResult = await compactSession({

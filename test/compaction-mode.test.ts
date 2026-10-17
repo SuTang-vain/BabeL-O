@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   applyCompactionMode,
+  evaluateCompactionPolicy,
   recordCompactionDecision,
   resolveCompactionMode,
 } from '../src/runtime/compactionMode.js'
@@ -80,9 +81,9 @@ describe('applyCompactionMode', () => {
     assert.equal(below.shouldCompact, false)
     assert.equal(below.enabled, true)
     assert.equal(below.thresholdPercent, 92)
-    assert.equal(below.reason, 'adaptive-headroom')
+    assert.equal(below.reason, 'payback')
     assert.equal(at.shouldCompact, true)
-    assert.equal(at.reason, 'adaptive-forced')
+    assert.equal(at.reason, 'forced-payback-negative')
   })
 
   test('adaptive still respects the failure fuse', () => {
@@ -94,6 +95,64 @@ describe('applyCompactionMode', () => {
     })
     assert.equal(decision.shouldCompact, false)
     assert.equal(decision.fuseOpen, true)
+  })
+})
+
+describe('evaluateCompactionPolicy', () => {
+  test('rejects proactive compaction when payback is negative', () => {
+    const decision = evaluateCompactionPolicy({
+      tokenEstimate: 45_000,
+      maxTokens: 90_000,
+      nHat: 3,
+      dHat: 6_000,
+      sHat: 12_000,
+      kHat: 0.5,
+    })
+    assert.equal(decision.shouldCompact, false)
+    assert.equal(decision.tier, 'noop')
+    assert.equal(decision.reason, 'payback')
+    assert.ok(decision.nStar > decision.nHat)
+  })
+
+  test('accepts proactive compaction when the horizon pays for it', () => {
+    const decision = evaluateCompactionPolicy({
+      tokenEstimate: 40_000,
+      maxTokens: 100_000,
+      nHat: 20,
+      dHat: 8_000,
+      sHat: 2_000,
+      kHat: 0.5,
+      cacheRatio: 0,
+    })
+    assert.equal(decision.shouldCompact, true)
+    assert.equal(decision.tier, 't3')
+    assert.equal(decision.reason, 'payback')
+  })
+
+  test('forces compaction at 92% even when payback is negative', () => {
+    const decision = evaluateCompactionPolicy({
+      tokenEstimate: 92_000,
+      maxTokens: 100_000,
+      nHat: 1,
+      dHat: 4_000,
+      sHat: 12_000,
+    })
+    assert.equal(decision.shouldCompact, true)
+    assert.equal(decision.reason, 'forced-payback-negative')
+  })
+
+  test('throttles by churn, hysteresis, and the failure fuse', () => {
+    const base = {
+      tokenEstimate: 60_000,
+      maxTokens: 200_000,
+      nHat: 20,
+      dHat: 8_000,
+      sHat: 2_000,
+    }
+    assert.equal(evaluateCompactionPolicy({ ...base, compactionsThisTurn: 1 }).reason, 'churn-turn')
+    assert.equal(evaluateCompactionPolicy({ ...base, callsSinceLastCompact: 1 }).reason, 'churn-calls')
+    assert.equal(evaluateCompactionPolicy({ ...base, lastPostTokens: 58_000 }).reason, 'hysteresis')
+    assert.equal(evaluateCompactionPolicy({ ...base, fuseOpen: true }).reason, 'fuse-open')
   })
 })
 
