@@ -344,8 +344,11 @@ export function getAutoCompactDecision(options: {
   failureLimit?: number
 }): AutoCompactDecision {
   const enabled = options.enabled ?? isAutoCompactEnabled()
+  // The documented env knob wins over the caller's runtime default. Before
+  // this, contextRefresh always passed the hardcoded 90% and the env var was
+  // silently ignored.
   const thresholdPercent = clampPercent(
-    options.thresholdPercent ?? readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', 90),
+    readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', options.thresholdPercent ?? 90),
   )
   const failureLimit = Math.max(
     1,

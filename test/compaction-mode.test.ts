@@ -9,7 +9,7 @@ import {
   recordCompactionDecision,
   resolveCompactionMode,
 } from '../src/runtime/compactionMode.js'
-import type { AutoCompactDecision } from '../src/runtime/compact.js'
+import { getAutoCompactDecision, type AutoCompactDecision } from '../src/runtime/compact.js'
 
 function stockDecision(overrides: Partial<AutoCompactDecision> = {}): AutoCompactDecision {
   return {
@@ -153,6 +153,27 @@ describe('evaluateCompactionPolicy', () => {
     assert.equal(evaluateCompactionPolicy({ ...base, callsSinceLastCompact: 1 }).reason, 'churn-calls')
     assert.equal(evaluateCompactionPolicy({ ...base, lastPostTokens: 58_000 }).reason, 'hysteresis')
     assert.equal(evaluateCompactionPolicy({ ...base, fuseOpen: true }).reason, 'fuse-open')
+  })
+})
+
+describe('auto compact threshold env', () => {
+  test('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT wins over the caller default', () => {
+    const previous = process.env.BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT
+    process.env.BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT = '50'
+    try {
+      const decision = getAutoCompactDecision({
+        events: [],
+        tokenEstimate: 50,
+        maxTokens: 100,
+        enabled: true,
+        thresholdPercent: 90,
+      })
+      assert.equal(decision.thresholdPercent, 50)
+      assert.equal(decision.shouldCompact, true)
+    } finally {
+      if (previous === undefined) delete process.env.BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT
+      else process.env.BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT = previous
+    }
   })
 })
 
