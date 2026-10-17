@@ -72,6 +72,11 @@ import {
   absorbCompactSummaryLatencyMetrics,
 } from './runtimePipeline.js'
 import { buildCompactFailureEvent, compactSession } from './compact.js'
+import {
+  recordCompactionDecision,
+  resolveCompactionMode,
+  type CompactionModeDecision,
+} from './compactionMode.js'
 import { ContextRefreshStrategy, type ContextRefreshStrategyOptions } from './ContextRefreshStrategy.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
@@ -130,9 +135,35 @@ export type ExecuteProviderLoopCompactBlockResult = {
 export async function executeProviderLoopCompactBlock(
   input: ExecuteProviderLoopCompactBlockInput,
 ): Promise<ExecuteProviderLoopCompactBlockResult> {
+  const mode = resolveCompactionMode()
+  if (mode === 'noop') {
+    return { events: [], compactAttempted: input.alreadyAttempted }
+  }
   if (!input.isContextWindowBlocking || input.alreadyAttempted) {
     return { events: [], compactAttempted: input.alreadyAttempted }
   }
+  const reactiveDecision = input.state.getAutoCompactDecision() as CompactionModeDecision
+  const reactiveWindow = input.state.getContextWindowState()
+  recordCompactionDecision({
+    sessionId: input.sessionId,
+    requestId: input.requestId,
+    modelId: input.cleanedModelId,
+    providerId: input.providerId,
+    source: 'reactive',
+    mode,
+    tokenEstimate: reactiveWindow.tokenEstimate,
+    maxTokens: reactiveWindow.maxTokens,
+    percentUsed: reactiveWindow.percentUsed,
+    warningThresholdTokens: reactiveWindow.warningThresholdTokens,
+    compactThresholdTokens: reactiveWindow.compactThresholdTokens,
+    blockingLimitTokens: reactiveWindow.blockingLimitTokens,
+    enabled: true,
+    shouldCompact: true,
+    thresholdPercent: reactiveDecision.thresholdPercent,
+    failureCount: reactiveDecision.failureCount,
+    fuseOpen: reactiveDecision.fuseOpen,
+    reason: 'provider-loop-blocking',
+  })
   const events: NexusEvent[] = []
   try {
     const compactResult = await compactSession({

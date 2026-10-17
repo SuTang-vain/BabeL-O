@@ -85,6 +85,11 @@ import {
   absorbCacheAwareCompactPolicyMetrics,
 } from './runtimePipeline.js'
 import { buildCompactFailureEvent, compactSession } from './compact.js'
+import {
+  recordCompactionDecision,
+  resolveCompactionMode,
+  type CompactionModeDecision,
+} from './compactionMode.js'
 import { ContextRefreshStrategy, type ContextRefreshStrategyOptions } from './ContextRefreshStrategy.js'
 import type { RuntimeExecutionMetrics } from './pipeline/cache.js'
 import type { NexusEvent } from '../shared/events.js'
@@ -180,6 +185,29 @@ export async function* executePreLoopCompactSequence(
   input: ExecutePreLoopCompactSequenceInput,
 ): AsyncGenerator<NexusEvent, ExecutePreLoopCompactSequenceResult> {
   let compactAttempted = input.compactAttempted
+  const mode = resolveCompactionMode()
+  const initialDecision = input.state.getAutoCompactDecision() as CompactionModeDecision
+  const initialWindow = input.state.getContextWindowState()
+  recordCompactionDecision({
+    sessionId: input.sessionId,
+    requestId: input.requestId,
+    modelId: input.cleanedModelId,
+    providerId: input.providerId,
+    source: 'pre_loop',
+    mode,
+    tokenEstimate: initialWindow.tokenEstimate,
+    maxTokens: initialWindow.maxTokens,
+    percentUsed: initialWindow.percentUsed,
+    warningThresholdTokens: initialWindow.warningThresholdTokens,
+    compactThresholdTokens: initialWindow.compactThresholdTokens,
+    blockingLimitTokens: initialWindow.blockingLimitTokens,
+    enabled: initialDecision.enabled,
+    shouldCompact: initialDecision.shouldCompact,
+    thresholdPercent: initialDecision.thresholdPercent,
+    failureCount: initialDecision.failureCount,
+    fuseOpen: initialDecision.fuseOpen,
+    reason: initialDecision.reason ?? (initialDecision.shouldCompact ? 'should-compact' : 'headroom'),
+  })
 
   // Block 1: auto compact.
   if (input.autoCompactShouldCompact) {
@@ -237,9 +265,32 @@ export async function* executePreLoopCompactSequence(
   }
 
   // Block 2: reactive compact (only if auto did not run and
-  // the context is still blocking).
-  if (input.isContextWindowBlocking && !compactAttempted) {
+  // the context is still blocking). `noop` suppresses reactive
+  // compaction as well; the blocking emit below still runs.
+  if (input.isContextWindowBlocking && !compactAttempted && mode !== 'noop') {
     compactAttempted = true
+    const reactiveDecision = input.state.getAutoCompactDecision() as CompactionModeDecision
+    const reactiveWindow = input.state.getContextWindowState()
+    recordCompactionDecision({
+      sessionId: input.sessionId,
+      requestId: input.requestId,
+      modelId: input.cleanedModelId,
+      providerId: input.providerId,
+      source: 'reactive',
+      mode,
+      tokenEstimate: reactiveWindow.tokenEstimate,
+      maxTokens: reactiveWindow.maxTokens,
+      percentUsed: reactiveWindow.percentUsed,
+      warningThresholdTokens: reactiveWindow.warningThresholdTokens,
+      compactThresholdTokens: reactiveWindow.compactThresholdTokens,
+      blockingLimitTokens: reactiveWindow.blockingLimitTokens,
+      enabled: true,
+      shouldCompact: true,
+      thresholdPercent: reactiveDecision.thresholdPercent,
+      failureCount: reactiveDecision.failureCount,
+      fuseOpen: reactiveDecision.fuseOpen,
+      reason: 'reactive-blocking',
+    })
     try {
       const compactResult = await compactSession({
         storage: input.storage,

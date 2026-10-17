@@ -8,6 +8,11 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Added
 
+- Added opt-in `BABEL_O_COMPACT_MODE=stock|noop|adaptive` (default `stock`)
+  and an optional `BABEL_O_COMPACT_DECISION_LOG` JSONL ledger. `noop` records
+  decisions without compacting (same-ceiling control arm); `adaptive` currently
+  compacts only at 92% pressure until the admission policy lands.
+
 - Added `bbl go --nexus-port-scan-attempts <n>` to bound the local port scan
   used when the requested Nexus port is occupied (default: 12).
 
