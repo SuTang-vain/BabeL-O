@@ -81,6 +81,7 @@ import { ContextRefreshStrategy, type ContextRefreshStrategyOptions } from './Co
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import type { GroundingScope } from './compactionAuthority.js'
 
 export type ExecuteProviderLoopCompactBlockInput = {
   storage: NexusStorage
@@ -109,7 +110,7 @@ export type ExecuteProviderLoopCompactBlockInput = {
   }
   closures: {
     applyContextRefreshState: (next: any) => void
-    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string) => NexusEvent[]
+    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string, scope?: GroundingScope) => NexusEvent[]
     contextMicrocompactEvent: (
       trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget',
     ) => NexusEvent | undefined
@@ -177,7 +178,7 @@ export async function executeProviderLoopCompactBlock(
     absorbCompactSummaryLatencyMetrics(input.metrics, compactResult.summaryLatencyMs)
     events.push(compactResult.event)
     events.push(compactResult.contextEvent)
-    const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+    const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId, compactResult.groundingScope)
     for (const groundingEvent of groundingEvents) events.push(groundingEvent)
     input.state.setPreviousEvents([
       ...input.state.getPreviousEvents(),

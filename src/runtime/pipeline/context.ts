@@ -1,4 +1,5 @@
 import { eventBase, type NexusEvent } from '../../shared/events.js'
+import type { GroundingAction, GroundingKind, GroundingScope } from '../compactionAuthority.js'
 
 export function buildContextGroundingRequiredEvent(options: {
   sessionId: string
@@ -6,21 +7,27 @@ export function buildContextGroundingRequiredEvent(options: {
   boundaryId?: string
   source: Extract<NexusEvent, { type: 'context_grounding_required' }>['source']
   message?: string
+  requiredFor?: readonly GroundingKind[]
+  suggestedActions?: readonly GroundingAction[]
 }): Extract<NexusEvent, { type: 'context_grounding_required' }> {
-  const requiredFor: Extract<NexusEvent, { type: 'context_grounding_required' }>['requiredFor'] = [
-    'file_facts',
-    'test_results',
-    'git_status',
-    'task_completion',
-    'implementation_status',
-  ]
-  const suggestedActions: Extract<NexusEvent, { type: 'context_grounding_required' }>['suggestedActions'] = [
-    're_read_referenced_files',
-    'inspect_changed_files',
-    'inspect_git_status',
-    'run_focused_tests',
-    'inspect_event_log',
-  ]
+  const requiredFor: Extract<NexusEvent, { type: 'context_grounding_required' }>['requiredFor'] = options.requiredFor
+    ? [...options.requiredFor]
+    : [
+        'file_facts',
+        'test_results',
+        'git_status',
+        'task_completion',
+        'implementation_status',
+      ]
+  const suggestedActions: Extract<NexusEvent, { type: 'context_grounding_required' }>['suggestedActions'] = options.suggestedActions
+    ? [...options.suggestedActions]
+    : [
+        're_read_referenced_files',
+        'inspect_changed_files',
+        'inspect_git_status',
+        'run_focused_tests',
+        'inspect_event_log',
+      ]
   return {
     type: 'context_grounding_required',
     ...eventBase(options.sessionId),
@@ -64,13 +71,26 @@ export function buildPostCompactGroundingEvents(options: {
   source: Extract<NexusEvent, { type: 'context_grounding_required' }>['source']
   boundaryId?: string
   gitStatus?: string
+  scope?: GroundingScope
 }): NexusEvent[] {
-  const groundingEvent = buildContextGroundingRequiredEvent({
-    sessionId: options.sessionId,
-    requestId: options.requestId,
-    boundaryId: options.boundaryId,
-    source: options.source,
-  })
+  const scoped = options.scope
+  const groundingEvent = scoped
+    ? scoped.requiredFor.length > 0
+      ? buildContextGroundingRequiredEvent({
+          sessionId: options.sessionId,
+          requestId: options.requestId,
+          boundaryId: options.boundaryId,
+          source: options.source,
+          requiredFor: scoped.requiredFor,
+          suggestedActions: scoped.suggestedActions,
+        })
+      : undefined
+    : buildContextGroundingRequiredEvent({
+        sessionId: options.sessionId,
+        requestId: options.requestId,
+        boundaryId: options.boundaryId,
+        source: options.source,
+      })
   const dirtyEvent = options.gitStatus
     ? buildWorkspaceDirtyDetectedEvent({
       sessionId: options.sessionId,
@@ -79,7 +99,10 @@ export function buildPostCompactGroundingEvents(options: {
       gitStatus: options.gitStatus,
     })
     : undefined
-  return dirtyEvent ? [groundingEvent, dirtyEvent] : [groundingEvent]
+  return [
+    ...(groundingEvent ? [groundingEvent] : []),
+    ...(dirtyEvent ? [dirtyEvent] : []),
+  ]
 }
 
 type ContextGroundingConfirmedEvent = Extract<NexusEvent, { type: 'context_grounding_confirmed' }>

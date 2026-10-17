@@ -93,6 +93,7 @@ import { ContextRefreshStrategy, type ContextRefreshStrategyOptions } from './Co
 import type { RuntimeExecutionMetrics } from './pipeline/cache.js'
 import type { RuntimeContextRefreshState } from './pipeline/contextRefresh.js'
 import type { NexusEvent } from '../shared/events.js'
+import type { GroundingScope } from './compactionAuthority.js'
 import type { ModelToolDefinition } from '../providers/adapters/ModelAdapter.js'
 import type { ReadFileCacheEntry } from './runtimeToolLoop.js'
 
@@ -150,6 +151,7 @@ export type ContextRefreshClosureSet = {
   postCompactGroundingEvents: (
     source: 'post_compact' | 'context_recovery',
     boundaryId?: string,
+    scope?: GroundingScope,
   ) => NexusEvent[]
 }
 
@@ -218,7 +220,7 @@ export function buildContextRefreshClosureSet(
       absorbCacheAwareCompactPolicyMetrics(metrics, next.cacheAwareCompactPolicy)
     },
 
-    postCompactGroundingEvents: (source, boundaryId) => {
+    postCompactGroundingEvents: (source, boundaryId, scope) => {
       readFileCache.clear()
       return buildPostCompactGroundingEvents({
         sessionId: input.sessionId,
@@ -226,6 +228,7 @@ export function buildContextRefreshClosureSet(
         source,
         boundaryId,
         gitStatus: state.getAssembledContext().gitStatus,
+        ...(scope ? { scope } : {}),
       })
     },
   }

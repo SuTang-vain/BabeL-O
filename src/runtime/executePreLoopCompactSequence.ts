@@ -96,6 +96,7 @@ import type { NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ReadFileCacheEntry } from './runtimeToolLoop.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import type { GroundingScope } from './compactionAuthority.js'
 
 export type ExecutePreLoopCompactSequenceInput = {
   storage: NexusStorage
@@ -134,7 +135,7 @@ export type ExecutePreLoopCompactSequenceInput = {
   }
   closures: {
     applyContextRefreshState: (next: any) => void
-    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string) => NexusEvent[]
+    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string, scope?: GroundingScope) => NexusEvent[]
     contextMicrocompactEvent: (
       trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget',
     ) => NexusEvent | undefined
@@ -231,7 +232,7 @@ export async function* executePreLoopCompactSequence(
       absorbCompactSummaryLatencyMetrics(input.metrics, compactResult.summaryLatencyMs)
       yield compactResult.event
       yield compactResult.contextEvent
-      const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+      const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId, compactResult.groundingScope)
       for (const groundingEvent of groundingEvents) yield groundingEvent
       input.state.setPreviousEvents([
         ...input.state.getPreviousEvents(),
@@ -313,7 +314,7 @@ export async function* executePreLoopCompactSequence(
       absorbCompactSummaryLatencyMetrics(input.metrics, compactResult.summaryLatencyMs)
       yield compactResult.event
       yield compactResult.contextEvent
-      const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+      const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId, compactResult.groundingScope)
       for (const groundingEvent of groundingEvents) yield groundingEvent
       input.state.setPreviousEvents([
         ...input.state.getPreviousEvents(),
