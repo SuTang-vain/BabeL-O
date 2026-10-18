@@ -68,6 +68,11 @@ windows.”
   a different statistic (P1 v3: 1.0035).
 - `cacheReadRatio` = `cacheRead / max(input, cacheRead+cacheCreation)` per
   event; run-cumulative uses sums. State the scope when quoting a range.
+- Reproduce the four post-wiring gate tables and paired ratios with
+  `node scripts/compaction-metrics.mjs` (`--format json|md|both`); pinned by
+  `node --test scripts/compaction-metrics.test.mjs`. CI intervals and the
+  pre-wiring/v2 tables are not computed by this script. The tool prints
+  exact `.5` medians; docs truncate them to integers.
 
 ## Limitations
 

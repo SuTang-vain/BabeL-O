@@ -52,7 +52,7 @@ this report validates the decision math and the mapping contract.
 After the adapter fix, run-cumulative DeepSeek cache-read ratios
 (`Σ cacheRead / Σ max(input, cacheRead+cacheCreation)`) are about **0.68–0.85**
 in P1.5 and **0.77–0.90** in P3; per-event ratios span roughly 0.06–0.99.
-Examples: B A-ledger r2 0.78, C B-todos r2 0.85 (run-cumulative). The 0.5
+Examples: ON A-ledger r2 0.7801, ON B-todos r3 0.8515 (run-cumulative). The 0.5
 activation threshold is crossed in many runs; the live A/B below verifies the
 93/80 branch. The threshold/payback table above remains a policy mock.
 
@@ -66,6 +66,9 @@ activation threshold is crossed in many runs; the live A/B below verifies the
   Anthropic `input_tokens` excludes cache reads/creation. For a run, use the
   sum form: `Σ cacheRead / Σ max(input, cacheRead + cacheCreation)`.
   State clearly whether a quoted ratio is per-event or run-cumulative.
+- Canonical reporter: `node scripts/compaction-metrics.mjs [gateDir ...]` reads
+  `results/*.json` + `runs/*/db-*.sqlite` and prints these metrics as Markdown
+  or JSON; tests: `node --test scripts/compaction-metrics.test.mjs`.
 
 ## Live cache-aware A/B (fixed ratio)
 
