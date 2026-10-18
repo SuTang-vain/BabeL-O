@@ -8,6 +8,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Added
 
+- Added an experimental `BABEL_O_COMPACT_RETRIEVAL=1` mode that replaces the
+  compaction summary with a pointer index and relies on `contextSearch` /
+  `contextRecent` for evidence. Prototype only; not a default.
+
 - Added opt-in `BABEL_O_COMPACT_MODE=stock|noop|adaptive` (default `stock`)
   and an optional `BABEL_O_COMPACT_DECISION_LOG` JSONL ledger. `noop` records
   decisions without compacting (same-ceiling control arm); `adaptive` currently

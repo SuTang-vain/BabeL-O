@@ -15,6 +15,7 @@ import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessio
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
 import { buildDeterministicDigest, renderDigest } from './compactionDigest.js'
+import { buildRetrievalIndex, isRetrievalCompactionEnabled, renderRetrievalPointers } from './retrievalDigest.js'
 import { buildSummaryCacheKey, getCachedSummary, setCachedSummary } from './summaryCache.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
@@ -96,11 +97,17 @@ export async function compactSession(
   let newSummary: string
   let summaryUsage = { inputTokens: 0, outputTokens: 0 }
   if (resolveCompactionMode() === 'adaptive') {
-    // T2: deterministic structured digest. No provider call, no prose.
-    newSummary = renderDigest(
-      buildDeterministicDigest(omittedEvents),
-      budget.layerBudgets.summary * 4,
-    )
+    // T2: deterministic structured digest. P3 opt-in: pointers instead of a
+    // digest, so the model retrieves exact slices via contextSearch.
+    newSummary = isRetrievalCompactionEnabled()
+      ? renderRetrievalPointers(
+          buildRetrievalIndex(omittedEvents),
+          budget.layerBudgets.summary * 4,
+        )
+      : renderDigest(
+          buildDeterministicDigest(omittedEvents),
+          budget.layerBudgets.summary * 4,
+        )
   } else if (mapFn && modelId !== 'local/coding-runtime') {
     const cacheKey = buildSummaryCacheKey(omittedEvents, modelId)
     const cached = getCachedSummary(cacheKey)
