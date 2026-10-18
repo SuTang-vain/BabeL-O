@@ -74,6 +74,7 @@ export type CompactionPolicyInput = {
   lastD?: number
   forcedPercent?: number
   minPayback?: number
+  paybackMultiplier?: number
 }
 
 export type CompactionPolicyDecision = {
@@ -96,12 +97,17 @@ const DEFAULT_FORCED_PERCENT = 92
 const DEFAULT_MIN_PAYBACK = 1.25
 const CACHE_PRICE_RATIO = 0.02
 
+function resolveForcedPercent(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.BABEL_O_COMPACT_FORCED_PERCENT)
+  return Number.isFinite(raw) ? Math.max(50, Math.min(99, raw)) : DEFAULT_FORCED_PERCENT
+}
+
 export function evaluateCompactionPolicy(
   input: CompactionPolicyInput,
 ): CompactionPolicyDecision {
   const maxTokens = Math.max(1, input.maxTokens)
   const percentUsed = (input.tokenEstimate / maxTokens) * 100
-  const forcedPercent = input.forcedPercent ?? DEFAULT_FORCED_PERCENT
+  const forcedPercent = input.forcedPercent ?? resolveForcedPercent()
   const nHat = Math.max(1, input.nHat ?? DEFAULT_N_HAT)
   const dHat = Math.max(
     1,
@@ -149,7 +155,7 @@ export function evaluateCompactionPolicy(
     return { shouldCompact: false, tier: 'noop', reason: 'too-small', percentUsed, nHat, dHat, sHat, kHat, nStar, payback }
   }
   const cost = sHat + kHat * input.tokenEstimate + (1 - cacheRatio) * input.tokenEstimate
-  if (payback < (input.minPayback ?? DEFAULT_MIN_PAYBACK) * cost) {
+  if (payback < (input.minPayback ?? DEFAULT_MIN_PAYBACK) * (input.paybackMultiplier ?? 1) * cost) {
     return { shouldCompact: false, tier: 'noop', reason: 'payback', percentUsed, nHat, dHat, sHat, kHat, nStar, payback }
   }
   return { shouldCompact: true, tier: 't3', reason: 'payback', percentUsed, nHat, dHat, sHat, kHat, nStar, payback }
@@ -202,7 +208,7 @@ export function applyCompactionMode(input: {
       ...input.stock,
       enabled: true,
       shouldCompact: policy.shouldCompact,
-      thresholdPercent: DEFAULT_FORCED_PERCENT,
+      thresholdPercent: resolveForcedPercent(),
       reason: policy.reason,
       tier: policy.tier,
       payback: policy.payback,

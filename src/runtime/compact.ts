@@ -15,6 +15,7 @@ import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessio
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
 import { buildDeterministicDigest, renderDigest } from './compactionDigest.js'
+import { buildSummaryCacheKey, getCachedSummary, setCachedSummary } from './summaryCache.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -101,12 +102,20 @@ export async function compactSession(
       budget.layerBudgets.summary * 4,
     )
   } else if (mapFn && modelId !== 'local/coding-runtime') {
-    const summarized = await llmSummarizeEventsWithUsage(omittedEvents, modelId, {
-      mapEventsToMessages: mapFn,
-      initialPrompt: options.initialPrompt,
-    })
-    newSummary = summarized.text
-    summaryUsage = summarized.usage
+    const cacheKey = buildSummaryCacheKey(omittedEvents, modelId)
+    const cached = getCachedSummary(cacheKey)
+    if (cached) {
+      newSummary = cached.text
+      summaryUsage = cached.usage
+    } else {
+      const summarized = await llmSummarizeEventsWithUsage(omittedEvents, modelId, {
+        mapEventsToMessages: mapFn,
+        initialPrompt: options.initialPrompt,
+      })
+      newSummary = summarized.text
+      summaryUsage = summarized.usage
+      setCachedSummary(cacheKey, { text: newSummary, usage: summaryUsage })
+    }
   } else {
     newSummary = summarizeSessionEvents(
       omittedEvents,

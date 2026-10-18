@@ -18,6 +18,11 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Changed
 
+- Compaction summaries can be reused from a bounded in-process cache; the
+  summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
+  realized payback can raise the adaptive admission threshold. Add
+  `BABEL_O_COMPACT_FORCED_PERCENT` for forced-compaction experiments.
+
 - Added provider cache-token mapping (DeepSeek `prompt_cache_hit_tokens`, OpenAI
   `cached_tokens`) and an opt-in `BABEL_O_COMPACT_BOUNDARY=tail` mode that moves
   the compact boundary before the current instruction for prefix stability.
