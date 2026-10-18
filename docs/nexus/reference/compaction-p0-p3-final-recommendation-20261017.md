@@ -17,7 +17,8 @@ Status: complete prototype stack, **no stock default change**.
 - B STOCK / A NOOP billed median **1.190** (90% CI [1.052, 1.288]); calls 1.0×;
   quality 186/186 both.
 - C ADAPTIVE / A **1.000** (CI [0.911, 1.076]); calls 0.933×; quality 186/186.
-- C gate passes; H1 is task-dependent (12/23 pairs ≥+15%, B-todos is cheaper
+- C gate passes; a forced-50 supplement shows adaptive C performs 7 compactions
+  with C/A 0.950 and equal quality. H1 is task-dependent (12/23 pairs ≥+15%, B-todos is cheaper
   with stock compaction); H2 is mixed (natural 852k is not uniformly cheapest).
 - One stock cell hit context blocking at 90k despite compaction; residual risk.
 
