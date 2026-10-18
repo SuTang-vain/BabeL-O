@@ -222,6 +222,82 @@ describe('adaptive compaction uses the digest', () => {
   })
 })
 
+describe('hierarchical digest merge', () => {
+  test('merges the previous boundary digest into the new summary', async () => {
+    const previousMode = process.env.BABEL_O_COMPACT_MODE
+    const previousMax = process.env.BABEL_O_MAX_CONTEXT_TOKENS
+    process.env.BABEL_O_COMPACT_MODE = 'adaptive'
+    process.env.BABEL_O_MAX_CONTEXT_TOKENS = '90000'
+    try {
+      const sessionId = 'session-digest-merge'
+      const storage = new MemoryStorage()
+      const base = fixture(sessionId)
+      const huge: NexusEvent = {
+        type: 'assistant_delta',
+        schemaVersion,
+        sessionId,
+        timestamp: '2026-05-23T00:00:01.500Z',
+        text: 'x'.repeat(80_000),
+      }
+      const priorBoundary: NexusEvent = {
+        type: 'compact_boundary',
+        schemaVersion,
+        sessionId,
+        timestamp: '2026-05-23T00:00:09.000Z',
+        trigger: 'auto',
+        summary: 'prior',
+        beforeEventCount: 2,
+        afterEventCount: 1,
+        summaryChars: 5,
+        snippedToolResults: 0,
+        retainedEvents: [],
+        digest: {
+          version: 1,
+          records: [{
+            id: 'old-contract',
+            kind: 'contract',
+            subject: 'user:1',
+            value: 'OLD CONTRACT',
+            evidence: { type: 'user', ref: 'user:1' },
+            turn: 1,
+            status: 'provisional',
+          }],
+        },
+      }
+      const tail = Array.from({ length: 4 }, (_, index): NexusEvent => ({
+        type: 'user_message',
+        schemaVersion,
+        sessionId,
+        timestamp: `2026-05-23T00:00:${String(20 + index).padStart(2, '0')}.000Z`,
+        text: `follow-up ${index}`,
+      }))
+      await storage.saveSession({
+        sessionId,
+        cwd: '/tmp',
+        prompt: 'digest',
+        phase: 'executing',
+        createdAt: '2026-05-23T00:00:00.000Z',
+        updatedAt: '2026-05-23T00:00:00.000Z',
+        events: [base[0]!, base[1]!, huge, priorBoundary, ...tail],
+      })
+      const result = await compactSession({
+        storage,
+        sessionId,
+        modelId: 'deepseek/deepseek-v4-flash',
+        trigger: 'auto',
+        mapEventsToMessages,
+      })
+      assert.ok(result.event.summary.includes('OLD CONTRACT'))
+      assert.ok(result.event.digest)
+    } finally {
+      if (previousMode === undefined) delete process.env.BABEL_O_COMPACT_MODE
+      else process.env.BABEL_O_COMPACT_MODE = previousMode
+      if (previousMax === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
+      else process.env.BABEL_O_MAX_CONTEXT_TOKENS = previousMax
+    }
+  })
+})
+
 describe('adaptive summary budget', () => {
   test('scales the summary layer with the window and keeps stock at 4k', () => {
     const previousMode = process.env.BABEL_O_COMPACT_MODE

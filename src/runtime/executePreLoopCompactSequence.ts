@@ -84,7 +84,7 @@ import {
   absorbCompactSummaryLatencyMetrics,
   absorbCacheAwareCompactPolicyMetrics,
 } from './runtimePipeline.js'
-import { buildCompactFailureEvent, compactSession } from './compact.js'
+import { buildCompactFailureEvent, compactSession, recordBoundaryPayback } from './compact.js'
 import {
   recordCompactionDecision,
   resolveCompactionMode,
@@ -186,6 +186,7 @@ export async function* executePreLoopCompactSequence(
   input: ExecutePreLoopCompactSequenceInput,
 ): AsyncGenerator<NexusEvent, ExecutePreLoopCompactSequenceResult> {
   let compactAttempted = input.compactAttempted
+  recordBoundaryPayback(input.sessionId, input.state.getPreviousEvents())
   const mode = resolveCompactionMode()
   const initialDecision = input.state.getAutoCompactDecision() as CompactionModeDecision
   const initialWindow = input.state.getContextWindowState()

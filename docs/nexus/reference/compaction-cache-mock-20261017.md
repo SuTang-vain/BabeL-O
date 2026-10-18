@@ -46,3 +46,11 @@ this report validates the decision math and the mapping contract.
 - **Not proven live**: no provider-level cache-hit A/B was run. Do not cite
   the 90→93% threshold or the 17.4-call break-even as measured production
   behavior; they are policy-mock outputs.
+
+## Live mapping check (audit follow-up)
+
+After the adapter fix, P2/P3 runs record DeepSeek cache-read ratios of
+**0.70–0.87** in `usage` events (examples: B A-ledger r2 0.78, C B-todos r2
+0.85, R B-todos r3 0.875). The cache-aware policy now sees real hits. The
+threshold/payback table above remains a policy mock; no cache-on/off A/B was
+run.
