@@ -14,9 +14,10 @@ import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
-import { buildDeterministicDigest, renderDigest } from './compactionDigest.js'
+import { buildDeterministicDigest, mergeDigests, normalizeCompactionDigest, renderDigest } from './compactionDigest.js'
 import { buildRetrievalIndex, isRetrievalCompactionEnabled, renderRetrievalPointers } from './retrievalDigest.js'
-import { buildSummaryCacheKey, getCachedSummary, setCachedSummary } from './summaryCache.js'
+import { buildSummaryCacheKey, getCachedSummary, isSummaryCacheEnabled, setCachedSummary } from './summaryCache.js'
+import { recordPayback } from './paybackController.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -96,21 +97,25 @@ export async function compactSession(
   const summaryStartMs = performance.now()
   let newSummary: string
   let summaryUsage = { inputTokens: 0, outputTokens: 0 }
+  let digestState: ReturnType<typeof buildDeterministicDigest> | undefined
   if (resolveCompactionMode() === 'adaptive') {
     // T2: deterministic structured digest. P3 opt-in: pointers instead of a
     // digest, so the model retrieves exact slices via contextSearch.
-    newSummary = isRetrievalCompactionEnabled()
-      ? renderRetrievalPointers(
-          buildRetrievalIndex(omittedEvents),
-          budget.layerBudgets.summary * 4,
-        )
-      : renderDigest(
-          buildDeterministicDigest(omittedEvents),
-          budget.layerBudgets.summary * 4,
-        )
+    if (isRetrievalCompactionEnabled()) {
+      newSummary = renderRetrievalPointers(
+        buildRetrievalIndex(omittedEvents),
+        budget.layerBudgets.summary * 4,
+      )
+    } else {
+      const previousDigest = normalizeCompactionDigest(previousBoundary?.event.digest)
+      const deltaDigest = buildDeterministicDigest(omittedEvents)
+      digestState = previousDigest ? mergeDigests(previousDigest, deltaDigest) : deltaDigest
+      newSummary = renderDigest(digestState, budget.layerBudgets.summary * 4)
+    }
   } else if (mapFn && modelId !== 'local/coding-runtime') {
-    const cacheKey = buildSummaryCacheKey(omittedEvents, modelId)
-    const cached = getCachedSummary(cacheKey)
+    const cacheEnabled = isSummaryCacheEnabled()
+    const cacheKey = cacheEnabled ? buildSummaryCacheKey(omittedEvents, modelId) : undefined
+    const cached = cacheKey ? getCachedSummary(cacheKey) : undefined
     if (cached) {
       newSummary = cached.text
       summaryUsage = cached.usage
@@ -121,7 +126,9 @@ export async function compactSession(
       })
       newSummary = summarized.text
       summaryUsage = summarized.usage
-      setCachedSummary(cacheKey, { text: newSummary, usage: summaryUsage })
+      if (cacheKey) {
+        setCachedSummary(cacheKey, { text: newSummary, usage: summaryUsage })
+      }
     }
   } else {
     newSummary = summarizeSessionEvents(
@@ -160,6 +167,7 @@ export async function compactSession(
           summaryOutputTokens: summaryUsage.outputTokens,
         }
       : {}),
+    ...(digestState ? { digest: digestState } : {}),
     retainedEvents: selectedEvents,
     modelId,
     budget,
@@ -334,6 +342,44 @@ function estimateEventsAsProviderTokens(
     initialPrompt,
   ].filter(Boolean).join('\n')
   return estimateContextTokens({ messages: [{ role: 'user', content: text }] }).totalTokens
+}
+
+const recordedBoundaryPaybacks = new Set<string>()
+
+/**
+ * Record the realized payback of the latest compact boundary once usage for
+ * the following call exists. The prediction is the boundary's pre/post delta;
+ * the realization is the actual provider prompt reduction. This feeds
+ * `getPaybackMultiplier` used by adaptive admission.
+ */
+export function recordBoundaryPayback(sessionId: string, events: NexusEvent[]): void {
+  let boundaryIndex = -1
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (events[index]?.type === 'compact_boundary') {
+      boundaryIndex = index
+      break
+    }
+  }
+  if (boundaryIndex < 0) return
+  const boundary = events[boundaryIndex] as Extract<NexusEvent, { type: 'compact_boundary' }>
+  const key = `${sessionId}:${boundary.timestamp}`
+  if (recordedBoundaryPaybacks.has(key)) return
+  let before: Extract<NexusEvent, { type: 'usage' }> | undefined
+  for (let index = boundaryIndex - 1; index >= 0; index -= 1) {
+    const event = events[index]
+    if (event?.type === 'usage') { before = event; break }
+  }
+  let after: Extract<NexusEvent, { type: 'usage' }> | undefined
+  for (let index = boundaryIndex + 1; index < events.length; index += 1) {
+    const event = events[index]
+    if (event?.type === 'usage') { after = event; break }
+  }
+  if (!before || !after) return
+  const predicted = Math.max(0, (boundary.preTokens ?? 0) - (boundary.postTokens ?? 0))
+  if (predicted <= 0) return
+  const realized = Math.max(0, before.inputTokens - after.inputTokens)
+  recordPayback(sessionId, predicted, realized)
+  recordedBoundaryPaybacks.add(key)
 }
 
 function inferSessionCwd(events: NexusEvent[]): string | undefined {

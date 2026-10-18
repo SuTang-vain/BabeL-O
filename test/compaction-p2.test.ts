@@ -4,6 +4,7 @@ import {
   buildSummaryCacheKey,
   clearSummaryCache,
   getCachedSummary,
+  isSummaryCacheEnabled,
   setCachedSummary,
   summaryCacheSize,
 } from '../src/runtime/summaryCache.js'
@@ -13,6 +14,7 @@ import {
   resetPaybackController,
 } from '../src/runtime/paybackController.js'
 import { evaluateCompactionPolicy } from '../src/runtime/compactionMode.js'
+import { recordBoundaryPayback } from '../src/runtime/compact.js'
 import { resolveSummaryModelId } from '../src/runtime/compactSummary.js'
 import { buildDeterministicDigest, mergeDigests } from '../src/runtime/compactionDigest.js'
 import type { NexusEvent } from '../src/shared/events.js'
@@ -56,6 +58,11 @@ function readPair(sessionId: string, id: string, path: string, output: string, s
 describe('summary cache', () => {
   beforeEach(() => clearSummaryCache())
 
+  test('is opt-in and off by default', () => {
+    assert.equal(isSummaryCacheEnabled({}), false)
+    assert.equal(isSummaryCacheEnabled({ BABEL_O_COMPACT_SUMMARY_CACHE: '1' }), true)
+  })
+
   test('keys are stable per events+model and differ across models', () => {
     const events = [userEvent('s', 'hello', 1)]
     assert.equal(buildSummaryCacheKey(events, 'model-a'), buildSummaryCacheKey(events, 'model-a'))
@@ -82,6 +89,28 @@ describe('payback controller', () => {
     recordPayback('s1', 100, 30)
     recordPayback('s1', 100, 40)
     assert.equal(getPaybackMultiplier('s1'), 1.5)
+  })
+
+  test('records realized payback from a boundary and a following usage event', () => {
+    resetPaybackController('s3')
+    const base = {
+      type: 'compact_boundary', schemaVersion, sessionId: 's3',
+      trigger: 'auto', summary: 's', beforeEventCount: 2, afterEventCount: 1,
+      summaryChars: 1, snippedToolResults: 0, preTokens: 8000, postTokens: 2000,
+    } as NexusEvent
+    const first: NexusEvent[] = [
+      { type: 'usage', schemaVersion, sessionId: 's3', timestamp: '2026-05-23T00:00:00.000Z', inputTokens: 9000, outputTokens: 10 },
+      { ...base, timestamp: '2026-05-23T00:00:01.000Z' },
+      { type: 'usage', schemaVersion, sessionId: 's3', timestamp: '2026-05-23T00:00:02.000Z', inputTokens: 9000, outputTokens: 10 },
+    ]
+    recordBoundaryPayback('s3', first)
+    const second: NexusEvent[] = [
+      ...first,
+      { ...base, timestamp: '2026-05-23T00:00:03.000Z' },
+      { type: 'usage', schemaVersion, sessionId: 's3', timestamp: '2026-05-23T00:00:04.000Z', inputTokens: 9000, outputTokens: 10 },
+    ]
+    recordBoundaryPayback('s3', second)
+    assert.equal(getPaybackMultiplier('s3'), 1.5)
   })
 
   test('stays neutral when realized payback is healthy', () => {

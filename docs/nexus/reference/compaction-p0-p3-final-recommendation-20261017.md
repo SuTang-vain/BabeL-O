@@ -67,3 +67,19 @@ windows.”
 
 Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
 `.eval/p3gate/`; reports under `docs/nexus/reference/compaction-*.md`.
+
+## Audit follow-up (2026-10-17)
+
+- **P2 realized payback is wired**: `recordBoundaryPayback` runs at pre-loop,
+  records predicted vs actual prompt reduction, and `applyCompactionMode` feeds
+  `getPaybackMultiplier(sessionId)` plus `cacheRatio` into the policy.
+- **P2 hierarchical digest is wired**: the boundary persists `digest`; the next
+  adaptive compaction uses `normalizeCompactionDigest` + `mergeDigests`, not
+  prose concatenation.
+- **P2 summary cache is opt-in**: `BABEL_O_COMPACT_SUMMARY_CACHE=1`; stock does
+  not use it.
+- **Live cache mapping**: P2/P3 usage events show DeepSeek cache-read ratios
+  **0.70–0.87**, so the cache-aware policy sees real hits.
+- **P2/P3 replay**: B 12 boundaries D_estimate 38,539; C 7 boundaries 37,561;
+  R 10 boundaries 36,463 (D_actual negative due to next-turn growth).
+- P1 replay D_estimate corrected to **37,491**.

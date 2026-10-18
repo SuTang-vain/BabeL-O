@@ -14,6 +14,7 @@
  */
 import { appendFileSync } from 'node:fs'
 import type { AutoCompactDecision } from './compact.js'
+import { getPaybackMultiplier } from './paybackController.js'
 
 export type CompactionMode = 'stock' | 'noop' | 'adaptive'
 
@@ -183,6 +184,8 @@ export function applyCompactionMode(input: {
   tokenEstimate: number
   maxTokens: number
   stock: AutoCompactDecision
+  sessionId?: string
+  cacheRatio?: number
 }): CompactionModeDecision {
   const percentUsed = input.maxTokens > 0
     ? (input.tokenEstimate / input.maxTokens) * 100
@@ -198,11 +201,16 @@ export function applyCompactionMode(input: {
   }
 
   if (input.mode === 'adaptive') {
+    const paybackMultiplier = input.sessionId
+      ? getPaybackMultiplier(input.sessionId)
+      : 1
     const policy = evaluateCompactionPolicy({
       tokenEstimate: input.tokenEstimate,
       maxTokens: input.maxTokens,
       fuseOpen: input.stock.fuseOpen,
       failureCount: input.stock.failureCount,
+      cacheRatio: input.cacheRatio,
+      paybackMultiplier,
     })
     return {
       ...input.stock,

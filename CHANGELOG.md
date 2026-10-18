@@ -22,7 +22,7 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Changed
 
-- Compaction summaries can be reused from a bounded in-process cache; the
+- Compaction summaries can be reused from a bounded in-process cache when `BABEL_O_COMPACT_SUMMARY_CACHE=1`; the
   summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
   realized payback can raise the adaptive admission threshold. Add
   `BABEL_O_COMPACT_FORCED_PERCENT` for forced-compaction experiments.

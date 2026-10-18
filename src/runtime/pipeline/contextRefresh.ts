@@ -271,6 +271,7 @@ export function buildRuntimeContextRefreshState(options: {
   assembledContext: AssembledContext
   events: NexusEvent[]
   tools: ModelToolDefinition[]
+  sessionId?: string
   modelId: string
   warningPercent: number
   compactPercent: number
@@ -313,6 +314,8 @@ export function buildRuntimeContextRefreshState(options: {
     tokenEstimate: contextEstimateTokens,
     maxTokens: cacheAwareCompactPolicy.effectiveContextCeiling,
     stock: stockAutoCompactDecision,
+    sessionId: options.sessionId,
+    cacheRatio: cacheAwareCompactPolicy.cacheReadRatio,
   })
 
   return {
@@ -371,6 +374,7 @@ export async function refreshRuntimeContextState(options: ContextAssemblerOption
     assembledContext,
     events: options.events,
     tools: options.tools(),
+    sessionId: options.runtimeOptions.sessionId,
     modelId: options.modelId,
     warningPercent: options.warningPercent,
     compactPercent: options.compactPercent,

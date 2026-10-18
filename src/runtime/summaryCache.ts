@@ -17,6 +17,11 @@ export type CachedSummary = {
 const MAX_ENTRIES = 32
 const cache = new Map<string, CachedSummary>()
 
+export function isSummaryCacheEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.BABEL_O_COMPACT_SUMMARY_CACHE ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
 export function buildSummaryCacheKey(events: readonly NexusEvent[], modelId: string): string {
   const hash = createHash('sha256').update(modelId)
   for (const event of events) {

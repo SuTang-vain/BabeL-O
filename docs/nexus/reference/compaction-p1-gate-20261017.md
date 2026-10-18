@@ -57,7 +57,7 @@ Per task (billed median):
 
 45 B boundaries across 24 cells:
 
-- `D_estimate` (trigger estimate − boundary postTokens): median **37,495 tokens**.
+- `D_estimate` (trigger estimate − boundary postTokens): median **37,491 tokens**.
 - `D_provider` (last provider prompt before − first after): median **−840 tokens**;
   negative because the first call after a boundary includes the next turn's prompt
   and tool results. This is not a causal shrink measurement.

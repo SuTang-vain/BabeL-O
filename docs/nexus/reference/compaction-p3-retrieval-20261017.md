@@ -63,3 +63,8 @@ same-ceiling gate before any default change.
 
 Raw: `.eval/p3gate/results/`, `.eval/p3gate/aggregate.json`; B/C from
 `.eval/p2gate/results/`.
+
+## Replay evidence
+
+10 R boundaries: `D_estimate` median **36,463**, `D_actual` median **−864**
+(same turn-growth caveat as P1/P2). Raw: `.eval/p3gate/replay.json`.
