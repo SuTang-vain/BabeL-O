@@ -40,7 +40,7 @@ import {
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
 import { errorMessage } from '../shared/errors.js'
-import { isReversibleEvictionEnabled } from './compactionMode.js'
+import { isReversibleEvictionEnabled, resolveCompactionMode } from './compactionMode.js'
 import { evictReversibleBeforeCurrentTurn } from './reversibleEviction.js'
 
 export type ContextBudget = {
@@ -261,7 +261,9 @@ export function allocateBudget(modelId: string): ContextBudget {
     layerBudgets: {
       system: 5_000,
       memory: 2_000,
-      summary: 4_000,
+      summary: resolveCompactionMode() === 'adaptive'
+        ? Math.max(1_500, Math.min(12_000, Math.floor(maxTokens * 0.06)))
+        : 4_000,
       recent: Math.max(1_000, maxTokens - fixedBudget),
     },
     snipToolOutputChars: Math.max(2_000, Math.min(20_000, Math.floor(maxChars * 0.08))),

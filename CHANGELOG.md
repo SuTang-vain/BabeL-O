@@ -18,6 +18,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Changed
 
+- Adaptive compaction now uses a deterministic structured digest (contracts,
+  artifacts, facts, failures) instead of an LLM prose summary, and the summary
+  layer budget scales with the context window. Stock behavior is unchanged.
+
 - `bbl go` now prints a `[bbl] ...` notice when it switches to a different
   local port for the Nexus service.
 

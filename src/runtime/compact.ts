@@ -14,6 +14,7 @@ import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
+import { buildDeterministicDigest, renderDigest } from './compactionDigest.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -93,7 +94,13 @@ export async function compactSession(
   const summaryStartMs = performance.now()
   let newSummary: string
   let summaryUsage = { inputTokens: 0, outputTokens: 0 }
-  if (mapFn && modelId !== 'local/coding-runtime') {
+  if (resolveCompactionMode() === 'adaptive') {
+    // T2: deterministic structured digest. No provider call, no prose.
+    newSummary = renderDigest(
+      buildDeterministicDigest(omittedEvents),
+      budget.layerBudgets.summary * 4,
+    )
+  } else if (mapFn && modelId !== 'local/coding-runtime') {
     const summarized = await llmSummarizeEventsWithUsage(omittedEvents, modelId, {
       mapEventsToMessages: mapFn,
       initialPrompt: options.initialPrompt,
