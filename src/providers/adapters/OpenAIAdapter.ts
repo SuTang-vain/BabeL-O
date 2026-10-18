@@ -13,6 +13,39 @@ import { ProviderError } from '../../shared/errors.js'
 import { getModel, getProvider, type ProviderDefinition } from '../registry.js'
 import { withRetry } from '../retry.js'
 
+export type OpenAIUsageFields = {
+  prompt_tokens?: number
+  completion_tokens?: number
+  prompt_cache_hit_tokens?: number
+  prompt_cache_miss_tokens?: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  cache_creation_input_tokens?: number
+}
+
+/**
+ * Map OpenAI-compatible usage to the runtime's token fields. DeepSeek exposes
+ * `prompt_cache_hit_tokens`; OpenAI exposes `prompt_tokens_details.cached_tokens`.
+ * Without this mapping the cache-aware compaction policy always sees ratio 0.
+ */
+export function mapOpenAIUsage(usage: OpenAIUsageFields | undefined): {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens?: number
+  cacheCreationInputTokens?: number
+} | undefined {
+  if (!usage || typeof usage.prompt_tokens !== 'number') return undefined
+  const cacheRead = usage.prompt_cache_hit_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0
+  const cacheCreation = usage.cache_creation_input_tokens ?? 0
+  return {
+    inputTokens: usage.prompt_tokens,
+    outputTokens: usage.completion_tokens ?? 0,
+    ...(cacheRead > 0 ? { cacheReadInputTokens: cacheRead } : {}),
+    ...(cacheCreation > 0 ? { cacheCreationInputTokens: cacheCreation } : {}),
+  }
+}
+
 export class OpenAIAdapter implements ModelAdapter {
   async *queryStream(
     params: ModelQueryParams,
@@ -190,10 +223,9 @@ export class OpenAIAdapter implements ModelAdapter {
         continue
       }
       if (data.usage) {
-        yield {
-          type: 'usage',
-          inputTokens: data.usage.prompt_tokens || 0,
-          outputTokens: data.usage.completion_tokens || 0,
+        const mappedUsage = mapOpenAIUsage(data.usage)
+        if (mappedUsage) {
+          yield { type: 'usage', ...mappedUsage }
         }
       }
       const choice = data.choices?.[0]
@@ -397,13 +429,7 @@ export class OpenAIAdapter implements ModelAdapter {
         typeof message?.reasoning_content === 'string'
           ? message.reasoning_content
           : undefined,
-      usage:
-        usage && typeof usage.prompt_tokens === 'number'
-          ? {
-              inputTokens: usage.prompt_tokens || 0,
-              outputTokens: usage.completion_tokens || 0,
-            }
-          : undefined,
+      usage: mapOpenAIUsage(usage),
     }
   }
 }

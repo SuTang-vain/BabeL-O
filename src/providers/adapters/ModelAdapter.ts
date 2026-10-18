@@ -121,6 +121,8 @@ export type NonStreamCompletion = {
   usage?: {
     inputTokens: number
     outputTokens: number
+    cacheReadInputTokens?: number
+    cacheCreationInputTokens?: number
   }
 }
 
