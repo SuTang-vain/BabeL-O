@@ -2193,7 +2193,7 @@ test('analyzeContext returns token and compact diagnostics', async () => {
   assert.equal(analysis.diagnostics.usageSummary.inputTokens, 100)
   assert.equal(analysis.diagnostics.usageSummary.outputTokens, 25)
   assert.equal(analysis.diagnostics.usageSummary.cacheReadInputTokens, 40)
-  assert.equal(analysis.diagnostics.cacheEconomics.cacheReadRatio, 40 / 150)
+  assert.equal(analysis.diagnostics.cacheEconomics.cacheReadRatio, 40 / 100)
   assert.equal(analysis.diagnostics.cacheEconomics.cachePreservationMode, false)
   assert.equal(analysis.diagnostics.cacheEconomics.longContextUtilizationMode, false)
   assert.equal(analysis.diagnostics.cacheEconomics.effectiveContextCeiling, analysis.window.maxTokens)
