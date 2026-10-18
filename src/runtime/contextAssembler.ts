@@ -40,7 +40,7 @@ import {
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
 import { errorMessage } from '../shared/errors.js'
-import { resolveCompactionMode } from './compactionMode.js'
+import { isReversibleEvictionEnabled } from './compactionMode.js'
 import { evictReversibleBeforeCurrentTurn } from './reversibleEviction.js'
 
 export type ContextBudget = {
@@ -293,7 +293,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   // T1 reversible eviction is opt-in via `BABEL_O_COMPACT_MODE=adaptive`.
   // It never touches the current turn (newest user_message onwards); stock and
   // noop keep the exact previous assembly behavior.
-  const reversibleEviction = resolveCompactionMode() === 'adaptive'
+  const reversibleEviction = isReversibleEvictionEnabled()
     ? evictReversibleBeforeCurrentTurn(compactAwareEvents, budget)
     : { events: compactAwareEvents, compactedEvents: 0, bytesSaved: 0 }
   const workingEvents = reversibleEviction.events

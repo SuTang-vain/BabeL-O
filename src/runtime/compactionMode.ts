@@ -155,6 +155,16 @@ export function evaluateCompactionPolicy(
   return { shouldCompact: true, tier: 't3', reason: 'payback', percentUsed, nHat, dHat, sHat, kHat, nStar, payback }
 }
 
+/**
+ * T1 reversible eviction is independent of the compaction policy. It is off
+ * by default so stock behavior is unchanged; the P1 gate runs A/B/C with T1
+ * off to isolate admission from eviction.
+ */
+export function isReversibleEvictionEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.BABEL_O_COMPACT_T1 ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
 export function resolveCompactionMode(env: NodeJS.ProcessEnv = process.env): CompactionMode {
   const raw = (env.BABEL_O_COMPACT_MODE ?? '').trim().toLowerCase()
   if (raw === 'noop' || raw === 'off') return 'noop'

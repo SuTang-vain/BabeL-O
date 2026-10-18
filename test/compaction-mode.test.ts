@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import {
   applyCompactionMode,
   evaluateCompactionPolicy,
+  isReversibleEvictionEnabled,
   recordCompactionDecision,
   resolveCompactionMode,
 } from '../src/runtime/compactionMode.js'
@@ -35,6 +36,16 @@ describe('resolveCompactionMode', () => {
     assert.equal(resolveCompactionMode({ BABEL_O_COMPACT_MODE: 'OFF' }), 'noop')
     assert.equal(resolveCompactionMode({ BABEL_O_COMPACT_MODE: ' adaptive ' }), 'adaptive')
     assert.equal(resolveCompactionMode({ BABEL_O_COMPACT_MODE: 'stock' }), 'stock')
+  })
+})
+
+describe('isReversibleEvictionEnabled', () => {
+  test('is off by default and on only for explicit truthy values', () => {
+    assert.equal(isReversibleEvictionEnabled({}), false)
+    assert.equal(isReversibleEvictionEnabled({ BABEL_O_COMPACT_T1: 'off' }), false)
+    assert.equal(isReversibleEvictionEnabled({ BABEL_O_COMPACT_T1: 'on' }), true)
+    assert.equal(isReversibleEvictionEnabled({ BABEL_O_COMPACT_T1: 'TRUE' }), true)
+    assert.equal(isReversibleEvictionEnabled({ BABEL_O_COMPACT_T1: '1' }), true)
   })
 })
 
