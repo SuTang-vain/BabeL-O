@@ -4,6 +4,7 @@ import { ConfigManager } from '../shared/config.js'
 import { logger } from '../shared/logger.js'
 import { getAdapter, getModel } from '../providers/registry.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
+import { appendFileSync } from 'node:fs'
 
 export const COMPACT_MAX_OUTPUT_TOKENS = 16384
 const COMPACT_CONTEXT_RESERVE = 8192
@@ -128,9 +129,33 @@ export async function queryModelText(
   options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string },
 ): Promise<string> {
   const chunks: string[] = []
+  // Eval instrumentation (branch eval/context-compression-toggle): the
+  // summary call bypasses the runtime event loop, so its usage never
+  // reaches the `usage` event stream. When BABEL_O_COMPACT_USAGE_LOG is
+  // set, append the provider-reported usage to that JSONL file so the
+  // compaction cost can be accounted for. No-op when unset.
+  let inputTokens = 0
+  let outputTokens = 0
   for await (const delta of adapter.queryStream(params, options)) {
     if (delta.type === 'text') {
       chunks.push(delta.text)
+    } else if (delta.type === 'usage') {
+      inputTokens += delta.inputTokens
+      outputTokens += delta.outputTokens
+    }
+  }
+  const usageLog = process.env.BABEL_O_COMPACT_USAGE_LOG
+  if (usageLog) {
+    try {
+      appendFileSync(usageLog, `${JSON.stringify({
+        ts: new Date().toISOString(),
+        model: params.model,
+        inputTokens,
+        outputTokens,
+        purpose: 'compact_summary',
+      })}\n`)
+    } catch {
+      // measurement must never break the run
     }
   }
   return chunks.join('')

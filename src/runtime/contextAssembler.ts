@@ -40,6 +40,7 @@ import {
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
 import { errorMessage } from '../shared/errors.js'
+import { isContextCompressionEnabled } from './contextCompressionMode.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -339,20 +340,37 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   )
   const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
   const compactSummary = compactBoundary?.event.summary.trim() ?? ''
+  const compressionEnabled = isContextCompressionEnabled()
   let sessionSummary = [
     compactSummary,
-    summarizeSessionEvents(omittedEvents, budget.layerBudgets.summary * 4),
+    compressionEnabled
+      ? summarizeSessionEvents(omittedEvents, budget.layerBudgets.summary * 4)
+      : '',
   ]
     .filter(part => part.trim().length > 0)
     .join('\n')
     .trim()
-  const microcompactResult = microcompactEventsWithMetrics(selectedEvents, compactorBudget)
+  const microcompactResult = compressionEnabled
+    ? microcompactEventsWithMetrics(selectedEvents, compactorBudget)
+    : {
+        events: selectedEvents,
+        metrics: {
+          compactedEventCount: 0,
+          deduplicatedToolResultCount: 0,
+          bytesBefore: 0,
+          bytesAfter: 0,
+          bytesSaved: 0,
+          estimatedTokensSaved: 0,
+        },
+      }
   const microcompactedEvents = microcompactResult.events
-  const snippedEvents = snipEventsWithTurnBoundary(
-    microcompactedEvents,
-    compactorBudget.snipToolOutputChars,
-    compactorBudget.snipPriorTurnToolOutputChars,
-  )
+  const snippedEvents = compressionEnabled
+    ? snipEventsWithTurnBoundary(
+        microcompactedEvents,
+        compactorBudget.snipToolOutputChars,
+        compactorBudget.snipPriorTurnToolOutputChars,
+      )
+    : microcompactedEvents
   const messages = options.mapEventsToMessages(
     snippedEvents,
     options.runtimeOptions.prompt,

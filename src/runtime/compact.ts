@@ -13,6 +13,7 @@ import { summarizeSessionEvents } from './sessionSummary.js'
 import { llmSummarizeEvents } from './compactSummary.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
+import { isContextCompressionEnabled } from './contextCompressionMode.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -48,10 +49,18 @@ export async function compactSession(
 ): Promise<CompactSessionResult> {
   const modelId = options.modelId ?? 'local/coding-runtime'
   const budget = allocateBudget(modelId)
-  const { events } = await options.storage.listEvents(options.sessionId, {
+  // Eval instrumentation (branch eval/context-compression-toggle):
+  // the stock call loads the OLDEST 10k events (order 'asc' + limit), so a
+  // session that has emitted more than 10k events (delta events count)
+  // compacts a stale window and drops the newest turns — including the
+  // current user instruction. `BABEL_O_COMPACT_LOAD_NEWEST=1` loads the
+  // newest 10k instead, which is what the caller intends. Default is stock.
+  const loadNewest = process.env.BABEL_O_COMPACT_LOAD_NEWEST === '1'
+  const listed = await options.storage.listEvents(options.sessionId, {
     limit: 10_000,
-    order: 'asc',
+    order: loadNewest ? 'desc' : 'asc',
   })
+  const events = loadNewest ? [...listed.events].reverse() : listed.events
 
   const previousBoundary = findLatestCompactBoundary(events)
   const previousRetainedEvents = previousBoundary
@@ -227,9 +236,12 @@ export function getAutoCompactDecision(options: {
   thresholdPercent?: number
   failureLimit?: number
 }): AutoCompactDecision {
-  const enabled = options.enabled ?? isAutoCompactEnabled()
+  const enabled = options.enabled ?? (isContextCompressionEnabled() && isAutoCompactEnabled())
+  // Eval branch: let the documented env knob actually win. Before this,
+  // `contextRefresh.ts` always passed the hardcoded 90% runtime value, so
+  // BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT could never change the trigger.
   const thresholdPercent = clampPercent(
-    options.thresholdPercent ?? readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', 90),
+    readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', options.thresholdPercent ?? 90),
   )
   const failureLimit = Math.max(
     1,
