@@ -8,11 +8,11 @@ Status: complete prototype stack, **no stock default change**.
 |---|---|---|
 | P0 | newest window + current-instruction pin, state budget, message-based ledger, summary usage | 3/124 failures fixed; PR #33 |
 | P1 | opt-in mode/NOOP/ledger, payback admission, T1 eviction, grounding narrowing, threshold env fix | PR stack; gate v2 below |
-| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | digest A/B: summary 8,524→0, quality 51/51 |
-| P2 | summary cache, summarizer override, realized-payback feedback, forced-percent knob | 8 unit tests; directional A/B |
+| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | post-wiring digest A/B: summary 8,433→0, quality 62/62; live cache-aware A/B ON worse |
+| P2 | summary cache, summarizer override, realized-payback feedback, forced-percent knob | post-wiring digest A/B C/B 0.936, quality 62/62; runtime wiring tests |
 | P3 | retrieval pointers + contextSearch/contextRecent prototype | negative A/B: 1.24× prose, 50/51 |
 
-## P1 gate (same ceiling, 4 tasks × 6 reps)
+## P1 gate (same ceiling; v2 4x6, v3 4x4)
 
 - B STOCK / A NOOP billed median **1.190** (90% CI [1.052, 1.288]); calls 1.0×;
   quality 186/186 both.
@@ -23,7 +23,7 @@ Status: complete prototype stack, **no stock default change**.
   with stock compaction); H2 is mixed (natural 852k is not uniformly cheapest).
 - One stock cell hit context blocking at 90k despite compaction; residual risk.
 
-## P2/P3 A/B (2 tasks × 3 reps, forced 50%, same ceiling)
+## P2/P3 A/B (pre-wiring 2x3; post-wiring 4x2)
 
 | arm | billed median | summary median | calls | contextSearch | quality |
 |---|---:|---:|---:|---:|---|
@@ -61,7 +61,7 @@ windows.”
 
 ## Limitations
 
-- Single model, small n (P1 6 reps, P2/P3 3 reps), 2–4 tasks, saturated quality.
+- Single model, small n (P1 v2 6 reps / v3 4 reps, P2/P3 2–3 reps), 2–4 tasks, saturated quality.
 - The ceiling is a deliberate experimental knob; default-window behavior is not
   directly measured.
 - Cache A/B is a policy mock, not live; P3 is a prototype evaluation.
@@ -83,6 +83,7 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
 - **Live cache mapping**: P2/P3 usage events show DeepSeek cache-read ratios
   **0.70–0.87**. A live cache-aware A/B (OFF vs ON) was worse: ON 493,523 billed
   vs OFF 359,349, calls 23.5 vs 17.0, quality equal. Cache-aware stays opt-in.
-- **P2/P3 replay**: B 12 boundaries D_estimate 38,539; C 7 boundaries 37,561;
-  R 10 boundaries 36,463 (D_actual negative due to next-turn growth).
+- **P2/P3 replay**: post-wiring B 8 cells D_estimate 37,051; C 8 cells 37,696;
+  R 10 boundaries 36,463. P1 v3 B 27 boundaries 37,259; C 26 boundaries 37,181
+  (D_actual negative due to next-turn growth).
 - P1 replay D_estimate corrected to **37,491**.
