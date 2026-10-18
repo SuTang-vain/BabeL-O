@@ -88,6 +88,19 @@ decisions remain 81,000/62,999 when it is lower), so cache-preservation mode
 actually activated. ON was **15% cheaper** with fewer compactions and equal
 quality in this small run.
 
+> **Round-2 update (2026-10-18, NOT reproduced):** a 4-task × 3-rep × OFF/ON
+> rerun under identical conditions (`.eval/next-cache/`, 22 cells) gives OFF
+> billed median 478,075 / ON 503,840, compactions 21 vs 28, paired ON/OFF
+> median **1.101** (n=11; pooled with round 1: ≈1.084, 17 pairs). The 15%
+> cheaper result above does **not** reproduce and the direction reverses;
+> treat the round-1 cost delta as trajectory noise. Activation still
+> reproduces (ON ledgers show 93/80 in 34/55 decisions; OFF stays 90/70).
+> Mechanistically, with `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50` the env
+> override fixes an identical 50% trigger in both arms, so 93/80 cannot reduce
+> the compaction count under these conditions. Cache-aware is **no longer a
+> default-switch candidate** on cost evidence. Full details:
+> `compaction-next-round-20261018.md`.
+
 Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative
 (turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
 `runs/{OFF,ON}/decisions-*.jsonl`.

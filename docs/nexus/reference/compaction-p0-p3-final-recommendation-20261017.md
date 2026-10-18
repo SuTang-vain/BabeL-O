@@ -45,6 +45,13 @@ context is not a safe replacement for the digest.
    - `BABEL_O_COMPACT_BOUNDARY=tail` — boundary before the current instruction.
    - `BABEL_O_COMPACT_SUMMARY_MODEL=<model>` — cheaper summarizer.
    - `BABEL_O_COMPACT_RETRIEVAL=1` — experimental only; not recommended.
+   - `BABEL_O_COMPACT_CACHE_AWARE=1` — opt-in only; **not** a default-switch
+     candidate (round-2 reproduction reversed the cost direction; see
+     `compaction-next-round-20261018.md`).
+   - `BABEL_O_COMPACT_FAITHFUL_DIGEST=1` (with adaptive mode) — extractive
+     faithful digest prototype (2026-10-18, `feat/compaction-next`); no LLM
+     summary cost, verbatim anchors, no recursive digest compaction; pilot
+     evidence only, not a candidate until a same-trigger A/B exists.
 4. Default-switch criteria (not met yet): a 4×6 same-ceiling gate at the
    **default** window with C/A ≤1.02, calls ≤1.05, quality non-inferior; a live
    cache-hit A/B; a harder task set; no stale-window/blocking failures; 95% CI.
@@ -102,6 +109,14 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
   P1.5/P3 (per-event roughly 0.06–0.99), not a single 0.70–0.87 band. Live
   cache-aware A/B: ON 433,093 billed vs OFF 508,636, compactions 9 vs 15,
   quality 51/51; ON decisions show 93/80. Cache-aware stays opt-in.
+- **Cache-aware cost claim retracted (round 2, 2026-10-18)**: a 4×3×2
+  reproduction (`.eval/next-cache/`, 22 cells) reverses the direction —
+  paired ON/OFF billed median **1.101** (n=11), compactions 28 vs 21, quality
+  equal; pooled with round 1 ≈1.084 (17 pairs). Activation still verified
+  (93/80 in ON ledgers only). Round-1's "ON 15% cheaper" is trajectory noise:
+  with the threshold env override the trigger is identical across arms.
+  **Cache-aware is opt-in only and is no longer a default-switch candidate
+  on cost evidence.** Details: `compaction-next-round-20261018.md`.
 - **P2/P3 replay**: post-wiring B 15 boundaries D_estimate 37,051; C 17 boundaries
   37,696; post-delivery R 9 boundaries 38,521 (pre-delivery R 10/36,463). P1 v3
   B 27/37,259; C 26/37,181 (D_actual negative due to next-turn growth).
