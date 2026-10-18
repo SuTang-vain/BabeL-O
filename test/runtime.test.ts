@@ -1221,7 +1221,7 @@ test('runtime pipeline builds provider loop request state and query params', () 
     finalResponseOnlyRemainingLoops: 3,
   })
   assert.equal(policyRequestState.contextWindowState.maxTokens, 920_000)
-  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.93))
+  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.90))
 
   const deepSeekPolicyRequestState = buildProviderLoopRequestState({
     loopCount: 4,
@@ -2570,7 +2570,7 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(metrics.contextWarningThresholdTokens, policy.warningThresholdTokens)
   assert.equal(metrics.contextCompactThresholdTokens, policy.compactThresholdTokens)
   assert.equal(metrics.contextBlockingLimitTokens, policy.blockingLimitTokens)
-  assert.equal(metrics.cachePreservationMode, true)
+  assert.equal(metrics.cachePreservationMode, false)
   assert.equal(metrics.longContextUtilizationMode, true)
 
   const prefixCacheDiagnostics = computeProviderPrefixCacheDiagnostics({
@@ -2602,7 +2602,7 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(event.contextCompactThresholdTokens, policy.compactThresholdTokens)
   assert.equal(event.contextBlockingLimitTokens, policy.blockingLimitTokens)
   assert.equal(event.compactSummaryLatencyMs, 15)
-  assert.equal(event.cachePreservationMode, true)
+  assert.equal(event.cachePreservationMode, false)
   assert.equal(event.longContextUtilizationMode, true)
   assert.equal(event.prefixCacheImmutableRatio, prefixCacheDiagnostics.immutablePrefixRatio)
   assert.equal(event.prefixCacheVolatileContentLast, true)
