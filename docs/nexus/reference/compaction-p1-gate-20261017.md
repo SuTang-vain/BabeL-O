@@ -164,8 +164,13 @@ keeps A/B at the same 90k ceiling (D natural). T1 and cache-aware policy off.
 
 - B/A billed median **1.125**, 90% CI [1.024, 1.419]; 7/16 pairs ≥1.15.
   H1 remains partial: compaction costs on median, not uniformly.
-- C/A billed median **1.068**, CI [0.872, 1.160]; calls 20 vs 18 (+11%);
-  quality equal. The pre-registered C gate (≤1.02 cost, ≤1.05 calls) **fails**.
+- C/A billed **1.068** (median of 16 paired per-cell ratios; the ratio of arm
+  medians is 1.0035), CI [0.872, 1.160]; **median** calls 20 vs 18 (+11%),
+  while **total** calls are C 304 vs A 333 (−8.7%); quality equal. The
+  pre-registered C gate (≤1.02 cost, ≤1.05 calls) **fails** on the median
+  call count.
+- `calls med` in the table is median provider calls per cell. Median and total
+  calls can move in opposite directions; both are reported here.
 - H2 fails: natural D is not the cheapest (A and C are lower).
 - Branch replay: B 27 boundaries D_estimate 37,259; C 26 boundaries 37,181;
   D_actual medians −856/−939 (turn-growth caveat).

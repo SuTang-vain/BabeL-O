@@ -67,10 +67,10 @@ non-inferior, regressions green). Do not present the 21% as a general effect.
 
 ## Live cache evidence
 
-The cache mapping is live: P2/P3 usage events show DeepSeek cache-read ratios of
-**0.70–0.87** (e.g. B A-ledger r2 0.78, C B-todos r2 0.85, R B-todos r3 0.875).
-The cache-aware policy therefore sees real hits; this is not the earlier
-zero-cache mock. No cache-on/off A/B was run.
+Run-cumulative DeepSeek cache-read ratios are about **0.68–0.90** across the
+P1.5/P3 runs (per-event range roughly 0.06–0.99); see the definition in
+`compaction-cache-mock-20261017.md`. The cache-aware policy sees real hits; a
+separate cache-aware A/B is in the P1.5 report.
 
 ## Replay (paired A/B boundaries)
 

@@ -59,6 +59,16 @@ fixed the current-instruction/ledger defects, and shipped an opt-in
 digest/admission stack; default remains no proactive compaction on large
 windows.”
 
+## Metric definitions
+
+- `billed` = input + output + summaryInput + summaryOutput tokens.
+- `calls` = provider calls. Report median per cell and total separately. P1 v3:
+  median C 20 vs A 18 (+11%), while total calls C 304 vs A 333 (−8.7%).
+- `C/A` = median of paired per-cell billed ratios; the ratio of arm medians is
+  a different statistic (P1 v3: 1.0035).
+- `cacheReadRatio` = `cacheRead / max(input, cacheRead+cacheCreation)` per
+  event; run-cumulative uses sums. State the scope when quoting a range.
+
 ## Limitations
 
 - Single model, small n (P1 v2 6 reps / v3 4 reps, P2/P3 2–3 reps), 2–4 tasks, saturated quality.
@@ -81,10 +91,12 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
   prose concatenation.
 - **P2 summary cache is opt-in**: `BABEL_O_COMPACT_SUMMARY_CACHE=1`; stock does
   not use it.
-- **Live cache mapping**: P2/P3 usage events show DeepSeek cache-read ratios
-  **0.70–0.87** after the ratio fix. Live cache-aware A/B: ON 433,093 billed vs
-  OFF 508,636, compactions 9 vs 15, quality 51/51; ON decisions show 93/80.
-  Cache-aware stays opt-in.
+- **Live cache mapping**: per-event `cacheReadRatio =
+  cacheRead / max(input, cacheRead+cacheCreation)`; run-cumulative uses the
+  sum form. Observed run-cumulative ratios are about **0.68–0.90** across
+  P1.5/P3 (per-event roughly 0.06–0.99), not a single 0.70–0.87 band. Live
+  cache-aware A/B: ON 433,093 billed vs OFF 508,636, compactions 9 vs 15,
+  quality 51/51; ON decisions show 93/80. Cache-aware stays opt-in.
 - **P2/P3 replay**: post-wiring B 15 boundaries D_estimate 37,051; C 17 boundaries
   37,696; post-delivery R 9 boundaries 38,521 (pre-delivery R 10/36,463). P1 v3
   B 27/37,259; C 26/37,181 (D_actual negative due to next-turn growth).

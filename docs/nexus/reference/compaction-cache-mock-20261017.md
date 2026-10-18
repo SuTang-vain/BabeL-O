@@ -43,17 +43,29 @@ this report validates the decision math and the mapping contract.
 - The policy math is conservative: on a cached 1M-window model, proactive
   compaction is even less attractive than before; this supports the `NO_OP`
   default.
-- **Not proven live**: no provider-level cache-hit A/B was run. Do not cite
-  the 90→93% threshold or the 17.4-call break-even as measured production
-  behavior; they are policy-mock outputs.
+- **Policy mock vs live A/B**: the threshold/payback table above is a policy
+  mock. A provider-level cache-aware A/B was later run (below); it verifies
+  activation but is small (2 tasks × 3 reps).
 
 ## Live mapping check (audit follow-up)
 
-After the adapter fix, P2/P3 runs record DeepSeek cache-read ratios of
-**0.70–0.87** in `usage` events (examples: B A-ledger r2 0.78, C B-todos r2
-0.85, R B-todos r3 0.875). The cache-aware policy now sees real hits. The
-threshold/payback table above remains a policy mock; no cache-on/off A/B was
-run.
+After the adapter fix, run-cumulative DeepSeek cache-read ratios
+(`Σ cacheRead / Σ max(input, cacheRead+cacheCreation)`) are about **0.68–0.85**
+in P1.5 and **0.77–0.90** in P3; per-event ratios span roughly 0.06–0.99.
+Examples: B A-ledger r2 0.78, C B-todos r2 0.85 (run-cumulative). The 0.5
+activation threshold is crossed in many runs; the live A/B below verifies the
+93/80 branch. The threshold/payback table above remains a policy mock.
+
+## Metric definitions
+
+- `billed` = input + output + summaryInput + summaryOutput tokens.
+- `calls` = provider calls. Reports show the median per cell and the total
+  separately; the two can move in opposite directions.
+- `cacheReadRatio(event)` = `cacheRead / max(input, cacheRead + cacheCreation)`.
+  OpenAI/DeepSeek `prompt_tokens` already include cached tokens, while
+  Anthropic `input_tokens` excludes cache reads/creation. For a run, use the
+  sum form: `Σ cacheRead / Σ max(input, cacheRead + cacheCreation)`.
+  State clearly whether a quoted ratio is per-event or run-cumulative.
 
 ## Live cache-aware A/B (fixed ratio)
 
