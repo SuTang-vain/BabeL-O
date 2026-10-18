@@ -446,12 +446,16 @@ function parseArgs(argv) {
 
 function parsePair(spec) {
   const m = spec.match(/^([^=]+)=([^/]+)\/([^@]+)(?:@(.+))?$/)
-  if (!m) throw new Error(`invalid --pair spec: ${spec} (expected LABEL=NUM/DEN[@DEN_GATE])`)
-  return { label: m[1], num: m[2], den: m[3], ...(m[4] ? { denGate: m[4] } : {}) }
+  if (m) return { label: m[1], num: m[2], den: m[3], ...(m[4] ? { denGate: m[4] } : {}) }
+  // Shorthand: NUM/DEN[@DEN_GATE] with the label defaulting to "NUM/DEN".
+  const s = spec.match(/^([^/=]+)\/([^@=]+)(?:@(.+))?$/)
+  if (s) return { label: `${s[1]}/${s[2]}`, num: s[1], den: s[2], ...(s[3] ? { denGate: s[3] } : {}) }
+  throw new Error(`invalid --pair spec: ${spec} (expected LABEL=NUM/DEN[@DEN_GATE] or NUM/DEN[@DEN_GATE])`)
 }
 
 const USAGE = `Usage: node scripts/compaction-metrics.mjs [--format md|json|both]
               [--pair LABEL=NUM/DEN[@DEN_GATE]]... [gateDir ...]
+--pair accepts LABEL=NUM/DEN[@DEN_GATE] or the shorthand NUM/DEN[@DEN_GATE].
 Defaults: the four post-wiring gates (${DEFAULT_GATES.join(', ')}).
 Read-only; requires Node >= 22 (node:sqlite for runs/*/db-*.sqlite cache ratios).`
 
