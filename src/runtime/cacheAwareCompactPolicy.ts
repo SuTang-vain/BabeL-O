@@ -33,6 +33,12 @@ const DEFAULT_CONTEXT_WINDOW = 8192
 const LEGACY_MAX_CONTEXT_TOKENS = 120_000
 const DEFAULT_WARNING_PERCENT = 70
 const DEFAULT_COMPACT_PERCENT = 90
+
+export function isCacheAwarePolicyEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = (env.BABEL_O_COMPACT_CACHE_AWARE ?? '').trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
 const CACHE_PRESERVING_WARNING_PERCENT = 80
 const CACHE_PRESERVING_COMPACT_PERCENT = 93
 const LARGE_CONTEXT_WINDOW_TOKENS = 180_000
@@ -87,7 +93,7 @@ export function buildCacheAwareCompactPolicy(options: {
     compactPercent: CACHE_PRESERVING_COMPACT_PERCENT,
     blockingBufferTokens: options.blockingBufferTokens,
   })
-  const cachePreservationMode = highCacheReuse && !options.providerContextError && !nearBlocking
+  const cachePreservationMode = isCacheAwarePolicyEnabled() && highCacheReuse && !options.providerContextError && !nearBlocking
   const compactThresholdPercent = options.providerContextError
     ? Math.min(baseCompactPercent, 80)
     : cachePreservationMode

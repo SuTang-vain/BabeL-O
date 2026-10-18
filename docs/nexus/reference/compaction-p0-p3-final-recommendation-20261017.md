@@ -17,8 +17,9 @@ Status: complete prototype stack, **no stock default change**.
 - B STOCK / A NOOP billed median **1.190** (90% CI [1.052, 1.288]); calls 1.0×;
   quality 186/186 both.
 - C ADAPTIVE / A **1.000** (CI [0.911, 1.076]); calls 0.933×; quality 186/186.
-- C gate passes; a forced-50 supplement shows adaptive C performs 7 compactions
-  with C/A 0.950 and equal quality. H1 is task-dependent (12/23 pairs ≥+15%, B-todos is cheaper
+- C gate **fails** at the 4x4 gate v3: C/A billed 1.068 (CI 0.872–1.160), calls
+  +11%, quality equal; adaptive did compact (26 boundaries), but was not cheaper
+  than NOOP. H1 is task-dependent (7/16 pairs ≥15%) (12/23 pairs ≥+15%, B-todos is cheaper
   with stock compaction); H2 is mixed (natural 852k is not uniformly cheapest).
 - One stock cell hit context blocking at 90k despite compaction; residual risk.
 
@@ -80,7 +81,8 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
 - **P2 summary cache is opt-in**: `BABEL_O_COMPACT_SUMMARY_CACHE=1`; stock does
   not use it.
 - **Live cache mapping**: P2/P3 usage events show DeepSeek cache-read ratios
-  **0.70–0.87**, so the cache-aware policy sees real hits.
+  **0.70–0.87**. A live cache-aware A/B (OFF vs ON) was worse: ON 493,523 billed
+  vs OFF 359,349, calls 23.5 vs 17.0, quality equal. Cache-aware stays opt-in.
 - **P2/P3 replay**: B 12 boundaries D_estimate 38,539; C 7 boundaries 37,561;
   R 10 boundaries 36,463 (D_actual negative due to next-turn growth).
 - P1 replay D_estimate corrected to **37,491**.

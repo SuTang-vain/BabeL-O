@@ -106,3 +106,17 @@ checklist non-inferior. The digest-vs-prose A/B is that summary-cost A/B;
 hierarchical merge and payback are runtime-wired and covered by integration
 tests. Cache/override are opt-in flags with unit tests; no separate live A/B
 exists for them, and the report does not claim one.
+
+## Post-wiring A/B (4 tasks x 2 reps)
+
+Run after the payback/hierarchical/cache wiring commit (6e17bee), same model,
+90k, threshold/forced 50, T1 off, cache-aware off:
+
+| arm | billed median | summary med | calls med | compactions | quality |
+|---|---:|---:|---:|---:|---|
+| B prose | 446,068 | 8,433 | 21.5 | 15 | 62/62 |
+| C digest | 364,095 | 0 | 17.0 | 17 | 62/62 |
+
+C/B billed ratio median **0.936** (range 0.537–1.100); quality equal. Replay:
+B D_estimate 37,051, C 37,696. This is post-wiring evidence, not the earlier
+pre-wiring p2gate run.

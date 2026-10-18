@@ -54,3 +54,18 @@ After the adapter fix, P2/P3 runs record DeepSeek cache-read ratios of
 0.85, R B-todos r3 0.875). The cache-aware policy now sees real hits. The
 threshold/payback table above remains a policy mock; no cache-on/off A/B was
 run.
+
+## Live cache-aware A/B (audit follow-up)
+
+OFF vs ON (`BABEL_O_COMPACT_CACHE_AWARE=1`), 90k, stock threshold 50, T1 off,
+2 tasks x 2 reps, same model:
+
+| arm | billed median | calls med | compactions | quality |
+|---|---:|---:|---:|---|
+| OFF (stock 90/70) | 359,349 | 17.0 | 4 | 34/34 |
+| ON (cache-aware 93/80) | 493,523 | 23.5 | 7 | 34/34 |
+
+The cache-aware policy was **worse** in this live run (+37% billed, +38% calls,
+more compactions), with equal quality. Cache mapping is live (ratios 0.70–0.87),
+but the policy is not beneficial here. Stock remains 90/70; the flag stays
+opt-in and is not recommended.

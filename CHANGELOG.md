@@ -22,6 +22,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Changed
 
+- Cache-aware compaction thresholds (93/80) are now opt-in via
+  `BABEL_O_COMPACT_CACHE_AWARE=1`; stock remains 90/70. A live A/B found the
+  cache-aware policy worse on billed tokens/calls with equal quality.
+
 - Compaction summaries can be reused from a bounded in-process cache when `BABEL_O_COMPACT_SUMMARY_CACHE=1`; the
   summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
   realized payback can raise the adaptive admission threshold. Add
