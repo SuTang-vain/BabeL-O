@@ -97,3 +97,12 @@ Paired C/A billed median **0.950** (range 0.753–1.208). Adaptive actually
 compacts under pressure, is 5% cheaper in the paired median, and has no
 checklist regression on the shared tasks. This is still a small supplement,
 not a 4x6 gate.
+
+## Contract mapping
+
+The P2 task asks for unit coverage of hierarchical merge, summary-cache reuse,
+and realized-payback feedback, plus an A/B showing summary cost down with
+checklist non-inferior. The digest-vs-prose A/B is that summary-cost A/B;
+hierarchical merge and payback are runtime-wired and covered by integration
+tests. Cache/override are opt-in flags with unit tests; no separate live A/B
+exists for them, and the report does not claim one.

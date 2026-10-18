@@ -64,7 +64,7 @@ windows.”
 - The ceiling is a deliberate experimental knob; default-window behavior is not
   directly measured.
 - Cache A/B is a policy mock, not live; P3 is a prototype evaluation.
-- P1–P3 share a stacked branch/PR; Phase 0 is separate.
+- P1–P3 are delivered as stacked per-stage PRs #35–#38; Phase 0 is #33.
 
 Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
 `.eval/p3gate/`; reports under `docs/nexus/reference/compaction-*.md`.
