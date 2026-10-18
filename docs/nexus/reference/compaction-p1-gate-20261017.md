@@ -88,3 +88,29 @@ Per task (billed median):
 - If the goal is to minimize tokens on 1M-window models, the evidence favors
   **natural window + no proactive compaction**; the ceiling cap itself costs ~7%.
 - Do not change the stock default on this evidence.
+
+## Addendum: v2 T1-decoupled rerun (partial, blocked)
+
+After v1, T1 was decoupled behind `BABEL_O_COMPACT_T1` (default off) and A/B/C
+were rerun at 90k with T1 off for 6 reps; D was reused from v1 (stock at 852k,
+unaffected). During reps r4-r6 the provider returned HTTP **402 Insufficient
+Balance**; those cells have 0 provider calls and `failedTurns=5` and are excluded.
+
+Valid cells (r1-r3, `failedTurns=0`): A 12, B 9, C 9, D 12.
+
+| arm | billed median | calls med | compactions | quality |
+|---|---:|---:|---:|---|
+| A | 353,645 | 18 | 0 | 93/93 |
+| B | 435,878 | 19 | 15 | 71/71 |
+| C | 392,082 | 20 | 0 | 70/70 |
+| D | 372,820 | 16.5 | 0 | 93/93 |
+
+- B/A paired median **1.223** (9 pairs); C/A paired median **0.934** (9 pairs).
+- The v1 C regression (+7.1%) did **not** reproduce after T1 was removed; this
+  is consistent with the T1/noise explanation rather than admission itself.
+- The gate remains **inconclusive**: the pre-registered 6 reps are incomplete
+  (B/C missing three reps), and no further provider calls are possible until the
+  balance is restored.
+
+Blocker: DeepSeek `402 Insufficient Balance`. Raw invalid cells remain in
+`.eval/p1gate2/results/` with `failedTurns=5`; do not aggregate them.
