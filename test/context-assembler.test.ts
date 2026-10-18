@@ -2566,8 +2566,10 @@ test('/context display includes cache-aware long-context diagnostics', async () 
   ]
 
   const previous = process.env.BABEL_O_MAX_CONTEXT_TOKENS
+  const previousCacheAware = process.env.BABEL_O_COMPACT_CACHE_AWARE
   try {
     delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
+    process.env.BABEL_O_COMPACT_CACHE_AWARE = '1'
     const analysis = await analyzeContext({
       runtimeOptions: {
         sessionId: 'session-context-cache-display',
@@ -2600,6 +2602,8 @@ test('/context display includes cache-aware long-context diagnostics', async () 
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
     else process.env.BABEL_O_MAX_CONTEXT_TOKENS = previous
+    if (previousCacheAware === undefined) delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+    else process.env.BABEL_O_COMPACT_CACHE_AWARE = previousCacheAware
   }
 })
 
