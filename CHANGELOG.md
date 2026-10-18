@@ -18,6 +18,11 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Changed
 
+- Added provider cache-token mapping (DeepSeek `prompt_cache_hit_tokens`, OpenAI
+  `cached_tokens`) and an opt-in `BABEL_O_COMPACT_BOUNDARY=tail` mode that moves
+  the compact boundary before the current instruction for prefix stability.
+  Cache reuse is now part of the adaptive payback model. Stock stays `system`.
+
 - Adaptive compaction now uses a deterministic structured digest (contracts,
   artifacts, facts, failures) instead of an LLM prose summary, and the summary
   layer budget scales with the context window. Stock behavior is unchanged.

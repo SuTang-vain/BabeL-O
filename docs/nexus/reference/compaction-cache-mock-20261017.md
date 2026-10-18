@@ -1,0 +1,48 @@
+# Cache-aware compaction: policy mock report (2026-10-17)
+
+Status: policy-level mock, **not a live provider A/B**. Live cache A/B is
+deferred because the DeepSeek balance and gate sample were already stretched;
+this report validates the decision math and the mapping contract.
+
+## What changed
+
+- `mapOpenAIUsage` now maps DeepSeek `prompt_cache_hit_tokens` and OpenAI
+  `prompt_tokens_details.cached_tokens` to `cacheReadInputTokens` on `usage`
+  events. `summarizeCacheAwareUsage` and `buildCacheAwareCompactPolicy` already
+  consumed that field; they previously saw zero on every row.
+- The adaptive cost model already included the cache term:
+  `gain = N·D·[(1−r) + r·p_cache/p_in]`,
+  `cost = S + k·P + (1−r)·P`.
+- `BABEL_O_COMPACT_BOUNDARY=tail` moves the boundary into a user message before
+  the current instruction (default `system`; stock unchanged). Guards covered:
+  ordering before the current instruction, duplicate suppression, tool-result
+  arrays are never split, and the shared `assembleContext` path used by CLI
+  `/compact` (integration test).
+
+## Mock inputs
+
+`P=40,000`, `D=8,000`, `S=2,000`, `k=0.5`, `N=5`, `p_cache/p_in=0.02`.
+
+| cache ratio r | compact threshold | payback (tokens) | cost (tokens) | 1.25×cost | decision |
+|---:|---:|---:|---:|---:|---|
+| 0.0 | 90% | 40,000 | 62,000 | 77,500 | reject |
+| 0.8 | 93% | 8,640 | 30,000 | 37,500 | reject |
+
+- At r=0, the cache-adjusted break-even is `(S+kP+P)/(D) = 62k/8k ≈ 7.8`
+  calls; at r=0.8 it is `(S+kP+0.2P)/(D·0.216) ≈ 30k/1.728k ≈ 17.4` calls.
+  Cache reuse makes saved prompt tokens worth ~5× less, so the horizon needed
+  to amortize a summary grows, not shrinks.
+- `buildCacheAwareCompactPolicy` with r=0.8 and a 0.5 cacheable system-prompt
+  ratio enters `cachePreservationMode` and raises the compact threshold from
+  90% to 93%. Stock uses the same policy; the difference is that it can now see
+  the cache signal.
+
+## Verdict
+
+- The mapping is correct and tested (`test/compaction-cache.test.ts`).
+- The policy math is conservative: on a cached 1M-window model, proactive
+  compaction is even less attractive than before; this supports the `NO_OP`
+  default.
+- **Not proven live**: no provider-level cache-hit A/B was run. Do not cite
+  the 90→93% threshold or the 17.4-call break-even as measured production
+  behavior; they are policy-mock outputs.
