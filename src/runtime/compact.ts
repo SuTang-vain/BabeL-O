@@ -15,6 +15,14 @@ import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessio
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
 import { buildDeterministicDigest, mergeDigests, normalizeCompactionDigest, renderDigest } from './compactionDigest.js'
+import {
+  buildFaithfulDigest,
+  carryFaithfulDigest,
+  isFaithfulDigestEnabled,
+  normalizeFaithfulDigest,
+  renderFaithfulDigest,
+  type FaithfulDigest,
+} from './compactionFaithfulDigest.js'
 import { buildRetrievalIndex, isRetrievalCompactionEnabled, renderRetrievalPointers } from './retrievalDigest.js'
 import { buildSummaryCacheKey, getCachedSummary, isSummaryCacheEnabled, setCachedSummary } from './summaryCache.js'
 import { recordPayback } from './paybackController.js'
@@ -97,11 +105,32 @@ export async function compactSession(
   const summaryStartMs = performance.now()
   let newSummary: string
   let summaryUsage = { inputTokens: 0, outputTokens: 0 }
-  let digestState: ReturnType<typeof buildDeterministicDigest> | undefined
+  let digestState: ReturnType<typeof buildDeterministicDigest> | FaithfulDigest | undefined
+  // Faithful digest carries the previous faithful boundary verbatim inside its
+  // own render, so the prose-era priorSummary chaining is skipped in that case
+  // to avoid duplicating the carried content.
+  let skipPriorSummaryChain = false
   if (resolveCompactionMode() === 'adaptive') {
     // T2: deterministic structured digest. P3 opt-in: pointers instead of a
     // digest, so the model retrieves exact slices via contextSearch.
-    if (isRetrievalCompactionEnabled()) {
+    // P-next opt-in: faithful extractive digest; never merges/re-compresses
+    // the previous digest (carries it verbatim, or builds from raw events).
+    if (isFaithfulDigestEnabled()) {
+      const delta = buildFaithfulDigest(omittedEvents)
+      const carried = normalizeFaithfulDigest(previousBoundary?.event.digest)
+      digestState = carried ? carryFaithfulDigest(carried, delta) : delta
+      // Mixed histories: when the previous boundary was NOT faithful but left
+      // a prose/T2 summary, move that text into the digest verbatim exactly
+      // once (carriedProse) instead of chaining it into the summary text, so
+      // later faithful boundaries keep it without duplication or loss.
+      if (!carried && priorSummary) {
+        digestState = { ...digestState!, carriedProse: priorSummary }
+      }
+      // Faithful renders self-contain prior history (carried / carriedProse),
+      // so the summary-level priorSummary chain is always skipped here.
+      skipPriorSummaryChain = true
+      newSummary = renderFaithfulDigest(digestState, budget.layerBudgets.summary * 4)
+    } else if (isRetrievalCompactionEnabled()) {
       newSummary = renderRetrievalPointers(
         buildRetrievalIndex(omittedEvents),
         budget.layerBudgets.summary * 4,
@@ -137,7 +166,7 @@ export async function compactSession(
     )
   }
   const summaryLatencyMs = performance.now() - summaryStartMs
-  const summary = [priorSummary, newSummary]
+  const summary = [skipPriorSummaryChain ? undefined : priorSummary, newSummary]
     .filter((part): part is string => Boolean(part && part.trim()))
     .join('\n')
     .trim()
