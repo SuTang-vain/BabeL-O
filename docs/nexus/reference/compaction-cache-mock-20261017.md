@@ -69,3 +69,10 @@ The cache-aware policy was **worse** in this live run (+37% billed, +38% calls,
 more compactions), with equal quality. Cache mapping is live (ratios 0.70–0.87),
 but the policy is not beneficial here. Stock remains 90/70; the flag stays
 opt-in and is not recommended.
+
+## Replay
+
+OFF: 4 boundaries, `D_estimate` median **35,602**, `D_actual` median −1,267.
+ON: 7 boundaries, `D_estimate` median **38,206**, `D_actual` median −224.
+`D_actual` is the last-call-before vs first-call-after and is negative because
+the next turn's prompt/tool results are included; it is not a causal shrink.
