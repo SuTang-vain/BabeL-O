@@ -114,3 +114,37 @@ Valid cells (r1-r3, `failedTurns=0`): A 12, B 9, C 9, D 12.
 
 Blocker: DeepSeek `402 Insufficient Balance`. Raw invalid cells remain in
 `.eval/p1gate2/results/` with `failedTurns=5`; do not aggregate them.
+
+## Addendum 2: v2 final (6 reps, balance restored)
+
+The missing r4-r6 cells and the failed r3 cells were rerun after the provider
+balance was restored. One cell per arm still has `failedTurns>0` but a passing
+checklist; those cells are excluded from token medians and pair ratios.
+
+| arm | valid/total | billed median | calls med | compactions | quality | wall med | re-ground | peak prompt |
+|---|---|---|---:|---:|---|---:|---:|---:|
+| A NOOP | 24/24 | 347,543 | 18 | 0 | 186/186 | 77.1 s | 109 | 26,416 |
+| B STOCK | 23/24 | 434,447 | 19 | 41 | 186/186 | 92.6 s | 153 | 31,935 |
+| C ADAPTIVE | 23/24 | 369,594 | 19 | 0 | 186/186 | 73.3 s | 78 | 26,077 |
+| D NATURAL | 23/24 | 357,520 | 17 | 0 | 186/186 | 68.6 s | 33 | 30,033 |
+
+Paired comparisons (valid cells):
+
+- **B/A**: billed median **1.190**, 90% CI **[1.052, 1.288]**; calls median 1.0.
+  B is more expensive in A-ledger (+37%), C-logstats (+7%), D-rules (+8%), but
+  cheaper in B-todos (−12%). Only 12/23 pairs reach +15%; the effect is
+  task-dependent, so H1 is **supported on the median, not uniformly**.
+- **C/A**: billed median **1.000**, 90% CI **[0.911, 1.076]**; calls median
+  **0.933**; quality equal. The pre-registered C gate (cost ≤1.02, calls ≤1.05,
+  quality ≥A) **passes**.
+- **H2 (ceiling)**: not confirmed. D is not uniformly cheapest: A is cheaper
+  than D on A-ledger (315k vs 352k), D is much cheaper on B-todos (363k vs 573k),
+  and the other two tasks are near-tied.
+
+Residual risk: `B-A-ledger p1-r6` hit `CONTEXT_LIMIT_EXCEEDED` on three turns
+despite stock compaction (estimate reached 98.8k vs an 89k blocking limit). The
+checklist still passed, but the blocking path is a real failure mode at 90k.
+
+Gate verdict: **conditional pass**. Adaptive admission is non-inferior to NOOP
+and avoids the stock compaction median (+19%), but H1 is task-dependent and H2
+is mixed. Stock default remains unchanged; proceed to P1.5 with these caveats.
