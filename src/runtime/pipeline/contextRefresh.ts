@@ -4,6 +4,7 @@ import type { AssembledContext, ContextAssemblerOptions } from '../contextAssemb
 import { assembleContext } from '../contextAssembler.js'
 import type { RuntimeContextBroadcaster } from '../contextBroadcaster.js'
 import { getAutoCompactDecision, type AutoCompactDecision } from '../compact.js'
+import { applyCompactionMode, resolveCompactionMode } from '../compactionMode.js'
 import {
   buildCacheAwareCompactPolicy,
   computeSystemPromptCacheableRatio,
@@ -301,11 +302,17 @@ export function buildRuntimeContextRefreshState(options: {
     warningPercent: cacheAwareCompactPolicy.warningThresholdPercent,
     compactPercent: cacheAwareCompactPolicy.compactThresholdPercent,
   })
-  const autoCompactDecision = getAutoCompactDecision({
+  const stockAutoCompactDecision = getAutoCompactDecision({
     events: options.events,
     tokenEstimate: contextEstimateTokens,
     maxTokens: cacheAwareCompactPolicy.effectiveContextCeiling,
     thresholdPercent: cacheAwareCompactPolicy.compactThresholdPercent,
+  })
+  const autoCompactDecision = applyCompactionMode({
+    mode: resolveCompactionMode(),
+    tokenEstimate: contextEstimateTokens,
+    maxTokens: cacheAwareCompactPolicy.effectiveContextCeiling,
+    stock: stockAutoCompactDecision,
   })
 
   return {
