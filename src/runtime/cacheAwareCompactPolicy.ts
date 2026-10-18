@@ -227,9 +227,15 @@ function normalizeTokenCount(value: number | undefined): number {
 }
 
 function computeCacheReadRatio(usage: CacheAwareCompactUsage): number {
-  const denominator = usage.inputTokens + usage.cacheCreationInputTokens + usage.cacheReadInputTokens
-  if (denominator <= 0) return 0
-  return clampRatio(usage.cacheReadInputTokens / denominator)
+  // OpenAI/DeepSeek `prompt_tokens` already include cached tokens, while
+  // Anthropic's `input_tokens` excludes cache reads/creation. Use the larger
+  // of the two as the total prompt denominator instead of double-counting.
+  const totalInputTokens = Math.max(
+    usage.inputTokens,
+    usage.cacheReadInputTokens + usage.cacheCreationInputTokens,
+  )
+  if (totalInputTokens <= 0) return 0
+  return clampRatio(usage.cacheReadInputTokens / totalInputTokens)
 }
 
 function getModelDefinition(modelId: string): { contextWindow: number; defaultMaxTokens: number } {

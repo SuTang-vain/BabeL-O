@@ -36,7 +36,7 @@ describe('cache-aware compaction policy', () => {
     delete process.env.BABEL_O_COMPACT_CACHE_AWARE
     try {
       const usage = {
-        inputTokens: 1_000,
+        inputTokens: 5_000,
         outputTokens: 50,
         cacheCreationInputTokens: 0,
         cacheReadInputTokens: 4_000,
@@ -60,7 +60,7 @@ describe('cache-aware compaction policy', () => {
     process.env.BABEL_O_COMPACT_CACHE_AWARE = '1'
     try {
       const usage = {
-      inputTokens: 1_000,
+      inputTokens: 5_000,
       outputTokens: 50,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 4_000,

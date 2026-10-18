@@ -8,9 +8,9 @@ Status: complete prototype stack, **no stock default change**.
 |---|---|---|
 | P0 | newest window + current-instruction pin, state budget, message-based ledger, summary usage | 3/124 failures fixed; PR #33 |
 | P1 | opt-in mode/NOOP/ledger, payback admission, T1 eviction, grounding narrowing, threshold env fix | PR stack; gate v2 below |
-| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | post-wiring digest A/B: summary 8,433→0, quality 62/62; live cache-aware A/B ON worse |
+| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | post-wiring digest A/B: summary 8,433→0, quality 62/62; fixed-ratio cache A/B ON 433k vs OFF 509k, 9 vs 15 compactions, quality equal |
 | P2 | summary cache, summarizer override, realized-payback feedback, forced-percent knob | post-wiring digest A/B C/B 0.936, quality 62/62; runtime wiring tests |
-| P3 | retrieval pointers + contextSearch/contextRecent prototype | negative A/B: 1.24× prose, 50/51 |
+| P3 | retrieval pointers + contextSearch/contextRecent prototype | post-delivery R median 538k vs prose 446k, paired 0.967, quality equal, 0 contextSearch; not recommended |
 
 ## P1 gate (same ceiling; v2 4x6, v3 4x4)
 
@@ -64,11 +64,12 @@ windows.”
 - Single model, small n (P1 v2 6 reps / v3 4 reps, P2/P3 2–3 reps), 2–4 tasks, saturated quality.
 - The ceiling is a deliberate experimental knob; default-window behavior is not
   directly measured.
-- Cache A/B is a policy mock, not live; P3 is a prototype evaluation.
+- The cache policy mock and the live cache-aware A/B are separate: the live run used the fixed ratio and verified 93/80 decisions. P3 is a post-delivery prototype evaluation.
 - P1–P3 are delivered as stacked per-stage PRs #35–#38; Phase 0 is #33.
 
-Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
-`.eval/p3gate/`; reports under `docs/nexus/reference/compaction-*.md`.
+Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
+`.eval/p2gate/`, `.eval/p2gate2/`, `.eval/p15gate2/`, `.eval/p3gate/`,
+`.eval/p3gate2/`; reports under `docs/nexus/reference/compaction-*.md`.
 
 ## Audit follow-up (2026-10-17)
 
@@ -81,8 +82,9 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p2gate/`,
 - **P2 summary cache is opt-in**: `BABEL_O_COMPACT_SUMMARY_CACHE=1`; stock does
   not use it.
 - **Live cache mapping**: P2/P3 usage events show DeepSeek cache-read ratios
-  **0.70–0.87**. A live cache-aware A/B (OFF vs ON) was worse: ON 493,523 billed
-  vs OFF 359,349, calls 23.5 vs 17.0, quality equal. Cache-aware stays opt-in.
+  **0.70–0.87** after the ratio fix. Live cache-aware A/B: ON 433,093 billed vs
+  OFF 508,636, compactions 9 vs 15, quality 51/51; ON decisions show 93/80.
+  Cache-aware stays opt-in.
 - **P2/P3 replay**: post-wiring B 8 cells D_estimate 37,051; C 8 cells 37,696;
   R 10 boundaries 36,463. P1 v3 B 27 boundaries 37,259; C 26 boundaries 37,181
   (D_actual negative due to next-turn growth).

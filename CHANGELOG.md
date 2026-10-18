@@ -45,6 +45,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Fixed
 
+- Fixed cache-reuse ratio double-counting for OpenAI/DeepSeek (`prompt_tokens`
+  already includes cached tokens). Cache-aware thresholds now activate on live
+  ratios and remain opt-in; stock stays 90/70.
+
 - Fixed context compaction reading the **oldest** 10k events instead of the
   newest window, which could drop the current user instruction on sessions
   with more than 10k events. Compaction now keeps the newest turns under a

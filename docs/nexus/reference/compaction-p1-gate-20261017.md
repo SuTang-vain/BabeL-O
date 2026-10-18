@@ -172,3 +172,4 @@ keeps A/B at the same 90k ceiling (D natural). T1 and cache-aware policy off.
 
 Verdict: adaptive digest compacts and preserves quality, but at 4x4 it is not
 cheaper than NOOP; the C gate fails. Do not default adaptive on this evidence.
+Raw: `.eval/p1gate3/results/`, `aggregate.json`, `replay.json`.

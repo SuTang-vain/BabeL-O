@@ -55,24 +55,27 @@ After the adapter fix, P2/P3 runs record DeepSeek cache-read ratios of
 threshold/payback table above remains a policy mock; no cache-on/off A/B was
 run.
 
-## Live cache-aware A/B (audit follow-up)
+## Live cache-aware A/B (fixed ratio)
 
-OFF vs ON (`BABEL_O_COMPACT_CACHE_AWARE=1`), 90k, stock threshold 50, T1 off,
-2 tasks x 2 reps, same model:
+`computeCacheReadRatio` now uses `max(input, cacheRead+cacheCreation)` so
+OpenAI/DeepSeek cached prompt tokens are not double-counted. OFF vs ON
+(`BABEL_O_COMPACT_CACHE_AWARE=1`), 90k, stock threshold 50, T1 off, 2 tasks x
+3 reps:
 
 | arm | billed median | calls med | compactions | quality |
 |---|---:|---:|---:|---|
-| OFF (stock 90/70) | 359,349 | 17.0 | 4 | 34/34 |
-| ON (cache-aware 93/80) | 493,523 | 23.5 | 7 | 34/34 |
+| OFF (90/70) | 508,636 | 22.0 | 15 | 51/51 |
+| ON (cache-aware 93/80) | 433,093 | 20.0 | 9 | 51/51 |
 
-The cache-aware policy was **worse** in this live run (+37% billed, +38% calls,
-more compactions), with equal quality. Cache mapping is live (ratios 0.70–0.87),
-but the policy is not beneficial here. Stock remains 90/70; the flag stays
-opt-in and is not recommended.
+The ON decision logs contain `compactThresholdTokens=83,700` /
+`warningThresholdTokens=72,000` when the live cache ratio is >=0.5 (some
+decisions remain 81,000/62,999 when it is lower), so cache-preservation mode
+actually activated. ON was **15% cheaper** with fewer compactions and equal
+quality in this small run.
 
-## Replay
+Replay: OFF `D_estimate` 41,792 (n=4); ON 37,750 (n=9); `D_actual` negative
+(turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
+`runs/{OFF,ON}/decisions-*.jsonl`.
 
-OFF: 4 boundaries, `D_estimate` median **35,602**, `D_actual` median −1,267.
-ON: 7 boundaries, `D_estimate` median **38,206**, `D_actual` median −224.
-`D_actual` is the last-call-before vs first-call-after and is negative because
-the next turn's prompt/tool results are included; it is not a causal shrink.
+The earlier 359k vs 493k run was a **null experiment**: the ratio double-count
+kept both arms at 90/70. Do not use those numbers.

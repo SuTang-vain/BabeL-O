@@ -119,4 +119,4 @@ Run after the payback/hierarchical/cache wiring commit (6e17bee), same model,
 
 C/B billed ratio median **0.936** (range 0.537–1.100); quality equal. Replay:
 B D_estimate 37,051, C 37,696. This is post-wiring evidence, not the earlier
-pre-wiring p2gate run.
+pre-wiring p2gate run. Raw: `.eval/p2gate2/results/`, `aggregate.json`, `replay.json`.

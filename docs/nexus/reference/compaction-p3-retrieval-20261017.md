@@ -68,3 +68,18 @@ Raw: `.eval/p3gate/results/`, `.eval/p3gate/aggregate.json`; B/C from
 
 10 R boundaries: `D_estimate` median **36,463**, `D_actual` median **−864**
 (same turn-growth caveat as P1/P2). Raw: `.eval/p3gate/replay.json`.
+
+
+## Post-delivery re-run (audit follow-up)
+
+R was re-run on the delivered stack after P2 wiring/cache fixes: 2 tasks x
+2 reps, 90k, forced 50, T1 off, cache-aware off.
+
+- R billed: 391,417 / 438,903 / 638,194 / 1,003,954; median 538,548.
+- Paired R/prose ratios: 0.767, 0.848, 1.087, 3.255; median 0.967.
+- R quality 34/34; `contextSearch` calls **0** (the model did not actually
+  retrieve), so the pointer index was mostly ignored.
+- Replay: R 9 boundaries `D_estimate` 38,521, `D_actual` -617.
+
+The post-delivery run is high-variance and does not show a retrieval win; one
+cell used 1.0M tokens. Keep retrieval experimental. Raw: `.eval/p3gate2/`.
