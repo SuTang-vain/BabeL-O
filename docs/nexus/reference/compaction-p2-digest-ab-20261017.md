@@ -80,3 +80,20 @@ zero-cache mock. No cache-on/off A/B was run.
 `D_actual` compares the last call before the boundary to the first after; it is
 negative because the next turn's prompt/tool results are included. `D_estimate`
 is the system's pre/post estimate, not a causal shrink.
+
+## Gate supplement: adaptive under forced pressure vs NOOP
+
+P1's v2 gate had C at 90k with 0 compactions, so C/A there was effectively a
+NOOP comparison. This supplement reuses:
+- A: NOOP, 90k, p1gate2, 4 tasks x 3 reps (12 valid cells).
+- C: adaptive digest, 90k, forced 50%, p2gate, 2 tasks x 3 reps (6 valid cells).
+
+| arm | billed median | calls med | compactions | quality |
+|---|---:|---:|---:|---|
+| A NOOP | 353,645 | 18.0 | 0 | 93/93 |
+| C adaptive | 366,045 | 18.5 | **7** | 51/51 (paired 51/51) |
+
+Paired C/A billed median **0.950** (range 0.753–1.208). Adaptive actually
+compacts under pressure, is 5% cheaper in the paired median, and has no
+checklist regression on the shared tasks. This is still a small supplement,
+not a 4x6 gate.
