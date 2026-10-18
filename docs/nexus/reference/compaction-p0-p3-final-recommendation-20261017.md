@@ -85,7 +85,7 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
   **0.70–0.87** after the ratio fix. Live cache-aware A/B: ON 433,093 billed vs
   OFF 508,636, compactions 9 vs 15, quality 51/51; ON decisions show 93/80.
   Cache-aware stays opt-in.
-- **P2/P3 replay**: post-wiring B 8 cells D_estimate 37,051; C 8 cells 37,696;
-  R 10 boundaries 36,463. P1 v3 B 27 boundaries 37,259; C 26 boundaries 37,181
-  (D_actual negative due to next-turn growth).
+- **P2/P3 replay**: post-wiring B 15 boundaries D_estimate 37,051; C 17 boundaries
+  37,696; post-delivery R 9 boundaries 38,521 (pre-delivery R 10/36,463). P1 v3
+  B 27/37,259; C 26/37,181 (D_actual negative due to next-turn growth).
 - P1 replay D_estimate corrected to **37,491**.

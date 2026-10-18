@@ -73,7 +73,7 @@ decisions remain 81,000/62,999 when it is lower), so cache-preservation mode
 actually activated. ON was **15% cheaper** with fewer compactions and equal
 quality in this small run.
 
-Replay: OFF `D_estimate` 41,792 (n=4); ON 37,750 (n=9); `D_actual` negative
+Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative
 (turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
 `runs/{OFF,ON}/decisions-*.jsonl`.
 

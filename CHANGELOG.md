@@ -15,7 +15,7 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 - Added opt-in `BABEL_O_COMPACT_MODE=stock|noop|adaptive` (default `stock`)
   and an optional `BABEL_O_COMPACT_DECISION_LOG` JSONL ledger. `noop` records
   decisions without compacting (same-ceiling control arm); `adaptive` currently
-  compacts only at 92% pressure until the admission policy lands.
+  uses payback admission with a forced threshold (default 92%, lowerable for experiments).
 
 - Added `bbl go --nexus-port-scan-attempts <n>` to bound the local port scan
   used when the requested Nexus port is occupied (default: 12).
@@ -23,8 +23,9 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 ### Changed
 
 - Cache-aware compaction thresholds (93/80) are now opt-in via
-  `BABEL_O_COMPACT_CACHE_AWARE=1`; stock remains 90/70. A live A/B found the
-  cache-aware policy worse on billed tokens/calls with equal quality.
+  `BABEL_O_COMPACT_CACHE_AWARE=1`; stock remains 90/70. After fixing the cache-ratio
+  double-count, a live A/B found ON cheaper than OFF (433,093 vs 508,636 billed;
+  9 vs 15 compactions; quality equal).
 
 - Compaction summaries can be reused from a bounded in-process cache when `BABEL_O_COMPACT_SUMMARY_CACHE=1`; the
   summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
