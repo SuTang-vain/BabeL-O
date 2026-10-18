@@ -189,6 +189,20 @@ export function buildDeterministicDigest(
   return boundDigest({ version: 1, records }, maxRecords)
 }
 
+export function normalizeCompactionDigest(value: unknown): CompactionDigest | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const candidate = value as Partial<CompactionDigest>
+  if (candidate.version !== 1 || !Array.isArray(candidate.records)) return undefined
+  const records = candidate.records.filter((record): record is DigestRecord => {
+    return Boolean(record
+      && typeof record === 'object'
+      && typeof (record as DigestRecord).subject === 'string'
+      && typeof (record as DigestRecord).kind === 'string'
+      && typeof (record as DigestRecord).turn === 'number')
+  })
+  return { version: 1, records }
+}
+
 export function mergeDigests(
   previous: CompactionDigest,
   delta: CompactionDigest,

@@ -161,6 +161,14 @@ export type LlmSummarizeOptions = {
   signal?: AbortSignal
 }
 
+export function resolveSummaryModelId(
+  fallback: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const override = (env.BABEL_O_COMPACT_SUMMARY_MODEL ?? '').trim()
+  return override || fallback
+}
+
 export type LlmSummarizeResult = {
   text: string
   usage: CompactSummaryUsage
@@ -203,14 +211,15 @@ export async function llmSummarizeEventsWithUsage(
     }
     const allMessages = [...conversationMessages, compactPromptMessage]
 
+    const summaryModelId = resolveSummaryModelId(settings.modelId ?? modelId)
     let contextWindow = 8192
-    try { contextWindow = getModel(modelId).contextWindow } catch (e) { logger.debug('Failed to resolve model context window', e) }
+    try { contextWindow = getModel(summaryModelId).contextWindow } catch (e) { logger.debug('Failed to resolve model context window', e) }
     const maxInputTokens = contextWindow - COMPACT_MAX_OUTPUT_TOKENS - COMPACT_CONTEXT_RESERVE
 
     const messages = truncateMessagesToFit(allMessages, maxInputTokens)
 
     const params: ModelQueryParams = {
-      model: settings.modelId ?? modelId,
+      model: summaryModelId,
       systemPrompt: COMPACT_SYSTEM_PROMPT,
       messages,
       maxTokens: COMPACT_MAX_OUTPUT_TOKENS,

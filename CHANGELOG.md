@@ -8,6 +8,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
 ### Added
 
+- Added an experimental `BABEL_O_COMPACT_RETRIEVAL=1` mode that replaces the
+  compaction summary with a pointer index and relies on `contextSearch` /
+  `contextRecent` for evidence. Prototype only; not a default.
+
 - Added opt-in `BABEL_O_COMPACT_MODE=stock|noop|adaptive` (default `stock`)
   and an optional `BABEL_O_COMPACT_DECISION_LOG` JSONL ledger. `noop` records
   decisions without compacting (same-ceiling control arm); `adaptive` currently
@@ -17,6 +21,11 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
   used when the requested Nexus port is occupied (default: 12).
 
 ### Changed
+
+- Compaction summaries can be reused from a bounded in-process cache when `BABEL_O_COMPACT_SUMMARY_CACHE=1`; the
+  summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
+  realized payback can raise the adaptive admission threshold. Add
+  `BABEL_O_COMPACT_FORCED_PERCENT` for forced-compaction experiments.
 
 - Added provider cache-token mapping (DeepSeek `prompt_cache_hit_tokens`, OpenAI
   `cached_tokens`) and an opt-in `BABEL_O_COMPACT_BOUNDARY=tail` mode that moves
