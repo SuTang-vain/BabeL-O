@@ -188,8 +188,8 @@ describe('byte-verbatim extraction', () => {
   })
 })
 
-describe('stock mode is untouched by the faithful flag', () => {
-  test('mode=stock + flag=1 still uses the deterministic stock fallback, no v2 digest', async () => {
+describe('stock mode faithful opt-in (P-next same-trigger arm)', () => {
+  const withEnv = async (flag: string | undefined, fn: () => Promise<void>) => {
     const prev = {
       mode: process.env.BABEL_O_COMPACT_MODE,
       max: process.env.BABEL_O_MAX_CONTEXT_TOKENS,
@@ -197,24 +197,10 @@ describe('stock mode is untouched by the faithful flag', () => {
     }
     process.env.BABEL_O_COMPACT_MODE = 'stock'
     process.env.BABEL_O_MAX_CONTEXT_TOKENS = '90000'
-    process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST = '1'
+    if (flag === undefined) delete process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST
+    else process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST = flag
     try {
-      const sessionId = 's-stock-inert'
-      const storage = new MemoryStorage()
-      const huge: NexusEvent = {
-        type: 'assistant_delta', schemaVersion, sessionId,
-        timestamp: '2026-05-23T00:00:01.500Z', text: 'x'.repeat(80_000),
-      } as NexusEvent
-      await storage.saveSession({
-        sessionId, cwd: '/tmp', prompt: 'stock', phase: 'executing',
-        createdAt: '2026-05-23T00:00:00.000Z', updatedAt: '2026-05-23T00:00:00.000Z',
-        events: [fixture(sessionId)[0]!, fixture(sessionId)[1]!, huge, ...fixture(sessionId).slice(2)],
-      })
-      const result = await compactSession({
-        storage, sessionId, modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
-      })
-      assert.ok(!result.event.summary.startsWith('## Faithful Compaction Digest'), 'faithful digest must not activate in stock mode')
-      assert.equal(normalizeFaithfulDigest((result.event as any).digest), undefined)
+      await fn()
     } finally {
       if (prev.mode === undefined) delete process.env.BABEL_O_COMPACT_MODE
       else process.env.BABEL_O_COMPACT_MODE = prev.mode
@@ -223,7 +209,105 @@ describe('stock mode is untouched by the faithful flag', () => {
       if (prev.flag === undefined) delete process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST
       else process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST = prev.flag
     }
-  })
+  }
+
+  const seedHugeSession = async (sessionId: string) => {
+    const storage = new MemoryStorage()
+    const huge: NexusEvent = {
+      type: 'assistant_delta', schemaVersion, sessionId,
+      timestamp: '2026-05-23T00:00:01.500Z', text: 'x'.repeat(80_000),
+    } as NexusEvent
+    const base = fixture(sessionId)
+    // Same shape as the adaptive integration fixture: a 3-message tail after
+    // the huge event, so the retained window holds the tail and the fixture's
+    // instruction lands in the omitted set.
+    const tail: NexusEvent[] = Array.from({ length: 3 }, (_, i) => ev(
+      { type: 'user_message', text: `follow-up ${i}` }, sessionId, 20 + i,
+    ))
+    const events = [base[0]!, base[1]!, huge, ...base.slice(2), ...tail]
+    await storage.saveSession({
+      sessionId, cwd: '/tmp', prompt: 'stock', phase: 'executing',
+      createdAt: '2026-05-23T00:00:00.000Z', updatedAt: '2026-05-23T00:00:00.000Z',
+      events,
+    })
+    return { storage, baseEvents: events, huge: (t: string): NexusEvent => ({
+      type: 'assistant_delta', schemaVersion, sessionId, timestamp: t, text: 'x'.repeat(80_000),
+    } as NexusEvent) }
+  }
+
+  test('stock + flag OFF: deterministic prose path, no v2 digest (byte-equivalence guard)', () => withEnv(undefined, async () => {
+    const { storage } = await seedHugeSession('s-stock-off')
+    const result = await compactSession({
+      storage, sessionId: 's-stock-off', modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    assert.ok(!result.event.summary.startsWith('## Faithful Compaction Digest'), 'flag-off stock must not emit a faithful digest')
+    assert.equal(normalizeFaithfulDigest((result.event as any).digest), undefined)
+  }))
+
+  test('stock + flag ON: boundary carries faithful v2 digest and faithful render', () => withEnv('1', async () => {
+    const { storage } = await seedHugeSession('s-stock-faithful')
+    const result = await compactSession({
+      storage, sessionId: 's-stock-faithful', modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    assert.ok(result.event.summary.startsWith('## Faithful Compaction Digest'), 'stock+flag must use the faithful render')
+    const digest = normalizeFaithfulDigest((result.event as any).digest)
+    assert.ok(digest, 'stock+flag boundary must persist a v2 digest')
+    // Stock retention keeps the recent user messages (current instruction +
+    // tail); the most recent OMITTED user message is the build instruction.
+    assert.equal(digest!.instruction, 'Build the export tool in src/export.mjs. You must keep the CSV header exactly `id,amountCents`. Never rename exported functions. Pin commit 0123456789abcdef0123456789abcdef01234567 as the base.')
+  }))
+
+  test('stock + flag ON: second compaction carries the first digest verbatim (no recursion)', () => withEnv('1', async () => {
+    const sessionId = 's-stock-faithful-chain'
+    const { storage, baseEvents, huge } = await seedHugeSession(sessionId)
+    const first = await compactSession({
+      storage, sessionId, modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    await storage.saveSession({
+      sessionId, cwd: '/tmp', prompt: 'stock', phase: 'executing',
+      createdAt: '2026-05-23T00:00:00.000Z', updatedAt: '2026-05-23T00:01:00.000Z',
+      events: [
+        ...baseEvents,
+        first.event as NexusEvent,
+        huge('2026-05-23T00:01:00.000Z'),
+        ev({ type: 'user_message', text: 'phase two, keep going' }, sessionId, 60),
+      ],
+    })
+    const second = await compactSession({
+      storage, sessionId, modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    const digest2 = normalizeFaithfulDigest((second.event as any).digest)
+    const digest1 = normalizeFaithfulDigest((first.event as any).digest)
+    assert.ok(digest2?.carried, 'second stock+faithful boundary must carry the first digest')
+    assert.deepEqual(digest2!.carried, digest1)
+  }))
+
+  test('stock mixed history: prose boundary then faithful boundary carries prose verbatim', () => withEnv(undefined, async () => {
+    const sessionId = 's-stock-mixed'
+    const { storage, baseEvents, huge } = await seedHugeSession(sessionId)
+    const first = await compactSession({
+      storage, sessionId, modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    const proseSummary = first.event.summary
+    assert.ok(!proseSummary.startsWith('## Faithful Compaction Digest'))
+    process.env.BABEL_O_COMPACT_FAITHFUL_DIGEST = '1'
+    await storage.saveSession({
+      sessionId, cwd: '/tmp', prompt: 'stock', phase: 'executing',
+      createdAt: '2026-05-23T00:00:00.000Z', updatedAt: '2026-05-23T00:01:00.000Z',
+      events: [
+        ...baseEvents,
+        first.event as NexusEvent,
+        huge('2026-05-23T00:01:00.000Z'),
+        ev({ type: 'user_message', text: 'phase two' }, sessionId, 60),
+      ],
+    })
+    const second = await compactSession({
+      storage, sessionId, modelId: 'local/coding-runtime', trigger: 'auto', mapEventsToMessages,
+    })
+    const digest = normalizeFaithfulDigest((second.event as any).digest)
+    assert.equal(digest?.carriedProse, proseSummary.trim(), 'prose summary must be carried verbatim into the faithful digest')
+    assert.ok(second.event.summary.includes(proseSummary.trim().slice(0, 60)))
+  }))
 })
 
 describe('mixed prose -> faithful -> faithful history', () => {
