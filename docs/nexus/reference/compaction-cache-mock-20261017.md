@@ -86,19 +86,22 @@ The ON decision logs contain `compactThresholdTokens=83,700` /
 `warningThresholdTokens=72,000` when the live cache ratio is >=0.5 (some
 decisions remain 81,000/62,999 when it is lower), so cache-preservation mode
 actually activated. ON was **15% cheaper** with fewer compactions and equal
-quality in this small run.
+quality in this n=6 run; this claim is not reproduced by the round-2 null test
+below and must not be used as a cost estimate.
 
 > **Round-2 update (2026-10-18, NOT reproduced):** a 4-task × 3-rep × OFF/ON
 > rerun under identical conditions (`.eval/next-cache/`, 22 cells) gives OFF
 > billed median 478,075 / ON 503,840, compactions 21 vs 28, paired ON/OFF
-> median **1.101** (n=11; pooled with round 1: ≈1.084, 17 pairs). The 15%
-> cheaper result above does **not** reproduce and the direction reverses;
-> treat the round-1 cost delta as trajectory noise. Activation still
-> reproduces (ON ledgers show 93/80 in 34/55 decisions; OFF stays 90/70).
-> Mechanistically, with `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50` the env
-> override fixes an identical 50% trigger in both arms, so 93/80 cannot reduce
-> the compaction count under these conditions. Cache-aware is **no longer a
-> default-switch candidate** on cost evidence. Full details:
+> median **1.101** (n=11; bootstrap 90% CI 0.874–1.504, spans 1; pooled with
+> round 1: ≈1.084, 17 pairs). The 15% cheaper result above does **not**
+> reproduce. Activation still reproduces (ON ledgers show 93/80 in 34/55
+> decisions; OFF stays 90/70). Critically, both rounds set
+> `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50`, whose env override fixes an
+> identical 50% trigger in both arms, so 93/80 cannot reduce the compaction
+> count under these conditions. **This is a null test for the cache-aware
+> trigger, not evidence that 93/80 is worse.** Do not cite either direction
+> as a cost result; a valid A/B must omit the override. Cache-aware remains
+> opt-in and untested for default-switch cost. Full details:
 > `compaction-next-round-20261018.md`.
 
 Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative

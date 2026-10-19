@@ -37,28 +37,33 @@ task+rep): **1.1011** (n=11; range 0.760–1.743; arm-median ratio 1.0539; mean
 paired 1.1606). Round 1 was 0.8840 (n=6). Pooled 17 pairs: median ≈ **1.084**.
 
 **Verdict: the round-1 cost claim ("ON ≈15% cheaper, 9 vs 15 compactions")
-does not reproduce; at n=22 the direction reverses (ON ≈ +10% paired median,
-more compactions).** The activation mechanism DOES reproduce: ON decision
-ledgers show `compactThresholdTokens=83,700 / warningThresholdTokens=72,000`
-(93/80) in 34/55 entries (never in OFF; OFF 57/57 at 90/70 — command:
+does not reproduce; round 2's paired median is 1.101 (n=11; bootstrap 90% CI
+[0.874, 1.504], which spans 1), so there is no statistically distinguishable
+cost difference in this sample.** The activation mechanism DOES reproduce: ON
+decision ledgers show `compactThresholdTokens=83,700 /
+warningThresholdTokens=72,000` (93/80) in 34/55 entries (never in OFF; OFF
+57/57 at 90/70 — command:
 `grep compactThresholdTokens .eval/next-cache/runs/*/decisions-*.jsonl`).
 
-Mechanistic note (root cause of the non-difference): with
-`BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50` set, `getAutoCompactDecision`
-reads the env override BEFORE the policy value, so the compaction *trigger*
-(50%) is identical in both arms; cache-preservation 93/80 changes only the
-window-state/blocking limits, not the trigger. Under these conditions the
-compaction-count and billed differences are trajectory noise, which is what
-the reversed replication shows. Round 1's cost delta should be treated as
-noise (its own CI already spanned 1).
+Mechanistic note (why this is a **null test**, not evidence against
+cache-aware): with `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50` set,
+`getAutoCompactDecision` reads the env override BEFORE the policy value, so
+the compaction *trigger* (50%) is identical in both arms;
+cache-preservation 93/80 changes only the window-state/blocking limits, not
+the trigger. Therefore neither round measured whether the 93/80 trigger
+reduces compactions. Do not cite either round's cost delta as evidence for or
+against the policy; a valid test must omit the threshold override (or use a
+ceiling/task set where 90% and 93% actually differ). Round 1's 15% claim is
+withdrawn; round 2's 1.101 is not a reversal claim.
 
 cacheReadRatio (`cacheRead / max(input, cacheRead+creation)`; run-cumulative
 Σ/Σ): OFF runs 0.7564–0.8233, ON runs 0.7357–0.8539; gate-wide per-event
 n=474, min 0.0608, median 0.9812, max 0.9958. Consistent with the documented
 bands (round-1: run-cumulative 0.68–0.85; per-event ~0.06–0.99).
 
-Confidence limits: 22 cells, 4 tasks, single model, saturated quality;
-no formal CI computed (median spread across pairs is 0.76–1.74).
+Confidence limits: 22 cells, 4 tasks, single model, saturated quality. The
+paired-ratio CI above is a 20k-resample bootstrap of the median (seed 7); no
+CI is computed for the other metrics (median spread across pairs is 0.76–1.74).
 
 ## B. Faithful digest prototype (`feat/compaction-next`, commit `0887e94`)
 
@@ -183,12 +188,13 @@ recorded.
 
 1. **`compaction-cache-mock-20261017.md` / final-recommendation "live A/B"**:
    round-1 "ON 433,093 vs OFF 508,636; 9 vs 15 compactions; ON 15% cheaper" is
-   contradicted in direction by this round (paired median 1.101, compactions
-   28 vs 21). Docs updated on this branch (round-1 kept as history, round-2
-   negative result added; cache-aware removed from default-candidate list).
+   not reproduced. Round 2 gives paired median 1.101 (CI spans 1) and 28 vs
+   21 compactions, but both rounds set the 50% threshold override, so the
+   93/80 trigger was shadowed. Docs updated on this branch to call this a
+   null test; cache-aware remains opt-in and untested for default-switch cost.
 2. **cache-mock doc example labels** ("B A-ledger r2 0.78, C B-todos r2 0.85")
-   still match no gate arm naming (values exist: ON/A-ledger-p15-r2 0.7801,
-   ON/B-todos-p15-r3 0.8515) — pre-existing label nit, unchanged.
+   were corrected to ON/A-ledger-p15-r2 0.7801 and ON/B-todos-p15-r3 0.8515
+   in the main docs; the worktree copy may still carry the old line.
 
 ## G. Unfinished / next steps
 

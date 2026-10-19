@@ -8,7 +8,7 @@ Status: complete prototype stack, **no stock default change**.
 |---|---|---|
 | P0 | newest window + current-instruction pin, state budget, message-based ledger, summary usage | 3/124 failures fixed; PR #33 |
 | P1 | opt-in mode/NOOP/ledger, payback admission, T1 eviction, grounding narrowing, threshold env fix | PR stack; gate v2 below |
-| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | post-wiring digest A/B: summary 8,433→0, quality 62/62; fixed-ratio cache A/B ON 433k vs OFF 509k, 9 vs 15 compactions, quality equal |
+| P1.5 | deterministic digest, window-scaled summary budget, cache token mapping, tail boundary | post-wiring digest A/B: summary 8,433→0, quality 62/62; round-1 cache n=6 ON 433k vs OFF 509k **not reproduced** (round-2 null test) |
 | P2 | summary cache, summarizer override, realized-payback feedback, forced-percent knob | post-wiring digest A/B C/B 0.936, quality 62/62; runtime wiring tests |
 | P3 | retrieval pointers + contextSearch/contextRecent prototype | post-delivery R median 538k vs prose 446k, paired 0.967, quality equal, 0 contextSearch; not recommended |
 
@@ -46,8 +46,9 @@ context is not a safe replacement for the digest.
    - `BABEL_O_COMPACT_SUMMARY_MODEL=<model>` — cheaper summarizer.
    - `BABEL_O_COMPACT_RETRIEVAL=1` — experimental only; not recommended.
    - `BABEL_O_COMPACT_CACHE_AWARE=1` — opt-in only; **not** a default-switch
-     candidate (round-2 reproduction reversed the cost direction; see
-     `compaction-next-round-20261018.md`).
+     candidate without a valid trigger A/B. Round 2 did not reproduce round 1
+     and, like round 1, shadowed 93/80 with a 50% threshold override; see
+     `compaction-next-round-20261018.md`.
    - `BABEL_O_COMPACT_FAITHFUL_DIGEST=1` (with adaptive mode) — extractive
      faithful digest prototype (2026-10-18, `feat/compaction-next`); no LLM
      summary cost, verbatim anchors, no recursive digest compaction; pilot
@@ -86,7 +87,7 @@ windows.”
 - Single model, small n (P1 v2 6 reps / v3 4 reps, P2/P3 2–3 reps), 2–4 tasks, saturated quality.
 - The ceiling is a deliberate experimental knob; default-window behavior is not
   directly measured.
-- The cache policy mock and the live cache-aware A/B are separate: the live run used the fixed ratio and verified 93/80 decisions. P3 is a post-delivery prototype evaluation.
+- The cache policy mock and the live cache-aware A/B are separate: the live run used the fixed ratio and verified 93/80 **activation**, but its 50% trigger override shadowed the policy threshold; treat it as a null test, not a cost result. P3 is a post-delivery prototype evaluation.
 - P1–P3 are delivered as stacked per-stage PRs #35–#38; Phase 0 is #33.
 
 Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
@@ -110,13 +111,15 @@ Raw artifacts: `.eval/p1gate/`, `.eval/p1gate2/`, `.eval/p1gate3/`,
   cache-aware A/B: ON 433,093 billed vs OFF 508,636, compactions 9 vs 15,
   quality 51/51; ON decisions show 93/80. Cache-aware stays opt-in.
 - **Cache-aware cost claim retracted (round 2, 2026-10-18)**: a 4×3×2
-  reproduction (`.eval/next-cache/`, 22 cells) reverses the direction —
-  paired ON/OFF billed median **1.101** (n=11), compactions 28 vs 21, quality
-  equal; pooled with round 1 ≈1.084 (17 pairs). Activation still verified
-  (93/80 in ON ledgers only). Round-1's "ON 15% cheaper" is trajectory noise:
-  with the threshold env override the trigger is identical across arms.
-  **Cache-aware is opt-in only and is no longer a default-switch candidate
-  on cost evidence.** Details: `compaction-next-round-20261018.md`.
+  reproduction (`.eval/next-cache/`, 22 cells) does not reproduce round 1 —
+  paired ON/OFF billed median **1.101** (n=11; bootstrap 90% CI 0.874–1.504,
+  spans 1), compactions 28 vs 21, quality equal; pooled with round 1 ≈1.084
+  (17 pairs). Activation still verified (93/80 in ON ledgers only). Critically,
+  both rounds set `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50`, which overrides
+  the 93/80 trigger, so this is a **null test**, not evidence that cache-aware
+  is worse. **Cache-aware remains opt-in and untested for default-switch
+  cost; a valid A/B must omit the override.** Details:
+  `compaction-next-round-20261018.md`.
 - **P2/P3 replay**: post-wiring B 15 boundaries D_estimate 37,051; C 17 boundaries
   37,696; post-delivery R 9 boundaries 38,521 (pre-delivery R 10/36,463). P1 v3
   B 27/37,259; C 26/37,181 (D_actual negative due to next-turn growth).
