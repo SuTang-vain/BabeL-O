@@ -114,6 +114,17 @@ below and must not be used as a cost estimate.
 > lost 2/3 cells to context blocking, leaving 0 valid pairs. Mechanism:
 > confirmed. Cost: still unproven in either direction. Details:
 > `compaction-next-e-90k-20261019.md`.
+>
+> **Round-4 update (2026-10-19, E @ 100k, validity fixed, n=1 pairs):**
+> same design at 100k, 4 reps (`.eval/next-e-100k/`). 93/80 again only under
+> the flag (36/42 CACHE decisions; STOCK/SFAITH 100% 90/70). Validity 3/4
+> CACHE, 4/4 SFAITH, 1/4 STOCK — STOCK's failures are `final_check`
+> finalization artifacts, not context blocking. One double-valid rep
+> (e100-r2): CACHE/STOCK billed ratio **1.0093**, SFAITH/STOCK **0.7359** —
+> single cells, degenerate CI, **no inference**. Compactions (all cells):
+> STOCK 5 / CACHE 2 / SFAITH 1; at 100k the task mostly fits, so the 90-vs-93
+> trigger rarely fires and the cache-aware question needs a longer task at
+> this ceiling. Details: `compaction-next-e-100k-20261019.md`.
 
 Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative
 (turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
