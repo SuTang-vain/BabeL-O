@@ -176,6 +176,18 @@ export const providerRegistry: ProviderDefinition[] = [
     ],
   },
   {
+    // Eval-only provider: Kimi Code plan endpoint (credentials live in the
+    // operator's auth store; inject via BABEL_O_API_KEY). Added for the
+    // compaction eval rounds (kimi-k3 @ 95k); not a product default.
+    id: 'kimi-coding',
+    displayName: 'Kimi Code',
+    adapter: 'openai-compatible',
+    authMode: 'bearer',
+    defaultBaseUrl: 'https://api.kimi.com/coding/v1',
+    defaultModel: 'kimi-coding/k3',
+    models: ['kimi-coding/k3'],
+  },
+  {
     id: 'ollama',
     displayName: 'Ollama local OpenAI-compatible',
     adapter: 'openai-compatible',
@@ -959,6 +971,20 @@ export const modelRegistry: ModelDefinition[] = [
     id: 'moonshot/kimi-for-coding',
     name: 'Kimi for Coding',
     contextWindow: 262144,
+    defaultMaxTokens: 32768,
+    capabilities: {
+      toolCalling: true,
+      jsonOutput: true,
+      streaming: true,
+    },
+  },
+  {
+    // Eval-only: explicit 1M context so the compaction policy ceiling is not
+    // collapsed by the unknown-model 8k fallback; the eval clamps the window
+    // via BABEL_O_MAX_CONTEXT_TOKENS regardless.
+    id: 'kimi-coding/k3',
+    name: 'Kimi K3',
+    contextWindow: 1048576,
     defaultMaxTokens: 32768,
     capabilities: {
       toolCalling: true,
