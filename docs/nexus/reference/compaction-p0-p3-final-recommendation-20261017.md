@@ -70,6 +70,14 @@ windows.”
 ## Metric definitions
 
 - `billed` = input + output + summaryInput + summaryOutput tokens.
+- **Validity strata (2026-10-19)**: `protocolValid` (legacy `valid` =
+  aggregate.json flag else `failedTurns===0`), `taskSuccess` (checklist
+  full pass), `costEligible` = protocolValid && taskSuccess. **Paired cost
+  comparisons are canonical ONLY over costEligible cells**; legacy
+  protocolValid-only pairs are printed alongside. `failureClass`
+  (context_blocking / final_check / other / none / unknown) and
+  `blockedTurns` are diagnostics, never eligibility. See
+  `compaction-evaluation-validity-20261019.md`.
 - `calls` = provider calls. Report median per cell and total separately. P1 v3:
   median C 20 vs A 18 (+11%), while total calls C 304 vs A 333 (−8.7%).
 - `C/A` = median of paired per-cell billed ratios; the ratio of arm medians is

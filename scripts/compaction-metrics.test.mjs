@@ -13,9 +13,11 @@ import { DatabaseSync } from 'node:sqlite'
 import {
   REPO_ROOT,
   analyzeGate,
+  attachFailureClass,
   billedFromTotals,
   cacheReadRatioCumulative,
   cacheReadRatioEvent,
+  classifyFailureEvents,
   loadGateCache,
   pairedRatioMedian,
   summarizeArms,
@@ -118,31 +120,139 @@ describe('cacheReadRatioCumulative (run-cumulative Σ/Σ formula)', () => {
 })
 
 // ---------------------------------------------------------------------------
+// validity strata: protocolValid / taskSuccess / costEligible / failureClass
+
+describe('costEligible strata', () => {
+  // mk builds a fully-tagged cell like loadGateCells does.
+  const mk = (arm, rep, billed, { valid = true, q = 1, qt = 1 } = {}) => {
+    const taskSuccess = qt > 0 && q === qt
+    return {
+      arm, task: 't', rep, valid, protocolValid: valid, billed, calls: 1,
+      compactions: 0, summary: 0, qualityPassed: q, qualityTotal: qt,
+      taskSuccess, costEligible: valid && taskSuccess, failureClass: 'none',
+    }
+  }
+
+  test('failedTurns=0 + full checklist -> eligible', () => {
+    const [x] = summarizeArms([mk('X', 'r1', 100)])
+    assert.equal(x.protocolValidCells, 1)
+    assert.equal(x.taskSuccessCells, 1)
+    assert.equal(x.costEligibleCells, 1)
+  })
+
+  test('protocolValid=true + checklist NOT full -> not eligible (the 24/45 case)', () => {
+    const cells = [mk('X', 'r1', 100, { q: 3, qt: 9 })]
+    const [x] = summarizeArms(cells)
+    assert.equal(x.validCells, 1)               // legacy median still includes it
+    assert.equal(x.billedMedian, 100)
+    assert.equal(x.protocolValidCells, 1)
+    assert.equal(x.taskSuccessCells, 0)
+    assert.equal(x.costEligibleCells, 0)
+    assert.equal(x.billedMedianEligible, null)  // no eligible cells at all
+  })
+
+  test('protocolValid=false (e.g. final_check) + full checklist -> not eligible', () => {
+    const cells = [{ ...mk('X', 'r1', 100), valid: false, protocolValid: false, costEligible: false, failureClass: 'final_check' }]
+    const [x] = summarizeArms(cells)
+    assert.equal(x.validCells, 0)
+    assert.equal(x.taskSuccessCells, 1)         // task succeeded but protocol failed
+    assert.equal(x.costEligibleCells, 0)
+  })
+
+  test('paired ratio uses ONLY costEligible pairs; legacy count kept alongside', () => {
+    // r1: both eligible. r2: num protocolValid but 3/9 (not taskSuccess).
+    // r3: den invalid. Legacy pairs: r1+r2. Eligible pairs: r1 only.
+    const num = [
+      mk('C', 'r1', 110),
+      mk('C', 'r2', 999, { q: 3, qt: 9 }),      // protocolValid, not taskSuccess
+      mk('C', 'r3', 500),
+    ]
+    const den = [
+      mk('A', 'r1', 100),
+      mk('A', 'r2', 100),
+      { ...mk('A', 'r3', 100), valid: false, protocolValid: false, costEligible: false },
+    ]
+    const res = pairedRatioMedian(num, den, { label: 'C/A', num: 'C', den: 'A' })
+    assert.equal(res.pairsEligible, 1)
+    assert.equal(res.ratioMedianEligible, 1.1)  // canonical: only the r1 eligible pair
+    assert.equal(res.pairsProtocolValidLegacy, 2)
+    assert.equal(res.ratioMedianLegacy, (1.1 + 9.99) / 2)
+    assert.equal(res.ratioMedian, res.ratioMedianEligible) // canonical alias
+    assert.equal(res.canonical, 'eligible')
+  })
+})
+
+describe('classifyFailureEvents (synthetic messages)', () => {
+  test('context_blocking patterns', () => {
+    assert.equal(classifyFailureEvents(['Context estimate 43447/100000 tokens exceeds the blocking limit (99000)']).failureClass, 'context_blocking')
+    assert.equal(classifyFailureEvents(['provider error: CONTEXT_LIMIT_EXCEEDED']).failureClass, 'context_blocking')
+  })
+  test('final_check patterns', () => {
+    assert.equal(classifyFailureEvents(['final_check: write/execute tool calls (Edit) attempted during finalization window.']).failureClass, 'final_check')
+  })
+  test('other + precedence (context_blocking wins over final_check and other)', () => {
+    assert.equal(classifyFailureEvents(['fetch failed']).failureClass, 'other')
+    const mixed = classifyFailureEvents(['fetch failed', 'final_check: …', 'CONTEXT_LIMIT_EXCEEDED'])
+    assert.equal(mixed.failureClass, 'context_blocking')
+    assert.deepEqual(mixed.failureClasses, ['context_blocking', 'final_check', 'other'])
+  })
+  test('no messages -> none', () => {
+    assert.deepEqual(classifyFailureEvents([]), { failureClass: 'none', failureClasses: [] })
+  })
+})
+
+describe('attachFailureClass with a real node:sqlite DB', () => {
+  const gate = join(tmp, 'failgate')
+  const laneDir = join(gate, 'runs', 'X')
+  mkdirSync(laneDir, { recursive: true })
+  createUsageDb(join(laneDir, 'db-t1-r1.sqlite'), [
+    { type: 'error', payload: { message: 'final_check: write/execute tool calls (Edit) attempted during finalization window. Routing to the permission flow.' } },
+    { type: 'usage', payload: { inputTokens: 10 } },
+  ])
+  createUsageDb(join(laneDir, 'db-t1-r2.sqlite'), [
+    { type: 'error', payload: { message: 'Context estimate 99999/100000 tokens exceeds the blocking limit (99000).' } },
+  ])
+
+  test('classifies final_check and context_blocking from sqlite error events', () => {
+    const c1 = attachFailureClass(gate, { arm: 'X', task: 't1', rep: 'r1', failedTurns: 1, blockedTurns: 0 })
+    assert.equal(c1.failureClass, 'final_check')
+    const c2 = attachFailureClass(gate, { arm: 'X', task: 't1', rep: 'r2', failedTurns: 1, blockedTurns: 1 })
+    assert.equal(c2.failureClass, 'context_blocking')
+  })
+  test('missing DB -> unknown (failed) / none (clean)', () => {
+    assert.equal(attachFailureClass(gate, { arm: 'X', task: 't1', rep: 'rX', failedTurns: 2, blockedTurns: 0 }).failureClass, 'unknown')
+    assert.equal(attachFailureClass(gate, { arm: 'X', task: 't1', rep: 'rX', failedTurns: 0, blockedTurns: 0 }).failureClass, 'none')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // paired per-cell ratio vs ratio of arm medians
 
 describe('pairedRatioMedian', () => {
+  const mkp = (arm, rep, billed, extra = {}) => ({
+    arm, task: 't', rep, valid: true, protocolValid: true, billed, calls: 1,
+    compactions: 0, summary: 0, qualityPassed: 1, qualityTotal: 1,
+    taskSuccess: true, costEligible: true, failureClass: 'none', ...extra,
+  })
   test('median of paired per-cell ratios differs from ratio of arm medians', () => {
-    const mk = (arm, rep, billed, valid = true) => ({
-      arm, task: 't', rep, valid, billed, calls: 1, compactions: 0, summary: 0, qualityPassed: 1, qualityTotal: 1,
-    })
-    const num = [mk('Y', 'r1', 150), mk('Y', 'r2', 150)] // arm median 150
-    const den = [mk('X', 'r1', 100), mk('X', 'r2', 200)] // arm median 150
+    const num = [mkp('Y', 'r1', 150), mkp('Y', 'r2', 150)] // arm median 150
+    const den = [mkp('X', 'r1', 100), mkp('X', 'r2', 200)] // arm median 150
     const res = pairedRatioMedian(num, den, { label: 'Y/X', num: 'Y', den: 'X' })
     assert.equal(res.label, 'Y/X')
     assert.equal(res.pairs, 2)
+    assert.equal(res.pairsEligible, 2)
     assert.equal(res.armMedianRatio, 1)                    // 150 / 150
     assert.equal(res.ratioMedian, 1.125)                   // median(1.5, 0.75)
     assert.notEqual(res.ratioMedian, res.armMedianRatio)
   })
-  test('invalid cells are dropped from pairing', () => {
-    const mk = (arm, task, rep, billed, valid = true) => ({
-      arm, task, rep, valid, billed, calls: 1, compactions: 0, summary: 0, qualityPassed: 1, qualityTotal: 1,
-    })
-    const num = [mk('C', 'a', 'r1', 110), mk('C', 'a', 'r2', 999, false)]
-    const den = [mk('A', 'a', 'r1', 100), mk('A', 'a', 'r2', 100)]
+  test('ineligible cells are dropped from canonical pairing but kept in legacy', () => {
+    const num = [mkp('C', 'r1', 110), mkp('C', 'r2', 999, { qualityPassed: 3, qualityTotal: 9, taskSuccess: false, costEligible: false })]
+    const den = [mkp('A', 'r1', 100), mkp('A', 'r2', 100)]
     const res = pairedRatioMedian(num, den, { num: 'C', den: 'A' })
     assert.equal(res.pairs, 1)
     assert.equal(res.ratioMedian, 1.1)
+    assert.equal(res.pairsProtocolValidLegacy, 2)
+    assert.equal(res.ratioMedianLegacy, (1.1 + 9.99) / 2)
   })
 })
 
@@ -303,5 +413,58 @@ describe('integration: real gates match documented numbers', { skip: !haveGates 
     assert.equal(ratios.length, 4)
     assert.ok(Math.min(...ratios) >= 0.7 && Math.max(...ratios) <= 0.95,
       `run-cumulative band drifted: ${Math.min(...ratios)}..${Math.max(...ratios)}`)
+    // All P1/P2/P3 cells are taskSuccess, so eligible == legacy: the
+    // historical paired numbers must be reproduced byte-identically.
+    for (const [gate, label] of [['p1gate3', 'C/A'], ['p2gate2', 'C/B'], ['p3gate2', 'R/B']]) {
+      const p = pairOf(gate, label)
+      assert.equal(p.pairsEligible, p.pairsProtocolValidLegacy, `${gate} ${label}: eligible must equal legacy`)
+      assert.equal(p.ratioMedianEligible, p.ratioMedianLegacy)
+    }
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Integration: E/Kimi rounds — strict (costEligible) pairs drop vs legacy
+
+const E_GATES = ['next-e-90k', 'next-e-95k', 'next-e-100k', 'kimi-e-95k']
+  .map(g => join(REPO_ROOT, '.eval', g))
+const haveEGates = E_GATES.every(g => existsSync(join(g, 'results')))
+
+describe('integration: E/Kimi strict pairing drops vs legacy', { skip: !haveEGates }, () => {
+  const pairs = { pairs: [{ label: 'CACHE/STOCK', num: 'CACHE', den: 'STOCK' }, { label: 'SFAITH/STOCK', num: 'SFAITH', den: 'STOCK' }] }
+  const reports = Object.fromEntries(E_GATES.map(g => [g.split('/').pop(), analyzeGate(g, pairs)]))
+  const pairOf = (gate, label) => reports[gate].pairs.find(p => p.label === label)
+  const armOf = (gate, arm) => reports[gate].arms.find(a => a.arm === arm)
+
+  test('E rounds: all protocolValid cells are also taskSuccess (strict == legacy)', () => {
+    for (const gate of ['next-e-90k', 'next-e-95k', 'next-e-100k']) {
+      for (const label of ['CACHE/STOCK', 'SFAITH/STOCK']) {
+        const p = pairOf(gate, label)
+        assert.equal(p.pairsEligible, p.pairsProtocolValidLegacy, `${gate} ${label}: strict must equal legacy here`)
+      }
+    }
+    // Documented strict pair counts (verified against raw): 90k 0 pairs; 95k 1+1; 100k 1+1.
+    assert.equal(pairOf('next-e-90k', 'CACHE/STOCK').pairsEligible, 0)
+    assert.equal(pairOf('next-e-95k', 'CACHE/STOCK').pairsEligible, 1)
+    assert.equal(pairOf('next-e-95k', 'SFAITH/STOCK').pairsEligible, 1)
+    assert.equal(pairOf('next-e-100k', 'CACHE/STOCK').pairsEligible, 1)
+    assert.equal(pairOf('next-e-100k', 'SFAITH/STOCK').pairsEligible, 1)
+  })
+
+  test('kimi round: strict pairs DROP from legacy 5 to eligible subset', () => {
+    const cs = pairOf('kimi-e-95k', 'CACHE/STOCK')
+    const ss = pairOf('kimi-e-95k', 'SFAITH/STOCK')
+    assert.equal(cs.pairsProtocolValidLegacy, 5)
+    assert.equal(ss.pairsProtocolValidLegacy, 5)
+    // CACHE only r4 is taskSuccess; STOCK r1/r2/r4/r5 are.
+    assert.equal(cs.pairsEligible, 1)
+    assert.ok(Math.abs(cs.ratioMedianEligible - 0.7662) < 5e-4)
+    // SFAITH r1/r2/r4 taskSuccess; strict median over 3 pairs.
+    assert.equal(ss.pairsEligible, 3)
+    assert.ok(Math.abs(ss.ratioMedianEligible - 1.3396) < 5e-4)
+    // quality non-comparability is visible in the arm strata.
+    assert.equal(armOf('kimi-e-95k', 'CACHE').taskSuccessCells, 1)
+    assert.equal(armOf('kimi-e-95k', 'STOCK').taskSuccessCells, 4)
+    assert.equal(armOf('kimi-e-95k', 'SFAITH').taskSuccessCells, 3)
   })
 })

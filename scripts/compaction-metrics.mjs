@@ -18,9 +18,22 @@
  *              uses the sum form: Σ cacheRead / Σ max(input, cacheRead+cacheCreation).
  *   valid    = aggregate.json `valid` flag when present, else derived from raw
  *              results as `totals.failedTurns === 0` (reproduces the p1gate2
- *              aggregate flags on all 96 cells). Medians, totals and paired
- *              ratios are computed over valid cells; quality is summed over all
- *              cells (the checklist still ran on invalid cells).
+ *              aggregate flags on all 96 cells). Legacy name: protocolValid.
+ *
+ * Validity strata (2026-10-19, see
+ * docs/nexus/reference/compaction-evaluation-validity-20261019.md):
+ *   protocolValid = the legacy `valid` flag above (aggregate.json else
+ *              failedTurns===0). Protocol ran to completion; NOT the same as
+ *              task success.
+ *   taskSuccess = checklist.passed === checklist.total && total > 0.
+ *   costEligible  = protocolValid && taskSuccess. **Canonical for paired cost
+ *              ratios** (a cell that ran clean but scored 24/45 is not a cost
+ *              sample for the task). Legacy protocolValid-only pairs are still
+ *              reported alongside; nothing historical is recomputed silently.
+ *   failureClass  = per-cell read-only classification from runs/<arm>/db-*.sqlite
+ *              error events: context_blocking | final_check | other | none |
+ *              unknown. Diagnostic only; never decides eligibility.
+ *   blockedTurns  = diagnostic only; never decides eligibility.
  *
  * Usage:
  *   node scripts/compaction-metrics.mjs [--format md|json|both]
@@ -73,8 +86,10 @@ export function mean(values) {
 
 /**
  * Per-arm summary. `cells` items: { arm, task, rep, valid, billed, calls,
- * compactions, summary, qualityPassed, qualityTotal }. Medians and totals are
- * valid-only; quality is additionally summed over all cells.
+ * compactions, summary, qualityPassed, qualityTotal, protocolValid,
+ * taskSuccess, costEligible, failureClass }. Medians and totals are
+ * valid-only (legacy protocolValid); quality is additionally summed over all
+ * cells; eligibility counts and failure classes are tallied over all cells.
  */
 export function summarizeArms(cells) {
   const byArm = new Map()
@@ -85,15 +100,27 @@ export function summarizeArms(cells) {
   const arms = []
   for (const [arm, rows] of [...byArm.entries()].sort(([a], [b]) => a.localeCompare(b))) {
     const valid = rows.filter(r => r.valid)
+    const eligible = rows.filter(r => r.costEligible)
+    const failureClasses = {}
+    for (const r of rows) {
+      const cls = r.failureClass ?? 'unknown'
+      failureClasses[cls] = (failureClasses[cls] ?? 0) + 1
+    }
     arms.push({
       arm,
       cells: rows.length,
       validCells: valid.length,
       invalidCells: rows.length - valid.length,
+      protocolValidCells: rows.filter(r => r.protocolValid).length,
+      taskSuccessCells: rows.filter(r => r.taskSuccess).length,
+      costEligibleCells: eligible.length,
+      failureClasses,
       billedMedian: median(valid.map(r => r.billed)),
       billedTotal: valid.reduce((a, r) => a + r.billed, 0),
+      billedMedianEligible: median(eligible.map(r => r.billed)),
       callsMedian: median(valid.map(r => r.calls)),
       callsTotal: valid.reduce((a, r) => a + r.calls, 0),
+      callsMedianEligible: median(eligible.map(r => r.calls)),
       compactions: valid.reduce((a, r) => a + r.compactions, 0),
       summaryMedian: median(valid.map(r => r.summary)),
       qualityAll: {
@@ -104,6 +131,10 @@ export function summarizeArms(cells) {
         passed: valid.reduce((a, r) => a + r.qualityPassed, 0),
         total: valid.reduce((a, r) => a + r.qualityTotal, 0),
       },
+      qualityEligible: {
+        passed: eligible.reduce((a, r) => a + r.qualityPassed, 0),
+        total: eligible.reduce((a, r) => a + r.qualityTotal, 0),
+      },
     })
   }
   return arms
@@ -112,29 +143,42 @@ export function summarizeArms(cells) {
 /**
  * Median of paired per-cell billed ratios, cells matched on (task, rep).
  * Explicitly distinct from the ratio of arm-level billed medians.
+ * Canonical pairing uses costEligible cells (protocolValid && taskSuccess);
+ * the legacy protocolValid-only pairing is reported alongside.
  */
 export function pairedRatioMedian(numCells, denCells, { label, num, den } = {}) {
-  const denIndex = new Map()
-  for (const c of denCells.filter(c => c.valid)) denIndex.set(`${c.task}${c.rep}`, c)
-  const pairs = []
-  for (const c of numCells.filter(c => c.valid)) {
-    const d = denIndex.get(`${c.task}${c.rep}`)
-    if (d && d.billed > 0) {
-      pairs.push({ task: c.task, rep: c.rep, numBilled: c.billed, denBilled: d.billed, ratio: c.billed / d.billed })
+  const pairOn = (keep) => {
+    const denIndex = new Map()
+    for (const c of denCells.filter(keep)) denIndex.set(`${c.task}${c.rep}`, c)
+    const pairs = []
+    for (const c of numCells.filter(keep)) {
+      const d = denIndex.get(`${c.task}${c.rep}`)
+      if (d && d.billed > 0) {
+        pairs.push({ task: c.task, rep: c.rep, numBilled: c.billed, denBilled: d.billed, ratio: c.billed / d.billed })
+      }
     }
+    return pairs
   }
-  const numMedian = median(numCells.filter(c => c.valid).map(c => c.billed))
-  const denMedian = median(denCells.filter(c => c.valid).map(c => c.billed))
+  const eligiblePairs = pairOn(c => c.costEligible)
+  const legacyPairs = pairOn(c => c.valid)
+  const numMedian = median(numCells.filter(c => c.costEligible).map(c => c.billed))
+  const denMedian = median(denCells.filter(c => c.costEligible).map(c => c.billed))
   return {
     label: label ?? `${num}/${den}`,
     numArm: num,
     denArm: den,
-    pairs: pairs.length,
-    ratioMedian: median(pairs.map(p => p.ratio)),
-    ratioMean: mean(pairs.map(p => p.ratio)),
+    canonical: 'eligible',
+    pairs: eligiblePairs.length,
+    pairsEligible: eligiblePairs.length,
+    ratioMedian: median(eligiblePairs.map(p => p.ratio)),
+    ratioMedianEligible: median(eligiblePairs.map(p => p.ratio)),
+    ratioMean: mean(eligiblePairs.map(p => p.ratio)),
+    pairsProtocolValidLegacy: legacyPairs.length,
+    ratioMedianLegacy: median(legacyPairs.map(p => p.ratio)),
     armMedianRatio: numMedian !== null && denMedian ? numMedian / denMedian : null,
-    statistic: 'median of paired per-cell billed ratios (not the ratio of arm medians)',
-    cells: pairs,
+    statistic: 'median of paired per-cell billed ratios over costEligible cells (not the ratio of arm medians)',
+    cells: eligiblePairs,
+    legacyCells: legacyPairs,
   }
 }
 
@@ -190,6 +234,102 @@ export function perEventStats(ratios) {
 // ---------------------------------------------------------------------------
 // Loading: results/*.json (+ aggregate.json validity), runs/&#42;/db-*.sqlite
 
+// ---------------------------------------------------------------------------
+// Failure classification (read-only; diagnostic only, never eligibility)
+
+const FAILURE_PATTERNS = [
+  ['context_blocking', /CONTEXT_LIMIT_EXCEEDED|blocking limit|context.{0,40}(exceed|limit|blocking)/i],
+  ['final_check', /final_check|finalization/i],
+]
+const FAILURE_PRECEDENCE = ['context_blocking', 'final_check', 'other']
+
+/**
+ * Classify one cell's failure from raw error/turn_failed event messages.
+ * Returns { failureClass, failureClasses }: the primary class (precedence
+ * context_blocking > final_check > other) plus the full observed set.
+ * `none` when there is nothing to classify.
+ */
+export function classifyFailureEvents(messages) {
+  const found = new Set()
+  for (const msg of messages) {
+    if (!msg) continue
+    let matched = false
+    for (const [cls, pattern] of FAILURE_PATTERNS) {
+      if (pattern.test(msg)) {
+        found.add(cls)
+        matched = true
+      }
+    }
+    if (!matched) found.add('other')
+  }
+  if (found.size === 0) return { failureClass: 'none', failureClasses: [] }
+  const failureClasses = FAILURE_PRECEDENCE.filter(c => found.has(c))
+  return { failureClass: failureClasses[0], failureClasses }
+}
+
+/** Read a cell's error/turn_failed event messages from its run sqlite. */
+export function readFailureMessages(dbPath) {
+  let db
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: true })
+  } catch {
+    return null
+  }
+  try {
+    const hasEvents = db.prepare(
+      "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='events'",
+    ).get().n
+    if (!hasEvents) return null
+    const rows = db.prepare(
+      "SELECT event_json FROM events WHERE event_type IN ('error','turn_failed')",
+    ).all()
+    const messages = []
+    for (const row of rows) {
+      try {
+        const text = typeof row.event_json === 'string' ? row.event_json : Buffer.from(row.event_json).toString('utf8')
+        const e = JSON.parse(text)
+        const msg = e?.message ?? e?.error ?? ''
+        if (msg) messages.push(String(msg))
+      } catch { /* skip unparseable rows */ }
+    }
+    return messages
+  } finally {
+    db.close()
+  }
+}
+
+/** Conventional per-cell DB path: runs/<arm>/db-<task>-<rep>.sqlite. */
+export function cellDbPath(gateDir, cell) {
+  return join(gateDir, 'runs', cell.arm, `db-${cell.task}-${cell.rep}.sqlite`)
+}
+
+/**
+ * Attach failureClass to one cell. failedTurns===0 with no error evidence
+ * yields 'none'; failedTurns>0 without readable DB/error events yields
+ * 'unknown'; otherwise the classified result. blockedTurns>0 always implies
+ * context_blocking evidence regardless of message parsing.
+ */
+export function attachFailureClass(gateDir, cell) {
+  const messages = readFailureMessages(cellDbPath(gateDir, cell))
+  if (messages === null) {
+    cell.failureClass = cell.failedTurns > 0 ? 'unknown' : 'none'
+    cell.failureClasses = []
+    return cell
+  }
+  const { failureClass, failureClasses } = classifyFailureEvents(messages)
+  const classes = new Set(failureClasses)
+  if (cell.blockedTurns > 0) classes.add('context_blocking')
+  if (classes.size === 0) {
+    cell.failureClass = cell.failedTurns > 0 ? 'unknown' : 'none'
+    cell.failureClasses = []
+    return cell
+  }
+  const ordered = FAILURE_PRECEDENCE.filter(c => classes.has(c))
+  cell.failureClass = ordered[0]
+  cell.failureClasses = ordered
+  return cell
+}
+
 /** Read one gate's result cells. Read-only. */
 export function loadGateCells(gateDir) {
   const resultsDir = join(gateDir, 'results')
@@ -205,19 +345,23 @@ export function loadGateCells(gateDir) {
       continue
     }
     const t = d.totals ?? {}
+    const qualityPassed = d.checklist?.passed ?? 0
+    const qualityTotal = d.checklist?.total ?? 0
+    const failedTurns = t.failedTurns ?? 0
     cells.push({
       file,
       arm: d.arm,
       task: d.taskId,
       rep: d.rep,
-      failedTurns: t.failedTurns ?? 0,
+      failedTurns,
       blockedTurns: t.blockedTurns ?? 0,
       billed: billedFromTotals(t),
       calls: t.providerCalls ?? 0,
       compactions: t.compactions ?? 0,
       summary: (t.summaryInputTokens ?? 0) + (t.summaryOutputTokens ?? 0),
-      qualityPassed: d.checklist?.passed ?? 0,
-      qualityTotal: d.checklist?.total ?? 0,
+      qualityPassed,
+      qualityTotal,
+      taskSuccess: qualityTotal > 0 && qualityPassed === qualityTotal,
     })
   }
 
@@ -250,6 +394,13 @@ export function loadGateCells(gateDir) {
   }
   if (validSource !== 'aggregate.json') {
     for (const cell of cells) cell.valid = cell.failedTurns === 0
+  }
+  // Validity strata: protocolValid is the legacy flag; costEligible adds
+  // task success. failureClass is a read-only diagnostic from sqlite.
+  for (const cell of cells) {
+    cell.protocolValid = cell.valid
+    cell.costEligible = cell.protocolValid && cell.taskSuccess
+    attachFailureClass(gateDir, cell)
   }
   return { cells, problems, validSource, validDisagreements: disagreements }
 }
@@ -383,19 +534,20 @@ export function renderMarkdown(reports) {
     out.push(`## ${report.path}`)
     if (report.problems.length) out.push(`> problems: ${report.problems.join('; ')}`)
     out.push('')
-    out.push('| arm | n (valid/total) | billed median | calls median | calls total | compactions | summary median | quality (all cells) |')
-    out.push('|---|---:|---:|---:|---:|---:|---:|---|')
+    out.push('| arm | n (valid/total) | pv/ts/eligible | billed median | calls median | calls total | compactions | summary median | quality (all cells) | failureClass |')
+    out.push('|---|---:|---:|---:|---:|---:|---:|---:|---|---|')
     for (const a of report.arms) {
-      out.push(`| ${a.arm} | ${a.validCells}/${a.cells} | ${fmtMed(a.billedMedian)} | ${fmtMed(a.callsMedian)} | ${fmtInt(a.callsTotal)} | ${a.compactions} | ${fmtMed(a.summaryMedian)} | ${a.qualityAll.passed}/${a.qualityAll.total} |`)
+      const fc = Object.entries(a.failureClasses).map(([k, v]) => `${k}:${v}`).join(' ') || '—'
+      out.push(`| ${a.arm} | ${a.validCells}/${a.cells} | ${a.protocolValidCells}/${a.taskSuccessCells}/${a.costEligibleCells} | ${fmtMed(a.billedMedian)} | ${fmtMed(a.callsMedian)} | ${fmtInt(a.callsTotal)} | ${a.compactions} | ${fmtMed(a.summaryMedian)} | ${a.qualityAll.passed}/${a.qualityAll.total} | ${fc} |`)
     }
     out.push('')
-    out.push(`calls median and calls total are different statistics and can move in opposite directions; quality is summed over all cells, medians/totals are valid-only (validity: ${report.validSource}).`)
+    out.push(`calls median and calls total are different statistics and can move in opposite directions; quality is summed over all cells, medians/totals are valid-only (validity: ${report.validSource}). pv/ts/eligible = protocolValid / taskSuccess / costEligible cell counts; failureClass is a read-only diagnostic and never decides eligibility.`)
     if (report.pairs.length) {
       out.push('')
-      out.push('Paired billed ratios (median of per-cell ratios, cells matched on task+rep — **not** the ratio of arm medians):')
+      out.push('Paired billed ratios (median of per-cell ratios, cells matched on task+rep — **not** the ratio of arm medians). **Canonical = costEligible pairs**; legacy protocolValid-only pairing shown for continuity:')
       for (const p of report.pairs) {
         const cross = p.crossGate ? ` (denominator arm ${p.denArm} from ${p.denominatorGate})` : ''
-        out.push(`- **${p.label} = ${fmtRatio(p.ratioMedian)}** over ${p.pairs} pairs${cross}; ratio of arm medians = ${fmtRatio(p.armMedianRatio)}, mean paired ratio = ${fmtRatio(p.ratioMean)}`)
+        out.push(`- **${p.label} = ${fmtRatio(p.ratioMedianEligible)}** over ${p.pairsEligible} costEligible pairs${cross}; legacy: ${fmtRatio(p.ratioMedianLegacy)} over ${p.pairsProtocolValidLegacy} protocolValid pairs; ratio of arm medians (eligible) = ${fmtRatio(p.armMedianRatio)}, mean paired ratio = ${fmtRatio(p.ratioMean)}`)
       }
     }
     out.push('')

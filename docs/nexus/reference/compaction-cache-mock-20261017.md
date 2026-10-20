@@ -59,6 +59,11 @@ activation threshold is crossed in many runs; the live A/B below verifies the
 ## Metric definitions
 
 - `billed` = input + output + summaryInput + summaryOutput tokens.
+- **Validity strata (2026-10-19)**: `protocolValid` (legacy `valid`),
+  `taskSuccess` (checklist full pass), `costEligible` = both. **Paired cost
+  comparisons are canonical ONLY over costEligible cells**; legacy pairs are
+  printed alongside. `failureClass` / `blockedTurns` are diagnostics, never
+  eligibility. See `compaction-evaluation-validity-20261019.md`.
 - `calls` = provider calls. Reports show the median per cell and the total
   separately; the two can move in opposite directions.
 - `cacheReadRatio(event)` = `cacheRead / max(input, cacheRead + cacheCreation)`.
