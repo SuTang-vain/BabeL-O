@@ -54,6 +54,38 @@ describe('buildPrefetchKey', () => {
 })
 
 describe('createPrefetchCache', () => {
+  test('P2 regression: evict -> re-prefetch same key -> old promise rejects -> new entry survives', async () => {
+    const calls: Array<ReturnType<typeof deferred<string>>> = []
+    const cache = createPrefetchCache({
+      summarize: () => {
+        const d = deferred<string>()
+        calls.push(d)
+        return d.promise
+      },
+      maxEntries: 1,
+      now: () => 0,
+    })
+    const events = transcript('s1', 'alpha')
+    const other = transcript('s1', 'beta')
+
+    cache.prefetch(events)
+    // An awaiter attaches to entry1 while it is still pending.
+    const firstAwait = cache.awaitSummary(events, { deadlineMs: 10_000 })
+    // Evict entry1 (LRU, maxEntries=1) and re-prefetch the same key -> entry2.
+    cache.prefetch(other)
+    cache.prefetch(events)
+    assert.equal(calls.length, 3) // alpha, beta (evicts alpha), alpha again (evicts beta)
+    // Old promise rejects: first awaiter falls back, the newest entry must NOT be deleted.
+    calls[0]!.reject(new Error('old summarize failed'))
+    const first = await firstAwait
+    assert.deepEqual(first, { status: 'fallback', reason: 'error' })
+    // The newer entry still resolves to a hit.
+    calls[2]!.resolve('summary from entry2')
+    await tick()
+    const second = await cache.awaitSummary(events, { deadlineMs: 10_000 })
+    assert.deepEqual(second, { status: 'hit', summary: 'summary from entry2', latencySavedMs: 0 })
+  })
+
   test('hit returns the prefetched summary with the latency saved', async () => {
     let nowMs = 0
     const d = deferred<string>()

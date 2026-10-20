@@ -183,8 +183,11 @@ export function createPrefetchCache(options: PrefetchCacheOptions): CompactionPr
         return { status: 'fallback', reason: 'timeout' }
       }
       if (!outcome.ok) {
-        // A rejected summarize can never produce a summary; drop the entry.
-        entries.delete(key)
+        // A rejected summarize can never produce a summary; drop the entry —
+        // but ONLY if it is still the same entry. After an LRU eviction the
+        // key may already hold a NEWER prefetch; deleting by key alone would
+        // destroy that live entry (P2 identity-delete race).
+        if (entries.get(key) === entry) entries.delete(key)
         return { status: 'fallback', reason: 'error' }
       }
       // Saved latency = summarization time we did not pay synchronously:
