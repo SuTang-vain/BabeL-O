@@ -103,6 +103,17 @@ below and must not be used as a cost estimate.
 > as a cost result; a valid A/B must omit the override. Cache-aware remains
 > opt-in and untested for default-switch cost. Full details:
 > `compaction-next-round-20261018.md`.
+>
+> **Round-3 update (2026-10-19, mechanism confirmed at 90k; cost still null):**
+> E-stateful-migrator @ 90k, 3 arms × 3 reps, **no threshold override**
+> (`.eval/next-e-90k/`). The 93/80 tier appears only under the flag (26/32
+> CACHE decisions vs 0/35 STOCK and 0/33 SFAITH). CACHE's valid cells (2/3)
+> had **zero compactions** — the 93% trigger kept the 10-step task below
+> threshold end-to-end — with the only perfect quality (27/27) and the lowest
+> valid billed median (1,523,920). But paired CACHE/STOCK is **null**: STOCK
+> lost 2/3 cells to context blocking, leaving 0 valid pairs. Mechanism:
+> confirmed. Cost: still unproven in either direction. Details:
+> `compaction-next-e-90k-20261019.md`.
 
 Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative
 (turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
