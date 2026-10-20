@@ -15,6 +15,7 @@ import {
   analyzeGate,
   attachFailureClass,
   billedFromTotals,
+  bootstrapPairedRatio,
   cacheReadRatioCumulative,
   cacheReadRatioEvent,
   classifyFailureEvents,
@@ -226,6 +227,63 @@ describe('attachFailureClass with a real node:sqlite DB', () => {
 })
 
 // ---------------------------------------------------------------------------
+// bootstrapPairedRatio: costEligible-only bootstrap CI
+
+describe('bootstrapPairedRatio', () => {
+  const mk = (arm, rep, billed, { valid = true, q = 1, qt = 1 } = {}) => {
+    const taskSuccess = qt > 0 && q === qt
+    return {
+      arm, task: 't', rep, valid, protocolValid: valid, billed, calls: 1,
+      compactions: 0, summary: 0, qualityPassed: q, qualityTotal: qt,
+      taskSuccess, costEligible: valid && taskSuccess, failureClass: 'none',
+    }
+  }
+  const den = ['r1', 'r2', 'r3', 'r4'].map((rep, i) => mk('A', rep, 100 * (i + 1)))
+
+  test('pairs only costEligible cells; legacy count kept alongside', () => {
+    const num = [
+      mk('C', 'r1', 110), mk('C', 'r2', 220),
+      mk('C', 'r3', 999, { q: 3, qt: 9 }),   // protocolValid, not taskSuccess
+      mk('C', 'r4', 440),
+    ]
+    const res = bootstrapPairedRatio(num, den, { resamples: 1000, seed: 7 })
+    assert.equal(res.pairsEligible, 3)          // r1, r2, r4 (r3 dropped)
+    assert.equal(res.pairsProtocolValidLegacy, 4)
+    assert.equal(res.ratioMedianEligible, 1.1)  // ratios 1.1, 1.1, 1.1
+    assert.deepEqual(res.boot90CI, [1.1, 1.1])
+    assert.equal(res.insufficient, false)
+  })
+
+  test('n<3 eligible pairs -> insufficient (CI computed but not citable)', () => {
+    const num = [mk('C', 'r1', 110), mk('C', 'r2', 220, { valid: false })]
+    num[1].protocolValid = false
+    num[1].costEligible = false
+    const res = bootstrapPairedRatio(num, den, { resamples: 1000, seed: 7 })
+    assert.equal(res.pairsEligible, 1)
+    assert.equal(res.insufficient, true)
+    assert.ok(res.boot90CI)
+  })
+
+  test('seed makes the CI reproducible byte-identically; different seed shifts it', () => {
+    const num = ['r1', 'r2', 'r3', 'r4'].map((rep, i) => mk('C', rep, 100 * (i + 1) + 13))
+    const a1 = bootstrapPairedRatio(num, den, { resamples: 2000, seed: 42 })
+    const a2 = bootstrapPairedRatio(num, den, { resamples: 2000, seed: 42 })
+    const b = bootstrapPairedRatio(num, den, { resamples: 2000, seed: 43 })
+    assert.deepEqual(a1.boot90CI, a2.boot90CI)
+    // (different seed is extremely likely to differ; if it equals, the test
+    // still passes on the reproducibility assertion above)
+    assert.equal(a1.ratioMedianEligible, b.ratioMedianEligible)
+  })
+
+  test('zero eligible pairs -> null CI + insufficient', () => {
+    const res = bootstrapPairedRatio([mk('C', 'r9', 1)], den, { resamples: 500, seed: 1 })
+    assert.equal(res.pairsEligible, 0)
+    assert.equal(res.boot90CI, null)
+    assert.equal(res.insufficient, true)
+  })
+})
+
+// ---------------------------------------------------------------------------
 // paired per-cell ratio vs ratio of arm medians
 
 describe('pairedRatioMedian', () => {
@@ -421,6 +479,20 @@ describe('integration: real gates match documented numbers', { skip: !haveGates 
       assert.equal(p.ratioMedianEligible, p.ratioMedianLegacy)
     }
   })
+
+  test('bootstrap on P1/P2/P3: eligible CI present, point matches legacy, sufficient', () => {
+    const boot = { resamples: 2000, seed: 20261019 }
+    for (const [gate, label, num, den] of [['p1gate3', 'C/A', 'C', 'A'], ['p2gate2', 'C/B', 'C', 'B']]) {
+      const r = analyzeGate(join(REPO_ROOT, '.eval', gate), { bootstrap: boot })
+      const p = r.pairs.find(x => x.label === label)
+      assert.ok(p.bootstrap, 'bootstrap block present')
+      assert.equal(p.bootstrap.pairsEligible, p.pairsProtocolValidLegacy)
+      assert.equal(p.bootstrap.ratioMedianEligible, p.ratioMedian)
+      assert.equal(p.bootstrap.insufficient, false)
+      assert.ok(p.bootstrap.boot90CI[0] <= p.ratioMedian && p.ratioMedian <= p.bootstrap.boot90CI[1],
+        `${gate} ${label}: point ${p.ratioMedian} within CI ${p.bootstrap.boot90CI}`)
+    }
+  })
 })
 
 // ---------------------------------------------------------------------------
@@ -466,5 +538,18 @@ describe('integration: E/Kimi strict pairing drops vs legacy', { skip: !haveEGat
     assert.equal(armOf('kimi-e-95k', 'CACHE').taskSuccessCells, 1)
     assert.equal(armOf('kimi-e-95k', 'STOCK').taskSuccessCells, 4)
     assert.equal(armOf('kimi-e-95k', 'SFAITH').taskSuccessCells, 3)
+  })
+
+  test('kimi round: bootstrap flags CACHE/STOCK insufficient, SFAITH/STOCK borderline-sufficient', () => {
+    const r = analyzeGate(join(REPO_ROOT, '.eval', 'kimi-e-95k'), {
+      pairs: [{ label: 'CACHE/STOCK', num: 'CACHE', den: 'STOCK' }, { label: 'SFAITH/STOCK', num: 'SFAITH', den: 'STOCK' }],
+      bootstrap: { resamples: 2000, seed: 20261019 },
+    })
+    const cs = r.pairs.find(p => p.label === 'CACHE/STOCK')
+    const ss = r.pairs.find(p => p.label === 'SFAITH/STOCK')
+    assert.equal(cs.bootstrap.insufficient, true)   // 1 eligible pair
+    assert.equal(ss.bootstrap.insufficient, false)  // exactly 3 (min)
+    assert.equal(cs.bootstrap.pairsProtocolValidLegacy, 5)
+    assert.equal(ss.bootstrap.pairsProtocolValidLegacy, 5)
   })
 })

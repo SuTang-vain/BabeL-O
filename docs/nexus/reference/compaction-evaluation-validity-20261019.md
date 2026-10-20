@@ -83,11 +83,32 @@ node scripts/compaction-metrics.mjs --format json .eval/kimi-e-95k
 node --test scripts/compaction-metrics.test.mjs
 ```
 
+## Bootstrap (eligible-aware, 2026-10-19 second half)
+
+`compaction-metrics.mjs --bootstrap [--resamples N] [--seed N]` now computes a
+percentile 90% CI over the **canonical costEligible** paired ratios only
+(mulberry32 seeded RNG, reproducible; default 10,000 resamples,
+seed 20261019; legacy counts printed alongside). Fewer than 3 eligible pairs
+is flagged `insufficient` — the CI is computed but must not be cited.
+Tests: `node --test scripts/compaction-metrics.test.mjs` (36/36).
+
+Recomputed strict CIs:
+
+| gate | pair | strict pairs | median | boot 90% CI | verdict |
+|---|---|---:|---:|---|---|
+| p1gate3 | C/A | 16 | 1.0684 | [0.8757, 1.1169] | point unchanged (== legacy); CI crosses 1 (first honest CI for this headline — noted as confidence limits, not a reversal) |
+| p2gate2 | C/B | 8 | 0.9356 | [0.8297, 1.0508] | point unchanged; CI crosses 1 |
+| p3gate2 | R/B | 4 | 0.9675 | [0.7667, 3.2548] | point unchanged; CI crosses 1 |
+| next-e-90k | both | 0 | — | — | insufficient |
+| next-e-95k | CACHE/STOCK · SFAITH/STOCK | 1 · 1 | 1.3521 · 0.6982 | degenerate | insufficient |
+| next-e-100k | CACHE/STOCK · SFAITH/STOCK | 1 · 1 | 1.0093 · 0.7359 | degenerate | insufficient |
+| kimi-e-95k | CACHE/STOCK | 1 | 0.7662 | degenerate | **insufficient** (strict restatement: was 5p legacy) |
+| kimi-e-95k | SFAITH/STOCK | 3 | 1.3396 | [0.8928, 1.5603] | crosses 1 → null (and ts 3/5 vs 4/5 caveat stands) |
+
 ## Unfinished
 
-- Bootstrap CI is still computed by the separate `.eval/paired_bootstrap.py`
-  (legacy protocolValid pairing); an eligible-aware variant is a natural
-  follow-up (mechanical).
+- The standalone `.eval/paired_bootstrap.py` remains legacy-only and is now
+  superseded by `--bootstrap` in the canonical tool (kept for reference).
 - A validity-rule proposal for the harness itself (distinguish procedural
   final_check failures from contextual ones when marking cells) remains
   unlanded; this stratum covers the reporting side only.

@@ -232,6 +232,72 @@ export function perEventStats(ratios) {
 }
 
 // ---------------------------------------------------------------------------
+// Bootstrap CI for the canonical (costEligible) paired ratio median
+
+/** Deterministic seeded RNG (mulberry32) so CIs are reproducible. */
+export function mulberry32(seed) {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+export const BOOTSTRAP_MIN_PAIRS = 3
+
+/**
+ * Percentile bootstrap over the CANONICAL (costEligible) paired per-cell
+ * billed ratios. Legacy protocolValid-only pairing is reported alongside for
+ * continuity. Returns insufficient: true when the eligible pair count is
+ * below BOOTSTRAP_MIN_PAIRS (CI is still computed but must not be cited).
+ */
+export function bootstrapPairedRatio(numCells, denCells, { label, num, den, resamples = 10_000, seed = 20261019, minPairs = BOOTSTRAP_MIN_PAIRS } = {}) {
+  const pairOn = (keep) => {
+    const denIndex = new Map()
+    for (const c of denCells.filter(keep)) denIndex.set(`${c.task}${c.rep}`, c)
+    const pairs = []
+    for (const c of numCells.filter(keep)) {
+      const d = denIndex.get(`${c.task}${c.rep}`)
+      if (d && d.billed > 0) pairs.push(c.billed / d.billed)
+    }
+    return pairs
+  }
+  const eligible = pairOn(c => c.costEligible)
+  const legacy = pairOn(c => c.valid)
+  const point = median(eligible)
+  let ci = null
+  if (eligible.length > 0) {
+    const rng = mulberry32(seed)
+    const boots = []
+    for (let i = 0; i < resamples; i += 1) {
+      const sample = []
+      for (let j = 0; j < eligible.length; j += 1) sample.push(eligible[Math.floor(rng() * eligible.length)])
+      boots.push(median(sample))
+    }
+    boots.sort((a, b) => a - b)
+    ci = [boots[Math.floor(0.05 * resamples)], boots[Math.ceil(0.95 * resamples) - 1]]
+  }
+  return {
+    label: label ?? `${num}/${den}`,
+    canonical: 'eligible',
+    pairsEligible: eligible.length,
+    ratioMedianEligible: point,
+    boot90CI: ci,
+    ciCrosses1: ci !== null && ci[0] <= 1 && 1 <= ci[1],
+    insufficient: eligible.length < minPairs,
+    minPairs,
+    seed,
+    resamples,
+    pairsProtocolValidLegacy: legacy.length,
+    ratioMedianLegacy: median(legacy),
+    statistic: 'percentile bootstrap over costEligible paired per-cell billed ratios',
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Loading: results/*.json (+ aggregate.json validity), runs/&#42;/db-*.sqlite
 
 // ---------------------------------------------------------------------------
@@ -492,7 +558,7 @@ export function loadGateCache(gateDir) {
 // ---------------------------------------------------------------------------
 // Gate analysis + rendering
 
-export function analyzeGate(gateDir, { pairs } = {}) {
+export function analyzeGate(gateDir, { pairs, bootstrap } = {}) {
   const { cells, problems, validSource, validDisagreements } = loadGateCells(gateDir)
   const pairSpecs = pairs ?? DEFAULT_PAIRS[basename(gateDir)] ?? []
   const pairResults = []
@@ -503,6 +569,7 @@ export function analyzeGate(gateDir, { pairs } = {}) {
     const denPool = denCells.filter(c => c.arm === spec.den)
     pairResults.push({
       ...pairedRatioMedian(numCells, denPool, spec),
+      ...(bootstrap ? { bootstrap: bootstrapPairedRatio(numCells, denPool, { ...spec, ...bootstrap }) } : {}),
       ...(denGateDir ? { denominatorGate: basename(denGateDir), crossGate: true } : {}),
     })
   }
@@ -548,6 +615,14 @@ export function renderMarkdown(reports) {
       for (const p of report.pairs) {
         const cross = p.crossGate ? ` (denominator arm ${p.denArm} from ${p.denominatorGate})` : ''
         out.push(`- **${p.label} = ${fmtRatio(p.ratioMedianEligible)}** over ${p.pairsEligible} costEligible pairs${cross}; legacy: ${fmtRatio(p.ratioMedianLegacy)} over ${p.pairsProtocolValidLegacy} protocolValid pairs; ratio of arm medians (eligible) = ${fmtRatio(p.armMedianRatio)}, mean paired ratio = ${fmtRatio(p.ratioMean)}`)
+        if (p.bootstrap) {
+          const b = p.bootstrap
+          const ci = b.boot90CI ? `[${fmtRatio(b.boot90CI[0])}, ${fmtRatio(b.boot90CI[1])}]` : '—'
+          const verdict = b.insufficient
+            ? `**insufficient** (<${b.minPairs} eligible pairs; do not cite)`
+            : b.ciCrosses1 ? 'crosses 1 → null' : 'excludes 1'
+          out.push(`  bootstrap 90% CI ${ci} (${b.resamples.toLocaleString('en-US')} resamples, seed ${b.seed}, costEligible only): ${verdict}; legacy pairs: ${b.pairsProtocolValidLegacy} (median ${fmtRatio(b.ratioMedianLegacy)})`)
+        }
       }
     }
     out.push('')
@@ -576,13 +651,23 @@ export function renderMarkdown(reports) {
 // CLI
 
 function parseArgs(argv) {
-  const opts = { format: 'md', pairs: undefined, gates: [] }
+  const opts = { format: 'md', pairs: undefined, gates: [], bootstrap: false, resamples: 10_000, seed: 20261019 }
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]
     if (arg === '--format') {
       opts.format = argv[++i]
     } else if (arg.startsWith('--format=')) {
       opts.format = arg.slice('--format='.length)
+    } else if (arg === '--bootstrap') {
+      opts.bootstrap = true
+    } else if (arg === '--resamples') {
+      opts.resamples = parseInt(argv[++i], 10)
+    } else if (arg.startsWith('--resamples=')) {
+      opts.resamples = parseInt(arg.slice('--resamples='.length), 10)
+    } else if (arg === '--seed') {
+      opts.seed = parseInt(argv[++i], 10)
+    } else if (arg.startsWith('--seed=')) {
+      opts.seed = parseInt(arg.slice('--seed='.length), 10)
     } else if (arg === '--pair') {
       opts.pairs = [...(opts.pairs ?? []), parsePair(argv[++i])]
     } else if (arg.startsWith('--pair=')) {
@@ -606,8 +691,11 @@ function parsePair(spec) {
 }
 
 const USAGE = `Usage: node scripts/compaction-metrics.mjs [--format md|json|both]
-              [--pair LABEL=NUM/DEN[@DEN_GATE]]... [gateDir ...]
+              [--pair LABEL=NUM/DEN[@DEN_GATE]]... [--bootstrap]
+              [--resamples N] [--seed N] [gateDir ...]
 --pair accepts LABEL=NUM/DEN[@DEN_GATE] or the shorthand NUM/DEN[@DEN_GATE].
+--bootstrap adds a percentile 90% CI over the canonical costEligible paired
+  ratios (default ${10_000} resamples, seed 20261019; <3 pairs => insufficient).
 Defaults: the four post-wiring gates (${DEFAULT_GATES.join(', ')}).
 Read-only; requires Node >= 22 (node:sqlite for runs/*/db-*.sqlite cache ratios).`
 
@@ -624,13 +712,18 @@ export function main(argv = process.argv.slice(2)) {
   }
   const gates = (opts.gates.length ? opts.gates : DEFAULT_GATES.map(g => resolve(REPO_ROOT, g)))
     .map(g => resolve(g))
+  if (opts.bootstrap && (!Number.isFinite(opts.resamples) || opts.resamples < 100)) {
+    console.error(`--resamples must be a number >= 100 (got ${opts.resamples})`)
+    return 2
+  }
+  const bootstrap = opts.bootstrap ? { resamples: opts.resamples, seed: opts.seed } : undefined
   const reports = []
   for (const gateDir of gates) {
     if (!existsSync(gateDir)) {
       reports.push({ gate: basename(gateDir), path: gateDir, cells: 0, problems: ['gate directory missing'], arms: [], pairs: [], cache: { available: false, reason: 'gate directory missing' } })
       continue
     }
-    reports.push(analyzeGate(gateDir, { pairs: opts.pairs }))
+    reports.push(analyzeGate(gateDir, { pairs: opts.pairs, bootstrap }))
   }
   if (opts.format === 'json' || opts.format === 'both') {
     console.log(JSON.stringify({ generatedBy: 'scripts/compaction-metrics.mjs', reports }, null, 2))
