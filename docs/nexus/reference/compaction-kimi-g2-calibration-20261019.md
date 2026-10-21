@@ -29,8 +29,8 @@ raw `.eval/kimi-g2-cal/{results,runs,logs}`.
 
 | cell | billed | calls | comp | fail/blk | quality | peak est | peak per-call input |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| g2-r1 | 1,839,692 | 103 | 0 | 0/0 | 7/10 | 44,557 (46.9%) | — |
-| g2-r2 | 1,533,111 | 91 | 0 | 0/0 | 9/10 | 48,613 (51.2%) | **29,213** |
+| g2-r1 | 1,839,692 | 103 | 0 | 0/0 | 7/10 | **65,519 (69%)** | — |
+| g2-r2 | 1,533,111 | 91 | 0 | 0/0 | 9/10 | **67,119 (71%)** | **29,213** |
 
 Failures: r1 — README.md missing, rejected.exact (JSON-line format), its own
 test.mjs's reverse case; r2 — rejected.exact (same format nit). All ledgers
@@ -40,8 +40,10 @@ uniformly 66,500/85,500 (90/70), zero `shouldCompact`, zero compactions.
 
 The accumulation design worked as instructed — full journal reads and 400-line
 reconciliation prints happened (e.g. r2 S6 out=6,970; per-step billed input up
-to 126k) — yet the **estimate plateaued at 44–49k and the largest single
-provider call carried just 29,213 tokens** (max over 91 usage events, r2).
+to 126k) — yet the **max pre-provider estimate reached only 65,519 (r1) /
+67,119 (r2), still below the 85,500 trigger; estimates oscillated 44–67k as
+old output fell out of assembly**, and the largest single provider call carried
+just 29,213 tokens (max over 91 usage events, r2).
 
 Mechanism (read-only code evidence):
 1. `toolResultBudget.ts`: tool results > 50,000 chars are persisted to

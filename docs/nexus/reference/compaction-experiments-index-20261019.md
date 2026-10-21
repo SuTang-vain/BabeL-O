@@ -46,7 +46,7 @@ opt-in), tests 22/22, stock+flag-off byte-equivalence pinned by test.
 |---|---|---|---|
 | kimi-e-95k | 15/15 valid, 0 blocked | legacy 5p (1.2119 / 0.9218) **withdrawn**; strict 1p CACHE/STOCK 0.7662 insufficient, 3p SFAITH/STOCK 1.3396 CI [0.8928, 1.5603] crosses 1 | **null**; quality non-comparable (CACHE 24/45 vs STOCK 39/45); kimi trajectories never exercise the 85.5–93k band (≈0 compactions) |
 | kimi-g-cal (G-bank-ledger) | 4 | 9/10, 9/10, 9/10, **10/10**; peaks 54k–72k at 95k | **not-ready**: taskSuccess ok after fixes, band unreached (tool-result persistence caps read-driven accumulation) |
-| kimi-g2-cal (G2-ledger-accumulation) | 2 (+2 allowed) | see `compaction-kimi-g2-calibration-20261019.md` | calibration |
+| kimi-g2-cal (G2-ledger-accumulation) | 2 (+2 allowed) | max pre-provider est **65.5k / 67.1k**, still below 85.5k; 7/10 & 9/10 | **not-ready**; structural assembly/tool-result plateau, no trigger |
 
 Root-cause note (kimi-e-95k low taskSuccess): E3's `/tmp` copy step +
 stateful shell drifted all later work out of the workspace (11–25 `cd /tmp`
