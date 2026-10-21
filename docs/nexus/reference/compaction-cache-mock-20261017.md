@@ -43,14 +43,97 @@ this report validates the decision math and the mapping contract.
 - The policy math is conservative: on a cached 1M-window model, proactive
   compaction is even less attractive than before; this supports the `NO_OP`
   default.
-- **Not proven live**: no provider-level cache-hit A/B was run. Do not cite
-  the 90→93% threshold or the 17.4-call break-even as measured production
-  behavior; they are policy-mock outputs.
+- **Policy mock vs live A/B**: the threshold/payback table above is a policy
+  mock. A provider-level cache-aware A/B was later run (below); it verifies
+  activation but is small (2 tasks × 3 reps).
 
 ## Live mapping check (audit follow-up)
 
-After the adapter fix, P2/P3 runs record DeepSeek cache-read ratios of
-**0.70–0.87** in `usage` events (examples: B A-ledger r2 0.78, C B-todos r2
-0.85, R B-todos r3 0.875). The cache-aware policy now sees real hits. The
-threshold/payback table above remains a policy mock; no cache-on/off A/B was
-run.
+After the adapter fix, run-cumulative DeepSeek cache-read ratios
+(`Σ cacheRead / Σ max(input, cacheRead+cacheCreation)`) are about **0.68–0.85**
+in P1.5 and **0.77–0.90** in P3; per-event ratios span roughly 0.06–0.99.
+Examples: ON A-ledger r2 0.7801, ON B-todos r3 0.8515 (run-cumulative). The 0.5
+activation threshold is crossed in many runs; the live A/B below verifies the
+93/80 branch. The threshold/payback table above remains a policy mock.
+
+## Metric definitions
+
+- `billed` = input + output + summaryInput + summaryOutput tokens.
+- **Validity strata (2026-10-19)**: `protocolValid` (legacy `valid`),
+  `taskSuccess` (checklist full pass), `costEligible` = both. **Paired cost
+  comparisons are canonical ONLY over costEligible cells**; legacy pairs are
+  printed alongside. `failureClass` / `blockedTurns` are diagnostics, never
+  eligibility. See `compaction-evaluation-validity-20261019.md`.
+- `calls` = provider calls. Reports show the median per cell and the total
+  separately; the two can move in opposite directions.
+- `cacheReadRatio(event)` = `cacheRead / max(input, cacheRead + cacheCreation)`.
+  OpenAI/DeepSeek `prompt_tokens` already include cached tokens, while
+  Anthropic `input_tokens` excludes cache reads/creation. For a run, use the
+  sum form: `Σ cacheRead / Σ max(input, cacheRead + cacheCreation)`.
+  State clearly whether a quoted ratio is per-event or run-cumulative.
+- Canonical reporter: `node scripts/compaction-metrics.mjs [gateDir ...]` reads
+  `results/*.json` + `runs/*/db-*.sqlite` and prints these metrics as Markdown
+  or JSON; tests: `node --test scripts/compaction-metrics.test.mjs`.
+
+## Live cache-aware A/B (fixed ratio)
+
+`computeCacheReadRatio` now uses `max(input, cacheRead+cacheCreation)` so
+OpenAI/DeepSeek cached prompt tokens are not double-counted. OFF vs ON
+(`BABEL_O_COMPACT_CACHE_AWARE=1`), 90k, stock threshold 50, T1 off, 2 tasks x
+3 reps:
+
+| arm | billed median | calls med | compactions | quality |
+|---|---:|---:|---:|---|
+| OFF (90/70) | 508,636 | 22.0 | 15 | 51/51 |
+| ON (cache-aware 93/80) | 433,093 | 20.0 | 9 | 51/51 |
+
+The ON decision logs contain `compactThresholdTokens=83,700` /
+`warningThresholdTokens=72,000` when the live cache ratio is >=0.5 (some
+decisions remain 81,000/62,999 when it is lower), so cache-preservation mode
+actually activated. ON was **15% cheaper** with fewer compactions and equal
+quality in this n=6 run; this claim is not reproduced by the round-2 null test
+below and must not be used as a cost estimate.
+
+> **Round-2 update (2026-10-18, NOT reproduced):** a 4-task × 3-rep × OFF/ON
+> rerun under identical conditions (`.eval/next-cache/`, 22 cells) gives OFF
+> billed median 478,075 / ON 503,840, compactions 21 vs 28, paired ON/OFF
+> median **1.101** (n=11; bootstrap 90% CI 0.874–1.504, spans 1; pooled with
+> round 1: ≈1.084, 17 pairs). The 15% cheaper result above does **not**
+> reproduce. Activation still reproduces (ON ledgers show 93/80 in 34/55
+> decisions; OFF stays 90/70). Critically, both rounds set
+> `BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT=50`, whose env override fixes an
+> identical 50% trigger in both arms, so 93/80 cannot reduce the compaction
+> count under these conditions. **This is a null test for the cache-aware
+> trigger, not evidence that 93/80 is worse.** Do not cite either direction
+> as a cost result; a valid A/B must omit the override. Cache-aware remains
+> opt-in and untested for default-switch cost. Full details:
+> `compaction-next-round-20261018.md`.
+>
+> **Round-3 update (2026-10-19, mechanism confirmed at 90k; cost still null):**
+> E-stateful-migrator @ 90k, 3 arms × 3 reps, **no threshold override**
+> (`.eval/next-e-90k/`). The 93/80 tier appears only under the flag (26/32
+> CACHE decisions vs 0/35 STOCK and 0/33 SFAITH). CACHE's valid cells (2/3)
+> had **zero compactions** — the 93% trigger kept the 10-step task below
+> threshold end-to-end — with the only perfect quality (27/27) and the lowest
+> valid billed median (1,523,920). But paired CACHE/STOCK is **null**: STOCK
+> lost 2/3 cells to context blocking, leaving 0 valid pairs. Mechanism:
+> confirmed. Cost: still unproven in either direction. Details:
+> `compaction-next-e-90k-20261019.md`.
+>
+> **Round-4 update (2026-10-19, E @ 100k, validity fixed, n=1 pairs):**
+> same design at 100k, 4 reps (`.eval/next-e-100k/`). 93/80 again only under
+> the flag (36/42 CACHE decisions; STOCK/SFAITH 100% 90/70). Validity 3/4
+> CACHE, 4/4 SFAITH, 1/4 STOCK — STOCK's failures are `final_check`
+> finalization artifacts, not context blocking. One double-valid rep
+> (e100-r2): CACHE/STOCK billed ratio **1.0093**, SFAITH/STOCK **0.7359** —
+> single cells, degenerate CI, **no inference**. Compactions (all cells):
+> STOCK 5 / CACHE 2 / SFAITH 1; at 100k the task mostly fits, so the 90-vs-93
+> trigger rarely fires and the cache-aware question needs a longer task at
+> this ceiling. Details: `compaction-next-e-100k-20261019.md`.
+
+Replay: OFF `D_estimate` 41,792 (n=15); ON 37,750 (n=9); `D_actual` negative
+(turn-growth caveat). Raw: `.eval/p15gate2/results/`, `replay.json`,
+`runs/{OFF,ON}/decisions-*.jsonl`.
+
+The earlier 359k vs 493k run was a **null experiment**: the ratio double-count
+kept both arms at 90/70. Do not use those numbers.

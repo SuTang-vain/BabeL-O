@@ -31,9 +31,36 @@ describe('mapOpenAIUsage', () => {
 })
 
 describe('cache-aware compaction policy', () => {
-  test('high cache reuse raises the compact threshold to 93%', () => {
-    const usage = {
-      inputTokens: 1_000,
+  test('high cache reuse is opt-in and stock stays at 90%', () => {
+    const previous = process.env.BABEL_O_COMPACT_CACHE_AWARE
+    delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+    try {
+      const usage = {
+        inputTokens: 5_000,
+        outputTokens: 50,
+        cacheCreationInputTokens: 0,
+        cacheReadInputTokens: 4_000,
+      }
+      const stock = buildCacheAwareCompactPolicy({
+        modelId: 'anthropic/claude-3-5-sonnet',
+        tokenEstimate: 1_000,
+        usage,
+        cacheableSystemPromptRatio: 0.5,
+      })
+      assert.equal(stock.cachePreservationMode, false)
+      assert.equal(stock.compactThresholdPercent, 90)
+    } finally {
+      if (previous === undefined) delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+      else process.env.BABEL_O_COMPACT_CACHE_AWARE = previous
+    }
+  })
+
+  test('high cache reuse raises the compact threshold to 93% when opted in', () => {
+    const previous = process.env.BABEL_O_COMPACT_CACHE_AWARE
+    process.env.BABEL_O_COMPACT_CACHE_AWARE = '1'
+    try {
+      const usage = {
+      inputTokens: 5_000,
       outputTokens: 50,
       cacheCreationInputTokens: 0,
       cacheReadInputTokens: 4_000,
@@ -44,8 +71,12 @@ describe('cache-aware compaction policy', () => {
       usage,
       cacheableSystemPromptRatio: 0.5,
     })
-    assert.equal(policy.cachePreservationMode, true)
-    assert.equal(policy.compactThresholdPercent, 93)
+      assert.equal(policy.cachePreservationMode, true)
+      assert.equal(policy.compactThresholdPercent, 93)
+    } finally {
+      if (previous === undefined) delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+      else process.env.BABEL_O_COMPACT_CACHE_AWARE = previous
+    }
   })
 
   test('summarizeCacheAwareUsage sums cache reads', () => {

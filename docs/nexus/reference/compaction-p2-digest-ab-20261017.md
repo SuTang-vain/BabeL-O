@@ -67,10 +67,10 @@ non-inferior, regressions green). Do not present the 21% as a general effect.
 
 ## Live cache evidence
 
-The cache mapping is live: P2/P3 usage events show DeepSeek cache-read ratios of
-**0.70–0.87** (e.g. B A-ledger r2 0.78, C B-todos r2 0.85, R B-todos r3 0.875).
-The cache-aware policy therefore sees real hits; this is not the earlier
-zero-cache mock. No cache-on/off A/B was run.
+Run-cumulative DeepSeek cache-read ratios are about **0.68–0.90** across the
+P1.5/P3 runs (per-event range roughly 0.06–0.99); see the definition in
+`compaction-cache-mock-20261017.md`. The cache-aware policy sees real hits; a
+separate cache-aware A/B is in the P1.5 report.
 
 ## Replay (paired A/B boundaries)
 
@@ -97,3 +97,26 @@ Paired C/A billed median **0.950** (range 0.753–1.208). Adaptive actually
 compacts under pressure, is 5% cheaper in the paired median, and has no
 checklist regression on the shared tasks. This is still a small supplement,
 not a 4x6 gate.
+
+## Contract mapping
+
+The P2 task asks for unit coverage of hierarchical merge, summary-cache reuse,
+and realized-payback feedback, plus an A/B showing summary cost down with
+checklist non-inferior. The digest-vs-prose A/B is that summary-cost A/B;
+hierarchical merge and payback are runtime-wired and covered by integration
+tests. Cache/override are opt-in flags with unit tests; no separate live A/B
+exists for them, and the report does not claim one.
+
+## Post-wiring A/B (4 tasks x 2 reps)
+
+Run after the payback/hierarchical/cache wiring commit (6e17bee), same model,
+90k, threshold/forced 50, T1 off, cache-aware off:
+
+| arm | billed median | summary med | calls med | compactions | quality |
+|---|---:|---:|---:|---:|---|
+| B prose | 446,068 | 8,433 | 21.5 | 15 | 62/62 |
+| C digest | 364,095 | 0 | 17.0 | 17 | 62/62 |
+
+C/B billed ratio median **0.936** (range 0.537–1.100); quality equal. Replay:
+B D_estimate 37,051, C 37,696. This is post-wiring evidence, not the earlier
+pre-wiring p2gate run. Raw: `.eval/p2gate2/results/`, `aggregate.json`, `replay.json`.
