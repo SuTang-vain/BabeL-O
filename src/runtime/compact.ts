@@ -6,11 +6,10 @@ import {
   allocateBudget,
   buildRetainedSegmentMetadata,
   protectToolPairs,
-  selectRecentEvents,
   selectOmittedEvents,
 } from './contextAssembler.js'
 import { summarizeSessionEvents } from './sessionSummary.js'
-import { llmSummarizeEvents } from './compactSummary.js'
+import { llmSummarizeEventsWithUsage } from './compactSummary.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
 
@@ -48,10 +47,16 @@ export async function compactSession(
 ): Promise<CompactSessionResult> {
   const modelId = options.modelId ?? 'local/coding-runtime'
   const budget = allocateBudget(modelId)
-  const { events } = await options.storage.listEvents(options.sessionId, {
+  // Load the newest events, then restore chronological order. The previous
+  // `order: 'asc' + limit` read the OLDEST 10k events, so any session with
+  // more than 10k events (delta events count) compacted a stale window and
+  // could drop the current user instruction.
+  const listed = await options.storage.listEvents(options.sessionId, {
     limit: 10_000,
-    order: 'asc',
+    order: 'desc',
   })
+  const events = [...listed.events].reverse()
+  const mapFn = options.mapEventsToMessages
 
   const previousBoundary = findLatestCompactBoundary(events)
   const previousRetainedEvents = previousBoundary
@@ -62,19 +67,31 @@ export async function compactSession(
     : events
   const selectedEvents = protectToolPairs(
     compactableEvents,
-    selectRecentEvents(compactableEvents, budget),
+    selectCompactionWindow(compactableEvents, budget, options.initialPrompt ?? '', mapFn),
   )
+  // Fail closed if the window would drop the instruction the turn is acting on.
+  const newestUserMessage = [...compactableEvents].reverse().find(event => event.type === 'user_message')
+  if (newestUserMessage && !selectedEvents.includes(newestUserMessage)) {
+    throw new Error('compaction window would drop the current user message')
+  }
   const omittedEvents = selectOmittedEvents(compactableEvents, selectedEvents)
-  const beforeTokenEstimate = estimateEventsAsProviderTokens(compactableEvents, options.initialPrompt ?? '')
+  const beforeTokenEstimate = estimateEventsAsProviderTokens(
+    compactableEvents,
+    options.initialPrompt ?? '',
+    undefined,
+    mapFn,
+  )
   const priorSummary = previousBoundary?.event.summary.trim()
-  const mapFn = options.mapEventsToMessages
   const summaryStartMs = performance.now()
   let newSummary: string
+  let summaryUsage = { inputTokens: 0, outputTokens: 0 }
   if (mapFn && modelId !== 'local/coding-runtime') {
-    newSummary = await llmSummarizeEvents(omittedEvents, modelId, {
+    const summarized = await llmSummarizeEventsWithUsage(omittedEvents, modelId, {
       mapEventsToMessages: mapFn,
       initialPrompt: options.initialPrompt,
     })
+    newSummary = summarized.text
+    summaryUsage = summarized.usage
   } else {
     newSummary = summarizeSessionEvents(
       omittedEvents,
@@ -87,7 +104,12 @@ export async function compactSession(
     .join('\n')
     .trim()
   const fallbackSummary = summary || 'Manual compact boundary created; no earlier events required summarization.'
-  const afterTokenEstimate = estimateEventsAsProviderTokens(selectedEvents, options.initialPrompt ?? '', fallbackSummary)
+  const afterTokenEstimate = estimateEventsAsProviderTokens(
+    selectedEvents,
+    options.initialPrompt ?? '',
+    fallbackSummary,
+    mapFn,
+  )
 
   const event: Extract<NexusEvent, { type: 'compact_boundary' }> = {
     type: 'compact_boundary',
@@ -101,6 +123,12 @@ export async function compactSession(
     preTokens: beforeTokenEstimate,
     postTokens: afterTokenEstimate,
     estimatedTokensSaved: Math.max(0, beforeTokenEstimate - afterTokenEstimate),
+    ...(summaryUsage.inputTokens > 0 || summaryUsage.outputTokens > 0
+      ? {
+          summaryInputTokens: summaryUsage.inputTokens,
+          summaryOutputTokens: summaryUsage.outputTokens,
+        }
+      : {}),
     retainedEvents: selectedEvents,
     modelId,
     budget,
@@ -164,6 +192,8 @@ export function buildContextCompactBoundaryEvent(
     ...(boundary.preTokens !== undefined && { preTokens: boundary.preTokens }),
     ...(boundary.postTokens !== undefined && { postTokens: boundary.postTokens }),
     ...(boundary.estimatedTokensSaved !== undefined && { estimatedTokensSaved: boundary.estimatedTokensSaved }),
+    ...(boundary.summaryInputTokens !== undefined && { summaryInputTokens: boundary.summaryInputTokens }),
+    ...(boundary.summaryOutputTokens !== undefined && { summaryOutputTokens: boundary.summaryOutputTokens }),
     summaryChars: boundary.summaryChars,
     snippedToolResults: boundary.snippedToolResults,
     messagesSummarized,
@@ -184,17 +214,94 @@ function truncate(value: string, maxChars: number): string {
   return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 1))}…`
 }
 
+const MIN_RETAINED_TURNS = 2
+const RETAINED_TOKEN_FRACTION = 0.2
+
+function estimateEventsForSelection(
+  events: NexusEvent[],
+  initialPrompt: string,
+  mapFn?: (events: NexusEvent[], initialPrompt: string) => ModelMessage[],
+): number {
+  if (mapFn) {
+    return estimateContextTokens({ messages: mapFn(events, initialPrompt) }).totalTokens
+  }
+  return estimateEventsAsProviderTokens(events, initialPrompt)
+}
+
+/**
+ * Newest-first, soft token-budgeted window. Always keeps the current user
+ * message and at least the previous turn so a single oversized tool result
+ * cannot evict the instruction the turn is acting on.
+ */
+function selectCompactionWindow(
+  events: NexusEvent[],
+  budget: ReturnType<typeof allocateBudget>,
+  initialPrompt: string,
+  mapFn?: (events: NexusEvent[], initialPrompt: string) => ModelMessage[],
+): NexusEvent[] {
+  const userIndexes: number[] = []
+  events.forEach((event, index) => {
+    if (event.type === 'user_message') userIndexes.push(index)
+  })
+  if (userIndexes.length === 0) return events
+
+  const lastUserIndex = userIndexes[userIndexes.length - 1]!
+  const maxRetainedTokens = Math.max(
+    2_000,
+    Math.floor(budget.maxTokens * RETAINED_TOKEN_FRACTION),
+  )
+  let startIndex = lastUserIndex
+  let keptTurns = 1
+
+  for (let index = userIndexes.length - 2; index >= 0; index -= 1) {
+    const candidateStart = userIndexes[index]!
+    const candidateEstimate = estimateEventsForSelection(
+      events.slice(candidateStart),
+      initialPrompt,
+      mapFn,
+    )
+    if (keptTurns >= MIN_RETAINED_TURNS && candidateEstimate > maxRetainedTokens) break
+    startIndex = candidateStart
+    keptTurns += 1
+  }
+
+  return events.slice(startIndex)
+}
+
 function estimateEventsAsProviderTokens(
   events: NexusEvent[],
   initialPrompt: string,
   summary?: string,
+  mapFn?: (events: NexusEvent[], initialPrompt: string) => ModelMessage[],
 ): number {
-  const content = [
+  if (mapFn) {
+    const messages = mapFn(events, initialPrompt)
+    const messageTokens = estimateContextTokens({ messages }).totalTokens
+    return messageTokens + (summary ? Math.ceil(summary.length / 4) : 0)
+  }
+
+  // Content-only fallback: never stringify event metadata/delta streams, which
+  // inflated the old pre/post ledger by 3-13x relative to the trigger estimate.
+  const content = events
+    .map(event => {
+      if (event.type === 'user_message') return `user: ${event.text}`
+      if (event.type === 'tool_started') return `tool call: ${JSON.stringify(event.input)}`
+      if (event.type === 'tool_completed') {
+        const output = typeof event.output === 'string'
+          ? event.output
+          : JSON.stringify(event.output)
+        return `tool result (${event.name}): ${output}`
+      }
+      return ''
+    })
+    .filter(Boolean)
+    .join('\n')
+  const text = [
     summary ? `Compact summary:\n${summary}` : '',
-    JSON.stringify(events),
+    content,
     initialPrompt,
   ].filter(Boolean).join('\n')
-  return estimateContextTokens({ messages: [{ role: 'user', content }] }).totalTokens
+  return estimateContextTokens({ messages: [{ role: 'user', content: text }] }).totalTokens
 }
 
 function inferSessionCwd(events: NexusEvent[]): string | undefined {

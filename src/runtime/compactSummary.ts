@@ -122,18 +122,37 @@ export function formatCompactSummary(rawText: string): string {
   return formatted.trim()
 }
 
+export type CompactSummaryUsage = {
+  inputTokens: number
+  outputTokens: number
+}
+
+const EMPTY_SUMMARY_USAGE: CompactSummaryUsage = { inputTokens: 0, outputTokens: 0 }
+
+export async function queryModelTextWithUsage(
+  adapter: ModelAdapter,
+  params: ModelQueryParams,
+  options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string },
+): Promise<{ text: string; usage: CompactSummaryUsage }> {
+  const chunks: string[] = []
+  const usage: CompactSummaryUsage = { ...EMPTY_SUMMARY_USAGE }
+  for await (const delta of adapter.queryStream(params, options)) {
+    if (delta.type === 'text') {
+      chunks.push(delta.text)
+    } else if (delta.type === 'usage') {
+      usage.inputTokens += delta.inputTokens
+      usage.outputTokens += delta.outputTokens
+    }
+  }
+  return { text: chunks.join(''), usage }
+}
+
 export async function queryModelText(
   adapter: ModelAdapter,
   params: ModelQueryParams,
   options?: { signal?: AbortSignal; apiKey?: string; baseUrl?: string },
 ): Promise<string> {
-  const chunks: string[] = []
-  for await (const delta of adapter.queryStream(params, options)) {
-    if (delta.type === 'text') {
-      chunks.push(delta.text)
-    }
-  }
-  return chunks.join('')
+  return (await queryModelTextWithUsage(adapter, params, options)).text
 }
 
 export type LlmSummarizeOptions = {
@@ -142,15 +161,30 @@ export type LlmSummarizeOptions = {
   signal?: AbortSignal
 }
 
+export type LlmSummarizeResult = {
+  text: string
+  usage: CompactSummaryUsage
+}
+
 export async function llmSummarizeEvents(
   events: NexusEvent[],
   modelId: string,
   options: LlmSummarizeOptions,
 ): Promise<string> {
-  if (events.length === 0) return ''
+  return (await llmSummarizeEventsWithUsage(events, modelId, options)).text
+}
 
-  const fallbackResult = (): string =>
-    summarizeSessionEvents(events)
+export async function llmSummarizeEventsWithUsage(
+  events: NexusEvent[],
+  modelId: string,
+  options: LlmSummarizeOptions,
+): Promise<LlmSummarizeResult> {
+  if (events.length === 0) return { text: '', usage: { ...EMPTY_SUMMARY_USAGE } }
+
+  const fallbackResult = (): LlmSummarizeResult => ({
+    text: summarizeSessionEvents(events),
+    usage: { ...EMPTY_SUMMARY_USAGE },
+  })
 
   if (modelId === 'local/coding-runtime') return fallbackResult()
 
@@ -183,16 +217,18 @@ export async function llmSummarizeEvents(
       temperature: 0,
     }
 
-    const rawText = await queryModelText(adapter, params, {
+    const summarized = await queryModelTextWithUsage(adapter, params, {
       signal: options.signal,
       apiKey: settings.apiKey,
       baseUrl: settings.baseUrl,
     })
 
-    if (!rawText || !rawText.trim()) return fallbackResult()
+    if (!summarized.text || !summarized.text.trim()) return fallbackResult()
 
-    const formatted = formatCompactSummary(rawText)
-    return formatted || fallbackResult()
+    const formatted = formatCompactSummary(summarized.text)
+    return formatted
+      ? { text: formatted, usage: summarized.usage }
+      : fallbackResult()
   } catch {
     return fallbackResult()
   }
