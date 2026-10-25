@@ -72,10 +72,16 @@ import {
   absorbCompactSummaryLatencyMetrics,
 } from './runtimePipeline.js'
 import { buildCompactFailureEvent, compactSession } from './compact.js'
+import {
+  recordCompactionDecision,
+  resolveCompactionMode,
+  type CompactionModeDecision,
+} from './compactionMode.js'
 import { ContextRefreshStrategy, type ContextRefreshStrategyOptions } from './ContextRefreshStrategy.js'
 import type { NexusEvent } from '../shared/events.js'
 import type { NexusStorage } from '../storage/Storage.js'
 import type { ModelMessage } from '../providers/adapters/ModelAdapter.js'
+import type { GroundingScope } from './compactionAuthority.js'
 
 export type ExecuteProviderLoopCompactBlockInput = {
   storage: NexusStorage
@@ -104,7 +110,7 @@ export type ExecuteProviderLoopCompactBlockInput = {
   }
   closures: {
     applyContextRefreshState: (next: any) => void
-    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string) => NexusEvent[]
+    postCompactGroundingEvents: (source: 'post_compact' | 'context_recovery', boundaryId?: string, scope?: GroundingScope) => NexusEvent[]
     contextMicrocompactEvent: (
       trigger: 'initial_refresh' | 'pre_provider_call' | 'after_compact' | 'after_message_budget',
     ) => NexusEvent | undefined
@@ -130,9 +136,35 @@ export type ExecuteProviderLoopCompactBlockResult = {
 export async function executeProviderLoopCompactBlock(
   input: ExecuteProviderLoopCompactBlockInput,
 ): Promise<ExecuteProviderLoopCompactBlockResult> {
+  const mode = resolveCompactionMode()
+  if (mode === 'noop') {
+    return { events: [], compactAttempted: input.alreadyAttempted }
+  }
   if (!input.isContextWindowBlocking || input.alreadyAttempted) {
     return { events: [], compactAttempted: input.alreadyAttempted }
   }
+  const reactiveDecision = input.state.getAutoCompactDecision() as CompactionModeDecision
+  const reactiveWindow = input.state.getContextWindowState()
+  recordCompactionDecision({
+    sessionId: input.sessionId,
+    requestId: input.requestId,
+    modelId: input.cleanedModelId,
+    providerId: input.providerId,
+    source: 'reactive',
+    mode,
+    tokenEstimate: reactiveWindow.tokenEstimate,
+    maxTokens: reactiveWindow.maxTokens,
+    percentUsed: reactiveWindow.percentUsed,
+    warningThresholdTokens: reactiveWindow.warningThresholdTokens,
+    compactThresholdTokens: reactiveWindow.compactThresholdTokens,
+    blockingLimitTokens: reactiveWindow.blockingLimitTokens,
+    enabled: true,
+    shouldCompact: true,
+    thresholdPercent: reactiveDecision.thresholdPercent,
+    failureCount: reactiveDecision.failureCount,
+    fuseOpen: reactiveDecision.fuseOpen,
+    reason: 'provider-loop-blocking',
+  })
   const events: NexusEvent[] = []
   try {
     const compactResult = await compactSession({
@@ -146,7 +178,7 @@ export async function executeProviderLoopCompactBlock(
     absorbCompactSummaryLatencyMetrics(input.metrics, compactResult.summaryLatencyMs)
     events.push(compactResult.event)
     events.push(compactResult.contextEvent)
-    const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId)
+    const groundingEvents = input.closures.postCompactGroundingEvents('post_compact', compactResult.contextEvent.boundaryId, compactResult.groundingScope)
     for (const groundingEvent of groundingEvents) events.push(groundingEvent)
     input.state.setPreviousEvents([
       ...input.state.getPreviousEvents(),

@@ -40,6 +40,8 @@ import {
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
 import { errorMessage } from '../shared/errors.js'
+import { isReversibleEvictionEnabled } from './compactionMode.js'
+import { evictReversibleBeforeCurrentTurn } from './reversibleEviction.js'
 
 export type ContextBudget = {
   maxTokens: number
@@ -288,6 +290,13 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   const compactAwareEvents = compactBoundary && retainedSegmentCheck.valid
     ? [...retainedBoundaryEvents, ...options.events.slice(compactBoundary.index + 1)]
     : options.events
+  // T1 reversible eviction is opt-in via `BABEL_O_COMPACT_MODE=adaptive`.
+  // It never touches the current turn (newest user_message onwards); stock and
+  // noop keep the exact previous assembly behavior.
+  const reversibleEviction = isReversibleEvictionEnabled()
+    ? evictReversibleBeforeCurrentTurn(compactAwareEvents, budget)
+    : { events: compactAwareEvents, compactedEvents: 0, bytesSaved: 0 }
+  const workingEvents = reversibleEviction.events
   const userIntentGuidance = deriveSelectedUserIntentGuidance({
     events: compactAwareEvents,
     latestPrompt: options.runtimeOptions.prompt,
@@ -305,11 +314,11 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
   // only gates a binary "trim or not," so imprecision is tolerable. When the
   // estimate is below the warning threshold (default 70%), prior turns are
   // retained instead of dropped at single-digit usage.
-  const preSelectionMessages = options.mapEventsToMessages(compactAwareEvents, options.runtimeOptions.prompt)
+  const preSelectionMessages = options.mapEventsToMessages(workingEvents, options.runtimeOptions.prompt)
   const preSelectionTokenEstimate = estimateContextTokens({
     messages: preSelectionMessages,
   }).totalTokens
-  const rawSelectedEvents = selectRecentEvents(compactAwareEvents, budget, {
+  const rawSelectedEvents = selectRecentEvents(workingEvents, budget, {
     preSelectionTokenEstimate,
   })
   // Phase 2 (adaptive-context-window-selection-plan.md): gate the microcompact
@@ -334,10 +343,10 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
       }
     : budget
   const selectedEvents = protectToolPairs(
-    compactAwareEvents,
+    workingEvents,
     rawSelectedEvents,
   )
-  const omittedEvents = selectOmittedEvents(compactAwareEvents, selectedEvents)
+  const omittedEvents = selectOmittedEvents(workingEvents, selectedEvents)
   const compactSummary = compactBoundary?.event.summary.trim() ?? ''
   let sessionSummary = [
     compactSummary,
@@ -501,7 +510,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     sessionSummary: budgetedSessionSummary,
     activeSkills: budgetedActiveSkills,
     workingSetEntries,
-    events: compactAwareEvents,
+    events: workingEvents,
     selectedEvents,
     rawSelectedEvents,
     compactBoundaryId: compactBoundary ? eventIdentity(compactBoundary.event) : undefined,

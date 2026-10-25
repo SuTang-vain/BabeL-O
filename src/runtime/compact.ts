@@ -12,6 +12,8 @@ import { summarizeSessionEvents } from './sessionSummary.js'
 import { llmSummarizeEventsWithUsage } from './compactSummary.js'
 import { estimateContextTokens } from './tokenEstimator.js'
 import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessionMemoryLite.js'
+import { resolveCompactionMode } from './compactionMode.js'
+import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
 
 export type CompactTrigger = 'manual' | 'auto' | 'reactive'
 
@@ -31,6 +33,8 @@ export type CompactSessionResult = {
   beforeEventCount: number
   afterEventCount: number
   summaryLatencyMs: number
+  /** Present only in `adaptive` mode; narrows post-compact grounding. */
+  groundingScope?: GroundingScope
 }
 
 export type AutoCompactDecision = {
@@ -57,6 +61,10 @@ export async function compactSession(
   })
   const events = [...listed.events].reverse()
   const mapFn = options.mapEventsToMessages
+  const sessionCwd = inferSessionCwd(events) ?? await inferStoredSessionCwd(options.storage, options.sessionId)
+  const groundingScope = resolveCompactionMode() === 'adaptive' && sessionCwd
+    ? await computeGroundingScopeFromEvents(events, sessionCwd)
+    : undefined
 
   const previousBoundary = findLatestCompactBoundary(events)
   const previousRetainedEvents = previousBoundary
@@ -142,7 +150,7 @@ export async function compactSession(
     const memoryDecision = shouldUpdateSessionMemoryLite(events, { force: true })
     const memoryEvent = await updateSessionMemoryLite({
       sessionId: options.sessionId,
-      cwd: inferSessionCwd(events) ?? await inferStoredSessionCwd(options.storage, options.sessionId),
+      cwd: sessionCwd,
       trigger: event.trigger,
       reason: 'compact',
       decisionReason: memoryDecision.reason,
@@ -163,6 +171,7 @@ export async function compactSession(
     beforeEventCount: event.beforeEventCount,
     afterEventCount: event.afterEventCount,
     summaryLatencyMs,
+    ...(groundingScope ? { groundingScope } : {}),
   }
 }
 
@@ -335,8 +344,11 @@ export function getAutoCompactDecision(options: {
   failureLimit?: number
 }): AutoCompactDecision {
   const enabled = options.enabled ?? isAutoCompactEnabled()
+  // The documented env knob wins over the caller's runtime default. Before
+  // this, contextRefresh always passed the hardcoded 90% and the env var was
+  // silently ignored.
   const thresholdPercent = clampPercent(
-    options.thresholdPercent ?? readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', 90),
+    readPercentEnv('BABEL_O_AUTO_COMPACT_THRESHOLD_PERCENT', options.thresholdPercent ?? 90),
   )
   const failureLimit = Math.max(
     1,
