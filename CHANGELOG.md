@@ -4,7 +4,9 @@ This changelog highlights user-facing changes in BabeL-O releases.
 
 For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 
-## Unreleased
+## v0.5.0 - 2026-10-25
+
+[Full release notes](docs/releases/v0.5.0.md)
 
 ### Added
 
@@ -17,12 +19,16 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
   decisions without compacting (same-ceiling control arm); `adaptive` currently
   uses payback admission with a forced threshold (default 92%, lowerable for experiments).
 
-- Added opt-in `BABEL_O_COMPACT_FAITHFUL_DIGEST=1` (adaptive only): extractive
-  digest with verbatim anchors and no recursive digest compaction; stock is
-  unchanged. Prototype/pilot only, not a default candidate.
+- Added opt-in `BABEL_O_COMPACT_FAITHFUL_DIGEST=1` (adaptive or stock mode):
+  extractive digest with verbatim anchors and no recursive digest compaction.
+  Stock without the flag is unchanged. Prototype/pilot only, not a default
+  candidate.
 
 - Added `bbl go --nexus-port-scan-attempts <n>` to bound the local port scan
   used when the requested Nexus port is occupied (default: 12).
+
+- Added an eval-only `kimi-coding/k3` provider/model entry for compaction
+  evaluation. It is not a default provider and carries no support commitment.
 
 ### Changed
 
