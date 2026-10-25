@@ -40,7 +40,12 @@ import {
 import { createMemoryProviderDiagnostics, type MemoryProvider, type MemoryProviderDiagnostics } from './memoryProvider.js'
 import { formatMemoryCandidateGovernanceForInbox } from './memoryCandidateGovernance.js'
 import { errorMessage } from '../shared/errors.js'
-import { isReversibleEvictionEnabled } from './compactionMode.js'
+import { isReversibleEvictionEnabled, resolveCompactionMode } from './compactionMode.js'
+import {
+  formatCompactionBoundaryText,
+  insertCompactionBoundaryMessage,
+  resolveCompactionBoundaryMode,
+} from './compactionBoundaryMessage.js'
 import { evictReversibleBeforeCurrentTurn } from './reversibleEviction.js'
 
 export type ContextBudget = {
@@ -261,7 +266,9 @@ export function allocateBudget(modelId: string): ContextBudget {
     layerBudgets: {
       system: 5_000,
       memory: 2_000,
-      summary: 4_000,
+      summary: resolveCompactionMode() === 'adaptive'
+        ? Math.max(1_500, Math.min(12_000, Math.floor(maxTokens * 0.06)))
+        : 4_000,
       recent: Math.max(1_000, maxTokens - fixedBudget),
     },
     snipToolOutputChars: Math.max(2_000, Math.min(20_000, Math.floor(maxChars * 0.08))),
@@ -362,7 +369,7 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
     compactorBudget.snipToolOutputChars,
     compactorBudget.snipPriorTurnToolOutputChars,
   )
-  const messages = options.mapEventsToMessages(
+  let messages = options.mapEventsToMessages(
     snippedEvents,
     options.runtimeOptions.prompt,
   )
@@ -445,12 +452,24 @@ export async function assembleContext(options: ContextAssemblerOptions): Promise
       budget,
     })
 
+  const boundaryMode = resolveCompactionBoundaryMode()
+  const tailBoundary = boundaryMode === 'tail'
+    && Boolean(compactBoundary)
+    && budgetedSessionSummary.trim().length > 0
+  if (tailBoundary) {
+    messages = insertCompactionBoundaryMessage(
+      messages,
+      formatCompactionBoundaryText(budgetedSessionSummary),
+      options.runtimeOptions.prompt,
+    ).messages
+  }
+
   const memoryTruncation = truncateMemoryContent(budgetedProjectMemory)
   const sections = buildSystemPromptSections({
     cwd: options.runtimeOptions.cwd,
     platform: process.platform,
     projectMemory: memoryTruncation.content || undefined,
-    sessionSummary: budgetedSessionSummary.trim() || undefined,
+    sessionSummary: tailBoundary ? undefined : (budgetedSessionSummary.trim() || undefined),
     activeSkills: budgetedActiveSkills.trim() || undefined,
     agentMdContent: agentMdContent || undefined,
     gitStatus: gitStatus || undefined,
