@@ -57,7 +57,7 @@ Per task (billed median):
 
 45 B boundaries across 24 cells:
 
-- `D_estimate` (trigger estimate − boundary postTokens): median **37,495 tokens**.
+- `D_estimate` (trigger estimate − boundary postTokens): median **37,491 tokens**.
 - `D_provider` (last provider prompt before − first after): median **−840 tokens**;
   negative because the first call after a boundary includes the next turn's prompt
   and tool results. This is not a causal shrink measurement.
@@ -148,3 +148,33 @@ checklist still passed, but the blocking path is a real failure mode at 90k.
 Gate verdict: **conditional pass**. Adaptive admission is non-inferior to NOOP
 and avoids the stock compaction median (+19%), but H1 is task-dependent and H2
 is mixed. Stock default remains unchanged; proceed to P1.5 with these caveats.
+
+## Gate v3: 4 tasks x 4 reps with adaptive forced to compact
+
+The v2 gate's C arm did 0 compactions at 90k. v3 sets
+`BABEL_O_COMPACT_FORCED_PERCENT=50` for C so adaptive actually compacts, and
+keeps A/B at the same 90k ceiling (D natural). T1 and cache-aware policy off.
+
+| arm | billed median | calls med | compactions | quality | peak prompt |
+|---|---:|---:|---:|---|---:|
+| A NOOP | 380,983 | 18 | 0 | 124/124 | 26,408 |
+| B STOCK (50%) | 437,224 | 20 | 27 | 124/124 | 31,032 |
+| C ADAPTIVE (digest, forced 50%) | 382,318 | 20 | **26** | 124/124 | 28,886 |
+| D NATURAL 852k | 396,039 | 17 | 0 | 124/124 | 32,460 |
+
+- B/A billed median **1.125**, 90% CI [1.024, 1.419]; 7/16 pairs ≥1.15.
+  H1 remains partial: compaction costs on median, not uniformly.
+- C/A billed **1.068** (median of 16 paired per-cell ratios; the ratio of arm
+  medians is 1.0035), CI [0.872, 1.160]; **median** calls 20 vs 18 (+11%),
+  while **total** calls are C 304 vs A 333 (−8.7%); quality equal. The
+  pre-registered C gate (≤1.02 cost, ≤1.05 calls) **fails** on the median
+  call count.
+- `calls med` in the table is median provider calls per cell. Median and total
+  calls can move in opposite directions; both are reported here.
+- H2 fails: natural D is not the cheapest (A and C are lower).
+- Branch replay: B 27 boundaries D_estimate 37,259; C 26 boundaries 37,181;
+  D_actual medians −856/−939 (turn-growth caveat).
+
+Verdict: adaptive digest compacts and preserves quality, but at 4x4 it is not
+cheaper than NOOP; the C gate fails. Do not default adaptive on this evidence.
+Raw: `.eval/p1gate3/results/`, `aggregate.json`, `replay.json`.

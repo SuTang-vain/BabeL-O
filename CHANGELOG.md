@@ -15,12 +15,24 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
 - Added opt-in `BABEL_O_COMPACT_MODE=stock|noop|adaptive` (default `stock`)
   and an optional `BABEL_O_COMPACT_DECISION_LOG` JSONL ledger. `noop` records
   decisions without compacting (same-ceiling control arm); `adaptive` currently
-  compacts only at 92% pressure until the admission policy lands.
+  uses payback admission with a forced threshold (default 92%, lowerable for experiments).
+
+- Added opt-in `BABEL_O_COMPACT_FAITHFUL_DIGEST=1` (adaptive only): extractive
+  digest with verbatim anchors and no recursive digest compaction; stock is
+  unchanged. Prototype/pilot only, not a default candidate.
 
 - Added `bbl go --nexus-port-scan-attempts <n>` to bound the local port scan
   used when the requested Nexus port is occupied (default: 12).
 
 ### Changed
+
+- Cache-aware compaction thresholds (93/80) are now opt-in via
+  `BABEL_O_COMPACT_CACHE_AWARE=1`; stock remains 90/70. A round-1 n=6 A/B saw
+  ON cheaper (433,093 vs 508,636 billed), but a 22-cell round-2 reproduction
+  did not confirm it (paired 1.101, CI spans 1); both rounds set a 50% threshold
+  override that shadowed the 93/80 trigger. Treat this as an unvalidated
+  null test, not a cost win; cache-aware is not a default candidate.
+
 
 - Compaction summaries can be reused from a bounded in-process cache when `BABEL_O_COMPACT_SUMMARY_CACHE=1`; the
   summarizer model can be overridden with `BABEL_O_COMPACT_SUMMARY_MODEL`, and
@@ -40,6 +52,10 @@ For full bilingual release notes, see [docs/releases](docs/releases/README.md).
   local port for the Nexus service.
 
 ### Fixed
+
+- Fixed cache-reuse ratio double-counting for OpenAI/DeepSeek (`prompt_tokens`
+  already includes cached tokens). Cache-aware thresholds now activate on live
+  ratios and remain opt-in; stock stays 90/70.
 
 - Fixed context compaction reading the **oldest** 10k events instead of the
   newest window, which could drop the current user instruction on sessions

@@ -938,8 +938,10 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
   assert.equal(state.autoCompactDecision.failureCount, 1)
 
   const previous = process.env.BABEL_O_MAX_CONTEXT_TOKENS
+  const previousCacheAware = process.env.BABEL_O_COMPACT_CACHE_AWARE
   try {
     delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
+    process.env.BABEL_O_COMPACT_CACHE_AWARE = '1'
     const cacheAwareState = buildRuntimeContextRefreshState({
       assembledContext,
       events: [{
@@ -959,6 +961,8 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
     assert.equal(cacheAwareState.cacheAwareCompactPolicy.cachePreservationMode, true)
     assert.equal(cacheAwareState.contextWindowState.maxTokens, 920_000)
     assert.equal(cacheAwareState.autoCompactDecision.thresholdPercent, 93)
+    if (previousCacheAware === undefined) delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+    else process.env.BABEL_O_COMPACT_CACHE_AWARE = previousCacheAware
 
     const providerErrorState = buildRuntimeContextRefreshState({
       assembledContext,
@@ -979,6 +983,8 @@ test('runtime pipeline builds compact refresh state from assembled context', () 
   } finally {
     if (previous === undefined) delete process.env.BABEL_O_MAX_CONTEXT_TOKENS
     else process.env.BABEL_O_MAX_CONTEXT_TOKENS = previous
+    if (previousCacheAware === undefined) delete process.env.BABEL_O_COMPACT_CACHE_AWARE
+    else process.env.BABEL_O_COMPACT_CACHE_AWARE = previousCacheAware
   }
 })
 
@@ -1221,7 +1227,7 @@ test('runtime pipeline builds provider loop request state and query params', () 
     finalResponseOnlyRemainingLoops: 3,
   })
   assert.equal(policyRequestState.contextWindowState.maxTokens, 920_000)
-  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.93))
+  assert.equal(policyRequestState.contextWindowState.compactThresholdTokens, Math.floor(920_000 * 0.90))
 
   const deepSeekPolicyRequestState = buildProviderLoopRequestState({
     loopCount: 4,
@@ -2570,7 +2576,7 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(metrics.contextWarningThresholdTokens, policy.warningThresholdTokens)
   assert.equal(metrics.contextCompactThresholdTokens, policy.compactThresholdTokens)
   assert.equal(metrics.contextBlockingLimitTokens, policy.blockingLimitTokens)
-  assert.equal(metrics.cachePreservationMode, true)
+  assert.equal(metrics.cachePreservationMode, false)
   assert.equal(metrics.longContextUtilizationMode, true)
 
   const prefixCacheDiagnostics = computeProviderPrefixCacheDiagnostics({
@@ -2602,7 +2608,7 @@ test('runtime execution metrics include cache-aware compact diagnostics', () => 
   assert.equal(event.contextCompactThresholdTokens, policy.compactThresholdTokens)
   assert.equal(event.contextBlockingLimitTokens, policy.blockingLimitTokens)
   assert.equal(event.compactSummaryLatencyMs, 15)
-  assert.equal(event.cachePreservationMode, true)
+  assert.equal(event.cachePreservationMode, false)
   assert.equal(event.longContextUtilizationMode, true)
   assert.equal(event.prefixCacheImmutableRatio, prefixCacheDiagnostics.immutablePrefixRatio)
   assert.equal(event.prefixCacheVolatileContentLast, true)

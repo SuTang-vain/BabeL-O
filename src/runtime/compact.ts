@@ -15,6 +15,15 @@ import { shouldUpdateSessionMemoryLite, updateSessionMemoryLite } from './sessio
 import { resolveCompactionMode } from './compactionMode.js'
 import { computeGroundingScopeFromEvents, type GroundingScope } from './compactionAuthority.js'
 import { buildDeterministicDigest, mergeDigests, normalizeCompactionDigest, renderDigest } from './compactionDigest.js'
+import {
+  buildFaithfulDigest,
+  carryFaithfulDigest,
+  isFaithfulDigestEnabled,
+  normalizeFaithfulDigest,
+  renderFaithfulDigest,
+  type FaithfulDigest,
+} from './compactionFaithfulDigest.js'
+import { buildRetrievalIndex, isRetrievalCompactionEnabled, renderRetrievalPointers } from './retrievalDigest.js'
 import { buildSummaryCacheKey, getCachedSummary, isSummaryCacheEnabled, setCachedSummary } from './summaryCache.js'
 import { recordPayback } from './paybackController.js'
 
@@ -96,14 +105,46 @@ export async function compactSession(
   const summaryStartMs = performance.now()
   let newSummary: string
   let summaryUsage = { inputTokens: 0, outputTokens: 0 }
-  let digestState: ReturnType<typeof buildDeterministicDigest> | undefined
-  if (resolveCompactionMode() === 'adaptive') {
-    // T2: deterministic structured digest. Merge the previous boundary's
-    // digest so contracts/facts survive hierarchical compaction.
-    const previousDigest = normalizeCompactionDigest(previousBoundary?.event.digest)
-    const deltaDigest = buildDeterministicDigest(omittedEvents)
-    digestState = previousDigest ? mergeDigests(previousDigest, deltaDigest) : deltaDigest
-    newSummary = renderDigest(digestState, budget.layerBudgets.summary * 4)
+  let digestState: ReturnType<typeof buildDeterministicDigest> | FaithfulDigest | undefined
+  // Faithful digest carries the previous faithful boundary verbatim inside its
+  // own render, so the prose-era priorSummary chaining is skipped in that case
+  // to avoid duplicating the carried content.
+  let skipPriorSummaryChain = false
+  if (isFaithfulDigestEnabled()) {
+    // P-next opt-in: faithful extractive digest. Gated on the flag ALONE —
+    // active under both stock and adaptive mode so the summary substrate can
+    // be A/B-compared at an identical trigger policy. Stock without the flag
+    // never reaches this branch (byte-identical behavior). The digest never
+    // merges/re-compresses the previous digest (carries it verbatim, or
+    // builds from raw events).
+    const delta = buildFaithfulDigest(omittedEvents)
+    const carried = normalizeFaithfulDigest(previousBoundary?.event.digest)
+    digestState = carried ? carryFaithfulDigest(carried, delta) : delta
+    // Mixed histories: when the previous boundary was NOT faithful but left
+    // a prose/T2 summary, move that text into the digest verbatim exactly
+    // once (carriedProse) instead of chaining it into the summary text, so
+    // later faithful boundaries keep it without duplication or loss.
+    if (!carried && priorSummary) {
+      digestState = { ...digestState!, carriedProse: priorSummary }
+    }
+    // Faithful renders self-contain prior history (carried / carriedProse),
+    // so the summary-level priorSummary chain is always skipped here.
+    skipPriorSummaryChain = true
+    newSummary = renderFaithfulDigest(digestState, budget.layerBudgets.summary * 4)
+  } else if (resolveCompactionMode() === 'adaptive') {
+    // T2: deterministic structured digest. P3 opt-in: pointers instead of a
+    // digest, so the model retrieves exact slices via contextSearch.
+    if (isRetrievalCompactionEnabled()) {
+      newSummary = renderRetrievalPointers(
+        buildRetrievalIndex(omittedEvents),
+        budget.layerBudgets.summary * 4,
+      )
+    } else {
+      const previousDigest = normalizeCompactionDigest(previousBoundary?.event.digest)
+      const deltaDigest = buildDeterministicDigest(omittedEvents)
+      digestState = previousDigest ? mergeDigests(previousDigest, deltaDigest) : deltaDigest
+      newSummary = renderDigest(digestState, budget.layerBudgets.summary * 4)
+    }
   } else if (mapFn && modelId !== 'local/coding-runtime') {
     const cacheEnabled = isSummaryCacheEnabled()
     const cacheKey = cacheEnabled ? buildSummaryCacheKey(omittedEvents, modelId) : undefined
@@ -129,7 +170,7 @@ export async function compactSession(
     )
   }
   const summaryLatencyMs = performance.now() - summaryStartMs
-  const summary = [priorSummary, newSummary]
+  const summary = [skipPriorSummaryChain ? undefined : priorSummary, newSummary]
     .filter((part): part is string => Boolean(part && part.trim()))
     .join('\n')
     .trim()
@@ -340,7 +381,9 @@ const recordedBoundaryPaybacks = new Set<string>()
 
 /**
  * Record the realized payback of the latest compact boundary once usage for
- * the following call exists. Feeds getPaybackMultiplier in adaptive admission.
+ * the following call exists. The prediction is the boundary's pre/post delta;
+ * the realization is the actual provider prompt reduction. This feeds
+ * `getPaybackMultiplier` used by adaptive admission.
  */
 export function recordBoundaryPayback(sessionId: string, events: NexusEvent[]): void {
   let boundaryIndex = -1
