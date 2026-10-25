@@ -6,20 +6,9 @@ This guide covers all installation methods for BabeL-O.
 
 - **Operating System**: macOS or Linux
 - **Node.js**: Version 22 or higher (required for native SQLite support)
-- **Go** (optional): Version 1.23+ for building the Go TUI from source
+- **Go** (optional): Version 1.25+ for building the Go TUI from source
 
-## Method 1: npm Global Install (Recommended)
-
-The fastest way to get started:
-
-```bash
-npm install -g babel-o
-bbl go
-```
-
-This method is ideal for Node.js developers and CI/CD environments.
-
-## Method 2: Release Installer
+## Method 1: Release Installer (Recommended)
 
 The release installer downloads a lightweight package for your platform,
 installs the `bbl` launcher, bundles the matching Go TUI binary, and runs
@@ -33,10 +22,10 @@ bbl go
 ### Install a Specific Version
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.4.2 bash
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | BBL_VERSION=v0.5.0 bash
 ```
 
-## Method 3: From Source
+## Method 2: From Source
 
 For contributors and those who want the latest development version:
 
@@ -153,19 +142,16 @@ Node.js 22 or higher:
 node --version  # Should be v22.x.x or higher
 ```
 
-### Permission Errors
+### Installer Permission Errors
 
-If you get permission errors during npm install:
+If the release installer cannot write to the default paths, choose a writable
+install directory and HOME:
 
 ```bash
-# Option 1: Use sudo (not recommended for security)
-sudo npm install -g babel-o
-
-# Option 2: Configure npm to use a directory you own
-mkdir -p ~/.npm-global
-npm config set prefix '~/.npm-global'
-# Add to your shell profile:
-export PATH=~/.npm-global/bin:$PATH
+tmp="$(mktemp -d)"
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | \
+  BBL_VERSION=v0.5.0 BBL_INSTALL_DIR="$tmp/bin" HOME="$tmp/home" bash
+"$tmp/bin/bbl" --version
 ```
 
 ### Go TUI Not Found
@@ -176,8 +162,8 @@ If the Go TUI binary is missing after installation:
 # Rebuild the Go TUI
 cd clients/go-tui && make build
 
-# Or use the TypeScript fallback
-npx tsx src/cli/program.ts go
+# Or run the source CLI (from a source checkout)
+npm run cli -- go
 ```
 
 ## Next Steps

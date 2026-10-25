@@ -12,14 +12,13 @@
 
 <p align="center">
   <a href="https://github.com/SuTang-vain/BabeL-O/releases"><img src="https://img.shields.io/github/v/release/SuTang-vain/BabeL-O" alt="Latest release" /></a>
-  <a href="https://www.npmjs.com/package/babel-o"><img src="https://img.shields.io/npm/v/babel-o" alt="npm version" /></a>
   <a href="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml"><img src="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen" alt="Contributions welcome" /></a>
   <a href="https://github.com/SuTang-vain/BabeL-O/discussions"><img src="https://img.shields.io/badge/discussions-open-blue" alt="GitHub Discussions" /></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/product.png" alt="BabeL-O Go TUI 截图" width="860" />
+  <img src="docs/assets/product.png" alt="BabeL-O v0.5.0 Go TUI 截图" width="860" />
 </p>
 
 [English README](README.md)
@@ -46,8 +45,8 @@ bbl go
   后台 daemon 持有状态，客户端断线重连任务不丢。
   *(Technical: worktree isolation + session persistence + WebSocket reconnect)*
 
-- **10MB 无依赖客户端** —— `bbl go` 是 Go TUI 二进制（~10MB），无 Node 依赖，
-  丢到容器里就能跑。
+- **轻量独立 Go TUI 客户端** —— `bbl go` 是约 14MB 的原生 Go TUI 二进制；
+  Nexus daemon 仍需 Node.js 22+ 与原生 SQLite，客户端保持轻薄，会话状态仍然持久。
   *(Technical: Go Bubble Tea TUI + Node 22+ daemon with native SQLite)*
 
 - **真正能完成长任务** —— context compaction、tool loop 边界、权限治理、
@@ -63,18 +62,32 @@ bbl go
 - **跨 session 协作** —— `/session`、`/inbox` 和 SessionChannel 让不同 session 交换 findings、
   handoff、决策、review 请求，但不会把这些消息当作隐藏指令执行。
 
+### 压缩与上下文（v0.5.0）
+
+v0.5.0 默认修复压缩正确性：读取最新事件窗口、保留当前指令、state 与 summary
+使用独立预算，并记录消息级 ledger。默认策略仍是 `stock`：90/70 阈值、prose
+摘要、system boundary、无 retrieval。
+
+adaptive、确定性 digest、faithful digest、cache-aware 阈值和 retrieval 指针
+都是 opt-in 实验能力；默认不开启，成本收益尚未证明，retrieval 不推荐生产使用。
+用 `/context` 查看当前预算、压缩状态、记忆和 working set。
+
 ---
 
 ## 快速开始 (5 分钟)
 
 > ⚠️ **要求 Node.js >= 22。** 如果你的 Node 版本较旧，请先升级。
-> 其他安装方式见 [安装指南](docs/INSTALLATION.md)。
+> 从源码构建与平台细节见 [安装指南](docs/INSTALLATION.md)。
 
 ```bash
-# 全局安装
-npm install -g babel-o
+# 安装当前 release
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | \
+  BBL_VERSION=v0.5.0 bash
 
-# 交互式初始化（即将推出：bbl config init）
+# 首次交互式配置
+bbl config init
+
+# 或非交互式配置
 bbl config add anthropic "$ANTHROPIC_API_KEY"
 bbl config use anthropic/claude-sonnet-4-6
 
@@ -88,16 +101,18 @@ bbl go
 
 ## 安装
 
-### 推荐：npm 全局安装
+### 推荐：release 安装脚本
 
 ```bash
-npm install -g babel-o
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | \
+  BBL_VERSION=v0.5.0 bash
 bbl go
 ```
 
-要求：macOS 或 Linux，Node.js >= 22。
+要求：macOS 或 Linux，Node.js >= 22。安装脚本会打包匹配的 Go TUI 二进制并执行
+安装后自检。
 
-> 其他安装方式（release 安装脚本、从源码构建）见
+> 从源码构建与平台细节见
 > [安装指南](docs/INSTALLATION.md)。
 
 ---
@@ -169,7 +184,7 @@ bbl memory doctor
 
 BabeL-O 的本地配置保存在 `~/.babel-o/config.json`。
 
-支持的 provider 包括 `anthropic`、`openai`、`deepseek`、`moonshot`、`ollama`、`zhipu`、`minimax` 和 `local`。
+支持的 provider 包括 `anthropic`、`openai`、`deepseek`、`moonshot`、`ollama`、`zhipu`、`minimax` 和 `local`，以及自定义 OpenAI-compatible provider。
 
 常用检查：
 
@@ -192,10 +207,12 @@ BabeL-O 围绕显式边界设计：
 
 ## Release 说明
 
-从 v0.3.7 开始，旧的 `bbl chat` TypeScript TUI 已从 release 包中移除。
-正式交互入口是 `bbl go`；`bbl run` 继续用于一次性自动化和脚本场景。
+当前 release 是 **v0.5.0**（2026-10-25）。它默认修复压缩正确性，并加入 opt-in
+压缩实验能力；stock 默认未变。各开关与已知限制见
+[v0.5.0 发布说明](docs/releases/v0.5.0.md)。
 
-这样可以减小安装包体积，移除重复的终端 UI 逻辑，并把后续交互体验集中到原生 Go TUI。
+旧的 `bbl chat` TypeScript TUI 已在 v0.3.7 移除。`bbl go` 是正式交互入口；
+`bbl run` 继续用于一次性自动化。
 
 ## 文档
 

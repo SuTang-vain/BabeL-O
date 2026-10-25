@@ -12,14 +12,13 @@
 
 <p align="center">
   <a href="https://github.com/SuTang-vain/BabeL-O/releases"><img src="https://img.shields.io/github/v/release/SuTang-vain/BabeL-O" alt="Latest release" /></a>
-  <a href="https://www.npmjs.com/package/babel-o"><img src="https://img.shields.io/npm/v/babel-o" alt="npm version" /></a>
   <a href="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml"><img src="https://github.com/SuTang-vain/BabeL-O/actions/workflows/ci.yml/badge.svg" alt="CI status" /></a>
   <a href="CONTRIBUTING.md"><img src="https://img.shields.io/badge/contributions-welcome-brightgreen" alt="Contributions welcome" /></a>
   <a href="https://github.com/SuTang-vain/BabeL-O/discussions"><img src="https://img.shields.io/badge/discussions-open-blue" alt="GitHub Discussions" /></a>
 </p>
 
 <p align="center">
-  <img src="docs/assets/product.png" alt="BabeL-O Go TUI screenshot" width="860" />
+  <img src="docs/assets/product.png" alt="BabeL-O v0.5.0 Go TUI screenshot" width="860" />
 </p>
 
 [简体中文 README](README.zh-CN.md)
@@ -49,8 +48,9 @@ terminal into a fragile one-shot chat.
   and reconnect without losing tasks.
   *(Technical: worktree isolation + session persistence + WebSocket reconnect)*
 
-- **10MB standalone binary client** — `bbl go` is a Go TUI binary (~10MB) with no
-  Node.js dependency. Drop it in a container and run.
+- **Small standalone Go TUI client** — `bbl go` is a native Go TUI binary (~14MB).
+  The Nexus daemon still needs Node.js 22+ and native SQLite, so the client can
+  stay thin while sessions remain durable.
   *(Technical: Go Bubble Tea TUI + Node 22+ daemon with native SQLite)*
 
 - **Completes long tasks for real** — Context compaction, tool loop boundaries,
@@ -68,18 +68,35 @@ terminal into a fragile one-shot chat.
   sessions exchange findings, handoffs, decisions, and review requests without
   treating those messages as secret instructions.
 
+### Compaction and context (v0.5.0)
+
+v0.5.0 fixes compaction correctness by default: it reads the newest event
+window, keeps the current instruction, separates state and summary budgets, and
+records a message-based ledger. The default strategy is still `stock` — 90/70
+thresholds, a prose summary, the system boundary, and no retrieval.
+
+Adaptive compaction, deterministic digest, faithful digest, cache-aware
+thresholds, and retrieval pointers are available as opt-in experiments. They
+are not enabled by default, their cost benefits have not been established, and
+retrieval is not recommended for production. Use `/context` to inspect the
+current budget, compaction state, memory, and working set.
+
 ---
 
 ## Quick Start (5 minutes)
 
 > ⚠️ **Requires Node.js >= 22.** If your Node is older, upgrade first.
-> For alternative installation methods, see [INSTALLATION.md](docs/INSTALLATION.md).
+> For source builds and platform details, see [INSTALLATION.md](docs/INSTALLATION.md).
 
 ```bash
-# Install globally
-npm install -g babel-o
+# Install the current release
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | \
+  BBL_VERSION=v0.5.0 bash
 
-# Initialize with interactive setup (coming soon: bbl config init)
+# First-time provider setup (interactive)
+bbl config init
+
+# Or configure non-interactively
 bbl config add anthropic "$ANTHROPIC_API_KEY"
 bbl config use anthropic/claude-sonnet-4-6
 
@@ -93,16 +110,18 @@ See [Common Commands](#common-commands) for more usage examples.
 
 ## Installation
 
-### Recommended: npm global install
+### Recommended: release installer
 
 ```bash
-npm install -g babel-o
+curl -fsSL https://raw.githubusercontent.com/SuTang-vain/BabeL-O/main/scripts/install.sh | \
+  BBL_VERSION=v0.5.0 bash
 bbl go
 ```
 
-Requirements: macOS or Linux, Node.js >= 22.
+Requirements: macOS or Linux, Node.js >= 22. The installer bundles the matching
+Go TUI binary and runs a post-install self-check.
 
-> For alternative installation methods (release installer, from source), see
+> For source builds and platform details, see
 > [INSTALLATION.md](docs/INSTALLATION.md).
 
 ---
@@ -176,7 +195,8 @@ bbl memory doctor
 BabeL-O stores local configuration in `~/.babel-o/config.json`.
 
 Supported providers include `anthropic`, `openai`, `deepseek`, `moonshot`,
-`ollama`, `zhipu`, `minimax`, and `local`.
+`ollama`, `zhipu`, `minimax`, and `local`, plus custom OpenAI-compatible
+providers.
 
 Useful checks:
 
@@ -205,12 +225,14 @@ tools, agents, memory, storage, and observability layers fit together, see
 
 ## Release Notes
 
-As of v0.3.7, the old `bbl chat` TypeScript TUI has been removed from the
-release package. The official interactive entrypoint is `bbl go`; `bbl run`
-remains available for one-shot automation.
+The current release is **v0.5.0** (2026-10-25). It fixes compaction correctness
+by default and adds opt-in compaction experiments; the stock defaults are
+unchanged. See [v0.5.0 release notes](docs/releases/v0.5.0.md) for flags and
+known limitations.
 
-This keeps the install smaller, removes duplicated terminal UI logic, and puts
-future interaction work into the native Go TUI.
+The legacy `bbl chat` TypeScript TUI was removed in v0.3.7. `bbl go` is the
+production interactive entrypoint; `bbl run` remains available for one-shot
+automation.
 
 ## Documentation
 
